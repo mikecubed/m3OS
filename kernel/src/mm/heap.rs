@@ -882,6 +882,14 @@ pub fn grow_heap(additional_bytes: usize) -> Result<(), ()> {
     // current core. The IPI infrastructure (`smp::tlb`) already runs in
     // the page-fault demand-paging path; reusing the range API keeps the
     // shootdown to a single IPI handshake instead of one per page.
+    //
+    // We hold `GROW_HEAP_LOCK` (an `IrqSafeMutex`) here, so IF is
+    // currently 0.  As of session 5 (2026-05-25) the shootdown is
+    // delivered via NMI rather than a Fixed-mode IPI, so recipient
+    // cores ack regardless of their IF state — this call is safe from
+    // any kernel context, including nested IrqSafeMutex regions.  See
+    // `arch::x86_64::interrupts::nmi_handler`, `smp::ipi::send_nmi`,
+    // and `docs/handoffs/2026-05-24-4gib-pci-hole-vga-mapping.md`.
     let flush_start = (HEAP_START + current_mapped) as u64;
     let flush_end = flush_start + bytes_mapped as u64;
     if crate::smp::is_per_core_ready() {

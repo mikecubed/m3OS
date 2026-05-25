@@ -20,6 +20,7 @@
 extern crate alloc;
 
 use alloc::collections::BTreeMap;
+use alloc::rc::Rc;
 use alloc::vec::Vec;
 
 use kernel_core::display::compose::ComposeLayer;
@@ -55,6 +56,38 @@ use kernel_core::display::surface::{
     SurfaceEffect, SurfaceError, SurfaceEvent, SurfaceStateMachine,
 };
 
+/// One live `sys_shm_map` result. Owns the user-space mapping; the
+/// `Drop` impl returns the mapping to the kernel via `sys_shm_unmap`.
+///
+/// Wrapped in [`Rc`] so the same kernel mapping can back many
+/// [`BufferStorage::Shared`] values without re-entering `sys_shm_map`
+/// on every `AttachSharedBuffer`. At 4K resolution a single shm_map
+/// allocates a ~63 KiB `Vec<PhysFrame>` on the kernel heap as
+/// page-table-walk scratch; calling it 60 Hz × N clients fragments
+/// the buddy and OOMs the next task-creation. The Rc cache cuts
+/// this to *one* shm_map per shm_id per lifetime.
+///
+/// `len` is the visible pixel-region byte count (`width * height *
+/// 4`); the underlying mapping is page-aligned and may extend past
+/// it. `shm_id` is preserved so [`SurfaceRegistry`]'s cache can
+/// prune dead entries opportunistically.
+#[derive(Debug)]
+pub struct SharedMapping {
+    pub shm_id: u32,
+    pub user_va: u64,
+    pub len: usize,
+}
+
+impl Drop for SharedMapping {
+    fn drop(&mut self) {
+        // Best-effort release. If the syscall fails the SHM registry
+        // still has us as a holder; the leak is bounded by the
+        // surviving kernel registry's lifetime, not by accumulating
+        // across many surfaces.
+        let _ = syscall_lib::shm_unmap(self.user_va);
+    }
+}
+
 /// Storage backing for a committed buffer's pixel data.
 ///
 /// Phase 56's chunked-pixel path produced [`Vec<u8>`]-owned buffers
@@ -64,69 +97,21 @@ use kernel_core::display::surface::{
 /// mapped writable via `sys_shm_map`. The compose path treats both
 /// uniformly through [`BufferStorage::as_slice`].
 ///
-/// `Owned` cleans up automatically on drop. `Shared` carries the
-/// owning user virtual address + length so [`Drop`] can call
-/// `sys_shm_unmap` to release the mapping (and decrement the registry
-/// refcount) when the surface is destroyed or re-attached.
+/// `Owned` cleans up automatically on drop. `Shared` holds an [`Rc`]
+/// to a [`SharedMapping`]; the kernel mapping is released when the
+/// last holder drops. Multiple concurrent `AttachSharedBuffer`s
+/// against the same `shm_id` reuse the same [`SharedMapping`] via
+/// [`SurfaceRegistry`]'s cache, eliminating per-frame remap churn.
 ///
 /// Note: the kernel currently maps SHM pages writable for every mapper
 /// — the compositor does not enforce read-only on its side. Phase 57d
 /// callers do not write through the compositor's mapping, but the
 /// [`BufferStorage::as_slice`] API is `unsafe` because the underlying
 /// bytes are concurrently writable by the originating client.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum BufferStorage {
     Owned(Vec<u8>),
-    Shared {
-        /// User virtual address returned by `sys_shm_map`.
-        user_va: u64,
-        /// Byte length of the visible pixel region: exactly
-        /// `width * height * 4`. The kernel's underlying mapping is
-        /// page-aligned and may extend past this length, but only
-        /// the first `len` bytes are valid pixel data.
-        len: usize,
-    },
-}
-
-impl Clone for BufferStorage {
-    fn clone(&self) -> Self {
-        match self {
-            BufferStorage::Owned(v) => BufferStorage::Owned(v.clone()),
-            // Shared mappings are not deep-cloneable: the kernel
-            // refcount is decremented on drop, and we cannot bump it
-            // again from userspace without a syscall round-trip. The
-            // composer takes `&CommittedBuffer` borrows so a clone is
-            // never structurally required; if it ever is, fall back
-            // to materialising an owned copy of the visible bytes.
-            //
-            // SAFETY: copy directly through a raw pointer rather than
-            // synthesising an `&[u8]` so the producer's concurrent
-            // writes never alias a Rust reference, even briefly. Torn
-            // reads are inherent to the cross-process editing pattern;
-            // the resulting `Vec<u8>` is a single-point-in-time
-            // snapshot.
-            BufferStorage::Shared { user_va, len } => {
-                let mut owned = alloc::vec::Vec::<u8>::with_capacity(*len);
-                unsafe {
-                    core::ptr::copy_nonoverlapping(*user_va as *const u8, owned.as_mut_ptr(), *len);
-                    owned.set_len(*len);
-                }
-                BufferStorage::Owned(owned)
-            }
-        }
-    }
-}
-
-impl Drop for BufferStorage {
-    fn drop(&mut self) {
-        if let BufferStorage::Shared { user_va, .. } = self {
-            // Best-effort release. If the syscall fails the SHM
-            // registry still has us as a holder; the leak is bounded
-            // by the surviving kernel registry's lifetime, not by
-            // accumulating across many surfaces.
-            let _ = syscall_lib::shm_unmap(*user_va);
-        }
-    }
+    Shared(Rc<SharedMapping>),
 }
 
 impl BufferStorage {
@@ -147,15 +132,20 @@ impl BufferStorage {
     pub fn snapshot(&self) -> Vec<u8> {
         match self {
             BufferStorage::Owned(v) => v.clone(),
-            BufferStorage::Shared { user_va, len } => {
-                let mut owned = Vec::<u8>::with_capacity(*len);
-                // SAFETY: kernel mapped `*len` bytes at `*user_va` for
-                // this process; we copy through a raw pointer rather
-                // than synthesising an `&[u8]` so the producer's
-                // concurrent writes never alias a Rust reference.
+            BufferStorage::Shared(mapping) => {
+                let mut owned = Vec::<u8>::with_capacity(mapping.len);
+                // SAFETY: kernel mapped `mapping.len` bytes at
+                // `mapping.user_va` for this process; we copy through
+                // a raw pointer rather than synthesising an `&[u8]`
+                // so the producer's concurrent writes never alias a
+                // Rust reference.
                 unsafe {
-                    core::ptr::copy_nonoverlapping(*user_va as *const u8, owned.as_mut_ptr(), *len);
-                    owned.set_len(*len);
+                    core::ptr::copy_nonoverlapping(
+                        mapping.user_va as *const u8,
+                        owned.as_mut_ptr(),
+                        mapping.len,
+                    );
+                    owned.set_len(mapping.len);
                 }
                 owned
             }
@@ -186,8 +176,8 @@ impl BufferStorage {
     pub unsafe fn as_slice(&self) -> &[u8] {
         match self {
             BufferStorage::Owned(v) => v,
-            BufferStorage::Shared { user_va, len } => unsafe {
-                core::slice::from_raw_parts(*user_va as *const u8, *len)
+            BufferStorage::Shared(mapping) => unsafe {
+                core::slice::from_raw_parts(mapping.user_va as *const u8, mapping.len)
             },
         }
     }
@@ -263,6 +253,25 @@ struct ServerSurface {
     role: Option<SurfaceRole>,
     pending_buffer: Option<CommittedBuffer>,
     committed_buffer: Option<CommittedBuffer>,
+    /// Per-surface SHM mappings keyed by `BufferId`. Each entry is
+    /// a strong `Rc<SharedMapping>` the surface holds for as long
+    /// as the client keeps that `BufferId` alive on this surface.
+    /// `AttachSharedBuffer(surface_id, buffer_id, shm_id)` first
+    /// checks this map: if `buffer_id` is already mapped to the
+    /// same `shm_id`, the existing `Rc` is reused (no `sys_shm_map`
+    /// call); if `buffer_id` previously held a different `shm_id`,
+    /// the old `Rc` is replaced (drops the old mapping); if the
+    /// `buffer_id` is new, a fresh `sys_shm_map` populates it.
+    ///
+    /// This replaces the previous global byte-budget cache, which
+    /// thrashed at compositor scale: with 9+ terms × 2 buffers each
+    /// at 16 MiB per buffer the working set (~288 MiB) didn't fit
+    /// in any reasonable budget without pinning a quarter of system
+    /// RAM, and every cache miss became a per-frame `sys_shm_map`
+    /// (kernel-heap pressure → eventual OOM). Per-surface tracking
+    /// stays hot for the lifetime of the surface and drops cleanly
+    /// when the client destroys it.
+    buffer_mappings: BTreeMap<BufferId, Rc<SharedMapping>>,
     /// Set when a new buffer is committed and the composer hasn't yet
     /// re-blitted this surface. Cleared by [`SurfaceRegistry::mark_clean`]
     /// after each compose pass.
@@ -313,6 +322,19 @@ pub enum SurfaceShimError {
     /// protocol error.
     ShmMapFailed {
         shm_id: u32,
+        buffer_id: BufferId,
+    },
+    /// `AttachSharedBuffer` carried `width`/`height` whose
+    /// `width * height * 4` byte product overflows `usize` or exceeds
+    /// the compositor's per-surface dimension cap. Previously the byte
+    /// count was computed with `saturating_mul`, which silently produced
+    /// `usize::MAX` for absurd client inputs and then handed that length
+    /// to `from_raw_parts` / `Vec::with_capacity` over the SHM mapping
+    /// (potential UB / OOM). The dispatcher now rejects the attach
+    /// before any pointer math.
+    ShmDimensionsTooLarge {
+        width: u32,
+        height: u32,
         buffer_id: BufferId,
     },
 }
@@ -521,6 +543,7 @@ impl SurfaceRegistry {
                         role: None,
                         pending_buffer: None,
                         committed_buffer: None,
+                        buffer_mappings: BTreeMap::new(),
                         dirty: false,
                         client_token: *client_token,
                     },
@@ -567,48 +590,111 @@ impl SurfaceRegistry {
                 width,
                 height,
             } => {
-                // Map the SHM region into our address space. The
-                // mapping survives until the resulting `CommittedBuffer`
-                // is dropped (Drop calls `sys_shm_unmap`); the kernel
-                // refcount keeps the underlying frames alive even if
-                // the client exits before the surface is torn down.
-                let user_va = syscall_lib::shm_map(*shm_id);
-                if user_va == 0 {
-                    // Phase 57d follow-up — log the failure so the
-                    // intermittent boot-1 "no terminal" symptom (where
-                    // display_server silently drops AttachSharedBuffer
-                    // and the surface never gets pixels) produces a
-                    // visible signal in the boot transcript.
-                    syscall_lib::write_str(
-                        syscall_lib::STDOUT_FILENO,
-                        "display_server: AttachSharedBuffer shm_map failed shm_id=",
-                    );
-                    write_u32_log(*shm_id);
-                    syscall_lib::write_str(syscall_lib::STDOUT_FILENO, "\n");
-                    return Err(SurfaceShimError::ShmMapFailed {
-                        shm_id: *shm_id,
+                // Per-surface buffer cache: the client identifies its
+                // own backing storage with a stable `BufferId`. Look up
+                // the surface's current mapping for that id and reuse
+                // it iff the shm_id still matches — that's the
+                // double-buffer ping-pong case where the same two
+                // `buffer_id`s carry the same two `shm_id`s for the
+                // lifetime of the surface. A shm_id mismatch means
+                // the client reallocated (e.g. SurfaceResized → fresh
+                // SHMs); replace the old mapping (Rc drop fires
+                // `sys_shm_unmap`) and map the new one. A truly new
+                // buffer_id (first attach for that slot) falls through
+                // to a single `sys_shm_map`.
+                //
+                // No global cache, no byte budget, no eviction. The
+                // working set is the union of every live surface's
+                // mappings, bounded by client behaviour rather than by
+                // a knob in the compositor.
+                // Compute the SHM byte count with checked arithmetic.
+                // Previously this was `saturating_mul`, which silently
+                // produced `usize::MAX` for absurd client-supplied
+                // `width`/`height` and then handed that length to
+                // `from_raw_parts` / `Vec::with_capacity` over the
+                // mapping (potential UB / OOM). Reject overflow and
+                // out-of-cap dimensions before any pointer math. The
+                // dimension cap is generous — 16384 in each axis
+                // covers every realistic display plus headroom — and
+                // exists strictly to keep the `width * height * 4`
+                // product well inside `usize`.
+                const MAX_SURFACE_DIMENSION: u32 = 16_384;
+                if *width > MAX_SURFACE_DIMENSION || *height > MAX_SURFACE_DIMENSION {
+                    return Err(SurfaceShimError::ShmDimensionsTooLarge {
+                        width: *width,
+                        height: *height,
                         buffer_id: *buffer_id,
                     });
                 }
-                syscall_lib::write_str(
-                    syscall_lib::STDOUT_FILENO,
-                    "display_server: AttachSharedBuffer ok shm_id=",
-                );
-                write_u32_log(*shm_id);
-                syscall_lib::write_str(syscall_lib::STDOUT_FILENO, " va=");
-                write_u64_log(user_va);
-                syscall_lib::write_str(syscall_lib::STDOUT_FILENO, "\n");
-                let byte_count = (*width as usize)
-                    .saturating_mul(*height as usize)
-                    .saturating_mul(4);
+                let byte_count = match (*width as usize)
+                    .checked_mul(*height as usize)
+                    .and_then(|wh| wh.checked_mul(4))
+                {
+                    Some(n) => n,
+                    None => {
+                        return Err(SurfaceShimError::ShmDimensionsTooLarge {
+                            width: *width,
+                            height: *height,
+                            buffer_id: *buffer_id,
+                        });
+                    }
+                };
+                let mapping = {
+                    // Inspect the surface's existing entry first.
+                    let existing = self
+                        .surfaces
+                        .get(surface_id)
+                        .and_then(|s| s.buffer_mappings.get(buffer_id))
+                        .cloned();
+                    match existing {
+                        Some(rc) if rc.shm_id == *shm_id => rc,
+                        _ => {
+                            let user_va = syscall_lib::shm_map(*shm_id);
+                            if user_va == 0 {
+                                // Phase 57d follow-up — log the failure so the
+                                // intermittent boot-1 "no terminal" symptom (where
+                                // display_server silently drops AttachSharedBuffer
+                                // and the surface never gets pixels) produces a
+                                // visible signal in the boot transcript.
+                                syscall_lib::write_str(
+                                    syscall_lib::STDOUT_FILENO,
+                                    "display_server: AttachSharedBuffer shm_map failed shm_id=",
+                                );
+                                write_u32_log(*shm_id);
+                                syscall_lib::write_str(syscall_lib::STDOUT_FILENO, "\n");
+                                return Err(SurfaceShimError::ShmMapFailed {
+                                    shm_id: *shm_id,
+                                    buffer_id: *buffer_id,
+                                });
+                            }
+                            syscall_lib::write_str(
+                                syscall_lib::STDOUT_FILENO,
+                                "display_server: AttachSharedBuffer mapped shm_id=",
+                            );
+                            write_u32_log(*shm_id);
+                            syscall_lib::write_str(syscall_lib::STDOUT_FILENO, " va=");
+                            write_u64_log(user_va);
+                            syscall_lib::write_str(syscall_lib::STDOUT_FILENO, "\n");
+                            Rc::new(SharedMapping {
+                                shm_id: *shm_id,
+                                user_va,
+                                len: byte_count,
+                            })
+                        }
+                    }
+                };
+                // Update the surface's per-buffer slot. If a previous
+                // Rc for this `buffer_id` existed with a different
+                // shm_id, the insert drops it here — `sys_shm_unmap`
+                // fires when the surface was the last holder.
+                if let Some(s) = self.surfaces.get_mut(surface_id) {
+                    s.buffer_mappings.insert(*buffer_id, mapping.clone());
+                }
                 let buf = CommittedBuffer {
                     buffer_id: *buffer_id,
                     width: *width,
                     height: *height,
-                    pixels: BufferStorage::Shared {
-                        user_va,
-                        len: byte_count,
-                    },
+                    pixels: BufferStorage::Shared(mapping),
                 };
                 self.apply_event(
                     *surface_id,
@@ -920,6 +1006,7 @@ impl SurfaceRegistry {
                 layer: role_layer,
                 rect,
                 buf,
+                dirty: surface.dirty,
             });
         }
         // Stable order: by layer ascending (composer requires this),
@@ -958,13 +1045,9 @@ impl SurfaceRegistry {
     /// The surface (if any) currently holding the global exclusive-
     /// keyboard claim. The D.3 input dispatcher consults this to gate
     /// `KeyboardInteractivity` routing so an exclusive layer always
-    /// wins focus while mapped.
-    ///
-    /// `#[allow(dead_code)]` because D.3's `CompositorState`
-    /// `active_exclusive_layer` field that consumes this getter has not
-    /// yet merged into the integration branch. Once D.3 plumbs through,
-    /// the allow can drop.
-    #[allow(dead_code)]
+    /// wins focus while mapped. Phase 73 — wired through the main
+    /// loop's `drain_one_pass` call so the lockscreen actually
+    /// receives keystrokes.
     pub fn active_exclusive_layer(&self) -> Option<SurfaceId> {
         self.layer_conflicts.active()
     }
@@ -978,6 +1061,13 @@ pub struct ComposeEntry<'a> {
     pub layer: ComposeLayer,
     pub rect: Rect,
     pub buf: &'a CommittedBuffer,
+    /// Phase 73 follow-up — `true` iff this surface committed a new
+    /// buffer since the last [`SurfaceRegistry::mark_clean`] call.
+    /// Used by the compositor's buffer-age damage tracker so the
+    /// VBE flip backend's `prev_frame_damage` only includes surfaces
+    /// that actually changed (instead of conservatively marking every
+    /// Toplevel tile dirty every general-path frame).
+    pub dirty: bool,
 }
 
 impl<'a> ComposeEntry<'a> {

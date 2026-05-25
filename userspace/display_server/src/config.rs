@@ -25,6 +25,7 @@ use kernel_core::input::keymap::{
 use layout::{GapConfig, PolicyKind};
 
 use crate::borders::BorderConfig;
+use crate::decoration::DecorationConfig;
 use crate::keybind::KeybindAction;
 use crate::workspace::NUM_WORKSPACES;
 
@@ -37,9 +38,14 @@ pub const CONFIG_PATH: &str = "/etc/compositor.conf";
 pub struct CompositorConfig {
     pub gaps: GapConfig,
     pub borders: BorderConfig,
+    pub decorations: DecorationConfig,
     pub keybinds: KeybindConfig,
     pub workspaces: WorkspaceConfig,
     pub autostart: AutostartConfig,
+    // `[wallpaper]` is owned by the `userspace/wallpaper` client; the
+    // compositor only needs to recognise the section header so it does
+    // not emit an `UnknownSection` warning on every parse. See
+    // `Section::Wallpaper` below.
 }
 
 impl Default for CompositorConfig {
@@ -55,6 +61,7 @@ impl CompositorConfig {
         Self {
             gaps: GapConfig::new(8, 8),
             borders: BorderConfig::defaults(),
+            decorations: DecorationConfig::defaults(),
             keybinds: KeybindConfig::defaults(),
             workspaces: WorkspaceConfig::defaults(),
             autostart: AutostartConfig::defaults(),
@@ -90,9 +97,11 @@ impl CompositorConfig {
                 section = match name.trim() {
                     "gaps" => Section::Gaps,
                     "borders" => Section::Borders,
+                    "decorations" => Section::Decorations,
                     "keybinds" => Section::Keybinds,
                     "workspaces" => Section::Workspaces,
                     "autostart" => Section::Autostart,
+                    "wallpaper" => Section::Wallpaper,
                     other => {
                         warnings.push(ConfigWarning::UnknownSection {
                             name: other.to_string(),
@@ -113,9 +122,16 @@ impl CompositorConfig {
                 Section::Top | Section::Unknown => Ok(()),
                 Section::Gaps => apply_gap_key(&mut cfg.gaps, k, v, lineno + 1),
                 Section::Borders => apply_border_key(&mut cfg.borders, k, v, lineno + 1),
+                Section::Decorations => {
+                    apply_decoration_key(&mut cfg.decorations, k, v, lineno + 1)
+                }
                 Section::Keybinds => apply_keybind_key(&mut cfg.keybinds, k, v, lineno + 1),
                 Section::Workspaces => apply_workspace_key(&mut cfg.workspaces, k, v, lineno + 1),
                 Section::Autostart => apply_autostart_key(&mut cfg.autostart, k, v, lineno + 1),
+                // `[wallpaper]` keys are validated by the wallpaper
+                // client's own parser; skip them silently here so the
+                // section is not flagged as unknown.
+                Section::Wallpaper => Ok(()),
             };
             match apply_result {
                 Ok(()) => {}
@@ -134,9 +150,11 @@ enum Section {
     Top,
     Gaps,
     Borders,
+    Decorations,
     Keybinds,
     Workspaces,
     Autostart,
+    Wallpaper,
     /// An unrecognized section header. Subsequent `key = value` lines
     /// are still syntax-checked but the values are discarded, mirroring
     /// the `UnknownSection` warning at the section header.
@@ -522,6 +540,42 @@ fn apply_autostart_key(
             line,
         }),
     }
+}
+
+fn parse_u32(key: &str, value: &str, line: usize) -> Result<u32, ConfigError> {
+    value.parse::<u32>().map_err(|_| ConfigError::BadValue {
+        key: key.to_string(),
+        line,
+    })
+}
+
+fn parse_i32(key: &str, value: &str, line: usize) -> Result<i32, ConfigError> {
+    value.parse::<i32>().map_err(|_| ConfigError::BadValue {
+        key: key.to_string(),
+        line,
+    })
+}
+
+fn apply_decoration_key(
+    cfg: &mut DecorationConfig,
+    key: &str,
+    value: &str,
+    line: usize,
+) -> Result<(), ConfigError> {
+    match key {
+        "corner_radius" => cfg.corner_radius = parse_u32(key, value, line)?,
+        "shadow_blur" | "shadow_radius" => cfg.shadow_blur = parse_u32(key, value, line)?,
+        "shadow_offset_x" => cfg.shadow_offset_x = parse_i32(key, value, line)?,
+        "shadow_offset_y" => cfg.shadow_offset_y = parse_i32(key, value, line)?,
+        "shadow_color" => cfg.shadow_color = parse_color(key, value, line)?,
+        _ => {
+            return Err(ConfigError::UnknownKey {
+                key: key.to_string(),
+                line,
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

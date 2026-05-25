@@ -89,6 +89,18 @@ pub struct ComposeContext {
     /// once per cursor old/new bounding box; `union_rect` is the
     /// blit clip rectangle.
     damage_tracker: DamageTracker,
+    /// Phase 73 follow-up — buffer-age damage history.
+    ///
+    /// Snapshots the previous frame's damage rectangles so the flip
+    /// backend (where the about-to-be-written half last held *frame
+    /// N-2*'s content) can compute the correct repaint region as
+    /// `damage(N) ∪ damage(N-1)` — the buffer-age technique standard
+    /// double-buffered Wayland / X compositors apply via
+    /// `EGL_EXT_buffer_age`. Inert in memcpy mode (the back buffer is
+    /// a true mirror of the front there, so no historical union is
+    /// needed). Saved at the end of every compose pass before
+    /// `damage_tracker.reset()` clears the live tracker.
+    prev_frame_damage: Vec<Rect>,
 }
 
 impl ComposeContext {
@@ -102,6 +114,7 @@ impl ComposeContext {
             cached_toplevel_ids: Vec::new(),
             cached_arrangement: Vec::new(),
             damage_tracker: DamageTracker::new(),
+            prev_frame_damage: Vec::new(),
         }
     }
 
@@ -111,21 +124,41 @@ impl ComposeContext {
         &self.damage_tracker
     }
 
-    /// Phase 72b — request a full-screen repaint on the next compose
-    /// pass. Called from the surface-lifecycle path in `main.rs` when
-    /// a Toplevel surface is destroyed, so stale pixels left in the
-    /// framebuffer by the dying surface (or by greeter on logout) get
-    /// cleared instead of bleeding through the gaps between live
-    /// tiles. `run_compose_filtered`'s first-compose branch already
-    /// understands `mark_full_repaint` — flipping it once here is
-    /// enough; the next pass clears the whole output and re-blits
-    /// every live surface.
+    /// Request that every mapped surface re-blit its full rect on the
+    /// next compose pass. Used by callers (animation engine, focus
+    /// change, set-layout, ...) where surfaces stay in place but the
+    /// frame's visual state needs to recompute — e.g. an in-flight
+    /// animation that updates each tick, or a border colour change
+    /// after a focus transition.
+    ///
+    /// Critically, this method does **not** trigger
+    /// `is_first_compose` and therefore does **not** drop a
+    /// full-output `clear_rect_to_background` before the surface pass.
+    /// Direct-to-FB rendering with no double buffer means a clear
+    /// followed by a 5+ ms surface blit can be latched mid-sequence by
+    /// vsync, flashing the background colour to the user. Callers
+    /// that genuinely need to wipe stale pixels — surface destroy,
+    /// workspace switch with a different surface set, tile shrink
+    /// exposing previously-covered area — should call
+    /// [`force_full_repaint_clearing_background`] instead.
     pub fn force_full_repaint(&mut self) {
         self.damage_tracker.mark_full_repaint();
-        // Resetting `prev_pointer`/`prev_cursor_size` to `None` also
-        // triggers `is_first_compose` in `run_compose_filtered`, which
-        // re-runs `clear_rect_to_background(output)` on the whole FB
-        // before the surface pass. Belt-and-suspenders.
+    }
+
+    /// Like [`force_full_repaint`], but additionally triggers a full
+    /// `clear_rect_to_background(output)` before the surface pass so
+    /// pixels from now-vacated regions (a destroyed surface, a
+    /// shrunken tile's old extent, a workspace switch's outgoing
+    /// surface set) are wiped.
+    ///
+    /// With the [`KernelFramebufferOwner`] back-buffer in place the
+    /// clear + surface blits land in the back buffer first and only
+    /// reach the visible framebuffer at the next `present()` — so the
+    /// intermediate cleared-but-not-yet-painted state is never
+    /// observable. Without double buffering this path used to flash
+    /// the background colour for one or two refreshes.
+    pub fn force_full_repaint_clearing_background(&mut self) {
+        self.damage_tracker.mark_full_repaint();
         self.prev_pointer = None;
         self.prev_cursor_size = None;
     }
@@ -181,6 +214,7 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
         |_| true,
         None,
         None,
+        None,
     )
 }
 
@@ -190,7 +224,10 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
 /// workspace's Toplevels are blitted. `border_cfg`, when `Some`,
 /// paints active / inactive borders around every Toplevel rect after
 /// the surface blit completes. `focused_id` selects which border uses
-/// the active colour.
+/// the active colour. `animations`, when `Some`, supplies per-surface
+/// transforms (window-open scale-up, window-move slide, ...) the
+/// compose pass applies to the natural tile rect before snapshotting
+/// and blitting.
 #[allow(clippy::too_many_arguments)]
 pub fn run_compose_filtered<O, L, F>(
     owner: &mut O,
@@ -201,6 +238,7 @@ pub fn run_compose_filtered<O, L, F>(
     include_toplevel: F,
     border_cfg: Option<crate::borders::BorderConfig>,
     focused_id: Option<SurfaceId>,
+    animations: Option<&crate::animation::AnimationEngine>,
 ) -> Result<usize, ComposeError>
 where
     O: FramebufferOwner,
@@ -264,6 +302,13 @@ where
     // Wiring the tracker into the general-path clip decision is a
     // documented Phase 68 follow-up.
     let surface_damage = registry.has_damage();
+    // Phase 73 follow-up — buffer-age awareness for the flip backend.
+    // When `true`, the about-to-be-written back half is two frames
+    // stale; the cursor-trail clear and the cursor-only fast path
+    // must extend their per-frame region with the *previous* frame's
+    // damage so the post-flip visible buffer matches the current
+    // frame's content rather than frame N-2's.
+    let needs_buffer_age = owner.needs_full_repaint_per_frame();
     // Phase 72b — bypass the no-op gate when a full repaint was
     // requested via `ComposeContext::force_full_repaint`. The gate
     // existed before per-surface clip rects: the old assumption was
@@ -388,6 +433,15 @@ where
         for rect in damage {
             clear_rect_to_background(owner, rect)?;
         }
+        // Phase 73 follow-up — in flip mode, also wipe the previous
+        // frame's damage rects to background so the upcoming per-
+        // surface re-blits cover any stale pixels the back half
+        // inherited from frame N-2.
+        if needs_buffer_age {
+            for rect in ctx.prev_frame_damage.iter() {
+                clear_rect_to_background(owner, *rect)?;
+            }
+        }
     }
 
     if entries.is_empty() && !cursor_motion {
@@ -431,7 +485,16 @@ where
         let prev_size = ctx.prev_cursor_size.expect(
             "cursor fast path: prev_cursor_size set whenever cursor_motion && !is_first_compose",
         );
-        let cursor_repaint = cursor_damage(prev_pos, prev_size, pointer_position, cursor_size);
+        let mut cursor_repaint = cursor_damage(prev_pos, prev_size, pointer_position, cursor_size);
+        // Phase 73 follow-up — fold the previous frame's damage
+        // rects into the cursor-only repaint region when the backend
+        // is two frames stale (`needs_full_repaint_per_frame() ==
+        // true`, i.e. the VBE Y_OFFSET flip backend). Without this
+        // union the post-flip visible half would show frame N-2's
+        // pixels in any region the cursor union does not cover.
+        if needs_buffer_age {
+            cursor_repaint.extend_from_slice(&ctx.prev_frame_damage);
+        }
 
         // Per-surface damage = cursor union translated into surface-
         // local coordinates. `compose_frame` clips each local rect
@@ -452,7 +515,11 @@ where
         let mut scaled_flags: Vec<bool> = Vec::with_capacity(entries.len());
         for entry in entries.iter() {
             let original = entry.buf.pixels_snapshot();
-            let tile = tile_for_entry(entry, arrangement);
+            let (tile, anim_forced) = animated_tile_for_entry(entry, arrangement, animations);
+            // See the general path below for the full rationale on
+            // the should_scale predicate. Same rule: scale to fill
+            // when an animation forces a transformed rect; else only
+            // when the buffer is strictly larger than the tile.
             let should_scale = match tile {
                 Some(t) => {
                     matches!(
@@ -462,7 +529,8 @@ where
                         && entry.buf.height > 0
                         && t.w > 0
                         && t.h > 0
-                        && (entry.buf.width != t.w || entry.buf.height != t.h)
+                        && ((anim_forced && (entry.buf.width != t.w || entry.buf.height != t.h))
+                            || (!anim_forced && (entry.buf.width > t.w || entry.buf.height > t.h)))
                 }
                 None => false,
             };
@@ -486,7 +554,24 @@ where
                 scaled_flags.push(true);
             } else {
                 snapshots.push(original);
-                let surface_rect = surface_screen_rect(entry, arrangement);
+                // Animations that didn't trigger should_scale produce
+                // a translate-only effect: keep the buffer dims,
+                // shift the rect by the animation's offset.
+                let surface_rect = match tile {
+                    Some(t) if anim_forced => {
+                        let surf_w = entry.buf.width;
+                        let surf_h = entry.buf.height;
+                        let dx = (t.w as i32 - surf_w as i32) / 2;
+                        let dy = (t.h as i32 - surf_h as i32) / 2;
+                        Rect {
+                            x: t.x.saturating_add(dx),
+                            y: t.y.saturating_add(dy),
+                            w: surf_w,
+                            h: surf_h,
+                        }
+                    }
+                    _ => surface_screen_rect(entry, arrangement),
+                };
                 let local: Vec<Rect> = cursor_repaint
                     .iter()
                     .filter_map(|sr| {
@@ -526,7 +611,41 @@ where
             });
         }
 
-        let surface_writes = compose_frame(owner, output, &mut compose)?;
+        let mut surface_writes = compose_frame(owner, output, &mut compose)?;
+
+        // Repaint Toplevel borders. The cursor-trail clear above
+        // wiped the underlying pixels with the background colour
+        // wherever the cursor passed; if its trail crossed a tile
+        // border, that border is now missing on the back buffer and
+        // would visibly flicker on every cursor move. Borders are
+        // 4 thin strips per Toplevel, so repainting them on every
+        // cursor frame is cheap relative to the surface-blit pass
+        // we're already doing.
+        if let Some(cfg) = border_cfg
+            && cfg.width > 0
+        {
+            for entry in entries.iter().filter(|e| {
+                matches!(
+                    e.layer,
+                    kernel_core::display::compose::ComposeLayer::Toplevel
+                )
+            }) {
+                let rect = arrangement
+                    .iter()
+                    .find(|(id, _)| *id == entry.id)
+                    .map(|(_, tile)| *tile)
+                    .unwrap_or(entry.rect);
+                let color = if focused_id == Some(entry.id) {
+                    cfg.active_color
+                } else {
+                    cfg.inactive_color
+                };
+                let written = crate::borders::paint_border(owner, rect, cfg.width, color)
+                    .map_err(ComposeError::from)?;
+                surface_writes = surface_writes.saturating_add(written);
+            }
+        }
+
         let cursor_writes =
             blit_cursor(owner, output, cursor, pointer_position).map_err(ComposeError::from)?;
         if surface_writes + cursor_writes > 0 {
@@ -534,9 +653,10 @@ where
         }
         ctx.prev_pointer = Some(pointer_position);
         ctx.prev_cursor_size = Some(cursor_size);
-        // Keep the damage tracker observable to tests but clear it
-        // so the next frame starts empty.
-        ctx.damage_tracker.reset();
+        // Phase 73 follow-up — snapshot the frame's actual damage
+        // rects so the next compose pass can do buffer-age union when
+        // the flip backend is active. Reset the live tracker after.
+        snapshot_damage(ctx);
         return Ok(surface_writes + cursor_writes);
     }
 
@@ -558,14 +678,27 @@ where
         })
         .collect();
 
-    // Phase 68 Track B — feed each mapped surface's screen rect into
-    // the tracker so the union covers everything the compose pass
-    // will touch. `union_rect()` is observable from outside this
-    // function via [`ComposeContext::damage_tracker`] for tests and
-    // debug dumps; the cursor-only fast path above already returned
-    // by this point.
+    // Phase 73 follow-up — feed each *dirty* surface's screen rect
+    // into the tracker. Previously every entry's rect was marked
+    // unconditionally, which made `prev_frame_damage` (the
+    // buffer-age history) conservatively cover every Toplevel tile
+    // — the next cursor-only frame in flip mode then had to repaint
+    // every tile even when only one surface actually changed. With
+    // the per-entry dirty bit threaded through from
+    // [`SurfaceRegistry::iter_compose_filtered`] we mark only the
+    // surfaces that committed new pixels this frame, so a term
+    // update keeps every other tile in the cheap cursor-only
+    // steady state.
+    //
+    // `force_full` short-circuits the filter — a workspace switch
+    // or first compose explicitly demands that every tile be
+    // repaintable next frame, so we mark every entry regardless of
+    // its commit state (the dirty bit is also stale for the
+    // first-compose case because no commit has cleared it yet).
     for entry in entries.iter() {
-        ctx.damage_tracker.mark_dirty(entry.rect);
+        if entry.dirty || force_full {
+            ctx.damage_tracker.mark_dirty(entry.rect);
+        }
     }
 
     // Snapshot the current pixel contents of every compose entry into
@@ -615,7 +748,13 @@ where
     let mut scaled_flags: Vec<bool> = Vec::with_capacity(entries.len());
     for entry in entries.iter() {
         let original = entry.buf.pixels_snapshot();
-        let tile = tile_for_entry(entry, arrangement);
+        let (tile, anim_forced) = animated_tile_for_entry(entry, arrangement, animations);
+        // Phase 73 — only scale when the surface is **strictly
+        // larger** than the assigned tile, i.e. when letterboxing
+        // would visibly clip content. Animation transforms override
+        // this — when an animation provides a transformed rect
+        // (scale-up on window open, slide on window move) we always
+        // scale to fill the animated rect.
         let should_scale = match tile {
             Some(t) => {
                 matches!(
@@ -625,7 +764,8 @@ where
                     && entry.buf.height > 0
                     && t.w > 0
                     && t.h > 0
-                    && (entry.buf.width != t.w || entry.buf.height != t.h)
+                    && ((anim_forced && (entry.buf.width != t.w || entry.buf.height != t.h))
+                        || (!anim_forced && (entry.buf.width > t.w || entry.buf.height > t.h)))
             }
             None => false,
         };
@@ -648,9 +788,30 @@ where
             effective_rects.push(tile);
             scaled_flags.push(true);
         } else {
+            // Non-scaled path: surface drawn at its natural size,
+            // letterboxed inside whichever rect the animation produced
+            // (or the tile from the workspace arrangement).
+            let surface_rect = match tile {
+                Some(t) if anim_forced => {
+                    // Animation requested a translate without a
+                    // scale change (rect dims match buffer); centre
+                    // the surface inside the animated rect.
+                    let surf_w = entry.buf.width;
+                    let surf_h = entry.buf.height;
+                    let dx = (t.w as i32 - surf_w as i32) / 2;
+                    let dy = (t.h as i32 - surf_h as i32) / 2;
+                    Rect {
+                        x: t.x.saturating_add(dx),
+                        y: t.y.saturating_add(dy),
+                        w: surf_w,
+                        h: surf_h,
+                    }
+                }
+                _ => surface_screen_rect(entry, arrangement),
+            };
             snapshots.push(original);
             scaled_damages.push(Vec::new());
-            effective_rects.push(surface_screen_rect(entry, arrangement));
+            effective_rects.push(surface_rect);
             scaled_flags.push(false);
         }
     }
@@ -667,8 +828,22 @@ where
         // because the surface IS the tile, no overflow to clip.
         // For non-scaled surfaces, take the existing letterbox-and-
         // clip path so a too-large buffer stays bounded by the tile.
+        // While an animation is forcing a transformed rect we drop
+        // the tile clip so the surface can extend outside its
+        // arrangement-assigned tile (move animations lerp the rect
+        // through positions that may partially leave the natural
+        // tile).
+        let anim_forced_idx = matches!(
+            animations.and_then(|eng| {
+                tile_for_entry(entry, arrangement)
+                    .and_then(|nat| eng.effective_transform(entry.id, nat))
+            }),
+            Some(_)
+        );
         let (damage_slice, clip_rect): (&[Rect], Option<Rect>) = if scaled_flags[idx] {
             (scaled_damages[idx].as_slice(), None)
+        } else if anim_forced_idx {
+            (&dmg[..], None)
         } else {
             (&dmg[..], surface_tile_clip(entry, arrangement))
         };
@@ -741,19 +916,20 @@ where
 
     // Phase 56 E.3 — blit the cursor on top.
     //
-    // Rationale: `compose_frame` already presented the surfaces.
-    // We sample the cursor pixel-by-pixel and write directly to the
-    // framebuffer, then call `present()` again. (The kernel
-    // framebuffer's `present` is currently a no-op default impl, so
-    // the duplicate is free; future hardware paths that swap on
-    // present will need to be careful here.)
+    // Phase 73 follow-up: `present()` no longer fires inside
+    // `compose_frame`, so this is the single visible update for the
+    // whole frame — surfaces, borders, and the cursor all land in the
+    // back buffer first and reach the screen together. Workspace
+    // transitions don't need a separate blit pass anymore: the
+    // adapter's offset arrangement makes them just another rect in
+    // the surface-blit loop above.
     let cursor: &dyn CursorRenderer = match &client_cursor_clone {
         Some(cc) => cc,
         None => &default,
     };
     let cursor_writes =
         blit_cursor(owner, output, cursor, pointer_position).map_err(ComposeError::from)?;
-    if cursor_writes > 0 {
+    if surface_writes + cursor_writes > 0 {
         owner.present().map_err(ComposeError::from)?;
     }
 
@@ -763,10 +939,34 @@ where
 
     // Phase 68 Track B — clear the damage tracker now that the
     // compose pass has consumed everything. The next frame starts
-    // empty; cursor motion / surface commits repopulate it.
-    ctx.damage_tracker.reset();
+    // empty; cursor motion / surface commits repopulate it. Phase 73
+    // follow-up — but first capture this frame's rects into
+    // `prev_frame_damage` so the next compose pass can do
+    // buffer-age union when the flip backend is active.
+    snapshot_damage(ctx);
 
     Ok(surface_writes + cursor_writes)
+}
+
+/// Copy this frame's [`DamageTracker`] rects into
+/// [`ComposeContext::prev_frame_damage`] and reset the live tracker
+/// for the next pass. Centralised so both compose paths (cursor-only
+/// fast path and general path) feed the same buffer-age history. A
+/// full-repaint marker is stored as the whole `output` rect so the
+/// next frame still over-paints every previously-stale pixel rather
+/// than skipping the union as "no prior damage".
+fn snapshot_damage(ctx: &mut ComposeContext) {
+    ctx.prev_frame_damage.clear();
+    if ctx.damage_tracker.is_full_repaint_needed() {
+        if let Some(union) = ctx.damage_tracker.union_rect() {
+            ctx.prev_frame_damage.push(union);
+        }
+    } else {
+        for rect in ctx.damage_tracker.rects() {
+            ctx.prev_frame_damage.push(*rect);
+        }
+    }
+    ctx.damage_tracker.reset();
 }
 
 /// Resolve a `ComposeEntry`'s screen-space rect, honouring the layout
@@ -821,6 +1021,30 @@ fn tile_for_entry(
         .iter()
         .find(|(id, _)| *id == entry.id)
         .map(|(_, tile)| *tile)
+}
+
+/// Resolve the destination rect a Toplevel should be drawn into this
+/// frame, taking any active animation into account. Returns
+/// `(rect, force_scale)` where `force_scale = true` indicates the
+/// animation is requesting a non-identity transform, so the compose
+/// pass must use the nearest-neighbour-scale path even if the buffer
+/// and rect happen to share the same dimensions. Non-Toplevel
+/// surfaces and Toplevels with no active animation produce
+/// `(natural_tile, false)`.
+fn animated_tile_for_entry(
+    entry: &crate::surface::ComposeEntry<'_>,
+    arrangement: &[(SurfaceId, Rect)],
+    animations: Option<&crate::animation::AnimationEngine>,
+) -> (Option<Rect>, bool) {
+    let natural = tile_for_entry(entry, arrangement);
+    let animated = match (animations, natural) {
+        (Some(eng), Some(nat)) => eng.effective_transform(entry.id, nat).map(|t| t.rect),
+        _ => None,
+    };
+    match animated {
+        Some(rect) => (Some(rect), true),
+        None => (natural, false),
+    }
 }
 
 /// Phase 72b — nearest-neighbour scale a BGRA8888 source buffer of
@@ -1129,7 +1353,14 @@ pub fn fill_background<O: FramebufferOwner>(owner: &mut O) -> Result<(), FbError
             w: meta.width,
             h: meta.height,
         },
-    )
+    )?;
+    // Phase 73 — double-buffered backend keeps `write_pixels` in the
+    // back buffer; the visible framebuffer only updates on `present()`.
+    // Call it here so callers that fill_background without immediately
+    // running a compose pass (the boot wipe before the first compose
+    // tick, the post-FB-reclaim wipe before the compositor resumes)
+    // still flush the new background to the screen.
+    owner.present()
 }
 
 /// Construct the default Phase 56 layout policy. Re-exported as a named

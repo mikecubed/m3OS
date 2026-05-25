@@ -125,7 +125,29 @@ mod os_binary {
         match parsed {
             ParsedVerb::Display(cmd) => dispatch_display(cmd),
             ParsedVerb::Session(verb) => dispatch_session(verb),
+            ParsedVerb::LockScreen => dispatch_lock(),
         }
+    }
+
+    /// Phase 73 — spawn `/bin/lockscreen` directly. We don't extend
+    /// the wire protocol with a `Lock` verb because the lockscreen is
+    /// a regular compositor client; the compositor handles the
+    /// exclusive-keyboard grant via `LayerConfig::keyboard_interactivity`.
+    fn dispatch_lock() -> i32 {
+        let pid = syscall_lib::fork();
+        if pid < 0 {
+            print_str("m3ctl: fork failed\n");
+            return 1;
+        }
+        if pid == 0 {
+            let path = b"/bin/lockscreen\0";
+            let argv: [*const u8; 2] = [path.as_ptr(), core::ptr::null()];
+            let envp: [*const u8; 1] = [core::ptr::null()];
+            let _ = syscall_lib::execve(path, &argv, &envp);
+            print_str("m3ctl: execve lockscreen failed\n");
+            syscall_lib::exit(127);
+        }
+        0
     }
 
     fn parse_error_label(err: &ParseError) -> &str {

@@ -1514,6 +1514,14 @@ mod syscall_nr {
     /// Used by display_server's compose-log line during the held-key
     /// cursor-freeze investigation. Strip once root-caused.
     pub const PS2_DIAG_COUNTER: u64 = 0x101E;
+    /// Phase 73 follow-up: page-flip the hardware framebuffer to
+    /// `y_offset` rows (arg0). Only `0` and `framebuffer.back_y_offset`
+    /// are accepted; any other value returns `NEG_EINVAL`. Requires
+    /// that VBE double-buffering was enabled at boot (the kernel
+    /// returns `NEG_ENOSYS` otherwise so userspace can fall back to
+    /// the memcpy path). The caller must currently own the framebuffer
+    /// (`NEG_EPERM` if not). Returns `0` on success.
+    pub const FRAMEBUFFER_PAGEFLIP: u64 = 0x101F;
 
     // -- ipc --
     pub const IPC_BASE: u64 = 0x1100;
@@ -1933,6 +1941,7 @@ pub extern "C" fn syscall_handler(
         FRAMEBUFFER_RELEASE => sys_framebuffer_release(),
         FB_YIELD => sys_fb_yield(),
         FB_REACQUIRE => sys_fb_reacquire(),
+        FRAMEBUFFER_PAGEFLIP => sys_framebuffer_pageflip(arg0),
         PS2_DIAG_COUNTER => sys_ps2_diag_counter(arg0),
         READ_MOUSE_PACKET => sys_read_mouse_packet(arg0, arg1),
         FRAME_TICK_HZ => sys_frame_tick_hz(),
@@ -2511,6 +2520,17 @@ fn do_full_process_exit(pid: crate::process::Pid, code: i32) -> ! {
     // return) completes while the address space is still around for any
     // per-BAR cleanup we might need later.
     crate::syscall::device_host::release_claims_for_pid(pid);
+
+    // Clear this PID's slot in the SHM per-process byte budget. The
+    // SHM regions themselves stay alive while other mappers reference
+    // them; the budget just stops tracking them against the (now
+    // dead) creator. Without this, if the kernel ever reuses pid N
+    // after a creator exited holding live SHMs, the new pid N would
+    // start with a non-zero budget — and could be falsely capped.
+    // The leftover entries' final decrefs are no-ops via
+    // `release_bytes`'s saturating subtract against the absent map
+    // entry.
+    crate::mm::shm::release_creator(pid);
 
     // Phase 69d follow-up: drop every flock entry this PID still holds
     // BEFORE closing fds.  close_all_fds_for() calls
@@ -10302,7 +10322,47 @@ pub(super) fn sys_shm_create(byte_len: u64) -> u64 {
     if byte_len == 0 {
         return u64::MAX;
     }
-    match crate::mm::shm::create(byte_len as usize) {
+    let pid = crate::process::current_pid();
+    let result = crate::mm::shm::create(byte_len as usize, pid);
+    // Always log the create with the post-create buddy state. This
+    // is the diagnostic seam the leak hunts need: walking the boot
+    // transcript pairs every shm_create with the resulting free-page
+    // count so we see exactly when the buddy starts running out and
+    // which creates consumed the headroom.
+    let (free, total) = crate::mm::frame_allocator::free_frame_count();
+    match &result {
+        Ok((id, _, page_count)) => {
+            log::info!(
+                "[shm] create ok pid={} byte_len={} pages={} id={} buddy={}/{}",
+                pid,
+                byte_len,
+                page_count,
+                id.0,
+                free,
+                total
+            );
+        }
+        Err(crate::mm::shm::ShmError::ProcessCapExceeded) => {
+            log::warn!(
+                "[shm] create: per-process cap exceeded pid={} byte_len={} buddy={}/{}",
+                pid,
+                byte_len,
+                free,
+                total
+            );
+        }
+        Err(e) => {
+            log::warn!(
+                "[shm] create failed pid={} byte_len={} err={:?} buddy={}/{}",
+                pid,
+                byte_len,
+                e,
+                free,
+                total
+            );
+        }
+    }
+    match result {
         Ok((id, _start_phys, _page_count)) => u64::from(id.0),
         Err(_) => u64::MAX,
     }
@@ -10336,19 +10396,17 @@ pub(super) fn sys_shm_map(shm_id_arg: u64) -> u64 {
     };
     let total_size = (page_count as u64) * 4096;
 
-    // Build the per-page PhysFrame array the user_space helper expects.
+    // The SHM region is a single contiguous run from `start_phys`
+    // for `page_count` pages, so we feed it directly to the
+    // contiguous-mapping helper instead of building a per-page
+    // `Vec<PhysFrame>` scratch (~63 KiB at 4K resolution). The
+    // per-call kernel-heap alloc was the dominant fragmenter of
+    // the buddy allocator under the steady-state per-frame
+    // `AttachSharedBuffer` traffic clients emit; eliminating it
+    // bounds `sys_shm_map`'s allocation footprint to a few small
+    // entries (the VMA tree node + the page-table-walk's frame
+    // allocator overhead).
     use x86_64::structures::paging::{PhysFrame, Size4KiB};
-    let mut frames = alloc::vec::Vec::with_capacity(page_count as usize);
-    for i in 0..(page_count as u64) {
-        let phys_addr = x86_64::PhysAddr::new(start_phys + i * 4096);
-        match PhysFrame::<Size4KiB>::from_start_address(phys_addr) {
-            Ok(f) => frames.push(f),
-            Err(_) => {
-                let _ = crate::mm::shm::decref(id);
-                return u64::MAX;
-            }
-        }
-    }
 
     let pid = crate::process::current_pid();
     let addr_space = {
@@ -10410,12 +10468,18 @@ pub(super) fn sys_shm_map(shm_id_arg: u64) -> u64 {
         let mut mapper = unsafe { crate::mm::mapper_for_frame(cr3_frame) };
 
         if unsafe {
-            crate::mm::user_space::map_user_frames(&mut mapper, virt_addr, &frames, shm_pte_flags())
+            crate::mm::user_space::map_user_frames_contiguous(
+                &mut mapper,
+                virt_addr,
+                start_phys,
+                page_count as u64,
+                shm_pte_flags(),
+            )
         }
         .is_err()
         {
             log::warn!(
-                "[shm] map: map_user_frames failed pid={} virt={:#x} pages={}",
+                "[shm] map: map_user_frames_contiguous failed pid={} virt={:#x} pages={}",
                 pid,
                 virt_addr,
                 page_count
@@ -10528,9 +10592,24 @@ pub(super) fn sys_shm_destroy(shm_id_arg: u64) -> u64 {
         return u64::MAX;
     }
     let id = crate::mm::shm::ShmId(shm_id_arg as u32);
+    let pid = crate::process::current_pid();
     match crate::mm::shm::decref(id) {
-        Ok(_) => 0,
-        Err(_) => u64::MAX,
+        Ok(was_last_ref) => {
+            let (free, total) = crate::mm::frame_allocator::free_frame_count();
+            log::info!(
+                "[shm] destroy pid={} id={} last_ref={} buddy={}/{}",
+                pid,
+                id.0,
+                was_last_ref,
+                free,
+                total
+            );
+            0
+        }
+        Err(e) => {
+            log::warn!("[shm] destroy failed pid={} id={} err={:?}", pid, id.0, e);
+            u64::MAX
+        }
     }
 }
 
@@ -10658,6 +10737,47 @@ pub(super) fn sys_fb_reacquire() -> u64 {
         0
     } else {
         NEG_EBUSY
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 73 follow-up — page-flip the hardware framebuffer (0x101F)
+//
+// Dual-purpose syscall:
+//   * arg0 == u64::MAX → query mode, returns `back_y_offset_pixels` as a
+//     u64. Returns 0 if VBE double-buffering was not enabled at boot
+//     (caller falls back to the memcpy path).
+//   * arg0 ∈ { 0, back_y_offset_pixels } → write the value to the VBE
+//     Y_OFFSET register and return 0. The flip is applied by the
+//     display device on the next scanout cycle.
+//   * any other arg0 → NEG_EINVAL.
+//
+// The "query" sentinel avoids a separate syscall for capability discovery
+// and keeps `sys_framebuffer_info`'s wire format unchanged.
+// ---------------------------------------------------------------------------
+
+const PAGEFLIP_QUERY: u64 = u64::MAX;
+
+pub(super) fn sys_framebuffer_pageflip(arg0: u64) -> u64 {
+    if arg0 == PAGEFLIP_QUERY {
+        return crate::fb::framebuffer_back_y_offset_pixels() as u64;
+    }
+    if !crate::fb::vbe::doublebuffer_ready() {
+        return NEG_ENOSYS;
+    }
+    let pid = crate::process::current_pid();
+    if crate::fb::fb_owner_pid() != pid {
+        return NEG_EPERM;
+    }
+    let y_offset = match u32::try_from(arg0) {
+        Ok(v) => v,
+        Err(_) => return NEG_EINVAL,
+    };
+    // SAFETY: ring-0 context; VBE I/O ports are device-owned.
+    match unsafe { crate::fb::vbe::pageflip(y_offset) } {
+        Ok(()) => 0,
+        Err(crate::fb::vbe::FlipError::NotReady) => NEG_ENOSYS,
+        Err(crate::fb::vbe::FlipError::BadOffset) => NEG_EINVAL,
     }
 }
 

@@ -132,7 +132,7 @@ impl FloatingLayout {
 /// exclusive zones from `output`. Zones that don't tile a full edge are
 /// ignored — the userspace `display_server` is responsible for converting
 /// layer geometry into proper edge tilings before calling `arrange`.
-fn usable_rect(output: Rect, zones: &[Rect]) -> Rect {
+pub fn usable_rect(output: Rect, zones: &[Rect]) -> Rect {
     let ox = output.x;
     let oy = output.y;
     let mut x = ox;

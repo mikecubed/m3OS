@@ -136,13 +136,15 @@ pub const SURFACE_WIDTH_PX: u32 = (DEFAULT_COLS as u32) * (CELL_WIDTH as u32);
 pub const SURFACE_HEIGHT_PX: u32 = (DEFAULT_ROWS as u32) * (CELL_HEIGHT as u32);
 /// Cell pixel width. The Phase 69c TTF atlas rasterises glyphs into
 /// this cell size, so a wider cell produces more legible Nerd Font
-/// glyphs without changing the 80×25 column/row contract. Picked
-/// 16 (2× the static IBM VGA 8×16 fallback width) so the static
-/// fallback bitmap occupies a clean integer quadrant of the cell.
-pub const CELL_WIDTH: u8 = 16;
-/// Cell pixel height. Doubled from the static font's 16-px height
-/// for the same reason as [`CELL_WIDTH`].
-pub const CELL_HEIGHT: u8 = 32;
+/// glyphs without changing the 80×25 column/row contract. Phase 73
+/// bumped from 16 to 24 (3× the static 8×16 fallback width) so the
+/// terminal stays legible on a 1080p framebuffer; the static IBM VGA
+/// bitmap still occupies a clean integer sub-rect (top-left 8×16).
+pub const CELL_WIDTH: u8 = 24;
+/// Cell pixel height. Phase 73 bumped from 32 to 48 so the cell
+/// matches the wider [`CELL_WIDTH`] and stays a 3× multiple of the
+/// 8×16 static fallback.
+pub const CELL_HEIGHT: u8 = 48;
 
 /// Stack-sized encode buffer for protocol verbs. The widest
 /// `ClientMessage` body in Phase 57 is `SetSurfaceRole(Layer{...})`

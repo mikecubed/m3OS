@@ -250,10 +250,9 @@ type CurrentTaskDebugSnapshot = (TaskId, u32, &'static str, TaskState, u8, u64, 
 // # Phase 57b F.1 — preempt-discipline wiring
 //
 // `IrqSafeMutex::lock` raises the per-task `preempt_count` via
-// [`preempt_disable`] *before* masking interrupts; `IrqSafeGuard::Drop`
-// drops the count via [`preempt_enable`] *after* the spin guard has
-// released the lock and IF has been restored.  The drop order is
-// load-bearing:
+// [`preempt_disable`] *before* anything else; `IrqSafeGuard::Drop` drops
+// the count via [`preempt_enable`] *after* the spin guard has released the
+// lock and IF has been restored.  The drop order is load-bearing:
 //
 //   1. Inner spin guard releases the lock (Phase 57a invariant — preserves
 //      the unlock-before-IF-restore window so an ISR cannot reach a
@@ -261,10 +260,50 @@ type CurrentTaskDebugSnapshot = (TaskId, u32, &'static str, TaskState, u8, u64, 
 //   2. [`InterruptRestore`] restores IF.
 //   3. [`PreemptRestore`] decrements `preempt_count` last.
 //
-// Lock-acquire order is the inverse: raise `preempt_count` first, mask IF,
-// take the spin lock.  See Phase 57b F.1 in
-// `docs/roadmap/tasks/57b-preemption-foundation-tasks.md` and the
-// recursion-safety regression test below.
+// # 2026-05-24 — IRQ window during contended spin (4 GiB-hang fix)
+//
+// Lock-acquire order: raise `preempt_count`, mask IF, then test-then-
+// test-and-set on the inner `spin::Mutex`.  When `try_lock` fails the
+// loop briefly re-enables IF (only if the caller had IF=1) and waits on
+// `is_locked` before retrying.  See
+// `docs/handoffs/2026-05-24-4gib-pci-hole-vga-mapping.md`.
+//
+// Why we need the IRQ window: the previous unconditional "CLI then spin"
+// caused a multi-core deadlock at higher guest RAM.  Every core competing
+// for a hot IrqSafeMutex (notably `DMESG_RING` and `SERIAL1` during
+// AP-init logging, or `GROW_HEAP_LOCK` during concurrent bootstrap-heap
+// growth) spun with IF=0, which prevented them from servicing any other
+// core's `tlb_shootdown_*` IPI.  One core inside `grow_heap →
+// tlb_shootdown_range_kernel` would broadcast and spin on
+// `SHOOTDOWN_PENDING` forever waiting for acks from cores that could not
+// run their IDT handler.
+//
+// Why the IRQ window is *outside* the held region (not "spin with IF=1
+// then CLI"): the simpler "spin with IF=1 then CLI" pattern leaves a
+// race window where this core holds the inner spin guard but IF is still
+// 1, so a same-core IRQ handler that tries to take the same lock
+// (e.g. `log::warn!` → `DMESG_RING.lock()` from a fault handler) would
+// deadlock on the held inner lock.  The test-then-test-and-set pattern
+// guarantees that whenever we *hold* the guard, IF is masked — same
+// invariant the original code maintained.
+//
+// Safety of the IRQ window:
+//   * `preempt_count` is already raised, so a timer tick during the
+//     window sets the reschedule flag but cannot preempt us off this
+//     core — the spin keeps its identity.
+//   * We hold no inner spin guard during the window (we already failed
+//     `try_lock`), so an IRQ that re-takes this same lock from inside
+//     `log::{debug,warn}!` → `_kernel_print` → `DMESG_RING`/`SERIAL1`
+//     runs through its own `IrqSafeMutex::lock` path normally and
+//     returns; we then resume our own spin without ever observing
+//     held-while-IRQ-enabled.
+//   * The window is conditional on `was_enabled` — nested IrqSafeMutex
+//     callers (caller had IF=0) keep the historical IF=0 spin semantics,
+//     so we never leak an IRQ window into a region the outer caller
+//     intended to be IRQ-free.
+//
+// See `kernel/src/smp/tlb.rs::ShootdownIrqWindow` for the matching
+// sender-side fix and the recursion-safety regression test below.
 //
 // `try_lock` mirrors the same pattern: it raises `preempt_count` *before*
 // the inner `try_lock` call and undoes the raise (paired
@@ -301,20 +340,64 @@ impl<T> IrqSafeMutex<T> {
 }
 
 impl<T: ?Sized> IrqSafeMutex<T> {
+    #[track_caller]
     pub fn lock(&self) -> IrqSafeGuard<'_, T> {
-        // Phase 57b F.1 — raise `preempt_count` *before* masking IRQs.  The
+        // Phase 57b F.1 — raise `preempt_count` *before* anything else.  The
         // helper is lock-free by mandate (Phase 57b D.2) so it cannot
         // recurse through this very call.
-        preempt_disable();
+        //
+        // `[track_caller]` plus the explicit `Location::caller()` capture
+        // here surfaces the real call site (the user of `IrqSafeMutex::lock`,
+        // not the line inside this function) in the [preempt-depth]
+        // diagnostic warning. Without this, every IrqSafeMutex acquisition
+        // would appear to come from this function and the warning would be
+        // useless for finding the actual deep-nesting culprit.
+        preempt_disable_at(core::panic::Location::caller());
         let was_enabled = interrupts::are_enabled();
+        // 2026-05-24 — test-then-test-and-set with IRQ window.
+        //
+        // We mask IRQs *before* the atomic acquire attempt so that the
+        // held region always runs with IF=0 (matches the historical
+        // invariant — no same-core IRQ handler can ever observe a
+        // half-acquired lock, and no IRQ handler can deadlock by trying
+        // to re-acquire a lock its interrupted code already holds).
+        //
+        // Between acquire attempts, however, we briefly re-enable IRQs so
+        // that cross-core IPIs — specifically TLB shootdowns from a peer
+        // core inside `tlb_shootdown_range_kernel` — can be serviced on
+        // this core while we wait.  Without this window every core
+        // spinning to acquire any IrqSafeMutex would block all cross-core
+        // shootdowns, which deadlocked the system at 4 GiB guest RAM (see
+        // `docs/handoffs/2026-05-24-4gib-pci-hole-vga-mapping.md`).
         if was_enabled {
             interrupts::disable();
         }
-        let guard = self.inner.lock();
-        IrqSafeGuard {
-            guard,
-            _restore: InterruptRestore { was_enabled },
-            _preempt: PreemptRestore,
+        loop {
+            if let Some(guard) = self.inner.try_lock() {
+                return IrqSafeGuard {
+                    guard,
+                    _restore: InterruptRestore { was_enabled },
+                    _preempt: PreemptRestore,
+                };
+            }
+            if was_enabled {
+                // IRQ window: re-enable IF while the inner lock looks
+                // taken so this core can service incoming IPIs.  Only
+                // honour this for callers that had IF=1 — nested
+                // IrqSafeMutex callers (IF already masked) keep the
+                // original IF=0 spin semantics so we never leak an
+                // IRQ window into a region the outer caller intended to
+                // be IRQ-free.
+                interrupts::enable();
+                while self.inner.is_locked() {
+                    core::hint::spin_loop();
+                }
+                interrupts::disable();
+            } else {
+                while self.inner.is_locked() {
+                    core::hint::spin_loop();
+                }
+            }
         }
     }
 
@@ -327,8 +410,9 @@ impl<T: ?Sized> IrqSafeMutex<T> {
     /// `try_lock`; on `None` (acquire failed) the raise is undone with a
     /// paired [`preempt_enable`] before returning, so a failed `try_lock`
     /// has zero net effect on the per-task counter.
+    #[track_caller]
     pub fn try_lock(&self) -> Option<IrqSafeGuard<'_, T>> {
-        preempt_disable();
+        preempt_disable_at(core::panic::Location::caller());
         let was_enabled = interrupts::are_enabled();
         if was_enabled {
             interrupts::disable();
@@ -463,6 +547,66 @@ impl core::ops::DerefMut for SchedulerGuard<'_> {
 // ---------------------------------------------------------------------------
 
 static SCHEDULER_INNER: IrqSafeMutex<Scheduler> = IrqSafeMutex::new(Scheduler::new());
+
+/// Pre-reserve `tasks` / `fpu_states` Vec capacity so that subsequent
+/// `Vec::push` calls inside `alloc_task_slot` cannot trigger `grow_heap`.
+///
+/// # Why
+///
+/// `alloc_task_slot` runs inside [`scheduler_lock`] (an `IrqSafeMutex`,
+/// IF=0 in the held region). When `sched.tasks.push` exceeds the current
+/// Vec capacity, the Vec reallocates via the global allocator; if the
+/// bootstrap heap is short on free space the allocator falls into
+/// `grow_heap` → `GROW_HEAP_LOCK.lock()` → `tlb_shootdown_range_kernel`.
+/// All of that runs with IF=0 inherited from the outer `scheduler_lock`,
+/// and the recipients of the shootdown — sibling APs that are themselves
+/// inside their own `spawn_idle_for_core` → `scheduler_lock` path — are
+/// also CLI'd and can't service the IPI. Result: shootdown timeout panic
+/// at 4 GiB guest RAM with 4-core SMP, as diagnosed in
+/// `docs/handoffs/2026-05-24-4gib-pci-hole-vga-mapping.md`.
+///
+/// Call this from BSP **before** [`crate::smp::boot::boot_aps`] so the
+/// Vec growth happens single-core (no IPI possible) and AP-boot pushes
+/// fit inside the pre-reserved capacity.
+///
+/// Capacity sized to fit the expected boot-time tasks: one idle per
+/// MAX_CORES + init + a small headroom. Userspace task spawns after
+/// boot run with IF=1 at the outer (syscall) frame, so a later
+/// realloc-triggered `grow_heap` from inside `scheduler_lock` is no
+/// longer a deadlock — the would-be recipient cores can service the IPI.
+pub fn reserve_for_smp_boot() {
+    let target = crate::smp::MAX_CORES + 16;
+    // Allocate the pre-sized Vec buffers **outside** the scheduler_lock so
+    // that any `grow_heap` triggered by the allocator runs in a top-level
+    // IF=1 context — not inside an IrqSafeMutex region where the
+    // resulting `tlb_shootdown_range_kernel` would broadcast IPIs that
+    // every other CLI'd core could not service.
+    let mut tasks_buf: Vec<crate::mm::slab_box::SlabBox<Task>> = Vec::with_capacity(target);
+    let mut fpu_buf: Vec<crate::mm::slab_box::SlabBox<XSaveArea>> = Vec::with_capacity(target);
+    let mut sched = scheduler_lock();
+    // Move any existing slots into the pre-sized buffers (preserving order
+    // — `pop` returns LIFO so we reverse). `Vec::pop` does not deallocate
+    // the original buffer; it is dropped when `sched.tasks` is replaced
+    // below, deferring that deallocation to outside the held region in
+    // principle — though in practice the original Vec was capacity 0 so
+    // there is nothing to free.
+    while let Some(t) = sched.tasks.pop() {
+        tasks_buf.push(t);
+    }
+    while let Some(f) = sched.fpu_states.pop() {
+        fpu_buf.push(f);
+    }
+    tasks_buf.reverse();
+    fpu_buf.reverse();
+    sched.tasks = tasks_buf;
+    sched.fpu_states = fpu_buf;
+    let tasks_cap = sched.tasks.capacity();
+    let fpu_cap = sched.fpu_states.capacity();
+    drop(sched);
+    log::info!(
+        "[sched] reserved boot capacity: tasks.cap={tasks_cap} fpu_states.cap={fpu_cap} (target={target})"
+    );
+}
 
 /// Acquire the global scheduler lock, setting the per-CPU `holds_scheduler_lock`
 /// flag for the Phase 57a B.3 lock-ordering assertion.
@@ -2013,6 +2157,23 @@ fn dump_preempt_trace_for_task(task_idx: usize) {
 #[inline]
 #[track_caller]
 pub fn preempt_disable() {
+    preempt_disable_at(core::panic::Location::caller());
+}
+
+/// Variant of [`preempt_disable`] that accepts an explicit caller location.
+///
+/// Used by [`IrqSafeMutex::lock`] / [`IrqSafeMutex::try_lock`] so the
+/// `[preempt-depth]` diagnostic surfaces the *user* of the mutex rather
+/// than line 308 inside `IrqSafeMutex::lock` itself. Without this routing
+/// every IrqSafeMutex acquisition reports the same `scheduler.rs:308`
+/// location in the warning, and the diagnostic is useless for tracking
+/// down deep-nesting bugs.
+///
+/// Callers that aren't wrapping their own location pass-through still use
+/// the plain [`preempt_disable`] — it just inlines a `Location::caller()`
+/// capture here, preserving the historical behaviour.
+#[inline]
+pub fn preempt_disable_at(location: &'static core::panic::Location<'static>) {
     // Phase 57b F.1 — `IrqSafeMutex::lock` now calls this helper on every
     // lock acquisition, including a few callsites reachable before per-core
     // data is initialised (early boot, the `#[cfg(test)]` harness, panic
@@ -2041,7 +2202,6 @@ pub fn preempt_disable() {
     // pointee outlives this load.
     let prev = unsafe { (*ptr).fetch_add(1, core::sync::atomic::Ordering::Acquire) };
     let new_value = prev + 1;
-    let location = core::panic::Location::caller();
     record_preempt_trace(1, prev, new_value, location);
     // Phase 57e Bug #9 — immediate warning when nesting exceeds the
     // expected maximum (preempt_disable + IrqSafeMutex pi_lock + IrqSafeMutex
@@ -2049,6 +2209,7 @@ pub fn preempt_disable() {
     // either a legitimate deeper nesting (worth knowing about) or an
     // unbalanced disable that's accumulating — either way the next
     // forensic capture wants the immediate caller.
+    //
     if new_value >= 5
         && PREEMPT_LEAK_LOG_BUDGET.fetch_sub(1, core::sync::atomic::Ordering::Relaxed) > 0
     {
@@ -2283,13 +2444,33 @@ pub fn peek_preempt_count_irq() -> i32 {
 /// Ready tasks (the "stale-ready 30 s + cpu-hog" Bug #9 fingerprint).
 ///
 /// Until the leak is hunted down at its source, the user-return boundary
-/// clamps `preempt_count` to zero unconditionally and logs the first 32
+/// clamps `preempt_count` to zero unconditionally and logs the first N
 /// non-zero observations so the next forensic capture pinpoints the
 /// imbalance.  The clamp itself is correct by the same invariant that
 /// `preempt_frame_to_scheduler` already relies on: any kernel work that
 /// raised the counter must have lowered it before this boundary; a
 /// non-zero value is by definition a bug, and zeroing it cannot widen
 /// any race that wasn't already broken.
+///
+/// Note (2026-05-23): the warning emission path itself acquires
+/// `DMESG_RING` + `SERIAL1` via `_kernel_print`, each of which goes
+/// through `IrqSafeMutex::lock → preempt_disable_at`. When a warning
+/// fires at depth N, the recursive lock acquisitions inside the log
+/// path also see depth ≥ 5 and trigger nested warnings, burning ~32
+/// budget slots per real event and inflating reported depths.
+///
+/// An obvious fix — a per-core re-entry guard that suppresses the
+/// nested warnings — turned out to be load-bearing: removing the
+/// multi-ms recursive-log delay broke 4 GiB GUI boot somewhere in the
+/// `wait_icr_idle`/IPI delivery path (the recursion was inadvertently
+/// providing the wait window the IPI handshake needed). That's a
+/// real latent bug, but unblocking it requires more focused
+/// investigation than the diagnostic-quality fix in this commit.
+///
+/// Treat the diagnostic accordingly: a stream of warnings with
+/// `caller=kernel/src/serial.rs:40` (or :41 / :61) is recursion noise;
+/// the *single* warning with a different caller (e.g.
+/// `kernel/src/smp/ipi.rs:56`) is the real call site.
 static PREEMPT_LEAK_LOG_BUDGET: core::sync::atomic::AtomicI32 =
     core::sync::atomic::AtomicI32::new(32);
 

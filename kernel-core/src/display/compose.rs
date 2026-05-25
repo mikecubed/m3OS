@@ -331,9 +331,22 @@ pub fn compose_frame<O: FramebufferOwner>(
         }
     }
 
-    if writes > 0 {
-        owner.present()?;
-    }
+    // Phase 73 follow-up — `present()` used to be issued here, but each
+    // frame's compositor pass also paints borders + cursor *after*
+    // `compose_frame` returns, then calls `present()` itself. The
+    // internal call meant every frame did two visible updates: one
+    // half-rendered (surfaces only), then one complete (surfaces +
+    // borders + cursor). With the userspace memcpy backend this
+    // doubled the chance of racing scanout (the border-flicker the
+    // user reported); with the VBE page-flip backend it was strictly
+    // wrong (each `present()` flipped to a different half, so the
+    // mid-frame flip exposed surfaces without borders or cursor).
+    // Callers are now expected to invoke `owner.present()` exactly
+    // once per frame, after every per-frame write is staged. Tests
+    // that previously asserted `present_calls == 1` after
+    // `compose_frame` either drive `owner.present()` themselves or
+    // assert against the new "zero presents inside compose_frame"
+    // contract.
     Ok(writes)
 }
 
@@ -482,7 +495,10 @@ mod tests {
         let writes = owner.writes();
         assert_eq!(writes.len(), 1);
         assert_eq!(writes[0].clipped_rect, rect(10, 10, 50, 50));
-        assert_eq!(owner.present_calls(), 1);
+        // Phase 73 follow-up: compose_frame no longer issues an
+        // internal present(); the compositor's per-frame end-of-pass
+        // present() is the single visible update.
+        assert_eq!(owner.present_calls(), 0);
     }
 
     #[test]
@@ -659,7 +675,8 @@ mod tests {
         // full output (which both bg and top happen to share), so we instead
         // verify by looking at the FB pixel content: top filled with 0x22.
         assert_eq!(owner.pixel(50, 50) & 0xff, 0x22);
-        assert_eq!(owner.present_calls(), 1);
+        // Phase 73 follow-up: compose_frame no longer presents internally.
+        assert_eq!(owner.present_calls(), 0);
     }
 
     #[test]
@@ -682,8 +699,13 @@ mod tests {
     }
 
     #[test]
-    fn compose_frame_present_called_once_when_any_write() {
-        // Case A: one write → present_calls == 1.
+    fn compose_frame_never_presents_internally() {
+        // Phase 73 follow-up: `compose_frame` no longer issues an
+        // internal `present()`. Callers (display_server's main loop)
+        // are now responsible for calling `present()` exactly once
+        // per frame after every per-frame write is staged.
+
+        // Case A: writes happen, but present_calls stays 0.
         let mut owner = RecordingFramebufferOwner::new(meta(100, 100));
         let pixels = solid_pixels(20, 20, 0xAA);
         let damage = [rect(0, 0, 20, 20)];
@@ -696,9 +718,10 @@ mod tests {
             false,
         )];
         compose_frame(&mut owner, rect(0, 0, 100, 100), &mut surfaces).expect("compose ok");
-        assert_eq!(owner.present_calls(), 1);
+        assert_eq!(owner.writes().len(), 1, "the write still happens");
+        assert_eq!(owner.present_calls(), 0);
 
-        // Case B: zero writes → present_calls == 0.
+        // Case B: zero writes → present_calls still 0.
         let mut owner2 = RecordingFramebufferOwner::new(meta(100, 100));
         let mut empty: [ComposeSurface; 0] = [];
         compose_frame(&mut owner2, rect(0, 0, 100, 100), &mut empty).expect("compose ok");

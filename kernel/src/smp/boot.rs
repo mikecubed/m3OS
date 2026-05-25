@@ -446,6 +446,35 @@ extern "C" fn ap_entry(per_core_data_ptr: *mut super::PerCoreData) -> ! {
     // Now that EFER.NXE is set, APs can access the phys_offset range.
     ap_lapic_init_from(data.lapic_virt_base as usize, data.lapic_ticks_per_ms);
 
+    // Enable interrupts on this AP **before** marking it online and before
+    // doing any further work that allocates from the shared kernel heap.
+    //
+    // The bootloader hands APs to `ap_entry` with IF=0; nothing above
+    // explicitly STIs. Without this enable, the AP would stay IF=0 all the
+    // way through `spawn_idle_for_core` (which constructs a new `Task` +
+    // kernel stack and can therefore call `grow_heap` →
+    // `tlb_shootdown_range_kernel`) and only first take an interrupt inside
+    // the run-loop's `enable_and_hlt` (`task::scheduler::run`).
+    //
+    // That created a deterministic deadlock at higher guest RAM: every core
+    // was simultaneously doing IF=0 init work, so when *any* core fired a
+    // kernel-VMA TLB shootdown during its heap grow, no other core could
+    // service the IPI from the IRR and the sender spun on
+    // `SHOOTDOWN_PENDING` forever. Diagnosed via
+    // `docs/handoffs/2026-05-24-4gib-pci-hole-vga-mapping.md` and the
+    // bounded-spin diagnostics that landed alongside this fix
+    // (`smp::tlb::wait_for_shootdown_acks_or_panic`,
+    // `smp::ipi::wait_icr_idle`, `interrupts::TIMER_TICKS_PER_CORE`).
+    //
+    // Safe at this point: the IDT is installed (`interrupts::init` above),
+    // the LAPIC including the timer LVT is configured, per-core data /
+    // gs_base are live, and syscall MSRs are programmed. The IRQ handlers
+    // that can fire in the remaining window are the LAPIC timer (atomic
+    // tick + reschedule flag + EOI, no allocation) and the TLB-shootdown
+    // IPI (atomic decrement + local flush, no allocation) — neither
+    // contends with anything `spawn_idle_for_core` does.
+    x86_64::instructions::interrupts::enable();
+
     // Signal that this AP is online.
     data.is_online.store(true, Ordering::Release);
 

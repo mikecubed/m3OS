@@ -138,6 +138,21 @@ members = [
     # in-process so term inherits the authenticated UID/GID without a
     # fork/pipe handoff through `session_manager`.
     "userspace/greeter",
+    # Phase 73 — desktop background Layer-shell client.
+    "userspace/wallpaper",
+    # Phase 73 — persistent status bar (workspace indicators, clock,
+    # window title, audio mute).
+    "userspace/bar",
+    # Phase 73 — fuzzy-filter app launcher (SUPER+SPACE).
+    "userspace/launcher",
+    # Phase 73 — notification daemon + notify-send utility.
+    "userspace/notifyd",
+    # Phase 73 — lockscreen stub.
+    "userspace/lockscreen",
+    # Phase 73 — shared Layer-shell client boilerplate (handshake,
+    # SHM, text rendering) consumed by bar / launcher / notifyd /
+    # lockscreen.
+    "userspace/lib/desktop_client",
 ]
 
 # Exclude xtask and userspace from default build — kernel only

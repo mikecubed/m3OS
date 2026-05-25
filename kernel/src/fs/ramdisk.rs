@@ -315,6 +315,23 @@ static DOOM_CONCURRENT_ELF: &[u8] = generated_initrd_asset!("doom-concurrent");
 // than parenting the process.
 static GREETER_ELF: &[u8] = generated_initrd_asset!("greeter");
 
+// Phase 73 — desktop background Layer-shell client.
+static WALLPAPER_ELF: &[u8] = generated_initrd_asset!("wallpaper");
+
+// Phase 73 — persistent status bar Layer-shell client.
+static BAR_ELF: &[u8] = generated_initrd_asset!("bar");
+
+// Phase 73 — SUPER+SPACE fuzzy-filter launcher (Toplevel).
+static LAUNCHER_ELF: &[u8] = generated_initrd_asset!("launcher");
+
+// Phase 73 — notification daemon (AF_UNIX listener) and companion
+// `notify-send` CLI.
+static NOTIFYD_ELF: &[u8] = generated_initrd_asset!("notifyd");
+static NOTIFY_SEND_ELF: &[u8] = generated_initrd_asset!("notify-send");
+
+// Phase 73 — lockscreen Layer-shell stub (exclusive keyboard grab).
+static LOCKSCREEN_ELF: &[u8] = generated_initrd_asset!("lockscreen");
+
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
 // ---------------------------------------------------------------------------
@@ -823,6 +840,42 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "greeter",
         RamdiskNode::File {
             content: GREETER_ELF,
+        },
+    ),
+    // Phase 73 — desktop background client.
+    (
+        "wallpaper",
+        RamdiskNode::File {
+            content: WALLPAPER_ELF,
+        },
+    ),
+    // Phase 73 — status bar client.
+    ("bar", RamdiskNode::File { content: BAR_ELF }),
+    // Phase 73 — fuzzy-filter app launcher.
+    (
+        "launcher",
+        RamdiskNode::File {
+            content: LAUNCHER_ELF,
+        },
+    ),
+    // Phase 73 — notification daemon + CLI.
+    (
+        "notifyd",
+        RamdiskNode::File {
+            content: NOTIFYD_ELF,
+        },
+    ),
+    (
+        "notify-send",
+        RamdiskNode::File {
+            content: NOTIFY_SEND_ELF,
+        },
+    ),
+    // Phase 73 — lockscreen stub.
+    (
+        "lockscreen",
+        RamdiskNode::File {
+            content: LOCKSCREEN_ELF,
         },
     ),
 ];

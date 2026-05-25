@@ -47,6 +47,138 @@ static SHOOTDOWN_USE_CR3_RELOAD: AtomicBool = AtomicBool::new(false);
 /// `invlpg` for each page.
 const INVLPG_THRESHOLD: u64 = 32;
 
+/// Per-core counter of `IPI_TLB_SHOOTDOWN` invocations actually serviced by
+/// [`handle_tlb_shootdown_ipi`]. Incremented from the IDT entry on each
+/// recipient; read by [`wait_for_shootdown_acks_or_panic`] before/after the
+/// spin so the timeout diagnostic can dump a per-recipient delta and tell us
+/// definitively whether each target's IPI handler fired at all during the
+/// hang.
+///
+/// Sized to [`crate::smp::MAX_CORES`] (16) to match the largest core_id the
+/// crate exposes. `Relaxed` ordering is sufficient: this counter is read only
+/// from panic / diagnostic context, never participates in correctness
+/// synchronisation (`SHOOTDOWN_PENDING` carries the ack semantics).
+static TLB_IPI_SERVICED: [AtomicU64; crate::smp::MAX_CORES] =
+    [const { AtomicU64::new(0) }; crate::smp::MAX_CORES];
+
+// `ShootdownIrqWindow` (sessions 2 + 3) is no longer needed: TLB shootdown
+// IPIs are now delivered as NMIs (see `smp::ipi::send_nmi` and
+// `arch::x86_64::interrupts::nmi_handler`), which bypass the recipient's
+// `IF` mask entirely. The sender's spin no longer needs to keep IF=1 to
+// let other senders' shootdowns flow through this core — incoming NMIs
+// fire regardless of IF. The struct and its `open()` / `Drop` pair were
+// removed in session 5 (2026-05-25). See
+// `docs/handoffs/2026-05-24-4gib-pci-hole-vga-mapping.md`.
+
+/// Spin on `SHOOTDOWN_PENDING > 0` with a generous timeout. On timeout, dump
+/// the request state and which APIC IDs we sent to vs the final pending
+/// count, then panic. Designed for the 4 GiB-RAM-on-Zen 5 hang investigation
+/// (docs/handoffs/2026-05-24-4gib-pci-hole-vga-mapping.md): converts a
+/// previously-silent infinite spin into an actionable panic.
+///
+/// 500 ms is ~5 orders of magnitude over the SDM-spec ~1 µs IPI delivery
+/// latency; comfortable margin under TCG without inflating real-hang
+/// detection time. tsc_per_ms() returns 0 before APIC calibration; fall
+/// back to a ~10G-cycle absolute ceiling (~10 s at 1 GHz) in that window.
+fn wait_for_shootdown_acks_or_panic(
+    site: &'static str,
+    expected_targets: u8,
+    range_start: u64,
+    range_end: u64,
+    recipients_repr: core::fmt::Arguments<'_>,
+) {
+    let tsc_per_ms = crate::arch::x86_64::apic::tsc_per_ms();
+    let timeout_tsc: u64 = if tsc_per_ms > 0 {
+        tsc_per_ms.saturating_mul(500)
+    } else {
+        10_000_000_000
+    };
+    // Snapshot the per-core IPI-serviced counter so a timeout panic can dump
+    // a per-recipient delta and tell us definitively whether each target's
+    // IDT handler actually fired during the spin window.
+    let mut serviced_at_start = [0u64; crate::smp::MAX_CORES];
+    for (i, slot) in TLB_IPI_SERVICED.iter().enumerate() {
+        serviced_at_start[i] = slot.load(Ordering::Relaxed);
+    }
+    // Also snapshot per-core LAPIC timer ticks. The diagnostic discriminates:
+    //   * timer-delta > 0, ipi-delta = 0  → core's interrupts work but it
+    //     specifically isn't taking vector 0xFD (vector masking, IDT entry
+    //     missing, dispatch race) — bug is IPI-specific.
+    //   * timer-delta = 0, ipi-delta = 0  → core has IF=0 for the entire
+    //     window (or its LAPIC timer is dead) — bug is interrupt-delivery
+    //     generic, almost certainly the recursive log path holding IrqSafeMutex.
+    //   * timer-delta > 0, ipi-delta > 0  → core ack'd but the atomic
+    //     accounting is wrong somewhere.
+    let mut timer_at_start = [0u64; crate::smp::MAX_CORES];
+    for (i, slot) in crate::arch::x86_64::interrupts::TIMER_TICKS_PER_CORE
+        .iter()
+        .enumerate()
+    {
+        timer_at_start[i] = slot.load(Ordering::Relaxed);
+    }
+    let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    let mut iterations: u64 = 0;
+    while SHOOTDOWN_PENDING.load(Ordering::Acquire) > 0 {
+        core::hint::spin_loop();
+        iterations += 1;
+        if iterations.is_multiple_of(4096) {
+            let now = unsafe { core::arch::x86_64::_rdtsc() };
+            if now.wrapping_sub(start_tsc) > timeout_tsc {
+                let pending = SHOOTDOWN_PENDING.load(Ordering::Acquire);
+                let my_core = super::per_core().core_id;
+                let icr_low = unsafe { ipi::lapic_read(ipi::LAPIC_ICR_LOW) };
+                // Build per-core "before → after" maps for both counters.
+                let mut serviced_now = [0u64; crate::smp::MAX_CORES];
+                for (i, slot) in TLB_IPI_SERVICED.iter().enumerate() {
+                    serviced_now[i] = slot.load(Ordering::Relaxed);
+                }
+                let mut timer_now = [0u64; crate::smp::MAX_CORES];
+                for (i, slot) in crate::arch::x86_64::interrupts::TIMER_TICKS_PER_CORE
+                    .iter()
+                    .enumerate()
+                {
+                    timer_now[i] = slot.load(Ordering::Relaxed);
+                }
+                // Use _panic_print directly so the dump goes out even if the
+                // log infrastructure is wedged on the recursive DMESG_RING
+                // path.
+                crate::serial::_panic_print(format_args!(
+                    "[tlb] {site} stuck >500ms: SHOOTDOWN_PENDING={pending} \
+                     (of {expected_targets} targets), my_core={my_core}, \
+                     range={range_start:#x}..{range_end:#x}, \
+                     ICR_LOW={icr_low:#010x} (bit 12 = delivery-pending), \
+                     recipients=[{recipients_repr}], iterations={iterations}, \
+                     tsc_per_ms={tsc_per_ms}\n\
+                     [tlb] per-core diagnostics — \
+                     tlb-ipi serviced (before → after, delta), \
+                     LAPIC-timer ticks (before → after, delta):\n"
+                ));
+                for i in 0..crate::smp::MAX_CORES {
+                    let ipi_before = serviced_at_start[i];
+                    let ipi_after = serviced_now[i];
+                    let tmr_before = timer_at_start[i];
+                    let tmr_after = timer_now[i];
+                    if ipi_before != 0
+                        || ipi_after != 0
+                        || tmr_before != 0
+                        || tmr_after != 0
+                        || i == my_core as usize
+                    {
+                        let ipi_delta = ipi_after.wrapping_sub(ipi_before);
+                        let tmr_delta = tmr_after.wrapping_sub(tmr_before);
+                        crate::serial::_panic_print(format_args!(
+                            "[tlb]   core {i}: ipi {ipi_before} → {ipi_after} \
+                             (Δ{ipi_delta})  timer {tmr_before} → {tmr_after} \
+                             (Δ{tmr_delta})\n"
+                        ));
+                    }
+                }
+                panic!("[tlb] {site} ack timeout — see per-core dump above");
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public API (T031, T034)
 // ---------------------------------------------------------------------------
@@ -122,22 +254,25 @@ pub fn tlb_shootdown(addr: u64) {
         SHOOTDOWN_PENDING.store(targets as u8, Ordering::Release);
 
         // Send to exactly the snapshot we counted — same set, by construction.
+        // NMI delivery (vs Fixed-mode IPI) so the recipient cores service the
+        // shootdown even when they are inside a CLI'd IrqSafeMutex region.
+        // See `arch::x86_64::interrupts::nmi_handler` for the receiver and
+        // `docs/handoffs/2026-05-24-4gib-pci-hole-vga-mapping.md` for the
+        // bug class this fix addresses.
         for &apic_id in &recipients[..targets] {
-            ipi::send_ipi(apic_id, ipi::IPI_TLB_SHOOTDOWN);
+            ipi::send_nmi(apic_id);
         }
 
-        // Spin-wait for all remote cores to acknowledge.  IF stays
-        // enabled here; a self-targeted IRQ (timer, etc.) is allowed
-        // to fire and return.  Remote cores' IPI handlers run with
-        // their own IF state, never contend for `SHOOTDOWN_LOCK`,
-        // and only touch the `SHOOTDOWN_*` atomics.
-        // IPI-bounded: remote-CPU IPI handlers complete within IPI delivery latency
-        // + IRQ-handler runtime (both bounded and lock-free).  IF is enabled here so
-        // this core can service its own IRQs.  Cannot yield here: we are still inside
-        // the preempt_disable()/preempt_enable() region wrapping the SHOOTDOWN_* atomics.
-        while SHOOTDOWN_PENDING.load(Ordering::Acquire) > 0 {
-            core::hint::spin_loop();
-        }
+        // Spin-wait for all remote cores to acknowledge. With NMI delivery
+        // recipients service the shootdown regardless of their IF state, so
+        // the sender no longer needs to keep IF=1 here.
+        wait_for_shootdown_acks_or_panic(
+            "tlb_shootdown",
+            targets as u8,
+            addr,
+            addr + 4096,
+            format_args!("{:?}", &recipients[..targets]),
+        );
     }
     crate::task::scheduler::preempt_enable();
 }
@@ -222,25 +357,25 @@ pub fn tlb_shootdown_range(addr_space: &crate::mm::AddressSpace, start: u64, end
 
         SHOOTDOWN_PENDING.store(targets, Ordering::Release);
 
-        // Now that the pending count is visible, send the IPIs.
-        // send_ipi_to_core already checks existence + is_online, matching the
-        // count above.
+        // Now that the pending count is visible, send the NMIs.
+        // send_nmi_to_core already checks existence + is_online, matching
+        // the count above. NMI delivery bypasses recipient IF, so cores in
+        // CLI'd regions still service the shootdown.
         for core_id in 0..64u8 {
             if remote_mask & (1u64 << core_id) != 0 {
-                ipi::send_ipi_to_core(core_id, ipi::IPI_TLB_SHOOTDOWN);
+                ipi::send_nmi_to_core(core_id);
             }
         }
 
-        // Spin-wait for acknowledgment from all targeted cores.  IF stays
-        // enabled; remote cores must be able to receive their IPIs and
-        // ack via the `SHOOTDOWN_*` atomics.
-        // IPI-bounded: remote-CPU IPI handlers complete within IPI delivery latency
-        // + IRQ-handler runtime (both bounded and lock-free).  IF is enabled here so
-        // this core can service its own IRQs.  Cannot yield here: we are still inside
-        // the preempt_disable()/preempt_enable() region wrapping the SHOOTDOWN_* atomics.
-        while SHOOTDOWN_PENDING.load(Ordering::Acquire) > 0 {
-            core::hint::spin_loop();
-        }
+        // Spin-wait for acknowledgment from all targeted cores. NMI
+        // delivery ensures recipients ack regardless of their IF state.
+        wait_for_shootdown_acks_or_panic(
+            "tlb_shootdown_range",
+            targets,
+            aligned_start,
+            aligned_end,
+            format_args!("remote_mask={:#018x}", remote_mask),
+        );
     }
     crate::task::scheduler::preempt_enable();
 }
@@ -327,15 +462,24 @@ pub fn tlb_shootdown_range_kernel(start: u64, end: u64) {
 
         // Send to exactly the snapshot. Recipients and pending count are
         // by construction equal — there is no second predicate walk that
-        // could disagree with the snapshot.
+        // could disagree with the snapshot. NMI delivery (vs Fixed) so
+        // recipients in CLI'd IrqSafeMutex regions still service the
+        // shootdown.
         for &apic_id in &recipients[..targets] {
-            ipi::send_ipi(apic_id, ipi::IPI_TLB_SHOOTDOWN);
+            ipi::send_nmi(apic_id);
         }
 
-        // IPI-bounded spin; same IF/preempt discipline as `tlb_shootdown_range`.
-        while SHOOTDOWN_PENDING.load(Ordering::Acquire) > 0 {
-            core::hint::spin_loop();
-        }
+        // NMI-bounded spin. With NMI delivery the recipient cores ack
+        // regardless of IF, so the prior `ShootdownIrqWindow` (forcing
+        // IF=1 during the wait) is no longer required — callers from
+        // inside any `IrqSafeMutex` region are safe.
+        wait_for_shootdown_acks_or_panic(
+            "tlb_shootdown_range_kernel",
+            targets as u8,
+            aligned_start,
+            aligned_end,
+            format_args!("{:?}", &recipients[..targets]),
+        );
     }
     crate::task::scheduler::preempt_enable();
 }
@@ -345,6 +489,16 @@ pub fn tlb_shootdown_range_kernel(start: u64, end: u64) {
 /// Called from the IDT handler. Reads the target address or range, executes
 /// the appropriate flush, and decrements the pending count.
 pub fn handle_tlb_shootdown_ipi() {
+    // Diagnostic counter for the 4 GiB-hang investigation: bump the
+    // per-core ack count before doing any TLB work. If a sender times out
+    // waiting for our ack, `wait_for_shootdown_acks_or_panic` reads this
+    // counter to determine whether our IDT entry fired at all.
+    if let Some(pc) = super::try_per_core()
+        && let Some(slot) = TLB_IPI_SERVICED.get(pc.core_id as usize)
+    {
+        slot.fetch_add(1, Ordering::Relaxed);
+    }
+
     let start = SHOOTDOWN_RANGE_START.load(Ordering::Acquire);
     let end = SHOOTDOWN_RANGE_END.load(Ordering::Acquire);
 

@@ -69,12 +69,36 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 #[cfg(not(test))]
 syscall_lib::entry_point!(program_main);
 
-/// Default surface dimensions. Matches `term`'s 1280×800 baseline so
-/// the greeter inherits the same SHM page count budget.
+/// Fallback surface dimensions if `framebuffer_info` is unavailable.
+/// Kept at the legacy 1280×800 baseline so a misconfigured boot still
+/// shows a usable form.
 #[cfg(not(test))]
-const SURFACE_WIDTH_PX: u32 = 1280;
+const FALLBACK_SURFACE_WIDTH_PX: u32 = 1280;
 #[cfg(not(test))]
-const SURFACE_HEIGHT_PX: u32 = 800;
+const FALLBACK_SURFACE_HEIGHT_PX: u32 = 800;
+
+/// Runtime-resolved surface size. Populated from the kernel
+/// framebuffer query at the top of `program_main` so the login form
+/// fills the entire output (1080p or larger) instead of a centred
+/// 1280×800 island. Stored as atomics because Rust forbids mutable
+/// statics without unsafe; the greeter is single-threaded so
+/// `Relaxed` ordering is fine.
+#[cfg(not(test))]
+static SURFACE_WIDTH_PX_RUNTIME: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(FALLBACK_SURFACE_WIDTH_PX);
+#[cfg(not(test))]
+static SURFACE_HEIGHT_PX_RUNTIME: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(FALLBACK_SURFACE_HEIGHT_PX);
+
+#[cfg(not(test))]
+fn surface_width_px() -> u32 {
+    SURFACE_WIDTH_PX_RUNTIME.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(not(test))]
+fn surface_height_px() -> u32 {
+    SURFACE_HEIGHT_PX_RUNTIME.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 #[cfg(not(test))]
 const SURFACE_ID: SurfaceId = SurfaceId(1);
@@ -107,6 +131,21 @@ const POLL_IDLE_NS: u32 = 5_000_000;
 fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, "greeter: starting (Phase 71)\n");
 
+    // Resolve the actual framebuffer dimensions so the login form
+    // fills the running output (1080p, 4K, ...) instead of a centred
+    // 1280×800 island. Phase 73.
+    {
+        let mut buf = [0u8; 20];
+        if syscall_lib::framebuffer_info(&mut buf) == 0 {
+            let width = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+            let height = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+            if width > 0 && height > 0 {
+                SURFACE_WIDTH_PX_RUNTIME.store(width, core::sync::atomic::Ordering::Relaxed);
+                SURFACE_HEIGHT_PX_RUNTIME.store(height, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
     // 1. Register an IPC presence beacon so session_manager and
     //    `m3ctl` can observe us.
     let ep = syscall_lib::create_endpoint();
@@ -126,7 +165,7 @@ fn program_main(_args: &[&str]) -> i32 {
     };
 
     // 3. Allocate the surface backing buffer.
-    let byte_len = (SURFACE_WIDTH_PX as usize) * (SURFACE_HEIGHT_PX as usize) * 4;
+    let byte_len = (surface_width_px() as usize) * (surface_height_px() as usize) * 4;
     let shm_id = syscall_lib::shm_create(byte_len);
     if shm_id == 0 {
         syscall_lib::write_str(STDOUT_FILENO, "greeter: shm_create failed\n");
@@ -160,8 +199,8 @@ fn program_main(_args: &[&str]) -> i32 {
     let pixels_slice = unsafe { surface_pixels(surface_va, surface_len) };
     paint_background(
         pixels_slice,
-        SURFACE_WIDTH_PX,
-        SURFACE_HEIGHT_PX,
+        surface_width_px(),
+        surface_height_px(),
         &background,
         &config,
     );
@@ -177,8 +216,8 @@ fn program_main(_args: &[&str]) -> i32 {
     render_login_ui(
         &initial_state,
         pixels_slice,
-        SURFACE_WIDTH_PX,
-        SURFACE_HEIGHT_PX,
+        surface_width_px(),
+        surface_height_px(),
     );
     if !attach_damage_commit(server_handle, shm_id) {
         let _ = syscall_lib::shm_unmap(surface_va);
@@ -461,8 +500,8 @@ fn attach_damage_commit(handle: u32, shm_id: u32) -> bool {
         surface_id: SURFACE_ID,
         buffer_id: BUFFER_ID,
         shm_id,
-        width: SURFACE_WIDTH_PX,
-        height: SURFACE_HEIGHT_PX,
+        width: surface_width_px(),
+        height: surface_height_px(),
     };
     if !send_verb(handle, &attach) {
         return false;
@@ -472,8 +511,8 @@ fn attach_damage_commit(handle: u32, shm_id: u32) -> bool {
         rect: Rect {
             x: 0,
             y: 0,
-            w: SURFACE_WIDTH_PX,
-            h: SURFACE_HEIGHT_PX,
+            w: surface_width_px(),
+            h: surface_height_px(),
         },
     };
     if !send_verb(handle, &damage) {
@@ -812,6 +851,7 @@ fn run_auth_loop(
             handle,
             shm_id,
             ActiveField::Username,
+            "",
             pixels,
             background,
             config,
@@ -822,10 +862,14 @@ fn run_auth_loop(
                 return None;
             }
         };
+        // Pass the submitted username through so the password-prompt
+        // frame keeps it visible — otherwise the user types blind
+        // into a form that has just discarded their identity.
         let password = match read_field(
             handle,
             shm_id,
             ActiveField::Password,
+            &username,
             pixels,
             background,
             config,
@@ -844,12 +888,12 @@ fn run_auth_loop(
         };
         paint_background(
             pixels,
-            SURFACE_WIDTH_PX,
-            SURFACE_HEIGHT_PX,
+            surface_width_px(),
+            surface_height_px(),
             background,
             config,
         );
-        render_login_ui(&checking, pixels, SURFACE_WIDTH_PX, SURFACE_HEIGHT_PX);
+        render_login_ui(&checking, pixels, surface_width_px(), surface_height_px());
         let _ = attach_damage_commit(handle, shm_id);
 
         let result = backend.verify(&username, &password);
@@ -868,12 +912,12 @@ fn run_auth_loop(
                 };
                 paint_background(
                     pixels,
-                    SURFACE_WIDTH_PX,
-                    SURFACE_HEIGHT_PX,
+                    surface_width_px(),
+                    surface_height_px(),
                     background,
                     config,
                 );
-                render_login_ui(&failed, pixels, SURFACE_WIDTH_PX, SURFACE_HEIGHT_PX);
+                render_login_ui(&failed, pixels, surface_width_px(), surface_height_px());
                 let _ = attach_damage_commit(handle, shm_id);
             }
             AuthOutcome::Backoff { wait_secs, reason } => {
@@ -892,12 +936,17 @@ fn run_auth_loop(
                     };
                     paint_background(
                         pixels,
-                        SURFACE_WIDTH_PX,
-                        SURFACE_HEIGHT_PX,
+                        surface_width_px(),
+                        surface_height_px(),
                         background,
                         config,
                     );
-                    render_login_ui(&backoff_state, pixels, SURFACE_WIDTH_PX, SURFACE_HEIGHT_PX);
+                    render_login_ui(
+                        &backoff_state,
+                        pixels,
+                        surface_width_px(),
+                        surface_height_px(),
+                    );
                     let _ = attach_damage_commit(handle, shm_id);
                     let _ = syscall_lib::nanosleep_for(1, 0);
                     remaining = remaining.saturating_sub(1);
@@ -920,11 +969,17 @@ fn error_to_message(err: &AuthError) -> &'static str {
 /// Read one form field from the keyboard event stream. Returns the
 /// typed string when the user submits with Enter; `None` if the
 /// display server disconnects.
+///
+/// `prefill_username` carries the username submitted during the prior
+/// `read_field` call so the password-prompt frame keeps showing it
+/// (it is otherwise blanked, leaving the user to type a password into
+/// what looks like an empty form).
 #[cfg(not(test))]
 fn read_field(
     handle: u32,
     shm_id: u32,
     active: ActiveField,
+    prefill_username: &str,
     pixels: &mut [u32],
     background: &Option<Background>,
     config: &GreeterConfig,
@@ -934,21 +989,22 @@ fn read_field(
     let mut dirty = true;
     loop {
         if dirty {
-            // Repaint to show the current buffer contents (username
-            // only; password always shows empty per Phase 71 D.1).
             paint_background(
                 pixels,
-                SURFACE_WIDTH_PX,
-                SURFACE_HEIGHT_PX,
+                surface_width_px(),
+                surface_height_px(),
                 background,
                 config,
             );
             let ui_state = LoginUiState {
                 config,
+                // Username field: live buffer while typing in it,
+                // otherwise the already-submitted prefill so it stays
+                // visible during password entry.
                 username: if matches!(active, ActiveField::Username) {
                     buf.as_str()
                 } else {
-                    ""
+                    prefill_username
                 },
                 password_len: if matches!(active, ActiveField::Password) {
                     buf.len()
@@ -959,7 +1015,7 @@ fn read_field(
                 error: None,
                 backoff_seconds_remaining: None,
             };
-            render_login_ui(&ui_state, pixels, SURFACE_WIDTH_PX, SURFACE_HEIGHT_PX);
+            render_login_ui(&ui_state, pixels, surface_width_px(), surface_height_px());
             let _ = attach_damage_commit(handle, shm_id);
             dirty = false;
         }

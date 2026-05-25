@@ -24,11 +24,13 @@
 
 extern crate alloc;
 
+mod animation;
 mod borders;
 mod client;
 mod compose;
 mod config;
 mod control;
+mod decoration;
 mod fb;
 mod input;
 mod keybind;
@@ -58,6 +60,47 @@ static DIAG_COMPOSES_RUN: core::sync::atomic::AtomicU64 = core::sync::atomic::At
 static DIAG_FB_WRITES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static DIAG_PROTOCOL_VIOLATION_LOG_BUDGET: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(16);
+
+/// Monotonic-microsecond timestamp of the most recent fork/spawn
+/// initiated by a keybind handler (`SpawnTerm`, `LaunchLauncher`).
+/// Drives the [`MIN_SPAWN_INTERVAL_US`] coalescing gate so a user
+/// mashing SUPER+RETURN can't fork N processes in a tight loop —
+/// each spawn allocates a 64 KiB kernel stack + new page tables +
+/// initial SHM regions, and N simultaneous forks compound until
+/// the buddy can't satisfy a contiguous run. The gate keeps single
+/// presses snappy (the 100 ms window is below human perception)
+/// and turns adversarial mashing into bounded one-at-a-time
+/// serialisation.
+static LAST_SPAWN_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Minimum interval between successive spawn-from-keybind events,
+/// in microseconds. 100 ms is comfortably below the per-key
+/// repeat-delay threshold and indistinguishable from instant for
+/// deliberate user input, but a single mashed chord (typical
+/// key-repeat rate ~30 Hz = one event per 33 ms) coalesces to at
+/// most one fork per 100 ms.
+const MIN_SPAWN_INTERVAL_US: u64 = 100_000;
+
+/// Return `true` when a fresh keybind-driven spawn should fire
+/// (and atomically record the time as the latest spawn);
+/// `false` when the previous spawn was too recent. Single-threaded
+/// daemon, but `compare_exchange` keeps the call-site honest if
+/// the input drain ever becomes concurrent.
+fn try_consume_spawn_budget() -> bool {
+    let now = monotonic_micros();
+    let prev = LAST_SPAWN_US.load(core::sync::atomic::Ordering::Relaxed);
+    if now.saturating_sub(prev) < MIN_SPAWN_INTERVAL_US {
+        return false;
+    }
+    LAST_SPAWN_US
+        .compare_exchange(
+            prev,
+            now,
+            core::sync::atomic::Ordering::Relaxed,
+            core::sync::atomic::Ordering::Relaxed,
+        )
+        .is_ok()
+}
 use crate::control::{
     ControlSubscriptions, DebugCrashPolicy, null_subscriber_sender, publish_bind_triggered,
     publish_focus_changed, publish_surface_created, publish_surface_destroyed, record_frame_sample,
@@ -368,6 +411,19 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     let mut registry = SurfaceRegistry::new();
     let mut compose_ctx = ComposeContext::new();
     let mut bulk_buf = alloc::vec![0u8; client::MAX_BULK_BYTES];
+    // Phase 73 Track A — animation engine, ticked once per compose
+    // frame below. `push` will be wired up by the upcoming workspace-
+    // switch / surface-create / surface-destroy hooks; until those
+    // land the engine ticks an empty list and produces no damage.
+    let mut animation_engine = animation::AnimationEngine::new();
+    let mut last_animation_tick_us: u64 = monotonic_micros();
+    // Phase 73 Track B — pre-computed rounded-corner mask. Held here
+    // so the per-frame decoration pass (a documented follow-up) can
+    // apply it without re-allocating. Zero radius makes
+    // `RoundedCornerMask::is_disabled()` true and the future apply
+    // pass becomes a no-op.
+    let _decoration_mask =
+        decoration::RoundedCornerMask::new(compositor_config.decorations.corner_radius);
     // Phase 72b — `[autostart]` execution latch. Flipped to `true`
     // after the first successful compose so the autostart entries
     // launch exactly once per compositor lifetime, matching
@@ -385,6 +441,33 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     // its intrinsic size and the compositor handles repositioning.
     let mut last_tile_dims: alloc::collections::BTreeMap<SurfaceId, (u32, u32)> =
         alloc::collections::BTreeMap::new();
+    // Phase 73 — full tile rect per surface (position + size). Used to
+    // detect *position* changes that drive `WindowMove` animations;
+    // the dims-only map above still gates `SurfaceResized` so clients
+    // that don't care about position don't get spurious notifications.
+    let mut last_tile_rects: alloc::collections::BTreeMap<SurfaceId, Rect> =
+        alloc::collections::BTreeMap::new();
+    // Phase 73 — last-computed Toplevel arrangement, used by the
+    // input dispatcher's hit-test so clicks land on the *tiled* rect
+    // (not the centred buffer rect from `iter_compose`). Updated on
+    // every frame-tick compose pass; the input drain consumes it on
+    // every iteration of the outer loop, so the hit-test lags compose
+    // by at most one frame.
+    let mut last_arrangement: alloc::vec::Vec<(SurfaceId, Rect)> = alloc::vec::Vec::new();
+    // Phase 73 — last active workspace index. When this changes (the
+    // user invokes SUPER+1..9 / `m3ctl workspace switch`), the main
+    // loop pushes a `WorkspaceSwitch` slide-in for each surface in
+    // the newly-active workspace so the transition has motion
+    // instead of snapping instantly to the destination set.
+    let mut last_workspace_idx: usize = workspace_mgr.current_index();
+    // Surfaces the compose loop has rendered at least once. The
+    // `WindowOpen` animation is pushed when a Toplevel first enters
+    // this set so the open-pop is paid by the FIRST visible frame —
+    // not at SetSurfaceRole time, when the client typically hasn't
+    // committed its first buffer yet and the animation's first
+    // 50–100 ms would be invisible.
+    let mut rendered_surfaces: alloc::collections::BTreeSet<SurfaceId> =
+        alloc::collections::BTreeSet::new();
     // Phase 57d follow-up — Tier 1 fullscreen-takeover gate. When a
     // control client (e.g. `/bin/fb-takeover`) sends `YieldFb`, the
     // server drops framebuffer ownership via `SYS_FB_YIELD` and sets
@@ -591,6 +674,8 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                 for sid in &destroyed {
                     let _ = workspace_mgr.remove_surface(*sid);
                     last_tile_dims.remove(sid);
+                    last_tile_rects.remove(sid);
+                    rendered_surfaces.remove(sid);
                     if focused == Some(*sid) {
                         focused = None;
                     }
@@ -605,7 +690,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                     // path lands here when a client cleanly says
                     // farewell while the destroy branch covers
                     // explicit DestroySurface verbs.
-                    compose_ctx.force_full_repaint();
+                    compose_ctx.force_full_repaint_clearing_background();
                 }
             } else {
                 syscall_lib::write_str(
@@ -621,6 +706,14 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         for (sid, role) in outcome.created.iter() {
             if matches!(role, SurfaceRole::Toplevel) {
                 workspace_mgr.insert_on_current(*sid);
+                // The WindowOpen animation is *not* pushed here.
+                // SetSurfaceRole fires before the client has
+                // committed its first buffer, so the engine would
+                // tick for 50–100 ms with the surface still invisible
+                // — by the time it landed on screen the pop-in would
+                // be 30–60% complete. The animation is pushed below,
+                // once the surface actually shows up in the compose
+                // entries list, so the user sees the full effect.
             }
         }
         for sid in outcome.destroyed.iter() {
@@ -629,6 +722,13 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             // map so a future surface that lands at the same id does
             // not get spuriously diffed against the dead tile.
             last_tile_dims.remove(sid);
+            last_tile_rects.remove(sid);
+            rendered_surfaces.remove(sid);
+            // Phase 73 Track A — drop any in-flight animations against
+            // this surface so the engine does not advance timers for a
+            // dead client. The destroy path already forces a full
+            // repaint below.
+            animation_engine.drop_surface(*sid);
         }
         // Phase 72b — surfaces leaving the active arrangement leave
         // stale pixels in the framebuffer (term being closed, greeter
@@ -637,7 +737,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         // surface re-blits cleanly. Cheap (one full FB clear) and
         // confined to the rare destroy path.
         if !outcome.destroyed.is_empty() {
-            compose_ctx.force_full_repaint();
+            compose_ctx.force_full_repaint_clearing_background();
         }
         if let Some(focused_id) = focused
             && outcome.destroyed.iter().any(|id| *id == focused_id)
@@ -787,6 +887,47 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             syscall_lib::frame_tick_drain()
         };
         if ticks > 0 {
+            // Phase 73 Track A — advance the animation engine once per
+            // frame. When any animation is in flight, the returned
+            // `DamageRegion` is non-empty and we conservatively force a
+            // full repaint so the animated rect lands on screen. An
+            // empty engine produces no damage and skips this branch
+            // entirely.
+            let now_us = monotonic_micros();
+            let delta_us = now_us.saturating_sub(last_animation_tick_us);
+            last_animation_tick_us = now_us;
+            let delta_ms = (delta_us / 1000) as u32;
+            if delta_ms > 0 && !animation_engine.is_empty() {
+                let damage = animation_engine.tick(delta_ms);
+                if !damage.is_empty() {
+                    // Animations move pixels within already-occupied
+                    // rects — no surface vacates an area, so a
+                    // full-screen background clear is not needed.
+                    // Using the bare repaint avoids the
+                    // clear-then-blit flash that single-buffered
+                    // direct-to-FB rendering otherwise produces every
+                    // animation tick.
+                    compose_ctx.force_full_repaint();
+                }
+                // The cached arrangement in `ComposeContext` is keyed
+                // on the toplevel id set, so it only recomputes when
+                // surfaces are added or removed. During a workspace
+                // slide the id set stays constant across frames (both
+                // workspaces' surfaces are in the merged filter), so
+                // without an explicit invalidation `layout.arrange`
+                // would run once at slide-start and the cached rects
+                // — with frame-0 offsets baked in — would survive the
+                // entire 260 ms duration. The user-visible symptom is
+                // "no slide motion at all": the workspace appears to
+                // snap on slide-end when the id set finally shrinks
+                // and arrange runs again. Invalidating per tick while
+                // a slide is in flight is cheap (two `arrange_*` calls
+                // per frame) and lets the per-frame `from_offset_x` /
+                // `to_offset_x` values actually drive on-screen motion.
+                if animation_engine.workspace_slide().is_some() {
+                    compose_ctx.invalidate_arrangement_cache();
+                }
+            }
             // Phase 57d follow-up — post-reclaim full-screen fill.
             // After Tier 1 fullscreen-takeover, the takeover program
             // (e.g. doom) drew over the entire FB. `run_compose`
@@ -836,8 +977,19 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             // workspaces don't receive resize events until they come
             // back into view (the next `switch_workspace` will diff and
             // re-emit if their new tile differs).
+            // Phase 73 — feed Layer-shell `exclusive_zones` into the
+            // pre-tile usable rect so the bar's 24 px top strip (and
+            // any other docked Layer surface) is excluded from the
+            // tiling area. Without this, toplevels overlap docked
+            // Layer surfaces — the visible Phase 73 bug.
+            let diff_exclusive_zones = registry.exclusive_zones(Rect {
+                x: 0,
+                y: 0,
+                w: meta.width,
+                h: meta.height,
+            });
             let arrangement_for_diff: alloc::vec::Vec<(SurfaceId, Rect)> = workspace_mgr
-                .arrange_current(
+                .arrange_current_with_exclusive(
                     Rect {
                         x: 0,
                         y: 0,
@@ -845,20 +997,53 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                         h: meta.height,
                     },
                     compositor_config.gaps,
+                    &diff_exclusive_zones,
                 );
-            // Phase 72b — track whether the arrangement structure
-            // changed this frame (any tile dim flipped or any surface
-            // left the active set). On a change, the now-uncovered
-            // FB regions — inner gaps that shifted, outer-gap edges
-            // newly exposed by a shrunken tile, the entire
-            // previously-occupied area when a workspace switch swaps
-            // surface sets — keep stale pixels from the old frame
-            // because compose_frame only writes inside damage rects
-            // and the gap areas are in no damage list. Force a full
-            // repaint when this happens so the background fill clears
-            // the gaps before the surface pass re-blits the live tiles.
+            last_arrangement = arrangement_for_diff.clone();
+            // Workspace-switch detection: when the active workspace
+            // changed since last frame, push a `WorkspaceSwitch`
+            // slide-in animation for every surface in the new
+            // arrangement. The animation lerps each surface in from
+            // off-screen-right so the transition has visible motion
+            // instead of the surfaces snapping to their destination
+            // instantly. Runs before the first-render / move passes
+            // below so workspace-switch is the dominant animation
+            // when both could apply.
+            let current_ws = workspace_mgr.current_index();
+            let workspace_switched = current_ws != last_workspace_idx;
+            if workspace_switched {
+                // Workspace transitions are a single value, not a pile
+                // of per-surface state. The animation engine owns one
+                // `WorkspaceSlide` that drives the x-offset of every
+                // tile in both workspaces; the compose pass reads the
+                // offsets via [`SlideContext`] and renders the live
+                // surfaces of both workspaces at the resulting offsets.
+                // No pixel snapshots, no per-surface animations, no
+                // unbounded allocation under rapid switching.
+                //
+                // Direction sign: `+1` when stepping forward (new
+                // workspace enters from the right); `-1` for backward.
+                let direction = if current_ws > last_workspace_idx {
+                    1
+                } else {
+                    -1
+                };
+                animation_engine.request_workspace_slide(
+                    last_workspace_idx,
+                    current_ws,
+                    direction,
+                    meta.width as i32,
+                );
+                last_workspace_idx = current_ws;
+            }
+            // Per-surface WindowOpen / WindowMove animations layer on
+            // top of the slide; while a slide is in flight we suppress
+            // them so a slide-in tile doesn't simultaneously trigger a
+            // pop-in or a spring-move.
+            let slide_in_flight = animation_engine.workspace_slide().is_some();
             let mut arrangement_changed = false;
             for (sid, rect) in arrangement_for_diff.iter() {
+                // Dim-change check drives `SurfaceResized` -> client.
                 let entry = last_tile_dims.entry(*sid).or_insert((0, 0));
                 if entry.0 != rect.w || entry.1 != rect.h {
                     *entry = (rect.w, rect.h);
@@ -875,6 +1060,30 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                         },
                     ));
                 }
+                // Rect-change check. First appearance of a surface in
+                // the active arrangement → WindowOpen pop-in (unless a
+                // slide is in flight — the surface's slide-in motion
+                // already provides visible entry). Subsequent rect
+                // changes → WindowMove spring lerp.
+                let prev_rect = last_tile_rects.insert(*sid, *rect);
+                match prev_rect {
+                    None => {
+                        if !slide_in_flight && !rendered_surfaces.contains(sid) {
+                            animation_engine.animate(
+                                *sid,
+                                animation::AnimationKind::WindowOpen,
+                                *rect,
+                            );
+                        }
+                        rendered_surfaces.insert(*sid);
+                    }
+                    Some(prev) if prev != *rect => {
+                        if !slide_in_flight {
+                            animation_engine.animate_move(*sid, prev, *rect);
+                        }
+                    }
+                    _ => {}
+                }
             }
             // Drop tracked dims for surfaces that left the active
             // arrangement (workspace switch, destroy, move). This keeps
@@ -884,15 +1093,41 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                 arrangement_for_diff.iter().map(|(sid, _)| *sid).collect();
             let prev_tracked = last_tile_dims.len();
             last_tile_dims.retain(|sid, _| active_set.contains(sid));
+            last_tile_rects.retain(|sid, _| active_set.contains(sid));
             if last_tile_dims.len() != prev_tracked {
                 arrangement_changed = true;
             }
             if arrangement_changed {
-                compose_ctx.force_full_repaint();
+                compose_ctx.force_full_repaint_clearing_background();
             }
+            // Slide-aware compose: if a workspace slide is in flight,
+            // feed the adapter the precomputed offsets and the include
+            // filter the union of both workspaces' Toplevel id sets.
+            // The adapter merges both workspaces' tile arrangements
+            // with the offsets applied; the filter ensures
+            // `iter_compose_filtered` picks up surfaces from both.
+            let slide_state = animation_engine.workspace_slide().copied();
+            let (slide_ctx, outgoing_ws_windows) = match slide_state {
+                Some(slide) => {
+                    let from_windows = workspace_mgr
+                        .workspace(slide.from_ws)
+                        .map(|w| w.windows().to_vec())
+                        .unwrap_or_default();
+                    (
+                        Some(crate::workspace::SlideContext {
+                            from_ws: slide.from_ws,
+                            from_offset_x: slide.from_offset_x(),
+                            to_offset_x: slide.to_offset_x(),
+                        }),
+                        from_windows,
+                    )
+                }
+                None => (None, alloc::vec::Vec::new()),
+            };
             let mut adapter = WorkspaceLayoutAdapter {
                 manager: &mut workspace_mgr,
                 gaps: compositor_config.gaps,
+                slide: slide_ctx,
             };
             let compose_result = run_compose_filtered(
                 &mut owner,
@@ -900,9 +1135,10 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                 &mut registry,
                 &mut compose_ctx,
                 pointer_position,
-                |id| active_ws_windows.contains(&id),
+                |id| active_ws_windows.contains(&id) || outgoing_ws_windows.contains(&id),
                 Some(compositor_config.borders),
                 focused,
+                Some(&animation_engine),
             );
             let elapsed_us = monotonic_micros().saturating_sub(start_us);
             let compose_micros = if elapsed_us > u32::MAX as u64 {
@@ -1022,11 +1258,45 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             w: meta.width,
             h: meta.height,
         };
+        // Build the dispatcher's hit-test slice in compose layer
+        // order so `hit_test`'s reverse-iteration picks the front-most
+        // surface first: Background, then Bottom, then Toplevel, then
+        // Top, then Overlay. `iter_compose` already returns surfaces
+        // in that order, so we just walk it once. For Toplevels we
+        // substitute the tile rect from the last frame's arrangement
+        // (so clicks land on the *tiled* rect, not `iter_compose`'s
+        // centred buffer rect) and filter out Toplevels on other
+        // workspaces. Layer surfaces keep their `iter_compose` rect
+        // (compute_layer_geometry already resolved anchor + buffer
+        // dims to a final placement). Phase 73 — earlier revisions
+        // pushed Toplevels first and Layer surfaces after, which
+        // inverted the layer order and made the wallpaper Background
+        // (full-output rect) win every hit-test → clicks on the
+        // terminal never produced a focus change.
+        let active_ws_set: alloc::collections::BTreeSet<SurfaceId> =
+            workspace_mgr.current().windows().iter().copied().collect();
+        let tile_lookup: alloc::collections::BTreeMap<SurfaceId, Rect> =
+            last_arrangement.iter().copied().collect();
+        let mut surface_geom: alloc::vec::Vec<SurfaceGeometry> = alloc::vec::Vec::new();
         let compose_entries = registry.iter_compose(output_rect);
-        let surface_geom: alloc::vec::Vec<SurfaceGeometry> = compose_entries
-            .iter()
-            .map(|e| SurfaceGeometry::toplevel(e.id, e.rect))
-            .collect();
+        for entry in compose_entries.iter() {
+            if matches!(
+                entry.layer,
+                kernel_core::display::compose::ComposeLayer::Toplevel
+            ) {
+                if !active_ws_set.contains(&entry.id) {
+                    continue;
+                }
+                let rect = tile_lookup.get(&entry.id).copied().unwrap_or(entry.rect);
+                surface_geom.push(SurfaceGeometry::toplevel(entry.id, rect));
+            } else if let Some(role) = registry.surface_role(entry.id) {
+                surface_geom.push(SurfaceGeometry {
+                    id: entry.id,
+                    rect: entry.rect,
+                    role,
+                });
+            }
+        }
         // Reset hover tracking if the previously hovered surface is no
         // longer in the registry. The dispatcher cannot know this on
         // its own — the registry is the source of truth.
@@ -1043,9 +1313,18 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         // table is the union of the built-in chord set plus any
         // user-supplied chords parsed from `/etc/compositor.conf`.
         let _ = &bind_table; // legacy: still mutated by control socket
+        // Phase 73 — honour exclusive-keyboard claims from Layer
+        // surfaces (lockscreen, modal dialogs). `SurfaceRegistry`
+        // already tracks the active claim via its `LayerConflictTracker`;
+        // wire it through to the dispatcher so a mapped lockscreen
+        // actually receives every keystroke (the dispatcher routes the
+        // event to the exclusive layer instead of the focused
+        // Toplevel). Without this, the lockscreen never sees the
+        // unlock chord and the user is stuck.
+        let active_exclusive_layer = registry.active_exclusive_layer();
         let effects = input_wiring.drain_one_pass(
             focused,
-            None, // active_exclusive_layer — E.2 wires this once Layer surfaces map
+            active_exclusive_layer,
             pointer_position,
             &surface_geom,
             bind_stack.active_table(),
@@ -1114,17 +1393,21 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                     focused = Some(id);
                     if prev != focused {
                         publish_focus_changed(&mut control_subs, focused, null_subscriber_sender);
-                        // Phase 72 review-resolution — borders use the
-                        // focused id to pick active vs inactive colour
-                        // every compose pass. Without a forced repaint
-                        // here the no-damage short-circuit can keep the
-                        // previous border colours on screen until some
-                        // unrelated surface damages. Focus changes are
-                        // user-initiated and infrequent, so paying one
-                        // full repaint per focus transition is cheap.
-                        // Also invalidates the cache so `focus_affects_
-                        // geometry()` layouts (tabbed, fullscreen) pick
-                        // the new visible surface on the next pass.
+                        // Borders use the focused id to pick active vs
+                        // inactive colour every compose pass. Without
+                        // a forced repaint the no-damage short-circuit
+                        // can keep the previous border colours on
+                        // screen until some unrelated surface damages.
+                        // Focus changes don't expose any new
+                        // background area — surfaces stay in place
+                        // and the bar / toplevels overpaint their
+                        // tiles — so the bare repaint variant
+                        // suffices, avoiding the clear-then-blit
+                        // flash on every click-to-focus.
+                        // `invalidate_arrangement_cache` still fires
+                        // so `focus_affects_geometry()` layouts
+                        // (tabbed, fullscreen) pick the new visible
+                        // surface on the next pass.
                         compose_ctx.force_full_repaint();
                         compose_ctx.invalidate_arrangement_cache();
                     }
@@ -1278,7 +1561,7 @@ fn serve_one_control_request(
                 // partition until something else damaged the framebuffer.
                 let n = handle_set_layout(workspace_mgr, kind, &mut reply_buf);
                 compose_ctx.invalidate_arrangement_cache();
-                compose_ctx.force_full_repaint();
+                compose_ctx.force_full_repaint_clearing_background();
                 n
             }
             ControlCommand::SwitchWorkspace { n } => {
@@ -1295,7 +1578,7 @@ fn serve_one_control_request(
                 // gate bypassed so borders + background recolour on the
                 // next pass.
                 compose_ctx.invalidate_arrangement_cache();
-                compose_ctx.force_full_repaint();
+                compose_ctx.force_full_repaint_clearing_background();
                 nbytes
             }
             ControlCommand::MoveToWorkspace { n, follow } => {
@@ -1308,7 +1591,7 @@ fn serve_one_control_request(
                     &mut reply_buf,
                 );
                 compose_ctx.invalidate_arrangement_cache();
-                compose_ctx.force_full_repaint();
+                compose_ctx.force_full_repaint_clearing_background();
                 nbytes
             }
             ControlCommand::Reload => {
@@ -1316,7 +1599,7 @@ fn serve_one_control_request(
                 // Gaps / borders / per-workspace policy may all have
                 // changed; recompute arrangement and repaint.
                 compose_ctx.invalidate_arrangement_cache();
-                compose_ctx.force_full_repaint();
+                compose_ctx.force_full_repaint_clearing_background();
                 n
             }
             ControlCommand::QueryWindows => {
@@ -1336,13 +1619,13 @@ fn serve_one_control_request(
             ControlCommand::SetMasterRatio { ratio_x100 } => {
                 let n = handle_set_master_ratio(workspace_mgr, ratio_x100, &mut reply_buf);
                 compose_ctx.invalidate_arrangement_cache();
-                compose_ctx.force_full_repaint();
+                compose_ctx.force_full_repaint_clearing_background();
                 n
             }
             ControlCommand::TileFullscreen => {
                 let n = handle_tile_fullscreen(workspace_mgr, &mut reply_buf);
                 compose_ctx.invalidate_arrangement_cache();
-                compose_ctx.force_full_repaint();
+                compose_ctx.force_full_repaint_clearing_background();
                 n
             }
             _ => {
@@ -2156,7 +2439,7 @@ fn dispatch_keybind_action(
                     *focused = workspace_mgr.next_focus(None);
                     publish_focus_changed(control_subs, *focused, null_subscriber_sender);
                     compose_ctx.invalidate_arrangement_cache();
-                    compose_ctx.force_full_repaint();
+                    compose_ctx.force_full_repaint_clearing_background();
                 }
             }
         }
@@ -2177,7 +2460,7 @@ fn dispatch_keybind_action(
                         publish_focus_changed(control_subs, *focused, null_subscriber_sender);
                     }
                     compose_ctx.invalidate_arrangement_cache();
-                    compose_ctx.force_full_repaint();
+                    compose_ctx.force_full_repaint_clearing_background();
                 }
             }
         }
@@ -2186,20 +2469,59 @@ fn dispatch_keybind_action(
             if next != *focused {
                 *focused = next;
                 publish_focus_changed(control_subs, *focused, null_subscriber_sender);
-                // Repaint so border colours track the new focus, and
-                // recompute arrangement for `focus_affects_geometry()`
-                // policies (tabbed / fullscreen).
+                // Same rationale as `InputEffect::FocusChanged`: border
+                // recolour, no vacated area. The bare repaint variant
+                // avoids the clear-then-blit flash.
                 compose_ctx.invalidate_arrangement_cache();
                 compose_ctx.force_full_repaint();
             }
         }
         KeybindAction::SpawnTerm => {
+            // Coalesce rapid mashes: each fork allocates a 64 KiB
+            // kernel stack + new page tables + initial SHM regions,
+            // so N near-simultaneous forks pressurise the buddy
+            // allocator. The throttle keeps a single press snappy
+            // and bounds keymashing to one spawn per
+            // MIN_SPAWN_INTERVAL_US.
+            if !try_consume_spawn_budget() {
+                syscall_lib::write_str(STDOUT_FILENO, "display_server: SUPER+RETURN throttled\n");
+                return;
+            }
             let pid = syscall_lib::fork();
             if pid == 0 {
                 let _ = spawn_term();
                 syscall_lib::exit(99);
             }
             syscall_lib::write_str(STDOUT_FILENO, "display_server: SUPER+RETURN spawned term\n");
+        }
+        KeybindAction::LaunchLauncher => {
+            // Phase 73 — fork + execve the launcher. If a launcher is
+            // already running, the existing process owns the chord
+            // surface and a second fork is harmless: it exits after
+            // failing to acquire the singleton service-registry slot
+            // it tries to register. Cheap (one extra fork on
+            // double-press) and keeps the code path symmetric with
+            // `SpawnTerm`. Same throttle for the same reason.
+            if !try_consume_spawn_budget() {
+                syscall_lib::write_str(STDOUT_FILENO, "display_server: SUPER+SPACE throttled\n");
+                return;
+            }
+            let pid = syscall_lib::fork();
+            if pid == 0 {
+                if let Some(session) = read_session_state() {
+                    let _ = syscall_lib::setgid(session.gid);
+                    let _ = syscall_lib::setuid(session.uid);
+                    let _ =
+                        spawn_exec_with_session(b"/bin/launcher\0", b"/bin/launcher\0", &session);
+                } else {
+                    let _ = spawn_exec(b"/bin/launcher\0", b"/bin/launcher\0");
+                }
+                syscall_lib::exit(99);
+            }
+            syscall_lib::write_str(
+                STDOUT_FILENO,
+                "display_server: SUPER+SPACE spawned launcher\n",
+            );
         }
         KeybindAction::KillFocused => {
             // Phase 72b Track K.6 — push `ServerMessage::CloseRequest`
@@ -2267,7 +2589,7 @@ fn dispatch_keybind_action(
                 // otherwise keep painting the previous ratios.
                 if result.is_ok() {
                     compose_ctx.invalidate_arrangement_cache();
-                    compose_ctx.force_full_repaint();
+                    compose_ctx.force_full_repaint_clearing_background();
                 }
                 let _ = result;
             } else {

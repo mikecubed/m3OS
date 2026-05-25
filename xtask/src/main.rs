@@ -191,6 +191,17 @@ struct DeviceSet {
     /// for context (TCG `rdmsr` cost was a notable contributor to that
     /// regression's tail latency).
     kvm: bool,
+    /// Override the guest RAM size (MiB). `None` keeps the
+    /// 2 GiB Phase 73 default in
+    /// [`qemu_args_with_devices_resolved`]; `Some(N)` substitutes `N`
+    /// MiB for the `-m` argument. Set via `-m <spec>` / `-m=<spec>` /
+    /// `--memory <spec>` / `--memory=<spec>` (suffixes `g`/`G` = GiB,
+    /// `m`/`M` or bare = MiB) or the `M3OS_MEM` env var. The compositor
+    /// SHM-leak handoff (`docs/handoffs/2026-05-22-compositor-shm-leak-multi-term-oom.md`)
+    /// motivates the override: 4 GiB KVM lets the original
+    /// multi-term + workspace repro run with headroom, while the
+    /// default 2 GiB keeps TCG smoke/regression suites within budget.
+    memory_mib: Option<u32>,
 }
 
 /// Parse `--device <name>` and `--iommu` flags out of `args`, returning the
@@ -221,6 +232,17 @@ fn extract_device_flags(args: &[String]) -> Result<(DeviceSet, Vec<String>), Str
             devices.iommu = true;
         } else if arg == "--kvm" {
             devices.kvm = true;
+        } else if arg == "-m" || arg == "--memory" {
+            index += 1;
+            let spec = args
+                .get(index)
+                .ok_or_else(|| format!("missing value for `{arg}`"))?;
+            devices.memory_mib = Some(parse_memory_spec(spec)?);
+        } else if let Some(spec) = arg
+            .strip_prefix("-m=")
+            .or_else(|| arg.strip_prefix("--memory="))
+        {
+            devices.memory_mib = Some(parse_memory_spec(spec)?);
         } else {
             remaining.push(arg.clone());
         }
@@ -233,7 +255,58 @@ fn extract_device_flags(args: &[String]) -> Result<(DeviceSet, Vec<String>), Str
         devices.kvm = true;
     }
 
+    // `M3OS_MEM` env-var alias — matches the `-m`/`--memory` flag for CI
+    // and tmux-session use where flag-plumbing is awkward. Flag wins if
+    // both are set (handed to `extract_device_flags` first).
+    apply_memory_env_fallback(&mut devices)?;
+
     Ok((devices, remaining))
+}
+
+/// Populate `devices.memory_mib` from `M3OS_MEM=` if no explicit flag set it.
+///
+/// Centralized so every QEMU launch path — including the smoke variants that
+/// have their own arg parsers and never call `extract_device_flags` — picks
+/// up the env-var override consistently. Called both from `extract_device_flags`
+/// (so the flag still wins) and from `qemu_args_with_devices_resolved` (catch-all
+/// for subcommands that build a `DeviceSet` without flag parsing). Idempotent:
+/// silently no-ops if `memory_mib` is already set.
+fn apply_memory_env_fallback(devices: &mut DeviceSet) -> Result<(), String> {
+    if devices.memory_mib.is_some() {
+        return Ok(());
+    }
+    if let Some(spec) = std::env::var_os("M3OS_MEM") {
+        let spec = spec.to_string_lossy().into_owned();
+        if !spec.is_empty() {
+            devices.memory_mib = Some(parse_memory_spec(&spec)?);
+        }
+    }
+    Ok(())
+}
+
+/// Parse an `-m <spec>` / `--memory <spec>` / `-m=<spec>` / `--memory=<spec>`
+/// argument out of the slice at `*index`, advancing the index past any consumed
+/// value. Returns `Ok(Some(mib))` if the current arg matched, `Ok(None)` if it
+/// didn't (caller should handle the arg via its own dispatch), and `Err(_)` on
+/// malformed input. Mirrors the parsing in `extract_device_flags` so the
+/// smoke / regression subcommand parsers can opt in to the same surface area
+/// without duplicating the suffix-stripping logic.
+fn try_take_memory_arg(args: &[String], index: &mut usize) -> Result<Option<u32>, String> {
+    let arg = &args[*index];
+    if arg == "-m" || arg == "--memory" {
+        *index += 1;
+        let spec = args
+            .get(*index)
+            .ok_or_else(|| format!("missing value for `{arg}`"))?;
+        return Ok(Some(parse_memory_spec(spec)?));
+    }
+    if let Some(spec) = arg
+        .strip_prefix("-m=")
+        .or_else(|| arg.strip_prefix("--memory="))
+    {
+        return Ok(Some(parse_memory_spec(spec)?));
+    }
+    Ok(None)
 }
 
 fn apply_device_flag(name: &str, devices: &mut DeviceSet) -> Result<(), String> {
@@ -248,6 +321,61 @@ fn apply_device_flag(name: &str, devices: &mut DeviceSet) -> Result<(), String> 
         }
     }
     Ok(())
+}
+
+/// Minimum guest RAM in MiB. Set to 256 because the kernel's bootstrap heap is
+/// 8 MiB and SMP/userspace setup pushes peak usage past 64 MiB before paging
+/// in additional buddy regions. Anything under 256 MiB is more useful as a
+/// bug report than a configuration option.
+const MIN_GUEST_MEMORY_MIB: u32 = 256;
+
+/// Soft ceiling above which TCG boot becomes prohibitively slow because
+/// `BuddyAllocator::free()` is called once per frame at init_buddy time.
+/// At 4 GiB that is ~1M frames × MAX_ORDER walk-up. KVM handles this fine,
+/// hence the warning is conditional on `kvm == false`.
+const TCG_GUEST_MEMORY_WARN_MIB: u32 = 2048;
+
+/// Parse a `-m` / `--memory` spec into MiB.
+///
+/// Accepted forms (case-insensitive suffix):
+///   * `4g`, `4G`        → gigabytes (`4 * 1024` MiB)
+///   * `512m`, `512M`    → megabytes
+///   * `2048`            → bare number = MiB (matches QEMU's `-m` convention)
+///
+/// Rejects empty input, non-integer prefixes, unknown suffixes, and values
+/// below [`MIN_GUEST_MEMORY_MIB`]. The handoff at
+/// `docs/handoffs/2026-05-22-compositor-shm-leak-multi-term-oom.md`
+/// documents why the 256 MiB floor exists.
+fn parse_memory_spec(spec: &str) -> Result<u32, String> {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return Err("memory spec is empty".to_string());
+    }
+    let (num_part, mult) = match trimmed.as_bytes().last() {
+        Some(&b) if b == b'g' || b == b'G' => (&trimmed[..trimmed.len() - 1], 1024u32),
+        Some(&b) if b == b'm' || b == b'M' => (&trimmed[..trimmed.len() - 1], 1u32),
+        Some(&b) if b.is_ascii_digit() => (trimmed, 1u32),
+        _ => {
+            return Err(format!(
+                "memory spec `{spec}` has unsupported suffix (use `g`/`G`, `m`/`M`, or bare MiB)"
+            ));
+        }
+    };
+    if num_part.is_empty() {
+        return Err(format!("memory spec `{spec}` is missing a numeric value"));
+    }
+    let n: u32 = num_part
+        .parse()
+        .map_err(|_| format!("memory spec `{spec}` is not a positive integer"))?;
+    let mib = n
+        .checked_mul(mult)
+        .ok_or_else(|| format!("memory spec `{spec}` overflows u32 MiB"))?;
+    if mib < MIN_GUEST_MEMORY_MIB {
+        return Err(format!(
+            "memory spec `{spec}` resolves to {mib} MiB — minimum is {MIN_GUEST_MEMORY_MIB} MiB"
+        ));
+    }
+    Ok(mib)
 }
 
 /// Path to the QEMU NVMe backing image used by `--device nvme`.
@@ -527,6 +655,14 @@ fn main() {
             });
             cmd_less_render_probe(&probe_args);
         }
+        Some("compositor-stress") => {
+            let stress_args = parse_compositor_stress_args(&args[2..]).unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            cmd_compositor_stress(&stress_args);
+        }
         Some("runner") => {
             let kernel_binary = args
                 .get(2)
@@ -585,8 +721,9 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [--device nvme|e1000|audio]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
-     Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths."
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+     Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
+     Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
 
 fn workspace_root() -> PathBuf {
@@ -787,6 +924,19 @@ fn build_userspace_bins() {
         // binary links `kernel-core`, `passwd`, and uses `String` /
         // `Vec` in the auth + render paths.
         ("greeter", "greeter", true),
+        // Phase 73 — desktop background Layer-shell client.
+        ("wallpaper", "wallpaper", true),
+        // Phase 73 — persistent status bar Layer-shell client.
+        ("bar", "bar", true),
+        // Phase 73 — fuzzy-filter app launcher (SUPER+SPACE chord
+        // target).
+        ("launcher", "launcher", true),
+        // Phase 73 — notification daemon + companion `notify-send`
+        // CLI. Both bins ship from the `notifyd` crate.
+        ("notifyd", "notifyd", true),
+        ("notifyd", "notify-send", true),
+        // Phase 73 — lockscreen Layer-shell stub.
+        ("lockscreen", "lockscreen", true),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -2249,7 +2399,17 @@ fn build_kernel() -> PathBuf {
 fn create_uefi_image(kernel_binary: &Path) -> PathBuf {
     let uefi_path = kernel_binary.parent().unwrap().join("boot-uefi-m3os.img");
 
-    let builder = bootloader::DiskImageBuilder::new(kernel_binary.to_path_buf());
+    let mut builder = bootloader::DiskImageBuilder::new(kernel_binary.to_path_buf());
+    // Phase 73 — request a 1920×1080 GOP mode at boot time. The UEFI
+    // bootloader picks the closest available mode at or above these
+    // dimensions and falls back to a smaller mode if the firmware
+    // doesn't expose 1080p (QEMU's `std` VGA + recent OVMF both
+    // expose 1920×1080; earlier phases came up at 1280×800 because
+    // no minimum was requested).
+    let mut boot_cfg = bootloader::BootConfig::default();
+    boot_cfg.frame_buffer.minimum_framebuffer_width = Some(1920);
+    boot_cfg.frame_buffer.minimum_framebuffer_height = Some(1080);
+    builder.set_boot_config(&boot_cfg);
     builder
         .create_uefi_image(&uefi_path)
         .expect("failed to create UEFI disk image");
@@ -2653,6 +2813,27 @@ fn qemu_args_with_devices(
     )
 }
 
+/// One-time stderr warning when the operator picks a guest memory size that
+/// exceeds the empirical TCG comfort ceiling. KVM is fine at 4+ GiB so the
+/// warning is conditional. Driven by [`TCG_GUEST_MEMORY_WARN_MIB`].
+fn warn_if_memory_overrides_tcg_budget(memory_mib: u32, kvm: bool) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if kvm || memory_mib <= TCG_GUEST_MEMORY_WARN_MIB {
+        return;
+    }
+    if WARNED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    eprintln!(
+        "warning: -m {memory_mib} MiB exceeds the TCG soft ceiling of \
+         {TCG_GUEST_MEMORY_WARN_MIB} MiB. Boot will work but `init_buddy` \
+         walks one buddy `free()` per frame and scales linearly with RAM, \
+         so TCG smoke/regression budgets may time out. Add `--kvm` for \
+         near-native boot at larger RAM, or accept the slower boot."
+    );
+}
+
 /// One-time stderr warning when `--kvm` is requested but `/dev/kvm` is not
 /// usable (missing, wrong permissions, or KVM module not loaded). QEMU
 /// itself will fail loudly with `Could not access KVM kernel module` once
@@ -2700,9 +2881,37 @@ fn qemu_args_with_devices_resolved(
     uefi_image: &Path,
     ovmf: &Path,
     display_mode: QemuDisplayMode,
-    devices: DeviceSet,
+    mut devices: DeviceSet,
     nvme_image: Option<&Path>,
 ) -> Vec<String> {
+    // Catch-all M3OS_MEM env-var fallback. `extract_device_flags` already
+    // applies this for `run` / `run-gui` / `test` / `device-smoke`, but the
+    // dedicated smoke parsers (audio-smoke, tui-smoke, regression, …) build
+    // a `DeviceSet` of their own without going through `extract_device_flags`.
+    // Centralizing the env-var check here means `M3OS_MEM=4g` works for
+    // every subcommand without needing per-parser plumbing.
+    if let Err(e) = apply_memory_env_fallback(&mut devices) {
+        // Match the loudness of the flag path — bad spec aborts the build
+        // rather than silently falling back to the default.
+        eprintln!("error parsing M3OS_MEM: {e}");
+        std::process::exit(1);
+    }
+    // Phase 73 (4K follow-up): 2 GiB default. Doubles the previous
+    // 1 GiB budget so the multi-term + workspace load at 4K has
+    // headroom for many surface buffers + per-process heaps without
+    // saturating physical memory. The `init_buddy` self-deadlock
+    // that previously hung boot at >1 GiB was fixed in
+    // `kernel/src/mm/frame_allocator.rs`. Pushed past 2 GiB TCG boot
+    // becomes prohibitively slow because `BuddyAllocator::free()`
+    // scales with frame count; KVM handles 4+ GiB fine, but the
+    // headless smoke / regression suites would time out under TCG.
+    //
+    // Callers can override via `-m <spec>` / `--memory <spec>` /
+    // `M3OS_MEM=<spec>` — see `extract_device_flags` and
+    // `parse_memory_spec`.
+    const DEFAULT_GUEST_MEMORY_MIB: u32 = 2048;
+    let memory_mib = devices.memory_mib.unwrap_or(DEFAULT_GUEST_MEMORY_MIB);
+    warn_if_memory_overrides_tcg_budget(memory_mib, devices.kvm);
     let mut args = vec![
         "-bios".to_string(),
         ovmf.display().to_string(),
@@ -2710,9 +2919,8 @@ fn qemu_args_with_devices_resolved(
         format!("format=raw,file={}", uefi_image.display()),
         "-serial".to_string(),
         "stdio".to_string(),
-        // Phase 36: increase RAM to 1 GB for larger disk image and extended storage workloads.
         "-m".to_string(),
-        "1024".to_string(),
+        memory_mib.to_string(),
         "-smp".to_string(),
         qemu_smp_count().to_string(),
     ];
@@ -2750,11 +2958,69 @@ fn qemu_args_with_devices_resolved(
             args.extend(["-display".to_string(), "none".to_string()]);
         }
         QemuDisplayMode::Gui => {
+            // Display backend selection. SDL is the historical default but
+            // is known to misbehave with QEMU 8.x on some Wayland and X11
+            // setups (gitlab qemu-project/qemu#2048, gitlab-#1902); set
+            // `M3OS_GUI_BACKEND=gtk` or `=vnc` to swap in a different
+            // backend without touching code. `=vnc` opens a server on
+            // `:0` so a host `vncviewer localhost:5900` (or any RFB
+            // client) can attach.
+            let backend = std::env::var("M3OS_GUI_BACKEND").unwrap_or_else(|_| "sdl".to_string());
+            let (display_arg, mention_vnc) = match backend.as_str() {
+                "sdl" => ("sdl".to_string(), false),
+                "gtk" => ("gtk".to_string(), false),
+                "vnc" => ("vnc=:0".to_string(), true),
+                other => {
+                    eprintln!(
+                        "warning: M3OS_GUI_BACKEND={other:?} not recognised; falling back to sdl. \
+                         Supported: sdl, gtk, vnc."
+                    );
+                    ("sdl".to_string(), false)
+                }
+            };
+            if mention_vnc {
+                eprintln!(
+                    "M3OS_GUI_BACKEND=vnc: QEMU listening on port 5900 — attach with \
+                     `vncviewer localhost:5900` (or `gvncviewer localhost:0`)."
+                );
+            }
             args.extend([
                 "-display".to_string(),
-                "sdl".to_string(),
+                display_arg,
                 "-audiodev".to_string(),
                 "none,id=noaudio".to_string(),
+                // Phase 73 follow-up — pin the standard VGA device.
+                // Without an explicit `-vga` the q35 + OVMF default
+                // varies by OVMF build: older OVMF exposes GOP via
+                // an implicit device, but recent OVMF builds (and
+                // certain KVM-host combinations) expose nothing at
+                // all and `bootloader_api` reports "no framebuffer"
+                // — the symptom the user hit after the VBE prototype
+                // landed without an explicit `-vga`. `std` forces
+                // the QEMU `VGA` device which OVMF reliably wires
+                // through GOP, and matches the device class the
+                // `-global VGA.vgamem_mb=32` below targets so the
+                // doubled VRAM for VBE page-flip actually lands.
+                //
+                // Override via `M3OS_GUI_VGA=<bochs-display|virtio-vga|...>`
+                // to swap in an alternative QEMU display device. Useful
+                // when investigating black-screen issues at 4K — the
+                // `std` device's 32 MiB VRAM is 98.9% utilized by a
+                // single 3840×2160×4 framebuffer, leaving no headroom
+                // for VBE double-buffering, and OVMF's default GOP mode
+                // list only goes up to 2560×1600.
+                "-vga".to_string(),
+                std::env::var("M3OS_GUI_VGA").unwrap_or_else(|_| "std".to_string()),
+                // Bump VGA VRAM so the kernel can request a virtual
+                // framebuffer that is `2 × visible_height` rows tall
+                // (true hardware page flip via VBE Y_OFFSET panning).
+                // At 1920 × 1080 × 4 the doubled buffer is ~16.6 MiB,
+                // just past the default `vgamem_mb=16`; 32 MiB leaves
+                // comfortable headroom. Confined to the GUI arm so
+                // headless boots (no display device) don't emit a
+                // noisy "global VGA.vgamem_mb=32 not used" warning.
+                "-global".to_string(),
+                "VGA.vgamem_mb=32".to_string(),
             ]);
         }
     }
@@ -2915,6 +3181,20 @@ fn launch_qemu_with_devices_audio(
         println!(
             "QEMU GUI mode: click the window to grab the keyboard, then press Ctrl+Alt+G to release it."
         );
+    }
+
+    if let Ok(dump) = std::env::var("M3OS_DUMP_QEMU_ARGS") {
+        let mut buf = String::new();
+        for a in &args {
+            buf.push_str(a);
+            buf.push('\n');
+        }
+        if let Err(e) = std::fs::write(&dump, buf) {
+            eprintln!("M3OS_DUMP_QEMU_ARGS: write {dump}: {e}");
+            std::process::exit(2);
+        }
+        println!("M3OS_DUMP_QEMU_ARGS: wrote {} args to {dump}", args.len());
+        return;
     }
 
     let status = Command::new("qemu-system-x86_64")
@@ -3889,6 +4169,7 @@ struct SmokeTestArgs {
     display: bool,
     timeout_secs: u64,
     kvm: bool,
+    memory_mib: Option<u32>,
 }
 
 fn parse_smoke_test_args(args: &[String]) -> Result<SmokeTestArgs, String> {
@@ -3902,9 +4183,15 @@ fn parse_smoke_test_args(args: &[String]) -> Result<SmokeTestArgs, String> {
     // `M3OS_SMOKE_SKIP_TCC_COMPILE=1`.
     let mut timeout_secs = 300u64;
     let mut kvm = false;
+    let mut memory_mib: Option<u32> = None;
 
     let mut index = 0;
     while index < args.len() {
+        if let Some(mib) = try_take_memory_arg(args, &mut index)? {
+            memory_mib = Some(mib);
+            index += 1;
+            continue;
+        }
         match args[index].as_str() {
             "--display" => display = true,
             "--kvm" => kvm = true,
@@ -3930,6 +4217,7 @@ fn parse_smoke_test_args(args: &[String]) -> Result<SmokeTestArgs, String> {
         display,
         timeout_secs,
         kvm,
+        memory_mib,
     })
 }
 
@@ -6178,6 +6466,7 @@ fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
     };
     let mut devices = DeviceSet::default();
     devices.kvm = smoke_args.kvm;
+    devices.memory_mib = smoke_args.memory_mib;
     let mut args = qemu_args_with_devices(&uefi_image, &ovmf, display_mode, devices);
     // Strip hostfwd to avoid port conflicts in CI (same as qemu_test_args).
     for arg in args.iter_mut() {
@@ -8747,6 +9036,336 @@ fn cmd_less_render_probe(args: &LessRenderProbeArgs) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// compositor-stress — reproduce the compositor OOM seen when a user
+// rapidly spawns terms across multiple workspaces. Boots the graphical
+// stack headlessly, then drives SUPER+RETURN spawn-term and SUPER+1..9
+// workspace-switch keybinds through QMP `send-key` at a configurable
+// cadence, while watching serial output for "KERNEL PANIC". Exits
+// non-zero if a panic appears within the budget.
+//
+// The serial transcript is always written to the output directory so
+// post-mortem investigation has the same artefact the user has been
+// pasting into the chat.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct CompositorStressArgs {
+    /// Global wall-clock budget for the whole probe.
+    timeout_secs: u64,
+    /// Per-cycle term-spawn count. A cycle is "spawn N terms, then
+    /// rotate through workspaces" — multiplied by `cycles`.
+    spawns_per_cycle: u32,
+    /// Number of cycles to run.
+    cycles: u32,
+    /// Inter-keystroke delay in milliseconds. Below 100 ms exercises
+    /// the spawn-throttle gate; above 100 ms exercises the steady-
+    /// state SHM cache behaviour without throttling.
+    keystroke_gap_ms: u32,
+    /// Workspaces to round-robin between. The user's reproducer
+    /// typically uses 1, 2, 3.
+    workspaces: Vec<u8>,
+    /// Directory to write the serial log into.
+    out_dir: PathBuf,
+    /// Use KVM for near-native execution speed. The user's repro is
+    /// `cargo xtask run-gui --kvm` so this matches the load profile.
+    /// At 4K resolution with multiple terms TCG can stretch boot to
+    /// many minutes; KVM completes in seconds.
+    kvm: bool,
+}
+
+fn parse_compositor_stress_args(args: &[String]) -> Result<CompositorStressArgs, String> {
+    let mut timeout_secs = 240u64;
+    let mut spawns_per_cycle = 4u32;
+    let mut cycles = 4u32;
+    let mut keystroke_gap_ms = 150u32;
+    let mut workspaces: Vec<u8> = vec![1, 2, 3];
+    let mut out_dir: Option<PathBuf> = None;
+    let mut kvm = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--kvm" => kvm = true,
+            "--timeout" => {
+                i += 1;
+                timeout_secs = args
+                    .get(i)
+                    .ok_or("--timeout requires a value")?
+                    .parse()
+                    .map_err(|_| "invalid --timeout value")?;
+            }
+            "--spawns-per-cycle" => {
+                i += 1;
+                spawns_per_cycle = args
+                    .get(i)
+                    .ok_or("--spawns-per-cycle requires a value")?
+                    .parse()
+                    .map_err(|_| "invalid --spawns-per-cycle value")?;
+            }
+            "--cycles" => {
+                i += 1;
+                cycles = args
+                    .get(i)
+                    .ok_or("--cycles requires a value")?
+                    .parse()
+                    .map_err(|_| "invalid --cycles value")?;
+            }
+            "--keystroke-gap-ms" => {
+                i += 1;
+                keystroke_gap_ms = args
+                    .get(i)
+                    .ok_or("--keystroke-gap-ms requires a value")?
+                    .parse()
+                    .map_err(|_| "invalid --keystroke-gap-ms value")?;
+            }
+            "--workspaces" => {
+                i += 1;
+                let s = args
+                    .get(i)
+                    .ok_or("--workspaces requires a comma-separated list")?;
+                workspaces = s
+                    .split(',')
+                    .map(|x| x.trim().parse::<u8>().map_err(|_| "bad workspace number"))
+                    .collect::<Result<Vec<u8>, &str>>()?;
+                if workspaces.is_empty() || workspaces.iter().any(|w| !(1..=9).contains(w)) {
+                    return Err("--workspaces must list numbers in 1..=9".to_string());
+                }
+            }
+            "--out" => {
+                i += 1;
+                out_dir = Some(PathBuf::from(
+                    args.get(i).ok_or("--out requires a path")?.as_str(),
+                ));
+            }
+            other => return Err(format!("unknown compositor-stress flag: {other}")),
+        }
+        i += 1;
+    }
+    let out_dir = out_dir.unwrap_or_else(|| {
+        let mut p = std::env::temp_dir();
+        p.push("m3os-compositor-stress");
+        p
+    });
+    Ok(CompositorStressArgs {
+        timeout_secs,
+        spawns_per_cycle,
+        cycles,
+        keystroke_gap_ms,
+        workspaces,
+        out_dir,
+        kvm,
+    })
+}
+
+fn cmd_compositor_stress(args: &CompositorStressArgs) {
+    // Build the image — mirror less-render-probe rather than cmd_image
+    // so we get the autologin/serial term path (graphical_login=false)
+    // that drops us straight into a running compositor + term with no
+    // greeter to drive through. The harness can then issue
+    // SUPER+RETURN immediately.
+    if let Err(msg) = port_build::build_phase_69d_ports() {
+        eprintln!("compositor-stress: precondition failed: {msg}");
+        std::process::exit(1);
+    }
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = std::fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false, // graphical_login — autologin/serial path
+    );
+    let ovmf = find_ovmf();
+    if let Err(e) = std::fs::create_dir_all(&args.out_dir) {
+        eprintln!(
+            "compositor-stress: cannot create out dir {}: {e}",
+            args.out_dir.display()
+        );
+        std::process::exit(1);
+    }
+    let qmp_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&qmp_socket);
+    let vnc_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&vnc_socket);
+
+    let mut devices = DeviceSet::default();
+    devices.kvm = args.kvm;
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, QemuDisplayMode::Headless, devices);
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    let mut idx = 0;
+    while idx + 1 < qemu_args.len() {
+        if qemu_args[idx] == "-display" && qemu_args[idx + 1] == "none" {
+            qemu_args[idx + 1] = format!("vnc=unix:{}", vnc_socket.display());
+            break;
+        }
+        idx += 1;
+    }
+    qemu_args.push("-qmp".to_string());
+    qemu_args.push(format!("unix:{},server,nowait", qmp_socket.display()));
+    qemu_args.push("-vga".to_string());
+    qemu_args.push("std".to_string());
+    // NOTE: deliberately *not* setting `-global VGA.vgamem_mb=32` —
+    // it pushes the framebuffer to 3840x2160 (matches the user's
+    // 4K repro) but also hangs boot under KVM+VNC here. We test at
+    // the smaller mode the default vgamem yields (~2560x1600) and
+    // still exercise the SHM cache / per-surface buffer paths;
+    // the actual memory cost the harness probes scales with surface
+    // count, not single-surface size.
+
+    println!(
+        "compositor-stress: launching QEMU (timeout {}s, qmp {})",
+        args.timeout_secs,
+        qmp_socket.display()
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let rx = spawn_serial_reader(stdout);
+    let mut serial_history = String::new();
+    let mut serial_buf = String::new();
+    let global_start = std::time::Instant::now();
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+
+    let outcome: Result<(), String> = (|| {
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "display_server: registered as 'display.input-owner'",
+            std::time::Duration::from_secs(args.timeout_secs.min(180)),
+            global_start,
+            global_timeout,
+        )?;
+        println!("compositor-stress: display_server owns input grab");
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "TERM_SMOKE:prompt-ready",
+            std::time::Duration::from_secs(args.timeout_secs.min(180)),
+            global_start,
+            global_timeout,
+        )?;
+        println!("compositor-stress: term/sh0 prompt is ready; starting stress");
+
+        let qmp_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut q = qmp::QmpClient::connect(&qmp_socket, qmp_deadline)
+            .map_err(|e| format!("qmp connect: {e}"))?;
+        println!("compositor-stress: QMP handshake complete");
+
+        let gap = std::time::Duration::from_millis(args.keystroke_gap_ms as u64);
+        // The qcode for the Super/Meta key in QEMU. PS/2 emulation
+        // reports `meta_l` for the left Windows key; the m3OS kbd_server
+        // sees it as the same scancode the keybind table maps to SUPER.
+        let super_key = "meta_l";
+        let digit_qcodes = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
+
+        for cycle in 0..args.cycles {
+            // Each cycle: rotate to a fresh workspace, then spawn N terms.
+            let ws_n = args.workspaces[cycle as usize % args.workspaces.len()];
+            let ws_qcode = digit_qcodes[(ws_n - 1) as usize];
+            println!(
+                "compositor-stress: cycle {}: SUPER+{} (switch workspace)",
+                cycle + 1,
+                ws_n
+            );
+            q.press_chord(&[super_key, ws_qcode], 30)
+                .map_err(|e| format!("workspace switch: {e}"))?;
+            std::thread::sleep(gap);
+            // Bail out fast if the kernel already panicked.
+            if drain_and_check_panic(&rx, &mut serial_buf, &mut serial_history)? {
+                return Err("kernel panicked after workspace switch".to_string());
+            }
+            for s in 0..args.spawns_per_cycle {
+                println!(
+                    "compositor-stress: cycle {}, spawn {} (SUPER+RETURN)",
+                    cycle + 1,
+                    s + 1
+                );
+                q.press_chord(&[super_key, "ret"], 30)
+                    .map_err(|e| format!("SUPER+RETURN: {e}"))?;
+                std::thread::sleep(gap);
+                if drain_and_check_panic(&rx, &mut serial_buf, &mut serial_history)? {
+                    return Err(format!(
+                        "kernel panicked after cycle {} spawn {}",
+                        cycle + 1,
+                        s + 1
+                    ));
+                }
+            }
+        }
+
+        // Settle: let the kernel chew on the final batch for a bit
+        // and verify it stays alive.
+        let settle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < settle_deadline {
+            if drain_and_check_panic(&rx, &mut serial_buf, &mut serial_history)? {
+                return Err("kernel panicked during settle window".to_string());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        Ok(())
+    })();
+
+    while let Ok(chunk) = rx.try_recv() {
+        append_serial_chunk(&mut serial_buf, &mut serial_history, &chunk);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&qmp_socket);
+    let _ = std::fs::remove_file(&vnc_socket);
+
+    let serial_log = args.out_dir.join("serial.log");
+    let _ = std::fs::write(&serial_log, &serial_history);
+    println!("compositor-stress: serial log -> {}", serial_log.display());
+
+    match outcome {
+        Ok(()) => {
+            println!("compositor-stress: PASSED (no kernel panic)");
+        }
+        Err(msg) => {
+            eprintln!("compositor-stress: FAILED — {msg}");
+            let tail = tail_lines(&strip_ansi(&serial_history), 80);
+            eprintln!("--- last 80 lines of serial ---\n{tail}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Drain pending serial chunks into history and return `true` if a
+/// `KERNEL PANIC` marker has appeared. The compositor-stress driver
+/// calls this after every keystroke so it can stop spinning the
+/// moment the OOM fires instead of timing out the global budget.
+fn drain_and_check_panic(
+    rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+    serial_buf: &mut String,
+    serial_history: &mut String,
+) -> Result<bool, String> {
+    while let Ok(chunk) = rx.try_recv() {
+        append_serial_chunk(serial_buf, serial_history, &chunk);
+    }
+    let stripped = strip_ansi(serial_buf);
+    Ok(stripped.contains("KERNEL PANIC"))
+}
+
 /// Read every PPM the probe captured, print a per-event burst table,
 /// and surface the peak-content frame vs. the settled frame for each
 /// event. The bug signature is "peak frame has much less black than
@@ -10371,6 +10990,17 @@ fn populate_ext2_files(
     // `PermanentlyStopped`, so it would never start.
     let greeter_conf = "name=greeter\ncommand=/bin/greeter\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display,kbd,mouse_server,audio_server\n";
 
+    // Phase 73 — desktop client daemons. Each is a normal Phase 56
+    // compositor client running as a regular supervised process. They
+    // depend only on `display` (the compositor) — none of them claim
+    // keyboard focus (wallpaper is `Background`, bar is `Top`, notifyd
+    // is `Overlay` with `KeyboardInteractivity::None`), so the focus
+    // dispatcher race that motivates explicit input-server deps for
+    // greeter does not apply here.
+    let wallpaper_conf = "name=wallpaper\ncommand=/bin/wallpaper\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=display\n";
+    let bar_conf = "name=bar\ncommand=/bin/bar\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=display\n";
+    let notifyd_conf = "name=notifyd\ncommand=/bin/notifyd\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=display\n";
+
     // Phase 71 — `/etc/greeter.conf` is the greeter binary's runtime
     // configuration file (separate from the init service manifest at
     // `/etc/services.d/greeter.conf` defined below). Built-in defaults
@@ -10537,6 +11167,10 @@ fn populate_ext2_files(
     let greeter_user_conf_tmp = output_dir.join("_tmp_greeter_user_conf");
     let greeter_service_conf_tmp = output_dir.join("_tmp_greeter_service_conf");
     let compositor_conf_tmp = output_dir.join("_tmp_compositor_conf");
+    // Phase 73 — desktop client service confs.
+    let wallpaper_conf_tmp = output_dir.join("_tmp_wallpaper_conf");
+    let bar_conf_tmp = output_dir.join("_tmp_bar_conf");
+    let notifyd_conf_tmp = output_dir.join("_tmp_notifyd_conf");
     let hostname_tmp = output_dir.join("_tmp_hostname");
     let smoke_mode_tmp = output_dir.join("_tmp_smoke_mode");
     let empty_tmp = output_dir.join("_tmp_empty");
@@ -10564,6 +11198,9 @@ fn populate_ext2_files(
     fs::write(&greeter_user_conf_tmp, greeter_user_conf).expect("write temp greeter user conf");
     fs::write(&greeter_service_conf_tmp, greeter_conf).expect("write temp greeter service conf");
     fs::write(&compositor_conf_tmp, compositor_conf).expect("write temp compositor.conf");
+    fs::write(&wallpaper_conf_tmp, wallpaper_conf).expect("write temp wallpaper.conf");
+    fs::write(&bar_conf_tmp, bar_conf).expect("write temp bar.conf");
+    fs::write(&notifyd_conf_tmp, notifyd_conf).expect("write temp notifyd.conf");
     fs::write(&hostname_tmp, hostname_content).expect("write temp hostname");
     fs::write(&empty_tmp, empty_content).expect("write temp empty file");
     if smoke_test_mode {
@@ -10749,6 +11386,35 @@ fn populate_ext2_files(
          sif etc/compositor.conf gid 0\n",
         compositor_conf_tmp.display(),
     );
+
+    // Phase 73 — stage the three desktop-daemon service confs only
+    // in graphical-login boots. Their startup chatter
+    // ("display_server: AttachSharedBuffer ok ...") interleaves with
+    // the smoke / regression runner's serial output and would otherwise
+    // mask the `# ` prompt the harness waits on between steps. The
+    // daemons are also only useful in GUI sessions, so a serial /
+    // autologin boot has no reason to pay their startup cost either.
+    let phase73_daemon_cmds = if smoke_test_mode || !graphical_login {
+        String::new()
+    } else {
+        format!(
+            "write \"{}\" etc/services.d/wallpaper.conf\n\
+             sif etc/services.d/wallpaper.conf mode 0x81A4\n\
+             sif etc/services.d/wallpaper.conf uid 0\n\
+             sif etc/services.d/wallpaper.conf gid 0\n\
+             write \"{}\" etc/services.d/bar.conf\n\
+             sif etc/services.d/bar.conf mode 0x81A4\n\
+             sif etc/services.d/bar.conf uid 0\n\
+             sif etc/services.d/bar.conf gid 0\n\
+             write \"{}\" etc/services.d/notifyd.conf\n\
+             sif etc/services.d/notifyd.conf mode 0x81A4\n\
+             sif etc/services.d/notifyd.conf uid 0\n\
+             sif etc/services.d/notifyd.conf gid 0\n",
+            wallpaper_conf_tmp.display(),
+            bar_conf_tmp.display(),
+            notifyd_conf_tmp.display(),
+        )
+    };
 
     // Phase 56 Track F.2 — drop the debug-crash marker file when the
     // F.2 regression asks for it. Production boots leave the file out;
@@ -11073,6 +11739,7 @@ fn populate_ext2_files(
          sif etc/services.d/audio_server.conf gid 0\n\
          {greeter_or_term_cmds}\
          {compositor_conf_cmds}\
+         {phase73_daemon_cmds}\
          write \"{hostname}\" etc/hostname\n\
          sif etc/hostname mode 0x81A4\n\
          sif etc/hostname uid 0\n\
@@ -11107,6 +11774,7 @@ fn populate_ext2_files(
         audio_server_conf = audio_server_conf_tmp.display(),
         greeter_or_term_cmds = greeter_or_term_cmds,
         compositor_conf_cmds = compositor_conf_cmds,
+        phase73_daemon_cmds = phase73_daemon_cmds,
         hostname = hostname_tmp.display(),
         empty = empty_tmp.display(),
         smoke_mode_cmds = smoke_mode_cmds,
@@ -11164,6 +11832,9 @@ fn populate_ext2_files(
     let _ = fs::remove_file(&greeter_user_conf_tmp);
     let _ = fs::remove_file(&greeter_service_conf_tmp);
     let _ = fs::remove_file(&term_conf_tmp);
+    let _ = fs::remove_file(&wallpaper_conf_tmp);
+    let _ = fs::remove_file(&bar_conf_tmp);
+    let _ = fs::remove_file(&notifyd_conf_tmp);
     // Phase 56 F.3: silently best-effort; the file only exists when the
     // M3OS_DISABLE_DISPLAY_SERVER env var was set.
     let _ = fs::remove_file(output_dir.join("_tmp_disable_display"));
@@ -12606,15 +13277,22 @@ struct RegressionArgs {
     test_name: Option<String>,
     timeout_secs: Option<u64>,
     display: bool,
+    memory_mib: Option<u32>,
 }
 
 fn parse_regression_args(args: &[String]) -> Result<RegressionArgs, String> {
     let mut test_name = None;
     let mut timeout_secs = None;
     let mut display = false;
+    let mut memory_mib: Option<u32> = None;
     let mut index = 0;
 
     while index < args.len() {
+        if let Some(mib) = try_take_memory_arg(args, &mut index)? {
+            memory_mib = Some(mib);
+            index += 1;
+            continue;
+        }
         match args[index].as_str() {
             "--test" => {
                 index += 1;
@@ -12643,6 +13321,7 @@ fn parse_regression_args(args: &[String]) -> Result<RegressionArgs, String> {
         test_name,
         timeout_secs,
         display,
+        memory_mib,
     })
 }
 
@@ -12918,6 +13597,7 @@ fn regression_tests() -> Vec<RegressionTest> {
                 audio: false,
                 iommu: false,
                 kvm: false,
+                memory_mib: None,
             },
             wants_debug_crash_marker: false,
             wants_readback_marker: false,
@@ -12953,6 +13633,7 @@ fn regression_tests() -> Vec<RegressionTest> {
                 audio: false,
                 iommu: false,
                 kvm: false,
+                memory_mib: None,
             },
             wants_debug_crash_marker: false,
             wants_readback_marker: false,
@@ -12985,6 +13666,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             audio: false,
             iommu: false,
             kvm: false,
+            memory_mib: None,
         },
         wants_debug_crash_marker: false,
         wants_readback_marker: false,
@@ -13014,6 +13696,7 @@ fn regression_tests() -> Vec<RegressionTest> {
                 audio: false,
                 iommu: false,
                 kvm: false,
+                memory_mib: None,
             },
             wants_debug_crash_marker: false,
             wants_readback_marker: false,
@@ -14487,7 +15170,14 @@ fn cmd_regression(args: &RegressionArgs) {
         }
 
         print!("  {}: ", test.name);
-        let result = run_regression_test(test, &uefi_image, &ovmf, timeout, args.display);
+        let result = run_regression_test(
+            test,
+            &uefi_image,
+            &ovmf,
+            timeout,
+            args.display,
+            args.memory_mib,
+        );
 
         match result {
             Ok(serial_log) => {
@@ -14534,16 +15224,25 @@ fn run_regression_test(
     ovmf: &Path,
     timeout_secs: u64,
     display: bool,
+    memory_mib: Option<u32>,
 ) -> Result<String, (String, String)> {
     let display_mode = if display {
         QemuDisplayMode::Gui
     } else {
         QemuDisplayMode::Headless
     };
-    let mut args = if test.devices == DeviceSet::default() {
+    // Apply the operator's `-m` / `--memory` override to whichever DeviceSet
+    // the test declared. When the override is `None`, the test's own
+    // DeviceSet (and the centralized `M3OS_MEM` fallback inside
+    // `qemu_args_with_devices_resolved`) determines the guest RAM size.
+    let mut devices = test.devices;
+    if memory_mib.is_some() {
+        devices.memory_mib = memory_mib;
+    }
+    let mut args = if devices == DeviceSet::default() {
         qemu_args(uefi_image, ovmf, display_mode)
     } else {
-        qemu_args_with_devices(uefi_image, ovmf, display_mode, test.devices)
+        qemu_args_with_devices(uefi_image, ovmf, display_mode, devices)
     };
     // Strip hostfwd to avoid port conflicts.
     for arg in args.iter_mut() {
@@ -16115,6 +16814,127 @@ mod tests {
         assert!(err.contains("missing value"));
     }
 
+    // ----------------------------------------------------------------
+    // Memory override (-m / --memory / M3OS_MEM): see
+    // `docs/handoffs/2026-05-22-compositor-shm-leak-multi-term-oom.md`
+    // for the motivation. The 2 GiB default was the original handoff
+    // ceiling; these tests guard the override plumbing.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn parse_memory_spec_accepts_gigabyte_forms() {
+        assert_eq!(parse_memory_spec("4g").unwrap(), 4096);
+        assert_eq!(parse_memory_spec("4G").unwrap(), 4096);
+        assert_eq!(parse_memory_spec("1g").unwrap(), 1024);
+    }
+
+    #[test]
+    fn parse_memory_spec_accepts_megabyte_forms() {
+        assert_eq!(parse_memory_spec("2048m").unwrap(), 2048);
+        assert_eq!(parse_memory_spec("512M").unwrap(), 512);
+        assert_eq!(parse_memory_spec("2048").unwrap(), 2048);
+    }
+
+    #[test]
+    fn parse_memory_spec_rejects_below_floor() {
+        let err = parse_memory_spec("128m").unwrap_err();
+        assert!(err.contains("128 MiB"));
+        assert!(err.contains("minimum is 256"));
+    }
+
+    #[test]
+    fn parse_memory_spec_rejects_empty_and_garbage() {
+        assert!(parse_memory_spec("").is_err());
+        assert!(parse_memory_spec("  ").is_err());
+        assert!(parse_memory_spec("g").is_err());
+        assert!(parse_memory_spec("xg").is_err());
+        assert!(parse_memory_spec("4t").is_err());
+        assert!(parse_memory_spec("-1g").is_err());
+    }
+
+    #[test]
+    fn extract_device_flags_parses_dash_m_space_form() {
+        let input = string_args(&["-m", "4g"]);
+        let (devices, rest) = extract_device_flags(&input).unwrap();
+        assert_eq!(devices.memory_mib, Some(4096));
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn extract_device_flags_parses_dash_m_equals_form() {
+        let input = string_args(&["-m=2048"]);
+        let (devices, _) = extract_device_flags(&input).unwrap();
+        assert_eq!(devices.memory_mib, Some(2048));
+    }
+
+    #[test]
+    fn extract_device_flags_parses_long_memory_form() {
+        let space = string_args(&["--memory", "512m"]);
+        let (devices, _) = extract_device_flags(&space).unwrap();
+        assert_eq!(devices.memory_mib, Some(512));
+
+        let eq = string_args(&["--memory=1g"]);
+        let (devices, _) = extract_device_flags(&eq).unwrap();
+        assert_eq!(devices.memory_mib, Some(1024));
+    }
+
+    #[test]
+    fn extract_device_flags_memory_composes_with_other_flags() {
+        let input = string_args(&["--kvm", "-m", "4g", "--device", "nvme"]);
+        let (devices, rest) = extract_device_flags(&input).unwrap();
+        assert!(devices.kvm);
+        assert!(devices.nvme);
+        assert_eq!(devices.memory_mib, Some(4096));
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn extract_device_flags_missing_memory_value_errors() {
+        let input = string_args(&["-m"]);
+        let err = extract_device_flags(&input).unwrap_err();
+        assert!(err.contains("missing value for `-m`"));
+    }
+
+    #[test]
+    fn qemu_args_override_memory_substitutes_dash_m_value() {
+        let args = qemu_args_with_devices_resolved(
+            Path::new("target/boot-uefi-m3os.img"),
+            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
+            QemuDisplayMode::Headless,
+            DeviceSet {
+                nvme: false,
+                e1000: false,
+                audio: false,
+                iommu: false,
+                kvm: true,
+                memory_mib: Some(4096),
+            },
+            None,
+        );
+        let m_idx = args
+            .iter()
+            .position(|a| a == "-m")
+            .expect("expected -m flag in argv");
+        assert_eq!(args[m_idx + 1], "4096");
+    }
+
+    #[test]
+    fn qemu_args_default_memory_is_two_gib() {
+        let args = qemu_args_with_devices_resolved(
+            Path::new("target/boot-uefi-m3os.img"),
+            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
+            QemuDisplayMode::Headless,
+            DeviceSet::default(),
+            None,
+        );
+        let m_idx = args.iter().position(|a| a == "-m").expect("expected -m");
+        assert_eq!(
+            args[m_idx + 1],
+            "2048",
+            "default guest RAM must remain 2 GiB so smoke / regression suites keep their budgets"
+        );
+    }
+
     #[test]
     fn qemu_args_default_uses_virtio_net() {
         let args = qemu_args(
@@ -16143,6 +16963,7 @@ mod tests {
                 audio: false,
                 iommu: false,
                 kvm: false,
+                memory_mib: None,
             },
         );
         assert!(
@@ -16172,6 +16993,7 @@ mod tests {
                 audio: false,
                 iommu: false,
                 kvm: false,
+                memory_mib: None,
             },
             Some(fake_nvme),
         );
@@ -16213,6 +17035,7 @@ mod tests {
                 audio: false,
                 iommu: true,
                 kvm: false,
+                memory_mib: None,
             },
             Some(fake_nvme),
         );
@@ -16254,6 +17077,7 @@ mod tests {
                 audio: false,
                 iommu: true,
                 kvm: false,
+                memory_mib: None,
             },
             Some(Path::new("/tmp/m3os-test-nvme-rootdisk-never-created.img")),
         );
@@ -16307,6 +17131,7 @@ mod tests {
                 audio: false,
                 iommu: true,
                 kvm: false,
+                memory_mib: None,
             },
             None,
         );
@@ -16365,6 +17190,7 @@ mod tests {
                 audio: false,
                 iommu: true,
                 kvm: false,
+                memory_mib: None,
             },
             None,
         );
@@ -16396,6 +17222,7 @@ mod tests {
                 audio: false,
                 iommu: true,
                 kvm: false,
+                memory_mib: None,
             },
             None,
         );
@@ -16619,6 +17446,7 @@ mod tests {
             audio: false,
             iommu: false,
             kvm: false,
+            memory_mib: None,
         });
         let iommu = device_smoke_steps(DeviceSet {
             nvme: true,
@@ -16626,6 +17454,7 @@ mod tests {
             audio: false,
             iommu: true,
             kvm: false,
+            memory_mib: None,
         });
 
         assert_eq!(smoke_step_labels(&iommu), smoke_step_labels(&base));

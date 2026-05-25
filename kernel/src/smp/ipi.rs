@@ -54,8 +54,40 @@ pub(super) unsafe fn wait_icr_idle() {
         // progress.  `preempt_disable` is a no-op before per-core data is
         // live, so the wrapper is harmless on the early-boot caller path.
         crate::task::scheduler::preempt_disable();
+        // Diagnostic for 4 GiB-on-Zen-5 hang investigation
+        // (docs/handoffs/2026-05-24-4gib-pci-hole-vga-mapping.md): bound the
+        // spin at ~100 ms and panic with the ICR state on timeout. The
+        // hardware spec is ~1 µs, so 100 ms is 100,000x slack — generous
+        // enough to never false-positive under normal load (incl. the
+        // multi-ms recursive-log delay the handoff documented) while still
+        // catching the previously-silent "kernel never returns" symptom.
+        // tsc_per_ms() returns 0 before APIC calibration; fall back to a
+        // ~500M-cycle absolute ceiling (~500 ms at 1 GHz) in that window.
+        let tsc_per_ms = crate::arch::x86_64::apic::tsc_per_ms();
+        let timeout_tsc: u64 = if tsc_per_ms > 0 {
+            tsc_per_ms.saturating_mul(100)
+        } else {
+            500_000_000
+        };
+        let start_tsc = core::arch::x86_64::_rdtsc();
+        let mut iterations: u64 = 0;
         while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 {
             core::hint::spin_loop();
+            iterations += 1;
+            if iterations.is_multiple_of(1024) {
+                let now = core::arch::x86_64::_rdtsc();
+                if now.wrapping_sub(start_tsc) > timeout_tsc {
+                    let icr_low = lapic_read(LAPIC_ICR_LOW);
+                    let icr_high = lapic_read(LAPIC_ICR_HIGH);
+                    let dest_apic = (icr_high >> 24) & 0xff;
+                    panic!(
+                        "[ipi] wait_icr_idle stuck >100ms: ICR_LOW={icr_low:#010x} \
+                         (delivery-pending bit 12 stays set), ICR_HIGH={icr_high:#010x} \
+                         (dest APIC {dest_apic}), iterations={iterations}, \
+                         tsc_per_ms={tsc_per_ms}"
+                    );
+                }
+            }
         }
         crate::task::scheduler::preempt_enable();
     }
@@ -75,6 +107,31 @@ pub fn send_ipi(target_apic_id: u8, vector: u8) {
         lapic_write(LAPIC_ICR_HIGH, (target_apic_id as u32) << 24);
         // Fixed delivery mode (000), vector in bits 0-7.
         lapic_write(LAPIC_ICR_LOW, vector as u32);
+        wait_icr_idle();
+    }
+}
+
+/// Send a Non-Maskable Interrupt to a specific APIC ID.
+///
+/// NMI delivery mode (`100b` in ICR_LOW bits 8-10) bypasses the
+/// recipient's `IF` mask — the NMI fires even if the recipient is
+/// inside a CLI'd region. Used by `smp::tlb` to deliver TLB shootdown
+/// requests to cores that may be holding an `IrqSafeMutex` (which
+/// CLIs on acquire). The vector field is ignored for NMI delivery;
+/// the recipient's IDT entry for vector 2 (`non_maskable_interrupt`)
+/// handles the dispatch.
+///
+/// See `arch::x86_64::interrupts::nmi_handler` for the receiver-side
+/// implementation and `docs/handoffs/2026-05-24-4gib-pci-hole-vga-mapping.md`
+/// for the bug class this fix addresses.
+pub fn send_nmi(target_apic_id: u8) {
+    unsafe {
+        wait_icr_idle();
+        lapic_write(LAPIC_ICR_HIGH, (target_apic_id as u32) << 24);
+        // Delivery mode = NMI (100b) in bits 8:10 → 0x400.
+        // Destination shorthand = none (00) in bits 18:19.
+        // Vector is ignored for NMI delivery.
+        lapic_write(LAPIC_ICR_LOW, 0x0000_0400);
         wait_icr_idle();
     }
 }
@@ -108,5 +165,19 @@ pub fn send_ipi_to_core(core_id: u8, vector: u8) {
         && data.is_online.load(core::sync::atomic::Ordering::Acquire)
     {
         send_ipi(data.apic_id, vector);
+    }
+}
+
+/// Send an NMI to a specific logical core ID.
+///
+/// Looks up the core's APIC ID from the per-core data table and delegates
+/// to [`send_nmi`]. Returns without sending if the core ID is invalid or
+/// the core is not yet online. Used by `smp::tlb` to deliver shootdowns
+/// to cores by logical id.
+pub fn send_nmi_to_core(core_id: u8) {
+    if let Some(data) = super::get_core_data(core_id)
+        && data.is_online.load(core::sync::atomic::Ordering::Acquire)
+    {
+        send_nmi(data.apic_id);
     }
 }

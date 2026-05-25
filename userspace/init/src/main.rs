@@ -56,8 +56,17 @@ fn alloc_error(_layout: Layout) -> ! {
 // Constants
 // ---------------------------------------------------------------------------
 
-const MAX_SERVICES: usize = 16;
-const MAX_DISCOVERED_DISABLED: usize = 16;
+// Phase 73 — `KNOWN_CONFIGS` below lists 25 service paths after the
+// new `wallpaper`, `bar`, and `notifyd` daemons were added. The
+// fallback loader (`load_services_from_known_configs`) stops adding
+// services once `self.count >= MAX_SERVICES`, so a 24-slot ceiling
+// would silently drop the 25th entry on any boot where every config
+// loads. Sized to `KNOWN_CONFIGS.len()` (25) + 3 headroom for future
+// additions; the static arrays' memory footprint is dominated by
+// `MAX_NAME` + `MAX_CMD` per slot and the extra ~400 bytes are
+// negligible.
+const MAX_SERVICES: usize = 28;
+const MAX_DISCOVERED_DISABLED: usize = 24;
 const MAX_PIDS: usize = 64;
 const MAX_DEPS: usize = 4;
 const MAX_NAME: usize = 32;
@@ -212,6 +221,12 @@ const KNOWN_CONFIGS: &[&[u8]] = &[
     // `setuid`s + `execve`s `/bin/term` in-process so term inherits
     // the authenticated UID.
     b"/etc/services.d/greeter.conf\0",
+    // Phase 73: native desktop client daemons.  Each is a regular
+    // Phase 56 compositor client (Layer or Toplevel surface); init
+    // supervises them so a crash respawns automatically.
+    b"/etc/services.d/wallpaper.conf\0",
+    b"/etc/services.d/bar.conf\0",
+    b"/etc/services.d/notifyd.conf\0",
 ];
 
 // ---------------------------------------------------------------------------
