@@ -18,6 +18,8 @@ fix-commits:
   - 7b4b65b  # smp/tlb: ShootdownIrqWindow — IF=1 across SHOOTDOWN_PENDING spin (SENDER-side fix)
   # === Session 3 (2026-05-24 evening) — recipient-side fix landed; new hang exposed ===
   - f0a899d  # sched: IrqSafeMutex::lock — test-then-test-and-set with IRQ window during spin (RECIPIENT-side fix)
+  # === Session 4 (2026-05-25) — nested-lock recipient case; pre-allocation ===
+  - 9b0f0f3  # sched: reserve_for_smp_boot pre-allocates Vec capacity before AP boot
 date: 2026-05-24
 component: kernel/smp (TLB shootdown IF=1 invariant + AP IRQ-enable ordering); secondary xtask
   -m flag plumbing; tertiary userspace/display_server slide rendering (unrelated, fixed in
@@ -94,51 +96,50 @@ new-tooling:
 
 ## Quick-resume checklist (start here tomorrow)
 
-1. **Branch**: `feat/phase-73-compositor-polish`. Latest commit is the IrqSafeMutex
-   recipient-side fix described below. Push pending.
-2. **Build state**: `cargo xtask check` clean. `cargo xtask smoke-test` (2 GiB) passes
-   in 14 s. `cargo xtask run -m 3g` (TCG, SMP) runs the full smoke session to
-   `SMOKE:PASS`. `M3OS_SMP=1 cargo xtask run -m 4g` (single-core, TCG) progresses
-   well into userspace (display_server, term, smoke-runner all start).
-3. **What's still broken**: `cargo xtask run -m 4g` with default SMP (4 cores) hangs
-   silently after `[kernel] entering scheduler — init will start service set`. No
-   panic, no further log output, no scheduler progress. The original TLB shootdown
-   deadlock is **gone** (no `tlb_shootdown_range_kernel stuck` panic anymore), so
-   this is a separate, previously-masked bug.
-4. **Reproducer for the residual hang**:
+1. **Branch**: `feat/phase-73-compositor-polish`. Latest commit pushes the
+   session-4 `reserve_for_smp_boot` fix. All upstream fixes shipped.
+2. **Build state**: `cargo xtask check` clean.
+   `cargo xtask smoke-test` (2 GiB) PASS in 14 s.
+   `cargo xtask run -m 3g` (3 GiB SMP=4) runs the full smoke session.
+   `M3OS_SMP=1 cargo xtask run -m 4g` and `M3OS_SMP=2 cargo xtask run -m 4g`
+   both progress into userspace (display_server / term).
+3. **What's still broken**: `cargo xtask run -m 4g` with default `M3OS_SMP=4`
+   hangs silently after `[kernel] entering scheduler — init will start
+   service set`. Heartbeat instrumentation localised: APs enter
+   `spawn_idle_for_core` but get stuck inside `Task::new` (never reach the
+   `Task::new done` heartbeat). Likely a 4-way race in
+   `KernelStack::alloc`'s CAS over `STACK_USED` or `init_stack`'s memory
+   writes. Not the TLB shootdown bug.
+4. **Reproducer matrix for the residual hang**:
    ```bash
-   cargo xtask run -m 4g --fresh                       # TCG, 4 cores — hangs
-   cargo xtask run --kvm -m 4g --fresh                 # KVM, 4 cores — likely hangs
-   M3OS_SMP=1 cargo xtask run -m 4g --fresh            # 1 core — works
-   cargo xtask run -m 3g --fresh                       # 3 GiB, 4 cores — works
+   cargo xtask run -m 4g --fresh                       # TCG, SMP=4 — HANGS
+   M3OS_SMP=2 cargo xtask run -m 4g --fresh            # SMP=2 — works
+   M3OS_SMP=1 cargo xtask run -m 4g --fresh            # SMP=1 — works
+   cargo xtask run -m 3g --fresh                       # 3 GiB SMP=4 — works
    ```
-   Diff between working and hanging case: same fix, same kernel, **only guest RAM
-   crosses the 4 GiB threshold AND APs are online**. Both conditions are required.
 5. **Most likely next-investigation targets** (in order):
-   - The BSP's first `task::spawn(init_task)` → `task::run()` transition. The
-     init_task never prints `[init] service registry: console=...`, so either
-     (a) init_task is dispatched but its first IrqSafeMutex acquire (e.g.,
-     `ENDPOINTS.lock()`) deadlocks against an AP holding something, or
-     (b) the BSP scheduler never picks init_task because some per-core queue
-     or scheduler-lock state is wrong at 4 GiB+SMP, or
-     (c) init_task gets dispatched to an AP that's stuck.
-   - The 595951f early-STI in `ap_entry`: APs run `spawn_idle_for_core` and
-     `task::run` with IF=1. Each AP's `spawn_idle_for_core` may grow_heap →
-     TLB-shootdown. With BSP also doing post-AP-boot work concurrently, multiple
-     paths can hit `GROW_HEAP_LOCK` at once. The new IrqSafeMutex pattern should
-     handle this — but maybe an AP is in a deeper deadlock involving
-     `PROCESS_TABLE`, `ENDPOINTS`, or `kstack_pool`.
-   - Add a `_panic_print` heartbeat at the top of `task::run()` on the BSP path
-     to confirm the BSP is alive in the scheduler loop. If the heartbeat fires
-     but init_task never runs, the bug is in task selection/dispatch. If the
-     heartbeat doesn't fire, the BSP is stuck before reaching the loop.
-6. **What's been verified**:
+   - Add a heartbeat at the top of `Task::new` and after each line up to the
+     end. The hang is between `enter` and `Task::new done` in
+     `spawn_idle_for_core`. The two candidates are `KernelStack::alloc`
+     (lock-free CAS over `STACK_USED`) and `init_stack` (raw memory writes
+     to the freshly-claimed stack page).
+   - If `KernelStack::alloc` is the culprit: 4-way concurrent CAS on
+     `STACK_USED` should still terminate (CAS retry loop). But maybe one
+     core takes a stack slot already in use? Add a `compare_exchange`
+     iteration counter that panics over some threshold.
+   - If `init_stack` is the culprit: it does raw memory writes to the
+     kstack pages. At 4 GiB with `STACK_USED` slots > 4, slots 0-3 are
+     used by BSP + 3 APs. Maybe the slot's mapped pages aren't fully
+     present at 4 GiB? Check `kstack::init`'s page-mapping loop for
+     anything that could leave a slot only partially mapped at higher RAM.
+   - File a separate phase doc once isolated — this is no longer in the
+     "TLB shootdown / IF=0 deadlock" family.
+6. **Verified after session 4**:
    - `cargo xtask check` clean.
    - 2 GiB smoke-test: PASS in 14 s (no regression).
-   - 3 GiB run: full smoke session completes (`SMOKE:PASS`).
-   - 4 GiB single-core: progresses well into userspace, audio_server + term + smoke
-     runner all start.
-   - 4 GiB SMP: silent hang after BSP enters scheduler.
+   - 3 GiB SMP=4: full smoke session completes (`SMOKE:PASS`).
+   - 4 GiB SMP=1, SMP=2: progresses well into userspace.
+   - 4 GiB SMP=4: APs stuck in `Task::new`. Separate bug.
 
 ## TL;DR — what the bug actually was
 
@@ -177,32 +178,74 @@ the *held* region is preserved (so same-core IRQ handlers that take the same loc
 shootdown protocol needs. See `kernel/src/task/scheduler.rs::IrqSafeMutex::lock` and
 the module-level commentary for the full safety argument.
 
+**Bug 4 (nested-lock recipient case, fixed in session 4)**: even with bug 3's
+fix, a recipient core that's *inside* an outer IrqSafeMutex (e.g. holding
+`scheduler_lock` and contending on `GROW_HEAP_LOCK`) has `was_enabled = false`
+at the inner lock and so the IRQ-window opt-in does not fire. The user's
+2026-05-25 `m3os.log` showed exactly this: BSP (core 0) had `timer Δ=499`
+(bug 3 fix working), but AP2 and AP3 had `timer = 0` *absolute* (still IF=0
+the entire boot), pinpointing them as stuck inside nested IrqSafeMutex.
+
+The specific nested path was `ap_entry` → `spawn_idle_for_core` →
+`scheduler_lock` → `alloc_task_slot` → `Vec::push` (`sched.tasks` and
+`sched.fpu_states`) → `grow_heap` → `GROW_HEAP_LOCK` (nested) →
+`tlb_shootdown_range_kernel`. The Vec realloc happened because both Vecs
+were initialized to capacity 0 and grew on each push.
+
+Fixed by `task::scheduler::reserve_for_smp_boot()`, called from
+`kernel_main` *before* `boot_aps`: pre-sizes both `sched.tasks` and
+`sched.fpu_states` capacity to `MAX_CORES + 16` via
+`Vec::with_capacity` (allocated **outside** `scheduler_lock` so any
+allocator-level work runs in a top-level IF=1 context), then moves any
+pre-existing entries in under `scheduler_lock`. After this, every AP's
+`spawn_idle_for_core` push fits within the pre-reserved capacity — no
+`Vec::push` realloc, no `grow_heap`, no nested-lock TLB shootdown.
+
+Why we didn't pursue the "split IrqSafeMutex into a `PreemptMutex` (no CLI)
++ IrqSafeMutex (CLI when held)" Linux-style refactor that came up mid-session:
+audit showed every candidate lock that would benefit (`scheduler_lock`,
+`GROW_HEAP_LOCK`, `DMESG_RING`, `SERIAL1`, `PROCESS_TABLE`) MUST keep CLI
+semantics because each is acquired from at least one IRQ-handler call path
+(`wake_task` from IPI handler, demand-paging frame alloc, recursive
+`log::warn!` from any handler). Linux's *actual* fix for this class of bug
+is the no-alloc-in-spinlock discipline (which our `reserve_for_smp_boot`
+implements for the spawn paths), not the lock-type split. The split has
+secondary value (lower CLI overhead on non-IRQ-shared locks) and is filed
+as a follow-up phase.
+
 Decisive evidence from the m3os.log that triggered session 3: every recipient core in the
 500 ms shootdown spin showed `timer Δ=0` AND `tlb-ipi Δ=0` — i.e., they had IF=0 the
 entire window. Only the **sender** had `timer Δ=50` proving the 7b4b65b
-`ShootdownIrqWindow` was working as intended. The recipients-stuck-IF=0 case was exactly
-what the previous handoff's "How to read a diagnostic dump" table predicted as the
-remaining failure mode.
+`ShootdownIrqWindow` was working as intended. The session 4 m3os.log then showed
+the bug-4 fingerprint: BSP `timer Δ=499` (bug 3 fix working) but AP2/AP3
+`timer = 0` absolute (nested-lock IF=0).
 
-## TL;DR — what's still broken after session 3
+## TL;DR — what's still broken after session 4
 
-`cargo xtask run -m 4g` (TCG, 4-core SMP) hangs silently after BSP logs
-`[kernel] entering scheduler — init will start service set`. The init task never
-runs — no `[init] service registry: console=...` log line appears. With the same
-kernel:
+The TLB shootdown protocol is healthy at all RAM sizes and most SMP counts.
+**Only** `cargo xtask run -m 4g` with default `M3OS_SMP=4` (4 cores) still
+hangs silently after `[kernel] entering scheduler — init will start service set`.
+Heartbeat instrumentation localised it: APs print
+`[sched] spawn_idle_for_core: enter core_id=N` but never print the next line
+(`Task::new done`), so the residual race is inside `Task::new` → most likely
+`KernelStack::alloc`'s CAS over `STACK_USED` or the subsequent
+`init_stack` writes — under 4-way concurrent entry it appears one or more
+APs get stuck. This is NOT the TLB shootdown bug.
 
-- `cargo xtask smoke-test` (2 GiB, 4-core SMP) — PASS in 14 s
-- `cargo xtask run -m 3g` (3 GiB, 4-core SMP) — full smoke session completes (`SMOKE:PASS`)
-- `M3OS_SMP=1 cargo xtask run -m 4g` (4 GiB, 1 core) — progresses well into userspace
+Verified pass/fail matrix after session 4 fixes:
 
-So the residual bug fires only when **guest RAM ≥ 4 GiB AND SMP is enabled**. There
-is no `tlb_shootdown_range_kernel stuck` panic anymore — the bounded-spin diagnostic
-is satisfied, the shootdown protocol is healthy. The hang is somewhere in the
-post-AP-boot scheduler / first-task-dispatch path that only manifests at 4 GiB.
+| RAM   | SMP | Status         |
+|-------|-----|----------------|
+| 2 GiB |  4  | PASS (14 s)    |
+| 3 GiB |  4  | PASS (smoke session completes) |
+| 4 GiB |  1  | PASS (boots into display_server / term) |
+| 4 GiB |  2  | PASS (boots into display_server / term) |
+| 4 GiB |  4  | HANG (APs stuck in Task::new during spawn_idle_for_core) |
 
-This is **separate from the TLB shootdown bug** — bugs 1, 2, and 3 above are
-genuinely fixed. The residual hang was previously masked by the AP-boot deadlock
-firing first.
+So the residual bug is **specifically** SMP=4 + 4 GiB. It is **separate** from
+the TLB shootdown bug — bugs 1, 2, 3, and 4 above are genuinely fixed. The
+4-way Task::new race was previously masked by the AP-boot TLB shootdown
+deadlock firing first.
 
 ## TL;DR — why this was so hard to find
 
