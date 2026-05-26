@@ -1285,6 +1285,17 @@ const _: () = assert!(
 /// state; on receiver-side `TableFull` failure or invalid handle, rolls back
 /// any caps already transferred and returns the inserting [`CapError`].
 ///
+/// # Rollback atomicity
+///
+/// On rollback the function snapshots the original sender-side handle for
+/// each slot (along with the underlying [`Capability`] value) before
+/// `grant_task_cap` removes it from the sender. If a later slot fails, the
+/// rollback removes the cap from the receiver and re-inserts it into the
+/// sender at the *original* handle via [`scheduler::insert_cap_at`] — not
+/// at whichever free slot `CapabilityTable::insert` happens to choose. From
+/// the caller's perspective the sender-side handle space is untouched on a
+/// failed transfer: the cap is back in exactly the slot it came from.
+///
 /// The transfer uses [`crate::task::scheduler::grant_task_cap`] under the
 /// scheduler lock for each slot, matching the atomicity guarantee of the
 /// existing single-cap `sys_cap_grant` path.
@@ -1310,19 +1321,25 @@ fn ipc_transfer_caps(
         return Ok(());
     }
 
-    // Phase A: pre-validate every source handle. This is racy against
-    // concurrent revocation but tightens the common-case failure mode:
-    // a typo'd handle returns `InvalidHandle` before any partial state
-    // mutation.
+    // Phase A: snapshot every source handle and the underlying capability
+    // *before* any mutation. Pre-validation tightens the common-case
+    // failure mode (typo'd handle returns `InvalidHandle` before any
+    // partial state) and the cap snapshot lets Phase C restore the
+    // original sender-side slot on rollback.
+    let mut orig_handles = [0u32; CAP_SLOTS_PER_MSG];
+    let mut orig_caps: [Option<Capability>; CAP_SLOTS_PER_MSG] = [None, None];
     for i in 0..n {
-        scheduler::task_cap(sender, msg.cap_slots[i])?;
+        let cap = scheduler::task_cap(sender, msg.cap_slots[i])?;
+        orig_handles[i] = msg.cap_slots[i];
+        orig_caps[i] = Some(cap);
     }
 
     // Phase B: transfer each handle in turn. `grant_task_cap` performs
     // an atomic remove-from-source + insert-into-target under the
     // scheduler lock. If any transfer fails (validation lost the race
     // or the receiver table truly cannot grow), roll back the already-
-    // transferred caps by granting them back.
+    // transferred caps by restoring them to the sender's *original*
+    // slot (preserving caller-side handle stability).
     let mut new_handles = [0u32; CAP_SLOTS_PER_MSG];
     let mut transferred = 0usize;
     for i in 0..n {
@@ -1332,8 +1349,24 @@ fn ipc_transfer_caps(
                 transferred += 1;
             }
             Err(err) => {
-                for &h in new_handles.iter().take(transferred) {
-                    let _ = scheduler::grant_task_cap(receiver, h, sender);
+                // Phase C: roll back every cap already transferred to the
+                // receiver back into the sender at the original slot. The
+                // `remove_task_cap(receiver, h)` + `insert_cap_at(sender,
+                // orig_handles[j], cap)` pair is not itself wrapped in a
+                // single scheduler-lock acquisition, but each step IS
+                // atomic — the worst-case observable state on a wedged
+                // rollback (e.g. cap removed from receiver but
+                // `insert_cap_at` returns `SlotOccupied` because another
+                // thread filled the original slot) is a leaked cap, never
+                // a duplicated one. That is the same failure model
+                // `sys_cap_grant` carries today.
+                for j in 0..transferred {
+                    let h = new_handles[j];
+                    let cap = match scheduler::remove_task_cap(receiver, h) {
+                        Ok(c) => c,
+                        Err(_) => continue,
+                    };
+                    let _ = scheduler::insert_cap_at(sender, orig_handles[j], cap);
                 }
                 return Err(err);
             }

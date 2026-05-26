@@ -427,17 +427,16 @@ pub fn sys_page_grant_send(sender: TaskId, pages_vaddr: u64, n_pages: u64) -> u6
     // Phase B: SMP-wide TLB shootdown over the unmapped range. The
     // sender's other threads must not retain a stale TLB entry pointing
     // at a frame the receiver is about to own.
-    if let Some(addr_space) = addr_space_for_pid(pid) {
+    //
+    // `addr_space_for_pid` returns an `Arc<AddressSpace>` cloned under
+    // `PROCESS_TABLE.lock()`, so the address space cannot be freed for
+    // the duration of the shootdown even if the sender's process is
+    // concurrently torn down (exit/exec). Dereferencing via `&*aspace`
+    // is safe and carries no aliasing or lifetime hazard.
+    if let Some(aspace) = addr_space_for_pid(pid) {
         let start = pages_vaddr;
         let end = pages_vaddr + (n_pages as u64) * 4096;
-        // SAFETY: addr_space is a raw pointer into the process table;
-        // tlb_shootdown_range takes &AddressSpace and the table is
-        // protected by the process-table lock. Dereference is bounded
-        // to this call.
-        unsafe {
-            let aspace_ref = &*addr_space;
-            crate::smp::tlb::tlb_shootdown_range(aspace_ref, start, end);
-        }
+        crate::smp::tlb::tlb_shootdown_range(&aspace, start, end);
     }
 
     // Phase C: register + cap insert. Roll back the unmap if cap-insert
@@ -607,6 +606,7 @@ pub fn sys_page_grant_recv(receiver: TaskId, grant_cap: u32) -> u64 {
             Ok(f) => f,
             Err(_) => {
                 rollback_recv_map(&mut mapper, base, i);
+                release_user_va(pid, base, bytes);
                 return u64::MAX;
             }
         };
@@ -617,6 +617,7 @@ pub fn sys_page_grant_recv(receiver: TaskId, grant_cap: u32) -> u64 {
             Ok(flush) => flush.flush(),
             Err(_) => {
                 rollback_recv_map(&mut mapper, base, i);
+                release_user_va(pid, base, bytes);
                 return u64::MAX;
             }
         }
@@ -662,18 +663,23 @@ fn cr3_for_pid(pid: u32) -> Option<u64> {
         .and_then(|p| p.addr_space.as_ref().map(|a| a.pml4_phys().as_u64()))
 }
 
-/// Borrow the `AddressSpace` for `pid` as a raw pointer so the TLB
-/// shootdown helper can read its `active_cores` mask. The pointer is
-/// only valid for the duration of the call inside the locked process
-/// table — callers must dereference inside a tight unsafe block while
-/// the process is known to be live.
-fn addr_space_for_pid(pid: u32) -> Option<*const crate::mm::AddressSpace> {
+/// Borrow the `Arc<AddressSpace>` for `pid` by cloning it out of the
+/// process table under the table lock.
+///
+/// Returning the cloned `Arc` (rather than a raw pointer borrowed from the
+/// lock-guarded entry) keeps the address space alive for the entire
+/// `tlb_shootdown_range` call even if the owning process is concurrently
+/// torn down (exit/exec replacing `Process.addr_space`). Callers
+/// dereference the `Arc` directly — see [`sys_page_grant_send`].
+///
+/// This matches the pattern in
+/// [`crate::pci::bar::unmap_mmio_region_from_user`], which also takes a
+/// `&Arc<AddressSpace>` and lets the caller hold the refcount.
+fn addr_space_for_pid(pid: u32) -> Option<alloc::sync::Arc<crate::mm::AddressSpace>> {
     let table = crate::process::PROCESS_TABLE.lock();
-    table.find(pid).and_then(|p| {
-        p.addr_space
-            .as_ref()
-            .map(|a| a.as_ref() as *const crate::mm::AddressSpace)
-    })
+    table
+        .find(pid)
+        .and_then(|p| p.addr_space.as_ref().map(alloc::sync::Arc::clone))
 }
 
 /// Reserve `bytes` bytes of user VA from the process's `mmap_next`
@@ -692,6 +698,26 @@ fn reserve_user_va(pid: u32, bytes: u64) -> Option<u64> {
         *mmap_next = end;
         Some(current)
     })?
+}
+
+/// Best-effort rollback of a `reserve_user_va` call.
+///
+/// Mirrors [`crate::syscall::device_host::release_user_va_reservation`]:
+/// only restores `mmap_next` if the reservation is still the current tail
+/// (`mmap_next == base + bytes`). A subsequent mmap-style allocation may
+/// have moved the bump pointer past this reservation; in that case the
+/// VA is conservatively forfeited rather than risk a free-list gap. The
+/// receiver VA window is 128 TiB so leaking the occasional failed
+/// reservation does not threaten address space exhaustion in practice —
+/// the rollback exists so that *repeated* failures on the same code path
+/// (e.g. a malformed grant retried in a tight loop) don't permanently
+/// burn through the window.
+fn release_user_va(pid: u32, base: u64, bytes: u64) {
+    let _ = crate::process::with_shared_mm_mut(pid, |_brk, mmap_next, _vmas| {
+        if *mmap_next == base + bytes {
+            *mmap_next = base;
+        }
+    });
 }
 
 #[cfg(test)]
