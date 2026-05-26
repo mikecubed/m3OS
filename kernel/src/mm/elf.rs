@@ -288,11 +288,16 @@ unsafe fn map_load_segment(
         // every page it covers. Reject before any frame allocation or
         // page-table mutation so no partial state is left behind.
         if phdr.p_flags & (PF_W | PF_X) == (PF_W | PF_X) {
+            // PIE/ET_DYN binaries link at a virtual base of 0; the effective
+            // mapped vaddr is `p_vaddr + load_bias`. Log both so the warning
+            // is unambiguous regardless of binary type.
             log::warn!(
-                "elf: rejecting PT_LOAD with PF_W|PF_X (W^X violation): binary={} p_offset={:#x} p_vaddr={:#x} p_flags={:#x}",
+                "elf: rejecting PT_LOAD with PF_W|PF_X (W^X violation): binary={} p_offset={:#x} p_vaddr_raw={:#x} p_vaddr_mapped={:#x} load_bias={:#x} p_flags={:#x}",
                 binary_name,
                 phdr.p_offset,
                 phdr.p_vaddr,
+                phdr.p_vaddr.wrapping_add(load_bias),
+                load_bias,
                 phdr.p_flags,
             );
             return Err(ElfError::MappingFailed(
@@ -760,14 +765,17 @@ pub unsafe fn load_elf_into(
 /// Convenience wrapper around [`load_elf_into`] that obtains the active
 /// mapper via `paging::get_mapper()`.
 ///
+/// `binary_name` is threaded through to `load_elf_into` for log
+/// provenance — callers should pass a path or `argv[0]`-equivalent.
+///
 /// # Safety
 /// No other `OffsetPageTable` over the current CR3 may be alive at the
 /// same time.
-pub unsafe fn load_elf(data: &[u8]) -> Result<LoadedElf, ElfError> {
+pub unsafe fn load_elf(data: &[u8], binary_name: &str) -> Result<LoadedElf, ElfError> {
     unsafe {
         let phys_off = super::phys_offset();
         let mut mapper = super::paging::get_mapper();
-        load_elf_into(&mut mapper, phys_off, data, "")
+        load_elf_into(&mut mapper, phys_off, data, binary_name)
     }
 }
 

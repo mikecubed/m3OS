@@ -126,7 +126,7 @@ looks exactly as it did before the syscall.
 
 ### The JIT exception pattern
 
-JIT engines (Node.js, V8, Cranelift, the Lua LuaJIT, etc.) need to
+JIT engines (Node.js, V8, Cranelift, LuaJIT, etc.) need to
 write machine code at runtime and then execute it. They cannot use
 `PROT_WRITE | PROT_EXEC` — that combination is rejected. The
 supported pattern is the two-step toggle:
