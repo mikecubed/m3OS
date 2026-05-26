@@ -19,12 +19,18 @@
 //! Wired into `cargo xtask smoke-test` via the `smoke-runner`
 //! `wx-violation` stage; `smoke-runner` execs `/bin/wx-violation` and
 //! asserts the `WX_VIOLATION:smoke:ok` marker is present.
+//!
+//! Syscalls route through `syscall_lib::{syscall2, syscall3, syscall6}`
+//! and the centrally-defined `SYS_MMAP` / `SYS_MPROTECT` / `SYS_MUNMAP`
+//! constants — no local inline-asm wrappers or duplicate syscall
+//! numbers.
 
 #![no_std]
 #![no_main]
 
-use core::arch::asm;
-use syscall_lib::{STDOUT_FILENO, exit, write};
+use syscall_lib::{
+    STDOUT_FILENO, SYS_MMAP, SYS_MPROTECT, SYS_MUNMAP, exit, syscall2, syscall3, syscall6, write,
+};
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -39,15 +45,6 @@ fn fail(reason: &[u8]) -> ! {
     exit(2)
 }
 
-// ---------------------------------------------------------------------------
-// Local syscall numbers / constants. Mirrors
-// `kernel/src/arch/x86_64/syscall/mod.rs` and standard POSIX.
-// ---------------------------------------------------------------------------
-
-const SYS_MMAP: u64 = 9;
-const SYS_MPROTECT: u64 = 10;
-const SYS_MUNMAP: u64 = 11;
-
 const PROT_READ: u64 = 0x1;
 const PROT_WRITE: u64 = 0x2;
 const PROT_EXEC: u64 = 0x4;
@@ -59,73 +56,20 @@ const EINVAL_NEG: i64 = -22;
 
 const PAGE: u64 = 4096;
 
-/// Raw `mmap` — the kernel reads `flags`/`fd`/`offset` from r10/r8/r9
-/// (per `sys_linux_mmap`'s `per_core_syscall_arg3` / r8 / r9 reads).
-unsafe fn raw_mmap(addr_hint: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64) -> u64 {
-    unsafe {
-        let mut rax = SYS_MMAP;
-        asm!(
-            "syscall",
-            inlateout("rax") rax,
-            in("rdi") addr_hint,
-            in("rsi") len,
-            in("rdx") prot,
-            in("r10") flags,
-            in("r8") fd,
-            in("r9") offset,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-        rax
-    }
-}
-
-unsafe fn raw_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
-    unsafe {
-        let mut rax = SYS_MPROTECT;
-        asm!(
-            "syscall",
-            inlateout("rax") rax,
-            in("rdi") addr,
-            in("rsi") len,
-            in("rdx") prot,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-        rax
-    }
-}
-
-unsafe fn raw_munmap(addr: u64, len: u64) -> u64 {
-    unsafe {
-        let mut rax = SYS_MUNMAP;
-        asm!(
-            "syscall",
-            inlateout("rax") rax,
-            in("rdi") addr,
-            in("rsi") len,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-        rax
-    }
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     let _ = write(STDOUT_FILENO, b"WX_VIOLATION:smoke:begin\n");
 
-    // 1. Allocate one anonymous RW page.
+    // 1. Allocate one anonymous RW page. fd is ignored for MAP_ANONYMOUS,
+    //    but pass an obviously-invalid value.
     let base = unsafe {
-        raw_mmap(
+        syscall6(
+            SYS_MMAP,
             0,
             PAGE,
             PROT_READ | PROT_WRITE,
             MAP_PRIVATE | MAP_ANONYMOUS,
-            u64::MAX, // fd ignored for MAP_ANONYMOUS, but pass an obviously-invalid value
+            u64::MAX,
             0,
         )
     };
@@ -143,7 +87,7 @@ pub extern "C" fn _start() -> ! {
 
     // 3. Negative case — `mprotect(PROT_WRITE | PROT_EXEC)` must be
     //    rejected with EINVAL by the Phase 75 guard.
-    let rc_wx = unsafe { raw_mprotect(base, PAGE, PROT_WRITE | PROT_EXEC) } as i64;
+    let rc_wx = unsafe { syscall3(SYS_MPROTECT, base, PAGE, PROT_WRITE | PROT_EXEC) } as i64;
     if rc_wx != EINVAL_NEG {
         fail(b"mprotect-rwx-not-einval");
     }
@@ -161,13 +105,13 @@ pub extern "C" fn _start() -> ! {
 
     // 5. Positive case — the JIT pattern: flip to R-X. Must succeed
     //    (rax = 0).
-    let rc_rx = unsafe { raw_mprotect(base, PAGE, PROT_READ | PROT_EXEC) };
+    let rc_rx = unsafe { syscall3(SYS_MPROTECT, base, PAGE, PROT_READ | PROT_EXEC) };
     if rc_rx != 0 {
         fail(b"mprotect-rx-failed");
     }
 
     // 6. Cleanup — best effort; failure does not invalidate the test.
-    let _ = unsafe { raw_munmap(base, PAGE) };
+    let _ = unsafe { syscall2(SYS_MUNMAP, base, PAGE) };
 
     let _ = write(STDOUT_FILENO, b"WX_VIOLATION:smoke:ok\n");
     exit(0)

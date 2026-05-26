@@ -111,3 +111,4 @@ In `kernel/src/arch/x86_64/syscall/mod.rs`, `sys_mprotect` (line 9762) currently
 - Stack canaries and shadow stacks (CET) — hardware-assisted stack protection for the userspace ABI
 - Executable-space protection for kernel memory (SMEP/SMAP enforcement) — already partially in place via the x86_64 CR4 bits set during boot; a full audit is deferred
 - W^X validation for kernel module loading — m3OS has no loadable kernel modules, so this is moot
+- Dedicated NX-fault runtime regression for stack and heap — a test binary that casts a stack or heap address to a function pointer, calls it, and asserts the page-fault handler emits an NX-fault diagnostic string. Phase 75 covers stack/heap NX via static audit plus the per-PT_LOAD `log::info!` trace in Track E.2 and the Track A.1 W+X-segment rejection; the explicit jump-and-catch-#PF regressions are a future hardening item

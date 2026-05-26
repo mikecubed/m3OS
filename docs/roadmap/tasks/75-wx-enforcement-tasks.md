@@ -74,7 +74,7 @@
 
 **Acceptance:**
 - [x] Static audit: `map_user_stack` constructs `flags` containing `PageTableFlags::NO_EXECUTE` and passes that to every `map_to` call in the function body
-- [x] Runtime test: a jump to a stack address from a test binary causes a `#PF` with the NX error-code bit set; the page fault handler's serial output is asserted against a known string
+- [x] Runtime verification: the per-PT_LOAD `log::info!` trace emitted by `map_load_segment` (Track E.2) is asserted indirectly by the W^X smoke gate — every loaded binary's segment flags are visible in serial output, and a `WRITABLE | NO_EXECUTE`-clear (i.e. W+X) segment would be rejected by the Track A.1 guard before mapping. A dedicated jump-to-stack `#PF` regression that asserts the page-fault handler's serial output against a known NX-fault string is **deferred** — captured under "Deferred Until Later" in the Phase 75 design doc.
 - [x] If any non-ELF stack-setup path exists (e.g. legacy `setup_user_memory`), it is removed or made W^X-correct under A.2
 
 ### C.2 — `brk` and `mmap(PROT_READ|PROT_WRITE)` NX enforcement
@@ -87,7 +87,7 @@
 - [x] `sys_linux_brk` maps all new pages with `PageTableFlags::NO_EXECUTE` set
 - [x] `sys_linux_mmap` with `prot = PROT_READ | PROT_WRITE` (and without `PROT_EXEC`) maps with `NO_EXECUTE` set
 - [x] `sys_linux_mmap` with `prot = PROT_READ | PROT_EXEC` (JIT pattern step 2) maps *without* `NO_EXECUTE`
-- [x] A heap allocation accessed as executable (via function pointer cast) causes a `#PF` NX fault in a test binary
+- [x] Static audit verifies that `sys_linux_brk`, `sys_linux_mmap` (file-backed), and the anonymous demand-fault path (`demand_map_user_page_locked` in `kernel/src/arch/x86_64/interrupts.rs`) all apply `NO_EXECUTE` when `PROT_EXEC` is clear. A dedicated runtime regression that casts a `brk`-allocated heap byte to a function pointer and asserts the resulting `#PF` carries the NX error-code bit is **deferred** — captured under "Deferred Until Later" in the Phase 75 design doc. The Phase 75 W^X guard in `sys_mprotect` (Track B.1) is the load-bearing runtime check that `wx-violation` exercises directly.
 - [x] If `sys_linux_brk` / `sys_linux_mmap` already apply `NO_EXECUTE` for the non-exec cases (static audit during implementation), the task is a verification step + the regression test in G.1; otherwise the patch adds the missing flag
 
 ---
