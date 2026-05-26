@@ -46,6 +46,9 @@ use crate::mm::user_mem::{UserSliceRo, UserSliceWo};
 const NEG_EPERM: u64 = (-1_i64) as u64;
 const NEG_ENOENT: u64 = (-2_i64) as u64;
 const NEG_EIO: u64 = (-5_i64) as u64;
+/// Phase 75: surfaced by execve when ELF parsing/mapping fails (including
+/// the new PF_W|PF_X W^X-violation rejection in `mm::elf::map_load_segment`).
+const NEG_ENOEXEC: u64 = (-8_i64) as u64;
 const NEG_EBADF: u64 = (-9_i64) as u64;
 #[allow(dead_code)]
 const NEG_EAGAIN: u64 = (-11_i64) as u64;
@@ -4708,13 +4711,21 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     let (loaded, user_rsp) = {
         // SAFETY: new_cr3 is freshly allocated; no other mapper exists.
         let mut mapper = unsafe { crate::mm::mapper_for_frame(new_cr3) };
-        let loaded = match unsafe { crate::mm::elf::load_elf_into(&mut mapper, phys_off, data) } {
-            Ok(l) => l,
-            Err(e) => {
-                log::warn!("[execve] ELF load failed: {:?}", e);
-                return NEG_ENOENT; // treat invalid ELF as "not found"
-            }
-        };
+        let loaded =
+            match unsafe { crate::mm::elf::load_elf_into(&mut mapper, phys_off, data, name) } {
+                Ok(l) => l,
+                Err(crate::mm::elf::ElfError::OutOfFrames) => {
+                    log::warn!("[execve] ELF load OOM for {}", name);
+                    return NEG_ENOMEM;
+                }
+                Err(e) => {
+                    // Phase 75: an invalid ELF (including the new PF_W|PF_X
+                    // W^X-violation rejection) surfaces to userspace as ENOEXEC,
+                    // matching POSIX semantics for execve(2).
+                    log::warn!("[execve] ELF load failed for {}: {:?}", name, e);
+                    return NEG_ENOEXEC;
+                }
+            };
         // SAFETY: stack pages were just mapped by load_elf_into; mapper is valid.
         let user_rsp = match unsafe {
             crate::mm::elf::setup_abi_stack_with_envp(
@@ -9763,6 +9774,21 @@ pub(super) fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
     // Mask prot to supported POSIX bits only.
     let prot = prot & 0x7; // PROT_READ | PROT_WRITE | PROT_EXEC
 
+    const PROT_READ: u64 = 0x1;
+    const PROT_WRITE: u64 = 0x2;
+    const PROT_EXEC: u64 = 0x4;
+
+    // Phase 75 W^X enforcement: reject any request that asks for both
+    // PROT_WRITE and PROT_EXEC on the same range. The guard runs before
+    // page-alignment validation, the VMA walk, and any PTE mutation so
+    // that no partial state is left behind on rejection. The supported
+    // JIT pattern is documented in
+    // `docs/appendix/architecture-and-syscalls.md` (allocate RW-, write
+    // machine code, then `mprotect` to R-X).
+    if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
+        return NEG_EINVAL;
+    }
+
     // Validate: page-aligned address and non-zero length.
     if addr & 0xFFF != 0 || len == 0 {
         return NEG_EINVAL;
@@ -9776,10 +9802,6 @@ pub(super) fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
         Some(e) => e,
         None => return NEG_EINVAL,
     };
-
-    const PROT_READ: u64 = 0x1;
-    const PROT_WRITE: u64 = 0x2;
-    const PROT_EXEC: u64 = 0x4;
 
     // Validate that the entire range is covered by VMAs (or stack/brk regions).
     // For now, we are permissive: if the address falls outside tracked VMAs

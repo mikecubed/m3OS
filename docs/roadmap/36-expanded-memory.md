@@ -179,3 +179,8 @@ shootdown via existing SMP infrastructure.
 - Huge pages (2 MiB / 1 GiB) — performance optimization
 - Memory-mapped files (`mmap` with file descriptors)
 - NUMA-aware allocation
+- W^X validation of `mprotect()` — **Enforced as of
+  [Phase 75](./75-wx-enforcement.md)**. `sys_mprotect` returns `EINVAL`
+  before any VMA walk or PTE mutation when both `PROT_WRITE` and
+  `PROT_EXEC` are requested, and the anonymous-`mmap` / `brk` paths
+  always apply `NO_EXECUTE` to data pages.

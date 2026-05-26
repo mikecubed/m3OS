@@ -1050,7 +1050,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.74.0"
+version = "0.75.0"
 dependencies = [
  "bootloader_api",
  "kernel-core",
@@ -2606,6 +2606,13 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
+]
+
+[[package]]
+name = "wx-violation"
+version = "0.1.0"
+dependencies = [
+ "syscall-lib",
 ]
 
 [[package]]

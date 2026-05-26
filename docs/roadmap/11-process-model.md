@@ -77,6 +77,11 @@ lifecycle transitions: spawn -> running -> zombie -> reaped.
 - **Extends Phase 9 (Shell):** the shell becomes the parent process that spawns children via fork+exec
 - **Extends Phase 3 (Memory Management):** allocates fresh page tables and frames for each new process address space
 - **Reuses Phase 6 (IPC):** process exit notifications and wait/reap use kernel-internal signaling
+- **Hardened by [Phase 75 (W^X Enforcement)](./75-wx-enforcement.md):** Phase 11's
+  per-segment ELF flag handling is the foundation Phase 75 builds on — every
+  `PT_LOAD` segment now lands as `R-X` / `RW-` / `R--` (never `WX`), and the
+  `map_load_segment` PF_W|PF_X guard surfaces malformed binaries to `execve(2)`
+  as `ENOEXEC`.
 
 ## Implementation Outline
 
@@ -115,3 +120,8 @@ reason about.
 - process groups and sessions
 - `clone` with shared address spaces (threads)
 - `ptrace` and debugging support
+- W^X enforcement for `PT_LOAD` text/data separation — **Delivered in
+  [Phase 75](./75-wx-enforcement.md)**. The ELF loader's `segment_flags`
+  helper produced W^X-correct flags for the three benign `PT_LOAD` shapes
+  from day one, but the malformed `PF_W | PF_X` rejection branch was added
+  in Phase 75 along with the `sys_mprotect` guard.

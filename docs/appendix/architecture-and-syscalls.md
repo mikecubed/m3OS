@@ -642,10 +642,63 @@ sign that the code should be reconsidered.
 
 ---
 
+## W^X Enforcement (Phase 75)
+
+m3OS enforces write-XOR-execute (W^X) for every userspace page. The
+guarantees, in increasing scope:
+
+1. **ELF loader (`kernel/src/mm/elf.rs`)** — `map_load_segment` rejects
+   any `PT_LOAD` segment whose `p_flags` set both `PF_W` and `PF_X` with
+   `ElfError::MappingFailed("PT_LOAD with PF_W|PF_X — W^X violation")`,
+   surfaced to `execve(2)` as `-ENOEXEC`. The three benign segment
+   shapes (`PF_X` only / `PF_W` only / neither) map as `R-X` / `RW-` /
+   `R--` respectively, with `NO_EXECUTE` applied whenever `PF_X` is
+   clear.
+2. **`mprotect(2)`** — `sys_mprotect` rejects any request with
+   `PROT_WRITE | PROT_EXEC` and returns `EINVAL` before validating the
+   address range, walking VMAs, or mutating any PTE. The rejection is
+   atomic — no page is left half-mutated on the failure path.
+3. **Stack / heap (`brk`, anonymous `mmap`)** — the ELF loader's
+   `map_user_stack` and the kernel `brk` and `mmap` paths apply
+   `NO_EXECUTE` to every page mapped without `PROT_EXEC`. Stack and
+   heap pages are never executable.
+
+### JIT Code Generation Pattern
+
+A JIT engine (Phase 80 Node.js, future Cranelift / V8 ports, etc.)
+cannot map a single page as `PROT_WRITE | PROT_EXEC` — `sys_mprotect`
+rejects that combination with `EINVAL`. The supported pattern is the
+classic two-step toggle:
+
+```c
+// 1. Allocate writable scratch.
+void *code = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+// 2. Emit machine code (CPU sees a non-executable page until step 3).
+memcpy(code, generated_bytes, size);
+
+// 3. Flip to read+execute. EINVAL would mean we asked for
+//    PROT_WRITE | PROT_EXEC; only the R-X form is allowed.
+mprotect(code, size, PROT_READ | PROT_EXEC);
+
+// 4. Call into the freshly-generated code.
+((void (*)())code)();
+```
+
+`PROT_WRITE | PROT_EXEC` is not available as an alternative — the
+guard in `sys_mprotect` rejects the combination unconditionally. JIT
+engines must commit to the two-step toggle.
+
+Phase 80 (Node.js) is the first in-tree consumer of this pattern.
+
+---
+
 ## Related Docs
 
 - [Phase 5 — Userspace Entry](../05-userspace-entry.md) — Ring 3 execution model
 - [Phase 6 — IPC](../06-ipc.md) — IPC implementation details
 - [Phase 7 — Core Servers](../07-core-servers.md) — Server infrastructure
 - [Phase 12 — POSIX Compat](../12-posix-compatibility-layer.md) — Linux syscall ABI
+- [Phase 75 — W^X Enforcement](../75-wx-enforcement.md) — Detailed enforcement walkthrough
 - [Roadmap Guide](../roadmap/README.md) — Per-phase milestones
