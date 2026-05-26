@@ -1,9 +1,9 @@
 # Phase 74a — Pre-1.0 Audit and Release Blocker Inventory
 
-**Status:** Planned (audit artifact — feeds Phase 77 Release 1.0 Gate)
+**Status:** Planned (audit artifact — feeds Phase 83 Release 1.0 Gate)
 **Source Ref:** phase-74a
-**Depends on:** Phase 74 ✅, Phases 60–73 ✅
-**Builds on:** The audit reconciliation captured in `docs/appendix/audit-status/` and the per-phase "Deferred Until Later" sections of every roadmap doc 01–73.
+**Depends on:** Phase 74 ✅, Phase 75 ✅, Phases 60–73 ✅
+**Builds on:** The audit reconciliation captured in `docs/appendix/audit-status/` and the per-phase "Deferred Until Later" sections of every roadmap doc 01–75.
 **Primary Components:** none (documentation-only)
 
 ## Milestone Goal
@@ -19,15 +19,15 @@ This doc is the planning input for Phases 74b…77. Items here are graded by 1.0
 
 ## Why This Phase Exists
 
-Phases 60–73 were audit-driven cleanup of Phases 1–58. Phase 73 closed the visible desktop story (compositor + bar + launcher + notifyd + lockscreen). Phase 74 closes the last IPC-correctness gap (capability grants + bulk transfers). What remains is the gap between *runs in QEMU* and *runs on the metal in front of the user*, plus a small tail of correctness items from earlier phases that quiet doc drift has been hiding.
+Phases 60–73 were audit-driven cleanup of Phases 1–58. Phase 73 closed the visible desktop story (compositor + bar + launcher + notifyd + lockscreen). Phase 74 closed the last IPC-correctness gap (capability grants + bulk transfers). Phase 75 closed the W^X security gap. What remains is the gap between *runs in QEMU* and *runs on the metal in front of the user*, plus a small tail of correctness items from earlier phases that quiet doc drift has been hiding.
 
-Without this inventory, Phase 77 (Release 1.0 Gate) cannot be scoped — there is no single place that lists what 1.0 must include and what it must defer.
+Without this inventory, Phase 83 (Release 1.0 Gate) cannot be scoped — there is no single place that lists what 1.0 must include and what it must defer.
 
 ## Audit Methodology
 
 Five parallel agents catalogued and source-verified every item in:
 
-- Every phase doc 01–73 ("Deferred Until Later", "How Real OS Implementations Differ", embedded TODOs, unmet acceptance criteria)
+- Every phase doc 01–75 ("Deferred Until Later", "How Real OS Implementations Differ", embedded TODOs, unmet acceptance criteria)
 - Every doc under `docs/handoffs/`, `docs/post-mortems/`, `docs/research/`, `docs/evaluation/`, `docs/debug/`
 - Driver inventory under `kernel/src/`, `userspace/drivers/`, `kernel-core/src/iommu/`
 - The tcc port (`xtask/src/main.rs` ports build) + ELF loader (`kernel/src/mm/elf.rs`) + syscall table + libc/CRT staging
@@ -42,25 +42,31 @@ Hardware target for §3: the user's actual laptop (HP OmniBook, AMD Ryzen AI 9 3
 
 | # | Blocker | Class | Owner phase | Severity |
 |---|---|---|---|---|
-| 1 | No USB stack at all — `kernel/`/`userspace/` contain zero xHCI/EHCI/UHCI/OHCI bytes | Hardware driver | new (proposed 74b) | **BLOCKER** |
-| 2 | No Wi-Fi driver of any kind (laptop target has zero ethernet) | Hardware driver | new (proposed 74e) | **BLOCKER for laptops** |
-| 3 | Only e1000-82540EM supported — no e1000e/igb/igc/Realtek/Broadcom | Hardware driver | new (proposed 74d) | **BLOCKER for desktops** |
-| 4 | No SATA/AHCI driver — NVMe-only storage | Hardware driver | new (proposed 74f) | HIGH (NVMe-only systems work; older boxes fail) |
-| 5 | Only AC'97 audio — no HDA, no HDMI audio | Hardware driver | new (proposed 74c) | HIGH (modern boxes have no AC'97) |
+| 1 | No USB stack at all — `kernel/`/`userspace/` contain zero xHCI/EHCI/UHCI/OHCI bytes | Hardware driver | Phase 78 | **BLOCKER** |
+| 2 | No Wi-Fi driver of any kind (laptop target has zero ethernet) | Hardware driver | Phase 81 | **BLOCKER for laptops** |
+| 3 | Only e1000-82540EM supported — no e1000e/igb/igc/Realtek/Broadcom | Hardware driver | Phase 79 | **BLOCKER for desktops** |
+| 4 | No SATA/AHCI driver — NVMe-only storage | Hardware driver | Phase 82 (optional) | HIGH (NVMe-only systems work; older boxes fail) |
+| 5 | Only AC'97 audio — no HDA, no HDMI audio | Hardware driver | Phase 80 | HIGH (modern boxes have no AC'97) |
 | 6 | Phase 65 fat_server still stubs every op to `ENOSYS` | Code | Phase 65 (planned) | HIGH (declared release-gating in roadmap) |
-| 7 | Phase 75 W^X not enforced — userspace text pages are RWX | Security | Phase 75 (planned) | HIGH |
-| 8 | Phase 76 dynamic linker absent — no `PT_INTERP`, no `dlopen`, no `.so` support | Code | Phase 76 (planned) | HIGH (toolkit GUI apps and Node.js blocked) |
-| 9 | No Spectre-v2/SMEP/SMAP/KPTI mitigations on real silicon | Security | new (proposed 74g) | HIGH (silent on QEMU TCG, exploitable on metal) |
-| 10 | SSH client disconnect hangs forever — PR #118 residual | Correctness | hotfix or 74-series | MEDIUM |
-| 11 | `sys_nanosleep` busy-yield can starve PID 1 — PR #118 residual | Correctness | hotfix or 74-series | MEDIUM (flaky `serverization-fallback` regression) |
-| 12 | TCP retransmit + 4-connection-slot limit | Code | network rework | MEDIUM |
-| 13 | `PT_TLS` segment not parsed — musl works around it via reserved stack space; multi-threaded TLS is fragile | Code | Phase 40 follow-up | MEDIUM |
+| 7 | ~~W^X not enforced — userspace text pages are RWX~~ | Security | Phase 75 ✅ (merged 2026-05-26) | CLOSED |
+| 8 | Dynamic linker absent — no `PT_INTERP`, no `dlopen`, no `.so` support | Code | Phase 76 (planned) | HIGH (toolkit GUI apps and Node.js blocked) |
+| 9 | No Spectre/SMEP/SMAP/KPTI mitigations on real silicon | Security | Phase 77 (SMEP+SMAP) + Phase 84 (KPTI/retpoline/IBRS, post-1.0) | HIGH for SMEP+SMAP; deferrable for KPTI |
+| 10 | SSH client disconnect hangs forever — PR #118 residual | Correctness | Phase 77 (Track A.1) | MEDIUM |
+| 11 | `sys_nanosleep` busy-yield can starve PID 1 — PR #118 residual | Correctness | Phase 77 (Track A.2) | MEDIUM (flaky `serverization-fallback` regression) |
+| 12 | TCP retransmit + 4-connection-slot limit | Code | Phase 77 (Track D.2) | MEDIUM (real internet is broken without it) |
+| 13 | `PT_TLS` segment not parsed — musl works around it via reserved stack space; multi-threaded TLS is fragile | Code | Phase 77 (Track C) | MEDIUM |
 | 14 | Phase 10 (Secure Boot) never validated on real hardware | Validation | Phase 59 | MEDIUM |
-| 15 | IPv6 / DHCPv6 absent; no on-target DNS resolver | Code | post-1.0 acceptable | MEDIUM |
+| 15 | DNS resolver absent (user must type IPs); IPv6 / DHCPv6 absent | Code | Phase 77 (Track D.1, DNS) + Phase 89 (IPv6 post-1.0) | MEDIUM |
+| 16 | No CPU microcode loading on real hardware | Correctness/Security | Phase 77 (Track E) | MEDIUM |
+| 17 | `epoll_*` PARTIAL — `sys_poll` exists but `epoll_create1`/`epoll_ctl`/`epoll_wait` not confirmed; needs verification | Code | Phase 77 (Track F) | MEDIUM |
+| 18 | virtio-input migration status unclear from 2026-05-04 handoff | Handoff | Phase 77 (Track G.3) or Phase 59 | LOW |
+| 19 | `htop` shows zero processes even as root — `/proc` compatibility gap with Linux's `getdents64` / `/proc/<pid>/stat` / `openat`-on-dir-fd semantics (2026-05-20 handoff, open) | Code | Phase 77 (Track H) | HIGH (breaks a Phase 69d-shipped TUI app) |
+| 20 | Cursor pinned at (0,0) on display_server start under some scheduler conditions (2026-04-28 handoff, open) | Correctness | Phase 77 (Track G.4) | MEDIUM (likely closed by 57a/57b/57e SMP hardening; needs verification on current main) |
+| 21 | PS/2 mouse intermittently resets cursor to (0,0) after sticky bad state (2026-05-13 handoff, open) | Correctness | Phase 77 (Track G.5) | LOW (reboot-recoverable, intermittent, no log captured yet) |
 
-Items 1–9 are the actual gate for 1.0. Items 10–15 are degradations a 1.0 user will hit within a session.
+Items 1–9 are the gate for 1.0. Items 10–21 are degradations a 1.0 user will hit within a session and are bundled into Phase 77.
 
-The recommended new-phase sequence to clear 1–9 before Phase 77 is in §7.
+The new-phase sequence to clear 1–9 before Phase 83 is in §7. Phase 75 closed item 7. Phase 74 closed the items previously on this list (IPC timeouts, capability grants, page-grant bulk transfers).
 
 ---
 
@@ -73,9 +79,10 @@ Full per-doc inventory lives in `docs/appendix/audit-status/74a-detail.md` (to b
 These are the items where source grep confirmed the deferral is still real:
 
 - **IPC timeouts and cancellation** (Phase 6 deferred list) — closed by Phase 74 ✅ (merged 2026-05-26).
-- **TCP retransmission timer + multi-connection slots** (Phase 16 deferred list) — kernel TCP has fixed 4-slot array and no retransmit on loss; networking outside an idle LAN will hang.
-- **IPv6 / DHCP / DNS resolver** (Phase 16 / 23 deferred list) — IPv4 only; no in-OS resolver.
-- **`epoll` proper** (Phase 23 deferred list) — `sys_poll` exists at `kernel/src/arch/x86_64/syscall/mod.rs:17800`; no `epoll_create1`/`epoll_ctl`/`epoll_wait`. Phase 37 docs claim epoll complete, but the source check did not turn up `epoll_*` syscall handlers — needs deeper verification, flagged as PARTIAL.
+- **W^X enforcement** (Phase 11 / Phase 36 deferred lists) — closed by Phase 75 ✅ (merged 2026-05-26).
+- **TCP retransmission timer + multi-connection slots** (Phase 16 deferred list) — kernel TCP has fixed 4-slot array and no retransmit on loss; networking outside an idle LAN will hang. → Phase 77 Track D.2.
+- **IPv6 / DHCP / DNS resolver** (Phase 16 / 23 deferred list) — IPv4 only; no in-OS resolver. → DNS resolver in Phase 77 Track D.1; IPv6 / DHCPv6 in Phase 89 (post-1.0).
+- **`epoll` proper** (Phase 23 deferred list) — `sys_poll` exists at `kernel/src/arch/x86_64/syscall/mod.rs:17800`; no `epoll_create1`/`epoll_ctl`/`epoll_wait`. Phase 37 docs claim epoll complete, but the source check did not turn up `epoll_*` syscall handlers — needs deeper verification, flagged as PARTIAL. → Phase 77 Track F.
 - **Setuid bit on executables + supplementary groups + privilege separation in sshd** (Phase 48 deferred) — `sshd` still runs as root for the entire session.
 - **Argon2id password hashing** (Phase 48 deferred) — iterated SHA-256 only. Acceptable for local-only systems; below modern standards.
 - **Driver-side seccomp / syscall filtering** (Phase 55b deferred) — ring-3 drivers have full syscall surface. Phase 74's capability-grants work narrows this but does not close it.
@@ -92,12 +99,15 @@ These are the items where source grep confirmed the deferral is still real:
 
 Source: `docs/handoffs/`, `docs/post-mortems/`.
 
-- **2026-04-25 PR #118 residuals** — SSH disconnect hang (`userspace/sshd/src/session.rs:1474`) and `sys_nanosleep` busy-yield (`kernel/src/arch/x86_64/syscall/mod.rs:3174-3191`). Both still open; the second causes `cargo xtask regression --test serverization-fallback` to be flaky.
-- **2026-05-22 compositor SHM leak / multi-term OOM** — five separate fixes landed; the *original* reproducer (multi-terminal 4K launch) has not been re-confirmed on-target. Run `cargo xtask run-gui --kvm --fresh` to close.
-- **2026-05-24 4 GiB + SMP silent hang** — closed via NMI-based TLB shootdown (commit 646cb60). Framebuffer MMIO cacheability is a known latent hygiene gap; not blocking.
-- **2026-05-17 less render disappearance** — animation polish, low priority.
+- **2026-04-25 PR #118 residuals** — SSH disconnect hang (`userspace/sshd/src/session.rs:1474`) and `sys_nanosleep` busy-yield (`kernel/src/arch/x86_64/syscall/mod.rs:3174-3191`). Both still open; the second causes `cargo xtask regression --test serverization-fallback` to be flaky. → Phase 77 Tracks A.1 + A.2.
+- **2026-04-28 graphical-stack-startup** (STATUS: open) — display_server lands on an AP and its `MouseInputSource::poll_pointer` calls `ipc_call(mouse_handle, MOUSE_EVENT_PULL, 0)` and blocks forever; cursor pinned at (0,0). Suspected to be the same lost-wake root cause as 2026-04-25-scheduler-design-comparison.md. Largely superseded by Phase 57a / 57b / 57e SMP discipline hardening; needs a verification run on current `main` to confirm closure. → Phase 77 Track G.4 (verify-and-close on current main; if still reproducible, root-cause and fix).
+- **2026-05-04 virtio-input migration** (STATUS: open) — status unclear from doc; needs picker. → Phase 77 Track G.3.
 - **2026-05-11 audio IRQ/wake race** — empirically mitigated to ~1 error per boot via retry; full fix requires `wake_task_v2` precondition-closure refactor. Acceptable for 1.0.
-- **2026-05-04 virtio-input migration** — status unclear from doc; needs picker.
+- **2026-05-13 mouse-reset-top-left-intermittent** (STATUS: open) — PS/2 mouse cursor enters a sticky bad state after boot where tiny motions reset it to (0,0). Reboot-recoverable. No log captured during failure window. May or may not share root cause with the 2026-04-28 handoff. → Phase 77 Track G.5 (capture log on reproduction; fix or document as known issue).
+- **2026-05-17 less render disappearance** — animation polish, low priority. Acceptable for 1.0.
+- **2026-05-20 htop-zero-processes** (STATUS: open) — `htop` (a Phase 69d TUI deliverable) shows zero processes even as root. Suspected root causes: (1) `getdents64` semantic mismatch (m3OS musl path may differ from glibc), (2) `/proc/<pid>/stat` field-format mismatch with htop's `sscanf` template, (3) `/proc/<pid>/status` missing a field htop relies on, (4) `openat`-on-`/proc`-dir-fd semantics, (5) `/proc/cpuinfo` or `/proc/stat` row-format mismatch. Touches `kernel/src/fs/procfs.rs` plus the userspace `getdents64`/`readdir` path. → **Phase 77 Track H** (own track, see §7).
+- **2026-05-22 compositor SHM leak / multi-term OOM** — five separate fixes landed; the *original* reproducer (multi-terminal 4K launch) has not been re-confirmed on-target. Run `cargo xtask run-gui --kvm --fresh` to close. → Phase 77 Track G.2.
+- **2026-05-24 4 GiB + SMP silent hang** — closed via NMI-based TLB shootdown (commit 646cb60). Framebuffer MMIO cacheability is a known latent hygiene gap; not blocking.
 - **57e Bug #9 (FS-mutex fairness)** and **57e Bug #10 (sporadic DOOM GPF)** — both low priority; Bug #10 was observed once, never reproduced.
 
 ### Roadmap-level open phases (per `docs/roadmap/README.md`)
@@ -108,9 +118,17 @@ Source: `docs/handoffs/`, `docs/post-mortems/`.
 | 59 | Planned | Validation backlog — manual QEMU tests from earlier phases never run. Hard 1.0 gate. |
 | 65 | Planned | fat_server real implementation. Hard 1.0 gate. |
 | 74 | Complete (merged 2026-05-26) | IPC capability grants + bulk transfers. Closes Phase 6/50 deferrals. |
-| 75 | Planned | W^X enforcement. Hard 1.0 gate. |
-| 76 | Planned | Dynamic linker. Optional pre-1.0; required for Node.js (Phase 80). |
-| 77 | Planned | Release 1.0 Gate. |
+| 75 | Complete (merged 2026-05-26) | W^X enforcement. Closes audit § E1. |
+| 76 | Planned | Dynamic linker. Optional pre-1.0; required for Node.js (Phase 87). |
+| 77 | Planned | Pre-1.0 Correctness, Cheap Security, and Network Polish (bundle phase). Hard 1.0 gate. |
+| 78 | Planned | USB Host Foundation. Hard 1.0 gate (single biggest unblocker). |
+| 79 | Planned | Modern Intel/Realtek NIC. Hard 1.0 gate. |
+| 80 | Planned | Intel HDA Audio. Hard 1.0 gate. |
+| 81 | Planned | Wi-Fi Reference (MT7925). Hard 1.0 gate for laptop targets. |
+| 82 | Planned (optional) | AHCI/SATA. Optional pre-1.0; deferrable to post-1.0. |
+| 83 | Planned | Release 1.0 Gate. |
+| 84 | Planned (post-1.0) | KPTI / retpoline / IBRS — the expensive Spectre mitigations. |
+| 89 | Planned (post-1.0) | IPv6 / DHCPv6. |
 | 57e | Deferred 2026-05-07 | Full kernel preemption; voluntary mode is the 1.0 baseline. Not a blocker. |
 
 ---
@@ -210,15 +228,17 @@ The on-target build path is exercised by:
 In dependency order, the code-only items that should block 1.0:
 
 1. **Phase 65 — fat_server implementation** (already on roadmap). Today every FAT op routes through `vfs_server` to `fat_server` and returns `ENOSYS`. Either implement it or drop FAT32 from the supported matrix and document ext2-only.
-2. **Phase 75 — W^X enforcement** (already on roadmap). Userspace text pages currently include `WRITABLE`. Real attackers will notice; Linux has had `mprotect` PROT_W|PROT_X rejection since the 2000s.
-3. **PR #118 residuals** — SSH disconnect hang (HIGH user-visible bug — SSH session won't terminate) and `sys_nanosleep` busy-yield (causes flaky regression test). Both should be hotfixed before 1.0, not deferred.
-4. **TCP retransmission + connection-count cap** — IPv4 networking will appear to "work" on a perfect LAN and hang on the real internet. This is the single biggest code-only correctness gap.
-5. **`PT_TLS` parsing in ELF loader** — required before any multi-threaded tcc-built or musl-built program is reliable. Phase 40 threading exists but TLS is fragile without it.
-6. **Spectre-v2 / SMEP / SMAP / KPTI** — absent. Acceptable on a QEMU teaching system, exploitable on the metal. Add at minimum SMEP+SMAP (single CR4 bit each) before 1.0; KPTI/retpoline are larger.
-7. **`/etc/resolv.conf` DNS resolver** — no on-target resolver; user must type IPs. Trivial port of musl's stub resolver against a Phase 23 socket.
-8. **IPv6 / DHCPv6** — acceptable to defer to post-1.0 if explicitly documented as IPv4-only.
+2. ~~**Phase 75 — W^X enforcement**~~ — **CLOSED 2026-05-26** by Phase 75. ELF loader rejects `PF_W|PF_X`; `mprotect` rejects `PROT_WRITE|PROT_EXEC`; stack / brk / mmap NX-audited; regression in `wx-violation` smoke binary.
+3. **Phase 77 Track A — PR #118 residuals** — SSH disconnect hang (HIGH user-visible bug) and `sys_nanosleep` busy-yield (causes flaky regression test). Both bundled into Phase 77.
+4. **Phase 77 Track D.2 — TCP retransmission + connection-count cap** — IPv4 networking will appear to "work" on a perfect LAN and hang on the real internet. The single biggest code-only correctness gap; bundled into Phase 77.
+5. **Phase 77 Track C — `PT_TLS` parsing in ELF loader** — required before any multi-threaded tcc-built or musl-built program is reliable. Phase 40 threading exists but TLS is fragile without it; bundled into Phase 77.
+6. **Spectre / SMEP / SMAP / KPTI** — split: Phase 77 Track B lands SMEP + SMAP (CR4 bit flips, ~200 LOC, pre-1.0). Phase 84 (post-1.0) lands KPTI + retpoline + IBRS.
+7. **Phase 77 Track D.1 — `/etc/resolv.conf` DNS resolver** — no on-target resolver; user must type IPs. Trivial port of musl's stub resolver against a Phase 23 socket; bundled into Phase 77.
+8. **Phase 77 Track E — microcode loading** — ~300 LOC, real correctness impact on the dev laptop's Strix Halo silicon (multiple known errata patched only via microcode updates).
+9. **Phase 77 Track F — `epoll_*` verify-and-implement-if-missing** — `sys_poll` exists; audit could not confirm `epoll_*` syscall handlers. If absent, implement against the existing `WaitQueue` infrastructure.
+10. **Phase 89 — IPv6 / DHCPv6** — explicitly deferred to post-1.0. Phase 83 Release Gate documents the IPv4-only-for-1.0 promise.
 
-(Phase 74's IPC capability grants and bulk transfers merged 2026-05-26 — that closes the Phase 6 timeout/cancellation deferrals and the Phase 50 page-grant gap that were previously on this list.)
+(Phase 74's IPC capability grants and bulk transfers merged 2026-05-26 — that closes the Phase 6 timeout/cancellation deferrals and the Phase 50 page-grant gap that were previously on this list. Phase 75's W^X enforcement merged 2026-05-26 — that closes the Phase 11 / Phase 36 deferred-W^X notes.)
 
 ---
 
@@ -236,7 +256,7 @@ Items the per-phase audit pulled forward as "deferred" but a later phase quietly
 - **Phase 13 lists per-process FD tables as deferred** — shipped in Phase 14.
 - **Phase 21 dependency on Phase 22 termios** — Phase 22 shipped.
 
-Recommended action: a doc-only PR that walks each Phase-56-and-earlier "Deferred Until Later" list and strikes items shipped in later phases, citing the shipping phase. This is bookkeeping but matters for trust in the audit before Phase 77.
+Recommended action: a doc-only PR (Phase 77 Track G.1) that walks each Phase-56-and-earlier "Deferred Until Later" list and strikes items shipped in later phases, citing the shipping phase. This is bookkeeping but matters for trust in the audit before Phase 83.
 
 Phase 56 also has open deferrals that genuinely have NOT shipped (kept in §1/§2):
 
@@ -248,47 +268,59 @@ Phase 56 also has open deferrals that genuinely have NOT shipped (kept in §1/§
 
 ---
 
-## 7. Recommended Phase Sequencing to Reach Phase 77
+## 7. Recommended Phase Sequencing to Reach Phase 83
 
 Strict dependency order; items in the same group can run in parallel.
 
-### Group A — code-only hotfixes (1 sprint)
-
-- **Hotfix A1** — SSH disconnect hang (`userspace/sshd/src/session.rs:1474`)
-- **Hotfix A2** — `sys_nanosleep` busy-yield (`kernel/src/arch/x86_64/syscall/mod.rs:3174-3191`)
-- **Hotfix A3** — Doc-drift PR per §6
-- **Hotfix A4** — Confirm 2026-05-22 multi-term OOM reproducer is fixed (`cargo xtask run-gui --kvm --fresh`)
-
-### Group B — existing roadmap phases (3–4 sprints)
+### Group A — existing roadmap phases that still need to ship before Phase 83
 
 - **Phase 54a** — Post-serverization hygiene (already small)
-- **Phase 59** — Validation backlog (mechanical: run the manual QEMU tests)
+- **Phase 59** — Validation backlog (mechanical: run the manual QEMU tests; also resolves the 2026-05-04 virtio-input handoff and the Phase 10 Secure Boot real-hardware validation)
 - **Phase 65** — fat_server implementation (or drop FAT32 from matrix)
-- **Phase 75** — W^X enforcement
 
-(Phase 74 already shipped 2026-05-26.)
+(Phase 74 shipped 2026-05-26 — IPC capability grants + bulk transfers. Phase 75 shipped 2026-05-26 — W^X enforcement.)
+
+### Group B — Phase 77 (bundle phase, ~1–2 sprints across parallel tracks)
+
+Single phase, multiple parallel tracks. The full track list lives in [`docs/roadmap/77-pre-1-0-cleanup.md`](../../roadmap/77-pre-1-0-cleanup.md):
+
+- **Track A** — PR #118 residuals (SSH hang + nanosleep busy-yield)
+- **Track B** — SMEP + SMAP CR4 enable (cheap security)
+- **Track C** — `PT_TLS` parsing in ELF loader
+- **Track D.1** — DNS resolver stub
+- **Track D.2** — TCP retransmission + multi-connection slot lift
+- **Track E** — Microcode loading
+- **Track F** — `epoll_*` verify-and-implement-if-missing
+- **Track G** — Open-handoff resolution (§6 doc-drift, multi-term OOM verify, virtio-input picker, graphical-stack-startup verify, mouse-reset capture)
+- **Track H** — `/proc` compatibility for `htop` / `ps` / `top` (root-cause `getdents64` / `/proc/<pid>/stat` / `openat`-on-dir-fd mismatch from 2026-05-20 handoff; touches `kernel/src/fs/procfs.rs`)
 
 ### Group C — new hardware-driver phases (the actual 1.0 work)
 
-Proposed naming: insert as 74b…74h between current 74 and 75. Concrete LOC estimates are rough.
+Concrete LOC estimates are rough; refer to each phase doc for full scope.
 
-- **Phase 74b — USB Host Foundation (xHCI + Hub + HID)** — ~5500 LOC. xHCI host controller driver in ring 3 via Phase 55b device-host syscalls, USB core enumeration, HID class for keyboard + mouse. **Single biggest 1.0 unblocker.** Without this, no interactive use on any modern hardware.
-- **Phase 74c — Intel HDA Audio** — ~2000–5000 LOC. HDA controller + at least one codec family (Realtek ALC888/892 covers most boxes). Replaces the AC'97-only `audio_server` backend; the device-selection layer in `userspace/audio_server/src/device.rs` is already designed for a second backend ("phase add a second backend (e.g., HDA after AC'97) by adding a..." per source comment).
-- **Phase 74d — Modern Intel/Realtek NIC** — ~3000–5000 LOC. e1000e (`0x8086:0x10D3`/`0x153A`/`0x153B`/…) and igb/igc; Realtek RTL8169/8125. The Phase 55b ring-3 driver host already takes care of isolation; this is per-device register work.
-- **Phase 74e — Wi-Fi (MediaTek MT7925 reference)** — ~8000–15000 LOC. MT7925 is the reference target because it is in the dev laptop. Wi-Fi drivers are large; consider a stub that supports only one chipset for 1.0 and documents the rest as deferred.
-- **Phase 74f — AHCI/SATA** — ~2000 LOC. Optional if NVMe-only is the 1.0 storage matrix.
-- **Phase 74g — Spectre/SMEP/SMAP/KPTI baseline** — SMEP + SMAP via CR4 bits is ~200 LOC; KPTI is ~1500 LOC; retpoline + IBRS toggling is ~500 LOC. Stage in two waves.
-- **Phase 74h — PT_TLS in ELF loader** — ~200 LOC. Closes the silent multi-thread TLS fragility.
+- **[Phase 78 — USB Host Foundation (xHCI + Hub + HID)](../../roadmap/78-usb-host-foundation.md)** — ~5500 LOC. **Single biggest 1.0 unblocker.** Without this, no interactive use on any modern hardware.
+- **[Phase 79 — Modern Intel/Realtek NIC](../../roadmap/79-modern-nic.md)** — ~3000–5000 LOC. e1000e + igb + igc + RTL8169 + RTL8125. Phase 78 + Phase 79 together are the "boot-on-real-hardware bundle."
+- **[Phase 80 — Intel HDA Audio](../../roadmap/80-intel-hda-audio.md)** — ~2000–5000 LOC. HDA controller + Realtek ALC888/892/1220 codec family.
+- **[Phase 81 — Wi-Fi Reference (MediaTek MT7925)](../../roadmap/81-wifi-reference.md)** — ~8000–15000 LOC. One chipset only for 1.0; explicit deferral of the rest.
+- **[Phase 82 — AHCI/SATA](../../roadmap/82-ahci-sata.md)** — ~2000 LOC. **Optional pre-1.0.** Defer to post-1.0 if anything else slips.
 
 ### Group D — release gate
 
-- **Phase 77** — Release 1.0 Gate. Defines the supported hardware matrix (probably "NVMe + e1000e *or* Realtek + xHCI USB-HID + HDA audio + UEFI GOP framebuffer" as the baseline), the runs-on-real-hardware test plan, and the version/branding cut.
+- **[Phase 83 — Release 1.0 Gate](../../roadmap/83-release-1-0-gate.md)**. Defines the supported hardware matrix (baseline: NVMe + e1000e *or* Realtek + xHCI USB-HID + HDA audio + UEFI GOP framebuffer, with MT7925 Wi-Fi on the laptop target), the runs-on-real-hardware test plan, and the version/branding cut.
+
+### Group E — post-1.0 (explicit deferrals)
+
+- **[Phase 84 — KPTI + retpoline + IBRS](../../roadmap/84-spectre-mitigations.md)** — the expensive Spectre mitigations. Phase 77 covered SMEP + SMAP.
+- **[Phase 85 — Cross-Compiled Toolchains](../../roadmap/85-cross-compiled-toolchains.md)** — git, Python, Clang. tcc covers 1.0.
+- **[Phase 86 — Networking and GitHub](../../roadmap/86-networking-and-github.md)**
+- **[Phase 87 — Node.js](../../roadmap/87-nodejs.md)** — depends on Phase 76 (dynamic linker).
+- **[Phase 88 — Claude Code](../../roadmap/88-claude-code.md)**
+- **[Phase 89 — IPv6 / DHCPv6](../../roadmap/89-ipv6-dhcpv6.md)**
 
 Optional pre-1.0 (defer if the rest slips):
 
-- **Phase 76** — Dynamic linker. Required for Phase 80 Node.js but not for 1.0 itself.
+- **Phase 76** — Dynamic linker. Required for Phase 87 Node.js but not for 1.0 itself.
 - **Phase 67/55b follow-ups** — multiqueue NVMe, MSI-X per-core steering, interrupt remapping.
-- **IPv6/DHCPv6/DNS resolver** — document as IPv4-only-for-1.0 if needed.
 
 ---
 
@@ -302,24 +334,33 @@ To keep 1.0 honest and shippable, the Release Gate should commit in writing to:
 - **No international keymaps beyond US QWERTY.**
 - **No setuid programs / no supplementary groups / no sshd privilege separation.**
 - **No multi-client kernel audio mixing** (userspace mixer in `audio_mixer` is the answer for 1.0).
-- **No IPv6 / DHCPv6.**
+- **No IPv6 / DHCPv6** — Phase 89, post-1.0.
+- **No KPTI / retpoline / IBRS** — Phase 84, post-1.0. SMEP + SMAP land in Phase 77.
 - **No SR-IOV, no hot-plug, no live driver update.**
-- **No clang/llvm/gcc on-target** — tcc only.
+- **No clang/llvm/gcc on-target** — tcc only. Cross-compiled toolchains land in Phase 85.
 - **No dynamic libraries / `.so` on-target** unless Phase 76 lands.
+- **No Wi-Fi chipsets beyond MT7925** — Phase 81 ships exactly one.
+- **No NIC silicon beyond e1000 / e1000e / igb / igc / RTL8169 / RTL8125.**
+- **No HDMI / DisplayPort audio** — Phase 80 ships analog HDA only.
+- **No x2APIC** (255+ core boxes break; rare on consumer hardware).
+- **No MTRR** (relevant only with GPU acceleration, which is also deferred).
+- **No HPET** — TSC + APIC timer are the 1.0 time sources.
+- **No on-target package management or online updates** — disk image rebuild is the supported update path.
 
 All of these are documented in the source-of-truth phase docs already; the Release Gate doc should pull them into one user-facing "what's supported and what isn't" page.
 
 ## Acceptance Criteria
 
-- [ ] This audit doc lists every blocker source-verified against current code, with citations.
-- [ ] The doc-drift PR removes shipped items from Phase 56's deferred list with citations to the shipping phase.
+- [x] This audit doc lists every blocker source-verified against current code, with citations.
+- [x] The proposed Phase 77–84 + 89 phase sequence has stub design docs under `docs/roadmap/` reflecting the audit's recommended scope.
+- [ ] The doc-drift PR (Phase 77 Track G.1) removes shipped items from Phase 56's deferred list with citations to the shipping phase.
 - [ ] A `docs/appendix/audit-status/74a-detail.md` companion captures the per-doc inventory the parallel audit produced (raw data, kept for traceability).
-- [ ] The roadmap README links to this doc.
-- [ ] Phase 77 (Release 1.0 Gate) treats §1 as its blocker list.
+- [x] The roadmap README links to this doc and to the proposed Phase 77–84 + 89 sequence.
+- [ ] Phase 83 (Release 1.0 Gate) treats §1 as its blocker list.
 
 ## Companion Task List
 
-Deferred — once the new-phase numbering for 74b–74h is locked in, each gets its own task doc under `docs/roadmap/tasks/`.
+Each of Phases 77–84 + 89 gets its own task doc under `docs/roadmap/tasks/` when its implementation planning begins. Phase 77 should be authored first as it is the most concrete (and the audit has already named the eight tracks).
 
 ## How Real OS Implementations Differ
 
@@ -338,13 +379,15 @@ m3OS at 1.0 is justified in deferring GPU/Wi-Fi-breadth/multi-seat/Spectre-retpo
 ## Deferred Until Later (post-1.0)
 
 - Phase 76 dynamic linker (unless required for 1.0 polish)
-- Phase 78 cross-compiled toolchains (git, Python, Clang)
-- Phase 79 networking + GitHub
-- Phase 80 Node.js
-- Phase 81 Claude Code
+- Phase 84 Spectre / KPTI / retpoline / IBRS
+- Phase 85 cross-compiled toolchains (git, Python, Clang)
+- Phase 86 networking + GitHub
+- Phase 87 Node.js
+- Phase 88 Claude Code
+- Phase 89 IPv6 / DHCPv6
 - Multi-output / multi-seat compositor
 - Hardware-accelerated composition (KMS/DRM/GL)
-- Wi-Fi breadth beyond the reference chipset
+- Wi-Fi breadth beyond the reference chipset (MT7925)
 - AML interpreter / dynamic ACPI events
 - Suspend / resume / power management
 - Hot-plug / SR-IOV / live driver update

@@ -8,7 +8,7 @@
 
 ## Milestone Goal
 
-m3OS supports dynamic linking via `PT_INTERP` and a ported or purpose-written `ld.so`. A program that declares a `DT_NEEDED` shared library dependency resolves it from `/lib` or `/usr/lib` at runtime; `dlopen`/`dlsym`/`dlclose` work from a C program; a `tcc -shared`-produced `.so` loads and executes correctly. This unblocks Phase 80 (Node.js) native modules and Phase 81 (Claude Code) dependencies.
+m3OS supports dynamic linking via `PT_INTERP` and a ported or purpose-written `ld.so`. A program that declares a `DT_NEEDED` shared library dependency resolves it from `/lib` or `/usr/lib` at runtime; `dlopen`/`dlsym`/`dlclose` work from a C program; a `tcc -shared`-produced `.so` loads and executes correctly. This unblocks Phase 87 (Node.js) native modules and Phase 88 (Claude Code) dependencies.
 
 ## Why This Phase Exists
 

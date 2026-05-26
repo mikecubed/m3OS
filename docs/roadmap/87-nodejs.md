@@ -1,8 +1,8 @@
-# Phase 80 - Node.js
+# Phase 87 - Node.js
 
 **Status:** Planned
-**Source Ref:** phase-80
-**Depends on:** Phase 37 (I/O Multiplexing) ✅, Phase 40 (Threading) ✅, Phase 42 (Crypto Primitives) ✅, Phase 78 (Cross-Compiled Toolchains) ✅, Phase 79 (Networking and GitHub) ✅
+**Source Ref:** phase-87
+**Depends on:** Phase 37 (I/O Multiplexing) ✅, Phase 40 (Threading) ✅, Phase 42 (Crypto Primitives) ✅, Phase 76 (Dynamic Linker), Phase 85 (Cross-Compiled Toolchains), Phase 86 (Networking and GitHub)
 **Builds on:** Extends the post-1.0 developer platform into a heavier managed runtime with JIT, async I/O, and package-management expectations that stress more of the system than the earlier toolchain phases
 **Primary Components:** Node.js runtime build pipeline, libuv integration expectations, V8 memory behavior, npm packaging path, docs/nodejs-roadmap.md
 
@@ -74,7 +74,7 @@ The runtime only becomes strategically useful once the package path needed for l
 
 ## How This Builds on Earlier Phases
 
-- Builds on Phase 78's toolchain packaging and Phase 79's outbound network/trust path.
+- Builds on Phase 85's toolchain packaging, Phase 86's outbound network/trust path, and Phase 76's dynamic linker for native add-on `.so` loading.
 - Stresses the earlier memory, I/O, threading, and crypto work in a more demanding runtime.
 - Prepares the final CLI-agent milestone by making npm and a supported Node environment available inside m3OS.
 
@@ -88,7 +88,7 @@ The runtime only becomes strategically useful once the package path needed for l
 
 ## Learning Documentation Requirement
 
-- Create `docs/80-nodejs.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
+- Create `docs/87-nodejs.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
 - Explain the chosen Node configuration, runtime expectations, event-loop integration, npm path, and explicit non-goals.
 - Link the learning doc from `docs/README.md` when this phase lands.
 
@@ -97,7 +97,7 @@ The runtime only becomes strategically useful once the package path needed for l
 - Update `docs/nodejs-roadmap.md`, `docs/README.md`, and `docs/roadmap/README.md`.
 - Update any runtime, memory, or package-layout docs that the chosen Node configuration depends on.
 - Update post-1.0 evaluation framing if Node support changes the platform story materially.
-- When the phase lands, bump `kernel/Cargo.toml` and any release/version references to `0.61.0`.
+- When the phase lands, bump `kernel/Cargo.toml` and any release/version references to the next post-1.0 minor version.
 
 ## Acceptance Criteria
 
@@ -109,7 +109,7 @@ The runtime only becomes strategically useful once the package path needed for l
 
 ## Companion Task List
 
-- Phase 80 task list — defer until implementation planning begins.
+- Phase 87 task list — defer until implementation planning begins.
 
 ## How Real OS Implementations Differ
 

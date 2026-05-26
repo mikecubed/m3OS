@@ -98,13 +98,13 @@
 
 **File:** `docs/appendix/architecture-and-syscalls.md`
 **Symbol:** N/A
-**Why it matters:** Phase 80 Node.js and Phase 81 Claude Code will require JIT code generation; developers need the correct pattern before they hit `EINVAL` from `mprotect`.
+**Why it matters:** Phase 87 Node.js and Phase 88 Claude Code will require JIT code generation; developers need the correct pattern before they hit `EINVAL` from `mprotect`.
 
 **Acceptance:**
 - [x] A new subsection "JIT Code Generation Pattern" is added to the architecture reference
 - [x] The pattern is documented as: (1) `mmap(NULL, size, PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)`, (2) write machine code, (3) `mprotect(ptr, size, PROT_READ | PROT_EXEC)`
 - [x] The doc explicitly states that `PROT_WRITE | PROT_EXEC` is rejected by `sys_mprotect` and is not an available alternative
-- [x] A note references Phase 80 (Node.js) as the first consumer
+- [x] A note references Phase 87 (Node.js) as the first consumer
 
 ---
 
@@ -187,7 +187,7 @@
 
 **File:** `docs/75-wx-enforcement.md`
 **Symbol:** N/A
-**Why it matters:** A learner-friendly doc scoped to Phase 75 consolidates the W^X enforcement story — ELF loader, `mprotect` guard, heap/stack NX, and the JIT exception pattern — in one place, so readers do not need to cross-reference Phase 11, Phase 36, and Phase 80 documentation.
+**Why it matters:** A learner-friendly doc scoped to Phase 75 consolidates the W^X enforcement story — ELF loader, `mprotect` guard, heap/stack NX, and the JIT exception pattern — in one place, so readers do not need to cross-reference Phase 11, Phase 36, and Phase 87 documentation.
 
 **Acceptance:**
 - [x] File exists at `docs/75-wx-enforcement.md`
