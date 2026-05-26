@@ -13,7 +13,7 @@
 | B | `ld.so` bring-up: load, relocate, construct | A | Planned |
 | C | `dlopen`/`dlsym`/`dlclose` runtime API | B | Planned |
 | D | Symbol versioning (basic `DT_GNU_HASH`) | B | Planned |
-| E | `xtask` `.so` build pipeline and disk placement | Phase 31 ✅ | Planned |
+| E | `xtask` `ld.so` and `.so` build pipeline and disk placement | Phase 31 ✅ | Planned |
 | F | Test applications (`dynlink_hello`, `dlopen_test`) | B, C, E | Planned |
 | G | Phase 11 and Phase 12 design doc updates | F | Planned |
 | H | Documentation and Release | A–G | Planned |
@@ -43,8 +43,9 @@
 **Acceptance:**
 - [ ] `build_auxv` constructs an `AT_NULL`-terminated auxiliary vector on the user stack after the environment strings
 - [ ] Entries present: `AT_PHDR`, `AT_PHNUM`, `AT_ENTRY` (main binary entry), `AT_BASE` (interpreter load bias), `AT_PAGESZ` (4096), `AT_RANDOM` (16 bytes from the kernel's CSPRNG), `AT_NULL`
-- [ ] The initial `rsp` points to the conventional `argc / argv / envp / auxv` layout expected by musl `ldso`
-- [ ] A static-binary boot (no `PT_INTERP`) produces an empty auxiliary vector (or minimal `AT_NULL`-only vector) and is unaffected
+- [ ] The initial `rsp` points to the conventional SysV-ABI layout that musl `_dlstart` expects, in this exact order from low addresses upward: `argc: u64` → `argv[0..argc]: *const u8` → `argv_terminator: *const u8 = NULL` → `envp[0..]: *const u8` → `envp_terminator: *const u8 = NULL` → `auxv[0..]: AuxEnt { a_type: u64, a_val: u64 }` → `AT_NULL` sentinel `{ 0, 0 }` → string region holding the argv / envp / AT_RANDOM byte strings (string region must sit above the auxv so the pointers remain valid)
+- [ ] Initial `rsp` is 16-byte aligned at the point control transfers to the interpreter (SysV-ABI requirement; misalignment crashes any later `xmm` save/restore the linker performs)
+- [ ] A static-binary boot (no `PT_INTERP`) produces a minimal `AT_NULL`-only auxiliary vector and is unaffected
 
 ---
 
@@ -165,7 +166,7 @@
 
 ---
 
-## Track E — `xtask` `.so` Build Pipeline
+## Track E — `xtask` `ld.so` and `.so` Build Pipeline
 
 ### E.1 — `build_shared_lib` helper in xtask
 
@@ -189,6 +190,25 @@
 - [ ] `ld.so` binary is copied to `/lib/ld-musl-x86_64.so.1` on the ext2 data disk
 - [ ] The directory `/lib` is created by `populate_ext2_files` if absent
 - [ ] `cargo xtask clean && cargo xtask run` produces a disk that contains `/lib/ld-musl-x86_64.so.1`
+
+### E.3 — Build `ld.so` as a position-independent ELF
+
+**Files:**
+- `userspace/ld-musl-x86_64.so.1/Cargo.toml`
+- `userspace/ld-musl-x86_64.so.1/build.rs` (if linker-script wiring is needed)
+- `userspace/ld-musl-x86_64.so.1/x86_64-m3os-ldso.json` (custom target spec)
+- `xtask/src/main.rs`
+
+**Symbol:** `build_ldso`
+**Why it matters:** The dynamic linker is the one userspace binary that must be a `-pie` (position-independent executable) `no_std` ELF with its own `_start` (`_dlstart`); none of the existing userspace binaries are built this way, so the build pipeline must grow a new code path. Without an explicit build task, the linker never gets compiled and E.2 has nothing to stage.
+
+**Acceptance:**
+- [ ] `userspace/ld-musl-x86_64.so.1/` exists as a workspace crate with `crate-type = ["bin"]` (or `["staticlib"]` linked via a custom linker script — implementer's choice; document the chosen route in the crate's `lib.rs` / `main.rs` top-of-file comment)
+- [ ] Crate is `no_std`, uses `BrkAllocator` from `syscall-lib`, and is built with `-fPIC` / `-Crelocation-model=pic` so the linker can self-relocate; output is a `-pie` ELF whose `e_type == ET_DYN`
+- [ ] `xtask::build_ldso` invokes the Rust toolchain (via the existing `build_userspace` plumbing) with the linker's target spec and stages the resulting ELF to `target/generated-libs/ld-musl-x86_64.so.1`
+- [ ] The crate is added to `Cargo.toml` `members` and to the `bins` array in `xtask/src/main.rs` (`build_userspace`); `needs_alloc = true`
+- [ ] `readelf -h target/generated-libs/ld-musl-x86_64.so.1` reports `Type: DYN (Shared object file)` (i.e., `ET_DYN`, not `ET_EXEC`)
+- [ ] `cargo xtask check` and `cargo xtask run` both succeed with the new crate in the workspace
 
 ---
 
@@ -250,8 +270,6 @@
 
 ---
 
----
-
 ## Track H — Documentation and Release
 
 ### H.1 — Create the aligned legacy learning doc
@@ -292,6 +310,7 @@
 
 - Track A's auxiliary vector layout must exactly match what musl `_dlstart` expects at process start; the musl source's `arch/x86_64/crt_arch.h` and `ldso/dynlink.c:_dlstart` are the authoritative references.
 - Track B.1's self-relocation must complete before any call to a Rust `#[no_mangle]` function in the linker itself; this is the hardest bootstrap correctness constraint.
+- Track C's `dlerror()` storage: TLS is explicitly deferred in this phase (see design doc Deferred Until Later). Until per-thread TLS lands, `dlerror()` stores its message in a single process-global `static mut` (or `spin::Mutex<Option<&'static str>>`) string slot — m3OS userspace is effectively single-threaded per process at phase entry, so a process-global slot is correct. Track 76+ TLS work will replace this with `__thread`-qualified storage.
 - Track B.4's PLT trampoline is x86_64 assembly; it must preserve all caller-saved registers (`rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r8`, `r9`, `r10`, `r11`, `xmm0–xmm7`) before calling the Rust symbol-resolution code.
 - Track E.2 must run `cargo xtask clean` in the PR CI step to ensure the disk is recreated with `/lib/ld-musl-x86_64.so.1`; otherwise the disk from a previous build is reused and the test binary cannot find the interpreter.
 - Track F's two test binaries are the acceptance gate; they replace any manual QEMU session as the reproducible proof of dynamic linking correctness.
