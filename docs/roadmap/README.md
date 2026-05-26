@@ -207,32 +207,40 @@ flowchart TD
     P76["Phase 76<br/>Dynamic Linker"]
     P75 --> P76
 
-    %% Release gate (renumbered)
-    P59 --> P77["Phase 77<br/>Release 1.0 Gate"]
-    P60 --> P77
-    P61 --> P77
-    P62 --> P77
-    P63 --> P77
-    P64 --> P77
-    P65 --> P77
-    P66 --> P77
-    P67 --> P77
-    P68 --> P77
-    P69 --> P77
-    P70 --> P77
-    P71 --> P77
-    P72 --> P77
-    P73 --> P77
+    %% Pre-1.0 hardware + correctness (per the pre-1.0 audit)
+    P77["Phase 77<br/>Pre-1.0 Correctness<br/>+ Cheap Security<br/>+ Network Polish"]
+    P78["Phase 78<br/>USB Host Foundation"]
+    P79["Phase 79<br/>Modern NIC"]
+    P80["Phase 80<br/>Intel HDA Audio"]
+    P81["Phase 81<br/>Wi-Fi Reference"]
+    P82["Phase 82<br/>AHCI/SATA"]
+    P74 --> P77
     P75 --> P77
-    P74 -.->|optional pre-1.0| P77
-    P76 -.->|optional pre-1.0| P77
+    P77 --> P78
+    P77 --> P79
+    P77 --> P80
+    P77 --> P81
+    P77 --> P82
 
-    %% Post-1.0 platform growth (renumbered from 59-62)
-    P77 --> P78["Phase 78<br/>Cross-Compiled Toolchains"]
-    P78 --> P79["Phase 79<br/>Networking and GitHub"]
-    P79 --> P80["Phase 80<br/>Node.js"]
-    P76 -.-> P80
-    P80 --> P81["Phase 81<br/>Claude Code"]
+    %% Release gate
+    P59 --> P83["Phase 83<br/>Release 1.0 Gate"]
+    P65 --> P83
+    P77 --> P83
+    P78 --> P83
+    P79 --> P83
+    P80 --> P83
+    P81 -.->|laptop-target only| P83
+    P82 -.->|optional pre-1.0| P83
+    P76 -.->|optional pre-1.0| P83
+
+    %% Post-1.0 platform growth
+    P83 --> P84["Phase 84<br/>Spectre/KPTI<br/>Mitigations"]
+    P83 --> P85["Phase 85<br/>Cross-Compiled Toolchains"]
+    P85 --> P86["Phase 86<br/>Networking and GitHub"]
+    P86 --> P87["Phase 87<br/>Node.js"]
+    P76 -.-> P87
+    P87 --> P88["Phase 88<br/>Claude Code"]
+    P83 --> P89["Phase 89<br/>IPv6 / DHCPv6"]
 ```
 
 ## Milestone Summary
@@ -392,22 +400,37 @@ These phases were drafted 2026-05-08 in response to the phase-completion audit (
 | 73 | Compositor: Polish (bar / launcher / notifications / animations) | Native status bar, fuzzy-find launcher, notification daemon, animation engine (slide/fade), rounded corners + drop shadows. omarchy-aesthetic desktop | **Complete** | `phase-73` | [Phase 73](./73-compositor-polish.md) | [Tasks](./tasks/73-compositor-polish-tasks.md) |
 | 74 | IPC Capability Grants and Bulk Transfers | `sys_cap_grant` via IPC, page-grant bulk-data transport (closes Phase 56 D-B4), IPC timeouts, many-to-one notification binding. Closes audit § E2 + Phase 6+/Phase 7+ deferrals | **Complete** | `phase-74` | [Phase 74](./74-ipc-capability-grants.md) | [Tasks](./tasks/74-ipc-capability-grants-tasks.md) |
 | 75 | W^X Enforcement | Userspace code pages mapped R-X (no `WRITABLE`); `mprotect` rejects `PROT_WRITE \| PROT_EXEC`; ELF loader splits text/data segments. Closes audit § E1 | **Complete** | `phase-75` | [Phase 75](./75-wx-enforcement.md) | [Tasks](./tasks/75-wx-enforcement-tasks.md) |
-| 76 | Dynamic Linker / Shared Libraries | `PT_INTERP` honored; `ld.so` (musl-based); `dlopen`/`dlsym`/`dlclose`; build system supports `.so` outputs. Required for toolkit GUI apps and Phase 80 Node.js. Closes audit § F6 | Planned | `phase-76` | [Phase 76](./76-dynamic-linker.md) | [Tasks](./tasks/76-dynamic-linker-tasks.md) |
+| 76 | Dynamic Linker / Shared Libraries | `PT_INTERP` honored; `ld.so` (musl-based); `dlopen`/`dlsym`/`dlclose`; build system supports `.so` outputs. Required for toolkit GUI apps and Phase 87 Node.js. Closes audit § F6 | Planned | `phase-76` | [Phase 76](./76-dynamic-linker.md) | [Tasks](./tasks/76-dynamic-linker-tasks.md) |
 
-### Release Gate (renumbered from Phase 58)
+> **Pre-1.0 audit reference:** the source-verified blocker inventory and sequencing rationale for phases 77–89 lives in [`docs/appendix/audit-status/74a-pre-1.0-audit.md`](../appendix/audit-status/74a-pre-1.0-audit.md). It is an audit artifact, not a phase — it informs Phase 83 (Release 1.0 Gate) without being on the delivery critical path itself.
 
-| Phase | Theme | Primary Outcome | Status | Source Ref | Milestone | Tasks |
-|---|---|---|---|---|---|---|
-| 77 | Release 1.0 Gate | The project defines and validates an honest 1.0 support matrix | Planned | `phase-77` | [Phase 77](./77-release-1-0-gate.md) | Deferred until implementation planning |
-
-### Post-1.0 Platform Growth (renumbered from 59-62)
+### Pre-1.0 Hardware and Correctness Phases (per the pre-1.0 audit)
 
 | Phase | Theme | Primary Outcome | Status | Source Ref | Milestone | Tasks |
 |---|---|---|---|---|---|---|
-| 78 | Cross-Compiled Toolchains | git, Python, and Clang are bundled as a supported post-1.0 developer-toolchain set | Planned | `phase-78` | [Phase 78](./78-cross-compiled-toolchains.md) | Deferred until implementation planning |
-| 79 | Networking and GitHub | Outbound developer workflows add DNS, HTTPS, git remotes, and GitHub CLI support | Planned | `phase-79` | [Phase 79](./79-networking-and-github.md) | Deferred until implementation planning |
-| 80 | Node.js | A supported Node.js and npm environment runs natively inside m3OS | Planned | `phase-80` | [Phase 80](./80-nodejs.md) | Deferred until implementation planning |
-| 81 | Claude Code | A modern CLI coding agent runs on the post-1.0 m3OS developer platform | Planned | `phase-81` | [Phase 81](./81-claude-code.md) | Deferred until implementation planning |
+| 77 | Pre-1.0 Correctness, Cheap Security, and Network Polish | Bundle phase: SSH disconnect hang, `sys_nanosleep` busy-yield, SMEP+SMAP, `PT_TLS` parsing, DNS resolver stub, TCP retransmit + multi-slot, microcode loading, `epoll_*` verify-or-implement, doc-drift PR | Planned | `phase-77` | [Phase 77](./77-pre-1-0-cleanup.md) | Deferred until implementation planning |
+| 78 | USB Host Foundation (xHCI + Hub + HID) | Ring-3 xHCI driver + USB core + HID class; modern laptops/desktops without PS/2 get keyboard and mouse input. Single biggest 1.0 unblocker. | Planned | `phase-78` | [Phase 78](./78-usb-host-foundation.md) | Deferred until implementation planning |
+| 79 | Modern Intel/Realtek NIC | e1000e / igb / igc + RTL8169 / RTL8125 ring-3 drivers; modern desktops get wired ethernet beyond the QEMU-only 82540EM. | Planned | `phase-79` | [Phase 79](./79-modern-nic.md) | Deferred until implementation planning |
+| 80 | Intel HDA Audio (+ Realtek codec family) | Ring-3 HDA controller + Realtek ALC888/892/1220 codec drivers; replaces AC'97-only `audio_server` backend. | Planned | `phase-80` | [Phase 80](./80-intel-hda-audio.md) | Deferred until implementation planning |
+| 81 | Wi-Fi Reference Driver (MediaTek MT7925) | Single-chipset Wi-Fi driver targeting the dev laptop; WPA2-PSK only. Honest "Wi-Fi works on one chipset" 1.0 promise. | Planned | `phase-81` | [Phase 81](./81-wifi-reference.md) | Deferred until implementation planning |
+| 82 | AHCI / SATA Storage | Optional pre-1.0 SATA driver for systems without NVMe. Defer to post-1.0 if the rest of 77–81 slips. | Planned (optional) | `phase-82` | [Phase 82](./82-ahci-sata.md) | Deferred until implementation planning |
+
+### Release Gate
+
+| Phase | Theme | Primary Outcome | Status | Source Ref | Milestone | Tasks |
+|---|---|---|---|---|---|---|
+| 83 | Release 1.0 Gate | The project defines and validates an honest 1.0 support matrix | Planned | `phase-83` | [Phase 83](./83-release-1-0-gate.md) | Deferred until implementation planning |
+
+### Post-1.0 Platform Growth
+
+| Phase | Theme | Primary Outcome | Status | Source Ref | Milestone | Tasks |
+|---|---|---|---|---|---|---|
+| 84 | Spectre / KPTI / Retpoline / IBRS Mitigations | Post-1.0 expensive security mitigations layered on top of the Phase 77 SMEP+SMAP baseline | Planned | `phase-84` | [Phase 84](./84-spectre-mitigations.md) | Deferred until implementation planning |
+| 85 | Cross-Compiled Toolchains | git, Python, and Clang are bundled as a supported post-1.0 developer-toolchain set | Planned | `phase-85` | [Phase 85](./85-cross-compiled-toolchains.md) | Deferred until implementation planning |
+| 86 | Networking and GitHub | Outbound developer workflows add DNS, HTTPS, git remotes, and GitHub CLI support | Planned | `phase-86` | [Phase 86](./86-networking-and-github.md) | Deferred until implementation planning |
+| 87 | Node.js | A supported Node.js and npm environment runs natively inside m3OS | Planned | `phase-87` | [Phase 87](./87-nodejs.md) | Deferred until implementation planning |
+| 88 | Claude Code | A modern CLI coding agent runs on the post-1.0 m3OS developer platform | Planned | `phase-88` | [Phase 88](./88-claude-code.md) | Deferred until implementation planning |
+| 89 | IPv6 / DHCPv6 | Dual-stack IPv6 layered on top of the IPv4-only 1.0 network promise | Planned | `phase-89` | [Phase 89](./89-ipv6-dhcpv6.md) | Deferred until implementation planning |
 
 ## Suggested Delivery Rhythm
 

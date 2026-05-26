@@ -10,7 +10,7 @@
 
 Phase 69d closes the loop: `less /etc/passwd` pages cleanly inside `term`, `htop` renders a full-colour process list and reflows on resize, `tmux new-session && split-window && resize-pane && detach` produces a visible split that reflows correctly. These three apps cover the pager / process-monitor / multiplexer archetypes; passing them is the load-bearing signal that the 69-series terminal stack is ready for arbitrary C TUI apps.
 
-Neovim is **not** in 69d — it has its own dependency chain (libuv + Lua/LuaJIT or a supported alternative + tree-sitter) and gets a dedicated phase after 69d. `btop` is **not** in 69d — it is C++ and depends on the cross-compiled toolchain landing in Phase 78. `lazygit`, `fzf`, `starship` are Go binaries deferred to a Go-toolchain phase. 69d is the C-with-ncurses gateway; everything else inherits from it.
+Neovim is **not** in 69d — it has its own dependency chain (libuv + Lua/LuaJIT or a supported alternative + tree-sitter) and gets a dedicated phase after 69d. `btop` is **not** in 69d — it is C++ and depends on the cross-compiled toolchain landing in Phase 85. `lazygit`, `fzf`, `starship` are Go binaries deferred to a Go-toolchain phase. 69d is the C-with-ncurses gateway; everything else inherits from it.
 
 ## Why This Phase Exists
 
@@ -116,7 +116,7 @@ New subcommand boots, executes a scripted keystroke sequence through `term`, ass
 ## Deferred Until Later
 
 - **Neovim** — own phase (libuv + Lua/LuaJIT + tree-sitter).
-- **btop** — own phase after Phase 78 cross-compiled toolchains (C++).
+- **btop** — own phase after Phase 85 cross-compiled toolchains (C++).
 - **lazygit, fzf, starship** — own phase after a Go toolchain port.
 - **mc** (Midnight Commander) — own phase or stretch goal; depends on the slang library or ncurses (mc upstream supports both).
 - **ranger / lf** — Python or Go dependencies push these to their own phase.

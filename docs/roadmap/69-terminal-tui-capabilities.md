@@ -174,7 +174,7 @@ Source: `xtask/terminfo/m3os-term.ti`. Compiled by host-side `tic` during `xtask
 - **TTF/OTF font loader + glyph atlas + Nerd Font asset embedding** → Phase 69c.
 - **`ncurses` port + first quality TUI app validators (`less`, `htop`, `tmux`)** → Phase 69d.
 - **Neovim port** (libuv + Lua/LuaJIT-equivalent + tree-sitter) → dedicated phase after 69d.
-- **`btop` port** (C++ toolchain dependency) → after Phase 78 cross-compiled toolchains.
+- **`btop` port** (C++ toolchain dependency) → after Phase 85 cross-compiled toolchains.
 - **Kitty keyboard protocol and Kitty graphics protocol**.
 - **Sixel graphics rendering inside `term`**.
 - **Terminal scrollback selection and clipboard integration**.

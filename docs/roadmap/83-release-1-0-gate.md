@@ -1,8 +1,8 @@
-# Phase 77 - Release 1.0 Gate
+# Phase 83 - Release 1.0 Gate
 
 **Status:** Planned
-**Source Ref:** phase-77
-**Depends on:** Phase 53 (Headless Hardening) ✅, Phase 55c (Ring-3 Driver Correctness Closure)
+**Source Ref:** phase-83
+**Depends on:** Phase 53 (Headless Hardening) ✅, Phase 55c (Ring-3 Driver Correctness Closure), Phase 65 (fat_server Implementation), Phase 75 (W^X Enforcement) ✅, Phase 77 (Pre-1.0 Correctness, Cheap Security, and Network Polish), Phase 78 (USB Host Foundation), Phase 79 (Modern Intel/Realtek NIC), Phase 80 (Intel HDA Audio)
 **Builds on:** Converts the convergence, hardening, and hardware work into an explicit release promise, while giving the project a disciplined place to decide whether the local-system branch is in scope for 1.0 or deferred to 1.x
 **Primary Components:** docs/roadmap/README.md, README.md, docs/README.md, xtask validation flows, release and support-matrix documentation
 
@@ -92,7 +92,7 @@ This phase succeeds only if top-level docs, subsystem docs, roadmap docs, and ve
 - Builds on Phase 55's hardware promise and Phase 55c's ring-3 driver correctness closure as additional supported-target evidence beyond the Phase 53 QEMU reference.
 - Optionally includes the local-system milestones from Phase 47 and Phases 56-57 if the project chooses the broader release target.
 - Creates the stable boundary after which later ecosystem work can clearly be called 1.x growth instead of hidden release debt.
-- Inherits the Phase 53/53a closure rule: Phase 53 gates must have already passed on the post-53a allocator baseline before Phase 77 can close.
+- Inherits the Phase 53/53a closure rule: Phase 53 gates must have already passed on the post-53a allocator baseline before Phase 83 can close.
 
 ## Implementation Outline
 
@@ -105,7 +105,7 @@ This phase succeeds only if top-level docs, subsystem docs, roadmap docs, and ve
 
 ## Learning Documentation Requirement
 
-- Create `docs/77-release-1-0-gate.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
+- Create `docs/83-release-1-0-gate.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
 - Explain the support matrix, validation gate bundle, headless-vs-local-system decision, and how the phase keeps scope honest.
 - Link the learning doc from `docs/README.md` when this phase lands.
 
@@ -114,7 +114,7 @@ This phase succeeds only if top-level docs, subsystem docs, roadmap docs, and ve
 - Update `README.md`, `docs/README.md`, `docs/roadmap/README.md`, release notes, and any support-matrix documentation.
 - Update `docs/evaluation/roadmap/README.md`, `docs/evaluation/roadmap/R10-release-1-0-and-beyond.md`, and any evaluation docs that describe release readiness.
 - Update validation docs such as `docs/43c-regression-stress-ci.md` if the release gate changes how those results are interpreted.
-- When the phase lands, bump `kernel/Cargo.toml` and any release/version references to `0.58.0`.
+- When the phase lands, bump `kernel/Cargo.toml` and any release/version references to `1.0.0` (or the agreed 1.0 version string the gate codifies).
 
 ## Acceptance Criteria
 
@@ -127,7 +127,7 @@ This phase succeeds only if top-level docs, subsystem docs, roadmap docs, and ve
 
 ## Companion Task List
 
-- Phase 77 task list — defer until implementation planning begins.
+- Phase 83 task list — defer until implementation planning begins.
 
 ## How Real OS Implementations Differ
 

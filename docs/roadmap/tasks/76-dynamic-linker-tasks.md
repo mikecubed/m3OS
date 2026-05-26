@@ -115,7 +115,7 @@
 
 **File:** `userspace/ld-musl-x86_64.so.1/src/dl.rs`
 **Symbol:** `dlopen`
-**Why it matters:** `dlopen` is the primary runtime plugin-loading mechanism; it is required for Node.js native modules (Phase 80) and for any application that loads backend implementations at runtime.
+**Why it matters:** `dlopen` is the primary runtime plugin-loading mechanism; it is required for Node.js native modules (Phase 87) and for any application that loads backend implementations at runtime.
 
 **Acceptance:**
 - [ ] `dlopen(path, RTLD_LAZY)` loads and relocates the named shared object if not already loaded; returns a non-null opaque handle on success
