@@ -1,105 +1,140 @@
-# Phase 76 - Dynamic Linker / Shared Libraries
+# Phase 76 - Dynamic Linker / Shared Libraries (Scaffolding + Handoff)
 
-**Status:** Planned
+**Status:** In Progress
 **Source Ref:** phase-76
 **Depends on:** Phase 11 (Process Model) ✅, Phase 12 (POSIX Compatibility) ✅, Phase 75 (W^X Enforcement) ✅, Phase 31 (TCC Compiler Bootstrap) ✅
-**Builds on:** Extends the Phase 11 ELF loader to honor `PT_INTERP`, bringing up musl's `ld.so` as the runtime linker and enabling shared library (`DT_NEEDED`) resolution for the first time
-**Primary Components:** `kernel/src/elf/`, `userspace/ld-musl-x86_64.so.1/`, `xtask/src/main.rs`, `userspace/syscall-lib`, `userspace/tests/dynlink_hello/`, `userspace/tests/dlopen_test/`
+**Builds on:** Extends the Phase 11 ELF loader to honor `PT_INTERP`, scaffolds the `ld.so` userspace crate, and proves the kernel→ld.so→main binary handoff end to end. The full dynamic-linker semantics (`DT_NEEDED` resolution, relocations, `dlopen`, GNU hash, PLT lazy resolve) land in subsequent phases.
+**Primary Components:** `kernel/src/mm/elf.rs`, `userspace/ld-musl-x86_64.so.1/`, `xtask/src/main.rs`, `userspace/tests/dynlink_smoke/`
+
+## Subphase Split (added during implementation)
+
+Phase 76 turned out to be too large to land in a single PR after design review. It has been split into four subphases so each PR is reviewable and each lands with a green smoke gate:
+
+| Subphase | Scope | Status |
+|---|---|---|
+| **76** | Kernel `PT_INTERP` + auxv, `ld.so` crate scaffold (no_std PIE), xtask `build_ldso` + stage to `/lib/`, minimal `_dlstart` that just transfers control to the main binary's entry, `dynlink_smoke` test that proves the kernel → ld.so → main handoff | **In Progress** |
+| **76b** | Real `ld.so` bring-up: `DT_NEEDED` dependency graph, x86_64 relocations (`GLOB_DAT`/`JUMP_SLOT`/`RELATIVE`/`64`), `DT_INIT`/`DT_INIT_ARRAY` constructors, `libhello.so` + `dynlink_hello` end-to-end | Planned |
+| **76c** | `dlopen` / `dlsym` / `dlclose` + `dlopen_test` binary | Planned |
+| **76d** | PLT lazy resolution (`_dl_runtime_resolve`), `DT_GNU_HASH`, basic symbol versioning | Planned |
+
+This file documents only the **76 scaffolding** scope. See `76b-dynamic-linker-bringup.md`, `76c-dlopen.md`, `76d-dynamic-linker-polish.md` for the follow-on phases.
 
 ## Milestone Goal
 
-m3OS supports dynamic linking via `PT_INTERP` and a ported or purpose-written `ld.so`. A program that declares a `DT_NEEDED` shared library dependency resolves it from `/lib` or `/usr/lib` at runtime; `dlopen`/`dlsym`/`dlclose` work from a C program; a `tcc -shared`-produced `.so` loads and executes correctly. This unblocks Phase 87 (Node.js) native modules and Phase 88 (Claude Code) dependencies.
+A dynamically linked binary (`dynlink_smoke`) carries `PT_INTERP = /lib/ld-musl-x86_64.so.1`. The kernel detects `PT_INTERP`, loads the interpreter at a non-overlapping load bias, builds the full SysV-ABI auxiliary vector on the user stack (`AT_PHDR`, `AT_PHNUM`, `AT_PHENT`, `AT_ENTRY`, `AT_BASE`, `AT_PAGESZ`, `AT_RANDOM`, `AT_NULL`), and transfers control to the interpreter's entry. The interpreter's `_dlstart` self-relocates, locates the main binary's entry via `AT_ENTRY`, and jumps to it. The main binary prints a sentinel to serial and exits cleanly. All existing statically linked binaries continue to function.
 
 ## Why This Phase Exists
 
-Every m3OS binary today is statically linked: the runtime, libc, and all dependencies are baked into the binary at link time. This works for small, purpose-built OS binaries, but it makes porting toolkit-class software (GTK, Qt, browsers, scripting runtimes) impractical — those projects expect to link against shared libraries and use `dlopen` for plugin loading.
+Dynamic linking is the single largest userspace change in the m3OS roadmap. Cramming it into one PR sacrifices reviewability and forces the smoke gate to wait until the entire stack is bottom-up correct. Splitting along the `PT_INTERP` boundary lets us:
 
-The audit (§ F6) identified dynamic linking as a Stage-3 gap. Phase 75 W^X enforcement is a prerequisite because a dynamic linker's relocation pass must map GOT/PLT as `RW-` and text as `R-X`; the W^X machinery must be correct before the linker exercises it. The `wayland-gap-analysis.md` document lists dynamic linking as the first prerequisite for every Wayland path.
+1. land the kernel ELF-loader change with a guaranteed green smoke test (the interpreter binary is just a self-relocating stub),
+2. prove the SysV-ABI auxiliary vector matches what musl `_dlstart` expects before any real relocation logic depends on it,
+3. give subsequent subphases (76b–76d) a stable, regression-tested foundation to grow against.
 
-SOLID/SRP: the dynamic linker lives entirely in userspace (`ld.so`) and the kernel contributes only `PT_INTERP` loading and auxiliary vector construction — a clean boundary with a single concern on each side. Dependency inversion: `ld.so` resolves `DT_NEEDED` against `LD_LIBRARY_PATH` before the standard search paths, meaning the runtime composition strategy is injected at launch rather than baked into the binary at compile time. TDD: auxiliary vector parsing is pure logic that host-tests cleanly in `kernel-core`; for `dlopen`/`dlsym`/`dlclose`, write failing host tests against a fixture `.so` first, then implement until they pass — musl's own test suite transfers directly if the port route is taken.
+SOLID/SRP: this phase delivers exactly two responsibilities — kernel `PT_INTERP` handoff and a userspace crate that proves the handoff works. The `dlopen`/relocation/PLT concerns belong to later subphases and are kept out of this PR's diff.
 
 ## Learning Goals
 
-- Understand how a dynamic linker resolves `DT_NEEDED` entries from `PT_DYNAMIC` and loads shared objects
-- Learn how the GOT (Global Offset Table) and PLT (Procedure Linkage Table) enable lazy symbol resolution
-- See how `PT_INTERP` changes the kernel's ELF loading behavior: the kernel loads the interpreter, not the binary directly
-- Understand how `dlopen`/`dlsym`/`dlclose` are implemented on top of the dynamic linker's symbol table
-- Learn the build-system implications: separate compilation units, position-independent code (`-fPIC`), `.so` output format
+- Understand how `PT_INTERP` changes the kernel's ELF loading path: the kernel still parses the main binary's program headers (to populate `AT_PHDR` / `AT_PHNUM` / `AT_ENTRY`), but transfers control to the interpreter instead of the main binary's `e_entry`.
+- See the exact SysV AMD64 ABI initial-stack layout (argc → argv → NULL → envp → NULL → auxv → AT_NULL → string region) and the 16-byte `rsp` alignment requirement at the moment control reaches the interpreter's `_dlstart`.
+- Learn how a no_std PIE binary is built (custom target spec, `-Crelocation-model=pic`, `crate-type = ["bin"]` with a linker script that produces `ET_DYN`).
+- Observe the kernel→userspace handoff end to end: kernel boots, loads main + interp, transfers to interp's entry, interp self-relocates, interp jumps to `AT_ENTRY`, main prints sentinel.
 
-## Feature Scope
+## Feature Scope (Phase 76 only)
 
-### `PT_INTERP` honored in the kernel ELF loader
+### Kernel `PT_INTERP` parsing and interpreter loading
 
-When the kernel's ELF loader encounters a `PT_INTERP` segment, it loads the interpreter binary (typically `/lib/ld-musl-x86_64.so.1`) instead of executing the main binary directly. It maps the interpreter into the process address space at a load bias, passes the auxiliary vector (`AT_PHDR`, `AT_PHNUM`, `AT_ENTRY`, `AT_BASE`, etc.) on the initial stack, and transfers control to the interpreter's entry point. The interpreter then loads the main binary, resolves its dependencies, and transfers to the main binary's entry point.
+`kernel/src/mm/elf.rs::load_elf_into` scans program headers for a `PT_INTERP` segment. If present, it reads the interpreter path from the segment content, calls `read_file_from_disk(path)` to fetch the interpreter ELF, parses its headers, and maps its `PT_LOAD` segments into the new process at a load bias chosen to avoid colliding with the main binary. The kernel returns a `LoadedElf` whose `entry` is the **interpreter's** entry point (`interp.e_entry + interp_load_bias`) instead of the main binary's. `AT_ENTRY` carries the main binary's entry so the interpreter can transfer to it after self-relocation.
 
-### `ld.so` bring-up
+### Full SysV-ABI auxiliary vector
 
-Port musl's `ldso` (from the musl libc source tree) or implement a fresh dynamic linker following musl's design. The linker must: parse `PT_DYNAMIC` to find `DT_NEEDED`, `DT_SONAME`, `DT_RPATH`/`DT_RUNPATH`; load each needed shared object from `LD_LIBRARY_PATH` and the standard search paths (`/lib`, `/usr/lib`, `/usr/local/lib`); apply relocations (`R_X86_64_GLOB_DAT`, `R_X86_64_JUMP_SLOT`, `R_X86_64_RELATIVE`, `R_X86_64_64`); run `DT_INIT` and `DT_INIT_ARRAY` constructors; then transfer to the main binary's entry point. The linker itself is position-independent and maps its own text as `R-X`, GOT as `RW-`, compliant with Phase 75 W^X rules.
+`setup_abi_stack_with_envp` is extended to take an `interp_load_bias: Option<u64>` and emit `AT_BASE` (interpreter load bias) when present. The auxv ordering matches what musl `_dlstart` reads: `AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_ENTRY` (main binary entry), `AT_BASE` (interpreter bias, only when `PT_INTERP` was honored), `AT_PAGESZ` (4096), `AT_RANDOM` (16 bytes from kernel CSPRNG, hashed via the existing `0xAB`-pattern seed for determinism in tests), `AT_NULL`. Initial `rsp` is 16-byte aligned at the moment control transfers to the interpreter.
 
-### `dlopen` / `dlsym` / `dlclose`
+### `ld-musl-x86_64.so.1` crate scaffold (PIE, no_std)
 
-The dynamic linker exports a `libdl`-compatible interface: `dlopen(path, flags)` loads and relocates an additional shared object at runtime, returning a handle; `dlsym(handle, name)` searches the shared object's exported symbol table and returns the address; `dlclose(handle)` decrements the reference count and unmaps when it reaches zero. `RTLD_LAZY` defers PLT resolution to the first call; `RTLD_NOW` resolves immediately. `RTLD_GLOBAL` adds the library's symbols to the global lookup scope.
+A new workspace crate `userspace/ld-musl-x86_64.so.1/` with:
+- `crate-type = ["bin"]`, `#![no_std]`, `#![no_main]`
+- Custom target spec `x86_64-m3os-ldso.json` with `relocation-model = "pic"` and `position-independent-executables = true`
+- `_dlstart` entry point in inline asm that recovers `argc`/`argv`/`envp`/`auxv` from `rsp`, walks the auxv for `AT_ENTRY`, and jumps to that address with a clean stack
+- BSS/data zero-init verified by an early serial log
 
-### Symbol versioning (basic)
+In this subphase the linker is intentionally a **transfer-only stub**: it does NOT apply relocations, walk `DT_NEEDED`, or run constructors. Those land in 76b.
 
-musl uses limited `DT_GNU_HASH` and `DT_VERSYM`/`DT_VERNEED` entries. The linker must not crash on versioned symbols; it should resolve them using the baseline (unversioned) lookup if exact version matching is not implemented in this phase.
+### `xtask` build pipeline
 
-### Build-system support
+A new `build_ldso` helper invokes the Rust toolchain with the custom target spec, stages the binary to `target/generated-libs/ld-musl-x86_64.so.1`, and `populate_ext2_files` copies it to `/lib/ld-musl-x86_64.so.1` on the ext2 disk. The directory `/lib` is created if absent. `cargo xtask clean && cargo xtask run` produces a disk that contains `/lib/ld-musl-x86_64.so.1`.
 
-`xtask` gains the ability to compile shared libraries (`.so` output) for in-tree libraries that benefit. Initially: `userspace/lib/crypto-lib/` and `userspace/lib/passwd_lib/` can optionally be built as `.so` files. `xtask` calls `tcc -shared` (Phase 31 TCC) to produce the `.so`; the `.so` files are placed in the ext2 data disk under `/usr/lib/`. The kernel ramdisk does not need to embed `.so` files because they are loaded at runtime from the filesystem.
+### `dynlink_smoke` test binary
 
-### Test application
-
-A small `userspace/tests/dynlink_hello/` binary links against a `libhello.so` (also in the test directory). `libhello.so` exports one function `hello_str()` returning a static string. The test binary calls `hello_str()` and writes the result to stdout. A separate `userspace/tests/dlopen_test/` binary uses `dlopen`/`dlsym` to call `hello_str()` at runtime.
+A new test binary `userspace/dynlink_smoke/` built with musl-gcc as a dynamically linked ELF (`PT_INTERP = /lib/ld-musl-x86_64.so.1`, no `DT_NEEDED` entries beyond what the C startup needs). The binary's `main` writes `DYNLINK_SMOKE:PASS` to serial via the existing `sys_write(stdout)` syscall, then exits 0. The smoke harness asserts the sentinel appears.
 
 ## Important Components and How They Work
 
 ### Kernel ELF loader `PT_INTERP` branch
 
-In `kernel/src/elf/loader.rs`, a new branch after segment scanning: if `PT_INTERP` is present, load the interpreter ELF from the filesystem path given in the segment content, compute a load bias for the interpreter, and map its PT_LOAD segments into the new process's address space. Build the auxiliary vector on the user stack: `AT_PHDR` (address of the main binary's program headers), `AT_PHNUM`, `AT_ENTRY` (main binary's `e_entry`), `AT_BASE` (interpreter load bias), `AT_PAGESZ`, `AT_RANDOM` (16 random bytes), `AT_NULL`. Set the initial instruction pointer to the interpreter's entry point.
+After the main binary's PT_LOAD scan, `load_elf_into` iterates program headers a second time looking for `PT_INTERP`. If found, it reads the interpreter path bytes, validates that they form a UTF-8 NUL-terminated string, calls `crate::arch::x86_64::syscall::read_file_from_disk(path)` (re-exported via a thin wrapper because `mm::elf` cannot directly depend on the syscall module), and recursively parses + maps the interpreter ELF. The interpreter's load bias is computed as `INTERP_LOAD_BASE_HINT (0x4000_0000)` rounded up past the main binary's highest mapped vaddr to guarantee no collision. The function returns a `LoadedElf` whose `entry` field points at the interpreter's entry; `AT_ENTRY` is populated separately with the main binary's entry.
 
-### musl `ldso` or fresh implementation
+### Auxiliary vector ordering
 
-The design closely follows musl's `ldso` (`musl/ldso/dynlink.c`). Key internal data structures: `struct dso` (one per loaded shared object, linked in load order), symbol hash tables (`DT_GNU_HASH` preferred over `DT_HASH`), a global symbol table for `RTLD_GLOBAL` scope. Relocation application is architecture-specific: only x86_64 is in scope. Constructor order follows topological sort of the dependency graph (deepest dependency runs first).
+The auxv must appear in the exact order musl's `arch/x86_64/crt_arch.h::_dlstart` walks. Order from low addresses upward (after envp NULL):
+1. `AT_PHDR` (3) — main binary phdr vaddr
+2. `AT_PHENT` (4) — main binary phentsize
+3. `AT_PHNUM` (5) — main binary phnum
+4. `AT_PAGESZ` (6) — 4096
+5. `AT_BASE` (7) — interpreter load bias (only emitted when `PT_INTERP` was honored)
+6. `AT_ENTRY` (9) — main binary entry vaddr
+7. `AT_RANDOM` (25) — pointer to 16 bytes on the stack
+8. `AT_NULL` (0) — sentinel `{0, 0}`
 
-### PLT lazy resolution stubs
+The 16-byte alignment requirement on `rsp` is enforced by padding the pointer table downward so that after `argc` is pushed, the resulting `rsp` is `0 (mod 16)`. (SysV-ABI is "8 mod 16" at function-call boundaries, but `_dlstart` is the program entry point — its convention is `0 mod 16` for the initial stack pointer.)
 
-Each PLT entry initially jumps to the linker's `_dl_runtime_resolve` trampoline. On first call, the trampoline looks up the symbol in the dependency graph, writes the resolved address into the GOT slot, and jumps to the function. Subsequent calls go directly to the function via the pre-filled GOT slot. This requires the GOT to be mapped `RW-` and the PLT to be mapped `R-X` — both consistent with Phase 75 W^X rules.
+### `_dlstart` transfer-only stub
 
-### `xtask` `.so` build path
+```asm
+.global _dlstart
+_dlstart:
+    xor  %rbp, %rbp                  # mark the outermost frame
+    mov  %rsp, %rdi                  # pass argv-style stack pointer
+    call dlstart_rust                # find AT_ENTRY, returns it in rax
+    jmp  *%rax                       # transfer to main binary
+```
 
-A new `build_shared_lib(name, srcs, output)` helper in `xtask/src/main.rs`. For Rust-built shared libraries, `rustc` is invoked with `--crate-type cdylib`. For C-built shared libraries, `tcc -shared` is used. Output `.so` files are staged to `target/generated-libs/` and then embedded in the ext2 data disk by `populate_ext2_files`.
+`dlstart_rust` walks the stack: skip `argc`, skip `argv[0..argc] + NULL`, skip `envp[..] + NULL`, then iterate the auxv looking for `AT_ENTRY`. Returns the value. No allocator, no relocations, no syscalls — pure stack walking.
+
+### `xtask::build_ldso`
+
+Invokes `cargo build --release --package ld-musl-x86_64.so.1 --bin ld-musl-x86_64.so.1 --target userspace/ld-musl-x86_64.so.1/x86_64-m3os-ldso.json -Zbuild-std=core,compiler_builtins`. The resulting binary is copied to `target/generated-libs/ld-musl-x86_64.so.1`. `populate_ext2_files` ensures `/lib` exists on the ext2 disk and stages the binary there with `mode = 0o755`.
 
 ## How This Builds on Earlier Phases
 
-- Extends Phase 11's ELF loader with the `PT_INTERP` branch and auxiliary vector construction
-- Depends on Phase 75 W^X enforcement to ensure the linker's own GOT/PLT use the correct protection flags
-- Depends on Phase 31 TCC for `tcc -shared` to build the test `.so` files
-- Reuses Phase 36's VMA tracking to record the shared library load regions
-- Phase 12 POSIX compatibility provides `dlopen`/`dlsym` in the libc surface; this phase delivers the actual implementation behind those symbols
+- Extends Phase 11's `load_elf_into` with the `PT_INTERP` branch and the auxv `AT_BASE` slot
+- Reuses Phase 31's TCC + musl toolchain to build `dynlink_smoke` as a dynamic ELF
+- Honors Phase 75 W^X by mapping the interpreter's text `R-X` and data `RW-|NX`, identical to the main-binary path
+- Reuses Phase 36's VMA bookkeeping (no new VMA types — the interpreter's segments are recorded the same way as the main binary's)
 
 ## Implementation Outline
 
-1. Add `PT_INTERP` detection and interpreter loading to `kernel/src/elf/loader.rs`
-2. Implement auxiliary vector construction and stack setup for the interpreter entry path (SysV-ABI `argc / argv / NULL / envp / NULL / auxv / AT_NULL` ordering, 16-byte aligned `rsp`)
-3. Scaffold the `userspace/ld-musl-x86_64.so.1/` crate: `no_std`, `-fPIC` / `-Crelocation-model=pic`, output `ET_DYN` ELF; wire into `xtask::build_userspace` and stage to `target/generated-libs/`
-4. Port musl `ldso` or write a fresh dynamic linker inside that crate; copy the resulting binary to `/lib/ld-musl-x86_64.so.1` on the ext2 data disk via `populate_ext2_files`
-5. Implement `DT_NEEDED` resolution, dependency graph construction, and topological load order
-6. Implement x86_64 relocation types: `R_X86_64_GLOB_DAT`, `R_X86_64_JUMP_SLOT`, `R_X86_64_RELATIVE`, `R_X86_64_64`
-7. Implement PLT lazy-resolution trampoline (`_dl_runtime_resolve`)
-8. Implement `dlopen`/`dlsym`/`dlclose` on top of the linker's symbol table
-9. Add `.so` build support to `xtask`; build `libhello.so` test library
-10. Write `dynlink_hello` and `dlopen_test` test binaries; register in xtask and ramdisk
-11. Update Phase 11 and Phase 12 design docs; mark dynamic-linking deferrals as closed
-12. Bump the kernel version to 0.76.0 and author `docs/76-dynamic-linker.md` learning doc
+1. Add `INTERP_LOAD_BASE_HINT` and `compute_interp_load_bias` helpers to `kernel/src/mm/elf.rs`
+2. Add `read_interpreter_data` callback indirection (kernel pure-logic vs. VFS read split)
+3. Add `PT_INTERP` detection + `map_interp_segments` to `load_elf_into`
+4. Extend `setup_abi_stack_with_envp` with `aux_extras: Option<{at_base, at_entry}>`; emit `AT_BASE` + override `AT_ENTRY` when present
+5. Scaffold `userspace/ld-musl-x86_64.so.1/` crate, custom target spec, `_dlstart` asm + `dlstart_rust`
+6. Add `xtask::build_ldso`, custom-target probe, stage to `target/generated-libs/`
+7. Extend `populate_ext2_files` to create `/lib` and stage `ld-musl-x86_64.so.1`
+8. Scaffold `userspace/dynlink_smoke/` (musl-gcc dynamic ELF), wire into `xtask::build_musl_bins`
+9. Add `dynlink-smoke` xtask gate that boots m3OS, drives `dynlink_smoke`, asserts `DYNLINK_SMOKE:PASS` on serial
+10. Update Phase 11 design doc (note the `PT_INTERP` extension); the Phase 12 `dlopen` deferral is closed by 76c, not 76
+11. Bump kernel version to 0.76.0 and author `docs/76-dynamic-linker.md` learner doc
 
 ## Acceptance Criteria
 
-- `tcc -shared` produces a working `.so` from a C source file; the binary loads and `hello_str()` returns the expected string
-- A dynamically linked binary runs correctly under QEMU: `PT_INTERP` triggers interpreter load; `ld.so` resolves `DT_NEEDED` from `/usr/lib/`
-- `dlopen("libhello.so") → handle`, `dlsym(handle, "hello_str") → fn_ptr`, `fn_ptr()` returns the expected string
-- `dlclose(handle)` decrements the reference count; a second `dlopen` of the same path reuses the already-loaded DSO
-- All existing statically linked in-tree binaries continue to function (they have no `PT_INTERP` and are unaffected)
+- A musl-built `dynlink_smoke` binary with `PT_INTERP = /lib/ld-musl-x86_64.so.1` runs under QEMU and prints `DYNLINK_SMOKE:PASS` to serial
+- The serial log shows the kernel "elf: PT_INTERP=/lib/ld-musl-x86_64.so.1 interp_bias=0x..." line followed by "ldso: _dlstart entry=0x..." followed by `DYNLINK_SMOKE:PASS`
+- `readelf -h target/generated-libs/ld-musl-x86_64.so.1` reports `Type: DYN`
+- `readelf -d target/generated-initrd/dynlink_smoke` shows a `PT_INTERP` segment pointing at `/lib/ld-musl-x86_64.so.1`
+- All existing static-binary smoke tests (`cargo xtask smoke-test`) continue to pass — no regression on the no-`PT_INTERP` path
+- `cargo xtask check` and `cargo xtask test` are clean
+- `cargo test -p kernel-core` includes new auxv-layout host tests that pin the byte-exact stack layout
 
 ## Companion Task List
 
@@ -107,16 +142,17 @@ A new `build_shared_lib(name, srcs, output)` helper in `xtask/src/main.rs`. For 
 
 ## How Real OS Implementations Differ
 
-- glibc's `ld.so` implements full GNU symbol versioning, `RTLD_NEXT`, `__attribute__((constructor))` ordering, TLS (thread-local storage) blocks, and lazy IFUNC resolution; m3OS's linker defers all of these to post-Phase-76
-- Linux's `ld.so` uses a namespace model (multiple independent symbol scopes) for plugin isolation; m3OS uses a single flat global scope in this phase
-- Production dynamic linkers use `mmap` to memory-map `.so` files directly (zero-copy load from disk cache); m3OS may use a simpler read-then-map approach in the first version
-- musl's `ldso` deliberately avoids `malloc` during early load to prevent initialization order issues; a fresh implementation must observe the same constraint
+- glibc's `ld-linux-x86-64.so.2` does substantially more than transfer to `AT_ENTRY`: it walks the main binary's `PT_DYNAMIC`, builds the dependency graph, applies all relocations, runs constructors, and only then jumps. m3OS phases 76b–76d add these layers incrementally.
+- Production kernels populate `AT_HWCAP`, `AT_PLATFORM`, `AT_CLKTCK`, `AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID`, `AT_EXECFN`, and `AT_SECURE` in the auxv. m3OS emits only the eight entries musl's `_dlstart` actually reads in 76; the rest land if/when a real libc binary needs them.
+- Linux's interpreter-load bias is randomized for ASLR (`mmap_rnd_bits`); m3OS uses a fixed `0x4000_0000` hint in 76 with the option to randomize later.
 
 ## Deferred Until Later
 
-- Thread-local storage (TLS) blocks for `__thread` variables — requires per-thread TLS block allocation and `FS` register setup per thread
-- GNU symbol versioning beyond the basic "don't crash" handling
-- `RTLD_NEXT` (search scope continuation) — needed for libc interposition patterns
-- Namespace isolation (`dlmopen`) — needed for plugin sandbox isolation
-- Lazy IFUNC resolution — needed for glibc-compatible CPU feature dispatch (not a musl dependency)
-- Shared library build support for languages beyond C and Rust `cdylib` (e.g., C++ with static constructors) — deferred to when a C++ runtime lands
+- `DT_NEEDED` resolution, dependency graph, topological sort → Phase 76b
+- x86_64 relocations (`R_X86_64_GLOB_DAT`, `R_X86_64_JUMP_SLOT`, `R_X86_64_RELATIVE`, `R_X86_64_64` inside the interpreter and inside loaded `.so` files) → Phase 76b (the existing `R_X86_64_RELATIVE` path in `load_elf_into` is unaffected and still runs for kernel-loaded PIE binaries)
+- `DT_INIT` / `DT_INIT_ARRAY` constructor running → Phase 76b
+- `dlopen` / `dlsym` / `dlclose` → Phase 76c
+- PLT lazy resolution (`_dl_runtime_resolve`) → Phase 76d
+- `DT_GNU_HASH` / `DT_HASH` symbol lookup → Phase 76d
+- `DT_VERSYM` / `DT_VERNEED` symbol versioning → Phase 76d
+- Thread-local storage (TLS) blocks, `RTLD_NEXT`, namespace isolation (`dlmopen`), IFUNC — deferred beyond Phase 76d
