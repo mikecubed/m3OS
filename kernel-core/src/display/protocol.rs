@@ -53,7 +53,12 @@ use crate::input::events::{
 /// `display_server` scope `Goodbye` teardown to the disconnecting
 /// client's own surfaces only, fixing the Phase 70 multi-client
 /// regression that preserved the entire registry on disconnect.
-pub const PROTOCOL_VERSION: u32 = 3;
+///
+/// Phase 74 Track F.1 — bumped from 3 to 4 to add
+/// `AttachPageGrantBuffer` (opcode `0x0018`). Pre-Phase-74 clients
+/// negotiate `3` and never send the new opcode, preserving the
+/// existing chunked / shm-backed paths unchanged.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Fixed frame-header size: `body_len (u16) + opcode (u16)`.
 pub const FRAME_HEADER_SIZE: usize = 4;
@@ -88,6 +93,13 @@ const OP_CLIENT_ACK_CONFIGURE: u16 = 0x0016;
 /// buffer. Body layout: surface_id (u32 LE), buffer_id (u32 LE),
 /// shm_id (u32 LE), width (u32 LE), height (u32 LE).
 const OP_CLIENT_ATTACH_SHARED_BUFFER: u16 = 0x0017;
+/// Phase 74 Track F.1 — zero-copy surface buffer attach via Phase 74
+/// page-grant transport. The client transfers a `Capability::PageGrant`
+/// alongside this message (in the IPC `cap_slots`); the compositor
+/// consumes the grant and maps the granted frames as a surface buffer
+/// without any byte-by-byte copy. Replaces the chunked-pixel path for
+/// the highest-bandwidth use case (1080p+ framebuffer surfaces).
+const OP_CLIENT_ATTACH_PAGE_GRANT_BUFFER: u16 = 0x0018;
 
 // Server → client (0x0100..=0x01FF)
 const OP_SERVER_WELCOME: u16 = 0x0101;
@@ -413,6 +425,32 @@ pub enum ClientMessage {
         shm_id: u32,
         width: u32,
         height: u32,
+    },
+    /// Phase 74 Track F.1 — zero-copy surface buffer attached via the
+    /// Phase 74 page-grant transport.
+    ///
+    /// The client extracts `n_pages` pages from its own address space
+    /// via `sys_page_grant_send`, receives back a `Capability::PageGrant`
+    /// handle, and sends this message alongside the cap handle in the
+    /// IPC `cap_slots`. The compositor consumes the grant via
+    /// `sys_page_grant_recv`, mapping the granted frames as a surface
+    /// buffer without any byte-by-byte copy.
+    ///
+    /// `byte_len` is the actual pixel-data byte length (≤ `n_pages * 4096`).
+    /// The compositor uses `width × height × 4` to compute the BGRA
+    /// row stride; the trailing bytes of the last page may be padding.
+    AttachPageGrantBuffer {
+        surface_id: SurfaceId,
+        buffer_id: BufferId,
+        /// Cap-slot index the IPC layer wrote the receiver-side
+        /// PageGrant handle into. Always `0` for the canonical Phase 74
+        /// flow; the field is preserved so a future multi-cap-slot
+        /// message (e.g. surface + cursor in one frame) does not need a
+        /// new opcode.
+        cap_slot_index: u32,
+        width: u32,
+        height: u32,
+        n_pages: u32,
     },
     DamageSurface {
         surface_id: SurfaceId,
@@ -1085,6 +1123,21 @@ impl ClientMessage {
                 body[12..16].copy_from_slice(&width.to_le_bytes());
                 body[16..20].copy_from_slice(&height.to_le_bytes());
             }),
+            Self::AttachPageGrantBuffer {
+                surface_id,
+                buffer_id,
+                cap_slot_index,
+                width,
+                height,
+                n_pages,
+            } => encode_fixed_body(buf, OP_CLIENT_ATTACH_PAGE_GRANT_BUFFER, 24, |body| {
+                body[0..4].copy_from_slice(&surface_id.0.to_le_bytes());
+                body[4..8].copy_from_slice(&buffer_id.0.to_le_bytes());
+                body[8..12].copy_from_slice(&cap_slot_index.to_le_bytes());
+                body[12..16].copy_from_slice(&width.to_le_bytes());
+                body[16..20].copy_from_slice(&height.to_le_bytes());
+                body[20..24].copy_from_slice(&n_pages.to_le_bytes());
+            }),
             Self::DamageSurface { surface_id, rect } => {
                 encode_fixed_body(buf, OP_CLIENT_DAMAGE_SURFACE, 20, |body| {
                     body[0..4].copy_from_slice(&surface_id.0.to_le_bytes());
@@ -1165,6 +1218,17 @@ impl ClientMessage {
                     shm_id: read_u32(body, 8)?,
                     width: read_u32(body, 12)?,
                     height: read_u32(body, 16)?,
+                }
+            }
+            OP_CLIENT_ATTACH_PAGE_GRANT_BUFFER => {
+                expect_body_len(body_len, 24)?;
+                Self::AttachPageGrantBuffer {
+                    surface_id: SurfaceId(read_u32(body, 0)?),
+                    buffer_id: BufferId(read_u32(body, 4)?),
+                    cap_slot_index: read_u32(body, 8)?,
+                    width: read_u32(body, 12)?,
+                    height: read_u32(body, 16)?,
+                    n_pages: read_u32(body, 20)?,
                 }
             }
             OP_CLIENT_DAMAGE_SURFACE => {

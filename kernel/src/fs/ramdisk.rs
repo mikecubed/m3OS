@@ -298,6 +298,12 @@ static WINSIZE_BANG_ELF: &[u8] = generated_initrd_asset!("winsize-bang");
 // Not a daemon: no `.conf`.
 static SENDMSG_TEST_ELF: &[u8] = generated_initrd_asset!("sendmsg-test");
 
+// Phase 74 Track B.3 — `page-grant-test` round-trip regression: brk
+// 1024 pages, sentinel-fill, sys_page_grant_send → CapHandle,
+// sys_page_grant_recv → fresh vaddr, verify sentinel survives,
+// assert double-recv fails. Not a daemon: no `.conf`.
+static PAGE_GRANT_TEST_ELF: &[u8] = generated_initrd_asset!("page-grant-test");
+
 // Phase 70 follow-up — `doom-concurrent` forks two `doom` processes
 // and waits for both. Run from the post-login shell by `cargo xtask
 // doom-concurrent-smoke` to assert real kernel-level concurrency
@@ -549,6 +555,13 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "sendmsg-test",
         RamdiskNode::File {
             content: SENDMSG_TEST_ELF,
+        },
+    ),
+    // Phase 74 Track B.3: page-grant-test — round-trip regression.
+    (
+        "page-grant-test",
+        RamdiskNode::File {
+            content: PAGE_GRANT_TEST_ELF,
         },
     ),
     // Phase 70 follow-up: doom-concurrent — forks two doom children

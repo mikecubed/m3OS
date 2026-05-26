@@ -88,6 +88,42 @@ impl Drop for SharedMapping {
     }
 }
 
+/// Phase 74 Track F.1 — zero-copy mapping from `sys_page_grant_recv`.
+///
+/// Backs a [`BufferStorage::PageGrant`] variant the same way
+/// [`SharedMapping`] backs `BufferStorage::Shared`. The pages were
+/// extracted from the client's address space by `sys_page_grant_send`
+/// and mapped into the compositor by `sys_page_grant_recv`; the
+/// compositor reads pixels directly through `user_va` without ever
+/// copying them.
+///
+/// **Lifecycle:** the kernel currently does not expose a
+/// `sys_page_grant_release` syscall — the receiver's page-table
+/// mappings persist until the receiver process exits. For the in-tree
+/// compositor this is acceptable: surface lifetimes are bounded by the
+/// compositor's own lifetime, and a future hardening pass that adds an
+/// explicit release syscall can hook the `Drop` impl below without
+/// changing the storage variant.
+#[derive(Debug)]
+pub struct PageGrantMapping {
+    /// Receiver-side virtual address returned by `sys_page_grant_recv`.
+    pub user_va: u64,
+    /// Byte length of the granted region. Always a multiple of 4096.
+    pub len: usize,
+    /// Number of 4 KiB pages backing the mapping. Equal to `len / 4096`.
+    pub n_pages: u32,
+}
+
+impl Drop for PageGrantMapping {
+    fn drop(&mut self) {
+        // Phase 74 Track F.1 — no `sys_page_grant_release` syscall
+        // exists yet. The receiver's page-table entries stay live
+        // until the process exits. This is a documented hardening
+        // follow-up; see `docs/74-ipc-capability-grants.md` "Known
+        // Follow-ups".
+    }
+}
+
 /// Storage backing for a committed buffer's pixel data.
 ///
 /// Phase 56's chunked-pixel path produced [`Vec<u8>`]-owned buffers
@@ -112,6 +148,11 @@ impl Drop for SharedMapping {
 pub enum BufferStorage {
     Owned(Vec<u8>),
     Shared(Rc<SharedMapping>),
+    /// Phase 74 Track F.1 — pixel bytes backed by a `sys_page_grant_recv`
+    /// mapping. The compositor reads pixels directly through the
+    /// receiver-side virtual address; the same per-frame zero-copy
+    /// guarantee as `Shared` but without going through the SHM registry.
+    PageGrant(Rc<PageGrantMapping>),
 }
 
 impl BufferStorage {
@@ -139,6 +180,26 @@ impl BufferStorage {
                 // a raw pointer rather than synthesising an `&[u8]`
                 // so the producer's concurrent writes never alias a
                 // Rust reference.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        mapping.user_va as *const u8,
+                        owned.as_mut_ptr(),
+                        mapping.len,
+                    );
+                    owned.set_len(mapping.len);
+                }
+                owned
+            }
+            BufferStorage::PageGrant(mapping) => {
+                // Same shape as the `Shared` arm — pixels live behind a
+                // user-virtual address that the producing client owns
+                // for the duration of the grant. Copy through a raw
+                // pointer so a concurrent client write never aliases a
+                // Rust reference.
+                let mut owned = Vec::<u8>::with_capacity(mapping.len);
+                // SAFETY: `sys_page_grant_recv` mapped `mapping.len`
+                // bytes at `mapping.user_va` into this process's
+                // address space.
                 unsafe {
                     core::ptr::copy_nonoverlapping(
                         mapping.user_va as *const u8,
@@ -177,6 +238,9 @@ impl BufferStorage {
         match self {
             BufferStorage::Owned(v) => v,
             BufferStorage::Shared(mapping) => unsafe {
+                core::slice::from_raw_parts(mapping.user_va as *const u8, mapping.len)
+            },
+            BufferStorage::PageGrant(mapping) => unsafe {
                 core::slice::from_raw_parts(mapping.user_va as *const u8, mapping.len)
             },
         }
@@ -380,6 +444,16 @@ pub struct SurfaceRegistry {
     /// for that id clears the slot — without this, a destroyed
     /// cursor surface would leave a stale `ClientCursor` behind.
     client_cursor_owner: Option<SurfaceId>,
+    /// Phase 74 Track F.1 — capability handles the current IPC
+    /// message transferred via the Phase 74 `cap_slots` field. Set by
+    /// the dispatcher (`client::dispatch`) immediately before
+    /// `handle_message`; consumed by the `AttachPageGrantBuffer` arm
+    /// to look up the receiver-side grant capability. Cleared after
+    /// each dispatch so a stray cap from a previous message cannot
+    /// leak into the next.
+    pending_caps: [u32; syscall_lib::CAP_SLOTS_PER_MSG],
+    /// Phase 74 Track F.1 — count of valid entries in [`pending_caps`].
+    pending_caps_count: u8,
 }
 
 impl SurfaceRegistry {
@@ -391,7 +465,33 @@ impl SurfaceRegistry {
             layer_conflicts: LayerConflictTracker::new(),
             client_cursor: None,
             client_cursor_owner: None,
+            pending_caps: [0; syscall_lib::CAP_SLOTS_PER_MSG],
+            pending_caps_count: 0,
         }
+    }
+
+    /// Phase 74 Track F.1 — install the cap handles transferred with the
+    /// current IPC message so the `AttachPageGrantBuffer` arm can look
+    /// them up. Callers must clear this via [`clear_pending_caps`] after
+    /// `handle_message` returns.
+    pub fn set_pending_caps(&mut self, caps: [u32; syscall_lib::CAP_SLOTS_PER_MSG], n: u8) {
+        self.pending_caps = caps;
+        self.pending_caps_count = n;
+    }
+
+    /// Phase 74 Track F.1 — clear the cap-slot scratch state. Called
+    /// from the dispatcher after `handle_message` returns so a stray
+    /// cap from one client cannot leak into another's message.
+    pub fn clear_pending_caps(&mut self) {
+        self.pending_caps = [0; syscall_lib::CAP_SLOTS_PER_MSG];
+        self.pending_caps_count = 0;
+    }
+
+    /// Phase 74 Track F.1 — read the active cap-slot scratch state for
+    /// the `AttachPageGrantBuffer` handler.
+    fn pending_caps_snapshot(&self) -> &[u32] {
+        let n = (self.pending_caps_count as usize).min(self.pending_caps.len());
+        &self.pending_caps[..n]
     }
 
     /// Phase 56 Track E.3 — the currently active client cursor, if any.
@@ -695,6 +795,139 @@ impl SurfaceRegistry {
                     width: *width,
                     height: *height,
                     pixels: BufferStorage::Shared(mapping),
+                };
+                self.apply_event(
+                    *surface_id,
+                    SurfaceEvent::AttachBuffer(*buffer_id),
+                    &mut result,
+                )?;
+                if let Some(s) = self.surfaces.get_mut(surface_id) {
+                    s.pending_buffer = Some(buf);
+                }
+            }
+            ClientMessage::AttachPageGrantBuffer {
+                surface_id,
+                buffer_id,
+                cap_slot_index,
+                width,
+                height,
+                n_pages,
+            } => {
+                // Phase 74 Track F.1 — zero-copy attach via page-grant
+                // transport. The client already invoked
+                // `sys_page_grant_send` on its pixel buffer pages and
+                // transferred the resulting `Capability::PageGrant` via
+                // the IPC message's `cap_slots`. The compositor's
+                // recv path (`ipc_recv_msg` / `ipc_recv_with_caps`)
+                // populated `cap_slots[cap_slot_index]` with the
+                // receiver-side capability handle when this message
+                // landed. We pull that handle here and call
+                // `sys_page_grant_recv` to map the granted frames into
+                // our address space.
+                //
+                // No SHM registry, no per-frame remap caching: the
+                // grant is single-shot (the kernel removes the cap and
+                // consumes the registry entry inside
+                // `sys_page_grant_recv`), so every fresh frame from a
+                // client that wants to update pixels is a fresh
+                // grant+attach. Clients that update in-place can keep
+                // the same vaddr across frames and just commit Damage
+                // verbs against it; clients that double-buffer send a
+                // new AttachPageGrantBuffer per flip.
+                const MAX_SURFACE_DIMENSION: u32 = 16_384;
+                if *width > MAX_SURFACE_DIMENSION || *height > MAX_SURFACE_DIMENSION {
+                    return Err(SurfaceShimError::ShmDimensionsTooLarge {
+                        width: *width,
+                        height: *height,
+                        buffer_id: *buffer_id,
+                    });
+                }
+                let byte_count = match (*width as usize)
+                    .checked_mul(*height as usize)
+                    .and_then(|wh| wh.checked_mul(4))
+                {
+                    Some(n) => n,
+                    None => {
+                        return Err(SurfaceShimError::ShmDimensionsTooLarge {
+                            width: *width,
+                            height: *height,
+                            buffer_id: *buffer_id,
+                        });
+                    }
+                };
+                // `cap_slot_index` is bounded by syscall_lib's
+                // CAP_SLOTS_PER_MSG. We re-validate the index against
+                // the IPC layer's slot count rather than trusting the
+                // wire value to keep a malformed client from indexing
+                // past our local cap_slots snapshot.
+                let snapshot = self.pending_caps_snapshot();
+                let idx = *cap_slot_index as usize;
+                if idx >= snapshot.len() {
+                    return Err(SurfaceShimError::ShmMapFailed {
+                        shm_id: 0,
+                        buffer_id: *buffer_id,
+                    });
+                }
+                let server_cap = snapshot[idx];
+                if server_cap == 0 {
+                    return Err(SurfaceShimError::ShmMapFailed {
+                        shm_id: 0,
+                        buffer_id: *buffer_id,
+                    });
+                }
+                // Reject mismatched `n_pages` *before* consuming the grant so a
+                // client that lied about the page count cannot trick the server
+                // into trusting a larger mapping than the kernel installed.
+                // `sys_page_grant_recv` does not report the actual mapped
+                // length, so the only safe anchor we have is the server-derived
+                // `byte_count` (= width × height × 4, both already bounded by
+                // `MAX_SURFACE_DIMENSION`). Requiring `n_pages == ceil(byte_count
+                // / 4096)` makes the protocol fields self-consistent.
+                let required_pages = byte_count.div_ceil(4096);
+                if *n_pages as usize != required_pages {
+                    return Err(SurfaceShimError::ShmDimensionsTooLarge {
+                        width: *width,
+                        height: *height,
+                        buffer_id: *buffer_id,
+                    });
+                }
+                let user_va = syscall_lib::page_grant_recv(server_cap);
+                if user_va == u64::MAX {
+                    syscall_lib::write_str(
+                        syscall_lib::STDOUT_FILENO,
+                        "display_server: AttachPageGrantBuffer page_grant_recv failed cap=",
+                    );
+                    write_u32_log(server_cap);
+                    syscall_lib::write_str(syscall_lib::STDOUT_FILENO, "\n");
+                    return Err(SurfaceShimError::ShmMapFailed {
+                        shm_id: 0,
+                        buffer_id: *buffer_id,
+                    });
+                }
+                // `len` is now anchored to the server-derived pixel byte count,
+                // not the client-supplied `n_pages`. Subsequent `as_slice` /
+                // `snapshot` calls read at most `byte_count` bytes, which is
+                // guaranteed to fit inside the kernel-installed mapping
+                // because `required_pages * 4096 >= byte_count` by construction.
+                let len = byte_count;
+                syscall_lib::write_str(
+                    syscall_lib::STDOUT_FILENO,
+                    "display_server: AttachPageGrantBuffer mapped cap=",
+                );
+                write_u32_log(server_cap);
+                syscall_lib::write_str(syscall_lib::STDOUT_FILENO, " va=");
+                write_u64_log(user_va);
+                syscall_lib::write_str(syscall_lib::STDOUT_FILENO, "\n");
+                let mapping = Rc::new(PageGrantMapping {
+                    user_va,
+                    len,
+                    n_pages: *n_pages,
+                });
+                let buf = CommittedBuffer {
+                    buffer_id: *buffer_id,
+                    width: *width,
+                    height: *height,
+                    pixels: BufferStorage::PageGrant(mapping),
                 };
                 self.apply_event(
                     *surface_id,

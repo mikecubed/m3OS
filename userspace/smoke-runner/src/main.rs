@@ -14,6 +14,9 @@ const HELLO_BIN_PATH: &[u8] = b"/tmp/h\0";
 const SKIP_TCC_MARKER: &[u8] = b"/etc/m3os-skip-tcc-compile\0";
 const PASSWD_PATH: &[u8] = b"/etc/passwd\0";
 const UDP_SMOKE_PATH: &[u8] = b"/root/udp-smoke\0";
+const PAGE_GRANT_TEST_PATH: &[u8] = b"/bin/page-grant-test\0";
+const PAGE_GRANT_TEST_ARGV0: &[u8] = b"page-grant-test\0";
+const PAGE_GRANT_PASS_NEEDLE: &[u8] = b"PAGE_GRANT_SMOKE:roundtrip:ok";
 const CAPTURE_FILE_PATH: &[u8] = b"/tmp/smoke-runner.capture\0";
 const LOGGER_PATH: &[u8] = b"/bin/logger\0";
 const SYSTEM_LOG_PATH: &[u8] = b"/var/log/messages\0";
@@ -117,6 +120,23 @@ fn program_main(_args: &[&str]) -> i32 {
         return code;
     }
     pass("log");
+
+    // Phase 74 Track B.3 — page-grant round-trip regression. Validates
+    // that `sys_page_grant_send` + `sys_page_grant_recv` actually move
+    // 1024 pages without copying any bytes and that the consume side is
+    // single-shot.
+    begin("page-grant");
+    let page_grant_argv = [PAGE_GRANT_TEST_ARGV0.as_ptr(), ptr::null()];
+    if let Err(code) = run_command_expect_output(
+        "page-grant",
+        PAGE_GRANT_TEST_PATH,
+        &page_grant_argv,
+        PAGE_GRANT_PASS_NEEDLE,
+        &mut command_output,
+    ) {
+        return code;
+    }
+    pass("page-grant");
 
     write_str(STDOUT_FILENO, "SMOKE:PASS\n");
     0

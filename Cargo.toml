@@ -127,6 +127,11 @@ members = [
     # Phase 69d follow-up — SCM_RIGHTS regression: socketpair, sendmsg
     # an inflight fd, recvmsg in the peer, assert recovered fd matches.
     "userspace/sendmsg-test",
+    # Phase 74 Track B.3 — page-grant round-trip regression: brk-allocate
+    # 1024 pages, write a per-page sentinel, send the grant to the kernel,
+    # recv it back at a fresh vaddr, verify the sentinel survives, and
+    # check that a double-recv against the same cap fails.
+    "userspace/page-grant-test",
     # Phase 70 follow-up — helper that forks two `doom` processes and
     # waits for both, so the `doom-concurrent-smoke` gate exercises
     # real kernel-level concurrency rather than relying on the in-tree

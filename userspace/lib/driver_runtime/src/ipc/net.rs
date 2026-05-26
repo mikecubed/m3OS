@@ -350,6 +350,8 @@ mod tests {
             data0: 0,
             reply_cap_handle: 0,
             bulk: send_frame_bytes(frame.len() as u16, &frame),
+            cap_slots: [0; syscall_lib::CAP_SLOTS_PER_MSG],
+            n_caps: 0,
         });
 
         let server = NetServer::with_backend(ep(), mock);
@@ -388,6 +390,8 @@ mod tests {
             reply_cap_handle: 0,
             // Empty bulk — decode_net_send rejects as InvalidFrame.
             bulk: Vec::new(),
+            cap_slots: [0; syscall_lib::CAP_SLOTS_PER_MSG],
+            n_caps: 0,
         });
 
         let server = NetServer::with_backend(ep(), mock);
@@ -553,6 +557,8 @@ mod tests {
             data0: 0,
             reply_cap_handle: 0,
             bulk: send_frame_bytes(frame.len() as u16, &frame),
+            cap_slots: [0; syscall_lib::CAP_SLOTS_PER_MSG],
+            n_caps: 0,
         });
 
         let server = NetServer::with_backend(ep(), mock);

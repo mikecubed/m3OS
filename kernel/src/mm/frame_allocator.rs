@@ -765,6 +765,24 @@ pub fn free_frame_count() -> (usize, usize) {
 /// enforced on the allocation side via [`allocate_frame_zeroed`]. Panics on
 /// double-free (frame already on the free list).
 pub fn free_frame(phys: u64) {
+    // Phase 74 Track B hardening — refuse to free a frame that is
+    // currently pinned by a live page-grant. The grant epoch is
+    // tracked in `crate::ipc::page_grant::GRANTED_FRAMES`; a frame
+    // becomes pinned at `PageGrant::new` time (inside
+    // `sys_page_grant_send`) and unpinned at `consume` time (inside
+    // `sys_page_grant_recv`). A `free_frame` against a pinned PFN is
+    // a kernel bug (the page-table walker should never reach it) but
+    // surfacing it as a non-fatal skip + diagnostic bump catches the
+    // class of bug rather than producing silent data corruption.
+    if crate::ipc::page_grant::is_frame_granted(phys) {
+        crate::ipc::page_grant::record_granted_free_refusal();
+        log::warn!(
+            "[frame_allocator] free_frame: refusing to free granted PFN {:#x}",
+            phys / 4096,
+        );
+        return;
+    }
+
     if !release_last_reference(phys) {
         return;
     }
@@ -812,6 +830,17 @@ pub fn free_frame(phys: u64) {
 /// Used by allocator-local reclaim when a hidden slab page has already been
 /// selected for immediate surfacing back to the global pool.
 pub(crate) fn free_frame_direct(phys: u64) {
+    // Phase 74 Track B hardening — same granted-frame check as
+    // `free_frame`. Catches kernel-side direct-free callers that
+    // would otherwise bypass the per-CPU cache path's check.
+    if crate::ipc::page_grant::is_frame_granted(phys) {
+        crate::ipc::page_grant::record_granted_free_refusal();
+        log::warn!(
+            "[frame_allocator] free_frame_direct: refusing to free granted PFN {:#x}",
+            phys / 4096,
+        );
+        return;
+    }
     if !release_last_reference(phys) {
         return;
     }
@@ -824,6 +853,28 @@ pub(crate) fn free_frame_direct(phys: u64) {
 /// count reaches zero.  Does **not** zero — see [`allocate_contiguous_zeroed`].
 #[allow(dead_code)]
 pub fn free_contiguous(phys: u64, order: usize) {
+    // Phase 74 Track B hardening — refuse to free any frame in the
+    // contiguous range that is currently pinned by a live page-grant.
+    // `is_frame_granted` short-circuits via an atomic counter when no
+    // grants are live, so the common case pays a single relaxed load
+    // per frame; only when grants are active do we walk the registry.
+    let n_frames = 1usize << order;
+    for i in 0..n_frames {
+        let frame_phys = phys + (i as u64) * 4096;
+        if crate::ipc::page_grant::is_frame_granted(frame_phys) {
+            crate::ipc::page_grant::record_granted_free_refusal();
+            log::warn!(
+                "[frame_allocator] free_contiguous: refusing to free range \
+                 base PFN {:#x} order {} — frame {:#x} (PFN {:#x}) is granted",
+                phys / 4096,
+                order,
+                frame_phys,
+                frame_phys / 4096,
+            );
+            return;
+        }
+    }
+
     if !release_last_reference(phys) {
         return;
     }

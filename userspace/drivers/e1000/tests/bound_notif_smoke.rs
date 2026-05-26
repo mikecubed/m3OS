@@ -64,6 +64,8 @@ impl TestBackend {
             label: u64::from(NET_SEND_FRAME),
             data0: 0,
             bulk,
+            cap_slots: [0; syscall_lib::CAP_SLOTS_PER_MSG],
+            n_caps: 0,
         }));
     }
 }

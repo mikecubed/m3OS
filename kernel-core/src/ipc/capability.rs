@@ -57,6 +57,19 @@ pub enum Capability {
         device: DeviceCapKey,
         notif: NotifId,
     },
+    /// Phase 74 Track B: opaque handle to a `PageGrant` kernel object in
+    /// the grant registry. The grant carries a list of physical frames
+    /// extracted from the sender's address space and pending delivery to
+    /// the receiver. The receiver calls `sys_page_grant_recv` with the
+    /// `CapHandle` that resolves to this variant; the kernel maps the
+    /// grant's frames into the receiver's address space and consumes the
+    /// grant. The variant carries only the opaque `grant_id` because
+    /// frame ownership is recorded in the grant registry (which holds
+    /// the per-frame PFN list and the monotonic grant epoch).
+    PageGrant {
+        /// Opaque registry id assigned at `sys_page_grant_send` time.
+        grant_id: u32,
+    },
 }
 
 impl Capability {

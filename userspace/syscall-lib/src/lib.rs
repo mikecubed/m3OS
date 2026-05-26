@@ -406,6 +406,45 @@ pub const SYS_IPC_WAIT_SERVICE: u64 = 0x1115;
 /// lifecycle methods can target the child by PID.
 pub const SYS_IPC_LOOKUP_SERVICE_OWNER_PID: u64 = 0x1116;
 
+/// Phase 74 Track A.3: `ipc_call_with_caps(ep_cap, msg_ptr, buf_ptr, buf_len)`.
+/// Reads the full cap-bearing `IpcMessage` from user memory and transfers
+/// the named `cap_slots[..n_caps]` capabilities to the receiver alongside
+/// the message. On reply, the reply's cap_slots are written back to the
+/// same `msg_ptr` with the receiver-side handles the server granted.
+pub const SYS_IPC_CALL_WITH_CAPS: u64 = 0x1117;
+
+/// Phase 74 Track A.3: `ipc_recv_with_caps(ep_cap, msg_ptr, buf_ptr, buf_len)`.
+/// Receives a message and writes the full cap-bearing `IpcMessage`
+/// (including `cap_slots[..n_caps]` filled with receiver-side handles) to
+/// `msg_ptr`.
+pub const SYS_IPC_RECV_WITH_CAPS: u64 = 0x1118;
+
+/// Phase 74 Track C.3: `ipc_call_timeout(ep_cap, label, data0, deadline_ns)`.
+/// Like `ipc_call` but registers a deadline (absolute CLOCK_MONOTONIC
+/// nanoseconds) with the scheduler timer wheel. Returns the reply label
+/// on success or `NEG_ETIMEDOUT` (-110 cast to u64) if the deadline
+/// elapses without a reply.
+pub const SYS_IPC_CALL_TIMEOUT: u64 = 0x1119;
+
+/// Phase 74 Track C.3: `ipc_recv_timeout(ep_cap, deadline_ns)`. Like
+/// `ipc_recv` but registers a deadline with the scheduler timer wheel.
+/// Returns the message label on success or `NEG_ETIMEDOUT` on deadline
+/// expiry.
+pub const SYS_IPC_RECV_TIMEOUT: u64 = 0x111A;
+
+/// Phase 74 Track B: `sys_page_grant_send(pages_vaddr, n_pages)`. Hands
+/// `n_pages` contiguous user-space pages starting at `pages_vaddr` to
+/// the kernel as a `PageGrant`. Returns the new capability handle on
+/// success or `u64::MAX` on error.
+pub const SYS_PAGE_GRANT_SEND: u64 = 0x1020;
+
+/// Phase 74 Track B: `sys_page_grant_recv(grant_cap)`. Consumes a
+/// `PageGrant` capability and maps the granted frames into the
+/// receiver's address space at a kernel-chosen virtual address.
+/// Returns the chosen virtual address on success or `u64::MAX` on
+/// error (invalid capability, double-recv, or mapping failure).
+pub const SYS_PAGE_GRANT_RECV: u64 = 0x1021;
+
 /// Read raw disk sectors from userspace (Phase 54).
 pub const SYS_BLOCK_READ: u64 = 0x1011;
 
@@ -416,12 +455,44 @@ pub const SYS_BLOCK_WRITE: u64 = 0x1012;
 // IPC wrappers (Phase 52)
 // ===========================================================================
 
-/// IPC message data: 4 u64 words.
+/// Phase 74: maximum number of capability handles transferred per IPC message
+/// via the [`IpcMessage::cap_slots`] field. Sized at 2 so a typical server
+/// reply can return both a fresh endpoint capability and a related
+/// notification capability without forcing a second `sys_cap_grant`
+/// round-trip.
+pub const CAP_SLOTS_PER_MSG: usize = 2;
+
+/// IPC message data: label, 4 u64 words, plus the Phase 74 cap-slot fields.
+///
+/// The Phase 74 fields ([`IpcMessage::cap_slots`] / [`IpcMessage::n_caps`])
+/// are placed at the **end** of the struct so the offsets of the pre-Phase-74
+/// fields (label + data) are unchanged. Every kernel recv-shaped syscall —
+/// `ipc_recv_msg` (`0x110E`), `ipc_try_recv_msg` (`0x1113`),
+/// `ipc_reply_recv_msg` (`0x110F`), and the new cap-aware
+/// `ipc_recv_with_caps` (`0x1118`) — emits the full 56-byte
+/// `build_cap_msg_wire` header (label + 4 data words + cap_slots + n_caps +
+/// padding). When a sender attaches no capabilities the kernel still writes
+/// the trailing cap-slot bytes, but with `n_caps = 0` and `cap_slots = [0;
+/// 2]`, so legacy callers observe identical end-to-end behaviour to the
+/// pre-Phase-74 wire (the kernel treats `n_caps == 0` as "no caps to
+/// transfer" and never inserts handles into the receiver's cap table).
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct IpcMessage {
     pub label: u64,
     pub data: [u64; 4],
+    /// Phase 74: capability handles to transfer with this message. Valid
+    /// entries are `cap_slots[..n_caps as usize]`. Senders fill this before
+    /// calling [`ipc_call_with_caps`]; receivers read the granted handles
+    /// from this field after [`ipc_recv_with_caps`] returns.
+    pub cap_slots: [u32; CAP_SLOTS_PER_MSG],
+    /// Phase 74: count of valid entries in [`IpcMessage::cap_slots`]. `0`
+    /// (the default) preserves pre-Phase-74 semantics — no capability
+    /// transfer happens at delivery time.
+    pub n_caps: u8,
+    /// Padding to make the struct size a multiple of 8 bytes so future
+    /// fields land at a predictable offset.
+    _pad: [u8; 7],
 }
 
 impl IpcMessage {
@@ -429,6 +500,9 @@ impl IpcMessage {
         Self {
             label,
             data: [0; 4],
+            cap_slots: [0; CAP_SLOTS_PER_MSG],
+            n_caps: 0,
+            _pad: [0; 7],
         }
     }
 
@@ -445,6 +519,25 @@ impl IpcMessage {
         } else {
             Some(raw as u32)
         }
+    }
+
+    /// Phase 74: fill the cap-slot fields with `handles` and update
+    /// [`IpcMessage::n_caps`]. Excess entries beyond [`CAP_SLOTS_PER_MSG`]
+    /// are silently truncated, matching the kernel-side
+    /// `Message::with_cap_slots` helper.
+    pub fn set_cap_slots(&mut self, handles: &[u32]) {
+        let n = core::cmp::min(handles.len(), CAP_SLOTS_PER_MSG);
+        for (i, h) in handles.iter().take(n).enumerate() {
+            self.cap_slots[i] = *h;
+        }
+        self.n_caps = n as u8;
+    }
+
+    /// Phase 74: return the slice of capability handles delivered with this
+    /// message.
+    pub fn received_caps(&self) -> &[u32] {
+        let n = core::cmp::min(self.n_caps as usize, CAP_SLOTS_PER_MSG);
+        &self.cap_slots[..n]
     }
 }
 
@@ -876,6 +969,135 @@ pub fn sys_notif_bind(notif_cap_handle: u32, ep_cap_handle: u32) -> u64 {
             ep_cap_handle as u64,
         )
     }
+}
+
+/// Phase 74 Track D — alias of [`sys_notif_bind`] that matches the verb
+/// name in the Phase 74 task list. New userspace callers should prefer
+/// this name; the legacy `sys_notif_bind` name is retained for the
+/// existing Phase 55b/55c IRQ-multiplex pattern.
+pub fn notif_bind(notif_cap_handle: u32, ep_cap_handle: u32) -> u64 {
+    sys_notif_bind(notif_cap_handle, ep_cap_handle)
+}
+
+// ===========================================================================
+// Phase 74 Track A.3 — cap-bearing IPC wrappers
+// ===========================================================================
+
+/// Phase 74 Track A.3 — send a cap-bearing IPC call.
+///
+/// Fills `msg.cap_slots[..]` with `caps` (truncated to [`CAP_SLOTS_PER_MSG`])
+/// and updates `msg.n_caps`, then issues `SYS_IPC_CALL_WITH_CAPS`. The
+/// kernel transfers each named capability handle from the caller's table
+/// into the receiver's table atomically — every handle either lands in
+/// the receiver, or none of them do.
+///
+/// On reply, `msg.cap_slots[..msg.n_caps]` is overwritten with the
+/// receiver-side handles the server granted back.
+///
+/// Returns the reply label on success or `u64::MAX` on error (invalid
+/// handle, receiver table full, or copy failure).
+pub fn ipc_call_with_caps(
+    ep_cap_handle: u32,
+    msg: &mut IpcMessage,
+    caps: &[u32],
+    buf: &[u8],
+) -> u64 {
+    msg.set_cap_slots(caps);
+    unsafe {
+        syscall6(
+            SYS_IPC_CALL_WITH_CAPS,
+            ep_cap_handle as u64,
+            msg as *mut IpcMessage as u64,
+            buf.as_ptr() as u64,
+            buf.len() as u64,
+            0,
+            0,
+        )
+    }
+}
+
+/// Phase 74 Track A.3 — receive a cap-bearing IPC message.
+///
+/// Blocks until a message arrives. On return, `msg.cap_slots[..msg.n_caps]`
+/// holds the receiver-side handles for any capabilities the sender
+/// transferred. Use [`IpcMessage::received_caps`] for an ergonomic
+/// slice-of-handles view.
+///
+/// Returns the message label on success or `u64::MAX` on error.
+pub fn ipc_recv_with_caps(ep_cap_handle: u32, msg: &mut IpcMessage, buf: &mut [u8]) -> u64 {
+    unsafe {
+        syscall6(
+            SYS_IPC_RECV_WITH_CAPS,
+            ep_cap_handle as u64,
+            msg as *mut IpcMessage as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            0,
+            0,
+        )
+    }
+}
+
+// ===========================================================================
+// Phase 74 Track C.3 — IPC timeout wrappers
+// ===========================================================================
+
+/// Phase 74 Track C.3 — call an endpoint with an absolute deadline.
+///
+/// `deadline_ns` is an **absolute** CLOCK_MONOTONIC deadline in nanoseconds
+/// since boot, matching the kernel ABI (`SYS_IPC_CALL_TIMEOUT`) and Linux's
+/// `clock_nanosleep(TIMER_ABSTIME)` semantics. A deadline that has already
+/// passed (including `0`) returns `NEG_ETIMEDOUT` (-110 cast to `u64`)
+/// immediately if no receiver is already queued.
+///
+/// To wait "at most N nanoseconds from now", read CLOCK_MONOTONIC and add
+/// the relative timeout yourself before calling. Phase 74 does not provide a
+/// bundled relative-timeout helper; the choice keeps the wrapper a thin
+/// pass-through so deadline computation lives in a single place per caller.
+///
+/// **Note:** for a kernel BSP whose tick rate is 1 ms (`1 tick = 1 ms`),
+/// the kernel rounds the absolute deadline down to tick granularity. Sub-
+/// millisecond IPC deadlines are not supported in Phase 74.
+pub fn ipc_call_timeout(ep_cap_handle: u32, label: u64, data0: u64, deadline_ns: u64) -> u64 {
+    unsafe {
+        syscall4(
+            SYS_IPC_CALL_TIMEOUT,
+            ep_cap_handle as u64,
+            label,
+            data0,
+            deadline_ns,
+        )
+    }
+}
+
+/// Phase 74 Track C.3 — receive on an endpoint with an absolute deadline.
+///
+/// `deadline_ns` shares the same absolute-CLOCK_MONOTONIC semantics as
+/// [`ipc_call_timeout`].
+pub fn ipc_recv_timeout(ep_cap_handle: u32, deadline_ns: u64) -> u64 {
+    unsafe { syscall2(SYS_IPC_RECV_TIMEOUT, ep_cap_handle as u64, deadline_ns) }
+}
+
+// ===========================================================================
+// Phase 74 Track B — page-grant transport wrappers
+// ===========================================================================
+
+/// Phase 74 Track B — hand `n_pages` contiguous user-space pages to the
+/// kernel as a `PageGrant`. The pages are unmapped from the caller's page
+/// table; ownership transfers to the kernel-side grant object until the
+/// matching [`page_grant_recv`] consumes it.
+///
+/// Returns the new capability handle on success or `u64::MAX` on error
+/// (invalid range, pages not mapped, or grant registry full).
+pub fn page_grant_send(pages_vaddr: u64, n_pages: usize) -> u64 {
+    unsafe { syscall2(SYS_PAGE_GRANT_SEND, pages_vaddr, n_pages as u64) }
+}
+
+/// Phase 74 Track B — consume a `PageGrant` capability and map its frames
+/// into the calling process's address space at a kernel-chosen virtual
+/// address. Returns the chosen address on success or `u64::MAX` on error.
+pub fn page_grant_recv(grant_cap_handle: u32) -> u64 {
+    unsafe { syscall1(SYS_PAGE_GRANT_RECV, grant_cap_handle as u64) }
 }
 
 /// Read raw disk sectors into a userspace buffer (Phase 54).

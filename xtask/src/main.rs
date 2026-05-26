@@ -912,6 +912,10 @@ fn build_userspace_bins() {
         // Uses `BrkAllocator` via syscall-lib's `alloc` feature, so
         // `needs_alloc = true`.
         ("sendmsg-test", "sendmsg-test", true),
+        // Phase 74 Track B.3 — `page-grant-test` round-trip regression.
+        // Calls brk + page_grant_send + page_grant_recv + write only;
+        // no Vec / Box allocator needed.
+        ("page-grant-test", "page-grant-test", false),
         // Phase 70 follow-up — `doom-concurrent` forks two `doom`
         // children and waits for both, so the
         // `doom-concurrent-smoke` gate exercises real concurrency
@@ -5202,6 +5206,14 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         pattern: "SMOKE:log:PASS",
         timeout_secs: 20,
         label: "guest/log: smoke runner verified syslog marker",
+    });
+    // Phase 74 Track B.3 — page-grant round-trip regression. Boot-time
+    // smoke that proves `sys_page_grant_send` + `sys_page_grant_recv`
+    // actually move 1024 pages without copying any bytes.
+    steps.push(SmokeStep::Wait {
+        pattern: "SMOKE:page-grant:PASS",
+        timeout_secs: 30,
+        label: "guest/page-grant: smoke runner verified page-grant round-trip",
     });
     steps.push(SmokeStep::Wait {
         pattern: "SMOKE:PASS",

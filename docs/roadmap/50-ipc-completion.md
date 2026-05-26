@@ -180,6 +180,7 @@ Transport mechanism summary:
 
 ## Deferred Until Later
 
-- Deep performance tuning of zero-copy paths
-- Rich typed service IDLs or code-generated message bindings
-- Advanced delegation patterns beyond the basic capability and buffer model
+- **Deep performance tuning of zero-copy paths** — Phase 74 lays the groundwork with `sys_page_grant_send` / `sys_page_grant_recv` (no per-frame `memcpy`); the page-table unmap + IOMMU remap fast path that turns the syscall surface into an actual zero-copy transport is the Phase 74 Track B follow-up.
+- **Capability grants delivered with the IPC message** — **closed in Phase 74** via `Message::cap_slots` and the new `sys_ipc_call_with_caps` / `sys_ipc_recv_with_caps` syscalls.
+- Rich typed service IDLs or code-generated message bindings (remain deferred).
+- Advanced delegation patterns beyond the basic capability and buffer model (remain deferred).
