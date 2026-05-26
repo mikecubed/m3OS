@@ -22,28 +22,29 @@
 
 ## Track A — ELF Loader PT_LOAD Flag Dispatch
 
-### A.1 — Read `p_flags` per segment in `map_segment`
+### A.1 — Reject `PF_W | PF_X` PT_LOAD segments in `map_load_segment`
 
-**File:** `kernel/src/elf/loader.rs`
-**Symbol:** `map_segment`
-**Why it matters:** The loader currently passes a uniform `WRITABLE | USER_ACCESSIBLE` flag to every PT_LOAD segment, making code pages writable and the absence of `NO_EXECUTE` leaves data pages executable — both are wrong.
+**File:** `kernel/src/mm/elf.rs`
+**Symbol:** `map_load_segment` (line 270), `segment_flags` (line 245)
+**Why it matters:** `segment_flags()` already produces W^X-correct PTE flags for the three benign PT_LOAD shapes (`PF_X` only → R-X; `PF_W` only → RW-/NX; neither → R--/NX). What is missing is the malformed-segment guard: a PT_LOAD with both `PF_W` and `PF_X` is still mapped as a W+X page. A hostile or mis-linked binary can therefore introduce a writable code segment.
 
 **Acceptance:**
-- [ ] `map_segment` reads `segment.flags()` and branches: `PF_X` only → `R-X`; `PF_W` only → `RW-|NX`; neither → `R--|NX`; both → `ENOEXEC`
-- [ ] A segment with both `PF_W | PF_X` is rejected with `ENOEXEC`; a log line identifies the offending binary and segment offset
-- [ ] The flag-dispatch logic is covered by a host-side unit test in `kernel-core` that exercises all four flag combinations
+- [ ] A guard at the top of `map_load_segment` rejects `phdr.p_flags & (PF_W | PF_X) == (PF_W | PF_X)` before any frame allocation or page-table mutation; returns `ElfError::MappingFailed("PT_LOAD with PF_W|PF_X — W^X violation")`
+- [ ] The rejection emits a `log::warn!` line carrying the binary identity (caller-provided) and the segment's `p_offset` and `p_vaddr`
+- [ ] `execve` surfaces the rejection as `-ENOEXEC` to userspace (covered by the test binary in G.1 if the test fixture exercises it; otherwise by a kernel-side unit-style test)
+- [ ] `segment_flags()` is left unchanged — the existing PF_W/PF_X mapping logic is already W^X-correct for the three benign cases
 
-### A.2 — Remove `WRITABLE` from code-segment call sites in `user_space.rs`
+### A.2 — Retire the legacy `setup_user_memory` helper in `user_space.rs`
 
 **File:** `kernel/src/mm/user_space.rs`
-**Symbol:** `map_user_pages` (call sites at lines 135 and 143)
-**Why it matters:** These two call sites are the direct cause of the audit finding at § E1; removing `WRITABLE` from them closes the vulnerability.
+**Symbol:** `setup_user_memory` (lines 208–242), `map_user_pages` (line 43, called at line 233)
+**Why it matters:** `setup_user_memory` maps user code pages at `USER_CODE_BASE` with `PRESENT | WRITABLE | USER_ACCESSIBLE` (line 225) — the exact W+X shape the audit (§ E1) flagged. Two `// W^X enforcement is deferred to Phase 6+` comments live at lines 214 and 222. The function has **zero live callers** today — every binary load flows through `mm::elf::load_elf_into` — but the dead-code shape is a latent hazard.
 
 **Acceptance:**
-- [ ] Line 135 no longer passes `WRITABLE` for executable segments
-- [ ] Line 143 no longer passes `WRITABLE` for executable segments
-- [ ] The comment `// Phase 6+ deferred` (or equivalent) is removed; replaced with `// W^X enforced: Phase 75`
-- [ ] No other call sites in `user_space.rs` pass `WRITABLE` for text segments
+- [ ] `setup_user_memory` and its `WRITABLE`-bearing call site at line 225 are removed, OR rewritten so the code mapping never carries `WRITABLE` and an explanatory comment cites Phase 75 (decision is left to the implementer)
+- [ ] Both `// W^X enforcement is deferred to Phase 6+` comments (lines 214 and 222) are removed
+- [ ] `cargo xtask check` and `cargo xtask test` still pass — confirming no live caller depends on the legacy helper
+- [ ] `grep -rn 'WRITABLE.*USER_ACCESSIBLE' kernel/src/mm/user_space.rs` returns no executable-mapping site
 
 ---
 
@@ -51,42 +52,43 @@
 
 ### B.1 — Add W^X guard to `sys_mprotect`
 
-**File:** `kernel/src/syscall/mm.rs`
-**Symbol:** `sys_mprotect`
+**File:** `kernel/src/arch/x86_64/syscall/mod.rs`
+**Symbol:** `sys_mprotect` (line 9762)
 **Why it matters:** Without this guard, a program can map a page `PROT_WRITE`, fill it with shellcode, then call `mprotect(PROT_WRITE | PROT_EXEC)` to execute it.
 
 **Acceptance:**
-- [ ] `sys_mprotect` returns `EINVAL` immediately (before any VMA walk) if `prot` contains both `PROT_WRITE` and `PROT_EXEC`
+- [ ] `sys_mprotect` returns `NEG_EINVAL` immediately after the `prot &= 0x7` mask (line 9764) — before the page-alignment check, before any VMA walk, before any PTE modification — when `prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0`
 - [ ] Existing calls with `PROT_READ | PROT_WRITE` succeed unchanged
 - [ ] Existing calls with `PROT_READ | PROT_EXEC` succeed unchanged (the JIT pattern's second step)
-- [ ] A kernel-side unit test exercises the `PROT_WRITE | PROT_EXEC` case and asserts `EINVAL`
+- [ ] The G.1 userspace test binary exercises the `PROT_WRITE | PROT_EXEC` case and asserts `EINVAL`
 
 ---
 
 ## Track C — Stack and Heap NX Enforcement
 
-### C.1 — Initial stack mapping with `NO_EXECUTE`
+### C.1 — Verify initial stack mapping is `NO_EXECUTE`
 
-**File:** `kernel/src/elf/loader.rs`
-**Symbol:** `setup_user_stack`
-**Why it matters:** Stack-executable mappings are the target of classic return-to-stack shellcode attacks; this closes that vector.
+**File:** `kernel/src/mm/elf.rs`
+**Symbol:** `map_user_stack` (line 382)
+**Why it matters:** Stack-executable mappings are the target of classic return-to-stack shellcode attacks. The modern ELF loader's `map_user_stack` already builds its flag set with `PRESENT | WRITABLE | USER_ACCESSIBLE | NO_EXECUTE` (lines 384–388), so this track is a verification step rather than a code change — but the regression test still needs to be authored so the property is locked in.
 
 **Acceptance:**
-- [ ] `setup_user_stack` passes `PAGE_NX` (or equivalent) when mapping the initial user stack
-- [ ] The stack mapping appears in the kernel's VMA list with `PROT_READ | PROT_WRITE` and no `PROT_EXEC`
-- [ ] A jump to a stack address from a test binary causes a `#PF` with NX error code (bit 4 of the error code word set)
+- [ ] Static audit: `map_user_stack` constructs `flags` containing `PageTableFlags::NO_EXECUTE` and passes that to every `map_to` call in the function body
+- [ ] Runtime test: a jump to a stack address from a test binary causes a `#PF` with the NX error-code bit set; the page fault handler's serial output is asserted against a known string
+- [ ] If any non-ELF stack-setup path exists (e.g. legacy `setup_user_memory`), it is removed or made W^X-correct under A.2
 
 ### C.2 — `brk` and `mmap(PROT_READ|PROT_WRITE)` NX enforcement
 
-**File:** `kernel/src/syscall/mm.rs`
-**Symbol:** `sys_brk`, `sys_mmap`
+**File:** `kernel/src/arch/x86_64/syscall/mod.rs`
+**Symbol:** `sys_linux_brk` (dispatch at line 1773), `sys_linux_mmap` (dispatch at line 1770)
 **Why it matters:** Heap allocations that are executable are equivalent to a stack-execute vulnerability; the entire heap must be NX by default.
 
 **Acceptance:**
-- [ ] `sys_brk` maps all new pages with `PAGE_NX`
-- [ ] `sys_mmap` with `prot = PROT_READ | PROT_WRITE` (and without `PROT_EXEC`) maps with `PAGE_NX`
-- [ ] `sys_mmap` with `prot = PROT_READ | PROT_EXEC` (JIT pattern step 2) maps without `PAGE_NX`
+- [ ] `sys_linux_brk` maps all new pages with `PageTableFlags::NO_EXECUTE` set
+- [ ] `sys_linux_mmap` with `prot = PROT_READ | PROT_WRITE` (and without `PROT_EXEC`) maps with `NO_EXECUTE` set
+- [ ] `sys_linux_mmap` with `prot = PROT_READ | PROT_EXEC` (JIT pattern step 2) maps *without* `NO_EXECUTE`
 - [ ] A heap allocation accessed as executable (via function pointer cast) causes a `#PF` NX fault in a test binary
+- [ ] If `sys_linux_brk` / `sys_linux_mmap` already apply `NO_EXECUTE` for the non-exec cases (static audit during implementation), the task is a verification step + the regression test in G.1; otherwise the patch adds the missing flag
 
 ---
 
@@ -126,13 +128,14 @@
 
 ### E.2 — Verify code-page `WRITABLE` bit is absent at runtime
 
-**File:** `kernel/src/syscall/debug.rs` (or equivalent VMA query path)
-**Symbol:** `sys_query_vma` (or an equivalent debug query)
-**Why it matters:** The acceptance criterion requires a verifiable runtime check, not just a code review.
+**File:** `kernel/src/mm/elf.rs` (log emission site) **and/or** `kernel/src/arch/x86_64/interrupts.rs` (`dump_pte_walk_diagnostics`, line 412)
+**Symbol:** `map_load_segment` (post-mapping log emission) **or** `dump_pte_walk_diagnostics` invoked from a one-shot debug path
+**Why it matters:** The acceptance criterion requires a verifiable runtime check, not just a code review. m3OS has no `/proc/<pid>/maps`, so the verification surface is the existing kernel-side PTE inspection path.
 
 **Acceptance:**
-- [ ] A test binary or a QEMU-side inspection confirms that the text segment VMA of a loaded binary has no `WRITABLE` bit in its PTE
-- [ ] The check is recorded in the PR description with a QEMU serial-output snippet showing the PTE flags
+- [ ] After a successful PT_LOAD mapping, `map_load_segment` emits a `log::info!` line covering each segment as `elf: mapped pid=<N> p_vaddr=<va> p_flags=<rwx> pte_flags=<…>`, with `pte_flags` showing the actual `PageTableFlags` bits applied
+- [ ] The serial-output snippet for at least one loaded binary (`init` or `sh0`) is captured in the PR description, showing that text-segment PTEs have neither `WRITABLE` nor (for the no-NX hardware-level executable bit) `NO_EXECUTE`
+- [ ] Alternative path is acceptable: a one-shot `dump_pte_walk_diagnostics` call from a debug syscall — if added, document the new syscall number and stub in `docs/appendix/architecture-and-syscalls.md`
 
 ---
 
@@ -190,7 +193,7 @@
 - [ ] File exists at `docs/75-wx-enforcement.md`
 - [ ] All required template fields populated: `**Aligned Roadmap Phase:** Phase 75`, `**Status:** Planned`, `**Source Ref:** phase-75`, `**Supersedes Legacy Doc:** new`
 - [ ] Overview is learner-friendly (explains what W^X is and why it matters before describing the implementation)
-- [ ] Key Files table cites real files this phase touches: `kernel/src/elf/loader.rs`, `kernel/src/mm/user_space.rs`, `kernel/src/syscall/mm.rs`, `docs/appendix/architecture-and-syscalls.md`, `userspace/tests/wx_violation/src/main.rs`
+- [ ] Key Files table cites real files this phase touches: `kernel/src/mm/elf.rs`, `kernel/src/mm/user_space.rs`, `kernel/src/arch/x86_64/syscall/mod.rs`, `docs/appendix/architecture-and-syscalls.md`, `userspace/tests/wx_violation/src/main.rs`
 - [ ] Related Roadmap Docs links `docs/roadmap/75-wx-enforcement.md` and `docs/roadmap/tasks/75-wx-enforcement-tasks.md`
 
 ### H.2 — Bump kernel version to 0.75.0
@@ -216,9 +219,9 @@
 
 ## Documentation Notes
 
-- Track A's `map_segment` change is the most load-bearing; it touches every binary load path and must be tested with `doom`, `term`, `init`, and `sh0` specifically (as the widest ELF variety in the tree).
-- Track B's guard position matters: it must execute before any VMA walk or page-table modification so that no partial state is left on `EINVAL`.
-- Track C must cover both `brk` and `mmap`; omitting one leaves a hole that attackers can exploit.
-- The `// Phase 6+ deferred` comment in `kernel/src/mm/user_space.rs` is the specific textual marker from the audit (§ E1); its removal is an explicit deliverable of Track A.2.
+- Track A's `map_load_segment` change is the most load-bearing in principle, but in practice `segment_flags()` already produces W^X-correct PTE bits for benign segments; the only ELF-loader change is the `PF_W | PF_X` rejection branch. Still, the change touches every binary load path, so run `cargo xtask run`, `cargo xtask test`, and `cargo xtask tui-app-smoke` to exercise `doom`, `term`, `init`, `sh0`, `htop`, `less`, and `tmux` (the widest ELF variety in the tree).
+- Track B's guard position matters: it must execute before any address validation, VMA walk, or page-table modification so that no partial state is left on `EINVAL`.
+- Track C must cover both `sys_linux_brk` and `sys_linux_mmap`; omitting one leaves a hole that attackers can exploit. Note that `map_user_stack` in `kernel/src/mm/elf.rs` already applies `NO_EXECUTE`, so C.1 is primarily a regression-locking test.
+- The literal comments `// W^X enforcement is deferred to Phase 6+` at `kernel/src/mm/user_space.rs:214` and `:222` are the specific textual markers from the audit (§ E1); their removal — together with the dead `setup_user_memory` helper that contains them — is an explicit deliverable of Track A.2.
 - Track G's JIT-pattern test (second bullet in G.1) is the positive-case proof that the enforcement does not break future JIT use; it is as important as the negative case.
 - Track H.1 learning doc should be authored after Track G so it can cite the actual test binary paths and serial-output snippets as concrete examples.

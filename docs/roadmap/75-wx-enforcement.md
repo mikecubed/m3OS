@@ -4,7 +4,7 @@
 **Source Ref:** phase-75
 **Depends on:** Phase 11 (Process Model) ✅, Phase 36 (Memory Subsystem Expansion) ✅
 **Builds on:** Hardens the ELF loader and `mprotect` path introduced in Phase 11 and Phase 36 to enforce write-XOR-execute for all userspace code and data pages
-**Primary Components:** `kernel/src/elf/`, `kernel/src/mm/user_space.rs`, `kernel/src/syscall/` (`sys_mprotect`)
+**Primary Components:** `kernel/src/mm/elf.rs`, `kernel/src/mm/user_space.rs`, `kernel/src/arch/x86_64/syscall/mod.rs` (`sys_mprotect`, `sys_linux_brk`, `sys_linux_mmap`)
 
 ## Milestone Goal
 
@@ -12,7 +12,7 @@ Every userspace process launched by m3OS has its code pages mapped read-execute 
 
 ## Why This Phase Exists
 
-The current ELF loader in `kernel/src/mm/user_space.rs` maps all code segments with `WRITABLE | USER_ACCESSIBLE` and no `NO_EXECUTE` separation (`user_space.rs:135, 143`). This is a well-known exploit enabler: a vulnerability that achieves an arbitrary write into a code page can immediately redirect execution. The audit (§ E1) identified this as a pre-1.0 security hardening item.
+Two W^X gaps exist today. (1) The modern ELF loader in `kernel/src/mm/elf.rs` already derives per-segment PTE flags via `segment_flags()` (`elf.rs:245`) — PF_W adds WRITABLE, absence of PF_X adds NO_EXECUTE — but it does *not* reject a malformed `PF_W | PF_X` segment. A linker bug or hostile binary could therefore still create a W+X code segment. (2) The legacy `setup_user_memory` path in `kernel/src/mm/user_space.rs` (lines 214–231) maps user code pages with `WRITABLE | USER_ACCESSIBLE` and no `NO_EXECUTE` (the `// W^X enforcement is deferred to Phase 6+` comment marks the site). That function currently has *zero callers* (every live binary load goes through `mm::elf::load_elf_into`), so the runtime exposure is nil — but the dead-code shape leaves a trap for future contributors and matches the audit finding (§ E1). This is a well-known exploit enabler in principle: a vulnerability that achieves an arbitrary write into a code page can immediately redirect execution. The audit identified this as a pre-1.0 security hardening item.
 
 W^X is a foundational memory safety guarantee present in every modern OS since OpenBSD 3.3 (2003). It costs nothing at runtime (no extra page faults on normal code execution) and eliminates an entire class of memory-corruption exploit primitives. It must be in place before Phase 80 (Node.js) and Phase 81 (Claude Code) introduce JIT compilation, which requires a documented exception path.
 
@@ -29,7 +29,7 @@ SRP: the ELF loader's sole concern is splitting PT_LOAD segments by `p_flags`; a
 
 ### ELF loader text/data segment separation
 
-The ELF loader currently maps all PT_LOAD segments with identical flags. This phase teaches it to read the `p_flags` field on each PT_LOAD segment: `PF_X` means execute (map `R-X`); absence of `PF_X` means data (map `RW-`). A segment with both `PF_W` and `PF_X` in the ELF header is an error: the loader logs a warning and refuses to map it, returning `ENOEXEC`.
+The modern ELF loader in `kernel/src/mm/elf.rs` already derives per-segment PTE flags from `p_flags` via `segment_flags()` (`elf.rs:245`): `PF_W` adds `WRITABLE`, absence of `PF_X` adds `NO_EXECUTE`. What is missing is the malformed-segment guard: a PT_LOAD with both `PF_W` and `PF_X` is currently mapped as a W+X page. This phase adds the rejection branch in `map_load_segment` (`elf.rs:270`): if `p_flags & (PF_W | PF_X) == (PF_W | PF_X)`, the loader logs a warning identifying the offending binary and segment offset and aborts the load with `ElfError::MappingFailed("PT_LOAD with PF_W|PF_X — W^X violation")`, which surfaces to `execve` as `-ENOEXEC`.
 
 ### `mprotect` W^X validation
 
@@ -51,20 +51,22 @@ The "Deferred Until Later" section of the Phase 11 design doc notes W^X as defer
 
 ### ELF loader PT_LOAD flag dispatch
 
-In `kernel/src/elf/loader.rs`, the current `map_segment` function calls `user_space::map_user_pages` with a fixed flag set. After this phase it branches on `segment.flags() & PF_X`:
+In `kernel/src/mm/elf.rs`, the `map_load_segment` function (line 270) already calls `segment_flags()` (line 245) to derive PTE flags from `p_flags`. That helper produces:
 
-- `PF_X` set, `PF_W` clear → `PAGE_PRESENT | PAGE_USER | PAGE_EXECUTABLE` (no `PAGE_WRITABLE`)
-- `PF_W` set, `PF_X` clear → `PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE | PAGE_NX`
-- Both set → log `ENOEXEC` and abort the load
-- Neither set → `PAGE_PRESENT | PAGE_USER | PAGE_NX` (read-only data section)
+- `PF_X` set, `PF_W` clear → `PRESENT | USER_ACCESSIBLE` (no `WRITABLE`, no `NO_EXECUTE`) — the R-X mapping
+- `PF_W` set, `PF_X` clear → `PRESENT | USER_ACCESSIBLE | WRITABLE | NO_EXECUTE` — the RW- mapping
+- Neither set → `PRESENT | USER_ACCESSIBLE | NO_EXECUTE` — read-only data
+- Both set → still produces a W+X mapping (**this phase fixes that**)
+
+This phase adds a guard at the top of `map_load_segment` (before flag derivation): if `phdr.p_flags & (PF_W | PF_X) == (PF_W | PF_X)`, the loader emits a warning identifying the offending binary and segment offset, then returns `ElfError::MappingFailed("PT_LOAD with PF_W|PF_X — W^X violation")`. `execve` surfaces this as `-ENOEXEC`.
 
 ### `mprotect` W^X check
 
-In `kernel/src/syscall/mm.rs` (or wherever `sys_mprotect` is implemented), immediately after parsing the `prot` argument: `if prot.contains(PROT_WRITE) && prot.contains(PROT_EXEC) { return Err(EINVAL); }`. This guard runs before the walk of the VMA list.
+In `kernel/src/arch/x86_64/syscall/mod.rs`, `sys_mprotect` (line 9762) currently parses `prot` into `new_flags` without checking the W+X combination. This phase adds an early guard immediately after the `prot` mask: `if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 { return NEG_EINVAL; }`. The guard runs before any address validation, VMA walk, or page-table modification, so no partial state is left on rejection.
 
 ### `user_space.rs` deferral comment removal
 
-Lines 135 and 143 of `kernel/src/mm/user_space.rs` currently pass `WRITABLE | USER_ACCESSIBLE` for code segments. This phase changes those call sites to pass the segment-flag-derived protection. The comment referencing "Phase 6+ deferred" is removed.
+`kernel/src/mm/user_space.rs` contains the legacy `setup_user_memory` (line 217) which maps code pages with `PRESENT | WRITABLE | USER_ACCESSIBLE` (line 225) and carries `// W^X enforcement is deferred to Phase 6+` comments at lines 214 and 222. The function has **zero live callers** — every binary load now flows through `mm::elf::load_elf_into`, so this is dead code rather than an active exposure, but it remains a hazard that future contributors could resurrect. This phase deletes `setup_user_memory` outright (along with its stale comments), or, if any near-term bring-up path needs an `setup_user_memory`-shaped helper, rewrites it to produce the same per-segment W^X-correct flags that `elf::segment_flags()` produces.
 
 ## How This Builds on Earlier Phases
 
@@ -75,18 +77,18 @@ Lines 135 and 143 of `kernel/src/mm/user_space.rs` currently pass `WRITABLE | US
 
 ## Implementation Outline
 
-1. Audit all PT_LOAD segment mappings in `kernel/src/elf/loader.rs`; add `p_flags` dispatch
-2. Update `kernel/src/mm/user_space.rs` lines 135 and 143; remove deferral comment
-3. Add W^X validation guard to `sys_mprotect` in the kernel syscall layer
-4. Ensure all `brk`, `mmap(PROT_READ|PROT_WRITE)`, and stack setup paths apply `NO_EXECUTE`
-5. Run all existing binaries under QEMU to verify no regressions
-6. Write a small test binary that attempts `mprotect(PROT_WRITE | PROT_EXEC)` and verifies `EINVAL`
+1. Add a `PF_W | PF_X` rejection branch to `map_load_segment` in `kernel/src/mm/elf.rs` (returns `ElfError::MappingFailed`, surfaced to `execve` as `-ENOEXEC`)
+2. Delete the dead `setup_user_memory` helper in `kernel/src/mm/user_space.rs` (lines 208–242), removing the `// W^X enforcement is deferred to Phase 6+` comments at lines 214 and 222
+3. Add a W^X validation guard to `sys_mprotect` in `kernel/src/arch/x86_64/syscall/mod.rs` (line 9762) — early-return `NEG_EINVAL` before address validation
+4. Audit `sys_linux_brk` and `sys_linux_mmap` in `kernel/src/arch/x86_64/syscall/mod.rs` to confirm all `PROT_WRITE`-only mappings apply `NO_EXECUTE`; `map_user_stack` (`kernel/src/mm/elf.rs:382`) already does so and only needs verification
+5. Run all existing binaries under QEMU (`cargo xtask run`, `cargo xtask test`, `cargo xtask tui-app-smoke`) to verify no regressions
+6. Write a small test binary that attempts `mprotect(PROT_WRITE | PROT_EXEC)` and verifies `EINVAL`, and that exercises the positive JIT-pattern path
 7. Update `docs/appendix/architecture-and-syscalls.md` with the JIT exception pattern
-8. Update Phase 11 and Phase 36 design docs; remove the `// Phase 6+ deferred` comment
+8. Update Phase 11 and Phase 36 design docs to record W^X as a baseline guarantee as of Phase 75
 
 ## Acceptance Criteria
 
-- Every in-tree userspace binary's text segment pages are mapped without the `WRITABLE` bit; verified by reading `/proc/<pid>/maps`-equivalent kernel debug output
+- Every in-tree userspace binary's text segment pages are mapped without the `WRITABLE` bit; verified by a kernel-side log emitted from `map_load_segment` (or by a one-shot `dump_pte_walk_diagnostics` call against the loaded text segment), captured on the QEMU serial console
 - An attempt to `mprotect` any page to `PROT_WRITE | PROT_EXEC` returns `EINVAL`
 - Stack and heap pages are mapped with `NO_EXECUTE` set; a jump to a stack address causes a page fault with the `#PF` error code indicating an NX violation
 - All existing in-tree binaries (`exit0`, `term`, `coreutils`, `init`, `sh0`, `edit`, `doom`, etc.) boot and operate correctly under the new mapping rules
