@@ -10,11 +10,15 @@
 //! 3. `mprotect(PROT_READ | PROT_EXEC)` succeeds — the supported JIT
 //!    pattern (allocate RW-, write code, then flip to R-X).
 //!
-//! On success prints `WX_VIOLATION:smoke:ok` and exits 0. Any failure
-//! prints `WX_VIOLATION:fail <reason>` and exits 2.
+//! On success prints `WX_VIOLATION:smoke:ok` and exits 0. An assertion
+//! failure prints `WX_VIOLATION:fail <reason>` and exits 2. A panic
+//! prints `WX_VIOLATION:fail panic` and exits 101 (distinct sentinel so
+//! a panic and a normal assertion failure are distinguishable in serial
+//! output).
 //!
-//! Wired into `cargo xtask test --test wx_violation` via the QEMU
-//! harness; runs from the post-login shell in `cargo xtask tui-app-smoke`.
+//! Wired into `cargo xtask smoke-test` via the `smoke-runner`
+//! `wx-violation` stage; `smoke-runner` execs `/bin/wx-violation` and
+//! asserts the `WX_VIOLATION:smoke:ok` marker is present.
 
 #![no_std]
 #![no_main]

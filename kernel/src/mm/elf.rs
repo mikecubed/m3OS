@@ -37,7 +37,9 @@ const PT_DYNAMIC: u32 = 2;
 // ELF segment flags
 const PF_X: u32 = 0x1; // Execute
 const PF_W: u32 = 0x2; // Write
-// PF_R (0x4) is always assumed present.
+const PF_R: u32 = 0x4; // Read — assumed present on every PT_LOAD m3OS loads,
+// but named so the segment-flag log line in `map_load_segment` does
+// not carry a magic number for the read bit.
 
 /// Virtual address of the top of the user stack.
 /// Set well below the canonical boundary (0x0000_8000_0000_0000) to leave
@@ -393,7 +395,7 @@ unsafe fn map_load_segment(
         // running `/proc/<pid>/maps`. One line per PT_LOAD covers every code
         // and data segment of every loaded binary.
         let pid = crate::process::current_pid();
-        let r = (phdr.p_flags & 0x4) != 0;
+        let r = (phdr.p_flags & PF_R) != 0;
         let w = (phdr.p_flags & PF_W) != 0;
         let x = (phdr.p_flags & PF_X) != 0;
         log::info!(

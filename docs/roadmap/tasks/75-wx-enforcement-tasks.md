@@ -167,15 +167,15 @@
 
 ### G.1 — W^X violation test binary
 
-**File:** `userspace/tests/wx_violation/src/main.rs`
-**Symbol:** `main`
+**File:** `userspace/wx-violation/src/main.rs`
+**Symbol:** `_start` (no_std `#![no_main]` userspace binary)
 **Why it matters:** Acceptance criteria require a programmatic verification that `mprotect(PROT_WRITE | PROT_EXEC)` returns `EINVAL`; a manual QEMU run is not reproducible.
 
 **Acceptance:**
 - [x] Binary calls `mmap(PROT_READ | PROT_WRITE)` then `mprotect(ptr, sz, PROT_WRITE | PROT_EXEC)` and asserts the result is `EINVAL`
 - [x] Binary calls `mmap(PROT_READ | PROT_WRITE)` then `mprotect(ptr, sz, PROT_READ | PROT_EXEC)` (JIT pattern) and asserts success
-- [x] Binary is registered as a QEMU test under `cargo xtask test --test wx_violation`
-- [x] Test exits with `QEMU_EXIT_SUCCESS` (0x21) when all assertions pass
+- [x] Binary is registered as a QEMU smoke-test under `cargo xtask smoke-test` via the `smoke-runner` `wx-violation` stage (Phase 75 in-tree convention; the binary lives at `/bin/wx-violation` on the ramdisk and prints `SMOKE:wx-violation:PASS` on success)
+- [x] On success the binary prints `WX_VIOLATION:smoke:ok` and exits 0; on assertion failure it prints `WX_VIOLATION:fail <reason>` and exits 2 (panic path uses 101 as a distinct sentinel so a panic vs. a normal assertion failure is distinguishable in serial output)
 
 ---
 
@@ -191,9 +191,9 @@
 
 **Acceptance:**
 - [x] File exists at `docs/75-wx-enforcement.md`
-- [x] All required template fields populated: `**Aligned Roadmap Phase:** Phase 75`, `**Status:** Planned`, `**Source Ref:** phase-75`, `**Supersedes Legacy Doc:** new`
+- [x] All required template fields populated: `**Aligned Roadmap Phase:** Phase 75`, `**Status:** Complete`, `**Source Ref:** phase-75`, `**Supersedes Legacy Doc:** new`
 - [x] Overview is learner-friendly (explains what W^X is and why it matters before describing the implementation)
-- [x] Key Files table cites real files this phase touches: `kernel/src/mm/elf.rs`, `kernel/src/mm/user_space.rs`, `kernel/src/arch/x86_64/syscall/mod.rs`, `docs/appendix/architecture-and-syscalls.md`, `userspace/tests/wx_violation/src/main.rs`
+- [x] Key Files table cites real files this phase touches: `kernel/src/mm/elf.rs`, `kernel/src/mm/user_space.rs`, `kernel/src/arch/x86_64/syscall/mod.rs`, `docs/appendix/architecture-and-syscalls.md`, `userspace/wx-violation/src/main.rs`
 - [x] Related Roadmap Docs links `docs/roadmap/75-wx-enforcement.md` and `docs/roadmap/tasks/75-wx-enforcement-tasks.md`
 
 ### H.2 — Bump kernel version to 0.75.0
