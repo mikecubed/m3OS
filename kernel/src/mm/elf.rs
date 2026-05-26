@@ -263,6 +263,10 @@ fn segment_flags(p_flags: u32) -> PageTableFlags {
 /// `load_bias` is added to each segment's p_vaddr — non-zero for PIE (ET_DYN)
 /// binaries where segments are linked at a virtual base of 0.
 ///
+/// `binary_name` is a caller-supplied identifier (e.g. argv[0] or a path)
+/// used purely for log line provenance — Phase 75 W^X-violation rejection
+/// and the per-segment "mapped" trace.
+///
 /// # Safety
 /// `mapper` must own exclusive access to its PML4. The virtual range
 /// `[phdr.p_vaddr + load_bias, phdr.p_vaddr + load_bias + phdr.p_memsz)` must
@@ -273,8 +277,27 @@ unsafe fn map_load_segment(
     data: &[u8],
     phdr: &Phdr,
     load_bias: u64,
+    binary_name: &str,
 ) -> Result<(), ElfError> {
     unsafe {
+        // Phase 75 W^X enforcement: reject malformed PT_LOAD segments that
+        // request both PF_W and PF_X. Such a segment would otherwise be
+        // mapped writable+executable, defeating write-XOR-execute for
+        // every page it covers. Reject before any frame allocation or
+        // page-table mutation so no partial state is left behind.
+        if phdr.p_flags & (PF_W | PF_X) == (PF_W | PF_X) {
+            log::warn!(
+                "elf: rejecting PT_LOAD with PF_W|PF_X (W^X violation): binary={} p_offset={:#x} p_vaddr={:#x} p_flags={:#x}",
+                binary_name,
+                phdr.p_offset,
+                phdr.p_vaddr,
+                phdr.p_flags,
+            );
+            return Err(ElfError::MappingFailed(
+                "PT_LOAD with PF_W|PF_X — W^X violation",
+            ));
+        }
+
         if phdr.p_memsz == 0 {
             return Ok(());
         }
@@ -364,6 +387,25 @@ unsafe fn map_load_segment(
             }
             // BSS portion already zeroed by allocate_frame_zeroed.
         }
+
+        // Phase 75 E.2: trace the actual PTE flags applied to this segment so
+        // the W^X invariant is verifiable from the serial console without a
+        // running `/proc/<pid>/maps`. One line per PT_LOAD covers every code
+        // and data segment of every loaded binary.
+        let pid = crate::process::current_pid();
+        let r = (phdr.p_flags & 0x4) != 0;
+        let w = (phdr.p_flags & PF_W) != 0;
+        let x = (phdr.p_flags & PF_X) != 0;
+        log::info!(
+            "elf: mapped pid={} binary={} p_vaddr={:#x} p_flags={}{}{} pte_flags={:?}",
+            pid,
+            binary_name,
+            phdr.p_vaddr + load_bias,
+            if r { 'r' } else { '-' },
+            if w { 'w' } else { '-' },
+            if x { 'x' } else { '-' },
+            flags,
+        );
 
         Ok(())
     }
@@ -608,6 +650,10 @@ pub unsafe fn setup_abi_stack_with_envp(
 /// through `phys_off` so the function works whether `mapper` references the
 /// current CR3 or a not-yet-active per-process PML4.
 ///
+/// `binary_name` is a caller-supplied identifier (e.g. argv[0] or a path)
+/// used only for the Phase 75 W^X-violation rejection warning and the
+/// per-segment "mapped" trace.
+///
 /// # Safety
 /// `mapper` must have exclusive access to its PML4 and `phys_off` must be
 /// the correct physical-memory offset for this machine.
@@ -615,6 +661,7 @@ pub unsafe fn load_elf_into(
     mapper: &mut OffsetPageTable<'_>,
     phys_off: u64,
     data: &[u8],
+    binary_name: &str,
 ) -> Result<LoadedElf, ElfError> {
     unsafe {
         let ehdr = parse_ehdr(data)?;
@@ -665,7 +712,7 @@ pub unsafe fn load_elf_into(
 
             let phdr = parse_phdr(data, base, phentsize)?;
             if phdr.p_type == PT_LOAD {
-                map_load_segment(mapper, phys_off, data, &phdr, load_bias)?;
+                map_load_segment(mapper, phys_off, data, &phdr, load_bias, binary_name)?;
             }
             if phdr.p_type == PT_DYNAMIC {
                 dyn_offset = Some((phdr.p_offset, phdr.p_filesz));
@@ -718,7 +765,7 @@ pub unsafe fn load_elf(data: &[u8]) -> Result<LoadedElf, ElfError> {
     unsafe {
         let phys_off = super::phys_offset();
         let mut mapper = super::paging::get_mapper();
-        load_elf_into(&mut mapper, phys_off, data)
+        load_elf_into(&mut mapper, phys_off, data, "")
     }
 }
 

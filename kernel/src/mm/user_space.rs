@@ -205,38 +205,10 @@ pub fn copy_to_user(virt_base: u64, src: &[u8]) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Set up code and stack regions for a userspace process.
-///
-/// Maps USER_CODE_PAGES pages at USER_CODE_BASE (read-write + executable, user-accessible)
-/// and USER_STACK_PAGES pages below USER_STACK_TOP (read-write, no-execute, user-accessible).
-///
-/// Code pages are mapped writable so the kernel can copy the binary before `iretq`
-/// (CR0.WP blocks ring-0 writes to read-only pages).  W^X enforcement is deferred to Phase 6+.
-///
-/// Returns `Ok(())` on success, or an error string if any mapping operation fails.
-pub unsafe fn setup_user_memory(mapper: &mut OffsetPageTable) -> Result<(), &'static str> {
-    unsafe {
-        // Code: user-accessible, present, writable (no NO_EXECUTE flag → executable).
-        // WRITABLE is required so the kernel can copy the binary into these pages
-        // before iretq (CR0.WP prevents ring-0 writes to read-only pages).
-        // W^X (write-xor-execute) enforcement is deferred to Phase 6+ when a proper
-        // ELF loader will let us separate the copy step from the execute step.
-        let code_flags =
-            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
-
-        // Stack: user-accessible, present, writable, no-execute
-        let stack_flags = PageTableFlags::PRESENT
-            | PageTableFlags::WRITABLE
-            | PageTableFlags::USER_ACCESSIBLE
-            | PageTableFlags::NO_EXECUTE;
-
-        map_user_pages(mapper, USER_CODE_BASE, USER_CODE_PAGES, code_flags)?;
-        map_user_pages(
-            mapper,
-            USER_STACK_TOP - USER_STACK_PAGES * 4096,
-            USER_STACK_PAGES,
-            stack_flags,
-        )?;
-        Ok(())
-    }
-}
+// Phase 75: the legacy `setup_user_memory` helper used to map user code
+// pages with `PRESENT | WRITABLE | USER_ACCESSIBLE` (a W+X mapping) before
+// the modern ELF loader (`mm::elf::load_elf_into`) took over every binary
+// load path. The helper carried two `// W^X enforcement is deferred to
+// Phase 6+` markers and had zero live callers by Phase 11. Removing it
+// closes the audit-§E1 W+X dead-code hazard documented in
+// `docs/roadmap/75-wx-enforcement.md`.

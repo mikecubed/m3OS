@@ -304,6 +304,13 @@ static SENDMSG_TEST_ELF: &[u8] = generated_initrd_asset!("sendmsg-test");
 // assert double-recv fails. Not a daemon: no `.conf`.
 static PAGE_GRANT_TEST_ELF: &[u8] = generated_initrd_asset!("page-grant-test");
 
+// Phase 75 Track G.1 — `wx-violation` W^X-enforcement regression:
+// mmap RW, assert `mprotect(PROT_WRITE | PROT_EXEC)` is rejected with
+// EINVAL by the new `sys_mprotect` guard, then assert the supported
+// JIT pattern `mprotect(PROT_READ | PROT_EXEC)` succeeds.  Not a daemon:
+// no `.conf`.
+static WX_VIOLATION_ELF: &[u8] = generated_initrd_asset!("wx-violation");
+
 // Phase 70 follow-up — `doom-concurrent` forks two `doom` processes
 // and waits for both. Run from the post-login shell by `cargo xtask
 // doom-concurrent-smoke` to assert real kernel-level concurrency
@@ -562,6 +569,13 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "page-grant-test",
         RamdiskNode::File {
             content: PAGE_GRANT_TEST_ELF,
+        },
+    ),
+    // Phase 75 Track G.1: wx-violation — W^X enforcement regression.
+    (
+        "wx-violation",
+        RamdiskNode::File {
+            content: WX_VIOLATION_ELF,
         },
     ),
     // Phase 70 follow-up: doom-concurrent — forks two doom children

@@ -17,6 +17,9 @@ const UDP_SMOKE_PATH: &[u8] = b"/root/udp-smoke\0";
 const PAGE_GRANT_TEST_PATH: &[u8] = b"/bin/page-grant-test\0";
 const PAGE_GRANT_TEST_ARGV0: &[u8] = b"page-grant-test\0";
 const PAGE_GRANT_PASS_NEEDLE: &[u8] = b"PAGE_GRANT_SMOKE:roundtrip:ok";
+const WX_VIOLATION_PATH: &[u8] = b"/bin/wx-violation\0";
+const WX_VIOLATION_ARGV0: &[u8] = b"wx-violation\0";
+const WX_VIOLATION_PASS_NEEDLE: &[u8] = b"WX_VIOLATION:smoke:ok";
 const CAPTURE_FILE_PATH: &[u8] = b"/tmp/smoke-runner.capture\0";
 const LOGGER_PATH: &[u8] = b"/bin/logger\0";
 const SYSTEM_LOG_PATH: &[u8] = b"/var/log/messages\0";
@@ -137,6 +140,23 @@ fn program_main(_args: &[&str]) -> i32 {
         return code;
     }
     pass("page-grant");
+
+    // Phase 75 Track G.1 — W^X enforcement regression. Validates the
+    // new `sys_mprotect` guard rejects `PROT_WRITE | PROT_EXEC`
+    // (EINVAL) and that the supported JIT pattern
+    // (`PROT_READ | PROT_EXEC`) still succeeds.
+    begin("wx-violation");
+    let wx_argv = [WX_VIOLATION_ARGV0.as_ptr(), ptr::null()];
+    if let Err(code) = run_command_expect_output(
+        "wx-violation",
+        WX_VIOLATION_PATH,
+        &wx_argv,
+        WX_VIOLATION_PASS_NEEDLE,
+        &mut command_output,
+    ) {
+        return code;
+    }
+    pass("wx-violation");
 
     write_str(STDOUT_FILENO, "SMOKE:PASS\n");
     0

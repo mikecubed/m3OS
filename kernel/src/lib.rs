@@ -436,7 +436,7 @@ fn spawn_userspace_init() {
 
     let (loaded, user_rsp) = {
         let mut mapper = unsafe { mm::mapper_for_frame(new_cr3) };
-        let loaded = unsafe { load_elf_into(&mut mapper, phys_off, data) }
+        let loaded = unsafe { load_elf_into(&mut mapper, phys_off, data, "/sbin/init") }
             .expect("[init] ELF load failed for /sbin/init");
         let user_rsp = unsafe {
             mm::elf::setup_abi_stack_with_envp(

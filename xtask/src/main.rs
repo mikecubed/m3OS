@@ -916,6 +916,12 @@ fn build_userspace_bins() {
         // Calls brk + page_grant_send + page_grant_recv + write only;
         // no Vec / Box allocator needed.
         ("page-grant-test", "page-grant-test", false),
+        // Phase 75 Track G.1 — `wx-violation` W^X enforcement regression.
+        // Allocates an RW anonymous page, asserts
+        // `mprotect(PROT_WRITE | PROT_EXEC)` is rejected with EINVAL,
+        // and asserts the JIT pattern (`PROT_READ | PROT_EXEC`)
+        // succeeds. Pure syscall+write — no allocator.
+        ("wx-violation", "wx-violation", false),
         // Phase 70 follow-up — `doom-concurrent` forks two `doom`
         // children and waits for both, so the
         // `doom-concurrent-smoke` gate exercises real concurrency
@@ -5214,6 +5220,14 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         pattern: "SMOKE:page-grant:PASS",
         timeout_secs: 30,
         label: "guest/page-grant: smoke runner verified page-grant round-trip",
+    });
+    // Phase 75 Track G.1 — W^X enforcement regression. Boot-time smoke
+    // that proves `mprotect(PROT_WRITE | PROT_EXEC)` returns EINVAL and
+    // that the JIT pattern (`PROT_READ | PROT_EXEC`) still succeeds.
+    steps.push(SmokeStep::Wait {
+        pattern: "SMOKE:wx-violation:PASS",
+        timeout_secs: 20,
+        label: "guest/wx-violation: smoke runner verified W^X mprotect guard",
     });
     steps.push(SmokeStep::Wait {
         pattern: "SMOKE:PASS",
