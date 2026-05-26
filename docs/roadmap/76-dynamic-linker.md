@@ -4,7 +4,7 @@
 **Source Ref:** phase-76
 **Depends on:** Phase 11 (Process Model) ✅, Phase 12 (POSIX Compatibility) ✅, Phase 75 (W^X Enforcement) ✅, Phase 31 (TCC Compiler Bootstrap) ✅
 **Builds on:** Extends the Phase 11 ELF loader to honor `PT_INTERP`, bringing up musl's `ld.so` as the runtime linker and enabling shared library (`DT_NEEDED`) resolution for the first time
-**Primary Components:** `kernel/src/elf/`, `userspace/` (ld.so port), `xtask/src/main.rs`, `userspace/syscall-lib`
+**Primary Components:** `kernel/src/elf/`, `userspace/ld-musl-x86_64.so.1/`, `xtask/src/main.rs`, `userspace/syscall-lib`, `userspace/tests/dynlink_hello/`, `userspace/tests/dlopen_test/`
 
 ## Milestone Goal
 
@@ -81,15 +81,17 @@ A new `build_shared_lib(name, srcs, output)` helper in `xtask/src/main.rs`. For 
 ## Implementation Outline
 
 1. Add `PT_INTERP` detection and interpreter loading to `kernel/src/elf/loader.rs`
-2. Implement auxiliary vector construction and stack setup for the interpreter entry path
-3. Port musl `ldso` or write a fresh dynamic linker; build it as a static-position-independent ELF (`-pie`) placed at `/lib/ld-musl-x86_64.so.1` on the data disk
-4. Implement `DT_NEEDED` resolution, dependency graph construction, and topological load order
-5. Implement x86_64 relocation types: `R_X86_64_GLOB_DAT`, `R_X86_64_JUMP_SLOT`, `R_X86_64_RELATIVE`, `R_X86_64_64`
-6. Implement PLT lazy-resolution trampoline (`_dl_runtime_resolve`)
-7. Implement `dlopen`/`dlsym`/`dlclose` on top of the linker's symbol table
-8. Add `.so` build support to `xtask`; build `libhello.so` test library
-9. Write `dynlink_hello` and `dlopen_test` test binaries; register in xtask and ramdisk
-10. Update Phase 11 and Phase 12 design docs; mark dynamic-linking deferrals as closed
+2. Implement auxiliary vector construction and stack setup for the interpreter entry path (SysV-ABI `argc / argv / NULL / envp / NULL / auxv / AT_NULL` ordering, 16-byte aligned `rsp`)
+3. Scaffold the `userspace/ld-musl-x86_64.so.1/` crate: `no_std`, `-fPIC` / `-Crelocation-model=pic`, output `ET_DYN` ELF; wire into `xtask::build_userspace` and stage to `target/generated-libs/`
+4. Port musl `ldso` or write a fresh dynamic linker inside that crate; copy the resulting binary to `/lib/ld-musl-x86_64.so.1` on the ext2 data disk via `populate_ext2_files`
+5. Implement `DT_NEEDED` resolution, dependency graph construction, and topological load order
+6. Implement x86_64 relocation types: `R_X86_64_GLOB_DAT`, `R_X86_64_JUMP_SLOT`, `R_X86_64_RELATIVE`, `R_X86_64_64`
+7. Implement PLT lazy-resolution trampoline (`_dl_runtime_resolve`)
+8. Implement `dlopen`/`dlsym`/`dlclose` on top of the linker's symbol table
+9. Add `.so` build support to `xtask`; build `libhello.so` test library
+10. Write `dynlink_hello` and `dlopen_test` test binaries; register in xtask and ramdisk
+11. Update Phase 11 and Phase 12 design docs; mark dynamic-linking deferrals as closed
+12. Bump the kernel version to 0.76.0 and author `docs/76-dynamic-linker.md` learning doc
 
 ## Acceptance Criteria
 
