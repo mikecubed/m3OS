@@ -27,7 +27,7 @@
 
 **Acceptance:**
 - [x] `HandleTable::insert(dso_id) -> *mut c_void` returns an opaque pointer to a `Handle { dso_id, generation }` record.
-- [x] `HandleTable::resolve(handle: *mut c_void) -> Option<DsoId>` returns `None` for forged handles, already-freed handles, or handles whose generation does not match the live DSO's generation.
+- [x] `HandleTable::resolve(handle: *mut c_void) -> Result<DsoId, HandleError>` returns `Err` for forged handles, already-freed handles, or handles whose generation does not match the live DSO's generation.
 - [x] Unit-tested under `#[cfg(test)]` with insert / resolve / remove / re-insert-bumps-generation fixtures.
 
 ### C1.2 — `dlopen` entry, path resolution, flag parsing
@@ -39,8 +39,8 @@
 **Acceptance:**
 - [x] `extern "C" fn dlopen(path: *const c_char, flags: c_int) -> *mut c_void`.
 - [x] `path = NULL` returns a handle to the main binary.
-- [x] Path with no `/` searches the standard load paths (matches 76b's `LD_LIBRARY_PATH` / `/lib` / `/usr/lib` / `/usr/local/lib` order).
-- [x] Path with `/` is treated as absolute (or relative-to-CWD; POSIX allows either — m3OS chooses absolute).
+- [x] Bare-name path (no leading `/`) is resolved under `/usr/lib/` only in Phase 76c. The full `LD_LIBRARY_PATH` / `/lib` / `/usr/lib` / `/usr/local/lib` search chain is deferred to a follow-up phase; non-absolute inputs that include `/` (e.g. `./libx.so`) are still treated as bare basenames and prefixed with `/usr/lib/`.
+- [x] Path whose first byte is `/` is treated as absolute and used as-is.
 - [x] `RTLD_NOW` triggers `apply_jmprel_table` at open time; `RTLD_LAZY` is accepted but treated as `RTLD_NOW` in 76c (PLT lazy resolve is 76d).
 - [x] `RTLD_GLOBAL` inserts the DSO into the process-global scope; `RTLD_LOCAL` (default) does not.
 
@@ -104,7 +104,7 @@
 **Why it matters:** The libdl contract requires that error messages survive across libdl calls but are cleared by `dlerror()` itself; getting the read-and-clear ordering wrong breaks error-checking idioms.
 
 **Acceptance:**
-- [x] `DlError` is a `Mutex<Option<&'static str>>` (or equivalent) accessed under the same `DlState` lock as the handle table.
+- [x] Error state lives on `DlState` itself: an `error: Option<&'static [u8]>` slot for the static message bank (`ERR_LIBRARY_NOT_FOUND`, …) plus a `error_buf: [u8; MAX_ERR_LEN]` formatting buffer for the per-symbol `"undefined symbol: <name>"` shape. `DlState` is held in a process-global `UnsafeCell` (no `Mutex`) — Phase 76c is single-threaded and a `Mutex` upgrade is gated on TLS.
 - [x] `dlerror()` reads the current message, clears the slot, returns the message (or `NULL` if there was none).
 - [x] Documented as not-yet-thread-safe in `docs/76-dynamic-linker.md` (the thread-local upgrade is gated on TLS).
 
@@ -150,7 +150,7 @@
 **Why it matters:** `DT_FINI_ARRAY` is the most subtle part of `dlclose` and the easiest to silently skip; the gate must explicitly verify destructor invocation with a serial ordering pin that cannot be satisfied by a no-op.
 
 **Acceptance:**
-- [x] `userspace/lib/libhello_fini/hello_fini.{h,c}` source mirrors the 76b `libhello` shape (`DT_SONAME=libhello_fini.so`, built with `--hash-style=sysv` per Documentation Notes); a `__attribute__((destructor))` function writes `LIBHELLO_FINI:RAN\n` directly to stderr via `write(2)` (not `printf` — avoids dependence on stdio flush on DSO unmap).
+- [x] `userspace/lib/libhello_fini/hello_fini.{h,c}` source mirrors the 76b `libhello` shape (`DT_SONAME=libhello_fini.so`, built with `--hash-style=sysv` per Documentation Notes); a `__attribute__((destructor))` function writes `LIBHELLO_FINI:RAN\n` directly to **stdout (fd 1) via `write(2)`** (not stderr; not `printf` — avoids dependence on stdio flush on DSO unmap). Writing to fd 1 keeps the destructor sentinel in the same capture stream as the bracket sentinels because m3OS's `dup2` does not share the file description between fd 1 and fd 2.
 - [x] xtask wiring calls `build_shared_lib("libhello_fini", &["userspace/lib/libhello_fini/hello_fini.c"], "target/generated-libs/libhello_fini.so")`; `populate_ext2_files` writes it to `/usr/lib/libhello_fini.so`; kernel ramdisk `USR_LIB_ENTRIES` gains the matching row.
 - [x] `dlopen_test` prints `DLOPEN_TEST:FINI_PENDING` *before* its `dlclose(libhello_fini)` call and `DLOPEN_TEST:PASS` *after* every assertion.
 - [x] Smoke-runner asserts the serial substring order `DLOPEN_TEST:FINI_PENDING` → `LIBHELLO_FINI:RAN` → `DLOPEN_TEST:PASS` strictly (a missing `LIBHELLO_FINI:RAN` between the two bracket sentinels is a `:FAIL`).
@@ -220,7 +220,7 @@
 ## Documentation Notes
 
 - The original (pre-split) Phase 76 task list's C.1 / C.2 / F.2 acceptance items migrate here verbatim, restructured to match the per-track template.
-- `dlerror()` storage uses a process-global `static mut` slot (wrapped in `Mutex`) until TLS lands; the deferred-TLS rationale is recorded in `docs/76-dynamic-linker.md`.
+- `dlerror()` storage uses a process-global `UnsafeCell<DlState>` slot (no `Mutex` — Phase 76c is single-threaded) until TLS lands; the deferred-TLS rationale is recorded in `docs/76-dynamic-linker.md`.
 - 76c uses `DT_HASH` only — 76d switches `dlsym` to prefer `DT_GNU_HASH`. Libraries opened via `dlopen` in 76c must therefore be built with `--hash-style=sysv` (matching the 76b convention).
 - 76c kernel version is `0.76.2` (patch); 76d will continue the patch sequence with `0.76.3`.
 - The 76c learning content is added to the existing `docs/76-dynamic-linker.md` (created in Phase 76 and extended by 76b); no new learning doc is created.

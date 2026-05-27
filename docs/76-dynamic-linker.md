@@ -273,7 +273,7 @@ is single-threaded; the thread-safety upgrade is gated on TLS. The
 `DlState` carries:
 
 - `dsos: [LoadedDso; MAX_SLOTS]` — slot-indexed DSO table.
-- `names: [&'static [u8]; MAX_SLOTS]` — SONAME per slot for `find_by_soname` dedup.
+- `name_storage: [[u8; MAX_NAME_LEN]; MAX_SLOTS]` + `name_lens: [u8; MAX_SLOTS]` — linker-owned per-slot SONAME buffer (so dedup never aliases caller memory or about-to-be-unmapped DSO bytes). Names are interned via `DlState::intern_name` and read back via `DlState::name(idx)`.
 - `dep_lists: [heapless::Vec<DsoId, MAX_SLOTS>; MAX_SLOTS]` — dependency edges for `dlsym`'s walk.
 - `refcounts: [u32; MAX_SLOTS]` — `0` means free slot; `REFCOUNT_PERMANENT == u32::MAX` for main / linker / bring-up `DT_NEEDED` libs (`dlclose` never unmaps them).
 - `in_global_scope: [bool; MAX_SLOTS]` — `RTLD_GLOBAL` visibility.

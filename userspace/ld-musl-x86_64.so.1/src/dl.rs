@@ -89,6 +89,7 @@ pub const ERR_INVALID_HANDLE: &[u8] = b"invalid handle\0";
 pub const ERR_HANDLE_TABLE_FULL: &[u8] = b"handle table full\0";
 pub const ERR_TOO_MANY_DSOS: &[u8] = b"too many loaded DSOs\0";
 pub const ERR_BAD_PATH: &[u8] = b"invalid path\0";
+pub const ERR_UNMAP_FAILED: &[u8] = b"unmap failed\0";
 
 /// Prefix used when `dlsym` formats the per-symbol error message.
 /// Mirrors the conventional libdl `"undefined symbol: <name>"` shape
@@ -409,11 +410,11 @@ pub unsafe extern "C" fn dlopen(path: *const c_char, flags: c_int) -> *mut c_voi
         PREFIX.len() + name_bytes.len() + 1
     };
 
-    // Reserve a slot before loading so a load failure doesn't waste
-    // the slot — actually we do load first, then commit, so a partial
-    // load can be rolled back.
-    let _ = path_len;
-    let loaded = match unsafe { runtime::load_dso_for_dl(&path_buf) } {
+    // Load first, then commit a slot so a partial load can be rolled
+    // back without consuming slot state. Pass a NUL-bounded slice so
+    // the downstream loader doesn't need to re-scan the 320-byte
+    // buffer.
+    let loaded = match unsafe { runtime::load_dso_for_dl(&path_buf[..path_len]) } {
         Ok(d) => d,
         Err(DlLoadError::NotFound) => {
             state.set_error(ERR_LIBRARY_NOT_FOUND);
@@ -428,9 +429,11 @@ pub unsafe extern "C" fn dlopen(path: *const c_char, flags: c_int) -> *mut c_voi
     let id = match state.allocate_slot() {
         Some(id) => id,
         None => {
-            // Loaded DSO is leaked — Phase 76c does not unmap on
-            // slot-allocation failure because the allocator never
-            // hits this path with the MAX_DSOS = 32 cap.
+            // Out of slots — unmap the freshly-loaded DSO so its
+            // address space is not leaked. `MAX_DSOS = 32` makes
+            // this path unlikely in practice, but the rollback keeps
+            // the contract honest for callers that hit the cap.
+            let _ = unmap_dso(&loaded, crate::sys_munmap);
             state.set_error(ERR_TOO_MANY_DSOS);
             return core::ptr::null_mut();
         }
@@ -577,20 +580,30 @@ pub unsafe extern "C" fn dlclose(handle: *mut c_void) -> c_int {
     // own data are safe up to the return-from-destructor moment.
     unsafe { runtime::run_destructors_for(&dso) };
 
-    if let Err(e) = unmap_dso(&dso, crate::sys_munmap) {
-        // The DSO is conceptually gone (slot evicted) but the kernel
-        // may still hold its pages. Log the munmap failure on serial
-        // — it indicates a real bug. The name buffer is still
-        // populated; clear it after we've logged the name.
-        let _ = e;
-        crate::serial(b"ldso: dlclose: unmap failed for ");
-        crate::serial(&state.name_storage[idx][..dso_name_len]);
-        crate::serial(b"\n");
-    }
+    let unmap_result = unmap_dso(&dso, crate::sys_munmap);
+    let return_code = match unmap_result {
+        Ok(()) => 0,
+        Err(e) => {
+            // The DSO is conceptually gone (slot evicted) but the
+            // kernel may still hold its pages. Log the failure on
+            // serial *before* clearing the name buffer so the
+            // diagnostic carries the real DSO name, and surface the
+            // error through `dlerror()` so callers can detect it —
+            // the contract is `0` on success, `-1` on failure.
+            let prefix: &[u8] = match e {
+                UnmapError::EmptyImage => b"ldso: dlclose: unmap failed (empty image) for ",
+                UnmapError::MunmapFailed(_) => b"ldso: dlclose: unmap failed for ",
+            };
+            crate::serial(prefix);
+            crate::serial(&state.name_storage[idx][..dso_name_len]);
+            crate::serial(b"\n");
+            state.set_error(ERR_UNMAP_FAILED);
+            -1
+        }
+    };
     state.clear_name(idx);
-    let _: UnmapError = UnmapError::EmptyImage; // keep variant alive
 
-    0
+    return_code
 }
 
 /// Return the last libdl error message, or `NULL` if none. Clears
