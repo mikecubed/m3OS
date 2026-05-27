@@ -283,7 +283,11 @@ unsafe fn dl_relocate_self(phdr_base: *const Phdr, phnum: usize, load_bias: u64)
         if t == R_X86_64_RELATIVE {
             let target = (load_bias.wrapping_add(r.r_offset)) as *mut u64;
             let value = load_bias.wrapping_add(r.r_addend as u64);
-            unsafe { core::ptr::write(target, value) };
+            // `write_unaligned` keeps this safe even if a malformed
+            // (or future tooling-generated) RELA in the linker's own
+            // image carries a non-8-byte-aligned `r_offset`. Rust's
+            // aligned `ptr::write` would be UB in that case.
+            unsafe { core::ptr::write_unaligned(target, value) };
         } else {
             // Any other relocation type in the linker's own image is
             // a build-time bug — the bring-up linker is built with
@@ -424,7 +428,17 @@ enum LoadError {
 unsafe fn load_dso(path_bytes: &[u8]) -> Result<LoadedDso, LoadError> {
     let fd = sys_open(path_bytes);
     if fd < 0 {
-        return Err(LoadError::NotFound);
+        // m3OS `sys_open` follows the Linux ABI and returns `-errno`
+        // on failure. Distinguish ENOENT (the DT_NEEDED file genuinely
+        // doesn't exist — caller maps this to `exit(ENOENT)`) from
+        // every other open failure (EACCES, EINVAL, ENFILE, etc.) so
+        // diagnostics stay accurate. The caller currently exits with
+        // ENOENT_CODE on both variants, but a richer error string for
+        // `Other` makes serial-log triage tractable.
+        if fd == -(ENOENT_CODE as i64) {
+            return Err(LoadError::NotFound);
+        }
+        return Err(LoadError::Other("open failed"));
     }
     let scratch_len: u64 = 64 * 1024;
     let scratch = sys_mmap(
@@ -666,7 +680,10 @@ unsafe fn apply_rela(
         match rt {
             R_X86_64_RELATIVE => {
                 let value = dso.load_bias.wrapping_add(r.r_addend as u64);
-                unsafe { core::ptr::write(target, value) };
+                // See dl_relocate_self: `write_unaligned` avoids UB on
+                // malformed (or future-tooling) RELAs whose `r_offset`
+                // is not 8-byte aligned.
+                unsafe { core::ptr::write_unaligned(target, value) };
             }
             R_X86_64_GLOB_DAT | R_X86_64_JUMP_SLOT => {
                 if strtab.is_null() || symtab.is_null() {
@@ -682,7 +699,7 @@ unsafe fn apply_rela(
                     serial(b"\n");
                     return Err("undefined symbol");
                 }
-                unsafe { core::ptr::write(target, value) };
+                unsafe { core::ptr::write_unaligned(target, value) };
             }
             R_X86_64_64 => {
                 if strtab.is_null() || symtab.is_null() {

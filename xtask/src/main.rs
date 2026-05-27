@@ -1356,9 +1356,14 @@ fn build_shared_lib(name: &str, srcs: &[&str], output: &Path) -> io::Result<()> 
 }
 
 /// Phase 76b — build `libhello.so` and stage it under
-/// `target/generated-libs/`. Falls back to a zero-byte placeholder if
-/// the toolchain is missing so the kernel ramdisk `include_bytes!`
-/// path always resolves; the runtime smoke gate then SKIPs.
+/// `target/generated-libs/`. Mirrors `build_dynlink_smoke`'s error
+/// policy:
+///   * `ErrorKind::NotFound` (toolchain missing) — write a zero-byte
+///     placeholder so the kernel ramdisk `include_bytes!` path still
+///     resolves; the runtime smoke gate then SKIPs.
+///   * any other failure (compile/link error, permission denied, etc.)
+///     is treated as fatal so a previous successful build's binary
+///     cannot survive into the next smoke run and falsely PASS.
 fn build_libhello() {
     let root = workspace_root();
     let libs = ensure_generated_libs_dir(&root);
@@ -1367,9 +1372,24 @@ fn build_libhello() {
     let src_str = src.to_str().expect("non-UTF-8 path");
     match build_shared_lib("libhello", &[src_str], &dst) {
         Ok(()) => {}
-        Err(e) => {
-            eprintln!("warning: libhello.so build failed ({e}) — writing placeholder");
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "warning: libhello.so toolchain missing ({e}) — writing \
+                 placeholder. The dynlink-hello-smoke gate will SKIP at runtime."
+            );
+            // Force-overwrite so a stale binary from a previous
+            // successful build cannot be picked up later.
             let _ = fs::write(&dst, b"");
+        }
+        Err(e) => {
+            eprintln!(
+                "error: libhello.so build failed ({e}). The toolchain is \
+                 available but the source/link did not produce a valid \
+                 shared library — treating as a hard build error so a \
+                 stale binary cannot let the smoke gate falsely PASS."
+            );
+            let _ = fs::write(&dst, b"");
+            std::process::exit(1);
         }
     }
 }
@@ -1434,6 +1454,16 @@ fn build_dynlink_hello() {
     cmd.arg(lib.to_str().expect("non-UTF-8 path"));
     cmd.arg("-o").arg(dst.to_str().expect("non-UTF-8 path"));
 
+    // Error policy mirrors `build_dynlink_smoke`:
+    //   * Compiler ran but exited non-zero → FATAL. A working toolchain
+    //     that fails to compile means the source/link flags are broken;
+    //     keeping a placeholder would let the smoke gate falsely PASS
+    //     against the previous build's stale artifact.
+    //   * `Err(NotFound)` → SKIP-eligible (toolchain disappeared mid-build,
+    //     unlikely after the earlier `find_musl_cc()` probe but handled
+    //     for completeness).
+    //   * Any other invoke error → FATAL for the same reason as a
+    //     non-zero exit.
     match cmd.output() {
         Ok(out) if out.status.success() => {
             println!("dynlink_hello: built → {}", dst.display());
@@ -1441,14 +1471,30 @@ fn build_dynlink_hello() {
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
             eprintln!(
-                "warning: dynlink_hello build failed (exit {}): {stderr}",
+                "error: dynlink_hello build failed (exit {}): {stderr}. \
+                 The toolchain is available but the source/link did not \
+                 produce a valid binary — treating as a hard build error \
+                 so a stale binary cannot let the smoke gate falsely PASS.",
                 out.status.code().unwrap_or(-1)
+            );
+            let _ = fs::write(&dst, b"");
+            std::process::exit(1);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "warning: {cc} not found mid-build — skipping dynlink_hello. \
+                 The dynlink-hello-smoke gate will SKIP at runtime."
             );
             let _ = fs::write(&dst, b"");
         }
         Err(e) => {
-            eprintln!("warning: failed to invoke {cc} for dynlink_hello: {e}");
+            eprintln!(
+                "error: failed to invoke {cc} for dynlink_hello: {e}. Not a \
+                 missing-binary error — treating as a hard environment \
+                 problem so the developer notices."
+            );
             let _ = fs::write(&dst, b"");
+            std::process::exit(1);
         }
     }
 }
@@ -11837,6 +11883,11 @@ fn populate_ext2_files(
             staged_libs.push((name, path));
         }
     }
+    // `read_dir` order depends on the host filesystem's inode/dirent
+    // ordering, which would make the resulting ext2 image
+    // byte-nondeterministic across hosts and across rebuilds. Sort by
+    // filename so `cargo xtask image` produces a reproducible disk.
+    staged_libs.sort_by(|a, b| a.0.cmp(&b.0));
     let mut shared_libs_cmds = String::new();
     if !staged_libs.is_empty() {
         shared_libs_cmds.push_str(
