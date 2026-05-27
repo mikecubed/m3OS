@@ -1453,6 +1453,293 @@ fn build_dynlink_hello() {
     }
 }
 
+/// Phase 76b F1.4 — build the cycle-test shared libs `libcyca.so`
+/// and `libcycb.so` with mutual `DT_NEEDED` entries. The cycle is
+/// created by a three-step build:
+///
+/// 1. `libcyca_stub.so` — `cyca.c_stub` returning 0, no DT_NEEDED.
+///    Built first so libcycb.so has something to link against.
+/// 2. `libcycb.so` — `cycb.c` linked against `libcyca_stub.so`, so
+///    its DT_NEEDED records `libcyca.so`.
+/// 3. `libcyca.so` — `cyca.c` (calls cycb_func) linked against
+///    `libcycb.so`, so its DT_NEEDED records `libcycb.so`. This
+///    final binary REPLACES `libcyca_stub.so` and is the one staged
+///    on disk; together with `libcycb.so` it closes the cycle.
+///
+/// `libcyca_stub.so` is intentionally never staged — it exists only
+/// as a link-time placeholder under `target/cycle-stub/`.
+fn build_cycle_libs() -> Result<(), io::Error> {
+    let root = workspace_root();
+    let libs = ensure_generated_libs_dir(&root);
+    let stub_dir = root.join("target/cycle-stub");
+    fs::create_dir_all(&stub_dir)?;
+
+    let cc = find_musl_cc()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "musl cross-compiler missing"))?;
+
+    let cyca_src = root.join("userspace/lib/libcyca/cyca.c");
+    let cyca_stub_src = root.join("userspace/lib/libcyca/cyca_stub.c");
+    let cycb_src = root.join("userspace/lib/libcycb/cycb.c");
+    let stub_so = stub_dir.join("libcyca.so");
+    let cycb_so = libs.join("libcycb.so");
+    let cyca_so = libs.join("libcyca.so");
+
+    // Step 1: build libcyca_stub.so with SONAME=libcyca.so.
+    {
+        let mut cmd = Command::new(cc);
+        cmd.args([
+            "-shared",
+            "-fPIC",
+            "-O2",
+            "-nostdlib",
+            "-Wl,--hash-style=sysv",
+            "-Wl,-soname,libcyca.so",
+        ]);
+        cmd.arg(cyca_stub_src.to_str().unwrap());
+        cmd.arg("-o").arg(&stub_so);
+        let out = cmd.output()?;
+        if !out.status.success() {
+            eprintln!(
+                "libcyca_stub.so build failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return Err(io::Error::other("stub build failed"));
+        }
+    }
+
+    // Step 2: build libcycb.so linking against libcyca_stub.so.
+    {
+        let mut cmd = Command::new(cc);
+        cmd.args([
+            "-shared",
+            "-fPIC",
+            "-O2",
+            "-nostdlib",
+            "-Wl,--hash-style=sysv",
+            "-Wl,-soname,libcycb.so",
+            "-Wl,--no-as-needed",
+        ]);
+        cmd.arg(format!("-L{}", stub_dir.display()));
+        cmd.arg(cycb_src.to_str().unwrap());
+        cmd.arg("-lcyca");
+        cmd.arg("-o").arg(&cycb_so);
+        let out = cmd.output()?;
+        if !out.status.success() {
+            eprintln!(
+                "libcycb.so build failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return Err(io::Error::other("libcycb build failed"));
+        }
+    }
+
+    // Step 3: build the final libcyca.so linking against libcycb.so
+    // (so its DT_NEEDED records libcycb.so and the cycle closes).
+    {
+        let mut cmd = Command::new(cc);
+        cmd.args([
+            "-shared",
+            "-fPIC",
+            "-O2",
+            "-nostdlib",
+            "-Wl,--hash-style=sysv",
+            "-Wl,-soname,libcyca.so",
+            "-Wl,--no-as-needed",
+        ]);
+        cmd.arg(format!("-L{}", libs.display()));
+        cmd.arg(cyca_src.to_str().unwrap());
+        cmd.arg("-lcycb");
+        cmd.arg("-o").arg(&cyca_so);
+        let out = cmd.output()?;
+        if !out.status.success() {
+            eprintln!(
+                "libcyca.so build failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return Err(io::Error::other("libcyca build failed"));
+        }
+    }
+    println!(
+        "cycle-libs: {} + {} (with mutual DT_NEEDED) staged in {}",
+        cyca_so.display(),
+        cycb_so.display(),
+        libs.display()
+    );
+    Ok(())
+}
+
+/// Phase 76b F1.4 — build the `libdoesnotexist.so` stub used at
+/// link-time by `dynlink_missing` to inject the `DT_NEEDED =
+/// libdoesnotexist.so` entry. The stub lives under
+/// `target/missing-stub/` and is NEVER staged on disk, so at runtime
+/// the bring-up linker hits ENOENT for the path.
+fn build_missing_stub() -> Result<PathBuf, io::Error> {
+    let root = workspace_root();
+    let stub_dir = root.join("target/missing-stub");
+    fs::create_dir_all(&stub_dir)?;
+    let cc = find_musl_cc()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "musl cross-compiler missing"))?;
+    let src = stub_dir.join("doesnotexist_stub.c");
+    fs::write(&src, b"int doesnotexist_sym = 0;\n")?;
+    let stub_so = stub_dir.join("libdoesnotexist.so");
+    let mut cmd = Command::new(cc);
+    cmd.args([
+        "-shared",
+        "-fPIC",
+        "-O2",
+        "-nostdlib",
+        "-Wl,--hash-style=sysv",
+        "-Wl,-soname,libdoesnotexist.so",
+    ]);
+    cmd.arg(&src);
+    cmd.arg("-o").arg(&stub_so);
+    let out = cmd.output()?;
+    if !out.status.success() {
+        eprintln!(
+            "libdoesnotexist stub build failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return Err(io::Error::other("missing-stub build failed"));
+    }
+    Ok(stub_dir)
+}
+
+/// Phase 76b F1.4 — build `dynlink_missing`: a dynamic ELF whose
+/// `DT_NEEDED` names `libdoesnotexist.so`. At runtime the bring-up
+/// linker fails to open `/usr/lib/libdoesnotexist.so`, prints an
+/// error, and `exit(2)` (ENOENT).
+fn build_dynlink_missing() {
+    let root = workspace_root();
+    let initrd = ensure_generated_initrd_dir(&root);
+    let dst = initrd.join("dynlink_missing");
+    let src = root.join("userspace/dynlink_missing/dynlink_missing.c");
+
+    let stub_dir = match build_missing_stub() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("warning: dynlink_missing skipped (stub build failed: {e})");
+            let _ = fs::write(&dst, b"");
+            return;
+        }
+    };
+    let cc = match find_musl_cc() {
+        Some(c) => c,
+        None => {
+            eprintln!("warning: musl-gcc missing — skipping dynlink_missing");
+            let _ = fs::write(&dst, b"");
+            return;
+        }
+    };
+    let mut cmd = Command::new(cc);
+    cmd.args([
+        "-nostdlib",
+        "-nostartfiles",
+        "-fno-stack-protector",
+        "-fno-pie",
+        "-no-pie",
+        "-fPIC",
+        "-Wl,-pie",
+        "-Wl,-dynamic-linker=/lib/ld-musl-x86_64.so.1",
+        "-Wl,--hash-style=sysv",
+        "-Wl,-rpath,/usr/lib",
+        "-Wl,--no-as-needed",
+        "-Wl,--no-eh-frame-hdr",
+        "-O2",
+        "-fno-builtin",
+    ]);
+    cmd.arg(format!("-L{}", stub_dir.display()));
+    cmd.arg(src);
+    cmd.arg("-ldoesnotexist");
+    cmd.arg("-o").arg(&dst);
+    match cmd.output() {
+        Ok(o) if o.status.success() => {
+            println!("dynlink_missing: built → {}", dst.display());
+        }
+        Ok(o) => {
+            eprintln!(
+                "warning: dynlink_missing build failed (exit {}): {}",
+                o.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            let _ = fs::write(&dst, b"");
+        }
+        Err(e) => {
+            eprintln!("warning: failed to invoke {cc}: {e}");
+            let _ = fs::write(&dst, b"");
+        }
+    }
+}
+
+/// Phase 76b F1.4 — build `dynlink_cycle`: a dynamic ELF whose
+/// `DT_NEEDED` names `libcyca.so`, where libcyca.so ↔ libcycb.so
+/// have mutual DT_NEEDED entries. At runtime the linker detects the
+/// cycle via topo_sort and `exit(80)` (ELIBBAD).
+fn build_dynlink_cycle() {
+    let root = workspace_root();
+    let initrd = ensure_generated_initrd_dir(&root);
+    let libs = ensure_generated_libs_dir(&root);
+    let dst = initrd.join("dynlink_cycle");
+    let src = root.join("userspace/dynlink_cycle/dynlink_cycle.c");
+
+    if let Err(e) = build_cycle_libs() {
+        eprintln!("warning: cycle libs skipped: {e}");
+        let _ = fs::write(&dst, b"");
+        return;
+    }
+    let cc = match find_musl_cc() {
+        Some(c) => c,
+        None => {
+            eprintln!("warning: musl-gcc missing — skipping dynlink_cycle");
+            let _ = fs::write(&dst, b"");
+            return;
+        }
+    };
+    let mut cmd = Command::new(cc);
+    cmd.args([
+        "-nostdlib",
+        "-nostartfiles",
+        "-fno-stack-protector",
+        "-fno-pie",
+        "-no-pie",
+        "-fPIC",
+        "-Wl,-pie",
+        "-Wl,-dynamic-linker=/lib/ld-musl-x86_64.so.1",
+        "-Wl,--hash-style=sysv",
+        "-Wl,-rpath,/usr/lib",
+        "-Wl,--no-as-needed",
+        "-Wl,--no-eh-frame-hdr",
+        "-O2",
+        "-fno-builtin",
+    ]);
+    cmd.arg(format!("-L{}", libs.display()));
+    cmd.arg(format!("-Wl,-rpath-link={}", libs.display()));
+    // Allow undefined references — `cyca_func` chains into libcycb's
+    // `cycb_func` which is intentionally absent at runtime when the
+    // cycle gate trips. The link uses --unresolved-symbols to leave
+    // the references for the dynamic linker.
+    cmd.arg("-Wl,--unresolved-symbols=ignore-in-shared-libs");
+    cmd.arg(src);
+    cmd.arg("-lcyca");
+    cmd.arg("-o").arg(&dst);
+    match cmd.output() {
+        Ok(o) if o.status.success() => {
+            println!("dynlink_cycle: built → {}", dst.display());
+        }
+        Ok(o) => {
+            eprintln!(
+                "warning: dynlink_cycle build failed (exit {}): {}",
+                o.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            let _ = fs::write(&dst, b"");
+        }
+        Err(e) => {
+            eprintln!("warning: failed to invoke {cc}: {e}");
+            let _ = fs::write(&dst, b"");
+        }
+    }
+}
+
 /// Compile Phase 12 musl-linked C binaries and stage them under target/generated-initrd/.
 ///
 /// Requires `musl-gcc` on the host PATH (package `musl-tools` on Debian/Ubuntu).
@@ -2693,6 +2980,9 @@ fn build_kernel() -> PathBuf {
     // target/generated-initrd/ for the ext2 disk + ramdisk paths.
     build_libhello();
     build_dynlink_hello();
+    // Phase 76b F1.4 — negative gates.
+    build_dynlink_missing();
+    build_dynlink_cycle();
     build_musl_bins();
     // Phase 44: cross-compile musl-linked Rust userspace programs.
     build_musl_rust_bins();
@@ -3824,6 +4114,9 @@ fn cmd_check() {
     // target/generated-initrd/ for the ext2 disk + ramdisk paths.
     build_libhello();
     build_dynlink_hello();
+    // Phase 76b F1.4 — negative gates.
+    build_dynlink_missing();
+    build_dynlink_cycle();
     build_musl_bins();
     // Phase 44: cross-compile musl-linked Rust userspace programs.
     build_musl_rust_bins();
@@ -5598,6 +5891,24 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         pattern_b: "SMOKE:dynlink-hello-smoke:SKIP",
         timeout_secs: 30,
         label: "guest/dynlink-hello-smoke: full bring-up linker resolves libhello.so",
+        extra_steps_a: &[],
+        extra_steps_b: &[],
+    });
+    // Phase 76b F1.4 — missing-dep negative gate.
+    steps.push(SmokeStep::WaitEither {
+        pattern_a: "SMOKE:dynlink-missing-smoke:PASS",
+        pattern_b: "SMOKE:dynlink-missing-smoke:SKIP",
+        timeout_secs: 30,
+        label: "guest/dynlink-missing-smoke: missing DT_NEEDED → ENOENT",
+        extra_steps_a: &[],
+        extra_steps_b: &[],
+    });
+    // Phase 76b F1.4 — circular-dep negative gate.
+    steps.push(SmokeStep::WaitEither {
+        pattern_a: "SMOKE:dynlink-cycle-smoke:PASS",
+        pattern_b: "SMOKE:dynlink-cycle-smoke:SKIP",
+        timeout_secs: 30,
+        label: "guest/dynlink-cycle-smoke: cyclic DT_NEEDED → ELIBBAD",
         extra_steps_a: &[],
         extra_steps_b: &[],
     });

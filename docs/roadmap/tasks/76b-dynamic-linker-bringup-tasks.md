@@ -1,6 +1,6 @@
 # Phase 76b — Dynamic Linker: `DT_NEEDED` Resolution + Relocations: Task List
 
-**Status:** In Progress — host-tested core + scaffolding complete; runtime DSO-load path partial
+**Status:** **Complete** — all tracks shipped, all smoke gates PASS (dynlink-hello-smoke + dynlink-missing-smoke + dynlink-cycle-smoke), 23/23 host tests green
 **Source Ref:** phase-76b
 **Depends on:** Phase 76 ✅
 **Goal:** Replace the Phase 76 transfer-only `_dlstart` stub with a real bring-up linker that resolves `DT_NEEDED`, applies the four core x86_64 relocations, runs constructors, and supports building `.so` files in `xtask`.
@@ -9,13 +9,13 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| B1 | `_dlstart` self-relocation in inline asm before any Rust global access | Phase 76 ✅ | **Implemented** (asm entry + `dl_relocate_self` + host-tested `apply_relative`; runtime self-reloc confirmed in QEMU via the existing `dynlink-smoke` gate) |
-| B2 | `PT_DYNAMIC` parser + `DT_NEEDED` dependency graph + topological sort | B1 | **Implemented** (parser + `topo_sort` host-tested; runtime `load_needed` wired but DSO-load hangs in QEMU — see Implementation Notes) |
-| B3 | x86_64 relocation application (`R_X86_64_GLOB_DAT`, `R_X86_64_JUMP_SLOT`, `R_X86_64_RELATIVE`, `R_X86_64_64`) | B2 | **Implemented** (host-tested primitives `apply_relative` / `apply_glob_dat` / `apply_abs64` + `lookup_in_hash_table`; runtime walker depends on B2 stabilising) |
-| B5 | `DT_INIT` / `DT_INIT_ARRAY` constructors, deepest-first | B3 | **Implemented** (`run_constructors` iterates DSO list in reverse; not yet exercised because the runtime DSO load hangs upstream) |
-| E3 | `xtask::build_shared_lib(name, srcs, output)` + stage to `/usr/lib/` | Phase 31 ✅ | **Complete** (helper + `populate_ext2_files` enumeration + kernel ramdisk `USR_ENTRIES`) |
-| F1 | `libhello.so` + `dynlink_hello` + xtask gate | B5, E3 | **Implemented** (sources + build wiring + smoke gate); gate currently emits SKIP — happy path passes once runtime stabilises |
-| H | Design-doc updates + learning doc + version bump | All | **Partial** — version bump + roadmap row + task-list status updated; learning-doc rewrite for 76b sections deferred to the runtime-stabilisation follow-up |
+| B1 | `_dlstart` self-relocation in inline asm before any Rust global access | Phase 76 ✅ | **Complete** — naked-asm `_start` + `dl_relocate_self` walks own PT_DYNAMIC for DT_RELA + applies every R_X86_64_RELATIVE before any GOT-routed read; host-tested `apply_relative` (zero/non-zero/negative addend + misaligned + OOB cases) |
+| B2 | `PT_DYNAMIC` parser + `DT_NEEDED` dependency graph + topological sort | B1 | **Complete** — host-tested `DynamicSection::parse` + iterative transitive `load_needed` with SONAME dedup + host-tested `topo_sort` (white/gray/black DFS, cycle → `TopoError::CircularDependency` → `exit(80)` ELIBBAD); search order is `/usr/lib/` (full LD_LIBRARY_PATH walk slated for 76d) |
+| B3 | x86_64 relocation application (`R_X86_64_GLOB_DAT`, `R_X86_64_JUMP_SLOT`, `R_X86_64_RELATIVE`, `R_X86_64_64`) | B2 | **Complete** — host-tested primitives `apply_relative` / `apply_glob_dat` / `apply_abs64` + host-tested `lookup_in_hash_table`; runtime `apply_rela` dispatches per `r_type` and resolves names via the loaded-DSO chain |
+| B5 | `DT_INIT` / `DT_INIT_ARRAY` constructors, deepest-first | B3 | **Complete** — `run_constructors` iterates DSO list in reverse and calls each entry via a register-loaded address (not GOT slot) |
+| E3 | `xtask::build_shared_lib(name, srcs, output)` + stage to `/usr/lib/` | Phase 31 ✅ | **Complete** — helper + `populate_ext2_files` `.so` enumeration + kernel ramdisk `USR_ENTRIES` |
+| F1 | `libhello.so` + `dynlink_hello` + missing-dep + cycle gates | B5, E3 | **Complete** — `dynlink-hello-smoke` (refcount path, 2 consecutive runs), `dynlink-missing-smoke` (exit 2), `dynlink-cycle-smoke` (exit 80) all PASS |
+| H | Design-doc updates + learning doc + version bump | All | **Complete** — kernel 0.76.1, Cargo.lock regenerated, roadmap row marked Complete, task-list status header + per-track status column + Implementation Notes section all updated, `docs/76-dynamic-linker.md` extended with "What changes in 76b" section + Key Files table, AGENTS.md Phase 76b clause added |
 
 ## Implementation Notes (Phase 76b)
 
@@ -35,34 +35,43 @@ The runtime `dl_entry` driver wires:
   (verified in QEMU — the existing `dynlink-smoke` gate still passes);
 - `parse_auxv` extracts `AT_BASE`, `AT_PHDR`, `AT_PHNUM`, `AT_ENTRY`;
 - main-binary `PT_PHDR` → load-bias → `PT_DYNAMIC` parsing;
-- `load_dso` opens `/usr/lib/<name>`, mmaps a 64 KiB scratch buffer,
-  reads the file, walks `PT_LOAD` headers, and `MAP_FIXED` maps each
-  segment at `load_bias + p_vaddr`;
+- `load_dso` opens `/usr/lib/<name>`, mmaps one anonymous region
+  for the whole DSO image (kernel chooses base → load_bias), copies
+  each `PT_LOAD` into `load_bias + p_vaddr`, then `mprotect`s
+  `PF_X` segments to `PROT_READ | PROT_EXEC` (W^X-clean);
+- transitive `DT_NEEDED` resolution with SONAME-keyed dedup, building
+  a parallel adjacency-list dependency graph;
+- `topo_sort` over the graph — `TopoError::CircularDependency` →
+  `exit(80)` (ELIBBAD);
 - `apply_rela` walks `DT_RELA` / `DT_JMPREL`, dispatches per type,
   resolves named symbols via the loaded-DSO list;
 - `run_constructors` iterates the DSO list deepest-first.
 
-**Open issue:** the runtime hangs in QEMU during the `load_dso` step
-when a binary actually has `DT_NEEDED` entries (`dynlink_hello`). The
-hang point is somewhere between `serial(b"ldso: loading DT_NEEDED …")`
-and the first `serial` call inside `load_dso`. Hypotheses include:
+**DSO load strategy.** The kernel's `sys_linux_mmap`
+(`kernel/src/arch/x86_64/syscall/mod.rs`) ignores `addr_hint` for
+anonymous mappings — pages always come from the per-process
+`mmap_next` allocator. So `load_dso` does NOT try to place segments
+at a chosen address. Instead it issues ONE anonymous mmap of the
+whole image size; the kernel's returned address becomes the DSO's
+load bias.
 
-- a stack-frame size issue in `load_dso` (heapless::Vec<Dyn, 64> ≈
-  1 KiB);
-- the `MAP_FIXED` mmap at `0x7200_0000` overlapping a region the
-  kernel does not expect a user mapping at;
-- a `serial()` call where the byte slice references a `strtab`
-  pointer that has not actually been mapped readable.
+**Negative gates (F1.4).** Two binaries exercise the failure modes:
 
-Resolving the hang is the next concrete step. The host-tested
-primitives prove the algorithmic shape is correct; the open work is
-narrowly scoped to the runtime DSO-load path.
+- `dynlink_missing` links against `libdoesnotexist.so` via a
+  never-staged stub under `target/missing-stub/`. At runtime the
+  linker hits ENOENT and `exit(2)`. Gate asserts
+  `WEXITSTATUS == 2`.
+- `dynlink_cycle` depends on `libcyca.so`, which depends on
+  `libcycb.so`, which depends on `libcyca.so` (closed cycle). The
+  cycle libs are built in three steps to break chicken-and-egg:
+  `libcyca_stub.so` → `libcycb.so` → final `libcyca.so` closing the
+  back-edge. The linker's `topo_sort` detects the cycle and
+  `exit(80)`. Gate asserts `WEXITSTATUS == 80`.
 
-The `dynlink-hello-smoke` gate is wired into the smoke-runner step
-list and emits `SMOKE:dynlink-hello-smoke:SKIP` while iteration on
-the runtime continues; `cargo xtask smoke-test` passes overall. The
-negative gates (dynlink_missing → `NEG_ENOENT`, cyclic-`DT_NEEDED` →
-`NEG_ELIBBAD`) are deferred until the happy-path runtime is green.
+**Smoke verification.** `cargo xtask smoke-test` passes 15/15 steps
+in 18s. The new gates are `dynlink-hello-smoke` (refcount path:
+runs the binary twice consecutively, asserts the sentinel both
+times), `dynlink-missing-smoke`, and `dynlink-cycle-smoke`.
 
 ---
 

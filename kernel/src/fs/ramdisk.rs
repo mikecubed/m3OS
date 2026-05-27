@@ -328,6 +328,16 @@ static DYNLINK_SMOKE_ELF: &[u8] = generated_initrd_asset!("dynlink_smoke");
 // main → external symbol call chain.
 static DYNLINK_HELLO_ELF: &[u8] = generated_initrd_asset!("dynlink_hello");
 
+// Phase 76b F1.4 — `dynlink_missing` musl-built dynamic ELF with
+// `DT_NEEDED = libdoesnotexist.so`. Smoke gate asserts the linker
+// exits with code 2 (ENOENT).
+static DYNLINK_MISSING_ELF: &[u8] = generated_initrd_asset!("dynlink_missing");
+
+// Phase 76b F1.4 — `dynlink_cycle` musl-built dynamic ELF whose
+// DT_NEEDED chain has a libcyca ↔ libcycb cycle. Smoke gate asserts
+// the linker exits with code 80 (ELIBBAD).
+static DYNLINK_CYCLE_ELF: &[u8] = generated_initrd_asset!("dynlink_cycle");
+
 // Phase 70 follow-up — `doom-concurrent` forks two `doom` processes
 // and waits for both. Run from the post-login shell by `cargo xtask
 // doom-concurrent-smoke` to assert real kernel-level concurrency
@@ -610,6 +620,19 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "dynlink_hello",
         RamdiskNode::File {
             content: DYNLINK_HELLO_ELF,
+        },
+    ),
+    // Phase 76b F1.4 negative gates.
+    (
+        "dynlink_missing",
+        RamdiskNode::File {
+            content: DYNLINK_MISSING_ELF,
+        },
+    ),
+    (
+        "dynlink_cycle",
+        RamdiskNode::File {
+            content: DYNLINK_CYCLE_ELF,
         },
     ),
     // Phase 70 follow-up: doom-concurrent — forks two doom children

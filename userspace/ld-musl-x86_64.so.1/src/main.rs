@@ -56,7 +56,9 @@
 use core::arch::naked_asm;
 use core::panic::PanicInfo;
 
-use ldso_core::dynlink::{DsoId, DynamicSection, MAX_DSOS, MAX_NEEDED, elf_hash};
+use ldso_core::dynlink::{
+    DsoId, DynamicSection, MAX_DSOS, MAX_NEEDED, TopoError, elf_hash, topo_sort,
+};
 use ldso_core::elf64::{
     DT_NULL, Dyn, PT_DYNAMIC, PT_LOAD, Phdr, R_X86_64_64, R_X86_64_GLOB_DAT, R_X86_64_JUMP_SLOT,
     R_X86_64_RELATIVE, Rela, Sym, r_sym, r_type,
@@ -87,6 +89,13 @@ const SYS_OPEN: u64 = 2;
 const SYS_CLOSE: u64 = 3;
 const SYS_MMAP: u64 = 9;
 const SYS_MPROTECT: u64 = 10;
+const SYS_EXIT: u64 = 60;
+
+/// `errno` codes the bring-up linker uses as `exit(2)` codes when a
+/// DT_NEEDED dependency fails to load. The negative gates (Track
+/// F1.4) wait for these specific codes via `WEXITSTATUS(status)`.
+const ENOENT_CODE: u64 = 2;
+const ELIBBAD_CODE: u64 = 80;
 
 const O_RDONLY: u64 = 0;
 
@@ -182,6 +191,13 @@ fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: i64, offset: u64) ->
 
 fn sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
     unsafe { syscall3(SYS_MPROTECT, addr, len, prot) }
+}
+
+fn sys_exit(code: u64) -> ! {
+    unsafe {
+        let _ = syscall1(SYS_EXIT, code);
+        core::hint::unreachable_unchecked()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -365,10 +381,23 @@ struct Ehdr {
 /// 5. For each segment whose `p_flags` has `PF_X` set, `mprotect` its
 ///    page range to `PROT_READ | PROT_EXEC` (Phase 75 W^X requires
 ///    separate W and X mappings).
-unsafe fn load_dso(path_bytes: &[u8]) -> Result<LoadedDso, &'static str> {
+///
+/// (continues — see [`load_dso`] below.)
+const _LOAD_DSO_DOC_BREAK: () = ();
+
+/// Distinguishable error from `load_dso`: `NotFound` lets the
+/// caller map a missing DSO to `exit(ENOENT)` while `Other` covers
+/// any other failure shape.
+#[derive(Clone, Copy)]
+enum LoadError {
+    NotFound,
+    Other(&'static str),
+}
+
+unsafe fn load_dso(path_bytes: &[u8]) -> Result<LoadedDso, LoadError> {
     let fd = sys_open(path_bytes);
     if fd < 0 {
-        return Err("open failed");
+        return Err(LoadError::NotFound);
     }
     let scratch_len: u64 = 64 * 1024;
     let scratch = sys_mmap(
@@ -381,7 +410,7 @@ unsafe fn load_dso(path_bytes: &[u8]) -> Result<LoadedDso, &'static str> {
     );
     if scratch < 0 {
         sys_close(fd);
-        return Err("scratch mmap failed");
+        return Err(LoadError::Other("scratch mmap failed"));
     }
     let scratch_buf =
         unsafe { core::slice::from_raw_parts_mut(scratch as *mut u8, scratch_len as usize) };
@@ -390,7 +419,7 @@ unsafe fn load_dso(path_bytes: &[u8]) -> Result<LoadedDso, &'static str> {
         let n = sys_read(fd, &mut scratch_buf[total..]);
         if n < 0 {
             sys_close(fd);
-            return Err("read failed");
+            return Err(LoadError::Other("read failed"));
         }
         if n == 0 {
             break;
@@ -402,11 +431,11 @@ unsafe fn load_dso(path_bytes: &[u8]) -> Result<LoadedDso, &'static str> {
     }
     sys_close(fd);
     if total < core::mem::size_of::<Ehdr>() {
-        return Err("file too small");
+        return Err(LoadError::Other("file too small"));
     }
     let ehdr = unsafe { &*(scratch as *const Ehdr) };
     if &ehdr.e_ident[..4] != b"\x7fELF" {
-        return Err("not ELF");
+        return Err(LoadError::Other("not ELF"));
     }
     let phoff = ehdr.e_phoff;
     let phnum = ehdr.e_phnum as usize;
@@ -424,7 +453,7 @@ unsafe fn load_dso(path_bytes: &[u8]) -> Result<LoadedDso, &'static str> {
         }
     }
     if image_end == 0 {
-        return Err("no PT_LOAD");
+        return Err(LoadError::Other("no PT_LOAD"));
     }
     let image_len = (image_end + 4095) & !4095;
 
@@ -439,7 +468,7 @@ unsafe fn load_dso(path_bytes: &[u8]) -> Result<LoadedDso, &'static str> {
         0,
     );
     if image_base < 0 {
-        return Err("image mmap failed");
+        return Err(LoadError::Other("image mmap failed"));
     }
     let load_bias = image_base as u64;
 
@@ -471,7 +500,7 @@ unsafe fn load_dso(path_bytes: &[u8]) -> Result<LoadedDso, &'static str> {
         // satisfied; the kernel splits the VMA if needed.
         let r = sys_mprotect(seg_start, seg_len, PROT_READ | PROT_EXEC);
         if r < 0 {
-            return Err("mprotect PT_LOAD R-X failed");
+            return Err(LoadError::Other("mprotect PT_LOAD R-X failed"));
         }
     }
 
@@ -485,7 +514,7 @@ unsafe fn load_dso(path_bytes: &[u8]) -> Result<LoadedDso, &'static str> {
         }
     }
     if dyn_ptr.is_null() {
-        return Err("no PT_DYNAMIC");
+        return Err(LoadError::Other("no PT_DYNAMIC"));
     }
     let mut entries: heapless::Vec<Dyn, 64> = heapless::Vec::new();
     let mut p = dyn_ptr;
@@ -783,40 +812,123 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
         Some(p) => p.as_ptr(),
         None => core::ptr::null(),
     };
-    for i in 0..main_dyn_section.n_needed as usize {
-        let name_off = main_dyn_section.needed[i];
-        if strtab_main.is_null() {
+    // SONAME (or DT_NEEDED name when DT_SONAME is absent) of every
+    // loaded DSO, parallel to `dsos`. The main binary's slot is
+    // empty (it has no SONAME).
+    let mut loaded_names: heapless::Vec<&[u8], MAX_DSOS> = heapless::Vec::new();
+    let _ = loaded_names.push(&[]);
+    // Pending DT_NEEDED queue: name + index of the DSO that asked
+    // for it (so the graph edge can be recorded).
+    let mut queue: heapless::Vec<(&[u8], usize), 64> = heapless::Vec::new();
+    if !strtab_main.is_null() {
+        for i in 0..main_dyn_section.n_needed as usize {
+            let name_off = main_dyn_section.needed[i];
+            let name = unsafe { strtab_get(strtab_main, name_off, main_dyn_section.strsz) };
+            let _ = queue.push((name, 0));
+        }
+    }
+    // Per-DSO DT_NEEDED → child-index lists, used for cycle detection.
+    let mut dep_lists: heapless::Vec<heapless::Vec<DsoId, MAX_DSOS>, MAX_DSOS> =
+        heapless::Vec::new();
+    for _ in 0..MAX_DSOS {
+        let _ = dep_lists.push(heapless::Vec::new());
+    }
+    let mut qhead = 0usize;
+    while qhead < queue.len() {
+        let (name, parent_idx) = queue[qhead];
+        qhead += 1;
+        // Dedup against already-loaded SONAMEs.
+        let mut existing = None;
+        for (idx, n) in loaded_names.iter().enumerate() {
+            if *n == name {
+                existing = Some(idx);
+                break;
+            }
+        }
+        if let Some(idx) = existing {
+            if let Some(slot) = dep_lists.get_mut(parent_idx) {
+                let _ = slot.push(DsoId(idx as u32));
+            }
             continue;
         }
-        let name = unsafe { strtab_get(strtab_main, name_off, main_dyn_section.strsz) };
         // Build "/usr/lib/<name>\0" in a stack buffer.
         let mut path_buf = [0u8; 256];
         let prefix = b"/usr/lib/";
         if prefix.len() + name.len() + 1 > path_buf.len() {
             serial(b"ldso: path too long for DT_NEEDED\n");
-            return 0;
+            sys_exit(ENOENT_CODE);
         }
         path_buf[..prefix.len()].copy_from_slice(prefix);
         path_buf[prefix.len()..prefix.len() + name.len()].copy_from_slice(name);
-        // NUL terminator already present (buf is zeroed).
         let loaded = match unsafe { load_dso(&path_buf) } {
             Ok(d) => d,
-            Err(msg) => {
+            Err(LoadError::NotFound) => {
+                serial(b"ldso: DT_NEEDED not found: ");
+                serial(name);
+                serial(b"\n");
+                sys_exit(ENOENT_CODE);
+            }
+            Err(LoadError::Other(msg)) => {
                 serial(b"ldso: failed to load DT_NEEDED ");
                 serial(name);
                 serial(b": ");
                 serial(msg.as_bytes());
                 serial(b"\n");
-                return 0;
+                sys_exit(ENOENT_CODE);
             }
         };
-        if dsos.push(loaded).is_err() {
+        let new_idx = dsos.len();
+        if dsos.push(loaded).is_err() || loaded_names.push(name).is_err() {
             serial(b"ldso: too many DSOs\n");
-            return 0;
+            sys_exit(ELIBBAD_CODE);
         }
-        let _ = MAX_NEEDED;
-        let _ = DsoId(0);
+        if let Some(slot) = dep_lists.get_mut(parent_idx) {
+            let _ = slot.push(DsoId(new_idx as u32));
+        }
+        // Enqueue this DSO's own DT_NEEDED for transitive resolution.
+        let strtab_p = match loaded.dyn_.strtab {
+            Some(p) => p.as_ptr(),
+            None => core::ptr::null(),
+        };
+        if !strtab_p.is_null() {
+            for k in 0..loaded.dyn_.n_needed as usize {
+                let dep_off = loaded.dyn_.needed[k];
+                let dep_name = unsafe { strtab_get(strtab_p, dep_off, loaded.dyn_.strsz) };
+                if queue.push((dep_name, new_idx)).is_err() {
+                    serial(b"ldso: queue overflow\n");
+                    sys_exit(ELIBBAD_CODE);
+                }
+            }
+        }
     }
+    // Cycle detection via topo_sort on the dep graph.
+    {
+        let mut slices: heapless::Vec<&[DsoId], MAX_DSOS> = heapless::Vec::new();
+        for i in 0..dsos.len() {
+            let _ = slices.push(dep_lists[i].as_slice());
+        }
+        match topo_sort(slices.as_slice()) {
+            Ok(_) => {}
+            Err(TopoError::CircularDependency(a, b)) => {
+                serial(b"ldso: circular DT_NEEDED between ");
+                if let Some(n) = loaded_names.get(a.0 as usize) {
+                    serial(n);
+                }
+                serial(b" and ");
+                if let Some(n) = loaded_names.get(b.0 as usize) {
+                    serial(n);
+                }
+                serial(b"\n");
+                sys_exit(ELIBBAD_CODE);
+            }
+            Err(_) => {
+                serial(b"ldso: dependency-graph overflow\n");
+                sys_exit(ELIBBAD_CODE);
+            }
+        }
+    }
+    let _ = MAX_NEEDED;
+    let _ = DsoId(0);
 
     // -- Apply relocations against the main binary --------------------------
     if let Some(rela) = main_dyn_section.rela {
