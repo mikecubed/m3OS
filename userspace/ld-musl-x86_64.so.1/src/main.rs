@@ -53,11 +53,13 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+mod dl;
+
 use core::arch::naked_asm;
 use core::panic::PanicInfo;
 
 use ldso_core::dynlink::{
-    DsoId, DynamicSection, MAX_DSOS, MAX_NEEDED, TopoError, elf_hash, topo_sort,
+    DsoId, DynamicSection, LoadedDso, MAX_DSOS, MAX_NEEDED, TopoError, elf_hash, topo_sort,
 };
 use ldso_core::elf64::{
     DT_NULL, Dyn, PT_DYNAMIC, PT_LOAD, Phdr, R_X86_64_64, R_X86_64_GLOB_DAT, R_X86_64_JUMP_SLOT,
@@ -97,6 +99,14 @@ const SYS_EXIT: u64 = 60;
 /// F1.4) wait for these specific codes via `WEXITSTATUS(status)`.
 const ENOENT_CODE: u64 = 2;
 const ELIBBAD_CODE: u64 = 80;
+
+/// Basename used to dedup a `DT_NEEDED` reference to the linker itself.
+/// Programs that link `-l:ld-musl-x86_64.so.1` (or that link against a
+/// `libdl.so` stub that itself DT_NEEDEDs the linker) end up with this
+/// name in `DT_NEEDED`; the bring-up driver recognises it and skips
+/// loading the linker a second time (it is already mapped by the
+/// kernel via `PT_INTERP` and self-injected into the DSO scope).
+const LDSO_BASENAME: &[u8] = b"ld-musl-x86_64.so.1";
 
 const O_RDONLY: u64 = 0;
 
@@ -194,7 +204,7 @@ fn sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
     unsafe { syscall3(SYS_MPROTECT, addr, len, prot) }
 }
 
-fn sys_munmap(addr: u64, len: u64) -> i64 {
+pub(crate) fn sys_munmap(addr: u64, len: u64) -> i64 {
     // `addr` must be page-aligned (sys_linux_munmap rejects with
     // -EINVAL otherwise). All mappings unmapped by this file are
     // created by `sys_mmap(addr=0, …)` so the kernel-chosen base is
@@ -215,7 +225,7 @@ fn sys_exit(code: u64) -> ! {
 // Observability helpers (stderr / serial).
 // ---------------------------------------------------------------------------
 
-fn serial(msg: &[u8]) {
+pub(crate) fn serial(msg: &[u8]) {
     let _ = sys_write(2, msg);
 }
 
@@ -312,33 +322,77 @@ unsafe fn dl_relocate_self(phdr_base: *const Phdr, phnum: usize, load_bias: u64)
     }
 }
 
-// ---------------------------------------------------------------------------
-// LoadedDso — one mapped shared library in the linker's address space.
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Copy)]
-struct LoadedDso {
-    load_bias: u64,
-    /// Page-rounded in-memory span of this DSO's image — used by
-    /// `apply_rela` to bounds-check every relocation write so a
-    /// malformed (or attacker-controlled) DSO cannot make the linker
-    /// scribble outside its own mapping.  `0` means "trust the caller"
-    /// and disables the check (only the placeholder `empty()` value
-    /// should ever take that path).
-    image_len: u64,
-    dyn_: DynamicSection,
-}
-
-#[allow(dead_code)]
-impl LoadedDso {
-    const fn empty() -> Self {
-        Self {
-            load_bias: 0,
-            image_len: 0,
-            dyn_: DynamicSection::empty(),
+/// Parse the linker's own PT_DYNAMIC and compute its image span so
+/// it can be injected into the bring-up DSO scope. Without this, the
+/// libdl entry points (`dlopen` / `dlsym` / `dlclose` / `dlerror`)
+/// would never resolve through the relocation walker — a stub
+/// `libdl.so` exporting the same names would shadow them and break
+/// `dlopen`.
+///
+/// # Safety
+/// `phdr_base` / `phnum` / `load_bias` must describe the linker's
+/// own mapped image (the kernel hands them off via `AT_BASE` +
+/// `e_phoff`). Caller must have run [`dl_relocate_self`] first so
+/// any Rust global referenced from this function is already valid.
+unsafe fn parse_linker_dso(phdr_base: *const Phdr, phnum: usize, load_bias: u64) -> LoadedDso {
+    // Image extent: max(p_vaddr + p_memsz) over PT_LOAD, page-aligned up.
+    let mut image_end: u64 = 0;
+    let mut dyn_ptr: *const Dyn = core::ptr::null();
+    for i in 0..phnum {
+        let ph = unsafe { *phdr_base.add(i) };
+        if ph.p_type == PT_LOAD {
+            let end = ph.p_vaddr.wrapping_add(ph.p_memsz);
+            if end > image_end {
+                image_end = end;
+            }
+        }
+        if ph.p_type == PT_DYNAMIC {
+            dyn_ptr = (load_bias.wrapping_add(ph.p_vaddr)) as *const Dyn;
         }
     }
+    let image_len = if image_end == 0 {
+        0
+    } else {
+        (image_end + 4095) & !4095
+    };
+    if dyn_ptr.is_null() {
+        return LoadedDso {
+            load_bias,
+            image_len,
+            dyn_: DynamicSection::empty(),
+        };
+    }
+    let mut entries: heapless::Vec<Dyn, 64> = heapless::Vec::new();
+    let mut saw_null = false;
+    let mut p = dyn_ptr;
+    while entries.len() < 64 {
+        let e = unsafe { *p };
+        let _ = entries.push(e);
+        if e.d_tag == DT_NULL {
+            saw_null = true;
+            break;
+        }
+        p = unsafe { p.add(1) };
+    }
+    if !saw_null {
+        serial(b"ldso: linker PT_DYNAMIC > 64 entries\n");
+        // Continue with whatever we have; the linker's own dynamic
+        // section is always small enough to fit so this branch is
+        // a future-proofing failsafe.
+    }
+    let dyn_ = DynamicSection::parse(&entries, load_bias);
+    LoadedDso {
+        load_bias,
+        image_len,
+        dyn_,
+    }
 }
+
+// ---------------------------------------------------------------------------
+// `LoadedDso` lives in `ldso_core::dynlink` so the host harness can
+// drive the pure-logic `unmap_dso` helper without invoking real
+// syscalls. Phase 76c moved the type out of this binary.
+// ---------------------------------------------------------------------------
 
 /// Validate the entry-size and PLT-flavour invariants Phase 76b
 /// silently relied on when dividing `relasz`/`pltrelsz` by 24.
@@ -465,7 +519,7 @@ unsafe fn strlen_bounded(p: *const u8, max: usize) -> usize {
 /// Borrow a string from `DT_STRTAB` at byte offset `off`. The
 /// returned slice borrows from the loaded image so the caller must
 /// not free or unmap it.
-unsafe fn strtab_get(strtab: *const u8, off: u64, strsz: u64) -> &'static [u8] {
+pub(crate) unsafe fn strtab_get(strtab: *const u8, off: u64, strsz: u64) -> &'static [u8] {
     if off >= strsz {
         return &[];
     }
@@ -904,24 +958,132 @@ unsafe fn run_constructors(dsos: &[LoadedDso]) {
     // dsos[0] is the main binary. Deepest-first ⇒ reverse iteration
     // (so deps run before the main binary).
     for dso in dsos.iter().rev() {
-        if let Some(init) = dso.dyn_.init {
-            let f: extern "C" fn() = unsafe { core::mem::transmute(init.as_ptr()) };
-            f();
-        }
-        if let Some(arr) = dso.dyn_.init_array
-            && dso.dyn_.init_arraysz >= 8
-        {
-            let n = (dso.dyn_.init_arraysz / 8) as usize;
-            let base = arr.as_ptr() as *const u64;
-            for i in 0..n {
-                let fnptr = unsafe { *base.add(i) };
-                if fnptr != 0 {
-                    let f: extern "C" fn() = unsafe { core::mem::transmute(fnptr) };
-                    f();
-                }
+        // SAFETY: each DSO's `dyn_` came from a `validate_dyn_pointers`
+        // pass at load time, so the function pointers lie inside the
+        // mapped image. The destructor convention is `extern "C" fn()`.
+        unsafe { run_constructors_for(dso) };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// dl-runtime façade — `pub(crate)` wrappers consumed by `crate::dl`.
+// ---------------------------------------------------------------------------
+
+/// Run `DT_INIT` then iterate `DT_INIT_ARRAY` in array order for a
+/// single DSO. Used by `dlopen` after a fresh load.
+///
+/// # Safety
+/// `dso` must have been produced by `load_dso` or the bring-up
+/// linker — i.e. its `init` / `init_array` pointers lie inside the
+/// mapped image. Constructors are called as `extern "C" fn()`.
+pub(crate) unsafe fn run_constructors_for(dso: &LoadedDso) {
+    if let Some(init) = dso.dyn_.init {
+        let f: extern "C" fn() = unsafe { core::mem::transmute(init.as_ptr()) };
+        f();
+    }
+    if let Some(arr) = dso.dyn_.init_array
+        && dso.dyn_.init_arraysz >= 8
+    {
+        let n = (dso.dyn_.init_arraysz / 8) as usize;
+        let base = arr.as_ptr() as *const u64;
+        for i in 0..n {
+            let fnptr = unsafe { *base.add(i) };
+            if fnptr != 0 {
+                let f: extern "C" fn() = unsafe { core::mem::transmute(fnptr) };
+                f();
             }
         }
     }
+}
+
+/// Run `DT_FINI_ARRAY` in reverse-array order then `DT_FINI` for a
+/// single DSO. Mirrors the SysV ELF destructor pipeline; matches the
+/// inverse of `run_constructors_for`.
+///
+/// The destructor is invoked through a register-loaded function
+/// pointer (the `transmute` returns a value-typed `extern "C" fn()`
+/// the compiler emits as `call rax`) — not via a GOT slot — because
+/// the DSO's GOT may be about to be unmapped by `dlclose`; a
+/// GOT-routed indirect call would page-fault on the next dispatch.
+///
+/// # Safety
+/// Same invariant as `run_constructors_for`. The caller must NOT
+/// unmap the DSO until after this function returns.
+pub(crate) unsafe fn run_destructors_for(dso: &LoadedDso) {
+    if let Some(arr) = dso.dyn_.fini_array
+        && dso.dyn_.fini_arraysz >= 8
+    {
+        let n = (dso.dyn_.fini_arraysz / 8) as usize;
+        let base = arr.as_ptr() as *const u64;
+        // Reverse-array order: index `n - 1` first.
+        for i in (0..n).rev() {
+            let fnptr = unsafe { *base.add(i) };
+            if fnptr != 0 {
+                let f: extern "C" fn() = unsafe { core::mem::transmute(fnptr) };
+                f();
+            }
+        }
+    }
+    if let Some(fini) = dso.dyn_.fini {
+        let f: extern "C" fn() = unsafe { core::mem::transmute(fini.as_ptr()) };
+        f();
+    }
+}
+
+/// `dlopen`-flavoured load-from-disk. Mirrors `load_dso` but returns
+/// a typed error the caller can map to a `dlerror` slot string.
+///
+/// # Safety
+/// Same invariant as `load_dso` — `path_bytes` must be a
+/// NUL-terminated C string.
+pub(crate) unsafe fn load_dso_for_dl(path_bytes: &[u8]) -> Result<LoadedDso, dl::DlLoadError> {
+    match unsafe { load_dso(path_bytes) } {
+        Ok(d) => Ok(d),
+        Err(LoadError::NotFound) => Err(dl::DlLoadError::NotFound),
+        Err(LoadError::Other(_msg)) => Err(dl::DlLoadError::Other),
+    }
+}
+
+/// Apply `DT_RELA` and `DT_JMPREL` on `state.dsos[id]` using the
+/// state's complete DSO list as the symbol search scope. Used by
+/// `dlopen` after a fresh load.
+///
+/// # Safety
+/// `state.dsos[id]` must be a fully-populated `LoadedDso` produced by
+/// `load_dso_for_dl`. Symbol resolution dereferences other DSO
+/// images through the state's dsos slice — every entry must be valid
+/// for the lifetime of this call.
+pub(crate) unsafe fn apply_relocations_for(
+    id: DsoId,
+    state: &dl::DlState,
+) -> Result<(), &'static str> {
+    let idx = id.0 as usize;
+    let dso = state.dsos[idx];
+    if let Some(rela) = dso.dyn_.rela {
+        let n = (dso.dyn_.relasz / 24) as usize;
+        let scope = &state.dsos[..state.n_slots_used];
+        unsafe {
+            apply_rela(
+                &dso,
+                rela.as_ptr() as *const ldso_core::elf64::Rela,
+                n,
+                scope,
+            )?
+        };
+    }
+    if let Some(jmprel) = dso.dyn_.jmprel {
+        let n = (dso.dyn_.pltrelsz / 24) as usize;
+        let scope = &state.dsos[..state.n_slots_used];
+        unsafe {
+            apply_rela(
+                &dso,
+                jmprel.as_ptr() as *const ldso_core::elf64::Rela,
+                n,
+                scope,
+            )?
+        };
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -975,7 +1137,7 @@ unsafe fn parse_auxv(stack: *const u64) -> (u64, *const Phdr, usize, u64) {
 /// `_start` and never invokes this function from any other context.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
-    serial(b"ldso(76b): _dlstart\n");
+    serial(b"ldso(76c): _dlstart\n");
     let (at_base, at_phdr, at_phnum, at_entry) = unsafe { parse_auxv(stack) };
     if at_phdr.is_null() || at_phnum == 0 || at_entry == 0 {
         serial(b"ldso: missing AT_PHDR/AT_PHNUM/AT_ENTRY\n");
@@ -986,12 +1148,20 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
     // The linker's own PHDR table is at `at_base + e_phoff`; we know
     // `at_base` from the auxv, and `e_phoff` is at byte 32 of the ELF
     // header. Read those few bytes inline.
+    let mut linker_dso = LoadedDso::empty();
     if at_base != 0 {
         let our_ehdr = at_base as *const Ehdr;
         let our_phoff = unsafe { (*our_ehdr).e_phoff };
         let our_phnum = unsafe { (*our_ehdr).e_phnum } as usize;
         let our_phdr = (at_base + our_phoff) as *const Phdr;
         unsafe { dl_relocate_self(our_phdr, our_phnum, at_base) };
+        // After self-relocation it is safe to dereference Rust
+        // globals. Parse the linker's own PT_DYNAMIC so we can
+        // inject the linker into the DSO scope below — that lets
+        // `dlopen` / `dlsym` / `dlclose` / `dlerror` resolve to the
+        // linker's implementations rather than to any stub library
+        // (e.g. `libdl.so`) the consumer linked.
+        linker_dso = unsafe { parse_linker_dso(our_phdr, our_phnum, at_base) };
     }
 
     // -- Walk main binary's PT_DYNAMIC --------------------------------------
@@ -1102,6 +1272,17 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
     // empty (it has no SONAME).
     let mut loaded_names: heapless::Vec<&[u8], MAX_DSOS> = heapless::Vec::new();
     let _ = loaded_names.push(&[]);
+
+    // Phase 76c — inject the linker itself as slot 1 so the libdl
+    // entry points (`dlopen` / `dlsym` / `dlclose` / `dlerror`)
+    // resolve through SysV symbol search rather than via a stub
+    // library. The dedup loop below recognises `ld-musl-x86_64.so.1`
+    // as the linker's basename so a `DT_NEEDED` carrying that name
+    // does not trigger a second load of the linker file from disk.
+    if at_base != 0 {
+        let _ = dsos.push(linker_dso);
+        let _ = loaded_names.push(LDSO_BASENAME);
+    }
     // Pending DT_NEEDED queue: name + index of the DSO that asked
     // for it (so the graph edge can be recorded).
     let mut queue: heapless::Vec<(&[u8], usize), 64> = heapless::Vec::new();
@@ -1288,8 +1469,15 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
     }
 
     // -- Apply relocations against each loaded DSO --------------------------
+    // Slot 1 (when present) is the self-injected linker; its image
+    // was already self-relocated by `dl_relocate_self` and applying
+    // another reloc pass would double-process every entry. Skip it.
     let n_dsos = dsos.len();
+    let linker_slot: Option<usize> = if at_base != 0 { Some(1) } else { None };
     for i in 1..n_dsos {
+        if linker_slot == Some(i) {
+            continue;
+        }
         let dso = dsos[i];
         if let Some(rela) = dso.dyn_.rela {
             let n = (dso.dyn_.relasz / 24) as usize;
@@ -1313,10 +1501,33 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
         }
     }
 
+    // -- Publish bring-up state into `DL_STATE` so the libdl entry
+    // points have something to operate on after handoff.
+    //
+    // Refcounts on every bring-up DSO are set to `REFCOUNT_PERMANENT`
+    // so `dlclose` can never drop them to zero — the main binary,
+    // the linker, and any `DT_NEEDED` library loaded at process
+    // start are non-evictable for the life of the process.
+    {
+        let state = dl::dl_state_mut();
+        for i in 0..n_dsos {
+            state.dsos[i] = dsos[i];
+            state.names[i] = loaded_names.get(i).copied().unwrap_or(&[]);
+            state.refcounts[i] = dl::REFCOUNT_PERMANENT;
+            state.in_global_scope[i] = true;
+            state.dep_lists[i].clear();
+            for &child in dep_lists[i].iter() {
+                let _ = state.dep_lists[i].push(child);
+            }
+        }
+        state.n_slots_used = n_dsos;
+        state.initialized = true;
+    }
+
     // -- Run constructors deepest-first -------------------------------------
     unsafe { run_constructors(&dsos) };
 
-    serial(b"ldso(76b): handoff to main entry=");
+    serial(b"ldso(76c): handoff to main entry=");
     serial_hex(at_entry);
     serial(b"\n");
     at_entry

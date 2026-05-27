@@ -6,6 +6,8 @@
 //!   lookup, constructor invocation (host-testable).
 //! * [`elf64`]   — minimal ELF64 type stubs and dynamic-tag constants
 //!   shared by the modules above.
+//! * [`handle`]  — Phase 76c `dlopen`/`dlclose` handle-table slab
+//!   (host-testable).
 //!
 //! Everything in this library uses only `core::` so the same source
 //! compiles for the linker's `no_std` target build *and* the host
@@ -17,4 +19,5 @@
 
 pub mod dynlink;
 pub mod elf64;
+pub mod handle;
 pub mod reloc;

@@ -10,9 +10,9 @@
 //! * `run_constructors` — deepest-first walker (B5.1).
 
 use crate::elf64::{
-    DT_HASH, DT_INIT, DT_INIT_ARRAY, DT_INIT_ARRAYSZ, DT_JMPREL, DT_NEEDED, DT_NULL, DT_PLTREL,
-    DT_PLTRELSZ, DT_RELA, DT_RELAENT, DT_RELASZ, DT_SONAME, DT_STRSZ, DT_STRTAB, DT_SYMENT,
-    DT_SYMTAB, Dyn, Sym,
+    DT_FINI, DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_HASH, DT_INIT, DT_INIT_ARRAY, DT_INIT_ARRAYSZ,
+    DT_JMPREL, DT_NEEDED, DT_NULL, DT_PLTREL, DT_PLTRELSZ, DT_RELA, DT_RELAENT, DT_RELASZ,
+    DT_SONAME, DT_STRSZ, DT_STRTAB, DT_SYMENT, DT_SYMTAB, Dyn, Sym,
 };
 use core::ptr::NonNull;
 
@@ -53,6 +53,12 @@ pub struct DynamicSection {
     pub init_array: Option<NonNull<u8>>,
     /// `DT_INIT_ARRAYSZ` — size in bytes of the constructor array.
     pub init_arraysz: u64,
+    /// `DT_FINI` — address of the `_fini` function (legacy single-fini).
+    pub fini: Option<NonNull<u8>>,
+    /// `DT_FINI_ARRAY` — address of the destructor pointer array.
+    pub fini_array: Option<NonNull<u8>>,
+    /// `DT_FINI_ARRAYSZ` — size in bytes of the destructor array.
+    pub fini_arraysz: u64,
     /// `DT_HASH` — address of the SysV hash table.
     pub hash: Option<NonNull<u32>>,
     /// `DT_SONAME` — offset into `strtab` of the library's `SONAME`,
@@ -84,6 +90,9 @@ impl DynamicSection {
             init: None,
             init_array: None,
             init_arraysz: 0,
+            fini: None,
+            fini_array: None,
+            fini_arraysz: 0,
             hash: None,
             soname: u64::MAX,
             needed: [0; MAX_NEEDED],
@@ -143,6 +152,13 @@ impl DynamicSection {
                     out.init_array = NonNull::new((entry.d_val.wrapping_add(load_bias)) as *mut u8);
                 }
                 DT_INIT_ARRAYSZ => out.init_arraysz = entry.d_val,
+                DT_FINI => {
+                    out.fini = NonNull::new((entry.d_val.wrapping_add(load_bias)) as *mut u8);
+                }
+                DT_FINI_ARRAY => {
+                    out.fini_array = NonNull::new((entry.d_val.wrapping_add(load_bias)) as *mut u8);
+                }
+                DT_FINI_ARRAYSZ => out.fini_arraysz = entry.d_val,
                 _ => {} // unknown tag — ignore per SysV ELF spec
             }
         }
@@ -235,6 +251,82 @@ pub fn lookup_in_hash_table(
         hops += 1;
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// LoadedDso — one mapped shared library in the linker's address space.
+//
+// Phase 76c moves this struct out of the binary so the library can
+// expose `unmap_dso` as a pure-logic helper that downstream tests can
+// drive without invoking real syscalls.
+// ---------------------------------------------------------------------------
+
+/// One mapped DSO. `load_bias` + `image_len` are the byte range the
+/// runtime `mmap`ed for the whole image; `dyn_` is the parsed
+/// `PT_DYNAMIC` view rebased against `load_bias`.
+#[derive(Debug, Clone, Copy)]
+pub struct LoadedDso {
+    /// Address the kernel mapped the DSO at. Equal to the value
+    /// returned by `mmap(addr=0, …)` for the DSO's whole-image
+    /// anonymous mapping.
+    pub load_bias: u64,
+    /// Page-rounded in-memory span of the DSO's image — the full
+    /// `mmap` length so a single `munmap(load_bias, image_len)`
+    /// matches the load shape. `0` means "trust the caller" (only
+    /// the [`LoadedDso::empty`] placeholder uses this).
+    pub image_len: u64,
+    /// Parsed `PT_DYNAMIC` view, pointers rebased against
+    /// `load_bias`.
+    pub dyn_: DynamicSection,
+}
+
+impl LoadedDso {
+    /// Placeholder `LoadedDso` for slot prefill. All pointer fields
+    /// of `dyn_` are `None` so any attempt to read symbols / strings
+    /// off the placeholder bails out safely.
+    pub const fn empty() -> Self {
+        Self {
+            load_bias: 0,
+            image_len: 0,
+            dyn_: DynamicSection::empty(),
+        }
+    }
+}
+
+/// `unmap_dso` errors. `EmptyImage` is the placeholder-`LoadedDso`
+/// shape — unmap is meaningless there. `MunmapFailed` carries the
+/// negative `errno` returned by the host `munmap` callback so the
+/// runtime caller can log the exact failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnmapError {
+    /// `image_len == 0` — no mapping to release.
+    EmptyImage,
+    /// The munmap callback returned `< 0`.
+    MunmapFailed(i64),
+}
+
+/// Issue a single `munmap(load_bias, image_len)` matching the 76b
+/// whole-image mmap shape (one anonymous mmap covering the highest
+/// `PT_LOAD`-aligned-up range). The caller provides the `munmap`
+/// closure so this function is pure-logic and host-testable; the
+/// runtime caller passes a wrapper around `sys_munmap`.
+///
+/// Returns `Ok(())` when the callback returns `>= 0`. The DSO record
+/// itself is not mutated — the caller is responsible for evicting
+/// the entry from its load list, since this function does not know
+/// how the runtime stores its DSOs.
+pub fn unmap_dso<F>(dso: &LoadedDso, mut munmap: F) -> Result<(), UnmapError>
+where
+    F: FnMut(u64, u64) -> i64,
+{
+    if dso.image_len == 0 {
+        return Err(UnmapError::EmptyImage);
+    }
+    let r = munmap(dso.load_bias, dso.image_len);
+    if r < 0 {
+        return Err(UnmapError::MunmapFailed(r));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -401,6 +493,20 @@ mod tests {
         let d = DynamicSection::parse(&entries, 0);
         assert!(d.strtab.is_some());
         assert!(d.symtab.is_none(), "parser walked past DT_NULL");
+    }
+
+    #[test]
+    fn dynamic_section_indexes_fini_tags() {
+        let entries = [
+            entry(DT_FINI, 0x8000),
+            entry(DT_FINI_ARRAY, 0x9000),
+            entry(DT_FINI_ARRAYSZ, 24),
+            entry(DT_NULL, 0),
+        ];
+        let d = DynamicSection::parse(&entries, 0x1_0000_0000);
+        assert_eq!(d.fini.unwrap().as_ptr() as u64, 0x1_0000_8000);
+        assert_eq!(d.fini_array.unwrap().as_ptr() as u64, 0x1_0000_9000);
+        assert_eq!(d.fini_arraysz, 24);
     }
 
     #[test]
@@ -587,5 +693,51 @@ mod tests {
         let deps: &[&[DsoId]] = &[];
         let order = topo_sort(deps).unwrap();
         assert_eq!(order.len(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // LoadedDso + unmap_dso tests (Phase 76c C2.3).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn loaded_dso_empty_has_zero_image_len() {
+        let d = LoadedDso::empty();
+        assert_eq!(d.load_bias, 0);
+        assert_eq!(d.image_len, 0);
+        assert!(d.dyn_.strtab.is_none());
+    }
+
+    #[test]
+    fn unmap_dso_empty_image_errors() {
+        let d = LoadedDso::empty();
+        let r = unmap_dso(&d, |_addr, _len| 0);
+        assert_eq!(r, Err(UnmapError::EmptyImage));
+    }
+
+    #[test]
+    fn unmap_dso_calls_munmap_with_whole_image() {
+        let d = LoadedDso {
+            load_bias: 0x4000_0000,
+            image_len: 0x3000, // page-aligned, 12 KiB
+            dyn_: DynamicSection::empty(),
+        };
+        let mut observed: Option<(u64, u64)> = None;
+        let r = unmap_dso(&d, |addr, len| {
+            observed = Some((addr, len));
+            0
+        });
+        assert_eq!(r, Ok(()));
+        assert_eq!(observed, Some((0x4000_0000, 0x3000)));
+    }
+
+    #[test]
+    fn unmap_dso_propagates_munmap_failure() {
+        let d = LoadedDso {
+            load_bias: 0x4000_0000,
+            image_len: 0x3000,
+            dyn_: DynamicSection::empty(),
+        };
+        let r = unmap_dso(&d, |_addr, _len| -22); // -EINVAL
+        assert_eq!(r, Err(UnmapError::MunmapFailed(-22)));
     }
 }
