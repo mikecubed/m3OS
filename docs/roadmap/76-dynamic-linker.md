@@ -4,7 +4,7 @@
 **Source Ref:** phase-76
 **Depends on:** Phase 11 (Process Model) ✅, Phase 12 (POSIX Compatibility) ✅, Phase 75 (W^X Enforcement) ✅, Phase 31 (TCC Compiler Bootstrap) ✅
 **Builds on:** Extends the Phase 11 ELF loader to honor `PT_INTERP`, scaffolds the `ld.so` userspace crate, and proves the kernel→ld.so→main binary handoff end to end. The full dynamic-linker semantics (`DT_NEEDED` resolution, relocations, `dlopen`, GNU hash, PLT lazy resolve) land in subsequent phases.
-**Primary Components:** `kernel/src/mm/elf.rs`, `userspace/ld-musl-x86_64.so.1/`, `xtask/src/main.rs`, `userspace/tests/dynlink_smoke/`
+**Primary Components:** `kernel/src/mm/elf.rs`, `kernel-core/src/elf/auxv.rs`, `userspace/ld-musl-x86_64.so.1/`, `xtask/src/main.rs`, `userspace/dynlink_smoke/`
 
 ## Subphase Split (added during implementation)
 
@@ -36,8 +36,8 @@ SOLID/SRP: this phase delivers exactly two responsibilities — kernel `PT_INTER
 ## Learning Goals
 
 - Understand how `PT_INTERP` changes the kernel's ELF loading path: the kernel still parses the main binary's program headers (to populate `AT_PHDR` / `AT_PHNUM` / `AT_ENTRY`), but transfers control to the interpreter instead of the main binary's `e_entry`.
-- See the exact SysV AMD64 ABI initial-stack layout (argc → argv → NULL → envp → NULL → auxv → AT_NULL → string region) and the 16-byte `rsp` alignment requirement at the moment control reaches the interpreter's `_dlstart`.
-- Learn how a no_std PIE binary is built (custom target spec, `-Crelocation-model=pic`, `crate-type = ["bin"]` with a linker script that produces `ET_DYN`).
+- See the exact SysV AMD64 ABI initial-stack layout (argc → argv → NULL → envp → NULL → auxv → AT_NULL → string region) and the **`8 (mod 16)`** `rsp` alignment the m3OS kernel delivers at the moment control reaches the interpreter's `_dlstart` (the next `call` instruction then brings it to `0 (mod 16)` for the Rust callee).
+- Learn how a no_std PIE binary is built without a custom target spec — `x86_64-unknown-none`'s baked-in `position-independent-executables: true` and `relocation-model: "pic"` already produce `ET_DYN` output, so the `ld.so` crate just sets `crate-type = ["bin"]` and uses the standard target.
 - Observe the kernel→userspace handoff end to end: kernel boots, loads main + interp, transfers to interp's entry, interp self-relocates, interp jumps to `AT_ENTRY`, main prints sentinel.
 
 ## Feature Scope (Phase 76 only)
@@ -50,25 +50,25 @@ SOLID/SRP: this phase delivers exactly two responsibilities — kernel `PT_INTER
 
 `setup_abi_stack_with_envp` now drives the auxv via the new pure-logic `kernel-core::elf::auxv::build_layout` helper. The kernel ELF loader returns `LoadedElf.aux_extras: Option<AuxExtras>` where `AuxExtras { at_base, at_entry }` carries both the interpreter load bias and the main binary's entry (the two travel together because `AT_ENTRY` only makes sense when an interpreter was loaded — when no interpreter, `LoadedElf.entry` already IS the main binary's entry and no `AT_ENTRY` slot is needed). `ElfAuxInfo` threads this option through, and `setup_abi_stack_with_envp` consumes it.
 
-The emitted auxv ordering (low → high address) is `AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`, `AT_BASE`, `AT_ENTRY`, `AT_RANDOM`, `AT_NULL` when an interpreter is loaded; the four `AT_BASE` / `AT_ENTRY` slots are simply omitted for static binaries so the pre-Phase-76 6-entry shape (`AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`, `AT_RANDOM`, `AT_NULL`) is preserved bit-for-bit. `AT_RANDOM` continues to use the existing `0xAB`-pattern seed for determinism in tests; later phases may swap in real kernel CSPRNG output. Initial `rsp` is 16-byte aligned at the moment control transfers to the interpreter — the existing alignment-pad-above-auxv logic in `setup_abi_stack_with_envp` covers both the old 6-entry and new 8-entry shapes.
+The emitted auxv ordering (low → high address) is `AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`, `AT_BASE`, `AT_ENTRY`, `AT_RANDOM`, `AT_NULL` when an interpreter is loaded; the four `AT_BASE` / `AT_ENTRY` slots are simply omitted for static binaries so the pre-Phase-76 6-entry shape (`AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`, `AT_RANDOM`, `AT_NULL`) is preserved bit-for-bit. `AT_RANDOM` continues to use the existing `0xAB`-pattern seed for determinism in tests; later phases may swap in real kernel CSPRNG output. Initial `rsp` lands at `8 (mod 16)` at the moment control transfers to the interpreter — the existing alignment-pad-above-auxv logic in `setup_abi_stack_with_envp` (`if target % 16 != 8 { cursor -= 8; }`) covers both the old 6-entry and new 8-entry shapes. The `8 (mod 16)` choice matches SysV-ABI's function-call boundary so the very next `call` inside `_dlstart` brings the stack to `0 (mod 16)` for the Rust callee.
 
 ### `ld-musl-x86_64.so.1` crate scaffold (PIE, no_std)
 
 A new workspace crate `userspace/ld-musl-x86_64.so.1/` with:
-- `crate-type = ["bin"]`, `#![no_std]`, `#![no_main]`
-- Custom target spec `x86_64-m3os-ldso.json` with `relocation-model = "pic"` and `position-independent-executables = true`
-- `_dlstart` entry point in inline asm that recovers `argc`/`argv`/`envp`/`auxv` from `rsp`, walks the auxv for `AT_ENTRY`, and jumps to that address with a clean stack
-- BSS/data zero-init verified by an early serial log
+- `crate-type = ["bin"]`, `#![no_std]`, `#![no_main]`, `edition = "2024"`
+- Built with the **standard `x86_64-unknown-none` target** — no custom target spec needed. That target already enables `position-independent-executables: true` and `relocation-model: "pic"` (verified with `rustc -Z unstable-options --print target-spec-json`), so the linker emits an `ET_DYN` ELF by default. The crate name uses underscores (`ld-musl-x86_64-so-1`) because cargo rejects dots in package names; the xtask staging step renames the binary back to `ld-musl-x86_64.so.1` so the on-disk path matches what `PT_INTERP` records.
+- `_start` (aliased as `_dlstart` for cross-reference to musl's naming) — naked-asm entry that zeroes `rbp`, passes `rsp` to `dlstart_rust`, then `jmp`s the returned `AT_ENTRY`
+- A single early serial-write line (`ldso: _dlstart entry=0x<hex>`) emitted via inline-asm `syscall` so the smoke gate can observe the handoff
 
 In this subphase the linker is intentionally a **transfer-only stub**: it does NOT apply relocations, walk `DT_NEEDED`, or run constructors. Those land in 76b.
 
 ### `xtask` build pipeline
 
-A new `build_ldso` helper invokes the Rust toolchain with the custom target spec, stages the binary to `target/generated-libs/ld-musl-x86_64.so.1`, and `populate_ext2_files` copies it to `/lib/ld-musl-x86_64.so.1` on the ext2 disk. The directory `/lib` is created if absent. `cargo xtask clean && cargo xtask run` produces a disk that contains `/lib/ld-musl-x86_64.so.1`.
+A new `build_ldso` helper invokes the Rust toolchain with `--target x86_64-unknown-none` (the standard kernel target, which already produces PIE `ET_DYN` binaries), stages the resulting binary as `target/generated-libs/ld-musl-x86_64.so.1`, and `populate_ext2_files` copies it to `/lib/ld-musl-x86_64.so.1` on the ext2 disk. The directory `/lib` is created if absent. The same binary is also embedded in the kernel ramdisk under `/lib/ld-musl-x86_64.so.1` so the kernel's `PT_INTERP` reader can find it before the ext2 mount completes (early-boot smoke). `cargo xtask clean && cargo xtask run` produces a disk that contains `/lib/ld-musl-x86_64.so.1`.
 
 ### `dynlink_smoke` test binary
 
-A new test binary `userspace/dynlink_smoke/` built with musl-gcc as a dynamically linked ELF (`PT_INTERP = /lib/ld-musl-x86_64.so.1`, no `DT_NEEDED` entries beyond what the C startup needs). The binary's `main` writes `DYNLINK_SMOKE:PASS` to serial via the existing `sys_write(stdout)` syscall, then exits 0. The smoke harness asserts the sentinel appears.
+A new test binary `userspace/dynlink_smoke/dynlink-smoke.c` built with `musl-gcc -nostdlib -nostartfiles -fPIC -Wl,-pie -Wl,-dynamic-linker=/lib/ld-musl-x86_64.so.1` (with host `gcc` as fallback — the binary uses no libc symbols). The resulting ELF carries `PT_INTERP = /lib/ld-musl-x86_64.so.1` and **zero `DT_NEEDED` entries**. The binary has no `main` — `_start` is its own entry point, writes `DYNLINK_SMOKE:PASS\n` to fd 2 (stderr / serial) via inline-asm `syscall`, then exits via inline-asm `sys_exit(0)`. fd 2 is chosen over fd 1 so the smoke runner's serial-log pattern match works even if some intermediate shell ever redirects stdout. The smoke harness asserts the sentinel appears.
 
 ## Important Components and How They Work
 
@@ -88,7 +88,7 @@ The auxv must appear in the exact order musl's `arch/x86_64/crt_arch.h::_dlstart
 7. `AT_RANDOM` (25) — pointer to 16 bytes on the stack
 8. `AT_NULL` (0) — sentinel `{0, 0}`
 
-The 16-byte alignment requirement on `rsp` is enforced by padding the pointer table downward so that after `argc` is pushed, the resulting `rsp` is `0 (mod 16)`. (SysV-ABI is "8 mod 16" at function-call boundaries, but `_dlstart` is the program entry point — its convention is `0 mod 16` for the initial stack pointer.)
+The m3OS kernel enforces `rsp == 8 (mod 16)` at the point control transfers to `_dlstart` by padding the pointer table downward (`if target % 16 != 8 { cursor -= 8; }`). This matches SysV-ABI's **function-call boundary** convention — the very next `call dlstart_rust` inside `_dlstart` pushes the 8-byte return address and brings the stack to `0 (mod 16)`, the alignment any SSE/AVX code in the Rust callee may need. Note this deliberately differs from the Linux kernel's `_start` contract (which delivers `0 (mod 16)` directly to the program entry); the m3OS choice works because every binary we currently load has a `_start` that immediately calls into a higher-level language runtime. A future port of full musl `crt1.o` would either need a `and rsp, -16` prologue in `_start` or a kernel-side switch to the Linux convention; tracked for Phase 76b's bring-up work.
 
 ### `_dlstart` transfer-only stub
 
@@ -105,7 +105,7 @@ _dlstart:
 
 ### `xtask::build_ldso`
 
-Invokes `cargo build --release --package ld-musl-x86_64.so.1 --bin ld-musl-x86_64.so.1 --target userspace/ld-musl-x86_64.so.1/x86_64-m3os-ldso.json -Zbuild-std=core,compiler_builtins`. The resulting binary is copied to `target/generated-libs/ld-musl-x86_64.so.1`. `populate_ext2_files` ensures `/lib` exists on the ext2 disk and stages the binary there with `mode = 0o755`.
+Invokes `cargo build --release --package ld-musl-x86_64-so-1 --bin ld-musl-x86_64-so-1 --target x86_64-unknown-none -Zbuild-std=core,compiler_builtins -Zbuild-std-features=compiler-builtins-mem`. The standard `x86_64-unknown-none` target already produces a PIE `ET_DYN` ELF, so no custom target spec is required. The resulting binary is copied to `target/generated-libs/ld-musl-x86_64.so.1` (renamed from the underscored package name — cargo rejects dots in package names). `populate_ext2_files` ensures `/lib` exists on the ext2 disk and stages the binary there with `mode = 0o755`, and `kernel/src/fs/ramdisk.rs` embeds the same binary at the same path via `include_bytes!` for early-boot resolution.
 
 ## How This Builds on Earlier Phases
 

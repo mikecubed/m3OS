@@ -35,8 +35,19 @@
 //! [...]                      string region              raw bytes
 //! ```
 //!
-//! `rsp` is 16-byte aligned at this point (SysV-ABI requirement for
-//! `_dlstart`).
+//! `rsp` is delivered at `8 (mod 16)` at this point — matching the
+//! SysV-ABI function-call boundary convention. The very next `call`
+//! instruction in `_start` pushes the 8-byte return address and
+//! brings `rsp` to `0 (mod 16)` so `dlstart_rust` enters with a
+//! 16-byte-aligned stack (required for any SSE/AVX save/restore
+//! Rust may emit). This differs from the Linux kernel's `_start`
+//! contract (which delivers `0 (mod 16)` directly to the program
+//! entry); the m3OS kernel deliberately chose the function-call
+//! convention because every ELF we load has a `_start` that
+//! immediately calls into Rust. A future port of full musl crt1.o
+//! would either need a `and rsp, -16` prologue inside `_start` or a
+//! kernel-side switch to the Linux convention; tracked for Phase
+//! 76b's bring-up work.
 
 #![no_std]
 #![no_main]
@@ -76,15 +87,21 @@ const SYS_WRITE: u64 = 1;
 unsafe fn sys_write(fd: i32, buf: *const u8, len: usize) -> i64 {
     let ret: i64;
     unsafe {
+        // `rax` is both an input (syscall number) and an output
+        // (syscall return) so it must be a single `inlateout`
+        // operand — the separate `in("rax") … lateout("rax") …`
+        // shape leaves room for the compiler's register allocator
+        // to assume the two operands are distinct, which can cause
+        // operand-overlap surprises. `inlateout` is also the
+        // idiomatic Rust inline-asm form for any syscall pattern.
         core::arch::asm!(
             "syscall",
-            in("rax") SYS_WRITE,
+            inlateout("rax") SYS_WRITE => ret,
             in("rdi") fd as i64,
             in("rsi") buf,
             in("rdx") len,
             out("rcx") _,
             out("r11") _,
-            lateout("rax") ret,
             options(nostack),
         );
     }
