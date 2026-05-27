@@ -157,6 +157,7 @@ The kernel populates the auxiliary vector on the user stack in `setup_abi_stack`
 
 ### Real implementations (behaviour matches Linux semantics)
 
+- **dlopen/dlsym/dlclose/dlerror** (Phase 76c): Implemented by the dynamic linker (`/lib/ld-musl-x86_64.so.1`). See [Phase 76 — Dynamic Linker](./76-dynamic-linker.md) for the full libdl runtime. `RTLD_LAZY` is currently treated as `RTLD_NOW`; PLT lazy resolve ships in 76d. `dlerror` storage is process-global until TLS lands.
 - **read/write/writev/readv**: Global kernel-side FD table; reads from static ramdisk, writes to kernel serial log.
 - **open/close**: Global FD table with ramdisk file lookup.
 - **fstat/fstatat**: Returns file size, mode, block size from ramdisk.

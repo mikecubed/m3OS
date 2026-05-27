@@ -1,19 +1,19 @@
 # Phase 76c — Dynamic Linker: `dlopen` / `dlsym` / `dlclose`: Task List
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-76c
-**Depends on:** Phase 76 ✅, Phase 76b
+**Depends on:** Phase 76 ✅, Phase 76b ✅
 **Goal:** Ship a libdl-compatible `dlopen` / `dlsym` / `dlclose` / `dlerror` on top of the Phase 76b dependency-graph + relocation machinery, with `DT_FINI` / `DT_FINI_ARRAY` running on last-close.
 
 ## Track Layout
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| C1 | `dlopen(path, flags)` with `RTLD_LAZY` / `RTLD_NOW` / `RTLD_GLOBAL` / `RTLD_LOCAL` | Phase 76b | Planned |
-| C2 | `dlsym(handle, name)` + `dlclose(handle)` with `DT_FINI` / `DT_FINI_ARRAY` | C1 | Planned |
-| C3 | `dlerror()` process-global slot | C1 | Planned |
-| F2 | `dlopen_test` binary + xtask gate | C2, C3 | Planned |
-| H | Phase 12 doc closure + `docs/76-dynamic-linker.md` update + version bump | F2 | Planned |
+| C1 | `dlopen(path, flags)` with `RTLD_LAZY` / `RTLD_NOW` / `RTLD_GLOBAL` / `RTLD_LOCAL` | Phase 76b | **Complete** |
+| C2 | `dlsym(handle, name)` + `dlclose(handle)` with `DT_FINI` / `DT_FINI_ARRAY` | C1 | **Complete** |
+| C3 | `dlerror()` process-global slot | C1 | **Complete** |
+| F2 | `dlopen_test` binary + xtask gate | C2, C3 | **Complete** |
+| H | Phase 12 doc closure + `docs/76-dynamic-linker.md` update + version bump | F2 | **Complete** |
 
 ---
 
@@ -26,9 +26,9 @@
 **Why it matters:** `dlopen` returns an opaque handle that `dlclose` must validate; without a slab + generation counter, forged or already-freed handles produce undefined behavior on `dlclose`.
 
 **Acceptance:**
-- [ ] `HandleTable::insert(dso_id) -> *mut c_void` returns an opaque pointer to a `Handle { dso_id, generation }` record.
-- [ ] `HandleTable::resolve(handle: *mut c_void) -> Option<DsoId>` returns `None` for forged handles, already-freed handles, or handles whose generation does not match the live DSO's generation.
-- [ ] Unit-tested under `#[cfg(test)]` with insert / resolve / remove / re-insert-bumps-generation fixtures.
+- [x] `HandleTable::insert(dso_id) -> *mut c_void` returns an opaque pointer to a `Handle { dso_id, generation }` record.
+- [x] `HandleTable::resolve(handle: *mut c_void) -> Option<DsoId>` returns `None` for forged handles, already-freed handles, or handles whose generation does not match the live DSO's generation.
+- [x] Unit-tested under `#[cfg(test)]` with insert / resolve / remove / re-insert-bumps-generation fixtures.
 
 ### C1.2 — `dlopen` entry, path resolution, flag parsing
 
@@ -37,12 +37,12 @@
 **Why it matters:** This is the libdl entry point; flag parsing and search-path resolution must match the POSIX contract so existing libdl-using code works without modification.
 
 **Acceptance:**
-- [ ] `extern "C" fn dlopen(path: *const c_char, flags: c_int) -> *mut c_void`.
-- [ ] `path = NULL` returns a handle to the main binary.
-- [ ] Path with no `/` searches the standard load paths (matches 76b's `LD_LIBRARY_PATH` / `/lib` / `/usr/lib` / `/usr/local/lib` order).
-- [ ] Path with `/` is treated as absolute (or relative-to-CWD; POSIX allows either — m3OS chooses absolute).
-- [ ] `RTLD_NOW` triggers `apply_jmprel_table` at open time; `RTLD_LAZY` is accepted but treated as `RTLD_NOW` in 76c (PLT lazy resolve is 76d).
-- [ ] `RTLD_GLOBAL` inserts the DSO into the process-global scope; `RTLD_LOCAL` (default) does not.
+- [x] `extern "C" fn dlopen(path: *const c_char, flags: c_int) -> *mut c_void`.
+- [x] `path = NULL` returns a handle to the main binary.
+- [x] Path with no `/` searches the standard load paths (matches 76b's `LD_LIBRARY_PATH` / `/lib` / `/usr/lib` / `/usr/local/lib` order).
+- [x] Path with `/` is treated as absolute (or relative-to-CWD; POSIX allows either — m3OS chooses absolute).
+- [x] `RTLD_NOW` triggers `apply_jmprel_table` at open time; `RTLD_LAZY` is accepted but treated as `RTLD_NOW` in 76c (PLT lazy resolve is 76d).
+- [x] `RTLD_GLOBAL` inserts the DSO into the process-global scope; `RTLD_LOCAL` (default) does not.
 
 ### C1.3 — Refcount-increment for repeat opens
 
@@ -51,8 +51,8 @@
 **Why it matters:** POSIX requires that repeat opens of the same `SONAME` return the same handle with an incremented refcount; without this, every plugin host that calls `dlopen` twice leaks memory.
 
 **Acceptance:**
-- [ ] Repeat `dlopen` of the same resolved `SONAME` increments the existing handle's refcount and returns a fresh handle pointer that resolves to the same `DsoId`.
-- [ ] A new `dlopen` after every prior handle was `dlclose`d still re-maps the library (refcount semantics are per-DSO, not per-handle).
+- [x] Repeat `dlopen` of the same resolved `SONAME` increments the existing handle's refcount and returns a fresh handle pointer that resolves to the same `DsoId`.
+- [x] A new `dlopen` after every prior handle was `dlclose`d still re-maps the library (refcount semantics are per-DSO, not per-handle).
 
 ---
 
@@ -65,10 +65,10 @@
 **Why it matters:** Every libdl-using consumer goes through `dlsym` to actually call into the loaded library; missing or wrong lookups break every consumer.
 
 **Acceptance:**
-- [ ] `extern "C" fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void`.
-- [ ] Real-handle path: search the handle's DSO and its dependency chain via `DT_HASH`.
-- [ ] `RTLD_DEFAULT` (`handle == NULL`): search the process-global scope.
-- [ ] Not-found returns `NULL` and populates `dlerror()` with `"undefined symbol: <name>"`.
+- [x] `extern "C" fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void`.
+- [x] Real-handle path: search the handle's DSO and its dependency chain via `DT_HASH`.
+- [x] `RTLD_DEFAULT` (`handle == NULL`): search the process-global scope.
+- [x] Not-found returns `NULL` and populates `dlerror()` with `"undefined symbol: <name>"`.
 
 ### C2.2 — `dlclose` refcount + destructor pipeline
 
@@ -77,10 +77,10 @@
 **Why it matters:** `dlclose` must run destructors before unmapping; the order (`DT_FINI_ARRAY` reverse then `DT_FINI`) is contractually fixed and ABI-visible. The destructor must be invoked via a register-loaded function pointer (not a GOT slot) because the DSO's GOT is about to be unmapped — a GOT-routed indirect call would page-fault on the very next instruction after the unmap.
 
 **Acceptance:**
-- [ ] `extern "C" fn dlclose(handle: *mut c_void) -> c_int`.
-- [ ] Decrements the DSO's refcount; when refcount reaches zero, runs `DT_FINI_ARRAY` in reverse-array order then `DT_FINI` (if present), then removes the DSO from the global scope, then unmaps the DSO's image via `unmap_dso` (C2.3).
-- [ ] Forged or already-freed handle returns `-1` and populates `dlerror()`.
-- [ ] Destructor invocation uses a register-loaded function pointer (not a GOT slot) — rationale above.
+- [x] `extern "C" fn dlclose(handle: *mut c_void) -> c_int`.
+- [x] Decrements the DSO's refcount; when refcount reaches zero, runs `DT_FINI_ARRAY` in reverse-array order then `DT_FINI` (if present), then removes the DSO from the global scope, then unmaps the DSO's image via `unmap_dso` (C2.3).
+- [x] Forged or already-freed handle returns `-1` and populates `dlerror()`.
+- [x] Destructor invocation uses a register-loaded function pointer (not a GOT slot) — rationale above.
 
 ### C2.3 — DSO unmap path
 
@@ -89,9 +89,9 @@
 **Why it matters:** Without unmapping, refcounted close still leaks address space. Phase 76b's `load_dso` issues a single anonymous `mmap` covering the whole image extent (the kernel ignores `MAP_FIXED`, so the kernel-chosen base becomes `load_bias`) and then copies each `PT_LOAD` in and `mprotect`s the executable segments — the matching unmap is therefore one `munmap` of the same whole-image range, not a per-`PT_LOAD` walk (the inter-segment gaps belong to the same allocation).
 
 **Acceptance:**
-- [ ] `LoadedDso` carries the `(load_bias, image_len)` pair captured at load time (image_len = `p_vaddr + p_memsz` of the highest `PT_LOAD`, page-aligned up).
-- [ ] `unmap_dso(dso: &LoadedDso) -> Result<(), DlError>` issues a single `munmap(load_bias, image_len)` matching the 76b whole-image mmap shape.
-- [ ] After return, the DSO record is removed from the linker's load list and its handle generation is invalidated so subsequent `dlsym`/`dlclose` against a stale handle returns the forged-handle error.
+- [x] `LoadedDso` carries the `(load_bias, image_len)` pair captured at load time (image_len = `p_vaddr + p_memsz` of the highest `PT_LOAD`, page-aligned up).
+- [x] `unmap_dso(dso: &LoadedDso) -> Result<(), DlError>` issues a single `munmap(load_bias, image_len)` matching the 76b whole-image mmap shape.
+- [x] After return, the DSO record is removed from the linker's load list and its handle generation is invalidated so subsequent `dlsym`/`dlclose` against a stale handle returns the forged-handle error.
 
 ---
 
@@ -104,9 +104,9 @@
 **Why it matters:** The libdl contract requires that error messages survive across libdl calls but are cleared by `dlerror()` itself; getting the read-and-clear ordering wrong breaks error-checking idioms.
 
 **Acceptance:**
-- [ ] `DlError` is a `Mutex<Option<&'static str>>` (or equivalent) accessed under the same `DlState` lock as the handle table.
-- [ ] `dlerror()` reads the current message, clears the slot, returns the message (or `NULL` if there was none).
-- [ ] Documented as not-yet-thread-safe in `docs/76-dynamic-linker.md` (the thread-local upgrade is gated on TLS).
+- [x] `DlError` is a `Mutex<Option<&'static str>>` (or equivalent) accessed under the same `DlState` lock as the handle table.
+- [x] `dlerror()` reads the current message, clears the slot, returns the message (or `NULL` if there was none).
+- [x] Documented as not-yet-thread-safe in `docs/76-dynamic-linker.md` (the thread-local upgrade is gated on TLS).
 
 ---
 
@@ -119,15 +119,15 @@
 **Why it matters:** A real C consumer is the only way to validate that the libdl ABI works against existing libdl-using code shapes; a Rust-only test would mask C-ABI bugs. Per AGENTS.md the binary also needs the full four-place wiring (xtask build + ramdisk embedding) or `execve` returns ENOENT at smoke time.
 
 **Acceptance:**
-- [ ] Source at `userspace/dlopen_test/dlopen_test.c`; built as a musl dynamic ELF with `PT_INTERP=/lib/ld-musl-x86_64.so.1` (mirrors the 76b `dynlink_hello` shape) — no Rust workspace member is added.
-- [ ] xtask build pipeline (`xtask/src/main.rs`) invokes musl-gcc for the binary and stages it to `target/generated-initrd/dlopen_test`; `populate_ext2_files` writes it to `/bin/dlopen_test` on the data disk.
-- [ ] `kernel/src/fs/ramdisk.rs` `BIN_ENTRIES` gains a `dlopen_test` row with the matching `include_bytes!` static so the binary is available before ext2 mount.
-- [ ] Calls `dlopen("/usr/lib/libhello.so", RTLD_NOW)`; asserts non-NULL.
-- [ ] Calls `dlsym(handle, "hello_str")`; asserts non-NULL.
-- [ ] Calls the function through the resolved pointer; asserts the returned string equals `"HELLO_FROM_SHARED_LIB:OK"`.
-- [ ] Calls `dlclose(handle)`; asserts return value is 0.
-- [ ] Exercises the four negative paths: missing library, missing symbol, double-close, close-of-never-opened-handle. Asserts each populates `dlerror()` appropriately.
-- [ ] Prints `DLOPEN_TEST:PASS` on serial after all positive and negative cases pass.
+- [x] Source at `userspace/dlopen_test/dlopen_test.c`; built as a musl dynamic ELF with `PT_INTERP=/lib/ld-musl-x86_64.so.1` (mirrors the 76b `dynlink_hello` shape) — no Rust workspace member is added.
+- [x] xtask build pipeline (`xtask/src/main.rs`) invokes musl-gcc for the binary and stages it to `target/generated-initrd/dlopen_test`; `populate_ext2_files` writes it to `/bin/dlopen_test` on the data disk.
+- [x] `kernel/src/fs/ramdisk.rs` `BIN_ENTRIES` gains a `dlopen_test` row with the matching `include_bytes!` static so the binary is available before ext2 mount.
+- [x] Calls `dlopen("/usr/lib/libhello.so", RTLD_NOW)`; asserts non-NULL.
+- [x] Calls `dlsym(handle, "hello_str")`; asserts non-NULL.
+- [x] Calls the function through the resolved pointer; asserts the returned string equals `"HELLO_FROM_SHARED_LIB:OK"`.
+- [x] Calls `dlclose(handle)`; asserts return value is 0.
+- [x] Exercises the four negative paths: missing library, missing symbol, double-close, close-of-never-opened-handle. Asserts each populates `dlerror()` appropriately.
+- [x] Prints `DLOPEN_TEST:PASS` on serial after all positive and negative cases pass.
 
 ### F2.2 — `cargo xtask dlopen-test-smoke` gate
 
@@ -136,8 +136,8 @@
 **Why it matters:** Without the gate, the demo regresses silently the moment any of C1/C2/C3 is broken.
 
 **Acceptance:**
-- [ ] Subcommand boots QEMU, execs `/bin/dlopen_test`, asserts the test prints `DLOPEN_TEST:PASS` on serial.
-- [ ] Smoke-runner emits `SMOKE:dlopen-test-smoke:PASS` / `:FAIL` and is wired into the standard `cargo xtask smoke-test` step list.
+- [x] Subcommand boots QEMU, execs `/bin/dlopen_test`, asserts the test prints `DLOPEN_TEST:PASS` on serial.
+- [x] Smoke-runner emits `SMOKE:dlopen-test-smoke:PASS` / `:FAIL` and is wired into the standard `cargo xtask smoke-test` step list.
 
 ### F2.3 — Destructor-runs assertion in the gate
 
@@ -150,10 +150,10 @@
 **Why it matters:** `DT_FINI_ARRAY` is the most subtle part of `dlclose` and the easiest to silently skip; the gate must explicitly verify destructor invocation with a serial ordering pin that cannot be satisfied by a no-op.
 
 **Acceptance:**
-- [ ] `userspace/lib/libhello_fini/hello_fini.{h,c}` source mirrors the 76b `libhello` shape (`DT_SONAME=libhello_fini.so`, built with `--hash-style=sysv` per Documentation Notes); a `__attribute__((destructor))` function writes `LIBHELLO_FINI:RAN\n` directly to stderr via `write(2)` (not `printf` — avoids dependence on stdio flush on DSO unmap).
-- [ ] xtask wiring calls `build_shared_lib("libhello_fini", &["userspace/lib/libhello_fini/hello_fini.c"], "target/generated-libs/libhello_fini.so")`; `populate_ext2_files` writes it to `/usr/lib/libhello_fini.so`; kernel ramdisk `USR_LIB_ENTRIES` gains the matching row.
-- [ ] `dlopen_test` prints `DLOPEN_TEST:FINI_PENDING` *before* its `dlclose(libhello_fini)` call and `DLOPEN_TEST:PASS` *after* every assertion.
-- [ ] Smoke-runner asserts the serial substring order `DLOPEN_TEST:FINI_PENDING` → `LIBHELLO_FINI:RAN` → `DLOPEN_TEST:PASS` strictly (a missing `LIBHELLO_FINI:RAN` between the two bracket sentinels is a `:FAIL`).
+- [x] `userspace/lib/libhello_fini/hello_fini.{h,c}` source mirrors the 76b `libhello` shape (`DT_SONAME=libhello_fini.so`, built with `--hash-style=sysv` per Documentation Notes); a `__attribute__((destructor))` function writes `LIBHELLO_FINI:RAN\n` directly to stderr via `write(2)` (not `printf` — avoids dependence on stdio flush on DSO unmap).
+- [x] xtask wiring calls `build_shared_lib("libhello_fini", &["userspace/lib/libhello_fini/hello_fini.c"], "target/generated-libs/libhello_fini.so")`; `populate_ext2_files` writes it to `/usr/lib/libhello_fini.so`; kernel ramdisk `USR_LIB_ENTRIES` gains the matching row.
+- [x] `dlopen_test` prints `DLOPEN_TEST:FINI_PENDING` *before* its `dlclose(libhello_fini)` call and `DLOPEN_TEST:PASS` *after* every assertion.
+- [x] Smoke-runner asserts the serial substring order `DLOPEN_TEST:FINI_PENDING` → `LIBHELLO_FINI:RAN` → `DLOPEN_TEST:PASS` strictly (a missing `LIBHELLO_FINI:RAN` between the two bracket sentinels is a `:FAIL`).
 
 ---
 
@@ -169,9 +169,9 @@
 **Why it matters:** Phase 76c is the second 76 sub-phase; the patch bump keeps the running banner accurate.
 
 **Acceptance:**
-- [ ] `kernel/Cargo.toml` `version = "0.76.2"`.
-- [ ] `Cargo.lock` regenerated and checked in.
-- [ ] Boot banner prints `m3OS 0.76.2`.
+- [x] `kernel/Cargo.toml` `version = "0.76.2"`.
+- [x] `Cargo.lock` regenerated and checked in.
+- [x] Boot banner prints `m3OS 0.76.2`.
 
 ### H.2 — Extend `docs/76-dynamic-linker.md` with the libdl sections
 
@@ -180,10 +180,10 @@
 **Why it matters:** Phase 76's learning doc must grow to cover the runtime plugin API once it ships, or it becomes misleading.
 
 **Acceptance:**
-- [ ] New "What changes in 76c" section describes `dlopen` / `dlsym` / `dlclose` / `dlerror` and the destructor pipeline.
-- [ ] Key Files table extended with `userspace/ld-musl-x86_64.so.1/src/dl.rs`, `handle.rs`, `userspace/dlopen_test/`.
-- [ ] Subphase table at the top of the doc updates 76c's row to reflect the gate is now wired.
-- [ ] "Deferred Until Later" section in the learning doc clarifies that the `dlerror` slot is process-global until TLS lands.
+- [x] New "What changes in 76c" section describes `dlopen` / `dlsym` / `dlclose` / `dlerror` and the destructor pipeline.
+- [x] Key Files table extended with `userspace/ld-musl-x86_64.so.1/src/dl.rs`, `handle.rs`, `userspace/dlopen_test/`.
+- [x] Subphase table at the top of the doc updates 76c's row to reflect the gate is now wired.
+- [x] "Deferred Until Later" section in the learning doc clarifies that the `dlerror` slot is process-global until TLS lands.
 
 ### H.3 — Phase 12 doc closure: remove `dlopen` not-yet-implemented entry
 
@@ -192,8 +192,8 @@
 **Why it matters:** `docs/12-posix-compatibility-layer.md` currently lists `dlopen` / `dlsym` / `dlclose` as unimplemented; without an update, the POSIX-compat tracker contradicts the shipping behavior.
 
 **Acceptance:**
-- [ ] `dlopen` / `dlsym` / `dlclose` / `dlerror` are documented as implemented in 76c with a link to `docs/76-dynamic-linker.md`.
-- [ ] Any "Deferred Until Later" entry in Phase 12 that pointed at `dlopen` is updated to point at the 76c row.
+- [x] `dlopen` / `dlsym` / `dlclose` / `dlerror` are documented as implemented in 76c with a link to `docs/76-dynamic-linker.md`.
+- [x] Any "Deferred Until Later" entry in Phase 12 that pointed at `dlopen` is updated to point at the 76c row.
 
 ### H.4 — Update roadmap README row for Phase 76c
 
@@ -202,8 +202,8 @@
 **Why it matters:** The roadmap README is the canonical phase index; missing or stale rows mean readers cannot navigate to the phase docs.
 
 **Acceptance:**
-- [ ] New row: `| 76c | Dynamic Linker: dlopen | dlopen / dlsym / dlclose / dlerror with DT_FINI_ARRAY destructors | Complete | phase-76c | [Phase 76c](./76c-dlopen.md) | [Tasks](./tasks/76c-dlopen-tasks.md) |`.
-- [ ] Phase 76 and 76b rows remain `Complete` and are unaffected.
+- [x] New row: `| 76c | Dynamic Linker: dlopen | dlopen / dlsym / dlclose / dlerror with DT_FINI_ARRAY destructors | Complete | phase-76c | [Phase 76c](./76c-dlopen.md) | [Tasks](./tasks/76c-dlopen-tasks.md) |`.
+- [x] Phase 76 and 76b rows remain `Complete` and are unaffected.
 
 ### H.5 — Update `AGENTS.md` project-overview paragraph
 
@@ -212,8 +212,8 @@
 **Why it matters:** The project-overview paragraph is the single most-read summary of the current state of m3OS.
 
 **Acceptance:**
-- [ ] Phase 76c clause added describing: `dlopen` / `dlsym` / `dlclose` / `dlerror`, refcounted handle table, `DT_FINI_ARRAY` + `DT_FINI` destructors on last-close, `dlopen_test` gate, kernel version `0.76.2`.
-- [ ] Phase 76 paragraph's "Deferred Until Later" closure references are updated to remove 76c from the deferred list.
+- [x] Phase 76c clause added describing: `dlopen` / `dlsym` / `dlclose` / `dlerror`, refcounted handle table, `DT_FINI_ARRAY` + `DT_FINI` destructors on last-close, `dlopen_test` gate, kernel version `0.76.2`.
+- [x] Phase 76 paragraph's "Deferred Until Later" closure references are updated to remove 76c from the deferred list.
 
 ---
 

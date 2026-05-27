@@ -38,8 +38,8 @@ the `PT_INTERP` boundary:
 | Subphase | What it ships | Smoke gate |
 |---|---|---|
 | **76** (this) | Kernel `PT_INTERP` branch, full SysV-ABI auxv, ld.so PIE crate scaffold, transfer-only `_dlstart` | `dynlink_smoke` — a no-DT_NEEDED dynamic ELF that prints `DYNLINK_SMOKE:PASS` |
-| 76b | Real `_dlstart`, `PT_DYNAMIC` parse, `DT_NEEDED` dependency graph, x86_64 relocations, `DT_INIT_ARRAY` | `libhello.so` + `dynlink_hello` |
-| 76c | `dlopen` / `dlsym` / `dlclose`, `DT_FINI_ARRAY` | `dlopen_test` |
+| 76b | Real `_dlstart`, `PT_DYNAMIC` parse, `DT_NEEDED` dependency graph, x86_64 relocations, `DT_INIT_ARRAY` | `libhello.so` + `dynlink_hello` ✅ |
+| **76c** | `dlopen` / `dlsym` / `dlclose` / `dlerror`, refcounted handle table, `DT_FINI_ARRAY` + `DT_FINI` destructors on last-close | `dlopen_test` + `libhello_fini.so` ✅ |
 | 76d | PLT lazy resolve (`_dl_runtime_resolve`), `DT_GNU_HASH`, basic symbol versioning | A `.so` built with `--hash-style=gnu` |
 
 The split lets each PR land with a green smoke gate. 76's gate proves
@@ -135,6 +135,12 @@ embedded in the kernel ramdisk under `/lib/` so the kernel's
 | `userspace/dynlink_missing/dynlink_missing.c` | 76b F1.4 missing-dep negative gate (`DT_NEEDED = libdoesnotexist.so` → exit 2) |
 | `userspace/dynlink_cycle/dynlink_cycle.c` | 76b F1.4 cycle negative gate (links `libcyca.so` ↔ `libcycb.so` → exit 80) |
 | `userspace/lib/libcyca/{cyca,cyca_stub}.c` | 76b cycle-test source (final + chicken-and-egg-break stub) |
+| `userspace/ld-musl-x86_64.so.1/src/dl.rs` | 76c `DlState`, `dlopen` / `dlsym` / `dlclose` / `dlerror` |
+| `userspace/ld-musl-x86_64.so.1/src/handle.rs` | 76c `HandleTable` slab + generation counter (host-tested) |
+| `userspace/ld-musl-x86_64.so.1/build.rs` | 76c link-time flags (`--hash-style=sysv` / `--export-dynamic` / `-soname=ld-musl-x86_64.so.1`) |
+| `userspace/lib/libdl/libdl.c` | 76c link-time stub library (real impls live in the linker) |
+| `userspace/lib/libhello_fini/hello_fini.{c,h}` | 76c destructor demo (`__attribute__((destructor))` writes `LIBHELLO_FINI:RAN`) |
+| `userspace/dlopen_test/dlopen_test.c` | 76c smoke binary: open / sym / call / close + four negative paths + DT_FINI_ARRAY assertion |
 | `userspace/lib/libcycb/cycb.c` | 76b cycle-test source (other half of the cycle) |
 | `userspace/smoke-runner/src/main.rs` | Drives `dynlink_*` and asserts sentinels + exit codes |
 | `xtask/src/main.rs` | `build_ldso` + `build_shared_lib` + `build_dynlink_{smoke,hello,missing,cycle}` + `build_cycle_libs` + `/lib/` and `/usr/lib/` staging |
@@ -251,16 +257,89 @@ built first so `libcycb.so` can link against it; then the final
 `libcyca.so` is built linking against `libcycb.so` to close the
 cycle. Only the final pair is staged on disk.
 
-## What is intentionally NOT in 76 / 76b
+## What changes in 76c
+
+### libdl runtime — `userspace/ld-musl-x86_64.so.1/src/dl.rs`
+
+The four POSIX libdl entry points (`dlopen`, `dlsym`, `dlclose`,
+`dlerror`) live in the dynamic linker binary itself. The linker is
+no longer just an exec-time stub — after `dl_entry` returns and the
+asm caller `jmp`s to the main binary, the linker stays in memory
+and answers libdl calls.
+
+State persistence is a single `static DL_STATE: DlStateCell` wrapping
+an `UnsafeCell<DlState>`. The cell is `Sync` only because Phase 76c
+is single-threaded; the thread-safety upgrade is gated on TLS. The
+`DlState` carries:
+
+- `dsos: [LoadedDso; MAX_SLOTS]` — slot-indexed DSO table.
+- `names: [&'static [u8]; MAX_SLOTS]` — SONAME per slot for `find_by_soname` dedup.
+- `dep_lists: [heapless::Vec<DsoId, MAX_SLOTS>; MAX_SLOTS]` — dependency edges for `dlsym`'s walk.
+- `refcounts: [u32; MAX_SLOTS]` — `0` means free slot; `REFCOUNT_PERMANENT == u32::MAX` for main / linker / bring-up `DT_NEEDED` libs (`dlclose` never unmaps them).
+- `in_global_scope: [bool; MAX_SLOTS]` — `RTLD_GLOBAL` visibility.
+- `handles: HandleTable` — slab of `(dso_id, generation)` records so a forged or freed handle pointer is detected.
+- `error: Option<&'static [u8]>` — last `dlerror()` message; read-and-clear semantics.
+
+### Linker self-injection
+
+`dl_entry` builds the bring-up DSO list as before, but with the
+linker itself injected at slot 1 (right after the main binary).
+That makes the linker's own DT_HASH the first place the SysV
+symbol-search walker checks for `dlopen` / `dlsym` / `dlclose` /
+`dlerror`, so the linker's real implementations resolve to those
+names regardless of whether `libdl.so` defines them as stubs.
+
+The linker's binary now ships with three new link-time flags
+(`build.rs` emits them for the `x86_64-unknown-none` target):
+
+- `--hash-style=sysv` — `DT_HASH` populated, `DT_GNU_HASH` absent (76d will switch).
+- `--export-dynamic` — promotes `#[no_mangle] pub extern "C" fn` symbols into the dynamic symbol table.
+- `-soname=ld-musl-x86_64.so.1` — `DT_SONAME` set so GNU ld can scan the linker as a shared library at link time.
+
+### Destructor pipeline — `run_destructors_for(&LoadedDso)`
+
+On `dlclose`'s last-close path, the linker walks `DT_FINI_ARRAY` in
+reverse-array order then calls `DT_FINI` (if present). Destructors
+are invoked through a register-loaded `extern "C" fn()` pointer —
+not via a GOT slot — because the DSO's GOT is about to be unmapped;
+a GOT-routed indirect call would page-fault on the next dispatch
+inside `unmap_dso`. The unmap is a single
+`munmap(load_bias, image_len)` (matched to the 76b whole-image
+mmap) wrapped by the host-testable `ldso_core::dynlink::unmap_dso`.
+
+### `dlopen_test` smoke gate
+
+The new `dlopen_test` C binary exercises every libdl entry point —
+positive open / sym / call / close on `libhello.so`, refcount path
+(open twice, close twice), and four negative paths (missing
+library, missing symbol, close-of-bogus-handle, double-close).
+`libhello_fini.so` has a `__attribute__((destructor))` that writes
+`LIBHELLO_FINI:RAN\n` directly via `write(1, …)`; the smoke gate
+asserts the strict serial order
+`DLOPEN_TEST:FINI_PENDING → LIBHELLO_FINI:RAN → DLOPEN_TEST:PASS`,
+so a missing destructor invocation between the bracket sentinels is
+a `:FAIL`.
+
+### Caveats / known sharp edges
+
+- **Thread safety:** `DL_STATE` is reachable through an
+  `UnsafeCell` with an unsynchronised access wrapper. The current
+  invariant is "single-threaded process"; concurrent libdl calls
+  from different threads would race. The fix is gated on TLS.
+- **`dlerror` is process-global:** likewise gated on TLS. POSIX
+  requires thread-local `dlerror` storage; m3OS will switch when
+  TLS lands.
+- **`RTLD_LAZY` is treated as `RTLD_NOW`:** PLT lazy resolution
+  ships in 76d.
+
+## What is intentionally NOT in 76 / 76b / 76c
 
 | Concern | Subphase |
 |---|---|
-| `dlopen(path, flags)`, `dlsym(handle, name)`, `dlclose(handle)`, `dlerror()` | 76c |
-| `DT_FINI` / `DT_FINI_ARRAY` destructor running on `dlclose` | 76c |
 | PLT lazy resolution (`_dl_runtime_resolve` asm trampoline + first-call GOT slot rewrite) | 76d |
 | `DT_GNU_HASH` Bloom-filter symbol lookup | 76d |
 | `DT_VERSYM` / `DT_VERNEED` graceful handling | 76d |
-| TLS blocks, `RTLD_NEXT`, namespaces (`dlmopen`), IFUNC | Beyond 76d |
+| TLS blocks, `RTLD_NEXT`, namespaces (`dlmopen`), IFUNC, `dladdr` / `dlinfo` | Beyond 76d |
 
 ## Related Roadmap Docs
 
