@@ -35,7 +35,14 @@ const char *hello_fini_str(void) {
 __attribute__((destructor))
 static void __hello_fini_dtor(void) {
     static const char SENTINEL[] = "LIBHELLO_FINI:RAN\n";
-    /* fd 2 = stderr. The kernel serial console mirrors both fd 1
-     * and fd 2 in smoke-test mode. */
-    sys_write(2, SENTINEL, sizeof(SENTINEL) - 1);
+    /* fd 1 (stdout) rather than fd 2 because m3OS's `dup2` does not
+     * share the file description between fd 1 and fd 2 (so writes
+     * from the two fds land in two separate streams in the smoke
+     * gate's capture file). Writing to fd 1 keeps the destructor
+     * sentinel in the same stream as `DLOPEN_TEST:FINI_PENDING` /
+     * `DLOPEN_TEST:PASS`, preserving the strict serial ordering the
+     * smoke gate asserts. The "raw `write(2)` rather than `printf`"
+     * reasoning is unchanged — we still avoid any stdio dependency
+     * on the about-to-be-unmapped DSO. */
+    sys_write(1, SENTINEL, sizeof(SENTINEL) - 1);
 }

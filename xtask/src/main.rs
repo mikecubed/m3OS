@@ -6155,6 +6155,18 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         extra_steps_a: &[],
         extra_steps_b: &[],
     });
+    // Phase 76c — libdl runtime gate. Drives dlopen / dlsym /
+    // dlclose / dlerror through `dlopen_test` and asserts that
+    // DT_FINI_ARRAY destructors fire in the right serial order
+    // between the test's FINI_PENDING and PASS bracket sentinels.
+    steps.push(SmokeStep::WaitEither {
+        pattern_a: "SMOKE:dlopen-test-smoke:PASS",
+        pattern_b: "SMOKE:dlopen-test-smoke:SKIP",
+        timeout_secs: 30,
+        label: "guest/dlopen-test-smoke: libdl runtime + DT_FINI_ARRAY destructors",
+        extra_steps_a: &[],
+        extra_steps_b: &[],
+    });
     steps.push(SmokeStep::Wait {
         pattern: "SMOKE:PASS",
         timeout_secs: 5,
