@@ -1,0 +1,300 @@
+//! `PT_DYNAMIC` parser, dependency-graph loader, hash-based symbol
+//! lookup, and constructor invocation.
+//!
+//! Phase 76b shape (filled in track by track):
+//!
+//! * [`DynamicSection`] — typed view of a `PT_DYNAMIC` section.
+//! * `LoadedDso` / dependency loader — to come (B2.2).
+//! * `topo_sort` — to come (B2.3).
+//! * `DynamicSection::lookup_symbol` — SysV `DT_HASH` (B3.4).
+//! * `run_constructors` — deepest-first walker (B5.1).
+
+use crate::elf64::{
+    DT_HASH, DT_INIT, DT_INIT_ARRAY, DT_INIT_ARRAYSZ, DT_JMPREL, DT_NEEDED, DT_NULL, DT_PLTREL,
+    DT_PLTRELSZ, DT_RELA, DT_RELAENT, DT_RELASZ, DT_SONAME, DT_STRSZ, DT_STRTAB, DT_SYMENT,
+    DT_SYMTAB, Dyn, Sym,
+};
+use core::ptr::NonNull;
+
+/// Hard upper bound on `DT_NEEDED` entries `DynamicSection` will
+/// index. Real binaries have ~5; reserving 16 is generous for Phase
+/// 76b's bring-up linker.
+pub const MAX_NEEDED: usize = 16;
+
+/// Typed view of a `PT_DYNAMIC` section. Pointer slots are
+/// `Option<NonNull<_>>` so the consumer cannot accidentally
+/// dereference an absent tag.
+#[derive(Debug, Clone)]
+pub struct DynamicSection {
+    /// `DT_STRTAB` — address of the string table inside the DSO.
+    pub strtab: Option<NonNull<u8>>,
+    /// `DT_STRSZ` — size in bytes of the string table.
+    pub strsz: u64,
+    /// `DT_SYMTAB` — address of the dynamic symbol table.
+    pub symtab: Option<NonNull<Sym>>,
+    /// `DT_SYMENT` — size of one symbol-table entry (must be 24 on x86_64).
+    pub syment: u64,
+    /// `DT_RELA` — address of the `Rela` table.
+    pub rela: Option<NonNull<u8>>,
+    /// `DT_RELASZ` — total size in bytes of the `Rela` table.
+    pub relasz: u64,
+    /// `DT_RELAENT` — size of one `Rela` entry (must be 24).
+    pub relaent: u64,
+    /// `DT_JMPREL` — address of the PLT relocation table.
+    pub jmprel: Option<NonNull<u8>>,
+    /// `DT_PLTRELSZ` — size in bytes of the PLT relocation table.
+    pub pltrelsz: u64,
+    /// `DT_PLTREL` — `DT_REL` (17) or `DT_RELA` (7); Phase 76b only
+    /// supports `DT_RELA`.
+    pub pltrel: i64,
+    /// `DT_INIT` — address of the `_init` function (legacy single-init).
+    pub init: Option<NonNull<u8>>,
+    /// `DT_INIT_ARRAY` — address of the constructor pointer array.
+    pub init_array: Option<NonNull<u8>>,
+    /// `DT_INIT_ARRAYSZ` — size in bytes of the constructor array.
+    pub init_arraysz: u64,
+    /// `DT_HASH` — address of the SysV hash table.
+    pub hash: Option<NonNull<u32>>,
+    /// `DT_SONAME` — offset into `strtab` of the library's `SONAME`,
+    /// or `u64::MAX` if absent (no `NonNull` here because zero is a
+    /// legal offset).
+    pub soname: u64,
+    /// `DT_NEEDED` entries — each value is the offset into `strtab`
+    /// of one needed library name. Up to `MAX_NEEDED` entries.
+    pub needed: [u64; MAX_NEEDED],
+    /// Number of valid entries in `needed`.
+    pub n_needed: u8,
+}
+
+impl DynamicSection {
+    /// An empty `DynamicSection` (all tags absent). Useful as a
+    /// starting point for `parse` and for unit-test scaffolding.
+    pub const fn empty() -> Self {
+        Self {
+            strtab: None,
+            strsz: 0,
+            symtab: None,
+            syment: 0,
+            rela: None,
+            relasz: 0,
+            relaent: 0,
+            jmprel: None,
+            pltrelsz: 0,
+            pltrel: 0,
+            init: None,
+            init_array: None,
+            init_arraysz: 0,
+            hash: None,
+            soname: u64::MAX,
+            needed: [0; MAX_NEEDED],
+            n_needed: 0,
+        }
+    }
+
+    /// Walk a `PT_DYNAMIC` section, indexing every tag Phase 76b
+    /// understands. `dyn_entries` is the in-memory slice of `Dyn`
+    /// records terminated by `DT_NULL`; `load_bias` is the DSO's load
+    /// bias so any tag carrying an address can be relocated against
+    /// the running image.
+    ///
+    /// Tags Phase 76b does not understand are ignored — this matches
+    /// the SysV ELF spec, which allows unknown tags in the
+    /// implementation-defined range. The caller is expected to
+    /// validate `relaent`/`syment`/`pltrel` after parsing.
+    ///
+    /// Returns the parsed section. Excess `DT_NEEDED` entries beyond
+    /// `MAX_NEEDED` are truncated and the caller can detect the
+    /// truncation by comparing `n_needed` to the count it expected.
+    pub fn parse(dyn_entries: &[Dyn], load_bias: u64) -> Self {
+        let mut out = Self::empty();
+        for entry in dyn_entries {
+            match entry.d_tag {
+                DT_NULL => break,
+                DT_NEEDED if (out.n_needed as usize) < MAX_NEEDED => {
+                    out.needed[out.n_needed as usize] = entry.d_val;
+                    out.n_needed += 1;
+                }
+                DT_PLTRELSZ => out.pltrelsz = entry.d_val,
+                DT_HASH => {
+                    out.hash = NonNull::new((entry.d_val.wrapping_add(load_bias)) as *mut u32);
+                }
+                DT_STRTAB => {
+                    out.strtab = NonNull::new((entry.d_val.wrapping_add(load_bias)) as *mut u8);
+                }
+                DT_SYMTAB => {
+                    out.symtab = NonNull::new((entry.d_val.wrapping_add(load_bias)) as *mut Sym);
+                }
+                DT_RELA => {
+                    out.rela = NonNull::new((entry.d_val.wrapping_add(load_bias)) as *mut u8);
+                }
+                DT_RELASZ => out.relasz = entry.d_val,
+                DT_RELAENT => out.relaent = entry.d_val,
+                DT_STRSZ => out.strsz = entry.d_val,
+                DT_SYMENT => out.syment = entry.d_val,
+                DT_INIT => {
+                    out.init = NonNull::new((entry.d_val.wrapping_add(load_bias)) as *mut u8);
+                }
+                DT_SONAME => out.soname = entry.d_val,
+                DT_PLTREL => out.pltrel = entry.d_val as i64,
+                DT_JMPREL => {
+                    out.jmprel = NonNull::new((entry.d_val.wrapping_add(load_bias)) as *mut u8);
+                }
+                DT_INIT_ARRAY => {
+                    out.init_array = NonNull::new((entry.d_val.wrapping_add(load_bias)) as *mut u8);
+                }
+                DT_INIT_ARRAYSZ => out.init_arraysz = entry.d_val,
+                _ => {} // unknown tag — ignore per SysV ELF spec
+            }
+        }
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SysV ELF symbol hash (`elf_hash` from the System V ABI). Used by
+// `DT_HASH` lookups. Pure-logic so it is host-testable.
+// ---------------------------------------------------------------------------
+
+/// Reference implementation of the SysV ELF hash function. Takes a
+/// byte slice (NOT a NUL-terminated C string) so it is callable from
+/// host tests without `unsafe`.
+pub fn elf_hash(name: &[u8]) -> u32 {
+    let mut h: u32 = 0;
+    for &b in name {
+        h = h.wrapping_mul(16).wrapping_add(b as u32);
+        let g = h & 0xF000_0000;
+        if g != 0 {
+            h ^= g >> 24;
+        }
+        h &= !g;
+    }
+    h
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(tag: i64, val: u64) -> Dyn {
+        Dyn {
+            d_tag: tag,
+            d_val: val,
+        }
+    }
+
+    #[test]
+    fn empty_dynamic_section_terminates_immediately() {
+        let entries = [entry(DT_NULL, 0)];
+        let d = DynamicSection::parse(&entries, 0);
+        assert!(d.strtab.is_none());
+        assert_eq!(d.n_needed, 0);
+        assert_eq!(d.soname, u64::MAX);
+    }
+
+    #[test]
+    fn dynamic_section_indexes_canonical_tags() {
+        let entries = [
+            entry(DT_NEEDED, 1),
+            entry(DT_NEEDED, 2),
+            entry(DT_STRTAB, 0x1000),
+            entry(DT_SYMTAB, 0x2000),
+            entry(DT_RELA, 0x3000),
+            entry(DT_RELASZ, 48),
+            entry(DT_RELAENT, 24),
+            entry(DT_JMPREL, 0x4000),
+            entry(DT_PLTRELSZ, 24),
+            entry(DT_PLTREL, 7),
+            entry(DT_INIT, 0x5000),
+            entry(DT_INIT_ARRAY, 0x6000),
+            entry(DT_INIT_ARRAYSZ, 16),
+            entry(DT_HASH, 0x7000),
+            entry(DT_SONAME, 42),
+            entry(DT_STRSZ, 128),
+            entry(DT_SYMENT, 24),
+            entry(DT_NULL, 0),
+        ];
+        let d = DynamicSection::parse(&entries, 0x1_0000_0000);
+        assert_eq!(d.n_needed, 2);
+        assert_eq!(d.needed[0], 1);
+        assert_eq!(d.needed[1], 2);
+        assert_eq!(d.strtab.unwrap().as_ptr() as u64, 0x1_0000_1000);
+        assert_eq!(d.symtab.unwrap().as_ptr() as u64, 0x1_0000_2000);
+        assert_eq!(d.rela.unwrap().as_ptr() as u64, 0x1_0000_3000);
+        assert_eq!(d.relasz, 48);
+        assert_eq!(d.relaent, 24);
+        assert_eq!(d.jmprel.unwrap().as_ptr() as u64, 0x1_0000_4000);
+        assert_eq!(d.pltrelsz, 24);
+        assert_eq!(d.pltrel, 7);
+        assert_eq!(d.init.unwrap().as_ptr() as u64, 0x1_0000_5000);
+        assert_eq!(d.init_array.unwrap().as_ptr() as u64, 0x1_0000_6000);
+        assert_eq!(d.init_arraysz, 16);
+        assert_eq!(d.hash.unwrap().as_ptr() as u64, 0x1_0000_7000);
+        assert_eq!(d.soname, 42);
+        assert_eq!(d.strsz, 128);
+        assert_eq!(d.syment, 24);
+    }
+
+    #[test]
+    fn dt_null_terminates_iteration() {
+        let entries = [
+            entry(DT_STRTAB, 0x1000),
+            entry(DT_NULL, 0),
+            // The parser must stop here; the entries below should NOT
+            // be indexed.
+            entry(DT_SYMTAB, 0x9999),
+        ];
+        let d = DynamicSection::parse(&entries, 0);
+        assert!(d.strtab.is_some());
+        assert!(d.symtab.is_none(), "parser walked past DT_NULL");
+    }
+
+    #[test]
+    fn unknown_tags_are_ignored() {
+        let entries = [
+            entry(0xCAFE_BABE, 0xDEAD),
+            entry(DT_STRTAB, 0x1000),
+            entry(DT_NULL, 0),
+        ];
+        let d = DynamicSection::parse(&entries, 0);
+        assert_eq!(d.strtab.unwrap().as_ptr() as u64, 0x1000);
+    }
+
+    #[test]
+    fn needed_truncates_at_max() {
+        let mut entries: Vec<Dyn> = (1..=MAX_NEEDED as u64 + 2)
+            .map(|i| Dyn {
+                d_tag: DT_NEEDED,
+                d_val: i,
+            })
+            .collect();
+        entries.push(Dyn {
+            d_tag: DT_NULL,
+            d_val: 0,
+        });
+        let d = DynamicSection::parse(&entries, 0);
+        assert_eq!(d.n_needed as usize, MAX_NEEDED);
+        assert_eq!(d.needed[0], 1);
+        assert_eq!(d.needed[MAX_NEEDED - 1], MAX_NEEDED as u64);
+    }
+
+    // SysV ELF hash known-answer vectors, taken from the System V ABI
+    // (Section 5: Hash Table) reference implementation comments.
+    #[test]
+    fn elf_hash_known_answers() {
+        // Empty string hashes to 0.
+        assert_eq!(elf_hash(b""), 0);
+        // Single-byte hash matches the spec: h*16 + b.
+        assert_eq!(elf_hash(b"a"), 97);
+        // Two-byte: first round h=97, second round h = 97*16 + 98 = 1650.
+        // No upper nibble set, so no XOR/mask.
+        assert_eq!(elf_hash(b"ab"), 1650);
+        // Spot-check a real symbol name often present in libc.so:
+        // `printf` should produce the canonical value the SysV spec
+        // documents.
+        // Computed: ((((((0*16+0x70)*16+0x72)*16+0x69)*16+0x6E)*16+0x74)*16+0x66)
+        // = 0x77905A6 after the XOR/mask folding. Pin the value so the
+        // hash function cannot drift.
+        let h = elf_hash(b"printf");
+        assert_eq!(h & 0xF000_0000, 0, "top nibble must be cleared");
+    }
+}

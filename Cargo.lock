@@ -1099,7 +1099,7 @@ dependencies = [
 
 [[package]]
 name = "ld-musl-x86_64-so-1"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "leb128fmt"
