@@ -366,10 +366,30 @@ pub unsafe extern "C" fn dlopen(path: *const c_char, flags: c_int) -> *mut c_voi
     // (e.g. `/usr/lib/libfoo.so` vs `/lib/libfoo.so`) share one
     // refcount.
     let basename = basename_of(name_bytes);
+    // Reject empty basenames before any dedup lookup. Without this,
+    // inputs like `"/"`, `"/usr/lib/"`, or `"foo/"` produce an empty
+    // basename which would alias slot 0's empty interned name (the
+    // main binary has no `DT_SONAME`) and `dlopen` would silently
+    // hand back a handle to the main binary instead of failing.
+    if basename.is_empty() {
+        state.set_error(ERR_BAD_PATH);
+        return core::ptr::null_mut();
+    }
     if let Some(id) = state.find_by_soname(basename) {
-        // Repeat open of an already-loaded DSO. Refcount-clamp at
-        // `REFCOUNT_PERMANENT - 1` so a pathological caller cannot
-        // overflow into the permanent sentinel.
+        // Repeat open of an already-loaded DSO. Insert the handle
+        // BEFORE touching the refcount or RTLD_GLOBAL bit so a
+        // handle-table-full failure cannot leak a refcount or widen
+        // symbol visibility (the user gets NULL and has no handle to
+        // `dlclose` the leaked reference with).
+        let handle = match state.handles.insert(id) {
+            Ok(h) => h,
+            Err(_) => {
+                state.set_error(ERR_HANDLE_TABLE_FULL);
+                return core::ptr::null_mut();
+            }
+        };
+        // Refcount-clamp at `REFCOUNT_PERMANENT - 1` so a pathological
+        // caller cannot overflow into the permanent sentinel.
         let rc = &mut state.refcounts[id.0 as usize];
         if *rc != REFCOUNT_PERMANENT {
             *rc = rc.saturating_add(1).min(REFCOUNT_PERMANENT - 1);
@@ -377,13 +397,7 @@ pub unsafe extern "C" fn dlopen(path: *const c_char, flags: c_int) -> *mut c_voi
         if (flags & RTLD_GLOBAL) != 0 {
             state.in_global_scope[id.0 as usize] = true;
         }
-        return match state.handles.insert(id) {
-            Ok(h) => h,
-            Err(_) => {
-                state.set_error(ERR_HANDLE_TABLE_FULL);
-                core::ptr::null_mut()
-            }
-        };
+        return handle;
     }
 
     // Build the on-disk path. If `name` is absolute (starts with /)
@@ -464,16 +478,47 @@ pub unsafe extern "C" fn dlopen(path: *const c_char, flags: c_int) -> *mut c_voi
         return core::ptr::null_mut();
     }
 
-    // Run constructors for just-this-DSO (DT_INIT then DT_INIT_ARRAY).
-    unsafe { runtime::run_constructors_for(&state.dsos[id.0 as usize]) };
-
-    match state.handles.insert(id) {
+    // Reserve a handle BEFORE running constructors. Two reasons:
+    //
+    // 1. A handle-table-full failure that happens AFTER constructors
+    //    have run cannot be undone cleanly — constructor side effects
+    //    (registered atexit handlers, allocated state) outlive the
+    //    aborted `dlopen` even though the caller gets NULL and has no
+    //    way to ever `dlclose` the slot. Inserting the handle first
+    //    lets us fully roll back (unmap + clear slot) when constructors
+    //    have NOT yet run.
+    // 2. The constructor runs arbitrary user code that can call back
+    //    into libdl. Holding a `&mut DlState` borrow across that call
+    //    would let the reentrant `dl_state_mut()` create an aliased
+    //    `&mut` — undefined behaviour. By doing the last `state.*`
+    //    operation here (the insert), NLL releases the borrow before
+    //    the constructor runs.
+    let handle = match state.handles.insert(id) {
         Ok(h) => h,
         Err(_) => {
+            // No constructors ran yet — full rollback is safe and
+            // does not leak side effects.
+            let _ = unmap_dso(&state.dsos[id.0 as usize], crate::sys_munmap);
+            state.dsos[id.0 as usize] = LoadedDso::empty();
+            state.clear_name(id.0 as usize);
+            state.refcounts[id.0 as usize] = 0;
+            state.in_global_scope[id.0 as usize] = false;
+            state.dep_lists[id.0 as usize].clear();
             state.set_error(ERR_HANDLE_TABLE_FULL);
-            core::ptr::null_mut()
+            return core::ptr::null_mut();
         }
-    }
+    };
+
+    // Snapshot the DSO so the `&mut DlState` borrow can end before
+    // arbitrary constructor code runs. A constructor that calls back
+    // into `dlopen` / `dlsym` / `dlclose` will re-acquire
+    // `dl_state_mut()` once this scope's borrow is NLL-released —
+    // there is no further use of `state` after the insert above.
+    let dso_copy = state.dsos[id.0 as usize];
+    // Run constructors for just-this-DSO (DT_INIT then DT_INIT_ARRAY).
+    unsafe { runtime::run_constructors_for(&dso_copy) };
+
+    handle
 }
 
 /// Look up a symbol in a `dlopen`'d library.
@@ -561,13 +606,14 @@ pub unsafe extern "C" fn dlclose(handle: *mut c_void) -> c_int {
     }
 
     // Last close → run destructors, evict from scope, unmap.
-    // Capture the LoadedDso by value before mutating state so the
-    // destructor walker doesn't observe a half-cleared slot. Capture
-    // the name length too so a munmap-failure log later can still
-    // read the linker-owned per-slot buffer (which we leave intact
-    // through the unmap and only clear at the end if it succeeded).
+    // Capture the LoadedDso and name bytes by value before mutating
+    // state so the destructor walker doesn't observe a half-cleared
+    // slot and so we can release the `&mut DlState` borrow across
+    // the destructor call (see SAFETY note below).
     let dso = state.dsos[idx];
     let dso_name_len = state.name_lens[idx] as usize;
+    let mut name_snapshot = [0u8; MAX_NAME_LEN];
+    name_snapshot[..dso_name_len].copy_from_slice(&state.name_storage[idx][..dso_name_len]);
     // Mark the slot evicted BEFORE running destructors so a
     // destructor that calls back into dlsym(self) can't find itself.
     state.in_global_scope[idx] = false;
@@ -578,24 +624,39 @@ pub unsafe extern "C" fn dlclose(handle: *mut c_void) -> c_int {
     // captured DSO image. The captured image is still mapped until
     // the `unmap_dso` call below; destructors that touch the DSO's
     // own data are safe up to the return-from-destructor moment.
+    //
+    // Reentrancy note: the `&mut DlState` held in `state` must NOT be
+    // live across this call. A destructor that calls back into libdl
+    // would re-enter `dl_state_mut()`, creating an aliased `&mut` to
+    // the same static cell — undefined behaviour. The line above is
+    // the final `state.*` access in this scope, so NLL ends the
+    // borrow before the destructor runs and the rebinding below
+    // takes a fresh borrow for post-destructor bookkeeping.
     unsafe { runtime::run_destructors_for(&dso) };
 
     let unmap_result = unmap_dso(&dso, crate::sys_munmap);
+
+    // Re-acquire `DlState` after destructor execution. Safe because
+    // the previous `&mut` was NLL-released before the destructor call
+    // and we are still single-threaded.
+    let state = dl_state_mut();
     let return_code = match unmap_result {
         Ok(()) => 0,
         Err(e) => {
             // The DSO is conceptually gone (slot evicted) but the
             // kernel may still hold its pages. Log the failure on
             // serial *before* clearing the name buffer so the
-            // diagnostic carries the real DSO name, and surface the
-            // error through `dlerror()` so callers can detect it —
-            // the contract is `0` on success, `-1` on failure.
+            // diagnostic carries the real DSO name (read from the
+            // pre-destructor snapshot, not the live state), and
+            // surface the error through `dlerror()` so callers can
+            // detect it — the contract is `0` on success, `-1` on
+            // failure.
             let prefix: &[u8] = match e {
                 UnmapError::EmptyImage => b"ldso: dlclose: unmap failed (empty image) for ",
                 UnmapError::MunmapFailed(_) => b"ldso: dlclose: unmap failed for ",
             };
             crate::serial(prefix);
-            crate::serial(&state.name_storage[idx][..dso_name_len]);
+            crate::serial(&name_snapshot[..dso_name_len]);
             crate::serial(b"\n");
             state.set_error(ERR_UNMAP_FAILED);
             -1
