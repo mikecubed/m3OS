@@ -108,7 +108,7 @@ Single-file C binary linking `-lhello` (`DT_NEEDED = libhello.so`). `main` write
 - A circular dependency between two test `.so` files is detected and logged; `execve` returns `NEG_ELIBBAD`.
 - All Phase 76 acceptance criteria continue to pass.
 - Kernel version is `0.76.1`.
-- `docs/76b-dynamic-linker.md` learning doc exists and conforms to the aligned legacy learning-doc template.
+- `docs/76-dynamic-linker.md` learning doc carries the 76b sections (self-relocation, `PT_DYNAMIC` parser, relocation handlers, constructor pipeline) and the subphase table marks 76b's gate as wired.
 
 ## Companion Task List
 

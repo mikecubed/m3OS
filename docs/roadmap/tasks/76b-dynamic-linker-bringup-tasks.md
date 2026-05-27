@@ -257,17 +257,17 @@
 - [ ] `Cargo.lock` regenerated and checked in.
 - [ ] Boot banner prints `m3OS 0.76.1`.
 
-### H.2 — Create `docs/76b-dynamic-linker.md` learning doc
+### H.2 — Extend `docs/76-dynamic-linker.md` learning doc with the 76b sections
 
-**File:** `docs/76b-dynamic-linker.md`
-**Symbol:** N/A (new learning doc)
-**Why it matters:** Phase docs describe what the phase implements; learning docs describe how the resulting subsystem works for a future reader who needs to understand the dynamic-linker pipeline without re-deriving it from the roadmap.
+**File:** `docs/76-dynamic-linker.md`
+**Symbol:** N/A (existing learning doc, extended)
+**Why it matters:** The Phase 76 learning doc already covers the scaffolding; 76b ships the real bring-up linker, so the same doc must grow sections that describe how `_dlstart` self-relocates, how `PT_DYNAMIC` is parsed, how the four relocations are applied, and how constructors run. Without this update, the doc lies about the state of the subsystem.
 
 **Acceptance:**
-- [ ] Conforms to the "Template: aligned legacy learning doc" section of `docs/appendix/doc-templates.md`.
-- [ ] Required front-matter present: Aligned Roadmap Phase, Status, Source Ref, Supersedes Legacy Doc (set to `none` if N/A).
-- [ ] Sections present: Overview, What This Doc Covers, Core Implementation, Key Files, How This Phase Differs From Later Memory Work (retitled to "How This Phase Differs From Later Dynamic-Linker Work"), Related Roadmap Docs, Deferred or Later-Phase Topics.
-- [ ] Key Files table covers `start.rs`, `dynlink.rs`, `reloc.rs`, `xtask::build_shared_lib`, `libhello.so`, `dynlink_hello`.
+- [ ] Doc front-matter `Status` updated from "Implemented (scaffolding only — 76b/76c/76d ship the rest)" to reflect 76b shipping.
+- [ ] New "What changes in 76b" section describes the rewrite of `_dlstart` self-relocation, the `PT_DYNAMIC` parser, the four relocation handlers, and the constructor pipeline.
+- [ ] Key Files table extended with `userspace/ld-musl-x86_64.so.1/src/start.rs`, `dynlink.rs`, `reloc.rs`, `xtask::build_shared_lib`, `userspace/lib/libhello/`, `userspace/dynlink_hello/`.
+- [ ] Subphase table at the top of the doc updates 76b's row to reflect that the gate is now wired and passing.
 
 ### H.3 — Update roadmap README row for Phase 76b
 
