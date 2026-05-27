@@ -135,6 +135,12 @@ pub enum ElfError {
     TruncatedProgramHeader,
     MappingFailed(&'static str),
     OutOfFrames,
+    /// Phase 76: `PT_INTERP` named an interpreter the kernel could
+    /// not find on disk (neither the ramdisk nor any mounted
+    /// filesystem). Distinct from `MappingFailed` so the execve path
+    /// can surface `ENOENT` (POSIX-correct for a missing
+    /// interpreter) rather than `ENOEXEC`.
+    InterpreterNotFound,
 }
 
 /// Result of a successful ELF load.
@@ -830,7 +836,7 @@ pub unsafe fn load_elf_into_with_interp(
 
             let interp_data = reader(interp_path).ok_or_else(|| {
                 log::warn!("elf: PT_INTERP target not found in VFS: {}", interp_path);
-                ElfError::MappingFailed("PT_INTERP not found")
+                ElfError::InterpreterNotFound
             })?;
 
             // Round main-binary's top up to the next page, then add a

@@ -4746,6 +4746,16 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
                 log::warn!("[execve] ELF load OOM for {}", name);
                 return NEG_ENOMEM;
             }
+            Err(crate::mm::elf::ElfError::InterpreterNotFound) => {
+                // Phase 76: POSIX execve(2) returns ENOENT when the
+                // binary's dynamic linker is missing — this is what
+                // shells observe when they try to run an unsupported
+                // binary on a system without the right libc.so /
+                // ld.so combination, and it is distinct from ENOEXEC
+                // (which means "the bytes aren't a valid executable").
+                log::warn!("[execve] PT_INTERP target missing for {}", name);
+                return NEG_ENOENT;
+            }
             Err(e) => {
                 // Phase 75: an invalid ELF (including the new PF_W|PF_X
                 // W^X-violation rejection) surfaces to userspace as ENOEXEC,
