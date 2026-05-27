@@ -124,6 +124,7 @@ Single-file C binary that exercises the full open → sym → call → close cyc
 
 - PLT lazy resolution (so that `RTLD_LAZY` defers PLT entries) → Phase 76d
 - `DT_GNU_HASH`-preferred symbol lookup for `dlsym` → Phase 76d
+- `RTLD_NEXT` (search starting from the DSO *after* the caller's) — deferred beyond Phase 76d; the lookup-chain plumbing needed for it is a non-trivial extension of the global-scope walker.
 - `dlmopen` / `RTLD_DEEPBIND` / link-namespaces — deferred beyond Phase 76d
 - Thread-local `dlerror()` storage — gated on TLS implementation
 - `dladdr()` / `dlinfo()` — deferred indefinitely
