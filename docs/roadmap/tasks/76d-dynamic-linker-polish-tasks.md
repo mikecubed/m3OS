@@ -9,7 +9,7 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| S1 | `sym.rs` refactor — unified `lookup(scope, name, version)` API over the 76b `DT_HASH` backend | Phase 76b, 76c | Planned |
+| S1 | `sym.rs` refactor — unified `lookup(scope, name, version)` API over the 76b `DT_HASH` backend + route 76b runtime reloc write-sites through `ldso_core::reloc` slice helpers | Phase 76b, 76c | Planned |
 | D1 | `DT_GNU_HASH` Bloom + bucket + chain lookup; dispatcher prefers GNU over SysV | S1 | Planned |
 | D2 | `DT_VERSYM` / `DT_VERNEED` / `DT_VERDEF` graceful handling | D1 | Planned |
 | B4 | `_dl_runtime_resolve` asm trampoline + GOT slot rewrite + lazy `JUMP_SLOT` deferral | S1 | Planned |
@@ -45,6 +45,21 @@
 - [ ] `apply_rela_table` and `apply_jmprel_table` call `sym::lookup` instead of `DynamicSection::lookup_symbol` directly.
 - [ ] `dlsym` calls `sym::lookup`.
 - [ ] All 76b and 76c smoke gates pass after the refactor.
+
+### S1.3 — Route runtime relocation write-sites through `ldso_core::reloc` slice helpers
+
+**Files:**
+- `userspace/ld-musl-x86_64.so.1/src/main.rs`
+
+**Symbols:** `dl_relocate_self`, `apply_rela` (R_X86_64_RELATIVE / R_X86_64_GLOB_DAT / R_X86_64_JUMP_SLOT arms).
+**Why it matters:** Phase 76b's host-tested `apply_relative` / `apply_glob_dat` / `apply_abs64` primitives in `ldso_core::reloc` take a `&mut [u8]` image slice and perform their own alignment + bounds check; the runtime currently bypasses three of those four paths and writes via `core::ptr::write_unaligned` directly (only the `R_X86_64_64` arm at `main.rs:885` already routes through `apply_abs64`). Routing the remaining three write-sites through the slice helpers eliminates the divergence between what the host tests prove and what the runtime actually executes, and lets a future malformed-input regression be caught at the same byte-level the host tests pin. Declined in PR #194 review thread `PRRT_kwDORTRVIM6FBzyo` as a 76c/76d follow-up; pinned here so it is not lost.
+
+**Acceptance:**
+- [ ] `dl_relocate_self`'s `R_X86_64_RELATIVE` write (`main.rs:301`) calls `ldso_core::reloc::apply_relative` against a `&mut [u8]` view of the linker's own image instead of `core::ptr::write_unaligned`.
+- [ ] `apply_rela`'s `R_X86_64_RELATIVE` arm (`main.rs:849`) calls `apply_relative` against a `&mut [u8]` view of the loaded DSO's image.
+- [ ] `apply_rela`'s `R_X86_64_GLOB_DAT` / `R_X86_64_JUMP_SLOT` arm (`main.rs:865`) calls `apply_glob_dat` against the same slice view.
+- [ ] The `&mut [u8]` view is constructed from `load_bias` + `image_len` (which `LoadedDso` already carries since PR #194's bounds-check fix); no new field is needed.
+- [ ] All 76b smoke gates (`dynlink-hello-smoke`, `dynlink-missing-smoke`, `dynlink-cycle-smoke`) and the 76c `dlopen-test-smoke` gate pass after the refactor.
 
 ---
 
