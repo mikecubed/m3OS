@@ -14,7 +14,8 @@
 | D2 | `DT_VERSYM` / `DT_VERNEED` / `DT_VERDEF` graceful handling | D1 | Planned |
 | B4 | `_dl_runtime_resolve` asm trampoline + GOT slot rewrite + lazy `JUMP_SLOT` deferral | S1 | Planned |
 | E4 | `LD_BIND_NOW` environment variable honored | B4 | Planned |
-| F | New gate variant: a `.so` built with `-Wl,--hash-style=gnu` runs end-to-end | B4, D1, D2 | Planned |
+| F | New gate variant: a `.so` built with `-Wl,--hash-style=gnu` runs end-to-end | B4, D1 | Planned |
+| G | New gate variant: a versioned `.so` (with `DT_VERSYM` / `DT_VERNEED`) loads end-to-end, with mismatch-fallback and `LD_BIND_NOW` strict-mode coverage | D2, E4 | Planned |
 | H | docs/76-dynamic-linker.md polish-pass + kernel version bump + mark Phase 76 family Complete | All | Planned |
 
 ---
@@ -130,7 +131,7 @@
 
 **File:** `userspace/ld-musl-x86_64.so.1/src/sym.rs`
 **Symbol:** `lookup` (strict path)
-**Why it matters:** Diagnostic builds need to surface version mismatches as hard errors; warn-only is the wrong default for production debug builds.
+**Why it matters:** Diagnostic builds need to surface version mismatches as hard errors; warn-only is the wrong default for production debug builds. End-to-end gated by **G.3**.
 
 **Acceptance:**
 - [ ] When `LD_BIND_NOW=1`, a version mismatch returns `None` instead of falling back to unversioned lookup, and the log line is `log::error!` rather than `log::warn!`.
@@ -254,6 +255,50 @@
 
 ---
 
+## Track G — Symbol-Versioning Gate Variant
+
+### G.1 — `libhello_versioned.so` + `dynlink_hello_versioned` artifacts
+
+**Files:**
+- `userspace/lib/libhello_versioned/hello.c` (or reuses `userspace/lib/libhello/hello.c` with a version script)
+- `userspace/lib/libhello_versioned/libhello_versioned.ver` (linker version script declaring `LIBHELLO_1.0`)
+- `userspace/dynlink_hello_versioned/dynlink_hello_versioned.c`
+
+**Symbols:** `hello_str@LIBHELLO_1.0`, `main`
+**Why it matters:** Without a versioned-symbol test artifact, D2's correctness (parser + version-aware lookup) is unverifiable end-to-end and regresses silently between releases.
+
+**Acceptance:**
+- [ ] `libhello_versioned.so` is built with `-Wl,--version-script=libhello_versioned.ver,--hash-style=gnu` and exports `hello_str` under version `LIBHELLO_1.0`.
+- [ ] `dynlink_hello_versioned` links against `libhello_versioned.so` and carries a `DT_VERNEED` referring to `libhello_versioned.so` / `LIBHELLO_1.0`.
+- [ ] `readelf -V target/generated-libs/libhello_versioned.so` shows `DT_VERSYM` + `DT_VERDEF` populated with `LIBHELLO_1.0` under "Version definitions".
+- [ ] `readelf -V target/generated-bins/dynlink_hello_versioned` shows `Version needs` referencing `libhello_versioned.so` / `LIBHELLO_1.0`.
+
+### G.2 — `cargo xtask dynlink-hello-versioned-smoke` exact-match gate
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `dynlink_hello_versioned_smoke`
+**Why it matters:** Without the gate, D2.2's exact-version match path regresses silently the moment any of D2.1 / D2.2 breaks.
+
+**Acceptance:**
+- [ ] Subcommand boots QEMU, execs `/bin/dynlink_hello_versioned`, asserts `HELLO_FROM_VERSIONED_LIB:OK` on serial (proves `hello_str@LIBHELLO_1.0` resolved through the version-aware path).
+- [ ] The smoke gate also asserts that NO `log::warn!` line referencing a version mismatch appears on serial during the run (negative assertion: the positive path is silent).
+- [ ] Smoke-runner emits `SMOKE:dynlink-hello-versioned-smoke:PASS` / `:FAIL` and is wired into the standard `cargo xtask smoke-test` step list.
+
+### G.3 — Mismatch-fallback and `LD_BIND_NOW` strict-mode gates
+
+**Files:**
+- `userspace/lib/libhello_versioned_v2/hello.c` + `libhello_versioned_v2.ver` declaring `LIBHELLO_2.0` (exports `hello_str@LIBHELLO_2.0` plus an unversioned `hello_str` so the fallback target exists)
+- `userspace/dynlink_hello_versioned_mismatch/dynlink_hello_versioned_mismatch.c` linked against `libhello_versioned.so` (requiring `LIBHELLO_1.0`) at build time, then at boot the consumer is started with `libhello_versioned_v2.so` resolved via an `LD_LIBRARY_PATH`-shaped redirect (or by staging `libhello_versioned_v2.so` at `/usr/lib/libhello_versioned.so.1` so the `DT_NEEDED` SONAME match picks up the v2 library).
+
+**Symbol:** `dynlink_hello_versioned_smoke` (extended)
+**Why it matters:** D2.2's "no exact-version match → unversioned fallback + `log::warn!`" path is the policy that lets m3OS load real-world glibc-built `.so` files whose versions have no m3OS equivalent. D2.3's "under `LD_BIND_NOW`, version mismatch is a hard error" path is the diagnostic counterpart. Both regress silently without a gate.
+
+**Acceptance:**
+- [ ] Default-env (`LD_BIND_NOW` unset) run of `dynlink_hello_versioned_mismatch`: linker emits a `log::warn!` containing both the unmatched version name (`LIBHELLO_1.0`) and the providing library SONAME (`libhello_versioned.so.1`), falls back to the unversioned `hello_str`, and the binary still prints `HELLO_FROM_VERSIONED_LIB:OK`. Gate greps serial for both the warn-line substrings AND the success sentinel.
+- [ ] `LD_BIND_NOW=1` run of the same binary: linker emits `log::error!` for the version mismatch and the binary exits non-zero (no fallback). Gate asserts the error-line substrings present and the exit code is non-zero (via `run_command_expect_exit`).
+
+---
+
 ## Track H — Documentation + Version Bump + Phase 76 Family Closure
 
 ### H.1 — Bump kernel version to `0.76.3`
@@ -290,8 +335,8 @@
 **Why it matters:** The roadmap README is the canonical phase index; without an update, the index lies about the state of the dynamic-linker theme.
 
 **Acceptance:**
-- [ ] Phase 76d row added: `| 76d | Dynamic Linker: Polish | _dl_runtime_resolve + DT_GNU_HASH + DT_VERSYM/DT_VERNEED + LD_BIND_NOW | Complete | phase-76d | [Phase 76d](./76d-dynamic-linker-polish.md) | [Tasks](./tasks/76d-dynamic-linker-polish-tasks.md) |`.
-- [ ] All four Phase 76 family rows (76, 76b, 76c, 76d) carry Status `Complete`.
+- [ ] The existing Phase 76d row (currently `Status = Planned`, Primary Outcome lists `_dl_runtime_resolve` + `DT_GNU_HASH` + graceful `DT_VERSYM`/`DT_VERNEED` only) is updated to `Status = Complete` and its Primary Outcome column is extended to include `LD_BIND_NOW` strict-mode coverage and the new gates (`dynlink-hello-gnu-smoke`, `dynlink-hello-versioned-smoke`).
+- [ ] All four Phase 76 family rows (76, 76b, 76c, 76d) carry Status `Complete` after this task lands.
 
 ### H.4 — Update `AGENTS.md` project-overview paragraph
 
@@ -300,7 +345,7 @@
 **Why it matters:** The project-overview paragraph is the single most-read summary of the current state of m3OS.
 
 **Acceptance:**
-- [ ] Phase 76d clause added describing: `_dl_runtime_resolve` asm trampoline + lazy `JUMP_SLOT`, `DT_GNU_HASH` Bloom + bucket + chain, `DT_VERSYM` / `DT_VERNEED` graceful handling, `LD_BIND_NOW` strict mode, `dynlink-hello-gnu-smoke` gate, kernel version `0.76.3`.
+- [ ] Phase 76d clause added describing: `_dl_runtime_resolve` asm trampoline + lazy `JUMP_SLOT`, `DT_GNU_HASH` Bloom + bucket + chain, `DT_VERSYM` / `DT_VERNEED` graceful handling, `LD_BIND_NOW` strict mode, `dynlink-hello-gnu-smoke` + `dynlink-hello-versioned-smoke` gates, kernel version `0.76.3`.
 - [ ] The "Phase 76b/76c/76d are tracked as separate roadmap phases" sentence from the Phase 76 paragraph is updated to reflect that all three have shipped.
 
 ---
