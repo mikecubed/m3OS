@@ -839,16 +839,30 @@ pub unsafe fn load_elf_into_with_interp(
                 ElfError::InterpreterNotFound
             })?;
 
-            // Round main-binary's top up to the next page, then add a
-            // 64 KiB safety pad. Then take the max with the hint so
-            // we stay well away from the 4 MiB main-binary base.
-            let main_top_aligned = (max_vaddr_end
+            // Round the main binary's effective top up to a page
+            // boundary, then add an explicit 64 KiB safety pad before
+            // the interpreter. The page-align step gives us a
+            // well-defined "next page" address; the +0x10000 then
+            // unconditionally adds a 16-page gap so the interpreter
+            // never abuts the main binary even when the binary
+            // happens to end on a 64 KiB-aligned vaddr (in which case
+            // the old `round up to 64 KiB` formula would have
+            // produced zero padding).
+            //
+            // Finally `max` with `INTERP_LOAD_BASE_HINT` so we stay
+            // well above the 4 MiB main-binary base regardless of
+            // how small the main binary is.
+            let main_top_eff = max_vaddr_end
                 .checked_add(load_bias)
+                .ok_or(ElfError::MappingFailed("interp bias overflow"))?;
+            let main_top_page_aligned = main_top_eff
+                .checked_add(0xFFF)
                 .ok_or(ElfError::MappingFailed("interp bias overflow"))?
-                .checked_add(0xFFFF)
-                .ok_or(ElfError::MappingFailed("interp bias overflow"))?)
-                & !0xFFFF;
-            let interp_bias_floor = main_top_aligned.max(INTERP_LOAD_BASE_HINT);
+                & !0xFFF;
+            let interp_bias_floor = main_top_page_aligned
+                .checked_add(0x10000)
+                .ok_or(ElfError::MappingFailed("interp bias overflow"))?
+                .max(INTERP_LOAD_BASE_HINT);
 
             let interp_loaded = map_interpreter(
                 mapper,
