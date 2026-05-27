@@ -89,6 +89,7 @@ const SYS_OPEN: u64 = 2;
 const SYS_CLOSE: u64 = 3;
 const SYS_MMAP: u64 = 9;
 const SYS_MPROTECT: u64 = 10;
+const SYS_MUNMAP: u64 = 11;
 const SYS_EXIT: u64 = 60;
 
 /// `errno` codes the bring-up linker uses as `exit(2)` codes when a
@@ -191,6 +192,16 @@ fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: i64, offset: u64) ->
 
 fn sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
     unsafe { syscall3(SYS_MPROTECT, addr, len, prot) }
+}
+
+fn sys_munmap(addr: u64, len: u64) -> i64 {
+    // `addr` must be page-aligned (sys_linux_munmap rejects with
+    // -EINVAL otherwise). All mappings unmapped by this file are
+    // created by `sys_mmap(addr=0, …)` so the kernel-chosen base is
+    // already page-aligned — callers can pass the raw mmap return
+    // value. Linux munmap takes only `(addr, len)`; the unused third
+    // syscall3 register is ignored by the kernel.
+    unsafe { syscall3(SYS_MUNMAP, addr, len, 0) }
 }
 
 fn sys_exit(code: u64) -> ! {
@@ -308,6 +319,13 @@ unsafe fn dl_relocate_self(phdr_base: *const Phdr, phnum: usize, load_bias: u64)
 #[derive(Clone, Copy)]
 struct LoadedDso {
     load_bias: u64,
+    /// Page-rounded in-memory span of this DSO's image — used by
+    /// `apply_rela` to bounds-check every relocation write so a
+    /// malformed (or attacker-controlled) DSO cannot make the linker
+    /// scribble outside its own mapping.  `0` means "trust the caller"
+    /// and disables the check (only the placeholder `empty()` value
+    /// should ever take that path).
+    image_len: u64,
     dyn_: DynamicSection,
 }
 
@@ -316,6 +334,7 @@ impl LoadedDso {
     const fn empty() -> Self {
         Self {
             load_bias: 0,
+            image_len: 0,
             dyn_: DynamicSection::empty(),
         }
     }
@@ -453,6 +472,18 @@ unsafe fn load_dso(path_bytes: &[u8]) -> Result<LoadedDso, LoadError> {
         sys_close(fd);
         return Err(LoadError::Other("scratch mmap failed"));
     }
+    // The scratch buffer is only needed for header parsing + PT_LOAD
+    // copy.  Once `dyn_` is built, every pointer it carries lives in
+    // the freshly-mmap'd image, not in scratch.  Delegating to an
+    // inner helper lets us munmap the scratch buffer on EVERY return
+    // path (success + every early-error path) without scattering the
+    // teardown across half a dozen `return Err(…)` sites.
+    let result = unsafe { load_dso_impl(fd, scratch as u64, scratch_len) };
+    let _ = sys_munmap(scratch as u64, scratch_len);
+    result
+}
+
+unsafe fn load_dso_impl(fd: i64, scratch: u64, scratch_len: u64) -> Result<LoadedDso, LoadError> {
     let scratch_buf =
         unsafe { core::slice::from_raw_parts_mut(scratch as *mut u8, scratch_len as usize) };
     let mut total = 0usize;
@@ -490,6 +521,18 @@ unsafe fn load_dso(path_bytes: &[u8]) -> Result<LoadedDso, LoadError> {
     if &ehdr.e_ident[..4] != b"\x7fELF" {
         return Err(LoadError::Other("not ELF"));
     }
+    // Reject ELFs whose header-size or program-header entry-size
+    // don't match what this loader was compiled against.  Without
+    // this check a malformed ELF with an unexpected `e_phentsize`
+    // would let the loop below treat the PHDR table as an array of
+    // `Phdr` even though each entry would actually be wider/narrower,
+    // producing mis-parsed PT_LOAD records and out-of-bounds reads.
+    if ehdr.e_ehsize as usize != core::mem::size_of::<Ehdr>() {
+        return Err(LoadError::Other("e_ehsize != sizeof(Ehdr)"));
+    }
+    if ehdr.e_phentsize as usize != core::mem::size_of::<Phdr>() {
+        return Err(LoadError::Other("e_phentsize != sizeof(Phdr)"));
+    }
     let phoff = ehdr.e_phoff;
     let phnum = ehdr.e_phnum as usize;
     // Bounds-check the program-header table against the bytes we
@@ -504,7 +547,7 @@ unsafe fn load_dso(path_bytes: &[u8]) -> Result<LoadedDso, LoadError> {
     if phdr_end > total {
         return Err(LoadError::Other("PHDR table outside scratch"));
     }
-    let phdr_base = (scratch as u64 + phoff) as *const Phdr;
+    let phdr_base = (scratch + phoff) as *const Phdr;
 
     // Pass 1: compute total in-memory image span.
     let mut image_end: u64 = 0;
@@ -554,7 +597,7 @@ unsafe fn load_dso(path_bytes: &[u8]) -> Result<LoadedDso, LoadError> {
         if seg_end > total {
             return Err(LoadError::Other("PT_LOAD file range outside scratch"));
         }
-        let src = (scratch as u64 + ph.p_offset) as *const u8;
+        let src = (scratch + ph.p_offset) as *const u8;
         let dst = (load_bias + ph.p_vaddr) as *mut u8;
         unsafe { core::ptr::copy_nonoverlapping(src, dst, ph.p_filesz as usize) };
     }
@@ -602,7 +645,11 @@ unsafe fn load_dso(path_bytes: &[u8]) -> Result<LoadedDso, LoadError> {
         p = unsafe { p.add(1) };
     }
     let dyn_ = DynamicSection::parse(&entries, load_bias);
-    Ok(LoadedDso { load_bias, dyn_ })
+    Ok(LoadedDso {
+        load_bias,
+        image_len,
+        dyn_,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -675,6 +722,18 @@ unsafe fn apply_rela(
     };
     for i in 0..count {
         let r = unsafe { *table.add(i) };
+        // Bounds-check `r_offset` against the image span recorded by
+        // `load_dso` (or the main-binary loader).  A malformed (or
+        // attacker-controlled) DSO whose RELA carries `r_offset >=
+        // image_len - 8` would otherwise write 8 bytes outside the
+        // mapped image and corrupt unrelated memory.  `image_len == 0`
+        // is the placeholder-LoadedDso shape; treating it as "no
+        // bounds known" preserves backwards compatibility but the
+        // standard runtime construction sites all populate it.
+        if dso.image_len != 0 && (r.r_offset > dso.image_len || dso.image_len - r.r_offset < 8) {
+            serial(b"ldso: relocation r_offset outside image\n");
+            return Err("relocation outside image");
+        }
         let target = (dso.load_bias.wrapping_add(r.r_offset)) as *mut u64;
         let rt = r_type(r.r_info);
         match rt {
@@ -851,6 +910,30 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
         0
     };
 
+    // Compute the main binary's in-memory image span the same way
+    // `load_dso` does for DT_NEEDED libraries — `max(p_vaddr +
+    // p_memsz)` over PT_LOAD segments, rounded up to a page.  This
+    // populates `LoadedDso.image_len` so `apply_rela`'s bounds check
+    // is symmetric for the main binary and its dependencies.  A
+    // zero result (no PT_LOAD found) leaves the check disabled for
+    // the main binary, which would only happen on a degenerate
+    // static binary that this function has already returned through.
+    let mut main_image_end: u64 = 0;
+    for i in 0..at_phnum {
+        let ph = unsafe { *at_phdr.add(i) };
+        if ph.p_type == PT_LOAD {
+            let end = ph.p_vaddr.wrapping_add(ph.p_memsz);
+            if end > main_image_end {
+                main_image_end = end;
+            }
+        }
+    }
+    let main_image_len = if main_image_end == 0 {
+        0
+    } else {
+        (main_image_end + 4095) & !4095
+    };
+
     // Locate main's PT_DYNAMIC.
     let mut main_dyn: *const Dyn = core::ptr::null();
     for i in 0..at_phnum {
@@ -884,6 +967,7 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
     // for self-referential globals (matches SysV scope).
     let _ = dsos.push(LoadedDso {
         load_bias: main_load_bias,
+        image_len: main_image_len,
         dyn_: main_dyn_section,
     });
     let strtab_main = match main_dyn_section.strtab {
@@ -1050,6 +1134,7 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
         let dsos_slice = dsos.as_slice();
         let dso_main = LoadedDso {
             load_bias: main_load_bias,
+            image_len: main_image_len,
             dyn_: main_dyn_section,
         };
         if let Err(e) =
@@ -1066,6 +1151,7 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
         let dsos_slice = dsos.as_slice();
         let dso_main = LoadedDso {
             load_bias: main_load_bias,
+            image_len: main_image_len,
             dyn_: main_dyn_section,
         };
         if let Err(e) =

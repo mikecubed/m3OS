@@ -1701,21 +1701,40 @@ fn build_dynlink_missing() {
     cmd.arg(src);
     cmd.arg("-ldoesnotexist");
     cmd.arg("-o").arg(&dst);
+    // Error policy mirrors `build_dynlink_smoke`: only the
+    // toolchain-missing case (`ErrorKind::NotFound`) emits a SKIP-
+    // eligible placeholder.  A present-toolchain compile/link
+    // failure is fatal so the dynlink-missing-smoke gate cannot
+    // silently SKIP against a stale binary.
     match cmd.output() {
         Ok(o) if o.status.success() => {
             println!("dynlink_missing: built → {}", dst.display());
         }
         Ok(o) => {
             eprintln!(
-                "warning: dynlink_missing build failed (exit {}): {}",
+                "error: dynlink_missing build failed (exit {}): {}. \
+                 Treating as a hard build error so a stale binary \
+                 cannot let the dynlink-missing-smoke gate falsely PASS/SKIP.",
                 o.status.code().unwrap_or(-1),
                 String::from_utf8_lossy(&o.stderr)
             );
             let _ = fs::write(&dst, b"");
+            std::process::exit(1);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "warning: {cc} not found mid-build — skipping dynlink_missing. \
+                 The dynlink-missing-smoke gate will SKIP at runtime."
+            );
+            let _ = fs::write(&dst, b"");
         }
         Err(e) => {
-            eprintln!("warning: failed to invoke {cc}: {e}");
+            eprintln!(
+                "error: failed to invoke {cc} for dynlink_missing: {e}. Not a \
+                 missing-binary error — treating as a hard environment problem."
+            );
             let _ = fs::write(&dst, b"");
+            std::process::exit(1);
         }
     }
 }
@@ -1771,21 +1790,40 @@ fn build_dynlink_cycle() {
     cmd.arg(src);
     cmd.arg("-lcyca");
     cmd.arg("-o").arg(&dst);
+    // Error policy mirrors `build_dynlink_smoke`: only the
+    // toolchain-missing case (`ErrorKind::NotFound`) emits a SKIP-
+    // eligible placeholder.  A present-toolchain compile/link
+    // failure is fatal so the dynlink-cycle-smoke gate cannot
+    // silently SKIP against a stale binary.
     match cmd.output() {
         Ok(o) if o.status.success() => {
             println!("dynlink_cycle: built → {}", dst.display());
         }
         Ok(o) => {
             eprintln!(
-                "warning: dynlink_cycle build failed (exit {}): {}",
+                "error: dynlink_cycle build failed (exit {}): {}. \
+                 Treating as a hard build error so a stale binary \
+                 cannot let the dynlink-cycle-smoke gate falsely PASS/SKIP.",
                 o.status.code().unwrap_or(-1),
                 String::from_utf8_lossy(&o.stderr)
             );
             let _ = fs::write(&dst, b"");
+            std::process::exit(1);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "warning: {cc} not found mid-build — skipping dynlink_cycle. \
+                 The dynlink-cycle-smoke gate will SKIP at runtime."
+            );
+            let _ = fs::write(&dst, b"");
         }
         Err(e) => {
-            eprintln!("warning: failed to invoke {cc}: {e}");
+            eprintln!(
+                "error: failed to invoke {cc} for dynlink_cycle: {e}. Not a \
+                 missing-binary error — treating as a hard environment problem."
+            );
             let _ = fs::write(&dst, b"");
+            std::process::exit(1);
         }
     }
 }
