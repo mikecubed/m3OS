@@ -42,6 +42,16 @@ const DYNLINK_MISSING_PATH: &[u8] = b"/bin/dynlink_missing\0";
 const DYNLINK_MISSING_ARGV0: &[u8] = b"dynlink_missing\0";
 const DYNLINK_CYCLE_PATH: &[u8] = b"/bin/dynlink_cycle\0";
 const DYNLINK_CYCLE_ARGV0: &[u8] = b"dynlink_cycle\0";
+// Phase 76c — `dlopen_test` exercises dlopen / dlsym / dlclose /
+// dlerror plus DT_FINI_ARRAY destructors. The smoke gate asserts
+// the serial order FINI_PENDING → LIBHELLO_FINI:RAN → PASS so a
+// missing destructor invocation between the bracket sentinels is a
+// hard FAIL.
+const DLOPEN_TEST_PATH: &[u8] = b"/bin/dlopen_test\0";
+const DLOPEN_TEST_ARGV0: &[u8] = b"dlopen_test\0";
+const DLOPEN_TEST_PASS_NEEDLE: &[u8] = b"DLOPEN_TEST:PASS";
+const DLOPEN_TEST_PENDING_NEEDLE: &[u8] = b"DLOPEN_TEST:FINI_PENDING";
+const DLOPEN_TEST_FINI_RAN_NEEDLE: &[u8] = b"LIBHELLO_FINI:RAN";
 const CAPTURE_FILE_PATH: &[u8] = b"/tmp/smoke-runner.capture\0";
 const LOGGER_PATH: &[u8] = b"/bin/logger\0";
 const SYSTEM_LOG_PATH: &[u8] = b"/var/log/messages\0";
@@ -291,8 +301,119 @@ fn program_main(_args: &[&str]) -> i32 {
         }
     }
 
+    // Phase 76c — full libdl runtime gate. Runs `/bin/dlopen_test`,
+    // asserts every libdl entry point works (positive + four negative
+    // paths) AND that the destructor pipeline runs in the correct
+    // serial order. A missing `LIBHELLO_FINI:RAN` between the
+    // `DLOPEN_TEST:FINI_PENDING` and `DLOPEN_TEST:PASS` bracket
+    // sentinels is a hard FAIL.
+    {
+        let mut probe = Stat::zeroed();
+        if stat(DLOPEN_TEST_PATH, &mut probe) < 0 || probe.st_size == 0 {
+            skip("dlopen-test-smoke");
+        } else {
+            begin("dlopen-test-smoke");
+            let argv = [DLOPEN_TEST_ARGV0.as_ptr(), ptr::null()];
+            if let Err(code) = run_command_expect_dlopen_order(
+                "dlopen-test-smoke",
+                DLOPEN_TEST_PATH,
+                &argv,
+                &mut command_output,
+            ) {
+                return code;
+            }
+            pass("dlopen-test-smoke");
+        }
+    }
+
     write_str(STDOUT_FILENO, "SMOKE:PASS\n");
     0
+}
+
+/// Phase 76c-specific helper: run `dlopen_test` and assert the
+/// captured output contains FINI_PENDING → LIBHELLO_FINI:RAN →
+/// DLOPEN_TEST:PASS in strict serial order. Catches both a missing
+/// destructor invocation AND a destructor that fired before the
+/// `dlclose` call (which would imply the pipeline is running too
+/// eagerly).
+fn run_command_expect_dlopen_order(
+    stage: &str,
+    path: &[u8],
+    argv: &[*const u8],
+    output: &mut [u8],
+) -> Result<(), i32> {
+    let (status, len) = match run_command_capture(path, argv, output) {
+        Ok(result) => result,
+        Err(msg) => return Err(fail(stage, msg, 12)),
+    };
+    match exit_code(status) {
+        Some(0) => {}
+        Some(c) => {
+            return Err(fail_with_output(
+                stage,
+                "dlopen_test exited non-zero",
+                40 + c.max(0),
+                &output[..len],
+            ));
+        }
+        None => {
+            return Err(fail_with_output(
+                stage,
+                "dlopen_test did not exit normally",
+                49,
+                &output[..len],
+            ));
+        }
+    }
+    let captured = &output[..len];
+    let pending = find_subslice(captured, DLOPEN_TEST_PENDING_NEEDLE);
+    let fini = find_subslice(captured, DLOPEN_TEST_FINI_RAN_NEEDLE);
+    let done = find_subslice(captured, DLOPEN_TEST_PASS_NEEDLE);
+    match (pending, fini, done) {
+        (Some(p), Some(f), Some(d)) if p < f && f < d => Ok(()),
+        (Some(_), None, Some(_)) => Err(fail_with_output(
+            stage,
+            "LIBHELLO_FINI:RAN missing between FINI_PENDING and PASS",
+            50,
+            captured,
+        )),
+        (None, _, _) => Err(fail_with_output(
+            stage,
+            "DLOPEN_TEST:FINI_PENDING sentinel missing",
+            51,
+            captured,
+        )),
+        (_, _, None) => Err(fail_with_output(
+            stage,
+            "DLOPEN_TEST:PASS sentinel missing",
+            52,
+            captured,
+        )),
+        _ => Err(fail_with_output(
+            stage,
+            "FINI_PENDING / LIBHELLO_FINI:RAN / PASS out of order",
+            53,
+            captured,
+        )),
+    }
+}
+
+/// Find `needle` in `haystack`; return the index of the first
+/// occurrence or `None`. Hand-rolled because `slice::find` is unstable
+/// for no_std consumers.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    let last = haystack.len() - needle.len();
+    let mut i = 0;
+    while i <= last {
+        if &haystack[i..i + needle.len()] == needle {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Run a command and assert it exits with `expected_code`. Used by

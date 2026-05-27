@@ -1828,6 +1828,153 @@ fn build_dynlink_cycle() {
     }
 }
 
+/// Phase 76c — build `libhello_fini.so`, the destructor-pipeline
+/// demo library. Same shape as `libhello.so` but carries a
+/// `__attribute__((destructor))` function that writes a sentinel
+/// when `dlclose` runs the DT_FINI_ARRAY pipeline.
+fn build_libhello_fini() {
+    let root = workspace_root();
+    let libs = ensure_generated_libs_dir(&root);
+    let dst = libs.join("libhello_fini.so");
+    let src = root.join("userspace/lib/libhello_fini/hello_fini.c");
+    let src_str = src.to_str().expect("non-UTF-8 path");
+    match build_shared_lib("libhello_fini", &[src_str], &dst) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "warning: libhello_fini.so toolchain missing ({e}) — writing \
+                 placeholder. The dlopen-test-smoke gate will SKIP at runtime."
+            );
+            let _ = fs::write(&dst, b"");
+        }
+        Err(e) => {
+            eprintln!(
+                "error: libhello_fini.so build failed ({e}). Treating as a \
+                 hard build error so a stale binary cannot let the \
+                 dlopen-test-smoke gate falsely PASS."
+            );
+            let _ = fs::write(&dst, b"");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Phase 76c — build `libdl.so`, the POSIX link-time stub that
+/// programs link `-ldl` against so GNU ld can satisfy the four
+/// libdl symbols at link time. At runtime the dynamic linker
+/// self-injects ahead of `libdl.so` in the SysV symbol search
+/// scope, so its real implementations shadow these stubs.
+fn build_libdl() {
+    let root = workspace_root();
+    let libs = ensure_generated_libs_dir(&root);
+    let dst = libs.join("libdl.so");
+    let src = root.join("userspace/lib/libdl/libdl.c");
+    let src_str = src.to_str().expect("non-UTF-8 path");
+    match build_shared_lib("libdl", &[src_str], &dst) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "warning: libdl.so toolchain missing ({e}) — writing placeholder. \
+                 The dlopen-test-smoke gate will SKIP at runtime."
+            );
+            let _ = fs::write(&dst, b"");
+        }
+        Err(e) => {
+            eprintln!(
+                "error: libdl.so build failed ({e}). Treating as a hard build \
+                 error so a stale binary cannot let the dlopen-test-smoke gate \
+                 falsely PASS."
+            );
+            let _ = fs::write(&dst, b"");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Phase 76c — build `dlopen_test`, the musl dynamic ELF that drives
+/// the full `dlopen` → `dlsym` → call-through-fn-ptr → `dlclose`
+/// cycle against `/usr/lib/libhello.so`, plus the destructor demo
+/// against `/usr/lib/libhello_fini.so`, plus the four negative gates.
+fn build_dlopen_test() {
+    let root = workspace_root();
+    let initrd = ensure_generated_initrd_dir(&root);
+    let libs = ensure_generated_libs_dir(&root);
+    let dst = initrd.join("dlopen_test");
+    let src = root.join("userspace/dlopen_test/dlopen_test.c");
+    let libdl = libs.join("libdl.so");
+
+    if !libdl.exists() || fs::metadata(&libdl).map(|m| m.len() == 0).unwrap_or(true) {
+        eprintln!(
+            "warning: libdl.so missing or empty at {} — skipping dlopen_test build",
+            libdl.display()
+        );
+        let _ = fs::write(&dst, b"");
+        return;
+    }
+
+    let cc = match find_musl_cc() {
+        Some(c) => c,
+        None => {
+            eprintln!("warning: musl-gcc missing — skipping dlopen_test build");
+            let _ = fs::write(&dst, b"");
+            return;
+        }
+    };
+
+    let mut cmd = Command::new(cc);
+    cmd.args([
+        "-nostdlib",
+        "-nostartfiles",
+        "-fno-stack-protector",
+        "-fno-pie",
+        "-no-pie",
+        "-fPIC",
+        "-Wl,-pie",
+        "-Wl,-dynamic-linker=/lib/ld-musl-x86_64.so.1",
+        "-Wl,--hash-style=sysv",
+        "-Wl,-rpath,/usr/lib",
+        "-Wl,--no-eh-frame-hdr",
+        "-O2",
+        "-fno-builtin",
+    ]);
+    cmd.arg(src.to_str().expect("non-UTF-8 path"));
+    cmd.arg(libdl.to_str().expect("non-UTF-8 path"));
+    cmd.arg("-o").arg(dst.to_str().expect("non-UTF-8 path"));
+
+    match cmd.output() {
+        Ok(out) if out.status.success() => {
+            println!("dlopen_test: built → {}", dst.display());
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            eprintln!(
+                "error: dlopen_test build failed (exit {}): {stderr}. \
+                 Treating as a hard build error so a stale binary cannot let \
+                 the dlopen-test-smoke gate falsely PASS.",
+                out.status.code().unwrap_or(-1)
+            );
+            let _ = fs::write(&dst, b"");
+            std::process::exit(1);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "warning: {cc} not found mid-build — skipping dlopen_test. \
+                 The dlopen-test-smoke gate will SKIP at runtime."
+            );
+            let _ = fs::write(&dst, b"");
+        }
+        Err(e) => {
+            eprintln!(
+                "error: failed to invoke {cc} for dlopen_test: {e}. Not a \
+                 missing-binary error — treating as a hard environment \
+                 problem so the developer notices."
+            );
+            let _ = fs::write(&dst, b"");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Compile Phase 12 musl-linked C binaries and stage them under target/generated-initrd/.
 ///
 /// Requires `musl-gcc` on the host PATH (package `musl-tools` on Debian/Ubuntu).
@@ -3071,6 +3218,12 @@ fn build_kernel() -> PathBuf {
     // Phase 76b F1.4 — negative gates.
     build_dynlink_missing();
     build_dynlink_cycle();
+    // Phase 76c — libdl.so link-time stub, libhello_fini.so
+    // destructor demo, and the dlopen_test binary that exercises
+    // every libdl entry point.
+    build_libdl();
+    build_libhello_fini();
+    build_dlopen_test();
     build_musl_bins();
     // Phase 44: cross-compile musl-linked Rust userspace programs.
     build_musl_rust_bins();
@@ -4205,6 +4358,12 @@ fn cmd_check() {
     // Phase 76b F1.4 — negative gates.
     build_dynlink_missing();
     build_dynlink_cycle();
+    // Phase 76c — libdl.so link-time stub, libhello_fini.so
+    // destructor demo, and the dlopen_test binary that exercises
+    // every libdl entry point.
+    build_libdl();
+    build_libhello_fini();
+    build_dlopen_test();
     build_musl_bins();
     // Phase 44: cross-compile musl-linked Rust userspace programs.
     build_musl_rust_bins();
@@ -5997,6 +6156,18 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         pattern_b: "SMOKE:dynlink-cycle-smoke:SKIP",
         timeout_secs: 30,
         label: "guest/dynlink-cycle-smoke: cyclic DT_NEEDED → ELIBBAD",
+        extra_steps_a: &[],
+        extra_steps_b: &[],
+    });
+    // Phase 76c — libdl runtime gate. Drives dlopen / dlsym /
+    // dlclose / dlerror through `dlopen_test` and asserts that
+    // DT_FINI_ARRAY destructors fire in the right serial order
+    // between the test's FINI_PENDING and PASS bracket sentinels.
+    steps.push(SmokeStep::WaitEither {
+        pattern_a: "SMOKE:dlopen-test-smoke:PASS",
+        pattern_b: "SMOKE:dlopen-test-smoke:SKIP",
+        timeout_secs: 30,
+        label: "guest/dlopen-test-smoke: libdl runtime + DT_FINI_ARRAY destructors",
         extra_steps_a: &[],
         extra_steps_b: &[],
     });

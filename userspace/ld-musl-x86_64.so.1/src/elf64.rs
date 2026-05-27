@@ -70,11 +70,14 @@ pub const DT_RELAENT: i64 = 9;
 pub const DT_STRSZ: i64 = 10;
 pub const DT_SYMENT: i64 = 11;
 pub const DT_INIT: i64 = 12;
+pub const DT_FINI: i64 = 13;
 pub const DT_SONAME: i64 = 14;
 pub const DT_PLTREL: i64 = 20;
 pub const DT_JMPREL: i64 = 23;
 pub const DT_INIT_ARRAY: i64 = 25;
+pub const DT_FINI_ARRAY: i64 = 26;
 pub const DT_INIT_ARRAYSZ: i64 = 27;
+pub const DT_FINI_ARRAYSZ: i64 = 28;
 
 // ---------------------------------------------------------------------------
 // Program-header types.

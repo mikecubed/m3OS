@@ -338,6 +338,12 @@ static DYNLINK_MISSING_ELF: &[u8] = generated_initrd_asset!("dynlink_missing");
 // the linker exits with code 80 (ELIBBAD).
 static DYNLINK_CYCLE_ELF: &[u8] = generated_initrd_asset!("dynlink_cycle");
 
+// Phase 76c — `dlopen_test` musl-built dynamic ELF with PT_INTERP +
+// DT_NEEDED libdl.so. Exercises the full dlopen / dlsym / dlclose /
+// dlerror lifecycle including DT_FINI_ARRAY destructors on
+// `libhello_fini.so`. Drives the dlopen-test-smoke gate.
+static DLOPEN_TEST_ELF: &[u8] = generated_initrd_asset!("dlopen_test");
+
 // Phase 70 follow-up — `doom-concurrent` forks two `doom` processes
 // and waits for both. Run from the post-login shell by `cargo xtask
 // doom-concurrent-smoke` to assert real kernel-level concurrency
@@ -633,6 +639,15 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "dynlink_cycle",
         RamdiskNode::File {
             content: DYNLINK_CYCLE_ELF,
+        },
+    ),
+    // Phase 76c: dlopen_test — exercises dlopen / dlsym / dlclose /
+    // dlerror via `libdl.so` (resolved through the dynamic linker's
+    // self-injected scope). Drives the dlopen-test-smoke step.
+    (
+        "dlopen_test",
+        RamdiskNode::File {
+            content: DLOPEN_TEST_ELF,
         },
     ),
     // Phase 70 follow-up: doom-concurrent — forks two doom children
@@ -998,6 +1013,19 @@ static LIBHELLO_ELF: &[u8] = include_bytes!(concat!(
     "/../target/generated-libs/libhello.so"
 ));
 
+// Phase 76c — libdl.so link-time stub; libhello_fini.so destructor
+// demo. Both embedded the same way so dlopen_test resolves its
+// DT_NEEDED libdl.so and runtime-`dlopen` of libhello_fini.so against
+// `/usr/lib/` even before the ext2 disk mounts.
+static LIBDL_ELF: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../target/generated-libs/libdl.so"
+));
+static LIBHELLO_FINI_ELF: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../target/generated-libs/libhello_fini.so"
+));
+
 static LIB_ENTRIES: &[(&str, RamdiskNode)] = &[(
     "ld-musl-x86_64.so.1",
     RamdiskNode::File { content: LDSO_ELF },
@@ -1007,12 +1035,21 @@ static LIB_ENTRIES: &[(&str, RamdiskNode)] = &[(
 // because the ramdisk tree mirrors the on-disk layout. Adding a new
 // LIB_ENTRIES slot would map to `/lib/`, which is wrong; the linker's
 // search order finds libhello under `/usr/lib/` first.
-static USR_LIB_ENTRIES: &[(&str, RamdiskNode)] = &[(
-    "libhello.so",
-    RamdiskNode::File {
-        content: LIBHELLO_ELF,
-    },
-)];
+static USR_LIB_ENTRIES: &[(&str, RamdiskNode)] = &[
+    (
+        "libhello.so",
+        RamdiskNode::File {
+            content: LIBHELLO_ELF,
+        },
+    ),
+    ("libdl.so", RamdiskNode::File { content: LIBDL_ELF }),
+    (
+        "libhello_fini.so",
+        RamdiskNode::File {
+            content: LIBHELLO_FINI_ELF,
+        },
+    ),
+];
 
 static USR_ENTRIES: &[(&str, RamdiskNode)] = &[(
     "lib",
