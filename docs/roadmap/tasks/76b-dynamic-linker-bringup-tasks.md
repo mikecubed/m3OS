@@ -1,6 +1,6 @@
 # Phase 76b — Dynamic Linker: `DT_NEEDED` Resolution + Relocations: Task List
 
-**Status:** Planned
+**Status:** **Complete** — all tracks shipped, all smoke gates PASS (dynlink-hello-smoke + dynlink-missing-smoke + dynlink-cycle-smoke), 23/23 host tests green
 **Source Ref:** phase-76b
 **Depends on:** Phase 76 ✅
 **Goal:** Replace the Phase 76 transfer-only `_dlstart` stub with a real bring-up linker that resolves `DT_NEEDED`, applies the four core x86_64 relocations, runs constructors, and supports building `.so` files in `xtask`.
@@ -9,13 +9,69 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| B1 | `_dlstart` self-relocation in inline asm before any Rust global access | Phase 76 ✅ | Planned |
-| B2 | `PT_DYNAMIC` parser + `DT_NEEDED` dependency graph + topological sort | B1 | Planned |
-| B3 | x86_64 relocation application (`R_X86_64_GLOB_DAT`, `R_X86_64_JUMP_SLOT`, `R_X86_64_RELATIVE`, `R_X86_64_64`) | B2 | Planned |
-| B5 | `DT_INIT` / `DT_INIT_ARRAY` constructors, deepest-first | B3 | Planned |
-| E3 | `xtask::build_shared_lib(name, srcs, output)` + stage to `/usr/lib/` | Phase 31 ✅ | Planned |
-| F1 | `libhello.so` + `dynlink_hello` + xtask gate | B5, E3 | Planned |
-| H | Design-doc updates + learning doc + version bump | All | Planned |
+| B1 | `_dlstart` self-relocation in inline asm before any Rust global access | Phase 76 ✅ | **Complete** — naked-asm `_start` + `dl_relocate_self` walks own PT_DYNAMIC for DT_RELA + applies every R_X86_64_RELATIVE before any GOT-routed read; host-tested `apply_relative` (zero/non-zero/negative addend + misaligned + OOB cases) |
+| B2 | `PT_DYNAMIC` parser + `DT_NEEDED` dependency graph + topological sort | B1 | **Complete** — host-tested `DynamicSection::parse` + iterative transitive `load_needed` with SONAME dedup + host-tested `topo_sort` (white/gray/black DFS, cycle → `TopoError::CircularDependency` → `exit(80)` ELIBBAD); search order is `/usr/lib/` (full LD_LIBRARY_PATH walk slated for 76d) |
+| B3 | x86_64 relocation application (`R_X86_64_GLOB_DAT`, `R_X86_64_JUMP_SLOT`, `R_X86_64_RELATIVE`, `R_X86_64_64`) | B2 | **Complete** — host-tested primitives `apply_relative` / `apply_glob_dat` / `apply_abs64` + host-tested `lookup_in_hash_table`; runtime `apply_rela` dispatches per `r_type` and resolves names via the loaded-DSO chain |
+| B5 | `DT_INIT` / `DT_INIT_ARRAY` constructors, deepest-first | B3 | **Complete** — `run_constructors` iterates DSO list in reverse and calls each entry via a register-loaded address (not GOT slot) |
+| E3 | `xtask::build_shared_lib(name, srcs, output)` + stage to `/usr/lib/` | Phase 31 ✅ | **Complete** — helper + `populate_ext2_files` `.so` enumeration + kernel ramdisk `USR_ENTRIES` |
+| F1 | `libhello.so` + `dynlink_hello` + missing-dep + cycle gates | B5, E3 | **Complete** — `dynlink-hello-smoke` (refcount path, 2 consecutive runs), `dynlink-missing-smoke` (exit 2), `dynlink-cycle-smoke` (exit 80) all PASS |
+| H | Design-doc updates + learning doc + version bump | All | **Complete** — kernel 0.76.1, Cargo.lock regenerated, roadmap row marked Complete, task-list status header + per-track status column + Implementation Notes section all updated, `docs/76-dynamic-linker.md` extended with "What changes in 76b" section + Key Files table, AGENTS.md Phase 76b clause added |
+
+## Implementation Notes (Phase 76b)
+
+The bring-up linker is split into a host-testable `ldso_core` library
+(`userspace/ld-musl-x86_64.so.1/src/{reloc,dynlink,elf64}.rs`) and a
+`no_std` + `no_main` PIE binary (`src/main.rs`). 23 host tests in the
+library pin the byte-exact semantics of every pure-logic primitive
+(`apply_relative` / `apply_glob_dat` / `apply_abs64`, the SysV
+`elf_hash` and `lookup_in_hash_table`, the `DynamicSection` parser,
+and the `topo_sort`).
+
+The runtime `dl_entry` driver wires:
+
+- `_start` naked-asm hand-off to `dl_entry`;
+- `dl_relocate_self` walks own `PT_DYNAMIC` for `DT_RELA`/`DT_RELASZ`
+  and applies every `R_X86_64_RELATIVE` before any GOT-routed read
+  (verified in QEMU — the existing `dynlink-smoke` gate still passes);
+- `parse_auxv` extracts `AT_BASE`, `AT_PHDR`, `AT_PHNUM`, `AT_ENTRY`;
+- main-binary `PT_PHDR` → load-bias → `PT_DYNAMIC` parsing;
+- `load_dso` opens `/usr/lib/<name>`, mmaps one anonymous region
+  for the whole DSO image (kernel chooses base → load_bias), copies
+  each `PT_LOAD` into `load_bias + p_vaddr`, then `mprotect`s
+  `PF_X` segments to `PROT_READ | PROT_EXEC` (W^X-clean);
+- transitive `DT_NEEDED` resolution with SONAME-keyed dedup, building
+  a parallel adjacency-list dependency graph;
+- `topo_sort` over the graph — `TopoError::CircularDependency` →
+  `exit(80)` (ELIBBAD);
+- `apply_rela` walks `DT_RELA` / `DT_JMPREL`, dispatches per type,
+  resolves named symbols via the loaded-DSO list;
+- `run_constructors` iterates the DSO list deepest-first.
+
+**DSO load strategy.** The kernel's `sys_linux_mmap`
+(`kernel/src/arch/x86_64/syscall/mod.rs`) ignores `addr_hint` for
+anonymous mappings — pages always come from the per-process
+`mmap_next` allocator. So `load_dso` does NOT try to place segments
+at a chosen address. Instead it issues ONE anonymous mmap of the
+whole image size; the kernel's returned address becomes the DSO's
+load bias.
+
+**Negative gates (F1.4).** Two binaries exercise the failure modes:
+
+- `dynlink_missing` links against `libdoesnotexist.so` via a
+  never-staged stub under `target/missing-stub/`. At runtime the
+  linker hits ENOENT and `exit(2)`. Gate asserts
+  `WEXITSTATUS == 2`.
+- `dynlink_cycle` depends on `libcyca.so`, which depends on
+  `libcycb.so`, which depends on `libcyca.so` (closed cycle). The
+  cycle libs are built in three steps to break chicken-and-egg:
+  `libcyca_stub.so` → `libcycb.so` → final `libcyca.so` closing the
+  back-edge. The linker's `topo_sort` detects the cycle and
+  `exit(80)`. Gate asserts `WEXITSTATUS == 80`.
+
+**Smoke verification.** `cargo xtask smoke-test` passes 15/15 steps
+in 18s. The new gates are `dynlink-hello-smoke` (refcount path:
+runs the binary twice consecutively, asserts the sentinel both
+times), `dynlink-missing-smoke`, and `dynlink-cycle-smoke`.
 
 ---
 

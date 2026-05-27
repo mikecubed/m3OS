@@ -1303,6 +1303,531 @@ fn build_dynlink_smoke() {
     }
 }
 
+/// Phase 76b — build a shared C library (`*.so`) from one or more C
+/// sources using the host musl cross-compiler, with the linker flags
+/// the bring-up dynamic linker expects:
+///
+///   * `-shared -fPIC` — PIC code + DSO output shape
+///   * `-Wl,--hash-style=sysv` — emit `DT_HASH` (no `DT_GNU_HASH`)
+///   * `-Wl,-soname,<name>.so` — set `DT_SONAME` so the consumer's
+///     `DT_NEEDED` can match by SONAME at link time.
+///
+/// Output: `target/generated-libs/<name>.so`. Returns an `io::Error`
+/// when the toolchain is missing or the compile fails so the caller
+/// can surface a structured diagnostic instead of silently producing
+/// an empty placeholder.
+fn build_shared_lib(name: &str, srcs: &[&str], output: &Path) -> io::Result<()> {
+    let cc = find_musl_cc().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "musl cross-compiler not on PATH (install musl-tools)",
+        )
+    })?;
+    let mut cmd = Command::new(cc);
+    // `-nostdlib` keeps `DT_NEEDED = libc.so` off the result so the
+    // Phase 76b bring-up linker (which does not yet load libc) does
+    // not have to resolve libc symbols transitively. Phase 76d will
+    // relax this once `DT_GNU_HASH` + lazy resolve land.
+    cmd.args([
+        "-shared",
+        "-fPIC",
+        "-O2",
+        "-nostdlib",
+        "-Wl,--hash-style=sysv",
+    ]);
+    cmd.arg(format!("-Wl,-soname,{name}.so"));
+    for s in srcs {
+        cmd.arg(s);
+    }
+    cmd.arg("-o").arg(output);
+    let out = cmd
+        .output()
+        .map_err(|e| io::Error::other(format!("failed to invoke {cc}: {e}")))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        eprintln!("build_shared_lib({name}.so) failed:\n{stderr}");
+        return Err(io::Error::other(format!(
+            "{cc} exited {}",
+            out.status.code().unwrap_or(-1)
+        )));
+    }
+    println!("shared-lib: {} → {}", srcs.join(" "), output.display());
+    Ok(())
+}
+
+/// Phase 76b — build `libhello.so` and stage it under
+/// `target/generated-libs/`. Mirrors `build_dynlink_smoke`'s error
+/// policy:
+///   * `ErrorKind::NotFound` (toolchain missing) — write a zero-byte
+///     placeholder so the kernel ramdisk `include_bytes!` path still
+///     resolves; the runtime smoke gate then SKIPs.
+///   * any other failure (compile/link error, permission denied, etc.)
+///     is treated as fatal so a previous successful build's binary
+///     cannot survive into the next smoke run and falsely PASS.
+fn build_libhello() {
+    let root = workspace_root();
+    let libs = ensure_generated_libs_dir(&root);
+    let dst = libs.join("libhello.so");
+    let src = root.join("userspace/lib/libhello/hello.c");
+    let src_str = src.to_str().expect("non-UTF-8 path");
+    match build_shared_lib("libhello", &[src_str], &dst) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "warning: libhello.so toolchain missing ({e}) — writing \
+                 placeholder. The dynlink-hello-smoke gate will SKIP at runtime."
+            );
+            // Force-overwrite so a stale binary from a previous
+            // successful build cannot be picked up later.
+            let _ = fs::write(&dst, b"");
+        }
+        Err(e) => {
+            eprintln!(
+                "error: libhello.so build failed ({e}). The toolchain is \
+                 available but the source/link did not produce a valid \
+                 shared library — treating as a hard build error so a \
+                 stale binary cannot let the smoke gate falsely PASS."
+            );
+            let _ = fs::write(&dst, b"");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Phase 76b — build `dynlink_hello`, the dynamic ELF whose
+/// `PT_INTERP` points at `/lib/ld-musl-x86_64.so.1` and whose
+/// `DT_NEEDED` carries `libhello.so`. Linked with `-Wl,--hash-style=sysv`
+/// so the consumer's own dynamic section also uses `DT_HASH` (the
+/// bring-up linker does not yet understand `DT_GNU_HASH`).
+///
+/// The binary is staged under `target/generated-initrd/dynlink_hello`
+/// so the kernel ramdisk can `include_bytes!` it the same way it does
+/// `dynlink_smoke`.
+fn build_dynlink_hello() {
+    let root = workspace_root();
+    let initrd = ensure_generated_initrd_dir(&root);
+    let libs = ensure_generated_libs_dir(&root);
+    let dst = initrd.join("dynlink_hello");
+    let src = root.join("userspace/dynlink_hello/dynlink_hello.c");
+    let lib = libs.join("libhello.so");
+
+    if !lib.exists() || fs::metadata(&lib).map(|m| m.len() == 0).unwrap_or(true) {
+        eprintln!(
+            "warning: libhello.so missing or empty at {} — skipping dynlink_hello build",
+            lib.display()
+        );
+        let _ = fs::write(&dst, b"");
+        return;
+    }
+
+    let cc = match find_musl_cc() {
+        Some(c) => c,
+        None => {
+            eprintln!("warning: musl-gcc missing — skipping dynlink_hello build");
+            let _ = fs::write(&dst, b"");
+            return;
+        }
+    };
+
+    let mut cmd = Command::new(cc);
+    cmd.args([
+        "-nostdlib",
+        "-nostartfiles",
+        "-fno-stack-protector",
+        "-fno-pie",
+        "-no-pie",
+    ]);
+    cmd.args([
+        "-fPIC",
+        "-Wl,-pie",
+        "-Wl,-dynamic-linker=/lib/ld-musl-x86_64.so.1",
+        "-Wl,--hash-style=sysv",
+        "-Wl,-rpath,/usr/lib",
+        "-Wl,--no-eh-frame-hdr",
+        "-O2",
+        // gcc would otherwise pattern-match our hand-rolled
+        // `while (s[n] != 0) n++;` into a strlen() call against
+        // libc — which dynlink_hello does not link with.
+        "-fno-builtin",
+    ]);
+    cmd.arg(src.to_str().expect("non-UTF-8 path"));
+    cmd.arg(lib.to_str().expect("non-UTF-8 path"));
+    cmd.arg("-o").arg(dst.to_str().expect("non-UTF-8 path"));
+
+    // Error policy mirrors `build_dynlink_smoke`:
+    //   * Compiler ran but exited non-zero → FATAL. A working toolchain
+    //     that fails to compile means the source/link flags are broken;
+    //     keeping a placeholder would let the smoke gate falsely PASS
+    //     against the previous build's stale artifact.
+    //   * `Err(NotFound)` → SKIP-eligible (toolchain disappeared mid-build,
+    //     unlikely after the earlier `find_musl_cc()` probe but handled
+    //     for completeness).
+    //   * Any other invoke error → FATAL for the same reason as a
+    //     non-zero exit.
+    match cmd.output() {
+        Ok(out) if out.status.success() => {
+            println!("dynlink_hello: built → {}", dst.display());
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            eprintln!(
+                "error: dynlink_hello build failed (exit {}): {stderr}. \
+                 The toolchain is available but the source/link did not \
+                 produce a valid binary — treating as a hard build error \
+                 so a stale binary cannot let the smoke gate falsely PASS.",
+                out.status.code().unwrap_or(-1)
+            );
+            let _ = fs::write(&dst, b"");
+            std::process::exit(1);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "warning: {cc} not found mid-build — skipping dynlink_hello. \
+                 The dynlink-hello-smoke gate will SKIP at runtime."
+            );
+            let _ = fs::write(&dst, b"");
+        }
+        Err(e) => {
+            eprintln!(
+                "error: failed to invoke {cc} for dynlink_hello: {e}. Not a \
+                 missing-binary error — treating as a hard environment \
+                 problem so the developer notices."
+            );
+            let _ = fs::write(&dst, b"");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Phase 76b F1.4 — build the cycle-test shared libs `libcyca.so`
+/// and `libcycb.so` with mutual `DT_NEEDED` entries. The cycle is
+/// created by a three-step build:
+///
+/// 1. Stub `libcyca.so` — `cyca_stub.c` returning 0, no DT_NEEDED,
+///    `DT_SONAME=libcyca.so`. Written to `target/cycle-stub/libcyca.so`
+///    (not staged) so libcycb.so has something to link against.
+/// 2. `libcycb.so` — `cycb.c` linked against the stub `libcyca.so`,
+///    so its DT_NEEDED records `libcyca.so`.
+/// 3. Final `libcyca.so` — `cyca.c` (calls cycb_func) linked against
+///    `libcycb.so`, so its DT_NEEDED records `libcycb.so`. This
+///    final binary supersedes the stub and is the one staged on
+///    disk; together with `libcycb.so` it closes the cycle.
+///
+/// The stub artifact at `target/cycle-stub/libcyca.so` is
+/// intentionally never staged — it exists only as a link-time
+/// placeholder.
+fn build_cycle_libs() -> Result<(), io::Error> {
+    let root = workspace_root();
+    let libs = ensure_generated_libs_dir(&root);
+    let stub_dir = root.join("target/cycle-stub");
+    fs::create_dir_all(&stub_dir)?;
+
+    let cc = find_musl_cc()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "musl cross-compiler missing"))?;
+
+    let cyca_src = root.join("userspace/lib/libcyca/cyca.c");
+    let cyca_stub_src = root.join("userspace/lib/libcyca/cyca_stub.c");
+    let cycb_src = root.join("userspace/lib/libcycb/cycb.c");
+    let stub_so = stub_dir.join("libcyca.so");
+    let cycb_so = libs.join("libcycb.so");
+    let cyca_so = libs.join("libcyca.so");
+
+    // Step 1: build the cycle-stub libcyca.so (in target/cycle-stub/)
+    // with DT_SONAME=libcyca.so. This is the link-time placeholder
+    // that libcycb.so binds against.
+    {
+        let mut cmd = Command::new(cc);
+        cmd.args([
+            "-shared",
+            "-fPIC",
+            "-O2",
+            "-nostdlib",
+            "-Wl,--hash-style=sysv",
+            "-Wl,-soname,libcyca.so",
+        ]);
+        cmd.arg(cyca_stub_src.to_str().unwrap());
+        cmd.arg("-o").arg(&stub_so);
+        let out = cmd.output()?;
+        if !out.status.success() {
+            eprintln!(
+                "cycle-stub libcyca.so build failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return Err(io::Error::other("stub build failed"));
+        }
+    }
+
+    // Step 2: build libcycb.so linking against the cycle-stub libcyca.so.
+    {
+        let mut cmd = Command::new(cc);
+        cmd.args([
+            "-shared",
+            "-fPIC",
+            "-O2",
+            "-nostdlib",
+            "-Wl,--hash-style=sysv",
+            "-Wl,-soname,libcycb.so",
+            "-Wl,--no-as-needed",
+        ]);
+        cmd.arg(format!("-L{}", stub_dir.display()));
+        cmd.arg(cycb_src.to_str().unwrap());
+        cmd.arg("-lcyca");
+        cmd.arg("-o").arg(&cycb_so);
+        let out = cmd.output()?;
+        if !out.status.success() {
+            eprintln!(
+                "libcycb.so build failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return Err(io::Error::other("libcycb build failed"));
+        }
+    }
+
+    // Step 3: build the final libcyca.so linking against libcycb.so
+    // (so its DT_NEEDED records libcycb.so and the cycle closes).
+    {
+        let mut cmd = Command::new(cc);
+        cmd.args([
+            "-shared",
+            "-fPIC",
+            "-O2",
+            "-nostdlib",
+            "-Wl,--hash-style=sysv",
+            "-Wl,-soname,libcyca.so",
+            "-Wl,--no-as-needed",
+        ]);
+        cmd.arg(format!("-L{}", libs.display()));
+        cmd.arg(cyca_src.to_str().unwrap());
+        cmd.arg("-lcycb");
+        cmd.arg("-o").arg(&cyca_so);
+        let out = cmd.output()?;
+        if !out.status.success() {
+            eprintln!(
+                "libcyca.so build failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return Err(io::Error::other("libcyca build failed"));
+        }
+    }
+    println!(
+        "cycle-libs: {} + {} (with mutual DT_NEEDED) staged in {}",
+        cyca_so.display(),
+        cycb_so.display(),
+        libs.display()
+    );
+    Ok(())
+}
+
+/// Phase 76b F1.4 — build the `libdoesnotexist.so` stub used at
+/// link-time by `dynlink_missing` to inject the `DT_NEEDED =
+/// libdoesnotexist.so` entry. The stub lives under
+/// `target/missing-stub/` and is NEVER staged on disk, so at runtime
+/// the bring-up linker hits ENOENT for the path.
+fn build_missing_stub() -> Result<PathBuf, io::Error> {
+    let root = workspace_root();
+    let stub_dir = root.join("target/missing-stub");
+    fs::create_dir_all(&stub_dir)?;
+    let cc = find_musl_cc()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "musl cross-compiler missing"))?;
+    let src = stub_dir.join("doesnotexist_stub.c");
+    fs::write(&src, b"int doesnotexist_sym = 0;\n")?;
+    let stub_so = stub_dir.join("libdoesnotexist.so");
+    let mut cmd = Command::new(cc);
+    cmd.args([
+        "-shared",
+        "-fPIC",
+        "-O2",
+        "-nostdlib",
+        "-Wl,--hash-style=sysv",
+        "-Wl,-soname,libdoesnotexist.so",
+    ]);
+    cmd.arg(&src);
+    cmd.arg("-o").arg(&stub_so);
+    let out = cmd.output()?;
+    if !out.status.success() {
+        eprintln!(
+            "libdoesnotexist stub build failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return Err(io::Error::other("missing-stub build failed"));
+    }
+    Ok(stub_dir)
+}
+
+/// Phase 76b F1.4 — build `dynlink_missing`: a dynamic ELF whose
+/// `DT_NEEDED` names `libdoesnotexist.so`. At runtime the bring-up
+/// linker fails to open `/usr/lib/libdoesnotexist.so`, prints an
+/// error, and `exit(2)` (ENOENT).
+fn build_dynlink_missing() {
+    let root = workspace_root();
+    let initrd = ensure_generated_initrd_dir(&root);
+    let dst = initrd.join("dynlink_missing");
+    let src = root.join("userspace/dynlink_missing/dynlink_missing.c");
+
+    let stub_dir = match build_missing_stub() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("warning: dynlink_missing skipped (stub build failed: {e})");
+            let _ = fs::write(&dst, b"");
+            return;
+        }
+    };
+    let cc = match find_musl_cc() {
+        Some(c) => c,
+        None => {
+            eprintln!("warning: musl-gcc missing — skipping dynlink_missing");
+            let _ = fs::write(&dst, b"");
+            return;
+        }
+    };
+    let mut cmd = Command::new(cc);
+    cmd.args([
+        "-nostdlib",
+        "-nostartfiles",
+        "-fno-stack-protector",
+        "-fno-pie",
+        "-no-pie",
+        "-fPIC",
+        "-Wl,-pie",
+        "-Wl,-dynamic-linker=/lib/ld-musl-x86_64.so.1",
+        "-Wl,--hash-style=sysv",
+        "-Wl,-rpath,/usr/lib",
+        "-Wl,--no-as-needed",
+        "-Wl,--no-eh-frame-hdr",
+        "-O2",
+        "-fno-builtin",
+    ]);
+    cmd.arg(format!("-L{}", stub_dir.display()));
+    cmd.arg(src);
+    cmd.arg("-ldoesnotexist");
+    cmd.arg("-o").arg(&dst);
+    // Error policy mirrors `build_dynlink_smoke`: only the
+    // toolchain-missing case (`ErrorKind::NotFound`) emits a SKIP-
+    // eligible placeholder.  A present-toolchain compile/link
+    // failure is fatal so the dynlink-missing-smoke gate cannot
+    // silently SKIP against a stale binary.
+    match cmd.output() {
+        Ok(o) if o.status.success() => {
+            println!("dynlink_missing: built → {}", dst.display());
+        }
+        Ok(o) => {
+            eprintln!(
+                "error: dynlink_missing build failed (exit {}): {}. \
+                 Treating as a hard build error so a stale binary \
+                 cannot let the dynlink-missing-smoke gate falsely PASS/SKIP.",
+                o.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            let _ = fs::write(&dst, b"");
+            std::process::exit(1);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "warning: {cc} not found mid-build — skipping dynlink_missing. \
+                 The dynlink-missing-smoke gate will SKIP at runtime."
+            );
+            let _ = fs::write(&dst, b"");
+        }
+        Err(e) => {
+            eprintln!(
+                "error: failed to invoke {cc} for dynlink_missing: {e}. Not a \
+                 missing-binary error — treating as a hard environment problem."
+            );
+            let _ = fs::write(&dst, b"");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Phase 76b F1.4 — build `dynlink_cycle`: a dynamic ELF whose
+/// `DT_NEEDED` names `libcyca.so`, where libcyca.so ↔ libcycb.so
+/// have mutual DT_NEEDED entries. At runtime the linker detects the
+/// cycle via topo_sort and `exit(80)` (ELIBBAD).
+fn build_dynlink_cycle() {
+    let root = workspace_root();
+    let initrd = ensure_generated_initrd_dir(&root);
+    let libs = ensure_generated_libs_dir(&root);
+    let dst = initrd.join("dynlink_cycle");
+    let src = root.join("userspace/dynlink_cycle/dynlink_cycle.c");
+
+    if let Err(e) = build_cycle_libs() {
+        eprintln!("warning: cycle libs skipped: {e}");
+        let _ = fs::write(&dst, b"");
+        return;
+    }
+    let cc = match find_musl_cc() {
+        Some(c) => c,
+        None => {
+            eprintln!("warning: musl-gcc missing — skipping dynlink_cycle");
+            let _ = fs::write(&dst, b"");
+            return;
+        }
+    };
+    let mut cmd = Command::new(cc);
+    cmd.args([
+        "-nostdlib",
+        "-nostartfiles",
+        "-fno-stack-protector",
+        "-fno-pie",
+        "-no-pie",
+        "-fPIC",
+        "-Wl,-pie",
+        "-Wl,-dynamic-linker=/lib/ld-musl-x86_64.so.1",
+        "-Wl,--hash-style=sysv",
+        "-Wl,-rpath,/usr/lib",
+        "-Wl,--no-as-needed",
+        "-Wl,--no-eh-frame-hdr",
+        "-O2",
+        "-fno-builtin",
+    ]);
+    cmd.arg(format!("-L{}", libs.display()));
+    cmd.arg(format!("-Wl,-rpath-link={}", libs.display()));
+    // Allow undefined references — `cyca_func` chains into libcycb's
+    // `cycb_func` which is intentionally absent at runtime when the
+    // cycle gate trips. The link uses --unresolved-symbols to leave
+    // the references for the dynamic linker.
+    cmd.arg("-Wl,--unresolved-symbols=ignore-in-shared-libs");
+    cmd.arg(src);
+    cmd.arg("-lcyca");
+    cmd.arg("-o").arg(&dst);
+    // Error policy mirrors `build_dynlink_smoke`: only the
+    // toolchain-missing case (`ErrorKind::NotFound`) emits a SKIP-
+    // eligible placeholder.  A present-toolchain compile/link
+    // failure is fatal so the dynlink-cycle-smoke gate cannot
+    // silently SKIP against a stale binary.
+    match cmd.output() {
+        Ok(o) if o.status.success() => {
+            println!("dynlink_cycle: built → {}", dst.display());
+        }
+        Ok(o) => {
+            eprintln!(
+                "error: dynlink_cycle build failed (exit {}): {}. \
+                 Treating as a hard build error so a stale binary \
+                 cannot let the dynlink-cycle-smoke gate falsely PASS/SKIP.",
+                o.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            let _ = fs::write(&dst, b"");
+            std::process::exit(1);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "warning: {cc} not found mid-build — skipping dynlink_cycle. \
+                 The dynlink-cycle-smoke gate will SKIP at runtime."
+            );
+            let _ = fs::write(&dst, b"");
+        }
+        Err(e) => {
+            eprintln!(
+                "error: failed to invoke {cc} for dynlink_cycle: {e}. Not a \
+                 missing-binary error — treating as a hard environment problem."
+            );
+            let _ = fs::write(&dst, b"");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Compile Phase 12 musl-linked C binaries and stage them under target/generated-initrd/.
 ///
 /// Requires `musl-gcc` on the host PATH (package `musl-tools` on Debian/Ubuntu).
@@ -2538,6 +3063,14 @@ fn build_kernel() -> PathBuf {
     // file under `target/generated-libs/`.
     build_ldso();
     build_dynlink_smoke();
+    // Phase 76b — build libhello.so first so dynlink_hello can link
+    // against it; both are staged into target/generated-libs/ and
+    // target/generated-initrd/ for the ext2 disk + ramdisk paths.
+    build_libhello();
+    build_dynlink_hello();
+    // Phase 76b F1.4 — negative gates.
+    build_dynlink_missing();
+    build_dynlink_cycle();
     build_musl_bins();
     // Phase 44: cross-compile musl-linked Rust userspace programs.
     build_musl_rust_bins();
@@ -3664,6 +4197,14 @@ fn cmd_check() {
     // the C smoke binary that exercises the kernel → ld.so handoff.
     build_ldso();
     build_dynlink_smoke();
+    // Phase 76b — build libhello.so first so dynlink_hello can link
+    // against it; both are staged into target/generated-libs/ and
+    // target/generated-initrd/ for the ext2 disk + ramdisk paths.
+    build_libhello();
+    build_dynlink_hello();
+    // Phase 76b F1.4 — negative gates.
+    build_dynlink_missing();
+    build_dynlink_cycle();
     build_musl_bins();
     // Phase 44: cross-compile musl-linked Rust userspace programs.
     build_musl_rust_bins();
@@ -5424,6 +5965,38 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         pattern_b: "SMOKE:dynlink-smoke:SKIP",
         timeout_secs: 30,
         label: "guest/dynlink-smoke: kernel PT_INTERP + ld.so handoff verified or skipped",
+        extra_steps_a: &[],
+        extra_steps_b: &[],
+    });
+    // Phase 76b — full bring-up linker gate. The smoke-runner execs
+    // `/bin/dynlink_hello` twice consecutively, which exercises
+    // ld.so self-relocation, DT_NEEDED loading of `/usr/lib/libhello.so`,
+    // R_X86_64_JUMP_SLOT resolution, and the refcounted re-load
+    // path. Accepts SKIP when the demo binaries are zero-byte
+    // placeholders (no host musl-gcc available at build time).
+    steps.push(SmokeStep::WaitEither {
+        pattern_a: "SMOKE:dynlink-hello-smoke:PASS",
+        pattern_b: "SMOKE:dynlink-hello-smoke:SKIP",
+        timeout_secs: 30,
+        label: "guest/dynlink-hello-smoke: full bring-up linker resolves libhello.so",
+        extra_steps_a: &[],
+        extra_steps_b: &[],
+    });
+    // Phase 76b F1.4 — missing-dep negative gate.
+    steps.push(SmokeStep::WaitEither {
+        pattern_a: "SMOKE:dynlink-missing-smoke:PASS",
+        pattern_b: "SMOKE:dynlink-missing-smoke:SKIP",
+        timeout_secs: 30,
+        label: "guest/dynlink-missing-smoke: missing DT_NEEDED → ENOENT",
+        extra_steps_a: &[],
+        extra_steps_b: &[],
+    });
+    // Phase 76b F1.4 — circular-dep negative gate.
+    steps.push(SmokeStep::WaitEither {
+        pattern_a: "SMOKE:dynlink-cycle-smoke:PASS",
+        pattern_b: "SMOKE:dynlink-cycle-smoke:SKIP",
+        timeout_secs: 30,
+        label: "guest/dynlink-cycle-smoke: cyclic DT_NEEDED → ELIBBAD",
         extra_steps_a: &[],
         extra_steps_b: &[],
     });
@@ -11316,6 +11889,58 @@ fn populate_ext2_files(
         ldso_bin.display(),
     );
 
+    // Phase 76b — enumerate every `.so` under `target/generated-libs/`
+    // except the linker itself so each one lands at
+    // `/usr/lib/<basename>` on the ext2 disk. The bring-up linker's
+    // search path is LD_LIBRARY_PATH → /lib → /usr/lib → /usr/local/lib,
+    // so `/usr/lib/` is the canonical home for Phase 76b shared libs.
+    let libs_dir = generated_libs_dir(&workspace_root());
+    let mut staged_libs: Vec<(String, PathBuf)> = Vec::new();
+    if libs_dir.is_dir()
+        && let Ok(rd) = fs::read_dir(&libs_dir)
+    {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            if name == "ld-musl-x86_64.so.1" {
+                continue; // staged separately under /lib
+            }
+            if !name.ends_with(".so") {
+                continue;
+            }
+            if fs::metadata(&path).map(|m| m.len() == 0).unwrap_or(true) {
+                eprintln!(
+                    "warning: skipping zero-byte shared lib {} (build failed earlier)",
+                    path.display()
+                );
+                continue;
+            }
+            staged_libs.push((name, path));
+        }
+    }
+    // `read_dir` order depends on the host filesystem's inode/dirent
+    // ordering, which would make the resulting ext2 image
+    // byte-nondeterministic across hosts and across rebuilds. Sort by
+    // filename so `cargo xtask image` produces a reproducible disk.
+    staged_libs.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut shared_libs_cmds = String::new();
+    if !staged_libs.is_empty() {
+        shared_libs_cmds.push_str(
+            "mkdir usr/lib\nsif usr/lib mode 0x41ED\nsif usr/lib uid 0\nsif usr/lib gid 0\n",
+        );
+        for (name, path) in &staged_libs {
+            use core::fmt::Write as _;
+            let _ = write!(
+                shared_libs_cmds,
+                "write \"{src}\" usr/lib/{name}\nsif usr/lib/{name} mode 0x81ED\nsif usr/lib/{name} uid 0\nsif usr/lib/{name} gid 0\n",
+                src = path.display(),
+            );
+        }
+    }
+
     // Phase 69 Track A — compile the `m3os-term` terminfo entry so a binary
     // copy can be staged at `/usr/share/terminfo/m/m3os-term` inside the
     // data disk. Returns the path to the compiled `m3os-term` file. Treats
@@ -11888,6 +12513,7 @@ fn populate_ext2_files(
          sif usr mode 0x41ED\n\
          sif usr uid 0\n\
          sif usr gid 0\n\
+         {shared_libs_cmds}\
          mkdir usr/share\n\
          sif usr/share mode 0x41ED\n\
          sif usr/share uid 0\n\
@@ -12041,6 +12667,9 @@ fn populate_ext2_files(
         // Phase 76 — host path of the staged dynamic linker; written
         // to `/lib/ld-musl-x86_64.so.1` on the ext2 disk.
         ldso_bin = ldso_bin.display(),
+        // Phase 76b — every shared lib under target/generated-libs/ is
+        // mkdir'd + written under /usr/lib/ by this block.
+        shared_libs_cmds = shared_libs_cmds,
         terminfo_bin = terminfo_bin.display(),
         font_src = font_src.display(),
     );

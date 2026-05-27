@@ -321,6 +321,23 @@ static WX_VIOLATION_ELF: &[u8] = generated_initrd_asset!("wx-violation");
 // compiler.
 static DYNLINK_SMOKE_ELF: &[u8] = generated_initrd_asset!("dynlink_smoke");
 
+// Phase 76b — `dynlink_hello` musl-built dynamic ELF carrying
+// `PT_INTERP = /lib/ld-musl-x86_64.so.1` AND `DT_NEEDED = libhello.so`.
+// The smoke-runner execs `/bin/dynlink_hello` to validate the full
+// PT_INTERP → ld.so self-relocation → DT_NEEDED → relocations →
+// main → external symbol call chain.
+static DYNLINK_HELLO_ELF: &[u8] = generated_initrd_asset!("dynlink_hello");
+
+// Phase 76b F1.4 — `dynlink_missing` musl-built dynamic ELF with
+// `DT_NEEDED = libdoesnotexist.so`. Smoke gate asserts the linker
+// exits with code 2 (ENOENT).
+static DYNLINK_MISSING_ELF: &[u8] = generated_initrd_asset!("dynlink_missing");
+
+// Phase 76b F1.4 — `dynlink_cycle` musl-built dynamic ELF whose
+// DT_NEEDED chain has a libcyca ↔ libcycb cycle. Smoke gate asserts
+// the linker exits with code 80 (ELIBBAD).
+static DYNLINK_CYCLE_ELF: &[u8] = generated_initrd_asset!("dynlink_cycle");
+
 // Phase 70 follow-up — `doom-concurrent` forks two `doom` processes
 // and waits for both. Run from the post-login shell by `cargo xtask
 // doom-concurrent-smoke` to assert real kernel-level concurrency
@@ -594,6 +611,28 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "dynlink_smoke",
         RamdiskNode::File {
             content: DYNLINK_SMOKE_ELF,
+        },
+    ),
+    // Phase 76b: dynlink_hello — exercises DT_NEEDED + relocations
+    // against `/usr/lib/libhello.so`. Drives the dynlink-hello-smoke
+    // step in the SMOKE: gate.
+    (
+        "dynlink_hello",
+        RamdiskNode::File {
+            content: DYNLINK_HELLO_ELF,
+        },
+    ),
+    // Phase 76b F1.4 negative gates.
+    (
+        "dynlink_missing",
+        RamdiskNode::File {
+            content: DYNLINK_MISSING_ELF,
+        },
+    ),
+    (
+        "dynlink_cycle",
+        RamdiskNode::File {
+            content: DYNLINK_CYCLE_ELF,
         },
     ),
     // Phase 70 follow-up: doom-concurrent — forks two doom children
@@ -951,9 +990,35 @@ static LDSO_ELF: &[u8] = include_bytes!(concat!(
     "/../target/generated-libs/ld-musl-x86_64.so.1"
 ));
 
+// Phase 76b — libhello.so embedded in the ramdisk so the bring-up
+// linker can resolve `/usr/lib/libhello.so` even before the ext2
+// data disk mounts. The build path mirrors LDSO_ELF.
+static LIBHELLO_ELF: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../target/generated-libs/libhello.so"
+));
+
 static LIB_ENTRIES: &[(&str, RamdiskNode)] = &[(
     "ld-musl-x86_64.so.1",
     RamdiskNode::File { content: LDSO_ELF },
+)];
+
+// Phase 76b — `/usr/lib/libhello.so` lives in its own directory entry
+// because the ramdisk tree mirrors the on-disk layout. Adding a new
+// LIB_ENTRIES slot would map to `/lib/`, which is wrong; the linker's
+// search order finds libhello under `/usr/lib/` first.
+static USR_LIB_ENTRIES: &[(&str, RamdiskNode)] = &[(
+    "libhello.so",
+    RamdiskNode::File {
+        content: LIBHELLO_ELF,
+    },
+)];
+
+static USR_ENTRIES: &[(&str, RamdiskNode)] = &[(
+    "lib",
+    RamdiskNode::Dir {
+        children: USR_LIB_ENTRIES,
+    },
 )];
 
 // Phase 55b Tracks D.1 / E.1 — hardware driver ELFs. Ring-3 drivers live
@@ -1016,6 +1081,14 @@ static ROOT_ENTRIES: &[(&str, RamdiskNode)] = &[
         "lib",
         RamdiskNode::Dir {
             children: LIB_ENTRIES,
+        },
+    ),
+    // Phase 76b — `/usr/lib/libhello.so` reachable before the ext2
+    // mount.
+    (
+        "usr",
+        RamdiskNode::Dir {
+            children: USR_ENTRIES,
         },
     ),
 ];

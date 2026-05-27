@@ -1,20 +1,28 @@
 [package]
 name = "ld-musl-x86_64-so-1"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
-# Phase 76 scaffolding: the dynamic linker is a no_std PIE ELF that
-# the kernel loads when a binary carries PT_INTERP. In Phase 76 the
-# linker is intentionally a **transfer-only stub** — it walks the
-# auxv for AT_ENTRY and jmps. Real DT_NEEDED resolution + relocation
-# application + constructor running ships in Phase 76b.
+# Phase 76b: the dynamic linker now performs real bring-up work
+# (`_dlstart` self-relocation, `DT_NEEDED` resolution, four core
+# x86_64 relocations, constructors). The crate is split into a
+# `no_std` library (`ldso_core`) holding pure-logic relocation and
+# `PT_DYNAMIC` parsing so the host harness can `cargo test` it, plus
+# a `no_std` + `no_main` binary that links the asm entry path against
+# that library.
 #
-# The crate name uses an underscore (`ld-musl-x86_64-so-1`) because
+# The crate name uses underscores (`ld-musl-x86_64-so-1`) because
 # cargo rejects dots in package names. The output binary is renamed
 # to `ld-musl-x86_64.so.1` by the xtask staging step so the on-disk
 # path matches what PT_INTERP records in the test binaries.
+
+[lib]
+name = "ldso_core"
+path = "src/lib.rs"
+
 [[bin]]
 name = "ld-musl-x86_64-so-1"
 path = "src/main.rs"
 
 [dependencies]
+heapless = { version = "0.8", default-features = false }

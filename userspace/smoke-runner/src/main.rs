@@ -30,6 +30,18 @@ const WX_VIOLATION_PASS_NEEDLE: &[u8] = b"WX_VIOLATION:smoke:ok";
 const DYNLINK_SMOKE_PATH: &[u8] = b"/bin/dynlink_smoke\0";
 const DYNLINK_SMOKE_ARGV0: &[u8] = b"dynlink_smoke\0";
 const DYNLINK_SMOKE_PASS_NEEDLE: &[u8] = b"DYNLINK_SMOKE:PASS";
+// Phase 76b — `dynlink_hello` is a musl-built dynamic ELF carrying
+// `DT_NEEDED = libhello.so` and `PT_INTERP = /lib/ld-musl-x86_64.so.1`.
+// The bring-up linker resolves `hello_str` via `DT_HASH` + `DT_JMPREL`
+// (R_X86_64_JUMP_SLOT) and the binary prints the sentinel to stdout.
+const DYNLINK_HELLO_PATH: &[u8] = b"/bin/dynlink_hello\0";
+const DYNLINK_HELLO_ARGV0: &[u8] = b"dynlink_hello\0";
+const DYNLINK_HELLO_PASS_NEEDLE: &[u8] = b"HELLO_FROM_SHARED_LIB:OK";
+// Phase 76b F1.4 negative gates.
+const DYNLINK_MISSING_PATH: &[u8] = b"/bin/dynlink_missing\0";
+const DYNLINK_MISSING_ARGV0: &[u8] = b"dynlink_missing\0";
+const DYNLINK_CYCLE_PATH: &[u8] = b"/bin/dynlink_cycle\0";
+const DYNLINK_CYCLE_ARGV0: &[u8] = b"dynlink_cycle\0";
 const CAPTURE_FILE_PATH: &[u8] = b"/tmp/smoke-runner.capture\0";
 const LOGGER_PATH: &[u8] = b"/bin/logger\0";
 const SYSTEM_LOG_PATH: &[u8] = b"/var/log/messages\0";
@@ -199,8 +211,119 @@ fn program_main(_args: &[&str]) -> i32 {
         }
     }
 
+    // Phase 76b — full bring-up linker gate. Runs `/bin/dynlink_hello`
+    // twice consecutively. The first run exercises the
+    // PT_INTERP → ld.so self-relocation → DT_NEEDED → libhello.so map →
+    // R_X86_64_JUMP_SLOT → main → hello_str() chain. The second run
+    // verifies the refcount path on `libhello.so`.
+    {
+        let mut probe = Stat::zeroed();
+        if stat(DYNLINK_HELLO_PATH, &mut probe) < 0 || probe.st_size == 0 {
+            skip("dynlink-hello-smoke");
+        } else {
+            begin("dynlink-hello-smoke");
+            let argv = [DYNLINK_HELLO_ARGV0.as_ptr(), ptr::null()];
+            if let Err(code) = run_command_expect_output(
+                "dynlink-hello-smoke",
+                DYNLINK_HELLO_PATH,
+                &argv,
+                DYNLINK_HELLO_PASS_NEEDLE,
+                &mut command_output,
+            ) {
+                return code;
+            }
+            if let Err(code) = run_command_expect_output(
+                "dynlink-hello-smoke",
+                DYNLINK_HELLO_PATH,
+                &argv,
+                DYNLINK_HELLO_PASS_NEEDLE,
+                &mut command_output,
+            ) {
+                return code;
+            }
+            pass("dynlink-hello-smoke");
+        }
+    }
+
+    // Phase 76b F1.4 — missing-dependency negative gate. The
+    // bring-up linker tries to open `/usr/lib/libdoesnotexist.so`,
+    // gets ENOENT from the kernel, and exits with code 2 (ENOENT).
+    {
+        let mut probe = Stat::zeroed();
+        if stat(DYNLINK_MISSING_PATH, &mut probe) < 0 || probe.st_size == 0 {
+            skip("dynlink-missing-smoke");
+        } else {
+            begin("dynlink-missing-smoke");
+            let argv = [DYNLINK_MISSING_ARGV0.as_ptr(), ptr::null()];
+            if let Err(code) = run_command_expect_exit(
+                "dynlink-missing-smoke",
+                DYNLINK_MISSING_PATH,
+                &argv,
+                2,
+                &mut command_output,
+            ) {
+                return code;
+            }
+            pass("dynlink-missing-smoke");
+        }
+    }
+
+    // Phase 76b F1.4 — circular-dependency negative gate. The
+    // bring-up linker's topo_sort detects the libcyca ↔ libcycb
+    // cycle and exits with code 80 (ELIBBAD).
+    {
+        let mut probe = Stat::zeroed();
+        if stat(DYNLINK_CYCLE_PATH, &mut probe) < 0 || probe.st_size == 0 {
+            skip("dynlink-cycle-smoke");
+        } else {
+            begin("dynlink-cycle-smoke");
+            let argv = [DYNLINK_CYCLE_ARGV0.as_ptr(), ptr::null()];
+            if let Err(code) = run_command_expect_exit(
+                "dynlink-cycle-smoke",
+                DYNLINK_CYCLE_PATH,
+                &argv,
+                80,
+                &mut command_output,
+            ) {
+                return code;
+            }
+            pass("dynlink-cycle-smoke");
+        }
+    }
+
     write_str(STDOUT_FILENO, "SMOKE:PASS\n");
     0
+}
+
+/// Run a command and assert it exits with `expected_code`. Used by
+/// the Phase 76b F1.4 negative gates: missing-dep → exit(2),
+/// cyclic-DT_NEEDED → exit(80).
+fn run_command_expect_exit(
+    stage: &str,
+    path: &[u8],
+    argv: &[*const u8],
+    expected_code: i32,
+    output: &mut [u8],
+) -> Result<(), i32> {
+    let (status, len) = match run_command_capture(path, argv, output) {
+        Ok(result) => result,
+        Err(msg) => return Err(fail(stage, msg, 12)),
+    };
+    match exit_code(status) {
+        Some(c) if c == expected_code => Ok(()),
+        Some(c) => Err(fail_with_output(
+            stage,
+            "unexpected exit code",
+            18 + c,
+            &output[..len],
+        )),
+        None => Err(fail_with_output(
+            stage,
+            "process did not exit normally",
+            19,
+            &output[..len],
+        )),
+    }
 }
 
 fn verify_required_storage_files() -> Result<(), i32> {

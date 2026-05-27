@@ -1,53 +1,53 @@
-//! m3OS dynamic linker (`ld-musl-x86_64.so.1`) — Phase 76 scaffolding.
+//! m3OS dynamic linker (`ld-musl-x86_64.so.1`) — Phase 76b bring-up.
 //!
-//! This crate produces a `no_std` PIE ELF that the kernel maps when a
-//! binary carries a `PT_INTERP` segment. In Phase 76 the linker is
-//! intentionally a **transfer-only stub**: it walks the SysV-ABI
-//! initial stack for `AT_ENTRY`, prints a single observability line
-//! to serial, and `jmp`s to the main binary's entry. Real
-//! `DT_NEEDED` resolution, relocation application, constructor
-//! running, and `dlopen`/`dlsym`/`dlclose` ship in Phases 76b–76d.
+//! The kernel loads this PIE ELF when a binary carries `PT_INTERP`
+//! and hands control to `_start` with the SysV-ABI initial stack at
+//! `rsp`. From there:
 //!
-//! ## Why a stub is the right shape for Phase 76
+//! 1. [`_start`] is naked-asm. It zeroes `rbp`, passes the stack
+//!    pointer in `rdi`, and calls into [`dl_entry`]. Naked entry is
+//!    mandatory because the function returns the resolved entry
+//!    point in `rax`; the asm `jmp rax` after the call transfers
+//!    control to the main binary's `_start` without touching the
+//!    initial stack.
+//! 2. [`dl_entry`] walks the auxv for `AT_BASE` / `AT_PHDR` /
+//!    `AT_PHNUM` / `AT_ENTRY`, runs [`dl_relocate_self`] against the
+//!    linker's own image (Phase 76b's transfer-only stub has zero
+//!    `R_X86_64_RELATIVE` entries today; the call is still made so
+//!    future linker growth is correctness-bounded), parses the main
+//!    binary's `PT_DYNAMIC`, loads each `DT_NEEDED` dependency from
+//!    `/usr/lib/`, applies the four core relocations, runs any
+//!    `DT_INIT` / `DT_INIT_ARRAY` constructors, and returns the main
+//!    binary's `AT_ENTRY` value.
+//! 3. The naked-asm caller `jmp rax`s to that entry point, leaving
+//!    the kernel-built initial stack intact for the main binary's
+//!    `_start` to consume.
 //!
-//! Cramming the kernel `PT_INTERP` branch and a real bring-up linker
-//! into one PR would push the diff past reviewable size and force the
-//! smoke gate to wait until the entire stack is bottom-up correct.
-//! Phase 76's stub validates the kernel → ld.so → main binary handoff
-//! in isolation: the auxv layout matches what musl `_dlstart` would
-//! expect, the interpreter loads at a sane bias, and control reaches
-//! `AT_ENTRY` exactly once. Subsequent subphases grow the linker on
-//! top of this proven foundation.
+//! ## Why `dl_entry` is `extern "C"` and not `dlstart_rust`
 //!
-//! ## Stack shape on entry
+//! The Phase 76 stub used the name `dlstart_rust`. Phase 76b grows
+//! that function into the full bring-up linker entry; the new name
+//! `dl_entry` reflects that it is no longer "just the stub". The
+//! musl reference linker calls the conceptually equivalent function
+//! `__dls2` (after `__dls1` self-relocates); we collapse the two
+//! phases because Phase 76b's linker is small enough that the
+//! separation has no payoff yet.
 //!
-//! When the kernel transfers to `_dlstart`, `rsp` points at the SysV
-//! AMD64 ABI initial stack:
+//! ## Safety constraints
 //!
-//! ```text
-//! [rsp + 0]                  argc                       u64
-//! [rsp + 8 .. 8+8*argc]      argv[0..argc]              *const u8
-//! [rsp + 8+8*argc]           NULL terminator            *const u8
-//! [...]                      envp[..]                   *const u8
-//! [...]                      NULL terminator            *const u8
-//! [...]                      auxv[..] (16-byte slots)   AuxEntry
-//! [...]                      AT_NULL sentinel {0, 0}    AuxEntry
-//! [...]                      string region              raw bytes
-//! ```
-//!
-//! `rsp` is delivered at `8 (mod 16)` at this point — matching the
-//! SysV-ABI function-call boundary convention. The very next `call`
-//! instruction in `_start` pushes the 8-byte return address and
-//! brings `rsp` to `0 (mod 16)` so `dlstart_rust` enters with a
-//! 16-byte-aligned stack (required for any SSE/AVX save/restore
-//! Rust may emit). This differs from the Linux kernel's `_start`
-//! contract (which delivers `0 (mod 16)` directly to the program
-//! entry); the m3OS kernel deliberately chose the function-call
-//! convention because every ELF we load has a `_start` that
-//! immediately calls into Rust. A future port of full musl crt1.o
-//! would either need a `and rsp, -16` prologue inside `_start` or a
-//! kernel-side switch to the Linux convention; tracked for Phase
-//! 76b's bring-up work.
+//! - Until `dl_relocate_self` returns, no code on this path may
+//!   touch a Rust global (`static`, `&str` literal in `.rodata` via
+//!   a GOT-routed reference, etc.). The Phase 76b ld.so emits zero
+//!   `R_X86_64_RELATIVE` entries today because every reference goes
+//!   through stack-local data or `static` constants the compiler
+//!   resolves at link time as PC-relative (no GOT round-trip). The
+//!   `apply_rela_table_self` call is still made so adding new
+//!   globals later does not silently break the bring-up.
+//! - All inter-function calls in this file are intra-crate, so the
+//!   PIE-default code generation emits PC-relative `call rel32`s
+//!   instead of GOT-routed `call qword ptr [rip+offset]`s. This is
+//!   the property that lets the bring-up linker call into Rust
+//!   helpers without first self-relocating those very call sites.
 
 #![no_std]
 #![no_main]
@@ -56,50 +56,65 @@
 use core::arch::naked_asm;
 use core::panic::PanicInfo;
 
+use ldso_core::dynlink::{
+    DsoId, DynamicSection, MAX_DSOS, MAX_NEEDED, TopoError, elf_hash, topo_sort,
+};
+use ldso_core::elf64::{
+    DT_NULL, Dyn, PT_DYNAMIC, PT_LOAD, Phdr, R_X86_64_64, R_X86_64_GLOB_DAT, R_X86_64_JUMP_SLOT,
+    R_X86_64_RELATIVE, Rela, Sym, r_sym, r_type,
+};
+use ldso_core::reloc::apply_abs64;
+
 // ---------------------------------------------------------------------------
-// AT_* constants — kept private so this file is self-contained. Phase 76b
-// will route through `kernel_core::elf::auxv` for sharing.
+// AT_* constants (subset we read).
 // ---------------------------------------------------------------------------
 
 const AT_NULL: u64 = 0;
-const AT_ENTRY: u64 = 9;
+const AT_PHDR: u64 = 3;
+const AT_PHENT: u64 = 4;
+const AT_PHNUM: u64 = 5;
 const AT_BASE: u64 = 7;
+const AT_ENTRY: u64 = 9;
 
 // ---------------------------------------------------------------------------
-// Raw syscalls — ld.so cannot link `syscall_lib` (it uses `BrkAllocator`,
-// which would touch the heap before the main binary has had a chance to
-// initialize). Phase 76b will introduce a no-alloc subset of `syscall_lib`
-// that the linker can share.
+// Raw syscalls — Phase 76b's linker cannot link `syscall_lib` because
+// `BrkAllocator` would touch the heap before the main binary's
+// `_start` has had a chance to set the brk pointer. Inline-asm
+// `syscall` keeps the surface to exactly the calls we use.
 // ---------------------------------------------------------------------------
 
+const SYS_READ: u64 = 0;
 const SYS_WRITE: u64 = 1;
+const SYS_OPEN: u64 = 2;
+const SYS_CLOSE: u64 = 3;
+const SYS_MMAP: u64 = 9;
+const SYS_MPROTECT: u64 = 10;
+const SYS_MUNMAP: u64 = 11;
+const SYS_EXIT: u64 = 60;
 
-/// `write(fd, buf, len)` — returns bytes written or negative errno.
-///
-/// The `syscall` instruction clobbers RFLAGS (and the kernel may
-/// modify many flag bits before returning), so this `asm!` block
-/// does NOT use the `preserves_flags` option — that option promises
-/// the flags register is unchanged across the asm, which is false
-/// for `syscall` and could let the compiler reorder flag-sensitive
-/// code (e.g. a conditional jump on a flag set just before the
-/// syscall) past the syscall. `nostack` stays because we do not
-/// touch the stack.
-unsafe fn sys_write(fd: i32, buf: *const u8, len: usize) -> i64 {
+/// `errno` codes the bring-up linker uses as `exit(2)` codes when a
+/// DT_NEEDED dependency fails to load. The negative gates (Track
+/// F1.4) wait for these specific codes via `WEXITSTATUS(status)`.
+const ENOENT_CODE: u64 = 2;
+const ELIBBAD_CODE: u64 = 80;
+
+const O_RDONLY: u64 = 0;
+
+const PROT_READ: u64 = 0x1;
+const PROT_WRITE: u64 = 0x2;
+const PROT_EXEC: u64 = 0x4;
+
+const MAP_PRIVATE: u64 = 0x02;
+const MAP_ANONYMOUS: u64 = 0x20;
+
+#[inline(always)]
+unsafe fn syscall1(num: u64, a1: u64) -> i64 {
     let ret: i64;
     unsafe {
-        // `rax` is both an input (syscall number) and an output
-        // (syscall return) so it must be a single `inlateout`
-        // operand — the separate `in("rax") … lateout("rax") …`
-        // shape leaves room for the compiler's register allocator
-        // to assume the two operands are distinct, which can cause
-        // operand-overlap surprises. `inlateout` is also the
-        // idiomatic Rust inline-asm form for any syscall pattern.
         core::arch::asm!(
             "syscall",
-            inlateout("rax") SYS_WRITE => ret,
-            in("rdi") fd as i64,
-            in("rsi") buf,
-            in("rdx") len,
+            inlateout("rax") num => ret,
+            in("rdi") a1,
             out("rcx") _,
             out("r11") _,
             options(nostack),
@@ -108,16 +123,102 @@ unsafe fn sys_write(fd: i32, buf: *const u8, len: usize) -> i64 {
     ret
 }
 
-/// Write a fixed string to fd 2 (stderr / serial console).
-fn serial(msg: &[u8]) {
-    // Best-effort — if the syscall fails there is no recovery path
-    // available to us at this stage.
+#[inline(always)]
+unsafe fn syscall3(num: u64, a1: u64, a2: u64, a3: u64) -> i64 {
+    let ret: i64;
     unsafe {
-        let _ = sys_write(2, msg.as_ptr(), msg.len());
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") num => ret,
+            in("rdi") a1,
+            in("rsi") a2,
+            in("rdx") a3,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+#[inline(always)]
+unsafe fn syscall6(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") num => ret,
+            in("rdi") a1,
+            in("rsi") a2,
+            in("rdx") a3,
+            in("r10") a4,
+            in("r8") a5,
+            in("r9") a6,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+fn sys_write(fd: i32, buf: &[u8]) -> i64 {
+    unsafe { syscall3(SYS_WRITE, fd as u64, buf.as_ptr() as u64, buf.len() as u64) }
+}
+
+fn sys_open(path: &[u8]) -> i64 {
+    // `path` must be NUL-terminated by the caller.
+    unsafe { syscall3(SYS_OPEN, path.as_ptr() as u64, O_RDONLY, 0) }
+}
+
+fn sys_close(fd: i64) -> i64 {
+    unsafe { syscall1(SYS_CLOSE, fd as u64) }
+}
+
+fn sys_read(fd: i64, buf: &mut [u8]) -> i64 {
+    unsafe {
+        syscall3(
+            SYS_READ,
+            fd as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        )
     }
 }
 
-/// Write a `u64` in hex (no `0x` prefix, no padding).
+fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: i64, offset: u64) -> i64 {
+    unsafe { syscall6(SYS_MMAP, addr, len, prot, flags, fd as u64, offset) }
+}
+
+fn sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
+    unsafe { syscall3(SYS_MPROTECT, addr, len, prot) }
+}
+
+fn sys_munmap(addr: u64, len: u64) -> i64 {
+    // `addr` must be page-aligned (sys_linux_munmap rejects with
+    // -EINVAL otherwise). All mappings unmapped by this file are
+    // created by `sys_mmap(addr=0, …)` so the kernel-chosen base is
+    // already page-aligned — callers can pass the raw mmap return
+    // value. Linux munmap takes only `(addr, len)`; the unused third
+    // syscall3 register is ignored by the kernel.
+    unsafe { syscall3(SYS_MUNMAP, addr, len, 0) }
+}
+
+fn sys_exit(code: u64) -> ! {
+    unsafe {
+        let _ = syscall1(SYS_EXIT, code);
+        core::hint::unreachable_unchecked()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Observability helpers (stderr / serial).
+// ---------------------------------------------------------------------------
+
+fn serial(msg: &[u8]) {
+    let _ = sys_write(2, msg);
+}
+
 fn serial_hex(mut value: u64) {
     let mut buf = [0u8; 16];
     let mut i = buf.len();
@@ -139,122 +240,1125 @@ fn serial_hex(mut value: u64) {
 }
 
 // ---------------------------------------------------------------------------
-// Entry point
+// Self-relocation (Track B1.2).
 // ---------------------------------------------------------------------------
 
-/// SysV-ABI entry point. The kernel transfers here with `rsp` pointing
-/// at `argc` and 16-byte alignment. We pass `rsp` to `dlstart_rust`
-/// which walks the auxv for `AT_ENTRY` and returns its value; we then
-/// `jmp` to it with the stack untouched so the main binary's `_start`
-/// sees exactly what it would have seen if loaded directly.
+/// Walk the linker's own `PT_DYNAMIC`, find its `DT_RELA` table, and
+/// apply every `R_X86_64_RELATIVE` against the linker's load image.
+/// Other relocation types in the linker's own image are unexpected
+/// (the bring-up linker is built `-Bsymbolic`-style with no external
+/// symbols) so they trigger a hard fail.
 ///
-/// `rbp` is zeroed per SysV-ABI convention (the outermost frame).
-/// SysV entry point. Named `_start` so rust-lld defaults to it as the
-/// ELF `e_entry`. musl calls the conceptually-equivalent symbol
-/// `_dlstart` — preserved here as an alias for cross-reference, see
-/// `musl/arch/x86_64/crt_arch.h`.
+/// # Safety
+/// `phdr_base`, `phnum`, `load_bias` must all describe the linker's
+/// own load image, and the call must occur before any Rust global is
+/// dereferenced through a GOT-routed read.
+unsafe fn dl_relocate_self(phdr_base: *const Phdr, phnum: usize, load_bias: u64) {
+    // Find PT_DYNAMIC for the linker's image.
+    let mut dyn_ptr: *const Dyn = core::ptr::null();
+    for i in 0..phnum {
+        let ph = unsafe { &*phdr_base.add(i) };
+        if ph.p_type == PT_DYNAMIC {
+            dyn_ptr = (load_bias.wrapping_add(ph.p_vaddr)) as *const Dyn;
+            break;
+        }
+    }
+    if dyn_ptr.is_null() {
+        return; // No PT_DYNAMIC ⇒ no relocations to apply.
+    }
+    // Walk DT_RELA / DT_RELASZ inline (no allocation, no helper).
+    let mut rela: *const Rela = core::ptr::null();
+    let mut relasz: u64 = 0;
+    let mut p = dyn_ptr;
+    loop {
+        let entry = unsafe { *p };
+        if entry.d_tag == DT_NULL {
+            break;
+        }
+        match entry.d_tag {
+            ldso_core::elf64::DT_RELA => {
+                rela = (load_bias.wrapping_add(entry.d_val)) as *const Rela;
+            }
+            ldso_core::elf64::DT_RELASZ => relasz = entry.d_val,
+            _ => {}
+        }
+        p = unsafe { p.add(1) };
+    }
+    if rela.is_null() || relasz == 0 {
+        return;
+    }
+    let n = (relasz / 24) as usize; // sizeof(Rela) == 24
+    for i in 0..n {
+        let r = unsafe { *rela.add(i) };
+        let t = r_type(r.r_info);
+        if t == R_X86_64_RELATIVE {
+            let target = (load_bias.wrapping_add(r.r_offset)) as *mut u64;
+            let value = load_bias.wrapping_add(r.r_addend as u64);
+            // `write_unaligned` keeps this safe even if a malformed
+            // (or future tooling-generated) RELA in the linker's own
+            // image carries a non-8-byte-aligned `r_offset`. Rust's
+            // aligned `ptr::write` would be UB in that case.
+            unsafe { core::ptr::write_unaligned(target, value) };
+        } else {
+            // Any other relocation type in the linker's own image is
+            // a build-time bug — the bring-up linker is built with
+            // `-Bsymbolic`-style flags so only R_X86_64_RELATIVE
+            // should appear in its own DT_RELA. Shout via serial and
+            // halt: if we kept going we would later read through an
+            // unrelocated GOT slot and crash with no diagnostic.
+            serial(b"ldso: dl_relocate_self: unexpected relocation type in linker image\n");
+            sys_exit(ELIBBAD_CODE);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LoadedDso — one mapped shared library in the linker's address space.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+struct LoadedDso {
+    load_bias: u64,
+    /// Page-rounded in-memory span of this DSO's image — used by
+    /// `apply_rela` to bounds-check every relocation write so a
+    /// malformed (or attacker-controlled) DSO cannot make the linker
+    /// scribble outside its own mapping.  `0` means "trust the caller"
+    /// and disables the check (only the placeholder `empty()` value
+    /// should ever take that path).
+    image_len: u64,
+    dyn_: DynamicSection,
+}
+
+#[allow(dead_code)]
+impl LoadedDso {
+    const fn empty() -> Self {
+        Self {
+            load_bias: 0,
+            image_len: 0,
+            dyn_: DynamicSection::empty(),
+        }
+    }
+}
+
+/// Validate the entry-size and PLT-flavour invariants Phase 76b
+/// silently relied on when dividing `relasz`/`pltrelsz` by 24.
+/// All three tags are optional — when absent (`0`), the matching
+/// table is also absent, so no division occurs. When present, they
+/// must match the canonical x86_64 values (`Rela`/`Sym` are 24 bytes
+/// and Phase 76b only resolves `DT_RELA`-flavoured PLT entries).
+/// Returns a static error string identifying which invariant failed.
+fn validate_dyn_invariants(d: &DynamicSection) -> Result<(), &'static str> {
+    if d.relaent != 0 && d.relaent != 24 {
+        return Err("DT_RELAENT != 24");
+    }
+    if d.syment != 0 && d.syment != 24 {
+        return Err("DT_SYMENT != 24");
+    }
+    if d.pltrel != 0 && d.pltrel != ldso_core::elf64::DT_RELA {
+        return Err("DT_PLTREL != DT_RELA");
+    }
+    Ok(())
+}
+
+/// Validate that every pointer carried by `PT_DYNAMIC` lies inside
+/// the DSO's mapped image span `[load_bias, load_bias + image_len)`.
+///
+/// A malformed (or attacker-controlled) DSO can place arbitrary
+/// values in `DT_STRTAB` / `DT_SYMTAB` / `DT_HASH` / `DT_RELA` /
+/// `DT_JMPREL` / `DT_INIT` / `DT_INIT_ARRAY`.  Without this check,
+/// `strtab_get` / `strlen_bounded` / `lookup_symbol` / `apply_rela` /
+/// `run_constructors` would happily dereference pointers pointing
+/// into unrelated process memory — leaking data via the serial log
+/// or corrupting the heap.
+///
+/// For sized tags (`strtab + strsz`, `rela + relasz`, `jmprel +
+/// pltrelsz`, `init_array + init_arraysz`) the full range must fit.
+/// For pointer-only tags (`symtab`, `hash`, `init`) the base must lie
+/// inside the span and (for `hash`) at least the 8-byte header
+/// (`nbuckets`/`nchain`) must fit.  `init_arraysz`-clear is treated
+/// the same way: no upper bound to enforce.
+///
+/// `image_len == 0` is the placeholder-`LoadedDso` shape — the check
+/// is skipped (no bounds known).  Every real-runtime construction
+/// site populates `image_len`.
+fn validate_dyn_pointers(
+    d: &DynamicSection,
+    load_bias: u64,
+    image_len: u64,
+) -> Result<(), &'static str> {
+    if image_len == 0 {
+        return Ok(());
+    }
+    let image_end = load_bias.wrapping_add(image_len);
+    // Inclusive-base, exclusive-end: the address must satisfy
+    // `load_bias <= ptr < image_end`.
+    let in_image = |ptr: u64| ptr >= load_bias && ptr < image_end;
+    // Sized range: `[base, base + size)` must lie within the image.
+    let range_in_image = |base: u64, size: u64| {
+        if !in_image(base) {
+            return false;
+        }
+        match base.checked_add(size) {
+            Some(end) => end <= image_end,
+            None => false,
+        }
+    };
+    if let Some(p) = d.strtab
+        && !range_in_image(p.as_ptr() as u64, d.strsz)
+    {
+        return Err("DT_STRTAB + DT_STRSZ outside image");
+    }
+    if let Some(p) = d.symtab
+        && !in_image(p.as_ptr() as u64)
+    {
+        return Err("DT_SYMTAB outside image");
+    }
+    if let Some(p) = d.hash
+        && !range_in_image(p.as_ptr() as u64, 8)
+    {
+        // Need at least the 8-byte (nbuckets,nchain) header in range
+        // before lookup_symbol dereferences it.
+        return Err("DT_HASH header outside image");
+    }
+    if let Some(p) = d.rela
+        && !range_in_image(p.as_ptr() as u64, d.relasz)
+    {
+        return Err("DT_RELA + DT_RELASZ outside image");
+    }
+    if let Some(p) = d.jmprel
+        && !range_in_image(p.as_ptr() as u64, d.pltrelsz)
+    {
+        return Err("DT_JMPREL + DT_PLTRELSZ outside image");
+    }
+    if let Some(p) = d.init
+        && !in_image(p.as_ptr() as u64)
+    {
+        return Err("DT_INIT outside image");
+    }
+    if let Some(p) = d.init_array
+        && !range_in_image(p.as_ptr() as u64, d.init_arraysz)
+    {
+        return Err("DT_INIT_ARRAY + DT_INIT_ARRAYSZ outside image");
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// String-table helpers (raw pointer reads inside the loaded image).
+// ---------------------------------------------------------------------------
+
+/// Compute the byte length of a C string. Bounded by `max` to keep
+/// the linker from running off into unmapped pages if the string
+/// table is corrupt.
+unsafe fn strlen_bounded(p: *const u8, max: usize) -> usize {
+    let mut i = 0usize;
+    while i < max {
+        let b = unsafe { *p.add(i) };
+        if b == 0 {
+            return i;
+        }
+        i += 1;
+    }
+    max
+}
+
+/// Borrow a string from `DT_STRTAB` at byte offset `off`. The
+/// returned slice borrows from the loaded image so the caller must
+/// not free or unmap it.
+unsafe fn strtab_get(strtab: *const u8, off: u64, strsz: u64) -> &'static [u8] {
+    if off >= strsz {
+        return &[];
+    }
+    let p = unsafe { strtab.add(off as usize) };
+    let len = unsafe { strlen_bounded(p, (strsz - off) as usize) };
+    unsafe { core::slice::from_raw_parts(p, len) }
+}
+
+// ---------------------------------------------------------------------------
+// Open + load one DSO from disk.
+// ---------------------------------------------------------------------------
+
+/// Minimal ELF64 header subset.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Ehdr {
+    e_ident: [u8; 16],
+    e_type: u16,
+    e_machine: u16,
+    e_version: u32,
+    e_entry: u64,
+    e_phoff: u64,
+    e_shoff: u64,
+    e_flags: u32,
+    e_ehsize: u16,
+    e_phentsize: u16,
+    e_phnum: u16,
+    _rest: [u8; 6],
+}
+
+/// Load a single DSO from `/usr/lib/<name>`.
+///
+/// Strategy (matched to the m3OS kernel's anonymous-mmap behavior,
+/// which ignores `MAP_FIXED` and always allocates linearly from
+/// `mmap_next` — see `kernel/src/arch/x86_64/syscall/mod.rs::sys_linux_mmap`):
+///
+/// 1. Open the file, mmap a scratch buffer, read the entire file in.
+/// 2. Parse the ELF header to find `phoff` / `phnum` / the highest
+///    `p_vaddr + p_memsz` across all `PT_LOAD` segments.
+/// 3. mmap one contiguous anonymous region of `total_image_size`
+///    bytes as `PROT_READ | PROT_WRITE`. The kernel picks the address;
+///    we use it as the `load_bias`.
+/// 4. For each `PT_LOAD`, copy `p_filesz` bytes from the scratch
+///    buffer at `p_offset` to `load_bias + p_vaddr`. The
+///    `p_memsz - p_filesz` tail is already zero (mmap-zeroed).
+/// 5. For each segment whose `p_flags` has `PF_X` set, `mprotect` its
+///    page range to `PROT_READ | PROT_EXEC` (Phase 75 W^X requires
+///    separate W and X mappings).
+///
+/// (continues — see [`load_dso`] below.)
+const _LOAD_DSO_DOC_BREAK: () = ();
+
+/// Distinguishable error from `load_dso`: `NotFound` lets the
+/// caller map a missing DSO to `exit(ENOENT)` while `Other` covers
+/// any other failure shape.
+#[derive(Clone, Copy)]
+enum LoadError {
+    NotFound,
+    Other(&'static str),
+}
+
+unsafe fn load_dso(path_bytes: &[u8]) -> Result<LoadedDso, LoadError> {
+    let fd = sys_open(path_bytes);
+    if fd < 0 {
+        // m3OS `sys_open` follows the Linux ABI and returns `-errno`
+        // on failure. Distinguish ENOENT (the DT_NEEDED file genuinely
+        // doesn't exist — caller maps this to `exit(ENOENT)`) from
+        // every other open failure (EACCES, EINVAL, ENFILE, etc.) so
+        // diagnostics stay accurate. The caller currently exits with
+        // ENOENT_CODE on both variants, but a richer error string for
+        // `Other` makes serial-log triage tractable.
+        if fd == -(ENOENT_CODE as i64) {
+            return Err(LoadError::NotFound);
+        }
+        return Err(LoadError::Other("open failed"));
+    }
+    let scratch_len: u64 = 64 * 1024;
+    let scratch = sys_mmap(
+        0,
+        scratch_len,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+    if scratch < 0 {
+        sys_close(fd);
+        return Err(LoadError::Other("scratch mmap failed"));
+    }
+    // The scratch buffer is only needed for header parsing + PT_LOAD
+    // copy.  Once `dyn_` is built, every pointer it carries lives in
+    // the freshly-mmap'd image, not in scratch.  Delegating to an
+    // inner helper lets us munmap the scratch buffer on EVERY return
+    // path (success + every early-error path) without scattering the
+    // teardown across half a dozen `return Err(…)` sites.
+    let result = unsafe { load_dso_impl(fd, scratch as u64, scratch_len) };
+    let _ = sys_munmap(scratch as u64, scratch_len);
+    result
+}
+
+unsafe fn load_dso_impl(fd: i64, scratch: u64, scratch_len: u64) -> Result<LoadedDso, LoadError> {
+    let scratch_buf =
+        unsafe { core::slice::from_raw_parts_mut(scratch as *mut u8, scratch_len as usize) };
+    let mut total = 0usize;
+    let mut truncated = false;
+    loop {
+        let n = sys_read(fd, &mut scratch_buf[total..]);
+        if n < 0 {
+            sys_close(fd);
+            return Err(LoadError::Other("read failed"));
+        }
+        if n == 0 {
+            break;
+        }
+        total += n as usize;
+        if total >= scratch_buf.len() {
+            // Buffer is full. Probe for one more byte to distinguish
+            // "file is exactly scratch_len" from "file is larger and
+            // would be silently truncated". A non-zero return from
+            // this read means the file kept going past our buffer —
+            // refuse to parse a truncated image.
+            let mut probe = [0u8; 1];
+            let extra = sys_read(fd, &mut probe);
+            truncated = extra > 0;
+            break;
+        }
+    }
+    sys_close(fd);
+    if truncated {
+        return Err(LoadError::Other("DSO larger than 64 KiB scratch"));
+    }
+    if total < core::mem::size_of::<Ehdr>() {
+        return Err(LoadError::Other("file too small"));
+    }
+    let ehdr = unsafe { &*(scratch as *const Ehdr) };
+    if &ehdr.e_ident[..4] != b"\x7fELF" {
+        return Err(LoadError::Other("not ELF"));
+    }
+    // Reject ELFs whose header-size or program-header entry-size
+    // don't match what this loader was compiled against.  Without
+    // this check a malformed ELF with an unexpected `e_phentsize`
+    // would let the loop below treat the PHDR table as an array of
+    // `Phdr` even though each entry would actually be wider/narrower,
+    // producing mis-parsed PT_LOAD records and out-of-bounds reads.
+    if ehdr.e_ehsize as usize != core::mem::size_of::<Ehdr>() {
+        return Err(LoadError::Other("e_ehsize != sizeof(Ehdr)"));
+    }
+    if ehdr.e_phentsize as usize != core::mem::size_of::<Phdr>() {
+        return Err(LoadError::Other("e_phentsize != sizeof(Phdr)"));
+    }
+    let phoff = ehdr.e_phoff;
+    let phnum = ehdr.e_phnum as usize;
+    // Bounds-check the program-header table against the bytes we
+    // actually read. A malformed or truncated ELF must not cause
+    // out-of-bounds reads while iterating PHDRs below.
+    let phdr_bytes = phnum
+        .checked_mul(core::mem::size_of::<Phdr>())
+        .ok_or(LoadError::Other("phnum*sizeof(Phdr) overflow"))?;
+    let phdr_end = (phoff as usize)
+        .checked_add(phdr_bytes)
+        .ok_or(LoadError::Other("phoff+phdr_bytes overflow"))?;
+    if phdr_end > total {
+        return Err(LoadError::Other("PHDR table outside scratch"));
+    }
+    let phdr_base = (scratch + phoff) as *const Phdr;
+
+    // Pass 1: compute total in-memory image span.
+    let mut image_end: u64 = 0;
+    for i in 0..phnum {
+        let ph = unsafe { *phdr_base.add(i) };
+        if ph.p_type == PT_LOAD {
+            let end = ph.p_vaddr + ph.p_memsz;
+            if end > image_end {
+                image_end = end;
+            }
+        }
+    }
+    if image_end == 0 {
+        return Err(LoadError::Other("no PT_LOAD"));
+    }
+    let image_len = (image_end + 4095) & !4095;
+
+    // One anonymous mmap for the whole image. The kernel picks the
+    // address; the returned value IS our load bias.
+    let image_base = sys_mmap(
+        0,
+        image_len,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+    if image_base < 0 {
+        return Err(LoadError::Other("image mmap failed"));
+    }
+    let load_bias = image_base as u64;
+
+    // Pass 2: copy each PT_LOAD into the image, then mprotect text
+    // pages to R-X (W^X requires separate W and X mappings).
+    for i in 0..phnum {
+        let ph = unsafe { *phdr_base.add(i) };
+        if ph.p_type != PT_LOAD {
+            continue;
+        }
+        // Bounds-check the file range against the bytes we actually
+        // read. A malformed ELF whose PT_LOAD references data past
+        // the scratch buffer would otherwise cause an out-of-bounds
+        // read during copy_nonoverlapping.
+        let seg_end = (ph.p_offset as usize)
+            .checked_add(ph.p_filesz as usize)
+            .ok_or(LoadError::Other("p_offset+p_filesz overflow"))?;
+        if seg_end > total {
+            return Err(LoadError::Other("PT_LOAD file range outside scratch"));
+        }
+        let src = (scratch + ph.p_offset) as *const u8;
+        let dst = (load_bias + ph.p_vaddr) as *mut u8;
+        unsafe { core::ptr::copy_nonoverlapping(src, dst, ph.p_filesz as usize) };
+    }
+    for i in 0..phnum {
+        let ph = unsafe { *phdr_base.add(i) };
+        if ph.p_type != PT_LOAD {
+            continue;
+        }
+        // PF_X = 0x1.
+        if ph.p_flags & 0x1 == 0 {
+            continue;
+        }
+        // Page-align the segment.
+        let seg_start = (load_bias + ph.p_vaddr) & !4095u64;
+        let seg_end = (load_bias + ph.p_vaddr + ph.p_memsz + 4095) & !4095u64;
+        let seg_len = seg_end - seg_start;
+        // PROT_READ | PROT_EXEC — no PROT_WRITE so Phase 75 W^X is
+        // satisfied; the kernel splits the VMA if needed.
+        let r = sys_mprotect(seg_start, seg_len, PROT_READ | PROT_EXEC);
+        if r < 0 {
+            return Err(LoadError::Other("mprotect PT_LOAD R-X failed"));
+        }
+    }
+
+    // Locate PT_DYNAMIC.
+    let mut dyn_ptr: *const Dyn = core::ptr::null();
+    for i in 0..phnum {
+        let ph = unsafe { *phdr_base.add(i) };
+        if ph.p_type == PT_DYNAMIC {
+            dyn_ptr = (load_bias + ph.p_vaddr) as *const Dyn;
+            break;
+        }
+    }
+    if dyn_ptr.is_null() {
+        return Err(LoadError::Other("no PT_DYNAMIC"));
+    }
+    let mut entries: heapless::Vec<Dyn, 64> = heapless::Vec::new();
+    let mut p = dyn_ptr;
+    // Track whether we actually observed DT_NULL inside the 64-entry
+    // cap. If the loop fills without seeing DT_NULL, the dynamic
+    // section is larger than this loader supports and parsing
+    // whatever we have would silently drop tags — return an error
+    // instead so the caller can fail with ELIBBAD.
+    let mut saw_null = false;
+    while entries.len() < 64 {
+        let e = unsafe { *p };
+        let _ = entries.push(e);
+        if e.d_tag == DT_NULL {
+            saw_null = true;
+            break;
+        }
+        p = unsafe { p.add(1) };
+    }
+    if !saw_null {
+        return Err(LoadError::Other("PT_DYNAMIC too large (>64 entries)"));
+    }
+    let dyn_ = DynamicSection::parse(&entries, load_bias);
+    // Reject DSOs whose dynamic-section pointer tags reference memory
+    // outside the mapped image span.  Without this, downstream
+    // `strtab_get` / `lookup_symbol` / `apply_rela` /
+    // `run_constructors` would dereference attacker-controlled
+    // pointers into unrelated process memory.
+    if let Err(why) = validate_dyn_pointers(&dyn_, load_bias, image_len) {
+        serial(b"ldso: DSO dynamic-pointer bounds check failed: ");
+        serial(why.as_bytes());
+        serial(b"\n");
+        return Err(LoadError::Other("dynamic pointer outside image"));
+    }
+    Ok(LoadedDso {
+        load_bias,
+        image_len,
+        dyn_,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Symbol lookup across the loaded-DSO list.
+// ---------------------------------------------------------------------------
+
+/// Resolve a symbol name by walking the SysV `DT_HASH` table of each
+/// loaded DSO in search order (main binary first, then deps in load
+/// order — matches the SysV global scope).
+unsafe fn lookup_symbol(name: &[u8], dsos: &[LoadedDso]) -> Option<u64> {
+    for dso in dsos {
+        let hash_ptr = match dso.dyn_.hash {
+            Some(p) => p.as_ptr(),
+            None => continue,
+        };
+        let symtab = match dso.dyn_.symtab {
+            Some(p) => p.as_ptr(),
+            None => continue,
+        };
+        let strtab = match dso.dyn_.strtab {
+            Some(p) => p.as_ptr(),
+            None => continue,
+        };
+        let nbuckets = unsafe { *hash_ptr } as usize;
+        let nchain = unsafe { *hash_ptr.add(1) } as usize;
+        if nbuckets == 0 {
+            continue;
+        }
+        let buckets = unsafe { hash_ptr.add(2) };
+        let chain = unsafe { buckets.add(nbuckets) };
+        let h = elf_hash(name);
+        let mut idx = unsafe { *buckets.add(h as usize % nbuckets) };
+        let mut hops = 0usize;
+        while idx != 0 && hops <= nchain {
+            if (idx as usize) >= nchain {
+                break;
+            }
+            let sym = unsafe { &*symtab.add(idx as usize) };
+            let nm = unsafe { strtab_get(strtab, sym.st_name as u64, dso.dyn_.strsz) };
+            if nm == name && sym.st_value != 0 {
+                return Some(dso.load_bias.wrapping_add(sym.st_value));
+            }
+            idx = unsafe { *chain.add(idx as usize) };
+            hops += 1;
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Relocation walker (Track B3.1 / B3.2 / B3.3).
+// ---------------------------------------------------------------------------
+
+/// Walk a `Rela` table at `table` of `count` entries and apply each
+/// relocation against `dso.load_bias`. Symbol resolution routes
+/// through [`lookup_symbol`] against the full loaded-DSO list.
+unsafe fn apply_rela(
+    dso: &LoadedDso,
+    table: *const Rela,
+    count: usize,
+    dsos: &[LoadedDso],
+) -> Result<(), &'static str> {
+    let strtab = match dso.dyn_.strtab {
+        Some(p) => p.as_ptr(),
+        None => core::ptr::null(),
+    };
+    let symtab = match dso.dyn_.symtab {
+        Some(p) => p.as_ptr(),
+        None => core::ptr::null(),
+    };
+    for i in 0..count {
+        let r = unsafe { *table.add(i) };
+        // Bounds-check `r_offset` against the image span recorded by
+        // `load_dso` (or the main-binary loader).  A malformed (or
+        // attacker-controlled) DSO whose RELA carries `r_offset >=
+        // image_len - 8` would otherwise write 8 bytes outside the
+        // mapped image and corrupt unrelated memory.  `image_len == 0`
+        // is the placeholder-LoadedDso shape; treating it as "no
+        // bounds known" preserves backwards compatibility but the
+        // standard runtime construction sites all populate it.
+        if dso.image_len != 0 && (r.r_offset > dso.image_len || dso.image_len - r.r_offset < 8) {
+            serial(b"ldso: relocation r_offset outside image\n");
+            return Err("relocation outside image");
+        }
+        let target = (dso.load_bias.wrapping_add(r.r_offset)) as *mut u64;
+        let rt = r_type(r.r_info);
+        match rt {
+            R_X86_64_RELATIVE => {
+                let value = dso.load_bias.wrapping_add(r.r_addend as u64);
+                // See dl_relocate_self: `write_unaligned` avoids UB on
+                // malformed (or future-tooling) RELAs whose `r_offset`
+                // is not 8-byte aligned.
+                unsafe { core::ptr::write_unaligned(target, value) };
+            }
+            R_X86_64_GLOB_DAT | R_X86_64_JUMP_SLOT => {
+                if strtab.is_null() || symtab.is_null() {
+                    return Err("missing strtab/symtab for sym reloc");
+                }
+                let sym_idx = r_sym(r.r_info);
+                let sym = unsafe { &*symtab.add(sym_idx as usize) };
+                let name = unsafe { strtab_get(strtab, sym.st_name as u64, dso.dyn_.strsz) };
+                let value = unsafe { lookup_symbol(name, dsos).unwrap_or(0) };
+                if value == 0 {
+                    serial(b"ldso: undefined symbol ");
+                    serial(name);
+                    serial(b"\n");
+                    return Err("undefined symbol");
+                }
+                unsafe { core::ptr::write_unaligned(target, value) };
+            }
+            R_X86_64_64 => {
+                if strtab.is_null() || symtab.is_null() {
+                    return Err("missing strtab/symtab for sym reloc");
+                }
+                let sym_idx = r_sym(r.r_info);
+                let sym = unsafe { &*symtab.add(sym_idx as usize) };
+                let name = unsafe { strtab_get(strtab, sym.st_name as u64, dso.dyn_.strsz) };
+                let value = unsafe { lookup_symbol(name, dsos).unwrap_or(0) };
+                if value == 0 {
+                    return Err("undefined symbol (R_X86_64_64)");
+                }
+                let mut buf = [0u8; 8];
+                let img = unsafe { core::slice::from_raw_parts_mut(target as *mut u8, 8) };
+                let dummy_rela = Rela {
+                    r_offset: 0,
+                    r_info: 0,
+                    r_addend: r.r_addend,
+                };
+                apply_abs64(&dummy_rela, 0, value, &mut buf).map_err(|_| "abs64 failed")?;
+                img.copy_from_slice(&buf);
+            }
+            _ => {
+                serial(b"ldso: unsupported reloc type ");
+                serial_hex(rt as u64);
+                serial(b"\n");
+                return Err("unsupported reloc");
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Constructors (Track B5.1).
+// ---------------------------------------------------------------------------
+
+unsafe fn run_constructors(dsos: &[LoadedDso]) {
+    // dsos[0] is the main binary. Deepest-first ⇒ reverse iteration
+    // (so deps run before the main binary).
+    for dso in dsos.iter().rev() {
+        if let Some(init) = dso.dyn_.init {
+            let f: extern "C" fn() = unsafe { core::mem::transmute(init.as_ptr()) };
+            f();
+        }
+        if let Some(arr) = dso.dyn_.init_array
+            && dso.dyn_.init_arraysz >= 8
+        {
+            let n = (dso.dyn_.init_arraysz / 8) as usize;
+            let base = arr.as_ptr() as *const u64;
+            for i in 0..n {
+                let fnptr = unsafe { *base.add(i) };
+                if fnptr != 0 {
+                    let f: extern "C" fn() = unsafe { core::mem::transmute(fnptr) };
+                    f();
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main bring-up driver.
+// ---------------------------------------------------------------------------
+
+/// Walk argc / argv / envp / auxv to extract `AT_BASE`, `AT_PHDR`,
+/// `AT_PHNUM`, `AT_ENTRY`. Returns the four values in order.
+///
+/// # Safety
+/// `stack` must be the genuine kernel-built SysV stack.
+unsafe fn parse_auxv(stack: *const u64) -> (u64, *const Phdr, usize, u64) {
+    let argc = unsafe { *stack } as usize;
+    let mut p = unsafe { stack.add(1).add(argc).add(1) };
+    while unsafe { *p } != 0 {
+        p = unsafe { p.add(1) };
+    }
+    p = unsafe { p.add(1) };
+    let mut at_base = 0u64;
+    let mut at_phdr: *const Phdr = core::ptr::null();
+    let mut at_phnum = 0usize;
+    let mut at_entry = 0u64;
+    loop {
+        let a_type = unsafe { *p };
+        let a_val = unsafe { *p.add(1) };
+        if a_type == AT_NULL {
+            break;
+        }
+        match a_type {
+            AT_BASE => at_base = a_val,
+            AT_PHDR => at_phdr = a_val as *const Phdr,
+            AT_PHNUM => at_phnum = a_val as usize,
+            AT_ENTRY => at_entry = a_val,
+            _ => {}
+        }
+        p = unsafe { p.add(2) };
+    }
+    let _ = AT_PHENT; // accepted in input, not yet acted on
+    (at_base, at_phdr, at_phnum, at_entry)
+}
+
+/// The bring-up driver. Returns the main binary's `AT_ENTRY` value
+/// for the asm caller to `jmp` to. Returns 0 on any unrecoverable
+/// error (the asm caller will then `jmp 0` and the kernel reports a
+/// page-fault on user code — visible failure mode).
+/// Bring-up driver invoked from the naked-asm `_start`.
+///
+/// # Safety
+/// `stack` must be the genuine kernel-built SysV-ABI initial stack
+/// passed in `rsp` at process entry. Caller is the linker's own
+/// `_start` and never invokes this function from any other context.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
+    serial(b"ldso(76b): _dlstart\n");
+    let (at_base, at_phdr, at_phnum, at_entry) = unsafe { parse_auxv(stack) };
+    if at_phdr.is_null() || at_phnum == 0 || at_entry == 0 {
+        serial(b"ldso: missing AT_PHDR/AT_PHNUM/AT_ENTRY\n");
+        return 0;
+    }
+
+    // -- Self-relocation ----------------------------------------------------
+    // The linker's own PHDR table is at `at_base + e_phoff`; we know
+    // `at_base` from the auxv, and `e_phoff` is at byte 32 of the ELF
+    // header. Read those few bytes inline.
+    if at_base != 0 {
+        let our_ehdr = at_base as *const Ehdr;
+        let our_phoff = unsafe { (*our_ehdr).e_phoff };
+        let our_phnum = unsafe { (*our_ehdr).e_phnum } as usize;
+        let our_phdr = (at_base + our_phoff) as *const Phdr;
+        unsafe { dl_relocate_self(our_phdr, our_phnum, at_base) };
+    }
+
+    // -- Walk main binary's PT_DYNAMIC --------------------------------------
+    // The kernel sets at_base for the main binary by passing the main
+    // binary's load bias (or 0 for non-PIE).  For PIE binaries the
+    // load bias must be computed from PT_PHDR vs at_phdr.
+    let mut main_phdr_vaddr = 0u64;
+    for i in 0..at_phnum {
+        let ph = unsafe { *at_phdr.add(i) };
+        if ph.p_type == ldso_core::elf64::PT_PHDR {
+            main_phdr_vaddr = ph.p_vaddr;
+            break;
+        }
+    }
+    let main_load_bias = if main_phdr_vaddr != 0 {
+        (at_phdr as u64).wrapping_sub(main_phdr_vaddr)
+    } else {
+        0
+    };
+
+    // Compute the main binary's in-memory image span the same way
+    // `load_dso` does for DT_NEEDED libraries — `max(p_vaddr +
+    // p_memsz)` over PT_LOAD segments, rounded up to a page.  This
+    // populates `LoadedDso.image_len` so `apply_rela`'s bounds check
+    // is symmetric for the main binary and its dependencies.  A
+    // zero result (no PT_LOAD found) leaves the check disabled for
+    // the main binary, which would only happen on a degenerate
+    // static binary that this function has already returned through.
+    let mut main_image_end: u64 = 0;
+    for i in 0..at_phnum {
+        let ph = unsafe { *at_phdr.add(i) };
+        if ph.p_type == PT_LOAD {
+            let end = ph.p_vaddr.wrapping_add(ph.p_memsz);
+            if end > main_image_end {
+                main_image_end = end;
+            }
+        }
+    }
+    let main_image_len = if main_image_end == 0 {
+        0
+    } else {
+        (main_image_end + 4095) & !4095
+    };
+
+    // Locate main's PT_DYNAMIC.
+    let mut main_dyn: *const Dyn = core::ptr::null();
+    for i in 0..at_phnum {
+        let ph = unsafe { *at_phdr.add(i) };
+        if ph.p_type == PT_DYNAMIC {
+            main_dyn = (main_load_bias.wrapping_add(ph.p_vaddr)) as *const Dyn;
+            break;
+        }
+    }
+    if main_dyn.is_null() {
+        return at_entry; // static binary — just transfer through
+    }
+    // Build a slice view of main's dynamic section. Same truncation
+    // guard as `load_dso_impl`: if the loop fills 64 entries without
+    // observing DT_NULL, the binary's dynamic section exceeds what
+    // this loader supports and silently truncating would drop tags
+    // (causing confusing downstream failures).  Hard-fail with
+    // ELIBBAD instead.
+    let mut main_entries: heapless::Vec<Dyn, 64> = heapless::Vec::new();
+    let mut main_saw_null = false;
+    {
+        let mut p = main_dyn;
+        while main_entries.len() < 64 {
+            let e = unsafe { *p };
+            let _ = main_entries.push(e);
+            if e.d_tag == DT_NULL {
+                main_saw_null = true;
+                break;
+            }
+            p = unsafe { p.add(1) };
+        }
+    }
+    if !main_saw_null {
+        serial(b"ldso: main binary PT_DYNAMIC > 64 entries\n");
+        sys_exit(ELIBBAD_CODE);
+    }
+    let main_dyn_section = DynamicSection::parse(&main_entries, main_load_bias);
+    // Same dynamic-pointer bounds check as `load_dso_impl` runs for
+    // every loaded DSO — keep the main binary on the same protection
+    // floor so a corrupted main binary's `DT_STRTAB` / `DT_HASH` /
+    // etc. cannot trick the linker into reading unrelated memory.
+    if let Err(why) = validate_dyn_pointers(&main_dyn_section, main_load_bias, main_image_len) {
+        serial(b"ldso: main binary dynamic-pointer bounds check failed: ");
+        serial(why.as_bytes());
+        serial(b"\n");
+        sys_exit(ELIBBAD_CODE);
+    }
+
+    // -- Load DT_NEEDED dependencies ----------------------------------------
+    let mut dsos: heapless::Vec<LoadedDso, MAX_DSOS> = heapless::Vec::new();
+    // Main binary first (index 0) so lookup_symbol resolves to it
+    // for self-referential globals (matches SysV scope).
+    let _ = dsos.push(LoadedDso {
+        load_bias: main_load_bias,
+        image_len: main_image_len,
+        dyn_: main_dyn_section,
+    });
+    let strtab_main = match main_dyn_section.strtab {
+        Some(p) => p.as_ptr(),
+        None => core::ptr::null(),
+    };
+    // SONAME (or DT_NEEDED name when DT_SONAME is absent) of every
+    // loaded DSO, parallel to `dsos`. The main binary's slot is
+    // empty (it has no SONAME).
+    let mut loaded_names: heapless::Vec<&[u8], MAX_DSOS> = heapless::Vec::new();
+    let _ = loaded_names.push(&[]);
+    // Pending DT_NEEDED queue: name + index of the DSO that asked
+    // for it (so the graph edge can be recorded).
+    let mut queue: heapless::Vec<(&[u8], usize), 64> = heapless::Vec::new();
+    if !strtab_main.is_null() {
+        for i in 0..main_dyn_section.n_needed as usize {
+            let name_off = main_dyn_section.needed[i];
+            let name = unsafe { strtab_get(strtab_main, name_off, main_dyn_section.strsz) };
+            let _ = queue.push((name, 0));
+        }
+    }
+    // Per-DSO DT_NEEDED → child-index lists, used for cycle detection.
+    let mut dep_lists: heapless::Vec<heapless::Vec<DsoId, MAX_DSOS>, MAX_DSOS> =
+        heapless::Vec::new();
+    for _ in 0..MAX_DSOS {
+        let _ = dep_lists.push(heapless::Vec::new());
+    }
+    let mut qhead = 0usize;
+    while qhead < queue.len() {
+        let (name, parent_idx) = queue[qhead];
+        qhead += 1;
+        // Dedup against already-loaded SONAMEs.
+        let mut existing = None;
+        for (idx, n) in loaded_names.iter().enumerate() {
+            if *n == name {
+                existing = Some(idx);
+                break;
+            }
+        }
+        if let Some(idx) = existing {
+            if let Some(slot) = dep_lists.get_mut(parent_idx) {
+                let _ = slot.push(DsoId(idx as u32));
+            }
+            continue;
+        }
+        // Build "/usr/lib/<name>\0" in a stack buffer.
+        let mut path_buf = [0u8; 256];
+        let prefix = b"/usr/lib/";
+        if prefix.len() + name.len() + 1 > path_buf.len() {
+            serial(b"ldso: path too long for DT_NEEDED\n");
+            sys_exit(ENOENT_CODE);
+        }
+        path_buf[..prefix.len()].copy_from_slice(prefix);
+        path_buf[prefix.len()..prefix.len() + name.len()].copy_from_slice(name);
+        let loaded = match unsafe { load_dso(&path_buf) } {
+            Ok(d) => d,
+            Err(LoadError::NotFound) => {
+                serial(b"ldso: DT_NEEDED not found: ");
+                serial(name);
+                serial(b"\n");
+                sys_exit(ENOENT_CODE);
+            }
+            Err(LoadError::Other(msg)) => {
+                serial(b"ldso: failed to load DT_NEEDED ");
+                serial(name);
+                serial(b": ");
+                serial(msg.as_bytes());
+                serial(b"\n");
+                sys_exit(ENOENT_CODE);
+            }
+        };
+        // Resolve the loaded DSO's actual DT_SONAME (if present) so
+        // dedup is keyed on the library's self-identified name, not
+        // the DT_NEEDED string the parent happened to use. Falls back
+        // to the requested DT_NEEDED string when DT_SONAME is absent.
+        let display_name: &[u8] = if loaded.dyn_.soname != u64::MAX {
+            let strtab_p = match loaded.dyn_.strtab {
+                Some(p) => p.as_ptr(),
+                None => core::ptr::null(),
+            };
+            if !strtab_p.is_null() {
+                unsafe { strtab_get(strtab_p, loaded.dyn_.soname, loaded.dyn_.strsz) }
+            } else {
+                name
+            }
+        } else {
+            name
+        };
+        let new_idx = dsos.len();
+        if dsos.push(loaded).is_err() || loaded_names.push(display_name).is_err() {
+            serial(b"ldso: too many DSOs\n");
+            sys_exit(ELIBBAD_CODE);
+        }
+        if let Some(slot) = dep_lists.get_mut(parent_idx) {
+            let _ = slot.push(DsoId(new_idx as u32));
+        }
+        // Enqueue this DSO's own DT_NEEDED for transitive resolution.
+        let strtab_p = match loaded.dyn_.strtab {
+            Some(p) => p.as_ptr(),
+            None => core::ptr::null(),
+        };
+        if !strtab_p.is_null() {
+            for k in 0..loaded.dyn_.n_needed as usize {
+                let dep_off = loaded.dyn_.needed[k];
+                let dep_name = unsafe { strtab_get(strtab_p, dep_off, loaded.dyn_.strsz) };
+                if queue.push((dep_name, new_idx)).is_err() {
+                    serial(b"ldso: queue overflow\n");
+                    sys_exit(ELIBBAD_CODE);
+                }
+            }
+        }
+    }
+    // Cycle detection via topo_sort on the dep graph.
+    {
+        let mut slices: heapless::Vec<&[DsoId], MAX_DSOS> = heapless::Vec::new();
+        for i in 0..dsos.len() {
+            let _ = slices.push(dep_lists[i].as_slice());
+        }
+        match topo_sort(slices.as_slice()) {
+            Ok(_) => {}
+            Err(TopoError::CircularDependency(a, b)) => {
+                serial(b"ldso: circular DT_NEEDED between ");
+                if let Some(n) = loaded_names.get(a.0 as usize) {
+                    serial(n);
+                }
+                serial(b" and ");
+                if let Some(n) = loaded_names.get(b.0 as usize) {
+                    serial(n);
+                }
+                serial(b"\n");
+                sys_exit(ELIBBAD_CODE);
+            }
+            Err(_) => {
+                serial(b"ldso: dependency-graph overflow\n");
+                sys_exit(ELIBBAD_CODE);
+            }
+        }
+    }
+    let _ = MAX_NEEDED;
+    let _ = DsoId(0);
+
+    // -- Validate entry-size invariants across main + every loaded DSO.
+    // The reloc passes below divide `relasz` / `pltrelsz` by 24 and
+    // assume DT_PLTREL == DT_RELA. Catch any DSO that breaks those
+    // invariants before we trust the resulting entry counts.
+    if let Err(why) = validate_dyn_invariants(&main_dyn_section) {
+        serial(b"ldso: main DT_* invariant failed: ");
+        serial(why.as_bytes());
+        serial(b"\n");
+        sys_exit(ELIBBAD_CODE);
+    }
+    for i in 1..dsos.len() {
+        if let Err(why) = validate_dyn_invariants(&dsos[i].dyn_) {
+            serial(b"ldso: DSO DT_* invariant failed: ");
+            serial(why.as_bytes());
+            serial(b"\n");
+            sys_exit(ELIBBAD_CODE);
+        }
+    }
+
+    // -- Apply relocations against the main binary --------------------------
+    if let Some(rela) = main_dyn_section.rela {
+        let n = (main_dyn_section.relasz / 24) as usize;
+        let dsos_slice = dsos.as_slice();
+        let dso_main = LoadedDso {
+            load_bias: main_load_bias,
+            image_len: main_image_len,
+            dyn_: main_dyn_section,
+        };
+        if let Err(e) =
+            unsafe { apply_rela(&dso_main, rela.as_ptr() as *const Rela, n, dsos_slice) }
+        {
+            serial(b"ldso: apply_rela (main DT_RELA) failed: ");
+            serial(e.as_bytes());
+            serial(b"\n");
+            return 0;
+        }
+    }
+    if let Some(jmprel) = main_dyn_section.jmprel {
+        let n = (main_dyn_section.pltrelsz / 24) as usize;
+        let dsos_slice = dsos.as_slice();
+        let dso_main = LoadedDso {
+            load_bias: main_load_bias,
+            image_len: main_image_len,
+            dyn_: main_dyn_section,
+        };
+        if let Err(e) =
+            unsafe { apply_rela(&dso_main, jmprel.as_ptr() as *const Rela, n, dsos_slice) }
+        {
+            serial(b"ldso: apply_rela (main DT_JMPREL) failed: ");
+            serial(e.as_bytes());
+            serial(b"\n");
+            return 0;
+        }
+    }
+
+    // -- Apply relocations against each loaded DSO --------------------------
+    let n_dsos = dsos.len();
+    for i in 1..n_dsos {
+        let dso = dsos[i];
+        if let Some(rela) = dso.dyn_.rela {
+            let n = (dso.dyn_.relasz / 24) as usize;
+            let dsos_slice = dsos.as_slice();
+            if let Err(_e) =
+                unsafe { apply_rela(&dso, rela.as_ptr() as *const Rela, n, dsos_slice) }
+            {
+                serial(b"ldso: apply_rela on DSO failed\n");
+                return 0;
+            }
+        }
+        if let Some(jmprel) = dso.dyn_.jmprel {
+            let n = (dso.dyn_.pltrelsz / 24) as usize;
+            let dsos_slice = dsos.as_slice();
+            if let Err(_e) =
+                unsafe { apply_rela(&dso, jmprel.as_ptr() as *const Rela, n, dsos_slice) }
+            {
+                serial(b"ldso: apply_rela jmprel on DSO failed\n");
+                return 0;
+            }
+        }
+    }
+
+    // -- Run constructors deepest-first -------------------------------------
+    unsafe { run_constructors(&dsos) };
+
+    serial(b"ldso(76b): handoff to main entry=");
+    serial_hex(at_entry);
+    serial(b"\n");
+    at_entry
+}
+
+// ---------------------------------------------------------------------------
+// Naked entry point. Mirrors the Phase 76 stub's shape but calls
+// `dl_entry` (the full bring-up driver) instead of the old
+// `dlstart_rust`.
+// ---------------------------------------------------------------------------
+
 #[unsafe(no_mangle)]
 #[unsafe(naked)]
 pub extern "C" fn _start() -> ! {
     naked_asm!(
-        // Outermost frame: zero rbp.
         "xor rbp, rbp",
-        // Pass rsp to Rust handler.
         "mov rdi, rsp",
-        "call {dlstart_rust}",
-        // dlstart_rust returns AT_ENTRY in rax. Jump there leaving
-        // the stack unchanged.
+        "call {dl_entry}",
         "jmp rax",
-        dlstart_rust = sym dlstart_rust,
+        dl_entry = sym dl_entry,
     );
 }
 
-/// musl-style alias for `_start`. Phase 76b's bring-up linker may
-/// keep this name as the public entry; for now it just forwards.
 #[unsafe(no_mangle)]
 #[unsafe(naked)]
 pub extern "C" fn _dlstart() -> ! {
     naked_asm!("jmp _start");
 }
 
-/// Walk the SysV-ABI initial stack for `AT_ENTRY` and return its
-/// value. Called from `_dlstart` with `stack` pointing at `argc`.
-///
-/// # Safety
-/// `stack` must be the genuine kernel-built SysV stack. We trust the
-/// kernel's `setup_abi_stack_with_envp` to terminate every list
-/// (argv, envp, auxv) correctly.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dlstart_rust(stack: *const u64) -> u64 {
-    serial(b"ldso: _dlstart entry=");
-    // SAFETY: stack came from the kernel-built SysV layout; the
-    // caller (`_dlstart`) hands us the exact pointer the kernel set
-    // as the initial `rsp`.
-    let entry = unsafe { find_at_entry(stack) };
-    serial_hex(entry);
-    serial(b"\n");
-    entry
-}
-
-/// Walk argc + argv + envp + auxv to find `AT_ENTRY`. Returns 0 if
-/// not found (which would indicate a kernel bug — Phase 76's auxv
-/// always emits `AT_ENTRY` when `PT_INTERP` was honored).
-///
-/// # Safety
-/// `stack` must point at a SysV-ABI initial stack laid out by the
-/// kernel `setup_abi_stack_with_envp` path. The argv and envp lists
-/// must be `NULL`-terminated and the auxv must be `AT_NULL`-terminated.
-unsafe fn find_at_entry(stack: *const u64) -> u64 {
-    unsafe {
-        // [rsp + 0]: argc
-        let argc = *stack as usize;
-        // Skip argc.
-        let mut p = stack.add(1);
-        // Skip argv[0..argc] then the NULL terminator.
-        p = p.add(argc).add(1);
-        // Skip envp[..] until NULL.
-        while *p != 0 {
-            p = p.add(1);
-        }
-        // Skip envp NULL terminator.
-        p = p.add(1);
-        // auxv entries: 16 bytes each (a_type, a_val). AT_NULL ends.
-        loop {
-            let a_type = *p;
-            let a_val = *p.add(1);
-            if a_type == AT_NULL {
-                serial(b"ldso: WARN AT_ENTRY missing\n");
-                return 0;
-            }
-            if a_type == AT_ENTRY {
-                return a_val;
-            }
-            // AT_BASE is harmless to see; mention it once for
-            // observability so the smoke log shows the linker
-            // recognized its own load bias.
-            if a_type == AT_BASE {
-                serial(b"ldso: AT_BASE=");
-                serial_hex(a_val);
-                serial(b"\n");
-            }
-            p = p.add(2);
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Panic handler — there is nothing the linker can do at this stage;
-// crash hard so the kernel sees a SIGSEGV and reports it.
+// Panic handler.
 // ---------------------------------------------------------------------------
 
 #[panic_handler]
 fn panic(info: &PanicInfo<'_>) -> ! {
     serial(b"ldso: PANIC\n");
     let _ = info;
-    // SAFETY: `ud2` deliberately raises #UD so the kernel observes
-    // an illegal instruction and terminates the process. `noreturn`
-    // tells rustc this asm never returns control.
     unsafe {
         core::arch::asm!("ud2", options(noreturn));
     }
 }
+
+// Pull a Sym reference so the type is not unused (rustc would warn).
+#[allow(dead_code)]
+const _SYM_SIZE: usize = core::mem::size_of::<Sym>();
