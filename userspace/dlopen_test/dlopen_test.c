@@ -16,7 +16,10 @@
  *   4. Open libhello_fini.so to exercise the destructor pipeline
  *   5. Print "DLOPEN_TEST:FINI_PENDING" before closing libhello_fini
  *   6. dlclose(libhello_fini_handle) → must return 0; the destructor
- *      writes "LIBHELLO_FINI:RAN\n" to stderr
+ *      writes "LIBHELLO_FINI:RAN\n" to fd 1 (stdout) — fd 1 rather
+ *      than fd 2 because m3OS's `dup2` does not share the file
+ *      description between fd 1 and fd 2, so the smoke gate sees the
+ *      destructor sentinel in the same stream as the bracket markers
  *   7. dlclose(libhello_handle) → must return 0
  *   8. Print "DLOPEN_TEST:PASS"
  *
@@ -91,6 +94,22 @@ static int c_streq(const char *a, const char *b) {
     return 0;
 }
 
+/* Substring search — used to verify dlerror() messages carry the
+ * symbol/path name the caller asked about. Returns 1 on match. */
+static int c_contains(const char *haystack, const char *needle) {
+    if (haystack == 0 || needle == 0) return 0;
+    long nlen = c_strlen(needle);
+    if (nlen == 0) return 1;
+    long hlen = c_strlen(haystack);
+    if (hlen < nlen) return 0;
+    for (long i = 0; i <= hlen - nlen; i++) {
+        long j = 0;
+        while (j < nlen && haystack[i + j] == needle[j]) j++;
+        if (j == nlen) return 1;
+    }
+    return 0;
+}
+
 static void puts1(const char *s) {
     sys_write(1, s, c_strlen(s));
     sys_write(1, "\n", 1);
@@ -153,6 +172,17 @@ void _start(void) {
     char *err1 = dlerror();
     if (err1 == 0) {
         puts1("DLOPEN_TEST:FAIL dlerror() after missing-symbol returned NULL");
+        sys_exit(1);
+    }
+    /* The task contract (76c C2.1) requires the error string to be
+     * "undefined symbol: <name>" so an "is this symbol missing"
+     * diagnostic by tail-grepping dlerror works on m3OS the same
+     * way it does on glibc/musl. Assert both halves so a regression
+     * to the old static "undefined symbol\0" shape fails the gate. */
+    if (!c_contains(err1, "undefined symbol")
+        || !c_contains(err1, "this_symbol_does_not_exist")) {
+        puts1("DLOPEN_TEST:FAIL dlerror() missing-symbol message lacks symbol name");
+        diag_label_msg("dlerror missing-symbol", err1);
         sys_exit(1);
     }
     /* dlerror is read-and-clear; second call without intervening

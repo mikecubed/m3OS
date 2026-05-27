@@ -90,6 +90,17 @@ pub const ERR_HANDLE_TABLE_FULL: &[u8] = b"handle table full\0";
 pub const ERR_TOO_MANY_DSOS: &[u8] = b"too many loaded DSOs\0";
 pub const ERR_BAD_PATH: &[u8] = b"invalid path\0";
 
+/// Prefix used when `dlsym` formats the per-symbol error message.
+/// Mirrors the conventional libdl `"undefined symbol: <name>"` shape
+/// so existing error-checking idioms keep working.
+pub const ERR_UNDEFINED_SYMBOL_PREFIX: &[u8] = b"undefined symbol: ";
+
+/// Capacity of the per-process `dlerror` formatting buffer. Long
+/// enough for any plausible symbol name plus the prefix and trailing
+/// NUL; over-length names are truncated rather than producing a
+/// caller-visible error.
+pub const MAX_ERR_LEN: usize = 256;
+
 // ---------------------------------------------------------------------------
 // DlState — single-process libdl state.
 // ---------------------------------------------------------------------------
@@ -98,6 +109,11 @@ pub const ERR_BAD_PATH: &[u8] = b"invalid path\0";
 /// `ldso_core::dynlink::MAX_DSOS` so a `DsoId` can index any state
 /// array without a separate bounds check.
 pub const MAX_SLOTS: usize = MAX_DSOS;
+
+/// Per-slot capacity for the linker-owned name buffer. Long enough
+/// for any plausible SONAME or `DT_NEEDED` string (which are
+/// typically short basenames like `libfoo.so.1`).
+pub const MAX_NAME_LEN: usize = 128;
 
 /// Const initializer for one row of `dep_lists` — needed because
 /// `heapless::Vec` is not `Copy` and the array literal would
@@ -112,10 +128,15 @@ pub struct DlState {
     /// linker itself (so the libdl symbols resolve to its
     /// implementations before any user-provided stub library).
     pub dsos: [LoadedDso; MAX_SLOTS],
-    /// SONAME (or `DT_NEEDED` name) for each slot. The main binary's
-    /// slot uses `&[]`; every other live slot carries the canonical
-    /// SONAME so `dlopen` can dedup repeat opens.
-    pub names: [&'static [u8]; MAX_SLOTS],
+    /// Linker-owned per-slot name storage. Every slot's canonical
+    /// SONAME (or fallback basename) lives here, not in caller- or
+    /// DSO-mapped memory. This keeps `find_by_soname` correct after
+    /// the caller's path buffer goes out of scope and after the DSO
+    /// is unmapped.
+    pub name_storage: [[u8; MAX_NAME_LEN]; MAX_SLOTS],
+    /// Number of valid bytes in `name_storage[i]`. `0` means the slot
+    /// has no name (e.g. the main binary's slot).
+    pub name_lens: [u8; MAX_SLOTS],
     /// Direct dependency-graph edges for each slot. Used by `dlsym`
     /// to walk the handle's dependency chain.
     pub dep_lists: [heapless::Vec<DsoId, MAX_SLOTS>; MAX_SLOTS],
@@ -136,7 +157,17 @@ pub struct DlState {
     /// is detected at `dlclose` / `dlsym` time.
     pub handles: HandleTable,
     /// Last libdl error message. `dlerror()` reads and clears it.
+    /// The slice points either at one of the static `ERR_*` byte
+    /// strings (set via [`DlState::set_error`]) or at the per-process
+    /// `error_buf` (set via [`DlState::set_error_undefined_symbol`]).
+    /// Both backings live for the program lifetime so a `'static`
+    /// slice claim is sound.
     pub error: Option<&'static [u8]>,
+    /// Formatting buffer for dynamic error messages (currently just
+    /// `dlsym`'s `"undefined symbol: <name>"`). Includes the trailing
+    /// NUL so the raw pointer returned by `dlerror()` is a valid C
+    /// string.
+    pub error_buf: [u8; MAX_ERR_LEN],
     /// `true` after `dl_entry` has finished publishing the bring-up
     /// state. Until that flips, any libdl call is a use-before-init
     /// bug and returns `NULL` immediately.
@@ -147,22 +178,45 @@ impl DlState {
     pub const fn new() -> Self {
         Self {
             dsos: [LoadedDso::empty(); MAX_SLOTS],
-            names: [&[]; MAX_SLOTS],
+            name_storage: [[0u8; MAX_NAME_LEN]; MAX_SLOTS],
+            name_lens: [0u8; MAX_SLOTS],
             dep_lists: [EMPTY_DEP_LIST; MAX_SLOTS],
             refcounts: [0; MAX_SLOTS],
             in_global_scope: [false; MAX_SLOTS],
             n_slots_used: 0,
             handles: HandleTable::new(),
             error: None,
+            error_buf: [0u8; MAX_ERR_LEN],
             initialized: false,
         }
     }
 
-    /// Find a slot whose `names[i]` matches `soname`. Skips freed
+    /// Borrow slot `idx`'s name. Returns an empty slice when the slot
+    /// has no name (the main binary, or a slot whose name was cleared
+    /// on `dlclose`).
+    pub fn name(&self, idx: usize) -> &[u8] {
+        let len = self.name_lens[idx] as usize;
+        &self.name_storage[idx][..len]
+    }
+
+    /// Copy `bytes` into the linker-owned per-slot name buffer. Bytes
+    /// beyond [`MAX_NAME_LEN`] are truncated.
+    pub fn intern_name(&mut self, idx: usize, bytes: &[u8]) {
+        let len = bytes.len().min(MAX_NAME_LEN);
+        self.name_storage[idx][..len].copy_from_slice(&bytes[..len]);
+        self.name_lens[idx] = len as u8;
+    }
+
+    /// Clear slot `idx`'s name. Used by `dlclose` before unmapping.
+    pub fn clear_name(&mut self, idx: usize) {
+        self.name_lens[idx] = 0;
+    }
+
+    /// Find a slot whose interned name matches `soname`. Skips freed
     /// slots (`refcounts[i] == 0`). Returns the first match.
     pub fn find_by_soname(&self, soname: &[u8]) -> Option<DsoId> {
         for i in 0..self.n_slots_used {
-            if self.refcounts[i] != 0 && self.names[i] == soname {
+            if self.refcounts[i] != 0 && self.name(i) == soname {
                 return Some(DsoId(i as u32));
             }
         }
@@ -188,6 +242,35 @@ impl DlState {
 
     pub fn set_error(&mut self, msg: &'static [u8]) {
         self.error = Some(msg);
+    }
+
+    /// Format `"undefined symbol: <name>\0"` into `error_buf` and
+    /// publish it as the current `dlerror` slot. Names longer than
+    /// the buffer minus the prefix and NUL are truncated; the
+    /// remainder of the message is still well-formed.
+    pub fn set_error_undefined_symbol(&mut self, name: &[u8]) {
+        let prefix = ERR_UNDEFINED_SYMBOL_PREFIX;
+        let mut written = 0usize;
+        // Reserve one byte for the trailing NUL.
+        let cap = MAX_ERR_LEN - 1;
+        let plen = prefix.len().min(cap);
+        self.error_buf[..plen].copy_from_slice(&prefix[..plen]);
+        written += plen;
+        let name_room = cap - written;
+        let nlen = name.len().min(name_room);
+        self.error_buf[written..written + nlen].copy_from_slice(&name[..nlen]);
+        written += nlen;
+        self.error_buf[written] = 0;
+        // SAFETY: `error_buf` lives in `DlState`, which lives in the
+        // `static DL_STATE`. The slice we publish into `self.error`
+        // therefore really does have `'static` lifetime — the address
+        // and the bytes are stable for the program lifetime, and the
+        // single-threaded invariant on `DlState` prevents anyone from
+        // overwriting the buffer while another caller is reading it
+        // through the C `dlerror()` return.
+        let ptr = self.error_buf.as_ptr();
+        let bytes = unsafe { core::slice::from_raw_parts(ptr, written + 1) };
+        self.error = Some(bytes);
     }
 
     pub fn take_error(&mut self) -> Option<&'static [u8]> {
@@ -238,8 +321,11 @@ pub fn dl_state() -> &'static DlState {
 /// Open a shared library and return a refcounted handle.
 ///
 /// `path == NULL` returns a handle to the main binary (slot 0).
-/// Paths containing `/` are treated as absolute; bare names search
-/// `/usr/lib/` first, then `/lib/`.
+/// Paths whose first byte is `/` are used as-is (absolute paths);
+/// every other input — including relative paths such as `./foo` —
+/// is treated as a bare basename and resolved under `/usr/lib/`.
+/// The `/lib/` fallback is deferred to a later phase; only
+/// `/usr/lib/` is searched in Phase 76c.
 ///
 /// # Safety
 /// `path` must either be `NULL` or a valid NUL-terminated C string.
@@ -351,7 +437,12 @@ pub unsafe extern "C" fn dlopen(path: *const c_char, flags: c_int) -> *mut c_voi
     };
 
     state.dsos[id.0 as usize] = loaded;
-    state.names[id.0 as usize] = canonical_soname(&loaded, basename);
+    // Intern the canonical name into linker-owned per-slot storage so
+    // dedup, error logging, and lookup don't alias caller memory
+    // (`basename` was borrowed from the caller's path C string) or
+    // about-to-be-unmapped DSO memory (when DT_SONAME was present).
+    let canonical = canonical_soname_bytes(&loaded, basename);
+    state.intern_name(id.0 as usize, canonical);
     state.refcounts[id.0 as usize] = 1;
     state.in_global_scope[id.0 as usize] = (flags & RTLD_GLOBAL) != 0;
     state.dep_lists[id.0 as usize].clear();
@@ -364,7 +455,7 @@ pub unsafe extern "C" fn dlopen(path: *const c_char, flags: c_int) -> *mut c_voi
         // Roll back the slot before reporting the failure.
         let _ = unmap_dso(&state.dsos[id.0 as usize], crate::sys_munmap);
         state.dsos[id.0 as usize] = LoadedDso::empty();
-        state.names[id.0 as usize] = &[];
+        state.clear_name(id.0 as usize);
         state.refcounts[id.0 as usize] = 0;
         state.set_error(ERR_RELOC_FAILED);
         return core::ptr::null_mut();
@@ -406,7 +497,7 @@ pub unsafe extern "C" fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut
         if let Some(addr) = unsafe { search_global_scope(state, name_bytes) } {
             return addr as *mut c_void;
         }
-        state.set_error(ERR_UNDEFINED_SYMBOL);
+        state.set_error_undefined_symbol(name_bytes);
         return core::ptr::null_mut();
     }
 
@@ -421,7 +512,7 @@ pub unsafe extern "C" fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut
     if let Some(addr) = unsafe { search_handle_scope(state, dso_id, name_bytes) } {
         return addr as *mut c_void;
     }
-    state.set_error(ERR_UNDEFINED_SYMBOL);
+    state.set_error_undefined_symbol(name_bytes);
     core::ptr::null_mut()
 }
 
@@ -468,13 +559,16 @@ pub unsafe extern "C" fn dlclose(handle: *mut c_void) -> c_int {
 
     // Last close → run destructors, evict from scope, unmap.
     // Capture the LoadedDso by value before mutating state so the
-    // destructor walker doesn't observe a half-cleared slot.
+    // destructor walker doesn't observe a half-cleared slot. Capture
+    // the name length too so a munmap-failure log later can still
+    // read the linker-owned per-slot buffer (which we leave intact
+    // through the unmap and only clear at the end if it succeeded).
     let dso = state.dsos[idx];
+    let dso_name_len = state.name_lens[idx] as usize;
     // Mark the slot evicted BEFORE running destructors so a
     // destructor that calls back into dlsym(self) can't find itself.
     state.in_global_scope[idx] = false;
     state.dep_lists[idx].clear();
-    state.names[idx] = &[];
     state.dsos[idx] = LoadedDso::empty();
 
     // SAFETY: destructors are `extern "C" fn()` pointers held in the
@@ -486,12 +580,14 @@ pub unsafe extern "C" fn dlclose(handle: *mut c_void) -> c_int {
     if let Err(e) = unmap_dso(&dso, crate::sys_munmap) {
         // The DSO is conceptually gone (slot evicted) but the kernel
         // may still hold its pages. Log the munmap failure on serial
-        // — it indicates a real bug.
+        // — it indicates a real bug. The name buffer is still
+        // populated; clear it after we've logged the name.
         let _ = e;
         crate::serial(b"ldso: dlclose: unmap failed for ");
-        crate::serial(state.names[idx]);
+        crate::serial(&state.name_storage[idx][..dso_name_len]);
         crate::serial(b"\n");
     }
+    state.clear_name(idx);
     let _: UnmapError = UnmapError::EmptyImage; // keep variant alive
 
     0
@@ -512,11 +608,20 @@ pub unsafe extern "C" fn dlerror() -> *const c_char {
 // Helpers shared between the entry points.
 // ---------------------------------------------------------------------------
 
-/// Compute the byte length of a NUL-terminated C string, bounded.
+/// Compute the byte length of a NUL-terminated C string, bounded,
+/// and return the bytes as a call-scoped slice.
+///
+/// The returned lifetime `'a` is inferred from the input pointer's
+/// validity window — the caller is responsible for not letting the
+/// underlying buffer be freed or mutated while the slice is in use.
+/// Callers must NOT store the returned slice beyond the immediate
+/// call (e.g. into `DlState`) — copy the bytes via
+/// [`DlState::intern_name`] first.
 ///
 /// # Safety
-/// `p` must point at a region of at most `max` bytes of mapped memory.
-unsafe fn cstr_to_bytes_bounded(p: *const c_char, max: usize) -> &'static [u8] {
+/// `p` must point at a region of at most `max` bytes of mapped memory
+/// for the duration of the resulting borrow.
+unsafe fn cstr_to_bytes_bounded<'a>(p: *const c_char, max: usize) -> &'a [u8] {
     let mut n = 0usize;
     while n < max {
         if unsafe { *(p.add(n) as *const u8) } == 0 {
@@ -525,9 +630,8 @@ unsafe fn cstr_to_bytes_bounded(p: *const c_char, max: usize) -> &'static [u8] {
         n += 1;
     }
     // SAFETY: caller guarantees the C string occupies at least `n`
-    // mapped bytes (we walked them). Borrow as `'static` because the
-    // string lives in the caller's address space for as long as the
-    // libdl call runs.
+    // mapped bytes (we walked them) for the lifetime of the returned
+    // slice.
     unsafe { core::slice::from_raw_parts(p as *const u8, n) }
 }
 
@@ -546,7 +650,16 @@ fn basename_of(path: &[u8]) -> &[u8] {
 /// real `DT_SONAME` (from the DSO's own dynamic section) so dedup is
 /// keyed on the library's self-identified name, not the caller's
 /// path. Falls back to the basename when DT_SONAME is absent.
-fn canonical_soname(dso: &LoadedDso, fallback: &'static [u8]) -> &'static [u8] {
+///
+/// The returned slice borrows either from the caller (`fallback`,
+/// when DT_SONAME is absent) or from the DSO's mapped strtab. Both
+/// borrow scopes are shorter than `'static`, which is why the
+/// caller must copy the bytes via `DlState::intern_name` rather
+/// than storing the slice directly.
+fn canonical_soname_bytes<'a, 'b>(dso: &'b LoadedDso, fallback: &'a [u8]) -> &'a [u8]
+where
+    'b: 'a,
+{
     if dso.dyn_.soname == u64::MAX {
         return fallback;
     }

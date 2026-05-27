@@ -1828,11 +1828,10 @@ fn build_dynlink_cycle() {
     }
 }
 
-/// Phase 76c — build `libdl.so`, the POSIX link-time stub that
-/// programs link `-ldl` against so GNU ld can satisfy the four
-/// libdl symbols at link time. At runtime the dynamic linker
-/// self-injects ahead of `libdl.so` in the SysV symbol search
-/// scope, so its real implementations shadow these stubs.
+/// Phase 76c — build `libhello_fini.so`, the destructor-pipeline
+/// demo library. Same shape as `libhello.so` but carries a
+/// `__attribute__((destructor))` function that writes a sentinel
+/// when `dlclose` runs the DT_FINI_ARRAY pipeline.
 fn build_libhello_fini() {
     let root = workspace_root();
     let libs = ensure_generated_libs_dir(&root);
@@ -1860,6 +1859,11 @@ fn build_libhello_fini() {
     }
 }
 
+/// Phase 76c — build `libdl.so`, the POSIX link-time stub that
+/// programs link `-ldl` against so GNU ld can satisfy the four
+/// libdl symbols at link time. At runtime the dynamic linker
+/// self-injects ahead of `libdl.so` in the SysV symbol search
+/// scope, so its real implementations shadow these stubs.
 fn build_libdl() {
     let root = workspace_root();
     let libs = ensure_generated_libs_dir(&root);

@@ -1258,11 +1258,17 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
     let mut dsos: heapless::Vec<LoadedDso, MAX_DSOS> = heapless::Vec::new();
     // Main binary first (index 0) so lookup_symbol resolves to it
     // for self-referential globals (matches SysV scope).
-    let _ = dsos.push(LoadedDso {
-        load_bias: main_load_bias,
-        image_len: main_image_len,
-        dyn_: main_dyn_section,
-    });
+    if dsos
+        .push(LoadedDso {
+            load_bias: main_load_bias,
+            image_len: main_image_len,
+            dyn_: main_dyn_section,
+        })
+        .is_err()
+    {
+        serial(b"ldso: bring-up: dsos.push(main) failed (MAX_DSOS exhausted)\n");
+        sys_exit(ELIBBAD_CODE);
+    }
     let strtab_main = match main_dyn_section.strtab {
         Some(p) => p.as_ptr(),
         None => core::ptr::null(),
@@ -1271,7 +1277,10 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
     // loaded DSO, parallel to `dsos`. The main binary's slot is
     // empty (it has no SONAME).
     let mut loaded_names: heapless::Vec<&[u8], MAX_DSOS> = heapless::Vec::new();
-    let _ = loaded_names.push(&[]);
+    if loaded_names.push(&[]).is_err() {
+        serial(b"ldso: bring-up: loaded_names.push(main) failed\n");
+        sys_exit(ELIBBAD_CODE);
+    }
 
     // Phase 76c — inject the linker itself as slot 1 so the libdl
     // entry points (`dlopen` / `dlsym` / `dlclose` / `dlerror`)
@@ -1280,8 +1289,15 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
     // as the linker's basename so a `DT_NEEDED` carrying that name
     // does not trigger a second load of the linker file from disk.
     if at_base != 0 {
-        let _ = dsos.push(linker_dso);
-        let _ = loaded_names.push(LDSO_BASENAME);
+        // Both pushes must succeed atomically; otherwise the parallel
+        // `dsos` / `loaded_names` arrays go out of sync and downstream
+        // dedup + the bring-up publication loop (which interns the
+        // names into `DL_STATE`) silently corrupt the linker's view
+        // of the DSO graph.
+        if dsos.push(linker_dso).is_err() || loaded_names.push(LDSO_BASENAME).is_err() {
+            serial(b"ldso: bring-up: linker self-injection push failed\n");
+            sys_exit(ELIBBAD_CODE);
+        }
     }
     // Pending DT_NEEDED queue: name + index of the DSO that asked
     // for it (so the graph edge can be recorded).
@@ -1512,7 +1528,14 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
         let state = dl::dl_state_mut();
         for i in 0..n_dsos {
             state.dsos[i] = dsos[i];
-            state.names[i] = loaded_names.get(i).copied().unwrap_or(&[]);
+            // Intern bring-up names into linker-owned per-slot storage.
+            // The source bytes come from each DSO's mapped strtab,
+            // which is permanent for bring-up DSOs, so we could read
+            // them directly — but going through `intern_name` keeps
+            // every `state.names[i]` slice rooted in `DlState` and
+            // removes the implicit-`'static` claim entirely.
+            let name = loaded_names.get(i).copied().unwrap_or(&[]);
+            state.intern_name(i, name);
             state.refcounts[i] = dl::REFCOUNT_PERMANENT;
             state.in_global_scope[i] = true;
             state.dep_lists[i].clear();

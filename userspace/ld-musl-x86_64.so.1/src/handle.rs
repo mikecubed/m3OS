@@ -7,11 +7,12 @@
 //! invoke a stale `DT_FINI_ARRAY` pointer.
 //!
 //! The table is a fixed-size array of [`HandleSlot`]. Each slot stores
-//! `(dso_id, generation)`. `insert` returns a pointer to one of the
-//! slot records (the slot itself lives in the table, which lives in
-//! the linker's static [`crate::dl::DlState`]). `resolve` walks the
-//! slot array to find the slot whose address matches the passed-in
-//! handle pointer, then validates the generation matches.
+//! `(dso_id, generation)`. Handles are **not** raw slot pointers —
+//! they encode `(slot_idx, generation)` directly into the `usize` so
+//! a leaked pointer from a previously-freed handle cannot alias a
+//! reused slot. Encoding: `handle = ((generation as usize) << 16)
+//! | (slot_idx + 1)`. The `+1` keeps slot 0's handle non-NULL (NULL
+//! is reserved for the libdl `RTLD_DEFAULT` sentinel).
 //!
 //! ### Pure-logic kernel
 //!
@@ -28,6 +29,14 @@ use crate::dynlink::DsoId;
 /// from regressing on workloads that hold many handles open at once
 /// (e.g. plugin hosts that open one .so per plugin).
 pub const MAX_HANDLES: usize = 64;
+
+/// Number of low bits reserved for the slot index in the encoded
+/// handle value. 16 bits is comfortably larger than MAX_HANDLES and
+/// leaves the upper 48 bits for the generation token on 64-bit
+/// platforms, which is far more than enough to avoid collisions on a
+/// wrapping counter.
+const SLOT_BITS: u32 = 16;
+const SLOT_MASK: usize = (1usize << SLOT_BITS) - 1;
 
 /// One handle-table slot. `in_use == false` means the slot is free
 /// and may be reused on the next `insert`. `generation` increments
@@ -67,9 +76,9 @@ pub struct HandleTable {
 pub enum HandleError {
     /// All `MAX_HANDLES` slots are in use.
     TableFull,
-    /// The passed-in `*mut c_void` does not match any slot in the
-    /// table, OR the slot's generation has been bumped since the
-    /// handle was issued (e.g. after `dlclose` reused the slot).
+    /// The passed-in `*mut c_void` does not decode to any slot in
+    /// the table, OR the slot's generation has been bumped since
+    /// the handle was issued (e.g. after `dlclose` reused the slot).
     InvalidHandle,
 }
 
@@ -81,10 +90,11 @@ impl HandleTable {
         }
     }
 
-    /// Reserve a slot for `dso_id` and return an opaque pointer to
-    /// the slot. The pointer is stable as long as the [`HandleTable`]
-    /// itself is not moved (it lives in static [`crate::dl::DlState`],
-    /// so the address is stable for the lifetime of the process).
+    /// Reserve a slot for `dso_id` and return an opaque handle that
+    /// encodes both the slot index and a generation token. The handle
+    /// value is unique per `(slot_idx, generation)` pair — a leaked
+    /// copy of an old handle cannot alias a reused slot, because the
+    /// stored generation will not match.
     pub fn insert(&mut self, dso_id: DsoId) -> Result<*mut c_void, HandleError> {
         for i in 0..MAX_HANDLES {
             if !self.slots[i].in_use {
@@ -93,12 +103,18 @@ impl HandleTable {
                 // has to differ between a freed slot's old handle and
                 // its reuse, not be unique across the entire process.
                 self.next_gen = self.next_gen.wrapping_add(1);
+                // Skip generation 0 — it's reserved as the empty-slot
+                // marker so a synthetic handle whose generation field
+                // is zero is always rejected.
+                if self.next_gen == 0 {
+                    self.next_gen = 1;
+                }
                 self.slots[i] = HandleSlot {
                     dso_id,
                     generation,
                     in_use: true,
                 };
-                return Ok(self.slot_ptr(i));
+                return Ok(encode(i, generation));
             }
         }
         Err(HandleError::TableFull)
@@ -108,9 +124,12 @@ impl HandleTable {
     /// for forged handles, freed handles, or handles whose generation
     /// no longer matches the live slot's generation.
     pub fn resolve(&self, handle: *mut c_void) -> Result<DsoId, HandleError> {
-        let idx = self.slot_index(handle).ok_or(HandleError::InvalidHandle)?;
+        let (idx, gen_token) = decode(handle).ok_or(HandleError::InvalidHandle)?;
         let slot = &self.slots[idx];
         if !slot.in_use {
+            return Err(HandleError::InvalidHandle);
+        }
+        if slot.generation != gen_token {
             return Err(HandleError::InvalidHandle);
         }
         Ok(slot.dso_id)
@@ -121,9 +140,12 @@ impl HandleTable {
     /// so a leaked copy of the old pointer fails validation. Returns
     /// the freed `DsoId` so the caller can take any per-DSO action.
     pub fn remove(&mut self, handle: *mut c_void) -> Result<DsoId, HandleError> {
-        let idx = self.slot_index(handle).ok_or(HandleError::InvalidHandle)?;
+        let (idx, gen_token) = decode(handle).ok_or(HandleError::InvalidHandle)?;
         let slot = &mut self.slots[idx];
         if !slot.in_use {
+            return Err(HandleError::InvalidHandle);
+        }
+        if slot.generation != gen_token {
             return Err(HandleError::InvalidHandle);
         }
         let dso_id = slot.dso_id;
@@ -147,34 +169,37 @@ impl HandleTable {
     pub fn live_count(&self) -> usize {
         self.slots.iter().filter(|s| s.in_use).count()
     }
+}
 
-    /// Compute the slot index from a handle pointer by pointer
-    /// arithmetic. Returns `None` if `handle` is `null` or does not
-    /// lie inside the slot array.
-    fn slot_index(&self, handle: *mut c_void) -> Option<usize> {
-        if handle.is_null() {
-            return None;
-        }
-        let base = self.slots.as_ptr() as usize;
-        let h = handle as usize;
-        if h < base {
-            return None;
-        }
-        let off = h - base;
-        let stride = core::mem::size_of::<HandleSlot>();
-        if !off.is_multiple_of(stride) {
-            return None;
-        }
-        let idx = off / stride;
-        if idx >= MAX_HANDLES {
-            return None;
-        }
-        Some(idx)
-    }
+/// Encode `(slot_idx, generation)` into an opaque handle pointer.
+/// Layout: `[ generation : upper bits ][ slot_idx + 1 : low 16 bits ]`.
+fn encode(slot_idx: usize, generation: u32) -> *mut c_void {
+    debug_assert!(slot_idx < MAX_HANDLES);
+    let v = ((generation as usize) << SLOT_BITS) | ((slot_idx + 1) & SLOT_MASK);
+    v as *mut c_void
+}
 
-    fn slot_ptr(&self, idx: usize) -> *mut c_void {
-        &self.slots[idx] as *const HandleSlot as *mut c_void
+/// Decode a handle pointer into `(slot_idx, generation)`. Returns
+/// `None` when the encoded slot index is out of range or zero
+/// (`NULL` is reserved for `RTLD_DEFAULT`).
+fn decode(handle: *mut c_void) -> Option<(usize, u32)> {
+    let v = handle as usize;
+    if v == 0 {
+        return None;
     }
+    let slot_plus_one = v & SLOT_MASK;
+    if slot_plus_one == 0 {
+        return None;
+    }
+    let slot_idx = slot_plus_one - 1;
+    if slot_idx >= MAX_HANDLES {
+        return None;
+    }
+    let gen_token = (v >> SLOT_BITS) as u32;
+    if gen_token == 0 {
+        return None;
+    }
+    Some((slot_idx, gen_token))
 }
 
 impl Default for HandleTable {
@@ -234,13 +259,28 @@ mod tests {
     fn reinsert_bumps_generation() {
         let mut t = HandleTable::new();
         let h1 = t.insert(DsoId(1)).unwrap();
-        let g1 = unsafe { (*(h1 as *const HandleSlot)).generation };
         t.remove(h1).unwrap();
         let h2 = t.insert(DsoId(2)).unwrap();
-        // The first free slot gets reused.
-        assert_eq!(h1, h2);
-        let g2 = unsafe { (*(h2 as *const HandleSlot)).generation };
-        assert_ne!(g1, g2, "generation must change on slot reuse");
+        // Reused slot, but the handle value must differ because the
+        // generation field is encoded directly into the pointer bits.
+        assert_ne!(h1, h2, "encoded handle must change on slot reuse");
+        // And the stale handle must not resolve to the new DSO.
+        assert_eq!(t.resolve(h1), Err(HandleError::InvalidHandle));
+        assert_eq!(t.resolve(h2).unwrap(), DsoId(2));
+    }
+
+    #[test]
+    fn stale_handle_after_reuse_does_not_alias() {
+        // Concrete demonstration of the soundness invariant: after
+        // remove() + insert() into the same slot, the previously-
+        // issued handle pointer must not unlock the new DSO.
+        let mut t = HandleTable::new();
+        let stale = t.insert(DsoId(100)).unwrap();
+        t.remove(stale).unwrap();
+        let fresh = t.insert(DsoId(200)).unwrap();
+        assert_eq!(t.resolve(fresh).unwrap(), DsoId(200));
+        assert_eq!(t.resolve(stale), Err(HandleError::InvalidHandle));
+        assert_eq!(t.remove(stale), Err(HandleError::InvalidHandle));
     }
 
     #[test]
@@ -267,12 +307,28 @@ mod tests {
     }
 
     #[test]
-    fn misaligned_pointer_errors() {
+    fn forged_slot_index_out_of_range_rejected() {
         let t = HandleTable::new();
-        let base = t.slots.as_ptr() as usize;
-        // Pointer 1 byte past the first slot is misaligned and lies
-        // inside slot 0 — must reject.
-        let bad = (base + 1) as *mut c_void;
-        assert_eq!(t.resolve(bad), Err(HandleError::InvalidHandle));
+        // Encode an out-of-range slot with a plausible generation:
+        // generation = 1, slot_plus_one = MAX_HANDLES + 5.
+        let bad = (1usize << SLOT_BITS) | (MAX_HANDLES + 5);
+        assert_eq!(
+            t.resolve(bad as *mut c_void),
+            Err(HandleError::InvalidHandle)
+        );
+    }
+
+    #[test]
+    fn forged_generation_zero_rejected() {
+        let mut t = HandleTable::new();
+        let h = t.insert(DsoId(1)).unwrap();
+        // Drop the upper (generation) bits to zero so only the slot
+        // index remains. resolve() must reject because gen=0 cannot
+        // be a real handle.
+        let stripped = (h as usize) & SLOT_MASK;
+        assert_eq!(
+            t.resolve(stripped as *mut c_void),
+            Err(HandleError::InvalidHandle)
+        );
     }
 }
