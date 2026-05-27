@@ -750,6 +750,25 @@ fn ensure_generated_initrd_dir(root: &Path) -> PathBuf {
     initrd
 }
 
+/// Phase 76 — staging directory for shared libraries and the dynamic
+/// linker. Files dropped here are copied to `/lib/` (for the linker)
+/// or `/usr/lib/` (for `.so` files in Phase 76b) on the ext2 data
+/// disk by `populate_ext2_files`.
+fn generated_libs_dir(root: &Path) -> PathBuf {
+    root.join("target/generated-libs")
+}
+
+fn ensure_generated_libs_dir(root: &Path) -> PathBuf {
+    let libs = generated_libs_dir(root);
+    fs::create_dir_all(&libs).unwrap_or_else(|e| {
+        panic!(
+            "failed to create generated libs directory {}: {e}",
+            libs.display()
+        );
+    });
+    libs
+}
+
 /// Compile userspace Rust binaries and stage them under target/generated-initrd/.
 ///
 /// Includes Phase 11 test binaries (exit0, fork-test, echo-args) and
@@ -1131,6 +1150,156 @@ fn build_userspace_bins() {
             "userspace: {} → target/generated-initrd/{bin}",
             src.display()
         );
+    }
+}
+
+/// Phase 76 — compile `userspace/ld-musl-x86_64.so.1/` and stage the
+/// resulting PIE ELF under `target/generated-libs/ld-musl-x86_64.so.1`.
+///
+/// The crate name uses underscores (`ld-musl-x86_64-so-1`) because
+/// cargo rejects dots in package names; the staging step renames the
+/// binary to `ld-musl-x86_64.so.1` so the on-disk path matches what
+/// `PT_INTERP` records in test binaries.
+fn build_ldso() {
+    let root = workspace_root();
+    let libs = ensure_generated_libs_dir(&root);
+
+    let status = Command::new(env!("CARGO"))
+        .current_dir(&root)
+        .args([
+            "build",
+            "--release",
+            "--package",
+            "ld-musl-x86_64-so-1",
+            "--bin",
+            "ld-musl-x86_64-so-1",
+            "--target",
+            "x86_64-unknown-none",
+            "-Zbuild-std=core,compiler_builtins",
+            "-Zbuild-std-features=compiler-builtins-mem",
+        ])
+        .status()
+        .expect("failed to invoke cargo build for ld-musl-x86_64-so-1");
+
+    if !status.success() {
+        eprintln!("ld.so build failed");
+        std::process::exit(1);
+    }
+
+    let src = root.join("target/x86_64-unknown-none/release/ld-musl-x86_64-so-1");
+    let dst = libs.join("ld-musl-x86_64.so.1");
+    fs::copy(&src, &dst).unwrap_or_else(|e| {
+        panic!("failed to copy ld.so to {}: {e}", dst.display());
+    });
+    println!("ldso: {} → {}", src.display(), dst.display());
+}
+
+/// Phase 76 — compile `userspace/dynlink_smoke/dynlink-smoke.c` as a
+/// `PT_INTERP`-carrying, `DT_NEEDED`-free dynamic ELF and stage it
+/// under `target/generated-initrd/dynlink_smoke`.
+///
+/// We invoke `musl-gcc` (or `gcc` if musl is unavailable; either
+/// works because the binary uses no libc symbols — only inline-asm
+/// `syscall` instructions) with `-nostdlib -nostartfiles -pie
+/// -Wl,-dynamic-linker=/lib/ld-musl-x86_64.so.1` so the resulting
+/// ELF carries `PT_INTERP` pointing at the Phase 76 linker but has
+/// zero `DT_NEEDED` entries (those land in Phase 76b's `dynlink_hello`).
+///
+/// Falls back to a placeholder if no C compiler is available; the
+/// smoke gate detects the placeholder and emits a SKIP.
+fn build_dynlink_smoke() {
+    let root = workspace_root();
+    let initrd = ensure_generated_initrd_dir(&root);
+    let src = root.join("userspace/dynlink_smoke/dynlink-smoke.c");
+    let dst = initrd.join("dynlink_smoke");
+
+    // Try the musl cross-compiler first, then fall back to host `gcc`
+    // which is fine because the binary uses no libc symbols. The
+    // dynamic-linker hint is the same string in both cases — the
+    // linker only records the path, it does not resolve it at build
+    // time.
+    let cc = find_musl_cc().unwrap_or("gcc");
+
+    let mut cmd = Command::new(cc);
+    cmd.args([
+        "-nostdlib",
+        "-nostartfiles",
+        "-fno-stack-protector",
+        "-fno-pie",
+        "-no-pie",
+    ]);
+    // Re-enable PIE explicitly via -fPIC + linker flags. The two
+    // -no-pie above neutralise gcc's `--enable-default-pie` config
+    // so the next two flags fully determine the output shape.
+    cmd.args([
+        "-fPIC",
+        "-Wl,-pie",
+        "-Wl,-dynamic-linker=/lib/ld-musl-x86_64.so.1",
+        "-Wl,--no-eh-frame-hdr",
+        "-O2",
+        src.to_str().expect("non-UTF-8 path"),
+        "-o",
+        dst.to_str().expect("non-UTF-8 path"),
+    ]);
+
+    // Error handling rationale:
+    //
+    // - **Compiler missing (`Err(NotFound)`)**: SKIP-eligible.  A
+    //   developer machine without `musl-gcc` and without host `gcc`
+    //   cannot run the gate; emit a placeholder so include_bytes! in
+    //   `ramdisk.rs` still finds a file, and the smoke runner will
+    //   detect `st_size == 0` and emit SKIP at runtime.
+    //
+    // - **Compiler ran but exited non-zero**: FATAL.  The toolchain
+    //   is working; a compile/link failure means our source is broken
+    //   and shipping a stale binary would let the smoke gate falsely
+    //   PASS against the previous build's artifact.
+    //
+    // - **Other invoke errors (permission, etc.)**: FATAL for the
+    //   same reason — anything that isn't "the binary isn't on PATH"
+    //   indicates a real environment problem the developer should
+    //   fix before pushing.
+    //
+    // In both placeholder paths we **always overwrite** the file (not
+    // just create-when-missing) so a previous successful build's
+    // binary does not survive into the next smoke run as a stale
+    // artifact.
+    match cmd.status() {
+        Ok(s) if s.success() => {
+            println!("dynlink_smoke: built → {}", dst.display());
+        }
+        Ok(s) => {
+            eprintln!(
+                "error: dynlink_smoke build failed (exit {}). The C source \
+                 compiled previously but does not compile against the current \
+                 toolchain — treating as a hard build error so a stale binary \
+                 cannot let the smoke gate falsely PASS.",
+                s.code().unwrap_or(-1)
+            );
+            // Force-overwrite (not just create-when-missing) so the
+            // stale artifact from a previous successful build cannot
+            // be picked up later.
+            let _ = fs::write(&dst, b"");
+            std::process::exit(1);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "warning: {cc} not found — skipping dynlink_smoke build. \
+                 The dynlink-smoke gate will SKIP at runtime."
+            );
+            // Always truncate so a non-empty stale binary from a
+            // previous build cannot fool the runtime size check.
+            let _ = fs::write(&dst, b"");
+        }
+        Err(e) => {
+            eprintln!(
+                "error: failed to invoke {cc} for dynlink_smoke: {e}. Not a \
+                 missing-binary error — treating as a hard environment \
+                 problem so the developer notices."
+            );
+            let _ = fs::write(&dst, b"");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -2362,6 +2531,13 @@ fn human_size(bytes: u64) -> String {
 fn build_kernel() -> PathBuf {
     let root = workspace_root();
     build_userspace_bins();
+    // Phase 76 — build ld.so before the musl binaries; the
+    // `dynlink_smoke` musl binary's PT_INTERP refers to
+    // `/lib/ld-musl-x86_64.so.1`, but the on-disk staging happens
+    // in `populate_ext2_files`. Building here just produces the
+    // file under `target/generated-libs/`.
+    build_ldso();
+    build_dynlink_smoke();
     build_musl_bins();
     // Phase 44: cross-compile musl-linked Rust userspace programs.
     build_musl_rust_bins();
@@ -3482,6 +3658,12 @@ fn normalize_run_qemu_exit(code: Option<i32>) -> i32 {
 fn cmd_check() {
     let root = workspace_root();
     build_userspace_bins();
+    // Phase 76 — the dynamic linker is a PIE crate that lives outside
+    // the static `bins` table; build it explicitly so `xtask check`
+    // proves it still compiles. `build_dynlink_smoke` likewise builds
+    // the C smoke binary that exercises the kernel → ld.so handoff.
+    build_ldso();
+    build_dynlink_smoke();
     build_musl_bins();
     // Phase 44: cross-compile musl-linked Rust userspace programs.
     build_musl_rust_bins();
@@ -3539,6 +3721,8 @@ fn cmd_check() {
         "nvme_driver",
         // Phase 56 Track B.4 — userspace surface-buffer helper
         "surface_buffer",
+        // Phase 76 Track E — dynamic linker (no_std PIE).
+        "ld-musl-x86_64-so-1",
     ];
     let mut clippy_args = vec![
         "clippy".to_string(),
@@ -5228,6 +5412,20 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         pattern: "SMOKE:wx-violation:PASS",
         timeout_secs: 20,
         label: "guest/wx-violation: smoke runner verified W^X mprotect guard",
+    });
+    // Phase 76 — kernel PT_INTERP + ld.so transfer-only stub
+    // round-trip. The smoke-runner execs `/bin/dynlink_smoke`
+    // (musl-built dynamic ELF, no DT_NEEDED) and waits for
+    // `DYNLINK_SMOKE:PASS` on stderr. Wait for one of two terminal
+    // patterns: PASS when the smoke gate completed, or SKIP when no
+    // C toolchain was available at build time (empty placeholder).
+    steps.push(SmokeStep::WaitEither {
+        pattern_a: "SMOKE:dynlink-smoke:PASS",
+        pattern_b: "SMOKE:dynlink-smoke:SKIP",
+        timeout_secs: 30,
+        label: "guest/dynlink-smoke: kernel PT_INTERP + ld.so handoff verified or skipped",
+        extra_steps_a: &[],
+        extra_steps_b: &[],
     });
     steps.push(SmokeStep::Wait {
         pattern: "SMOKE:PASS",
@@ -11098,6 +11296,26 @@ fn populate_ext2_files(
     let empty_content = "";
     let udp_smoke_bin = generated_initrd_dir(&workspace_root()).join("udp-smoke");
 
+    // Phase 76 — `/lib/ld-musl-x86_64.so.1` source path. Built by
+    // `build_ldso()` into `target/generated-libs/`. The on-disk
+    // staging block below mkdirs `/lib`, writes the binary, and
+    // chmods it executable so the kernel's `PT_INTERP` branch can
+    // open it.
+    //
+    // If the file is missing (someone ran `populate_ext2_files`
+    // without going through `build_kernel`), treat it as a hard
+    // error — booting without the linker means every dynamically
+    // linked binary fails with ENOENT, which is exactly what the
+    // Phase 76 smoke gate exists to prevent.
+    let ldso_bin = generated_libs_dir(&workspace_root()).join("ld-musl-x86_64.so.1");
+    assert!(
+        ldso_bin.exists(),
+        "Phase 76 — ld.so missing at {}; was `build_ldso()` skipped? \
+         Run `cargo xtask run` or `cargo xtask image` instead of \
+         invoking populate_ext2_files directly.",
+        ldso_bin.display(),
+    );
+
     // Phase 69 Track A — compile the `m3os-term` terminfo entry so a binary
     // copy can be staged at `/usr/share/terminfo/m/m3os-term` inside the
     // data disk. Returns the path to the compiled `m3os-term` file. Treats
@@ -11557,6 +11775,7 @@ fn populate_ext2_files(
         "mkdir bin\n\
          mkdir sbin\n\
          mkdir etc\n\
+         mkdir lib\n\
          mkdir root\n\
          mkdir home\n\
          mkdir home/user\n\
@@ -11573,6 +11792,13 @@ fn populate_ext2_files(
          mkdir tmp\n\
          mkdir var\n\
          mkdir dev\n\
+         write \"{ldso_bin}\" lib/ld-musl-x86_64.so.1\n\
+         sif lib mode 0x41ED\n\
+         sif lib uid 0\n\
+         sif lib gid 0\n\
+         sif lib/ld-musl-x86_64.so.1 mode 0x81ED\n\
+         sif lib/ld-musl-x86_64.so.1 uid 0\n\
+         sif lib/ld-musl-x86_64.so.1 gid 0\n\
          write \"{passwd}\" etc/passwd\n\
          write \"{shadow}\" etc/shadow\n\
          write \"{group}\" etc/group\n\
@@ -11812,6 +12038,9 @@ fn populate_ext2_files(
         readback_cmds = readback_cmds,
         inject_key_cmds = inject_key_cmds,
         udp_smoke_bin = udp_smoke_bin.display(),
+        // Phase 76 — host path of the staged dynamic linker; written
+        // to `/lib/ld-musl-x86_64.so.1` on the ext2 disk.
+        ldso_bin = ldso_bin.display(),
         terminfo_bin = terminfo_bin.display(),
         font_src = font_src.display(),
     );

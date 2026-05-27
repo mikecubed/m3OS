@@ -116,7 +116,13 @@ reason about.
 ## Deferred Until Later
 
 - copy-on-write page faults
-- dynamic linking and `ld.so`
+- dynamic linking and `ld.so` — **Kernel `PT_INTERP` branch + auxv
+  `AT_BASE`/`AT_ENTRY` delivered in [Phase 76](./76-dynamic-linker.md)**;
+  the userspace `ld.so` is currently a transfer-only stub (it walks the
+  auxv for `AT_ENTRY` and `jmp`s). Real `DT_NEEDED` resolution +
+  relocation application + `dlopen` land in
+  [Phase 76b](./76b-dynamic-linker-bringup.md) /
+  [76c](./76c-dlopen.md) / [76d](./76d-dynamic-linker-polish.md).
 - process groups and sessions
 - `clone` with shared address spaces (threads)
 - `ptrace` and debugging support

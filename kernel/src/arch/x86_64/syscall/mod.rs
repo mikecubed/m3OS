@@ -4708,24 +4708,64 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     };
     let envp_refs: alloc::vec::Vec<&[u8]> = user_envp.iter().map(|v| v.as_slice()).collect();
 
+    // Phase 76: thread the on-disk interpreter reader through so
+    // `PT_INTERP` is honored. The closure tries the ramdisk first
+    // (the linker may live there too for early-boot smoke tests) and
+    // falls back to the ext2/tmpfs/fat32 path used for the main
+    // binary. Returning `None` propagates `ElfError::InterpreterNotFound`
+    // from `load_elf_into_with_interp`, which the dedicated match arm
+    // below surfaces to userspace as `NEG_ENOENT` (POSIX execve(2)
+    // semantics for a missing interpreter). The other ELF-load error
+    // paths still surface as `NEG_ENOEXEC`.
+    let interp_reader = |path: &str| -> Option<alloc::vec::Vec<u8>> {
+        // Try the ramdisk first — the linker may be staged there for
+        // early-boot smoke tests where the ext2 disk is not yet
+        // mounted. ramdisk_lookup accepts paths with or without a
+        // leading slash.
+        if let Some(crate::fs::ramdisk::RamdiskNode::File { content }) =
+            crate::fs::ramdisk::ramdisk_lookup(path)
+        {
+            return Some(content.to_vec());
+        }
+        read_file_from_disk(path).ok()
+    };
+    let interp_reader_dyn: crate::mm::elf::InterpReader<'_> = &interp_reader;
+
     let (loaded, user_rsp) = {
         // SAFETY: new_cr3 is freshly allocated; no other mapper exists.
         let mut mapper = unsafe { crate::mm::mapper_for_frame(new_cr3) };
-        let loaded =
-            match unsafe { crate::mm::elf::load_elf_into(&mut mapper, phys_off, data, name) } {
-                Ok(l) => l,
-                Err(crate::mm::elf::ElfError::OutOfFrames) => {
-                    log::warn!("[execve] ELF load OOM for {}", name);
-                    return NEG_ENOMEM;
-                }
-                Err(e) => {
-                    // Phase 75: an invalid ELF (including the new PF_W|PF_X
-                    // W^X-violation rejection) surfaces to userspace as ENOEXEC,
-                    // matching POSIX semantics for execve(2).
-                    log::warn!("[execve] ELF load failed for {}: {:?}", name, e);
-                    return NEG_ENOEXEC;
-                }
-            };
+        let loaded = match unsafe {
+            crate::mm::elf::load_elf_into_with_interp(
+                &mut mapper,
+                phys_off,
+                data,
+                name,
+                Some(interp_reader_dyn),
+            )
+        } {
+            Ok(l) => l,
+            Err(crate::mm::elf::ElfError::OutOfFrames) => {
+                log::warn!("[execve] ELF load OOM for {}", name);
+                return NEG_ENOMEM;
+            }
+            Err(crate::mm::elf::ElfError::InterpreterNotFound) => {
+                // Phase 76: POSIX execve(2) returns ENOENT when the
+                // binary's dynamic linker is missing — this is what
+                // shells observe when they try to run an unsupported
+                // binary on a system without the right libc.so /
+                // ld.so combination, and it is distinct from ENOEXEC
+                // (which means "the bytes aren't a valid executable").
+                log::warn!("[execve] PT_INTERP target missing for {}", name);
+                return NEG_ENOENT;
+            }
+            Err(e) => {
+                // Phase 75: an invalid ELF (including the new PF_W|PF_X
+                // W^X-violation rejection) surfaces to userspace as ENOEXEC,
+                // matching POSIX semantics for execve(2).
+                log::warn!("[execve] ELF load failed for {}: {:?}", name, e);
+                return NEG_ENOEXEC;
+            }
+        };
         // SAFETY: stack pages were just mapped by load_elf_into; mapper is valid.
         let user_rsp = match unsafe {
             crate::mm::elf::setup_abi_stack_with_envp(
@@ -7081,7 +7121,7 @@ fn is_directory(path: &str) -> bool {
 /// failure (e.g. `NEG_ENOENT` if not found, `NEG_E2BIG` if too large).
 const NEG_E2BIG: u64 = (-7_i64) as u64;
 
-fn read_file_from_disk(path: &str) -> Result<alloc::vec::Vec<u8>, u64> {
+pub(crate) fn read_file_from_disk(path: &str) -> Result<alloc::vec::Vec<u8>, u64> {
     /// Maximum executable size we can safely materialize in one reclaimable
     /// kernel heap allocation with the current page-backed large-allocation path.
     const MAX_EXEC_SIZE: usize = crate::mm::heap::max_page_backed_allocation_bytes();
