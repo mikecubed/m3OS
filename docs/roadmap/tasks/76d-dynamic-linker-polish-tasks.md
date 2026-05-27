@@ -10,7 +10,7 @@
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
 | S1 | `sym.rs` refactor — unified `lookup(scope, name, version)` API over the 76b `DT_HASH` backend + route 76b runtime reloc write-sites through `ldso_core::reloc` slice helpers | Phase 76b, 76c | ✅ Complete |
-| D1 | `DT_GNU_HASH` Bloom + bucket + chain lookup; dispatcher prefers GNU over SysV | S1 ✅ | In Progress |
+| D1 | `DT_GNU_HASH` Bloom + bucket + chain lookup; dispatcher prefers GNU over SysV | S1 ✅ | ✅ Complete (end-to-end gate ships with F) |
 | D2 | `DT_VERSYM` / `DT_VERNEED` / `DT_VERDEF` graceful handling | D1 | Planned |
 | B4 | `_dl_runtime_resolve` asm trampoline + GOT slot rewrite + lazy `JUMP_SLOT` deferral | S1 ✅ | In Progress |
 | E4 | `LD_BIND_NOW` environment variable honored | B4 | Planned |

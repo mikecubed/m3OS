@@ -10,9 +10,10 @@
 //! * `run_constructors` — deepest-first walker (B5.1).
 
 use crate::elf64::{
-    DT_FINI, DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_HASH, DT_INIT, DT_INIT_ARRAY, DT_INIT_ARRAYSZ,
-    DT_JMPREL, DT_NEEDED, DT_NULL, DT_PLTREL, DT_PLTRELSZ, DT_RELA, DT_RELAENT, DT_RELASZ,
-    DT_SONAME, DT_STRSZ, DT_STRTAB, DT_SYMENT, DT_SYMTAB, Dyn, Sym,
+    DT_FINI, DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_GNU_HASH, DT_HASH, DT_INIT, DT_INIT_ARRAY,
+    DT_INIT_ARRAYSZ, DT_JMPREL, DT_NEEDED, DT_NULL, DT_PLTREL, DT_PLTRELSZ, DT_RELA, DT_RELAENT,
+    DT_RELASZ, DT_SONAME, DT_STRSZ, DT_STRTAB, DT_SYMENT, DT_SYMTAB, DT_VERDEF, DT_VERDEFNUM,
+    DT_VERNEED, DT_VERNEEDNUM, DT_VERSYM, Dyn, Sym,
 };
 use core::ptr::NonNull;
 
@@ -61,6 +62,28 @@ pub struct DynamicSection {
     pub fini_arraysz: u64,
     /// `DT_HASH` — address of the SysV hash table.
     pub hash: Option<NonNull<u32>>,
+    /// `DT_GNU_HASH` (Phase 76d.D1) — address of the GNU hash table
+    /// header. The layout is `[nbuckets, symoffset, bloom_size,
+    /// bloom_shift] u32` followed by `[u64; bloom_size]` followed by
+    /// `[u32; nbuckets]` (buckets) followed by `[u32; …]` (hashes).
+    /// Absent when the DSO was built with `--hash-style=sysv` (the
+    /// Phase 76b default).
+    pub gnu_hash: Option<NonNull<u32>>,
+    /// `DT_VERSYM` (Phase 76d.D2) — `Elf64_Half` (u16) per
+    /// dynsym entry indexing into `DT_VERDEF` / `DT_VERNEED`. Absent
+    /// when the DSO is unversioned (the Phase 76b/c default).
+    pub versym: Option<NonNull<u16>>,
+    /// `DT_VERDEF` (Phase 76d.D2) — first `Verdef` record. Absent when
+    /// the DSO defines no versioned symbols.
+    pub verdef: Option<NonNull<u8>>,
+    /// `DT_VERDEFNUM` — number of `Verdef` records.
+    pub verdefnum: u64,
+    /// `DT_VERNEED` (Phase 76d.D2) — first `Verneed` record. Absent
+    /// when the DSO requires no versioned symbols from its
+    /// dependencies.
+    pub verneed: Option<NonNull<u8>>,
+    /// `DT_VERNEEDNUM` — number of `Verneed` records.
+    pub verneednum: u64,
     /// `DT_SONAME` — offset into `strtab` of the library's `SONAME`,
     /// or `u64::MAX` if absent (no `NonNull` here because zero is a
     /// legal offset).
@@ -94,6 +117,12 @@ impl DynamicSection {
             fini_array: None,
             fini_arraysz: 0,
             hash: None,
+            gnu_hash: None,
+            versym: None,
+            verdef: None,
+            verdefnum: 0,
+            verneed: None,
+            verneednum: 0,
             soname: u64::MAX,
             needed: [0; MAX_NEEDED],
             n_needed: 0,
@@ -159,6 +188,22 @@ impl DynamicSection {
                     out.fini_array = NonNull::new((entry.d_val.wrapping_add(load_bias)) as *mut u8);
                 }
                 DT_FINI_ARRAYSZ => out.fini_arraysz = entry.d_val,
+                // Phase 76d.D1 — GNU hash table.
+                DT_GNU_HASH => {
+                    out.gnu_hash = NonNull::new((entry.d_val.wrapping_add(load_bias)) as *mut u32);
+                }
+                // Phase 76d.D2 — symbol versioning.
+                DT_VERSYM => {
+                    out.versym = NonNull::new((entry.d_val.wrapping_add(load_bias)) as *mut u16);
+                }
+                DT_VERDEF => {
+                    out.verdef = NonNull::new((entry.d_val.wrapping_add(load_bias)) as *mut u8);
+                }
+                DT_VERDEFNUM => out.verdefnum = entry.d_val,
+                DT_VERNEED => {
+                    out.verneed = NonNull::new((entry.d_val.wrapping_add(load_bias)) as *mut u8);
+                }
+                DT_VERNEEDNUM => out.verneednum = entry.d_val,
                 _ => {} // unknown tag — ignore per SysV ELF spec
             }
         }

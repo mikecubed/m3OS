@@ -502,6 +502,29 @@ fn validate_dyn_pointers(
         // before lookup_symbol dereferences it.
         return Err("DT_HASH header outside image");
     }
+    if let Some(p) = d.gnu_hash
+        && !range_in_image(p.as_ptr() as u64, 16)
+    {
+        // Phase 76d.D1 — need at least the 16-byte (nbuckets,
+        // symoffset, bloom_size, bloom_shift) header in range before
+        // `sym::lookup_gnu` reads it.
+        return Err("DT_GNU_HASH header outside image");
+    }
+    if let Some(p) = d.versym
+        && !in_image(p.as_ptr() as u64)
+    {
+        return Err("DT_VERSYM outside image");
+    }
+    if let Some(p) = d.verdef
+        && !in_image(p.as_ptr() as u64)
+    {
+        return Err("DT_VERDEF outside image");
+    }
+    if let Some(p) = d.verneed
+        && !in_image(p.as_ptr() as u64)
+    {
+        return Err("DT_VERNEED outside image");
+    }
     if let Some(p) = d.rela
         && !range_in_image(p.as_ptr() as u64, d.relasz)
     {

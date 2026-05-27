@@ -80,6 +80,20 @@ pub const DT_INIT_ARRAYSZ: i64 = 27;
 pub const DT_FINI_ARRAYSZ: i64 = 28;
 
 // ---------------------------------------------------------------------------
+// Phase 76d.D2 — symbol versioning tags.
+// ---------------------------------------------------------------------------
+pub const DT_VERSYM: i64 = 0x6FFFFFF0;
+pub const DT_VERDEF: i64 = 0x6FFFFFFC;
+pub const DT_VERDEFNUM: i64 = 0x6FFFFFFD;
+pub const DT_VERNEED: i64 = 0x6FFFFFFE;
+pub const DT_VERNEEDNUM: i64 = 0x6FFFFFFF;
+
+// ---------------------------------------------------------------------------
+// Phase 76d.D1 — GNU hash table tag.
+// ---------------------------------------------------------------------------
+pub const DT_GNU_HASH: i64 = 0x6FFFFEF5;
+
+// ---------------------------------------------------------------------------
 // Program-header types.
 // ---------------------------------------------------------------------------
 
