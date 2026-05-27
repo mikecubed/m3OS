@@ -279,14 +279,21 @@ unsafe fn dl_relocate_self(phdr_base: *const Phdr, phnum: usize, load_bias: u64)
     let n = (relasz / 24) as usize; // sizeof(Rela) == 24
     for i in 0..n {
         let r = unsafe { *rela.add(i) };
-        if r_type(r.r_info) == R_X86_64_RELATIVE {
+        let t = r_type(r.r_info);
+        if t == R_X86_64_RELATIVE {
             let target = (load_bias.wrapping_add(r.r_offset)) as *mut u64;
             let value = load_bias.wrapping_add(r.r_addend as u64);
             unsafe { core::ptr::write(target, value) };
+        } else {
+            // Any other relocation type in the linker's own image is
+            // a build-time bug — the bring-up linker is built with
+            // `-Bsymbolic`-style flags so only R_X86_64_RELATIVE
+            // should appear in its own DT_RELA. Shout via serial and
+            // halt: if we kept going we would later read through an
+            // unrelocated GOT slot and crash with no diagnostic.
+            serial(b"ldso: dl_relocate_self: unexpected relocation type in linker image\n");
+            sys_exit(ELIBBAD_CODE);
         }
-        // Any other relocation type in the linker's own image is a
-        // build-time bug — shouting via serial is the most diagnostic
-        // thing we can do before things go off the rails.
     }
 }
 
@@ -308,6 +315,26 @@ impl LoadedDso {
             dyn_: DynamicSection::empty(),
         }
     }
+}
+
+/// Validate the entry-size and PLT-flavour invariants Phase 76b
+/// silently relied on when dividing `relasz`/`pltrelsz` by 24.
+/// All three tags are optional — when absent (`0`), the matching
+/// table is also absent, so no division occurs. When present, they
+/// must match the canonical x86_64 values (`Rela`/`Sym` are 24 bytes
+/// and Phase 76b only resolves `DT_RELA`-flavoured PLT entries).
+/// Returns a static error string identifying which invariant failed.
+fn validate_dyn_invariants(d: &DynamicSection) -> Result<(), &'static str> {
+    if d.relaent != 0 && d.relaent != 24 {
+        return Err("DT_RELAENT != 24");
+    }
+    if d.syment != 0 && d.syment != 24 {
+        return Err("DT_SYMENT != 24");
+    }
+    if d.pltrel != 0 && d.pltrel != ldso_core::elf64::DT_RELA {
+        return Err("DT_PLTREL != DT_RELA");
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -415,6 +442,7 @@ unsafe fn load_dso(path_bytes: &[u8]) -> Result<LoadedDso, LoadError> {
     let scratch_buf =
         unsafe { core::slice::from_raw_parts_mut(scratch as *mut u8, scratch_len as usize) };
     let mut total = 0usize;
+    let mut truncated = false;
     loop {
         let n = sys_read(fd, &mut scratch_buf[total..]);
         if n < 0 {
@@ -426,10 +454,21 @@ unsafe fn load_dso(path_bytes: &[u8]) -> Result<LoadedDso, LoadError> {
         }
         total += n as usize;
         if total >= scratch_buf.len() {
+            // Buffer is full. Probe for one more byte to distinguish
+            // "file is exactly scratch_len" from "file is larger and
+            // would be silently truncated". A non-zero return from
+            // this read means the file kept going past our buffer —
+            // refuse to parse a truncated image.
+            let mut probe = [0u8; 1];
+            let extra = sys_read(fd, &mut probe);
+            truncated = extra > 0;
             break;
         }
     }
     sys_close(fd);
+    if truncated {
+        return Err(LoadError::Other("DSO larger than 64 KiB scratch"));
+    }
     if total < core::mem::size_of::<Ehdr>() {
         return Err(LoadError::Other("file too small"));
     }
@@ -439,6 +478,18 @@ unsafe fn load_dso(path_bytes: &[u8]) -> Result<LoadedDso, LoadError> {
     }
     let phoff = ehdr.e_phoff;
     let phnum = ehdr.e_phnum as usize;
+    // Bounds-check the program-header table against the bytes we
+    // actually read. A malformed or truncated ELF must not cause
+    // out-of-bounds reads while iterating PHDRs below.
+    let phdr_bytes = phnum
+        .checked_mul(core::mem::size_of::<Phdr>())
+        .ok_or(LoadError::Other("phnum*sizeof(Phdr) overflow"))?;
+    let phdr_end = (phoff as usize)
+        .checked_add(phdr_bytes)
+        .ok_or(LoadError::Other("phoff+phdr_bytes overflow"))?;
+    if phdr_end > total {
+        return Err(LoadError::Other("PHDR table outside scratch"));
+    }
     let phdr_base = (scratch as u64 + phoff) as *const Phdr;
 
     // Pass 1: compute total in-memory image span.
@@ -478,6 +529,16 @@ unsafe fn load_dso(path_bytes: &[u8]) -> Result<LoadedDso, LoadError> {
         let ph = unsafe { *phdr_base.add(i) };
         if ph.p_type != PT_LOAD {
             continue;
+        }
+        // Bounds-check the file range against the bytes we actually
+        // read. A malformed ELF whose PT_LOAD references data past
+        // the scratch buffer would otherwise cause an out-of-bounds
+        // read during copy_nonoverlapping.
+        let seg_end = (ph.p_offset as usize)
+            .checked_add(ph.p_filesz as usize)
+            .ok_or(LoadError::Other("p_offset+p_filesz overflow"))?;
+        if seg_end > total {
+            return Err(LoadError::Other("PT_LOAD file range outside scratch"));
         }
         let src = (scratch as u64 + ph.p_offset) as *const u8;
         let dst = (load_bias + ph.p_vaddr) as *mut u8;
@@ -877,8 +938,25 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
                 sys_exit(ENOENT_CODE);
             }
         };
+        // Resolve the loaded DSO's actual DT_SONAME (if present) so
+        // dedup is keyed on the library's self-identified name, not
+        // the DT_NEEDED string the parent happened to use. Falls back
+        // to the requested DT_NEEDED string when DT_SONAME is absent.
+        let display_name: &[u8] = if loaded.dyn_.soname != u64::MAX {
+            let strtab_p = match loaded.dyn_.strtab {
+                Some(p) => p.as_ptr(),
+                None => core::ptr::null(),
+            };
+            if !strtab_p.is_null() {
+                unsafe { strtab_get(strtab_p, loaded.dyn_.soname, loaded.dyn_.strsz) }
+            } else {
+                name
+            }
+        } else {
+            name
+        };
         let new_idx = dsos.len();
-        if dsos.push(loaded).is_err() || loaded_names.push(name).is_err() {
+        if dsos.push(loaded).is_err() || loaded_names.push(display_name).is_err() {
             serial(b"ldso: too many DSOs\n");
             sys_exit(ELIBBAD_CODE);
         }
@@ -929,6 +1007,25 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
     }
     let _ = MAX_NEEDED;
     let _ = DsoId(0);
+
+    // -- Validate entry-size invariants across main + every loaded DSO.
+    // The reloc passes below divide `relasz` / `pltrelsz` by 24 and
+    // assume DT_PLTREL == DT_RELA. Catch any DSO that breaks those
+    // invariants before we trust the resulting entry counts.
+    if let Err(why) = validate_dyn_invariants(&main_dyn_section) {
+        serial(b"ldso: main DT_* invariant failed: ");
+        serial(why.as_bytes());
+        serial(b"\n");
+        sys_exit(ELIBBAD_CODE);
+    }
+    for i in 1..dsos.len() {
+        if let Err(why) = validate_dyn_invariants(&dsos[i].dyn_) {
+            serial(b"ldso: DSO DT_* invariant failed: ");
+            serial(why.as_bytes());
+            serial(b"\n");
+            sys_exit(ELIBBAD_CODE);
+        }
+    }
 
     // -- Apply relocations against the main binary --------------------------
     if let Some(rela) = main_dyn_section.rela {

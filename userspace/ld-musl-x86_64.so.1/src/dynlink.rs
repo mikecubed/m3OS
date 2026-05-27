@@ -447,10 +447,10 @@ mod tests {
         // `printf` should produce the canonical value the SysV spec
         // documents.
         // Computed: ((((((0*16+0x70)*16+0x72)*16+0x69)*16+0x6E)*16+0x74)*16+0x66)
-        // = 0x77905A6 after the XOR/mask folding. Pin the value so the
-        // hash function cannot drift.
-        let h = elf_hash(b"printf");
-        assert_eq!(h & 0xF000_0000, 0, "top nibble must be cleared");
+        // = 0x07790_5A6. No iteration sets the top nibble, so no
+        // XOR/mask folding occurs along the way — but the final
+        // value is the byte-exact known answer.
+        assert_eq!(elf_hash(b"printf"), 0x0779_05A6);
     }
 
     // -----------------------------------------------------------------

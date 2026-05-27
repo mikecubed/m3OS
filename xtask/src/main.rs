@@ -1457,17 +1457,19 @@ fn build_dynlink_hello() {
 /// and `libcycb.so` with mutual `DT_NEEDED` entries. The cycle is
 /// created by a three-step build:
 ///
-/// 1. `libcyca_stub.so` — `cyca.c_stub` returning 0, no DT_NEEDED.
-///    Built first so libcycb.so has something to link against.
-/// 2. `libcycb.so` — `cycb.c` linked against `libcyca_stub.so`, so
-///    its DT_NEEDED records `libcyca.so`.
-/// 3. `libcyca.so` — `cyca.c` (calls cycb_func) linked against
+/// 1. Stub `libcyca.so` — `cyca_stub.c` returning 0, no DT_NEEDED,
+///    `DT_SONAME=libcyca.so`. Written to `target/cycle-stub/libcyca.so`
+///    (not staged) so libcycb.so has something to link against.
+/// 2. `libcycb.so` — `cycb.c` linked against the stub `libcyca.so`,
+///    so its DT_NEEDED records `libcyca.so`.
+/// 3. Final `libcyca.so` — `cyca.c` (calls cycb_func) linked against
 ///    `libcycb.so`, so its DT_NEEDED records `libcycb.so`. This
-///    final binary REPLACES `libcyca_stub.so` and is the one staged
-///    on disk; together with `libcycb.so` it closes the cycle.
+///    final binary supersedes the stub and is the one staged on
+///    disk; together with `libcycb.so` it closes the cycle.
 ///
-/// `libcyca_stub.so` is intentionally never staged — it exists only
-/// as a link-time placeholder under `target/cycle-stub/`.
+/// The stub artifact at `target/cycle-stub/libcyca.so` is
+/// intentionally never staged — it exists only as a link-time
+/// placeholder.
 fn build_cycle_libs() -> Result<(), io::Error> {
     let root = workspace_root();
     let libs = ensure_generated_libs_dir(&root);
@@ -1484,7 +1486,9 @@ fn build_cycle_libs() -> Result<(), io::Error> {
     let cycb_so = libs.join("libcycb.so");
     let cyca_so = libs.join("libcyca.so");
 
-    // Step 1: build libcyca_stub.so with SONAME=libcyca.so.
+    // Step 1: build the cycle-stub libcyca.so (in target/cycle-stub/)
+    // with DT_SONAME=libcyca.so. This is the link-time placeholder
+    // that libcycb.so binds against.
     {
         let mut cmd = Command::new(cc);
         cmd.args([
@@ -1500,14 +1504,14 @@ fn build_cycle_libs() -> Result<(), io::Error> {
         let out = cmd.output()?;
         if !out.status.success() {
             eprintln!(
-                "libcyca_stub.so build failed: {}",
+                "cycle-stub libcyca.so build failed: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
             return Err(io::Error::other("stub build failed"));
         }
     }
 
-    // Step 2: build libcycb.so linking against libcyca_stub.so.
+    // Step 2: build libcycb.so linking against the cycle-stub libcyca.so.
     {
         let mut cmd = Command::new(cc);
         cmd.args([

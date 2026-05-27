@@ -13,10 +13,12 @@
  *   musl-gcc -fPIC -Wl,-pie -lhello -Wl,-rpath,/usr/lib \
  *     -Wl,--hash-style=sysv -nostartfiles
  *
- * The `_start` entry exits via `SYS_EXIT_GROUP` so the kernel
- * registers a normal termination — Phase 76b's ld.so transfers
- * control to this function via the AT_ENTRY auxv slot after
- * applying all relocations and running constructors.
+ * The `_start` entry exits via the raw `SYS_exit` syscall (Linux
+ * syscall number 60 — single-thread exit, not `exit_group`); the
+ * Phase 76b smoke binary is single-threaded so this is equivalent
+ * to a normal termination. Phase 76b's ld.so transfers control to
+ * this function via the AT_ENTRY auxv slot after applying all
+ * relocations and running constructors.
  */
 
 #include "../lib/libhello/hello.h"
