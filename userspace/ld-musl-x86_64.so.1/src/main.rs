@@ -63,7 +63,7 @@ use ldso_core::elf64::{
     DT_NULL, Dyn, PT_DYNAMIC, PT_LOAD, Phdr, R_X86_64_64, R_X86_64_GLOB_DAT, R_X86_64_JUMP_SLOT,
     R_X86_64_RELATIVE, Rela, Sym, r_sym, r_type,
 };
-use ldso_core::reloc::{apply_abs64, apply_glob_dat, apply_relative};
+use ldso_core::reloc::apply_abs64;
 
 // ---------------------------------------------------------------------------
 // AT_* constants (subset we read).
@@ -360,6 +360,89 @@ fn validate_dyn_invariants(d: &DynamicSection) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Validate that every pointer carried by `PT_DYNAMIC` lies inside
+/// the DSO's mapped image span `[load_bias, load_bias + image_len)`.
+///
+/// A malformed (or attacker-controlled) DSO can place arbitrary
+/// values in `DT_STRTAB` / `DT_SYMTAB` / `DT_HASH` / `DT_RELA` /
+/// `DT_JMPREL` / `DT_INIT` / `DT_INIT_ARRAY`.  Without this check,
+/// `strtab_get` / `strlen_bounded` / `lookup_symbol` / `apply_rela` /
+/// `run_constructors` would happily dereference pointers pointing
+/// into unrelated process memory — leaking data via the serial log
+/// or corrupting the heap.
+///
+/// For sized tags (`strtab + strsz`, `rela + relasz`, `jmprel +
+/// pltrelsz`, `init_array + init_arraysz`) the full range must fit.
+/// For pointer-only tags (`symtab`, `hash`, `init`) the base must lie
+/// inside the span and (for `hash`) at least the 8-byte header
+/// (`nbuckets`/`nchain`) must fit.  `init_arraysz`-clear is treated
+/// the same way: no upper bound to enforce.
+///
+/// `image_len == 0` is the placeholder-`LoadedDso` shape — the check
+/// is skipped (no bounds known).  Every real-runtime construction
+/// site populates `image_len`.
+fn validate_dyn_pointers(
+    d: &DynamicSection,
+    load_bias: u64,
+    image_len: u64,
+) -> Result<(), &'static str> {
+    if image_len == 0 {
+        return Ok(());
+    }
+    let image_end = load_bias.wrapping_add(image_len);
+    // Inclusive-base, exclusive-end: the address must satisfy
+    // `load_bias <= ptr < image_end`.
+    let in_image = |ptr: u64| ptr >= load_bias && ptr < image_end;
+    // Sized range: `[base, base + size)` must lie within the image.
+    let range_in_image = |base: u64, size: u64| {
+        if !in_image(base) {
+            return false;
+        }
+        match base.checked_add(size) {
+            Some(end) => end <= image_end,
+            None => false,
+        }
+    };
+    if let Some(p) = d.strtab
+        && !range_in_image(p.as_ptr() as u64, d.strsz)
+    {
+        return Err("DT_STRTAB + DT_STRSZ outside image");
+    }
+    if let Some(p) = d.symtab
+        && !in_image(p.as_ptr() as u64)
+    {
+        return Err("DT_SYMTAB outside image");
+    }
+    if let Some(p) = d.hash
+        && !range_in_image(p.as_ptr() as u64, 8)
+    {
+        // Need at least the 8-byte (nbuckets,nchain) header in range
+        // before lookup_symbol dereferences it.
+        return Err("DT_HASH header outside image");
+    }
+    if let Some(p) = d.rela
+        && !range_in_image(p.as_ptr() as u64, d.relasz)
+    {
+        return Err("DT_RELA + DT_RELASZ outside image");
+    }
+    if let Some(p) = d.jmprel
+        && !range_in_image(p.as_ptr() as u64, d.pltrelsz)
+    {
+        return Err("DT_JMPREL + DT_PLTRELSZ outside image");
+    }
+    if let Some(p) = d.init
+        && !in_image(p.as_ptr() as u64)
+    {
+        return Err("DT_INIT outside image");
+    }
+    if let Some(p) = d.init_array
+        && !range_in_image(p.as_ptr() as u64, d.init_arraysz)
+    {
+        return Err("DT_INIT_ARRAY + DT_INIT_ARRAYSZ outside image");
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // String-table helpers (raw pointer reads inside the loaded image).
 // ---------------------------------------------------------------------------
@@ -636,15 +719,36 @@ unsafe fn load_dso_impl(fd: i64, scratch: u64, scratch_len: u64) -> Result<Loade
     }
     let mut entries: heapless::Vec<Dyn, 64> = heapless::Vec::new();
     let mut p = dyn_ptr;
+    // Track whether we actually observed DT_NULL inside the 64-entry
+    // cap. If the loop fills without seeing DT_NULL, the dynamic
+    // section is larger than this loader supports and parsing
+    // whatever we have would silently drop tags — return an error
+    // instead so the caller can fail with ELIBBAD.
+    let mut saw_null = false;
     while entries.len() < 64 {
         let e = unsafe { *p };
         let _ = entries.push(e);
         if e.d_tag == DT_NULL {
+            saw_null = true;
             break;
         }
         p = unsafe { p.add(1) };
     }
+    if !saw_null {
+        return Err(LoadError::Other("PT_DYNAMIC too large (>64 entries)"));
+    }
     let dyn_ = DynamicSection::parse(&entries, load_bias);
+    // Reject DSOs whose dynamic-section pointer tags reference memory
+    // outside the mapped image span.  Without this, downstream
+    // `strtab_get` / `lookup_symbol` / `apply_rela` /
+    // `run_constructors` would dereference attacker-controlled
+    // pointers into unrelated process memory.
+    if let Err(why) = validate_dyn_pointers(&dyn_, load_bias, image_len) {
+        serial(b"ldso: DSO dynamic-pointer bounds check failed: ");
+        serial(why.as_bytes());
+        serial(b"\n");
+        return Err(LoadError::Other("dynamic pointer outside image"));
+    }
     Ok(LoadedDso {
         load_bias,
         image_len,
@@ -780,8 +884,6 @@ unsafe fn apply_rela(
                 };
                 apply_abs64(&dummy_rela, 0, value, &mut buf).map_err(|_| "abs64 failed")?;
                 img.copy_from_slice(&buf);
-                let _ = apply_relative;
-                let _ = apply_glob_dat;
             }
             _ => {
                 serial(b"ldso: unsupported reloc type ");
@@ -946,20 +1048,41 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
     if main_dyn.is_null() {
         return at_entry; // static binary — just transfer through
     }
-    // Build a slice view of main's dynamic section.
+    // Build a slice view of main's dynamic section. Same truncation
+    // guard as `load_dso_impl`: if the loop fills 64 entries without
+    // observing DT_NULL, the binary's dynamic section exceeds what
+    // this loader supports and silently truncating would drop tags
+    // (causing confusing downstream failures).  Hard-fail with
+    // ELIBBAD instead.
     let mut main_entries: heapless::Vec<Dyn, 64> = heapless::Vec::new();
+    let mut main_saw_null = false;
     {
         let mut p = main_dyn;
         while main_entries.len() < 64 {
             let e = unsafe { *p };
             let _ = main_entries.push(e);
             if e.d_tag == DT_NULL {
+                main_saw_null = true;
                 break;
             }
             p = unsafe { p.add(1) };
         }
     }
+    if !main_saw_null {
+        serial(b"ldso: main binary PT_DYNAMIC > 64 entries\n");
+        sys_exit(ELIBBAD_CODE);
+    }
     let main_dyn_section = DynamicSection::parse(&main_entries, main_load_bias);
+    // Same dynamic-pointer bounds check as `load_dso_impl` runs for
+    // every loaded DSO — keep the main binary on the same protection
+    // floor so a corrupted main binary's `DT_STRTAB` / `DT_HASH` /
+    // etc. cannot trick the linker into reading unrelated memory.
+    if let Err(why) = validate_dyn_pointers(&main_dyn_section, main_load_bias, main_image_len) {
+        serial(b"ldso: main binary dynamic-pointer bounds check failed: ");
+        serial(why.as_bytes());
+        serial(b"\n");
+        sys_exit(ELIBBAD_CODE);
+    }
 
     // -- Load DT_NEEDED dependencies ----------------------------------------
     let mut dsos: heapless::Vec<LoadedDso, MAX_DSOS> = heapless::Vec::new();
