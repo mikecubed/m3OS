@@ -64,6 +64,15 @@ const AT_BASE: u64 = 7;
 const SYS_WRITE: u64 = 1;
 
 /// `write(fd, buf, len)` — returns bytes written or negative errno.
+///
+/// The `syscall` instruction clobbers RFLAGS (and the kernel may
+/// modify many flag bits before returning), so this `asm!` block
+/// does NOT use the `preserves_flags` option — that option promises
+/// the flags register is unchanged across the asm, which is false
+/// for `syscall` and could let the compiler reorder flag-sensitive
+/// code (e.g. a conditional jump on a flag set just before the
+/// syscall) past the syscall. `nostack` stays because we do not
+/// touch the stack.
 unsafe fn sys_write(fd: i32, buf: *const u8, len: usize) -> i64 {
     let ret: i64;
     unsafe {
@@ -76,7 +85,7 @@ unsafe fn sys_write(fd: i32, buf: *const u8, len: usize) -> i64 {
             out("rcx") _,
             out("r11") _,
             lateout("rax") ret,
-            options(nostack, preserves_flags),
+            options(nostack),
         );
     }
     ret

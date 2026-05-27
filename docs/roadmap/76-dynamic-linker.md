@@ -48,7 +48,9 @@ SOLID/SRP: this phase delivers exactly two responsibilities — kernel `PT_INTER
 
 ### Full SysV-ABI auxiliary vector
 
-`setup_abi_stack_with_envp` is extended to take an `interp_load_bias: Option<u64>` and emit `AT_BASE` (interpreter load bias) when present. The auxv ordering matches what musl `_dlstart` reads: `AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_ENTRY` (main binary entry), `AT_BASE` (interpreter bias, only when `PT_INTERP` was honored), `AT_PAGESZ` (4096), `AT_RANDOM` (16 bytes from kernel CSPRNG, hashed via the existing `0xAB`-pattern seed for determinism in tests), `AT_NULL`. Initial `rsp` is 16-byte aligned at the moment control transfers to the interpreter.
+`setup_abi_stack_with_envp` now drives the auxv via the new pure-logic `kernel-core::elf::auxv::build_layout` helper. The kernel ELF loader returns `LoadedElf.aux_extras: Option<AuxExtras>` where `AuxExtras { at_base, at_entry }` carries both the interpreter load bias and the main binary's entry (the two travel together because `AT_ENTRY` only makes sense when an interpreter was loaded — when no interpreter, `LoadedElf.entry` already IS the main binary's entry and no `AT_ENTRY` slot is needed). `ElfAuxInfo` threads this option through, and `setup_abi_stack_with_envp` consumes it.
+
+The emitted auxv ordering (low → high address) is `AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`, `AT_BASE`, `AT_ENTRY`, `AT_RANDOM`, `AT_NULL` when an interpreter is loaded; the four `AT_BASE` / `AT_ENTRY` slots are simply omitted for static binaries so the pre-Phase-76 6-entry shape (`AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`, `AT_RANDOM`, `AT_NULL`) is preserved bit-for-bit. `AT_RANDOM` continues to use the existing `0xAB`-pattern seed for determinism in tests; later phases may swap in real kernel CSPRNG output. Initial `rsp` is 16-byte aligned at the moment control transfers to the interpreter — the existing alignment-pad-above-auxv logic in `setup_abi_stack_with_envp` covers both the old 6-entry and new 8-entry shapes.
 
 ### `ld-musl-x86_64.so.1` crate scaffold (PIE, no_std)
 

@@ -105,13 +105,13 @@ Phase 76 turned out to be too large for one PR. It was split into four subphases
 - `xtask/src/main.rs` (entry in `build_musl_bins` table)
 - `kernel/src/fs/ramdisk.rs` (`include_bytes!` + `BIN_ENTRIES` row)
 
-**Symbol:** `main`
+**Symbol:** `_start` (no `main` — the binary is built `-nostdlib -nostartfiles` so it has no `crt1.o` and is its own entry point)
 **Why it matters:** This is the minimum end-to-end proof that the kernel → ld.so → main binary handoff works. Without this binary there is no smoke gate for Phase 76.
 
 **Acceptance:**
-- [ ] `userspace/dynlink_smoke/dynlink-smoke.c` is a single-file C program built by `musl-gcc` (not `musl-gcc -static`) so the resulting ELF carries `PT_INTERP = /lib/ld-musl-x86_64.so.1`
-- [ ] `main` writes `DYNLINK_SMOKE:PASS\n` to stdout via `write(1, ...)` and returns 0
-- [ ] `cargo xtask build` produces `target/generated-initrd/dynlink_smoke` whose `readelf -d` shows `PT_INTERP` set and at least the `[no DT_NEEDED]` baseline (musl-gcc may add `libc.so` to DT_NEEDED; 76 acceptance only requires that `dynlink_smoke` runs at all — `libc.so` resolution is a 76b problem, not a 76 problem, so we link `-Wl,--no-needed -nostdlib` and supply `_start` manually if necessary)
+- [ ] `userspace/dynlink_smoke/dynlink-smoke.c` is a single-file C program built by `musl-gcc` (or host `gcc` as fallback) with `-nostdlib -nostartfiles -fPIC -Wl,-pie -Wl,-dynamic-linker=/lib/ld-musl-x86_64.so.1` so the resulting ELF carries `PT_INTERP = /lib/ld-musl-x86_64.so.1` and zero `DT_NEEDED` entries (`-nostdlib` excludes libc.so; the binary uses inline-asm `syscall` directly)
+- [ ] `_start` writes `DYNLINK_SMOKE:PASS\n` to fd 2 (stderr / serial console) via inline-asm `syscall` and then exits with `sys_exit(0)` (also via inline-asm `syscall`). fd 2 is chosen over fd 1 so the smoke runner's serial-log pattern match works even when the binary runs under a shell whose stdout is redirected
+- [ ] `cargo xtask build` produces `target/generated-initrd/dynlink_smoke` whose `readelf -d` shows `PT_INTERP` set and **no** `DT_NEEDED` entries (the `-nostdlib` build is what guarantees this — `libc.so` resolution is a 76b problem, not a 76 problem)
 - [ ] The binary appears in the ramdisk and is callable as `/bin/dynlink_smoke`
 
 ### F.2 — `dynlink-smoke` xtask gate

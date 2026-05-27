@@ -1242,29 +1242,63 @@ fn build_dynlink_smoke() {
         dst.to_str().expect("non-UTF-8 path"),
     ]);
 
+    // Error handling rationale:
+    //
+    // - **Compiler missing (`Err(NotFound)`)**: SKIP-eligible.  A
+    //   developer machine without `musl-gcc` and without host `gcc`
+    //   cannot run the gate; emit a placeholder so include_bytes! in
+    //   `ramdisk.rs` still finds a file, and the smoke runner will
+    //   detect `st_size == 0` and emit SKIP at runtime.
+    //
+    // - **Compiler ran but exited non-zero**: FATAL.  The toolchain
+    //   is working; a compile/link failure means our source is broken
+    //   and shipping a stale binary would let the smoke gate falsely
+    //   PASS against the previous build's artifact.
+    //
+    // - **Other invoke errors (permission, etc.)**: FATAL for the
+    //   same reason — anything that isn't "the binary isn't on PATH"
+    //   indicates a real environment problem the developer should
+    //   fix before pushing.
+    //
+    // In both placeholder paths we **always overwrite** the file (not
+    // just create-when-missing) so a previous successful build's
+    // binary does not survive into the next smoke run as a stale
+    // artifact.
     match cmd.status() {
         Ok(s) if s.success() => {
             println!("dynlink_smoke: built → {}", dst.display());
         }
         Ok(s) => {
             eprintln!(
-                "warning: dynlink_smoke build failed (exit {}). Staging an empty \
-                 placeholder so the include_bytes! in ramdisk.rs still succeeds; \
-                 the dynlink smoke gate will SKIP at runtime.",
+                "error: dynlink_smoke build failed (exit {}). The C source \
+                 compiled previously but does not compile against the current \
+                 toolchain — treating as a hard build error so a stale binary \
+                 cannot let the smoke gate falsely PASS.",
                 s.code().unwrap_or(-1)
             );
-            if !dst.exists() {
-                let _ = fs::write(&dst, b"");
-            }
+            // Force-overwrite (not just create-when-missing) so the
+            // stale artifact from a previous successful build cannot
+            // be picked up later.
+            let _ = fs::write(&dst, b"");
+            std::process::exit(1);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "warning: {cc} not found — skipping dynlink_smoke build. \
+                 The dynlink-smoke gate will SKIP at runtime."
+            );
+            // Always truncate so a non-empty stale binary from a
+            // previous build cannot fool the runtime size check.
+            let _ = fs::write(&dst, b"");
         }
         Err(e) => {
             eprintln!(
-                "warning: failed to invoke {cc} for dynlink_smoke: {e}. \
-                 Staging an empty placeholder."
+                "error: failed to invoke {cc} for dynlink_smoke: {e}. Not a \
+                 missing-binary error — treating as a hard environment \
+                 problem so the developer notices."
             );
-            if !dst.exists() {
-                let _ = fs::write(&dst, b"");
-            }
+            let _ = fs::write(&dst, b"");
+            std::process::exit(1);
         }
     }
 }
