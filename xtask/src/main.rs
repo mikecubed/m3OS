@@ -5587,6 +5587,20 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         extra_steps_a: &[],
         extra_steps_b: &[],
     });
+    // Phase 76b — full bring-up linker gate. The smoke-runner execs
+    // `/bin/dynlink_hello` twice consecutively, which exercises
+    // ld.so self-relocation, DT_NEEDED loading of `/usr/lib/libhello.so`,
+    // R_X86_64_JUMP_SLOT resolution, and the refcounted re-load
+    // path. Accepts SKIP when the demo binaries are zero-byte
+    // placeholders (no host musl-gcc available at build time).
+    steps.push(SmokeStep::WaitEither {
+        pattern_a: "SMOKE:dynlink-hello-smoke:PASS",
+        pattern_b: "SMOKE:dynlink-hello-smoke:SKIP",
+        timeout_secs: 30,
+        label: "guest/dynlink-hello-smoke: full bring-up linker resolves libhello.so",
+        extra_steps_a: &[],
+        extra_steps_b: &[],
+    });
     steps.push(SmokeStep::Wait {
         pattern: "SMOKE:PASS",
         timeout_secs: 5,

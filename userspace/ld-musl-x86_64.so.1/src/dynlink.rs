@@ -24,7 +24,7 @@ pub const MAX_NEEDED: usize = 16;
 /// Typed view of a `PT_DYNAMIC` section. Pointer slots are
 /// `Option<NonNull<_>>` so the consumer cannot accidentally
 /// dereference an absent tag.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct DynamicSection {
     /// `DT_STRTAB` — address of the string table inside the DSO.
     pub strtab: Option<NonNull<u8>>,
