@@ -171,6 +171,161 @@ pub fn elf_hash(name: &[u8]) -> u32 {
     h
 }
 
+/// SysV `DT_HASH` table layout:
+///
+/// ```text
+/// nbuckets : u32
+/// nchain   : u32
+/// buckets  : [u32; nbuckets]
+/// chain    : [u32; nchain]
+/// ```
+///
+/// To resolve a name `n`:
+///   1. compute `h = elf_hash(n)`;
+///   2. read `idx = buckets[h % nbuckets]`;
+///   3. while `idx != 0`: if `symtab[idx].name == n` → hit; else
+///      `idx = chain[idx]`.
+///
+/// `STN_UNDEF == 0` is the chain terminator and also the index of the
+/// always-undefined first symbol-table entry, so a `0` from `buckets`
+/// or `chain` means "not present".
+///
+/// `lookup_in_hash_table` is a pure-logic implementation that takes
+/// the raw `DT_HASH` payload as a `&[u32]`, a callback that resolves
+/// `(symbol_index → symbol-name bytes)`, and the name being searched
+/// for. The runtime walker wraps this with raw-pointer reads of the
+/// real `DT_HASH` table.
+pub fn lookup_in_hash_table(
+    hash_table: &[u32],
+    name: &[u8],
+    mut name_of_symbol: impl FnMut(u32) -> Option<&'static [u8]>,
+) -> Option<u32> {
+    if hash_table.len() < 2 {
+        return None;
+    }
+    let nbuckets = hash_table[0] as usize;
+    let nchain = hash_table[1] as usize;
+    if hash_table.len() < 2 + nbuckets + nchain || nbuckets == 0 {
+        return None;
+    }
+    let buckets = &hash_table[2..2 + nbuckets];
+    let chain = &hash_table[2 + nbuckets..2 + nbuckets + nchain];
+
+    let h = elf_hash(name);
+    let mut idx = buckets[(h as usize) % nbuckets];
+    // STN_UNDEF (0) is both the always-undefined first slot AND the
+    // chain terminator — walking it would always miss; bail out fast.
+    let mut hops = 0usize;
+    while idx != 0 {
+        // Defensive: a corrupt chain could otherwise loop forever.
+        // `nchain` is an upper bound on legitimate hops because each
+        // symbol appears at most once in the chain.
+        if hops > nchain {
+            return None;
+        }
+        if (idx as usize) >= nchain {
+            return None;
+        }
+        if let Some(symbol_name) = name_of_symbol(idx)
+            && symbol_name == name
+        {
+            return Some(idx);
+        }
+        idx = chain[idx as usize];
+        hops += 1;
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Topological sort of the loaded-DSO dependency graph.
+// ---------------------------------------------------------------------------
+
+/// Lightweight identifier for one loaded DSO. The runtime allocates
+/// `DsoId`s contiguously starting at 0 (main binary) so the topo-sort
+/// can use them as array indices without an extra hash map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DsoId(pub u32);
+
+/// Errors `topo_sort` can return.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TopoError {
+    /// A cycle was detected. The payload is the two DSO IDs forming
+    /// the back-edge; the runtime caller maps them back to SONAMEs
+    /// for the log message.
+    CircularDependency(DsoId, DsoId),
+    /// Graph exceeds [`MAX_DSOS`].
+    Overflow,
+}
+
+/// Maximum nodes the topo-sort accepts in one pass. Real binaries
+/// have at most a handful of DSOs; the cap is a safety belt against
+/// runaway recursion in pathological inputs.
+pub const MAX_DSOS: usize = 32;
+
+/// Topologically sort a dependency graph deepest-first (post-order
+/// DFS). Returns the sort order whose first element is the deepest
+/// dependency and whose last element is the root.
+///
+/// `deps[i]` is the slice of nodes `DsoId(i as u32)` depends on
+/// directly. The function never mutates external state — the
+/// runtime caller builds `deps` once after parsing every loaded
+/// DSO's `DT_NEEDED` list.
+///
+/// Cycle handling: a cycle is detected when a node is revisited
+/// while still on the DFS stack. The two IDs forming the back-edge
+/// are returned in `TopoError::CircularDependency`.
+pub fn topo_sort(deps: &[&[DsoId]]) -> Result<heapless::Vec<DsoId, MAX_DSOS>, TopoError> {
+    let n = deps.len();
+    if n > MAX_DSOS {
+        return Err(TopoError::Overflow);
+    }
+    // 0 = white (unvisited), 1 = gray (on stack), 2 = black (done).
+    let mut color = [0u8; MAX_DSOS];
+    let mut order: heapless::Vec<DsoId, MAX_DSOS> = heapless::Vec::new();
+
+    for i in 0..n {
+        if color[i] != 0 {
+            continue;
+        }
+        // Iterative DFS — each stack frame is `(node, next_child_idx)`.
+        let mut stack: heapless::Vec<(DsoId, usize), MAX_DSOS> = heapless::Vec::new();
+        let start = DsoId(i as u32);
+        stack.push((start, 0)).map_err(|_| TopoError::Overflow)?;
+        color[i] = 1;
+        while let Some(&(node, next_child)) = stack.last() {
+            let nidx = node.0 as usize;
+            let children = if nidx < deps.len() { deps[nidx] } else { &[] };
+            if next_child < children.len() {
+                let child = children[next_child];
+                // Advance the iterator for `node` before recursing.
+                if let Some(last) = stack.last_mut() {
+                    last.1 = next_child + 1;
+                }
+                let cidx = child.0 as usize;
+                if cidx >= n {
+                    return Err(TopoError::CircularDependency(node, child));
+                }
+                match color[cidx] {
+                    0 => {
+                        color[cidx] = 1;
+                        stack.push((child, 0)).map_err(|_| TopoError::Overflow)?;
+                    }
+                    1 => {
+                        return Err(TopoError::CircularDependency(node, child));
+                    }
+                    _ => {}
+                }
+            } else {
+                color[nidx] = 2;
+                order.push(node).map_err(|_| TopoError::Overflow)?;
+                stack.pop();
+            }
+        }
+    }
+    Ok(order)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,5 +451,141 @@ mod tests {
         // hash function cannot drift.
         let h = elf_hash(b"printf");
         assert_eq!(h & 0xF000_0000, 0, "top nibble must be cleared");
+    }
+
+    // -----------------------------------------------------------------
+    // lookup_in_hash_table tests.
+    // -----------------------------------------------------------------
+
+    /// Build a minimal SysV DT_HASH table for a fixed set of names.
+    /// Layout: `[nbuckets, nchain, buckets..., chain...]`. The dummy
+    /// `STN_UNDEF` symbol occupies index 0 in the chain (value 0 == end).
+    fn build_hash_table(names: &[&'static [u8]], nbuckets: usize) -> Vec<u32> {
+        let nchain = names.len() + 1; // +1 for STN_UNDEF
+        let mut buckets = vec![0u32; nbuckets];
+        let mut chain = vec![0u32; nchain];
+        for (i, name) in names.iter().enumerate() {
+            let sym_idx = (i + 1) as u32; // +1 to skip STN_UNDEF
+            let bucket = (elf_hash(name) as usize) % nbuckets;
+            // Push onto the chain head for this bucket.
+            chain[sym_idx as usize] = buckets[bucket];
+            buckets[bucket] = sym_idx;
+        }
+        let mut out = vec![nbuckets as u32, nchain as u32];
+        out.extend_from_slice(&buckets);
+        out.extend_from_slice(&chain);
+        out
+    }
+
+    #[test]
+    fn lookup_resolves_a_symbol_with_one_bucket() {
+        let names: &[&[u8]] = &[b"foo", b"bar", b"baz"];
+        let ht = build_hash_table(names, 1);
+        let idx = lookup_in_hash_table(&ht, b"bar", |i| names.get((i - 1) as usize).copied())
+            .expect("bar should be found");
+        assert_eq!(idx, 2); // names[1] -> sym idx 2
+    }
+
+    #[test]
+    fn lookup_resolves_a_symbol_with_multiple_buckets() {
+        let names: &[&[u8]] = &[b"foo", b"bar", b"baz", b"qux", b"hello"];
+        let ht = build_hash_table(names, 4);
+        for (i, n) in names.iter().enumerate() {
+            let idx = lookup_in_hash_table(&ht, n, |j| names.get((j - 1) as usize).copied())
+                .unwrap_or_else(|| panic!("{:?} should be found", core::str::from_utf8(n)));
+            assert_eq!(idx as usize, i + 1);
+        }
+    }
+
+    #[test]
+    fn lookup_returns_none_for_absent_name() {
+        let names: &[&[u8]] = &[b"foo", b"bar"];
+        let ht = build_hash_table(names, 1);
+        let r = lookup_in_hash_table(&ht, b"baz", |i| names.get((i - 1) as usize).copied());
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn lookup_rejects_malformed_table() {
+        // 1-element table (only nbuckets, no nchain) is malformed.
+        let ht = vec![1u32];
+        let r = lookup_in_hash_table(&ht, b"foo", |_| Some(&b"foo"[..]));
+        assert!(r.is_none());
+        // zero buckets is malformed (would divide by zero).
+        let ht2 = vec![0u32, 1, 0];
+        let r2 = lookup_in_hash_table(&ht2, b"foo", |_| Some(&b"foo"[..]));
+        assert!(r2.is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // topo_sort tests.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn topo_sort_linear_chain_deepest_first() {
+        // 0 -> 1 -> 2  (main -> libA -> libB)
+        let d1: &[DsoId] = &[DsoId(1)];
+        let d2: &[DsoId] = &[DsoId(2)];
+        let d3: &[DsoId] = &[];
+        let deps: &[&[DsoId]] = &[d1, d2, d3];
+        let order = topo_sort(deps).unwrap();
+        // Deepest first → leaf 2, then 1, then root 0.
+        assert_eq!(&order[..], &[DsoId(2), DsoId(1), DsoId(0)]);
+    }
+
+    #[test]
+    fn topo_sort_diamond_visits_shared_dep_once() {
+        // 0 -> {1, 2}; 1 -> 3; 2 -> 3
+        let d0: &[DsoId] = &[DsoId(1), DsoId(2)];
+        let d1: &[DsoId] = &[DsoId(3)];
+        let d2: &[DsoId] = &[DsoId(3)];
+        let d3: &[DsoId] = &[];
+        let deps: &[&[DsoId]] = &[d0, d1, d2, d3];
+        let order = topo_sort(deps).unwrap();
+        assert_eq!(order.len(), 4);
+        // 3 must come before both 1 and 2; 1 and 2 must come before 0.
+        let pos: heapless::Vec<usize, MAX_DSOS> = (0..4)
+            .map(|i| order.iter().position(|d| d.0 == i as u32).unwrap())
+            .collect();
+        assert!(pos[3] < pos[1]);
+        assert!(pos[3] < pos[2]);
+        assert!(pos[1] < pos[0]);
+        assert!(pos[2] < pos[0]);
+    }
+
+    #[test]
+    fn topo_sort_two_node_cycle_errors() {
+        // 0 -> 1 -> 0
+        let d0: &[DsoId] = &[DsoId(1)];
+        let d1: &[DsoId] = &[DsoId(0)];
+        let deps: &[&[DsoId]] = &[d0, d1];
+        match topo_sort(deps) {
+            Err(TopoError::CircularDependency(a, b)) => {
+                // Either back-edge orientation is acceptable.
+                assert!(
+                    (a == DsoId(1) && b == DsoId(0)) || (a == DsoId(0) && b == DsoId(1)),
+                    "expected back-edge between 0 and 1, got ({a:?}, {b:?})"
+                );
+            }
+            other => panic!("expected CircularDependency, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn topo_sort_self_loop_is_a_cycle() {
+        // 0 -> 0
+        let d0: &[DsoId] = &[DsoId(0)];
+        let deps: &[&[DsoId]] = &[d0];
+        assert!(matches!(
+            topo_sort(deps),
+            Err(TopoError::CircularDependency(DsoId(0), DsoId(0)))
+        ));
+    }
+
+    #[test]
+    fn topo_sort_empty_graph_returns_empty_order() {
+        let deps: &[&[DsoId]] = &[];
+        let order = topo_sort(deps).unwrap();
+        assert_eq!(order.len(), 0);
     }
 }

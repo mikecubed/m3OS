@@ -1100,6 +1100,9 @@ dependencies = [
 [[package]]
 name = "ld-musl-x86_64-so-1"
 version = "0.2.0"
+dependencies = [
+ "heapless",
+]
 
 [[package]]
 name = "leb128fmt"
