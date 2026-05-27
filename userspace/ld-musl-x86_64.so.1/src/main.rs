@@ -86,6 +86,7 @@ const SYS_WRITE: u64 = 1;
 const SYS_OPEN: u64 = 2;
 const SYS_CLOSE: u64 = 3;
 const SYS_MMAP: u64 = 9;
+const SYS_MPROTECT: u64 = 10;
 
 const O_RDONLY: u64 = 0;
 
@@ -95,7 +96,6 @@ const PROT_EXEC: u64 = 0x4;
 
 const MAP_PRIVATE: u64 = 0x02;
 const MAP_ANONYMOUS: u64 = 0x20;
-const MAP_FIXED: u64 = 0x10;
 
 #[inline(always)]
 unsafe fn syscall1(num: u64, a1: u64) -> i64 {
@@ -178,6 +178,10 @@ fn sys_read(fd: i64, buf: &mut [u8]) -> i64 {
 
 fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: i64, offset: u64) -> i64 {
     unsafe { syscall6(SYS_MMAP, addr, len, prot, flags, fd as u64, offset) }
+}
+
+fn sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
+    unsafe { syscall3(SYS_MPROTECT, addr, len, prot) }
 }
 
 // ---------------------------------------------------------------------------
@@ -325,36 +329,6 @@ unsafe fn strtab_get(strtab: *const u8, off: u64, strsz: u64) -> &'static [u8] {
 // Open + load one DSO from disk.
 // ---------------------------------------------------------------------------
 
-/// Read an entire file into memory at a kernel-chosen address via
-/// `mmap(NULL, len, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS)` + a
-/// loop of `read()` calls. Returns the base address (or 0 on error).
-#[allow(dead_code)]
-unsafe fn read_file_into_anon(fd: i64, file_size: u64) -> u64 {
-    // Round up to page boundary.
-    let mapped_len = (file_size + 4095) & !4095;
-    let base = sys_mmap(
-        0,
-        mapped_len,
-        PROT_READ | PROT_WRITE,
-        MAP_PRIVATE | MAP_ANONYMOUS,
-        -1,
-        0,
-    );
-    if base < 0 {
-        return 0;
-    }
-    let buf = unsafe { core::slice::from_raw_parts_mut(base as *mut u8, file_size as usize) };
-    let mut off = 0usize;
-    while off < buf.len() {
-        let n = sys_read(fd, &mut buf[off..]);
-        if n <= 0 {
-            return 0;
-        }
-        off += n as usize;
-    }
-    base as u64
-}
-
 /// Minimal ELF64 header subset.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -373,80 +347,29 @@ struct Ehdr {
     _rest: [u8; 6],
 }
 
-/// Map a single PT_LOAD segment of the in-memory file image into a
-/// fresh `MAP_FIXED` region with the appropriate `PROT_*` bits. The
-/// file content for `p_filesz` bytes is copied from the in-memory
-/// file image; the remaining `p_memsz - p_filesz` bytes are zero
-/// (mmap-zeroed by the kernel).
-unsafe fn map_load_segment(file_image: u64, load_bias: u64, ph: &Phdr) -> Result<(), &'static str> {
-    let vstart = load_bias.wrapping_add(ph.p_vaddr) & !4095u64;
-    let voff = (load_bias.wrapping_add(ph.p_vaddr)) - vstart;
-    let total = ph.p_memsz + voff;
-    let mapped_len = (total + 4095) & !4095;
-    let mut prot = 0u64;
-    if ph.p_flags & 0x4 != 0 {
-        prot |= PROT_READ;
-    }
-    if ph.p_flags & 0x2 != 0 {
-        prot |= PROT_WRITE;
-    }
-    if ph.p_flags & 0x1 != 0 {
-        prot |= PROT_EXEC;
-    }
-    // W^X (Phase 75): if both write and exec are requested, drop
-    // exec on the writable copy. libhello.so does not have any RWX
-    // segments so this is paranoia.
-    if (prot & PROT_WRITE) != 0 && (prot & PROT_EXEC) != 0 {
-        prot &= !PROT_EXEC;
-    }
-    let r = sys_mmap(
-        vstart,
-        mapped_len,
-        PROT_READ | PROT_WRITE,
-        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
-        -1,
-        0,
-    );
-    if r < 0 {
-        return Err("mmap PT_LOAD failed");
-    }
-    // Copy p_filesz bytes from file_image+p_offset into vaddr.
-    let src = (file_image + ph.p_offset) as *const u8;
-    let dst = (load_bias.wrapping_add(ph.p_vaddr)) as *mut u8;
-    unsafe {
-        core::ptr::copy_nonoverlapping(src, dst, ph.p_filesz as usize);
-    }
-    // Phase 76b accepts the segment as PROT_READ|PROT_WRITE for the
-    // copy step. A real linker would now `mprotect` to the final
-    // protection; the bring-up linker skips that to keep the syscall
-    // surface bounded — libhello.so's code segment is still RWX-
-    // capable, which the kernel allows under MAP_PRIVATE|MAP_ANONYMOUS
-    // mmap because our prot mask above doesn't include EXEC.
-    //
-    // For Phase 76b's libhello.so demo the code segment must be
-    // executable so we issue a second mmap if PROT_EXEC was set,
-    // overlaying the just-written code page with the same content via
-    // PROT_READ|PROT_EXEC. This is the simplest way to satisfy W^X
-    // without a separate mprotect syscall path.
-    let _ = prot;
-    Ok(())
-}
-
-/// Find the next `MAX_DSOS` load bias above the linker image so each
-/// loaded DSO gets its own non-overlapping region.
-const DSO_BASE_HINT_START: u64 = 0x7000_0000;
-const DSO_BASE_HINT_STRIDE: u64 = 0x0200_0000;
-
-/// Load a single DSO from `/usr/lib/<name>` (Phase 76b's only search
-/// directory we actually exercise; the broader search order is in
-/// the docs and will be needed for libc-bearing binaries in 76d).
-unsafe fn load_dso(path_bytes: &[u8], load_bias: u64) -> Result<LoadedDso, &'static str> {
+/// Load a single DSO from `/usr/lib/<name>`.
+///
+/// Strategy (matched to the m3OS kernel's anonymous-mmap behavior,
+/// which ignores `MAP_FIXED` and always allocates linearly from
+/// `mmap_next` — see `kernel/src/arch/x86_64/syscall/mod.rs::sys_linux_mmap`):
+///
+/// 1. Open the file, mmap a scratch buffer, read the entire file in.
+/// 2. Parse the ELF header to find `phoff` / `phnum` / the highest
+///    `p_vaddr + p_memsz` across all `PT_LOAD` segments.
+/// 3. mmap one contiguous anonymous region of `total_image_size`
+///    bytes as `PROT_READ | PROT_WRITE`. The kernel picks the address;
+///    we use it as the `load_bias`.
+/// 4. For each `PT_LOAD`, copy `p_filesz` bytes from the scratch
+///    buffer at `p_offset` to `load_bias + p_vaddr`. The
+///    `p_memsz - p_filesz` tail is already zero (mmap-zeroed).
+/// 5. For each segment whose `p_flags` has `PF_X` set, `mprotect` its
+///    page range to `PROT_READ | PROT_EXEC` (Phase 75 W^X requires
+///    separate W and X mappings).
+unsafe fn load_dso(path_bytes: &[u8]) -> Result<LoadedDso, &'static str> {
     let fd = sys_open(path_bytes);
     if fd < 0 {
         return Err("open failed");
     }
-    // Read the file into anon memory so we can walk the headers.
-    // Bounded read: assume libhello.so fits in 64 KiB (it's ~12 KiB).
     let scratch_len: u64 = 64 * 1024;
     let scratch = sys_mmap(
         0,
@@ -488,27 +411,82 @@ unsafe fn load_dso(path_bytes: &[u8], load_bias: u64) -> Result<LoadedDso, &'sta
     let phoff = ehdr.e_phoff;
     let phnum = ehdr.e_phnum as usize;
     let phdr_base = (scratch as u64 + phoff) as *const Phdr;
-    // Map each PT_LOAD segment.
+
+    // Pass 1: compute total in-memory image span.
+    let mut image_end: u64 = 0;
     for i in 0..phnum {
         let ph = unsafe { *phdr_base.add(i) };
         if ph.p_type == PT_LOAD {
-            unsafe { map_load_segment(scratch as u64, load_bias, &ph)? };
+            let end = ph.p_vaddr + ph.p_memsz;
+            if end > image_end {
+                image_end = end;
+            }
         }
     }
+    if image_end == 0 {
+        return Err("no PT_LOAD");
+    }
+    let image_len = (image_end + 4095) & !4095;
+
+    // One anonymous mmap for the whole image. The kernel picks the
+    // address; the returned value IS our load bias.
+    let image_base = sys_mmap(
+        0,
+        image_len,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+    if image_base < 0 {
+        return Err("image mmap failed");
+    }
+    let load_bias = image_base as u64;
+
+    // Pass 2: copy each PT_LOAD into the image, then mprotect text
+    // pages to R-X (W^X requires separate W and X mappings).
+    for i in 0..phnum {
+        let ph = unsafe { *phdr_base.add(i) };
+        if ph.p_type != PT_LOAD {
+            continue;
+        }
+        let src = (scratch as u64 + ph.p_offset) as *const u8;
+        let dst = (load_bias + ph.p_vaddr) as *mut u8;
+        unsafe { core::ptr::copy_nonoverlapping(src, dst, ph.p_filesz as usize) };
+    }
+    for i in 0..phnum {
+        let ph = unsafe { *phdr_base.add(i) };
+        if ph.p_type != PT_LOAD {
+            continue;
+        }
+        // PF_X = 0x1.
+        if ph.p_flags & 0x1 == 0 {
+            continue;
+        }
+        // Page-align the segment.
+        let seg_start = (load_bias + ph.p_vaddr) & !4095u64;
+        let seg_end = (load_bias + ph.p_vaddr + ph.p_memsz + 4095) & !4095u64;
+        let seg_len = seg_end - seg_start;
+        // PROT_READ | PROT_EXEC — no PROT_WRITE so Phase 75 W^X is
+        // satisfied; the kernel splits the VMA if needed.
+        let r = sys_mprotect(seg_start, seg_len, PROT_READ | PROT_EXEC);
+        if r < 0 {
+            return Err("mprotect PT_LOAD R-X failed");
+        }
+    }
+
     // Locate PT_DYNAMIC.
     let mut dyn_ptr: *const Dyn = core::ptr::null();
     for i in 0..phnum {
         let ph = unsafe { *phdr_base.add(i) };
         if ph.p_type == PT_DYNAMIC {
-            dyn_ptr = (load_bias.wrapping_add(ph.p_vaddr)) as *const Dyn;
+            dyn_ptr = (load_bias + ph.p_vaddr) as *const Dyn;
             break;
         }
     }
     if dyn_ptr.is_null() {
         return Err("no PT_DYNAMIC");
     }
-    // Build the typed view by walking up to a sentinel; the Vec form
-    // in `DynamicSection::parse` needs a slice.
     let mut entries: heapless::Vec<Dyn, 64> = heapless::Vec::new();
     let mut p = dyn_ptr;
     while entries.len() < 64 {
@@ -821,8 +799,7 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
         path_buf[..prefix.len()].copy_from_slice(prefix);
         path_buf[prefix.len()..prefix.len() + name.len()].copy_from_slice(name);
         // NUL terminator already present (buf is zeroed).
-        let bias = DSO_BASE_HINT_START + (i as u64 + 1) * DSO_BASE_HINT_STRIDE;
-        let loaded = match unsafe { load_dso(&path_buf, bias) } {
+        let loaded = match unsafe { load_dso(&path_buf) } {
             Ok(d) => d,
             Err(msg) => {
                 serial(b"ldso: failed to load DT_NEEDED ");

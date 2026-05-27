@@ -211,11 +211,6 @@ fn program_main(_args: &[&str]) -> i32 {
     // PT_INTERP → ld.so self-relocation → DT_NEEDED → libhello.so map →
     // R_X86_64_JUMP_SLOT → main → hello_str() chain. The second run
     // verifies the refcount path on `libhello.so`.
-    //
-    // While the bring-up runtime is still under iteration, treat any
-    // non-PASS terminal state as SKIP rather than FAIL so the rest of
-    // the smoke suite still reports PASS. A real PASS still requires
-    // the full chain to work end-to-end.
     {
         let mut probe = Stat::zeroed();
         if stat(DYNLINK_HELLO_PATH, &mut probe) < 0 || probe.st_size == 0 {
@@ -223,24 +218,25 @@ fn program_main(_args: &[&str]) -> i32 {
         } else {
             begin("dynlink-hello-smoke");
             let argv = [DYNLINK_HELLO_ARGV0.as_ptr(), ptr::null()];
-            let first = run_command_expect_output(
+            if let Err(code) = run_command_expect_output(
                 "dynlink-hello-smoke",
                 DYNLINK_HELLO_PATH,
                 &argv,
                 DYNLINK_HELLO_PASS_NEEDLE,
                 &mut command_output,
-            );
-            let second = run_command_expect_output(
-                "dynlink-hello-smoke",
-                DYNLINK_HELLO_PATH,
-                &argv,
-                DYNLINK_HELLO_PASS_NEEDLE,
-                &mut command_output,
-            );
-            match (first, second) {
-                (Ok(()), Ok(())) => pass("dynlink-hello-smoke"),
-                _ => skip("dynlink-hello-smoke"),
+            ) {
+                return code;
             }
+            if let Err(code) = run_command_expect_output(
+                "dynlink-hello-smoke",
+                DYNLINK_HELLO_PATH,
+                &argv,
+                DYNLINK_HELLO_PASS_NEEDLE,
+                &mut command_output,
+            ) {
+                return code;
+            }
+            pass("dynlink-hello-smoke");
         }
     }
 
