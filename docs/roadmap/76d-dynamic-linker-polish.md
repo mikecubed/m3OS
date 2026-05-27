@@ -4,7 +4,7 @@
 **Source Ref:** phase-76d
 **Depends on:** Phase 76 ✅, Phase 76b, Phase 76c
 **Builds on:** Adds the performance and compatibility polish layer that lets m3OS load glibc-built and musl-built `.so` files in the wild: PLT lazy resolution (`_dl_runtime_resolve`), `DT_GNU_HASH` lookup, and graceful `DT_VERSYM` / `DT_VERNEED` handling. Completes the Phase 76 dynamic-linker theme.
-**Primary Components:** `userspace/ld-musl-x86_64.so.1/src/plt.rs`, `userspace/ld-musl-x86_64.so.1/src/sym.rs`, `userspace/ld-musl-x86_64.so.1/src/ver.rs`
+**Primary Components:** `userspace/ld-musl-x86_64.so.1/src/plt.rs` (new), `userspace/ld-musl-x86_64.so.1/src/sym.rs` (new), `userspace/ld-musl-x86_64.so.1/src/ver.rs` (new); modifications to `userspace/ld-musl-x86_64.so.1/src/{dynlink.rs,reloc.rs,main.rs}`
 
 ## Milestone Goal
 
@@ -101,7 +101,8 @@ The trampoline writes into the GOT — so the GOT region must be mapped `RW-` (w
 4. Write `_dl_runtime_resolve` asm trampoline + `plt::resolve_pltrel` Rust callback. Install the trampoline address at `GOT[2]` at load time.
 5. Switch the 76b eager `JUMP_SLOT` path to lazy when the DSO is not opened with `RTLD_NOW` and `LD_BIND_NOW` is unset.
 6. Add the `--hash-style=gnu` gate variant (a new `libhello_gnu.so` built with GNU hash + a `dynlink_hello_gnu` consumer).
-7. Bump the kernel to `0.76.3`; mark the Phase 76 family Complete in the roadmap README; extend `docs/76-dynamic-linker.md` with the lazy-resolve + GNU-hash + versioning sections.
+7. Add the versioned-symbol gate variant (a `libhello_versioned.so` built with a `--version-script` declaring `LIBHELLO_1.0` + a `dynlink_hello_versioned` consumer); extend the gate to also exercise the warn-then-fallback mismatch path and the `LD_BIND_NOW=1` strict-mode error path.
+8. Bump the kernel to `0.76.3`; mark the Phase 76 family Complete in the roadmap README; extend `docs/76-dynamic-linker.md` with the lazy-resolve + GNU-hash + versioning sections.
 
 ## Acceptance Criteria
 
