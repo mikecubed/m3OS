@@ -1303,6 +1303,156 @@ fn build_dynlink_smoke() {
     }
 }
 
+/// Phase 76b — build a shared C library (`*.so`) from one or more C
+/// sources using the host musl cross-compiler, with the linker flags
+/// the bring-up dynamic linker expects:
+///
+///   * `-shared -fPIC` — PIC code + DSO output shape
+///   * `-Wl,--hash-style=sysv` — emit `DT_HASH` (no `DT_GNU_HASH`)
+///   * `-Wl,-soname,<name>.so` — set `DT_SONAME` so the consumer's
+///     `DT_NEEDED` can match by SONAME at link time.
+///
+/// Output: `target/generated-libs/<name>.so`. Returns an `io::Error`
+/// when the toolchain is missing or the compile fails so the caller
+/// can surface a structured diagnostic instead of silently producing
+/// an empty placeholder.
+fn build_shared_lib(name: &str, srcs: &[&str], output: &Path) -> io::Result<()> {
+    let cc = find_musl_cc().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "musl cross-compiler not on PATH (install musl-tools)",
+        )
+    })?;
+    let mut cmd = Command::new(cc);
+    // `-nostdlib` keeps `DT_NEEDED = libc.so` off the result so the
+    // Phase 76b bring-up linker (which does not yet load libc) does
+    // not have to resolve libc symbols transitively. Phase 76d will
+    // relax this once `DT_GNU_HASH` + lazy resolve land.
+    cmd.args([
+        "-shared",
+        "-fPIC",
+        "-O2",
+        "-nostdlib",
+        "-Wl,--hash-style=sysv",
+    ]);
+    cmd.arg(format!("-Wl,-soname,{name}.so"));
+    for s in srcs {
+        cmd.arg(s);
+    }
+    cmd.arg("-o").arg(output);
+    let out = cmd
+        .output()
+        .map_err(|e| io::Error::other(format!("failed to invoke {cc}: {e}")))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        eprintln!("build_shared_lib({name}.so) failed:\n{stderr}");
+        return Err(io::Error::other(format!(
+            "{cc} exited {}",
+            out.status.code().unwrap_or(-1)
+        )));
+    }
+    println!("shared-lib: {} → {}", srcs.join(" "), output.display());
+    Ok(())
+}
+
+/// Phase 76b — build `libhello.so` and stage it under
+/// `target/generated-libs/`. Falls back to a zero-byte placeholder if
+/// the toolchain is missing so the kernel ramdisk `include_bytes!`
+/// path always resolves; the runtime smoke gate then SKIPs.
+fn build_libhello() {
+    let root = workspace_root();
+    let libs = ensure_generated_libs_dir(&root);
+    let dst = libs.join("libhello.so");
+    let src = root.join("userspace/lib/libhello/hello.c");
+    let src_str = src.to_str().expect("non-UTF-8 path");
+    match build_shared_lib("libhello", &[src_str], &dst) {
+        Ok(()) => {}
+        Err(e) => {
+            eprintln!("warning: libhello.so build failed ({e}) — writing placeholder");
+            let _ = fs::write(&dst, b"");
+        }
+    }
+}
+
+/// Phase 76b — build `dynlink_hello`, the dynamic ELF whose
+/// `PT_INTERP` points at `/lib/ld-musl-x86_64.so.1` and whose
+/// `DT_NEEDED` carries `libhello.so`. Linked with `-Wl,--hash-style=sysv`
+/// so the consumer's own dynamic section also uses `DT_HASH` (the
+/// bring-up linker does not yet understand `DT_GNU_HASH`).
+///
+/// The binary is staged under `target/generated-initrd/dynlink_hello`
+/// so the kernel ramdisk can `include_bytes!` it the same way it does
+/// `dynlink_smoke`.
+fn build_dynlink_hello() {
+    let root = workspace_root();
+    let initrd = ensure_generated_initrd_dir(&root);
+    let libs = ensure_generated_libs_dir(&root);
+    let dst = initrd.join("dynlink_hello");
+    let src = root.join("userspace/dynlink_hello/dynlink_hello.c");
+    let lib = libs.join("libhello.so");
+
+    if !lib.exists() || fs::metadata(&lib).map(|m| m.len() == 0).unwrap_or(true) {
+        eprintln!(
+            "warning: libhello.so missing or empty at {} — skipping dynlink_hello build",
+            lib.display()
+        );
+        let _ = fs::write(&dst, b"");
+        return;
+    }
+
+    let cc = match find_musl_cc() {
+        Some(c) => c,
+        None => {
+            eprintln!("warning: musl-gcc missing — skipping dynlink_hello build");
+            let _ = fs::write(&dst, b"");
+            return;
+        }
+    };
+
+    let mut cmd = Command::new(cc);
+    cmd.args([
+        "-nostdlib",
+        "-nostartfiles",
+        "-fno-stack-protector",
+        "-fno-pie",
+        "-no-pie",
+    ]);
+    cmd.args([
+        "-fPIC",
+        "-Wl,-pie",
+        "-Wl,-dynamic-linker=/lib/ld-musl-x86_64.so.1",
+        "-Wl,--hash-style=sysv",
+        "-Wl,-rpath,/usr/lib",
+        "-Wl,--no-eh-frame-hdr",
+        "-O2",
+        // gcc would otherwise pattern-match our hand-rolled
+        // `while (s[n] != 0) n++;` into a strlen() call against
+        // libc — which dynlink_hello does not link with.
+        "-fno-builtin",
+    ]);
+    cmd.arg(src.to_str().expect("non-UTF-8 path"));
+    cmd.arg(lib.to_str().expect("non-UTF-8 path"));
+    cmd.arg("-o").arg(dst.to_str().expect("non-UTF-8 path"));
+
+    match cmd.output() {
+        Ok(out) if out.status.success() => {
+            println!("dynlink_hello: built → {}", dst.display());
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            eprintln!(
+                "warning: dynlink_hello build failed (exit {}): {stderr}",
+                out.status.code().unwrap_or(-1)
+            );
+            let _ = fs::write(&dst, b"");
+        }
+        Err(e) => {
+            eprintln!("warning: failed to invoke {cc} for dynlink_hello: {e}");
+            let _ = fs::write(&dst, b"");
+        }
+    }
+}
+
 /// Compile Phase 12 musl-linked C binaries and stage them under target/generated-initrd/.
 ///
 /// Requires `musl-gcc` on the host PATH (package `musl-tools` on Debian/Ubuntu).
@@ -2538,6 +2688,11 @@ fn build_kernel() -> PathBuf {
     // file under `target/generated-libs/`.
     build_ldso();
     build_dynlink_smoke();
+    // Phase 76b — build libhello.so first so dynlink_hello can link
+    // against it; both are staged into target/generated-libs/ and
+    // target/generated-initrd/ for the ext2 disk + ramdisk paths.
+    build_libhello();
+    build_dynlink_hello();
     build_musl_bins();
     // Phase 44: cross-compile musl-linked Rust userspace programs.
     build_musl_rust_bins();
@@ -3664,6 +3819,11 @@ fn cmd_check() {
     // the C smoke binary that exercises the kernel → ld.so handoff.
     build_ldso();
     build_dynlink_smoke();
+    // Phase 76b — build libhello.so first so dynlink_hello can link
+    // against it; both are staged into target/generated-libs/ and
+    // target/generated-initrd/ for the ext2 disk + ramdisk paths.
+    build_libhello();
+    build_dynlink_hello();
     build_musl_bins();
     // Phase 44: cross-compile musl-linked Rust userspace programs.
     build_musl_rust_bins();
@@ -11316,6 +11476,53 @@ fn populate_ext2_files(
         ldso_bin.display(),
     );
 
+    // Phase 76b — enumerate every `.so` under `target/generated-libs/`
+    // except the linker itself so each one lands at
+    // `/usr/lib/<basename>` on the ext2 disk. The bring-up linker's
+    // search path is LD_LIBRARY_PATH → /lib → /usr/lib → /usr/local/lib,
+    // so `/usr/lib/` is the canonical home for Phase 76b shared libs.
+    let libs_dir = generated_libs_dir(&workspace_root());
+    let mut staged_libs: Vec<(String, PathBuf)> = Vec::new();
+    if libs_dir.is_dir()
+        && let Ok(rd) = fs::read_dir(&libs_dir)
+    {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            if name == "ld-musl-x86_64.so.1" {
+                continue; // staged separately under /lib
+            }
+            if !name.ends_with(".so") {
+                continue;
+            }
+            if fs::metadata(&path).map(|m| m.len() == 0).unwrap_or(true) {
+                eprintln!(
+                    "warning: skipping zero-byte shared lib {} (build failed earlier)",
+                    path.display()
+                );
+                continue;
+            }
+            staged_libs.push((name, path));
+        }
+    }
+    let mut shared_libs_cmds = String::new();
+    if !staged_libs.is_empty() {
+        shared_libs_cmds.push_str(
+            "mkdir usr/lib\nsif usr/lib mode 0x41ED\nsif usr/lib uid 0\nsif usr/lib gid 0\n",
+        );
+        for (name, path) in &staged_libs {
+            use core::fmt::Write as _;
+            let _ = write!(
+                shared_libs_cmds,
+                "write \"{src}\" usr/lib/{name}\nsif usr/lib/{name} mode 0x81ED\nsif usr/lib/{name} uid 0\nsif usr/lib/{name} gid 0\n",
+                src = path.display(),
+            );
+        }
+    }
+
     // Phase 69 Track A — compile the `m3os-term` terminfo entry so a binary
     // copy can be staged at `/usr/share/terminfo/m/m3os-term` inside the
     // data disk. Returns the path to the compiled `m3os-term` file. Treats
@@ -11888,6 +12095,7 @@ fn populate_ext2_files(
          sif usr mode 0x41ED\n\
          sif usr uid 0\n\
          sif usr gid 0\n\
+         {shared_libs_cmds}\
          mkdir usr/share\n\
          sif usr/share mode 0x41ED\n\
          sif usr/share uid 0\n\
@@ -12041,6 +12249,9 @@ fn populate_ext2_files(
         // Phase 76 — host path of the staged dynamic linker; written
         // to `/lib/ld-musl-x86_64.so.1` on the ext2 disk.
         ldso_bin = ldso_bin.display(),
+        // Phase 76b — every shared lib under target/generated-libs/ is
+        // mkdir'd + written under /usr/lib/ by this block.
+        shared_libs_cmds = shared_libs_cmds,
         terminfo_bin = terminfo_bin.display(),
         font_src = font_src.display(),
     );
