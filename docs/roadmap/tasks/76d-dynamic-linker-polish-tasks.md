@@ -13,8 +13,8 @@
 | D1 | `DT_GNU_HASH` Bloom + bucket + chain lookup; dispatcher prefers GNU over SysV | S1 ✅ | ✅ Complete (end-to-end gate ships with F) |
 | D2 | `DT_VERSYM` / `DT_VERNEED` / `DT_VERDEF` graceful handling | D1 | Planned |
 | B4 | `_dl_runtime_resolve` asm trampoline + GOT slot rewrite + lazy `JUMP_SLOT` deferral | S1 ✅ | ✅ Complete |
-| E4 | `LD_BIND_NOW` environment variable honored | B4 ✅ | In Progress |
-| F | New gate variant: a `.so` built with `-Wl,--hash-style=gnu` runs end-to-end | B4, D1 | Planned |
+| E4 | `LD_BIND_NOW` environment variable honored | B4 ✅ | ✅ Complete (env walk wired; F.3 gates) |
+| F | New gate variant: a `.so` built with `-Wl,--hash-style=gnu` runs end-to-end | B4 ✅, D1 ✅ | In Progress |
 | G | New gate variant: a versioned `.so` (with `DT_VERSYM` / `DT_VERNEED`) loads end-to-end, with mismatch-fallback and `LD_BIND_NOW` strict-mode coverage | D2, E4 | Planned |
 | H | docs/76-dynamic-linker.md polish-pass + kernel version bump + mark Phase 76 family Complete | All | Planned |
 

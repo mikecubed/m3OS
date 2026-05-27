@@ -1211,6 +1211,54 @@ unsafe fn parse_auxv(stack: *const u64) -> (u64, *const Phdr, usize, u64) {
     (at_base, at_phdr, at_phnum, at_entry)
 }
 
+/// Phase 76d.E4.1 — Walk `envp` for `LD_BIND_NOW`. Returns `true` if
+/// the variable is present and its value is non-empty AND non-zero
+/// (i.e. matches any of the conventional truthy spellings
+/// `LD_BIND_NOW=1` / `LD_BIND_NOW=y` / `LD_BIND_NOW=true`). Empty
+/// (`LD_BIND_NOW=`) or zero (`LD_BIND_NOW=0`) values are treated as
+/// "not set" because the conventional shell idiom for disabling the
+/// flag is `unset LD_BIND_NOW` (which removes it from envp) but a
+/// developer who set it once and wants to opt out without clearing
+/// the env spelling expects `LD_BIND_NOW=0` to disable.
+///
+/// # Safety
+/// `stack` must be the genuine kernel-built SysV stack.
+unsafe fn read_ld_bind_now(stack: *const u64) -> bool {
+    // envp starts at `stack + 1 + argc + 1`.
+    let argc = unsafe { *stack } as usize;
+    let mut p = unsafe { stack.add(1).add(argc).add(1) } as *const *const u8;
+    loop {
+        let entry = unsafe { *p };
+        if entry.is_null() {
+            return false;
+        }
+        // Match "LD_BIND_NOW=" prefix; tolerate truncation.
+        const PREFIX: &[u8] = b"LD_BIND_NOW=";
+        let mut ok = true;
+        for (i, want) in PREFIX.iter().enumerate() {
+            let b = unsafe { *entry.add(i) };
+            if b != *want {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            let val_start = unsafe { entry.add(PREFIX.len()) };
+            let first = unsafe { *val_start };
+            // Empty value → not set.
+            if first == 0 {
+                return false;
+            }
+            // Single-char "0" → off (also "0\0", regardless of trailing).
+            if first == b'0' && unsafe { *val_start.add(1) } == 0 {
+                return false;
+            }
+            return true;
+        }
+        p = unsafe { p.add(1) };
+    }
+}
+
 /// The bring-up driver. Returns the main binary's `AT_ENTRY` value
 /// for the asm caller to `jmp` to. Returns 0 on any unrecoverable
 /// error (the asm caller will then `jmp 0` and the kernel reports a
@@ -1223,11 +1271,23 @@ unsafe fn parse_auxv(stack: *const u64) -> (u64, *const Phdr, usize, u64) {
 /// `_start` and never invokes this function from any other context.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
-    serial(b"ldso(76c): _dlstart\n");
+    serial(b"ldso(76d): _dlstart\n");
     let (at_base, at_phdr, at_phnum, at_entry) = unsafe { parse_auxv(stack) };
     if at_phdr.is_null() || at_phnum == 0 || at_entry == 0 {
         serial(b"ldso: missing AT_PHDR/AT_PHNUM/AT_ENTRY\n");
         return 0;
+    }
+
+    // -- Phase 76d.E4.1 — Read `LD_BIND_NOW` from envp BEFORE any
+    // relocation pass runs, so apply_rela's JUMP_SLOT arm sees the
+    // correct mode. The flag flips `plt::BIND_NOW` from POSIX-default
+    // lazy (false) to eager (true) when the variable is non-empty
+    // and non-zero. Track D2.3 also reads `plt::BIND_NOW` for the
+    // strict-mode version-mismatch handler.
+    let bind_now = unsafe { read_ld_bind_now(stack) };
+    if bind_now {
+        plt::BIND_NOW.store(true, core::sync::atomic::Ordering::Release);
+        serial(b"ldso(76d): LD_BIND_NOW=1 (eager resolve)\n");
     }
 
     // -- Self-relocation ----------------------------------------------------
