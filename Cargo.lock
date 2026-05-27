@@ -1050,7 +1050,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.75.0"
+version = "0.76.0"
 dependencies = [
  "bootloader_api",
  "kernel-core",
@@ -1096,6 +1096,10 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 dependencies = [
  "spin",
 ]
+
+[[package]]
+name = "ld-musl-x86_64-so-1"
+version = "0.1.0"
 
 [[package]]
 name = "leb128fmt"

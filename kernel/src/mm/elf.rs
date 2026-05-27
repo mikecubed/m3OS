@@ -33,6 +33,21 @@ const EM_X86_64: u16 = 0x3E;
 
 const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
+/// Phase 76: program-header type carrying the path to the dynamic
+/// linker (typically `/lib/ld-musl-x86_64.so.1`). When present, the
+/// kernel loads the named interpreter ELF and transfers control to its
+/// entry instead of the main binary's entry; the main binary's entry
+/// is carried in `AT_ENTRY` so the interpreter knows where to jump
+/// after bring-up.
+const PT_INTERP: u32 = 3;
+
+/// Hint for where to place the interpreter's load bias. The actual
+/// bias is `max(INTERP_LOAD_BASE_HINT, main_top_page_aligned + 64 KiB)`
+/// — the 64 KiB padding guarantees the interpreter never overlaps the
+/// main binary even when the main binary lays out segments past
+/// `INTERP_LOAD_BASE_HINT`. The value sits well inside the userspace
+/// canonical range and well below the stack at `ELF_STACK_TOP`.
+pub const INTERP_LOAD_BASE_HINT: u64 = 0x4000_0000;
 
 // ELF segment flags
 const PF_X: u32 = 0x1; // Execute
@@ -124,7 +139,12 @@ pub enum ElfError {
 
 /// Result of a successful ELF load.
 pub struct LoadedElf {
-    /// Virtual address of the entry point.
+    /// Virtual address of the entry point control transfers to. For
+    /// statically linked binaries (no `PT_INTERP`) this is the main
+    /// binary's `e_entry`. For dynamically linked binaries this is the
+    /// **interpreter's** entry (e.g. `_dlstart`) — the main binary's
+    /// entry is carried separately in `aux_extras.at_entry` so the
+    /// auxiliary vector can hand it to the interpreter.
     pub entry: u64,
     /// Virtual address of the top of the allocated user stack.
     pub stack_top: u64,
@@ -135,14 +155,26 @@ pub struct LoadedElf {
     pub phentsize: u16,
     /// Number of program header entries (for AT_PHNUM).
     pub phnum: u16,
+    /// Phase 76: extra auxv entries the loader needs to emit when
+    /// `PT_INTERP` was honored. `Some` ⇒ the auxv will carry
+    /// `AT_BASE` (interpreter load bias) and `AT_ENTRY` (main binary
+    /// entry). `None` ⇒ no interpreter, so the auxv keeps its
+    /// pre-Phase-76 6-entry shape and existing static binaries are
+    /// unaffected.
+    pub aux_extras: Option<kernel_core::elf::auxv::AuxExtras>,
 }
 
-/// Program-header values published in the initial process auxiliary vector.
+/// Program-header values published in the initial process auxiliary
+/// vector. Phase 76 extends this with `aux_extras`: when `Some`, the
+/// auxv emits `AT_BASE` (interpreter load bias) and `AT_ENTRY` (main
+/// binary entry) so the dynamic linker can locate both itself and the
+/// program it is about to bring up.
 #[derive(Clone, Copy)]
 pub struct ElfAuxInfo {
     pub phdr_vaddr: u64,
     pub phentsize: u16,
     pub phnum: u16,
+    pub aux_extras: Option<kernel_core::elf::auxv::AuxExtras>,
 }
 
 impl LoadedElf {
@@ -151,6 +183,7 @@ impl LoadedElf {
             phdr_vaddr: self.phdr_vaddr,
             phentsize: self.phentsize,
             phnum: self.phnum,
+            aux_extras: self.aux_extras,
         }
     }
 }
@@ -572,13 +605,25 @@ pub unsafe fn setup_abi_stack_with_envp(
         }
         cursor &= !7; // realign to 8 bytes
 
-        // Now build the pointer table growing downward:
-        // aux vector, envp NULL, argv NULLs + pointers, argc
-        //
+        // Build the auxv layout via the pure-logic kernel-core helper
+        // so the byte-exact ordering is host-testable (see
+        // `kernel-core/src/elf/auxv.rs`).  The helper returns entries
+        // in **low-to-high** address order; we write them onto the
+        // stack high-to-low here, so iterate in reverse.
+        let auxv_entries = kernel_core::elf::auxv::build_layout(
+            kernel_core::elf::auxv::PhdrInfo {
+                phdr_vaddr: aux.phdr_vaddr,
+                phentsize: aux.phentsize,
+                phnum: aux.phnum,
+            },
+            aux.aux_extras,
+            at_random_ptr,
+        );
+
         // SysV AMD64 ABI: RSP at `_start` must be 8 mod 16.
         // Calculate the total size of the pointer table so we can align
         // BEFORE writing it, keeping argc/argv/envp contiguous.
-        let auxv_slots = 6 * 2; // 6 entries × 2 (key + value)
+        let auxv_slots = auxv_entries.len() * 2; // each entry = (key, value)
         let envp_slots = env_ptrs.len() + 1; // pointers + NULL
         let argv_slots = arg_ptrs.len() + 1; // pointers + NULL
         let argc_slot = 1;
@@ -589,14 +634,6 @@ pub unsafe fn setup_abi_stack_with_envp(
         if target % 16 != 8 {
             cursor -= 8; // alignment pad goes ABOVE the auxv
         }
-
-        // Auxiliary vector (key, value pairs, terminated by AT_NULL).
-        const AT_PHDR: u64 = 3;
-        const AT_PHENT: u64 = 4;
-        const AT_PHNUM: u64 = 5;
-        const AT_PAGESZ: u64 = 6;
-        const AT_RANDOM: u64 = 25;
-        const AT_NULL: u64 = 0;
 
         // Helper to push one auxv entry (type, value).
         let push_aux = |cursor: &mut u64, key: u64, val: u64| -> Result<(), ElfError> {
@@ -609,12 +646,9 @@ pub unsafe fn setup_abi_stack_with_envp(
             Ok(())
         };
 
-        push_aux(&mut cursor, AT_NULL, 0)?;
-        push_aux(&mut cursor, AT_RANDOM, at_random_ptr)?;
-        push_aux(&mut cursor, AT_PAGESZ, 4096)?;
-        push_aux(&mut cursor, AT_PHNUM, aux.phnum as u64)?;
-        push_aux(&mut cursor, AT_PHENT, aux.phentsize as u64)?;
-        push_aux(&mut cursor, AT_PHDR, aux.phdr_vaddr)?;
+        for entry in auxv_entries.iter().rev() {
+            push_aux(&mut cursor, entry.a_type, entry.a_val)?;
+        }
 
         // envp: pointers followed by NULL terminator.
         cursor -= 8;
@@ -650,6 +684,13 @@ pub unsafe fn setup_abi_stack_with_envp(
 // Public entry points
 // ---------------------------------------------------------------------------
 
+/// Callback signature for reading interpreter ELFs from the VFS.
+/// `mm::elf` cannot directly depend on the syscall module, so the
+/// caller passes this closure when it wants `PT_INTERP` to be honored.
+/// Callers that load static binaries (the boot `/sbin/init` path)
+/// pass `None`.
+pub type InterpReader<'a> = &'a dyn Fn(&str) -> Option<alloc::vec::Vec<u8>>;
+
 /// Load an ELF64 binary from `data` into `mapper`.
 ///
 /// This is the core loader used by both `load_elf` (active CR3) and
@@ -661,6 +702,16 @@ pub unsafe fn setup_abi_stack_with_envp(
 /// used only for the Phase 75 W^X-violation rejection warning and the
 /// per-segment "mapped" trace.
 ///
+/// Phase 76: if `interpreter_reader` is `Some` and the binary carries a
+/// `PT_INTERP` segment, the named interpreter is read from the VFS,
+/// parsed, and mapped at a non-overlapping load bias. The returned
+/// `LoadedElf.entry` becomes the **interpreter's** entry (so control
+/// transfers to `_dlstart`); the main binary's entry is carried in
+/// `LoadedElf.aux_extras.at_entry` so the auxv can hand it to the
+/// interpreter. If `interpreter_reader` is `None` and `PT_INTERP` is
+/// present, the load fails with `MappingFailed("PT_INTERP without
+/// reader")` — this prevents silent fallback to the wrong entry point.
+///
 /// # Safety
 /// `mapper` must have exclusive access to its PML4 and `phys_off` must be
 /// the correct physical-memory offset for this machine.
@@ -669,6 +720,26 @@ pub unsafe fn load_elf_into(
     phys_off: u64,
     data: &[u8],
     binary_name: &str,
+) -> Result<LoadedElf, ElfError> {
+    // SAFETY: caller upholds load_elf_into's invariants; pass-through.
+    unsafe { load_elf_into_with_interp(mapper, phys_off, data, binary_name, None) }
+}
+
+/// Same as `load_elf_into` but accepts an `InterpReader` for honoring
+/// `PT_INTERP`. The split keeps existing call sites that load static
+/// binaries (`spawn_userspace_init`) unchanged while letting the
+/// `execve` path opt in.
+///
+/// # Safety
+/// Same constraints as `load_elf_into`. The `interpreter_reader`
+/// closure must return ELF bytes that are independently valid (the
+/// caller is trusted not to inject crafted bytes).
+pub unsafe fn load_elf_into_with_interp(
+    mapper: &mut OffsetPageTable<'_>,
+    phys_off: u64,
+    data: &[u8],
+    binary_name: &str,
+    interpreter_reader: Option<InterpReader<'_>>,
 ) -> Result<LoadedElf, ElfError> {
     unsafe {
         let ehdr = parse_ehdr(data)?;
@@ -679,6 +750,7 @@ pub unsafe fn load_elf_into(
 
         // Find minimum LOAD segment vaddr (needed for load_bias and phdr_vaddr).
         let mut min_vaddr = u64::MAX;
+        let mut max_vaddr_end = 0u64;
         for i in 0..phnum {
             let base = phoff
                 .checked_add(
@@ -689,6 +761,11 @@ pub unsafe fn load_elf_into(
             let phdr = parse_phdr(data, base, phentsize)?;
             if phdr.p_type == PT_LOAD && phdr.p_memsz > 0 {
                 min_vaddr = min_vaddr.min(phdr.p_vaddr);
+                let end = phdr
+                    .p_vaddr
+                    .checked_add(phdr.p_memsz)
+                    .ok_or(ElfError::MappingFailed("LOAD vaddr+memsz overflow"))?;
+                max_vaddr_end = max_vaddr_end.max(end);
             }
         }
 
@@ -706,8 +783,9 @@ pub unsafe fn load_elf_into(
             return Err(ElfError::MappingFailed("unsupported ELF type"));
         };
 
-        // Track the PT_DYNAMIC segment for relocation processing.
+        // Track the PT_DYNAMIC and PT_INTERP segments.
         let mut dyn_offset: Option<(u64, u64)> = None; // (p_offset, p_filesz)
+        let mut interp_segment: Option<(u64, u64)> = None; // (p_offset, p_filesz)
 
         for i in 0..phnum {
             let base = phoff
@@ -724,6 +802,9 @@ pub unsafe fn load_elf_into(
             if phdr.p_type == PT_DYNAMIC {
                 dyn_offset = Some((phdr.p_offset, phdr.p_filesz));
             }
+            if phdr.p_type == PT_INTERP {
+                interp_segment = Some((phdr.p_offset, phdr.p_filesz));
+            }
         }
 
         // Apply R_X86_64_RELATIVE relocations for PIE binaries.
@@ -733,6 +814,56 @@ pub unsafe fn load_elf_into(
             apply_rela_relocations(
                 mapper, phys_off, data, dyn_off, dyn_sz, load_bias, min_vaddr,
             );
+        }
+
+        // Phase 76: if PT_INTERP is present, load the interpreter.
+        // Compute its load bias to sit safely above the main binary so
+        // there is no segment collision.
+        let mut aux_extras: Option<kernel_core::elf::auxv::AuxExtras> = None;
+        let mut entry = ehdr.entry + load_bias;
+
+        if let Some((interp_off, interp_sz)) = interp_segment {
+            let reader =
+                interpreter_reader.ok_or(ElfError::MappingFailed("PT_INTERP without reader"))?;
+            let interp_path = read_interp_path(data, interp_off, interp_sz)?;
+            log::info!("elf: PT_INTERP={} (binary={})", interp_path, binary_name,);
+
+            let interp_data = reader(interp_path).ok_or_else(|| {
+                log::warn!("elf: PT_INTERP target not found in VFS: {}", interp_path);
+                ElfError::MappingFailed("PT_INTERP not found")
+            })?;
+
+            // Round main-binary's top up to the next page, then add a
+            // 64 KiB safety pad. Then take the max with the hint so
+            // we stay well away from the 4 MiB main-binary base.
+            let main_top_aligned = (max_vaddr_end
+                .checked_add(load_bias)
+                .ok_or(ElfError::MappingFailed("interp bias overflow"))?
+                .checked_add(0xFFFF)
+                .ok_or(ElfError::MappingFailed("interp bias overflow"))?)
+                & !0xFFFF;
+            let interp_bias_floor = main_top_aligned.max(INTERP_LOAD_BASE_HINT);
+
+            let interp_loaded = map_interpreter(
+                mapper,
+                phys_off,
+                &interp_data,
+                interp_path,
+                interp_bias_floor,
+            )?;
+
+            log::info!(
+                "elf: interp loaded base={:#x} entry={:#x} main_entry={:#x}",
+                interp_loaded.load_bias,
+                interp_loaded.entry,
+                entry,
+            );
+
+            aux_extras = Some(kernel_core::elf::auxv::AuxExtras {
+                at_base: interp_loaded.load_bias,
+                at_entry: entry, // main binary entry, carried for the linker
+            });
+            entry = interp_loaded.entry; // kernel transfers to _dlstart
         }
 
         let stack_top = map_user_stack(mapper)?;
@@ -751,11 +882,126 @@ pub unsafe fn load_elf_into(
         };
 
         Ok(LoadedElf {
-            entry: ehdr.entry + load_bias,
+            entry,
             stack_top,
             phdr_vaddr,
             phentsize: ehdr.phentsize,
             phnum: ehdr.phnum,
+            aux_extras,
+        })
+    }
+}
+
+/// Read the interpreter path string from a `PT_INTERP` segment. The
+/// segment carries a NUL-terminated UTF-8 path up to `p_filesz` bytes.
+fn read_interp_path(data: &[u8], p_offset: u64, p_filesz: u64) -> Result<&str, ElfError> {
+    if p_filesz == 0 || p_filesz > 4096 {
+        return Err(ElfError::MappingFailed("PT_INTERP invalid filesz"));
+    }
+    let start = usize::try_from(p_offset).map_err(|_| ElfError::TruncatedProgramHeader)?;
+    let end = start
+        .checked_add(usize::try_from(p_filesz).map_err(|_| ElfError::TruncatedProgramHeader)?)
+        .ok_or(ElfError::TruncatedProgramHeader)?;
+    let bytes = data
+        .get(start..end)
+        .ok_or(ElfError::TruncatedProgramHeader)?;
+    // Find the NUL terminator (PT_INTERP includes the trailing NUL in
+    // p_filesz on every Linux toolchain we care about).
+    let nul = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    core::str::from_utf8(&bytes[..nul]).map_err(|_| ElfError::MappingFailed("PT_INTERP not UTF-8"))
+}
+
+struct LoadedInterp {
+    entry: u64,
+    load_bias: u64,
+}
+
+/// Map a dynamic linker ELF into the new process at a chosen load
+/// bias. Mirrors `load_elf_into` but stripped down: no stack
+/// allocation, no PT_INTERP recursion (a linker cannot itself have a
+/// linker), and the caller-supplied `bias_floor` overrides the default
+/// PIE bias so the interpreter never collides with the main binary.
+///
+/// # Safety
+/// Same constraints as `load_elf_into`: `mapper` must own the PML4.
+unsafe fn map_interpreter(
+    mapper: &mut OffsetPageTable<'_>,
+    phys_off: u64,
+    data: &[u8],
+    interp_path: &str,
+    bias_floor: u64,
+) -> Result<LoadedInterp, ElfError> {
+    unsafe {
+        let ehdr = parse_ehdr(data)?;
+        if ehdr.e_type != ET_DYN {
+            return Err(ElfError::MappingFailed(
+                "interpreter is not ET_DYN (must be PIE)",
+            ));
+        }
+
+        let phoff = ehdr.phoff as usize;
+        let phentsize = ehdr.phentsize as usize;
+        let phnum = ehdr.phnum as usize;
+
+        let mut min_vaddr = u64::MAX;
+        for i in 0..phnum {
+            let base = phoff
+                .checked_add(
+                    i.checked_mul(phentsize)
+                        .ok_or(ElfError::TruncatedProgramHeader)?,
+                )
+                .ok_or(ElfError::TruncatedProgramHeader)?;
+            let phdr = parse_phdr(data, base, phentsize)?;
+            if phdr.p_type == PT_LOAD && phdr.p_memsz > 0 {
+                min_vaddr = min_vaddr.min(phdr.p_vaddr);
+            }
+        }
+
+        let load_bias = if min_vaddr == u64::MAX {
+            bias_floor
+        } else {
+            bias_floor.saturating_sub(min_vaddr)
+        };
+
+        // Track PT_DYNAMIC for the interpreter's own R_X86_64_RELATIVE
+        // entries — the linker is a PIE ELF and its data-section
+        // pointers need rebasing before any global access. Phase 76
+        // applies these relocations via the existing
+        // `apply_rela_relocations` helper, identical to the main-binary
+        // PIE path.
+        let mut dyn_offset: Option<(u64, u64)> = None;
+
+        for i in 0..phnum {
+            let base = phoff
+                .checked_add(
+                    i.checked_mul(phentsize)
+                        .ok_or(ElfError::TruncatedProgramHeader)?,
+                )
+                .ok_or(ElfError::TruncatedProgramHeader)?;
+            let phdr = parse_phdr(data, base, phentsize)?;
+            if phdr.p_type == PT_LOAD {
+                map_load_segment(mapper, phys_off, data, &phdr, load_bias, interp_path)?;
+            }
+            if phdr.p_type == PT_DYNAMIC {
+                dyn_offset = Some((phdr.p_offset, phdr.p_filesz));
+            }
+            if phdr.p_type == PT_INTERP {
+                // A linker cannot itself have a linker.
+                return Err(ElfError::MappingFailed(
+                    "interpreter unexpectedly carries PT_INTERP",
+                ));
+            }
+        }
+
+        if let Some((dyn_off, dyn_sz)) = dyn_offset {
+            apply_rela_relocations(
+                mapper, phys_off, data, dyn_off, dyn_sz, load_bias, min_vaddr,
+            );
+        }
+
+        Ok(LoadedInterp {
+            entry: ehdr.entry + load_bias,
+            load_bias,
         })
     }
 }

@@ -20,6 +20,16 @@ const PAGE_GRANT_PASS_NEEDLE: &[u8] = b"PAGE_GRANT_SMOKE:roundtrip:ok";
 const WX_VIOLATION_PATH: &[u8] = b"/bin/wx-violation\0";
 const WX_VIOLATION_ARGV0: &[u8] = b"wx-violation\0";
 const WX_VIOLATION_PASS_NEEDLE: &[u8] = b"WX_VIOLATION:smoke:ok";
+// Phase 76 — `dynlink_smoke` is a musl-built dynamic ELF carrying
+// `PT_INTERP = /lib/ld-musl-x86_64.so.1` and zero `DT_NEEDED`
+// entries. Running it exercises the kernel `PT_INTERP` branch +
+// the ld.so transfer-only stub end to end. The sentinel
+// (`DYNLINK_SMOKE:PASS`) is written via inline-asm `syscall` so the
+// binary touches no libc symbols and 76b's full bring-up is not
+// required for the gate to pass.
+const DYNLINK_SMOKE_PATH: &[u8] = b"/bin/dynlink_smoke\0";
+const DYNLINK_SMOKE_ARGV0: &[u8] = b"dynlink_smoke\0";
+const DYNLINK_SMOKE_PASS_NEEDLE: &[u8] = b"DYNLINK_SMOKE:PASS";
 const CAPTURE_FILE_PATH: &[u8] = b"/tmp/smoke-runner.capture\0";
 const LOGGER_PATH: &[u8] = b"/bin/logger\0";
 const SYSTEM_LOG_PATH: &[u8] = b"/var/log/messages\0";
@@ -157,6 +167,37 @@ fn program_main(_args: &[&str]) -> i32 {
         return code;
     }
     pass("wx-violation");
+
+    // Phase 76 — exercise the kernel PT_INTERP branch + ld.so
+    // transfer-only stub. The dynlink_smoke binary writes the
+    // sentinel below to stderr (fd 2) via inline-asm syscalls so it
+    // has zero DT_NEEDED entries; the linker's only job is to walk
+    // the auxv for AT_ENTRY and jmp. The smoke gate is the byte-exact
+    // proof that kernel → ld.so → main hand-off works.
+    //
+    // The dynlink_smoke binary's build can SKIP at xtask time if
+    // musl-gcc and host gcc are both missing (the staging step
+    // detects a zero-byte placeholder and emits SKIP). Detect that
+    // here so a missing C toolchain does not break the gate.
+    {
+        let mut probe = Stat::zeroed();
+        if stat(DYNLINK_SMOKE_PATH, &mut probe) < 0 || probe.st_size == 0 {
+            skip("dynlink-smoke");
+        } else {
+            begin("dynlink-smoke");
+            let dynlink_argv = [DYNLINK_SMOKE_ARGV0.as_ptr(), ptr::null()];
+            if let Err(code) = run_command_expect_output(
+                "dynlink-smoke",
+                DYNLINK_SMOKE_PATH,
+                &dynlink_argv,
+                DYNLINK_SMOKE_PASS_NEEDLE,
+                &mut command_output,
+            ) {
+                return code;
+            }
+            pass("dynlink-smoke");
+        }
+    }
 
     write_str(STDOUT_FILENO, "SMOKE:PASS\n");
     0

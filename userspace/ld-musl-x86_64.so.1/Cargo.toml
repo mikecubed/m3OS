@@ -1,0 +1,20 @@
+[package]
+name = "ld-musl-x86_64-so-1"
+version = "0.1.0"
+edition = "2024"
+
+# Phase 76 scaffolding: the dynamic linker is a no_std PIE ELF that
+# the kernel loads when a binary carries PT_INTERP. In Phase 76 the
+# linker is intentionally a **transfer-only stub** — it walks the
+# auxv for AT_ENTRY and jmps. Real DT_NEEDED resolution + relocation
+# application + constructor running ships in Phase 76b.
+#
+# The crate name uses an underscore (`ld-musl-x86_64-so-1`) because
+# cargo rejects dots in package names. The output binary is renamed
+# to `ld-musl-x86_64.so.1` by the xtask staging step so the on-disk
+# path matches what PT_INTERP records in the test binaries.
+[[bin]]
+name = "ld-musl-x86_64-so-1"
+path = "src/main.rs"
+
+[dependencies]

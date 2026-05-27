@@ -311,6 +311,16 @@ static PAGE_GRANT_TEST_ELF: &[u8] = generated_initrd_asset!("page-grant-test");
 // no `.conf`.
 static WX_VIOLATION_ELF: &[u8] = generated_initrd_asset!("wx-violation");
 
+// Phase 76 — `dynlink_smoke` musl-built dynamic ELF carrying
+// `PT_INTERP = /lib/ld-musl-x86_64.so.1` and zero `DT_NEEDED`
+// entries. The smoke-runner execs this to validate the kernel
+// `PT_INTERP` branch + the ld.so transfer-only stub end to end.
+// `include_bytes!` accepts a zero-byte placeholder gracefully (the
+// smoke runner detects size==0 and emits SKIP at runtime), so this
+// definition is always present even when the host lacks a C
+// compiler.
+static DYNLINK_SMOKE_ELF: &[u8] = generated_initrd_asset!("dynlink_smoke");
+
 // Phase 70 follow-up — `doom-concurrent` forks two `doom` processes
 // and waits for both. Run from the post-login shell by `cargo xtask
 // doom-concurrent-smoke` to assert real kernel-level concurrency
@@ -576,6 +586,14 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "wx-violation",
         RamdiskNode::File {
             content: WX_VIOLATION_ELF,
+        },
+    ),
+    // Phase 76: dynlink_smoke — kernel PT_INTERP + ld.so transfer
+    // smoke. Drives the dynlink-smoke step in the SMOKE: gate.
+    (
+        "dynlink_smoke",
+        RamdiskNode::File {
+            content: DYNLINK_SMOKE_ELF,
         },
     ),
     // Phase 70 follow-up: doom-concurrent — forks two doom children
@@ -919,6 +937,25 @@ static ETC_ENTRIES: &[(&str, RamdiskNode)] = &[
 
 static SBIN_ENTRIES: &[(&str, RamdiskNode)] = &[("init", RamdiskNode::File { content: INIT_ELF })];
 
+// Phase 76 — dynamic linker (`ld-musl-x86_64.so.1`). Staged in both
+// the ramdisk and the ext2 `/lib/` so the kernel's `PT_INTERP` branch
+// can resolve the path before ext2 is mounted (early-boot smoke).
+//
+// The macro path uses dots in the filename (`ld-musl-x86_64.so.1`),
+// matching the on-disk staging produced by `xtask::build_ldso`. The
+// generated-libs directory is a sibling of generated-initrd; we reach
+// it via `../generated-libs/` because the existing
+// `generated_initrd_asset!` macro is keyed off generated-initrd.
+static LDSO_ELF: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../target/generated-libs/ld-musl-x86_64.so.1"
+));
+
+static LIB_ENTRIES: &[(&str, RamdiskNode)] = &[(
+    "ld-musl-x86_64.so.1",
+    RamdiskNode::File { content: LDSO_ELF },
+)];
+
 // Phase 55b Tracks D.1 / E.1 — hardware driver ELFs. Ring-3 drivers live
 // under `/drivers/<name>` so init's service registration (Track F.1) and
 // any future `execve` call can target a canonical path that is not mixed
@@ -970,6 +1007,15 @@ static ROOT_ENTRIES: &[(&str, RamdiskNode)] = &[
         "drivers",
         RamdiskNode::Dir {
             children: DRIVERS_ENTRIES,
+        },
+    ),
+    // Phase 76 — `/lib/ld-musl-x86_64.so.1` reachable via the ramdisk
+    // path. The kernel's PT_INTERP reader tries the ramdisk first
+    // before falling back to the ext2 mount.
+    (
+        "lib",
+        RamdiskNode::Dir {
+            children: LIB_ENTRIES,
         },
     ),
 ];

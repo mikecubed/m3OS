@@ -162,6 +162,10 @@ members = [
     # SHM, text rendering) consumed by bar / launcher / notifyd /
     # lockscreen.
     "userspace/lib/desktop_client",
+    # Phase 76 — dynamic linker (no_std PIE). Phase 76 ships the
+    # transfer-only stub; Phase 76b grows it into a real bring-up
+    # linker that walks DT_NEEDED and applies relocations.
+    "userspace/ld-musl-x86_64.so.1",
 ]
 
 # Exclude xtask and userspace from default build — kernel only
