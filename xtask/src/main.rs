@@ -55,6 +55,14 @@ const USERSPACE_LIB_HOST_TEST_PACKAGES: &[(&str, &[&str])] = &[
         "shadow",
         &["--no-default-features", "--features", "host-tests"],
     ),
+    // Phase 76b/c/d — pure-logic `ldso_core` library hosting the
+    // relocation primitives, `DT_HASH` walker, topo-sort, handle-table
+    // slab, and the Phase 76d.D1 GNU-hash + D2 versioning paths. Needs
+    // `--lib` because the bin target is `#![no_main]` and cannot link
+    // on the host. Phase 76d.S1.1 introduces the `sym.rs` dispatch
+    // surface; running these tests on every `xtask check` keeps the
+    // backend-dispatch + relocation slice-helper contract honest.
+    ("ld-musl-x86_64-so-1", &["--lib"]),
 ];
 
 /// QEMU arguments enabling an emulated Intel VT-d IOMMU on the q35 machine.
@@ -4620,7 +4628,7 @@ fn cmd_check() {
     doom_c_test_step(&root);
 
     println!(
-        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, and shadow host tests pass; doom platform-layer C tests pass"
+        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, shadow, and ldso_core host tests pass; doom platform-layer C tests pass"
     );
 }
 

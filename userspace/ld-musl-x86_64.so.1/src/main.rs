@@ -54,18 +54,19 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod dl;
+pub(crate) mod sym;
 
 use core::arch::naked_asm;
 use core::panic::PanicInfo;
 
 use ldso_core::dynlink::{
-    DsoId, DynamicSection, LoadedDso, MAX_DSOS, MAX_NEEDED, TopoError, elf_hash, topo_sort,
+    DsoId, DynamicSection, LoadedDso, MAX_DSOS, MAX_NEEDED, TopoError, topo_sort,
 };
 use ldso_core::elf64::{
     DT_NULL, Dyn, PT_DYNAMIC, PT_LOAD, Phdr, R_X86_64_64, R_X86_64_GLOB_DAT, R_X86_64_JUMP_SLOT,
     R_X86_64_RELATIVE, Rela, Sym, r_sym, r_type,
 };
-use ldso_core::reloc::apply_abs64;
+use ldso_core::reloc::{apply_abs64, apply_glob_dat, apply_relative};
 
 // ---------------------------------------------------------------------------
 // AT_* constants (subset we read).
@@ -264,18 +265,34 @@ fn serial_hex(mut value: u64) {
 /// own load image, and the call must occur before any Rust global is
 /// dereferenced through a GOT-routed read.
 unsafe fn dl_relocate_self(phdr_base: *const Phdr, phnum: usize, load_bias: u64) {
-    // Find PT_DYNAMIC for the linker's image.
+    // Find PT_DYNAMIC for the linker's image. Simultaneously compute
+    // the image span so the per-RELA slice view passed into
+    // `apply_relative` carries a real bound — Phase 76d.S1.3 routes
+    // every write-site through the `ldso_core::reloc` slice helpers
+    // so the runtime hits the same alignment + bounds path that the
+    // host tests pin.
     let mut dyn_ptr: *const Dyn = core::ptr::null();
+    let mut image_end: u64 = 0;
     for i in 0..phnum {
         let ph = unsafe { &*phdr_base.add(i) };
+        if ph.p_type == PT_LOAD {
+            let end = ph.p_vaddr.wrapping_add(ph.p_memsz);
+            if end > image_end {
+                image_end = end;
+            }
+        }
         if ph.p_type == PT_DYNAMIC {
             dyn_ptr = (load_bias.wrapping_add(ph.p_vaddr)) as *const Dyn;
-            break;
         }
     }
     if dyn_ptr.is_null() {
         return; // No PT_DYNAMIC ⇒ no relocations to apply.
     }
+    let image_len = if image_end == 0 {
+        0
+    } else {
+        ((image_end + 4095) & !4095) as usize
+    };
     // Walk DT_RELA / DT_RELASZ inline (no allocation, no helper).
     let mut rela: *const Rela = core::ptr::null();
     let mut relasz: u64 = 0;
@@ -302,13 +319,24 @@ unsafe fn dl_relocate_self(phdr_base: *const Phdr, phnum: usize, load_bias: u64)
         let r = unsafe { *rela.add(i) };
         let t = r_type(r.r_info);
         if t == R_X86_64_RELATIVE {
-            let target = (load_bias.wrapping_add(r.r_offset)) as *mut u64;
-            let value = load_bias.wrapping_add(r.r_addend as u64);
-            // `write_unaligned` keeps this safe even if a malformed
-            // (or future tooling-generated) RELA in the linker's own
-            // image carries a non-8-byte-aligned `r_offset`. Rust's
-            // aligned `ptr::write` would be UB in that case.
-            unsafe { core::ptr::write_unaligned(target, value) };
+            // Route through the host-tested `apply_relative` slice
+            // helper. The slice covers the whole image; the helper
+            // writes 8 bytes at `r.r_offset` and bounds-checks the
+            // range internally. The slice is re-borrowed per iteration
+            // so it does not overlap with the raw-pointer read of the
+            // next RELA above.
+            //
+            // SAFETY: the linker's own image is mapped RW (text was
+            // not yet mprotected R-X — the kernel maps the linker
+            // with the same load flags as any PIE), and we are
+            // single-threaded. No other code holds a slice into the
+            // image while this loop runs.
+            let image: &mut [u8] =
+                unsafe { core::slice::from_raw_parts_mut(load_bias as *mut u8, image_len) };
+            if let Err(_e) = apply_relative(&r, load_bias, image) {
+                serial(b"ldso: dl_relocate_self: apply_relative failed\n");
+                sys_exit(ELIBBAD_CODE);
+            }
         } else {
             // Any other relocation type in the linker's own image is
             // a build-time bug — the bring-up linker is built with
@@ -811,59 +839,13 @@ unsafe fn load_dso_impl(fd: i64, scratch: u64, scratch_len: u64) -> Result<Loade
 }
 
 // ---------------------------------------------------------------------------
-// Symbol lookup across the loaded-DSO list.
-// ---------------------------------------------------------------------------
-
-/// Resolve a symbol name by walking the SysV `DT_HASH` table of each
-/// loaded DSO in search order (main binary first, then deps in load
-/// order — matches the SysV global scope).
-unsafe fn lookup_symbol(name: &[u8], dsos: &[LoadedDso]) -> Option<u64> {
-    for dso in dsos {
-        let hash_ptr = match dso.dyn_.hash {
-            Some(p) => p.as_ptr(),
-            None => continue,
-        };
-        let symtab = match dso.dyn_.symtab {
-            Some(p) => p.as_ptr(),
-            None => continue,
-        };
-        let strtab = match dso.dyn_.strtab {
-            Some(p) => p.as_ptr(),
-            None => continue,
-        };
-        let nbuckets = unsafe { *hash_ptr } as usize;
-        let nchain = unsafe { *hash_ptr.add(1) } as usize;
-        if nbuckets == 0 {
-            continue;
-        }
-        let buckets = unsafe { hash_ptr.add(2) };
-        let chain = unsafe { buckets.add(nbuckets) };
-        let h = elf_hash(name);
-        let mut idx = unsafe { *buckets.add(h as usize % nbuckets) };
-        let mut hops = 0usize;
-        while idx != 0 && hops <= nchain {
-            if (idx as usize) >= nchain {
-                break;
-            }
-            let sym = unsafe { &*symtab.add(idx as usize) };
-            let nm = unsafe { strtab_get(strtab, sym.st_name as u64, dso.dyn_.strsz) };
-            if nm == name && sym.st_value != 0 {
-                return Some(dso.load_bias.wrapping_add(sym.st_value));
-            }
-            idx = unsafe { *chain.add(idx as usize) };
-            hops += 1;
-        }
-    }
-    None
-}
-
-// ---------------------------------------------------------------------------
 // Relocation walker (Track B3.1 / B3.2 / B3.3).
 // ---------------------------------------------------------------------------
 
 /// Walk a `Rela` table at `table` of `count` entries and apply each
 /// relocation against `dso.load_bias`. Symbol resolution routes
-/// through [`lookup_symbol`] against the full loaded-DSO list.
+/// through [`sym::lookup`] (Phase 76d.S1.1's unified dispatch) against
+/// the full loaded-DSO list.
 unsafe fn apply_rela(
     dso: &LoadedDso,
     table: *const Rela,
@@ -892,15 +874,29 @@ unsafe fn apply_rela(
             serial(b"ldso: relocation r_offset outside image\n");
             return Err("relocation outside image");
         }
-        let target = (dso.load_bias.wrapping_add(r.r_offset)) as *mut u64;
         let rt = r_type(r.r_info);
         match rt {
             R_X86_64_RELATIVE => {
-                let value = dso.load_bias.wrapping_add(r.r_addend as u64);
-                // See dl_relocate_self: `write_unaligned` avoids UB on
-                // malformed (or future-tooling) RELAs whose `r_offset`
-                // is not 8-byte aligned.
-                unsafe { core::ptr::write_unaligned(target, value) };
+                // Phase 76d.S1.3: route through the host-tested
+                // `apply_relative` slice helper so the runtime hits
+                // the same alignment + bounds path the host tests
+                // pin. The slice covers the whole image; the helper
+                // writes 8 bytes at `r.r_offset` and bounds-checks
+                // the range internally.
+                //
+                // SAFETY: `dso.load_bias` and `dso.image_len` came
+                // from `load_dso_impl` (or the main-binary loader)
+                // and reference a live mmap. We are single-threaded.
+                let image: &mut [u8] = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        dso.load_bias as *mut u8,
+                        dso.image_len as usize,
+                    )
+                };
+                if let Err(_e) = apply_relative(&r, dso.load_bias, image) {
+                    serial(b"ldso: apply_relative failed\n");
+                    return Err("apply_relative failed");
+                }
             }
             R_X86_64_GLOB_DAT | R_X86_64_JUMP_SLOT => {
                 if strtab.is_null() || symtab.is_null() {
@@ -909,14 +905,26 @@ unsafe fn apply_rela(
                 let sym_idx = r_sym(r.r_info);
                 let sym = unsafe { &*symtab.add(sym_idx as usize) };
                 let name = unsafe { strtab_get(strtab, sym.st_name as u64, dso.dyn_.strsz) };
-                let value = unsafe { lookup_symbol(name, dsos).unwrap_or(0) };
+                let value = unsafe { sym::lookup(dsos, name, None).unwrap_or(0) };
                 if value == 0 {
                     serial(b"ldso: undefined symbol ");
                     serial(name);
                     serial(b"\n");
                     return Err("undefined symbol");
                 }
-                unsafe { core::ptr::write_unaligned(target, value) };
+                // Phase 76d.S1.3: route through `apply_glob_dat` slice
+                // helper. The helper writes 8 bytes at `r.r_offset`
+                // and bounds-checks the range internally.
+                let image: &mut [u8] = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        dso.load_bias as *mut u8,
+                        dso.image_len as usize,
+                    )
+                };
+                if let Err(_e) = apply_glob_dat(&r, dso.load_bias, value, image) {
+                    serial(b"ldso: apply_glob_dat failed\n");
+                    return Err("apply_glob_dat failed");
+                }
             }
             R_X86_64_64 => {
                 if strtab.is_null() || symtab.is_null() {
@@ -925,10 +933,17 @@ unsafe fn apply_rela(
                 let sym_idx = r_sym(r.r_info);
                 let sym = unsafe { &*symtab.add(sym_idx as usize) };
                 let name = unsafe { strtab_get(strtab, sym.st_name as u64, dso.dyn_.strsz) };
-                let value = unsafe { lookup_symbol(name, dsos).unwrap_or(0) };
+                let value = unsafe { sym::lookup(dsos, name, None).unwrap_or(0) };
                 if value == 0 {
                     return Err("undefined symbol (R_X86_64_64)");
                 }
+                // Phase 76b shape: write into the image via `apply_abs64`
+                // on a narrow 8-byte slice. Phase 76d.S1.3 leaves this
+                // arm unchanged because it already routes through
+                // `ldso_core::reloc`; only the three previously-direct
+                // write sites (RELATIVE here + RELATIVE in
+                // `dl_relocate_self` + GLOB_DAT/JUMP_SLOT above) move.
+                let target = (dso.load_bias.wrapping_add(r.r_offset)) as *mut u64;
                 let mut buf = [0u8; 8];
                 let img = unsafe { core::slice::from_raw_parts_mut(target as *mut u8, 8) };
                 let dummy_rela = Rela {
