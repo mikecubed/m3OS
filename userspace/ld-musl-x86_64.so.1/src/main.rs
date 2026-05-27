@@ -54,6 +54,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod dl;
+pub(crate) mod plt;
 pub(crate) mod sym;
 
 use core::arch::naked_asm;
@@ -921,7 +922,7 @@ unsafe fn apply_rela(
                     return Err("apply_relative failed");
                 }
             }
-            R_X86_64_GLOB_DAT | R_X86_64_JUMP_SLOT => {
+            R_X86_64_GLOB_DAT => {
                 if strtab.is_null() || symtab.is_null() {
                     return Err("missing strtab/symtab for sym reloc");
                 }
@@ -947,6 +948,53 @@ unsafe fn apply_rela(
                 if let Err(_e) = apply_glob_dat(&r, dso.load_bias, value, image) {
                     serial(b"ldso: apply_glob_dat failed\n");
                     return Err("apply_glob_dat failed");
+                }
+            }
+            R_X86_64_JUMP_SLOT => {
+                // Phase 76d.B4.4 — JUMP_SLOT is lazy by default once
+                // the trampoline is installed. The dispatcher path:
+                //
+                //   * BIND_NOW=true (Phase 76b/c behaviour, kept as
+                //     the initial default) — resolve immediately,
+                //     write the absolute address into the GOT slot.
+                //     Identical to the GLOB_DAT path above.
+                //   * BIND_NOW=false (E4 default) — leave the static
+                //     linker's image-relative offset alone but add
+                //     `load_bias` so the first call lands on the
+                //     PLT's plt0 stub, which jumps to
+                //     `_dl_runtime_resolve` via `GOT[2]`.
+                //
+                // The trampoline target at `GOT[2]` and the link-map
+                // at `GOT[1]` are installed by
+                // `plt::install_trampoline` after relocations and
+                // before constructors run.
+                if plt::bind_now_set() {
+                    if strtab.is_null() || symtab.is_null() {
+                        return Err("missing strtab/symtab for sym reloc");
+                    }
+                    let sym_idx = r_sym(r.r_info);
+                    let sym = unsafe { &*symtab.add(sym_idx as usize) };
+                    let name = unsafe { strtab_get(strtab, sym.st_name as u64, dso.dyn_.strsz) };
+                    let value = unsafe { sym::lookup(dsos, name, None).unwrap_or(0) };
+                    if value == 0 {
+                        serial(b"ldso: undefined symbol ");
+                        serial(name);
+                        serial(b"\n");
+                        return Err("undefined symbol");
+                    }
+                    let image: &mut [u8] = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            dso.load_bias as *mut u8,
+                            dso.image_len as usize,
+                        )
+                    };
+                    if let Err(_e) = apply_glob_dat(&r, dso.load_bias, value, image) {
+                        serial(b"ldso: apply_glob_dat (JUMP_SLOT eager) failed\n");
+                        return Err("apply_glob_dat failed");
+                    }
+                } else {
+                    // Lazy path — rebase the image-relative offset.
+                    unsafe { plt::apply_jmprel_lazy(dso, &r) };
                 }
             }
             R_X86_64_64 => {
@@ -1555,6 +1603,16 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
         }
     }
 
+    // -- Phase 76d.B4.3 — Install the PLT lazy-resolve trampoline
+    // addresses into each DSO's GOT, BEFORE publication so the
+    // post-publication path can read `link_map` from `DL_STATE`.
+    //
+    // Wait — install_trampoline needs a stable link_map pointer.
+    // `DL_STATE.dsos[i]` is the only stable address we have, but
+    // publication moves the dsos into that array. So we must install
+    // AFTER publication. See the second `install_trampoline` loop
+    // below, after the publication block.
+
     // -- Publish bring-up state into `DL_STATE` so the libdl entry
     // points have something to operate on after handoff.
     //
@@ -1583,6 +1641,31 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
         }
         state.n_slots_used = n_dsos;
         state.initialized = true;
+    }
+
+    // -- Phase 76d.B4.3 — Install the PLT lazy-resolve trampoline
+    // for every DSO that carries a `DT_PLTGOT` (which is every DSO
+    // with a PLT). The link-map pointer references the DSO's
+    // canonical slot inside `DL_STATE.dsos`, which is now populated
+    // and lives for the program's lifetime.
+    //
+    // The linker itself (slot 1, when self-injected) is skipped: it
+    // is built with `-Bsymbolic`-style flags so it has no JUMP_SLOTs
+    // and would otherwise install the trampoline against its own
+    // GOT, which the kernel mapped via `PT_INTERP` and which we do
+    // not re-walk.
+    {
+        let state = dl::dl_state_mut();
+        for i in 0..n_dsos {
+            if linker_slot == Some(i) {
+                continue;
+            }
+            let link_map = &state.dsos[i] as *const LoadedDso;
+            // SAFETY: `state.dsos[i]` was populated above and lives
+            // for the program lifetime; `DT_PLTGOT` was bounds-checked
+            // by `validate_dyn_pointers` at load time.
+            unsafe { plt::install_trampoline(&state.dsos[i], link_map) };
+        }
     }
 
     // -- Run constructors deepest-first -------------------------------------

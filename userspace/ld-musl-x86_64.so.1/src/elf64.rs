@@ -61,6 +61,10 @@ pub struct Phdr {
 pub const DT_NULL: i64 = 0;
 pub const DT_NEEDED: i64 = 1;
 pub const DT_PLTRELSZ: i64 = 2;
+/// `DT_PLTGOT` — address of the Procedure Linkage Table's GOT region.
+/// Phase 76d.B4 reads this to install `&_dl_runtime_resolve` at
+/// `GOT[2]` and the link-map at `GOT[1]` for each DSO.
+pub const DT_PLTGOT: i64 = 3;
 pub const DT_HASH: i64 = 4;
 pub const DT_STRTAB: i64 = 5;
 pub const DT_SYMTAB: i64 = 6;

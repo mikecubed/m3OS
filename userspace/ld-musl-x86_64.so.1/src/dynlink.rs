@@ -11,9 +11,9 @@
 
 use crate::elf64::{
     DT_FINI, DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_GNU_HASH, DT_HASH, DT_INIT, DT_INIT_ARRAY,
-    DT_INIT_ARRAYSZ, DT_JMPREL, DT_NEEDED, DT_NULL, DT_PLTREL, DT_PLTRELSZ, DT_RELA, DT_RELAENT,
-    DT_RELASZ, DT_SONAME, DT_STRSZ, DT_STRTAB, DT_SYMENT, DT_SYMTAB, DT_VERDEF, DT_VERDEFNUM,
-    DT_VERNEED, DT_VERNEEDNUM, DT_VERSYM, Dyn, Sym,
+    DT_INIT_ARRAYSZ, DT_JMPREL, DT_NEEDED, DT_NULL, DT_PLTGOT, DT_PLTREL, DT_PLTRELSZ, DT_RELA,
+    DT_RELAENT, DT_RELASZ, DT_SONAME, DT_STRSZ, DT_STRTAB, DT_SYMENT, DT_SYMTAB, DT_VERDEF,
+    DT_VERDEFNUM, DT_VERNEED, DT_VERNEEDNUM, DT_VERSYM, Dyn, Sym,
 };
 use core::ptr::NonNull;
 
@@ -60,6 +60,12 @@ pub struct DynamicSection {
     pub fini_array: Option<NonNull<u8>>,
     /// `DT_FINI_ARRAYSZ` — size in bytes of the destructor array.
     pub fini_arraysz: u64,
+    /// `DT_PLTGOT` (Phase 76d.B4.3) — address of the DSO's GOT,
+    /// indexed so `GOT[0]` is the `DT_DYNAMIC` back-pointer, `GOT[1]`
+    /// holds the link-map (we use `*const LoadedDso`), and `GOT[2]`
+    /// holds `&_dl_runtime_resolve`. Absent when the DSO has no PLT
+    /// (e.g. the bring-up linker itself).
+    pub pltgot: Option<NonNull<u64>>,
     /// `DT_HASH` — address of the SysV hash table.
     pub hash: Option<NonNull<u32>>,
     /// `DT_GNU_HASH` (Phase 76d.D1) — address of the GNU hash table
@@ -116,6 +122,7 @@ impl DynamicSection {
             fini: None,
             fini_array: None,
             fini_arraysz: 0,
+            pltgot: None,
             hash: None,
             gnu_hash: None,
             versym: None,
@@ -188,6 +195,10 @@ impl DynamicSection {
                     out.fini_array = NonNull::new((entry.d_val.wrapping_add(load_bias)) as *mut u8);
                 }
                 DT_FINI_ARRAYSZ => out.fini_arraysz = entry.d_val,
+                // Phase 76d.B4 — PLT GOT for lazy-resolve trampoline.
+                DT_PLTGOT => {
+                    out.pltgot = NonNull::new((entry.d_val.wrapping_add(load_bias)) as *mut u64);
+                }
                 // Phase 76d.D1 — GNU hash table.
                 DT_GNU_HASH => {
                     out.gnu_hash = NonNull::new((entry.d_val.wrapping_add(load_bias)) as *mut u32);
