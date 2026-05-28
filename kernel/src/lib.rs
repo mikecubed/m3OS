@@ -503,6 +503,20 @@ fn spawn_userspace_init() {
     );
     log::info!("[init] /sbin/init registered as pid {}", pid);
 
+    // PID 1 is loaded directly here, not through `execve`, so it never
+    // passes the path that populates `comm` / `exec_path` / `cmdline` from
+    // the binary basename. Set them explicitly so `/proc/1/{comm,stat,
+    // cmdline}`, `ps`, and `htop` show "init" instead of the "unknown"
+    // fallback `proc_name` uses when all three are empty.
+    {
+        let mut table = process::PROCESS_TABLE.lock();
+        if let Some(proc) = table.find_mut(pid) {
+            proc.set_comm(b"init");
+            proc.exec_path = String::from("/sbin/init");
+            proc.cmdline = vec![String::from("/sbin/init")];
+        }
+    }
+
     task::spawn_fork_task(
         process::make_fork_ctx_zeroed(pid, loaded.entry, user_rsp),
         "userspace-init",
