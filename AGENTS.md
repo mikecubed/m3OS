@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**m3OS** (technical name: `m3os`) is a bootable microkernel OS in Rust: x86_64, UEFI boot, kernel **v0.76.3**. Ring 0 handles memory, scheduling, IPC/capabilities, interrupt routing, and in-kernel drivers; ring 3 hosts everything else.
+**m3OS** (technical name: `m3os`) is a bootable microkernel OS in Rust: x86_64, UEFI boot, kernel **v0.77.0**. Ring 0 handles memory, scheduling, IPC/capabilities, interrupt routing, and in-kernel drivers; ring 3 hosts everything else.
 
 Capabilities now present in the tree:
 
@@ -16,6 +16,7 @@ Capabilities now present in the tree:
 - **Audio**: `audio_server` (AC'97) with PCM-out, mixer, DOOM audio + bell.
 - **Terminal**: `term` emulator, full termios/line-discipline, UTF-8 + TTF/Nerd Font glyphs, ncurses + less/htop/tmux ports.
 - **Dynamic linking**: `ld-musl-x86_64.so.1` with `ldso_core`, PT_INTERP support, dlopen/dlsym/dlclose, PLT lazy resolve, DT_GNU_HASH, symbol versioning, LD_BIND_NOW, W^X enforcement.
+- **CPU hardening**: SMEP + SMAP enforced on every core, per-CPU microcode application (AMD container), PT_TLS-backed pthreads, RFC 6298 TCP retransmission.
 
 > **Phase history is NOT maintained here.** For the detailed per-phase record (Phase 55a → 76d and onward) and the full workspace/source layout, read `docs/roadmap/README.md` and `docs/appendix/codebase-map.md`. Read the relevant phase doc under `docs/roadmap/` before changing a subsystem.
 

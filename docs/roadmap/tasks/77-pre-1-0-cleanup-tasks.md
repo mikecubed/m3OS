@@ -1,6 +1,6 @@
 # Phase 77 — Pre-1.0 Correctness, Cheap Security, and Network Polish: Task List
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-77
 **Depends on:** Phase 74 (IPC Capability Grants) ✅, Phase 75 (W^X Enforcement) ✅
 **Goal:** Land the bundle of small, well-scoped correctness, security, and networking fixes the Phase 74a audit promoted into pre-1.0 must-fix. After this phase the SSH session exits cleanly, `sys_nanosleep` never starves PID 1, SMEP+SMAP are on where supported, `PT_TLS` works, DNS resolves names, TCP survives packet loss, `htop`/`ps`/`top` show real processes, microcode loads on every CPU, `epoll_*` is verified, the earlier-phase deferral lists are de-drifted, and the kernel is bumped to `0.77.0`. No track may expand into an adjacent subsystem.
@@ -17,7 +17,7 @@
 | F | `epoll_*` verify-and-implement-if-missing | — | Complete |
 | G | Open-handoff resolution + doc-drift PR | A–F, H | Complete (5 handoffs resolved/downgraded; high-signal deferral-list drift struck) |
 | H | `/proc` compatibility for `htop` / `ps` / `top` | — | Mostly complete (H.1/H.3 done; H.2 screenshot gate blocked on a pre-existing graphical-term display issue) |
-| I | Documentation and Release (learning doc + `0.77.0` bump) | A–H | Planned |
+| I | Documentation and Release (learning doc + `0.77.0` bump) | A–H | Complete |
 
 > **Review note (2026-05-28):** The Phase 77 design doc was source-verified before this task list was authored. Four claims drifted from current `main` and are corrected in-place below: (1) `sys_nanosleep` already blocks for ≥1 ms sleeps — A.2 is re-scoped to closing residual busy paths, not a rewrite; (2) `epoll_*` syscalls already exist and are fully implemented — F.1 is verify + smoke + audit-doc, not implementation; (3) the TCP table is **8** slots, not 4; (4) there is **no in-tree musl source tree** — musl is a prebuilt cross-toolchain, so D.1 stages `/etc/resolv.conf` and verifies the prebuilt resolver rather than porting `__dns_query` C source.
 
@@ -313,12 +313,12 @@
 **Why it matters:** A learner-friendly doc scoped to Phase 77 consolidates the cleanup story — SSH/nanosleep correctness, SMEP/SMAP, `PT_TLS`, DNS, TCP retransmission, microcode, epoll verification, and the `/proc` compatibility fix — so readers do not have to reconstruct the bundle from eight separate tracks. Follows the "aligned legacy learning doc" template in `docs/appendix/doc-templates.md`.
 
 **Acceptance:**
-- [ ] File exists at `docs/77-pre-1-0-cleanup.md`
-- [ ] All required template fields populated: `**Aligned Roadmap Phase:** Phase 77`, `**Status:** Complete` (at merge), `**Source Ref:** phase-77`, `**Supersedes Legacy Doc:** new`
-- [ ] Overview explains, learner-first, why a release-gate phase is the wrong place to discover small correctness bugs and which mitigations are cheap CR4 flips versus expensive page-table reshapes
-- [ ] Key Files table cites the real files this phase touches: `userspace/sshd/src/session.rs`, `kernel/src/arch/x86_64/syscall/mod.rs`, `kernel/src/smp/boot.rs`, `kernel/src/mm/user_mem.rs`, `kernel/src/mm/elf.rs`, `kernel/src/net/tcp.rs`, `kernel/src/net/udp.rs`, `kernel/src/fs/procfs.rs`
-- [ ] "How This Phase Differs From Later Memory/Security Work" notes KPTI/retpoline/IBRS are Phase 84 and congestion control beyond Reno is post-1.0
-- [ ] Related Roadmap Docs links `docs/roadmap/77-pre-1-0-cleanup.md` and `docs/roadmap/tasks/77-pre-1-0-cleanup-tasks.md`
+- [x] File exists at `docs/77-pre-1-0-cleanup.md`
+- [x] All required template fields populated: `**Aligned Roadmap Phase:** Phase 77`, `**Status:** Complete`, `**Source Ref:** phase-77`, `**Supersedes Legacy Doc:** new`
+- [x] Overview explains, learner-first, why a release-gate phase is the wrong place to find small correctness bugs and contrasts cheap CR4 flips (SMEP/SMAP) with expensive page-table reshapes (KPTI)
+- [x] Key Files table cites the real files touched (the actual fix sites — `cpuid.rs`/`lib.rs`/`boot.rs` for SMEP/SMAP rather than the planning-doc's `user_mem.rs`, plus `process/mod.rs`, `scheduler.rs`, `net/tcp.rs`, `net/udp.rs`, `net_server`, `microcode.rs`, `procfs.rs`)
+- [x] "How This Phase Differs From Later Memory/Security Work" notes KPTI/retpoline/IBRS are Phase 84 and congestion control beyond Reno-style retransmit is post-1.0
+- [x] Related Roadmap Docs links the design doc + this task list
 
 ### I.2 — Bump kernel version to `0.77.0`
 
@@ -332,12 +332,12 @@
 **Why it matters:** Project convention is one minor-version bump per shipped phase; disciplined version tracking signals a complete, shippable phase.
 
 **Acceptance:**
-- [ ] `kernel/Cargo.toml` `version = "0.77.0"`
-- [ ] `Cargo.lock` regenerated (via `cargo xtask check`)
-- [ ] `AGENTS.md` "Kernel v0.76.3" updated to `v0.77.0` and the project-overview summary extended with a Phase 77 sentence
-- [ ] `docs/roadmap/README.md` Phase 77 row Status updated to "Complete" and the Tasks cell pointed at this task list at merge time
-- [ ] `cargo xtask check` passes
-- [ ] Git tag `v0.77.0` recommended at phase merge
+- [x] `kernel/Cargo.toml` `version = "0.77.0"`
+- [x] `Cargo.lock` regenerated (via `cargo xtask check`)
+- [x] `AGENTS.md` kernel version updated to `v0.77.0` and a "CPU hardening" capability bullet added (per the file's keep-it-small maintenance policy — the detailed per-phase record lives in `docs/roadmap/`)
+- [x] `docs/roadmap/README.md` Phase 77 row Status updated to "Complete" (Tasks cell already points at this list); the design doc + task-doc Status headers set to Complete
+- [x] `cargo xtask check` passes
+- [ ] Git tag `v0.77.0` — recommended at phase merge (left to the merge step)
 
 ---
 
