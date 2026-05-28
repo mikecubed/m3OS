@@ -105,6 +105,50 @@ pub fn bind_now_set() -> bool {
     BIND_NOW.load(Ordering::Acquire)
 }
 
+/// Test-and-set spinlock serializing the lazy-bind resolver.
+///
+/// m3OS supports `CLONE_VM` threads (Phase 40) that share one address
+/// space — and therefore one GOT and one [`crate::dl::DL_STATE`]. Two
+/// sibling threads can hit the trampoline at the same time, so the
+/// resolver must not (a) form aliasing references into `DL_STATE` nor
+/// (b) let two writers race the same GOT slot. This lock makes the
+/// resolve-and-patch critical section mutually exclusive.
+///
+/// A plain spin is sufficient: lazy resolution is idempotent and only
+/// runs on the *first* call to each PLT-routed symbol, so the lock is
+/// effectively uncontended after warm-up. ld.so is self-relocated and
+/// never routes its own calls through a lazy PLT, so the resolver
+/// cannot re-enter the lock and self-deadlock.
+struct ResolveLock {
+    held: AtomicBool,
+}
+
+impl ResolveLock {
+    const fn new() -> Self {
+        Self {
+            held: AtomicBool::new(false),
+        }
+    }
+
+    fn lock(&self) {
+        while self
+            .held
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            while self.held.load(Ordering::Relaxed) {
+                core::hint::spin_loop();
+            }
+        }
+    }
+
+    fn unlock(&self) {
+        self.held.store(false, Ordering::Release);
+    }
+}
+
+static LAZY_RESOLVE_LOCK: ResolveLock = ResolveLock::new();
+
 /// Naked-asm trampoline reached on first call to a lazily-resolved
 /// PLT-routed symbol. See the module-level docs for the ABI.
 ///
@@ -172,6 +216,15 @@ pub extern "C" fn _dl_runtime_resolve() -> ! {
 
 /// Rust callback the trampoline invokes to compute one symbol's
 /// resolved address and patch the GOT slot.
+///
+/// ## Thread safety
+/// The resolve-and-patch step (`DL_STATE` scope read + GOT-slot write)
+/// runs under [`LAZY_RESOLVE_LOCK`] so sibling `CLONE_VM` threads
+/// hitting the trampoline concurrently cannot form aliasing references
+/// into `DL_STATE` or tear the GOT write. Coordinating the trampoline
+/// with concurrent `dlopen`/`dlclose` `DL_STATE` mutation is the
+/// separate, documented single-threaded-libdl limitation (see
+/// `crate::dl` module docs) and remains gated on the TLS upgrade.
 ///
 /// # Safety
 /// `link_map` must be a pointer the linker installed at load time
@@ -259,15 +312,25 @@ pub unsafe extern "C" fn resolve_pltrel(link_map: *const LoadedDso, reloc_index:
         dso.image_len,
         &ver_table,
     );
+    // Enter the resolve-and-patch critical section. The lock serializes
+    // sibling CLONE_VM threads so only one resolver touches DL_STATE and
+    // the GOT slot at a time (see `LAZY_RESOLVE_LOCK`). Everything above
+    // this point only reads per-DSO immutable data (the `LoadedDso` and
+    // its mapped image), which concurrent readers may share safely.
+    LAZY_RESOLVE_LOCK.lock();
     // Search the full process scope via `sym::lookup`. The bring-up
     // publication into `DL_STATE.dsos` makes the entire dependency
-    // graph the lookup scope (matches SysV global semantics).
-    let state = dl::dl_state_mut();
+    // graph the lookup scope (matches SysV global semantics). A shared
+    // borrow is enough — the resolver only reads the scope — and avoids
+    // the aliasing `&mut DlState` two concurrent trampoline entries
+    // would otherwise form.
+    let state = dl::dl_state();
     let scope = &state.dsos[..state.n_slots_used];
     let resolved = unsafe { sym::lookup(scope, name, version) };
     let addr = match resolved {
         Some(a) => a,
         None => {
+            // Diverges: the process exits, so the held lock is moot.
             serial(b"plt: resolve_pltrel: undefined symbol ");
             serial(name);
             serial(b"\n");
@@ -282,6 +345,7 @@ pub unsafe extern "C" fn resolve_pltrel(link_map: *const LoadedDso, reloc_index:
         match r.r_offset.checked_add(8) {
             Some(end) if end <= dso.image_len => {}
             _ => {
+                // Diverges: the process exits, so the held lock is moot.
                 serial(b"plt: resolve_pltrel: GOT slot outside image\n");
                 sys_exit(127);
             }
@@ -289,6 +353,7 @@ pub unsafe extern "C" fn resolve_pltrel(link_map: *const LoadedDso, reloc_index:
     }
     let got_slot = (dso.load_bias.wrapping_add(r.r_offset)) as *mut u64;
     unsafe { core::ptr::write_unaligned(got_slot, addr) };
+    LAZY_RESOLVE_LOCK.unlock();
     addr
 }
 

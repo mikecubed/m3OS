@@ -44,6 +44,24 @@ pub fn elem_in_image(base: u64, idx: u64, elem_size: u64, image_base: u64, image
     }
 }
 
+/// Returns `true` when `addr` is a multiple of `align`. `align` is the
+/// natural alignment of the type the linker is about to read through the
+/// pointer — `2` for a `u16` (`DT_VERSYM`), `4` for a `u32` (`DT_HASH`),
+/// `8` for a `u64` / `Elf64_*` (`DT_GNU_HASH`, `DT_SYMTAB`, `DT_PLTGOT`,
+/// `DT_RELA`) — and must be a non-zero power of two.
+///
+/// `range_in_image` proves a `PT_DYNAMIC` pointer lands inside the mapped
+/// image but says nothing about its alignment. A malformed or
+/// attacker-controlled DSO can therefore supply a pointer that is
+/// in-range yet misaligned; dereferencing it as `*const u32` / `*const
+/// u64` is Undefined Behaviour in Rust even on x86_64, where the hardware
+/// itself tolerates unaligned scalar loads. Call this before forming the
+/// first typed pointer so a misaligned table is rejected at load time
+/// rather than miscompiled at use time.
+pub fn is_aligned(addr: u64, align: u64) -> bool {
+    align != 0 && addr & (align - 1) == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,5 +140,44 @@ mod tests {
         let last = LEN / 2 - 1;
         assert!(elem_in_image(BASE, last, 2, BASE, LEN));
         assert!(!elem_in_image(BASE, LEN / 2, 2, BASE, LEN));
+    }
+
+    #[test]
+    fn aligned_addresses_pass_for_their_width() {
+        // 8-aligned base satisfies every width we use.
+        assert!(is_aligned(BASE, 8));
+        assert!(is_aligned(BASE, 4));
+        assert!(is_aligned(BASE, 2));
+        // 4-aligned-but-not-8 passes 4/2, fails 8 (the DT_GNU_HASH case).
+        assert!(is_aligned(BASE + 4, 4));
+        assert!(is_aligned(BASE + 4, 2));
+        assert!(!is_aligned(BASE + 4, 8));
+    }
+
+    #[test]
+    fn misaligned_addresses_are_rejected() {
+        // u32 read off a 1-byte-misaligned pointer — the lookup_gnu /
+        // lookup_sysv header UB the round-7 review flagged.
+        assert!(!is_aligned(BASE + 1, 4));
+        assert!(!is_aligned(BASE + 2, 4));
+        assert!(!is_aligned(BASE + 3, 4));
+        // u64 read off a 2/4-misaligned pointer.
+        assert!(!is_aligned(BASE + 2, 8));
+        // odd address fails even a u16's 2-byte requirement.
+        assert!(!is_aligned(BASE + 1, 2));
+    }
+
+    #[test]
+    fn align_of_zero_is_rejected() {
+        // Defensive: a zero alignment is never "satisfied".
+        assert!(!is_aligned(BASE, 0));
+        assert!(!is_aligned(0, 0));
+    }
+
+    #[test]
+    fn zero_address_is_aligned_to_any_power_of_two() {
+        assert!(is_aligned(0, 2));
+        assert!(is_aligned(0, 4));
+        assert!(is_aligned(0, 8));
     }
 }

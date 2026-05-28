@@ -521,6 +521,56 @@ fn validate_dyn_pointers(
         // those writes into unrelated process memory.
         return Err("DT_PLTGOT (first 3 slots) outside image");
     }
+    // Phase 76d round-7 — alignment hardening. The range checks above
+    // prove each pointer lands inside the image but NOT that it carries
+    // the natural alignment of the type the lookup/relocation paths read
+    // through it. A malformed DSO can supply an in-range yet misaligned
+    // pointer; the typed `*const u16` / `*const u32` / `*const u64` /
+    // `*const Rela` dereferences in `sym::lookup_gnu` / `lookup_sysv`,
+    // `versym_entry`, `consumer_required_version`, `crate::sym_entry`,
+    // `plt::install_trampoline`, `plt::resolve_pltrel`, and `apply_rela`
+    // would then be Undefined Behaviour even on x86_64 (which tolerates
+    // unaligned scalar loads in hardware). Reject misaligned tables here,
+    // before any typed pointer is formed. Required alignment is the read
+    // width: `DT_VERSYM` reads `u16` (2); `DT_HASH` reads `u32` (4);
+    // `DT_GNU_HASH` needs 8 because its bloom array is `u64`; `DT_SYMTAB`
+    // (`Elf64_Sym`), `DT_PLTGOT` (`u64` GOT slots), and `DT_RELA` /
+    // `DT_JMPREL` (`Elf64_Rela`) all read 8-byte fields, so 8.
+    if let Some(p) = d.hash
+        && !ldso_core::bounds::is_aligned(p.as_ptr() as u64, 4)
+    {
+        return Err("DT_HASH misaligned");
+    }
+    if let Some(p) = d.gnu_hash
+        && !ldso_core::bounds::is_aligned(p.as_ptr() as u64, 8)
+    {
+        return Err("DT_GNU_HASH misaligned");
+    }
+    if let Some(p) = d.symtab
+        && !ldso_core::bounds::is_aligned(p.as_ptr() as u64, 8)
+    {
+        return Err("DT_SYMTAB misaligned");
+    }
+    if let Some(p) = d.pltgot
+        && !ldso_core::bounds::is_aligned(p.as_ptr() as u64, 8)
+    {
+        return Err("DT_PLTGOT misaligned");
+    }
+    if let Some(p) = d.versym
+        && !ldso_core::bounds::is_aligned(p.as_ptr() as u64, 2)
+    {
+        return Err("DT_VERSYM misaligned");
+    }
+    if let Some(p) = d.rela
+        && !ldso_core::bounds::is_aligned(p.as_ptr() as u64, 8)
+    {
+        return Err("DT_RELA misaligned");
+    }
+    if let Some(p) = d.jmprel
+        && !ldso_core::bounds::is_aligned(p.as_ptr() as u64, 8)
+    {
+        return Err("DT_JMPREL misaligned");
+    }
     if let Some(p) = d.versym
         && !in_image(p.as_ptr() as u64)
     {
