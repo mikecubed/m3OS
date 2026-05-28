@@ -98,6 +98,7 @@ This sets `core.hooksPath` to `.githooks/`. **pre-commit** runs `cargo xtask che
 | `tui-app-smoke` | `M3OS_TUI_APP_REGRESSION=1` |
 | `doom-concurrent-smoke` | `M3OS_DOOM_CONCURRENT_REGRESSION=1` |
 | `tiling-smoke` | `M3OS_TILING_REGRESSION=1` |
+| `htop-render-probe` | `M3OS_HTOP_REGRESSION=1` |
 
 ## Architecture
 

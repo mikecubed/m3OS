@@ -2876,6 +2876,70 @@ pub fn task_times_for_pid(pid: u32) -> (u64, u64, u64, u64) {
     (user, system, child_user, child_system)
 }
 
+/// Aggregate CPU-time split for `/proc/stat`, summed across all cores.
+/// Returns `(user_ms, system_ms, idle_ms)`: busy (user/system) is summed
+/// over every non-idle task, idle over the per-core idle tasks. All values
+/// are in ms (`TICKS_PER_SEC = 1000`); the procfs renderer converts to
+/// USER_HZ jiffies. Replaces the previous hard-coded 10 %/90 % split so
+/// htop's CPU meter reflects real activity.
+pub fn global_cpu_times() -> (u64, u64, u64) {
+    let sched = scheduler_lock();
+    let (mut user, mut system, mut idle) = (0u64, 0u64, 0u64);
+    for (idx, task) in sched.tasks.iter().enumerate() {
+        let u = task.user_ticks.load(core::sync::atomic::Ordering::Relaxed);
+        let s = task
+            .system_ticks
+            .load(core::sync::atomic::Ordering::Relaxed);
+        if sched.idle_tasks.contains(&Some(idx)) {
+            idle = idle.saturating_add(u).saturating_add(s);
+        } else {
+            user = user.saturating_add(u);
+            system = system.saturating_add(s);
+        }
+    }
+    (user, system, idle)
+}
+
+/// Number of non-idle tasks currently runnable (`Ready` or `Running`).
+/// Used by `/proc/loadavg` as an instantaneous load proxy. Far more honest
+/// than counting `Process.state`, which m3OS never transitions out of
+/// `Ready` — so every process looked runnable and load read a flat ~N.
+pub fn runnable_task_count() -> usize {
+    let sched = scheduler_lock();
+    let mut count = 0;
+    for (idx, task) in sched.tasks.iter().enumerate() {
+        if sched.idle_tasks.contains(&Some(idx)) {
+            continue;
+        }
+        if matches!(task.state, TaskState::Ready | TaskState::Running) {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Canonical scheduler state for the task(s) of `pid`, or `None` if no live
+/// task matches. A runnable thread wins over a blocked one, so the
+/// thread-group view reports "running if any thread runs". Lets procfs
+/// report a real `R`/`S` state instead of the stale `Process.state`.
+pub fn task_state_for_pid(pid: u32) -> Option<TaskState> {
+    let sched = scheduler_lock();
+    let mut blocked: Option<TaskState> = None;
+    for task in sched.tasks.iter() {
+        if task.pid == pid && task.state != TaskState::Dead {
+            match task.state {
+                TaskState::Ready | TaskState::Running => return Some(task.state),
+                other => {
+                    if blocked.is_none() {
+                        blocked = Some(other);
+                    }
+                }
+            }
+        }
+    }
+    blocked
+}
+
 /// Phase 61 Track E.4 — rusage event-counter snapshot for one pid's full
 /// thread group. Returns a `RusageCounters` of `(own, child)` pairs for
 /// minor faults, major faults, voluntary ctxsw, involuntary ctxsw — eight

@@ -92,6 +92,58 @@ pub fn path_node(abs_path: &str) -> Option<ProcfsNode> {
                 .find(|(open_fd, _)| *open_fd == fd)
                 .map(|(_, target)| ProcfsNode::Symlink(target))
         }
+        // `/proc/<pid>/task/<tid>/…` — the per-thread view. htop reads the
+        // main thread's stat via `task/<pid>/stat` (its `scanMainThread`
+        // path), so the absence of this subtree made `readStatFile` fail
+        // for every process and the table render empty. For m3OS's mostly
+        // single-threaded processes `<tid>` is the pid itself; multi-thread
+        // groups expose every member tid.
+        [pid, "task"] => {
+            let pid = parse_pid_component(pid)?;
+            process_snapshot(pid).map(|_| ProcfsNode::Dir)
+        }
+        [pid, "task", tid] => {
+            let pid = parse_pid_component(pid)?;
+            let tid = parse_pid_component(tid)?;
+            task_member(pid, tid).then_some(ProcfsNode::Dir)
+        }
+        [
+            pid,
+            "task",
+            tid,
+            "status" | "cmdline" | "comm" | "maps" | "stat" | "statm" | "io",
+        ] => {
+            let pid = parse_pid_component(pid)?;
+            let tid = parse_pid_component(tid)?;
+            task_member(pid, tid).then_some(ProcfsNode::File)
+        }
+        [pid, "task", tid, "fd"] => {
+            let pid = parse_pid_component(pid)?;
+            let tid = parse_pid_component(tid)?;
+            task_member(pid, tid).then_some(ProcfsNode::Dir)
+        }
+        [pid, "task", tid, "exe"] => {
+            let pid = parse_pid_component(pid)?;
+            let tid = parse_pid_component(tid)?;
+            if !task_member(pid, tid) {
+                return None;
+            }
+            let proc = process_snapshot(tid)?;
+            (!proc.exec_path.is_empty()).then_some(ProcfsNode::Symlink(proc.exec_path))
+        }
+        [pid, "task", tid, "fd", fd] => {
+            let pid = parse_pid_component(pid)?;
+            let tid = parse_pid_component(tid)?;
+            if !task_member(pid, tid) {
+                return None;
+            }
+            let fd = fd.parse::<usize>().ok()?;
+            let proc = process_snapshot(tid)?;
+            proc.fd_targets
+                .into_iter()
+                .find(|(open_fd, _)| *open_fd == fd)
+                .map(|(_, target)| ProcfsNode::Symlink(target))
+        }
         _ => None,
     }
 }
@@ -137,6 +189,10 @@ pub fn read_file(abs_path: &str) -> Option<Vec<u8>> {
         let proc = process_snapshot(parse_pid_component(pid)?)?;
         return Some(render_comm_bytes(proc));
     }
+    if let [pid, "task", tid, "comm"] = parts.as_slice() {
+        let proc = task_snapshot(parse_pid_component(pid)?, parse_pid_component(tid)?)?;
+        return Some(render_comm_bytes(proc));
+    }
     let text = match parts.as_slice() {
         ["meminfo"] => render_meminfo(),
         ["kmsg"] => render_kmsg(),
@@ -152,6 +208,30 @@ pub fn read_file(abs_path: &str) -> Option<Vec<u8>> {
         [pid, "stat"] => render_pid_stat(process_snapshot(parse_pid_component(pid)?)?),
         [pid, "statm"] => render_pid_statm(process_snapshot(parse_pid_component(pid)?)?),
         [pid, "io"] => render_pid_io(process_snapshot(parse_pid_component(pid)?)?),
+        [pid, "task", tid, "status"] => render_status(task_snapshot(
+            parse_pid_component(pid)?,
+            parse_pid_component(tid)?,
+        )?),
+        [pid, "task", tid, "cmdline"] => render_cmdline(task_snapshot(
+            parse_pid_component(pid)?,
+            parse_pid_component(tid)?,
+        )?),
+        [pid, "task", tid, "maps"] => render_maps(task_snapshot(
+            parse_pid_component(pid)?,
+            parse_pid_component(tid)?,
+        )?),
+        [pid, "task", tid, "stat"] => render_pid_stat(task_snapshot(
+            parse_pid_component(pid)?,
+            parse_pid_component(tid)?,
+        )?),
+        [pid, "task", tid, "statm"] => render_pid_statm(task_snapshot(
+            parse_pid_component(pid)?,
+            parse_pid_component(tid)?,
+        )?),
+        [pid, "task", tid, "io"] => render_pid_io(task_snapshot(
+            parse_pid_component(pid)?,
+            parse_pid_component(tid)?,
+        )?),
         _ => return None,
     };
     Some(text.into_bytes())
@@ -211,11 +291,61 @@ pub fn list_dir(abs_path: &str) -> Option<Vec<(String, bool)>> {
                 (String::from("io"), false),
                 (String::from("exe"), false),
                 (String::from("fd"), true),
+                (String::from("task"), true),
             ])
         }
         [pid, "fd"] => {
             let pid = parse_pid_component(pid)?;
             let proc = process_snapshot(pid)?;
+            let mut entries = Vec::new();
+            for (fd, _) in proc.fd_targets {
+                entries.push((alloc::format!("{fd}"), false));
+            }
+            Some(entries)
+        }
+        [pid, "task"] => {
+            let pid = parse_pid_component(pid)?;
+            process_snapshot(pid)?;
+            let table = PROCESS_TABLE.lock();
+            let mut tids: Vec<u32> = table
+                .iter()
+                .filter(|proc| proc.pid == pid || proc.tgid == pid)
+                .map(|proc| proc.pid)
+                .collect();
+            drop(table);
+            tids.sort_unstable();
+            tids.dedup();
+            Some(
+                tids.into_iter()
+                    .map(|t| (alloc::format!("{t}"), true))
+                    .collect(),
+            )
+        }
+        [pid, "task", tid] => {
+            let pid = parse_pid_component(pid)?;
+            let tid = parse_pid_component(tid)?;
+            if !task_member(pid, tid) {
+                return None;
+            }
+            Some(alloc::vec![
+                (String::from("status"), false),
+                (String::from("cmdline"), false),
+                (String::from("comm"), false),
+                (String::from("maps"), false),
+                (String::from("stat"), false),
+                (String::from("statm"), false),
+                (String::from("io"), false),
+                (String::from("exe"), false),
+                (String::from("fd"), true),
+            ])
+        }
+        [pid, "task", tid, "fd"] => {
+            let pid = parse_pid_component(pid)?;
+            let tid = parse_pid_component(tid)?;
+            if !task_member(pid, tid) {
+                return None;
+            }
+            let proc = process_snapshot(tid)?;
             let mut entries = Vec::new();
             for (fd, _) in proc.fd_targets {
                 entries.push((alloc::format!("{fd}"), false));
@@ -296,6 +426,45 @@ fn process_snapshot(pid: u32) -> Option<ProcessSnapshot> {
         mappings: proc.vma_tree.iter().cloned().collect(),
         fd_targets,
     })
+}
+
+/// Is `tid` a thread of the process group led by `pid`?  True for the main
+/// thread (`tid == pid`) and for any task whose thread-group id is `pid`.
+/// Used to validate `/proc/<pid>/task/<tid>/…` paths.
+fn task_member(pid: u32, tid: u32) -> bool {
+    let table = PROCESS_TABLE.lock();
+    match table.find(tid) {
+        Some(proc) => tid == pid || proc.tgid == pid,
+        None => false,
+    }
+}
+
+/// Snapshot for a `/proc/<pid>/task/<tid>/…` path: the thread's own
+/// snapshot, but only when `tid` actually belongs to `pid`'s thread group.
+fn task_snapshot(pid: u32, tid: u32) -> Option<ProcessSnapshot> {
+    if !task_member(pid, tid) {
+        return None;
+    }
+    process_snapshot(tid)
+}
+
+/// The real process state, taken from the scheduler's canonical `TaskState`
+/// rather than `Process.state` (which m3OS never moves out of `Ready`, so
+/// every process otherwise reported `R (running)`).  Falls back to the
+/// snapshot's stale value when no live task matches (e.g. zombies).
+///
+/// Must be called WITHOUT `PROCESS_TABLE` held — it acquires the scheduler
+/// lock, and the two are never held simultaneously to avoid lock-order
+/// inversion.
+fn live_process_state(pid: u32, fallback: ProcessState) -> ProcessState {
+    use crate::task::TaskState;
+    match crate::task::scheduler::task_state_for_pid(pid) {
+        Some(TaskState::Running) => ProcessState::Running,
+        Some(TaskState::Ready) => ProcessState::Ready,
+        // Any BlockedOn* variant maps to "sleeping" (S) for /proc purposes.
+        Some(_) => ProcessState::Blocked,
+        None => fallback,
+    }
 }
 
 fn fd_target(backend: &FdBackend) -> Option<String> {
@@ -442,61 +611,63 @@ fn render_cpuinfo() -> String {
 /// last PID. m3OS does not track real load averages; synthesise from
 /// runnable process count so htop has non-zero values to render.
 fn render_loadavg() -> String {
-    let table = PROCESS_TABLE.lock();
-    let total = table.iter().count();
-    let runnable = table
-        .iter()
-        .filter(|proc| matches!(proc.state, ProcessState::Running | ProcessState::Ready))
-        .count();
-    let last_pid = table.iter().map(|p| p.pid).max().unwrap_or(0);
-    drop(table);
+    // Total / last-pid from the process table; release it before touching
+    // the scheduler (locks are never held simultaneously).
+    let (total, last_pid) = {
+        let table = PROCESS_TABLE.lock();
+        let total = table.iter().count();
+        let last_pid = table.iter().map(|p| p.pid).max().unwrap_or(0);
+        (total, last_pid)
+    };
+    // Runnable count from the scheduler's canonical task states, NOT
+    // `Process.state` (which never leaves `Ready`, so every process — even
+    // daemons parked in `BlockedOnRecv` — counted as runnable and load read
+    // a flat ~N).  This now reflects only genuinely runnable tasks.
+    let runnable = crate::task::scheduler::runnable_task_count();
     // Format as `X.XX X.XX X.XX runnable/total last_pid`.  Using the
-    // current runnable count for all three windows is a coarse but
-    // honest approximation — m3OS does not yet drive the exponential
-    // moving averages Linux uses.  Integer-only math; the centi
-    // fraction is always 00 since `runnable` is whole and pure
-    // integer formatting avoids pulling in soft-float in the kernel
-    // (PR #177 fifth-pass review fix).
+    // current runnable count for all three windows is a coarse but honest
+    // approximation — m3OS does not yet drive the exponential moving
+    // averages Linux uses.  Integer-only math keeps soft-float out of the
+    // kernel; the centi fraction is always 00.
     alloc::format!("{runnable}.00 {runnable}.00 {runnable}.00 {runnable}/{total} {last_pid}\n")
 }
 
 fn render_stat() -> String {
-    let ticks = tick_count();
     let btime = crate::rtc::BOOT_EPOCH_SECS.load(core::sync::atomic::Ordering::Relaxed);
-    let table = PROCESS_TABLE.lock();
-    let total = table.iter().count();
-    let running = table
-        .iter()
-        .filter(|proc| proc.state == ProcessState::Running)
-        .count();
-    drop(table);
+    // Process count from the table; drop the lock before touching the
+    // scheduler (the two locks are never held simultaneously).
+    let total = {
+        let table = PROCESS_TABLE.lock();
+        table.iter().count()
+    };
+    // Real runnable count — `Process.state` is stale (always Ready), so use
+    // the scheduler's canonical task states.
+    let running = crate::task::scheduler::runnable_task_count();
     let cores = crate::smp::core_count() as u64;
-    // Per-Linux /proc/stat: USER_HZ for the cpu* lines is 100, so
-    // a tick (1 ms today) divides by 10 to convert ms→jiffies.
-    let jiffies_total = ticks / 10;
-    // We do not yet track per-CPU idle vs. busy ticks separately, so
-    // synthesise a plausible split: assume the system is mostly idle
-    // (90%) and divide the busy 10% evenly across cores into user time.
-    let busy_jiffies_total = jiffies_total / 10;
-    let idle_jiffies_total = jiffies_total.saturating_sub(busy_jiffies_total);
-    let per_core_busy = busy_jiffies_total
-        .checked_div(cores)
-        .unwrap_or(busy_jiffies_total);
-    let per_core_idle = idle_jiffies_total
-        .checked_div(cores)
-        .unwrap_or(idle_jiffies_total);
+    // Real busy/idle, derived from the per-task tick accounting the timer
+    // IRQ maintains (ms, TICKS_PER_SEC = 1000). USER_HZ for the cpu* lines
+    // is 100, so convert ms→jiffies by dividing by 10.  This replaces the
+    // old hard-coded 10 %/90 % split that pinned htop's CPU meter at ~10 %.
+    let (user_ms, system_ms, idle_ms) = crate::task::scheduler::global_cpu_times();
+    let user_j = user_ms / 10;
+    let system_j = system_ms / 10;
+    let idle_j = idle_ms / 10;
+    // Per-core lines: m3OS does not attribute non-idle busy time to a
+    // specific core (tasks migrate), so distribute the aggregate evenly.
+    // The bars are uniform but the percentage is real.
+    let per_core = |v: u64| v.checked_div(cores).unwrap_or(v);
 
     let mut out = String::new();
     // Aggregate cpu line: user nice system idle iowait irq softirq steal guest guest_nice.
-    let _ = writeln!(
-        out,
-        "cpu  {busy_jiffies_total} 0 0 {idle_jiffies_total} 0 0 0 0 0 0"
-    );
+    let _ = writeln!(out, "cpu  {user_j} 0 {system_j} {idle_j} 0 0 0 0 0 0");
     // Per-CPU lines: htop reads these to drive its per-core CPU bars.
     for core in 0..cores {
         let _ = writeln!(
             out,
-            "cpu{core} {per_core_busy} 0 0 {per_core_idle} 0 0 0 0 0 0"
+            "cpu{core} {} 0 {} {} 0 0 0 0 0 0",
+            per_core(user_j),
+            per_core(system_j),
+            per_core(idle_j)
         );
     }
     let _ = writeln!(out, "intr 0");
@@ -549,7 +720,7 @@ pub fn render_kmsg_bytes() -> Vec<u8> {
 
 fn render_status(proc: ProcessSnapshot) -> String {
     let name = proc_name(&proc);
-    let state = match proc.state {
+    let state = match live_process_state(proc.pid, proc.state) {
         ProcessState::Ready | ProcessState::Running => "R (running)",
         ProcessState::Blocked => "S (sleeping)",
         ProcessState::Stopped => "T (stopped)",
@@ -722,7 +893,7 @@ fn proc_vm_size_bytes(proc: &ProcessSnapshot) -> u64 {
 /// drawing the row without per-process CPU%.
 fn render_pid_stat(proc: ProcessSnapshot) -> String {
     let name = proc_name(&proc);
-    let state_char = match proc.state {
+    let state_char = match live_process_state(proc.pid, proc.state) {
         ProcessState::Ready | ProcessState::Running => 'R',
         ProcessState::Blocked => 'S',
         ProcessState::Stopped => 'T',
@@ -739,16 +910,35 @@ fn render_pid_stat(proc: ProcessSnapshot) -> String {
     // rss in pages — VmSize/4096 is a generous upper bound; m3OS does
     // not page-out so RSS ~= VmSize in practice.
     let rss_pages = vsize / 4096;
+    // utime / stime: the scheduler accumulates per-task CPU time in ms
+    // (1 tick = 1 ms, TICKS_PER_SEC = 1000) via the timer-IRQ sampler.
+    // /proc/<pid>/stat reports them in USER_HZ jiffies (100 Hz), so divide
+    // by 10. Previously these were hard-coded to 0, which made htop / top /
+    // ps display a flat 0% per-process CPU even for busy processes.
+    let (user_ms, system_ms, _, _) = crate::task::scheduler::task_times_for_pid(pid);
+    let utime = user_ms / 10;
+    let stime = system_ms / 10;
     // starttime in jiffies since boot: 0 is acceptable for htop, which
     // displays this as the "TIME+" column relative to its own clock.
     let starttime = 0u64;
-    // Fields 1..52 per Linux's `man 5 proc` (we emit 52 to match modern
-    // kernels; htop's parser uses sscanf with a fixed format).
-    alloc::format!(
-        "{pid} ({name}) {state_char} {ppid} {pgrp} {session} 0 -1 0 \
-0 0 0 0 0 0 0 0 0 20 0 1 0 {starttime} {vsize} {rss_pages} \
-18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
-    )
+    // Canonical Linux `/proc/<pid>/stat` layout (`man 5 proc`).  Field
+    // positions are load-bearing: htop / ps index every field by position
+    // after the `comm` parenthesis, so the count before each field must be
+    // exact.  Fields 1..=25 are emitted explicitly below; the remaining
+    // 26..=52 (which include processor at field 39) are appended as zeros.
+    //   1:pid 2:(comm) 3:state 4:ppid 5:pgrp 6:session 7:tty_nr 8:tpgid
+    //   9:flags 10:minflt 11:cminflt 12:majflt 13:cmajflt 14:utime 15:stime
+    //   16:cutime 17:cstime 18:priority 19:nice 20:num_threads 21:itrealvalue
+    //   22:starttime 23:vsize 24:rss 25:rsslim
+    let mut line = alloc::format!(
+        "{pid} ({name}) {state_char} {ppid} {pgrp} {session} 0 -1 0 0 0 0 0 \
+{utime} {stime} 0 0 20 0 1 0 {starttime} {vsize} {rss_pages} 18446744073709551615"
+    );
+    for _ in 26..=52 {
+        line.push_str(" 0");
+    }
+    line.push('\n');
+    line
 }
 
 /// `/proc/<pid>/statm` — seven decimal counts (size, resident, shared,
