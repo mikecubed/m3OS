@@ -4,6 +4,7 @@ pub mod apic;
 pub mod cpuid;
 pub mod gdt;
 pub mod interrupts;
+pub mod microcode;
 pub mod preempt_trap_frame;
 pub mod ps2;
 #[cfg(feature = "smep-smap-test")]

@@ -13,7 +13,7 @@
 | B | Cheap security mitigations (SMEP + SMAP) | Phase 75 ✅ | Complete |
 | C | `PT_TLS` parsing in the ELF loader | Phase 74 ✅ | Complete |
 | D | Networking polish (DNS resolver, TCP retransmit + slot lift) | — | Complete |
-| E | Microcode loading | — | Planned |
+| E | Microcode loading | — | Complete |
 | F | `epoll_*` verify-and-implement-if-missing | — | Complete |
 | G | Open-handoff resolution + doc-drift PR | A–F, H | Complete (5 handoffs resolved/downgraded; high-signal deferral-list drift struck) |
 | H | `/proc` compatibility for `htop` / `ps` / `top` | — | Mostly complete (H.1/H.3 done; H.2 screenshot gate blocked on a pre-existing graphical-term display issue) |
@@ -176,11 +176,11 @@
 **Why it matters:** No microcode code exists (`grep` for `microcode`/`IA32_BIOS_UPDT_TRIG`/`PATCH_LOADER`/`ucode` is empty). The dev laptop's CPU boots with whatever patch level the firmware left. The AP bring-up path already runs a clean per-CPU init sequence (CR4, XCR0, GDT, IDT, MSRs), so microcode application slots in right after CR4/XCR0. ~300 LOC. The blob is a static, embedded artifact — updates require rebuilding the disk image.
 
 **Acceptance:**
-- [ ] A vendor-supplied microcode blob is embedded under `kernel/initrd/lib/firmware/` (Intel 48-byte header path **or** AMD `cpu_id_match` table → patch-blob path, matching the dev laptop's vendor)
-- [ ] The header is parsed and validated (revision, processor signature / `cpu_id_match`) before any MSR write
-- [ ] The patch is written to `IA32_BIOS_UPDT_TRIG` (0x79, Intel) or `MSR_AMD64_PATCH_LOADER` (0xC0010020, AMD) on the BSP first, then on every AP during bring-up via a new helper following the `write_gs_base` inline-asm convention
-- [ ] A `log::info!` reports the loaded patch level (read back from `IA32_BIOS_SIGN_ID` / AMD `PATCH_LEVEL`) on every CPU at boot
-- [ ] If the blob does not match the running CPU signature, the load is skipped with a `log::warn!` and boot continues unchanged
+- [x] A vendor-supplied AMD microcode blob (linux-firmware `microcode_amd_fam19h.bin`, matching the dev machine's `AuthenticAMD` CPU) is embedded at `kernel/initrd/lib/firmware/amd-ucode.bin` via `include_bytes!` (available in the BSP/AP bring-up window before any fs mount).
+- [x] The container is parsed + validated by the host-tested `kernel_core::microcode` module (magic, equivalence table → `equiv_id`, patch `processor_rev_id` match, `patch_id` revision strictly newer than the running level) **before** any MSR write — 5 host tests cover the parse + the strictly-newer gate + truncated-blob safety.
+- [x] On a match the patch VA is written to `MSR_AMD64_PATCH_LOADER` (`0xC0010020`) — applied on the **BSP first** (`lib.rs`, after the SMEP/SMAP setup) then on every **AP** during bring-up (`smp/boot.rs::ap_entry`). (The AMD path is used because the dev machine is AMD; the Intel `0x79` path is not implemented since no Intel blob is embedded.)
+- [x] The loaded patch level (read back from MSR `0x8B`) is logged on **every CPU** at boot — verified: `[ucode] CPU0..3 sig=0x60fb1 ... current level 0x1000065`.
+- [x] On signature mismatch the load is skipped and boot continues unchanged — verified in QEMU: all 4 CPUs log `no newer microcode in blob ... skipped` (no MSR write, since QEMU's `AuthenticAMD` sig `0x60fb1` is not in the fam19h equivalence table) and `cargo xtask smoke-test` PASSES. (Per the user, the QEMU no-op/skip is the expected behaviour; the apply path activates only on matching real AMD hardware.)
 
 ---
 

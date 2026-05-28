@@ -22,6 +22,7 @@ pub mod iommu;
 pub mod ipc;
 pub mod log_ring;
 pub mod magazine;
+pub mod microcode;
 pub mod mm;
 pub mod net;
 pub mod nvme;

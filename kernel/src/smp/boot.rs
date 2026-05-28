@@ -447,6 +447,10 @@ extern "C" fn ap_entry(per_core_data_ptr: *mut super::PerCoreData) -> ! {
 
     let data = unsafe { &*per_core_data_ptr };
 
+    // Phase 77 Track E: apply microcode on this AP (same blob the BSP used).
+    // A clean skip on QEMU / non-AMD CPUs — no MSR write without a match.
+    crate::arch::x86_64::microcode::apply_microcode_on_cpu(data.core_id);
+
     // Load this AP's GDT and TSS (pre-allocated on BSP).
     unsafe {
         super::per_core_gdt_init(data);

@@ -261,6 +261,11 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
         arch::x86_64::smap_test::run_boot_self_test();
     });
 
+    // Phase 77 Track E: apply microcode on the BSP first (before APs are
+    // woken). A no-op clean skip on QEMU / non-AMD CPUs (no MSR write unless a
+    // strictly-newer matching patch is found in the embedded blob).
+    arch::x86_64::microcode::apply_microcode_on_cpu(0);
+
     // Phase 16: Initialize NIC drivers.  Phase 55b E.5: the in-kernel e1000
     // driver has been deleted; device-specific 82540EM code now lives in
     // `userspace/drivers/e1000`. The kernel registers only virtio-net here;
