@@ -1346,9 +1346,11 @@ fn build_shared_lib_with_hash_style(
     })?;
     let mut cmd = Command::new(cc);
     // `-nostdlib` keeps `DT_NEEDED = libc.so` off the result so the
-    // Phase 76b bring-up linker (which does not yet load libc) does
-    // not have to resolve libc symbols transitively. Phase 76d will
-    // relax this once `DT_GNU_HASH` + lazy resolve land.
+    // bring-up linker (which does not load libc) does not have to
+    // resolve libc symbols transitively. GNU hash + lazy resolve
+    // landed in Phase 76d, but libc itself stays out of the dynlink
+    // demo libraries until a later phase wires up a loadable libc, so
+    // this flag is still required by the current gates.
     cmd.args(["-shared", "-fPIC", "-O2", "-nostdlib"]);
     cmd.arg(format!("-Wl,--hash-style={hash_style}"));
     cmd.arg(format!("-Wl,-soname,{name}.so"));

@@ -890,17 +890,35 @@ unsafe fn load_dso_impl(fd: i64, scratch: u64, scratch_len: u64) -> Result<Loade
 ///   * `Some(name)` when the consumer's `DT_VERNEED` records carry a
 ///     `Vernaux` with matching `vna_other`.
 ///
+/// `load_bias` / `image_len` bound the `versym[sym_idx]` read to the
+/// consumer's mapped image: `validate_dyn_pointers` only checks the
+/// `DT_VERSYM` base, so a malformed relocation or symbol index could
+/// otherwise drive an out-of-image read here. An out-of-range index
+/// (or `image_len == 0`, the placeholder shape) yields `None` (no
+/// version requirement) — mirrors `sym::versym_entry`.
+///
 /// # Safety
-/// If `versym_ptr` is `Some`, it must reference a valid `versym`
-/// array of at least `sym_idx + 1` entries inside the consumer's
-/// mapped image. The `ver_table.verneed_bytes` slice must reference
-/// the consumer's mapped image.
+/// If `versym_ptr` is `Some`, the bytes for `versym[sym_idx]` are read
+/// only after the per-index range check against `load_bias +
+/// image_len` passes (or unconditionally when `image_len == 0`). The
+/// `ver_table.verneed_bytes` slice must reference the consumer's
+/// mapped image.
 pub(crate) fn consumer_required_version<'a>(
     versym_ptr: Option<*mut u16>,
     sym_idx: u32,
+    load_bias: u64,
+    image_len: u64,
     ver_table: &ldso_core::ver::VersionTable<'a>,
 ) -> Option<&'a [u8]> {
     let p = versym_ptr?;
+    if image_len > 0 {
+        let image_end = load_bias.saturating_add(image_len);
+        let entry_end =
+            (p as u64).checked_add(((sym_idx as u64).checked_add(1)?).checked_mul(2)?)?;
+        if entry_end > image_end {
+            return None;
+        }
+    }
     let raw = unsafe { *p.add(sym_idx as usize) };
     let version_index = raw & ldso_core::ver::VERSYM_VERSION_MASK;
     if version_index == ldso_core::ver::VER_NDX_LOCAL
@@ -1003,7 +1021,13 @@ unsafe fn apply_rela(
                 let sym_idx = r_sym(r.r_info);
                 let sym = unsafe { &*symtab.add(sym_idx as usize) };
                 let name = unsafe { strtab_get(strtab, sym.st_name as u64, dso.dyn_.strsz) };
-                let version = consumer_required_version(versym_ptr, sym_idx, &ver_table);
+                let version = consumer_required_version(
+                    versym_ptr,
+                    sym_idx,
+                    dso.load_bias,
+                    dso.image_len,
+                    &ver_table,
+                );
                 let value = unsafe { sym::lookup(dsos, name, version).unwrap_or(0) };
                 if value == 0 {
                     serial(b"ldso: undefined symbol ");
@@ -1050,7 +1074,13 @@ unsafe fn apply_rela(
                     let sym_idx = r_sym(r.r_info);
                     let sym = unsafe { &*symtab.add(sym_idx as usize) };
                     let name = unsafe { strtab_get(strtab, sym.st_name as u64, dso.dyn_.strsz) };
-                    let version = consumer_required_version(versym_ptr, sym_idx, &ver_table);
+                    let version = consumer_required_version(
+                        versym_ptr,
+                        sym_idx,
+                        dso.load_bias,
+                        dso.image_len,
+                        &ver_table,
+                    );
                     let value = unsafe { sym::lookup(dsos, name, version).unwrap_or(0) };
                     if value == 0 {
                         serial(b"ldso: undefined symbol ");
@@ -1080,7 +1110,13 @@ unsafe fn apply_rela(
                 let sym_idx = r_sym(r.r_info);
                 let sym = unsafe { &*symtab.add(sym_idx as usize) };
                 let name = unsafe { strtab_get(strtab, sym.st_name as u64, dso.dyn_.strsz) };
-                let version = consumer_required_version(versym_ptr, sym_idx, &ver_table);
+                let version = consumer_required_version(
+                    versym_ptr,
+                    sym_idx,
+                    dso.load_bias,
+                    dso.image_len,
+                    &ver_table,
+                );
                 let value = unsafe { sym::lookup(dsos, name, version).unwrap_or(0) };
                 if value == 0 {
                     return Err("undefined symbol (R_X86_64_64)");

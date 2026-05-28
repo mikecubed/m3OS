@@ -50,14 +50,23 @@
 //! jmp _dl_runtime_resolve
 //! ```
 //!
-//! [`_dl_runtime_resolve`] saves all caller-saved registers (so the
-//! original caller's arguments survive), passes `link_map` in `rdi`
-//! and `reloc_index` in `rsi`, calls [`resolve_pltrel`], stores the
-//! resolved address over the link-map slot on the stack, restores
-//! the caller-saved registers, discards the now-unused `reloc_index`
-//! slot, and `ret`s — which pops the resolved address into `rip`.
-//! The caller's return address remains on the stack so the resolved
-//! function's own `ret` returns to the caller normally.
+//! [`_dl_runtime_resolve`] saves the caller-saved **general-purpose**
+//! argument registers (`rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r8`–`r11`)
+//! so the original caller's arguments survive, passes `link_map` in
+//! `rdi` and `reloc_index` in `rsi`, calls [`resolve_pltrel`], stores
+//! the resolved address over the link-map slot on the stack, restores
+//! those registers, discards the now-unused `reloc_index` slot, and
+//! `ret`s — which pops the resolved address into `rip`. The caller's
+//! return address remains on the stack so the resolved function's own
+//! `ret` returns to the caller normally.
+//!
+//! XMM registers are also caller-saved on the SysV x86_64 ABI and
+//! would normally need preserving across the resolver call, but m3OS
+//! builds the whole tree with `-mmx,-sse` (see CLAUDE.md "Target
+//! flags") so no float/vector arguments are ever passed in XMM. The
+//! trampoline therefore deliberately preserves only the GPR argument
+//! set; if SIMD is ever re-enabled this must be extended to spill
+//! `xmm0`–`xmm7`.
 //!
 //! ## Why naked
 //!
@@ -237,8 +246,13 @@ pub unsafe extern "C" fn resolve_pltrel(link_map: *const LoadedDso, reloc_index:
         verneed_num: dso.dyn_.verneednum as usize,
         strtab: strtab_bytes,
     };
-    let version =
-        crate::consumer_required_version(dso.dyn_.versym.map(|p| p.as_ptr()), sym_idx, &ver_table);
+    let version = crate::consumer_required_version(
+        dso.dyn_.versym.map(|p| p.as_ptr()),
+        sym_idx,
+        dso.load_bias,
+        dso.image_len,
+        &ver_table,
+    );
     // Search the full process scope via `sym::lookup`. The bring-up
     // publication into `DL_STATE.dsos` makes the entire dependency
     // graph the lookup scope (matches SysV global semantics).

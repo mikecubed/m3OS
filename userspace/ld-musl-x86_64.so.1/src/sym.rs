@@ -232,10 +232,12 @@ unsafe fn dso_version_matches(dso: &LoadedDso, sym_idx: u32, requested: &[u8]) -
         Some(p) => p.as_ptr(),
         None => return false, // VERSYM present but no VERDEF — no version names.
     };
-    // Build slice views over the DSO's mapped image. The byte length
-    // of verdef + strtab is bounded by the image span (validated at
-    // load time); we use the DSO's strsz for strtab and a generous
-    // 16 KiB cap on verdef (real DSOs have a handful of records).
+    // Build slice views over the DSO's mapped image. We use the DSO's
+    // strsz for strtab, and for verdef we bound the slice to the image
+    // tail (`max_verdef_bytes` returns `image_end - verdef_ptr`, or a
+    // 16 KiB fallback only when `image_len` is unknown). The pure-logic
+    // walker bails at `verdef_num` records or the first out-of-range
+    // offset, so an over-long slice is safe.
     let verdef_bytes = unsafe { core::slice::from_raw_parts(verdef_ptr, max_verdef_bytes(dso)) };
     let strtab_ptr = match dso.dyn_.strtab {
         Some(p) => p.as_ptr(),
