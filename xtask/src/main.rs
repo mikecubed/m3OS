@@ -949,6 +949,9 @@ fn build_userspace_bins() {
         // and asserts the JIT pattern (`PROT_READ | PROT_EXEC`)
         // succeeds. Pure syscall+write — no allocator.
         ("wx-violation", "wx-violation", false),
+        // Phase 77 Track F.1 — epoll_* verification smoke test.
+        // Pure syscall+write against a pipe; no allocator.
+        ("epoll-smoke", "epoll-smoke", false),
         // Phase 70 follow-up — `doom-concurrent` forks two `doom`
         // children and waits for both, so the
         // `doom-concurrent-smoke` gate exercises real concurrency

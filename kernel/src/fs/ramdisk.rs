@@ -315,6 +315,9 @@ static PAGE_GRANT_TEST_ELF: &[u8] = generated_initrd_asset!("page-grant-test");
 // no `.conf`.
 static WX_VIOLATION_ELF: &[u8] = generated_initrd_asset!("wx-violation");
 
+// Phase 77 Track F.1 — `epoll-smoke` epoll_* verification regression.
+static EPOLL_SMOKE_ELF: &[u8] = generated_initrd_asset!("epoll-smoke");
+
 // Phase 76 — `dynlink_smoke` musl-built dynamic ELF carrying
 // `PT_INTERP = /lib/ld-musl-x86_64.so.1` and zero `DT_NEEDED`
 // entries. The smoke-runner execs this to validate the kernel
@@ -637,6 +640,13 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "wx-violation",
         RamdiskNode::File {
             content: WX_VIOLATION_ELF,
+        },
+    ),
+    // Phase 77 Track F.1: epoll-smoke — epoll_* verification regression.
+    (
+        "epoll-smoke",
+        RamdiskNode::File {
+            content: EPOLL_SMOKE_ELF,
         },
     ),
     // Phase 76: dynlink_smoke — kernel PT_INTERP + ld.so transfer

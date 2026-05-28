@@ -20,6 +20,11 @@ const PAGE_GRANT_PASS_NEEDLE: &[u8] = b"PAGE_GRANT_SMOKE:roundtrip:ok";
 const WX_VIOLATION_PATH: &[u8] = b"/bin/wx-violation\0";
 const WX_VIOLATION_ARGV0: &[u8] = b"wx-violation\0";
 const WX_VIOLATION_PASS_NEEDLE: &[u8] = b"WX_VIOLATION:smoke:ok";
+// Phase 77 Track F.1 — epoll_* verification (handlers already exist; this
+// proves the ADD/MOD/DEL/wait/timeout path end to end against a pipe).
+const EPOLL_SMOKE_PATH: &[u8] = b"/bin/epoll-smoke\0";
+const EPOLL_SMOKE_ARGV0: &[u8] = b"epoll-smoke\0";
+const EPOLL_SMOKE_PASS_NEEDLE: &[u8] = b"EPOLL_SMOKE:PASS";
 // Phase 77 Track C — multi-threaded __thread / PT_TLS smoke test. A
 // full-musl static binary; SKIP if the musl toolchain was absent at build.
 const TLS_SMOKE_PATH: &[u8] = b"/bin/tls-smoke\0";
@@ -230,6 +235,22 @@ fn program_main(_args: &[&str]) -> i32 {
         return code;
     }
     pass("wx-violation");
+
+    // Phase 77 Track F.1 — epoll_* verification. The handlers already exist;
+    // this proves EPOLL_CTL_ADD/MOD/DEL + epoll_wait readiness + timeout end
+    // to end against a pipe.
+    begin("epoll-smoke");
+    let epoll_argv = [EPOLL_SMOKE_ARGV0.as_ptr(), ptr::null()];
+    if let Err(code) = run_command_expect_output(
+        "epoll-smoke",
+        EPOLL_SMOKE_PATH,
+        &epoll_argv,
+        EPOLL_SMOKE_PASS_NEEDLE,
+        &mut command_output,
+    ) {
+        return code;
+    }
+    pass("epoll-smoke");
 
     // Phase 77 Track C — multi-threaded __thread / PT_TLS test. Proves each
     // pthread sees its own copy of a `__thread` variable (the PT_TLS template

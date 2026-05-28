@@ -14,7 +14,7 @@
 | C | `PT_TLS` parsing in the ELF loader | Phase 74 ✅ | Complete |
 | D | Networking polish (DNS resolver, TCP retransmit + slot lift) | — | Planned |
 | E | Microcode loading | — | Planned |
-| F | `epoll_*` verify-and-implement-if-missing | — | Planned |
+| F | `epoll_*` verify-and-implement-if-missing | — | Complete |
 | G | Open-handoff resolution + doc-drift PR | A–F, H | Planned |
 | H | `/proc` compatibility for `htop` / `ps` / `top` | — | Planned |
 | I | Documentation and Release (learning doc + `0.77.0` bump) | A–H | Planned |
@@ -197,10 +197,10 @@
 **Why it matters:** Audit §2 flagged `epoll_*` as PARTIAL/possibly-absent. Source verification shows all three handlers **exist and are fully implemented** (FD-table integration, interest lists, wait-queue-backed blocking, close-on-exec cleanup). So this track is verification + a regression gate + an audit correction — **not** new implementation.
 
 **Acceptance:**
-- [ ] A new `userspace/epoll-smoke` binary registers a readable fd (pipe or socket) with `epoll_ctl(EPOLL_CTL_ADD)`, writes to it, and asserts `epoll_wait` reports the fd ready with the correct event mask; it also exercises `EPOLL_CTL_MOD`, `EPOLL_CTL_DEL`, and the timeout path
-- [ ] The binary prints `EPOLL_SMOKE:PASS` / `EPOLL_SMOKE:FAIL <detail>` and is wired into the `smoke-runner` gate (`SMOKE:epoll-smoke:PASS`)
-- [ ] `docs/appendix/audit-status/74a-pre-1.0-audit.md` §2 is updated from PARTIAL to "wired and verified," citing the three handler line numbers and the new smoke gate
-- [ ] No new syscall handler is added unless the smoke test surfaces a genuine gap; if it does, the gap is implemented against the existing `WaitQueue` infrastructure (`kernel/src/task/wait_queue.rs`) and noted explicitly
+- [x] A new `userspace/epoll-smoke` binary registers a pipe read end with `epoll_ctl(EPOLL_CTL_ADD)`, writes to it, and asserts `epoll_wait` reports the fd ready with the correct event mask (`EPOLLIN`) and `data` token; it also exercises `EPOLL_CTL_MOD` (token change verified), `EPOLL_CTL_DEL` (no event after delete), and the timeout path (returns 0)
+- [x] The binary prints `EPOLL_SMOKE:PASS` / `EPOLL_SMOKE:FAIL <detail>` and is wired into the `smoke-runner` gate (`SMOKE:epoll-smoke:PASS` observed in `cargo xtask smoke-test`)
+- [x] `docs/appendix/audit-status/74a-pre-1.0-audit.md` §1 row 17 + §2 entry updated from PARTIAL to "wired and verified," citing the three handler line numbers (`18453`/`18551`/`18593`) and the new smoke gate
+- [x] No new syscall handler was added — the smoke test surfaced no gap; all three handlers were already fully implemented
 
 ---
 
