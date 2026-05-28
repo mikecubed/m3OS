@@ -214,12 +214,37 @@ pub unsafe extern "C" fn resolve_pltrel(link_map: *const LoadedDso, reloc_index:
     let sym_idx = r_sym(r.r_info);
     let sym_entry = unsafe { &*symtab.add(sym_idx as usize) };
     let name = unsafe { crate::strtab_get(strtab, sym_entry.st_name as u64, dso.dyn_.strsz) };
+    // Phase 76d.D2.2 — read the consumer's `DT_VERSYM` /
+    // `DT_VERNEED` to derive the required version name for this
+    // symbol. `consumer_required_version` returns `None` for
+    // unversioned consumers.
+    let strtab_bytes: &[u8] =
+        unsafe { core::slice::from_raw_parts(strtab, dso.dyn_.strsz as usize) };
+    let verneed_bytes: &[u8] = match (dso.dyn_.verneed, dso.dyn_.verneednum) {
+        (Some(p), n) if n > 0 && dso.image_len != 0 => {
+            let base = p.as_ptr() as u64;
+            let image_end = dso.load_bias.saturating_add(dso.image_len);
+            let len = image_end.saturating_sub(base) as usize;
+            unsafe { core::slice::from_raw_parts(p.as_ptr(), len) }
+        }
+        _ => &[],
+    };
+    let ver_table = ldso_core::ver::VersionTable {
+        versym: &[],
+        verdef_bytes: &[],
+        verdef_num: 0,
+        verneed_bytes,
+        verneed_num: dso.dyn_.verneednum as usize,
+        strtab: strtab_bytes,
+    };
+    let version =
+        crate::consumer_required_version(dso.dyn_.versym.map(|p| p.as_ptr()), sym_idx, &ver_table);
     // Search the full process scope via `sym::lookup`. The bring-up
     // publication into `DL_STATE.dsos` makes the entire dependency
     // graph the lookup scope (matches SysV global semantics).
     let state = dl::dl_state_mut();
     let scope = &state.dsos[..state.n_slots_used];
-    let resolved = unsafe { sym::lookup(scope, name, None) };
+    let resolved = unsafe { sym::lookup(scope, name, version) };
     let addr = match resolved {
         Some(a) => a,
         None => {

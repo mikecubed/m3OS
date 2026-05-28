@@ -9,26 +9,42 @@
 //!
 //! [`lookup`] walks `scope` in order and returns the address of the
 //! first DSO that defines `name`. Behavior matches the Phase 76b
-//! free-function `lookup_symbol` byte-for-byte: SysV global scope,
-//! `STN_UNDEF == 0` terminator, `st_value != 0` filter, `nchain`
-//! hops bound.
+//! free-function `lookup_symbol` byte-for-byte when `version` is
+//! `None`: SysV global scope, `STN_UNDEF == 0` terminator,
+//! `st_value != 0` filter, `nchain` hops bound.
 //!
 //! ## Backend dispatch
 //!
 //! Each DSO is dispatched to a [`Backend`] based on which hash tags
-//! its `PT_DYNAMIC` carries. Phase 76d.S1 ships only [`Backend::SysV`];
-//! D1 inserts the GNU arm in front of it (so libraries with
-//! `--hash-style=both` benefit from the Bloom-filter short-circuit).
+//! its `PT_DYNAMIC` carries. Phase 76d.D1.3 added `Gnu` (preferred
+//! when present); SysV is the fallback. Both backends return the
+//! symbol's index in `DT_SYMTAB`, which the dispatcher then feeds
+//! into the version-aware path (D2).
 //!
 //! ## Version-awareness
 //!
-//! The `version` parameter is accepted today but threaded as `None`
-//! by every Phase 76d.S1 caller — D2 wires real version constraints
-//! into the path. Carrying the parameter from S1 means D2 does not
-//! re-touch every call site.
+//! Phase 76d.D2.2 wires the `version: Option<&[u8]>` parameter into
+//! the walker. Behaviour:
+//!
+//!   * `version == None` — Phase 76b/c semantics (back-compat).
+//!   * `version == Some(v)` — try each DSO for an exact-version
+//!     match against the DSO's `DT_VERSYM` + `DT_VERDEF`. If no DSO
+//!     provides the named symbol with the matching version:
+//!       * Default mode (POSIX lazy + `LD_BIND_NOW` unset) — emit a
+//!         serial warning and fall back to an unversioned scan.
+//!       * Strict mode (`LD_BIND_NOW=1`, D2.3) — return `None`
+//!         immediately and emit a serial error. The caller (apply_rela)
+//!         surfaces this as a hard load-time failure.
+//!
+//! DSOs that carry NO `DT_VERSYM` (unversioned providers) satisfy
+//! any version request for a matching name — matches the standard
+//! glibc back-compat rule.
 
 use ldso_core::dynlink::{LoadedDso, elf_hash};
 use ldso_core::gnu_hash::{GnuHashHeader, GnuLookupOutcome, gnu_hash, gnu_hash_lookup};
+use ldso_core::ver::{VER_NDX_GLOBAL, VER_NDX_LOCAL, VERSYM_VERSION_MASK, VersionTable};
+
+use crate::plt;
 
 /// Backend chosen for one DSO's symbol-table walk.
 ///
@@ -42,12 +58,24 @@ enum Backend {
     Gnu,
 }
 
+/// One per-DSO lookup hit. Carries both the resolved address and the
+/// symbol-table index so the dispatcher can check `DT_VERSYM` /
+/// `DT_VERDEF` for the version-aware path (D2.2).
+#[derive(Clone, Copy)]
+struct DsoHit {
+    addr: u64,
+    sym_idx: u32,
+}
+
 /// Look up `name` across `scope` and return the first DSO's
 /// definition address, or `None` if no DSO defines it.
 ///
-/// `version` is reserved for D2 and ignored by Phase 76d.S1/D1
-/// callers (they pass `None`). Carrying the parameter through S1
-/// means D2 does not need a second pass over every call site.
+/// `version`:
+///   * `None` → unversioned lookup (Phase 76b/c semantics).
+///   * `Some(v)` → exact-version match required. Falls back to
+///     unversioned with a serial warning when nothing matches in
+///     default mode; returns `None` with a serial error in strict
+///     mode (`plt::bind_now_set() == true`, Phase 76d.D2.3).
 ///
 /// # Safety
 /// Every `LoadedDso` in `scope` whose `dyn_.hash` / `dyn_.gnu_hash` /
@@ -56,48 +84,145 @@ enum Backend {
 /// in `main.rs` runs this check at load time. Pointers must remain
 /// valid for the call.
 pub unsafe fn lookup(scope: &[LoadedDso], name: &[u8], version: Option<&[u8]>) -> Option<u64> {
-    let _ = version; // wired by D2; Phase 76d.S1/D1 are version-blind
+    // Pass 1: try every DSO for the name. When `version` is set, also
+    // check the DSO's version constraint matches.
+    let mut name_matched_somewhere = false;
     for dso in scope {
-        // D1.3 dispatcher: prefer GNU when present (Bloom-filter
-        // short-circuit); fall back to SysV when only DT_HASH is
-        // available; skip entirely when neither table is populated.
-        let backend = if dso.dyn_.gnu_hash.is_some() {
-            Backend::Gnu
-        } else if dso.dyn_.hash.is_some() {
-            Backend::SysV
-        } else {
-            continue;
+        let hit = match unsafe { lookup_in_dso(dso, name) } {
+            Some(h) => h,
+            None => continue,
         };
-        let hit = match backend {
-            Backend::SysV => unsafe { lookup_sysv(dso, name) },
-            Backend::Gnu => unsafe { lookup_gnu(dso, name) },
+        name_matched_somewhere = true;
+        let requested = match version {
+            Some(v) => v,
+            None => return Some(hit.addr), // Unversioned lookup — first match wins.
         };
-        if let Some(addr) = hit {
-            return Some(addr);
+        if unsafe { dso_version_matches(dso, hit.sym_idx, requested) } {
+            return Some(hit.addr);
+        }
+        // Same-name, different-version — keep scanning. SysV semantics:
+        // a versioned consumer can be satisfied by any DSO that defines
+        // the matching version.
+    }
+
+    // Phase 76d.D2.2 — pass 1 found no exact-version match.
+    if let Some(requested) = version {
+        if !name_matched_somewhere {
+            // Nothing in scope defines this name at all — neither
+            // versioned nor unversioned fallback can help. Return
+            // None silently; apply_rela will report the
+            // undefined-symbol error.
+            return None;
+        }
+        if plt::bind_now_set() {
+            // D2.3 strict mode — hard fail with serial error.
+            crate::serial(b"ldso: version mismatch (LD_BIND_NOW strict): symbol=");
+            crate::serial(name);
+            crate::serial(b" version=");
+            crate::serial(requested);
+            crate::serial(b"\n");
+            return None;
+        }
+        crate::serial(b"ldso: version mismatch, falling back to unversioned: symbol=");
+        crate::serial(name);
+        crate::serial(b" version=");
+        crate::serial(requested);
+        crate::serial(b"\n");
+        // Pass 2 — unversioned fallback.
+        for dso in scope {
+            if let Some(hit) = unsafe { lookup_in_dso(dso, name) } {
+                return Some(hit.addr);
+            }
         }
     }
+
     None
 }
 
-/// SysV `DT_HASH` walk against one DSO. Extracted from the Phase 76b
-/// free-function `lookup_symbol` so the dispatcher in [`lookup`] can
-/// invoke it per-DSO without duplicating chain-walk semantics.
-///
-/// # Safety
-/// `dso.dyn_.hash` must reference at least 8 bytes of mapped memory
-/// (the `nbuckets`/`nchain` header); the bucket and chain arrays must
-/// fit within the DSO's image span. `validate_dyn_pointers` enforces
-/// the header bound; the chain-walk's `hops <= nchain` guard plus the
-/// `idx >= nchain` bail-out keep the in-loop reads bounded even on
-/// corrupt tables.
-/// Phase 76d.D1.2 — GNU `DT_GNU_HASH` runtime walker. Mirrors
-/// [`lookup_sysv`] in shape (per-DSO, returns the relocated symbol
-/// address) but consults the GNU table's Bloom filter + bucket +
-/// chain layout.
-///
-/// The pure-logic walk lives in `ldso_core::gnu_hash::gnu_hash_lookup`;
-/// this function wraps it with raw-pointer reads of the in-memory
-/// table.
+/// Pick the GNU or SysV backend for `dso` based on which hash table
+/// it carries and run it. Returns the resolved address + sym_idx if
+/// the DSO defines `name`, or `None` if it doesn't.
+unsafe fn lookup_in_dso(dso: &LoadedDso, name: &[u8]) -> Option<DsoHit> {
+    let backend = if dso.dyn_.gnu_hash.is_some() {
+        Backend::Gnu
+    } else if dso.dyn_.hash.is_some() {
+        Backend::SysV
+    } else {
+        return None;
+    };
+    match backend {
+        Backend::SysV => unsafe { lookup_sysv(dso, name) },
+        Backend::Gnu => unsafe { lookup_gnu(dso, name) },
+    }
+}
+
+/// Phase 76d.D2.2 — return `true` when the DSO's `DT_VERSYM` /
+/// `DT_VERDEF` say `sym_idx` is exported under `requested`. Returns
+/// `true` for DSOs with no `DT_VERSYM` (unversioned providers
+/// satisfy any version request — standard glibc back-compat).
+/// Returns `true` when the symbol's version index is the special
+/// `VER_NDX_GLOBAL` (1) — that's the unversioned default export
+/// slot and matches any version request.
+unsafe fn dso_version_matches(dso: &LoadedDso, sym_idx: u32, requested: &[u8]) -> bool {
+    let versym_ptr = match dso.dyn_.versym {
+        Some(p) => p.as_ptr(),
+        None => return true, // Unversioned DSO satisfies any version request.
+    };
+    let raw_index = unsafe { *versym_ptr.add(sym_idx as usize) };
+    let version_index = raw_index & VERSYM_VERSION_MASK;
+    if version_index == VER_NDX_LOCAL || version_index == VER_NDX_GLOBAL {
+        // Default / unversioned export — satisfies any version request.
+        return true;
+    }
+    let verdef_ptr = match dso.dyn_.verdef {
+        Some(p) => p.as_ptr(),
+        None => return false, // VERSYM present but no VERDEF — no version names.
+    };
+    // Build slice views over the DSO's mapped image. The byte length
+    // of verdef + strtab is bounded by the image span (validated at
+    // load time); we use the DSO's strsz for strtab and a generous
+    // 16 KiB cap on verdef (real DSOs have a handful of records).
+    let verdef_bytes = unsafe { core::slice::from_raw_parts(verdef_ptr, max_verdef_bytes(dso)) };
+    let strtab_ptr = match dso.dyn_.strtab {
+        Some(p) => p.as_ptr(),
+        None => return false,
+    };
+    let strtab_bytes = unsafe { core::slice::from_raw_parts(strtab_ptr, dso.dyn_.strsz as usize) };
+    let table = VersionTable {
+        versym: &[],
+        verdef_bytes,
+        verdef_num: dso.dyn_.verdefnum as usize,
+        verneed_bytes: &[],
+        verneed_num: 0,
+        strtab: strtab_bytes,
+    };
+    match table.defined_version_name(version_index) {
+        Some(name) => name == requested,
+        None => false,
+    }
+}
+
+/// Bound the verdef byte slice. The verdef section sits inside the
+/// DSO's image; without a `DT_VERDEFSZ` (which doesn't exist in
+/// SysV ELF — only `DT_VERDEFNUM`), we cap at the image span minus
+/// the verdef offset. For a typical DSO that's tens of KiB; the
+/// pure-logic walker bails out at `verdef_num` records or the first
+/// out-of-range offset, whichever comes first.
+unsafe fn max_verdef_bytes(dso: &LoadedDso) -> usize {
+    let verdef_ptr = match dso.dyn_.verdef {
+        Some(p) => p.as_ptr() as u64,
+        None => return 0,
+    };
+    if dso.image_len == 0 {
+        return 16 * 1024;
+    }
+    let image_end = dso.load_bias.saturating_add(dso.image_len);
+    image_end.saturating_sub(verdef_ptr) as usize
+}
+
+/// Phase 76d.D1.2 — GNU `DT_GNU_HASH` runtime walker. Returns the
+/// resolved address + sym_idx so the dispatcher can route the result
+/// through the version-aware path.
 ///
 /// # Safety
 /// `dso.dyn_.gnu_hash` must reference at least 16 bytes (the four
@@ -106,11 +231,10 @@ pub unsafe fn lookup(scope: &[LoadedDso], name: &[u8], version: Option<&[u8]>) -
 /// reads inside the DSO image (the runtime currently trusts the
 /// validate_dyn_pointers pass at load time + the chain end-marker bit
 /// to bound the walk).
-unsafe fn lookup_gnu(dso: &LoadedDso, name: &[u8]) -> Option<u64> {
+unsafe fn lookup_gnu(dso: &LoadedDso, name: &[u8]) -> Option<DsoHit> {
     let header = dso.dyn_.gnu_hash?.as_ptr();
     let symtab = dso.dyn_.symtab?.as_ptr();
     let strtab = dso.dyn_.strtab?.as_ptr();
-    // Header is four u32 words: [nbuckets, symoffset, bloom_size, bloom_shift].
     let nbuckets = unsafe { *header };
     let symoffset = unsafe { *header.add(1) };
     let bloom_size = unsafe { *header.add(2) };
@@ -118,15 +242,10 @@ unsafe fn lookup_gnu(dso: &LoadedDso, name: &[u8]) -> Option<u64> {
     if nbuckets == 0 || bloom_size == 0 {
         return None;
     }
-    // Bloom array follows the header (u64 aligned). The header is 16
-    // bytes (4 × u32), so the bloom array starts at `header + 4` u32s.
     let bloom_ptr = unsafe { header.add(4) } as *const u64;
     let buckets_ptr = unsafe { bloom_ptr.add(bloom_size as usize) } as *const u32;
     let hashes_ptr = unsafe { buckets_ptr.add(nbuckets as usize) };
 
-    // Bloom probe inline so the dispatcher exits without ever forming
-    // a temporary slice over the bucket/chain arrays when the symbol is
-    // proven absent. This is the D1 hot-path short-circuit.
     let h = gnu_hash(name);
     let bit0 = 1u64 << (h % 64);
     let bit1 = 1u64 << (h.wrapping_shr(bloom_shift) % 64);
@@ -137,9 +256,6 @@ unsafe fn lookup_gnu(dso: &LoadedDso, name: &[u8]) -> Option<u64> {
         return None;
     }
 
-    // Bucket walk inline. Build a chain length bound by scanning until
-    // a chain-end marker (bit 0 of the hash entry); cap at a generous
-    // 65536 to defend against a corrupt table that lacks an end marker.
     let bucket_idx = (h % nbuckets) as usize;
     let mut sym_idx = unsafe { *buckets_ptr.add(bucket_idx) };
     if sym_idx < symoffset {
@@ -153,15 +269,16 @@ unsafe fn lookup_gnu(dso: &LoadedDso, name: &[u8]) -> Option<u64> {
         }
         let chain_idx = (sym_idx - symoffset) as usize;
         let h2 = unsafe { *hashes_ptr.add(chain_idx) };
-        // Compare upper 31 bits (bit 0 is the chain-end marker).
         if (h | 1) == (h2 | 1) {
             let sym = unsafe { &*symtab.add(sym_idx as usize) };
             let nm = unsafe { crate::strtab_get(strtab, sym.st_name as u64, dso.dyn_.strsz) };
             if nm == name && sym.st_value != 0 {
-                return Some(dso.load_bias.wrapping_add(sym.st_value));
+                return Some(DsoHit {
+                    addr: dso.load_bias.wrapping_add(sym.st_value),
+                    sym_idx,
+                });
             }
         }
-        // Bit 0 set ⇒ chain end.
         if (h2 & 1) != 0 {
             return None;
         }
@@ -193,7 +310,18 @@ fn _gnu_hash_lookup_keepalive() -> GnuLookupOutcome {
     )
 }
 
-unsafe fn lookup_sysv(dso: &LoadedDso, name: &[u8]) -> Option<u64> {
+/// SysV `DT_HASH` walk against one DSO. Returns the resolved address
+/// + sym_idx so the dispatcher can route the result through the
+///   version-aware path.
+///
+/// # Safety
+/// `dso.dyn_.hash` must reference at least 8 bytes of mapped memory
+/// (the `nbuckets`/`nchain` header); the bucket and chain arrays must
+/// fit within the DSO's image span. `validate_dyn_pointers` enforces
+/// the header bound; the chain-walk's `hops <= nchain` guard plus the
+/// `idx >= nchain` bail-out keep the in-loop reads bounded even on
+/// corrupt tables.
+unsafe fn lookup_sysv(dso: &LoadedDso, name: &[u8]) -> Option<DsoHit> {
     let hash_ptr = dso.dyn_.hash?.as_ptr();
     let symtab = dso.dyn_.symtab?.as_ptr();
     let strtab = dso.dyn_.strtab?.as_ptr();
@@ -214,7 +342,10 @@ unsafe fn lookup_sysv(dso: &LoadedDso, name: &[u8]) -> Option<u64> {
         let sym = unsafe { &*symtab.add(idx as usize) };
         let nm = unsafe { crate::strtab_get(strtab, sym.st_name as u64, dso.dyn_.strsz) };
         if nm == name && sym.st_value != 0 {
-            return Some(dso.load_bias.wrapping_add(sym.st_value));
+            return Some(DsoHit {
+                addr: dso.load_bias.wrapping_add(sym.st_value),
+                sym_idx: idx,
+            });
         }
         idx = unsafe { *chain.add(idx as usize) };
         hops += 1;

@@ -866,6 +866,41 @@ unsafe fn load_dso_impl(fd: i64, scratch: u64, scratch_len: u64) -> Result<Loade
 // Relocation walker (Track B3.1 / B3.2 / B3.3).
 // ---------------------------------------------------------------------------
 
+/// Phase 76d.D2.2 — translate the consumer's `versym[sym_idx]` into a
+/// required version-name byte slice the per-DSO version-matcher
+/// (`sym::dso_version_matches`) can compare against the provider's
+/// `DT_VERDEF`.
+///
+/// Returns:
+///   * `None` when the consumer has no `DT_VERSYM` (unversioned —
+///     Phase 76b/c semantics, any provider satisfies any request).
+///   * `None` when the symbol's version index is the special LOCAL
+///     (0) or GLOBAL (1) — those are the unversioned default and any
+///     provider satisfies them.
+///   * `Some(name)` when the consumer's `DT_VERNEED` records carry a
+///     `Vernaux` with matching `vna_other`.
+///
+/// # Safety
+/// If `versym_ptr` is `Some`, it must reference a valid `versym`
+/// array of at least `sym_idx + 1` entries inside the consumer's
+/// mapped image. The `ver_table.verneed_bytes` slice must reference
+/// the consumer's mapped image.
+pub(crate) fn consumer_required_version<'a>(
+    versym_ptr: Option<*mut u16>,
+    sym_idx: u32,
+    ver_table: &ldso_core::ver::VersionTable<'a>,
+) -> Option<&'a [u8]> {
+    let p = versym_ptr?;
+    let raw = unsafe { *p.add(sym_idx as usize) };
+    let version_index = raw & ldso_core::ver::VERSYM_VERSION_MASK;
+    if version_index == ldso_core::ver::VER_NDX_LOCAL
+        || version_index == ldso_core::ver::VER_NDX_GLOBAL
+    {
+        return None;
+    }
+    ver_table.required_version_name_by_index(version_index)
+}
+
 /// Walk a `Rela` table at `table` of `count` entries and apply each
 /// relocation against `dso.load_bias`. Symbol resolution routes
 /// through [`sym::lookup`] (Phase 76d.S1.1's unified dispatch) against
@@ -883,6 +918,35 @@ unsafe fn apply_rela(
     let symtab = match dso.dyn_.symtab {
         Some(p) => p.as_ptr(),
         None => core::ptr::null(),
+    };
+    // Phase 76d.D2.2 — consumer-side version metadata. For each
+    // symbol-relocation we read `versym[sym_idx]` and translate via
+    // the consumer's `DT_VERNEED` to a required version-name string,
+    // which `sym::lookup` then matches against the provider's
+    // `DT_VERSYM` + `DT_VERDEF`. DSOs with no `DT_VERSYM` (unversioned
+    // consumers) pass `None` and Phase 76b/c behaviour holds.
+    let versym_ptr = dso.dyn_.versym.map(|p| p.as_ptr());
+    let verneed_bytes: &[u8] = match (dso.dyn_.verneed, dso.dyn_.verneednum) {
+        (Some(p), n) if n > 0 && dso.image_len != 0 => {
+            let base = p.as_ptr() as u64;
+            let image_end = dso.load_bias.saturating_add(dso.image_len);
+            let len = image_end.saturating_sub(base) as usize;
+            unsafe { core::slice::from_raw_parts(p.as_ptr(), len) }
+        }
+        _ => &[],
+    };
+    let strtab_bytes: &[u8] = if strtab.is_null() {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(strtab, dso.dyn_.strsz as usize) }
+    };
+    let ver_table = ldso_core::ver::VersionTable {
+        versym: &[],
+        verdef_bytes: &[],
+        verdef_num: 0,
+        verneed_bytes,
+        verneed_num: dso.dyn_.verneednum as usize,
+        strtab: strtab_bytes,
     };
     for i in 0..count {
         let r = unsafe { *table.add(i) };
@@ -929,7 +993,8 @@ unsafe fn apply_rela(
                 let sym_idx = r_sym(r.r_info);
                 let sym = unsafe { &*symtab.add(sym_idx as usize) };
                 let name = unsafe { strtab_get(strtab, sym.st_name as u64, dso.dyn_.strsz) };
-                let value = unsafe { sym::lookup(dsos, name, None).unwrap_or(0) };
+                let version = consumer_required_version(versym_ptr, sym_idx, &ver_table);
+                let value = unsafe { sym::lookup(dsos, name, version).unwrap_or(0) };
                 if value == 0 {
                     serial(b"ldso: undefined symbol ");
                     serial(name);
@@ -975,7 +1040,8 @@ unsafe fn apply_rela(
                     let sym_idx = r_sym(r.r_info);
                     let sym = unsafe { &*symtab.add(sym_idx as usize) };
                     let name = unsafe { strtab_get(strtab, sym.st_name as u64, dso.dyn_.strsz) };
-                    let value = unsafe { sym::lookup(dsos, name, None).unwrap_or(0) };
+                    let version = consumer_required_version(versym_ptr, sym_idx, &ver_table);
+                    let value = unsafe { sym::lookup(dsos, name, version).unwrap_or(0) };
                     if value == 0 {
                         serial(b"ldso: undefined symbol ");
                         serial(name);
@@ -1004,7 +1070,8 @@ unsafe fn apply_rela(
                 let sym_idx = r_sym(r.r_info);
                 let sym = unsafe { &*symtab.add(sym_idx as usize) };
                 let name = unsafe { strtab_get(strtab, sym.st_name as u64, dso.dyn_.strsz) };
-                let value = unsafe { sym::lookup(dsos, name, None).unwrap_or(0) };
+                let version = consumer_required_version(versym_ptr, sym_idx, &ver_table);
+                let value = unsafe { sym::lookup(dsos, name, version).unwrap_or(0) };
                 if value == 0 {
                     return Err("undefined symbol (R_X86_64_64)");
                 }

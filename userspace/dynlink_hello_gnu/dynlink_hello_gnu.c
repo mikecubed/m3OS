@@ -2,28 +2,29 @@
  * dynlink_hello_gnu — Phase 76d.F end-to-end smoke binary.
  *
  * Built with --hash-style=gnu, links libhello_gnu.so. Exercises
- * Phase 76d.D1's GNU-hash backend, B4's PLT lazy resolve, and
- * F.4's W^X invariant via /proc/self/maps.
+ * Phase 76d.D1's GNU-hash backend, B4's PLT lazy resolve trampoline
+ * (F.2 GOT-mutation assertion), E4's LD_BIND_NOW (F.3), and F.4's
+ * W^X invariant via /proc/self/maps.
  *
  *   * Sentinel `HELLO_FROM_GNU_LIB:OK` — basic GNU-hash path works.
+ *   * Sentinel `BIND_NOW:0` or `BIND_NOW:1` — F.2's GOT[3] mutation
+ *     assertion. The lazy path patches `GOT[3]` on first call; the
+ *     eager path pre-resolves at load. Differs across the run, gate
+ *     asserts BIND_NOW:0 (default env) and BIND_NOW:1 (LD_BIND_NOW=1).
  *   * Sentinel `WX_CHECK:OK` (F.4) — no `rwx` line in /proc/self/maps.
  *
- * The F.2 acceptance ("first call goes through trampoline") is
- * proven implicitly: under the lazy default (`BIND_NOW=false`), the
- * first call to `hello_str()` MUST traverse the PLT trampoline path
- * for the binary to print the sentinel. A direct GOT[3]-pointer
- * inspection is fragile in this build setup (`-no-pie -fno-pie
- * -Wl,-pie -nostartfiles` confuses the linker's
- * R_X86_64_GOTPC32 handling for `_GLOBAL_OFFSET_TABLE_`); the
- * end-to-end sentinel is the assertion that matters.
- *
- * The F.3 acceptance (LD_BIND_NOW=1 eager resolution) is verified by
- * the smoke gate running the binary twice — once with default env
- * and once with `LD_BIND_NOW=1`. Both must succeed.
+ * `_GLOBAL_OFFSET_TABLE_` is loaded via inline-asm `lea` rather than
+ * a C array reference. The compiler's default reference (`extern u64
+ * _GLOBAL_OFFSET_TABLE_[]`) emits a `mov -4(%rip), %rbx`
+ * GOTPCREL-style load under this build's `-no-pie -fno-pie -Wl,-pie
+ * -nostartfiles` flag combo — that load is broken because it would
+ * itself need the GOT to be set up. The explicit `lea` bypasses the
+ * GOT and computes the address PC-relatively.
  */
 
 #include "../lib/libhello_gnu/hello.h"
 
+typedef unsigned long u64;
 typedef long i64;
 
 static i64 sys_write(i64 fd, const char *buf, i64 len) {
@@ -104,15 +105,45 @@ static int wx_check(void) {
     return 1;
 }
 
+/* PC-relative load of `_GLOBAL_OFFSET_TABLE_`. Bypasses the
+ * compiler's broken GOTPCREL handling for `extern u64
+ * _GLOBAL_OFFSET_TABLE_[]` under our build flags. */
+static u64 *got_base(void) {
+    u64 *p;
+    __asm__("leaq _GLOBAL_OFFSET_TABLE_(%%rip), %0" : "=r"(p));
+    return p;
+}
+
 void _start(void) {
+    /* F.2 — snapshot GOT[3] BEFORE first call. With Phase 76d's
+     * lazy default this holds (load_bias + plt_fallback_offset);
+     * after the first call the trampoline patches it to the
+     * absolute `hello_str` address. */
+    u64 *got = got_base();
+    volatile u64 got_before = got[3];
+
     const char *msg = hello_str();
+
+    volatile u64 got_after = got[3];
+
     i64 len = c_strlen(msg);
     sys_write(1, msg, len);
     sys_write(1, "\n", 1);
+
+    /* F.2 + F.3 — GOT[3] mutation tells us whether the trampoline
+     * ran. Lazy default: mutated (BIND_NOW:0). Eager via env: stable
+     * (BIND_NOW:1). */
+    if (got_before == got_after) {
+        sys_write(1, "BIND_NOW:1\n", 11);
+    } else {
+        sys_write(1, "BIND_NOW:0\n", 11);
+    }
+
     if (wx_check()) {
         sys_write(1, "WX_CHECK:OK\n", 12);
     } else {
         sys_write(1, "WX_CHECK:FAIL\n", 14);
     }
+
     sys_exit(0);
 }

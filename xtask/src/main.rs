@@ -2026,6 +2026,313 @@ fn build_dynlink_hello_gnu() {
     }
 }
 
+/// Phase 76d.G — build `libhello_versioned.so` with a linker
+/// `--version-script` that exports `hello_str` under symbol version
+/// `LIBHELLO_1.0`. The result carries `DT_VERSYM` + `DT_VERDEF` so
+/// the consumer's `DT_VERNEED` resolves through Phase 76d.D2.2's
+/// version-aware lookup.
+fn build_libhello_versioned() {
+    let root = workspace_root();
+    let libs = ensure_generated_libs_dir(&root);
+    let dst = libs.join("libhello_versioned.so");
+    let src = root.join("userspace/lib/libhello_versioned/hello.c");
+    let ver = root.join("userspace/lib/libhello_versioned/libhello_versioned.ver");
+
+    let cc = match find_musl_cc() {
+        Some(c) => c,
+        None => {
+            eprintln!(
+                "warning: musl-gcc missing — skipping libhello_versioned.so. \
+                 dynlink-hello-versioned-smoke will SKIP at runtime."
+            );
+            let _ = fs::write(&dst, b"");
+            return;
+        }
+    };
+
+    let mut cmd = Command::new(cc);
+    cmd.args(["-shared", "-fPIC", "-O2", "-nostdlib"]);
+    cmd.arg("-Wl,--hash-style=gnu");
+    cmd.arg("-Wl,-soname,libhello_versioned.so");
+    cmd.arg(format!(
+        "-Wl,--version-script={}",
+        ver.to_str().expect("non-UTF-8 path")
+    ));
+    cmd.arg(src.to_str().expect("non-UTF-8 path"));
+    cmd.arg("-o").arg(dst.to_str().expect("non-UTF-8 path"));
+    match cmd.output() {
+        Ok(out) if out.status.success() => {
+            println!(
+                "shared-lib(gnu+versioned): {} → {}",
+                src.display(),
+                dst.display()
+            );
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            eprintln!("error: libhello_versioned.so build failed: {stderr}");
+            let _ = fs::write(&dst, b"");
+            std::process::exit(1);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("warning: {cc} not found mid-build — skipping libhello_versioned.so");
+            let _ = fs::write(&dst, b"");
+        }
+        Err(e) => {
+            eprintln!("error: failed to invoke {cc} for libhello_versioned.so: {e}");
+            let _ = fs::write(&dst, b"");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Phase 76d.G — build `dynlink_hello_versioned`, the binary that
+/// links against `libhello_versioned.so` and requires the
+/// `LIBHELLO_1.0` version (via the lib's version script). Drives
+/// the dynlink-hello-versioned-smoke exact-match gate.
+fn build_dynlink_hello_versioned() {
+    let root = workspace_root();
+    let initrd = ensure_generated_initrd_dir(&root);
+    let libs = ensure_generated_libs_dir(&root);
+    let dst = initrd.join("dynlink_hello_versioned");
+    let src = root.join("userspace/dynlink_hello_versioned/dynlink_hello_versioned.c");
+    let lib = libs.join("libhello_versioned.so");
+
+    if !lib.exists() || fs::metadata(&lib).map(|m| m.len() == 0).unwrap_or(true) {
+        eprintln!(
+            "warning: libhello_versioned.so missing or empty at {} — skipping dynlink_hello_versioned build",
+            lib.display()
+        );
+        let _ = fs::write(&dst, b"");
+        return;
+    }
+    let cc = match find_musl_cc() {
+        Some(c) => c,
+        None => {
+            eprintln!("warning: musl-gcc missing — skipping dynlink_hello_versioned build");
+            let _ = fs::write(&dst, b"");
+            return;
+        }
+    };
+
+    let mut cmd = Command::new(cc);
+    cmd.args([
+        "-nostdlib",
+        "-nostartfiles",
+        "-fno-stack-protector",
+        "-fno-pie",
+        "-no-pie",
+    ]);
+    cmd.args([
+        "-fPIC",
+        "-Wl,-pie",
+        "-Wl,-dynamic-linker=/lib/ld-musl-x86_64.so.1",
+        "-Wl,--hash-style=gnu",
+        "-Wl,-rpath,/usr/lib",
+        "-Wl,--no-eh-frame-hdr",
+        "-O2",
+        "-fno-builtin",
+    ]);
+    cmd.arg(src.to_str().expect("non-UTF-8 path"));
+    cmd.arg(lib.to_str().expect("non-UTF-8 path"));
+    cmd.arg("-o").arg(dst.to_str().expect("non-UTF-8 path"));
+    match cmd.output() {
+        Ok(out) if out.status.success() => {
+            println!("dynlink_hello_versioned: built → {}", dst.display());
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            eprintln!(
+                "error: dynlink_hello_versioned build failed (exit {}): {stderr}",
+                out.status.code().unwrap_or(-1)
+            );
+            let _ = fs::write(&dst, b"");
+            std::process::exit(1);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("warning: {cc} not found mid-build — skipping dynlink_hello_versioned");
+            let _ = fs::write(&dst, b"");
+        }
+        Err(e) => {
+            eprintln!("error: failed to invoke {cc} for dynlink_hello_versioned: {e}");
+            let _ = fs::write(&dst, b"");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Phase 76d.G.3 — build the REAL `libhello_versioned_v2.so`
+/// (defines `hello_str` only under `LIBHELLO_2.0`) AND the
+/// link-time stub `libhello_versioned_v2_link.so` (defines
+/// `hello_str@LIBHELLO_1.0`, same SONAME). Only the real lib is
+/// staged on disk; the stub lives outside `target/generated-libs/`
+/// so the auto-staging walker skips it. Returns the stub path so
+/// the mismatch binary build can link against it.
+fn build_libhello_versioned_v2_pair() -> Option<PathBuf> {
+    let root = workspace_root();
+    let libs = ensure_generated_libs_dir(&root);
+    let real_dst = libs.join("libhello_versioned_v2.so");
+    let stub_dir = root.join("target/v2-stub");
+    let _ = fs::create_dir_all(&stub_dir);
+    let stub_dst = stub_dir.join("libhello_versioned_v2_link.so");
+    let real_src = root.join("userspace/lib/libhello_versioned_v2/hello.c");
+    let real_ver = root.join("userspace/lib/libhello_versioned_v2/libhello_versioned_v2.ver");
+    let stub_src = root.join("userspace/lib/libhello_versioned_v2/v1_stub.c");
+    let stub_ver = root.join("userspace/lib/libhello_versioned_v2/v1_stub.ver");
+
+    let cc = match find_musl_cc() {
+        Some(c) => c,
+        None => {
+            eprintln!("warning: musl-gcc missing — skipping libhello_versioned_v2 pair.");
+            let _ = fs::write(&real_dst, b"");
+            return None;
+        }
+    };
+
+    let mut cmd = Command::new(cc);
+    cmd.args(["-shared", "-fPIC", "-O2", "-nostdlib"]);
+    cmd.arg("-Wl,--hash-style=gnu");
+    cmd.arg("-Wl,-soname,libhello_versioned_v2.so");
+    cmd.arg(format!(
+        "-Wl,--version-script={}",
+        real_ver.to_str().expect("non-UTF-8 path")
+    ));
+    cmd.arg(real_src.to_str().expect("non-UTF-8 path"));
+    cmd.arg("-o")
+        .arg(real_dst.to_str().expect("non-UTF-8 path"));
+    match cmd.output() {
+        Ok(out) if out.status.success() => {
+            println!(
+                "shared-lib(gnu+versioned): {} → {}",
+                real_src.display(),
+                real_dst.display()
+            );
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            eprintln!("error: libhello_versioned_v2.so build failed: {stderr}");
+            let _ = fs::write(&real_dst, b"");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("error: failed to invoke {cc} for libhello_versioned_v2.so: {e}");
+            let _ = fs::write(&real_dst, b"");
+            std::process::exit(1);
+        }
+    }
+
+    let mut cmd = Command::new(cc);
+    cmd.args(["-shared", "-fPIC", "-O2", "-nostdlib"]);
+    cmd.arg("-Wl,--hash-style=gnu");
+    cmd.arg("-Wl,-soname,libhello_versioned_v2.so");
+    cmd.arg(format!(
+        "-Wl,--version-script={}",
+        stub_ver.to_str().expect("non-UTF-8 path")
+    ));
+    cmd.arg(stub_src.to_str().expect("non-UTF-8 path"));
+    cmd.arg("-o")
+        .arg(stub_dst.to_str().expect("non-UTF-8 path"));
+    match cmd.output() {
+        Ok(out) if out.status.success() => {
+            println!(
+                "shared-lib(stub gnu+versioned): {} → {}",
+                stub_src.display(),
+                stub_dst.display()
+            );
+            Some(stub_dst)
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            eprintln!("error: libhello_versioned_v2 stub build failed: {stderr}");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("error: failed to invoke {cc} for v2 stub: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Phase 76d.G.3 — build `dynlink_hello_versioned_mismatch`. Linked
+/// against the v2 stub (so its `DT_VERNEED` records `LIBHELLO_1.0`),
+/// runs against the real v2 lib at boot.
+fn build_dynlink_hello_versioned_mismatch(stub_path: &Path) {
+    let root = workspace_root();
+    let initrd = ensure_generated_initrd_dir(&root);
+    let dst = initrd.join("dynlink_hello_versioned_mismatch");
+    let src =
+        root.join("userspace/dynlink_hello_versioned_mismatch/dynlink_hello_versioned_mismatch.c");
+
+    if !stub_path.exists()
+        || fs::metadata(stub_path)
+            .map(|m| m.len() == 0)
+            .unwrap_or(true)
+    {
+        eprintln!(
+            "warning: v2 stub missing at {} — skipping mismatch binary",
+            stub_path.display()
+        );
+        let _ = fs::write(&dst, b"");
+        return;
+    }
+    let cc = match find_musl_cc() {
+        Some(c) => c,
+        None => {
+            eprintln!("warning: musl-gcc missing — skipping mismatch binary");
+            let _ = fs::write(&dst, b"");
+            return;
+        }
+    };
+
+    let mut cmd = Command::new(cc);
+    cmd.args([
+        "-nostdlib",
+        "-nostartfiles",
+        "-fno-stack-protector",
+        "-fno-pie",
+        "-no-pie",
+    ]);
+    cmd.args([
+        "-fPIC",
+        "-Wl,-pie",
+        "-Wl,-dynamic-linker=/lib/ld-musl-x86_64.so.1",
+        "-Wl,--hash-style=gnu",
+        "-Wl,-rpath,/usr/lib",
+        "-Wl,--no-eh-frame-hdr",
+        "-O2",
+        "-fno-builtin",
+    ]);
+    cmd.arg(src.to_str().expect("non-UTF-8 path"));
+    cmd.arg(stub_path.to_str().expect("non-UTF-8 path"));
+    cmd.arg("-o").arg(dst.to_str().expect("non-UTF-8 path"));
+    match cmd.output() {
+        Ok(out) if out.status.success() => {
+            println!(
+                "dynlink_hello_versioned_mismatch: built → {}",
+                dst.display()
+            );
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            eprintln!(
+                "error: dynlink_hello_versioned_mismatch build failed (exit {}): {stderr}",
+                out.status.code().unwrap_or(-1)
+            );
+            let _ = fs::write(&dst, b"");
+            std::process::exit(1);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("warning: {cc} not found mid-build — skipping mismatch binary");
+            let _ = fs::write(&dst, b"");
+        }
+        Err(e) => {
+            eprintln!("error: failed to invoke {cc} for mismatch binary: {e}");
+            let _ = fs::write(&dst, b"");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Phase 76c — build `dlopen_test`, the musl dynamic ELF that drives
 /// the full `dlopen` → `dlsym` → call-through-fn-ptr → `dlclose`
 /// cycle against `/usr/lib/libhello.so`, plus the destructor demo
@@ -3362,6 +3669,15 @@ fn build_kernel() -> PathBuf {
     // Phase 76d.F — GNU-hashed variant of libhello + consumer.
     build_libhello_gnu();
     build_dynlink_hello_gnu();
+    // Phase 76d.G — versioned-symbol variant + consumer.
+    build_libhello_versioned();
+    build_dynlink_hello_versioned();
+    // Phase 76d.G.3 — mismatch test pair (real v2 lib + stub for
+    // link time + consumer that requests LIBHELLO_1.0 against a lib
+    // that only provides LIBHELLO_2.0).
+    if let Some(stub_path) = build_libhello_versioned_v2_pair() {
+        build_dynlink_hello_versioned_mismatch(&stub_path);
+    }
     build_musl_bins();
     // Phase 44: cross-compile musl-linked Rust userspace programs.
     build_musl_rust_bins();
@@ -4505,6 +4821,15 @@ fn cmd_check() {
     // Phase 76d.F — GNU-hashed variant of libhello + consumer.
     build_libhello_gnu();
     build_dynlink_hello_gnu();
+    // Phase 76d.G — versioned-symbol variant + consumer.
+    build_libhello_versioned();
+    build_dynlink_hello_versioned();
+    // Phase 76d.G.3 — mismatch test pair (real v2 lib + stub for
+    // link time + consumer that requests LIBHELLO_1.0 against a lib
+    // that only provides LIBHELLO_2.0).
+    if let Some(stub_path) = build_libhello_versioned_v2_pair() {
+        build_dynlink_hello_versioned_mismatch(&stub_path);
+    }
     build_musl_bins();
     // Phase 44: cross-compile musl-linked Rust userspace programs.
     build_musl_rust_bins();
@@ -6310,6 +6635,24 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         pattern_b: "SMOKE:dynlink-hello-gnu-smoke:SKIP",
         timeout_secs: 30,
         label: "guest/dynlink-hello-gnu-smoke: GNU-hash bring-up",
+        extra_steps_a: &[],
+        extra_steps_b: &[],
+    });
+    // Phase 76d.G — versioned-symbol exact-match gate.
+    steps.push(SmokeStep::WaitEither {
+        pattern_a: "SMOKE:dynlink-hello-versioned-smoke:PASS",
+        pattern_b: "SMOKE:dynlink-hello-versioned-smoke:SKIP",
+        timeout_secs: 30,
+        label: "guest/dynlink-hello-versioned-smoke: D2 version-aware lookup",
+        extra_steps_a: &[],
+        extra_steps_b: &[],
+    });
+    // Phase 76d.G.3 — mismatch-fallback + strict-mode gate.
+    steps.push(SmokeStep::WaitEither {
+        pattern_a: "SMOKE:dynlink-hello-versioned-mismatch-smoke:PASS",
+        pattern_b: "SMOKE:dynlink-hello-versioned-mismatch-smoke:SKIP",
+        timeout_secs: 30,
+        label: "guest/dynlink-hello-versioned-mismatch-smoke: D2.2 fallback + D2.3 strict mode",
         extra_steps_a: &[],
         extra_steps_b: &[],
     });

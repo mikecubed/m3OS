@@ -157,6 +157,39 @@ impl<'a> VersionTable<'a> {
     }
 
     /// Look up the version NAME a consumer requires for a symbol
+    /// whose `version_index` came from `DT_VERSYM`, ignoring the
+    /// provider SONAME. Scans every `Verneed` record's `Vernaux`
+    /// chain for the first matching `vna_other`. Useful when the
+    /// caller doesn't yet know which DSO provides the symbol (the
+    /// version index is unique across the consumer's whole
+    /// `DT_VERNEED`).
+    pub fn required_version_name_by_index(&self, version_index: u16) -> Option<&'a [u8]> {
+        if version_index == VER_NDX_LOCAL || version_index == VER_NDX_GLOBAL {
+            return None;
+        }
+        let mut vn_offset = 0usize;
+        for _ in 0..self.verneed_num {
+            let verneed = read_verneed(self.verneed_bytes, vn_offset)?;
+            let mut aux_offset = vn_offset.checked_add(verneed.vn_aux as usize)?;
+            for _ in 0..verneed.vn_cnt {
+                let aux = read_vernaux(self.verneed_bytes, aux_offset)?;
+                if aux.vna_other == version_index {
+                    return strtab_lookup(self.strtab, aux.vna_name);
+                }
+                if aux.vna_next == 0 {
+                    break;
+                }
+                aux_offset = aux_offset.checked_add(aux.vna_next as usize)?;
+            }
+            if verneed.vn_next == 0 {
+                break;
+            }
+            vn_offset = vn_offset.checked_add(verneed.vn_next as usize)?;
+        }
+        None
+    }
+
+    /// Look up the version NAME a consumer requires for a symbol
     /// whose `version_index` came from `DT_VERSYM` and whose
     /// providing library's SONAME is `provider_soname`. Walks
     /// `DT_VERNEED` for the matching `Verneed`, then its `Vernaux`
