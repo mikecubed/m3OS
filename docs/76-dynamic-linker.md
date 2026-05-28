@@ -1,8 +1,8 @@
-# Dynamic Linker — Scaffolding (Phase 76) + Bring-up (Phase 76b)
+# Dynamic Linker — Scaffolding (Phase 76) → Bring-up (76b) → libdl (76c) → Polish (76d)
 
-**Aligned Roadmap Phase:** Phase 76 / Phase 76b
-**Status:** 76 Implemented (scaffolding); 76b Implemented (bring-up — DT_NEEDED + 4 relocations + constructors + negative gates)
-**Source Ref:** phase-76 / phase-76b
+**Aligned Roadmap Phase:** Phase 76 / 76b / 76c / 76d
+**Status:** Complete (Phase 76 family shipped through 76d — PLT lazy resolve, GNU hash, symbol versioning, `LD_BIND_NOW`, end-to-end gates for all)
+**Source Ref:** phase-76 / phase-76b / phase-76c / phase-76d
 **Supersedes Legacy Doc:** new
 
 ## Overview
@@ -37,10 +37,10 @@ the `PT_INTERP` boundary:
 
 | Subphase | What it ships | Smoke gate |
 |---|---|---|
-| **76** (this) | Kernel `PT_INTERP` branch, full SysV-ABI auxv, ld.so PIE crate scaffold, transfer-only `_dlstart` | `dynlink_smoke` — a no-DT_NEEDED dynamic ELF that prints `DYNLINK_SMOKE:PASS` |
-| 76b | Real `_dlstart`, `PT_DYNAMIC` parse, `DT_NEEDED` dependency graph, x86_64 relocations, `DT_INIT_ARRAY` | `libhello.so` + `dynlink_hello` ✅ |
+| **76** | Kernel `PT_INTERP` branch, full SysV-ABI auxv, ld.so PIE crate scaffold, transfer-only `_dlstart` | `dynlink_smoke` ✅ |
+| **76b** | Real `_dlstart`, `PT_DYNAMIC` parse, `DT_NEEDED` dependency graph, x86_64 relocations, `DT_INIT_ARRAY` | `libhello.so` + `dynlink_hello` ✅ |
 | **76c** | `dlopen` / `dlsym` / `dlclose` / `dlerror`, refcounted handle table, `DT_FINI_ARRAY` + `DT_FINI` destructors on last-close | `dlopen_test` + `libhello_fini.so` ✅ |
-| 76d | PLT lazy resolve (`_dl_runtime_resolve`), `DT_GNU_HASH`, basic symbol versioning | A `.so` built with `--hash-style=gnu` |
+| **76d** | PLT lazy resolve (`_dl_runtime_resolve`), `DT_GNU_HASH` Bloom + bucket + chain, `DT_VERSYM` / `DT_VERNEED` / `DT_VERDEF`, `LD_BIND_NOW` env handling | `libhello_gnu.so` + `dynlink_hello_gnu` (lazy / eager / W^X), `libhello_versioned.so` + `dynlink_hello_versioned` (exact match), `dynlink_hello_versioned_mismatch` (mismatch-fallback + strict-mode) ✅ |
 
 The split lets each PR land with a green smoke gate. 76's gate proves
 the kernel → ld.so → main binary handoff in isolation; 76b adds real
@@ -143,7 +143,17 @@ embedded in the kernel ramdisk under `/lib/` so the kernel's
 | `userspace/dlopen_test/dlopen_test.c` | 76c smoke binary: open / sym / call / close + four negative paths + DT_FINI_ARRAY assertion |
 | `userspace/lib/libcycb/cycb.c` | 76b cycle-test source (other half of the cycle) |
 | `userspace/smoke-runner/src/main.rs` | Drives `dynlink_*` and asserts sentinels + exit codes |
-| `xtask/src/main.rs` | `build_ldso` + `build_shared_lib` + `build_dynlink_{smoke,hello,missing,cycle}` + `build_cycle_libs` + `/lib/` and `/usr/lib/` staging |
+| `xtask/src/main.rs` | `build_ldso` + `build_shared_lib` (76d.F: `build_shared_lib_with_hash_style` variant) + `build_dynlink_{smoke,hello,missing,cycle}` + `build_cycle_libs` + 76d artifacts (`build_libhello_{gnu,versioned,versioned_v2_pair}` + `build_dynlink_hello_{gnu,versioned,versioned_mismatch}`) + `/lib/` and `/usr/lib/` staging |
+| `userspace/ld-musl-x86_64.so.1/src/sym.rs` | 76d.S1.1 unified `sym::lookup(scope, name, version)` — dispatcher picks GNU over SysV per DSO; 76d.D2.2 version-aware path with `dso_version_matches`; 76d.D2.3 strict-mode error on mismatch under `LD_BIND_NOW` |
+| `userspace/ld-musl-x86_64.so.1/src/gnu_hash.rs` | 76d.D1 pure-logic GNU hash primitives (`gnu_hash`, `bloom_probe`, `gnu_hash_lookup`) — 15 host tests with djb2 known-answer fixtures + hand-built tables |
+| `userspace/ld-musl-x86_64.so.1/src/ver.rs` | 76d.D2.1 pure-logic versioning parser — `Verdef` / `Verdaux` / `Verneed` / `Vernaux` decoders + `VersionTable` with `version_index` / `defined_version_name` / `required_version_name{,_by_index}` query methods (4 host tests) |
+| `userspace/ld-musl-x86_64.so.1/src/plt.rs` | 76d.B4 naked-asm `_dl_runtime_resolve` trampoline + `resolve_pltrel` Rust callback + `install_trampoline` (GOT[1]=link_map, GOT[2]=trampoline addr) + `apply_jmprel_lazy` (lazy-bind GOT rebase) + `BIND_NOW: AtomicBool` master flag |
+| `userspace/lib/libhello_gnu/hello.{c,h}` | 76d.F demo lib built with `--hash-style=gnu` (DT_GNU_HASH present, DT_HASH absent) |
+| `userspace/dynlink_hello_gnu/dynlink_hello_gnu.c` | 76d.F consumer that asserts `BIND_NOW:{0,1}` via GOT[3]-mutation check (PC-relative `lea _GLOBAL_OFFSET_TABLE_`) and `WX_CHECK:OK` via `/proc/self/maps` scan |
+| `userspace/lib/libhello_versioned/{hello.{c,h},libhello_versioned.ver}` | 76d.G demo lib: `--version-script` exports `hello_str@LIBHELLO_1.0` |
+| `userspace/dynlink_hello_versioned/dynlink_hello_versioned.c` | 76d.G consumer; `DT_VERNEED` requires `LIBHELLO_1.0` |
+| `userspace/lib/libhello_versioned_v2/{hello.{c,h},libhello_versioned_v2.ver,v1_stub.{c,ver}}` | 76d.G.3 mismatch-test artifacts: real v2 lib defines `LIBHELLO_2.0` only; v1 stub (linked at build, NOT staged) lets the mismatch consumer carry `DT_VERNEED` for `LIBHELLO_1.0` |
+| `userspace/dynlink_hello_versioned_mismatch/dynlink_hello_versioned_mismatch.c` | 76d.G.3 mismatch consumer — drives D2.2 fallback (default) + D2.3 strict-error (`LD_BIND_NOW=1`) |
 
 ## What you'll see on the serial console
 
@@ -332,14 +342,179 @@ a `:FAIL`.
 - **`RTLD_LAZY` is treated as `RTLD_NOW`:** PLT lazy resolution
   ships in 76d.
 
-## What is intentionally NOT in 76 / 76b / 76c
+## What changes in 76d
+
+76d closes the Phase 76 family. Four major capability tracks ship,
+plus a refactor track (S1) that lets the other three land without
+re-touching every consumer.
+
+### Symbol-lookup unification — `userspace/ld-musl-x86_64.so.1/src/sym.rs`
+
+Phase 76b/c had three places that walked SysV `DT_HASH` directly:
+the free-function `lookup_symbol` in `main.rs`, `lookup_in_dso` in
+`dl.rs` (used by `dlsym`), and the inline path in `apply_rela`.
+76d.S1 collapses them all behind `sym::lookup(scope, name, version)`.
+The dispatcher picks a backend per DSO:
+
+* `Backend::Gnu` when the DSO has `DT_GNU_HASH` (76d.D1) — Bloom
+  filter short-circuits non-matches in O(1).
+* `Backend::SysV` when the DSO has only `DT_HASH` (76b fallback).
+* Skipped when the DSO has neither.
+
+The `version` parameter is reserved for 76d.D2: `None` means
+"unversioned lookup" (Phase 76b/c semantics, back-compat); `Some(v)`
+means "exact version `v` required".
+
+S1 also routes the three remaining `core::ptr::write_unaligned`
+relocation sites through the host-tested `ldso_core::reloc` slice
+helpers (`apply_relative`, `apply_glob_dat`) — eliminates the
+divergence between what the host tests prove and what the runtime
+actually executes.
+
+### GNU hash — `userspace/ld-musl-x86_64.so.1/src/gnu_hash.rs`
+
+`DT_GNU_HASH` is the modern format GNU `ld` emits with
+`--hash-style=gnu` (or `both`). Its Bloom filter answers "is this
+symbol definitely NOT here?" in O(1), short-circuiting the
+expensive bucket-and-chain walk for symbols the DSO doesn't define.
+
+The pure-logic primitives — `gnu_hash` (djb2 with seed 5381),
+`bloom_probe`, `gnu_hash_lookup` — live in `ldso_core::gnu_hash`
+with 15 host tests (known-answer fixtures: `printf=0x156B2BB8`,
+`exit=0x7C967E3F`, `dlopen=0xF9040207`, plus hand-built bucket+chain
+tables). The runtime walker in `sym::lookup_gnu` reads the four-word
+header inline and bypasses the slice-construction step in the hot
+path.
+
+### PLT lazy resolve — `userspace/ld-musl-x86_64.so.1/src/plt.rs`
+
+The 76b/c bring-up linker resolved every `R_X86_64_JUMP_SLOT`
+eagerly at load time. That works for the demo but doesn't scale: a
+program linking against a multi-MiB `libc.so` would pay the
+resolution cost for hundreds of functions it never calls. 76d.B4
+adds the classic SysV PLT lazy-resolve dance:
+
+* **`_dl_runtime_resolve`** is a `#[naked]` asm trampoline. On
+  first call to a PLT-routed function, the static-linker-generated
+  `plt0` stub pushes the link-map (`GOT[1]`) and jumps through the
+  resolver pointer (`GOT[2]`) — landing here. The trampoline saves
+  all 9 caller-saved registers, loads link_map and reloc_index
+  from the PLT-pushed stack slots into `rdi`/`rsi`, calls
+  `resolve_pltrel`, overwrites the saved `reloc_index` slot with
+  the resolved address, restores the 9 registers, discards the
+  stale link_map slot, and `ret`s — which pops the resolved
+  address into `rip`. The caller's return address survives one
+  slot below so the resolved function's own `ret` works.
+* **`resolve_pltrel`** is the Rust callback. It reads
+  `DT_JMPREL[reloc_index]`, resolves the symbol via `sym::lookup`
+  with the version constraint extracted from the consumer's
+  `DT_VERSYM` + `DT_VERNEED`, writes the absolute address into the
+  GOT slot at `load_bias + r.r_offset` (so subsequent calls bypass
+  the trampoline), and returns the address.
+* **`install_trampoline`** runs once per loaded DSO at the end of
+  `dl_entry`, after DL_STATE publication and before constructors.
+  Writes `link_map` (= `&DL_STATE.dsos[i]`, stable for program
+  lifetime) at `GOT[1]` and `&_dl_runtime_resolve` at `GOT[2]`.
+* **`apply_jmprel_lazy`** is the lazy-bind reloc applicator. For
+  each `JUMP_SLOT` it leaves the static linker's image-relative
+  offset alone and adds `load_bias` so the first call lands on
+  the PLT's plt0 stub.
+
+The `BIND_NOW: AtomicBool` master flag at the top of `plt.rs`
+controls the eager / lazy split. POSIX default is **lazy** (false);
+76d.E4's env walk in `dl_entry` flips it to true when
+`LD_BIND_NOW=1` is in `envp`.
+
+### Symbol versioning — `userspace/ld-musl-x86_64.so.1/src/ver.rs`
+
+Real-world `.so` files (every glibc-built library since 1999)
+record per-symbol version requirements and definitions in three
+optional dynamic tags:
+
+* `DT_VERSYM` — `u16` parallel array, one per dynsym entry; low 15
+  bits index a `Verdef` (for symbols the DSO defines) or a
+  `Vernaux` (for symbols the DSO requires). Bit 15 is a "hidden"
+  flag.
+* `DT_VERDEF` + `DT_VERDEFNUM` — linked list of `Verdef` records
+  (one per version this DSO defines — e.g. `GLIBC_2.2.5`).
+* `DT_VERNEED` + `DT_VERNEEDNUM` — linked list of `Verneed` records
+  (one per `DT_NEEDED` dependency the DSO requires versions from).
+
+76d.D2.1 ships the pure-logic decoders in `ldso_core::ver`. The
+`VersionTable` struct provides:
+
+* `version_index(symbol_idx) -> Option<u16>` — read VERSYM with the
+  hidden bit masked.
+* `defined_version_name(version_index) -> Option<&[u8]>` — walk
+  VERDEF for matching `vd_ndx`, follow `vd_aux` to the `Verdaux`,
+  return the name from STRTAB.
+* `required_version_name{_by_index}` — walk VERNEED's Vernaux
+  chains.
+
+4 host tests pin the decoder behavior.
+
+76d.D2.2 wires the runtime path. `apply_rela` and `resolve_pltrel`
+read `versym[sym_idx]` on the consumer, walk `DT_VERNEED` for the
+matching `vna_other`, and pass the resulting version-name to
+`sym::lookup`. The dispatcher then matches against each candidate
+provider's `dyn_.versym` + `dyn_.verdef` via `dso_version_matches`.
+
+The matching rules follow standard glibc back-compat:
+
+* Provider with no `DT_VERSYM` (unversioned) satisfies any version
+  request — keeps Phase 76b/c binaries working.
+* Provider with VERSYM index 0 (LOCAL) or 1 (GLOBAL) is the
+  unversioned default export; matches any request.
+* Provider with VERSYM ≥ 2 is versioned; matches only when the
+  VERDEF lookup returns the requested name.
+
+76d.D2.3 strict mode: when `BIND_NOW=true` (set by E4 on
+`LD_BIND_NOW=1`), a version-mismatch returns `None` and emits a
+serial error instead of falling back to unversioned lookup. The
+caller (`apply_rela`) treats the resulting `0` address as an
+undefined symbol and `exit`s.
+
+### `LD_BIND_NOW` — `userspace/ld-musl-x86_64.so.1/src/main.rs::read_ld_bind_now`
+
+76d.E4 walks `envp` at the very start of `dl_entry`, before any
+relocation pass runs. When `LD_BIND_NOW` is present and its value
+is non-empty AND non-zero, stores `true` to `plt::BIND_NOW`. The
+flag controls two paths: 76d.B4.4's lazy-vs-eager `JUMP_SLOT`
+applicator, and 76d.D2.3's strict-vs-fallback version-mismatch
+handler.
+
+### Gates
+
+76d adds two new smoke gates with sub-phase coverage:
+
+* `dynlink-hello-gnu-smoke` (76d.F) — runs `/bin/dynlink_hello_gnu`
+  twice. Default env asserts `BIND_NOW:0` (GOT[3] mutated across
+  first call = lazy resolution went through trampoline) +
+  `HELLO_FROM_GNU_LIB:OK` + `WX_CHECK:OK`. `LD_BIND_NOW=1` asserts
+  `BIND_NOW:1` (GOT[3] stable = pre-resolved at load).
+* `dynlink-hello-versioned-smoke` (76d.G) — runs
+  `/bin/dynlink_hello_versioned` twice (default + `LD_BIND_NOW=1`),
+  both asserting `HELLO_FROM_VERSIONED_LIB:OK`. The exact-version
+  match must succeed in both modes (strict only rejects mismatches).
+* `dynlink-hello-versioned-mismatch-smoke` (76d.G.3) — runs
+  `/bin/dynlink_hello_versioned_mismatch` twice. Default env: D2.2
+  warn + fallback to unversioned `hello_str` →
+  `HELLO_FROM_V2_FALLBACK:OK`. `LD_BIND_NOW=1`: D2.3 error + non-zero
+  exit (the asm caller `jmp 0`s after `dl_entry` returns 0,
+  triggering SIGSEGV).
+
+## What is intentionally NOT in 76 / 76b / 76c / 76d
 
 | Concern | Subphase |
 |---|---|
-| PLT lazy resolution (`_dl_runtime_resolve` asm trampoline + first-call GOT slot rewrite) | 76d |
-| `DT_GNU_HASH` Bloom-filter symbol lookup | 76d |
-| `DT_VERSYM` / `DT_VERNEED` graceful handling | 76d |
-| TLS blocks, `RTLD_NEXT`, namespaces (`dlmopen`), IFUNC, `dladdr` / `dlinfo` | Beyond 76d |
+| TLS blocks (`__thread`, `tls_get_addr`, TLS-aware reloc types) | Beyond 76d (gates Phase 77 TLS work) |
+| `RTLD_NEXT` + interpose / preload semantics | Beyond 76d |
+| `dlmopen` (namespaces / load groups) | Beyond 76d |
+| IFUNC (indirect functions for CPU-specific dispatch) | Beyond 76d |
+| `DT_FILTER` / `DT_AUXILIARY` (filter-only DSOs) | Beyond 76d |
+| `dladdr` / `dlinfo` / `dlvsym` | Beyond 76d |
+| `LD_BIND_NOT` (alternate lazy mode that resolves but doesn't patch) | Beyond 76d |
+| Verdef-aux chain walk (multiple Verdaux per Verdef — for aliases) | Beyond 76d (we only read the first Verdaux per Verdef) |
 
 ## Related Roadmap Docs
 
