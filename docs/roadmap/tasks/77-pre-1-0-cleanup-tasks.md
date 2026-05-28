@@ -15,8 +15,8 @@
 | D | Networking polish (DNS resolver, TCP retransmit + slot lift) | — | Complete |
 | E | Microcode loading | — | Complete |
 | F | `epoll_*` verify-and-implement-if-missing | — | Complete |
-| G | Open-handoff resolution + doc-drift PR | A–F, H | Complete (5 handoffs resolved/downgraded; high-signal deferral-list drift struck) |
-| H | `/proc` compatibility for `htop` / `ps` / `top` | — | PARTIAL — H.1 htop-zero-processes **still reproduces** (htop renders but `Tasks: 0`; opens `/proc/<pid>/statm` but never `/proc/<pid>/stat`). `ps`/`top` (H.3) + the status fields + the working screenshot probe (H.2) are done; the htop `stat`-read root cause is re-opened in the 2026-05-20 handoff |
+| G | Open-handoff resolution + doc-drift PR | A–F, H | Complete (5 handoffs resolved/downgraded; full line-by-line Phase 50-56 deferral-list sweep done — drift struck across 52/52a/52b/52c/53/55/56) |
+| H | `/proc` compatibility for `htop` / `ps` / `top` | — | Complete — htop now shows a populated process list (root cause: missing `/proc/<pid>/task/<tid>/stat` subtree, fixed in commits `d3cc752`/`a012ab8`). `htop-render-probe` passes (~480 changed band scanlines vs. 0 before) and is gated under `M3OS_HTOP_REGRESSION=1`; `ps -e` covered by `smoke-test`; the 2026-05-20 handoff is resolved |
 | I | Documentation and Release (learning doc + `0.77.0` bump) | A–H | Complete |
 
 > **Review note (2026-05-28):** The Phase 77 design doc was source-verified before this task list was authored. Four claims drifted from current `main` and are corrected in-place below: (1) `sys_nanosleep` already blocks for ≥1 ms sleeps — A.2 is re-scoped to closing residual busy paths, not a rewrite; (2) `epoll_*` syscalls already exist and are fully implemented — F.1 is verify + smoke + audit-doc, not implementation; (3) the TCP table is **8** slots, not 4; (4) there is **no in-tree musl source tree** — musl is a prebuilt cross-toolchain, so D.1 stages `/etc/resolv.conf` and verifies the prebuilt resolver rather than porting `__dns_query` C source.
@@ -36,7 +36,7 @@
 - [x] After a client `exit`, the sshd session task terminates — the EOF-driven `cleanup` (close PTY master first → shell EOF-exits → bounded `nanosleep` reap, SIGKILL last resort) shipped in `6f57fbc`; the futex fix removes the residual reaper hang
 - [x] The shell child PID is reaped exactly once and the PTY master/slave fds are closed in an order that does not leave the session loop runnable (`6f57fbc`)
 - [x] `cargo xtask regression --test serverization-fallback` passes 10/10 consecutive runs (verified 2026-05-28: 10 passed, 0 failed)
-- [ ] The 2026-04-25 handoff doc is marked resolved with a citation to this task (deferred to Track G open-handoff resolution)
+- [x] The 2026-04-25 handoff docs (`2026-04-25-pr-118-residual-issues.md` + `-update.md`) are marked **RESOLVED** with a citation to this task (commits `b6f517b` + `6f57fbc`).
 
 ### A.2 — `sys_nanosleep` residual busy-yield closure
 
@@ -64,30 +64,30 @@
 **Symbol:** `install_trampoline` (`smp/boot.rs:160`; BSP CR4 capture into the trampoline slot at line 216 — there is **no** `save_bsp_cr4_for_aps` function), `ap_entry` (AP CR4 load, `smp/boot.rs:408`, CR4 store lines 412-415); `cpuid_raw` (`arch/x86_64/cpuid.rs:232`) + the `XSaveFeatures`-style `probe()` pattern (line 120). Note: leaf `0x07` is not probed today (only leaves 1 and `0x0D`), so the SMEP/SMAP feature check is net-new but follows the established pattern. (`kernel/src/arch/x86_64/cpu.rs` does not exist — the design doc's Primary Components line is stale.)
 **Why it matters:** CR4 is configured in `smp/boot.rs`, not `cpu.rs` as the roadmap's component list implied — the BSP saves its CR4 for the AP trampoline and each AP reloads it. Setting CR4.SMEP causes a kernel `#PF` if ring 0 ever fetches an instruction from a user page, eliminating an entire class of "smash userspace shellcode" exploits. ~50 LOC including the AP path.
 
-**Acceptance:**
-- [ ] A `CPUID.07h:EBX[7]` (SMEP) check is added following the existing `cpuid_raw`/feature-struct pattern in `arch/x86_64/cpuid.rs`
-- [ ] When supported, `CR4` bit 20 is set on the BSP before APs are woken, and the saved-CR4 value the APs reload already carries the bit (so no separate AP code path is needed beyond confirming the bit propagates)
-- [ ] A debug-only kernel test (gated behind a debug feature) deliberately fetches an instruction from a user-mapped page and asserts the resulting `#PF` — proving SMEP is live
-- [ ] On hardware/QEMU configs without SMEP support, boot proceeds unchanged (the bit is not forced)
-- [ ] A `log::info!` reports SMEP enabled (or "unsupported") on each CPU at boot
+**Acceptance:** (all shipped in commit `83d54fb`; verified by the 2026-05-28 boot log)
+- [x] A `CPUID.07h:0.EBX[7]` (SMEP) check is added — `cpuid.rs::probe_smep_smap()` (line 232) tests `CPUID_07_EBX_SMEP = 1 << 7` (line 221). Leaf `0x07` was not probed before (only leaves 1 and `0x0D`), so this is net-new but follows the cached-`Once` feature-struct pattern.
+- [x] `CR4` bit 20 is set on the BSP before APs are woken (`lib.rs:239` `enable_smep_smap()`), and the APs reload the bit from the trampoline-captured CR4 (`smp/boot.rs:426`) — no separate AP enable path, confirmed by the per-AP log below.
+- [x] A debug-only self-test (`kernel/src/arch/x86_64/smap_test.rs::run_boot_self_test`, gated behind the `smep-smap-test` cargo feature, invoked from `lib.rs:257-261`) deliberately `jmp`s into a `USER_ACCESSIBLE` page and asserts the resulting `#PF` — proving SMEP is live; zero-cost/absent in production builds.
+- [x] On configs without SMEP support the bit is not forced (`enable_smep_smap` is gated on `probe_smep_smap()`); boot proceeds unchanged.
+- [x] A `log::info!` reports SMEP state on every CPU — verified 2026-05-28: `[sec] BSP CR4.SMEP enabled (supported=true)…` (`lib.rs:250`) + `[sec] AP CR4.SMEP enabled …` ×3 (`smp/boot.rs:435`).
 
-### B.2 — Enable `CR4.SMAP` (bit 21) + STAC/CLAC around user-memory copies
+### B.2 — Enable `CR4.SMAP` (bit 21); SMAP-clean via physmap-routed user access
 
 **Files:**
 - `kernel/src/smp/boot.rs`
 - `kernel/src/arch/x86_64/cpuid.rs`
 - `kernel/src/mm/user_mem.rs`
 
-**Symbol:** `copy_from_user` (`mm/user_mem.rs:41`), `copy_to_user` (`mm/user_mem.rs:116`) — the two centralized primitives behind `UserSliceRo::copy_to_kernel` (line 369) and `UserSliceWo::copy_from_kernel` (line 420)
-**Why it matters:** SMAP faults if ring 0 reads or writes a user page without an explicit `stac`/`clac` window. Every deliberate user-memory access already funnels through the two `user_mem.rs` primitives, so the change is centralized. ~150 LOC total.
+**Symbol:** `UserSliceRo::copy_to_kernel` / `UserSliceWo::copy_from_kernel` in `mm/user_mem.rs` — the centralized primitives every deliberate user-memory access funnels through.
+**Why it matters:** SMAP faults if ring 0 reads or writes a user-accessible page. **Implementation note (mechanism deviation from the plan):** rather than open STAC/CLAC windows around a user-virtual dereference, m3OS reaches user bytes through the **physical-memory direct map** (physmap-routed) — the kernel never dereferences a `USER_ACCESSIBLE` *virtual* page, so SMAP is satisfied **by construction** and no STAC/CLAC is required (the cleaner of the two designs). The lone raw user-virtual writer (the dead `copy_to_user` at `user_space.rs:197`) was deleted during the audit, leaving the kernel SMAP-clean.
 
-**Acceptance:**
-- [ ] A `CPUID.07h:EBX[20]` (SMAP) check is added alongside the SMEP probe
-- [ ] When supported, `CR4` bit 21 is set on the BSP and propagated to APs via the same saved-CR4 path as B.1
-- [ ] `stac` precedes and `clac` follows the user-pointer dereference inside `copy_from_user` and `copy_to_user` only (not around the surrounding bounds checks); the asm is wrapped in an explicit `unsafe {}` block per edition-2024 rules
-- [ ] No other call site touches user memory directly — a `grep` audit confirms all user reads/writes route through `user_mem.rs`; any stray site found is either routed through the helpers or given its own STAC/CLAC window with a comment. (Known counterexample: a dead `copy_to_user` at `kernel/src/mm/user_space.rs:197` does a raw `from_raw_parts_mut` deref with **zero callers** — delete it as part of this audit rather than wrapping it.)
-- [ ] A debug-only kernel test deliberately reads a user page *without* the STAC window and asserts a `#PF`, then reads through `copy_from_user` and asserts success
-- [ ] `cargo xtask test` and `cargo xtask smoke-test` pass — confirming no syscall regressed from the SMAP window
+**Acceptance:** (all shipped in commit `83d54fb`; verified by the 2026-05-28 boot log)
+- [x] A `CPUID.07h:0.EBX[20]` (SMAP) check is added alongside the SMEP probe — `CPUID_07_EBX_SMAP = 1 << 20` (`cpuid.rs:223`), returned by `probe_smep_smap()`.
+- [x] `CR4` bit 21 is set on the BSP (`lib.rs:239`) and propagated to APs via the trampoline-captured CR4 (`smp/boot.rs:426`); BSP clears `EFLAGS.AC` (`lib.rs:242`) so the firmware's AC can't silently disable enforcement.
+- [~] STAC/CLAC windows — **superseded by the physmap-routing mechanism above.** No `stac`/`clac` is needed because no user-virtual dereference occurs in ring 0; the acceptance intent (SMAP enforced without breaking syscalls) is met by construction.
+- [x] No other call site touches user memory directly — the `grep` audit confirms all user reads/writes route through `user_mem.rs` (physmap-backed); the dead `copy_to_user` at `kernel/src/mm/user_space.rs:197` (raw `from_raw_parts_mut`, zero callers) was **deleted** (tombstone comment retained at that site).
+- [x] A debug-only self-test (`smap_test.rs`, `smep-smap-test` feature) deliberately reads a `USER_ACCESSIBLE` page from ring 0 and asserts a `#PF`, proving SMAP is live.
+- [x] `cargo xtask test` and `cargo xtask smoke-test` pass — no syscall regressed (the physmap path is the same one every live syscall already used, so there was no SMAP window to regress).
 
 > KPTI, retpoline, and IBRS are explicitly **out of scope** — Phase 84.
 
@@ -143,9 +143,9 @@
 **Acceptance:**
 - [x] `/etc/resolv.conf` is staged onto the ext2 data disk by `populate_ext2_files` (`nameserver 10.0.2.3` for QEMU SLIRP + `options timeout:5 attempts:3`; mode 0644, user-editable). It is a plain config, not an init-managed service, so `KNOWN_CONFIGS` is unchanged.
 - [x] A `cargo xtask clean` + boot confirms `/etc/resolv.conf` is present and read at runtime — the resolver picks up `nameserver 10.0.2.3` and sends its query there (observed on the serial UDP trace)
-- [~] `getaddrinfo("github.com", ...)` is driven by the new `userspace/dns-smoke` binary. **The full kernel round-trip works**: the query egresses with a valid ephemeral source port and the DNS reply (44 bytes from `10.0.2.3:53`) is received and enqueued to that port. The reply is not yet surfaced to the resolver's userspace `poll`/`recvfrom` within its retry window, so `getaddrinfo` returns `EAI_AGAIN` and dns-smoke emits `DNS_SMOKE:SKIP` (the gate accepts SKIP). Residual blocker documented below.
-- [x] The missing syscall surface is identified and **filled minimally**: musl's `__res_msend` does `sendto` on a never-bound UDP socket, which previously returned `EINVAL` (`net_server::handle_sendto` rejected unbound handles) — now auto-assigns an ephemeral source port (mirroring `handle_connect`), and the kernel (`sys_sendto`) registers that ephemeral port (`udp::bind` + `socket.local_port`) so the reply is routable. The resolver's UDP traffic is confirmed to flow through `sys_socket`/`udp::send` **both directions** at the kernel. **Residual blocker (scoped follow-up):** the enqueued reply is not delivered to the resolver's `poll`/`recvfrom` in time even though `poll` re-scans `udp::has_data(local_port)` and the datagram is present on the correct port — the gap is in the userspace-delivery hop; the kernel round-trip itself is proven.
-- [ ] The roadmap's "~600 LOC C port" framing is corrected in the Phase 77 design doc's Feature Scope (done in Track I when the design doc is authored/updated)
+- [x] `getaddrinfo("github.com", ...)` resolves end to end via the `userspace/dns-smoke` binary — **fixed and verified 2026-05-28.** The query egresses with a valid ephemeral source port and the reply (44 bytes from `10.0.2.3:53`) is delivered to the resolver, which accepts it (source-address validation passes) and `getaddrinfo` returns the A record; `dns-smoke` emits `DNS_SMOKE:PASS <ip>`. Verified by serial trace: `recvmsg` delivers `n=44`, the resolver's `poll` busy-spin collapsed from **11,918 iterations → 4**, and the process terminates immediately (no retransmit, no timeout). `cargo xtask smoke-test` PASSES with `SMOKE:dns-smoke:PASS`.
+- [x] The missing syscall surface is identified and **filled minimally** — two parts. (1) musl's `__res_msend` `sendto`s on an unbound UDP socket (it `bind`s to `0.0.0.0:0`, leaving `local_port == 0`), which previously returned `EINVAL`; `net_server::handle_sendto` + `sys_sendto` now auto-assign and register an ephemeral source port so the reply is routable. (2) **The actual delivery blocker:** modern musl drains the DNS reply with **`recvmsg(2)`, not `recvfrom(2)`**, and `sys_recvmsg` returned `EOPNOTSUPP` for AF_INET `FdBackend::Socket` — so the resolver busy-looped `poll → recvmsg(fail) → poll` until its retry window expired (the earlier "userspace-delivery hop" note was correct in location but mis-attributed to `poll`/`recvfrom`; the prior probe instrumented `recvfrom`, a path musl never calls). Fixed by `sys_recvmsg_inet` (`kernel/src/arch/x86_64/syscall/mod.rs`): delivers the UDP/TCP payload into the iovecs and fills `msg_name` with the sender's `sockaddr_in`, which musl byte-compares (`memcmp(ns+j, &sa, 16)`) against its nameserver list. The reply source is now both delivered and accepted. (Adversarially reviewed: `msg_name` is pre-validated before the datagram is consumed; TCP/EOF report `msg_namelen = 0` per Linux connection-mode semantics; `cap == 0` is guarded.)
+- [x] The roadmap's "~600 LOC C port" framing is corrected in the Phase 77 design doc's Feature Scope (`docs/roadmap/77-pre-1-0-cleanup.md` line 48 — "wire-and-verify, not a C port"). The "missing syscall surface filled as the resolver demands it" framing is now concrete: the demanded surface was `recvmsg` on INET sockets.
 
 ### D.2 — TCP retransmission timer + multi-connection slot lift
 
@@ -214,7 +214,7 @@
 
 **Acceptance:**
 - [x] The clearly-shipped drifts in the Phase 50-56 deferral lists are annotated with their shipping phase: `53-headless-hardening.md` — "DNS resolution" → Phase 77 D.1, "Dynamic linking / shared libraries" → Phase 76; `55c-ring-3-driver-correctness-closure-learning.md` — `ipc_recv_timeout` → Phase 74 (`SYS_IPC_RECV_TIMEOUT`). (Prior phases already de-drifted the Phase 6/50/55c lists with explicit Phase 74 references.)
-- [~] No deferral entry contradicts a shipped capability — the high-signal contradictions (DNS, dynamic linking, ipc_recv_timeout) are struck; a line-by-line sweep of every remaining 50-56 entry is a low-risk mechanical follow-up (most remaining entries — HTTPS/TLS clients, `git`/`gh`, package feeds — are genuinely still deferred).
+- [x] No deferral entry contradicts a shipped capability — the line-by-line sweep of all 16 Phase 50-56 deferral lists is **complete** (2026-05-28; verified each "now-shipped" claim against in-tree artifacts before striking, discarding several cross-contaminated/already-annotated false positives). Additional drifts annotated this pass: `52` (storage/namespace/networking extraction → Phase 54; fully graphical display ownership → Phase 56), `52a` (`syscall_user_rsp` task-owned state + typed `UserBuffer` wrappers → 52b/52d), `52b` (VMA tree, per-core scheduler/work-stealing, ISR-direct wakeup → 52c), `52c` (preemptive scheduling from interrupt context → Phase 57d), `53` (GUI/compositor + mouse/audio → Phase 56/57; DNS → Phase 77 D.1; dynamic linking → Phase 76), `55` (IOMMU → 55a, ring-3 NVMe/e1000 → 55b), `56` (native bar/launcher/notifyd/lockscreen + animation engine → Phase 73, correcting the stale "Phase 57b/57c territory" pointers). Genuinely-still-deferred entries (HTTPS/TLS clients, `git`/`gh`, package feeds, Wi-Fi/GPU/USB, growable notif pool, Wayland, IME/keymaps) are left intact.
 - [x] Annotations cite the delivering phase inline, so the change is auditable from the doc alone.
 
 ### G.2 — Confirm the 2026-05-22 multi-term OOM reproducer is fixed
@@ -274,7 +274,7 @@
 **Why it matters:** `htop` shows zero processes. The 2026-05-20 handoff lists five suspected causes, ranked: (1) `getdents64` semantics (`d_off`/`d_reclen` alignment), (2) `/proc/<pid>/stat` field count or `(comm)` paren escaping, (3) `/proc/<pid>/status` missing fields (`Tgid`, `VmRSS`, `VmData`, `VmStk`), (4) `openat(dirfd, "/proc/<pid>")` across a dir fd, (5) `/proc/cpuinfo` or `/proc/stat` cpu-line parser failure. `render_status` today emits only Name/State/Pid/PPid/Uid/Gid/Threads/VmSize/Cwd — the missing fields are a confirmed candidate.
 
 **Acceptance:**
-- [~] Root cause: **PARTIALLY identified, NOT the full story.** Phase 72b's all-PIDs `list_dir` fix (every user sees every PID) is real and necessary, and `/proc` enumeration + `ps -e` work. But it does **not** fix htop: a headless screendump shows htop still at `Tasks: 0`. The actual htop blocker is that htop reads `/proc/<pid>/stat` (not `/proc/<pid>/status` like `ps`) and m3OS's htop never opens `/proc/<pid>/stat` — re-opened with the trace in `docs/handoffs/2026-05-20-htop-zero-processes.md`. (This item was wrongly marked done earlier in the phase; corrected after visually inspecting the screenshot.)
+- [x] Root cause **fully identified and fixed** (final story below). The journey: Phase 72b's all-PIDs `list_dir` fix (every user sees every PID) made `/proc` enumeration + `ps -e` work but did **not** fix htop — a headless screendump still showed `Tasks: 0`. The true blocker (pinned via a PID-scoped `/proc` trace) was that htop's `scanMainThread`/`readStatFile` reads the main thread's stat via **`/proc/<pid>/task/<pid>/stat`**, and m3OS had **no `/proc/<pid>/task/` subtree** → ENOENT → every process discarded. Fixed by implementing the `/proc/<pid>/task/<tid>/…` subtree in `kernel/src/fs/procfs.rs` (commits `d3cc752`/`a012ab8`). See the final acceptance item below and `docs/handoffs/2026-05-20-htop-zero-processes.md` (resolved).
 - [x] `/proc/<pid>/status` now emits `Tgid`, `VmRSS`, `VmData`, and `VmStk` (added to `render_status`) alongside the pre-existing Name/State/Pid/PPid/Uid/Gid/Threads/VmSize/Cwd. VmRSS approximates the mapped footprint, VmData sums writable mappings + heap, VmStk is the fixed 64 KiB user stack, Tgid == Pid (procfs lists the thread-group leader).
 - [x] `getdents64` over `/proc` is exercised by every htop launch in `tui-app-smoke` (htop enumerates `/proc` via getdents to find PIDs and renders its header); per-pid dirs (`status`/`stat`/`comm`/...) are openable and read by htop.
 - [x] `/proc/<pid>/stat` field order is confirmed correct by `render_pid_stat` (the `(comm)` field is paren-wrapped; m3OS process names cannot contain `)` since `comm` is set from PR_SET_NAME / argv basenames).
@@ -288,8 +288,8 @@
 
 **Acceptance:**
 - [x] The cell-grid capture mechanism is built and **WORKS**: `cargo xtask htop-render-probe` boots the graphical stack **headless** (QMP + VNC, per the new AGENTS.md "Headless framebuffer screenshots" section), launches htop via QMP `send-key`, and screendumps the framebuffer. Correction: an earlier note here wrongly claimed the graphical-term render didn't reach the screendump — it does. The screenshot clearly shows htop's full UI (meters, column header, F-keys). The keystrokes DO reach the term and htop DOES render.
-- [x] Fails loudly when the process table is empty (`changed_rows_in_band` in `xtask/src/main.rs` diffs the process-table band vs the prompt baseline; `MIN_CHANGED_BAND_SCANLINES`). It currently FAILS **correctly** — because htop genuinely shows zero processes (`Tasks: 0`), the band has no content rows. This is the real bug (see H.1), not a probe defect.
-- [ ] Not yet wired into the `tui-app-smoke` / `M3OS_TUI_APP_REGRESSION` pre-push gate — it would fail today (the H.1 htop-zero-processes regression is unfixed). Wire it in once H.1's `/proc/<pid>/stat` read issue is fixed; the probe is ready. (`ps -e` regression coverage in `smoke-test` remains, but it does NOT exercise htop's `/proc/<pid>/stat` path, which is the actual gap.)
+- [x] Fails loudly when the process table is empty (`changed_rows_in_band` in `xtask/src/main.rs` diffs the process-table band vs the prompt baseline; `MIN_CHANGED_BAND_SCANLINES`). With H.1 fixed it now **PASSES** correctly — ≈480 changed process-table band scanlines vs. the 20 threshold (0 before the fix), so the assertion both catches a regression to zero processes and confirms a populated list.
+- [x] Wired into the pre-push gate under its own opt-in env var `M3OS_HTOP_REGRESSION=1` (`.githooks/pre-push` → `cargo xtask htop-render-probe --timeout 300`; listed in the AGENTS.md hooks table). A dedicated gate — rather than folding into `M3OS_TUI_APP_REGRESSION` — matches the other heavyweight opt-in gates (the probe cross-compiles ncurses + drives headless QMP/VNC), keeping the default `tui-app-smoke` fast. With H.1 fixed the gate passes; `ps -e` regression coverage in `smoke-test` remains as the always-on procfs check.
 
 ### H.3 — Verify `ps aux` and `top` show non-empty process lists
 

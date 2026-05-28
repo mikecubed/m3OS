@@ -405,10 +405,10 @@ Release quality is partly about saying no. The support boundary (§ Support Boun
 
 ## Deferred Until Later
 
-- Broad outbound developer networking (HTTPS/TLS clients, DNS resolution, git remotes, GitHub tooling)
-- GUI / display compositor / graphical session / local desktop
-- Mouse input, audio output
+- Broad outbound developer networking (HTTPS/TLS clients, ~~DNS resolution~~, git remotes, GitHub tooling) — **DNS resolution ✅ delivered in [Phase 77](./77-pre-1-0-cleanup.md) Track D.1** (musl resolver + `/etc/resolv.conf` + `recvmsg` AF_INET delivery); HTTPS/TLS clients, git remotes, and GitHub tooling remain deferred.
+- ~~GUI / display compositor / graphical session / local desktop~~ — **✅ delivered in [Phase 56 — Display and Input Architecture](./56-display-and-input-architecture.md)** + [Phase 57 — Audio and Local Session](./57-audio-and-local-session.md).
+- ~~Mouse input, audio output~~ — **✅ delivered**: mouse input in [Phase 56](./56-display-and-input-architecture.md) (`mouse_server`), audio output in [Phase 57](./57-audio-and-local-session.md) (`audio_server`, AC'97).
 - Large third-party runtime ecosystems (Python, Node.js, JVM)
 - Broad hardware certification beyond QEMU x86_64 with OVMF
-- Package feeds, remote package repositories, dynamic linking
+- Package feeds, remote package repositories, ~~dynamic linking~~ — **dynamic linking ✅ delivered in [Phase 76](./76-dynamic-linker.md)** (`ld-musl-x86_64.so.1`, dlopen/dlsym, PLT lazy resolve, GNU hash, symbol versioning); package feeds and remote repositories remain deferred.
 - Full POSIX compliance testing

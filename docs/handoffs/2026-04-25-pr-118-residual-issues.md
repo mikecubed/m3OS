@@ -14,8 +14,13 @@
   `6f57fbc`); the ≥1 ms sched-v2 path blocks on `block_current_until`. PID 1 is
   not starved across the smoke/regression suites.
 
-**Status:** Open. Both issues block PR #118 ("Phase 55c: close ring-3 driver
-correctness gaps") from being merge-ready.
+**Status:** RESOLVED (Phase 77 Track A, 2026-05-28 — see the Resolution block
+above; commits `b6f517b` + `6f57fbc`, referenced by task A.1 in
+`docs/roadmap/tasks/77-pre-1-0-cleanup-tasks.md`). The text below is the
+original cold-start handoff, retained for historical context.
+
+~~Open. Both issues block PR #118 ("Phase 55c: close ring-3 driver
+correctness gaps") from being merge-ready.~~
 
 **Branch:** `feat/phase-55c-ring3-driver-closure` (HEAD: `f877af7`)
 

@@ -1,10 +1,21 @@
 # Handoff Update: PR #118 residual issues (2026-04-25 second pass)
 
-**Status:** Both Issue 1 (SSH disconnect hang) and Issue 2 (`sys_nanosleep`
+**Status:** RESOLVED (Phase 77 Track A, 2026-05-28). This pass correctly
+suspected the bug was "deeper than the cleanup `waitpid`" — it was a lost
+futex wakeup: `sshd` reaps via musl pthreads whose `__thread_list_lock`
+(`CLONE_CHILD_CLEARTID`) is a **non-private** futex, but `do_clear_child_tid`
+woke only the **private** key. Fixed by waking both keys (`b6f517b`) plus the
+scheduler `on_cpu` wake/defer fix and EOF-driven teardown ordering (`6f57fbc`);
+`serverization-fallback` regression passes 10/10. See the Resolution block in
+`docs/handoffs/2026-04-25-pr-118-residual-issues.md` and task A.1 in
+`docs/roadmap/tasks/77-pre-1-0-cleanup-tasks.md`. The investigation notes below
+are retained for historical context.
+
+~~Both Issue 1 (SSH disconnect hang) and Issue 2 (`sys_nanosleep`
 busy-yield) remain open after a deep investigation pass. The original
 handoff at `docs/handoffs/2026-04-25-pr-118-residual-issues.md` is still
 accurate but its hypotheses for Issue 1 turn out to be incomplete — the bug
-is deeper than the cleanup `waitpid`. This document records what was tried,
+is deeper than the cleanup `waitpid`.~~ This document records what was tried,
 what was learned, and what the next agent should attempt.
 
 **Branch:** `feat/phase-55c-ring3-driver-closure`
