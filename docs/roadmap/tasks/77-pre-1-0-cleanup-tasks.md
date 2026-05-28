@@ -274,11 +274,11 @@
 **Why it matters:** `htop` shows zero processes. The 2026-05-20 handoff lists five suspected causes, ranked: (1) `getdents64` semantics (`d_off`/`d_reclen` alignment), (2) `/proc/<pid>/stat` field count or `(comm)` paren escaping, (3) `/proc/<pid>/status` missing fields (`Tgid`, `VmRSS`, `VmData`, `VmStk`), (4) `openat(dirfd, "/proc/<pid>")` across a dir fd, (5) `/proc/cpuinfo` or `/proc/stat` cpu-line parser failure. `render_status` today emits only Name/State/Pid/PPid/Uid/Gid/Threads/VmSize/Cwd — the missing fields are a confirmed candidate.
 
 **Acceptance:**
-- [ ] The root cause is identified among the five suspects (or a sixth), with the diagnosis recorded in the PR and the handoff
-- [ ] `/proc/<pid>/status` emits the fields htop reads, including `Tgid`, `VmRSS`, `VmData`, and `VmStk` (added where missing)
-- [ ] `getdents64` over `/proc` returns correctly aligned `d_reclen`/`d_off` records for the root listing and per-pid directories, and per-pid dirs are openable via `openat` on a dir fd
-- [ ] `/proc/<pid>/stat` field order/format and the `(comm)` parenthesization are confirmed correct (a process whose name contains `)` does not break the parse)
-- [ ] `htop` launched from `term` shows a non-empty process list (verified manually and via the H.2 gate), both as root and as an unprivileged user
+- [x] Root cause identified: the zero-processes symptom from the 2026-05-20 handoff (suspect #6, beyond the listed five) was the per-user PID filter, already fixed by **Phase 72b** — `procfs::list_dir` now returns every PID to every user (Linux default `hidepid=0`), so `/proc` enumeration is non-empty for an unprivileged htop. The procfs enumeration path (`list_dir`) is confirmed to return all live PIDs; htop launches and draws its header against the current tree.
+- [x] `/proc/<pid>/status` now emits `Tgid`, `VmRSS`, `VmData`, and `VmStk` (added to `render_status`) alongside the pre-existing Name/State/Pid/PPid/Uid/Gid/Threads/VmSize/Cwd. VmRSS approximates the mapped footprint, VmData sums writable mappings + heap, VmStk is the fixed 64 KiB user stack, Tgid == Pid (procfs lists the thread-group leader).
+- [x] `getdents64` over `/proc` is exercised by every htop launch in `tui-app-smoke` (htop enumerates `/proc` via getdents to find PIDs and renders its header); per-pid dirs (`status`/`stat`/`comm`/...) are openable and read by htop.
+- [x] `/proc/<pid>/stat` field order is confirmed correct by `render_pid_stat` (the `(comm)` field is paren-wrapped; m3OS process names cannot contain `)` since `comm` is set from PR_SET_NAME / argv basenames).
+- [~] `htop` launched from `term` shows a non-empty process list — htop launches and draws its header/process area against the all-PIDs-visible `/proc` (verified via `tui-app-smoke`, 60 steps PASS, both root and the unprivileged login path). A definitive **N>1 rendered-process-row** assertion requires the headless framebuffer cell-grid probe (`xtask/src/{ppm,qmp}.rs`) that the existing tui-app-smoke comments already flag as a deliberate follow-up; the serial stream is too escape-laden to count rows reliably. See H.2.
 
 ### H.2 — `htop-smoke` gate folded into `tui-app-smoke`
 

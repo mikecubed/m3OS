@@ -555,13 +555,32 @@ fn render_status(proc: ProcessSnapshot) -> String {
         ProcessState::Stopped => "T (stopped)",
         ProcessState::Zombie => "Z (zombie)",
     };
+    // Phase 77 Track H.1 — emit the fields htop / ps read for their memory
+    // columns. m3OS does not track a precise resident-set size, so VmRSS is
+    // approximated by the total mapped size (a reasonable upper bound for this
+    // simple VM model); VmStk is the fixed 64 KiB user stack; VmData sums the
+    // writable anonymous/heap mappings. Tgid == Pid here because procfs lists
+    // the thread-group leader.
+    const STACK_KIB: u64 = (16 * 4096) / 1024; // fixed 64 KiB user stack
     let mut vm_size = 16 * 4096u64;
+    let mut vm_data = 0u64;
     for mapping in &proc.mappings {
         vm_size = vm_size.saturating_add(mapping.len);
+        // prot bit 0x2 == writable → counts toward the data footprint.
+        if mapping.prot & 0x2 != 0 {
+            vm_data = vm_data.saturating_add(mapping.len);
+        }
+    }
+    if proc.brk_current != 0 {
+        vm_data = vm_data.saturating_add(4096);
     }
     let vm_size_kib = vm_size / 1024;
+    let vm_data_kib = vm_data / 1024;
+    // VmRSS upper-bound: everything mapped is treated as resident in this model.
+    let vm_rss_kib = vm_size_kib;
     alloc::format!(
-        "Name:\t{name}\nState:\t{state}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nThreads:\t1\nVmSize:\t{} kB\nCwd:\t{}\n",
+        "Name:\t{name}\nState:\t{state}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nThreads:\t1\nVmSize:\t{} kB\nVmRSS:\t{} kB\nVmData:\t{} kB\nVmStk:\t{} kB\nCwd:\t{}\n",
+        proc.pid,
         proc.pid,
         proc.ppid,
         proc.uid,
@@ -573,6 +592,9 @@ fn render_status(proc: ProcessSnapshot) -> String {
         proc.egid,
         proc.egid,
         vm_size_kib,
+        vm_rss_kib,
+        vm_data_kib,
+        STACK_KIB,
         proc.cwd
     )
 }
