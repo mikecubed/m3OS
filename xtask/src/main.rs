@@ -663,6 +663,15 @@ fn main() {
             });
             cmd_less_render_probe(&probe_args);
         }
+        // Phase 77 Track H.2 — headless htop process-row render probe.
+        Some("htop-render-probe") => {
+            let probe_args = parse_less_render_probe_args(&args[2..]).unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            cmd_htop_render_probe(&probe_args);
+        }
         Some("compositor-stress") => {
             let stress_args = parse_compositor_stress_args(&args[2..]).unwrap_or_else(|err| {
                 eprintln!("Error: {err}");
@@ -10254,6 +10263,44 @@ fn wait_for_serial_pattern(
     }
 }
 
+/// Phase 77 Track H.2 — count scanlines in a vertical band `[y0_frac, y1_frac)`
+/// whose pixels differ between two frames of identical dimensions. Diff-based so
+/// it works despite the non-black compositor background: a frame where htop drew
+/// its process table over the previously-empty terminal region changes many
+/// scanlines in the band; a frame where nothing rendered changes ~none.
+fn changed_rows_in_band(a: &ppm::PpmFrame, b: &ppm::PpmFrame, y0_frac: f64, y1_frac: f64) -> u32 {
+    if a.width != b.width || a.height != b.height || a.height == 0 {
+        return 0;
+    }
+    let w = a.width as usize;
+    let h = a.height as usize;
+    let y0 = ((y0_frac.clamp(0.0, 1.0) * h as f64) as usize).min(h);
+    let y1 = ((y1_frac.clamp(0.0, 1.0) * h as f64) as usize).min(h);
+    let mut changed = 0u32;
+    for y in y0..y1 {
+        let rs = y * w * 3;
+        let mut diff_px = 0u32;
+        for x in 0..w {
+            let i = rs + x * 3;
+            if i + 2 >= a.pixels.len() || i + 2 >= b.pixels.len() {
+                break;
+            }
+            let d = (a.pixels[i] as i32 - b.pixels[i] as i32).unsigned_abs()
+                + (a.pixels[i + 1] as i32 - b.pixels[i + 1] as i32).unsigned_abs()
+                + (a.pixels[i + 2] as i32 - b.pixels[i + 2] as i32).unsigned_abs();
+            if d > 60 {
+                diff_px += 1;
+            }
+        }
+        // A scanline counts as "changed" only if a meaningful run of pixels
+        // differs (filters single-pixel cursor-blink noise).
+        if diff_px > 5 {
+            changed += 1;
+        }
+    }
+    changed
+}
+
 fn capture_frame(q: &mut qmp::QmpClient, out_dir: &Path, tag: &str) -> Result<(), String> {
     let path = out_dir.join(format!("{tag}.ppm"));
     q.screendump(&path)
@@ -10515,6 +10562,201 @@ fn cmd_less_render_probe(args: &LessRenderProbeArgs) {
         }
         Err(msg) => {
             eprintln!("less-render-probe: FAILED\n{msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Phase 77 Track H.2 — headless htop process-row render probe.
+///
+/// Boots the graphical stack headlessly (same QMP + VNC plumbing as
+/// `less-render-probe`), launches `htop` in `term`, captures a framebuffer
+/// screendump, and asserts that htop's process-table band actually renders
+/// multiple process rows. This is the cell-grid assertion the serial-only
+/// `tui-app-smoke` gate cannot make: a zero-process htop draws its meter header
+/// but leaves the table band blank, so the row count collapses to ~0.
+///
+/// Exit code 0 = process rows rendered; non-zero = blank table (the
+/// 2026-05-20 regression) or a probe error. Run via `cargo xtask
+/// htop-render-probe`.
+fn cmd_htop_render_probe(args: &LessRenderProbeArgs) {
+    /// Minimum changed scanlines in htop's process-table band (vs the empty
+    /// prompt baseline) that indicate htop rendered a populated table. A full
+    /// render changes hundreds of scanlines across the band; a no-render / blank
+    /// table changes ~0. 20 cleanly separates "drew a table" from "nothing".
+    const MIN_CHANGED_BAND_SCANLINES: u32 = 20;
+
+    if let Err(msg) = port_build::build_phase_69d_ports() {
+        eprintln!("htop-render-probe: precondition failed: {msg}");
+        std::process::exit(1);
+    }
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false, // graphical_login — autologin / serial path
+    );
+    let ovmf = find_ovmf();
+    if let Err(e) = std::fs::create_dir_all(&args.out_dir) {
+        eprintln!(
+            "htop-render-probe: cannot create out dir {}: {e}",
+            args.out_dir.display()
+        );
+        std::process::exit(1);
+    }
+
+    let qmp_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&qmp_socket);
+    let vnc_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&vnc_socket);
+    let mut qemu_args = qemu_args_with_devices(
+        &uefi_image,
+        &ovmf,
+        QemuDisplayMode::Headless,
+        DeviceSet::default(),
+    );
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    let mut idx = 0;
+    while idx + 1 < qemu_args.len() {
+        if qemu_args[idx] == "-display" && qemu_args[idx + 1] == "none" {
+            qemu_args[idx + 1] = format!("vnc=unix:{}", vnc_socket.display());
+            break;
+        }
+        idx += 1;
+    }
+    qemu_args.push("-qmp".to_string());
+    qemu_args.push(format!("unix:{},server,nowait", qmp_socket.display()));
+    qemu_args.push("-vga".to_string());
+    qemu_args.push("std".to_string());
+
+    println!(
+        "htop-render-probe: launching QEMU (timeout {}s, qmp {})",
+        args.timeout_secs,
+        qmp_socket.display()
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let rx = spawn_serial_reader(stdout);
+    let mut serial_history = String::new();
+    let mut serial_buf = String::new();
+    let global_start = std::time::Instant::now();
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+
+    let result: Result<u32, String> = (|| {
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "display_server: registered as 'display.input-owner'",
+            std::time::Duration::from_secs(args.timeout_secs.min(180)),
+            global_start,
+            global_timeout,
+        )?;
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "TERM_SMOKE:prompt-ready",
+            std::time::Duration::from_secs(args.timeout_secs.min(180)),
+            global_start,
+            global_timeout,
+        )?;
+        println!("htop-render-probe: term/sh0 prompt is ready");
+
+        let qmp_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut q = qmp::QmpClient::connect(&qmp_socket, qmp_deadline)
+            .map_err(|e| format!("qmp connect: {e}"))?;
+        println!("htop-render-probe: QMP handshake complete");
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        capture_frame(&mut q, &args.out_dir, "00-prompt")?;
+
+        // Launch htop through the graphical term (PS/2 → kbd_server →
+        // display_server → term → PTY → sh0). The env prefix supplies the
+        // terminfo path htop's ncurses needs (same invocation tui-app-smoke
+        // uses on the serial console).
+        q.type_text("TERM=m3os-term TERMINFO=/usr/share/terminfo /usr/local/bin/htop\n")
+            .map_err(|e| format!("type htop cmd: {e}"))?;
+
+        // htop's initscr + first full paint can take several seconds at the
+        // large headless framebuffer under TCG; capture a burst and keep the
+        // frame that changed MOST from the prompt baseline. The metric is
+        // diff-based (scanlines in the process-table band whose pixels differ
+        // from the baseline) because the compositor background is non-black, so
+        // absolute blackness metrics cannot distinguish content from backdrop.
+        let baseline = ppm::read_ppm(&args.out_dir.join("00-prompt.ppm"))?;
+        let burst_ms: &[u32] = &[1500, 3000, 5000, 8000];
+        let event_start = std::time::Instant::now();
+        let mut best_rows = 0u32;
+        for off in burst_ms {
+            let target = event_start + std::time::Duration::from_millis(*off as u64);
+            let now = std::time::Instant::now();
+            if target > now {
+                std::thread::sleep(target - now);
+            }
+            let tag = format!("htop-{off:04}ms");
+            capture_frame(&mut q, &args.out_dir, &tag)?;
+            let frame = ppm::read_ppm(&args.out_dir.join(format!("{tag}.ppm")))?;
+            let rows = changed_rows_in_band(&baseline, &frame, 0.30, 0.92);
+            println!(
+                "htop-render-probe: {tag} {}x{} -> {rows} changed table-band rows",
+                frame.width, frame.height
+            );
+            best_rows = best_rows.max(rows);
+        }
+
+        // Quit htop politely so cleanup doesn't leave it foreground.
+        let _ = q.press_key("q", 20);
+        Ok(best_rows)
+    })();
+
+    while let Ok(chunk) = rx.try_recv() {
+        append_serial_chunk(&mut serial_buf, &mut serial_history, &chunk);
+    }
+    if !args.keep_qemu {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&qmp_socket);
+        let _ = std::fs::remove_file(&vnc_socket);
+    }
+    let serial_log = args.out_dir.join("serial.log");
+    let _ = std::fs::write(&serial_log, &serial_history);
+
+    match result {
+        Ok(rows) if rows >= MIN_CHANGED_BAND_SCANLINES => {
+            println!(
+                "htop-render-probe: PASS — htop rendered a populated process table ({rows} changed band scanlines, min {MIN_CHANGED_BAND_SCANLINES})"
+            );
+        }
+        Ok(rows) => {
+            eprintln!(
+                "htop-render-probe: FAIL — htop process-table band changed only {rows} scanlines vs the prompt baseline (< {MIN_CHANGED_BAND_SCANLINES}); htop did not render a populated table. Frames in {}",
+                args.out_dir.display()
+            );
+            std::process::exit(1);
+        }
+        Err(msg) => {
+            eprintln!("htop-render-probe: FAILED\n{msg}");
             std::process::exit(1);
         }
     }

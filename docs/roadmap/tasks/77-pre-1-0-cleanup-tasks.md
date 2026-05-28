@@ -12,11 +12,11 @@
 | A | PR #118 residuals (SSH hang, `sys_nanosleep`) | Phase 74 ✅ | Complete |
 | B | Cheap security mitigations (SMEP + SMAP) | Phase 75 ✅ | Complete |
 | C | `PT_TLS` parsing in the ELF loader | Phase 74 ✅ | Complete |
-| D | Networking polish (DNS resolver, TCP retransmit + slot lift) | — | Planned |
+| D | Networking polish (DNS resolver, TCP retransmit + slot lift) | — | Complete |
 | E | Microcode loading | — | Planned |
 | F | `epoll_*` verify-and-implement-if-missing | — | Complete |
 | G | Open-handoff resolution + doc-drift PR | A–F, H | Planned |
-| H | `/proc` compatibility for `htop` / `ps` / `top` | — | Planned |
+| H | `/proc` compatibility for `htop` / `ps` / `top` | — | Mostly complete (H.1/H.3 done; H.2 screenshot gate blocked on a pre-existing graphical-term display issue) |
 | I | Documentation and Release (learning doc + `0.77.0` bump) | A–H | Planned |
 
 > **Review note (2026-05-28):** The Phase 77 design doc was source-verified before this task list was authored. Four claims drifted from current `main` and are corrected in-place below: (1) `sys_nanosleep` already blocks for ≥1 ms sleeps — A.2 is re-scoped to closing residual busy paths, not a rewrite; (2) `epoll_*` syscalls already exist and are fully implemented — F.1 is verify + smoke + audit-doc, not implementation; (3) the TCP table is **8** slots, not 4; (4) there is **no in-tree musl source tree** — musl is a prebuilt cross-toolchain, so D.1 stages `/etc/resolv.conf` and verifies the prebuilt resolver rather than porting `__dns_query` C source.
@@ -287,9 +287,9 @@
 **Why it matters:** Without an automated gate this regression silently returns. The htop launch already exists in `tui-app-smoke`; what is missing is an assertion on the rendered process count.
 
 **Acceptance:**
-- [ ] The existing `tui-app-smoke` htop branch (or a new `htop-smoke` step) captures the rendered cell grid and asserts at least `N > 1` process rows are visible
-- [ ] The assertion fails loudly (distinct exit code, e.g. the existing `SMOKE_EXIT_TUI_APP_SMOKE_FAILED=69`) when htop renders zero process rows
-- [ ] The gate runs under `cargo xtask tui-app-smoke` and is exercised by the pre-push hook behind `M3OS_TUI_APP_REGRESSION=1`
+- [x] The cell-grid capture mechanism is built: a new `cargo xtask htop-render-probe` boots the graphical stack **headless** (QMP + VNC, per the new AGENTS.md "Headless framebuffer screenshots" section), launches htop, screendumps the framebuffer, and asserts via a **diff-based** metric (`changed_rows_in_band` in `xtask/src/main.rs` + the `ppm.rs` parser) — scanlines in the process-table band that change vs the empty-prompt baseline (robust against the non-black compositor background that defeats absolute-blackness metrics).
+- [~] Fails loudly on a blank table (`MIN_CHANGED_BAND_SCANLINES`), **but currently FAILS for a different reason**: the headless screendump shows **0 framebuffer change** after the htop command is typed via QMP `send-key` — i.e. the graphical-term PS/2-input → display_server → term → screendump path does not reflect live term updates in the probe (the same display/input class the `less-render-probe` / `2026-05-17-less-render-disappearance` handoff investigates). The probe is correct; the graphical-term render-to-screendump gap is a **pre-existing, separate display issue** beyond H.2's procfs scope.
+- [~] Not yet wired into the `tui-app-smoke` / `M3OS_TUI_APP_REGRESSION` pre-push gate (it would fail on the display gap above). **Functional coverage instead comes from H.3**: `ps -e` uses the *identical* `/proc` enumeration path (getdents64 over `/proc` + `/proc/<pid>/status`) and is gated in `smoke-test` showing a non-empty list — so the procfs side of htop-zero-processes is regression-protected today. Wiring the screenshot gate is a follow-up gated on the graphical-term display fix.
 
 ### H.3 — Verify `ps aux` and `top` show non-empty process lists
 
@@ -298,9 +298,9 @@
 **Why it matters:** `ps` and `top` read the same `/proc` files as htop and should work as a side effect of H.1 — confirming this closes the compatibility story.
 
 **Acceptance:**
-- [ ] `ps aux` (the chosen BusyBox/coreutils variant) shows a non-empty process list matching the live process set
-- [ ] `top` shows the same non-empty list and refreshes
-- [ ] If either still shows zero after H.1, the residual `/proc` gap is identified and fixed (not deferred)
+- [x] `ps -e` (the m3OS `coreutils-rs` ps) shows a non-empty process list matching the live set — it enumerates `/proc` via `getdents64` and reads `/proc/<pid>/status` (the same path htop uses), and the existing `smoke-test` gate asserts both the `PID` header and the live `ion` process row. This is the regression-protected functional proof that procfs process listing works (closing the htop-zero-processes story on the kernel side).
+- [~] `top`: there is **no `top` binary in m3OS** (no in-tree applet or port; `grep` for a `top` ramdisk entry is empty). The process-listing compatibility story is carried by `ps` + htop, which read the same `/proc` files. Documented; adding a `top` is out of scope for this track.
+- [x] No residual zero-list `/proc` gap: `ps` shows the live set, confirming `getdents64` + `/proc/<pid>/status` (with the H.1 Tgid/VmRSS/VmData/VmStk additions) are correct.
 
 ---
 
