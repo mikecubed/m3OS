@@ -45,7 +45,7 @@ KPTI, retpoline, and IBRS are explicitly out of scope here — they go in Phase 
 
 ### Track D — Networking polish
 
-- **D.1** — DNS resolver stub. Port musl's `__dns_query` against the Phase 23 `socket(AF_INET, SOCK_DGRAM)` path. `/etc/resolv.conf` parsed; `gethostbyname` / `getaddrinfo` work. ~600 LOC of pure C in the musl tree the on-target build already pulls.
+- **D.1** — DNS resolution via the prebuilt musl resolver. There is no in-tree musl source tree — musl is a prebuilt cross-toolchain (`find_musl_cc`) whose libc already ships `getaddrinfo` / `gethostbyname` / `__dns_query`. The work is therefore wire-and-verify, not a C port: stage `/etc/resolv.conf` (only `passwd` / `shadow` / `group` are staged today) and exercise the resolver against the Phase 23 `socket(AF_INET, SOCK_DGRAM)` path (`sys_socket`, `udp::bind`), filling any missing syscall surface only as the resolver demands it. ~tens of LOC of xtask staging plus verification, not ~600 LOC of new C.
 - **D.2** — TCP retransmission timer + multi-connection slot lift. The 4-slot fixed array in `kernel/src/net/tcp.rs` becomes a `BoundedVec` of N configurable slots (target N=64); retransmission honors RFC 6298 RTO. Without this, leaving QEMU's perfect LAN hangs the first time a packet is lost.
 
 ### Track E — Microcode loading
@@ -54,7 +54,7 @@ KPTI, retpoline, and IBRS are explicitly out of scope here — they go in Phase 
 
 ### Track F — `epoll_*` verify-and-implement-if-missing
 
-- **F.1** — Confirm whether `sys_epoll_create1` / `sys_epoll_ctl` / `sys_epoll_wait` exist. Audit §2 flags them as PARTIAL — `sys_poll` is wired but the audit could not find `epoll_*` syscall handlers. If absent, implement against the existing `WaitQueue` infrastructure. ~400 LOC.
+- **F.1** — Source verification (2026-05-28) confirms `sys_epoll_create1` / `sys_epoll_ctl` / `sys_epoll_wait` **already exist and are fully implemented** (`kernel/src/arch/x86_64/syscall/mod.rs:18453` / `:18496` / `:18593`, dispatched at lines 1900-1913, backed by the `kernel/src/epoll.rs` module with FD-table integration, interest lists, and `WaitQueue`-backed blocking). Audit §2 had flagged them PARTIAL. So this track is verify-only: add a `userspace/epoll-smoke` regression and update the audit doc from PARTIAL to "wired and verified." No new implementation unless the smoke test surfaces a genuine gap, in which case it is filled against the existing `WaitQueue` infrastructure.
 
 ### Track G — Open-handoff resolution
 
@@ -127,7 +127,7 @@ A per-connection RTO timer (one-shot, rescheduled on every ack). The four-slot a
 
 ## Companion Task List
 
-- [Phase 77 Task List](./tasks/77-pre-1-0-cleanup-tasks.md) — to be authored when implementation planning begins.
+- [Phase 77 Task List](./tasks/77-pre-1-0-cleanup-tasks.md)
 
 ## How Real OS Implementations Differ
 
