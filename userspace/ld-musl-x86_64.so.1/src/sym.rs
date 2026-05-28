@@ -174,18 +174,35 @@ unsafe fn lookup_in_dso(dso: &LoadedDso, name: &[u8]) -> Option<DsoHit> {
     }
 }
 
+/// Phase 76d security hardening — read `versym[sym_idx]` only when the
+/// 2-byte entry lies inside the DSO image. Returns `None` when the DSO
+/// has no `DT_VERSYM`, or when the computed read would run past
+/// `load_bias + image_len` (malformed table or an out-of-range
+/// `sym_idx` produced by a corrupt hash table). `validate_dyn_pointers`
+/// only checks the `DT_VERSYM` base pointer, so this per-index guard is
+/// what keeps the parallel-array read inside the image. When
+/// `image_len == 0` (placeholder DSO) the bound is unknown and the read
+/// is trusted.
+unsafe fn versym_entry(dso: &LoadedDso, sym_idx: u32) -> Option<u16> {
+    let versym_ptr = dso.dyn_.versym?.as_ptr();
+    if dso.image_len > 0 {
+        let image_end = dso.load_bias.saturating_add(dso.image_len);
+        let entry_end =
+            (versym_ptr as u64).checked_add(((sym_idx as u64).checked_add(1)?).checked_mul(2)?)?;
+        if entry_end > image_end {
+            return None;
+        }
+    }
+    Some(unsafe { *versym_ptr.add(sym_idx as usize) })
+}
+
 /// Phase 76d.D2 — return `true` when the DSO's `DT_VERSYM` entry for
 /// `sym_idx` has the `VERSYM_HIDDEN` (`0x8000`) bit set. Used by
 /// `lookup` to skip non-default version exports when serving
-/// unversioned consumers. DSOs without a `DT_VERSYM` are never
-/// considered hidden.
+/// unversioned consumers. DSOs without a `DT_VERSYM` (or an
+/// out-of-image `sym_idx`) are never considered hidden.
 unsafe fn dso_symbol_is_hidden(dso: &LoadedDso, sym_idx: u32) -> bool {
-    let versym_ptr = match dso.dyn_.versym {
-        Some(p) => p.as_ptr(),
-        None => return false,
-    };
-    let raw_index = unsafe { *versym_ptr.add(sym_idx as usize) };
-    raw_index & VERSYM_HIDDEN != 0
+    matches!(unsafe { versym_entry(dso, sym_idx) }, Some(raw) if raw & VERSYM_HIDDEN != 0)
 }
 
 /// Phase 76d.D2.2 — return `true` when the DSO's `DT_VERSYM` /
@@ -196,11 +213,16 @@ unsafe fn dso_symbol_is_hidden(dso: &LoadedDso, sym_idx: u32) -> bool {
 /// `VER_NDX_GLOBAL` (1) — that's the unversioned default export
 /// slot and matches any version request.
 unsafe fn dso_version_matches(dso: &LoadedDso, sym_idx: u32, requested: &[u8]) -> bool {
-    let versym_ptr = match dso.dyn_.versym {
-        Some(p) => p.as_ptr(),
-        None => return true, // Unversioned DSO satisfies any version request.
+    if dso.dyn_.versym.is_none() {
+        return true; // Unversioned DSO satisfies any version request.
+    }
+    // VERSYM present — read the entry under the image-span guard. An
+    // out-of-image `sym_idx` (corrupt table) cannot be verified, so
+    // treat it as "no match" rather than dereferencing past the image.
+    let raw_index = match unsafe { versym_entry(dso, sym_idx) } {
+        Some(raw) => raw,
+        None => return false,
     };
-    let raw_index = unsafe { *versym_ptr.add(sym_idx as usize) };
     let version_index = raw_index & VERSYM_VERSION_MASK;
     if version_index == VER_NDX_LOCAL || version_index == VER_NDX_GLOBAL {
         // Default / unversioned export — satisfies any version request.
@@ -294,25 +316,18 @@ unsafe fn lookup_gnu(dso: &LoadedDso, name: &[u8]) -> Option<DsoHit> {
         if bloom_end > image_end || buckets_end > image_end {
             return None;
         }
-        // We also need at least the hashes_ptr base to lie within the
-        // image; the per-`chain_idx` element bound is enforced inline
-        // below using `max_chain_idx`.
-        if (hashes_ptr as u64) >= image_end {
-            return None;
-        }
     }
-    // Maximum `chain_idx` whose 4-byte read still fits inside the
-    // image (or unbounded when image_len is unknown — placeholder DSO).
-    let max_chain_idx = if dso.image_len > 0 {
+    // Number of complete 4-byte hash-table slots that fit between
+    // `hashes_ptr` and the image end (unbounded when `image_len` is
+    // unknown — placeholder DSO). Each `chain_idx` must be strictly
+    // less than this. A `span < 4` window (not even one full `u32`
+    // remains, including `hashes_ptr == image_end`) yields 0 slots, so
+    // every read — including `chain_idx == 0` — is rejected before it
+    // can run off the image edge.
+    let chain_len = if dso.image_len > 0 {
         let image_end = dso.load_bias.saturating_add(dso.image_len);
         let span = image_end.saturating_sub(hashes_ptr as u64);
-        // span / 4 is the count of u32 slots that fit; the last valid
-        // index is span/4 - 1. Treat 0-slot span as "no chain".
-        if span < 4 {
-            0usize
-        } else {
-            (span / 4 - 1) as usize
-        }
+        (span / 4) as usize
     } else {
         usize::MAX
     };
@@ -339,7 +354,7 @@ unsafe fn lookup_gnu(dso: &LoadedDso, name: &[u8]) -> Option<DsoHit> {
             return None;
         }
         let chain_idx = (sym_idx - symoffset) as usize;
-        if chain_idx > max_chain_idx {
+        if chain_idx >= chain_len {
             return None;
         }
         let h2 = unsafe { *hashes_ptr.add(chain_idx) };

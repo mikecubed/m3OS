@@ -6625,11 +6625,12 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         extra_steps_a: &[],
         extra_steps_b: &[],
     });
-    // Phase 76d.F — minimal: GNU-hash binary calls hello_str()
-    // and prints the sentinel. The fuller F.3/F.4 BIND_NOW + W^X
-    // checks ship after the basic path is proven. Step order matches
-    // the smoke-runner block order so the WaitEither matcher does
-    // not race with later SMOKE outputs.
+    // Phase 76d.F — this WaitEither only gates on the guest's
+    // PASS/SKIP sentinel; the substantive assertions live in the
+    // smoke-runner block, which already drives the full F.3/F.4
+    // coverage (two-phase BIND_NOW:{0,1} + WX_CHECK:OK). Step order
+    // matches the smoke-runner block order so the WaitEither matcher
+    // does not race with later SMOKE outputs.
     steps.push(SmokeStep::WaitEither {
         pattern_a: "SMOKE:dynlink-hello-gnu-smoke:PASS",
         pattern_b: "SMOKE:dynlink-hello-gnu-smoke:SKIP",

@@ -1288,15 +1288,20 @@ unsafe fn parse_auxv(stack: *const u64) -> (u64, *const Phdr, usize, u64) {
     (at_base, at_phdr, at_phnum, at_entry)
 }
 
-/// Phase 76d.E4.1 — Walk `envp` for `LD_BIND_NOW`. Returns `true` if
-/// the variable is present and its value is non-empty AND non-zero
-/// (i.e. matches any of the conventional truthy spellings
-/// `LD_BIND_NOW=1` / `LD_BIND_NOW=y` / `LD_BIND_NOW=true`). Empty
-/// (`LD_BIND_NOW=`) or zero (`LD_BIND_NOW=0`) values are treated as
-/// "not set" because the conventional shell idiom for disabling the
-/// flag is `unset LD_BIND_NOW` (which removes it from envp) but a
-/// developer who set it once and wants to opt out without clearing
-/// the env spelling expects `LD_BIND_NOW=0` to disable.
+/// Phase 76d.E4.1 — Walk `envp` for `LD_BIND_NOW`. Returns `true` when
+/// the variable is present and its value is neither empty
+/// (`LD_BIND_NOW=`) nor the single character `0` (`LD_BIND_NOW=0`);
+/// every other non-empty value enables eager binding. So
+/// `LD_BIND_NOW=1`, `LD_BIND_NOW=true`, and `LD_BIND_NOW=anything` all
+/// enable it, while `LD_BIND_NOW=0` and an empty value disable it.
+/// (Note: multi-character forms like `00` are NOT special-cased — only
+/// the exact one-byte `0` disables; this matches the "set unless empty
+/// or exactly 0" rule, not a full numeric parse.)
+///
+/// The `=0` carve-out exists because the conventional shell idiom for
+/// disabling the flag is `unset LD_BIND_NOW` (which removes it from
+/// envp), but a developer who set it once and wants to opt out without
+/// clearing the env spelling expects `LD_BIND_NOW=0` to disable.
 ///
 /// # Safety
 /// `stack` must be the genuine kernel-built SysV stack.
