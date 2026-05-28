@@ -1761,11 +1761,19 @@ pub(crate) fn make_fork_ctx_zeroed(pid: Pid, user_rip: u64, user_rsp: u64) -> Fo
 
 /// Build a fork context for a clone(CLONE_THREAD) child.
 ///
-/// The child thread starts at `user_rip` (the return address from the
-/// clone syscall) with `user_rsp` set to the provided child stack.
-/// Callee-saved registers are inherited from the parent's syscall entry.
-/// Caller-saved registers (rdi, rsi, rdx, r8, r9, r10) are zeroed
-/// because the clone wrapper sets up its own context.
+/// The child thread starts at `user_rip` (the return address from the clone
+/// syscall) with `user_rsp` set to the provided child stack.
+///
+/// Phase 77 Track C fix: the child must inherit the parent's **full** user
+/// register state (everything except RAX, which the syscall return path sets to
+/// 0 for the child), exactly like `make_fork_ctx`. The previous code zeroed the
+/// caller-saved registers (rdi/rsi/rdx/r8/**r9**/r10) on the mistaken belief
+/// that "the clone wrapper sets up its own context" — but musl's `__clone`
+/// child path does `call *%r9`, where `r9` holds the thread start function it
+/// loaded *before* the `syscall`. Zeroing r9 made every pthread start with
+/// `call *0`, faulting at rip=0 the moment a worker thread began (the
+/// tls-smoke crash). The Linux clone ABI guarantees the child sees the same
+/// GPRs the parent had at the syscall, so preserve them.
 pub(crate) fn make_fork_ctx_for_thread(pid: Pid, user_rip: u64, child_stack: u64) -> ForkChildCtx {
     // Phase 57e Bug #3 fix — see make_fork_ctx for the rationale.
     let snap = crate::task::current_task_syscall_snapshot();
@@ -1779,14 +1787,15 @@ pub(crate) fn make_fork_ctx_for_thread(pid: Pid, user_rip: u64, child_stack: u64
         user_r13: snap.user_r13,
         user_r14: snap.user_r14,
         user_r15: snap.user_r15,
-        // Caller-saved registers — zeroed for clone child since the
-        // clone wrapper (musl __clone) will set up its own context.
-        user_rdi: 0,
-        user_rsi: 0,
-        user_rdx: 0,
-        user_r8: 0,
-        user_r9: 0,
-        user_r10: 0,
+        // Preserve the parent's caller-saved registers — musl's __clone
+        // child path reads r9 (start fn), rdi/rsi/etc. that it set up before
+        // the syscall. The Linux clone ABI preserves all GPRs but RAX.
+        user_rdi: snap.user_rdi,
+        user_rsi: snap.user_rsi,
+        user_rdx: snap.user_rdx,
+        user_r8: snap.user_r8,
+        user_r9: snap.user_r9,
+        user_r10: snap.user_r10,
         user_rflags: snap.user_rflags,
     }
 }

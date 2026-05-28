@@ -2461,38 +2461,61 @@ pub(super) fn sys_getppid() -> u64 {
 /// Writes 0 to the userspace `clear_child_tid` address and wakes one futex
 /// waiter, allowing `pthread_join` to unblock.
 fn do_clear_child_tid(pid: crate::process::Pid) {
-    let clear_tid_addr = {
+    let (clear_tid_addr, futex_root) = {
         let table = crate::process::PROCESS_TABLE.lock();
-        table.find(pid).map(|p| p.clear_child_tid).unwrap_or(0)
+        match table.find(pid) {
+            Some(p) => (
+                p.clear_child_tid,
+                p.addr_space
+                    .as_ref()
+                    .map(|a| a.pml4_phys().as_u64())
+                    .unwrap_or(0),
+            ),
+            None => (0, 0),
+        }
     };
     if clear_tid_addr != 0 {
         // Write 0u32 to the userspace address.
         let zero = 0u32.to_ne_bytes();
         let _ =
             UserSliceWo::new(clear_tid_addr, zero.len()).and_then(|s| s.copy_from_kernel(&zero));
-        // Wake one waiter on the private futex key (0, addr) — this
-        // matches musl's pthread_join which uses FUTEX_WAIT|FUTEX_PRIVATE.
+        // Wake one waiter on this address.
+        //
+        // Phase 77 Track A fix: wake BOTH the private key (0, addr) AND the
+        // non-private key (cr3, addr). musl sets `CLONE_CHILD_CLEARTID` to
+        // `&__thread_list_lock` so the kernel releases the thread-list lock on
+        // thread exit — and `__tl_lock` waits on that word with a NON-PRIVATE
+        // futex (`__wait(..., priv=0)`), registering under (cr3, addr). The old
+        // code woke only the private key (0, addr), so the wake was lost and a
+        // thread blocked in `__tl_lock` while a sibling exited never ran again —
+        // its `pthread_join`er hung forever (the intermittent multithread-join
+        // freeze, and the SSH-teardown freeze: sshd's reaper joins its threads).
+        // Waking an extra (always-empty in practice) private waiter is harmless
+        // for a lock-release wake — a spuriously woken lock waiter re-contends.
         use crate::process::futex::{FUTEX_BITSET_MATCH_ANY, FUTEX_TABLE};
-        let key = (0u64, clear_tid_addr);
+        let mut keys: [(u64, u64); 2] = [(0u64, clear_tid_addr), (futex_root, clear_tid_addr)];
+        // Dedup when futex_root == 0 so we don't double-scan the same key.
+        let n_keys = if futex_root == 0 { 1 } else { 2 };
         let to_wake = {
             let mut table = FUTEX_TABLE.lock();
             let mut wake_ids = alloc::vec::Vec::new();
-            if let Some(waiters) = table.get_mut(&key) {
-                if !waiters.is_empty() {
-                    // Wake up to 1 waiter with matching bitset.
+            for key in keys.iter_mut().take(n_keys) {
+                let mut woke_this_key = false;
+                if let Some(waiters) = table.get_mut(key) {
                     let mut i = 0;
-                    while i < waiters.len() && wake_ids.is_empty() {
+                    while i < waiters.len() && !woke_this_key {
                         if (waiters[i].bitset & FUTEX_BITSET_MATCH_ANY) != 0 {
                             let w = waiters.remove(i);
                             w.woken.store(true, core::sync::atomic::Ordering::Release);
                             wake_ids.push(w.tid);
+                            woke_this_key = true;
                         } else {
                             i += 1;
                         }
                     }
-                }
-                if waiters.is_empty() {
-                    table.remove(&key);
+                    if waiters.is_empty() {
+                        table.remove(key);
+                    }
                 }
             }
             wake_ids
@@ -14790,6 +14813,30 @@ pub(super) fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
                     &woken_flag,
                     None,
                 );
+            }
+
+            // Phase 77 Track A — dequeue our waiter on return.
+            //
+            // A matching FUTEX_WAKE / `do_clear_child_tid` removes our waiter
+            // before waking us, but ANY OTHER wake source (a stray
+            // `wake_task_v2`, a signal-driven unblock, a sibling clearing a
+            // *shared* `clear_child_tid` address — musl gives every joinable
+            // thread the same join word in some layouts) returns us here with
+            // our entry STILL queued. `FUTEX_WAKE`/`do_clear_child_tid` only
+            // wake `val` (typically 1) waiters, so a lingering stale entry ahead
+            // of a future real waiter absorbs that single wake and starves the
+            // real `pthread_join` — the intermittent multithread-join / SSH
+            // teardown freeze. Linux dequeues the futex waiter on every return
+            // path; mirror that. Idempotent: removes 0 entries on the common
+            // wake-removed-us path.
+            {
+                let mut table = FUTEX_TABLE.lock();
+                if let Some(waiters) = table.get_mut(&key) {
+                    waiters.retain(|w| w.tid != tid);
+                    if waiters.is_empty() {
+                        table.remove(&key);
+                    }
+                }
             }
 
             0

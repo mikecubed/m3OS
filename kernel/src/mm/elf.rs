@@ -40,6 +40,15 @@ const PT_DYNAMIC: u32 = 2;
 /// is carried in `AT_ENTRY` so the interpreter knows where to jump
 /// after bring-up.
 const PT_INTERP: u32 = 3;
+/// Phase 77 Track C: Thread-Local Storage template segment. Carries the
+/// `.tdata` initialized image (`p_filesz`) plus `.tbss` zero-fill
+/// (`p_memsz - p_filesz`) that musl's `__init_tls` copies into each thread's
+/// TLS block. The `.tdata` bytes live inside a `PT_LOAD` segment (already
+/// mapped), and musl discovers this header by walking the program headers via
+/// `AT_PHDR`/`AT_PHENT`/`AT_PHNUM` (which `setup_abi_stack_with_envp` supplies
+/// pointing into the mapped phdr table), so no separate TLS image or aux entry
+/// is needed — the kernel only has to recognise the segment.
+const PT_TLS: u32 = 7;
 
 /// Hint for where to place the interpreter's load bias. The actual
 /// bias is `max(INTERP_LOAD_BASE_HINT, main_top_page_aligned + 64 KiB)`
@@ -810,6 +819,27 @@ pub unsafe fn load_elf_into_with_interp(
             }
             if phdr.p_type == PT_INTERP {
                 interp_segment = Some((phdr.p_offset, phdr.p_filesz));
+            }
+            if phdr.p_type == PT_TLS {
+                // Phase 77 Track C: the TLS template (`.tdata` init image of
+                // `p_filesz` bytes + `.tbss` zero-fill of `p_memsz - p_filesz`)
+                // lives at `load_bias + p_vaddr`, which falls inside an already
+                // mapped `PT_LOAD` segment, so the initialized image is
+                // preserved and reachable in the user address space with no
+                // extra staging.  musl's `__init_tls` rediscovers this header
+                // through `AT_PHDR`/`AT_PHENT`/`AT_PHNUM` (supplied by
+                // `setup_abi_stack_with_envp`) and copies the image into each
+                // thread's TLS block; `.tbss` is zero-init per thread by musl.
+                // We log it so the segment is visibly recognised rather than
+                // silently skipped (the pre-Phase-77 behaviour).
+                log::info!(
+                    "elf: PT_TLS binary={} vaddr={:#x} filesz={:#x} memsz={:#x} align={:#x}",
+                    binary_name,
+                    load_bias.wrapping_add(phdr.p_vaddr),
+                    phdr.p_filesz,
+                    phdr.p_memsz,
+                    phdr.p_align,
+                );
             }
         }
 

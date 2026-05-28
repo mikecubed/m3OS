@@ -2450,6 +2450,8 @@ fn build_musl_bins() {
             "userspace/mmap-leak-test/mmap-leak-test.c",
             "mmap-leak-test",
         ),
+        // Phase 77 Track C: multi-threaded __thread / PT_TLS smoke test
+        ("userspace/tls-smoke/tls-smoke.c", "tls-smoke"),
     ];
 
     let cc = match find_musl_cc() {

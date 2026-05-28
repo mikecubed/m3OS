@@ -20,6 +20,11 @@ const PAGE_GRANT_PASS_NEEDLE: &[u8] = b"PAGE_GRANT_SMOKE:roundtrip:ok";
 const WX_VIOLATION_PATH: &[u8] = b"/bin/wx-violation\0";
 const WX_VIOLATION_ARGV0: &[u8] = b"wx-violation\0";
 const WX_VIOLATION_PASS_NEEDLE: &[u8] = b"WX_VIOLATION:smoke:ok";
+// Phase 77 Track C — multi-threaded __thread / PT_TLS smoke test. A
+// full-musl static binary; SKIP if the musl toolchain was absent at build.
+const TLS_SMOKE_PATH: &[u8] = b"/bin/tls-smoke\0";
+const TLS_SMOKE_ARGV0: &[u8] = b"tls-smoke\0";
+const TLS_SMOKE_PASS_NEEDLE: &[u8] = b"TLS_SMOKE:PASS";
 // Phase 76 — `dynlink_smoke` is a musl-built dynamic ELF carrying
 // `PT_INTERP = /lib/ld-musl-x86_64.so.1` and zero `DT_NEEDED`
 // entries. Running it exercises the kernel `PT_INTERP` branch +
@@ -218,6 +223,30 @@ fn program_main(_args: &[&str]) -> i32 {
         return code;
     }
     pass("wx-violation");
+
+    // Phase 77 Track C — multi-threaded __thread / PT_TLS test. Proves each
+    // pthread sees its own copy of a `__thread` variable (the PT_TLS template
+    // the ELF loader now recognises is copied per-thread by musl). SKIP if the
+    // musl toolchain was missing at build (zero-byte placeholder).
+    {
+        let mut probe = Stat::zeroed();
+        if stat(TLS_SMOKE_PATH, &mut probe) < 0 || probe.st_size == 0 {
+            skip("tls-smoke");
+        } else {
+            begin("tls-smoke");
+            let tls_argv = [TLS_SMOKE_ARGV0.as_ptr(), ptr::null()];
+            if let Err(code) = run_command_expect_output(
+                "tls-smoke",
+                TLS_SMOKE_PATH,
+                &tls_argv,
+                TLS_SMOKE_PASS_NEEDLE,
+                &mut command_output,
+            ) {
+                return code;
+            }
+            pass("tls-smoke");
+        }
+    }
 
     // Phase 76 — exercise the kernel PT_INTERP branch + ld.so
     // transfer-only stub. The dynlink_smoke binary writes the
