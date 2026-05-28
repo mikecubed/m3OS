@@ -16189,9 +16189,27 @@ pub(super) fn sys_sendto(
                             return err;
                         }
                         sp
-                    } else {
+                    } else if local_port != 0 {
                         local_port
+                    } else {
+                        // Phase 77 Track D.1 — kernel-direct unbound-UDP send:
+                        // assign an ephemeral source port (Linux behaviour) so
+                        // the reply can be routed back. Range 0xC000.. matches
+                        // the connect/net_udp ephemeral range.
+                        (crate::arch::x86_64::interrupts::tick_count() as u16) | 0xC000
                     };
+                    // Phase 77 Track D.1 — register a freshly-assigned ephemeral
+                    // source port so inbound datagrams (e.g. the DNS reply) are
+                    // enqueued for it and `recvfrom` can dequeue them. musl's
+                    // resolver `sendto`s from an unbound socket; without this the
+                    // reply's dst_port matches no binding and is dropped.
+                    if local_port == 0 && src_port != 0 {
+                        let _ = crate::net::udp::bind(src_port);
+                        crate::net::with_socket_mut(handle, |s| {
+                            s.local_port = src_port;
+                            s.udp_bound = true;
+                        });
+                    }
                     // Phase 55c Track G R1: surface EAGAIN when the ring-3 NIC
                     // driver is in a restart window.  Socket fd is already
                     // validated by the FdBackend::Socket check above.

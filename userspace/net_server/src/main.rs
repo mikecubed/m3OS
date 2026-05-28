@@ -277,31 +277,48 @@ fn handle_connect(table: &mut HandleTable, handle: u64, packed_ip_port: u64) -> 
     (0, ephemeral_port as u64)
 }
 
-fn handle_sendto(table: &HandleTable, handle: u64, packed_dst: u64, _len: u64) -> (u64, u64) {
+fn handle_sendto(table: &mut HandleTable, handle: u64, packed_dst: u64, _len: u64) -> (u64, u64) {
     let idx = handle as usize;
-    let h = match table.get(idx) {
-        Some(h) => h,
+    let (shut_wr, has_peer, bound, local_port) = match table.get(idx) {
+        Some(h) => (h.shut_wr, h.remote_port != 0, h.bound, h.local_port),
         None => return (NEG_EINVAL, 0),
     };
 
-    if h.shut_wr {
+    if shut_wr {
         return (NEG_EPIPE, 0);
     }
 
     let (dst_ip, dst_port) = unpack_ip_port(packed_dst);
-    // If no explicit destination, must be connected
-    if dst_ip == [0, 0, 0, 0] && dst_port == 0 {
-        if h.remote_port == 0 {
-            return (NEG_ENOTCONN, 0);
+    // If no explicit destination, must be connected.
+    if dst_ip == [0, 0, 0, 0] && dst_port == 0 && !has_peer {
+        return (NEG_ENOTCONN, 0);
+    }
+
+    // Phase 77 Track D.1 — auto-bind an ephemeral source port when sending
+    // from an unbound socket. musl's resolver (`__res_msend`) does `sendto`
+    // on a fresh, never-bound UDP socket and relies on the OS to assign a
+    // source port (Linux unbound-UDP-send behaviour). Previously this returned
+    // EINVAL, so the DNS query never went out with a usable source port and
+    // the reply could not be routed back → getaddrinfo EAI_AGAIN. Mirror the
+    // ephemeral allocation `handle_connect` already does.
+    if !bound || local_port == 0 {
+        let ep = match table.alloc_ephemeral() {
+            Some(p) => p,
+            None => return (NEG_EADDRINUSE, 0),
+        };
+        if !table.bind_port(ep) {
+            return (NEG_EADDRINUSE, 0);
         }
+        let h = table.get_mut(idx).unwrap();
+        h.local_port = ep;
+        h.bound = true;
+        if h.state == HandleState::Unbound {
+            h.state = HandleState::Bound;
+        }
+        return (0, ep as u64);
     }
 
-    // Must be bound to have a source port
-    if !h.bound || h.local_port == 0 {
-        return (NEG_EINVAL, 0);
-    }
-
-    (0, h.local_port as u64)
+    (0, local_port as u64)
 }
 
 fn handle_recvfrom(table: &HandleTable, handle: u64) -> (u64, u64) {

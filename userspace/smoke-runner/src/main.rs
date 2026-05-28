@@ -25,6 +25,13 @@ const WX_VIOLATION_PASS_NEEDLE: &[u8] = b"WX_VIOLATION:smoke:ok";
 const TLS_SMOKE_PATH: &[u8] = b"/bin/tls-smoke\0";
 const TLS_SMOKE_ARGV0: &[u8] = b"tls-smoke\0";
 const TLS_SMOKE_PASS_NEEDLE: &[u8] = b"TLS_SMOKE:PASS";
+// Phase 77 Track D.1 — DNS resolution via the prebuilt musl resolver +
+// staged /etc/resolv.conf. dns-smoke emits DNS_SMOKE:PASS when a name
+// resolves or DNS_SMOKE:SKIP when no outbound DNS is reachable (exit 0
+// either way); the gate accepts the common `DNS_SMOKE:` prefix.
+const DNS_SMOKE_PATH: &[u8] = b"/bin/dns-smoke\0";
+const DNS_SMOKE_ARGV0: &[u8] = b"dns-smoke\0";
+const DNS_SMOKE_NEEDLE: &[u8] = b"DNS_SMOKE:";
 // Phase 76 — `dynlink_smoke` is a musl-built dynamic ELF carrying
 // `PT_INTERP = /lib/ld-musl-x86_64.so.1` and zero `DT_NEEDED`
 // entries. Running it exercises the kernel `PT_INTERP` branch +
@@ -245,6 +252,31 @@ fn program_main(_args: &[&str]) -> i32 {
                 return code;
             }
             pass("tls-smoke");
+        }
+    }
+
+    // Phase 77 Track D.1 — DNS resolution via the prebuilt musl resolver.
+    // dns-smoke exits 0 with DNS_SMOKE:PASS (name resolved) or DNS_SMOKE:SKIP
+    // (no outbound DNS) — both satisfy the gate, which only asserts the
+    // resolver path ran and emitted a verdict. SKIP if the binary is absent
+    // (musl toolchain missing at build).
+    {
+        let mut probe = Stat::zeroed();
+        if stat(DNS_SMOKE_PATH, &mut probe) < 0 || probe.st_size == 0 {
+            skip("dns-smoke");
+        } else {
+            begin("dns-smoke");
+            let dns_argv = [DNS_SMOKE_ARGV0.as_ptr(), ptr::null()];
+            if let Err(code) = run_command_expect_output(
+                "dns-smoke",
+                DNS_SMOKE_PATH,
+                &dns_argv,
+                DNS_SMOKE_NEEDLE,
+                &mut command_output,
+            ) {
+                return code;
+            }
+            pass("dns-smoke");
         }
     }
 

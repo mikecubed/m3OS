@@ -2452,6 +2452,8 @@ fn build_musl_bins() {
         ),
         // Phase 77 Track C: multi-threaded __thread / PT_TLS smoke test
         ("userspace/tls-smoke/tls-smoke.c", "tls-smoke"),
+        // Phase 77 Track D.1: DNS resolution smoke test (musl resolver).
+        ("userspace/dns-smoke/dns-smoke.c", "dns-smoke"),
     ];
 
     let cc = match find_musl_cc() {
@@ -12334,6 +12336,13 @@ fn populate_ext2_files(
     let shadow_content = shadow_content.as_str();
     let group_content = "root:x:0:root\nuser:x:1000:user\n";
 
+    // Phase 77 Track D.1 — stage /etc/resolv.conf so the prebuilt musl resolver
+    // (getaddrinfo / gethostbyname) has a nameserver. QEMU SLIRP user-net exposes
+    // a virtual DNS server at 10.0.2.3 that forwards to the host resolver. The
+    // short timeout/attempts keep dns-smoke bounded when no outbound DNS exists.
+    // Override the nameserver for a different deployment by editing /etc/resolv.conf.
+    let resolv_conf_content = "nameserver 10.0.2.3\noptions timeout:5 attempts:3\n";
+
     // Phase 46: service definition files.
     let sshd_conf = "name=sshd\ncommand=/bin/sshd\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=syslogd\n";
     let telnetd_conf = "name=telnetd\ncommand=/bin/telnetd\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=syslogd\n";
@@ -12550,6 +12559,7 @@ fn populate_ext2_files(
     let smoke_mode_content = "enabled\n";
     let empty_content = "";
     let udp_smoke_bin = generated_initrd_dir(&workspace_root()).join("udp-smoke");
+    let dns_smoke_bin = generated_initrd_dir(&workspace_root()).join("dns-smoke");
 
     // Phase 76 — `/lib/ld-musl-x86_64.so.1` source path. Built by
     // `build_ldso()` into `target/generated-libs/`. The on-disk
@@ -12725,9 +12735,11 @@ fn populate_ext2_files(
     let hostname_tmp = output_dir.join("_tmp_hostname");
     let smoke_mode_tmp = output_dir.join("_tmp_smoke_mode");
     let empty_tmp = output_dir.join("_tmp_empty");
+    let resolv_conf_tmp = output_dir.join("_tmp_resolv_conf");
     fs::write(&passwd_tmp, passwd_content).expect("write temp passwd");
     fs::write(&shadow_tmp, shadow_content).expect("write temp shadow");
     fs::write(&group_tmp, group_content).expect("write temp group");
+    fs::write(&resolv_conf_tmp, resolv_conf_content).expect("write temp resolv.conf");
     fs::write(&sshd_conf_tmp, sshd_conf).expect("write temp sshd.conf");
     fs::write(&syslogd_conf_tmp, syslogd_conf).expect("write temp syslogd.conf");
     fs::write(&crond_conf_tmp, crond_conf).expect("write temp crond.conf");
@@ -13109,6 +13121,10 @@ fn populate_ext2_files(
          write \"{passwd}\" etc/passwd\n\
          write \"{shadow}\" etc/shadow\n\
          write \"{group}\" etc/group\n\
+         write \"{resolv_conf}\" etc/resolv.conf\n\
+         sif etc/resolv.conf mode 0x81A4\n\
+         sif etc/resolv.conf uid 0\n\
+         sif etc/resolv.conf gid 0\n\
          write \"{empty}\" root/.local/share/ion/history\n\
          write \"{empty}\" home/user/.local/share/ion/history\n\
          sif bin mode 0x41ED\n\
@@ -13127,6 +13143,10 @@ fn populate_ext2_files(
           sif root/udp-smoke mode 0x81ED\n\
           sif root/udp-smoke uid 0\n\
           sif root/udp-smoke gid 0\n\
+          write \"{dns_smoke_bin}\" bin/dns-smoke\n\
+          sif bin/dns-smoke mode 0x81ED\n\
+          sif bin/dns-smoke uid 0\n\
+          sif bin/dns-smoke gid 0\n\
           sif home mode 0x41ED\n\
          sif home uid 0\n\
          sif home gid 0\n\
@@ -13316,6 +13336,7 @@ fn populate_ext2_files(
         passwd = passwd_tmp.display(),
         shadow = shadow_tmp.display(),
         group = group_tmp.display(),
+        resolv_conf = resolv_conf_tmp.display(),
         sshd_conf = sshd_conf_tmp.display(),
         telnetd_cmds = telnetd_cmds,
         syslogd_conf = syslogd_conf_tmp.display(),
@@ -13346,6 +13367,7 @@ fn populate_ext2_files(
         readback_cmds = readback_cmds,
         inject_key_cmds = inject_key_cmds,
         udp_smoke_bin = udp_smoke_bin.display(),
+        dns_smoke_bin = dns_smoke_bin.display(),
         // Phase 76 — host path of the staged dynamic linker; written
         // to `/lib/ld-musl-x86_64.so.1` on the ext2 disk.
         ldso_bin = ldso_bin.display(),
