@@ -1,5 +1,13 @@
 # virtio-input Migration — Plan & Handoff
 
+**Resolution (Phase 77 Track G.3, 2026-05-28):** CLOSED — superseded by Phase 56.
+The input stack m3OS actually shipped is PS/2-based (`kbd_server` / `mouse_server`
+publishing typed `KeyEvent` / `PointerEvent` to the `display_server`
+focus-aware dispatcher), which fully covers the graphical-session input needs
+this plan targeted. A virtio-input migration is **not** a 1.0 requirement and is
+not scheduled; if QEMU `-device virtio-keyboard`/`virtio-mouse` support is wanted
+later it can be re-opened as a fresh phase. No work is carried into Phase 77.
+
 **Status:** Plan only. No implementation work has started. All current code
 is on `feat/57d-voluntary-preemption` at `ae45431` (the typematic-revert
 commit) — PS/2 input is intact and functional, with one known limitation

@@ -1,5 +1,6 @@
 ---
-status: open
+status: resolved
+resolution: "Phase 77 Track G.4 (2026-05-28) — cursor-at-(0,0)-on-AP symptom not reproducible; closed by the Phase 57a/57b/57e SMP scheduler hardening (pi_lock outer / scheduler_lock inner discipline, with_block_state_locked_scheduler, wake_task_v2 precondition closure) plus the Phase 77 Track A wake/defer + futex CHILD_CLEARTID fixes. The graphical stack (display_server landing on an AP) comes up cleanly across the session-smoke / boot gates and the repeated headless graphical boots run this session; serverization-fallback passes 10/10."
 branch: feat/phase-57-impl
 last-known-good-commit: 3729a69
 date: 2026-04-28

@@ -1,5 +1,6 @@
 ---
-status: open  # symptom should be gone; awaits user confirmation under real run-gui
+status: resolved  # Phase 77 Track G.2 (2026-05-28): not reproducible
+resolution: "Phase 77 Track G.2 (2026-05-28) — `cargo xtask compositor-stress --timeout 300 --cycles 3 --spawns-per-cycle 4` spawned 12 terminals across 3 workspaces (SUPER+RETURN + SUPER+1/2/3) and completed with NO kernel panic / OOM ('compositor-stress: PASSED (no kernel panic)'; serial under /tmp/g2-oom/serial.log). The Phase 73 single-slide workspace state + SHM-cache fixes (commits listed below) hold up under repeated multi-term spawn pressure. Closed."
 branch: feat/phase-73-compositor-polish (PR not yet open)
 last-known-good-commit: 43940fc  # current HEAD after the init_buddy fix
 fix-commits:

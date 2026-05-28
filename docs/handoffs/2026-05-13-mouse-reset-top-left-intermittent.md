@@ -1,5 +1,6 @@
 ---
-status: open
+status: downgraded-post-1.0-followup
+resolution: "Phase 77 Track G.5 (2026-05-28) — too rare to reproduce on demand (reboot-recoverable, intermittent). Explicitly downgraded to a known intermittent issue / post-1.0 follow-up per the G.5 acceptance. The serial transcript is retained across runs via M3OS_SMOKE_SERIAL_DUMP=<path> and the AGENTS.md headless-screenshot (QMP screendump) path, so the sticky-state can be analysed after the fact when it next occurs; no synchronous root-cause is blocking 1.0."
 priority: medium (user-visible UX regression, intermittent, reboot-recoverable)
 date: 2026-05-13
 component: PS/2 mouse pipeline — kernel decoder ↔ `MOUSE_PACKET_RING` ↔ `mouse_server` ↔ `display_server` cursor integration
