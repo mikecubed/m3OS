@@ -29,7 +29,7 @@
 
 **File:** `userspace/sshd/src/session.rs`
 **Symbol:** `async_session` (line 204), `cleanup` (line 1526) — the session-teardown ordering invoked from the `exit`/EOF path at line 281
-**Why it matters:** The 2026-04-25 handoff (`docs/handoffs/2026-04-25-pr-118-residual-issues.md` + `-update.md`) documents that a clean client `exit` leaves the sshd session task spinning. The roadmap cited `session.rs:1474`; the teardown logic now lives in `cleanup` near line 1526, so the fix is in the shutdown ordering, not the SSH protocol. The current `cleanup` already escalates SIGTERM → 500 ms poll → SIGKILL, so the residual spin is most likely a channel/EOF or PTY-close ordering issue that leaves the task runnable after the shell PID reaps.
+**Why it matters:** The 2026-04-25 handoff (`docs/handoffs/2026-04-25-pr-118-residual-issues.md` + `-update.md`) documents that a clean client `exit` leaves the sshd session task spinning. The roadmap cited `session.rs:1474`; the teardown logic now lives in `cleanup` near line 1526, so the fix is in the shutdown ordering, not the SSH protocol. The current `cleanup` already escalates SIGHUP → 500 ms poll (20 × 25 ms `waitpid(WNOHANG)`) → SIGKILL, so the residual spin is most likely a channel/EOF or PTY-close ordering issue that leaves the task runnable after the shell PID reaps.
 
 **Acceptance:**
 - [ ] The 2026-04-25 spin is reproduced (or confirmed already-fixed) on current `main`, with the reproduction recipe recorded in the PR description
@@ -61,7 +61,7 @@
 - `kernel/src/smp/boot.rs`
 - `kernel/src/arch/x86_64/cpuid.rs`
 
-**Symbol:** `save_bsp_cr4_for_aps` (BSP CR4 capture, `smp/boot.rs` ~line 216), `ap_entry` (AP CR4 load, `smp/boot.rs` line 408, CR4 store ~lines 409-416); `cpuid_raw` + the `XSaveFeatures`-style probe in `arch/x86_64/cpuid.rs`
+**Symbol:** `install_trampoline` (`smp/boot.rs:160`; BSP CR4 capture into the trampoline slot at line 216 — there is **no** `save_bsp_cr4_for_aps` function), `ap_entry` (AP CR4 load, `smp/boot.rs:408`, CR4 store lines 412-415); `cpuid_raw` (`arch/x86_64/cpuid.rs:232`) + the `XSaveFeatures`-style `probe()` pattern (line 120). Note: leaf `0x07` is not probed today (only leaves 1 and `0x0D`), so the SMEP/SMAP feature check is net-new but follows the established pattern. (`kernel/src/arch/x86_64/cpu.rs` does not exist — the design doc's Primary Components line is stale.)
 **Why it matters:** CR4 is configured in `smp/boot.rs`, not `cpu.rs` as the roadmap's component list implied — the BSP saves its CR4 for the AP trampoline and each AP reloads it. Setting CR4.SMEP causes a kernel `#PF` if ring 0 ever fetches an instruction from a user page, eliminating an entire class of "smash userspace shellcode" exploits. ~50 LOC including the AP path.
 
 **Acceptance:**
@@ -85,7 +85,7 @@
 - [ ] A `CPUID.07h:EBX[20]` (SMAP) check is added alongside the SMEP probe
 - [ ] When supported, `CR4` bit 21 is set on the BSP and propagated to APs via the same saved-CR4 path as B.1
 - [ ] `stac` precedes and `clac` follows the user-pointer dereference inside `copy_from_user` and `copy_to_user` only (not around the surrounding bounds checks); the asm is wrapped in an explicit `unsafe {}` block per edition-2024 rules
-- [ ] No other call site touches user memory directly — a `grep` audit confirms all user reads/writes route through `user_mem.rs`; any stray site found is either routed through the helpers or given its own STAC/CLAC window with a comment
+- [ ] No other call site touches user memory directly — a `grep` audit confirms all user reads/writes route through `user_mem.rs`; any stray site found is either routed through the helpers or given its own STAC/CLAC window with a comment. (Known counterexample: a dead `copy_to_user` at `kernel/src/mm/user_space.rs:197` does a raw `from_raw_parts_mut` deref with **zero callers** — delete it as part of this audit rather than wrapping it.)
 - [ ] A debug-only kernel test deliberately reads a user page *without* the STAC window and asserts a `#PF`, then reads through `copy_from_user` and asserts success
 - [ ] `cargo xtask test` and `cargo xtask smoke-test` pass — confirming no syscall regressed from the SMAP window
 
@@ -133,7 +133,7 @@
 **Files:**
 - `xtask/src/main.rs` (`populate_ext2_files`, ~line 12298; `etc/passwd` staging at ~13102 is the pattern to follow)
 - `userspace/init/src/main.rs` (`KNOWN_CONFIGS`)
-- `kernel/src/net/udp.rs` (`bind`, line 18) and `kernel/src/arch/x86_64/syscall/mod.rs` (`sys_socket`, line 15638)
+- `kernel/src/net/udp.rs` (`bind`, line 18) and `kernel/src/arch/x86_64/syscall/mod.rs` (`sys_socket`, line 15639)
 
 **Symbol:** `populate_ext2_files`, `sys_socket`, `udp::bind`
 **Why it matters:** The roadmap framed this as "port ~600 LOC of C into the musl tree." That does not match this repo: there is **no in-tree musl source** — musl is a prebuilt cross-toolchain resolved via `find_musl_cc`, and `getaddrinfo`/`gethostbyname` already ship in its libc. The real gap is that `/etc/resolv.conf` is not staged (only `passwd`/`shadow`/`group` are) and the prebuilt resolver has never been exercised against m3OS's `socket(AF_INET, SOCK_DGRAM)` syscall path. `sys_socket` (UDP path lines 15642-15665) and `udp::bind` exist, so the work is wiring + verification, with any missing syscall surface filled only as the resolver demands it.
@@ -191,7 +191,7 @@
 - `kernel/src/epoll.rs`
 - `docs/appendix/audit-status/74a-pre-1.0-audit.md`
 
-**Symbol:** `sys_epoll_create1` (`syscall/mod.rs:18453`), `sys_epoll_ctl` (line 18496), `sys_epoll_wait` (line 18593); dispatch arms at lines 1900-1913; the `epoll` module at `kernel/src/epoll.rs`
+**Symbol:** `sys_epoll_create1` (`syscall/mod.rs:18453`), `sys_epoll_ctl` (line 18496), `sys_epoll_wait` (line 18593); dispatch arms at lines 1902/1906/1913; supporting types `EpollInstance`/`EpollInterest`/`EPOLL_TABLE` and the **entire implementation** live in `syscall/mod.rs:18355-18720`. `kernel/src/epoll.rs` is only a 21-line teardown shim (`epoll_free_pub`), **not** the implementation — do not point the verification at it
 **Why it matters:** Audit §2 flagged `epoll_*` as PARTIAL/possibly-absent. Source verification shows all three handlers **exist and are fully implemented** (FD-table integration, interest lists, wait-queue-backed blocking, close-on-exec cleanup). So this track is verification + a regression gate + an audit correction — **not** new implementation.
 
 **Acceptance:**
@@ -266,7 +266,7 @@
 
 **Files:**
 - `kernel/src/fs/procfs.rs`
-- `kernel/src/arch/x86_64/syscall/mod.rs` (`sys_linux_getdents64`, lines 13392-13450; dispatch at line 1755)
+- `kernel/src/arch/x86_64/syscall/mod.rs` (`sys_linux_getdents64`, lines 13395-13450; dispatch at line 1755)
 
 **Symbol:** `list_dir` (`procfs.rs:160`), `render_pid_stat` (line 701), `render_status` (line 550), `render_comm_bytes` (line 661), `sys_linux_getdents64`
 **Why it matters:** `htop` shows zero processes. The 2026-05-20 handoff lists five suspected causes, ranked: (1) `getdents64` semantics (`d_off`/`d_reclen` alignment), (2) `/proc/<pid>/stat` field count or `(comm)` paren escaping, (3) `/proc/<pid>/status` missing fields (`Tgid`, `VmRSS`, `VmData`, `VmStk`), (4) `openat(dirfd, "/proc/<pid>")` across a dir fd, (5) `/proc/cpuinfo` or `/proc/stat` cpu-line parser failure. `render_status` today emits only Name/State/Pid/PPid/Uid/Gid/Threads/VmSize/Cwd — the missing fields are a confirmed candidate.
