@@ -122,6 +122,84 @@ pub fn build(p: &TcpBuildParams, payload: &[u8]) -> Vec<u8> {
     pkt
 }
 
+// ===========================================================================
+// Phase 77 Track D.2 — RFC 6298 retransmission timeout estimator
+// ===========================================================================
+
+/// Minimum RTO (RFC 6298 §2.4: "SHOULD be rounded up to 1 second").
+pub const RTO_MIN_MS: u32 = 1_000;
+/// Maximum RTO (RFC 6298 §5.7 permits a 60 s cap).
+pub const RTO_MAX_MS: u32 = 60_000;
+/// Initial RTO before any measurement (RFC 6298 §2.1).
+pub const RTO_INITIAL_MS: u32 = 1_000;
+/// Clock granularity G used in the variance term (ms-resolution ticks → 1).
+const RTO_CLOCK_GRANULARITY_MS: u32 = 1;
+/// K factor from RFC 6298 (RTO = SRTT + max(G, K·RTTVAR)).
+const RTO_K: u32 = 4;
+
+/// Per-connection round-trip-time estimator implementing the RFC 6298 SRTT /
+/// RTTVAR smoothing with the standard 1 s minimum / 60 s maximum RTO clamps and
+/// exponential backoff on timeout. All values are in milliseconds; integer
+/// math mirrors the RFC's 1/8 (SRTT) and 1/4 (RTTVAR) gains exactly.
+#[derive(Debug, Clone, Copy)]
+pub struct RttEstimator {
+    srtt_ms: u32,
+    rttvar_ms: u32,
+    rto_ms: u32,
+    have_measurement: bool,
+}
+
+impl Default for RttEstimator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RttEstimator {
+    pub const fn new() -> Self {
+        Self {
+            srtt_ms: 0,
+            rttvar_ms: 0,
+            rto_ms: RTO_INITIAL_MS,
+            have_measurement: false,
+        }
+    }
+
+    /// Current retransmission timeout in milliseconds.
+    pub fn rto_ms(&self) -> u32 {
+        self.rto_ms
+    }
+
+    /// Feed a fresh RTT sample `r_ms` (must NOT be a retransmitted segment —
+    /// Karn's algorithm: the caller skips measurements on retransmits).
+    /// Recomputes SRTT, RTTVAR, and RTO per RFC 6298 §2.2/§2.3.
+    pub fn on_measurement(&mut self, r_ms: u32) {
+        if !self.have_measurement {
+            // First measurement (§2.2): SRTT = R, RTTVAR = R/2.
+            self.srtt_ms = r_ms;
+            self.rttvar_ms = r_ms / 2;
+            self.have_measurement = true;
+        } else {
+            // Subsequent (§2.3): RTTVAR = 3/4·RTTVAR + 1/4·|SRTT-R|,
+            //                    SRTT  = 7/8·SRTT  + 1/8·R.
+            let delta = self.srtt_ms.abs_diff(r_ms);
+            self.rttvar_ms = (3 * self.rttvar_ms + delta) / 4;
+            self.srtt_ms = (7 * self.srtt_ms + r_ms) / 8;
+        }
+        let var_term = (RTO_K * self.rttvar_ms).max(RTO_CLOCK_GRANULARITY_MS);
+        self.rto_ms = self
+            .srtt_ms
+            .saturating_add(var_term)
+            .clamp(RTO_MIN_MS, RTO_MAX_MS);
+    }
+
+    /// RFC 6298 §5.5: on RTO expiry, double the timeout (exponential backoff),
+    /// capped at the maximum.
+    pub fn on_timeout(&mut self) {
+        self.rto_ms = self.rto_ms.saturating_mul(2).min(RTO_MAX_MS);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,5 +268,68 @@ mod tests {
         // Flags are combinable
         let combined = TCP_SYN | TCP_ACK;
         assert_eq!(combined, 0x12);
+    }
+
+    // ---- Phase 77 Track D.2 — RFC 6298 RTO estimator -----------------------
+
+    #[test]
+    fn rto_initial_is_one_second() {
+        let est = RttEstimator::new();
+        assert_eq!(est.rto_ms(), RTO_INITIAL_MS);
+        assert_eq!(est.rto_ms(), 1_000);
+    }
+
+    #[test]
+    fn rto_lan_rtt_clamps_to_min() {
+        // A fast LAN RTT (20 ms): SRTT=20, RTTVAR=10, RTO=20+max(1,40)=60 →
+        // clamped up to the 1 s minimum (RFC 6298 §2.4).
+        let mut est = RttEstimator::new();
+        est.on_measurement(20);
+        assert_eq!(est.rto_ms(), RTO_MIN_MS);
+    }
+
+    #[test]
+    fn rto_large_rtt_uses_formula() {
+        // First measurement R=2000: SRTT=2000, RTTVAR=1000,
+        // RTO = 2000 + max(1, 4·1000) = 6000.
+        let mut est = RttEstimator::new();
+        est.on_measurement(2_000);
+        assert_eq!(est.rto_ms(), 6_000);
+    }
+
+    #[test]
+    fn rto_subsequent_measurement_smooths() {
+        // First R=2000 → SRTT=2000, RTTVAR=1000.
+        // Second R=2000 → |SRTT-R|=0; RTTVAR=(3·1000+0)/4=750;
+        // SRTT=(7·2000+2000)/8=2000; RTO=2000+max(1,4·750)=5000.
+        let mut est = RttEstimator::new();
+        est.on_measurement(2_000);
+        est.on_measurement(2_000);
+        assert_eq!(est.rto_ms(), 5_000);
+    }
+
+    #[test]
+    fn rto_backoff_doubles_and_caps() {
+        let mut est = RttEstimator::new();
+        assert_eq!(est.rto_ms(), 1_000);
+        est.on_timeout();
+        assert_eq!(est.rto_ms(), 2_000);
+        est.on_timeout();
+        assert_eq!(est.rto_ms(), 4_000);
+        // Drive well past the 60 s cap.
+        for _ in 0..10 {
+            est.on_timeout();
+        }
+        assert_eq!(est.rto_ms(), RTO_MAX_MS);
+    }
+
+    #[test]
+    fn rto_never_below_min_after_backoff_then_measure() {
+        let mut est = RttEstimator::new();
+        est.on_timeout(); // 2000
+        est.on_timeout(); // 4000
+        // A fresh fast measurement recomputes from SRTT/RTTVAR, re-clamped ≥1s.
+        est.on_measurement(10);
+        assert_eq!(est.rto_ms(), RTO_MIN_MS);
     }
 }

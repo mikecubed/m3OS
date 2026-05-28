@@ -840,17 +840,27 @@ fn net_task() -> ! {
             any = net::virtio_net::NET_IRQ_WOKEN.swap(false, core::sync::atomic::Ordering::Acquire);
             drained_remote_tx = net::remote::RemoteNic::drain_tx_queue();
         }
+        // Phase 77 Track D.2 — service the TCP retransmission timers once per
+        // pass. Runs in this (task) context so the replayed segments go out the
+        // normal `ipv4::send` path; the periodic deadline below guarantees it
+        // fires even when no NIC event wakes the task.
+        net::tcp::tcp_tick();
+
         // Park on the unified flag: the virtio-net ISR, RemoteNic, and the
         // ingress pending-send hook all set it, so a wake from any path
         // reliably unblocks the task.
         //
-        // F.6: under sched-v2 use block_current_until (v2 CAS primitive)
-        // with no deadline; under v1 retain block_current_unless_woken.
+        // F.6: under sched-v2 use block_current_until (v2 CAS primitive).
+        // Phase 77 Track D.2: a ~200 ms deadline turns the park into a periodic
+        // wake so the RTO scan above runs even on an otherwise idle link.
         {
+            const TCP_RTO_TICK_INTERVAL_MS: u64 = 200;
+            let deadline = crate::arch::x86_64::interrupts::tick_count()
+                .saturating_add(TCP_RTO_TICK_INTERVAL_MS);
             let _ = task::scheduler::block_current_until(
                 task::TaskState::BlockedOnRecv,
                 &net::NIC_WOKEN,
-                None,
+                Some(deadline),
             );
         }
     }

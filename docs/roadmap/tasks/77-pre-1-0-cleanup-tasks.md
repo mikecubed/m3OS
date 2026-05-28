@@ -154,12 +154,12 @@
 **Why it matters:** The fixed 8-element `[Option<TcpConnection>; 8]` array caps concurrent connections far below a realistic 1.0 workload, and there is **no retransmission logic** today (only a comment about "retransmitting SYNs" at line 216 — no RTO timer, no resend queue). On QEMU's perfect LAN this is invisible; the first dropped packet on the real internet hangs the connection.
 
 **Acceptance:**
-- [ ] `MAX_TCP_CONNECTIONS` is raised to 64 and the backing storage becomes a `BoundedVec<TcpConnection, MAX_TCP_CONNECTIONS>` (or an equivalent bounded structure); the const-`new()` no longer hard-codes a fixed list of `None`s
-- [ ] A per-connection one-shot RTO timer is added, rescheduled on every ACK, computing RTO per RFC 6298 (SRTT/RTTVAR estimation with the standard 1 s minimum / 60 s maximum clamps)
-- [ ] On RTO expiry the oldest unacknowledged segment is retransmitted and RTO doubles (exponential backoff), capped at the RFC maximum
-- [ ] The connection-state machine is otherwise unchanged (verified by the existing TCP tests still passing)
-- [ ] A new `userspace/tcp-loss-smoke` test transfers 100 MB through a QEMU netem-style 5% drop filter and completes without hang
-- [ ] 64 concurrent connections can be opened (a smoke or kernel test exercises the raised cap)
+- [x] `MAX_TCP_CONNECTIONS` raised 8 → 64; the backing `[Option<TcpConnection>; 64]` now uses inline-const init (`[const { None }; 64]`) instead of a hand-written list of `None`s (`TcpConnection` is non-`Copy` — it owns `VecDeque`s + the estimator — so this scales to any cap). A `BoundedVec` would add a second length source of truth; the fixed array with `flatten()` iteration is the simpler equivalent bounded structure.
+- [x] A per-connection one-shot RTO timer (`rto_deadline` + `RttEstimator`) is armed on send and disarmed/recomputed on the ACK that covers the segment, computing RTO per **RFC 6298** (SRTT/RTTVAR integer smoothing, 1 s min / 60 s max clamps). The estimator is `kernel_core::net::tcp::RttEstimator` with **6 host tests** pinning the formula (initial, LAN-clamp, large-RTT, smoothing, backoff cap, post-backoff re-clamp).
+- [x] On RTO expiry (`tcp_tick`, driven every ~200 ms from the net task's deadline-wake) the oldest unacked segment is retransmitted with its **original sequence number** and the RTO doubles (`RttEstimator::on_timeout`), capped at 60 s; after `MAX_RETRANSMITS` (8) the connection is reset. Karn's algorithm: no RTT sample on retransmitted segments.
+- [x] The connection-state machine is otherwise unchanged — the retransmit hooks are additive (`arm_retransmit` on SYN/data send, `on_ack` in the existing ACK arms); `cargo xtask check` (clippy + fmt + host tests) and the smoke/regression suites still pass.
+- [~] `tcp-loss-smoke` 100 MB / 5 % drop: **infeasible in the QEMU SLIRP harness** (SLIRP does not drop packets and there is no tap+netem rig). Per the implementation note in this file, the loss-recovery *logic* (RFC 6298 RTO timing + exponential backoff + the wrapping ACK-coverage check) is **host-tested** in `kernel-core`; the live retransmit integration rides the real TCP path exercised by the smoke/regression boots. Documented limitation.
+- [~] 64 concurrent connections: the cap is satisfied by construction (the 64-slot table) and the allocation path (`create` scans for a free slot up to 64). A runtime 64-client open requires an in-guest TCP listener + 64-client driver the harness does not have; documented alongside the netem limitation.
 
 ---
 
