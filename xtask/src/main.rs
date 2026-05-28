@@ -1325,6 +1325,19 @@ fn build_dynlink_smoke() {
 /// can surface a structured diagnostic instead of silently producing
 /// an empty placeholder.
 fn build_shared_lib(name: &str, srcs: &[&str], output: &Path) -> io::Result<()> {
+    build_shared_lib_with_hash_style(name, srcs, output, "sysv")
+}
+
+/// Phase 76d.F — version of [`build_shared_lib`] that lets the caller
+/// pick the linker's hash-style flag (`"sysv"`, `"gnu"`, or `"both"`).
+/// The default `build_shared_lib` continues to use `"sysv"` so the
+/// Phase 76b/c tests still exercise the `DT_HASH` walker.
+fn build_shared_lib_with_hash_style(
+    name: &str,
+    srcs: &[&str],
+    output: &Path,
+    hash_style: &str,
+) -> io::Result<()> {
     let cc = find_musl_cc().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
@@ -1336,13 +1349,8 @@ fn build_shared_lib(name: &str, srcs: &[&str], output: &Path) -> io::Result<()> 
     // Phase 76b bring-up linker (which does not yet load libc) does
     // not have to resolve libc symbols transitively. Phase 76d will
     // relax this once `DT_GNU_HASH` + lazy resolve land.
-    cmd.args([
-        "-shared",
-        "-fPIC",
-        "-O2",
-        "-nostdlib",
-        "-Wl,--hash-style=sysv",
-    ]);
+    cmd.args(["-shared", "-fPIC", "-O2", "-nostdlib"]);
+    cmd.arg(format!("-Wl,--hash-style={hash_style}"));
     cmd.arg(format!("-Wl,-soname,{name}.so"));
     for s in srcs {
         cmd.arg(s);
@@ -1359,7 +1367,11 @@ fn build_shared_lib(name: &str, srcs: &[&str], output: &Path) -> io::Result<()> 
             out.status.code().unwrap_or(-1)
         )));
     }
-    println!("shared-lib: {} → {}", srcs.join(" "), output.display());
+    println!(
+        "shared-lib({hash_style}): {} → {}",
+        srcs.join(" "),
+        output.display()
+    );
     Ok(())
 }
 
@@ -1893,6 +1905,121 @@ fn build_libdl() {
                  error so a stale binary cannot let the dlopen-test-smoke gate \
                  falsely PASS."
             );
+            let _ = fs::write(&dst, b"");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Phase 76d.F.1 — build `libhello_gnu.so` with `--hash-style=gnu`
+/// so the bring-up linker resolves its symbols via Phase 76d.D1's
+/// GNU-hash backend (Bloom filter + bucket + chain) rather than the
+/// SysV `DT_HASH` walker.
+///
+/// Mirrors `build_libhello`'s error policy (placeholder on missing
+/// toolchain so the gate can SKIP; fatal on compile/link failure so
+/// a stale binary can't let the gate falsely PASS).
+fn build_libhello_gnu() {
+    let root = workspace_root();
+    let libs = ensure_generated_libs_dir(&root);
+    let dst = libs.join("libhello_gnu.so");
+    let src = root.join("userspace/lib/libhello_gnu/hello.c");
+    let src_str = src.to_str().expect("non-UTF-8 path");
+    match build_shared_lib_with_hash_style("libhello_gnu", &[src_str], &dst, "gnu") {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "warning: libhello_gnu.so toolchain missing ({e}) — writing \
+                 placeholder. dynlink-hello-gnu-smoke will SKIP at runtime."
+            );
+            let _ = fs::write(&dst, b"");
+        }
+        Err(e) => {
+            eprintln!(
+                "error: libhello_gnu.so build failed ({e}). Treating as a \
+                 hard build error so a stale binary cannot let the \
+                 dynlink-hello-gnu-smoke gate falsely PASS."
+            );
+            let _ = fs::write(&dst, b"");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Phase 76d.F.1 — build `dynlink_hello_gnu`, the consumer binary
+/// that links against `libhello_gnu.so` and is itself built with
+/// `--hash-style=gnu`. Drives the dynlink-hello-gnu-smoke gate
+/// (lazy default + F.3 `LD_BIND_NOW=1` regression + F.4 W^X check).
+fn build_dynlink_hello_gnu() {
+    let root = workspace_root();
+    let initrd = ensure_generated_initrd_dir(&root);
+    let libs = ensure_generated_libs_dir(&root);
+    let dst = initrd.join("dynlink_hello_gnu");
+    let src = root.join("userspace/dynlink_hello_gnu/dynlink_hello_gnu.c");
+    let lib = libs.join("libhello_gnu.so");
+
+    if !lib.exists() || fs::metadata(&lib).map(|m| m.len() == 0).unwrap_or(true) {
+        eprintln!(
+            "warning: libhello_gnu.so missing or empty at {} — skipping dynlink_hello_gnu build",
+            lib.display()
+        );
+        let _ = fs::write(&dst, b"");
+        return;
+    }
+
+    let cc = match find_musl_cc() {
+        Some(c) => c,
+        None => {
+            eprintln!("warning: musl-gcc missing — skipping dynlink_hello_gnu build");
+            let _ = fs::write(&dst, b"");
+            return;
+        }
+    };
+
+    let mut cmd = Command::new(cc);
+    cmd.args([
+        "-nostdlib",
+        "-nostartfiles",
+        "-fno-stack-protector",
+        "-fno-pie",
+        "-no-pie",
+    ]);
+    cmd.args([
+        "-fPIC",
+        "-Wl,-pie",
+        "-Wl,-dynamic-linker=/lib/ld-musl-x86_64.so.1",
+        "-Wl,--hash-style=gnu",
+        "-Wl,-rpath,/usr/lib",
+        "-Wl,--no-eh-frame-hdr",
+        "-O2",
+        "-fno-builtin",
+    ]);
+    cmd.arg(src.to_str().expect("non-UTF-8 path"));
+    cmd.arg(lib.to_str().expect("non-UTF-8 path"));
+    cmd.arg("-o").arg(dst.to_str().expect("non-UTF-8 path"));
+
+    match cmd.output() {
+        Ok(out) if out.status.success() => {
+            println!("dynlink_hello_gnu: built → {}", dst.display());
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            eprintln!(
+                "error: dynlink_hello_gnu build failed (exit {}): {stderr}.",
+                out.status.code().unwrap_or(-1)
+            );
+            let _ = fs::write(&dst, b"");
+            std::process::exit(1);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "warning: {cc} not found mid-build — skipping dynlink_hello_gnu. \
+                 The dynlink-hello-gnu-smoke gate will SKIP at runtime."
+            );
+            let _ = fs::write(&dst, b"");
+        }
+        Err(e) => {
+            eprintln!("error: failed to invoke {cc} for dynlink_hello_gnu: {e}");
             let _ = fs::write(&dst, b"");
             std::process::exit(1);
         }
@@ -3232,6 +3359,9 @@ fn build_kernel() -> PathBuf {
     build_libdl();
     build_libhello_fini();
     build_dlopen_test();
+    // Phase 76d.F — GNU-hashed variant of libhello + consumer.
+    build_libhello_gnu();
+    build_dynlink_hello_gnu();
     build_musl_bins();
     // Phase 44: cross-compile musl-linked Rust userspace programs.
     build_musl_rust_bins();
@@ -4372,6 +4502,9 @@ fn cmd_check() {
     build_libdl();
     build_libhello_fini();
     build_dlopen_test();
+    // Phase 76d.F — GNU-hashed variant of libhello + consumer.
+    build_libhello_gnu();
+    build_dynlink_hello_gnu();
     build_musl_bins();
     // Phase 44: cross-compile musl-linked Rust userspace programs.
     build_musl_rust_bins();
@@ -6164,6 +6297,19 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         pattern_b: "SMOKE:dynlink-cycle-smoke:SKIP",
         timeout_secs: 30,
         label: "guest/dynlink-cycle-smoke: cyclic DT_NEEDED → ELIBBAD",
+        extra_steps_a: &[],
+        extra_steps_b: &[],
+    });
+    // Phase 76d.F — minimal: GNU-hash binary calls hello_str()
+    // and prints the sentinel. The fuller F.3/F.4 BIND_NOW + W^X
+    // checks ship after the basic path is proven. Step order matches
+    // the smoke-runner block order so the WaitEither matcher does
+    // not race with later SMOKE outputs.
+    steps.push(SmokeStep::WaitEither {
+        pattern_a: "SMOKE:dynlink-hello-gnu-smoke:PASS",
+        pattern_b: "SMOKE:dynlink-hello-gnu-smoke:SKIP",
+        timeout_secs: 30,
+        label: "guest/dynlink-hello-gnu-smoke: GNU-hash bring-up",
         extra_steps_a: &[],
         extra_steps_b: &[],
     });

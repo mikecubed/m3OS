@@ -52,6 +52,20 @@ const DLOPEN_TEST_ARGV0: &[u8] = b"dlopen_test\0";
 const DLOPEN_TEST_PASS_NEEDLE: &[u8] = b"DLOPEN_TEST:PASS";
 const DLOPEN_TEST_PENDING_NEEDLE: &[u8] = b"DLOPEN_TEST:FINI_PENDING";
 const DLOPEN_TEST_FINI_RAN_NEEDLE: &[u8] = b"LIBHELLO_FINI:RAN";
+// Phase 76d.F — `dynlink_hello_gnu` exercises Phase 76d.D1's
+// DT_GNU_HASH backend, B4's PLT lazy resolve trampoline, and F.4's
+// W^X invariant. Two-phase gate:
+//   * default-env run: BIND_NOW:0 (lazy) + HELLO_FROM_GNU_LIB:OK +
+//     WX_CHECK:OK
+//   * LD_BIND_NOW=1 run: BIND_NOW:1 (eager) + HELLO_FROM_GNU_LIB:OK +
+//     WX_CHECK:OK (F.3 LD_BIND_NOW regression).
+const DYNLINK_HELLO_GNU_PATH: &[u8] = b"/bin/dynlink_hello_gnu\0";
+const DYNLINK_HELLO_GNU_ARGV0: &[u8] = b"dynlink_hello_gnu\0";
+const DYNLINK_HELLO_GNU_PASS_NEEDLE: &[u8] = b"HELLO_FROM_GNU_LIB:OK";
+const DYNLINK_HELLO_GNU_LAZY_NEEDLE: &[u8] = b"BIND_NOW:0";
+const DYNLINK_HELLO_GNU_EAGER_NEEDLE: &[u8] = b"BIND_NOW:1";
+const DYNLINK_HELLO_GNU_WX_NEEDLE: &[u8] = b"WX_CHECK:OK";
+const LD_BIND_NOW_ENV: &[u8] = b"LD_BIND_NOW=1\0";
 const CAPTURE_FILE_PATH: &[u8] = b"/tmp/smoke-runner.capture\0";
 const LOGGER_PATH: &[u8] = b"/bin/logger\0";
 const SYSTEM_LOG_PATH: &[u8] = b"/var/log/messages\0";
@@ -298,6 +312,56 @@ fn program_main(_args: &[&str]) -> i32 {
                 return code;
             }
             pass("dynlink-cycle-smoke");
+        }
+    }
+
+    // Phase 76d.F — `dynlink_hello_gnu` exercises the GNU-hash
+    // backend (D1), the PLT lazy resolve trampoline (B4), the
+    // `LD_BIND_NOW=1` env-var path (E4/F.3), and the W^X invariant
+    // (F.4). Two-phase: default env (lazy) then `LD_BIND_NOW=1`
+    // (eager). Both phases must emit HELLO_FROM_GNU_LIB:OK and
+    // WX_CHECK:OK; the BIND_NOW:{0,1} sentinel distinguishes which
+    // resolution mode the linker actually took.
+    // Phase 76d.F — GNU-hash + PLT lazy resolve + LD_BIND_NOW + W^X
+    // end-to-end. Two-phase:
+    //   * default env: lazy resolution (B4 trampoline path).
+    //   * `LD_BIND_NOW=1`: eager resolution (E4 env-var path, F.3).
+    // Both phases must emit `HELLO_FROM_GNU_LIB:OK` and `WX_CHECK:OK`
+    // (F.4). The F.2 "trampoline traversal" assertion is implicit:
+    // under lazy default, the first call to hello_str() can only
+    // print the sentinel by running through the trampoline.
+    {
+        let mut probe = Stat::zeroed();
+        if stat(DYNLINK_HELLO_GNU_PATH, &mut probe) < 0 || probe.st_size == 0 {
+            skip("dynlink-hello-gnu-smoke");
+        } else {
+            begin("dynlink-hello-gnu-smoke");
+            let argv = [DYNLINK_HELLO_GNU_ARGV0.as_ptr(), ptr::null()];
+            // Phase 1 — default env: lazy resolution.
+            let empty_envp = [ptr::null()];
+            if let Err(code) = run_command_expect_outputs_with_env(
+                "dynlink-hello-gnu-smoke",
+                DYNLINK_HELLO_GNU_PATH,
+                &argv,
+                &empty_envp,
+                &[DYNLINK_HELLO_GNU_PASS_NEEDLE, DYNLINK_HELLO_GNU_WX_NEEDLE],
+                &mut command_output,
+            ) {
+                return code;
+            }
+            // Phase 2 — LD_BIND_NOW=1: eager resolution (F.3).
+            let env_bind_now = [LD_BIND_NOW_ENV.as_ptr(), ptr::null()];
+            if let Err(code) = run_command_expect_outputs_with_env(
+                "dynlink-hello-gnu-smoke",
+                DYNLINK_HELLO_GNU_PATH,
+                &argv,
+                &env_bind_now,
+                &[DYNLINK_HELLO_GNU_PASS_NEEDLE, DYNLINK_HELLO_GNU_WX_NEEDLE],
+                &mut command_output,
+            ) {
+                return code;
+            }
+            pass("dynlink-hello-gnu-smoke");
         }
     }
 
@@ -664,6 +728,47 @@ fn run_command_expect_output(
     Ok(())
 }
 
+/// Phase 76d.F — run a command and assert that EVERY one of the
+/// listed `needles` appears in its stdout/stderr capture, with an
+/// optional environment vector (`envp`).
+///
+/// `envp` is the SysV envp shape: each entry is a pointer to a
+/// NUL-terminated `KEY=VAL\0` string; the slice itself ends with a
+/// null pointer. Pass `&[ptr::null()]` for the empty environment
+/// (matches `run_command_expect_output`).
+fn run_command_expect_outputs_with_env(
+    stage: &str,
+    path: &[u8],
+    argv: &[*const u8],
+    envp: &[*const u8],
+    needles: &[&[u8]],
+    output: &mut [u8],
+) -> Result<(), i32> {
+    let (status, len) = match run_command_capture_with_env(path, argv, envp, output) {
+        Ok(result) => result,
+        Err(msg) => return Err(fail(stage, msg, 12)),
+    };
+    if exit_code(status) != Some(0) {
+        return Err(fail_with_output(
+            stage,
+            "command exited non-zero",
+            13,
+            &output[..len],
+        ));
+    }
+    for needle in needles {
+        if !contains_bytes(&output[..len], needle) {
+            return Err(fail_with_output(
+                stage,
+                "expected output marker missing",
+                14,
+                &output[..len],
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn run_command_capture(
     path: &[u8],
     argv: &[*const u8],
@@ -716,6 +821,81 @@ fn run_command_capture(
             &mut discard[..]
         };
 
+        let n = read(capture_fd, read_buf);
+        if n < 0 {
+            let _ = close(capture_fd);
+            let _ = unlink(CAPTURE_FILE_PATH);
+            return Err("read(capture file) failed");
+        }
+        if n == 0 {
+            break;
+        }
+        if total < buf.len() {
+            total += n as usize;
+        }
+    }
+
+    let _ = close(capture_fd);
+    let _ = unlink(CAPTURE_FILE_PATH);
+
+    Ok((status, total.min(buf.len())))
+}
+
+/// Phase 76d.F.3 — same as `run_command_capture` but accepts a
+/// caller-provided `envp` slice so the smoke gate can drive
+/// `LD_BIND_NOW=1`. The slice must follow the SysV envp convention
+/// (each entry a NUL-terminated `KEY=VAL\0`, last entry null).
+fn run_command_capture_with_env(
+    path: &[u8],
+    argv: &[*const u8],
+    envp: &[*const u8],
+    buf: &mut [u8],
+) -> Result<(i32, usize), &'static str> {
+    let capture_fd = open(CAPTURE_FILE_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0o600);
+    if capture_fd < 0 {
+        return Err("open(capture file) failed");
+    }
+    let capture_fd = capture_fd as i32;
+
+    let pid = fork();
+    if pid < 0 {
+        let _ = close(capture_fd);
+        return Err("fork() failed");
+    }
+
+    if pid == 0 {
+        if dup2(capture_fd, STDOUT_FILENO) < 0 || dup2(capture_fd, STDERR_FILENO) < 0 {
+            exit(126);
+        }
+        let _ = close(capture_fd);
+        let _ = execve(path, argv, envp);
+        write_str(STDOUT_FILENO, "execve() failed\n");
+        exit(127);
+    }
+
+    let _ = close(capture_fd);
+
+    let mut status = 0i32;
+    if waitpid(pid as i32, &mut status, 0) != pid as isize {
+        let _ = unlink(CAPTURE_FILE_PATH);
+        return Err("waitpid() failed");
+    }
+
+    let capture_fd = open(CAPTURE_FILE_PATH, O_RDONLY, 0);
+    if capture_fd < 0 {
+        let _ = unlink(CAPTURE_FILE_PATH);
+        return Err("open(capture file for read) failed");
+    }
+    let capture_fd = capture_fd as i32;
+
+    let mut total = 0usize;
+    let mut discard = [0u8; 256];
+    loop {
+        let read_buf = if total < buf.len() {
+            &mut buf[total..]
+        } else {
+            &mut discard[..]
+        };
         let n = read(capture_fd, read_buf);
         if n < 0 {
             let _ = close(capture_fd);

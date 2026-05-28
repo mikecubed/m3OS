@@ -344,6 +344,14 @@ static DYNLINK_CYCLE_ELF: &[u8] = generated_initrd_asset!("dynlink_cycle");
 // `libhello_fini.so`. Drives the dlopen-test-smoke gate.
 static DLOPEN_TEST_ELF: &[u8] = generated_initrd_asset!("dlopen_test");
 
+// Phase 76d.F — `dynlink_hello_gnu` musl-built dynamic ELF with
+// PT_INTERP + DT_NEEDED libhello_gnu.so, both built with
+// `--hash-style=gnu`. Exercises Phase 76d.D1's GNU hash backend end
+// to end via the bring-up linker plus B4's lazy PLT resolve. Also
+// emits BIND_NOW:{0,1} (resolution mode) and WX_CHECK:OK (F.4 W^X
+// invariant) sentinels for the dynlink-hello-gnu-smoke gate.
+static DYNLINK_HELLO_GNU_ELF: &[u8] = generated_initrd_asset!("dynlink_hello_gnu");
+
 // Phase 70 follow-up — `doom-concurrent` forks two `doom` processes
 // and waits for both. Run from the post-login shell by `cargo xtask
 // doom-concurrent-smoke` to assert real kernel-level concurrency
@@ -639,6 +647,15 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "dynlink_cycle",
         RamdiskNode::File {
             content: DYNLINK_CYCLE_ELF,
+        },
+    ),
+    // Phase 76d.F: dynlink_hello_gnu — exercises GNU-hash backend +
+    // PLT lazy resolve end-to-end. Drives the dynlink-hello-gnu-smoke
+    // gate.
+    (
+        "dynlink_hello_gnu",
+        RamdiskNode::File {
+            content: DYNLINK_HELLO_GNU_ELF,
         },
     ),
     // Phase 76c: dlopen_test — exercises dlopen / dlsym / dlclose /
