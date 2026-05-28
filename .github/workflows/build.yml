@@ -51,6 +51,15 @@ jobs:
       - name: Allocator loom concurrency tests
         run: RUSTFLAGS='--cfg loom' cargo test -p kernel-core --target x86_64-unknown-linux-gnu --test allocator_loom
 
+      - name: Fetch Nerd Font asset
+        # Phase 69c: xtask/assets/fonts/term.ttf is gitignored — only the
+        # SHA-256 checksum is committed. `cargo xtask smoke-test` triggers
+        # `cargo xtask image`, which refuses to build the data disk without
+        # the font asset. Fetch + SHA-verify it here so smoke-test (and the
+        # device-smoke + regression steps below) see a valid asset. Mirrors
+        # the equivalent step in release.yml.
+        run: cargo xtask fetch-fonts
+
       - name: "Smoke test (headless workflow: boot + login + auth + service + storage + log + TCC)"
         run: |
           # Delete cached disk.img so it is regenerated with TCC files.

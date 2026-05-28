@@ -52,6 +52,35 @@ const DLOPEN_TEST_ARGV0: &[u8] = b"dlopen_test\0";
 const DLOPEN_TEST_PASS_NEEDLE: &[u8] = b"DLOPEN_TEST:PASS";
 const DLOPEN_TEST_PENDING_NEEDLE: &[u8] = b"DLOPEN_TEST:FINI_PENDING";
 const DLOPEN_TEST_FINI_RAN_NEEDLE: &[u8] = b"LIBHELLO_FINI:RAN";
+// Phase 76d.F — `dynlink_hello_gnu` exercises Phase 76d.D1's
+// DT_GNU_HASH backend, B4's PLT lazy resolve trampoline, and F.4's
+// W^X invariant. Two-phase gate:
+//   * default-env run: BIND_NOW:0 (lazy) + HELLO_FROM_GNU_LIB:OK +
+//     WX_CHECK:OK
+//   * LD_BIND_NOW=1 run: BIND_NOW:1 (eager) + HELLO_FROM_GNU_LIB:OK +
+//     WX_CHECK:OK (F.3 LD_BIND_NOW regression).
+const DYNLINK_HELLO_GNU_PATH: &[u8] = b"/bin/dynlink_hello_gnu\0";
+const DYNLINK_HELLO_GNU_ARGV0: &[u8] = b"dynlink_hello_gnu\0";
+const DYNLINK_HELLO_GNU_PASS_NEEDLE: &[u8] = b"HELLO_FROM_GNU_LIB:OK";
+const DYNLINK_HELLO_GNU_LAZY_NEEDLE: &[u8] = b"BIND_NOW:0";
+const DYNLINK_HELLO_GNU_EAGER_NEEDLE: &[u8] = b"BIND_NOW:1";
+const DYNLINK_HELLO_GNU_WX_NEEDLE: &[u8] = b"WX_CHECK:OK";
+const LD_BIND_NOW_ENV: &[u8] = b"LD_BIND_NOW=1\0";
+// Phase 76d.G — `dynlink_hello_versioned` exercises Phase 76d.D2.2
+// version-aware lookup. The consumer's `DT_VERNEED` requires
+// `LIBHELLO_1.0` against `libhello_versioned.so`; the lib defines
+// that exact version via its `--version-script`. Success sentinel:
+// the lib's exported `hello_str` returns the bytes below.
+const DYNLINK_HELLO_VERSIONED_PATH: &[u8] = b"/bin/dynlink_hello_versioned\0";
+const DYNLINK_HELLO_VERSIONED_ARGV0: &[u8] = b"dynlink_hello_versioned\0";
+const DYNLINK_HELLO_VERSIONED_PASS_NEEDLE: &[u8] = b"HELLO_FROM_VERSIONED_LIB:OK";
+// Phase 76d.G.3 — `dynlink_hello_versioned_mismatch` requests
+// `LIBHELLO_1.0` against a lib (v2) that only provides
+// `LIBHELLO_2.0`. Default mode → D2.2 warns + falls back to
+// unversioned. Strict mode (`LD_BIND_NOW=1`) → D2.3 errors + exits.
+const DYNLINK_HELLO_VERSIONED_MISMATCH_PATH: &[u8] = b"/bin/dynlink_hello_versioned_mismatch\0";
+const DYNLINK_HELLO_VERSIONED_MISMATCH_ARGV0: &[u8] = b"dynlink_hello_versioned_mismatch\0";
+const DYNLINK_HELLO_VERSIONED_MISMATCH_FALLBACK_NEEDLE: &[u8] = b"HELLO_FROM_V2_FALLBACK:OK";
 const CAPTURE_FILE_PATH: &[u8] = b"/tmp/smoke-runner.capture\0";
 const LOGGER_PATH: &[u8] = b"/bin/logger\0";
 const SYSTEM_LOG_PATH: &[u8] = b"/var/log/messages\0";
@@ -301,6 +330,150 @@ fn program_main(_args: &[&str]) -> i32 {
         }
     }
 
+    // Phase 76d.F — `dynlink_hello_gnu` exercises the GNU-hash backend
+    // (D1), the PLT lazy-resolve trampoline (B4), the `LD_BIND_NOW=1`
+    // env-var path (E4/F.3), and the W^X invariant (F.4). Two-phase:
+    //   * default env: lazy resolution (B4 trampoline path) → BIND_NOW:0.
+    //   * `LD_BIND_NOW=1`: eager resolution (E4 env-var path, F.3) → BIND_NOW:1.
+    // Both phases must emit `HELLO_FROM_GNU_LIB:OK` and `WX_CHECK:OK`
+    // (F.4); the BIND_NOW:{0,1} sentinel distinguishes which resolution
+    // mode the linker actually took. The F.2 "trampoline traversal"
+    // assertion is implicit: under lazy default, the first call to
+    // hello_str() can only print the sentinel by running through the
+    // trampoline.
+    {
+        let mut probe = Stat::zeroed();
+        if stat(DYNLINK_HELLO_GNU_PATH, &mut probe) < 0 || probe.st_size == 0 {
+            skip("dynlink-hello-gnu-smoke");
+        } else {
+            begin("dynlink-hello-gnu-smoke");
+            let argv = [DYNLINK_HELLO_GNU_ARGV0.as_ptr(), ptr::null()];
+            // Phase 1 — default env: lazy resolution → BIND_NOW:0.
+            let empty_envp = [ptr::null()];
+            if let Err(code) = run_command_expect_outputs_with_env(
+                "dynlink-hello-gnu-smoke",
+                DYNLINK_HELLO_GNU_PATH,
+                &argv,
+                &empty_envp,
+                &[
+                    DYNLINK_HELLO_GNU_PASS_NEEDLE,
+                    DYNLINK_HELLO_GNU_LAZY_NEEDLE,
+                    DYNLINK_HELLO_GNU_WX_NEEDLE,
+                ],
+                &mut command_output,
+            ) {
+                return code;
+            }
+            // Phase 2 — LD_BIND_NOW=1: eager → BIND_NOW:1 (F.3).
+            let env_bind_now = [LD_BIND_NOW_ENV.as_ptr(), ptr::null()];
+            if let Err(code) = run_command_expect_outputs_with_env(
+                "dynlink-hello-gnu-smoke",
+                DYNLINK_HELLO_GNU_PATH,
+                &argv,
+                &env_bind_now,
+                &[
+                    DYNLINK_HELLO_GNU_PASS_NEEDLE,
+                    DYNLINK_HELLO_GNU_EAGER_NEEDLE,
+                    DYNLINK_HELLO_GNU_WX_NEEDLE,
+                ],
+                &mut command_output,
+            ) {
+                return code;
+            }
+            pass("dynlink-hello-gnu-smoke");
+        }
+    }
+
+    // Phase 76d.G — versioned-symbol gate. Two-phase:
+    //   * default env: lazy resolution, version-aware lookup in
+    //     `sym::lookup` matches `LIBHELLO_1.0` against the lib's
+    //     `DT_VERSYM` + `DT_VERDEF`.
+    //   * `LD_BIND_NOW=1`: eager resolution + D2.3 strict mode.
+    //     Exact-version match must still succeed (strict only fires
+    //     on mismatch); this phase exercises the BIND_NOW=true
+    //     branch through `sym::lookup`.
+    {
+        let mut probe = Stat::zeroed();
+        if stat(DYNLINK_HELLO_VERSIONED_PATH, &mut probe) < 0 || probe.st_size == 0 {
+            skip("dynlink-hello-versioned-smoke");
+        } else {
+            begin("dynlink-hello-versioned-smoke");
+            let argv = [DYNLINK_HELLO_VERSIONED_ARGV0.as_ptr(), ptr::null()];
+            // Phase 1 — lazy + default env.
+            let empty_envp = [ptr::null()];
+            if let Err(code) = run_command_expect_outputs_with_env(
+                "dynlink-hello-versioned-smoke",
+                DYNLINK_HELLO_VERSIONED_PATH,
+                &argv,
+                &empty_envp,
+                &[DYNLINK_HELLO_VERSIONED_PASS_NEEDLE],
+                &mut command_output,
+            ) {
+                return code;
+            }
+            // Phase 2 — eager + strict (LD_BIND_NOW=1). Exact match
+            // still succeeds; this phase proves D2.3's strict gate
+            // doesn't reject matching versions.
+            let env_bind_now = [LD_BIND_NOW_ENV.as_ptr(), ptr::null()];
+            if let Err(code) = run_command_expect_outputs_with_env(
+                "dynlink-hello-versioned-smoke",
+                DYNLINK_HELLO_VERSIONED_PATH,
+                &argv,
+                &env_bind_now,
+                &[DYNLINK_HELLO_VERSIONED_PASS_NEEDLE],
+                &mut command_output,
+            ) {
+                return code;
+            }
+            pass("dynlink-hello-versioned-smoke");
+        }
+    }
+
+    // Phase 76d.G.3 — mismatch + LD_BIND_NOW strict-mode gate. The
+    // consumer requires `LIBHELLO_1.0` against a lib (v2) that only
+    // provides `LIBHELLO_2.0` plus an unversioned `hello_str`.
+    //
+    //   * Default mode (lazy + no env): D2.2 detects the mismatch,
+    //     emits a serial warn, falls back to the unversioned
+    //     `hello_str` → prints `HELLO_FROM_V2_FALLBACK:OK`.
+    //   * Strict mode (LD_BIND_NOW=1): D2.3 detects the mismatch,
+    //     emits a serial error, returns None. apply_rela errors and
+    //     `dl_entry` returns 0; the asm caller `jmp 0` triggers a
+    //     SIGSEGV — the smoke gate asserts a non-zero exit.
+    {
+        let mut probe = Stat::zeroed();
+        if stat(DYNLINK_HELLO_VERSIONED_MISMATCH_PATH, &mut probe) < 0 || probe.st_size == 0 {
+            skip("dynlink-hello-versioned-mismatch-smoke");
+        } else {
+            begin("dynlink-hello-versioned-mismatch-smoke");
+            let argv = [DYNLINK_HELLO_VERSIONED_MISMATCH_ARGV0.as_ptr(), ptr::null()];
+            // Phase 1 — default mode: fallback to unversioned.
+            let empty_envp = [ptr::null()];
+            if let Err(code) = run_command_expect_outputs_with_env(
+                "dynlink-hello-versioned-mismatch-smoke",
+                DYNLINK_HELLO_VERSIONED_MISMATCH_PATH,
+                &argv,
+                &empty_envp,
+                &[DYNLINK_HELLO_VERSIONED_MISMATCH_FALLBACK_NEEDLE],
+                &mut command_output,
+            ) {
+                return code;
+            }
+            // Phase 2 — strict mode: non-zero exit.
+            let env_bind_now = [LD_BIND_NOW_ENV.as_ptr(), ptr::null()];
+            if let Err(code) = run_command_expect_nonzero_with_env(
+                "dynlink-hello-versioned-mismatch-smoke",
+                DYNLINK_HELLO_VERSIONED_MISMATCH_PATH,
+                &argv,
+                &env_bind_now,
+                &mut command_output,
+            ) {
+                return code;
+            }
+            pass("dynlink-hello-versioned-mismatch-smoke");
+        }
+    }
+
     // Phase 76c — full libdl runtime gate. Runs `/bin/dlopen_test`,
     // asserts every libdl entry point works (positive + four negative
     // paths) AND that the destructor pipeline runs in the correct
@@ -444,6 +617,35 @@ fn run_command_expect_exit(
             19,
             &output[..len],
         )),
+    }
+}
+
+/// Phase 76d.G.3 — assert the command exits with ANY non-zero code
+/// (or did not exit normally — e.g., killed by SIGSEGV after the
+/// linker's `dl_entry` returns 0 from a strict-mode mismatch). Takes
+/// a caller-provided `envp` so the gate can set `LD_BIND_NOW=1`.
+fn run_command_expect_nonzero_with_env(
+    stage: &str,
+    path: &[u8],
+    argv: &[*const u8],
+    envp: &[*const u8],
+    output: &mut [u8],
+) -> Result<(), i32> {
+    let (status, len) = match run_command_capture_with_env(path, argv, envp, output) {
+        Ok(result) => result,
+        Err(msg) => return Err(fail(stage, msg, 12)),
+    };
+    match exit_code(status) {
+        Some(0) => Err(fail_with_output(
+            stage,
+            "expected non-zero exit but command succeeded",
+            20,
+            &output[..len],
+        )),
+        // Either non-zero exit (e.g. linker exited with code 80) or
+        // killed by a signal (e.g. SIGSEGV from jumping to 0 after
+        // dl_entry returned 0). Both count as failure-as-expected.
+        _ => Ok(()),
     }
 }
 
@@ -664,6 +866,47 @@ fn run_command_expect_output(
     Ok(())
 }
 
+/// Phase 76d.F — run a command and assert that EVERY one of the
+/// listed `needles` appears in its stdout/stderr capture, with an
+/// optional environment vector (`envp`).
+///
+/// `envp` is the SysV envp shape: each entry is a pointer to a
+/// NUL-terminated `KEY=VAL\0` string; the slice itself ends with a
+/// null pointer. Pass `&[ptr::null()]` for the empty environment
+/// (matches `run_command_expect_output`).
+fn run_command_expect_outputs_with_env(
+    stage: &str,
+    path: &[u8],
+    argv: &[*const u8],
+    envp: &[*const u8],
+    needles: &[&[u8]],
+    output: &mut [u8],
+) -> Result<(), i32> {
+    let (status, len) = match run_command_capture_with_env(path, argv, envp, output) {
+        Ok(result) => result,
+        Err(msg) => return Err(fail(stage, msg, 12)),
+    };
+    if exit_code(status) != Some(0) {
+        return Err(fail_with_output(
+            stage,
+            "command exited non-zero",
+            13,
+            &output[..len],
+        ));
+    }
+    for needle in needles {
+        if !contains_bytes(&output[..len], needle) {
+            return Err(fail_with_output(
+                stage,
+                "expected output marker missing",
+                14,
+                &output[..len],
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn run_command_capture(
     path: &[u8],
     argv: &[*const u8],
@@ -716,6 +959,81 @@ fn run_command_capture(
             &mut discard[..]
         };
 
+        let n = read(capture_fd, read_buf);
+        if n < 0 {
+            let _ = close(capture_fd);
+            let _ = unlink(CAPTURE_FILE_PATH);
+            return Err("read(capture file) failed");
+        }
+        if n == 0 {
+            break;
+        }
+        if total < buf.len() {
+            total += n as usize;
+        }
+    }
+
+    let _ = close(capture_fd);
+    let _ = unlink(CAPTURE_FILE_PATH);
+
+    Ok((status, total.min(buf.len())))
+}
+
+/// Phase 76d.F.3 — same as `run_command_capture` but accepts a
+/// caller-provided `envp` slice so the smoke gate can drive
+/// `LD_BIND_NOW=1`. The slice must follow the SysV envp convention
+/// (each entry a NUL-terminated `KEY=VAL\0`, last entry null).
+fn run_command_capture_with_env(
+    path: &[u8],
+    argv: &[*const u8],
+    envp: &[*const u8],
+    buf: &mut [u8],
+) -> Result<(i32, usize), &'static str> {
+    let capture_fd = open(CAPTURE_FILE_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0o600);
+    if capture_fd < 0 {
+        return Err("open(capture file) failed");
+    }
+    let capture_fd = capture_fd as i32;
+
+    let pid = fork();
+    if pid < 0 {
+        let _ = close(capture_fd);
+        return Err("fork() failed");
+    }
+
+    if pid == 0 {
+        if dup2(capture_fd, STDOUT_FILENO) < 0 || dup2(capture_fd, STDERR_FILENO) < 0 {
+            exit(126);
+        }
+        let _ = close(capture_fd);
+        let _ = execve(path, argv, envp);
+        write_str(STDOUT_FILENO, "execve() failed\n");
+        exit(127);
+    }
+
+    let _ = close(capture_fd);
+
+    let mut status = 0i32;
+    if waitpid(pid as i32, &mut status, 0) != pid as isize {
+        let _ = unlink(CAPTURE_FILE_PATH);
+        return Err("waitpid() failed");
+    }
+
+    let capture_fd = open(CAPTURE_FILE_PATH, O_RDONLY, 0);
+    if capture_fd < 0 {
+        let _ = unlink(CAPTURE_FILE_PATH);
+        return Err("open(capture file for read) failed");
+    }
+    let capture_fd = capture_fd as i32;
+
+    let mut total = 0usize;
+    let mut discard = [0u8; 256];
+    loop {
+        let read_buf = if total < buf.len() {
+            &mut buf[total..]
+        } else {
+            &mut discard[..]
+        };
         let n = read(capture_fd, read_buf);
         if n < 0 {
             let _ = close(capture_fd);

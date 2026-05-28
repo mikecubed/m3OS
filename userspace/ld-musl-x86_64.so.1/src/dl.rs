@@ -40,10 +40,11 @@
 use core::cell::UnsafeCell;
 use core::ffi::{c_char, c_int, c_void};
 
-use ldso_core::dynlink::{DsoId, LoadedDso, MAX_DSOS, UnmapError, elf_hash, unmap_dso};
+use ldso_core::dynlink::{DsoId, LoadedDso, MAX_DSOS, UnmapError, unmap_dso};
 use ldso_core::handle::HandleTable;
 
 use crate as runtime;
+use crate::sym;
 
 // ---------------------------------------------------------------------------
 // libdl flag values (matches musl `<dlfcn.h>`).
@@ -749,8 +750,14 @@ where
 }
 
 /// Walk the global scope (all slots with `in_global_scope[i] == true`
-/// AND `refcounts[i] != 0`) searching for `name`.
+/// AND `refcounts[i] != 0`) searching for `name`. Routes through
+/// [`sym::lookup`] (Phase 76d.S1.1) so D1's GNU-hash backend and D2's
+/// version-aware path only need to extend one dispatcher.
 unsafe fn search_global_scope(state: &DlState, name: &[u8]) -> Option<u64> {
+    // Build the in-place scope slice (single-DSO) and pass it through
+    // `sym::lookup`. We can't stack-allocate the whole `state.dsos`
+    // sub-slice because we need to skip non-global slots; instead loop
+    // per-slot and call `sym::lookup` on a one-element view.
     for i in 0..state.n_slots_used {
         if state.refcounts[i] == 0 {
             continue;
@@ -758,7 +765,8 @@ unsafe fn search_global_scope(state: &DlState, name: &[u8]) -> Option<u64> {
         if !state.in_global_scope[i] {
             continue;
         }
-        if let Some(addr) = unsafe { lookup_in_dso(&state.dsos[i], name) } {
+        let single = core::slice::from_ref(&state.dsos[i]);
+        if let Some(addr) = unsafe { sym::lookup(single, name, None) } {
             return Some(addr);
         }
     }
@@ -766,7 +774,9 @@ unsafe fn search_global_scope(state: &DlState, name: &[u8]) -> Option<u64> {
 }
 
 /// Walk the dependency chain of `root` (BFS over `dep_lists`)
-/// searching for `name`. The `root` itself is searched first.
+/// searching for `name`. The `root` itself is searched first. Routes
+/// through [`sym::lookup`] for the same reason as
+/// [`search_global_scope`].
 unsafe fn search_handle_scope(state: &DlState, root: DsoId, name: &[u8]) -> Option<u64> {
     let mut visited = [false; MAX_SLOTS];
     let mut queue: heapless::Vec<DsoId, MAX_SLOTS> = heapless::Vec::new();
@@ -783,44 +793,13 @@ unsafe fn search_handle_scope(state: &DlState, root: DsoId, name: &[u8]) -> Opti
         if state.refcounts[i] == 0 {
             continue;
         }
-        if let Some(addr) = unsafe { lookup_in_dso(&state.dsos[i], name) } {
+        let single = core::slice::from_ref(&state.dsos[i]);
+        if let Some(addr) = unsafe { sym::lookup(single, name, None) } {
             return Some(addr);
         }
         for &child in state.dep_lists[i].iter() {
             let _ = queue.push(child);
         }
-    }
-    None
-}
-
-/// Resolve `name` via the DSO's `DT_HASH` table. Mirrors the
-/// `lookup_symbol` helper used by the bring-up linker, but scoped to
-/// a single DSO.
-unsafe fn lookup_in_dso(dso: &LoadedDso, name: &[u8]) -> Option<u64> {
-    let hash_ptr = dso.dyn_.hash?.as_ptr();
-    let symtab = dso.dyn_.symtab?.as_ptr();
-    let strtab = dso.dyn_.strtab?.as_ptr();
-    let nbuckets = unsafe { *hash_ptr } as usize;
-    let nchain = unsafe { *hash_ptr.add(1) } as usize;
-    if nbuckets == 0 {
-        return None;
-    }
-    let buckets = unsafe { hash_ptr.add(2) };
-    let chain = unsafe { buckets.add(nbuckets) };
-    let h = elf_hash(name);
-    let mut idx = unsafe { *buckets.add(h as usize % nbuckets) };
-    let mut hops = 0usize;
-    while idx != 0 && hops <= nchain {
-        if (idx as usize) >= nchain {
-            break;
-        }
-        let sym = unsafe { &*symtab.add(idx as usize) };
-        let nm = unsafe { runtime::strtab_get(strtab, sym.st_name as u64, dso.dyn_.strsz) };
-        if nm == name && sym.st_value != 0 {
-            return Some(dso.load_bias.wrapping_add(sym.st_value));
-        }
-        idx = unsafe { *chain.add(idx as usize) };
-        hops += 1;
     }
     None
 }

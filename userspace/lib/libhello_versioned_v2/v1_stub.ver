@@ -1,0 +1,6 @@
+LIBHELLO_1.0 {
+    global:
+        hello_str;
+    local:
+        *;
+};

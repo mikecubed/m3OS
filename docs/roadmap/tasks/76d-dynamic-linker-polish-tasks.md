@@ -1,22 +1,22 @@
 # Phase 76d — Dynamic Linker: PLT Lazy + GNU Hash + Versioning: Task List
 
-**Status:** Planned
+**Status:** ✅ Complete (S1, D1, D2.1, D2.2, D2.3, B4, E4, F, G, H all shipped)
 **Source Ref:** phase-76d
-**Depends on:** Phase 76 ✅, Phase 76b, Phase 76c
+**Depends on:** Phase 76 ✅, Phase 76b ✅, Phase 76c ✅
 **Goal:** Add PLT lazy resolution (`_dl_runtime_resolve`), `DT_GNU_HASH` lookup, and graceful `DT_VERSYM` / `DT_VERNEED` handling. Complete the Phase 76 dynamic-linker theme.
 
 ## Track Layout
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| S1 | `sym.rs` refactor — unified `lookup(scope, name, version)` API over the 76b `DT_HASH` backend + route 76b runtime reloc write-sites through `ldso_core::reloc` slice helpers | Phase 76b, 76c | Planned |
-| D1 | `DT_GNU_HASH` Bloom + bucket + chain lookup; dispatcher prefers GNU over SysV | S1 | Planned |
-| D2 | `DT_VERSYM` / `DT_VERNEED` / `DT_VERDEF` graceful handling | D1 | Planned |
-| B4 | `_dl_runtime_resolve` asm trampoline + GOT slot rewrite + lazy `JUMP_SLOT` deferral | S1 | Planned |
-| E4 | `LD_BIND_NOW` environment variable honored | B4 | Planned |
-| F | New gate variant: a `.so` built with `-Wl,--hash-style=gnu` runs end-to-end | B4, D1 | Planned |
-| G | New gate variant: a versioned `.so` (with `DT_VERSYM` / `DT_VERNEED`) loads end-to-end, with mismatch-fallback and `LD_BIND_NOW` strict-mode coverage | D2, E4 | Planned |
-| H | docs/76-dynamic-linker.md polish-pass + kernel version bump + mark Phase 76 family Complete | All | Planned |
+| S1 | `sym.rs` refactor — unified `lookup(scope, name, version)` API over the 76b `DT_HASH` backend + route 76b runtime reloc write-sites through `ldso_core::reloc` slice helpers | Phase 76b, 76c | ✅ Complete |
+| D1 | `DT_GNU_HASH` Bloom + bucket + chain lookup; dispatcher prefers GNU over SysV | S1 ✅ | ✅ Complete (end-to-end gate ships with F) |
+| D2 | `DT_VERSYM` / `DT_VERNEED` / `DT_VERDEF` parser (D2.1) + runtime version-aware lookup (D2.2) + `LD_BIND_NOW` strict mode (D2.3) | D1 ✅ | ✅ Complete (parser + 4 host tests in `ldso_core::ver`; runtime `sym::lookup` is version-aware; strict-mode hard fail on mismatch when `plt::BIND_NOW=true`) |
+| B4 | `_dl_runtime_resolve` asm trampoline + GOT slot rewrite + lazy `JUMP_SLOT` deferral | S1 ✅ | ✅ Complete |
+| E4 | `LD_BIND_NOW` environment variable honored | B4 ✅ | ✅ Complete (env walk wired; F.3 gates) |
+| F | New gate variant: a `.so` built with `-Wl,--hash-style=gnu` runs end-to-end | B4 ✅, D1 ✅ | ✅ Complete |
+| G | New gate variant: a versioned `.so` (with `DT_VERSYM` / `DT_VERNEED`) loads end-to-end, with mismatch-fallback and `LD_BIND_NOW` strict-mode coverage | D2 ✅, E4 ✅ | ✅ Complete (`dynlink-hello-versioned-smoke` + `dynlink-hello-versioned-mismatch-smoke` gates; default mode asserts D2.2 fallback to `HELLO_FROM_V2_FALLBACK:OK`; `LD_BIND_NOW=1` asserts D2.3 strict-error non-zero exit) |
+| H | docs/76-dynamic-linker.md polish-pass + kernel version bump + mark Phase 76 family Complete | All | ✅ Complete (kernel bumped to 0.76.3; `docs/76-dynamic-linker.md` extended with full 76d section; all four Phase 76 family rows in `docs/roadmap/README.md` flipped to Complete; `AGENTS.md` project-overview updated) |
 
 ---
 

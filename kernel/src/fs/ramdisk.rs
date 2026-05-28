@@ -344,6 +344,30 @@ static DYNLINK_CYCLE_ELF: &[u8] = generated_initrd_asset!("dynlink_cycle");
 // `libhello_fini.so`. Drives the dlopen-test-smoke gate.
 static DLOPEN_TEST_ELF: &[u8] = generated_initrd_asset!("dlopen_test");
 
+// Phase 76d.F — `dynlink_hello_gnu` musl-built dynamic ELF with
+// PT_INTERP + DT_NEEDED libhello_gnu.so, both built with
+// `--hash-style=gnu`. Exercises Phase 76d.D1's GNU hash backend end
+// to end via the bring-up linker plus B4's lazy PLT resolve. Also
+// emits BIND_NOW:{0,1} (resolution mode) and WX_CHECK:OK (F.4 W^X
+// invariant) sentinels for the dynlink-hello-gnu-smoke gate.
+static DYNLINK_HELLO_GNU_ELF: &[u8] = generated_initrd_asset!("dynlink_hello_gnu");
+
+// Phase 76d.G — `dynlink_hello_versioned` musl-built dynamic ELF
+// with PT_INTERP + DT_NEEDED libhello_versioned.so. The lib's
+// `--version-script` exports `hello_str` under symbol version
+// `LIBHELLO_1.0`; the consumer's `DT_VERNEED` carries the matching
+// requirement. Exercises Phase 76d.D2.2 version-aware lookup end to
+// end via the dynlink-hello-versioned-smoke gate.
+static DYNLINK_HELLO_VERSIONED_ELF: &[u8] = generated_initrd_asset!("dynlink_hello_versioned");
+
+// Phase 76d.G.3 — `dynlink_hello_versioned_mismatch`. Linked against
+// a stub lib that defines `hello_str@LIBHELLO_1.0`, runs at boot
+// against the REAL v2 lib that only defines `hello_str@LIBHELLO_2.0`
+// plus an unversioned `hello_str`. Drives the mismatch-fallback +
+// LD_BIND_NOW strict-mode gates.
+static DYNLINK_HELLO_VERSIONED_MISMATCH_ELF: &[u8] =
+    generated_initrd_asset!("dynlink_hello_versioned_mismatch");
+
 // Phase 70 follow-up — `doom-concurrent` forks two `doom` processes
 // and waits for both. Run from the post-login shell by `cargo xtask
 // doom-concurrent-smoke` to assert real kernel-level concurrency
@@ -639,6 +663,32 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "dynlink_cycle",
         RamdiskNode::File {
             content: DYNLINK_CYCLE_ELF,
+        },
+    ),
+    // Phase 76d.F: dynlink_hello_gnu — exercises GNU-hash backend +
+    // PLT lazy resolve end-to-end. Drives the dynlink-hello-gnu-smoke
+    // gate.
+    (
+        "dynlink_hello_gnu",
+        RamdiskNode::File {
+            content: DYNLINK_HELLO_GNU_ELF,
+        },
+    ),
+    // Phase 76d.G: dynlink_hello_versioned — exercises version-aware
+    // lookup end-to-end. Drives the dynlink-hello-versioned-smoke
+    // gate.
+    (
+        "dynlink_hello_versioned",
+        RamdiskNode::File {
+            content: DYNLINK_HELLO_VERSIONED_ELF,
+        },
+    ),
+    // Phase 76d.G.3: dynlink_hello_versioned_mismatch — drives the
+    // mismatch-fallback + LD_BIND_NOW strict-mode gates.
+    (
+        "dynlink_hello_versioned_mismatch",
+        RamdiskNode::File {
+            content: DYNLINK_HELLO_VERSIONED_MISMATCH_ELF,
         },
     ),
     // Phase 76c: dlopen_test — exercises dlopen / dlsym / dlclose /

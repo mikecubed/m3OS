@@ -54,18 +54,20 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod dl;
+pub(crate) mod plt;
+pub(crate) mod sym;
 
 use core::arch::naked_asm;
 use core::panic::PanicInfo;
 
 use ldso_core::dynlink::{
-    DsoId, DynamicSection, LoadedDso, MAX_DSOS, MAX_NEEDED, TopoError, elf_hash, topo_sort,
+    DsoId, DynamicSection, LoadedDso, MAX_DSOS, MAX_NEEDED, TopoError, topo_sort,
 };
 use ldso_core::elf64::{
     DT_NULL, Dyn, PT_DYNAMIC, PT_LOAD, Phdr, R_X86_64_64, R_X86_64_GLOB_DAT, R_X86_64_JUMP_SLOT,
     R_X86_64_RELATIVE, Rela, Sym, r_sym, r_type,
 };
-use ldso_core::reloc::apply_abs64;
+use ldso_core::reloc::{apply_abs64, apply_glob_dat, apply_relative};
 
 // ---------------------------------------------------------------------------
 // AT_* constants (subset we read).
@@ -264,18 +266,34 @@ fn serial_hex(mut value: u64) {
 /// own load image, and the call must occur before any Rust global is
 /// dereferenced through a GOT-routed read.
 unsafe fn dl_relocate_self(phdr_base: *const Phdr, phnum: usize, load_bias: u64) {
-    // Find PT_DYNAMIC for the linker's image.
+    // Find PT_DYNAMIC for the linker's image. Simultaneously compute
+    // the image span so the per-RELA slice view passed into
+    // `apply_relative` carries a real bound — Phase 76d.S1.3 routes
+    // every write-site through the `ldso_core::reloc` slice helpers
+    // so the runtime hits the same alignment + bounds path that the
+    // host tests pin.
     let mut dyn_ptr: *const Dyn = core::ptr::null();
+    let mut image_end: u64 = 0;
     for i in 0..phnum {
         let ph = unsafe { &*phdr_base.add(i) };
+        if ph.p_type == PT_LOAD {
+            let end = ph.p_vaddr.wrapping_add(ph.p_memsz);
+            if end > image_end {
+                image_end = end;
+            }
+        }
         if ph.p_type == PT_DYNAMIC {
             dyn_ptr = (load_bias.wrapping_add(ph.p_vaddr)) as *const Dyn;
-            break;
         }
     }
     if dyn_ptr.is_null() {
         return; // No PT_DYNAMIC ⇒ no relocations to apply.
     }
+    let image_len = if image_end == 0 {
+        0
+    } else {
+        ((image_end + 4095) & !4095) as usize
+    };
     // Walk DT_RELA / DT_RELASZ inline (no allocation, no helper).
     let mut rela: *const Rela = core::ptr::null();
     let mut relasz: u64 = 0;
@@ -302,13 +320,24 @@ unsafe fn dl_relocate_self(phdr_base: *const Phdr, phnum: usize, load_bias: u64)
         let r = unsafe { *rela.add(i) };
         let t = r_type(r.r_info);
         if t == R_X86_64_RELATIVE {
-            let target = (load_bias.wrapping_add(r.r_offset)) as *mut u64;
-            let value = load_bias.wrapping_add(r.r_addend as u64);
-            // `write_unaligned` keeps this safe even if a malformed
-            // (or future tooling-generated) RELA in the linker's own
-            // image carries a non-8-byte-aligned `r_offset`. Rust's
-            // aligned `ptr::write` would be UB in that case.
-            unsafe { core::ptr::write_unaligned(target, value) };
+            // Route through the host-tested `apply_relative` slice
+            // helper. The slice covers the whole image; the helper
+            // writes 8 bytes at `r.r_offset` and bounds-checks the
+            // range internally. The slice is re-borrowed per iteration
+            // so it does not overlap with the raw-pointer read of the
+            // next RELA above.
+            //
+            // SAFETY: the linker's own image is mapped RW (text was
+            // not yet mprotected R-X — the kernel maps the linker
+            // with the same load flags as any PIE), and we are
+            // single-threaded. No other code holds a slice into the
+            // image while this loop runs.
+            let image: &mut [u8] =
+                unsafe { core::slice::from_raw_parts_mut(load_bias as *mut u8, image_len) };
+            if let Err(_e) = apply_relative(&r, load_bias, image) {
+                serial(b"ldso: dl_relocate_self: apply_relative failed\n");
+                sys_exit(ELIBBAD_CODE);
+            }
         } else {
             // Any other relocation type in the linker's own image is
             // a build-time bug — the bring-up linker is built with
@@ -474,6 +503,89 @@ fn validate_dyn_pointers(
         // before lookup_symbol dereferences it.
         return Err("DT_HASH header outside image");
     }
+    if let Some(p) = d.gnu_hash
+        && !range_in_image(p.as_ptr() as u64, 16)
+    {
+        // Phase 76d.D1 — need at least the 16-byte (nbuckets,
+        // symoffset, bloom_size, bloom_shift) header in range before
+        // `sym::lookup_gnu` reads it.
+        return Err("DT_GNU_HASH header outside image");
+    }
+    if let Some(p) = d.pltgot
+        && !range_in_image(p.as_ptr() as u64, 24)
+    {
+        // Phase 76d.B4 — `plt::install_trampoline` writes GOT[1] and
+        // GOT[2] via this pointer (offsets +8 and +16 bytes), so the
+        // first three `u64` slots must lie inside the DSO image.
+        // Without this check a malformed `DT_PLTGOT` could redirect
+        // those writes into unrelated process memory.
+        return Err("DT_PLTGOT (first 3 slots) outside image");
+    }
+    // Phase 76d round-7 — alignment hardening. The range checks above
+    // prove each pointer lands inside the image but NOT that it carries
+    // the natural alignment of the type the lookup/relocation paths read
+    // through it. A malformed DSO can supply an in-range yet misaligned
+    // pointer; the typed `*const u16` / `*const u32` / `*const u64` /
+    // `*const Rela` dereferences in `sym::lookup_gnu` / `lookup_sysv`,
+    // `versym_entry`, `consumer_required_version`, `crate::sym_entry`,
+    // `plt::install_trampoline`, `plt::resolve_pltrel`, and `apply_rela`
+    // would then be Undefined Behaviour even on x86_64 (which tolerates
+    // unaligned scalar loads in hardware). Reject misaligned tables here,
+    // before any typed pointer is formed. Required alignment is the read
+    // width: `DT_VERSYM` reads `u16` (2); `DT_HASH` reads `u32` (4);
+    // `DT_GNU_HASH` needs 8 because its bloom array is `u64`; `DT_SYMTAB`
+    // (`Elf64_Sym`), `DT_PLTGOT` (`u64` GOT slots), and `DT_RELA` /
+    // `DT_JMPREL` (`Elf64_Rela`) all read 8-byte fields, so 8.
+    if let Some(p) = d.hash
+        && !ldso_core::bounds::is_aligned(p.as_ptr() as u64, 4)
+    {
+        return Err("DT_HASH misaligned");
+    }
+    if let Some(p) = d.gnu_hash
+        && !ldso_core::bounds::is_aligned(p.as_ptr() as u64, 8)
+    {
+        return Err("DT_GNU_HASH misaligned");
+    }
+    if let Some(p) = d.symtab
+        && !ldso_core::bounds::is_aligned(p.as_ptr() as u64, 8)
+    {
+        return Err("DT_SYMTAB misaligned");
+    }
+    if let Some(p) = d.pltgot
+        && !ldso_core::bounds::is_aligned(p.as_ptr() as u64, 8)
+    {
+        return Err("DT_PLTGOT misaligned");
+    }
+    if let Some(p) = d.versym
+        && !ldso_core::bounds::is_aligned(p.as_ptr() as u64, 2)
+    {
+        return Err("DT_VERSYM misaligned");
+    }
+    if let Some(p) = d.rela
+        && !ldso_core::bounds::is_aligned(p.as_ptr() as u64, 8)
+    {
+        return Err("DT_RELA misaligned");
+    }
+    if let Some(p) = d.jmprel
+        && !ldso_core::bounds::is_aligned(p.as_ptr() as u64, 8)
+    {
+        return Err("DT_JMPREL misaligned");
+    }
+    if let Some(p) = d.versym
+        && !in_image(p.as_ptr() as u64)
+    {
+        return Err("DT_VERSYM outside image");
+    }
+    if let Some(p) = d.verdef
+        && !in_image(p.as_ptr() as u64)
+    {
+        return Err("DT_VERDEF outside image");
+    }
+    if let Some(p) = d.verneed
+        && !in_image(p.as_ptr() as u64)
+    {
+        return Err("DT_VERNEED outside image");
+    }
     if let Some(p) = d.rela
         && !range_in_image(p.as_ptr() as u64, d.relasz)
     {
@@ -493,6 +605,19 @@ fn validate_dyn_pointers(
         && !range_in_image(p.as_ptr() as u64, d.init_arraysz)
     {
         return Err("DT_INIT_ARRAY + DT_INIT_ARRAYSZ outside image");
+    }
+    // Phase 76c parsed DT_FINI / DT_FINI_ARRAY but the original
+    // validation only covered the init side; `run_destructors_for`
+    // walks these at dlclose, so they need the same range guard.
+    if let Some(p) = d.fini
+        && !in_image(p.as_ptr() as u64)
+    {
+        return Err("DT_FINI outside image");
+    }
+    if let Some(p) = d.fini_array
+        && !range_in_image(p.as_ptr() as u64, d.fini_arraysz)
+    {
+        return Err("DT_FINI_ARRAY + DT_FINI_ARRAYSZ outside image");
     }
     Ok(())
 }
@@ -526,6 +651,36 @@ pub(crate) unsafe fn strtab_get(strtab: *const u8, off: u64, strsz: u64) -> &'st
     let p = unsafe { strtab.add(off as usize) };
     let len = unsafe { strlen_bounded(p, (strsz - off) as usize) };
     unsafe { core::slice::from_raw_parts(p, len) }
+}
+
+/// Read `DT_SYMTAB[sym_idx]` (a 24-byte `Elf64_Sym`) only when the
+/// entry lies inside the DSO image. ELF carries no symbol *count* in
+/// `PT_DYNAMIC`, so `validate_dyn_pointers` can only check the symtab
+/// *base*; this per-index guard is what keeps reads driven by an
+/// untrusted `sym_idx` (from a hash-chain walk or a relocation's
+/// `r_info`) inside `load_bias + image_len`. Returns `None` when the
+/// computed entry would run past the image; reads unconditionally when
+/// `image_len == 0` (placeholder DSO, no bound known). `Sym` is `Copy`
+/// (24 bytes) so the entry is returned by value.
+pub(crate) unsafe fn sym_entry(
+    symtab: *const Sym,
+    sym_idx: u32,
+    load_bias: u64,
+    image_len: u64,
+) -> Option<Sym> {
+    let entry_size = core::mem::size_of::<Sym>() as u64;
+    if image_len > 0
+        && !ldso_core::bounds::elem_in_image(
+            symtab as u64,
+            sym_idx as u64,
+            entry_size,
+            load_bias,
+            image_len,
+        )
+    {
+        return None;
+    }
+    Some(unsafe { *symtab.add(sym_idx as usize) })
 }
 
 // ---------------------------------------------------------------------------
@@ -811,59 +966,63 @@ unsafe fn load_dso_impl(fd: i64, scratch: u64, scratch_len: u64) -> Result<Loade
 }
 
 // ---------------------------------------------------------------------------
-// Symbol lookup across the loaded-DSO list.
-// ---------------------------------------------------------------------------
-
-/// Resolve a symbol name by walking the SysV `DT_HASH` table of each
-/// loaded DSO in search order (main binary first, then deps in load
-/// order — matches the SysV global scope).
-unsafe fn lookup_symbol(name: &[u8], dsos: &[LoadedDso]) -> Option<u64> {
-    for dso in dsos {
-        let hash_ptr = match dso.dyn_.hash {
-            Some(p) => p.as_ptr(),
-            None => continue,
-        };
-        let symtab = match dso.dyn_.symtab {
-            Some(p) => p.as_ptr(),
-            None => continue,
-        };
-        let strtab = match dso.dyn_.strtab {
-            Some(p) => p.as_ptr(),
-            None => continue,
-        };
-        let nbuckets = unsafe { *hash_ptr } as usize;
-        let nchain = unsafe { *hash_ptr.add(1) } as usize;
-        if nbuckets == 0 {
-            continue;
-        }
-        let buckets = unsafe { hash_ptr.add(2) };
-        let chain = unsafe { buckets.add(nbuckets) };
-        let h = elf_hash(name);
-        let mut idx = unsafe { *buckets.add(h as usize % nbuckets) };
-        let mut hops = 0usize;
-        while idx != 0 && hops <= nchain {
-            if (idx as usize) >= nchain {
-                break;
-            }
-            let sym = unsafe { &*symtab.add(idx as usize) };
-            let nm = unsafe { strtab_get(strtab, sym.st_name as u64, dso.dyn_.strsz) };
-            if nm == name && sym.st_value != 0 {
-                return Some(dso.load_bias.wrapping_add(sym.st_value));
-            }
-            idx = unsafe { *chain.add(idx as usize) };
-            hops += 1;
-        }
-    }
-    None
-}
-
-// ---------------------------------------------------------------------------
 // Relocation walker (Track B3.1 / B3.2 / B3.3).
 // ---------------------------------------------------------------------------
 
+/// Phase 76d.D2.2 — translate the consumer's `versym[sym_idx]` into a
+/// required version-name byte slice the per-DSO version-matcher
+/// (`sym::dso_version_matches`) can compare against the provider's
+/// `DT_VERDEF`.
+///
+/// Returns:
+///   * `None` when the consumer has no `DT_VERSYM` (unversioned —
+///     Phase 76b/c semantics, any provider satisfies any request).
+///   * `None` when the symbol's version index is the special LOCAL
+///     (0) or GLOBAL (1) — those are the unversioned default and any
+///     provider satisfies them.
+///   * `Some(name)` when the consumer's `DT_VERNEED` records carry a
+///     `Vernaux` with matching `vna_other`.
+///
+/// `load_bias` / `image_len` bound the `versym[sym_idx]` read to the
+/// consumer's mapped image: `validate_dyn_pointers` only checks the
+/// `DT_VERSYM` base, so a malformed relocation or symbol index could
+/// otherwise drive an out-of-image read here. An out-of-range index
+/// (or `image_len == 0`, the placeholder shape) yields `None` (no
+/// version requirement) — mirrors `sym::versym_entry`.
+///
+/// # Safety
+/// If `versym_ptr` is `Some`, the bytes for `versym[sym_idx]` are read
+/// only after the per-index range check against `load_bias +
+/// image_len` passes (or unconditionally when `image_len == 0`). The
+/// `ver_table.verneed_bytes` slice must reference the consumer's
+/// mapped image.
+pub(crate) fn consumer_required_version<'a>(
+    versym_ptr: Option<*mut u16>,
+    sym_idx: u32,
+    load_bias: u64,
+    image_len: u64,
+    ver_table: &ldso_core::ver::VersionTable<'a>,
+) -> Option<&'a [u8]> {
+    let p = versym_ptr?;
+    if image_len > 0
+        && !ldso_core::bounds::elem_in_image(p as u64, sym_idx as u64, 2, load_bias, image_len)
+    {
+        return None;
+    }
+    let raw = unsafe { *p.add(sym_idx as usize) };
+    let version_index = raw & ldso_core::ver::VERSYM_VERSION_MASK;
+    if version_index == ldso_core::ver::VER_NDX_LOCAL
+        || version_index == ldso_core::ver::VER_NDX_GLOBAL
+    {
+        return None;
+    }
+    ver_table.required_version_name_by_index(version_index)
+}
+
 /// Walk a `Rela` table at `table` of `count` entries and apply each
 /// relocation against `dso.load_bias`. Symbol resolution routes
-/// through [`lookup_symbol`] against the full loaded-DSO list.
+/// through [`sym::lookup`] (Phase 76d.S1.1's unified dispatch) against
+/// the full loaded-DSO list.
 unsafe fn apply_rela(
     dso: &LoadedDso,
     table: *const Rela,
@@ -877,6 +1036,35 @@ unsafe fn apply_rela(
     let symtab = match dso.dyn_.symtab {
         Some(p) => p.as_ptr(),
         None => core::ptr::null(),
+    };
+    // Phase 76d.D2.2 — consumer-side version metadata. For each
+    // symbol-relocation we read `versym[sym_idx]` and translate via
+    // the consumer's `DT_VERNEED` to a required version-name string,
+    // which `sym::lookup` then matches against the provider's
+    // `DT_VERSYM` + `DT_VERDEF`. DSOs with no `DT_VERSYM` (unversioned
+    // consumers) pass `None` and Phase 76b/c behaviour holds.
+    let versym_ptr = dso.dyn_.versym.map(|p| p.as_ptr());
+    let verneed_bytes: &[u8] = match (dso.dyn_.verneed, dso.dyn_.verneednum) {
+        (Some(p), n) if n > 0 && dso.image_len != 0 => {
+            let base = p.as_ptr() as u64;
+            let image_end = dso.load_bias.saturating_add(dso.image_len);
+            let len = image_end.saturating_sub(base) as usize;
+            unsafe { core::slice::from_raw_parts(p.as_ptr(), len) }
+        }
+        _ => &[],
+    };
+    let strtab_bytes: &[u8] = if strtab.is_null() {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(strtab, dso.dyn_.strsz as usize) }
+    };
+    let ver_table = ldso_core::ver::VersionTable {
+        versym: &[],
+        verdef_bytes: &[],
+        verdef_num: 0,
+        verneed_bytes,
+        verneed_num: dso.dyn_.verneednum as usize,
+        strtab: strtab_bytes,
     };
     for i in 0..count {
         let r = unsafe { *table.add(i) };
@@ -892,52 +1080,166 @@ unsafe fn apply_rela(
             serial(b"ldso: relocation r_offset outside image\n");
             return Err("relocation outside image");
         }
-        let target = (dso.load_bias.wrapping_add(r.r_offset)) as *mut u64;
         let rt = r_type(r.r_info);
         match rt {
             R_X86_64_RELATIVE => {
-                let value = dso.load_bias.wrapping_add(r.r_addend as u64);
-                // See dl_relocate_self: `write_unaligned` avoids UB on
-                // malformed (or future-tooling) RELAs whose `r_offset`
-                // is not 8-byte aligned.
-                unsafe { core::ptr::write_unaligned(target, value) };
+                // Phase 76d.S1.3: route through the host-tested
+                // `apply_relative` slice helper so the runtime hits
+                // the same alignment + bounds path the host tests
+                // pin. The slice covers the whole image; the helper
+                // writes 8 bytes at `r.r_offset` and bounds-checks
+                // the range internally.
+                //
+                // SAFETY: `dso.load_bias` and `dso.image_len` came
+                // from `load_dso_impl` (or the main-binary loader)
+                // and reference a live mmap. We are single-threaded.
+                let image: &mut [u8] = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        dso.load_bias as *mut u8,
+                        dso.image_len as usize,
+                    )
+                };
+                if let Err(_e) = apply_relative(&r, dso.load_bias, image) {
+                    serial(b"ldso: apply_relative failed\n");
+                    return Err("apply_relative failed");
+                }
             }
-            R_X86_64_GLOB_DAT | R_X86_64_JUMP_SLOT => {
+            R_X86_64_GLOB_DAT => {
                 if strtab.is_null() || symtab.is_null() {
                     return Err("missing strtab/symtab for sym reloc");
                 }
                 let sym_idx = r_sym(r.r_info);
-                let sym = unsafe { &*symtab.add(sym_idx as usize) };
+                let sym = match unsafe { sym_entry(symtab, sym_idx, dso.load_bias, dso.image_len) }
+                {
+                    Some(s) => s,
+                    None => return Err("symbol index outside image"),
+                };
                 let name = unsafe { strtab_get(strtab, sym.st_name as u64, dso.dyn_.strsz) };
-                let value = unsafe { lookup_symbol(name, dsos).unwrap_or(0) };
+                let version = consumer_required_version(
+                    versym_ptr,
+                    sym_idx,
+                    dso.load_bias,
+                    dso.image_len,
+                    &ver_table,
+                );
+                let value = unsafe { sym::lookup(dsos, name, version).unwrap_or(0) };
                 if value == 0 {
                     serial(b"ldso: undefined symbol ");
                     serial(name);
                     serial(b"\n");
                     return Err("undefined symbol");
                 }
-                unsafe { core::ptr::write_unaligned(target, value) };
+                // Phase 76d.S1.3: route through `apply_glob_dat` slice
+                // helper. The helper writes 8 bytes at `r.r_offset`
+                // and bounds-checks the range internally.
+                let image: &mut [u8] = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        dso.load_bias as *mut u8,
+                        dso.image_len as usize,
+                    )
+                };
+                if let Err(_e) = apply_glob_dat(&r, dso.load_bias, value, image) {
+                    serial(b"ldso: apply_glob_dat failed\n");
+                    return Err("apply_glob_dat failed");
+                }
+            }
+            R_X86_64_JUMP_SLOT => {
+                // Phase 76d.B4.4 — JUMP_SLOT is lazy by default once
+                // the trampoline is installed. The dispatcher path:
+                //
+                //   * BIND_NOW=true (Phase 76b/c behaviour, kept as
+                //     the initial default) — resolve immediately,
+                //     write the absolute address into the GOT slot.
+                //     Identical to the GLOB_DAT path above.
+                //   * BIND_NOW=false (E4 default) — leave the static
+                //     linker's image-relative offset alone but add
+                //     `load_bias` so the first call lands on the
+                //     PLT's plt0 stub, which jumps to
+                //     `_dl_runtime_resolve` via `GOT[2]`.
+                //
+                // The trampoline target at `GOT[2]` and the link-map
+                // at `GOT[1]` are installed by
+                // `plt::install_trampoline` after relocations and
+                // before constructors run.
+                if plt::bind_now_set() {
+                    if strtab.is_null() || symtab.is_null() {
+                        return Err("missing strtab/symtab for sym reloc");
+                    }
+                    let sym_idx = r_sym(r.r_info);
+                    let sym =
+                        match unsafe { sym_entry(symtab, sym_idx, dso.load_bias, dso.image_len) } {
+                            Some(s) => s,
+                            None => return Err("symbol index outside image"),
+                        };
+                    let name = unsafe { strtab_get(strtab, sym.st_name as u64, dso.dyn_.strsz) };
+                    let version = consumer_required_version(
+                        versym_ptr,
+                        sym_idx,
+                        dso.load_bias,
+                        dso.image_len,
+                        &ver_table,
+                    );
+                    let value = unsafe { sym::lookup(dsos, name, version).unwrap_or(0) };
+                    if value == 0 {
+                        serial(b"ldso: undefined symbol ");
+                        serial(name);
+                        serial(b"\n");
+                        return Err("undefined symbol");
+                    }
+                    let image: &mut [u8] = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            dso.load_bias as *mut u8,
+                            dso.image_len as usize,
+                        )
+                    };
+                    if let Err(_e) = apply_glob_dat(&r, dso.load_bias, value, image) {
+                        serial(b"ldso: apply_glob_dat (JUMP_SLOT eager) failed\n");
+                        return Err("apply_glob_dat failed");
+                    }
+                } else {
+                    // Lazy path — rebase the image-relative offset.
+                    unsafe { plt::apply_jmprel_lazy(dso, &r) };
+                }
             }
             R_X86_64_64 => {
                 if strtab.is_null() || symtab.is_null() {
                     return Err("missing strtab/symtab for sym reloc");
                 }
                 let sym_idx = r_sym(r.r_info);
-                let sym = unsafe { &*symtab.add(sym_idx as usize) };
+                let sym = match unsafe { sym_entry(symtab, sym_idx, dso.load_bias, dso.image_len) }
+                {
+                    Some(s) => s,
+                    None => return Err("symbol index outside image"),
+                };
                 let name = unsafe { strtab_get(strtab, sym.st_name as u64, dso.dyn_.strsz) };
-                let value = unsafe { lookup_symbol(name, dsos).unwrap_or(0) };
+                let version = consumer_required_version(
+                    versym_ptr,
+                    sym_idx,
+                    dso.load_bias,
+                    dso.image_len,
+                    &ver_table,
+                );
+                let value = unsafe { sym::lookup(dsos, name, version).unwrap_or(0) };
                 if value == 0 {
                     return Err("undefined symbol (R_X86_64_64)");
                 }
-                let mut buf = [0u8; 8];
-                let img = unsafe { core::slice::from_raw_parts_mut(target as *mut u8, 8) };
-                let dummy_rela = Rela {
-                    r_offset: 0,
-                    r_info: 0,
-                    r_addend: r.r_addend,
+                // Route through `apply_abs64` against the FULL image
+                // slice (matching the RELATIVE / GLOB_DAT arms) so the
+                // helper bounds-checks `r.r_offset` against the image
+                // before writing. The earlier narrow-8-byte-slice shape
+                // applied apply_abs64's bound to a throwaway buffer and
+                // then blind-copied to `load_bias + r_offset`, leaving
+                // the real write target unbounded on a corrupt reloc.
+                let image: &mut [u8] = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        dso.load_bias as *mut u8,
+                        dso.image_len as usize,
+                    )
                 };
-                apply_abs64(&dummy_rela, 0, value, &mut buf).map_err(|_| "abs64 failed")?;
-                img.copy_from_slice(&buf);
+                if let Err(_e) = apply_abs64(&r, dso.load_bias, value, image) {
+                    serial(b"ldso: apply_abs64 failed\n");
+                    return Err("apply_abs64 failed");
+                }
             }
             _ => {
                 serial(b"ldso: unsupported reloc type ");
@@ -1125,6 +1427,62 @@ unsafe fn parse_auxv(stack: *const u64) -> (u64, *const Phdr, usize, u64) {
     (at_base, at_phdr, at_phnum, at_entry)
 }
 
+/// Phase 76d.E4.1 — Walk `envp` for `LD_BIND_NOW`. Returns `true` when
+/// the variable is present and its value is neither empty
+/// (`LD_BIND_NOW=`) nor the single character `0` (`LD_BIND_NOW=0`);
+/// every other non-empty value enables eager binding. So
+/// `LD_BIND_NOW=1`, `LD_BIND_NOW=true`, and `LD_BIND_NOW=anything` all
+/// enable it, while `LD_BIND_NOW=0` and an empty value disable it.
+/// (Note: multi-character forms like `00` are NOT special-cased — only
+/// the exact one-byte `0` disables; this matches the "set unless empty
+/// or exactly 0" rule, not a full numeric parse.)
+///
+/// The `=0` carve-out exists because the conventional shell idiom for
+/// disabling the flag is `unset LD_BIND_NOW` (which removes it from
+/// envp), but a developer who set it once and wants to opt out without
+/// clearing the env spelling expects `LD_BIND_NOW=0` to disable.
+///
+/// # Safety
+/// `stack` must be the genuine kernel-built SysV stack.
+unsafe fn read_ld_bind_now(stack: *const u64) -> bool {
+    // envp starts at `stack + 1 + argc + 1`.
+    let argc = unsafe { *stack } as usize;
+    let mut p = unsafe { stack.add(1).add(argc).add(1) } as *const *const u8;
+    loop {
+        let entry = unsafe { *p };
+        if entry.is_null() {
+            return false;
+        }
+        // Match "LD_BIND_NOW=" prefix; tolerate truncation. Stop at
+        // the first NUL terminator so a shorter env string can never
+        // drag the loop past its mapped length, even if a future
+        // PREFIX edit ever added embedded NUL bytes.
+        const PREFIX: &[u8] = b"LD_BIND_NOW=";
+        let mut ok = true;
+        for (i, want) in PREFIX.iter().enumerate() {
+            let b = unsafe { *entry.add(i) };
+            if b == 0 || b != *want {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            let val_start = unsafe { entry.add(PREFIX.len()) };
+            let first = unsafe { *val_start };
+            // Empty value → not set.
+            if first == 0 {
+                return false;
+            }
+            // Single-char "0" → off (also "0\0", regardless of trailing).
+            if first == b'0' && unsafe { *val_start.add(1) } == 0 {
+                return false;
+            }
+            return true;
+        }
+        p = unsafe { p.add(1) };
+    }
+}
+
 /// The bring-up driver. Returns the main binary's `AT_ENTRY` value
 /// for the asm caller to `jmp` to. Returns 0 on any unrecoverable
 /// error (the asm caller will then `jmp 0` and the kernel reports a
@@ -1137,11 +1495,23 @@ unsafe fn parse_auxv(stack: *const u64) -> (u64, *const Phdr, usize, u64) {
 /// `_start` and never invokes this function from any other context.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
-    serial(b"ldso(76c): _dlstart\n");
+    serial(b"ldso(76d): _dlstart\n");
     let (at_base, at_phdr, at_phnum, at_entry) = unsafe { parse_auxv(stack) };
     if at_phdr.is_null() || at_phnum == 0 || at_entry == 0 {
         serial(b"ldso: missing AT_PHDR/AT_PHNUM/AT_ENTRY\n");
         return 0;
+    }
+
+    // -- Phase 76d.E4.1 — Read `LD_BIND_NOW` from envp BEFORE any
+    // relocation pass runs, so apply_rela's JUMP_SLOT arm sees the
+    // correct mode. The flag flips `plt::BIND_NOW` from POSIX-default
+    // lazy (false) to eager (true) when the variable is non-empty
+    // and non-zero. Track D2.3 also reads `plt::BIND_NOW` for the
+    // strict-mode version-mismatch handler.
+    let bind_now = unsafe { read_ld_bind_now(stack) };
+    if bind_now {
+        plt::BIND_NOW.store(true, core::sync::atomic::Ordering::Release);
+        serial(b"ldso(76d): LD_BIND_NOW=1 (eager resolve)\n");
     }
 
     // -- Self-relocation ----------------------------------------------------
@@ -1517,6 +1887,16 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
         }
     }
 
+    // -- Phase 76d.B4.3 — Install the PLT lazy-resolve trampoline
+    // addresses into each DSO's GOT, BEFORE publication so the
+    // post-publication path can read `link_map` from `DL_STATE`.
+    //
+    // Wait — install_trampoline needs a stable link_map pointer.
+    // `DL_STATE.dsos[i]` is the only stable address we have, but
+    // publication moves the dsos into that array. So we must install
+    // AFTER publication. See the second `install_trampoline` loop
+    // below, after the publication block.
+
     // -- Publish bring-up state into `DL_STATE` so the libdl entry
     // points have something to operate on after handoff.
     //
@@ -1545,6 +1925,31 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
         }
         state.n_slots_used = n_dsos;
         state.initialized = true;
+    }
+
+    // -- Phase 76d.B4.3 — Install the PLT lazy-resolve trampoline
+    // for every DSO that carries a `DT_PLTGOT` (which is every DSO
+    // with a PLT). The link-map pointer references the DSO's
+    // canonical slot inside `DL_STATE.dsos`, which is now populated
+    // and lives for the program's lifetime.
+    //
+    // The linker itself (slot 1, when self-injected) is skipped: it
+    // is built with `-Bsymbolic`-style flags so it has no JUMP_SLOTs
+    // and would otherwise install the trampoline against its own
+    // GOT, which the kernel mapped via `PT_INTERP` and which we do
+    // not re-walk.
+    {
+        let state = dl::dl_state_mut();
+        for i in 0..n_dsos {
+            if linker_slot == Some(i) {
+                continue;
+            }
+            let link_map = &state.dsos[i] as *const LoadedDso;
+            // SAFETY: `state.dsos[i]` was populated above and lives
+            // for the program lifetime; `DT_PLTGOT` was bounds-checked
+            // by `validate_dyn_pointers` at load time.
+            unsafe { plt::install_trampoline(&state.dsos[i], link_map) };
+        }
     }
 
     // -- Run constructors deepest-first -------------------------------------
