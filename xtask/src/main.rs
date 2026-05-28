@@ -2258,25 +2258,33 @@ fn build_libhello_versioned_v2_pair() -> Option<PathBuf> {
 /// Phase 76d.G.3 — build `dynlink_hello_versioned_mismatch`. Linked
 /// against the v2 stub (so its `DT_VERNEED` records `LIBHELLO_1.0`),
 /// runs against the real v2 lib at boot.
-fn build_dynlink_hello_versioned_mismatch(stub_path: &Path) {
+///
+/// Always writes `dst` — either the real binary or an empty
+/// placeholder — even when `stub_path` is `None` (v2 pair could not be
+/// built, e.g. musl-gcc missing). `target/generated-initrd/` is never
+/// wiped between builds, and the guest smoke-runner only SKIPs the gate
+/// on a missing/zero-size file, so leaving a stale non-empty binary
+/// would turn a "toolchain missing → SKIP" run into a confusing
+/// execute-and-fail. The empty-placeholder policy here matches every
+/// other dynlink artifact.
+fn build_dynlink_hello_versioned_mismatch(stub_path: Option<&Path>) {
     let root = workspace_root();
     let initrd = ensure_generated_initrd_dir(&root);
     let dst = initrd.join("dynlink_hello_versioned_mismatch");
     let src =
         root.join("userspace/dynlink_hello_versioned_mismatch/dynlink_hello_versioned_mismatch.c");
 
-    if !stub_path.exists()
-        || fs::metadata(stub_path)
-            .map(|m| m.len() == 0)
-            .unwrap_or(true)
-    {
-        eprintln!(
-            "warning: v2 stub missing at {} — skipping mismatch binary",
-            stub_path.display()
-        );
-        let _ = fs::write(&dst, b"");
-        return;
-    }
+    let stub_path = match stub_path {
+        Some(p) if p.exists() && fs::metadata(p).map(|m| m.len() > 0).unwrap_or(false) => p,
+        _ => {
+            eprintln!(
+                "warning: v2 stub unavailable — writing empty mismatch placeholder so the \
+                 smoke-runner SKIPs instead of executing a stale binary"
+            );
+            let _ = fs::write(&dst, b"");
+            return;
+        }
+    };
     let cc = match find_musl_cc() {
         Some(c) => c,
         None => {
@@ -3677,9 +3685,7 @@ fn build_kernel() -> PathBuf {
     // Phase 76d.G.3 — mismatch test pair (real v2 lib + stub for
     // link time + consumer that requests LIBHELLO_1.0 against a lib
     // that only provides LIBHELLO_2.0).
-    if let Some(stub_path) = build_libhello_versioned_v2_pair() {
-        build_dynlink_hello_versioned_mismatch(&stub_path);
-    }
+    build_dynlink_hello_versioned_mismatch(build_libhello_versioned_v2_pair().as_deref());
     build_musl_bins();
     // Phase 44: cross-compile musl-linked Rust userspace programs.
     build_musl_rust_bins();
@@ -4829,9 +4835,7 @@ fn cmd_check() {
     // Phase 76d.G.3 — mismatch test pair (real v2 lib + stub for
     // link time + consumer that requests LIBHELLO_1.0 against a lib
     // that only provides LIBHELLO_2.0).
-    if let Some(stub_path) = build_libhello_versioned_v2_pair() {
-        build_dynlink_hello_versioned_mismatch(&stub_path);
-    }
+    build_dynlink_hello_versioned_mismatch(build_libhello_versioned_v2_pair().as_deref());
     build_musl_bins();
     // Phase 44: cross-compile musl-linked Rust userspace programs.
     build_musl_rust_bins();
