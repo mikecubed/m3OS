@@ -8,6 +8,8 @@
 //!   shared by the modules above.
 //! * [`handle`]  — Phase 76c `dlopen`/`dlclose` handle-table slab
 //!   (host-testable).
+//! * [`bounds`]  — image-window range arithmetic shared by every
+//!   untrusted-index pointer read in the linker (host-testable).
 //!
 //! Everything in this library uses only `core::` so the same source
 //! compiles for the linker's `no_std` target build *and* the host
@@ -17,6 +19,7 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod bounds;
 pub mod dynlink;
 pub mod elf64;
 pub mod gnu_hash;

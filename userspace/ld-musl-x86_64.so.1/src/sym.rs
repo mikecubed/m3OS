@@ -185,13 +185,16 @@ unsafe fn lookup_in_dso(dso: &LoadedDso, name: &[u8]) -> Option<DsoHit> {
 /// is trusted.
 unsafe fn versym_entry(dso: &LoadedDso, sym_idx: u32) -> Option<u16> {
     let versym_ptr = dso.dyn_.versym?.as_ptr();
-    if dso.image_len > 0 {
-        let image_end = dso.load_bias.saturating_add(dso.image_len);
-        let entry_end =
-            (versym_ptr as u64).checked_add(((sym_idx as u64).checked_add(1)?).checked_mul(2)?)?;
-        if entry_end > image_end {
-            return None;
-        }
+    if dso.image_len > 0
+        && !ldso_core::bounds::elem_in_image(
+            versym_ptr as u64,
+            sym_idx as u64,
+            2,
+            dso.load_bias,
+            dso.image_len,
+        )
+    {
+        return None;
     }
     Some(unsafe { *versym_ptr.add(sym_idx as usize) })
 }
@@ -310,12 +313,19 @@ unsafe fn lookup_gnu(dso: &LoadedDso, name: &[u8]) -> Option<DsoHit> {
     // `bloom_size` / `nbuckets` could otherwise push subsequent
     // reads outside the image.
     if dso.image_len > 0 {
-        let image_end = dso.load_bias.saturating_add(dso.image_len);
-        let bloom_bytes = (bloom_size as u64).saturating_mul(8);
-        let buckets_bytes = (nbuckets as u64).saturating_mul(4);
-        let bloom_end = (bloom_ptr as u64).checked_add(bloom_bytes)?;
-        let buckets_end = (buckets_ptr as u64).checked_add(buckets_bytes)?;
-        if bloom_end > image_end || buckets_end > image_end {
+        let bloom_ok = ldso_core::bounds::range_in_image(
+            bloom_ptr as u64,
+            (bloom_size as u64).saturating_mul(8),
+            dso.load_bias,
+            dso.image_len,
+        );
+        let buckets_ok = ldso_core::bounds::range_in_image(
+            buckets_ptr as u64,
+            (nbuckets as u64).saturating_mul(4),
+            dso.load_bias,
+            dso.image_len,
+        );
+        if !bloom_ok || !buckets_ok {
             return None;
         }
     }
@@ -361,7 +371,7 @@ unsafe fn lookup_gnu(dso: &LoadedDso, name: &[u8]) -> Option<DsoHit> {
         }
         let h2 = unsafe { *hashes_ptr.add(chain_idx) };
         if (h | 1) == (h2 | 1) {
-            let sym = unsafe { &*symtab.add(sym_idx as usize) };
+            let sym = unsafe { crate::sym_entry(symtab, sym_idx, dso.load_bias, dso.image_len) }?;
             let nm = unsafe { crate::strtab_get(strtab, sym.st_name as u64, dso.dyn_.strsz) };
             if nm == name && sym.st_value != 0 {
                 return Some(DsoHit {
@@ -407,11 +417,14 @@ fn _gnu_hash_lookup_keepalive() -> GnuLookupOutcome {
 ///
 /// # Safety
 /// `dso.dyn_.hash` must reference at least 8 bytes of mapped memory
-/// (the `nbuckets`/`nchain` header); the bucket and chain arrays must
-/// fit within the DSO's image span. `validate_dyn_pointers` enforces
-/// the header bound; the chain-walk's `hops <= nchain` guard plus the
-/// `idx >= nchain` bail-out keep the in-loop reads bounded even on
-/// corrupt tables.
+/// (the `nbuckets`/`nchain` header); `validate_dyn_pointers` enforces
+/// that header bound. The bucket (`nbuckets`×`u32`) and chain
+/// (`nchain`×`u32`) arrays — whose lengths come from the untrusted
+/// header — are clamped against `load_bias + image_len` before any
+/// element is read, so a corrupt `nbuckets`/`nchain` cannot drive an
+/// out-of-image read. The symtab read routes through the bounded
+/// `crate::sym_entry`. (`image_len == 0` is the placeholder shape — the
+/// span is unknown and the legacy `nchain`-relative guards apply.)
 unsafe fn lookup_sysv(dso: &LoadedDso, name: &[u8]) -> Option<DsoHit> {
     let hash_ptr = dso.dyn_.hash?.as_ptr();
     let symtab = dso.dyn_.symtab?.as_ptr();
@@ -423,6 +436,25 @@ unsafe fn lookup_sysv(dso: &LoadedDso, name: &[u8]) -> Option<DsoHit> {
     }
     let buckets = unsafe { hash_ptr.add(2) };
     let chain = unsafe { buckets.add(nbuckets) };
+    // Clamp both arrays against the image span. Each entry is a `u32`
+    // (4 bytes); buckets has `nbuckets` entries, chain has `nchain`.
+    if dso.image_len > 0 {
+        let buckets_ok = ldso_core::bounds::range_in_image(
+            buckets as u64,
+            (nbuckets as u64).saturating_mul(4),
+            dso.load_bias,
+            dso.image_len,
+        );
+        let chain_ok = ldso_core::bounds::range_in_image(
+            chain as u64,
+            (nchain as u64).saturating_mul(4),
+            dso.load_bias,
+            dso.image_len,
+        );
+        if !buckets_ok || !chain_ok {
+            return None;
+        }
+    }
     let h = elf_hash(name);
     let mut idx = unsafe { *buckets.add(h as usize % nbuckets) };
     let mut hops = 0usize;
@@ -430,7 +462,7 @@ unsafe fn lookup_sysv(dso: &LoadedDso, name: &[u8]) -> Option<DsoHit> {
         if (idx as usize) >= nchain {
             break;
         }
-        let sym = unsafe { &*symtab.add(idx as usize) };
+        let sym = unsafe { crate::sym_entry(symtab, idx, dso.load_bias, dso.image_len) }?;
         let nm = unsafe { crate::strtab_get(strtab, sym.st_name as u64, dso.dyn_.strsz) };
         if nm == name && sym.st_value != 0 {
             return Some(DsoHit {

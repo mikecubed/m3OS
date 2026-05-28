@@ -221,8 +221,14 @@ pub unsafe extern "C" fn resolve_pltrel(link_map: *const LoadedDso, reloc_index:
         }
     };
     let sym_idx = r_sym(r.r_info);
-    let sym_entry = unsafe { &*symtab.add(sym_idx as usize) };
-    let name = unsafe { crate::strtab_get(strtab, sym_entry.st_name as u64, dso.dyn_.strsz) };
+    let sym = match unsafe { crate::sym_entry(symtab, sym_idx, dso.load_bias, dso.image_len) } {
+        Some(s) => s,
+        None => {
+            serial(b"plt: resolve_pltrel: symbol index outside image\n");
+            sys_exit(127);
+        }
+    };
+    let name = unsafe { crate::strtab_get(strtab, sym.st_name as u64, dso.dyn_.strsz) };
     // Phase 76d.D2.2 — read the consumer's `DT_VERSYM` /
     // `DT_VERNEED` to derive the required version name for this
     // symbol. `consumer_required_version` returns `None` for
@@ -269,6 +275,18 @@ pub unsafe extern "C" fn resolve_pltrel(link_map: *const LoadedDso, reloc_index:
         }
     };
     // Patch the GOT slot so subsequent calls skip the trampoline.
+    // `r.r_offset` is the in-image offset of the slot; bound the 8-byte
+    // write to the image (`r_offset + 8 <= image_len`) before writing,
+    // so a corrupt JMPREL entry cannot redirect the write out of image.
+    if dso.image_len != 0 {
+        match r.r_offset.checked_add(8) {
+            Some(end) if end <= dso.image_len => {}
+            _ => {
+                serial(b"plt: resolve_pltrel: GOT slot outside image\n");
+                sys_exit(127);
+            }
+        }
+    }
     let got_slot = (dso.load_bias.wrapping_add(r.r_offset)) as *mut u64;
     unsafe { core::ptr::write_unaligned(got_slot, addr) };
     addr
@@ -312,6 +330,15 @@ pub unsafe fn install_trampoline(dso: &LoadedDso, link_map: *const LoadedDso) {
 /// writable GOT region. The slot must currently hold an
 /// image-relative offset (the static linker's default).
 pub unsafe fn apply_jmprel_lazy(dso: &LoadedDso, r: &Rela) {
+    // `r.r_offset` is the in-image offset of the GOT slot; bound the
+    // 8-byte read+write to the image before touching it so a corrupt
+    // JMPREL entry cannot rebase memory outside the DSO.
+    if dso.image_len != 0 {
+        match r.r_offset.checked_add(8) {
+            Some(end) if end <= dso.image_len => {}
+            _ => return,
+        }
+    }
     let target = (dso.load_bias.wrapping_add(r.r_offset)) as *mut u64;
     let cur = unsafe { core::ptr::read_unaligned(target) };
     unsafe { core::ptr::write_unaligned(target, cur.wrapping_add(dso.load_bias)) };

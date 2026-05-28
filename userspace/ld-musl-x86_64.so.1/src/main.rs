@@ -556,6 +556,19 @@ fn validate_dyn_pointers(
     {
         return Err("DT_INIT_ARRAY + DT_INIT_ARRAYSZ outside image");
     }
+    // Phase 76c parsed DT_FINI / DT_FINI_ARRAY but the original
+    // validation only covered the init side; `run_destructors_for`
+    // walks these at dlclose, so they need the same range guard.
+    if let Some(p) = d.fini
+        && !in_image(p.as_ptr() as u64)
+    {
+        return Err("DT_FINI outside image");
+    }
+    if let Some(p) = d.fini_array
+        && !range_in_image(p.as_ptr() as u64, d.fini_arraysz)
+    {
+        return Err("DT_FINI_ARRAY + DT_FINI_ARRAYSZ outside image");
+    }
     Ok(())
 }
 
@@ -588,6 +601,36 @@ pub(crate) unsafe fn strtab_get(strtab: *const u8, off: u64, strsz: u64) -> &'st
     let p = unsafe { strtab.add(off as usize) };
     let len = unsafe { strlen_bounded(p, (strsz - off) as usize) };
     unsafe { core::slice::from_raw_parts(p, len) }
+}
+
+/// Read `DT_SYMTAB[sym_idx]` (a 24-byte `Elf64_Sym`) only when the
+/// entry lies inside the DSO image. ELF carries no symbol *count* in
+/// `PT_DYNAMIC`, so `validate_dyn_pointers` can only check the symtab
+/// *base*; this per-index guard is what keeps reads driven by an
+/// untrusted `sym_idx` (from a hash-chain walk or a relocation's
+/// `r_info`) inside `load_bias + image_len`. Returns `None` when the
+/// computed entry would run past the image; reads unconditionally when
+/// `image_len == 0` (placeholder DSO, no bound known). `Sym` is `Copy`
+/// (24 bytes) so the entry is returned by value.
+pub(crate) unsafe fn sym_entry(
+    symtab: *const Sym,
+    sym_idx: u32,
+    load_bias: u64,
+    image_len: u64,
+) -> Option<Sym> {
+    let entry_size = core::mem::size_of::<Sym>() as u64;
+    if image_len > 0
+        && !ldso_core::bounds::elem_in_image(
+            symtab as u64,
+            sym_idx as u64,
+            entry_size,
+            load_bias,
+            image_len,
+        )
+    {
+        return None;
+    }
+    Some(unsafe { *symtab.add(sym_idx as usize) })
 }
 
 // ---------------------------------------------------------------------------
@@ -911,13 +954,10 @@ pub(crate) fn consumer_required_version<'a>(
     ver_table: &ldso_core::ver::VersionTable<'a>,
 ) -> Option<&'a [u8]> {
     let p = versym_ptr?;
-    if image_len > 0 {
-        let image_end = load_bias.saturating_add(image_len);
-        let entry_end =
-            (p as u64).checked_add(((sym_idx as u64).checked_add(1)?).checked_mul(2)?)?;
-        if entry_end > image_end {
-            return None;
-        }
+    if image_len > 0
+        && !ldso_core::bounds::elem_in_image(p as u64, sym_idx as u64, 2, load_bias, image_len)
+    {
+        return None;
     }
     let raw = unsafe { *p.add(sym_idx as usize) };
     let version_index = raw & ldso_core::ver::VERSYM_VERSION_MASK;
@@ -1019,7 +1059,11 @@ unsafe fn apply_rela(
                     return Err("missing strtab/symtab for sym reloc");
                 }
                 let sym_idx = r_sym(r.r_info);
-                let sym = unsafe { &*symtab.add(sym_idx as usize) };
+                let sym = match unsafe { sym_entry(symtab, sym_idx, dso.load_bias, dso.image_len) }
+                {
+                    Some(s) => s,
+                    None => return Err("symbol index outside image"),
+                };
                 let name = unsafe { strtab_get(strtab, sym.st_name as u64, dso.dyn_.strsz) };
                 let version = consumer_required_version(
                     versym_ptr,
@@ -1072,7 +1116,11 @@ unsafe fn apply_rela(
                         return Err("missing strtab/symtab for sym reloc");
                     }
                     let sym_idx = r_sym(r.r_info);
-                    let sym = unsafe { &*symtab.add(sym_idx as usize) };
+                    let sym =
+                        match unsafe { sym_entry(symtab, sym_idx, dso.load_bias, dso.image_len) } {
+                            Some(s) => s,
+                            None => return Err("symbol index outside image"),
+                        };
                     let name = unsafe { strtab_get(strtab, sym.st_name as u64, dso.dyn_.strsz) };
                     let version = consumer_required_version(
                         versym_ptr,
@@ -1108,7 +1156,11 @@ unsafe fn apply_rela(
                     return Err("missing strtab/symtab for sym reloc");
                 }
                 let sym_idx = r_sym(r.r_info);
-                let sym = unsafe { &*symtab.add(sym_idx as usize) };
+                let sym = match unsafe { sym_entry(symtab, sym_idx, dso.load_bias, dso.image_len) }
+                {
+                    Some(s) => s,
+                    None => return Err("symbol index outside image"),
+                };
                 let name = unsafe { strtab_get(strtab, sym.st_name as u64, dso.dyn_.strsz) };
                 let version = consumer_required_version(
                     versym_ptr,
@@ -1121,22 +1173,23 @@ unsafe fn apply_rela(
                 if value == 0 {
                     return Err("undefined symbol (R_X86_64_64)");
                 }
-                // Phase 76b shape: write into the image via `apply_abs64`
-                // on a narrow 8-byte slice. Phase 76d.S1.3 leaves this
-                // arm unchanged because it already routes through
-                // `ldso_core::reloc`; only the three previously-direct
-                // write sites (RELATIVE here + RELATIVE in
-                // `dl_relocate_self` + GLOB_DAT/JUMP_SLOT above) move.
-                let target = (dso.load_bias.wrapping_add(r.r_offset)) as *mut u64;
-                let mut buf = [0u8; 8];
-                let img = unsafe { core::slice::from_raw_parts_mut(target as *mut u8, 8) };
-                let dummy_rela = Rela {
-                    r_offset: 0,
-                    r_info: 0,
-                    r_addend: r.r_addend,
+                // Route through `apply_abs64` against the FULL image
+                // slice (matching the RELATIVE / GLOB_DAT arms) so the
+                // helper bounds-checks `r.r_offset` against the image
+                // before writing. The earlier narrow-8-byte-slice shape
+                // applied apply_abs64's bound to a throwaway buffer and
+                // then blind-copied to `load_bias + r_offset`, leaving
+                // the real write target unbounded on a corrupt reloc.
+                let image: &mut [u8] = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        dso.load_bias as *mut u8,
+                        dso.image_len as usize,
+                    )
                 };
-                apply_abs64(&dummy_rela, 0, value, &mut buf).map_err(|_| "abs64 failed")?;
-                img.copy_from_slice(&buf);
+                if let Err(_e) = apply_abs64(&r, dso.load_bias, value, image) {
+                    serial(b"ldso: apply_abs64 failed\n");
+                    return Err("apply_abs64 failed");
+                }
             }
             _ => {
                 serial(b"ldso: unsupported reloc type ");
