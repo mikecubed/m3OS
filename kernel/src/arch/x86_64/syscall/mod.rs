@@ -16196,13 +16196,46 @@ pub(super) fn sys_sendto(
                         // assign an ephemeral source port (Linux behaviour) so
                         // the reply can be routed back. Range 0xC000.. matches
                         // the connect/net_udp ephemeral range.
-                        (crate::arch::x86_64::interrupts::tick_count() as u16) | 0xC000
+                        //
+                        // Retry up to 8 candidates so two resolver lookups
+                        // racing on the same tick value do not silently collide
+                        // and mis-route the reply: only a port that actually
+                        // binds is used, and exhausting all 8 returns EAGAIN
+                        // rather than falsely marking the socket bound. The `if`
+                        // block below re-binds this same port (a no-op here,
+                        // since it is already bound) so the shared service path
+                        // is also registered.
+                        let mut found_port = 0u16;
+                        for attempt in 0u16..8 {
+                            let cand = (crate::arch::x86_64::interrupts::tick_count() as u16)
+                                .wrapping_add(attempt)
+                                | 0xC000;
+                            if crate::net::udp::bind(cand) {
+                                found_port = cand;
+                                break;
+                            }
+                        }
+                        if found_port == 0 {
+                            return NEG_EAGAIN;
+                        }
+                        found_port
                     };
                     // Phase 77 Track D.1 — register a freshly-assigned ephemeral
                     // source port so inbound datagrams (e.g. the DNS reply) are
                     // enqueued for it and `recvfrom` can dequeue them. musl's
                     // resolver `sendto`s from an unbound socket; without this the
                     // reply's dst_port matches no binding and is dropped.
+                    //
+                    // Bind `src_port` in the kernel `UDP_BINDINGS` table here —
+                    // inbound delivery is kernel-owned even with the userspace
+                    // net_udp service present (`recvfrom` dequeues via
+                    // `crate::net::udp::recv`, and `handle_udp` drops datagrams
+                    // for any unbound port). On the kernel-direct path the retry
+                    // loop above already bound this exact port, so `bind` returns
+                    // false (a harmless no-op); on the net_udp-service path the
+                    // service-allocated port is not otherwise registered in the
+                    // kernel table, so this is the binding that lets the reply
+                    // arrive (mirrors the kernel-side bind in sys_bind/sys_connect).
                     if local_port == 0 && src_port != 0 {
                         let _ = crate::net::udp::bind(src_port);
                         crate::net::with_socket_mut(handle, |s| {

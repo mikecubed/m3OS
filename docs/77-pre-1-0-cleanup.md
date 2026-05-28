@@ -159,10 +159,6 @@ the remaining work was the `/proc/<pid>/status` memory fields htop/ps read, and
 - **DNS userspace delivery:** the kernel round-trip works but the resolver's
   `poll`/`recvfrom` does not surface the reply in its window — a UDP-delivery
   gap, not resolver wiring.
-- **htop screenshot gate:** `cargo xtask htop-render-probe` (headless QMP/VNC
-  screendump) is built, but the graphical-term PS/2→screendump path shows no
-  live update — the same display issue the 2026-05-17 less-render handoff
-  tracks; the procfs side is regression-protected by `ps` instead.
 - **TCP:** SACK / window scaling / modern congestion control; a real
   packet-loss test rig (tap + netem) to replace the host-tested estimator.
 - **Microcode:** an Intel `0x79` path + a fetch-and-verify flow for the blob

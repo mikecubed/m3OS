@@ -315,6 +315,16 @@ impl TcpConnection {
             TcpState::Established | TcpState::CloseWait => {
                 self.queue_segment(pending, TCP_FIN | TCP_ACK, &[]);
                 self.snd_nxt = self.snd_nxt.wrapping_add(1);
+                // Phase 77 Track D.2 — arm the FIN for retransmit so a dropped
+                // FIN is replayed by `service_rto`. Mirror the `tcp_send` guard:
+                // only arm when the slot is free (don't clobber an outstanding
+                // unacked data segment). `end_seq` is `snd_nxt` after the +1
+                // because the FIN consumes one phantom sequence byte. On a
+                // lossless path the covering ACK calls `on_ack` which disarms
+                // immediately, so happy-path behaviour is unchanged.
+                if self.retransmit.is_none() {
+                    self.arm_retransmit(self.snd_nxt, TCP_FIN | TCP_ACK, &[]);
+                }
                 self.state = if self.state == TcpState::Established {
                     TcpState::FinWait1
                 } else {
@@ -425,6 +435,10 @@ impl TcpConnection {
                 log::debug!("[tcp] FIN received in FinWait2 → TimeWait");
             }
             TcpState::LastAck if has_ack => {
+                // Disarm the FIN retransmit before moving to Closed so the
+                // CloseWait→LastAck FIN retransmit slot is not left live after
+                // the connection teardown completes.
+                self.on_ack(header.ack);
                 self.state = TcpState::Closed;
                 log::debug!("[tcp] ACK received in LastAck → Closed");
             }

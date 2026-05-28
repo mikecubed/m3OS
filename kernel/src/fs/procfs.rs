@@ -31,6 +31,7 @@ pub struct ProcfsStat {
 #[derive(Clone)]
 struct ProcessSnapshot {
     pid: u32,
+    tgid: u32,
     ppid: u32,
     state: ProcessState,
     uid: u32,
@@ -411,6 +412,7 @@ fn process_snapshot(pid: u32) -> Option<ProcessSnapshot> {
     };
     Some(ProcessSnapshot {
         pid: proc.pid,
+        tgid: proc.tgid,
         ppid: proc.ppid,
         state: proc.state,
         uid: proc.uid,
@@ -730,8 +732,10 @@ fn render_status(proc: ProcessSnapshot) -> String {
     // columns. m3OS does not track a precise resident-set size, so VmRSS is
     // approximated by the total mapped size (a reasonable upper bound for this
     // simple VM model); VmStk is the fixed 64 KiB user stack; VmData sums the
-    // writable anonymous/heap mappings. Tgid == Pid here because procfs lists
-    // the thread-group leader.
+    // writable anonymous/heap mappings. Tgid is the thread-group leader PID,
+    // which for non-leader threads (tid != pid) differs from the thread's own
+    // pid; populated from `proc.tgid` so `/proc/<pid>/task/<tid>/status` is
+    // Linux-compatible.
     const STACK_KIB: u64 = (16 * 4096) / 1024; // fixed 64 KiB user stack
     let mut vm_size = 16 * 4096u64;
     let mut vm_data = 0u64;
@@ -751,7 +755,7 @@ fn render_status(proc: ProcessSnapshot) -> String {
     let vm_rss_kib = vm_size_kib;
     alloc::format!(
         "Name:\t{name}\nState:\t{state}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nThreads:\t1\nVmSize:\t{} kB\nVmRSS:\t{} kB\nVmData:\t{} kB\nVmStk:\t{} kB\nCwd:\t{}\n",
-        proc.pid,
+        proc.tgid,
         proc.pid,
         proc.ppid,
         proc.uid,
