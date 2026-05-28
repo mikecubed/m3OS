@@ -55,6 +55,12 @@ jobs:
           key: ${{ runner.os }}-tcc-${{ hashFiles('xtask/src/main.rs') }}
           restore-keys: ${{ runner.os }}-tcc-
 
+      - name: Fetch Nerd Font asset
+        # Phase 69c: xtask/assets/fonts/term.ttf is gitignored. `cargo xtask
+        # image` (triggered by smoke-test) refuses to build the data disk
+        # without the font asset. Mirrors release.yml + build.yml.
+        run: cargo xtask fetch-fonts
+
       - name: "Smoke test (full-system: boot + login + auth + service + storage + log + TCC)"
         # Per-step waits scale 3x under CI TCG to absorb shared-runner jitter;
         # Sleep durations are not scaled (they're deliberate settle delays).
