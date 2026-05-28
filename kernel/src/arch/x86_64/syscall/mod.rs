@@ -5425,7 +5425,7 @@ pub fn init() {
         fn syscall_entry();
     }
     LStar::write(VirtAddr::new(syscall_entry as *const () as u64));
-    SFMask::write(RFlags::INTERRUPT_FLAG | RFlags::TRAP_FLAG);
+    SFMask::write(RFlags::INTERRUPT_FLAG | RFlags::TRAP_FLAG | RFlags::ALIGNMENT_CHECK);
     unsafe {
         Efer::update(|flags| *flags |= EferFlags::SYSTEM_CALL_EXTENSIONS);
     }
@@ -5450,7 +5450,7 @@ pub fn init_ap() {
         fn syscall_entry();
     }
     LStar::write(VirtAddr::new(syscall_entry as *const () as u64));
-    SFMask::write(RFlags::INTERRUPT_FLAG | RFlags::TRAP_FLAG);
+    SFMask::write(RFlags::INTERRUPT_FLAG | RFlags::TRAP_FLAG | RFlags::ALIGNMENT_CHECK);
     unsafe {
         Efer::update(|flags| *flags |= EferFlags::SYSTEM_CALL_EXTENSIONS);
     }

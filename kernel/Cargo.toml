@@ -38,6 +38,11 @@ default = ["trace", "preempt-voluntary"]
 # cfg(feature = "preempt-voluntary") guards (I.3). Do not remove guards until I.2 passes.
 trace = []
 legacy-bootstrap-allocator = []
+# Phase 77 Track B: debug-only SMEP/SMAP "deliberate fault" self-test.
+# Adds a boot-time self-test plus a feature-gated expected-fault recovery hook
+# in the page-fault handler. Zero-cost/absent in production. Run with:
+#   cargo xtask run --features smep-smap-test  (or via M3OS_KERNEL_FEATURES)
+smep-smap-test = []
 # When `sched-trace` is enabled, every block/wake/scan state transition
 # emits a structured SchedTrace entry into the per-core trace ring (Phase 43b).
 # Default OFF — zero runtime overhead in production builds.

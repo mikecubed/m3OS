@@ -4281,9 +4281,14 @@ fn qemu_args_with_devices_resolved(
         // Phase 57e Track J: advertise XSAVE + AVX + XSAVEOPT so the kernel
         // can enable CR4.OSXSAVE + XCR0 = 0x7 at boot.  The default QEMU
         // `qemu64` model lacks these architectural feature bits.
+        // Phase 77 Track B: also advertise SMEP + SMAP (CPUID.07h:EBX[7]/[20])
+        // so the kernel enables CR4.SMEP/SMAP under TCG too — without these the
+        // probe reports "unsupported" and the mitigations would be silently
+        // untested on the CI/headless lanes.  `-cpu host` (KVM) already exposes
+        // them on any modern host.
         args.extend([
             "-cpu".to_string(),
-            "qemu64,+xsave,+avx,+xsaveopt".to_string(),
+            "qemu64,+xsave,+avx,+xsaveopt,+smep,+smap".to_string(),
         ]);
     }
 

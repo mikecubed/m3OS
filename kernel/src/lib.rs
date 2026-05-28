@@ -231,6 +231,36 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
         enabled_area
     );
 
+    // Phase 77 Track B — enable CR4.SMEP (bit 20) + CR4.SMAP (bit 21) on the
+    // BSP when the CPU supports them.  Ordering matters for the same reason as
+    // XSAVE above: this runs *before* `boot_aps()` so the trampoline's captured
+    // `DATA_CR4` carries the bits and every AP inherits them on CR4 reload.
+    let (smep_on, smap_on) = x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        arch::x86_64::cpuid::enable_smep_smap()
+    });
+    // Clear EFLAGS.AC *outside* the `without_interrupts` bracket above (whose
+    // `popf` would otherwise restore the firmware AC and silently disable SMAP
+    // for the BSP's boot/idle context). Persistent for this context; syscall
+    // entry clears AC via SFMASK and APs clear it in `ap_entry`.
+    unsafe {
+        arch::x86_64::cpuid::clear_ac_for_smap();
+    }
+    let (smep_sup, smap_sup) = arch::x86_64::cpuid::probe_smep_smap();
+    log::info!(
+        "[sec] BSP CR4.SMEP {} (supported={}), CR4.SMAP {} (supported={})",
+        if smep_on { "enabled" } else { "off" },
+        smep_sup,
+        if smap_on { "enabled" } else { "off" },
+        smap_sup,
+    );
+
+    // Phase 77 Track B (debug-only): prove SMEP/SMAP actually fault a ring-0
+    // access to a user page. Feature-gated; absent in production builds.
+    #[cfg(feature = "smep-smap-test")]
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        arch::x86_64::smap_test::run_boot_self_test();
+    });
+
     // Phase 16: Initialize NIC drivers.  Phase 55b E.5: the in-kernel e1000
     // driver has been deleted; device-specific 82540EM code now lives in
     // `userspace/drivers/e1000`. The kernel registers only virtio-net here;

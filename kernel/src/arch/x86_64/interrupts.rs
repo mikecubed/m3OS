@@ -1135,6 +1135,20 @@ extern "x86-interrupt" fn page_fault_handler(
         return;
     }
 
+    // Phase 77 Track B (debug-only): SMEP/SMAP deliberate-fault self-test
+    // recovery hook. When the self-test arms an expected ring-0 fault, redirect
+    // the trap frame's RIP to the recovery label instead of panicking. Absent
+    // from production builds (feature-gated).
+    #[cfg(feature = "smep-smap-test")]
+    if let Some(recovery_rip) = crate::arch::x86_64::smap_test::take_expected_fault_recovery() {
+        unsafe {
+            stack_frame.as_mut().update(|f| {
+                f.instruction_pointer = VirtAddr::new(recovery_rip);
+            });
+        }
+        return;
+    }
+
     // Ring-0 page fault: unrecoverable kernel bug.
     //
     // Re-entrance guard: if the crash-dump path below faulted, we'll be

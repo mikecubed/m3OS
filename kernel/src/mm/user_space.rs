@@ -189,21 +189,14 @@ unsafe fn rollback_user_mapping(mapper: &mut OffsetPageTable, virt_base: u64, ma
     }
 }
 
-/// Copy `src` bytes into the user code region at `virt_base`.
-///
-/// The region must already be mapped (e.g. via `map_user_pages`).
-/// The bounds check is sized to the **code** region (`USER_CODE_PAGES * 4096`);
-/// do not use this helper to write to the stack or any other user region.
-pub fn copy_to_user(virt_base: u64, src: &[u8]) -> Result<(), &'static str> {
-    let max_bytes = (USER_CODE_PAGES * 4096) as usize;
-    if src.len() > max_bytes {
-        return Err("copy_to_user: src exceeds mapped user code region");
-    }
-    // Safety: caller guarantees virt_base is mapped and we've checked the length.
-    let dst = unsafe { core::slice::from_raw_parts_mut(virt_base as *mut u8, src.len()) };
-    dst.copy_from_slice(src);
-    Ok(())
-}
+// Phase 77 Track B: the legacy `copy_to_user` helper that lived here did a
+// raw `from_raw_parts_mut(virt_base as *mut u8, ..)` write through the USER
+// virtual address — the one direct user-page dereference left in ring 0 after
+// every live path migrated to `mm::user_mem` (physmap-routed) and the modern
+// ELF loader.  It had zero callers and, once `CR4.SMAP` is enabled, would
+// `#PF` if ever resurrected.  Removed as part of the SMAP audit (the kernel
+// is now SMAP-clean: all user-memory access reaches the bytes through the
+// physical-memory direct map, never the user virtual address).
 
 // Phase 75: the legacy `setup_user_memory` helper used to map user code
 // pages with `PRESENT | WRITABLE | USER_ACCESSIBLE` (a W+X mapping) before

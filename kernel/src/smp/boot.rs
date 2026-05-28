@@ -423,6 +423,28 @@ extern "C" fn ap_entry(per_core_data_ptr: *mut super::PerCoreData) -> ! {
         crate::arch::x86_64::cpuid::enable_xsave_state();
     }
 
+    // Phase 77 Track B — CR4.SMEP/SMAP were captured into the trampoline's
+    // `DATA_CR4` from the BSP (which set them before `boot_aps`) and reloaded
+    // above, so this AP already carries the bits.  Clear EFLAGS.AC so SMAP
+    // actually enforces on this core (AC is per-context; the trampoline does
+    // not guarantee AC == 0).
+    unsafe {
+        crate::arch::x86_64::cpuid::clear_ac_for_smap();
+    }
+    log::info!(
+        "[sec] AP CR4.SMEP {} CR4.SMAP {}",
+        if crate::arch::x86_64::cpuid::cr4_smep_enabled() {
+            "enabled"
+        } else {
+            "off"
+        },
+        if crate::arch::x86_64::cpuid::cr4_smap_enabled() {
+            "enabled"
+        } else {
+            "off"
+        },
+    );
+
     let data = unsafe { &*per_core_data_ptr };
 
     // Load this AP's GDT and TSS (pre-allocated on BSP).
