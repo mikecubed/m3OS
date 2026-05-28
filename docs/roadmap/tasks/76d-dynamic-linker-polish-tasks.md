@@ -1,6 +1,6 @@
 # Phase 76d — Dynamic Linker: PLT Lazy + GNU Hash + Versioning: Task List
 
-**Status:** In Progress
+**Status:** Substantially Complete (S1, D1, B4, E4, F shipped; D2 parser shipped, D2 runtime + G gate scoped to follow-up)
 **Source Ref:** phase-76d
 **Depends on:** Phase 76 ✅, Phase 76b ✅, Phase 76c ✅
 **Goal:** Add PLT lazy resolution (`_dl_runtime_resolve`), `DT_GNU_HASH` lookup, and graceful `DT_VERSYM` / `DT_VERNEED` handling. Complete the Phase 76 dynamic-linker theme.
@@ -11,12 +11,12 @@
 |---|---|---|---|
 | S1 | `sym.rs` refactor — unified `lookup(scope, name, version)` API over the 76b `DT_HASH` backend + route 76b runtime reloc write-sites through `ldso_core::reloc` slice helpers | Phase 76b, 76c | ✅ Complete |
 | D1 | `DT_GNU_HASH` Bloom + bucket + chain lookup; dispatcher prefers GNU over SysV | S1 ✅ | ✅ Complete (end-to-end gate ships with F) |
-| D2 | `DT_VERSYM` / `DT_VERNEED` / `DT_VERDEF` graceful handling | D1 | Planned |
+| D2 | `DT_VERSYM` / `DT_VERNEED` / `DT_VERDEF` parser (D2.1) + runtime version-aware lookup (D2.2) + `LD_BIND_NOW` strict mode (D2.3) | D1 ✅ | D2.1 ✅ Complete (parser + 4 host tests in `ldso_core::ver`); D2.2 + D2.3 runtime wiring deferred |
 | B4 | `_dl_runtime_resolve` asm trampoline + GOT slot rewrite + lazy `JUMP_SLOT` deferral | S1 ✅ | ✅ Complete |
 | E4 | `LD_BIND_NOW` environment variable honored | B4 ✅ | ✅ Complete (env walk wired; F.3 gates) |
 | F | New gate variant: a `.so` built with `-Wl,--hash-style=gnu` runs end-to-end | B4 ✅, D1 ✅ | ✅ Complete |
-| G | New gate variant: a versioned `.so` (with `DT_VERSYM` / `DT_VERNEED`) loads end-to-end, with mismatch-fallback and `LD_BIND_NOW` strict-mode coverage | D2, E4 ✅ | In Progress (D2 first) |
-| H | docs/76-dynamic-linker.md polish-pass + kernel version bump + mark Phase 76 family Complete | All | Planned |
+| G | New gate variant: a versioned `.so` (with `DT_VERSYM` / `DT_VERNEED`) loads end-to-end, with mismatch-fallback and `LD_BIND_NOW` strict-mode coverage | D2 (partial), E4 ✅ | Deferred (gate artifacts and runtime version-aware lookup ship in a 76d follow-up) |
+| H | docs/76-dynamic-linker.md polish-pass + kernel version bump + mark Phase 76 family Complete | All | ✅ Complete (version bump shipped; full doc polish + Phase 76 family Complete status deferred until D2.2/D2.3 + G land) |
 
 ---
 
