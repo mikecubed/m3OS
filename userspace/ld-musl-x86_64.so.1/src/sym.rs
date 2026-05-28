@@ -303,25 +303,30 @@ unsafe fn lookup_gnu(dso: &LoadedDso, name: &[u8]) -> Option<DsoHit> {
     if nbuckets == 0 || bloom_size == 0 {
         return None;
     }
+    // `header.add(4)` is a fixed 16-byte offset; `validate_dyn_pointers`
+    // proved the 16-byte header is in-image and provenance is the whole
+    // mmap, so this small constant `.add` is in-bounds. The bucket/hash
+    // array bases, by contrast, are offset by the UNTRUSTED `bloom_size`
+    // / `nbuckets`, so they are derived with integer arithmetic — never
+    // `<*const T>::add`, whose in-bounds precondition a corrupt header
+    // could violate (UB even before any dereference). The typed pointers
+    // are materialized only after the ranges are proven in-image.
     let bloom_ptr = unsafe { header.add(4) } as *const u64;
-    let buckets_ptr = unsafe { bloom_ptr.add(bloom_size as usize) } as *const u32;
-    let hashes_ptr = unsafe { buckets_ptr.add(nbuckets as usize) };
+    let bloom_bytes = (bloom_size as u64).saturating_mul(8);
+    let buckets_bytes = (nbuckets as u64).saturating_mul(4);
+    let buckets_addr = (bloom_ptr as u64).wrapping_add(bloom_bytes);
+    let hashes_addr = buckets_addr.wrapping_add(buckets_bytes);
 
-    // Phase 76d security hardening — clamp every array derived from
-    // the (untrusted) `DT_GNU_HASH` header fields against the DSO's
-    // mapped image span before any element is read. A corrupt
-    // `bloom_size` / `nbuckets` could otherwise push subsequent
-    // reads outside the image.
     if dso.image_len > 0 {
         let bloom_ok = ldso_core::bounds::range_in_image(
             bloom_ptr as u64,
-            (bloom_size as u64).saturating_mul(8),
+            bloom_bytes,
             dso.load_bias,
             dso.image_len,
         );
         let buckets_ok = ldso_core::bounds::range_in_image(
-            buckets_ptr as u64,
-            (nbuckets as u64).saturating_mul(4),
+            buckets_addr,
+            buckets_bytes,
             dso.load_bias,
             dso.image_len,
         );
@@ -329,16 +334,23 @@ unsafe fn lookup_gnu(dso: &LoadedDso, name: &[u8]) -> Option<DsoHit> {
             return None;
         }
     }
+    // Safe to form the typed array pointers now: either the ranges were
+    // proven in-image above, or `image_len == 0` (placeholder DSO, no
+    // real mapping — host-test shape only). Per-element `.add` below uses
+    // indices bounded by `bloom_size` / `nbuckets` / `chain_len`.
+    let buckets_ptr = buckets_addr as *const u32;
+    let hashes_ptr = hashes_addr as *const u32;
+
     // Number of complete 4-byte hash-table slots that fit between
-    // `hashes_ptr` and the image end (unbounded when `image_len` is
+    // `hashes_addr` and the image end (unbounded when `image_len` is
     // unknown — placeholder DSO). Each `chain_idx` must be strictly
     // less than this. A `span < 4` window (not even one full `u32`
-    // remains, including `hashes_ptr == image_end`) yields 0 slots, so
+    // remains, including `hashes_addr == image_end`) yields 0 slots, so
     // every read — including `chain_idx == 0` — is rejected before it
     // can run off the image edge.
     let chain_len = if dso.image_len > 0 {
         let image_end = dso.load_bias.saturating_add(dso.image_len);
-        let span = image_end.saturating_sub(hashes_ptr as u64);
+        let span = image_end.saturating_sub(hashes_addr);
         (span / 4) as usize
     } else {
         usize::MAX
@@ -434,19 +446,25 @@ unsafe fn lookup_sysv(dso: &LoadedDso, name: &[u8]) -> Option<DsoHit> {
     if nbuckets == 0 {
         return None;
     }
+    // `hash_ptr.add(2)` is a fixed 8-byte offset within the validated
+    // header / image. The chain array, by contrast, is offset by the
+    // UNTRUSTED `nbuckets`, so its base is derived with integer
+    // arithmetic — never `<*const T>::add`, whose in-bounds precondition
+    // a corrupt header could violate (UB even before a dereference).
     let buckets = unsafe { hash_ptr.add(2) };
-    let chain = unsafe { buckets.add(nbuckets) };
+    let buckets_bytes = (nbuckets as u64).saturating_mul(4);
+    let chain_addr = (buckets as u64).wrapping_add(buckets_bytes);
     // Clamp both arrays against the image span. Each entry is a `u32`
     // (4 bytes); buckets has `nbuckets` entries, chain has `nchain`.
     if dso.image_len > 0 {
         let buckets_ok = ldso_core::bounds::range_in_image(
             buckets as u64,
-            (nbuckets as u64).saturating_mul(4),
+            buckets_bytes,
             dso.load_bias,
             dso.image_len,
         );
         let chain_ok = ldso_core::bounds::range_in_image(
-            chain as u64,
+            chain_addr,
             (nchain as u64).saturating_mul(4),
             dso.load_bias,
             dso.image_len,
@@ -455,6 +473,10 @@ unsafe fn lookup_sysv(dso: &LoadedDso, name: &[u8]) -> Option<DsoHit> {
             return None;
         }
     }
+    // Materialized only after the range is proven in-image (or
+    // `image_len == 0` placeholder). Per-element `.add(idx)` below uses
+    // `idx < nchain`, within the validated range.
+    let chain = chain_addr as *const u32;
     let h = elf_hash(name);
     let mut idx = unsafe { *buckets.add(h as usize % nbuckets) };
     let mut hops = 0usize;
