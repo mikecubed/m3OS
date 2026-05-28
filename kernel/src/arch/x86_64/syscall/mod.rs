@@ -17253,6 +17253,261 @@ pub(super) fn sys_sendmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
     written as u64
 }
 
+/// `recvmsg()` for AF_INET sockets (UDP / TCP).
+///
+/// musl's stub resolver (`__res_msend`) drains DNS replies with `recvmsg`,
+/// **not** `recvfrom`, and then byte-compares the reply's source address —
+/// which it reads from `msg_name` — against its configured nameserver list
+/// (`memcmp(ns+j, &sa, sl)`). A reply whose source sockaddr is missing or
+/// wrong is silently discarded, so the kernel MUST both deliver the payload
+/// and fill `msg_name` with the sender's `sockaddr_in`. Before this path
+/// existed, `recvmsg` on an INET socket returned `EOPNOTSUPP`, so the
+/// resolver busy-looped `poll → recvmsg(fail) → poll` until its timeout and
+/// `getaddrinfo` returned `EAI_AGAIN` even though the reply sat ready in the
+/// kernel's UDP queue. Mirrors `sys_recvfrom_socket`'s recv logic.
+fn sys_recvmsg_inet(
+    handle: crate::net::SocketHandle,
+    mut header: kernel_core::net::msghdr::MsgHdr,
+    msghdr_ptr: u64,
+    nonblock: bool,
+) -> u64 {
+    use kernel_core::net::msghdr::{IOVEC_SIZE, IoVec, MSG_TRUNC, MSGHDR_SIZE};
+
+    // Decode the scatter list.
+    let iov_count = header.msg_iovlen as usize;
+    if iov_count > 1024 {
+        return NEG_EINVAL;
+    }
+    let mut iov_buf = alloc::vec![0u8; iov_count.checked_mul(IOVEC_SIZE).unwrap_or(0)];
+    if iov_count > 0
+        && UserSliceRo::new(header.msg_iov, iov_buf.len())
+            .and_then(|s| s.copy_to_kernel(&mut iov_buf))
+            .is_err()
+    {
+        return NEG_EFAULT;
+    }
+    let iovs = match IoVec::decode_array(&iov_buf, iov_count) {
+        Some(v) => v,
+        None => return NEG_EINVAL,
+    };
+    let cap = IoVec::total_len(&iovs).min(SENDMSG_MAX_BYTES as u64) as usize;
+
+    // Validate the writable destination prefix BEFORE consuming a datagram,
+    // so an EFAULT cannot drop an already-dequeued reply (same discipline as
+    // the Unix recvmsg path).
+    let mut remaining_validate = cap as u64;
+    for iov in &iovs {
+        if remaining_validate == 0 {
+            break;
+        }
+        let chunk = iov.iov_len.min(remaining_validate);
+        if chunk == 0 {
+            continue;
+        }
+        if UserSliceWo::new(iov.iov_base, chunk as usize).is_err() {
+            return NEG_EFAULT;
+        }
+        remaining_validate -= chunk;
+    }
+    if UserSliceWo::new(msghdr_ptr, MSGHDR_SIZE).is_err() {
+        return NEG_EFAULT;
+    }
+    // Pre-validate the `msg_name` buffer up front too. The source-address
+    // write happens in `finish` AFTER a datagram is dequeued, so without this
+    // a faulting `msg_name` pointer would consume-and-drop the reply — the
+    // same loss the iov/msghdr pre-validation above guards against.
+    if header.msg_name != 0 {
+        let name_len = (header.msg_namelen as usize).min(16);
+        if name_len > 0 && UserSliceWo::new(header.msg_name, name_len).is_err() {
+            return NEG_EFAULT;
+        }
+    }
+
+    let info = match crate::net::with_socket(handle, |s| {
+        (
+            s.protocol,
+            s.tcp_slot,
+            s.local_port,
+            s.remote_addr,
+            s.remote_port,
+            s.shut_rd,
+        )
+    }) {
+        Some(v) => v,
+        None => return NEG_EBADF,
+    };
+    // remote_addr/remote_port are intentionally unused: datagram sockets fill
+    // msg_name from the per-datagram source, and connection-mode (TCP) reports
+    // msg_namelen = 0 like Linux.
+    let (proto, tcp_slot, local_port, _remote_addr, _remote_port, shut_rd) = info;
+
+    // Helper: write the sender's `sockaddr_in` into `msg_name` for datagram
+    // sockets (`src = Some(..)`) and commit the updated msghdr
+    // (namelen/controllen/flags). Connection-mode (TCP) and EOF pass
+    // `src = None`, which reports `msg_namelen = 0` like Linux. `msg_name` is
+    // pre-validated above, so the copy here only faults under a concurrent
+    // unmap (same window the iov writes accept). Returns `Err(errno)` on a
+    // faulting copy. On return `msg_namelen` carries the real address size
+    // (16) even if the caller's buffer was smaller — the recvmsg(2) contract,
+    // matching `sys_recvfrom_socket`.
+    let finish = |header: &mut kernel_core::net::msghdr::MsgHdr,
+                  src: Option<([u8; 4], u16)>,
+                  truncated: bool|
+     -> Result<(), u64> {
+        match src {
+            Some((src_ip, src_port)) if header.msg_name != 0 && header.msg_namelen > 0 => {
+                let name_len = (header.msg_namelen as usize).min(16);
+                let mut sa = [0u8; 16];
+                sa[0..2].copy_from_slice(&2u16.to_ne_bytes()); // AF_INET
+                sa[2..4].copy_from_slice(&src_port.to_be_bytes());
+                sa[4..8].copy_from_slice(&src_ip);
+                if UserSliceWo::new(header.msg_name, name_len)
+                    .and_then(|s| s.copy_from_kernel(&sa[..name_len]))
+                    .is_err()
+                {
+                    return Err(NEG_EFAULT);
+                }
+                header.msg_namelen = 16;
+            }
+            _ => header.msg_namelen = 0,
+        }
+        header.msg_controllen = 0;
+        header.msg_flags = if truncated { MSG_TRUNC } else { 0 };
+        let encoded = header.encode();
+        if UserSliceWo::new(msghdr_ptr, encoded.len())
+            .and_then(|s| s.copy_from_kernel(&encoded))
+            .is_err()
+        {
+            return Err(NEG_EFAULT);
+        }
+        Ok(())
+    };
+
+    if shut_rd {
+        // EOF: deliver a zero-length message with a clean header.
+        return match finish(&mut header, None, false) {
+            Ok(()) => 0,
+            Err(e) => e,
+        };
+    }
+
+    match proto {
+        crate::net::SocketProtocol::Udp => {
+            // Resolve the recv port through the same policy authority as
+            // recvfrom so the port the service tracked matches the binding
+            // the reply was enqueued on.
+            let recv_port = if net_udp_service_available() {
+                let (err, port) = net_udp_service_recvfrom_port(handle);
+                if err != 0 {
+                    return err;
+                }
+                port
+            } else {
+                local_port
+            };
+            loop {
+                if let Some(dgram) = crate::net::udp::recv(recv_port) {
+                    let n = dgram.data.len().min(cap);
+                    let mut cursor = 0usize;
+                    for iov in &iovs {
+                        if cursor >= n {
+                            break;
+                        }
+                        let chunk = ((n - cursor) as u64).min(iov.iov_len) as usize;
+                        if chunk == 0 {
+                            continue;
+                        }
+                        if UserSliceWo::new(iov.iov_base, chunk)
+                            .and_then(|s| s.copy_from_kernel(&dgram.data[cursor..cursor + chunk]))
+                            .is_err()
+                        {
+                            return NEG_EFAULT;
+                        }
+                        cursor += chunk;
+                    }
+                    let truncated = dgram.data.len() > n;
+                    if let Err(e) =
+                        finish(&mut header, Some((dgram.src_ip, dgram.src_port)), truncated)
+                    {
+                        return e;
+                    }
+                    return n as u64;
+                }
+                if nonblock {
+                    return NEG_EAGAIN;
+                }
+                if has_pending_signal() {
+                    return NEG_EINTR;
+                }
+                crate::task::yield_now();
+            }
+        }
+        crate::net::SocketProtocol::Tcp => {
+            let tcp_idx = match tcp_slot {
+                Some(idx) => idx,
+                None => return NEG_ENOTCONN,
+            };
+            // A zero-length read returns 0 immediately (Linux recv semantics);
+            // entering the loop with cap == 0 would otherwise spin a blocking
+            // socket forever, since tcp::recv always yields 0 for an empty buf.
+            if cap == 0 {
+                return match finish(&mut header, None, false) {
+                    Ok(()) => 0,
+                    Err(e) => e,
+                };
+            }
+            let mut tmp = alloc::vec![0u8; cap];
+            loop {
+                let n = crate::net::tcp::recv(tcp_idx, &mut tmp[..cap]);
+                if n > 0 {
+                    let mut cursor = 0usize;
+                    for iov in &iovs {
+                        if cursor >= n {
+                            break;
+                        }
+                        let chunk = ((n - cursor) as u64).min(iov.iov_len) as usize;
+                        if chunk == 0 {
+                            continue;
+                        }
+                        if UserSliceWo::new(iov.iov_base, chunk)
+                            .and_then(|s| s.copy_from_kernel(&tmp[cursor..cursor + chunk]))
+                            .is_err()
+                        {
+                            return NEG_EFAULT;
+                        }
+                        cursor += chunk;
+                    }
+                    // Connection-mode socket: Linux reports msg_namelen = 0.
+                    if let Err(e) = finish(&mut header, None, false) {
+                        return e;
+                    }
+                    return n as u64;
+                }
+                let state = crate::net::tcp::state(tcp_idx);
+                if matches!(
+                    state,
+                    crate::net::tcp::TcpState::CloseWait
+                        | crate::net::tcp::TcpState::Closed
+                        | crate::net::tcp::TcpState::TimeWait
+                ) {
+                    return match finish(&mut header, None, false) {
+                        Ok(()) => 0,
+                        Err(e) => e,
+                    };
+                }
+                if nonblock {
+                    return NEG_EAGAIN;
+                }
+                if has_pending_signal() {
+                    return NEG_EINTR;
+                }
+                crate::task::yield_now();
+            }
+        }
+        crate::net::SocketProtocol::Icmp => NEG_EOPNOTSUPP,
+    }
+}
+
 pub(super) fn sys_recvmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
     use kernel_core::net::msghdr::{
         IOVEC_SIZE, IoVec, MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_DONTWAIT, MSGHDR_SIZE, MsgHdr,
@@ -17297,6 +17552,12 @@ pub(super) fn sys_recvmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
         return NEG_EBADF;
     }
     let nonblock = entry.nonblock || force_nonblock;
+    // AF_INET sockets (UDP/TCP) take a dedicated path: the DNS resolver drains
+    // UDP replies with recvmsg and validates the source address from msg_name.
+    // The Unix-socket SCM_RIGHTS machinery below does not apply.
+    if let FdBackend::Socket { handle } = &entry.backend {
+        return sys_recvmsg_inet(*handle, header, msghdr_ptr, nonblock);
+    }
     let unix_handle = match &entry.backend {
         FdBackend::UnixSocket { handle } => *handle,
         _ => return NEG_EOPNOTSUPP,
