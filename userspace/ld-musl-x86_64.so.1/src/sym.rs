@@ -42,7 +42,9 @@
 
 use ldso_core::dynlink::{LoadedDso, elf_hash};
 use ldso_core::gnu_hash::{GnuHashHeader, GnuLookupOutcome, gnu_hash, gnu_hash_lookup};
-use ldso_core::ver::{VER_NDX_GLOBAL, VER_NDX_LOCAL, VERSYM_VERSION_MASK, VersionTable};
+use ldso_core::ver::{
+    VER_NDX_GLOBAL, VER_NDX_LOCAL, VERSYM_HIDDEN, VERSYM_VERSION_MASK, VersionTable,
+};
 
 use crate::plt;
 
@@ -92,10 +94,20 @@ pub unsafe fn lookup(scope: &[LoadedDso], name: &[u8], version: Option<&[u8]>) -
             Some(h) => h,
             None => continue,
         };
+        // Phase 76d.D2 — for unversioned consumers (`version == None`),
+        // skip hits whose `DT_VERSYM` entry has the VERSYM_HIDDEN bit
+        // set. Hidden symbols are non-default version exports that
+        // must NOT be returned to unversioned consumers (matches the
+        // glibc rule + the documented intent in `ldso_core::ver`).
+        if version.is_none() && unsafe { dso_symbol_is_hidden(dso, hit.sym_idx) } {
+            // Same-name, hidden non-default — keep scanning for a
+            // non-hidden definition in a later DSO.
+            continue;
+        }
         name_matched_somewhere = true;
         let requested = match version {
             Some(v) => v,
-            None => return Some(hit.addr), // Unversioned lookup — first match wins.
+            None => return Some(hit.addr), // Unversioned lookup — first non-hidden match wins.
         };
         if unsafe { dso_version_matches(dso, hit.sym_idx, requested) } {
             return Some(hit.addr);
@@ -154,6 +166,20 @@ unsafe fn lookup_in_dso(dso: &LoadedDso, name: &[u8]) -> Option<DsoHit> {
         Backend::SysV => unsafe { lookup_sysv(dso, name) },
         Backend::Gnu => unsafe { lookup_gnu(dso, name) },
     }
+}
+
+/// Phase 76d.D2 — return `true` when the DSO's `DT_VERSYM` entry for
+/// `sym_idx` has the `VERSYM_HIDDEN` (`0x8000`) bit set. Used by
+/// `lookup` to skip non-default version exports when serving
+/// unversioned consumers. DSOs without a `DT_VERSYM` are never
+/// considered hidden.
+unsafe fn dso_symbol_is_hidden(dso: &LoadedDso, sym_idx: u32) -> bool {
+    let versym_ptr = match dso.dyn_.versym {
+        Some(p) => p.as_ptr(),
+        None => return false,
+    };
+    let raw_index = unsafe { *versym_ptr.add(sym_idx as usize) };
+    raw_index & VERSYM_HIDDEN != 0
 }
 
 /// Phase 76d.D2.2 — return `true` when the DSO's `DT_VERSYM` /
@@ -226,11 +252,13 @@ unsafe fn max_verdef_bytes(dso: &LoadedDso) -> usize {
 ///
 /// # Safety
 /// `dso.dyn_.gnu_hash` must reference at least 16 bytes (the four
-/// `u32` header words) of mapped memory. The header's `nbuckets`,
-/// `bloom_size`, and the chain table length must keep all subsequent
-/// reads inside the DSO image (the runtime currently trusts the
-/// validate_dyn_pointers pass at load time + the chain end-marker bit
-/// to bound the walk).
+/// `u32` header words) of mapped memory; `validate_dyn_pointers`
+/// enforces this at load time. The bloom, bucket, and hash arrays
+/// derived from `bloom_size` / `nbuckets` are bounds-checked against
+/// the DSO's `load_bias` + `image_len` window before any of their
+/// elements are read. Chain hops are capped via the GNU end-marker
+/// bit, a hard `MAX_HOPS` ceiling, and the per-element hash-array
+/// bound (whichever comes first).
 unsafe fn lookup_gnu(dso: &LoadedDso, name: &[u8]) -> Option<DsoHit> {
     let header = dso.dyn_.gnu_hash?.as_ptr();
     let symtab = dso.dyn_.symtab?.as_ptr();
@@ -245,6 +273,43 @@ unsafe fn lookup_gnu(dso: &LoadedDso, name: &[u8]) -> Option<DsoHit> {
     let bloom_ptr = unsafe { header.add(4) } as *const u64;
     let buckets_ptr = unsafe { bloom_ptr.add(bloom_size as usize) } as *const u32;
     let hashes_ptr = unsafe { buckets_ptr.add(nbuckets as usize) };
+
+    // Phase 76d security hardening — clamp every array derived from
+    // the (untrusted) `DT_GNU_HASH` header fields against the DSO's
+    // mapped image span before any element is read. A corrupt
+    // `bloom_size` / `nbuckets` could otherwise push subsequent
+    // reads outside the image.
+    if dso.image_len > 0 {
+        let image_end = dso.load_bias.saturating_add(dso.image_len);
+        let bloom_bytes = (bloom_size as u64).saturating_mul(8);
+        let buckets_bytes = (nbuckets as u64).saturating_mul(4);
+        let bloom_end = (bloom_ptr as u64).checked_add(bloom_bytes)?;
+        let buckets_end = (buckets_ptr as u64).checked_add(buckets_bytes)?;
+        if bloom_end > image_end || buckets_end > image_end {
+            return None;
+        }
+        // We also need at least the hashes_ptr base to lie within the
+        // image; the per-`chain_idx` element bound is enforced inline
+        // below using `max_chain_idx`.
+        if (hashes_ptr as u64) >= image_end {
+            return None;
+        }
+    }
+    // Maximum `chain_idx` whose 4-byte read still fits inside the
+    // image (or unbounded when image_len is unknown — placeholder DSO).
+    let max_chain_idx = if dso.image_len > 0 {
+        let image_end = dso.load_bias.saturating_add(dso.image_len);
+        let span = image_end.saturating_sub(hashes_ptr as u64);
+        // span / 4 is the count of u32 slots that fit; the last valid
+        // index is span/4 - 1. Treat 0-slot span as "no chain".
+        if span < 4 {
+            0usize
+        } else {
+            (span / 4 - 1) as usize
+        }
+    } else {
+        usize::MAX
+    };
 
     let h = gnu_hash(name);
     let bit0 = 1u64 << (h % 64);
@@ -268,6 +333,9 @@ unsafe fn lookup_gnu(dso: &LoadedDso, name: &[u8]) -> Option<DsoHit> {
             return None;
         }
         let chain_idx = (sym_idx - symoffset) as usize;
+        if chain_idx > max_chain_idx {
+            return None;
+        }
         let h2 = unsafe { *hashes_ptr.add(chain_idx) };
         if (h | 1) == (h2 | 1) {
             let sym = unsafe { &*symtab.add(sym_idx as usize) };

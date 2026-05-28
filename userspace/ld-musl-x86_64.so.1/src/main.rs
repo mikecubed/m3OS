@@ -511,6 +511,16 @@ fn validate_dyn_pointers(
         // `sym::lookup_gnu` reads it.
         return Err("DT_GNU_HASH header outside image");
     }
+    if let Some(p) = d.pltgot
+        && !range_in_image(p.as_ptr() as u64, 24)
+    {
+        // Phase 76d.B4 — `plt::install_trampoline` writes GOT[1] and
+        // GOT[2] via this pointer (offsets +8 and +16 bytes), so the
+        // first three `u64` slots must lie inside the DSO image.
+        // Without this check a malformed `DT_PLTGOT` could redirect
+        // those writes into unrelated process memory.
+        return Err("DT_PLTGOT (first 3 slots) outside image");
+    }
     if let Some(p) = d.versym
         && !in_image(p.as_ptr() as u64)
     {
@@ -1299,12 +1309,15 @@ unsafe fn read_ld_bind_now(stack: *const u64) -> bool {
         if entry.is_null() {
             return false;
         }
-        // Match "LD_BIND_NOW=" prefix; tolerate truncation.
+        // Match "LD_BIND_NOW=" prefix; tolerate truncation. Stop at
+        // the first NUL terminator so a shorter env string can never
+        // drag the loop past its mapped length, even if a future
+        // PREFIX edit ever added embedded NUL bytes.
         const PREFIX: &[u8] = b"LD_BIND_NOW=";
         let mut ok = true;
         for (i, want) in PREFIX.iter().enumerate() {
             let b = unsafe { *entry.add(i) };
-            if b != *want {
+            if b == 0 || b != *want {
                 ok = false;
                 break;
             }
