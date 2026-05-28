@@ -411,7 +411,7 @@ These phases were drafted 2026-05-08 in response to the phase-completion audit (
 
 | Phase | Theme | Primary Outcome | Status | Source Ref | Milestone | Tasks |
 |---|---|---|---|---|---|---|
-| 77 | Pre-1.0 Correctness, Cheap Security, and Network Polish | Bundle phase: SSH disconnect hang, `sys_nanosleep` busy-yield, SMEP+SMAP, `PT_TLS` parsing, DNS resolver stub, TCP retransmit + multi-slot, microcode loading, `epoll_*` verify-or-implement, doc-drift PR | Planned | `phase-77` | [Phase 77](./77-pre-1-0-cleanup.md) | Deferred until implementation planning |
+| 77 | Pre-1.0 Correctness, Cheap Security, and Network Polish | Bundle phase: SSH disconnect hang, `sys_nanosleep` busy-yield, SMEP+SMAP, `PT_TLS` parsing, DNS resolver stub, TCP retransmit + multi-slot, microcode loading, `epoll_*` verify-or-implement, doc-drift PR | Planned | `phase-77` | [Phase 77](./77-pre-1-0-cleanup.md) | [Tasks](./tasks/77-pre-1-0-cleanup-tasks.md) |
 | 78 | USB Host Foundation (xHCI + Hub + HID) | Ring-3 xHCI driver + USB core + HID class; modern laptops/desktops without PS/2 get keyboard and mouse input. Single biggest 1.0 unblocker. | Planned | `phase-78` | [Phase 78](./78-usb-host-foundation.md) | Deferred until implementation planning |
 | 79 | Modern Intel/Realtek NIC | e1000e / igb / igc + RTL8169 / RTL8125 ring-3 drivers; modern desktops get wired ethernet beyond the QEMU-only 82540EM. | Planned | `phase-79` | [Phase 79](./79-modern-nic.md) | Deferred until implementation planning |
 | 80 | Intel HDA Audio (+ Realtek codec family) | Ring-3 HDA controller + Realtek ALC888/892/1220 codec drivers; replaces AC'97-only `audio_server` backend. | Planned | `phase-80` | [Phase 80](./80-intel-hda-audio.md) | Deferred until implementation planning |
