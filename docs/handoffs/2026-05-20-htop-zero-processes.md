@@ -1,5 +1,6 @@
 ---
 status: open
+phase_77_finding: "STILL REPRODUCES on feat/phase-77 (2026-05-28). The Phase 77 Track H.1 claim that Phase 72b's all-PIDs visibility fixed this was WRONG. Verified via headless QMP screendump (cargo xtask htop-render-probe): htop renders its full UI but the header reads 'Tasks: 0, 0 thr, 0 kthr; 0 running' and the process table is empty. Kernel-side open() tracing shows that, per PID, htop opens /proc/<pid> (dir) and /proc/<pid>/statm via absolute open() but NEVER opens /proc/<pid>/stat (the file it requires to construct a process), so it discards every entry. ps -e works because it reads /proc/<pid>/status instead — which is why H.1 was mis-marked resolved. ROOT CAUSE of why htop skips the stat read is NOT yet pinned (htop opens files by fixed name, so statm-but-not-stat is anomalous); needs a tight per-PID syscall trace (open + getdents + newfstatat on /proc/<pid>, scoped to avoid the boot-log flood that defeated the first attempt) or inspection of htop 3.4.0 LinuxProcessTable_recurse. The H.2 htop-render-probe harness itself WORKS and is the right tool to validate the eventual fix."
 branch: feat/phase-72-compositor-tiling
 last-known-good-commit: 435f0a1
 date: 2026-05-20
