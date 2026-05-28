@@ -140,9 +140,15 @@ pub unsafe fn lookup(scope: &[LoadedDso], name: &[u8], version: Option<&[u8]>) -
         crate::serial(b" version=");
         crate::serial(requested);
         crate::serial(b"\n");
-        // Pass 2 — unversioned fallback.
+        // Pass 2 — unversioned fallback. This block IS an unversioned
+        // resolution, so it applies the same VERSYM_HIDDEN skip as the
+        // pass-1 unversioned path: non-default hidden exports must not
+        // surface during fallback either.
         for dso in scope {
             if let Some(hit) = unsafe { lookup_in_dso(dso, name) } {
+                if unsafe { dso_symbol_is_hidden(dso, hit.sym_idx) } {
+                    continue;
+                }
                 return Some(hit.addr);
             }
         }

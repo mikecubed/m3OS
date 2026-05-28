@@ -136,20 +136,23 @@ pub struct GnuHashHeader {
 /// from the four-word DT_GNU_HASH header. `bloom` is the per-table
 /// filter; `buckets` and `hashes` are the post-bloom arrays.
 /// `name_of_symbol` resolves a symbol index back into the raw bytes
-/// of its name (caller-provided so the runtime can wrap `DT_SYMTAB`
-/// + `DT_STRTAB` reads without `gnu_hash` needing to know about
-///   either).
+/// of its name (caller-provided so the runtime can wrap the
+/// `DT_SYMTAB` and `DT_STRTAB` reads without `gnu_hash` needing to
+/// know about either). The returned borrow is tied to the lifetime
+/// parameter `'n` rather than `'static`: the resolved name is only
+/// compared against `name`, never stored, so a caller can hand back a
+/// slice borrowed from its own string table.
 ///
 /// The walker stops at the first chain entry whose top-31 hash bits
 /// match `gnu_hash(name) >> 1` AND whose resolved name is byte-equal
 /// to `name`. Chain ends are marked by bit 0 set in the hash entry.
-pub fn gnu_hash_lookup(
+pub fn gnu_hash_lookup<'n>(
     header: GnuHashHeader,
     bloom: &[u64],
     buckets: &[u32],
     hashes: &[u32],
     name: &[u8],
-    mut name_of_symbol: impl FnMut(u32) -> Option<&'static [u8]>,
+    mut name_of_symbol: impl FnMut(u32) -> Option<&'n [u8]>,
 ) -> GnuLookupOutcome {
     let GnuHashHeader {
         nbuckets,

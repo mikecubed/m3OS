@@ -330,21 +330,17 @@ fn program_main(_args: &[&str]) -> i32 {
         }
     }
 
-    // Phase 76d.F — `dynlink_hello_gnu` exercises the GNU-hash
-    // backend (D1), the PLT lazy resolve trampoline (B4), the
-    // `LD_BIND_NOW=1` env-var path (E4/F.3), and the W^X invariant
-    // (F.4). Two-phase: default env (lazy) then `LD_BIND_NOW=1`
-    // (eager). Both phases must emit HELLO_FROM_GNU_LIB:OK and
-    // WX_CHECK:OK; the BIND_NOW:{0,1} sentinel distinguishes which
-    // resolution mode the linker actually took.
-    // Phase 76d.F — GNU-hash + PLT lazy resolve + LD_BIND_NOW + W^X
-    // end-to-end. Two-phase:
-    //   * default env: lazy resolution (B4 trampoline path).
-    //   * `LD_BIND_NOW=1`: eager resolution (E4 env-var path, F.3).
+    // Phase 76d.F — `dynlink_hello_gnu` exercises the GNU-hash backend
+    // (D1), the PLT lazy-resolve trampoline (B4), the `LD_BIND_NOW=1`
+    // env-var path (E4/F.3), and the W^X invariant (F.4). Two-phase:
+    //   * default env: lazy resolution (B4 trampoline path) → BIND_NOW:0.
+    //   * `LD_BIND_NOW=1`: eager resolution (E4 env-var path, F.3) → BIND_NOW:1.
     // Both phases must emit `HELLO_FROM_GNU_LIB:OK` and `WX_CHECK:OK`
-    // (F.4). The F.2 "trampoline traversal" assertion is implicit:
-    // under lazy default, the first call to hello_str() can only
-    // print the sentinel by running through the trampoline.
+    // (F.4); the BIND_NOW:{0,1} sentinel distinguishes which resolution
+    // mode the linker actually took. The F.2 "trampoline traversal"
+    // assertion is implicit: under lazy default, the first call to
+    // hello_str() can only print the sentinel by running through the
+    // trampoline.
     {
         let mut probe = Stat::zeroed();
         if stat(DYNLINK_HELLO_GNU_PATH, &mut probe) < 0 || probe.st_size == 0 {
