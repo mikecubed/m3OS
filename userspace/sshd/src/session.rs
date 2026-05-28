@@ -1515,28 +1515,36 @@ async fn drain_pty_locked(
 
 /// Clean up all session resources.
 ///
-/// The interactive shell (`/bin/ion`) installs handlers for SIGHUP, SIGINT,
-/// and SIGTERM that merely set a PENDING flag and do not terminate the
-/// process. Only SIGKILL is unblockable. To guarantee bounded cleanup time
-/// we send SIGHUP first (so well-behaved shells exit gracefully), poll
-/// `waitpid(WNOHANG)` for a brief grace period, and escalate to SIGKILL if
-/// the shell is still alive. Without this escalation `cleanup` would block
-/// indefinitely on `waitpid(_, _, 0)`, preventing `close(sock_fd)` from ever
-/// running and leaving the OpenSSH client hung waiting for FIN.
+/// Phase 77 (PR #118 residual fix): teardown is **EOF-driven**, not
+/// signal-driven.  We close the PTY master FIRST so the shell's
+/// controlling-terminal read returns end-of-file; an interactive shell
+/// (`/bin/ion` and every POSIX shell) treats EOF on stdin as logout and
+/// exits on its own — the canonical Unix way a session ends when the
+/// terminal disappears.  This deliberately avoids sending the shell a
+/// signal during teardown: `kill(shell, SIGHUP)` routes through the
+/// kernel's `interrupt_ipc_waits`, which races the SMP scheduler/IPC
+/// cancellation machinery when the shell is parked in an IPC wait and can
+/// wedge the guest (the 2026-04-25 disconnect hang).  SIGKILL is retained
+/// only as a bounded last resort for a (hypothetical) shell that ignores
+/// EOF, so `cleanup` always completes in bounded time and `close(sock_fd)`
+/// runs, delivering FIN to the OpenSSH client.
 fn cleanup(shell_pid: Option<isize>, pty_master: Option<i32>, pty_slave: Option<i32>) {
     if shell_pid.is_some() || pty_master.is_some() || pty_slave.is_some() {
         log_sshd_step("cleanup:start");
     }
+    // 1. Close the master first → the slave read returns EOF → shell exits.
+    if let Some(fd) = pty_master {
+        log_sshd_step_u64("cleanup:close pty_master", "fd", fd as u64);
+        close(fd);
+    }
+    // 2. Reap the shell. It should exit on EOF within the grace window with
+    //    no signal at all. Only if it stubbornly ignores EOF do we SIGKILL.
     if let Some(pid) = shell_pid {
-        log_sshd_step_u64("cleanup:kill shell", "child_pid", pid as u64);
-        // ion catches SIGHUP/SIGINT/SIGTERM and merely sets a PENDING flag;
-        // only SIGKILL is unblockable. Send SIGHUP first (graceful), poll
-        // waitpid(WNOHANG) for ~500ms, then escalate to SIGKILL so cleanup
-        // always completes in bounded time.
-        syscall_lib::kill(pid as i32, syscall_lib::SIGHUP as i32);
+        log_sshd_step_u64("cleanup:reap shell", "child_pid", pid as u64);
         let mut status: i32 = 0;
         let mut reaped = false;
-        for _ in 0..20 {
+        // ~2 s grace for the EOF-driven exit (80 × 25 ms).
+        for _ in 0..80 {
             let ret = waitpid(pid as i32, &mut status, syscall_lib::WNOHANG);
             if ret > 0 {
                 reaped = true;
@@ -1545,16 +1553,23 @@ fn cleanup(shell_pid: Option<isize>, pty_master: Option<i32>, pty_slave: Option<
             syscall_lib::nanosleep_for(0, 25_000_000);
         }
         if !reaped {
+            // Last resort: the shell ignored EOF. SIGKILL is unblockable.
             log_sshd_step_u64("cleanup:escalate SIGKILL", "child_pid", pid as u64);
             syscall_lib::kill(pid as i32, syscall_lib::SIGKILL as i32);
-            waitpid(pid as i32, &mut status, 0);
+            for _ in 0..40 {
+                if waitpid(pid as i32, &mut status, syscall_lib::WNOHANG) > 0 {
+                    reaped = true;
+                    break;
+                }
+                syscall_lib::nanosleep_for(0, 25_000_000);
+            }
+            if !reaped {
+                waitpid(pid as i32, &mut status, 0);
+            }
         }
         log_sshd_step_u64("cleanup:waitpid shell", "status", status as u64);
     }
-    if let Some(fd) = pty_master {
-        log_sshd_step_u64("cleanup:close pty_master", "fd", fd as u64);
-        close(fd);
-    }
+    // 3. Close the slave fd.
     if let Some(fd) = pty_slave {
         log_sshd_step_u64("cleanup:close pty_slave", "fd", fd as u64);
         close(fd);

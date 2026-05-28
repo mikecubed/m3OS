@@ -4230,14 +4230,16 @@ fn wake_task_v2_with(
         let log_unpaired_reply_wake = prev_state_u8 == TaskState::BlockedOnReply as u8
             && sched.tasks[idx].pending_msg.is_none();
 
-        // Re-read `assigned_core` and `on_cpu_ptr` from the VALIDATED slot,
-        // for use after both locks drop.
-        let assigned: u8 = sched.tasks[idx].assigned_core;
-        let on_cpu_ptr: *const core::sync::atomic::AtomicBool = &raw const sched.tasks[idx].on_cpu;
-        (assigned, on_cpu_ptr, log_unpaired_reply_wake)
+        // Read the `on_cpu` flag from the VALIDATED slot for the
+        // enqueue-vs-defer decision below.  The read happens under
+        // SCHEDULER.lock (held here), atomic with respect to the dispatch
+        // epilogue (which clears `on_cpu` and re-enqueues woken tasks under the
+        // same lock — see the matching change in the dispatch loop).
+        let on_cpu_now: bool = sched.tasks[idx].on_cpu.load(Ordering::Acquire);
+        (on_cpu_now, log_unpaired_reply_wake)
         // SCHEDULER.lock released, then pi_lock released.
     };
-    let (assigned_core, on_cpu_ptr, log_unpaired_reply_wake) = post_lock;
+    let (on_cpu_now, log_unpaired_reply_wake) = post_lock;
 
     // Phase 63 audio handoff follow-up — emit the deferred BlockedOnReply
     // wake diag now that both `pi_lock` and `scheduler_lock` are released.
@@ -4248,68 +4250,35 @@ fn wake_task_v2_with(
         log_wake_blocked_on_reply(id, caller_loc, false);
     }
 
-    // ── Step 4: Spin-wait on Task::on_cpu == false (cross-core only) ─────────
+    // ── Step 4: Enqueue now, or DEFER to the wakee's dispatch epilogue ───────
     //
-    // The arch-level switch-out epilogue clears `on_cpu` only after
-    // `saved_rsp` is durably written to the task struct (with Release
-    // ordering, Track E.1).  Spinning here with Acquire ordering guarantees
-    // that our subsequent `enqueue_to_core` observes the published
-    // `saved_rsp` so the dispatch path does not jump to a stale RSP.
+    // The arch switch-out epilogue (`dispatch_for_core`) publishes the wakee's
+    // `saved_rsp` with Release ordering and THEN clears `on_cpu`.  We read
+    // `on_cpu` (Acquire) under SCHEDULER.lock at CAS time (step 3):
     //
-    // Linux analog: `smp_cond_load_acquire(&p->on_cpu, !VAL)` in
-    // `try_to_wake_up` (`kernel/sched/core.c`).
+    //   * `on_cpu == false` — the wakee has fully switched out and its
+    //     `saved_rsp` is published (our Acquire read pairs with the epilogue's
+    //     Release).  We enqueue it here in step 5.  Because both our CAS and
+    //     the epilogue's "clear on_cpu + re-enqueue Ready" run under
+    //     SCHEDULER.lock, an `on_cpu == false` observation means the epilogue
+    //     already ran and saw the task still `Blocked*` (our CAS hadn't
+    //     landed), so it did NOT enqueue — no double-enqueue.
     //
-    // # Same-core escape
+    //   * `on_cpu == true` — the wakee is still mid-switch-out (on this or
+    //     another core).  We DEFER: the epilogue, which clears `on_cpu` and
+    //     re-enqueues any task it then finds `Ready` (serialised against our
+    //     CAS by SCHEDULER.lock), will enqueue it.  We do NOT enqueue here.
     //
-    // If the waker is running on the task's `assigned_core`, we skip the
-    // spin entirely.  Same-core wake is dispatch-safe by construction:
-    //   1. `pick_next` on this core consumes this core's local queue, so
-    //      our enqueue cannot be picked up until WE return.
-    //   2. The interrupted (or blocking) task can't reach the dispatch
-    //      epilogue — and therefore can't clear `on_cpu` — until WE
-    //      return.  Spinning would be a guaranteed deadlock for
-    //      same-core IRQ wakes (e.g. COM1 RX → wake_feeder_task →
-    //      wake_task_v2 for the very task whose `block_current_until`
-    //      the IRQ interrupted).
-    //   3. After we return, the task either self-reverts (state=Running,
-    //      our queue entry is silently filtered by dequeue_local's
-    //      state==Ready check) or proceeds to switch_context (saved_rsp
-    //      committed before pick_next can run on this core).
-    //
-    // SAFETY: `on_cpu_ptr` is a valid pointer to an `AtomicBool` in the
-    // same stable Task struct as `pi_lock_ptr` (step 1 invariant).
-    let waker_core = crate::smp::per_core().core_id;
-    if assigned_core != waker_core {
-        let on_cpu_ref = unsafe { &*on_cpu_ptr };
-        // Phase 57a: bounded by cross-core context-switch completion time.  The
-        // remote core clears `on_cpu` with Ordering::Release on its next switch-out.
-        // We intentionally busy-wait here: step 3 has already committed the
-        // wakeup transition, but step 5 has not yet published the task on its
-        // assigned core's run queue.  Blocking or yielding in this handoff
-        // window would require an additional wake/publication protocol to avoid
-        // losing forward progress under the current lock/queue invariants.
-        //
-        // Phase 57e Track B.2: under PREEMPT_FULL, a kernel-mode preemption
-        // mid-spin could migrate this task off `waker_core` and break the
-        // step 5 invariant ("the waker enqueues onto the wakee's assigned
-        // core").  `preempt_disable` keeps the waker pinned for the duration
-        // of the spin and the subsequent `enqueue_to_core` call.
-        preempt_disable();
-        // Phase 57e Track B.2 (review-resolution refinement): after
-        // `preempt_disable` we are pinned to the current core, but a
-        // preemption between the `waker_core` read above and reaching here
-        // could already have migrated us.  If migration moved us onto the
-        // wakee's `assigned_core`, the cross-core spin would deadlock on
-        // same-core (per the same-core escape comment above).  Re-check
-        // here after we are pinned and skip the spin in that case.  Limit
-        // the re-check to the cross-core branch to preserve the same-core
-        // fast path's zero-overhead profile.
-        if assigned_core != crate::smp::per_core().core_id {
-            while on_cpu_ref.load(Ordering::Acquire) {
-                core::hint::spin_loop();
-            }
-        }
-        preempt_enable();
+    // This replaces the previous cross-core `on_cpu` busy-spin, which could
+    // dead-/live-lock: two cores each spinning in `wake_task_v2` for a task
+    // mid-switch-out on the other core would each prevent the other core's
+    // scheduler loop (hence its epilogue, hence the `on_cpu` clear) from ever
+    // running — the SSH-disconnect freeze in
+    // `docs/handoffs/2026-04-25-pr-118-residual-issues.md`.  Deferring to the
+    // epilogue makes the handoff wait-free.
+    if on_cpu_now {
+        // Wakee mid-switch-out — the dispatch epilogue owns the enqueue.
+        return WakeOutcome::Woken;
     }
 
     // ── Step 5: Enqueue to assigned_core run queue + reschedule IPI ──────────
@@ -5367,6 +5336,16 @@ pub fn run() -> ! {
                         task.state = TaskState::Ready;
                         task.last_ready_tick = now;
                         task.last_migrated_tick = now;
+                        Some((task.assigned_core, sidx))
+                    } else if task.state == TaskState::Ready {
+                        // Woken DURING its own switch-out: a `wake_task_v2`
+                        // CAS'd this task Blocked* → Ready while `on_cpu` was
+                        // still set, so the waker deferred the enqueue to us
+                        // (see step 4 in `wake_task_v2`).  `saved_rsp` is now
+                        // published and `on_cpu` cleared above, so it is safe
+                        // to enqueue.  Both the waker's CAS and this check run
+                        // under SCHEDULER.lock, so exactly one of the two paths
+                        // performs the enqueue.
                         Some((task.assigned_core, sidx))
                     } else {
                         None

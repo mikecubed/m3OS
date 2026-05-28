@@ -3802,47 +3802,37 @@ pub(super) fn sys_nanosleep(req_ptr: u64) -> u64 {
         return 0;
     }
 
-    // v1 path (all durations) and sched-v2 path for < 1 ms:
+    // Everything that reaches here is a sub-millisecond sleep (1..=999 us):
+    // all sleeps >= 1 ms returned above via `block_current_until` on an
+    // absolute tick deadline (Phase 77 A.2 removed the dead v1 "long sleep"
+    // yield-loop that this `else` branch used to hold — it was unreachable
+    // because the `sleep_us >= 1_000` arm returns first).
+    debug_assert!(sleep_us < 1_000);
     if tsc_per_ms == 0 {
-        // TSC not yet calibrated — fall back to tick_count (coarse, 1ms res).
-        let ticks = (secs as u64).saturating_mul(TICKS_PER_SEC)
-            + (nsecs as u64) / (1_000_000_000 / TICKS_PER_SEC);
-        let start = crate::arch::x86_64::interrupts::tick_count();
-        while crate::arch::x86_64::interrupts::tick_count().wrapping_sub(start) < ticks {
-            crate::task::yield_now();
-            if has_pending_signal() {
-                return NEG_EINTR;
-            }
-        }
-    } else if sleep_us < 1_000 {
-        // Short sleep (< 1 ms): TSC busy-spin without yielding.
-        //
-        // APs have a 10 ms timer granularity, so a single yield_now() would
-        // sleep ~10 ms — far too coarse for sub-millisecond sleeps.  A brief
-        // busy-spin is acceptable here: the sleep completes in < 1 ms and the
-        // cost of a context switch would exceed the sleep duration.
-        let sleep_tsc = sleep_us.saturating_mul(tsc_per_ms) / 1_000;
-        let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
-        while unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start_tsc) < sleep_tsc {
-            core::hint::spin_loop();
-        }
-    } else {
-        // Long sleep (≥ 1 ms, v1 path only): yield-based sleep.
-        // TSC is invariant across cores, so this is accurate regardless of
-        // which AP DOOM runs on — each yield costs ~10 ms at the AP timer
-        // granularity, which is acceptable for multi-millisecond sleeps.
+        // Boot-window-only fallback: the TSC is not yet calibrated.  This path
+        // cannot be reached after APIC/TSC calibration completes during early
+        // boot, and a sub-millisecond duration cannot be timed accurately
+        // without the TSC, so we yield once and return rather than busy-spin on
+        // an uncalibrated clock.  (Sleeps >= 1 ms never reach here — they block
+        // on an absolute tick deadline above, which is valid even before TSC
+        // calibration, so PID 1 is never starved by the boot-window case.)
         crate::task::yield_now();
         if has_pending_signal() {
             return NEG_EINTR;
         }
-        let sleep_tsc = sleep_us.saturating_mul(tsc_per_ms) / 1_000;
-        let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
-        while unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start_tsc) < sleep_tsc {
-            crate::task::yield_now();
-            if has_pending_signal() {
-                return NEG_EINTR;
-            }
-        }
+        return 0;
+    }
+
+    // Short sleep (< 1 ms): TSC busy-spin without yielding.
+    //
+    // APs have a 10 ms timer granularity, so a single yield_now() would
+    // sleep ~10 ms — far too coarse for sub-millisecond sleeps.  A brief
+    // busy-spin is acceptable here: the sleep completes in < 1 ms and the
+    // cost of a context switch would exceed the sleep duration.
+    let sleep_tsc = sleep_us.saturating_mul(tsc_per_ms) / 1_000;
+    let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    while unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start_tsc) < sleep_tsc {
+        core::hint::spin_loop();
     }
     0
 }

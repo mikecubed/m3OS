@@ -48,11 +48,11 @@ pub fn wake_slave(id: u32) {
 
 /// Set the slave-side foreground process group for a PTY pair.
 ///
-/// Called from `TIOCSCTTY` when a session leader binds the controlling tty
-/// so the kernel's `close_master` SIGHUP-to-fg-pgrp delivery has a target.
-/// Without this, `slave_fg_pgid` stays 0 and `close_master` skips the
-/// SIGHUP path entirely — the symptom we hit on PR #118 where ion never
-/// receives SIGHUP after sshd closes the PTY master.
+/// Called from `TIOCSCTTY` when a session leader binds the controlling tty.
+/// The foreground pgid is consulted by the job-control signal paths
+/// (`TIOCSPGRP`/`TIOCGPGRP`, line-discipline `SIGINT`/`SIGWINCH` delivery).
+/// Note: `close_master` no longer broadcasts SIGHUP to this pgroup — see the
+/// Phase 77 comment there — it hangs up via EOF instead.
 pub fn set_slave_fg_pgid(id: u32, pgid: u32) {
     if (id as usize) < MAX_PTYS {
         let mut table = PTY_TABLE.lock();
@@ -105,21 +105,16 @@ pub fn add_slave_ref(id: u32) {
     }
 }
 
-/// Close one master reference. Sends SIGHUP when last ref is closed.
-/// Also frees the PTY pair if the slave side has already fully closed.
+/// Close one master reference. Hangs up the slave side via EOF when the last
+/// reference is closed. Also frees the PTY pair if the slave side has already
+/// fully closed.
 pub fn close_master(id: u32) {
-    let fg;
     {
         let mut table = PTY_TABLE.lock();
         if let Some(Some(pair)) = table.get_mut(id as usize) {
             if pair.master_refcount > 0 {
                 pair.master_refcount -= 1;
             }
-            fg = if pair.master_refcount == 0 {
-                pair.slave_fg_pgid
-            } else {
-                0
-            };
             // Free if both sides are done and the slave was opened at
             // least once (prevents a race where master is closed by a
             // forked child before the slave has been opened).
@@ -130,11 +125,18 @@ pub fn close_master(id: u32) {
             return;
         }
     }
-    // Send signals outside the lock to avoid deadlock with process table.
-    if fg != 0 {
-        crate::process::send_signal_to_group(fg, crate::process::SIGHUP);
-        crate::process::send_signal_to_group(fg, crate::process::SIGCONT);
-    }
+    // Phase 77 (PR #118 residual fix): hang up via EOF, NOT a synchronous
+    // SIGHUP-to-foreground-pgroup broadcast.  Sending a signal here is
+    // deadlock-prone: if a slave-side reader (e.g. a shell, or a server
+    // reading the slave on the shell's behalf) is parked in an IPC wait,
+    // `send_signal_to_group` routes through `interrupt_ipc_waits`, which
+    // races the scheduler/IPC cancellation machinery across cores and can
+    // wedge the guest (the 2026-04-25 SSH-disconnect hang).  Waking the
+    // slave readers below delivers EOF instead — the canonical Unix
+    // controlling-terminal-hangup mechanism: a blocked slave read returns
+    // 0, so the shell's REPL sees end-of-input and exits on its own.
+    // Explicit job-control signals still flow through `TIOCSPGRP`-driven
+    // paths and `sys_kill`.
     // Wake both sides — slave readers see EOF, master pollers see HUP.
     wake_master(id);
     wake_slave(id);
