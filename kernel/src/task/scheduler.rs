@@ -5904,6 +5904,14 @@ static DISPATCH_DUMP_FIRED: core::sync::atomic::AtomicBool =
 /// Acquires `SCHEDULER.lock` briefly to snapshot task state, then releases
 /// it before walking per-core run queues so the dump never holds the
 /// scheduler lock while iterating IRQ-shared `run_queue` mutexes.
+/// Public trigger for the per-core dispatch-state dump. Used by `sys_ktrace`
+/// (`ktrace cores`) to name the task holding a core in ring 0 — and the
+/// freshly-Ready tasks piled up behind it — while an interactive session is
+/// wedged. Prints to serial via `log::warn!`.
+pub fn ktrace_dump_dispatch_state() {
+    dump_dispatch_state();
+}
+
 fn dump_dispatch_state() {
     let n_cores = crate::smp::core_count();
 

@@ -408,8 +408,50 @@ re-dispatch it (and other Ready tasks pile up on cores 3/1). This is the *same c
 halted with a missed reschedule) doesn't pick up a freshly-Ready task until it voluntarily
 yields. The IPC reply path is exonerated.
 
+## Core-context capture (fifth pass) — it IS a lost wake on BlockedOnRecv
+
+Added two lightweight serial dumps to `ktrace` — `cores` (cmd 7, per-core dispatch state via
+`dump_dispatch_state`) and `states` (cmd 8, **every** task's state incl. Blocked, no
+preempt-trace flood) — and sampled them repeatedly during a live hang. Result, stable across
+samples:
+
+```
+idx=28 pid=34 state=BlkRecv core=1   <- sshd session child (teardown actor)
+idx=27 pid=35 state=BlkRecv core=1   <- ion (session shell)
+```
+
+Both wedged tasks are **BlockedOnRecv**, and the cores are **idle** (core 2/3 running their
+idle task). So the freeze is a **lost wake on a plain `recv`** — NOT dispatch starvation. This
+**confirms the original evidence point #4** and **invalidates the dispatch-starvation detour**
+(the `stale-ready` warnings were transient latency on *other* tasks, not the wedged ones). ⇒
+**The planned idle-task-only redispatch fix is inapplicable** (the tasks are Blocked, not Ready).
+
+Refined causal chain:
+- **`ion`'s wait is legitimate** — it is correctly blocked reading its PTY slave
+  (`block_on_pty_slave_read`, already verified lost-wake-safe), waiting for input that never
+  arrives because the relay is stuck.
+- **The root is the sshd child (pid 34) stuck in `BlockedOnRecv`** — almost certainly its
+  `poll()`/socket-recv multiplex of the TCP socket + PTY master: the `exit\n` bytes
+  (client→TCP→sshd→PTY→ion) never get relayed.
+- The IPC `recv`/`reply` v2 block primitives (`block_current_on_recv_v2` /
+  `block_current_on_reply_v2`, scheduler.rs:3810/3592) both register a waker + recheck
+  `pending_msg` before parking — race-free. The TCP receive path sets `wake_slot` on every
+  matched segment and calls `wake_sockets_for_tcp_slot` after the lock drops (tcp.rs:644-726)
+  — fires correctly. `sys_poll` re-registers + rescans each iteration — lost-wake-safe.
+- So every wake path *reads* as correct ⇒ this is a **subtle intermittent race** in the
+  net_task → `wake_socket` → poll chain, OR the `on_cpu` deferred-enqueue epilogue
+  (`6f57fbc`). It cannot be pinned by inspection; it needs targeted block/wake tracing at the
+  exact hang moment. (Consistent with the original "any extra scheduler activity unsticks it"
+  Heisenbug — the task is enqueue-able, the wake is *almost* delivered.)
+
 ## Immediate next steps (with the tool now in hand)
 
+0. **CURRENT: instrument the block/wake chain to pinpoint the lost wake.** Emit a focus
+   trace event when a target parks (`BlockCurrent` at `block_current_until`) and on every
+   `wake_task_v2` *outcome*, so the timeline shows the target's last `BLOCK` and whether a
+   wake fired (and with what outcome: enqueued / deferred / already-awake / not-found). A
+   `BLOCK` with no following `WAKE` ⇒ producer never woke it; a `WAKE(deferred)` with no
+   `DISPATCH` ⇒ lost deferred enqueue. Then fix that specific site.
 1. **Capture the stalled core's running context.** The focus filter is target-only, so it
    shows the *victims* (ion, the stale-ready tasks) but not **what occupies core 3 / core 1
    in ring 0 while they wait**. Add a small focus mode that, in addition to the targets, also

@@ -19196,6 +19196,8 @@ const KTRACE_READ_FOCUS: u64 = 3;
 const KTRACE_FOCUS_LEN: u64 = 4;
 const KTRACE_TASKS: u64 = 5;
 const KTRACE_DUMP_SERIAL: u64 = 6;
+const KTRACE_DUMP_CORES: u64 = 7;
+const KTRACE_DUMP_TASKS_SERIAL: u64 = 8;
 
 /// Largest kernel staging buffer for a single text dump call (focus / tasks).
 #[cfg(feature = "trace")]
@@ -19220,6 +19222,8 @@ const KTRACE_FOCUS_BATCH: usize = 256;
 /// - `6 DUMP_SERIAL`: dump the whole focus ring to the serial console (the
 ///   always-available path for reading the trace while userspace I/O is wedged
 ///   by the hang under study). Returns entries dumped.
+/// - `7 DUMP_CORES`: dump per-core dispatch state (current task + run queue per
+///   core, and every Ready/Running task) to serial. Names the ring-0 hog.
 ///
 /// Returns `u64::MAX` on error.
 pub(super) fn sys_ktrace(cmd: u64, a: u64, b: u64, c: u64) -> u64 {
@@ -19231,6 +19235,11 @@ pub(super) fn sys_ktrace(cmd: u64, a: u64, b: u64, c: u64) -> u64 {
             0
         }
         KTRACE_DUMP_SERIAL => sys_ktrace_dump_serial(),
+        KTRACE_DUMP_CORES => {
+            crate::task::scheduler::ktrace_dump_dispatch_state();
+            0
+        }
+        KTRACE_DUMP_TASKS_SERIAL => sys_ktrace_dump_tasks_serial(),
         KTRACE_FOCUS_LEN => crate::trace::focus::len() as u64,
         KTRACE_READ_FOCUS => sys_ktrace_read_focus(a, b, c),
         KTRACE_TASKS => sys_ktrace_tasks(b, c),
@@ -19385,6 +19394,37 @@ fn sys_ktrace_tasks(buf_ptr: u64, buf_len: u64) -> u64 {
 fn sys_ktrace_dump_serial() -> u64 {
     // Annotation uses the arm-time name snapshot stored in the focus ring.
     crate::trace::focus::dump_serial() as u64
+}
+
+/// Dump every live task's state to serial (idx/pid/state/prio/core/name),
+/// INCLUDING Blocked tasks. Lightweight (~one line per task, no preempt-trace
+/// flood) so it does not perturb the hang it samples. Distinguishes a lost
+/// wake (`ion` stuck `Blk*`) from dispatch starvation (`ion` stuck `Ready`).
+#[cfg(feature = "trace")]
+fn sys_ktrace_dump_tasks_serial() -> u64 {
+    // Pre-reserve before the scheduler-locked walk so it never allocates while
+    // the lock is held; format to serial afterwards (lock released).
+    let mut rows: alloc::vec::Vec<(u32, u32, u8, u8, u8, &'static str)> =
+        alloc::vec::Vec::with_capacity(160);
+    crate::task::scheduler::ktrace_for_each_task(|idx, pid, st, prio, core, name| {
+        if rows.len() < rows.capacity() {
+            rows.push((idx, pid, st, prio, core, name));
+        }
+    });
+    crate::serial_println!("=== KTRACE TASK STATES ({} tasks) ===", rows.len());
+    for (idx, pid, st, prio, core, name) in &rows {
+        crate::serial_println!(
+            "idx={} pid={} state={} prio={} core={} {}",
+            idx,
+            pid,
+            ktrace_state_name(*st),
+            prio,
+            core,
+            name
+        );
+    }
+    crate::serial_println!("=== END KTRACE TASK STATES ===");
+    rows.len() as u64
 }
 
 /// Map a `TaskState` u8 discriminant to a short name (see `SchedTrace` docs).

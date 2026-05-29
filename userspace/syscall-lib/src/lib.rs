@@ -2538,6 +2538,8 @@ pub const KTRACE_READ_FOCUS: u64 = 3;
 pub const KTRACE_FOCUS_LEN: u64 = 4;
 pub const KTRACE_TASKS: u64 = 5;
 pub const KTRACE_DUMP_SERIAL: u64 = 6;
+pub const KTRACE_DUMP_CORES: u64 = 7;
+pub const KTRACE_DUMP_TASKS_SERIAL: u64 = 8;
 
 /// Read raw `TraceEntry` records from a specific core's ring into a byte buffer
 /// (legacy/compat path).
@@ -2581,6 +2583,19 @@ pub fn ktrace_disarm() -> u64 {
 /// even while the userspace I/O path is wedged). Returns entries dumped.
 pub fn ktrace_dump_serial() -> u64 {
     unsafe { syscall1(SYS_KTRACE, KTRACE_DUMP_SERIAL) }
+}
+
+/// Dump per-core dispatch state (current task + run queue per core, and every
+/// Ready/Running task) to the kernel serial console. Returns 0.
+pub fn ktrace_dump_cores() -> u64 {
+    unsafe { syscall1(SYS_KTRACE, KTRACE_DUMP_CORES) }
+}
+
+/// Dump every live task's state (including Blocked) to the kernel serial
+/// console. Lightweight; distinguishes a lost wake from dispatch starvation.
+/// Returns the task count.
+pub fn ktrace_dump_tasks_serial() -> u64 {
+    unsafe { syscall1(SYS_KTRACE, KTRACE_DUMP_TASKS_SERIAL) }
 }
 
 /// Current number of entries in the focus trace ring.

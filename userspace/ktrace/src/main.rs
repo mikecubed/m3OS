@@ -15,8 +15,9 @@
 #![no_main]
 
 use syscall_lib::{
-    STDOUT_FILENO, exit, ktrace_arm, ktrace_disarm, ktrace_dump_serial, ktrace_focus_len,
-    ktrace_read_focus, ktrace_tasks, write, write_str, write_u64,
+    STDOUT_FILENO, exit, ktrace_arm, ktrace_disarm, ktrace_dump_cores, ktrace_dump_serial,
+    ktrace_dump_tasks_serial, ktrace_focus_len, ktrace_read_focus, ktrace_tasks, write, write_str,
+    write_u64,
 };
 
 syscall_lib::entry_point!(main);
@@ -48,6 +49,28 @@ fn main(args: &[&str]) -> i32 {
             write_str(STDOUT_FILENO, "\n");
             0
         }
+        // Dump per-core dispatch state to serial — names what holds each core
+        // (and what is Ready-but-waiting) while a session is wedged.
+        "cores" => {
+            ktrace_dump_cores();
+            write_str(
+                STDOUT_FILENO,
+                "ktrace: dumped per-core dispatch state to serial\n",
+            );
+            0
+        }
+        // Dump every task's state (incl. Blocked) to serial — lightweight,
+        // distinguishes lost-wake (Blk*) from dispatch-starvation (Ready).
+        "states" => {
+            let n = ktrace_dump_tasks_serial();
+            write_str(
+                STDOUT_FILENO,
+                "ktrace: dumped task states to serial, tasks = ",
+            );
+            write_u64(STDOUT_FILENO, n);
+            write_str(STDOUT_FILENO, "\n");
+            0
+        }
         _ => {
             usage();
             1
@@ -58,7 +81,7 @@ fn main(args: &[&str]) -> i32 {
 fn usage() {
     write_str(
         STDOUT_FILENO,
-        "usage: ktrace <arm PID... | dump | serial | tasks | len | off>\n",
+        "usage: ktrace <arm PID... | dump | serial | cores | tasks | len | off>\n",
     );
 }
 
