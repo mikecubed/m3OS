@@ -264,6 +264,22 @@ impl<const N: usize> TraceRing<N> {
         }
     }
 
+    /// Iterate at most `max` entries in chronological order, starting at
+    /// chronological index `start` (0 = oldest). Returns the number of entries
+    /// visited. Enables paging through a deep ring without allocation — a
+    /// caller drains it by repeatedly calling with `start += visited`.
+    pub fn for_each_from(&self, start: usize, max: usize, mut f: impl FnMut(&TraceEntry)) -> usize {
+        if self.count == 0 || max == 0 || start >= self.count {
+            return 0;
+        }
+        let ring_start = if self.count < N { 0 } else { self.write_idx };
+        let take = (self.count - start).min(max);
+        for i in start..(start + take) {
+            f(&self.buf[(ring_start + i) % N]);
+        }
+        take
+    }
+
     /// Copy entries in chronological order into `dst`, returning the count written.
     ///
     /// Does not allocate. Suitable for `sys_ktrace` where entries must be
@@ -424,6 +440,31 @@ mod tests {
         for (i, entry) in snap.iter().enumerate() {
             assert_eq!(collected[i], entry.tick);
         }
+    }
+
+    #[test]
+    fn for_each_from_pages_through_ring() {
+        let mut ring = TraceRing::<8>::new();
+        for i in 0..12 {
+            ring.push(make_entry(i)); // ring now holds ticks 4..=11
+        }
+        // Page through in batches of 3, accumulating.
+        let mut got = Vec::new();
+        let mut start = 0;
+        loop {
+            let mut batch = Vec::new();
+            let n = ring.for_each_from(start, 3, |e| batch.push(e.tick));
+            if n == 0 {
+                break;
+            }
+            assert_eq!(n, batch.len());
+            got.extend(batch);
+            start += n;
+        }
+        assert_eq!(got, vec![4, 5, 6, 7, 8, 9, 10, 11]);
+        // start past the end yields nothing.
+        assert_eq!(ring.for_each_from(8, 4, |_| {}), 0);
+        assert_eq!(ring.for_each_from(100, 4, |_| {}), 0);
     }
 
     #[test]

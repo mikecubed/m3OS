@@ -2876,6 +2876,66 @@ pub fn task_times_for_pid(pid: u32) -> (u64, u64, u64, u64) {
     (user, system, child_user, child_system)
 }
 
+// ---------------------------------------------------------------------------
+// ktrace focus support (deep per-task trace tool)
+// ---------------------------------------------------------------------------
+
+/// Resolve target pids to task indices for the ktrace focus ring. Fills `out`
+/// with the `task_idx` of every live task whose pid is in `pids` (a thread
+/// group may contribute several idxs). Returns the count written.
+pub fn ktrace_resolve_pids(pids: &[u32], out: &mut [u32]) -> usize {
+    let sched = scheduler_lock();
+    let mut n = 0;
+    for (idx, task) in sched.tasks.iter().enumerate() {
+        if n >= out.len() {
+            break;
+        }
+        if pids.contains(&task.pid) && !matches!(task.state, TaskState::Dead) {
+            out[n] = idx as u32;
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Collect the per-core idle task indices (so the focus filter can drop idle
+/// dispatch/yield churn). Returns the count written.
+pub fn ktrace_idle_idxs(out: &mut [u32]) -> usize {
+    let sched = scheduler_lock();
+    let mut n = 0;
+    for slot in sched.idle_tasks.iter() {
+        if n >= out.len() {
+            break;
+        }
+        if let Some(idx) = slot {
+            out[n] = *idx as u32;
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Snapshot the live task table for ktrace: invokes
+/// `f(idx, pid, state_u8, priority, assigned_core, name)` for every non-Dead
+/// task. Used by the `sys_ktrace` TASKS dump and to annotate focus entries
+/// with pid/name. Holds `SCHEDULER.lock` only for the duration of the walk.
+pub fn ktrace_for_each_task(mut f: impl FnMut(u32, u32, u8, u8, u8, &'static str)) {
+    let sched = scheduler_lock();
+    for (idx, task) in sched.tasks.iter().enumerate() {
+        if matches!(task.state, TaskState::Dead) {
+            continue;
+        }
+        f(
+            idx as u32,
+            task.pid,
+            task.state as u8,
+            task.priority,
+            task.assigned_core,
+            task.name,
+        );
+    }
+}
+
 /// Aggregate CPU-time split for `/proc/stat`, summed across all cores.
 /// Returns `(user_ms, system_ms, idle_ms)`: busy (user/system) is summed
 /// over every non-idle task, idle over the per-core idle tasks. All values

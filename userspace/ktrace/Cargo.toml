@@ -1,0 +1,11 @@
+[package]
+name = "ktrace"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "ktrace"
+path = "src/main.rs"
+
+[dependencies]
+syscall-lib = { path = "../syscall-lib" }

@@ -819,6 +819,7 @@ fn build_userspace_bins() {
         ("adduser", "adduser", false),
         ("id", "id", false),
         ("whoami", "whoami", false),
+        ("ktrace", "ktrace", false), // deep per-task scheduler trace tool
         ("pty-test", "pty-test", false),
         ("unix-socket-test", "unix-socket-test", false),
         ("thread-test", "thread-test", false),

@@ -102,6 +102,7 @@ static PASSWD_ELF: &[u8] = generated_initrd_asset!("passwd");
 static ADDUSER_ELF: &[u8] = generated_initrd_asset!("adduser");
 static ID_ELF: &[u8] = generated_initrd_asset!("id");
 static WHOAMI_ELF: &[u8] = generated_initrd_asset!("whoami");
+static KTRACE_ELF: &[u8] = generated_initrd_asset!("ktrace");
 static TELNETD_ELF: &[u8] = generated_initrd_asset!("telnetd");
 // Phase 43: SSH server
 static SSHD_ELF: &[u8] = generated_initrd_asset!("sshd");
@@ -496,6 +497,12 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "whoami",
         RamdiskNode::File {
             content: WHOAMI_ELF,
+        },
+    ),
+    (
+        "ktrace",
+        RamdiskNode::File {
+            content: KTRACE_ELF,
         },
     ),
     (

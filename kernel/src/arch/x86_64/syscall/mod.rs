@@ -1961,7 +1961,7 @@ pub extern "C" fn syscall_handler(
         DEBUG_PRINT => sys_debug_print(arg0, arg1),
         MEMINFO => sys_meminfo(arg0, arg1),
         #[cfg(feature = "trace")]
-        KTRACE => sys_ktrace(arg0, arg1, arg2),
+        KTRACE => sys_ktrace(arg0, arg1, arg2, per_core_syscall_arg3()),
         FRAMEBUFFER_INFO => sys_framebuffer_info(arg0, arg1),
         FRAMEBUFFER_MMAP => sys_framebuffer_mmap(),
         FRAMEBUFFER_RELEASE => sys_framebuffer_release(),
@@ -19188,68 +19188,219 @@ pub(super) fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout
 // sys_ktrace — Phase 43b Track G
 // ---------------------------------------------------------------------------
 
+// ktrace command codes (passed in arg0). Keep in sync with `syscall_lib`.
+const KTRACE_READ_CORE: u64 = 0;
+const KTRACE_ARM: u64 = 1;
+const KTRACE_DISARM: u64 = 2;
+const KTRACE_READ_FOCUS: u64 = 3;
+const KTRACE_FOCUS_LEN: u64 = 4;
+const KTRACE_TASKS: u64 = 5;
+const KTRACE_DUMP_SERIAL: u64 = 6;
+
+/// Largest kernel staging buffer for a single text dump call (focus / tasks).
 #[cfg(feature = "trace")]
-/// Read trace ring entries from a specific core into a userspace buffer.
+const KTRACE_TEXT_CAP: usize = 16 * 1024;
+/// Focus entries formatted per `READ_FOCUS` call (callers page with `offset`).
+#[cfg(feature = "trace")]
+const KTRACE_FOCUS_BATCH: usize = 256;
+
+#[cfg(feature = "trace")]
+/// Kernel trace control + readout. Command (`cmd`, arg0) selects the operation:
 ///
-/// Arguments:
-///   - `core_id`: which core's trace ring to read
-///   - `buf_ptr`: userspace buffer address
-///   - `buf_len`: size of the userspace buffer in bytes
+/// - `0 READ_CORE`: a=core_id, b=buf_ptr, c=buf_len — copy raw `TraceEntry`
+///   records from a per-core ring (legacy/compat path).
+/// - `1 ARM`: a=pids_ptr (u32 array), b=count — arm the deep focus ring on
+///   those pids. Returns resolved target idx count.
+/// - `2 DISARM`: disarm the focus ring.
+/// - `3 READ_FOCUS`: a=offset, b=buf_ptr, c=buf_len — write annotated text
+///   lines for focus entries `[offset..]`. Returns entries written.
+/// - `4 FOCUS_LEN`: return the focus ring's current entry count.
+/// - `5 TASKS`: b=buf_ptr, c=buf_len — write the live task table as text
+///   (idx pid state prio core name). Returns rows.
+/// - `6 DUMP_SERIAL`: dump the whole focus ring to the serial console (the
+///   always-available path for reading the trace while userspace I/O is wedged
+///   by the hang under study). Returns entries dumped.
 ///
-/// Returns the number of entries written, or `u64::MAX` on error.
-pub(super) fn sys_ktrace(core_id: u64, buf_ptr: u64, buf_len: u64) -> u64 {
-    let core_id = core_id as u8;
-    if core_id >= crate::smp::core_count() {
-        return u64::MAX;
+/// Returns `u64::MAX` on error.
+pub(super) fn sys_ktrace(cmd: u64, a: u64, b: u64, c: u64) -> u64 {
+    match cmd {
+        KTRACE_READ_CORE => sys_ktrace_read_core(a, b, c),
+        KTRACE_ARM => sys_ktrace_arm(a, b),
+        KTRACE_DISARM => {
+            crate::trace::focus::disarm();
+            0
+        }
+        KTRACE_DUMP_SERIAL => sys_ktrace_dump_serial(),
+        KTRACE_FOCUS_LEN => crate::trace::focus::len() as u64,
+        KTRACE_READ_FOCUS => sys_ktrace_read_focus(a, b, c),
+        KTRACE_TASKS => sys_ktrace_tasks(b, c),
+        _ => u64::MAX,
     }
-    if buf_ptr == 0 {
+}
+
+#[cfg(feature = "trace")]
+fn sys_ktrace_read_core(core_id: u64, buf_ptr: u64, buf_len: u64) -> u64 {
+    let core_id = core_id as u8;
+    if core_id >= crate::smp::core_count() || buf_ptr == 0 {
         return u64::MAX;
     }
     if buf_len == 0 {
         return 0;
     }
-
     let data = match crate::smp::get_core_data(core_id) {
         Some(d) => d,
         None => return u64::MAX,
     };
-
-    // Safety: trace_ring is wrapped in UnsafeCell for interior mutability.
-    // We only read; the owning core may concurrently write (at most one
-    // torn entry, which is acceptable for diagnostic data).
+    // Safety: trace_ring is UnsafeCell; we only read. The owning core may
+    // concurrently write (at most one torn entry — acceptable for diagnostics).
     let ring_ptr = data.trace_ring.get();
-
     let entry_size = core::mem::size_of::<kernel_core::trace_ring::TraceEntry>();
     let max_entries = (buf_len as usize) / entry_size;
-
     if max_entries == 0 {
         return 0;
     }
-
-    // Use a fixed stack buffer to avoid heap allocation. Cap at 64 entries
-    // per call; callers can call again for more.
     const MAX_BATCH: usize = 64;
     let batch = max_entries.min(MAX_BATCH);
     let mut tmp = [kernel_core::trace_ring::TraceEntry::EMPTY; MAX_BATCH];
     let write_count = unsafe { (*ring_ptr).copy_into(&mut tmp[..batch]) };
-
     if write_count == 0 {
         return 0;
     }
-
-    // TraceEntry uses #[repr(C)] with explicit padding fields zeroed on
-    // construction, so raw byte reinterpretation is safe — no uninit bytes.
+    // TraceEntry is #[repr(C)] with zeroed padding, so byte reinterpretation
+    // leaks no uninit bytes.
     let src_bytes =
         unsafe { core::slice::from_raw_parts(tmp.as_ptr() as *const u8, write_count * entry_size) };
-
     if UserSliceWo::new(buf_ptr, src_bytes.len())
         .and_then(|s| s.copy_from_kernel(src_bytes))
         .is_err()
     {
         return u64::MAX;
     }
-
     write_count as u64
+}
+
+#[cfg(feature = "trace")]
+fn sys_ktrace_arm(pids_ptr: u64, count: u64) -> u64 {
+    use crate::trace::focus::MAX_TARGETS;
+    if pids_ptr == 0 {
+        return u64::MAX;
+    }
+    let count = (count as usize).min(MAX_TARGETS);
+    if count == 0 {
+        return u64::MAX;
+    }
+    // Read the requested pids from userspace.
+    let mut pid_bytes = [0u8; MAX_TARGETS * 4];
+    let want = count * 4;
+    if UserSliceRo::new(pids_ptr, want)
+        .and_then(|s| s.copy_to_kernel(&mut pid_bytes[..want]))
+        .is_err()
+    {
+        return u64::MAX;
+    }
+    let mut pids = [0u32; MAX_TARGETS];
+    for i in 0..count {
+        pids[i] = u32::from_ne_bytes(pid_bytes[i * 4..i * 4 + 4].try_into().unwrap());
+    }
+    // Resolve pids -> task indices.
+    let mut target_idxs = [0u32; MAX_TARGETS];
+    let n_targets = crate::task::scheduler::ktrace_resolve_pids(&pids[..count], &mut target_idxs);
+    // Snapshot the idx -> (pid, name) table now (targets alive) for annotation.
+    let mut names: alloc::vec::Vec<(u32, u32, &'static str)> = alloc::vec::Vec::with_capacity(96);
+    crate::task::scheduler::ktrace_for_each_task(|idx, pid, _st, _prio, _core, name| {
+        if names.len() < names.capacity() {
+            names.push((idx, pid, name));
+        }
+    });
+    crate::trace::focus::arm(&target_idxs[..n_targets], names);
+    n_targets as u64
+}
+
+#[cfg(feature = "trace")]
+fn sys_ktrace_read_focus(offset: u64, buf_ptr: u64, buf_len: u64) -> u64 {
+    if buf_ptr == 0 || buf_len == 0 {
+        return u64::MAX;
+    }
+    // Annotation uses the arm-time name snapshot stored in the focus ring.
+    let cap = (buf_len as usize).min(KTRACE_TEXT_CAP);
+    let mut out = alloc::vec![0u8; cap];
+    let entries = crate::trace::focus::dump_text(offset as usize, KTRACE_FOCUS_BATCH, &mut out);
+
+    // Copy the formatted text (through the NUL terminator) to userspace.
+    let text_len = out
+        .iter()
+        .position(|&x| x == 0)
+        .map(|p| p + 1)
+        .unwrap_or(cap);
+    let copy_len = text_len.min(cap);
+    if UserSliceWo::new(buf_ptr, copy_len)
+        .and_then(|s| s.copy_from_kernel(&out[..copy_len]))
+        .is_err()
+    {
+        return u64::MAX;
+    }
+    entries as u64
+}
+
+#[cfg(feature = "trace")]
+fn sys_ktrace_tasks(buf_ptr: u64, buf_len: u64) -> u64 {
+    use core::fmt::Write;
+    if buf_ptr == 0 || buf_len == 0 {
+        return u64::MAX;
+    }
+    // Snapshot rows under the scheduler lock (pre-reserved: no alloc while held).
+    let mut rows: alloc::vec::Vec<(u32, u32, u8, u8, u8, &'static str)> =
+        alloc::vec::Vec::with_capacity(96);
+    crate::task::scheduler::ktrace_for_each_task(|idx, pid, st, prio, core, name| {
+        if rows.len() < rows.capacity() {
+            rows.push((idx, pid, st, prio, core, name));
+        }
+    });
+
+    let mut s = alloc::string::String::with_capacity((buf_len as usize).min(KTRACE_TEXT_CAP));
+    let _ = writeln!(s, "idx pid state prio core name");
+    for (idx, pid, st, prio, core, name) in &rows {
+        let _ = writeln!(
+            s,
+            "{idx} {pid} {} {prio} {core} {name}",
+            ktrace_state_name(*st)
+        );
+    }
+
+    let bytes = s.as_bytes();
+    let cap = (buf_len as usize).saturating_sub(1).min(bytes.len());
+    let mut tmp = alloc::vec![0u8; cap + 1];
+    tmp[..cap].copy_from_slice(&bytes[..cap]);
+    tmp[cap] = 0; // NUL-terminate
+    if UserSliceWo::new(buf_ptr, tmp.len())
+        .and_then(|sl| sl.copy_from_kernel(&tmp))
+        .is_err()
+    {
+        return u64::MAX;
+    }
+    rows.len() as u64
+}
+
+#[cfg(feature = "trace")]
+fn sys_ktrace_dump_serial() -> u64 {
+    // Annotation uses the arm-time name snapshot stored in the focus ring.
+    crate::trace::focus::dump_serial() as u64
+}
+
+/// Map a `TaskState` u8 discriminant to a short name (see `SchedTrace` docs).
+#[cfg(feature = "trace")]
+fn ktrace_state_name(st: u8) -> &'static str {
+    match st {
+        0 => "Ready",
+        1 => "Running",
+        2 => "BlkRecv",
+        3 => "BlkSend",
+        4 => "BlkReply",
+        5 => "BlkNotif",
+        6 => "BlkFutex",
+        7 => "Dead",
+        _ => "?",
+    }
 }
 
 // ===========================================================================

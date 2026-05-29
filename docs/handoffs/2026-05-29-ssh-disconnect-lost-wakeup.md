@@ -334,3 +334,67 @@ kernel teardown lost-wake / kernel-mode-no-preempt path (recommended next steps 
 the dedicated deep per-task trace, or the idle-task-only redispatch in
 `reschedule_ipi_handler_kernel`). Verify any future fix with the now-portable
 `scripts/ssh_session_exit_test.sh virtio exit`.
+
+---
+
+# Update: `ktrace` deep per-task trace tool BUILT + first capture (2026-05-29, fourth session)
+
+The deep per-task trace tool (recommended step 1) is **built and working**, and its first
+capture **pins the freeze endpoint** the earlier cycles could not.
+
+## The tool (`ktrace`)
+
+A deep, **pid-filtered** focus trace ring, decoupled from the shallow per-core
+`TraceRing<128>` rings so it is not swamped by idle churn. Controlled via the extended
+`sys_ktrace` (syscall `0x1002`) and a new `userspace/ktrace` binary.
+
+- Kernel: `kernel/src/trace.rs::focus` — a heap `Vec`-backed ring (`FOCUS_CAP=4096`) that
+  records **only events whose subject task index is a target** (≤8 targets). Filtering uses
+  standalone atomics so `record()` only takes the ring lock for kept events (rare); it uses
+  `try_lock` and never nests another lock, so it is safe from scheduler-locked / IRQ-ish
+  contexts. Entries are annotated from an **arm-time** `idx→(pid,name)` snapshot (dump-time
+  lookup mislabels them — task slots are reused during teardown).
+- ABI (`sys_ktrace(cmd,a,b,c)`): `1 ARM(pids)`, `2 DISARM`, `3 READ_FOCUS(offset)` (paged
+  text), `4 FOCUS_LEN`, `5 TASKS`, **`6 DUMP_SERIAL`**. The serial dump is the load-bearing
+  path: it prints the ring to the **serial console**, which works even while the userspace
+  I/O path is wedged by the very hang under study (the userspace `read_focus` path is *not*
+  reliable mid-hang).
+- Usage: `ktrace arm <pid>...` then trigger the hang, then from a second SSH session
+  `ktrace serial` and read the dump out of the QEMU serial log.
+
+## First capture — what it shows (DECISIVE)
+
+Armed on the session's sshd-child (pid 21, idx 25) + its `ion` (pid 22, idx 26) + the sshd
+listener (pid 3), then sent `exit`, waited 12 s, dumped from a second session. The focus
+ring (target-only) is clean and legible. Over the 4.4 s window from arm to the freeze:
+
+- **`ion` (pid 22) is in a tight synchronous IPC `call` loop on endpoint 4** — 1784×
+  `CALL_BLOCK ep=4` → `REPLY_DELIVER`, ~2.5 ms/cycle. It uses a **direct call/reply
+  rendezvous hand-off** (no `Dispatch`/`Wake`/`Enqueue` events for idx 26 at all — the reply
+  resumes the caller without going through the run queue).
+- **The hang's freeze point is exact:** the *last* recorded event is
+  `t=47971 REPLY_DELIVER caller_idx=26 pid=22` — ion's call got its reply (so ion became
+  runnable) and then **ion never ran again** (no next `CALL_BLOCK`, ever). The dump ran ~12 s
+  later with zero newer entries. So **the reply was delivered but the caller was never
+  resumed** — the textbook "wake/reply fires but the task is never dispatched" endpoint.
+- sshd child (pid 21) was being woken/dispatched normally (44 wakes / 132 dispatches) until
+  t=47881, then it too goes silent (~90 ticks before ion).
+
+So the teardown hang localises to the **IPC call/reply resume path** (the rendezvous that
+hands the CPU back to a `call`-blocked caller after `reply`), NOT the generic run-queue
+dispatch — a tighter localisation than the prior `preempt-voluntary` hypothesis.
+
+## Immediate next steps (with the tool now in hand)
+
+1. **Identify endpoint 4 and trace the server side.** `ion` calls ep4 synchronously every
+   input cycle (likely `vfs_server`/`console` — the VFS read path uses
+   `endpoint::call_msg(vfs_ep,…)`). Re-run the capture arming the **ep4 server pid too**, so
+   the dump shows the server's `RECV`/`REPLY` and whether, on the final reply, the caller is
+   (a) enqueued-Ready-but-never-dispatched, or (b) never enqueued at all (lost-wake in
+   `reply`). The current target-only trace shows ion has *no* enqueue/dispatch events
+   (direct hand-off), so audit `endpoint::reply*` → caller-resume for a missed hand-off.
+2. **Why is `ion` busy-looping ep4 at ~2.5 ms/cycle?** That tight synchronous poll is itself
+   suspect (a blocking read should not spin). It may be the same input-not-delivered symptom
+   (ion never receives the `exit\n`, so it re-polls) — confirm by tracing the input path.
+3. Audit the `reply`/`call` rendezvous resume for a missed-wakeup window analogous to the
+   `wake_task_v2_if` TOCTTOU fix, focusing on the hand-back to the `BlockedOnReply` caller.
