@@ -46,6 +46,11 @@ struct ProcessSnapshot {
     brk_current: u64,
     mappings: Vec<MemoryMapping>,
     fd_targets: Vec<(usize, String)>,
+    /// TIDs whose scheduler states should be aggregated for this snapshot.
+    /// For the process-level view this is all thread-group members; for the
+    /// per-thread view (`/proc/<pid>/task/<tid>/…`) it is overridden to just
+    /// the single tid so the exact thread state is reported.
+    thread_tids: Vec<u32>,
 }
 
 pub fn path_node(abs_path: &str) -> Option<ProcfsNode> {
@@ -410,6 +415,19 @@ fn process_snapshot(pid: u32) -> Option<ProcessSnapshot> {
     } else {
         Vec::new()
     };
+    // Collect the tids whose scheduler state this snapshot aggregates.
+    // Only the thread-group LEADER (pid == tgid) takes the process-level view
+    // over every member, so `/proc/<tgid>/stat` reports "running if any thread
+    // runs". A non-leader worker accessed directly at the top level
+    // (`/proc/<worker_tid>/stat`) reports its own exact state, matching Linux
+    // and the pre-aggregation behaviour. Members are read while PROCESS_TABLE
+    // is held; only the members mutex (a sibling lock) is acquired here — the
+    // scheduler lock is never touched from process_snapshot, so there is no
+    // lock-order issue.
+    let thread_tids = match &proc.thread_group {
+        Some(tg) if proc.pid == proc.tgid => tg.members.lock().clone(),
+        _ => alloc::vec![proc.pid],
+    };
     Some(ProcessSnapshot {
         pid: proc.pid,
         tgid: proc.tgid,
@@ -427,6 +445,7 @@ fn process_snapshot(pid: u32) -> Option<ProcessSnapshot> {
         brk_current: proc.brk_current,
         mappings: proc.vma_tree.iter().cloned().collect(),
         fd_targets,
+        thread_tids,
     })
 }
 
@@ -443,11 +462,15 @@ fn task_member(pid: u32, tid: u32) -> bool {
 
 /// Snapshot for a `/proc/<pid>/task/<tid>/…` path: the thread's own
 /// snapshot, but only when `tid` actually belongs to `pid`'s thread group.
+/// `thread_tids` is overridden to just `[tid]` so the per-thread view
+/// reports that single thread's exact scheduler state, not the group aggregate.
 fn task_snapshot(pid: u32, tid: u32) -> Option<ProcessSnapshot> {
     if !task_member(pid, tid) {
         return None;
     }
-    process_snapshot(tid)
+    let mut snap = process_snapshot(tid)?;
+    snap.thread_tids = alloc::vec![tid];
+    Some(snap)
 }
 
 /// The real process state, taken from the scheduler's canonical `TaskState`
@@ -455,12 +478,16 @@ fn task_snapshot(pid: u32, tid: u32) -> Option<ProcessSnapshot> {
 /// every process otherwise reported `R (running)`).  Falls back to the
 /// snapshot's stale value when no live task matches (e.g. zombies).
 ///
+/// `tids` is the set of scheduler tids to aggregate: pass all thread-group
+/// members for the process-level `/proc/<tgid>/stat` view (runnable wins),
+/// or a single tid for the per-thread `/proc/<tgid>/task/<tid>/stat` view.
+///
 /// Must be called WITHOUT `PROCESS_TABLE` held — it acquires the scheduler
 /// lock, and the two are never held simultaneously to avoid lock-order
 /// inversion.
-fn live_process_state(pid: u32, fallback: ProcessState) -> ProcessState {
+fn live_process_state(tids: &[u32], fallback: ProcessState) -> ProcessState {
     use crate::task::TaskState;
-    match crate::task::scheduler::task_state_for_pid(pid) {
+    match crate::task::scheduler::task_state_for_group(tids) {
         Some(TaskState::Running) => ProcessState::Running,
         Some(TaskState::Ready) => ProcessState::Ready,
         // Any BlockedOn* variant maps to "sleeping" (S) for /proc purposes.
@@ -722,7 +749,7 @@ pub fn render_kmsg_bytes() -> Vec<u8> {
 
 fn render_status(proc: ProcessSnapshot) -> String {
     let name = proc_name(&proc);
-    let state = match live_process_state(proc.pid, proc.state) {
+    let state = match live_process_state(&proc.thread_tids, proc.state) {
         ProcessState::Ready | ProcessState::Running => "R (running)",
         ProcessState::Blocked => "S (sleeping)",
         ProcessState::Stopped => "T (stopped)",
@@ -897,7 +924,7 @@ fn proc_vm_size_bytes(proc: &ProcessSnapshot) -> u64 {
 /// drawing the row without per-process CPU%.
 fn render_pid_stat(proc: ProcessSnapshot) -> String {
     let name = proc_name(&proc);
-    let state_char = match live_process_state(proc.pid, proc.state) {
+    let state_char = match live_process_state(&proc.thread_tids, proc.state) {
         ProcessState::Ready | ProcessState::Running => 'R',
         ProcessState::Blocked => 'S',
         ProcessState::Stopped => 'T',

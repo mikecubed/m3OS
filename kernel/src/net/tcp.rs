@@ -138,6 +138,13 @@ impl TcpConnection {
     /// to `Closed` (observed by the recv loop as EOF and the send loop as a
     /// broken pipe).
     fn service_rto(&mut self, now: u64, out: &mut Vec<(Ipv4Addr, Vec<u8>)>) {
+        // A Closed connection must never replay outstanding segments: it may
+        // have stale queue entries left by an RST, on_link_down, or
+        // TimeWait→Closed transition. Skip entirely rather than generating
+        // spurious retransmits to a peer that has already torn down.
+        if self.state == TcpState::Closed {
+            return;
+        }
         match self.retransmit.service_rto(now, &mut self.rtt) {
             RtoAction::Idle => {}
             RtoAction::Reset => {
@@ -300,6 +307,7 @@ impl TcpConnection {
     fn handle_segment(&mut self, header: &TcpHeader, payload: &[u8], pending: &mut PendingTx) {
         if header.flags & TCP_RST != 0 {
             log::info!("[tcp] RST received — connection closed");
+            self.retransmit.clear();
             self.state = TcpState::Closed;
             return;
         }
@@ -325,6 +333,11 @@ impl TcpConnection {
                 self.snd_una = self.snd_nxt;
                 self.queue_segment(pending, TCP_SYN | TCP_ACK, &[]);
                 self.snd_nxt = self.snd_nxt.wrapping_add(1);
+                // Retain the SYN-ACK for retransmit (mirrors the active-open SYN
+                // arming in `connect`). A lost SYN-ACK is recovered by service_rto;
+                // the final handshake ACK (SynReceived if has_ack) calls on_ack
+                // which disarms it automatically.
+                self.arm_retransmit(self.snd_nxt, TCP_SYN | TCP_ACK, &[]);
                 self.state = TcpState::SynReceived;
                 log::debug!("[tcp] SYN-ACK sent (passive open)");
             }

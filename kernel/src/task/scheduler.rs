@@ -2918,15 +2918,17 @@ pub fn runnable_task_count() -> usize {
     count
 }
 
-/// Canonical scheduler state for the task(s) of `pid`, or `None` if no live
-/// task matches. A runnable thread wins over a blocked one, so the
-/// thread-group view reports "running if any thread runs". Lets procfs
-/// report a real `R`/`S` state instead of the stale `Process.state`.
-pub fn task_state_for_pid(pid: u32) -> Option<TaskState> {
+/// Canonical scheduler state for a set of tids, or `None` if no live task
+/// matches. A runnable thread wins over a blocked one, so passing all
+/// thread-group members yields a process-level "running if any thread runs"
+/// view. Passing a single tid yields that thread's exact state (per-thread
+/// `/proc/<pid>/task/<tid>/stat` view). Lets procfs report a real `R`/`S`
+/// state instead of the stale `Process.state`.
+pub fn task_state_for_group(tids: &[u32]) -> Option<TaskState> {
     let sched = scheduler_lock();
     let mut blocked: Option<TaskState> = None;
     for task in sched.tasks.iter() {
-        if task.pid == pid && task.state != TaskState::Dead {
+        if tids.contains(&task.pid) && task.state != TaskState::Dead {
             match task.state {
                 TaskState::Ready | TaskState::Running => return Some(task.state),
                 other => {
