@@ -599,6 +599,13 @@ pub mod focus {
                     1 => "unix-socket",
                     2 => "pty-master",
                     3 => "pty-slave",
+                    // Net-RX hang trace stage markers (A→D). See the matching
+                    // `trace_event(Wakeup { kind: 4..=7, .. })` call sites.
+                    4 => "irq-fired",     // id = device IRQ vector
+                    5 => "wake-net-task", // id = net_task id (0 ⇒ unregistered)
+                    6 => "recv-frames",   // id = frames pulled off virtio RX ring
+                    7 => "tcp-recv",      // id = payload len; high bit ⇒ OOO drop
+                    8 => "blk-drain",     // id=1 real completion, id=0 spurious blk IRQ
                     _ => "?",
                 };
                 let _ = write!(c, "PRODUCER_WAKE {what} id={id}");

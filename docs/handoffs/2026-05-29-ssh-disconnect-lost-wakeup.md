@@ -1,5 +1,17 @@
 # Handoff: SSH `exit`-disconnect hang — timing-sensitive lost wakeup in sshd teardown
 
+> **UPDATE 2026-05-29 (sixth session — net-RX theory RETIRED; hang is teardown-side):**
+> a net-RX + device-IRQ + blk-completion trace overlay + a clean-disk capture **rule out**
+> both the "incoming TCP data stops reaching the relay" theory (net RX is healthy; the `exit`
+> *was* delivered — `ion` exited) **and** an apparent "virtio-blk MSI storm" (all 443 blk IRQs
+> are *real* completions — it was the control session's own command-exec disk I/O, a capture
+> artifact). A tried blk `ISR_STATUS`-under-MSI-X fix did **not** help and was reverted. The
+> hang is now localized to the **teardown/reap path** (sshd child never finishes `cleanup` →
+> never `close()`s the socket → no FIN), with `userspace-init` blocking at
+> `syscall/mod.rs:3817`. syslogd CPU re-verified fixed. **See the bottom section "net-RX trace
+> overlay RETIRES the net-RX-delivery theory" for the full evidence + revised next steps
+> (arm the sshd-child + ion pids and trace the cleanup block site).**
+>
 > **UPDATE 2026-05-29 (syslogd RT busy-spin found + FIXED — separate bug):** a
 > persistent userspace CPU hog was discovered and fixed. `syslogd` was busy-spinning at
 > **100% of a core at RT priority 5** because `/proc/kmsg` was a frozen snapshot that
@@ -537,3 +549,110 @@ correctness improvement for lossy links.
    shell at a prompt should block on its read, not spin a synchronous `call`. Likely the
    `exit\n` never reaches ion (input-delivery starvation, same root cause), so it re-polls.
    Identify ep4 (arm its server pid) and confirm.
+
+---
+
+# Update: net-RX trace overlay RETIRES the net-RX-delivery theory; hang is teardown-side (2026-05-29, sixth session)
+
+This session built a **net-RX + device-IRQ + blk-completion focus-trace overlay**, captured the
+hang on a **clean disk** (reproduced), and the data **retires the "incoming TCP data stops
+reaching the relay" framing** of the fourth/fifth-session updates. It also definitively
+**rules out a virtio-blk interrupt-storm** (a tempting but wrong lead this session chased and
+disproved). Net result: the SSH `exit` hang is **teardown-side**, not an RX-delivery or
+device-IRQ problem. The investigation is meaningfully *narrowed*, though not yet fixed.
+
+## syslogd CPU (the htop observation) — CONFIRMED fixed, not spinning
+
+Re-verified live on the current build under active SSH load: `/proc/2/stat`
+(syslogd) delta = **utime 0, stime 14 jiffies / 8 s** (cumulative ~19 since boot). The **zero
+userspace time** is the tell — a poll-loop busy-spin burns *utime*, and it is flat zero. The
+committed fix (`a92486f`, live consuming `/proc/kmsg`) is working; the earlier "syslog uses a
+lot of CPU in htop" was a **pre-fix** observation. No further action needed on syslogd.
+
+## The trace overlay (kept as permanent, `trace`-gated tooling)
+
+Reuses the ISR-safe, pid-filter-bypassing `TraceEvent::Wakeup { kind, id }` carrier (records
+unconditionally while the focus ring is armed). New `kind` codes + formatter labels:
+
+| kind | label | site | `id` meaning |
+|---|---|---|---|
+| 4 | `irq-fired` | `interrupts.rs` `dispatch_device_irq` | device IRQ vector (**all** devices — noisy; filter by vector) |
+| 5 | `wake-net-task` | `virtio_net.rs` ISR | net_task id about to be woken |
+| 6 | `recv-frames` | `virtio_net.rs::recv_frames` | frames pulled off the virtio RX used-ring this poll |
+| 7 | `tcp-recv` | `tcp.rs::handle_segment` | in-order payload bytes (high bit set ⇒ OOO/dup drop) |
+| 8 | `blk-drain` | `virtio_blk.rs` ISR | `1` = real completion, `0` = spurious blk IRQ |
+
+Capture harness: `/tmp/ssh-repro/netrx_capture.sh` (login-retry to beat the boot-smoke
+handshake race; **arm-verified-by-`ktrace len`-growth** — the interactive `arm` is flaky
+because ion's *persisted history autosuggestion* corrupts fast-typed input, so retry until
+`ktrace len` actually grows). Session A reproduces the hang; session B arms + `ktrace serial`
+dumps the focus ring while wedged. **Vector map (from boot):** `0x60`=virtio-blk MSI-X,
+`0x61`=virtio-net MSI-X, `0x63`/INTx legacy fallbacks.
+
+## DECISIVE findings (clean-disk capture, hang reproduced)
+
+1. **Net RX is HEALTHY through the freeze.** `recv-frames`, `tcp-recv`, `wake-net-task`, and
+   socket-wake (`PRODUCER_WAKE socket`) all fire normally right up to the freeze. The `exit\n`
+   **was** delivered — `ion` received it and **exited (zombie)**. ⇒ The fourth/fifth/sixth
+   "incoming data stops reaching the relay / net-RX-delivery" conclusion is **RETIRED**: RX is
+   not the failure. After the client sends `exit` it stops sending and waits for the server's
+   FIN, so *no further RX is even expected* — the bug is the **server never completing
+   teardown / sending FIN**.
+2. **The "virtio-blk MSI storm on vector 0x60" is a CAPTURE ARTIFACT — not a bug.** The dump's
+   silence-tail is dominated by hundreds of `irq-fired id=96` (blk MSI), which *looked* like a
+   storm pinning cpu0. But the `blk-drain` discriminator shows **every one is a real completion
+   (443× `id=1`, 0× `id=0`)** and the kernel logged **0** `[virtio-blk] completion poll …
+   timeout` warnings. The source is **session B's own diagnostic disk I/O** — each `ktrace`/
+   `ion`/`PROMPT` command re-execs and reads its binary from the ext2 disk (late pids
+   31/34/37/39/42 = the five `ktrace` invocations). The every-device-IRQ marker (`kind 4`)
+   amplified normal disk reads into an apparent storm. **Not the hang cause.**
+3. **An MSI-X `ISR_STATUS` fix was TRIED and REVERTED.** Hypothesis: virtio-blk reads the legacy
+   `VIRTIO_ISR_STATUS` register unconditionally under MSI-X (lines 634/686), whereas virtio-net
+   was deliberately fixed *not* to (`USING_LEGACY_INTX` guard, `virtio_net.rs:591`) to avoid a
+   QEMU/transitional-virtio edge-delivery quirk. Mirroring that guard for blk **did not change
+   the behavior** (still hung, blk IRQs still all real completions) — consistent with the storm
+   being benign disk I/O. Reverted. (The blk/net inconsistency is a *latent* tidy-up at most,
+   **not** related to this hang.)
+
+## What the capture DID establish about the freeze
+
+At the wedged moment (all four cores idle, daemons `BlkRecv`):
+- `userspace-init` (pid 1) **spin-dispatches** its reap/supervise loop ~1/tick, then **blocks**
+  `BlockedOnRecv` at `kernel/src/arch/x86_64/syscall/mod.rs:3817`.
+- The session's **sshd child + `ion` are `BlockedOnRecv`** (matches the original evidence #4 and
+  the fifth-session `ktrace states` capture) — `ion` having already exited as a zombie.
+- This is the **teardown** phase, *after* `exit` was delivered. The client hang = the server's
+  per-connection sshd child never finishes `cleanup`/reap and never `close()`s `client_fd`
+  (→ no FIN), exactly as the original evidence chain (#2/#3) described.
+
+## Theories now RULED OUT (cumulative, across all sessions)
+
+| Theory | Verdict | This session's evidence |
+|---|---|---|
+| net-RX delivery stops (4th/5th/6th update) | ❌ retired | RX healthy; `exit` delivered (ion exited) |
+| virtio-blk MSI storm / lost completion | ❌ | 443 real completions, 0 spurious, 0 blk timeouts; source = session-B disk I/O |
+| blk `ISR_STATUS`-under-MSI-X | ❌ | fix applied → no change → reverted |
+| scheduler/IPC lost-wake on recv/reply | ❌ (prior) | register-then-recheck primitives are race-free |
+| dispatch starvation (Ready-not-dispatched) | ❌ (prior) | wedged tasks are `BlockedOnRecv`, cores idle |
+| syslogd RT busy-spin | ✅ fixed (`a92486f`) | 0 utime/8s, verified live |
+
+## Recommended next steps (the teardown path is the remaining suspect)
+
+1. **Arm the wedged actors directly.** Re-run `netrx_capture.sh` but `ktrace arm <sshd-child-pid>
+   <ion-pid>` (find them via `ktrace tasks` after session A logs in — the non-listener `/bin/sshd`
+   and its `/bin/ion`). With the **deep focus ring** recording *their* block/wake/dispatch +
+   `BlockCurrent` call sites during `exit`, the dump will show the exact teardown block site that
+   never wakes (vs. the fifth session, which only sampled state, and this session, which armed the
+   wrong pids 1+3).
+2. **Trace the sshd `cleanup` path in userspace** (`userspace/sshd/src/session.rs`): the original
+   `log_sshd_step` trace showed teardown reaches `cleanup:reap shell` then stops. Re-instrument
+   with the system now better understood — is the child stuck in `waitpid` on the `ion` zombie, in
+   a `poll`, or in a synchronous IPC `write` (the original evidence #4's `write()` block)? The
+   answer pins which kernel primitive loses the wake.
+3. **Reaping angle:** `userspace-init` blocks at `syscall/mod.rs:3817` (the BlockedOnRecv site).
+   Confirm whether the `ion` zombie is reaped by the sshd child or by init, and whether the
+   reaper's wake (SIGCHLD/notification) is the lost edge. This is the most likely remaining
+   mechanism class for a "BlockedOnRecv, no deadline, never woken" teardown actor.
+4. **Note on tooling:** the `kind 4` every-device-IRQ marker is noisy (records all disk/NIC IRQs);
+   keep it but **filter by `id` (vector)**. blk IRQs (`id=96`) during a capture are almost always
+   the *control session's own* command-exec disk reads — do not mistake them for a fault.

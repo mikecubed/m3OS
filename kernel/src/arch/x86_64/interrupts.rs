@@ -2325,6 +2325,13 @@ pub fn unregister_device_irq(vector: u8) {
 fn dispatch_device_irq(vector: u8, stack_frame: &InterruptStackFrame) {
     let idx = (vector - DEVICE_IRQ_VECTOR_BASE) as usize;
     DEVICE_IRQ_HITS[idx].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // Net-RX hang trace — Stage A: a device IRQ reached the CPU. `id` is the
+    // raw vector so the net vector can be filtered out of other-device noise.
+    // ISR-safe (single-writer per-core ring + try_lock focus); no alloc/lock.
+    crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::Wakeup {
+        kind: 4,
+        id: vector as u32,
+    });
     let snapshot: Option<(fn(), DeviceIrqKind)> = {
         let tbl = DEVICE_IRQ_TABLE.lock();
         tbl[idx].as_ref().map(|e| (e.handler, e.kind))

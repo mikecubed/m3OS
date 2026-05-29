@@ -400,7 +400,21 @@ impl TcpConnection {
                     self.recv_buf.extend(payload);
                     self.rcv_nxt = self.rcv_nxt.wrapping_add(payload.len() as u32);
                     self.queue_segment(pending, TCP_ACK, &[]);
+                    // Net-RX hang trace — Stage D (in-order): the segment's
+                    // payload reached recv_buf. `id` = bytes accepted in order.
+                    crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::Wakeup {
+                        kind: 7,
+                        id: payload.len() as u32,
+                    });
                 } else if !payload.is_empty() {
+                    // Net-RX hang trace — Stage D (out-of-order/dup): payload
+                    // arrived but seq != rcv_nxt, so it is dropped (no
+                    // reassembly) and only a dup-ACK is sent. High bit set in
+                    // `id` distinguishes this from the in-order case above.
+                    crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::Wakeup {
+                        kind: 7,
+                        id: 0x8000_0000 | (payload.len() as u32 & 0x7fff_ffff),
+                    });
                     // Out-of-order or duplicate data. m3OS TCP has no reassembly
                     // queue, so we cannot buffer a future segment — but we MUST
                     // still send a duplicate ACK for our current `rcv_nxt` so the
