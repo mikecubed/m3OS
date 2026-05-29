@@ -115,7 +115,48 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
     fs::tmpfs::init();
 
     // P9-T002: initialise framebuffer text console (fixed-font renderer).
-    if let Some((buf_ptr, info)) = fb_parts {
+    if let Some((buf_ptr, mut info)) = fb_parts {
+        // Cap an over-large bootloader-selected framebuffer down to
+        // FB_CAP (1920×1080). With QEMU `-vga std` the UEFI GOP path
+        // greedily selects the LARGEST mode that fits in VRAM (up to 4K
+        // with `vgamem_mb=32`), and the compositor has no GPU — it
+        // software-composites every pixel, so 4K (8.3 MP) is the dominant
+        // GUI cost. Reprogramming Bochs VBE to 1080p (2.07 MP) cuts that
+        // ~4× and still leaves VRAM for double-buffering (2×1080×1920×4 =
+        // 16.6 MiB < 32 MiB). A VBE mode set does not move the LFB, so
+        // `buf_ptr` and the bootloader mapping (sized for the larger mode)
+        // stay valid. Non-Bochs framebuffers (real UEFI hardware) decline
+        // and keep their native mode.
+        const FB_CAP_W: usize = 1920;
+        const FB_CAP_H: usize = 1080;
+        if info.width > FB_CAP_W || info.height > FB_CAP_H {
+            let bpp_bits = (info.bytes_per_pixel * 8) as u16;
+            // SAFETY: ring 0; runs before init_from_parts/enable_doublebuffer
+            // touch the framebuffer. mm::init does not touch the FB region.
+            match unsafe { fb::vbe::set_mode(FB_CAP_W as u16, FB_CAP_H as u16, bpp_bits) } {
+                Ok((w, h)) => {
+                    let (w, h) = (w as usize, h as usize);
+                    info.width = w;
+                    info.height = h;
+                    // Bochs VBE sets VIRT_WIDTH = XRES on the mode set, so the
+                    // linear stride is exactly `width` pixels with no padding.
+                    info.stride = w;
+                    // Single visible buffer; enable_doublebuffer() doubles this.
+                    info.byte_len = w * h * info.bytes_per_pixel;
+                    log::info!(
+                        "[fb] capped framebuffer to {}x{} via Bochs VBE (compositor perf)",
+                        w,
+                        h
+                    );
+                }
+                Err(e) => {
+                    log::info!(
+                        "[fb] framebuffer mode cap skipped ({:?}); using bootloader mode",
+                        e
+                    );
+                }
+            }
+        }
         // SAFETY: buf_ptr is derived from boot_info.framebuffer which is
         // &'static mut; the mapping outlives the kernel.  mm::init does not
         // touch the framebuffer region.

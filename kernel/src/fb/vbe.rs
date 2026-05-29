@@ -23,17 +23,23 @@ const VBE_DISPI_IOPORT_INDEX: u16 = 0x01CE;
 const VBE_DISPI_IOPORT_DATA: u16 = 0x01CF;
 
 const VBE_DISPI_INDEX_ID: u16 = 0;
-#[allow(dead_code)]
 const VBE_DISPI_INDEX_XRES: u16 = 1;
 const VBE_DISPI_INDEX_YRES: u16 = 2;
-#[allow(dead_code)]
 const VBE_DISPI_INDEX_BPP: u16 = 3;
 const VBE_DISPI_INDEX_ENABLE: u16 = 4;
 const VBE_DISPI_INDEX_VIRT_WIDTH: u16 = 6;
 const VBE_DISPI_INDEX_VIRT_HEIGHT: u16 = 7;
-#[allow(dead_code)]
 const VBE_DISPI_INDEX_X_OFFSET: u16 = 8;
 const VBE_DISPI_INDEX_Y_OFFSET: u16 = 9;
+
+/// `ENABLE` register bits. `VBE_DISPI_ENABLED` turns the mode on;
+/// `VBE_DISPI_LFB_ENABLED` selects the linear framebuffer (vs. banked) so the
+/// scanout reads straight from the BAR the bootloader already mapped. We omit
+/// `VBE_DISPI_NOCLEARMEM` so the device blanks VRAM to black on the mode set
+/// (no flash of stale garbage before the compositor draws).
+const VBE_DISPI_DISABLED: u16 = 0x00;
+const VBE_DISPI_ENABLED: u16 = 0x01;
+const VBE_DISPI_LFB_ENABLED: u16 = 0x40;
 
 /// Documented Bochs VBE ID range. QEMU's stdvga reports `0xB0C5`; older
 /// emulators reported earlier values in the same family.
@@ -61,6 +67,60 @@ pub enum EnableError {
     /// device clamped, almost certainly because `2 × YRES × stride`
     /// exceeds the configured `vgamem_mb`.
     VirtHeightClamped { requested: u16, actual: u16 },
+}
+
+/// Reprogram the Bochs VBE scanout to `width × height` at `bpp` bits per pixel.
+///
+/// Used at framebuffer init to cap an over-large mode the bootloader selected
+/// (e.g. the UEFI GOP path greedily picks the largest mode that fits in VRAM —
+/// up to 4K with `vgamem_mb=32`). The software compositor has no GPU, so it
+/// composites every pixel on the CPU; dropping 4K (8.3 MP) to 1080p (2.07 MP)
+/// is a ~4× reduction in per-frame work, and 1080p still leaves room for VBE
+/// double-buffering in 32 MiB. Returns the device-confirmed `(width, height)`.
+///
+/// A Bochs VBE mode set does **not** move the linear framebuffer — it stays at
+/// the same BAR/physical base — so the bootloader's existing framebuffer
+/// mapping (sized for the larger mode) remains valid and still covers the
+/// smaller one. Resets `VIRT_*`/offsets so a later [`enable_doublebuffer`]
+/// starts from a clean single-buffer state.
+///
+/// # Safety
+/// Must be called from ring 0, before [`init_from_parts`] consumes the
+/// framebuffer and before [`enable_doublebuffer`]. Touches I/O ports
+/// `0x1CE` / `0x1CF`.
+pub unsafe fn set_mode(width: u16, height: u16, bpp: u16) -> Result<(u16, u16), EnableError> {
+    let id = unsafe { read_register(VBE_DISPI_INDEX_ID) };
+    if !(VBE_ID_MIN..=VBE_ID_MAX).contains(&id) {
+        return Err(EnableError::NotBochsVbe);
+    }
+    if width == 0 || height == 0 {
+        return Err(EnableError::NoYRes);
+    }
+    unsafe {
+        // The device requires DISABLED while geometry registers change.
+        write_register(VBE_DISPI_INDEX_ENABLE, VBE_DISPI_DISABLED);
+        write_register(VBE_DISPI_INDEX_XRES, width);
+        write_register(VBE_DISPI_INDEX_YRES, height);
+        write_register(VBE_DISPI_INDEX_BPP, bpp);
+        write_register(VBE_DISPI_INDEX_VIRT_WIDTH, width);
+        write_register(VBE_DISPI_INDEX_VIRT_HEIGHT, height);
+        write_register(VBE_DISPI_INDEX_X_OFFSET, 0);
+        write_register(VBE_DISPI_INDEX_Y_OFFSET, 0);
+        write_register(
+            VBE_DISPI_INDEX_ENABLE,
+            VBE_DISPI_ENABLED | VBE_DISPI_LFB_ENABLED,
+        );
+    }
+    // Confirm the device accepted the geometry (it clamps to what VRAM allows).
+    let actual_w = unsafe { read_register(VBE_DISPI_INDEX_XRES) };
+    let actual_h = unsafe { read_register(VBE_DISPI_INDEX_YRES) };
+    if actual_w != width || actual_h != height {
+        return Err(EnableError::VirtHeightClamped {
+            requested: height,
+            actual: actual_h,
+        });
+    }
+    Ok((actual_w, actual_h))
 }
 
 /// Try to enable double-buffering. On success, registers

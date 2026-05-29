@@ -4378,6 +4378,16 @@ fn qemu_args_with_devices_resolved(
                 "-global".to_string(),
                 "VGA.vgamem_mb=32".to_string(),
             ]);
+            // NOTE: the framebuffer *resolution* is NOT capped here. With
+            // `-vga std` the QEMU/OVMF EDID (xres/yres/xmax/ymax) only sets the
+            // *preferred* mode — OVMF still enumerates every mode that fits in
+            // VRAM, and the `bootloader` crate greedily selects the LARGEST one
+            // ≥ its 1920×1080 minimum, which with `vgamem_mb=32` can be 4K. The
+            // resolution cap is therefore applied guest-side, where it actually
+            // works regardless of OVMF version: the kernel reprograms Bochs VBE
+            // down to 1920×1080 at framebuffer init (see `kernel/src/lib.rs`
+            // and `kernel/src/fb/vbe.rs::set_mode`). The 32 MiB VRAM is retained
+            // so VBE double-buffering (2×1080×1920×4 = 16.6 MiB) still fits.
         }
     }
 
