@@ -5736,6 +5736,10 @@ fn block_on_pty_slave_read(pty_id: u32) -> Result<(), u64> {
 // T013: read(fd, buf, count)
 // ---------------------------------------------------------------------------
 
+/// Maximum bytes copied from the dmesg ring per `/proc/kmsg` read. Caps the
+/// transient kernel staging buffer; callers loop to drain more.
+const KMSG_READ_CHUNK: usize = 4096;
+
 pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     let fd = fd as usize;
     if fd >= MAX_FDS {
@@ -5882,18 +5886,47 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             });
             to_read as u64
         }
-        FdBackend::Proc { path, snapshot } => {
-            let generated;
-            let data: &[u8] = match snapshot.as_deref() {
-                Some(data) => data,
-                None => {
-                    generated = match crate::fs::procfs::read_file(path) {
-                        Some(data) => data,
-                        None => return NEG_ENOENT,
-                    };
-                    &generated
+        FdBackend::Proc { path } => {
+            // `/proc/kmsg` is a live, consuming kernel-log stream. `entry.offset`
+            // holds an absolute byte-sequence cursor into the dmesg ring (NOT a
+            // file offset); each read copies the bytes logged since the cursor
+            // and advances it. When the reader is caught up, read returns 0
+            // (no data right now) and `fd_poll_events` reports it not-readable,
+            // so a poll() loop blocks for its timeout instead of spinning.
+            // This replaces the old frozen-snapshot model, which both busy-spun
+            // poll() loops (always-readable at EOF) and never delivered kernel
+            // messages emitted after open().
+            if path == "/proc/kmsg" {
+                let cap = (count as usize).min(KMSG_READ_CHUNK);
+                if cap == 0 {
+                    return 0;
                 }
+                let cursor = entry.offset as u64;
+                let mut tmp = alloc::vec![0u8; cap];
+                let (n, new_cursor) = crate::serial::dmesg_read_from(cursor, &mut tmp);
+                if n == 0 {
+                    return 0;
+                }
+                if UserSliceWo::new(buf_ptr, n)
+                    .and_then(|s| s.copy_from_kernel(&tmp[..n]))
+                    .is_err()
+                {
+                    return NEG_EFAULT;
+                }
+                with_current_fd_mut(fd, |slot| {
+                    if let Some(e) = slot {
+                        e.offset = new_cursor as usize;
+                    }
+                });
+                return n as u64;
+            }
+
+            // All other procfs files regenerate their full content on each read.
+            let generated = match crate::fs::procfs::read_file(path) {
+                Some(data) => data,
+                None => return NEG_ENOENT,
             };
+            let data: &[u8] = &generated;
             let offset = entry.offset.min(data.len());
             let to_read = (count as usize).min(data.len().saturating_sub(offset));
             if to_read == 0 {
@@ -7871,12 +7904,21 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
         ) {
             return NEG_ENOENT;
         }
+        // `/proc/kmsg` is a live consuming stream: seed its cursor at the
+        // oldest byte currently resident in the dmesg ring so a fresh open
+        // replays the existing buffer once (matching the prior snapshot's
+        // first-read behaviour), then streams messages logged afterwards.
+        // Other procfs files use `offset` as an ordinary byte offset (start 0).
+        let initial_offset = if name == "/proc/kmsg" {
+            crate::serial::dmesg_oldest_seq() as usize
+        } else {
+            0
+        };
         let entry = FdEntry {
             backend: FdBackend::Proc {
                 path: alloc::string::String::from(name),
-                snapshot: (name == "/proc/kmsg").then(crate::fs::procfs::render_kmsg_bytes),
             },
-            offset: 0,
+            offset: initial_offset,
             readable: true,
             writable: false,
             cloexec,
@@ -8683,7 +8725,7 @@ pub(super) fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
         FdBackend::DevNull | FdBackend::DevZero | FdBackend::DevUrandom | FdBackend::DevFull => {
             (0x2000 | 0o666, 0, 0, 0, 0)
         }
-        FdBackend::Proc { path, .. } => {
+        FdBackend::Proc { path } => {
             let Some(st) = crate::fs::procfs::stat(path) else {
                 return NEG_ENOENT;
             };
@@ -18112,10 +18154,26 @@ fn fd_poll_events(entry: &FdEntry) -> i16 {
         }
         FdBackend::Stdout => POLLOUT,
         FdBackend::DevNull => POLLIN | POLLOUT,
+        FdBackend::Proc { path } => {
+            // `/proc/kmsg` is a live stream: readable only while this fd's
+            // cursor is behind the dmesg write position. Reporting always-ready
+            // here (as the old snapshot model did) made poll() loops spin at
+            // 100% CPU once the stream was drained. Proc fds are read-only, so
+            // no POLLOUT. Other procfs files regenerate on read and stay
+            // effectively always-ready.
+            if path == "/proc/kmsg" {
+                if (entry.offset as u64) < crate::serial::dmesg_total_written() {
+                    POLLIN
+                } else {
+                    0
+                }
+            } else {
+                POLLIN | POLLOUT
+            }
+        }
         FdBackend::DevZero
         | FdBackend::DevUrandom
         | FdBackend::DevFull
-        | FdBackend::Proc { .. }
         | FdBackend::Ramdisk { .. }
         | FdBackend::Tmpfs { .. }
         | FdBackend::Fat32Disk { .. }

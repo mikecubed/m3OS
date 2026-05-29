@@ -184,11 +184,15 @@ pub enum FdBackend {
     /// /dev/full — reads return zero bytes, writes return ENOSPC (Phase 38).
     DevFull,
     /// Synthetic procfs file content, generated on read from kernel state.
-    /// `/proc/kmsg` stores a per-fd snapshot so chunked reads stay stable.
-    Proc {
-        path: String,
-        snapshot: Option<Vec<u8>>,
-    },
+    ///
+    /// `/proc/kmsg` is special: it is a live, *consuming* view of the kernel
+    /// log ring rather than a regenerated file. For it, [`FdEntry::offset`]
+    /// holds an absolute byte-sequence cursor into the dmesg ring (see
+    /// `crate::serial::dmesg_read_from`), not a file offset — each read streams
+    /// the bytes logged since the cursor and advances it. All other procfs
+    /// files regenerate their full content on each read and use `offset` as an
+    /// ordinary byte offset into that content.
+    Proc { path: String },
     /// TTY device — reads from stdin buffer, writes to console (Phase 22).
     DeviceTTY { tty_id: u32 },
     /// PTY master — Phase 22 skeleton; read/write return ENOSYS (Phase 23+).

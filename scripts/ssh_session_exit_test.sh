@@ -12,7 +12,7 @@ SESSION_LOG="$ARTIFACT_DIR/ssh-session.log"
 SSH_PORT="${SSH_PORT:-2222}"
 BOOT_TIMEOUT_S=45
 
-cd /home/mikecubed/projects/ostest-wt-int-phase55c
+cd "$REPO_ROOT"
 
 case "$DRIVER" in
     e1000) QEMU_ARGS="--device e1000" ;;

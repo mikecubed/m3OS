@@ -743,10 +743,6 @@ fn render_kmsg() -> String {
     String::from_utf8_lossy(&crate::serial::dmesg_snapshot()).into_owned()
 }
 
-pub fn render_kmsg_bytes() -> Vec<u8> {
-    crate::serial::dmesg_snapshot()
-}
-
 fn render_status(proc: ProcessSnapshot) -> String {
     let name = proc_name(&proc);
     let state = match live_process_state(&proc.thread_tids, proc.state) {

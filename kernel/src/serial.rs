@@ -106,6 +106,29 @@ pub fn dmesg_snapshot() -> Vec<u8> {
     out
 }
 
+/// Absolute byte-sequence number of the oldest log byte still resident in the
+/// dmesg ring. Used to initialise a fresh `/proc/kmsg` reader cursor so it
+/// replays the current buffer once, then streams new messages.
+pub fn dmesg_oldest_seq() -> u64 {
+    DMESG_RING.lock().oldest_seq()
+}
+
+/// Total number of bytes ever written to the dmesg ring (one past the newest
+/// resident byte). A `/proc/kmsg` reader is "caught up" when its cursor equals
+/// this; poll() reports the fd readable only while the cursor is behind it.
+pub fn dmesg_total_written() -> u64 {
+    DMESG_RING.lock().total_written()
+}
+
+/// Stream dmesg bytes newer than `cursor` into `out`, returning
+/// `(bytes_copied, new_cursor)`. A cursor that has fallen behind the resident
+/// window is fast-forwarded (see [`LogRing::read_from`]); when caught up this
+/// copies nothing and returns the cursor unchanged. Task-context only (takes
+/// the `DMESG_RING` mutex briefly); never call from an ISR.
+pub fn dmesg_read_from(cursor: u64, out: &mut [u8]) -> (usize, u64) {
+    DMESG_RING.lock().read_from(cursor, out)
+}
+
 #[macro_export]
 macro_rules! serial_print {
     ($($arg:tt)*) => {
