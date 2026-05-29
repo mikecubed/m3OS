@@ -16159,8 +16159,40 @@ pub(super) fn sys_sendto(
             match proto {
                 crate::net::SocketProtocol::Tcp => {
                     if let Some(tcp_idx) = tcp_slot {
-                        crate::net::tcp::send(tcp_idx, &tmp[..capped]);
-                        capped as u64
+                        // Flow-control-aware send. `tcp::send` accepts as many
+                        // bytes as the connection's send window allows (always
+                        // >= one segment when nothing is outstanding); a 0
+                        // return means the window is currently full. Mirror the
+                        // recv path: block (yield) until space frees, unless the
+                        // socket is non-blocking, a signal is pending, or the
+                        // connection drops. A dead peer cannot wedge us — its
+                        // unacked data hits MAX_RETRANSMITS and the connection
+                        // resets to Closed, surfaced here as EPIPE.
+                        const NEG_EPIPE: u64 = (-32_i64) as u64;
+                        let nonblock = entry.nonblock;
+                        loop {
+                            match crate::net::tcp::state(tcp_idx) {
+                                crate::net::tcp::TcpState::Established => {
+                                    let n = crate::net::tcp::send(tcp_idx, &tmp[..capped]);
+                                    if n > 0 {
+                                        break n as u64;
+                                    }
+                                    // Send window full — wait for an ACK.
+                                }
+                                // Still completing the handshake — wait for it.
+                                crate::net::tcp::TcpState::SynSent
+                                | crate::net::tcp::TcpState::SynReceived => {}
+                                // Any half-closed / closed state: broken pipe.
+                                _ => break NEG_EPIPE,
+                            }
+                            if nonblock {
+                                break NEG_EAGAIN;
+                            }
+                            if has_pending_signal() {
+                                break NEG_EINTR;
+                            }
+                            crate::task::yield_now();
+                        }
                     } else {
                         NEG_ENOTCONN
                     }

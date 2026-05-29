@@ -117,9 +117,15 @@ user-VA access from ring 0 faults.
   kernel-level round-trip work (query out, reply in). A residual userspace
   poll/recvfrom delivery gap is documented.
 - **TCP retransmit (D):** RFC 6298 SRTT/RTTVAR with a 1 s-min / 60 s-max RTO and
-  exponential backoff; one outstanding segment is buffered and replayed on RTO
-  expiry. The estimator is host-tested in `kernel-core` because QEMU's lossless
-  SLIRP cannot exercise packet loss.
+  exponential backoff. A per-connection `RetransmitQueue` buffers **every**
+  outstanding segment (SYN, data, FIN); the single RFC 6298 timer times the
+  oldest, `on_ack` prunes the cumulatively-acked prefix, and `service_rto`
+  replays the earliest unacked segment. Send is flow-controlled — outstanding
+  bytes are capped at `min(peer_window, 64 KiB)` and the send syscall blocks /
+  `EAGAIN`s / `EPIPE`s on a full window. (The first cut buffered only one
+  segment, leaving a multi-segment window — and a FIN behind in-flight data —
+  unprotected.) The queue + estimator are host-tested in `kernel-core` because
+  QEMU's lossless SLIRP cannot exercise packet loss.
 - **Microcode (E):** the AMD container parser is host-tested pure logic; the
   apply writes `MSR_AMD64_PATCH_LOADER` only on an exact equivalence +
   strictly-newer-revision match, so QEMU and non-AMD CPUs are a clean,

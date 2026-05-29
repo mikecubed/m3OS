@@ -9,31 +9,16 @@ use crate::task::scheduler::IrqSafeMutex;
 use super::arp::Ipv4Addr;
 use super::ipv4::{self, Ipv4Header};
 
-use kernel_core::net::tcp::{RttEstimator, TcpBuildParams, build, parse};
+use kernel_core::net::tcp::{
+    MAX_RETRANSMITS, RetransmitQueue, RtoAction, RttEstimator, TcpBuildParams, build, parse,
+};
 pub use kernel_core::net::tcp::{TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN, TcpHeader};
 
-/// Maximum retransmissions of a single segment before the connection is reset
-/// (RFC 1122 R2 equivalent — after this many doublings the peer is presumed
-/// dead). With the RFC 6298 exponential backoff (1s,2s,4s,…,60s) this is well
-/// over a minute of total retry time before giving up.
-const MAX_RETRANSMITS: u32 = 8;
-
-/// A single unacknowledged outbound segment retained for possible
-/// retransmission (Phase 77 Track D.2). m3OS's TCP sends one segment at a time,
-/// so tracking the oldest (only) unacked segment is sufficient to recover from
-/// a dropped SYN, data segment, or FIN on a lossy link.
-struct RetransmitSeg {
-    /// Sequence number this segment occupies (its first byte, or the SYN/FIN
-    /// phantom byte) — used to detect when an inbound ACK covers it.
-    end_seq: u32,
-    flags: u8,
-    payload: Vec<u8>,
-    /// Tick at which the segment was FIRST transmitted (for the RTT sample).
-    first_sent_tick: u64,
-    /// Number of retransmissions so far. Karn's algorithm: an RTT sample is
-    /// only taken when this is 0 (the segment was never retransmitted).
-    retx_count: u32,
-}
+/// Per-connection cap on outstanding (unacknowledged) bytes. Bounds the
+/// retransmit queue's memory footprint; the effective send window is the
+/// smaller of this and the peer's advertised window. At 64 connections this is
+/// a 4 MiB worst case, but the peer window keeps it far lower in practice.
+const MAX_INFLIGHT_BYTES: usize = 64 * 1024;
 
 /// Outbound TCP segments queued during `handle_segment` or other state-machine
 /// methods that run under `TCP_CONNS.lock()`. Sending must happen AFTER the
@@ -102,11 +87,10 @@ pub struct TcpConnection {
     pub send_buf: VecDeque<u8>,
     /// Phase 77 Track D.2 — RFC 6298 RTT/RTO estimator for this connection.
     rtt: RttEstimator,
-    /// The single outstanding unacked segment, if any, retained for retransmit.
-    retransmit: Option<RetransmitSeg>,
-    /// Absolute tick (1 tick = 1 ms) at which the RTO fires; `None` when there
-    /// is nothing outstanding.
-    rto_deadline: Option<u64>,
+    /// All outstanding unacked segments (SYN, data, FIN), retained for
+    /// retransmission. Holds the single RFC 6298 retransmit timer, which times
+    /// the oldest unacked segment.
+    retransmit: RetransmitQueue,
 }
 
 impl TcpConnection {
@@ -125,113 +109,76 @@ impl TcpConnection {
             recv_buf: VecDeque::new(),
             send_buf: VecDeque::new(),
             rtt: RttEstimator::new(),
-            retransmit: None,
-            rto_deadline: None,
+            retransmit: RetransmitQueue::new(),
         }
     }
 
-    /// Arm the retransmit timer for a freshly-sent segment. `end_seq` is the
+    /// Retain a freshly-sent segment for possible retransmit. `end_seq` is the
     /// sequence number just past the segment (so an inbound ACK >= `end_seq`
-    /// fully acknowledges it). Stores the segment bytes for replay and sets the
-    /// RTO deadline from the current estimator.
+    /// fully acknowledges it). Appends to the per-connection queue and arms the
+    /// RFC 6298 timer if it was not already running.
     fn arm_retransmit(&mut self, end_seq: u32, flags: u8, payload: &[u8]) {
         let now = crate::arch::x86_64::interrupts::tick_count();
-        self.retransmit = Some(RetransmitSeg {
-            end_seq,
-            flags,
-            payload: payload.to_vec(),
-            first_sent_tick: now,
-            retx_count: 0,
-        });
-        self.rto_deadline = Some(now.saturating_add(self.rtt.rto_ms() as u64));
+        self.retransmit
+            .push(end_seq, flags, payload.to_vec(), now, &self.rtt);
     }
 
-    /// An inbound ACK acknowledged sequence `ack`. If it covers the outstanding
-    /// segment, take an RTT sample (Karn: only when the segment was never
-    /// retransmitted), feed the estimator, and disarm the timer.
+    /// An inbound ACK acknowledged sequence `ack`. Drop every fully-covered
+    /// segment from the queue (cumulative ACK), take a Karn-safe RTT sample,
+    /// and stop or restart the timer — all handled by the queue.
     fn on_ack(&mut self, ack: u32) {
-        let Some(seg) = self.retransmit.as_ref() else {
-            return;
-        };
-        // `ack >= seg.end_seq` in sequence space (wrapping-aware): the segment
-        // is fully acknowledged.
-        if ack.wrapping_sub(seg.end_seq) < 0x8000_0000 {
-            if seg.retx_count == 0 {
-                let now = crate::arch::x86_64::interrupts::tick_count();
-                let rtt_ms = now.saturating_sub(seg.first_sent_tick).min(u32::MAX as u64) as u32;
-                self.rtt.on_measurement(rtt_ms);
-            }
-            self.retransmit = None;
-            self.rto_deadline = None;
-        }
+        let now = crate::arch::x86_64::interrupts::tick_count();
+        self.retransmit.on_ack(ack, now, &mut self.rtt);
     }
 
     /// Called from the periodic `tcp_tick`. If the RTO has fired, replay the
-    /// outstanding segment (with its ORIGINAL sequence number), apply RFC 6298
-    /// exponential backoff, and re-arm. After `MAX_RETRANSMITS` the peer is
-    /// presumed dead and the connection is reset. Returns `true` if the
-    /// connection was reset (so the caller can surface the error upstream).
-    fn service_rto(&mut self, now: u64, out: &mut Vec<(Ipv4Addr, Vec<u8>)>) -> bool {
-        let Some(deadline) = self.rto_deadline else {
-            return false;
-        };
-        if now < deadline {
-            return false;
+    /// OLDEST outstanding segment (with its original sequence number) into
+    /// `out`, applying RFC 6298 exponential backoff. After `MAX_RETRANSMITS` of
+    /// the oldest segment the peer is presumed dead and the connection is reset
+    /// to `Closed` (observed by the recv loop as EOF and the send loop as a
+    /// broken pipe).
+    fn service_rto(&mut self, now: u64, out: &mut Vec<(Ipv4Addr, Vec<u8>)>) {
+        match self.retransmit.service_rto(now, &mut self.rtt) {
+            RtoAction::Idle => {}
+            RtoAction::Reset => {
+                log::warn!(
+                    "[tcp] connection reset after {} retransmits (state={:?}) remote={}.{}.{}.{}:{}",
+                    MAX_RETRANSMITS,
+                    self.state,
+                    self.remote_ip[0],
+                    self.remote_ip[1],
+                    self.remote_ip[2],
+                    self.remote_ip[3],
+                    self.remote_port,
+                );
+                self.state = TcpState::Closed;
+            }
+            RtoAction::Retransmit {
+                seq,
+                flags,
+                payload,
+            } => {
+                let p = TcpBuildParams {
+                    src_ip: self.local_ip,
+                    dst_ip: self.remote_ip,
+                    src_port: self.local_port,
+                    dst_port: self.remote_port,
+                    seq,
+                    ack: self.rcv_nxt,
+                    flags,
+                    window: self.rcv_wnd,
+                };
+                let bytes = build(&p, &payload);
+                out.push((self.remote_ip, bytes));
+                log::debug!(
+                    "[tcp] retransmit seq={:#x} flags={:#x} rto={}ms outstanding={}",
+                    seq,
+                    flags,
+                    self.rtt.rto_ms(),
+                    self.retransmit.len(),
+                );
+            }
         }
-        let Some(seg) = self.retransmit.as_mut() else {
-            self.rto_deadline = None;
-            return false;
-        };
-        if seg.retx_count >= MAX_RETRANSMITS {
-            log::warn!(
-                "[tcp] connection reset after {} retransmits (state={:?}) remote={}.{}.{}.{}:{}",
-                seg.retx_count,
-                self.state,
-                self.remote_ip[0],
-                self.remote_ip[1],
-                self.remote_ip[2],
-                self.remote_ip[3],
-                self.remote_port,
-            );
-            self.state = TcpState::Closed;
-            self.retransmit = None;
-            self.rto_deadline = None;
-            return true;
-        }
-        // Recover the segment's original sequence number: a SYN/FIN consumes a
-        // single phantom byte; a data segment consumes `payload.len()`.
-        let seq_len = if seg.flags & (TCP_SYN | TCP_FIN) != 0 {
-            1u32
-        } else {
-            seg.payload.len() as u32
-        };
-        let original_seq = seg.end_seq.wrapping_sub(seq_len);
-        let p = TcpBuildParams {
-            src_ip: self.local_ip,
-            dst_ip: self.remote_ip,
-            src_port: self.local_port,
-            dst_port: self.remote_port,
-            seq: original_seq,
-            ack: self.rcv_nxt,
-            flags: seg.flags,
-            window: self.rcv_wnd,
-        };
-        let bytes = build(&p, &seg.payload);
-        out.push((self.remote_ip, bytes));
-        seg.retx_count = seg.retx_count.saturating_add(1);
-        // Karn's algorithm: back off RTO; the next RTT sample is suppressed
-        // (retx_count > 0) so the doubled RTO is not corrupted by an ambiguous
-        // ACK of the retransmitted segment.
-        self.rtt.on_timeout();
-        self.rto_deadline = Some(now.saturating_add(self.rtt.rto_ms() as u64));
-        log::debug!(
-            "[tcp] retransmit #{} seq={:#x} flags={:#x} rto={}ms",
-            seg.retx_count,
-            original_seq,
-            seg.flags,
-            self.rtt.rto_ms(),
-        );
-        false
     }
 
     fn build_params(&self, flags: u8) -> TcpBuildParams {
@@ -294,20 +241,37 @@ impl TcpConnection {
         self.state = TcpState::Listen;
     }
 
-    fn tcp_send(&mut self, data: &[u8], pending: &mut PendingTx) {
-        if self.state != TcpState::Established {
-            return;
+    /// Queue as much of `data` as the send window allows, retaining every
+    /// segment for retransmit. Returns the number of bytes accepted (0 when the
+    /// window is currently full — the caller blocks or reports `EAGAIN`).
+    ///
+    /// Flow control: outstanding (unacked) bytes are capped at the smaller of
+    /// the peer's advertised window and `MAX_INFLIGHT_BYTES`. When nothing is
+    /// outstanding at least one segment is always accepted, so a small or
+    /// transiently-zero advertised window cannot deadlock the sender (the ACK
+    /// that reopens the window can only arrive once we have sent something).
+    fn tcp_send(&mut self, data: &[u8], pending: &mut PendingTx) -> usize {
+        if self.state != TcpState::Established || data.is_empty() {
+            return 0;
         }
-        // Phase 77 Track D.2 — only one segment is tracked for retransmit at a
-        // time; if the previous one is still unacked, skip arming (the existing
-        // RTO covers it). m3OS's blocking write path sends serially, so this is
-        // the common case rather than a real window restriction.
-        let arm = self.retransmit.is_none();
-        self.queue_segment(pending, TCP_ACK | TCP_PSH, data);
-        self.snd_nxt = self.snd_nxt.wrapping_add(data.len() as u32);
-        if arm && !data.is_empty() {
-            self.arm_retransmit(self.snd_nxt, TCP_ACK | TCP_PSH, data);
+        let in_flight = self.snd_nxt.wrapping_sub(self.snd_una) as usize;
+        let window = (self.snd_wnd as usize).min(MAX_INFLIGHT_BYTES);
+        let available = if in_flight == 0 {
+            data.len()
+        } else {
+            window.saturating_sub(in_flight)
+        };
+        let n = data.len().min(available);
+        if n == 0 {
+            return 0;
         }
+        let payload = &data[..n];
+        self.queue_segment(pending, TCP_ACK | TCP_PSH, payload);
+        self.snd_nxt = self.snd_nxt.wrapping_add(n as u32);
+        // Every data segment is retained — a dropped segment anywhere in a
+        // multi-segment window is recovered by `service_rto`.
+        self.arm_retransmit(self.snd_nxt, TCP_ACK | TCP_PSH, payload);
+        n
     }
 
     fn close(&mut self, pending: &mut PendingTx) {
@@ -315,16 +279,14 @@ impl TcpConnection {
             TcpState::Established | TcpState::CloseWait => {
                 self.queue_segment(pending, TCP_FIN | TCP_ACK, &[]);
                 self.snd_nxt = self.snd_nxt.wrapping_add(1);
-                // Phase 77 Track D.2 — arm the FIN for retransmit so a dropped
-                // FIN is replayed by `service_rto`. Mirror the `tcp_send` guard:
-                // only arm when the slot is free (don't clobber an outstanding
-                // unacked data segment). `end_seq` is `snd_nxt` after the +1
-                // because the FIN consumes one phantom sequence byte. On a
-                // lossless path the covering ACK calls `on_ack` which disarms
+                // Retain the FIN for retransmit so a dropped FIN is replayed by
+                // `service_rto`. The queue appends it behind any still-unacked
+                // data (its `end_seq` is `snd_nxt` after the +1 phantom byte),
+                // so — unlike the old single-slot design — closing a connection
+                // with data in flight no longer leaves the FIN unprotected. On
+                // a lossless path the covering ACK calls `on_ack` which drops it
                 // immediately, so happy-path behaviour is unchanged.
-                if self.retransmit.is_none() {
-                    self.arm_retransmit(self.snd_nxt, TCP_FIN | TCP_ACK, &[]);
-                }
+                self.arm_retransmit(self.snd_nxt, TCP_FIN | TCP_ACK, &[]);
                 self.state = if self.state == TcpState::Established {
                     TcpState::FinWait1
                 } else {
@@ -514,17 +476,23 @@ pub fn listen(conn_idx: usize) {
     }
 }
 
-pub fn send(conn_idx: usize, data: &[u8]) {
+/// Queue outbound data on `conn_idx`, honoring the connection's send window.
+/// Returns the number of bytes accepted (0 when the window is full or the
+/// connection is not `Established`); the syscall layer blocks or reports
+/// `EAGAIN` on a 0 return.
+pub fn send(conn_idx: usize, data: &[u8]) -> usize {
     let mut pending = PendingTx::default();
+    let mut accepted = 0;
     {
         let mut conns = TCP_CONNS.lock();
         if let Some(slot) = conns.conns.get_mut(conn_idx)
             && let Some(conn) = slot.as_mut()
         {
-            conn.tcp_send(data, &mut pending);
+            accepted = conn.tcp_send(data, &mut pending);
         }
     }
     pending.flush();
+    accepted
 }
 
 pub fn recv(conn_idx: usize, buf: &mut [u8]) -> usize {
@@ -586,7 +554,7 @@ pub fn tcp_tick() {
     {
         let mut conns = TCP_CONNS.lock();
         for slot in conns.conns.iter_mut().flatten() {
-            let _reset = slot.service_rto(now, &mut out);
+            slot.service_rto(now, &mut out);
         }
     }
     for (dst, bytes) in out {
