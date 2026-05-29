@@ -18,14 +18,16 @@
 > recv/reply rendezvous, async-rt waker persistence) — this was a userspace edge-driven-stall,
 > **not** a kernel lost-wake. **syslog CPU: confirmed a non-issue** on the current build
 > (measured `utime=0`, `stime≈0.3%` idle; the `a92486f` fix holds — the earlier observation
-> was a stale pre-fix build). **Residual (separate, lower priority):** teardown now always
-> disconnects the client, but via a raw transport close → `ssh` reports exit 255 ("closed by
-> remote host") instead of a clean exit 0; this teardown-cleanliness gap predates the hang
-> (the flow hung before reaching any close) and is tracked below. Also corrected two earlier
-> mis-diagnoses: `init`@`syscall/mod.rs:3817` is `nanosleep` (a deadline'd sleep, **not** a
-> wedge), and `write(1)` for a daemon is a kernel serial write (**not** an IPC — refuting the
-> evidence-#4 "lost write reply" theory). **See the bottom section "seventh session" for the
-> full capture, fix, and the residual exit-255 follow-up.**
+> was a stale pre-fix build). **Clean logout (exit 255 → 0) ALSO fixed (follow-up):** the
+> client previously saw a raw transport close ("closed by remote host", `ssh` exit 255). A
+> `ssh -vvv` capture proved the server sent **no** SSH channel-close at all — sunset's
+> `channel_done()` only sets `app_done`, it has no server-initiated close. Added
+> `Runner::server_session_exit()` to sunset (sends `exit-status` + `CHANNEL_EOF` +
+> `CHANNEL_CLOSE`) and call it in sshd teardown before `close(sock_fd)`. Now **5/5 runs exit
+> cleanly with status 0.** Also corrected two earlier mis-diagnoses: `init`@`syscall/mod.rs:3817`
+> is `nanosleep` (a deadline'd sleep, **not** a wedge), and `write(1)` for a daemon is a kernel
+> serial write (**not** an IPC — refuting the evidence-#4 "lost write reply" theory). **See the
+> bottom section "seventh session" for the full capture + both fixes.**
 
 > **UPDATE 2026-05-29 (sixth session — net-RX theory RETIRED; hang is teardown-side):**
 > a net-RX + device-IRQ + blk-completion trace overlay + a clean-disk capture **rule out**
@@ -62,10 +64,10 @@
 > to ~100 s. Empirically RULED OUT this cycle: AP-timer coarseness, cross-core
 > steal cooldown, TCP retransmit, and the display-server/GUI stack.
 
-**Status:** HANG FIXED (seventh session — async-rt liveness backstop, verified 5/5 no-hang);
+**Status:** RESOLVED (seventh session). HANG FIXED (async-rt liveness backstop) **and** clean
+logout fixed (sunset `server_session_exit` sends exit-status + EOF + CHANNEL_CLOSE) — verified
+**5/5 `ssh_session_exit_test.sh virtio exit` runs exit cleanly with status 0** (was ~100 % hang).
 `syslogd` RT busy-spin sub-issue CLOSED (fixed `a92486f`, re-verified non-issue this session).
-RESIDUAL (separate, lower priority): teardown disconnects the client but via a raw transport
-close → `ssh` exit 255 ("closed by remote host") rather than a clean exit 0 — tracked below.
 **Date:** 2026-05-29
 **Relates to:** Phase 77 Track A "SSH-disconnect hang" (the *residual* explicitly noted in
 commit `6f57fbc` — "the SSH client `exit` disconnect still intermittently wedges the guest
@@ -778,20 +780,38 @@ that models a spawned task with a lost readiness edge and asserts the backstop r
   The client now always disconnects (no `rc=10`). Expectation: the same backstop also cures the
   "every-other interactive command stalls until next input" responsiveness symptom (same class).
 
-## RESIDUAL (separate, lower priority) — teardown is not a *clean* SSH logout (ssh exit 255)
+## Clean logout — exit 255 → exit 0 (FIXED, follow-up commit)
 
-Post-fix the client always disconnects, but `ssh` reports **exit 255 / "Connection closed by
-remote host"** (test `rc=8`), not a clean exit 0. This is a **teardown-protocol** gap, not a
-hang: the server completes teardown and `close(sock_fd)`s the raw socket **without** an orderly
-SSH close. It predates the hang (the flow hung before reaching any close, so the clean close was
-never exercised). A tried best-effort fix — `runner.channel_done(handle)` → `progress()` →
-flush before `close(sock_fd)` in `async_session` teardown — **did not change the 255** and was
-**reverted** (it ventured into sunset/TCP-close territory with no observable benefit). Likely
-cause: kernel TCP `close()` emits **RST** when unread data sits in the socket receive buffer
-(client's `exit\n`/trailing bytes), or a missing `SSH_MSG_DISCONNECT`. **Next step for a clean
-exit 0:** confirm RST-vs-FIN on `close()` with pending RX (kernel `net/tcp` close path) and/or
-drain the socket + send `SSH_MSG_DISCONNECT` before close. Low user impact (terminal returns
-immediately; 255 is cosmetic), so deprioritized below the now-fixed hang.
+After the hang fix the client always disconnected, but `ssh` reported **exit 255 / "Connection
+closed by remote host"**, not a clean exit 0. An `ssh -vvv` capture gave ground truth: at
+teardown the client logged `Connection ... closed by remote host` + `Exit status -1` and
+received **no `CHANNEL_EOF`, no `CHANNEL_CLOSE`, no `exit-status`** — the server sent *nothing*
+at the SSH layer and just dropped the transport.
+
+Root cause: the kernel TCP `close()` already sends a graceful **FIN, not RST** (`tcp.rs:300`),
+so this was **not** a TCP-layer problem — it was the **SSH protocol layer**. The vendored
+`sunset` SSH library has **no server-initiated channel close**: `Runner::channel_done()` →
+`Channels::done()` only sets `app_done`; the `ChannelEof`/`ChannelClose` sends
+(`channel.rs::handle_eof`/`handle_close`) are *incoming-packet handlers* only. So when the
+shell exits server-side, neither end initiates the SSH close and sshd eventually drops TCP →
+"closed by remote host". (This is why the earlier `channel_done`+`progress`+flush attempt did
+nothing: `done()` queues no packets.)
+
+Fix (3 files):
+- `sunset-local/src/channel.rs` — `Channels::send_server_exit(num, exit_status, s)`: sends
+  `SSH_MSG_CHANNEL_REQUEST("exit-status")` then `CHANNEL_EOF` + `CHANNEL_CLOSE` (idempotent on
+  the `sent_eof`/`sent_close` flags), modelled on the existing `Req::send` packet path.
+- `sunset-local/src/runner.rs` — `Runner::server_session_exit(chan, exit_status)` (in the
+  **server** impl block — note `term_break` lives in the *client* block, an easy mis-place):
+  encodes those packets into the output buffer via `traf_out.sender`, then releases the channel
+  like `channel_done` (`done` + `discard_read_channel` + `wake`).
+- `userspace/sshd/src/session.rs` — `async_session` teardown calls a bounded best-effort
+  `send_clean_channel_close(...)` (takes the `ChanHandle`, calls `server_session_exit`, flushes
+  the output buffer to the socket) **before** `close(sock_fd)`. Any failure falls through to the
+  unconditional close, so it cannot reintroduce a hang.
+
+Verified: `scripts/ssh_session_exit_test.sh virtio exit` ×5 → **5/5 `ssh exited with status 0`**
+("clean disconnect"); `cargo xtask check` green.
 
 ## Tooling added this session (host-side, under /tmp during the investigation)
 

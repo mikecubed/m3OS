@@ -279,8 +279,45 @@ async fn async_session(sock_fd: i32, host_key: &HostKey) -> i32 {
     let pty_master = state.borrow().pty_master;
     let pty_slave = state.borrow().pty_slave;
     cleanup(shell_pid, pty_master, pty_slave);
+    // Send an orderly SSH channel close (exit-status + CHANNEL_EOF +
+    // CHANNEL_CLOSE) before dropping the transport, so the client logs out
+    // cleanly (ssh exit 0) instead of seeing a raw transport drop
+    // ("Connection closed by remote host", ssh exit 255). Best-effort and
+    // bounded: any failure falls through to the unconditional `close` below,
+    // which still releases the client.
+    send_clean_channel_close(&runner, sock_fd, &chan, &output_lock, exit_code).await;
     close(sock_fd);
     exit_code
+}
+
+/// Queue the orderly SSH session-close packets (via `server_session_exit`) and
+/// flush them to the socket before the caller closes it. The channel handle is
+/// consumed; no-op if the channel was never opened.
+async fn send_clean_channel_close(
+    runner: &SharedRunner,
+    sock_fd: i32,
+    chan: &SharedChan,
+    output_lock: &SharedOutputLock,
+    exit_code: i32,
+) {
+    // Release the RefCell borrow before awaiting the runner lock.
+    let handle_opt = chan.borrow_mut().take();
+    if let Some(handle) = handle_opt {
+        {
+            let mut guard = runner.lock().await;
+            // SSH exit-status is an unsigned code; map sshd's internal -1/err
+            // sentinel to a generic failure status, normal logout → 0.
+            let status = if exit_code < 0 {
+                1u32
+            } else {
+                exit_code as u32
+            };
+            let _ = guard.server_session_exit(handle, status);
+        }
+        // The close packets are now in sunset's output buffer; flush them to
+        // the socket so the client receives them before the transport FIN.
+        let _ = flush_output_locked(runner, sock_fd, output_lock).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
