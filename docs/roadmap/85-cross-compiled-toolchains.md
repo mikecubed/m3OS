@@ -29,6 +29,8 @@ This phase exists to make that growth deliberate and reproducible.
 
 Bundle git in a configuration suitable for local repository work first. Remote workflows are intentionally left to the next phase so this milestone stays self-contained.
 
+> **Pre-planning note (2026-05-29):** a musl `git` built with **`NO_CURL NO_OPENSSL`** (linking the existing `ports/lib/zlib`) is the right shape here — it covers local repos and, combined with an `ssh` client binary, yields the cheapest *first secure remote clone* (git's SSH transport just shells out to `ssh` and runs `git-upload-pack`). HTTPS/curl/TLS is deliberately deferred to Phase 86. See the secure-transport track in [`docs/roadmap/86-networking-and-github.md`](./86-networking-and-github.md#pre-planning-findings-2026-05-29--secure-transport-track).
+
 ### Python interpreter and standard library
 
 Add a host-built Python interpreter with the stdlib needed for scripting, REPL use, and local automation on the supported platform.

@@ -165,7 +165,7 @@ To register a new port: add the name to `PORTS` in `xtask/src/main.rs:10792`, ad
 In `.cargo/config.toml` / target spec:
 
 - `"disable-redzone": true` — hardware interrupts use the stack; removing this causes silent stack corruption
-- `"-mmx,-sse"` — disables SIMD to avoid FPU state save/restore on context switches
+- `"-mmx,-sse"` — kernel stays soft-float (no XMM in ring 0 / IRQ handlers). NOTE: per-task FPU/XSAVE state *is* already preserved across context switches (Phase 57e/60); enabling **userspace** SIMD is a tracked future task — see `docs/research/simd-enablement.md`
 - `"panic-strategy": "abort"` — no unwinding; panics halt the machine
 
 ### `no_std` everywhere in kernel and userspace
