@@ -231,6 +231,16 @@ static SMEP_SMAP: Once<(bool, bool)> = Once::new();
 /// `0x0D`), so this is the only `CPUID.07h` consumer.
 pub fn probe_smep_smap() -> (bool, bool) {
     *SMEP_SMAP.call_once(|| {
+        // CPUID leaf `0x07` only exists when the maximum basic leaf
+        // (`CPUID.0:EAX`) is at least 7. On an older CPU or a VM CPU model
+        // that exposes only lower leaves, executing `cpuid` with an
+        // unsupported basic leaf returns the data of the *highest* supported
+        // leaf instead — whose EBX bits 7/20 could be mistaken for SMEP/SMAP
+        // support, after which `enable_smep_smap` would set unsupported CR4
+        // bits and `#GP` during boot. Gate the read on the max basic leaf.
+        if cpuid_raw(0, 0).eax < 0x07 {
+            return (false, false);
+        }
         let leaf7 = cpuid_raw(0x07, 0);
         (
             leaf7.ebx & CPUID_07_EBX_SMEP != 0,

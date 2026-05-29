@@ -17420,17 +17420,25 @@ fn sys_recvmsg_inet(
                   truncated: bool|
      -> Result<(), u64> {
         match src {
-            Some((src_ip, src_port)) if header.msg_name != 0 && header.msg_namelen > 0 => {
+            // Datagram source address. recvmsg(2) is value-result: copy at most
+            // the caller's buffer size, but always report the *real* address
+            // length (16) on return — even when the buffer is too small or
+            // empty (`msg_namelen == 0`) — so a caller probing the length or
+            // truncating sees the true size. A zero-length buffer therefore
+            // copies nothing yet still reports 16.
+            Some((src_ip, src_port)) if header.msg_name != 0 => {
                 let name_len = (header.msg_namelen as usize).min(16);
-                let mut sa = [0u8; 16];
-                sa[0..2].copy_from_slice(&2u16.to_ne_bytes()); // AF_INET
-                sa[2..4].copy_from_slice(&src_port.to_be_bytes());
-                sa[4..8].copy_from_slice(&src_ip);
-                if UserSliceWo::new(header.msg_name, name_len)
-                    .and_then(|s| s.copy_from_kernel(&sa[..name_len]))
-                    .is_err()
-                {
-                    return Err(NEG_EFAULT);
+                if name_len > 0 {
+                    let mut sa = [0u8; 16];
+                    sa[0..2].copy_from_slice(&2u16.to_ne_bytes()); // AF_INET
+                    sa[2..4].copy_from_slice(&src_port.to_be_bytes());
+                    sa[4..8].copy_from_slice(&src_ip);
+                    if UserSliceWo::new(header.msg_name, name_len)
+                        .and_then(|s| s.copy_from_kernel(&sa[..name_len]))
+                        .is_err()
+                    {
+                        return Err(NEG_EFAULT);
+                    }
                 }
                 header.msg_namelen = 16;
             }

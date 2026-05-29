@@ -76,7 +76,7 @@ gate instead of in the phase that built the subsystem.
 | `kernel/src/net/tcp.rs`, `kernel-core/src/net/tcp.rs` | RFC 6298 `RttEstimator`, per-connection retransmit buffer + `tcp_tick`, `MAX_TCP_CONNECTIONS` 8→64 |
 | `kernel/src/net/udp.rs`, `kernel/src/arch/x86_64/syscall/mod.rs`, `userspace/net_server/src/main.rs` | unbound-UDP-send ephemeral source port (DNS resolver) |
 | `kernel/src/arch/x86_64/microcode.rs`, `kernel-core/src/microcode.rs` | AMD microcode container parse + per-CPU apply |
-| `kernel/src/fs/procfs.rs` | `/proc/<pid>/status` gains `Tgid`/`VmRSS`/`VmData`/`VmStk` |
+| `kernel/src/fs/procfs.rs` | `/proc/<pid>/task/<tid>` per-thread subtree (htop's `scanMainThread`); `/proc/<pid>/status` gains `Tgid`/`VmRSS`/`VmData`/`VmStk` |
 
 ## Core Concepts
 
@@ -135,9 +135,16 @@ user-VA access from ring 0 faults.
 
 `epoll_create1`/`epoll_ctl`/`epoll_wait` were already fully implemented; the
 audit's "PARTIAL" was a source-search miss. F adds a regression gate, not code.
-H's htop-zero-processes was the per-user PID filter (already fixed in Phase 72b);
-the remaining work was the `/proc/<pid>/status` memory fields htop/ps read, and
-`ps -e` (same `/proc` enumeration path) is the regression-protected proof.
+H's htop-zero-processes had two layers. An old per-user PID filter (already
+fixed in Phase 72b) hid root-owned daemons from an unprivileged user — but the
+*load-bearing* fix here is the `/proc/<pid>/task/<tid>` per-thread subtree:
+htop's `scanMainThread` reads each process's main-thread stat from
+`/proc/<pid>/task/<pid>/stat`, and m3OS never exposed that subtree, so
+`readStatFile` failed for **every** process and the table rendered empty.
+Track H adds the `task/<tid>/` subtree (`stat`/`statm`/`status`/`comm`/
+`cmdline`/`maps`/`io`/`fd`) alongside the `/proc/<pid>/status` memory fields
+(`VmRSS`/`VmData`/`VmStk`) htop/ps also read; `ps -e` (the same `/proc`
+enumeration path) is the regression-protected proof.
 
 ## How This Phase Differs From Later Memory/Security Work
 
