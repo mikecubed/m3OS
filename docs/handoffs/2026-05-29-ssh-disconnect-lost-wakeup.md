@@ -1,5 +1,32 @@
 # Handoff: SSH `exit`-disconnect hang — timing-sensitive lost wakeup in sshd teardown
 
+> **UPDATE 2026-05-29 (seventh session — HANG FIXED via async-rt liveness backstop; syslog confirmed non-issue):**
+> The infinite hang is **fixed** and verified (5/5 repro runs no longer hang). A decisive
+> ktrace capture (armed on the *real* session-child pid, discovered from sshd's own serial
+> log lines, with the host **draining** to trigger the bug) finally resolved the
+> 5th-vs-6th-session contradiction: the wedged sshd child **cycles the async reactor's
+> `poll_once(100)` every 100 ms** (`syscall/mod.rs:18493`) with **all four async tasks parked
+> and no fd reporting ready**, so none of its three `waitpid(WNOHANG)` exit-backstops ever
+> run → the shell-exit is never noticed → `cleanup()`/`close(sock_fd)`/FIN never happen.
+> A second SSH session reliably **unsticks** the first (`cleanup:done` appears only after) —
+> the textbook Heisenbug. Root: the async-rt executor was *purely* edge-driven, so a single
+> transient missed I/O-readiness edge stalled the session **forever**. **Fix:** an
+> idle-liveness backstop in `userspace/async-rt/src/executor.rs` — after 3 consecutive empty
+> 100 ms polls it force-re-polls every parked task, so the relay reaches its `waitpid`
+> backstop and teardown completes within ~300 ms regardless of the missed edge. The audit
+> verified the **kernel mechanics are sound** (PTY refcount, `wake_master`/POLLHUP, IPC
+> recv/reply rendezvous, async-rt waker persistence) — this was a userspace edge-driven-stall,
+> **not** a kernel lost-wake. **syslog CPU: confirmed a non-issue** on the current build
+> (measured `utime=0`, `stime≈0.3%` idle; the `a92486f` fix holds — the earlier observation
+> was a stale pre-fix build). **Residual (separate, lower priority):** teardown now always
+> disconnects the client, but via a raw transport close → `ssh` reports exit 255 ("closed by
+> remote host") instead of a clean exit 0; this teardown-cleanliness gap predates the hang
+> (the flow hung before reaching any close) and is tracked below. Also corrected two earlier
+> mis-diagnoses: `init`@`syscall/mod.rs:3817` is `nanosleep` (a deadline'd sleep, **not** a
+> wedge), and `write(1)` for a daemon is a kernel serial write (**not** an IPC — refuting the
+> evidence-#4 "lost write reply" theory). **See the bottom section "seventh session" for the
+> full capture, fix, and the residual exit-255 follow-up.**
+
 > **UPDATE 2026-05-29 (sixth session — net-RX theory RETIRED; hang is teardown-side):**
 > a net-RX + device-IRQ + blk-completion trace overlay + a clean-disk capture **rule out**
 > both the "incoming TCP data stops reaching the relay" theory (net RX is healthy; the `exit`
@@ -35,8 +62,10 @@
 > to ~100 s. Empirically RULED OUT this cycle: AP-timer coarseness, cross-core
 > steal cooldown, TCP retransmit, and the display-server/GUI stack.
 
-**Status:** OPEN (teardown hang) — `syslogd` RT busy-spin sub-issue is CLOSED (fixed);
-the `exit` teardown hang is confirmed independent of it and remains open.
+**Status:** HANG FIXED (seventh session — async-rt liveness backstop, verified 5/5 no-hang);
+`syslogd` RT busy-spin sub-issue CLOSED (fixed `a92486f`, re-verified non-issue this session).
+RESIDUAL (separate, lower priority): teardown disconnects the client but via a raw transport
+close → `ssh` exit 255 ("closed by remote host") rather than a clean exit 0 — tracked below.
 **Date:** 2026-05-29
 **Relates to:** Phase 77 Track A "SSH-disconnect hang" (the *residual* explicitly noted in
 commit `6f57fbc` — "the SSH client `exit` disconnect still intermittently wedges the guest
@@ -656,3 +685,118 @@ At the wedged moment (all four cores idle, daemons `BlkRecv`):
 4. **Note on tooling:** the `kind 4` every-device-IRQ marker is noisy (records all disk/NIC IRQs);
    keep it but **filter by `id` (vector)**. blk IRQs (`id=96`) during a capture are almost always
    the *control session's own* command-exec disk reads — do not mistake them for a fault.
+
+---
+
+# Update: HANG FIXED — async-rt edge-driven-stall, not a kernel lost-wake (2026-05-29, seventh session)
+
+This session **fixed** the infinite hang, **confirmed syslog is a non-issue**, ran an
+adversarially-verified kernel audit, and pinned the failure with a decisive ktrace capture.
+Net: the bug was a userspace **edge-driven executor stall** in `async-rt`, not a kernel
+lost-wake. The kernel mechanics the prior six sessions suspected are all sound.
+
+## syslog CPU (the original side-observation) — CONFIRMED non-issue
+
+Measured live on the current build (SSH in, sample `/proc/<pid>/stat` across an 8 s idle
+window): **syslogd `utime=0`, `stime` Δ≈3 jiffies / 10 s ≈ 0.3 % CPU.** Not spinning. The
+`a92486f` live-`/proc/kmsg`-cursor fix holds; a 4-track adversarial audit confirmed **no
+feedback loop** (the write→ext2→blk→fsync path emits zero dmesg bytes) and **no continuous
+idle kernel logging** (`max_level=Info`, timer/scheduler hot paths log nothing). The user's
+"large CPU in htop" was a **stale pre-fix build**. NB: the sixth-session "verification" that
+dismissed `stime` because `utime=0` was wrong reasoning (a `poll→read→poll` spin burns
+*stime*, not utime) — but the measurement re-done here shows it genuinely isn't spinning.
+
+## Two earlier mis-diagnoses corrected
+
+- **`init` blocking at `syscall/mod.rs:3817` is NOT a wedge.** Line 3817 is `nanosleep`'s
+  `block_current_until(BlockedOnRecv, Some(deadline))` — init's normal supervise-loop sleep,
+  which wakes on its deadline. (Sixth-session update mislabeled it as the reap-block site.)
+- **`write(STDOUT_FILENO)` for sshd is NOT a synchronous IPC.** A daemon inherits init's fd 1 =
+  `FdBackend::Stdout` → `syscall/mod.rs:6397` writes to serial + framebuffer console (kernel-side,
+  no IPC, no block). This **refutes original evidence #4** ("blocked on a lost `write()` reply").
+
+## Adversarial kernel audit — mechanics are SOUND (each finding independently refuted/verified)
+
+| Suspected kernel bug | Verdict |
+|---|---|
+| PTY `slave_refcount` off-by-one across fork/exit | ❌ refuted — `fork` bumps refs via `add_fd_refs`, exit decrements; `POLLHUP` at `slave_refcount==0 && slave_opened` is correct |
+| `close_slave`→`wake_master` lost | ❌ — fires correctly; and the 100 ms re-poll re-reads `fd_poll_events` anyway |
+| async-rt reactor registration gap (waker lost between iterations) | ❌ refuted — wakers are a persistent `Arc<TaskHeader>`; `interests` persist (no deregister) |
+| `wake_all`→`wake_task_v2` SMP ordering | ⚠️ doc-gap only — `pi_lock` CMPXCHG already provides the barrier; bounded µs latency, not a 100 s hang |
+| watchdog skips `BlockedOnRecv`-no-deadline | intentional (servers block in recv by design); re-waking would be a symptom-mask with broad blast radius |
+
+## DECISIVE capture (hang reproduced; armed on the *real* pid; host draining)
+
+Harness: boot → SSH session A logs in → discover the session-child pid from sshd's **own serial
+log** (`run_session:start pid=N`) — robust, since kernel task names are all `"fork-child"` →
+`ktrace arm N` → send `exit` → **keep draining** session A's pty for 14 s (required to trigger
+the bug) → SSH session B dumps `ktrace serial`/`states`. Result:
+
+- `ktrace states` during the hang: `idx=25 pid=21 state=BlkRecv core=2` — session A's child wedged.
+- Focus ring: `idx=25` **cycles `BLOCK @syscall/mod.rs:18493` (the reactor's `poll_once(100)`)
+  every exactly 100 ms**, waking on timeout (`from_state=2`), re-scanning, re-blocking — forever.
+  So it is **NOT a lost wake** (poll cycles fine); it is that **no registered fd ever reports
+  ready**, so the executor's `poll_once(100)` always times out with `run_queue` empty.
+- The sshd teardown log shows `cleanup:start … cleanup:done pid=21` appearing **only after**
+  session B connects (long after the `states` snapshot) — i.e. **session B's activity unstuck
+  session A.** Classic Heisenbug.
+
+### Why "no fd ready" ⇒ permanent stall (the actual mechanism)
+
+The sshd session child is a single process running an `async-rt` executor with four tasks
+(root `async_session`, `io_task`, `progress_task`, `channel_relay`). Shell-exit detection is
+the relay's `waitpid(WNOHANG)` backstop (`session.rs:1010`) plus two others — but **a task only
+runs when its waker fires.** When `poll_once(100)` times out with no fd ready, **no task is
+woken, so none of the three `waitpid` backstops execute.** ion's exit *should* make the PTY
+master report `POLLHUP`, but the captured behavior shows the relay's poll set never surfaces a
+ready fd during the hang (a transient missed edge — the exact lost edge is bounded to a window
+the 100 ms re-poll should have caught but, intermittently, doesn't). Because the executor was
+**purely edge-driven**, that single missed edge stalls the whole session **forever**.
+
+## The fix (verified) — idle-liveness backstop in the executor
+
+`userspace/async-rt/src/executor.rs` `block_on`: track consecutive empty 100 ms reactor polls;
+after `LIVENESS_STALL_TICKS = 3` (~300 ms of zero progress) call new `Executor::requeue_all()`
+— mark every live task woken + queued and wake the root — so each task **re-polls from its
+await point**. The relay's `WaitWake` future returns `Ready` once `registered`, so the relay
+reaches its `waitpid(WNOHANG)` backstop, reaps the zombie shell, sets `session_done`, and
+teardown (`cleanup` → `close(sock_fd)` → FIN) completes within ~300 ms — converting a permanent
+hang into bounded recovery **regardless of which edge was missed**. `TaskHeader::mark_woken()`
+added in `task.rs`. Reset on any progress, so normal event-driven operation is unchanged; only
+a genuine ≥300 ms stall triggers the backstop (then ~3 Hz re-poll until it clears).
+
+Also: fixed a **pre-existing** broken async-rt host test (`test_spawn_during_poll_is_not_dropped`
+used `ran` after move — it never compiled, and `cargo xtask check` doesn't run async-rt tests so
+it slipped through) and added a regression test `test_idle_liveness_backstop_recovers_lost_wake`
+that models a spawned task with a lost readiness edge and asserts the backstop recovers it.
+
+### Verification
+
+- `cargo test -p async-rt` — **67/67 pass** (incl. the new regression test).
+- `cargo xtask check` — clippy `-D warnings` clean, fmt clean, all host tests pass.
+- `scripts/ssh_session_exit_test.sh virtio exit` ×5 — **0/5 HUNG** (was ~100 % hang before).
+  The client now always disconnects (no `rc=10`). Expectation: the same backstop also cures the
+  "every-other interactive command stalls until next input" responsiveness symptom (same class).
+
+## RESIDUAL (separate, lower priority) — teardown is not a *clean* SSH logout (ssh exit 255)
+
+Post-fix the client always disconnects, but `ssh` reports **exit 255 / "Connection closed by
+remote host"** (test `rc=8`), not a clean exit 0. This is a **teardown-protocol** gap, not a
+hang: the server completes teardown and `close(sock_fd)`s the raw socket **without** an orderly
+SSH close. It predates the hang (the flow hung before reaching any close, so the clean close was
+never exercised). A tried best-effort fix — `runner.channel_done(handle)` → `progress()` →
+flush before `close(sock_fd)` in `async_session` teardown — **did not change the 255** and was
+**reverted** (it ventured into sunset/TCP-close territory with no observable benefit). Likely
+cause: kernel TCP `close()` emits **RST** when unread data sits in the socket receive buffer
+(client's `exit\n`/trailing bytes), or a missing `SSH_MSG_DISCONNECT`. **Next step for a clean
+exit 0:** confirm RST-vs-FIN on `close()` with pending RX (kernel `net/tcp` close path) and/or
+drain the socket + send `SSH_MSG_DISCONNECT` before close. Low user impact (terminal returns
+immediately; 255 is cosmetic), so deprioritized below the now-fixed hang.
+
+## Tooling added this session (host-side, under /tmp during the investigation)
+
+- syslog CPU sampler (boot → SSH → sample `/proc/<pid>/stat` idle delta; slow-typed to defeat
+  ion autosuggestion, time-drained reads).
+- ktrace hang-capture harness (pid discovery from sshd serial log + host-draining + two-session
+  arm/dump) — the pattern that finally produced a clean armed-on-the-right-pid capture.
+- `verify_fix.sh` — runs `ssh_session_exit_test.sh virtio exit` N× and tallies clean/hung.

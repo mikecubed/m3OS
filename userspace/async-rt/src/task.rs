@@ -105,6 +105,13 @@ impl TaskHeader {
         self.woken.store(false, Ordering::Release);
     }
 
+    /// Mark the task woken so the executor re-polls it. Used by the executor's
+    /// idle-liveness backstop to force every parked task to re-poll after a
+    /// stall (see `Executor::requeue_all`).
+    pub fn mark_woken(&self) {
+        self.woken.store(true, Ordering::Release);
+    }
+
     /// Check whether this task is already queued for polling.
     pub fn is_queued(&self) -> bool {
         self.queued.load(Ordering::Acquire)
