@@ -446,12 +446,42 @@ Refined causal chain:
 
 ## Immediate next steps (with the tool now in hand)
 
-0. **CURRENT: instrument the block/wake chain to pinpoint the lost wake.** Emit a focus
-   trace event when a target parks (`BlockCurrent` at `block_current_until`) and on every
-   `wake_task_v2` *outcome*, so the timeline shows the target's last `BLOCK` and whether a
-   wake fired (and with what outcome: enqueued / deferred / already-awake / not-found). A
-   `BLOCK` with no following `WAKE` ⇒ producer never woke it; a `WAKE(deferred)` with no
-   `DISPATCH` ⇒ lost deferred enqueue. Then fix that specific site.
+### Block-site instrumentation result — pinpointed to `poll()`, NO wake attempted
+
+`block_current_until` is now `#[track_caller]` and emits a `BlockCurrent` focus event
+carrying the **caller location** (the block site) + state. Re-captured. The freeze sequence
+for the sshd session child (pid 23, idx 26) is exact:
+
+```
+t=58946 WAKE idx=26 ->core2 (from BlockedOnRecv) → ENQUEUE → DISPATCH   (runs its relay)
+t=58946 BLOCK idx=26 core2 state=2 @kernel/src/arch/x86_64/syscall/mod.rs:18493
+t=58946 SWITCHOUT idx=26 core2
+<silence — no further events for idx 26, ever>
+```
+
+Line **18493 is the `block_current_until` call inside `sys_poll`**. So the child is lost-woken
+**in `poll()`**. Crucially, **no `WakeTask` is emitted for idx 26 after that BLOCK** — and since
+the block committed (state=BlockedOnRecv), any later `wake_task_v2` would have succeeded and
+emitted one. ⇒ **No wake was attempted at all.** The poll's fd-waitqueue producers
+(`wake_socket` → `wake_all` → `wake_task_v2`) never fired for the child's fd.
+
+By elimination the break is **upstream of the poll wake**: either net_task never processed the
+`exit\n` segment (NIC→net_task wake lost), or the data reached the socket but
+`wake_sockets_for_tcp_slot`/`wake_socket` wasn't called (or the child was momentarily
+deregistered), or the relay's PTY-master write didn't wake the right waiter. The wake chain
+(`tcp.rs` sets `wake_slot` on every matched segment → `wake_sockets_for_tcp_slot` →
+`wake_socket` → `wake_all`; mod.rs:369) and `sys_poll` re-register/rescan are all correct by
+inspection — so it is a real intermittent producer-side miss, not a missing guard.
+
+NB also observed: the **serial-console `ion` (pid 21)** busy-loops a synchronous `call` on
+endpoint 4 (~1/ms) the whole time — a separate suspect worth its own look (a prompt read
+should block, not spin).
+
+0. **CURRENT NEXT: wake-side trace.** Record producer wakes unconditionally-when-armed —
+   `wake_socket(handle)`, the PTY-master→slave wake, and `wake_task_v2` *attempts that return
+   AlreadyAwake* — so the timeline shows whether `wake_socket` fired for the child's fd around
+   the freeze (and on which handle) vs. never fired. That names the exact missing wake; then
+   fix that producer (or the deregister-window race in `sys_poll`).
 1. **Capture the stalled core's running context.** The focus filter is target-only, so it
    shows the *victims* (ion, the stale-ready tasks) but not **what occupies core 3 / core 1
    in ring 0 while they wait**. Add a small focus mode that, in addition to the targets, also

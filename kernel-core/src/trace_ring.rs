@@ -98,6 +98,11 @@ pub enum TraceEvent {
         task_idx: u32,
         core: u8,
         new_state: u8,
+        /// Call site that parked the task (via `#[track_caller]` on
+        /// `block_current_until`). Distinguishes the block kind — poll vs IPC
+        /// recv vs reply vs PTY/socket read — when hunting a lost wake.
+        caller_file: &'static str,
+        caller_line: u32,
     },
     WakeTask {
         task_idx: u32,

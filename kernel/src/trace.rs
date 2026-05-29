@@ -141,8 +141,10 @@ fn print_trace_event(event: &TraceEvent) {
             task_idx,
             core,
             new_state,
+            caller_file,
+            caller_line,
         } => _panic_print(format_args!(
-            "BlockCurrent {{ task_idx: {task_idx}, core: {core}, new_state: {new_state} }}"
+            "BlockCurrent {{ task_idx: {task_idx}, core: {core}, new_state: {new_state}, caller={caller_file}:{caller_line} }}"
         )),
         TraceEvent::WakeTask {
             task_idx,
@@ -449,16 +451,22 @@ pub mod focus {
                 );
             }
             TraceEvent::BlockCurrent {
-                core, new_state, ..
+                core,
+                new_state,
+                caller_file,
+                caller_line,
+                ..
             } => {
                 let _ = write!(
                     c,
-                    "BLOCK idx={} pid={} {} core{} state={}",
+                    "BLOCK idx={} pid={} {} core{} state={} @{}:{}",
                     subj.unwrap_or(EMPTY),
                     pid,
                     name,
                     core,
-                    new_state
+                    new_state,
+                    caller_file,
+                    caller_line
                 );
             }
             TraceEvent::WakeTask {

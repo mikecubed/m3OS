@@ -3332,12 +3332,17 @@ pub enum BlockOutcome {
 /// - Linux `do_nanosleep` (`kernel/time/hrtimer.c`) — four-step block recipe.
 /// - Linux `try_to_wake_up` (`kernel/sched/core.c`) — CAS wake side.
 /// - m3OS handoff 2026-04-25: `docs/handoffs/57a-scheduler-rewrite-v2-transitions.md`.
+#[track_caller]
 pub fn block_current_until(
     kind: TaskState,
     woken: &core::sync::atomic::AtomicBool,
     deadline_ticks: Option<u64>,
 ) -> BlockOutcome {
     use core::sync::atomic::Ordering;
+    // Capture the block site (immediate caller — `sys_poll`,
+    // `block_current_on_recv_v2`, the PTY/socket read, …) so the focus trace
+    // can distinguish which wait a lost wake stranded.
+    let block_caller = core::panic::Location::caller();
 
     debug_assert!(
         matches!(
@@ -3456,6 +3461,17 @@ pub fn block_current_until(
         }
         // pi_lock released.
     }
+
+    // Trace the park (after the state write, before the self-revert recheck).
+    // A `BLOCK` with no following `WakeTask` for this idx is the lost-wake
+    // signature; the caller location names which wait it is.
+    crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::BlockCurrent {
+        task_idx: idx as u32,
+        core,
+        new_state: kind as u8,
+        caller_file: block_caller.file(),
+        caller_line: block_caller.line(),
+    });
 
     // ── Step 2: pi_lock + SCHEDULER.lock both released ───────────────────────
 
