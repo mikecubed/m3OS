@@ -169,9 +169,16 @@ enumeration path) is the regression-protected proof.
 
 ## Known Follow-ups
 
-- **DNS userspace delivery:** the kernel round-trip works but the resolver's
-  `poll`/`recvfrom` does not surface the reply in its window — a UDP-delivery
-  gap, not resolver wiring.
+- **DNS:** forward resolution works end to end — `getaddrinfo` over UDP
+  resolves A records. (The earlier "userspace-delivery gap" was mis-attributed
+  to `poll`/`recvfrom`: musl drains replies with `recvmsg`, not `recvfrom`, and
+  `recvmsg` on AF_INET returned `EOPNOTSUPP`; closed by `sys_recvmsg_inet` in
+  commit `8303990`.) Remaining follow-ups: the `dns-smoke` gate is
+  intentionally **soft** — it accepts `DNS_SMOKE:SKIP` (no outbound DNS in a
+  sandbox) as well as `:PASS`, so it proves the resolver path is wired and
+  non-hanging but does **not** regression-protect a successful resolution; and
+  there is no caching, no search-domain / `nsswitch.conf` handling, and no
+  AAAA/IPv6 or DNSSEC.
 - **TCP:** SACK / window scaling / modern congestion control; a real
   packet-loss test rig (tap + netem) to replace the host-tested estimator.
 - **Microcode:** an Intel `0x79` path + a fetch-and-verify flow for the blob

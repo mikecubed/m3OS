@@ -256,7 +256,7 @@ Closure evidence lives in the same places the tooling already produces today:
 | Large runtime ecosystems (Python, Node.js, JVM) | Out of scope | Post-1.0 (Phase 59–62) |
 | Outbound HTTPS/TLS client tooling | Deferred | Post-1.0 |
 | `git`, `gh`, GitHub integration | Deferred | Post-1.0 |
-| DNS resolution and general outbound networking | Partially delivered in Phase 77 (Track D.1: `/etc/resolv.conf` + unbound-UDP ephemeral source port; kernel-level DNS round-trip works, userspace-delivery residual documented) | Phase 77 |
+| DNS resolution and general outbound networking | DNS delivered in Phase 77 (Track D.1: `/etc/resolv.conf` + unbound-UDP ephemeral source port + `recvmsg`-on-AF_INET reply delivery, commit `8303990`); `getaddrinfo` resolves A records end to end. Outbound HTTPS/TLS client tooling remains deferred (see row above); DNS caching / search domains / IPv6 / DNSSEC are post-1.0 | Phase 77 |
 | Package feeds / remote package repositories | Deferred | Post-1.0 |
 | Dynamic linking / shared libraries | Delivered in Phase 76 (`ld-musl-x86_64.so.1` + `dlopen`/`dlsym`/`dlclose` + PLT lazy resolve + GNU hash + symbol versioning) | Phase 76 |
 | Full POSIX compliance testing | Deferred | Post-1.0 |
