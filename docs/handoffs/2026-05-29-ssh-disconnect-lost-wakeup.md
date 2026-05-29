@@ -477,11 +477,48 @@ NB also observed: the **serial-console `ion` (pid 21)** busy-loops a synchronous
 endpoint 4 (~1/ms) the whole time — a separate suspect worth its own look (a prompt read
 should block, not spin).
 
-0. **CURRENT NEXT: wake-side trace.** Record producer wakes unconditionally-when-armed —
-   `wake_socket(handle)`, the PTY-master→slave wake, and `wake_task_v2` *attempts that return
-   AlreadyAwake* — so the timeline shows whether `wake_socket` fired for the child's fd around
-   the freeze (and on which handle) vs. never fired. That names the exact missing wake; then
-   fix that producer (or the deregister-window race in `sys_poll`).
+### Wake-side trace — it is NOT a scheduler lost-wake; the relay's poll works
+
+Added a `Wakeup` focus event (recorded unconditionally-when-armed) at the fd-waitqueue
+producers — `wake_socket` (kind=0), `wake_master`/`wake_slave` (kind=2/3) — and re-captured.
+This **overturns the lost-wake framing of the last four sessions**:
+
+- The sshd child's poll wakes on a **100 ms timeout** (`WAKE(from_state=2)` → `BLOCK
+  @poll:18493`, exactly 100 ms apart) and re-scans — so a lost *wake* cannot permanently hang
+  it; a 100 ms timeout rescan would find any buffered data. The relay's `poll()` is working.
+- `PRODUCER_WAKE socket/pty` events fire plentifully **and then stop** — after which the child
+  poll-cycles forever finding nothing ready. ⇒ **The hang is that incoming data STOPS being
+  delivered to the relay's socket**, not a missed wakeup.
+
+### Ruled OUT (each by instrumentation/inspection this session)
+
+| Hypothesis | Verdict | Evidence |
+|---|---|---|
+| Dispatch starvation (Ready-not-dispatched) | ❌ | tasks are `BlockedOnRecv`, cores idle (`ktrace states`) |
+| Scheduler/IPC lost-wake on recv/reply | ❌ | `block_current_on_recv_v2`/`reply_v2` register-then-recheck (race-free) |
+| `poll()` lost-wake | ❌ | poll wakes every 100 ms (timeout) + rescans; producer wakes fire |
+| TCP out-of-order drop (no reassembly) | ❌ | added `[tcp] no-reassembly` drop log — **never fired** during the hang |
+| TCP zero-window deadlock | ❌ | `rcv_wnd` is a constant `DEFAULT_WINDOW`; window never closes |
+
+### Refined conclusion + next step
+
+The bug is **incoming TCP data stops reaching sshd's relay socket** mid-session, while the
+relay's poll keeps timing out on an empty socket. TCP is neither dropping (OOO log silent) nor
+window-blocking it. The remaining suspect is the **net RX path**: the NIC-ISR→`net_task` wake
+(`net_task` parks in `BlockedOnRecv`; woken lock-free from the virtio/e1000 ISR like the serial
+feeder) or `net_task`'s segment processing. **NEXT:** instrument the NIC RX ISR wake of
+`net_task` + `net_task`'s per-segment processing (does the `exit\n` segment reach
+`handle_segment` for socket 2?), to see whether net_task stops being woken/scheduled or stops
+processing. Only then is the true fix locatable. (NB: the four-session "scheduler lost-wake"
+framing is now retired — the relay poll is healthy; the failure is upstream in net RX delivery.)
+
+### Side fix landed this session
+
+`tcp.rs`: an out-of-order/duplicate Established-state segment was dropped **silently with no
+ACK**; now it sends a duplicate ACK for `rcv_nxt` (RFC 5681 §3.2) so the peer can fast-
+retransmit, plus a rate-limited `[tcp] no-reassembly` drop log. Correct + low-risk, but
+confirmed **dormant** in this hang (log count 0) — not the root cause; kept as a latent-
+correctness improvement for lossy links.
 1. **Capture the stalled core's running context.** The focus filter is target-only, so it
    shows the *victims* (ion, the stale-ready tasks) but not **what occupies core 3 / core 1
    in ring 0 while they wait**. Add a small focus mode that, in addition to the targets, also

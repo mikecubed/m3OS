@@ -193,6 +193,9 @@ fn print_trace_event(event: &TraceEvent) {
         TraceEvent::MessageDelivered { task_idx, ep } => _panic_print(format_args!(
             "MessageDelivered {{ task_idx: {task_idx}, ep: {ep} }}"
         )),
+        TraceEvent::Wakeup { kind, id } => {
+            _panic_print(format_args!("Wakeup {{ kind: {kind}, id: {id} }}"))
+        }
     }
 }
 
@@ -318,7 +321,7 @@ pub mod focus {
             | ForkTaskSpawned { task_idx, .. }
             | ForkTrampolineEnter { task_idx, .. } => Some(task_idx),
             ReplyDeliver { caller_idx, .. } => Some(caller_idx),
-            ForkCtxPublish { .. } | ForkTrampolineExit { .. } => None,
+            ForkCtxPublish { .. } | ForkTrampolineExit { .. } | Wakeup { .. } => None,
         }
     }
 
@@ -361,12 +364,18 @@ pub mod focus {
         if !ARMED.load(Ordering::Relaxed) {
             return;
         }
-        let subj = match event_subject_idx(&entry.event) {
-            Some(s) => s,
-            None => return,
-        };
-        if !targets_contains(subj) {
-            return;
+        // Producer-wake events have no task subject but are always recorded
+        // (while armed) so the timeline shows whether the wake a focused poller
+        // is waiting for ever fires.
+        let is_wakeup = matches!(entry.event, TraceEvent::Wakeup { .. });
+        if !is_wakeup {
+            let subj = match event_subject_idx(&entry.event) {
+                Some(s) => s,
+                None => return,
+            };
+            if !targets_contains(subj) {
+                return;
+            }
         }
         if let Some(mut g) = FOCUS.try_lock()
             && g.armed
@@ -583,6 +592,16 @@ pub mod focus {
             }
             TraceEvent::ForkCtxPublish { .. } | TraceEvent::ForkTrampolineExit { .. } => {
                 let _ = write!(c, "FORK_MISC");
+            }
+            TraceEvent::Wakeup { kind, id } => {
+                let what = match kind {
+                    0 => "socket",
+                    1 => "unix-socket",
+                    2 => "pty-master",
+                    3 => "pty-slave",
+                    _ => "?",
+                };
+                let _ = write!(c, "PRODUCER_WAKE {what} id={id}");
             }
         }
         let _ = c.write_str("\n");

@@ -164,6 +164,15 @@ pub enum TraceEvent {
         task_idx: u32,
         ep: u32,
     },
+
+    /// A producer-side wake of an fd wait queue (no task subject). Recorded
+    /// unconditionally while the focus ring is armed, to reveal whether the
+    /// wake a poller is waiting for ever fires. `kind`: 0=socket, 1=unix-socket,
+    /// 2=pty-master, 3=pty-slave. `id` is the handle / pty id.
+    Wakeup {
+        kind: u8,
+        id: u32,
+    },
 }
 
 /// A single trace ring entry: timestamp + core ID + event.

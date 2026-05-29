@@ -14,6 +14,22 @@ use kernel_core::net::tcp::{
 };
 pub use kernel_core::net::tcp::{TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN, TcpHeader};
 
+/// Rate-limited log for dropped out-of-order/duplicate TCP payload (m3OS has no
+/// reassembly queue). Budgeted so a lossy link cannot flood the serial console;
+/// the count confirms whether this path fires during the SSH-disconnect hang.
+fn log_tcp_ooo_drop(seq: u32, rcv_nxt: u32, len: usize) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static BUDGET: AtomicU32 = AtomicU32::new(64);
+    if BUDGET
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |r| r.checked_sub(1))
+        .is_ok()
+    {
+        log::warn!(
+            "[tcp] no-reassembly: dropped out-of-order/dup payload seq={seq} rcv_nxt={rcv_nxt} len={len} (dup-ACK sent)"
+        );
+    }
+}
+
 /// Per-connection cap on outstanding (unacknowledged) bytes. Bounds the
 /// retransmit queue's memory footprint; the effective send window is the
 /// smaller of this and the peer's advertised window. At 64 connections this is
@@ -384,6 +400,20 @@ impl TcpConnection {
                     self.recv_buf.extend(payload);
                     self.rcv_nxt = self.rcv_nxt.wrapping_add(payload.len() as u32);
                     self.queue_segment(pending, TCP_ACK, &[]);
+                } else if !payload.is_empty() {
+                    // Out-of-order or duplicate data. m3OS TCP has no reassembly
+                    // queue, so we cannot buffer a future segment — but we MUST
+                    // still send a duplicate ACK for our current `rcv_nxt` so the
+                    // peer learns what we expect and (fast-)retransmits the
+                    // missing in-order segment (RFC 5681 §3.2). The previous code
+                    // dropped this segment *silently with no ACK*, which stalls
+                    // the peer's retransmit logic and can permanently wedge an
+                    // interactive stream — the SSH-disconnect hang: the client's
+                    // `exit\n` (or a later byte) arrives out-of-order once, is
+                    // dropped un-ACKed, and is never re-driven, so the relay
+                    // polls forever with no data.
+                    self.queue_segment(pending, TCP_ACK, &[]);
+                    log_tcp_ooo_drop(header.seq, self.rcv_nxt, payload.len());
                 }
                 if has_fin {
                     self.rcv_nxt = self.rcv_nxt.wrapping_add(1);

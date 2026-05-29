@@ -216,6 +216,10 @@ pub static SOCKET_WAITQUEUES: [WaitQueue; MAX_SOCKETS] = {
 /// Wake all tasks waiting on the given socket.
 pub fn wake_socket(handle: SocketHandle) {
     if (handle as usize) < MAX_SOCKETS {
+        crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::Wakeup {
+            kind: 0,
+            id: handle,
+        });
         SOCKET_WAITQUEUES[handle as usize].wake_all();
     }
 }

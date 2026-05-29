@@ -35,6 +35,7 @@ pub static PTY_SLAVE_WQ: [WaitQueue; MAX_PTYS] = {
 /// Wake tasks waiting on the master side of a PTY.
 pub fn wake_master(id: u32) {
     if (id as usize) < MAX_PTYS {
+        crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::Wakeup { kind: 2, id });
         PTY_MASTER_WQ[id as usize].wake_all();
     }
 }
@@ -42,6 +43,7 @@ pub fn wake_master(id: u32) {
 /// Wake tasks waiting on the slave side of a PTY.
 pub fn wake_slave(id: u32) {
     if (id as usize) < MAX_PTYS {
+        crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::Wakeup { kind: 3, id });
         PTY_SLAVE_WQ[id as usize].wake_all();
     }
 }
