@@ -380,21 +380,51 @@ ring (target-only) is clean and legible. Over the 4.4 s window from arm to the f
 - sshd child (pid 21) was being woken/dispatched normally (44 wakes / 132 dispatches) until
   t=47881, then it too goes silent (~90 ticks before ion).
 
-So the teardown hang localises to the **IPC call/reply resume path** (the rendezvous that
-hands the CPU back to a `call`-blocked caller after `reply`), NOT the generic run-queue
-dispatch — a tighter localisation than the prior `preempt-voluntary` hypothesis.
+So the *last thing that happens* to ion is a reply delivery; it then never runs again.
+
+## Follow-up audit — it is dispatch starvation, NOT a lost IPC wake
+
+Two further pieces, gathered after the capture, **redirect the conclusion** away from an IPC
+rendezvous bug:
+
+1. **The IPC `call`/`reply` rendezvous is race-free.** `endpoint::reply` (endpoint.rs:1208)
+   does `deliver_message(caller)` then `wake_task_v2(caller)` under a `preempt_disable`
+   bracket. `deliver_message` (scheduler.rs:4462) sets `pending_msg` **and** stores `true`
+   into the caller's `reply_waker` flag, under `SCHEDULER.lock`. The caller's
+   `block_current_on_reply_v2` (scheduler.rs:3592) registers that same flag, re-checks
+   `has_pending_message` after registering, and blocks on the flag — all under the same lock.
+   Every interleaving is covered: deliver-before-block self-reverts via the flag;
+   block-before-deliver gets a real `wake_task_v2`. No missed-wakeup window here.
+2. **The kernel's own `stale-ready` warnings fire at the exact freeze tick.** With pid
+   filtering quiet, the serial log shows, at `ready_at_tick≈47972` (ion's last event was
+   47971): `stale-ready pid=9 core=3 stale~50ms`, `pid=18 core=3 ~147ms`, `pid=15 core=3
+   ~182ms`, `pid=0(net) core=1 ~238ms`. I.e. **multiple tasks become Ready on core 3 / core 1
+   at the freeze and sit un-dispatched for tens-to-hundreds of ms.**
+
+⇒ The freeze is **dispatch starvation**: ion's reply makes it Ready, but its core does not
+re-dispatch it (and other Ready tasks pile up on cores 3/1). This is the *same class* as the
+"chronic ~100-150 ms stale-ready latency" backdrop and matches the four-agent
+**kernel-mode-no-preempt under `preempt-voluntary`** consensus: a core busy in ring 0 (or
+halted with a missed reschedule) doesn't pick up a freshly-Ready task until it voluntarily
+yields. The IPC reply path is exonerated.
 
 ## Immediate next steps (with the tool now in hand)
 
-1. **Identify endpoint 4 and trace the server side.** `ion` calls ep4 synchronously every
-   input cycle (likely `vfs_server`/`console` — the VFS read path uses
-   `endpoint::call_msg(vfs_ep,…)`). Re-run the capture arming the **ep4 server pid too**, so
-   the dump shows the server's `RECV`/`REPLY` and whether, on the final reply, the caller is
-   (a) enqueued-Ready-but-never-dispatched, or (b) never enqueued at all (lost-wake in
-   `reply`). The current target-only trace shows ion has *no* enqueue/dispatch events
-   (direct hand-off), so audit `endpoint::reply*` → caller-resume for a missed hand-off.
-2. **Why is `ion` busy-looping ep4 at ~2.5 ms/cycle?** That tight synchronous poll is itself
-   suspect (a blocking read should not spin). It may be the same input-not-delivered symptom
-   (ion never receives the `exit\n`, so it re-polls) — confirm by tracing the input path.
-3. Audit the `reply`/`call` rendezvous resume for a missed-wakeup window analogous to the
-   `wake_task_v2_if` TOCTTOU fix, focusing on the hand-back to the `BlockedOnReply` caller.
+1. **Capture the stalled core's running context.** The focus filter is target-only, so it
+   shows the *victims* (ion, the stale-ready tasks) but not **what occupies core 3 / core 1
+   in ring 0 while they wait**. Add a small focus mode that, in addition to the targets, also
+   records `Dispatch`/`SwitchOut` for the core(s) named in a `stale-ready` warning (or a
+   one-shot "dump the running task of every core" op). That names the task holding the core
+   in kernel mode — the actual culprit.
+2. **Evaluate the idle-task-only redispatch fix** (recommended step 2 from the trace-ring
+   section): make `reschedule_ipi_handler_kernel` (interrupts.rs:2091) force a redispatch
+   only when the interrupted ring-0 context is the per-core **idle** task. If the stalled
+   cores are idle/halted with a missed reschedule, this fixes it with minimal risk; if they
+   are busy in a real kernel-mode task, a bounded kernel-preempt is needed (gated by the
+   documented soak). The `stale-ready` tasks (pid 9/15/18) suggest core 3 is *not* idle
+   (those would be picked up instantly by an idle core), so lean toward the busy-in-kernel
+   case — confirm with step 1.
+3. **Why is `ion` busy-looping ep4 at ~2.5 ms/cycle?** A separate, lower-priority oddity: a
+   shell at a prompt should block on its read, not spin a synchronous `call`. Likely the
+   `exit\n` never reaches ion (input-delivery starvation, same root cause), so it re-polls.
+   Identify ep4 (arm its server pid) and confirm.
