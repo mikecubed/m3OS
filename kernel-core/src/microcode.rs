@@ -221,4 +221,33 @@ mod tests {
             let _ = find_amd_patch(&c[..n], 0xa010);
         }
     }
+
+    #[test]
+    fn oversized_section_length_is_safe() {
+        // A full-length (non-truncated) blob whose section-length field is
+        // hostile (`u32::MAX`) must return None without panicking or reading
+        // out of bounds — exercises the `*_end > blob.len()` guards directly
+        // (the truncation sweep above only ever shrinks valid lengths).
+
+        // Equiv-table section claiming a u32::MAX payload length.
+        let mut b = Vec::new();
+        b.extend_from_slice(&AMD_CONTAINER_MAGIC.to_le_bytes());
+        b.extend_from_slice(&SECTION_TYPE_EQUIV_TABLE.to_le_bytes());
+        b.extend_from_slice(&u32::MAX.to_le_bytes()); // hostile length
+        b.extend_from_slice(&[0u8; 32]); // payload far smaller than claimed
+        assert_eq!(find_amd_equiv_id(&b, 0x00a0_0f10), None);
+        assert_eq!(find_amd_patch(&b, 0xa010), None);
+
+        // Valid (empty) equiv table followed by a patch section with a hostile
+        // length.
+        let mut c = Vec::new();
+        c.extend_from_slice(&AMD_CONTAINER_MAGIC.to_le_bytes());
+        c.extend_from_slice(&SECTION_TYPE_EQUIV_TABLE.to_le_bytes());
+        c.extend_from_slice(&16u32.to_le_bytes()); // one zero-terminator entry
+        c.extend_from_slice(&[0u8; 16]); // zero-terminator equiv entry
+        c.extend_from_slice(&SECTION_TYPE_PATCH.to_le_bytes());
+        c.extend_from_slice(&u32::MAX.to_le_bytes()); // hostile patch length
+        c.extend_from_slice(&[0u8; 8]); // truncated patch payload
+        assert_eq!(find_amd_patch(&c, 0xa010), None);
+    }
 }
