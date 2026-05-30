@@ -1,11 +1,21 @@
 # Phase 78b — USB Host Foundation: Enumeration + Hub: Task List
 
-**Status:** Planned
+**Status:** In Progress
 **Source Ref:** phase-78b
 **Depends on:** Phase 78a (xHCI Host-Controller Bring-Up), Phase 74 (IPC Capability Grants / page-grant bulk transport) ✅, Phase 67 (IOMMU Substrate Completion) ✅
 **Goal:** Make the live 78a controller discover devices: a host-testable USB core (descriptor parser + enumeration state machine), the host↔class IPC protocol crate, a `usbhub` class driver with a host-tested `PortId` topology, and the committed `sys_device_pci_enumerate` so all xHCI controllers are found. The full device tree enumerates to Configured and prints on boot. Kernel bumped to `0.78.1`. Second of three Phase 78 sub-phases ([78a](../78a-xhci-host-bringup.md) → [78b](../78b-usb-enumeration-hub.md) → [78c](../78c-usb-hid-and-release.md)).
 
 > **Note:** Enumeration runs **inside** the `xhci` host driver (the Redox `xhcid` model), with the class-agnostic logic in the host-testable `kernel-core/src/usb/` + the shared `userspace/lib/usb-core` library. There is **no** separate "usb-core daemon" / `usb-core.conf` — `usb-core` is a library linked by `xhci`, `usbhub`, and (in 78c) `usb-hid`.
+
+## Validation against merged 78a (recorded at implementation start)
+
+Source-verified after Phase 78a (#203) merged. Findings that adjust this task list:
+
+- **xHCI driver crate/service is named `xhci_driver`, not `xhci`.** The 78a crate is `userspace/drivers/xhci` with package + bin name **`xhci_driver`**; its service config is `name=xhci_driver`, `command=/drivers/xhci`. Therefore **B.2's `usbhub.conf` must use `depends=xhci_driver`** (not `depends=xhci`).
+- **78a placed `xhci_driver.conf` in the ext2 data disk via `populate_ext2_files`, _not_ in the static `kernel/initrd/etc/services.d/` tree** (which holds kbd/mouse/console/etc.), plus an entry in `init` `KNOWN_CONFIGS`. **B.2 follows this 78a precedent**: write `usbhub.conf` through `populate_ext2_files` + add to `KNOWN_CONFIGS`, rather than adding a static `kernel/initrd/etc/services.d/usbhub.conf` file. `cargo xtask clean` still required.
+- **Line/symbol references drifted** (corrected inline below): `build_userspace_bins` → `xtask/src/main.rs:813`; `bins` array → `:818` (3-tuple `(pkg, bin, needs_alloc)`, e.g. 78a's `("xhci_driver","xhci_driver",true)`); `populate_ext2_files` → `:12746`; `DRIVERS_ENTRIES` → `ramdisk.rs:1152`; `PciMatch::ClassSubclass` → `pci/mod.rs:1554` (enum carries `#[allow(dead_code)]`); `is_authorized_driver_process` → `device_host.rs:126` (unchanged); `KNOWN_CONFIGS` → `init/src/main.rs:185` (unchanged).
+- **Syscall numbers `0x1120`–`0x1126` confirmed** in `kernel-core/src/device_host/syscalls.rs`; next free is **`0x1127`** for `sys_device_pci_enumerate`.
+- **Foundations already present from 78a** (additive, no conflict): `kernel-core/src/usb/xhci/context.rs` has Input Control / Slot Context / Add-flags encoders; `trb.rs` has all TRB type constants + `TrbType` enum (Setup/Data/Status/AddressDevice/ConfigureEndpoint/EvaluateContext) but **only `link`/`enable_slot`/`no_op_command` builders** — A.2 must add the Setup/Data/Status/command-TRB builders + EP0/interrupt-EP context encoders. `kernel-core/src/usb/mod.rs` currently exports only `pub mod xhci;` — A.1/A.2/B.1 add `descriptor`, `enumerate`, `hub`.
 
 ## Track Layout
 
@@ -87,18 +97,17 @@
 
 **Files:**
 - `Cargo.toml` (workspace `members`)
-- `xtask/src/main.rs` (`build_userspace_bins`, line 795; `bins` array, line 800; `populate_ext2_files` service configs, ~line 12597)
-- `kernel/src/fs/ramdisk.rs` (`DRIVERS_ENTRIES`, line 1150)
-- `userspace/init/src/main.rs` (`KNOWN_CONFIGS`, lines 185–230)
-- `kernel/initrd/etc/services.d/usbhub.conf` (new)
+- `xtask/src/main.rs` (`build_userspace_bins` line 813; `bins` array line 818; `populate_ext2_files` service configs, ~line 12746 — mirror the 78a `xhci_driver_conf` block)
+- `kernel/src/fs/ramdisk.rs` (`DRIVERS_ENTRIES`, line 1152)
+- `userspace/init/src/main.rs` (`KNOWN_CONFIGS`, line 185)
 
-**Symbol:** `bins` tuple `(pkg, bin, needs_alloc=true)`, `DRIVERS_ENTRIES`, `usbhub.conf`
-**Why it matters:** `usb-core` is a library linked by the drivers (no service); `usbhub` is a ring-3 driver that must be staged under `/drivers/` (not `/bin/`) or the `is_authorized_driver_process` gate denies `sys_device_claim`. (`xhci` was staged in 78a; `usb-hid` is staged in 78c.)
+**Symbol:** `bins` tuple `(pkg, bin, needs_alloc)` (e.g. `("usbhub","usbhub",true)`), `DRIVERS_ENTRIES`, `usbhub.conf`
+**Why it matters:** `usb-core` is a library linked by the drivers (no service); `usbhub` is a ring-3 driver that must be staged under `/drivers/` (not `/bin/`) or the `is_authorized_driver_process` gate denies `sys_device_claim`. (`xhci_driver` was staged in 78a; `usb-hid` is staged in 78c.)
 
 **Acceptance:**
 - [ ] `usb-core` added as a Cargo `member` (library, no service); `usbhub` added as a Cargo `member` + `bins` entry with `needs_alloc = true`
 - [ ] `usbhub` binary embedded in `DRIVERS_ENTRIES` (`ramdisk.rs`) at `/drivers/usbhub`
-- [ ] `usbhub.conf` added to `kernel/initrd/etc/services.d/` **and** `init` `KNOWN_CONFIGS`; uses `command=/drivers/usbhub`, `type=daemon`, `restart=on-failure`, `depends=xhci`
+- [ ] `usbhub.conf` written via `populate_ext2_files` (ext2 data disk, mirroring 78a's `xhci_driver.conf` block) **and** added to `init` `KNOWN_CONFIGS`; uses `command=/drivers/usbhub`, `type=daemon`, `restart=on-failure`, **`depends=xhci_driver`** (the 78a service name)
 - [ ] `cargo xtask clean` run after adding the config (forces ext2 disk recreation)
 
 ---
@@ -112,11 +121,11 @@
 - `kernel-core/src/device_host/syscalls.rs` (syscall-number registration, currently `0x1120`–`0x1126`)
 - `kernel/src/pci/mod.rs` (`PciMatch::ClassSubclass`, line 1555)
 
-**Symbol:** `sys_device_pci_enumerate(class, subclass, prog_if)` (new, committed); `crate::pci::PciMatch::ClassSubclass` (`kernel/src/pci/mod.rs:1555`, currently `#[allow(dead_code)]`) as the in-kernel matcher to expose
+**Symbol:** `sys_device_pci_enumerate(class, subclass, prog_if)` (new, committed); `crate::pci::PciMatch::ClassSubclass` (`kernel/src/pci/mod.rs:1554`, enum carries `#[allow(dead_code)]`) as the in-kernel matcher to expose
 **Why it matters:** **Source-verified gap.** `sys_device_claim` takes a BDF only — there is no class-code filter, and no ring-3 PCI-config-space read path exists (NVMe/e1000 hardcode `SENTINEL_BDF`). Because the **headline milestone is the no-PS/2 laptop with six xHCI controllers**, the multi-controller path is committed here (a single QEMU controller still bootstraps on the 78a sentinel BDF as an interim, but is not the deliverable).
 
 **Acceptance:**
-- [ ] A new capability-gated syscall `sys_device_pci_enumerate(class, subclass, prog_if)` is added to `kernel/src/syscall/device_host.rs` (next free number after `0x1126` in `kernel-core/src/device_host/syscalls.rs`), returning the BDFs of every device matching class `0x0C0330`, built on the existing in-kernel `PciMatch::ClassSubclass` matcher (`pci/mod.rs:1555`, removing its `dead_code` allow)
+- [ ] A new capability-gated syscall `sys_device_pci_enumerate(class, subclass, prog_if)` is added to `kernel/src/syscall/device_host.rs` (number **`0x1127`**, the next free after `0x1126` in `kernel-core/src/device_host/syscalls.rs`), returning the BDFs of every device matching class `0x0C0330`, built on the existing in-kernel `PciMatch::ClassSubclass` matcher (`pci/mod.rs:1554`, removing its `dead_code` allow if it becomes live)
 - [ ] The new syscall is gated by the same `/drivers/` exec-path authorization as `sys_device_claim` (`is_authorized_driver_process`, `device_host.rs:126`)
 - [ ] `xhci` discovers **all** xHCI controllers via this enumeration and claims each (one driver instance per controller, or one instance iterating the set) — no hardcoded BDF on the real-hardware path; the `qemu-xhci` sentinel BDF remains only as an interim bootstrap
 - [ ] Host test: the enumeration filter returns exactly the class-`0x0C0330` BDFs from a synthetic PCI device list
