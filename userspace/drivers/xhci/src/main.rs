@@ -38,6 +38,14 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+/// Bring-up glue (MMIO / DMA / IRQ) around the host-tested
+/// `kernel_core::usb::xhci` pure logic. Compiled only for the OS target —
+/// it speaks the syscall ABI and has no host-test surface.
+#[cfg(not(test))]
+mod controller;
+
+#[cfg(not(test))]
+use crate::controller::{BringUpError, Controller, XhciBar0};
 #[cfg(not(test))]
 use core::alloc::Layout;
 #[cfg(not(test))]
@@ -93,15 +101,6 @@ const SENTINEL_BDF: DeviceCapKey = DeviceCapKey::new(0, 0x00, 0x06, 0);
 #[cfg(not(test))]
 const BAR0_EXPECTED_BYTES: usize = 0x1_0000;
 
-/// xHCI Capability register offsets (from BAR0 base).
-#[cfg(not(test))]
-mod cap_off {
-    /// CAPLENGTH is the low byte of the dword at offset 0.
-    pub const CAPLENGTH: usize = 0x00;
-    /// HCSPARAMS1 — MaxSlots / MaxIntrs / MaxPorts.
-    pub const HCSPARAMS1: usize = 0x04;
-}
-
 #[cfg(not(test))]
 fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, BOOT_LOG_MARKER);
@@ -138,22 +137,65 @@ fn program_main(_args: &[&str]) -> i32 {
 
     syscall_lib::write_str(STDOUT_FILENO, "[xhci] claimed 0000:00:06.0\n");
 
-    let caplength = bar0.read_reg::<u8>(cap_off::CAPLENGTH);
-    let hcsparams1 = bar0.read_reg::<u32>(cap_off::HCSPARAMS1);
-    let max_ports = ((hcsparams1 >> 24) & 0xFF) as u8;
-    let _ = caplength;
+    // Discover the register regions + capabilities (A.2).
+    let mut controller = Controller::new(handle, bar0);
+    write_ports_detected(controller.max_ports());
+    // Context size (32 vs 64) is selected from HCCPARAMS1.CSZ and threaded
+    // into all later context allocation; report it during discovery.
+    syscall_lib::write_str(STDOUT_FILENO, "[xhci] context size ");
+    write_u8_dec(controller.context_size() as u8);
+    syscall_lib::write_str(STDOUT_FILENO, " bytes\n");
 
-    write_ports_detected(max_ports);
+    // Ordered bring-up (A.3 checklist): handoff → reset(CNR) → MaxSlotsEn →
+    // DCBAA(+scratchpad) → command ring → event ring(ERST) → MSI-X
+    // interrupter → run → Enable Slot. Any stage failure exits non-zero so
+    // the service manager observes it.
+    controller.release_bios_ownership();
+    if let Err(e) = controller.reset() {
+        return bringup_failed(e);
+    }
+    controller.program_max_slots();
+    if let Err(e) = controller.init_dcbaa() {
+        return bringup_failed(e);
+    }
+    if let Err(e) = controller.init_command_ring() {
+        return bringup_failed(e);
+    }
+    if let Err(e) = controller.init_event_ring() {
+        return bringup_failed(e);
+    }
+    let irq = match controller.init_interrupter() {
+        Ok(irq) => irq,
+        Err(e) => return bringup_failed(e),
+    };
+    if let Err(e) = controller.run() {
+        return bringup_failed(e);
+    }
 
-    // Full bring-up (reset → DCBAA/scratchpad/contexts → rings → MSI-X → run
-    // → Enable Slot) lands in the A.3–A.7 glue. Until then the scaffold has
-    // proven claim + BAR map + register discovery; exit cleanly.
-    0
+    // A.7: reset any device already connected at the root hub (e.g. a
+    // `usb-kbd` present at machine creation) so its port reaches Enabled and
+    // its speed is decoded. Hotplug after this is event-driven in the loop.
+    controller.scan_ports();
+
+    // Milestone: enqueue Enable Slot, ring Doorbell 0, then drain the event
+    // ring on the MSI-X wake — the `XHCI_BRINGUP:enable-slot:OK` sentinel is
+    // emitted only from the interrupt-driven completion path.
+    controller.enqueue_enable_slot();
+    controller.event_loop(irq)
 }
 
-/// Typestate marker for the xHCI BAR0 MMIO window.
+/// Map a bring-up stage failure to a stable non-zero exit code + log line.
 #[cfg(not(test))]
-struct XhciBar0;
+fn bringup_failed(err: BringUpError) -> i32 {
+    let (msg, code) = match err {
+        BringUpError::ResetTimeout => ("xhci_driver: controller reset timeout\n", 5),
+        BringUpError::RunTimeout => ("xhci_driver: controller run timeout (HCH stuck)\n", 6),
+        BringUpError::DmaAlloc => ("xhci_driver: DMA allocation failed\n", 7),
+        BringUpError::IrqSubscribe => ("xhci_driver: MSI-X IRQ subscribe failed\n", 8),
+    };
+    syscall_lib::write_str(STDOUT_FILENO, msg);
+    code
+}
 
 /// Print `[xhci] N ports detected` without pulling in `alloc::format!`.
 #[cfg(not(test))]

@@ -1,6 +1,6 @@
 # Phase 78a - USB Host Foundation: xHCI Host-Controller Bring-Up
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-78a
 **Depends on:** Phase 55b (Ring-3 Driver Host) ✅, Phase 55c (Ring-3 Driver Correctness Closure) ✅, Phase 67 (IOMMU Substrate Completion) ✅
 **Builds on:** First sub-phase of the [Phase 78](./78-usb-host-foundation.md) USB theme. Extends the Phase 55b/55c ring-3 driver-host substrate with a userspace xHCI host-controller driver that claims the controller, completes the full xHCI bring-up sequence, and reaches a first command completion off the event ring via MSI-X. Sub-phases 78b (enumeration + hub) and 78c (HID + release) build on the live controller this phase produces.
