@@ -5,16 +5,23 @@
 //! the command endpoint (`sys_notif_bind`), and serves [`UsbRequest`]s from
 //! class drivers (the `usb-hid` daemon).
 //!
-//! # Why the setup happens before the loop
+//! # Request shapes and hardware waits
 //!
-//! HID Boot-Protocol setup (`SET_PROTOCOL(0)` + `SET_IDLE(0)`) and interrupt-IN
-//! arming use the **blocking** `control_transfer` path (`irq.wait()`), so they
-//! run **before** the notification is bound into the endpoint. After binding,
-//! the loop never blocks on hardware inside a request handler — exactly the
-//! e1000 server discipline. On each bound IRQ wake it drains the event ring
-//! (capturing interrupt-IN reports + re-arming); requests are served from that
-//! captured state with no hardware wait. A class driver therefore polls
-//! [`UsbRequest::PollInterruptIn`] and receives whatever the IRQ path captured.
+//! After enumeration the server binds its controller IRQ into the endpoint and
+//! runs the request loop. HID Boot-Protocol setup is **not** done here up front
+//! — the `usb-hid` class driver issues `SET_PROTOCOL(0)` / `SET_IDLE(0)` itself
+//! via [`UsbRequest::ControlRequest`], so the server serves two request shapes
+//! with different blocking behaviour:
+//!
+//! - [`UsbRequest::PollInterruptIn`] is **non-blocking**: on each bound IRQ wake
+//!   the server drains the event ring, capturing interrupt-IN reports and
+//!   re-arming the endpoint, and the poll just returns whatever was captured.
+//! - [`UsbRequest::ControlRequest`] runs a **real EP0 control transfer** whose
+//!   `control_transfer` path waits on the IRQ notification (`notify_wait`).
+//!   This handler therefore **does** block on hardware even though the IRQ is
+//!   already bound. It is safe because the server is single-threaded:
+//!   `notify_wait` drains the same `PENDING` word the bound `ipc_recv_msg`
+//!   does, and the server is never in both at once.
 
 use alloc::vec::Vec;
 

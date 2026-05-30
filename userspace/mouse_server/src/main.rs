@@ -456,7 +456,20 @@ fn emit_pointer_event(ev: &PointerEvent, reply_cap: u32) {
     let mut buf = [0u8; POINTER_EVENT_WIRE_SIZE];
     match ev.encode(&mut buf) {
         Ok(_) => {
-            let _ = syscall_lib::ipc_store_reply_bulk(&buf);
+            // Stage the bulk and reply. If staging fails (kernel bulk slot
+            // unavailable, oversized buf, copy fault — surfaces as `u64::MAX`),
+            // we cannot deliver the encoded event; reply with the sentinel so
+            // the client doesn't see a `MOUSE_EVENT_PULL` label paired with an
+            // empty/stale bulk and silently mis-decode. Mirrors kbd_server's
+            // `emit_key_event` discipline.
+            if syscall_lib::ipc_store_reply_bulk(&buf) == u64::MAX {
+                syscall_lib::write_str(
+                    STDOUT_FILENO,
+                    "mouse_server: error: ipc_store_reply_bulk failed; replying with sentinel\n",
+                );
+                syscall_lib::ipc_reply(reply_cap, u64::MAX, 0);
+                return;
+            }
             syscall_lib::ipc_reply(reply_cap, MOUSE_EVENT_PULL, 0);
         }
         Err(_) => {
@@ -520,6 +533,14 @@ fn program_main(_args: &[&str]) -> i32 {
     let mut bulk = [0u8; POINTER_EVENT_WIRE_SIZE];
 
     loop {
+        // Clear the reused bulk buffer before each recv. `ipc_recv_msg` copies
+        // only the received byte count into `bulk` and leaves any tail
+        // untouched, so a short send could otherwise let stale bytes from a
+        // previous message survive into `PointerEvent::decode`. The sole sender
+        // of a bulk payload here is the gated `usb-hid` driver TCB, which always
+        // sends the full `POINTER_EVENT_WIRE_SIZE`, but clearing keeps the
+        // inject path robust against cross-message contamination regardless.
+        bulk.fill(0);
         let rc = syscall_lib::ipc_recv_msg(ep_handle, &mut msg, &mut bulk);
         if rc == u64::MAX {
             continue;

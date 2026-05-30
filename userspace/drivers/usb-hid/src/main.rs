@@ -8,10 +8,12 @@
 //! # Flow
 //!
 //! 1. Wait for + look up the `usb` service the xHCI driver registers.
-//! 2. Pull every attached device via `NextAttach`. The xHCI server already put
-//!    each HID interface in Boot Protocol (`SET_PROTOCOL(0)` / `SET_IDLE(0)`)
-//!    and armed its interrupt-IN endpoint, and the `AttachNotice` carries the
-//!    endpoint's DCI / MPS so this driver needs no descriptor round-trip.
+//! 2. Pull every attached device via `NextAttach`. The `AttachNotice` carries
+//!    the interrupt-IN endpoint's DCI / MPS so this driver needs no descriptor
+//!    round-trip. This driver then puts each HID interface into Boot Protocol
+//!    itself (`SET_PROTOCOL(0)` / `SET_IDLE(0)` via `boot_protocol_init`, over
+//!    the xHCI server's `ControlRequest` EP0 path); the interrupt-IN endpoint
+//!    arms lazily on the first `PollInterruptIn`.
 //! 3. Look up `kbd` / `mouse` for the device classes present.
 //! 4. Poll each device's interrupt-IN endpoint (`PollInterruptIn`); decode the
 //!    boot report with the host-tested `kernel_core::usb::hid` layer; resolve

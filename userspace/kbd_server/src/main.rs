@@ -481,6 +481,14 @@ fn program_main(_args: &[&str]) -> i32 {
     let mut bulk = [0u8; KEY_EVENT_WIRE_SIZE];
 
     loop {
+        // Clear the reused bulk buffer before each recv. `ipc_recv_msg` copies
+        // only the received byte count into `bulk` and leaves any tail
+        // untouched, so a short send could otherwise let stale bytes from a
+        // previous message survive into `KeyEvent::decode`. The sole sender of
+        // a bulk payload here is the gated `usb-hid` driver TCB, which always
+        // sends the full `KEY_EVENT_WIRE_SIZE`, but clearing keeps the inject
+        // path robust against cross-message contamination regardless.
+        bulk.fill(0);
         let rc = syscall_lib::ipc_recv_msg(ep_handle, &mut msg, &mut bulk);
         if rc == u64::MAX {
             continue;

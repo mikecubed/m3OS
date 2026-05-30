@@ -70,7 +70,7 @@ Regression validation (all PASS): `usb-smoke` (kbd + mouse live + prompt render)
 **Acceptance:**
 - [x] After bring-up + enumeration, registers service `usb`, binds the controller IRQ into the endpoint (`sys_notif_bind`), and runs an `ipc_recv_msg` loop multiplexing IRQ + IPC (e1000 pattern), replacing the discard-only `event_loop`
 - [x] Holds a device table of enumerated devices (slot_id, interface class/sub/proto, interrupt-IN dci + mps + interval); serves an attach-pull request returning `AttachNotice` for already-present HID devices
-- [x] Serves `ControlRequest` (via `control_transfer`, inline data reply) and an interrupt-IN read; the interrupt-IN read **defers** its reply — the reply cap is stashed and answered when the matching Transfer Event arrives off the IRQ-drained event ring; endpoint is re-armed after each report
+- [x] Serves `ControlRequest` (a real EP0 `control_transfer`, inline data reply) and an interrupt-IN read (`PollInterruptIn`); the interrupt-IN read replies **immediately** with the next report from an IRQ-drained capture buffer (`take_interrupt_report`) — the bound IRQ handler drains the event ring, captures each interrupt-IN report, and re-arms the endpoint, so the poll never blocks and no reply cap is stashed
 - [x] New `Controller` methods enqueue a Normal TRB on an interrupt-IN endpoint ring, ring the endpoint doorbell, and decode the Transfer Event (slot/dci/residual) — host-tested where the logic is pure (`kernel-core/src/usb/xhci`)
 - [x] `xhci-bringup-smoke` and `xhci-enum-smoke` still PASS (no regression to the 78a/78b sentinels)
 
