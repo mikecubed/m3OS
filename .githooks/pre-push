@@ -296,4 +296,11 @@ if [ "${M3OS_USB_REGRESSION:-0}" = "1" ]; then
     # real control transfers, on top of the 78a bring-up.
     echo "pre-push: running cargo xtask xhci-enum-smoke..."
     cargo xtask xhci-enum-smoke --timeout 150
+    # Phase 78c — full HID input gate: boots `-device qemu-xhci` + `usb-kbd`,
+    # injects a real keystroke over QMP, and asserts it travels the whole USB
+    # input chain (interrupt-IN Transfer event → usb-hid decode → kbd_server).
+    # Set the env var additionally for branches touching userspace/drivers/usb-hid,
+    # the kbd_server/mouse_server inject path, or kernel-core/src/usb/hid.
+    echo "pre-push: running cargo xtask usb-smoke..."
+    cargo xtask usb-smoke --timeout 160
 fi

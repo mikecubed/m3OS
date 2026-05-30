@@ -514,6 +514,17 @@ fn main() {
                 });
             cmd_xhci_enum_smoke(&smoke_args);
         }
+        // Phase 78c Track B.3 — boots with `-device qemu-xhci` + `usb-kbd`,
+        // injects a real keystroke over QMP, and asserts it travels the full
+        // USB input chain (interrupt-IN transfer → usb-hid decode → kbd_server).
+        Some("usb-smoke") => {
+            let smoke_args = parse_smoke_boot_args("usb-smoke", &args[2..]).unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            cmd_usb_smoke(&smoke_args);
+        }
         Some("ssh-e1000-banner-check") => {
             let banner_args = parse_ssh_e1000_banner_check_args(&args[2..]).unwrap_or_else(|err| {
                 eprintln!("Error: {err}");
@@ -768,7 +779,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio|xhci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio|xhci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio|xhci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio|xhci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio|xhci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio|xhci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -8755,6 +8766,180 @@ fn xhci_enum_smoke_steps(timeout_secs: u64) -> Vec<SmokeStep> {
             label: "guest/xhci: USB device enumerated to Configured state (78b A-glue)",
         },
     ]
+}
+
+/// Phase 78c Track B.3 — the `usb-smoke` acceptance gate.
+///
+/// Boots m3OS with `-device qemu-xhci -device usb-kbd`, then drives a **real**
+/// keystroke over QMP and asserts it travels the full USB input chain to
+/// `kbd_server`. Unlike a `[xhci] N ports` serial sentinel (which proves only
+/// that the daemon ran), this asserts, in causal order:
+///
+/// 1. `XHCI_BRINGUP:enable-slot:OK` — an Enable Slot Command Completion event.
+/// 2. `XHCI_USB:server-ready` — the xHCI USB IPC server is registered + bound.
+/// 3. `usb-hid: polling` — the HID class driver bound the keyboard and is
+///    polling its interrupt-IN endpoint.
+/// 4. A QMP `send-key` injects `a` into the emulated `usb-kbd` (so an
+///    interrupt-IN report is produced **only in response to the injected key**
+///    — injection precedes the observation, never after).
+/// 5. `USB_HID:key kind=0 sym=0x00000061` — the resulting interrupt-IN Transfer
+///    event was decoded to a `KeyEvent` for `a` and accepted by `kbd_server`
+///    (the `usb-hid` inject blocks on kbd_server's ack before logging this).
+///
+/// The mouse path is host-tested only (`kernel-core::usb::hid`) — QEMU's
+/// `usb-mouse` is not attached and live mouse input is not asserted here.
+///
+/// Opt-in pre-push gate via `M3OS_USB_REGRESSION=1`.
+fn cmd_usb_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false, // graphical_login — autologin / serial path
+    );
+    let ovmf = find_ovmf();
+
+    let qmp_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&qmp_socket);
+    let vnc_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&vnc_socket);
+
+    let devices = DeviceSet {
+        xhci: true,
+        ..DeviceSet::default()
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, QemuDisplayMode::Headless, devices);
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    // Swap `-display none` for a VNC unix socket (keeps the VGA surface live
+    // for QMP) and add the QMP control socket the keystroke is injected over.
+    let mut idx = 0;
+    while idx + 1 < qemu_args.len() {
+        if qemu_args[idx] == "-display" && qemu_args[idx + 1] == "none" {
+            qemu_args[idx + 1] = format!("vnc=unix:{}", vnc_socket.display());
+            break;
+        }
+        idx += 1;
+    }
+    qemu_args.push("-qmp".to_string());
+    qemu_args.push(format!("unix:{},server,nowait", qmp_socket.display()));
+
+    println!(
+        "usb-smoke: launching QEMU with -device qemu-xhci + usb-kbd (timeout {}s, qmp {})",
+        args.timeout_secs,
+        qmp_socket.display()
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let rx = spawn_serial_reader(stdout);
+    let mut serial_history = String::new();
+    let mut serial_buf = String::new();
+    let global_start = std::time::Instant::now();
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let step = std::time::Duration::from_secs(args.timeout_secs.min(180));
+
+    let result: Result<(), String> = (|| {
+        // (1) Enable Slot Command Completion (78a milestone, causal anchor).
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "XHCI_BRINGUP:enable-slot:OK",
+            step,
+            global_start,
+            global_timeout,
+        )?;
+        // (2) the USB IPC server is registered + the IRQ is bound.
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "XHCI_USB:server-ready",
+            step,
+            global_start,
+            global_timeout,
+        )?;
+        // (3) usb-hid bound the keyboard and is polling its interrupt-IN EP.
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "usb-hid: polling",
+            step,
+            global_start,
+            global_timeout,
+        )?;
+        println!("usb-smoke: USB stack ready — injecting keystroke over QMP");
+
+        // (4) Inject a real `a` keystroke into the emulated usb-kbd. The
+        // emulated keyboard only emits an interrupt-IN report in response, so
+        // injection strictly precedes the Transfer-event observation below.
+        let qmp_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut q = qmp::QmpClient::connect(&qmp_socket, qmp_deadline)
+            .map_err(|e| format!("qmp connect: {e}"))?;
+
+        // (5) Decoded-and-injected sentinel for the Down edge of `a`
+        // (sym 0x61). Press a few times with a short wait between to absorb any
+        // poll-cadence race; the first one that lands satisfies the wait.
+        let mut last_err = String::new();
+        for attempt in 0..5 {
+            q.press_key("a", 40)
+                .map_err(|e| format!("qmp send-key: {e}"))?;
+            match wait_for_serial_pattern(
+                &rx,
+                &mut serial_buf,
+                &mut serial_history,
+                "USB_HID:key kind=0 sym=0x00000061",
+                std::time::Duration::from_secs(5),
+                global_start,
+                global_timeout,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    last_err = e;
+                    println!("usb-smoke: keystroke not yet observed (attempt {attempt})");
+                }
+            }
+        }
+        Err(format!(
+            "injected keystroke never reached usb-hid → kbd_server\n{last_err}"
+        ))
+    })();
+
+    let _ = child.kill();
+    let _ = child.wait();
+    match result {
+        Ok(()) => {
+            let elapsed = global_start.elapsed().as_secs();
+            println!(
+                "usb-smoke: PASSED ({elapsed}s) — QMP keystroke traveled USB → usb-hid → kbd_server"
+            );
+        }
+        Err(msg) => {
+            eprintln!("usb-smoke: FAILED\n{msg}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Build the command-line contract for the Phase 55c R3 SSH banner regression:

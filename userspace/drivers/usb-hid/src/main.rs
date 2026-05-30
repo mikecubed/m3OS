@@ -154,7 +154,24 @@ fn poll_keyboard(usb_ep: u32, kbd_ep: u32, dev: &mut HidDevice, keymap: &Keymap)
     for edge in &edges {
         let ev = key_event_from_edge(edge, keymap, now);
         inject_key(kbd_ep, &ev);
+        // Load-bearing sentinel for the `usb-smoke` gate: a real interrupt-IN
+        // boot report was decoded to a `KeyEvent` AND accepted by kbd_server
+        // (inject_key blocks on its ack). Emitted per edge; the gate asserts
+        // the Down edge of the injected key. The exact spelling is asserted.
+        emit_key_sentinel(&ev);
     }
+}
+
+/// `USB_HID:key kind=<k> sym=0x<hex> kc=0x<hex>` — proves the full USB input
+/// chain delivered a decoded key into kbd_server.
+fn emit_key_sentinel(ev: &KeyEvent) {
+    syscall_lib::write_str(STDOUT_FILENO, "USB_HID:key kind=");
+    write_u8_dec(ev.kind as u8);
+    syscall_lib::write_str(STDOUT_FILENO, " sym=0x");
+    write_u32_hex(ev.symbol);
+    syscall_lib::write_str(STDOUT_FILENO, " kc=0x");
+    write_u32_hex(ev.keycode);
+    syscall_lib::write_str(STDOUT_FILENO, "\n");
 }
 
 /// Poll one mouse device: read its report, decode motion + button edges.
@@ -323,5 +340,17 @@ fn write_u8_dec(mut n: u8) {
     }
     // SAFETY: `buf[i..]` contains only ASCII digits.
     let s = unsafe { core::str::from_utf8_unchecked(&buf[i..]) };
+    syscall_lib::write_str(STDOUT_FILENO, s);
+}
+
+/// Write a `u32` as a fixed 8-digit lowercase-hex string to stdout.
+fn write_u32_hex(n: u32) {
+    let mut buf = [0u8; 8];
+    for (i, slot) in buf.iter_mut().enumerate() {
+        let nib = ((n >> (28 - i * 4)) & 0xF) as u8;
+        *slot = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
+    }
+    // SAFETY: `buf` contains only ASCII hex digits.
+    let s = unsafe { core::str::from_utf8_unchecked(&buf) };
     syscall_lib::write_str(STDOUT_FILENO, s);
 }
