@@ -198,6 +198,23 @@ impl QmpClient {
         Ok(())
     }
 
+    /// Inject a relative pointer motion into the guest via QMP
+    /// `input-send-event`. Drives the emulated `usb-mouse` (QEMU routes the
+    /// pointer event through its input subsystem to the active mouse device).
+    /// Used by the `usb-smoke` gate to assert a live USB mouse report.
+    pub fn send_pointer_rel(&mut self, dx: i32, dy: i32) -> Result<(), QmpError> {
+        let _ = self.execute(
+            "input-send-event",
+            json!({
+                "events": [
+                    {"type": "rel", "data": {"axis": "x", "value": dx}},
+                    {"type": "rel", "data": {"axis": "y", "value": dy}},
+                ]
+            }),
+        )?;
+        Ok(())
+    }
+
     /// Type a literal ASCII string, one PS/2 keypress per character.
     /// Whitespace, punctuation, and shift-modified letters are mapped
     /// through [`ascii_to_qkeys`]. Characters outside the supported

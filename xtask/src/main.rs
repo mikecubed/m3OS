@@ -4517,12 +4517,17 @@ fn qemu_args_with_devices_resolved(
     // populated (the controller posts a Port Status Change and the driver's
     // A.7 port-reset path has a connected device to act on). The Enable Slot
     // milestone (Track A.5/C.1) does not itself require a connected device.
+    // Phase 78c: attach BOTH a usb-kbd and a usb-mouse so the multi-slot
+    // enumeration path (keyboard AND mouse) is exercised, matching the
+    // design-doc acceptance `-device qemu-xhci -device usb-kbd -device usb-mouse`.
     if devices.xhci {
         args.extend([
             "-device".to_string(),
             "qemu-xhci,id=xhci0,addr=0x6".to_string(),
             "-device".to_string(),
             "usb-kbd,bus=xhci0.0".to_string(),
+            "-device".to_string(),
+            "usb-mouse,bus=xhci0.0".to_string(),
         ]);
     }
 
@@ -8837,9 +8842,16 @@ fn cmd_usb_smoke(args: &SmokeBootArgs) {
     }
     qemu_args.push("-qmp".to_string());
     qemu_args.push(format!("unix:{},server,nowait", qmp_socket.display()));
+    // A standard VGA device so the QMP `screendump` reads the same framebuffer
+    // surface the compositor renders the focused term into (prompt-render step).
+    qemu_args.push("-vga".to_string());
+    qemu_args.push("std".to_string());
+
+    let out_dir = std::env::temp_dir().join("m3os-usb-smoke");
+    let _ = std::fs::create_dir_all(&out_dir);
 
     println!(
-        "usb-smoke: launching QEMU with -device qemu-xhci + usb-kbd (timeout {}s, qmp {})",
+        "usb-smoke: launching QEMU with -device qemu-xhci + usb-kbd + usb-mouse (timeout {}s, qmp {})",
         args.timeout_secs,
         qmp_socket.display()
     );
@@ -8858,72 +8870,109 @@ fn cmd_usb_smoke(args: &SmokeBootArgs) {
     let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
     let step = std::time::Duration::from_secs(args.timeout_secs.min(180));
 
-    let result: Result<(), String> = (|| {
-        // (1) Enable Slot Command Completion (78a milestone, causal anchor).
-        wait_for_serial_pattern(
-            &rx,
-            &mut serial_buf,
-            &mut serial_history,
-            "XHCI_BRINGUP:enable-slot:OK",
-            step,
-            global_start,
-            global_timeout,
-        )?;
-        // (2) the USB IPC server is registered + the IRQ is bound.
-        wait_for_serial_pattern(
-            &rx,
-            &mut serial_buf,
-            &mut serial_history,
-            "XHCI_USB:server-ready",
-            step,
-            global_start,
-            global_timeout,
-        )?;
-        // (3) usb-hid bound the keyboard and is polling its interrupt-IN EP.
-        wait_for_serial_pattern(
-            &rx,
-            &mut serial_buf,
-            &mut serial_history,
-            "usb-hid: polling",
-            step,
-            global_start,
-            global_timeout,
-        )?;
-        println!("usb-smoke: USB stack ready — injecting keystroke over QMP");
+    // Minimum changed scanlines in the focused term's prompt band (vs the
+    // pre-typing baseline) that prove the USB-injected characters actually
+    // rendered as glyphs. A line of ~17 typed chars changes a full text row's
+    // worth of pixels; a blinking cursor changes ~none by this diff metric.
+    const MIN_PROMPT_ROWS: u32 = 3;
 
-        // (4) Inject a real `a` keystroke into the emulated usb-kbd. The
-        // emulated keyboard only emits an interrupt-IN report in response, so
-        // injection strictly precedes the Transfer-event observation below.
+    let result: Result<(), String> = (|| {
+        let mut wait = |pat: &str| {
+            wait_for_serial_pattern(
+                &rx,
+                &mut serial_buf,
+                &mut serial_history,
+                pat,
+                step,
+                global_start,
+                global_timeout,
+            )
+        };
+        // (1) Enable Slot Command Completion (78a milestone, causal anchor).
+        wait("XHCI_BRINGUP:enable-slot:OK")?;
+        // (2) the USB IPC server is registered + the IRQ is bound.
+        wait("XHCI_USB:server-ready")?;
+        // (3) usb-hid bound the keyboard and is polling its interrupt-IN EP.
+        wait("usb-hid: polling")?;
+        // (4) the compositor + a focused term reached an interactive prompt, so
+        //     a KBD_EVENT_PULL consumer exists to render injected USB keys.
+        wait("TERM_SMOKE:prompt-ready")?;
+        println!("usb-smoke: USB stack + focused term ready — driving QMP");
+
         let qmp_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut q = qmp::QmpClient::connect(&qmp_socket, qmp_deadline)
             .map_err(|e| format!("qmp connect: {e}"))?;
 
-        // (5) Decoded-and-injected sentinel for the Down edge of `a`
-        // (sym 0x61). Press a few times with a short wait between to absorb any
-        // poll-cadence race; the first one that lands satisfies the wait.
-        let mut last_err = String::new();
+        // (5) Baseline framebuffer at the clean prompt (before any typing).
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let baseline_path = out_dir.join("00-prompt.ppm");
+        q.screendump(&baseline_path)
+            .map_err(|e| format!("baseline screendump: {e}"))?;
+        let baseline = ppm::read_ppm(&baseline_path)?;
+
+        // (6) Keyboard: inject a real `a` and assert it decoded to a KeyEvent
+        // (sym 0x61) — the emulated usb-kbd only emits a report in response, so
+        // injection strictly precedes the Transfer-event observation.
+        let mut decoded = false;
         for attempt in 0..5 {
             q.press_key("a", 40)
                 .map_err(|e| format!("qmp send-key: {e}"))?;
-            match wait_for_serial_pattern(
-                &rx,
-                &mut serial_buf,
-                &mut serial_history,
-                "USB_HID:key kind=0 sym=0x00000061",
-                std::time::Duration::from_secs(5),
-                global_start,
-                global_timeout,
-            ) {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    last_err = e;
-                    println!("usb-smoke: keystroke not yet observed (attempt {attempt})");
-                }
+            if wait("USB_HID:key kind=0 sym=0x00000061").is_ok() {
+                decoded = true;
+                break;
             }
+            println!("usb-smoke: keystroke not yet observed (attempt {attempt})");
         }
-        Err(format!(
-            "injected keystroke never reached usb-hid → kbd_server\n{last_err}"
-        ))
+        if !decoded {
+            return Err("injected keystroke never decoded by usb-hid".to_string());
+        }
+        println!("usb-smoke: keyboard report decoded USB -> usb-hid -> kbd_server");
+
+        // (7) Mouse: inject relative motion and assert usb-hid decoded a live
+        // boot-mouse report (USB_HID:mouse).
+        let mut mouse_ok = false;
+        for attempt in 0..5 {
+            q.send_pointer_rel(24, 18)
+                .map_err(|e| format!("qmp input-send-event: {e}"))?;
+            if wait("USB_HID:mouse").is_ok() {
+                mouse_ok = true;
+                break;
+            }
+            println!("usb-smoke: mouse report not yet observed (attempt {attempt})");
+        }
+        if !mouse_ok {
+            return Err("injected mouse motion never decoded by usb-hid".to_string());
+        }
+        println!("usb-smoke: mouse report decoded USB -> usb-hid -> mouse_server");
+
+        // (8) Prompt render: type a recognizable string over USB and assert the
+        // characters rendered as glyphs at the focused term (USB -> usb-hid ->
+        // kbd_server -> display_server -> term), proving the keystroke reaches a
+        // visible prompt — not just kbd_server.
+        for ch in "usbhidrendercheck".chars() {
+            let qc = ch.to_string();
+            q.press_key(&qc, 30)
+                .map_err(|e| format!("qmp type {ch}: {e}"))?;
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        let typed_path = out_dir.join("01-typed.ppm");
+        q.screendump(&typed_path)
+            .map_err(|e| format!("typed screendump: {e}"))?;
+        let typed = ppm::read_ppm(&typed_path)?;
+        // The focused term occupies the upper portion of the framebuffer; scan a
+        // broad band for rows whose pixels changed vs the clean-prompt baseline.
+        let changed = changed_rows_in_band(&baseline, &typed, 0.0, 0.7);
+        println!("usb-smoke: prompt band changed {changed} rows (min {MIN_PROMPT_ROWS})");
+        if changed < MIN_PROMPT_ROWS {
+            return Err(format!(
+                "USB keystrokes did not render at the prompt (only {changed} changed rows; \
+                 baseline {} typed {})",
+                baseline_path.display(),
+                typed_path.display()
+            ));
+        }
+        Ok(())
     })();
 
     let _ = child.kill();
@@ -8932,7 +8981,8 @@ fn cmd_usb_smoke(args: &SmokeBootArgs) {
         Ok(()) => {
             let elapsed = global_start.elapsed().as_secs();
             println!(
-                "usb-smoke: PASSED ({elapsed}s) — QMP keystroke traveled USB → usb-hid → kbd_server"
+                "usb-smoke: PASSED ({elapsed}s) — USB keyboard + mouse decoded live, and USB \
+                 keystrokes rendered at the focused term prompt"
             );
         }
         Err(msg) => {
