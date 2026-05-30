@@ -2281,6 +2281,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "usb-core"
+version = "0.78.2"
+dependencies = [
+ "kernel-core",
+]
+
+[[package]]
 name = "uuid"
 version = "1.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

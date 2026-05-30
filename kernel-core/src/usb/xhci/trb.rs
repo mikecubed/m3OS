@@ -265,6 +265,251 @@ impl Trb {
 }
 
 // ---------------------------------------------------------------------------
+// SetupPacket — USB SETUP transaction payload (USB 2.0 §9.3)
+// ---------------------------------------------------------------------------
+
+/// Standard USB SETUP packet (8 bytes), as defined in USB 2.0 §9.3.
+///
+/// xHCI embeds the 8 setup bytes into the `parameter` field of a Setup Stage
+/// TRB (the low 32 bits carry bytes 0–3, the high 32 bits carry bytes 4–7).
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct SetupPacket {
+    /// `bmRequestType` (byte 0): direction, type, and recipient.
+    pub bm_request_type: u8,
+    /// `bRequest` (byte 1): the request identifier.
+    pub b_request: u8,
+    /// `wValue` (bytes 2–3, little-endian): request-specific value.
+    pub w_value: u16,
+    /// `wIndex` (bytes 4–5, little-endian): request-specific index.
+    pub w_index: u16,
+    /// `wLength` (bytes 6–7, little-endian): expected data-stage byte count.
+    pub w_length: u16,
+}
+
+// --- bmRequestType bit fields (USB 2.0 §9.3 Table 9-2) ---
+
+/// `bmRequestType` for a Host-to-Device (OUT) Standard Device request.
+pub const BM_REQUEST_TYPE_H2D_STD_DEV: u8 = 0x00;
+/// `bmRequestType` for a Device-to-Host (IN) Standard Device request.
+pub const BM_REQUEST_TYPE_D2H_STD_DEV: u8 = 0x80;
+
+// --- Standard bRequest codes (USB 2.0 §9.4 Table 9-4) ---
+
+/// `bRequest` for GET_DESCRIPTOR.
+pub const B_REQUEST_GET_DESCRIPTOR: u8 = 0x06;
+/// `bRequest` for SET_CONFIGURATION.
+pub const B_REQUEST_SET_CONFIGURATION: u8 = 0x09;
+
+// --- Standard descriptor type codes (USB 2.0 §9.4.3 Table 9-5) ---
+
+/// Descriptor type for Device Descriptor.
+pub const DESCRIPTOR_TYPE_DEVICE: u8 = 0x01;
+/// Descriptor type for Configuration Descriptor.
+pub const DESCRIPTOR_TYPE_CONFIGURATION: u8 = 0x02;
+
+impl SetupPacket {
+    /// Encode the packet as a little-endian 64-bit value suitable for the
+    /// `parameter` field of a Setup Stage TRB (xHCI §6.4.1.2.1).
+    ///
+    /// Layout:
+    /// * Bits  7:0  — `bmRequestType`
+    /// * Bits 15:8  — `bRequest`
+    /// * Bits 31:16 — `wValue`
+    /// * Bits 47:32 — `wIndex`
+    /// * Bits 63:48 — `wLength`
+    pub const fn as_u64(self) -> u64 {
+        (self.bm_request_type as u64)
+            | ((self.b_request as u64) << 8)
+            | ((self.w_value as u64) << 16)
+            | ((self.w_index as u64) << 32)
+            | ((self.w_length as u64) << 48)
+    }
+
+    /// Build a `GET_DESCRIPTOR(Device)` request (USB 2.0 §9.4.3).
+    ///
+    /// Requests `length` bytes of the Device Descriptor; 18 is the full size.
+    pub const fn get_device_descriptor(length: u16) -> Self {
+        SetupPacket {
+            bm_request_type: BM_REQUEST_TYPE_D2H_STD_DEV,
+            b_request: B_REQUEST_GET_DESCRIPTOR,
+            w_value: (DESCRIPTOR_TYPE_DEVICE as u16) << 8,
+            w_index: 0,
+            w_length: length,
+        }
+    }
+
+    /// Build a `GET_DESCRIPTOR(Configuration, index)` request (USB 2.0 §9.4.3).
+    ///
+    /// `index` selects which configuration (0-based). Requests `length` bytes;
+    /// a first short read typically requests 9 bytes to learn `wTotalLength`.
+    pub const fn get_config_descriptor(index: u8, length: u16) -> Self {
+        SetupPacket {
+            bm_request_type: BM_REQUEST_TYPE_D2H_STD_DEV,
+            b_request: B_REQUEST_GET_DESCRIPTOR,
+            w_value: ((DESCRIPTOR_TYPE_CONFIGURATION as u16) << 8) | (index as u16),
+            w_index: 0,
+            w_length: length,
+        }
+    }
+
+    /// Build a `SET_CONFIGURATION` request (USB 2.0 §9.4.7).
+    ///
+    /// `value` is the `bConfigurationValue` from the desired Configuration
+    /// Descriptor. Typically 1 for single-configuration devices.
+    pub const fn set_configuration(value: u8) -> Self {
+        SetupPacket {
+            bm_request_type: BM_REQUEST_TYPE_H2D_STD_DEV,
+            b_request: B_REQUEST_SET_CONFIGURATION,
+            w_value: value as u16,
+            w_index: 0,
+            w_length: 0,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transfer TRB control-dword bits (xHCI §6.4.1)
+// ---------------------------------------------------------------------------
+
+/// Shift of the Transfer Type field in a Setup Stage TRB control dword (bits
+/// 17:16, xHCI §6.4.1.2.1). Encodes the expected data-stage direction: 0 = no
+/// data, 2 = OUT, 3 = IN.
+const SETUP_TT_SHIFT: u32 = 16;
+/// Transfer Type — No Data Stage (control write with no data phase).
+pub const SETUP_TT_NO_DATA: u32 = 0;
+/// Transfer Type — OUT Data Stage.
+pub const SETUP_TT_OUT: u32 = 2;
+/// Transfer Type — IN Data Stage.
+pub const SETUP_TT_IN: u32 = 3;
+
+/// Immediate Data bit in Setup Stage TRB control dword (bit 6, xHCI §6.4.1.2.1).
+/// Must be set to 1 for Setup Stage TRBs so the controller reads the setup
+/// data directly from the TRB `parameter` field.
+const SETUP_IDT_BIT: u32 = 1 << 6;
+
+/// Shift of the Transfer Length field in a Setup Stage TRB status dword (bits
+/// 16:0, xHCI §6.4.1.2.1). For Setup Stage TRBs this is always 8.
+const SETUP_TRB_LENGTH: u32 = 8;
+
+/// Direction bit in a Data Stage TRB control dword (bit 16, xHCI §6.4.1.2.2).
+/// `1` = IN (device-to-host), `0` = OUT (host-to-device).
+const DATA_DIR_BIT: u32 = 1 << 16;
+
+/// Mask of the TD Size field in a Data or Normal TRB status dword (bits 21:17,
+/// xHCI §6.4.1.1/1.2.2). For a single-TRB transfer the remaining TDs = 0.
+const DATA_TRB_TRANSFER_LENGTH_MASK: u32 = 0x0001_FFFF;
+
+// ---------------------------------------------------------------------------
+// Command TRB control-dword bits (xHCI §6.4.3)
+// ---------------------------------------------------------------------------
+
+/// Shift of the Slot ID in a command TRB control dword (bits 31:24).
+const CMD_SLOT_ID_SHIFT: u32 = 24;
+/// BSR (Block Set Address Request) bit in an Address Device Command TRB
+/// control dword (bit 9, xHCI §6.4.3.4). When set the controller skips
+/// assigning a USB address; used during the EP0 MPS two-step.
+const ADDRESS_DEVICE_BSR_BIT: u32 = 1 << 9;
+
+// ---------------------------------------------------------------------------
+// TRB builders — control-transfer stage TRBs (xHCI §6.4.1)
+// ---------------------------------------------------------------------------
+
+impl Trb {
+    /// Build a **Setup Stage TRB** (xHCI §6.4.1.2.1) for the EP0 transfer ring.
+    ///
+    /// `setup` is encoded directly into `parameter`. `transfer_type` selects
+    /// the data-stage direction: use [`SETUP_TT_IN`], [`SETUP_TT_OUT`], or
+    /// [`SETUP_TT_NO_DATA`]. `cycle` is the producer cycle bit.
+    pub const fn setup_stage(setup: &SetupPacket, transfer_type: u32, cycle: bool) -> Trb {
+        Trb {
+            parameter: setup.as_u64(),
+            status: SETUP_TRB_LENGTH,
+            control: control_type_cycle(TRB_TYPE_SETUP_STAGE, cycle)
+                | SETUP_IDT_BIT
+                | ((transfer_type & 0x3) << SETUP_TT_SHIFT),
+        }
+    }
+
+    /// Build a **Data Stage TRB** (xHCI §6.4.1.2.2) for the EP0 transfer ring.
+    ///
+    /// `buf_iova` is the device-visible address of the data buffer. `len` is
+    /// the number of bytes to transfer. `dir_in` selects the direction
+    /// (`true` = IN / device-to-host). `cycle` is the producer cycle bit.
+    pub const fn data_stage(buf_iova: u64, len: u32, dir_in: bool, cycle: bool) -> Trb {
+        Trb {
+            parameter: buf_iova,
+            status: len & DATA_TRB_TRANSFER_LENGTH_MASK,
+            control: control_type_cycle(TRB_TYPE_DATA_STAGE, cycle)
+                | if dir_in { DATA_DIR_BIT } else { 0 },
+        }
+    }
+
+    /// Build a **Status Stage TRB** (xHCI §6.4.1.2.3) for the EP0 transfer ring.
+    ///
+    /// `dir_in` should be the **opposite** direction of the data stage (`true`
+    /// for an OUT status after an IN data stage, i.e. a handshake toward the
+    /// host). For a no-data-stage transfer, `dir_in = true` (xHCI §4.11.2.2).
+    /// `cycle` is the producer cycle bit.
+    pub const fn status_stage(dir_in: bool, cycle: bool) -> Trb {
+        Trb {
+            parameter: 0,
+            status: 0,
+            control: control_type_cycle(TRB_TYPE_STATUS_STAGE, cycle)
+                | if dir_in { DATA_DIR_BIT } else { 0 },
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Command TRB builders (xHCI §6.4.3)
+    // -----------------------------------------------------------------------
+
+    /// Build an **Address Device Command TRB** (xHCI §6.4.3.4).
+    ///
+    /// `input_ctx_iova` is the device-visible address of the Input Context.
+    /// `slot_id` identifies the slot (assigned by Enable Slot). `bsr = true`
+    /// sets the Block Set Address Request flag so the controller updates the
+    /// slot state without assigning a USB address — used during the two-step
+    /// EP0 Max Packet Size negotiation. `cycle` is the producer cycle bit.
+    pub const fn address_device(input_ctx_iova: u64, slot_id: u8, bsr: bool, cycle: bool) -> Trb {
+        Trb {
+            parameter: input_ctx_iova,
+            status: 0,
+            control: control_type_cycle(TRB_TYPE_ADDRESS_DEVICE, cycle)
+                | ((slot_id as u32) << CMD_SLOT_ID_SHIFT)
+                | if bsr { ADDRESS_DEVICE_BSR_BIT } else { 0 },
+        }
+    }
+
+    /// Build a **Configure Endpoint Command TRB** (xHCI §6.4.3.5).
+    ///
+    /// `input_ctx_iova` is the device-visible address of the Input Context
+    /// describing the endpoints to add or drop. `slot_id` is the target device
+    /// slot. `cycle` is the producer cycle bit.
+    pub const fn configure_endpoint(input_ctx_iova: u64, slot_id: u8, cycle: bool) -> Trb {
+        Trb {
+            parameter: input_ctx_iova,
+            status: 0,
+            control: control_type_cycle(TRB_TYPE_CONFIGURE_ENDPOINT, cycle)
+                | ((slot_id as u32) << CMD_SLOT_ID_SHIFT),
+        }
+    }
+
+    /// Build an **Evaluate Context Command TRB** (xHCI §6.4.3.6).
+    ///
+    /// Used to update the EP0 Max Packet Size after reading the first 8 bytes
+    /// of the Device Descriptor (the BSR two-step). `input_ctx_iova` is the
+    /// Input Context address; `slot_id` is the target slot.
+    pub const fn evaluate_context(input_ctx_iova: u64, slot_id: u8, cycle: bool) -> Trb {
+        Trb {
+            parameter: input_ctx_iova,
+            status: 0,
+            control: control_type_cycle(TRB_TYPE_EVALUATE_CONTEXT, cycle)
+                | ((slot_id as u32) << CMD_SLOT_ID_SHIFT),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Event decoders
 // ---------------------------------------------------------------------------
 
@@ -834,5 +1079,162 @@ mod tests {
         };
         assert!(c.owns(&owned));
         assert!(!c.owns(&stale));
+    }
+
+    // -----------------------------------------------------------------------
+    // SetupPacket tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn setup_packet_get_device_descriptor() {
+        let pkt = SetupPacket::get_device_descriptor(18);
+        assert_eq!(pkt.bm_request_type, BM_REQUEST_TYPE_D2H_STD_DEV);
+        assert_eq!(pkt.b_request, B_REQUEST_GET_DESCRIPTOR);
+        // wValue high byte = DESCRIPTOR_TYPE_DEVICE = 0x01.
+        assert_eq!(pkt.w_value, (DESCRIPTOR_TYPE_DEVICE as u16) << 8);
+        assert_eq!(pkt.w_index, 0);
+        assert_eq!(pkt.w_length, 18);
+    }
+
+    #[test]
+    fn setup_packet_get_config_descriptor_short() {
+        // Short read: request 9 bytes to learn wTotalLength.
+        let pkt = SetupPacket::get_config_descriptor(0, 9);
+        assert_eq!(pkt.bm_request_type, BM_REQUEST_TYPE_D2H_STD_DEV);
+        assert_eq!(pkt.b_request, B_REQUEST_GET_DESCRIPTOR);
+        // wValue high byte = 0x02 (Configuration), low = index 0.
+        assert_eq!(pkt.w_value, (DESCRIPTOR_TYPE_CONFIGURATION as u16) << 8);
+        assert_eq!(pkt.w_length, 9);
+    }
+
+    #[test]
+    fn setup_packet_set_configuration() {
+        let pkt = SetupPacket::set_configuration(1);
+        assert_eq!(pkt.bm_request_type, BM_REQUEST_TYPE_H2D_STD_DEV);
+        assert_eq!(pkt.b_request, B_REQUEST_SET_CONFIGURATION);
+        assert_eq!(pkt.w_value, 1);
+        assert_eq!(pkt.w_length, 0);
+    }
+
+    #[test]
+    fn setup_packet_as_u64_layout() {
+        // Manually verify the bit layout (USB 2.0 §9.3 / xHCI §6.4.1.2.1).
+        let pkt = SetupPacket {
+            bm_request_type: 0x80,
+            b_request: 0x06,
+            w_value: 0x0100,
+            w_index: 0x0000,
+            w_length: 18,
+        };
+        let raw = pkt.as_u64();
+        assert_eq!(raw & 0xFF, 0x80); // byte 0
+        assert_eq!((raw >> 8) & 0xFF, 0x06); // byte 1
+        assert_eq!((raw >> 16) & 0xFFFF, 0x0100); // bytes 2-3
+        assert_eq!((raw >> 32) & 0xFFFF, 0x0000); // bytes 4-5
+        assert_eq!((raw >> 48) & 0xFFFF, 18); // bytes 6-7
+    }
+
+    // -----------------------------------------------------------------------
+    // Control-transfer stage TRB builder tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn setup_stage_trb_fields() {
+        let setup = SetupPacket::get_device_descriptor(18);
+        let trb = Trb::setup_stage(&setup, SETUP_TT_IN, true);
+        // Type.
+        assert_eq!(trb_type_raw(&trb), TRB_TYPE_SETUP_STAGE);
+        assert!(trb_cycle(&trb));
+        // IDT bit must be set (bit 6).
+        assert_ne!(trb.control & SETUP_IDT_BIT, 0);
+        // Transfer Type = IN (3) at bits 17:16.
+        assert_eq!((trb.control >> SETUP_TT_SHIFT) & 0x3, SETUP_TT_IN);
+        // Setup data in parameter.
+        assert_eq!(trb.parameter, setup.as_u64());
+        // Status = 8 (setup packet is always 8 bytes).
+        assert_eq!(trb.status, 8);
+    }
+
+    #[test]
+    fn data_stage_trb_in() {
+        let buf = 0x0020_0000u64;
+        let trb = Trb::data_stage(buf, 18, true, true);
+        assert_eq!(trb_type_raw(&trb), TRB_TYPE_DATA_STAGE);
+        assert!(trb_cycle(&trb));
+        assert_eq!(trb.parameter, buf);
+        assert_eq!(trb.status, 18);
+        // DIR bit set for IN.
+        assert_ne!(trb.control & DATA_DIR_BIT, 0);
+    }
+
+    #[test]
+    fn data_stage_trb_out() {
+        let trb = Trb::data_stage(0x100, 64, false, false);
+        assert_eq!(trb_type_raw(&trb), TRB_TYPE_DATA_STAGE);
+        assert!(!trb_cycle(&trb));
+        // DIR bit clear for OUT.
+        assert_eq!(trb.control & DATA_DIR_BIT, 0);
+    }
+
+    #[test]
+    fn status_stage_trb() {
+        // After an IN data stage the status stage is OUT (dir_in = false).
+        let trb = Trb::status_stage(false, true);
+        assert_eq!(trb_type_raw(&trb), TRB_TYPE_STATUS_STAGE);
+        assert!(trb_cycle(&trb));
+        assert_eq!(trb.control & DATA_DIR_BIT, 0);
+
+        // No-data-stage: status is IN (dir_in = true).
+        let trb2 = Trb::status_stage(true, false);
+        assert_ne!(trb2.control & DATA_DIR_BIT, 0);
+        assert!(!trb_cycle(&trb2));
+    }
+
+    // -----------------------------------------------------------------------
+    // Command TRB builder tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn address_device_trb_bsr_false() {
+        let ctx = 0x0040_0000u64;
+        let trb = Trb::address_device(ctx, 5, false, true);
+        assert_eq!(trb_type_raw(&trb), TRB_TYPE_ADDRESS_DEVICE);
+        assert!(trb_cycle(&trb));
+        assert_eq!(trb.parameter, ctx);
+        // Slot ID at bits 31:24.
+        assert_eq!((trb.control >> CMD_SLOT_ID_SHIFT) as u8, 5);
+        // BSR must be clear.
+        assert_eq!(trb.control & ADDRESS_DEVICE_BSR_BIT, 0);
+    }
+
+    #[test]
+    fn address_device_trb_bsr_true() {
+        let ctx = 0x0040_0000u64;
+        let trb = Trb::address_device(ctx, 3, true, false);
+        assert_eq!(trb_type_raw(&trb), TRB_TYPE_ADDRESS_DEVICE);
+        assert!(!trb_cycle(&trb));
+        // BSR must be set.
+        assert_ne!(trb.control & ADDRESS_DEVICE_BSR_BIT, 0);
+        assert_eq!((trb.control >> CMD_SLOT_ID_SHIFT) as u8, 3);
+    }
+
+    #[test]
+    fn configure_endpoint_trb() {
+        let ctx = 0x0050_0000u64;
+        let trb = Trb::configure_endpoint(ctx, 7, true);
+        assert_eq!(trb_type_raw(&trb), TRB_TYPE_CONFIGURE_ENDPOINT);
+        assert!(trb_cycle(&trb));
+        assert_eq!(trb.parameter, ctx);
+        assert_eq!((trb.control >> CMD_SLOT_ID_SHIFT) as u8, 7);
+    }
+
+    #[test]
+    fn evaluate_context_trb() {
+        let ctx = 0x0060_0000u64;
+        let trb = Trb::evaluate_context(ctx, 2, true);
+        assert_eq!(trb_type_raw(&trb), TRB_TYPE_EVALUATE_CONTEXT);
+        assert!(trb_cycle(&trb));
+        assert_eq!(trb.parameter, ctx);
+        assert_eq!((trb.control >> CMD_SLOT_ID_SHIFT) as u8, 2);
     }
 }
