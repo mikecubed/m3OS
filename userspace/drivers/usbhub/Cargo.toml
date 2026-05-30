@@ -1,0 +1,14 @@
+[package]
+name = "usbhub"
+version = "0.78.2"
+edition = "2024"
+description = "Phase 78b Track B — ring-3 USB hub class driver (hub enumeration + PortId topology)."
+
+[[bin]]
+name = "usbhub"
+path = "src/main.rs"
+
+[dependencies]
+syscall-lib = { path = "../../syscall-lib", features = ["alloc"] }
+kernel-core = { path = "../../../kernel-core", default-features = false }
+usb-core = { path = "../../lib/usb-core" }

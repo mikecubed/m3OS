@@ -8,4 +8,5 @@
 
 pub mod descriptor;
 pub mod enumerate;
+pub mod hub;
 pub mod xhci;
