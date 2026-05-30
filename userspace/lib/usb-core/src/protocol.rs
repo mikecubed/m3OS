@@ -71,6 +71,15 @@ pub struct AttachNotice {
     pub interface_protocol: u8,
     /// `true` if the device was just attached; `false` if it was detached.
     pub attached: bool,
+    /// Device Context Index of the interface's interrupt-IN endpoint, or `0`
+    /// if the interface has none. Phase 78c: the server resolves this from the
+    /// enumerated configuration so a HID class driver can poll the endpoint
+    /// without a separate `GetDescriptors` round-trip.
+    pub ep_in_dci: u8,
+    /// `wMaxPacketSize` of that interrupt-IN endpoint (0 if `ep_in_dci == 0`).
+    pub ep_in_mps: u16,
+    /// `bInterval` of that interrupt-IN endpoint (0 if `ep_in_dci == 0`).
+    pub ep_in_interval: u8,
 }
 
 // ---------------------------------------------------------------------------
@@ -81,7 +90,7 @@ pub struct AttachNotice {
 ///
 /// Requests are issued synchronously via `sys_ipc_call`; the matching
 /// [`UsbReply`] is the rendezvous response.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UsbRequest {
     /// Retrieve the parsed descriptor set for a device.
     ///
@@ -139,6 +148,38 @@ pub enum UsbRequest {
         /// For OUT endpoints the class driver writes the data before calling.
         grant: PageGrant,
     },
+
+    /// Pull the next attached device the server has enumerated, starting at
+    /// `cursor` (0-based index into the server's device table).
+    ///
+    /// Phase 78c: class daemons (HID, hub) discover their bound devices by
+    /// walking this cursor until the reply carries `None`. Replaces a live
+    /// push-notification channel for the no-hotplug 1.0 path — devices are
+    /// present at boot, so a pull is sufficient and simpler.
+    ///
+    /// Returns [`UsbReply::Attach`].
+    NextAttach {
+        /// 0-based index into the server's enumerated-device table.
+        cursor: u8,
+    },
+
+    /// Non-blocking read of the most recent interrupt-IN report the server has
+    /// captured for `(slot_id, dci)`.
+    ///
+    /// The server arms the endpoint (enqueues a Normal TRB) on the first poll
+    /// and re-arms it after every IRQ-delivered report. HID reports are tiny
+    /// (≤ 8 bytes), so the report is returned **inline** rather than via a
+    /// page-grant. If no new report is buffered the reply carries empty data.
+    ///
+    /// Returns [`UsbReply::InterruptReport`].
+    PollInterruptIn {
+        /// Target slot ID.
+        slot_id: u8,
+        /// Device Context Index of the interrupt-IN endpoint to poll.
+        dci: u8,
+        /// Maximum bytes to return (the endpoint's `wMaxPacketSize`).
+        len: u16,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -146,7 +187,7 @@ pub enum UsbRequest {
 // ---------------------------------------------------------------------------
 
 /// Reply from the xHCI host server to a class driver.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UsbReply {
     /// Reply to [`UsbRequest::GetDescriptors`].
     Descriptors {
@@ -178,10 +219,30 @@ pub enum UsbReply {
         completion_code: u8,
     },
 
+    /// Reply to [`UsbRequest::NextAttach`]: the device at the requested cursor,
+    /// or `None` if the cursor is past the end of the table.
+    Attach {
+        /// The enumerated device, or `None` when the cursor is exhausted.
+        notice: Option<AttachNotice>,
+    },
+
+    /// Reply to [`UsbRequest::PollInterruptIn`].
+    ///
+    /// `data` is the captured interrupt-IN report (inline, ≤ `len` bytes); an
+    /// **empty** `data` with `completion_code == 0` means "no new report yet".
+    InterruptReport {
+        /// The captured report bytes (empty = no report pending).
+        data: Vec<u8>,
+        /// xHCI completion code of the last completed transfer (`1` = success,
+        /// `0` = none captured yet).
+        completion_code: u8,
+    },
+
     /// The request failed for a reason not captured by a specific variant.
     Error {
-        /// Human-readable error description (short, for logging only).
-        message: &'static str,
+        /// Stable numeric error code (for logging / matching). Wire-safe — a
+        /// `&'static str` cannot be reconstructed on the decode side.
+        code: u16,
     },
 }
 
@@ -275,6 +336,332 @@ impl UsbClient {
 }
 
 // ---------------------------------------------------------------------------
+// Wire transport — IPC service name, labels, and byte codec
+// ---------------------------------------------------------------------------
+
+/// Well-known service name the xHCI host server registers and class drivers
+/// look up (`ipc_lookup_service`).
+pub const USB_SERVICE_NAME: &str = "usb";
+
+/// IPC label for a client→server [`UsbRequest`] call. The request kind is the
+/// first byte of the bulk payload, so a single label carries every request.
+pub const USB_REQ_LABEL: u64 = 1;
+
+/// IPC label the server replies with; the [`UsbReply`] travels as reply bulk.
+pub const USB_REPLY_LABEL: u64 = 1;
+
+/// Upper bound on an encoded request/reply that the live HID path produces
+/// (a full-config `Descriptors` reply is the largest). Clients/servers size
+/// their bulk buffers to this.
+pub const USB_MSG_MAX: usize = 1024;
+
+// --- request tags ---
+const REQ_GET_DESCRIPTORS: u8 = 1;
+const REQ_CONFIGURE_ENDPOINTS: u8 = 2;
+const REQ_CONTROL: u8 = 3;
+const REQ_SUBMIT_TRANSFER: u8 = 4;
+const REQ_NEXT_ATTACH: u8 = 5;
+const REQ_POLL_INTERRUPT_IN: u8 = 6;
+
+// --- reply tags ---
+const REP_DESCRIPTORS: u8 = 1;
+const REP_ENDPOINTS_CONFIGURED: u8 = 2;
+const REP_CONTROL_DATA: u8 = 3;
+const REP_TRANSFER_COMPLETE: u8 = 4;
+const REP_ATTACH: u8 = 5;
+const REP_INTERRUPT_REPORT: u8 = 6;
+const REP_ERROR: u8 = 7;
+
+#[inline]
+fn put_u16(v: &mut Vec<u8>, x: u16) {
+    v.extend_from_slice(&x.to_le_bytes());
+}
+#[inline]
+fn put_u32(v: &mut Vec<u8>, x: u32) {
+    v.extend_from_slice(&x.to_le_bytes());
+}
+#[inline]
+fn put_bytes(v: &mut Vec<u8>, b: &[u8]) {
+    put_u16(v, b.len() as u16);
+    v.extend_from_slice(b);
+}
+
+/// A forward-only cursor over an encoded message. Every accessor returns
+/// `None` on truncation, so a malformed message decodes to `None` rather than
+/// panicking.
+struct Reader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+impl<'a> Reader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+    fn u8(&mut self) -> Option<u8> {
+        let b = *self.buf.get(self.pos)?;
+        self.pos += 1;
+        Some(b)
+    }
+    fn u16(&mut self) -> Option<u16> {
+        let end = self.pos.checked_add(2)?;
+        let s = self.buf.get(self.pos..end)?;
+        self.pos = end;
+        Some(u16::from_le_bytes([s[0], s[1]]))
+    }
+    fn u32(&mut self) -> Option<u32> {
+        let end = self.pos.checked_add(4)?;
+        let s = self.buf.get(self.pos..end)?;
+        self.pos = end;
+        Some(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    }
+    fn bytes(&mut self) -> Option<Vec<u8>> {
+        let n = self.u16()? as usize;
+        let end = self.pos.checked_add(n)?;
+        let s = self.buf.get(self.pos..end)?;
+        self.pos = end;
+        Some(s.to_vec())
+    }
+}
+
+impl AttachNotice {
+    /// Fixed encoded length of an [`AttachNotice`] on the wire.
+    pub const WIRE_LEN: usize = 10;
+
+    fn encode_into(&self, out: &mut Vec<u8>) {
+        out.push(self.port);
+        out.push(self.slot_id);
+        out.push(self.interface_class);
+        out.push(self.interface_sub_class);
+        out.push(self.interface_protocol);
+        out.push(self.attached as u8);
+        out.push(self.ep_in_dci);
+        put_u16(out, self.ep_in_mps);
+        out.push(self.ep_in_interval);
+    }
+
+    fn read(r: &mut Reader) -> Option<Self> {
+        Some(AttachNotice {
+            port: r.u8()?,
+            slot_id: r.u8()?,
+            interface_class: r.u8()?,
+            interface_sub_class: r.u8()?,
+            interface_protocol: r.u8()?,
+            attached: r.u8()? != 0,
+            ep_in_dci: r.u8()?,
+            ep_in_mps: r.u16()?,
+            ep_in_interval: r.u8()?,
+        })
+    }
+
+    /// Encode to a fresh byte vector (for sending as IPC bulk).
+    pub fn encode(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(Self::WIRE_LEN);
+        self.encode_into(&mut v);
+        v
+    }
+
+    /// Decode from the start of `buf`. Returns `None` on truncation.
+    pub fn decode(buf: &[u8]) -> Option<Self> {
+        Self::read(&mut Reader::new(buf))
+    }
+}
+
+impl UsbRequest {
+    /// Encode this request to IPC-bulk bytes (tag byte + fields).
+    pub fn encode(&self) -> Vec<u8> {
+        let mut v = Vec::new();
+        match self {
+            UsbRequest::GetDescriptors { slot_id } => {
+                v.push(REQ_GET_DESCRIPTORS);
+                v.push(*slot_id);
+            }
+            UsbRequest::ConfigureEndpoints {
+                slot_id,
+                configuration_value,
+            } => {
+                v.push(REQ_CONFIGURE_ENDPOINTS);
+                v.push(*slot_id);
+                v.push(*configuration_value);
+            }
+            UsbRequest::ControlRequest {
+                slot_id,
+                setup,
+                length,
+            } => {
+                v.push(REQ_CONTROL);
+                v.push(*slot_id);
+                v.extend_from_slice(setup);
+                put_u16(&mut v, *length);
+            }
+            UsbRequest::SubmitTransfer {
+                slot_id,
+                dci,
+                grant,
+            } => {
+                v.push(REQ_SUBMIT_TRANSFER);
+                v.push(*slot_id);
+                v.push(*dci);
+                put_u32(&mut v, grant.cap);
+                put_u32(&mut v, grant.len as u32);
+            }
+            UsbRequest::NextAttach { cursor } => {
+                v.push(REQ_NEXT_ATTACH);
+                v.push(*cursor);
+            }
+            UsbRequest::PollInterruptIn { slot_id, dci, len } => {
+                v.push(REQ_POLL_INTERRUPT_IN);
+                v.push(*slot_id);
+                v.push(*dci);
+                put_u16(&mut v, *len);
+            }
+        }
+        v
+    }
+
+    /// Decode a request from IPC-bulk bytes. Returns `None` on a bad tag or
+    /// truncation.
+    pub fn decode(buf: &[u8]) -> Option<Self> {
+        let mut r = Reader::new(buf);
+        Some(match r.u8()? {
+            REQ_GET_DESCRIPTORS => UsbRequest::GetDescriptors { slot_id: r.u8()? },
+            REQ_CONFIGURE_ENDPOINTS => UsbRequest::ConfigureEndpoints {
+                slot_id: r.u8()?,
+                configuration_value: r.u8()?,
+            },
+            REQ_CONTROL => {
+                let slot_id = r.u8()?;
+                let mut setup = [0u8; 8];
+                for b in &mut setup {
+                    *b = r.u8()?;
+                }
+                let length = r.u16()?;
+                UsbRequest::ControlRequest {
+                    slot_id,
+                    setup,
+                    length,
+                }
+            }
+            REQ_SUBMIT_TRANSFER => UsbRequest::SubmitTransfer {
+                slot_id: r.u8()?,
+                dci: r.u8()?,
+                grant: PageGrant {
+                    cap: r.u32()?,
+                    len: r.u32()? as usize,
+                },
+            },
+            REQ_NEXT_ATTACH => UsbRequest::NextAttach { cursor: r.u8()? },
+            REQ_POLL_INTERRUPT_IN => UsbRequest::PollInterruptIn {
+                slot_id: r.u8()?,
+                dci: r.u8()?,
+                len: r.u16()?,
+            },
+            _ => return None,
+        })
+    }
+}
+
+impl UsbReply {
+    /// Encode this reply to IPC reply-bulk bytes (tag byte + fields).
+    pub fn encode(&self) -> Vec<u8> {
+        let mut v = Vec::new();
+        match self {
+            UsbReply::Descriptors { device, config } => {
+                v.push(REP_DESCRIPTORS);
+                put_bytes(&mut v, device);
+                put_bytes(&mut v, config);
+            }
+            UsbReply::EndpointsConfigured { slot_id } => {
+                v.push(REP_ENDPOINTS_CONFIGURED);
+                v.push(*slot_id);
+            }
+            UsbReply::ControlData {
+                data,
+                completion_code,
+            } => {
+                v.push(REP_CONTROL_DATA);
+                v.push(*completion_code);
+                put_bytes(&mut v, data);
+            }
+            UsbReply::TransferComplete {
+                transferred,
+                completion_code,
+            } => {
+                v.push(REP_TRANSFER_COMPLETE);
+                v.push(*completion_code);
+                put_u32(&mut v, *transferred as u32);
+            }
+            UsbReply::Attach { notice } => {
+                v.push(REP_ATTACH);
+                match notice {
+                    Some(n) => {
+                        v.push(1);
+                        n.encode_into(&mut v);
+                    }
+                    None => v.push(0),
+                }
+            }
+            UsbReply::InterruptReport {
+                data,
+                completion_code,
+            } => {
+                v.push(REP_INTERRUPT_REPORT);
+                v.push(*completion_code);
+                put_bytes(&mut v, data);
+            }
+            UsbReply::Error { code } => {
+                v.push(REP_ERROR);
+                put_u16(&mut v, *code);
+            }
+        }
+        v
+    }
+
+    /// Decode a reply from IPC reply-bulk bytes. Returns `None` on a bad tag
+    /// or truncation.
+    pub fn decode(buf: &[u8]) -> Option<Self> {
+        let mut r = Reader::new(buf);
+        Some(match r.u8()? {
+            REP_DESCRIPTORS => UsbReply::Descriptors {
+                device: r.bytes()?,
+                config: r.bytes()?,
+            },
+            REP_ENDPOINTS_CONFIGURED => UsbReply::EndpointsConfigured { slot_id: r.u8()? },
+            REP_CONTROL_DATA => {
+                let completion_code = r.u8()?;
+                let data = r.bytes()?;
+                UsbReply::ControlData {
+                    data,
+                    completion_code,
+                }
+            }
+            REP_TRANSFER_COMPLETE => UsbReply::TransferComplete {
+                completion_code: r.u8()?,
+                transferred: r.u32()? as usize,
+            },
+            REP_ATTACH => {
+                let present = r.u8()?;
+                let notice = if present != 0 {
+                    Some(AttachNotice::read(&mut r)?)
+                } else {
+                    None
+                };
+                UsbReply::Attach { notice }
+            }
+            REP_INTERRUPT_REPORT => {
+                let completion_code = r.u8()?;
+                let data = r.bytes()?;
+                UsbReply::InterruptReport {
+                    data,
+                    completion_code,
+                }
+            }
+            REP_ERROR => UsbReply::Error { code: r.u16()? },
+            _ => return None,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -282,19 +669,27 @@ impl UsbClient {
 mod tests {
     use super::*;
 
-    #[test]
-    fn attach_notice_fields() {
-        let notice = AttachNotice {
+    fn sample_kbd_notice() -> AttachNotice {
+        AttachNotice {
             port: 2,
             slot_id: 5,
             interface_class: 0x03,
             interface_sub_class: 0x01,
             interface_protocol: 0x01,
             attached: true,
-        };
+            ep_in_dci: 3,
+            ep_in_mps: 8,
+            ep_in_interval: 10,
+        }
+    }
+
+    #[test]
+    fn attach_notice_fields() {
+        let notice = sample_kbd_notice();
         assert!(notice.attached);
         assert_eq!(notice.interface_class, 0x03);
         assert_eq!(notice.interface_protocol, 0x01);
+        assert_eq!(notice.ep_in_dci, 3);
     }
 
     #[test]
@@ -306,8 +701,119 @@ mod tests {
             interface_sub_class: 0x00,
             interface_protocol: 0x00,
             attached: false,
+            ep_in_dci: 0,
+            ep_in_mps: 0,
+            ep_in_interval: 0,
         };
         assert!(!notice.attached);
+    }
+
+    #[test]
+    fn attach_notice_wire_roundtrip() {
+        let notice = sample_kbd_notice();
+        let bytes = notice.encode();
+        assert_eq!(bytes.len(), AttachNotice::WIRE_LEN);
+        assert_eq!(AttachNotice::decode(&bytes), Some(notice));
+        // Truncated input decodes to None, never panics.
+        assert_eq!(AttachNotice::decode(&bytes[..3]), None);
+    }
+
+    #[test]
+    fn request_wire_roundtrips() {
+        let reqs = [
+            UsbRequest::GetDescriptors { slot_id: 4 },
+            UsbRequest::ConfigureEndpoints {
+                slot_id: 4,
+                configuration_value: 1,
+            },
+            UsbRequest::ControlRequest {
+                slot_id: 4,
+                setup: [0x21, 0x0B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+                length: 0,
+            },
+            UsbRequest::SubmitTransfer {
+                slot_id: 4,
+                dci: 3,
+                grant: PageGrant { cap: 9, len: 4096 },
+            },
+            UsbRequest::NextAttach { cursor: 1 },
+            UsbRequest::PollInterruptIn {
+                slot_id: 4,
+                dci: 3,
+                len: 8,
+            },
+        ];
+        for r in reqs {
+            let bytes = r.encode();
+            let back = UsbRequest::decode(&bytes).expect("decode");
+            // Compare via re-encode (UsbRequest is not PartialEq).
+            assert_eq!(back.encode(), bytes);
+        }
+        assert_eq!(UsbRequest::decode(&[]), None);
+        assert_eq!(UsbRequest::decode(&[0xFE]), None); // unknown tag
+    }
+
+    #[test]
+    fn reply_wire_roundtrips() {
+        let replies = [
+            UsbReply::Descriptors {
+                device: alloc::vec![1, 2, 3],
+                config: alloc::vec![4, 5, 6, 7],
+            },
+            UsbReply::EndpointsConfigured { slot_id: 5 },
+            UsbReply::ControlData {
+                data: alloc::vec![],
+                completion_code: 1,
+            },
+            UsbReply::TransferComplete {
+                transferred: 8,
+                completion_code: 1,
+            },
+            UsbReply::Attach {
+                notice: Some(sample_kbd_notice()),
+            },
+            UsbReply::Attach { notice: None },
+            UsbReply::InterruptReport {
+                data: alloc::vec![0, 0, 0x04, 0, 0, 0, 0, 0],
+                completion_code: 1,
+            },
+            UsbReply::InterruptReport {
+                data: alloc::vec![],
+                completion_code: 0,
+            },
+            UsbReply::Error { code: 19 },
+        ];
+        for r in replies {
+            let bytes = r.encode();
+            let back = UsbReply::decode(&bytes).expect("decode");
+            assert_eq!(back.encode(), bytes);
+        }
+        assert_eq!(UsbReply::decode(&[]), None);
+    }
+
+    #[test]
+    fn interrupt_report_inline_decodes_to_report_bytes() {
+        let report = alloc::vec![0x00, 0x00, 0x04, 0x05, 0x00, 0x00, 0x00, 0x00];
+        let reply = UsbReply::InterruptReport {
+            data: report.clone(),
+            completion_code: 1,
+        };
+        match UsbReply::decode(&reply.encode()).unwrap() {
+            UsbReply::InterruptReport {
+                data,
+                completion_code,
+            } => {
+                assert_eq!(data, report);
+                assert_eq!(completion_code, 1);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn service_name_and_labels_are_stable() {
+        assert_eq!(USB_SERVICE_NAME, "usb");
+        assert_eq!(USB_REQ_LABEL, 1);
     }
 
     #[test]
