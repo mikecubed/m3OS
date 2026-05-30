@@ -202,6 +202,8 @@ const KNOWN_CONFIGS: &[&[u8]] = &[
     // Phase 55b F.1: ring-3 driver process configs.
     b"/etc/services.d/nvme_driver.conf\0",
     b"/etc/services.d/e1000_driver.conf\0",
+    // Phase 78a B.2: ring-3 xHCI USB host-controller driver.
+    b"/etc/services.d/xhci_driver.conf\0",
     // Phase 56 Track C: display server (compositor).
     b"/etc/services.d/display_server.conf\0",
     // Phase 57 Track F.2: session_manager daemon.

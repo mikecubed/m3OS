@@ -2672,6 +2672,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "xhci_driver"
+version = "0.78.0"
+dependencies = [
+ "driver_runtime",
+ "kernel-core",
+ "syscall-lib",
+]
+
+[[package]]
 name = "xtask"
 version = "0.1.0"
 dependencies = [

@@ -200,6 +200,8 @@ static DOOM_BIN: &[u8] = generated_initrd_asset!("doom");
 // canonical driver path.
 static NVME_DRIVER_ELF: &[u8] = generated_initrd_asset!("nvme_driver");
 static E1000_DRIVER_ELF: &[u8] = generated_initrd_asset!("e1000_driver");
+// Phase 78a Track B.2: ring-3 xHCI USB host-controller driver.
+static XHCI_DRIVER_ELF: &[u8] = generated_initrd_asset!("xhci_driver");
 // Phase 55b Track F.3b: NVMe crash-and-restart end-to-end smoke client.
 // Exposed under /bin so the QEMU regression can launch it from the shell.
 static NVME_CRASH_SMOKE_ELF: &[u8] = generated_initrd_asset!("nvme-crash-smoke");
@@ -1167,6 +1169,15 @@ static DRIVERS_ENTRIES: &[(&str, RamdiskNode)] = &[
         "audio_server",
         RamdiskNode::File {
             content: AUDIO_SERVER_ELF,
+        },
+    ),
+    // Phase 78a Track B.2: ring-3 xHCI driver. Lives under `/drivers/` so
+    // `is_authorized_driver_process` accepts its `sys_device_claim` for the
+    // qemu-xhci controller.
+    (
+        "xhci",
+        RamdiskNode::File {
+            content: XHCI_DRIVER_ELF,
         },
     ),
 ];
