@@ -864,6 +864,9 @@ fn build_userspace_bins() {
         // Phase 78a Track B.2: ring-3 xHCI USB host-controller driver
         // (`needs_alloc = true` for driver_runtime + kernel-core deps).
         ("xhci_driver", "xhci_driver", true),
+        // Phase 78b Track B: ring-3 USB hub class driver.
+        // `needs_alloc = true` for kernel-core + usb-core deps.
+        ("usbhub", "usbhub", true),
         // Phase 55b Track F.3b: NVMe crash-and-restart end-to-end smoke
         // client. No alloc dependency — syscall_lib only.
         ("nvme-crash-smoke", "nvme-crash-smoke", false),
@@ -12819,6 +12822,9 @@ fn populate_ext2_files(
     // substrate is kernel-internal init), restart=on-failure max_restart=5.
     let xhci_driver_conf =
         "name=xhci_driver\ncommand=/drivers/xhci\ntype=daemon\nrestart=on-failure\nmax_restart=5\n";
+    // Phase 78b Track B — ring-3 USB hub class driver. Depends on xhci_driver
+    // so the hub daemon starts after the host controller is up.
+    let usbhub_conf = "name=usbhub\ncommand=/drivers/usbhub\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=xhci_driver\n";
 
     // Phase 56 Track C.1: ring-3 display server (compositor) scaffold.
     // Depends on `kbd` so input arrives before the compositor binds the
@@ -13166,6 +13172,7 @@ fn populate_ext2_files(
     let nvme_driver_conf_tmp = output_dir.join("_tmp_nvme_driver_conf");
     let e1000_driver_conf_tmp = output_dir.join("_tmp_e1000_driver_conf");
     let xhci_driver_conf_tmp = output_dir.join("_tmp_xhci_driver_conf");
+    let usbhub_conf_tmp = output_dir.join("_tmp_usbhub_conf");
     let display_server_conf_tmp = output_dir.join("_tmp_display_server_conf");
     let session_manager_conf_tmp = output_dir.join("_tmp_session_manager_conf");
     let audio_server_conf_tmp = output_dir.join("_tmp_audio_server_conf");
@@ -13198,6 +13205,7 @@ fn populate_ext2_files(
     fs::write(&nvme_driver_conf_tmp, nvme_driver_conf).expect("write temp nvme_driver.conf");
     fs::write(&e1000_driver_conf_tmp, e1000_driver_conf).expect("write temp e1000_driver.conf");
     fs::write(&xhci_driver_conf_tmp, xhci_driver_conf).expect("write temp xhci_driver.conf");
+    fs::write(&usbhub_conf_tmp, usbhub_conf).expect("write temp usbhub.conf");
     fs::write(&display_server_conf_tmp, display_server_conf)
         .expect("write temp display_server.conf");
     fs::write(&session_manager_conf_tmp, session_manager_conf)
@@ -13755,6 +13763,10 @@ fn populate_ext2_files(
          sif etc/services.d/xhci_driver.conf mode 0x81A4\n\
          sif etc/services.d/xhci_driver.conf uid 0\n\
          sif etc/services.d/xhci_driver.conf gid 0\n\
+         write \"{usbhub_conf}\" etc/services.d/usbhub.conf\n\
+         sif etc/services.d/usbhub.conf mode 0x81A4\n\
+         sif etc/services.d/usbhub.conf uid 0\n\
+         sif etc/services.d/usbhub.conf gid 0\n\
          write \"{display_server_conf}\" etc/services.d/display_server.conf\n\
          sif etc/services.d/display_server.conf mode 0x81A4\n\
          sif etc/services.d/display_server.conf uid 0\n\
@@ -13801,6 +13813,7 @@ fn populate_ext2_files(
         nvme_driver_conf = nvme_driver_conf_tmp.display(),
         e1000_driver_conf = e1000_driver_conf_tmp.display(),
         xhci_driver_conf = xhci_driver_conf_tmp.display(),
+        usbhub_conf = usbhub_conf_tmp.display(),
         display_server_conf = display_server_conf_tmp.display(),
         session_manager_conf = session_manager_conf_tmp.display(),
         audio_server_conf = audio_server_conf_tmp.display(),
