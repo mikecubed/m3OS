@@ -316,7 +316,13 @@ async fn send_clean_channel_close(
         }
         // The close packets are now in sunset's output buffer; flush them to
         // the socket so the client receives them before the transport FIN.
-        let _ = flush_output_locked(runner, sock_fd, output_lock).await;
+        // BOUNDED flush (not `flush_output_locked`): a client that is still
+        // alive but has stopped draining its receive window returns EAGAIN
+        // rather than an error, and `write_all_nonblocking`'s `writable().await`
+        // would then park forever — re-opening the exact teardown-hang this
+        // path exists to prevent, and starving `close(sock_fd)` below. The
+        // bounded variant gives up after a fixed budget so `close` always runs.
+        flush_output_bounded(runner, sock_fd, output_lock).await;
     }
 }
 
@@ -1465,6 +1471,56 @@ async fn flush_output_locked(
 
         if write_all_nonblocking(sock_fd, &tmp[..chunk]).await.is_err() {
             return false;
+        }
+
+        let mut guard = runner.lock().await;
+        guard.consume_output(chunk);
+    }
+}
+
+/// Bounded teardown flush. Used only on the session-close path, where the peer
+/// may be alive yet not draining (write → EAGAIN, never an error). Unlike
+/// `flush_output_locked` (whose `write_all_nonblocking` parks on
+/// `writable().await` until POLLOUT and can hang forever against such a client),
+/// this caps the total time spent waiting on EAGAIN and then returns so the
+/// caller can `close(sock_fd)` — the transport FIN still releases the client.
+async fn flush_output_bounded(runner: &SharedRunner, sock_fd: i32, output_lock: &SharedOutputLock) {
+    // ~1 s total EAGAIN budget (40 × 25 ms), matching cleanup()'s bounded grace.
+    // The budget is NOT reset on progress, so even a 1-byte-per-tick trickling
+    // client cannot extend teardown past the cap. A healthy client drains the
+    // few hundred bytes of close packets in one write and never touches it.
+    const MAX_EAGAIN_WAITS: u32 = 40;
+    let _flush_guard = output_lock.lock().await;
+    let mut eagain_waits = 0u32;
+    loop {
+        let mut guard = runner.lock().await;
+        let out = guard.output_buf();
+        if out.is_empty() {
+            return;
+        }
+        let mut tmp = [0u8; 4096];
+        let chunk = out.len().min(tmp.len());
+        tmp[..chunk].copy_from_slice(&out[..chunk]);
+        drop(guard);
+
+        let mut written = 0usize;
+        while written < chunk {
+            let n = syscall_lib::write(sock_fd, &tmp[written..chunk]);
+            if n > 0 {
+                written += n as usize;
+            } else if n == NEG_EINTR {
+                continue;
+            } else if n == NEG_EAGAIN {
+                if eagain_waits >= MAX_EAGAIN_WAITS {
+                    // Client alive but not draining; give up so the caller closes.
+                    return;
+                }
+                eagain_waits += 1;
+                syscall_lib::nanosleep_for(0, 25_000_000); // 25 ms
+            } else {
+                // Hard error: stop flushing; the caller's close releases the fd.
+                return;
+            }
         }
 
         let mut guard = runner.lock().await;
