@@ -239,13 +239,16 @@ impl Controller {
         // Bounded walk: the list is short and `next == 0` terminates it; the
         // cap guards against a malformed self-referential list.
         for _ in 0..64 {
+            // The USBLEGSUP register overlays the capability-header dword: bits
+            // [7:0] = cap id, [15:8] = next pointer (in dwords), bit 16 = HC
+            // BIOS Owned, bit 24 = HC OS Owned. So this single read is both the
+            // header and (for the legacy cap) the semaphore register.
             let dword = self.bar.read_reg::<u32>(off);
             let id = (dword & 0xFF) as u8;
             let next = ((dword >> 8) & 0xFF) as usize;
             if id == XECP_ID_LEGACY {
-                let legsup = self.bar.read_reg::<u32>(off);
-                if legsup & USBLEGSUP_BIOS_OWNED != 0 {
-                    self.bar.write_reg::<u32>(off, legsup | USBLEGSUP_OS_OWNED);
+                if dword & USBLEGSUP_BIOS_OWNED != 0 {
+                    self.bar.write_reg::<u32>(off, dword | USBLEGSUP_OS_OWNED);
                     let mut budget = POLL_BUDGET;
                     while self.bar.read_reg::<u32>(off) & USBLEGSUP_BIOS_OWNED != 0 && budget > 0 {
                         budget -= 1;
@@ -563,7 +566,19 @@ impl Controller {
     /// `HCRST` is not guaranteed to re-post a connect change afterwards.
     pub fn scan_ports(&self) {
         for portnum in 1..=self.max_ports {
-            let raw = self.op_u32(self.portsc(portnum));
+            let off = self.portsc(portnum);
+            let mut raw = self.op_u32(off);
+            // Ensure Port Power is on before sampling connect status: on real
+            // xHCI with software-controlled power `PORTSC.PP` can default to 0,
+            // and CCS/CSC are not meaningful until it is set. qemu-xhci powers
+            // ports automatically (PP defaults to 1), so this is a no-op there.
+            // (Real-hardware connect debounce after a fresh power-on needs a
+            // timer and lands with 78b enumeration.)
+            if !port::Portsc(raw).pp() {
+                let powered = port::portsc_write_preserving(raw, port::PORTSC_PP);
+                self.op_write_u32(off, powered);
+                raw = self.op_u32(off);
+            }
             if port::Portsc(raw).ccs() {
                 self.reset_port(portnum);
             }
