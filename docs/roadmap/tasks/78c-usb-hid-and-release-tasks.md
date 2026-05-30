@@ -1,19 +1,64 @@
 # Phase 78c — USB Host Foundation: HID + Integration + Release: Task List
 
-**Status:** Planned
+**Status:** In Progress
 **Source Ref:** phase-78c
-**Depends on:** Phase 78b (USB Enumeration + Hub), Phase 56 (Display and Input Architecture) ✅, Phase 74 (IPC Capability Grants) ✅
+**Depends on:** Phase 78b (USB Enumeration + Hub) ✅ merged, Phase 78a ✅ merged, Phase 56 (Display and Input Architecture) ✅, Phase 74 (IPC Capability Grants) ✅
 **Goal:** Complete the USB milestone — a USB keyboard and mouse drive m3OS. Add the `usb-hid` Boot-Protocol class driver, inject its events into the Phase 56 `kbd_server`/`mouse_server` input path (leaving the dispatcher unchanged), land the full `usb-smoke` QMP gate (keystroke → prompt), write the Phase 78 learning doc, and cut `0.78.2` with the new USB capability inventory entry. Final of three Phase 78 sub-phases ([78a](../78a-xhci-host-bringup.md) → [78b](../78b-usb-enumeration-hub.md) → [78c](../78c-usb-hid-and-release.md)).
 
 > **Source-verified (2026-05-30):** `KeyEvent`/`PointerEvent` already exist with stable 20-/37-byte codecs (`kernel-core/src/input/events.rs:146`/`:199`); the input syscalls are `SYS_READ_SCANCODE` (`0x1007`) / `SYS_READ_MOUSE_PACKET` (`0x1015`); the dispatcher is `InputDispatcher::route_key_event`/`route_pointer_event` (`kernel-core/src/input/dispatch.rs:304`/`:379`); `kbd_server`/`mouse_server` are synchronous single-endpoint pull loops with **no** pending-event buffer (so the inject is a real change, not just a label); there is **no** `qemu-xhci`/`usb-kbd` in xtask today.
+
+## Post-Merge Validation & Architecture Decision (2026-05-30, after 78a + 78b merged)
+
+A full source audit of the merged 78a/78b tree changed the scope of this phase. **Both 78a and 78b are merged.** Key findings:
+
+1. **The live xHCI IPC server does NOT exist yet — it was deferred from 78b to here.** `userspace/drivers/xhci/src/main.rs` enumerates the device once at bring-up, prints the descriptor tree, then enters `controller.event_loop()` (`controller.rs:546`) which **discards every interrupt-IN transfer event silently** (`controller.rs:583`). It never registers a service, never publishes `AttachNotice`, never serves `UsbRequest`. `usb-core/src/protocol.rs:196` says verbatim *"the `sys_ipc_call` plumbing is **not** implemented here"* — `UsbClient` is a request-*builder* only, with no wire codec and nothing serving it. `usbhub/src/main.rs:14` confirms: *"the live `AttachNotice` IPC path … is deferred to **Phase 78c**."* **This server + transport work is new and was unbudgeted by the original task list.**
+2. **Architecture chosen (developer decision): Full IPC.** Build the xHCI IPC server + a separate `/drivers/usb-hid` daemon (rejected alternative: in-process HID inside the xhci driver). This is captured as a **new Track A0** below.
+3. **The IRQ↔IPC multiplex is a solved problem in m3OS.** `sys_notif_bind` (`0x1111`) binds an IRQ notification into an IPC endpoint; `ipc_recv_msg` then wakes on *either* a message *or* the IRQ (`RECV_KIND_NOTIFICATION = 1`). The e1000 driver already uses this exact pattern — the xHCI server reuses it (single-threaded; no `sys_clone` needed).
+4. **HID reports are tiny** (8-byte kbd / ≤4-byte mouse, ≤64-byte descriptors), so control/interrupt-IN data returns **inline via `ipc_store_reply_bulk`** (the `UsbReply::ControlData` pattern). Cross-process `PageGrant` transfer (Phase 74) stays for future bulk endpoints — **deferred**, not used by the 1.0 HID path.
+5. **B.2 drift corrected:** `DECLARED_SESSION_STEP_NAMES` (`session_supervisor.rs:89`) does **not** contain `xhci_driver`/`usbhub` — they are plain service-config daemons (`type=daemon`, `restart=on-failure`, `depends=`). `usb-hid` follows the **same daemon model** (config in `xtask::populate_ext2_files` + `init` `KNOWN_CONFIGS`, `depends=xhci_driver`), **not** an addition to `DECLARED_SESSION_STEP_NAMES`. The original B.2 acceptance referencing the session step list and `kernel/initrd/etc/services.d/usb-hid.conf` is superseded accordingly.
+6. The xhci driver **already has every in-process primitive** the server needs: `control_transfer` (SETUP/DATA/STATUS, `controller.rs:723`), `alloc_interrupt_ep_ring` (`:1061`), `wait_for_transfer_event`. New controller code needed: enqueue a **Normal TRB** on an interrupt-IN ring + ring its doorbell + decode the resulting Transfer Event (slot/dci/residual).
 
 ## Track Layout
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | HID class driver (ring 3): Boot keyboard, Boot mouse, Report-Protocol skeleton | Phase 78b | Planned |
-| B | Input integration + smoke: inject into `kbd_server`/`mouse_server`, stage `usb-hid`, full `usb-smoke` QMP gate | A, Phase 56 ✅ | Planned |
-| C | Documentation + release: learning doc, `0.78.2` bump + capability entry | A, B | Planned |
+| A0 | **(new)** USB IPC transport: `usb-core` wire codec for `AttachNotice`/`UsbRequest`/`UsbReply`; xHCI IPC server (register `usb`, IRQ-bound `ipc_recv_msg` multiplex, device table, control + interrupt-IN serving, deferred reply); controller interrupt-IN Normal-TRB enqueue/decode | Phase 78b ✅ | In Progress |
+| A | HID decode core (host-tested): `kernel-core/src/usb/hid.rs` usage→keycode + boot report decode, `hid_report.rs` skeleton | Phase 78b ✅ | In Progress |
+| B1 | Input integration: bounded inject queue + `KBD_EVENT_INJECT`/`MOUSE_EVENT_INJECT` in `kbd_server`/`mouse_server` (dispatcher unchanged) | Phase 56 ✅ | In Progress |
+| A-hid | `usb-hid` daemon (ring 3): lookup `usb` service, `SET_PROTOCOL(0)`/`SET_IDLE(0)`, poll interrupt-IN, decode via Track A, inject via Track B1 | A0, A, B1 | Planned |
+| B2 | Build + ramdisk + service wiring for `usb-hid` (`/drivers/usb-hid`, `depends=xhci_driver`) | A-hid | Planned |
+| B3 | `usb-smoke` QMP gate (`qemu-xhci`+`usb-kbd`+`usb-mouse`, keystroke→prompt), opt-in `M3OS_USB_REGRESSION=1` | all above | Planned |
+| C | Documentation + release: learning doc, `0.78.2` bump + capability entry | all above | Planned |
+
+> **Inject-label contract (pinned for parallel tracks):** `KBD_EVENT_INJECT = 5` on the `kbd` endpoint, `MOUSE_EVENT_INJECT = 3` on the `mouse` endpoint. Payload = the existing 20-byte `KeyEvent` / 37-byte `PointerEvent` wire form as IPC bulk; reply label `0` = enqueued OK, `u64::MAX` = queue full/error. Drain priority on `*_EVENT_PULL`: injected (USB) events drain **before** the PS/2 stream.
+
+---
+
+## Track A0 — USB IPC Transport (new; unblocks the separate `usb-hid` daemon)
+
+### A0.1 — `usb-core` wire codec
+
+**Files:** `userspace/lib/usb-core/src/protocol.rs` (+ host tests)
+**Symbol:** `AttachNotice::{encode,decode}`, `UsbRequest::{encode,decode}`, `UsbReply::{encode,decode}`, IPC label constants, `USB_SERVICE_NAME = "usb"`
+**Why it matters:** The types exist but have no byte transport (`protocol.rs:196`). Without a host-tested codec there is nothing to send over `ipc_call_buf`/`ipc_store_reply_bulk`.
+
+**Acceptance:**
+- [ ] `encode`/`decode` for `AttachNotice`, `UsbRequest`, `UsbReply` round-trip in host tests (incl. the `ControlData`/inline-report variants and an `Error` variant)
+- [ ] IPC label constants + `USB_SERVICE_NAME` defined and host-asserted
+- [ ] No `PageGrant` required on the live HID path (inline-bulk return documented; grant variant retained but marked deferred)
+
+### A0.2 — xHCI IPC server loop
+
+**Files:** `userspace/drivers/xhci/src/main.rs`, new `userspace/drivers/xhci/src/server.rs`, `userspace/drivers/xhci/src/controller.rs`
+**Symbol:** `run_server`, `DeviceTable`, interrupt-IN `enqueue_normal_trb`/`ring_ep_doorbell`/transfer-event decode
+**Why it matters:** Turns the driver from "enumerate once and discard events" into a live request/reply server that `usb-hid` (and later `usbhub`) drive.
+
+**Acceptance:**
+- [ ] After bring-up + enumeration, registers service `usb`, binds the controller IRQ into the endpoint (`sys_notif_bind`), and runs an `ipc_recv_msg` loop multiplexing IRQ + IPC (e1000 pattern), replacing the discard-only `event_loop`
+- [ ] Holds a device table of enumerated devices (slot_id, interface class/sub/proto, interrupt-IN dci + mps + interval); serves an attach-pull request returning `AttachNotice` for already-present HID devices
+- [ ] Serves `ControlRequest` (via `control_transfer`, inline data reply) and an interrupt-IN read; the interrupt-IN read **defers** its reply — the reply cap is stashed and answered when the matching Transfer Event arrives off the IRQ-drained event ring; endpoint is re-armed after each report
+- [ ] New `Controller` methods enqueue a Normal TRB on an interrupt-IN endpoint ring, ring the endpoint doorbell, and decode the Transfer Event (slot/dci/residual) — host-tested where the logic is pure (`kernel-core/src/usb/xhci`)
+- [ ] `xhci-bringup-smoke` and `xhci-enum-smoke` still PASS (no regression to the 78a/78b sentinels)
 
 ---
 
@@ -89,10 +134,10 @@
 **Why it matters:** `usb-hid` is a ring-3 driver that must be staged under `/drivers/` (not `/bin/`) or the `is_authorized_driver_process` gate (`device_host.rs:126`) denies `sys_device_claim`. It is a static daemon receiving device-attach notifications over IPC (the 78b A.3 lifecycle model), not forked per device.
 
 **Acceptance:**
-- [ ] `usb-hid` added as a Cargo `member` + `bins` entry with `needs_alloc = true`
-- [ ] `usb-hid` binary embedded in `DRIVERS_ENTRIES` (`ramdisk.rs`) at `/drivers/usb-hid`
-- [ ] `usb-hid.conf` added to `kernel/initrd/etc/services.d/` **and** `init` `KNOWN_CONFIGS`; uses `command=/drivers/usb-hid`, `type=daemon`, `restart=on-failure`, `depends=xhci`
-- [ ] `session_manager` start sequence (`DECLARED_SESSION_STEP_NAMES`, `kernel-core/src/session_supervisor.rs:89`) brings `usb-hid` up before `greeter`; on attach, `xhci` sends a device-attach IPC notification to the running `usb-hid` daemon (not forked per device, per the userspace-first rule)
+- [ ] `usb-hid` added as a Cargo `member` + `bins` entry with `needs_alloc = true` (mirrors the `("xhci_driver", …, true)` / `("usbhub", …, true)` entries)
+- [ ] `usb-hid` binary embedded in `DRIVERS_ENTRIES` (`ramdisk.rs`) at `/drivers/usb-hid` so the `is_authorized_driver_process` gate (`device_host.rs:126`, `/drivers/` prefix) admits it for `sys_device_*`
+- [ ] **(corrected)** service config follows the `xhci_driver`/`usbhub` precedent: written in `xtask::populate_ext2_files` (ext2 data disk) **and** added to `init` `KNOWN_CONFIGS`; uses `command=/drivers/usb-hid`, `type=daemon`, `restart=on-failure`, `depends=xhci_driver`. (The original `kernel/initrd/etc/services.d/usb-hid.conf` location is superseded — the existing USB drivers use the ext2 path.)
+- [ ] **(corrected)** `usb-hid` is a plain `depends=xhci_driver` daemon. It is **not** added to `DECLARED_SESSION_STEP_NAMES` (`session_supervisor.rs:89` contains neither `xhci_driver` nor `usbhub`). It is a static daemon that looks up the `usb` service and receives `AttachNotice` over IPC (not forked per device, per the userspace-first rule)
 - [ ] `cargo xtask clean` run after adding the config (forces ext2 disk recreation)
 
 ### B.3 — `usb-smoke` acceptance gate (QMP + serial; asserts a real keystroke-to-prompt)
