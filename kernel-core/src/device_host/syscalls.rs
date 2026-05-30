@@ -62,6 +62,55 @@ pub const SYS_DEVICE_PIO_READ: u64 = 0x1125;
 /// out-of-range access returns `-ERANGE`.
 pub const SYS_DEVICE_PIO_WRITE: u64 = 0x1126;
 
+/// Enumerate PCI devices matching a class/subclass/prog_if triple.
+/// Phase 78b Track C.1 —
+/// `sys_device_pci_enumerate(class, subclass, prog_if, out_user_ptr, max_entries) -> isize`.
+///
+/// ## ABI
+///
+/// | Register | Value |
+/// |----------|-------|
+/// | `rax`    | `SYS_DEVICE_PCI_ENUMERATE` (0x1127) |
+/// | `rdi`    | `class: u8`  — PCI class code (e.g. `0x0C` for Serial Bus) |
+/// | `rsi`    | `subclass: u8` — PCI subclass (e.g. `0x03` for USB) |
+/// | `rdx`    | `prog_if: u8` — Programming Interface (e.g. `0x30` for xHCI) |
+/// | `r10`    | `out_user_ptr: usize` — pointer to caller's output buffer |
+/// | `r8`     | `max_entries: usize` — capacity of the output buffer in entries |
+///
+/// On success the kernel writes up to `max_entries` packed BDF entries to
+/// `out_user_ptr` and returns the **total** match count (which may exceed
+/// `max_entries` if the buffer was too small). The caller must size the
+/// buffer conservatively (e.g. 8 entries for USB controllers) or call once
+/// with `max_entries=0` to query the count then call again with a real
+/// buffer. A negative return value is a negated `errno`:
+///
+/// - `-EACCES` (`-13`): caller's exec-path is not under `/drivers/` — only
+///   authorized driver processes may enumerate PCI devices.
+/// - `-EFAULT` (`-14`): `out_user_ptr` is invalid or the copy-out failed.
+/// - `-EINVAL` (`-22`): `class`, `subclass`, or `prog_if` is out of `u8` range
+///   (rejected at the dispatcher before reaching this function).
+/// - `-ESRCH` (`-3`): kernel context (PID 0) — use the in-kernel PCI scan
+///   directly.
+///
+/// ## BDF packing format
+///
+/// Each entry is a `u32` in little-endian byte order:
+///
+/// ```text
+/// bits [31:20] — PCI segment group (12 bits; encodable range 0–4095;
+///                always 0 on current platforms)
+/// bits [19:12] — bus number (8 bits; 0–255)
+/// bits [11:10] — reserved / padding (always 0; dev is 5 bits, not 7)
+/// bits [ 9: 5] — device number (5 bits; 0–31)
+/// bits [ 4: 2] — function number (3 bits; 0–7)
+/// bits [  1:0] — reserved (always 0)
+/// ```
+///
+/// A future phase may promote segment to `u16` and extend the entry to `u64`
+/// when multi-segment PCIe is implemented; a new syscall number will be
+/// allocated at that time rather than silently changing this one's layout.
+pub const SYS_DEVICE_PCI_ENUMERATE: u64 = 0x1127;
+
 /// Sentinel passed as `notification_arg` (arg3) of [`SYS_DEVICE_IRQ_SUBSCRIBE`]
 /// to request that the kernel allocate a fresh `Notification` object on the
 /// caller's behalf, rather than binding the IRQ to an existing notification
@@ -81,7 +130,7 @@ pub const DEVICE_HOST_BASE: u64 = SYS_DEVICE_CLAIM;
 ///
 /// Adjust upward when adding new device-host syscalls; the Track B acceptance
 /// items pin this constant as the authoritative upper bound.
-pub const DEVICE_HOST_LAST: u64 = SYS_DEVICE_PIO_WRITE;
+pub const DEVICE_HOST_LAST: u64 = SYS_DEVICE_PCI_ENUMERATE;
 
 #[cfg(test)]
 mod tests {
@@ -99,6 +148,8 @@ mod tests {
         // Phase 63 Track Z.1 — PIO syscalls appended after IRQ_SUBSCRIBE.
         assert_eq!(SYS_DEVICE_PIO_READ, 0x1125);
         assert_eq!(SYS_DEVICE_PIO_WRITE, 0x1126);
+        // Phase 78b Track C.1 — PCI class enumeration.
+        assert_eq!(SYS_DEVICE_PCI_ENUMERATE, 0x1127);
     }
 
     #[test]
@@ -111,6 +162,7 @@ mod tests {
             SYS_DEVICE_IRQ_SUBSCRIBE,
             SYS_DEVICE_PIO_READ,
             SYS_DEVICE_PIO_WRITE,
+            SYS_DEVICE_PCI_ENUMERATE,
         ];
         for (i, a) in all.iter().enumerate() {
             for (j, b) in all.iter().enumerate() {
@@ -131,6 +183,7 @@ mod tests {
             SYS_DEVICE_IRQ_SUBSCRIBE,
             SYS_DEVICE_PIO_READ,
             SYS_DEVICE_PIO_WRITE,
+            SYS_DEVICE_PCI_ENUMERATE,
         ];
         for n in all {
             assert!(
@@ -147,7 +200,9 @@ mod tests {
         // discipline.
         assert_eq!(SYS_DEVICE_PIO_READ, SYS_DEVICE_IRQ_SUBSCRIBE + 1);
         assert_eq!(SYS_DEVICE_PIO_WRITE, SYS_DEVICE_PIO_READ + 1);
-        assert_eq!(DEVICE_HOST_LAST, SYS_DEVICE_PIO_WRITE);
+        // Phase 78b Track C.1 pin: PCI_ENUMERATE follows PIO_WRITE without gap.
+        assert_eq!(SYS_DEVICE_PCI_ENUMERATE, SYS_DEVICE_PIO_WRITE + 1);
+        assert_eq!(DEVICE_HOST_LAST, SYS_DEVICE_PCI_ENUMERATE);
     }
 
     #[test]

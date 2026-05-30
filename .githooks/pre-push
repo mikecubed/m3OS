@@ -291,4 +291,9 @@ fi
 if [ "${M3OS_USB_REGRESSION:-0}" = "1" ]; then
     echo "pre-push: running cargo xtask xhci-bringup-smoke..."
     cargo xtask xhci-bringup-smoke --timeout 150
+    # Phase 78b — enumeration gate: boots `-device qemu-xhci` + `usb-kbd` and
+    # asserts the device enumerates to Configured (XHCI_ENUM:configured) over
+    # real control transfers, on top of the 78a bring-up.
+    echo "pre-push: running cargo xtask xhci-enum-smoke..."
+    cargo xtask xhci-enum-smoke --timeout 150
 fi

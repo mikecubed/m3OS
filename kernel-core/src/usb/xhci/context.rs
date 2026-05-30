@@ -166,6 +166,115 @@ pub const fn slot_root_hub_port(dword1: u32) -> u8 {
     ((dword1 >> SLOT_ROOT_HUB_PORT_SHIFT) & SLOT_ROOT_HUB_PORT_MASK) as u8
 }
 
+// ---------------------------------------------------------------------------
+// Endpoint Context field encoders (xHCI §6.2.3)
+// ---------------------------------------------------------------------------
+
+// --- Endpoint Type (EP Type field, bits 5:3 of dword 1) ---
+
+/// EP Type value for a Bidirectional Control endpoint (xHCI §6.2.3 Table 6-9).
+/// Used for EP0, the default control endpoint.
+pub const EP_TYPE_CONTROL: u8 = 4;
+/// EP Type value for a Bulk OUT endpoint.
+pub const EP_TYPE_BULK_OUT: u8 = 2;
+/// EP Type value for a Bulk IN endpoint.
+pub const EP_TYPE_BULK_IN: u8 = 6;
+/// EP Type value for an Interrupt OUT endpoint.
+pub const EP_TYPE_INTERRUPT_OUT: u8 = 3;
+/// EP Type value for an Interrupt IN endpoint.
+pub const EP_TYPE_INTERRUPT_IN: u8 = 7;
+
+/// Shift of the Endpoint Type field in Endpoint Context dword 1 (bits 5:3).
+pub const EP_TYPE_SHIFT: u32 = 3;
+/// Mask of the Endpoint Type field after shifting (3 bits).
+pub const EP_TYPE_MASK: u32 = 0x7;
+/// Shift of the Error Count (CErr) field in Endpoint Context dword 1 (bits
+/// 2:1). For non-isoch endpoints this is set to 3 (maximum retries).
+pub const EP_CERR_SHIFT: u32 = 1;
+/// Mask of the CErr field after shifting (2 bits).
+pub const EP_CERR_MASK: u32 = 0x3;
+/// Shift of Max Packet Size in Endpoint Context dword 1 (bits 31:16).
+pub const EP_MAX_PACKET_SIZE_SHIFT: u32 = 16;
+/// Mask of Max Packet Size after shifting (16 bits).
+pub const EP_MAX_PACKET_SIZE_MASK: u32 = 0xFFFF;
+
+/// Shift of the Interval field in Endpoint Context dword 0 (bits 23:16).
+/// For interrupt and isochronous endpoints: the service interval = 2^Interval
+/// microframes (HS) or frames (FS/LS, after adjustment).
+pub const EP_INTERVAL_SHIFT: u32 = 16;
+/// Mask of the Interval field after shifting (8 bits).
+pub const EP_INTERVAL_MASK: u32 = 0xFF;
+
+/// DCS — Dequeue Cycle State: bit 0 of the TR Dequeue Pointer in Endpoint
+/// Context dwords 2–3. Must be set to 1 on the initial context so the
+/// controller starts polling the ring with the matching cycle bit.
+pub const EP_DCS_BIT: u64 = 1;
+
+/// Error Count (CErr = 3) for non-isochronous endpoints (xHCI §6.2.3).
+///
+/// Non-zero CErr causes the controller to retry failed transactions; 3 is the
+/// maximum and the standard choice for control/bulk/interrupt endpoints.
+pub const EP_CERR_3: u8 = 3;
+
+/// Encode **Endpoint Context dword 0** for an interrupt endpoint (xHCI §6.2.3).
+///
+/// Sets the Interval field (bits 23:16); all other bits in dword 0 are left
+/// zero (Max ESIT Payload and Max Burst Size are not required for FS/HS
+/// interrupt endpoints in basic enumeration).
+///
+/// `interval` is the raw xHCI Interval value (not the bInterval from the
+/// endpoint descriptor — the caller must convert: for HS interrupt, use
+/// `bInterval - 1` clamped to 0..=15; for FS/LS, use log2(bInterval) where
+/// bInterval is 1..=255 ms).
+pub const fn ep_context_dword0_interval(interval: u8) -> u32 {
+    ((interval as u32) & EP_INTERVAL_MASK) << EP_INTERVAL_SHIFT
+}
+
+/// Encode **Endpoint Context dword 1** from its three fields (xHCI §6.2.3):
+///
+/// * `ep_type` (bits 5:3) — the endpoint type (see `EP_TYPE_*` constants).
+/// * `cerr`    (bits 2:1) — error count, use [`EP_CERR_3`] for non-isoch.
+/// * `max_packet_size` (bits 31:16) — the endpoint's `wMaxPacketSize`.
+///
+/// Bits 15:8 (Max Burst Size) and bits 7:6 (reserved) are left zero.
+pub const fn ep_context_dword1(ep_type: u8, cerr: u8, max_packet_size: u16) -> u32 {
+    (((ep_type as u32) & EP_TYPE_MASK) << EP_TYPE_SHIFT)
+        | (((cerr as u32) & EP_CERR_MASK) << EP_CERR_SHIFT)
+        | (((max_packet_size as u32) & EP_MAX_PACKET_SIZE_MASK) << EP_MAX_PACKET_SIZE_SHIFT)
+}
+
+/// Encode the **TR Dequeue Pointer** value stored in Endpoint Context dwords
+/// 2–3 (xHCI §6.2.3.2).
+///
+/// `ring_iova` is the device-visible address of the first TRB on the
+/// endpoint's transfer ring, which **must** be 16-byte aligned (low 4 bits
+/// zero). This function ORs in the Dequeue Cycle State bit (`DCS = 1`), which
+/// tells the controller the initial producer cycle state so it starts polling
+/// the ring correctly.
+pub const fn ep_tr_dequeue_ptr(ring_iova: u64) -> u64 {
+    ring_iova | EP_DCS_BIT
+}
+
+/// Decode the Endpoint Type from Endpoint Context dword 1 (bits 5:3).
+pub const fn ep_type(dword1: u32) -> u8 {
+    ((dword1 >> EP_TYPE_SHIFT) & EP_TYPE_MASK) as u8
+}
+
+/// Decode the Error Count (CErr) from Endpoint Context dword 1 (bits 2:1).
+pub const fn ep_cerr(dword1: u32) -> u8 {
+    ((dword1 >> EP_CERR_SHIFT) & EP_CERR_MASK) as u8
+}
+
+/// Decode Max Packet Size from Endpoint Context dword 1 (bits 31:16).
+pub const fn ep_max_packet_size(dword1: u32) -> u16 {
+    ((dword1 >> EP_MAX_PACKET_SIZE_SHIFT) & EP_MAX_PACKET_SIZE_MASK) as u16
+}
+
+/// Decode the Interval from Endpoint Context dword 0 (bits 23:16).
+pub const fn ep_interval(dword0: u32) -> u8 {
+    ((dword0 >> EP_INTERVAL_SHIFT) & EP_INTERVAL_MASK) as u8
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +351,86 @@ mod tests {
         assert_eq!(slot_root_hub_port(d1), 7);
         // Field is at bits 23:16.
         assert_eq!(d1, 7 << 16);
+    }
+
+    // -----------------------------------------------------------------------
+    // Endpoint Context encoder tests (xHCI §6.2.3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ep_context_dword1_control_ep0_full_speed() {
+        // EP0 full/low speed: EP Type = Control (4), CErr = 3, MPS = 8.
+        let d1 = ep_context_dword1(EP_TYPE_CONTROL, EP_CERR_3, 8);
+        assert_eq!(ep_type(d1), EP_TYPE_CONTROL);
+        assert_eq!(ep_cerr(d1), 3);
+        assert_eq!(ep_max_packet_size(d1), 8);
+        // Type at bits 5:3 → Control = 4 → 4 << 3 = 0x20.
+        // CErr at bits 2:1 → 3 → 3 << 1 = 0x06.
+        // MPS at bits 31:16 → 8 → 8 << 16.
+        assert_eq!(d1 & 0b11_1110, 0x20 | 0x06);
+        assert_eq!(d1 >> 16, 8);
+    }
+
+    #[test]
+    fn ep_context_dword1_control_ep0_high_speed() {
+        // EP0 high speed: MPS = 64.
+        let d1 = ep_context_dword1(EP_TYPE_CONTROL, EP_CERR_3, 64);
+        assert_eq!(ep_type(d1), EP_TYPE_CONTROL);
+        assert_eq!(ep_cerr(d1), 3);
+        assert_eq!(ep_max_packet_size(d1), 64);
+    }
+
+    #[test]
+    fn ep_context_dword1_control_ep0_super_speed() {
+        // EP0 superspeed: MPS = 512.
+        let d1 = ep_context_dword1(EP_TYPE_CONTROL, EP_CERR_3, 512);
+        assert_eq!(ep_type(d1), EP_TYPE_CONTROL);
+        assert_eq!(ep_max_packet_size(d1), 512);
+    }
+
+    #[test]
+    fn ep_context_dword1_interrupt_in() {
+        // Interrupt IN endpoint (e.g. HID keyboard), MPS = 8, CErr = 3.
+        let d1 = ep_context_dword1(EP_TYPE_INTERRUPT_IN, EP_CERR_3, 8);
+        assert_eq!(ep_type(d1), EP_TYPE_INTERRUPT_IN);
+        assert_eq!(ep_cerr(d1), 3);
+        assert_eq!(ep_max_packet_size(d1), 8);
+    }
+
+    #[test]
+    fn ep_context_dword0_interval_roundtrip() {
+        // Interval = 10 (for a HS interrupt endpoint with bInterval = 11).
+        let d0 = ep_context_dword0_interval(10);
+        assert_eq!(ep_interval(d0), 10);
+        // Field sits at bits 23:16.
+        assert_eq!(d0, 10u32 << 16);
+
+        // Interval = 0 yields zero dword.
+        assert_eq!(ep_context_dword0_interval(0), 0);
+        // Interval = 255 maximum (8-bit field).
+        let d0b = ep_context_dword0_interval(255);
+        assert_eq!(ep_interval(d0b), 255);
+    }
+
+    #[test]
+    fn ep_tr_dequeue_ptr_sets_dcs() {
+        // A 16-byte-aligned ring address: low 4 bits are zero, DCS is ORed in.
+        let ring = 0x0010_0000u64;
+        let ptr = ep_tr_dequeue_ptr(ring);
+        assert_eq!(ptr & !1u64, ring); // address bits preserved
+        assert_eq!(ptr & 1, 1); // DCS = 1
+    }
+
+    #[test]
+    fn ep_type_constants_match_spec() {
+        // xHCI §6.2.3 Table 6-9 values.
+        assert_eq!(EP_TYPE_CONTROL, 4);
+        assert_eq!(EP_TYPE_BULK_OUT, 2);
+        assert_eq!(EP_TYPE_BULK_IN, 6);
+        assert_eq!(EP_TYPE_INTERRUPT_OUT, 3);
+        assert_eq!(EP_TYPE_INTERRUPT_IN, 7);
+        // EP0 control endpoint type encodes as 4.
+        let d1 = ep_context_dword1(EP_TYPE_CONTROL, 0, 0);
+        assert_eq!((d1 >> EP_TYPE_SHIFT) & EP_TYPE_MASK, 4);
     }
 }

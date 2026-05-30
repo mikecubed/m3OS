@@ -12,6 +12,7 @@ pub mod audio_class;
 pub mod dma_logic;
 pub mod irq_logic;
 pub mod mmio_bounds;
+pub mod pci_enum;
 pub mod pio_validation;
 pub mod registry_logic;
 pub mod syscalls;
@@ -32,6 +33,7 @@ pub use mmio_bounds::{
     MAX_MMIO_BAR_BYTES, MmioBoundsError, bar_page_count, build_mmio_window, cache_mode_for_bar,
     validate_mmio_bar_size,
 };
+pub use pci_enum::{PciDeviceInfo, collect_matching_bdfs};
 pub use pio_validation::{PioValidationError, validate_pio_access};
 pub use registry_logic::{DeviceHostRegistryCore, RegistryError, RegistryPid};
 pub use types::{

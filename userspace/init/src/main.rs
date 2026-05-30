@@ -204,6 +204,8 @@ const KNOWN_CONFIGS: &[&[u8]] = &[
     b"/etc/services.d/e1000_driver.conf\0",
     // Phase 78a B.2: ring-3 xHCI USB host-controller driver.
     b"/etc/services.d/xhci_driver.conf\0",
+    // Phase 78b Track B: ring-3 USB hub class driver.
+    b"/etc/services.d/usbhub.conf\0",
     // Phase 56 Track C: display server (compositor).
     b"/etc/services.d/display_server.conf\0",
     // Phase 57 Track F.2: session_manager daemon.

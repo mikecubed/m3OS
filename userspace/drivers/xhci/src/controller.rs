@@ -1,5 +1,6 @@
-//! xHCI host-controller bring-up — Phase 78a Tracks A.3–A.7 (MMIO/DMA/IRQ
-//! glue around the host-tested `kernel_core::usb::xhci` pure logic).
+//! xHCI host-controller bring-up — Phase 78a Tracks A.3–A.7 + Phase 78b
+//! Track A-glue (synchronous command/transfer rings, per-slot context DMA,
+//! `UsbHostOps` backed by real DMA rings).
 //!
 //! [`Controller`] owns the claimed device, the BAR0 MMIO window, and every
 //! controller-visible DMA structure (DCBAA, scratchpad, command ring, event
@@ -16,7 +17,10 @@
 use core::sync::atomic::{Ordering, fence};
 
 use driver_runtime::{DeviceHandle, DmaBuffer, IrqNotification, Mmio};
-use kernel_core::usb::xhci::{port, regs, trb};
+use kernel_core::usb::xhci::{
+    context::{input_control_offset, input_endpoint_offset, input_slot_offset},
+    port, regs, trb,
+};
 use syscall_lib::STDOUT_FILENO;
 use syscall_lib::write_str;
 
@@ -93,13 +97,20 @@ const USBLEGSUP_OS_OWNED: u32 = 1 << 24;
 // ---------------------------------------------------------------------------
 
 /// TRBs per ring segment (command ring and the single event-ring segment).
-/// 16 entries × 16 bytes = 256 bytes — ample for the single Enable Slot of
-/// the 78a milestone; 78b/78c grow this as transfer traffic appears.
-const RING_TRBS: usize = 16;
+/// 64 entries × 16 bytes = 1024 bytes — sufficient for full enumeration
+/// command/transfer traffic during 78b; still small enough to not waste DMA.
+const RING_TRBS: usize = 64;
 const RING_BYTES: usize = RING_TRBS * trb::TRB_SIZE;
 /// 64-byte alignment is the strictest xHCI requirement for rings, the DCBAA,
 /// the ERST, and contexts.
 const XHCI_ALIGN: usize = 64;
+
+/// Device context size: Slot + 31 EP contexts (32 entries total).
+/// With entry_size=32: 32*32 = 1024 bytes; with entry_size=64: 2048 bytes.
+const DEVICE_CONTEXT_ENTRIES: usize = 32;
+/// Input context has one extra entry (Input Control Context) before the 32
+/// device-context entries: total (DEVICE_CONTEXT_ENTRIES + 1) entries.
+const INPUT_CONTEXT_ENTRIES: usize = DEVICE_CONTEXT_ENTRIES + 1;
 
 /// Bounded spin budget for the reset / CNR / halt handshakes. QEMU clears the
 /// relevant bit within a handful of reads; a few hundred thousand iterations
@@ -114,6 +125,28 @@ pub enum BringUpError {
     RunTimeout,
     DmaAlloc,
     IrqSubscribe,
+}
+
+// ---------------------------------------------------------------------------
+// Per-slot device context bookkeeping
+// ---------------------------------------------------------------------------
+
+/// Per-slot DMA context allocated during Address Device.
+pub struct SlotContext {
+    /// Output Device Context — the controller writes state back here.
+    pub output_ctx: DmaBuffer<u8>,
+    /// EP0 transfer ring (command and data TRBs).
+    pub ep0_ring: DmaBuffer<u8>,
+    /// EP0 ring producer cursor.
+    pub ep0_producer: trb::ProducerRing,
+    /// IOVA of the EP0 transfer ring (written into the EP0 context).
+    pub ep0_ring_iova: u64,
+    /// Input Context DMA buffer — rebuilt from an `InputContextSnapshot`
+    /// before every command that needs one.
+    pub input_ctx: DmaBuffer<u8>,
+    /// Additional endpoint (interrupt/bulk) transfer rings kept alive for
+    /// the slot's lifetime. Populated during Configure Endpoint.
+    pub ep_rings: alloc::vec::Vec<DmaBuffer<u8>>,
 }
 
 pub struct Controller {
@@ -142,6 +175,9 @@ pub struct Controller {
     producer: trb::ProducerRing,
     consumer: trb::EventConsumer,
     enable_slot_emitted: bool,
+
+    /// Per-slot context (allocated lazily when Address Device is issued).
+    slot_ctx: Option<SlotContext>,
 }
 
 impl Controller {
@@ -178,6 +214,7 @@ impl Controller {
             producer: trb::ProducerRing::new(RING_TRBS),
             consumer: trb::EventConsumer::new(&[RING_TRBS]),
             enable_slot_emitted: false,
+            slot_ctx: None,
         }
     }
 
@@ -513,7 +550,7 @@ impl Controller {
                 // Spurious / errored wake — re-block rather than spin.
                 continue;
             }
-            self.drain_event_ring();
+            self.drain_event_ring_discard();
             // Update ERDP to the current dequeue pointer and clear EHB.
             let erdp = self.event_ring_iova + (self.consumer.index as u64) * trb::TRB_SIZE as u64;
             self.rt_write_u64(rt_reg::ERDP, erdp | ERDP_EHB);
@@ -524,8 +561,9 @@ impl Controller {
     }
 
     /// Consume every TRB the controller has produced (cycle bit == CCS),
-    /// dispatching each by type.
-    fn drain_event_ring(&mut self) {
+    /// dispatching each by type. Used in the steady-state event loop where
+    /// completion events are discarded (enumeration already complete).
+    fn drain_event_ring_discard(&mut self) {
         loop {
             let seg = self.event_ring.as_ref().expect("event ring allocated");
             let candidate = read_trb(seg, self.consumer.index);
@@ -542,13 +580,506 @@ impl Controller {
                     self.on_port_status_change(ev);
                 }
                 Some(trb::TrbType::TransferEvent) => {
-                    // No transfers issued in 78a; enumeration is 78b.
+                    // Steady-state: interrupt endpoint events — consumed silently.
                 }
                 _ => {}
             }
             self.consumer.dequeue_step();
         }
     }
+
+    // -- 78b synchronous command / transfer machinery ----------------------
+
+    /// Enqueue one TRB on the command ring, ring Doorbell 0, then block until
+    /// a Command Completion Event matching this TRB's pointer arrives on the
+    /// event ring. Returns the decoded completion event.
+    ///
+    /// This is the synchronous path used by enumeration. It is distinct from
+    /// the fire-and-forget `enqueue_enable_slot` path but shares the same
+    /// `producer` cursor and `ring_doorbell` primitive.
+    pub fn issue_command_and_wait(
+        &mut self,
+        irq: &IrqNotification,
+        cmd: trb::Trb,
+    ) -> trb::CommandCompletionEvent {
+        let ring = self.cmd_ring.as_ref().expect("command ring allocated");
+        // Record the IOVA of the slot we are about to write — the completion
+        // event's `command_trb_pointer` will point back here.
+        let cmd_iova = self.cmd_ring_iova + (self.producer.enqueue as u64) * trb::TRB_SIZE as u64;
+        write_trb(ring, self.producer.enqueue, cmd);
+        let cycle_before = self.producer.cycle;
+        if self.producer.advance() {
+            write_trb(
+                ring,
+                self.producer.link_index(),
+                trb::Trb::link(self.cmd_ring_iova, true, cycle_before),
+            );
+        }
+        self.ring_doorbell(0, 0);
+
+        // Drain the event ring on each IRQ wake until we find the matching
+        // Command Completion Event. Bounded to avoid hanging if the controller
+        // wedges. A totally-silent controller (zero interrupts delivered) is
+        // still a known limitation pending a timeout-capable wait syscall.
+        const COMMAND_WAIT_WAKES: u32 = 128;
+        let mut wakes = 0u32;
+        loop {
+            let bits = irq.wait();
+            if bits == 0 {
+                wakes += 1;
+                if wakes >= COMMAND_WAIT_WAKES {
+                    write_str(
+                        STDOUT_FILENO,
+                        "[xhci] command timed out (no completion event)\n",
+                    );
+                    // Return a synthetic failure completion so enumeration can
+                    // transition to Error/Timeout rather than hanging.
+                    return trb::CommandCompletionEvent {
+                        command_trb_pointer: cmd_iova,
+                        completion_code: 0xFF, // synthetic: not COMPLETION_SUCCESS
+                        slot_id: 0,
+                        cycle: false,
+                    };
+                }
+                continue;
+            }
+            // Drain all pending events; collect our completion.
+            if let Some(ev) = self.drain_for_command_completion(cmd_iova) {
+                // Update ERDP + clear IMAN.IP.
+                let erdp =
+                    self.event_ring_iova + (self.consumer.index as u64) * trb::TRB_SIZE as u64;
+                self.rt_write_u64(rt_reg::ERDP, erdp | ERDP_EHB);
+                self.rt_write_u32(rt_reg::IMAN, IMAN_IP | IMAN_IE);
+                let _ = irq.ack(bits);
+                return ev;
+            }
+            // Update ERDP even if we didn't find our event yet.
+            let erdp = self.event_ring_iova + (self.consumer.index as u64) * trb::TRB_SIZE as u64;
+            self.rt_write_u64(rt_reg::ERDP, erdp | ERDP_EHB);
+            self.rt_write_u32(rt_reg::IMAN, IMAN_IP | IMAN_IE);
+            let _ = irq.ack(bits);
+            wakes += 1;
+            if wakes >= COMMAND_WAIT_WAKES {
+                write_str(
+                    STDOUT_FILENO,
+                    "[xhci] command timed out (no completion event)\n",
+                );
+                return trb::CommandCompletionEvent {
+                    command_trb_pointer: cmd_iova,
+                    completion_code: 0xFF,
+                    slot_id: 0,
+                    cycle: false,
+                };
+            }
+        }
+    }
+
+    /// Drain the event ring looking for a Command Completion Event whose
+    /// `command_trb_pointer` matches `cmd_iova`. Side-effects all other
+    /// events normally (sentinel emission for Enable Slot, port status
+    /// changes). Returns `Some(ev)` when found, `None` if the ring is
+    /// exhausted without a match.
+    fn drain_for_command_completion(
+        &mut self,
+        cmd_iova: u64,
+    ) -> Option<trb::CommandCompletionEvent> {
+        let mut found: Option<trb::CommandCompletionEvent> = None;
+        loop {
+            let seg = self.event_ring.as_ref().expect("event ring allocated");
+            let candidate = read_trb(seg, self.consumer.index);
+            if !self.consumer.owns(&candidate) {
+                break;
+            }
+            match trb::event_trb_type(&candidate) {
+                Some(trb::TrbType::CommandCompletion) => {
+                    let ev = trb::parse_command_completion(&candidate);
+                    // Always run the sentinel-emission side effect.
+                    self.on_command_completion(ev);
+                    // Check if this is our matching completion.
+                    if ev.command_trb_pointer == cmd_iova {
+                        found = Some(ev);
+                    }
+                }
+                Some(trb::TrbType::PortStatusChange) => {
+                    let ev = trb::parse_port_status_change(&candidate);
+                    self.on_port_status_change(ev);
+                }
+                Some(trb::TrbType::TransferEvent) => {
+                    // Not expected during command processing; ignore.
+                }
+                _ => {}
+            }
+            self.consumer.dequeue_step();
+        }
+        found
+    }
+
+    /// Perform a control transfer on slot `slot_id`'s EP0 transfer ring.
+    ///
+    /// Builds: Setup Stage → (optional Data Stage IN) → Status Stage TRBs,
+    /// rings Doorbell `slot_id` at DCI 1 (EP0), then blocks for the Transfer
+    /// Event. On success returns the received data bytes (or an empty Vec for
+    /// OUT-only transfers). Returns `None` on timeout or error completion code.
+    pub fn control_transfer(
+        &mut self,
+        irq: &IrqNotification,
+        slot_id: u8,
+        setup: trb::SetupPacket,
+        len: u16,
+        dir_in: bool,
+    ) -> Option<alloc::vec::Vec<u8>> {
+        // Allocate a temporary data DMA buffer if data is expected.
+        let data_buf = if dir_in && len > 0 {
+            match DmaBuffer::<u8>::allocate(&self.handle, len as usize, XHCI_ALIGN) {
+                Ok(buf) => {
+                    zero_dma(&buf);
+                    Some(buf)
+                }
+                Err(_) => {
+                    write_str(STDOUT_FILENO, "[xhci] ctrl-xfer: data buf alloc failed\n");
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
+
+        let sc = self.slot_ctx.as_mut().expect("slot context allocated");
+
+        // Build and enqueue the three-stage control transfer on the EP0 ring.
+        let tt = if len == 0 {
+            trb::SETUP_TT_NO_DATA
+        } else if dir_in {
+            trb::SETUP_TT_IN
+        } else {
+            trb::SETUP_TT_OUT
+        };
+
+        // Setup Stage TRB
+        {
+            let cycle = sc.ep0_producer.cycle;
+            let setup_trb = trb::Trb::setup_stage(&setup, tt, cycle);
+            write_trb(&sc.ep0_ring, sc.ep0_producer.enqueue, setup_trb);
+            let cycle_before = sc.ep0_producer.cycle;
+            if sc.ep0_producer.advance() {
+                let iova = sc.ep0_ring_iova;
+                write_trb(
+                    &sc.ep0_ring,
+                    sc.ep0_producer.link_index(),
+                    trb::Trb::link(iova, true, cycle_before),
+                );
+            }
+        }
+
+        // Data Stage TRB (only for transfers with data)
+        if let Some(ref buf) = data_buf {
+            let cycle = sc.ep0_producer.cycle;
+            let data_trb = trb::Trb::data_stage(buf.iova(), len as u32, dir_in, cycle);
+            write_trb(&sc.ep0_ring, sc.ep0_producer.enqueue, data_trb);
+            let cycle_before = sc.ep0_producer.cycle;
+            if sc.ep0_producer.advance() {
+                let iova = sc.ep0_ring_iova;
+                write_trb(
+                    &sc.ep0_ring,
+                    sc.ep0_producer.link_index(),
+                    trb::Trb::link(iova, true, cycle_before),
+                );
+            }
+        }
+
+        // Status Stage TRB — direction is opposite of data stage for IN,
+        // or IN (true) for no-data OUT transfers (xHCI §4.11.2.2).
+        // The IOC (Interrupt On Completion) bit is set so the controller
+        // generates a Transfer Event when the status phase completes.
+        {
+            let cycle = sc.ep0_producer.cycle;
+            // For IN data transfers status is OUT (dir_in=false); for OUT or
+            // no-data, status is IN (dir_in=true).
+            let status_dir_in = !dir_in || len == 0;
+            // IOC is now set inside Trb::status_stage (kernel-core fix).
+            let status_trb = trb::Trb::status_stage(status_dir_in, cycle);
+            write_trb(&sc.ep0_ring, sc.ep0_producer.enqueue, status_trb);
+            let cycle_before = sc.ep0_producer.cycle;
+            if sc.ep0_producer.advance() {
+                let iova = sc.ep0_ring_iova;
+                write_trb(
+                    &sc.ep0_ring,
+                    sc.ep0_producer.link_index(),
+                    trb::Trb::link(iova, true, cycle_before),
+                );
+            }
+        }
+
+        // Ring EP0 doorbell (DCI = 1).
+        self.ring_doorbell(slot_id, 1);
+
+        // Block for Transfer Event(s) — wait for the status stage to complete.
+        let result = self.wait_for_transfer_event(irq, slot_id, 1);
+
+        match result {
+            Some(ev) if ev.completion_code == trb::COMPLETION_SUCCESS => {
+                // Read back data from the DMA buffer, length = len minus the
+                // event's residual_transfer_length, clamped to [0, len].
+                //
+                // NOTE: the control TD sets IOC only on the (zero-length)
+                // Status Stage TRB and does NOT set ISP on the Data Stage TRB,
+                // so the single Transfer Event we receive reports the Status
+                // TRB's residual (always 0 on success). `actual` therefore
+                // currently equals `len` on every successful read — short-read
+                // detection is a no-op until the Data Stage TRB sets ISP and we
+                // drain its event. This is fine for 78b enumeration, where every
+                // IN control read requests the descriptor's exact length; a
+                // future caller needing true short-read accounting must add ISP.
+                if let Some(buf) = data_buf {
+                    let residual = ev.residual_transfer_length.min(len as u32) as usize;
+                    let actual = (len as usize).saturating_sub(residual);
+                    let mut out = alloc::vec::Vec::with_capacity(actual);
+                    for i in 0..actual {
+                        // SAFETY: buf was allocated with `len` bytes, i < actual <= len.
+                        let byte = unsafe { core::ptr::read_volatile(buf.user_ptr().add(i)) };
+                        out.push(byte);
+                    }
+                    Some(out)
+                } else {
+                    Some(alloc::vec::Vec::new())
+                }
+            }
+            Some(ev) => {
+                write_str(STDOUT_FILENO, "[xhci] ctrl-xfer: completion code ");
+                crate::write_u8_dec(ev.completion_code);
+                write_str(STDOUT_FILENO, "\n");
+                None
+            }
+            None => {
+                write_str(STDOUT_FILENO, "[xhci] ctrl-xfer: no transfer event\n");
+                None
+            }
+        }
+    }
+
+    /// Block for a Transfer Event targeting `slot_id` / `endpoint_id` (DCI).
+    /// Returns the first matching event or `None` after a bounded number of
+    /// IRQ wakes without a match.
+    fn wait_for_transfer_event(
+        &mut self,
+        irq: &IrqNotification,
+        slot_id: u8,
+        endpoint_id: u8,
+    ) -> Option<trb::TransferEvent> {
+        // Bound the wait: after TRANSFER_WAIT_WAKES IRQ wakes without our
+        // event we give up and return None. This prevents infinite blocking if
+        // the controller misbehaves.
+        const TRANSFER_WAIT_WAKES: u32 = 128;
+        let mut wakes = 0u32;
+        loop {
+            let bits = irq.wait();
+            if bits == 0 {
+                wakes += 1;
+                if wakes >= TRANSFER_WAIT_WAKES {
+                    return None;
+                }
+                continue;
+            }
+            if let Some(ev) = self.drain_for_transfer_event(slot_id, endpoint_id) {
+                let erdp =
+                    self.event_ring_iova + (self.consumer.index as u64) * trb::TRB_SIZE as u64;
+                self.rt_write_u64(rt_reg::ERDP, erdp | ERDP_EHB);
+                self.rt_write_u32(rt_reg::IMAN, IMAN_IP | IMAN_IE);
+                let _ = irq.ack(bits);
+                return Some(ev);
+            }
+            let erdp = self.event_ring_iova + (self.consumer.index as u64) * trb::TRB_SIZE as u64;
+            self.rt_write_u64(rt_reg::ERDP, erdp | ERDP_EHB);
+            self.rt_write_u32(rt_reg::IMAN, IMAN_IP | IMAN_IE);
+            let _ = irq.ack(bits);
+            wakes += 1;
+            if wakes >= TRANSFER_WAIT_WAKES {
+                return None;
+            }
+        }
+    }
+
+    /// Drain the event ring looking for a Transfer Event for `slot_id` /
+    /// `endpoint_id`. Returns the last matching event, consuming all
+    /// produced events up to and including it.
+    fn drain_for_transfer_event(
+        &mut self,
+        slot_id: u8,
+        endpoint_id: u8,
+    ) -> Option<trb::TransferEvent> {
+        let mut found: Option<trb::TransferEvent> = None;
+        loop {
+            let seg = self.event_ring.as_ref().expect("event ring allocated");
+            let candidate = read_trb(seg, self.consumer.index);
+            if !self.consumer.owns(&candidate) {
+                break;
+            }
+            match trb::event_trb_type(&candidate) {
+                Some(trb::TrbType::TransferEvent) => {
+                    let ev = trb::parse_transfer_event(&candidate);
+                    if ev.slot_id == slot_id && ev.endpoint_id == endpoint_id {
+                        found = Some(ev);
+                    }
+                }
+                Some(trb::TrbType::CommandCompletion) => {
+                    let ev = trb::parse_command_completion(&candidate);
+                    self.on_command_completion(ev);
+                }
+                Some(trb::TrbType::PortStatusChange) => {
+                    let ev = trb::parse_port_status_change(&candidate);
+                    self.on_port_status_change(ev);
+                }
+                _ => {}
+            }
+            self.consumer.dequeue_step();
+        }
+        found
+    }
+
+    // -- 78b: per-slot context management ----------------------------------
+
+    /// Allocate per-slot DMA: Output Device Context + EP0 transfer ring +
+    /// Input Context. Install the Output Device Context IOVA into DCBAA[slot].
+    pub fn alloc_slot_context(&mut self, slot_id: u8) -> Result<(), BringUpError> {
+        let entry_size = self.context_size;
+        let device_ctx_bytes = DEVICE_CONTEXT_ENTRIES * entry_size;
+        let input_ctx_bytes = INPUT_CONTEXT_ENTRIES * entry_size;
+
+        // Output Device Context
+        let output_ctx = DmaBuffer::<u8>::allocate(&self.handle, device_ctx_bytes, XHCI_ALIGN)
+            .map_err(|_| BringUpError::DmaAlloc)?;
+        zero_dma(&output_ctx);
+
+        // Install into DCBAA[slot_id]
+        let dcbaa = self.dcbaa.as_ref().expect("DCBAA allocated");
+        write_u64_at(dcbaa, slot_id as usize * 8, output_ctx.iova());
+
+        // EP0 transfer ring
+        let ep0_ring = DmaBuffer::<u8>::allocate(&self.handle, RING_BYTES, XHCI_ALIGN)
+            .map_err(|_| BringUpError::DmaAlloc)?;
+        zero_dma(&ep0_ring);
+        let ep0_ring_iova = ep0_ring.iova();
+        let ep0_producer = trb::ProducerRing::new(RING_TRBS);
+        // Install trailing Link TRB on the EP0 ring.
+        write_trb(
+            &ep0_ring,
+            ep0_producer.link_index(),
+            trb::Trb::link(ep0_ring_iova, true, false),
+        );
+
+        // Input Context
+        let input_ctx = DmaBuffer::<u8>::allocate(&self.handle, input_ctx_bytes, XHCI_ALIGN)
+            .map_err(|_| BringUpError::DmaAlloc)?;
+        zero_dma(&input_ctx);
+
+        self.slot_ctx = Some(SlotContext {
+            output_ctx,
+            ep0_ring,
+            ep0_producer,
+            ep0_ring_iova,
+            input_ctx,
+            ep_rings: alloc::vec::Vec::new(),
+        });
+        Ok(())
+    }
+
+    /// Write a snapshot into the Input Context DMA buffer and return the IOVA.
+    /// Layout (xHCI §6.2.5):
+    ///   [0]            = Input Control Context (Add Flags at dword1, Drop at dword0=0)
+    ///   [entry_size]   = Slot Context (dword0, dword1)
+    ///   [(1+dci)*es]   = Endpoint Context for each DCI
+    pub fn write_input_context(
+        &mut self,
+        snap: &kernel_core::usb::enumerate::InputContextSnapshot,
+    ) -> u64 {
+        let entry_size = self.context_size;
+        let sc = self.slot_ctx.as_mut().expect("slot context allocated");
+        zero_dma(&sc.input_ctx);
+
+        // Input Control Context: Drop Flags (dword0) = 0, Add Flags (dword1).
+        let icc_base = input_control_offset();
+        write_u32_at(&sc.input_ctx, icc_base, 0); // drop flags
+        write_u32_at(&sc.input_ctx, icc_base + 4, snap.add_flags); // add flags
+
+        // Slot Context dwords 0 and 1.
+        let slot_base = input_slot_offset(entry_size);
+        write_u32_at(&sc.input_ctx, slot_base, snap.slot_dword0);
+        write_u32_at(&sc.input_ctx, slot_base + 4, snap.slot_dword1);
+
+        // EP0 Context (DCI=1): dword1 at ep_base+4, dequeue ptr at dwords 2-3.
+        let ep0_base = input_endpoint_offset(1, entry_size);
+        write_u32_at(&sc.input_ctx, ep0_base + 4, snap.ep0_dword1);
+        write_u64_at(&sc.input_ctx, ep0_base + 8, snap.ep0_dequeue_ptr);
+        // EP0 Average TRB Length (dword4, bits 15:0) = 8 — the conventional
+        // value for the default control endpoint (xHCI 1.2 §6.2.3.2 /
+        // §4.14.1.1 recommend a non-zero estimate). qemu-xhci tolerates 0, but
+        // real controllers use it for bandwidth/scheduling estimation.
+        write_u32_at(&sc.input_ctx, ep0_base + 16, 8);
+
+        // Additional endpoint contexts (interrupt/bulk/etc.).
+        for ep_snap in &snap.endpoint_contexts {
+            let ep_base = input_endpoint_offset(ep_snap.dci, entry_size);
+            write_u32_at(&sc.input_ctx, ep_base, ep_snap.ep_dword0);
+            write_u32_at(&sc.input_ctx, ep_base + 4, ep_snap.ep_dword1);
+            write_u64_at(&sc.input_ctx, ep_base + 8, ep_snap.ep_dequeue_ptr);
+            // dword4: Average TRB Length (bits 15:0) = MPS, Max ESIT Payload
+            // (bits 31:16) = MPS. For FS/HS interrupt endpoints the controller
+            // uses these values for scheduling; setting them to the MPS is the
+            // correct value (one full packet per service interval).
+            // MPS lives at bits 31:16 of ep_dword1.
+            let mps = (ep_snap.ep_dword1 >> 16) as u16;
+            let dword4 = (mps as u32) | ((mps as u32) << 16);
+            write_u32_at(&sc.input_ctx, ep_base + 16, dword4);
+        }
+
+        sc.input_ctx.iova()
+    }
+
+    /// Return the IOVA of the EP0 transfer ring for the current slot (after
+    /// `alloc_slot_context`). Used by `program_main` to seed `EnumContext`.
+    pub fn ep0_ring_iova(&self) -> u64 {
+        self.slot_ctx
+            .as_ref()
+            .expect("slot context allocated")
+            .ep0_ring_iova
+    }
+
+    /// Return the current producer cycle bit — consumed by `enumerate.rs`
+    /// before building each command TRB.
+    pub fn producer_cycle(&self) -> bool {
+        self.producer.cycle
+    }
+
+    /// Allocate a transfer ring for an interrupt endpoint (DCI != 1) and
+    /// return its IOVA with DCS=1 ORed in. Used by `configure_endpoint` in
+    /// `enumerate.rs` to replace the placeholder IOVA of 0 that the
+    /// enumeration state machine puts in `EndpointContextSnapshot.ep_dequeue_ptr`.
+    ///
+    /// The ring is kept alive for the controller's lifetime (stored in the
+    /// `slot_ctx`'s `ep_rings` Vec). Repeated calls for the same DCI append
+    /// additional rings; the caller should call this once per endpoint.
+    pub fn alloc_interrupt_ep_ring(&mut self) -> Result<u64, BringUpError> {
+        let ring = DmaBuffer::<u8>::allocate(&self.handle, RING_BYTES, XHCI_ALIGN)
+            .map_err(|_| BringUpError::DmaAlloc)?;
+        zero_dma(&ring);
+        let iova = ring.iova();
+        // Install trailing Link TRB.
+        let producer = trb::ProducerRing::new(RING_TRBS);
+        write_trb(
+            &ring,
+            producer.link_index(),
+            trb::Trb::link(iova, true, false),
+        );
+
+        // Store the ring to keep it alive.
+        let sc = self.slot_ctx.as_mut().expect("slot context allocated");
+        sc.ep_rings.push(ring);
+
+        // Return IOVA | DCS (DCS=1 means initial cycle state = true).
+        Ok(iova | 1)
+    }
+
+    // -- A.6: single-threaded drain-on-wake event loop ---------------------
 
     /// The load-bearing milestone: a real `Enable Slot` Command Completion
     /// delivered off the event ring **by interrupt**. Emitted exactly once.
@@ -589,7 +1120,10 @@ impl Controller {
     /// serviced by the Port Status Change path in the event loop. Real xHCI
     /// drivers perform this initial sweep because a device present across the
     /// `HCRST` is not guaranteed to re-post a connect change afterwards.
-    pub fn scan_ports(&self) {
+    ///
+    /// Returns `(port_num, speed)` for the first connected port, or `None`.
+    pub fn scan_ports(&self) -> Option<(u8, port::PortSpeed)> {
+        let mut found: Option<(u8, port::PortSpeed)> = None;
         for portnum in 1..=self.max_ports {
             let off = self.portsc(portnum);
             let mut raw = self.op_u32(off);
@@ -597,49 +1131,46 @@ impl Controller {
             // xHCI with software-controlled power `PORTSC.PP` can default to 0,
             // and CCS/CSC are not meaningful until it is set. qemu-xhci powers
             // ports automatically (PP defaults to 1), so this is a no-op there.
-            // (Real-hardware connect debounce after a fresh power-on needs a
-            // timer and lands with 78b enumeration.)
             if !port::Portsc(raw).pp() {
                 let powered = port::portsc_write_preserving(raw, port::PORTSC_PP);
                 self.op_write_u32(off, powered);
                 raw = self.op_u32(off);
             }
             if port::Portsc(raw).ccs() {
-                self.reset_port(portnum);
+                if let Some(speed) = self.reset_port_with_speed(portnum) {
+                    if found.is_none() {
+                        found = Some((portnum, speed));
+                    }
+                }
             }
         }
+        found
     }
 
-    /// A.7 port reset + speed detection (RW1C-safe). USB2 ports get an
-    /// explicit `PR`; USB3 ports reach Enabled via controller-driven training.
-    /// On success the connect-status change (`CSC`) is RW1C-cleared so the
-    /// event-loop's Port Status Change handler does not redundantly re-reset
-    /// the same port.
-    fn reset_port(&self, port_num: u8) {
+    /// A.7 port reset + speed detection (RW1C-safe). Returns the detected
+    /// `PortSpeed` on success or `None` if the port did not reach Enabled.
+    fn reset_port_with_speed(&self, port_num: u8) -> Option<port::PortSpeed> {
         let off = self.portsc(port_num);
         let raw = self.op_u32(off);
         let p = port::Portsc(raw);
-        // USB3 ports train to Enabled without a software PR — they already
-        // report a valid speed and PED.
+        // USB3 ports train to Enabled without a software PR.
         if p.ped()
             && let Some(speed) = port::port_speed_from_psi(p.port_speed())
         {
-            let _mps = port::ep0_max_packet_for_speed(speed);
             self.op_write_u32(
                 off,
                 port::portsc_clear_change(self.op_u32(off), port::PORTSC_CSC),
             );
             self.report_port_enabled(port_num, speed);
-            return;
+            return Some(speed);
         }
-        // USB2: issue a Port Reset preserving the RW1C change bits, then wait
-        // for PRC, clear PRC + CSC, and confirm PED before decoding speed.
+        // USB2: issue a Port Reset, wait for PRC.
         let pr = port::portsc_write_preserving(raw, port::PORTSC_PR);
         self.op_write_u32(off, pr);
         let mut budget = POLL_BUDGET;
         while self.op_u32(off) & port::PORTSC_PRC == 0 {
             if budget == 0 {
-                return;
+                return None;
             }
             budget -= 1;
         }
@@ -651,7 +1182,14 @@ impl Controller {
             && let Some(speed) = port::port_speed_from_psi(final_p.port_speed())
         {
             self.report_port_enabled(port_num, speed);
+            return Some(speed);
         }
+        None
+    }
+
+    /// A.7 port reset (legacy path kept for the Port Status Change handler).
+    fn reset_port(&self, port_num: u8) {
+        self.reset_port_with_speed(port_num);
     }
 
     fn report_port_enabled(&self, port_num: u8, speed: port::PortSpeed) {
@@ -680,7 +1218,7 @@ fn zero_dma(buf: &DmaBuffer<u8>) {
     unsafe { core::ptr::write_bytes(buf.user_ptr(), 0, buf.len()) };
 }
 
-fn write_trb(buf: &DmaBuffer<u8>, index: usize, value: trb::Trb) {
+pub(crate) fn write_trb(buf: &DmaBuffer<u8>, index: usize, value: trb::Trb) {
     debug_assert!((index + 1) * trb::TRB_SIZE <= buf.len());
     // SAFETY: index is bounds-checked above; the pointer is 64-byte aligned
     // (allocation alignment) so a 16-byte `Trb` write is well-aligned.
@@ -702,7 +1240,7 @@ fn write_u64_at(buf: &DmaBuffer<u8>, byte_off: usize, val: u64) {
     unsafe { core::ptr::write_volatile(ptr, val) };
 }
 
-fn write_u32_at(buf: &DmaBuffer<u8>, byte_off: usize, val: u32) {
+pub(crate) fn write_u32_at(buf: &DmaBuffer<u8>, byte_off: usize, val: u32) {
     debug_assert!(byte_off + 4 <= buf.len());
     // SAFETY: bounds-checked; 64-byte allocation alignment covers 4-byte access.
     let ptr = unsafe { buf.user_ptr().add(byte_off) } as *mut u32;

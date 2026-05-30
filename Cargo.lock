@@ -1057,7 +1057,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.78.0"
+version = "0.78.1"
 dependencies = [
  "bootloader_api",
  "kernel-core",
@@ -2278,6 +2278,22 @@ name = "unix-socket-test"
 version = "0.1.0"
 dependencies = [
  "syscall-lib",
+]
+
+[[package]]
+name = "usb-core"
+version = "0.78.2"
+dependencies = [
+ "kernel-core",
+]
+
+[[package]]
+name = "usbhub"
+version = "0.78.2"
+dependencies = [
+ "kernel-core",
+ "syscall-lib",
+ "usb-core",
 ]
 
 [[package]]

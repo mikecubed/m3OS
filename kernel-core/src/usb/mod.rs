@@ -6,4 +6,7 @@
 //! DMA, no kernel dependencies beyond `core`/`alloc`. Host-testable via
 //! `cargo test -p kernel-core --target x86_64-unknown-linux-gnu usb::`.
 
+pub mod descriptor;
+pub mod enumerate;
+pub mod hub;
 pub mod xhci;

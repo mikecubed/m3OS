@@ -1,6 +1,6 @@
 # Phase 78b - USB Host Foundation: Enumeration + Hub
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-78b
 **Depends on:** Phase 78a (xHCI Host-Controller Bring-Up), Phase 74 (IPC Capability Grants / page-grant bulk transport) ✅, Phase 67 (IOMMU Substrate Completion) ✅
 **Builds on:** Second sub-phase of the [Phase 78](./78-usb-host-foundation.md) USB theme. Takes the live xHCI controller from [78a](./78a-xhci-host-bringup.md) and makes it discover devices: a host-testable USB core (descriptor parsing + the enumeration state machine), a hub class driver, the host↔class IPC protocol crate, and the multi-controller PCI class enumeration the dev laptop needs. Sub-phase 78c adds the HID class driver and input integration on top.
