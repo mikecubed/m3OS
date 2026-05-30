@@ -201,6 +201,19 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
 /// The runner buffers are leaked to obtain `'static` references, which allows
 /// spawning tasks that share the `Rc<Mutex<Runner>>`. This is acceptable
 /// because each session runs in a forked child process that exits when done.
+/// Decode a `waitpid` status into the exit code to report to the SSH client:
+/// `WEXITSTATUS` for a normal exit, `128 + signal` (shell convention) for a
+/// signalled exit. The kernel encodes a normal exit as `(code & 0xff) << 8` and
+/// a terminating signal in the low 7 bits, so an `exit 3` from the remote shell
+/// is reflected as SSH exit-status 3 instead of the previous always-0.
+fn decode_wait_status(status: i32) -> i32 {
+    if status & 0x7f == 0 {
+        (status >> 8) & 0xff
+    } else {
+        128 + (status & 0x7f)
+    }
+}
+
 async fn async_session(sock_fd: i32, host_key: &HostKey) -> i32 {
     // Allocate runner buffers and leak them for 'static lifetime.
     // The forked child process exits after this function, so the leak is benign.
@@ -253,6 +266,10 @@ async fn async_session(sock_fd: i32, host_key: &HostKey) -> i32 {
             let ret = waitpid(pid as i32, &mut status, WNOHANG);
             if ret > 0 {
                 log_sshd_step_u64("async_session:shell exited", "child_pid", pid as u64);
+                // Record the shell's real exit code (a flush failure below may
+                // still override it with 1 — a transport problem is reported as
+                // a generic error).
+                state.borrow_mut().exit_code = decode_wait_status(status);
                 // Shell exited — drain remaining PTY output, then stop.
                 let pty_master = state.borrow().pty_master;
                 let has_chan = chan.borrow().is_some();
@@ -370,6 +387,7 @@ async fn io_task(
             let ret = syscall_lib::waitpid(pid as i32, &mut status, WNOHANG);
             if ret > 0 {
                 log_sshd_step_u64("io_task:shell_exited_backstop", "child_pid", pid as u64);
+                state.borrow_mut().exit_code = decode_wait_status(status);
                 state.borrow_mut().session_done = true;
                 state.borrow_mut().shell_pid = None;
                 session_notify.signal();
@@ -586,6 +604,7 @@ async fn progress_task(
             let ret = syscall_lib::waitpid(pid as i32, &mut status, WNOHANG);
             if ret > 0 {
                 log_sshd_step_u64("progress:shell_exited_backstop", "child_pid", pid as u64);
+                state.borrow_mut().exit_code = decode_wait_status(status);
                 state.borrow_mut().session_done = true;
                 state.borrow_mut().shell_pid = None;
                 session_notify.signal();
@@ -1057,6 +1076,7 @@ async fn channel_relay_task(
                     "child_pid",
                     pid as u64,
                 );
+                state.borrow_mut().exit_code = decode_wait_status(status);
                 let _ = flush_output_locked(&runner, sock_fd, &output_lock).await;
                 state.borrow_mut().session_done = true;
                 state.borrow_mut().shell_pid = None;
