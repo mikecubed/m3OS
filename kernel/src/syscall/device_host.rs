@@ -3329,6 +3329,108 @@ pub fn sys_device_pio_write(
     0
 }
 
+// ---------------------------------------------------------------------------
+// Phase 78b Track C.1 — `sys_device_pci_enumerate`
+// ---------------------------------------------------------------------------
+//
+// Signature:
+//   sys_device_pci_enumerate(class, subclass, prog_if, out_user_ptr, max_entries) -> isize
+//
+// Authorization: same gate as `sys_device_claim` — caller's exec_path must
+// start with `/drivers/`.
+//
+// ABI (see `kernel_core::device_host::syscalls::SYS_DEVICE_PCI_ENUMERATE`
+// for the full register map and BDF packing format).
+//
+// Implementation strategy:
+//   1. Verify caller is an authorized driver process.
+//   2. Snapshot and filter PCI devices via `pci::pci_enumerate_by_class`,
+//      which calls the pure host-tested `collect_matching_bdfs` internally.
+//   3. Copy the packed BDF slice into the caller's buffer using the same
+//      `UserSliceWo` / kernel-virt fallback as `copy_dma_handle_out`.
+//   4. Return the total match count (may exceed `max_entries` — caller
+//      detects truncation by comparing return value to `max_entries`).
+
+/// Enumerate PCI devices matching `(class, subclass, prog_if)` and write
+/// their packed BDFs to the caller-supplied user buffer.
+///
+/// Returns the total match count as a non-negative `isize`, or a negative
+/// errno:
+///
+/// - `NEG_EACCES` — caller is not an authorized driver process.
+/// - `NEG_ESRCH`  — called from kernel task context (PID 0).
+/// - `NEG_EFAULT` — `out_user_ptr` is invalid or the copy-out failed.
+///
+/// See [`kernel_core::device_host::syscalls::SYS_DEVICE_PCI_ENUMERATE`] for
+/// the full ABI documentation.
+pub fn sys_device_pci_enumerate(
+    class: u8,
+    subclass: u8,
+    prog_if: u8,
+    out_user_ptr: usize,
+    max_entries: usize,
+) -> isize {
+    let pid = crate::process::current_pid();
+    if pid == 0 {
+        // Kernel-context callers must use `pci_enumerate_by_class` directly.
+        return NEG_ESRCH;
+    }
+
+    // Authorization gate — same policy as `sys_device_claim`.
+    if !is_authorized_driver_process(pid) {
+        return NEG_EACCES;
+    }
+
+    // Collect matches into a stack-allocated buffer.  MAX_PCI_DEVICES = 64,
+    // so 64 × 4 = 256 bytes on the stack — well within kernel-stack budget.
+    const BUF_CAP: usize = 64;
+    let buf_len = max_entries.min(BUF_CAP);
+    let mut bdf_buf = [0u32; BUF_CAP];
+
+    let total =
+        crate::pci::pci_enumerate_by_class(class, subclass, prog_if, &mut bdf_buf[..buf_len]);
+
+    // Number of entries to copy to user: the lesser of what we collected
+    // and what the caller asked for.
+    let to_copy = total.min(buf_len);
+
+    if to_copy > 0 {
+        // Serialize the u32 entries to a byte slice for the copy-out path.
+        // Each u32 is little-endian; the kernel's native endian is LE on
+        // x86_64.  We reinterpret the u32 slice as bytes in-place.
+        let byte_len = to_copy * core::mem::size_of::<u32>();
+        // SAFETY: bdf_buf is [u32; 64] on the stack, fully initialized for
+        // indices [0..buf_len].  `to_copy <= buf_len`, so the slice is valid.
+        let bytes = unsafe { core::slice::from_raw_parts(bdf_buf.as_ptr() as *const u8, byte_len) };
+
+        // Use the same copy-out helper strategy as `copy_dma_handle_out`:
+        // UserSliceWo for canonical user-space addresses, direct write for
+        // kernel-virt addresses (test path).
+        let dst_u64 = out_user_ptr as u64;
+        let copy_result = if dst_u64 < 0x0000_8000_0000_0000 {
+            // User-space address — walk page tables.
+            crate::mm::user_mem::UserSliceWo::new(dst_u64, byte_len)
+                .and_then(|s| s.copy_from_kernel(bytes))
+        } else {
+            // Kernel-virt address — direct write (test path only).
+            // SAFETY: dst is a kernel-virt address inside the phys-offset
+            // window; the syscall dispatcher validated that max_entries fits.
+            unsafe {
+                core::ptr::copy_nonoverlapping(bytes.as_ptr(), out_user_ptr as *mut u8, byte_len);
+            }
+            Ok(())
+        };
+
+        if copy_result.is_err() {
+            return NEG_EFAULT;
+        }
+    }
+
+    // Return the total count, which may be larger than what was written if
+    // the buffer was too small (caller detects truncation).
+    total as isize
+}
+
 fn device_claim_error_to_errno(
     error: DeviceHostError,
     segment: u16,

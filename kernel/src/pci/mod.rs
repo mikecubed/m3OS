@@ -838,6 +838,62 @@ pub fn pci_device(index: usize) -> Option<PciDevice> {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 78b Track C.1 — class-based enumeration (sys_device_pci_enumerate)
+// ---------------------------------------------------------------------------
+
+/// Snapshot every discovered PCI device, filter by `(class, subclass, prog_if)`,
+/// and write matching BDFs as packed `u32` entries into `out`.
+///
+/// Returns the **total** match count regardless of buffer capacity — the
+/// caller can use this to detect truncation and retry with a larger buffer.
+///
+/// The lock on `PCI_DEVICES` is held only for the snapshot loop; once the
+/// devices are projected into `kernel_core::device_host::pci_enum::PciDeviceInfo`
+/// values the lock is released before calling `collect_matching_bdfs`.
+///
+/// This function is `no_std` and allocation-free. The caller (the syscall
+/// handler) provides the output slice; the syscall handler is responsible for
+/// writing it to user address space afterwards.
+///
+/// BDF packing format — each `u32`:
+///
+/// ```text
+/// bits [31:20] — PCI segment (always 0 on current platforms)
+/// bits [19:12] — bus number
+/// bits [11: 5] — device number
+/// bits [ 4: 2] — function number
+/// bits [  1:0] — reserved (always 0)
+/// ```
+pub fn pci_enumerate_by_class(class: u8, subclass: u8, prog_if: u8, out: &mut [u32]) -> usize {
+    use kernel_core::device_host::pci_enum::{PciDeviceInfo, collect_matching_bdfs};
+
+    // Snapshot the device list while holding the lock so a concurrent scan
+    // cannot race us. MAX_PCI_DEVICES = 64; stack allocation is safe here.
+    const MAX: usize = MAX_PCI_DEVICES;
+    let mut snapshot = [PciDeviceInfo::new(0, 0, 0, 0, 0, 0, 0); MAX];
+    let count = {
+        let list = PCI_DEVICES.lock();
+        let n = list.count.min(MAX);
+        for (slot, entry) in snapshot.iter_mut().zip(list.devices[..n].iter()) {
+            if let Some(dev) = entry {
+                *slot = PciDeviceInfo::new(
+                    0, // segment always 0 on current platforms
+                    dev.bus,
+                    dev.device,
+                    dev.function,
+                    dev.class_code,
+                    dev.subclass,
+                    dev.prog_if,
+                );
+            }
+        }
+        n
+    };
+    // Lock is dropped here. Call pure filter logic with the snapshot.
+    collect_matching_bdfs(&snapshot[..count], class, subclass, prog_if, out)
+}
+
+// ---------------------------------------------------------------------------
 // Device probing (P15-T037)
 // ---------------------------------------------------------------------------
 
