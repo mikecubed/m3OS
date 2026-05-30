@@ -2,9 +2,11 @@
 
 **Status:** Planned
 **Source Ref:** phase-78
-**Depends on:** Phase 55b (Ring-3 Driver Hosting) ✅, Phase 55c (Ring-3 Driver Correctness Closure) ✅, Phase 67 (IOMMU Substrate) ✅
+**Depends on:** Phase 55b (Ring-3 Driver Host) ✅, Phase 55c (Ring-3 Driver Correctness Closure) ✅, Phase 67 (IOMMU Substrate Completion) ✅, Phase 56 (Display and Input Architecture) ✅, Phase 74 (IPC Capability Grants / page-grant bulk transport) ✅
 **Builds on:** Extends the Phase 55b/55c ring-3 driver-host substrate with the first USB stack the project ships — a userspace xHCI host driver, a minimal USB core, and a HID class driver capable of presenting at least one keyboard and one mouse as the same `kbd_server` / `mouse_server` clients Phase 56 already feeds
-**Primary Components:** `userspace/drivers/xhci/` (new), `userspace/drivers/usb-core/` (new), `userspace/drivers/usb-hid/` (new), `kernel/src/arch/x86_64/syscall/mod.rs` (USB-IRQ wiring through existing Phase 55b device-host primitives), `kernel-core/src/usb/` (host-testable framing logic), `kernel-core/src/iommu/` (BAR + DMA buffer wiring)
+**Primary Components:** `userspace/drivers/xhci/` (new), `userspace/lib/usb-core/` (new, shared lib re-exporting `kernel-core/src/usb/`), `userspace/drivers/usbhub/` (new), `userspace/drivers/usb-hid/` (new), `kernel/src/syscall/device_host.rs` (the existing Phase 55b `sys_device_*` primitives; USB-IRQ rides `sys_device_irq_subscribe`), `kernel-core/src/usb/` (new — host-testable framing/parse/state-machine logic), `kernel/src/mm/dma.rs` + `kernel-core/src/iommu/` (existing Phase 67 `DmaBuffer<T>` + IOMMU domain wiring)
+
+> **Review note (source-verified 2026-05-30):** Before the companion task list was authored, this design doc was checked against `main` and against Redox `xhcid` / the Intel xHCI 1.2b spec / iPXE / USB-HID 1.11. Six items below drifted and are corrected in place; the full per-item record is in the [task list](./tasks/78-usb-host-foundation-tasks.md) Review note. In summary: (1) the device-host syscalls are `sys_device_claim` / `sys_device_mmio_map` / `sys_device_dma_alloc` / `sys_device_irq_subscribe` (all in `kernel/src/syscall/device_host.rs`), **not** `sys_device_pci_probe` / `iommu_map_bar` / `sys_device_irq_bind`; (2) `sys_device_claim` takes a BDF only — there is **no** class-code filter, so controller discovery is a new requirement (Track A/D); (3) ring-3 drivers must be staged under `/drivers/` via `DRIVERS_ENTRIES`, gated by `is_authorized_driver_process`; (4) the Track A scope below was missing most of the mandatory xHCI bring-up (register-region discovery, BIOS/OS handoff, `CNR` reset wait, `CONFIG.MaxSlotsEn`, DCBAA, scratchpad, Event Ring + ERST, MSI-X interrupter, context-size selection, Enable Slot / Configure Endpoint / Evaluate Context, Link + Event TRBs, cycle bit + doorbell, PORTSC reset) — now enumerated; (5) `KeyEvent`/`PointerEvent` already exist with stable 20-/37-byte codecs in `kernel-core/src/input/events.rs`; (6) HID Boot needs `SET_IDLE` and an interrupt-IN endpoint configured via Configure Endpoint and polled with Normal TRBs.
 
 ## Milestone Goal
 
@@ -28,71 +30,86 @@ xHCI is the only host-controller standard worth implementing — EHCI and UHCI a
 
 ### Track A — xHCI host controller driver (ring 3)
 
-- **A.1** — PCI probe via the Phase 55b device-host syscall surface. Filter on class code `0x0C0330` (USB xHCI).
-- **A.2** — MMIO BAR map via `iommu_map_bar`. Reset controller. Allocate Command Ring, Event Ring, and per-slot Transfer Rings using `DmaBuffer<T>`.
-- **A.3** — Implement the four TRB types needed for boot HID: Normal, Setup, Data, Status. Handle the Command Completion, Transfer, and Port Status Change events.
-- **A.4** — Port-status polling for hot-plug detection (deferred — pre-1.0 uses initial enumeration only).
+(Sub-IDs A.1–A.7 align 1:1 with the companion task list.)
 
-### Track B — USB core (ring 3)
+- **A.1** — `xhci` driver crate scaffold. Claim the controller via `sys_device_claim` (a known/sentinel BDF for `qemu-xhci`, as NVMe/e1000 do) and map BAR0 via `sys_device_mmio_map`. (Class-code discovery — there is no `sys_device_claim` class filter — is Track D.1.)
+- **A.2** — Register-region discovery: compute Operational/Runtime/Doorbell bases from `CAPLENGTH`/`RTSOFF`/`DBOFF`; decode `HCSPARAMS1`/`HCSPARAMS2`/`HCCPARAMS1` (incl. the `CSZ` 32-vs-64-byte context bit, which sizes every later context).
+- **A.3** — Bring-up sequence: BIOS/OS handoff via the `USBLEGSUP` extended capability; controller reset (`USBCMD.HCRST`, poll `USBSTS.CNR=0`) before any `CONFIG`/`DCBAAP`/`CRCR` write; set `CONFIG.MaxSlotsEn`; run the ordered init (`CONFIG`→`DCBAAP`→scratchpad→`CRCR`→`ERSTSZ`/`ERSTBA`/`ERDP`→MSI-X→**Bus Master Enable confirmed (D.2)**) and only then set `USBCMD.R/S`.
+- **A.4** — DMA structures via `DmaBuffer<T>` (IOMMU-routed, IOVA programmed into hardware): the **DCBAA** (+`DCBAAP`), the **Scratchpad Buffer Array** into `DCBAA[0]` when `HCSPARAMS2` requires it, and the Input/Slot/Endpoint contexts (sized per `CSZ`).
+- **A.5** — TRB ring machinery: the **Command Ring** (+`CRCR`, Link TRB, RCS), per-endpoint Transfer Rings, and the **Event Ring** + **ERST** (`ERSTSZ`→`ERSTBA`→`ERDP`); Normal/Setup/Data/Status/**Link** TRBs; consume the **Command Completion**, **Transfer**, and **Port Status Change** event TRBs; producer cycle bit, event-ring **consumer** cycle state + `ERDP`/`EHB`, the **DCI** doorbell formula (EP0=DCI 1, `epN = 2N + IN`; Doorbell 0 = commands).
+- **A.6** — MSI-X interrupter (`IMAN.IE`/`IMOD`) via `sys_device_irq_subscribe`, plus a **single-threaded drain-on-wake event loop** (the NVMe model — no userspace thread primitive exists) that drains the event ring on the `Notification` and wakes the matching outstanding request (no busy-poll). Legacy INTx is unreliable on xHCI — MSI-X is the supported path.
+- **A.7** — PORTSC port reset + speed detection (RW1C-safe writes; `CSC` edge vs `CCS` level); USB2 ports need an explicit `PR` write, USB3 trains automatically. Detected speed selects EP0 Max Packet Size (Low 8 / Full 8 / High 64 / **SuperSpeed 512**).
 
-- **B.1** — Generic device enumeration walker. Issue `GET_DESCRIPTOR(DEVICE)`, then `GET_DESCRIPTOR(CONFIG)` and walk interfaces.
-- **B.2** — Per-device address assignment (xHCI Slot Context). Set Configuration. Per-interface driver lookup.
-- **B.3** — Hub class support: enumerate downstream ports of every detected hub. The dev laptop has six xHCI controllers each with internal hub topology.
+### Track B — USB core (host-testable in `kernel-core`, shared via `usb-core` lib)
+
+- **B.1** — Descriptor model + parser in `kernel-core/src/usb/`: `GET_DESCRIPTOR(DEVICE)`, then `GET_DESCRIPTOR(CONFIG)` short-then-full by `wTotalLength`, walking interfaces/endpoints. Host-tested against captured blobs.
+- **B.2** — Enumeration state machine: **Enable Slot** → **Address Device** (BSR two-step for full-speed EP0 Max Packet Size) → descriptor walk → **SET_CONFIGURATION** → **Configure Endpoint** (and **Evaluate Context** to correct EP0 packet size). xHCI's Address Device replaces the raw USB `SET_ADDRESS`.
+- **B.3** — Hub class support (`bDeviceClass 0x09`): `SetPortFeature(PORT_POWER)`, reset and walk downstream ports; `PortId` topology (root-port + hub-depth + parent) for nested hubs. Runs as the `usbhub` ring-3 driver (Redox `usbhubd` model).
+- **B.4** — Host↔class IPC protocol crate (`usb-core`): descriptors/setup as IPC payloads, transfer buffers as Phase 74 page grants; a thin client API (m3OS analogue of Redox `XhciClientHandle`).
 
 ### Track C — HID class driver (ring 3)
 
-- **C.1** — Boot Protocol keyboard. 8-byte report → standard scancodes → `kbd_server` typed `KeyEvent` (already defined in Phase 56). Phase 56's input dispatch path does not change.
-- **C.2** — Boot Protocol mouse. 3-byte report → relative `dx`/`dy` + button bitfield → `mouse_server` typed `PointerEvent`.
-- **C.3** — Report Protocol skeleton (parse HID report descriptor, derive field offsets). Boot Protocol is enough for 1.0 keyboards and mice; Report Protocol unlocks touchpads, gaming mice, multi-touch displays — deferred unless time permits.
+- **C.1** — Boot Protocol keyboard. `SET_PROTOCOL(0)` + `SET_IDLE(0)`; poll the interrupt-IN endpoint (configured via Configure Endpoint) with Normal TRBs at `bInterval`; first 8 bytes of the report → HID Usage IDs → `KeyEvent` via the existing `kernel-core` 20-byte codec.
+- **C.2** — Boot Protocol mouse. First 3 bytes of the report (accept ≥3, ignore trailing wheel bytes) → relative `dx`/`dy` + button bitfield → `PointerEvent` via the existing 37-byte codec.
+- **C.3** — Inject into `kbd_server`/`mouse_server` so USB becomes an additional **producer** merged into the same pull stream `display_server` already drains — the Phase 56 dispatcher and `InputWiring` are unchanged. (This requires a bounded pending-event queue in those servers, which are synchronous pull loops today.)
+- **C.4** — Report Protocol skeleton (parse HID report descriptor, derive field offsets) — host-tested only, not wired to a device. Boot Protocol is enough for 1.0 keyboards and mice; Report Protocol unlocks touchpads, gaming mice, multi-touch displays — deferred unless time permits.
 
 ### Track D — Kernel-side wiring
 
-- **D.1** — Add the new IRQ vectors for xHCI controllers to `kernel/src/arch/x86_64/interrupts.rs` via the existing Phase 55b `sys_device_irq_bind` path. No new syscalls.
-- **D.2** — Add `usb-core.conf` + `xhci.conf` + `usb-hid.conf` to `kernel/initrd/etc/services.d/` so `session_manager` starts the stack on every boot.
+- **D.1** — Controller discovery. `sys_device_claim` takes a BDF only (no class filter), so a committed capability-gated `sys_device_pci_enumerate(class, subclass, prog_if)` (built on the existing in-kernel `PciMatch::ClassSubclass`) returns every class-`0x0C0330` BDF — required for the dev laptop's six controllers. The `qemu-xhci` sentinel BDF is an interim bootstrap only. IRQ delivery rides the existing `sys_device_irq_subscribe` + `register_device_irq` path — no new IRQ syscall.
+- **D.2** — PCI enablement: ensure `sys_device_claim` sets **Bus Master Enable + Memory Space** (Command reg `0x04`) for the claimed device (the ring-3 claim path does not today — only the in-kernel virtio drivers do), and that `sys_device_irq_subscribe` programs the xHCI controller's PCI MSI-X table + enable bit (not just a kernel vector).
+- **D.3** — Build/ramdisk/service wiring: stage the `xhci`/`usbhub`/`usb-hid` driver binaries under `DRIVERS_ENTRIES` (`/drivers/`, so the `is_authorized_driver_process` gate passes), add `usb-core` as a lib member, and add `xhci.conf` + `usb-core.conf` + `usb-hid.conf` to `kernel/initrd/etc/services.d/` and `init` `KNOWN_CONFIGS` so `session_manager` starts the stack (as static daemons) before `greeter`.
+- **D.4** — `usb-smoke` QMP gate (QEMU `-device qemu-xhci -device usb-kbd -device usb-mouse`): assert a real `Enable Slot` Command Completion event, then inject a QMP `send-key`, observe the resulting boot-keyboard Transfer event, and confirm the keystroke reaches the prompt — not a `[xhci] N ports detected` serial sentinel.
+
+### Track E — Documentation + release
+
+- **E.1** — Phase 78 learning doc (`docs/78-usb-host-foundation.md`).
+- **E.2** — Kernel version bump to `0.78.0` (`kernel/Cargo.toml`, `Cargo.lock`, `AGENTS.md` capability inventory, `docs/roadmap/README.md`).
 
 ## Important Components and How They Work
 
 ### TRB rings
 
-xHCI uses three kinds of ring: a single Command Ring (host → controller), a single Event Ring (controller → host) shared across slots, and one Transfer Ring per endpoint per slot. Each ring is a contiguous physical region carrying 16-byte TRBs with a producer/consumer cycle bit. DMA is the only way data crosses the ring 3 / hardware boundary — the IOMMU substrate from Phase 67 maps the rings via `iommu_map_bar` so a malicious driver cannot point DMA at arbitrary physical memory.
+xHCI uses three kinds of ring: a single Command Ring (host → controller), a single Event Ring (controller → host) shared across slots and described by an Event Ring Segment Table (ERST), and one Transfer Ring per endpoint per slot. Each ring is a contiguous region carrying 16-byte TRBs with a producer/consumer **cycle bit**; the Command and Transfer rings end in a **Link TRB** that loops to the start and toggles the cycle, while the Event Ring wraps per its ERST segment sizes and has no Link TRB. Software enqueues a TRB, then rings a **doorbell** (Doorbell 0 for the Command Ring; the slot's doorbell with the endpoint DCI for a Transfer Ring) to tell the controller there is new work. DMA is the only way data crosses the ring 3 / hardware boundary — every ring, the DCBAA, the scratchpad pages, and each device context are allocated as IOMMU-routed `DmaBuffer<T>`s (Phase 67) and the controller is programmed with their **IOVA**, so a compromised driver can only DMA into the pages its per-device VT-d/AMD-Vi domain grants. The Event Ring is the only channel by which the controller reports Command Completion, Transfer, and Port Status Change events.
 
 ### USB enumeration
 
-When a port reports Connect Status Change, the host driver issues a Reset, then a Set Address (via xHCI Address Device command), then walks the descriptor tree to discover what kind of device is attached. The HID class driver registers for `bInterfaceClass == 0x03` (HID); the hub class driver registers for `bDeviceClass == 0x09` (HUB).
+When a port reports Connect Status Change (via a Port Status Change event), the host driver resets the port (PORTSC), reads the speed, then issues **Enable Slot** to get a slot ID, allocates an Output Device Context into `DCBAA[slot]`, and runs **Address Device** (replacing the raw USB `SET_ADDRESS`; a BSR=1 pre-read first discovers full-speed EP0 Max Packet Size). It then walks the descriptor tree over EP0 control transfers — `GET_DESCRIPTOR(DEVICE)`, `GET_DESCRIPTOR(CONFIG)` short-then-full — chooses a configuration with `SET_CONFIGURATION`, and brings the interrupt-IN endpoint into the controller with **Configure Endpoint**. The HID class driver matches `bInterfaceClass == 0x03` (HID); the hub class driver matches `bDeviceClass == 0x09` (HUB).
 
 ### Boot Protocol HID parsing
 
-`SET_PROTOCOL(0)` puts a HID device into Boot Protocol. Keyboard reports become 8 bytes (1 modifier byte + 1 reserved byte + 6 scancode bytes, all USB HID Usage IDs); mouse reports become 3 bytes (1 button-bitfield byte + signed `dx` byte + signed `dy` byte). This is enough for keyboard + mouse boot input on essentially every USB HID device in existence.
+For an interface with `bInterfaceClass 0x03` / `bInterfaceSubClass 0x01` (Boot) / `bInterfaceProtocol 0x01` (keyboard) or `0x02` (mouse), the driver issues `SET_PROTOCOL(0)` (fixed boot reports, no report-descriptor parsing) and `SET_IDLE(0)` (suppress duplicate/streamed reports), then polls the interrupt-IN endpoint with Normal TRBs at the descriptor's `bInterval`. Keyboard reports are 8 bytes (1 modifier byte + 1 reserved byte + 6 keycode bytes, all USB HID Usage IDs, with a rollover code); mouse reports are 3 bytes (1 button-bitfield byte + signed `dx` byte + signed `dy` byte). The driver translates HID Usage IDs to `KeyEvent`s (and the 3-byte reports to `PointerEvent`s) and injects them into `kbd_server`/`mouse_server`, which merge them with PS/2 into the same pull stream `display_server` already drains — so the Phase 56 dispatcher is untouched. This is enough for keyboard + mouse boot input on essentially every USB HID device in existence.
 
 ## How This Builds on Earlier Phases
 
-- Reuses the Phase 55b ring-3 driver-host primitives (`sys_device_pci_probe`, `sys_device_pio_*`, `sys_device_mmio_map`, `sys_device_irq_bind`) without modification.
-- Reuses Phase 67's `iommu_map_bar` and `DmaBuffer<T>` for safe DMA.
-- Reuses Phase 56's `KeyEvent` / `PointerEvent` wire formats — `kbd_server` and `mouse_server` source from USB-HID exactly the same way they source from PS/2 today.
-- Slots into Phase 64's `session_manager` start sequence between `mouse_server` and `audio_server` so the input stack is ready before the user-facing services come up.
+- Reuses the Phase 55b ring-3 driver-host primitives (`sys_device_claim`, `sys_device_mmio_map`, `sys_device_dma_alloc`, `sys_device_irq_subscribe`, `sys_device_pio_read`/`pio_write`) without modification — the only possible new kernel surface is the Track D.1 PCI class-enumeration path for multi-controller hardware.
+- Reuses Phase 67's IOMMU-routed `DmaBuffer<T>` for safe DMA on every controller-visible structure — kernel-side `bus_address()` (`kernel/src/mm/dma.rs`) and the ring-3 `.iova()` accessor (`userspace/lib/driver_runtime/src/dma.rs`); BAR mapping is via `sys_device_mmio_map`.
+- Reuses Phase 56's `KeyEvent` / `PointerEvent` wire formats (`kernel-core/src/input/events.rs`, 20-/37-byte codecs) — `usb-hid` becomes an additional **producer** that injects into `kbd_server`/`mouse_server` exactly alongside the PS/2 stream, leaving the dispatcher unchanged.
+- Slots into the `session_manager` start sequence (`DECLARED_SESSION_STEP_NAMES`, `kernel-core/src/session_supervisor.rs:89`) so the USB input stack is ready before `greeter`; mirrors the NVMe/e1000 supervised ring-3 driver lifecycle and restart contract.
 
 ## Implementation Outline
 
-1. Bring up the xHCI driver as a standalone binary that prints `[xhci] N ports detected` on the dev laptop's QEMU emulation (`-device qemu-xhci`).
-2. Add USB core + descriptor walker; print the full enumerated tree on boot.
-3. Add hub class support so downstream devices on the laptop's six controllers come up.
-4. Add HID class with Boot Protocol; verify keystrokes from a real USB keyboard reach `kbd_server`.
+1. Bring up the `xhci` driver: claim the `qemu-xhci` controller, map BAR0, discover the register regions + capabilities, do the BIOS handoff + `HCRST`/`CNR` reset, set `CONFIG.MaxSlotsEn`, allocate DCBAA + scratchpad + command ring + event ring/ERST, wire the MSI-X interrupter, set `RUN`, and reach a first `Enable Slot` Command Completion event. Print `[xhci] N ports detected`.
+2. Add USB core + descriptor walker + the enumeration state machine (Enable Slot → Address Device BSR → descriptors → SET_CONFIGURATION → Configure Endpoint); print the full enumerated tree on boot.
+3. Add hub class (`usbhub`) so downstream devices on the laptop's six controllers come up.
+4. Add HID class with Boot Protocol (`SET_PROTOCOL(0)` + `SET_IDLE(0)` + interrupt-IN polling); verify keystrokes from a USB keyboard reach `kbd_server` and the login prompt.
 5. Add Boot Protocol mouse; verify pointer movement reaches `mouse_server`.
-6. Wire the three new services into `session_manager` and `init` `KNOWN_CONFIGS`.
-7. Bump kernel to `0.78.0` (driver-only phase, but the version cut aligns with the audit-blocker closure).
+6. Stage the drivers under `/drivers/` (`DRIVERS_ENTRIES`), wire the three new services into `session_manager` and `init` `KNOWN_CONFIGS`, and add the `usb-smoke` QMP gate.
+7. Author the learning doc and bump kernel to `0.78.0` (the version cut aligns with the audit-blocker closure).
 
 ## Acceptance Criteria
 
-- `cargo xtask run` under `qemu-xhci` emulation enumerates a virtual USB keyboard and feeds keystrokes to the m3OS login prompt.
-- A new `cargo xtask usb-smoke` gate verifies the full enumeration → HID-report → `kbd_server` chain.
-- On the dev laptop (HP OmniBook, Strix Halo): a USB keyboard plugged into any of the six xHCI controllers types into the m3OS shell.
-- `display_server`-aware: keystrokes route through the focus-aware dispatcher introduced in Phase 56 (no change to the dispatcher itself).
-- No regression in PS/2 input — both stacks coexist; PS/2 still works for QEMU's i8042 emulation.
+- `cargo xtask run` under `qemu-xhci` emulation (`-device qemu-xhci -device usb-kbd -device usb-mouse`) enumerates a virtual USB keyboard and feeds keystrokes to the m3OS login prompt.
+- A new `cargo xtask usb-smoke` gate verifies the full chain, asserting a real `Enable Slot` Command Completion event, a real boot-keyboard Transfer event, and a QMP `send-key` keystroke reaching the prompt (QMP `screendump`/serial echo) — not just a `[xhci] N ports detected` serial sentinel. Opt-in pre-push gate `M3OS_USB_REGRESSION=1`.
+- The pure-logic layer (register decoders, TRB/cycle-bit, context layouts for both `CSZ` sizes, PORTSC bits, descriptor parser, enumeration state machine, HID report/usage decoders) is host-tested in `kernel-core/src/usb/`.
+- On the dev laptop (HP OmniBook, Strix Halo): a USB keyboard plugged into any of the six xHCI controllers types into the m3OS shell (requires the Track D.1 class-enumeration path).
+- `display_server`-aware: keystrokes route through the focus-aware dispatcher introduced in Phase 56 (no change to the dispatcher or `display_server` `InputWiring` — `usb-hid` injects into `kbd_server`/`mouse_server`).
+- No regression in PS/2 input — both producers coexist; PS/2 still works for QEMU's i8042 emulation.
 - Kernel bumped to `0.78.0`.
 
 ## Companion Task List
 
-- [Phase 78 Task List](./tasks/78-usb-host-foundation-tasks.md) — to be authored when implementation planning begins.
+- [Phase 78 Task List](./tasks/78-usb-host-foundation-tasks.md) — authored 2026-05-30 (implementation-ready; source-verified against `main` + Redox `xhcid` + the xHCI 1.2b spec).
 
 ## How Real OS Implementations Differ
 
