@@ -99,6 +99,15 @@ This sets `core.hooksPath` to `.githooks/`. **pre-commit** runs `cargo xtask che
 | `doom-concurrent-smoke` | `M3OS_DOOM_CONCURRENT_REGRESSION=1` |
 | `tiling-smoke` | `M3OS_TILING_REGRESSION=1` |
 | `htop-render-probe` | `M3OS_HTOP_REGRESSION=1` |
+| `tls-smoke` PASS (not SKIP) | `M3OS_TLS_REGRESSION=1` |
+| `dns-smoke` PASS (not SKIP) | `M3OS_DNS_REGRESSION=1` |
+
+The `tls-smoke`/`dns-smoke` gates assert the musl-built smoke stage actually
+`PASS`ed rather than `SKIP`ped — a `SKIP` means the musl cross-compiler was
+absent at build time, which would otherwise let the Track C PT_TLS/pthread and
+Track D.1 DNS fixes ride **unverified**. Set them on branches touching the
+kernel clone path, `PT_TLS` loader, futex `CHILD_CLEARTID` wake, or the DNS
+resolver / `recvmsg` / ephemeral-UDP path (they require a musl cross-gcc).
 
 ## Architecture
 

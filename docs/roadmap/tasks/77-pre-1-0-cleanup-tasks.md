@@ -124,6 +124,8 @@
 - [x] Wired into the `smoke-runner` gate so `cargo xtask smoke-test` execs `/bin/tls-smoke` and asserts `SMOKE:tls-smoke:PASS`
 - [x] All four wiring points are completed (musl C binary: `build_musl_bins` entry in `xtask`, `ramdisk.rs` `BIN_ENTRIES` embedding, smoke-runner gate; no Cargo workspace member or service config needed for a C binary)
 
+> **Coverage caveat (PR #201 audit):** `tls-smoke` is a **musl-built** binary; on a host without a musl cross-compiler it is staged as a zero-byte placeholder and the smoke-runner emits `SMOKE:tls-smoke:SKIP`, so on the common no-musl dev/CI lane this load-bearing Track C fix is **not** exercised. To regression-protect it, set `M3OS_TLS_REGRESSION=1` on branches touching the clone path / `PT_TLS` loader / futex `CHILD_CLEARTID` wake: the pre-push gate then fails the push unless `SMOKE:tls-smoke:PASS` (not `SKIP`) is observed. Do not read a green default build as proof Track C still works.
+
 > **Implementation note (2026-05-28):** C.2 surfaced two latent threading bugs that made musl pthreads unusable, both fixed in this track's commit: (1) `make_fork_ctx_for_thread` zeroed the clone child's caller-saved GPRs including **r9**, but musl's `__clone` child does `call *%r9` (r9 = start fn) → every worker faulted at rip=0; (2) `do_clear_child_tid` woke only the **private** futex key `(0,addr)`, but musl's `__thread_list_lock` (the `CLONE_CHILD_CLEARTID` target) is waited as a **non-private** futex `(cr3,addr)` → the thread-list-lock release wake was lost, hanging `pthread_join` intermittently (and the Track A SSH-teardown freeze, since `sshd` reaps via pthreads). Also added the Linux-standard futex-waiter dequeue on `FUTEX_WAIT` return so stale entries can't absorb single-waiter wakes.
 
 ---
