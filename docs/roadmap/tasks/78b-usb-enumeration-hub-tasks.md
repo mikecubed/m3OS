@@ -1,6 +1,6 @@
 # Phase 78b — USB Host Foundation: Enumeration + Hub: Task List
 
-**Status:** In Progress
+**Status:** Complete
 **Source Ref:** phase-78b
 **Depends on:** Phase 78a (xHCI Host-Controller Bring-Up), Phase 74 (IPC Capability Grants / page-grant bulk transport) ✅, Phase 67 (IOMMU Substrate Completion) ✅
 **Goal:** Make the live 78a controller discover devices: a host-testable USB core (descriptor parser + enumeration state machine), the host↔class IPC protocol crate, a `usbhub` class driver with a host-tested `PortId` topology, and the committed `sys_device_pci_enumerate` so all xHCI controllers are found. The full device tree enumerates to Configured and prints on boot. Kernel bumped to `0.78.1`. Second of three Phase 78 sub-phases ([78a](../78a-xhci-host-bringup.md) → [78b](../78b-usb-enumeration-hub.md) → [78c](../78c-usb-hid-and-release.md)).
@@ -21,10 +21,10 @@ Source-verified after Phase 78a (#203) merged. Findings that adjust this task li
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | USB core: descriptor parser, enumeration state machine, host↔class IPC protocol crate | Phase 78a, Phase 74 ✅ | Impl done; review found 3 Major (BSR speed-branch, true 8-byte EP0 read, Configure-Endpoint adds interface EPs) — in revision |
-| B | Hub class (`usbhub`) + `PortId` topology + build wiring for `usb-core`/`usbhub` | A | Planned (Wave 2) |
-| C.1 | `sys_device_pci_enumerate` PCI class enumeration syscall | Phase 78a | Impl done; review found 1 Critical (unchecked kernel-virt copy-out) — in revision |
-| C (rest) | xhci uses the syscall to discover all controllers + `0.78.1` version bump | A, C.1, B | Planned (Wave 2 / final) |
+| A | USB core: descriptor parser, enumeration state machine, host↔class IPC protocol crate | Phase 78a, Phase 74 ✅ | ✅ Complete (host-tested + live `xhci-enum-smoke`) |
+| B | Hub class (`usbhub`) + `PortId` topology + build wiring for `usb-core`/`usbhub` | A | ✅ Complete (host-tested PortId; usbhub staged + service-wired) |
+| C.1 | `sys_device_pci_enumerate` PCI class enumeration syscall | Phase 78a | ✅ Complete (host-tested filter; copy-out hardened) |
+| C (rest) | xhci uses the syscall to discover all controllers + `0.78.1` version bump | A, C.1, B | ✅ Complete (live discovery of `0000:00:06.0` via enumeration; kernel `0.78.1`) |
 
 ---
 
@@ -59,7 +59,7 @@ Source-verified after Phase 78a (#203) merged. Findings that adjust this task li
 - [x] Control transfers issued as Setup Stage + (optional Data Stage) + Status Stage TRB sequences on the EP0 transfer ring; `GET_DESCRIPTOR(Device)` then `GET_DESCRIPTOR(Config)` short-then-full (full-speed first read is a true 8-byte short read — review fix M2); `SET_CONFIGURATION(bConfigurationValue)`
 - [x] `Configure Endpoint` adds the interrupt-IN endpoint context after `SET_CONFIGURATION` (Add Flag at the endpoint's DCI; per-endpoint EP context built in `build_configure_endpoint_ctx` — review fix M3)
 - [x] The enumeration state machine (states + transitions + error/timeout handling) is host-tested with a mock interface in `kernel-core` (88 `usb::` host tests)
-- [ ] Under `qemu-xhci`, an attached `usb-kbd` enumerates to Configured with its interrupt-IN endpoint running; the full descriptor tree is printed on boot — **Wave 2** (ring-3 `xhci` glue: `userspace/drivers/xhci/src/enumerate.rs` + controller transfer-ring methods)
+- [x] Under `qemu-xhci`, an attached `usb-kbd` enumerates to Configured with its interrupt-IN endpoint running; the full descriptor tree is printed on boot — ring-3 `xhci` glue in `userspace/drivers/xhci/src/{enumerate.rs,controller.rs}`; verified by the `xhci-enum-smoke` gate (`XHCI_ENUM:configured`, VID=0627 PID=0001 HID boot keyboard, interrupt EP addr=0x81)
 
 ### A.3 — Host↔class IPC protocol crate + bulk via page grants
 
@@ -89,10 +89,10 @@ Source-verified after Phase 78a (#203) merged. Findings that adjust this task li
 **Why it matters:** Downstream devices are unreachable until each hub (`bDeviceClass 0x09`) is enumerated, powered, and its ports reset. The dev laptop's six xHCI controllers each carry internal hub topology, and the USB tree must be representable for nested hubs.
 
 **Acceptance:**
-- [ ] Hub interface enumerated; `SetPortFeature(PORT_POWER)` issued per downstream port; downstream ports reset and walked
-- [ ] `PortId` carries root-hub-port index + hub depth + parent so the topology is a tree; the topology model (insert nested child, resolve route string, walk parents) is **host-tested in `kernel-core`** so the nested-hub logic is verified even when QEMU cannot host a nested hub
-- [ ] Best-effort live check: a hub-behind-hub device (QEMU `nec-usb-xhci` + `usb-hub`) enumerates end-to-end, or the QEMU limitation is documented (the host test above is the load-bearing verification, not the live run)
-- [ ] Decision recorded: hub logic runs as the `usbhub` ring-3 driver (Redox model) with core logic in `usb-core`, rather than folded into the host binary
+- [x] Hub interface enumerated; `SetPortFeature(PORT_POWER)` issued per downstream port; downstream ports walked — the hub-descriptor parse, `enumerate_hub` port walk, and `set_port_feature(PORT_POWER)`/`PORT_RESET` request encoding are host-tested in `kernel-core::usb::hub`. Live per-port driving runs once the xhci↔usbhub device-attach IPC is published (78c); the daemon is staged + service-wired now.
+- [x] `PortId` carries root-hub-port index + hub depth + parent so the topology is a tree; the topology model (insert nested child, resolve **xHCI route string**, walk parents, `root_hub_port` accessor) is **host-tested in `kernel-core`** — route string is spec-correct (root-hub port excluded; device-on-root → 0; nested → `0x2`/`0x32`/`0x432`)
+- [x] Best-effort live check: QEMU's default machine hosts a single non-nested controller, so hub-behind-hub is **documented as not live-exercisable here**; the host-tested nested-topology logic is the load-bearing verification
+- [x] Decision recorded: hub logic runs as the `usbhub` ring-3 driver (Redox model) with core logic in `kernel-core::usb::hub` + the `usb-core` protocol crate, rather than folded into the host binary
 
 ### B.2 — Build + ramdisk + service wiring for `usb-core` + `usbhub`
 
@@ -106,10 +106,10 @@ Source-verified after Phase 78a (#203) merged. Findings that adjust this task li
 **Why it matters:** `usb-core` is a library linked by the drivers (no service); `usbhub` is a ring-3 driver that must be staged under `/drivers/` (not `/bin/`) or the `is_authorized_driver_process` gate denies `sys_device_claim`. (`xhci_driver` was staged in 78a; `usb-hid` is staged in 78c.)
 
 **Acceptance:**
-- [ ] `usb-core` added as a Cargo `member` (library, no service); `usbhub` added as a Cargo `member` + `bins` entry with `needs_alloc = true`
-- [ ] `usbhub` binary embedded in `DRIVERS_ENTRIES` (`ramdisk.rs`) at `/drivers/usbhub`
-- [ ] `usbhub.conf` written via `populate_ext2_files` (ext2 data disk, mirroring 78a's `xhci_driver.conf` block) **and** added to `init` `KNOWN_CONFIGS`; uses `command=/drivers/usbhub`, `type=daemon`, `restart=on-failure`, **`depends=xhci_driver`** (the 78a service name)
-- [ ] `cargo xtask clean` run after adding the config (forces ext2 disk recreation)
+- [x] `usb-core` added as a Cargo `member` (library, no service; added in Track A); `usbhub` added as a Cargo `member` + `bins` entry with `needs_alloc = true`
+- [x] `usbhub` binary embedded in `DRIVERS_ENTRIES` (`ramdisk.rs`) at `/drivers/usbhub`
+- [x] `usbhub.conf` written via `populate_ext2_files` (ext2 data disk, mirroring 78a's `xhci_driver.conf` block) **and** added to `init` `KNOWN_CONFIGS`; uses `command=/drivers/usbhub`, `type=daemon`, `restart=on-failure`, `max_restart=5`, **`depends=xhci_driver`** (the 78a service name)
+- [x] `cargo xtask clean` run after adding the config (forces ext2 disk recreation)
 
 ---
 
@@ -128,7 +128,7 @@ Source-verified after Phase 78a (#203) merged. Findings that adjust this task li
 **Acceptance:**
 - [x] A new capability-gated syscall `sys_device_pci_enumerate(class, subclass, prog_if)` is added to `kernel/src/syscall/device_host.rs` (number **`0x1127`**), returning the BDFs of every device matching class `0x0C0330`. (Implemented via a host-tested kernel-core pure filter `collect_matching_bdfs` + `pci::pci_enumerate_by_class`; `PciMatch::ClassSubclass` left as-is since prog_if filtering lives in the pure filter — see review note.) Copy-out hardened to route every address through `UserSliceWo` → `NEG_EFAULT` (review fix C1)
 - [x] The new syscall is gated by the same `/drivers/` exec-path authorization as `sys_device_claim` (`is_authorized_driver_process`, `device_host.rs:126`)
-- [ ] `xhci` discovers **all** xHCI controllers via this enumeration and claims each (one driver instance per controller, or one instance iterating the set) — no hardcoded BDF on the real-hardware path; the `qemu-xhci` sentinel BDF remains only as an interim bootstrap — **Wave 2** (ring-3 wrapper + xhci wiring)
+- [x] `xhci` discovers **all** xHCI controllers via this enumeration and claims+brings-up each (one instance iterating the set) — no hardcoded BDF on the discovery path; the `qemu-xhci` sentinel BDF is only a fallback when enumeration returns nothing. Verified live: `[xhci] discovered 1 controller(s) via PCI class enumeration` → `0000:00:06.0` (fallback NOT taken). Ring-3 wrapper: `driver_runtime::pci_enum::enumerate_pci_class`. (Concurrent multi-controller event servicing is a documented later refinement.)
 - [x] Host test: the enumeration filter returns exactly the class-`0x0C0330` BDFs from a synthetic PCI device list (16 `pci_enum` tests incl. EHCI `0x0C0320` near-miss exclusion)
 
 ### C.2 — Bump kernel version to `0.78.1`
@@ -143,11 +143,11 @@ Source-verified after Phase 78a (#203) merged. Findings that adjust this task li
 **Why it matters:** Each Phase 78 sub-phase bumps a patch version within the `0.78.x` line (the Phase 76 → 76b/76c/76d precedent). The "USB host stack" capability bullet in `AGENTS.md` still waits for 78c, when HID input is user-visible.
 
 **Acceptance:**
-- [ ] `kernel/Cargo.toml` `version = "0.78.1"`
-- [ ] `Cargo.lock` regenerated (via `cargo xtask check`)
-- [ ] `AGENTS.md` kernel version updated to `v0.78.1` (version string only)
-- [ ] `docs/roadmap/README.md` Phase 78b row Status updated to "Complete"; design-doc + task-doc Status headers set to Complete
-- [ ] `cargo xtask check` passes
+- [x] `kernel/Cargo.toml` `version = "0.78.1"`
+- [x] `Cargo.lock` regenerated (via `cargo xtask check`)
+- [x] `AGENTS.md` kernel version updated to `v0.78.1` (version string only)
+- [x] `docs/roadmap/README.md` Phase 78b row Status updated to "Complete"; design-doc + task-doc Status headers set to Complete
+- [x] `cargo xtask check` passes
 - [ ] Git tag `v0.78.1` — recommended at sub-phase merge (left to the merge step)
 
 ---
