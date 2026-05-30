@@ -63,7 +63,9 @@ use crate::controller::{BringUpError, Controller, XhciBar0};
 #[cfg(not(test))]
 use core::alloc::Layout;
 #[cfg(not(test))]
-use driver_runtime::{DeviceCapKey, DeviceHandle, DriverRuntimeError, Mmio};
+use driver_runtime::{
+    DeviceCapKey, DeviceHandle, DriverRuntimeError, IrqNotification, Mmio, enumerate_pci_class,
+};
 #[cfg(not(test))]
 use kernel_core::device_host::DeviceHostError;
 #[cfg(not(test))]
@@ -107,12 +109,30 @@ pub const ENABLE_SLOT_OK_SENTINEL: &str = "XHCI_BRINGUP:enable-slot:OK\n";
 /// load-bearing.
 pub const XHCI_ENUM_CONFIGURED_SENTINEL: &str = "XHCI_ENUM:configured\n";
 
-/// Sentinel PCI BDF QEMU assigns to `-device qemu-xhci,addr=0x6` under m3OS
-/// (bus 0, device 6, function 0). Slot +6 is the next free slot after the
-/// net (3), nvme (4) and audio (5) family slots — see the AC'97 device
-/// comment in `xtask/src/main.rs`.
+/// Fallback PCI BDF used when `sys_device_pci_enumerate` returns no matches.
+///
+/// QEMU assigns this address to `-device qemu-xhci,addr=0x6` under m3OS
+/// (bus 0, device 6, function 0). In the normal QEMU boot the real-hardware
+/// path (`enumerate_pci_class`) discovers this controller and claims it
+/// directly — the fallback is exercised only when the enumeration syscall
+/// returns no results (e.g. on a platform that lacks xHCI or when the
+/// syscall is unavailable to the caller). This is an interim bootstrap; a
+/// future phase will remove it once `sys_device_pci_enumerate` is available
+/// on all supported platforms.
+///
+/// Slot +6 is the next free slot after the net (3), nvme (4), and audio (5)
+/// family — see the AC'97 device comment in `xtask/src/main.rs`.
 #[cfg(not(test))]
 const SENTINEL_BDF: DeviceCapKey = DeviceCapKey::new(0, 0x00, 0x06, 0);
+
+/// PCI class/subclass/prog_if triple that identifies an xHCI USB host controller.
+/// Class 0x0C = Serial Bus Controller, subclass 0x03 = USB, prog_if 0x30 = xHCI.
+#[cfg(not(test))]
+const XHCI_CLASS: u8 = 0x0C;
+#[cfg(not(test))]
+const XHCI_SUBCLASS: u8 = 0x03;
+#[cfg(not(test))]
+const XHCI_PROG_IF: u8 = 0x30;
 
 /// BAR0 length the driver asks the kernel to map. The xHCI register space
 /// (Capability + Operational + Runtime + Doorbell + the MSI-X table) fits
@@ -121,11 +141,23 @@ const SENTINEL_BDF: DeviceCapKey = DeviceCapKey::new(0, 0x00, 0x06, 0);
 #[cfg(not(test))]
 const BAR0_EXPECTED_BYTES: usize = 0x1_0000;
 
+/// Per-controller bring-up, port scan, and USB enumeration.
+///
+/// Claims `key`, maps BAR0, runs the full xHCI bring-up sequence (BIOS
+/// handoff → reset → DCBAA/scratchpad → rings → MSI-X → run), scans
+/// ports, and if a device is connected runs the full USB enumeration state
+/// machine to Configured.
+///
+/// Returns `Ok((controller, irq))` when the controller is fully up and ready
+/// for the event loop, or `Err(exit_code)` when a fatal error occurred (the
+/// caller should exit with that code).
+///
+/// The EXACT bring-up ordering from Phase 78a is preserved unchanged. Both
+/// sentinel lines (`XHCI_BRINGUP:enable-slot:OK` and `XHCI_ENUM:configured`)
+/// are emitted here, maintaining gate compatibility.
 #[cfg(not(test))]
-fn program_main(_args: &[&str]) -> i32 {
-    syscall_lib::write_str(STDOUT_FILENO, BOOT_LOG_MARKER);
-
-    let handle = match DeviceHandle::claim(SENTINEL_BDF) {
+fn bring_up_controller(key: DeviceCapKey) -> Result<(Controller, IrqNotification), i32> {
+    let handle = match DeviceHandle::claim(key) {
         Ok(h) => h,
         // The controller is not available to us. `NotClaimed` (ENODEV — QEMU
         // launched without `-device qemu-xhci`) and `AlreadyClaimed` (EBUSY —
@@ -137,13 +169,13 @@ fn program_main(_args: &[&str]) -> i32 {
         )) => {
             syscall_lib::write_str(
                 STDOUT_FILENO,
-                "xhci_driver: no qemu-xhci controller at sentinel BDF — exiting cleanly\n",
+                "xhci_driver: no controller at BDF — exiting cleanly\n",
             );
-            return 0;
+            return Err(0);
         }
         Err(_) => {
             syscall_lib::write_str(STDOUT_FILENO, "xhci_driver: device claim failed\n");
-            return 3;
+            return Err(3);
         }
     };
 
@@ -151,11 +183,14 @@ fn program_main(_args: &[&str]) -> i32 {
         Ok(m) => m,
         Err(_) => {
             syscall_lib::write_str(STDOUT_FILENO, "xhci_driver: BAR0 map failed\n");
-            return 4;
+            return Err(4);
         }
     };
 
-    syscall_lib::write_str(STDOUT_FILENO, "[xhci] claimed 0000:00:06.0\n");
+    // Log the claimed BDF (segment:bus:dev.func).
+    syscall_lib::write_str(STDOUT_FILENO, "[xhci] claimed ");
+    write_bdf(key);
+    syscall_lib::write_str(STDOUT_FILENO, "\n");
 
     // Discover the register regions + capabilities (A.2).
     let mut controller = Controller::new(handle, bar0);
@@ -171,32 +206,32 @@ fn program_main(_args: &[&str]) -> i32 {
     // interrupter → run → Enable Slot. Any stage failure exits non-zero so
     // the service manager observes it.
     if let Err(e) = controller.release_bios_ownership() {
-        return bringup_failed(e);
+        return Err(bringup_failed(e));
     }
     if let Err(e) = controller.reset() {
-        return bringup_failed(e);
+        return Err(bringup_failed(e));
     }
     controller.program_max_slots();
     if let Err(e) = controller.init_dcbaa() {
-        return bringup_failed(e);
+        return Err(bringup_failed(e));
     }
     if let Err(e) = controller.init_command_ring() {
-        return bringup_failed(e);
+        return Err(bringup_failed(e));
     }
     if let Err(e) = controller.init_event_ring() {
-        return bringup_failed(e);
+        return Err(bringup_failed(e));
     }
     let irq = match controller.init_interrupter() {
         Ok(irq) => irq,
-        Err(e) => return bringup_failed(e),
+        Err(e) => return Err(bringup_failed(e)),
     };
     if let Err(e) = controller.run() {
-        return bringup_failed(e);
+        return Err(bringup_failed(e));
     }
 
     // A.7: reset any device already connected at the root hub (e.g. a
     // `usb-kbd` present at machine creation) so its port reaches Enabled and
-    // its speed is decoded. scan_ports now returns the first connected port
+    // its speed is decoded. scan_ports returns the first connected port
     // and its speed for use in enumeration.
     let connected = controller.scan_ports();
 
@@ -265,7 +300,97 @@ fn program_main(_args: &[&str]) -> i32 {
         controller.enqueue_enable_slot();
     }
 
-    controller.event_loop(irq)
+    Ok((controller, irq))
+}
+
+#[cfg(not(test))]
+fn program_main(_args: &[&str]) -> i32 {
+    syscall_lib::write_str(STDOUT_FILENO, BOOT_LOG_MARKER);
+
+    // Step 1: discover xHCI controllers via PCI class enumeration.
+    //
+    // `enumerate_pci_class(0x0C, 0x03, 0x30)` issues `sys_device_pci_enumerate`
+    // which scans the kernel's PCI device list for controllers with class
+    // 0x0C (Serial Bus), subclass 0x03 (USB), prog_if 0x30 (xHCI). In QEMU
+    // the single `qemu-xhci` controller at 0000:00:06.0 is class 0x0C0330
+    // and will be returned in the list.
+    let discovered = enumerate_pci_class(XHCI_CLASS, XHCI_SUBCLASS, XHCI_PROG_IF)
+        .unwrap_or_else(|_| alloc::vec![]);
+
+    // Determine the ordered list of BDFs to bring up.
+    let bdf_list: alloc::vec::Vec<DeviceCapKey> = if !discovered.is_empty() {
+        // Real-hardware path: enumeration found controllers.
+        syscall_lib::write_str(STDOUT_FILENO, "[xhci] discovered ");
+        write_u8_dec(discovered.len() as u8);
+        syscall_lib::write_str(STDOUT_FILENO, " controller(s) via PCI class enumeration\n");
+        for key in &discovered {
+            syscall_lib::write_str(STDOUT_FILENO, "[xhci]  controller at ");
+            write_bdf(*key);
+            syscall_lib::write_str(STDOUT_FILENO, "\n");
+        }
+        discovered
+    } else {
+        // Fallback path: enumeration returned no results. This may happen if
+        // the syscall returned -EACCES (exec-path check failed), returned 0
+        // matches (no xHCI on this platform), or the driver was started before
+        // the PCI scan populated the kernel's device list.
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "[xhci] PCI enumeration empty — falling back to sentinel BDF 0000:00:06.0 (interim bootstrap)\n",
+        );
+        alloc::vec![SENTINEL_BDF]
+    };
+
+    // Step 2: bring up each discovered controller sequentially.
+    //
+    // Phase 78b deliverable: discover + claim + enumerate each controller.
+    // Concurrent multi-controller event servicing (multiple IRQ loops) is a
+    // later refinement — for now, bring up and enumerate all controllers, then
+    // enter the event loop on the primary (first) successfully brought-up one.
+    let mut primary: Option<(Controller, IrqNotification)> = None;
+
+    for key in bdf_list {
+        match bring_up_controller(key) {
+            Ok(pair) => {
+                if primary.is_none() {
+                    primary = Some(pair);
+                }
+                // Additional controllers are enumerated (bring_up_controller ran
+                // the full discovery + USB enumeration path) but their event
+                // loops are not started — that is the Phase 78c multi-controller
+                // IRQ multiplexing deliverable.
+            }
+            Err(0) => {
+                // Clean exit requested (no controller at BDF). For the primary
+                // slot, if no other controller succeeds we will fall through to
+                // the clean exit below.
+            }
+            Err(code) => {
+                // Hard bring-up failure on one controller. Log it but continue
+                // attempting the rest (a secondary controller failure should not
+                // prevent the primary from coming up).
+                syscall_lib::write_str(
+                    STDOUT_FILENO,
+                    "xhci_driver: controller bring-up failed, continuing\n",
+                );
+                let _ = code;
+            }
+        }
+    }
+
+    // Step 3: enter the event loop on the primary controller.
+    match primary {
+        Some((mut controller, irq)) => controller.event_loop(irq),
+        None => {
+            // No controller came up successfully. Exit cleanly so the service
+            // manager marks xhci_driver as permanently stopped.
+            syscall_lib::write_str(
+                STDOUT_FILENO,
+                "xhci_driver: no controller brought up — exiting cleanly\n",
+            );
+            0
+        }
+    }
 }
 
 /// Print the USB descriptor tree for a successfully enumerated device.
@@ -333,6 +458,29 @@ fn bringup_failed(err: BringUpError) -> i32 {
     };
     syscall_lib::write_str(STDOUT_FILENO, msg);
     code
+}
+
+/// Write a BDF in `SSSS:BB:DD.F` notation to stdout.
+///
+/// Formats `key` as the four-field PCI address `segment:bus:dev.func`
+/// zero-padded to the conventional widths (`0000:00:06.0` etc.).
+#[cfg(not(test))]
+fn write_bdf(key: DeviceCapKey) {
+    // segment — 4 hex digits
+    write_u8_hex((key.segment >> 8) as u8);
+    write_u8_hex((key.segment & 0xFF) as u8);
+    syscall_lib::write_str(STDOUT_FILENO, ":");
+    // bus — 2 hex digits
+    write_u8_hex(key.bus);
+    syscall_lib::write_str(STDOUT_FILENO, ":");
+    // device — 2 hex digits
+    write_u8_hex(key.dev);
+    syscall_lib::write_str(STDOUT_FILENO, ".");
+    // function — 1 decimal digit (0–7)
+    let f = [b'0' + (key.func & 0x7)];
+    // SAFETY: f contains only ASCII digits.
+    let s = unsafe { core::str::from_utf8_unchecked(&f) };
+    syscall_lib::write_str(STDOUT_FILENO, s);
 }
 
 /// Print `[xhci] N ports detected` without pulling in `alloc::format!`.

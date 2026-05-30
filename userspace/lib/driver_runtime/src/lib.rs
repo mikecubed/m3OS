@@ -60,6 +60,7 @@ pub mod dma;
 pub mod ipc;
 pub mod irq;
 pub mod mmio;
+pub mod pci_enum;
 pub mod pio;
 pub mod syscall_backend;
 
@@ -68,6 +69,7 @@ pub mod syscall_backend;
 pub use device::{DeviceCapKey, DeviceHandle};
 pub use dma::{DmaBuffer, DmaHandle};
 pub use mmio::{Mmio, MmioCacheMode, MmioWindowDescriptor};
+pub use pci_enum::enumerate_pci_class;
 pub use pio::Pio;
 pub use syscall_backend::SyscallBackend;
 
