@@ -1006,10 +1006,31 @@ extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
     assert_preempt_count_zero_on_return_to_user(&stack_frame);
 }
 
+/// Clear `EFLAGS.AC` on entry to an interrupt/exception handler that may have
+/// been entered from ring 3.
+///
+/// `CR4.SMAP` only blocks ring-0 access to user pages while `EFLAGS.AC == 0`,
+/// and x86 interrupt/exception **delivery does not clear AC** (unlike `IF`).
+/// Since AC is unprivileged (ring 3 can set it via `POPF`), a handler entered
+/// from a userspace task running with `AC == 1` would otherwise execute with
+/// SMAP silently non-enforcing for its whole duration — defeating the backstop
+/// SMAP is meant to provide if any handler (now or in future) accidentally
+/// dereferences a user virtual address. Clearing AC here restores enforcement;
+/// the interrupted context's AC is unaffected (it is restored by `iretq`).
+/// No-op when SMAP is not enabled — `clear_ac_for_smap` guards on `CR4.SMAP`,
+/// so this is also safe on CPUs that do not support `clac`. See PR #201 audit.
+#[inline(always)]
+fn clac_on_irq_entry() {
+    // SAFETY: `clear_ac_for_smap` only emits `clac` when `CR4.SMAP` is set
+    // (which implies SMAP is supported), so calling it is always valid.
+    unsafe { crate::arch::x86_64::cpuid::clear_ac_for_smap() };
+}
+
 extern "x86-interrupt" fn page_fault_handler(
     mut stack_frame: InterruptStackFrame,
     err: PageFaultErrorCode,
 ) {
+    clac_on_irq_entry();
     let addr = x86_64::registers::control::Cr2::read();
 
     // Check if the fault came from ring 3 (user mode).
@@ -1281,6 +1302,10 @@ extern "x86-interrupt" fn general_protection_fault_handler(
             options(nostack, preserves_flags),
         );
     }
+    // Clear AC AFTER the user-GPR capture above (a `call` would preserve the
+    // callee-saved regs being snapshotted, but keep the snapshot asm strictly
+    // first to be safe), so SMAP enforces for the rest of the handler. See M1.
+    clac_on_irq_entry();
     // Check if the fault came from ring 3.
     if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
         let pid = crate::process::current_pid();
@@ -1560,6 +1585,9 @@ unsafe fn check_and_preempt_user(frame: &mut PreemptTrapFrameUser, trigger: Pree
 /// ring 3.  `frame` points directly at the on-stack [`PreemptTrapFrameUser`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn timer_handler_user(frame: &mut PreemptTrapFrameUser) {
+    // Entered from ring 3 (the naked stub branches here only when CPL==3); clear
+    // AC so SMAP enforces while this handler runs the scheduler/IPC. See M1.
+    clac_on_irq_entry();
     bump_timer_ticks_for_current_core();
     if !USING_APIC.load(Ordering::Relaxed) || crate::smp::is_bsp() {
         TICK_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -1996,6 +2024,7 @@ fn ps2_drain_all_bytes() {
 }
 
 extern "x86-interrupt" fn keyboard_handler(stack_frame: InterruptStackFrame) {
+    clac_on_irq_entry(); // SMAP enforce in-ISR when interrupted from ring 3 (M1)
     super::ps2::IRQ1_ENTRIES.fetch_add(1, Ordering::Relaxed);
     ps2_drain_all_bytes();
 
@@ -2024,6 +2053,7 @@ extern "x86-interrupt" fn keyboard_handler(stack_frame: InterruptStackFrame) {
 /// bytes whose status byte indicates the AUX port owns them. The 8042
 /// reports this via the AUX-OUTPUT bit (status bit 5).
 extern "x86-interrupt" fn mouse_handler(stack_frame: InterruptStackFrame) {
+    clac_on_irq_entry(); // SMAP enforce in-ISR when interrupted from ring 3 (M1)
     super::ps2::IRQ12_ENTRIES.fetch_add(1, Ordering::Relaxed);
     // Both kbd and mouse bytes drain through the same helper — see the
     // doc comment on `ps2_drain_all_bytes` for why each ISR drains
@@ -2057,6 +2087,9 @@ extern "x86-interrupt" fn spurious_handler(stack_frame: InterruptStackFrame) {
 /// Phase 57d Track B — reschedule IPI handler, user (ring 3) path.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reschedule_ipi_handler_user(frame: &mut PreemptTrapFrameUser) {
+    // Entered from ring 3; clear AC so SMAP enforces in the scheduler/IPC code
+    // this handler runs. See M1.
+    clac_on_irq_entry();
     if let Some(pc) = crate::smp::try_per_core() {
         let n = pc
             .ipi_recv_log_budget
@@ -2168,6 +2201,7 @@ extern "x86-interrupt" fn cache_drain_ipi_handler(stack_frame: InterruptStackFra
 // ---------------------------------------------------------------------------
 
 extern "x86-interrupt" fn serial_handler(stack_frame: InterruptStackFrame) {
+    clac_on_irq_entry(); // SMAP enforce in-ISR when interrupted from ring 3 (M1)
     crate::serial::handle_serial_irq();
 
     if USING_APIC.load(Ordering::Relaxed) {
@@ -2323,6 +2357,10 @@ pub fn unregister_device_irq(vector: u8) {
 /// Practice Gates.
 #[inline(always)]
 fn dispatch_device_irq(vector: u8, stack_frame: &InterruptStackFrame) {
+    // A device IRQ can interrupt a userspace task running with AC=1; clear AC so
+    // SMAP enforces while the (DMA-adjacent) device handler runs. No-op when the
+    // IRQ interrupted kernel context (AC already 0). See M1.
+    clac_on_irq_entry();
     let idx = (vector - DEVICE_IRQ_VECTOR_BASE) as usize;
     DEVICE_IRQ_HITS[idx].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     // Net-RX hang trace — Stage A: a device IRQ reached the CPU. `id` is the
