@@ -172,8 +172,9 @@ fn handle_request(
         },
         // GetDescriptors / ConfigureEndpoints / SubmitTransfer are not needed by
         // the live HID-boot path (descriptors are pre-resolved into AttachNotice
-        // during enumeration; endpoints are configured at bring-up). Deferred to
-        // Phase 79 (hub child-device config) — typed ENOSYS for now.
+        // during enumeration; endpoints are configured at bring-up). Served live
+        // in Phase 90 (USB Class Expansion: hub child-device config + bulk mass
+        // storage) — typed ENOSYS for now.
         _ => UsbReply::Error { code: ENOSYS },
     }
 }
