@@ -2222,6 +2222,13 @@ fn check_pending_signals(syscall_result: u64) {
         return; // kernel task, no signals
     }
 
+    // Deliver any deferred controlling-terminal hangups (SIGHUP+SIGCONT to the
+    // foreground pgroup of a closed PTY master) from this lock-free syscall-
+    // return boundary — see process::queue_pgroup_hangup (PR #201 audit M4).
+    // Cheap no-op when nothing is queued. Runs before the per-pid dequeue below
+    // so a hangup targeting the current process is processed in the same pass.
+    crate::process::drain_pending_hangups();
+
     loop {
         let sig = crate::process::dequeue_signal(pid);
         match sig {

@@ -1384,6 +1384,67 @@ pub fn send_signal_to_group(pgid: Pid, sig: u32) {
 }
 
 // ---------------------------------------------------------------------------
+// Deferred controlling-terminal hangup (PR #201 audit M4)
+// ---------------------------------------------------------------------------
+//
+// When the last master reference of a PTY closes, POSIX requires SIGHUP (then
+// SIGCONT) be sent to the slave's foreground process group — otherwise a
+// foreground process that is NOT blocked on a tty read (a compute loop,
+// `sleep`, `pause()`, a TUI polling timers) never sees the EOF hangup and is
+// orphaned on disconnect. Delivering that signal *synchronously* from
+// `close_master` is unsafe: `close_master` runs in arbitrary teardown contexts
+// (process-exit fd cleanup, `close`/cloexec), and `send_signal_to_group` ->
+// `interrupt_ipc_waits` reaches the cross-core scheduler/IPC cancellation
+// machinery, which is what made the original synchronous broadcast deadlock
+// during SSH teardown. Instead, `close_master` *queues* the pgid here and the
+// broadcast is drained from the syscall-return signal-check boundary
+// (`drain_pending_hangups`), a context that holds no kernel locks — the same
+// safety profile as a userspace `kill()`.
+
+static PENDING_HANGUP_PGIDS: IrqSafeMutex<Vec<Pid>> = IrqSafeMutex::new(Vec::new());
+static HAS_PENDING_HANGUP: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Queue a controlling-terminal hangup (SIGHUP + SIGCONT) for foreground process
+/// group `pgid`, to be delivered from the next safe syscall-return boundary.
+/// No-op for `pgid == 0` (no foreground group bound). Safe to call from any
+/// teardown context — it only touches this module's queue, never the scheduler.
+pub fn queue_pgroup_hangup(pgid: Pid) {
+    if pgid == 0 {
+        return;
+    }
+    let mut q = PENDING_HANGUP_PGIDS.lock();
+    if !q.contains(&pgid) {
+        q.push(pgid);
+    }
+    HAS_PENDING_HANGUP.store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// Deliver any queued controlling-terminal hangups. MUST be called from a
+/// context holding no kernel locks (it acquires `PROCESS_TABLE` and may
+/// interrupt IPC waits via `send_signal_to_group`). Cheap fast-path when the
+/// queue is empty (a single relaxed-acquire load, no lock).
+pub fn drain_pending_hangups() {
+    use core::sync::atomic::Ordering;
+    if !HAS_PENDING_HANGUP.load(Ordering::Acquire) {
+        return;
+    }
+    let pgids: Vec<Pid> = {
+        let mut q = PENDING_HANGUP_PGIDS.lock();
+        // Clear the flag under the queue lock so a concurrent enqueue either
+        // lands in this drain or re-sets the flag for the next one (no loss).
+        HAS_PENDING_HANGUP.store(false, Ordering::Release);
+        core::mem::take(&mut *q)
+    };
+    for pgid in pgids {
+        // POSIX hangup order: SIGHUP, then SIGCONT so a stopped foreground job
+        // resumes to observe the HUP.
+        send_signal_to_group(pgid, SIGHUP);
+        send_signal_to_group(pgid, SIGCONT);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Signal helpers (Phase 14)
 // ---------------------------------------------------------------------------
 
