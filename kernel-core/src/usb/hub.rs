@@ -142,9 +142,12 @@ impl HubDescriptor {
         if port == 0 || port > 15 {
             return false;
         }
-        let byte_idx = ((port - 1) / 8) as usize; // bit 0 of byte 0 is port 1
-        let bit = (port - 1) % 8;
-        // DeviceRemovable[0] covers ports 1-8, [1] covers 9-15.
+        // USB 2.0 §11.23.2.1 Table 11-13: DeviceRemovable is indexed by the
+        // port number directly — bit N corresponds to port N, and bit 0 of
+        // byte 0 is RESERVED (there is no port 0). So port 1 → byte 0 bit 1,
+        // port 7 → byte 0 bit 7, port 8 → byte 1 bit 0, port 15 → byte 1 bit 7.
+        let byte_idx = (port / 8) as usize;
+        let bit = port % 8;
         if byte_idx < self.device_removable.len() {
             (self.device_removable[byte_idx] >> bit) & 1 != 0
         } else {
@@ -594,14 +597,17 @@ mod tests {
     #[test]
     fn parse_hub_descriptor_non_removable_ports() {
         // Build a descriptor with ports 1 and 3 marked non-removable.
-        // DeviceRemovable[0]: bit 0 = port 1, bit 2 = port 3 → 0b0000_0101 = 0x05.
+        // USB 2.0 §11.23.2.1: port N is at bit N (bit 0 reserved), so ports 1
+        // and 3 set bits 1 and 3 → 0b0000_1010 = 0x0A.
         let mut blob = HUB4_DESCRIPTOR_BLOB.to_vec();
-        blob[7] = 0x05;
+        blob[7] = 0x0A;
         let desc = HubDescriptor::parse(&blob).unwrap();
         assert!(desc.is_non_removable(1));
         assert!(!desc.is_non_removable(2));
         assert!(desc.is_non_removable(3));
         assert!(!desc.is_non_removable(4));
+        // Bit 0 is reserved, never a port; the no-port-0 guard returns false.
+        assert!(!desc.is_non_removable(0));
     }
 
     // -----------------------------------------------------------------------

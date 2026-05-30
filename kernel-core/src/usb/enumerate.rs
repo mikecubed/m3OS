@@ -296,21 +296,27 @@ fn build_configure_endpoint_ctx(ctx: &EnumContext) -> InputContextSnapshot {
                     _ => EP_TYPE_INTERRUPT_IN,
                 };
 
-                // Convert bInterval to xHCI Interval field.
-                // For FS/LS interrupt: xHCI Interval = floor(log2(bInterval))
-                // clamped to 0..=7, per xHCI §6.2.3.6.
-                // For HS interrupt: Interval = bInterval - 1 clamped to 0..=15.
-                // We use a simple approximation: store bInterval directly and
-                // let the production driver refine. For tests, the exact value
-                // of the interval field is not the load-bearing assertion.
+                // Convert bInterval to the xHCI Endpoint-Context Interval field
+                // (xHCI 1.2 §6.2.3.6, Table 6-12).
+                //   HS/SS: bInterval already counts 125 µs microframes as
+                //          2^(bInterval-1), so Interval = bInterval - 1,
+                //          clamped 0..=15.
+                //   FS/LS: bInterval counts 1 ms frames, but the Interval field
+                //          encodes the period as 2^Interval × 125 µs microframes.
+                //          Since 1 frame = 8 microframes = 2^3, the conversion is
+                //          Interval = 3 + floor(log2(bInterval)), clamped to the
+                //          valid FS range 3..=10 (equivalent to Linux's
+                //          `fls(8 * bInterval) - 1`).
+                // The field is only meaningful for periodic (interrupt/isoch)
+                // endpoints; the controller ignores it for control/bulk.
                 let xhci_interval = match ctx.speed {
                     Some(PortSpeed::High) | Some(PortSpeed::Super) => {
                         ep.b_interval.saturating_sub(1).min(15)
                     }
                     _ => {
-                        // For FS/LS: find floor(log2(bInterval)), clamped 0..=7.
                         let bi = ep.b_interval.max(1);
-                        (u8::BITS - bi.leading_zeros() - 1).min(7) as u8
+                        let log2 = u8::BITS - bi.leading_zeros() - 1; // floor(log2)
+                        (3 + log2).clamp(3, 10) as u8
                     }
                 };
 
@@ -549,7 +555,8 @@ pub fn run_enumeration(
 mod tests {
     use super::*;
     use crate::usb::xhci::context::{
-        EP_TYPE_CONTROL, EP_TYPE_INTERRUPT_IN, ep_max_packet_size, ep_type, slot_context_entries,
+        EP_TYPE_CONTROL, EP_TYPE_INTERRUPT_IN, ep_interval, ep_max_packet_size, ep_type,
+        slot_context_entries,
     };
     use crate::usb::xhci::trb::dci as compute_dci;
 
@@ -907,6 +914,16 @@ mod tests {
 
         // Max Packet Size must match the descriptor (8 bytes for boot keyboard).
         assert_eq!(ep_max_packet_size(ep_snap.ep_dword1), 8);
+
+        // Interval: the boot keyboard's interrupt EP has bInterval=10 (10 ms,
+        // Full speed). Per xHCI §6.2.3.6 the FS conversion is
+        // 3 + floor(log2(10)) = 3 + 3 = 6 (2^6 = 64 microframes = 8 ms), NOT
+        // floor(log2(10)) = 3. This pins the frame→microframe (+3) term.
+        assert_eq!(
+            ep_interval(ep_snap.ep_dword0),
+            6,
+            "FS interrupt bInterval=10 must encode xHCI Interval=6"
+        );
     }
 
     #[test]

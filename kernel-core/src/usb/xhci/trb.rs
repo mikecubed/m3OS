@@ -395,8 +395,10 @@ const SETUP_TRB_LENGTH: u32 = 8;
 /// `1` = IN (device-to-host), `0` = OUT (host-to-device).
 const DATA_DIR_BIT: u32 = 1 << 16;
 
-/// Mask of the TD Size field in a Data or Normal TRB status dword (bits 21:17,
-/// xHCI §6.4.1.1/1.2.2). For a single-TRB transfer the remaining TDs = 0.
+/// Mask of the TRB Transfer Length field in a Data or Normal TRB status dword
+/// (bits 16:0, xHCI §6.4.1.1/1.2.2). For a single-TRB transfer the TD Size
+/// field (bits 21:17) and Interrupter Target (bits 31:22) are left zero, so
+/// masking `len` to the low 17 bits yields TD Size = 0 as required.
 const DATA_TRB_TRANSFER_LENGTH_MASK: u32 = 0x0001_FFFF;
 
 // ---------------------------------------------------------------------------

@@ -860,8 +860,9 @@ pub fn pci_device(index: usize) -> Option<PciDevice> {
 /// ```text
 /// bits [31:20] — PCI segment (always 0 on current platforms)
 /// bits [19:12] — bus number
-/// bits [11: 5] — device number
-/// bits [ 4: 2] — function number
+/// bits [11:10] — reserved (always 0)
+/// bits [ 9: 5] — device number (5 bits)
+/// bits [ 4: 2] — function number (3 bits)
 /// bits [  1:0] — reserved (always 0)
 /// ```
 pub fn pci_enumerate_by_class(class: u8, subclass: u8, prog_if: u8, out: &mut [u32]) -> usize {

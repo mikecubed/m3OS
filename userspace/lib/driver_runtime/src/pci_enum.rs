@@ -127,9 +127,10 @@ fn unpack_bdf(packed: u32) -> (u16, u8, u8, u8) {
 /// # Errors
 ///
 /// - `DriverRuntimeError::Device(DeviceHostError::NotClaimed)` on `-EACCES`
-///   (exec-path not under `/drivers/`) or `-ESRCH` (kernel context).
-/// - `DriverRuntimeError::Device(DeviceHostError::Internal)` on `-EFAULT` or
-///   other unexpected errnos.
+///   (exec-path not under `/drivers/`).
+/// - `DriverRuntimeError::Device(DeviceHostError::Internal)` on `-ESRCH`
+///   (kernel context — unreachable from a ring-3 driver), `-EFAULT`, or any
+///   other unexpected errno.
 ///
 /// # Example
 ///

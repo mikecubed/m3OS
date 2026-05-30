@@ -818,10 +818,18 @@ impl Controller {
 
         match result {
             Some(ev) if ev.completion_code == trb::COMPLETION_SUCCESS => {
-                // Read back data from the DMA buffer. Use the actual bytes
-                // transferred: len minus residual_transfer_length, clamped to
-                // [0, len]. Descriptors are self-describing so this makes the
-                // returned slice length truthful (xHCI §4.11.3).
+                // Read back data from the DMA buffer, length = len minus the
+                // event's residual_transfer_length, clamped to [0, len].
+                //
+                // NOTE: the control TD sets IOC only on the (zero-length)
+                // Status Stage TRB and does NOT set ISP on the Data Stage TRB,
+                // so the single Transfer Event we receive reports the Status
+                // TRB's residual (always 0 on success). `actual` therefore
+                // currently equals `len` on every successful read — short-read
+                // detection is a no-op until the Data Stage TRB sets ISP and we
+                // drain its event. This is fine for 78b enumeration, where every
+                // IN control read requests the descriptor's exact length; a
+                // future caller needing true short-read accounting must add ISP.
                 if let Some(buf) = data_buf {
                     let residual = ev.residual_transfer_length.min(len as u32) as usize;
                     let actual = (len as usize).saturating_sub(residual);
@@ -1002,6 +1010,11 @@ impl Controller {
         let ep0_base = input_endpoint_offset(1, entry_size);
         write_u32_at(&sc.input_ctx, ep0_base + 4, snap.ep0_dword1);
         write_u64_at(&sc.input_ctx, ep0_base + 8, snap.ep0_dequeue_ptr);
+        // EP0 Average TRB Length (dword4, bits 15:0) = 8 — the conventional
+        // value for the default control endpoint (xHCI 1.2 §6.2.3.2 /
+        // §4.14.1.1 recommend a non-zero estimate). qemu-xhci tolerates 0, but
+        // real controllers use it for bandwidth/scheduling estimation.
+        write_u32_at(&sc.input_ctx, ep0_base + 16, 8);
 
         // Additional endpoint contexts (interrupt/bulk/etc.).
         for ep_snap in &snap.endpoint_contexts {
