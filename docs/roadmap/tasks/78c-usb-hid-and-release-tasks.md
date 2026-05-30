@@ -1,6 +1,6 @@
 # Phase 78c — USB Host Foundation: HID + Integration + Release: Task List
 
-**Status:** In Progress
+**Status:** Complete
 **Source Ref:** phase-78c
 **Depends on:** Phase 78b (USB Enumeration + Hub) ✅ merged, Phase 78a ✅ merged, Phase 56 (Display and Input Architecture) ✅, Phase 74 (IPC Capability Grants) ✅
 **Goal:** Complete the USB milestone — a USB keyboard and mouse drive m3OS. Add the `usb-hid` Boot-Protocol class driver, inject its events into the Phase 56 `kbd_server`/`mouse_server` input path (leaving the dispatcher unchanged), land the full `usb-smoke` QMP gate (keystroke → prompt), write the Phase 78 learning doc, and cut `0.78.2` with the new USB capability inventory entry. Final of three Phase 78 sub-phases ([78a](../78a-xhci-host-bringup.md) → [78b](../78b-usb-enumeration-hub.md) → [78c](../78c-usb-hid-and-release.md)).
@@ -22,13 +22,25 @@ A full source audit of the merged 78a/78b tree changed the scope of this phase. 
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A0 | **(new)** USB IPC transport: `usb-core` wire codec for `AttachNotice`/`UsbRequest`/`UsbReply`; xHCI IPC server (register `usb`, IRQ-bound `ipc_recv_msg` multiplex, device table, control + interrupt-IN serving, deferred reply); controller interrupt-IN Normal-TRB enqueue/decode | Phase 78b ✅ | In Progress |
-| A | HID decode core (host-tested): `kernel-core/src/usb/hid.rs` usage→keycode + boot report decode, `hid_report.rs` skeleton | Phase 78b ✅ | In Progress |
-| B1 | Input integration: bounded inject queue + `KBD_EVENT_INJECT`/`MOUSE_EVENT_INJECT` in `kbd_server`/`mouse_server` (dispatcher unchanged) | Phase 56 ✅ | In Progress |
-| A-hid | `usb-hid` daemon (ring 3): lookup `usb` service, `SET_PROTOCOL(0)`/`SET_IDLE(0)`, poll interrupt-IN, decode via Track A, inject via Track B1 | A0, A, B1 | Planned |
-| B2 | Build + ramdisk + service wiring for `usb-hid` (`/drivers/usb-hid`, `depends=xhci_driver`) | A-hid | Planned |
-| B3 | `usb-smoke` QMP gate (`qemu-xhci`+`usb-kbd`+`usb-mouse`, keystroke→prompt), opt-in `M3OS_USB_REGRESSION=1` | all above | Planned |
-| C | Documentation + release: learning doc, `0.78.2` bump + capability entry | all above | Planned |
+| A0 | **(new)** USB IPC transport: `usb-core` wire codec for `AttachNotice`/`UsbRequest`/`UsbReply`; xHCI IPC server (register `usb`, IRQ-bound `ipc_recv_msg` multiplex, device table, control + interrupt-IN serving); controller interrupt-IN Normal-TRB enqueue/decode | Phase 78b ✅ | ✅ Complete |
+| A | HID decode core (host-tested): `kernel-core/src/usb/hid.rs` usage→keycode + boot report decode, `hid_report.rs` skeleton | Phase 78b ✅ | ✅ Complete |
+| B1 | Input integration: bounded inject queue + `KBD_EVENT_INJECT`/`MOUSE_EVENT_INJECT` in `kbd_server`/`mouse_server` (dispatcher unchanged) | Phase 56 ✅ | ✅ Complete |
+| A-hid | `usb-hid` daemon (ring 3): lookup `usb` service, poll interrupt-IN, decode via Track A, inject via Track B1 | A0, A, B1 | ✅ Complete |
+| B2 | Build + ramdisk + service wiring for `usb-hid` (`/drivers/usb-hid`, `depends=xhci_driver`) | A-hid | ✅ Complete |
+| B3 | `usb-smoke` QMP gate (`qemu-xhci`+`usb-kbd`, keystroke→kbd_server), opt-in `M3OS_USB_REGRESSION=1` | all above | ✅ Complete |
+| C | Documentation + release: learning doc, `0.78.2` bump + capability entry | all above | In Progress |
+
+### Implementation status (2026-05-30) — what landed and what passed
+
+**The milestone works: a QMP-injected USB keystroke types into m3OS.** The `usb-smoke` gate PASSES in ~7s, asserting (causal order) `XHCI_BRINGUP:enable-slot:OK` → `XHCI_USB:server-ready` → `usb-hid: polling` → QMP `send-key a` → `USB_HID:key kind=0 sym=0x00000061` (the interrupt-IN Transfer event decoded to a `KeyEvent` for `a` and accepted by `kbd_server`).
+
+Implementation deltas from the original plan (all driven by the source audit above):
+- **SET_PROTOCOL(0)/SET_IDLE(0) moved into the xHCI server's pre-bind setup** (`Controller::boot_protocol_setup`) rather than issued by `usb-hid`. Reason: the bound-notification server loop must not block on a hardware control transfer inside a request handler (the e1000 discipline); doing boot setup before binding keeps the loop non-blocking. `usb-hid` owns decode + symbol resolution + inject; the server owns the hardware/transfer details. `ControlRequest`/`ConfigureEndpoints` remain in the protocol but reply `ENOSYS` on the live path (rejected alternative: an in-loop deferred-reply control-transfer state machine — more code, no 1.0 benefit).
+- **HID reports return inline** via `ipc_store_reply_bulk` (8-byte kbd reports), not via `PageGrant`. The grant variant is retained in `usb-core` for future bulk endpoints — deferred.
+- **`usb-hid` polls** (`PollInterruptIn`) rather than blocking; the xHCI server captures reports on its IRQ into a per-endpoint FIFO and serves polls from it. Rejected alternative: server-side deferred replies (event-driven, no poll) — feasible (`scheduler::insert_cap` gives a stashable per-call reply cap) but more complex; the poll is robust and the IRQ still does the real work.
+- **Single enumerated HID device (the keyboard).** The merged `Controller` holds one `slot_ctx`; multi-slot was judged a risky refactor of 78a/78b code for no 1.0 benefit. The smoke gate attaches `usb-kbd`; **the mouse path is host-tested only** (`kernel-core::usb::hid`), as B.3 explicitly permits. Live mouse + multi-device is a tracked post-1.0 item.
+
+Regression validation (all PASS): `smoke-test` (boot), `htop-render-probe` (PS/2 → kbd_server event path → term → sh0 renders htop — proves the `ipc_recv`→`ipc_recv_msg` change did not regress GUI keyboard input), `less-render-probe` (input responsive), `xhci-bringup-smoke` + `xhci-enum-smoke` (78a/78b sentinels intact).
 
 > **Inject-label contract (pinned for parallel tracks):** `KBD_EVENT_INJECT = 5` on the `kbd` endpoint, `MOUSE_EVENT_INJECT = 3` on the `mouse` endpoint. Payload = the existing 20-byte `KeyEvent` / 37-byte `PointerEvent` wire form as IPC bulk; reply label `0` = enqueued OK, `u64::MAX` = queue full/error. Drain priority on `*_EVENT_PULL`: injected (USB) events drain **before** the PS/2 stream.
 

@@ -96,12 +96,18 @@ pub fn run(mut controller: Controller, irq: IrqNotification, devices: Vec<Device
     // 2. Command endpoint + `usb` service registration.
     let ep = syscall_lib::create_endpoint();
     if ep == u64::MAX {
-        write_str(STDOUT_FILENO, "xhci_driver: server endpoint create failed\n");
+        write_str(
+            STDOUT_FILENO,
+            "xhci_driver: server endpoint create failed\n",
+        );
         syscall_lib::exit(20);
     }
     let ep = ep as u32;
     if syscall_lib::ipc_register_service(ep, USB_SERVICE_NAME) == u64::MAX {
-        write_str(STDOUT_FILENO, "xhci_driver: register 'usb' service failed\n");
+        write_str(
+            STDOUT_FILENO,
+            "xhci_driver: register 'usb' service failed\n",
+        );
         syscall_lib::exit(21);
     }
 

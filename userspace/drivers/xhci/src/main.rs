@@ -163,7 +163,14 @@ const BAR0_EXPECTED_BYTES: usize = 0x1_0000;
 #[cfg(not(test))]
 fn bring_up_controller(
     key: DeviceCapKey,
-) -> Result<(Controller, IrqNotification, alloc::vec::Vec<crate::server::DeviceInfo>), i32> {
+) -> Result<
+    (
+        Controller,
+        IrqNotification,
+        alloc::vec::Vec<crate::server::DeviceInfo>,
+    ),
+    i32,
+> {
     let mut devices: alloc::vec::Vec<crate::server::DeviceInfo> = alloc::vec::Vec::new();
     let handle = match DeviceHandle::claim(key) {
         Ok(h) => h,
@@ -361,8 +368,11 @@ fn program_main(_args: &[&str]) -> i32 {
     // Concurrent multi-controller event servicing (multiple IRQ loops) is a
     // later refinement — for now, bring up and enumerate all controllers, then
     // enter the event loop on the primary (first) successfully brought-up one.
-    let mut primary: Option<(Controller, IrqNotification, alloc::vec::Vec<server::DeviceInfo>)> =
-        None;
+    let mut primary: Option<(
+        Controller,
+        IrqNotification,
+        alloc::vec::Vec<server::DeviceInfo>,
+    )> = None;
 
     for key in bdf_list {
         match bring_up_controller(key) {

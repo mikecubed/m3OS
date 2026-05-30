@@ -348,7 +348,11 @@ fn write_u32_hex(n: u32) {
     let mut buf = [0u8; 8];
     for (i, slot) in buf.iter_mut().enumerate() {
         let nib = ((n >> (28 - i * 4)) & 0xF) as u8;
-        *slot = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
+        *slot = if nib < 10 {
+            b'0' + nib
+        } else {
+            b'a' + nib - 10
+        };
     }
     // SAFETY: `buf` contains only ASCII hex digits.
     let s = unsafe { core::str::from_utf8_unchecked(&buf) };

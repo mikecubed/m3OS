@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**m3OS** (technical name: `m3os`) is a bootable microkernel OS in Rust: x86_64, UEFI boot, kernel **v0.78.1**. Ring 0 handles memory, scheduling, IPC/capabilities, interrupt routing, and in-kernel drivers; ring 3 hosts everything else.
+**m3OS** (technical name: `m3os`) is a bootable microkernel OS in Rust: x86_64, UEFI boot, kernel **v0.78.2**. Ring 0 handles memory, scheduling, IPC/capabilities, interrupt routing, and in-kernel drivers; ring 3 hosts everything else.
 
 Capabilities now present in the tree:
 
@@ -12,6 +12,7 @@ Capabilities now present in the tree:
 - **Networking & storage**: IPv4/TCP/UDP stack, AF_UNIX sockets, NVMe + Intel e1000 (82540EM) real-hardware drivers on a VirtIO baseline.
 - **IOMMU substrate**: ACPI DMAR/IVRS parsing, per-device VT-d / AMD-Vi domains, IOMMU-routed `DmaBuffer<T>`, fault ISRs, VT-d queued invalidation.
 - **Ring-3 driver hosting**: capability-gated device-host syscalls, supervised userspace NVMe/e1000 with `RemoteBlockDevice`/`RemoteNic` facades.
+- **USB host stack**: ring-3 xHCI host driver (MSI-X, BME, TRB/event rings) + `usb-core`/hub + a HID Boot-Protocol class driver (`usb-hid`) injecting keyboard/mouse into `kbd_server`/`mouse_server` — modern PS/2-less machines get USB keyboard/mouse input.
 - **Graphical stack**: `display_server` (framebuffer owner, focus-aware input, layer-shell surface roles, damage tracking, animations/decorations), `kbd_server`/`mouse_server`, compositor clients (`wallpaper`, `bar`, `launcher`, `notifyd`, `lockscreen`), `greeter` GUI login, `session_manager` lifecycle supervision.
 - **Audio**: `audio_server` (AC'97) with PCM-out, mixer, DOOM audio + bell.
 - **Terminal**: `term` emulator, full termios/line-discipline, UTF-8 + TTF/Nerd Font glyphs, ncurses + less/htop/tmux ports.
@@ -99,7 +100,7 @@ This sets `core.hooksPath` to `.githooks/`. **pre-commit** runs `cargo xtask che
 | `doom-concurrent-smoke` | `M3OS_DOOM_CONCURRENT_REGRESSION=1` |
 | `tiling-smoke` | `M3OS_TILING_REGRESSION=1` |
 | `htop-render-probe` | `M3OS_HTOP_REGRESSION=1` |
-| `xhci-bringup-smoke` + `xhci-enum-smoke` | `M3OS_USB_REGRESSION=1` |
+| `xhci-bringup-smoke` + `xhci-enum-smoke` + `usb-smoke` | `M3OS_USB_REGRESSION=1` |
 | `tls-smoke` PASS (not SKIP) | `M3OS_TLS_REGRESSION=1` |
 | `dns-smoke` PASS (not SKIP) | `M3OS_DNS_REGRESSION=1` |
 

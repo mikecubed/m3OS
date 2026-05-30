@@ -1057,7 +1057,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.78.1"
+version = "0.78.2"
 dependencies = [
  "bootloader_api",
  "kernel-core",

@@ -1,6 +1,6 @@
 # Phase 78c - USB Host Foundation: HID + Integration + Release
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-78c
 **Depends on:** Phase 78b (USB Enumeration + Hub), Phase 56 (Display and Input Architecture) ✅, Phase 74 (IPC Capability Grants) ✅
 **Builds on:** Final sub-phase of the [Phase 78](./78-usb-host-foundation.md) USB theme. On top of the enumerating stack from [78b](./78b-usb-enumeration-hub.md), adds the HID class driver (Boot-Protocol keyboard + mouse), injects its events into the Phase 56 `kbd_server` / `mouse_server` input path, lands the full `usb-smoke` QMP gate, writes the learning doc, and cuts the `0.78.2` release with the new USB capability inventory entry. Completes the milestone: a USB keyboard types into the m3OS shell.
