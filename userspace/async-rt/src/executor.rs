@@ -232,11 +232,25 @@ pub fn block_on<F: Future>(reactor: &mut Reactor, future: F) -> F::Output {
     let mut future = core::pin::pin!(future);
 
     // Consecutive blocking reactor polls that timed out with nothing woken.
-    // After `LIVENESS_STALL_TICKS` of these (~ticks × 100 ms) the executor
-    // assumes a wake edge was lost and force-re-polls every parked task (see
-    // `Executor::requeue_all`). Reset on any progress.
+    // After `stall_threshold` of these (~ticks × 100 ms) the executor assumes a
+    // wake edge was lost and force-re-polls every parked task (see
+    // `Executor::requeue_all`).
+    //
+    // `stall_threshold` starts at the fast base (300 ms) so a genuine lost edge
+    // — the SSH-disconnect PTY-HUP this backstop exists for — is recovered
+    // promptly on first occurrence. But a *healthy* idle session has no edge to
+    // recover, so an un-backed-off backstop would force-re-poll every parked
+    // task every 300 ms for the whole session lifetime (a permanent ~3 Hz
+    // syscall burn). So we DOUBLE the threshold on each fire (capped at ~30 s),
+    // decaying steady-state idle to an occasional heartbeat, and RESET to the
+    // base on genuine external activity. `settle` suppresses that reset for the
+    // couple of iterations our own `requeue_all` batch takes to drain, so the
+    // forced re-poll is not mistaken for real progress.
     let mut idle_ticks: u32 = 0;
-    const LIVENESS_STALL_TICKS: u32 = 3;
+    const LIVENESS_STALL_TICKS_BASE: u32 = 3; // ~300 ms
+    const LIVENESS_STALL_TICKS_MAX: u32 = 300; // ~30 s heartbeat
+    let mut stall_threshold: u32 = LIVENESS_STALL_TICKS_BASE;
+    let mut settle: u32 = 0;
 
     let result = loop {
         // 1. Poll spawned tasks first (they may wake the root future)
@@ -277,17 +291,27 @@ pub fn block_on<F: Future>(reactor: &mut Reactor, future: F) -> F::Output {
             // bounded window instead of hanging forever.
             if executor.run_queue.is_empty() && !root_header.is_woken() {
                 idle_ticks += 1;
-                if idle_ticks >= LIVENESS_STALL_TICKS {
+                if idle_ticks >= stall_threshold {
                     idle_ticks = 0;
                     executor.requeue_all();
                     root_header.mark_woken();
+                    // Back off so a healthy idle session decays to a heartbeat
+                    // rather than a permanent 3 Hz re-poll; `settle` ignores the
+                    // run_queue churn from this forced requeue on the next
+                    // iterations so it isn't read as genuine progress.
+                    stall_threshold = (stall_threshold * 2).min(LIVENESS_STALL_TICKS_MAX);
+                    settle = 2;
                 }
-            } else {
+            } else if settle == 0 {
+                // A real reactor event broke the idle → return to fast cadence.
                 idle_ticks = 0;
+                stall_threshold = LIVENESS_STALL_TICKS_BASE;
             }
-        } else {
+        } else if settle == 0 {
             idle_ticks = 0;
+            stall_threshold = LIVENESS_STALL_TICKS_BASE;
         }
+        settle = settle.saturating_sub(1);
     };
 
     set_executor_ptr(prev_executor);
@@ -494,8 +518,9 @@ mod tests {
             spawn(StalledUntilFlag(flag)).await.unwrap();
         });
         let elapsed = start.elapsed();
-        // Without the backstop this hangs forever; with it, recovery is
-        // bounded (~LIVENESS_STALL_TICKS × 100 ms plus the 50 ms flag delay).
+        // Without the backstop this hangs forever; with it, recovery is bounded
+        // (~LIVENESS_STALL_TICKS_BASE × 100 ms plus the 50 ms flag delay — the
+        // first fire is always at the fast base threshold, before any backoff).
         assert!(
             elapsed < Duration::from_secs(5),
             "liveness backstop did not recover a lost wake: {:?}",
