@@ -450,12 +450,19 @@ impl Trb {
     /// for an OUT status after an IN data stage, i.e. a handshake toward the
     /// host). For a no-data-stage transfer, `dir_in = true` (xHCI §4.11.2.2).
     /// `cycle` is the producer cycle bit.
+    ///
+    /// The IOC (Interrupt On Completion) bit is always set so the controller
+    /// generates a Transfer Event when the status phase completes (xHCI
+    /// §6.4.1.2.3). Do **not** set IOC on Setup or Data Stage TRBs — only
+    /// the terminal Status Stage needs it.
     pub const fn status_stage(dir_in: bool, cycle: bool) -> Trb {
+        const IOC_BIT: u32 = 1 << 5;
         Trb {
             parameter: 0,
             status: 0,
             control: control_type_cycle(TRB_TYPE_STATUS_STAGE, cycle)
-                | if dir_in { DATA_DIR_BIT } else { 0 },
+                | if dir_in { DATA_DIR_BIT } else { 0 }
+                | IOC_BIT,
         }
     }
 
@@ -1183,11 +1190,25 @@ mod tests {
         assert_eq!(trb_type_raw(&trb), TRB_TYPE_STATUS_STAGE);
         assert!(trb_cycle(&trb));
         assert_eq!(trb.control & DATA_DIR_BIT, 0);
+        // IOC (bit 5) must be set per xHCI §6.4.1.2.3 so a Transfer Event is
+        // generated when the status phase completes.
+        const IOC_BIT: u32 = 1 << 5;
+        assert_ne!(
+            trb.control & IOC_BIT,
+            0,
+            "Status Stage TRB must have IOC set (xHCI §6.4.1.2.3)"
+        );
 
         // No-data-stage: status is IN (dir_in = true).
         let trb2 = Trb::status_stage(true, false);
         assert_ne!(trb2.control & DATA_DIR_BIT, 0);
         assert!(!trb_cycle(&trb2));
+        // IOC must also be set on the no-data-stage status TRB.
+        assert_ne!(
+            trb2.control & IOC_BIT,
+            0,
+            "Status Stage TRB (no-data) must have IOC set"
+        );
     }
 
     // -----------------------------------------------------------------------

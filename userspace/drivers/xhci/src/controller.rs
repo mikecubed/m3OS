@@ -117,11 +117,6 @@ const INPUT_CONTEXT_ENTRIES: usize = DEVICE_CONTEXT_ENTRIES + 1;
 /// is a generous ceiling that still terminates if the controller wedges.
 const POLL_BUDGET: u32 = 5_000_000;
 
-/// Interrupt On Completion (IOC) bit in a Transfer TRB control dword (bit 5,
-/// xHCI §6.4.1). Must be set on at least the Status Stage TRB so the
-/// controller generates a Transfer Event when the control transfer completes.
-const TRB_IOC_BIT: u32 = 1 << 5;
-
 /// Outcome of the bring-up sequence: either the controller is live (with the
 /// IRQ subscription handed to the event loop) or a stage failed.
 pub enum BringUpError {
@@ -623,10 +618,29 @@ impl Controller {
         self.ring_doorbell(0, 0);
 
         // Drain the event ring on each IRQ wake until we find the matching
-        // Command Completion Event.
+        // Command Completion Event. Bounded to avoid hanging if the controller
+        // wedges. A totally-silent controller (zero interrupts delivered) is
+        // still a known limitation pending a timeout-capable wait syscall.
+        const COMMAND_WAIT_WAKES: u32 = 128;
+        let mut wakes = 0u32;
         loop {
             let bits = irq.wait();
             if bits == 0 {
+                wakes += 1;
+                if wakes >= COMMAND_WAIT_WAKES {
+                    write_str(
+                        STDOUT_FILENO,
+                        "[xhci] command timed out (no completion event)\n",
+                    );
+                    // Return a synthetic failure completion so enumeration can
+                    // transition to Error/Timeout rather than hanging.
+                    return trb::CommandCompletionEvent {
+                        command_trb_pointer: cmd_iova,
+                        completion_code: 0xFF, // synthetic: not COMPLETION_SUCCESS
+                        slot_id: 0,
+                        cycle: false,
+                    };
+                }
                 continue;
             }
             // Drain all pending events; collect our completion.
@@ -644,6 +658,19 @@ impl Controller {
             self.rt_write_u64(rt_reg::ERDP, erdp | ERDP_EHB);
             self.rt_write_u32(rt_reg::IMAN, IMAN_IP | IMAN_IE);
             let _ = irq.ack(bits);
+            wakes += 1;
+            if wakes >= COMMAND_WAIT_WAKES {
+                write_str(
+                    STDOUT_FILENO,
+                    "[xhci] command timed out (no completion event)\n",
+                );
+                return trb::CommandCompletionEvent {
+                    command_trb_pointer: cmd_iova,
+                    completion_code: 0xFF,
+                    slot_id: 0,
+                    cycle: false,
+                };
+            }
         }
     }
 
@@ -769,10 +796,8 @@ impl Controller {
             // For IN data transfers status is OUT (dir_in=false); for OUT or
             // no-data, status is IN (dir_in=true).
             let status_dir_in = !dir_in || len == 0;
-            let mut status_trb = trb::Trb::status_stage(status_dir_in, cycle);
-            // Set IOC (bit 5) so the controller interrupts the host on
-            // Status Stage completion (xHCI §6.4.1.2.3).
-            status_trb.control |= TRB_IOC_BIT;
+            // IOC is now set inside Trb::status_stage (kernel-core fix).
+            let status_trb = trb::Trb::status_stage(status_dir_in, cycle);
             write_trb(&sc.ep0_ring, sc.ep0_producer.enqueue, status_trb);
             let cycle_before = sc.ep0_producer.cycle;
             if sc.ep0_producer.advance() {
@@ -793,11 +818,16 @@ impl Controller {
 
         match result {
             Some(ev) if ev.completion_code == trb::COMPLETION_SUCCESS => {
-                // Read back data from the DMA buffer.
+                // Read back data from the DMA buffer. Use the actual bytes
+                // transferred: len minus residual_transfer_length, clamped to
+                // [0, len]. Descriptors are self-describing so this makes the
+                // returned slice length truthful (xHCI §4.11.3).
                 if let Some(buf) = data_buf {
-                    let mut out = alloc::vec::Vec::with_capacity(len as usize);
-                    for i in 0..len as usize {
-                        // SAFETY: buf was allocated with `len` bytes, i < len.
+                    let residual = ev.residual_transfer_length.min(len as u32) as usize;
+                    let actual = (len as usize).saturating_sub(residual);
+                    let mut out = alloc::vec::Vec::with_capacity(actual);
+                    for i in 0..actual {
+                        // SAFETY: buf was allocated with `len` bytes, i < actual <= len.
                         let byte = unsafe { core::ptr::read_volatile(buf.user_ptr().add(i)) };
                         out.push(byte);
                     }

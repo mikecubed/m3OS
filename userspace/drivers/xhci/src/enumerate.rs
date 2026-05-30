@@ -131,13 +131,9 @@ impl UsbHostOps for XhciHostOps<'_> {
         // Patch EP0 dequeue pointer and allocate real transfer rings for each
         // interface endpoint in the snapshot. The state machine provides
         // placeholder IOVAs of 0; we replace them with real DMA ring addresses.
+        // A1 (EP0) is no longer included in add_flags from kernel-core
+        // (build_configure_endpoint_ctx fix), so no workaround needed here.
         let mut patched = self.patched_snapshot(ctx);
-        // Clear A1 (EP0) from Add Flags for Configure Endpoint: EP0 is already
-        // correctly configured from Address Device and does not need to be
-        // re-provided. Including A1 causes QEMU's xhci to validate the EP0 TR
-        // Dequeue Pointer against the current controller state, which rejects
-        // the original ring start address with TRB Error (code 5).
-        patched.add_flags &= !0x2u32; // clear bit 1 (A1 = EP0)
         for ep_snap in &mut patched.endpoint_contexts {
             match self.controller.alloc_interrupt_ep_ring() {
                 Ok(iova_dcs) => {

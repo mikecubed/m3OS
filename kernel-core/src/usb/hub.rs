@@ -24,9 +24,14 @@
 //! node in the tree is identified by the chain of port numbers from the root
 //! hub port down to the device. xHCI §8.9 and USB 3.2 §8.9 define the
 //! **route string** used to address a device through intermediate hubs: five
-//! 4-bit tier fields packed into the low 20 bits of a u32, where tier 1 is
-//! the root-hub port and tier 5 is the deepest hub port. Values 0x1–0xF are
-//! valid for each tier (a tier value of 0 terminates the route string).
+//! 4-bit tier fields packed into the low 20 bits of a u32. **Tier 1 is the
+//! downstream port of the first hub attached to the root port** (not the root
+//! port itself). The root-hub port number is carried separately in the Slot
+//! Context Root Hub Port Number field and is NOT encoded in the route string.
+//! A device directly attached to a root port has route string **0**. Values
+//! 0x1–0xF are valid for each tier (a tier value of 0 terminates the route
+//! string). Use [`PortTopology::root_hub_port`] to retrieve the root-hub port
+//! for the Slot Context.
 //!
 //! This module stores the topology as a flat arena (a `Vec` of `PortNode`
 //! entries with integer parent indices) — cleaner than recursive `Box<…>`
@@ -273,11 +278,16 @@ pub const fn get_hub_descriptor(length: u16) -> SetupPacket {
 // PortId — USB topology tree (flat arena)
 // ---------------------------------------------------------------------------
 
-/// Maximum hub depth (tiers) allowed by xHCI §8.9 / USB 3.2 §8.9.
+/// Maximum hub depth (tiers) encoded in the xHCI route string (xHCI §8.9 /
+/// USB 3.2 §8.9).
 ///
-/// The route string has five 4-bit tier slots. Tier 1 is the root-hub port;
-/// tier 5 is the deepest hub port. Devices beyond this depth cannot be
-/// addressed.
+/// The route string has five 4-bit tier slots. Tier 1 is the downstream port
+/// of the first hub attached to the root port (not the root port itself). A
+/// route string can therefore represent up to 5 hubs between the root and the
+/// device, corresponding to USB's 7-tier device limit minus the root hub and
+/// the root-hub port tier. Devices whose path requires more than 5 route-string
+/// nibbles cannot be addressed by xHCI and are rejected by
+/// [`PortTopology::add_child_port`].
 pub const MAX_HUB_DEPTH: usize = 5;
 
 /// One node in the USB port topology tree.
@@ -362,40 +372,63 @@ impl PortTopology {
     ///
     /// The route string is a 20-bit value packed into the low 20 bits of a
     /// `u32`. Tier 1 occupies bits 3:0, tier 2 bits 7:4, …, tier 5 bits
-    /// 19:16. Each tier value is the port number at that depth, clamped to
-    /// 4 bits (0xF max). A tier value of 0 means the route string terminates
-    /// at the previous tier. Port numbers ≥ 16 are stored as 0xF per the
-    /// USB 3.2 spec (the host must use `wIndex` port for deeper routing).
+    /// 19:16. Each tier value is the downstream port number of a **hub** on
+    /// the path from the root hub to the device, clamped to 4 bits (0xF for
+    /// ports ≥ 16). The **root-hub port number is NOT encoded** here — it goes
+    /// in the Slot Context Root Hub Port Number field (see
+    /// [`root_hub_port`](PortTopology::root_hub_port)). A device directly
+    /// attached to a root port has route string **0**.
     ///
     /// Returns `0` if the topology is empty or `idx` is out of bounds.
     pub fn route_string(&self, idx: usize) -> u32 {
         if idx >= self.nodes.len() {
             return 0;
         }
-        // Collect the chain of port numbers from `idx` up to (but not
-        // including) the root; the root-hub port is tier 1.
+        // Collect port numbers from `idx` walking toward root. Stop before
+        // the root-hub-port node (the node whose parent_idx is None).
+        // The root-hub port is NOT part of the route string.
         let mut chain: [u8; MAX_HUB_DEPTH] = [0; MAX_HUB_DEPTH];
         let mut depth = 0usize;
         let mut current = idx;
-        loop {
-            chain[depth] = self.nodes[current].port;
-            depth += 1;
-            match self.nodes[current].parent_idx {
-                Some(parent) => current = parent,
-                None => break,
+        while let Some(parent) = self.nodes[current].parent_idx {
+            // `current` is a non-root node; include its port.
+            if depth < MAX_HUB_DEPTH {
+                chain[depth] = self.nodes[current].port;
+                depth += 1;
             }
+            current = parent;
+            // When we reach the root (parent_idx == None), the while-let exits.
         }
-        // `chain[depth-1]` is the root-hub port (tier 1), `chain[0]` is the
-        // deepest port. Reverse to build tier order.
+        // `chain[0]` is the deepest port (highest tier); `chain[depth-1]` is
+        // the port of the first hub on the root port (tier 1, bits 3:0).
+        // Reverse to fill tier 1 first.
         let mut route: u32 = 0;
         for tier in 0..depth {
-            // Port at tier+1 is chain[depth-1-tier].
             let port = chain[depth - 1 - tier];
-            // Clamp to 4 bits (0xF for ports ≥ 16).
             let nibble = if port > 0xF { 0xF } else { port as u32 };
             route |= nibble << (tier * 4);
         }
         route
+    }
+
+    /// Return the root-hub port number for the node at `idx`.
+    ///
+    /// Walks the parent chain to the root-hub-port node (the node whose
+    /// `parent_idx` is `None`) and returns its `port` field. This is the value
+    /// that belongs in the xHCI Slot Context Root Hub Port Number field.
+    ///
+    /// Returns `None` if `idx` is out of bounds.
+    pub fn root_hub_port(&self, idx: usize) -> Option<u8> {
+        if idx >= self.nodes.len() {
+            return None;
+        }
+        let mut current = idx;
+        loop {
+            match self.nodes[current].parent_idx {
+                Some(parent) => current = parent,
+                None => return Some(self.nodes[current].port),
+            }
+        }
     }
 
     /// Walk from `idx` to the root, returning the sequence of arena indices
@@ -576,16 +609,16 @@ mod tests {
     //
     // Topology under test:
     //
-    //   root hub port 1   (tier 1, idx 0)
-    //     └─ hub A port 2 (tier 2, idx 1)
-    //          └─ hub B port 3 (tier 3, idx 2)
-    //               └─ device port 4 (tier 4, idx 3)
+    //   root hub port 1   (root node, idx 0) — root-hub port, NOT in route string
+    //     └─ hub A port 2 (tier 1, idx 1)
+    //          └─ hub B port 3 (tier 2, idx 2)
+    //               └─ device port 4 (tier 3, idx 3)
     //
-    // Route strings (xHCI §8.9):
-    //   idx 0 (root port 1):   0x0000_0001
-    //   idx 1 (hub A port 2):  0x0000_0021  (tier1=1, tier2=2)
-    //   idx 2 (hub B port 3):  0x0000_0321  (tier1=1, tier2=2, tier3=3)
-    //   idx 3 (device port 4): 0x0004_0321  (tier1=1, tier2=2, tier3=3, tier4=4)
+    // Route strings (xHCI §8.9 — root-hub port goes in Slot Context, NOT here):
+    //   idx 0 (root port 1):   0x0000_0000  (directly on root → route string = 0)
+    //   idx 1 (hub A port 2):  0x0000_0002  (tier1=2)
+    //   idx 2 (hub B port 3):  0x0000_0032  (tier1=2, tier2=3)
+    //   idx 3 (device port 4): 0x0000_0432  (tier1=2, tier2=3, tier3=4)
     // -----------------------------------------------------------------------
 
     fn build_four_tier_topology() -> (PortTopology, [usize; 4]) {
@@ -600,31 +633,50 @@ mod tests {
     #[test]
     fn route_string_root_port() {
         let (topo, idxs) = build_four_tier_topology();
-        // Root-hub port 1 → route string = 0x01.
-        assert_eq!(topo.route_string(idxs[0]), 0x0000_0001);
+        // Root-hub port: route string = 0 (root port is NOT in the route string;
+        // it goes in the Slot Context Root Hub Port Number field per xHCI §8.9).
+        assert_eq!(topo.route_string(idxs[0]), 0x0000_0000);
     }
 
     #[test]
     fn route_string_hub_a() {
         let (topo, idxs) = build_four_tier_topology();
-        // Tier 1 = 1, tier 2 = 2 → 0x21.
-        assert_eq!(topo.route_string(idxs[1]), 0x0000_0021);
+        // Hub A is at tier 1 (first hub on the root port), port 2 → 0x02.
+        assert_eq!(topo.route_string(idxs[1]), 0x0000_0002);
     }
 
     #[test]
     fn route_string_hub_b() {
         let (topo, idxs) = build_four_tier_topology();
-        // Tier 1 = 1, tier 2 = 2, tier 3 = 3 → 0x0321.
-        assert_eq!(topo.route_string(idxs[2]), 0x0000_0321);
+        // Tier 1 = hub A port 2, tier 2 = hub B port 3 → 0x32.
+        assert_eq!(topo.route_string(idxs[2]), 0x0000_0032);
     }
 
     #[test]
     fn route_string_device() {
         let (topo, idxs) = build_four_tier_topology();
-        // Tier 1 = 1, tier 2 = 2, tier 3 = 3, tier 4 = 4 → 0x0004_0321.
-        // Tier 4 nibble is in bits 15:12. But 4 << 12 = 0x4000, so:
-        // 0x1 | (0x2 << 4) | (0x3 << 8) | (0x4 << 12) = 0x4321.
-        assert_eq!(topo.route_string(idxs[3]), 0x0000_4321);
+        // Tier 1 = hub A port 2, tier 2 = hub B port 3, tier 3 = device port 4
+        // → 0x432.
+        assert_eq!(topo.route_string(idxs[3]), 0x0000_0432);
+    }
+
+    #[test]
+    fn root_hub_port_of_each_node() {
+        let (topo, idxs) = build_four_tier_topology();
+        // All nodes in this chain share root-hub port 1.
+        for &idx in &idxs {
+            assert_eq!(
+                topo.root_hub_port(idx),
+                Some(1),
+                "root_hub_port must return 1 for idx {idx}"
+            );
+        }
+    }
+
+    #[test]
+    fn root_hub_port_out_of_bounds() {
+        let topo = PortTopology::new();
+        assert_eq!(topo.root_hub_port(0), None);
     }
 
     #[test]
@@ -673,11 +725,16 @@ mod tests {
 
     #[test]
     fn route_string_clamped_to_four_bits_for_large_port() {
-        // Port number 20 should be stored as 0xF (clamped) per USB 3.2 §8.9.
+        // A child port number ≥ 16 should be stored as 0xF (clamped) per
+        // USB 3.2 §8.9. The root-hub port is not in the route string, so the
+        // clamp must be tested on a non-root (child) node.
         let mut topo = PortTopology::new();
-        let root = topo.add_root_port(20);
-        // 20 > 15, clamps to 0xF = 15.
-        assert_eq!(topo.route_string(root), 0x0F);
+        let root = topo.add_root_port(1); // root port 1 — NOT in route string
+        let child = topo.add_child_port(root, 20).unwrap(); // port 20 → clamp to 0xF
+        // Route string for child: tier 1 = 0xF (20 clamped).
+        assert_eq!(topo.route_string(child), 0x0F);
+        // Root itself still has route string 0.
+        assert_eq!(topo.route_string(root), 0x00);
     }
 
     // -----------------------------------------------------------------------

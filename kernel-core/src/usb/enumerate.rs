@@ -328,8 +328,12 @@ fn build_configure_endpoint_ctx(ctx: &EnumContext) -> InputContextSnapshot {
         }
     }
 
-    // Build Add Flags: A0 (Slot) + A1 (EP0) + one bit per new endpoint DCI.
-    let mut dci_list: Vec<u8> = alloc::vec![0, 1];
+    // Build Add Flags: A0 (Slot) + one bit per new endpoint DCI.
+    // A1 (EP0, DCI 1) must NOT be included — EP0 was already configured by
+    // Address Device. Re-adding it via Configure Endpoint would cause the
+    // controller to validate the stale TR Dequeue Pointer and reject the
+    // command with TRB Error (completion code 5). See xHCI §4.6.6 / §6.2.5.1.
+    let mut dci_list: Vec<u8> = alloc::vec![0]; // A0 (Slot) only; no DCI 1
     for snap in &ep_snapshots {
         dci_list.push(snap.dci);
     }
@@ -915,6 +919,37 @@ mod tests {
         assert_ne!(
             cfg_snap.add_flags, 0x3,
             "Configure Endpoint must add more than just Slot+EP0"
+        );
+    }
+
+    #[test]
+    fn configure_endpoint_add_flags_excludes_ep0_a1() {
+        // Per xHCI §4.6.6 / §6.2.5.1, Configure Endpoint must NOT include A1
+        // (EP0, bit 1). EP0 was already configured by Address Device; re-adding
+        // it causes the controller to validate the stale TR Dequeue Pointer.
+        let (_state, _ctx, ops) = run_fs_keyboard();
+        let cfg_snap = ops.ctx_snapshots.last().unwrap();
+
+        // A0 (bit 0, Slot) must be set.
+        assert_ne!(
+            cfg_snap.add_flags & (1 << 0),
+            0,
+            "Configure Endpoint add_flags must include A0 (Slot); add_flags=0x{:X}",
+            cfg_snap.add_flags
+        );
+        // A1 (bit 1, EP0) must NOT be set.
+        assert_eq!(
+            cfg_snap.add_flags & (1 << 1),
+            0,
+            "Configure Endpoint add_flags must NOT include A1 (EP0); add_flags=0x{:X}",
+            cfg_snap.add_flags
+        );
+        // A3 (bit 3, DCI 3 = EP1 IN) must be set.
+        assert_ne!(
+            cfg_snap.add_flags & (1 << 3),
+            0,
+            "Configure Endpoint add_flags must include A3 (DCI 3 = EP1 IN); add_flags=0x{:X}",
+            cfg_snap.add_flags
         );
     }
 
