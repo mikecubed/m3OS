@@ -86,7 +86,18 @@ const MOUSE_EVENT_PULL: u64 = 1;
 /// `userspace/display_server/src/input.rs`.
 const MOUSE_EVENT_NONE: u64 = 2;
 
-/// Reply-cap slot is fixed at 1 by the kernel's IPC ABI.
+/// Phase 78c — USB-HID inject. The `usb-hid` driver decodes a USB boot mouse
+/// report into a `PointerEvent`, encodes it with the 37-byte `kernel-core`
+/// codec, and `ipc_call`s this label with the wire bytes as bulk. mouse_server
+/// enqueues the event onto a bounded pending queue and replies `0` (ack); the
+/// event drains into the next `MOUSE_EVENT_PULL` reply ahead of the PS/2
+/// stream. USB and PS/2 are parallel producers; the dispatcher is unchanged.
+const MOUSE_EVENT_INJECT: u64 = 3;
+
+/// Bound on the injected-event queue (oldest dropped on overflow).
+const INJECT_QUEUE_CAP: usize = 64;
+
+/// Reply-cap slot fallback if the kernel did not stage one (`msg.data[3]`).
 const REPLY_CAP_HANDLE: u32 = 1;
 
 /// Polling interval used while waiting for a packet to arrive (matches D.1's
@@ -326,10 +337,20 @@ fn monotonic_ms() -> u64 {
 ///
 /// On timeout, replies with `label = u64::MAX` and no bulk so the caller
 /// can distinguish a bounded-wait expiry from a real event (matches D.1).
-fn handle_mouse_event_pull(pipeline: &mut MousePipeline) {
+fn handle_mouse_event_pull(
+    pipeline: &mut MousePipeline,
+    injected: &mut alloc::collections::VecDeque<PointerEvent>,
+    reply_cap: u32,
+) {
+    // Drain priority: injected USB-HID events first, then this pipeline's
+    // PS/2-derived pending edges, then a fresh PS/2 packet.
+    if let Some(ev) = injected.pop_front() {
+        emit_pointer_event(&ev, reply_cap);
+        return;
+    }
     // Drain queued events first — keep latency low for chord traffic.
     if let Some(ev) = pipeline.pending.dequeue() {
-        emit_pointer_event(&ev);
+        emit_pointer_event(&ev, reply_cap);
         return;
     }
 
@@ -344,7 +365,7 @@ fn handle_mouse_event_pull(pipeline: &mut MousePipeline) {
                 let packet = decode_packet(&buf);
                 let now = monotonic_ms();
                 if let Some(ev) = pipeline.ingest_packet(packet, now) {
-                    emit_pointer_event(&ev);
+                    emit_pointer_event(&ev, reply_cap);
                     return;
                 }
                 // Idle packet — drain the next one if available without
@@ -369,7 +390,7 @@ fn handle_mouse_event_pull(pipeline: &mut MousePipeline) {
                     "mouse_server: warn: read_mouse_packet returned unexpected errno\n",
                 );
                 let _ = other;
-                syscall_lib::ipc_reply(REPLY_CAP_HANDLE, u64::MAX, 0);
+                syscall_lib::ipc_reply(reply_cap, u64::MAX, 0);
                 return;
             }
         }
@@ -381,7 +402,35 @@ fn handle_mouse_event_pull(pipeline: &mut MousePipeline) {
     // syscall failure). Mirrors the D.1 `KBD_EVENT_NONE` shape so
     // display_server's bounded-wait machinery handles both
     // services identically.
-    syscall_lib::ipc_reply(REPLY_CAP_HANDLE, MOUSE_EVENT_NONE, 0);
+    syscall_lib::ipc_reply(reply_cap, MOUSE_EVENT_NONE, 0);
+}
+
+/// Handle a `MOUSE_EVENT_INJECT` request from `usb-hid`.
+///
+/// `bulk` holds the 37-byte `PointerEvent` wire payload. Decode it, push it
+/// onto the bounded `injected` queue (dropping the oldest on overflow), and
+/// reply `0` (ack). The event surfaces on the next `MOUSE_EVENT_PULL`.
+fn handle_mouse_inject(
+    injected: &mut alloc::collections::VecDeque<PointerEvent>,
+    bulk: &[u8],
+    reply_cap: u32,
+) {
+    match PointerEvent::decode(bulk) {
+        Ok((ev, _)) => {
+            if injected.len() >= INJECT_QUEUE_CAP {
+                injected.pop_front();
+            }
+            injected.push_back(ev);
+            syscall_lib::ipc_reply(reply_cap, 0, 0);
+        }
+        Err(_) => {
+            syscall_lib::write_str(
+                STDOUT_FILENO,
+                "mouse_server: warn: MOUSE_EVENT_INJECT decode failed; dropping\n",
+            );
+            syscall_lib::ipc_reply(reply_cap, u64::MAX, 0);
+        }
+    }
 }
 
 /// Encode the `PointerEvent` and reply with it as bulk data.
@@ -390,19 +439,19 @@ fn handle_mouse_event_pull(pipeline: &mut MousePipeline) {
 /// encoding fails (which the codec does only when the modifiers bitmask
 /// has unknown bits set, which we never do) we surface a typed error to
 /// the caller via `label = u64::MAX`.
-fn emit_pointer_event(ev: &PointerEvent) {
+fn emit_pointer_event(ev: &PointerEvent, reply_cap: u32) {
     let mut buf = [0u8; POINTER_EVENT_WIRE_SIZE];
     match ev.encode(&mut buf) {
         Ok(_) => {
             let _ = syscall_lib::ipc_store_reply_bulk(&buf);
-            syscall_lib::ipc_reply(REPLY_CAP_HANDLE, MOUSE_EVENT_PULL, 0);
+            syscall_lib::ipc_reply(reply_cap, MOUSE_EVENT_PULL, 0);
         }
         Err(_) => {
             syscall_lib::write_str(
                 STDOUT_FILENO,
                 "mouse_server: error: PointerEvent encode failed; replying with sentinel\n",
             );
-            syscall_lib::ipc_reply(REPLY_CAP_HANDLE, u64::MAX, 0);
+            syscall_lib::ipc_reply(reply_cap, u64::MAX, 0);
         }
     }
 }
@@ -447,24 +496,34 @@ fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, "mouse_server: ready\n");
 
     let mut pipeline = MousePipeline::new();
+    // Phase 78c — bounded queue of USB-HID-injected pointer events.
+    let mut injected: alloc::collections::VecDeque<PointerEvent> =
+        alloc::collections::VecDeque::new();
 
-    // Service loop: dispatch by label. Each branch must end in an
-    // `ipc_reply` so the reply-cap slot is freed before the next recv.
-    let mut label = syscall_lib::ipc_recv(ep_handle);
+    // Service loop: dispatch by label. We use `ipc_recv_msg` (not `ipc_recv`)
+    // so `MOUSE_EVENT_INJECT` can read the 37-byte `PointerEvent` bulk, and we
+    // reply on the kernel-staged reply cap (`msg.data[3]`).
+    let mut msg = syscall_lib::IpcMessage::new(0);
+    let mut bulk = [0u8; POINTER_EVENT_WIRE_SIZE];
 
     loop {
-        match label {
-            MOUSE_EVENT_PULL => handle_mouse_event_pull(&mut pipeline),
+        let rc = syscall_lib::ipc_recv_msg(ep_handle, &mut msg, &mut bulk);
+        if rc == u64::MAX {
+            continue;
+        }
+        let reply_cap = msg.reply_cap_handle().unwrap_or(REPLY_CAP_HANDLE);
+        match rc {
+            MOUSE_EVENT_PULL => handle_mouse_event_pull(&mut pipeline, &mut injected, reply_cap),
+            MOUSE_EVENT_INJECT => handle_mouse_inject(&mut injected, &bulk, reply_cap),
             _ => {
                 // Unknown label — typed error, observable to clients.
                 syscall_lib::write_str(
                     STDOUT_FILENO,
                     "mouse_server: warn: unknown IPC label; replying with sentinel\n",
                 );
-                syscall_lib::ipc_reply(REPLY_CAP_HANDLE, u64::MAX, 0);
+                syscall_lib::ipc_reply(reply_cap, u64::MAX, 0);
             }
         }
-        label = syscall_lib::ipc_recv(ep_handle);
     }
 }
 

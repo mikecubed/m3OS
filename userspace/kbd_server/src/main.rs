@@ -94,7 +94,22 @@ const KBD_EVENT_NONE: u64 = 3;
 /// made this race consistently reproducible).
 const KBD_TRY_READ: u64 = 4;
 
+/// Phase 78c — USB-HID inject. The `usb-hid` driver decodes a USB boot
+/// keyboard report into a fully-formed [`KeyEvent`], encodes it with the
+/// 20-byte `kernel-core` codec, and `ipc_call`s this label with the wire
+/// bytes as bulk. kbd_server enqueues the event onto a bounded pending
+/// queue and replies `0` (ack). The event then drains into the next
+/// `KBD_EVENT_PULL` reply alongside the PS/2 stream — USB and PS/2 are
+/// parallel producers; the focus-aware `InputDispatcher` is unchanged.
+const KBD_EVENT_INJECT: u64 = 5;
+
+/// Bound on the injected-event queue. A keyboard at boot-report rate cannot
+/// outrun the compositor's pull cadence under any realistic typing speed, so
+/// 64 is generous headroom; on overflow the oldest injected event is dropped.
+const INJECT_QUEUE_CAP: usize = 64;
+
 /// Reply-cap slot is fixed at 1 by the kernel's IPC ABI.
+#[allow(dead_code)]
 const REPLY_CAP_HANDLE: u32 = 1;
 
 /// Polling interval used while waiting for a scancode to arrive
@@ -254,7 +269,7 @@ fn monotonic_ms() -> u64 {
 ///
 /// Polls `read_kbd_scancode` until a non-zero byte arrives, then replies
 /// with the byte as the reply label (preserving Phase 52 contract).
-fn handle_kbd_read() {
+fn handle_kbd_read(reply_cap: u32) {
     let scancode = loop {
         let sc = syscall_lib::read_kbd_scancode();
         if sc != 0 {
@@ -262,7 +277,7 @@ fn handle_kbd_read() {
         }
         let _ = syscall_lib::nanosleep_for(0, POLL_INTERVAL_NS);
     };
-    syscall_lib::ipc_reply(REPLY_CAP_HANDLE, scancode as u64, 0);
+    syscall_lib::ipc_reply(reply_cap, scancode as u64, 0);
 }
 
 /// Handle a `KBD_TRY_READ` request — non-blocking scancode probe.
@@ -272,9 +287,39 @@ fn handle_kbd_read() {
 /// empty. The caller (`stdin_feeder`) treats 0 as "no key available"
 /// and sleeps briefly before retrying, which keeps kbd_server's
 /// request queue drainable between polls.
-fn handle_kbd_try_read() {
+fn handle_kbd_try_read(reply_cap: u32) {
     let sc = syscall_lib::read_kbd_scancode();
-    syscall_lib::ipc_reply(REPLY_CAP_HANDLE, sc as u64, 0);
+    syscall_lib::ipc_reply(reply_cap, sc as u64, 0);
+}
+
+/// Handle a `KBD_EVENT_INJECT` request from `usb-hid`.
+///
+/// `bulk` holds the 20-byte `KeyEvent` wire payload the USB-HID driver
+/// produced. Decode it and push it onto the bounded `injected` queue (dropping
+/// the oldest event on overflow so a stalled compositor cannot wedge the USB
+/// producer), then reply `0` as an ack. The event surfaces on the next
+/// `KBD_EVENT_PULL`.
+fn handle_kbd_inject(
+    injected: &mut alloc::collections::VecDeque<KeyEvent>,
+    bulk: &[u8],
+    reply_cap: u32,
+) {
+    match KeyEvent::decode(bulk) {
+        Ok((ev, _)) => {
+            if injected.len() >= INJECT_QUEUE_CAP {
+                injected.pop_front();
+            }
+            injected.push_back(ev);
+            syscall_lib::ipc_reply(reply_cap, 0, 0);
+        }
+        Err(_) => {
+            syscall_lib::write_str(
+                STDOUT_FILENO,
+                "kbd_server: warn: KBD_EVENT_INJECT decode failed; dropping\n",
+            );
+            syscall_lib::ipc_reply(reply_cap, u64::MAX, 0);
+        }
+    }
 }
 
 /// Handle a `KBD_EVENT_PULL` request.
@@ -287,7 +332,20 @@ fn handle_kbd_try_read() {
 ///
 /// On timeout, replies with `label = u64::MAX` and no bulk so the
 /// caller can distinguish a bounded-wait expiry from a real event.
-fn handle_kbd_event_pull(pipeline: &mut KeyboardPipeline) {
+fn handle_kbd_event_pull(
+    pipeline: &mut KeyboardPipeline,
+    injected: &mut alloc::collections::VecDeque<KeyEvent>,
+    reply_cap: u32,
+) {
+    // Drain priority: injected USB-HID events first, then the PS/2 stream.
+    // USB events are already fully-formed `KeyEvent`s (decoded by `usb-hid`
+    // via the host-tested `kernel-core` HID layer), so they bypass the
+    // scancode pipeline and ship straight to the compositor.
+    if let Some(ev) = injected.pop_front() {
+        emit_key_event(&ev, reply_cap);
+        return;
+    }
+
     for iter in 0..MAX_PULL_POLLS {
         // Drain as many scancode bytes as the kernel has buffered,
         // emitting at most one KeyEvent per pull (the scheduler picks
@@ -299,7 +357,7 @@ fn handle_kbd_event_pull(pipeline: &mut KeyboardPipeline) {
             }
             let now = monotonic_ms();
             if let Some(ev) = pipeline.feed_byte(sc, now) {
-                emit_key_event(&ev);
+                emit_key_event(&ev, reply_cap);
                 return;
             }
         }
@@ -307,7 +365,7 @@ fn handle_kbd_event_pull(pipeline: &mut KeyboardPipeline) {
         // No fresh edge — see if the scheduler has a repeat ready.
         let now = monotonic_ms();
         if let Some(ev) = pipeline.tick_repeat(now) {
-            emit_key_event(&ev);
+            emit_key_event(&ev, reply_cap);
             return;
         }
 
@@ -326,7 +384,7 @@ fn handle_kbd_event_pull(pipeline: &mut KeyboardPipeline) {
     // transport-error sentinel returned by `ipc_call*` on a real
     // syscall failure). The bulk slot is left empty so the caller's
     // recv_msg returns a zero-byte payload alongside the label.
-    syscall_lib::ipc_reply(REPLY_CAP_HANDLE, KBD_EVENT_NONE, 0);
+    syscall_lib::ipc_reply(reply_cap, KBD_EVENT_NONE, 0);
 }
 
 /// Encode the `KeyEvent` and reply with it as bulk data.
@@ -335,7 +393,7 @@ fn handle_kbd_event_pull(pipeline: &mut KeyboardPipeline) {
 /// If encoding fails (which it cannot under the stable wire size, but
 /// we handle the typed error anyway), surface a typed error to the
 /// caller via `label = u64::MAX`.
-fn emit_key_event(ev: &KeyEvent) {
+fn emit_key_event(ev: &KeyEvent, reply_cap: u32) {
     let mut buf = [0u8; KEY_EVENT_WIRE_SIZE];
     match ev.encode(&mut buf) {
         Ok(_) => {
@@ -350,17 +408,17 @@ fn emit_key_event(ev: &KeyEvent) {
                     STDOUT_FILENO,
                     "kbd_server: error: ipc_store_reply_bulk failed; replying with sentinel\n",
                 );
-                syscall_lib::ipc_reply(REPLY_CAP_HANDLE, u64::MAX, 0);
+                syscall_lib::ipc_reply(reply_cap, u64::MAX, 0);
                 return;
             }
-            syscall_lib::ipc_reply(REPLY_CAP_HANDLE, KBD_EVENT_PULL, 0);
+            syscall_lib::ipc_reply(reply_cap, KBD_EVENT_PULL, 0);
         }
         Err(_) => {
             syscall_lib::write_str(
                 STDOUT_FILENO,
                 "kbd_server: error: KeyEvent encode failed; replying with sentinel\n",
             );
-            syscall_lib::ipc_reply(REPLY_CAP_HANDLE, u64::MAX, 0);
+            syscall_lib::ipc_reply(reply_cap, u64::MAX, 0);
         }
     }
 }
@@ -397,26 +455,38 @@ fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, "kbd_server: ready\n");
 
     let mut pipeline = KeyboardPipeline::new();
+    // Phase 78c — bounded queue of USB-HID-injected events, drained into
+    // `KBD_EVENT_PULL` replies ahead of the PS/2 stream.
+    let mut injected: alloc::collections::VecDeque<KeyEvent> = alloc::collections::VecDeque::new();
 
-    // Service loop: dispatch by label. Each branch must end in an
-    // `ipc_reply` so the reply-cap slot is freed before the next recv.
-    let mut label = syscall_lib::ipc_recv(ep_handle);
+    // Service loop: dispatch by label. Each branch must end in an `ipc_reply`
+    // so the reply-cap slot is freed before the next recv. We use
+    // `ipc_recv_msg` (not `ipc_recv`) so the `KBD_EVENT_INJECT` path can read
+    // the 20-byte `KeyEvent` bulk payload, and reply on the kernel-staged
+    // reply cap (`msg.data[3]`) rather than a hardcoded slot.
+    let mut msg = syscall_lib::IpcMessage::new(0);
+    let mut bulk = [0u8; KEY_EVENT_WIRE_SIZE];
 
     loop {
-        match label {
-            KBD_READ => handle_kbd_read(),
-            KBD_EVENT_PULL => handle_kbd_event_pull(&mut pipeline),
-            KBD_TRY_READ => handle_kbd_try_read(),
+        let rc = syscall_lib::ipc_recv_msg(ep_handle, &mut msg, &mut bulk);
+        if rc == u64::MAX {
+            continue;
+        }
+        let reply_cap = msg.reply_cap_handle().unwrap_or(REPLY_CAP_HANDLE);
+        match rc {
+            KBD_READ => handle_kbd_read(reply_cap),
+            KBD_EVENT_PULL => handle_kbd_event_pull(&mut pipeline, &mut injected, reply_cap),
+            KBD_TRY_READ => handle_kbd_try_read(reply_cap),
+            KBD_EVENT_INJECT => handle_kbd_inject(&mut injected, &bulk, reply_cap),
             _ => {
                 // Unknown label — typed error, observable to clients.
                 syscall_lib::write_str(
                     STDOUT_FILENO,
                     "kbd_server: warn: unknown IPC label; replying with sentinel\n",
                 );
-                syscall_lib::ipc_reply(REPLY_CAP_HANDLE, u64::MAX, 0);
+                syscall_lib::ipc_reply(reply_cap, u64::MAX, 0);
             }
         }
-        label = syscall_lib::ipc_recv(ep_handle);
     }
 }
 
