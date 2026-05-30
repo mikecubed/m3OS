@@ -8775,24 +8775,28 @@ fn xhci_enum_smoke_steps(timeout_secs: u64) -> Vec<SmokeStep> {
 
 /// Phase 78c Track B.3 — the `usb-smoke` acceptance gate.
 ///
-/// Boots m3OS with `-device qemu-xhci -device usb-kbd`, then drives a **real**
-/// keystroke over QMP and asserts it travels the full USB input chain to
-/// `kbd_server`. Unlike a `[xhci] N ports` serial sentinel (which proves only
-/// that the daemon ran), this asserts, in causal order:
+/// Boots m3OS with `-device qemu-xhci -device usb-kbd -device usb-mouse`, then
+/// drives **real** keyboard and mouse input over QMP and asserts each travels
+/// the full USB input chain. Unlike a `[xhci] N ports` serial sentinel (which
+/// proves only that the daemon ran), this asserts, in causal order:
 ///
 /// 1. `XHCI_BRINGUP:enable-slot:OK` — an Enable Slot Command Completion event.
 /// 2. `XHCI_USB:server-ready` — the xHCI USB IPC server is registered + bound.
-/// 3. `usb-hid: polling` — the HID class driver bound the keyboard and is
-///    polling its interrupt-IN endpoint.
+/// 3. `usb-hid: polling` — the HID class driver bound the devices and is
+///    polling their interrupt-IN endpoints.
 /// 4. A QMP `send-key` injects `a` into the emulated `usb-kbd` (so an
 ///    interrupt-IN report is produced **only in response to the injected key**
 ///    — injection precedes the observation, never after).
 /// 5. `USB_HID:key kind=0 sym=0x00000061` — the resulting interrupt-IN Transfer
 ///    event was decoded to a `KeyEvent` for `a` and accepted by `kbd_server`
 ///    (the `usb-hid` inject blocks on kbd_server's ack before logging this).
-///
-/// The mouse path is host-tested only (`kernel-core::usb::hid`) — QEMU's
-/// `usb-mouse` is not attached and live mouse input is not asserted here.
+/// 6. A QMP relative-motion event into the emulated `usb-mouse` produces
+///    `USB_HID:mouse` — a live boot-mouse interrupt-IN report decoded by
+///    `usb-hid` and injected into `mouse_server`.
+/// 7. Typing a recognizable string over USB changes the focused term's prompt
+///    band by at least `MIN_PROMPT_ROWS` scanlines (QMP `screendump` pixel
+///    diff), proving the keystrokes render as glyphs end-to-end — not just that
+///    `kbd_server` accepted them.
 ///
 /// Opt-in pre-push gate via `M3OS_USB_REGRESSION=1`.
 fn cmd_usb_smoke(args: &SmokeBootArgs) {

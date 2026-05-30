@@ -48,14 +48,14 @@ For a HID interface (`bInterfaceClass 0x03`), `SET_PROTOCOL(0)` selects fixed bo
 
 - Consumes the enumerated, Configure-Endpoint'd interrupt-IN endpoint from 78b via the `usb-core` `UsbClient`.
 - Reuses Phase 56's `KeyEvent` / `PointerEvent` wire formats (`kernel-core/src/input/events.rs`) verbatim — no new wire format.
-- Slots `usb-hid` into the `session_manager` start sequence (`DECLARED_SESSION_STEP_NAMES`, `kernel-core/src/session_supervisor.rs:89`) before `greeter`, as a static daemon receiving device-attach notifications over IPC.
+- Ships `usb-hid` as a static service-config daemon (`command=/drivers/usb-hid`, `type=daemon`, `restart=on-failure`, `depends=xhci_driver`), wired through `xtask::populate_ext2_files` + init `KNOWN_CONFIGS` like the other USB drivers — **not** a `DECLARED_SESSION_STEP_NAMES` session step. It discovers its bound devices by walking the xHCI server's `NextAttach` cursor (a pull), not a push notification channel.
 
 ## Implementation Outline
 
 1. `usb-hid` Boot keyboard: `SET_PROTOCOL(0)` + `SET_IDLE(0)`, poll interrupt-IN, decode → `KeyEvent`.
 2. `usb-hid` Boot mouse: decode → `PointerEvent`.
 3. Add the inject path to `kbd_server` / `mouse_server` (bounded pending-event queue + new IPC label).
-4. Stage `usb-hid` under `/drivers/`; wire its service config + `session_manager` ordering.
+4. Stage `usb-hid` under `/drivers/`; wire its service config + init `KNOWN_CONFIGS` ordering (`depends=xhci_driver`).
 5. Land the `usb-smoke` QMP gate (inject key → Transfer event → prompt).
 6. Report-Protocol skeleton (host-tested, deferred from live use).
 7. Write the learning doc; bump kernel to `0.78.2` + add the `AGENTS.md` capability entry.

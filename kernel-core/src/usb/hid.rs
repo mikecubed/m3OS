@@ -363,9 +363,15 @@ impl BootKeyboardDecoder {
             let new_keys = &report[2..8];
             let old_keys = &self.prev[2..8];
 
-            // Newly pressed: in new but not in old.
-            for &usage in new_keys {
+            // Newly pressed: in new but not in old. A usage repeated across
+            // multiple array slots within one (malformed) report must yield
+            // only a single Down edge, so skip a slot whose usage already
+            // appeared earlier in this report.
+            for (i, &usage) in new_keys.iter().enumerate() {
                 if usage == 0 {
+                    continue;
+                }
+                if new_keys[..i].contains(&usage) {
                     continue;
                 }
                 if !old_keys.contains(&usage)
@@ -379,9 +385,13 @@ impl BootKeyboardDecoder {
                 }
             }
 
-            // Newly released: in old but not in new.
-            for &usage in old_keys {
+            // Newly released: in old but not in new. De-duplicate the same way
+            // so a repeated usage in the prior report releases only once.
+            for (i, &usage) in old_keys.iter().enumerate() {
                 if usage == 0 {
+                    continue;
+                }
+                if old_keys[..i].contains(&usage) {
                     continue;
                 }
                 if !new_keys.contains(&usage)
@@ -396,8 +406,19 @@ impl BootKeyboardDecoder {
             }
         }
 
-        // Store the new report as the previous for the next diff.
-        self.prev = *report;
+        // Store the new report as the previous for the next diff. On a rollover
+        // frame the key array is all-0x01 sentinels rather than real keys:
+        // overwriting `prev` with it would erase the record of keys that were
+        // held *before* the rollover, so their eventual release could never be
+        // diffed and they would stick down forever. Preserve the previous key
+        // array across a rollover and update only the modifier/reserved bytes
+        // (the modifier byte was diffed normally above).
+        if rollover {
+            self.prev[0] = report[0];
+            self.prev[1] = report[1];
+        } else {
+            self.prev = *report;
+        }
     }
 }
 
@@ -716,6 +737,78 @@ mod tests {
             array_edges, 0,
             "no array-derived edges expected during rollover"
         );
+    }
+
+    /// A key held *before* a rollover frame must still produce an Up edge when
+    /// it is later released. Regression: the decoder used to overwrite `prev`
+    /// with the all-0x01 rollover sentinel, erasing the held-key record so the
+    /// release was never diffed and the key stuck down.
+    #[test]
+    fn keys_held_before_rollover_release_correctly() {
+        let mut dec = BootKeyboardDecoder::new();
+        let mut edges = alloc::vec::Vec::new();
+
+        // Hold A and B.
+        let ab = [0x00, 0x00, 0x04, 0x05, 0x00, 0x00, 0x00, 0x00];
+        dec.decode(&ab, &mut edges);
+        assert_eq!(edges.len(), 2, "expected two Down edges for A and B");
+        edges.clear();
+
+        // Rollover frame (more keys than the array can report): all 0x01.
+        let rollover = [0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01];
+        dec.decode(&rollover, &mut edges);
+        assert!(
+            edges.is_empty(),
+            "rollover frame must not emit any key edges"
+        );
+        edges.clear();
+
+        // Release everything. A and B (held before the rollover) must each
+        // produce exactly one Up edge.
+        dec.decode(&empty_report(), &mut edges);
+        assert_eq!(
+            edges.len(),
+            2,
+            "expected two Up edges after rollover release"
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.keycode == KEY_A.0 && e.kind == KeyEventKind::Up),
+            "A must release after a rollover"
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.keycode == KEY_B.0 && e.kind == KeyEventKind::Up),
+            "B must release after a rollover"
+        );
+    }
+
+    /// A malformed report listing the same usage in two array slots must yield
+    /// only one Down edge (and, on release, only one Up edge).
+    #[test]
+    fn duplicate_usage_in_report_yields_single_edge() {
+        let mut dec = BootKeyboardDecoder::new();
+        let mut edges = alloc::vec::Vec::new();
+
+        // Usage 0x04 (A) appears twice.
+        let dup = [0x00, 0x00, 0x04, 0x04, 0x00, 0x00, 0x00, 0x00];
+        dec.decode(&dup, &mut edges);
+        let a_downs = edges
+            .iter()
+            .filter(|e| e.keycode == KEY_A.0 && e.kind == KeyEventKind::Down)
+            .count();
+        assert_eq!(a_downs, 1, "duplicate usage must yield a single Down edge");
+        edges.clear();
+
+        // Release: a single Up edge despite the duplicate in the prior report.
+        dec.decode(&empty_report(), &mut edges);
+        let a_ups = edges
+            .iter()
+            .filter(|e| e.keycode == KEY_A.0 && e.kind == KeyEventKind::Up)
+            .count();
+        assert_eq!(a_ups, 1, "duplicate usage must yield a single Up edge");
     }
 
     /// Identical reports produce no edges.

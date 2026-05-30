@@ -346,8 +346,32 @@ fn program_main(_args: &[&str]) -> i32 {
     let want_mouse = devices
         .iter()
         .any(|d| d.notice.interface_protocol == PROTOCOL_HID_MOUSE);
-    let kbd_ep = if want_kbd { lookup("kbd") } else { None };
-    let mouse_ep = if want_mouse { lookup("mouse") } else { None };
+    // Wait (bounded) for the input servers to register before looking them up:
+    // `usb_hid` only `depends=xhci_driver`, so on a cold boot it can win the
+    // race against `kbd_server` / `mouse_server`. A plain `lookup` that loses
+    // that race returns `None` once and the device's input is dead for the
+    // process's lifetime. Mirror the bounded wait already used for the `usb`
+    // service so a genuinely-absent server still exits the wait cleanly.
+    let kbd_ep = if want_kbd {
+        if syscall_lib::ipc_wait_service("kbd", 10_000) {
+            lookup("kbd")
+        } else {
+            syscall_lib::write_str(STDOUT_FILENO, "usb-hid: 'kbd' service never appeared\n");
+            None
+        }
+    } else {
+        None
+    };
+    let mouse_ep = if want_mouse {
+        if syscall_lib::ipc_wait_service("mouse", 10_000) {
+            lookup("mouse")
+        } else {
+            syscall_lib::write_str(STDOUT_FILENO, "usb-hid: 'mouse' service never appeared\n");
+            None
+        }
+    } else {
+        None
+    };
 
     // 3b. Put each HID interface into Boot Protocol and suppress duplicate
     //     reports (SET_PROTOCOL(0) / SET_IDLE(0)) via the xHCI server's

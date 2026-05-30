@@ -733,11 +733,18 @@ impl Controller {
             None
         };
 
-        let sc = self
-            .slots
-            .iter_mut()
-            .find(|s| s.slot_id == slot_id)
-            .expect("slot context allocated");
+        // `slot_id` arrives from an untrusted `ControlRequest` IPC message
+        // (the server decodes it from a class driver's bulk payload), so a
+        // bogus or stale id must NOT panic — `panic = abort` would take the
+        // whole xHCI USB server down. Return `None` (the server maps it to a
+        // `ControlData` error reply) exactly as the poll path does.
+        let Some(sc) = self.slots.iter_mut().find(|s| s.slot_id == slot_id) else {
+            write_str(
+                STDOUT_FILENO,
+                "[xhci] ctrl-xfer: unknown slot id — rejecting request\n",
+            );
+            return None;
+        };
 
         // Build and enqueue the three-stage control transfer on the EP0 ring.
         let tt = if len == 0 {

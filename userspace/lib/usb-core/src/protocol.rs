@@ -385,6 +385,16 @@ fn put_u32(v: &mut Vec<u8>, x: u32) {
 }
 #[inline]
 fn put_bytes(v: &mut Vec<u8>, b: &[u8]) {
+    // The length prefix is a u16, so a body of 64 KiB or more would wrap and
+    // desync the frame on decode. Every live producer is bounded well below
+    // this (HID reports <= wMaxPacketSize, ControlData <= a u16 `length`, and
+    // both ends size their bulk buffers to USB_MSG_MAX); the assert documents
+    // and guards that invariant should a future (Phase 90) descriptor path
+    // grow the payload past the prefix width.
+    debug_assert!(
+        b.len() <= u16::MAX as usize,
+        "put_bytes: body length exceeds the u16 wire prefix"
+    );
     put_u16(v, b.len() as u16);
     v.extend_from_slice(b);
 }

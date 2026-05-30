@@ -165,10 +165,14 @@ with USB events draining before the PS/2 stream. The Phase 56 `InputDispatcher`
 
 The `usb-smoke` gate injects a real keystroke over QMP `send-key` into the
 emulated QEMU `usb-kbd` device and asserts the decoded `KeyEvent`
-(`USB_HID:key kind=0 sym=0x00000061`). A serial line like
-`[xhci] N ports detected` proves only that the daemon ran; only QMP injection
-proves the full hardware chain — controller event ring → interrupter → IRQ drain
-→ HID decode → kbd_server → prompt.
+(`USB_HID:key kind=0 sym=0x00000061`). It then injects relative mouse motion
+into the emulated `usb-mouse` and asserts a live boot-mouse report decoded
+(`USB_HID:mouse`), and finally types a recognizable string and asserts — via a
+QMP `screendump` pixel diff of the focused term's prompt band — that the
+keystrokes rendered as glyphs. A serial line like `[xhci] N ports detected`
+proves only that the daemon ran; only QMP injection proves the full hardware
+chain — controller event ring → interrupter → IRQ drain → HID decode →
+kbd_server/mouse_server → rendered prompt.
 
 ## Key Files
 
@@ -204,14 +208,16 @@ proves the full hardware chain — controller event ring → interrupter → IRQ
   **not wired to any live device at 1.0**. Boot Protocol handles every standard
   keyboard and mouse; Report Protocol unlocks touchpads, gaming mice, and
   multi-touch and will come later.
-- **Live mouse** — the Boot-Protocol mouse decode is host-tested in
-  `kernel-core::usb::hid` (including 4-byte report → `PointerEvent`), but the
-  live `usb-mouse` device path is **not wired at 1.0**. The `usb-smoke` gate
-  covers the keyboard chain; mouse injection proved unreachable in the QMP
-  harness at this milestone. Live mouse + multi-slot is a tracked post-1.0 item.
-- **Multi-device / multi-slot** — the merged `Controller` holds one `slot_ctx`.
-  The enumeration state machine supports multiple slots; multi-device support
-  in the live server is a post-1.0 refactor.
+- **Live mouse** — the Boot-Protocol mouse path **is** wired and live at 1.0:
+  the `usb-mouse` device is enumerated, its interrupt-IN reports are decoded by
+  `usb-hid` into `PointerEvent`s injected into `mouse_server`, and the
+  `usb-smoke` gate asserts a live boot-mouse report (`USB_HID:mouse`) from a
+  QMP-injected motion event. The decode logic is additionally host-tested in
+  `kernel-core::usb::hid` (including the 4-byte report → `PointerEvent`).
+- **Multi-device / multi-slot** — the merged `Controller` holds a
+  `Vec<SlotContext>` and serves keyboard + mouse on separate slots concurrently;
+  every per-slot operation looks up its context by `slot_id`. What remains
+  post-1.0 is multi-*controller* support, not multi-slot.
 - **Hot-plug** — devices are enumerated once at boot. There is no hot-plug event
   surface to userspace.
 
@@ -230,7 +236,7 @@ proves the full hardware chain — controller event ring → interrupter → IRQ
 
 - USB mass storage, USB audio, UVC video — post-1.0 class drivers
 - Report-Protocol live use — skeleton exists in `kernel-core/src/usb/hid_report.rs`
-- Live mouse over USB and multi-device / multi-slot controller management
+- Multi-*controller* management (multi-slot on a single controller is done)
 - Hot-plug event surface to userspace
 - USB-C / Power Delivery / DisplayPort alternate mode
 - xHCI Debug Capability (DbC) for kernel debug-over-USB

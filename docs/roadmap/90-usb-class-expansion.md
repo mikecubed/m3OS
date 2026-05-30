@@ -129,3 +129,37 @@ BOT wraps SCSI commands in a 31-byte Command Block Wrapper sent over the bulk-ou
 - USB CDC / Ethernet gadget (USB networking)
 - USB OTG / dual-role
 - Per-tier hub TT (Transaction Translator) bandwidth accounting for full/low-speed devices behind USB 2.0 hubs
+
+### Carry-over hardening from the Phase 78c review
+
+These are latent in the 78c xHCI server because the live HID-boot path never
+exercises them (it issues only zero-length `SET_PROTOCOL`/`SET_IDLE` control
+transfers and never reads descriptors over IPC), but the Phase 90 tracks that
+make `GetDescriptors` / `ControlRequest`-with-data / `SubmitTransfer` live must
+address them:
+
+- **DMA-buffer lifetime for repeated control reads.** `control_transfer`
+  allocates a fresh `DmaBuffer` per data-stage IN transfer, and `DmaBuffer::drop`
+  does **not** free the region (the kernel reclaims DMA only on process exit). In
+  the never-exiting USB server, a Phase-90 caller issuing many control IN reads
+  would leak monotonically. Fix when the path goes live: a persistent per-slot
+  control bounce buffer (as interrupt endpoints already keep), or a DMA-free
+  syscall.
+- **Interrupt reports lost during a blocking control transfer.**
+  `drain_for_transfer_event` / `drain_for_command_completion` discard non-matching
+  `TransferEvent`s instead of capturing + re-arming them the way
+  `service_interrupt_events` does. Harmless in 78c (control transfers happen once
+  at bring-up, before any interrupt endpoint is armed), but once control traffic
+  interleaves with active interrupt polling, a report that completes mid-transfer
+  would be dropped and its endpoint left un-rearmed. Route non-matching transfer
+  events through `capture_interrupt_report` + deferred re-arm.
+- **Inline `ControlData` capacity.** `USB_MSG_MAX` (1024) is smaller than the
+  maximum `ControlData` a u16 `length` can request; a large descriptor read would
+  decode to `None` (no crash, but silent data loss). Widen the buffer or page-grant
+  large control reads when `GetDescriptors` goes live.
+- **Inject-endpoint access control.** `KBD_EVENT_INJECT` / `MOUSE_EVENT_INJECT`
+  are reachable by any process that can look up `kbd` / `mouse`, so a hostile
+  ring-3 task could forge synthetic input. Gating these behind a private endpoint
+  (`PRIVATE_SERVICE_NAMES`) whose cap is granted only to `usb-hid` at spawn needs
+  a ring-3 cap-distribution mechanism that does not yet exist — track it with the
+  hot-plug / privileged-driver work.
