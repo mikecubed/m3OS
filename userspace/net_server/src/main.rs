@@ -61,6 +61,7 @@ const MAX_HANDLES: usize = 64;
 const MAX_BINDINGS: usize = 32;
 
 /// Negative errno values (matches kernel convention).
+const NEG_EAGAIN: u64 = (-11_i64) as u64;
 const NEG_EINVAL: u64 = (-22_i64) as u64;
 const NEG_EADDRINUSE: u64 = (-98_i64) as u64;
 const NEG_ENOTCONN: u64 = (-107_i64) as u64;
@@ -257,12 +258,15 @@ fn handle_connect(table: &mut HandleTable, handle: u64, packed_ip_port: u64) -> 
 
     let mut ephemeral_port: u16 = 0;
     if needs_bind {
+        // Ephemeral-source-port autobind exhaustion is EAGAIN (matching the
+        // kernel-direct sendto path and Linux autobind semantics), NOT
+        // EADDRINUSE — there is no specific in-use address the caller requested.
         let ep = match table.alloc_ephemeral() {
             Some(p) => p,
-            None => return (NEG_EADDRINUSE, 0),
+            None => return (NEG_EAGAIN, 0),
         };
         if !table.bind_port(ep) {
-            return (NEG_EADDRINUSE, 0);
+            return (NEG_EAGAIN, 0);
         }
         ephemeral_port = ep;
         let h = table.get_mut(idx).unwrap();

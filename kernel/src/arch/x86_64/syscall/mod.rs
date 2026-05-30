@@ -16275,22 +16275,30 @@ pub(super) fn sys_sendto(
                     } else {
                         // Phase 77 Track D.1 — kernel-direct unbound-UDP send:
                         // assign an ephemeral source port (Linux behaviour) so
-                        // the reply can be routed back. Range 0xC000.. matches
-                        // the connect/net_udp ephemeral range.
+                        // the reply can be routed back. Range 0xC000..=0xFFFF
+                        // (16384 ports) matches the connect/net_udp ephemeral
+                        // range.
                         //
-                        // Retry up to 8 candidates so two resolver lookups
-                        // racing on the same tick value do not silently collide
-                        // and mis-route the reply: only a port that actually
-                        // binds is used, and exhausting all 8 returns EAGAIN
-                        // rather than falsely marking the socket bound. The `if`
-                        // block below re-binds this same port (a no-op here,
-                        // since it is already bound) so the shared service path
-                        // is also registered.
+                        // Probe a persistent ROTATING counter rather than a
+                        // tick-derived window: the old 8-candidate loop derived
+                        // every candidate from the same near-constant
+                        // `tick_count`, so a cluster of ~8 contiguous bound ports
+                        // falsely returned EAGAIN with thousands of ports free.
+                        // The rotating counter spreads candidates across the
+                        // whole range; only a port that actually binds is used,
+                        // and exhausting the probe budget returns EAGAIN rather
+                        // than falsely marking the socket bound. The `if` block
+                        // below re-binds this same port (a no-op here, since it
+                        // is already bound) so the shared service path is also
+                        // registered.
+                        static EPHEMERAL_UDP_NEXT: core::sync::atomic::AtomicU16 =
+                            core::sync::atomic::AtomicU16::new(0);
                         let mut found_port = 0u16;
-                        for attempt in 0u16..8 {
-                            let cand = (crate::arch::x86_64::interrupts::tick_count() as u16)
-                                .wrapping_add(attempt)
-                                | 0xC000;
+                        for _ in 0..1024u16 {
+                            let n = EPHEMERAL_UDP_NEXT
+                                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                            // 0xC000 | (n & 0x3FFF) -> 0xC000..=0xFFFF, never 0.
+                            let cand = 0xC000u16 | (n & 0x3FFF);
                             if crate::net::udp::bind(cand) {
                                 found_port = cand;
                                 break;
@@ -16319,10 +16327,19 @@ pub(super) fn sys_sendto(
                     // arrive (mirrors the kernel-side bind in sys_bind/sys_connect).
                     if local_port == 0 && src_port != 0 {
                         let _ = crate::net::udp::bind(src_port);
-                        crate::net::with_socket_mut(handle, |s| {
+                        let associated = crate::net::with_socket_mut(handle, |s| {
                             s.local_port = src_port;
                             s.udp_bound = true;
                         });
+                        if associated.is_none() {
+                            // The socket was closed concurrently (another thread
+                            // sharing the fd table) between the snapshot above and
+                            // here, so no `SocketEntry` will carry this port and
+                            // the close path can never reclaim it. Release the
+                            // just-bound port now to avoid stranding one of the
+                            // 32 UDP binding slots until reboot.
+                            crate::net::udp::unbind(src_port);
+                        }
                     }
                     // Phase 55c Track G R1: surface EAGAIN when the ring-3 NIC
                     // driver is in a restart window.  Socket fd is already
