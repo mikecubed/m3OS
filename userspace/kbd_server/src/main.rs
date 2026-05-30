@@ -304,6 +304,19 @@ fn handle_kbd_inject(
     bulk: &[u8],
     reply_cap: u32,
 ) {
+    // Synthetic-input injection is privileged: only the driver TCB (e.g.
+    // `usb-hid`) may forge `KeyEvent`s. The public `kbd` service is reachable
+    // by any ring-3 task, so without this gate an untrusted process could
+    // inject keystrokes. The kernel authenticates the caller via the reply cap
+    // (an unforgeable `exec_path` check); reject anything outside `/drivers/`.
+    if !syscall_lib::ipc_peer_is_driver(reply_cap) {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "kbd_server: warn: KBD_EVENT_INJECT from non-driver caller; rejecting\n",
+        );
+        syscall_lib::ipc_reply(reply_cap, u64::MAX, 0);
+        return;
+    }
     match KeyEvent::decode(bulk) {
         Ok((ev, _)) => {
             if injected.len() >= INJECT_QUEUE_CAP {

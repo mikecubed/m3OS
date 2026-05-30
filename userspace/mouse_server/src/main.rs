@@ -415,6 +415,19 @@ fn handle_mouse_inject(
     bulk: &[u8],
     reply_cap: u32,
 ) {
+    // Synthetic-input injection is privileged: only the driver TCB (e.g.
+    // `usb-hid`) may forge `PointerEvent`s. The public `mouse` service is
+    // reachable by any ring-3 task, so without this gate an untrusted process
+    // could inject clicks/motion. The kernel authenticates the caller via the
+    // reply cap (an unforgeable `exec_path` check); reject non-driver callers.
+    if !syscall_lib::ipc_peer_is_driver(reply_cap) {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "mouse_server: warn: MOUSE_EVENT_INJECT from non-driver caller; rejecting\n",
+        );
+        syscall_lib::ipc_reply(reply_cap, u64::MAX, 0);
+        return;
+    }
     match PointerEvent::decode(bulk) {
         Ok((ev, _)) => {
             if injected.len() >= INJECT_QUEUE_CAP {

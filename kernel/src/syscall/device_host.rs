@@ -123,7 +123,7 @@ const DRIVER_EXEC_PATH_PREFIX: &str = "/drivers/";
 /// [`DRIVER_EXEC_PATH_PREFIX`]. A missing process entry (e.g. kernel task
 /// context where `pid == 0`) is treated as unauthorized — those callers
 /// should use the in-kernel `claim_pci_device_by_bdf` directly.
-fn is_authorized_driver_process(pid: Pid) -> bool {
+pub(crate) fn is_authorized_driver_process(pid: Pid) -> bool {
     let table = crate::process::PROCESS_TABLE.lock();
     match table.find(pid) {
         Some(p) => p.exec_path.starts_with(DRIVER_EXEC_PATH_PREFIX),

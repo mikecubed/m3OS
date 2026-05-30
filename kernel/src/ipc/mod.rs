@@ -200,6 +200,7 @@ pub use registry::RegistryError;
 /// | 25 | 0x1118 | `ipc_recv_with_caps(ep_cap, msg_ptr, buf_ptr, buf_len)` | `arg0..3` → label, `u64::MAX` on error (Phase 74 Track A) |
 /// | 26 | 0x1119 | `ipc_call_timeout(ep_cap, label, data0, deadline_ns)` | `arg0..3` → label or `NEG_ETIMEDOUT` (Phase 74 Track C) |
 /// | 27 | 0x111A | `ipc_recv_timeout(ep_cap, deadline_ns)` | `arg0..1` → label or `NEG_ETIMEDOUT` (Phase 74 Track C) |
+/// | 28 | 0x111B | `sys_ipc_peer_is_driver(reply_cap)` | `arg0 = reply_cap_handle` → `1` if caller is an authorized driver process, else `0` (Phase 78c) |
 ///
 /// Syscall 5 (`ipc_reply_recv`) uses only 3 args (reply_cap, label, ep_cap)
 /// because the syscall ABI currently forwards only 3 arguments through the
@@ -529,6 +530,29 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
             match cap {
                 Capability::Endpoint(ep_id) => ipc_recv_timeout(task_id, ep_id, arg1),
                 _ => u64::MAX,
+            }
+        }
+        28 => {
+            // sys_ipc_peer_is_driver(reply_cap_handle) -> 1 if the task that
+            // sent the message this reply cap answers is an authorized driver
+            // process (exec_path under `/drivers/`), else 0.
+            //
+            // Phase 78c review follow-up. Input servers (`kbd_server` /
+            // `mouse_server`) accept synthetic-input injection only from the
+            // driver TCB; without this gate any ring-3 task that can look up
+            // the public `kbd` / `mouse` service could forge keystrokes and
+            // clicks. The kernel is the only party that can authenticate the
+            // sender: it resolves the reply cap to the caller's `TaskId` and
+            // checks the kernel-recorded (unforgeable) `exec_path`. Fails
+            // closed — a non-Reply cap or an unknown task returns 0.
+            match cap {
+                Capability::Reply(sender) => match scheduler::pid_for_task_id(sender) {
+                    Some(pid) if crate::syscall::device_host::is_authorized_driver_process(pid) => {
+                        1
+                    }
+                    _ => 0,
+                },
+                _ => 0,
             }
         }
         _ => u64::MAX,

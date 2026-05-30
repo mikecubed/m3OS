@@ -157,9 +157,11 @@ address them:
   maximum `ControlData` a u16 `length` can request; a large descriptor read would
   decode to `None` (no crash, but silent data loss). Widen the buffer or page-grant
   large control reads when `GetDescriptors` goes live.
-- **Inject-endpoint access control.** `KBD_EVENT_INJECT` / `MOUSE_EVENT_INJECT`
-  are reachable by any process that can look up `kbd` / `mouse`, so a hostile
-  ring-3 task could forge synthetic input. Gating these behind a private endpoint
-  (`PRIVATE_SERVICE_NAMES`) whose cap is granted only to `usb-hid` at spawn needs
-  a ring-3 cap-distribution mechanism that does not yet exist — track it with the
-  hot-plug / privileged-driver work.
+
+Inject-endpoint access control was **resolved in 78c** rather than deferred:
+`KBD_EVENT_INJECT` / `MOUSE_EVENT_INJECT` are now gated by
+`sys_ipc_peer_is_driver` (syscall `0x111B`), which authenticates the caller via
+its reply cap and admits only driver-TCB processes (`exec_path` under
+`/drivers/`). Tightening this further to a single named injector, or to a true
+capability handed to `usb-hid` at spawn, waits on a ring-3 cap-distribution
+mechanism that does not yet exist — track it with the privileged-driver work.

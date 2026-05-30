@@ -1551,7 +1551,10 @@ mod syscall_nr {
     // timeouts (0x1119/0x111A). Page-grant transport (Track B) lives in
     // the custom-syscall range at 0x1020/0x1021 because it is not an
     // endpoint operation. See `kernel/src/ipc/page_grant.rs`.
-    pub const IPC_LAST: u64 = 0x111A;
+    // Phase 78c review follow-up: `sys_ipc_peer_is_driver` (0x111B) lets an
+    // input server authenticate the caller of its inject path via the reply
+    // cap, so only authorized driver processes can forge synthetic input.
+    pub const IPC_LAST: u64 = 0x111B;
 
     // -- device host (Phase 55b Track B) --
     //
