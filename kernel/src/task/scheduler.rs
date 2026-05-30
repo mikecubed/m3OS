@@ -2946,6 +2946,14 @@ pub fn global_cpu_times() -> (u64, u64, u64) {
     let sched = scheduler_lock();
     let (mut user, mut system, mut idle) = (0u64, 0u64, 0u64);
     for (idx, task) in sched.tasks.iter().enumerate() {
+        // Skip Dead-but-not-yet-recycled slots: their tick counters are frozen
+        // (never reset until the slot is reused by alloc_task_slot) and would
+        // otherwise overstate cumulative busy time, inconsistent with the
+        // Dead-filtering the sibling accessors apply. htop deltas successive
+        // samples so this never affected CPU%, but the absolute totals were wrong.
+        if task.state == TaskState::Dead {
+            continue;
+        }
         let u = task.user_ticks.load(core::sync::atomic::Ordering::Relaxed);
         let s = task
             .system_ticks
@@ -4124,10 +4132,14 @@ pub enum WakeOutcome {
 ///    `pi_lock`.  Returns `AlreadyAwake` if the CAS fails.
 /// 3. **Mirror to v1 fields** under `SCHEDULER.lock` (shadow-lock dual write,
 ///    required until Track E.3 removes `Task::state` / `Task::wake_deadline`).
-/// 4. **Spin-wait** on `Task::on_cpu == false` before enqueuing (Linux
-///    `p->on_cpu` `smp_cond_load_acquire` pattern, `kernel/sched/core.c`,
-///    `try_to_wake_up`).  This replaces v1's `PENDING_SWITCH_OUT[core]`
-///    RSP-publication guard.
+/// 4. **Enqueue now, or DEFER to the dispatch epilogue.** Read `Task::on_cpu`
+///    inside the same validated critical section. If `on_cpu == true` the task
+///    is still mid-switch-out on its core, so we must NOT enqueue it here (a
+///    wait-free handoff replaces the old cross-core `on_cpu` busy-spin, which
+///    could deadlock two cores each waiting on the other's dispatch epilogue):
+///    return `Woken` and let the dispatch epilogue enqueue it once it clears
+///    `on_cpu` and observes `state == Ready` (both under `SCHEDULER.lock`, so
+///    exactly one path enqueues). If `on_cpu == false`, fall through to step 5.
 /// 5. **Enqueue** to `assigned_core` run queue via [`enqueue_to_core`].
 ///    If the assigned core differs from the caller's core, [`enqueue_to_core`]
 ///    already sends a reschedule IPI (`IPI_RESCHEDULE` vector, `smp::ipi`),
@@ -4140,10 +4152,14 @@ pub enum WakeOutcome {
 /// brief `SCHEDULER.lock` and drops it.  Steps 2+3 acquire `pi_lock` OUTER
 /// and then `SCHEDULER.lock` INNER **simultaneously** so the canonical CAS
 /// and the scheduler-visible mirror are atomic with respect to a racing
-/// `block_current_until` self-revert.  Step 4's `on_cpu` spin-wait and
-/// step 5's enqueue run with both locks dropped (Linux pattern); a
-/// self-revert that interleaves there is harmless — `pick_next`'s
-/// `state != Ready` filter silently drops any stale queue entry.
+/// `block_current_until` self-revert.  Step 4's `on_cpu` read happens inside
+/// that validated critical section; the step-5 enqueue (when not deferred) runs
+/// with both locks dropped, and a self-revert that interleaves there is
+/// harmless — `pick_next`'s `state != Ready` filter silently drops any stale
+/// queue entry. When the enqueue is deferred to the dispatch epilogue, the
+/// epilogue's clear-`on_cpu` + recheck-`Ready` runs under `SCHEDULER.lock`, so
+/// the waker (which read `on_cpu == true` under the same lock) and the epilogue
+/// can never both enqueue nor both skip — the task is enqueued exactly once.
 ///
 /// # Identity revalidation
 ///
@@ -4157,8 +4173,8 @@ pub enum WakeOutcome {
 /// the recycled task's pi_lock for the validation read is benign: we read
 /// state, find identity mismatch, release without writing.
 ///
-/// `assigned_core` and `on_cpu_ptr` are also re-read inside the validated
-/// critical section so step 4's spin-wait and step 5's enqueue use values
+/// `assigned_core` and `on_cpu` are also re-read inside the validated
+/// critical section so step 4's defer decision and step 5's enqueue use values
 /// fresh from the validated slot, not stale values from step 1's snapshot.
 ///
 /// # Constraints
@@ -4169,9 +4185,11 @@ pub enum WakeOutcome {
 ///
 /// # References
 ///
-/// - Linux `try_to_wake_up`, `kernel/sched/core.c` — `p->on_cpu`
-///   `smp_cond_load_acquire` spin-wait before `ttwu_queue`; cross-core
-///   IPI via `smp_send_reschedule` inside `ttwu_queue`.
+/// - Linux `try_to_wake_up`, `kernel/sched/core.c` — m3OS replaces Linux's
+///   `p->on_cpu` `smp_cond_load_acquire` spin-before-`ttwu_queue` with a
+///   wait-free defer-to-dispatch-epilogue handoff (see step 4); cross-core
+///   IPI via `smp_send_reschedule` inside `ttwu_queue` is mirrored by
+///   [`enqueue_to_core`]'s `IPI_RESCHEDULE`.
 /// - m3OS handoff 2026-04-25:
 ///   `docs/handoffs/57a-scheduler-rewrite-v2-transitions.md` (wake side
 ///   steps 1–5).
@@ -4232,11 +4250,11 @@ fn wake_task_v2_with(
     //
     // The Vec never shrinks; slots are Dead-recycled but the memory at
     // `tasks[idx]` is stable.  We capture only `idx` and `pi_lock_ptr` here
-    // because everything else (`assigned_core`, `on_cpu_ptr`) MUST be re-read
+    // because everything else (`assigned_core`, `on_cpu`) MUST be re-read
     // inside the validated critical section after revalidating the slot's
     // identity — otherwise a recycle between step 1 and step 3 would let
-    // us spin / enqueue using stale values from the previous task in the
-    // slot.
+    // us decide the defer/enqueue using stale values from the previous task in
+    // the slot.
     let (idx, pi_lock_ptr) = {
         let sched = scheduler_lock();
         let idx = match sched.find(id) {

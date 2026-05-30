@@ -785,7 +785,7 @@ fn render_status(proc: ProcessSnapshot) -> String {
     // VmRSS upper-bound: everything mapped is treated as resident in this model.
     let vm_rss_kib = vm_size_kib;
     alloc::format!(
-        "Name:\t{name}\nState:\t{state}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nThreads:\t1\nVmSize:\t{} kB\nVmRSS:\t{} kB\nVmData:\t{} kB\nVmStk:\t{} kB\nCwd:\t{}\n",
+        "Name:\t{name}\nState:\t{state}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nThreads:\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nVmData:\t{} kB\nVmStk:\t{} kB\nCwd:\t{}\n",
         proc.tgid,
         proc.pid,
         proc.ppid,
@@ -797,6 +797,9 @@ fn render_status(proc: ProcessSnapshot) -> String {
         proc.egid,
         proc.egid,
         proc.egid,
+        // Real thread count: thread_tids is the full group-member set for the
+        // process-level view and [tid] for the per-thread view (Linux-correct).
+        proc.thread_tids.len(),
         vm_size_kib,
         vm_rss_kib,
         vm_data_kib,
