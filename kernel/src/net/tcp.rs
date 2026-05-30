@@ -30,11 +30,26 @@ fn log_tcp_ooo_drop(seq: u32, rcv_nxt: u32, len: usize) {
     }
 }
 
-/// Per-connection cap on outstanding (unacknowledged) bytes. Bounds the
-/// retransmit queue's memory footprint; the effective send window is the
-/// smaller of this and the peer's advertised window. At 64 connections this is
-/// a 4 MiB worst case, but the peer window keeps it far lower in practice.
+/// Per-connection cap on outstanding (unacknowledged) bytes. The effective send
+/// window is the smaller of this and the peer's advertised window.
 const MAX_INFLIGHT_BYTES: usize = 64 * 1024;
+
+/// Per-connection cap on the number of queued (unacknowledged) *segments*.
+///
+/// `MAX_INFLIGHT_BYTES` bounds the outstanding payload bytes, but NOT the
+/// segment count: there is no Nagle/coalescing, so each `tcp_send` call queues
+/// exactly one `RetransmitSeg` (≈48 B of metadata + a heap `Vec` for the
+/// payload) regardless of payload size. Without this cap, a peer advertising a
+/// large window then ceasing to ACK, combined with a local app doing many
+/// 1-byte writes, could queue ~65 536 tiny segments per connection — several
+/// MiB of per-segment metadata that the byte cap does not catch, and across
+/// enough connections enough to exhaust the kernel heap. Capping the segment
+/// count bounds the metadata footprint: 256 segments × ≈96 B ≈ 24 KiB/conn,
+/// so ≈1.5 MiB across 64 connections worst case. 256 also leaves ample
+/// headroom for legitimate bursts (a full 64 KiB window is only 16 MSS-sized
+/// segments). Overflow is treated exactly like a full window (`tcp_send`
+/// returns 0 → the send syscall blocks / `EAGAIN`s / `EPIPE`s).
+const MAX_INFLIGHT_SEGMENTS: usize = 256;
 
 /// Outbound TCP segments queued during `handle_segment` or other state-machine
 /// methods that run under `TCP_CONNS.lock()`. Sending must happen AFTER the
@@ -269,12 +284,24 @@ impl TcpConnection {
     /// window is currently full — the caller blocks or reports `EAGAIN`).
     ///
     /// Flow control: outstanding (unacked) bytes are capped at the smaller of
-    /// the peer's advertised window and `MAX_INFLIGHT_BYTES`. When nothing is
-    /// outstanding at least one segment is always accepted, so a small or
-    /// transiently-zero advertised window cannot deadlock the sender (the ACK
-    /// that reopens the window can only arrive once we have sent something).
+    /// the peer's advertised window and `MAX_INFLIGHT_BYTES`, and the queued
+    /// segment count at `MAX_INFLIGHT_SEGMENTS` (bounding per-segment metadata
+    /// under uncoalesced tiny writes). When nothing is outstanding at least one
+    /// segment is always accepted, so a small or transiently-zero advertised
+    /// window cannot deadlock the sender (the ACK that reopens the window can
+    /// only arrive once we have sent something).
     fn tcp_send(&mut self, data: &[u8], pending: &mut PendingTx) -> usize {
         if self.state != TcpState::Established || data.is_empty() {
+            return 0;
+        }
+        // Bound the queued-segment count (not just the byte count): with no
+        // coalescing, many tiny writes to a non-ACKing peer would otherwise
+        // grow the retransmit queue's metadata footprint without bound. A full
+        // queue is treated like a full window — return 0 so the caller blocks /
+        // `EAGAIN`s. Segments are only ever queued while bytes are unacked
+        // (`in_flight > 0`), so this never trips the zero-window-deadlock
+        // guarantee below (which applies only when nothing is outstanding).
+        if self.retransmit.len() >= MAX_INFLIGHT_SEGMENTS {
             return 0;
         }
         let in_flight = self.snd_nxt.wrapping_sub(self.snd_una) as usize;
