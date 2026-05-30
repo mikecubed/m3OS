@@ -334,6 +334,26 @@ pub fn cr4_smap_enabled() -> bool {
     cr4 & (1 << 21) != 0
 }
 
+/// True if `EFLAGS.AC` (bit 18) is currently set on this core.
+pub fn eflags_ac_set() -> bool {
+    use x86_64::registers::rflags::{self, RFlags};
+    rflags::read().contains(RFlags::ALIGNMENT_CHECK)
+}
+
+/// Debug-only assertion that SMAP is currently *enforcing*: when `CR4.SMAP` is
+/// set, `EFLAGS.AC` must be 0 (SMAP only blocks ring-0 access to user pages
+/// while `AC == 0`). Stripped in release builds; in a debug kernel it catches a
+/// ring-0 path that left AC set — e.g. a `popf`/`iret` that restored a
+/// firmware-set AC, or an interrupt/exception entry that forgot to `clac`
+/// (PR #201 audit) — turning a silent SMAP-disabled window into a loud panic.
+#[inline(always)]
+pub fn debug_assert_smap_enforcing() {
+    debug_assert!(
+        !cr4_smap_enabled() || !eflags_ac_set(),
+        "SMAP enabled but EFLAGS.AC=1 — SMAP is non-enforcing on this ring-0 path"
+    );
+}
+
 #[derive(Clone, Copy)]
 struct CpuidRaw {
     eax: u32,

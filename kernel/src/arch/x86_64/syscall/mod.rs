@@ -1633,6 +1633,10 @@ pub extern "C" fn syscall_handler(
 ) -> u64 {
     use syscall_nr::*;
 
+    // SMAP invariant: SYSCALL entry clears EFLAGS.AC via SFMASK, so SMAP must be
+    // enforcing here. Debug-only; validates the SFMASK setup did not regress.
+    crate::arch::x86_64::cpuid::debug_assert_smap_enforcing();
+
     // Phase 52d B.1: snapshot user return state once at syscall entry,
     // before any blocking or yield path can run.  This makes the task's
     // `UserReturnState` the authoritative source of truth for the
@@ -2500,13 +2504,13 @@ fn do_clear_child_tid(pid: crate::process::Pid) {
         // Waking an extra (always-empty in practice) private waiter is harmless
         // for a lock-release wake — a spuriously woken lock waiter re-contends.
         use crate::process::futex::{FUTEX_BITSET_MATCH_ANY, FUTEX_TABLE};
-        let mut keys: [(u64, u64); 2] = [(0u64, clear_tid_addr), (futex_root, clear_tid_addr)];
+        let keys: [(u64, u64); 2] = [(0u64, clear_tid_addr), (futex_root, clear_tid_addr)];
         // Dedup when futex_root == 0 so we don't double-scan the same key.
         let n_keys = if futex_root == 0 { 1 } else { 2 };
         let to_wake = {
             let mut table = FUTEX_TABLE.lock();
             let mut wake_ids = alloc::vec::Vec::new();
-            for key in keys.iter_mut().take(n_keys) {
+            for key in keys.iter().take(n_keys) {
                 let mut woke_this_key = false;
                 if let Some(waiters) = table.get_mut(key) {
                     let mut i = 0;
@@ -19251,6 +19255,22 @@ const KTRACE_FOCUS_BATCH: usize = 256;
 ///
 /// Returns `u64::MAX` on error.
 pub(super) fn sys_ktrace(cmd: u64, a: u64, b: u64, c: u64) -> u64 {
+    // ktrace exposes kernel-internal diagnostics — the full task table
+    // (KTRACE_TASKS), per-core dispatch state, and the focus-ring contents — and
+    // expensive serial-flood / heap-churn dumps (DUMP_SERIAL/DUMP_CORES/
+    // DUMP_TASKS_SERIAL). None of it is appropriate for an unprivileged caller,
+    // so gate the whole surface on root (PR #201 audit): no scheduler-internals
+    // disclosure and no UART/heap self-DoS from ring 3.
+    {
+        let pid = crate::process::current_pid();
+        let uid = {
+            let table = crate::process::PROCESS_TABLE.lock();
+            table.find(pid).map(|p| p.uid).unwrap_or(u32::MAX)
+        };
+        if uid != 0 {
+            return NEG_EPERM;
+        }
+    }
     match cmd {
         KTRACE_READ_CORE => sys_ktrace_read_core(a, b, c),
         KTRACE_ARM => sys_ktrace_arm(a, b),

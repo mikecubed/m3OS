@@ -127,6 +127,13 @@ fn cmd_tasks() -> i32 {
 }
 
 fn cmd_dump() -> i32 {
+    // Disarm before paging so the focus ring is a stable snapshot. The dump
+    // pages the ring via repeated read_focus(offset) calls; if record() keeps
+    // pushing while we page, the live count/start shift between batches and
+    // entries can be skipped or duplicated at batch boundaries. Stopping
+    // recording first makes `dump` internally consistent (re-arm with `arm`
+    // afterwards to continue capturing).
+    ktrace_disarm();
     // Lead with the task table so the focus timeline's idx/pid are decodable.
     cmd_tasks();
     write_str(STDOUT_FILENO, "---- focus trace (oldest first) ----\n");

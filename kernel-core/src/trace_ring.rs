@@ -167,8 +167,14 @@ pub enum TraceEvent {
 
     /// A producer-side wake of an fd wait queue (no task subject). Recorded
     /// unconditionally while the focus ring is armed, to reveal whether the
-    /// wake a poller is waiting for ever fires. `kind`: 0=socket, 1=unix-socket,
-    /// 2=pty-master, 3=pty-slave. `id` is the handle / pty id.
+    /// wake a poller is waiting for ever fires. `id` is the handle / pty id /
+    /// vector / frame count depending on `kind`. The canonical decode lives in
+    /// `kernel::trace::write_line`; `kind` values:
+    /// - `0`=socket, `1`=unix-socket (reserved/unused), `2`=pty-master,
+    ///   `3`=pty-slave — the general fd-wakeup markers (always compiled).
+    /// - `4`=irq-fired, `5`=wake-net-task, `6`=recv-frames, `7`=tcp-recv,
+    ///   `8`=blk-drain — the Net-RX/blk investigation probes, emitted only
+    ///   under the `net-rx-trace` feature (default off).
     Wakeup {
         kind: u8,
         id: u32,
