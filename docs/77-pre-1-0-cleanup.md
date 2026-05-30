@@ -29,9 +29,17 @@ also draws a useful line between two kinds of mitigation:
   real performance cost, and it is explicitly **not** in this phase (see
   "How This Phase Differs", below).
 
-The other recurring lesson: **a bug that looks like five different symptoms can
-have one root cause.** The SSH-disconnect freeze, the `pthread_join` hang, and
-intermittent smoke-test flakiness were all the *same* lost futex wakeup.
+The other recurring lesson runs the opposite way: **one symptom can hide more
+than one root cause, and a tidy single-cause story is seductive enough to stick
+even after the evidence retires it.** The multi-threaded `pthread_join` hang and
+the intermittent smoke-test flakiness *were* the same lost futex wakeup (Track
+C). The SSH-disconnect freeze *looked* like the same bug — `sshd` reaps its
+session via pthreads, so the lost-wake theory fit — and earlier handoffs were
+flipped to RESOLVED on that basis. A deeper investigation (the 2026-05-29
+handoff) overturned it: the disconnect freeze was a **separate userspace
+async-runtime stall** — a transient missed I/O-readiness edge in the `async-rt`
+executor — fixed by an idle-liveness backstop, *not* by the futex change. Two
+different bugs wore one face.
 
 ## What This Doc Covers
 
@@ -39,7 +47,7 @@ Eight tracks, each a self-contained fix:
 
 | Track | Fix |
 |---|---|
-| A | SSH-disconnect hang + `sys_nanosleep` starvation (a scheduler/futex lost-wakeup) |
+| A | SSH-disconnect hang (an `async-rt` missed-edge stall) + a scheduler `on_cpu` cross-core deadlock + `sys_nanosleep` starvation |
 | B | Enable + enforce SMEP and SMAP on every CPU |
 | C | `PT_TLS` parsing → working multi-threaded thread-local storage |
 | D | DNS resolver wiring + RFC 6298 TCP retransmission + 64-connection lift |
@@ -52,9 +60,10 @@ Eight tracks, each a self-contained fix:
 
 Each of these bugs is invisible in the happy path:
 
-- SSH works fine until you *disconnect* — then a musl-pthread reaper hangs.
+- SSH works fine until you *disconnect* — then a missed PTY-hangup wake edge
+  leaves the session's async relay parked forever.
 - pthreads work in a one-thread toy until a *second* thread contends the
-  thread-list lock.
+  thread-list lock (the lost futex wakeup).
 - TCP is flawless on QEMU's lossless SLIRP LAN until the *first dropped packet*
   on the real internet.
 - htop shows your own processes until an *unprivileged* user can't see the
@@ -67,8 +76,10 @@ gate instead of in the phase that built the subsystem.
 
 | File | What changed |
 |---|---|
+| `userspace/async-rt/src/executor.rs` | **The load-bearing SSH-disconnect fix:** `requeue_all` idle-liveness backstop — after several consecutive empty reactor polls, re-poll every parked task so a single missed I/O-readiness edge (a PTY-master `POLLHUP` that failed to wake the sshd relay) recovers instead of hanging forever |
+| `sunset-local/src/{runner,channel}.rs` | clean logout: `server_session_exit` sends an exit-status/EOF/CLOSE so the client sees `exit 0`, not "closed by remote host" |
 | `userspace/sshd/src/session.rs` | EOF-driven `cleanup` ordering (close PTY master first → shell EOF-exits → bounded reap) |
-| `kernel/src/arch/x86_64/syscall/mod.rs` | `do_clear_child_tid` wakes both private + non-private futex keys; futex-waiter dequeue on `FUTEX_WAIT` return; dead `sys_nanosleep` v1 branch removed |
+| `kernel/src/arch/x86_64/syscall/mod.rs` | `do_clear_child_tid` wakes both private + non-private futex keys (the pthread/TLS lost-wake fix); futex-waiter dequeue on `FUTEX_WAIT` return; dead `sys_nanosleep` v1 branch removed |
 | `kernel/src/process/mod.rs` | `make_fork_ctx_for_thread` preserves the clone child's caller-saved GPRs (incl. `r9`) |
 | `kernel/src/task/scheduler.rs` | `wake_task_v2` defers the enqueue to the dispatch epilogue when the wakee is mid-switch-out (`on_cpu`) |
 | `kernel/src/arch/x86_64/cpuid.rs`, `kernel/src/lib.rs`, `kernel/src/smp/boot.rs` | SMEP/SMAP probe + enable + per-CPU AC-clear; SFMASK clears `EFLAGS.AC` |
@@ -80,7 +91,7 @@ gate instead of in the phase that built the subsystem.
 
 ## Core Concepts
 
-### The one lost wakeup behind three symptoms (Track A + C)
+### The lost wakeup behind the pthread/TLS hang (Track C)
 
 musl gives every joinable thread the *same* join word in one layout: it sets
 `CLONE_CHILD_CLEARTID` to `&__thread_list_lock` so the kernel releases the
@@ -88,12 +99,41 @@ thread-list lock when the thread dies. Crucially, `__tl_lock` waits on that word
 with a **non-private** futex. m3OS keys private futexes as `(0, addr)` and
 non-private as `(cr3, addr)`. `do_clear_child_tid` woke only the private key —
 so the lock-release wake was *lost*, and a thread blocked in `__tl_lock` while a
-sibling exited never ran again. Its `pthread_join`er hung forever. Because
-`sshd` reaps its session via pthreads, the *same* lost wakeup is the
-SSH-disconnect freeze. The fix is two lines: wake both keys. The companion bug —
-`make_fork_ctx_for_thread` zeroing the clone child's `r9` (which musl's
-`__clone` uses as `call *%r9`) — made every worker fault at `rip=0` before the
-join path was even reachable.
+sibling exited never ran again. Its `pthread_join`er hung forever. The fix is
+two lines: wake both keys. The companion bug — `make_fork_ctx_for_thread`
+zeroing the clone child's `r9` (which musl's `__clone` uses as `call *%r9`) —
+made every worker fault at `rip=0` before the join path was even reachable.
+Together these make multi-threaded musl programs (and the 4-thread `tls-smoke`)
+work.
+
+### The SSH-disconnect freeze was a *different* bug (Track A)
+
+It was tempting to fold the SSH-disconnect hang into the lost-wake story above
+— `sshd` reaps its session with pthreads, so the same `__tl_lock` wake is on its
+path, and earlier handoffs were marked RESOLVED on that theory. But the freeze
+kept reproducing after the futex fix. The 2026-05-29 investigation pinned the
+real cause in **userspace**, not the kernel: the `async-rt` executor is purely
+edge-driven (a task only re-runs when a waker fires), so a single transient
+*missed* I/O-readiness edge — a PTY-master `POLLHUP` that failed to wake the
+sshd relay parked in `WaitWake` — stalled the whole session forever, with the
+reactor spinning its 100 ms timeout finding nothing ready. The fix is an
+**idle-liveness backstop** (`Executor::requeue_all` in
+`userspace/async-rt/src/executor.rs`): after several consecutive empty reactor
+polls, force every parked task to re-poll from its current await point, so a
+level-triggered condition (`WaitWake` returns `Ready` once registered; the relay
+then reaches its `waitpid(WNOHANG)` exit backstop) re-checks directly and a
+permanent hang becomes a bounded (~hundreds-of-ms) recovery. The companion
+`sunset-local` change makes the teardown send a proper exit-status/EOF/CLOSE so
+the client logs a clean `exit 0` rather than "closed by remote host." The
+scheduler `on_cpu` cross-core defer fix (`6f57fbc`) is a *real* fix for a
+distinct cross-core deadlock class, but it is not what unwedged the disconnect.
+
+> **Process note:** this is the cautionary half of "one symptom, two causes."
+> The first three commits and an earlier draft of this doc attributed the
+> SSH-disconnect freeze to the futex lost-wake; that attribution was wrong, and
+> the in-tree `docs/handoffs/2026-05-29-ssh-disconnect-lost-wakeup.md` records
+> how the evidence forced the correction. The futex fix was still necessary —
+> just for Track C, not for this.
 
 ### Cheap CR4 security: SMEP and SMAP (Track B)
 
