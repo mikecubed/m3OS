@@ -1057,7 +1057,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.77.0"
+version = "0.78.0"
 dependencies = [
  "bootloader_api",
  "kernel-core",
@@ -2669,6 +2669,15 @@ dependencies = [
  "const_fn",
  "rustversion",
  "volatile",
+]
+
+[[package]]
+name = "xhci_driver"
+version = "0.78.0"
+dependencies = [
+ "driver_runtime",
+ "kernel-core",
+ "syscall-lib",
 ]
 
 [[package]]

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**m3OS** (technical name: `m3os`) is a bootable microkernel OS in Rust: x86_64, UEFI boot, kernel **v0.77.0**. Ring 0 handles memory, scheduling, IPC/capabilities, interrupt routing, and in-kernel drivers; ring 3 hosts everything else.
+**m3OS** (technical name: `m3os`) is a bootable microkernel OS in Rust: x86_64, UEFI boot, kernel **v0.78.0**. Ring 0 handles memory, scheduling, IPC/capabilities, interrupt routing, and in-kernel drivers; ring 3 hosts everything else.
 
 Capabilities now present in the tree:
 
@@ -99,6 +99,7 @@ This sets `core.hooksPath` to `.githooks/`. **pre-commit** runs `cargo xtask che
 | `doom-concurrent-smoke` | `M3OS_DOOM_CONCURRENT_REGRESSION=1` |
 | `tiling-smoke` | `M3OS_TILING_REGRESSION=1` |
 | `htop-render-probe` | `M3OS_HTOP_REGRESSION=1` |
+| `xhci-bringup-smoke` | `M3OS_USB_REGRESSION=1` |
 | `tls-smoke` PASS (not SKIP) | `M3OS_TLS_REGRESSION=1` |
 | `dns-smoke` PASS (not SKIP) | `M3OS_DNS_REGRESSION=1` |
 

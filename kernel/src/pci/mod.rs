@@ -461,7 +461,27 @@ impl PciDeviceHandle {
 
 impl Drop for PciDeviceHandle {
     fn drop(&mut self) {
-        // 1. Destroy the IOMMU domain before releasing the claim. Live
+        // 1. Quiesce the device before tearing anything down: clear the PCI
+        //    Command-register I/O Space (bit 0), Memory Space (bit 1), and Bus
+        //    Master (bit 2) bits so a released device can no longer decode its
+        //    BARs or issue DMA. This MUST precede the IOMMU domain teardown
+        //    below — clearing Bus Master first stops DMA while the device is
+        //    still confined to its domain, so there is never a window where it
+        //    can bus-master with no domain backing it. `sys_device_claim` sets
+        //    these bits only once a claim is fully committed; clearing them on
+        //    every drop guarantees no failure or teardown path (a failed
+        //    capability-table insert, process exit, or a future driver unload)
+        //    can leave an unmanaged device decoding or bus-mastering without
+        //    verified IOMMU coverage. Idempotent — a device already quiesced
+        //    issues no write.
+        const PCI_COMMAND_REG: u8 = 0x04;
+        const PCI_CMD_DECODE_AND_BME: u16 = 0b111; // I/O Space | Memory Space | Bus Master
+        let cmd = self.read_config_u16(PCI_COMMAND_REG);
+        if cmd & PCI_CMD_DECODE_AND_BME != 0 {
+            self.write_config_u16(PCI_COMMAND_REG, cmd & !PCI_CMD_DECODE_AND_BME);
+        }
+
+        // 2. Destroy the IOMMU domain before releasing the claim. Live
         //    DMA buffers allocated against this handle **must** have
         //    been dropped before the handle itself — they carry IOVA
         //    mappings into this domain and releasing the domain first
@@ -490,7 +510,7 @@ impl Drop for PciDeviceHandle {
             }
         }
 
-        // 2. Return the registry slot to the free pool. Drivers currently
+        // 3. Return the registry slot to the free pool. Drivers currently
         //    never unload, so this runs only in tests or teardown paths.
         let mut reg = PCI_DEVICE_REGISTRY.lock();
         if let Some(slot) = reg.slots.get_mut(self.slot) {

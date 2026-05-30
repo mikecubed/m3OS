@@ -642,7 +642,39 @@ pub fn sys_device_claim(segment: u16, bus: u8, dev: u8, func: u8) -> isize {
                         Err(e)
                     } else {
                         match reg.insert_claim(pid, key, handle) {
-                            Ok(()) => Ok(()),
+                            Ok(()) => {
+                                // Phase 78a Track B.1 — enable PCI I/O Space +
+                                // Memory Space + Bus Master, but only after the
+                                // claim is committed in the registry and its IOMMU
+                                // coverage verified. A pure bus-master DMA device
+                                // like xHCI DMAs nothing and posts zero events until
+                                // Bus Master Enable (Command reg 0x04 bit 2) is set,
+                                // and its memory-mapped BAR0 (operational registers
+                                // + MSI-X table) is only decoded once Memory Space
+                                // (bit 1) is set; bit 0 (I/O Space) covers I/O-BAR
+                                // classes like AC97. Enabling these only on the
+                                // registry-owned handle is what makes it safe: no
+                                // earlier failure path (claim, coverage, or
+                                // insert_claim) can drop the handle — tearing down
+                                // its IOMMU domain — while leaving decode/bus-master
+                                // set, because the bits are not set yet. The one
+                                // later failure path that drops a committed handle
+                                // (a failed `insert_cap` below) is covered by
+                                // `PciDeviceHandle::drop`, which clears these bits
+                                // before destroying the domain. Bring-up timing is
+                                // unaffected: the driver does not issue `Run` until
+                                // several later syscalls.
+                                if let Some(slot) = reg.slot_for(pid, key) {
+                                    enable_bus_master_and_memory_space(
+                                        &slot.handle,
+                                        segment,
+                                        bus,
+                                        dev,
+                                        func,
+                                    );
+                                }
+                                Ok(())
+                            }
                             Err(e) => Err(DeviceHostError::from(e)),
                         }
                     }
@@ -690,6 +722,62 @@ pub fn sys_device_claim(segment: u16, bus: u8, dev: u8, func: u8) -> isize {
     );
 
     isize::try_from(handle).unwrap_or(isize::MAX)
+}
+
+/// PCI Command register offset (config space) and the access-enable bits the
+/// ring-3 claim path sets so a claimed device can decode accesses to its BARs
+/// and issue DMA.
+const PCI_COMMAND_REG: u8 = 0x04;
+/// Command register **bit 0** — I/O Space Enable. Gates the device's decode of
+/// I/O-port transactions to its I/O BARs (e.g. the AC97 NAM/NABM register
+/// files the audio_server drives over the PIO seam). Harmless on
+/// memory-BAR-only devices, which decode no I/O space.
+const PCI_CMD_IO_SPACE: u16 = 1 << 0;
+/// Command register **bit 1** — Memory Space Enable. Gates the device's decode
+/// of memory transactions to its memory BARs — xHCI / NVMe / e1000 BAR0,
+/// including an MSI-X table that lives in a memory BAR. Harmless on
+/// I/O-BAR-only devices, which decode no memory space.
+const PCI_CMD_MEMORY_SPACE: u16 = 1 << 1;
+/// Command register **bit 2** — Bus Master Enable. Required before the device
+/// may issue DMA. xHCI posts zero events until this is set.
+const PCI_CMD_BUS_MASTER: u16 = 1 << 2;
+
+/// Enable PCI I/O Space + Memory Space + Bus Master on a freshly claimed
+/// device (Command register = `cmd | 0x07`).
+///
+/// Phase 78a Track B.1. The claim path serves every ring-3 device class —
+/// memory-BAR controllers (xHCI / NVMe / e1000, which need **Memory Space**
+/// bit 1) and I/O-BAR controllers (AC97 audio, which needs **I/O Space**
+/// bit 0) — and all of them need **Bus Master** (bit 2) for DMA. Setting all
+/// three is correct for each class and a no-op for the bits a given device
+/// does not use, so one helper covers them without per-device BAR-type
+/// inspection. Reads the register back so a config space that silently
+/// dropped the write is observable in the boot log; idempotent — a device
+/// whose firmware already enabled the bits issues no write.
+fn enable_bus_master_and_memory_space(
+    handle: &PciDeviceHandle,
+    segment: u16,
+    bus: u8,
+    dev: u8,
+    func: u8,
+) {
+    let cmd = handle.read_config_u16(PCI_COMMAND_REG);
+    let want = cmd | PCI_CMD_IO_SPACE | PCI_CMD_MEMORY_SPACE | PCI_CMD_BUS_MASTER;
+    if want != cmd {
+        handle.write_config_u16(PCI_COMMAND_REG, want);
+    }
+    let after = handle.read_config_u16(PCI_COMMAND_REG);
+    log::info!(
+        "device_host.claim bme bdf={:04x}:{:02x}:{:02x}.{} cmd={:#06x}->{:#06x} bus_master={} mem_space={}",
+        segment,
+        bus,
+        dev,
+        func,
+        cmd,
+        after,
+        after & PCI_CMD_BUS_MASTER != 0,
+        after & PCI_CMD_MEMORY_SPACE != 0,
+    );
 }
 
 // ---------------------------------------------------------------------------

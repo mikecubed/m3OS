@@ -280,3 +280,15 @@ if [ "${M3OS_HTOP_REGRESSION:-0}" = "1" ]; then
     echo "pre-push: running cargo xtask htop-render-probe..."
     cargo xtask htop-render-probe --timeout 300
 fi
+
+# Phase 78a — xHCI host-controller bring-up gate. Gated behind
+# M3OS_USB_REGRESSION=1 because it boots QEMU with `-device qemu-xhci` and
+# asserts the ring-3 xhci_driver reaches a first Enable Slot Command
+# Completion delivered via MSI-X (not just a "ports detected" serial line).
+# Set the env var on branches that touch userspace/drivers/xhci,
+# kernel-core/src/usb, the device-host claim/IRQ syscalls
+# (kernel/src/syscall/device_host.rs), or the PCI Bus-Master/MSI-X path.
+if [ "${M3OS_USB_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask xhci-bringup-smoke..."
+    cargo xtask xhci-bringup-smoke --timeout 150
+fi

@@ -44,6 +44,7 @@ pub mod time;
 pub mod trace_ring;
 pub mod tty;
 pub mod types;
+pub mod usb;
 pub mod user_range;
 pub mod utf8;
 pub mod watchdog_policy;

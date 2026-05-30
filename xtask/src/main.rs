@@ -210,6 +210,11 @@ struct DeviceSet {
     /// multi-term + workspace repro run with headroom, while the
     /// default 2 GiB keeps TCG smoke/regression suites within budget.
     memory_mib: Option<u32>,
+    /// Attach a `qemu-xhci` USB host controller (+ a `usb-kbd` so a port is
+    /// populated) at a pinned PCI slot. Set via `--device xhci`. Phase 78a:
+    /// drives the ring-3 `xhci_driver` host-controller bring-up and the
+    /// `xhci-bringup-smoke` gate.
+    xhci: bool,
 }
 
 /// Parse `--device <name>` and `--iommu` flags out of `args`, returning the
@@ -322,9 +327,10 @@ fn apply_device_flag(name: &str, devices: &mut DeviceSet) -> Result<(), String> 
         "nvme" => devices.nvme = true,
         "e1000" => devices.e1000 = true,
         "audio" => devices.audio = true,
+        "xhci" => devices.xhci = true,
         other => {
             return Err(format!(
-                "unknown `--device` value `{other}` (supported: nvme, e1000, audio)"
+                "unknown `--device` value `{other}` (supported: nvme, e1000, audio, xhci)"
             ));
         }
     }
@@ -483,6 +489,18 @@ fn main() {
                 std::process::exit(1);
             });
             cmd_device_smoke(&device_smoke_args);
+        }
+        // Phase 78a Track C.1 — boots with `-device qemu-xhci` and asserts the
+        // ring-3 xhci_driver reaches a first Enable Slot Command Completion
+        // delivered via MSI-X (`XHCI_BRINGUP:enable-slot:OK`).
+        Some("xhci-bringup-smoke") => {
+            let smoke_args = parse_smoke_boot_args("xhci-bringup-smoke", &args[2..])
+                .unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_xhci_bringup_smoke(&smoke_args);
         }
         Some("ssh-e1000-banner-check") => {
             let banner_args = parse_ssh_e1000_banner_check_args(&args[2..]).unwrap_or_else(|err| {
@@ -738,7 +756,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio|xhci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio|xhci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio|xhci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -843,6 +861,9 @@ fn build_userspace_bins() {
         // Real bring-up lands in D.2/D.3 and E.2/E.3.
         ("nvme_driver", "nvme_driver", true),
         ("e1000_driver", "e1000_driver", true),
+        // Phase 78a Track B.2: ring-3 xHCI USB host-controller driver
+        // (`needs_alloc = true` for driver_runtime + kernel-core deps).
+        ("xhci_driver", "xhci_driver", true),
         // Phase 55b Track F.3b: NVMe crash-and-restart end-to-end smoke
         // client. No alloc dependency — syscall_lib only.
         ("nvme-crash-smoke", "nvme-crash-smoke", false),
@@ -4458,6 +4479,21 @@ fn qemu_args_with_devices_resolved(
             } else {
                 "nvme,serial=deadbeef,drive=nvme0".to_string()
             },
+        ]);
+    }
+
+    // Phase 78a: `--device xhci` attaches a `qemu-xhci` USB host controller
+    // at a pinned PCI slot (0:6.0) so the ring-3 `xhci_driver`'s `SENTINEL_BDF`
+    // resolves deterministically, plus a `usb-kbd` so a downstream port is
+    // populated (the controller posts a Port Status Change and the driver's
+    // A.7 port-reset path has a connected device to act on). The Enable Slot
+    // milestone (Track A.5/C.1) does not itself require a connected device.
+    if devices.xhci {
+        args.extend([
+            "-device".to_string(),
+            "qemu-xhci,id=xhci0,addr=0x6".to_string(),
+            "-device".to_string(),
+            "usb-kbd,bus=xhci0.0".to_string(),
         ]);
     }
 
@@ -8474,6 +8510,119 @@ fn cmd_device_smoke(args: &DeviceSmokeArgs) {
 
     eprintln!("device-smoke: FAILED after {MAX_ATTEMPTS} attempts\n{last_err}");
     std::process::exit(1);
+}
+
+/// Phase 78a Track C.1 — headless `xhci-bringup-smoke` gate.
+///
+/// Boots m3OS with `-device qemu-xhci` (+ a `usb-kbd`) and asserts that the
+/// ring-3 `xhci_driver` brought the controller fully alive: the load-bearing
+/// proof is a real `Enable Slot` Command Completion event consumed off the
+/// event ring **via MSI-X** (`XHCI_BRINGUP:enable-slot:OK`). A `[xhci] N ports
+/// detected` serial line proves only that the daemon ran — it is explicitly
+/// **not** sufficient for PASS, so the gate waits for the interrupt-delivered
+/// completion sentinel, which the driver emits only from its IRQ event loop.
+fn cmd_xhci_bringup_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false, // graphical_login — autologin / serial path
+    );
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let devices = DeviceSet {
+        xhci: true,
+        ..DeviceSet::default()
+    };
+    let mut qemu_args = qemu_args_with_devices(&uefi_image, &ovmf, display_mode, devices);
+    // Strip hostfwd to avoid port conflicts in CI (same as device-smoke).
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+
+    let steps = xhci_bringup_smoke_steps(args.timeout_secs);
+
+    println!(
+        "xhci-bringup-smoke: launching QEMU with -device qemu-xhci (timeout {}s)",
+        args.timeout_secs
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!(
+                "xhci-bringup-smoke: PASSED ({} steps in {elapsed}s) — Enable Slot \
+                 Command Completion delivered via MSI-X",
+                steps.len()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("xhci-bringup-smoke: FAILED\n{msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Serial step list for `xhci-bringup-smoke`. The `xhci_driver` daemon is
+/// started by init's service supervision during boot, so the gate only waits
+/// for the kernel banner and the interrupt-delivered Enable Slot completion —
+/// no login or shell interaction is needed.
+fn xhci_bringup_smoke_steps(timeout_secs: u64) -> Vec<SmokeStep> {
+    vec![
+        SmokeStep::Wait {
+            pattern: "[m3os] Hello from kernel",
+            timeout_secs: 30,
+            label: "guest/xhci: kernel first message",
+        },
+        SmokeStep::Wait {
+            // A.7: the attached `usb-kbd`'s root-hub port is reset and reaches
+            // the Enabled state with its speed decoded.
+            pattern: "[xhci] port",
+            timeout_secs,
+            label: "guest/xhci: connected device port reaches Enabled (A.7)",
+        },
+        SmokeStep::Wait {
+            // The driver emits this ONLY from its MSI-X event loop after a real
+            // Command Completion event is consumed off the event ring — a
+            // `[xhci] N ports detected` line alone is not sufficient.
+            pattern: "XHCI_BRINGUP:enable-slot:OK",
+            timeout_secs,
+            label: "guest/xhci: Enable Slot Command Completion via MSI-X",
+        },
+    ]
 }
 
 /// Build the command-line contract for the Phase 55c R3 SSH banner regression:
@@ -12665,6 +12814,11 @@ fn populate_ext2_files(
     let nvme_driver_conf =
         "name=nvme_driver\ncommand=/drivers/nvme\ntype=daemon\nrestart=on-failure\nmax_restart=5\n";
     let e1000_driver_conf = "name=e1000_driver\ncommand=/drivers/e1000\ntype=daemon\nrestart=on-failure\nmax_restart=5\n";
+    // Phase 78a Track B.2 — ring-3 xHCI USB host-controller driver.  Same
+    // supervised-driver shape as nvme/e1000: no `depends=` (the device-host
+    // substrate is kernel-internal init), restart=on-failure max_restart=5.
+    let xhci_driver_conf =
+        "name=xhci_driver\ncommand=/drivers/xhci\ntype=daemon\nrestart=on-failure\nmax_restart=5\n";
 
     // Phase 56 Track C.1: ring-3 display server (compositor) scaffold.
     // Depends on `kbd` so input arrives before the compositor binds the
@@ -13011,6 +13165,7 @@ fn populate_ext2_files(
     let net_server_conf_tmp = output_dir.join("_tmp_net_server_conf");
     let nvme_driver_conf_tmp = output_dir.join("_tmp_nvme_driver_conf");
     let e1000_driver_conf_tmp = output_dir.join("_tmp_e1000_driver_conf");
+    let xhci_driver_conf_tmp = output_dir.join("_tmp_xhci_driver_conf");
     let display_server_conf_tmp = output_dir.join("_tmp_display_server_conf");
     let session_manager_conf_tmp = output_dir.join("_tmp_session_manager_conf");
     let audio_server_conf_tmp = output_dir.join("_tmp_audio_server_conf");
@@ -13042,6 +13197,7 @@ fn populate_ext2_files(
     fs::write(&net_server_conf_tmp, net_server_conf).expect("write temp net_server.conf");
     fs::write(&nvme_driver_conf_tmp, nvme_driver_conf).expect("write temp nvme_driver.conf");
     fs::write(&e1000_driver_conf_tmp, e1000_driver_conf).expect("write temp e1000_driver.conf");
+    fs::write(&xhci_driver_conf_tmp, xhci_driver_conf).expect("write temp xhci_driver.conf");
     fs::write(&display_server_conf_tmp, display_server_conf)
         .expect("write temp display_server.conf");
     fs::write(&session_manager_conf_tmp, session_manager_conf)
@@ -13595,6 +13751,10 @@ fn populate_ext2_files(
          sif etc/services.d/e1000_driver.conf mode 0x81A4\n\
          sif etc/services.d/e1000_driver.conf uid 0\n\
          sif etc/services.d/e1000_driver.conf gid 0\n\
+         write \"{xhci_driver_conf}\" etc/services.d/xhci_driver.conf\n\
+         sif etc/services.d/xhci_driver.conf mode 0x81A4\n\
+         sif etc/services.d/xhci_driver.conf uid 0\n\
+         sif etc/services.d/xhci_driver.conf gid 0\n\
          write \"{display_server_conf}\" etc/services.d/display_server.conf\n\
          sif etc/services.d/display_server.conf mode 0x81A4\n\
          sif etc/services.d/display_server.conf uid 0\n\
@@ -13640,6 +13800,7 @@ fn populate_ext2_files(
         net_server_conf = net_server_conf_tmp.display(),
         nvme_driver_conf = nvme_driver_conf_tmp.display(),
         e1000_driver_conf = e1000_driver_conf_tmp.display(),
+        xhci_driver_conf = xhci_driver_conf_tmp.display(),
         display_server_conf = display_server_conf_tmp.display(),
         session_manager_conf = session_manager_conf_tmp.display(),
         audio_server_conf = audio_server_conf_tmp.display(),
@@ -15476,6 +15637,7 @@ fn regression_tests() -> Vec<RegressionTest> {
                 iommu: false,
                 kvm: false,
                 memory_mib: None,
+                xhci: false,
             },
             wants_debug_crash_marker: false,
             wants_readback_marker: false,
@@ -15512,6 +15674,7 @@ fn regression_tests() -> Vec<RegressionTest> {
                 iommu: false,
                 kvm: false,
                 memory_mib: None,
+                xhci: false,
             },
             wants_debug_crash_marker: false,
             wants_readback_marker: false,
@@ -15545,6 +15708,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             iommu: false,
             kvm: false,
             memory_mib: None,
+            xhci: false,
         },
         wants_debug_crash_marker: false,
         wants_readback_marker: false,
@@ -15575,6 +15739,7 @@ fn regression_tests() -> Vec<RegressionTest> {
                 iommu: false,
                 kvm: false,
                 memory_mib: None,
+                xhci: false,
             },
             wants_debug_crash_marker: false,
             wants_readback_marker: false,
@@ -18786,6 +18951,7 @@ mod tests {
                 iommu: false,
                 kvm: true,
                 memory_mib: Some(4096),
+                xhci: false,
             },
             None,
         );
@@ -18842,6 +19008,7 @@ mod tests {
                 iommu: false,
                 kvm: false,
                 memory_mib: None,
+                xhci: false,
             },
         );
         assert!(
@@ -18872,6 +19039,7 @@ mod tests {
                 iommu: false,
                 kvm: false,
                 memory_mib: None,
+                xhci: false,
             },
             Some(fake_nvme),
         );
@@ -18914,6 +19082,7 @@ mod tests {
                 iommu: true,
                 kvm: false,
                 memory_mib: None,
+                xhci: false,
             },
             Some(fake_nvme),
         );
@@ -18956,6 +19125,7 @@ mod tests {
                 iommu: true,
                 kvm: false,
                 memory_mib: None,
+                xhci: false,
             },
             Some(Path::new("/tmp/m3os-test-nvme-rootdisk-never-created.img")),
         );
@@ -19010,6 +19180,7 @@ mod tests {
                 iommu: true,
                 kvm: false,
                 memory_mib: None,
+                xhci: false,
             },
             None,
         );
@@ -19069,6 +19240,7 @@ mod tests {
                 iommu: true,
                 kvm: false,
                 memory_mib: None,
+                xhci: false,
             },
             None,
         );
@@ -19101,6 +19273,7 @@ mod tests {
                 iommu: true,
                 kvm: false,
                 memory_mib: None,
+                xhci: false,
             },
             None,
         );
@@ -19325,6 +19498,7 @@ mod tests {
             iommu: false,
             kvm: false,
             memory_mib: None,
+            xhci: false,
         });
         let iommu = device_smoke_steps(DeviceSet {
             nvme: true,
@@ -19333,6 +19507,7 @@ mod tests {
             iommu: true,
             kvm: false,
             memory_mib: None,
+            xhci: false,
         });
 
         assert_eq!(smoke_step_labels(&iommu), smoke_step_labels(&base));
