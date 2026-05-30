@@ -3346,8 +3346,8 @@ pub fn sys_device_pio_write(
 //   1. Verify caller is an authorized driver process.
 //   2. Snapshot and filter PCI devices via `pci::pci_enumerate_by_class`,
 //      which calls the pure host-tested `collect_matching_bdfs` internally.
-//   3. Copy the packed BDF slice into the caller's buffer using the same
-//      `UserSliceWo` / kernel-virt fallback as `copy_dma_handle_out`.
+//   3. Copy the packed BDF slice into the caller's buffer via `UserSliceWo`,
+//      which validates the destination address before touching it.
 //   4. Return the total match count (may exceed `max_entries` — caller
 //      detects truncation by comparing return value to `max_entries`).
 
@@ -3403,24 +3403,16 @@ pub fn sys_device_pci_enumerate(
         // indices [0..buf_len].  `to_copy <= buf_len`, so the slice is valid.
         let bytes = unsafe { core::slice::from_raw_parts(bdf_buf.as_ptr() as *const u8, byte_len) };
 
-        // Use the same copy-out helper strategy as `copy_dma_handle_out`:
-        // UserSliceWo for canonical user-space addresses, direct write for
-        // kernel-virt addresses (test path).
+        // Route every address through UserSliceWo.  This rejects NULL,
+        // kernel-virt addresses (≥ 0x0000_8000_0000_0000), and any range
+        // that overflows or exceeds the user-address limit.  There is no
+        // kernel-virt fallback here: unlike `copy_dma_handle_out` this
+        // function is reached directly through the live syscall dispatcher,
+        // so an unchecked write to an attacker-supplied address would be a
+        // ring-3-reachable kernel memory corruption primitive.
         let dst_u64 = out_user_ptr as u64;
-        let copy_result = if dst_u64 < 0x0000_8000_0000_0000 {
-            // User-space address — walk page tables.
-            crate::mm::user_mem::UserSliceWo::new(dst_u64, byte_len)
-                .and_then(|s| s.copy_from_kernel(bytes))
-        } else {
-            // Kernel-virt address — direct write (test path only).
-            // SAFETY: dst is a kernel-virt address inside the phys-offset
-            // window; the syscall dispatcher validated that max_entries fits.
-            unsafe {
-                core::ptr::copy_nonoverlapping(bytes.as_ptr(), out_user_ptr as *mut u8, byte_len);
-            }
-            Ok(())
-        };
-
+        let copy_result = crate::mm::user_mem::UserSliceWo::new(dst_u64, byte_len)
+            .and_then(|s| s.copy_from_kernel(bytes));
         if copy_result.is_err() {
             return NEG_EFAULT;
         }

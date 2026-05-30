@@ -97,10 +97,12 @@ pub const SYS_DEVICE_PIO_WRITE: u64 = 0x1126;
 /// Each entry is a `u32` in little-endian byte order:
 ///
 /// ```text
-/// bits [31:20] — PCI segment (always 0 on current platforms)
-/// bits [19:12] — bus number
-/// bits [11: 5] — device number
-/// bits [ 4: 2] — function number
+/// bits [31:20] — PCI segment group (12 bits; encodable range 0–4095;
+///                always 0 on current platforms)
+/// bits [19:12] — bus number (8 bits; 0–255)
+/// bits [11:10] — reserved / padding (always 0; dev is 5 bits, not 7)
+/// bits [ 9: 5] — device number (5 bits; 0–31)
+/// bits [ 4: 2] — function number (3 bits; 0–7)
 /// bits [  1:0] — reserved (always 0)
 /// ```
 ///
