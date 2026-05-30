@@ -21,9 +21,10 @@ Source-verified after Phase 78a (#203) merged. Findings that adjust this task li
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | USB core: descriptor parser, enumeration state machine, host↔class IPC protocol crate | Phase 78a, Phase 74 ✅ | Planned |
-| B | Hub class (`usbhub`) + `PortId` topology + build wiring for `usb-core`/`usbhub` | A | Planned |
-| C | Multi-controller PCI class enumeration + `0.78.1` version bump | A, B | Planned |
+| A | USB core: descriptor parser, enumeration state machine, host↔class IPC protocol crate | Phase 78a, Phase 74 ✅ | Impl done; review found 3 Major (BSR speed-branch, true 8-byte EP0 read, Configure-Endpoint adds interface EPs) — in revision |
+| B | Hub class (`usbhub`) + `PortId` topology + build wiring for `usb-core`/`usbhub` | A | Planned (Wave 2) |
+| C.1 | `sys_device_pci_enumerate` PCI class enumeration syscall | Phase 78a | Impl done; review found 1 Critical (unchecked kernel-virt copy-out) — in revision |
+| C (rest) | xhci uses the syscall to discover all controllers + `0.78.1` version bump | A, C.1, B | Planned (Wave 2 / final) |
 
 ---
 
@@ -39,9 +40,9 @@ Source-verified after Phase 78a (#203) merged. Findings that adjust this task li
 **Why it matters:** Descriptor parsing is class-agnostic pure logic — it belongs in `kernel-core` where it is host-testable, unlike Redox which keeps it inside the `xhcid` binary. This is the shared foundation both the host enumerator and class drivers consume. `kernel-core/src/usb/` gained its `xhci/` submodule in 78a; this adds the device-model side.
 
 **Acceptance:**
-- [ ] Typed structs for device/config/interface/endpoint + HID descriptors; `parse_config_tree` walks a configuration blob (short read then full read by `wTotalLength`) into typed interfaces + endpoints
-- [ ] Host tests parse real captured descriptor blobs for a boot keyboard, a boot mouse, and a hub, asserting `bInterfaceClass`/`SubClass`/`Protocol` and endpoint addresses/`bInterval`
-- [ ] `userspace/lib/usb-core` exposes these types to ring-3 drivers (added as a Cargo member in B.2)
+- [x] Typed structs for device/config/interface/endpoint + HID descriptors; `parse_config_tree` walks a configuration blob (short read then full read by `wTotalLength`) into typed interfaces + endpoints
+- [x] Host tests parse real captured descriptor blobs for a boot keyboard, a boot mouse, and a hub, asserting `bInterfaceClass`/`SubClass`/`Protocol` and endpoint addresses/`bInterval`
+- [x] `userspace/lib/usb-core` exposes these types to ring-3 drivers (Track A added the Cargo member; B.2 adds `usbhub`)
 
 ### A.2 — Enumeration state machine (Enable Slot → Address Device BSR → descriptors → Configure Endpoint)
 
@@ -53,12 +54,12 @@ Source-verified after Phase 78a (#203) merged. Findings that adjust this task li
 **Why it matters:** xHCI replaces the raw USB `SET_ADDRESS` with the `Address Device` command, but `Enable Slot`, `Configure Endpoint`, and `Evaluate Context` are **all** required besides it to attach a device and run an interrupt endpoint. The BSR=1 pre-read is needed to learn full-speed EP0 Max Packet Size before the real address assignment.
 
 **Acceptance:**
-- [ ] `Enable Slot` → allocate Output Device Context → install in `DCBAA[slot]`; for full-speed: `Address Device` BSR=1 (Default state, no SET_ADDRESS) → read EP0 Max Packet Size → `Evaluate Context` to correct it → `Address Device` BSR=0 to assign the address
-- [ ] **`Address Device` Input Context fields** populated and host-tested: Input Control Context **Add Flags = `0x3`** (`A0` Slot + `A1` EP0 Default Control Endpoint); Slot Context = Route String, Root Hub Port Number, Speed, Context Entries (1); EP0 Endpoint Context = EP Type **Control**, Max Packet Size (per 78a speed: 8/8/64/512), TR Dequeue Pointer = EP0 transfer-ring IOVA with `DCS`, Error Count (`CErr`) = 3. (Missing these → Address Device returns a Context-State/Parameter error.)
-- [ ] Control transfers issued as Setup Stage + (optional Data Stage) + Status Stage TRB sequences on the EP0 transfer ring; `GET_DESCRIPTOR(Device)` then `GET_DESCRIPTOR(Config)` short-then-full; `SET_CONFIGURATION(bConfigurationValue)`
-- [ ] `Configure Endpoint` adds the interrupt-IN endpoint context after `SET_CONFIGURATION` (Add Flag at the endpoint's DCI per the 78a A.5 formula)
-- [ ] The enumeration state machine (states + transitions + error/timeout handling) is host-tested with a mock interface in `kernel-core`
-- [ ] Under `qemu-xhci`, an attached `usb-kbd` enumerates to Configured with its interrupt-IN endpoint running; the full descriptor tree is printed on boot
+- [x] `Enable Slot` → allocate Output Device Context → install in `DCBAA[slot]`; for full-speed: `Address Device` BSR=1 (Default state, no SET_ADDRESS) → read EP0 Max Packet Size → `Evaluate Context` to correct it → `Address Device` BSR=0 to assign the address (state machine host-tested; HS/SS correctly skip the BSR pre-read — review fix M1)
+- [x] **`Address Device` Input Context fields** populated and host-tested: Input Control Context **Add Flags = `0x3`** (`A0` Slot + `A1` EP0 Default Control Endpoint); Slot Context = Route String, Root Hub Port Number, Speed, Context Entries (1); EP0 Endpoint Context = EP Type **Control**, Max Packet Size (per 78a speed: 8/8/64/512), TR Dequeue Pointer = EP0 transfer-ring IOVA with `DCS`, Error Count (`CErr`) = 3. (Missing these → Address Device returns a Context-State/Parameter error.)
+- [x] Control transfers issued as Setup Stage + (optional Data Stage) + Status Stage TRB sequences on the EP0 transfer ring; `GET_DESCRIPTOR(Device)` then `GET_DESCRIPTOR(Config)` short-then-full (full-speed first read is a true 8-byte short read — review fix M2); `SET_CONFIGURATION(bConfigurationValue)`
+- [x] `Configure Endpoint` adds the interrupt-IN endpoint context after `SET_CONFIGURATION` (Add Flag at the endpoint's DCI; per-endpoint EP context built in `build_configure_endpoint_ctx` — review fix M3)
+- [x] The enumeration state machine (states + transitions + error/timeout handling) is host-tested with a mock interface in `kernel-core` (88 `usb::` host tests)
+- [ ] Under `qemu-xhci`, an attached `usb-kbd` enumerates to Configured with its interrupt-IN endpoint running; the full descriptor tree is printed on boot — **Wave 2** (ring-3 `xhci` glue: `userspace/drivers/xhci/src/enumerate.rs` + controller transfer-ring methods)
 
 ### A.3 — Host↔class IPC protocol crate + bulk via page grants
 
@@ -70,9 +71,9 @@ Source-verified after Phase 78a (#203) merged. Findings that adjust this task li
 **Why it matters:** This is the contract the host publishes and the class drivers consume. It must honor the m3OS IPC rule: descriptors and setup packets cross as small call/reply payloads; transfer buffers cross as **page-capability grants**, never as IPC payloads.
 
 **Acceptance:**
-- [ ] Typed protocol: open device, get-descriptors, configure-endpoints, control-request, submit interrupt/bulk transfer — defined once in `usb-core` and shared by `xhci`, `usbhub`, and (in 78c) `usb-hid`
-- [ ] Descriptors + setup packets cross as IPC call/reply payloads; transfer buffers cross as Phase 74 page grants (verified: no transfer payload exceeds the IPC inline payload path)
-- [ ] A thin `UsbClient` library API (not raw IPC opcodes) is what class drivers link. **Lifecycle model:** the class drivers are **static long-lived daemons** started by `session_manager` (not per-device children forked by the host — the userspace-first rule forbids host-forks-children). On attach, the host (`xhci`) sends a **device-attach IPC notification** carrying `(port, interface class/subclass/protocol)` to the matching running daemon, which then drives that interface via `UsbClient`. The handoff is an **IPC message to a running daemon**, never `exec` arguments to a freshly spawned process
+- [x] Typed protocol: open device, get-descriptors, configure-endpoints, control-request, submit interrupt/bulk transfer — defined once in `usb-core` and shared by `xhci`, `usbhub`, and (in 78c) `usb-hid`
+- [x] Descriptors + setup packets cross as IPC call/reply payloads; transfer buffers cross as Phase 74 page grants — `SubmitTransfer` carries a `PageGrant { cap, len }`, not inline bytes (host test asserts no inline transfer buffer)
+- [x] A thin `UsbClient` library API (not raw IPC opcodes) is what class drivers link. **Lifecycle model:** the class drivers are **static long-lived daemons** started by `session_manager` (not per-device children forked by the host — the userspace-first rule forbids host-forks-children). On attach, the host (`xhci`) sends a **device-attach IPC notification** carrying `(port, interface class/subclass/protocol)` to the matching running daemon, which then drives that interface via `UsbClient`. The handoff is an **IPC message to a running daemon**, never `exec` arguments to a freshly spawned process
 
 ---
 
@@ -125,10 +126,10 @@ Source-verified after Phase 78a (#203) merged. Findings that adjust this task li
 **Why it matters:** **Source-verified gap.** `sys_device_claim` takes a BDF only — there is no class-code filter, and no ring-3 PCI-config-space read path exists (NVMe/e1000 hardcode `SENTINEL_BDF`). Because the **headline milestone is the no-PS/2 laptop with six xHCI controllers**, the multi-controller path is committed here (a single QEMU controller still bootstraps on the 78a sentinel BDF as an interim, but is not the deliverable).
 
 **Acceptance:**
-- [ ] A new capability-gated syscall `sys_device_pci_enumerate(class, subclass, prog_if)` is added to `kernel/src/syscall/device_host.rs` (number **`0x1127`**, the next free after `0x1126` in `kernel-core/src/device_host/syscalls.rs`), returning the BDFs of every device matching class `0x0C0330`, built on the existing in-kernel `PciMatch::ClassSubclass` matcher (`pci/mod.rs:1554`, removing its `dead_code` allow if it becomes live)
-- [ ] The new syscall is gated by the same `/drivers/` exec-path authorization as `sys_device_claim` (`is_authorized_driver_process`, `device_host.rs:126`)
-- [ ] `xhci` discovers **all** xHCI controllers via this enumeration and claims each (one driver instance per controller, or one instance iterating the set) — no hardcoded BDF on the real-hardware path; the `qemu-xhci` sentinel BDF remains only as an interim bootstrap
-- [ ] Host test: the enumeration filter returns exactly the class-`0x0C0330` BDFs from a synthetic PCI device list
+- [x] A new capability-gated syscall `sys_device_pci_enumerate(class, subclass, prog_if)` is added to `kernel/src/syscall/device_host.rs` (number **`0x1127`**), returning the BDFs of every device matching class `0x0C0330`. (Implemented via a host-tested kernel-core pure filter `collect_matching_bdfs` + `pci::pci_enumerate_by_class`; `PciMatch::ClassSubclass` left as-is since prog_if filtering lives in the pure filter — see review note.) Copy-out hardened to route every address through `UserSliceWo` → `NEG_EFAULT` (review fix C1)
+- [x] The new syscall is gated by the same `/drivers/` exec-path authorization as `sys_device_claim` (`is_authorized_driver_process`, `device_host.rs:126`)
+- [ ] `xhci` discovers **all** xHCI controllers via this enumeration and claims each (one driver instance per controller, or one instance iterating the set) — no hardcoded BDF on the real-hardware path; the `qemu-xhci` sentinel BDF remains only as an interim bootstrap — **Wave 2** (ring-3 wrapper + xhci wiring)
+- [x] Host test: the enumeration filter returns exactly the class-`0x0C0330` BDFs from a synthetic PCI device list (16 `pci_enum` tests incl. EHCI `0x0C0320` near-miss exclusion)
 
 ### C.2 — Bump kernel version to `0.78.1`
 
