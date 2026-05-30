@@ -58,6 +58,11 @@ mod controller;
 #[cfg(not(test))]
 mod enumerate;
 
+/// Phase 78c: the live USB IPC server (registers `usb`, binds the IRQ, serves
+/// `UsbRequest`s from class drivers, captures HID reports).
+#[cfg(not(test))]
+mod server;
+
 #[cfg(not(test))]
 use crate::controller::{BringUpError, Controller, XhciBar0};
 #[cfg(not(test))]
@@ -156,7 +161,10 @@ const BAR0_EXPECTED_BYTES: usize = 0x1_0000;
 /// sentinel lines (`XHCI_BRINGUP:enable-slot:OK` and `XHCI_ENUM:configured`)
 /// are emitted here, maintaining gate compatibility.
 #[cfg(not(test))]
-fn bring_up_controller(key: DeviceCapKey) -> Result<(Controller, IrqNotification), i32> {
+fn bring_up_controller(
+    key: DeviceCapKey,
+) -> Result<(Controller, IrqNotification, alloc::vec::Vec<crate::server::DeviceInfo>), i32> {
+    let mut devices: alloc::vec::Vec<crate::server::DeviceInfo> = alloc::vec::Vec::new();
     let handle = match DeviceHandle::claim(key) {
         Ok(h) => h,
         // The controller is not available to us. `NotClaimed` (ENODEV — QEMU
@@ -278,6 +286,12 @@ fn bring_up_controller(key: DeviceCapKey) -> Result<(Controller, IrqNotification
                 syscall_lib::write_str(STDOUT_FILENO, "[xhci] enumeration complete\n");
                 print_descriptor_tree(&final_ctx);
                 syscall_lib::write_str(STDOUT_FILENO, XHCI_ENUM_CONFIGURED_SENTINEL);
+                // Phase 78c: if this is a HID device, record it so the server
+                // can hand it to the `usb-hid` class driver.
+                if let Some(info) = crate::server::device_info_from_ctx(&final_ctx) {
+                    syscall_lib::write_str(STDOUT_FILENO, "[xhci] HID device registered\n");
+                    devices.push(info);
+                }
             }
             EnumState::Error { code } => {
                 syscall_lib::write_str(STDOUT_FILENO, "[xhci] enumeration error code ");
@@ -300,7 +314,7 @@ fn bring_up_controller(key: DeviceCapKey) -> Result<(Controller, IrqNotification
         controller.enqueue_enable_slot();
     }
 
-    Ok((controller, irq))
+    Ok((controller, irq, devices))
 }
 
 #[cfg(not(test))]
@@ -347,13 +361,14 @@ fn program_main(_args: &[&str]) -> i32 {
     // Concurrent multi-controller event servicing (multiple IRQ loops) is a
     // later refinement — for now, bring up and enumerate all controllers, then
     // enter the event loop on the primary (first) successfully brought-up one.
-    let mut primary: Option<(Controller, IrqNotification)> = None;
+    let mut primary: Option<(Controller, IrqNotification, alloc::vec::Vec<server::DeviceInfo>)> =
+        None;
 
     for key in bdf_list {
         match bring_up_controller(key) {
-            Ok(pair) => {
+            Ok(triple) => {
                 if primary.is_none() {
-                    primary = Some(pair);
+                    primary = Some(triple);
                 }
                 // Additional controllers are enumerated (bring_up_controller ran
                 // the full discovery + USB enumeration path) but their event
@@ -378,9 +393,11 @@ fn program_main(_args: &[&str]) -> i32 {
         }
     }
 
-    // Step 3: enter the event loop on the primary controller.
+    // Step 3: enter the USB IPC server loop on the primary controller. The
+    // server registers the `usb` service, binds the IRQ, runs HID Boot-Protocol
+    // setup, and serves class drivers. It never returns.
     match primary {
-        Some((mut controller, irq)) => controller.event_loop(irq),
+        Some((controller, irq, devices)) => server::run(controller, irq, devices),
         None => {
             // No controller came up successfully. Exit cleanly so the service
             // manager marks xhci_driver as permanently stopped.

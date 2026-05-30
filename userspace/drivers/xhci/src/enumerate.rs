@@ -135,7 +135,10 @@ impl UsbHostOps for XhciHostOps<'_> {
         // (build_configure_endpoint_ctx fix), so no workaround needed here.
         let mut patched = self.patched_snapshot(ctx);
         for ep_snap in &mut patched.endpoint_contexts {
-            match self.controller.alloc_interrupt_ep_ring() {
+            // MPS lives at bits 31:16 of ep_dword1 (same layout the controller
+            // writes into the endpoint context).
+            let mps = (ep_snap.ep_dword1 >> 16) as u16;
+            match self.controller.alloc_interrupt_ep_ring(ep_snap.dci, mps) {
                 Ok(iova_dcs) => {
                     ep_snap.ep_dequeue_ptr = iova_dcs;
                 }

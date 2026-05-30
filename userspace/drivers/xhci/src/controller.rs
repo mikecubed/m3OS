@@ -131,8 +131,33 @@ pub enum BringUpError {
 // Per-slot device context bookkeeping
 // ---------------------------------------------------------------------------
 
+/// A configured interrupt-IN/OUT endpoint on a slot. Phase 78c: owns the
+/// endpoint's transfer ring, its producer cursor, and a persistent DMA buffer
+/// the controller writes each report into. Captured reports queue here until a
+/// class driver polls them.
+pub struct InterruptEndpoint {
+    /// Device Context Index of this endpoint.
+    pub dci: u8,
+    /// `wMaxPacketSize` — the size of one report / the Normal-TRB length.
+    pub mps: u16,
+    /// Transfer ring for this endpoint (kept alive for the slot's lifetime).
+    ring: DmaBuffer<u8>,
+    /// IOVA of `ring`.
+    ring_iova: u64,
+    /// Producer cursor for `ring`.
+    producer: trb::ProducerRing,
+    /// DMA buffer the controller writes each interrupt-IN report into.
+    data_buf: DmaBuffer<u8>,
+    /// FIFO of captured reports awaiting a class-driver poll (bounded).
+    reports: alloc::collections::VecDeque<alloc::vec::Vec<u8>>,
+    /// `true` once a Normal TRB is pending on the ring.
+    armed: bool,
+}
+
 /// Per-slot DMA context allocated during Address Device.
 pub struct SlotContext {
+    /// xHCI Slot ID this context belongs to.
+    pub slot_id: u8,
     /// Output Device Context — the controller writes state back here.
     pub output_ctx: DmaBuffer<u8>,
     /// EP0 transfer ring (command and data TRBs).
@@ -144,9 +169,10 @@ pub struct SlotContext {
     /// Input Context DMA buffer — rebuilt from an `InputContextSnapshot`
     /// before every command that needs one.
     pub input_ctx: DmaBuffer<u8>,
-    /// Additional endpoint (interrupt/bulk) transfer rings kept alive for
-    /// the slot's lifetime. Populated during Configure Endpoint.
-    pub ep_rings: alloc::vec::Vec<DmaBuffer<u8>>,
+    /// Additional (interrupt/bulk) endpoints configured for this slot, each
+    /// owning its transfer ring + report buffer. Populated during Configure
+    /// Endpoint (Phase 78c).
+    pub interrupt_eps: alloc::vec::Vec<InterruptEndpoint>,
 }
 
 pub struct Controller {
@@ -537,57 +563,6 @@ impl Controller {
         self.ring_doorbell(0, 0);
     }
 
-    // -- A.6: single-threaded drain-on-wake event loop ---------------------
-
-    /// Block on the IRQ notification, drain the event ring on each wake, and
-    /// match completion events. Mirrors the NVMe `wait_completion` drain-on-
-    /// wake model — no busy-poll, no separate thread. Never returns (the
-    /// driver is a supervised daemon).
-    pub fn event_loop(&mut self, irq: IrqNotification) -> ! {
-        loop {
-            let bits = irq.wait();
-            if bits == 0 {
-                // Spurious / errored wake — re-block rather than spin.
-                continue;
-            }
-            self.drain_event_ring_discard();
-            // Update ERDP to the current dequeue pointer and clear EHB.
-            let erdp = self.event_ring_iova + (self.consumer.index as u64) * trb::TRB_SIZE as u64;
-            self.rt_write_u64(rt_reg::ERDP, erdp | ERDP_EHB);
-            // Clear the interrupter's pending bit (write-1-clear), keep IE.
-            self.rt_write_u32(rt_reg::IMAN, IMAN_IP | IMAN_IE);
-            let _ = irq.ack(bits);
-        }
-    }
-
-    /// Consume every TRB the controller has produced (cycle bit == CCS),
-    /// dispatching each by type. Used in the steady-state event loop where
-    /// completion events are discarded (enumeration already complete).
-    fn drain_event_ring_discard(&mut self) {
-        loop {
-            let seg = self.event_ring.as_ref().expect("event ring allocated");
-            let candidate = read_trb(seg, self.consumer.index);
-            if !self.consumer.owns(&candidate) {
-                break;
-            }
-            match trb::event_trb_type(&candidate) {
-                Some(trb::TrbType::CommandCompletion) => {
-                    let ev = trb::parse_command_completion(&candidate);
-                    self.on_command_completion(ev);
-                }
-                Some(trb::TrbType::PortStatusChange) => {
-                    let ev = trb::parse_port_status_change(&candidate);
-                    self.on_port_status_change(ev);
-                }
-                Some(trb::TrbType::TransferEvent) => {
-                    // Steady-state: interrupt endpoint events — consumed silently.
-                }
-                _ => {}
-            }
-            self.consumer.dequeue_step();
-        }
-    }
-
     // -- 78b synchronous command / transfer machinery ----------------------
 
     /// Enqueue one TRB on the command ring, ring Doorbell 0, then block until
@@ -973,12 +948,13 @@ impl Controller {
         zero_dma(&input_ctx);
 
         self.slot_ctx = Some(SlotContext {
+            slot_id,
             output_ctx,
             ep0_ring,
             ep0_producer,
             ep0_ring_iova,
             input_ctx,
-            ep_rings: alloc::vec::Vec::new(),
+            interrupt_eps: alloc::vec::Vec::new(),
         });
         Ok(())
     }
@@ -1050,15 +1026,16 @@ impl Controller {
         self.producer.cycle
     }
 
-    /// Allocate a transfer ring for an interrupt endpoint (DCI != 1) and
-    /// return its IOVA with DCS=1 ORed in. Used by `configure_endpoint` in
-    /// `enumerate.rs` to replace the placeholder IOVA of 0 that the
-    /// enumeration state machine puts in `EndpointContextSnapshot.ep_dequeue_ptr`.
+    /// Allocate a transfer ring + report buffer for endpoint `dci` (with
+    /// `wMaxPacketSize` `mps`) and return the ring IOVA with DCS=1 ORed in.
+    /// Used by `configure_endpoint` in `enumerate.rs` to replace the
+    /// placeholder IOVA of 0 the enumeration state machine puts in
+    /// `EndpointContextSnapshot.ep_dequeue_ptr`.
     ///
-    /// The ring is kept alive for the controller's lifetime (stored in the
-    /// `slot_ctx`'s `ep_rings` Vec). Repeated calls for the same DCI append
-    /// additional rings; the caller should call this once per endpoint.
-    pub fn alloc_interrupt_ep_ring(&mut self) -> Result<u64, BringUpError> {
+    /// The ring + report buffer are kept alive for the controller's lifetime
+    /// (stored in the `slot_ctx`'s `interrupt_eps` Vec). Phase 78c arms the
+    /// endpoint with Normal TRBs into the report buffer to receive HID reports.
+    pub fn alloc_interrupt_ep_ring(&mut self, dci: u8, mps: u16) -> Result<u64, BringUpError> {
         let ring = DmaBuffer::<u8>::allocate(&self.handle, RING_BYTES, XHCI_ALIGN)
             .map_err(|_| BringUpError::DmaAlloc)?;
         zero_dma(&ring);
@@ -1071,12 +1048,215 @@ impl Controller {
             trb::Trb::link(iova, true, false),
         );
 
-        // Store the ring to keep it alive.
+        // Persistent buffer the controller writes reports into (at least 8
+        // bytes for a boot keyboard report).
+        let data_len = (mps as usize).max(8);
+        let data_buf = DmaBuffer::<u8>::allocate(&self.handle, data_len, XHCI_ALIGN)
+            .map_err(|_| BringUpError::DmaAlloc)?;
+        zero_dma(&data_buf);
+
         let sc = self.slot_ctx.as_mut().expect("slot context allocated");
-        sc.ep_rings.push(ring);
+        sc.interrupt_eps.push(InterruptEndpoint {
+            dci,
+            mps,
+            ring,
+            ring_iova: iova,
+            producer,
+            data_buf,
+            reports: alloc::collections::VecDeque::new(),
+            armed: false,
+        });
 
         // Return IOVA | DCS (DCS=1 means initial cycle state = true).
         Ok(iova | 1)
+    }
+
+    // -- 78c: interrupt-IN arming, report capture, and polling -------------
+
+    /// Maximum captured-but-unpolled reports kept per interrupt endpoint.
+    /// Bounds memory if a class driver stops polling; oldest reports are
+    /// dropped first (a stale boot report is worthless next to a fresh one).
+    const MAX_PENDING_REPORTS: usize = 16;
+
+    /// Enqueue a Normal TRB on endpoint `dci`'s transfer ring (pointing at its
+    /// report buffer) and ring the slot doorbell so the controller delivers the
+    /// next interrupt-IN report. Returns `false` if no such endpoint exists.
+    pub fn arm_interrupt_in(&mut self, dci: u8) -> bool {
+        let slot_id;
+        {
+            let Some(sc) = self.slot_ctx.as_mut() else {
+                return false;
+            };
+            slot_id = sc.slot_id;
+            let Some(ep) = sc.interrupt_eps.iter_mut().find(|e| e.dci == dci) else {
+                return false;
+            };
+            zero_dma(&ep.data_buf);
+            let cycle = ep.producer.cycle;
+            write_trb(
+                &ep.ring,
+                ep.producer.enqueue,
+                trb::Trb::normal(ep.data_buf.iova(), ep.mps as u32, cycle),
+            );
+            let cycle_before = ep.producer.cycle;
+            if ep.producer.advance() {
+                let iova = ep.ring_iova;
+                write_trb(
+                    &ep.ring,
+                    ep.producer.link_index(),
+                    trb::Trb::link(iova, true, cycle_before),
+                );
+            }
+            ep.armed = true;
+        }
+        // Doorbell after the mutable borrow ends (ring_doorbell takes &self).
+        self.ring_doorbell(slot_id, dci);
+        true
+    }
+
+    /// Drain the event ring (non-blocking): capture interrupt-IN reports into
+    /// their endpoint's FIFO, re-arm those endpoints, and dispatch command /
+    /// port-status events normally. Called from the server loop on every bound
+    /// IRQ-notification wake. Updates ERDP + clears IMAN.IP at the end.
+    pub fn service_interrupt_events(&mut self) {
+        // Collect (dci, report) pairs first so re-arming (which needs &mut
+        // self via ring_doorbell) happens after the drain borrow ends.
+        let mut completed: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        loop {
+            let seg = self.event_ring.as_ref().expect("event ring allocated");
+            let candidate = read_trb(seg, self.consumer.index);
+            if !self.consumer.owns(&candidate) {
+                break;
+            }
+            match trb::event_trb_type(&candidate) {
+                Some(trb::TrbType::TransferEvent) => {
+                    let ev = trb::parse_transfer_event(&candidate);
+                    if self.capture_interrupt_report(ev) {
+                        completed.push(ev.endpoint_id);
+                    }
+                }
+                Some(trb::TrbType::CommandCompletion) => {
+                    let ev = trb::parse_command_completion(&candidate);
+                    self.on_command_completion(ev);
+                }
+                Some(trb::TrbType::PortStatusChange) => {
+                    let ev = trb::parse_port_status_change(&candidate);
+                    self.on_port_status_change(ev);
+                }
+                _ => {}
+            }
+            self.consumer.dequeue_step();
+        }
+        // Advance the controller's dequeue pointer and clear the pending bit.
+        let erdp = self.event_ring_iova + (self.consumer.index as u64) * trb::TRB_SIZE as u64;
+        self.rt_write_u64(rt_reg::ERDP, erdp | ERDP_EHB);
+        self.rt_write_u32(rt_reg::IMAN, IMAN_IP | IMAN_IE);
+        // Re-arm every endpoint that just completed so the next report lands.
+        for dci in completed {
+            self.arm_interrupt_in(dci);
+        }
+    }
+
+    /// Read the just-completed report out of `ev`'s endpoint buffer and push it
+    /// onto that endpoint's FIFO. Returns `true` if a matching endpoint was
+    /// found (so the caller re-arms it).
+    fn capture_interrupt_report(&mut self, ev: trb::TransferEvent) -> bool {
+        let Some(sc) = self.slot_ctx.as_mut() else {
+            return false;
+        };
+        let Some(ep) = sc
+            .interrupt_eps
+            .iter_mut()
+            .find(|e| e.dci == ev.endpoint_id)
+        else {
+            return false;
+        };
+        ep.armed = false;
+        let mps = ep.mps as usize;
+        let residual = (ev.residual_transfer_length as usize).min(mps);
+        let len = mps.saturating_sub(residual);
+        // A zero-length completion (no data) is still a valid wake — capture an
+        // empty report only when there is data; otherwise just re-arm.
+        if len == 0 {
+            return true;
+        }
+        let mut out = alloc::vec::Vec::with_capacity(len);
+        for i in 0..len {
+            // SAFETY: data_buf was allocated with at least `mps` bytes; i < len <= mps.
+            let byte = unsafe { core::ptr::read_volatile(ep.data_buf.user_ptr().add(i)) };
+            out.push(byte);
+        }
+        if ep.reports.len() >= Self::MAX_PENDING_REPORTS {
+            ep.reports.pop_front();
+        }
+        ep.reports.push_back(out);
+        true
+    }
+
+    /// Pop the oldest captured report for endpoint `dci`, arming the endpoint if
+    /// it is not currently armed. Returns `None` if no report is queued.
+    pub fn take_interrupt_report(&mut self, dci: u8) -> Option<alloc::vec::Vec<u8>> {
+        let (report, need_arm) = {
+            let sc = self.slot_ctx.as_mut()?;
+            let ep = sc.interrupt_eps.iter_mut().find(|e| e.dci == dci)?;
+            (ep.reports.pop_front(), !ep.armed)
+        };
+        if need_arm {
+            self.arm_interrupt_in(dci);
+        }
+        report
+    }
+
+    /// Perform the HID Boot-Protocol setup for the slot's interface: issue
+    /// `SET_PROTOCOL(0)` then `SET_IDLE(0)` over EP0, then arm the interrupt-IN
+    /// endpoint `ep_in_dci`. Must be called **before** the IRQ notification is
+    /// bound into the server endpoint (it uses the blocking `control_transfer`
+    /// path). Returns `true` if the endpoint was armed.
+    pub fn boot_protocol_setup(
+        &mut self,
+        irq: &IrqNotification,
+        slot_id: u8,
+        interface_num: u8,
+        ep_in_dci: u8,
+    ) -> bool {
+        // SET_PROTOCOL(0): bmRequestType 0x21 (H2D|Class|Interface),
+        // bRequest 0x0B, wValue 0 (Boot), wIndex = interface.
+        let set_protocol = trb::SetupPacket {
+            bm_request_type: 0x21,
+            b_request: 0x0B,
+            w_value: 0,
+            w_index: interface_num as u16,
+            w_length: 0,
+        };
+        if self
+            .control_transfer(irq, slot_id, set_protocol, 0, false)
+            .is_none()
+        {
+            write_str(STDOUT_FILENO, "[xhci] SET_PROTOCOL(0) failed\n");
+        }
+        // SET_IDLE(0): bRequest 0x0A, wValue 0 (duration 0 = report on change,
+        // report id 0 = all) so the device does not stream duplicate reports.
+        let set_idle = trb::SetupPacket {
+            bm_request_type: 0x21,
+            b_request: 0x0A,
+            w_value: 0,
+            w_index: interface_num as u16,
+            w_length: 0,
+        };
+        if self
+            .control_transfer(irq, slot_id, set_idle, 0, false)
+            .is_none()
+        {
+            write_str(STDOUT_FILENO, "[xhci] SET_IDLE(0) failed\n");
+        }
+        // Arm the interrupt-IN endpoint so the first report (keypress) lands.
+        let armed = self.arm_interrupt_in(ep_in_dci);
+        if armed {
+            write_str(STDOUT_FILENO, "[xhci] HID interrupt-IN armed\n");
+        } else {
+            write_str(STDOUT_FILENO, "[xhci] HID interrupt-IN arm failed\n");
+        }
+        armed
     }
 
     // -- A.6: single-threaded drain-on-wake event loop ---------------------
