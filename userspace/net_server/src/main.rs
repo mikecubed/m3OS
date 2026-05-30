@@ -306,12 +306,17 @@ fn handle_sendto(table: &mut HandleTable, handle: u64, packed_dst: u64, _len: u6
     // the reply could not be routed back → getaddrinfo EAI_AGAIN. Mirror the
     // ephemeral allocation `handle_connect` already does.
     if !bound || local_port == 0 {
+        // Ephemeral-source-port autobind exhaustion is EAGAIN, NOT EADDRINUSE —
+        // there is no specific in-use address the caller requested. This mirrors
+        // `handle_connect`'s autobind path (and the kernel-direct sendto path /
+        // Linux unbound-UDP-send semantics) so DNS/sendto callers see the same
+        // errno as connect when the ephemeral range is exhausted.
         let ep = match table.alloc_ephemeral() {
             Some(p) => p,
-            None => return (NEG_EADDRINUSE, 0),
+            None => return (NEG_EAGAIN, 0),
         };
         if !table.bind_port(ep) {
-            return (NEG_EADDRINUSE, 0);
+            return (NEG_EAGAIN, 0);
         }
         let h = table.get_mut(idx).unwrap();
         h.local_port = ep;

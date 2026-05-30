@@ -43,7 +43,7 @@ different bugs wore one face.
 
 ## What This Doc Covers
 
-Eight tracks, each a self-contained fix:
+Nine tracks, each a self-contained fix:
 
 | Track | Fix |
 |---|---|
@@ -55,6 +55,7 @@ Eight tracks, each a self-contained fix:
 | F | Verify `epoll_*` (already implemented) + a regression gate |
 | G | Resolve 5 open handoffs + de-drift the Phase 50-56 deferral lists |
 | H | `/proc` compatibility so `htop` / `ps` show real processes |
+| I | Documentation + release: this learning doc + the `0.77.0` version bump |
 
 ## Why a release-gate phase is the wrong place to find these (60-second version)
 

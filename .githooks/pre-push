@@ -1,5 +1,14 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Pre-push hook: run full quality gates before pushing to remote.
+#
+# Requires bash (not POSIX sh): the gate steps pipe `cargo xtask ...` through
+# `tee` so their output is both shown live and captured for the SKIP/PASS greps
+# below, and we need the exit status of the *cargo* command, not `tee`. We read
+# it via `${PIPESTATUS[0]}`, a bashism — under `#!/bin/sh` (dash) `PIPESTATUS`
+# is unset and a bare `$?` would be tee's status, silently masking a failing
+# smoke-test/test/regression run. (`pipefail` is deliberately *not* set: the
+# flake-retry blocks below build lists from greps that legitimately match
+# nothing, and `set -e` + `pipefail` would abort on those empty pipelines.)
 #
 # The PR CI gate only runs static checks (clippy/fmt/host tests/loom) because
 # GitHub's 2-vCPU shared runners can't execute TCG-emulated QEMU workloads
@@ -69,7 +78,7 @@ echo "pre-push: running cargo xtask smoke-test..."
 # let the Track C PT_TLS/pthread and Track D.1 DNS fixes ride unverified).
 set +e
 cargo xtask smoke-test --timeout 300 2>&1 | tee "$smoke_log"
-smoke_status=${PIPESTATUS:-$?}
+smoke_status=${PIPESTATUS[0]}  # exit status of cargo, not tee
 set -e
 if [ "$smoke_status" -ne 0 ]; then
     echo "pre-push: cargo xtask smoke-test failed" >&2
@@ -117,7 +126,7 @@ echo "pre-push: running cargo xtask test..."
 # on a fresh QEMU.
 set +e
 cargo xtask test --timeout 90 2>&1 | tee "$test_log"
-test_status=${PIPESTATUS:-$?}
+test_status=${PIPESTATUS[0]}  # exit status of cargo, not tee
 set -e
 if [ "$test_status" -ne 0 ]; then
     # cargo xtask test prints `Test <name>-<hash>: FAILED ...` per failed
@@ -173,7 +182,7 @@ echo "pre-push: running cargo xtask regression..."
 # log and decide whether to retry them in isolation.
 set +e
 cargo xtask regression --timeout 90 2>&1 | tee "$regression_log"
-suite_status=${PIPESTATUS:-$?}
+suite_status=${PIPESTATUS[0]}  # exit status of cargo, not tee
 set -e
 if [ "$suite_status" -ne 0 ]; then
     failed_tests="$(grep -E '^  [a-z0-9_-]+: FAIL' "$regression_log" \

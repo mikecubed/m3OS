@@ -76,22 +76,49 @@ unsafe fn read_user_vaddr_expect_fault(uvaddr: u64) -> bool {
 }
 
 /// Deliberately fetch+execute an instruction from `ucode` (a user page) in
-/// ring 0.  Returns `true` if the fetch `#PF`'d (SMEP live).  Uses `jmp` (not
-/// `call`) so no return address is pushed and the recovered RSP is clean.
+/// ring 0.  Returns `true` if the fetch `#PF`'d (SMEP live).
+///
+/// Uses `jmp` (not `call`), but the target page begins with a `ret` (0xC3), so
+/// if SMEP is *not* live — the very failure this probe exists to catch — the
+/// fetch succeeds and that stray `ret` executes.  A naked `ret` would pop an
+/// arbitrary kernel-stack word and jump there, crashing before the caller can
+/// log the "did NOT fault" failure.  To make both outcomes resume at a known
+/// label we push a synthetic return address (the common exit `3:`) before the
+/// `jmp`:
+///
+///   * **no fault** (SMEP off): the stray `ret` pops our synthetic address and
+///     lands cleanly at `3:`; the push and the `ret` cancel, so RSP is balanced.
+///   * **expected fault** (SMEP live): the fetch never executes, so the
+///     synthetic address is still on the stack when the page-fault handler
+///     redirects RIP.  It redirects to the fixup label `4:`, which discards
+///     that word (`add rsp, 8`) before falling through to `3:`, again leaving
+///     RSP balanced.
 #[inline(never)]
 unsafe fn exec_user_vaddr_expect_fault(ucode: u64) -> bool {
     FAULT_OCCURRED.store(false, Ordering::Release);
     let exp = EXPECTED_FAULT_RIP.as_ptr();
     unsafe {
         core::arch::asm!(
-            "lea rax, [rip + 3f]",
+            // Arm recovery at the fixup label (4:), not the common exit: on a
+            // fault the synthetic return address below is still on the stack and
+            // must be discarded before resuming.
+            "lea rax, [rip + 4f]",
             "mov qword ptr [{exp}], rax",
+            // Synthetic return address (common exit, 3:) so a stray `ret` from
+            // the target page (SMEP off) lands cleanly instead of popping junk.
+            "lea rax, [rip + 3f]",
+            "push rax",
             "jmp {code}",
+            // Fault path: the page-fault handler redirected RIP here; drop the
+            // synthetic return address to rebalance RSP.
+            "4:",
+            "add rsp, 8",
+            // Common exit (also where a no-fault stray `ret` lands).
             "3:",
             exp = in(reg) exp,
             code = in(reg) ucode,
             out("rax") _,
-            options(nostack),
+            // We push/pop the stack manually here, so this is NOT `nostack`.
         );
     }
     EXPECTED_FAULT_RIP.store(0, Ordering::Release);
