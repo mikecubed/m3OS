@@ -56,16 +56,14 @@ fn alloc_error(_layout: Layout) -> ! {
 // Constants
 // ---------------------------------------------------------------------------
 
-// Phase 73 — `KNOWN_CONFIGS` below lists 25 service paths after the
-// new `wallpaper`, `bar`, and `notifyd` daemons were added. The
-// fallback loader (`load_services_from_known_configs`) stops adding
-// services once `self.count >= MAX_SERVICES`, so a 24-slot ceiling
-// would silently drop the 25th entry on any boot where every config
-// loads. Sized to `KNOWN_CONFIGS.len()` (25) + 3 headroom for future
-// additions; the static arrays' memory footprint is dominated by
-// `MAX_NAME` + `MAX_CMD` per slot and the extra ~400 bytes are
-// negligible.
-const MAX_SERVICES: usize = 28;
+// Phase 78c — `KNOWN_CONFIGS` below now lists 28 service paths (Phase 73's 25
+// plus the 78a/78b/78c USB driver configs `xhci_driver`, `usbhub`, `usb-hid`).
+// The fallback loader (`load_services_from_known_configs`) and the dir-scan
+// path both stop adding services once `self.count >= MAX_SERVICES`, so the
+// ceiling must exceed the number of `.conf` files actually present or the last
+// entries are silently dropped. Sized to `KNOWN_CONFIGS.len()` (28) + 2
+// headroom for future additions; the extra slots cost a few hundred bytes.
+const MAX_SERVICES: usize = 30;
 const MAX_DISCOVERED_DISABLED: usize = 24;
 const MAX_PIDS: usize = 64;
 const MAX_DEPS: usize = 4;
@@ -206,6 +204,8 @@ const KNOWN_CONFIGS: &[&[u8]] = &[
     b"/etc/services.d/xhci_driver.conf\0",
     // Phase 78b Track B: ring-3 USB hub class driver.
     b"/etc/services.d/usbhub.conf\0",
+    // Phase 78c: ring-3 USB HID Boot-Protocol class driver.
+    b"/etc/services.d/usb-hid.conf\0",
     // Phase 56 Track C: display server (compositor).
     b"/etc/services.d/display_server.conf\0",
     // Phase 57 Track F.2: session_manager daemon.
