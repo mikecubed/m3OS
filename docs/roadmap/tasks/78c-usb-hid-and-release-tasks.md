@@ -28,7 +28,7 @@ A full source audit of the merged 78a/78b tree changed the scope of this phase. 
 | A-hid | `usb-hid` daemon (ring 3): lookup `usb` service, poll interrupt-IN, decode via Track A, inject via Track B1 | A0, A, B1 | ✅ Complete |
 | B2 | Build + ramdisk + service wiring for `usb-hid` (`/drivers/usb-hid`, `depends=xhci_driver`) | A-hid | ✅ Complete |
 | B3 | `usb-smoke` QMP gate (`qemu-xhci`+`usb-kbd`, keystroke→kbd_server), opt-in `M3OS_USB_REGRESSION=1` | all above | ✅ Complete |
-| C | Documentation + release: learning doc, `0.78.2` bump + capability entry | all above | In Progress |
+| C | Documentation + release: learning doc, `0.78.2` bump + capability entry | all above | ✅ Complete |
 
 ### Implementation status (2026-05-30) — what landed and what passed
 
@@ -55,9 +55,9 @@ Regression validation (all PASS): `smoke-test` (boot), `htop-render-probe` (PS/2
 **Why it matters:** The types exist but have no byte transport (`protocol.rs:196`). Without a host-tested codec there is nothing to send over `ipc_call_buf`/`ipc_store_reply_bulk`.
 
 **Acceptance:**
-- [ ] `encode`/`decode` for `AttachNotice`, `UsbRequest`, `UsbReply` round-trip in host tests (incl. the `ControlData`/inline-report variants and an `Error` variant)
-- [ ] IPC label constants + `USB_SERVICE_NAME` defined and host-asserted
-- [ ] No `PageGrant` required on the live HID path (inline-bulk return documented; grant variant retained but marked deferred)
+- [x] `encode`/`decode` for `AttachNotice`, `UsbRequest`, `UsbReply` round-trip in host tests (incl. the `ControlData`/inline-report variants and an `Error` variant)
+- [x] IPC label constants + `USB_SERVICE_NAME` defined and host-asserted
+- [x] No `PageGrant` required on the live HID path (inline-bulk return documented; grant variant retained but marked deferred)
 
 ### A0.2 — xHCI IPC server loop
 
@@ -66,11 +66,11 @@ Regression validation (all PASS): `smoke-test` (boot), `htop-render-probe` (PS/2
 **Why it matters:** Turns the driver from "enumerate once and discard events" into a live request/reply server that `usb-hid` (and later `usbhub`) drive.
 
 **Acceptance:**
-- [ ] After bring-up + enumeration, registers service `usb`, binds the controller IRQ into the endpoint (`sys_notif_bind`), and runs an `ipc_recv_msg` loop multiplexing IRQ + IPC (e1000 pattern), replacing the discard-only `event_loop`
-- [ ] Holds a device table of enumerated devices (slot_id, interface class/sub/proto, interrupt-IN dci + mps + interval); serves an attach-pull request returning `AttachNotice` for already-present HID devices
-- [ ] Serves `ControlRequest` (via `control_transfer`, inline data reply) and an interrupt-IN read; the interrupt-IN read **defers** its reply — the reply cap is stashed and answered when the matching Transfer Event arrives off the IRQ-drained event ring; endpoint is re-armed after each report
-- [ ] New `Controller` methods enqueue a Normal TRB on an interrupt-IN endpoint ring, ring the endpoint doorbell, and decode the Transfer Event (slot/dci/residual) — host-tested where the logic is pure (`kernel-core/src/usb/xhci`)
-- [ ] `xhci-bringup-smoke` and `xhci-enum-smoke` still PASS (no regression to the 78a/78b sentinels)
+- [x] After bring-up + enumeration, registers service `usb`, binds the controller IRQ into the endpoint (`sys_notif_bind`), and runs an `ipc_recv_msg` loop multiplexing IRQ + IPC (e1000 pattern), replacing the discard-only `event_loop`
+- [x] Holds a device table of enumerated devices (slot_id, interface class/sub/proto, interrupt-IN dci + mps + interval); serves an attach-pull request returning `AttachNotice` for already-present HID devices
+- [x] Serves `ControlRequest` (via `control_transfer`, inline data reply) and an interrupt-IN read; the interrupt-IN read **defers** its reply — the reply cap is stashed and answered when the matching Transfer Event arrives off the IRQ-drained event ring; endpoint is re-armed after each report
+- [x] New `Controller` methods enqueue a Normal TRB on an interrupt-IN endpoint ring, ring the endpoint doorbell, and decode the Transfer Event (slot/dci/residual) — host-tested where the logic is pure (`kernel-core/src/usb/xhci`)
+- [x] `xhci-bringup-smoke` and `xhci-enum-smoke` still PASS (no regression to the 78a/78b sentinels)
 
 ---
 
@@ -86,10 +86,10 @@ Regression validation (all PASS): `smoke-test` (boot), `htop-render-probe` (PS/2
 **Why it matters:** This is the actual input path. `SET_PROTOCOL(0)` puts the device in Boot Protocol (no report-descriptor parsing needed); `SET_IDLE(0)` suppresses duplicate/streamed reports; the interrupt-IN endpoint must be brought into the controller via `Configure Endpoint` (78b) and polled with Normal TRBs at `bInterval`.
 
 **Acceptance:**
-- [ ] Registers for `bInterfaceClass 0x03` / `SubClass 0x01` / `Protocol 0x01`; issues `SET_PROTOCOL(0)` (`bmRequestType 0x21`, `bRequest 0x0B`, `wValue 0`) and `SET_IDLE` with `wValue = (0 << 8) | 0` (duration 0 = report only on change, report ID 0 = all reports) so the keyboard does not stream duplicate reports
-- [ ] Polls the interrupt-IN endpoint with Normal TRBs at `bInterval`; decodes the **first 8 bytes** of the boot report `[modifier][reserved][keycode0..keycode5]` (HID Usage IDs), handling the rollover/`0x01` error code
-- [ ] HID Usage ID → `KeyEvent` (keycode/symbol/modifiers/`kind`) via the host-tested `hid_usage_to_keycode` table
-- [ ] The `KeyEvent` is encoded with the existing `kernel-core` codec (`KEY_EVENT_WIRE_SIZE` = 20 bytes) — no new wire format introduced
+- [x] Registers for `bInterfaceClass 0x03` / `SubClass 0x01` / `Protocol 0x01`; issues `SET_PROTOCOL(0)` (`bmRequestType 0x21`, `bRequest 0x0B`, `wValue 0`) and `SET_IDLE` with `wValue = (0 << 8) | 0` (duration 0 = report only on change, report ID 0 = all reports) so the keyboard does not stream duplicate reports
+- [x] Polls the interrupt-IN endpoint with Normal TRBs at `bInterval`; decodes the **first 8 bytes** of the boot report `[modifier][reserved][keycode0..keycode5]` (HID Usage IDs), handling the rollover/`0x01` error code
+- [x] HID Usage ID → `KeyEvent` (keycode/symbol/modifiers/`kind`) via the host-tested `hid_usage_to_keycode` table
+- [x] The `KeyEvent` is encoded with the existing `kernel-core` codec (`KEY_EVENT_WIRE_SIZE` = 20 bytes) — no new wire format introduced
 
 ### A.2 — Boot-Protocol mouse → `PointerEvent`
 
@@ -98,9 +98,9 @@ Regression validation (all PASS): `smoke-test` (boot), `htop-render-probe` (PS/2
 **Why it matters:** The 3-byte boot mouse report maps directly to the Phase 56 relative-pointer model.
 
 **Acceptance:**
-- [ ] Registers for `bInterfaceClass 0x03` / `Protocol 0x02`; reads the endpoint's `wMaxPacketSize` bytes and decodes the **first 3 bytes** `[button bitfield][signed dx][signed dy]`, **ignoring any trailing bytes** (real boot mice often send 4+ bytes with a wheel in byte 4; the Boot Protocol only guarantees the first-3-byte layout, so the driver must accept a report `>= 3` bytes, not assume exactly 3)
-- [ ] Produces a `PointerEvent` (relative `dx`/`dy` + button bitfield) via the existing `kernel-core` codec (`POINTER_EVENT_WIRE_SIZE` = 37 bytes)
-- [ ] Host tests cover report decode including sign extension, button-bit mapping, **and a 4-byte report decoding to the same `PointerEvent` as its 3-byte prefix**
+- [x] Registers for `bInterfaceClass 0x03` / `Protocol 0x02`; reads the endpoint's `wMaxPacketSize` bytes and decodes the **first 3 bytes** `[button bitfield][signed dx][signed dy]`, **ignoring any trailing bytes** (real boot mice often send 4+ bytes with a wheel in byte 4; the Boot Protocol only guarantees the first-3-byte layout, so the driver must accept a report `>= 3` bytes, not assume exactly 3)
+- [x] Produces a `PointerEvent` (relative `dx`/`dy` + button bitfield) via the existing `kernel-core` codec (`POINTER_EVENT_WIRE_SIZE` = 37 bytes)
+- [x] Host tests cover report decode including sign extension, button-bit mapping, **and a 4-byte report decoding to the same `PointerEvent` as its 3-byte prefix**
 
 ### A.3 — Report-Protocol skeleton (deferred from live use)
 
@@ -109,8 +109,8 @@ Regression validation (all PASS): `smoke-test` (boot), `htop-render-probe` (PS/2
 **Why it matters:** Report-Protocol parsing unlocks touchpads, gaming mice, and multi-touch — but Boot Protocol is sufficient for every 1.0 keyboard and mouse, so this is genuinely deferrable.
 
 **Acceptance:**
-- [ ] A minimal report-descriptor item parser (Input items, Usage Page, Usage, Report Size, Report Count) deriving field bit-offsets — **host-tested only**
-- [ ] Explicitly **not** wired to any live device for 1.0; the design-doc "Deferred Until Later" entry for Report Protocol is honored
+- [x] A minimal report-descriptor item parser (Input items, Usage Page, Usage, Report Size, Report Count) deriving field bit-offsets — **host-tested only**
+- [x] Explicitly **not** wired to any live device for 1.0; the design-doc "Deferred Until Later" entry for Report Protocol is honored
 
 ---
 
@@ -126,12 +126,12 @@ Regression validation (all PASS): `smoke-test` (boot), `htop-render-probe` (PS/2
 **Why it matters:** Making USB an additional **producer** keeps `display_server`'s `InputWiring` and the `InputDispatcher` (`kernel-core/src/input/dispatch.rs:304`/`:379`) completely unchanged — USB and PS/2 merge into the same pull stream the compositor already drains. **Source-verified scope note:** `kbd_server`/`mouse_server` today are strictly **synchronous single-endpoint loops** (`ipc_recv` → match label → `ipc_reply`) with **no pending-event buffer** — there is nowhere for an asynchronously injected event to land. So this task is a real change to those servers, not just "add a label": it must add a bounded pending-event queue and define how an inject `ipc_call` interleaves with `PULL` waiters on the single endpoint.
 
 **Acceptance:**
-- [ ] `kbd_server` gains a **bounded pending-`KeyEvent` queue** in `KeyboardPipeline`; a new `KBD_EVENT_INJECT` handler enqueues pushed `KeyEvent`s from `usb-hid`, and `handle_kbd_event_pull` drains that queue **and** the PS/2 (`SYS_READ_SCANCODE`, `0x1007`) stream into each `KBD_EVENT_PULL` reply, with a defined drain priority (injected vs PS/2) and a defined inject reply contract
-- [ ] `mouse_server` gains the analogous bounded pending-`PointerEvent` queue + `MOUSE_EVENT_INJECT` handler, merged into `MOUSE_EVENT_PULL` replies alongside the PS/2 packet (`SYS_READ_MOUSE_PACKET`, `0x1015`) stream
-- [ ] The single-endpoint interleaving of an inject `ipc_call` with `PULL` waiters is defined (no reply-cap collision, no dropped events under a full queue) and documented
-- [ ] `InputDispatcher::route_key_event` / `route_pointer_event` and `display_server/src/input.rs::InputWiring` are unchanged (verified by diff)
-- [ ] PS/2 input still works under QEMU's i8042 emulation — both producers coexist (no regression)
-- [ ] The rejected alternative (`usb-hid` as a third direct `display_server` `InputSource`) is documented with the reason (would fork focus/grab routing outside the single dispatcher)
+- [x] `kbd_server` gains a **bounded pending-`KeyEvent` queue** in `KeyboardPipeline`; a new `KBD_EVENT_INJECT` handler enqueues pushed `KeyEvent`s from `usb-hid`, and `handle_kbd_event_pull` drains that queue **and** the PS/2 (`SYS_READ_SCANCODE`, `0x1007`) stream into each `KBD_EVENT_PULL` reply, with a defined drain priority (injected vs PS/2) and a defined inject reply contract
+- [x] `mouse_server` gains the analogous bounded pending-`PointerEvent` queue + `MOUSE_EVENT_INJECT` handler, merged into `MOUSE_EVENT_PULL` replies alongside the PS/2 packet (`SYS_READ_MOUSE_PACKET`, `0x1015`) stream
+- [x] The single-endpoint interleaving of an inject `ipc_call` with `PULL` waiters is defined (no reply-cap collision, no dropped events under a full queue) and documented
+- [x] `InputDispatcher::route_key_event` / `route_pointer_event` and `display_server/src/input.rs::InputWiring` are unchanged (verified by diff)
+- [x] PS/2 input still works under QEMU's i8042 emulation — both producers coexist (no regression)
+- [x] The rejected alternative (`usb-hid` as a third direct `display_server` `InputSource`) is documented with the reason (would fork focus/grab routing outside the single dispatcher)
 
 ### B.2 — Build + ramdisk + service wiring for `usb-hid`
 
@@ -146,11 +146,11 @@ Regression validation (all PASS): `smoke-test` (boot), `htop-render-probe` (PS/2
 **Why it matters:** `usb-hid` is a ring-3 driver that must be staged under `/drivers/` (not `/bin/`) or the `is_authorized_driver_process` gate (`device_host.rs:126`) denies `sys_device_claim`. It is a static daemon receiving device-attach notifications over IPC (the 78b A.3 lifecycle model), not forked per device.
 
 **Acceptance:**
-- [ ] `usb-hid` added as a Cargo `member` + `bins` entry with `needs_alloc = true` (mirrors the `("xhci_driver", …, true)` / `("usbhub", …, true)` entries)
-- [ ] `usb-hid` binary embedded in `DRIVERS_ENTRIES` (`ramdisk.rs`) at `/drivers/usb-hid` so the `is_authorized_driver_process` gate (`device_host.rs:126`, `/drivers/` prefix) admits it for `sys_device_*`
-- [ ] **(corrected)** service config follows the `xhci_driver`/`usbhub` precedent: written in `xtask::populate_ext2_files` (ext2 data disk) **and** added to `init` `KNOWN_CONFIGS`; uses `command=/drivers/usb-hid`, `type=daemon`, `restart=on-failure`, `depends=xhci_driver`. (The original `kernel/initrd/etc/services.d/usb-hid.conf` location is superseded — the existing USB drivers use the ext2 path.)
-- [ ] **(corrected)** `usb-hid` is a plain `depends=xhci_driver` daemon. It is **not** added to `DECLARED_SESSION_STEP_NAMES` (`session_supervisor.rs:89` contains neither `xhci_driver` nor `usbhub`). It is a static daemon that looks up the `usb` service and receives `AttachNotice` over IPC (not forked per device, per the userspace-first rule)
-- [ ] `cargo xtask clean` run after adding the config (forces ext2 disk recreation)
+- [x] `usb-hid` added as a Cargo `member` + `bins` entry with `needs_alloc = true` (mirrors the `("xhci_driver", …, true)` / `("usbhub", …, true)` entries)
+- [x] `usb-hid` binary embedded in `DRIVERS_ENTRIES` (`ramdisk.rs`) at `/drivers/usb-hid` so the `is_authorized_driver_process` gate (`device_host.rs:126`, `/drivers/` prefix) admits it for `sys_device_*`
+- [x] **(corrected)** service config follows the `xhci_driver`/`usbhub` precedent: written in `xtask::populate_ext2_files` (ext2 data disk) **and** added to `init` `KNOWN_CONFIGS`; uses `command=/drivers/usb-hid`, `type=daemon`, `restart=on-failure`, `depends=xhci_driver`. (The original `kernel/initrd/etc/services.d/usb-hid.conf` location is superseded — the existing USB drivers use the ext2 path.)
+- [x] **(corrected)** `usb-hid` is a plain `depends=xhci_driver` daemon. It is **not** added to `DECLARED_SESSION_STEP_NAMES` (`session_supervisor.rs:89` contains neither `xhci_driver` nor `usbhub`). It is a static daemon that looks up the `usb` service and receives `AttachNotice` over IPC (not forked per device, per the userspace-first rule)
+- [x] `cargo xtask clean` run after adding the config (forces ext2 disk recreation)
 
 ### B.3 — `usb-smoke` acceptance gate (QMP + serial; asserts a real keystroke-to-prompt)
 
@@ -162,12 +162,12 @@ Regression validation (all PASS): `smoke-test` (boot), `htop-render-probe` (PS/2
 **Why it matters:** A serial `[xhci] N ports detected` sentinel proves only that the daemon ran — not that the event ring and interrupter delivered a real HID report and it reached the prompt. Per the AGENTS.md headless-framebuffer guidance, real input must be asserted via QMP, not a serial wait. (78a's `xhci-bringup-smoke` covers the controller; this gate covers the full input chain.)
 
 **Acceptance:**
-- [ ] QEMU launched with `-device qemu-xhci` plus `-device usb-kbd` and `-device usb-mouse` (extends the 78a QEMU arg builder)
-- [ ] The gate asserts, **in causal order** (the emulated `usb-kbd` only emits an interrupt-IN report in response to an injected key — so injection precedes the Transfer-event observation, never after): (1) an `Enable Slot` Command Completion event is observed; (2) a QMP `send-key` is injected into the emulated `usb-kbd`; (3) the resulting interrupt-IN **Transfer event** carrying the 8-byte boot report is observed and decoded to a `KeyEvent`; (4) the keystroke reaches the login/shell prompt (USB → `usb-hid` → `kbd_server` → prompt), verified via QMP `screendump` (PPM occupancy) or a serial echo
-- [ ] Mouse path: a QMP `input-send-event` relative mouse motion is injected into `usb-mouse` and the resulting `PointerEvent` is asserted to reach `mouse_server` (or, if `input-send-event` mouse injection proves unreachable in the harness, the A.2 mouse path is explicitly marked host-test-only and the gate does not imply live mouse verification)
-- [ ] A serial sentinel alone (e.g. `[xhci] N ports detected`) is explicitly **not** sufficient for PASS
-- [ ] Wired as `cargo xtask usb-smoke` with the opt-in pre-push gate `M3OS_USB_REGRESSION=1` (mirrors the heavyweight `htop-render-probe` / `compositor-stress` gates and the AGENTS.md hooks table)
-- [ ] PS/2 i8042 input still passes its existing `smoke-test` coverage (no regression)
+- [x] QEMU launched with `-device qemu-xhci` plus `-device usb-kbd` and `-device usb-mouse` (extends the 78a QEMU arg builder)
+- [x] The gate asserts, **in causal order** (the emulated `usb-kbd` only emits an interrupt-IN report in response to an injected key — so injection precedes the Transfer-event observation, never after): (1) an `Enable Slot` Command Completion event is observed; (2) a QMP `send-key` is injected into the emulated `usb-kbd`; (3) the resulting interrupt-IN **Transfer event** carrying the 8-byte boot report is observed and decoded to a `KeyEvent`; (4) the keystroke reaches the login/shell prompt (USB → `usb-hid` → `kbd_server` → prompt), verified via QMP `screendump` (PPM occupancy) or a serial echo
+- [x] Mouse path: a QMP `input-send-event` relative mouse motion is injected into `usb-mouse` and the resulting `PointerEvent` is asserted to reach `mouse_server` (or, if `input-send-event` mouse injection proves unreachable in the harness, the A.2 mouse path is explicitly marked host-test-only and the gate does not imply live mouse verification)
+- [x] A serial sentinel alone (e.g. `[xhci] N ports detected`) is explicitly **not** sufficient for PASS
+- [x] Wired as `cargo xtask usb-smoke` with the opt-in pre-push gate `M3OS_USB_REGRESSION=1` (mirrors the heavyweight `htop-render-probe` / `compositor-stress` gates and the AGENTS.md hooks table)
+- [x] PS/2 i8042 input still passes its existing `smoke-test` coverage (no regression)
 
 ---
 
@@ -180,14 +180,14 @@ Regression validation (all PASS): `smoke-test` (boot), `htop-render-probe` (PS/2
 **Why it matters:** A learner-friendly doc scoped to the whole Phase 78 USB stack consolidates the bring-up story — TRB rings, the event-ring/interrupter completion model, descriptor-tree enumeration, and HID Boot Protocol — so readers do not reconstruct it from three sub-phases. Follows the "aligned legacy learning doc" template in `docs/appendix/doc-templates.md`.
 
 **Acceptance:**
-- [ ] File exists at `docs/78-usb-host-foundation.md`
-- [ ] Required template fields populated: `**Aligned Roadmap Phase:** Phase 78`, `**Status:**`, `**Source Ref:** phase-78`, `**Supersedes Legacy Doc:** new`
-- [ ] Overview explains, learner-first, why USB-HID is the 1.0 real-hardware unblocker (modern laptops have no PS/2 port) and how a ring-3 + IOMMU-DMA driver issues hardware transfers safely
-- [ ] "What This Doc Covers" walks TRB rings, the event ring + interrupter (why an IRQ, not a poll, signals completion), the enumeration descriptor walk, and the HID boot-report layouts
-- [ ] Key Files table cites the **real** files (`userspace/drivers/xhci`, `userspace/drivers/usbhub`, `userspace/drivers/usb-hid`, `userspace/lib/usb-core`, `kernel-core/src/usb/`, `kernel/src/syscall/device_host.rs`, the `kernel-core/src/input` codecs)
-- [ ] "How This Phase Differs From Later USB Work" notes the deferrals (mass storage, UVC, USB audio, Report Protocol, hot-plug surface)
-- [ ] Related Roadmap Docs links the three sub-phase design docs + their task lists
-- [ ] Authored **after** 78a/78b/78c implementation so it cites the actual mechanism chosen (sentinel-BDF + class enumeration, MSI-X, BME, the `kbd_server`/`mouse_server` inject path)
+- [x] File exists at `docs/78-usb-host-foundation.md`
+- [x] Required template fields populated: `**Aligned Roadmap Phase:** Phase 78`, `**Status:**`, `**Source Ref:** phase-78`, `**Supersedes Legacy Doc:** new`
+- [x] Overview explains, learner-first, why USB-HID is the 1.0 real-hardware unblocker (modern laptops have no PS/2 port) and how a ring-3 + IOMMU-DMA driver issues hardware transfers safely
+- [x] "What This Doc Covers" walks TRB rings, the event ring + interrupter (why an IRQ, not a poll, signals completion), the enumeration descriptor walk, and the HID boot-report layouts
+- [x] Key Files table cites the **real** files (`userspace/drivers/xhci`, `userspace/drivers/usbhub`, `userspace/drivers/usb-hid`, `userspace/lib/usb-core`, `kernel-core/src/usb/`, `kernel/src/syscall/device_host.rs`, the `kernel-core/src/input` codecs)
+- [x] "How This Phase Differs From Later USB Work" notes the deferrals (mass storage, UVC, USB audio, Report Protocol, hot-plug surface)
+- [x] Related Roadmap Docs links the three sub-phase design docs + their task lists
+- [x] Authored **after** 78a/78b/78c implementation so it cites the actual mechanism chosen (sentinel-BDF + class enumeration, MSI-X, BME, the `kbd_server`/`mouse_server` inject path)
 
 ### C.2 — Bump kernel version to `0.78.2` + add the capability entry
 
@@ -201,12 +201,12 @@ Regression validation (all PASS): `smoke-test` (boot), `htop-render-probe` (PS/2
 **Why it matters:** 78c is the sub-phase where USB becomes a user-visible capability, so this is where the `AGENTS.md` capability inventory gains its "USB host stack" entry (per the file's keep-it-small policy — one bullet for a genuinely new capability class). The `0.78.2` cut closes the Phase 78 theme.
 
 **Acceptance:**
-- [ ] `kernel/Cargo.toml` `version = "0.78.2"`
-- [ ] `Cargo.lock` regenerated (via `cargo xtask check`)
-- [ ] `AGENTS.md` kernel version updated to `v0.78.2` and a new **"USB host stack"** capability-class bullet added (xHCI host driver + USB core/hub + HID — modern PS/2-less machines get keyboard/mouse input; detailed record stays in `docs/roadmap/`)
-- [ ] `docs/roadmap/README.md` Phase 78 (umbrella) + 78a/78b/78c rows Status updated to "Complete"; the three sub-phase design-doc + task-doc Status headers set to Complete
-- [ ] `cargo xtask check` passes
-- [ ] Git tag `v0.78.2` — recommended at sub-phase merge (left to the merge step)
+- [x] `kernel/Cargo.toml` `version = "0.78.2"`
+- [x] `Cargo.lock` regenerated (via `cargo xtask check`)
+- [x] `AGENTS.md` kernel version updated to `v0.78.2` and a new **"USB host stack"** capability-class bullet added (xHCI host driver + USB core/hub + HID — modern PS/2-less machines get keyboard/mouse input; detailed record stays in `docs/roadmap/`)
+- [x] `docs/roadmap/README.md` Phase 78 (umbrella) + 78a/78b/78c rows Status updated to "Complete"; the three sub-phase design-doc + task-doc Status headers set to Complete
+- [x] `cargo xtask check` passes
+- [x] Git tag `v0.78.2` — recommended at sub-phase merge (left to the merge step)
 
 ---
 
