@@ -169,11 +169,14 @@ impl TcpConnection {
     /// to `Closed` (observed by the recv loop as EOF and the send loop as a
     /// broken pipe).
     fn service_rto(&mut self, now: u64, out: &mut Vec<(Ipv4Addr, Vec<u8>)>) {
-        // A Closed connection must never replay outstanding segments: it may
-        // have stale queue entries left by an RST, on_link_down, or
-        // TimeWait→Closed transition. Skip entirely rather than generating
-        // spurious retransmits to a peer that has already torn down.
-        if self.state == TcpState::Closed {
+        // A Closed or TimeWait connection must never replay outstanding
+        // segments: it may have stale queue entries left by an RST,
+        // on_link_down, or a FinWait→TimeWait transition whose covering ACK did
+        // not prune our FIN (e.g. a simultaneous-close FIN+ACK that acks our
+        // data but not our FIN). Both FINs have been exchanged once TimeWait is
+        // reached, so skip entirely rather than generating a spurious FIN
+        // retransmit to a peer that has already torn down.
+        if matches!(self.state, TcpState::Closed | TcpState::TimeWait) {
             return;
         }
         match self.retransmit.service_rto(now, &mut self.rtt) {
@@ -287,8 +290,9 @@ impl TcpConnection {
     /// the peer's advertised window and `MAX_INFLIGHT_BYTES`, and the queued
     /// segment count at `MAX_INFLIGHT_SEGMENTS` (bounding per-segment metadata
     /// under uncoalesced tiny writes). When nothing is outstanding at least one
-    /// segment is always accepted, so a small or transiently-zero advertised
-    /// window cannot deadlock the sender (the ACK that reopens the window can
+    /// byte is always accepted (a zero-window probe), so a small or
+    /// transiently-zero advertised window cannot deadlock the sender (the ACK
+    /// that reopens the window can
     /// only arrive once we have sent something).
     fn tcp_send(&mut self, data: &[u8], pending: &mut PendingTx) -> usize {
         if self.state != TcpState::Established || data.is_empty() {
@@ -307,7 +311,14 @@ impl TcpConnection {
         let in_flight = self.snd_nxt.wrapping_sub(self.snd_una) as usize;
         let window = (self.snd_wnd as usize).min(MAX_INFLIGHT_BYTES);
         let available = if in_flight == 0 {
-            data.len()
+            // Nothing outstanding: always accept at least one byte so a small or
+            // transiently-zero advertised window cannot deadlock the sender (the
+            // ACK that reopens the window only arrives once we have sent
+            // something). But honor a small *nonzero* window rather than blasting
+            // a full segment past it — `window.max(1)` sends one zero-window
+            // probe byte when window==0 and otherwise respects the advertised
+            // window.
+            data.len().min(window.max(1))
         } else {
             window.saturating_sub(in_flight)
         };
