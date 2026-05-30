@@ -37,6 +37,13 @@ default = ["trace", "preempt-voluntary"]
 # I.2 soak (procedural gate): 24-hour post-flip soak required before removing the
 # cfg(feature = "preempt-voluntary") guards (I.3). Do not remove guards until I.2 passes.
 trace = []
+# Phase 77 follow-up — the "Net-RX hang" / "blk-drain" stage probes (Wakeup kinds
+# 4-8) wired into the device-IRQ dispatch, virtio-net RX ISR/poll, TCP recv, and
+# virtio-blk completion paths. These were investigation-specific instrumentation
+# for the SSH-disconnect / net-RX hang study; default OFF so 1.0 builds carry no
+# per-IRQ/net/blk trace residue. Enable to re-run that investigation:
+#   M3OS_KERNEL_FEATURES=net-rx-trace cargo xtask run
+net-rx-trace = ["trace"]
 legacy-bootstrap-allocator = []
 # Phase 77 Track B: debug-only SMEP/SMAP "deliberate fault" self-test.
 # Adds a boot-time self-test plus a feature-gated expected-fault recovery hook

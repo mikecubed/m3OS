@@ -2366,6 +2366,8 @@ fn dispatch_device_irq(vector: u8, stack_frame: &InterruptStackFrame) {
     // Net-RX hang trace — Stage A: a device IRQ reached the CPU. `id` is the
     // raw vector so the net vector can be filtered out of other-device noise.
     // ISR-safe (single-writer per-core ring + try_lock focus); no alloc/lock.
+    // Gated behind `net-rx-trace` (default OFF) — investigation-only.
+    #[cfg(feature = "net-rx-trace")]
     crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::Wakeup {
         kind: 4,
         id: vector as u32,

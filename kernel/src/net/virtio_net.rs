@@ -607,6 +607,8 @@ fn virtio_net_irq_handler() {
     // Net-RX hang trace — Stage B: the virtio-net RX ISR ran to its tail and
     // is about to wake net_task. `id` is the task id the wake will target
     // (0 ⇒ net_task never registered ⇒ wake falls back to a reschedule).
+    // Gated behind `net-rx-trace` (default OFF) — investigation-only.
+    #[cfg(feature = "net-rx-trace")]
     crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::Wakeup {
         kind: 5,
         id: NET_TASK_ID.load(Ordering::Acquire) as u32,
@@ -676,6 +678,8 @@ pub fn recv_frames() -> Vec<Vec<u8>> {
     // virtio RX used-ring. `id`=0 every pass ⇒ the device is not delivering
     // packets to the guest (avail/used ring stalled) even though net_task is
     // polling; `id`>0 with no downstream Stage D ⇒ frame dropped in dispatch.
+    // Gated behind `net-rx-trace` (default OFF) — investigation-only.
+    #[cfg(feature = "net-rx-trace")]
     crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::Wakeup {
         kind: 6,
         id: raw_frames.len() as u32,

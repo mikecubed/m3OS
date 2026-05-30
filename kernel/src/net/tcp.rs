@@ -429,6 +429,8 @@ impl TcpConnection {
                     self.queue_segment(pending, TCP_ACK, &[]);
                     // Net-RX hang trace — Stage D (in-order): the segment's
                     // payload reached recv_buf. `id` = bytes accepted in order.
+                    // Gated behind `net-rx-trace` (default OFF) — investigation-only.
+                    #[cfg(feature = "net-rx-trace")]
                     crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::Wakeup {
                         kind: 7,
                         id: payload.len() as u32,
@@ -438,6 +440,8 @@ impl TcpConnection {
                     // arrived but seq != rcv_nxt, so it is dropped (no
                     // reassembly) and only a dup-ACK is sent. High bit set in
                     // `id` distinguishes this from the in-order case above.
+                    // Gated behind `net-rx-trace` (default OFF) — investigation-only.
+                    #[cfg(feature = "net-rx-trace")]
                     crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::Wakeup {
                         kind: 7,
                         id: 0x8000_0000 | (payload.len() as u32 & 0x7fff_ffff),
