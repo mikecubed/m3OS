@@ -738,7 +738,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -6616,6 +6616,40 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         pattern: "SMOKE:wx-violation:PASS",
         timeout_secs: 20,
         label: "guest/wx-violation: smoke runner verified W^X mprotect guard",
+    });
+    // Phase 77 Track F — epoll_* regression. Hard gate (PASS only): the
+    // smoke-runner execs `/bin/epoll-smoke` and asserts ADD/MOD/DEL/wait/timeout
+    // against a pipe. Without an explicit wait step here a failure would be
+    // misattributed to the next stage's timeout (the runner returns early and
+    // never emits dynlink-smoke).
+    steps.push(SmokeStep::Wait {
+        pattern: "SMOKE:epoll-smoke:PASS",
+        timeout_secs: 20,
+        label: "guest/epoll-smoke: epoll_* ADD/MOD/DEL/wait/timeout verified",
+    });
+    // Phase 77 Track C — PT_TLS + multithread pthreads. The musl-built
+    // `/bin/tls-smoke` runs 4 threads each with their own `__thread` copy.
+    // Accepts SKIP when the musl toolchain was absent at build (zero-byte
+    // placeholder); M3OS_TLS_REGRESSION=1 in pre-push rejects that SKIP.
+    steps.push(SmokeStep::WaitEither {
+        pattern_a: "SMOKE:tls-smoke:PASS",
+        pattern_b: "SMOKE:tls-smoke:SKIP",
+        timeout_secs: 30,
+        label: "guest/tls-smoke: PT_TLS multithread TLS verified or skipped",
+        extra_steps_a: &[],
+        extra_steps_b: &[],
+    });
+    // Phase 77 Track D.1 — DNS resolver path. The musl-built `/bin/dns-smoke`
+    // exercises getaddrinfo end to end. Soft by design: SKIP when no outbound
+    // DNS is reachable (sandbox) or the binary is absent; M3OS_DNS_REGRESSION=1
+    // in pre-push rejects a SKIP when a real resolution is required.
+    steps.push(SmokeStep::WaitEither {
+        pattern_a: "SMOKE:dns-smoke:PASS",
+        pattern_b: "SMOKE:dns-smoke:SKIP",
+        timeout_secs: 30,
+        label: "guest/dns-smoke: resolver path exercised or skipped",
+        extra_steps_a: &[],
+        extra_steps_b: &[],
     });
     // Phase 76 — kernel PT_INTERP + ld.so transfer-only stub
     // round-trip. The smoke-runner execs `/bin/dynlink_smoke`
