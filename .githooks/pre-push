@@ -1,5 +1,14 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Pre-push hook: run full quality gates before pushing to remote.
+#
+# Requires bash (not POSIX sh): the gate steps pipe `cargo xtask ...` through
+# `tee` so their output is both shown live and captured for the SKIP/PASS greps
+# below, and we need the exit status of the *cargo* command, not `tee`. We read
+# it via `${PIPESTATUS[0]}`, a bashism — under `#!/bin/sh` (dash) `PIPESTATUS`
+# is unset and a bare `$?` would be tee's status, silently masking a failing
+# smoke-test/test/regression run. (`pipefail` is deliberately *not* set: the
+# flake-retry blocks below build lists from greps that legitimately match
+# nothing, and `set -e` + `pipefail` would abort on those empty pipelines.)
 #
 # The PR CI gate only runs static checks (clippy/fmt/host tests/loom) because
 # GitHub's 2-vCPU shared runners can't execute TCG-emulated QEMU workloads
@@ -59,10 +68,54 @@ fi
 # exits cleanly or aborts.
 test_log="$(mktemp)"
 regression_log="$(mktemp)"
-trap 'rm -f "$test_log" "$regression_log"' EXIT
+smoke_log="$(mktemp)"
+trap 'rm -f "$test_log" "$regression_log" "$smoke_log"' EXIT
 
 echo "pre-push: running cargo xtask smoke-test..."
-cargo xtask smoke-test --timeout 300
+# Capture the smoke output so the opt-in TLS/DNS gates below can assert the
+# musl-built tls-smoke / dns-smoke stages actually PASSed rather than SKIPped
+# (a SKIP means the musl toolchain was absent at build, which would otherwise
+# let the Track C PT_TLS/pthread and Track D.1 DNS fixes ride unverified).
+set +e
+cargo xtask smoke-test --timeout 300 2>&1 | tee "$smoke_log"
+smoke_status=${PIPESTATUS[0]}  # exit status of cargo, not tee
+set -e
+if [ "$smoke_status" -ne 0 ]; then
+    echo "pre-push: cargo xtask smoke-test failed" >&2
+    exit 1
+fi
+
+# Phase 77 — opt-in TLS regression gate. tls-smoke is a full-musl static binary
+# whose only purpose is to exercise the Track C clone(CLONE_THREAD) r9-preserve
+# + PT_TLS fix; when the musl cross-compiler is absent it is staged as a
+# zero-byte placeholder and the smoke-runner emits SMOKE:tls-smoke:SKIP, so the
+# headline fix is never run. Set M3OS_TLS_REGRESSION=1 on branches that touch
+# the kernel clone path, make_fork_ctx_for_thread, the ELF PT_TLS loader, or the
+# futex CHILD_CLEARTID wake to REQUIRE a real PASS (install a musl cross-gcc).
+if [ "${M3OS_TLS_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: enforcing tls-smoke PASS (M3OS_TLS_REGRESSION=1)..."
+    if grep -q 'SMOKE:tls-smoke:SKIP' "$smoke_log" || ! grep -q 'SMOKE:tls-smoke:PASS' "$smoke_log"; then
+        echo "pre-push: tls-smoke did not PASS (SKIP or absent). Install a musl" >&2
+        echo "          cross-compiler (e.g. x86_64-linux-musl-gcc) so the Track C" >&2
+        echo "          PT_TLS / pthread fix is actually exercised." >&2
+        exit 1
+    fi
+fi
+
+# Phase 77 — opt-in DNS regression gate. dns-smoke is musl-built; SMOKE:dns-smoke:SKIP
+# means the binary was absent (musl missing), whereas SMOKE:dns-smoke:PASS means the
+# resolver path ran end to end (it accepts DNS_SMOKE:SKIP offline, so a real
+# resolution cannot be required in a sandbox — but the path running without
+# hanging can). Set M3OS_DNS_REGRESSION=1 on branches touching the resolver /
+# recvmsg / ephemeral-UDP path to REQUIRE the path is exercised.
+if [ "${M3OS_DNS_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: enforcing dns-smoke PASS (M3OS_DNS_REGRESSION=1)..."
+    if grep -q 'SMOKE:dns-smoke:SKIP' "$smoke_log" || ! grep -q 'SMOKE:dns-smoke:PASS' "$smoke_log"; then
+        echo "pre-push: dns-smoke did not PASS (SKIP or absent). Install a musl" >&2
+        echo "          cross-compiler so the Track D.1 resolver path is exercised." >&2
+        exit 1
+    fi
+fi
 
 echo "pre-push: running cargo xtask test..."
 # Same retry-on-isolate pattern as regression below.  The kernel-test
@@ -73,7 +126,7 @@ echo "pre-push: running cargo xtask test..."
 # on a fresh QEMU.
 set +e
 cargo xtask test --timeout 90 2>&1 | tee "$test_log"
-test_status=${PIPESTATUS:-$?}
+test_status=${PIPESTATUS[0]}  # exit status of cargo, not tee
 set -e
 if [ "$test_status" -ne 0 ]; then
     # cargo xtask test prints `Test <name>-<hash>: FAILED ...` per failed
@@ -129,7 +182,7 @@ echo "pre-push: running cargo xtask regression..."
 # log and decide whether to retry them in isolation.
 set +e
 cargo xtask regression --timeout 90 2>&1 | tee "$regression_log"
-suite_status=${PIPESTATUS:-$?}
+suite_status=${PIPESTATUS[0]}  # exit status of cargo, not tee
 set -e
 if [ "$suite_status" -ne 0 ]; then
     failed_tests="$(grep -E '^  [a-z0-9_-]+: FAIL' "$regression_log" \
@@ -215,4 +268,15 @@ fi
 if [ "${M3OS_TILING_REGRESSION:-0}" = "1" ]; then
     echo "pre-push: running cargo xtask tiling-smoke..."
     cargo xtask tiling-smoke --timeout 120
+fi
+
+# Phase 77 — htop process-list regression gate. Gated behind
+# M3OS_HTOP_REGRESSION=1 because the gate cross-compiles the ncurses +
+# htop ports and boots the graphical stack headlessly (QMP + VNC), then
+# asserts htop renders a *populated* process table (not just that it
+# launched). Set the env var on branches that touch kernel/src/fs/procfs.rs,
+# the /proc syscall surface, or the scheduler's per-task accounting.
+if [ "${M3OS_HTOP_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask htop-render-probe..."
+    cargo xtask htop-render-probe --timeout 300
 fi

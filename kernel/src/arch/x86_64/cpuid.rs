@@ -213,6 +213,147 @@ pub fn osxsave_enabled() -> bool {
     OSXSAVE_ENABLED.load(Ordering::Acquire)
 }
 
+// ---------------------------------------------------------------------------
+// Phase 77 Track B — SMEP / SMAP (cheap CR4 security mitigations)
+// ---------------------------------------------------------------------------
+
+/// `CPUID.07h:0.EBX[7]` — Supervisor-Mode Execution Prevention.
+const CPUID_07_EBX_SMEP: u32 = 1 << 7;
+/// `CPUID.07h:0.EBX[20]` — Supervisor-Mode Access Prevention.
+const CPUID_07_EBX_SMAP: u32 = 1 << 20;
+
+static SMEP_SMAP: Once<(bool, bool)> = Once::new();
+
+/// Probe `CPUID.07h:0.EBX` for SMEP (bit 7) and SMAP (bit 20).  Returns
+/// `(smep_supported, smap_supported)`.  Idempotent — first call wins.
+///
+/// Leaf `0x07` is not probed elsewhere in this module (only leaves 1 and
+/// `0x0D`), so this is the only `CPUID.07h` consumer.
+pub fn probe_smep_smap() -> (bool, bool) {
+    *SMEP_SMAP.call_once(|| {
+        // CPUID leaf `0x07` only exists when the maximum basic leaf
+        // (`CPUID.0:EAX`) is at least 7. On an older CPU or a VM CPU model
+        // that exposes only lower leaves, executing `cpuid` with an
+        // unsupported basic leaf returns the data of the *highest* supported
+        // leaf instead — whose EBX bits 7/20 could be mistaken for SMEP/SMAP
+        // support, after which `enable_smep_smap` would set unsupported CR4
+        // bits and `#GP` during boot. Gate the read on the max basic leaf.
+        if cpuid_raw(0, 0).eax < 0x07 {
+            return (false, false);
+        }
+        let leaf7 = cpuid_raw(0x07, 0);
+        (
+            leaf7.ebx & CPUID_07_EBX_SMEP != 0,
+            leaf7.ebx & CPUID_07_EBX_SMAP != 0,
+        )
+    })
+}
+
+/// Enable `CR4.SMEP` (bit 20) and `CR4.SMAP` (bit 21) on the **current** core
+/// when the CPU reports support.  Returns `(smep_enabled, smap_enabled)`.
+///
+/// * **SMEP** faults (`#PF`) if ring 0 ever *fetches an instruction* from a
+///   user-accessible page — closing the "jump into userspace shellcode"
+///   exploit class.  It has no effect on legitimate kernel execution.
+/// * **SMAP** faults if ring 0 *reads or writes* a user-accessible page
+///   outside an explicit `STAC`/`CLAC` window.  m3OS is SMAP-clean by
+///   construction: every deliberate user-memory access funnels through
+///   `mm::user_mem` (`copy_from_user`/`copy_to_user` and the `UserSlice*`
+///   wrappers) and the ELF loader / ABI-stack / signal-frame writers, all of
+///   which reach the bytes through the **physical-memory direct map**
+///   (`mm::phys_offset() + phys_addr`) — a supervisor mapping that SMAP does
+///   not police — never through the user virtual address.  No `STAC`/`CLAC`
+///   window is therefore required; enabling the bit is free.
+///
+/// Must run on the BSP **before** `smp::boot::boot_aps()` so the trampoline's
+/// captured `DATA_CR4` carries the bits and every AP inherits them when it
+/// reloads CR4 in `ap_entry`.
+///
+/// # Safety
+/// CR4 is a privileged register; this must run in ring 0 with IRQs disabled or
+/// single-threaded.
+pub unsafe fn enable_smep_smap() -> (bool, bool) {
+    let (smep, smap) = probe_smep_smap();
+    if !smep && !smap {
+        return (false, false);
+    }
+    let mut cr4: u64;
+    unsafe {
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
+    }
+    if smep {
+        cr4 |= 1 << 20;
+    }
+    if smap {
+        cr4 |= 1 << 21;
+    }
+    unsafe {
+        core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nostack));
+    }
+    // NOTE: clearing EFLAGS.AC (so SMAP actually enforces — it only blocks
+    // ring-0 user access while AC == 0) is done by the *callers*, not here.
+    // A `clac` inside this function would be undone by the `without_interrupts`
+    // popf that the BSP caller wraps this in.  See `clear_ac_for_smap` and the
+    // SFMASK (ALIGNMENT_CHECK) syscall-entry mask.
+    (smep, smap)
+}
+
+/// Clear `EFLAGS.AC` on the current core so `CR4.SMAP` actually enforces.
+///
+/// SMAP only blocks ring-0 access to user pages while `AC == 0`; firmware may
+/// leave `AC == 1`.  Call this on each core's boot path **outside** any
+/// `without_interrupts` / `pushf`/`popf` bracket (which would restore the old
+/// AC).  Syscall entry separately clears AC via `SFMASK`.
+///
+/// # Safety
+/// `clac` is only valid when `CR4.SMAP` is set; call after [`enable_smep_smap`].
+#[inline]
+pub unsafe fn clear_ac_for_smap() {
+    if cr4_smap_enabled() {
+        unsafe {
+            core::arch::asm!("clac", options(nomem, nostack));
+        }
+    }
+}
+
+/// True if `CR4.SMEP` (bit 20) is currently set on this core.
+pub fn cr4_smep_enabled() -> bool {
+    let cr4: u64;
+    unsafe {
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
+    }
+    cr4 & (1 << 20) != 0
+}
+
+/// True if `CR4.SMAP` (bit 21) is currently set on this core.
+pub fn cr4_smap_enabled() -> bool {
+    let cr4: u64;
+    unsafe {
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
+    }
+    cr4 & (1 << 21) != 0
+}
+
+/// True if `EFLAGS.AC` (bit 18) is currently set on this core.
+pub fn eflags_ac_set() -> bool {
+    use x86_64::registers::rflags::{self, RFlags};
+    rflags::read().contains(RFlags::ALIGNMENT_CHECK)
+}
+
+/// Debug-only assertion that SMAP is currently *enforcing*: when `CR4.SMAP` is
+/// set, `EFLAGS.AC` must be 0 (SMAP only blocks ring-0 access to user pages
+/// while `AC == 0`). Stripped in release builds; in a debug kernel it catches a
+/// ring-0 path that left AC set — e.g. a `popf`/`iret` that restored a
+/// firmware-set AC, or an interrupt/exception entry that forgot to `clac`
+/// (PR #201 audit) — turning a silent SMAP-disabled window into a loud panic.
+#[inline(always)]
+pub fn debug_assert_smap_enforcing() {
+    debug_assert!(
+        !cr4_smap_enabled() || !eflags_ac_set(),
+        "SMAP enabled but EFLAGS.AC=1 — SMAP is non-enforcing on this ring-0 path"
+    );
+}
+
 #[derive(Clone, Copy)]
 struct CpuidRaw {
     eax: u32,

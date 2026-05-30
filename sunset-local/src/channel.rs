@@ -277,6 +277,41 @@ impl Channels {
         }
     }
 
+    /// Server-initiated orderly session close: send the process `exit-status`,
+    /// then `SSH_MSG_CHANNEL_EOF` and `SSH_MSG_CHANNEL_CLOSE`, so the peer (an
+    /// ssh client whose shell has exited) sees a clean logout rather than a
+    /// dropped transport ("Connection closed by remote host"). Idempotent on
+    /// the EOF/close flags; does not set `app_done` (the caller's
+    /// `channel_done` performs that cleanup so the channel number is released).
+    pub(crate) fn send_server_exit(
+        &mut self,
+        num: ChanNum,
+        exit_status: u32,
+        s: &mut TrafSend,
+    ) -> Result<()> {
+        let ch = self.get_mut(num)?;
+        let send_num = ch.send_num()?;
+        // exit-status is informational; the client never replies.
+        let req = ChannelRequest {
+            num: send_num,
+            want_reply: false,
+            req: ChannelReqType::ExitStatus(packets::ExitStatus {
+                status: exit_status,
+            }),
+        };
+        let req: Packet = req.into();
+        s.send(req)?;
+        if !ch.sent_eof {
+            s.send(packets::ChannelEof { num: send_num })?;
+            ch.sent_eof = true;
+        }
+        if !ch.sent_close {
+            s.send(packets::ChannelClose { num: send_num })?;
+            ch.sent_close = true;
+        }
+        Ok(())
+    }
+
     fn dispatch_open(
         &mut self,
         p: &ChannelOpen<'_>,

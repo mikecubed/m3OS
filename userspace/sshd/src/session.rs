@@ -201,6 +201,19 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
 /// The runner buffers are leaked to obtain `'static` references, which allows
 /// spawning tasks that share the `Rc<Mutex<Runner>>`. This is acceptable
 /// because each session runs in a forked child process that exits when done.
+/// Decode a `waitpid` status into the exit code to report to the SSH client:
+/// `WEXITSTATUS` for a normal exit, `128 + signal` (shell convention) for a
+/// signalled exit. The kernel encodes a normal exit as `(code & 0xff) << 8` and
+/// a terminating signal in the low 7 bits, so an `exit 3` from the remote shell
+/// is reflected as SSH exit-status 3 instead of the previous always-0.
+fn decode_wait_status(status: i32) -> i32 {
+    if status & 0x7f == 0 {
+        (status >> 8) & 0xff
+    } else {
+        128 + (status & 0x7f)
+    }
+}
+
 async fn async_session(sock_fd: i32, host_key: &HostKey) -> i32 {
     // Allocate runner buffers and leak them for 'static lifetime.
     // The forked child process exits after this function, so the leak is benign.
@@ -253,6 +266,10 @@ async fn async_session(sock_fd: i32, host_key: &HostKey) -> i32 {
             let ret = waitpid(pid as i32, &mut status, WNOHANG);
             if ret > 0 {
                 log_sshd_step_u64("async_session:shell exited", "child_pid", pid as u64);
+                // Record the shell's real exit code (a flush failure below may
+                // still override it with 1 — a transport problem is reported as
+                // a generic error).
+                state.borrow_mut().exit_code = decode_wait_status(status);
                 // Shell exited — drain remaining PTY output, then stop.
                 let pty_master = state.borrow().pty_master;
                 let has_chan = chan.borrow().is_some();
@@ -279,8 +296,51 @@ async fn async_session(sock_fd: i32, host_key: &HostKey) -> i32 {
     let pty_master = state.borrow().pty_master;
     let pty_slave = state.borrow().pty_slave;
     cleanup(shell_pid, pty_master, pty_slave);
+    // Send an orderly SSH channel close (exit-status + CHANNEL_EOF +
+    // CHANNEL_CLOSE) before dropping the transport, so the client logs out
+    // cleanly (ssh exit 0) instead of seeing a raw transport drop
+    // ("Connection closed by remote host", ssh exit 255). Best-effort and
+    // bounded: any failure falls through to the unconditional `close` below,
+    // which still releases the client.
+    send_clean_channel_close(&runner, sock_fd, &chan, &output_lock, exit_code).await;
     close(sock_fd);
     exit_code
+}
+
+/// Queue the orderly SSH session-close packets (via `server_session_exit`) and
+/// flush them to the socket before the caller closes it. The channel handle is
+/// consumed; no-op if the channel was never opened.
+async fn send_clean_channel_close(
+    runner: &SharedRunner,
+    sock_fd: i32,
+    chan: &SharedChan,
+    output_lock: &SharedOutputLock,
+    exit_code: i32,
+) {
+    // Release the RefCell borrow before awaiting the runner lock.
+    let handle_opt = chan.borrow_mut().take();
+    if let Some(handle) = handle_opt {
+        {
+            let mut guard = runner.lock().await;
+            // SSH exit-status is an unsigned code; map sshd's internal -1/err
+            // sentinel to a generic failure status, normal logout → 0.
+            let status = if exit_code < 0 {
+                1u32
+            } else {
+                exit_code as u32
+            };
+            let _ = guard.server_session_exit(handle, status);
+        }
+        // The close packets are now in sunset's output buffer; flush them to
+        // the socket so the client receives them before the transport FIN.
+        // BOUNDED flush (not `flush_output_locked`): a client that is still
+        // alive but has stopped draining its receive window returns EAGAIN
+        // rather than an error, and `write_all_nonblocking`'s `writable().await`
+        // would then park forever — re-opening the exact teardown-hang this
+        // path exists to prevent, and starving `close(sock_fd)` below. The
+        // bounded variant gives up after a fixed budget so `close` always runs.
+        flush_output_bounded(runner, sock_fd, output_lock).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -327,6 +387,7 @@ async fn io_task(
             let ret = syscall_lib::waitpid(pid as i32, &mut status, WNOHANG);
             if ret > 0 {
                 log_sshd_step_u64("io_task:shell_exited_backstop", "child_pid", pid as u64);
+                state.borrow_mut().exit_code = decode_wait_status(status);
                 state.borrow_mut().session_done = true;
                 state.borrow_mut().shell_pid = None;
                 session_notify.signal();
@@ -543,6 +604,7 @@ async fn progress_task(
             let ret = syscall_lib::waitpid(pid as i32, &mut status, WNOHANG);
             if ret > 0 {
                 log_sshd_step_u64("progress:shell_exited_backstop", "child_pid", pid as u64);
+                state.borrow_mut().exit_code = decode_wait_status(status);
                 state.borrow_mut().session_done = true;
                 state.borrow_mut().shell_pid = None;
                 session_notify.signal();
@@ -1014,6 +1076,7 @@ async fn channel_relay_task(
                     "child_pid",
                     pid as u64,
                 );
+                state.borrow_mut().exit_code = decode_wait_status(status);
                 let _ = flush_output_locked(&runner, sock_fd, &output_lock).await;
                 state.borrow_mut().session_done = true;
                 state.borrow_mut().shell_pid = None;
@@ -1435,6 +1498,56 @@ async fn flush_output_locked(
     }
 }
 
+/// Bounded teardown flush. Used only on the session-close path, where the peer
+/// may be alive yet not draining (write → EAGAIN, never an error). Unlike
+/// `flush_output_locked` (whose `write_all_nonblocking` parks on
+/// `writable().await` until POLLOUT and can hang forever against such a client),
+/// this caps the total time spent waiting on EAGAIN and then returns so the
+/// caller can `close(sock_fd)` — the transport FIN still releases the client.
+async fn flush_output_bounded(runner: &SharedRunner, sock_fd: i32, output_lock: &SharedOutputLock) {
+    // ~1 s total EAGAIN budget (40 × 25 ms), matching cleanup()'s bounded grace.
+    // The budget is NOT reset on progress, so even a 1-byte-per-tick trickling
+    // client cannot extend teardown past the cap. A healthy client drains the
+    // few hundred bytes of close packets in one write and never touches it.
+    const MAX_EAGAIN_WAITS: u32 = 40;
+    let _flush_guard = output_lock.lock().await;
+    let mut eagain_waits = 0u32;
+    loop {
+        let mut guard = runner.lock().await;
+        let out = guard.output_buf();
+        if out.is_empty() {
+            return;
+        }
+        let mut tmp = [0u8; 4096];
+        let chunk = out.len().min(tmp.len());
+        tmp[..chunk].copy_from_slice(&out[..chunk]);
+        drop(guard);
+
+        let mut written = 0usize;
+        while written < chunk {
+            let n = syscall_lib::write(sock_fd, &tmp[written..chunk]);
+            if n > 0 {
+                written += n as usize;
+            } else if n == NEG_EINTR {
+                continue;
+            } else if n == NEG_EAGAIN {
+                if eagain_waits >= MAX_EAGAIN_WAITS {
+                    // Client alive but not draining; give up so the caller closes.
+                    return;
+                }
+                eagain_waits += 1;
+                syscall_lib::nanosleep_for(0, 25_000_000); // 25 ms
+            } else {
+                // Hard error: stop flushing; the caller's close releases the fd.
+                return;
+            }
+        }
+
+        let mut guard = runner.lock().await;
+        guard.consume_output(chunk);
+    }
+}
+
 async fn write_all_nonblocking(fd: i32, data: &[u8]) -> Result<(), ()> {
     let async_fd = AsyncFd::new(fd);
     let mut written = 0usize;
@@ -1515,28 +1628,36 @@ async fn drain_pty_locked(
 
 /// Clean up all session resources.
 ///
-/// The interactive shell (`/bin/ion`) installs handlers for SIGHUP, SIGINT,
-/// and SIGTERM that merely set a PENDING flag and do not terminate the
-/// process. Only SIGKILL is unblockable. To guarantee bounded cleanup time
-/// we send SIGHUP first (so well-behaved shells exit gracefully), poll
-/// `waitpid(WNOHANG)` for a brief grace period, and escalate to SIGKILL if
-/// the shell is still alive. Without this escalation `cleanup` would block
-/// indefinitely on `waitpid(_, _, 0)`, preventing `close(sock_fd)` from ever
-/// running and leaving the OpenSSH client hung waiting for FIN.
+/// Phase 77 (PR #118 residual fix): teardown is **EOF-driven**, not
+/// signal-driven.  We close the PTY master FIRST so the shell's
+/// controlling-terminal read returns end-of-file; an interactive shell
+/// (`/bin/ion` and every POSIX shell) treats EOF on stdin as logout and
+/// exits on its own — the canonical Unix way a session ends when the
+/// terminal disappears.  This deliberately avoids sending the shell a
+/// signal during teardown: `kill(shell, SIGHUP)` routes through the
+/// kernel's `interrupt_ipc_waits`, which races the SMP scheduler/IPC
+/// cancellation machinery when the shell is parked in an IPC wait and can
+/// wedge the guest (the 2026-04-25 disconnect hang).  SIGKILL is retained
+/// only as a bounded last resort for a (hypothetical) shell that ignores
+/// EOF, so `cleanup` always completes in bounded time and `close(sock_fd)`
+/// runs, delivering FIN to the OpenSSH client.
 fn cleanup(shell_pid: Option<isize>, pty_master: Option<i32>, pty_slave: Option<i32>) {
     if shell_pid.is_some() || pty_master.is_some() || pty_slave.is_some() {
         log_sshd_step("cleanup:start");
     }
+    // 1. Close the master first → the slave read returns EOF → shell exits.
+    if let Some(fd) = pty_master {
+        log_sshd_step_u64("cleanup:close pty_master", "fd", fd as u64);
+        close(fd);
+    }
+    // 2. Reap the shell. It should exit on EOF within the grace window with
+    //    no signal at all. Only if it stubbornly ignores EOF do we SIGKILL.
     if let Some(pid) = shell_pid {
-        log_sshd_step_u64("cleanup:kill shell", "child_pid", pid as u64);
-        // ion catches SIGHUP/SIGINT/SIGTERM and merely sets a PENDING flag;
-        // only SIGKILL is unblockable. Send SIGHUP first (graceful), poll
-        // waitpid(WNOHANG) for ~500ms, then escalate to SIGKILL so cleanup
-        // always completes in bounded time.
-        syscall_lib::kill(pid as i32, syscall_lib::SIGHUP as i32);
+        log_sshd_step_u64("cleanup:reap shell", "child_pid", pid as u64);
         let mut status: i32 = 0;
         let mut reaped = false;
-        for _ in 0..20 {
+        // ~2 s grace for the EOF-driven exit (80 × 25 ms).
+        for _ in 0..80 {
             let ret = waitpid(pid as i32, &mut status, syscall_lib::WNOHANG);
             if ret > 0 {
                 reaped = true;
@@ -1545,16 +1666,23 @@ fn cleanup(shell_pid: Option<isize>, pty_master: Option<i32>, pty_slave: Option<
             syscall_lib::nanosleep_for(0, 25_000_000);
         }
         if !reaped {
+            // Last resort: the shell ignored EOF. SIGKILL is unblockable.
             log_sshd_step_u64("cleanup:escalate SIGKILL", "child_pid", pid as u64);
             syscall_lib::kill(pid as i32, syscall_lib::SIGKILL as i32);
-            waitpid(pid as i32, &mut status, 0);
+            for _ in 0..40 {
+                if waitpid(pid as i32, &mut status, syscall_lib::WNOHANG) > 0 {
+                    reaped = true;
+                    break;
+                }
+                syscall_lib::nanosleep_for(0, 25_000_000);
+            }
+            if !reaped {
+                waitpid(pid as i32, &mut status, 0);
+            }
         }
         log_sshd_step_u64("cleanup:waitpid shell", "status", status as u64);
     }
-    if let Some(fd) = pty_master {
-        log_sshd_step_u64("cleanup:close pty_master", "fd", fd as u64);
-        close(fd);
-    }
+    // 3. Close the slave fd.
     if let Some(fd) = pty_slave {
         log_sshd_step_u64("cleanup:close pty_slave", "fd", fd as u64);
         close(fd);

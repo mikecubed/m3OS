@@ -189,5 +189,5 @@ A `LineDiscipline` struct holds a reference to the TTY state and provides `proce
 - **True per-core scheduling** (lock-free dispatch hot path) — per-core run queues and work-stealing landed, but task state transitions still require the global `SCHEDULER` lock; splitting task ownership per-core is a larger architectural change deferred past Phase 52
 - **Growable notification pool** — notifications remain fixed-size (`MAX_NOTIFS = 64`) because ISR-safe access requires lock-free fixed-size arrays; a two-level design (fixed ISR-visible table + growable overflow) is possible but not needed at current scale
 - Atomic `reply_recv` (seL4-style) — nice optimization but not critical
-- Preemptive scheduling from interrupt context — requires deeper `switch_context` redesign
+- Preemptive scheduling from interrupt context — requires deeper `switch_context` redesign. **✅ delivered in Phase 57d** (`check_and_preempt_user` + `preempt_to_scheduler` in `kernel/src/arch/x86_64/interrupts.rs` / `task/scheduler.rs`, `preempt-voluntary` default feature).
 - Dynamic PTY pool — can grow the fixed array to a larger number as a simpler intermediate step

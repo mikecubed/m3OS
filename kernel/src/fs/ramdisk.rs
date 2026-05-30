@@ -102,6 +102,7 @@ static PASSWD_ELF: &[u8] = generated_initrd_asset!("passwd");
 static ADDUSER_ELF: &[u8] = generated_initrd_asset!("adduser");
 static ID_ELF: &[u8] = generated_initrd_asset!("id");
 static WHOAMI_ELF: &[u8] = generated_initrd_asset!("whoami");
+static KTRACE_ELF: &[u8] = generated_initrd_asset!("ktrace");
 static TELNETD_ELF: &[u8] = generated_initrd_asset!("telnetd");
 // Phase 43: SSH server
 static SSHD_ELF: &[u8] = generated_initrd_asset!("sshd");
@@ -115,6 +116,10 @@ static AR_ELF: &[u8] = generated_initrd_asset!("ar");
 static INSTALL_ELF: &[u8] = generated_initrd_asset!("install");
 static MEMINFO_ELF: &[u8] = generated_initrd_asset!("meminfo");
 static MMAP_LEAK_TEST_ELF: &[u8] = generated_initrd_asset!("mmap-leak-test");
+// Phase 77 Track C: multi-threaded __thread / PT_TLS smoke test.
+static TLS_SMOKE_ELF: &[u8] = generated_initrd_asset!("tls-smoke");
+// Phase 77 Track D.1: DNS resolution smoke test (musl resolver).
+static DNS_SMOKE_ELF: &[u8] = generated_initrd_asset!("dns-smoke");
 static MAKE_ELF: &[u8] = generated_initrd_asset!("make");
 static HEAD_ELF: &[u8] = generated_initrd_asset!("head");
 static TAIL_ELF: &[u8] = generated_initrd_asset!("tail");
@@ -311,6 +316,9 @@ static PAGE_GRANT_TEST_ELF: &[u8] = generated_initrd_asset!("page-grant-test");
 // no `.conf`.
 static WX_VIOLATION_ELF: &[u8] = generated_initrd_asset!("wx-violation");
 
+// Phase 77 Track F.1 — `epoll-smoke` epoll_* verification regression.
+static EPOLL_SMOKE_ELF: &[u8] = generated_initrd_asset!("epoll-smoke");
+
 // Phase 76 — `dynlink_smoke` musl-built dynamic ELF carrying
 // `PT_INTERP = /lib/ld-musl-x86_64.so.1` and zero `DT_NEEDED`
 // entries. The smoke-runner execs this to validate the kernel
@@ -492,6 +500,12 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         },
     ),
     (
+        "ktrace",
+        RamdiskNode::File {
+            content: KTRACE_ELF,
+        },
+    ),
+    (
         "telnetd",
         RamdiskNode::File {
             content: TELNETD_ELF,
@@ -633,6 +647,13 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "wx-violation",
         RamdiskNode::File {
             content: WX_VIOLATION_ELF,
+        },
+    ),
+    // Phase 77 Track F.1: epoll-smoke — epoll_* verification regression.
+    (
+        "epoll-smoke",
+        RamdiskNode::File {
+            content: EPOLL_SMOKE_ELF,
         },
     ),
     // Phase 76: dynlink_smoke — kernel PT_INTERP + ld.so transfer
@@ -787,6 +808,20 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "mmap-leak-test",
         RamdiskNode::File {
             content: MMAP_LEAK_TEST_ELF,
+        },
+    ),
+    // Phase 77 Track C: multi-threaded __thread / PT_TLS smoke test
+    (
+        "tls-smoke",
+        RamdiskNode::File {
+            content: TLS_SMOKE_ELF,
+        },
+    ),
+    // Phase 77 Track D.1: DNS resolution smoke test
+    (
+        "dns-smoke",
+        RamdiskNode::File {
+            content: DNS_SMOKE_ELF,
         },
     ),
     // Phase 34: timekeeping utilities

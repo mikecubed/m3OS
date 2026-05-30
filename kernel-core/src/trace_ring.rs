@@ -98,6 +98,11 @@ pub enum TraceEvent {
         task_idx: u32,
         core: u8,
         new_state: u8,
+        /// Call site that parked the task (via `#[track_caller]` on
+        /// `block_current_until`). Distinguishes the block kind — poll vs IPC
+        /// recv vs reply vs PTY/socket read — when hunting a lost wake.
+        caller_file: &'static str,
+        caller_line: u32,
     },
     WakeTask {
         task_idx: u32,
@@ -158,6 +163,21 @@ pub enum TraceEvent {
     MessageDelivered {
         task_idx: u32,
         ep: u32,
+    },
+
+    /// A producer-side wake of an fd wait queue (no task subject). Recorded
+    /// unconditionally while the focus ring is armed, to reveal whether the
+    /// wake a poller is waiting for ever fires. `id` is the handle / pty id /
+    /// vector / frame count depending on `kind`. The canonical decode lives in
+    /// `kernel::trace::write_line`; `kind` values:
+    /// - `0`=socket, `1`=unix-socket (reserved/unused), `2`=pty-master,
+    ///   `3`=pty-slave — the general fd-wakeup markers (always compiled).
+    /// - `4`=irq-fired, `5`=wake-net-task, `6`=recv-frames, `7`=tcp-recv,
+    ///   `8`=blk-drain — the Net-RX/blk investigation probes, emitted only
+    ///   under the `net-rx-trace` feature (default off).
+    Wakeup {
+        kind: u8,
+        id: u32,
     },
 }
 
@@ -262,6 +282,22 @@ impl<const N: usize> TraceRing<N> {
         for i in skip..(skip + take) {
             f(&self.buf[(start + i) % N]);
         }
+    }
+
+    /// Iterate at most `max` entries in chronological order, starting at
+    /// chronological index `start` (0 = oldest). Returns the number of entries
+    /// visited. Enables paging through a deep ring without allocation — a
+    /// caller drains it by repeatedly calling with `start += visited`.
+    pub fn for_each_from(&self, start: usize, max: usize, mut f: impl FnMut(&TraceEntry)) -> usize {
+        if self.count == 0 || max == 0 || start >= self.count {
+            return 0;
+        }
+        let ring_start = if self.count < N { 0 } else { self.write_idx };
+        let take = (self.count - start).min(max);
+        for i in start..(start + take) {
+            f(&self.buf[(ring_start + i) % N]);
+        }
+        take
     }
 
     /// Copy entries in chronological order into `dst`, returning the count written.
@@ -424,6 +460,31 @@ mod tests {
         for (i, entry) in snap.iter().enumerate() {
             assert_eq!(collected[i], entry.tick);
         }
+    }
+
+    #[test]
+    fn for_each_from_pages_through_ring() {
+        let mut ring = TraceRing::<8>::new();
+        for i in 0..12 {
+            ring.push(make_entry(i)); // ring now holds ticks 4..=11
+        }
+        // Page through in batches of 3, accumulating.
+        let mut got = Vec::new();
+        let mut start = 0;
+        loop {
+            let mut batch = Vec::new();
+            let n = ring.for_each_from(start, 3, |e| batch.push(e.tick));
+            if n == 0 {
+                break;
+            }
+            assert_eq!(n, batch.len());
+            got.extend(batch);
+            start += n;
+        }
+        assert_eq!(got, vec![4, 5, 6, 7, 8, 9, 10, 11]);
+        // start past the end yields nothing.
+        assert_eq!(ring.for_each_from(8, 4, |_| {}), 0);
+        assert_eq!(ring.for_each_from(100, 4, |_| {}), 0);
     }
 
     #[test]

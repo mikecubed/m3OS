@@ -124,7 +124,7 @@ The extracted services must be declared, supervised, and observable through the 
 
 ## Deferred Until Later
 
-- Storage, namespace, and networking extraction
+- Storage, namespace, and networking extraction — **✅ delivered in [Phase 54 — Deep Serverization](./54-deep-serverization.md)** (`userspace/vfs_server`, `fat_server`, `net_server`).
 - Rich multi-seat or multi-session input policy
-- Fully graphical display ownership
+- Fully graphical display ownership — **✅ delivered in [Phase 56 — Display and Input Architecture](./56-display-and-input-architecture.md)** (`userspace/display_server` owns the framebuffer).
 - Broad performance tuning of the new boundary

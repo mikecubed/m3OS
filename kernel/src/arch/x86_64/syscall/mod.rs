@@ -1633,6 +1633,10 @@ pub extern "C" fn syscall_handler(
 ) -> u64 {
     use syscall_nr::*;
 
+    // SMAP invariant: SYSCALL entry clears EFLAGS.AC via SFMASK, so SMAP must be
+    // enforcing here. Debug-only; validates the SFMASK setup did not regress.
+    crate::arch::x86_64::cpuid::debug_assert_smap_enforcing();
+
     // Phase 52d B.1: snapshot user return state once at syscall entry,
     // before any blocking or yield path can run.  This makes the task's
     // `UserReturnState` the authoritative source of truth for the
@@ -1961,7 +1965,7 @@ pub extern "C" fn syscall_handler(
         DEBUG_PRINT => sys_debug_print(arg0, arg1),
         MEMINFO => sys_meminfo(arg0, arg1),
         #[cfg(feature = "trace")]
-        KTRACE => sys_ktrace(arg0, arg1, arg2),
+        KTRACE => sys_ktrace(arg0, arg1, arg2, per_core_syscall_arg3()),
         FRAMEBUFFER_INFO => sys_framebuffer_info(arg0, arg1),
         FRAMEBUFFER_MMAP => sys_framebuffer_mmap(),
         FRAMEBUFFER_RELEASE => sys_framebuffer_release(),
@@ -2222,6 +2226,13 @@ fn check_pending_signals(syscall_result: u64) {
         return; // kernel task, no signals
     }
 
+    // Deliver any deferred controlling-terminal hangups (SIGHUP+SIGCONT to the
+    // foreground pgroup of a closed PTY master) from this lock-free syscall-
+    // return boundary — see process::queue_pgroup_hangup (PR #201 audit M4).
+    // Cheap no-op when nothing is queued. Runs before the per-pid dequeue below
+    // so a hangup targeting the current process is processed in the same pass.
+    crate::process::drain_pending_hangups();
+
     loop {
         let sig = crate::process::dequeue_signal(pid);
         match sig {
@@ -2461,38 +2472,61 @@ pub(super) fn sys_getppid() -> u64 {
 /// Writes 0 to the userspace `clear_child_tid` address and wakes one futex
 /// waiter, allowing `pthread_join` to unblock.
 fn do_clear_child_tid(pid: crate::process::Pid) {
-    let clear_tid_addr = {
+    let (clear_tid_addr, futex_root) = {
         let table = crate::process::PROCESS_TABLE.lock();
-        table.find(pid).map(|p| p.clear_child_tid).unwrap_or(0)
+        match table.find(pid) {
+            Some(p) => (
+                p.clear_child_tid,
+                p.addr_space
+                    .as_ref()
+                    .map(|a| a.pml4_phys().as_u64())
+                    .unwrap_or(0),
+            ),
+            None => (0, 0),
+        }
     };
     if clear_tid_addr != 0 {
         // Write 0u32 to the userspace address.
         let zero = 0u32.to_ne_bytes();
         let _ =
             UserSliceWo::new(clear_tid_addr, zero.len()).and_then(|s| s.copy_from_kernel(&zero));
-        // Wake one waiter on the private futex key (0, addr) — this
-        // matches musl's pthread_join which uses FUTEX_WAIT|FUTEX_PRIVATE.
+        // Wake one waiter on this address.
+        //
+        // Phase 77 Track A fix: wake BOTH the private key (0, addr) AND the
+        // non-private key (cr3, addr). musl sets `CLONE_CHILD_CLEARTID` to
+        // `&__thread_list_lock` so the kernel releases the thread-list lock on
+        // thread exit — and `__tl_lock` waits on that word with a NON-PRIVATE
+        // futex (`__wait(..., priv=0)`), registering under (cr3, addr). The old
+        // code woke only the private key (0, addr), so the wake was lost and a
+        // thread blocked in `__tl_lock` while a sibling exited never ran again —
+        // its `pthread_join`er hung forever (the intermittent multithread-join
+        // freeze, and the SSH-teardown freeze: sshd's reaper joins its threads).
+        // Waking an extra (always-empty in practice) private waiter is harmless
+        // for a lock-release wake — a spuriously woken lock waiter re-contends.
         use crate::process::futex::{FUTEX_BITSET_MATCH_ANY, FUTEX_TABLE};
-        let key = (0u64, clear_tid_addr);
+        let keys: [(u64, u64); 2] = [(0u64, clear_tid_addr), (futex_root, clear_tid_addr)];
+        // Dedup when futex_root == 0 so we don't double-scan the same key.
+        let n_keys = if futex_root == 0 { 1 } else { 2 };
         let to_wake = {
             let mut table = FUTEX_TABLE.lock();
             let mut wake_ids = alloc::vec::Vec::new();
-            if let Some(waiters) = table.get_mut(&key) {
-                if !waiters.is_empty() {
-                    // Wake up to 1 waiter with matching bitset.
+            for key in keys.iter().take(n_keys) {
+                let mut woke_this_key = false;
+                if let Some(waiters) = table.get_mut(key) {
                     let mut i = 0;
-                    while i < waiters.len() && wake_ids.is_empty() {
+                    while i < waiters.len() && !woke_this_key {
                         if (waiters[i].bitset & FUTEX_BITSET_MATCH_ANY) != 0 {
                             let w = waiters.remove(i);
                             w.woken.store(true, core::sync::atomic::Ordering::Release);
                             wake_ids.push(w.tid);
+                            woke_this_key = true;
                         } else {
                             i += 1;
                         }
                     }
-                }
-                if waiters.is_empty() {
-                    table.remove(&key);
+                    if waiters.is_empty() {
+                        table.remove(key);
+                    }
                 }
             }
             wake_ids
@@ -3802,47 +3836,37 @@ pub(super) fn sys_nanosleep(req_ptr: u64) -> u64 {
         return 0;
     }
 
-    // v1 path (all durations) and sched-v2 path for < 1 ms:
+    // Everything that reaches here is a sub-millisecond sleep (1..=999 us):
+    // all sleeps >= 1 ms returned above via `block_current_until` on an
+    // absolute tick deadline (Phase 77 A.2 removed the dead v1 "long sleep"
+    // yield-loop that this `else` branch used to hold — it was unreachable
+    // because the `sleep_us >= 1_000` arm returns first).
+    debug_assert!(sleep_us < 1_000);
     if tsc_per_ms == 0 {
-        // TSC not yet calibrated — fall back to tick_count (coarse, 1ms res).
-        let ticks = (secs as u64).saturating_mul(TICKS_PER_SEC)
-            + (nsecs as u64) / (1_000_000_000 / TICKS_PER_SEC);
-        let start = crate::arch::x86_64::interrupts::tick_count();
-        while crate::arch::x86_64::interrupts::tick_count().wrapping_sub(start) < ticks {
-            crate::task::yield_now();
-            if has_pending_signal() {
-                return NEG_EINTR;
-            }
-        }
-    } else if sleep_us < 1_000 {
-        // Short sleep (< 1 ms): TSC busy-spin without yielding.
-        //
-        // APs have a 10 ms timer granularity, so a single yield_now() would
-        // sleep ~10 ms — far too coarse for sub-millisecond sleeps.  A brief
-        // busy-spin is acceptable here: the sleep completes in < 1 ms and the
-        // cost of a context switch would exceed the sleep duration.
-        let sleep_tsc = sleep_us.saturating_mul(tsc_per_ms) / 1_000;
-        let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
-        while unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start_tsc) < sleep_tsc {
-            core::hint::spin_loop();
-        }
-    } else {
-        // Long sleep (≥ 1 ms, v1 path only): yield-based sleep.
-        // TSC is invariant across cores, so this is accurate regardless of
-        // which AP DOOM runs on — each yield costs ~10 ms at the AP timer
-        // granularity, which is acceptable for multi-millisecond sleeps.
+        // Boot-window-only fallback: the TSC is not yet calibrated.  This path
+        // cannot be reached after APIC/TSC calibration completes during early
+        // boot, and a sub-millisecond duration cannot be timed accurately
+        // without the TSC, so we yield once and return rather than busy-spin on
+        // an uncalibrated clock.  (Sleeps >= 1 ms never reach here — they block
+        // on an absolute tick deadline above, which is valid even before TSC
+        // calibration, so PID 1 is never starved by the boot-window case.)
         crate::task::yield_now();
         if has_pending_signal() {
             return NEG_EINTR;
         }
-        let sleep_tsc = sleep_us.saturating_mul(tsc_per_ms) / 1_000;
-        let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
-        while unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start_tsc) < sleep_tsc {
-            crate::task::yield_now();
-            if has_pending_signal() {
-                return NEG_EINTR;
-            }
-        }
+        return 0;
+    }
+
+    // Short sleep (< 1 ms): TSC busy-spin without yielding.
+    //
+    // APs have a 10 ms timer granularity, so a single yield_now() would
+    // sleep ~10 ms — far too coarse for sub-millisecond sleeps.  A brief
+    // busy-spin is acceptable here: the sleep completes in < 1 ms and the
+    // cost of a context switch would exceed the sleep duration.
+    let sleep_tsc = sleep_us.saturating_mul(tsc_per_ms) / 1_000;
+    let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    while unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start_tsc) < sleep_tsc {
+        core::hint::spin_loop();
     }
     0
 }
@@ -5435,7 +5459,7 @@ pub fn init() {
         fn syscall_entry();
     }
     LStar::write(VirtAddr::new(syscall_entry as *const () as u64));
-    SFMask::write(RFlags::INTERRUPT_FLAG | RFlags::TRAP_FLAG);
+    SFMask::write(RFlags::INTERRUPT_FLAG | RFlags::TRAP_FLAG | RFlags::ALIGNMENT_CHECK);
     unsafe {
         Efer::update(|flags| *flags |= EferFlags::SYSTEM_CALL_EXTENSIONS);
     }
@@ -5460,7 +5484,7 @@ pub fn init_ap() {
         fn syscall_entry();
     }
     LStar::write(VirtAddr::new(syscall_entry as *const () as u64));
-    SFMask::write(RFlags::INTERRUPT_FLAG | RFlags::TRAP_FLAG);
+    SFMask::write(RFlags::INTERRUPT_FLAG | RFlags::TRAP_FLAG | RFlags::ALIGNMENT_CHECK);
     unsafe {
         Efer::update(|flags| *flags |= EferFlags::SYSTEM_CALL_EXTENSIONS);
     }
@@ -5723,6 +5747,10 @@ fn block_on_pty_slave_read(pty_id: u32) -> Result<(), u64> {
 // T013: read(fd, buf, count)
 // ---------------------------------------------------------------------------
 
+/// Maximum bytes copied from the dmesg ring per `/proc/kmsg` read. Caps the
+/// transient kernel staging buffer; callers loop to drain more.
+const KMSG_READ_CHUNK: usize = 4096;
+
 pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     let fd = fd as usize;
     if fd >= MAX_FDS {
@@ -5869,18 +5897,47 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             });
             to_read as u64
         }
-        FdBackend::Proc { path, snapshot } => {
-            let generated;
-            let data: &[u8] = match snapshot.as_deref() {
-                Some(data) => data,
-                None => {
-                    generated = match crate::fs::procfs::read_file(path) {
-                        Some(data) => data,
-                        None => return NEG_ENOENT,
-                    };
-                    &generated
+        FdBackend::Proc { path } => {
+            // `/proc/kmsg` is a live, consuming kernel-log stream. `entry.offset`
+            // holds an absolute byte-sequence cursor into the dmesg ring (NOT a
+            // file offset); each read copies the bytes logged since the cursor
+            // and advances it. When the reader is caught up, read returns 0
+            // (no data right now) and `fd_poll_events` reports it not-readable,
+            // so a poll() loop blocks for its timeout instead of spinning.
+            // This replaces the old frozen-snapshot model, which both busy-spun
+            // poll() loops (always-readable at EOF) and never delivered kernel
+            // messages emitted after open().
+            if path == "/proc/kmsg" {
+                let cap = (count as usize).min(KMSG_READ_CHUNK);
+                if cap == 0 {
+                    return 0;
                 }
+                let cursor = entry.offset as u64;
+                let mut tmp = alloc::vec![0u8; cap];
+                let (n, new_cursor) = crate::serial::dmesg_read_from(cursor, &mut tmp);
+                if n == 0 {
+                    return 0;
+                }
+                if UserSliceWo::new(buf_ptr, n)
+                    .and_then(|s| s.copy_from_kernel(&tmp[..n]))
+                    .is_err()
+                {
+                    return NEG_EFAULT;
+                }
+                with_current_fd_mut(fd, |slot| {
+                    if let Some(e) = slot {
+                        e.offset = new_cursor as usize;
+                    }
+                });
+                return n as u64;
+            }
+
+            // All other procfs files regenerate their full content on each read.
+            let generated = match crate::fs::procfs::read_file(path) {
+                Some(data) => data,
+                None => return NEG_ENOENT,
             };
+            let data: &[u8] = &generated;
             let offset = entry.offset.min(data.len());
             let to_read = (count as usize).min(data.len().saturating_sub(offset));
             if to_read == 0 {
@@ -7858,12 +7915,21 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
         ) {
             return NEG_ENOENT;
         }
+        // `/proc/kmsg` is a live consuming stream: seed its cursor at the
+        // oldest byte currently resident in the dmesg ring so a fresh open
+        // replays the existing buffer once (matching the prior snapshot's
+        // first-read behaviour), then streams messages logged afterwards.
+        // Other procfs files use `offset` as an ordinary byte offset (start 0).
+        let initial_offset = if name == "/proc/kmsg" {
+            crate::serial::dmesg_oldest_seq() as usize
+        } else {
+            0
+        };
         let entry = FdEntry {
             backend: FdBackend::Proc {
                 path: alloc::string::String::from(name),
-                snapshot: (name == "/proc/kmsg").then(crate::fs::procfs::render_kmsg_bytes),
             },
-            offset: 0,
+            offset: initial_offset,
             readable: true,
             writable: false,
             cloexec,
@@ -8670,7 +8736,7 @@ pub(super) fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
         FdBackend::DevNull | FdBackend::DevZero | FdBackend::DevUrandom | FdBackend::DevFull => {
             (0x2000 | 0o666, 0, 0, 0, 0)
         }
-        FdBackend::Proc { path, .. } => {
+        FdBackend::Proc { path } => {
             let Some(st) = crate::fs::procfs::stat(path) else {
                 return NEG_ENOENT;
             };
@@ -14802,6 +14868,30 @@ pub(super) fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
                 );
             }
 
+            // Phase 77 Track A — dequeue our waiter on return.
+            //
+            // A matching FUTEX_WAKE / `do_clear_child_tid` removes our waiter
+            // before waking us, but ANY OTHER wake source (a stray
+            // `wake_task_v2`, a signal-driven unblock, a sibling clearing a
+            // *shared* `clear_child_tid` address — musl gives every joinable
+            // thread the same join word in some layouts) returns us here with
+            // our entry STILL queued. `FUTEX_WAKE`/`do_clear_child_tid` only
+            // wake `val` (typically 1) waiters, so a lingering stale entry ahead
+            // of a future real waiter absorbs that single wake and starves the
+            // real `pthread_join` — the intermittent multithread-join / SSH
+            // teardown freeze. Linux dequeues the futex waiter on every return
+            // path; mirror that. Idempotent: removes 0 entries on the common
+            // wake-removed-us path.
+            {
+                let mut table = FUTEX_TABLE.lock();
+                if let Some(waiters) = table.get_mut(&key) {
+                    waiters.retain(|w| w.tid != tid);
+                    if waiters.is_empty() {
+                        table.remove(&key);
+                    }
+                }
+            }
+
             0
         }
 
@@ -16122,8 +16212,40 @@ pub(super) fn sys_sendto(
             match proto {
                 crate::net::SocketProtocol::Tcp => {
                     if let Some(tcp_idx) = tcp_slot {
-                        crate::net::tcp::send(tcp_idx, &tmp[..capped]);
-                        capped as u64
+                        // Flow-control-aware send. `tcp::send` accepts as many
+                        // bytes as the connection's send window allows (always
+                        // >= one segment when nothing is outstanding); a 0
+                        // return means the window is currently full. Mirror the
+                        // recv path: block (yield) until space frees, unless the
+                        // socket is non-blocking, a signal is pending, or the
+                        // connection drops. A dead peer cannot wedge us — its
+                        // unacked data hits MAX_RETRANSMITS and the connection
+                        // resets to Closed, surfaced here as EPIPE.
+                        const NEG_EPIPE: u64 = (-32_i64) as u64;
+                        let nonblock = entry.nonblock;
+                        loop {
+                            match crate::net::tcp::state(tcp_idx) {
+                                crate::net::tcp::TcpState::Established => {
+                                    let n = crate::net::tcp::send(tcp_idx, &tmp[..capped]);
+                                    if n > 0 {
+                                        break n as u64;
+                                    }
+                                    // Send window full — wait for an ACK.
+                                }
+                                // Still completing the handshake — wait for it.
+                                crate::net::tcp::TcpState::SynSent
+                                | crate::net::tcp::TcpState::SynReceived => {}
+                                // Any half-closed / closed state: broken pipe.
+                                _ => break NEG_EPIPE,
+                            }
+                            if nonblock {
+                                break NEG_EAGAIN;
+                            }
+                            if has_pending_signal() {
+                                break NEG_EINTR;
+                            }
+                            crate::task::yield_now();
+                        }
                     } else {
                         NEG_ENOTCONN
                     }
@@ -16152,9 +16274,77 @@ pub(super) fn sys_sendto(
                             return err;
                         }
                         sp
-                    } else {
+                    } else if local_port != 0 {
                         local_port
+                    } else {
+                        // Phase 77 Track D.1 — kernel-direct unbound-UDP send:
+                        // assign an ephemeral source port (Linux behaviour) so
+                        // the reply can be routed back. Range 0xC000..=0xFFFF
+                        // (16384 ports) matches the connect/net_udp ephemeral
+                        // range.
+                        //
+                        // Probe a persistent ROTATING counter rather than a
+                        // tick-derived window: the old 8-candidate loop derived
+                        // every candidate from the same near-constant
+                        // `tick_count`, so a cluster of ~8 contiguous bound ports
+                        // falsely returned EAGAIN with thousands of ports free.
+                        // The rotating counter spreads candidates across the
+                        // whole range; only a port that actually binds is used,
+                        // and exhausting the probe budget returns EAGAIN rather
+                        // than falsely marking the socket bound. The `if` block
+                        // below re-binds this same port (a no-op here, since it
+                        // is already bound) so the shared service path is also
+                        // registered.
+                        static EPHEMERAL_UDP_NEXT: core::sync::atomic::AtomicU16 =
+                            core::sync::atomic::AtomicU16::new(0);
+                        let mut found_port = 0u16;
+                        for _ in 0..1024u16 {
+                            let n = EPHEMERAL_UDP_NEXT
+                                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                            // 0xC000 | (n & 0x3FFF) -> 0xC000..=0xFFFF, never 0.
+                            let cand = 0xC000u16 | (n & 0x3FFF);
+                            if crate::net::udp::bind(cand) {
+                                found_port = cand;
+                                break;
+                            }
+                        }
+                        if found_port == 0 {
+                            return NEG_EAGAIN;
+                        }
+                        found_port
                     };
+                    // Phase 77 Track D.1 — register a freshly-assigned ephemeral
+                    // source port so inbound datagrams (e.g. the DNS reply) are
+                    // enqueued for it and `recvfrom` can dequeue them. musl's
+                    // resolver `sendto`s from an unbound socket; without this the
+                    // reply's dst_port matches no binding and is dropped.
+                    //
+                    // Bind `src_port` in the kernel `UDP_BINDINGS` table here —
+                    // inbound delivery is kernel-owned even with the userspace
+                    // net_udp service present (`recvfrom` dequeues via
+                    // `crate::net::udp::recv`, and `handle_udp` drops datagrams
+                    // for any unbound port). On the kernel-direct path the retry
+                    // loop above already bound this exact port, so `bind` returns
+                    // false (a harmless no-op); on the net_udp-service path the
+                    // service-allocated port is not otherwise registered in the
+                    // kernel table, so this is the binding that lets the reply
+                    // arrive (mirrors the kernel-side bind in sys_bind/sys_connect).
+                    if local_port == 0 && src_port != 0 {
+                        let _ = crate::net::udp::bind(src_port);
+                        let associated = crate::net::with_socket_mut(handle, |s| {
+                            s.local_port = src_port;
+                            s.udp_bound = true;
+                        });
+                        if associated.is_none() {
+                            // The socket was closed concurrently (another thread
+                            // sharing the fd table) between the snapshot above and
+                            // here, so no `SocketEntry` will carry this port and
+                            // the close path can never reclaim it. Release the
+                            // just-bound port now to avoid stranding one of the
+                            // 32 UDP binding slots until reboot.
+                            crate::net::udp::unbind(src_port);
+                        }
+                    }
                     // Phase 55c Track G R1: surface EAGAIN when the ring-3 NIC
                     // driver is in a restart window.  Socket fd is already
                     // validated by the FdBackend::Socket check above.
@@ -17198,6 +17388,269 @@ pub(super) fn sys_sendmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
     written as u64
 }
 
+/// `recvmsg()` for AF_INET sockets (UDP / TCP).
+///
+/// musl's stub resolver (`__res_msend`) drains DNS replies with `recvmsg`,
+/// **not** `recvfrom`, and then byte-compares the reply's source address —
+/// which it reads from `msg_name` — against its configured nameserver list
+/// (`memcmp(ns+j, &sa, sl)`). A reply whose source sockaddr is missing or
+/// wrong is silently discarded, so the kernel MUST both deliver the payload
+/// and fill `msg_name` with the sender's `sockaddr_in`. Before this path
+/// existed, `recvmsg` on an INET socket returned `EOPNOTSUPP`, so the
+/// resolver busy-looped `poll → recvmsg(fail) → poll` until its timeout and
+/// `getaddrinfo` returned `EAI_AGAIN` even though the reply sat ready in the
+/// kernel's UDP queue. Mirrors `sys_recvfrom_socket`'s recv logic.
+fn sys_recvmsg_inet(
+    handle: crate::net::SocketHandle,
+    mut header: kernel_core::net::msghdr::MsgHdr,
+    msghdr_ptr: u64,
+    nonblock: bool,
+) -> u64 {
+    use kernel_core::net::msghdr::{IOVEC_SIZE, IoVec, MSG_TRUNC, MSGHDR_SIZE};
+
+    // Decode the scatter list.
+    let iov_count = header.msg_iovlen as usize;
+    if iov_count > 1024 {
+        return NEG_EINVAL;
+    }
+    let mut iov_buf = alloc::vec![0u8; iov_count.checked_mul(IOVEC_SIZE).unwrap_or(0)];
+    if iov_count > 0
+        && UserSliceRo::new(header.msg_iov, iov_buf.len())
+            .and_then(|s| s.copy_to_kernel(&mut iov_buf))
+            .is_err()
+    {
+        return NEG_EFAULT;
+    }
+    let iovs = match IoVec::decode_array(&iov_buf, iov_count) {
+        Some(v) => v,
+        None => return NEG_EINVAL,
+    };
+    let cap = IoVec::total_len(&iovs).min(SENDMSG_MAX_BYTES as u64) as usize;
+
+    // Validate the writable destination prefix BEFORE consuming a datagram,
+    // so an EFAULT cannot drop an already-dequeued reply (same discipline as
+    // the Unix recvmsg path).
+    let mut remaining_validate = cap as u64;
+    for iov in &iovs {
+        if remaining_validate == 0 {
+            break;
+        }
+        let chunk = iov.iov_len.min(remaining_validate);
+        if chunk == 0 {
+            continue;
+        }
+        if UserSliceWo::new(iov.iov_base, chunk as usize).is_err() {
+            return NEG_EFAULT;
+        }
+        remaining_validate -= chunk;
+    }
+    if UserSliceWo::new(msghdr_ptr, MSGHDR_SIZE).is_err() {
+        return NEG_EFAULT;
+    }
+    // Pre-validate the `msg_name` buffer up front too. The source-address
+    // write happens in `finish` AFTER a datagram is dequeued, so without this
+    // a faulting `msg_name` pointer would consume-and-drop the reply — the
+    // same loss the iov/msghdr pre-validation above guards against.
+    if header.msg_name != 0 {
+        let name_len = (header.msg_namelen as usize).min(16);
+        if name_len > 0 && UserSliceWo::new(header.msg_name, name_len).is_err() {
+            return NEG_EFAULT;
+        }
+    }
+
+    let info = match crate::net::with_socket(handle, |s| {
+        (
+            s.protocol,
+            s.tcp_slot,
+            s.local_port,
+            s.remote_addr,
+            s.remote_port,
+            s.shut_rd,
+        )
+    }) {
+        Some(v) => v,
+        None => return NEG_EBADF,
+    };
+    // remote_addr/remote_port are intentionally unused: datagram sockets fill
+    // msg_name from the per-datagram source, and connection-mode (TCP) reports
+    // msg_namelen = 0 like Linux.
+    let (proto, tcp_slot, local_port, _remote_addr, _remote_port, shut_rd) = info;
+
+    // Helper: write the sender's `sockaddr_in` into `msg_name` for datagram
+    // sockets (`src = Some(..)`) and commit the updated msghdr
+    // (namelen/controllen/flags). Connection-mode (TCP) and EOF pass
+    // `src = None`, which reports `msg_namelen = 0` like Linux. `msg_name` is
+    // pre-validated above, so the copy here only faults under a concurrent
+    // unmap (same window the iov writes accept). Returns `Err(errno)` on a
+    // faulting copy. On return `msg_namelen` carries the real address size
+    // (16) even if the caller's buffer was smaller — the recvmsg(2) contract,
+    // matching `sys_recvfrom_socket`.
+    let finish = |header: &mut kernel_core::net::msghdr::MsgHdr,
+                  src: Option<([u8; 4], u16)>,
+                  truncated: bool|
+     -> Result<(), u64> {
+        match src {
+            // Datagram source address. recvmsg(2) is value-result: copy at most
+            // the caller's buffer size, but always report the *real* address
+            // length (16) on return — even when the buffer is too small or
+            // empty (`msg_namelen == 0`) — so a caller probing the length or
+            // truncating sees the true size. A zero-length buffer therefore
+            // copies nothing yet still reports 16.
+            Some((src_ip, src_port)) if header.msg_name != 0 => {
+                let name_len = (header.msg_namelen as usize).min(16);
+                if name_len > 0 {
+                    let mut sa = [0u8; 16];
+                    sa[0..2].copy_from_slice(&2u16.to_ne_bytes()); // AF_INET
+                    sa[2..4].copy_from_slice(&src_port.to_be_bytes());
+                    sa[4..8].copy_from_slice(&src_ip);
+                    if UserSliceWo::new(header.msg_name, name_len)
+                        .and_then(|s| s.copy_from_kernel(&sa[..name_len]))
+                        .is_err()
+                    {
+                        return Err(NEG_EFAULT);
+                    }
+                }
+                header.msg_namelen = 16;
+            }
+            _ => header.msg_namelen = 0,
+        }
+        header.msg_controllen = 0;
+        header.msg_flags = if truncated { MSG_TRUNC } else { 0 };
+        let encoded = header.encode();
+        if UserSliceWo::new(msghdr_ptr, encoded.len())
+            .and_then(|s| s.copy_from_kernel(&encoded))
+            .is_err()
+        {
+            return Err(NEG_EFAULT);
+        }
+        Ok(())
+    };
+
+    if shut_rd {
+        // EOF: deliver a zero-length message with a clean header.
+        return match finish(&mut header, None, false) {
+            Ok(()) => 0,
+            Err(e) => e,
+        };
+    }
+
+    match proto {
+        crate::net::SocketProtocol::Udp => {
+            // Resolve the recv port through the same policy authority as
+            // recvfrom so the port the service tracked matches the binding
+            // the reply was enqueued on.
+            let recv_port = if net_udp_service_available() {
+                let (err, port) = net_udp_service_recvfrom_port(handle);
+                if err != 0 {
+                    return err;
+                }
+                port
+            } else {
+                local_port
+            };
+            loop {
+                if let Some(dgram) = crate::net::udp::recv(recv_port) {
+                    let n = dgram.data.len().min(cap);
+                    let mut cursor = 0usize;
+                    for iov in &iovs {
+                        if cursor >= n {
+                            break;
+                        }
+                        let chunk = ((n - cursor) as u64).min(iov.iov_len) as usize;
+                        if chunk == 0 {
+                            continue;
+                        }
+                        if UserSliceWo::new(iov.iov_base, chunk)
+                            .and_then(|s| s.copy_from_kernel(&dgram.data[cursor..cursor + chunk]))
+                            .is_err()
+                        {
+                            return NEG_EFAULT;
+                        }
+                        cursor += chunk;
+                    }
+                    let truncated = dgram.data.len() > n;
+                    if let Err(e) =
+                        finish(&mut header, Some((dgram.src_ip, dgram.src_port)), truncated)
+                    {
+                        return e;
+                    }
+                    return n as u64;
+                }
+                if nonblock {
+                    return NEG_EAGAIN;
+                }
+                if has_pending_signal() {
+                    return NEG_EINTR;
+                }
+                crate::task::yield_now();
+            }
+        }
+        crate::net::SocketProtocol::Tcp => {
+            let tcp_idx = match tcp_slot {
+                Some(idx) => idx,
+                None => return NEG_ENOTCONN,
+            };
+            // A zero-length read returns 0 immediately (Linux recv semantics);
+            // entering the loop with cap == 0 would otherwise spin a blocking
+            // socket forever, since tcp::recv always yields 0 for an empty buf.
+            if cap == 0 {
+                return match finish(&mut header, None, false) {
+                    Ok(()) => 0,
+                    Err(e) => e,
+                };
+            }
+            let mut tmp = alloc::vec![0u8; cap];
+            loop {
+                let n = crate::net::tcp::recv(tcp_idx, &mut tmp[..cap]);
+                if n > 0 {
+                    let mut cursor = 0usize;
+                    for iov in &iovs {
+                        if cursor >= n {
+                            break;
+                        }
+                        let chunk = ((n - cursor) as u64).min(iov.iov_len) as usize;
+                        if chunk == 0 {
+                            continue;
+                        }
+                        if UserSliceWo::new(iov.iov_base, chunk)
+                            .and_then(|s| s.copy_from_kernel(&tmp[cursor..cursor + chunk]))
+                            .is_err()
+                        {
+                            return NEG_EFAULT;
+                        }
+                        cursor += chunk;
+                    }
+                    // Connection-mode socket: Linux reports msg_namelen = 0.
+                    if let Err(e) = finish(&mut header, None, false) {
+                        return e;
+                    }
+                    return n as u64;
+                }
+                let state = crate::net::tcp::state(tcp_idx);
+                if matches!(
+                    state,
+                    crate::net::tcp::TcpState::CloseWait
+                        | crate::net::tcp::TcpState::Closed
+                        | crate::net::tcp::TcpState::TimeWait
+                ) {
+                    return match finish(&mut header, None, false) {
+                        Ok(()) => 0,
+                        Err(e) => e,
+                    };
+                }
+                if nonblock {
+                    return NEG_EAGAIN;
+                }
+                if has_pending_signal() {
+                    return NEG_EINTR;
+                }
+                crate::task::yield_now();
+            }
+        }
+        crate::net::SocketProtocol::Icmp => NEG_EOPNOTSUPP,
+    }
+}
+
 pub(super) fn sys_recvmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
     use kernel_core::net::msghdr::{
         IOVEC_SIZE, IoVec, MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_DONTWAIT, MSGHDR_SIZE, MsgHdr,
@@ -17242,6 +17695,12 @@ pub(super) fn sys_recvmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
         return NEG_EBADF;
     }
     let nonblock = entry.nonblock || force_nonblock;
+    // AF_INET sockets (UDP/TCP) take a dedicated path: the DNS resolver drains
+    // UDP replies with recvmsg and validates the source address from msg_name.
+    // The Unix-socket SCM_RIGHTS machinery below does not apply.
+    if let FdBackend::Socket { handle } = &entry.backend {
+        return sys_recvmsg_inet(*handle, header, msghdr_ptr, nonblock);
+    }
     let unix_handle = match &entry.backend {
         FdBackend::UnixSocket { handle } => *handle,
         _ => return NEG_EOPNOTSUPP,
@@ -17723,10 +18182,26 @@ fn fd_poll_events(entry: &FdEntry) -> i16 {
         }
         FdBackend::Stdout => POLLOUT,
         FdBackend::DevNull => POLLIN | POLLOUT,
+        FdBackend::Proc { path } => {
+            // `/proc/kmsg` is a live stream: readable only while this fd's
+            // cursor is behind the dmesg write position. Reporting always-ready
+            // here (as the old snapshot model did) made poll() loops spin at
+            // 100% CPU once the stream was drained. Proc fds are read-only, so
+            // no POLLOUT. Other procfs files regenerate on read and stay
+            // effectively always-ready.
+            if path == "/proc/kmsg" {
+                if (entry.offset as u64) < crate::serial::dmesg_total_written() {
+                    POLLIN
+                } else {
+                    0
+                }
+            } else {
+                POLLIN | POLLOUT
+            }
+        }
         FdBackend::DevZero
         | FdBackend::DevUrandom
         | FdBackend::DevFull
-        | FdBackend::Proc { .. }
         | FdBackend::Ramdisk { .. }
         | FdBackend::Tmpfs { .. }
         | FdBackend::Fat32Disk { .. }
@@ -18741,68 +19216,275 @@ pub(super) fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout
 // sys_ktrace — Phase 43b Track G
 // ---------------------------------------------------------------------------
 
+// ktrace command codes (passed in arg0). Keep in sync with `syscall_lib`.
+const KTRACE_READ_CORE: u64 = 0;
+const KTRACE_ARM: u64 = 1;
+const KTRACE_DISARM: u64 = 2;
+const KTRACE_READ_FOCUS: u64 = 3;
+const KTRACE_FOCUS_LEN: u64 = 4;
+const KTRACE_TASKS: u64 = 5;
+const KTRACE_DUMP_SERIAL: u64 = 6;
+const KTRACE_DUMP_CORES: u64 = 7;
+const KTRACE_DUMP_TASKS_SERIAL: u64 = 8;
+
+/// Largest kernel staging buffer for a single text dump call (focus / tasks).
 #[cfg(feature = "trace")]
-/// Read trace ring entries from a specific core into a userspace buffer.
+const KTRACE_TEXT_CAP: usize = 16 * 1024;
+/// Focus entries formatted per `READ_FOCUS` call (callers page with `offset`).
+#[cfg(feature = "trace")]
+const KTRACE_FOCUS_BATCH: usize = 256;
+
+#[cfg(feature = "trace")]
+/// Kernel trace control + readout. Command (`cmd`, arg0) selects the operation:
 ///
-/// Arguments:
-///   - `core_id`: which core's trace ring to read
-///   - `buf_ptr`: userspace buffer address
-///   - `buf_len`: size of the userspace buffer in bytes
+/// - `0 READ_CORE`: a=core_id, b=buf_ptr, c=buf_len — copy raw `TraceEntry`
+///   records from a per-core ring (legacy/compat path).
+/// - `1 ARM`: a=pids_ptr (u32 array), b=count — arm the deep focus ring on
+///   those pids. Returns resolved target idx count.
+/// - `2 DISARM`: disarm the focus ring.
+/// - `3 READ_FOCUS`: a=offset, b=buf_ptr, c=buf_len — write annotated text
+///   lines for focus entries `[offset..]`. Returns entries written.
+/// - `4 FOCUS_LEN`: return the focus ring's current entry count.
+/// - `5 TASKS`: b=buf_ptr, c=buf_len — write the live task table as text
+///   (idx pid state prio core name). Returns rows.
+/// - `6 DUMP_SERIAL`: dump the whole focus ring to the serial console (the
+///   always-available path for reading the trace while userspace I/O is wedged
+///   by the hang under study). Returns entries dumped.
+/// - `7 DUMP_CORES`: dump per-core dispatch state (current task + run queue per
+///   core, and every Ready/Running task) to serial. Names the ring-0 hog.
 ///
-/// Returns the number of entries written, or `u64::MAX` on error.
-pub(super) fn sys_ktrace(core_id: u64, buf_ptr: u64, buf_len: u64) -> u64 {
-    let core_id = core_id as u8;
-    if core_id >= crate::smp::core_count() {
-        return u64::MAX;
+/// Returns `u64::MAX` on error.
+pub(super) fn sys_ktrace(cmd: u64, a: u64, b: u64, c: u64) -> u64 {
+    // ktrace exposes kernel-internal diagnostics — the full task table
+    // (KTRACE_TASKS), per-core dispatch state, and the focus-ring contents — and
+    // expensive serial-flood / heap-churn dumps (DUMP_SERIAL/DUMP_CORES/
+    // DUMP_TASKS_SERIAL). None of it is appropriate for an unprivileged caller,
+    // so gate the whole surface on root (PR #201 audit): no scheduler-internals
+    // disclosure and no UART/heap self-DoS from ring 3.
+    {
+        let pid = crate::process::current_pid();
+        let uid = {
+            let table = crate::process::PROCESS_TABLE.lock();
+            table.find(pid).map(|p| p.uid).unwrap_or(u32::MAX)
+        };
+        if uid != 0 {
+            return NEG_EPERM;
+        }
     }
-    if buf_ptr == 0 {
+    match cmd {
+        KTRACE_READ_CORE => sys_ktrace_read_core(a, b, c),
+        KTRACE_ARM => sys_ktrace_arm(a, b),
+        KTRACE_DISARM => {
+            crate::trace::focus::disarm();
+            0
+        }
+        KTRACE_DUMP_SERIAL => sys_ktrace_dump_serial(),
+        KTRACE_DUMP_CORES => {
+            crate::task::scheduler::ktrace_dump_dispatch_state();
+            0
+        }
+        KTRACE_DUMP_TASKS_SERIAL => sys_ktrace_dump_tasks_serial(),
+        KTRACE_FOCUS_LEN => crate::trace::focus::len() as u64,
+        KTRACE_READ_FOCUS => sys_ktrace_read_focus(a, b, c),
+        KTRACE_TASKS => sys_ktrace_tasks(b, c),
+        _ => u64::MAX,
+    }
+}
+
+#[cfg(feature = "trace")]
+fn sys_ktrace_read_core(core_id: u64, buf_ptr: u64, buf_len: u64) -> u64 {
+    let core_id = core_id as u8;
+    if core_id >= crate::smp::core_count() || buf_ptr == 0 {
         return u64::MAX;
     }
     if buf_len == 0 {
         return 0;
     }
-
     let data = match crate::smp::get_core_data(core_id) {
         Some(d) => d,
         None => return u64::MAX,
     };
-
-    // Safety: trace_ring is wrapped in UnsafeCell for interior mutability.
-    // We only read; the owning core may concurrently write (at most one
-    // torn entry, which is acceptable for diagnostic data).
+    // Safety: trace_ring is UnsafeCell; we only read. The owning core may
+    // concurrently write (at most one torn entry — acceptable for diagnostics).
     let ring_ptr = data.trace_ring.get();
-
     let entry_size = core::mem::size_of::<kernel_core::trace_ring::TraceEntry>();
     let max_entries = (buf_len as usize) / entry_size;
-
     if max_entries == 0 {
         return 0;
     }
-
-    // Use a fixed stack buffer to avoid heap allocation. Cap at 64 entries
-    // per call; callers can call again for more.
     const MAX_BATCH: usize = 64;
     let batch = max_entries.min(MAX_BATCH);
     let mut tmp = [kernel_core::trace_ring::TraceEntry::EMPTY; MAX_BATCH];
     let write_count = unsafe { (*ring_ptr).copy_into(&mut tmp[..batch]) };
-
     if write_count == 0 {
         return 0;
     }
-
-    // TraceEntry uses #[repr(C)] with explicit padding fields zeroed on
-    // construction, so raw byte reinterpretation is safe — no uninit bytes.
+    // TraceEntry is #[repr(C)] with zeroed padding, so byte reinterpretation
+    // leaks no uninit bytes.
     let src_bytes =
         unsafe { core::slice::from_raw_parts(tmp.as_ptr() as *const u8, write_count * entry_size) };
-
     if UserSliceWo::new(buf_ptr, src_bytes.len())
         .and_then(|s| s.copy_from_kernel(src_bytes))
         .is_err()
     {
         return u64::MAX;
     }
-
     write_count as u64
+}
+
+#[cfg(feature = "trace")]
+fn sys_ktrace_arm(pids_ptr: u64, count: u64) -> u64 {
+    use crate::trace::focus::MAX_TARGETS;
+    if pids_ptr == 0 {
+        return u64::MAX;
+    }
+    let count = (count as usize).min(MAX_TARGETS);
+    if count == 0 {
+        return u64::MAX;
+    }
+    // Read the requested pids from userspace.
+    let mut pid_bytes = [0u8; MAX_TARGETS * 4];
+    let want = count * 4;
+    if UserSliceRo::new(pids_ptr, want)
+        .and_then(|s| s.copy_to_kernel(&mut pid_bytes[..want]))
+        .is_err()
+    {
+        return u64::MAX;
+    }
+    let mut pids = [0u32; MAX_TARGETS];
+    for i in 0..count {
+        pids[i] = u32::from_ne_bytes(pid_bytes[i * 4..i * 4 + 4].try_into().unwrap());
+    }
+    // Resolve pids -> task indices.
+    let mut target_idxs = [0u32; MAX_TARGETS];
+    let n_targets = crate::task::scheduler::ktrace_resolve_pids(&pids[..count], &mut target_idxs);
+    // Snapshot the idx -> (pid, name) table now (targets alive) for annotation.
+    let mut names: alloc::vec::Vec<(u32, u32, &'static str)> = alloc::vec::Vec::with_capacity(96);
+    crate::task::scheduler::ktrace_for_each_task(|idx, pid, _st, _prio, _core, name| {
+        if names.len() < names.capacity() {
+            names.push((idx, pid, name));
+        }
+    });
+    crate::trace::focus::arm(&target_idxs[..n_targets], names);
+    n_targets as u64
+}
+
+#[cfg(feature = "trace")]
+fn sys_ktrace_read_focus(offset: u64, buf_ptr: u64, buf_len: u64) -> u64 {
+    if buf_ptr == 0 || buf_len == 0 {
+        return u64::MAX;
+    }
+    // Annotation uses the arm-time name snapshot stored in the focus ring.
+    let cap = (buf_len as usize).min(KTRACE_TEXT_CAP);
+    let mut out = alloc::vec![0u8; cap];
+    let entries = crate::trace::focus::dump_text(offset as usize, KTRACE_FOCUS_BATCH, &mut out);
+
+    // Copy the formatted text (through the NUL terminator) to userspace.
+    let text_len = out
+        .iter()
+        .position(|&x| x == 0)
+        .map(|p| p + 1)
+        .unwrap_or(cap);
+    let copy_len = text_len.min(cap);
+    if UserSliceWo::new(buf_ptr, copy_len)
+        .and_then(|s| s.copy_from_kernel(&out[..copy_len]))
+        .is_err()
+    {
+        return u64::MAX;
+    }
+    entries as u64
+}
+
+#[cfg(feature = "trace")]
+fn sys_ktrace_tasks(buf_ptr: u64, buf_len: u64) -> u64 {
+    use core::fmt::Write;
+    if buf_ptr == 0 || buf_len == 0 {
+        return u64::MAX;
+    }
+    // Snapshot rows under the scheduler lock (pre-reserved: no alloc while held).
+    let mut rows: alloc::vec::Vec<(u32, u32, u8, u8, u8, &'static str)> =
+        alloc::vec::Vec::with_capacity(96);
+    crate::task::scheduler::ktrace_for_each_task(|idx, pid, st, prio, core, name| {
+        if rows.len() < rows.capacity() {
+            rows.push((idx, pid, st, prio, core, name));
+        }
+    });
+
+    let mut s = alloc::string::String::with_capacity((buf_len as usize).min(KTRACE_TEXT_CAP));
+    let _ = writeln!(s, "idx pid state prio core name");
+    for (idx, pid, st, prio, core, name) in &rows {
+        let _ = writeln!(
+            s,
+            "{idx} {pid} {} {prio} {core} {name}",
+            ktrace_state_name(*st)
+        );
+    }
+
+    let bytes = s.as_bytes();
+    let cap = (buf_len as usize).saturating_sub(1).min(bytes.len());
+    let mut tmp = alloc::vec![0u8; cap + 1];
+    tmp[..cap].copy_from_slice(&bytes[..cap]);
+    tmp[cap] = 0; // NUL-terminate
+    if UserSliceWo::new(buf_ptr, tmp.len())
+        .and_then(|sl| sl.copy_from_kernel(&tmp))
+        .is_err()
+    {
+        return u64::MAX;
+    }
+    rows.len() as u64
+}
+
+#[cfg(feature = "trace")]
+fn sys_ktrace_dump_serial() -> u64 {
+    // Annotation uses the arm-time name snapshot stored in the focus ring.
+    crate::trace::focus::dump_serial() as u64
+}
+
+/// Dump every live task's state to serial (idx/pid/state/prio/core/name),
+/// INCLUDING Blocked tasks. Lightweight (~one line per task, no preempt-trace
+/// flood) so it does not perturb the hang it samples. Distinguishes a lost
+/// wake (`ion` stuck `Blk*`) from dispatch starvation (`ion` stuck `Ready`).
+#[cfg(feature = "trace")]
+fn sys_ktrace_dump_tasks_serial() -> u64 {
+    // Pre-reserve before the scheduler-locked walk so it never allocates while
+    // the lock is held; format to serial afterwards (lock released).
+    let mut rows: alloc::vec::Vec<(u32, u32, u8, u8, u8, &'static str)> =
+        alloc::vec::Vec::with_capacity(160);
+    crate::task::scheduler::ktrace_for_each_task(|idx, pid, st, prio, core, name| {
+        if rows.len() < rows.capacity() {
+            rows.push((idx, pid, st, prio, core, name));
+        }
+    });
+    crate::serial_println!("=== KTRACE TASK STATES ({} tasks) ===", rows.len());
+    for (idx, pid, st, prio, core, name) in &rows {
+        crate::serial_println!(
+            "idx={} pid={} state={} prio={} core={} {}",
+            idx,
+            pid,
+            ktrace_state_name(*st),
+            prio,
+            core,
+            name
+        );
+    }
+    crate::serial_println!("=== END KTRACE TASK STATES ===");
+    rows.len() as u64
+}
+
+/// Map a `TaskState` u8 discriminant to a short name (see `SchedTrace` docs).
+#[cfg(feature = "trace")]
+fn ktrace_state_name(st: u8) -> &'static str {
+    match st {
+        0 => "Ready",
+        1 => "Running",
+        2 => "BlkRecv",
+        3 => "BlkSend",
+        4 => "BlkReply",
+        5 => "BlkNotif",
+        6 => "BlkFutex",
+        7 => "Dead",
+        _ => "?",
+    }
 }
 
 // ===========================================================================

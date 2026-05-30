@@ -170,7 +170,7 @@ Saved at syscall entry (from `PerCoreData` temporary state), restored by schedul
 
 ## Deferred Until Later
 
-- VMA tree (BTreeMap or interval tree) — deferred to Phase 52c
-- Per-core scheduler with work-stealing — deferred to Phase 52c
-- Dynamic IPC resource pools — deferred to Phase 52c
-- ISR-direct notification wakeup — deferred to Phase 52c
+- VMA tree (BTreeMap or interval tree) — deferred to Phase 52c — **✅ delivered** (`VmaTree` / `BTreeMap<u64, MemoryMapping>` in `kernel-core/src/mm.rs`).
+- Per-core scheduler with work-stealing — deferred to Phase 52c — **✅ delivered** (per-core run queues + `try_steal` in `task/scheduler.rs`).
+- Dynamic IPC resource pools — deferred to Phase 52c (still deferred: notifications remain fixed-size `MAX_NOTIFS = 64`).
+- ISR-direct notification wakeup — deferred to Phase 52c — **✅ delivered** (`IsrWakeQueue` in `kernel/src/smp/mod.rs`, drained by the scheduler dispatch loop).

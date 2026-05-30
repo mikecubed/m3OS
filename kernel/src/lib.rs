@@ -115,7 +115,48 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
     fs::tmpfs::init();
 
     // P9-T002: initialise framebuffer text console (fixed-font renderer).
-    if let Some((buf_ptr, info)) = fb_parts {
+    if let Some((buf_ptr, mut info)) = fb_parts {
+        // Cap an over-large bootloader-selected framebuffer down to
+        // FB_CAP (1920×1080). With QEMU `-vga std` the UEFI GOP path
+        // greedily selects the LARGEST mode that fits in VRAM (up to 4K
+        // with `vgamem_mb=32`), and the compositor has no GPU — it
+        // software-composites every pixel, so 4K (8.3 MP) is the dominant
+        // GUI cost. Reprogramming Bochs VBE to 1080p (2.07 MP) cuts that
+        // ~4× and still leaves VRAM for double-buffering (2×1080×1920×4 =
+        // 16.6 MiB < 32 MiB). A VBE mode set does not move the LFB, so
+        // `buf_ptr` and the bootloader mapping (sized for the larger mode)
+        // stay valid. Non-Bochs framebuffers (real UEFI hardware) decline
+        // and keep their native mode.
+        const FB_CAP_W: usize = 1920;
+        const FB_CAP_H: usize = 1080;
+        if info.width > FB_CAP_W || info.height > FB_CAP_H {
+            let bpp_bits = (info.bytes_per_pixel * 8) as u16;
+            // SAFETY: ring 0; runs before init_from_parts/enable_doublebuffer
+            // touch the framebuffer. mm::init does not touch the FB region.
+            match unsafe { fb::vbe::set_mode(FB_CAP_W as u16, FB_CAP_H as u16, bpp_bits) } {
+                Ok((w, h)) => {
+                    let (w, h) = (w as usize, h as usize);
+                    info.width = w;
+                    info.height = h;
+                    // Bochs VBE sets VIRT_WIDTH = XRES on the mode set, so the
+                    // linear stride is exactly `width` pixels with no padding.
+                    info.stride = w;
+                    // Single visible buffer; enable_doublebuffer() doubles this.
+                    info.byte_len = w * h * info.bytes_per_pixel;
+                    log::info!(
+                        "[fb] capped framebuffer to {}x{} via Bochs VBE (compositor perf)",
+                        w,
+                        h
+                    );
+                }
+                Err(e) => {
+                    log::info!(
+                        "[fb] framebuffer mode cap skipped ({:?}); using bootloader mode",
+                        e
+                    );
+                }
+            }
+        }
         // SAFETY: buf_ptr is derived from boot_info.framebuffer which is
         // &'static mut; the mapping outlives the kernel.  mm::init does not
         // touch the framebuffer region.
@@ -230,6 +271,41 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
         arch::x86_64::cpuid::XSAVE_AREA_SIZE,
         enabled_area
     );
+
+    // Phase 77 Track B — enable CR4.SMEP (bit 20) + CR4.SMAP (bit 21) on the
+    // BSP when the CPU supports them.  Ordering matters for the same reason as
+    // XSAVE above: this runs *before* `boot_aps()` so the trampoline's captured
+    // `DATA_CR4` carries the bits and every AP inherits them on CR4 reload.
+    let (smep_on, smap_on) = x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        arch::x86_64::cpuid::enable_smep_smap()
+    });
+    // Clear EFLAGS.AC *outside* the `without_interrupts` bracket above (whose
+    // `popf` would otherwise restore the firmware AC and silently disable SMAP
+    // for the BSP's boot/idle context). Persistent for this context; syscall
+    // entry clears AC via SFMASK and APs clear it in `ap_entry`.
+    unsafe {
+        arch::x86_64::cpuid::clear_ac_for_smap();
+    }
+    let (smep_sup, smap_sup) = arch::x86_64::cpuid::probe_smep_smap();
+    log::info!(
+        "[sec] BSP CR4.SMEP {} (supported={}), CR4.SMAP {} (supported={})",
+        if smep_on { "enabled" } else { "off" },
+        smep_sup,
+        if smap_on { "enabled" } else { "off" },
+        smap_sup,
+    );
+
+    // Phase 77 Track B (debug-only): prove SMEP/SMAP actually fault a ring-0
+    // access to a user page. Feature-gated; absent in production builds.
+    #[cfg(feature = "smep-smap-test")]
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        arch::x86_64::smap_test::run_boot_self_test();
+    });
+
+    // Phase 77 Track E: apply microcode on the BSP first (before APs are
+    // woken). A no-op clean skip on QEMU / non-AMD CPUs (no MSR write unless a
+    // strictly-newer matching patch is found in the embedded blob).
+    arch::x86_64::microcode::apply_microcode_on_cpu(0);
 
     // Phase 16: Initialize NIC drivers.  Phase 55b E.5: the in-kernel e1000
     // driver has been deleted; device-specific 82540EM code now lives in
@@ -467,6 +543,20 @@ fn spawn_userspace_init() {
         0,
     );
     log::info!("[init] /sbin/init registered as pid {}", pid);
+
+    // PID 1 is loaded directly here, not through `execve`, so it never
+    // passes the path that populates `comm` / `exec_path` / `cmdline` from
+    // the binary basename. Set them explicitly so `/proc/1/{comm,stat,
+    // cmdline}`, `ps`, and `htop` show "init" instead of the "unknown"
+    // fallback `proc_name` uses when all three are empty.
+    {
+        let mut table = process::PROCESS_TABLE.lock();
+        if let Some(proc) = table.find_mut(pid) {
+            proc.set_comm(b"init");
+            proc.exec_path = String::from("/sbin/init");
+            proc.cmdline = vec![String::from("/sbin/init")];
+        }
+    }
 
     task::spawn_fork_task(
         process::make_fork_ctx_zeroed(pid, loaded.entry, user_rsp),
@@ -810,17 +900,27 @@ fn net_task() -> ! {
             any = net::virtio_net::NET_IRQ_WOKEN.swap(false, core::sync::atomic::Ordering::Acquire);
             drained_remote_tx = net::remote::RemoteNic::drain_tx_queue();
         }
+        // Phase 77 Track D.2 — service the TCP retransmission timers once per
+        // pass. Runs in this (task) context so the replayed segments go out the
+        // normal `ipv4::send` path; the periodic deadline below guarantees it
+        // fires even when no NIC event wakes the task.
+        net::tcp::tcp_tick();
+
         // Park on the unified flag: the virtio-net ISR, RemoteNic, and the
         // ingress pending-send hook all set it, so a wake from any path
         // reliably unblocks the task.
         //
-        // F.6: under sched-v2 use block_current_until (v2 CAS primitive)
-        // with no deadline; under v1 retain block_current_unless_woken.
+        // F.6: under sched-v2 use block_current_until (v2 CAS primitive).
+        // Phase 77 Track D.2: a ~200 ms deadline turns the park into a periodic
+        // wake so the RTO scan above runs even on an otherwise idle link.
         {
+            const TCP_RTO_TICK_INTERVAL_MS: u64 = 200;
+            let deadline = crate::arch::x86_64::interrupts::tick_count()
+                .saturating_add(TCP_RTO_TICK_INTERVAL_MS);
             let _ = task::scheduler::block_current_until(
                 task::TaskState::BlockedOnRecv,
                 &net::NIC_WOKEN,
-                None,
+                Some(deadline),
             );
         }
     }

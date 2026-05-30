@@ -128,6 +128,11 @@ observable during the mid-restart window.
   constraint if a driver genuinely needs two independent async sources.
 - `ipc_recv_timeout` is deferred. The e1000 deadlock is resolved without it. Any timeout
   support is a separate design decision for a later phase.
+  **Update (Phase 77 Track G.1 de-drift):** delivered in **Phase 74** —
+  `SYS_IPC_RECV_TIMEOUT` (`0x111A`) and `SYS_IPC_CALL_TIMEOUT` (`0x1119`) drive
+  the Phase 57a `block_current_until` deadline path with race-free endpoint-queue
+  cleanup on deadline expiry; `userspace/syscall-lib` exposes `ipc_recv_timeout` /
+  `ipc_call_timeout`.
 - NVMe migration to the bound-notification model is deferred. NVMe is request-response;
   polling for completion inside the handler is correct for its workload shape.
 

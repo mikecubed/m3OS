@@ -256,9 +256,9 @@ Closure evidence lives in the same places the tooling already produces today:
 | Large runtime ecosystems (Python, Node.js, JVM) | Out of scope | Post-1.0 (Phase 59–62) |
 | Outbound HTTPS/TLS client tooling | Deferred | Post-1.0 |
 | `git`, `gh`, GitHub integration | Deferred | Post-1.0 |
-| DNS resolution and general outbound networking | Deferred | Post-1.0 |
+| DNS resolution and general outbound networking | DNS delivered in Phase 77 (Track D.1: `/etc/resolv.conf` + unbound-UDP ephemeral source port + `recvmsg`-on-AF_INET reply delivery, commit `8303990`); `getaddrinfo` resolves A records end to end. Outbound HTTPS/TLS client tooling remains deferred (see row above); DNS caching / search domains / IPv6 / DNSSEC are post-1.0 | Phase 77 |
 | Package feeds / remote package repositories | Deferred | Post-1.0 |
-| Dynamic linking / shared libraries | Deferred | Post-1.0 |
+| Dynamic linking / shared libraries | Delivered in Phase 76 (`ld-musl-x86_64.so.1` + `dlopen`/`dlsym`/`dlclose` + PLT lazy resolve + GNU hash + symbol versioning) | Phase 76 |
 | Full POSIX compliance testing | Deferred | Post-1.0 |
 
 The support boundary is intentionally narrow. Phase 58 (Release 1.0 Gate) builds
@@ -405,10 +405,10 @@ Release quality is partly about saying no. The support boundary (§ Support Boun
 
 ## Deferred Until Later
 
-- Broad outbound developer networking (HTTPS/TLS clients, DNS resolution, git remotes, GitHub tooling)
-- GUI / display compositor / graphical session / local desktop
-- Mouse input, audio output
+- Broad outbound developer networking (HTTPS/TLS clients, ~~DNS resolution~~, git remotes, GitHub tooling) — **DNS resolution ✅ delivered in [Phase 77](./77-pre-1-0-cleanup.md) Track D.1** (musl resolver + `/etc/resolv.conf` + `recvmsg` AF_INET delivery); HTTPS/TLS clients, git remotes, and GitHub tooling remain deferred.
+- ~~GUI / display compositor / graphical session / local desktop~~ — **✅ delivered in [Phase 56 — Display and Input Architecture](./56-display-and-input-architecture.md)** + [Phase 57 — Audio and Local Session](./57-audio-and-local-session.md).
+- ~~Mouse input, audio output~~ — **✅ delivered**: mouse input in [Phase 56](./56-display-and-input-architecture.md) (`mouse_server`), audio output in [Phase 57](./57-audio-and-local-session.md) (`audio_server`, AC'97).
 - Large third-party runtime ecosystems (Python, Node.js, JVM)
 - Broad hardware certification beyond QEMU x86_64 with OVMF
-- Package feeds, remote package repositories, dynamic linking
+- Package feeds, remote package repositories, ~~dynamic linking~~ — **dynamic linking ✅ delivered in [Phase 76](./76-dynamic-linker.md)** (`ld-musl-x86_64.so.1`, dlopen/dlsym, PLT lazy resolve, GNU hash, symbol versioning); package feeds and remote repositories remain deferred.
 - Full POSIX compliance testing

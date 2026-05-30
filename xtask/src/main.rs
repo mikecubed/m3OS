@@ -663,6 +663,15 @@ fn main() {
             });
             cmd_less_render_probe(&probe_args);
         }
+        // Phase 77 Track H.2 — headless htop process-row render probe.
+        Some("htop-render-probe") => {
+            let probe_args = parse_less_render_probe_args(&args[2..]).unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            cmd_htop_render_probe(&probe_args);
+        }
         Some("compositor-stress") => {
             let stress_args = parse_compositor_stress_args(&args[2..]).unwrap_or_else(|err| {
                 eprintln!("Error: {err}");
@@ -729,7 +738,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -810,6 +819,7 @@ fn build_userspace_bins() {
         ("adduser", "adduser", false),
         ("id", "id", false),
         ("whoami", "whoami", false),
+        ("ktrace", "ktrace", false), // deep per-task scheduler trace tool
         ("pty-test", "pty-test", false),
         ("unix-socket-test", "unix-socket-test", false),
         ("thread-test", "thread-test", false),
@@ -949,6 +959,9 @@ fn build_userspace_bins() {
         // and asserts the JIT pattern (`PROT_READ | PROT_EXEC`)
         // succeeds. Pure syscall+write — no allocator.
         ("wx-violation", "wx-violation", false),
+        // Phase 77 Track F.1 — epoll_* verification smoke test.
+        // Pure syscall+write against a pipe; no allocator.
+        ("epoll-smoke", "epoll-smoke", false),
         // Phase 70 follow-up — `doom-concurrent` forks two `doom`
         // children and waits for both, so the
         // `doom-concurrent-smoke` gate exercises real concurrency
@@ -2450,6 +2463,10 @@ fn build_musl_bins() {
             "userspace/mmap-leak-test/mmap-leak-test.c",
             "mmap-leak-test",
         ),
+        // Phase 77 Track C: multi-threaded __thread / PT_TLS smoke test
+        ("userspace/tls-smoke/tls-smoke.c", "tls-smoke"),
+        // Phase 77 Track D.1: DNS resolution smoke test (musl resolver).
+        ("userspace/dns-smoke/dns-smoke.c", "dns-smoke"),
     ];
 
     let cc = match find_musl_cc() {
@@ -4281,9 +4298,14 @@ fn qemu_args_with_devices_resolved(
         // Phase 57e Track J: advertise XSAVE + AVX + XSAVEOPT so the kernel
         // can enable CR4.OSXSAVE + XCR0 = 0x7 at boot.  The default QEMU
         // `qemu64` model lacks these architectural feature bits.
+        // Phase 77 Track B: also advertise SMEP + SMAP (CPUID.07h:EBX[7]/[20])
+        // so the kernel enables CR4.SMEP/SMAP under TCG too — without these the
+        // probe reports "unsupported" and the mitigations would be silently
+        // untested on the CI/headless lanes.  `-cpu host` (KVM) already exposes
+        // them on any modern host.
         args.extend([
             "-cpu".to_string(),
-            "qemu64,+xsave,+avx,+xsaveopt".to_string(),
+            "qemu64,+xsave,+avx,+xsaveopt,+smep,+smap".to_string(),
         ]);
     }
 
@@ -4356,6 +4378,16 @@ fn qemu_args_with_devices_resolved(
                 "-global".to_string(),
                 "VGA.vgamem_mb=32".to_string(),
             ]);
+            // NOTE: the framebuffer *resolution* is NOT capped here. With
+            // `-vga std` the QEMU/OVMF EDID (xres/yres/xmax/ymax) only sets the
+            // *preferred* mode — OVMF still enumerates every mode that fits in
+            // VRAM, and the `bootloader` crate greedily selects the LARGEST one
+            // ≥ its 1920×1080 minimum, which with `vgamem_mb=32` can be 4K. The
+            // resolution cap is therefore applied guest-side, where it actually
+            // works regardless of OVMF version: the kernel reprograms Bochs VBE
+            // down to 1920×1080 at framebuffer init (see `kernel/src/lib.rs`
+            // and `kernel/src/fb/vbe.rs::set_mode`). The 32 MiB VRAM is retained
+            // so VBE double-buffering (2×1080×1920×4 = 16.6 MiB) still fits.
         }
     }
 
@@ -6584,6 +6616,40 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         pattern: "SMOKE:wx-violation:PASS",
         timeout_secs: 20,
         label: "guest/wx-violation: smoke runner verified W^X mprotect guard",
+    });
+    // Phase 77 Track F — epoll_* regression. Hard gate (PASS only): the
+    // smoke-runner execs `/bin/epoll-smoke` and asserts ADD/MOD/DEL/wait/timeout
+    // against a pipe. Without an explicit wait step here a failure would be
+    // misattributed to the next stage's timeout (the runner returns early and
+    // never emits dynlink-smoke).
+    steps.push(SmokeStep::Wait {
+        pattern: "SMOKE:epoll-smoke:PASS",
+        timeout_secs: 20,
+        label: "guest/epoll-smoke: epoll_* ADD/MOD/DEL/wait/timeout verified",
+    });
+    // Phase 77 Track C — PT_TLS + multithread pthreads. The musl-built
+    // `/bin/tls-smoke` runs 4 threads each with their own `__thread` copy.
+    // Accepts SKIP when the musl toolchain was absent at build (zero-byte
+    // placeholder); M3OS_TLS_REGRESSION=1 in pre-push rejects that SKIP.
+    steps.push(SmokeStep::WaitEither {
+        pattern_a: "SMOKE:tls-smoke:PASS",
+        pattern_b: "SMOKE:tls-smoke:SKIP",
+        timeout_secs: 30,
+        label: "guest/tls-smoke: PT_TLS multithread TLS verified or skipped",
+        extra_steps_a: &[],
+        extra_steps_b: &[],
+    });
+    // Phase 77 Track D.1 — DNS resolver path. The musl-built `/bin/dns-smoke`
+    // exercises getaddrinfo end to end. Soft by design: SKIP when no outbound
+    // DNS is reachable (sandbox) or the binary is absent; M3OS_DNS_REGRESSION=1
+    // in pre-push rejects a SKIP when a real resolution is required.
+    steps.push(SmokeStep::WaitEither {
+        pattern_a: "SMOKE:dns-smoke:PASS",
+        pattern_b: "SMOKE:dns-smoke:SKIP",
+        timeout_secs: 30,
+        label: "guest/dns-smoke: resolver path exercised or skipped",
+        extra_steps_a: &[],
+        extra_steps_b: &[],
     });
     // Phase 76 — kernel PT_INTERP + ld.so transfer-only stub
     // round-trip. The smoke-runner execs `/bin/dynlink_smoke`
@@ -10242,6 +10308,44 @@ fn wait_for_serial_pattern(
     }
 }
 
+/// Phase 77 Track H.2 — count scanlines in a vertical band `[y0_frac, y1_frac)`
+/// whose pixels differ between two frames of identical dimensions. Diff-based so
+/// it works despite the non-black compositor background: a frame where htop drew
+/// its process table over the previously-empty terminal region changes many
+/// scanlines in the band; a frame where nothing rendered changes ~none.
+fn changed_rows_in_band(a: &ppm::PpmFrame, b: &ppm::PpmFrame, y0_frac: f64, y1_frac: f64) -> u32 {
+    if a.width != b.width || a.height != b.height || a.height == 0 {
+        return 0;
+    }
+    let w = a.width as usize;
+    let h = a.height as usize;
+    let y0 = ((y0_frac.clamp(0.0, 1.0) * h as f64) as usize).min(h);
+    let y1 = ((y1_frac.clamp(0.0, 1.0) * h as f64) as usize).min(h);
+    let mut changed = 0u32;
+    for y in y0..y1 {
+        let rs = y * w * 3;
+        let mut diff_px = 0u32;
+        for x in 0..w {
+            let i = rs + x * 3;
+            if i + 2 >= a.pixels.len() || i + 2 >= b.pixels.len() {
+                break;
+            }
+            let d = (a.pixels[i] as i32 - b.pixels[i] as i32).unsigned_abs()
+                + (a.pixels[i + 1] as i32 - b.pixels[i + 1] as i32).unsigned_abs()
+                + (a.pixels[i + 2] as i32 - b.pixels[i + 2] as i32).unsigned_abs();
+            if d > 60 {
+                diff_px += 1;
+            }
+        }
+        // A scanline counts as "changed" only if a meaningful run of pixels
+        // differs (filters single-pixel cursor-blink noise).
+        if diff_px > 5 {
+            changed += 1;
+        }
+    }
+    changed
+}
+
 fn capture_frame(q: &mut qmp::QmpClient, out_dir: &Path, tag: &str) -> Result<(), String> {
     let path = out_dir.join(format!("{tag}.ppm"));
     q.screendump(&path)
@@ -10503,6 +10607,201 @@ fn cmd_less_render_probe(args: &LessRenderProbeArgs) {
         }
         Err(msg) => {
             eprintln!("less-render-probe: FAILED\n{msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Phase 77 Track H.2 — headless htop process-row render probe.
+///
+/// Boots the graphical stack headlessly (same QMP + VNC plumbing as
+/// `less-render-probe`), launches `htop` in `term`, captures a framebuffer
+/// screendump, and asserts that htop's process-table band actually renders
+/// multiple process rows. This is the cell-grid assertion the serial-only
+/// `tui-app-smoke` gate cannot make: a zero-process htop draws its meter header
+/// but leaves the table band blank, so the row count collapses to ~0.
+///
+/// Exit code 0 = process rows rendered; non-zero = blank table (the
+/// 2026-05-20 regression) or a probe error. Run via `cargo xtask
+/// htop-render-probe`.
+fn cmd_htop_render_probe(args: &LessRenderProbeArgs) {
+    /// Minimum changed scanlines in htop's process-table band (vs the empty
+    /// prompt baseline) that indicate htop rendered a populated table. A full
+    /// render changes hundreds of scanlines across the band; a no-render / blank
+    /// table changes ~0. 20 cleanly separates "drew a table" from "nothing".
+    const MIN_CHANGED_BAND_SCANLINES: u32 = 20;
+
+    if let Err(msg) = port_build::build_phase_69d_ports() {
+        eprintln!("htop-render-probe: precondition failed: {msg}");
+        std::process::exit(1);
+    }
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false, // graphical_login — autologin / serial path
+    );
+    let ovmf = find_ovmf();
+    if let Err(e) = std::fs::create_dir_all(&args.out_dir) {
+        eprintln!(
+            "htop-render-probe: cannot create out dir {}: {e}",
+            args.out_dir.display()
+        );
+        std::process::exit(1);
+    }
+
+    let qmp_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&qmp_socket);
+    let vnc_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&vnc_socket);
+    let mut qemu_args = qemu_args_with_devices(
+        &uefi_image,
+        &ovmf,
+        QemuDisplayMode::Headless,
+        DeviceSet::default(),
+    );
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    let mut idx = 0;
+    while idx + 1 < qemu_args.len() {
+        if qemu_args[idx] == "-display" && qemu_args[idx + 1] == "none" {
+            qemu_args[idx + 1] = format!("vnc=unix:{}", vnc_socket.display());
+            break;
+        }
+        idx += 1;
+    }
+    qemu_args.push("-qmp".to_string());
+    qemu_args.push(format!("unix:{},server,nowait", qmp_socket.display()));
+    qemu_args.push("-vga".to_string());
+    qemu_args.push("std".to_string());
+
+    println!(
+        "htop-render-probe: launching QEMU (timeout {}s, qmp {})",
+        args.timeout_secs,
+        qmp_socket.display()
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let rx = spawn_serial_reader(stdout);
+    let mut serial_history = String::new();
+    let mut serial_buf = String::new();
+    let global_start = std::time::Instant::now();
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+
+    let result: Result<u32, String> = (|| {
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "display_server: registered as 'display.input-owner'",
+            std::time::Duration::from_secs(args.timeout_secs.min(180)),
+            global_start,
+            global_timeout,
+        )?;
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "TERM_SMOKE:prompt-ready",
+            std::time::Duration::from_secs(args.timeout_secs.min(180)),
+            global_start,
+            global_timeout,
+        )?;
+        println!("htop-render-probe: term/sh0 prompt is ready");
+
+        let qmp_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut q = qmp::QmpClient::connect(&qmp_socket, qmp_deadline)
+            .map_err(|e| format!("qmp connect: {e}"))?;
+        println!("htop-render-probe: QMP handshake complete");
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        capture_frame(&mut q, &args.out_dir, "00-prompt")?;
+
+        // Launch htop through the graphical term (PS/2 → kbd_server →
+        // display_server → term → PTY → sh0). The env prefix supplies the
+        // terminfo path htop's ncurses needs (same invocation tui-app-smoke
+        // uses on the serial console).
+        q.type_text("TERM=m3os-term TERMINFO=/usr/share/terminfo /usr/local/bin/htop\n")
+            .map_err(|e| format!("type htop cmd: {e}"))?;
+
+        // htop's initscr + first full paint can take several seconds at the
+        // large headless framebuffer under TCG; capture a burst and keep the
+        // frame that changed MOST from the prompt baseline. The metric is
+        // diff-based (scanlines in the process-table band whose pixels differ
+        // from the baseline) because the compositor background is non-black, so
+        // absolute blackness metrics cannot distinguish content from backdrop.
+        let baseline = ppm::read_ppm(&args.out_dir.join("00-prompt.ppm"))?;
+        let burst_ms: &[u32] = &[1500, 3000, 5000, 8000];
+        let event_start = std::time::Instant::now();
+        let mut best_rows = 0u32;
+        for off in burst_ms {
+            let target = event_start + std::time::Duration::from_millis(*off as u64);
+            let now = std::time::Instant::now();
+            if target > now {
+                std::thread::sleep(target - now);
+            }
+            let tag = format!("htop-{off:04}ms");
+            capture_frame(&mut q, &args.out_dir, &tag)?;
+            let frame = ppm::read_ppm(&args.out_dir.join(format!("{tag}.ppm")))?;
+            let rows = changed_rows_in_band(&baseline, &frame, 0.30, 0.92);
+            println!(
+                "htop-render-probe: {tag} {}x{} -> {rows} changed table-band rows",
+                frame.width, frame.height
+            );
+            best_rows = best_rows.max(rows);
+        }
+
+        // Quit htop politely so cleanup doesn't leave it foreground.
+        let _ = q.press_key("q", 20);
+        Ok(best_rows)
+    })();
+
+    while let Ok(chunk) = rx.try_recv() {
+        append_serial_chunk(&mut serial_buf, &mut serial_history, &chunk);
+    }
+    if !args.keep_qemu {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&qmp_socket);
+        let _ = std::fs::remove_file(&vnc_socket);
+    }
+    let serial_log = args.out_dir.join("serial.log");
+    let _ = std::fs::write(&serial_log, &serial_history);
+
+    match result {
+        Ok(rows) if rows >= MIN_CHANGED_BAND_SCANLINES => {
+            println!(
+                "htop-render-probe: PASS — htop rendered a populated process table ({rows} changed band scanlines, min {MIN_CHANGED_BAND_SCANLINES})"
+            );
+        }
+        Ok(rows) => {
+            eprintln!(
+                "htop-render-probe: FAIL — htop process-table band changed only {rows} scanlines vs the prompt baseline (< {MIN_CHANGED_BAND_SCANLINES}); htop did not render a populated table. Frames in {}",
+                args.out_dir.display()
+            );
+            std::process::exit(1);
+        }
+        Err(msg) => {
+            eprintln!("htop-render-probe: FAILED\n{msg}");
             std::process::exit(1);
         }
     }
@@ -12327,6 +12626,13 @@ fn populate_ext2_files(
     let shadow_content = shadow_content.as_str();
     let group_content = "root:x:0:root\nuser:x:1000:user\n";
 
+    // Phase 77 Track D.1 — stage /etc/resolv.conf so the prebuilt musl resolver
+    // (getaddrinfo / gethostbyname) has a nameserver. QEMU SLIRP user-net exposes
+    // a virtual DNS server at 10.0.2.3 that forwards to the host resolver. The
+    // short timeout/attempts keep dns-smoke bounded when no outbound DNS exists.
+    // Override the nameserver for a different deployment by editing /etc/resolv.conf.
+    let resolv_conf_content = "nameserver 10.0.2.3\noptions timeout:5 attempts:3\n";
+
     // Phase 46: service definition files.
     let sshd_conf = "name=sshd\ncommand=/bin/sshd\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=syslogd\n";
     let telnetd_conf = "name=telnetd\ncommand=/bin/telnetd\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=syslogd\n";
@@ -12543,6 +12849,7 @@ fn populate_ext2_files(
     let smoke_mode_content = "enabled\n";
     let empty_content = "";
     let udp_smoke_bin = generated_initrd_dir(&workspace_root()).join("udp-smoke");
+    let dns_smoke_bin = generated_initrd_dir(&workspace_root()).join("dns-smoke");
 
     // Phase 76 — `/lib/ld-musl-x86_64.so.1` source path. Built by
     // `build_ldso()` into `target/generated-libs/`. The on-disk
@@ -12718,9 +13025,11 @@ fn populate_ext2_files(
     let hostname_tmp = output_dir.join("_tmp_hostname");
     let smoke_mode_tmp = output_dir.join("_tmp_smoke_mode");
     let empty_tmp = output_dir.join("_tmp_empty");
+    let resolv_conf_tmp = output_dir.join("_tmp_resolv_conf");
     fs::write(&passwd_tmp, passwd_content).expect("write temp passwd");
     fs::write(&shadow_tmp, shadow_content).expect("write temp shadow");
     fs::write(&group_tmp, group_content).expect("write temp group");
+    fs::write(&resolv_conf_tmp, resolv_conf_content).expect("write temp resolv.conf");
     fs::write(&sshd_conf_tmp, sshd_conf).expect("write temp sshd.conf");
     fs::write(&syslogd_conf_tmp, syslogd_conf).expect("write temp syslogd.conf");
     fs::write(&crond_conf_tmp, crond_conf).expect("write temp crond.conf");
@@ -13102,6 +13411,10 @@ fn populate_ext2_files(
          write \"{passwd}\" etc/passwd\n\
          write \"{shadow}\" etc/shadow\n\
          write \"{group}\" etc/group\n\
+         write \"{resolv_conf}\" etc/resolv.conf\n\
+         sif etc/resolv.conf mode 0x81A4\n\
+         sif etc/resolv.conf uid 0\n\
+         sif etc/resolv.conf gid 0\n\
          write \"{empty}\" root/.local/share/ion/history\n\
          write \"{empty}\" home/user/.local/share/ion/history\n\
          sif bin mode 0x41ED\n\
@@ -13120,6 +13433,10 @@ fn populate_ext2_files(
           sif root/udp-smoke mode 0x81ED\n\
           sif root/udp-smoke uid 0\n\
           sif root/udp-smoke gid 0\n\
+          write \"{dns_smoke_bin}\" bin/dns-smoke\n\
+          sif bin/dns-smoke mode 0x81ED\n\
+          sif bin/dns-smoke uid 0\n\
+          sif bin/dns-smoke gid 0\n\
           sif home mode 0x41ED\n\
          sif home uid 0\n\
          sif home gid 0\n\
@@ -13309,6 +13626,7 @@ fn populate_ext2_files(
         passwd = passwd_tmp.display(),
         shadow = shadow_tmp.display(),
         group = group_tmp.display(),
+        resolv_conf = resolv_conf_tmp.display(),
         sshd_conf = sshd_conf_tmp.display(),
         telnetd_cmds = telnetd_cmds,
         syslogd_conf = syslogd_conf_tmp.display(),
@@ -13339,6 +13657,7 @@ fn populate_ext2_files(
         readback_cmds = readback_cmds,
         inject_key_cmds = inject_key_cmds,
         udp_smoke_bin = udp_smoke_bin.display(),
+        dns_smoke_bin = dns_smoke_bin.display(),
         // Phase 76 — host path of the staged dynamic linker; written
         // to `/lib/ld-musl-x86_64.so.1` on the ext2 disk.
         ldso_bin = ldso_bin.display(),

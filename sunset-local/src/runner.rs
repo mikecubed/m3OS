@@ -194,6 +194,29 @@ impl<'a> Runner<'a, server::Server> {
         Self::new(inbuf, outbuf)
     }
 
+    /// Cleanly finish a session channel after the remote process has exited.
+    /// Queues the `exit-status`, `CHANNEL_EOF`, and `CHANNEL_CLOSE` packets
+    /// (the caller then flushes the output buffer to the socket), so an ssh
+    /// client observes an orderly logout (exit 0) instead of a dropped
+    /// transport ("Connection closed by remote host", exit 255). Consumes the
+    /// handle and releases the channel, like [`Runner::channel_done`].
+    pub fn server_session_exit(
+        &mut self,
+        chan: ChanHandle,
+        exit_status: u32,
+    ) -> Result<()> {
+        let num = chan.0;
+        {
+            let mut s = self.traf_out.sender(&mut self.keys);
+            self.conn.channels.send_server_exit(num, exit_status, &mut s)?;
+        }
+        // Release the channel (sets app_done, discards buffered input).
+        self.conn.channels.done(num)?;
+        self.traf_in.discard_read_channel(num);
+        self.wake();
+        Ok(())
+    }
+
     pub(crate) fn resume_servhostkeys(&mut self, keys: &[&SignKey]) -> Result<()> {
         self.resume(&DispatchEvent::ServEvent(ServEventId::Hostkeys));
         let (payload, _seq) = self.traf_in.payload().trap()?;

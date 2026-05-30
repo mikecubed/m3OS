@@ -1,6 +1,6 @@
 # Phase 77 - Pre-1.0 Correctness, Cheap Security, and Network Polish
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-77
 **Depends on:** Phase 74 (IPC Capability Grants) ✅, Phase 75 (W^X Enforcement) ✅
 **Builds on:** Closes the small but real correctness and security gaps that the Phase 74a audit promoted out of "post-1.0 acceptable" into pre-1.0 must-fix, without committing to any large new subsystem

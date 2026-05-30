@@ -2876,6 +2876,140 @@ pub fn task_times_for_pid(pid: u32) -> (u64, u64, u64, u64) {
     (user, system, child_user, child_system)
 }
 
+// ---------------------------------------------------------------------------
+// ktrace focus support (deep per-task trace tool)
+// ---------------------------------------------------------------------------
+
+/// Resolve target pids to task indices for the ktrace focus ring. Fills `out`
+/// with the `task_idx` of every live task whose pid is in `pids` (a thread
+/// group may contribute several idxs). Returns the count written.
+pub fn ktrace_resolve_pids(pids: &[u32], out: &mut [u32]) -> usize {
+    let sched = scheduler_lock();
+    let mut n = 0;
+    for (idx, task) in sched.tasks.iter().enumerate() {
+        if n >= out.len() {
+            break;
+        }
+        if pids.contains(&task.pid) && !matches!(task.state, TaskState::Dead) {
+            out[n] = idx as u32;
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Collect the per-core idle task indices (so the focus filter can drop idle
+/// dispatch/yield churn). Returns the count written.
+pub fn ktrace_idle_idxs(out: &mut [u32]) -> usize {
+    let sched = scheduler_lock();
+    let mut n = 0;
+    for slot in sched.idle_tasks.iter() {
+        if n >= out.len() {
+            break;
+        }
+        if let Some(idx) = slot {
+            out[n] = *idx as u32;
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Snapshot the live task table for ktrace: invokes
+/// `f(idx, pid, state_u8, priority, assigned_core, name)` for every non-Dead
+/// task. Used by the `sys_ktrace` TASKS dump and to annotate focus entries
+/// with pid/name. Holds `SCHEDULER.lock` only for the duration of the walk.
+pub fn ktrace_for_each_task(mut f: impl FnMut(u32, u32, u8, u8, u8, &'static str)) {
+    let sched = scheduler_lock();
+    for (idx, task) in sched.tasks.iter().enumerate() {
+        if matches!(task.state, TaskState::Dead) {
+            continue;
+        }
+        f(
+            idx as u32,
+            task.pid,
+            task.state as u8,
+            task.priority,
+            task.assigned_core,
+            task.name,
+        );
+    }
+}
+
+/// Aggregate CPU-time split for `/proc/stat`, summed across all cores.
+/// Returns `(user_ms, system_ms, idle_ms)`: busy (user/system) is summed
+/// over every non-idle task, idle over the per-core idle tasks. All values
+/// are in ms (`TICKS_PER_SEC = 1000`); the procfs renderer converts to
+/// USER_HZ jiffies. Replaces the previous hard-coded 10 %/90 % split so
+/// htop's CPU meter reflects real activity.
+pub fn global_cpu_times() -> (u64, u64, u64) {
+    let sched = scheduler_lock();
+    let (mut user, mut system, mut idle) = (0u64, 0u64, 0u64);
+    for (idx, task) in sched.tasks.iter().enumerate() {
+        // Skip Dead-but-not-yet-recycled slots: their tick counters are frozen
+        // (never reset until the slot is reused by alloc_task_slot) and would
+        // otherwise overstate cumulative busy time, inconsistent with the
+        // Dead-filtering the sibling accessors apply. htop deltas successive
+        // samples so this never affected CPU%, but the absolute totals were wrong.
+        if task.state == TaskState::Dead {
+            continue;
+        }
+        let u = task.user_ticks.load(core::sync::atomic::Ordering::Relaxed);
+        let s = task
+            .system_ticks
+            .load(core::sync::atomic::Ordering::Relaxed);
+        if sched.idle_tasks.contains(&Some(idx)) {
+            idle = idle.saturating_add(u).saturating_add(s);
+        } else {
+            user = user.saturating_add(u);
+            system = system.saturating_add(s);
+        }
+    }
+    (user, system, idle)
+}
+
+/// Number of non-idle tasks currently runnable (`Ready` or `Running`).
+/// Used by `/proc/loadavg` as an instantaneous load proxy. Far more honest
+/// than counting `Process.state`, which m3OS never transitions out of
+/// `Ready` — so every process looked runnable and load read a flat ~N.
+pub fn runnable_task_count() -> usize {
+    let sched = scheduler_lock();
+    let mut count = 0;
+    for (idx, task) in sched.tasks.iter().enumerate() {
+        if sched.idle_tasks.contains(&Some(idx)) {
+            continue;
+        }
+        if matches!(task.state, TaskState::Ready | TaskState::Running) {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Canonical scheduler state for a set of tids, or `None` if no live task
+/// matches. A runnable thread wins over a blocked one, so passing all
+/// thread-group members yields a process-level "running if any thread runs"
+/// view. Passing a single tid yields that thread's exact state (per-thread
+/// `/proc/<pid>/task/<tid>/stat` view). Lets procfs report a real `R`/`S`
+/// state instead of the stale `Process.state`.
+pub fn task_state_for_group(tids: &[u32]) -> Option<TaskState> {
+    let sched = scheduler_lock();
+    let mut blocked: Option<TaskState> = None;
+    for task in sched.tasks.iter() {
+        if tids.contains(&task.pid) && task.state != TaskState::Dead {
+            match task.state {
+                TaskState::Ready | TaskState::Running => return Some(task.state),
+                other => {
+                    if blocked.is_none() {
+                        blocked = Some(other);
+                    }
+                }
+            }
+        }
+    }
+    blocked
+}
+
 /// Phase 61 Track E.4 — rusage event-counter snapshot for one pid's full
 /// thread group. Returns a `RusageCounters` of `(own, child)` pairs for
 /// minor faults, major faults, voluntary ctxsw, involuntary ctxsw — eight
@@ -3206,12 +3340,17 @@ pub enum BlockOutcome {
 /// - Linux `do_nanosleep` (`kernel/time/hrtimer.c`) — four-step block recipe.
 /// - Linux `try_to_wake_up` (`kernel/sched/core.c`) — CAS wake side.
 /// - m3OS handoff 2026-04-25: `docs/handoffs/57a-scheduler-rewrite-v2-transitions.md`.
+#[track_caller]
 pub fn block_current_until(
     kind: TaskState,
     woken: &core::sync::atomic::AtomicBool,
     deadline_ticks: Option<u64>,
 ) -> BlockOutcome {
     use core::sync::atomic::Ordering;
+    // Capture the block site (immediate caller — `sys_poll`,
+    // `block_current_on_recv_v2`, the PTY/socket read, …) so the focus trace
+    // can distinguish which wait a lost wake stranded.
+    let block_caller = core::panic::Location::caller();
 
     debug_assert!(
         matches!(
@@ -3330,6 +3469,17 @@ pub fn block_current_until(
         }
         // pi_lock released.
     }
+
+    // Trace the park (after the state write, before the self-revert recheck).
+    // A `BLOCK` with no following `WakeTask` for this idx is the lost-wake
+    // signature; the caller location names which wait it is.
+    crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::BlockCurrent {
+        task_idx: idx as u32,
+        core,
+        new_state: kind as u8,
+        caller_file: block_caller.file(),
+        caller_line: block_caller.line(),
+    });
 
     // ── Step 2: pi_lock + SCHEDULER.lock both released ───────────────────────
 
@@ -3982,10 +4132,14 @@ pub enum WakeOutcome {
 ///    `pi_lock`.  Returns `AlreadyAwake` if the CAS fails.
 /// 3. **Mirror to v1 fields** under `SCHEDULER.lock` (shadow-lock dual write,
 ///    required until Track E.3 removes `Task::state` / `Task::wake_deadline`).
-/// 4. **Spin-wait** on `Task::on_cpu == false` before enqueuing (Linux
-///    `p->on_cpu` `smp_cond_load_acquire` pattern, `kernel/sched/core.c`,
-///    `try_to_wake_up`).  This replaces v1's `PENDING_SWITCH_OUT[core]`
-///    RSP-publication guard.
+/// 4. **Enqueue now, or DEFER to the dispatch epilogue.** Read `Task::on_cpu`
+///    inside the same validated critical section. If `on_cpu == true` the task
+///    is still mid-switch-out on its core, so we must NOT enqueue it here (a
+///    wait-free handoff replaces the old cross-core `on_cpu` busy-spin, which
+///    could deadlock two cores each waiting on the other's dispatch epilogue):
+///    return `Woken` and let the dispatch epilogue enqueue it once it clears
+///    `on_cpu` and observes `state == Ready` (both under `SCHEDULER.lock`, so
+///    exactly one path enqueues). If `on_cpu == false`, fall through to step 5.
 /// 5. **Enqueue** to `assigned_core` run queue via [`enqueue_to_core`].
 ///    If the assigned core differs from the caller's core, [`enqueue_to_core`]
 ///    already sends a reschedule IPI (`IPI_RESCHEDULE` vector, `smp::ipi`),
@@ -3998,10 +4152,14 @@ pub enum WakeOutcome {
 /// brief `SCHEDULER.lock` and drops it.  Steps 2+3 acquire `pi_lock` OUTER
 /// and then `SCHEDULER.lock` INNER **simultaneously** so the canonical CAS
 /// and the scheduler-visible mirror are atomic with respect to a racing
-/// `block_current_until` self-revert.  Step 4's `on_cpu` spin-wait and
-/// step 5's enqueue run with both locks dropped (Linux pattern); a
-/// self-revert that interleaves there is harmless — `pick_next`'s
-/// `state != Ready` filter silently drops any stale queue entry.
+/// `block_current_until` self-revert.  Step 4's `on_cpu` read happens inside
+/// that validated critical section; the step-5 enqueue (when not deferred) runs
+/// with both locks dropped, and a self-revert that interleaves there is
+/// harmless — `pick_next`'s `state != Ready` filter silently drops any stale
+/// queue entry. When the enqueue is deferred to the dispatch epilogue, the
+/// epilogue's clear-`on_cpu` + recheck-`Ready` runs under `SCHEDULER.lock`, so
+/// the waker (which read `on_cpu == true` under the same lock) and the epilogue
+/// can never both enqueue nor both skip — the task is enqueued exactly once.
 ///
 /// # Identity revalidation
 ///
@@ -4015,8 +4173,8 @@ pub enum WakeOutcome {
 /// the recycled task's pi_lock for the validation read is benign: we read
 /// state, find identity mismatch, release without writing.
 ///
-/// `assigned_core` and `on_cpu_ptr` are also re-read inside the validated
-/// critical section so step 4's spin-wait and step 5's enqueue use values
+/// `assigned_core` and `on_cpu` are also re-read inside the validated
+/// critical section so step 4's defer decision and step 5's enqueue use values
 /// fresh from the validated slot, not stale values from step 1's snapshot.
 ///
 /// # Constraints
@@ -4027,9 +4185,11 @@ pub enum WakeOutcome {
 ///
 /// # References
 ///
-/// - Linux `try_to_wake_up`, `kernel/sched/core.c` — `p->on_cpu`
-///   `smp_cond_load_acquire` spin-wait before `ttwu_queue`; cross-core
-///   IPI via `smp_send_reschedule` inside `ttwu_queue`.
+/// - Linux `try_to_wake_up`, `kernel/sched/core.c` — m3OS replaces Linux's
+///   `p->on_cpu` `smp_cond_load_acquire` spin-before-`ttwu_queue` with a
+///   wait-free defer-to-dispatch-epilogue handoff (see step 4); cross-core
+///   IPI via `smp_send_reschedule` inside `ttwu_queue` is mirrored by
+///   [`enqueue_to_core`]'s `IPI_RESCHEDULE`.
 /// - m3OS handoff 2026-04-25:
 ///   `docs/handoffs/57a-scheduler-rewrite-v2-transitions.md` (wake side
 ///   steps 1–5).
@@ -4090,11 +4250,11 @@ fn wake_task_v2_with(
     //
     // The Vec never shrinks; slots are Dead-recycled but the memory at
     // `tasks[idx]` is stable.  We capture only `idx` and `pi_lock_ptr` here
-    // because everything else (`assigned_core`, `on_cpu_ptr`) MUST be re-read
+    // because everything else (`assigned_core`, `on_cpu`) MUST be re-read
     // inside the validated critical section after revalidating the slot's
     // identity — otherwise a recycle between step 1 and step 3 would let
-    // us spin / enqueue using stale values from the previous task in the
-    // slot.
+    // us decide the defer/enqueue using stale values from the previous task in
+    // the slot.
     let (idx, pi_lock_ptr) = {
         let sched = scheduler_lock();
         let idx = match sched.find(id) {
@@ -4230,14 +4390,16 @@ fn wake_task_v2_with(
         let log_unpaired_reply_wake = prev_state_u8 == TaskState::BlockedOnReply as u8
             && sched.tasks[idx].pending_msg.is_none();
 
-        // Re-read `assigned_core` and `on_cpu_ptr` from the VALIDATED slot,
-        // for use after both locks drop.
-        let assigned: u8 = sched.tasks[idx].assigned_core;
-        let on_cpu_ptr: *const core::sync::atomic::AtomicBool = &raw const sched.tasks[idx].on_cpu;
-        (assigned, on_cpu_ptr, log_unpaired_reply_wake)
+        // Read the `on_cpu` flag from the VALIDATED slot for the
+        // enqueue-vs-defer decision below.  The read happens under
+        // SCHEDULER.lock (held here), atomic with respect to the dispatch
+        // epilogue (which clears `on_cpu` and re-enqueues woken tasks under the
+        // same lock — see the matching change in the dispatch loop).
+        let on_cpu_now: bool = sched.tasks[idx].on_cpu.load(Ordering::Acquire);
+        (on_cpu_now, log_unpaired_reply_wake)
         // SCHEDULER.lock released, then pi_lock released.
     };
-    let (assigned_core, on_cpu_ptr, log_unpaired_reply_wake) = post_lock;
+    let (on_cpu_now, log_unpaired_reply_wake) = post_lock;
 
     // Phase 63 audio handoff follow-up — emit the deferred BlockedOnReply
     // wake diag now that both `pi_lock` and `scheduler_lock` are released.
@@ -4248,68 +4410,35 @@ fn wake_task_v2_with(
         log_wake_blocked_on_reply(id, caller_loc, false);
     }
 
-    // ── Step 4: Spin-wait on Task::on_cpu == false (cross-core only) ─────────
+    // ── Step 4: Enqueue now, or DEFER to the wakee's dispatch epilogue ───────
     //
-    // The arch-level switch-out epilogue clears `on_cpu` only after
-    // `saved_rsp` is durably written to the task struct (with Release
-    // ordering, Track E.1).  Spinning here with Acquire ordering guarantees
-    // that our subsequent `enqueue_to_core` observes the published
-    // `saved_rsp` so the dispatch path does not jump to a stale RSP.
+    // The arch switch-out epilogue (`dispatch_for_core`) publishes the wakee's
+    // `saved_rsp` with Release ordering and THEN clears `on_cpu`.  We read
+    // `on_cpu` (Acquire) under SCHEDULER.lock at CAS time (step 3):
     //
-    // Linux analog: `smp_cond_load_acquire(&p->on_cpu, !VAL)` in
-    // `try_to_wake_up` (`kernel/sched/core.c`).
+    //   * `on_cpu == false` — the wakee has fully switched out and its
+    //     `saved_rsp` is published (our Acquire read pairs with the epilogue's
+    //     Release).  We enqueue it here in step 5.  Because both our CAS and
+    //     the epilogue's "clear on_cpu + re-enqueue Ready" run under
+    //     SCHEDULER.lock, an `on_cpu == false` observation means the epilogue
+    //     already ran and saw the task still `Blocked*` (our CAS hadn't
+    //     landed), so it did NOT enqueue — no double-enqueue.
     //
-    // # Same-core escape
+    //   * `on_cpu == true` — the wakee is still mid-switch-out (on this or
+    //     another core).  We DEFER: the epilogue, which clears `on_cpu` and
+    //     re-enqueues any task it then finds `Ready` (serialised against our
+    //     CAS by SCHEDULER.lock), will enqueue it.  We do NOT enqueue here.
     //
-    // If the waker is running on the task's `assigned_core`, we skip the
-    // spin entirely.  Same-core wake is dispatch-safe by construction:
-    //   1. `pick_next` on this core consumes this core's local queue, so
-    //      our enqueue cannot be picked up until WE return.
-    //   2. The interrupted (or blocking) task can't reach the dispatch
-    //      epilogue — and therefore can't clear `on_cpu` — until WE
-    //      return.  Spinning would be a guaranteed deadlock for
-    //      same-core IRQ wakes (e.g. COM1 RX → wake_feeder_task →
-    //      wake_task_v2 for the very task whose `block_current_until`
-    //      the IRQ interrupted).
-    //   3. After we return, the task either self-reverts (state=Running,
-    //      our queue entry is silently filtered by dequeue_local's
-    //      state==Ready check) or proceeds to switch_context (saved_rsp
-    //      committed before pick_next can run on this core).
-    //
-    // SAFETY: `on_cpu_ptr` is a valid pointer to an `AtomicBool` in the
-    // same stable Task struct as `pi_lock_ptr` (step 1 invariant).
-    let waker_core = crate::smp::per_core().core_id;
-    if assigned_core != waker_core {
-        let on_cpu_ref = unsafe { &*on_cpu_ptr };
-        // Phase 57a: bounded by cross-core context-switch completion time.  The
-        // remote core clears `on_cpu` with Ordering::Release on its next switch-out.
-        // We intentionally busy-wait here: step 3 has already committed the
-        // wakeup transition, but step 5 has not yet published the task on its
-        // assigned core's run queue.  Blocking or yielding in this handoff
-        // window would require an additional wake/publication protocol to avoid
-        // losing forward progress under the current lock/queue invariants.
-        //
-        // Phase 57e Track B.2: under PREEMPT_FULL, a kernel-mode preemption
-        // mid-spin could migrate this task off `waker_core` and break the
-        // step 5 invariant ("the waker enqueues onto the wakee's assigned
-        // core").  `preempt_disable` keeps the waker pinned for the duration
-        // of the spin and the subsequent `enqueue_to_core` call.
-        preempt_disable();
-        // Phase 57e Track B.2 (review-resolution refinement): after
-        // `preempt_disable` we are pinned to the current core, but a
-        // preemption between the `waker_core` read above and reaching here
-        // could already have migrated us.  If migration moved us onto the
-        // wakee's `assigned_core`, the cross-core spin would deadlock on
-        // same-core (per the same-core escape comment above).  Re-check
-        // here after we are pinned and skip the spin in that case.  Limit
-        // the re-check to the cross-core branch to preserve the same-core
-        // fast path's zero-overhead profile.
-        if assigned_core != crate::smp::per_core().core_id {
-            while on_cpu_ref.load(Ordering::Acquire) {
-                core::hint::spin_loop();
-            }
-        }
-        preempt_enable();
+    // This replaces the previous cross-core `on_cpu` busy-spin, which could
+    // dead-/live-lock: two cores each spinning in `wake_task_v2` for a task
+    // mid-switch-out on the other core would each prevent the other core's
+    // scheduler loop (hence its epilogue, hence the `on_cpu` clear) from ever
+    // running — the SSH-disconnect freeze in
+    // `docs/handoffs/2026-04-25-pr-118-residual-issues.md`.  Deferring to the
+    // epilogue makes the handoff wait-free.
+    if on_cpu_now {
+        // Wakee mid-switch-out — the dispatch epilogue owns the enqueue.
+        return WakeOutcome::Woken;
     }
 
     // ── Step 5: Enqueue to assigned_core run queue + reschedule IPI ──────────
@@ -5368,6 +5497,16 @@ pub fn run() -> ! {
                         task.last_ready_tick = now;
                         task.last_migrated_tick = now;
                         Some((task.assigned_core, sidx))
+                    } else if task.state == TaskState::Ready {
+                        // Woken DURING its own switch-out: a `wake_task_v2`
+                        // CAS'd this task Blocked* → Ready while `on_cpu` was
+                        // still set, so the waker deferred the enqueue to us
+                        // (see step 4 in `wake_task_v2`).  `saved_rsp` is now
+                        // published and `on_cpu` cleared above, so it is safe
+                        // to enqueue.  Both the waker's CAS and this check run
+                        // under SCHEDULER.lock, so exactly one of the two paths
+                        // performs the enqueue.
+                        Some((task.assigned_core, sidx))
                     } else {
                         None
                     }
@@ -5799,6 +5938,14 @@ static DISPATCH_DUMP_FIRED: core::sync::atomic::AtomicBool =
 /// Acquires `SCHEDULER.lock` briefly to snapshot task state, then releases
 /// it before walking per-core run queues so the dump never holds the
 /// scheduler lock while iterating IRQ-shared `run_queue` mutexes.
+/// Public trigger for the per-core dispatch-state dump. Used by `sys_ktrace`
+/// (`ktrace cores`) to name the task holding a core in ring 0 — and the
+/// freshly-Ready tasks piled up behind it — while an interactive session is
+/// wedged. Prints to serial via `log::warn!`.
+pub fn ktrace_dump_dispatch_state() {
+    dump_dispatch_state();
+}
+
 fn dump_dispatch_state() {
     let n_cores = crate::smp::core_count();
 

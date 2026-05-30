@@ -172,6 +172,33 @@ impl Executor {
             }
         }
     }
+
+    /// Idle-liveness backstop: force every live task to re-poll from its
+    /// current await point by marking it woken and queueing it.
+    ///
+    /// `block_on` calls this only after several consecutive empty reactor
+    /// polls (a genuine stall, not normal idle). It exists because the
+    /// executor is otherwise *purely* edge-driven: a task only re-runs when a
+    /// waker fires, so a single transient missed I/O-readiness edge (e.g. a
+    /// PTY-master `POLLHUP` that fails to wake the sshd relay parked in
+    /// `WaitWake`) would stall the whole session **forever** with the reactor
+    /// spinning its 100 ms timeout finding nothing ready. Re-polling parked
+    /// tasks lets level-triggered work re-check its condition directly —
+    /// `WaitWake` returns `Ready` once registered, the sshd relay then reaches
+    /// its `waitpid(WNOHANG)` exit backstop — converting a permanent hang into
+    /// bounded (~hundreds-of-ms) recovery. See
+    /// docs/handoffs/2026-05-29-ssh-disconnect-lost-wakeup.md.
+    fn requeue_all(&mut self) {
+        for i in 0..self.high_water {
+            if let Some(slot) = self.tasks.get(i) {
+                slot.header.mark_woken();
+                if !slot.header.is_queued() {
+                    slot.header.mark_queued();
+                    self.run_queue.push_back(i);
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -204,6 +231,27 @@ pub fn block_on<F: Future>(reactor: &mut Reactor, future: F) -> F::Output {
     let root_header = Arc::new(TaskHeader::new());
     let mut future = core::pin::pin!(future);
 
+    // Consecutive blocking reactor polls that timed out with nothing woken.
+    // After `stall_threshold` of these (~ticks × 100 ms) the executor assumes a
+    // wake edge was lost and force-re-polls every parked task (see
+    // `Executor::requeue_all`).
+    //
+    // `stall_threshold` starts at the fast base (300 ms) so a genuine lost edge
+    // — the SSH-disconnect PTY-HUP this backstop exists for — is recovered
+    // promptly on first occurrence. But a *healthy* idle session has no edge to
+    // recover, so an un-backed-off backstop would force-re-poll every parked
+    // task every 300 ms for the whole session lifetime (a permanent ~3 Hz
+    // syscall burn). So we DOUBLE the threshold on each fire (capped at ~30 s),
+    // decaying steady-state idle to an occasional heartbeat, and RESET to the
+    // base on genuine external activity. `settle` suppresses that reset for the
+    // couple of iterations our own `requeue_all` batch takes to drain, so the
+    // forced re-poll is not mistaken for real progress.
+    let mut idle_ticks: u32 = 0;
+    const LIVENESS_STALL_TICKS_BASE: u32 = 3; // ~300 ms
+    const LIVENESS_STALL_TICKS_MAX: u32 = 300; // ~30 s heartbeat
+    let mut stall_threshold: u32 = LIVENESS_STALL_TICKS_BASE;
+    let mut settle: u32 = 0;
+
     let result = loop {
         // 1. Poll spawned tasks first (they may wake the root future)
         executor.poll_spawned_tasks();
@@ -235,7 +283,35 @@ pub fn block_on<F: Future>(reactor: &mut Reactor, future: F) -> F::Output {
         if executor.run_queue.is_empty() && !root_header.is_woken() {
             reactor.poll_once(100);
             executor.requeue_woken();
+
+            // Idle-liveness backstop. If the blocking poll keeps timing out
+            // with nothing woken, a wake edge was likely lost; force every
+            // parked task to re-poll so level-triggered work (e.g. the sshd
+            // relay's PTY-HUP / waitpid exit detection) recovers within a
+            // bounded window instead of hanging forever.
+            if executor.run_queue.is_empty() && !root_header.is_woken() {
+                idle_ticks += 1;
+                if idle_ticks >= stall_threshold {
+                    idle_ticks = 0;
+                    executor.requeue_all();
+                    root_header.mark_woken();
+                    // Back off so a healthy idle session decays to a heartbeat
+                    // rather than a permanent 3 Hz re-poll; `settle` ignores the
+                    // run_queue churn from this forced requeue on the next
+                    // iterations so it isn't read as genuine progress.
+                    stall_threshold = (stall_threshold * 2).min(LIVENESS_STALL_TICKS_MAX);
+                    settle = 2;
+                }
+            } else if settle == 0 {
+                // A real reactor event broke the idle → return to fast cadence.
+                idle_ticks = 0;
+                stall_threshold = LIVENESS_STALL_TICKS_BASE;
+            }
+        } else if settle == 0 {
+            idle_ticks = 0;
+            stall_threshold = LIVENESS_STALL_TICKS_BASE;
         }
+        settle = settle.saturating_sub(1);
     };
 
     set_executor_ptr(prev_executor);
@@ -404,6 +480,52 @@ mod tests {
             outer.await.unwrap()
         });
         assert_eq!(result, 8);
+    }
+
+    // Idle-liveness backstop: a spawned task whose readiness edge is lost
+    // (it becomes ready but never arranges a wake) must still complete via the
+    // executor's force-re-poll, not hang forever. Models the sshd relay missing
+    // a PTY-master POLLHUP edge during exit teardown.
+    #[test]
+    fn test_idle_liveness_backstop_recovers_lost_wake() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct StalledUntilFlag(Arc<AtomicBool>);
+        impl Future for StalledUntilFlag {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                // Deliberately register NO waker: the only way this ever
+                // completes is the executor re-polling it (the backstop).
+                if self.0.load(Ordering::Acquire) {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag2 = flag.clone();
+        // Flip the flag from another thread WITHOUT waking the task.
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            flag2.store(true, Ordering::Release);
+        });
+
+        let mut reactor = Reactor::new();
+        let start = Instant::now();
+        block_on(&mut reactor, async move {
+            spawn(StalledUntilFlag(flag)).await.unwrap();
+        });
+        let elapsed = start.elapsed();
+        // Without the backstop this hangs forever; with it, recovery is bounded
+        // (~LIVENESS_STALL_TICKS_BASE × 100 ms plus the 50 ms flag delay — the
+        // first fire is always at the fast base threshold, before any backoff).
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "liveness backstop did not recover a lost wake: {:?}",
+            elapsed
+        );
     }
 
     // T007.3: spawn 10 tasks, each returning their index
@@ -592,6 +714,7 @@ mod tests {
 
         let ran = Arc::new(AtomicBool::new(false));
         let ran2 = ran.clone();
+        let ran3 = ran.clone();
 
         let mut reactor = Reactor::new();
         block_on(&mut reactor, async move {
@@ -613,7 +736,7 @@ mod tests {
 
             // Keep the root future alive for another executor turn.
             poll_fn(|cx| {
-                if ran.load(Ordering::Acquire) {
+                if ran3.load(Ordering::Acquire) {
                     Poll::Ready(())
                 } else {
                     cx.waker().wake_by_ref();

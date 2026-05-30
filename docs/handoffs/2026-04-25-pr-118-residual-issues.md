@@ -1,7 +1,26 @@
 # Handoff: PR #118 residual issues — SSH disconnect hang + nanosleep starvation
 
-**Status:** Open. Both issues block PR #118 ("Phase 55c: close ring-3 driver
-correctness gaps") from being merge-ready.
+**Resolution (Phase 77 Track A, 2026-05-28):** RESOLVED.
+- *SSH disconnect hang:* root-caused to a lost futex wakeup, not a teardown-only
+  race. `sshd` reaps its session via musl pthreads, whose `__thread_list_lock`
+  (the `CLONE_CHILD_CLEARTID` target) is waited as a **non-private** futex, but
+  `do_clear_child_tid` woke only the **private** key — so the lock-release wake
+  was lost and the reaper hung. Fixed by waking both futex keys (commit
+  `b6f517b`), plus the scheduler `on_cpu` wake/defer fix and the EOF-driven
+  `sshd::cleanup` ordering (commit `6f57fbc`). `cargo xtask regression --test
+  serverization-fallback` now passes **10/10** consecutive runs.
+- *nanosleep starvation:* the dead v1 long-sleep yield branch was removed and the
+  uncalibrated-TSC fallback documented as a boot-window-only path (commit
+  `6f57fbc`); the ≥1 ms sched-v2 path blocks on `block_current_until`. PID 1 is
+  not starved across the smoke/regression suites.
+
+**Status:** RESOLVED (Phase 77 Track A, 2026-05-28 — see the Resolution block
+above; commits `b6f517b` + `6f57fbc`, referenced by task A.1 in
+`docs/roadmap/tasks/77-pre-1-0-cleanup-tasks.md`). The text below is the
+original cold-start handoff, retained for historical context.
+
+~~Open. Both issues block PR #118 ("Phase 55c: close ring-3 driver
+correctness gaps") from being merge-ready.~~
 
 **Branch:** `feat/phase-55c-ring3-driver-closure` (HEAD: `f877af7`)
 

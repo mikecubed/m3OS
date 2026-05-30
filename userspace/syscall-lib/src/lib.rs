@@ -2530,19 +2530,102 @@ pub fn meminfo(buf: &mut [u8]) -> usize {
     unsafe { syscall2(SYS_MEMINFO, buf.as_mut_ptr() as u64, buf.len() as u64) as usize }
 }
 
-/// Read trace ring entries from a specific core into a byte buffer.
+/// ktrace command codes (arg0 of `SYS_KTRACE`). Keep in sync with the kernel.
+pub const KTRACE_READ_CORE: u64 = 0;
+pub const KTRACE_ARM: u64 = 1;
+pub const KTRACE_DISARM: u64 = 2;
+pub const KTRACE_READ_FOCUS: u64 = 3;
+pub const KTRACE_FOCUS_LEN: u64 = 4;
+pub const KTRACE_TASKS: u64 = 5;
+pub const KTRACE_DUMP_SERIAL: u64 = 6;
+pub const KTRACE_DUMP_CORES: u64 = 7;
+pub const KTRACE_DUMP_TASKS_SERIAL: u64 = 8;
+
+/// Read raw `TraceEntry` records from a specific core's ring into a byte buffer
+/// (legacy/compat path).
 ///
-/// Returns the number of `TraceEntry`-sized records written on success.
-/// Returns `u64::MAX` on invalid core ID or null buffer pointer.
-/// Returns `0` when `buf` is zero-length.
+/// Returns the number of records written on success, `u64::MAX` on invalid core
+/// ID or null buffer, `0` when `buf` is zero-length.
 ///
-/// If the kernel is built without the `trace` feature, syscall `0x1002` is
-/// not registered and this returns the raw `-ENOSYS` value as `u64`.
+/// If the kernel is built without the `trace` feature, syscall `0x1002` is not
+/// registered and this returns the raw `-ENOSYS` value as `u64`.
 pub fn ktrace(core_id: u32, buf: &mut [u8]) -> u64 {
+    unsafe {
+        syscall4(
+            SYS_KTRACE,
+            KTRACE_READ_CORE,
+            core_id as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        )
+    }
+}
+
+/// Arm the deep focus trace ring on up to 8 target pids. Returns the number of
+/// task indices resolved (0 if none matched), or `u64::MAX` on error.
+pub fn ktrace_arm(pids: &[u32]) -> u64 {
     unsafe {
         syscall3(
             SYS_KTRACE,
-            core_id as u64,
+            KTRACE_ARM,
+            pids.as_ptr() as u64,
+            pids.len() as u64,
+        )
+    }
+}
+
+/// Disarm the focus trace ring (its contents remain readable until re-armed).
+pub fn ktrace_disarm() -> u64 {
+    unsafe { syscall1(SYS_KTRACE, KTRACE_DISARM) }
+}
+
+/// Dump the entire focus ring to the kernel serial console (always available,
+/// even while the userspace I/O path is wedged). Returns entries dumped.
+pub fn ktrace_dump_serial() -> u64 {
+    unsafe { syscall1(SYS_KTRACE, KTRACE_DUMP_SERIAL) }
+}
+
+/// Dump per-core dispatch state (current task + run queue per core, and every
+/// Ready/Running task) to the kernel serial console. Returns 0.
+pub fn ktrace_dump_cores() -> u64 {
+    unsafe { syscall1(SYS_KTRACE, KTRACE_DUMP_CORES) }
+}
+
+/// Dump every live task's state (including Blocked) to the kernel serial
+/// console. Lightweight; distinguishes a lost wake from dispatch starvation.
+/// Returns the task count.
+pub fn ktrace_dump_tasks_serial() -> u64 {
+    unsafe { syscall1(SYS_KTRACE, KTRACE_DUMP_TASKS_SERIAL) }
+}
+
+/// Current number of entries in the focus trace ring.
+pub fn ktrace_focus_len() -> u64 {
+    unsafe { syscall1(SYS_KTRACE, KTRACE_FOCUS_LEN) }
+}
+
+/// Read annotated focus-ring text lines starting at entry index `offset` into
+/// `buf` (NUL-terminated). Returns the number of entries written this call;
+/// page by advancing `offset` until it returns 0.
+pub fn ktrace_read_focus(offset: u64, buf: &mut [u8]) -> u64 {
+    unsafe {
+        syscall4(
+            SYS_KTRACE,
+            KTRACE_READ_FOCUS,
+            offset,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        )
+    }
+}
+
+/// Read the live task table as text (idx pid state prio core name) into `buf`
+/// (NUL-terminated). Returns the number of rows.
+pub fn ktrace_tasks(buf: &mut [u8]) -> u64 {
+    unsafe {
+        syscall4(
+            SYS_KTRACE,
+            KTRACE_TASKS,
+            0,
             buf.as_mut_ptr() as u64,
             buf.len() as u64,
         )

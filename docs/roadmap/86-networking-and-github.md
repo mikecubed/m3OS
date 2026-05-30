@@ -66,11 +66,63 @@ This phase should define where DNS configuration lives, how certificates or trus
 
 ### git remote transport path
 
-Remote git support is where local toolchains, auth, and network transport meet. The project should document the chosen transport strategy clearly enough that future developer workflows build on it without guesswork.
+Remote git support is where local toolchains, auth, and network transport meet. The project should document the chosen transport strategy clearly enough that future developer workflows build on it without guesswork. **A concrete, source-verified transport strategy is captured below in [Pre-Planning Findings](#pre-planning-findings-2026-05-29--secure-transport-track) — read it before scoping this section.**
 
 ### GitHub CLI workflow integration
 
 The GitHub CLI is a useful test because it exercises authenticated HTTPS, API access, and a realistic modern developer workflow end-to-end.
+
+## Pre-Planning Findings (2026-05-29) — secure-transport track
+
+Source-verified during the Phase 77 review cycle. Captured here so the transport
+strategy is not re-discovered from scratch when this phase is scoped.
+
+### What already exists (foundation is ~70% there)
+
+| Building block | Status |
+|---|---|
+| DNS forward resolution (`getaddrinfo`/A records, IPv4/UDP) | ✅ Phase 77 D.1 — the kernel reply-delivery gap (musl drains replies via `recvmsg`, not `recvfrom`) was closed by `sys_recvmsg_inet` (commit `8303990`). No caching / search-domains / AAAA / DNSSEC yet. |
+| Outbound TCP `connect()` active-open + RFC 6298 retransmit + flow control + 64 conns | ✅ Phase 77 D.2 + `sys_connect` → `tcp::connect` |
+| `zlib` (packfile inflate) | ✅ `ports/lib/zlib` |
+| `sunset` — full SSH **client**+server, `no_std` | ✅ pulls X25519, Ed25519, AES, ChaCha20-Poly1305, SHA-2, HMAC, RSA |
+| musl cross-toolchain + `ports/` build infra | ✅ |
+
+### Recommended strategy: SSH-first, then HTTPS
+
+The genuinely *minimal secure* first clone is **SSH, not HTTPS**, because it reuses the
+in-tree audited `sunset` crypto and skips the entire X.509/CA/HTTP stack.
+
+| Milestone | Work | Reuses | Effort / risk |
+|---|---|---|---|
+| **M0** prove outbound INET | smoke test: `connect()` to a SLIRP-forwarded host, exchange bytes | DNS, TCP connect | S / low (mostly verification) |
+| **M1** `ssh` client binary | build a userspace `ssh` from `sunset` (client role exists): connect → X25519 KEX → host-key TOFU → `known_hosts` → pubkey auth → session channel → exec + stdio pipe | sunset crypto/KEX/auth | S–M / **low** (audited crypto) — reusable beyond git |
+| **M2** git over SSH (the elegant shortcut) | port upstream git against musl with **`NO_CURL NO_OPENSSL`** (links `zlib`); git's SSH transport shells out to the `ssh` binary and runs `git-upload-pack` remotely — **we write no git-protocol/packfile code** | upstream git, zlib, M1 | M–L / med (build config; packfile is git's own code) — *first working secure `git clone`* |
+| **M3** HTTPS (the real lift, last) | TLS 1.3 client (one suite) + **X.509 chain validation + CA bundle + hostname verify** + HTTP/1.1 (chunked) + git smart-HTTP; rebuild git with curl+TLS | sunset primitives, git http transport | **L / med–high** — X.509/CA-trust correctness is the classic footgun |
+
+### TLS library decision (for M3)
+
+Do **not** hand-roll TLS. Two m3OS constraints pin the choice:
+
+1. **SIMD is off** (`+soft-float`, no SSE/AES-NI) → rules out `ring` / `aws-lc-rs` (asm/C/SIMD).
+   Pure-Rust RustCrypto software backends work here (proven by `sunset`). See
+   [`docs/research/simd-enablement.md`](../research/simd-enablement.md) — enabling SIMD is a
+   tracked future perf option, **not** a TLS prerequisite (its payoff is hardware AES-NI throughput).
+2. **Cert-expiry validation needs a trustworthy wall-clock.** `kernel/src/rtc.rs` provides
+   `BOOT_EPOCH_SECS` but falls back to 0 on an invalid RTC; a current-time source
+   (`BOOT_EPOCH + monotonic`) is a prerequisite for *any* TLS option.
+
+| Option | Fit | Catch |
+|---|---|---|
+| **mbedTLS + curl** (C ports) | **Best for the real git binary** — full X.509, portable C crypto (no SIMD dep), drops into the existing musl `ports/` pipeline next to `zlib` | C, not Rust — but git's HTTPS expects curl + a C TLS lib anyway |
+| **rustls + `rustls-rustcrypto` + `rustls-webpki` + `webpki-roots`** | "Correct" Rust path; `rustls-webpki` does chain validation, `webpki-roots` is the CA set | `rustls-rustcrypto` is experimental + still std-leaning (no_std WIP) |
+| **`embedded-tls`** | Lightest `no_std` TLS 1.3 client on RustCrypto | its cert verifier is **std-only** today — pair with `rustls-webpki` yourself |
+
+### Phasing note
+
+This belongs here (Phase 86, with the git binary in Phase 85), **not** as a "Phase 77b" —
+HTTPS/TLS + git is a post-1.0 headline capability, explicitly deferred behind the Phase 83
+release gate. The git binary build (`NO_CURL NO_OPENSSL` + ssh transport) is Phase 85's
+concern; the transport (ssh client, then HTTPS) is this phase's.
 
 ## How This Builds on Earlier Phases
 

@@ -114,6 +114,6 @@ The `clear_child_tid` field stores a userspace address provided at `clone(CLONE_
 
 ## Deferred Until Later
 
-- Moving `syscall_user_rsp` to task-owned state (Phase 52b structural hardening)
-- Typed `UserBuffer` wrappers to make `copy_to_user` auditable (Phase 52b)
+- Moving `syscall_user_rsp` to task-owned state (Phase 52b structural hardening) — **✅ delivered** (`UserReturnState` is task-owned; the scheduler restores `user_rsp`/`kernel_stack_top`/`fs_base`/`cr3_phys` from it; closed end-to-end by Phase 52d's completion audit).
+- Typed `UserBuffer` wrappers to make `copy_to_user` auditable (Phase 52b) — **✅ delivered** (`UserSliceRo`/`UserSliceWo`/`UserSliceRw` in `kernel/src/mm/user_mem.rs`).
 - AddressSpace object for the underlying mapping divergence (Phase 52b)

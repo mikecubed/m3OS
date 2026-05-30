@@ -689,6 +689,16 @@ fn virtio_blk_irq_handler() {
             None
         }
     };
+    // Diagnostic: classify each blk IRQ as a real completion (drain_used
+    // returned a waiter to wake) vs spurious (used ring empty). A storm of
+    // `id=0` ⇒ QEMU re-delivering the MSI with nothing used (a real MSI-X bug);
+    // a flood of `id=1` ⇒ legitimately heavy disk I/O. Gated behind
+    // `net-rx-trace` (default OFF) — investigation-only.
+    #[cfg(feature = "net-rx-trace")]
+    crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::Wakeup {
+        kind: 8,
+        id: u32::from(completed.is_some()),
+    });
     if let Some(task) = completed {
         let _ = crate::task::scheduler::wake_task_v2(task);
     }
