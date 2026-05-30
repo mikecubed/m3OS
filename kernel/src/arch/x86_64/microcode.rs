@@ -3,8 +3,9 @@
 //! Applies a vendor microcode patch on every CPU at boot. The embedded blob is
 //! an AMD `amd-ucode` container (the dev machine is `AuthenticAMD`); parsing is
 //! done by the host-tested `kernel_core::microcode` pure-logic module, and the
-//! application is the AMD `MSR_AMD64_PATCH_LOADER` (`0xC0010020`) write with the
-//! patch level read back from `0x8B`.
+//! application is the AMD `MSR_AMD64_PATCH_LOADER` (`0xC0010020`) write (of a
+//! 16-byte-aligned copy of the patch payload) with the patch level read back
+//! from `0x8B` and **verified** against the expected revision.
 //!
 //! **Safety / QEMU behaviour:** the patch-loader MSR is written ONLY when the
 //! running CPU's signature matches an entry in the blob's equivalence table AND
@@ -62,22 +63,57 @@ pub fn apply_microcode_on_cpu(cpu_id: u8) {
     match kernel_core::microcode::find_applicable_amd_patch(AMD_UCODE, sig, current) {
         Some(patch) => {
             // The AMD patch loader takes the virtual address of the patch
-            // payload (the patch header). The embedded blob lives in the
-            // kernel's identity/higher-half image, so its `.as_ptr()` is a
-            // valid VA for the loader.
-            let patch_va = AMD_UCODE.as_ptr() as u64 + patch.data_offset as u64;
+            // payload, and the AMD hardware loader requires that address to be
+            // **16-byte aligned**. The embedded blob is an `include_bytes!`
+            // `&[u8]` (alignment 1), and the patch payload sits at a non-16-
+            // aligned intra-blob offset (`20 + equiv_table_len`, i.e. ≡ 4 mod
+            // 16), so `AMD_UCODE.as_ptr() + data_offset` is never suitably
+            // aligned — passing it directly would make the load silently no-op
+            // or `#GP` on real AMD silicon. Linux copies the patch out of the
+            // container for the same reason; mirror that here with a 16-byte-
+            // aligned scratch buffer (a `Vec<u128>` is 16-aligned on x86_64).
+            let end = patch.data_offset + patch.data_len;
+            let src = &AMD_UCODE[patch.data_offset..end];
+            let words = patch.data_len.div_ceil(16).max(1);
+            let mut aligned: alloc::vec::Vec<u128> = alloc::vec![0u128; words];
+            // SAFETY: `aligned` owns `words * 16` bytes; we view them as `u8` to
+            // copy the patch payload in. The buffer is 16-byte aligned because
+            // `u128`'s alignment is 16.
+            let aligned_bytes = unsafe {
+                core::slice::from_raw_parts_mut(aligned.as_mut_ptr() as *mut u8, words * 16)
+            };
+            aligned_bytes[..patch.data_len].copy_from_slice(src);
+            let patch_va = aligned.as_ptr() as u64;
+            debug_assert_eq!(
+                patch_va % 16,
+                0,
+                "AMD patch loader address must be 16-aligned"
+            );
             // SAFETY: 0xC0010020 is the AMD patch-loader MSR; `patch_va` points
-            // at a validated, in-bounds patch payload within the embedded blob.
+            // at a 16-byte-aligned copy of a validated, in-bounds patch payload,
+            // and stays live until after this synchronous WRMSR consumes it.
             // Reached only on an exact equivalence + strictly-newer-revision
             // match, so it never fires on QEMU's virtual CPU.
             unsafe {
                 Msr::new(MSR_AMD64_PATCH_LOADER).write(patch_va);
             }
             let new_level = read_patch_level();
-            log::info!(
-                "[ucode] CPU{cpu_id} sig={sig:#x}: applied patch {:#x} (level {current:#x} -> {new_level:#x})",
-                patch.patch_id
-            );
+            // Verify the apply actually took effect: on success MSR 0x8B now
+            // reflects the patch revision. An unchanged level means the load was
+            // rejected (e.g. address/format) — surface it instead of logging a
+            // misleading "applied". `aligned` is dropped after this point.
+            if new_level == patch.patch_id {
+                log::info!(
+                    "[ucode] CPU{cpu_id} sig={sig:#x}: applied patch {:#x} (level {current:#x} -> {new_level:#x})",
+                    patch.patch_id
+                );
+            } else {
+                log::warn!(
+                    "[ucode] CPU{cpu_id} sig={sig:#x}: patch {:#x} apply did NOT take effect (level still {new_level:#x}, expected {:#x})",
+                    patch.patch_id,
+                    patch.patch_id
+                );
+            }
         }
         None => {
             log::info!(
