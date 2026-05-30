@@ -487,6 +487,14 @@ fn task_snapshot(pid: u32, tid: u32) -> Option<ProcessSnapshot> {
 /// inversion.
 fn live_process_state(tids: &[u32], fallback: ProcessState) -> ProcessState {
     use crate::task::TaskState;
+    // `Stopped` and `Zombie` are authoritative on `Process.state`, not on the
+    // scheduler. m3OS implements SIGSTOP as a `yield_now()` spin that keeps the
+    // scheduler task `Ready`/`Running`, so `task_state_for_group` would map a
+    // stopped process to `R (running)`. Trust the snapshot for these two states
+    // before consulting the live scheduler (which can only report run-state).
+    if matches!(fallback, ProcessState::Stopped | ProcessState::Zombie) {
+        return fallback;
+    }
     match crate::task::scheduler::task_state_for_group(tids) {
         Some(TaskState::Running) => ProcessState::Running,
         Some(TaskState::Ready) => ProcessState::Ready,
