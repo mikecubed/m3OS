@@ -631,18 +631,6 @@ pub fn sys_device_claim(segment: u16, bus: u8, dev: u8, func: u8) -> isize {
         } else {
             match claim_pci_device_by_bdf(segment, bus, dev, func, RING3_DRIVER_TAG) {
                 Ok(handle) => {
-                    // Phase 78a Track B.1 — enable PCI I/O Space + Memory Space +
-                    // Bus Master for the claimed device. The ring-3 claim path
-                    // previously left the Command register untouched: fine for the
-                    // in-kernel virtio drivers (which set the bits themselves) but
-                    // fatal for a pure bus-master DMA device like xHCI, which DMAs
-                    // nothing and posts zero events until Bus Master Enable
-                    // (Command reg 0x04 bit 2) is set, and whose memory-mapped BAR0
-                    // (operational registers + MSI-X table) is only decoded once
-                    // Memory Space (bit 1) is set. Bit 0 (I/O Space) covers
-                    // I/O-BAR device classes like AC97. Done before the IOMMU
-                    // coverage install so a later `Run` cannot precede BME.
-                    enable_bus_master_and_memory_space(&handle, segment, bus, dev, func);
                     // D.3 — Install IOMMU BAR identity maps and verify coverage
                     // before committing the claim. If coverage validation fails,
                     // `handle` is dropped here (tearing down the IOMMU domain and
@@ -654,7 +642,39 @@ pub fn sys_device_claim(segment: u16, bus: u8, dev: u8, func: u8) -> isize {
                         Err(e)
                     } else {
                         match reg.insert_claim(pid, key, handle) {
-                            Ok(()) => Ok(()),
+                            Ok(()) => {
+                                // Phase 78a Track B.1 — enable PCI I/O Space +
+                                // Memory Space + Bus Master, but only after the
+                                // claim is committed in the registry and its IOMMU
+                                // coverage verified. A pure bus-master DMA device
+                                // like xHCI DMAs nothing and posts zero events until
+                                // Bus Master Enable (Command reg 0x04 bit 2) is set,
+                                // and its memory-mapped BAR0 (operational registers
+                                // + MSI-X table) is only decoded once Memory Space
+                                // (bit 1) is set; bit 0 (I/O Space) covers I/O-BAR
+                                // classes like AC97. Enabling these only on the
+                                // registry-owned handle is what makes it safe: no
+                                // earlier failure path (claim, coverage, or
+                                // insert_claim) can drop the handle — tearing down
+                                // its IOMMU domain — while leaving decode/bus-master
+                                // set, because the bits are not set yet. The one
+                                // later failure path that drops a committed handle
+                                // (a failed `insert_cap` below) is covered by
+                                // `PciDeviceHandle::drop`, which clears these bits
+                                // before destroying the domain. Bring-up timing is
+                                // unaffected: the driver does not issue `Run` until
+                                // several later syscalls.
+                                if let Some(slot) = reg.slot_for(pid, key) {
+                                    enable_bus_master_and_memory_space(
+                                        &slot.handle,
+                                        segment,
+                                        bus,
+                                        dev,
+                                        func,
+                                    );
+                                }
+                                Ok(())
+                            }
                             Err(e) => Err(DeviceHostError::from(e)),
                         }
                     }

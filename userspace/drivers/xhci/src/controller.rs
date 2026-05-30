@@ -109,6 +109,7 @@ const POLL_BUDGET: u32 = 5_000_000;
 /// Outcome of the bring-up sequence: either the controller is live (with the
 /// IRQ subscription handed to the event loop) or a stage failed.
 pub enum BringUpError {
+    BiosHandoffTimeout,
     ResetTimeout,
     RunTimeout,
     DmaAlloc,
@@ -228,12 +229,17 @@ impl Controller {
     /// present, request OS ownership and poll until the BIOS-owned bit
     /// clears. `qemu-xhci` advertises no USBLEGSUP, so this is a documented
     /// no-op there; the walk is implemented for real hardware.
-    pub fn release_bios_ownership(&self) {
+    ///
+    /// Returns [`BringUpError::BiosHandoffTimeout`] if the poll budget is
+    /// exhausted while the controller is still BIOS-owned — proceeding into
+    /// reset/run in that state is exactly what the handoff exists to prevent,
+    /// so it is surfaced as a bring-up failure rather than a logged success.
+    pub fn release_bios_ownership(&self) -> Result<(), BringUpError> {
         let mut off = match self.xecp_off {
             Some(o) => o,
             None => {
                 write_str(STDOUT_FILENO, "[xhci] no extended capabilities\n");
-                return;
+                return Ok(());
             }
         };
         // Bounded walk: the list is short and `next == 0` terminates it; the
@@ -253,9 +259,20 @@ impl Controller {
                     while self.bar.read_reg::<u32>(off) & USBLEGSUP_BIOS_OWNED != 0 && budget > 0 {
                         budget -= 1;
                     }
+                    // If the BIOS-owned bit never cleared, the handoff failed.
+                    // Treating the timeout as success would let bring-up proceed
+                    // into HCRST/Run while the controller is still BIOS-owned —
+                    // surface it as a failure so the driver aborts instead.
+                    if self.bar.read_reg::<u32>(off) & USBLEGSUP_BIOS_OWNED != 0 {
+                        write_str(
+                            STDOUT_FILENO,
+                            "[xhci] BIOS/OS handoff timed out (still BIOS-owned)\n",
+                        );
+                        return Err(BringUpError::BiosHandoffTimeout);
+                    }
                 }
                 write_str(STDOUT_FILENO, "[xhci] BIOS/OS handoff complete\n");
-                return;
+                return Ok(());
             }
             if next == 0 {
                 break;
@@ -269,6 +286,7 @@ impl Controller {
             STDOUT_FILENO,
             "[xhci] no USBLEGSUP (no BIOS handoff needed)\n",
         );
+        Ok(())
     }
 
     /// Stop the controller (if running) and issue `HCRST`, then wait for the
@@ -352,11 +370,18 @@ impl Controller {
     }
 
     fn page_size(&self) -> usize {
+        // PAGESIZE bits[15:0] are a *bitmask* of supported page sizes: bit n set
+        // means the controller supports a 2^(n+12)-byte page. More than one bit
+        // may be set, so software must select a single supported size — shifting
+        // the whole mask would yield a non-power-of-two (e.g. bits 0|1 -> 12 KiB)
+        // that the DMA allocator rejects as a scratchpad alignment. Pick the
+        // lowest supported size (smallest is always a valid choice, and matches
+        // what the Linux xhci driver selects).
         let pagesize = self.op_u32(op_reg::PAGESIZE) & 0xFFFF;
         if pagesize == 0 {
             4096
         } else {
-            (pagesize as usize) << 12
+            4096usize << pagesize.trailing_zeros()
         }
     }
 

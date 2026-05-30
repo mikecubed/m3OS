@@ -150,7 +150,9 @@ fn program_main(_args: &[&str]) -> i32 {
     // DCBAA(+scratchpad) → command ring → event ring(ERST) → MSI-X
     // interrupter → run → Enable Slot. Any stage failure exits non-zero so
     // the service manager observes it.
-    controller.release_bios_ownership();
+    if let Err(e) = controller.release_bios_ownership() {
+        return bringup_failed(e);
+    }
     if let Err(e) = controller.reset() {
         return bringup_failed(e);
     }
@@ -188,6 +190,10 @@ fn program_main(_args: &[&str]) -> i32 {
 #[cfg(not(test))]
 fn bringup_failed(err: BringUpError) -> i32 {
     let (msg, code) = match err {
+        BringUpError::BiosHandoffTimeout => (
+            "xhci_driver: BIOS/OS handoff timeout (still BIOS-owned)\n",
+            9,
+        ),
         BringUpError::ResetTimeout => ("xhci_driver: controller reset timeout\n", 5),
         BringUpError::RunTimeout => ("xhci_driver: controller run timeout (HCH stuck)\n", 6),
         BringUpError::DmaAlloc => ("xhci_driver: DMA allocation failed\n", 7),
