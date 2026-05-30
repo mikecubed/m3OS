@@ -47,8 +47,8 @@ impl<'c> XhciHostOps<'c> {
     /// The state machine builds `ep0_dequeue_ptr = ep_tr_dequeue_ptr(ctx.ep0_ring_iova)`;
     /// when `ctx.ep0_ring_iova` is 0 (seeded before alloc_slot_context), the
     /// snapshot has `ep0_dequeue_ptr = 1`. We patch it here.
-    fn patched_snapshot(&self, snap: &InputContextSnapshot) -> InputContextSnapshot {
-        let real_iova = self.controller.ep0_ring_iova();
+    fn patched_snapshot(&self, slot_id: u8, snap: &InputContextSnapshot) -> InputContextSnapshot {
+        let real_iova = self.controller.ep0_ring_iova(slot_id);
         let mut patched = snap.clone();
         patched.ep0_dequeue_ptr = ep_tr_dequeue_ptr(real_iova);
         patched
@@ -74,8 +74,8 @@ impl UsbHostOps for XhciHostOps<'_> {
 
     fn address_device(&mut self, slot_id: u8, ctx: &InputContextSnapshot, bsr: bool) -> u8 {
         // Patch the EP0 dequeue pointer to reflect the real allocated ring.
-        let patched = self.patched_snapshot(ctx);
-        let input_ctx_iova = self.controller.write_input_context(&patched);
+        let patched = self.patched_snapshot(slot_id, ctx);
+        let input_ctx_iova = self.controller.write_input_context(slot_id, &patched);
         let cycle = self.controller.producer_cycle();
         let cmd = trb::Trb::address_device(input_ctx_iova, slot_id, bsr, cycle);
         let ev = self.controller.issue_command_and_wait(self.irq, cmd);
@@ -84,8 +84,8 @@ impl UsbHostOps for XhciHostOps<'_> {
 
     fn evaluate_context(&mut self, slot_id: u8, ctx: &InputContextSnapshot) -> u8 {
         // Patch the EP0 dequeue pointer to reflect the real allocated ring.
-        let patched = self.patched_snapshot(ctx);
-        let input_ctx_iova = self.controller.write_input_context(&patched);
+        let patched = self.patched_snapshot(slot_id, ctx);
+        let input_ctx_iova = self.controller.write_input_context(slot_id, &patched);
         let cycle = self.controller.producer_cycle();
         let cmd = trb::Trb::evaluate_context(input_ctx_iova, slot_id, cycle);
         let ev = self.controller.issue_command_and_wait(self.irq, cmd);
@@ -133,12 +133,15 @@ impl UsbHostOps for XhciHostOps<'_> {
         // placeholder IOVAs of 0; we replace them with real DMA ring addresses.
         // A1 (EP0) is no longer included in add_flags from kernel-core
         // (build_configure_endpoint_ctx fix), so no workaround needed here.
-        let mut patched = self.patched_snapshot(ctx);
+        let mut patched = self.patched_snapshot(slot_id, ctx);
         for ep_snap in &mut patched.endpoint_contexts {
             // MPS lives at bits 31:16 of ep_dword1 (same layout the controller
             // writes into the endpoint context).
             let mps = (ep_snap.ep_dword1 >> 16) as u16;
-            match self.controller.alloc_interrupt_ep_ring(ep_snap.dci, mps) {
+            match self
+                .controller
+                .alloc_interrupt_ep_ring(slot_id, ep_snap.dci, mps)
+            {
                 Ok(iova_dcs) => {
                     ep_snap.ep_dequeue_ptr = iova_dcs;
                 }
@@ -151,7 +154,7 @@ impl UsbHostOps for XhciHostOps<'_> {
                 }
             }
         }
-        let input_ctx_iova = self.controller.write_input_context(&patched);
+        let input_ctx_iova = self.controller.write_input_context(slot_id, &patched);
         let cycle = self.controller.producer_cycle();
         let cmd = trb::Trb::configure_endpoint(input_ctx_iova, slot_id, cycle);
         let ev = self.controller.issue_command_and_wait(self.irq, cmd);

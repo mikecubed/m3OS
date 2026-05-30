@@ -80,6 +80,9 @@ pub struct AttachNotice {
     pub ep_in_mps: u16,
     /// `bInterval` of that interrupt-IN endpoint (0 if `ep_in_dci == 0`).
     pub ep_in_interval: u8,
+    /// `bInterfaceNumber` of the HID interface — the `wIndex` a class driver
+    /// uses for `SET_PROTOCOL` / `SET_IDLE`.
+    pub interface_num: u8,
 }
 
 // ---------------------------------------------------------------------------
@@ -425,7 +428,7 @@ impl<'a> Reader<'a> {
 
 impl AttachNotice {
     /// Fixed encoded length of an [`AttachNotice`] on the wire.
-    pub const WIRE_LEN: usize = 10;
+    pub const WIRE_LEN: usize = 11;
 
     fn encode_into(&self, out: &mut Vec<u8>) {
         out.push(self.port);
@@ -437,6 +440,7 @@ impl AttachNotice {
         out.push(self.ep_in_dci);
         put_u16(out, self.ep_in_mps);
         out.push(self.ep_in_interval);
+        out.push(self.interface_num);
     }
 
     fn read(r: &mut Reader) -> Option<Self> {
@@ -450,6 +454,7 @@ impl AttachNotice {
             ep_in_dci: r.u8()?,
             ep_in_mps: r.u16()?,
             ep_in_interval: r.u8()?,
+            interface_num: r.u8()?,
         })
     }
 
@@ -680,6 +685,7 @@ mod tests {
             ep_in_dci: 3,
             ep_in_mps: 8,
             ep_in_interval: 10,
+            interface_num: 0,
         }
     }
 
@@ -704,6 +710,7 @@ mod tests {
             ep_in_dci: 0,
             ep_in_mps: 0,
             ep_in_interval: 0,
+            interface_num: 0,
         };
         assert!(!notice.attached);
     }

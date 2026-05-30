@@ -37,19 +37,10 @@ pub const USB_SERVER_READY_SENTINEL: &str = "XHCI_USB:server-ready\n";
 const EINVAL: u16 = 22;
 const ENOSYS: u16 = 38;
 
-/// One enumerated HID device the server exposes over `AttachNotice`, plus the
-/// interface number used for its Boot-Protocol setup.
-pub struct DeviceInfo {
-    /// The attach notice handed to the class driver.
-    pub notice: AttachNotice,
-    /// `bInterfaceNumber` of the HID interface (wIndex for SET_PROTOCOL/IDLE).
-    pub interface_num: u8,
-}
-
-/// Build a [`DeviceInfo`] from a Configured enumeration result if the device
+/// Build an [`AttachNotice`] from a Configured enumeration result if the device
 /// exposes a HID interface with an interrupt-IN endpoint. Returns `None` for a
 /// non-HID device or a HID interface lacking an interrupt-IN endpoint.
-pub fn device_info_from_ctx(ctx: &EnumContext) -> Option<DeviceInfo> {
+pub fn device_info_from_ctx(ctx: &EnumContext) -> Option<AttachNotice> {
     let cfg = ctx.parsed_config.as_ref()?;
     for iface in &cfg.interfaces {
         let i = &iface.interface;
@@ -60,18 +51,16 @@ pub fn device_info_from_ctx(ctx: &EnumContext) -> Option<DeviceInfo> {
             let is_in = ep.b_endpoint_address & 0x80 != 0;
             if ep.transfer_type() == TRANSFER_TYPE_INTERRUPT && is_in {
                 let ep_num = ep.b_endpoint_address & 0x0F;
-                return Some(DeviceInfo {
-                    notice: AttachNotice {
-                        port: ctx.port,
-                        slot_id: ctx.slot_id,
-                        interface_class: i.b_interface_class,
-                        interface_sub_class: i.b_interface_sub_class,
-                        interface_protocol: i.b_interface_protocol,
-                        attached: true,
-                        ep_in_dci: dci(ep_num, true),
-                        ep_in_mps: ep.w_max_packet_size,
-                        ep_in_interval: ep.b_interval,
-                    },
+                return Some(AttachNotice {
+                    port: ctx.port,
+                    slot_id: ctx.slot_id,
+                    interface_class: i.b_interface_class,
+                    interface_sub_class: i.b_interface_sub_class,
+                    interface_protocol: i.b_interface_protocol,
+                    attached: true,
+                    ep_in_dci: dci(ep_num, true),
+                    ep_in_mps: ep.w_max_packet_size,
+                    ep_in_interval: ep.b_interval,
                     interface_num: i.b_interface_number,
                 });
             }
@@ -81,19 +70,11 @@ pub fn device_info_from_ctx(ctx: &EnumContext) -> Option<DeviceInfo> {
 }
 
 /// Run the xHCI USB IPC server. Never returns.
-pub fn run(mut controller: Controller, irq: IrqNotification, devices: Vec<DeviceInfo>) -> ! {
-    // 1. Boot-protocol setup + interrupt-IN arm for each HID device. MUST run
-    //    before binding the IRQ — it blocks on control transfers.
-    for dev in &devices {
-        controller.boot_protocol_setup(
-            &irq,
-            dev.notice.slot_id,
-            dev.interface_num,
-            dev.notice.ep_in_dci,
-        );
-    }
-
-    // 2. Command endpoint + `usb` service registration.
+pub fn run(mut controller: Controller, irq: IrqNotification, devices: Vec<AttachNotice>) -> ! {
+    // 1. Command endpoint + `usb` service registration. The `usb-hid` daemon
+    //    issues SET_PROTOCOL(0)/SET_IDLE(0) itself via `ControlRequest`, and the
+    //    interrupt-IN endpoint arms lazily on the first `PollInterruptIn`, so no
+    //    pre-bind hardware setup is needed here.
     let ep = syscall_lib::create_endpoint();
     if ep == u64::MAX {
         write_str(
@@ -129,7 +110,7 @@ pub fn run(mut controller: Controller, irq: IrqNotification, devices: Vec<Device
                 let _ = irq.ack(bits);
             }
             Ok(RecvResult::Message(frame)) => {
-                let reply = handle_request(&mut controller, &devices, &frame.bulk);
+                let reply = handle_request(&mut controller, &irq, &devices, &frame.bulk);
                 let bytes = reply.encode();
                 let _ = backend.store_reply_bulk(&bytes);
                 let _ = backend.reply(USB_REPLY_LABEL, 0);
@@ -141,19 +122,31 @@ pub fn run(mut controller: Controller, irq: IrqNotification, devices: Vec<Device
     }
 }
 
-/// Decode and serve one request, producing the reply. Handlers never block on
-/// hardware: `PollInterruptIn` returns whatever the IRQ path has captured.
-fn handle_request(controller: &mut Controller, devices: &[DeviceInfo], bulk: &[u8]) -> UsbReply {
+/// Decode and serve one request, producing the reply.
+///
+/// `PollInterruptIn` returns whatever the IRQ path has captured (non-blocking).
+/// `ControlRequest` runs a real EP0 control transfer — `control_transfer` waits
+/// on the IRQ notification via `notify_wait`, which drains the same `PENDING`
+/// word the bound `ipc_recv_msg` does, so it works correctly inside the bound
+/// loop (the server is single-threaded — it is never in both at once).
+fn handle_request(
+    controller: &mut Controller,
+    irq: &IrqNotification,
+    devices: &[AttachNotice],
+    bulk: &[u8],
+) -> UsbReply {
     let Some(req) = UsbRequest::decode(bulk) else {
         return UsbReply::Error { code: EINVAL };
     };
     match req {
         UsbRequest::NextAttach { cursor } => UsbReply::Attach {
-            notice: devices.get(cursor as usize).map(|d| d.notice),
+            notice: devices.get(cursor as usize).copied(),
         },
         UsbRequest::PollInterruptIn {
-            dci: target_dci, ..
-        } => match controller.take_interrupt_report(target_dci) {
+            slot_id,
+            dci: target_dci,
+            ..
+        } => match controller.take_interrupt_report(slot_id, target_dci) {
             Some(data) => UsbReply::InterruptReport {
                 data,
                 completion_code: 1,
@@ -163,9 +156,24 @@ fn handle_request(controller: &mut Controller, devices: &[DeviceInfo], bulk: &[u
                 completion_code: 0,
             },
         },
-        // The live 1.0 HID path issues SET_PROTOCOL/SET_IDLE via the server's
-        // pre-bind boot_protocol_setup, so these aren't needed live. Reply with
-        // a typed ENOSYS rather than blocking inside the bound loop.
+        UsbRequest::ControlRequest {
+            slot_id,
+            setup,
+            length,
+        } => match controller.control_request(irq, slot_id, setup, length) {
+            Some(data) => UsbReply::ControlData {
+                data,
+                completion_code: 1,
+            },
+            None => UsbReply::ControlData {
+                data: Vec::new(),
+                completion_code: 0xFF,
+            },
+        },
+        // GetDescriptors / ConfigureEndpoints / SubmitTransfer are not needed by
+        // the live HID-boot path (descriptors are pre-resolved into AttachNotice
+        // during enumeration; endpoints are configured at bring-up). Deferred to
+        // Phase 79 (hub child-device config) — typed ENOSYS for now.
         _ => UsbReply::Error { code: ENOSYS },
     }
 }

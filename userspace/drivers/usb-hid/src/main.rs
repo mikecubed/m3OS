@@ -103,6 +103,36 @@ fn usb_call(usb_ep: u32, req: &UsbRequest) -> Option<UsbReply> {
     UsbReply::decode(&reply_buf[..n as usize])
 }
 
+/// Put a HID interface into Boot Protocol and stop duplicate reports by issuing
+/// `SET_PROTOCOL(0)` then `SET_IDLE(0)` over EP0 (via the xHCI server's
+/// `ControlRequest`). `wIndex` is the interface number from the attach notice.
+fn boot_protocol_init(usb_ep: u32, notice: &usb_core::protocol::AttachNotice) {
+    let iface = notice.interface_num as u16;
+    let ilo = (iface & 0xFF) as u8;
+    let ihi = (iface >> 8) as u8;
+    // SET_PROTOCOL(0): bmRequestType 0x21 (H2D|Class|Interface), bRequest 0x0B,
+    // wValue 0 (Boot), wIndex = interface, wLength 0.
+    let set_protocol = [0x21, 0x0B, 0x00, 0x00, ilo, ihi, 0x00, 0x00];
+    let _ = usb_call(
+        usb_ep,
+        &UsbRequest::ControlRequest {
+            slot_id: notice.slot_id,
+            setup: set_protocol,
+            length: 0,
+        },
+    );
+    // SET_IDLE(0): bRequest 0x0A, wValue 0 (duration 0 = report on change).
+    let set_idle = [0x21, 0x0A, 0x00, 0x00, ilo, ihi, 0x00, 0x00];
+    let _ = usb_call(
+        usb_ep,
+        &UsbRequest::ControlRequest {
+            slot_id: notice.slot_id,
+            setup: set_idle,
+            length: 0,
+        },
+    );
+}
+
 /// Inject a fully-formed `KeyEvent` into `kbd_server`.
 fn inject_key(kbd_ep: u32, ev: &KeyEvent) {
     let mut buf = [0u8; kernel_core::input::events::KEY_EVENT_WIRE_SIZE];
@@ -174,6 +204,19 @@ fn emit_key_sentinel(ev: &KeyEvent) {
     syscall_lib::write_str(STDOUT_FILENO, "\n");
 }
 
+/// `USB_HID:mouse btn=0x<hex> moved=<0|1>` — proves a live interrupt-IN
+/// boot-mouse report was decoded.
+fn emit_mouse_sentinel(m: &kernel_core::usb::hid::MouseReport) {
+    syscall_lib::write_str(STDOUT_FILENO, "USB_HID:mouse btn=0x");
+    write_u32_hex(m.buttons as u32);
+    let moved = if m.dx != 0 || m.dy != 0 {
+        " moved=1\n"
+    } else {
+        " moved=0\n"
+    };
+    syscall_lib::write_str(STDOUT_FILENO, moved);
+}
+
 /// Poll one mouse device: read its report, decode motion + button edges.
 fn poll_mouse(usb_ep: u32, mouse_ep: u32, dev: &mut HidDevice) {
     let report = match poll_report(usb_ep, dev) {
@@ -184,6 +227,10 @@ fn poll_mouse(usb_ep: u32, mouse_ep: u32, dev: &mut HidDevice) {
         return;
     };
     let now = monotonic_ms();
+    // Load-bearing sentinel for the `usb-smoke` gate's live-mouse assertion: a
+    // real interrupt-IN boot-mouse report was decoded. The exact spelling is
+    // asserted by the gate.
+    emit_mouse_sentinel(&m);
     // Motion event (USB +dy is down already in HID; keep sign as reported —
     // mouse_server/display_server treat relative deltas uniformly).
     if m.dx != 0 || m.dy != 0 {
@@ -301,6 +348,13 @@ fn program_main(_args: &[&str]) -> i32 {
         .any(|d| d.notice.interface_protocol == PROTOCOL_HID_MOUSE);
     let kbd_ep = if want_kbd { lookup("kbd") } else { None };
     let mouse_ep = if want_mouse { lookup("mouse") } else { None };
+
+    // 3b. Put each HID interface into Boot Protocol and suppress duplicate
+    //     reports (SET_PROTOCOL(0) / SET_IDLE(0)) via the xHCI server's
+    //     ControlRequest path. This is the class driver's responsibility.
+    for dev in &devices {
+        boot_protocol_init(usb_ep, &dev.notice);
+    }
 
     let keymap = Keymap::us_qwerty();
     syscall_lib::write_str(STDOUT_FILENO, READY_SENTINEL);
