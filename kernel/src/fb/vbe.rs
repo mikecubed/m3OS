@@ -76,7 +76,12 @@ pub enum EnableError {
 /// up to 4K with `vgamem_mb=32`). The software compositor has no GPU, so it
 /// composites every pixel on the CPU; dropping 4K (8.3 MP) to 1080p (2.07 MP)
 /// is a ~4× reduction in per-frame work, and 1080p still leaves room for VBE
-/// double-buffering in 32 MiB. Returns the device-confirmed `(width, height)`.
+/// double-buffering in 32 MiB. Returns the device-confirmed `(width, height)` —
+/// which the caller MUST adopt into its framebuffer `info`: if VRAM forces the
+/// device to clamp to a different geometry, this normalizes the stride to it
+/// and returns the clamped dims rather than erroring, so `info` always matches
+/// the live scanout (a mismatch would tear). Only `NotBochsVbe` / `NoYRes` —
+/// both of which return before touching any device register — are errors.
 ///
 /// A Bochs VBE mode set does **not** move the linear framebuffer — it stays at
 /// the same BAR/physical base — so the bootloader's existing framebuffer
@@ -115,10 +120,29 @@ pub unsafe fn set_mode(width: u16, height: u16, bpp: u16) -> Result<(u16, u16), 
     let actual_w = unsafe { read_register(VBE_DISPI_INDEX_XRES) };
     let actual_h = unsafe { read_register(VBE_DISPI_INDEX_YRES) };
     if actual_w != width || actual_h != height {
-        return Err(EnableError::VirtHeightClamped {
-            requested: height,
-            actual: actual_h,
-        });
+        // VRAM-clamped to a different geometry (on EITHER axis — the old code
+        // returned a height-only error that hid a width clamp). Do NOT leave the
+        // device in the clamped mode while the caller keeps the requested,
+        // larger `info`: that scans out at the wrong pitch and tears. Instead
+        // ADOPT the device's actual geometry — re-normalize VIRT_WIDTH/HEIGHT to
+        // it (so the linear stride is exactly `actual_w`, no padding) and return
+        // it so the caller rebuilds `info` to match the live scanout.
+        unsafe {
+            write_register(VBE_DISPI_INDEX_ENABLE, VBE_DISPI_DISABLED);
+            write_register(VBE_DISPI_INDEX_VIRT_WIDTH, actual_w);
+            write_register(VBE_DISPI_INDEX_VIRT_HEIGHT, actual_h);
+            write_register(
+                VBE_DISPI_INDEX_ENABLE,
+                VBE_DISPI_ENABLED | VBE_DISPI_LFB_ENABLED,
+            );
+        }
+        log::warn!(
+            "[fb] Bochs VBE clamped {}x{} -> {}x{} (insufficient VRAM); adopting device geometry",
+            width,
+            height,
+            actual_w,
+            actual_h
+        );
     }
     Ok((actual_w, actual_h))
 }
