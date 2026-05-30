@@ -1,12 +1,17 @@
 //! Ring-3 xHCI USB host-controller driver — Phase 78a (host-controller
-//! bring-up).
+//! bring-up) + Phase 78b Track A-glue (live device enumeration to Configured).
 //!
 //! Phase 78a stands the controller up: claim the `qemu-xhci` controller,
 //! map BAR0, discover the register regions, perform the BIOS/OS handoff and
 //! controller reset, program the DCBAA + scratchpad + command ring + event
 //! ring (ERST), wire an MSI-X interrupter, set the controller running, and
 //! reach a first `Enable Slot` Command Completion event delivered off the
-//! event ring **by interrupt**. Device enumeration, hubs and HID are 78b/78c.
+//! event ring **by interrupt**.
+//!
+//! Phase 78b Track A-glue drives `run_enumeration` from `kernel_core` against
+//! the real `qemu-xhci` + `usb-kbd` hardware, printing the full descriptor
+//! tree on success and emitting `XHCI_ENUM:configured` as the load-bearing
+//! acceptance sentinel.
 //!
 //! # Module layout
 //!
@@ -30,6 +35,10 @@
 //! 3. Bring-up (reset → DCBAA/scratchpad/contexts → rings → MSI-X → run →
 //!    Enable Slot) runs; on the first interrupt-delivered Command Completion
 //!    the driver emits [`ENABLE_SLOT_OK_SENTINEL`].
+//! 4. For the connected root-hub port, `run_enumeration` drives the full
+//!    xHCI enumeration sequence to Configured; on success the descriptor tree
+//!    is printed and [`XHCI_ENUM_CONFIGURED_SENTINEL`] is emitted.
+//! 5. `event_loop` runs indefinitely handling hotplug/interrupt endpoint events.
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
 #![cfg_attr(not(test), feature(alloc_error_handler))]
@@ -43,6 +52,11 @@ extern crate std;
 /// it speaks the syscall ABI and has no host-test surface.
 #[cfg(not(test))]
 mod controller;
+
+/// Phase 78b Track A-glue: real `UsbHostOps` implementation over the
+/// Controller's DMA rings.
+#[cfg(not(test))]
+mod enumerate;
 
 #[cfg(not(test))]
 use crate::controller::{BringUpError, Controller, XhciBar0};
@@ -86,6 +100,12 @@ pub const BOOT_LOG_MARKER: &str = "xhci_driver: spawned\n";
 /// exact line; a `[xhci] N ports detected` line alone is **not** sufficient
 /// for PASS. The spelling is load-bearing.
 pub const ENABLE_SLOT_OK_SENTINEL: &str = "XHCI_BRINGUP:enable-slot:OK\n";
+
+/// Sentinel emitted when the first USB device connected to the root hub
+/// reaches Configured state after a full enumeration sequence. The
+/// `xhci-enum-smoke` gate asserts this exact line. The spelling is
+/// load-bearing.
+pub const XHCI_ENUM_CONFIGURED_SENTINEL: &str = "XHCI_ENUM:configured\n";
 
 /// Sentinel PCI BDF QEMU assigns to `-device qemu-xhci,addr=0x6` under m3OS
 /// (bus 0, device 6, function 0). Slot +6 is the next free slot after the
@@ -176,14 +196,126 @@ fn program_main(_args: &[&str]) -> i32 {
 
     // A.7: reset any device already connected at the root hub (e.g. a
     // `usb-kbd` present at machine creation) so its port reaches Enabled and
-    // its speed is decoded. Hotplug after this is event-driven in the loop.
-    controller.scan_ports();
+    // its speed is decoded. scan_ports now returns the first connected port
+    // and its speed for use in enumeration.
+    let connected = controller.scan_ports();
 
-    // Milestone: enqueue Enable Slot, ring Doorbell 0, then drain the event
-    // ring on the MSI-X wake — the `XHCI_BRINGUP:enable-slot:OK` sentinel is
-    // emitted only from the interrupt-driven completion path.
-    controller.enqueue_enable_slot();
+    // Milestone: the first Enable Slot is fired as part of run_enumeration
+    // (which calls ops.enable_slot → issue_command_and_wait). The
+    // XHCI_BRINGUP:enable-slot:OK sentinel is emitted inside
+    // on_command_completion which runs within drain_for_command_completion.
+    // This preserves the 78a gate's requirement.
+
+    // Phase 78b: run the full enumeration state machine against the connected
+    // device, if any.
+    if let Some((port_num, speed)) = connected {
+        use crate::enumerate::XhciHostOps;
+        use kernel_core::usb::enumerate::{EnumContext, EnumState, run_enumeration};
+
+        syscall_lib::write_str(STDOUT_FILENO, "[xhci] starting enumeration on port ");
+        write_u8_dec(port_num);
+        syscall_lib::write_str(STDOUT_FILENO, "\n");
+
+        // EnumContext is seeded with the port's speed and port number.
+        // ep0_ring_iova is filled in after enable_slot allocates the slot ctx.
+        // We set it to 0 here; run_enumeration calls enable_slot first, which
+        // calls alloc_slot_context, and then we update ep0_ring_iova.
+        // Actually the state machine passes ep0_ring_iova from ctx into
+        // build_address_device_ctx. We need it set before AddressDevice runs.
+        // The flow is: EnableSlot → (BSR for FS/LS) AddressDeviceBsr → ...
+        // enable_slot in XhciHostOps allocates the slot context which sets
+        // ep0_ring_iova on the Controller. We then need to plumb it into ctx.
+        // The enumeration machine reads ctx.ep0_ring_iova when building the
+        // Address Device input context. We pre-set it to 0 and the ops impl
+        // will update it after alloc_slot_context.
+        let ctx = EnumContext {
+            speed: Some(speed),
+            port: port_num,
+            ep0_ring_iova: 0, // updated by enable_slot in ops
+            ..Default::default()
+        };
+
+        let mut ops = XhciHostOps::new(&mut controller, &irq);
+        let (final_state, final_ctx) = run_enumeration(EnumState::EnableSlot, ctx, &mut ops);
+
+        match final_state {
+            EnumState::Configured => {
+                syscall_lib::write_str(STDOUT_FILENO, "[xhci] enumeration complete\n");
+                print_descriptor_tree(&final_ctx);
+                syscall_lib::write_str(STDOUT_FILENO, XHCI_ENUM_CONFIGURED_SENTINEL);
+            }
+            EnumState::Error { code } => {
+                syscall_lib::write_str(STDOUT_FILENO, "[xhci] enumeration error code ");
+                write_u8_dec(code);
+                syscall_lib::write_str(STDOUT_FILENO, "\n");
+            }
+            EnumState::Timeout => {
+                syscall_lib::write_str(STDOUT_FILENO, "[xhci] enumeration timeout\n");
+            }
+            _ => {
+                syscall_lib::write_str(
+                    STDOUT_FILENO,
+                    "[xhci] enumeration ended in unexpected state\n",
+                );
+            }
+        }
+    } else {
+        // No device connected: fire a standalone Enable Slot to satisfy the
+        // 78a bringup-smoke gate (it expects XHCI_BRINGUP:enable-slot:OK).
+        controller.enqueue_enable_slot();
+    }
+
     controller.event_loop(irq)
+}
+
+/// Print the USB descriptor tree for a successfully enumerated device.
+#[cfg(not(test))]
+fn print_descriptor_tree(ctx: &kernel_core::usb::enumerate::EnumContext) {
+    use kernel_core::usb::descriptor::CLASS_HID;
+
+    if let Some(ref dev) = ctx.device_descriptor {
+        syscall_lib::write_str(STDOUT_FILENO, "[xhci] Device: VID=");
+        write_u16_hex(dev.id_vendor);
+        syscall_lib::write_str(STDOUT_FILENO, " PID=");
+        write_u16_hex(dev.id_product);
+        syscall_lib::write_str(STDOUT_FILENO, " class=");
+        write_u8_dec(dev.b_device_class);
+        syscall_lib::write_str(STDOUT_FILENO, "\n");
+    }
+
+    if let Some(ref cfg) = ctx.parsed_config {
+        syscall_lib::write_str(STDOUT_FILENO, "[xhci] Config: value=");
+        write_u8_dec(cfg.config.b_configuration_value);
+        syscall_lib::write_str(STDOUT_FILENO, " interfaces=");
+        write_u8_dec(cfg.config.b_num_interfaces);
+        syscall_lib::write_str(STDOUT_FILENO, "\n");
+
+        for iface in &cfg.interfaces {
+            let i = &iface.interface;
+            syscall_lib::write_str(STDOUT_FILENO, "[xhci]  Interface: class=");
+            write_u8_dec(i.b_interface_class);
+            syscall_lib::write_str(STDOUT_FILENO, " sub=");
+            write_u8_dec(i.b_interface_sub_class);
+            syscall_lib::write_str(STDOUT_FILENO, " proto=");
+            write_u8_dec(i.b_interface_protocol);
+            if i.b_interface_class == CLASS_HID {
+                syscall_lib::write_str(STDOUT_FILENO, " (HID)");
+            }
+            syscall_lib::write_str(STDOUT_FILENO, "\n");
+
+            for ep in &iface.endpoints {
+                syscall_lib::write_str(STDOUT_FILENO, "[xhci]   EP addr=");
+                write_u8_hex(ep.b_endpoint_address);
+                syscall_lib::write_str(STDOUT_FILENO, " type=");
+                write_u8_dec(ep.transfer_type());
+                syscall_lib::write_str(STDOUT_FILENO, " mps=");
+                write_u16_dec(ep.w_max_packet_size);
+                syscall_lib::write_str(STDOUT_FILENO, " interval=");
+                write_u8_dec(ep.b_interval);
+                syscall_lib::write_str(STDOUT_FILENO, "\n");
+            }
+        }
+    }
 }
 
 /// Map a bring-up stage failure to a stable non-zero exit code + log line.
@@ -213,7 +345,7 @@ fn write_ports_detected(n: u8) {
 
 /// Write a `u8` as decimal to stdout (max three digits).
 #[cfg(not(test))]
-fn write_u8_dec(mut n: u8) {
+pub(crate) fn write_u8_dec(mut n: u8) {
     let mut buf = [0u8; 3];
     let mut i = buf.len();
     loop {
@@ -229,9 +361,44 @@ fn write_u8_dec(mut n: u8) {
     syscall_lib::write_str(STDOUT_FILENO, s);
 }
 
+/// Write a `u16` as decimal to stdout.
+#[cfg(not(test))]
+fn write_u16_dec(mut n: u16) {
+    let mut buf = [0u8; 5];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    let s = unsafe { core::str::from_utf8_unchecked(&buf[i..]) };
+    syscall_lib::write_str(STDOUT_FILENO, s);
+}
+
+/// Write a `u8` as hex (2 digits) to stdout.
+#[cfg(not(test))]
+fn write_u8_hex(n: u8) {
+    let hi = (n >> 4) & 0xF;
+    let lo = n & 0xF;
+    let hex_digit = |d: u8| -> u8 { if d < 10 { b'0' + d } else { b'a' + d - 10 } };
+    let buf = [hex_digit(hi), hex_digit(lo)];
+    let s = unsafe { core::str::from_utf8_unchecked(&buf) };
+    syscall_lib::write_str(STDOUT_FILENO, s);
+}
+
+/// Write a `u16` as hex (4 digits) to stdout.
+#[cfg(not(test))]
+fn write_u16_hex(n: u16) {
+    write_u8_hex((n >> 8) as u8);
+    write_u8_hex((n & 0xFF) as u8);
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{BOOT_LOG_MARKER, ENABLE_SLOT_OK_SENTINEL};
+    use super::{BOOT_LOG_MARKER, ENABLE_SLOT_OK_SENTINEL, XHCI_ENUM_CONFIGURED_SENTINEL};
 
     #[test]
     fn boot_log_marker_matches_acceptance() {
@@ -242,5 +409,11 @@ mod tests {
     fn enable_slot_sentinel_matches_acceptance() {
         // The xhci-bringup-smoke gate (Track C.1) greps for this exact line.
         assert_eq!(ENABLE_SLOT_OK_SENTINEL, "XHCI_BRINGUP:enable-slot:OK\n");
+    }
+
+    #[test]
+    fn enum_configured_sentinel_matches_acceptance() {
+        // The xhci-enum-smoke gate asserts this exact line.
+        assert_eq!(XHCI_ENUM_CONFIGURED_SENTINEL, "XHCI_ENUM:configured\n");
     }
 }
