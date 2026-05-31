@@ -111,6 +111,51 @@ pub const SYS_DEVICE_PIO_WRITE: u64 = 0x1126;
 /// allocated at that time rather than silently changing this one's layout.
 pub const SYS_DEVICE_PCI_ENUMERATE: u64 = 0x1127;
 
+/// Read a value from the PCI configuration space of a device addressed by raw
+/// BDF — **without** claiming it.
+/// Phase 79 Track A.1 —
+/// `sys_device_config_read(segment, bus, dev, func, offset, width) -> isize`.
+///
+/// ## Why a raw-BDF (pre-claim) config read
+///
+/// A modern NIC driver must decide *which* PCI function to claim by matching its
+/// vendor:device ID against a per-family ID set. [`SYS_DEVICE_PCI_ENUMERATE`]
+/// returns only the BDFs of a class/subclass/prog_if triple (e.g. all Ethernet
+/// controllers); it does not reveal vendor/device. Claiming a function to read
+/// its ID then releasing it is not viable — `sys_device_claim` enables
+/// bus-mastering and installs an IOMMU domain, and there is no release syscall
+/// (the claim drops only on process exit), so a probe-by-claim would
+/// permanently lock every NIC the first driver inspected. This syscall lets an
+/// authorized driver read the identifying config-space registers up-front so
+/// exactly one driver claims each device.
+///
+/// ## ABI
+///
+/// | Register | Value |
+/// |----------|-------|
+/// | `rax`    | `SYS_DEVICE_CONFIG_READ` (0x1128) |
+/// | `rdi`    | `segment: u16` — PCI segment group (always 0 on current platforms) |
+/// | `rsi`    | `bus: u8` |
+/// | `rdx`    | `dev: u8` (0–31) |
+/// | `r10`    | `func: u8` (0–7) |
+/// | `r8`     | packed `(offset << 8) | width` — `offset` is the 0–255 byte offset, `width` ∈ {1,2,4} |
+///
+/// `offset` and `width` are packed into a single register so the call uses the
+/// same five-argument shape as [`SYS_DEVICE_PCI_ENUMERATE`] (no reliance on a
+/// sixth `r9` argument). Use [`pack_config_read_arg`] / [`unpack_config_read_arg`].
+///
+/// On success returns the config value zero-extended into the low bits
+/// (`offset`-aligned `width` bytes, little-endian). A negative return is a
+/// negated `errno`:
+///
+/// - `-EACCES` (`-13`): caller's exec-path is not under `/drivers/`.
+/// - `-EINVAL` (`-22`): `width` not in `{1,2,4}`, or `offset + width` exceeds
+///   256, or `offset` is not naturally aligned to `width`.
+/// - `-ENODEV` (`-19`): no PCI function exists at the supplied BDF (vendor ID
+///   reads back `0xFFFF`).
+/// - `-ESRCH` (`-3`): kernel context (PID 0).
+pub const SYS_DEVICE_CONFIG_READ: u64 = 0x1128;
+
 /// Sentinel passed as `notification_arg` (arg3) of [`SYS_DEVICE_IRQ_SUBSCRIBE`]
 /// to request that the kernel allocate a fresh `Notification` object on the
 /// caller's behalf, rather than binding the IRQ to an existing notification
@@ -118,6 +163,20 @@ pub const SYS_DEVICE_PCI_ENUMERATE: u64 = 0x1127;
 /// `CapHandle` into the caller's capability table. Single source of truth for
 /// both the kernel syscall handler and ring-3 driver_runtime backends.
 pub const NOTIFICATION_SENTINEL_NEW: u32 = u32::MAX;
+
+/// Pack the `offset` (0–255) and `width` (1/2/4) of a [`SYS_DEVICE_CONFIG_READ`]
+/// into the single `r8` argument. The driver_runtime wrapper packs; the kernel
+/// dispatcher unpacks with [`unpack_config_read_arg`].
+#[inline]
+pub const fn pack_config_read_arg(offset: u16, width: u8) -> u64 {
+    ((offset as u64) << 8) | (width as u64)
+}
+
+/// Inverse of [`pack_config_read_arg`] — returns `(offset, width)`.
+#[inline]
+pub const fn unpack_config_read_arg(packed: u64) -> (u16, u8) {
+    (((packed >> 8) & 0xFFFF) as u16, (packed & 0xFF) as u8)
+}
 
 /// Lowest syscall number in the reserved device-host block.
 ///
@@ -130,7 +189,7 @@ pub const DEVICE_HOST_BASE: u64 = SYS_DEVICE_CLAIM;
 ///
 /// Adjust upward when adding new device-host syscalls; the Track B acceptance
 /// items pin this constant as the authoritative upper bound.
-pub const DEVICE_HOST_LAST: u64 = SYS_DEVICE_PCI_ENUMERATE;
+pub const DEVICE_HOST_LAST: u64 = SYS_DEVICE_CONFIG_READ;
 
 #[cfg(test)]
 mod tests {
@@ -150,6 +209,8 @@ mod tests {
         assert_eq!(SYS_DEVICE_PIO_WRITE, 0x1126);
         // Phase 78b Track C.1 — PCI class enumeration.
         assert_eq!(SYS_DEVICE_PCI_ENUMERATE, 0x1127);
+        // Phase 79 Track A.1 — raw-BDF PCI config-space read.
+        assert_eq!(SYS_DEVICE_CONFIG_READ, 0x1128);
     }
 
     #[test]
@@ -163,6 +224,7 @@ mod tests {
             SYS_DEVICE_PIO_READ,
             SYS_DEVICE_PIO_WRITE,
             SYS_DEVICE_PCI_ENUMERATE,
+            SYS_DEVICE_CONFIG_READ,
         ];
         for (i, a) in all.iter().enumerate() {
             for (j, b) in all.iter().enumerate() {
@@ -184,6 +246,7 @@ mod tests {
             SYS_DEVICE_PIO_READ,
             SYS_DEVICE_PIO_WRITE,
             SYS_DEVICE_PCI_ENUMERATE,
+            SYS_DEVICE_CONFIG_READ,
         ];
         for n in all {
             assert!(
@@ -202,7 +265,27 @@ mod tests {
         assert_eq!(SYS_DEVICE_PIO_WRITE, SYS_DEVICE_PIO_READ + 1);
         // Phase 78b Track C.1 pin: PCI_ENUMERATE follows PIO_WRITE without gap.
         assert_eq!(SYS_DEVICE_PCI_ENUMERATE, SYS_DEVICE_PIO_WRITE + 1);
-        assert_eq!(DEVICE_HOST_LAST, SYS_DEVICE_PCI_ENUMERATE);
+        // Phase 79 Track A.1 pin: CONFIG_READ follows PCI_ENUMERATE without gap.
+        assert_eq!(SYS_DEVICE_CONFIG_READ, SYS_DEVICE_PCI_ENUMERATE + 1);
+        assert_eq!(DEVICE_HOST_LAST, SYS_DEVICE_CONFIG_READ);
+    }
+
+    #[test]
+    fn config_read_arg_packing_round_trips() {
+        for &(off, w) in &[
+            (0u16, 4u8),
+            (0x00, 2),
+            (0x02, 2),
+            (0x08, 1),
+            (0xFC, 4),
+            (0xFF, 1),
+        ] {
+            let packed = pack_config_read_arg(off, w);
+            assert_eq!(unpack_config_read_arg(packed), (off, w));
+        }
+        // The packed value never collides width into offset.
+        assert_eq!(pack_config_read_arg(0x00, 4), 4);
+        assert_eq!(pack_config_read_arg(0x02, 2), 0x202);
     }
 
     #[test]

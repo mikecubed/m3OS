@@ -1,0 +1,30 @@
+[package]
+name = "e1000e_driver"
+version = "0.79.0"
+edition = "2024"
+description = "Phase 79 Track A — ring-3 Intel e1000e (82574/82579/I217/I218/I219) NIC driver."
+
+# Mirror the e1000 driver's lib/bin split: the [lib] exposes the discovery
+# helpers for host tests; the [[bin]] _start entry point is gated on
+# `os-binary` so `cargo test --target x86_64-unknown-linux-gnu` skips it
+# (Scrt1.o also defines _start → duplicate-symbol link error otherwise).
+[lib]
+name = "e1000e_driver"
+path = "src/lib.rs"
+
+[features]
+os-binary = []
+
+[[bin]]
+name = "e1000e_driver"
+path = "src/main.rs"
+required-features = ["os-binary"]
+
+[dependencies]
+# Reuse the classic e1000 driver's legacy-descriptor bring-up + IO loop
+# verbatim — e1000e accepts the same 16-byte legacy descriptor and the same
+# RAL0/RAH0 MAC path; only PCI device discovery differs (Track A.1).
+e1000_driver = { path = "../e1000" }
+driver_runtime = { path = "../../lib/driver_runtime" }
+syscall-lib = { path = "../../syscall-lib", features = ["alloc"] }
+kernel-core = { path = "../../../kernel-core", default-features = false }

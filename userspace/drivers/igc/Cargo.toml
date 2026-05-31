@@ -1,0 +1,22 @@
+[package]
+name = "igc_driver"
+version = "0.79.0"
+edition = "2024"
+description = "Phase 79 Track B.2 — ring-3 Intel igc (I225/I226 discrete Foxville 2.5GbE) NIC driver."
+
+[lib]
+name = "igc_driver"
+path = "src/lib.rs"
+
+[features]
+os-binary = []
+
+[[bin]]
+name = "igc_driver"
+path = "src/main.rs"
+required-features = ["os-binary"]
+
+[dependencies]
+driver_runtime = { path = "../../lib/driver_runtime" }
+syscall-lib = { path = "../../syscall-lib", features = ["alloc"] }
+kernel-core = { path = "../../../kernel-core", default-features = false }

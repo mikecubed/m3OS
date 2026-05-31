@@ -62,6 +62,12 @@ members = [
     # Phase 55b Tracks D.1 / E.1 — ring-3 driver scaffolds
     "userspace/drivers/nvme",
     "userspace/drivers/e1000",
+    # Phase 79 — ring-3 modern NIC drivers (Intel e1000e/igb/igc, Realtek r8169/r8125)
+    "userspace/drivers/e1000e",
+    "userspace/drivers/igb",
+    "userspace/drivers/igc",
+    "userspace/drivers/r8169",
+    "userspace/drivers/r8125",
     # Phase 78a Track B.2 — ring-3 xHCI USB host-controller driver
     "userspace/drivers/xhci",
     # Phase 78b Track A — host↔class IPC protocol crate

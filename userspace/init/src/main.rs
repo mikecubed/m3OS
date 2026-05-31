@@ -200,6 +200,12 @@ const KNOWN_CONFIGS: &[&[u8]] = &[
     // Phase 55b F.1: ring-3 driver process configs.
     b"/etc/services.d/nvme_driver.conf\0",
     b"/etc/services.d/e1000_driver.conf\0",
+    // Phase 79: ring-3 modern NIC drivers.
+    b"/etc/services.d/e1000e_driver.conf\0",
+    b"/etc/services.d/igb_driver.conf\0",
+    b"/etc/services.d/igc_driver.conf\0",
+    b"/etc/services.d/r8169_driver.conf\0",
+    b"/etc/services.d/r8125_driver.conf\0",
     // Phase 78a B.2: ring-3 xHCI USB host-controller driver.
     b"/etc/services.d/xhci_driver.conf\0",
     // Phase 78b Track B: ring-3 USB hub class driver.

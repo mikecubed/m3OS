@@ -610,6 +610,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "e1000e_driver"
+version = "0.79.0"
+dependencies = [
+ "driver_runtime",
+ "e1000_driver",
+ "kernel-core",
+ "syscall-lib",
+]
+
+[[package]]
 name = "echo-args"
 version = "0.1.0"
 dependencies = [
@@ -982,6 +992,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
 
 [[package]]
+name = "igb_driver"
+version = "0.79.0"
+dependencies = [
+ "driver_runtime",
+ "kernel-core",
+ "syscall-lib",
+]
+
+[[package]]
+name = "igc_driver"
+version = "0.79.0"
+dependencies = [
+ "driver_runtime",
+ "kernel-core",
+ "syscall-lib",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1057,7 +1085,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.78.2"
+version = "0.79.0"
 dependencies = [
  "bootloader_api",
  "kernel-core",
@@ -1547,6 +1575,25 @@ name = "r-efi"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+
+[[package]]
+name = "r8125_driver"
+version = "0.79.0"
+dependencies = [
+ "driver_runtime",
+ "kernel-core",
+ "r8169_driver",
+ "syscall-lib",
+]
+
+[[package]]
+name = "r8169_driver"
+version = "0.79.0"
+dependencies = [
+ "driver_runtime",
+ "kernel-core",
+ "syscall-lib",
+]
 
 [[package]]
 name = "rand"

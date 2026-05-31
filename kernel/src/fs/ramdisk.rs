@@ -200,6 +200,12 @@ static DOOM_BIN: &[u8] = generated_initrd_asset!("doom");
 // canonical driver path.
 static NVME_DRIVER_ELF: &[u8] = generated_initrd_asset!("nvme_driver");
 static E1000_DRIVER_ELF: &[u8] = generated_initrd_asset!("e1000_driver");
+// Phase 79: ring-3 modern NIC drivers (Intel e1000e/igb/igc, Realtek r8169/r8125).
+static E1000E_DRIVER_ELF: &[u8] = generated_initrd_asset!("e1000e_driver");
+static IGB_DRIVER_ELF: &[u8] = generated_initrd_asset!("igb_driver");
+static IGC_DRIVER_ELF: &[u8] = generated_initrd_asset!("igc_driver");
+static R8169_DRIVER_ELF: &[u8] = generated_initrd_asset!("r8169_driver");
+static R8125_DRIVER_ELF: &[u8] = generated_initrd_asset!("r8125_driver");
 // Phase 78a Track B.2: ring-3 xHCI USB host-controller driver.
 static XHCI_DRIVER_ELF: &[u8] = generated_initrd_asset!("xhci_driver");
 // Phase 78b Track B: ring-3 USB hub class driver.
@@ -1164,6 +1170,37 @@ static DRIVERS_ENTRIES: &[(&str, RamdiskNode)] = &[
         "e1000",
         RamdiskNode::File {
             content: E1000_DRIVER_ELF,
+        },
+    ),
+    // Phase 79: ring-3 modern NIC drivers (Intel e1000e/igb/igc, Realtek r8169/r8125).
+    (
+        "e1000e",
+        RamdiskNode::File {
+            content: E1000E_DRIVER_ELF,
+        },
+    ),
+    (
+        "igb",
+        RamdiskNode::File {
+            content: IGB_DRIVER_ELF,
+        },
+    ),
+    (
+        "igc",
+        RamdiskNode::File {
+            content: IGC_DRIVER_ELF,
+        },
+    ),
+    (
+        "r8169",
+        RamdiskNode::File {
+            content: R8169_DRIVER_ELF,
+        },
+    ),
+    (
+        "r8125",
+        RamdiskNode::File {
+            content: R8125_DRIVER_ELF,
         },
     ),
     // Phase 63 driver-host fix: audio_server is a ring-3 driver and must

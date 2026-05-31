@@ -3423,6 +3423,63 @@ pub fn sys_device_pci_enumerate(
     total as isize
 }
 
+/// Syscall entry: `sys_device_config_read(segment, bus, dev, func, packed) -> isize`
+/// where `packed = (offset << 8) | width` (see
+/// [`kernel_core::device_host::syscalls::pack_config_read_arg`]).
+///
+/// Phase 79 Track A.1 — reads PCI configuration space for a raw BDF **without**
+/// claiming the device, so a NIC driver can match its vendor:device ID against
+/// a per-family set before deciding which function to claim.
+///
+/// Returns the requested config-space field zero-extended into the low bits, or
+/// a negative errno:
+///
+/// - `NEG_EACCES` — caller is not an authorized driver process.
+/// - `NEG_ESRCH`  — kernel task context (PID 0).
+/// - `NEG_EINVAL` — bad width/offset (see `validate_config_read`).
+/// - `NEG_ENODEV` — no PCI function at the BDF (vendor reads back `0xFFFF`), or a
+///   non-zero segment (multi-segment PCIe is not supported yet).
+///
+/// See [`kernel_core::device_host::syscalls::SYS_DEVICE_CONFIG_READ`] for the
+/// full ABI.
+pub fn sys_device_config_read(segment: u16, bus: u8, dev: u8, func: u8, packed: u64) -> isize {
+    let pid = crate::process::current_pid();
+    if pid == 0 {
+        return NEG_ESRCH;
+    }
+    // Authorization gate — same policy as `sys_device_claim` / enumerate.
+    if !is_authorized_driver_process(pid) {
+        return NEG_EACCES;
+    }
+    // Only segment 0 exists on current platforms; reject others as ENODEV.
+    if segment != 0 {
+        return NEG_ENODEV;
+    }
+    let (offset, width) = kernel_core::device_host::syscalls::unpack_config_read_arg(packed);
+    if kernel_core::device_host::validate_config_read(offset, width).is_err() {
+        return NEG_EINVAL;
+    }
+    // A function is absent when its vendor ID reads back all-ones.
+    let vendor = crate::pci::pci_config_read_u16(bus, dev, func, 0x00);
+    if vendor == 0xFFFF {
+        return NEG_ENODEV;
+    }
+    // `offset` is validated to be naturally aligned to `width` and within the
+    // 256-byte legacy config space, so each sub-read below is well-formed.
+    let off = offset as u8;
+    let value: u32 = match width {
+        1 => u32::from(crate::pci::pci_config_read_u8(bus, dev, func, off)),
+        2 => u32::from(crate::pci::pci_config_read_u16(bus, dev, func, off)),
+        // width == 4 (validated): combine two aligned 16-bit reads.
+        _ => {
+            let lo = u32::from(crate::pci::pci_config_read_u16(bus, dev, func, off));
+            let hi = u32::from(crate::pci::pci_config_read_u16(bus, dev, func, off + 2));
+            lo | (hi << 16)
+        }
+    };
+    value as isize
+}
+
 fn device_claim_error_to_errno(
     error: DeviceHostError,
     segment: u16,
