@@ -160,8 +160,18 @@ pub(crate) fn pci_config_write_u32_any(bus: u8, device: u8, function: u8, offset
 
 /// Legacy-compatible 32-bit config read (first 256 bytes only, u8 offset).
 /// Prefers ECAM MMIO when available so that behaviour is uniform.
+///
+/// Reads the dword **containing** `offset`: the offset is aligned down to the
+/// 4-byte boundary. The legacy CF8/CFC path already masks `offset & 0xFC` in
+/// [`config_address`], but the ECAM MMIO path ([`pcie_mmio_config_read`])
+/// indexes by the exact byte offset, so a sub-dword read via the u16/u8 helpers
+/// (which pass e.g. offset 2 and then shift) would otherwise do an *unaligned*
+/// MMIO read on an ECAM platform (q35 / real modern hardware) and return the
+/// wrong field — notably the device-ID half-word at offset 2 came back as the
+/// command register, so the driver-side enumeration dropped every device whose
+/// ID lives in the high half-word. Aligning here makes both paths identical.
 fn pci_config_read_u32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
-    pci_config_read_u32_any(bus, device, function, offset as u16)
+    pci_config_read_u32_any(bus, device, function, (offset & 0xFC) as u16)
 }
 
 /// Read a 16-bit value from PCI configuration space.
