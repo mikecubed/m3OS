@@ -1755,14 +1755,32 @@ fn allocate_device_vector(key: DeviceCapKey) -> Result<AllocatedDeviceVector, Ve
             .ok_or(VectorAllocError::NoDevice)?
     };
 
-    if let Some(allocated) = crate::pci::allocate_msi_vectors(&dev_copy, 1) {
+    // Phase 79: the ring-3 NIC drivers (e1000 / e1000e / igb / igc + Realtek
+    // r8169 / r8125) all drive the legacy ICR/IMS interrupt model — they
+    // program no MSI-X cause routing (the 82574/82576 `IVAR` / `EIMS` block,
+    // the Realtek V2 ISR). A kernel-enabled MSI-X vector therefore never fires
+    // for them: QEMU's `e1000e` (82574) reproduces this exactly — MSI-X gets
+    // enabled but stays silent without `IVAR`, so the driver's RX ring never
+    // drains and no packets flow even though link comes up. The device-host
+    // IRQ path is otherwise used by nvme (storage, class 0x01) and the xHCI
+    // host controller (serial-bus, class 0x0C), both of which *do* program
+    // MSI-X cause routing. Gate on the Ethernet class (0x02): NICs fall to
+    // INTx (their working path, identical to the 82540EM e1000), while
+    // storage / USB keep MSI-X. This realises the Phase 79 acceptance "INTx
+    // or single-MSI is used (no MSI-X required)" and is a no-op for the
+    // 82540EM e1000, which has no MSI-X capability and already used INTx.
+    let prefer_intx = dev_copy.class_code == kernel_core::nic_ids::ETHERNET_CLASS;
+
+    if !prefer_intx && let Some(allocated) = crate::pci::allocate_msi_vectors(&dev_copy, 1) {
         return Ok(AllocatedDeviceVector {
             vector: allocated.first_vector,
             legacy_irq_line: None,
         });
     }
 
-    // Fallback: legacy INTx on the first free slot in the device-IRQ bank.
+    // Legacy INTx on the first free slot in the device-IRQ bank — the only
+    // path for Ethernet-class NICs, and the MSI/MSI-X fallback for everything
+    // else.
     if let Some(vec) = crate::pci::reserve_msi_vectors(1) {
         return Ok(AllocatedDeviceVector {
             vector: vec,

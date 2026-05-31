@@ -331,11 +331,14 @@ fn apply_device_flag(name: &str, devices: &mut DeviceSet) -> Result<(), String> 
     match name {
         "nvme" => devices.nvme = true,
         "e1000" => devices.e1000 = true,
+        // Phase 79: modern Intel NIC families with a QEMU model.
+        "e1000e" => devices.e1000e = true,
+        "igb" => devices.igb = true,
         "audio" => devices.audio = true,
         "xhci" => devices.xhci = true,
         other => {
             return Err(format!(
-                "unknown `--device` value `{other}` (supported: nvme, e1000, audio, xhci)"
+                "unknown `--device` value `{other}` (supported: nvme, e1000, e1000e, igb, audio, xhci)"
             ));
         }
     }
