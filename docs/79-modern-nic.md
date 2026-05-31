@@ -57,6 +57,40 @@ This drives the `multi-nic-smoke` gate design:
 
 So `multi-nic-smoke` exercises e1000/e1000e in CI (and igb behind a version guard); igc and all Realtek paths are gated behind opt-in `M3OS_*_REGRESSION` env vars and skipped-with-reason otherwise. The hardware-only families ship **structurally complete + host-tested**; their real-card `ping`/`curl` validation is a Phase-83 hardware handoff.
 
+### What real silicon exposed (RTL8125 via VFIO passthrough)
+
+QEMU's emulated NICs are forgiving in ways real hardware is not. Running the
+`r8125` driver against a **physical RTL8125B** (VFIO-passed into the guest)
+uncovered four bugs that every QEMU test missed — a sharp reminder that
+emulation masks whole classes of defect:
+
+1. **MSI-X auto-selection vs legacy-model drivers** — the device-host IRQ
+   allocator preferred MSI-X for any device that advertised it, but these
+   drivers program no MSI-X cause routing, so the RX interrupt never fired
+   (link up, zero packets). Fixed by forcing INTx for Ethernet-class devices.
+2. **Unaligned ECAM sub-dword config reads** — `pci_config_read_u16/u8` indexed
+   ECAM by the exact byte offset; the legacy CF8/CFC path masks `& 0xFC`, so the
+   bug was invisible on the default i440fx machine. On q35 / real hardware the
+   device-ID half-word (offset 2) read back as the *command register*, so the
+   `0x8125` device was dropped from enumeration entirely.
+3. **Unlocked CF8/CFC across cores** — the legacy two-step config access was
+   guarded only by `without_interrupts` (local CPU); concurrent boot-time
+   enumeration from several drivers could clobber `CONFIG_ADDRESS` between a
+   core's address write and its data read.
+4. **BAR sizing with decode enabled** — the write-`0xFFFFFFFF`/read-back size
+   dance, run while the device still decoded memory, made the real card
+   transiently claim a huge address window and wedge the bus. The RTL8125B's
+   64-bit BAR2 sits high in the q35 PCI MMIO window (phys `0x380000000000`),
+   which QEMU's 32-bit e1000-family BARs never exercise. Fixed by disabling
+   decode for the dance — exactly what Linux's PCI core does.
+
+With those fixed the driver completes full bring-up of the physical card
+(claim → 64-bit BAR map → live-XID `mac_version` → soft reset → rings → V2
+interrupts → server-ready). The remaining gap to a literal `ping` is the
+`rtl_nic` **PHY-firmware load-to-PHY** sequence (the driver validates the blob
+but does not yet write it into the PHY) plus 2.5G link negotiation — genuine
+driver work deferred to Phase 83.
+
 ## Important Components and How They Work
 
 - **`sys_device_config_read` (0x1128).** `(segment, bus, dev, func, packed=(offset<<8)|width) -> value|errno`, `/drivers/`-gated, reads PCI config space by raw BDF without claiming. `driver_runtime::read_vendor_device` + `enumerate_ethernet_functions` + `select_nic` build the discovery flow.
