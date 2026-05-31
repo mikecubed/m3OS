@@ -50,7 +50,6 @@ syscall_lib::entry_point!(program_main);
 // Constants
 // ---------------------------------------------------------------------------
 
-const REPLY_CAP_HANDLE: u32 = 1;
 const MAX_HANDLES: usize = 64;
 /// Maximum number of simultaneously bound or connected UDP ports.
 ///
@@ -378,9 +377,18 @@ fn server_loop(ep_handle: u32) -> ! {
     syscall_lib::ipc_recv_msg(ep_handle, &mut msg, &mut recv_buf);
 
     loop {
-        let (reply_label, reply_data0) = dispatch(&mut table, &msg);
-
-        syscall_lib::ipc_reply(REPLY_CAP_HANDLE, reply_label, reply_data0);
+        // Reply on the kernel-staged reply capability (msg.data[3]) rather than
+        // a hardcoded slot. The staged handle is dynamic (first-free slot picked
+        // by the kernel's insert_cap), so assuming slot 1 can target the wrong
+        // cap. On a fire-and-forget message (data[3] == 0) there is no reply cap,
+        // and replying on a fixed slot would delete whatever cap sits there
+        // (e.g. our own endpoint), so we drop it: skip dispatch+reply and wait
+        // for the next request. All net_udp senders are call-shaped today, so
+        // no real request is ever dropped here.
+        if let Some(reply_cap) = msg.reply_cap_handle() {
+            let (reply_label, reply_data0) = dispatch(&mut table, &msg);
+            syscall_lib::ipc_reply(reply_cap, reply_label, reply_data0);
+        }
 
         msg = syscall_lib::IpcMessage::new(0);
         syscall_lib::ipc_recv_msg(ep_handle, &mut msg, &mut recv_buf);
