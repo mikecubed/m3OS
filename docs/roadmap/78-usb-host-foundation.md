@@ -1,6 +1,6 @@
 # Phase 78 - USB Host Foundation (xHCI + Hub + HID)
 
-**Status:** Planned — umbrella theme, delivered as sub-phases [78a](./78a-xhci-host-bringup.md) → [78b](./78b-usb-enumeration-hub.md) → [78c](./78c-usb-hid-and-release.md)
+**Status:** Complete — umbrella theme, delivered as sub-phases [78a](./78a-xhci-host-bringup.md) → [78b](./78b-usb-enumeration-hub.md) → [78c](./78c-usb-hid-and-release.md)
 **Source Ref:** phase-78
 **Depends on:** Phase 55b (Ring-3 Driver Host) ✅, Phase 55c (Ring-3 Driver Correctness Closure) ✅, Phase 67 (IOMMU Substrate Completion) ✅, Phase 56 (Display and Input Architecture) ✅, Phase 74 (IPC Capability Grants / page-grant bulk transport) ✅
 **Builds on:** Extends the Phase 55b/55c ring-3 driver-host substrate with the first USB stack the project ships — a userspace xHCI host driver, a minimal USB core, and a HID class driver capable of presenting at least one keyboard and one mouse as the same `kbd_server` / `mouse_server` clients Phase 56 already feeds

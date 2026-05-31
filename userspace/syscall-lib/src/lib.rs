@@ -434,6 +434,13 @@ pub const SYS_IPC_CALL_TIMEOUT: u64 = 0x1119;
 /// expiry.
 pub const SYS_IPC_RECV_TIMEOUT: u64 = 0x111A;
 
+/// Phase 78c review follow-up: `sys_ipc_peer_is_driver(reply_cap_handle)`.
+/// Returns `1` if the task that sent the message answered by `reply_cap_handle`
+/// is an authorized driver process (kernel-recorded `exec_path` under
+/// `/drivers/`), else `0`. Lets an input server authenticate the caller of its
+/// inject path so only the driver TCB can forge synthetic input.
+pub const SYS_IPC_PEER_IS_DRIVER: u64 = 0x111B;
+
 /// Phase 74 Track B: `sys_page_grant_send(pages_vaddr, n_pages)`. Hands
 /// `n_pages` contiguous user-space pages starting at `pages_vaddr` to
 /// the kernel as a `PageGrant`. Returns the new capability handle on
@@ -673,6 +680,19 @@ pub fn ipc_wait_service(name: &str, timeout_ms: u64) -> bool {
             timeout_ms,
         ) == 1
     }
+}
+
+/// Phase 78c review follow-up: report whether the peer that issued the call
+/// answered by `reply_cap_handle` is an authorized driver process (its
+/// kernel-recorded `exec_path` is under `/drivers/`). Fails closed — any error
+/// or non-driver caller yields `false`.
+///
+/// An input server calls this with the reply-cap handle of an in-flight inject
+/// request (before replying) to reject synthetic-input injection from anything
+/// outside the driver TCB. The caller's identity is authenticated by the
+/// kernel via the reply cap, which userspace cannot forge.
+pub fn ipc_peer_is_driver(reply_cap_handle: u32) -> bool {
+    unsafe { syscall1(SYS_IPC_PEER_IS_DRIVER, reply_cap_handle as u64) == 1 }
 }
 
 /// Phase 64 Track A.2: return the userspace PID of the process owning

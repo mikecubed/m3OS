@@ -58,6 +58,11 @@ mod controller;
 #[cfg(not(test))]
 mod enumerate;
 
+/// Phase 78c: the live USB IPC server (registers `usb`, binds the IRQ, serves
+/// `UsbRequest`s from class drivers, captures HID reports).
+#[cfg(not(test))]
+mod server;
+
 #[cfg(not(test))]
 use crate::controller::{BringUpError, Controller, XhciBar0};
 #[cfg(not(test))]
@@ -156,7 +161,17 @@ const BAR0_EXPECTED_BYTES: usize = 0x1_0000;
 /// sentinel lines (`XHCI_BRINGUP:enable-slot:OK` and `XHCI_ENUM:configured`)
 /// are emitted here, maintaining gate compatibility.
 #[cfg(not(test))]
-fn bring_up_controller(key: DeviceCapKey) -> Result<(Controller, IrqNotification), i32> {
+fn bring_up_controller(
+    key: DeviceCapKey,
+) -> Result<
+    (
+        Controller,
+        IrqNotification,
+        alloc::vec::Vec<usb_core::protocol::AttachNotice>,
+    ),
+    i32,
+> {
+    let mut devices: alloc::vec::Vec<usb_core::protocol::AttachNotice> = alloc::vec::Vec::new();
     let handle = match DeviceHandle::claim(key) {
         Ok(h) => h,
         // The controller is not available to us. `NotClaimed` (ENODEV — QEMU
@@ -229,10 +244,9 @@ fn bring_up_controller(key: DeviceCapKey) -> Result<(Controller, IrqNotification
         return Err(bringup_failed(e));
     }
 
-    // A.7: reset any device already connected at the root hub (e.g. a
-    // `usb-kbd` present at machine creation) so its port reaches Enabled and
-    // its speed is decoded. scan_ports returns the first connected port
-    // and its speed for use in enumeration.
+    // A.7: reset every device already connected at the root hub (e.g. a
+    // `usb-kbd` and a `usb-mouse` present at machine creation) so each port
+    // reaches Enabled with its speed decoded. Phase 78c enumerates ALL of them.
     let connected = controller.scan_ports();
 
     // Milestone: the first Enable Slot is fired as part of run_enumeration
@@ -241,66 +255,65 @@ fn bring_up_controller(key: DeviceCapKey) -> Result<(Controller, IrqNotification
     // on_command_completion which runs within drain_for_command_completion.
     // This preserves the 78a gate's requirement.
 
-    // Phase 78b: run the full enumeration state machine against the connected
-    // device, if any.
-    if let Some((port_num, speed)) = connected {
-        use crate::enumerate::XhciHostOps;
-        use kernel_core::usb::enumerate::{EnumContext, EnumState, run_enumeration};
-
-        syscall_lib::write_str(STDOUT_FILENO, "[xhci] starting enumeration on port ");
-        write_u8_dec(port_num);
-        syscall_lib::write_str(STDOUT_FILENO, "\n");
-
-        // EnumContext is seeded with the port's speed and port number.
-        // ep0_ring_iova is filled in after enable_slot allocates the slot ctx.
-        // We set it to 0 here; run_enumeration calls enable_slot first, which
-        // calls alloc_slot_context, and then we update ep0_ring_iova.
-        // Actually the state machine passes ep0_ring_iova from ctx into
-        // build_address_device_ctx. We need it set before AddressDevice runs.
-        // The flow is: EnableSlot → (BSR for FS/LS) AddressDeviceBsr → ...
-        // enable_slot in XhciHostOps allocates the slot context which sets
-        // ep0_ring_iova on the Controller. We then need to plumb it into ctx.
-        // The enumeration machine reads ctx.ep0_ring_iova when building the
-        // Address Device input context. We pre-set it to 0 and the ops impl
-        // will update it after alloc_slot_context.
-        let ctx = EnumContext {
-            speed: Some(speed),
-            port: port_num,
-            ep0_ring_iova: 0, // updated by enable_slot in ops
-            ..Default::default()
-        };
-
-        let mut ops = XhciHostOps::new(&mut controller, &irq);
-        let (final_state, final_ctx) = run_enumeration(EnumState::EnableSlot, ctx, &mut ops);
-
-        match final_state {
-            EnumState::Configured => {
-                syscall_lib::write_str(STDOUT_FILENO, "[xhci] enumeration complete\n");
-                print_descriptor_tree(&final_ctx);
-                syscall_lib::write_str(STDOUT_FILENO, XHCI_ENUM_CONFIGURED_SENTINEL);
-            }
-            EnumState::Error { code } => {
-                syscall_lib::write_str(STDOUT_FILENO, "[xhci] enumeration error code ");
-                write_u8_dec(code);
-                syscall_lib::write_str(STDOUT_FILENO, "\n");
-            }
-            EnumState::Timeout => {
-                syscall_lib::write_str(STDOUT_FILENO, "[xhci] enumeration timeout\n");
-            }
-            _ => {
-                syscall_lib::write_str(
-                    STDOUT_FILENO,
-                    "[xhci] enumeration ended in unexpected state\n",
-                );
-            }
-        }
-    } else {
+    if connected.is_empty() {
         // No device connected: fire a standalone Enable Slot to satisfy the
         // 78a bringup-smoke gate (it expects XHCI_BRINGUP:enable-slot:OK).
         controller.enqueue_enable_slot();
+    } else {
+        use crate::enumerate::XhciHostOps;
+        use kernel_core::usb::enumerate::{EnumContext, EnumState, run_enumeration};
+
+        // Phase 78c: enumerate each connected port into its own slot context so
+        // a keyboard AND mouse are both Configured and served.
+        for (port_num, speed) in connected {
+            syscall_lib::write_str(STDOUT_FILENO, "[xhci] starting enumeration on port ");
+            write_u8_dec(port_num);
+            syscall_lib::write_str(STDOUT_FILENO, "\n");
+
+            // ep0_ring_iova is 0 here; enable_slot allocates the per-slot
+            // context and the ops impl patches the real IOVA before Address
+            // Device builds its Input Context.
+            let ctx = EnumContext {
+                speed: Some(speed),
+                port: port_num,
+                ep0_ring_iova: 0,
+                ..Default::default()
+            };
+
+            let mut ops = XhciHostOps::new(&mut controller, &irq);
+            let (final_state, final_ctx) = run_enumeration(EnumState::EnableSlot, ctx, &mut ops);
+
+            match final_state {
+                EnumState::Configured => {
+                    syscall_lib::write_str(STDOUT_FILENO, "[xhci] enumeration complete\n");
+                    print_descriptor_tree(&final_ctx);
+                    syscall_lib::write_str(STDOUT_FILENO, XHCI_ENUM_CONFIGURED_SENTINEL);
+                    // Phase 78c: if this is a HID device, record it so the server
+                    // can hand it to the `usb-hid` class driver.
+                    if let Some(info) = crate::server::device_info_from_ctx(&final_ctx) {
+                        syscall_lib::write_str(STDOUT_FILENO, "[xhci] HID device registered\n");
+                        devices.push(info);
+                    }
+                }
+                EnumState::Error { code } => {
+                    syscall_lib::write_str(STDOUT_FILENO, "[xhci] enumeration error code ");
+                    write_u8_dec(code);
+                    syscall_lib::write_str(STDOUT_FILENO, "\n");
+                }
+                EnumState::Timeout => {
+                    syscall_lib::write_str(STDOUT_FILENO, "[xhci] enumeration timeout\n");
+                }
+                _ => {
+                    syscall_lib::write_str(
+                        STDOUT_FILENO,
+                        "[xhci] enumeration ended in unexpected state\n",
+                    );
+                }
+            }
+        }
     }
 
-    Ok((controller, irq))
+    Ok((controller, irq, devices))
 }
 
 #[cfg(not(test))]
@@ -347,13 +360,17 @@ fn program_main(_args: &[&str]) -> i32 {
     // Concurrent multi-controller event servicing (multiple IRQ loops) is a
     // later refinement — for now, bring up and enumerate all controllers, then
     // enter the event loop on the primary (first) successfully brought-up one.
-    let mut primary: Option<(Controller, IrqNotification)> = None;
+    let mut primary: Option<(
+        Controller,
+        IrqNotification,
+        alloc::vec::Vec<usb_core::protocol::AttachNotice>,
+    )> = None;
 
     for key in bdf_list {
         match bring_up_controller(key) {
-            Ok(pair) => {
+            Ok(triple) => {
                 if primary.is_none() {
-                    primary = Some(pair);
+                    primary = Some(triple);
                 }
                 // Additional controllers are enumerated (bring_up_controller ran
                 // the full discovery + USB enumeration path) but their event
@@ -378,9 +395,13 @@ fn program_main(_args: &[&str]) -> i32 {
         }
     }
 
-    // Step 3: enter the event loop on the primary controller.
+    // Step 3: enter the USB IPC server loop on the primary controller. The
+    // server registers the `usb` service, binds the IRQ, and serves class
+    // drivers — HID Boot-Protocol setup (`SET_PROTOCOL(0)` / `SET_IDLE(0)`) is
+    // performed by the `usb-hid` class driver itself via `ControlRequest`,
+    // after the service is registered. It never returns.
     match primary {
-        Some((mut controller, irq)) => controller.event_loop(irq),
+        Some((controller, irq, devices)) => server::run(controller, irq, devices),
         None => {
             // No controller came up successfully. Exit cleanly so the service
             // manager marks xhci_driver as permanently stopped.

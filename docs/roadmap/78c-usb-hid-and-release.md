@@ -1,6 +1,6 @@
 # Phase 78c - USB Host Foundation: HID + Integration + Release
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-78c
 **Depends on:** Phase 78b (USB Enumeration + Hub), Phase 56 (Display and Input Architecture) ✅, Phase 74 (IPC Capability Grants) ✅
 **Builds on:** Final sub-phase of the [Phase 78](./78-usb-host-foundation.md) USB theme. On top of the enumerating stack from [78b](./78b-usb-enumeration-hub.md), adds the HID class driver (Boot-Protocol keyboard + mouse), injects its events into the Phase 56 `kbd_server` / `mouse_server` input path, lands the full `usb-smoke` QMP gate, writes the learning doc, and cuts the `0.78.2` release with the new USB capability inventory entry. Completes the milestone: a USB keyboard types into the m3OS shell.
@@ -48,14 +48,14 @@ For a HID interface (`bInterfaceClass 0x03`), `SET_PROTOCOL(0)` selects fixed bo
 
 - Consumes the enumerated, Configure-Endpoint'd interrupt-IN endpoint from 78b via the `usb-core` `UsbClient`.
 - Reuses Phase 56's `KeyEvent` / `PointerEvent` wire formats (`kernel-core/src/input/events.rs`) verbatim — no new wire format.
-- Slots `usb-hid` into the `session_manager` start sequence (`DECLARED_SESSION_STEP_NAMES`, `kernel-core/src/session_supervisor.rs:89`) before `greeter`, as a static daemon receiving device-attach notifications over IPC.
+- Ships `usb-hid` as a static service-config daemon (`command=/drivers/usb-hid`, `type=daemon`, `restart=on-failure`, `depends=xhci_driver`), wired through `xtask::populate_ext2_files` + init `KNOWN_CONFIGS` like the other USB drivers — **not** a `DECLARED_SESSION_STEP_NAMES` session step. It discovers its bound devices by walking the xHCI server's `NextAttach` cursor (a pull), not a push notification channel.
 
 ## Implementation Outline
 
 1. `usb-hid` Boot keyboard: `SET_PROTOCOL(0)` + `SET_IDLE(0)`, poll interrupt-IN, decode → `KeyEvent`.
 2. `usb-hid` Boot mouse: decode → `PointerEvent`.
 3. Add the inject path to `kbd_server` / `mouse_server` (bounded pending-event queue + new IPC label).
-4. Stage `usb-hid` under `/drivers/`; wire its service config + `session_manager` ordering.
+4. Stage `usb-hid` under `/drivers/`; wire its service config + init `KNOWN_CONFIGS` ordering (`depends=xhci_driver`).
 5. Land the `usb-smoke` QMP gate (inject key → Transfer event → prompt).
 6. Report-Protocol skeleton (host-tested, deferred from live use).
 7. Write the learning doc; bump kernel to `0.78.2` + add the `AGENTS.md` capability entry.
@@ -81,7 +81,11 @@ For a HID interface (`bInterfaceClass 0x03`), `SET_PROTOCOL(0)` selects fixed bo
 
 ## Deferred Until Later
 
-- USB Report Protocol live use (touchpads, gaming mice, multi-touch) — skeleton host-tested only
-- USB mass storage, audio (HDA is the 1.0 audio bet), video (UVC) — post-1.0
-- Hot-plug event surface to userspace
-- USB-C / Power Delivery / DisplayPort alternate mode; xHCI Debug Capability
+All deferrals below are assigned to **[Phase 90 — USB Class Expansion](./90-usb-class-expansion.md)** (post-1.0). The original 78c deltas (single-slot controller, host-test-only mouse, kbd_server-only smoke) were **closed** in the 78c "100%" pass — multi-slot now serves a keyboard **and** mouse simultaneously, live mouse is asserted end-to-end, and the `usb-smoke` gate screendump-verifies a typed USB key rendering at the focused term prompt.
+
+- USB Report Protocol live use (touchpads, gaming mice, multi-touch, keyboard LEDs) — skeleton host-tested only → **Phase 90**
+- External-hub multi-tier enumeration (devices behind a `usb-hub`); `usbhub` becomes a live `usb`-service consumer → **Phase 90**
+- USB hot-plug event surface to userspace (`AttachNotice attached=false`, dynamic re-enumeration) → **Phase 90**
+- USB mass storage (BBB/UAS bulk via the `PageGrant` transport), audio (UAC — HDA is the 1.0 audio bet, Phase 80), video (UVC) → **Phase 90**
+- Multi-controller concurrent IRQ servicing → **Phase 90**
+- USB-C / Power Delivery / DisplayPort alternate mode; xHCI Debug Capability → **Phase 90 (Deferred Until Later)**

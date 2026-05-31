@@ -514,6 +514,17 @@ fn main() {
                 });
             cmd_xhci_enum_smoke(&smoke_args);
         }
+        // Phase 78c Track B.3 — boots with `-device qemu-xhci` + `usb-kbd`,
+        // injects a real keystroke over QMP, and asserts it travels the full
+        // USB input chain (interrupt-IN transfer → usb-hid decode → kbd_server).
+        Some("usb-smoke") => {
+            let smoke_args = parse_smoke_boot_args("usb-smoke", &args[2..]).unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            cmd_usb_smoke(&smoke_args);
+        }
         Some("ssh-e1000-banner-check") => {
             let banner_args = parse_ssh_e1000_banner_check_args(&args[2..]).unwrap_or_else(|err| {
                 eprintln!("Error: {err}");
@@ -768,7 +779,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio|xhci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio|xhci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio|xhci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio|xhci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio|xhci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio|xhci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -879,6 +890,9 @@ fn build_userspace_bins() {
         // Phase 78b Track B: ring-3 USB hub class driver.
         // `needs_alloc = true` for kernel-core + usb-core deps.
         ("usbhub", "usbhub", true),
+        // Phase 78c: ring-3 USB HID Boot-Protocol class driver (kbd + mouse).
+        // `needs_alloc = true` for kernel-core + usb-core deps.
+        ("usb_hid", "usb_hid", true),
         // Phase 55b Track F.3b: NVMe crash-and-restart end-to-end smoke
         // client. No alloc dependency — syscall_lib only.
         ("nvme-crash-smoke", "nvme-crash-smoke", false),
@@ -4503,12 +4517,17 @@ fn qemu_args_with_devices_resolved(
     // populated (the controller posts a Port Status Change and the driver's
     // A.7 port-reset path has a connected device to act on). The Enable Slot
     // milestone (Track A.5/C.1) does not itself require a connected device.
+    // Phase 78c: attach BOTH a usb-kbd and a usb-mouse so the multi-slot
+    // enumeration path (keyboard AND mouse) is exercised, matching the
+    // design-doc acceptance `-device qemu-xhci -device usb-kbd -device usb-mouse`.
     if devices.xhci {
         args.extend([
             "-device".to_string(),
             "qemu-xhci,id=xhci0,addr=0x6".to_string(),
             "-device".to_string(),
             "usb-kbd,bus=xhci0.0".to_string(),
+            "-device".to_string(),
+            "usb-mouse,bus=xhci0.0".to_string(),
         ]);
     }
 
@@ -8754,6 +8773,233 @@ fn xhci_enum_smoke_steps(timeout_secs: u64) -> Vec<SmokeStep> {
     ]
 }
 
+/// Phase 78c Track B.3 — the `usb-smoke` acceptance gate.
+///
+/// Boots m3OS with `-device qemu-xhci -device usb-kbd -device usb-mouse`, then
+/// drives **real** keyboard and mouse input over QMP and asserts each travels
+/// the full USB input chain. Unlike a `[xhci] N ports` serial sentinel (which
+/// proves only that the daemon ran), this asserts, in causal order:
+///
+/// 1. `XHCI_BRINGUP:enable-slot:OK` — an Enable Slot Command Completion event.
+/// 2. `XHCI_USB:server-ready` — the xHCI USB IPC server is registered + bound.
+/// 3. `usb-hid: polling` — the HID class driver bound the devices and is
+///    polling their interrupt-IN endpoints.
+/// 4. A QMP `send-key` injects `a` into the emulated `usb-kbd` (so an
+///    interrupt-IN report is produced **only in response to the injected key**
+///    — injection precedes the observation, never after).
+/// 5. `USB_HID:key kind=0 sym=0x00000061` — the resulting interrupt-IN Transfer
+///    event was decoded to a `KeyEvent` for `a` and accepted by `kbd_server`
+///    (the `usb-hid` inject blocks on kbd_server's ack before logging this).
+/// 6. A QMP relative-motion event into the emulated `usb-mouse` produces
+///    `USB_HID:mouse` — a live boot-mouse interrupt-IN report decoded by
+///    `usb-hid` and injected into `mouse_server`.
+/// 7. Typing a recognizable string over USB changes the focused term's prompt
+///    band by at least `MIN_PROMPT_ROWS` scanlines (QMP `screendump` pixel
+///    diff), proving the keystrokes render as glyphs end-to-end — not just that
+///    `kbd_server` accepted them.
+///
+/// Opt-in pre-push gate via `M3OS_USB_REGRESSION=1`.
+fn cmd_usb_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false, // graphical_login — autologin / serial path
+    );
+    let ovmf = find_ovmf();
+
+    let qmp_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&qmp_socket);
+    let vnc_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&vnc_socket);
+
+    let devices = DeviceSet {
+        xhci: true,
+        ..DeviceSet::default()
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, QemuDisplayMode::Headless, devices);
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    // Swap `-display none` for a VNC unix socket (keeps the VGA surface live
+    // for QMP) and add the QMP control socket the keystroke is injected over.
+    let mut idx = 0;
+    while idx + 1 < qemu_args.len() {
+        if qemu_args[idx] == "-display" && qemu_args[idx + 1] == "none" {
+            qemu_args[idx + 1] = format!("vnc=unix:{}", vnc_socket.display());
+            break;
+        }
+        idx += 1;
+    }
+    qemu_args.push("-qmp".to_string());
+    qemu_args.push(format!("unix:{},server,nowait", qmp_socket.display()));
+    // A standard VGA device so the QMP `screendump` reads the same framebuffer
+    // surface the compositor renders the focused term into (prompt-render step).
+    qemu_args.push("-vga".to_string());
+    qemu_args.push("std".to_string());
+
+    let out_dir = std::env::temp_dir().join("m3os-usb-smoke");
+    let _ = std::fs::create_dir_all(&out_dir);
+
+    println!(
+        "usb-smoke: launching QEMU with -device qemu-xhci + usb-kbd + usb-mouse (timeout {}s, qmp {})",
+        args.timeout_secs,
+        qmp_socket.display()
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let rx = spawn_serial_reader(stdout);
+    let mut serial_history = String::new();
+    let mut serial_buf = String::new();
+    let global_start = std::time::Instant::now();
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let step = std::time::Duration::from_secs(args.timeout_secs.min(180));
+
+    // Minimum changed scanlines in the focused term's prompt band (vs the
+    // pre-typing baseline) that prove the USB-injected characters actually
+    // rendered as glyphs. A line of ~17 typed chars changes a full text row's
+    // worth of pixels; a blinking cursor changes ~none by this diff metric.
+    const MIN_PROMPT_ROWS: u32 = 3;
+
+    let result: Result<(), String> = (|| {
+        let mut wait = |pat: &str| {
+            wait_for_serial_pattern(
+                &rx,
+                &mut serial_buf,
+                &mut serial_history,
+                pat,
+                step,
+                global_start,
+                global_timeout,
+            )
+        };
+        // (1) Enable Slot Command Completion (78a milestone, causal anchor).
+        wait("XHCI_BRINGUP:enable-slot:OK")?;
+        // (2) the USB IPC server is registered + the IRQ is bound.
+        wait("XHCI_USB:server-ready")?;
+        // (3) usb-hid bound the keyboard and is polling its interrupt-IN EP.
+        wait("usb-hid: polling")?;
+        // (4) the compositor + a focused term reached an interactive prompt, so
+        //     a KBD_EVENT_PULL consumer exists to render injected USB keys.
+        wait("TERM_SMOKE:prompt-ready")?;
+        println!("usb-smoke: USB stack + focused term ready — driving QMP");
+
+        let qmp_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut q = qmp::QmpClient::connect(&qmp_socket, qmp_deadline)
+            .map_err(|e| format!("qmp connect: {e}"))?;
+
+        // (5) Baseline framebuffer at the clean prompt (before any typing).
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let baseline_path = out_dir.join("00-prompt.ppm");
+        q.screendump(&baseline_path)
+            .map_err(|e| format!("baseline screendump: {e}"))?;
+        let baseline = ppm::read_ppm(&baseline_path)?;
+
+        // (6) Keyboard: inject a real `a` and assert it decoded to a KeyEvent
+        // (sym 0x61) — the emulated usb-kbd only emits a report in response, so
+        // injection strictly precedes the Transfer-event observation.
+        let mut decoded = false;
+        for attempt in 0..5 {
+            q.press_key("a", 40)
+                .map_err(|e| format!("qmp send-key: {e}"))?;
+            if wait("USB_HID:key kind=0 sym=0x00000061").is_ok() {
+                decoded = true;
+                break;
+            }
+            println!("usb-smoke: keystroke not yet observed (attempt {attempt})");
+        }
+        if !decoded {
+            return Err("injected keystroke never decoded by usb-hid".to_string());
+        }
+        println!("usb-smoke: keyboard report decoded USB -> usb-hid -> kbd_server");
+
+        // (7) Mouse: inject relative motion and assert usb-hid decoded a live
+        // boot-mouse report (USB_HID:mouse).
+        let mut mouse_ok = false;
+        for attempt in 0..5 {
+            q.send_pointer_rel(24, 18)
+                .map_err(|e| format!("qmp input-send-event: {e}"))?;
+            if wait("USB_HID:mouse").is_ok() {
+                mouse_ok = true;
+                break;
+            }
+            println!("usb-smoke: mouse report not yet observed (attempt {attempt})");
+        }
+        if !mouse_ok {
+            return Err("injected mouse motion never decoded by usb-hid".to_string());
+        }
+        println!("usb-smoke: mouse report decoded USB -> usb-hid -> mouse_server");
+
+        // (8) Prompt render: type a recognizable string over USB and assert the
+        // characters rendered as glyphs at the focused term (USB -> usb-hid ->
+        // kbd_server -> display_server -> term), proving the keystroke reaches a
+        // visible prompt — not just kbd_server.
+        for ch in "usbhidrendercheck".chars() {
+            let qc = ch.to_string();
+            q.press_key(&qc, 30)
+                .map_err(|e| format!("qmp type {ch}: {e}"))?;
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        let typed_path = out_dir.join("01-typed.ppm");
+        q.screendump(&typed_path)
+            .map_err(|e| format!("typed screendump: {e}"))?;
+        let typed = ppm::read_ppm(&typed_path)?;
+        // The focused term occupies the upper portion of the framebuffer; scan a
+        // broad band for rows whose pixels changed vs the clean-prompt baseline.
+        let changed = changed_rows_in_band(&baseline, &typed, 0.0, 0.7);
+        println!("usb-smoke: prompt band changed {changed} rows (min {MIN_PROMPT_ROWS})");
+        if changed < MIN_PROMPT_ROWS {
+            return Err(format!(
+                "USB keystrokes did not render at the prompt (only {changed} changed rows; \
+                 baseline {} typed {})",
+                baseline_path.display(),
+                typed_path.display()
+            ));
+        }
+        Ok(())
+    })();
+
+    let _ = child.kill();
+    let _ = child.wait();
+    // Unlink the QMP/VNC unix sockets so repeated runs/CI jobs don't accumulate
+    // stale `.sock` files in `$TMPDIR` (mirrors `cmd_less_render_probe`).
+    let _ = std::fs::remove_file(&qmp_socket);
+    let _ = std::fs::remove_file(&vnc_socket);
+    match result {
+        Ok(()) => {
+            let elapsed = global_start.elapsed().as_secs();
+            println!(
+                "usb-smoke: PASSED ({elapsed}s) — USB keyboard + mouse decoded live, and USB \
+                 keystrokes rendered at the focused term prompt"
+            );
+        }
+        Err(msg) => {
+            eprintln!("usb-smoke: FAILED\n{msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Build the command-line contract for the Phase 55c R3 SSH banner regression:
 ///
 /// `scripts/ssh_e1000_banner_check.sh <run-id> --timeout <secs> [--display]`
@@ -12951,6 +13197,9 @@ fn populate_ext2_files(
     // Phase 78b Track B — ring-3 USB hub class driver. Depends on xhci_driver
     // so the hub daemon starts after the host controller is up.
     let usbhub_conf = "name=usbhub\ncommand=/drivers/usbhub\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=xhci_driver\n";
+    // Phase 78c — ring-3 USB HID class driver. Depends on xhci_driver so it
+    // can look up the `usb` service the host controller registers.
+    let usb_hid_conf = "name=usb_hid\ncommand=/drivers/usb-hid\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=xhci_driver\n";
 
     // Phase 56 Track C.1: ring-3 display server (compositor) scaffold.
     // Depends on `kbd` so input arrives before the compositor binds the
@@ -13299,6 +13548,7 @@ fn populate_ext2_files(
     let e1000_driver_conf_tmp = output_dir.join("_tmp_e1000_driver_conf");
     let xhci_driver_conf_tmp = output_dir.join("_tmp_xhci_driver_conf");
     let usbhub_conf_tmp = output_dir.join("_tmp_usbhub_conf");
+    let usb_hid_conf_tmp = output_dir.join("_tmp_usb_hid_conf");
     let display_server_conf_tmp = output_dir.join("_tmp_display_server_conf");
     let session_manager_conf_tmp = output_dir.join("_tmp_session_manager_conf");
     let audio_server_conf_tmp = output_dir.join("_tmp_audio_server_conf");
@@ -13332,6 +13582,7 @@ fn populate_ext2_files(
     fs::write(&e1000_driver_conf_tmp, e1000_driver_conf).expect("write temp e1000_driver.conf");
     fs::write(&xhci_driver_conf_tmp, xhci_driver_conf).expect("write temp xhci_driver.conf");
     fs::write(&usbhub_conf_tmp, usbhub_conf).expect("write temp usbhub.conf");
+    fs::write(&usb_hid_conf_tmp, usb_hid_conf).expect("write temp usb-hid.conf");
     fs::write(&display_server_conf_tmp, display_server_conf)
         .expect("write temp display_server.conf");
     fs::write(&session_manager_conf_tmp, session_manager_conf)
@@ -13893,6 +14144,10 @@ fn populate_ext2_files(
          sif etc/services.d/usbhub.conf mode 0x81A4\n\
          sif etc/services.d/usbhub.conf uid 0\n\
          sif etc/services.d/usbhub.conf gid 0\n\
+         write \"{usb_hid_conf}\" etc/services.d/usb-hid.conf\n\
+         sif etc/services.d/usb-hid.conf mode 0x81A4\n\
+         sif etc/services.d/usb-hid.conf uid 0\n\
+         sif etc/services.d/usb-hid.conf gid 0\n\
          write \"{display_server_conf}\" etc/services.d/display_server.conf\n\
          sif etc/services.d/display_server.conf mode 0x81A4\n\
          sif etc/services.d/display_server.conf uid 0\n\
@@ -13940,6 +14195,7 @@ fn populate_ext2_files(
         e1000_driver_conf = e1000_driver_conf_tmp.display(),
         xhci_driver_conf = xhci_driver_conf_tmp.display(),
         usbhub_conf = usbhub_conf_tmp.display(),
+        usb_hid_conf = usb_hid_conf_tmp.display(),
         display_server_conf = display_server_conf_tmp.display(),
         session_manager_conf = session_manager_conf_tmp.display(),
         audio_server_conf = audio_server_conf_tmp.display(),

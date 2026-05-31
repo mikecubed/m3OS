@@ -11,17 +11,20 @@
 //! **Phase 78b Track B** implements the hub class logic in
 //! `kernel_core::usb::hub` (descriptor parsing, `PortId` topology tree,
 //! route-string computation) and wires this daemon into the build + service
-//! machinery. The live `AttachNotice` IPC path from the xHCI server to this
-//! daemon is deferred to **Phase 78c** (Track A.3), when the xHCI server
-//! publishes the notify channel. Until then the daemon starts, logs its
-//! presence, exercises the hub logic at a call site so it is verified at
+//! machinery. The xHCI server now publishes the `usb` service (Phase 78c), but
+//! it only classifies + enumerates ROOT-hub HID devices; **live external-hub
+//! enumeration (devices behind a `usb-hub`) is deferred to Phase 90 (USB Class
+//! Expansion)**, which adds hub-class publishing + the `SET_FEATURE`
+//! PORT_POWER/PORT_RESET child-device path. Until then the daemon starts, logs
+//! its presence, exercises the hub logic at a call site so it is verified at
 //! build time, and exits cleanly — exactly as `xhci_driver` exits 0 when no
 //! controller is present, so the service manager marks the service stopped
 //! without burning its restart budget.
 //!
-//! # Live enumeration path (78c, deferred)
+//! # Live enumeration path (Phase 90, deferred)
 //!
-//! Once the xHCI server publishes an `AttachNotice` IPC endpoint:
+//! Once the xHCI server publishes hub-class `AttachNotice`s and serves
+//! `GetDescriptors`/`ControlRequest` for hubs:
 //!
 //! 1. Receive `AttachNotice { interface_class: CLASS_HUB, … }`.
 //! 2. Issue `GET_DESCRIPTOR(Hub)` via the `UsbClient` request channel.
@@ -101,9 +104,8 @@ pub fn classify_hub_interface(b_interface_class: u8) -> bool {
 /// Hub daemon main — Phase 78b.
 ///
 /// Logs [`BOOT_LOG_MARKER`], exercises the hub classifier (verifying the link
-/// into `kernel_core::usb::hub`) and exits 0.  Live hub enumeration via the
-/// `AttachNotice` IPC channel lands in Phase 78c when the xHCI server side is
-/// wired up.
+/// into `kernel_core::usb::hub`) and exits 0.  Live external-hub enumeration via
+/// the `usb` service lands in Phase 90 (USB Class Expansion).
 #[cfg(not(test))]
 fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, BOOT_LOG_MARKER);
@@ -112,9 +114,9 @@ fn program_main(_args: &[&str]) -> i32 {
     // broken import or ABI mismatch would cause a link error here.
     let _ = classify_hub_interface(0x09); // CLASS_HUB
 
-    // Phase 78c: receive AttachNotice, enumerate ports, apply PORT_POWER /
-    // PORT_RESET, report devices. For now, exit cleanly so init's
-    // `on-failure` policy marks the service stopped rather than looping.
+    // Phase 90: receive hub AttachNotices, enumerate downstream ports, apply
+    // PORT_POWER / PORT_RESET, report child devices. For now, exit cleanly so
+    // init's `on-failure` policy marks the service stopped rather than looping.
     0
 }
 

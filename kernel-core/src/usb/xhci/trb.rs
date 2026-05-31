@@ -468,6 +468,26 @@ impl Trb {
         }
     }
 
+    /// Build a **Normal TRB** (xHCI §6.4.1.1) for a bulk or interrupt transfer
+    /// ring.
+    ///
+    /// `buf_iova` is the device-visible address of the transfer buffer and
+    /// `len` the number of bytes the controller may write (for an IN endpoint)
+    /// or read (OUT). `cycle` is the producer cycle bit. Both **IOC** (Interrupt
+    /// On Completion, bit 5) and **ISP** (Interrupt on Short Packet, bit 2) are
+    /// set so the controller posts a Transfer Event when the endpoint completes
+    /// — including a short report, where the residual reports the byte count.
+    /// This is the TRB the HID interrupt-IN poll uses to receive boot reports.
+    pub const fn normal(buf_iova: u64, len: u32, cycle: bool) -> Trb {
+        const IOC_BIT: u32 = 1 << 5;
+        const ISP_BIT: u32 = 1 << 2;
+        Trb {
+            parameter: buf_iova,
+            status: len & DATA_TRB_TRANSFER_LENGTH_MASK,
+            control: control_type_cycle(TRB_TYPE_NORMAL, cycle) | IOC_BIT | ISP_BIT,
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Command TRB builders (xHCI §6.4.3)
     // -----------------------------------------------------------------------
@@ -1183,6 +1203,22 @@ mod tests {
         assert!(!trb_cycle(&trb));
         // DIR bit clear for OUT.
         assert_eq!(trb.control & DATA_DIR_BIT, 0);
+    }
+
+    #[test]
+    fn normal_trb_interrupt_in() {
+        // Normal TRB used for an interrupt-IN HID poll: IOC + ISP set so a
+        // full or short report both post a Transfer Event.
+        let buf = 0x0030_0000u64;
+        let trb = Trb::normal(buf, 8, true);
+        assert_eq!(trb_type_raw(&trb), TRB_TYPE_NORMAL);
+        assert!(trb_cycle(&trb));
+        assert_eq!(trb.parameter, buf);
+        assert_eq!(trb.status & 0x1_FFFF, 8);
+        const IOC_BIT: u32 = 1 << 5;
+        const ISP_BIT: u32 = 1 << 2;
+        assert_ne!(trb.control & IOC_BIT, 0, "Normal TRB must set IOC");
+        assert_ne!(trb.control & ISP_BIT, 0, "Normal TRB must set ISP");
     }
 
     #[test]

@@ -1057,7 +1057,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.78.1"
+version = "0.78.2"
 dependencies = [
  "bootloader_api",
  "kernel-core",
@@ -2288,6 +2288,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "usb_hid"
+version = "0.78.2"
+dependencies = [
+ "kernel-core",
+ "syscall-lib",
+ "usb-core",
+]
+
+[[package]]
 name = "usbhub"
 version = "0.78.2"
 dependencies = [
@@ -2694,6 +2703,7 @@ dependencies = [
  "driver_runtime",
  "kernel-core",
  "syscall-lib",
+ "usb-core",
 ]
 
 [[package]]
