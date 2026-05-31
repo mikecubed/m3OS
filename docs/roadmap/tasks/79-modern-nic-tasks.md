@@ -1,0 +1,259 @@
+# Phase 79 — Modern Intel/Realtek NIC: Task List
+
+**Status:** Planned
+**Source Ref:** phase-79
+**Depends on:** Phase 55b (Ring-3 Driver Host) ✅, Phase 55c (Ring-3 Driver Correctness Closure) ✅, Phase 67 (IOMMU Substrate Completion) ✅, Phase 77 (Pre-1.0 Correctness — RFC 6298 TCP retransmit) ✅
+**Goal:** Ship IOMMU-isolated ring-3 drivers for the NIC families on modern x86 desktops/laptops — Intel e1000e/igb/igc and Realtek RTL8111/8168 + RTL8125 — feeding the in-kernel TCP/IP stack through `RemoteNic`, lifting the kernel NIC registry from one slot to a bounded set, adding a `multi-nic-smoke` gate, writing the learning doc, and cutting kernel `0.79.0`. Device IDs are corrected against Linux upstream + `pci.ids` (RTL8125 = `0x8125` not `0x8161`; `0x8168` is RTL8111/8168 Gigabit not "RTL8169"; e1000e set expanded to include I218/I219; igc i225 is the discrete Foxville controller).
+
+## Track Layout
+
+| Track | Scope | Dependencies | Status |
+|---|---|---|---|
+| A | Intel e1000e family (QEMU-testable; primary) | — (extracts its own shared ring engine in A.0) | Planned |
+| B | Intel igb / igc (advanced descriptors) | A (ring engine + `Descriptor` trait) | Planned |
+| C | Realtek RTL8111/8168 + RTL8169 (hardware-only) | — | Planned |
+| D | Realtek RTL8125 2.5GbE (hardware-only) | C | Planned |
+| E | Kernel-side bookkeeping (`REMOTE_NIC` → `Vec`; service wiring) | — | Planned |
+| F | Kernel version bump to `0.79.0` | A–E landed | Planned |
+| G | Learning doc | A–D (final accuracy pass only; may be drafted alongside) | Planned |
+| H | `multi-nic-smoke` gate | A, E (e1000+e1000e arms); B.1 for the igb arm | Planned |
+| I | Roadmap README + design-doc corrections | A–H | Planned |
+
+> **Ordering note.** Track A first extracts a shared ring engine + a `Descriptor` trait from the existing `userspace/drivers/e1000/`, which B reuses. C and D are independent of A/B (different vendor) and can proceed in parallel, but both are hardware-only (no QEMU model). E is independent and unblocks H. The `multi-nic-smoke` gate (H) lands its e1000 + e1000e arms once A + E are in; the **igb arm is added once B.1 lands** (it injects `-device igb`, a Track B deliverable). F/I are closeout. G can be drafted alongside A–D and finalized last.
+
+---
+
+## Track A — Intel e1000e family
+
+### A.0 — Extract shared ring engine + `Descriptor` trait
+
+**Files:**
+- `userspace/drivers/e1000/src/rings.rs`
+- `kernel-core/src/e1000.rs`
+- `userspace/lib/driver_runtime/src/` (new shared module, e.g. `net_ring.rs`)
+
+**Symbol:** new `trait Descriptor` (`Legacy16` impl wrapping `E1000RxDesc`/`E1000TxDesc`) + a generic ring engine factored from `rings.rs::{RX_RING_SIZE, TX_RING_SIZE, split_iova, initial_rdt}`
+**Why it matters:** e1000e reuses the legacy descriptor + ring math verbatim; igb/igc reuse only the control flow. A shared engine prevents four divergent copies of BAL/BAH/LEN/head-tail/DD-drain logic.
+
+**Acceptance:**
+- [ ] The existing 82540EM driver still builds and passes `device-smoke` (`E1000_SMOKE:link:PASS`) on `Legacy16` after the extraction — zero behavior change.
+- [ ] Host test confirms `Legacy16` descriptor `size() == 16` and the RDLEN/TDLEN multiple-of-128 gates still hold.
+
+### A.1 — e1000e PCI claim + device-ID match
+
+**File:** `userspace/drivers/e1000e/src/main.rs` (new; model on `userspace/drivers/e1000/src/main.rs::program_main`)
+**Symbol:** `program_main`, an `E1000E_DEVICE_IDS` const set, device-ID match replacing the e1000 `SENTINEL_BDF` BDF gate
+**Why it matters:** binds the actual modern Intel client silicon (82574/82579/I217/I218/I219) instead of one hardcoded QEMU BDF.
+
+**Acceptance:**
+- [ ] Matches the representative e1000e ID set `{0x10D3, 0x10F6, 0x150C, 0x1502, 0x1503, 0x153A, 0x153B, I218 set 0x155A/0x1559/0x15A0–0x15A3, representative I219 set 0x156F/0x1570/0x15B7–0x15BE}`.
+- [ ] Under `cargo xtask run` with `-device e1000e`, the driver claims the device and reaches its IRQ/IPC event loop, emitting a `E1000E_SMOKE:server:READY` sentinel.
+
+### A.2 — e1000e legacy-descriptor rings
+
+**Files:**
+- `userspace/drivers/e1000e/src/rings.rs` (re-exports/uses the A.0 engine)
+- `userspace/drivers/e1000e/src/init.rs`
+
+**Symbol:** `E1000eDevice::bring_up` (model on `e1000::init::E1000Device::bring_up`), selecting `Descriptor = Legacy16`
+**Depends on:** A.0
+**Why it matters:** proves the shared ring engine works for a second Intel family with no descriptor changes.
+
+**Acceptance:**
+- [ ] One TX ring + one RX ring initialize; RDLEN/TDLEN multiple-of-128 compile gates pass.
+- [ ] RX descriptors drain on the DD bit and TX completion is observed via the inline DD poll under `-device e1000e`.
+
+### A.3 — e1000e MAC + link + interrupts
+
+**File:** `userspace/drivers/e1000e/src/io.rs` + `init.rs` (reuse `e1000::init::read_mac` → `kernel_core::e1000::decode_mac_from_ra`, `e1000::io::{arm_irqs, compute_irq_outcome}`)
+**Symbol:** `read_mac` (RAL0 `0x5400`/RAH0 `0x5404`), `arm_irqs` (IMS subset = `irq_cause::{RXT0,RXDMT0,RXO,LSC}`, composed in `e1000::init::ims_bring_up_value`), `compute_irq_outcome` (link from `status::LU` bit 1 + `ICR.LSC`)
+**Depends on:** A.1, A.2
+**Why it matters:** MAC-from-RAL0/RAH0 is family-agnostic and needs zero EEPROM code; a hardcoded 82540EM EERD decode would mis-read on e1000e (different NVM shift/semaphore semantics).
+
+**Acceptance:**
+- [ ] Driver reads a valid MAC from RAL0/RAH0 (RAH0.AV bit 31 set) under `-device e1000e`.
+- [ ] System gets a DHCP lease and `ping` succeeds over the e1000e path; INTx or single-MSI is used (no MSI-X required).
+
+---
+
+## Track B — Intel igb / igc
+
+### B.1 — Advanced-descriptor path + igb driver
+
+**Files:**
+- `userspace/drivers/igb/src/main.rs` (new)
+- `userspace/lib/driver_runtime/src/net_ring.rs` (add `Advanced` impl of the A.0 `Descriptor` trait)
+
+**Symbol:** `Advanced` descriptor impl (adv-TX `buffer_addr`/`cmd_type_len`/`olinfo_status` read + write-back union per Linux `igb/e1000_82575.h`); EICR/EIMS single-vector interrupt path
+**Why it matters:** igb/igc do **not** accept the legacy descriptor; the advanced read/write-back union is the load-bearing difference and the EICR block replaces ICR.
+
+**Acceptance:**
+- [ ] Matches the igb ID set (`0x10A7/0x10A9/0x10D6` 82575; 82576 set; `0x1521–0x1524` I350; `0x1533/0x1536/0x1537/0x1538/0x157B/0x157C` I210; `0x1539` I211; `0x1F40/0x1F41/0x1F45` I354), and **claims no e1000e or igc ID** (asserted by a host test over the family ID sets).
+- [ ] Host test exercises advanced-descriptor encode/decode (TX cmd_type_len/olinfo_status fields, RX write-back status).
+- [ ] igb reaches link under `-device igb` on QEMU ≥ 8.0 (modest feature set acceptable).
+
+### B.2 — igc (I225/I226) + Clause-45 MMD PHY
+
+**File:** `userspace/drivers/igc/src/main.rs` (new)
+**Symbol:** `IGC_DEVICE_IDS` const; optional `igc_read_xmdio_reg`-style Clause-45 MMD PHY accessor
+**Why it matters:** igc is the common 2021+ Intel desktop NIC (discrete Foxville 2.5GbE PCIe), and its 2.5GBASE-T PHY needs MMD indirection if copper auto-neg disambiguation is required. The igb-vs-igc ID split (i210/i211 → igb, i225/i226 → igc) decides which driver binds.
+
+**Acceptance:**
+- [ ] (CI) Matches **only** the igc IDs `{0x15F2, 0x15F3, 0x15F8, 0x0D9F, 0x3100, 0x3101, 0x5502, 0x125B, 0x125C, 0x125D, 0x3102, 0x5503}` (I225/I226) and claims no igb ID — asserted by a host test.
+- [ ] (CI) Driver builds, advanced-descriptor + MMD-PHY logic is unit-tested, and `multi-nic-smoke` prints the igc exclusion reason ("no QEMU igc model").
+- [ ] (hardware-only; deferred to Phase 83 if no card) On a real I225/I226 board, DHCP lease + `ping` succeed.
+
+---
+
+## Track C — Realtek RTL8111/8168 + RTL8169
+
+### C.1 — r8169 ring (OWN-bit/TxPoll) + PCI claim
+
+**Files:**
+- `userspace/drivers/r8169/src/main.rs` (new)
+- `userspace/drivers/r8169/src/rings.rs` (new — Realtek layout, not the Intel engine)
+
+**Symbol:** r8169 descriptor (`DescOwn` 0x80000000 / `EOR` 0x40000000 / `FS` 0x20000000 / `LS` 0x10000000); `TxPoll` doorbell (0x38, NPQ=0x40); Cfg9346 (0x50) unlock(0xC0)/lock(0x00); TxDescStartAddrLow/High (0x20/0x24), RxDescStartAddrLow/High (0xE4/0xE8)
+**Why it matters:** Realtek has no head/tail registers — ownership is per-descriptor and TX is doorbell-kicked; the ring is a from-scratch design, not a re-skin of the Intel engine.
+
+**Acceptance:**
+- [ ] (CI) Matches the Realtek GbE set `{0x8168, 0x8169, 0x8161, 0x8167, 0x8136}`; a host test confirms the ring builder produces a 256-byte-aligned ring with correct OWN/EOR/FS/LS bit placement.
+- [ ] (hardware-only; deferred to Phase 83 if no card) On a real RTL8111/8168 card (or VFIO passthrough), DHCP lease + `ping` succeed; the TxPoll doorbell starts transmission.
+
+### C.2 — XID chip-versioning + per-revision reset quirks
+
+**File:** `userspace/drivers/r8169/src/version.rs` (new) + `kernel-core/src/r8169.rs` (new, host-testable XID table)
+**Symbol:** `mac_version_from_xid` — `{mask, value}` table over the TxConfig (0x40) XID (model on Linux `r8169_main.c::rtl8169_get_mac_version`); per-version soft-reset (ChipCmd 0x37 RST bit)
+**Why it matters:** r8169 dispatches on a runtime-read XID, not the PCI device ID — every reset/init/PHY/IRQ quirk branches on the computed `mac_version`, so this table is the spine of the driver.
+
+**Acceptance:**
+- [ ] (CI) Host test verifies the XID → `mac_version` table for a representative set of revisions (mask `0x7cf`/`0x7c8`).
+- [ ] (hardware-only; deferred to Phase 83 if no card) Soft reset succeeds: ChipCmd `RST` self-clears within a bounded poll on the available revision.
+
+---
+
+## Track D — Realtek RTL8125 (2.5G)
+
+### D.1 — Corrected ID + V2 interrupt block + firmware load
+
+**Files:**
+- `userspace/drivers/r8125/src/main.rs` (new)
+- `kernel/initrd/` / ext2 image (signed PHY firmware blob staging)
+
+**Symbol:** `0x8125` (RTL8125/8125B; optionally `0x8126` RTL8126 5GbE) device match; V2 interrupt regs IMR_V2_CLEAR (0x150) / ISR_V2 (0x154) / IMR_V2_SET (0x158) + INT_CFG0_8125 (0x34); firmware-load path
+**Why it matters:** the original draft's `0x8161` is a 1GbE part — matching it for "2.5G" would bind the wrong silicon. RTL8125 also replaces the 16-bit IMR/ISR with a 32-bit V2 block and needs signed PHY firmware to link reliably.
+
+**Acceptance:**
+- [ ] (CI) Binds `0x8125` (**not** `0x8161`) — host test over the ID set; the interrupt subsystem version-branches to the 32-bit V2 registers (`0x150`/`0x154`/`0x158`); the firmware-load path validates an `rtl_nic` `.fw` blob header and, on an absent/corrupt blob, **skips with a degraded-link warning sentinel rather than panicking** (host-tested). Firmware blobs are NOT vendored — they are sourced from host `linux-firmware` at image-build time with the license recorded.
+- [ ] (hardware-only; deferred to Phase 83 if no card) On a real RTL8125 card, DHCP lease + `ping` succeed.
+
+---
+
+## Track E — Kernel-side bookkeeping
+
+### E.1 — Lift `REMOTE_NIC` singleton to a bounded `Vec`
+
+**File:** `kernel/src/net/remote.rs`
+**Symbol:** `REMOTE_NIC: IrqSafeMutex<Option<NicEntry>>` → `Vec<NicEntry>`; update `RemoteNic::register`, `is_registered` (+ `REMOTE_NIC_REGISTERED` fast path), `inject_rx_frame`, `send_frame`
+**Why it matters:** the whole stack has assumed exactly one NIC since Phase 55b; several families may be present, so the registry must hold a small set with a first-registered default route.
+
+**Acceptance:**
+- [ ] Kernel host test registers two `NicEntry` values and routes an injected RX frame to the correct index.
+- [ ] The single-NIC fast path is preserved: `-device e1000-82540em` still passes `device-smoke` with no regression.
+- [ ] The default-route selector returns index 0 (== the first-registered `NicEntry`) in the two-NIC host test. (Multi-NIC routing tables remain out of scope — see Documentation Notes.)
+
+### E.2 — Per-driver service wiring (the four places)
+
+**Files:**
+- `Cargo.toml` (`members`)
+- `xtask/src/main.rs` (`build_userspace_bins` bins array ~line 886; `--features os-binary` map ~line 1054; `populate_ext2_files` confs ~line 13191)
+- `kernel/src/fs/ramdisk.rs` (`static *_DRIVER_ELF` + `DRIVERS_ENTRIES` ~line 1156)
+- `userspace/init/src/main.rs` (`KNOWN_CONFIGS` ~line 183)
+
+**Symbol:** `e1000e.conf`/`igb.conf`/`igc.conf`/`r8169.conf`/`r8125.conf` + matching bins/ELF/members entries
+**Why it matters:** missing any of the four places means the driver is not built, not embedded, or not found at runtime (per AGENTS.md "Adding a New Userspace Binary").
+
+**Acceptance:**
+- [ ] After `cargo xtask clean && cargo xtask run`, init logs `driver.registered name=e1000e` (and the other families present); first-to-match-wins probe order is verified.
+- [ ] `cargo xtask check` passes with all five new crates as workspace members.
+
+---
+
+## Track F — Kernel version bump to 0.79.0
+
+### F.1 — Bump kernel version to `0.79.0`
+
+**Files:**
+- `kernel/Cargo.toml` (line 3: `version = "0.78.2"` → `"0.79.0"`)
+- `AGENTS.md` (line 7: `kernel **v0.78.2**` → `**v0.79.0**`)
+
+**Symbol:** `version` (Cargo manifest) + the AGENTS.md capability-inventory version string
+**Why it matters:** the kernel version is the release marker for the phase; the AGENTS.md maintenance policy permits exactly this bump on phase landing.
+
+**Acceptance:**
+- [ ] Both files read `0.79.0`; `cargo xtask check` passes.
+- [ ] No kernel-version string remains at `0.78.2` (`grep -rn '0\.78\.2'` returns only historical changelog/roadmap references, not the live version).
+
+---
+
+## Track G — Learning doc
+
+### G.1 — Author `docs/79-modern-nic.md` learning doc + cross-link
+
+**Files:**
+- `docs/79-modern-nic.md` (new)
+- `docs/16-network.md` (update the Phase-55 "82540EM only / e1000e not supported" note ~line 171)
+
+**Symbol:** new learning doc following the design-doc template sections; a cross-link added to `docs/16-network.md`
+**Why it matters:** AGENTS.md mandates a learning doc per phase; `docs/16-network.md` currently states e1000e is unsupported and must be updated to point forward.
+
+**Acceptance:**
+- [ ] `docs/79-modern-nic.md` exists and covers: the universal TX-ring/RX-ring/interrupt model; Intel legacy-vs-advanced descriptors; the Realtek OWN-bit/TxPoll/XID model; and per-family QEMU emulation reality.
+- [ ] `docs/79-modern-nic.md` conforms to the design-doc template sections (the same criterion the design doc's Acceptance imposes on the learning doc).
+- [ ] `docs/16-network.md`'s Phase-55 note is updated and links to `docs/79-modern-nic.md`.
+
+---
+
+## Track H — multi-nic-smoke gate
+
+### H.1 — Add the `multi-nic-smoke` xtask gate
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `cmd_multi_nic_smoke` (model on `cmd_device_smoke` ~line 8423); extend `DeviceSet` + `qemu_args_with_devices_resolved` (~line 4281) to inject `e1000` + `e1000e` (+ `igb` behind a QEMU-version guard) with distinct `netdev`/MAC; opt-in `M3OS_*_REGRESSION` env gating for hardware-only families
+**Why it matters:** a serial-sentinel gate proves each emulated driver reaches link; QEMU has no igc/Realtek model, so those must be skipped-with-reason rather than silently passing.
+
+**Acceptance:**
+- [ ] `cargo xtask multi-nic-smoke` boots each emulated family in turn and asserts a per-driver link sentinel (e.g. `E1000E_SMOKE:link:PASS`).
+- [ ] igc and all Realtek families are **skipped with a printed reason** unless their `M3OS_*_REGRESSION` env var is set; the gate is added to the AGENTS.md opt-in gate table.
+- [ ] The existing `device-smoke` (82540EM) sentinel still passes (no regression).
+
+---
+
+## Track I — Roadmap README + design-doc corrections
+
+### I.1 — Update README row + apply design-doc corrections on landing
+
+**Files:**
+- `docs/roadmap/README.md` (Phase 79 row ~line 419)
+- `docs/roadmap/79-modern-nic.md`
+
+**Symbol:** README row 79 Status/Tasks cells; design-doc device-ID + symbol corrections
+**Why it matters:** the roadmap README is the canonical status index; the design doc's device-ID table and host-symbol names must match reality.
+
+**Acceptance:**
+- [ ] On landing, README row 79 Status flips `Planned → Complete` and the Tasks cell links `./tasks/79-modern-nic-tasks.md`.
+- [ ] The design doc's device-ID table and host-symbol references (`kernel/src/net/remote.rs::REMOTE_NIC`; `sys_device_claim`/`sys_device_mmio_map`/`sys_device_dma_alloc`/`sys_device_irq_subscribe`) match the in-tree reality (already corrected in this planning pass — this task verifies no drift at landing).
+
+---
+
+## Documentation Notes
+
+- **Device IDs are corrected vs the original Phase 79 draft** and cross-verified against Linux upstream headers + `pci.ids`: RTL8125 = `0x8125` (the draft's `0x8161` is a 1GbE RTL8111/8168 part); `0x8168` is the RTL8111/8168 PCIe **Gigabit** family, not the original parallel-PCI RTL8169 (`0x8169`); the e1000e set is expanded to include the common I218/I219 IDs; igc i225 is the **discrete Foxville 2.5GbE PCIe controller**, not a Comet Lake PCH-integrated MAC (the PCH-integrated MACs of that era are I219 parts, handled by e1000e).
+- **Host-symbol names corrected:** the NIC registry to lift is `kernel/src/net/remote.rs::REMOTE_NIC` (there is no `kernel-core::net::nic_registry`); the Phase 55b host syscalls are `sys_device_claim` / `sys_device_mmio_map` / `sys_device_dma_alloc` / `sys_device_irq_subscribe` (not `sys_device_pci_probe` / `iommu_map_bar` / `sys_device_irq_bind`).
+- **The in-tree e1000 driver gates on a hardcoded BDF** (`SENTINEL_BDF`), not a device-ID compare, and reads its MAC from **RAL0/RAH0** (not EEPROM). The new drivers replace the BDF gate with device-ID matching and keep the RAL0/RAH0 MAC path (no new EEPROM/EERD code needed for Intel families).
+- **Descriptor reuse is family-specific:** e1000e reuses the legacy 16-byte descriptor + most of the ring code; igb/igc require advanced descriptors and share only the ring control flow; Realtek is an entirely separate ring design.
+- **QEMU emulation reality drives the gate:** e1000/e1000e are CI-testable, igb requires QEMU ≥ 8.0 with a partial model, and igc + all Realtek families have no QEMU model (hardware/VFIO-passthrough only, behind `M3OS_*_REGRESSION`).
+- **Multi-NIC routing is out of scope.** E.1 lifts the registry to a bounded `Vec` and picks the first-registered NIC as the single default interface; per-destination routing tables across NICs are deferred post-1.0 (this is a prose scope boundary, not a coded behavior).
+- **Realtek firmware is shared across Tracks C and D.** The signed-PHY-firmware path is gated on the XID-computed `mac_version` (8168G-and-later, plus all 8125), not on Track D alone; blobs are sourced from host `linux-firmware` at image-build time and are not vendored.
+- Line-number references above (e.g. `~line 886`, `~line 1156`, `~line 183`) are accurate as of this writing and will drift; the function/symbol names are the durable anchors — locate by symbol, not by line.
+- Prefer the exact files/symbols above over directory-level descriptions when implementation begins; update each acceptance checkbox as the corresponding behavior lands.
