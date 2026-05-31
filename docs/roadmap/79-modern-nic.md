@@ -1,6 +1,6 @@
 # Phase 79 - Modern Intel/Realtek NIC
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-79
 **Depends on:** Phase 55b (Ring-3 Driver Host) ✅, Phase 55c (Ring-3 Driver Correctness Closure) ✅, Phase 67 (IOMMU Substrate Completion) ✅, Phase 77 (Pre-1.0 Correctness — RFC 6298 TCP retransmit) ✅
 **Builds on:** Extends the Phase 55b ring-3 NIC story (today: a single 82540EM e1000 driver, `0x8086:0x100E`, BDF-gated) with the NIC silicon actually shipping on 2010-and-later x86 desktops and laptops — Intel e1000e/igb/igc and the Realtek r8169 family (RTL8111/8168 GbE and RTL8125 2.5GbE).

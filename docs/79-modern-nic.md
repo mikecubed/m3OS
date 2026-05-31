@@ -1,6 +1,6 @@
 # Phase 79 — Modern Intel/Realtek NIC (Learning Doc)
 
-**Status:** In progress
+**Status:** Complete
 **Source Ref:** phase-79
 **Depends on:** Phase 55b (Ring-3 Driver Host), Phase 55c (Ring-3 Driver Correctness Closure), Phase 67 (IOMMU Substrate Completion), Phase 77 (RFC 6298 TCP retransmit)
 **Builds on:** the single 82540EM ring-3 e1000 driver (`0x8086:0x100E`, BDF-gated) — generalising it to the NIC silicon that actually ships on 2010-and-later x86 desktops/laptops.
@@ -28,6 +28,12 @@ The pre-1.0 audit grades the BDF-hardcoded single-e1000 driver as a real-hardwar
 ### The universal NIC model (all five drivers)
 
 Every driver: claim its PCI function (`DeviceHandle::claim`), map BAR0 (`Mmio<T>`), allocate TX/RX descriptor rings + per-slot buffers as IOMMU-constrained `DmaBuffer<T>`, subscribe to its IRQ (`IrqNotification`), register a `net.nic` IPC endpoint, and run a single-threaded loop multiplexing the IRQ notification with served IPC (Phase 55c bound-notification pattern). The kernel `RemoteNic` façade is unchanged — the in-kernel TCP/IP stack does not care which silicon is at the other end.
+
+### Interrupt mode: INTx vs MSI-X (a load-bearing subtlety)
+
+The driver loop is **interrupt-driven for RX** — it blocks until the IRQ notification wakes it, then drains the RX ring. So if the interrupt never reaches the driver, the RX ring never drains and *no packets move even though link is up and the device claims/initialises cleanly.* This is exactly the trap e1000e fell into: the device-host IRQ allocator (`allocate_device_vector`) preferred **MSI-X** whenever the device advertised it, and the 82574/82576 *do*. But these legacy-model NIC drivers set the simple `ICR`/`IMS` (Realtek: classic `ISR`) cause registers and program **no MSI-X cause routing** (the 82574/82576 `IVAR`/`EIMS` block). The kernel duly enabled MSI-X, but the device — with `IVAR` unprogrammed — sent nothing. The classic 82540EM e1000 dodged this only because it has no MSI-X capability and so fell to INTx.
+
+The fix gates on PCI class: **Ethernet-class (`0x02`) device-host devices use legacy INTx**, while storage (nvme, `0x01`) and the xHCI host controller (serial-bus, `0x0C`) — which *do* program their own MSI-X routing — keep MSI-X. With INTx the 82574/82576 assert the legacy interrupt pin on any unmasked cause, the kernel routes it through the I/O APIC, and the shared loop drains RX as designed. Lesson: *MSI-X is not free* — enabling it commits the driver to programming per-cause vector routing, and "interrupt-capable" silicon can be silently interrupt-*less* if that routing is skipped. A single-message **MSI** would also have worked (one message per `cause & mask`), which is why the acceptance reads "INTx **or single-MSI** (no MSI-X required)".
 
 ### Intel legacy vs advanced descriptors
 
