@@ -56,15 +56,36 @@ syscall_lib::entry_point!(program_main);
 #[cfg(not(test))]
 fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, BOOT_LOG_MARKER);
-    let functions = driver_runtime::enumerate_ethernet_functions();
-    let key = match select_r8125(&functions) {
-        Some(k) => k,
-        None => {
-            syscall_lib::write_str(
-                STDOUT_FILENO,
-                "r8125_driver: no r8125 device present — exiting cleanly\n",
-            );
-            return 0;
+    // PCI discovery can transiently miss the device: `enumerate_ethernet_functions`
+    // drops any function whose pre-claim config-space read fails, and at boot all
+    // the NIC drivers (e1000/e1000e/igb/igc/r8169/r8125) enumerate config space
+    // concurrently. On real silicon (observed on an RTL8125B via VFIO passthrough)
+    // a contended config read drops the 8125 for a scan, so a single attempt can
+    // see "no device" even though the card is present. Retry a bounded number of
+    // times with a short backoff before concluding the device is absent. When the
+    // card is genuinely absent (the common QEMU case) every attempt returns the
+    // same empty result, so this only adds a few quick PCI scans to that boot.
+    let key = {
+        let mut found = None;
+        for _ in 0..12 {
+            let functions = driver_runtime::enumerate_ethernet_functions();
+            if let Some(k) = select_r8125(&functions) {
+                found = Some(k);
+                break;
+            }
+            for _ in 0..200_000 {
+                core::hint::spin_loop();
+            }
+        }
+        match found {
+            Some(k) => k,
+            None => {
+                syscall_lib::write_str(
+                    STDOUT_FILENO,
+                    "r8125_driver: no r8125 device present — exiting cleanly\n",
+                );
+                return 0;
+            }
         }
     };
 
