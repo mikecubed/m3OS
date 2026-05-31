@@ -25,10 +25,6 @@ fn alloc_error(_layout: Layout) -> ! {
 
 syscall_lib::entry_point!(program_main);
 
-/// Reply cap handle — kernel inserts the one-shot reply cap at handle 1
-/// after each successful recv.
-const REPLY_CAP_HANDLE: u32 = 1;
-
 /// Negative `ENOSYS` as a reply label — signals "service exists but this
 /// operation is not implemented", distinct from `u64::MAX` which callers
 /// already use as a transport-level failure sentinel.
@@ -61,28 +57,26 @@ fn program_main(_args: &[&str]) -> i32 {
     let mut msg = syscall_lib::IpcMessage::new(0);
     let mut buf = [0u8; 64];
 
-    syscall_lib::ipc_recv_msg(ep_handle, &mut msg, &mut buf);
-
     loop {
+        let rc = syscall_lib::ipc_recv_msg(ep_handle, &mut msg, &mut buf);
+        if rc == u64::MAX {
+            continue;
+        }
+        // Use the reply cap the kernel staged for this CALL-shaped message
+        // (`msg.data[3]`), never a hardcoded slot. A fire-and-forget sender
+        // carries no reply cap (`msg.data[3] == 0`), and replying anyway on a
+        // fixed handle is unsafe: the kernel's `ipc_reply` path removes the
+        // cap at the given handle *before* type-checking it (`slot.take()` in
+        // `CapabilityTable::remove`), so a bogus handle silently deletes an
+        // unrelated cap — e.g. our own endpoint cap — from our table. Drop
+        // such messages instead.
+        let Some(reply_cap) = msg.reply_cap_handle() else {
+            continue;
+        };
         // Reply with -ENOSYS — no operations implemented in this slice.
         // Using a specific errno (not the u64::MAX transport sentinel) lets
         // callers tell "service up, op not implemented" from "IPC failure".
-        msg = syscall_lib::IpcMessage::new(0);
-        let ret = syscall_lib::ipc_reply_recv_msg(
-            REPLY_CAP_HANDLE,
-            NEG_ENOSYS,
-            ep_handle,
-            &mut msg,
-            &mut buf,
-        );
-        if ret == u64::MAX {
-            // Reply cap missing or revoked — either the sender used
-            // `ipc_send` (no reply expected) or a signal revoked the cap
-            // before we got here. In both cases no reply is owed; fall
-            // back to a plain recv so this loop does not hot-spin on the
-            // failing reply-recv syscall.
-            syscall_lib::ipc_recv_msg(ep_handle, &mut msg, &mut buf);
-        }
+        syscall_lib::ipc_reply(reply_cap, NEG_ENOSYS, 0);
     }
 }
 

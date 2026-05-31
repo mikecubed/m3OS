@@ -75,10 +75,6 @@ const CONSOLE_WRITE: u64 = 0;
 /// Maximum bytes per CONSOLE_WRITE request.
 const MAX_CONSOLE_WRITE_LEN: usize = 4096;
 
-/// Reply cap handle — the kernel inserts the one-shot reply cap at handle 1
-/// after each successful `ipc_recv`.
-const REPLY_CAP_HANDLE: u32 = 1;
-
 // ---------------------------------------------------------------------------
 // Server loop
 // ---------------------------------------------------------------------------
@@ -95,6 +91,19 @@ fn server_loop_stdout(ep_handle: u32) -> ! {
     syscall_lib::ipc_recv_msg(ep_handle, &mut msg, &mut buf);
 
     loop {
+        // Use the one-shot reply cap the kernel staged for this call (its
+        // dynamic handle is in `msg.data[3]`), never a hardcoded slot. A
+        // fire-and-forget sender carries no reply cap (`data[3] == 0`):
+        // replying anyway on a fixed handle is unsafe because the kernel's
+        // `ipc_reply` path `slot.take()`s the cap *before* type-checking it,
+        // silently deleting an unrelated cap from our own table. Drop such
+        // messages and just wait for the next one.
+        let Some(reply_cap) = msg.reply_cap_handle() else {
+            msg = syscall_lib::IpcMessage::new(0);
+            syscall_lib::ipc_recv_msg(ep_handle, &mut msg, &mut buf);
+            continue;
+        };
+
         let reply_label = match msg.label {
             CONSOLE_WRITE => {
                 let len = (msg.data[1] as usize).min(MAX_CONSOLE_WRITE_LEN);
@@ -108,15 +117,9 @@ fn server_loop_stdout(ep_handle: u32) -> ! {
             _ => u64::MAX,
         };
 
-        // Reply and wait for the next message.
+        // Reply on the staged cap and wait for the next message.
         msg = syscall_lib::IpcMessage::new(0);
-        syscall_lib::ipc_reply_recv_msg(
-            REPLY_CAP_HANDLE,
-            reply_label,
-            ep_handle,
-            &mut msg,
-            &mut buf,
-        );
+        syscall_lib::ipc_reply_recv_msg(reply_cap, reply_label, ep_handle, &mut msg, &mut buf);
     }
 }
 
@@ -128,6 +131,15 @@ fn server_loop(renderer: &mut FbRenderer, ep_handle: u32) -> ! {
     syscall_lib::ipc_recv_msg(ep_handle, &mut msg, &mut buf);
 
     loop {
+        // See `server_loop_stdout`: reply only on the kernel-staged one-shot
+        // cap (`msg.data[3]`); drop fire-and-forget sends rather than reply on
+        // a fixed handle that would delete an unrelated cap from our table.
+        let Some(reply_cap) = msg.reply_cap_handle() else {
+            msg = syscall_lib::IpcMessage::new(0);
+            syscall_lib::ipc_recv_msg(ep_handle, &mut msg, &mut buf);
+            continue;
+        };
+
         let reply_label = match msg.label {
             CONSOLE_WRITE => {
                 let len = (msg.data[1] as usize).min(MAX_CONSOLE_WRITE_LEN);
@@ -137,13 +149,7 @@ fn server_loop(renderer: &mut FbRenderer, ep_handle: u32) -> ! {
         };
 
         msg = syscall_lib::IpcMessage::new(0);
-        syscall_lib::ipc_reply_recv_msg(
-            REPLY_CAP_HANDLE,
-            reply_label,
-            ep_handle,
-            &mut msg,
-            &mut buf,
-        );
+        syscall_lib::ipc_reply_recv_msg(reply_cap, reply_label, ep_handle, &mut msg, &mut buf);
     }
 }
 

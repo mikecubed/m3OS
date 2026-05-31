@@ -83,9 +83,6 @@ pub const LABEL_CTL_CMD: u64 = 1;
 /// produced an encoded [`ControlReply`] in the reply bulk.
 pub const LABEL_CTL_REPLY: u64 = 2;
 
-/// Reply-cap handle the kernel writes when a recv produces a message.
-const REPLY_CAP_HANDLE: u32 = 1;
-
 /// Maximum bulk size accepted on the control endpoint. The verb is a
 /// single byte; the buffer must fit the worst-case Phase 64
 /// `ServiceStates` reply, which packs up to `MAX_SERVICE_STATE_ENTRIES`
@@ -444,10 +441,26 @@ pub fn poll_control_once<B: SupervisorBackend>(
         return false;
     }
     // Phase 64b — use the per-recv reply cap the kernel staged into
-    // `msg.data[3]` rather than the hardcoded slot-1 fallback. The
-    // deferred-reply path relies on this so a parked async-restart's
-    // reply cap survives subsequent recvs.
-    let reply_cap = msg.reply_cap_handle().unwrap_or(REPLY_CAP_HANDLE);
+    // `msg.data[3]`. A fire-and-forget sender carries no reply cap (the
+    // kernel signals this with `msg.data[3] == 0`). Replying anyway on a
+    // fallback handle is unsafe: the kernel's `ipc_reply` path removes the
+    // cap at the given handle *before* type-checking it (`slot.take()` in
+    // `CapabilityTable::remove`), so a bogus handle silently deletes an
+    // unrelated cap from our own table — and the deferred path would defer
+    // that corruption to a later `tick_pending`. Drop such messages instead;
+    // every reply site below (immediate and deferred) replies exactly once
+    // on this verified cap.
+    //
+    // Return `true`, not `false`: a message *was* dequeued and consumed this
+    // iteration (we chose to drop it), so a drain-style caller should keep
+    // polling rather than treat the socket as idle. This matches every other
+    // post-dequeue path — the unknown-label branch below and all of
+    // `handle_async_restart` likewise return `true` after consuming a
+    // message. `false` stays reserved for the empty-queue and dormant-socket
+    // cases named in the doc-comment above.
+    let Some(reply_cap) = msg.reply_cap_handle() else {
+        return true;
+    };
     if label != LABEL_CTL_CMD {
         // Unknown label — F.2 stub used `u64::MAX` as the catch-all
         // sentinel; F.5 keeps that signal so the prior contract holds.
