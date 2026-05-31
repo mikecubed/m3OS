@@ -396,8 +396,10 @@ fn program_main(_args: &[&str]) -> i32 {
     }
 
     // Step 3: enter the USB IPC server loop on the primary controller. The
-    // server registers the `usb` service, binds the IRQ, runs HID Boot-Protocol
-    // setup, and serves class drivers. It never returns.
+    // server registers the `usb` service, binds the IRQ, and serves class
+    // drivers — HID Boot-Protocol setup (`SET_PROTOCOL(0)` / `SET_IDLE(0)`) is
+    // performed by the `usb-hid` class driver itself via `ControlRequest`,
+    // after the service is registered. It never returns.
     match primary {
         Some((controller, irq, devices)) => server::run(controller, irq, devices),
         None => {

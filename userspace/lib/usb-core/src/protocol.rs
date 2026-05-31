@@ -763,8 +763,7 @@ mod tests {
         for r in reqs {
             let bytes = r.encode();
             let back = UsbRequest::decode(&bytes).expect("decode");
-            // Compare via re-encode (UsbRequest is not PartialEq).
-            assert_eq!(back.encode(), bytes);
+            assert_eq!(back, r);
         }
         assert_eq!(UsbRequest::decode(&[]), None);
         assert_eq!(UsbRequest::decode(&[0xFE]), None); // unknown tag

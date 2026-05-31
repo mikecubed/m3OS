@@ -4,7 +4,7 @@
 **Source Ref:** phase-90
 **Depends on:** Phase 78a (xHCI Host Bring-Up) ✅, Phase 78b (USB Enumeration + Hub) ✅, Phase 78c (HID Boot Protocol + usb IPC service) ✅, Phase 83 (Release 1.0 Gate)
 **Builds on:** Extends the Phase 78 USB foundation — xHCI host driver, root-hub enumeration, HID Boot-Protocol keyboard + mouse, and the `usb` IPC service — with the full set of USB features explicitly deferred from 78c
-**Primary Components:** `userspace/drivers/usbhub` (live hub walker), `userspace/drivers/xhci_server` (GetDescriptors, multi-tier slot assignment, isochronous scheduling), `kernel-core/src/usb/hid_report.rs` (Report Protocol wiring), `userspace/drivers/usb_mass_storage` (new — BOT + UAS facade), `userspace/drivers/usb_audio` (new — UAC isochronous PCM), `userspace/drivers/usb_video` (new — UVC isochronous frames)
+**Primary Components:** `userspace/drivers/usbhub` (live hub walker), `userspace/drivers/xhci` (the `usb` IPC server in `src/server.rs` — GetDescriptors, multi-tier slot assignment, isochronous scheduling), `kernel-core/src/usb/hid_report.rs` (Report Protocol wiring), `userspace/drivers/usb_mass_storage` (new — BOT + UAS facade), `userspace/drivers/usb_audio` (new — UAC isochronous PCM), `userspace/drivers/usb_video` (new — UVC isochronous frames)
 
 ## Milestone Goal
 

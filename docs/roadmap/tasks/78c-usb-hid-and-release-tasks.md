@@ -44,7 +44,7 @@ Remaining deferrals — **each assigned to [Phase 90 — USB Class Expansion](..
 
 Regression validation (all PASS): `usb-smoke` (kbd + mouse live + prompt render), `smoke-test` (boot), `htop-render-probe` (PS/2 → kbd_server event path → term → sh0 renders htop — proves the `ipc_recv`→`ipc_recv_msg` change did not regress GUI keyboard input), `xhci-bringup-smoke` + `xhci-enum-smoke` (now enumerates two devices; 78a/78b sentinels intact).
 
-> **Inject-label contract (pinned for parallel tracks):** `KBD_EVENT_INJECT = 5` on the `kbd` endpoint, `MOUSE_EVENT_INJECT = 3` on the `mouse` endpoint. Payload = the existing 20-byte `KeyEvent` / 37-byte `PointerEvent` wire form as IPC bulk; reply label `0` = enqueued OK, `u64::MAX` = queue full/error. Drain priority on `*_EVENT_PULL`: injected (USB) events drain **before** the PS/2 stream.
+> **Inject-label contract (pinned for parallel tracks):** `KBD_EVENT_INJECT = 5` on the `kbd` endpoint, `MOUSE_EVENT_INJECT = 3` on the `mouse` endpoint. Payload = the existing 20-byte `KeyEvent` / 37-byte `PointerEvent` wire form as IPC bulk; reply label `0` = enqueued OK (the bounded inject queue drops its **oldest** event on overflow rather than failing), `u64::MAX` = rejected — a non-driver caller (TCB gate) or a decode failure. There is no "queue full" reply. Drain priority on `*_EVENT_PULL`: injected (USB) events drain **before** the PS/2 stream.
 
 ---
 
