@@ -108,10 +108,6 @@ const KBD_EVENT_INJECT: u64 = 5;
 /// 64 is generous headroom; on overflow the oldest injected event is dropped.
 const INJECT_QUEUE_CAP: usize = 64;
 
-/// Reply-cap slot is fixed at 1 by the kernel's IPC ABI.
-#[allow(dead_code)]
-const REPLY_CAP_HANDLE: u32 = 1;
-
 /// Polling interval used while waiting for a scancode to arrive
 /// (matches the legacy 5 ms cadence).
 const POLL_INTERVAL_NS: u32 = 5_000_000;
@@ -493,7 +489,16 @@ fn program_main(_args: &[&str]) -> i32 {
         if rc == u64::MAX {
             continue;
         }
-        let reply_cap = msg.reply_cap_handle().unwrap_or(REPLY_CAP_HANDLE);
+        // A fire-and-forget sender carries no reply cap (the kernel signals
+        // this with `msg.data[3] == 0`). Replying anyway on a fallback handle
+        // is unsafe: the kernel's `ipc_reply` path removes the cap at the given
+        // handle *before* type-checking it (`slot.take()` in
+        // `CapabilityTable::remove`), so a bogus handle silently deletes an
+        // unrelated cap from our own table. Drop such messages instead. Every
+        // dispatch branch below replies exactly once on the verified cap.
+        let Some(reply_cap) = msg.reply_cap_handle() else {
+            continue;
+        };
         match rc {
             KBD_READ => handle_kbd_read(reply_cap),
             KBD_EVENT_PULL => handle_kbd_event_pull(&mut pipeline, &mut injected, reply_cap),

@@ -8981,6 +8981,10 @@ fn cmd_usb_smoke(args: &SmokeBootArgs) {
 
     let _ = child.kill();
     let _ = child.wait();
+    // Unlink the QMP/VNC unix sockets so repeated runs/CI jobs don't accumulate
+    // stale `.sock` files in `$TMPDIR` (mirrors `cmd_less_render_probe`).
+    let _ = std::fs::remove_file(&qmp_socket);
+    let _ = std::fs::remove_file(&vnc_socket);
     match result {
         Ok(()) => {
             let elapsed = global_start.elapsed().as_secs();

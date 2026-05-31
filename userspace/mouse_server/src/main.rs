@@ -97,9 +97,6 @@ const MOUSE_EVENT_INJECT: u64 = 3;
 /// Bound on the injected-event queue (oldest dropped on overflow).
 const INJECT_QUEUE_CAP: usize = 64;
 
-/// Reply-cap slot fallback if the kernel did not stage one (`msg.data[3]`).
-const REPLY_CAP_HANDLE: u32 = 1;
-
 /// Polling interval used while waiting for a packet to arrive (matches D.1's
 /// 5 ms cadence for kbd_server). Keeps the wake-rate bounded so a stuck
 /// reader does not pin a CPU.
@@ -545,7 +542,16 @@ fn program_main(_args: &[&str]) -> i32 {
         if rc == u64::MAX {
             continue;
         }
-        let reply_cap = msg.reply_cap_handle().unwrap_or(REPLY_CAP_HANDLE);
+        // A fire-and-forget sender carries no reply cap (the kernel signals
+        // this with `msg.data[3] == 0`). Replying anyway on a fallback handle
+        // is unsafe: the kernel's `ipc_reply` path removes the cap at the given
+        // handle *before* type-checking it (`slot.take()` in
+        // `CapabilityTable::remove`), so a bogus handle silently deletes an
+        // unrelated cap from our own table. Drop such messages instead. Every
+        // dispatch branch below replies exactly once on the verified cap.
+        let Some(reply_cap) = msg.reply_cap_handle() else {
+            continue;
+        };
         match rc {
             MOUSE_EVENT_PULL => handle_mouse_event_pull(&mut pipeline, &mut injected, reply_cap),
             MOUSE_EVENT_INJECT => handle_mouse_inject(&mut injected, &bulk, reply_cap),
