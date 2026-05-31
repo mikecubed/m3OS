@@ -1267,7 +1267,16 @@ impl Controller {
             w_length: u16::from_le_bytes([setup[6], setup[7]]),
         };
         let dir_in = setup[0] & 0x80 != 0;
-        self.control_transfer(irq, slot_id, packet, length, dir_in)
+        // The SETUP packet's `wLength` is the single source of truth for the
+        // data-stage size. `length` arrives as a separate IPC argument, so a
+        // buggy or hostile peer could supply a value that disagrees with the
+        // SETUP it also sent; programming a control TD whose TRB length
+        // contradicts the device's `wLength` produces an invalid transfer.
+        // Fail closed on any mismatch and drive the transfer from `w_length`.
+        if length != packet.w_length {
+            return None;
+        }
+        self.control_transfer(irq, slot_id, packet, packet.w_length, dir_in)
     }
 
     // -- A.6: single-threaded drain-on-wake event loop ---------------------

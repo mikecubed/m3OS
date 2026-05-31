@@ -115,24 +115,46 @@ fn boot_protocol_init(usb_ep: u32, notice: &usb_core::protocol::AttachNotice) {
     // SET_PROTOCOL(0): bmRequestType 0x21 (H2D|Class|Interface), bRequest 0x0B,
     // wValue 0 (Boot), wIndex = interface, wLength 0.
     let set_protocol = [0x21, 0x0B, 0x00, 0x00, ilo, ihi, 0x00, 0x00];
-    let _ = usb_call(
+    control_setup_step(
         usb_ep,
-        &UsbRequest::ControlRequest {
-            slot_id: notice.slot_id,
-            setup: set_protocol,
-            length: 0,
-        },
+        notice.slot_id,
+        set_protocol,
+        "usb-hid: warn: SET_PROTOCOL(0) failed; continuing to poll\n",
     );
     // SET_IDLE(0): bRequest 0x0A, wValue 0 (duration 0 = report on change).
     let set_idle = [0x21, 0x0A, 0x00, 0x00, ilo, ihi, 0x00, 0x00];
-    let _ = usb_call(
+    control_setup_step(
         usb_ep,
-        &UsbRequest::ControlRequest {
-            slot_id: notice.slot_id,
-            setup: set_idle,
-            length: 0,
-        },
+        notice.slot_id,
+        set_idle,
+        "usb-hid: warn: SET_IDLE(0) failed; continuing to poll\n",
     );
+}
+
+/// Issue one EP0 boot-protocol control transfer and emit `warn_msg` if the
+/// xHCI server reports a failed, error, or missing reply. The daemon still
+/// proceeds to poll the interrupt-IN endpoint — a `SET_PROTOCOL` / `SET_IDLE`
+/// failure (wrong interface number, stalled EP0, controller error) is surfaced
+/// in the log rather than silently swallowed, so the failure mode stays
+/// diagnosable. Success is `UsbReply::ControlData { completion_code: 1, .. }`.
+fn control_setup_step(usb_ep: u32, slot_id: u8, setup: [u8; 8], warn_msg: &str) {
+    let ok = matches!(
+        usb_call(
+            usb_ep,
+            &UsbRequest::ControlRequest {
+                slot_id,
+                setup,
+                length: 0,
+            },
+        ),
+        Some(UsbReply::ControlData {
+            completion_code: 1,
+            ..
+        })
+    );
+    if !ok {
+        syscall_lib::write_str(STDOUT_FILENO, warn_msg);
+    }
 }
 
 /// Inject a fully-formed `KeyEvent` into `kbd_server`.

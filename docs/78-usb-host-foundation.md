@@ -134,9 +134,16 @@ After enumeration the driver becomes a live server:
    **or** an IRQ transfer-completion wake (`RECV_KIND_NOTIFICATION = 1`). This
    is the same pattern the e1000 driver uses.
 
-HID Boot-Protocol setup (`SET_PROTOCOL(0)` / `SET_IDLE(0)`) and interrupt-IN
-endpoint arming happen **before** binding, so the live loop never blocks on
-hardware inside a request handler.
+HID Boot-Protocol setup (`SET_PROTOCOL(0)` / `SET_IDLE(0)`) is **not** done by
+the server up front: the `usb-hid` class driver issues it itself via
+`UsbRequest::ControlRequest` *after* the IRQ is bound. That handler runs a real
+EP0 transfer and therefore **does** block on hardware inside the request loop —
+which is safe because the server is single-threaded: `control_transfer` blocks
+in `irq.wait()` (the Phase 50 `notify_wait` syscall), which drains the same
+pending-notification word the bound `ipc_recv_msg` does, and the server is never
+in both at once. The interrupt-IN
+endpoint arms **lazily** on the first `PollInterruptIn`, whose handler is
+non-blocking (it returns whatever the IRQ-drain captured).
 
 ### HID decode and the inject path (78c)
 
@@ -182,7 +189,7 @@ kbd_server/mouse_server → rendered prompt.
 | `userspace/drivers/xhci/src/controller.rs` | xHCI register access, command/event TRB ring, DMA structures, interrupt-IN Normal-TRB enqueue/decode |
 | `userspace/drivers/xhci/src/enumerate.rs` | Live enumeration: implements `UsbHostOps` over real DMA rings; EP0 control transfers via Setup/Data/Status TRBs |
 | `userspace/drivers/xhci/src/server.rs` | IPC server: registers `usb`, `sys_notif_bind` IRQ wiring, `ipc_recv_msg` multiplex loop, device table |
-| `userspace/drivers/usbhub/src/main.rs` | Hub class driver; `SetPortFeature(PORT_POWER)`, downstream port reset + enumeration |
+| `userspace/drivers/usbhub/src/main.rs` | Hub class driver — **Phase 78b stub**: logs, exercises the `kernel_core::usb::hub` classifier, and exits cleanly. Live external-hub `SetPortFeature(PORT_POWER)` / `PORT_RESET` + downstream enumeration is deferred to Phase 90 (USB Class Expansion) |
 | `userspace/drivers/usb-hid/src/main.rs` | HID class daemon; Boot keyboard + mouse decode, `KBD_EVENT_INJECT`/`MOUSE_EVENT_INJECT` |
 | `userspace/lib/usb-core/src/protocol.rs` | `AttachNotice`/`UsbRequest`/`UsbReply` wire codec; `USB_SERVICE_NAME = "usb"` |
 | `kernel-core/src/usb/descriptor.rs` | USB descriptor model and parser (device/config/interface/endpoint); host-tested |

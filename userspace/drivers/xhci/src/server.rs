@@ -36,8 +36,13 @@ use usb_core::protocol::{AttachNotice, USB_REPLY_LABEL, USB_SERVICE_NAME, UsbRep
 
 use crate::controller::Controller;
 
-/// Emitted once the server is registered, the IRQ is bound, and HID setup is
-/// complete. The `usb-smoke` gate can wait on this before injecting keys.
+/// Emitted once the server has registered the `usb` service and bound its IRQ
+/// into the command endpoint — i.e. it is ready to accept requests. This does
+/// **not** imply HID setup is complete: the `usb-hid` class driver performs
+/// `SET_PROTOCOL(0)` / `SET_IDLE(0)` itself via `ControlRequest`, which may run
+/// *after* this sentinel. The `usb-smoke` gate waits on it before injecting
+/// keys, but it is a server-readiness marker, not a HID-setup ordering
+/// guarantee.
 pub const USB_SERVER_READY_SENTINEL: &str = "XHCI_USB:server-ready\n";
 
 // errno-style codes carried by `UsbReply::Error`.
@@ -119,8 +124,20 @@ pub fn run(mut controller: Controller, irq: IrqNotification, devices: Vec<Attach
             Ok(RecvResult::Message(frame)) => {
                 let reply = handle_request(&mut controller, &irq, &devices, &frame.bulk);
                 let bytes = reply.encode();
-                let _ = backend.store_reply_bulk(&bytes);
-                let _ = backend.reply(USB_REPLY_LABEL, 0);
+                // Fail closed: if staging the reply bulk fails, reply with the
+                // `u64::MAX` sentinel label so the client's `usb_call` returns
+                // `None` instead of decoding a stale/empty pending bulk as a
+                // valid `UsbReply`. Mirrors the `kbd_server` / `mouse_server`
+                // `ipc_store_reply_bulk`-failure path.
+                if backend.store_reply_bulk(&bytes).is_err() {
+                    write_str(
+                        STDOUT_FILENO,
+                        "xhci_driver: store_reply_bulk failed; replying with sentinel\n",
+                    );
+                    let _ = backend.reply(u64::MAX, 0);
+                } else {
+                    let _ = backend.reply(USB_REPLY_LABEL, 0);
+                }
             }
             Err(_) => {
                 // Transient recv error — re-loop rather than exit the daemon.
