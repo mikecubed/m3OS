@@ -450,8 +450,16 @@ pub fn poll_control_once<B: SupervisorBackend>(
     // that corruption to a later `tick_pending`. Drop such messages instead;
     // every reply site below (immediate and deferred) replies exactly once
     // on this verified cap.
+    //
+    // Return `true`, not `false`: a message *was* dequeued and consumed this
+    // iteration (we chose to drop it), so a drain-style caller should keep
+    // polling rather than treat the socket as idle. This matches every other
+    // post-dequeue path — the unknown-label branch below and all of
+    // `handle_async_restart` likewise return `true` after consuming a
+    // message. `false` stays reserved for the empty-queue and dormant-socket
+    // cases named in the doc-comment above.
     let Some(reply_cap) = msg.reply_cap_handle() else {
-        return false;
+        return true;
     };
     if label != LABEL_CTL_CMD {
         // Unknown label — F.2 stub used `u64::MAX` as the catch-all
