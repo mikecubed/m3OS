@@ -9520,7 +9520,15 @@ fn hda_smoke_qemu_args(
     // as root. The serial assertions (READY, audio-demo PASS, frames_consumed,
     // BCIS interrupt) still apply against the real ALC1220.
     if let Ok(bdf) = std::env::var("M3OS_HDA_VFIO_BDF") {
-        qemu_args.extend(["-device".to_string(), format!("vfio-pci,host={bdf}")]);
+        // Pin the passed-through controller to guest PCI slot 0x8 — clear of the
+        // ring-3 driver *sentinel* BDFs (e1000=0x3, nvme=0x4, ac97=0x5,
+        // xhci=0x6), which claim by fixed BDF. Without this the VFIO device
+        // lands on slot 0x4 and nvme_driver grabs it (wrong device), starving
+        // hda_driver. hda_driver finds it by PCI class scan regardless of slot.
+        qemu_args.extend([
+            "-device".to_string(),
+            format!("vfio-pci,host={bdf},addr=0x8"),
+        ]);
         return qemu_args;
     }
     let wav_path = smoke_dir.join("audio.wav");

@@ -68,24 +68,56 @@ echo 0000:10:00.6 | sudo tee /sys/bus/pci/drivers/vfio-pci/unbind
 echo 0000:10:00.6 | sudo tee /sys/bus/pci/drivers/snd_hda_intel/bind
 ```
 
-## To capture from the run (fill in)
+## Real-hardware run results (2026-06-01, this host, via VFIO)
 
-## To capture (fill in after the VFIO run)
+Ran `M3OS_HDA_VFIO_BDF=10:00.6 cargo xtask hda-smoke` against the physical AMD
+controller (vfio-pci bound). **Findings — three real issues surfaced (F.1 #3),
+two fixed, one open:**
 
-### Controller
-- `GCAP` raw = `0x____` → OSS=__ ISS=__ BSS=__ 64OK=__
-- `STATESTS` = `0x____` → codec address(es): ____
-- Reset + CORB/RIRB RUN-enable read-back: `CORBCTL.CORBRUN`=__ `RIRBCTL.RIRBDMAEN`=__
+### ✅ Fixed: PCI-slot collision with the nvme sentinel
+The passed-through controller first landed at guest `00:04.0`, which is
+`nvme_driver`'s **sentinel BDF** — nvme claimed the HDA (wrong device), failed,
+and its restart-churn starved `hda_driver` ("device claim failed"). **Fix:** the
+VFIO mode pins the device to slot `0x8` (clear of all sentinels e1000=3/nvme=4/
+ac97=5/xhci=6); `hda_driver` then claims it cleanly (`device_host.claim pid=NN
+bdf=0000:00:08.0`).
 
-### Codec widget graph
-- Vendor:device (`GET_PARAMETER VENDOR_ID`) = `0x____:0x____`
-- AFG NID = `0x__`; widget NID range = `0x__..0x__`
-- Enumerated widgets (NID → type): ____
-- Output pins + `GET_CONFIG_DEFAULT` words:
-  - Internal speaker pin NID `0x__` cfg=`0x________` (default_device=Speaker, port=fixed)
-  - HP pin NID `0x__` cfg=`0x________`
-  - Rear line-out NID `0x__` cfg=`0x________`
-- Selected pin→DAC path: ____
+### ✅ Fixed/hardened: reset + codec-ready wait
+Added STATESTS-clear-before-reset (Redox-style), a post-CRST codec-enumeration
+delay, a reset retry, and a 4 s wall-clock STATESTS poll (QEMU's codec reports
+in <1 ms; real silicon needs the window). No regression to the QEMU gate.
+
+### ⚠️ OPEN (AMD vendor quirk): the ALC1220 does not enumerate in STATESTS
+After the controller is fully up the codec link does not wake:
+- `GCAP = 0x4401` → OSS=4, ISS=4, BSS=0, 64OK=1 — **valid; MMIO reads/writes work.**
+- `GCTL = 0x00000001` → CRST set — **controller is out of reset.**
+- `STATESTS = 0x0000` — **no codec on any SDI line**, even after 2 reset cycles ×
+  4 s polling (~8 s total) with the STATESTS-clear + delay.
+
+**Diagnosis:** the AMD "Family 17h/19h HD Audio Controller" (`1022:15e3`) is
+fully accessible and resets correctly, but the ALC1220 does not assert SDI
+presence via the standard HDA `GCTL.CRST` sequence. Real drivers (Linux
+`snd_hda_intel`) bring AMD codecs up with vendor-specific handling not modelled
+by QEMU's `intel-hda` — e.g. AMD snoop/coherency config in PCI config space, and
+link/clock enablement beyond `CRST`. m3OS has no PCI-config-**write** syscall yet
+(only `sys_device_config_read`, Phase 79) and ships zero vendor quirks, so this
+AMD link bring-up is genuine follow-up work (the accretive, datasheet-driven part
+Track F represents).
+
+**Consequently:** F.1 #2 (operator-audible output) cannot be reached on this
+controller until the codec enumerates — it is blocked behind this open item, not
+behind the driver's QEMU-validated stream path (which is complete and produces
+non-silent audio against the generic codec).
+
+### What a future AMD-codec-enablement pass needs
+- A `sys_device_config_write` device-host syscall (mirror of `sys_device_config_read`).
+- AMD snoop/coherency + link-clock config in `hda_driver` (keyed off the AMD
+  controller IDs already in `HDA_DEVICE_IDS`), validated by re-running this VFIO
+  runbook until `STATESTS != 0`, then capturing the widget graph below.
+
+### Widget graph (capture once STATESTS != 0)
+- Vendor:device (`GET_PARAMETER VENDOR_ID`) = `0x10ec:0x____` (expect ALC1220)
+- Output pins + `GET_CONFIG_DEFAULT` words; selected pin→DAC path: ____
 
 ### The amp-enable question (the load-bearing Realtek datum)
 - Did `SET_EAPD_BTLENABLE 0x70C` (payload `0x02`) alone yield audible output? **[ ] yes / [ ] no**

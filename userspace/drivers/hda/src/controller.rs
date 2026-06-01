@@ -11,6 +11,24 @@ use kernel_core::hda::{self, irq, regs};
 
 const POLL_BUDGET: u32 = 2_000_000;
 
+/// Log `label` followed by `val` as `0x........` + newline (no_std, no alloc).
+fn dbg_hex(label: &str, val: u32) {
+    syscall_lib::write_str(syscall_lib::STDOUT_FILENO, label);
+    let mut buf = [b'0', b'x', 0, 0, 0, 0, 0, 0, 0, 0];
+    for i in 0..8 {
+        let nib = ((val >> ((7 - i) * 4)) & 0xF) as u8;
+        buf[2 + i] = if nib < 10 {
+            b'0' + nib
+        } else {
+            b'a' + (nib - 10)
+        };
+    }
+    if let Ok(s) = core::str::from_utf8(&buf) {
+        syscall_lib::write_str(syscall_lib::STDOUT_FILENO, s);
+    }
+    syscall_lib::write_str(syscall_lib::STDOUT_FILENO, "\n");
+}
+
 /// The brought-up HDA controller: BAR0 MMIO window, the CORB/RIRB rings, the
 /// decoded `GCAP`, the chosen output stream-descriptor index, and the codec
 /// addresses reported by STATESTS.
@@ -25,8 +43,28 @@ pub struct HdaController {
 impl HdaController {
     /// Bring the controller from cold reset to "rings running, codecs known".
     pub fn bring_up(device: &DeviceHandle, mmio: Mmio<u8>) -> Result<Self, &'static str> {
-        Self::reset(&mmio)?;
-        let statests = Self::wait_codecs(&mmio)?;
+        // A real codec — especially after a VFIO/FLR reset that took it away
+        // from a prior OS owner (Linux `snd_hda_intel`) — may need several full
+        // reset cycles + a long enumeration window before it reports in
+        // STATESTS. Mirror Linux `azx_reset`'s retry loop; QEMU's emulated
+        // codec reports on the first try.
+        let mut statests = 0u16;
+        for _ in 0..2 {
+            Self::reset(&mmio)?;
+            statests = Self::wait_codecs(&mmio);
+            if statests != 0 {
+                break;
+            }
+        }
+        if statests == 0 {
+            dbg_hex(
+                "hda_driver: GCAP=",
+                u32::from(mmio.read_reg::<u16>(hda::REG_GCAP)),
+            );
+            dbg_hex("hda_driver: STATESTS=", u32::from(statests));
+            dbg_hex("hda_driver: GCTL=", mmio.read_reg::<u32>(hda::REG_GCTL));
+            return Err("no codecs reported in STATESTS");
+        }
         let codecs: Vec<u8> = regs::codecs_from_statests(statests).collect();
         if codecs.is_empty() {
             return Err("no codecs reported in STATESTS");
@@ -50,8 +88,14 @@ impl HdaController {
         })
     }
 
-    /// `GCTL.CRST` reset: clear → poll read-0 → set → poll read-1.
+    /// `GCTL.CRST` reset: clear stale STATESTS → clear CRST → poll read-0 → set
+    /// CRST → poll read-1 → wait for codec self-enumeration.
     fn reset(mmio: &Mmio<u8>) -> Result<(), &'static str> {
+        // Clear any stale STATESTS bits before reset so a fresh codec wake is
+        // detectable afterward (Redox `ihdad` does this; a real codec may not
+        // re-set an already-set bit). STATESTS is write-1-to-clear.
+        mmio.write_reg::<u16>(hda::REG_STATESTS, 0x7FFF);
+
         let gctl = mmio.read_reg::<u32>(hda::REG_GCTL);
         mmio.write_reg::<u32>(hda::REG_GCTL, gctl & !hda::GCTL_CRST);
         for _ in 0..POLL_BUDGET {
@@ -60,23 +104,38 @@ impl HdaController {
             }
         }
         mmio.write_reg::<u32>(hda::REG_GCTL, hda::GCTL_CRST);
+        let mut up = false;
         for _ in 0..POLL_BUDGET {
             if regs::reset_ready(mmio.read_reg::<u32>(hda::REG_GCTL)) {
-                return Ok(());
+                up = true;
+                break;
             }
         }
-        Err("GCTL.CRST reset timeout")
+        if !up {
+            return Err("GCTL.CRST reset timeout");
+        }
+        // HDA spec §3.3.7: codecs need ≥521 µs (25 frames) after CRST is
+        // deasserted before STATESTS reflects their presence. A poll-only loop
+        // can race ahead on a fast MMIO path (and real silicon needs the full
+        // window), so wait explicitly before polling STATESTS.
+        let _ = syscall_lib::nanosleep_for(0, 2_000_000); // 2 ms, generous
+        Ok(())
     }
 
-    /// Poll `STATESTS` until at least one codec reports in (bounded bailout).
-    fn wait_codecs(mmio: &Mmio<u8>) -> Result<u16, &'static str> {
-        for _ in 0..POLL_BUDGET {
+    /// Poll `STATESTS` over a real wall-clock window (1 ms between reads) until
+    /// at least one codec reports in; returns the codec mask, or `0` if none
+    /// appeared within ~4 s. The caller retries the full reset on `0`. (QEMU's
+    /// emulated codec reports in <1 ms; real silicon needs the wall-clock wait.)
+    fn wait_codecs(mmio: &Mmio<u8>) -> u16 {
+        const STATESTS_POLL_MS: u32 = 4000;
+        for _ in 0..STATESTS_POLL_MS {
             let s = mmio.read_reg::<u16>(hda::REG_STATESTS) & 0x7FFF;
             if s != 0 {
-                return Ok(s);
+                return s;
             }
+            let _ = syscall_lib::nanosleep_for(0, 1_000_000); // 1 ms
         }
-        Err("STATESTS codec-ready timeout")
+        0
     }
 
     /// Issue a 12-bit-verb command to a codec node, returning the response.
