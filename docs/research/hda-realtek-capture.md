@@ -48,18 +48,18 @@ ALC1220 controller is bound to vfio-pci; step 5 restores it.
 # 1. Bind the isolated HDA controller to vfio-pci (drops host audio):
 sudo modprobe vfio-pci
 echo 0000:10:00.6 | sudo tee /sys/bus/pci/devices/0000:10:00.6/driver/unbind
-echo 1022 15e3   | sudo tee /sys/bus/pci/drivers/vfio-pci/new_id
+echo 1022 15e3    | sudo tee /sys/bus/pci/drivers/vfio-pci/new_id
 lspci -nnks 10:00.6     # expect: Kernel driver in use: vfio-pci
 
-# 2. Build + boot m3OS with the real controller passed through, serial to a file.
-#    (Temporarily swap `-device intel-hda -device hda-duplex` in hda_smoke_qemu_args
-#    for `-device vfio-pci,host=10:00.6`, or run `cargo xtask image` and launch
-#    QEMU directly with the standard UEFI/OVMF + data-disk args + that -device +
-#    `-serial file:/tmp/hda-hw.log`.)
-M3OS_SMOKE_SERIAL_DUMP=/tmp/hda-hw.log sudo -E cargo xtask hda-smoke   # after the vfio swap
+# 2. Boot m3OS with the real controller passed through (turnkey: the
+#    M3OS_HDA_VFIO_BDF env var makes hda-smoke pass the BDF through instead of
+#    the emulated intel-hda codec and skip the WAV check). Run as root so QEMU
+#    can open /dev/vfio. --display lets you also see it; drop it for headless.
+sudo -E M3OS_HDA_VFIO_BDF=10:00.6 M3OS_SMOKE_SERIAL_DUMP=/tmp/hda-hw.log \
+    cargo xtask hda-smoke --display
 
-# 3. Grep the serial for the bring-up (closes F.1 #1 / #3 programmatically):
-grep -iE "hda_driver|stream IRQ|codecs ready|VENDOR" /tmp/hda-hw.log
+# 3. Grep the serial for the real-hardware bring-up (closes F.1 #1 / #3):
+grep -iE "hda_driver|stream IRQ|codecs ready|HDA_SMOKE" /tmp/hda-hw.log
 
 # 4. LISTEN — audible, non-silent through the internal speaker (F.1 #2, human-only).
 

@@ -9512,6 +9512,17 @@ fn hda_smoke_qemu_args(
             *arg = "user,id=net0".to_string();
         }
     }
+    // Track F (real-hardware): when `M3OS_HDA_VFIO_BDF=<bdf>` is set, pass the
+    // *physical* HDA controller through via VFIO instead of the emulated
+    // intel-hda/hda-duplex codec. Audio then comes out the real speakers
+    // (operator listens — there is no WAV file), and the bound `vfio-pci`
+    // device requires the host BDF to already be bound to vfio-pci + QEMU run
+    // as root. The serial assertions (READY, audio-demo PASS, frames_consumed,
+    // BCIS interrupt) still apply against the real ALC1220.
+    if let Ok(bdf) = std::env::var("M3OS_HDA_VFIO_BDF") {
+        qemu_args.extend(["-device".to_string(), format!("vfio-pci,host={bdf}")]);
+        return qemu_args;
+    }
     let wav_path = smoke_dir.join("audio.wav");
     qemu_args.extend([
         "-audiodev".to_string(),
@@ -9587,6 +9598,15 @@ fn cmd_hda_smoke(args: &SmokeBootArgs) {
         }
     }
 
+    // VFIO real-hardware mode drives the physical speakers (no WAV file) — the
+    // operator confirms audible output by ear, so skip the host-side WAV check.
+    if std::env::var("M3OS_HDA_VFIO_BDF").is_ok() {
+        println!(
+            "hda-smoke: VFIO real-hardware run — serial bring-up PASSED; \
+             LISTEN for audible output through the speaker (operator check)."
+        );
+        return;
+    }
     let wav_path = smoke_dir.join("audio.wav");
     match assert_wav_non_silent(&wav_path) {
         Ok(()) => println!("hda-smoke: WAV non-silent check PASSED"),
