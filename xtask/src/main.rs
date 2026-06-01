@@ -186,6 +186,11 @@ struct DeviceSet {
     nvme: bool,
     /// Replace the default virtio-net NIC with the Intel 82540EM e1000.
     e1000: bool,
+    /// Phase 79: replace the NIC with the Intel e1000e (82574L, `-device e1000e`).
+    e1000e: bool,
+    /// Phase 79: replace the NIC with the Intel igb (82576, `-device igb`,
+    /// requires QEMU ≥ 8.0).
+    igb: bool,
     /// Run the AC'97 BAR-coverage kernel-core assertions (Phase 57 C.2).
     audio: bool,
     /// Enable the emulated Intel VT-d IOMMU (`--iommu`).
@@ -326,11 +331,14 @@ fn apply_device_flag(name: &str, devices: &mut DeviceSet) -> Result<(), String> 
     match name {
         "nvme" => devices.nvme = true,
         "e1000" => devices.e1000 = true,
+        // Phase 79: modern Intel NIC families with a QEMU model.
+        "e1000e" => devices.e1000e = true,
+        "igb" => devices.igb = true,
         "audio" => devices.audio = true,
         "xhci" => devices.xhci = true,
         other => {
             return Err(format!(
-                "unknown `--device` value `{other}` (supported: nvme, e1000, audio, xhci)"
+                "unknown `--device` value `{other}` (supported: nvme, e1000, e1000e, igb, audio, xhci)"
             ));
         }
     }
@@ -481,6 +489,9 @@ fn main() {
                 std::process::exit(1);
             });
             cmd_smoke_test(&smoke_args);
+        }
+        Some("multi-nic-smoke") => {
+            cmd_multi_nic_smoke();
         }
         Some("device-smoke") => {
             let device_smoke_args = parse_device_smoke_args(&args[2..]).unwrap_or_else(|err| {
@@ -884,6 +895,12 @@ fn build_userspace_bins() {
         // Real bring-up lands in D.2/D.3 and E.2/E.3.
         ("nvme_driver", "nvme_driver", true),
         ("e1000_driver", "e1000_driver", true),
+        // Phase 79: ring-3 modern NIC drivers (Intel e1000e/igb/igc, Realtek r8169/r8125).
+        ("e1000e_driver", "e1000e_driver", true),
+        ("igb_driver", "igb_driver", true),
+        ("igc_driver", "igc_driver", true),
+        ("r8169_driver", "r8169_driver", true),
+        ("r8125_driver", "r8125_driver", true),
         // Phase 78a Track B.2: ring-3 xHCI USB host-controller driver
         // (`needs_alloc = true` for driver_runtime + kernel-core deps).
         ("xhci_driver", "xhci_driver", true),
@@ -1052,6 +1069,10 @@ fn build_userspace_bins() {
         // e1000_driver uses "os-binary" to enable its _start entry point.
         let extra_features: &[&str] = match pkg {
             "e1000_driver" => &["--features", "os-binary"],
+            // Phase 79: modern NIC drivers use the same lib/bin os-binary split.
+            "e1000e_driver" | "igb_driver" | "igc_driver" | "r8169_driver" | "r8125_driver" => {
+                &["--features", "os-binary"]
+            }
             // Phase 57 Track D: audio_server uses the same os-binary
             // gate so the [[bin]] target is skipped on host-test
             // builds (where Scrt1.o would otherwise duplicate _start).
@@ -4453,7 +4474,21 @@ fn qemu_args_with_devices_resolved(
     // Phase 30: port-forward host 2323 → guest 23 for telnet access.
     // Phase 55 (F.1): `--device e1000` swaps the virtio-net-pci device out for
     // the Intel 82540EM classic e1000. The netdev remains unchanged.
-    let nic_device = if devices.e1000 {
+    let nic_device = if devices.e1000e {
+        // Phase 79: Intel e1000e (82574L) — the primary modern-NIC CI target.
+        if devices.iommu {
+            "e1000e,netdev=net0,addr=0x3"
+        } else {
+            "e1000e,netdev=net0"
+        }
+    } else if devices.igb {
+        // Phase 79: Intel igb (82576) — requires QEMU ≥ 8.0.
+        if devices.iommu {
+            "igb,netdev=net0,addr=0x3"
+        } else {
+            "igb,netdev=net0"
+        }
+    } else if devices.e1000 {
         if devices.iommu {
             "e1000,netdev=net0,addr=0x3"
         } else {
@@ -8362,6 +8397,178 @@ fn device_smoke_steps(devices: DeviceSet) -> Vec<SmokeStep> {
         }
     }
     steps
+}
+
+/// Parse `qemu-system-x86_64 --version` into a `(major, minor)` tuple, or
+/// `None` if QEMU is absent or the version string is unparseable. Phase 79
+/// Track H uses this to gate the `igb` arm of `multi-nic-smoke` (QEMU ≥ 8.0).
+fn qemu_version() -> Option<(u32, u32)> {
+    let out = Command::new("qemu-system-x86_64")
+        .arg("--version")
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    // e.g. "QEMU emulator version 8.2.1" → first whitespace token starting
+    // with a digit is the version.
+    let token = text
+        .split_whitespace()
+        .find(|t| t.bytes().next().is_some_and(|b| b.is_ascii_digit()))?;
+    let mut parts = token.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts
+        .next()
+        .map(|s| {
+            s.trim_end_matches(|c: char| !c.is_ascii_digit())
+                .parse()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+    Some((major, minor))
+}
+
+/// Phase 79 Track H — `multi-nic-smoke`.
+///
+/// Boots each **emulated** NIC family in turn (e1000 82540EM baseline, e1000e
+/// 82574L, and igb 82576 behind a QEMU ≥ 8.0 guard) and asserts that init
+/// launched the driver (`init: driver.registered name=<crate>`) and that the
+/// driver reached link (`E1000_SMOKE:link:PASS` / `E1000E_SMOKE:link:PASS` /
+/// `IGB_SMOKE:link:PASS`). igc and all Realtek families have **no QEMU model**
+/// (QEMU emulates only the RTL8139, a different chip), so they are
+/// skipped-with-reason unless their `M3OS_*_REGRESSION` env var is set.
+fn cmd_multi_nic_smoke() {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    let ovmf = find_ovmf();
+
+    struct NicArm {
+        name: &'static str,
+        devices: DeviceSet,
+        registered: &'static str,
+        link: &'static str,
+    }
+
+    let mut arms: Vec<NicArm> = vec![
+        NicArm {
+            name: "e1000 (82540EM)",
+            devices: DeviceSet {
+                e1000: true,
+                ..Default::default()
+            },
+            registered: "init: driver.registered name=e1000_driver",
+            link: "E1000_SMOKE:link:PASS",
+        },
+        NicArm {
+            name: "e1000e (82574L)",
+            devices: DeviceSet {
+                e1000e: true,
+                ..Default::default()
+            },
+            registered: "init: driver.registered name=e1000e_driver",
+            link: "E1000E_SMOKE:link:PASS",
+        },
+    ];
+
+    match qemu_version() {
+        Some((major, minor)) if major >= 8 => {
+            println!("multi-nic-smoke: QEMU {major}.{minor} — including the igb arm");
+            arms.push(NicArm {
+                name: "igb (82576)",
+                devices: DeviceSet {
+                    igb: true,
+                    ..Default::default()
+                },
+                registered: "init: driver.registered name=igb_driver",
+                link: "IGB_SMOKE:link:PASS",
+            });
+        }
+        other => {
+            println!("multi-nic-smoke: SKIP igb — requires QEMU >= 8.0 (detected {other:?})");
+        }
+    }
+
+    // Hardware-only families: QEMU has no model. Skip-with-reason unless the
+    // operator opts in via the per-family regression env var.
+    for (fam, env) in [
+        ("igc (I225/I226)", "M3OS_IGC_REGRESSION"),
+        ("r8169 (RTL8111/8168)", "M3OS_R8169_REGRESSION"),
+        ("r8125 (RTL8125 2.5G)", "M3OS_R8125_REGRESSION"),
+    ] {
+        if std::env::var(env).is_ok() {
+            println!(
+                "multi-nic-smoke: {fam} opted in via {env}, but QEMU has no model for it — \
+                 run on real hardware via VFIO passthrough; host tests cover the logic."
+            );
+        } else {
+            println!(
+                "multi-nic-smoke: SKIP {fam} — no QEMU model (set {env}=1 to acknowledge \
+                 hardware-only validation)."
+            );
+        }
+    }
+
+    for arm in &arms {
+        println!("multi-nic-smoke: === {} ===", arm.name);
+        let disk_img = uefi_image.parent().unwrap().join("disk.img");
+        if disk_img.exists() {
+            let _ = fs::remove_file(&disk_img);
+        }
+        create_data_disk(
+            uefi_image.parent().unwrap(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        let mut qemu_args =
+            qemu_args_with_devices(&uefi_image, &ovmf, QemuDisplayMode::Headless, arm.devices);
+        for a in qemu_args.iter_mut() {
+            if a.starts_with("user,id=net0,hostfwd=") {
+                *a = "user,id=net0".to_string();
+            }
+        }
+
+        let steps = vec![
+            SmokeStep::Wait {
+                pattern: arm.registered,
+                timeout_secs: 70,
+                label: "multi-nic: init launched the driver",
+            },
+            SmokeStep::Wait {
+                pattern: arm.link,
+                timeout_secs: 60,
+                label: "multi-nic: driver reached link",
+            },
+        ];
+
+        let global_timeout = std::time::Duration::from_secs(150);
+        let mut child = Command::new("qemu-system-x86_64")
+            .args(&qemu_args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to launch QEMU");
+
+        match run_smoke_script(&mut child, &steps, global_timeout) {
+            Ok(()) => {
+                println!("multi-nic-smoke: PASS — {}", arm.name);
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            Err(msg) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                eprintln!("multi-nic-smoke: FAIL — {} — {msg}", arm.name);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    println!("multi-nic-smoke: ALL EMULATED ARMS PASSED");
 }
 
 /// Phase 57 Track C.2 — run the kernel-core BAR-coverage smoke for the
@@ -13189,6 +13396,14 @@ fn populate_ext2_files(
     let nvme_driver_conf =
         "name=nvme_driver\ncommand=/drivers/nvme\ntype=daemon\nrestart=on-failure\nmax_restart=5\n";
     let e1000_driver_conf = "name=e1000_driver\ncommand=/drivers/e1000\ntype=daemon\nrestart=on-failure\nmax_restart=5\n";
+    // Phase 79: ring-3 modern NIC drivers — same supervised-driver shape.
+    let e1000e_driver_conf = "name=e1000e_driver\ncommand=/drivers/e1000e\ntype=daemon\nrestart=on-failure\nmax_restart=5\n";
+    let igb_driver_conf =
+        "name=igb_driver\ncommand=/drivers/igb\ntype=daemon\nrestart=on-failure\nmax_restart=5\n";
+    let igc_driver_conf =
+        "name=igc_driver\ncommand=/drivers/igc\ntype=daemon\nrestart=on-failure\nmax_restart=5\n";
+    let r8169_driver_conf = "name=r8169_driver\ncommand=/drivers/r8169\ntype=daemon\nrestart=on-failure\nmax_restart=5\n";
+    let r8125_driver_conf = "name=r8125_driver\ncommand=/drivers/r8125\ntype=daemon\nrestart=on-failure\nmax_restart=5\n";
     // Phase 78a Track B.2 — ring-3 xHCI USB host-controller driver.  Same
     // supervised-driver shape as nvme/e1000: no `depends=` (the device-host
     // substrate is kernel-internal init), restart=on-failure max_restart=5.
@@ -13546,6 +13761,11 @@ fn populate_ext2_files(
     let net_server_conf_tmp = output_dir.join("_tmp_net_server_conf");
     let nvme_driver_conf_tmp = output_dir.join("_tmp_nvme_driver_conf");
     let e1000_driver_conf_tmp = output_dir.join("_tmp_e1000_driver_conf");
+    let e1000e_driver_conf_tmp = output_dir.join("_tmp_e1000e_driver_conf");
+    let igb_driver_conf_tmp = output_dir.join("_tmp_igb_driver_conf");
+    let igc_driver_conf_tmp = output_dir.join("_tmp_igc_driver_conf");
+    let r8169_driver_conf_tmp = output_dir.join("_tmp_r8169_driver_conf");
+    let r8125_driver_conf_tmp = output_dir.join("_tmp_r8125_driver_conf");
     let xhci_driver_conf_tmp = output_dir.join("_tmp_xhci_driver_conf");
     let usbhub_conf_tmp = output_dir.join("_tmp_usbhub_conf");
     let usb_hid_conf_tmp = output_dir.join("_tmp_usb_hid_conf");
@@ -13580,6 +13800,11 @@ fn populate_ext2_files(
     fs::write(&net_server_conf_tmp, net_server_conf).expect("write temp net_server.conf");
     fs::write(&nvme_driver_conf_tmp, nvme_driver_conf).expect("write temp nvme_driver.conf");
     fs::write(&e1000_driver_conf_tmp, e1000_driver_conf).expect("write temp e1000_driver.conf");
+    fs::write(&e1000e_driver_conf_tmp, e1000e_driver_conf).expect("write temp e1000e_driver.conf");
+    fs::write(&igb_driver_conf_tmp, igb_driver_conf).expect("write temp igb_driver.conf");
+    fs::write(&igc_driver_conf_tmp, igc_driver_conf).expect("write temp igc_driver.conf");
+    fs::write(&r8169_driver_conf_tmp, r8169_driver_conf).expect("write temp r8169_driver.conf");
+    fs::write(&r8125_driver_conf_tmp, r8125_driver_conf).expect("write temp r8125_driver.conf");
     fs::write(&xhci_driver_conf_tmp, xhci_driver_conf).expect("write temp xhci_driver.conf");
     fs::write(&usbhub_conf_tmp, usbhub_conf).expect("write temp usbhub.conf");
     fs::write(&usb_hid_conf_tmp, usb_hid_conf).expect("write temp usb-hid.conf");
@@ -14136,6 +14361,26 @@ fn populate_ext2_files(
          sif etc/services.d/e1000_driver.conf mode 0x81A4\n\
          sif etc/services.d/e1000_driver.conf uid 0\n\
          sif etc/services.d/e1000_driver.conf gid 0\n\
+         write \"{e1000e_driver_conf}\" etc/services.d/e1000e_driver.conf\n\
+         sif etc/services.d/e1000e_driver.conf mode 0x81A4\n\
+         sif etc/services.d/e1000e_driver.conf uid 0\n\
+         sif etc/services.d/e1000e_driver.conf gid 0\n\
+         write \"{igb_driver_conf}\" etc/services.d/igb_driver.conf\n\
+         sif etc/services.d/igb_driver.conf mode 0x81A4\n\
+         sif etc/services.d/igb_driver.conf uid 0\n\
+         sif etc/services.d/igb_driver.conf gid 0\n\
+         write \"{igc_driver_conf}\" etc/services.d/igc_driver.conf\n\
+         sif etc/services.d/igc_driver.conf mode 0x81A4\n\
+         sif etc/services.d/igc_driver.conf uid 0\n\
+         sif etc/services.d/igc_driver.conf gid 0\n\
+         write \"{r8169_driver_conf}\" etc/services.d/r8169_driver.conf\n\
+         sif etc/services.d/r8169_driver.conf mode 0x81A4\n\
+         sif etc/services.d/r8169_driver.conf uid 0\n\
+         sif etc/services.d/r8169_driver.conf gid 0\n\
+         write \"{r8125_driver_conf}\" etc/services.d/r8125_driver.conf\n\
+         sif etc/services.d/r8125_driver.conf mode 0x81A4\n\
+         sif etc/services.d/r8125_driver.conf uid 0\n\
+         sif etc/services.d/r8125_driver.conf gid 0\n\
          write \"{xhci_driver_conf}\" etc/services.d/xhci_driver.conf\n\
          sif etc/services.d/xhci_driver.conf mode 0x81A4\n\
          sif etc/services.d/xhci_driver.conf uid 0\n\
@@ -14193,6 +14438,11 @@ fn populate_ext2_files(
         net_server_conf = net_server_conf_tmp.display(),
         nvme_driver_conf = nvme_driver_conf_tmp.display(),
         e1000_driver_conf = e1000_driver_conf_tmp.display(),
+        e1000e_driver_conf = e1000e_driver_conf_tmp.display(),
+        igb_driver_conf = igb_driver_conf_tmp.display(),
+        igc_driver_conf = igc_driver_conf_tmp.display(),
+        r8169_driver_conf = r8169_driver_conf_tmp.display(),
+        r8125_driver_conf = r8125_driver_conf_tmp.display(),
         xhci_driver_conf = xhci_driver_conf_tmp.display(),
         usbhub_conf = usbhub_conf_tmp.display(),
         usb_hid_conf = usb_hid_conf_tmp.display(),
@@ -16028,6 +16278,8 @@ fn regression_tests() -> Vec<RegressionTest> {
             devices: DeviceSet {
                 nvme: true,
                 e1000: false,
+                e1000e: false,
+                igb: false,
                 audio: false,
                 iommu: false,
                 kvm: false,
@@ -16065,6 +16317,8 @@ fn regression_tests() -> Vec<RegressionTest> {
             devices: DeviceSet {
                 nvme: true,
                 e1000: false,
+                e1000e: false,
+                igb: false,
                 audio: false,
                 iommu: false,
                 kvm: false,
@@ -16099,6 +16353,8 @@ fn regression_tests() -> Vec<RegressionTest> {
         devices: DeviceSet {
             nvme: false,
             e1000: true,
+            e1000e: false,
+            igb: false,
             audio: false,
             iommu: false,
             kvm: false,
@@ -16130,6 +16386,8 @@ fn regression_tests() -> Vec<RegressionTest> {
             devices: DeviceSet {
                 nvme: true,
                 e1000: false,
+                e1000e: false,
+                igb: false,
                 audio: false,
                 iommu: false,
                 kvm: false,
@@ -19342,6 +19600,8 @@ mod tests {
             DeviceSet {
                 nvme: false,
                 e1000: false,
+                e1000e: false,
+                igb: false,
                 audio: false,
                 iommu: false,
                 kvm: true,
@@ -19399,6 +19659,8 @@ mod tests {
             DeviceSet {
                 nvme: false,
                 e1000: true,
+                e1000e: false,
+                igb: false,
                 audio: false,
                 iommu: false,
                 kvm: false,
@@ -19430,6 +19692,8 @@ mod tests {
             DeviceSet {
                 nvme: true,
                 e1000: false,
+                e1000e: false,
+                igb: false,
                 audio: false,
                 iommu: false,
                 kvm: false,
@@ -19473,6 +19737,8 @@ mod tests {
             DeviceSet {
                 nvme: true,
                 e1000: false,
+                e1000e: false,
+                igb: false,
                 audio: false,
                 iommu: true,
                 kvm: false,
@@ -19516,6 +19782,8 @@ mod tests {
             DeviceSet {
                 nvme: true,
                 e1000: false,
+                e1000e: false,
+                igb: false,
                 audio: false,
                 iommu: true,
                 kvm: false,
@@ -19571,6 +19839,8 @@ mod tests {
             DeviceSet {
                 nvme: false,
                 e1000: false,
+                e1000e: false,
+                igb: false,
                 audio: false,
                 iommu: true,
                 kvm: false,
@@ -19631,6 +19901,8 @@ mod tests {
             DeviceSet {
                 nvme: false,
                 e1000: false,
+                e1000e: false,
+                igb: false,
                 audio: false,
                 iommu: true,
                 kvm: false,
@@ -19664,6 +19936,8 @@ mod tests {
             DeviceSet {
                 nvme: false,
                 e1000: false,
+                e1000e: false,
+                igb: false,
                 audio: false,
                 iommu: true,
                 kvm: false,
@@ -19889,6 +20163,8 @@ mod tests {
         let base = device_smoke_steps(DeviceSet {
             nvme: true,
             e1000: true,
+            e1000e: false,
+            igb: false,
             audio: false,
             iommu: false,
             kvm: false,
@@ -19898,6 +20174,8 @@ mod tests {
         let iommu = device_smoke_steps(DeviceSet {
             nvme: true,
             e1000: true,
+            e1000e: false,
+            igb: false,
             audio: false,
             iommu: true,
             kvm: false,

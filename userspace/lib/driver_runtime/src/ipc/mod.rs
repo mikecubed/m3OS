@@ -159,6 +159,21 @@ pub trait IpcBackend {
     /// if the underlying syscall reports an error.
     fn recv(&mut self, endpoint: EndpointCap) -> Result<RecvResult, crate::DriverRuntimeError>;
 
+    /// Non-blocking poll of the endpoint. Returns `Ok(Some(..))` when a message
+    /// or bound notification was pending, `Ok(None)` when nothing is pending.
+    ///
+    /// The default implementation reports nothing-pending (`Ok(None)`); only the
+    /// production [`SyscallBackend`] implements a real non-blocking recv via
+    /// `ipc_try_recv_msg`. Drivers that must poll a device ring on a timer
+    /// (e.g. a NIC whose interrupt delivery is unreliable under passthrough)
+    /// use this to serve the command endpoint without blocking.
+    fn try_recv(
+        &mut self,
+        _endpoint: EndpointCap,
+    ) -> Result<Option<RecvResult>, crate::DriverRuntimeError> {
+        Ok(None)
+    }
+
     /// Reply to the in-flight request on the reply capability the
     /// kernel staged for the peer. Implementations stamp any
     /// pre-staged bulk payload via `store_reply_bulk` before the
@@ -320,6 +335,27 @@ impl SyscallBackend {
 impl IpcBackend for SyscallBackend {
     fn recv(&mut self, endpoint: EndpointCap) -> Result<RecvResult, crate::DriverRuntimeError> {
         self.recv_with_capacity(endpoint, Self::MAX_BULK_RECV)
+    }
+
+    fn try_recv(
+        &mut self,
+        endpoint: EndpointCap,
+    ) -> Result<Option<RecvResult>, crate::DriverRuntimeError> {
+        use alloc::vec;
+        let mut msg = syscall_lib::IpcMessage::new(0);
+        let mut buf = vec![0u8; Self::MAX_BULK_RECV];
+        let rc = syscall_lib::ipc_try_recv_msg(endpoint.raw(), &mut msg, &mut buf);
+        // `u64::MAX` from the non-blocking recv means "nothing pending" (the ABI
+        // shares this sentinel with a copy fault; a persistent fault simply
+        // shows as no progress, which the caller's own observability surfaces).
+        if rc == u64::MAX {
+            return Ok(None);
+        }
+        let result = Self::decode_recv_result(rc, msg, buf);
+        if let RecvResult::Message(frame) = &result {
+            self.last_reply_cap_handle = frame.reply_cap_handle;
+        }
+        Ok(Some(result))
     }
 
     fn reply(&mut self, label: u64, data0: u64) -> Result<(), crate::DriverRuntimeError> {

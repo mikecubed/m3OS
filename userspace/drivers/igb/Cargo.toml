@@ -1,0 +1,22 @@
+[package]
+name = "igb_driver"
+version = "0.79.0"
+edition = "2024"
+description = "Phase 79 Track B — ring-3 Intel igb (82575/82576/I210/I211/I350/I354) NIC driver."
+
+[lib]
+name = "igb_driver"
+path = "src/lib.rs"
+
+[features]
+os-binary = []
+
+[[bin]]
+name = "igb_driver"
+path = "src/main.rs"
+required-features = ["os-binary"]
+
+[dependencies]
+driver_runtime = { path = "../../lib/driver_runtime" }
+syscall-lib = { path = "../../syscall-lib", features = ["alloc"] }
+kernel-core = { path = "../../../kernel-core", default-features = false }

@@ -9,6 +9,7 @@
 // still testable on the host via `cargo test -p kernel-core`.
 
 pub mod audio_class;
+pub mod config_read;
 pub mod dma_logic;
 pub mod irq_logic;
 pub mod mmio_bounds;
@@ -22,6 +23,7 @@ pub use audio_class::{
     AC97_BAR_LAYOUT, BarLayout, DeviceClass, PCI_DEVICE_AC97, PCI_VENDOR_INTEL,
     SUBSYSTEM_AUDIO_DEVICE, classify_pci_id,
 };
+pub use config_read::{ConfigReadError, extract_field, validate_config_read};
 pub use dma_logic::{
     DMA_MIN_ALIGN, DmaAllocEntry, DmaAllocId, DmaAllocationRegistryCore, DmaRegistryError,
     validate_size_align,

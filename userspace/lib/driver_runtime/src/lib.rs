@@ -60,6 +60,7 @@ pub mod dma;
 pub mod ipc;
 pub mod irq;
 pub mod mmio;
+pub mod net_ring;
 pub mod pci_enum;
 pub mod pio;
 pub mod syscall_backend;
@@ -69,7 +70,14 @@ pub mod syscall_backend;
 pub use device::{DeviceCapKey, DeviceHandle};
 pub use dma::{DmaBuffer, DmaHandle};
 pub use mmio::{Mmio, MmioCacheMode, MmioWindowDescriptor};
-pub use pci_enum::enumerate_pci_class;
+pub use net_ring::{
+    AdvRxDesc, AdvTxDesc, Advanced, Legacy16, NicDescriptors, adv_rx_wb, adv_tx, adv_tx_wb,
+    encode_adv_tx_cmd_olinfo, initial_rdt, ring_len_bytes, ring_len_is_valid, split_iova,
+};
+pub use pci_enum::{
+    PciFunctionId, enumerate_ethernet_functions, enumerate_pci_class, pci_config_read,
+    read_vendor_device, select_nic,
+};
 pub use pio::Pio;
 pub use syscall_backend::SyscallBackend;
 

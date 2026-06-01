@@ -35,11 +35,13 @@
 
 use alloc::vec::Vec;
 
-use kernel_core::device_host::DeviceCapKey;
+use kernel_core::device_host::{DeviceCapKey, DeviceHostError};
 use kernel_core::driver_runtime::contract::DriverRuntimeError;
 
 use crate::syscall_backend::decode_errno_common;
 
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
+use kernel_core::device_host::syscalls::SYS_DEVICE_CONFIG_READ;
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 use kernel_core::device_host::syscalls::SYS_DEVICE_PCI_ENUMERATE;
 
@@ -170,12 +172,186 @@ pub fn enumerate_pci_class(
 }
 
 // ---------------------------------------------------------------------------
+// Phase 79 Track A.1 — raw-BDF PCI config-space read (pre-claim).
+// ---------------------------------------------------------------------------
+
+/// Raw `sys_device_config_read` syscall.
+///
+/// Reads `width` (1/2/4) bytes at config-space `offset` for the device addressed
+/// by `key`, without claiming it. Returns the value (≥0) or a negated errno.
+///
+/// # Safety
+///
+/// Pure integer syscall — no pointer lifetimes are involved.
+#[inline]
+unsafe fn raw_sys_device_config_read(key: DeviceCapKey, offset: u16, width: u8) -> isize {
+    let packed = kernel_core::device_host::syscalls::pack_config_read_arg(offset, width);
+    #[cfg(all(target_arch = "x86_64", target_os = "none"))]
+    // SAFETY: all arguments are plain integers. `syscall5` places them in
+    // rdi/rsi/rdx/r10/r8 matching the documented ABI.
+    unsafe {
+        syscall_lib::syscall5(
+            SYS_DEVICE_CONFIG_READ,
+            u64::from(key.segment),
+            u64::from(key.bus),
+            u64::from(key.dev),
+            u64::from(key.func),
+            packed,
+        ) as isize
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_os = "none")))]
+    {
+        // Host-test path: no real kernel / PCI bus. Report ENODEV so the
+        // public wrapper exercises its error branch deterministically.
+        let _ = (key, offset, width, packed);
+        -19
+    }
+}
+
+/// Read `width` (1/2/4) bytes of PCI config space at `offset` for `key`,
+/// **without claiming** the device.
+///
+/// Used by NIC drivers to read the vendor/device ID of each enumerated
+/// Ethernet function so exactly one family driver claims a given device.
+///
+/// # Errors
+///
+/// - `DriverRuntimeError::Device(DeviceHostError::NotClaimed)` on `-EACCES`/`-EPERM`
+///   (exec-path not under `/drivers/`).
+/// - `DriverRuntimeError::Device(DeviceHostError::NotClaimed)` on `-ENODEV`
+///   (no function at the BDF).
+/// - `DriverRuntimeError::Device(DeviceHostError::Internal)` on `-EINVAL`
+///   (invalid config offset/width) or any other unexpected errno.
+pub fn pci_config_read(
+    key: DeviceCapKey,
+    offset: u16,
+    width: u8,
+) -> Result<u32, DriverRuntimeError> {
+    // SAFETY: see `raw_sys_device_config_read`.
+    let raw = unsafe { raw_sys_device_config_read(key, offset, width) };
+    if raw < 0 {
+        return Err(decode_config_errno(raw as i32));
+    }
+    Ok(raw as u32)
+}
+
+/// Decode a negative errno from `sys_device_config_read`.
+///
+/// This differs from the shared [`decode_errno_common`] (used by the MMIO BAR
+/// APIs) only for `-EINVAL`: for a config-space read `-EINVAL` means an invalid
+/// offset/width, **not** a bad BAR index, so it maps to `Internal` rather than
+/// the BAR-specific `InvalidBarIndex` a BAR API would surface. Every other errno
+/// keeps the shared mapping.
+#[inline]
+fn decode_config_errno(errno: i32) -> DriverRuntimeError {
+    if errno == -22 {
+        // -EINVAL: invalid config offset/width — no BAR index is involved.
+        return DriverRuntimeError::Device(DeviceHostError::Internal);
+    }
+    decode_errno_common(errno)
+}
+
+/// Read the `(vendor_id, device_id)` pair of an enumerated PCI function.
+///
+/// Convenience over [`pci_config_read`] for the offset-0 dword: the low 16 bits
+/// are the vendor ID, the high 16 bits the device ID.
+pub fn read_vendor_device(key: DeviceCapKey) -> Result<(u16, u16), DriverRuntimeError> {
+    let dword = pci_config_read(key, 0x00, 4)?;
+    Ok(((dword & 0xFFFF) as u16, ((dword >> 16) & 0xFFFF) as u16))
+}
+
+/// An enumerated PCI function plus its identifying vendor/device IDs.
+///
+/// Phase 79: the shared shape every NIC driver matches against when deciding
+/// which Ethernet function to claim. Produced by [`enumerate_ethernet_functions`]
+/// and filtered by [`select_nic`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PciFunctionId {
+    pub key: DeviceCapKey,
+    pub vendor: u16,
+    pub device: u16,
+}
+
+/// Enumerate every Ethernet controller (class 0x02 / subclass 0x00 / prog_if
+/// 0x00) and read each function's vendor:device ID via the pre-claim
+/// [`pci_config_read`] path.
+///
+/// Functions whose config read fails are silently skipped. On the host-test
+/// path the enumerate syscall returns no matches, so this returns an empty
+/// vector.
+pub fn enumerate_ethernet_functions() -> Vec<PciFunctionId> {
+    use kernel_core::nic_ids;
+    let mut out: Vec<PciFunctionId> = Vec::new();
+    let keys = match enumerate_pci_class(
+        nic_ids::ETHERNET_CLASS,
+        nic_ids::ETHERNET_SUBCLASS,
+        nic_ids::ETHERNET_PROG_IF,
+    ) {
+        Ok(keys) => keys,
+        Err(_) => return out,
+    };
+    for key in keys {
+        if let Ok((vendor, device)) = read_vendor_device(key) {
+            out.push(PciFunctionId {
+                key,
+                vendor,
+                device,
+            });
+        }
+    }
+    out
+}
+
+/// Return the BDF of the first enumerated function matching `vendor` and the
+/// per-family `is_family` device-ID predicate (one of the
+/// `kernel_core::nic_ids::is_*` functions), or `None`.
+pub fn select_nic(
+    functions: &[PciFunctionId],
+    vendor: u16,
+    is_family: fn(u16) -> bool,
+) -> Option<DeviceCapKey> {
+    functions
+        .iter()
+        .find(|f| f.vendor == vendor && is_family(f.device))
+        .map(|f| f.key)
+}
+
+// ---------------------------------------------------------------------------
 // Host tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- decode_config_errno: config reads must not borrow BAR-API semantics ---
+
+    #[test]
+    fn decode_config_errno_maps_einval_to_internal_not_bar() {
+        // -EINVAL from a config read means a bad offset/width, not a BAR index,
+        // so it must NOT surface as the BAR-specific InvalidBarIndex.
+        assert_eq!(
+            decode_config_errno(-22),
+            DriverRuntimeError::Device(DeviceHostError::Internal)
+        );
+    }
+
+    #[test]
+    fn decode_config_errno_delegates_other_errnos_to_common() {
+        // Every errno other than -EINVAL keeps the shared mapping.
+        assert_eq!(
+            decode_config_errno(-19), // ENODEV
+            DriverRuntimeError::Device(DeviceHostError::NotClaimed)
+        );
+        assert_eq!(
+            decode_config_errno(-13), // EACCES
+            DriverRuntimeError::Device(DeviceHostError::NotClaimed)
+        );
+        assert_eq!(
+            decode_config_errno(-16), // EBUSY
+            DriverRuntimeError::Device(DeviceHostError::AlreadyClaimed)
+        );
+    }
 
     // The host stub returns 0 (no matches), so enumerate_pci_class returns Ok([]).
     #[test]

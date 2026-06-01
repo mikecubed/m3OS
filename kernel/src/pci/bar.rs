@@ -690,10 +690,14 @@ pub fn map_bar(handle: &PciDeviceHandle, bar_index: u8) -> Result<BarMapping, Ba
 
     match bar_type {
         kpci::BarType::Memory32 { .. } => {
-            // Size dance: write 0xFFFFFFFF, read back, restore.
+            // Size dance: disable decode, write 0xFFFFFFFF, read back, restore,
+            // re-enable decode. See `disable_decode_for_sizing` for why the
+            // decode toggle matters on real hardware.
+            let saved_cmd = disable_decode_for_sizing(bus, device, function);
             pci_config_write_u32_any(bus, device, function, bar_offset, 0xFFFF_FFFF);
             let readback = pci_config_read_u32_any(bus, device, function, bar_offset);
             pci_config_write_u32_any(bus, device, function, bar_offset, raw_low);
+            restore_decode_after_sizing(bus, device, function, saved_cmd);
 
             let size32 = kpci::decode_bar_size_32(raw_low, readback);
             if size32 == 0 {
@@ -722,13 +726,19 @@ pub fn map_bar(handle: &PciDeviceHandle, bar_index: u8) -> Result<BarMapping, Ba
             let high_offset = bar_offset + 4;
             let raw_high = pci_config_read_u32_any(bus, device, function, high_offset);
 
-            // Size dance across both slots.
+            // Size dance across both slots, with decode disabled (see
+            // `disable_decode_for_sizing`). Without this, a real 64-bit-BAR
+            // device (e.g. a VFIO-passed RTL8125 whose BAR2 sits high in the
+            // q35 PCI MMIO window) wedges the bus when it decodes the all-ones
+            // probe address, hanging the next config access.
+            let saved_cmd = disable_decode_for_sizing(bus, device, function);
             pci_config_write_u32_any(bus, device, function, bar_offset, 0xFFFF_FFFF);
             pci_config_write_u32_any(bus, device, function, high_offset, 0xFFFF_FFFF);
             let readback_low = pci_config_read_u32_any(bus, device, function, bar_offset);
             let readback_high = pci_config_read_u32_any(bus, device, function, high_offset);
             pci_config_write_u32_any(bus, device, function, bar_offset, raw_low);
             pci_config_write_u32_any(bus, device, function, high_offset, raw_high);
+            restore_decode_after_sizing(bus, device, function, saved_cmd);
 
             let size64 = kpci::decode_bar_size_64(raw_low, readback_low, readback_high);
             if size64 == 0 {
@@ -751,9 +761,11 @@ pub fn map_bar(handle: &PciDeviceHandle, bar_index: u8) -> Result<BarMapping, Ba
             })
         }
         kpci::BarType::Io => {
+            let saved_cmd = disable_decode_for_sizing(bus, device, function);
             pci_config_write_u32_any(bus, device, function, bar_offset, 0xFFFF_FFFF);
             let readback = pci_config_read_u32_any(bus, device, function, bar_offset);
             pci_config_write_u32_any(bus, device, function, bar_offset, raw_low);
+            restore_decode_after_sizing(bus, device, function, saved_cmd);
 
             let size = kpci::decode_bar_size_32(raw_low, readback);
             if size == 0 {
@@ -768,6 +780,53 @@ pub fn map_bar(handle: &PciDeviceHandle, bar_index: u8) -> Result<BarMapping, Ba
             })
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// BAR-sizing decode gate
+// ---------------------------------------------------------------------------
+
+/// Config-space dword offset of the PCI Command register (Command is the low
+/// half-word at 0x04, Status the high half-word at 0x06).
+const PCI_COMMAND_OFFSET: u16 = 0x04;
+/// Command-register decode bits — I/O Space Enable (bit 0) and Memory Space
+/// Enable (bit 1).
+const PCI_COMMAND_DECODE_BITS: u32 = 0b11;
+
+/// Disable a device's I/O + memory decode before the destructive BAR-sizing
+/// dance, returning the original Command word for [`restore_decode_after_sizing`].
+///
+/// The sizing dance writes `0xFFFFFFFF` into a BAR and reads back the writable
+/// bits to learn the BAR size. While the device's decode is enabled, that
+/// all-ones value makes the device transiently claim a huge address window.
+/// QEMU's emulated BARs ignore this, but real hardware (observed on a
+/// VFIO-passed RTL8125 whose 64-bit BAR2 lives high in the q35 PCI MMIO window)
+/// conflicts on the bus and wedges the very next config access — hanging
+/// bring-up. Disabling decode for the dance (as Linux's PCI core does) avoids
+/// it. Writing the Status half (high 16 of the 0x04 dword) as 0 is a no-op for
+/// its write-1-to-clear bits.
+fn disable_decode_for_sizing(bus: u8, device: u8, function: u8) -> u32 {
+    let saved_cmd = pci_config_read_u32_any(bus, device, function, PCI_COMMAND_OFFSET) & 0xFFFF;
+    pci_config_write_u32_any(
+        bus,
+        device,
+        function,
+        PCI_COMMAND_OFFSET,
+        saved_cmd & !PCI_COMMAND_DECODE_BITS,
+    );
+    saved_cmd
+}
+
+/// Restore the Command word saved by [`disable_decode_for_sizing`], re-enabling
+/// whatever decode bits the device had before the sizing dance.
+fn restore_decode_after_sizing(bus: u8, device: u8, function: u8, saved_cmd: u32) {
+    pci_config_write_u32_any(
+        bus,
+        device,
+        function,
+        PCI_COMMAND_OFFSET,
+        saved_cmd & 0xFFFF,
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -90,12 +90,34 @@ pub const SERVICE_NAME: &str = "net.nic";
 /// link-state events back into `RemoteNic`.
 pub const INGRESS_SERVICE_NAME: &str = "net.nic.ingress";
 
-/// Sentinel PCI BDF QEMU uses for `-device e1000` under m3OS (bus 0,
-/// device 3, function 0 — slot +3, the net family's conventional
-/// location). Parallel to the `nvme_driver` sentinel.
+/// Enumerate Ethernet controllers and return the BDF of the first classic
+/// 82540EM e1000 (`0x8086:0x100E`), or `None`.
+///
+/// Phase 79 Track A.1 replaces the old hardcoded-BDF gate with a device-ID
+/// match: enumerate the Ethernet class, read each function's vendor:device ID
+/// through `sys_device_config_read` (pre-claim), and bind only the 82540EM.
+/// This is what lets the e1000e / igb / igc silicon — which QEMU places at the
+/// same NIC slot when `-device e1000e`/`igb` is used — be claimed by *their*
+/// drivers instead of being mis-driven by this one.
 #[cfg(not(test))]
-const SENTINEL_BDF: driver_runtime::DeviceCapKey =
-    driver_runtime::DeviceCapKey::new(0, 0x00, 0x03, 0);
+fn find_e1000() -> Option<driver_runtime::DeviceCapKey> {
+    let candidates = driver_runtime::enumerate_pci_class(
+        kernel_core::nic_ids::ETHERNET_CLASS,
+        kernel_core::nic_ids::ETHERNET_SUBCLASS,
+        kernel_core::nic_ids::ETHERNET_PROG_IF,
+    )
+    .ok()?;
+    for key in candidates {
+        if let Ok((vendor, device)) = driver_runtime::read_vendor_device(key) {
+            if vendor == kernel_core::nic_ids::VENDOR_INTEL
+                && kernel_core::nic_ids::is_e1000(device)
+            {
+                return Some(key);
+            }
+        }
+    }
+    None
+}
 
 #[cfg(not(test))]
 syscall_lib::entry_point!(program_main);
@@ -104,7 +126,18 @@ syscall_lib::entry_point!(program_main);
 fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, BOOT_LOG_MARKER);
 
-    match init::E1000Device::bring_up(SENTINEL_BDF) {
+    let key = match find_e1000() {
+        Some(k) => k,
+        None => {
+            syscall_lib::write_str(
+                STDOUT_FILENO,
+                "e1000_driver: no e1000 device present — exiting cleanly\n",
+            );
+            return 0;
+        }
+    };
+
+    match init::E1000Device::bring_up(key) {
         Ok(dev) => {
             log_mac("e1000_driver: MAC ", dev.mac());
             if dev.link_up_initial() {

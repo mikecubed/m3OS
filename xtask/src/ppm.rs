@@ -34,6 +34,18 @@ pub struct PpmFrame {
     pub pixels: Vec<u8>,
 }
 
+impl core::fmt::Debug for PpmFrame {
+    /// Summarize dimensions + byte count rather than dumping the full pixel
+    /// buffer (needed so `Result<PpmFrame, _>::expect_err` works in tests).
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PpmFrame")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("pixels_len", &self.pixels.len())
+            .finish()
+    }
+}
+
 impl PpmFrame {
     /// FNV-1a 64-bit hash over the entire pixel buffer. Used to print
     /// a stable per-frame fingerprint in the probe output; two

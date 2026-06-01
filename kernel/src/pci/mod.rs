@@ -12,7 +12,7 @@ pub mod bar;
 
 use core::ptr;
 use kernel_core::pci as kpci;
-use x86_64::instructions::{interrupts, port::Port};
+use x86_64::instructions::port::Port;
 
 use crate::task::scheduler::IrqSafeMutex;
 
@@ -32,36 +32,48 @@ fn config_address(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
         | ((offset as u32) & 0xFC)
 }
 
+/// Global lock serializing the shared CF8/CFC address/data register pair.
+///
+/// The legacy mechanism-#1 access is a *non-atomic two-step*: write the target
+/// address to `CONFIG_ADDRESS` (0xCF8), then read/write `CONFIG_DATA` (0xCFC).
+/// `without_interrupts` alone only blocks the *local* CPU — on SMP, another
+/// core can clobber `CONFIG_ADDRESS` between this core's write and its data
+/// access, so the data port returns the *wrong device's* config word. Userspace
+/// drivers do concurrent `sys_device_config_read`s across cores at boot (six NIC
+/// drivers enumerate at once), so this is a live race on platforms with no
+/// MCFG/ECAM (where this path is the only one). `IrqSafeMutex` both takes the
+/// cross-core lock and disables interrupts for the transaction.
+static LEGACY_PCI_CONFIG_LOCK: IrqSafeMutex<()> = IrqSafeMutex::new(());
+
 /// Legacy I/O-port read: 32-bit value from the first 256 bytes of config space.
 ///
-/// Interrupts are disabled for the duration of the two-port transaction
-/// to prevent races on the shared CONFIG_ADDRESS/CONFIG_DATA pair.
+/// Serialized cross-core via [`LEGACY_PCI_CONFIG_LOCK`] (which also disables
+/// local interrupts) so the CF8→CFC transaction is atomic against concurrent
+/// config access from other cores.
 fn legacy_pci_config_read_u32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
     let addr = config_address(bus, device, function, offset);
-    interrupts::without_interrupts(|| {
-        // SAFETY: Ports 0xCF8 and 0xCFC are the well-defined PCI configuration
-        // space I/O ports on x86. Writing an address and reading data is the
-        // standard mechanism #1 access pattern.
-        unsafe {
-            let mut addr_port = Port::<u32>::new(CONFIG_ADDRESS);
-            let mut data_port = Port::<u32>::new(CONFIG_DATA);
-            addr_port.write(addr);
-            data_port.read()
-        }
-    })
+    let _guard = LEGACY_PCI_CONFIG_LOCK.lock();
+    // SAFETY: Ports 0xCF8 and 0xCFC are the well-defined PCI configuration
+    // space I/O ports on x86. Writing an address and reading data is the
+    // standard mechanism #1 access pattern.
+    unsafe {
+        let mut addr_port = Port::<u32>::new(CONFIG_ADDRESS);
+        let mut data_port = Port::<u32>::new(CONFIG_DATA);
+        addr_port.write(addr);
+        data_port.read()
+    }
 }
 
 fn legacy_pci_config_write_u32(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
     let addr = config_address(bus, device, function, offset);
-    interrupts::without_interrupts(|| {
-        // SAFETY: standard PCI mechanism-#1 write.
-        unsafe {
-            let mut addr_port = Port::<u32>::new(CONFIG_ADDRESS);
-            let mut data_port = Port::<u32>::new(CONFIG_DATA);
-            addr_port.write(addr);
-            data_port.write(value);
-        }
-    });
+    let _guard = LEGACY_PCI_CONFIG_LOCK.lock();
+    // SAFETY: standard PCI mechanism-#1 write.
+    unsafe {
+        let mut addr_port = Port::<u32>::new(CONFIG_ADDRESS);
+        let mut data_port = Port::<u32>::new(CONFIG_DATA);
+        addr_port.write(addr);
+        data_port.write(value);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -148,8 +160,18 @@ pub(crate) fn pci_config_write_u32_any(bus: u8, device: u8, function: u8, offset
 
 /// Legacy-compatible 32-bit config read (first 256 bytes only, u8 offset).
 /// Prefers ECAM MMIO when available so that behaviour is uniform.
+///
+/// Reads the dword **containing** `offset`: the offset is aligned down to the
+/// 4-byte boundary. The legacy CF8/CFC path already masks `offset & 0xFC` in
+/// [`config_address`], but the ECAM MMIO path ([`pcie_mmio_config_read`])
+/// indexes by the exact byte offset, so a sub-dword read via the u16/u8 helpers
+/// (which pass e.g. offset 2 and then shift) would otherwise do an *unaligned*
+/// MMIO read on an ECAM platform (q35 / real modern hardware) and return the
+/// wrong field — notably the device-ID half-word at offset 2 came back as the
+/// command register, so the driver-side enumeration dropped every device whose
+/// ID lives in the high half-word. Aligning here makes both paths identical.
 fn pci_config_read_u32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
-    pci_config_read_u32_any(bus, device, function, offset as u16)
+    pci_config_read_u32_any(bus, device, function, (offset & 0xFC) as u16)
 }
 
 /// Read a 16-bit value from PCI configuration space.

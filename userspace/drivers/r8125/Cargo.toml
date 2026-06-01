@@ -1,0 +1,27 @@
+[package]
+name = "r8125_driver"
+version = "0.79.0"
+edition = "2024"
+description = "Phase 79 Track D — ring-3 Realtek RTL8125 (2.5GbE) / RTL8126 (5GbE) NIC driver."
+
+[lib]
+name = "r8125_driver"
+path = "src/lib.rs"
+
+[features]
+# Propagate to r8169_driver's os-binary so its hardware ring/init/io modules
+# (reused by the 8125 bring-up — the 8125 is a second-generation r8169 MAC) are
+# compiled in for the binary build.
+os-binary = ["r8169_driver/os-binary"]
+
+[[bin]]
+name = "r8125_driver"
+path = "src/main.rs"
+required-features = ["os-binary"]
+
+[dependencies]
+driver_runtime = { path = "../../lib/driver_runtime" }
+syscall-lib = { path = "../../syscall-lib", features = ["alloc"] }
+kernel-core = { path = "../../../kernel-core", default-features = false }
+# Reuse the r8169 OWN-bit/TxPoll ring + Cfg9346 reset base + IRQ loop.
+r8169_driver = { path = "../r8169", default-features = false }

@@ -1755,14 +1755,32 @@ fn allocate_device_vector(key: DeviceCapKey) -> Result<AllocatedDeviceVector, Ve
             .ok_or(VectorAllocError::NoDevice)?
     };
 
-    if let Some(allocated) = crate::pci::allocate_msi_vectors(&dev_copy, 1) {
+    // Phase 79: the ring-3 NIC drivers (e1000 / e1000e / igb / igc + Realtek
+    // r8169 / r8125) all drive the legacy ICR/IMS interrupt model — they
+    // program no MSI-X cause routing (the 82574/82576 `IVAR` / `EIMS` block,
+    // the Realtek V2 ISR). A kernel-enabled MSI-X vector therefore never fires
+    // for them: QEMU's `e1000e` (82574) reproduces this exactly — MSI-X gets
+    // enabled but stays silent without `IVAR`, so the driver's RX ring never
+    // drains and no packets flow even though link comes up. The device-host
+    // IRQ path is otherwise used by nvme (storage, class 0x01) and the xHCI
+    // host controller (serial-bus, class 0x0C), both of which *do* program
+    // MSI-X cause routing. Gate on the Ethernet class (0x02): NICs fall to
+    // INTx (their working path, identical to the 82540EM e1000), while
+    // storage / USB keep MSI-X. This realises the Phase 79 acceptance "INTx
+    // or single-MSI is used (no MSI-X required)" and is a no-op for the
+    // 82540EM e1000, which has no MSI-X capability and already used INTx.
+    let prefer_intx = dev_copy.class_code == kernel_core::nic_ids::ETHERNET_CLASS;
+
+    if !prefer_intx && let Some(allocated) = crate::pci::allocate_msi_vectors(&dev_copy, 1) {
         return Ok(AllocatedDeviceVector {
             vector: allocated.first_vector,
             legacy_irq_line: None,
         });
     }
 
-    // Fallback: legacy INTx on the first free slot in the device-IRQ bank.
+    // Legacy INTx on the first free slot in the device-IRQ bank — the only
+    // path for Ethernet-class NICs, and the MSI/MSI-X fallback for everything
+    // else.
     if let Some(vec) = crate::pci::reserve_msi_vectors(1) {
         return Ok(AllocatedDeviceVector {
             vector: vec,
@@ -3421,6 +3439,63 @@ pub fn sys_device_pci_enumerate(
     // Return the total count, which may be larger than what was written if
     // the buffer was too small (caller detects truncation).
     total as isize
+}
+
+/// Syscall entry: `sys_device_config_read(segment, bus, dev, func, packed) -> isize`
+/// where `packed = (offset << 8) | width` (see
+/// [`kernel_core::device_host::syscalls::pack_config_read_arg`]).
+///
+/// Phase 79 Track A.1 — reads PCI configuration space for a raw BDF **without**
+/// claiming the device, so a NIC driver can match its vendor:device ID against
+/// a per-family set before deciding which function to claim.
+///
+/// Returns the requested config-space field zero-extended into the low bits, or
+/// a negative errno:
+///
+/// - `NEG_EACCES` — caller is not an authorized driver process.
+/// - `NEG_ESRCH`  — kernel task context (PID 0).
+/// - `NEG_EINVAL` — bad width/offset (see `validate_config_read`).
+/// - `NEG_ENODEV` — no PCI function at the BDF (vendor reads back `0xFFFF`), or a
+///   non-zero segment (multi-segment PCIe is not supported yet).
+///
+/// See [`kernel_core::device_host::syscalls::SYS_DEVICE_CONFIG_READ`] for the
+/// full ABI.
+pub fn sys_device_config_read(segment: u16, bus: u8, dev: u8, func: u8, packed: u64) -> isize {
+    let pid = crate::process::current_pid();
+    if pid == 0 {
+        return NEG_ESRCH;
+    }
+    // Authorization gate — same policy as `sys_device_claim` / enumerate.
+    if !is_authorized_driver_process(pid) {
+        return NEG_EACCES;
+    }
+    // Only segment 0 exists on current platforms; reject others as ENODEV.
+    if segment != 0 {
+        return NEG_ENODEV;
+    }
+    let (offset, width) = kernel_core::device_host::syscalls::unpack_config_read_arg(packed);
+    if kernel_core::device_host::validate_config_read(offset, width).is_err() {
+        return NEG_EINVAL;
+    }
+    // A function is absent when its vendor ID reads back all-ones.
+    let vendor = crate::pci::pci_config_read_u16(bus, dev, func, 0x00);
+    if vendor == 0xFFFF {
+        return NEG_ENODEV;
+    }
+    // `offset` is validated to be naturally aligned to `width` and within the
+    // 256-byte legacy config space, so each sub-read below is well-formed.
+    let off = offset as u8;
+    let value: u32 = match width {
+        1 => u32::from(crate::pci::pci_config_read_u8(bus, dev, func, off)),
+        2 => u32::from(crate::pci::pci_config_read_u16(bus, dev, func, off)),
+        // width == 4 (validated): combine two aligned 16-bit reads.
+        _ => {
+            let lo = u32::from(crate::pci::pci_config_read_u16(bus, dev, func, off));
+            let hi = u32::from(crate::pci::pci_config_read_u16(bus, dev, func, off + 2));
+            lo | (hi << 16)
+        }
+    };
+    value as isize
 }
 
 fn device_claim_error_to_errno(

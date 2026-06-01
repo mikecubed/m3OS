@@ -46,6 +46,7 @@ use alloc::collections::VecDeque;
 use kernel_core::driver_ipc::net::{
     NetDriverError, NetLinkEvent, decode_net_link_event, decode_net_rx_notify,
 };
+use kernel_core::nic_ids::MAX_NICS;
 use kernel_core::types::{EndpointId, MacAddr};
 
 use crate::task::scheduler::IrqSafeMutex;
@@ -87,7 +88,14 @@ struct NicEntry {
 // `RemoteNic` is the userspace-driver facade; every callsite is task
 // context (register, send_frame, drain_*, inject_rx_frame).  No ISR
 // touches this lock.
-static REMOTE_NIC: IrqSafeMutex<Option<NicEntry>> = IrqSafeMutex::new(None);
+// Phase 79 Track E.1 — the single `Option<NicEntry>` slot is lifted to a
+// bounded `Vec<NicEntry>` so several NIC families can be present at once. Index
+// 0 is the default interface ("first registered wins"); per-destination
+// multi-NIC routing tables remain out of scope for 1.0. The single-NIC fast
+// path (`REMOTE_NIC_REGISTERED` + `first()`/`first_mut()`) is preserved so a
+// one-NIC boot behaves exactly as before.
+static REMOTE_NIC: IrqSafeMutex<alloc::vec::Vec<NicEntry>> =
+    IrqSafeMutex::new(alloc::vec::Vec::new());
 
 /// Set when `RemoteNic::register` succeeds; checked lock-free on the hot
 /// TX path by `net::send_frame`.
@@ -140,13 +148,34 @@ impl RemoteNic {
     /// `remote_nic.registered` event at info level.
     pub fn register(endpoint: EndpointId, mac: MacAddr) {
         {
-            let mut slot = REMOTE_NIC.lock();
-            *slot = Some(NicEntry {
+            let mut nics = REMOTE_NIC.lock();
+            let fresh = NicEntry {
                 endpoint,
                 mac,
                 tx_queue: VecDeque::new(),
                 rx_queue: VecDeque::new(),
-            });
+            };
+            if let Some(slot) = nics.iter_mut().find(|e| e.endpoint == endpoint) {
+                // Same endpoint re-registers — refresh in place.
+                *slot = fresh;
+            } else if nics.is_empty() {
+                // First NIC becomes the default interface (index 0).
+                nics.push(fresh);
+            } else if RESTART_SUSPECTED.load(Ordering::Acquire) {
+                // A driver restart replaces the now-dead primary NIC rather
+                // than appending a stale duplicate ahead of the live endpoint.
+                nics[0] = fresh;
+            } else if nics.len() < MAX_NICS {
+                // A genuinely-additional NIC family registering alongside the
+                // first; bounded by MAX_NICS.
+                nics.push(fresh);
+            } else {
+                log::warn!(
+                    "[remote_nic] registry full ({} NICs) — replacing default route",
+                    MAX_NICS
+                );
+                nics[0] = fresh;
+            }
         }
         REMOTE_NIC_REGISTERED.store(true, Ordering::Release);
         // Clear restart-suspected on successful re-registration so subsequent
@@ -174,8 +203,8 @@ impl RemoteNic {
     /// falls back to virtio-net. Logs a `remote_nic.unregistered` event.
     pub fn unregister() {
         {
-            let mut slot = REMOTE_NIC.lock();
-            *slot = None;
+            let mut nics = REMOTE_NIC.lock();
+            nics.clear();
         }
         REMOTE_NIC_REGISTERED.store(false, Ordering::Release);
         log::info!("[remote_nic] ring-3 NIC driver unregistered");
@@ -216,10 +245,11 @@ impl RemoteNic {
         // Cold path — service-registry lookup (throttled to once per 1024 misses).
         if let Some(ep) = crate::ipc::registry::lookup_endpoint_id("net.nic") {
             {
-                let mut slot = REMOTE_NIC.lock();
-                // Guard against a concurrent cold-path race.
-                if slot.is_none() {
-                    *slot = Some(NicEntry {
+                let mut nics = REMOTE_NIC.lock();
+                // Guard against a concurrent cold-path race — only bootstrap a
+                // primary entry when the registry is still empty.
+                if nics.is_empty() {
+                    nics.push(NicEntry {
                         endpoint: ep,
                         mac: [0u8; 6],
                         tx_queue: VecDeque::new(),
@@ -242,7 +272,7 @@ impl RemoteNic {
     /// Return the MAC address of the registered ring-3 NIC, or `None` if no
     /// driver is registered.
     pub fn mac_address() -> Option<MacAddr> {
-        REMOTE_NIC.lock().as_ref().map(|e| e.mac)
+        REMOTE_NIC.lock().first().map(|e| e.mac)
     }
 
     /// Phase 55c Track G R1 — pre-send errno gate for `sys_sendto`.
@@ -294,8 +324,8 @@ impl RemoteNic {
             );
             return Err(NetDriverError::DriverRestarting);
         }
-        let mut slot = REMOTE_NIC.lock();
-        let entry = match slot.as_mut() {
+        let mut nics = REMOTE_NIC.lock();
+        let entry = match nics.first_mut() {
             Some(e) => e,
             None => {
                 // Deduplicate: only emit the warn on the first absent-driver
@@ -350,8 +380,8 @@ impl RemoteNic {
             None => return 0,
         };
         let (endpoint, frames) = {
-            let mut slot = REMOTE_NIC.lock();
-            let entry = match slot.as_mut() {
+            let mut nics = REMOTE_NIC.lock();
+            let entry = match nics.first_mut() {
                 Some(e) => e,
                 None => return 0,
             };
@@ -444,8 +474,8 @@ impl RemoteNic {
         if !REMOTE_NIC_REGISTERED.load(Ordering::Acquire) {
             return;
         }
-        let registered = REMOTE_NIC.lock().as_ref().map(|e| e.endpoint);
-        if registered == Some(ep_id) {
+        let registered = REMOTE_NIC.lock().iter().any(|e| e.endpoint == ep_id);
+        if registered {
             log::warn!(
                 "[remote_nic] command endpoint {:?} closed by owner exit — \
                  marking restart-suspected",
@@ -496,8 +526,8 @@ impl RemoteNic {
             }
             let frame = &header_and_frame[pos + header_size..pos + header_size + frame_len];
             {
-                let mut slot = REMOTE_NIC.lock();
-                let Some(entry) = slot.as_mut() else {
+                let mut nics = REMOTE_NIC.lock();
+                let Some(entry) = nics.first_mut() else {
                     log::warn!("[remote_nic] RX: no ring-3 NIC registered");
                     break;
                 };
@@ -527,11 +557,17 @@ impl RemoteNic {
     /// frames successfully accepted by the protocol stack.
     pub fn drain_rx_queue() -> usize {
         let frames = {
-            let mut slot = REMOTE_NIC.lock();
-            let Some(entry) = slot.as_mut() else {
+            let mut nics = REMOTE_NIC.lock();
+            if nics.is_empty() {
                 return 0;
-            };
-            entry.rx_queue.drain(..).collect::<alloc::vec::Vec<_>>()
+            }
+            // Drain every registered NIC's RX queue (the single-NIC case is the
+            // N=1 path); per-NIC ingress steering is out of scope for 1.0.
+            let mut all: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+            for entry in nics.iter_mut() {
+                all.extend(entry.rx_queue.drain(..));
+            }
+            all
         };
         let mut dispatched = 0usize;
         for frame in frames {
@@ -608,13 +644,13 @@ impl RemoteNic {
     ) -> Option<EndpointId> {
         let mut live_endpoint = None;
         {
-            let mut slot = REMOTE_NIC.lock();
+            let mut nics = REMOTE_NIC.lock();
             if let Some(ep) = fallback_endpoint {
-                if let Some(entry) = slot.as_mut() {
+                if let Some(entry) = nics.first_mut() {
                     entry.endpoint = ep;
                     entry.mac = mac;
                 } else {
-                    *slot = Some(NicEntry {
+                    nics.push(NicEntry {
                         endpoint: ep,
                         mac,
                         tx_queue: VecDeque::new(),
@@ -622,7 +658,7 @@ impl RemoteNic {
                     });
                 }
                 live_endpoint = Some(ep);
-            } else if let Some(entry) = slot.as_mut() {
+            } else if let Some(entry) = nics.first_mut() {
                 entry.mac = mac;
             }
         }
@@ -651,7 +687,7 @@ mod tests {
     use super::*;
 
     fn reset_remote_nic_state() {
-        *REMOTE_NIC.lock() = None;
+        REMOTE_NIC.lock().clear();
         REMOTE_NIC_REGISTERED.store(false, Ordering::Release);
         RESTART_SUSPECTED.store(false, Ordering::Release);
         ABSENT_WARN_EMITTED.store(false, Ordering::Relaxed);
@@ -659,15 +695,44 @@ mod tests {
     }
 
     fn registered_endpoint() -> Option<EndpointId> {
-        REMOTE_NIC.lock().as_ref().map(|entry| entry.endpoint)
+        REMOTE_NIC.lock().first().map(|entry| entry.endpoint)
     }
 
     fn queued_rx_frames() -> usize {
         REMOTE_NIC
             .lock()
-            .as_ref()
+            .first()
             .map(|entry| entry.rx_queue.len())
             .unwrap_or(0)
+    }
+
+    /// Phase 79 Track E.1: the registry holds a bounded set of NICs with the
+    /// first-registered entry as the default route, and RX routing selects the
+    /// correct index by destination MAC.
+    #[test_case]
+    fn registry_holds_multiple_nics_with_first_as_default_route() {
+        use kernel_core::nic_ids::{default_route_index, rx_route_index};
+        reset_remote_nic_state();
+
+        let mac_a = [0x52, 0x54, 0x00, 0x11, 0x11, 0x11];
+        let mac_b = [0x52, 0x54, 0x00, 0x22, 0x22, 0x22];
+        RemoteNic::register(EndpointId(10), mac_a);
+        // A genuinely-additional second NIC family present at boot.
+        RemoteNic::register(EndpointId(11), mac_b);
+
+        let count = REMOTE_NIC.lock().len();
+        assert_eq!(count, 2, "registry holds two NICs");
+        // Default route is the first-registered NIC (index 0).
+        assert_eq!(default_route_index(count), Some(0));
+        assert_eq!(RemoteNic::mac_address(), Some(mac_a));
+        // RX routing steers to the matching NIC index.
+        let macs = [mac_a, mac_b];
+        assert_eq!(rx_route_index(&macs, &mac_a), Some(0));
+        assert_eq!(rx_route_index(&macs, &mac_b), Some(1));
+        // Broadcast routes to the default interface.
+        assert_eq!(rx_route_index(&macs, &[0xFF; 6]), Some(0));
+
+        reset_remote_nic_state();
     }
 
     #[test_case]

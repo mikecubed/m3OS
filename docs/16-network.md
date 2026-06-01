@@ -168,9 +168,12 @@ Intel 82540EM classic e1000 (`0x8086:0x100E`) as the first non-VirtIO
 networking path. The e1000 driver lives in `kernel/src/net/e1000.rs` and
 uses the same hardware-access layer as the post-C.5 VirtIO-net driver:
 
-- **Scope: 82540EM only.** The e1000e family (82574, 82576, etc.) is
-  different silicon with a separate register layout and is **not**
-  supported. Later phases will handle it.
+- **Scope (Phase 55): 82540EM only.** The classic in-kernel e1000 path
+  handles only `0x8086:0x100E`. **Phase 79 adds the modern NIC families**
+  — Intel e1000e/igb/igc and Realtek RTL8111/8168 (r8169) + RTL8125 2.5G
+  — as IOMMU-isolated ring-3 drivers that match on vendor:device ID and
+  feed the same in-kernel stack through `RemoteNic`. See the learning doc
+  [`docs/79-modern-nic.md`](79-modern-nic.md).
 - **Bring-up.** `e1000_probe` claims the device, maps BAR0 as MMIO,
   executes the global reset (`CTRL.RST`), reads the MAC from
   `RAL0`/`RAH0`, zeroes the multicast table, allocates 256-entry TX and

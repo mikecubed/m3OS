@@ -4,12 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**m3OS** (technical name: `m3os`) is a bootable microkernel OS in Rust: x86_64, UEFI boot, kernel **v0.78.2**. Ring 0 handles memory, scheduling, IPC/capabilities, interrupt routing, and in-kernel drivers; ring 3 hosts everything else.
+**m3OS** (technical name: `m3os`) is a bootable microkernel OS in Rust: x86_64, UEFI boot, kernel **v0.79.0**. Ring 0 handles memory, scheduling, IPC/capabilities, interrupt routing, and in-kernel drivers; ring 3 hosts everything else.
 
 Capabilities now present in the tree:
 
 - **Userspace**: init (PID 1), shell (sh0) + ion, coreutils, multi-user (login/su/passwd/adduser), editor, service manager, PTY, telnet/SSH servers, crypto.
-- **Networking & storage**: IPv4/TCP/UDP stack, AF_UNIX sockets, NVMe + Intel e1000 (82540EM) real-hardware drivers on a VirtIO baseline.
+- **Networking & storage**: IPv4/TCP/UDP stack, AF_UNIX sockets, NVMe + modern NIC ring-3 drivers — Intel e1000 (82540EM), e1000e/igb/igc and Realtek RTL8111/8168 (r8169) + RTL8125 2.5G — with device-ID matching over a bounded multi-NIC registry, on a VirtIO baseline.
 - **IOMMU substrate**: ACPI DMAR/IVRS parsing, per-device VT-d / AMD-Vi domains, IOMMU-routed `DmaBuffer<T>`, fault ISRs, VT-d queued invalidation.
 - **Ring-3 driver hosting**: capability-gated device-host syscalls, supervised userspace NVMe/e1000 with `RemoteBlockDevice`/`RemoteNic` facades.
 - **USB host stack**: ring-3 xHCI host driver (MSI-X, BME, TRB/event rings) + `usb-core`/hub + a HID Boot-Protocol class driver (`usb-hid`) injecting keyboard/mouse into `kbd_server`/`mouse_server` — modern PS/2-less machines get USB keyboard/mouse input.
@@ -103,6 +103,7 @@ This sets `core.hooksPath` to `.githooks/`. **pre-commit** runs `cargo xtask che
 | `xhci-bringup-smoke` + `xhci-enum-smoke` + `usb-smoke` | `M3OS_USB_REGRESSION=1` |
 | `tls-smoke` PASS (not SKIP) | `M3OS_TLS_REGRESSION=1` |
 | `dns-smoke` PASS (not SKIP) | `M3OS_DNS_REGRESSION=1` |
+| `multi-nic-smoke` (e1000 + e1000e + igb arms) | `M3OS_MULTI_NIC_REGRESSION=1` |
 
 The `tls-smoke`/`dns-smoke` gates assert the musl-built smoke stage actually
 `PASS`ed rather than `SKIP`ped — a `SKIP` means the musl cross-compiler was
