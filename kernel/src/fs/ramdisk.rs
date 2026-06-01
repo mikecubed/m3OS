@@ -202,6 +202,8 @@ static NVME_DRIVER_ELF: &[u8] = generated_initrd_asset!("nvme_driver");
 static E1000_DRIVER_ELF: &[u8] = generated_initrd_asset!("e1000_driver");
 // Phase 80 Track A.5: ring-3 AC'97 out-of-process audio hardware driver.
 static AC97_DRIVER_ELF: &[u8] = generated_initrd_asset!("ac97_driver");
+// Phase 80b: ring-3 Intel HDA out-of-process audio hardware driver.
+static HDA_DRIVER_ELF: &[u8] = generated_initrd_asset!("hda_driver");
 // Phase 79: ring-3 modern NIC drivers (Intel e1000e/igb/igc, Realtek r8169/r8125).
 static E1000E_DRIVER_ELF: &[u8] = generated_initrd_asset!("e1000e_driver");
 static IGB_DRIVER_ELF: &[u8] = generated_initrd_asset!("igb_driver");
@@ -1221,6 +1223,15 @@ static DRIVERS_ENTRIES: &[(&str, RamdiskNode)] = &[
         "ac97_driver",
         RamdiskNode::File {
             content: AC97_DRIVER_ELF,
+        },
+    ),
+    // Phase 80b: ring-3 Intel HDA driver. Lives under `/drivers/` so
+    // `is_authorized_driver_process` accepts its `sys_device_claim` for the
+    // class-0x0403 HDA controller.
+    (
+        "hda_driver",
+        RamdiskNode::File {
+            content: HDA_DRIVER_ELF,
         },
     ),
     // Phase 78a Track B.2: ring-3 xHCI driver. Lives under `/drivers/` so

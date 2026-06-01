@@ -56,14 +56,14 @@ fn alloc_error(_layout: Layout) -> ! {
 // Constants
 // ---------------------------------------------------------------------------
 
-// Phase 78c — `KNOWN_CONFIGS` below now lists 28 service paths (Phase 73's 25
-// plus the 78a/78b/78c USB driver configs `xhci_driver`, `usbhub`, `usb-hid`).
-// The fallback loader (`load_services_from_known_configs`) and the dir-scan
-// path both stop adding services once `self.count >= MAX_SERVICES`, so the
-// ceiling must exceed the number of `.conf` files actually present or the last
-// entries are silently dropped. Sized to `KNOWN_CONFIGS.len()` (28) + 2
-// headroom for future additions; the extra slots cost a few hundred bytes.
-const MAX_SERVICES: usize = 30;
+// `KNOWN_CONFIGS` below lists the service paths (Phase 73's 25 + the 78a/78b/78c
+// USB driver configs + Phase 80 `ac97_driver`/`hda_driver`). The fallback loader
+// (`load_services_from_known_configs`) and the dir-scan path both stop adding
+// services once `self.count >= MAX_SERVICES`, so the ceiling must exceed the
+// number of `.conf` files actually present (the ext2 staging now writes 31) or
+// the last entries are silently dropped. Sized with headroom for future
+// additions; the extra slots cost a few hundred bytes.
+const MAX_SERVICES: usize = 34;
 const MAX_DISCOVERED_DISABLED: usize = 24;
 const MAX_PIDS: usize = 64;
 const MAX_DEPS: usize = 4;
@@ -220,6 +220,8 @@ const KNOWN_CONFIGS: &[&[u8]] = &[
     b"/etc/services.d/audio_server.conf\0",
     // Phase 80 Track A.5: ac97_driver — out-of-process AC'97 hardware driver.
     b"/etc/services.d/ac97.conf\0",
+    // Phase 80b: hda_driver — out-of-process Intel HDA hardware driver.
+    b"/etc/services.d/hda.conf\0",
     // Phase 72b — `term.conf` is staged only in smoke-test mode (or
     // when `M3OS_LEGACY_TERM_CONF=1` is passed to `xtask`). In default
     // GUI mode and graphical-only mode, `term` is launched via the

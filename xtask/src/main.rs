@@ -67,6 +67,8 @@ const USERSPACE_LIB_HOST_TEST_PACKAGES: &[(&str, &[&str])] = &[
     // ordering, BDL ring, submit_frames_inner, iova bounds check). Uses the
     // same lib + bin split as audio_server; host tests build the lib only.
     ("ac97_driver", &[]),
+    // Phase 80b: hda_driver lib host build (logic is host-tested in kernel_core::hda).
+    ("hda_driver", &[]),
 ];
 
 /// QEMU arguments enabling an emulated Intel VT-d IOMMU on the q35 machine.
@@ -917,6 +919,8 @@ fn build_userspace_bins() {
         // Phase 80 Track A.5: ring-3 AC'97 out-of-process audio hardware driver.
         // `needs_alloc = true` for driver_runtime + kernel-core deps.
         ("ac97_driver", "ac97_driver", true),
+        // Phase 80b: ring-3 Intel HDA out-of-process audio hardware driver.
+        ("hda_driver", "hda_driver", true),
         // Phase 55b Track F.3b: NVMe crash-and-restart end-to-end smoke
         // client. No alloc dependency — syscall_lib only.
         ("nvme-crash-smoke", "nvme-crash-smoke", false),
@@ -1111,6 +1115,7 @@ fn build_userspace_bins() {
             // Phase 80 Track A.5: ac97_driver uses the same os-binary gate
             // so the [[bin]] target is skipped on host-test builds.
             "ac97_driver" => &["--features", "os-binary"],
+            "hda_driver" => &["--features", "os-binary"],
             _ => &[],
         };
 
@@ -5239,7 +5244,7 @@ fn cmd_check() {
     doom_c_test_step(&root);
 
     println!(
-        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, ac97_driver, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, shadow, and ldso_core host tests pass; doom platform-layer C tests pass"
+        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, ac97_driver, hda_driver, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, shadow, and ldso_core host tests pass; doom platform-layer C tests pass"
     );
 }
 
@@ -13430,6 +13435,11 @@ fn populate_ext2_files(
     // before audio_server so `audio.hw` is registered when audio_server resolves it.
     let ac97_driver_conf = "name=ac97_driver\ncommand=/drivers/ac97_driver\ntype=daemon\nrestart=on-failure\nmax_restart=3\n";
 
+    // Phase 80b — ring-3 Intel HDA out-of-process audio hardware driver. Exits
+    // cleanly (rc 0) when no HDA controller is present, so on an AC'97-only
+    // machine the ac97 driver serves `audio.hw` instead.
+    let hda_driver_conf = "name=hda_driver\ncommand=/drivers/hda_driver\ntype=daemon\nrestart=on-failure\nmax_restart=3\n";
+
     // Phase 56 Track C.1: ring-3 display server (compositor) scaffold.
     // Depends on `kbd` so input arrives before the compositor binds the
     // framebuffer.  restart=on-failure mirrors the driver shape: supervised
@@ -13784,6 +13794,7 @@ fn populate_ext2_files(
     let usbhub_conf_tmp = output_dir.join("_tmp_usbhub_conf");
     let usb_hid_conf_tmp = output_dir.join("_tmp_usb_hid_conf");
     let ac97_driver_conf_tmp = output_dir.join("_tmp_ac97_driver_conf");
+    let hda_driver_conf_tmp = output_dir.join("_tmp_hda_driver_conf");
     let display_server_conf_tmp = output_dir.join("_tmp_display_server_conf");
     let session_manager_conf_tmp = output_dir.join("_tmp_session_manager_conf");
     let audio_server_conf_tmp = output_dir.join("_tmp_audio_server_conf");
@@ -13824,6 +13835,7 @@ fn populate_ext2_files(
     fs::write(&usbhub_conf_tmp, usbhub_conf).expect("write temp usbhub.conf");
     fs::write(&usb_hid_conf_tmp, usb_hid_conf).expect("write temp usb-hid.conf");
     fs::write(&ac97_driver_conf_tmp, ac97_driver_conf).expect("write temp ac97.conf");
+    fs::write(&hda_driver_conf_tmp, hda_driver_conf).expect("write temp hda.conf");
     fs::write(&display_server_conf_tmp, display_server_conf)
         .expect("write temp display_server.conf");
     fs::write(&session_manager_conf_tmp, session_manager_conf)
@@ -14413,6 +14425,10 @@ fn populate_ext2_files(
          sif etc/services.d/ac97.conf mode 0x81A4\n\
          sif etc/services.d/ac97.conf uid 0\n\
          sif etc/services.d/ac97.conf gid 0\n\
+         write \"{hda_driver_conf}\" etc/services.d/hda.conf\n\
+         sif etc/services.d/hda.conf mode 0x81A4\n\
+         sif etc/services.d/hda.conf uid 0\n\
+         sif etc/services.d/hda.conf gid 0\n\
          write \"{display_server_conf}\" etc/services.d/display_server.conf\n\
          sif etc/services.d/display_server.conf mode 0x81A4\n\
          sif etc/services.d/display_server.conf uid 0\n\
@@ -14467,6 +14483,7 @@ fn populate_ext2_files(
         usbhub_conf = usbhub_conf_tmp.display(),
         usb_hid_conf = usb_hid_conf_tmp.display(),
         ac97_driver_conf = ac97_driver_conf_tmp.display(),
+        hda_driver_conf = hda_driver_conf_tmp.display(),
         display_server_conf = display_server_conf_tmp.display(),
         session_manager_conf = session_manager_conf_tmp.display(),
         audio_server_conf = audio_server_conf_tmp.display(),
