@@ -316,3 +316,19 @@ if [ "${M3OS_MULTI_NIC_REGRESSION:-0}" = "1" ]; then
     echo "pre-push: running cargo xtask multi-nic-smoke..."
     cargo xtask multi-nic-smoke
 fi
+
+# Phase 80b — opt-in HDA audio regression gate. `hda-smoke` boots QEMU with
+# `-device intel-hda -device hda-duplex`, brings up the ring-3 HDA driver
+# (controller reset + CORB/RIRB RUN-enable + codec widget enumeration + output
+# stream), runs `audio-demo` through `audio_server -> hda_driver`, and asserts a
+# non-silent captured WAV. Gated behind M3OS_HDA_REGRESSION=1 because it boots a
+# full QEMU + audio-demo run (~40s); set it on branches touching the hda/ac97
+# drivers, `driver_ipc::audio`, the audio shm transport, `kernel_core::hda`, or
+# the device-host audio-class IRQ routing.
+if [ "${M3OS_HDA_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask hda-smoke..."
+    if ! cargo xtask hda-smoke --timeout 240; then
+        echo "pre-push: cargo xtask hda-smoke failed" >&2
+        exit 1
+    fi
+fi
