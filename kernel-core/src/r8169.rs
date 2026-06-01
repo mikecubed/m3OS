@@ -75,6 +75,53 @@ pub const CHIP_CMD_RST: u8 = 0x10;
 pub const CHIP_CMD_RX_ENB: u8 = 0x08;
 pub const CHIP_CMD_TX_ENB: u8 = 0x04;
 
+// ---------------------------------------------------------------------------
+// RxConfig / TxConfig values.
+//
+// The classic 8169 accepts frames with just the low accept bits set, but the
+// 8125 RX *DMA engine* will not move frames into host memory unless the
+// fetch-default and DMA-burst fields are also programmed (Linux
+// `rtl_init_rxcfg`: `RxConfig = RX_FETCH_DFLT_8125 | RX_DMA_BURST | accepts`).
+// Omitting them is silent: link comes up but the RX ring never drains.
+// ---------------------------------------------------------------------------
+
+/// RxConfig accept bits: AcceptBroadcast (0x08) | AcceptMulticast (0x04) |
+/// AcceptMyPhys (0x02). The low-nibble accept mask Linux ORs in via
+/// `rtl_set_rx_mode`.
+pub const RX_CONFIG_ACCEPT: u32 = 0x0E;
+/// 8125 RxConfig fetch-default field (`8 << 27`).
+pub const RX_FETCH_DFLT_8125: u32 = 8 << 27;
+/// RxConfig DMA-burst field, unlimited (`7 << 8`). Shared 8125/8168 encoding.
+pub const RX_DMA_BURST: u32 = 7 << 8;
+/// TxConfig DMA-burst (unlimited, `7 << 8`) + standard inter-frame-gap
+/// (`3 << 24`). The soft reset clears TxConfig's writable fields, so the 8125
+/// TX engine needs these reprogrammed before frames will be fetched/sent.
+pub const TX_DMA_BURST: u32 = 7 << 8;
+pub const TX_INTERFRAMEGAP: u32 = 3 << 24;
+
+/// Full RxConfig value for an 8125 part: fetch default + unlimited DMA burst +
+/// the broadcast/multicast/my-phys accept bits.
+#[inline]
+pub fn rxconfig_8125() -> u32 {
+    RX_FETCH_DFLT_8125 | RX_DMA_BURST | RX_CONFIG_ACCEPT
+}
+
+/// MISC register (`0xF0`, 32-bit). Holds the RXDV gate on 8168g+/8125 parts.
+pub const REG_MISC: u32 = 0xF0;
+/// RXDV-gated-enable bit (`1 << 19`) in [`REG_MISC`]. While set, the 8125 MAC
+/// gates the receive-data-valid signal and **drops every inbound frame before
+/// it reaches the RX ring** — Linux `rtl_disable_rxdvgate` clears it during
+/// hardware start. The classic 8169 bring-up never touches this, so an 8125
+/// driven by the shared path links up but receives nothing until it is cleared.
+pub const RXDV_GATED_EN: u32 = 1 << 19;
+
+/// TxConfig value for an 8125 part: unlimited DMA burst + standard IFG. The
+/// hardware-version (XID) bits are read-only, so this only sets writable fields.
+#[inline]
+pub fn txconfig_8125() -> u32 {
+    TX_DMA_BURST | TX_INTERFRAMEGAP
+}
+
 /// TxPoll: poll the Normal-Priority Queue for newly-owned TX descriptors.
 pub const TX_POLL_NPQ: u8 = 0x40;
 
@@ -101,6 +148,92 @@ pub const REG_INT_CFG0_8125: u32 = 0x34;
 
 /// INT_CFG0 enable bit used by the 8125 path.
 pub const INT_CFG0_ENABLE: u8 = 0x08;
+
+// ---------------------------------------------------------------------------
+// GPHY-OCP PHY access (8168g and later, incl. 8125/8126).
+//
+// The classic 8168 reaches its PHY through `PHYAR` (0x60). The 8168g+ and all
+// 8125/8126 parts reach the PHY through a *GPHY-OCP* window instead: a single
+// 32-bit register at `GPHY_OCP` (0xB8). Linux `r8168_phy_ocp_{read,write}` +
+// `r8168g_mdio_{read,write}` (`r8169_main.c`).
+//
+// Command word layout (32-bit, written to / read from `GPHY_OCP`):
+//   bit 31      : OCPAR_FLAG — busy/command. WRITE sets it then hw clears it;
+//                 READ is issued with it clear and hw sets it when data ready.
+//   bits 30..16 : the *word* address = (byte OCP address >> 1)
+//   bits 15..0  : data (16-bit)
+//
+// Because every OCP byte address is even (`base + reg*2`), Linux encodes the
+// word address as `byte_addr << 15` (== `(byte_addr >> 1) << 16`). We keep the
+// same trick so the bit math matches the driver exactly.
+//
+// Page model (MDIO compatibility): writing MDIO "register 0x1f" selects a page
+// and only updates a base address (no bus cycle): `ocp_base = page<<4` (or the
+// standard base `0xA400` for page 0). In a non-standard page, in-page MDIO
+// registers are offset by 0x10, so the OCP byte address is
+// `ocp_base + (reg - 0x10) * 2`; in the standard page it is `ocp_base + reg*2`.
+// ---------------------------------------------------------------------------
+
+/// GPHY-OCP window register (32-bit) used by 8168g+/8125 PHY access.
+pub const REG_GPHY_OCP: u32 = 0xB8;
+/// GPHY-OCP busy/command flag (bit 31).
+pub const GPHY_OCP_FLAG: u32 = 0x8000_0000;
+/// Standard PHY OCP base (MDIO page 0).
+pub const OCP_STD_PHY_BASE: u32 = 0xA400;
+
+/// Resolve an MDIO page-select value into the OCP base address.
+///
+/// Mirrors `r8168g_mdio_write` page handling: page 0 → the standard base,
+/// otherwise `page << 4`.
+#[inline]
+pub fn ocp_base_for_page(page: u16) -> u32 {
+    if page == 0 {
+        OCP_STD_PHY_BASE
+    } else {
+        (page as u32) << 4
+    }
+}
+
+/// Map an in-page MDIO register number to its OCP *byte* address within the
+/// page identified by `ocp_base`. In a non-standard page the register is offset
+/// by 0x10 (so MDIO reg 0x10 maps to the page's first OCP word).
+#[inline]
+pub fn phy_ocp_addr(ocp_base: u32, reg: u32) -> u32 {
+    let reg = if ocp_base != OCP_STD_PHY_BASE {
+        reg.wrapping_sub(0x10)
+    } else {
+        reg
+    };
+    ocp_base + reg * 2
+}
+
+/// Encode the `GPHY_OCP` command word for a *write* to OCP byte address `addr`.
+/// `addr` must be even (all real OCP addresses are). Equivalent to Linux's
+/// `OCPAR_FLAG | (addr << 15) | data`.
+#[inline]
+pub fn gphy_ocp_write_cmd(addr: u32, data: u16) -> u32 {
+    GPHY_OCP_FLAG | (addr << 15) | data as u32
+}
+
+/// Encode the `GPHY_OCP` command word for a *read* from OCP byte address
+/// `addr` (flag clear; hw sets the flag when the data is ready).
+#[inline]
+pub fn gphy_ocp_read_cmd(addr: u32) -> u32 {
+    addr << 15
+}
+
+/// True while a GPHY-OCP transaction is in flight (busy flag set). A write
+/// completes when this goes false; a read completes when this goes true.
+#[inline]
+pub fn gphy_ocp_busy(reg_val: u32) -> bool {
+    reg_val & GPHY_OCP_FLAG != 0
+}
+
+/// Extract the 16-bit data from a completed GPHY-OCP read.
+#[inline]
+pub fn gphy_ocp_read_data(reg_val: u32) -> u16 {
+    (reg_val & 0xFFFF) as u16
+}
 
 // ---------------------------------------------------------------------------
 // C+ descriptor bit layout (Track C.1).
@@ -1202,5 +1335,68 @@ mod tests {
         run_phy_action(&bytes, &mut phy);
         // SKIPN regno=1 advances index by 2, skipping the 0xaa write.
         assert_eq!(phy.writes, vec![(0x2, 0x9)]);
+    }
+
+    // --- GPHY-OCP PHY access (8125) ---
+
+    #[test]
+    fn gphy_ocp_page_base_resolution() {
+        // Page 0 → standard base; non-zero page → page << 4.
+        assert_eq!(ocp_base_for_page(0), OCP_STD_PHY_BASE);
+        assert_eq!(ocp_base_for_page(0), 0xA400);
+        assert_eq!(ocp_base_for_page(0xA44), 0xA440);
+        assert_eq!(ocp_base_for_page(0xAC4), 0xAC40);
+        assert_eq!(ocp_base_for_page(0xA43), 0xA430);
+    }
+
+    #[test]
+    fn gphy_ocp_addr_standard_vs_paged() {
+        // Standard page: BMCR (reg 0) maps straight to the base.
+        assert_eq!(phy_ocp_addr(OCP_STD_PHY_BASE, 0x00), 0xA400);
+        // Standard page: reg N → base + N*2 (no 0x10 offset).
+        assert_eq!(phy_ocp_addr(OCP_STD_PHY_BASE, 0x02), 0xA404);
+        // Non-standard page from the captured config: page 0xA44, reg 0x11.
+        // base = 0xA440; reg -= 0x10 → 0x01; addr = 0xA440 + 2 = 0xA442.
+        assert_eq!(phy_ocp_addr(ocp_base_for_page(0xA44), 0x11), 0xA442);
+        // page 0xAC4, reg 0x13: base 0xAC40; (0x13-0x10)*2 = 6; addr 0xAC46.
+        assert_eq!(phy_ocp_addr(ocp_base_for_page(0xAC4), 0x13), 0xAC46);
+    }
+
+    #[test]
+    fn gphy_ocp_write_cmd_layout() {
+        // BMCR (addr 0xA400) write of 0x9240. Linux: FLAG | (addr<<15) | data.
+        // addr is even, so addr<<15 == (addr>>1)<<16 places the word address
+        // in bits 30:16 and leaves bit 31 for the flag.
+        let cmd = gphy_ocp_write_cmd(0xA400, 0x9240);
+        assert_eq!(cmd & GPHY_OCP_FLAG, GPHY_OCP_FLAG); // busy/cmd set
+        assert_eq!(cmd & 0xFFFF, 0x9240); // data in low 16
+        assert_eq!((cmd >> 16) & 0x7FFF, 0xA400 >> 1); // word addr in 30:16
+        assert_eq!(cmd, 0x8000_0000 | (0xA400u32 << 15) | 0x9240);
+        // Sanity: fits in 32 bits and bit 31 is only the flag.
+        assert_eq!(cmd, 0xD200_9240);
+    }
+
+    #[test]
+    fn gphy_ocp_read_cmd_layout_and_busy() {
+        // Read command: flag clear, word address in 30:16.
+        let cmd = gphy_ocp_read_cmd(0xA400);
+        assert_eq!(cmd & GPHY_OCP_FLAG, 0); // flag clear on issue
+        assert_eq!((cmd >> 16) & 0x7FFF, 0xA400 >> 1);
+        assert_eq!(cmd, 0x5200_0000);
+        // Busy predicate keys off bit 31.
+        assert!(gphy_ocp_busy(0x8000_1234));
+        assert!(!gphy_ocp_busy(0x0000_1234));
+        // Completed read: data is the low 16 bits of the register snapshot.
+        assert_eq!(gphy_ocp_read_data(0x8000_ABCD), 0xABCD);
+        assert_eq!(gphy_ocp_read_data(0x0000_5555), 0x5555);
+    }
+
+    #[test]
+    fn gphy_ocp_high_mac_addr_fits_32_bits() {
+        // A MAC-OCP address near the top of the range still fits (bit 31 free).
+        let cmd = gphy_ocp_write_cmd(0xE092, 0x0004);
+        assert_eq!(cmd & GPHY_OCP_FLAG, GPHY_OCP_FLAG);
+        assert_eq!(cmd & 0xFFFF, 0x0004);
+        assert_eq!((cmd >> 16) & 0x7FFF, 0xE092 >> 1);
     }
 }

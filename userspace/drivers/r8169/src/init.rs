@@ -54,6 +54,21 @@ fn off(reg: u32) -> usize {
     reg as usize
 }
 
+/// Log `label` followed by `val` as 8 hex digits + newline (no `alloc`/fmt).
+fn write_hex32(label: &str, val: u32) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut buf = [0u8; 9];
+    for i in 0..8 {
+        buf[i] = HEX[((val >> (28 - i * 4)) & 0xF) as usize];
+    }
+    buf[8] = b'\n';
+    let _ = sys::write_str(sys::STDOUT_FILENO, label);
+    // SAFETY: `buf` holds only ASCII hex digits + '\n', valid UTF-8.
+    let _ = sys::write_str(sys::STDOUT_FILENO, unsafe {
+        core::str::from_utf8_unchecked(&buf)
+    });
+}
+
 impl Nic {
     /// Claim `key`, map the BAR, reset the MAC, detect the chip version, set up
     /// rings, and enable RX/TX. Whether firmware is required is decided by the
@@ -89,30 +104,21 @@ impl Nic {
         };
         nic.program_rings();
         nic.enable();
-        // Bring the PHY up via the classic PHYAR MDIO path: restart
-        // auto-negotiation (BMCR = ANE | restart | power-up). This is correct
-        // for the r8169 GbE family (8168), which reaches its PHY through the
-        // PHYAR window at 0x60.
-        //
-        // NOTE (RTL8125): the 2.5G parts reach their PHY through a GPHY-OCP
-        // window, *not* PHYAR, so on the 8125 this write is a no-op and link
-        // negotiation does not start. Empirically confirmed on a real RTL8125B:
-        // after PHYAR autoneg-restart, `PHYstatus` (0x6C) still reads link-down.
-        // Bringing the 8125 PHY up requires porting the captured GPHY-OCP
-        // config + firmware sequence (Phase 83; see
-        // docs/research/r8125-phy-config-capture.md).
-        nic.phy_kick_autoneg();
-        // Settle briefly, then report the MAC's link view (read-only MMIO).
-        for _ in 0..2_000_000 {
-            core::hint::spin_loop();
-        }
-        if nic.phy_status() & hw::PHYSTATUS_LINK != 0 {
-            let _ = sys::write_str(sys::STDOUT_FILENO, "r8169: PHY link up\n");
+        // Kick the PHY's auto-negotiation, then return *immediately* — do NOT
+        // block on link here. Auto-negotiation takes seconds; blocking bring-up
+        // on it would delay the driver's `net.nic` service registration and lose
+        // the first-come-first-served race to another NIC (e.g. an emulated
+        // e1000e). The link comes up asynchronously and is polled/logged in the
+        // I/O loop after the service is registered. The two NIC families reach
+        // their PHY differently:
+        //   * classic 8168 GbE → PHYAR window (0x60)
+        //   * 8125/8126 2.5G   → GPHY-OCP window (0xB8)
+        // Empirically confirmed on a real RTL8125B that a PHYAR autoneg-restart
+        // is a no-op (link stays down); the OCP path is required.
+        if nic.version.is_8125() {
+            nic.phy_bring_up_ocp();
         } else {
-            let _ = sys::write_str(
-                sys::STDOUT_FILENO,
-                "r8169: PHY link down (autoneg settling, or 8125 needs OCP config)\n",
-            );
+            nic.phy_kick_autoneg();
         }
         Ok(nic)
     }
@@ -121,6 +127,22 @@ impl Nic {
     /// link state (no MDIO transaction needed).
     pub fn phy_status(&self) -> u8 {
         self.mmio.read_reg::<u8>(off(hw::REG_PHYSTATUS))
+    }
+
+    /// Read the station MAC address from the `MAC0` register file (6 bytes at
+    /// `0x00`, little-endian). The kernel net stack needs this as the source
+    /// address for ARP/IP frames and to accept inbound frames addressed to us.
+    pub fn mac(&self) -> [u8; 6] {
+        let lo = self.mmio.read_reg::<u32>(off(hw::REG_MAC0));
+        let hi = self.mmio.read_reg::<u16>(off(hw::REG_MAC0 + 4));
+        [
+            lo as u8,
+            (lo >> 8) as u8,
+            (lo >> 16) as u8,
+            (lo >> 24) as u8,
+            hi as u8,
+            (hi >> 8) as u8,
+        ]
     }
 
     /// Write a PHY register `reg` via the `PHYAR` MDIO interface (bounded poll).
@@ -158,6 +180,83 @@ impl Nic {
     /// Restart PHY auto-negotiation (BMCR = ANE | restart-AN, powered up).
     pub fn phy_kick_autoneg(&self) {
         self.mdio_write(0x00, hw::BMCR_AUTONEG_RESTART);
+    }
+
+    // --- GPHY-OCP PHY access (8125/8126; see kernel_core::r8169) ---
+
+    /// Raw GPHY-OCP write to OCP byte address `addr` (bounded busy-poll).
+    fn gphy_ocp_write(&self, addr: u32, data: u16) {
+        self.mmio
+            .write_reg::<u32>(off(hw::REG_GPHY_OCP), hw::gphy_ocp_write_cmd(addr, data));
+        for _ in 0..100 {
+            if !hw::gphy_ocp_busy(self.mmio.read_reg::<u32>(off(hw::REG_GPHY_OCP))) {
+                return;
+            }
+            for _ in 0..1000 {
+                core::hint::spin_loop();
+            }
+        }
+    }
+
+    /// Raw GPHY-OCP read from OCP byte address `addr` (bounded busy-poll).
+    fn gphy_ocp_read(&self, addr: u32) -> u16 {
+        self.mmio
+            .write_reg::<u32>(off(hw::REG_GPHY_OCP), hw::gphy_ocp_read_cmd(addr));
+        for _ in 0..100 {
+            let v = self.mmio.read_reg::<u32>(off(hw::REG_GPHY_OCP));
+            if hw::gphy_ocp_busy(v) {
+                return hw::gphy_ocp_read_data(v);
+            }
+            for _ in 0..1000 {
+                core::hint::spin_loop();
+            }
+        }
+        0
+    }
+
+    /// Write a paged PHY register via GPHY-OCP (`page` then in-page `reg`).
+    pub fn phy_ocp_write(&self, page: u16, reg: u32, val: u16) {
+        let base = hw::ocp_base_for_page(page);
+        self.gphy_ocp_write(hw::phy_ocp_addr(base, reg), val);
+    }
+
+    /// Read a paged PHY register via GPHY-OCP (`page` then in-page `reg`).
+    pub fn phy_ocp_read(&self, page: u16, reg: u32) -> u16 {
+        let base = hw::ocp_base_for_page(page);
+        self.gphy_ocp_read(hw::phy_ocp_addr(base, reg))
+    }
+
+    /// Read the PHY identifier (PHYSID1<<16 | PHYSID2) over GPHY-OCP. A sane,
+    /// non-`0x0000`/`0xFFFF` value confirms the OCP accessor reaches the PHY.
+    pub fn phy_id_ocp(&self) -> u32 {
+        let id1 = self.phy_ocp_read(0, 0x02) as u32;
+        let id2 = self.phy_ocp_read(0, 0x03) as u32;
+        (id1 << 16) | id2
+    }
+
+    /// Bring the 8125 PHY up over GPHY-OCP: log the PHY ID (accessor probe),
+    /// then issue a BMCR reset + autoneg-restart + power-up (`0x9240`).
+    pub fn phy_bring_up_ocp(&self) {
+        let id = self.phy_id_ocp();
+        write_hex32("r8169: phy_id(ocp)=0x", id);
+        // BMCR (standard-page reg 0): reset + ANE + restart-AN + power-up.
+        self.phy_ocp_write(0, 0x00, hw::BMCR_AUTONEG_RESTART);
+    }
+
+    /// Poll `PHYstatus` (0x6C) for link-up, up to roughly `max_ms` milliseconds.
+    /// Returns `true` as soon as the link bit is set.
+    pub fn wait_for_link(&self, max_ms: u32) -> bool {
+        // ~1 ms worth of spin per inner loop iteration (calibration is rough;
+        // this is a bring-up settle wait, not a precise timer).
+        for _ in 0..max_ms {
+            if self.phy_status() & hw::PHYSTATUS_LINK != 0 {
+                return true;
+            }
+            for _ in 0..200_000 {
+                core::hint::spin_loop();
+            }
+        }
+        self.phy_status() & hw::PHYSTATUS_LINK != 0
     }
 
     /// Issue ChipCmd.RST and poll the self-clearing bit within a bounded spin.
@@ -213,9 +312,24 @@ impl Nic {
             off(hw::REG_CHIP_CMD),
             hw::CHIP_CMD_RX_ENB | hw::CHIP_CMD_TX_ENB,
         );
-        // RxConfig: accept broadcast + physical-match frames.
-        self.mmio
-            .write_reg::<u32>(off(hw::REG_RX_CONFIG), 0x0000_000E);
+        // RxConfig/TxConfig: the 8125 RX/TX DMA engines need the fetch-default +
+        // DMA-burst fields programmed or they never move frames (link comes up
+        // but the rings stay idle). The classic 8169 only needs the accept bits.
+        if self.version.is_8125() {
+            // Ungate RXDV first: the 8125 drops every inbound frame before it
+            // reaches the RX ring while RXDV_GATED_EN (MISC bit 19) is set. The
+            // classic bring-up never clears it, so RX stays dead despite link.
+            let misc = self.mmio.read_reg::<u32>(off(hw::REG_MISC));
+            self.mmio
+                .write_reg::<u32>(off(hw::REG_MISC), misc & !hw::RXDV_GATED_EN);
+            self.mmio
+                .write_reg::<u32>(off(hw::REG_TX_CONFIG), hw::txconfig_8125());
+            self.mmio
+                .write_reg::<u32>(off(hw::REG_RX_CONFIG), hw::rxconfig_8125());
+        } else {
+            self.mmio
+                .write_reg::<u32>(off(hw::REG_RX_CONFIG), hw::RX_CONFIG_ACCEPT);
+        }
         // Unmask RX OK (bit0) + TX OK (bit2) on the classic 16-bit IMR.
         self.mmio.write_reg::<u16>(off(hw::REG_INTR_MASK), 0x0005);
     }

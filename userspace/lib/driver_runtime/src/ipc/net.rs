@@ -191,6 +191,56 @@ impl<B: IpcBackend> NetServer<B> {
         }
     }
 
+    /// Non-blocking variant of [`Self::handle_next`]. Polls the endpoint once
+    /// via the backend's `try_recv`; if a message or bound notification was
+    /// pending it is dispatched exactly as in `handle_next` and `Ok(true)` is
+    /// returned, otherwise `Ok(false)` (nothing pending). Lets a driver poll a
+    /// device ring on a timer while still serving the command endpoint, instead
+    /// of blocking on `recv` — needed when interrupt delivery is unreliable
+    /// (e.g. a passthrough NIC whose INTx may never reach the guest).
+    pub fn try_handle_next<F, G>(
+        &self,
+        mut on_message: F,
+        mut on_notification: G,
+    ) -> Result<bool, DriverRuntimeError>
+    where
+        F: FnMut(NetRequest) -> NetReply,
+        G: FnMut(u64),
+    {
+        let recv_result = self.backend.lock().try_recv(self.endpoint)?;
+        match recv_result {
+            None => Ok(false),
+            Some(RecvResult::Notification(bits)) => {
+                on_notification(bits);
+                Ok(true)
+            }
+            Some(RecvResult::Message(frame_in)) => {
+                match decode_net_send(&frame_in.bulk) {
+                    Ok(header) => {
+                        let declared = header.frame_len as usize;
+                        let start = NET_FRAME_HEADER_SIZE.min(frame_in.bulk.len());
+                        let available = frame_in.bulk.len() - start;
+                        let take = declared.min(available);
+                        let frame_bytes = frame_in.bulk[start..start + take].to_vec();
+                        let req = NetRequest {
+                            header,
+                            frame: frame_bytes,
+                        };
+                        let reply = on_message(req);
+                        self.write_reply(reply, frame_in.label)?;
+                    }
+                    Err(_) => {
+                        let reply = NetReply {
+                            status: NetDriverError::InvalidFrame,
+                        };
+                        self.write_reply(reply, frame_in.label)?;
+                    }
+                }
+                Ok(true)
+            }
+        }
+    }
+
     /// Encode the reply status byte and send it back on the reply
     /// capability the kernel staged.
     fn write_reply(&self, reply: NetReply, request_label: u64) -> Result<(), DriverRuntimeError> {
