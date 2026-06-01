@@ -216,11 +216,26 @@ ready"). On the real card the driver now:
 
 After the key, `0xB800` reads **`0x0080`** — bit **7** set, not the bit **6**
 (`0x40`) the blob's poll waits for. So the key *does* elicit a response from the
-PHY MCU, but **this rev-05 RTL8125B reports readiness on a different bit than the
-`rtl8125b-2.fw` blob expects** — a chip/firmware-variant mismatch. Candidate
-causes: (a) this silicon wants `rtl8125b-1.fw` (or another variant) rather than
-`-2`; (b) the patch key is a different value; (c) the request/ready bit semantics
-differ for this rev. All three are settled by the reference trace.
+PHY MCU, but the ready bit it reports differs from what the blob polls.
+
+The blob is **not** the wrong variant: the host carries
+`/lib/firmware/rtl_nic/rtl8125b-2.fw.zst` and the `r8169` driver links this exact
+card at **1000 Mbps**, so `rtl8125b-2.fw` is the blob Linux uses. The remaining
+candidates are therefore (a) the patch key value/sequence, or (b) a missing
+precondition before `set_phy_mcu_patch_request` (e.g. the order of the MAC-MCU
+patch vs. the request, or a halt/clock step). All are settled by the reference
+trace of Linux's actual write stream.
+
+Note also that the firmware is a PHY-MCU *tuning* patch — the card links without
+it (the m3OS driver reaches link via a bare `BMCR 0x9240`, and Linux links at
+1G). So the firmware is likely **not** the gate for a basic `ping`: the more
+probable RX gate is an incomplete `rtl_hw_start_8125` MAC datapath bring-up (the
+captured 26 MAC-OCP modifies are only the `mac_ocp_modify` calls; `rtl_hw_start`
+also issues many plain `RTL_W8/16/32` register writes — interrupt mitigation,
+descriptor mode, MTPS, etc. — that the OCP-only trace never saw). The committed
+default (`firmware_blob() = None`) already links + transmits; closing RX most
+likely means transcribing the full `rtl_hw_start_8125`, which the reference trace
+(extended to the plain register writes) would capture.
 
 ### Definitive next step (Phase 83)
 
