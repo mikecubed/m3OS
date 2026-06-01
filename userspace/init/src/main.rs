@@ -218,6 +218,8 @@ const KNOWN_CONFIGS: &[&[u8]] = &[
     b"/etc/services.d/session_manager.conf\0",
     // Phase 57 Track D.1: audio_server daemon (AC'97 driver).
     b"/etc/services.d/audio_server.conf\0",
+    // Phase 80 Track A.5: ac97_driver — out-of-process AC'97 hardware driver.
+    b"/etc/services.d/ac97.conf\0",
     // Phase 72b — `term.conf` is staged only in smoke-test mode (or
     // when `M3OS_LEGACY_TERM_CONF=1` is passed to `xtask`). In default
     // GUI mode and graphical-only mode, `term` is launched via the
