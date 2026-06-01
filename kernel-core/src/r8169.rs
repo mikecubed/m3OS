@@ -434,6 +434,10 @@ pub enum FirmwareError {
     UnalignedPayload,
     /// Payload is empty or exceeds the sane upper bound.
     BadPayloadLen,
+    /// The `fw_info` 8-bit checksum over the whole blob is non-zero.
+    BadChecksum,
+    /// `fw_start`/`fw_len` point outside the blob or overlap the header.
+    BadFwRegion,
 }
 
 /// Validate an `rtl_nic` firmware blob's header + payload framing.
@@ -504,6 +508,207 @@ pub fn resolve_firmware(version: MacVersion, blob: Option<&[u8]>) -> FirmwareLoa
             Err(e) => FirmwareLoad::Corrupt(e),
         },
     }
+}
+
+// ---------------------------------------------------------------------------
+// Real `rtl_fw` `fw_info` parser + PHY-action interpreter (Track D.1 loader).
+//
+// The on-disk `rtl_nic/*.fw` blob (after decompression) is Linux's `fw_info`
+// format:
+//   magic:    u32       @ 0x00   (0 for the PHY/MAC-MCU patch blobs)
+//   version:  [u8; 32]  @ 0x04   (NUL-padded ASCII, e.g. "rtl8125b-2_0.0.2 …")
+//   fw_start: u32 LE    @ 0x24   (byte offset of the PHY-action code)
+//   fw_len:   u32 LE    @ 0x28   (byte length of the code)
+//   chksum:   u8        @ 0x2C   (8-bit checksum: sum of ALL blob bytes == 0)
+//   if_is_fw: u8        @ 0x2D
+//   pad:      [u8; 2]   @ 0x2E
+// The code at `fw_start` is an array of `__le32` instructions interpreted by
+// [`run_phy_action`] (mirrors Linux `rtl_fw_write_firmware`). Verified against
+// the real `rtl8125b-2.fw` (sum-mod-256 == 0, fw_start 0x70, fw_len 0x320,
+// 200 instructions).
+// ---------------------------------------------------------------------------
+
+/// Size of the `fw_info` header preceding the firmware code.
+pub const RTL_FW_INFO_SIZE: usize = 48;
+
+/// A parsed, checksum-validated `rtl_fw` image: the version string and the
+/// `__le32` PHY-action code slice (still encoded; interpret via [`run_phy_action`]).
+#[derive(Clone, Copy, Debug)]
+pub struct RtlFwImage<'a> {
+    /// NUL-padded version field (`version[32]`).
+    pub version: &'a [u8],
+    /// The PHY-action code bytes (`fw_len` bytes, a multiple of 4).
+    pub code: &'a [u8],
+}
+
+impl RtlFwImage<'_> {
+    /// Number of `__le32` PHY-action instructions in [`Self::code`].
+    #[inline]
+    pub fn instr_count(&self) -> usize {
+        self.code.len() / 4
+    }
+}
+
+/// Parse and checksum-validate a decompressed `rtl_nic` `fw_info` firmware blob.
+///
+/// Returns the version string and the PHY-action code slice. Never panics on a
+/// malformed blob — every framing error maps to a [`FirmwareError`] so the
+/// driver can degrade gracefully.
+pub fn parse_rtl_fw(blob: &[u8]) -> Result<RtlFwImage<'_>, FirmwareError> {
+    if blob.len() < RTL_FW_INFO_SIZE {
+        return Err(FirmwareError::TooShort);
+    }
+    // 8-bit checksum: the `chksum` byte is set so the sum of every byte is 0.
+    let sum = blob.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+    if sum != 0 {
+        return Err(FirmwareError::BadChecksum);
+    }
+    let version = &blob[4..4 + RTL_FW_VER_SIZE];
+    if version.iter().all(|&b| b == 0) {
+        return Err(FirmwareError::EmptyVersion);
+    }
+    let fw_start = u32::from_le_bytes([blob[0x24], blob[0x25], blob[0x26], blob[0x27]]) as usize;
+    let fw_len = u32::from_le_bytes([blob[0x28], blob[0x29], blob[0x2a], blob[0x2b]]) as usize;
+    if fw_len == 0 || fw_len > RTL_FW_MAX_LEN || !fw_len.is_multiple_of(RTL_FW_INSTR_SIZE) {
+        return Err(FirmwareError::UnalignedPayload);
+    }
+    // Code must sit after the header and inside the blob.
+    let end = fw_start
+        .checked_add(fw_len)
+        .ok_or(FirmwareError::BadFwRegion)?;
+    if fw_start < RTL_FW_INFO_SIZE || end > blob.len() {
+        return Err(FirmwareError::BadFwRegion);
+    }
+    Ok(RtlFwImage {
+        version,
+        code: &blob[fw_start..end],
+    })
+}
+
+/// Sink the PHY-action interpreter writes to. The driver implements this over
+/// the real paged-MDIO / OCP register file; host tests implement it over a map.
+///
+/// `mdio_chg` selects the register space subsequent reads/writes target (the
+/// firmware switches between the PHY MCU and the MAC MCU mid-stream). The
+/// `target` value is the raw `data` field of a `PHY_MDIO_CHG` instruction.
+pub trait PhyActionSink {
+    /// Read PHY/MAC register `reg` (16-bit).
+    fn read(&mut self, reg: u16) -> u16;
+    /// Write `val` to PHY/MAC register `reg`.
+    fn write(&mut self, reg: u16, val: u16);
+    /// Switch the active MDIO target (PHY MCU vs MAC MCU).
+    fn mdio_chg(&mut self, target: u16);
+    /// Busy-wait `ms` milliseconds.
+    fn delay_ms(&mut self, ms: u16);
+}
+
+/// PHY-action opcodes (top nibble of each `__le32`), per Linux `r8169_firmware.c`.
+mod fw_op {
+    pub const READ: u32 = 0x0;
+    pub const DATA_OR: u32 = 0x1;
+    pub const DATA_AND: u32 = 0x2;
+    pub const BJMPN: u32 = 0x3;
+    pub const MDIO_CHG: u32 = 0x4;
+    pub const CLEAR_READCOUNT: u32 = 0x7;
+    pub const WRITE: u32 = 0x8;
+    pub const READCOUNT_EQ_SKIP: u32 = 0x9;
+    pub const COMP_EQ_SKIPN: u32 = 0xa;
+    pub const COMP_NEQ_SKIPN: u32 = 0xb;
+    pub const WRITE_PREVIOUS: u32 = 0xc;
+    pub const SKIPN: u32 = 0xd;
+    pub const DELAY_MS: u32 = 0xe;
+}
+
+/// Maximum interpreter steps — a hard backstop against a corrupt blob whose
+/// back-jumps never terminate. Real blobs run a few hundred steps.
+pub const PHY_ACTION_MAX_STEPS: u32 = 200_000;
+
+/// Run the PHY-action code against `sink` (mirrors Linux `rtl_fw_write_firmware`).
+///
+/// `code` is the `__le32` slice from [`parse_rtl_fw`]. Decoding per instruction:
+/// `op = action >> 28`, `regno = (action >> 16) & 0x0fff`, `data = action & 0xffff`.
+/// Returns the number of instructions executed (for diagnostics); bounded by
+/// [`PHY_ACTION_MAX_STEPS`] so a malformed back-jump can never hang.
+pub fn run_phy_action<S: PhyActionSink>(code: &[u8], sink: &mut S) -> u32 {
+    let n = code.len() / 4;
+    let at = |i: usize| -> u32 {
+        u32::from_le_bytes([
+            code[i * 4],
+            code[i * 4 + 1],
+            code[i * 4 + 2],
+            code[i * 4 + 3],
+        ])
+    };
+    let mut index: usize = 0;
+    let mut predata: u16 = 0;
+    let mut count: u32 = 0;
+    let mut steps: u32 = 0;
+    while index < n && steps < PHY_ACTION_MAX_STEPS {
+        steps += 1;
+        let action = at(index);
+        let regno = ((action >> 16) & 0x0fff) as u16;
+        let data = (action & 0xffff) as u16;
+        match action >> 28 {
+            fw_op::READ => {
+                predata = sink.read(regno);
+                count += 1;
+                index += 1;
+            }
+            fw_op::DATA_OR => {
+                predata |= data;
+                index += 1;
+            }
+            fw_op::DATA_AND => {
+                predata &= data;
+                index += 1;
+            }
+            fw_op::BJMPN => {
+                // Jump back `regno` instructions.
+                index = index.saturating_sub(regno as usize);
+            }
+            fw_op::MDIO_CHG => {
+                sink.mdio_chg(data);
+                index += 1;
+            }
+            fw_op::CLEAR_READCOUNT => {
+                count = 0;
+                index += 1;
+            }
+            fw_op::WRITE => {
+                sink.write(regno, data);
+                index += 1;
+            }
+            fw_op::READCOUNT_EQ_SKIP => {
+                index += if count == data as u32 { 2 } else { 1 };
+            }
+            fw_op::COMP_EQ_SKIPN => {
+                if predata == data {
+                    index += regno as usize;
+                }
+                index += 1;
+            }
+            fw_op::COMP_NEQ_SKIPN => {
+                if predata != data {
+                    index += regno as usize;
+                }
+                index += 1;
+            }
+            fw_op::WRITE_PREVIOUS => {
+                sink.write(regno, predata);
+                index += 1;
+            }
+            fw_op::SKIPN => {
+                index += regno as usize + 1;
+            }
+            fw_op::DELAY_MS => {
+                sink.delay_ms(data);
+                index += 1;
+            }
+            // Unknown opcode — skip it rather than wedge (defensive).
+            _ => index += 1,
+        }
+    }
+    steps
 }
 
 #[cfg(test)]
@@ -818,5 +1023,167 @@ mod tests {
             other => panic!("expected Loaded, got {other:?}"),
         }
         assert!(!r.is_degraded());
+    }
+
+    // --- D.1 loader: real fw_info parser + PHY-action interpreter ---
+
+    /// Build a checksum-valid `fw_info` blob: 48-byte header, code immediately
+    /// after it, and the `chksum` byte set so the whole-blob sum is 0.
+    fn build_fw_info(version: &str, code: &[u32]) -> Vec<u8> {
+        let mut b = vec![0u8; RTL_FW_INFO_SIZE];
+        // magic stays 0 (bytes 0..4). version[32] at 0x04.
+        let v = version.as_bytes();
+        b[4..4 + v.len().min(RTL_FW_VER_SIZE)].copy_from_slice(&v[..v.len().min(RTL_FW_VER_SIZE)]);
+        let fw_start = RTL_FW_INFO_SIZE as u32;
+        let fw_len = (code.len() * 4) as u32;
+        b[0x24..0x28].copy_from_slice(&fw_start.to_le_bytes());
+        b[0x28..0x2c].copy_from_slice(&fw_len.to_le_bytes());
+        // chksum placeholder at 0x2c == 0 for now; if_is_fw/pad stay 0.
+        for &w in code {
+            b.extend_from_slice(&w.to_le_bytes());
+        }
+        // Set chksum so the total sum is 0 mod 256.
+        let sum = b.iter().fold(0u8, |a, &x| a.wrapping_add(x));
+        b[0x2c] = b[0x2c].wrapping_sub(sum);
+        b
+    }
+
+    #[test]
+    fn parse_rtl_fw_accepts_valid_blob() {
+        let blob = build_fw_info("rtl8125b-2_0.0.2", &[0x8000_1234, 0x4000_0001]);
+        let img = parse_rtl_fw(&blob).expect("valid blob parses");
+        assert_eq!(img.instr_count(), 2);
+        assert!(img.version.starts_with(b"rtl8125b-2"));
+        // Sum of all bytes is 0 (checksum holds).
+        assert_eq!(blob.iter().fold(0u8, |a, &x| a.wrapping_add(x)), 0);
+    }
+
+    #[test]
+    fn parse_rtl_fw_rejects_bad_checksum() {
+        let mut blob = build_fw_info("rtl8125b-2", &[0x8000_0001]);
+        blob[0x2c] = blob[0x2c].wrapping_add(1); // break the checksum
+        assert_eq!(parse_rtl_fw(&blob).unwrap_err(), FirmwareError::BadChecksum);
+    }
+
+    #[test]
+    fn parse_rtl_fw_rejects_short_and_bad_region() {
+        assert_eq!(
+            parse_rtl_fw(&[0u8; 8]).unwrap_err(),
+            FirmwareError::TooShort
+        );
+        // fw_start/fw_len that run past the blob end.
+        let mut blob = build_fw_info("v", &[0x8000_0001]);
+        blob[0x28..0x2c].copy_from_slice(&0xFFFFu32.to_le_bytes()); // fw_len huge
+        // Re-fix checksum so it fails on region, not checksum.
+        blob[0x2c] = 0;
+        let s = blob.iter().fold(0u8, |a, &x| a.wrapping_add(x));
+        blob[0x2c] = blob[0x2c].wrapping_sub(s);
+        assert!(matches!(
+            parse_rtl_fw(&blob),
+            Err(FirmwareError::BadFwRegion | FirmwareError::UnalignedPayload)
+        ));
+    }
+
+    /// Mock sink recording writes and serving canned reads.
+    struct MockPhy {
+        writes: Vec<(u16, u16)>,
+        reads: Vec<(u16, u16)>, // reg -> value to return
+        mdio_target: u16,
+        delays: u32,
+    }
+    impl PhyActionSink for MockPhy {
+        fn read(&mut self, reg: u16) -> u16 {
+            self.reads
+                .iter()
+                .find(|(r, _)| *r == reg)
+                .map(|(_, v)| *v)
+                .unwrap_or(0)
+        }
+        fn write(&mut self, reg: u16, val: u16) {
+            self.writes.push((reg, val));
+        }
+        fn mdio_chg(&mut self, target: u16) {
+            self.mdio_target = target;
+        }
+        fn delay_ms(&mut self, ms: u16) {
+            self.delays += ms as u32;
+        }
+    }
+
+    #[test]
+    fn run_phy_action_executes_writes_and_mdio_chg() {
+        // MDIO_CHG(1); WRITE reg=0x1f val=0xfc2; WRITE reg=0x28 val=0; DELAY 5ms.
+        let code: Vec<u32> = vec![0x4000_0001, 0x801f_0fc2, 0x8028_0000, 0xe000_0005];
+        let mut bytes = Vec::new();
+        for w in &code {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        let mut phy = MockPhy {
+            writes: Vec::new(),
+            reads: Vec::new(),
+            mdio_target: 0,
+            delays: 0,
+        };
+        let steps = run_phy_action(&bytes, &mut phy);
+        assert_eq!(steps, 4);
+        assert_eq!(phy.mdio_target, 1);
+        assert_eq!(phy.writes, vec![(0x1f, 0xfc2), (0x28, 0x0000)]);
+        assert_eq!(phy.delays, 5);
+    }
+
+    #[test]
+    fn run_phy_action_read_or_write_previous() {
+        // READ reg=0x10 (returns 0x00f0); DATA_OR 0x0005; WRITE_PREVIOUS reg=0x10.
+        let code: Vec<u32> = vec![0x0010_0000, 0x1000_0005, 0xc010_0000];
+        let mut bytes = Vec::new();
+        for w in &code {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        let mut phy = MockPhy {
+            writes: Vec::new(),
+            reads: vec![(0x10, 0x00f0)],
+            mdio_target: 0,
+            delays: 0,
+        };
+        run_phy_action(&bytes, &mut phy);
+        // predata = 0x00f0 | 0x0005 = 0x00f5 written back to reg 0x10.
+        assert_eq!(phy.writes, vec![(0x10, 0x00f5)]);
+    }
+
+    #[test]
+    fn run_phy_action_bounded_against_infinite_backjump() {
+        // WRITE; BJMPN regno=1 (jump back 1 -> infinite). Must terminate via cap.
+        let code: Vec<u32> = vec![0x8000_0001, 0x3001_0000];
+        let mut bytes = Vec::new();
+        for w in &code {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        let mut phy = MockPhy {
+            writes: Vec::new(),
+            reads: Vec::new(),
+            mdio_target: 0,
+            delays: 0,
+        };
+        let steps = run_phy_action(&bytes, &mut phy);
+        assert_eq!(steps, PHY_ACTION_MAX_STEPS); // hit the backstop, did not hang
+    }
+
+    #[test]
+    fn run_phy_action_skipn_skips_forward() {
+        // SKIPN regno=1 (skip next 1 + self); WRITE (skipped); WRITE reg=0x2 val=0x9.
+        let code: Vec<u32> = vec![0xd001_0000, 0x8001_00aa, 0x8002_0009];
+        let mut bytes = Vec::new();
+        for w in &code {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        let mut phy = MockPhy {
+            writes: Vec::new(),
+            reads: Vec::new(),
+            mdio_target: 0,
+            delays: 0,
+        };
+        run_phy_action(&bytes, &mut phy);
+        // SKIPN regno=1 advances index by 2, skipping the 0xaa write.
+        assert_eq!(phy.writes, vec![(0x2, 0x9)]);
     }
 }
