@@ -1,5 +1,18 @@
 # RTL8125B PHY-config + firmware capture (Phase 79 → 83 reference)
 
+> **RESOLVED (2026-06): the literal `ping` works over the physical RTL8125B,
+> without firmware.** `R8125_LIVE: PASS — ICMP reply from 192.168.1.254 over the
+> REAL RTL8125`, reproduced across runs. The blocker was never the firmware (a
+> PHY-MCU *tuning* patch — the card links/RXes without it): it was two MAC
+> register-sequencing bugs found by reading the chip's registers back —
+> **(1)** the 8125 drops `ChipCmd RxEnb|TxEnb` if asserted while the link is down,
+> so the engines must be **re-enabled after link-up**; **(2)** the 8125 TX
+> doorbell is a 16-bit register at **`0x90`**, not the classic `TxPoll` (`0x38`),
+> so posted TX frames were never transmitted. Fixed in
+> `feat(r8125): real-silicon ping WORKS`. The firmware-loader material below
+> remains a valid Phase-83 reference for *enabling the firmware path* (perf/EEE
+> tuning), but it is **not** required for basic link/RX/ping.
+
 Empirically captured PHY/MAC bring-up sequence that Linux's `r8169` driver
 applies to a physical **RTL8125B** (`10ec:8125` rev 05, firmware `rtl8125b-2`),
 for porting into the m3OS `r8125` driver. Captured by tracing the live driver's
