@@ -35,7 +35,7 @@
 
 use alloc::vec::Vec;
 
-use kernel_core::device_host::DeviceCapKey;
+use kernel_core::device_host::{DeviceCapKey, DeviceHostError};
 use kernel_core::driver_runtime::contract::DriverRuntimeError;
 
 use crate::syscall_backend::decode_errno_common;
@@ -216,11 +216,12 @@ unsafe fn raw_sys_device_config_read(key: DeviceCapKey, offset: u16, width: u8) 
 ///
 /// # Errors
 ///
-/// - `DriverRuntimeError::Device(DeviceHostError::NotClaimed)` on `-EACCES`
+/// - `DriverRuntimeError::Device(DeviceHostError::NotClaimed)` on `-EACCES`/`-EPERM`
 ///   (exec-path not under `/drivers/`).
 /// - `DriverRuntimeError::Device(DeviceHostError::NotClaimed)` on `-ENODEV`
 ///   (no function at the BDF).
-/// - `DriverRuntimeError::Device(DeviceHostError::Internal)` on any other errno.
+/// - `DriverRuntimeError::Device(DeviceHostError::Internal)` on `-EINVAL`
+///   (invalid config offset/width) or any other unexpected errno.
 pub fn pci_config_read(
     key: DeviceCapKey,
     offset: u16,
@@ -229,9 +230,25 @@ pub fn pci_config_read(
     // SAFETY: see `raw_sys_device_config_read`.
     let raw = unsafe { raw_sys_device_config_read(key, offset, width) };
     if raw < 0 {
-        return Err(decode_errno_common(raw as i32));
+        return Err(decode_config_errno(raw as i32));
     }
     Ok(raw as u32)
+}
+
+/// Decode a negative errno from `sys_device_config_read`.
+///
+/// This differs from the shared [`decode_errno_common`] (used by the MMIO BAR
+/// APIs) only for `-EINVAL`: for a config-space read `-EINVAL` means an invalid
+/// offset/width, **not** a bad BAR index, so it maps to `Internal` rather than
+/// the BAR-specific `InvalidBarIndex` a BAR API would surface. Every other errno
+/// keeps the shared mapping.
+#[inline]
+fn decode_config_errno(errno: i32) -> DriverRuntimeError {
+    if errno == -22 {
+        // -EINVAL: invalid config offset/width — no BAR index is involved.
+        return DriverRuntimeError::Device(DeviceHostError::Internal);
+    }
+    decode_errno_common(errno)
 }
 
 /// Read the `(vendor_id, device_id)` pair of an enumerated PCI function.
@@ -306,6 +323,35 @@ pub fn select_nic(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- decode_config_errno: config reads must not borrow BAR-API semantics ---
+
+    #[test]
+    fn decode_config_errno_maps_einval_to_internal_not_bar() {
+        // -EINVAL from a config read means a bad offset/width, not a BAR index,
+        // so it must NOT surface as the BAR-specific InvalidBarIndex.
+        assert_eq!(
+            decode_config_errno(-22),
+            DriverRuntimeError::Device(DeviceHostError::Internal)
+        );
+    }
+
+    #[test]
+    fn decode_config_errno_delegates_other_errnos_to_common() {
+        // Every errno other than -EINVAL keeps the shared mapping.
+        assert_eq!(
+            decode_config_errno(-19), // ENODEV
+            DriverRuntimeError::Device(DeviceHostError::NotClaimed)
+        );
+        assert_eq!(
+            decode_config_errno(-13), // EACCES
+            DriverRuntimeError::Device(DeviceHostError::NotClaimed)
+        );
+        assert_eq!(
+            decode_config_errno(-16), // EBUSY
+            DriverRuntimeError::Device(DeviceHostError::AlreadyClaimed)
+        );
+    }
 
     // The host stub returns 0 (no matches), so enumerate_pci_class returns Ok([]).
     #[test]

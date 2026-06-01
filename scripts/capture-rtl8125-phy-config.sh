@@ -54,7 +54,7 @@ sleep 2
 
 log "capture complete -> $OUT"
 log "PHY writes (mdio_write_reg): $(grep -c '^W ' "$OUT")"
-log "PHY writes (rtl_writephy):   $(grep -c '^WP ' "$OUT")"
+log "PHY writes (phy_write_paged): $(grep -c '^PW ' "$OUT")"
 log "OCP modifies:                $(grep -c '^OCPMOD ' "$OUT")"
 log "firmware sections (FW_BEGIN):$(grep -c FW_BEGIN "$OUT")"
 echo "----- first 30 lines -----"

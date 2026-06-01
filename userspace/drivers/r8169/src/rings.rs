@@ -11,11 +11,12 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use driver_runtime::{DeviceHandle, DmaBuffer, DriverRuntimeError};
+use kernel_core::device_host::DeviceHostError;
 use kernel_core::r8169 as hw;
 
-/// Ring depth (descriptors). 16 slots * 16-byte descriptors = 256 bytes, so the
-/// ring byte length is `RING_ALIGN`-aligned; combined with the page-aligned DMA
-/// base this keeps every wrap aligned.
+/// Ring depth (descriptors). 64 slots * 16-byte descriptors = 1024 bytes, so the
+/// ring byte length is `RING_ALIGN`-aligned (1024 is a multiple of 256); combined
+/// with the page-aligned DMA base this keeps every wrap aligned.
 pub const RX_RING_SIZE: usize = 64;
 /// TX ring depth.
 pub const TX_RING_SIZE: usize = 64;
@@ -68,6 +69,19 @@ impl CplusRing {
         buf_size: usize,
         own: bool,
     ) -> Result<Self, DriverRuntimeError> {
+        // The descriptor ring backing is a fixed `[u8; RX_RING_BYTES]`
+        // (RX_RING_SIZE slots) and each packet buffer is a fixed
+        // `[u8; RX_BUF_SIZE]`. Reject out-of-range arguments up front: a caller
+        // passing `count > RX_RING_SIZE` would overflow `build_ring`'s output
+        // (it returns 0, silently yielding an empty ring in a release build),
+        // and `buf_size > RX_BUF_SIZE` would advertise a length larger than the
+        // real buffer (NIC RX-DMA overrun, and a `post_tx` slice-index panic).
+        // These are programming errors from undocumented misuse, so surface
+        // `Internal` (the service manager restarts the offending driver).
+        if count > RX_RING_SIZE || buf_size > RX_BUF_SIZE {
+            return Err(DriverRuntimeError::Device(DeviceHostError::Internal));
+        }
+
         let ring =
             DmaBuffer::<[u8; RX_RING_BYTES]>::allocate(handle, RX_RING_BYTES, hw::RING_ALIGN)?;
 
@@ -89,10 +103,17 @@ impl CplusRing {
         {
             // Build the descriptor words with the host-tested encoder into the
             // live DMA ring. `build_ring` writes exactly `count` 16-byte
-            // descriptors; `count <= RX_RING_SIZE` so the array length fits.
+            // descriptors; `count <= RX_RING_SIZE` (checked above) so the array
+            // length fits.
             let backing: &mut [u8; RX_RING_BYTES] = &mut ring.ring;
             let n = hw::build_ring(backing.as_mut_slice(), &iovas, own, buf_size as u32);
-            debug_assert_eq!(n, count);
+            if n != count {
+                // `build_ring` returns 0 on a size mismatch. With the bounds
+                // check above this is unreachable from documented callers, but
+                // enforce it at runtime (not just `debug_assert`) so a release
+                // build never proceeds with a partially-built ring.
+                return Err(DriverRuntimeError::Device(DeviceHostError::Internal));
+            }
         }
         Ok(ring)
     }
