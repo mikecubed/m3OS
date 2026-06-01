@@ -1567,8 +1567,9 @@ mod syscall_nr {
     #[allow(unused_imports)]
     pub use kernel_core::device_host::syscalls::{
         DEVICE_HOST_BASE, DEVICE_HOST_LAST, SYS_DEVICE_CLAIM, SYS_DEVICE_CONFIG_READ,
-        SYS_DEVICE_DMA_ALLOC, SYS_DEVICE_DMA_HANDLE_INFO, SYS_DEVICE_IRQ_SUBSCRIBE,
-        SYS_DEVICE_MMIO_MAP, SYS_DEVICE_PCI_ENUMERATE, SYS_DEVICE_PIO_READ, SYS_DEVICE_PIO_WRITE,
+        SYS_DEVICE_CONFIG_WRITE, SYS_DEVICE_DMA_ALLOC, SYS_DEVICE_DMA_HANDLE_INFO,
+        SYS_DEVICE_IRQ_SUBSCRIBE, SYS_DEVICE_MMIO_MAP, SYS_DEVICE_PCI_ENUMERATE,
+        SYS_DEVICE_PIO_READ, SYS_DEVICE_PIO_WRITE,
     };
 }
 
@@ -2209,6 +2210,34 @@ pub extern "C" fn syscall_handler(
                     arg2 as u8,
                     arg3 as u8,
                     arg4,
+                ) as u64
+            }
+        }
+        SYS_DEVICE_CONFIG_WRITE => {
+            // Signature (Phase 80c Track F.1):
+            //   sys_device_config_write(segment: u16, bus: u8, dev: u8, func: u8,
+            //                           packed: u64, value: u64) -> isize
+            // where packed = (offset << 8) | width and value rides in r9.
+            // arg0=segment (rdi), arg1=bus (rsi), arg2=dev (rdx),
+            // arg3=func (r10), arg4=packed (r8), arg5=value (r9).
+            let arg3 = per_core_syscall_arg3();
+            let snap = crate::task::current_task_syscall_snapshot();
+            let arg4 = snap.user_r8;
+            let arg5 = snap.user_r9;
+            if arg0 > u64::from(u16::MAX)
+                || arg1 > u64::from(u8::MAX)
+                || arg2 > u64::from(u8::MAX)
+                || arg3 > u64::from(u8::MAX)
+            {
+                NEG_EINVAL
+            } else {
+                crate::syscall::device_host::sys_device_config_write(
+                    arg0 as u16,
+                    arg1 as u8,
+                    arg2 as u8,
+                    arg3 as u8,
+                    arg4,
+                    arg5,
                 ) as u64
             }
         }

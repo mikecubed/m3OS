@@ -15,6 +15,7 @@
 
 #![allow(dead_code)] // submodule consumers + the out-of-tree driver crate use these.
 
+pub mod amd;
 pub mod fmt;
 pub mod ids;
 pub mod irq;

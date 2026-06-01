@@ -3506,6 +3506,87 @@ pub fn sys_device_config_read(segment: u16, bus: u8, dev: u8, func: u8, packed: 
     value as isize
 }
 
+/// Whether `pid` currently owns a device claim on the supplied BDF.
+///
+/// Locks the device-host registry and checks for a `ClaimSlot` matching
+/// `(pid, key)`. Used to gate `sys_device_config_write`: unlike a config-space
+/// *read* (a pre-claim probe), a *write* mutates device state and is only
+/// permitted on a device the caller has already claimed.
+fn pid_owns_bdf(pid: Pid, key: DeviceCapKey) -> bool {
+    DEVICE_HOST_REGISTRY.lock().slot_for(pid, key).is_some()
+}
+
+/// Syscall entry: `sys_device_config_write(segment, bus, dev, func, packed, value) -> isize`
+/// where `packed = (offset << 8) | width` (the same packing as
+/// [`sys_device_config_read`]) and `value` rides in the sixth register.
+///
+/// Phase 80c Track F.1 — writes PCI configuration space for a device the caller
+/// has **already claimed**, so a driver can perform vendor-specific config-space
+/// programming the generic register path cannot express (the motivating case is
+/// AMD HDA snoop enablement; see [`kernel_core::hda::amd`]).
+///
+/// Returns `0` on success, or a negative errno:
+///
+/// - `NEG_ESRCH`  — kernel task context (PID 0).
+/// - `NEG_EACCES` — caller is not an authorized driver process, **or** does not
+///   own a claim on the target BDF.
+/// - `NEG_EINVAL` — bad width/offset/alignment, or `value` does not fit `width`.
+/// - `NEG_ENODEV` — no PCI function at the BDF, or a non-zero segment.
+///
+/// See [`kernel_core::device_host::syscalls::SYS_DEVICE_CONFIG_WRITE`] for the
+/// full ABI.
+pub fn sys_device_config_write(
+    segment: u16,
+    bus: u8,
+    dev: u8,
+    func: u8,
+    packed: u64,
+    value: u64,
+) -> isize {
+    let pid = crate::process::current_pid();
+    if pid == 0 {
+        return NEG_ESRCH;
+    }
+    // Authorization gate — must be a `/drivers/` process, same as config-read.
+    if !is_authorized_driver_process(pid) {
+        return NEG_EACCES;
+    }
+    // Only segment 0 exists on current platforms; reject others as ENODEV.
+    if segment != 0 {
+        return NEG_ENODEV;
+    }
+    // A write mutates device state — require that the caller actually owns this
+    // BDF (it has claimed the device). A claimed device's config space is within
+    // the owning driver's existing authority (it already drives the BARs/DMA).
+    let key = DeviceCapKey::new(segment, bus, dev, func);
+    if !pid_owns_bdf(pid, key) {
+        return NEG_EACCES;
+    }
+    let (offset, width) = kernel_core::device_host::syscalls::unpack_config_read_arg(packed);
+    // `value` arrives as a u64 (the raw register); reject anything above u32
+    // before the width-fit check so the validator sees a clean u32.
+    if value > u64::from(u32::MAX) {
+        return NEG_EINVAL;
+    }
+    let value = value as u32;
+    if kernel_core::device_host::validate_config_write(offset, width, value).is_err() {
+        return NEG_EINVAL;
+    }
+    // A function is absent when its vendor ID reads back all-ones.
+    let vendor = crate::pci::pci_config_read_u16(bus, dev, func, 0x00);
+    if vendor == 0xFFFF {
+        return NEG_ENODEV;
+    }
+    let off = offset as u8;
+    match width {
+        1 => crate::pci::pci_config_write_u8(bus, dev, func, off, value as u8),
+        2 => crate::pci::pci_config_write_u16(bus, dev, func, off, value as u16),
+        // width == 4 (validated aligned): write the full dword.
+        _ => crate::pci::pci_config_write_u32_any(bus, dev, func, u16::from(off), value),
+    }
+    0
+}
+
 fn device_claim_error_to_errno(
     error: DeviceHostError,
     segment: u16,

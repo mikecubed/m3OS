@@ -6,8 +6,9 @@
 
 use crate::corb::CorbRirb;
 use alloc::vec::Vec;
-use driver_runtime::{DeviceHandle, Mmio};
-use kernel_core::hda::{self, irq, regs};
+use driver_runtime::{DeviceCapKey, DeviceHandle, Mmio, pci_config_read, pci_config_write};
+use kernel_core::device_host::pci_pm;
+use kernel_core::hda::{self, amd, irq, regs};
 
 const POLL_BUDGET: u32 = 2_000_000;
 
@@ -42,7 +43,23 @@ pub struct HdaController {
 
 impl HdaController {
     /// Bring the controller from cold reset to "rings running, codecs known".
-    pub fn bring_up(device: &DeviceHandle, mmio: Mmio<u8>) -> Result<Self, &'static str> {
+    ///
+    /// `key` is the controller's BDF (for config-space programming) and
+    /// `vendor` its PCI vendor ID (to gate the AMD snoop quirk). Both come from
+    /// the caller's pre-claim probe.
+    pub fn bring_up(
+        device: &DeviceHandle,
+        key: DeviceCapKey,
+        vendor: u16,
+        mmio: Mmio<u8>,
+    ) -> Result<Self, &'static str> {
+        // Vendor config-space programming the generic register path can't do:
+        // force PCI power state D0 (a VFIO host may have left the controller —
+        // and its internal codec block — in D3, which keeps the codec out of
+        // STATESTS), and enable the AMD/ATI snoop bit for coherent DMA. Mirrors
+        // Linux `snd_hda_intel` `azx_init_pci`, run before the link reset.
+        Self::power_up_and_quirk(key, vendor);
+
         // A real codec — especially after a VFIO/FLR reset that took it away
         // from a prior OS owner (Linux `snd_hda_intel`) — may need several full
         // reset cycles + a long enumeration window before it reports in
@@ -88,8 +105,56 @@ impl HdaController {
         })
     }
 
-    /// `GCTL.CRST` reset: clear stale STATESTS → clear CRST → poll read-0 → set
-    /// CRST → poll read-1 → wait for codec self-enumeration.
+    /// Force the controller to PCI power state **D0** and apply the AMD/ATI
+    /// snoop quirk via the new claim-gated config-space write syscall, before
+    /// the link reset. Best-effort: each config-space access is independently
+    /// fault-tolerant — a failure is logged-by-omission and bring-up proceeds,
+    /// since on QEMU (already D0, non-AMD) every step is a no-op anyway.
+    fn power_up_and_quirk(key: DeviceCapKey, vendor: u16) {
+        // 1. Ensure D0. Under VFIO the host's runtime-PM may have suspended the
+        //    function; resetting a D3 controller leaves its codec dark. Walk to
+        //    the PM capability and clear the PMCSR power-state field if set.
+        if let Ok(status) = pci_config_read(key, pci_pm::PCI_STATUS_REG, 2) {
+            let read_u8 = |off: u8| {
+                pci_config_read(key, u16::from(off), 1)
+                    .ok()
+                    .map(|v| v as u8)
+            };
+            if let Some(pm_cap) =
+                pci_pm::find_capability(status as u16, read_u8, pci_pm::PCI_CAP_ID_PM)
+            {
+                let pmcsr_off = pci_pm::pmcsr_offset(pm_cap);
+                if let Ok(pmcsr) = pci_config_read(key, pmcsr_off, 2) {
+                    let state = pci_pm::pm_power_state(pmcsr as u16);
+                    if state != 0 {
+                        let d0 = pci_pm::pmcsr_force_d0(pmcsr as u16);
+                        let _ = pci_config_write(key, pmcsr_off, 2, u32::from(d0));
+                        // PCI PM spec: ≤10 ms recovery for a D3hot→D0 transition.
+                        let _ = syscall_lib::nanosleep_for(0, 10_000_000);
+                        dbg_hex(
+                            "hda_driver: forced PCI power state D0, was D",
+                            u32::from(state),
+                        );
+                    }
+                }
+            }
+        }
+
+        // 2. AMD/ATI snoop enable (coherent DMA). NOT an enumeration fix — the
+        //    codec still appears without it; this prevents garbled playback once
+        //    it does. Skipped for non-AMD controllers (QEMU intel-hda).
+        if amd::is_amd_controller(vendor) {
+            if let Ok(cur) = pci_config_read(key, u16::from(amd::ATI_SNOOP_REG), 1) {
+                let patched = amd::ati_snoop_rmw(cur as u8);
+                let _ = pci_config_write(key, u16::from(amd::ATI_SNOOP_REG), 1, u32::from(patched));
+                dbg_hex("hda_driver: AMD snoop (cfg 0x42) <- ", u32::from(patched));
+            }
+        }
+    }
+
+    /// `GCTL.CRST` reset: clear stale STATESTS → clear CRST → poll read-0 →
+    /// in-reset PLL-settle delay → set CRST → poll read-1 → wait for codec
+    /// self-enumeration.
     fn reset(mmio: &Mmio<u8>) -> Result<(), &'static str> {
         // Clear any stale STATESTS bits before reset so a fresh codec wake is
         // detectable afterward (Redox `ihdad` does this; a real codec may not
@@ -103,6 +168,12 @@ impl HdaController {
                 break;
             }
         }
+        // HDA spec Rev 0.9 §5.5.1: hold reset asserted ≥100 µs so the codec PLL
+        // settles before bringing the link back up. Linux `snd_hdac_bus_enter_
+        // link_reset` waits 500–1000 µs here; the driver previously deasserted
+        // immediately, which on real silicon can leave the codec un-clocked and
+        // absent from STATESTS even though QEMU's instant codec still reports.
+        let _ = syscall_lib::nanosleep_for(0, 600_000); // 600 µs
         mmio.write_reg::<u32>(hda::REG_GCTL, hda::GCTL_CRST);
         let mut up = false;
         for _ in 0..POLL_BUDGET {

@@ -10,10 +10,12 @@
 
 pub mod audio_class;
 pub mod config_read;
+pub mod config_write;
 pub mod dma_logic;
 pub mod irq_logic;
 pub mod mmio_bounds;
 pub mod pci_enum;
+pub mod pci_pm;
 pub mod pio_validation;
 pub mod registry_logic;
 pub mod syscalls;
@@ -24,6 +26,7 @@ pub use audio_class::{
     SUBSYSTEM_AUDIO_DEVICE, classify_pci_id,
 };
 pub use config_read::{ConfigReadError, extract_field, validate_config_read};
+pub use config_write::{ConfigWriteError, validate_config_write};
 pub use dma_logic::{
     DMA_MIN_ALIGN, DmaAllocEntry, DmaAllocId, DmaAllocationRegistryCore, DmaRegistryError,
     validate_size_align,
@@ -36,6 +39,7 @@ pub use mmio_bounds::{
     validate_mmio_bar_size,
 };
 pub use pci_enum::{PciDeviceInfo, collect_matching_bdfs};
+pub use pci_pm::{PCI_CAP_ID_PM, find_capability, pm_power_state, pmcsr_force_d0, pmcsr_offset};
 pub use pio_validation::{PioValidationError, validate_pio_access};
 pub use registry_logic::{DeviceHostRegistryCore, RegistryError, RegistryPid};
 pub use types::{

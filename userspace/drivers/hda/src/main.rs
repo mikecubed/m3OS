@@ -134,6 +134,13 @@ fn program_main(_args: &[&str]) -> i32 {
         }
     };
 
+    // Read the controller's PCI vendor ID so bring-up can apply the AMD snoop
+    // quirk on real AMD silicon (`1022:15e3`); a probe failure degrades to
+    // vendor 0 (no quirk), which is correct for QEMU's `intel-hda`.
+    let vendor = driver_runtime::read_vendor_device(key)
+        .map(|(v, _d)| v)
+        .unwrap_or(0);
+
     let bar0 = match Mmio::<u8>::map(&device, 0, HDA_BAR0_LEN) {
         Ok(m) => m,
         Err(_) => {
@@ -142,7 +149,7 @@ fn program_main(_args: &[&str]) -> i32 {
         }
     };
 
-    let mut controller = match HdaController::bring_up(&device, bar0) {
+    let mut controller = match HdaController::bring_up(&device, key, vendor, bar0) {
         Ok(c) => c,
         Err(e) => {
             syscall_lib::write_str(STDOUT_FILENO, "hda_driver: controller bring-up failed: ");
