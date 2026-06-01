@@ -162,6 +162,22 @@ pub fn reset<M: IgbMmioOps>(mmio: &M, limit: u32) -> Result<u32, BringUpError> {
     Err(BringUpError::ResetTimeout)
 }
 
+/// Poll a queue-control register (`RXDCTL`/`TXDCTL`) until its `ENABLE` bit
+/// reads back set, bounded by [`RESET_POLL_LIMIT`]. Real I210/I350 silicon does
+/// not arm the queue on the same cycle the enable write posts (Intel's igb
+/// polls RXDCTL.ENABLE before advancing RDT), so software must wait before
+/// touching the ring tail or the tail write lands on a not-yet-live queue and
+/// is dropped. Best-effort: the bound keeps a non-latching emulated model from
+/// wedging bring-up.
+fn poll_qdctl_enabled<M: IgbMmioOps>(mmio: &M, reg: usize) {
+    for _ in 0..RESET_POLL_LIMIT {
+        if mmio.read_u32(reg) & qdctl::ENABLE != 0 {
+            return;
+        }
+        core::hint::spin_loop();
+    }
+}
+
 /// Program the RX queue-0 advanced ring: base/length, SRRCTL sizing, head/tail
 /// pre-post, and the per-queue enable bit.
 pub fn program_rx_ring<M: IgbMmioOps>(mmio: &M, ring_iova: u64) {
@@ -171,9 +187,11 @@ pub fn program_rx_ring<M: IgbMmioOps>(mmio: &M, ring_iova: u64) {
     mmio.write_u32(IgbRegs::RDLEN0, RX_RING_BYTES as u32);
     mmio.write_u32(IgbRegs::SRRCTL0, srrctl_bring_up_value());
     mmio.write_u32(IgbRegs::RDH0, 0);
-    // Enable the queue before pre-posting tail (igb requires RXDCTL.ENABLE
-    // before software advances RDT into the live region).
+    // Enable the queue and wait for RXDCTL.ENABLE to read back set *before*
+    // pre-posting RDT into the live region (igb arms the queue a few cycles
+    // after the write; a tail write to a not-yet-live queue is dropped).
     mmio.write_u32(IgbRegs::RXDCTL0, qdctl::ENABLE);
+    poll_qdctl_enabled(mmio, IgbRegs::RXDCTL0);
     mmio.write_u32(IgbRegs::RDT0, initial_rx_tail());
 }
 
@@ -185,7 +203,10 @@ pub fn program_tx_ring<M: IgbMmioOps>(mmio: &M, ring_iova: u64) {
     mmio.write_u32(IgbRegs::TDLEN0, TX_RING_BYTES as u32);
     mmio.write_u32(IgbRegs::TDH0, 0);
     mmio.write_u32(IgbRegs::TDT0, 0);
+    // Arm the queue and confirm TXDCTL.ENABLE latched before the TX path bumps
+    // TDT (igb requires the queue live before the tail advances).
     mmio.write_u32(IgbRegs::TXDCTL0, qdctl::ENABLE);
+    poll_qdctl_enabled(mmio, IgbRegs::TXDCTL0);
 }
 
 /// Configure the EICR single-vector interrupt block (everything masked).

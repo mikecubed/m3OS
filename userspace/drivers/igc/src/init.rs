@@ -133,6 +133,21 @@ pub fn reset<M: IgcMmioOps>(mmio: &M, limit: u32) -> Result<u32, BringUpError> {
     Err(BringUpError::ResetTimeout)
 }
 
+/// Poll a queue-control register (`RXDCTL`/`TXDCTL`) until its `ENABLE` bit
+/// reads back set, bounded by [`RESET_POLL_LIMIT`]. I225/I226 silicon arms the
+/// queue a few cycles after the enable write posts (Intel's igc polls
+/// RXDCTL.ENABLE before advancing RDT); a tail write to a not-yet-live queue is
+/// dropped. Best-effort and bounded so a non-latching emulated model cannot
+/// wedge bring-up.
+fn poll_qdctl_enabled<M: IgcMmioOps>(mmio: &M, reg: usize) {
+    for _ in 0..RESET_POLL_LIMIT {
+        if mmio.read_u32(reg) & qdctl::ENABLE != 0 {
+            return;
+        }
+        core::hint::spin_loop();
+    }
+}
+
 pub fn program_rx_ring<M: IgcMmioOps>(mmio: &M, ring_iova: u64) {
     let (lo, hi) = split_iova(ring_iova);
     mmio.write_u32(IgcRegs::RDBAL0, lo);
@@ -140,7 +155,11 @@ pub fn program_rx_ring<M: IgcMmioOps>(mmio: &M, ring_iova: u64) {
     mmio.write_u32(IgcRegs::RDLEN0, RX_RING_BYTES as u32);
     mmio.write_u32(IgcRegs::SRRCTL0, srrctl_bring_up_value());
     mmio.write_u32(IgcRegs::RDH0, 0);
+    // Wait for RXDCTL.ENABLE to read back set before pre-posting RDT — the queue
+    // is not live on the same cycle as the enable write, and a tail write to an
+    // un-armed queue is dropped.
     mmio.write_u32(IgcRegs::RXDCTL0, qdctl::ENABLE);
+    poll_qdctl_enabled(mmio, IgcRegs::RXDCTL0);
     mmio.write_u32(IgcRegs::RDT0, initial_rx_tail());
 }
 
@@ -151,7 +170,9 @@ pub fn program_tx_ring<M: IgcMmioOps>(mmio: &M, ring_iova: u64) {
     mmio.write_u32(IgcRegs::TDLEN0, TX_RING_BYTES as u32);
     mmio.write_u32(IgcRegs::TDH0, 0);
     mmio.write_u32(IgcRegs::TDT0, 0);
+    // Confirm TXDCTL.ENABLE latched before the TX path advances TDT.
     mmio.write_u32(IgcRegs::TXDCTL0, qdctl::ENABLE);
+    poll_qdctl_enabled(mmio, IgcRegs::TXDCTL0);
 }
 
 /// Configure the EICR single-vector interrupt block (everything masked).
