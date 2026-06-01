@@ -181,36 +181,42 @@ impl AdvRxDesc {
 ///
 /// * **read** layout: `buffer_addr` (lower qword) + `cmd_type_len` (low 32 of
 ///   upper qword) + `olinfo_status` (high 32 of upper qword).
-/// * **write-back** layout: the lower qword is reserved; the upper qword's low
-///   32 bits hold the completion `status` (DD in bit 0).
+/// * **write-back** layout (Intel `union e1000_adv_tx_desc`: `{ rsvd: __le64,
+///   nxtseq_seed: __le32, status: __le32 }`): the lower qword is reserved; the
+///   upper qword's *high* 32 bits hold the completion `status` (DD in bit 0) —
+///   i.e. the same slot the driver wrote `olinfo_status` into. `cmd_type_len`'s
+///   low dword aligns with `nxtseq_seed` on write-back, NOT with `status`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AdvTxDesc {
     /// Read: buffer IOVA. Write-back: reserved.
     pub buffer_addr: u64,
     /// Read: `cmd_type_len` (low 32) + `olinfo_status` (high 32).
-    /// Write-back: `status` (low 32; DD in bit 0) + reserved (high 32).
+    /// Write-back: `nxtseq_seed`/reserved (low 32) + `status` (high 32; DD bit 0).
     pub cmd_olinfo: u64,
 }
 
 impl AdvTxDesc {
     /// The `cmd_type_len` dword (low 32 of `cmd_olinfo`) as written by the
-    /// driver — also where the write-back `status` lands.
+    /// driver.
     #[inline]
     pub const fn cmd_type_len(&self) -> u32 {
         (self.cmd_olinfo & 0xFFFF_FFFF) as u32
     }
-    /// The `olinfo_status` dword (high 32 of `cmd_olinfo`).
+    /// The `olinfo_status` dword (high 32 of `cmd_olinfo`) — the slot hardware
+    /// overwrites with the write-back `status`.
     #[inline]
     pub const fn olinfo_status(&self) -> u32 {
         (self.cmd_olinfo >> 32) as u32
     }
-    /// Write-back `status` dword — the hardware overwrites the low 32 bits of
-    /// `cmd_olinfo` (the slot the driver wrote `cmd_type_len` into) with the
-    /// completion status; DD is bit 0.
+    /// Write-back `status` dword — hardware overwrites the *high* 32 bits of
+    /// `cmd_olinfo` (the slot the driver wrote `olinfo_status` into) with the
+    /// completion status; DD is bit 0. Reading the low dword here would observe
+    /// `cmd_type_len` (DD never set on even-length frames; spuriously set by
+    /// `len & 1` on odd-length frames) instead of the real completion status.
     #[inline]
     pub const fn wb_status(&self) -> u32 {
-        (self.cmd_olinfo & 0xFFFF_FFFF) as u32
+        (self.cmd_olinfo >> 32) as u32
     }
 }
 
@@ -247,7 +253,8 @@ impl NicDescriptors for Advanced {
     #[inline]
     fn tx_slot_free(desc: &AdvTxDesc) -> bool {
         // A never-programmed slot is all-zero (cmd_type_len == 0); a programmed
-        // slot is free once hardware writes back DD into the same low dword.
+        // slot is free once hardware writes DD into the write-back `status`
+        // (high dword), read via `wb_status()`.
         desc.cmd_type_len() == 0 || (desc.wb_status() & adv_tx_wb::DD != 0)
     }
     #[inline]
@@ -444,10 +451,26 @@ mod tests {
         let mut d = Advanced::encode_tx(0xABCD_0000, 64);
         assert!(!Advanced::tx_slot_free(&d));
         assert!(!Advanced::tx_done(&d));
-        // Hardware writes DD into the low dword of cmd_olinfo on completion.
-        d.cmd_olinfo = (d.cmd_olinfo & !0xFFFF_FFFF) | (adv_tx_wb::DD as u64);
+        // Hardware writes the completion `status` (DD) into the HIGH dword of
+        // cmd_olinfo (the `olinfo_status` slot), per `union e1000_adv_tx_desc`.
+        d.cmd_olinfo = (d.cmd_olinfo & 0xFFFF_FFFF) | ((adv_tx_wb::DD as u64) << 32);
         assert!(Advanced::tx_done(&d));
         assert!(Advanced::tx_slot_free(&d));
+    }
+
+    #[test]
+    fn advanced_tx_odd_length_slot_is_not_prematurely_free() {
+        // Regression guard for the write-back-DD-in-the-wrong-dword bug: an
+        // odd-length frame sets bit 0 of `cmd_type_len` (DTALEN low bit =
+        // len & 1). A `wb_status()` that read the LOW dword would observe that
+        // bit as a spurious DD and report a just-posted descriptor as already
+        // complete — premature reuse while the buffer may still be DMA'ing.
+        // Reading the HIGH (status) dword, a freshly-encoded odd-length slot is
+        // NOT done and NOT free until hardware writes back DD.
+        let d = Advanced::encode_tx(0xABCD_0000, 65);
+        assert_eq!(d.cmd_type_len() & 1, 1, "odd len sets cmd_type_len bit 0");
+        assert!(!Advanced::tx_done(&d));
+        assert!(!Advanced::tx_slot_free(&d));
     }
 
     #[test]

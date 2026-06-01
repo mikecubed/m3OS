@@ -569,7 +569,8 @@ mod tests {
         let m = FakeMmio::new();
         let (mut descs, mut bufs, buf_iova) = mk_tx();
         descs[0] = Advanced::encode_tx(buf_iova[0], 64);
-        descs[0].cmd_olinfo = (descs[0].cmd_olinfo & !0xFFFF_FFFF) | (adv_tx_wb::DD as u64);
+        // DD lands in the high/status dword (union e1000_adv_tx_desc).
+        descs[0].cmd_olinfo = (descs[0].cmd_olinfo & 0xFFFF_FFFF) | ((adv_tx_wb::DD as u64) << 32);
         let mut mb = borrow_mut(&mut bufs);
         let up = AtomicBool::new(true);
         let restart = AtomicBool::new(false);
