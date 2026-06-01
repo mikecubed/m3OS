@@ -28,7 +28,9 @@ use driver_runtime::ipc::audio::{decode_request_bulk, reply_response};
 #[cfg(not(test))]
 use driver_runtime::ipc::{EndpointCap, RecvResult, SyscallBackend};
 #[cfg(not(test))]
-use driver_runtime::{DeviceHandle, Mmio};
+use driver_runtime::{
+    DeviceCapHandle, DeviceHandle, IrqNotification, Mmio, SyscallBackend as IrqSyscallBackend,
+};
 #[cfg(not(test))]
 use hda_driver::codec::OutputPath;
 #[cfg(not(test))]
@@ -73,6 +75,20 @@ const STREAM_TAG: u8 = 1;
 /// Facing stream id returned to `audio_server` (it is single-stream).
 #[cfg(not(test))]
 const FACING_STREAM_ID: u32 = 1;
+
+/// Wraps a borrowed [`DeviceHandle`] as a [`DeviceCapHandle`] for
+/// [`IrqNotification::subscribe`].
+#[cfg(not(test))]
+struct DeviceCapView<'a> {
+    inner: &'a DeviceHandle,
+}
+
+#[cfg(not(test))]
+impl DeviceCapHandle for DeviceCapView<'_> {
+    fn cap_handle(&self) -> u32 {
+        self.inner.cap()
+    }
+}
 
 /// Discover an HDA controller by PCI class (vendor-agnostic 0x04/0x03/0x00).
 #[cfg(not(test))]
@@ -141,9 +157,35 @@ fn program_main(_args: &[&str]) -> i32 {
         return 5;
     }
 
+    // C.3: subscribe to the HDA IRQ and bind it into the endpoint recv loop so
+    // a single loop services both client requests and stream-completion (BCIS)
+    // interrupts. Falls back to SDnLPIB polling if subscription is unavailable.
+    let endpoint = EndpointCap::new(ep_u32);
+    let irq: Option<IrqNotification<IrqSyscallBackend>> = {
+        let view = DeviceCapView { inner: &device };
+        match IrqNotification::<IrqSyscallBackend>::subscribe(&view, None) {
+            Ok(n) => {
+                let _ = n.bind_to_endpoint(endpoint);
+                // Arm INTCTL only after a handler is bound — arming without a
+                // subscriber would leave the controller asserting an unhandled
+                // PCI IRQ on every buffer completion.
+                controller.arm_interrupts();
+                syscall_lib::write_str(STDOUT_FILENO, "hda_driver: IRQ armed (subscribed)\n");
+                Some(n)
+            }
+            Err(_) => {
+                syscall_lib::write_str(
+                    STDOUT_FILENO,
+                    "hda_driver: IRQ subscribe unavailable — SDnLPIB polling fallback\n",
+                );
+                None
+            }
+        }
+    };
+
     syscall_lib::write_str(STDOUT_FILENO, SERVER_READY_SENTINEL);
 
-    server_loop(&device, &mut controller, EndpointCap::new(ep_u32))
+    server_loop(&device, &mut controller, endpoint, irq.as_ref())
 }
 
 /// `audio.hw` server loop: serves the `driver_ipc::audio` protocol, copying
@@ -154,17 +196,33 @@ fn server_loop(
     device: &DeviceHandle,
     controller: &mut HdaController,
     endpoint: EndpointCap,
+    irq: Option<&IrqNotification<IrqSyscallBackend>>,
 ) -> i32 {
     let mut backend = SyscallBackend::new();
     let mut receiver = PcmReceiver::new();
     let mut scratch = vec![0u8; audio_pcm::PCM_RING_BYTES];
     let mut stream: Option<OutputStream> = None;
     let mut _path: Option<OutputPath> = None;
+    let mut logged_irq = false;
 
     loop {
         let frame = match backend.recv_with_capacity(endpoint, AUDIO_REQUEST_MAX_SIZE) {
             Ok(RecvResult::Message(f)) => f,
-            Ok(RecvResult::Notification(_)) => continue,
+            Ok(RecvResult::Notification(bits)) => {
+                // Stream-completion (BCIS) interrupt: clear it so it does not
+                // re-assert, then ack the notification.
+                if controller.handle_irq() && !logged_irq {
+                    syscall_lib::write_str(
+                        STDOUT_FILENO,
+                        "hda_driver: stream IRQ (BCIS cleared)\n",
+                    );
+                    logged_irq = true;
+                }
+                if let Some(irq) = irq {
+                    let _ = irq.ack(bits);
+                }
+                continue;
+            }
             Err(_) => continue,
         };
 
@@ -192,8 +250,16 @@ fn server_loop(
                     match receiver.recv_and_copy(grant_handle, offset, len, &mut scratch[..n]) {
                         Ok(copied) => {
                             if s.submit(&controller.mmio, &scratch[..copied]) {
+                                let fc = s.poll_consumed(&controller.mmio);
+                                // Proactively clear any pending BCIS during the
+                                // poll path. SDnLPIB polling is the authoritative
+                                // completion path (deferred DPB); this de-asserts
+                                // the level-triggered INTx line even when the
+                                // bound IRQ notification is not delivered, so the
+                                // armed interrupt can never storm.
+                                let _ = controller.handle_irq();
                                 AudioResponse::Ack {
-                                    frames_consumed: s.poll_consumed(&controller.mmio),
+                                    frames_consumed: fc,
                                 }
                             } else {
                                 AudioResponse::WouldBlock

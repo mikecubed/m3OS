@@ -7,7 +7,7 @@
 use crate::corb::CorbRirb;
 use alloc::vec::Vec;
 use driver_runtime::{DeviceHandle, Mmio};
-use kernel_core::hda::{self, regs};
+use kernel_core::hda::{self, irq, regs};
 
 const POLL_BUDGET: u32 = 2_000_000;
 
@@ -92,5 +92,29 @@ impl HdaController {
     /// `GET_PARAMETER(param)` convenience.
     pub fn get_parameter(&mut self, codec: u8, nid: u8, param: u32) -> Option<u32> {
         self.command(codec, nid, hda::VERB_GET_PARAMETER, param as u8)
+    }
+
+    /// Arm controller interrupts (C.3): global interrupt enable + the output
+    /// stream's per-stream interrupt-enable bit in `INTCTL`. The stream's
+    /// `SDnCTL.IOCE` (set at configure) + the BDL IOC flags then fire a
+    /// `BCIS` interrupt on each completed buffer.
+    pub fn arm_interrupts(&self) {
+        let intctl = hda::INTCTL_GIE | (1u32 << self.output_stream_index);
+        self.mmio.write_reg::<u32>(hda::REG_INTCTL, intctl);
+    }
+
+    /// Service an interrupt: decode `INTSTS`, and if our output stream fired,
+    /// clear its `SDnSTS.BCIS` (write-1-to-clear) so the interrupt does not
+    /// re-assert forever. Returns `true` if the output stream's IRQ was
+    /// handled. Uses the host-tested [`irq`] decode.
+    pub fn handle_irq(&self) -> bool {
+        let intsts = self.mmio.read_reg::<u32>(hda::REG_INTSTS);
+        if irq::stream_fired(intsts, self.output_stream_index) {
+            let sts = hda::stream_desc_offset(self.output_stream_index) + hda::SD_STS;
+            self.mmio.write_reg::<u8>(sts, irq::bcis_clear_value());
+            true
+        } else {
+            false
+        }
     }
 }

@@ -1769,7 +1769,15 @@ fn allocate_device_vector(key: DeviceCapKey) -> Result<AllocatedDeviceVector, Ve
     // storage / USB keep MSI-X. This realises the Phase 79 acceptance "INTx
     // or single-MSI is used (no MSI-X required)" and is a no-op for the
     // 82540EM e1000, which has no MSI-X capability and already used INTx.
-    let prefer_intx = dev_copy.class_code == kernel_core::nic_ids::ETHERNET_CLASS;
+    //
+    // Phase 80b: the ring-3 Intel HDA driver (audio class 0x04) likewise drives
+    // the legacy interrupt model — it programs `INTCTL`/`INTSTS` + per-stream
+    // `SDnCTL.IOCE` and clears `SDnSTS.BCIS`, but installs no MSI-X cause
+    // routing. A kernel-enabled MSI/MSI-X vector therefore stays silent for it
+    // (QEMU's `intel-hda` reproduces this: the stream-completion IRQ never
+    // reaches the driver), so audio-class joins the Ethernet INTx path.
+    let prefer_intx = dev_copy.class_code == kernel_core::nic_ids::ETHERNET_CLASS
+        || dev_copy.class_code == kernel_core::hda::ids::HDA_CLASS;
 
     if !prefer_intx && let Some(allocated) = crate::pci::allocate_msi_vectors(&dev_copy, 1) {
         return Ok(AllocatedDeviceVector {
