@@ -304,3 +304,15 @@ if [ "${M3OS_USB_REGRESSION:-0}" = "1" ]; then
     echo "pre-push: running cargo xtask usb-smoke..."
     cargo xtask usb-smoke --timeout 160
 fi
+
+# Phase 79 — opt-in modern-NIC regression gate. `multi-nic-smoke` boots QEMU
+# once per emulated NIC family (e1000 baseline + e1000e, and igb behind a
+# QEMU >= 8.0 guard) and asserts each driver registers and reaches link
+# (`E1000E_SMOKE:link:PASS`, etc.). Gated behind M3OS_MULTI_NIC_REGRESSION=1
+# because it launches several QEMU instances; set it on branches touching the
+# ring-3 NIC drivers, driver_runtime's net_ring/pci_enum, the device-host
+# claim/IRQ syscalls, or the kernel RemoteNic registry.
+if [ "${M3OS_MULTI_NIC_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask multi-nic-smoke..."
+    cargo xtask multi-nic-smoke
+fi

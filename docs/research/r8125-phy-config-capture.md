@@ -85,6 +85,22 @@ OCPMOD reg=0xe094 mask=0xff00 set=0x0
 OCPMOD reg=0xe092 mask=0xff   set=0x4
 ```
 
+---
+
+> ## ⚠️ Historical investigation (SUPERSEDED — read the RESOLVED banner at the top first)
+>
+> Empirical findings #1–#3 and their "Phase-83 next step" blocks below were
+> written **while the ping was still blocked** and conclude that link/RX cannot
+> come up and that the PHY-MCU firmware patch is the gate. **Those conclusions
+> were later falsified**: the ping works over the physical RTL8125B *without*
+> firmware once `ChipCmd` is re-enabled after link-up and the TX doorbell is
+> issued at `0x90` (see the RESOLVED banner). The sections below are retained
+> as a record of the debugging path and remain a valid reference for
+> *enabling the firmware/EEE-tuning path* in Phase 83 — they are **not** the
+> current status of basic link/RX/ping.
+
+---
+
 ## Empirical finding (real RTL8125B, 2026-06): link is the blocker, and PHYAR is the *wrong* MDIO window
 
 Tested against the physical card under VFIO. After full m3OS bring-up
