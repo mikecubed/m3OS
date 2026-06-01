@@ -116,10 +116,20 @@ fn program_main(_args: &[&str]) -> i32 {
         }
     };
 
+    // On first boot the device-host registry may not yet have the BDF ready, so
+    // the claim can fail; init's `restart=on-failure` re-execs the driver and
+    // the next attempt succeeds. This is the same accepted early-boot pattern
+    // `nvme_driver` uses (both log a one-shot "exited with error 1" then come
+    // up on restart) — exiting and letting the supervisor restart recovers
+    // faster than an in-process retry, since the readiness window outlasts a
+    // bounded back-off.
     let device = match DeviceHandle::claim(key) {
         Ok(d) => d,
         Err(_) => {
-            syscall_lib::write_str(STDOUT_FILENO, "hda_driver: device claim failed\n");
+            syscall_lib::write_str(
+                STDOUT_FILENO,
+                "hda_driver: device claim failed (will retry)\n",
+            );
             return 1;
         }
     };
@@ -269,7 +279,19 @@ fn server_loop(
                     }
                 }
             },
-            Ok(AudioRequest::Drain { .. }) => AudioResponse::Ok,
+            Ok(AudioRequest::Drain { .. }) => {
+                // Re-poll SDnLPIB at drain time and return the *fresh* consumed
+                // count. The DMA advances continuously while the stream runs, so
+                // a submit-time poll can read 0 if the demo's submits all landed
+                // before the engine moved; draining happens after playback, so
+                // this captures the real consumed total for the stats path.
+                match stream.as_mut() {
+                    Some(s) => AudioResponse::Ack {
+                        frames_consumed: s.poll_consumed(&controller.mmio),
+                    },
+                    None => AudioResponse::Ok,
+                }
+            }
             Ok(AudioRequest::CloseStream { .. }) => {
                 if let Some(s) = stream.take() {
                     s.stop(&controller.mmio);

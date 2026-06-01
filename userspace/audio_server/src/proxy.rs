@@ -207,6 +207,14 @@ impl<T: ProxyTransport> AudioBackend for AudioProxyBackend<T> {
             stream_id: driver_id,
         })? {
             AudioResponse::Ok => Ok(()),
+            // A driver may piggyback a fresh device-side consumed count on the
+            // drain reply (drain runs after playback, so it captures progress a
+            // submit-time poll can miss). Absorb it so the post-drain stats path
+            // reports the real total.
+            AudioResponse::Ack { frames_consumed } => {
+                self.last_consumed = frames_consumed;
+                Ok(())
+            }
             AudioResponse::Err(e) => Err(map_driver_error(e)),
             _ => Err(AudioError::Internal),
         }

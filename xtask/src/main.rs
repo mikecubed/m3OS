@@ -9463,6 +9463,16 @@ fn hda_smoke_steps() -> Vec<SmokeStep> {
         input: "audio-demo\n",
         label: "guest/hda: launch audio-demo (mixes through hda_driver)",
     });
+    // C.3: the stream-completion (BCIS) interrupt must actually fire — the
+    // driver logs this once, during the demo's submits (well before PASS),
+    // after decoding INTSTS + clearing SDnSTS.BCIS via the host-tested path.
+    // Proves the INTCTL arm + audio-class INTx routing deliver a real IRQ
+    // (not just SDnLPIB polling).
+    steps.push(SmokeStep::Wait {
+        pattern: "hda_driver: stream IRQ (BCIS cleared)",
+        timeout_secs: 30,
+        label: "guest/hda: stream-completion (BCIS) interrupt delivered",
+    });
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: "AUDIO_DEMO:PASS",
         fail_prefix: "AUDIO_DEMO:FAIL stage=",
