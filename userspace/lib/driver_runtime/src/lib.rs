@@ -55,6 +55,7 @@
 
 extern crate alloc;
 
+pub mod audio_pcm;
 pub mod device;
 pub mod dma;
 pub mod ipc;
