@@ -201,6 +201,27 @@ gap is firmware-application *fidelity*: either the MAC-MCU patch-RAM writes
 (idx 1..125, via `mac_ocp_write(ocp_base + reg)`) land at the wrong addresses, or
 the arm/kick at idx 127..133 needs additional state the trace never captured.
 
+### Update: the gap is the PHY-MCU patch-request handshake (bit 6 vs bit 7)
+
+Deeper instrumentation localized the timeout exactly. The trailing loop is the
+vendor driver's `rtl8125_set_phy_mcu_patch_request`: it writes `0xB820` bit
+`0x10` (idx 128–130) and polls `0xB800` for bit `0x40` (idx 134–138, "patch RAM
+ready"). On the real card the driver now:
+
+* loads the MAC-MCU patch correctly — a scratch `0xF800` round-trip
+  (`0xa5a5`/`0x5a5a`) reads back exactly, proving the MAC-OCP write path;
+* starts the MAC before the firmware (Linux `rtl_hw_start` precedes `phy_start`);
+* acquires the PHY-MCU patch key before the blob
+  (`0xA436=0x8024; 0xA438=0x3701; 0xB82E=0x0001`).
+
+After the key, `0xB800` reads **`0x0080`** — bit **7** set, not the bit **6**
+(`0x40`) the blob's poll waits for. So the key *does* elicit a response from the
+PHY MCU, but **this rev-05 RTL8125B reports readiness on a different bit than the
+`rtl8125b-2.fw` blob expects** — a chip/firmware-variant mismatch. Candidate
+causes: (a) this silicon wants `rtl8125b-1.fw` (or another variant) rather than
+`-2`; (b) the patch key is a different value; (c) the request/ready bit semantics
+differ for this rev. All three are settled by the reference trace.
+
 ### Definitive next step (Phase 83)
 
 `bpftrace` the **exact register pokes** Linux performs during *this blob's* load —
