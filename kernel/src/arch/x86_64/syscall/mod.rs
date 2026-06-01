@@ -2661,6 +2661,13 @@ fn do_full_process_exit(pid: crate::process::Pid, code: i32) -> ! {
     // entry.
     crate::mm::shm::release_creator(pid);
 
+    // Phase 80 Track A.6: also drop this PID's SHM *mapper* references. A
+    // crashed audio driver (a mapper of `audio_server`'s PCM ring, not its
+    // creator) would otherwise leak its `incref` forever — the region's
+    // refcount never reaches zero and its frames are never reclaimed across
+    // driver restarts. See `release_shm_mappings_for_pid`.
+    release_shm_mappings_for_pid(pid);
+
     // Phase 69d follow-up: drop every flock entry this PID still holds
     // BEFORE closing fds.  close_all_fds_for() calls
     // `free_unix_socket` → `wake_unix_socket`, which wakes any flock
@@ -10736,6 +10743,37 @@ pub(super) fn sys_shm_map(shm_id_arg: u64) -> u64 {
     }
 
     virt_addr
+}
+
+/// Phase 80 Track A.6 — reclaim a dying process's SHM *mapper* references.
+///
+/// Process exit runs [`crate::mm::shm::release_creator`], which drops only
+/// the refs a process held *as the creator*. A process that mapped someone
+/// else's region (e.g. the audio `ac97`/`hda` driver mapping `audio_server`'s
+/// PCM ring) and then crashed without `sys_shm_unmap` would otherwise leave
+/// its `incref` outstanding forever — the registry refcount never reaches
+/// zero, so the region's frames are never returned to the buddy (a permanent
+/// leak across every driver restart). The page-table teardown already unmaps
+/// the VA range but deliberately does **not** free SHM-marked frames (they
+/// belong to the registry, not the process), so the decref must happen here.
+///
+/// Walks the dying pid's VMA tree for `SHM_VMA_FLAG_MARKER` entries, collects
+/// their ids under the mm lock, then decrefs each outside the lock (the final
+/// decref returns the frames to the buddy). Idempotent against a clean
+/// `sys_shm_unmap` exit, which already removed the VMA entry.
+pub(super) fn release_shm_mappings_for_pid(pid: u32) {
+    let ids: alloc::vec::Vec<crate::mm::shm::ShmId> =
+        crate::process::with_shared_mm_mut(pid, |_brk, _mmap_next, vma_tree| {
+            vma_tree
+                .iter()
+                .filter(|m| m.flags & SHM_VMA_FLAG_MARKER != 0)
+                .filter_map(|m| shm_id_from_vma_flags(m.flags))
+                .collect()
+        })
+        .unwrap_or_default();
+    for id in ids {
+        let _ = crate::mm::shm::decref(id);
+    }
 }
 
 pub(super) fn sys_shm_unmap(user_va: u64) -> u64 {

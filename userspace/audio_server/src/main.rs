@@ -31,13 +31,13 @@ use core::alloc::Layout;
 
 #[cfg(not(test))]
 use audio_server::{
-    BOOT_LOG_MARKER, SENTINEL_BUS, SENTINEL_DEVICE, SENTINEL_FUNCTION, SERVER_READY_SENTINEL,
-    SERVICE_NAME, client::ClientRegistry, device::Ac97Backend, irq, stream::StreamRegistry,
-    stub::stub_reply_for,
+    BOOT_LOG_MARKER, SERVER_READY_SENTINEL, SERVICE_NAME, client::ClientRegistry,
+    device::AudioBackend, irq, proxy::{AudioProxyBackend, SyscallProxyTransport},
+    stream::StreamRegistry, stub::stub_reply_for,
 };
 
 #[cfg(not(test))]
-use driver_runtime::{DeviceCapKey, DeviceHandle, ipc::EndpointCap};
+use driver_runtime::ipc::EndpointCap;
 #[cfg(not(test))]
 use syscall_lib::STDOUT_FILENO;
 #[cfg(not(test))]
@@ -68,15 +68,10 @@ syscall_lib::entry_point!(program_main);
 fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, BOOT_LOG_MARKER);
 
-    // Phase H.2: probe first, but do NOT exit on absence — the IPC
-    // endpoint is registered unconditionally below so that
-    // `session_manager`'s `await_ready("audio_server")` probe
-    // (which looks up "audio.cmd") succeeds even when no AC'97
-    // hardware is present in the machine.
-    let key = DeviceCapKey::new(0, SENTINEL_BUS, SENTINEL_DEVICE, SENTINEL_FUNCTION);
-    let device_opt = DeviceHandle::claim(key).ok();
-
-    // Register the command endpoint regardless of hardware presence.
+    // Phase 80: `audio_server` is a pure policy/mixer server — it owns no
+    // hardware. The command endpoint is registered unconditionally so
+    // `session_manager`'s `await_ready("audio_server")` probe (which looks up
+    // "audio.cmd") succeeds even when no audio *driver* is present.
     let ep = syscall_lib::create_endpoint();
     if ep == u64::MAX {
         syscall_lib::write_str(STDOUT_FILENO, "audio_server: endpoint create failed\n");
@@ -85,10 +80,7 @@ fn program_main(_args: &[&str]) -> i32 {
     let ep_u32 = match u32::try_from(ep) {
         Ok(id) => id,
         Err(_) => {
-            syscall_lib::write_str(
-                STDOUT_FILENO,
-                "audio_server: endpoint id out of u32 range\n",
-            );
+            syscall_lib::write_str(STDOUT_FILENO, "audio_server: endpoint id out of u32 range\n");
             return 6;
         }
     };
@@ -100,36 +92,19 @@ fn program_main(_args: &[&str]) -> i32 {
 
     let endpoint = EndpointCap::new(ep_u32);
 
-    // Branch on whether we have real hardware.
-    let device = match device_opt {
-        Some(d) => d,
+    // Discover the out-of-process audio driver ("audio.hw"). The driver
+    // (`ac97`/`hda`) is ordered to start first, but retry with a bounded
+    // back-off so a start-ordering hiccup falls through to a working
+    // connection rather than the silent stub.
+    let mut backend = match connect_driver_backend() {
+        Some(b) => b,
         None => {
-            // Track H.2: no AC'97 hardware detected. Register the
-            // stub loop so `session_manager` can proceed to the
-            // graphical session.  Log a single warning and enter the
-            // no-op IPC server.
             syscall_lib::write_str(
                 STDOUT_FILENO,
-                "audio_server: WARNING — no AC'97 device found; running in stub mode (silent)\n",
+                "audio_server: WARNING — no audio.hw driver found; running in stub mode (silent)\n",
             );
             syscall_lib::write_str(STDOUT_FILENO, SERVER_READY_SENTINEL);
             return run_stub_loop(endpoint);
-        }
-    };
-
-    let mut backend = match Ac97Backend::init(device) {
-        Ok(b) => b,
-        Err(_) => {
-            syscall_lib::write_str(STDOUT_FILENO, "audio_server: AC'97 init failed\n");
-            return 3;
-        }
-    };
-
-    let irq_notif = match irq::subscribe_and_bind(backend.device(), endpoint) {
-        Ok(n) => n,
-        Err(_) => {
-            syscall_lib::write_str(STDOUT_FILENO, "audio_server: IRQ bind failed\n");
-            return 7;
         }
     };
 
@@ -137,13 +112,32 @@ fn program_main(_args: &[&str]) -> i32 {
 
     let mut streams = StreamRegistry::new();
     let mut clients = ClientRegistry::new();
-    irq::run_io_loop(
-        &mut backend,
-        &mut streams,
-        &mut clients,
-        endpoint,
-        irq_notif,
-    )
+    irq::run_io_loop(&mut backend, &mut streams, &mut clients, endpoint)
+}
+
+/// Discover the `audio.hw` driver service and build an [`AudioProxyBackend`].
+///
+/// Retries with a bounded back-off (≈5 s total) so the driver's start
+/// ordering relative to `audio_server` does not force the silent stub path.
+/// Returns `None` only if no driver answered within the window.
+#[cfg(not(test))]
+fn connect_driver_backend() -> Option<AudioProxyBackend<SyscallProxyTransport>> {
+    const ATTEMPTS: u32 = 50;
+    const RETRY_NS: u32 = 100_000_000; // 100 ms
+    for _ in 0..ATTEMPTS {
+        if let Ok(transport) = SyscallProxyTransport::connect() {
+            let mut backend = AudioProxyBackend::new(transport);
+            // `init` does a QueryCaps round-trip — confirms the driver is live
+            // and speaks the protocol before we commit to it.
+            if backend.init().is_ok() {
+                return Some(backend);
+            }
+            // Driver registered but not answering yet — drop this attempt's
+            // resources (ring teardown via Drop) and retry.
+        }
+        let _ = syscall_lib::nanosleep_for(0, RETRY_NS);
+    }
+    None
 }
 
 /// Stub IPC loop — runs when no AC'97 hardware was found.

@@ -38,6 +38,7 @@ extern crate std;
 pub mod client;
 pub mod device;
 pub mod irq;
+pub mod proxy;
 pub mod stream;
 pub mod stub;
 
