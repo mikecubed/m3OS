@@ -116,6 +116,12 @@ impl CorbRirb {
         self.exchange(mmio, dword)
     }
 
+    /// Send a pre-encoded command dword (e.g. a Realtek verb sequence built in
+    /// `kernel_core::hda::realtek`) and return the response.
+    pub fn command_raw(&mut self, mmio: &Mmio<u8>, dword: u32) -> Option<u32> {
+        self.exchange(mmio, dword)
+    }
+
     fn exchange(&mut self, mmio: &Mmio<u8>, dword: u32) -> Option<u32> {
         self.send_dword(mmio, dword);
         match self.get_response(mmio) {

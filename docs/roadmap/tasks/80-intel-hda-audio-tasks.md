@@ -1,6 +1,6 @@
 # Phase 80 — Intel HDA Audio (+ Realtek codec family): Task List
 
-**Status:** Planned
+**Status:** Complete — 80a/80b/80c landed + CI-validated (`audio-smoke`/`bell-smoke`/`doom-audio-smoke`/`hda-smoke` green). The only open item is Track F's operator audible-output validation on the physical dev laptop (hardware-only; code + runbook + capture template landed).
 **Source Ref:** phase-80
 **Depends on:** Phase 55b (Ring-3 Driver Hosting) ✅, Phase 57 (Audio Stack) ✅, Phase 63 (Audio PCM Emission) ✅, Phase 63a (DOOM Audio Wiring) ✅, Phase 67 (IOMMU Substrate) ✅, Phase 74 (IPC Capability Grants) ✅
 **Goal:** Move audio from the legacy *in-process* model (`audio_server` owns the AC'97 hardware) to the mature *out-of-process* ring-3 driver model used by `e1000`/`nvme`/`xhci`, then add an Intel HDA controller + Realtek ALC codec driver behind that same seam. `audio_server` becomes a pure policy/mixer server; the AC'97 hardware is *extracted* into `userspace/drivers/ac97/` to de-risk the seam against a QEMU-testable device before HDA hardware is touched; the HDA driver lands as `userspace/drivers/hda/`. No kernel `RemoteAudio` facade is added — the consumer (`audio_server`) is already in userspace, so the driver↔server link is direct userspace IPC over a new `driver_ipc::audio` protocol. Bulk PCM crosses the boundary by per-submission page-grant (Phase 74), and the driver copies each submission into its own `sys_device_dma_alloc` IOMMU-domain buffer (true zero-copy is a deferred follow-up — see A.3). Closeout bumps the kernel to `0.80.0` and adds the learning doc.
@@ -13,9 +13,9 @@
 | 80b | B | HDA host controller: crate + PCI claim + `GCAP` + BAR0 + reset + STATESTS + CORB/RIRB sizing/reset/**RUN-enable** (IOVA) | A (protocol) | ✅ Complete |
 | 80b | C | HDA codec + stream engine: widget-graph enumeration + analog-codec selection + BDL/`SDnFMT` + `SDnCTL` SRST/RUN + per-path power-up/amp-unmute/pin/EAPD + interrupts | B | ✅ Complete |
 | 80b | D | HDA integration: driver-side `driver_ipc::audio` server + HDA-first probe + `hda-smoke` gate | C, A.4 | ✅ Complete |
-| 80c | E | Realtek ALC888/892/1220 amp-enable (EAPD/GPIO/COEF) + pin-default output selection + volume/mute | C.1, C.2 | Planned |
-| 80c | F | Real-hardware bring-up on the dev laptop (hardware-only) | E | Planned |
-| 80c | G | Release closeout: kernel `0.80.0` bump + learning doc + README/AGENTS gate | A–F landed | Planned |
+| 80c | E | Realtek ALC888/892/1220 amp-enable (EAPD/GPIO/COEF) + pin-default output selection + volume/mute | C.1, C.2 | ✅ Complete (host-tested + driver-integrated) |
+| 80c | F | Real-hardware bring-up on the dev laptop (hardware-only) | E | ⏳ Code + runbook landed; operator step pending dev laptop |
+| 80c | G | Release closeout: kernel `0.80.0` bump + learning doc + README/AGENTS gate | A–F landed | ✅ Complete |
 
 > **Ordering note.** **80a (Track A) lands first and alone** — it changes the audio architecture using the *known-good, QEMU-testable* AC'97 device, so a regression is caught by the existing `audio-smoke`/`bell-smoke`/`doom-audio-smoke` gates with zero new-hardware risk. **80b (Tracks B–D)** adds the HDA hardware against QEMU `-device intel-hda` and depends on A's protocol (the HDA driver implements the *driver side* of `driver_ipc::audio` that the extracted AC'97 driver proved out). **80c (Tracks E–G)** is Realtek-specific config, real-hardware validation, and release closeout. Each sub-phase is a separate PR. Host-testable logic (verb encoding, `SDnFMT` packing, pin-default decode, BDL math, ring-pointer math, protocol message codec) lives in `kernel-core` so it is exercised by `cargo xtask check` without QEMU — mirroring how Phase 79 put its `nic_ids`/`r8169` host tests in `kernel-core` (the `net_ring` engine lives in `userspace/lib/driver_runtime/`).
 
@@ -258,8 +258,8 @@
 **Why it matters:** Realtek speaker/headphone outputs sit behind an external amplifier that defaults OFF — a driver that does only the basic pin-enable is silent on real ALC892/ALC1220 boards even though everything else "works."
 
 **Acceptance:**
-- [ ] Host test asserts the exact verb dword sequence emitted by `realtek_amp_enable` for the EAPD path and the GPIO-EAPD fallback (`kernel_core::hda::realtek::tests::eapd_verb_sequence`, `gpio_eapd_sequence`).
-- [ ] The COEF hook is present and host-tested but defaults to a no-op (board-specific COEF tables are out of scope — documented in Documentation Notes).
+- [x] Host test asserts the exact verb dword sequence emitted by `realtek_amp_enable` for the EAPD path and the GPIO-EAPD fallback (`kernel_core::hda::realtek::tests::eapd_verb_sequence`, `gpio_eapd_sequence`).
+- [x] The COEF hook is present and host-tested but defaults to a no-op (board-specific COEF tables are out of scope — documented in Documentation Notes).
 
 ### E.2 — Pin-default real-output selection
 
@@ -268,7 +268,7 @@
 **Why it matters:** on a real laptop the driver must pick the internal speaker (or headphone when present) — the difference between "stream runs" and "you hear it on the right output."
 
 **Acceptance:**
-- [ ] Host test: given a synthetic Realtek pin set (internal speaker + rear line-out + front HP), the selector returns the internal speaker when nothing is plugged into HP, and HP when present (`kernel_core::hda::realtek::tests::output_selection`).
+- [x] Host test: given a synthetic Realtek pin set (internal speaker + rear line-out + front HP), the selector returns the internal speaker when nothing is plugged into HP, and HP when present (`kernel_core::hda::realtek::tests::output_selection`).
 
 ### E.3 — Volume / mute control via amp widgets
 
@@ -277,8 +277,8 @@
 **Why it matters:** a non-muted, audible gain on the selected path is required for sound; this is the user-facing volume control the mixer ultimately drives.
 
 **Acceptance:**
-- [ ] Host test: the emitted `SET_AMP_GAIN_MUTE` payload encoding for a given (channel, gain, mute) tuple is correct (`kernel_core::hda::realtek::tests::amp_gain_mute_payload`).
-- [ ] `SET_AMP_GAIN_MUTE` is issued on the path's output amp(s) with mute clear and a sane default gain.
+- [x] Host test: the emitted `SET_AMP_GAIN_MUTE` payload encoding for a given (channel, gain, mute) tuple is correct (`kernel_core::hda::realtek::tests::amp_gain_mute_payload`).
+- [x] `SET_AMP_GAIN_MUTE` is issued on the path's output amp(s) with mute clear and a sane default gain.
 
 ---
 
@@ -293,10 +293,12 @@
 **Symbol:** the dev laptop's AMD HDA controller `0x1022:0x15e3` + its Realtek codec; the full bring-up path (reset → STATESTS → analog-codec select → enumerate → path select → power/amp/EAPD → stream RUN)
 **Why it matters:** like the Phase 79 Realtek tracks, QEMU has only a generic codec — real Realtek amp-enable/pin-default/multi-codec behavior can only be proven on hardware (VFIO passthrough or bare metal).
 
+> **Hardware-only — operator step pending physical dev laptop.** All the *code* this track needs is landed and CI-validated against QEMU's generic codec: the driver claims an HDA controller by class (incl. AMD `0x1022:0x15e3`), selects the analog codec (`select_codec`), enumerates it, selects the internal-speaker path (`realtek_output_select`), powers/unmutes the path, and issues the Realtek EAPD/GPIO amp-enable (`realtek_amp_enable_verbs`). The operator runbook (`scripts/hda-vfio-validate.md`) and the capture template (`docs/research/hda-realtek-capture.md`) are landed. The remaining items below are **operator actions on the physical dev laptop** (VFIO passthrough + listening) that cannot run in QEMU/CI — an environmental limitation, not a skipped feature.
+
 **Acceptance:**
-- [ ] On the dev laptop, the `hda_driver` completes bring-up (claims `0x1022:0x15e3`, selects the analog Realtek codec among any present, enumerates it, selects the internal-speaker path, powers/unmutes the path, enables EAPD) — captured in `docs/research/hda-realtek-capture.md`.
-- [ ] `audio-smoke` produces operator-audible, non-silent output through the internal speaker (operator-validated, not a CI sentinel; behind `M3OS_HDA_REGRESSION`).
-- [ ] Any kernel/driver bug uncovered on real hardware (cf. Phase 79's ECAM/BAR/IRQ fixes) is committed + recorded in the capture doc.
+- [ ] *(Hardware-only, pending dev laptop.)* On the dev laptop, the `hda_driver` completes bring-up (claims `0x1022:0x15e3`, selects the analog Realtek codec, enumerates it, selects the internal-speaker path, powers/unmutes, enables EAPD) — captured in `docs/research/hda-realtek-capture.md`. *(Code + runbook + capture template landed; run `scripts/hda-vfio-validate.md`.)*
+- [ ] *(Hardware-only, pending dev laptop.)* `audio-smoke` produces operator-audible, non-silent output through the internal speaker (operator-validated, behind `M3OS_HDA_REGRESSION`).
+- [ ] *(Hardware-only, pending dev laptop.)* Any kernel/driver bug uncovered on real hardware is committed + recorded in the capture doc.
 
 ---
 
@@ -312,9 +314,9 @@
 **Why it matters:** the kernel version is the release marker for the phase; the AGENTS.md maintenance policy permits exactly this bump on phase landing.
 
 **Acceptance:**
-- [ ] Both files read `0.80.0`; `cargo xtask check` passes.
-- [ ] No live kernel-version string remains at `0.79.0` (`grep -rn '0\.79\.0'` returns only historical roadmap/changelog references).
-- [ ] The AGENTS.md Audio capability bullet is rewritten (not appended) to reflect out-of-process drivers + HDA.
+- [x] Both files read `0.80.0`; `cargo xtask check` passes.
+- [x] No live kernel-version string remains at `0.79.0` (`grep -rn '0\.79\.0'` returns only historical roadmap/changelog references).
+- [x] The AGENTS.md Audio capability bullet is rewritten (not appended) to reflect out-of-process drivers + HDA.
 
 ### G.2 — Author `docs/80-intel-hda-audio.md` learning doc + cross-link
 
@@ -326,8 +328,8 @@
 **Why it matters:** AGENTS.md mandates a learning doc per phase (Phase 79 shipped `docs/79-modern-nic.md`).
 
 **Acceptance:**
-- [ ] `docs/80-intel-hda-audio.md` exists and conforms to the design-doc template sections (the same criterion the design doc's Acceptance imposes).
-- [ ] It covers: mechanism/policy separation and why no kernel facade is needed; the `driver_ipc::audio` + per-submission page-grant transport (and the `sys_shm_*` alternative) + why the driver copies into its own IOMMU-domain DMA buffer; the HDA controller (CORB/RIRB sizing + **RUN-enable**, reset, widget graph, BDL, `SDnFMT`, `SDnCTL` SRST/RUN); the Realtek EAPD/GPIO/COEF amp-enable trap + per-path power/unmute; and the IOMMU IOVA-vs-physical-address difference from the Redox `ihdad` reference.
+- [x] `docs/80-intel-hda-audio.md` exists and conforms to the design-doc template sections (the same criterion the design doc's Acceptance imposes).
+- [x] It covers: mechanism/policy separation and why no kernel facade is needed; the `driver_ipc::audio` + per-submission page-grant transport (and the `sys_shm_*` alternative) + why the driver copies into its own IOMMU-domain DMA buffer; the HDA controller (CORB/RIRB sizing + **RUN-enable**, reset, widget graph, BDL, `SDnFMT`, `SDnCTL` SRST/RUN); the Realtek EAPD/GPIO/COEF amp-enable trap + per-path power/unmute; and the IOMMU IOVA-vs-physical-address difference from the Redox `ihdad` reference.
 
 ### G.3 — Roadmap README row + design-doc landing corrections + gate table
 
@@ -340,9 +342,9 @@
 **Why it matters:** the roadmap README is the canonical status index; the design doc's register offsets and host-symbol names must match the as-built reality.
 
 **Acceptance:**
-- [ ] On landing, README row 80 Status flips `Planned → Complete` (the Tasks cell already links `./tasks/80-intel-hda-audio-tasks.md` as of this planning PR).
-- [ ] The design doc's register offsets, verb IDs, and file/symbol references match the in-tree reality (verified, no drift, at landing).
-- [ ] AGENTS.md gate table lists `hda-smoke` under `M3OS_HDA_REGRESSION=1`.
+- [x] On landing, README row 80 Status flips `Planned → Complete` (the Tasks cell already links `./tasks/80-intel-hda-audio-tasks.md` as of this planning PR).
+- [x] The design doc's register offsets, verb IDs, and file/symbol references match the in-tree reality (verified, no drift, at landing).
+- [x] AGENTS.md gate table lists `hda-smoke` under `M3OS_HDA_REGRESSION=1`.
 
 ---
 

@@ -18,6 +18,7 @@
 pub mod fmt;
 pub mod ids;
 pub mod irq;
+pub mod realtek;
 pub mod regs;
 pub mod verb;
 pub mod widget;

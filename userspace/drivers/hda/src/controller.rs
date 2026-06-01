@@ -94,6 +94,12 @@ impl HdaController {
         self.command(codec, nid, hda::VERB_GET_PARAMETER, param as u8)
     }
 
+    /// Issue a pre-encoded command dword (Realtek verb sequences are built as
+    /// full command dwords in `kernel_core::hda::realtek`).
+    pub fn raw_command(&mut self, dword: u32) -> Option<u32> {
+        self.rings.command_raw(&self.mmio, dword)
+    }
+
     /// Arm controller interrupts (C.3): global interrupt enable + the output
     /// stream's per-stream interrupt-enable bit in `INTCTL`. The stream's
     /// `SDnCTL.IOCE` (set at configure) + the BDL IOC flags then fire a

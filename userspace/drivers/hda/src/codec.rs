@@ -10,7 +10,7 @@
 
 use crate::controller::HdaController;
 use alloc::vec::Vec;
-use kernel_core::hda::{self, widget};
+use kernel_core::hda::{self, realtek, widget};
 
 /// The configured output path the stream engine drives.
 pub struct OutputPath {
@@ -22,8 +22,16 @@ pub struct OutputPath {
 /// One enumerated codec's widget graph + the chosen output pin.
 struct CodecGraph {
     addr: u8,
+    /// Codec vendor id (`GET_PARAMETER VENDOR_ID >> 16`) — drives Realtek-
+    /// specific amp-enable + selection (Track E).
+    vendor: u16,
+    /// Audio Function Group NID (for AFG-level verbs: GPIO-EAPD, COEF).
+    afg: u8,
     nodes: Vec<widget::WidgetNode>,
+    /// The generically-preferred output pin (Speaker > HP > Line-Out).
     output_pin: Option<(u8, widget::PinDefault)>,
+    /// Every usable output pin (for Realtek jack-presence selection).
+    output_pins: Vec<(u8, widget::PinDefault)>,
 }
 
 /// Decode a `SUBORDINATE_NODE_COUNT` response into `(start_nid, count)`.
@@ -93,6 +101,12 @@ fn enumerate_codec(ctrl: &mut HdaController, codec: u8) -> Option<CodecGraph> {
     }
     let afg = afg?;
 
+    // Codec vendor id (`VENDOR_ID >> 16`) — gates the Realtek amp-enable path.
+    let vendor = (ctrl
+        .get_parameter(codec, 0, hda::PARAM_VENDOR_ID)
+        .unwrap_or(0)
+        >> 16) as u16;
+
     // Power the AFG up before touching its widgets.
     let _ = ctrl.command(
         codec,
@@ -108,6 +122,7 @@ fn enumerate_codec(ctrl: &mut HdaController, codec: u8) -> Option<CodecGraph> {
     let mut nodes = Vec::new();
     // Output-pin candidates, ranked by default-device preference.
     let mut best_pin: Option<(u8, widget::PinDefault, u8)> = None; // (nid, def, rank)
+    let mut output_pins: Vec<(u8, widget::PinDefault)> = Vec::new();
 
     for nid in w_start..w_start.saturating_add(w_count) {
         let caps = ctrl
@@ -122,6 +137,7 @@ fn enumerate_codec(ctrl: &mut HdaController, codec: u8) -> Option<CodecGraph> {
                 .unwrap_or(0);
             let def = widget::decode_pin_default(cfg);
             if widget::is_output_device(&def) && def.port_connectivity != widget::PORT_CONN_NONE {
+                output_pins.push((nid, def));
                 let rank = match def.default_device {
                     widget::DEFAULT_DEVICE_SPEAKER => 3,
                     widget::DEFAULT_DEVICE_HP_OUT => 2,
@@ -144,25 +160,19 @@ fn enumerate_codec(ctrl: &mut HdaController, codec: u8) -> Option<CodecGraph> {
     let output_pin = best_pin.map(|(nid, def, _)| (nid, def));
     Some(CodecGraph {
         addr: codec,
+        vendor,
+        afg,
         nodes,
         output_pin,
+        output_pins,
     })
 }
 
-/// SET_AMP_GAIN_MUTE payload: unmute + set gain on both channels.
-/// `set_output` chooses the output amp (vs. input amp). `index` selects which
-/// input amp on a mixer/selector.
+/// SET_AMP_GAIN_MUTE payload: unmute + set gain on both channels. Delegates to
+/// the host-tested encoder (`kernel_core::hda::realtek::amp_gain_mute_payload`,
+/// Track E.3) so the bit layout lives + is tested in exactly one place.
 fn amp_unmute_payload(set_output: bool, index: u8, gain: u8) -> u16 {
-    let mut p: u16 = (1 << 13) | (1 << 12); // set-left | set-right
-    if set_output {
-        p |= 1 << 15; // set-output amp
-    } else {
-        p |= 1 << 14; // set-input amp
-    }
-    p |= ((index & 0xF) as u16) << 8;
-    // bit7 = mute (cleared); bits[6:0] = gain.
-    p |= (gain & 0x7F) as u16;
-    p
+    realtek::amp_gain_mute_payload(set_output, true, true, index, false, gain)
 }
 
 /// Enumerate the selected codec and configure an output path for the given
@@ -191,10 +201,44 @@ pub fn configure_output(
         .find(|g| g.addr == chosen)
         .ok_or("chosen codec missing")?;
 
-    let (pin_nid, pin_def) = graph.output_pin.ok_or("no analog output pin")?;
+    let codec = graph.addr;
+
+    // Pin selection (Track E.2): for a Realtek codec, prefer the internal
+    // speaker, then a headphone pin **only when its jack is present**
+    // (`GET_PIN_SENSE` bit31), then line-out — via the host-tested
+    // `realtek_output_select`. Other codecs use the generic Speaker > HP >
+    // Line-Out ranking.
+    let (pin_nid, pin_def) = if realtek::is_realtek(graph.vendor) {
+        let mut pins = Vec::with_capacity(graph.output_pins.len());
+        for &(nid, def) in &graph.output_pins {
+            // Fixed/internal outputs (speaker) are always "present"; jack pins
+            // (HP) are gated on presence detect.
+            let jack_present = if def.default_device == widget::DEFAULT_DEVICE_HP_OUT {
+                ctrl.command(codec, nid, hda::VERB_GET_PIN_SENSE, 0)
+                    .map(|r| r & 0x8000_0000 != 0)
+                    .unwrap_or(false)
+            } else {
+                true
+            };
+            pins.push((nid, def, jack_present));
+        }
+        match realtek::realtek_output_select(&pins) {
+            Some(nid) => {
+                let def = graph
+                    .output_pins
+                    .iter()
+                    .find(|(n, _)| *n == nid)
+                    .map(|(_, d)| *d)
+                    .ok_or("realtek pin vanished")?;
+                (nid, def)
+            }
+            None => graph.output_pin.ok_or("no analog output pin")?,
+        }
+    } else {
+        graph.output_pin.ok_or("no analog output pin")?
+    };
     let path = widget::find_path_to_dac(&graph.nodes, pin_nid).ok_or("no pin→DAC path")?;
     let dac_nid = *path.last().ok_or("empty path")?;
-    let codec = graph.addr;
 
     // Configure every widget on the path: power D0, then amps unmuted.
     const GAIN: u8 = 0x7F;
@@ -240,6 +284,18 @@ pub fn configure_output(
     }
     let _ = ctrl.command(codec, pin_nid, hda::VERB_SET_PIN_WIDGET_CONTROL, pinctl);
     let _ = ctrl.command(codec, pin_nid, hda::VERB_SET_EAPD_BTLENABLE, 0x02); // EAPD (bit1)
+
+    // Track E.1: a real Realtek output sits behind an external amplifier that
+    // defaults OFF — `SET_EAPD_BTLENABLE` alone (above) is silent on ALC892/
+    // ALC1220 boards. Issue the full Realtek amp-enable sequence (EAPD verb +
+    // GPIO-driven-EAPD fallback) from the host-tested verb builder. No-op on
+    // QEMU's generic codec (vendor != Realtek), so `hda-smoke` is unaffected;
+    // exercised on real hardware (Track F).
+    if realtek::is_realtek(graph.vendor) {
+        for dword in realtek::realtek_amp_enable_verbs(codec, graph.afg, pin_nid) {
+            let _ = ctrl.raw_command(dword);
+        }
+    }
 
     Ok(OutputPath {
         codec,
