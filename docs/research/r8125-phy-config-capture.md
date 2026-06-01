@@ -169,6 +169,50 @@ encoders + `parse_rtl_fw`/`run_phy_action`, host-tested). The firmware blob
 itself is **not** vendored (linux-firmware licensing); staging it is the
 coordinator's E.2 responsibility, and `firmware_blob()` is the single seam.
 
+## Empirical finding #3 (real RTL8125B, 2026-06): firmware runs correctly but the MCU-patch-status poll times out
+
+The complete `rtl8125b_hw_phy_config` (firmware → `enable_gphy_10m` → paged
+modifies → the 3 direct-OCP `phy_param` writes at `0xB87C`/`0xB87E` → the 10
+paged `phy_param` writes in page `0xa43` → EEE/ALDPS → autoneg) is now
+implemented verbatim, and a real **interpreter bug was fixed**: the `BJMPN`
+back-jump was off by one (Linux's action loop is `for(index=0;…;index++)`, so the
+net target is `index - regno + 1`, not `index - regno`). After the fix the
+firmware executes its back-jump loops correctly (step count rose from ~240 to
+**694**). Link still does **not** come up after the firmware.
+
+Decoding `rtl8125b-2.fw`'s control flow explains why and pinpoints the gap:
+
+```
+idx   0  MDIO_CHG data=1     # switch to MAC-MCU register space
+idx 1..125 WRITE …           # stream the MCU patch into RAM at 0xfc20 + reg
+idx 126  MDIO_CHG data=0     # back to PHY register space
+idx 127..133 WRITE/DELAY     # arm/kick the patch
+idx 134  READ                # \
+idx 136  COMP_EQ regno=2 d=0x40   #  poll: exit when the status reg == 0x40
+idx 137  RC_EQ_SKIP d=0x64        #  timeout after count==100 reads
+idx 138  BJMPN regno=5 -> 134     # /  loop back
+```
+
+The trailing loop is the MCU **patch-acceptance handshake**: load the patch, then
+poll a status register until it reads `0x40` ("patch ran"), bailing after 100
+reads. The 694-step run is that loop **timing out** — the status never reaches
+`0x40`, i.e. the MCU never accepts/executes the streamed patch. So the remaining
+gap is firmware-application *fidelity*: either the MAC-MCU patch-RAM writes
+(idx 1..125, via `mac_ocp_write(ocp_base + reg)`) land at the wrong addresses, or
+the arm/kick at idx 127..133 needs additional state the trace never captured.
+
+### Definitive next step (Phase 83)
+
+`bpftrace` the **exact register pokes** Linux performs during *this blob's* load —
+`kprobe:__r8168_mac_ocp_write { printf("MACOCP %x %x\n", arg1, arg2) }` and
+`kprobe:__r8168_mac_ocp_read`, plus the GPHY-OCP `r8168g_mdio_write` — across a
+single `ip link set <if> up` (which triggers `rtl_fw_write_firmware`). Diff that
+authoritative `(addr, value)` stream against the driver's MAC-MCU writes
+(instrument `Nic::mac_ocp_write` to log the same) to find exactly where the patch
+RAM diverges. Everything upstream (link, registration, real-MAC binding, TX,
+polled RX, the OCP accessors, the interpreter, the complete PHY config) is
+implemented, committed, and host-tested; only this last fidelity diff remains.
+
 ## Notes / open questions
 
 * The OCP block is mostly MAC feature/power setup (EEE, ASPM, ALDPS, jumbo,
