@@ -19600,6 +19600,8 @@ mod tests {
             DeviceSet {
                 nvme: false,
                 e1000: false,
+                e1000e: false,
+                igb: false,
                 audio: false,
                 iommu: false,
                 kvm: true,
@@ -19657,6 +19659,8 @@ mod tests {
             DeviceSet {
                 nvme: false,
                 e1000: true,
+                e1000e: false,
+                igb: false,
                 audio: false,
                 iommu: false,
                 kvm: false,
@@ -19733,6 +19737,8 @@ mod tests {
             DeviceSet {
                 nvme: true,
                 e1000: false,
+                e1000e: false,
+                igb: false,
                 audio: false,
                 iommu: true,
                 kvm: false,
@@ -19776,6 +19782,8 @@ mod tests {
             DeviceSet {
                 nvme: true,
                 e1000: false,
+                e1000e: false,
+                igb: false,
                 audio: false,
                 iommu: true,
                 kvm: false,
@@ -19831,6 +19839,8 @@ mod tests {
             DeviceSet {
                 nvme: false,
                 e1000: false,
+                e1000e: false,
+                igb: false,
                 audio: false,
                 iommu: true,
                 kvm: false,
@@ -19891,6 +19901,8 @@ mod tests {
             DeviceSet {
                 nvme: false,
                 e1000: false,
+                e1000e: false,
+                igb: false,
                 audio: false,
                 iommu: true,
                 kvm: false,
@@ -19924,6 +19936,8 @@ mod tests {
             DeviceSet {
                 nvme: false,
                 e1000: false,
+                e1000e: false,
+                igb: false,
                 audio: false,
                 iommu: true,
                 kvm: false,
@@ -20149,6 +20163,8 @@ mod tests {
         let base = device_smoke_steps(DeviceSet {
             nvme: true,
             e1000: true,
+            e1000e: false,
+            igb: false,
             audio: false,
             iommu: false,
             kvm: false,
@@ -20158,6 +20174,8 @@ mod tests {
         let iommu = device_smoke_steps(DeviceSet {
             nvme: true,
             e1000: true,
+            e1000e: false,
+            igb: false,
             audio: false,
             iommu: true,
             kvm: false,
