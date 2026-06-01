@@ -31,9 +31,13 @@ use core::alloc::Layout;
 
 #[cfg(not(test))]
 use audio_server::{
-    BOOT_LOG_MARKER, SERVER_READY_SENTINEL, SERVICE_NAME, client::ClientRegistry,
-    device::AudioBackend, irq, proxy::{AudioProxyBackend, SyscallProxyTransport},
-    stream::StreamRegistry, stub::stub_reply_for,
+    BOOT_LOG_MARKER, SERVER_READY_SENTINEL, SERVICE_NAME,
+    client::ClientRegistry,
+    device::AudioBackend,
+    irq,
+    proxy::{AudioProxyBackend, SyscallProxyTransport},
+    stream::StreamRegistry,
+    stub::stub_reply_for,
 };
 
 #[cfg(not(test))]
@@ -80,7 +84,10 @@ fn program_main(_args: &[&str]) -> i32 {
     let ep_u32 = match u32::try_from(ep) {
         Ok(id) => id,
         Err(_) => {
-            syscall_lib::write_str(STDOUT_FILENO, "audio_server: endpoint id out of u32 range\n");
+            syscall_lib::write_str(
+                STDOUT_FILENO,
+                "audio_server: endpoint id out of u32 range\n",
+            );
             return 6;
         }
     };

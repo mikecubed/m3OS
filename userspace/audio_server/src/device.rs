@@ -9,7 +9,6 @@
 
 use kernel_core::audio::{AudioError, ChannelLayout, PcmFormat, SampleRate};
 
-
 // ---------------------------------------------------------------------------
 // IrqEvent — decoded outcome of a single audio IRQ wake
 // ---------------------------------------------------------------------------

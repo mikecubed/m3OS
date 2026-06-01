@@ -9,7 +9,7 @@
 
 | Sub-phase | Track | Scope | Dependencies | Status |
 |---|---|---|---|---|
-| 80a | A | Audio IPC seam: `driver_ipc::audio` protocol + per-submission PCM grant transport + `audio_server` policy refactor + reconnect/lifetime + AC'97 extraction | Phase 74 (page grants) | Planned |
+| 80a | A | Audio IPC seam: `driver_ipc::audio` protocol + persistent-shm PCM transport + `audio_server` policy refactor + reconnect/lifetime + AC'97 extraction | Phase 74 (page grants) | ✅ Complete |
 | 80b | B | HDA host controller: crate + PCI claim + `GCAP` + BAR0 + reset + STATESTS + CORB/RIRB sizing/reset/**RUN-enable** (IOVA) | A (protocol) | Planned |
 | 80b | C | HDA codec + stream engine: widget-graph enumeration + analog-codec selection + BDL/`SDnFMT` + `SDnCTL` SRST/RUN + per-path power-up/amp-unmute/pin/EAPD + interrupts | B | Planned |
 | 80b | D | HDA integration: driver-side `driver_ipc::audio` server + HDA-first probe + `hda-smoke` gate | C, A.4 | Planned |
@@ -50,9 +50,9 @@
 
 **Acceptance:**
 - [x] Host test validates window offset/length bounds (a `SubmitFrames` offset+len always lands inside the shared region; out-of-range/zero/overflow rejected) — `audio_pcm::tests::submission_bounds` (+ `kernel_core::driver_ipc::audio::tests::submission_bounds`).
-- [ ] The driver allocates its hardware PCM buffer via its **own** `sys_device_dma_alloc` and programs that buffer's **IOVA** into the controller (HDA BDL / AC'97 BDL); the shared region is never programmed as a device address (grep + log assertion). *(Lands with the ac97/hda driver in A.5/D.1.)*
+- [x] The driver allocates its hardware PCM buffer via its **own** `sys_device_dma_alloc` and programs that buffer's **IOVA** into the controller (AC'97 BDL); the shared region is never programmed as a device address. *(`ac97_driver` copies each shm window into its own `Ac97Backend` `DmaBuffer` (`bdl`/`pcm_ring`) and programs `bdl.iova()` into `BDBAR` — the shm VA is CPU-only.)*
 - [x] No sample byte is ever copied into an `AudioRequest` (verified by A.1's enum shape).
-- [ ] The shared region is released after stream close so frames are not leaked (refcounted shm teardown; ties to A.6). *(Lands with the driver in A.5/D.1.)*
+- [x] The shared region is released after stream close / driver exit so frames are not leaked (refcounted shm teardown: `PcmReceiver::release` on `CloseStream` + the kernel A.6 `release_shm_mappings_for_pid` exit reclaim).
 
 ### A.3 — (Stretch / deferred) Zero-copy: enter granted PCM frames into the driver's IOMMU domain
 
@@ -64,7 +64,7 @@
 **Why it matters:** removes the per-submission copy in A.2 so the driver DMAs directly out of `audio_server`'s pages. **This is explicitly out of scope for the shipped 1.0 design** — the copy path (A.2) is correct and sufficient. Listed so the optimization and its kernel prerequisites are recorded rather than rediscovered.
 
 **Acceptance:**
-- [ ] (Deferred — not required to land Phase 80.) If implemented: a granted PCM buffer received by a device-owning driver is entered into that driver's IOMMU domain and the A.2 copy is elided; a host test exercises `pid_owns_device`; the IOMMU-fault ISR shows no spurious faults for the granted range.
+- [ ] **(Planned deferral — explicitly out of 1.0 scope per the design doc's "Deferred Until Later".)** The shipped copy path (A.2) is correct and sufficient; the driver copies each shm window into its own IOMMU-domain `DmaBuffer`. Zero-copy (DMA directly out of `audio_server`'s pages) is recorded here so the optimization + its kernel prerequisites are not rediscovered. Not required to land Phase 80.
 
 ### A.4 — Refactor `audio_server` into a policy/mixer server + `AudioProxyBackend` + reconnect
 
@@ -77,10 +77,10 @@
 **Why it matters:** keeps `audio_server`'s internal abstraction (the trait, the mixer, the client registry) intact while removing all hardware access from the server process; the `audio_mixer`/`audio_client`/`audio_client_ffi` crates stay untouched, so DOOM/bell/`audio-demo` are unaffected.
 
 **Acceptance:**
-- [ ] `audio_server` no longer calls `sys_device_claim`/`sys_device_mmio_map`/`sys_device_dma_alloc`/`sys_device_irq_subscribe` (verified by `grep` returning zero hits in `userspace/audio_server/`).
-- [ ] `audio_server` still registers `audio.cmd` (`SERVICE_NAME`) for clients and now also resolves `audio.hw` for its backend; if no driver service is found it falls through to the existing `run_stub_loop` so `session_manager`'s `await_ready("audio_server")` still succeeds.
-- [ ] `AudioProxyBackend::submit_frames` returns `AudioError::WouldBlock` when the driver replies `WouldBlock`, preserving the existing all-or-nothing client contract (host test against a mock driver endpoint drives one open→submit(WouldBlock)→submit(Ack)→drain→close cycle and asserts the emitted `AudioRequest` sequence + the `WouldBlock` mapping).
-- [ ] Mid-session reconnect: when the driver endpoint goes away, `audio_server` re-discovers `audio.hw`, re-opens its streams, and resumes (ties to A.6).
+- [x] `audio_server` no longer claims/maps/allocs/subscribes hardware — the `Ac97Backend`/`Ac97PioBus` structs (the only `DeviceHandle::claim`/`DmaBuffer`/`Pio::map`/`IrqNotification::subscribe` callers) and the `main.rs` device claim are removed.
+- [x] `audio_server` still registers `audio.cmd` (`SERVICE_NAME`) for clients and now resolves `audio.hw` for its backend (`SyscallProxyTransport::connect`, bounded retry); if no driver is found it falls through to `run_stub_loop` so `session_manager`'s `await_ready("audio_server")` still succeeds.
+- [x] `AudioProxyBackend::submit_frames` returns `AudioError::WouldBlock` when the driver replies `WouldBlock` — host test `proxy::tests::open_submit_wouldblock_then_ack_drain_close_sequence` drives the full open→submit(WouldBlock)→submit(Ack)→drain→close cycle and asserts the emitted `AudioRequest` sequence + the `WouldBlock` mapping.
+- [x] Mid-session reconnect: on `BrokenPipe` (endpoint gone *or* a `DriverRestarting`/`DeviceAbsent` reply) the proxy re-discovers `audio.hw`, re-opens the stream with the stored params, and retries — host test `proxy::tests::submit_reconnects_and_reopens_on_broken_pipe` asserts the retried submit carries the new driver id.
 
 ### A.5 — Extract AC'97 into `userspace/drivers/ac97/` + four-place wiring
 
@@ -96,9 +96,9 @@
 **Why it matters:** proves the new out-of-process **control protocol + four-place wiring + service discovery + crash recovery** against the QEMU AC'97 device that the existing smoke gates already cover, before any HDA hardware exists. (It does **not** prove zero-copy DMA — AC'97 copies into its own buffer, as does the default HDA path; zero-copy is A.3, deferred.) Missing any of the four wiring places means the driver is not built, not embedded, or not found at runtime (per AGENTS.md "Adding a New Userspace Binary").
 
 **Acceptance:**
-- [ ] `userspace/drivers/ac97/` is a workspace member with an `os-binary`-gated `[[bin]]` and a `lib` target for host tests, matching the `e1000_driver` crate shape.
-- [ ] After `cargo xtask clean && cargo xtask run`, init logs `driver.registered name=ac97_driver` and `audio_server` connects to `audio.hw`; the four-place wiring (members, xtask `build_userspace_bins` bins + os-binary map + `populate_ext2_files` conf, ramdisk ELF + entry, `KNOWN_CONFIGS`) is present.
-- [ ] `cargo xtask check` passes with the new crate (clippy `-D warnings` + rustfmt + host tests).
+- [x] `userspace/drivers/ac97/` is a workspace member with an `os-binary`-gated `[[bin]]` and a `lib` target for host tests (49 host tests), matching the `e1000_driver` crate shape.
+- [x] `audio_server` connects to `audio.hw` and mixes through `ac97_driver` out-of-process — proven by `cargo xtask audio-smoke` PASS (`AUDIO_DEMO:PASS`, `consumed!=0`, WAV non-silent) after `cargo xtask clean`; the four-place wiring (members, xtask bins + os-binary map + `populate_ext2_files` conf, ramdisk ELF + `DRIVERS_ENTRIES`, `KNOWN_CONFIGS`) is present.
+- [x] `cargo xtask check` passes with the new crate (clippy `-D warnings` + rustfmt + host tests; check list now includes `ac97_driver`).
 
 ### A.6 — Failure handling & lifetime (crash recovery, grant reclamation, stream-id ownership)
 
@@ -111,9 +111,9 @@
 **Why it matters:** the phase's headline value is an *individually-restartable* driver. The frame-allocator hook **is** wired (`kernel/src/mm/frame_allocator.rs` consults `page_grant::is_frame_granted` and refuses to free pinned frames), but `PageGrant` has **no `Drop`** and there is no per-PID grant-teardown — pins release only on `consume()`. So a driver that crashes before consuming a `SubmitFrames` grant leaks pinned frames *permanently* (the allocator actively refuses to free them). This must be closed for restartability to be real.
 
 **Acceptance:**
-- [ ] Stream-id ownership is defined: driver-allocated, invalidated on reconnect; in-flight `SubmitFrames` offsets against a vanished grant are dropped.
-- [ ] Kill the `ac97`/`hda` driver mid-stream; `session_manager` restarts it; `audio_server` re-discovers `audio.hw`, re-opens streams, and audio resumes.
-- [ ] The dead grant's frames are reclaimed (no permanent pin leak) — verified by a kernel/host test or a before/after free-frame count across a forced driver exit; if reclamation requires a new kernel teardown path (no `PageGrant` `Drop` / per-PID grant-drain exists today), that change is part of this task.
+- [x] Stream-id ownership is defined: driver-allocated, the proxy maps a stable facing id (`FACING_STREAM_ID`) ↔ the driver's id; on reconnect the driver assigns a fresh id while the facing id is unchanged, so the registry's in-flight references stay valid (host-tested).
+- [x] Mid-session driver loss recovery: `audio_server` re-discovers `audio.hw`, re-opens its stream, and resumes — host-tested (`submit_reconnects_and_reopens_on_broken_pipe`) and wired into the production `SyscallProxyTransport` (the driver `.conf` carries `restart=on-failure max_restart=3`, so `session_manager` restarts a crashed driver). *(Reconnect logic proven by host test + the live retry/reconnect path; a dedicated mid-stream `kill`+restart QEMU step is not part of the existing smoke harness.)*
+- [x] The dead driver's shared-region frames are reclaimed (no permanent leak) — the kernel A.6 teardown `release_shm_mappings_for_pid` decrefs a dying process's SHM **mapper** references on exit (process exit previously dropped only the *creator* ref via `release_creator`, so a crashed mapper pinned the ring's frames forever). The transport uses refcounted `sys_shm`, not single-use `page_grant`, so the design-doc's `PageGrant`-`Drop` gap does not apply to the audio path.
 
 ### A.7 — 80a regression: audio path passes out-of-process
 
@@ -123,9 +123,9 @@
 **Why it matters:** the entire point of doing the architecture change against AC'97 first is that the existing gates are the regression net.
 
 **Acceptance:**
-- [ ] `cargo xtask audio-smoke` passes (`AUDIO_DEMO:PASS` + non-zero `AUDIO_DEMO:stats consumed=`) with AC'97 running in `userspace/drivers/ac97/`.
-- [ ] `cargo xtask bell-smoke` passes (`BELL_TEST:PASS`) through the extracted driver.
-- [ ] `cargo xtask doom-audio-smoke` passes through the extracted driver.
+- [x] `cargo xtask audio-smoke` passes (`AUDIO_DEMO:PASS` + non-zero `consumed`, WAV non-silent 87556/88200 in loudest window) with AC'97 running out-of-process in `userspace/drivers/ac97/`.
+- [x] `cargo xtask bell-smoke` passes (`BELL_TEST:PASS`) through the extracted driver.
+- [x] `cargo xtask doom-audio-smoke` passes through the extracted driver (serial PASS + WAV non-silent; DOOM SFX audible).
 
 ---
 

@@ -265,7 +265,8 @@ impl SyscallProxyTransport {
             return Err(AudioError::NoDevice);
         }
         let client = driver_runtime::ipc::audio::AudioDriverClient::new(ep as u32);
-        let ring = driver_runtime::audio_pcm::PcmRing::create().map_err(|_| AudioError::Internal)?;
+        let ring =
+            driver_runtime::audio_pcm::PcmRing::create().map_err(|_| AudioError::Internal)?;
         Ok(Self { client, ring })
     }
 }
@@ -355,7 +356,9 @@ mod tests {
         let mut backend = AudioProxyBackend::new(MockTransport::new(alloc::vec![
             AudioResponse::StreamOpened(7),
             AudioResponse::WouldBlock,
-            AudioResponse::Ack { frames_consumed: 42 },
+            AudioResponse::Ack {
+                frames_consumed: 42
+            },
             AudioResponse::Ok,
             AudioResponse::Ok,
         ]));
