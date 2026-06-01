@@ -105,6 +105,70 @@ Tested against the physical card under VFIO. After full m3OS bring-up
 5. Only after link-up does the V2-interrupt RX datapath become the next thing
    to verify.
 
+## Empirical finding #2 (real RTL8125B, 2026-06): bring-up + TX work; RX needs the MCU-patch protocol
+
+A second live VFIO session implemented all of items 1–5 above and pushed the
+datapath much further. What now works on the physical card (serial-confirmed):
+
+* **GPHY-OCP + MAC-OCP accessors** reach the PHY: `phy_id(ocp)=0x001cc840` (a
+  real Realtek PHY ID). Implemented in `r8169_hal::init` over the host-tested
+  `kernel_core::r8169` OCP command-word encoder; PHYAR is confirmed a no-op.
+* **Link up** via a GPHY-OCP `BMCR 0x9240` (no firmware) — the minimal path.
+* **Service registration**: the driver wins the single-holder `net.nic` race
+  (after making bring-up non-blocking so it registers before any emulated NIC).
+* **Kernel binding with the real MAC**: the driver reads `MAC0`
+  (`34:5a:60:16:77:c6`) and publishes `NET_LINK_STATE`, which bootstraps the
+  kernel `RemoteNic` registration — without this the kernel had
+  `00:00:00:00:00:00` and never routed TX out to the driver.
+* **TX to the wire**: the kernel pushes the ARP request (42 B) and the driver
+  transmits it (`first TX frame sent, len=42`).
+* **Polled RX datapath**: the V2 loop now non-blocking-polls the command
+  endpoint (`IpcBackend::try_recv` / `NetServer::try_handle_next`) and drains
+  the RX ring every iteration, so RX no longer depends on INTx delivery — which
+  is unreliable for a VFIO passthrough device.
+* **8125 RX/TX engine config**: `RxConfig` fetch-default + DMA-burst, `TxConfig`
+  burst/IFG, the **RXDV gate** clear (`MISC` bit 19), and the 26-entry MAC-OCP
+  block — none of which the classic 8169 bring-up does.
+
+What still blocks RX (and therefore `ping`):
+
+* **The PHY-MCU firmware does not relink the PHY.** The firmware loader runs the
+  full 200-instruction patch (`firmware applied, steps=0x…`, varying with the
+  reads it branches on) and demonstrably reaches the PHY — applying it flips the
+  link from **up** to **down** and the captured 13 PHY modifies + `BMCR 0x9240`
+  do not bring it back. The missing piece is the **8125 MCU-patch load
+  protocol**: the enable/disable bracketing around `rtl_fw_write_firmware` that
+  Linux performs via MAC-OCP writes which this capture never traced (the
+  `FW_BEGIN/FW_END` window showed no MDIO writes). Without that bracket the patch
+  is loaded into an MCU that is not in patch-accept state, so it misapplies and
+  the PHY cannot relink.
+* Because the firmware misapplies and link drops, RX never receives — the polled
+  RX path is correct but has nothing to drain. With **no** firmware the link is
+  up and TX works, but the 8125 RX engine stays inert (the documented "8125
+  requires the signed PHY blob"), so RX is dead either way until the firmware
+  applies *correctly*.
+
+### Precise remaining work (the firmware path is built; only this is missing)
+
+1. Transcribe the **8125 MCU-patch load wrapper** from Linux
+   (`rtl8125_hw_mac_mcu_config` / the `rtl_fw_write_firmware` call site for the
+   8125): the MAC-OCP register pokes that put the PHY MCU into patch-accept mode
+   before the blob and restore/commit it after. Wrap `Nic::apply_firmware` with
+   those.
+2. Re-verify on hardware that `PHYstatus` (`0x6C`) returns to link-up *after* the
+   firmware (it currently does not), then that `first RX frame(s) drained`
+   appears (the polled RX path is already in place), then `ping` reply.
+3. Possibly fold in any remaining `rtl_hw_start_8125` register writes beyond the
+   captured 26-entry OCP block (interrupt mitigation, descriptor mode) if RX is
+   still dry once link holds.
+
+Everything except step 1's MCU bracket is implemented and committed
+(`r8169_hal::init`: GPHY/MAC-OCP accessors, `apply_firmware`/`FwSink`,
+`phy_config_8125`, the 13-PM and 26-OCP tables; `kernel_core::r8169`: the OCP
+encoders + `parse_rtl_fw`/`run_phy_action`, host-tested). The firmware blob
+itself is **not** vendored (linux-firmware licensing); staging it is the
+coordinator's E.2 responsibility, and `firmware_blob()` is the single seam.
+
 ## Notes / open questions
 
 * The OCP block is mostly MAC feature/power setup (EEE, ASPM, ALDPS, jumbo,
