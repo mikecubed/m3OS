@@ -122,8 +122,16 @@ pub fn txconfig_8125() -> u32 {
     TX_DMA_BURST | TX_INTERFRAMEGAP
 }
 
-/// TxPoll: poll the Normal-Priority Queue for newly-owned TX descriptors.
+/// TxPoll (8168 and earlier): poll the Normal-Priority Queue for newly-owned
+/// TX descriptors. 8-bit register at `0x38`.
 pub const TX_POLL_NPQ: u8 = 0x40;
+/// TxPoll for 8125/8126: a *different* 16-bit doorbell register (`0x90`); write
+/// the queue-0 bit to kick transmission. Linux `rtl8169_doorbell` branches here
+/// for `rtl_is_8125` — using the classic `0x38` doorbell on an 8125 leaves
+/// posted TX descriptors un-transmitted.
+pub const REG_TX_POLL_8125: u32 = 0x90;
+/// 8125 TxPoll queue-0 doorbell bit.
+pub const TX_POLL_8125_Q0: u16 = 0x0001;
 
 /// Cfg9346 unlock / lock values bracketing config-register writes.
 pub const CFG9346_UNLOCK: u8 = 0xC0;

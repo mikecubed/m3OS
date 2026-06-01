@@ -107,6 +107,14 @@ pub fn run_io_loop_v2(
         speed_mbps: 0,
     });
 
+    // Re-assert ChipCmd RxEnb|TxEnb now that auto-negotiation has brought the
+    // link up: the 8125 drops these bits when asserted (in `enable()`) while the
+    // link is still down, leaving the RX/TX engines off. Re-enabling post-link
+    // is what actually starts the datapath.
+    if link_up {
+        nic.chipcmd_enable();
+    }
+
     let nic = core::cell::RefCell::new(nic);
 
     // Poll loop, not a block-on-IRQ loop. INTx delivery for a passed-through

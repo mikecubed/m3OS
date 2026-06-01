@@ -537,14 +537,10 @@ impl Nic {
     fn enable(&self) {
         // C+ command register: leave checksum/VLAN offload off at 1.0.
         self.mmio.write_reg::<u16>(off(hw::REG_CPLUS_CMD), 0x0000);
-        // ChipCmd: RxEnb | TxEnb.
-        self.mmio.write_reg::<u8>(
-            off(hw::REG_CHIP_CMD),
-            hw::CHIP_CMD_RX_ENB | hw::CHIP_CMD_TX_ENB,
-        );
-        // RxConfig/TxConfig: the 8125 RX/TX DMA engines need the fetch-default +
-        // DMA-burst fields programmed or they never move frames (link comes up
-        // but the rings stay idle). The classic 8169 only needs the accept bits.
+        // RxConfig/TxConfig FIRST: the 8125 RX/TX DMA engines need the
+        // fetch-default + DMA-burst fields programmed or they never move frames
+        // (link comes up but the rings stay idle). The classic 8169 only needs
+        // the accept bits.
         if self.version.is_8125() {
             // Ungate RXDV first: the 8125 drops every inbound frame before it
             // reaches the RX ring while RXDV_GATED_EN (MISC bit 19) is set. The
@@ -560,15 +556,50 @@ impl Nic {
             self.mmio
                 .write_reg::<u32>(off(hw::REG_RX_CONFIG), hw::RX_CONFIG_ACCEPT);
         }
+        // Clear NOW_IS_OOB before enabling the engines: the 8125 boots in
+        // out-of-band (management) mode after reset, and ChipCmd RxEnb/TxEnb will
+        // NOT latch while NOW_IS_OOB (MCU register 0xD3, bit 7) is set — the
+        // observed `chipcmd reads back 0x00` symptom.
+        if self.version.is_8125() {
+            let mcu = self.mmio.read_reg::<u8>(0xD3);
+            self.mmio.write_reg::<u8>(0xD3, mcu & !0x80);
+        }
+        // ChipCmd: RxEnb | TxEnb — written LAST, after RxConfig/TxConfig, exactly
+        // as Linux `rtl_hw_start` does. NOTE: the 8125 *drops* these bits if
+        // asserted while the link is down (as it is here, before autoneg), so
+        // the driver re-asserts ChipCmd via `chipcmd_enable()` once the link is
+        // up — that re-assert is what actually starts the RX/TX engines.
+        self.mmio.write_reg::<u8>(
+            off(hw::REG_CHIP_CMD),
+            hw::CHIP_CMD_RX_ENB | hw::CHIP_CMD_TX_ENB,
+        );
         // Unmask RX OK (bit0) + TX OK (bit2) on the classic 16-bit IMR.
         self.mmio.write_reg::<u16>(off(hw::REG_INTR_MASK), 0x0005);
     }
 
+    /// (Re-)assert ChipCmd RxEnb|TxEnb. The 8125 drops these bits if asserted
+    /// while the link is down, so the driver calls this once auto-negotiation has
+    /// brought the link up — this is what actually starts the RX/TX engines.
+    pub fn chipcmd_enable(&self) {
+        self.mmio.write_reg::<u8>(
+            off(hw::REG_CHIP_CMD),
+            hw::CHIP_CMD_RX_ENB | hw::CHIP_CMD_TX_ENB,
+        );
+    }
+
     /// Doorbell: tell the NIC to poll the TX ring for newly-owned descriptors.
+    /// The 8125/8126 use a *different* 16-bit doorbell register (`0x90`) than the
+    /// classic 8-bit `TxPoll` (`0x38`) — using the wrong one leaves posted TX
+    /// descriptors un-transmitted (Linux `rtl8169_doorbell`).
     #[inline]
     pub fn kick_tx(&self) {
-        self.mmio
-            .write_reg::<u8>(off(hw::REG_TX_POLL), hw::TX_POLL_NPQ);
+        if self.version.is_8125() {
+            self.mmio
+                .write_reg::<u16>(off(hw::REG_TX_POLL_8125), hw::TX_POLL_8125_Q0);
+        } else {
+            self.mmio
+                .write_reg::<u8>(off(hw::REG_TX_POLL), hw::TX_POLL_NPQ);
+        }
     }
 
     /// Read + write-1-clear the classic 16-bit interrupt status. Returns the
