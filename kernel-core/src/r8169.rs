@@ -661,6 +661,20 @@ impl FirmwareLoad {
 ///
 /// Crucially this *never* panics on absent/corrupt firmware, satisfying the
 /// Track D.1 "degraded-link warning sentinel, NOT panic" requirement.
+///
+/// ⚠️ **Format hazard (Phase 83 — before staging a real blob):** this path
+/// validates with [`validate_firmware_header`] (the simple
+/// `version[32] + fw_offset/fw_reg + raw __le32 payload` framing), but the
+/// actual loader [`parse_rtl_fw`] / [`run_phy_action`] expects the real Linux
+/// `rtl_nic` `fw_info` framing (`magic[4]` + `version[32]` + `fw_start@0x24` +
+/// `fw_len@0x28` + 8-bit `chksum@0x2c`). The two are **incompatible**: fed a
+/// real `rtl_nic/*.fw` blob, `resolve_firmware` reads the version/payload from
+/// the wrong offsets and can report `Loaded`/`Corrupt` inconsistently with what
+/// `parse_rtl_fw` actually accepts. This is currently latent because
+/// `firmware_blob()` is hardwired to `None` in the r8125 driver. Before E.2
+/// stages a blob, **unify the two** — make `resolve_firmware` validate via
+/// `parse_rtl_fw` (or delete this legacy header path) so there is a single
+/// source of truth for blob framing.
 pub fn resolve_firmware(version: MacVersion, blob: Option<&[u8]>) -> FirmwareLoad {
     if !version.requires_firmware() {
         return FirmwareLoad::NotRequired;
@@ -827,14 +841,16 @@ pub fn run_phy_action<S: PhyActionSink>(code: &[u8], sink: &mut S) -> u32 {
                 index += 1;
             }
             fw_op::BJMPN => {
-                // Jump back `regno` instructions. Linux runs the action loop as
-                // `for (index = 0; ...; index++)`, so a `BJMPN`'s `index -= regno`
-                // is *followed* by the loop's `index++`. The net next index is
-                // therefore `index - regno + 1`, not `index - regno`. Real
-                // firmware (authored against Linux) encodes `regno` expecting
-                // this off-by-one, so matching it exactly is required or every
-                // back-jump loop body shifts by one instruction.
-                index = (index + 1).saturating_sub(regno as usize);
+                // Jump back `regno` instructions. Linux's PHY-action loop is
+                // `for (index = 0; index < pa->size; )` with an EMPTY increment
+                // clause — every opcode advances `index` itself (READ/WRITE do
+                // `index += 1`; SKIPN does `index += regno + 1`), exactly as this
+                // `while` loop does (there is no trailing `index += 1` after the
+                // match). So Linux's `PHY_BJMPN: index -= regno` translates to a
+                // bare `index - regno` here, with no `+1`. `saturating_sub`
+                // clamps a malformed over-jump to 0; the step cap below still
+                // bounds any resulting loop.
+                index = index.saturating_sub(regno as usize);
             }
             fw_op::MDIO_CHG => {
                 sink.mdio_chg(data);
@@ -1323,10 +1339,10 @@ mod tests {
     #[test]
     fn run_phy_action_bounded_against_infinite_backjump() {
         // idx0: WRITE reg=0 val=1; idx1: BJMPN regno=1.
-        // Linux net target = idx - regno + 1 = 1 - 1 + 1 = 1 → the BJMPN jumps to
-        // *itself*, so the WRITE runs exactly once and then the back-jump spins
-        // in place until the step cap. (The old, off-by-one implementation jumped
-        // to idx0 and re-ran the WRITE every iteration — writes.len() ~= cap/2.)
+        // Linux semantics (`index -= regno`): at idx1 the back-jump targets
+        // idx1 - 1 = idx0, re-running the WRITE on every pass. The loop bounces
+        // idx0→idx1→idx0… forever, so it must terminate on the step backstop
+        // (not hang), and the WRITE runs many times (≈ cap/2 — two steps/pass).
         let code: Vec<u32> = vec![0x8000_0001, 0x3001_0000];
         let mut bytes = Vec::new();
         for w in &code {
@@ -1340,19 +1356,20 @@ mod tests {
         };
         let steps = run_phy_action(&bytes, &mut phy);
         assert_eq!(steps, PHY_ACTION_MAX_STEPS); // hit the backstop, did not hang
-        // The +1 back-jump semantics mean the WRITE executes exactly once.
-        assert_eq!(phy.writes, vec![(0x0, 0x1)]);
+        // The back-jump re-enters idx0 every pass, so the WRITE re-runs.
+        assert!(phy.writes.len() > 1);
+        assert!(phy.writes.iter().all(|&w| w == (0x0, 0x1)));
     }
 
     #[test]
-    fn run_phy_action_backjump_targets_index_minus_regno_plus_one() {
+    fn run_phy_action_backjump_targets_index_minus_regno() {
         // idx0: WRITE reg=0xa val=1
-        // idx1: COMP_NEQ_SKIPN regno=2 data=0  (predata starts 0 → 0==0, no skip)
+        // idx1: COMP_NEQ_SKIPN regno=2 data=0  (predata stays 0 → 0==0, no skip)
         // idx2: WRITE reg=0xb val=2
-        // idx3: BJMPN regno=3 → Linux target = 3 - 3 + 1 = 1 (idx1), NOT idx0.
-        // First pass writes (0xa,1) then (0xb,2). On re-entry at idx1 the WRITE at
-        // idx0 is NOT re-run (proving the target is idx1, not idx0); idx2's WRITE
-        // repeats until the cap. The OLD impl would target idx0 and re-run (0xa,1).
+        // idx3: BJMPN regno=3 → Linux target = 3 - 3 = 0 (idx0), with no `+1`.
+        // Each pass re-enters idx0, so BOTH writes repeat until the step cap —
+        // proving the bare `index - regno` target. (The off-by-one `+1` impl
+        // targeted idx1 and left (0xa,1) running exactly once.)
         let code: Vec<u32> = vec![0x800a_0001, 0xb002_0000, 0x800b_0002, 0x3003_0000];
         let mut bytes = Vec::new();
         for w in &code {
@@ -1365,8 +1382,8 @@ mod tests {
             delays: 0,
         };
         run_phy_action(&bytes, &mut phy);
-        // (0xa,1) appears exactly once (idx0 never re-entered); (0xb,2) repeats.
-        assert_eq!(phy.writes.iter().filter(|&&w| w == (0xa, 0x1)).count(), 1);
+        // idx0 is re-entered every back-jump, so (0xa,1) and (0xb,2) both repeat.
+        assert!(phy.writes.iter().filter(|&&w| w == (0xa, 0x1)).count() > 1);
         assert!(phy.writes.iter().filter(|&&w| w == (0xb, 0x2)).count() > 1);
     }
 
