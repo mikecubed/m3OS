@@ -1,6 +1,6 @@
 # Phase 80 - Intel HDA Audio (+ Realtek codec family)
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-80
 **Depends on:** Phase 55b (Ring-3 Driver Hosting) ✅, Phase 57 (Audio Stack) ✅, Phase 63 (Audio PCM Emission) ✅, Phase 63a (DOOM Audio Wiring) ✅, Phase 67 (IOMMU Substrate) ✅, Phase 74 (IPC Capability Grants) ✅
 **Builds on:** Promotes audio from the legacy *in-process* model — where `audio_server` itself claims the AC'97 PCI device and pokes hardware — to the mature **out-of-process ring-3 driver model** used by `e1000`/`nvme`/`xhci`. `audio_server` becomes a pure policy/mixer server; the hardware moves into isolated driver processes. The existing in-process `Ac97Backend` (Intel 82801AA `0x8086:0x2415`) is *extracted* onto the new seam, and the Intel HDA controller + Realtek ALC codec family — the audio silicon shipped on essentially every Intel and AMD board since ~2008 — is added as a second driver behind the same seam.
@@ -126,6 +126,7 @@ The BDL is a list of `(IOVA address, length, IOC_bit)` entries; the controller w
 ## Companion Task List
 
 - [Phase 80 Task List](./tasks/80-intel-hda-audio-tasks.md)
+- [Phase 80 Learning Doc](../80-intel-hda-audio.md)
 
 ## How Real OS Implementations Differ
 
