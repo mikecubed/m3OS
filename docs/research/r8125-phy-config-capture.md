@@ -72,6 +72,39 @@ OCPMOD reg=0xe094 mask=0xff00 set=0x0
 OCPMOD reg=0xe092 mask=0xff   set=0x4
 ```
 
+## Empirical finding (real RTL8125B, 2026-06): link is the blocker, and PHYAR is the *wrong* MDIO window
+
+Tested against the physical card under VFIO. After full m3OS bring-up
+(claim → BAR map → soft reset → ring program → RX/TX enable) plus a classic
+`PHYAR` (`0x60`) **BMCR autoneg-restart** (`0x9240`), the MAC's `PHYstatus`
+(`0x6C`) still reads **link-down**, and `ping` gets no reply. Two conclusions:
+
+1. **The blocker is link, not the datapath.** With no link there are no RX
+   frames to drain, so the V2-interrupt RX path can't be the *first* thing to
+   fix — the PHY must negotiate first.
+2. **The RTL8125 does not use the `PHYAR` MDIO window.** The 8168 reaches its
+   PHY through `PHYAR` (`0x60`); the 8125 reaches its PHY through a **GPHY-OCP**
+   window (the same MAC-OCP mechanism used for the `0xC000–0xFFFF` MAC regs,
+   addressed into the PHY/GPHY range). The autoneg-restart above was therefore a
+   no-op on the 8125 — it never reached the PHY. This is the concrete missing
+   mechanism for the port.
+
+### Remaining Phase-83 work to get a real `ping`
+
+1. Implement the **GPHY-OCP MDIO** accessor for the 8125 (transcribe
+   `r8168g_mdio_write` / `r8168g_mdio_read` from Linux `r8169_main.c` — they
+   encode the PHY register into an OCP address and poke `OCPDR`/`PHYOCP`). The
+   captured `PM page/reg` and `W reg` entries above are addressed *through this
+   window*, not raw `PHYAR`.
+2. Replay the ordered config (the 13 paged PHY modifies + 26 MAC-OCP modifies)
+   over that accessor.
+3. Apply `rtl8125b-2.fw` via `kernel_core::r8169::{parse_rtl_fw, run_phy_action}`
+   over the OCP `PhyActionSink`.
+4. Issue BMCR `0x9240` **over the OCP window**, wait ~2–5 s for autoneg, then
+   re-check `PHYstatus` (`0x6C`) for link-up before expecting `ping` to reply.
+5. Only after link-up does the V2-interrupt RX datapath become the next thing
+   to verify.
+
 ## Notes / open questions
 
 * The OCP block is mostly MAC feature/power setup (EEE, ASPM, ALDPS, jumbo,
@@ -81,6 +114,3 @@ OCPMOD reg=0xe092 mask=0xff   set=0x4
 * The firmware section (`FW_BEGIN`/`FW_END`) showed no traced MDIO writes — the
   MCU patch is applied via the MAC-OCP write path (untraced here); apply it from
   the blob via the interpreter.
-* After config, link-up + `ping` still depend on the V2-interrupt RX datapath
-  draining real frames — verify link state (`PHYstatus` reg `0x6C`) first to see
-  whether the blocker is link (this config) or datapath.

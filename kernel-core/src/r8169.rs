@@ -42,6 +42,23 @@ pub const REG_TX_CONFIG: u32 = 0x40;
 pub const REG_RX_CONFIG: u32 = 0x44;
 /// Cfg9346 (8-bit) EEPROM/config lock: write `CFG9346_UNLOCK` / `CFG9346_LOCK`.
 pub const REG_CFG9346: u32 = 0x50;
+/// PHYAR (32-bit) — MDIO access to the on-chip PHY (Linux `r8169_mdio_*`).
+/// Write: `PHYAR_FLAG | (reg << 16) | val`, poll until `PHYAR_FLAG` self-clears.
+/// Read: `(reg << 16)`, poll until `PHYAR_FLAG` sets, value in the low 16 bits.
+pub const REG_PHYAR: u32 = 0x60;
+/// PHYAR command/ready flag (bit 31): set on write, cleared by hw when done;
+/// set by hw on a read completion.
+pub const PHYAR_FLAG: u32 = 0x8000_0000;
+/// PHYstatus (8-bit @ 0x6C) — MAC's view of the link: `PHYSTATUS_LINK` (bit 1)
+/// plus per-speed bits. Read-only; a simple MMIO read (no MDIO).
+pub const REG_PHYSTATUS: u32 = 0x6C;
+/// PHYstatus link-up bit.
+pub const PHYSTATUS_LINK: u8 = 0x02;
+/// BMCR (PHY register 0) value to enable + restart auto-negotiation and keep
+/// the PHY powered up: ANE (0x1000) | RESTART_AN (0x0200) — `0x1200` plus the
+/// speed-select bits Linux leaves; the captured RTL8125B bring-up writes
+/// `0x9240` (reset-clear + ANE + restart-AN + duplex/speed defaults).
+pub const BMCR_AUTONEG_RESTART: u16 = 0x9240;
 /// CPlusCmd (16-bit) — enables the C+ descriptor mode.
 pub const REG_CPLUS_CMD: u32 = 0xE0;
 /// RxMaxSize (16-bit) — max accepted RX frame size.

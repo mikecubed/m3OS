@@ -89,7 +89,75 @@ impl Nic {
         };
         nic.program_rings();
         nic.enable();
+        // Bring the PHY up via the classic PHYAR MDIO path: restart
+        // auto-negotiation (BMCR = ANE | restart | power-up). This is correct
+        // for the r8169 GbE family (8168), which reaches its PHY through the
+        // PHYAR window at 0x60.
+        //
+        // NOTE (RTL8125): the 2.5G parts reach their PHY through a GPHY-OCP
+        // window, *not* PHYAR, so on the 8125 this write is a no-op and link
+        // negotiation does not start. Empirically confirmed on a real RTL8125B:
+        // after PHYAR autoneg-restart, `PHYstatus` (0x6C) still reads link-down.
+        // Bringing the 8125 PHY up requires porting the captured GPHY-OCP
+        // config + firmware sequence (Phase 83; see
+        // docs/research/r8125-phy-config-capture.md).
+        nic.phy_kick_autoneg();
+        // Settle briefly, then report the MAC's link view (read-only MMIO).
+        for _ in 0..2_000_000 {
+            core::hint::spin_loop();
+        }
+        if nic.phy_status() & hw::PHYSTATUS_LINK != 0 {
+            let _ = sys::write_str(sys::STDOUT_FILENO, "r8169: PHY link up\n");
+        } else {
+            let _ = sys::write_str(
+                sys::STDOUT_FILENO,
+                "r8169: PHY link down (autoneg settling, or 8125 needs OCP config)\n",
+            );
+        }
         Ok(nic)
+    }
+
+    /// Read the MAC's `PHYstatus` byte (`0x6C`) — a direct MMIO read of the
+    /// link state (no MDIO transaction needed).
+    pub fn phy_status(&self) -> u8 {
+        self.mmio.read_reg::<u8>(off(hw::REG_PHYSTATUS))
+    }
+
+    /// Write a PHY register `reg` via the `PHYAR` MDIO interface (bounded poll).
+    pub fn mdio_write(&self, reg: u32, val: u16) {
+        self.mmio.write_reg::<u32>(
+            off(hw::REG_PHYAR),
+            hw::PHYAR_FLAG | ((reg & 0x1f) << 16) | (val as u32),
+        );
+        for _ in 0..100 {
+            if self.mmio.read_reg::<u32>(off(hw::REG_PHYAR)) & hw::PHYAR_FLAG == 0 {
+                break;
+            }
+            for _ in 0..1000 {
+                core::hint::spin_loop();
+            }
+        }
+    }
+
+    /// Read a PHY register `reg` via the `PHYAR` MDIO interface (bounded poll).
+    pub fn mdio_read(&self, reg: u32) -> u16 {
+        self.mmio
+            .write_reg::<u32>(off(hw::REG_PHYAR), (reg & 0x1f) << 16);
+        for _ in 0..100 {
+            let v = self.mmio.read_reg::<u32>(off(hw::REG_PHYAR));
+            if v & hw::PHYAR_FLAG != 0 {
+                return (v & 0xffff) as u16;
+            }
+            for _ in 0..1000 {
+                core::hint::spin_loop();
+            }
+        }
+        0
+    }
+
+    /// Restart PHY auto-negotiation (BMCR = ANE | restart-AN, powered up).
+    pub fn phy_kick_autoneg(&self) {
+        self.mdio_write(0x00, hw::BMCR_AUTONEG_RESTART);
     }
 
     /// Issue ChipCmd.RST and poll the self-clearing bit within a bounded spin.
