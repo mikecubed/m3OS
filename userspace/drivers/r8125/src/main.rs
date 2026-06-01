@@ -92,7 +92,7 @@ fn program_main(_args: &[&str]) -> i32 {
     // The 8125 is a second-generation r8169 MAC: reuse the r8169 OWN-bit/TxPoll
     // ring + Cfg9346 reset bring-up to claim, map BAR, reset, detect XID, and
     // set up rings. The interrupt block differs (V2) and is armed in the V2 loop.
-    let nic = match Nic::bring_up(key) {
+    let nic = match Nic::bring_up(key, firmware_blob()) {
         Ok(nic) => nic,
         Err(r8169_hal::init::BringUpError::ResetTimeout) => {
             syscall_lib::write_str(STDOUT_FILENO, "r8125_driver: reset timeout\n");

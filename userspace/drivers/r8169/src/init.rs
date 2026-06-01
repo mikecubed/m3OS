@@ -48,6 +48,62 @@ pub struct Nic {
     pub tx: CplusRing,
 }
 
+/// Captured RTL8125B MAC-OCP configuration block: `(reg, mask, set)` applied as
+/// read-modify-writes in order. This is the `rtl_hw_start_8125` MAC register
+/// sequence, empirically traced from Linux's r8169 driver against this exact
+/// chip (see `docs/research/r8125-phy-config-capture.md`). It sets up the RX/TX
+/// FIFO thresholds, DMA, flow control, and feature gates the 8125 receive engine
+/// requires before it will DMA inbound frames into the ring.
+const MAC_OCP_CONFIG_8125: &[(u32, u16, u16)] = &[
+    (0xc0ac, 0x1f80, 0x000),
+    (0xe8de, 0x4000, 0x000),
+    (0xe092, 0x00ff, 0x000),
+    (0xd40a, 0x0010, 0x000),
+    (0xd3e2, 0x0fff, 0x3a9),
+    (0xd3e4, 0x00ff, 0x000),
+    (0xe860, 0x0000, 0x080),
+    (0xeb58, 0x0001, 0x000),
+    (0xe614, 0x0700, 0x200),
+    (0xe63e, 0x0c30, 0x000),
+    (0xc0b4, 0x0000, 0x00c),
+    (0xeb6a, 0x00ff, 0x033),
+    (0xeb50, 0x03e0, 0x040),
+    (0xe056, 0x00f0, 0x000),
+    (0xe040, 0x1000, 0x000),
+    (0xea1c, 0x0003, 0x001),
+    (0xe0c0, 0x4f0f, 0x4403),
+    (0xe052, 0x0080, 0x068),
+    (0xd430, 0x0fff, 0x47f),
+    (0xea1c, 0x0004, 0x000),
+    (0xeb54, 0x0000, 0x001),
+    (0xeb54, 0x0001, 0x000),
+    (0xe040, 0x0000, 0x003),
+    (0xc0ac, 0x0000, 0x1f80),
+    (0xe094, 0xff00, 0x000),
+    (0xe092, 0x00ff, 0x004),
+];
+
+/// Captured RTL8125B paged-PHY configuration: `(page, reg, mask, set)` applied
+/// as read-modify-writes over GPHY-OCP, after the PHY-MCU firmware. These are
+/// the PHY signal-path tuning modifies from `rtl8125b_hw_phy_config`; the PHY
+/// will not re-establish link after the firmware patch without them. Empirically
+/// traced (see `docs/research/r8125-phy-config-capture.md`).
+const PHY_CONFIG_8125: &[(u16, u32, u16, u16)] = &[
+    (0xa44, 0x11, 0x000, 0x800),
+    (0xac4, 0x13, 0x0f0, 0x090),
+    (0xad3, 0x10, 0x003, 0x001),
+    (0xbf0, 0x10, 0xe000, 0xa000),
+    (0xbf4, 0x13, 0xf00, 0x300),
+    (0xa4c, 0x15, 0x000, 0x040),
+    (0xbf8, 0x12, 0xe000, 0xa000),
+    (0xa5b, 0x12, 0x8000, 0x000),
+    (0xa43, 0x10, 0x004, 0x000),
+    (0xa6d, 0x12, 0x001, 0x000),
+    (0xa6d, 0x14, 0x010, 0x000),
+    (0xa42, 0x14, 0x080, 0x000),
+    (0xa4a, 0x11, 0x200, 0x000),
+];
+
 /// Convenience: a `u32` register offset into the `usize` the MMIO API wants.
 #[inline]
 fn off(reg: u32) -> usize {
@@ -73,7 +129,7 @@ impl Nic {
     /// Claim `key`, map the BAR, reset the MAC, detect the chip version, set up
     /// rings, and enable RX/TX. Whether firmware is required is decided by the
     /// caller from [`Nic::version`] via `kernel_core::r8169::resolve_firmware`.
-    pub fn bring_up(key: DeviceCapKey) -> Result<Self, BringUpError> {
+    pub fn bring_up(key: DeviceCapKey, fw: Option<&[u8]>) -> Result<Self, BringUpError> {
         let pci = DeviceHandle::claim(key)?;
         let mmio = Mmio::<R8169Regs>::map(&pci, R8169_BAR_INDEX, R8169_BAR_LEN)?;
 
@@ -102,24 +158,28 @@ impl Nic {
             rx,
             tx,
         };
+        // Order mirrors Linux for the 8125: configure the PHY (firmware + tuning
+        // + autoneg) FIRST, right after reset, then program the rings, then the
+        // MAC-OCP feature block, and only then start the datapath in `enable()`.
+        // Starting the MAC RX engine before the PHY firmware is applied leaves
+        // the freshly-patched PHY unable to relink.
         nic.program_rings();
-        nic.enable();
-        // Kick the PHY's auto-negotiation, then return *immediately* — do NOT
-        // block on link here. Auto-negotiation takes seconds; blocking bring-up
-        // on it would delay the driver's `net.nic` service registration and lose
-        // the first-come-first-served race to another NIC (e.g. an emulated
-        // e1000e). The link comes up asynchronously and is polled/logged in the
-        // I/O loop after the service is registered. The two NIC families reach
-        // their PHY differently:
-        //   * classic 8168 GbE → PHYAR window (0x60)
-        //   * 8125/8126 2.5G   → GPHY-OCP window (0xB8)
-        // Empirically confirmed on a real RTL8125B that a PHYAR autoneg-restart
-        // is a no-op (link stays down); the OCP path is required.
         if nic.version.is_8125() {
-            nic.phy_bring_up_ocp();
+            // Full PHY bring-up: BMCR stage → PHY-MCU firmware → PHY signal-path
+            // modifies → autoneg restart (GPHY-OCP; a PHYAR autoneg is a
+            // confirmed no-op on real silicon). Returns immediately — link comes
+            // up asynchronously and is polled in the I/O loop, so the `net.nic`
+            // service still registers fast.
+            nic.phy_config_8125(fw);
+            // MAC-OCP feature block (RX/TX FIFO, DMA, flow control, gates) the
+            // 8125 receive engine needs before it will DMA frames into the ring.
+            nic.apply_8125_mac_config();
         } else {
             nic.phy_kick_autoneg();
         }
+        // Start the datapath last: ChipCmd RxEnb|TxEnb, RxConfig (+ the 8125
+        // burst/fetch fields and RXDV ungate), and unmask the classic IMR.
+        nic.enable();
         Ok(nic)
     }
 
@@ -226,6 +286,12 @@ impl Nic {
         self.gphy_ocp_read(hw::phy_ocp_addr(base, reg))
     }
 
+    /// Read-modify-write a paged PHY register: `(read & !mask) | set`.
+    pub fn phy_ocp_modify(&self, page: u16, reg: u32, mask: u16, set: u16) {
+        let v = self.phy_ocp_read(page, reg);
+        self.phy_ocp_write(page, reg, (v & !mask) | set);
+    }
+
     /// Read the PHY identifier (PHYSID1<<16 | PHYSID2) over GPHY-OCP. A sane,
     /// non-`0x0000`/`0xFFFF` value confirms the OCP accessor reaches the PHY.
     pub fn phy_id_ocp(&self) -> u32 {
@@ -241,6 +307,98 @@ impl Nic {
         write_hex32("r8169: phy_id(ocp)=0x", id);
         // BMCR (standard-page reg 0): reset + ANE + restart-AN + power-up.
         self.phy_ocp_write(0, 0x00, hw::BMCR_AUTONEG_RESTART);
+    }
+
+    /// RTL8125 PHY bring-up over GPHY-OCP.
+    ///
+    /// Without a firmware blob (`fw == None` — the default until blob staging
+    /// lands) this is the proven minimal path: probe the PHY ID and issue a BMCR
+    /// autoneg-restart (`0x9240`), which on real silicon brings the link up.
+    ///
+    /// With a firmware blob it additionally runs the full
+    /// `rtl8125b_hw_phy_config` sequence — BMCR staging (`0x1840`→`0x1040`),
+    /// PHY-MCU firmware, the captured PHY signal-path modifies, then the autoneg
+    /// restart. NOTE: this experimental path is incomplete — the 8125 MCU-patch
+    /// load protocol (the enable/disable bracketing around the firmware that
+    /// Linux performs via untraced MAC-OCP writes) is not yet replicated, so the
+    /// patched PHY does not relink. See `docs/research/r8125-phy-config-capture.md`.
+    pub fn phy_config_8125(&self, fw: Option<&[u8]>) {
+        write_hex32("r8169: phy_id(ocp)=0x", self.phy_id_ocp());
+        let Some(blob) = fw else {
+            // Proven minimal bring-up: just restart auto-negotiation.
+            self.phy_ocp_write(0, 0x00, hw::BMCR_AUTONEG_RESTART);
+            return;
+        };
+        // --- experimental full firmware path ---
+        self.phy_ocp_write(0, 0x00, 0x1840);
+        self.phy_ocp_write(0, 0x00, 0x1040);
+        match hw::parse_rtl_fw(blob) {
+            Ok(img) => {
+                let steps = self.apply_firmware(img.code);
+                write_hex32("r8125: firmware applied, steps=0x", steps);
+            }
+            Err(_) => {
+                let _ = sys::write_str(
+                    sys::STDOUT_FILENO,
+                    "r8125: firmware parse failed — continuing untuned\n",
+                );
+            }
+        }
+        for &(page, reg, mask, set) in PHY_CONFIG_8125 {
+            self.phy_ocp_modify(page, reg, mask, set);
+        }
+        self.phy_ocp_write(0, 0x00, hw::BMCR_AUTONEG_RESTART);
+    }
+
+    // --- MAC-OCP access (OCPDR window 0xB0; no busy-poll) ---
+
+    /// MAC-OCP write to register `reg` (`0xC000..0xFFFF`). Same command-word
+    /// encoding as the GPHY-OCP window, issued on `OCPDR`; completes at once.
+    fn mac_ocp_write(&self, reg: u32, data: u16) {
+        self.mmio
+            .write_reg::<u32>(off(hw::REG_OCPDR), hw::gphy_ocp_write_cmd(reg, data));
+    }
+
+    /// MAC-OCP read: issue the read command, then read back the low 16 bits.
+    fn mac_ocp_read(&self, reg: u32) -> u16 {
+        self.mmio
+            .write_reg::<u32>(off(hw::REG_OCPDR), hw::gphy_ocp_read_cmd(reg));
+        (self.mmio.read_reg::<u32>(off(hw::REG_OCPDR)) & 0xFFFF) as u16
+    }
+
+    /// MAC-OCP read-modify-write: `(read & !mask) | set`.
+    fn mac_ocp_modify(&self, reg: u32, mask: u16, set: u16) {
+        let data = self.mac_ocp_read(reg);
+        self.mac_ocp_write(reg, (data & !mask) | set);
+    }
+
+    /// Apply the captured RTL8125B MAC-OCP configuration block (the
+    /// `rtl_hw_start_8125` register sequence). This programs the RX/TX FIFO,
+    /// DMA, flow-control and feature gates that the 8125 receive engine needs to
+    /// actually move frames into the ring — without it the card links up and
+    /// transmits but receives nothing. The sequence was empirically traced from
+    /// Linux's r8169 driver against this exact chip; see
+    /// `docs/research/r8125-phy-config-capture.md`.
+    pub fn apply_8125_mac_config(&self) {
+        for &(reg, mask, set) in MAC_OCP_CONFIG_8125 {
+            self.mac_ocp_modify(reg, mask, set);
+        }
+    }
+
+    /// Apply a parsed PHY-MCU firmware image (`code` = the `__le32` PHY-action
+    /// slice from [`kernel_core::r8169::parse_rtl_fw`]). The 8125 requires this
+    /// signed PHY blob — without the MCU patch the PHY completes auto-negotiation
+    /// but its receive path stays non-functional. The interpreter
+    /// ([`kernel_core::r8169::run_phy_action`]) drives a sink that routes each
+    /// write to either the paged GPHY-OCP window (PHY mode) or the paged MAC-OCP
+    /// window (MAC-MCU mode), exactly as Linux `mac_mcu_write`/`r8168g_mdio_write`.
+    pub fn apply_firmware(&self, code: &[u8]) -> u32 {
+        let mut sink = FwSink {
+            nic: self,
+            mac_mcu_mode: false,
+            ocp_base: hw::OCP_STD_PHY_BASE,
+        };
+        hw::run_phy_action(code, &mut sink)
     }
 
     /// Poll `PHYstatus` (0x6C) for link-up, up to roughly `max_ms` milliseconds.
@@ -361,5 +519,76 @@ impl Nic {
                 "r8169: WARNING unknown MAC version (XID unmatched)\n",
             ),
         };
+    }
+}
+
+/// Firmware PHY-action sink: routes each interpreter read/write to the paged
+/// GPHY-OCP window (PHY mode) or the paged MAC-OCP window (MAC-MCU mode),
+/// replicating Linux's `r8168g_mdio_write` and `mac_mcu_write` address paging.
+/// `PHY_MDIO_CHG` toggles the mode; register `0x1f` selects the OCP page/base.
+struct FwSink<'a> {
+    nic: &'a Nic,
+    mac_mcu_mode: bool,
+    ocp_base: u32,
+}
+
+impl hw::PhyActionSink for FwSink<'_> {
+    fn read(&mut self, reg: u16) -> u16 {
+        if reg == 0x1f {
+            return if !self.mac_mcu_mode && self.ocp_base == hw::OCP_STD_PHY_BASE {
+                0
+            } else {
+                (self.ocp_base >> 4) as u16
+            };
+        }
+        if self.mac_mcu_mode {
+            // mac_mcu_read: r8168_mac_ocp_read(ocp_base + reg).
+            self.nic.mac_ocp_read(self.ocp_base + reg as u32)
+        } else {
+            // r8168g_mdio_read: (ocp_base + (reg - 0x10 if non-std page) * 2).
+            let mut r = reg as u32;
+            if self.ocp_base != hw::OCP_STD_PHY_BASE {
+                r -= 0x10;
+            }
+            self.nic.gphy_ocp_read(self.ocp_base + r * 2)
+        }
+    }
+
+    fn write(&mut self, reg: u16, val: u16) {
+        if reg == 0x1f {
+            // Page select. MAC-MCU: base = val<<4. PHY: val<<4, or the standard
+            // base for page 0 (Linux `r8168g_mdio_write`).
+            self.ocp_base = if !self.mac_mcu_mode && val == 0 {
+                hw::OCP_STD_PHY_BASE
+            } else {
+                (val as u32) << 4
+            };
+            return;
+        }
+        if self.mac_mcu_mode {
+            // mac_mcu_write: r8168_mac_ocp_write(ocp_base + reg, val) — plain add.
+            self.nic.mac_ocp_write(self.ocp_base + reg as u32, val);
+        } else {
+            // r8168g_mdio_write: phy_ocp_write(ocp_base + (reg-0x10 if non-std)*2).
+            let mut r = reg as u32;
+            if self.ocp_base != hw::OCP_STD_PHY_BASE {
+                r -= 0x10;
+            }
+            self.nic.gphy_ocp_write(self.ocp_base + r * 2, val);
+        }
+    }
+
+    fn mdio_chg(&mut self, target: u16) {
+        // Non-zero target selects the MAC-MCU register space; zero selects PHY.
+        self.mac_mcu_mode = target != 0;
+    }
+
+    fn delay_ms(&mut self, ms: u16) {
+        // Rough busy-wait (~ms milliseconds); firmware delays are short.
+        for _ in 0..ms {
+            for _ in 0..200_000 {
+                core::hint::spin_loop();
+            }
+        }
     }
 }

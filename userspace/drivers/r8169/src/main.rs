@@ -67,7 +67,8 @@ fn program_main(_args: &[&str]) -> i32 {
     };
 
     // Claim + map BAR + reset + detect XID version + set up rings + enable.
-    let nic = match Nic::bring_up(key) {
+    // The classic 8168 GbE parts need no PHY-MCU firmware blob.
+    let nic = match Nic::bring_up(key, None) {
         Ok(nic) => nic,
         Err(r8169_hal::init::BringUpError::ResetTimeout) => {
             syscall_lib::write_str(STDOUT_FILENO, "r8169_driver: reset timeout\n");

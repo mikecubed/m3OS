@@ -176,6 +176,12 @@ pub const INT_CFG0_ENABLE: u8 = 0x08;
 
 /// GPHY-OCP window register (32-bit) used by 8168g+/8125 PHY access.
 pub const REG_GPHY_OCP: u32 = 0xB8;
+/// MAC-OCP data register (`OCPDR`, 32-bit). MAC-OCP registers (`0xC000`..
+/// `0xFFFF` — RX/TX FIFO, DMA, power, feature gates) are reached through this
+/// window. The command-word encoding is identical to the GPHY-OCP window
+/// ([`gphy_ocp_write_cmd`]/[`gphy_ocp_read_cmd`]); only the register offset
+/// differs and MAC-OCP needs no busy-poll (the access completes immediately).
+pub const REG_OCPDR: u32 = 0xB0;
 /// GPHY-OCP busy/command flag (bit 31).
 pub const GPHY_OCP_FLAG: u32 = 0x8000_0000;
 /// Standard PHY OCP base (MDIO page 0).
