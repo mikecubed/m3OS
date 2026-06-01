@@ -83,25 +83,21 @@ const MAC_OCP_CONFIG_8125: &[(u32, u16, u16)] = &[
     (0xe092, 0x00ff, 0x004),
 ];
 
-/// Captured RTL8125B paged-PHY configuration: `(page, reg, mask, set)` applied
-/// as read-modify-writes over GPHY-OCP, after the PHY-MCU firmware. These are
-/// the PHY signal-path tuning modifies from `rtl8125b_hw_phy_config`; the PHY
-/// will not re-establish link after the firmware patch without them. Empirically
-/// traced (see `docs/research/r8125-phy-config-capture.md`).
-const PHY_CONFIG_8125: &[(u16, u32, u16, u16)] = &[
-    (0xa44, 0x11, 0x000, 0x800),
-    (0xac4, 0x13, 0x0f0, 0x090),
-    (0xad3, 0x10, 0x003, 0x001),
-    (0xbf0, 0x10, 0xe000, 0xa000),
-    (0xbf4, 0x13, 0xf00, 0x300),
-    (0xa4c, 0x15, 0x000, 0x040),
-    (0xbf8, 0x12, 0xe000, 0xa000),
-    (0xa5b, 0x12, 0x8000, 0x000),
-    (0xa43, 0x10, 0x004, 0x000),
-    (0xa6d, 0x12, 0x001, 0x000),
-    (0xa6d, 0x14, 0x010, 0x000),
-    (0xa42, 0x14, 0x080, 0x000),
-    (0xa4a, 0x11, 0x200, 0x000),
+/// RTL8125B PHY "parameter" writes via the direct PHY-OCP parameter register
+/// pair (`rtl8125_phy_param`): `(parm, mask, val)`. Linux issues these as
+/// MMD-VEND2 writes to `0xB87C` (selector) + `0xB87E` (data), which on the 8125
+/// resolve to direct OCP register access.
+const RTL8125_PHY_PARAMS: &[(u16, u16, u16)] = &[
+    (0x80f5, 0xffff, 0x760e),
+    (0x8107, 0xffff, 0x360e),
+    (0x8551, 0xff00, 0x0800),
+];
+
+/// RTL8125B per-channel PHY "parameter" writes via the paged accessor
+/// (`r8168g_phy_param`, page `0xa43`): each writes `parm` to reg `0x13` then
+/// `(mask,val)`-modifies reg `0x14`. All ten use the same `(mask,val)`.
+const R8168G_PHY_PARAM_SELECTORS: &[u16] = &[
+    0x8044, 0x804a, 0x8050, 0x8056, 0x805c, 0x8062, 0x8068, 0x806e, 0x8074, 0x807a,
 ];
 
 /// Convenience: a `u32` register offset into the `usize` the MMIO API wants.
@@ -292,6 +288,27 @@ impl Nic {
         self.phy_ocp_write(page, reg, (v & !mask) | set);
     }
 
+    /// Read-modify-write a raw PHY-OCP byte address: `(read & !mask) | set`.
+    fn gphy_ocp_modify(&self, addr: u32, mask: u16, set: u16) {
+        let v = self.gphy_ocp_read(addr);
+        self.gphy_ocp_write(addr, (v & !mask) | set);
+    }
+
+    /// `rtl8125_phy_param`: select `parm` into the PHY parameter register
+    /// (`0xB87C`), then `(mask,val)`-modify the parameter data register
+    /// (`0xB87E`) — direct PHY-OCP access (Linux issues these as MMD-VEND2).
+    fn rtl8125_phy_param(&self, parm: u16, mask: u16, val: u16) {
+        self.gphy_ocp_write(0xB87C, parm);
+        self.gphy_ocp_modify(0xB87E, mask, val);
+    }
+
+    /// `r8168g_phy_param`: in page `0xa43`, write `parm` to reg `0x13`, then
+    /// `(mask,val)`-modify reg `0x14`.
+    fn r8168g_phy_param(&self, parm: u16, mask: u16, val: u16) {
+        self.phy_ocp_write(0xa43, 0x13, parm);
+        self.phy_ocp_modify(0xa43, 0x14, mask, val);
+    }
+
     /// Read the PHY identifier (PHYSID1<<16 | PHYSID2) over GPHY-OCP. A sane,
     /// non-`0x0000`/`0xFFFF` value confirms the OCP accessor reaches the PHY.
     pub fn phy_id_ocp(&self) -> u32 {
@@ -329,9 +346,9 @@ impl Nic {
             self.phy_ocp_write(0, 0x00, hw::BMCR_AUTONEG_RESTART);
             return;
         };
-        // --- experimental full firmware path ---
-        self.phy_ocp_write(0, 0x00, 0x1840);
-        self.phy_ocp_write(0, 0x00, 0x1040);
+        // Full `rtl8125b_hw_phy_config`, in Linux order. Firmware FIRST, then the
+        // PHY register sequence the patch sits on top of; phylib kicks autoneg
+        // afterwards (we issue the BMCR restart at the end).
         match hw::parse_rtl_fw(blob) {
             Ok(img) => {
                 let steps = self.apply_firmware(img.code);
@@ -344,9 +361,30 @@ impl Nic {
                 );
             }
         }
-        for &(page, reg, mask, set) in PHY_CONFIG_8125 {
-            self.phy_ocp_modify(page, reg, mask, set);
+        // rtl8168g_enable_gphy_10m.
+        self.phy_ocp_modify(0xa44, 0x11, 0x0000, 0x0800);
+        self.phy_ocp_modify(0xac4, 0x13, 0x00f0, 0x0090);
+        self.phy_ocp_modify(0xad3, 0x10, 0x0003, 0x0001);
+        for &(parm, mask, val) in RTL8125_PHY_PARAMS {
+            self.rtl8125_phy_param(parm, mask, val);
         }
+        self.phy_ocp_modify(0xbf0, 0x10, 0xe000, 0xa000);
+        self.phy_ocp_modify(0xbf4, 0x13, 0x0f00, 0x0300);
+        for &parm in R8168G_PHY_PARAM_SELECTORS {
+            self.r8168g_phy_param(parm, 0xffff, 0x2417);
+        }
+        self.phy_ocp_modify(0xa4c, 0x15, 0x0000, 0x0040);
+        self.phy_ocp_modify(0xbf8, 0x12, 0xe000, 0xa000);
+        // rtl8125_legacy_force_mode.
+        self.phy_ocp_modify(0xa5b, 0x12, 0x8000, 0x0000);
+        // rtl8168g_disable_aldps.
+        self.phy_ocp_modify(0xa43, 0x10, 0x0004, 0x0000);
+        // rtl8125_config_eee_phy (rtl8168g + 8125 common).
+        self.phy_ocp_modify(0xa43, 0x11, 0x0000, 0x0010);
+        self.phy_ocp_modify(0xa6d, 0x14, 0x0010, 0x0000);
+        self.phy_ocp_modify(0xa42, 0x14, 0x0080, 0x0000);
+        self.phy_ocp_modify(0xa4a, 0x11, 0x0200, 0x0000);
+        // Enable + restart auto-negotiation, power up.
         self.phy_ocp_write(0, 0x00, hw::BMCR_AUTONEG_RESTART);
     }
 

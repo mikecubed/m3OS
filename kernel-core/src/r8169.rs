@@ -819,8 +819,14 @@ pub fn run_phy_action<S: PhyActionSink>(code: &[u8], sink: &mut S) -> u32 {
                 index += 1;
             }
             fw_op::BJMPN => {
-                // Jump back `regno` instructions.
-                index = index.saturating_sub(regno as usize);
+                // Jump back `regno` instructions. Linux runs the action loop as
+                // `for (index = 0; ...; index++)`, so a `BJMPN`'s `index -= regno`
+                // is *followed* by the loop's `index++`. The net next index is
+                // therefore `index - regno + 1`, not `index - regno`. Real
+                // firmware (authored against Linux) encodes `regno` expecting
+                // this off-by-one, so matching it exactly is required or every
+                // back-jump loop body shifts by one instruction.
+                index = (index + 1).saturating_sub(regno as usize);
             }
             fw_op::MDIO_CHG => {
                 sink.mdio_chg(data);
@@ -1308,7 +1314,11 @@ mod tests {
 
     #[test]
     fn run_phy_action_bounded_against_infinite_backjump() {
-        // WRITE; BJMPN regno=1 (jump back 1 -> infinite). Must terminate via cap.
+        // idx0: WRITE reg=0 val=1; idx1: BJMPN regno=1.
+        // Linux net target = idx - regno + 1 = 1 - 1 + 1 = 1 → the BJMPN jumps to
+        // *itself*, so the WRITE runs exactly once and then the back-jump spins
+        // in place until the step cap. (The old, off-by-one implementation jumped
+        // to idx0 and re-ran the WRITE every iteration — writes.len() ~= cap/2.)
         let code: Vec<u32> = vec![0x8000_0001, 0x3001_0000];
         let mut bytes = Vec::new();
         for w in &code {
@@ -1322,6 +1332,34 @@ mod tests {
         };
         let steps = run_phy_action(&bytes, &mut phy);
         assert_eq!(steps, PHY_ACTION_MAX_STEPS); // hit the backstop, did not hang
+        // The +1 back-jump semantics mean the WRITE executes exactly once.
+        assert_eq!(phy.writes, vec![(0x0, 0x1)]);
+    }
+
+    #[test]
+    fn run_phy_action_backjump_targets_index_minus_regno_plus_one() {
+        // idx0: WRITE reg=0xa val=1
+        // idx1: COMP_NEQ_SKIPN regno=2 data=0  (predata starts 0 → 0==0, no skip)
+        // idx2: WRITE reg=0xb val=2
+        // idx3: BJMPN regno=3 → Linux target = 3 - 3 + 1 = 1 (idx1), NOT idx0.
+        // First pass writes (0xa,1) then (0xb,2). On re-entry at idx1 the WRITE at
+        // idx0 is NOT re-run (proving the target is idx1, not idx0); idx2's WRITE
+        // repeats until the cap. The OLD impl would target idx0 and re-run (0xa,1).
+        let code: Vec<u32> = vec![0x800a_0001, 0xb002_0000, 0x800b_0002, 0x3003_0000];
+        let mut bytes = Vec::new();
+        for w in &code {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        let mut phy = MockPhy {
+            writes: Vec::new(),
+            reads: Vec::new(),
+            mdio_target: 0,
+            delays: 0,
+        };
+        run_phy_action(&bytes, &mut phy);
+        // (0xa,1) appears exactly once (idx0 never re-entered); (0xb,2) repeats.
+        assert_eq!(phy.writes.iter().filter(|&&w| w == (0xa, 0x1)).count(), 1);
+        assert!(phy.writes.iter().filter(|&&w| w == (0xb, 0x2)).count() > 1);
     }
 
     #[test]
