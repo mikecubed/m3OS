@@ -561,6 +561,14 @@ fn main() {
                 });
             cmd_audio_smoke(&smoke_args);
         }
+        Some("hda-smoke") => {
+            let smoke_args = parse_smoke_boot_args("hda-smoke", &args[2..]).unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            cmd_hda_smoke(&smoke_args);
+        }
         Some("session-smoke") => {
             let smoke_args =
                 parse_smoke_boot_args("session-smoke", &args[2..]).unwrap_or_else(|err| {
@@ -9419,6 +9427,164 @@ fn audio_smoke_steps() -> Vec<SmokeStep> {
         label: "guest/audio: frames_consumed non-zero (run #2)",
     });
     steps
+}
+
+// ---------------------------------------------------------------------------
+// Phase 80b — hda-smoke: HDA controller + generic codec end-to-end gate.
+// ---------------------------------------------------------------------------
+
+/// Boot with `-device intel-hda -device hda-duplex,audiodev=snd0`, wait for the
+/// HDA driver to bring up the controller + codec, run `audio-demo` (which mixes
+/// through `audio_server` → `hda_driver`), and assert non-zero `frames_consumed`
+/// plus (in `cmd_hda_smoke`) a non-silent captured WAV.
+fn hda_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = vec![
+        SmokeStep::Wait {
+            pattern: "[m3os] Hello from kernel",
+            timeout_secs: 30,
+            label: "guest/hda: kernel first message",
+        },
+        // The HDA driver resets the controller, polls STATESTS, RUN-enables
+        // CORB/RIRB, and enumerates the codec before emitting this sentinel.
+        SmokeStep::Wait {
+            pattern: "HDA_SMOKE:server:READY",
+            timeout_secs: 90,
+            label: "guest/hda: hda_driver controller + codec ready",
+        },
+        SmokeStep::Wait {
+            pattern: "init: loaded service 'audio_server'",
+            timeout_secs: 90,
+            label: "guest/hda: init loaded audio_server.conf",
+        },
+    ];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "audio-demo\n",
+        label: "guest/hda: launch audio-demo (mixes through hda_driver)",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "AUDIO_DEMO:PASS",
+        fail_prefix: "AUDIO_DEMO:FAIL stage=",
+        timeout_secs: 30,
+        label: "guest/hda: audio-demo PASS sentinel",
+        exit_code_on_fail: SMOKE_EXIT_AUDIO_DEMO_FAILED,
+    });
+    // A zero consumed count means the HDA stream DMA never advanced SDnLPIB —
+    // the regression Track C.2 guards (stream tag / RUN / converter binding).
+    steps.push(SmokeStep::WaitLineNotMatching {
+        pattern: "AUDIO_DEMO:stats consumed=",
+        bad_substring: "consumed=0 ",
+        timeout_secs: 5,
+        label: "guest/hda: frames_consumed non-zero",
+    });
+    steps
+}
+
+/// QEMU args for the HDA smoke: the generic `intel-hda` controller +
+/// `hda-duplex` codec wired to a WAV audiodev. No AC'97 device, so the HDA
+/// driver wins the `audio.hw` registration.
+fn hda_smoke_qemu_args(
+    smoke_dir: &Path,
+    uefi_image: &Path,
+    ovmf: &Path,
+    display: bool,
+) -> Vec<String> {
+    let display_mode = if display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(uefi_image, ovmf, display_mode, DeviceSet::default());
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    let wav_path = smoke_dir.join("audio.wav");
+    qemu_args.extend([
+        "-audiodev".to_string(),
+        format!("wav,id=snd0,path={}", wav_path.display()),
+        "-device".to_string(),
+        "intel-hda".to_string(),
+        "-device".to_string(),
+        "hda-duplex,audiodev=snd0".to_string(),
+    ]);
+    qemu_args
+}
+
+/// Run the HDA smoke (model on `cmd_audio_smoke`).
+fn cmd_hda_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+
+    let smoke_dir = prepare_audio_smoke_dir();
+    let ovmf = find_ovmf();
+    let qemu_args = hda_smoke_qemu_args(&smoke_dir, &uefi_image, &ovmf, args.display);
+    let steps = hda_smoke_steps();
+
+    println!(
+        "hda-smoke: launching QEMU with intel-hda + hda-duplex (timeout {}s)",
+        args.timeout_secs
+    );
+    println!(
+        "hda-smoke: WAV output → {}",
+        smoke_dir.join("audio.wav").display()
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!(
+                "hda-smoke: serial script PASSED ({} steps in {elapsed}s)",
+                steps.len()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("hda-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_AUDIO_DEMO_FAILED);
+        }
+    }
+
+    let wav_path = smoke_dir.join("audio.wav");
+    match assert_wav_non_silent(&wav_path) {
+        Ok(()) => println!("hda-smoke: WAV non-silent check PASSED"),
+        Err(msg) => {
+            eprintln!("hda-smoke: WAV non-silent check FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_WAV_SILENT);
+        }
+    }
 }
 
 /// Build the QEMU arg vector for the audio smoke.

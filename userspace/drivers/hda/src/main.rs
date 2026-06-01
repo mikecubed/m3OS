@@ -2,11 +2,11 @@
 //!
 //! Run-time flow: write the boot marker, discover an HDA controller by PCI
 //! class (0x04/0x03/0x00, vendor-agnostic), claim it, map BAR0, bring up the
-//! controller (reset → STATESTS codec-ready → CORB/RIRB RUN-enable) and the
-//! codec (enumerate widgets → select analog codec → configure output path),
-//! create an IPC endpoint, register it as `"audio.hw"`, emit the
-//! `HDA_SMOKE:server:READY` sentinel, and enter the `audio.hw` server loop
-//! serving the `driver_ipc::audio` protocol.
+//! controller (reset → STATESTS codec-ready → CORB/RIRB RUN-enable), create an
+//! IPC endpoint, register it as `"audio.hw"`, emit `HDA_SMOKE:server:READY`,
+//! and enter the `audio.hw` server loop serving the `driver_ipc::audio`
+//! protocol. The codec output path + stream descriptor are configured lazily
+//! on the first `OpenStream`.
 
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
@@ -17,20 +17,30 @@ extern crate alloc;
 extern crate std;
 
 #[cfg(not(test))]
+use alloc::vec;
+#[cfg(not(test))]
 use core::alloc::Layout;
 
+#[cfg(not(test))]
+use driver_runtime::audio_pcm::{self, PcmReceiver};
+#[cfg(not(test))]
+use driver_runtime::ipc::audio::{decode_request_bulk, reply_response};
 #[cfg(not(test))]
 use driver_runtime::ipc::{EndpointCap, RecvResult, SyscallBackend};
 #[cfg(not(test))]
 use driver_runtime::{DeviceHandle, Mmio};
+#[cfg(not(test))]
+use hda_driver::codec::OutputPath;
+#[cfg(not(test))]
+use hda_driver::controller::HdaController;
+#[cfg(not(test))]
+use hda_driver::stream::OutputStream;
 #[cfg(not(test))]
 use hda_driver::{BOOT_LOG_MARKER, HDA_BAR0_LEN, SERVER_READY_SENTINEL, SERVICE_NAME};
 #[cfg(not(test))]
 use kernel_core::driver_ipc::audio::{
     AUDIO_REQUEST_MAX_SIZE, AudioDriverError, AudioRequest, AudioResponse, caps_v1,
 };
-#[cfg(not(test))]
-use kernel_core::hda;
 #[cfg(not(test))]
 use syscall_lib::STDOUT_FILENO;
 #[cfg(not(test))]
@@ -57,10 +67,22 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 #[cfg(not(test))]
 syscall_lib::entry_point!(program_main);
 
+/// Single output stream tag (`audio_server` is single-stream for 1.0).
+#[cfg(not(test))]
+const STREAM_TAG: u8 = 1;
+/// Facing stream id returned to `audio_server` (it is single-stream).
+#[cfg(not(test))]
+const FACING_STREAM_ID: u32 = 1;
+
 /// Discover an HDA controller by PCI class (vendor-agnostic 0x04/0x03/0x00).
 #[cfg(not(test))]
 fn find_hda() -> Option<driver_runtime::DeviceCapKey> {
-    let candidates = driver_runtime::enumerate_pci_class(0x04, 0x03, 0x00).ok()?;
+    let candidates = driver_runtime::enumerate_pci_class(
+        kernel_core::hda::ids::HDA_CLASS,
+        kernel_core::hda::ids::HDA_SUBCLASS,
+        kernel_core::hda::ids::HDA_PROG_IF,
+    )
+    .ok()?;
     candidates.into_iter().next()
 }
 
@@ -71,8 +93,8 @@ fn program_main(_args: &[&str]) -> i32 {
     let key = match find_hda() {
         Some(k) => k,
         None => {
-            // No HDA controller on this machine (e.g. QEMU with only -device
-            // AC97) — exit cleanly so the ac97 driver serves audio.hw.
+            // No HDA controller (e.g. QEMU with only -device AC97) — exit
+            // cleanly so the ac97 driver serves audio.hw.
             syscall_lib::write_str(STDOUT_FILENO, "hda_driver: no HDA controller present\n");
             return 0;
         }
@@ -94,11 +116,17 @@ fn program_main(_args: &[&str]) -> i32 {
         }
     };
 
-    // Read GCAP so the log records the controller's stream counts.
-    let gcap: u16 = bar0.read_reg(hda::REG_GCAP);
-    let _ = gcap;
+    let mut controller = match HdaController::bring_up(&device, bar0) {
+        Ok(c) => c,
+        Err(e) => {
+            syscall_lib::write_str(STDOUT_FILENO, "hda_driver: controller bring-up failed: ");
+            syscall_lib::write_str(STDOUT_FILENO, e);
+            syscall_lib::write_str(STDOUT_FILENO, "\n");
+            return 3;
+        }
+    };
+    syscall_lib::write_str(STDOUT_FILENO, "hda_driver: controller up, codecs ready\n");
 
-    // Create + register the audio.hw endpoint.
     let ep = syscall_lib::create_endpoint();
     if ep == u64::MAX {
         syscall_lib::write_str(STDOUT_FILENO, "hda_driver: endpoint create failed\n");
@@ -115,27 +143,78 @@ fn program_main(_args: &[&str]) -> i32 {
 
     syscall_lib::write_str(STDOUT_FILENO, SERVER_READY_SENTINEL);
 
-    server_loop(EndpointCap::new(ep_u32))
+    server_loop(&device, &mut controller, EndpointCap::new(ep_u32))
 }
 
-/// Minimal control server loop (skeleton). The full output-stream engine
-/// (Track C) replaces the `SubmitFrames` arm; for now it answers `QueryCaps`
-/// so `audio_server`'s connect handshake succeeds.
+/// `audio.hw` server loop: serves the `driver_ipc::audio` protocol, copying
+/// each `SubmitFrames` shared-ring window into the output stream's cyclic DMA
+/// buffer.
 #[cfg(not(test))]
-fn server_loop(endpoint: EndpointCap) -> i32 {
-    use driver_runtime::ipc::audio::{decode_request_bulk, reply_response};
-
+fn server_loop(
+    device: &DeviceHandle,
+    controller: &mut HdaController,
+    endpoint: EndpointCap,
+) -> i32 {
     let mut backend = SyscallBackend::new();
+    let mut receiver = PcmReceiver::new();
+    let mut scratch = vec![0u8; audio_pcm::PCM_RING_BYTES];
+    let mut stream: Option<OutputStream> = None;
+    let mut _path: Option<OutputPath> = None;
+
     loop {
-        let rsp = match backend.recv_with_capacity(endpoint, AUDIO_REQUEST_MAX_SIZE) {
-            Ok(RecvResult::Message(frame)) => match decode_request_bulk(&frame.bulk) {
-                Ok(AudioRequest::QueryCaps) => AudioResponse::Caps(caps_v1()),
-                Ok(_) => AudioResponse::Err(AudioDriverError::Internal),
-                Err(_) => AudioResponse::Err(AudioDriverError::InvalidArgument),
-            },
+        let frame = match backend.recv_with_capacity(endpoint, AUDIO_REQUEST_MAX_SIZE) {
+            Ok(RecvResult::Message(f)) => f,
             Ok(RecvResult::Notification(_)) => continue,
             Err(_) => continue,
         };
+
+        let rsp = match decode_request_bulk(&frame.bulk) {
+            Ok(AudioRequest::QueryCaps) => AudioResponse::Caps(caps_v1()),
+            Ok(AudioRequest::OpenStream { .. }) => {
+                match hda_driver::stream::open_output(device, controller, STREAM_TAG) {
+                    Ok((s, p)) => {
+                        stream = Some(s);
+                        _path = Some(p);
+                        AudioResponse::StreamOpened(FACING_STREAM_ID)
+                    }
+                    Err(_) => AudioResponse::Err(AudioDriverError::Internal),
+                }
+            }
+            Ok(AudioRequest::SubmitFrames {
+                grant_handle,
+                offset,
+                len,
+                ..
+            }) => match stream.as_mut() {
+                None => AudioResponse::Err(AudioDriverError::InvalidArgument),
+                Some(s) => {
+                    let n = (len as usize).min(scratch.len());
+                    match receiver.recv_and_copy(grant_handle, offset, len, &mut scratch[..n]) {
+                        Ok(copied) => {
+                            if s.submit(&controller.mmio, &scratch[..copied]) {
+                                AudioResponse::Ack {
+                                    frames_consumed: s.poll_consumed(&controller.mmio),
+                                }
+                            } else {
+                                AudioResponse::WouldBlock
+                            }
+                        }
+                        Err(_) => AudioResponse::Err(AudioDriverError::InvalidArgument),
+                    }
+                }
+            },
+            Ok(AudioRequest::Drain { .. }) => AudioResponse::Ok,
+            Ok(AudioRequest::CloseStream { .. }) => {
+                if let Some(s) = stream.take() {
+                    s.stop(&controller.mmio);
+                }
+                _path = None;
+                receiver.release();
+                AudioResponse::Ok
+            }
+            Err(_) => AudioResponse::Err(AudioDriverError::InvalidArgument),
+        };
+
         let _ = reply_response(&mut backend, &rsp);
     }
 }

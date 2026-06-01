@@ -15,8 +15,15 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
-// Driver-internal production modules (register-poking) are added as Track B/C
-// land: `controller`, `corb`, `codec`, `stream`.
+// Driver-internal production modules (register-poking).
+#[cfg(not(test))]
+pub mod codec;
+#[cfg(not(test))]
+pub mod controller;
+#[cfg(not(test))]
+pub mod corb;
+#[cfg(not(test))]
+pub mod stream;
 
 /// Service name the driver registers and `audio_server` resolves.
 pub const SERVICE_NAME: &str = "audio.hw";
