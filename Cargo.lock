@@ -1300,6 +1300,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mt792x_driver"
+version = "0.1.0"
+dependencies = [
+ "driver_runtime",
+ "kernel-core",
+ "syscall-lib",
+]
+
+[[package]]
 name = "net_server"
 version = "0.55.0"
 dependencies = [
@@ -2546,7 +2555,6 @@ name = "wifi-core"
 version = "0.1.0"
 dependencies = [
  "crypto-lib",
- "kernel-core",
 ]
 
 [[package]]

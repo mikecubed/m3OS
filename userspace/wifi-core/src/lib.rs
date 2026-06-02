@@ -9,10 +9,9 @@
 
 extern crate alloc;
 
-// Track B / C / D modules are added here as they land:
-//   pub mod mgmt;     // B.4 — 802.11 mgmt-frame builders + RSN IE
-//   pub mod fsm;      // B.5 — association FSM
-//   pub mod eapol;    // B.6 — EAPOL-Key frame codec
-//   pub mod kdf;      // B.6 — PTK derivation
-//   pub mod control;  // C.2 — userspace Wi-Fi control protocol
-//   pub mod config;   // D.1 — /etc/wpa.conf parser
+pub mod config;
+pub mod control;
+pub mod eapol;
+pub mod fsm;
+pub mod kdf;
+pub mod mgmt;
