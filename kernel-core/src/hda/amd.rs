@@ -17,7 +17,11 @@
 //! applied so audio is correct once the codec is up, not to fix enumeration.
 //!
 //! m3OS ships **no** kernel HDA quirk table — this is the single vendor config
-//! write the ring-3 driver issues, keyed only off the AMD PCI vendor ID.
+//! write the ring-3 driver issues, keyed off the AMD PCI vendor ID **and** the
+//! HDA class/subclass (see [`is_amd_hda_controller`]). The class check keeps the
+//! kernel's config-write snoop-byte allowlist scoped to AMD *HDA* controllers
+//! (least privilege): a non-HDA AMD function the caller might own could
+//! interpret config offset `0x42` differently.
 
 /// AMD PCI vendor ID. The dev-laptop HDA controller is `1022:15e3`.
 pub const AMD_VENDOR_ID: u16 = 0x1022;
@@ -39,6 +43,20 @@ pub fn is_amd_controller(vendor: u16) -> bool {
     vendor == AMD_VENDOR_ID
 }
 
+/// Whether the device at `(vendor, base_class, subclass)` is an AMD/ATI **HDA
+/// controller** eligible for the snoop config-space write — i.e. AMD vendor AND
+/// PCI class [`HDA_CLASS`](crate::hda::ids::HDA_CLASS) / subclass
+/// [`HDA_SUBCLASS`](crate::hda::ids::HDA_SUBCLASS). The kernel's
+/// `sys_device_config_write` allowlist uses this so the snoop byte (`0x42`) is
+/// writable only on AMD HDA controllers, not every AMD function a driver might
+/// own — vendor alone would be too broad for least privilege.
+#[inline]
+pub fn is_amd_hda_controller(vendor: u16, base_class: u8, subclass: u8) -> bool {
+    is_amd_controller(vendor)
+        && base_class == crate::hda::ids::HDA_CLASS
+        && subclass == crate::hda::ids::HDA_SUBCLASS
+}
+
 /// Read-modify-write computation for the ATI/AMD snoop byte: clear the low 3
 /// bits and set them to [`ATI_SNOOP_ENABLE`]. Mirrors Linux
 /// `update_pci_byte(pci, 0x42, 0x07, 0x02)`.
@@ -56,6 +74,20 @@ mod tests {
         assert!(is_amd_controller(0x1022)); // AMD
         assert!(!is_amd_controller(0x8086)); // Intel (QEMU intel-hda)
         assert!(!is_amd_controller(0x10ec)); // Realtek (codec, not controller)
+    }
+
+    #[test]
+    fn amd_hda_controller_requires_vendor_and_hda_class() {
+        use crate::hda::ids::{HDA_CLASS, HDA_SUBCLASS};
+        // AMD HDA controller (1022:15e3 is class 0x04 / subclass 0x03) — eligible.
+        assert!(is_amd_hda_controller(0x1022, HDA_CLASS, HDA_SUBCLASS));
+        // AMD vendor but NOT an HDA controller — the snoop byte must NOT be
+        // allowlisted (offset 0x42 could mean something else on this function).
+        assert!(!is_amd_hda_controller(0x1022, 0x04, 0x01)); // AMD AC'97-class audio
+        assert!(!is_amd_hda_controller(0x1022, 0x02, 0x00)); // AMD network controller
+        assert!(!is_amd_hda_controller(0x1022, 0x01, 0x06)); // AMD SATA controller
+        // HDA class but non-AMD vendor — handled by the Intel path, not snoop.
+        assert!(!is_amd_hda_controller(0x8086, HDA_CLASS, HDA_SUBCLASS)); // QEMU intel-hda
     }
 
     #[test]

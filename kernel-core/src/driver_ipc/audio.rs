@@ -13,12 +13,16 @@
 //!
 //! Per the AGENTS.md IPC rule ("bulk data: page capability grants, never IPC
 //! payloads"), the sample bytes of a [`AudioRequest::SubmitFrames`] do **not**
-//! appear in any message field. Instead the request carries a single-use
-//! page-grant handle (Phase 74 `sys_page_grant_*`) plus a byte offset/length
-//! into the granted region. The driver maps the grant, copies the frames into
-//! its own `sys_device_dma_alloc` IOMMU-domain buffer, and releases the grant
-//! (see `driver_runtime::audio_pcm`). The absence of any `&[u8]`/`Vec<u8>`
-//! sample field in [`AudioRequest`] is enforced by the type — grep-verifiable.
+//! appear in any message field. Instead the bytes live in a **persistent
+//! page-capability-backed shared region** established once at stream open via
+//! `sys_shm_*`; each `SubmitFrames` carries only that region's id (in
+//! `grant_handle`) plus a byte offset/length window into it. The driver maps the
+//! region — reused every period, **not** a single-use move — copies the window
+//! into its own `sys_device_dma_alloc` IOMMU-domain buffer, and the region is
+//! refcount-released on `CloseStream`/exit. See `driver_runtime::audio_pcm`,
+//! which explains why a persistent ring is used rather than a per-submission
+//! `sys_page_grant_*` move. The absence of any `&[u8]`/`Vec<u8>` sample field in
+//! [`AudioRequest`] is enforced by the type — grep-verifiable.
 //!
 //! # Wire format
 //!
@@ -231,9 +235,10 @@ pub enum AudioRequest {
         rate: SampleRate,
         layout: ChannelLayout,
     },
-    /// Hand the driver a page-granted PCM buffer to play. `grant_handle` is a
-    /// single-use Phase 74 grant capability; `offset`/`len` bound the bytes
-    /// within the granted region. Reply is [`AudioResponse::Ack`] /
+    /// Point the driver at PCM to play. `grant_handle` is the id of the
+    /// persistent `sys_shm` region shared at stream open (mapped once and reused
+    /// every period — **not** a single-use grant); `offset`/`len` bound the bytes
+    /// within that region. Reply is [`AudioResponse::Ack`] /
     /// [`AudioResponse::WouldBlock`] / [`AudioResponse::Err`].
     SubmitFrames {
         stream_id: u32,

@@ -3588,15 +3588,23 @@ pub fn sys_device_config_write(
     // vector/LAPIC), nor relocate its BARs or clear Command bits out from under
     // the claim's IOMMU/MMIO state. Only the two writes the ring-3 HDA driver
     // legitimately needs are permitted: the PM-capability PMCSR (force D0) and
-    // the AMD/ATI HDA snoop byte (`0x42`, AMD controllers only).
+    // the AMD/ATI HDA snoop byte (`0x42`) — and the latter only on AMD *HDA*
+    // controllers (class 0x04 / subclass 0x03), not every AMD function a driver
+    // might own, since offset 0x42 can mean something else on other AMD devices.
     let pmcsr_offset =
         crate::pci::find_capability(bus, dev, func, kernel_core::device_host::PCI_CAP_ID_PM)
             .map(kernel_core::device_host::pmcsr_offset);
-    let vendor_byte_offset = if kernel_core::hda::amd::is_amd_controller(vendor) {
-        Some(u16::from(kernel_core::hda::amd::ATI_SNOOP_REG))
-    } else {
-        None
-    };
+    // PCI class code lives in the dword at offset 0x08: base class in bits
+    // 24..31, subclass in bits 16..23.
+    let class_reg = crate::pci::pci_config_read_u32_any(bus, dev, func, 0x08);
+    let base_class = ((class_reg >> 24) & 0xFF) as u8;
+    let subclass = ((class_reg >> 16) & 0xFF) as u8;
+    let vendor_byte_offset =
+        if kernel_core::hda::amd::is_amd_hda_controller(vendor, base_class, subclass) {
+            Some(u16::from(kernel_core::hda::amd::ATI_SNOOP_REG))
+        } else {
+            None
+        };
     if !kernel_core::device_host::config_write_permitted(
         offset,
         width,
