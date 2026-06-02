@@ -285,6 +285,15 @@ mod tests {
             hex_to_bytes::<20>("84983e441c3bd26ebaae4aa1f95129e5e54670f1"),
             "sha1(448-bit)"
         );
+
+        // 128-byte message — exercises the `while data.len() >= 64` multi-full-
+        // block compression loop in `update()` directly with real data (not just
+        // transitively via HMAC/PBKDF2). Reference value from Python hashlib.
+        assert_eq!(
+            sha1(&[b'a'; 128]),
+            hex_to_bytes::<20>("ad5b3fdbcb526778c2839d2f151ea753995e26a0"),
+            "sha1(128*'a')"
+        );
     }
 
     #[test]
@@ -302,6 +311,29 @@ mod tests {
             hmac_sha1(b"Jefe", b"what do ya want for nothing?"),
             hex_to_bytes::<20>("effcdf6ae5eb2fa2d27416d5f184df9c259a7c79"),
             "RFC 2202 TC2"
+        );
+
+        // RFC 2202 Test Case 6 — 80-byte 0xaa key (> 64-byte block) exercises
+        // the `key.len() > SHA1_BLOCK` compression branch in HmacSha1State::new,
+        // which no other vector reaches (PBKDF2/WPA keys are all < 64 bytes).
+        let big_key = [0xaau8; 80];
+        assert_eq!(
+            hmac_sha1(
+                &big_key,
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            ),
+            hex_to_bytes::<20>("aa4ae5e15272d00e95705637ce8a3b55ed402112"),
+            "RFC 2202 TC6"
+        );
+
+        // RFC 2202 Test Case 7 — same 80-byte key, multi-block data.
+        assert_eq!(
+            hmac_sha1(
+                &big_key,
+                b"Test Using Larger Than Block-Size Key and Larger Than One Block-Size Data"
+            ),
+            hex_to_bytes::<20>("e8e99d0f45237d786d6bbaa7965c7808bbff1a91"),
+            "RFC 2202 TC7"
         );
     }
 

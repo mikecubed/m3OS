@@ -15,7 +15,9 @@
 
 extern crate alloc;
 
-use kernel_core::mt792x::mcu::{CIPHER_CCMP, encode_sta_rec_key};
+use alloc::vec::Vec;
+
+use kernel_core::mt792x::mcu::{CIPHER_CCMP, STA_REC_KEY_V2, encode_sta_rec_key, push_tlv};
 use wifi_core::fsm::KeyMaterial;
 
 use crate::mcu::{McuError, McuRing};
@@ -26,13 +28,25 @@ pub const STA_REC_UPDATE_CID: u8 = 0x25;
 /// Key index for the pairwise (unicast) key — always 0 for CCMP pairwise.
 const PAIRWISE_KEY_IDX: u8 = 0;
 
+/// Wrap a `STA_REC_KEY_V2` key body in its TLV header for `STA_REC_UPDATE`.
+///
+/// The encoder (`encode_sta_rec_key`) produces only the value bytes; the wire
+/// frame the MCU expects is the value wrapped with the `STA_REC_KEY_V2` tag and
+/// a length header, which is what `push_tlv` emits.
+fn sta_rec_key_tlv(wcid: u16, cipher: u8, key_idx: u8, key: &[u8]) -> Vec<u8> {
+    let body = encode_sta_rec_key(wcid, cipher, key_idx, key);
+    let mut tlv = Vec::with_capacity(body.len() + 4);
+    push_tlv(&mut tlv, STA_REC_KEY_V2, &body);
+    tlv
+}
+
 /// Install the pairwise Temporal Key (TK) into the chipset WTBL for `wcid`.
 ///
-/// Builds a `STA_REC_KEY` TLV for the CCMP pairwise key and submits it on the
+/// Builds a `STA_REC_KEY_V2` TLV for the CCMP pairwise key and submits it on the
 /// WM MCU queue. The 16-byte TK is the unicast CCMP key derived by the host
 /// 4-way handshake (Track B.6).
 pub fn install_pairwise_key(mcu: &mut McuRing, wcid: u16, tk: &[u8; 16]) -> Result<(), McuError> {
-    let tlv = encode_sta_rec_key(wcid, CIPHER_CCMP, PAIRWISE_KEY_IDX, tk);
+    let tlv = sta_rec_key_tlv(wcid, CIPHER_CCMP, PAIRWISE_KEY_IDX, tk);
     mcu.submit_and_reap(STA_REC_UPDATE_CID, &tlv)
         .map(|_| ())
         .map_err(|_| McuError::Timeout)
@@ -45,7 +59,7 @@ pub fn install_group_key(
     gtk: &[u8],
     gtk_idx: u8,
 ) -> Result<(), McuError> {
-    let tlv = encode_sta_rec_key(wcid, CIPHER_CCMP, gtk_idx, gtk);
+    let tlv = sta_rec_key_tlv(wcid, CIPHER_CCMP, gtk_idx, gtk);
     mcu.submit_and_reap(STA_REC_UPDATE_CID, &tlv)
         .map(|_| ())
         .map_err(|_| McuError::Timeout)
@@ -63,7 +77,7 @@ pub fn install_keys(mcu: &mut McuRing, wcid: u16, km: &KeyMaterial) -> Result<()
 /// so stale keys do not linger in the WTBL. Installs zero-length CCMP keys.
 pub fn purge_keys(mcu: &mut McuRing, wcid: u16) -> Result<(), McuError> {
     let empty: [u8; 0] = [];
-    let tlv = encode_sta_rec_key(wcid, CIPHER_CCMP, PAIRWISE_KEY_IDX, &empty);
+    let tlv = sta_rec_key_tlv(wcid, CIPHER_CCMP, PAIRWISE_KEY_IDX, &empty);
     mcu.submit_and_reap(STA_REC_UPDATE_CID, &tlv)
         .map(|_| ())
         .map_err(|_| McuError::Timeout)

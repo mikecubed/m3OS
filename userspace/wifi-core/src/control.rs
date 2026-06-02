@@ -95,6 +95,30 @@ pub struct WifiStatus {
 }
 
 impl WifiStatus {
+    /// Build the status the driver's `wifi.control` responder returns for the
+    /// current supplicant state — the host-testable half of `m3ctl wifi status`.
+    ///
+    /// When `associated` is false the SSID is empty (which `m3ctl wifi status`
+    /// renders as "not associated") and `rssi`/`ipv4` are zero. When associated,
+    /// the connected SSID is reported; the live `rssi` and DHCP-assigned `ipv4`
+    /// are read from the radio + lease on hardware (E.4) and are passed through
+    /// here (0/`0.0.0.0` until the live values are available).
+    pub fn for_connection(associated: bool, ssid: &[u8], rssi: i8, ipv4: [u8; 4]) -> WifiStatus {
+        if associated {
+            WifiStatus {
+                ssid: ssid.to_vec(),
+                rssi,
+                ipv4,
+            }
+        } else {
+            WifiStatus {
+                ssid: Vec::new(),
+                rssi: 0,
+                ipv4: [0; 4],
+            }
+        }
+    }
+
     /// Encode to wire bytes.
     ///
     /// Format: `rssi[1] | ipv4[4] | ssid_len[1] | ssid[n]`
@@ -154,6 +178,22 @@ mod tests {
         let encoded_ws = ws.encode();
         let decoded_ws = WifiStatus::decode(&encoded_ws).expect("WifiStatus decode must succeed");
         assert_eq!(decoded_ws, ws, "WifiStatus must round-trip byte-for-byte");
+    }
+
+    /// The responder helper reports the SSID only when associated, and an
+    /// empty-SSID status otherwise (which m3ctl renders as "not associated").
+    #[test]
+    fn status_for_connection() {
+        let assoc = WifiStatus::for_connection(true, b"HomeNet", -55, [10, 0, 0, 7]);
+        assert_eq!(assoc.ssid, b"HomeNet");
+        assert_eq!(assoc.rssi, -55);
+        assert_eq!(assoc.ipv4, [10, 0, 0, 7]);
+        // Round-trips on the wire.
+        assert_eq!(WifiStatus::decode(&assoc.encode()).unwrap(), assoc);
+
+        let down = WifiStatus::for_connection(false, b"HomeNet", -55, [10, 0, 0, 7]);
+        assert!(down.ssid.is_empty(), "not-associated status has empty SSID");
+        assert_eq!(down.ipv4, [0; 4]);
     }
 
     /// Label constants must be distinct u16 values.

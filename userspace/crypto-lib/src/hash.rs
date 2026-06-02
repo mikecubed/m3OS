@@ -282,6 +282,34 @@ mod tests {
     }
 
     #[test]
+    fn pbkdf2_hmac_sha1_rfc6070_multiblock() {
+        // RFC 6070 §2 Test Vector 4: P="password", S="salt", c=4096, dkLen=25.
+        // Exercises the c>1 iteration loop and a >20-byte (2-block) output.
+        let mut dk4 = [0u8; 25];
+        pbkdf2_hmac_sha1(b"password", b"salt", 4096, &mut dk4);
+        let expected4: [u8; 25] = [
+            0x4b, 0x00, 0x79, 0x01, 0xb7, 0x65, 0x48, 0x9a, 0xbe, 0xad, 0x49, 0xd9, 0x26, 0xf7,
+            0x21, 0xd0, 0x65, 0xa4, 0x29, 0xc1, 0x2e, 0x46, 0x3f, 0x6c, 0x4c,
+        ];
+        assert_eq!(dk4, expected4, "RFC 6070 TC4 c=4096 dkLen=25");
+
+        // RFC 6070 §2 Test Vector 5: long P/S, c=4096, dkLen=40 (2 full blocks).
+        let mut dk5 = [0u8; 40];
+        pbkdf2_hmac_sha1(
+            b"passwordPASSWORDpassword",
+            b"saltSALTsaltSALTsaltSALTsaltSALTsalt",
+            4096,
+            &mut dk5,
+        );
+        let expected5: [u8; 40] = [
+            0x3d, 0x2e, 0xec, 0x4f, 0xe4, 0x1c, 0x84, 0x9b, 0x80, 0xc8, 0xd8, 0x36, 0x62, 0xc0,
+            0xe4, 0x4a, 0x8b, 0x29, 0x1a, 0x96, 0x4c, 0xf2, 0xf0, 0x70, 0x38, 0xb6, 0xb8, 0x9a,
+            0x48, 0x61, 0x2c, 0x5a, 0x25, 0x28, 0x4e, 0x66, 0x05, 0xe1, 0x23, 0x29,
+        ];
+        assert_eq!(dk5, expected5, "RFC 6070 TC5 c=4096 dkLen=40");
+    }
+
+    #[test]
     fn test_hkdf_rfc5869_case2() {
         // RFC 5869 Test Case 2 (longer inputs — 80-byte IKM, salt, info)
         // Verified against Python cryptography library's HKDF output.

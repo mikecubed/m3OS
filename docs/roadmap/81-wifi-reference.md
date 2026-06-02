@@ -10,7 +10,7 @@
 
 ## Milestone Goal
 
-m3OS associates with a WPA2-PSK Wi-Fi network on the dev laptop and pulls a DHCP lease over the wireless interface. The driver targets exactly one chipset (MT7925) and explicitly defers every other family. This phase exists to make 1.0 honest on the laptop the project is being developed on — not to ship a general Wi-Fi stack.
+m3OS associates with a WPA2-PSK Wi-Fi network on the dev laptop and pulls a DHCP lease over the wireless interface. The driver targets exactly one chipset family (mt792x; MT7921/MT7922 connac2 brought up first, MT7925/connac3 in the same `nic_ids` registry) and explicitly defers every other family. This phase exists to make 1.0 honest on the laptop the project is being developed on — not to ship a general Wi-Fi stack.
 
 ## Why This Phase Exists
 
@@ -50,7 +50,7 @@ Wi-Fi drivers are large (Linux's `mt76` family is ~15k LOC of pure driver code, 
 
 ### Firmware blob
 
-MT7925's host driver is the simple part; the hard work happens in the firmware running on the chipset's embedded MAC processor. The driver's job is to download the firmware, hand it work via a command ring, and consume completion events. Linux's `mt76` driver follows the same pattern. The blob is licensed for redistribution by MediaTek but is not open source — this is the same model as Intel's `iwlwifi`.
+The mt792x host driver is the simple part; the hard work happens in the firmware running on the chipset's embedded MAC processor. The driver's job is to download the firmware, hand it work via a command ring, and consume completion events. Linux's `mt76` driver follows the same pattern. The blob is licensed for redistribution by MediaTek but is not open source — this is the same model as Intel's `iwlwifi`.
 
 ### 802.11 mgmt vs data frames
 
@@ -70,7 +70,7 @@ After association the AP and the station each generate a nonce (ANonce / SNonce)
 ## Implementation Outline
 
 1. Land the firmware-blob staging path in `xtask` + `populate_ext2_files`.
-2. Bring up the MT7925 PCI driver shell: reset, firmware download, command-ring acknowledgment.
+2. Bring up the mt792x PCI driver shell (MT7921/MT7922 connac2 first): reset, firmware download, command-ring acknowledgment.
 3. Implement scan + the BSS list display.
 4. Implement open-system auth + association against a test AP (open network first).
 5. Implement WPA2-PSK 4-way handshake.

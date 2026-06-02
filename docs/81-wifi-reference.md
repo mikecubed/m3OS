@@ -56,7 +56,11 @@ builders + the exact CCMP+PSK RSN IE, the scan→auth→assoc→handshake→conn
 FSM, the EAPOL-Key codec, and the WPA2 key derivation. The four missing crypto
 primitives — SHA-1, HMAC-SHA1, PBKDF2-HMAC-SHA1, and AES Key-Wrap (RFC 3394) —
 are added to `crypto-lib` (they were **not** present from Phase 42, which is
-SHA-256-family only).
+SHA-256-family only). SHA-1/HMAC-SHA1 are introduced **solely** for the
+legacy-mandated WPA2-PSK KDF (PBKDF2/PRF-384) and EAPOL-Key MIC; SHA-1 is
+collision-broken and must not be used for any new security-sensitive purpose
+(this mirrors the `crypto-lib/src/sha1.rs` header and the task-list
+Documentation Notes).
 
 ### RemoteNic integration + config (Tracks C/D)
 

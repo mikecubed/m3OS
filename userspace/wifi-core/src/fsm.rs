@@ -12,7 +12,7 @@
 //! processes; callers dispatch actions (send frames, install keys, etc.).
 
 use crate::control::WifiStatus;
-use crate::eapol::{EapolKeyFrame, KEY_INFO_M2, KEY_INFO_M4, KeyInfo, mic_sha1_128};
+use crate::eapol::{EapolKeyFrame, KEY_INFO_M2, KEY_INFO_M4, KeyInfo, MIC_OFFSET, mic_sha1_128};
 use crate::kdf::{Ptk, derive_ptk};
 use crate::mgmt::{BssInfo, RsnIe, build_assoc_request, build_auth_open};
 use alloc::vec;
@@ -20,7 +20,14 @@ use alloc::vec::Vec;
 
 // ── CIPHER constant ───────────────────────────────────────────────────────────
 
-/// CCMP-128 pairwise cipher selector stored in KeyMaterial.
+/// CCMP-128 pairwise-cipher discriminator stored in [`KeyMaterial`].
+///
+/// This is a **software-internal tag** consumed only by host code to label the
+/// key material; it is deliberately NOT the on-wire MCU cipher selector. The
+/// value posted to silicon is `kernel_core::mt792x::mcu::CIPHER_CCMP`
+/// (`MCU_CIPHER_AES_CCMP = 5`), which the driver's key-install path uses. The
+/// two are intentionally independent: changing this tag does not change what is
+/// sent to the chip.
 pub const CIPHER_CCMP: u8 = 0x01;
 
 // ── Public types ─────────────────────────────────────────────────────────────
@@ -245,7 +252,9 @@ impl WifiFsm {
 
         match &self.state.clone() {
             WifiState::Handshake(HandshakeStep::WaitM1) => self.handle_m1(frame),
-            WifiState::Handshake(HandshakeStep::WaitM3) => self.handle_m3(frame),
+            // M3 verifies the MIC over the EXACT received bytes (see handle_m3),
+            // so the raw buffer is threaded through alongside the parsed frame.
+            WifiState::Handshake(HandshakeStep::WaitM3) => self.handle_m3(&raw, frame),
             _ => vec![],
         }
     }
@@ -285,7 +294,7 @@ impl WifiFsm {
         vec![WifiAction::SendEapol(m2)]
     }
 
-    fn handle_m3(&mut self, frame: EapolKeyFrame) -> Vec<WifiAction> {
+    fn handle_m3(&mut self, raw: &[u8], frame: EapolKeyFrame) -> Vec<WifiAction> {
         // M3: ACK + MIC + Install + Secure + Encrypted set.
         if !frame.key_info.key_ack()
             || !frame.key_info.key_mic()
@@ -306,12 +315,16 @@ impl WifiFsm {
             None => return vec![],
         };
 
-        // Verify M3 MIC: zero the MIC field and recompute.
-        let mut frame_bytes = {
-            let mut f = frame.clone();
-            f.mic = [0u8; 16];
-            f.encode()
-        };
+        // Verify the M3 MIC over the EXACT received bytes, with only the 16 MIC
+        // bytes zeroed in place (IEEE 802.11i). Verifying over `frame.encode()`
+        // would silently depend on encode() round-tripping every field
+        // (e.g. the reserved Key-ID octets) and could accept or reject a frame
+        // for the wrong reason; HMACing the original bytes avoids that.
+        if raw.len() < MIC_OFFSET + 16 {
+            return vec![]; // too short to carry a MIC
+        }
+        let mut frame_bytes = raw.to_vec();
+        frame_bytes[MIC_OFFSET..MIC_OFFSET + 16].fill(0);
         let computed_mic = mic_sha1_128(&ptk.kck, &frame_bytes);
         // Zero local copy
         frame_bytes.fill(0);
@@ -516,11 +529,12 @@ mod tests {
         let spa = sta_mac();
         let ptk = derive_ptk(&pmk, &aa, &spa, anonce, snonce);
 
-        // Build a synthetic GTK key-data for M3.
+        // Build standards-shaped M3 key-data: AES-Key-Wrap of a real GTK KDE
+        // ([0xDD][len][00 0F AC][01][KeyInfo][rsv][GTK]), exactly what a real AP
+        // sends and what `unwrap_gtk` now parses.
         let gtk_plain = [0x42u8; 16]; // synthetic GTK plaintext
-        let wrapped_gtk = crypto_lib::symmetric::aes_key_wrap(&ptk.kek, &gtk_plain);
-        let mut key_data = alloc::vec![0u8]; // key_idx = 0
-        key_data.extend_from_slice(&wrapped_gtk);
+        let kde = crate::kdf::build_gtk_kde(&gtk_plain, 0); // key_idx = 0
+        let key_data = crypto_lib::symmetric::aes_key_wrap(&ptk.kek, &kde);
 
         let mut frame = EapolKeyFrame {
             version: 1,

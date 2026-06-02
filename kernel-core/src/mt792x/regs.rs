@@ -58,6 +58,42 @@ pub const MT_WFDMA0_RST_DTX_PTR: usize = 0xD420C; // MT_WFDMA0_BASE + 0x20C
 pub const MT_WFDMA0_RST_DRX_PTR: usize = 0xD4280; // MT_WFDMA0_BASE + 0x280
 
 // ---------------------------------------------------------------------------
+// Connac TOP / firmware-ready registers
+// ---------------------------------------------------------------------------
+//
+// These live in the connac CSR address space (`0x1800_0000` bus range), NOT the
+// raw BAR0 window — the chip reaches them through a fixed reg-remap window
+// (`mt7921_reg_map[]` / `__mt7921_reg_addr` upstream). The numeric **offset and
+// mask** below are well-established from upstream mt76 (`mt7921/regs.h`,
+// `mt7921/mcu.c` `mt7921_load_firmware`); the BAR0-relative window that maps
+// this bus range, and the live ready-transition timing, are hardware-only
+// (E.3/E.4 capture).
+
+/// Hardware chip-id register, bus address `0x7001_0200` (upstream mt76
+/// `mt76_connac_reg.h: MT_HW_CHIPID`), reached via the connac CSR reg-remap
+/// window — NOT a raw BAR0 offset. The BAR0-relative offset is resolved on
+/// hardware (E.3 capture); driver attachment is gated by the PCI device-ID
+/// match, not this readback.
+pub const MT_HW_CHIPID_BUS_ADDR: u32 = 0x7001_0200;
+
+/// Connac TOP register base (bus address).
+pub const MT_TOP_BASE: u32 = 0x1806_0000;
+
+/// `MT_CONN_ON_MISC` (== `MT_TOP_MISC2`), bus address `0x1806_1140`. Polled for
+/// the firmware-N9-ready bits after `FW_START_REQ`.
+pub const MT_CONN_ON_MISC: u32 = MT_TOP_BASE + 0x1140;
+
+/// Firmware-N9-ready field in `MT_CONN_ON_MISC` (`GENMASK(1, 0)`).
+pub const MT_TOP_MISC2_FW_N9_RDY: u32 = 0x3;
+
+/// Return `true` when a read of [`MT_CONN_ON_MISC`] reports the WM/N9 firmware
+/// running (both [`MT_TOP_MISC2_FW_N9_RDY`] bits set).
+#[inline]
+pub fn fw_n9_ready(misc2: u32) -> bool {
+    misc2 & MT_TOP_MISC2_FW_N9_RDY == MT_TOP_MISC2_FW_N9_RDY
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -99,6 +135,20 @@ mod tests {
         assert_eq!(TX_DMA_BUSY, 1 << 1);
         assert_eq!(RX_DMA_EN, 1 << 2);
         assert_eq!(RX_DMA_BUSY, 1 << 3);
+    }
+
+    #[test]
+    fn fw_ready_register() {
+        // Offset + mask are pinned to the upstream-known values; the BAR0
+        // remap window is hardware-only and intentionally not encoded here.
+        assert_eq!(MT_CONN_ON_MISC, 0x1806_1140);
+        assert_eq!(MT_TOP_MISC2_FW_N9_RDY, 0x3);
+        // Predicate truth table: both bits required.
+        assert!(fw_n9_ready(0x3));
+        assert!(fw_n9_ready(0xFFFF_FFFF));
+        assert!(!fw_n9_ready(0x0));
+        assert!(!fw_n9_ready(0x1));
+        assert!(!fw_n9_ready(0x2));
     }
 
     #[test]

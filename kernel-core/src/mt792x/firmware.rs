@@ -72,6 +72,16 @@ const PATCH_HDR_N_REGION_OFF: usize = 0x20 + 12;
 
 /// `mt76_connac2_patch_sec` total size: 64 bytes.
 const PATCH_SEC_SIZE: usize = 64;
+/// Byte offset of `type` (BE u32) within a patch_sec entry.
+const PATCH_SEC_TYPE_OFF: usize = 0x00;
+/// Byte offset of `offs` (BE u32) — the section's byte offset within the blob.
+const PATCH_SEC_OFFS_OFF: usize = 0x04;
+/// Byte offset of `size` (BE u32) — the section's byte length within the blob.
+const PATCH_SEC_SIZE_OFF: usize = 0x08;
+/// Byte offset of `info.addr` (BE u32) — the section's MCU load address.
+const PATCH_SEC_ADDR_OFF: usize = 0x0C;
+/// Byte offset of `info.len` (BE u32) — the destination length.
+const PATCH_SEC_LEN_OFF: usize = 0x10;
 
 /// Maximum sensible n_region for a ROM-patch blob.
 const PATCH_MAX_REGIONS: u32 = 64;
@@ -102,8 +112,21 @@ pub const MCU_PATCH_ADDRESS: u32 = 0x200000;
 /// Scatter-DMA chunk size used when uploading firmware to the MCU (4 KiB).
 pub const FW_SCATTER_CHUNK: usize = 4096;
 
-/// `feature_set` flag: region specifies an override load address.
-pub const FW_FEATURE_OVERRIDE_ADDR: u8 = 1 << 0;
+// `feature_set` bit flags, matching upstream mt76
+// (`drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h`):
+//   FW_FEATURE_SET_ENCRYPT   BIT(0)
+//   FW_FEATURE_SET_KEY_IDX   GENMASK(2, 1)
+//   FW_FEATURE_ENCRY_MODE    BIT(4)
+//   FW_FEATURE_OVERRIDE_ADDR BIT(5)
+
+/// `feature_set` flag: the region image is encrypted (retail blobs).
+pub const FW_FEATURE_SET_ENCRYPT: u8 = 1 << 0;
+/// `feature_set` mask: encryption key index (`GENMASK(2, 1)`).
+pub const FW_FEATURE_SET_KEY_IDX: u8 = 0b110;
+/// `feature_set` flag: encryption mode selector.
+pub const FW_FEATURE_ENCRY_MODE: u8 = 1 << 4;
+/// `feature_set` flag: region specifies an override load address (`BIT(5)`).
+pub const FW_FEATURE_OVERRIDE_ADDR: u8 = 1 << 5;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -193,6 +216,79 @@ pub fn parse_patch_header(blob: &[u8]) -> Result<PatchHdr, FirmwareError> {
         patch_ver,
         n_region,
     })
+}
+
+/// A parsed `mt76_connac2_patch_sec` entry.
+///
+/// Every section carries its **own** MCU load address (`addr`) — the ROM-patch
+/// download must `PATCH_START_REQ` each section at `addr` and scatter-upload the
+/// slice `blob[offs..offs + size]`, not a single fixed `MCU_PATCH_ADDRESS` for
+/// all sections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PatchSec {
+    /// Section type discriminator (`type` field).
+    pub typ: u32,
+    /// Byte offset of this section's data within the patch blob.
+    pub offs: u32,
+    /// Byte length of this section's data within the patch blob.
+    pub size: u32,
+    /// MCU load address for this section (`info.addr`).
+    pub addr: u32,
+    /// Destination length (`info.len`).
+    pub len: u32,
+}
+
+/// Parse the `n_region` `mt76_connac2_patch_sec` entries that follow the
+/// 96-byte patch header.
+///
+/// All multi-byte fields are **big-endian** (`from_be_bytes`). Each section's
+/// `[offs, offs + size)` slice is bounds-checked against `blob.len()` so a
+/// corrupt or hostile blob yields a [`FirmwareError`] rather than an out-of-
+/// bounds slice at download time. `n_region` is the value returned by
+/// [`parse_patch_header`].
+pub fn parse_patch_sections(blob: &[u8], n_region: u32) -> Result<Vec<PatchSec>, FirmwareError> {
+    if n_region == 0 || n_region > PATCH_MAX_REGIONS {
+        return Err(FirmwareError::BadRegionCount);
+    }
+    let sections_size = (n_region as usize)
+        .checked_mul(PATCH_SEC_SIZE)
+        .ok_or(FirmwareError::BadRegionCount)?;
+    let required = PATCH_HDR_SIZE
+        .checked_add(sections_size)
+        .ok_or(FirmwareError::BadRegionCount)?;
+    if blob.len() < required {
+        return Err(FirmwareError::BadRegionCount);
+    }
+
+    let be32 = |off: usize| -> u32 {
+        u32::from_be_bytes([blob[off], blob[off + 1], blob[off + 2], blob[off + 3]])
+    };
+
+    let mut secs = Vec::with_capacity(n_region as usize);
+    for i in 0..n_region as usize {
+        let base = PATCH_HDR_SIZE + i * PATCH_SEC_SIZE;
+        let typ = be32(base + PATCH_SEC_TYPE_OFF);
+        let offs = be32(base + PATCH_SEC_OFFS_OFF);
+        let size = be32(base + PATCH_SEC_SIZE_OFF);
+        let addr = be32(base + PATCH_SEC_ADDR_OFF);
+        let len = be32(base + PATCH_SEC_LEN_OFF);
+
+        // The section's [offs, offs + size) slice must lie within the blob.
+        let end = (offs as usize)
+            .checked_add(size as usize)
+            .ok_or(FirmwareError::TrailerOutOfBounds)?;
+        if end > blob.len() {
+            return Err(FirmwareError::TrailerOutOfBounds);
+        }
+        secs.push(PatchSec {
+            typ,
+            offs,
+            size,
+            addr,
+            len,
+        });
+    }
+    Ok(secs)
 }
 
 // ---------------------------------------------------------------------------
@@ -445,6 +541,71 @@ mod tests {
         blob
     }
 
+    /// Build a patch blob with a header (`n_region` sections) plus a body, and
+    /// write each section's big-endian `type/offs/size/info.addr/info.len` so
+    /// `parse_patch_sections` has real per-section addresses to recover.
+    ///
+    /// Section `i` is given `addr = 0x0020_0000 + i * 0x1000`, points at a
+    /// `sec_size`-byte slice of the body at `offs = body_start + i * sec_size`.
+    fn make_patch_blob_with_sections(n_region: u32, sec_size: u32) -> Vec<u8> {
+        let sec_count = n_region as usize;
+        let header_and_table = PATCH_HDR_SIZE + sec_count * PATCH_SEC_SIZE;
+        let body_len = sec_count * sec_size as usize;
+        let mut blob = alloc::vec![0u8; header_and_table + body_len];
+
+        // desc.n_region @ 0x20+12 (BE).
+        blob[PATCH_HDR_N_REGION_OFF..PATCH_HDR_N_REGION_OFF + 4]
+            .copy_from_slice(&n_region.to_be_bytes());
+
+        for i in 0..sec_count {
+            let base = PATCH_HDR_SIZE + i * PATCH_SEC_SIZE;
+            let offs = (header_and_table + i * sec_size as usize) as u32;
+            let addr = 0x0020_0000u32 + (i as u32) * 0x1000;
+            let be = |v: u32| v.to_be_bytes();
+            blob[base + PATCH_SEC_TYPE_OFF..base + PATCH_SEC_TYPE_OFF + 4].copy_from_slice(&be(1));
+            blob[base + PATCH_SEC_OFFS_OFF..base + PATCH_SEC_OFFS_OFF + 4]
+                .copy_from_slice(&be(offs));
+            blob[base + PATCH_SEC_SIZE_OFF..base + PATCH_SEC_SIZE_OFF + 4]
+                .copy_from_slice(&be(sec_size));
+            blob[base + PATCH_SEC_ADDR_OFF..base + PATCH_SEC_ADDR_OFF + 4]
+                .copy_from_slice(&be(addr));
+            blob[base + PATCH_SEC_LEN_OFF..base + PATCH_SEC_LEN_OFF + 4]
+                .copy_from_slice(&be(sec_size));
+        }
+        blob
+    }
+
+    #[test]
+    fn parse_synthetic_patch_sections() {
+        let blob = make_patch_blob_with_sections(2, 256);
+        let secs = parse_patch_sections(&blob, 2).expect("valid sections");
+        assert_eq!(secs.len(), 2);
+        // Each section carries its OWN load address (not a single fixed addr).
+        assert_eq!(secs[0].addr, 0x0020_0000);
+        assert_eq!(secs[1].addr, 0x0020_1000);
+        assert_ne!(
+            secs[0].addr, secs[1].addr,
+            "per-section addresses must differ"
+        );
+        assert_eq!(secs[0].size, 256);
+        assert_eq!(secs[1].len, 256);
+        // offs/size must stay within the blob.
+        assert!(secs[1].offs as usize + secs[1].size as usize <= blob.len());
+    }
+
+    #[test]
+    fn patch_section_offs_past_blob_is_out_of_bounds() {
+        let mut blob = make_patch_blob_with_sections(1, 64);
+        // Corrupt section 0's size so offs+size overruns the blob.
+        let base = PATCH_HDR_SIZE;
+        blob[base + PATCH_SEC_SIZE_OFF..base + PATCH_SEC_SIZE_OFF + 4]
+            .copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+        assert_eq!(
+            parse_patch_sections(&blob, 1),
+            Err(FirmwareError::TrailerOutOfBounds)
+        );
+    }
+
     // -----------------------------------------------------------------------
     // parse_patch_header tests
     // -----------------------------------------------------------------------
@@ -509,6 +670,11 @@ mod tests {
         assert_eq!(img.chip_id, 0x79);
         assert_eq!(img.n_region, 2);
         assert_eq!(img.regions.len(), 2);
+
+        // Pin the literal upstream bit position (BIT(5) = 0x20) so a
+        // regression in FW_FEATURE_OVERRIDE_ADDR is caught, not masked by a
+        // self-referential comparison.
+        assert_eq!(FW_FEATURE_OVERRIDE_ADDR, 0x20, "OVERRIDE_ADDR = BIT(5)");
 
         // Region 0.
         assert_eq!(img.regions[0].addr, 0x0010_0000);

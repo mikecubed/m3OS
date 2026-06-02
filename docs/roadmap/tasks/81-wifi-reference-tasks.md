@@ -70,14 +70,15 @@
 - `kernel-core/src/mt792x/firmware.rs` (new; host-testable parsers — model on `kernel_core::r8169::parse_rtl_fw` / `validate_good_firmware`, which test against **synthetic crafted** blobs, not vendor firmware)
 - `userspace/drivers/mt792x/src/fw.rs` (new; the on-the-wire download sequence)
 
-**Symbol:** `parse_patch_header(blob) -> Result<PatchHdr, FirmwareError>` decoding `mt76_connac2_patch_hdr` (**big-endian** `hw_sw_ver`/`patch_ver`/`checksum` + `desc.n_region`) and the `mt76_connac2_patch_sec` entries; `parse_fw_trailer(blob) -> Result<FwImage, FirmwareError>` decoding the **trailing** `mt76_connac2_fw_trailer` (`chip_id`/`eco_code`/`n_region`/`format_ver`/`fw_ver[10]`/`crc`, **little-endian**) + the `n_region` × `mt76_connac2_fw_region` (`addr`/`len`/`feature_set`/`type`); `FirmwareError{TooShort, BadMagic, BadRegionCount, BadChecksum, UnalignedRegion, TrailerOutOfBounds}`; a `FirmwareSet{ rom_patch, ram_code }` selected by chip-id; the driver-side `download_firmware(...)` implementing: (1) `PATCH_SEM_GET` → branch on `PATCH_IS_DL` (skip) vs `PATCH_NOT_DL_SEM_SUCCESS` (proceed); (2) per-section `init_download` (`PATCH_START_REQ`, load addr `MCU_PATCH_ADDRESS = 0x200000`) + `FW_SCATTER` chunked at **4096 bytes**; (3) `PATCH_FINISH_REQ`; (4) `PATCH_SEM_RELEASE`; (5) per-region RAM `init_download` (`TARGET_ADDRESS_LEN_REQ` with **`addr = region.addr`, `len = region.len`** — each region carries its own load address, not a fixed one; mode from `feature_set` honoring `FW_FEATURE_OVERRIDE_ADDR`; the encrypt path is declined for retail blobs) + `FW_SCATTER`; (6) `FW_START_REQ` (`FW_START_OVERRIDE`/`FW_START_WORKING_PDA_CR4`); (7) poll firmware-running.
+**Symbol:** `parse_patch_header(blob) -> Result<PatchHdr, FirmwareError>` decoding `mt76_connac2_patch_hdr` (**big-endian** `hw_sw_ver`/`patch_ver`/`checksum` + `desc.n_region`) and the `mt76_connac2_patch_sec` entries; `parse_fw_trailer(blob) -> Result<FwImage, FirmwareError>` decoding the **trailing** `mt76_connac2_fw_trailer` (`chip_id`/`eco_code`/`n_region`/`format_ver`/`fw_ver[10]`/`crc`, **little-endian**) + the `n_region` × `mt76_connac2_fw_region` (`addr`/`len`/`feature_set`/`type`); `FirmwareError{TooShort, BadMagic, BadRegionCount, BadChecksum, UnalignedRegion, TrailerOutOfBounds}`; a `FirmwareSet{ rom_patch, ram_code }` selected by chip-id; the driver-side `download_firmware(...)` implementing, with the **established upstream connac2 `MCU_CMD_*` opcodes** (`mt76_connac_mcu.h`, pinned host-side in `mt792x_hal::fw_proto::cmd`, NOT guesses): (1) `PATCH_SEM_CONTROL` (payload op = get) → `decode_patch_sem` branch on `PATCH_IS_DL` (skip) vs `PATCH_NOT_DL_SEM_SUCCESS` (proceed); (2) for each parsed `mt76_connac2_patch_sec` (`parse_patch_sections`), `PATCH_START_REQ` at the **section's own `addr`** + `FW_SCATTER` of the section's `[offs, offs+size)` slice chunked at **4096 bytes**; (3) `PATCH_FINISH_REQ`; (4) `PATCH_SEM_CONTROL` (payload op = release); (5) per-region RAM `TARGET_ADDRESS_LEN_REQ` with **`addr = region.addr`, `len = region.len`** (each region carries its own load address; mode from `feature_set` honoring `FW_FEATURE_OVERRIDE_ADDR = BIT(5)`) + `FW_SCATTER`; (6) `FW_START_REQ`; (7) poll firmware-running via `kernel_core::mt792x::regs::fw_n9_ready(MT_CONN_ON_MISC)`. (`MCU_PATCH_ADDRESS = 0x200000` remains as the connac default base for blobs that do not carry per-section addresses.)
 **Why it matters:** firmware is **mandatory** for mt792x (unlike the *optional* r8169 PHY firmware) — the chip does nothing until the WM MCU is running. The patch header is big-endian and the RAM image is trailer-based little-endian, so an endianness slip corrupts section addresses (research pitfall #4); the patch-semaphore must skip re-download on `PATCH_IS_DL` or it wedges the MCU (pitfall #3); each RAM region loads to its **own** `region.addr`. Host-testing the parsers against **synthetic crafted** headers/trailers catches these before any DMA, exactly as `r8169::validate_good_firmware` does — committing the real vendor blob is deferred to the F.3 license clearance and exercised only on hardware (E.4).
 
 **Acceptance:**
 - [x] Host test builds **synthetic** patch/trailer blobs and asserts `parse_patch_header` returns the crafted `n_region` + big-endian version and `parse_fw_trailer` returns regions whose `addr`/`len` are in-bounds (`kernel_core::mt792x::firmware::tests::parse_synthetic_patch`, `parse_synthetic_ram_trailer`).
 - [x] Host test asserts every `FirmwareError` variant on crafted-malformed inputs (truncated, bad magic, region count overflowing the blob, trailer past EOF) — no parser panics on adversarial input.
 - [x] Host test models the scatter chunking: a blob of length `N` produces `ceil(N/4096)` `FW_SCATTER` chunks, the last short (`chunking_4096`); and the patch-semaphore branch: `PATCH_IS_DL` → zero patch sections downloaded, `PATCH_NOT_DL_SEM_SUCCESS` → all sections downloaded then released (`patch_sem_branch`).
-- [ ] *(Hardware-only / E.4.)* The full handshake completes against the operator-supplied real blob and the firmware-running poll returns ready before any MCU init command is issued. **The exact firmware-running poll register/value is `[UNCERTAIN]` in the upstream research and is lifted from `mt7921/mcu.c` + captured under E.3.**
+- [x] Host test parses per-section `mt76_connac2_patch_sec` entries — each carries its **own** big-endian `type`/`offs`/`size`/`info.addr` and the download uses that addr (not a single fixed base), with `[offs, offs+size)` bounds-checked against the blob (`parse_synthetic_patch_sections`, `patch_section_offs_past_blob_is_out_of_bounds`). The driver-side opcodes + semaphore decode are pinned host-side (`mt792x_hal::fw_proto::tests::{fw_constants_match_upstream, patch_sem_decode}`).
+- [ ] *(Hardware-only / E.4.)* The full handshake completes against the operator-supplied real blob and the firmware-running poll returns ready before any MCU init command is issued. **The poll register offset + mask are now upstream-derived and host-pinned** (`kernel_core::mt792x::regs::{MT_CONN_ON_MISC, MT_TOP_MISC2_FW_N9_RDY, fw_n9_ready}`, from `mt7921/mcu.c`); the only `[UNCERTAIN]` remainder is the **BAR0 reg-remap window** that maps the connac `0x1800_0000` bus range and the live ready-transition timing, both confirmed under E.3.
 
 ### A.5 — WM MCU command ring (FWDL/WM TX queues + MCU RX queue) + TXD/TLV encoders
 
@@ -116,16 +117,16 @@
 - `xtask/src/main.rs` (`build_userspace` `bins` array + `--features os-binary` map + `populate_ext2_files` service conf)
 - `kernel/src/fs/ramdisk.rs` (`generated_initrd_asset!` static + the `/drivers/mt792x` `DRIVERS_ENTRIES`/`BIN_ENTRIES` tuple)
 - `userspace/init/src/main.rs` (`KNOWN_CONFIGS`)
-- `kernel/initrd/etc/services.d/mt792x.conf` (via `populate_ext2_files`)
+- `kernel/initrd/etc/services.d/mt792x_driver.conf` (via `populate_ext2_files`)
 
-**Symbol:** the four AGENTS.md wiring places for a new userspace binary, applied to `mt792x_driver`, plus the `wifi-core` lib as a workspace member; the service conf `name=mt792x\ncommand=/drivers/mt792x\ntype=daemon\nrestart=on-failure\nmax_restart=5\n`
+**Symbol:** the four AGENTS.md wiring places for a new userspace binary, applied to `mt792x_driver`, plus the `wifi-core` lib as a workspace member; the service conf `name=mt792x_driver\ncommand=/drivers/mt792x\ntype=daemon\nrestart=on-failure\nmax_restart=5\n` (the service `name` is `mt792x_driver`; `/drivers/mt792x` is the `command=` ramdisk path)
 **Why it matters:** AGENTS.md "Adding a New Userspace Binary" requires **four distinct** wiring places — miss the `bins` array and the driver is never built into the image; miss the ramdisk entry and `execve` returns `ENOENT`; miss the `.conf`/`KNOWN_CONFIGS` and `init` never spawns it. `r8169`/`r8125` each appear in all four. `wifi-core` is a **lib only** (no binary, no ramdisk/conf entry) but must still be a workspace member or it is not built or checked.
 
 **Acceptance:**
 - [x] `userspace/drivers/mt792x` **and** `userspace/wifi-core` are added to root `Cargo.toml` `members`.
 - [x] `mt792x_driver` is added to the `bins` array in `build_userspace` with `needs_alloc = true` (it uses `alloc`/`kernel-core`) and the `--features os-binary` map.
 - [x] `static MT792X_DRIVER_ELF = generated_initrd_asset!("mt792x_driver")` + a `/drivers/mt792x` ramdisk tuple are added to `kernel/src/fs/ramdisk.rs`.
-- [x] `mt792x.conf` is present in `populate_ext2_files` **and** `KNOWN_CONFIGS`; after `cargo xtask clean` + boot, `init` logs `init: driver.registered name=mt792x` (the daemon spawns).
+- [x] `mt792x_driver.conf` is present in `populate_ext2_files` **and** `KNOWN_CONFIGS`; after `cargo xtask clean` + boot, `init` logs `init: driver.registered name=mt792x_driver` (the daemon spawns).
 
 ### A.8 — Firmware-staging pipeline (operator-supplied blob; graceful absence)
 
@@ -296,7 +297,7 @@
 
 **Files:**
 - `userspace/wifi-core/src/config.rs` (new; host-testable parser)
-- `kernel/initrd/etc/wpa.conf` (staged via `populate_ext2_files` — the **service** `.conf` + `KNOWN_CONFIGS` wiring is A.7)
+- `/etc/wpa.conf` — **operator-supplied** at runtime, NOT committed/staged (it holds the live SSID + PSK credentials, like the operator-staged firmware blob in A.8). The driver reads it best-effort: absent/malformed ⇒ `mt792x_driver: no usable /etc/wpa.conf — passive L2 mode`. The **service** `.conf` (`mt792x_driver.conf`) + `KNOWN_CONFIGS` wiring is A.7 and is unrelated to this credential file.
 
 **Symbol:** `wifi_core::config::parse_wpa_conf(text) -> Result<WpaConfig, ConfigError>` parsing `ssid=...`, `psk=...`, optional `freq=2.4|5` into `WpaConfig{ ssid, psk, freq: Band }`
 **Why it matters:** the design doc scopes config to a single static `/etc/wpa.conf` read at boot (no `wpa_supplicant` daemon at 1.0). Keeping the parser in `wifi-core` makes the (untrusted, on-disk) config parsing host-testable. The PSK→PMK conversion (B.2) happens at config load and the plaintext passphrase is zeroed once the PMK is cached.
@@ -304,7 +305,7 @@
 **Acceptance:**
 - [x] Host test parses `ssid=Home\npsk=secret123\nfreq=5\n` into `WpaConfig{ssid, psk, freq: Band::Ghz5}` and rejects malformed/missing-PSK input with a typed `ConfigError` (`wifi_core::config::tests::parse_valid`, `rejects_missing_psk`).
 - [x] Host test asserts the 8–63-char passphrase length bound (the PBKDF2 input constraint) is enforced (`rejects_short_psk`).
-- [x] The PSK is converted to the PMK via B.2 at config load and the plaintext passphrase is zeroed afterward (documented + a test asserting the `WpaConfig` exposes the PMK, not the raw passphrase, after `finalize()`).
+- [x] The PSK is converted to the PMK via B.2 at config load and the plaintext passphrase buffer is volatile-zeroed afterward (`config.rs` `zero_secret`) — `WpaConfig` exposes only the derived PMK (`pmk()`), never the raw passphrase (`config::tests::no_passphrase_getter`).
 
 ### D.2 — `m3ctl wifi status` read-only diagnostics
 
@@ -318,7 +319,8 @@
 **Acceptance:**
 - [x] Host test asserts the `m3ctl wifi status` formatter renders a `WIFI_STATUS{ssid, rssi, ipv4}` value into the expected human-readable lines (`m3ctl::tests::wifi_status_format`).
 - [x] When not associated, `m3ctl wifi status` prints "not associated" (driven by `WifiControlError::NotAssociated`) rather than erroring.
-- [ ] *(Hardware-only / E.4.)* `m3ctl wifi status` on the dev laptop reports the associated SSID, a plausible RSSI, and the DHCP-assigned IPv4.
+- [x] The driver-side responder logic — mapping supplicant state → `WifiStatus` (associated ⇒ SSID populated; otherwise empty-SSID) — is host-tested (`wifi_core::control::WifiStatus::for_connection` + `control::tests::status_for_connection`).
+- [ ] *(Hardware-only / E.4.)* `m3ctl wifi status` on the dev laptop reports the associated SSID, a plausible RSSI, and the DHCP-assigned IPv4. **Driver-side wiring note:** the driver's `run_io_loop` blocks on the single `net.nic` `NetServer::handle_next` endpoint, and `NetServer` does not surface non-net labels; multiplexing the read-only `wifi.control` responder onto the driver's IPC endpoint (so `m3ctl` can query it live) is the remaining E.4 hardware step — the `WifiStatus::for_connection` responder it calls is implemented + host-tested above, but serving it live is exercised only on the radio (no QEMU mt76 model). Until then `m3ctl wifi status` degrades to "not associated".
 
 ---
 
@@ -351,7 +353,7 @@
 
 **Acceptance:**
 - [x] `cargo xtask wifi-smoke` without `M3OS_WIFI_REGRESSION=1` prints the skip-with-reason and exits success, explicitly stating QEMU has no mt76 model and that the host tests are the coverage.
-- [x] With `M3OS_WIFI_REGRESSION=1` the gate references the E.3 VFIO runbook and (on the dev laptop only) asserts `init: driver.registered name=mt792x` + `MT792X_SMOKE:server:READY` + the association sentinel.
+- [x] With `M3OS_WIFI_REGRESSION=1` the gate references the E.3 VFIO runbook and (on the dev laptop only) asserts `init: driver.registered name=mt792x_driver` + `MT792X_SMOKE:server:READY` + the association sentinel.
 - [x] The gate is registered in the AGENTS.md opt-in table with env var `M3OS_WIFI_REGRESSION=1`.
 
 ### E.3 — Hardware-only VFIO / bare-metal validation runbook + `docs/research/` capture
@@ -399,7 +401,7 @@
 
 **Acceptance:**
 - [x] `kernel/Cargo.toml` reads `version = "0.81.0"` and `AGENTS.md` reads `kernel **v0.81.0**`; `cargo xtask check` passes.
-- [x] A scoped check confirms no **build** file (`Cargo.toml` / Rust source) still reads `0.80.0` — `grep -rn '0\.80\.0' kernel/ userspace/ kernel-core/ xtask/ --include=*.toml --include=*.rs` returns nothing (the broad repo grep is **not** used; landed phase docs under `docs/roadmap/` legitimately retain prior versions).
+- [x] A scoped check confirms the **kernel release marker** no longer reads `0.80.0`: `kernel/Cargo.toml` reads `version = "0.81.0"` and AGENTS.md reads `kernel **v0.81.0**`. The only remaining matches of `grep -rn '0\.80\.0' kernel/ userspace/ kernel-core/ xtask/ --include=*.toml --include=*.rs` are `userspace/drivers/hda/Cargo.toml` and `userspace/drivers/ac97/Cargo.toml` — independently-versioned Phase-80 audio-driver crate manifests, NOT the kernel release marker, which Phase 81 deliberately does not touch. (The broad repo grep is not used; landed phase docs under `docs/roadmap/` legitimately retain prior versions.)
 - [x] AGENTS.md gains one Wireless bullet (e.g. "**Wireless**: ring-3 MediaTek mt792x Wi-Fi driver — firmware-blob download, WM MCU command ring, WFDMA TX/RX rings, soft-MAC 802.11 mgmt FSM + WPA2-PSK 4-way handshake (host crypto in `wifi-core`/`crypto-lib`) with chipset CCMP offload, presenting as an L2 `RemoteNic`").
 
 ### F.2 — Author `docs/81-wifi-reference.md` learning doc + cross-link

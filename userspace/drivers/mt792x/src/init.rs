@@ -149,7 +149,14 @@ impl Mt792x {
         mmio.write_reg::<u32>(MT_WFDMA0_RST_DRX_PTR, 0xFFFF_FFFF); // reset all RX pointers
 
         // Read chip-ID register and log it.
-        // MT_HW_CHIPID is at BAR0 offset 0x00 (first MMIO word on mt7921+).
+        //
+        // `[UNCERTAIN]` BAR0-relative offset. The chip-id lives at upstream bus
+        // address `MT_HW_CHIPID = 0x7001_0200` (mt76 `mt76_connac_reg.h`),
+        // reached through the connac CSR reg-remap window — NOT a raw BAR0
+        // offset. The `0x00` below is a provisional placeholder; the real
+        // BAR0-relative offset depends on the remap table and is resolved on
+        // hardware (E.3 capture). The PCI device-ID match (`select_mt792x`),
+        // not this readback, is what gates driver attachment.
         let chip_id = mmio.read_reg::<u32>(0x00);
         write_hex32("mt792x: chip_id=0x", chip_id);
 

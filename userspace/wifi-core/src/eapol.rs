@@ -293,13 +293,19 @@ mod tests {
         let mic2 = mic_sha1_128(&ptk.kck, &corrupted);
         assert_ne!(mic, mic2, "single-bit corruption must flip the MIC");
 
-        // Deterministic assertion: hard-coded expected MIC for the above inputs.
-        // Computed by reference Python:
-        //   hmac.new(kck, frame_bytes, hashlib.sha1).digest()[:16]
-        // where frame_bytes is the output of build_m2_body with those inputs.
-        // (Stored in EXPECTED_M2_MIC below — generated from the same reference.)
-        let expected: [u8; 16] = expected_m2_mic(&ptk.kck, &frame);
-        assert_eq!(mic, expected, "MIC must equal reference value");
+        // Deterministic assertion against an EXTERNALLY-derived constant (not the
+        // function under test), so a wrong MIC offset, truncation length, or
+        // field ordering in build_m2_body / mic_sha1_128 fails here.
+        //
+        // Reproduction (independent of this code):
+        //   KCK   = 3ffe47104cb02312eaf13c567ec0417c  (kdf::tests::ptk_vector)
+        //   FRAME = build_m2_body(1, SNonce, RsnIe::ccmp_psk()) with MIC zeroed
+        //   MIC   = hmac.new(KCK, FRAME, hashlib.sha1).digest()[:16]
+        let expected: [u8; 16] = [
+            0xcc, 0x7d, 0x0d, 0xc7, 0x83, 0x04, 0x05, 0xc4, 0x32, 0xcd, 0x85, 0x7f, 0x5e, 0xf2,
+            0xb0, 0x9b,
+        ];
+        assert_eq!(mic, expected, "MIC must equal the external reference value");
     }
 
     /// The RSN IE embedded in an M2 key-data frame must be byte-for-byte
@@ -333,11 +339,5 @@ mod tests {
             key_data: rsn_ie.to_vec(),
         };
         frame.encode()
-    }
-
-    /// Compute the expected MIC by running the actual function —
-    /// this serves as the ground truth for the deterministic assertion.
-    fn expected_m2_mic(kck: &[u8], frame: &[u8]) -> [u8; 16] {
-        mic_sha1_128(kck, frame)
     }
 }

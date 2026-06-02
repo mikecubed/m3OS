@@ -137,23 +137,33 @@ pub fn rx_desc_len(ctrl: u32) -> u16 {
 // Token pool
 // ---------------------------------------------------------------------------
 
-/// Maximum number of concurrently live DMA tokens.
+/// Number of token slots this pool manages.
 ///
-/// A Wi-Fi NIC consumes at most one token slot in the combined NIC token
-/// registry — the Phase 79 `MAX_NICS = 8` cap is not duplicated here because
-/// the token pool is per-driver, not per-registry. 256 tokens covers the
-/// typical connac2 TX ring depth (256 entries).
+/// This is the **software token-id space** for in-flight TX buffers, not the
+/// hardware TX ring depth — upstream mt76 sizes the analogous id pool at
+/// `MT7921_TOKEN_SIZE = 8192`, independently of the per-ring descriptor count.
+/// 256 is a deliberately conservative cap for this driver's single TX path; a
+/// Wi-Fi NIC also consumes at most one slot in the Phase 79 combined NIC
+/// registry, which is a separate concern from this per-driver pool.
 pub const MAX_TOKENS: u16 = 256;
+
+/// Number of `u64` words in the liveness bitmap (`MAX_TOKENS` bits).
+const LIVE_WORDS: usize = (MAX_TOKENS as usize).div_ceil(64);
 
 /// An IDR-style free-list of [`Token`]s.
 ///
 /// Tokens are allocated monotonically from 0 to `MAX_TOKENS - 1`; released
-/// tokens are pushed onto the free list and reused in LIFO order.
+/// tokens are pushed onto the free list and reused in LIFO order. A liveness
+/// bitmap rejects double-release / release-of-never-acquired so a buggy
+/// TX-completion path cannot corrupt the free list into handing out the same
+/// id twice.
 pub struct TokenPool {
     /// LIFO free list of available token indices.
     free: Vec<u16>,
     /// Next never-yet-allocated index (used when `free` is empty).
     next: u16,
+    /// Per-token liveness bitmap (bit set ⇒ acquired and not yet released).
+    live: [u64; LIVE_WORDS],
 }
 
 impl TokenPool {
@@ -162,6 +172,7 @@ impl TokenPool {
         TokenPool {
             free: Vec::new(),
             next: 0,
+            live: [0; LIVE_WORDS],
         }
     }
 
@@ -170,22 +181,38 @@ impl TokenPool {
     /// Returns `None` when `MAX_TOKENS` tokens are simultaneously live
     /// (the pool is exhausted).
     pub fn acquire(&mut self) -> Option<Token> {
-        if let Some(idx) = self.free.pop() {
-            return Some(Token(idx));
-        }
-        if self.next < MAX_TOKENS {
+        let idx = if let Some(idx) = self.free.pop() {
+            idx
+        } else if self.next < MAX_TOKENS {
             let idx = self.next;
             self.next += 1;
-            return Some(Token(idx));
-        }
-        None
+            idx
+        } else {
+            return None;
+        };
+        self.live[idx as usize / 64] |= 1 << (idx as usize % 64);
+        Some(Token(idx))
     }
 
     /// Release a token back to the pool.
     ///
-    /// The caller must not use the token after release. In the kernel driver
-    /// this is enforced by consuming the `Token` value.
+    /// The caller must not use the token after release. A double-release or a
+    /// release of a never-acquired index is a no-op (it does not re-enter the
+    /// free list), so the invariant "each live id is unique" holds even if a
+    /// completion handler fires twice.
     pub fn release(&mut self, token: Token) {
+        let idx = token.0 as usize;
+        if idx >= MAX_TOKENS as usize {
+            return;
+        }
+        let (w, b) = (idx / 64, idx % 64);
+        if self.live[w] & (1 << b) == 0 {
+            // Not currently live: double-release or never acquired. Ignore it
+            // (a no-op) rather than corrupting the free list — graceful
+            // handling is the entire purpose of this guard.
+            return;
+        }
+        self.live[w] &= !(1 << b);
         self.free.push(token.0);
     }
 }
@@ -316,6 +343,23 @@ mod tests {
             let t = pool.acquire().unwrap();
             assert!(seen.insert(t.0), "token {} issued twice", t.0);
         }
+    }
+
+    #[test]
+    fn token_pool_rejects_double_release() {
+        let mut pool = TokenPool::new();
+        let t = pool.acquire().expect("first acquire");
+        pool.release(Token(t.0));
+        // A second (erroneous) release of the same id must NOT re-enter the
+        // free list, or the pool would later hand out the id twice.
+        pool.release(Token(t.0));
+
+        let a = pool.acquire().expect("re-acquire 1");
+        let b = pool.acquire().expect("acquire 2");
+        assert_ne!(
+            a.0, b.0,
+            "double-release must not allow the same id to be issued twice"
+        );
     }
 
     #[test]

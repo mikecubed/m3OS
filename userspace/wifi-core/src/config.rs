@@ -75,8 +75,8 @@ impl WpaConfig {
 /// All other keys are silently ignored.
 ///
 /// The passphrase is validated (8..=63 characters), converted to the PMK via
-/// `PBKDF2-HMAC-SHA1(passphrase, ssid, 4096, 32)`, and then zeroed from the
-/// stack buffer before returning.
+/// `PBKDF2-HMAC-SHA1(passphrase, ssid, 4096, 32)`, and the plaintext buffer is
+/// then volatile-zeroed before returning so only the derived PMK is retained.
 pub fn parse_wpa_conf(text: &str) -> Result<WpaConfig, ConfigError> {
     let mut ssid_opt: Option<Vec<u8>> = None;
     let mut psk_opt: Option<Vec<u8>> = None;
@@ -117,24 +117,36 @@ pub fn parse_wpa_conf(text: &str) -> Result<WpaConfig, ConfigError> {
     }
 
     let ssid = ssid_opt.ok_or(ConfigError::MissingSsid)?;
-    let psk_bytes = psk_opt.ok_or(ConfigError::MissingPsk)?;
+    let mut psk_bytes = psk_opt.ok_or(ConfigError::MissingPsk)?;
 
     // Validate passphrase length per IEEE 802.11 §H.4 (8..=63 octets).
     if psk_bytes.len() < 8 {
+        zero_secret(&mut psk_bytes);
         return Err(ConfigError::ShortPsk);
     }
     if psk_bytes.len() > 63 {
+        zero_secret(&mut psk_bytes);
         return Err(ConfigError::LongPsk);
     }
 
     // Derive PMK at parse time; keep only the PMK.
     let pmk = crypto_lib::hash::wpa_pmk(&psk_bytes, &ssid);
 
-    // Zero the passphrase bytes to prevent leaks.
-    // We use a direct Vec<u8> drop here; zeroization is best-effort in safe Rust.
+    // Volatile-zero the plaintext passphrase's HEAP CONTENTS (not just the Vec
+    // header) so the secret does not linger after the PMK is derived. Mirrors
+    // the `write_volatile` pattern in `crypto_lib::random`.
+    zero_secret(&mut psk_bytes);
     drop(psk_bytes);
 
     Ok(WpaConfig { ssid, pmk, freq })
+}
+
+/// Volatile-zero a heap byte buffer so the optimizer cannot elide the wipe.
+fn zero_secret(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        // SAFETY: `b` is a valid, uniquely-borrowed, aligned `u8`.
+        unsafe { core::ptr::write_volatile(b, 0u8) };
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

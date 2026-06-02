@@ -8,56 +8,56 @@
 //!
 //! The documented handshake for loading ROM-patch + RAM code onto the MCU is:
 //!
-//! 1. `PATCH_SEM_GET` — acquire the semaphore; branch on [`PatchSem`]:
+//! 1. `PATCH_SEM_CONTROL` (op = get) — acquire the semaphore; branch on
+//!    [`PatchSem`]:
 //!    - `IsDl` → ROM-patch already loaded by a prior driver instance; skip to step 5.
 //!    - `NotDlSemSuccess` → proceed to step 2.
-//! 2. Parse the ROM-patch header via `parse_patch_header`; for each of the
-//!    `n_region` sections: init-download (`PATCH_START_REQ` with target
-//!    `MCU_PATCH_ADDRESS`) then chunked scatter-DMA upload (`FW_SCATTER`) at
-//!    `FW_SCATTER_CHUNK` (4096 bytes) — use `scatter_chunk_count` for the loop
-//!    bound.
+//! 2. Parse the ROM-patch sections via `parse_patch_sections`; for each section:
+//!    init-download (`PATCH_START_REQ` with the section's **own** `addr`) then
+//!    chunked scatter-DMA upload (`FW_SCATTER`) of `rom_patch[offs..offs+size]`
+//!    at `FW_SCATTER_CHUNK` (4096 bytes) — use `scatter_chunk_count` for the
+//!    loop bound.
 //! 3. `PATCH_FINISH_REQ` — signal MCU that ROM-patch download is complete.
-//! 4. `PATCH_SEM_RELEASE` — release the semaphore.
+//! 4. `PATCH_SEM_CONTROL` (op = release) — release the semaphore.
 //! 5. Parse the RAM-code trailer via `parse_fw_trailer`; for each region:
 //!    - `TARGET_ADDRESS_LEN_REQ` with `addr = region.addr`, `len = region.len`,
 //!      honouring `FW_FEATURE_OVERRIDE_ADDR`.
 //!    - Chunked scatter-DMA upload (`FW_SCATTER`) at `FW_SCATTER_CHUNK`.
 //! 6. `FW_START_REQ` — signal MCU to begin executing the new firmware.
-//! 7. Poll firmware-running.
-//!    **[UNCERTAIN]** firmware-running poll register/value — resolve on hardware
-//!    (E.3 capture). A placeholder busy-loop is used here.
+//! 7. Poll firmware-running via `kernel_core::mt792x::regs::fw_n9_ready` over a
+//!    read of `MT_CONN_ON_MISC`.
+//!    **[UNCERTAIN]** only the BAR0 reg-remap *window* that maps the connac
+//!    `0x1800_0000` bus range — the register offset/mask and the ready predicate
+//!    are upstream-known (`kernel_core::mt792x::regs`). The window and the live
+//!    transition timing are confirmed on hardware (E.3 capture); until the Mmio
+//!    handle is threaded into this path a bounded spin stands in for the poll.
 //!
-//! The pure parsing logic (`parse_patch_header`, `parse_fw_trailer`, etc.) lives
-//! in `kernel_core::mt792x::firmware` (host-tested). This module is the
-//! thin policy + sequencing layer that calls those parsers and drives the MCU.
+//! The pure parsing logic (`parse_patch_header`, `parse_patch_sections`,
+//! `parse_fw_trailer`, etc.) lives in `kernel_core::mt792x::firmware`
+//! (host-tested). This module is the thin policy + sequencing layer that calls
+//! those parsers and drives the MCU.
+//!
+//! MCU command IDs are the established upstream connac2 values from
+//! `drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h` (`enum
+//! mt76_connac_mcu_cmd` / the `MCU_CMD()` opcodes), not guesses.
 
 extern crate alloc;
 
 use kernel_core::mt792x::firmware::{
-    FW_SCATTER_CHUNK, FirmwareError, MCU_PATCH_ADDRESS, PatchSem, parse_fw_trailer,
-    parse_patch_header, patch_sections_to_download, scatter_chunk_count,
+    FW_SCATTER_CHUNK, FirmwareError, PatchSem, parse_fw_trailer, parse_patch_header,
+    parse_patch_sections, scatter_chunk_count,
 };
 
+use crate::fw_proto::{
+    PATCH_SEM_GET, PATCH_SEM_RELEASE, cmd, decode_patch_sem as decode_patch_sem_pure,
+};
 use crate::mcu::{McuError, McuRing};
 
-/// Placeholder MCU command IDs used during the firmware-download handshake.
-/// These will be resolved against the upstream mt76 source at hardware-bring-up
-/// time (Track E.3 capture); the exact values are [UNCERTAIN].
-mod cmd {
-    /// Request semaphore acquisition for ROM-patch download.
-    pub const PATCH_SEM_GET: u8 = 0x10; // [UNCERTAIN] placeholder
-    /// Release the ROM-patch download semaphore.
-    pub const PATCH_SEM_RELEASE: u8 = 0x11; // [UNCERTAIN] placeholder
-    /// Initiate a ROM-patch region download.
-    pub const PATCH_START_REQ: u8 = 0x20; // [UNCERTAIN] placeholder
-    /// Signal ROM-patch download completion.
-    pub const PATCH_FINISH_REQ: u8 = 0x21; // [UNCERTAIN] placeholder
-    /// Upload one scatter-DMA chunk.
-    pub const FW_SCATTER: u8 = 0x30; // [UNCERTAIN] placeholder
-    /// Specify RAM-code region target address + length.
-    pub const TARGET_ADDRESS_LEN_REQ: u8 = 0x31; // [UNCERTAIN] placeholder
-    /// Signal firmware execution start.
-    pub const FW_START_REQ: u8 = 0x32; // [UNCERTAIN] placeholder
+/// Decode a `PATCH_SEM_CONTROL` (get) reply, mapping a semaphore failure to the
+/// driver's [`FwDownloadError`]. The pure decode lives in
+/// [`crate::fw_proto::decode_patch_sem`] (host-tested).
+fn decode_patch_sem(reply: &[u8]) -> Result<PatchSem, FwDownloadError> {
+    decode_patch_sem_pure(reply).ok_or(FwDownloadError::McuError(McuError::SequenceMismatch))
 }
 
 /// Errors that can occur during firmware download.
@@ -110,36 +110,33 @@ pub fn download_firmware(
     // Phase 1: ROM-patch download
     // -----------------------------------------------------------------------
 
-    // Step 1: Acquire the ROM-patch semaphore.
-    let sem_reply = mcu.submit_and_reap(cmd::PATCH_SEM_GET, &[])?;
-    // A reply byte of 0x01 means "already downloaded" (IsDl), 0x00 means
-    // we acquired the semaphore and must download. This encoding is
-    // [UNCERTAIN] pending hardware capture; use the first byte of the reply.
-    let sem = if sem_reply.first().copied().unwrap_or(0) != 0 {
-        PatchSem::IsDl
-    } else {
-        PatchSem::NotDlSemSuccess
-    };
+    // Step 1: Acquire the ROM-patch semaphore (PATCH_SEM_CONTROL, op = get).
+    let sem_reply = mcu.submit_and_reap(cmd::PATCH_SEM_CONTROL, &[PATCH_SEM_GET])?;
+    let sem = decode_patch_sem(&sem_reply)?;
 
     let hdr = parse_patch_header(rom_patch)?;
-    let sections_to_download = patch_sections_to_download(sem, hdr.n_region);
 
-    if sections_to_download > 0 {
-        // Step 2: for each ROM-patch section, send PATCH_START_REQ then scatter.
-        for _sec in 0..sections_to_download as usize {
-            // Build the PATCH_START_REQ payload: target address (LE u32) +
-            // placeholder section info. [UNCERTAIN] exact payload format.
-            let start_payload = MCU_PATCH_ADDRESS.to_le_bytes();
+    if sem == PatchSem::NotDlSemSuccess {
+        // Step 2: each ROM-patch section loads at its OWN address; upload only
+        // that section's [offs, offs+size) slice.
+        let sections = parse_patch_sections(rom_patch, hdr.n_region)?;
+        for sec in &sections {
+            // PATCH_START_REQ payload: section target address (LE u32).
+            let start_payload = sec.addr.to_le_bytes();
             mcu.submit_and_reap(cmd::PATCH_START_REQ, &start_payload)?;
 
-            // Scatter-DMA upload of this section's data. For the shell track
-            // we use the full rom_patch blob as a placeholder for the actual
-            // per-section slice; the real section-slice indexing will be wired
-            // in during Track E.3 hardware capture.
-            let chunk_count = scatter_chunk_count(rom_patch.len());
+            // Scatter-DMA upload of this section's bytes only.
+            let offs = sec.offs as usize;
+            let size = sec.size as usize;
+            let chunk_count = scatter_chunk_count(size);
             for chunk_idx in 0..chunk_count {
-                let start = chunk_idx * FW_SCATTER_CHUNK;
-                let end = (start + FW_SCATTER_CHUNK).min(rom_patch.len());
+                let start = offs + chunk_idx * FW_SCATTER_CHUNK;
+                let end = (start + FW_SCATTER_CHUNK)
+                    .min(offs + size)
+                    .min(rom_patch.len());
+                if start >= rom_patch.len() {
+                    break;
+                }
                 mcu.submit_and_reap(cmd::FW_SCATTER, &rom_patch[start..end])?;
             }
         }
@@ -148,8 +145,8 @@ pub fn download_firmware(
         mcu.submit_and_reap(cmd::PATCH_FINISH_REQ, &[])?;
     }
 
-    // Step 4: Release the semaphore.
-    mcu.submit_and_reap(cmd::PATCH_SEM_RELEASE, &[])?;
+    // Step 4: Release the semaphore (PATCH_SEM_CONTROL, op = release).
+    mcu.submit_and_reap(cmd::PATCH_SEM_CONTROL, &[PATCH_SEM_RELEASE])?;
 
     // -----------------------------------------------------------------------
     // Phase 2: RAM-code download
@@ -192,10 +189,13 @@ pub fn download_firmware(
     mcu.submit_and_reap(cmd::FW_START_REQ, &[])?;
 
     // Step 7: Poll firmware-running.
-    // [UNCERTAIN] firmware-running poll register/value — resolve on hardware
-    // (E.3 capture). The mt76 driver polls a status register in the MCU's
-    // address space via an OCP/indirect-register read. For the shell track we
-    // use a bounded spin-loop as a placeholder.
+    //
+    // The real poll reads MT_CONN_ON_MISC and tests
+    // `kernel_core::mt792x::regs::fw_n9_ready` (offset/mask upstream-known). The
+    // only [UNCERTAIN] piece is the BAR0 reg-remap window that maps the connac
+    // `0x1800_0000` bus range; until the Mmio handle is threaded into this path
+    // (so we can issue the masked read) a bounded spin stands in. The register
+    // semantics themselves are validated host-side in `kernel_core::mt792x::regs`.
     for _ in 0..10_000 {
         core::hint::spin_loop();
     }

@@ -91,37 +91,71 @@ pub struct Gtk {
     pub key_idx: u8,
 }
 
-/// Unwrap the GTK from M3 key-data using AES Key-Unwrap (RFC 3394).
+/// KDE element id (`0xDD`, the vendor-specific element type).
+const KDE_TYPE: u8 = 0xDD;
+/// IEEE 802.11 KDE OUI (`00:0F:AC`).
+const KDE_OUI: [u8; 3] = [0x00, 0x0F, 0xAC];
+/// KDE data-type selector for the GTK KDE.
+const KDE_DATA_TYPE_GTK: u8 = 0x01;
+/// Bytes preceding the GTK in the KDE body that the `len` field counts:
+/// OUI(3) + data_type(1) + KeyInfo(1) + reserved(1).
+const KDE_GTK_PREAMBLE: usize = 6;
+
+/// Unwrap the GTK from M3 key-data per IEEE 802.11i.
 ///
-/// For the purpose of this layer, M3 key-data is a 1-byte GTK index followed
-/// by the AES-wrapped GTK (no full GTK KDE parsing; the hardware driver
-/// supplies the wrapped portion starting after the 2-byte GTK-KDE header when
-/// integrating with real M3 key-data).
+/// The EAPOL-Key M3 Key Data field is AES-Key-Wrapped (RFC 3394) under the KEK
+/// (the "Encrypted Key Data" KeyInfo bit is set). This:
 ///
-/// Format expected here:
-///   `[key_idx: u8] [aes_wrapped_gtk: 24+ bytes]`
+/// 1. AES-Key-Unwraps the **entire** `m3_keydata` under `kek`;
+/// 2. parses the plaintext as a **GTK KDE**:
+///    `[0xDD][len][00 0F AC][0x01][KeyInfo][reserved][GTK…]`,
+///    rejecting a malformed type / OUI / data-type / length;
+/// 3. extracts the GTK key index (KeyInfo bits 0–1) and the GTK bytes
+///    (`len - 6` bytes, i.e. 16 for CCMP).
 ///
-/// This simplified format is documented in the driver integration guide; the
-/// real mt792x driver strips the outer EAPOL encryption layer before passing
-/// key-data here, and the real GTK KDE header (type=0xDD, len, OUI, data_type,
-/// flags, reserved, gtk) is parsed at a higher layer.  Deferring full KDE
-/// parsing keeps this module hardware-free and purely host-testable.
-///
-/// Returns `Err(CryptoError::InvalidLength)` if `m3_keydata` is too short,
-/// or `Err(CryptoError::AuthenticationFailed)` if the integrity check fails.
+/// Returns `Err(CryptoError::InvalidLength)` when the buffer is too short or the
+/// KDE length is inconsistent, or `Err(CryptoError::AuthenticationFailed)` when
+/// the AES-KW integrity check fails or the KDE header is not a GTK KDE.
 pub fn unwrap_gtk(kek: &[u8; 16], m3_keydata: &[u8]) -> Result<Gtk, CryptoError> {
-    // Minimum: 1-byte key_idx + 24-byte AES-wrapped 16-byte key (RFC 3394 wraps
-    // n plaintext words of 8 bytes each with n+1 words = 3×8=24 bytes for n=2).
-    if m3_keydata.len() < 25 {
+    // Unwrap the whole encrypted Key Data field (AES-KW yields n×8 plaintext).
+    let plaintext = crypto_lib::symmetric::aes_key_unwrap(kek, m3_keydata)?;
+
+    // Parse the GTK KDE from the front of the plaintext.
+    if plaintext.len() < 8 {
         return Err(CryptoError::InvalidLength);
     }
-    let key_idx = m3_keydata[0];
-    let wrapped = &m3_keydata[1..];
-    let plaintext = crypto_lib::symmetric::aes_key_unwrap(kek, wrapped)?;
+    if plaintext[0] != KDE_TYPE || plaintext[2..5] != KDE_OUI || plaintext[5] != KDE_DATA_TYPE_GTK {
+        return Err(CryptoError::AuthenticationFailed);
+    }
+    // `len` counts OUI(3)+data_type(1)+KeyInfo(1)+reserved(1)+GTK(n).
+    let kde_len = plaintext[1] as usize;
+    if kde_len < KDE_GTK_PREAMBLE || 2 + kde_len > plaintext.len() {
+        return Err(CryptoError::InvalidLength);
+    }
+    let key_info = plaintext[6];
+    let key_idx = key_info & 0x03;
+    let gtk_len = kde_len - KDE_GTK_PREAMBLE;
+    let gtk = plaintext[8..8 + gtk_len].to_vec();
     Ok(Gtk {
-        bytes: plaintext,
+        bytes: gtk,
         key_idx,
     })
+}
+
+/// Build a GTK KDE plaintext (`[0xDD][len][00 0F AC][01][KeyInfo][rsv][GTK]`)
+/// for a given GTK and key index, ready to be AES-Key-Wrapped into M3 key-data.
+/// Shared by the supplicant's own tests and the FSM-level handshake fixtures so
+/// both exercise the real KDE format.
+pub fn build_gtk_kde(gtk: &[u8], key_idx: u8) -> Vec<u8> {
+    let mut kde = Vec::with_capacity(8 + gtk.len());
+    kde.push(KDE_TYPE);
+    kde.push((KDE_GTK_PREAMBLE + gtk.len()) as u8); // len field
+    kde.extend_from_slice(&KDE_OUI);
+    kde.push(KDE_DATA_TYPE_GTK);
+    kde.push(key_idx & 0x03); // KeyInfo: KeyID in bits 0..1
+    kde.push(0x00); // reserved
+    kde.extend_from_slice(gtk);
+    kde
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -226,12 +260,13 @@ pub(crate) mod tests {
         ];
         let key_idx: u8 = 1;
 
-        // Build the synthetic m3_keydata: [key_idx] || aes_key_wrap(kek, gtk)
-        let wrapped = crypto_lib::symmetric::aes_key_wrap(&kek, &gtk_plaintext);
-        let mut m3_keydata = alloc::vec![key_idx];
-        m3_keydata.extend_from_slice(&wrapped);
+        // Build standards-shaped M3 key-data: AES-Key-Wrap of a real GTK KDE.
+        let kde = build_gtk_kde(&gtk_plaintext, key_idx);
+        // KDE is 8 + 16 = 24 bytes (a multiple of 8) — no padding needed.
+        assert_eq!(kde.len(), 24);
+        let m3_keydata = crypto_lib::symmetric::aes_key_wrap(&kek, &kde);
 
-        // Successful unwrap.
+        // Successful unwrap recovers the GTK and the key index from the KDE.
         let gtk = unwrap_gtk(&kek, &m3_keydata).expect("unwrap should succeed");
         assert_eq!(gtk.key_idx, key_idx);
         assert_eq!(gtk.bytes.as_slice(), &gtk_plaintext);
@@ -239,10 +274,21 @@ pub(crate) mod tests {
         // Tamper with wrapped bytes → integrity check must fail.
         let mut tampered = m3_keydata.clone();
         tampered[5] ^= 0xFF;
-        let result = unwrap_gtk(&kek, &tampered);
         assert!(
-            result.is_err(),
+            unwrap_gtk(&kek, &tampered).is_err(),
             "tampered key-data must fail AES-KW integrity check"
+        );
+
+        // A correctly-wrapped but non-GTK KDE (wrong data-type) must be rejected.
+        let mut bad_kde = build_gtk_kde(&gtk_plaintext, key_idx);
+        bad_kde[5] = 0x02; // data_type != GTK
+        let bad = crypto_lib::symmetric::aes_key_wrap(&kek, &bad_kde);
+        assert!(
+            matches!(
+                unwrap_gtk(&kek, &bad),
+                Err(CryptoError::AuthenticationFailed)
+            ),
+            "non-GTK KDE must be rejected"
         );
     }
 }

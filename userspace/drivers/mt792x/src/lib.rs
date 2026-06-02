@@ -26,6 +26,9 @@ use kernel_core::nic_ids;
 // Mirroring the exact pattern used in r8169/src/lib.rs and e1000/src/lib.rs.
 #[cfg(not(test))]
 pub mod fw;
+// Pure firmware-download protocol constants + decode — host-testable (no
+// hardware deps), unlike `fw` which drives the `McuRing`.
+pub mod fw_proto;
 #[cfg(not(test))]
 pub mod init;
 #[cfg(not(test))]

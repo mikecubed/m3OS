@@ -35,7 +35,13 @@ const USERSPACE_LIB_HOST_TEST_PACKAGES: &[(&str, &[&str])] = &[
     ("audio_client", &[]),
     ("audio_server", &[]),
     ("surface_buffer", &[]),
-    ("crypto-lib", &[]),
+    // Enable `alloc` so the RFC 3394 AES-Key-Wrap conformance vector
+    // (`aes_kw_rfc3394`) and the integrity-tamper rejection test
+    // (`aes_kw_rejects_tampered`) run in the merge gate — these gate the
+    // WPA2 GTK-unwrap path against the published standard. The
+    // alloc-gated functions still compile under the default (no-alloc)
+    // build; only the conformance assertions live behind the feature.
+    ("crypto-lib", &["--features", "alloc"]),
     ("term", &["--lib"]),
     // Phase 63a Track A — pure-logic mixer with C-ABI surface
     ("audio_mixer", &[]),
@@ -72,8 +78,12 @@ const USERSPACE_LIB_HOST_TEST_PACKAGES: &[(&str, &[&str])] = &[
     // Phase 81: userspace Wi-Fi mgmt plane + WPA2-PSK supplicant (mgmt/fsm/eapol/
     // kdf/control/config) — the primary correctness gate since QEMU has no mt76.
     ("wifi-core", &[]),
-    // Phase 81: mt792x driver lib host tests (select_mt792x + io rewrite/EAPOL demux).
+    // Phase 81: mt792x driver lib host tests (select_mt792x + io rewrite/EAPOL
+    // demux + fw_proto opcode/decode pinning).
     ("mt792x_driver", &[]),
+    // Phase 57 I.2 + Phase 81 D.2: m3ctl verb parser + `wifi status` codec.
+    // Default features (NOT `os-binary`) so the host `#[cfg(test)]` path builds.
+    ("m3ctl", &[]),
 ];
 
 /// QEMU arguments enabling an emulated Intel VT-d IOMMU on the q35 machine.
@@ -5332,7 +5342,7 @@ fn cmd_check() {
     doom_c_test_step(&root);
 
     println!(
-        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, ac97_driver, hda_driver, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, shadow, and ldso_core host tests pass; doom platform-layer C tests pass"
+        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, ac97_driver, hda_driver, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, shadow, ldso_core, wifi-core, mt792x_driver, and m3ctl host tests pass; doom platform-layer C tests pass"
     );
 }
 

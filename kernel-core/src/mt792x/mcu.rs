@@ -230,11 +230,24 @@ pub fn match_response(live_seq: u8, rx_seq: u8) -> McuMatch {
 // STA_REC_KEY TLV encoder (Task B.7)
 // ---------------------------------------------------------------------------
 
-/// TLV tag for `STA_REC_KEY` (nominal connac2 value).
-pub const STA_REC_KEY: u16 = 0x10;
+/// TLV tag for the connac2 **V2** station-record key descriptor.
+///
+/// mt7921/connac2 installs keys via the V2 key TLV. Upstream mt76
+/// (`drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h`) defines both
+/// `STA_REC_KEY = 0x0c` (legacy) and `STA_REC_KEY_V2 = 0x10`; the connac2
+/// key-install path (`mt76_connac_mcu_sta_key_tlv`) uses V2, so `0x10` is the
+/// tag this driver emits.
+pub const STA_REC_KEY_V2: u16 = 0x10;
 
-/// CCMP (AES-CCM, 802.11i/WPA2) cipher selector byte.
-pub const CIPHER_CCMP: u8 = 0x01;
+/// CCMP (AES-CCM, 802.11i/WPA2) cipher selector posted to the chip.
+///
+/// This is the value written into the `STA_REC_KEY_V2` TLV `cipher` field and
+/// is consumed by silicon, so it MUST match upstream `enum mcu_cipher_type`
+/// (`mt76_connac_mcu.h`): `NONE=0, WEP40=1, WEP104=2, WEP128=3, TKIP=4,
+/// AES_CCMP=5`. (Note: the software-internal `CIPHER_CCMP` tag in
+/// `wifi_core::fsm` is a different, host-only key-material discriminator and is
+/// deliberately unrelated to this on-wire selector.)
+pub const CIPHER_CCMP: u8 = 5;
 
 /// Build a `STA_REC_KEY` TLV body.
 ///
@@ -254,7 +267,7 @@ pub const CIPHER_CCMP: u8 = 0x01;
 /// ```
 ///
 /// The body is returned as a `Vec<u8>`. To embed it in a command buffer, wrap
-/// it with [`push_tlv`] using the [`STA_REC_KEY`] tag.
+/// it with [`push_tlv`] using the [`STA_REC_KEY_V2`] tag.
 pub fn encode_sta_rec_key(wcid: u16, cipher: u8, key_idx: u8, key: &[u8]) -> Vec<u8> {
     // 2 (wcid) + 1 (key_idx) + 1 (cipher) + 1 (key_len) = 5 fixed bytes.
     let fixed = 5;
@@ -384,14 +397,43 @@ mod tests {
         // key_idx @ [2].
         assert_eq!(body[2], 0, "key_idx");
 
-        // cipher @ [3] = CIPHER_CCMP.
-        assert_eq!(body[3], CIPHER_CCMP, "cipher must be CIPHER_CCMP");
+        // cipher @ [3] = CIPHER_CCMP. Pin the literal upstream value
+        // (MCU_CIPHER_AES_CCMP = 5) rather than re-asserting the constant
+        // against itself, so a regression in CIPHER_CCMP is caught here.
+        assert_eq!(body[3], 5, "cipher must be MCU_CIPHER_AES_CCMP = 5");
+        assert_eq!(body[3], CIPHER_CCMP);
 
         // key_len @ [4] = 16.
         assert_eq!(body[4], 16, "key_len");
 
         // key bytes @ [5..21].
         assert_eq!(&body[5..21], &key, "key bytes must round-trip");
+    }
+
+    #[test]
+    fn sta_rec_key_tlv_framing() {
+        // The driver wraps the key body with `push_tlv(STA_REC_KEY_V2, body)`
+        // before submitting it (key.rs `sta_rec_key_tlv`). Pin that the framed
+        // unit carries the V2 tag, a length covering the whole padded TLV, and a
+        // round-trippable body — so the bare body is never sent unframed.
+        let tk = [0xABu8; 16];
+        let body = encode_sta_rec_key(0x0003, CIPHER_CCMP, 0, &tk);
+        let mut tlv = Vec::new();
+        push_tlv(&mut tlv, STA_REC_KEY_V2, &body);
+
+        assert_eq!(u16::from_le_bytes([tlv[0], tlv[1]]), STA_REC_KEY_V2);
+        assert_eq!(STA_REC_KEY_V2, 0x10, "connac2 key install uses the V2 tag");
+        let len = u16::from_le_bytes([tlv[2], tlv[3]]) as usize;
+        assert_eq!(len, tlv.len(), "TLV len must cover the whole framed unit");
+        assert_eq!(tlv.len() % 4, 0, "TLV must be 4-byte aligned");
+        // cipher byte at body offset 3 ⇒ TLV offset 4+3.
+        assert_eq!(tlv[4 + 3], 5, "cipher must be MCU_CIPHER_AES_CCMP = 5");
+        // key bytes follow the 5-byte fixed body header ⇒ TLV offset 4+5.
+        assert_eq!(
+            &tlv[4 + 5..4 + 5 + 16],
+            &tk,
+            "TK must round-trip in the TLV"
+        );
     }
 
     #[test]
