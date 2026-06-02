@@ -63,6 +63,12 @@ const USERSPACE_LIB_HOST_TEST_PACKAGES: &[(&str, &[&str])] = &[
     // surface; running these tests on every `xtask check` keeps the
     // backend-dispatch + relocation slice-helper contract honest.
     ("ld-musl-x86_64-so-1", &["--lib"]),
+    // Phase 80 Track A.5: ac97_driver pure-logic host tests (register-write
+    // ordering, BDL ring, submit_frames_inner, iova bounds check). Uses the
+    // same lib + bin split as audio_server; host tests build the lib only.
+    ("ac97_driver", &[]),
+    // Phase 80b: hda_driver lib host build (logic is host-tested in kernel_core::hda).
+    ("hda_driver", &[]),
 ];
 
 /// QEMU arguments enabling an emulated Intel VT-d IOMMU on the q35 machine.
@@ -555,6 +561,14 @@ fn main() {
                 });
             cmd_audio_smoke(&smoke_args);
         }
+        Some("hda-smoke") => {
+            let smoke_args = parse_smoke_boot_args("hda-smoke", &args[2..]).unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            cmd_hda_smoke(&smoke_args);
+        }
         Some("session-smoke") => {
             let smoke_args =
                 parse_smoke_boot_args("session-smoke", &args[2..]).unwrap_or_else(|err| {
@@ -790,7 +804,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio|xhci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio|xhci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio|xhci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio|xhci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio|xhci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio|xhci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -910,6 +924,11 @@ fn build_userspace_bins() {
         // Phase 78c: ring-3 USB HID Boot-Protocol class driver (kbd + mouse).
         // `needs_alloc = true` for kernel-core + usb-core deps.
         ("usb_hid", "usb_hid", true),
+        // Phase 80 Track A.5: ring-3 AC'97 out-of-process audio hardware driver.
+        // `needs_alloc = true` for driver_runtime + kernel-core deps.
+        ("ac97_driver", "ac97_driver", true),
+        // Phase 80b: ring-3 Intel HDA out-of-process audio hardware driver.
+        ("hda_driver", "hda_driver", true),
         // Phase 55b Track F.3b: NVMe crash-and-restart end-to-end smoke
         // client. No alloc dependency — syscall_lib only.
         ("nvme-crash-smoke", "nvme-crash-smoke", false),
@@ -1101,6 +1120,10 @@ fn build_userspace_bins() {
             // a `[[bin]]` gated on the `os-binary` feature, same
             // pattern as `term` / `session_manager`.
             "greeter" => &["--features", "os-binary"],
+            // Phase 80 Track A.5: ac97_driver uses the same os-binary gate
+            // so the [[bin]] target is skipped on host-test builds.
+            "ac97_driver" => &["--features", "os-binary"],
+            "hda_driver" => &["--features", "os-binary"],
             _ => &[],
         };
 
@@ -5229,7 +5252,7 @@ fn cmd_check() {
     doom_c_test_step(&root);
 
     println!(
-        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, shadow, and ldso_core host tests pass; doom platform-layer C tests pass"
+        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, ac97_driver, hda_driver, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, shadow, and ldso_core host tests pass; doom platform-layer C tests pass"
     );
 }
 
@@ -9406,6 +9429,202 @@ fn audio_smoke_steps() -> Vec<SmokeStep> {
     steps
 }
 
+// ---------------------------------------------------------------------------
+// Phase 80b — hda-smoke: HDA controller + generic codec end-to-end gate.
+// ---------------------------------------------------------------------------
+
+/// Boot with `-device intel-hda -device hda-duplex,audiodev=snd0`, wait for the
+/// HDA driver to bring up the controller + codec, run `audio-demo` (which mixes
+/// through `audio_server` → `hda_driver`), and assert non-zero `frames_consumed`
+/// plus (in `cmd_hda_smoke`) a non-silent captured WAV.
+fn hda_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = vec![
+        SmokeStep::Wait {
+            pattern: "[m3os] Hello from kernel",
+            timeout_secs: 30,
+            label: "guest/hda: kernel first message",
+        },
+        // The HDA driver resets the controller, polls STATESTS, RUN-enables
+        // CORB/RIRB, and enumerates the codec before emitting this sentinel.
+        SmokeStep::Wait {
+            pattern: "HDA_SMOKE:server:READY",
+            timeout_secs: 90,
+            label: "guest/hda: hda_driver controller + codec ready",
+        },
+        SmokeStep::Wait {
+            pattern: "init: loaded service 'audio_server'",
+            timeout_secs: 90,
+            label: "guest/hda: init loaded audio_server.conf",
+        },
+    ];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "audio-demo\n",
+        label: "guest/hda: launch audio-demo (mixes through hda_driver)",
+    });
+    // C.3: the stream-completion (BCIS) interrupt must actually fire — the
+    // driver logs this once, during the demo's submits (well before PASS),
+    // after decoding INTSTS + clearing SDnSTS.BCIS via the host-tested path.
+    // Proves the INTCTL arm + audio-class INTx routing deliver a real IRQ
+    // (not just SDnLPIB polling).
+    steps.push(SmokeStep::Wait {
+        pattern: "hda_driver: stream IRQ (BCIS cleared)",
+        timeout_secs: 30,
+        label: "guest/hda: stream-completion (BCIS) interrupt delivered",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "AUDIO_DEMO:PASS",
+        fail_prefix: "AUDIO_DEMO:FAIL stage=",
+        timeout_secs: 30,
+        label: "guest/hda: audio-demo PASS sentinel",
+        exit_code_on_fail: SMOKE_EXIT_AUDIO_DEMO_FAILED,
+    });
+    // A zero consumed count means the HDA stream DMA never advanced SDnLPIB —
+    // the regression Track C.2 guards (stream tag / RUN / converter binding).
+    steps.push(SmokeStep::WaitLineNotMatching {
+        pattern: "AUDIO_DEMO:stats consumed=",
+        bad_substring: "consumed=0 ",
+        timeout_secs: 5,
+        label: "guest/hda: frames_consumed non-zero",
+    });
+    steps
+}
+
+/// QEMU args for the HDA smoke: the generic `intel-hda` controller +
+/// `hda-duplex` codec wired to a WAV audiodev. No AC'97 device, so the HDA
+/// driver wins the `audio.hw` registration.
+fn hda_smoke_qemu_args(
+    smoke_dir: &Path,
+    uefi_image: &Path,
+    ovmf: &Path,
+    display: bool,
+) -> Vec<String> {
+    let display_mode = if display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(uefi_image, ovmf, display_mode, DeviceSet::default());
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    // Track F (real-hardware): when `M3OS_HDA_VFIO_BDF=<bdf>` is set, pass the
+    // *physical* HDA controller through via VFIO instead of the emulated
+    // intel-hda/hda-duplex codec. Audio then comes out the real speakers
+    // (operator listens — there is no WAV file), and the bound `vfio-pci`
+    // device requires the host BDF to already be bound to vfio-pci + QEMU run
+    // as root. The serial assertions (READY, audio-demo PASS, frames_consumed,
+    // BCIS interrupt) still apply against the real ALC1220.
+    if let Ok(bdf) = std::env::var("M3OS_HDA_VFIO_BDF") {
+        // Pin the passed-through controller to guest PCI slot 0x8 — clear of the
+        // ring-3 driver *sentinel* BDFs (e1000=0x3, nvme=0x4, ac97=0x5,
+        // xhci=0x6), which claim by fixed BDF. Without this the VFIO device
+        // lands on slot 0x4 and nvme_driver grabs it (wrong device), starving
+        // hda_driver. hda_driver finds it by PCI class scan regardless of slot.
+        qemu_args.extend([
+            "-device".to_string(),
+            format!("vfio-pci,host={bdf},addr=0x8"),
+        ]);
+        return qemu_args;
+    }
+    let wav_path = smoke_dir.join("audio.wav");
+    qemu_args.extend([
+        "-audiodev".to_string(),
+        format!("wav,id=snd0,path={}", wav_path.display()),
+        "-device".to_string(),
+        "intel-hda".to_string(),
+        "-device".to_string(),
+        "hda-duplex,audiodev=snd0".to_string(),
+    ]);
+    qemu_args
+}
+
+/// Run the HDA smoke (model on `cmd_audio_smoke`).
+fn cmd_hda_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+
+    let smoke_dir = prepare_audio_smoke_dir();
+    let ovmf = find_ovmf();
+    let qemu_args = hda_smoke_qemu_args(&smoke_dir, &uefi_image, &ovmf, args.display);
+    let steps = hda_smoke_steps();
+
+    println!(
+        "hda-smoke: launching QEMU with intel-hda + hda-duplex (timeout {}s)",
+        args.timeout_secs
+    );
+    println!(
+        "hda-smoke: WAV output → {}",
+        smoke_dir.join("audio.wav").display()
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!(
+                "hda-smoke: serial script PASSED ({} steps in {elapsed}s)",
+                steps.len()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("hda-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_AUDIO_DEMO_FAILED);
+        }
+    }
+
+    // VFIO real-hardware mode drives the physical speakers (no WAV file) — the
+    // operator confirms audible output by ear, so skip the host-side WAV check.
+    if std::env::var("M3OS_HDA_VFIO_BDF").is_ok() {
+        println!(
+            "hda-smoke: VFIO real-hardware run — serial bring-up PASSED; \
+             LISTEN for audible output through the speaker (operator check)."
+        );
+        return;
+    }
+    let wav_path = smoke_dir.join("audio.wav");
+    match assert_wav_non_silent(&wav_path) {
+        Ok(()) => println!("hda-smoke: WAV non-silent check PASSED"),
+        Err(msg) => {
+            eprintln!("hda-smoke: WAV non-silent check FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_WAV_SILENT);
+        }
+    }
+}
+
 /// Build the QEMU arg vector for the audio smoke.
 ///
 /// Hostfwd is stripped the same way `cmd_device_smoke` strips it so parallel
@@ -13415,6 +13634,15 @@ fn populate_ext2_files(
     // Phase 78c — ring-3 USB HID class driver. Depends on xhci_driver so it
     // can look up the `usb` service the host controller registers.
     let usb_hid_conf = "name=usb_hid\ncommand=/drivers/usb-hid\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=xhci_driver\n";
+    // Phase 80 Track A.5 — ring-3 AC'97 out-of-process audio hardware driver.
+    // No `depends=` (device-host substrate is kernel-internal); must start
+    // before audio_server so `audio.hw` is registered when audio_server resolves it.
+    let ac97_driver_conf = "name=ac97_driver\ncommand=/drivers/ac97_driver\ntype=daemon\nrestart=on-failure\nmax_restart=3\n";
+
+    // Phase 80b — ring-3 Intel HDA out-of-process audio hardware driver. Exits
+    // cleanly (rc 0) when no HDA controller is present, so on an AC'97-only
+    // machine the ac97 driver serves `audio.hw` instead.
+    let hda_driver_conf = "name=hda_driver\ncommand=/drivers/hda_driver\ntype=daemon\nrestart=on-failure\nmax_restart=3\n";
 
     // Phase 56 Track C.1: ring-3 display server (compositor) scaffold.
     // Depends on `kbd` so input arrives before the compositor binds the
@@ -13769,6 +13997,8 @@ fn populate_ext2_files(
     let xhci_driver_conf_tmp = output_dir.join("_tmp_xhci_driver_conf");
     let usbhub_conf_tmp = output_dir.join("_tmp_usbhub_conf");
     let usb_hid_conf_tmp = output_dir.join("_tmp_usb_hid_conf");
+    let ac97_driver_conf_tmp = output_dir.join("_tmp_ac97_driver_conf");
+    let hda_driver_conf_tmp = output_dir.join("_tmp_hda_driver_conf");
     let display_server_conf_tmp = output_dir.join("_tmp_display_server_conf");
     let session_manager_conf_tmp = output_dir.join("_tmp_session_manager_conf");
     let audio_server_conf_tmp = output_dir.join("_tmp_audio_server_conf");
@@ -13808,6 +14038,8 @@ fn populate_ext2_files(
     fs::write(&xhci_driver_conf_tmp, xhci_driver_conf).expect("write temp xhci_driver.conf");
     fs::write(&usbhub_conf_tmp, usbhub_conf).expect("write temp usbhub.conf");
     fs::write(&usb_hid_conf_tmp, usb_hid_conf).expect("write temp usb-hid.conf");
+    fs::write(&ac97_driver_conf_tmp, ac97_driver_conf).expect("write temp ac97.conf");
+    fs::write(&hda_driver_conf_tmp, hda_driver_conf).expect("write temp hda.conf");
     fs::write(&display_server_conf_tmp, display_server_conf)
         .expect("write temp display_server.conf");
     fs::write(&session_manager_conf_tmp, session_manager_conf)
@@ -14393,6 +14625,14 @@ fn populate_ext2_files(
          sif etc/services.d/usb-hid.conf mode 0x81A4\n\
          sif etc/services.d/usb-hid.conf uid 0\n\
          sif etc/services.d/usb-hid.conf gid 0\n\
+         write \"{ac97_driver_conf}\" etc/services.d/ac97.conf\n\
+         sif etc/services.d/ac97.conf mode 0x81A4\n\
+         sif etc/services.d/ac97.conf uid 0\n\
+         sif etc/services.d/ac97.conf gid 0\n\
+         write \"{hda_driver_conf}\" etc/services.d/hda.conf\n\
+         sif etc/services.d/hda.conf mode 0x81A4\n\
+         sif etc/services.d/hda.conf uid 0\n\
+         sif etc/services.d/hda.conf gid 0\n\
          write \"{display_server_conf}\" etc/services.d/display_server.conf\n\
          sif etc/services.d/display_server.conf mode 0x81A4\n\
          sif etc/services.d/display_server.conf uid 0\n\
@@ -14446,6 +14686,8 @@ fn populate_ext2_files(
         xhci_driver_conf = xhci_driver_conf_tmp.display(),
         usbhub_conf = usbhub_conf_tmp.display(),
         usb_hid_conf = usb_hid_conf_tmp.display(),
+        ac97_driver_conf = ac97_driver_conf_tmp.display(),
+        hda_driver_conf = hda_driver_conf_tmp.display(),
         display_server_conf = display_server_conf_tmp.display(),
         session_manager_conf = session_manager_conf_tmp.display(),
         audio_server_conf = audio_server_conf_tmp.display(),

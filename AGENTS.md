@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**m3OS** (technical name: `m3os`) is a bootable microkernel OS in Rust: x86_64, UEFI boot, kernel **v0.79.0**. Ring 0 handles memory, scheduling, IPC/capabilities, interrupt routing, and in-kernel drivers; ring 3 hosts everything else.
+**m3OS** (technical name: `m3os`) is a bootable microkernel OS in Rust: x86_64, UEFI boot, kernel **v0.80.0**. Ring 0 handles memory, scheduling, IPC/capabilities, interrupt routing, and in-kernel drivers; ring 3 hosts everything else.
 
 Capabilities now present in the tree:
 
@@ -14,7 +14,7 @@ Capabilities now present in the tree:
 - **Ring-3 driver hosting**: capability-gated device-host syscalls, supervised userspace NVMe/e1000 with `RemoteBlockDevice`/`RemoteNic` facades.
 - **USB host stack**: ring-3 xHCI host driver (MSI-X, BME, TRB/event rings) + `usb-core`/hub + a HID Boot-Protocol class driver (`usb-hid`) injecting keyboard/mouse into `kbd_server`/`mouse_server` — modern PS/2-less machines get USB keyboard/mouse input.
 - **Graphical stack**: `display_server` (framebuffer owner, focus-aware input, layer-shell surface roles, damage tracking, animations/decorations), `kbd_server`/`mouse_server`, compositor clients (`wallpaper`, `bar`, `launcher`, `notifyd`, `lockscreen`), `greeter` GUI login, `session_manager` lifecycle supervision.
-- **Audio**: `audio_server` (AC'97) with PCM-out, mixer, DOOM audio + bell.
+- **Audio**: out-of-process ring-3 audio drivers — `ac97` and `hda` (Intel HD Audio controller + generic zero-quirk widget-graph codec, CORB/RIRB IOVA rings, BDL/`SDnFMT` output stream) — behind a `driver_ipc::audio` seam; `audio_server` is a pure policy/mixer (32-ch DMX→S16LE mix, DOOM audio + bell) that forwards PCM over a persistent `sys_shm` ring.
 - **Terminal**: `term` emulator, full termios/line-discipline, UTF-8 + TTF/Nerd Font glyphs, ncurses + less/htop/tmux ports.
 - **Dynamic linking**: `ld-musl-x86_64.so.1` with `ldso_core`, PT_INTERP support, dlopen/dlsym/dlclose, PLT lazy resolve, DT_GNU_HASH, symbol versioning, LD_BIND_NOW, W^X enforcement.
 - **CPU hardening**: SMEP + SMAP enforced on every core, per-CPU microcode application (AMD container), PT_TLS-backed pthreads, RFC 6298 TCP retransmission.
@@ -104,6 +104,7 @@ This sets `core.hooksPath` to `.githooks/`. **pre-commit** runs `cargo xtask che
 | `tls-smoke` PASS (not SKIP) | `M3OS_TLS_REGRESSION=1` |
 | `dns-smoke` PASS (not SKIP) | `M3OS_DNS_REGRESSION=1` |
 | `multi-nic-smoke` (e1000 + e1000e + igb arms) | `M3OS_MULTI_NIC_REGRESSION=1` |
+| `hda-smoke` (`-device intel-hda -device hda-duplex`, non-silent WAV) | `M3OS_HDA_REGRESSION=1` |
 
 The `tls-smoke`/`dns-smoke` gates assert the musl-built smoke stage actually
 `PASS`ed rather than `SKIP`ped — a `SKIP` means the musl cross-compiler was

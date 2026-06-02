@@ -156,6 +156,62 @@ pub const SYS_DEVICE_PCI_ENUMERATE: u64 = 0x1127;
 /// - `-ESRCH` (`-3`): kernel context (PID 0).
 pub const SYS_DEVICE_CONFIG_READ: u64 = 0x1128;
 
+/// Write a value into the PCI configuration space of a device the caller has
+/// **already claimed**.
+/// Phase 80c Track F.1 —
+/// `sys_device_config_write(segment, bus, dev, func, packed, value) -> isize`.
+///
+/// ## Why a config-space write (and why it is claim-gated)
+///
+/// Some controllers need vendor-specific configuration-space programming the
+/// generic register path cannot express. The motivating case is the AMD
+/// "Family 17h/19h HD Audio Controller" (`1022:15e3`): Linux's `snd_hda_intel`
+/// (`azx_init_pci`) sets an AMD/ATI **snoop** bit in config space so the
+/// controller's DMA stays cache-coherent. m3OS ships no kernel HDA quirk table,
+/// so the ring-3 `hda_driver` performs this write itself.
+///
+/// Note: the snoop write is a **DMA-coherency** fix, **not** a codec-enumeration
+/// gate. The Phase 80 VFIO capture (`docs/research/hda-realtek-capture.md`)
+/// confirmed a codec enumerates in `STATESTS` without it (playback would just be
+/// garbled); codec presence is gated by reset timing + codec power. Do not treat
+/// snoop as a bring-up dependency.
+///
+/// Unlike [`SYS_DEVICE_CONFIG_READ`] — which is a *pre-claim* probe so a driver
+/// can read vendor:device before deciding which function to claim — a config
+/// **write** mutates device state, so it is gated on the caller **owning a
+/// claim** on the target BDF (in addition to the `/drivers/` exec-path check).
+/// A driver that has claimed a device can already drive its BARs and DMA, so
+/// writing that same device's config space is within its existing authority;
+/// writing a device it does not own is rejected.
+///
+/// ## ABI
+///
+/// | Register | Value |
+/// |----------|-------|
+/// | `rax`    | `SYS_DEVICE_CONFIG_WRITE` (0x1129) |
+/// | `rdi`    | `segment: u16` — PCI segment group (always 0 on current platforms) |
+/// | `rsi`    | `bus: u8` |
+/// | `rdx`    | `dev: u8` (0–31) |
+/// | `r10`    | `func: u8` (0–7) |
+/// | `r8`     | packed `(offset << 8) | width` — `offset` is the 0–255 byte offset, `width` ∈ {1,2,4} |
+/// | `r9`     | `value: u32` — must fit in `width` bytes |
+///
+/// The `(offset, width)` packing reuses [`pack_config_read_arg`] /
+/// [`unpack_config_read_arg`]; the value rides in the sixth register so the
+/// BDF + access shape stay identical to the read path.
+///
+/// On success returns `0`. A negative return is a negated `errno`:
+///
+/// - `-EACCES` (`-13`): caller's exec-path is not under `/drivers/`, **or** the
+///   caller does not own a claim on the target BDF.
+/// - `-EINVAL` (`-22`): `width` not in `{1,2,4}`, `offset + width` exceeds 256,
+///   `offset` not naturally aligned to `width`, or `value` does not fit in
+///   `width` bytes.
+/// - `-ENODEV` (`-19`): no PCI function exists at the supplied BDF, or a
+///   non-zero segment (multi-segment PCIe is not supported yet).
+/// - `-ESRCH` (`-3`): kernel context (PID 0).
+pub const SYS_DEVICE_CONFIG_WRITE: u64 = 0x1129;
+
 /// Sentinel passed as `notification_arg` (arg3) of [`SYS_DEVICE_IRQ_SUBSCRIBE`]
 /// to request that the kernel allocate a fresh `Notification` object on the
 /// caller's behalf, rather than binding the IRQ to an existing notification
@@ -189,7 +245,7 @@ pub const DEVICE_HOST_BASE: u64 = SYS_DEVICE_CLAIM;
 ///
 /// Adjust upward when adding new device-host syscalls; the Track B acceptance
 /// items pin this constant as the authoritative upper bound.
-pub const DEVICE_HOST_LAST: u64 = SYS_DEVICE_CONFIG_READ;
+pub const DEVICE_HOST_LAST: u64 = SYS_DEVICE_CONFIG_WRITE;
 
 #[cfg(test)]
 mod tests {
@@ -211,6 +267,8 @@ mod tests {
         assert_eq!(SYS_DEVICE_PCI_ENUMERATE, 0x1127);
         // Phase 79 Track A.1 — raw-BDF PCI config-space read.
         assert_eq!(SYS_DEVICE_CONFIG_READ, 0x1128);
+        // Phase 80c Track F.1 — claim-gated PCI config-space write.
+        assert_eq!(SYS_DEVICE_CONFIG_WRITE, 0x1129);
     }
 
     #[test]
@@ -225,6 +283,7 @@ mod tests {
             SYS_DEVICE_PIO_WRITE,
             SYS_DEVICE_PCI_ENUMERATE,
             SYS_DEVICE_CONFIG_READ,
+            SYS_DEVICE_CONFIG_WRITE,
         ];
         for (i, a) in all.iter().enumerate() {
             for (j, b) in all.iter().enumerate() {
@@ -247,6 +306,7 @@ mod tests {
             SYS_DEVICE_PIO_WRITE,
             SYS_DEVICE_PCI_ENUMERATE,
             SYS_DEVICE_CONFIG_READ,
+            SYS_DEVICE_CONFIG_WRITE,
         ];
         for n in all {
             assert!(
@@ -267,7 +327,9 @@ mod tests {
         assert_eq!(SYS_DEVICE_PCI_ENUMERATE, SYS_DEVICE_PIO_WRITE + 1);
         // Phase 79 Track A.1 pin: CONFIG_READ follows PCI_ENUMERATE without gap.
         assert_eq!(SYS_DEVICE_CONFIG_READ, SYS_DEVICE_PCI_ENUMERATE + 1);
-        assert_eq!(DEVICE_HOST_LAST, SYS_DEVICE_CONFIG_READ);
+        // Phase 80c Track F.1 pin: CONFIG_WRITE follows CONFIG_READ without gap.
+        assert_eq!(SYS_DEVICE_CONFIG_WRITE, SYS_DEVICE_CONFIG_READ + 1);
+        assert_eq!(DEVICE_HOST_LAST, SYS_DEVICE_CONFIG_WRITE);
     }
 
     #[test]

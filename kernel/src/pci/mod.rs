@@ -195,6 +195,19 @@ pub fn pci_config_read_u8(bus: u8, device: u8, function: u8, offset: u8) -> u8 {
     ((dword >> shift) & 0xFF) as u8
 }
 
+/// Write an 8-bit value to PCI configuration space via read-modify-write of the
+/// containing dword.  Routes through ECAM MMIO when available, otherwise legacy
+/// mechanism #1 ports.
+#[allow(dead_code)]
+pub fn pci_config_write_u8(bus: u8, device: u8, function: u8, offset: u8, value: u8) {
+    let dword_offset = offset & !0x3;
+    let dword = pci_config_read_u32_any(bus, device, function, dword_offset as u16);
+    let shift = ((offset & 3) as u32) * 8;
+    let mask = !(0xFFu32 << shift);
+    let patched = (dword & mask) | ((value as u32) << shift);
+    pci_config_write_u32_any(bus, device, function, dword_offset as u16, patched);
+}
+
 /// Write a 16-bit value to PCI configuration space.  Routes through ECAM
 /// MMIO when available, otherwise legacy mechanism #1 ports.
 #[allow(dead_code)]

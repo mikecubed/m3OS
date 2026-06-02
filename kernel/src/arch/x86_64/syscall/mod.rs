@@ -1545,6 +1545,16 @@ mod syscall_nr {
     /// `sys_page_grant_recv(grant_cap) -> vaddr | u64::MAX`.
     pub const PAGE_GRANT_RECV: u64 = 0x1021;
 
+    /// Phase 80 review follow-up: return the byte length of an existing
+    /// shared-memory region (`page_count * 4096`), or `u64::MAX` if the id is
+    /// invalid/unknown. `SHM_MAP` returns only a base address; the receiver of
+    /// an SHM-backed transport (the audio drivers' PCM ring) uses this to learn
+    /// the kernel-attested mapped size of a peer-supplied region before forming
+    /// a slice over it, instead of trusting the peer's claimed size.
+    ///
+    /// `sys_shm_size(shm_id) -> bytes | u64::MAX`.
+    pub const SHM_SIZE: u64 = 0x1022;
+
     // -- ipc --
     pub const IPC_BASE: u64 = 0x1100;
     // Phase 74 extension: cap-bearing IPC (0x1117/0x1118) and per-call
@@ -1567,8 +1577,9 @@ mod syscall_nr {
     #[allow(unused_imports)]
     pub use kernel_core::device_host::syscalls::{
         DEVICE_HOST_BASE, DEVICE_HOST_LAST, SYS_DEVICE_CLAIM, SYS_DEVICE_CONFIG_READ,
-        SYS_DEVICE_DMA_ALLOC, SYS_DEVICE_DMA_HANDLE_INFO, SYS_DEVICE_IRQ_SUBSCRIBE,
-        SYS_DEVICE_MMIO_MAP, SYS_DEVICE_PCI_ENUMERATE, SYS_DEVICE_PIO_READ, SYS_DEVICE_PIO_WRITE,
+        SYS_DEVICE_CONFIG_WRITE, SYS_DEVICE_DMA_ALLOC, SYS_DEVICE_DMA_HANDLE_INFO,
+        SYS_DEVICE_IRQ_SUBSCRIBE, SYS_DEVICE_MMIO_MAP, SYS_DEVICE_PCI_ENUMERATE,
+        SYS_DEVICE_PIO_READ, SYS_DEVICE_PIO_WRITE,
     };
 }
 
@@ -1983,6 +1994,7 @@ pub extern "C" fn syscall_handler(
         SHM_MAP => sys_shm_map(arg0),
         SHM_UNMAP => sys_shm_unmap(arg0),
         SHM_DESTROY => sys_shm_destroy(arg0),
+        SHM_SIZE => sys_shm_size(arg0),
         READ_SCANCODE => sys_read_scancode(),
         STDIN_PUSH => sys_stdin_push(arg0, arg1),
         SIGNAL_PROCESS_GROUP => sys_signal_process_group(arg0, arg1),
@@ -2209,6 +2221,34 @@ pub extern "C" fn syscall_handler(
                     arg2 as u8,
                     arg3 as u8,
                     arg4,
+                ) as u64
+            }
+        }
+        SYS_DEVICE_CONFIG_WRITE => {
+            // Signature (Phase 80c Track F.1):
+            //   sys_device_config_write(segment: u16, bus: u8, dev: u8, func: u8,
+            //                           packed: u64, value: u64) -> isize
+            // where packed = (offset << 8) | width and value rides in r9.
+            // arg0=segment (rdi), arg1=bus (rsi), arg2=dev (rdx),
+            // arg3=func (r10), arg4=packed (r8), arg5=value (r9).
+            let arg3 = per_core_syscall_arg3();
+            let snap = crate::task::current_task_syscall_snapshot();
+            let arg4 = snap.user_r8;
+            let arg5 = snap.user_r9;
+            if arg0 > u64::from(u16::MAX)
+                || arg1 > u64::from(u8::MAX)
+                || arg2 > u64::from(u8::MAX)
+                || arg3 > u64::from(u8::MAX)
+            {
+                NEG_EINVAL
+            } else {
+                crate::syscall::device_host::sys_device_config_write(
+                    arg0 as u16,
+                    arg1 as u8,
+                    arg2 as u8,
+                    arg3 as u8,
+                    arg4,
+                    arg5,
                 ) as u64
             }
         }
@@ -2660,6 +2700,13 @@ fn do_full_process_exit(pid: crate::process::Pid, code: i32) -> ! {
     // `release_bytes`'s saturating subtract against the absent map
     // entry.
     crate::mm::shm::release_creator(pid);
+
+    // Phase 80 Track A.6: also drop this PID's SHM *mapper* references. A
+    // crashed audio driver (a mapper of `audio_server`'s PCM ring, not its
+    // creator) would otherwise leak its `incref` forever — the region's
+    // refcount never reaches zero and its frames are never reclaimed across
+    // driver restarts. See `release_shm_mappings_for_pid`.
+    release_shm_mappings_for_pid(pid);
 
     // Phase 69d follow-up: drop every flock entry this PID still holds
     // BEFORE closing fds.  close_all_fds_for() calls
@@ -10738,6 +10785,37 @@ pub(super) fn sys_shm_map(shm_id_arg: u64) -> u64 {
     virt_addr
 }
 
+/// Phase 80 Track A.6 — reclaim a dying process's SHM *mapper* references.
+///
+/// Process exit runs [`crate::mm::shm::release_creator`], which drops only
+/// the refs a process held *as the creator*. A process that mapped someone
+/// else's region (e.g. the audio `ac97`/`hda` driver mapping `audio_server`'s
+/// PCM ring) and then crashed without `sys_shm_unmap` would otherwise leave
+/// its `incref` outstanding forever — the registry refcount never reaches
+/// zero, so the region's frames are never returned to the buddy (a permanent
+/// leak across every driver restart). The page-table teardown already unmaps
+/// the VA range but deliberately does **not** free SHM-marked frames (they
+/// belong to the registry, not the process), so the decref must happen here.
+///
+/// Walks the dying pid's VMA tree for `SHM_VMA_FLAG_MARKER` entries, collects
+/// their ids under the mm lock, then decrefs each outside the lock (the final
+/// decref returns the frames to the buddy). Idempotent against a clean
+/// `sys_shm_unmap` exit, which already removed the VMA entry.
+pub(super) fn release_shm_mappings_for_pid(pid: u32) {
+    let ids: alloc::vec::Vec<crate::mm::shm::ShmId> =
+        crate::process::with_shared_mm_mut(pid, |_brk, _mmap_next, vma_tree| {
+            vma_tree
+                .iter()
+                .filter(|m| m.flags & SHM_VMA_FLAG_MARKER != 0)
+                .filter_map(|m| shm_id_from_vma_flags(m.flags))
+                .collect()
+        })
+        .unwrap_or_default();
+    for id in ids {
+        let _ = crate::mm::shm::decref(id);
+    }
+}
+
 pub(super) fn sys_shm_unmap(user_va: u64) -> u64 {
     if user_va == 0 || !user_va.is_multiple_of(4096) {
         return u64::MAX;
@@ -10830,6 +10908,26 @@ pub(super) fn sys_shm_destroy(shm_id_arg: u64) -> u64 {
             log::warn!("[shm] destroy failed pid={} id={} err={:?}", pid, id.0, e);
             u64::MAX
         }
+    }
+}
+
+/// Syscall `SHM_SIZE` (0x1022): return the byte length of an existing
+/// shared-memory region (`page_count * 4096`), or `u64::MAX` if the id is
+/// invalid or unknown.
+///
+/// The region size is not refcount/ownership-sensitive (any holder of the id
+/// could already map it), so this performs a plain lookup via
+/// [`crate::mm::shm::frames`] without touching the refcount. The receiver of an
+/// SHM-backed transport queries this before forming a slice over a peer-supplied
+/// region, so it can reject an under-sized region rather than read past it.
+pub(super) fn sys_shm_size(shm_id_arg: u64) -> u64 {
+    if shm_id_arg == 0 || shm_id_arg > u64::from(u32::MAX) {
+        return u64::MAX;
+    }
+    let id = crate::mm::shm::ShmId(shm_id_arg as u32);
+    match crate::mm::shm::frames(id) {
+        Ok((_start_phys, page_count)) => u64::from(page_count) * 4096,
+        Err(_) => u64::MAX,
     }
 }
 

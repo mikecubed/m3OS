@@ -1769,7 +1769,15 @@ fn allocate_device_vector(key: DeviceCapKey) -> Result<AllocatedDeviceVector, Ve
     // storage / USB keep MSI-X. This realises the Phase 79 acceptance "INTx
     // or single-MSI is used (no MSI-X required)" and is a no-op for the
     // 82540EM e1000, which has no MSI-X capability and already used INTx.
-    let prefer_intx = dev_copy.class_code == kernel_core::nic_ids::ETHERNET_CLASS;
+    //
+    // Phase 80b: the ring-3 Intel HDA driver (audio class 0x04) likewise drives
+    // the legacy interrupt model — it programs `INTCTL`/`INTSTS` + per-stream
+    // `SDnCTL.IOCE` and clears `SDnSTS.BCIS`, but installs no MSI-X cause
+    // routing. A kernel-enabled MSI/MSI-X vector therefore stays silent for it
+    // (QEMU's `intel-hda` reproduces this: the stream-completion IRQ never
+    // reaches the driver), so audio-class joins the Ethernet INTx path.
+    let prefer_intx = dev_copy.class_code == kernel_core::nic_ids::ETHERNET_CLASS
+        || dev_copy.class_code == kernel_core::hda::ids::HDA_CLASS;
 
     if !prefer_intx && let Some(allocated) = crate::pci::allocate_msi_vectors(&dev_copy, 1) {
         return Ok(AllocatedDeviceVector {
@@ -3496,6 +3504,133 @@ pub fn sys_device_config_read(segment: u16, bus: u8, dev: u8, func: u8, packed: 
         }
     };
     value as isize
+}
+
+/// Whether `pid` currently owns a device claim on the supplied BDF.
+///
+/// Locks the device-host registry and checks for a `ClaimSlot` matching
+/// `(pid, key)`. Used to gate `sys_device_config_write`: unlike a config-space
+/// *read* (a pre-claim probe), a *write* mutates device state and is only
+/// permitted on a device the caller has already claimed.
+fn pid_owns_bdf(pid: Pid, key: DeviceCapKey) -> bool {
+    DEVICE_HOST_REGISTRY.lock().slot_for(pid, key).is_some()
+}
+
+/// Syscall entry: `sys_device_config_write(segment, bus, dev, func, packed, value) -> isize`
+/// where `packed = (offset << 8) | width` (the same packing as
+/// [`sys_device_config_read`]) and `value` rides in the sixth register.
+///
+/// Phase 80c Track F.1 — writes PCI configuration space for a device the caller
+/// has **already claimed**, so a driver can perform vendor-specific config-space
+/// programming the generic register path cannot express (the motivating case is
+/// AMD HDA snoop enablement; see [`kernel_core::hda::amd`]).
+///
+/// Returns `0` on success, or a negative errno:
+///
+/// - `NEG_ESRCH`  — kernel task context (PID 0).
+/// - `NEG_EACCES` — caller is not an authorized driver process, does not own a
+///   claim on the target BDF, **or** the `(offset, width)` is not on the
+///   writable-offset allowlist (only the PM-cap PMCSR and the AMD/ATI HDA snoop
+///   byte are permitted; MSI/MSI-X, BARs, and the Command register are denied).
+/// - `NEG_EINVAL` — bad width/offset/alignment, or `value` does not fit `width`.
+/// - `NEG_ENODEV` — no PCI function at the BDF, or a non-zero segment.
+///
+/// See [`kernel_core::device_host::syscalls::SYS_DEVICE_CONFIG_WRITE`] for the
+/// full ABI.
+pub fn sys_device_config_write(
+    segment: u16,
+    bus: u8,
+    dev: u8,
+    func: u8,
+    packed: u64,
+    value: u64,
+) -> isize {
+    let pid = crate::process::current_pid();
+    if pid == 0 {
+        return NEG_ESRCH;
+    }
+    // Authorization gate — must be a `/drivers/` process, same as config-read.
+    if !is_authorized_driver_process(pid) {
+        return NEG_EACCES;
+    }
+    // Only segment 0 exists on current platforms; reject others as ENODEV.
+    if segment != 0 {
+        return NEG_ENODEV;
+    }
+    // A write mutates device state — require that the caller actually owns this
+    // BDF (it has claimed the device). Ownership is necessary but not sufficient:
+    // a writable-offset allowlist below further restricts *which* registers a
+    // claimed device's owner may write (interrupt routing and BAR decode are the
+    // kernel's, not the driver's).
+    let key = DeviceCapKey::new(segment, bus, dev, func);
+    if !pid_owns_bdf(pid, key) {
+        return NEG_EACCES;
+    }
+    let (offset, width) = kernel_core::device_host::syscalls::unpack_config_read_arg(packed);
+    // `value` arrives as a u64 (the raw register); reject anything above u32
+    // before the width-fit check so the validator sees a clean u32.
+    if value > u64::from(u32::MAX) {
+        return NEG_EINVAL;
+    }
+    let value = value as u32;
+    if kernel_core::device_host::validate_config_write(offset, width, value).is_err() {
+        return NEG_EINVAL;
+    }
+    // A function is absent when its vendor ID reads back all-ones.
+    let vendor = crate::pci::pci_config_read_u16(bus, dev, func, 0x00);
+    if vendor == 0xFFFF {
+        return NEG_ENODEV;
+    }
+    // Writable-offset allowlist (fail closed). Being well-formed is not enough:
+    // the kernel — not the driver — owns PCI interrupt routing, so the driver
+    // must not be able to write its device's MSI/MSI-X capability (which, with
+    // interrupt remapping off, would let it forge an arbitrary interrupt
+    // vector/LAPIC), nor relocate its BARs or clear Command bits out from under
+    // the claim's IOMMU/MMIO state. Only the two writes the ring-3 HDA driver
+    // legitimately needs are permitted: the PM-capability PMCSR (force D0) and
+    // the AMD/ATI HDA snoop byte (`0x42`) — and the latter only on AMD *HDA*
+    // controllers (class 0x04 / subclass 0x03), not every AMD function a driver
+    // might own, since offset 0x42 can mean something else on other AMD devices.
+    let pmcsr_offset =
+        crate::pci::find_capability(bus, dev, func, kernel_core::device_host::PCI_CAP_ID_PM)
+            .map(kernel_core::device_host::pmcsr_offset);
+    // PCI class code lives in the dword at offset 0x08: base class in bits
+    // 24..31, subclass in bits 16..23.
+    let class_reg = crate::pci::pci_config_read_u32_any(bus, dev, func, 0x08);
+    let base_class = ((class_reg >> 24) & 0xFF) as u8;
+    let subclass = ((class_reg >> 16) & 0xFF) as u8;
+    let vendor_byte_offset =
+        if kernel_core::hda::amd::is_amd_hda_controller(vendor, base_class, subclass) {
+            Some(u16::from(kernel_core::hda::amd::ATI_SNOOP_REG))
+        } else {
+            None
+        };
+    if !kernel_core::device_host::config_write_permitted(
+        offset,
+        width,
+        pmcsr_offset,
+        vendor_byte_offset,
+    ) {
+        log::warn!(
+            "device_host.config_write_denied pid={} bdf={:04x}:{:02x}:{:02x}.{} offset={:#x} width={}",
+            pid,
+            segment,
+            bus,
+            dev,
+            func,
+            offset,
+            width,
+        );
+        return NEG_EACCES;
+    }
+    let off = offset as u8;
+    match width {
+        1 => crate::pci::pci_config_write_u8(bus, dev, func, off, value as u8),
+        2 => crate::pci::pci_config_write_u16(bus, dev, func, off, value as u16),
+        // width == 4 (validated aligned): write the full dword.
+        _ => crate::pci::pci_config_write_u32_any(bus, dev, func, u16::from(off), value),
+    }
+    0
 }
 
 fn device_claim_error_to_errno(

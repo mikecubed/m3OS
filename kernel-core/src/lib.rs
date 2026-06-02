@@ -16,6 +16,7 @@ pub mod elf;
 pub mod fb;
 pub mod font;
 pub mod fs;
+pub mod hda;
 pub mod init;
 pub mod input;
 pub mod iommu;

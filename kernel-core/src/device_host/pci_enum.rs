@@ -12,6 +12,34 @@
 // The kernel's syscall handler is responsible for projecting `PciDevice`
 // fields into `PciDeviceInfo` values before calling `collect_matching_bdfs`.
 
+/// Sentinel `prog_if` value meaning "match any programming-interface byte"
+/// when passed to [`PciDeviceInfo::matches_class`] / [`collect_matching_bdfs`].
+///
+/// `0xFF` is not a defined prog_if for any class m3OS enumerates (USB uses
+/// 0x20/0x30, Ethernet uses 0x00), so it is safe to overload as a wildcard
+/// without colliding with a real exact-match request. HDA discovery uses it
+/// because the HD Audio spec only guarantees the class/subclass pair
+/// (0x04/0x03); some firmware reports a non-zero prog_if and the controller
+/// must still be bound (see [`crate::hda::ids::hda_pci_match`]). Existing exact
+/// callers pass a concrete prog_if (0x00/0x20/0x30) and are unaffected.
+pub const PROG_IF_ANY: u8 = 0xFF;
+
+/// Decode the PCI configuration-space class register (the dword at config
+/// offset `0x08`) into its `(class, subclass, prog_if)` bytes.
+///
+/// Layout (PCI Local Bus spec §6.1): bits `[31:24]` = base class,
+/// `[23:16]` = subclass, `[15:8]` = programming interface, `[7:0]` = revision
+/// ID (discarded). Shared so the bit positions are defined and host-tested in
+/// one place rather than re-derived at each config-read call site.
+#[inline]
+pub const fn decode_class_dword(class_reg: u32) -> (u8, u8, u8) {
+    (
+        ((class_reg >> 24) & 0xFF) as u8,
+        ((class_reg >> 16) & 0xFF) as u8,
+        ((class_reg >> 8) & 0xFF) as u8,
+    )
+}
+
 /// Minimal projection of a PCI function's identity, extracted from the
 /// kernel's `PciDevice` for the purpose of class-based enumeration.
 ///
@@ -64,10 +92,14 @@ impl PciDeviceInfo {
     }
 
     /// Returns `true` when this device matches the given class / subclass /
-    /// prog_if triple exactly. All three fields must match.
+    /// prog_if filter. `class` and `subclass` must always match exactly.
+    /// `prog_if` must also match exactly **unless** the requested value is
+    /// [`PROG_IF_ANY`], in which case any programming-interface byte matches.
     #[inline]
     pub const fn matches_class(&self, class: u8, subclass: u8, prog_if: u8) -> bool {
-        self.class_code == class && self.subclass == subclass && self.prog_if == prog_if
+        self.class_code == class
+            && self.subclass == subclass
+            && (prog_if == PROG_IF_ANY || self.prog_if == prog_if)
     }
 
     /// Pack this device's BDF into a `u32` in the format documented in
@@ -159,6 +191,18 @@ mod tests {
         ]
     }
 
+    // --- decode_class_dword ---------------------------------------------------
+
+    #[test]
+    fn decode_class_dword_splits_class_subclass_prog_if() {
+        // HDA controller, prog_if 0x01, revision 0x10 → 0x04030110.
+        assert_eq!(decode_class_dword(0x0403_0110), (0x04, 0x03, 0x01));
+        // xHCI 0x0C0330, revision 0x00.
+        assert_eq!(decode_class_dword(0x0C03_3000), (0x0C, 0x03, 0x30));
+        // The low revision byte must be discarded (0xFF here).
+        assert_eq!(decode_class_dword(0x0403_00FF), (0x04, 0x03, 0x00));
+    }
+
     // --- PciDeviceInfo::matches_class -----------------------------------------
 
     #[test]
@@ -188,6 +232,59 @@ mod tests {
         let ehci = PciDeviceInfo::new(0, 0, 2, 0, 0x0C, 0x03, 0x20);
         assert!(xhci.matches_class(0x0C, 0x03, 0x30));
         assert!(!ehci.matches_class(0x0C, 0x03, 0x30));
+    }
+
+    /// `PROG_IF_ANY` makes `prog_if` a wildcard: an HDA controller (class
+    /// 0x04 / subclass 0x03) reporting a non-zero prog_if must still match,
+    /// while class/subclass remain exact (so AC'97 subclass 0x01 is rejected).
+    #[test]
+    fn matches_class_prog_if_any_is_wildcard() {
+        // HDA controller that (per the HD Audio spec note) firmware reports
+        // with a non-zero prog_if. Exact 0x00 misses it; PROG_IF_ANY catches it.
+        let hda_pi1 = PciDeviceInfo::new(0, 0, 0x1b, 0, 0x04, 0x03, 0x01);
+        assert!(
+            !hda_pi1.matches_class(0x04, 0x03, 0x00),
+            "exact prog_if 0x00 must NOT match a 0x01 controller (the original bug)"
+        );
+        assert!(
+            hda_pi1.matches_class(0x04, 0x03, PROG_IF_ANY),
+            "PROG_IF_ANY must match any prog_if when class/subclass agree"
+        );
+        // class/subclass are still exact under the wildcard.
+        let ac97 = PciDeviceInfo::new(0, 0, 0x1b, 0, 0x04, 0x01, 0x00);
+        assert!(
+            !ac97.matches_class(0x04, 0x03, PROG_IF_ANY),
+            "AC'97 subclass 0x01 must be rejected even with PROG_IF_ANY"
+        );
+        let nvme = PciDeviceInfo::new(0, 0, 4, 0, 0x01, 0x08, 0x02);
+        assert!(
+            !nvme.matches_class(0x04, 0x03, PROG_IF_ANY),
+            "wrong class must be rejected even with PROG_IF_ANY"
+        );
+    }
+
+    /// Regression for the HDA discovery bug: `collect_matching_bdfs` with
+    /// `PROG_IF_ANY` returns every class-0x04/0x03 controller regardless of
+    /// prog_if, whereas an exact-0x00 request returns only the standard one.
+    #[test]
+    fn collect_matching_bdfs_prog_if_any_collects_all_hda_prog_ifs() {
+        let devs = [
+            PciDeviceInfo::new(0, 0x00, 0x00, 0, 0x06, 0x00, 0x00), // host bridge
+            PciDeviceInfo::new(0, 0x00, 0x1b, 0, 0x04, 0x03, 0x00), // HDA, prog_if 0x00
+            PciDeviceInfo::new(0, 0x00, 0x1c, 0, 0x04, 0x03, 0x01), // HDA, prog_if 0x01
+            PciDeviceInfo::new(0, 0x00, 0x1d, 0, 0x04, 0x01, 0x00), // AC'97 (subclass 0x01)
+        ];
+
+        let mut out = [0u32; 8];
+        let any = collect_matching_bdfs(&devs, 0x04, 0x03, PROG_IF_ANY, &mut out);
+        assert_eq!(any, 2, "PROG_IF_ANY must collect both HDA controllers");
+
+        let mut out0 = [0u32; 8];
+        let exact = collect_matching_bdfs(&devs, 0x04, 0x03, 0x00, &mut out0);
+        assert_eq!(
+            exact, 1,
+            "exact prog_if 0x00 collects only the standard HDA"
+        );
     }
 
     // --- PciDeviceInfo::pack_bdf ----------------------------------------------
@@ -314,7 +411,9 @@ mod tests {
         // A class that has no devices in the list.
         let devs = synthetic_devices();
         let mut out = [0u32; 8];
-        let total = collect_matching_bdfs(&devs, 0xFF, 0xFF, 0xFF, &mut out);
+        // class 0xFF guarantees no match; use a concrete (non-wildcard)
+        // prog_if so this exercises the class miss, not PROG_IF_ANY.
+        let total = collect_matching_bdfs(&devs, 0xFF, 0xFF, 0x99, &mut out);
         assert_eq!(total, 0);
         assert!(out.iter().all(|&v| v == 0), "no entries must be written");
     }

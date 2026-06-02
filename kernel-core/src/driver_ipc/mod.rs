@@ -7,6 +7,7 @@
 //! the schemas from here, so divergence is a compile error rather than a
 //! runtime corruption bug.
 
+pub mod audio;
 pub mod blk_dispatch;
 pub mod block;
 pub mod net;

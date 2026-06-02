@@ -24,6 +24,7 @@
 //! [`kernel_core::driver_ipc`] per the Phase 55b DRY rule; this module
 //! only *consumes* them.
 
+pub mod audio;
 pub mod block;
 pub mod net;
 

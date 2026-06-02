@@ -17,10 +17,7 @@ use crate::device::AudioBackend;
 use crate::stream::StreamRegistry;
 
 #[cfg(not(test))]
-use driver_runtime::{
-    DeviceCapHandle, DeviceHandle, DriverRuntimeError, IrqNotification, SyscallBackend,
-    ipc::EndpointCap,
-};
+use driver_runtime::ipc::EndpointCap;
 
 // ---------------------------------------------------------------------------
 // IoAction — pure decoded outcome of a single recv arm
@@ -179,58 +176,25 @@ pub fn dispatch_message(
 }
 
 // ---------------------------------------------------------------------------
-// subscribe_and_bind / run_io_loop — production entry points (Track D.4)
+// run_io_loop — production entry point
 // ---------------------------------------------------------------------------
 
-#[cfg(not(test))]
-pub struct DeviceCapView<'a> {
-    inner: &'a DeviceHandle,
-}
-
-#[cfg(not(test))]
-impl<'a> DeviceCapView<'a> {
-    pub fn new(inner: &'a DeviceHandle) -> Self {
-        Self { inner }
-    }
-}
-
-#[cfg(not(test))]
-impl DeviceCapHandle for DeviceCapView<'_> {
-    fn cap_handle(&self) -> u32 {
-        self.inner.cap()
-    }
-}
-
-/// Subscribe to the AC'97 IRQ, bind the resulting [`IrqNotification`]
-/// into `endpoint`'s recv loop, and return the notification cap so the
-/// io loop can ack each wake.
+/// Main server loop: blocks on the command endpoint, dispatches client
+/// messages through the registry, and forwards them to the backend.
 ///
-/// Mirrors `e1000_driver::io::subscribe_and_bind`: subscribe → bind →
-/// (no separate arm step — AC'97 IRQ-cause arming is done at
-/// per-stream open time via `nabm::CR`).
-#[cfg(not(test))]
-pub fn subscribe_and_bind(
-    device: &DeviceHandle,
-    endpoint: EndpointCap,
-) -> Result<IrqNotification<SyscallBackend>, DriverRuntimeError> {
-    let view = DeviceCapView::new(device);
-    let notif = IrqNotification::<SyscallBackend>::subscribe(&view, None)?;
-    notif.bind_to_endpoint(endpoint)?;
-    Ok(notif)
-}
-
-/// Main driver loop: blocks on `recv_multi`, fans out IRQ wakes to the
-/// backend, and dispatches client messages through the registry.
-///
-/// Acceptance: `grep "irq.wait" userspace/audio_server/src/` returns
-/// no hits — every block lives behind `endpoint.recv_multi(&irq)`.
+/// Phase 80: `audio_server` no longer owns the audio hardware — the backend
+/// is an [`crate::proxy::AudioProxyBackend`] (a `dyn AudioBackend`) forwarding
+/// to an out-of-process driver. There is therefore no device IRQ to subscribe
+/// to here: completion is observed via the `frames_consumed` the driver
+/// returns on each `SubmitFrames` `Ack` (surfaced through
+/// `backend.poll_frames_consumed()`). A `RecvResult::Notification` is not
+/// expected on this endpoint, but the arm is kept defensively.
 #[cfg(not(test))]
 pub fn run_io_loop(
     backend: &mut Ac97BackendDyn,
     streams: &mut StreamRegistry,
     clients: &mut ClientRegistry,
     endpoint: EndpointCap,
-    irq: IrqNotification<SyscallBackend>,
 ) -> i32 {
     use driver_runtime::ipc::{IpcBackend, RecvResult};
     use kernel_core::audio::{MAX_SUBMIT_BYTES, ServerMessage};
@@ -266,9 +230,8 @@ pub fn run_io_loop(
             }
         };
         match result {
-            RecvResult::Notification(bits) => {
+            RecvResult::Notification(_bits) => {
                 let _ = backend.handle_irq();
-                let _ = irq.ack(bits);
             }
             RecvResult::Message(frame) => {
                 // First-message admit: the connecting client must be

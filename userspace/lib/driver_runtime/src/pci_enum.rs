@@ -43,6 +43,8 @@ use crate::syscall_backend::decode_errno_common;
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 use kernel_core::device_host::syscalls::SYS_DEVICE_CONFIG_READ;
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
+use kernel_core::device_host::syscalls::SYS_DEVICE_CONFIG_WRITE;
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
 use kernel_core::device_host::syscalls::SYS_DEVICE_PCI_ENUMERATE;
 
 /// Maximum number of PCI controllers the ring-3 buffer can hold in one call.
@@ -258,6 +260,80 @@ fn decode_config_errno(errno: i32) -> DriverRuntimeError {
 pub fn read_vendor_device(key: DeviceCapKey) -> Result<(u16, u16), DriverRuntimeError> {
     let dword = pci_config_read(key, 0x00, 4)?;
     Ok(((dword & 0xFFFF) as u16, ((dword >> 16) & 0xFFFF) as u16))
+}
+
+// ---------------------------------------------------------------------------
+// Phase 80c Track F.1 — claim-gated PCI config-space write.
+// ---------------------------------------------------------------------------
+
+/// Raw `sys_device_config_write` syscall.
+///
+/// Writes `width` (1/2/4) `value` bytes at config-space `offset` for the device
+/// addressed by `key`. The caller must already own a claim on `key`. Returns 0
+/// on success or a negated errno.
+///
+/// # Safety
+///
+/// Pure integer syscall — no pointer lifetimes are involved.
+#[inline]
+unsafe fn raw_sys_device_config_write(
+    key: DeviceCapKey,
+    offset: u16,
+    width: u8,
+    value: u32,
+) -> isize {
+    let packed = kernel_core::device_host::syscalls::pack_config_read_arg(offset, width);
+    #[cfg(all(target_arch = "x86_64", target_os = "none"))]
+    // SAFETY: all arguments are plain integers. `syscall6` places them in
+    // rdi/rsi/rdx/r10/r8/r9 matching the documented ABI.
+    unsafe {
+        syscall_lib::syscall6(
+            SYS_DEVICE_CONFIG_WRITE,
+            u64::from(key.segment),
+            u64::from(key.bus),
+            u64::from(key.dev),
+            u64::from(key.func),
+            packed,
+            u64::from(value),
+        ) as isize
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_os = "none")))]
+    {
+        // Host-test path: no real kernel / PCI bus. Report ENODEV so the
+        // public wrapper exercises its error branch deterministically.
+        let _ = (key, offset, width, value, packed);
+        -19
+    }
+}
+
+/// Write `width` (1/2/4) bytes of `value` to PCI config space at `offset` for
+/// `key`, a device the caller has **already claimed**.
+///
+/// Used by `hda_driver` to perform vendor-specific controller programming the
+/// generic register path cannot express (AMD HDA snoop enablement, forcing the
+/// PCI power state to D0 — see `kernel_core::hda::amd` and
+/// `kernel_core::device_host::pci_pm`).
+///
+/// # Errors
+///
+/// - `DriverRuntimeError::Device(DeviceHostError::NotClaimed)` on `-EACCES`
+///   (exec-path not under `/drivers/`, or the caller does not own `key`).
+/// - `DriverRuntimeError::Device(DeviceHostError::NotClaimed)` on `-ENODEV`
+///   (no function at the BDF).
+/// - `DriverRuntimeError::Device(DeviceHostError::Internal)` on `-EINVAL`
+///   (invalid offset/width, or `value` too wide) or any other unexpected errno.
+pub fn pci_config_write(
+    key: DeviceCapKey,
+    offset: u16,
+    width: u8,
+    value: u32,
+) -> Result<(), DriverRuntimeError> {
+    // SAFETY: see `raw_sys_device_config_write`.
+    let raw = unsafe { raw_sys_device_config_write(key, offset, width, value) };
+    if raw < 0 {
+        return Err(decode_config_errno(raw as i32));
+    }
+    Ok(())
 }
 
 /// An enumerated PCI function plus its identifying vendor/device IDs.

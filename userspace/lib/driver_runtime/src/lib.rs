@@ -55,6 +55,7 @@
 
 extern crate alloc;
 
+pub mod audio_pcm;
 pub mod device;
 pub mod dma;
 pub mod ipc;
@@ -76,7 +77,7 @@ pub use net_ring::{
 };
 pub use pci_enum::{
     PciFunctionId, enumerate_ethernet_functions, enumerate_pci_class, pci_config_read,
-    read_vendor_device, select_nic,
+    pci_config_write, read_vendor_device, select_nic,
 };
 pub use pio::Pio;
 pub use syscall_backend::SyscallBackend;
