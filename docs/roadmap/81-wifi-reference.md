@@ -2,9 +2,11 @@
 
 **Status:** Planned
 **Source Ref:** phase-81
-**Depends on:** Phase 55b (Ring-3 Driver Hosting) ✅, Phase 67 (IOMMU Substrate) ✅, Phase 77 (Pre-1.0 Correctness), Phase 79 (Modern NIC — establishes the multi-NIC routing path)
+**Depends on:** Phase 55b (Ring-3 Driver Hosting) ✅, Phase 67 (IOMMU Substrate) ✅, Phase 77 (Pre-1.0 Correctness) ✅, Phase 79 (Modern NIC — establishes the multi-NIC routing path) ✅
 **Builds on:** Adds the project's first Wi-Fi driver — MediaTek MT7925 (`0x14C3:0x7925`), the chipset shipping in the dev laptop and a credible reference for the larger 802.11be family. This is a stub of a real Wi-Fi stack: one chipset, one band, one auth method, documented as such
 **Primary Components:** `userspace/drivers/mt7925/` (new), `userspace/drivers/wifi-core/` (new — minimal 802.11 mgmt-frame state machine), `kernel-core/src/net/wifi/` (host-testable association FSM), `kernel/initrd/lib/firmware/mt7925/` (vendor firmware blob)
+
+> **Planning update (companion task doc authored, [tasks/81-wifi-reference-tasks.md](./tasks/81-wifi-reference-tasks.md)).** The task doc reconciles this design doc to the as-planned scope, and several sections below are corrected there (tracked as task **F.4**): (1) the bring-up target is the MediaTek **mt792x family** (MT7921/MT7922 connac2 first; MT7925/connac3 in the same device-ID registry) matched over a bounded registry — Phase-79 style — rather than a single hardcoded `0x14C3:0x7925`, because this build host is **not** the user's laptop and the laptop's exact chip is unconfirmed; (2) the 802.11 mgmt plane + WPA2-PSK supplicant live in a **userspace `wifi-core` lib + `crypto-lib`** (not `kernel-core/src/net/wifi/`, which would compile policy into ring 0; `kernel-core` also cannot depend on `crypto-lib`), with only the primitive-free hardware logic in a top-level `kernel_core::mt792x`; (3) SHA-1/HMAC-SHA1/PBKDF2/AES-Key-Wrap are **absent** from the workspace and are added by Phase 81, not inherited from Phase 42; (4) Redox has no Wi-Fi stack and is not a valid reference (cite Fuchsia SME/MLME + FreeBSD `net80211` instead).
 
 ## Milestone Goal
 
@@ -12,7 +14,7 @@ m3OS associates with a WPA2-PSK Wi-Fi network on the dev laptop and pulls a DHCP
 
 ## Why This Phase Exists
 
-Phase 74a §3 documents the laptop reality: the dev hardware has zero ethernet. Every modern laptop ships only Wi-Fi for general-purpose connectivity. Without a Wi-Fi driver, m3OS at 1.0 is a desktop-only OS, and even then only on the diminishing set of desktops with onboard wired NICs.
+The pre-1.0 audit ([`docs/appendix/audit-status/74a-pre-1.0-audit.md`](../appendix/audit-status/74a-pre-1.0-audit.md), §3 — an audit artifact, not a phase) documents the laptop reality: the dev hardware has zero ethernet. Every modern laptop ships only Wi-Fi for general-purpose connectivity. Without a Wi-Fi driver, m3OS at 1.0 is a desktop-only OS, and even then only on the diminishing set of desktops with onboard wired NICs.
 
 Wi-Fi drivers are large (Linux's `mt76` family is ~15k LOC of pure driver code, not counting `mac80211` and `cfg80211`), so the project pragmatically scopes Phase 81 to one chipset, one band (5 GHz preferred, fall back to 2.4 GHz), one auth method (WPA2-PSK; no enterprise, no WPA3-SAE). Everything else is post-1.0.
 
@@ -36,7 +38,7 @@ Wi-Fi drivers are large (Linux's `mt76` family is ~15k LOC of pure driver code, 
 
 - **B.1** — Scan: issue probe-request on each supported channel; collect probe-responses into a BSS list.
 - **B.2** — Auth + assoc: open-system auth followed by association-request with the chosen BSS.
-- **B.3** — 4-way handshake (WPA2-PSK only). PTK derivation via PBKDF2(passphrase, SSID) → PMK → PTK with the 4-way `EAPOL-Key` exchange. The Phase 42 crypto primitives cover SHA-1 and HMAC; PBKDF2 is a thin wrapper.
+- **B.3** — 4-way handshake (WPA2-PSK only). PTK derivation via PBKDF2(passphrase, SSID) → PMK → PTK with the 4-way `EAPOL-Key` exchange. NOTE: SHA-1, HMAC-SHA1, PBKDF2, and AES-Key-Wrap (RFC 3394) are **not** present in the workspace (`crypto-lib` ships only the SHA-256 family); Phase 81 adds them — see the task doc Track B.1–B.3.
 - **B.4** — On successful association, expose the interface as a `RemoteNic`-compatible facade. The kernel TCP/IP stack treats it exactly like an Ethernet NIC.
 
 ### Track C — Configuration surface
@@ -62,7 +64,7 @@ After association the AP and the station each generate a nonce (ANonce / SNonce)
 
 - Reuses the Phase 55b ring-3 driver-host primitives — Wi-Fi driver is just another `RemoteNic` from the kernel's perspective.
 - Reuses Phase 67's `DmaBuffer<T>` for TX/RX ring allocation.
-- Reuses Phase 42's HMAC-SHA1 and PBKDF2 for WPA2-PSK key derivation.
+- Adds the WPA2-PSK key-derivation primitives (SHA-1, HMAC-SHA1, PBKDF2, AES-Key-Wrap) to `crypto-lib` — these are **not** present from Phase 42, which is SHA-256-family only.
 - Lifts the Phase 79 `Vec<RemoteNic>` so the laptop can route over Wi-Fi when no wired link is up.
 
 ## Implementation Outline
@@ -87,7 +89,7 @@ After association the AP and the station each generate a nonce (ANonce / SNonce)
 
 ## Companion Task List
 
-- [Phase 81 Task List](./tasks/81-wifi-reference-tasks.md) — to be authored when implementation planning begins.
+- [Phase 81 Task List](./tasks/81-wifi-reference-tasks.md)
 
 ## How Real OS Implementations Differ
 
