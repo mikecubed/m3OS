@@ -123,9 +123,13 @@ impl Mt792x {
 
         // Enable PCI bus-mastering (BME) so the WFDMA engine can DMA into
         // host memory. Without this the IOMMU rejects every descriptor fetch.
-        // Mirror how the hda driver enables BME via a config-space write to
-        // the PCI command register (offset 0x04, bit 2 = Bus Master Enable).
-        let _ = driver_runtime::pci_config_write(key, 0x04, 2, 0x0006);
+        // Read-modify-write the command register (offset 0x04, width 2): set
+        // Memory Space (bit 1) + Bus Master (bit 2) without clearing the other
+        // command bits, and propagate the syscall error rather than silently
+        // proceeding into hard-to-debug DMA/IOMMU faults. Mirrors how the hda
+        // driver programs config space.
+        let cmd = driver_runtime::pci_config_read(key, 0x04, 2)?;
+        driver_runtime::pci_config_write(key, 0x04, 2, cmd | 0x0006)?;
 
         // Subscribe the device IRQ. The IOMMU fault ISR is routed through the
         // same notification object as the WFDMA interrupt (MSI/MSI-X vector 0).

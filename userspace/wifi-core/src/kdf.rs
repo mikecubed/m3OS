@@ -264,7 +264,7 @@ pub(crate) mod tests {
         let kde = build_gtk_kde(&gtk_plaintext, key_idx);
         // KDE is 8 + 16 = 24 bytes (a multiple of 8) — no padding needed.
         assert_eq!(kde.len(), 24);
-        let m3_keydata = crypto_lib::symmetric::aes_key_wrap(&kek, &kde);
+        let m3_keydata = crypto_lib::symmetric::aes_key_wrap(&kek, &kde).expect("GTK KDE wraps");
 
         // Successful unwrap recovers the GTK and the key index from the KDE.
         let gtk = unwrap_gtk(&kek, &m3_keydata).expect("unwrap should succeed");
@@ -282,7 +282,7 @@ pub(crate) mod tests {
         // A correctly-wrapped but non-GTK KDE (wrong data-type) must be rejected.
         let mut bad_kde = build_gtk_kde(&gtk_plaintext, key_idx);
         bad_kde[5] = 0x02; // data_type != GTK
-        let bad = crypto_lib::symmetric::aes_key_wrap(&kek, &bad_kde);
+        let bad = crypto_lib::symmetric::aes_key_wrap(&kek, &bad_kde).expect("bad KDE wraps");
         assert!(
             matches!(
                 unwrap_gtk(&kek, &bad),

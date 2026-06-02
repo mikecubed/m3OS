@@ -34,6 +34,9 @@ pub enum ConfigError {
     ShortPsk,
     /// PSK passphrase is longer than 63 characters (IEEE 802.11 maximum).
     LongPsk,
+    /// PSK passphrase contains a non-printable / non-ASCII byte. IEEE 802.11
+    /// §H.4.1 restricts the passphrase to printable ASCII (octets 32..=126).
+    NonAsciiPsk,
     /// The configuration text is syntactically malformed.
     Malformed,
 }
@@ -128,6 +131,14 @@ pub fn parse_wpa_conf(text: &str) -> Result<WpaConfig, ConfigError> {
         zero_secret(&mut psk_bytes);
         return Err(ConfigError::LongPsk);
     }
+    // IEEE 802.11 §H.4.1: each passphrase character is printable ASCII (octets
+    // 32..=126). Reject anything else rather than feeding non-ASCII bytes into
+    // PBKDF2, which would silently diverge from the documented `/etc/wpa.conf`
+    // format and from typical WPA2-PSK passphrase rules.
+    if psk_bytes.iter().any(|&b| !(0x20..=0x7E).contains(&b)) {
+        zero_secret(&mut psk_bytes);
+        return Err(ConfigError::NonAsciiPsk);
+    }
 
     // Derive PMK at parse time; keep only the PMK.
     let pmk = crypto_lib::hash::wpa_pmk(&psk_bytes, &ssid);
@@ -191,6 +202,16 @@ mod tests {
         let text = alloc::format!("ssid=Net\npsk={long_psk}\n");
         let err = parse_wpa_conf(&text).expect_err("long psk must fail");
         assert_eq!(err, ConfigError::LongPsk);
+    }
+
+    /// A passphrase carrying a non-printable / non-ASCII byte is rejected per
+    /// IEEE 802.11 §H.4.1 (printable ASCII only), not fed into PBKDF2.
+    #[test]
+    fn rejects_non_ascii_psk() {
+        // 9 bytes (length-valid), but byte 4 is DEL (0x7F), outside 0x20..=0x7E.
+        let text = "ssid=Net\npsk=pass\u{7f}word\n";
+        let err = parse_wpa_conf(text).expect_err("non-ASCII psk must fail");
+        assert_eq!(err, ConfigError::NonAsciiPsk);
     }
 
     /// `WpaConfig` must NOT expose a passphrase getter — only PMK and SSID.

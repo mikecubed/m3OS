@@ -212,8 +212,18 @@ fn load_supplicant(sta_mac: [u8; 6]) -> Option<WifiFsm> {
     }
     let _ = syscall_lib::close(fd);
 
-    let text = core::str::from_utf8(&data).ok()?;
-    let cfg = wifi_core::config::parse_wpa_conf(text).ok()?;
+    // Parse into an owned `WpaConfig` (PMK + SSID only), then volatile-zero the
+    // plaintext buffers. `text` only borrows `data` for the parse call, so that
+    // borrow has ended by the time we wipe. This keeps the plaintext PSK from
+    // lingering on the heap (`data`) and stack (`chunk`) for the driver's
+    // lifetime — `wifi_core::config` already avoids retaining the passphrase
+    // internally; this closes the gap on the driver's own read buffers.
+    let parsed = core::str::from_utf8(&data)
+        .ok()
+        .and_then(|text| wifi_core::config::parse_wpa_conf(text).ok());
+    wipe_secret(&mut data);
+    wipe_secret(&mut chunk);
+    let cfg = parsed?;
 
     // Draw a fresh, unpredictable SNonce from the kernel CSPRNG for the 4-way
     // handshake (never the FSM's deterministic test seed). One SNonce per boot
@@ -232,4 +242,14 @@ fn load_supplicant(sta_mac: [u8; 6]) -> Option<WifiFsm> {
         sta_mac,
         snonce,
     ))
+}
+
+/// Volatile-zero a byte buffer so the optimizer cannot elide the wipe of a
+/// plaintext secret (the `/etc/wpa.conf` PSK) once the PMK has been derived.
+#[cfg(not(test))]
+fn wipe_secret(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        // SAFETY: `b` is a valid, uniquely-borrowed, aligned `u8`.
+        unsafe { core::ptr::write_volatile(b, 0u8) };
+    }
 }

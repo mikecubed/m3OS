@@ -36,7 +36,7 @@ pub const KEY_INFO_M4: u16 = 0x030A;
 pub struct KeyInfo(pub u16);
 
 impl KeyInfo {
-    // Descriptor version bits 1:0
+    // Descriptor version: bits 2:0 (mask 0x0007; IEEE 802.11i §8.5.2 Table 43b)
     pub fn desc_version(self) -> u8 {
         (self.0 & 0x0007) as u8
     }

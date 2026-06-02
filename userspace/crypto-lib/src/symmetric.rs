@@ -124,13 +124,16 @@ mod kw {
 
     /// Wrap `key` with the 128-bit key-encryption key `kek` (RFC 3394 §2.2.1).
     ///
-    /// `key.len()` must be a multiple of 8 and at least 16.
-    /// Returns a `Vec<u8>` of length `key.len() + 8`.
-    pub fn aes_key_wrap(kek: &[u8; 16], key: &[u8]) -> alloc::vec::Vec<u8> {
-        assert!(
-            key.len() >= 16 && key.len().is_multiple_of(8),
-            "key length must be a multiple of 8 and >= 16"
-        );
+    /// `key.len()` must be a multiple of 8 and at least 16; otherwise
+    /// `Err(CryptoError::InvalidLength)` is returned. A malformed KDE (or a
+    /// future caller bug) must not panic the whole driver/process, so this
+    /// returns a `CryptoError` rather than asserting — mirroring
+    /// [`aes_key_unwrap`] and the rest of `crypto-lib`.
+    /// On success returns a `Vec<u8>` of length `key.len() + 8`.
+    pub fn aes_key_wrap(kek: &[u8; 16], key: &[u8]) -> Result<alloc::vec::Vec<u8>, CryptoError> {
+        if key.len() < 16 || !key.len().is_multiple_of(8) {
+            return Err(CryptoError::InvalidLength);
+        }
 
         let n = key.len() / 8; // number of 64-bit blocks
         let cipher = Aes128::new(GenericArray::from_slice(kek));
@@ -164,7 +167,7 @@ mod kw {
         for ri in r {
             out.extend_from_slice(&ri.to_be_bytes());
         }
-        out
+        Ok(out)
     }
 
     /// Unwrap a wrapped key produced by [`aes_key_wrap`] (RFC 3394 §2.2.2).
@@ -343,7 +346,7 @@ mod tests {
             0x7B, 0x82, 0x9D, 0x3E, 0x86, 0x23, 0x71, 0xD2, 0xCF, 0xE5,
         ];
 
-        let wrapped = aes_key_wrap(&kek, &key_data);
+        let wrapped = aes_key_wrap(&kek, &key_data).expect("16-byte key wraps");
         assert_eq!(
             wrapped.as_slice(),
             &expected_wrapped[..],
@@ -369,7 +372,7 @@ mod tests {
             0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
             0xEE, 0xFF,
         ];
-        let mut wrapped = aes_key_wrap(&kek, &key_data);
+        let mut wrapped = aes_key_wrap(&kek, &key_data).expect("16-byte key wraps");
         // Flip one byte of the wrapped blob.
         wrapped[5] ^= 0xFF;
         let result = aes_key_unwrap(&kek, &wrapped);

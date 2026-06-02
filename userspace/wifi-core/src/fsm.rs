@@ -534,7 +534,7 @@ mod tests {
         // sends and what `unwrap_gtk` now parses.
         let gtk_plain = [0x42u8; 16]; // synthetic GTK plaintext
         let kde = crate::kdf::build_gtk_kde(&gtk_plain, 0); // key_idx = 0
-        let key_data = crypto_lib::symmetric::aes_key_wrap(&ptk.kek, &kde);
+        let key_data = crypto_lib::symmetric::aes_key_wrap(&ptk.kek, &kde).expect("GTK KDE wraps");
 
         let mut frame = EapolKeyFrame {
             version: 1,

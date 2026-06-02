@@ -17,6 +17,11 @@ pub const WIFI_CONNECT_REQ: u16 = 0x5603;
 /// Status update: current connection state.
 pub const WIFI_STATUS: u16 = 0x5604;
 
+/// Maximum SSID length in octets. An 802.11 SSID element is 0..=32 bytes
+/// (IEEE 802.11 §9.4.2.2), so both the encoders and the decoders bound the
+/// on-wire SSID here rather than trusting the 1-byte length up to 255.
+pub const MAX_SSID_LEN: usize = 32;
+
 // ── Error ─────────────────────────────────────────────────────────────────────
 
 /// Error codes for the Wi-Fi control protocol.
@@ -48,7 +53,7 @@ impl ScanResult {
     ///
     /// Format: `bssid[6] | rssi[1] | channel[1] | ssid_len[1] | ssid[n]`
     pub fn encode(&self) -> Vec<u8> {
-        let ssid_len = self.ssid.len().min(255) as u8;
+        let ssid_len = self.ssid.len().min(MAX_SSID_LEN) as u8;
         let mut out = Vec::with_capacity(6 + 1 + 1 + 1 + ssid_len as usize);
         out.extend_from_slice(&self.bssid);
         out.push(self.rssi as u8);
@@ -68,7 +73,7 @@ impl ScanResult {
         let rssi = bytes[6] as i8;
         let channel = bytes[7];
         let ssid_len = bytes[8] as usize;
-        if bytes.len() < 9 + ssid_len {
+        if ssid_len > MAX_SSID_LEN || bytes.len() < 9 + ssid_len {
             return None;
         }
         let ssid = bytes[9..9 + ssid_len].to_vec();
@@ -123,7 +128,7 @@ impl WifiStatus {
     ///
     /// Format: `rssi[1] | ipv4[4] | ssid_len[1] | ssid[n]`
     pub fn encode(&self) -> Vec<u8> {
-        let ssid_len = self.ssid.len().min(255) as u8;
+        let ssid_len = self.ssid.len().min(MAX_SSID_LEN) as u8;
         let mut out = Vec::with_capacity(1 + 4 + 1 + ssid_len as usize);
         out.push(self.rssi as u8);
         out.extend_from_slice(&self.ipv4);
@@ -141,7 +146,7 @@ impl WifiStatus {
         let mut ipv4 = [0u8; 4];
         ipv4.copy_from_slice(&bytes[1..5]);
         let ssid_len = bytes[5] as usize;
-        if bytes.len() < 6 + ssid_len {
+        if ssid_len > MAX_SSID_LEN || bytes.len() < 6 + ssid_len {
             return None;
         }
         let ssid = bytes[6..6 + ssid_len].to_vec();
@@ -194,6 +199,56 @@ mod tests {
         let down = WifiStatus::for_connection(false, b"HomeNet", -55, [10, 0, 0, 7]);
         assert!(down.ssid.is_empty(), "not-associated status has empty SSID");
         assert_eq!(down.ipv4, [0; 4]);
+    }
+
+    /// Decoders reject an on-wire `ssid_len` greater than the 32-octet maximum
+    /// instead of allocating up to 255 bytes for a malformed frame.
+    #[test]
+    fn rejects_oversized_ssid_len() {
+        // ScanResult: bssid[6] rssi[1] channel[1] ssid_len[1]=33 + 33 bytes.
+        let mut sr = alloc::vec![0u8; 9 + 33];
+        sr[8] = 33;
+        assert!(
+            ScanResult::decode(&sr).is_none(),
+            "ScanResult ssid_len 33 must be rejected"
+        );
+
+        // WifiStatus: rssi[1] ipv4[4] ssid_len[1]=33 + 33 bytes.
+        let mut ws = alloc::vec![0u8; 6 + 33];
+        ws[5] = 33;
+        assert!(
+            WifiStatus::decode(&ws).is_none(),
+            "WifiStatus ssid_len 33 must be rejected"
+        );
+    }
+
+    /// Encoders cap an over-length SSID at the 32-octet maximum.
+    #[test]
+    fn encode_caps_oversized_ssid() {
+        let sr = ScanResult {
+            bssid: [0; 6],
+            ssid: alloc::vec![b'x'; 40],
+            rssi: -50,
+            channel: 1,
+        };
+        let enc = sr.encode();
+        assert_eq!(
+            enc[8] as usize, MAX_SSID_LEN,
+            "encoded ssid_len capped at 32"
+        );
+        assert_eq!(enc.len(), 9 + MAX_SSID_LEN);
+
+        let ws = WifiStatus {
+            ssid: alloc::vec![b'y'; 40],
+            rssi: -50,
+            ipv4: [0; 4],
+        };
+        let enc = ws.encode();
+        assert_eq!(
+            enc[5] as usize, MAX_SSID_LEN,
+            "encoded ssid_len capped at 32"
+        );
+        assert_eq!(enc.len(), 6 + MAX_SSID_LEN);
     }
 
     /// Label constants must be distinct u16 values.
