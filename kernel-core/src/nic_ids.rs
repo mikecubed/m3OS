@@ -161,6 +161,132 @@ pub fn rx_route_index(macs: &[[u8; 6]], dest_mac: &[u8; 6]) -> Option<usize> {
     default_route_index(macs.len())
 }
 
+// ---------------------------------------------------------------------------
+// Wi-Fi (802.11) family registry — Phase 81 Track KC / Task A.1 + C.3.
+// ---------------------------------------------------------------------------
+//
+// MediaTek mt792x Wi-Fi devices use PCI vendor 0x14C3 and expose themselves
+// as Network Controller / Other Network Controller (class 0x02, subclass 0x80).
+// The five sub-families below are all connac2-based and share the same firmware
+// loading path; the mt7920/mt7902 are single-radio cut-downs, the mt7921/mt7922
+// cover the mainstream dual-band PCIe parts, and mt7925 is the Wi-Fi 7 (BE)
+// successor.
+//
+// Device-ID sets are cross-verified against the upstream mt76 driver
+// (drivers/net/wireless/mediatek/mt76/mt7921/) and linux/pci.ids.
+
+/// MediaTek PCI vendor ID (`0x14C3`).
+pub const VENDOR_MEDIATEK: u16 = 0x14C3;
+
+/// PCI class/subclass/prog_if triple identifying a Wi-Fi (802.11) controller.
+/// Class `0x02` = Network Controller, subclass `0x80` = Other Network
+/// Controller (used by 802.11 adapters), prog_if `0x00`.
+pub const WIFI_CLASS: u8 = 0x02;
+pub const WIFI_SUBCLASS: u8 = 0x80;
+pub const WIFI_PROG_IF: u8 = 0x00;
+
+/// MT7921 device IDs: the mainstream Wi-Fi 6 PCIe part (also sold as MT7921K
+/// for the low-cost SKU) plus the SDIO/USB variant's PCIe bridge DID.
+pub const MT7921_IDS: &[u16] = &[0x7961, 0x0608];
+
+/// MT7922 device IDs: the Wi-Fi 6E tri-band upgrade.
+pub const MT7922_IDS: &[u16] = &[0x7922, 0x0616];
+
+/// MT7920 device IDs: single-radio cut-down (2.4 GHz only, low-cost).
+pub const MT7920_IDS: &[u16] = &[0x7920];
+
+/// MT7902 device IDs: embedded single-radio variant.
+pub const MT7902_IDS: &[u16] = &[0x7902];
+
+/// MT7925 device IDs: Wi-Fi 7 (802.11be) — tri-band BE successor.
+pub const MT7925_IDS: &[u16] = &[0x7925, 0x0717];
+
+/// All mt792x sub-families as a table of `(name, id_slice)` pairs.
+///
+/// Used for the pairwise-disjoint and no-duplicate tests, mirroring the Intel
+/// family table.
+pub const MT792X_FAMILIES: &[(&str, &[u16])] = &[
+    ("mt7921", MT7921_IDS),
+    ("mt7922", MT7922_IDS),
+    ("mt7920", MT7920_IDS),
+    ("mt7902", MT7902_IDS),
+    ("mt7925", MT7925_IDS),
+];
+
+/// True for a MediaTek MT7921-family device.
+#[inline]
+pub fn is_mt7921(device_id: u16) -> bool {
+    matches(MT7921_IDS, device_id)
+}
+
+/// True for a MediaTek MT7922-family device.
+#[inline]
+pub fn is_mt7922(device_id: u16) -> bool {
+    matches(MT7922_IDS, device_id)
+}
+
+/// True for a MediaTek MT7920-family device.
+#[inline]
+pub fn is_mt7920(device_id: u16) -> bool {
+    matches(MT7920_IDS, device_id)
+}
+
+/// True for a MediaTek MT7902-family device.
+#[inline]
+pub fn is_mt7902(device_id: u16) -> bool {
+    matches(MT7902_IDS, device_id)
+}
+
+/// True for a MediaTek MT7925-family device.
+#[inline]
+pub fn is_mt7925(device_id: u16) -> bool {
+    matches(MT7925_IDS, device_id)
+}
+
+/// True for any mt792x Wi-Fi device (MT7921 / MT7922 / MT7920 / MT7902 / MT7925).
+#[inline]
+pub fn is_mt792x(device_id: u16) -> bool {
+    is_mt7921(device_id)
+        || is_mt7922(device_id)
+        || is_mt7920(device_id)
+        || is_mt7902(device_id)
+        || is_mt7925(device_id)
+}
+
+// ---------------------------------------------------------------------------
+// Route helper — Task C.3.
+//
+// Extends the count-based default_route_index with a link-state-aware version
+// that prefers wired NICs over wireless when both have link up.
+// ---------------------------------------------------------------------------
+
+/// Per-NIC link metadata used by [`default_route_index_by_link`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NicRoute {
+    /// True when this NIC is a wireless (802.11) adapter.
+    pub is_wireless: bool,
+    /// True when the NIC currently reports link up.
+    pub link_up: bool,
+}
+
+/// Choose the default-route NIC index from a slice of [`NicRoute`] descriptors.
+///
+/// Selection policy (mirrors standard OS behavior):
+/// 1. First link-up **wired** NIC (`is_wireless == false`), else
+/// 2. First link-up **wireless** NIC (`is_wireless == true`), else
+/// 3. `None` (no usable interface).
+///
+/// This is the per-link-state version; the count-based [`default_route_index`]
+/// remains for the degenerate single-NIC case where link state is not tracked.
+pub fn default_route_index_by_link(nics: &[NicRoute]) -> Option<usize> {
+    // Pass 1: first wired + link_up.
+    if let Some(i) = nics.iter().position(|n| !n.is_wireless && n.link_up) {
+        return Some(i);
+    }
+    // Pass 2: first wireless + link_up.
+    nics.iter().position(|n| n.is_wireless && n.link_up)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,5 +449,141 @@ mod tests {
                 }
             }
         }
+    }
+
+    // --- Phase 81 Wi-Fi registry (Task A.1 + C.3) ---
+
+    #[test]
+    fn wifi_class_triple_distinct() {
+        assert_eq!(
+            (WIFI_CLASS, WIFI_SUBCLASS, WIFI_PROG_IF),
+            (0x02, 0x80, 0x00)
+        );
+        assert_ne!(
+            (WIFI_CLASS, WIFI_SUBCLASS, WIFI_PROG_IF),
+            (ETHERNET_CLASS, ETHERNET_SUBCLASS, ETHERNET_PROG_IF),
+            "Wi-Fi and Ethernet class triples must be distinct"
+        );
+    }
+
+    #[test]
+    fn vendor_mediatek_is_correct() {
+        assert_eq!(VENDOR_MEDIATEK, 0x14C3);
+    }
+
+    #[test]
+    fn mt792x_predicates() {
+        // Known-good IDs for each family.
+        assert!(is_mt7921(0x7961), "MT7921 primary id");
+        assert!(is_mt7921(0x0608), "MT7921 secondary id");
+        assert!(is_mt7922(0x0616), "MT7922 secondary id");
+        assert!(is_mt7922(0x7922), "MT7922 primary id");
+        assert!(is_mt7920(0x7920), "MT7920 id");
+        assert!(is_mt7902(0x7902), "MT7902 id");
+        assert!(is_mt7925(0x7925), "MT7925 primary id");
+        assert!(is_mt7925(0x0717), "MT7925 secondary id");
+
+        // is_mt792x covers all families.
+        assert!(is_mt792x(0x7961));
+        assert!(is_mt792x(0x7922));
+        assert!(is_mt792x(0x7920));
+        assert!(is_mt792x(0x7902));
+        assert!(is_mt792x(0x7925));
+
+        // Intel Ethernet IDs must not match.
+        assert!(!is_mt792x(0x100E), "e1000 id must not match mt792x");
+        // Realtek 2.5G id must not match.
+        assert!(!is_mt792x(0x8125), "RTL8125 id must not match mt792x");
+        // A clearly-foreign MediaTek Bluetooth id (not in any mt792x slice).
+        assert!(!is_mt792x(0x7663), "non-mt792x MediaTek id must not match");
+    }
+
+    #[test]
+    fn mt792x_families_pairwise_disjoint() {
+        for (i, (na, a)) in MT792X_FAMILIES.iter().enumerate() {
+            for (nb, b) in MT792X_FAMILIES.iter().skip(i + 1) {
+                for &id in *a {
+                    assert!(
+                        !b.contains(&id),
+                        "mt792x: {na} id {id:#06x} also found in {nb}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_duplicate_ids_within_mt792x_family() {
+        for (name, ids) in MT792X_FAMILIES {
+            for (i, &a) in ids.iter().enumerate() {
+                for &b in &ids[i + 1..] {
+                    assert_ne!(a, b, "duplicate id {a:#06x} within {name} family");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn max_nics_unchanged() {
+        // A Wi-Fi NIC occupies one slot in the combined registry — the cap
+        // must remain 8, matching the Phase 79 multi-NIC registry bound.
+        assert_eq!(MAX_NICS, 8);
+    }
+
+    #[test]
+    fn route_prefers_wired_when_both_up() {
+        let nics = [
+            NicRoute {
+                is_wireless: true,
+                link_up: true,
+            },
+            NicRoute {
+                is_wireless: false,
+                link_up: true,
+            },
+            NicRoute {
+                is_wireless: false,
+                link_up: false,
+            },
+        ];
+        // Index 1 is the first wired + link-up NIC.
+        assert_eq!(default_route_index_by_link(&nics), Some(1));
+    }
+
+    #[test]
+    fn route_falls_back_to_wifi() {
+        let nics = [
+            NicRoute {
+                is_wireless: false,
+                link_up: false,
+            },
+            NicRoute {
+                is_wireless: true,
+                link_up: true,
+            },
+            NicRoute {
+                is_wireless: true,
+                link_up: false,
+            },
+        ];
+        // No wired link up → fall back to index 1 (first wireless + link-up).
+        assert_eq!(default_route_index_by_link(&nics), Some(1));
+    }
+
+    #[test]
+    fn route_none_when_all_down() {
+        let nics = [
+            NicRoute {
+                is_wireless: false,
+                link_up: false,
+            },
+            NicRoute {
+                is_wireless: true,
+                link_up: false,
+            },
+        ];
+        assert_eq!(default_route_index_by_link(&nics), None);
+        // Empty slice also returns None.
+        assert_eq!(default_route_index_by_link(&[]), None);
     }
 }
