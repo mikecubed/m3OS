@@ -4,12 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**m3OS** (technical name: `m3os`) is a bootable microkernel OS in Rust: x86_64, UEFI boot, kernel **v0.80.0**. Ring 0 handles memory, scheduling, IPC/capabilities, interrupt routing, and in-kernel drivers; ring 3 hosts everything else.
+**m3OS** (technical name: `m3os`) is a bootable microkernel OS in Rust: x86_64, UEFI boot, kernel **v0.81.0**. Ring 0 handles memory, scheduling, IPC/capabilities, interrupt routing, and in-kernel drivers; ring 3 hosts everything else.
 
 Capabilities now present in the tree:
 
 - **Userspace**: init (PID 1), shell (sh0) + ion, coreutils, multi-user (login/su/passwd/adduser), editor, service manager, PTY, telnet/SSH servers, crypto.
 - **Networking & storage**: IPv4/TCP/UDP stack, AF_UNIX sockets, NVMe + modern NIC ring-3 drivers — Intel e1000 (82540EM), e1000e/igb/igc and Realtek RTL8111/8168 (r8169) + RTL8125 2.5G — with device-ID matching over a bounded multi-NIC registry, on a VirtIO baseline.
+- **Wireless**: ring-3 MediaTek mt792x Wi-Fi driver (MT7921/MT7922 connac2, MT7925 in the same registry) — firmware-blob download, WM MCU command ring, WFDMA TX/RX rings, soft-MAC 802.11 mgmt FSM + WPA2-PSK 4-way handshake (host crypto in `wifi-core`/`crypto-lib`) with chipset CCMP offload, presenting as an L2 `RemoteNic`; no QEMU mt76 model, so logic is host-tested and the radio is VFIO/bare-metal validated.
 - **IOMMU substrate**: ACPI DMAR/IVRS parsing, per-device VT-d / AMD-Vi domains, IOMMU-routed `DmaBuffer<T>`, fault ISRs, VT-d queued invalidation.
 - **Ring-3 driver hosting**: capability-gated device-host syscalls, supervised userspace NVMe/e1000 with `RemoteBlockDevice`/`RemoteNic` facades.
 - **USB host stack**: ring-3 xHCI host driver (MSI-X, BME, TRB/event rings) + `usb-core`/hub + a HID Boot-Protocol class driver (`usb-hid`) injecting keyboard/mouse into `kbd_server`/`mouse_server` — modern PS/2-less machines get USB keyboard/mouse input.
@@ -105,6 +106,7 @@ This sets `core.hooksPath` to `.githooks/`. **pre-commit** runs `cargo xtask che
 | `dns-smoke` PASS (not SKIP) | `M3OS_DNS_REGRESSION=1` |
 | `multi-nic-smoke` (e1000 + e1000e + igb arms) | `M3OS_MULTI_NIC_REGRESSION=1` |
 | `hda-smoke` (`-device intel-hda -device hda-duplex`, non-silent WAV) | `M3OS_HDA_REGRESSION=1` |
+| `wifi-smoke` (no QEMU mt76 model — skip-with-reason; radio validated via VFIO) | `M3OS_WIFI_REGRESSION=1` |
 
 The `tls-smoke`/`dns-smoke` gates assert the musl-built smoke stage actually
 `PASS`ed rather than `SKIP`ped — a `SKIP` means the musl cross-compiler was
