@@ -169,7 +169,11 @@ impl Drop for PcmRing {
 /// (stream reconnect).
 #[cfg(not(test))]
 pub struct PcmReceiver {
-    mapped: Option<(u32, u64)>,
+    /// `(shm_id, base_va, kernel_attested_byte_len)` of the currently-mapped
+    /// region. The length is queried from the kernel (`shm_size`), never taken
+    /// from the peer-supplied `PCM_RING_BYTES` constant, so a maliciously
+    /// under-sized region cannot induce an out-of-bounds read.
+    mapped: Option<(u32, u64, usize)>,
 }
 
 #[cfg(not(test))]
@@ -185,10 +189,10 @@ impl PcmReceiver {
         Self { mapped: None }
     }
 
-    fn ensure_mapped(&mut self, shm_id: u32) -> Result<u64, AudioTransportError> {
-        if let Some((id, base)) = self.mapped {
+    fn ensure_mapped(&mut self, shm_id: u32) -> Result<(u64, usize), AudioTransportError> {
+        if let Some((id, base, len)) = self.mapped {
             if id == shm_id {
-                return Ok(base);
+                return Ok((base, len));
             }
             // A different region id — drop the stale mapping first.
             let _ = syscall_lib::shm_unmap(base);
@@ -198,13 +202,29 @@ impl PcmReceiver {
         if base == 0 {
             return Err(AudioTransportError::ShmMap);
         }
-        self.mapped = Some((shm_id, base));
-        Ok(base)
+        // Learn the region's KERNEL-ATTESTED byte length. `shm_map` returns only
+        // a base address, so without this query the receiver would have to trust
+        // the peer's claimed size — and `audio.hw` is not a private service, so
+        // any process can present a forged `grant_handle`. A peer that maps a
+        // smaller region would otherwise drive an out-of-bounds read up to the
+        // `PCM_RING_BYTES` slice length. We bound the slice to the real size
+        // instead; `copy_window` then rejects any window that does not fit.
+        let len = match syscall_lib::shm_size(shm_id) {
+            Some(n) if n > 0 => n,
+            _ => {
+                let _ = syscall_lib::shm_unmap(base);
+                return Err(AudioTransportError::ShmMap);
+            }
+        };
+        self.mapped = Some((shm_id, base, len));
+        Ok((base, len))
     }
 
     /// Map (or reuse) the region `shm_id`, validate the `[offset, offset+len)`
-    /// window against [`PCM_RING_BYTES`], and copy it into `dst` (the driver's
-    /// own `sys_device_dma_alloc` DMA buffer). Returns bytes copied.
+    /// window against the region's **kernel-attested** size, and copy it into
+    /// `dst` (the driver's own `sys_device_dma_alloc` DMA buffer). Returns bytes
+    /// copied. A window that does not fit the real region is rejected
+    /// ([`AudioTransportError::OutOfBounds`]) rather than read past the mapping.
     pub fn recv_and_copy(
         &mut self,
         shm_id: u32,
@@ -212,18 +232,18 @@ impl PcmReceiver {
         len: u32,
         dst: &mut [u8],
     ) -> Result<usize, AudioTransportError> {
-        let base = self.ensure_mapped(shm_id)?;
-        // SAFETY: `sys_shm_map` mapped at least `PCM_RING_BYTES` bytes
-        // (the sender created the region at that size) contiguously at
-        // `base`; we form a read-only slice of exactly that length and
-        // `copy_window` bounds-checks the window before reading.
-        let region = unsafe { core::slice::from_raw_parts(base as *const u8, PCM_RING_BYTES) };
+        let (base, region_len) = self.ensure_mapped(shm_id)?;
+        // SAFETY: `region_len` is the kernel-attested mapped byte length of the
+        // region at `base` (`page_count * 4096`, exactly what `sys_shm_map`
+        // installed), so a slice of that length lies entirely within the
+        // mapping; `copy_window` bounds-checks the window before reading.
+        let region = unsafe { core::slice::from_raw_parts(base as *const u8, region_len) };
         copy_window(region, offset, len, dst)
     }
 
     /// Release the cached mapping (called on stream close / driver shutdown).
     pub fn release(&mut self) {
-        if let Some((_, base)) = self.mapped.take() {
+        if let Some((_, base, _)) = self.mapped.take() {
             let _ = syscall_lib::shm_unmap(base);
         }
     }

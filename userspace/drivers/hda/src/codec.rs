@@ -39,47 +39,33 @@ fn node_range(val: u32) -> (u8, u8) {
     (((val >> 16) & 0xFF) as u8, (val & 0xFF) as u8)
 }
 
-/// Read a widget's short-form connection list (sufficient for QEMU + the
-/// common analog codecs; long-form entries are truncated to the first byte).
+/// Read a widget's connection list, decoding both short- and long-form layouts
+/// **and range entries** (HDA spec §7.1.2) via the host-tested
+/// [`widget::expand_connection_list`]. Each `GET_CONNECTION_LIST` response packs
+/// 4 entries (short form) or 2 (long form); the expander turns range markers
+/// into the runs of NIDs they denote, so real Realtek/IDT/Conexant codecs that
+/// use range encoding select a valid pin→DAC path instead of chasing phantom
+/// NIDs.
 fn read_connections(ctrl: &mut HdaController, codec: u8, nid: u8) -> Vec<u8> {
-    let mut out = Vec::new();
     let len_resp = ctrl
         .get_parameter(codec, nid, hda::PARAM_CONNECTION_LIST_LENGTH)
         .unwrap_or(0);
     let long_form = (len_resp & 0x80) != 0;
     let len = (len_resp & 0x7F) as usize;
     if len == 0 {
-        return out;
+        return Vec::new();
     }
-    if long_form {
-        // Long form: 2 entries per GET_CONNECTION_LIST response (16-bit each).
-        let mut i = 0;
-        while i < len {
-            let r = ctrl
-                .command(codec, nid, hda::VERB_GET_CONNECTION_LIST, i as u8)
-                .unwrap_or(0);
-            out.push((r & 0xFFFF) as u8);
-            if i + 1 < len {
-                out.push(((r >> 16) & 0xFFFF) as u8);
-            }
-            i += 2;
-        }
-    } else {
-        // Short form: 4 entries per response (8-bit each).
-        let mut i = 0;
-        while i < len {
-            let r = ctrl
-                .command(codec, nid, hda::VERB_GET_CONNECTION_LIST, i as u8)
-                .unwrap_or(0);
-            for b in 0..4 {
-                if i + b < len {
-                    out.push(((r >> (b * 8)) & 0xFF) as u8);
-                }
-            }
-            i += 4;
-        }
+    let per_dword = if long_form { 2 } else { 4 };
+    let mut responses = Vec::new();
+    let mut i = 0;
+    while i < len {
+        let r = ctrl
+            .command(codec, nid, hda::VERB_GET_CONNECTION_LIST, i as u8)
+            .unwrap_or(0);
+        responses.push(r);
+        i += per_dword;
     }
-    out
+    widget::expand_connection_list(&responses, len, long_form)
 }
 
 /// Enumerate a codec: find its Audio Function Group, walk every widget, build

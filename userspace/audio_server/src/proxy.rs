@@ -100,6 +100,11 @@ impl<T: ProxyTransport> AudioProxyBackend<T> {
     /// was open) it was re-opened.
     fn reconnect_and_reopen(&mut self) -> Result<(), AudioError> {
         self.transport.reconnect()?;
+        // The restarted driver assigns a fresh stream whose frames_consumed
+        // counter starts at zero; the io loop only mirrors positive deltas, so a
+        // stale (higher) `last_consumed` would stall the reported total. Reset it
+        // to track the new stream from zero.
+        self.last_consumed = 0;
         if let Some((format, layout, rate)) = self.open_params {
             let id = self.open_stream_on_driver(format, layout, rate)?;
             self.driver_stream_id = Some(id);
@@ -269,7 +274,12 @@ impl SyscallProxyTransport {
     /// Returns `Err(AudioError::NoDevice)` if no driver is registered.
     pub fn connect() -> Result<Self, AudioError> {
         let ep = syscall_lib::ipc_lookup_service(DRIVER_SERVICE_NAME);
-        if ep == 0 || ep == u64::MAX || ep > u64::from(u32::MAX) {
+        // `ipc_lookup_service` signals "not found" only with `u64::MAX`; on
+        // success it returns a cap handle, which is a valid index and may be 0
+        // (the first free cap slot). Gating on `== 0` would wrongly reject a
+        // live `audio.hw` endpoint that landed in slot 0 — match the sentinel
+        // every other call site uses.
+        if ep == u64::MAX || ep > u64::from(u32::MAX) {
             return Err(AudioError::NoDevice);
         }
         let client = driver_runtime::ipc::audio::AudioDriverClient::new(ep as u32);
@@ -304,7 +314,12 @@ impl ProxyTransport for SyscallProxyTransport {
         // — its shm region is independent of the driver's lifetime and the
         // driver re-maps it lazily on the next SubmitFrames.
         let ep = syscall_lib::ipc_lookup_service(DRIVER_SERVICE_NAME);
-        if ep == 0 || ep == u64::MAX || ep > u64::from(u32::MAX) {
+        // `ipc_lookup_service` signals "not found" only with `u64::MAX`; on
+        // success it returns a cap handle, which is a valid index and may be 0
+        // (the first free cap slot). Gating on `== 0` would wrongly reject a
+        // live `audio.hw` endpoint that landed in slot 0 — match the sentinel
+        // every other call site uses.
+        if ep == u64::MAX || ep > u64::from(u32::MAX) {
             return Err(AudioError::NoDevice);
         }
         self.client = driver_runtime::ipc::audio::AudioDriverClient::new(ep as u32);

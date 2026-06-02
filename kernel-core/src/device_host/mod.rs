@@ -26,7 +26,7 @@ pub use audio_class::{
     SUBSYSTEM_AUDIO_DEVICE, classify_pci_id,
 };
 pub use config_read::{ConfigReadError, extract_field, validate_config_read};
-pub use config_write::{ConfigWriteError, validate_config_write};
+pub use config_write::{ConfigWriteError, config_write_permitted, validate_config_write};
 pub use dma_logic::{
     DMA_MIN_ALIGN, DmaAllocEntry, DmaAllocId, DmaAllocationRegistryCore, DmaRegistryError,
     validate_size_align,

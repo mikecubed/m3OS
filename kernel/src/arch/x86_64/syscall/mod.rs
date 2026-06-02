@@ -1545,6 +1545,16 @@ mod syscall_nr {
     /// `sys_page_grant_recv(grant_cap) -> vaddr | u64::MAX`.
     pub const PAGE_GRANT_RECV: u64 = 0x1021;
 
+    /// Phase 80 review follow-up: return the byte length of an existing
+    /// shared-memory region (`page_count * 4096`), or `u64::MAX` if the id is
+    /// invalid/unknown. `SHM_MAP` returns only a base address; the receiver of
+    /// an SHM-backed transport (the audio drivers' PCM ring) uses this to learn
+    /// the kernel-attested mapped size of a peer-supplied region before forming
+    /// a slice over it, instead of trusting the peer's claimed size.
+    ///
+    /// `sys_shm_size(shm_id) -> bytes | u64::MAX`.
+    pub const SHM_SIZE: u64 = 0x1022;
+
     // -- ipc --
     pub const IPC_BASE: u64 = 0x1100;
     // Phase 74 extension: cap-bearing IPC (0x1117/0x1118) and per-call
@@ -1984,6 +1994,7 @@ pub extern "C" fn syscall_handler(
         SHM_MAP => sys_shm_map(arg0),
         SHM_UNMAP => sys_shm_unmap(arg0),
         SHM_DESTROY => sys_shm_destroy(arg0),
+        SHM_SIZE => sys_shm_size(arg0),
         READ_SCANCODE => sys_read_scancode(),
         STDIN_PUSH => sys_stdin_push(arg0, arg1),
         SIGNAL_PROCESS_GROUP => sys_signal_process_group(arg0, arg1),
@@ -10897,6 +10908,26 @@ pub(super) fn sys_shm_destroy(shm_id_arg: u64) -> u64 {
             log::warn!("[shm] destroy failed pid={} id={} err={:?}", pid, id.0, e);
             u64::MAX
         }
+    }
+}
+
+/// Syscall `SHM_SIZE` (0x1022): return the byte length of an existing
+/// shared-memory region (`page_count * 4096`), or `u64::MAX` if the id is
+/// invalid or unknown.
+///
+/// The region size is not refcount/ownership-sensitive (any holder of the id
+/// could already map it), so this performs a plain lookup via
+/// [`crate::mm::shm::frames`] without touching the refcount. The receiver of an
+/// SHM-backed transport queries this before forming a slice over a peer-supplied
+/// region, so it can reject an under-sized region rather than read past it.
+pub(super) fn sys_shm_size(shm_id_arg: u64) -> u64 {
+    if shm_id_arg == 0 || shm_id_arg > u64::from(u32::MAX) {
+        return u64::MAX;
+    }
+    let id = crate::mm::shm::ShmId(shm_id_arg as u32);
+    match crate::mm::shm::frames(id) {
+        Ok((_start_phys, page_count)) => u64::from(page_count) * 4096,
+        Err(_) => u64::MAX,
     }
 }
 

@@ -153,19 +153,31 @@ impl CorbRirb {
         None
     }
 
-    /// Immediate-command interface: write `ICOI`, set `ICS.ICB`, poll `ICS.IRV`,
-    /// read `IRII`. The reliable single-verb fallback.
+    /// Immediate-command interface: clear any stale `ICS.IRV`, write `ICOI`, set
+    /// `ICS.ICB`, poll `ICS.IRV`, read `IRII`, then clear `IRV` again. The
+    /// reliable single-verb fallback.
     fn immediate_command(&self, mmio: &Mmio<u8>, dword: u32) -> Option<u32> {
+        // Wait for any in-flight immediate command to finish (ICB self-clears).
         for _ in 0..POLL_BUDGET {
             if mmio.read_reg::<u16>(hda::REG_ICS) & hda::ICS_ICB == 0 {
                 break;
             }
         }
+        // `IRV` is write-1-to-clear and is NOT cleared by setting `ICB`.
+        // Acknowledge any stale Immediate-Result-Valid left by a prior command
+        // before issuing this one — otherwise the `IRV` poll below sees the old
+        // bit still set and returns the PREVIOUS response from `IRII` without
+        // waiting for this command to complete. (Linux `azx_single_send_cmd`
+        // clears `IRV` right before issuing for exactly this reason.)
+        mmio.write_reg::<u16>(hda::REG_ICS, hda::ICS_IRV);
         mmio.write_reg::<u32>(hda::REG_ICOI, dword);
         mmio.write_reg::<u16>(hda::REG_ICS, hda::ICS_ICB);
         for _ in 0..POLL_BUDGET {
             if mmio.read_reg::<u16>(hda::REG_ICS) & hda::ICS_IRV != 0 {
-                return Some(mmio.read_reg::<u32>(hda::REG_IRII));
+                let resp = mmio.read_reg::<u32>(hda::REG_IRII);
+                // Clear `IRV` (W1C) so the next immediate command starts clean.
+                mmio.write_reg::<u16>(hda::REG_ICS, hda::ICS_IRV);
+                return Some(resp);
             }
         }
         None

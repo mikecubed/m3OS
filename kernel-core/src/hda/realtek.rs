@@ -183,9 +183,15 @@ pub fn coef_write_verbs(codec: u8, afg: u8, index: u8, value: u16) -> Vec<u32> {
 ///
 /// Sequence (in order):
 /// 1. `eapd_enable_verbs(codec, pin_nid)` — de-assert EAPD on the output pin.
-/// 2. `gpio_eapd_verbs(codec, afg, GPIO_DEFAULT_MASK)` — raise GPIO0 on the
-///    AFG (GPIO-gated EAPD fallback for boards that need it; harmless on those
-///    that don't).
+/// 2. `gpio_eapd_verbs(codec, afg, GPIO_DEFAULT_MASK)` — drive GPIO0 high on the
+///    AFG (the GPIO-gated EAPD path many ALC892/ALC1220 boards use for their
+///    external amp). **Board-dependent, not universally safe:** GPIO0 is wired
+///    per board and may instead drive a mute relay, an LED, or be an input, so
+///    forcing it can mute/distort output on a board that does not gate EAPD
+///    through it. Linux drives codec GPIOs only under a per-subsystem-id quirk;
+///    m3OS has no quirk table yet, so this is applied to every Realtek codec as
+///    a bring-up default and should move behind a subsystem-id gate once real
+///    boards are characterized (see Track F).
 ///
 /// COEF writes are intentionally **excluded**: they are model/board-specific
 /// and must be applied separately via [`coef_write_verbs`] when a verified
@@ -208,7 +214,8 @@ pub fn realtek_amp_enable_verbs(codec: u8, afg: u8, pin_nid: u8) -> Vec<u32> {
 /// Choose the best output pin NID from a list of enumerated output pins,
 /// applying Realtek jack-detection priority policy.
 ///
-/// Priority order (mirrors Linux `realtek_check_auto_pin_ctl`):
+/// Priority order (a bring-up heuristic in the spirit of Linux's `hda_generic`
+/// auto-parser `alc_*` jack-presence handling — not a single named function):
 ///
 /// 1. **Internal Speaker** (`DEFAULT_DEVICE_SPEAKER`) — always preferred when
 ///    present; internal speakers are not pluggable so `jack_present` is

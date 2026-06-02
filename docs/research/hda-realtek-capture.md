@@ -238,7 +238,8 @@ environment, not m3OS code.
 - The driver selects the analog codec over an HDMI/DP-only codec via
   `kernel_core::hda::widget::select_codec`; on a multi-codec board record which
   codec address was chosen.
-- Live HDA interrupt delivery: the driver arms `INTCTL` + handles `SDnSTS.BCIS`
-  but uses `SDnLPIB` polling as the authoritative completion path. Note here
-  whether the BCIS IRQ is observed on real hardware (it may behave differently
-  from QEMU's `intel-hda`, where it was not delivered to the ring-3 driver).
+- Live HDA interrupt delivery: the driver arms `INTCTL` + handles `SDnSTS.BCIS`,
+  and the BCIS IRQ **is** delivered to the ring-3 driver under QEMU's
+  `intel-hda` (the `hda-smoke` gate asserts the driver's `stream IRQ (BCIS
+  cleared)` log line). `SDnLPIB` polling remains the authoritative *position*
+  path. Note here whether the BCIS IRQ is likewise observed on real hardware.

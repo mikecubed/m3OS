@@ -180,6 +180,68 @@ pub fn is_fixed(d: &PinDefault) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Connection-list decode (HDA spec §7.1.2)
+// ---------------------------------------------------------------------------
+
+/// Expand a codec connection list from the raw `GET_CONNECTION_LIST` response
+/// dwords into the list of connected NIDs, decoding **range entries**.
+///
+/// Per HDA spec §7.1.2 each entry's high bit (bit 7 short-form, bit 15
+/// long-form) is a *range marker*: such an entry is not a literal NID but the
+/// inclusive upper bound of a run that starts at the previously-decoded NID + 1.
+/// A widget that lists `{0x02, 0x85}` (short-form) therefore connects to NIDs
+/// `0x02, 0x03, 0x04, 0x05` — not to a phantom NID `0x85`. Real Realtek / IDT /
+/// Conexant codecs use range encoding routinely; QEMU's generic codec does not,
+/// which is why the un-decoded form passed the QEMU smoke gate while silently
+/// breaking pin→DAC path selection on real silicon.
+///
+/// Layout: short-form entries pack 4 per response dword (8 bits each, 7-bit
+/// NID); long-form pack 2 per dword (16 bits each, 15-bit NID — masked to the
+/// 8-bit verb NID space). `len` is the connection-list length from
+/// `PARAM_CONNECTION_LIST_LENGTH` (bits 6:0); `long_form` is its bit 7.
+/// `responses` are the dwords returned for starting indices
+/// `0, per_dword, 2*per_dword, …`.
+///
+/// A leading range entry (no previous NID) is treated as a literal, and a
+/// malformed descending range (`marker_nid <= prev`) is ignored, so a bogus
+/// codec response can never produce an unbounded or wrapping expansion.
+pub fn expand_connection_list(responses: &[u32], len: usize, long_form: bool) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    let per_dword = if long_form { 2 } else { 4 };
+    let mut prev: Option<u8> = None;
+    for idx in 0..len {
+        let dword = match responses.get(idx / per_dword) {
+            Some(&d) => d,
+            None => break,
+        };
+        let slot = idx % per_dword;
+        let (nid, is_range) = if long_form {
+            let e = ((dword >> (slot * 16)) & 0xFFFF) as u16;
+            ((e & 0x7FFF) as u8, e & 0x8000 != 0)
+        } else {
+            let e = ((dword >> (slot * 8)) & 0xFF) as u8;
+            (e & 0x7F, e & 0x80 != 0)
+        };
+        if is_range && let Some(start) = prev {
+            // Range marker: expand prev+1..=nid, skipping a malformed
+            // descending/empty range (nid <= prev) so a bogus response can never
+            // produce a wrapping/unbounded run. A leading range marker
+            // (prev == None) falls through below and is taken as a literal.
+            if start < nid {
+                for n in (start + 1)..=nid {
+                    out.push(n);
+                }
+            }
+            prev = Some(nid);
+            continue;
+        }
+        out.push(nid);
+        prev = Some(nid);
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Widget-graph path search
 // ---------------------------------------------------------------------------
 
@@ -293,6 +355,82 @@ pub fn select_codec(codecs: &[CodecSummary]) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- expand_connection_list ----
+
+    #[test]
+    fn short_form_literal_entries() {
+        // {0x02, 0x03, 0x04} packed in one dword, no range bits.
+        let responses = [0x0004_0302u32];
+        assert_eq!(
+            expand_connection_list(&responses, 3, false),
+            alloc::vec![0x02, 0x03, 0x04]
+        );
+    }
+
+    #[test]
+    fn short_form_range_expands() {
+        // {0x02, 0x85}: 0x85 has bit7 set → range from prev(0x02)+1..=0x05.
+        let responses = [0x0000_8502u32];
+        assert_eq!(
+            expand_connection_list(&responses, 2, false),
+            alloc::vec![0x02, 0x03, 0x04, 0x05]
+        );
+    }
+
+    #[test]
+    fn short_form_range_spanning_two_dwords() {
+        // dword0 = {0x02, 0x03, 0x04, 0x05}; dword1 = {0x88, ...}: 0x88 ranges
+        // from prev(0x05)+1..=0x08.
+        let responses = [0x0504_0302u32, 0x0000_0088u32];
+        assert_eq!(
+            expand_connection_list(&responses, 5, false),
+            alloc::vec![0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
+        );
+    }
+
+    #[test]
+    fn long_form_literal_and_range() {
+        // Long form: 2 entries/dword, 16-bit each. {0x0002, 0x8005}: second has
+        // bit15 set → range from 0x02+1..=0x05.
+        let responses = [0x8005_0002u32];
+        assert_eq!(
+            expand_connection_list(&responses, 2, true),
+            alloc::vec![0x02, 0x03, 0x04, 0x05]
+        );
+    }
+
+    #[test]
+    fn leading_range_marker_is_literal() {
+        // First entry has the range bit but no previous NID — taken literally
+        // (masked), never an unbounded expansion.
+        let responses = [0x0000_0083u32];
+        assert_eq!(
+            expand_connection_list(&responses, 1, false),
+            alloc::vec![0x03]
+        );
+    }
+
+    #[test]
+    fn malformed_descending_range_is_skipped() {
+        // {0x05, 0x82}: range marker 0x02 <= prev 0x05 → skip (no wrap blowup).
+        let responses = [0x0000_8205u32];
+        assert_eq!(
+            expand_connection_list(&responses, 2, false),
+            alloc::vec![0x05]
+        );
+    }
+
+    #[test]
+    fn empty_and_truncated_inputs() {
+        assert_eq!(expand_connection_list(&[], 0, false), Vec::<u8>::new());
+        // len claims 4 entries but only one dword (4 short entries) supplied —
+        // a missing dword stops the walk rather than reading past `responses`.
+        assert_eq!(
+            expand_connection_list(&[0x0004_0302u32], 8, false),
+            alloc::vec![0x02, 0x03, 0x04, 0x00]
+        );
+    }
 
     // ---- widget_type ----
 

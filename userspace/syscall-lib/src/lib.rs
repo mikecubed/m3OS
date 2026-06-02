@@ -289,6 +289,11 @@ pub const SYS_SHM_UNMAP: u64 = 0x101A;
 /// requiring an existing mapping. Used by the creating process to
 /// release the +1 that `SHM_CREATE` reserved.
 pub const SYS_SHM_DESTROY: u64 = 0x101B;
+/// Return the byte length of an existing shared-memory region, or
+/// `u64::MAX` on error. Lets the receiver of an SHM-backed transport
+/// learn the kernel-attested mapped size before forming a slice over a
+/// peer-supplied region.
+pub const SYS_SHM_SIZE: u64 = 0x1022;
 
 /// Phase 57d follow-up: temporarily release framebuffer ownership
 /// without unmapping the caller's FB VMA (so a future
@@ -2834,6 +2839,20 @@ pub fn shm_unmap(user_va: u64) -> bool {
 pub fn shm_destroy(shm_id: u32) -> bool {
     let raw = unsafe { syscall1(SYS_SHM_DESTROY, u64::from(shm_id)) };
     raw == 0
+}
+
+/// Return the byte length of an existing shared-memory region, or `None`
+/// if the id is invalid/unknown (kernel returns `u64::MAX`). Does not map
+/// the region or alter its refcount — it is a plain size query the receiver
+/// of an SHM-backed transport uses to validate a peer-supplied region's size
+/// before forming a slice over it.
+pub fn shm_size(shm_id: u32) -> Option<usize> {
+    let raw = unsafe { syscall1(SYS_SHM_SIZE, u64::from(shm_id)) };
+    if raw == u64::MAX {
+        None
+    } else {
+        Some(raw as usize)
+    }
 }
 
 /// Reads one raw PS/2 scancode from the keyboard ring buffer.

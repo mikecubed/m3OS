@@ -25,7 +25,10 @@ use ac97_driver::Ac97Backend;
 #[cfg(not(test))]
 use driver_runtime::ipc::{EndpointCap, RecvResult, SyscallBackend};
 #[cfg(not(test))]
-use driver_runtime::{DeviceCapKey, DeviceHandle};
+use driver_runtime::{
+    DeviceCapHandle, DeviceCapKey, DeviceHandle, IrqNotification,
+    SyscallBackend as IrqSyscallBackend,
+};
 #[cfg(not(test))]
 use kernel_core::audio::AudioError;
 #[cfg(not(test))]
@@ -63,6 +66,20 @@ pub const SERVER_READY_SENTINEL: &str = "AC97_SMOKE:server:READY\n";
 
 /// Service name under which the driver registers its `audio.hw` endpoint.
 pub const SERVICE_NAME: &str = "audio.hw";
+
+/// Wraps a borrowed [`DeviceHandle`] as a [`DeviceCapHandle`] for
+/// [`IrqNotification::subscribe`] (mirrors the HDA driver's view shim).
+#[cfg(not(test))]
+struct DeviceCapView<'a> {
+    inner: &'a DeviceHandle,
+}
+
+#[cfg(not(test))]
+impl DeviceCapHandle for DeviceCapView<'_> {
+    fn cap_handle(&self) -> u32 {
+        self.inner.cap()
+    }
+}
 
 #[cfg(not(test))]
 syscall_lib::entry_point!(program_main);
@@ -111,18 +128,49 @@ fn program_main(_args: &[&str]) -> i32 {
         return 5;
     }
 
+    // Subscribe to the AC'97 device IRQ and bind it into the endpoint recv loop
+    // so a single loop services both client requests and completion interrupts.
+    // The standalone extraction must restore the IRQ wiring the in-process
+    // audio_server had: AC'97's run-control value arms IOCE/LVBIE/FEIE, so
+    // without a subscriber the level-triggered INTx line has no consumer and
+    // completion/underrun events fall back to CIV polling only. Falls back to
+    // polling if subscription is unavailable (mirrors the HDA driver).
+    let endpoint = EndpointCap::new(ep_u32);
+    let irq: Option<IrqNotification<IrqSyscallBackend>> = {
+        let view = DeviceCapView {
+            inner: backend.device(),
+        };
+        match IrqNotification::<IrqSyscallBackend>::subscribe(&view, None) {
+            Ok(n) => {
+                let _ = n.bind_to_endpoint(endpoint);
+                syscall_lib::write_str(STDOUT_FILENO, "ac97_driver: IRQ armed (subscribed)\n");
+                Some(n)
+            }
+            Err(_) => {
+                syscall_lib::write_str(
+                    STDOUT_FILENO,
+                    "ac97_driver: IRQ subscribe unavailable — CIV polling fallback\n",
+                );
+                None
+            }
+        }
+    };
+
     syscall_lib::write_str(STDOUT_FILENO, SERVER_READY_SENTINEL);
 
     // Enter the audio.hw server loop — never returns on the happy path.
-    run_server_loop(&mut backend, ep_u32)
+    run_server_loop(&mut backend, endpoint, irq.as_ref())
 }
 
 #[cfg(not(test))]
-fn run_server_loop(backend: &mut Ac97Backend, ep_u32: u32) -> i32 {
+fn run_server_loop(
+    backend: &mut Ac97Backend,
+    endpoint: EndpointCap,
+    irq: Option<&IrqNotification<IrqSyscallBackend>>,
+) -> i32 {
     use driver_runtime::audio_pcm::{PCM_RING_BYTES, PcmReceiver};
     use driver_runtime::ipc::audio::{decode_request_bulk, reply_response};
 
-    let endpoint = EndpointCap::new(ep_u32);
     let mut backend_ipc = SyscallBackend::new();
     let mut receiver = PcmReceiver::new();
     let mut scratch = alloc::vec![0u8; PCM_RING_BYTES];
@@ -183,9 +231,14 @@ fn run_server_loop(backend: &mut Ac97Backend, ep_u32: u32) -> i32 {
                 };
                 let _ = reply_response(&mut backend_ipc, &rsp);
             }
-            Ok(RecvResult::Notification(_)) => {
-                // AC'97 IRQ: advance completed-buffer counters.
+            Ok(RecvResult::Notification(bits)) => {
+                // AC'97 IRQ: advance completed-buffer counters + clear the
+                // device interrupt status, then ack the notification so the
+                // level-triggered INTx line is released and cannot storm.
                 let _ = backend.handle_irq();
+                if let Some(irq) = irq {
+                    let _ = irq.ack(bits);
+                }
             }
             Err(_) => {
                 // Transient receive error — continue.

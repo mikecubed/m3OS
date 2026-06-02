@@ -3528,8 +3528,10 @@ fn pid_owns_bdf(pid: Pid, key: DeviceCapKey) -> bool {
 /// Returns `0` on success, or a negative errno:
 ///
 /// - `NEG_ESRCH`  — kernel task context (PID 0).
-/// - `NEG_EACCES` — caller is not an authorized driver process, **or** does not
-///   own a claim on the target BDF.
+/// - `NEG_EACCES` — caller is not an authorized driver process, does not own a
+///   claim on the target BDF, **or** the `(offset, width)` is not on the
+///   writable-offset allowlist (only the PM-cap PMCSR and the AMD/ATI HDA snoop
+///   byte are permitted; MSI/MSI-X, BARs, and the Command register are denied).
 /// - `NEG_EINVAL` — bad width/offset/alignment, or `value` does not fit `width`.
 /// - `NEG_ENODEV` — no PCI function at the BDF, or a non-zero segment.
 ///
@@ -3556,8 +3558,10 @@ pub fn sys_device_config_write(
         return NEG_ENODEV;
     }
     // A write mutates device state — require that the caller actually owns this
-    // BDF (it has claimed the device). A claimed device's config space is within
-    // the owning driver's existing authority (it already drives the BARs/DMA).
+    // BDF (it has claimed the device). Ownership is necessary but not sufficient:
+    // a writable-offset allowlist below further restricts *which* registers a
+    // claimed device's owner may write (interrupt routing and BAR decode are the
+    // kernel's, not the driver's).
     let key = DeviceCapKey::new(segment, bus, dev, func);
     if !pid_owns_bdf(pid, key) {
         return NEG_EACCES;
@@ -3576,6 +3580,40 @@ pub fn sys_device_config_write(
     let vendor = crate::pci::pci_config_read_u16(bus, dev, func, 0x00);
     if vendor == 0xFFFF {
         return NEG_ENODEV;
+    }
+    // Writable-offset allowlist (fail closed). Being well-formed is not enough:
+    // the kernel — not the driver — owns PCI interrupt routing, so the driver
+    // must not be able to write its device's MSI/MSI-X capability (which, with
+    // interrupt remapping off, would let it forge an arbitrary interrupt
+    // vector/LAPIC), nor relocate its BARs or clear Command bits out from under
+    // the claim's IOMMU/MMIO state. Only the two writes the ring-3 HDA driver
+    // legitimately needs are permitted: the PM-capability PMCSR (force D0) and
+    // the AMD/ATI HDA snoop byte (`0x42`, AMD controllers only).
+    let pmcsr_offset =
+        crate::pci::find_capability(bus, dev, func, kernel_core::device_host::PCI_CAP_ID_PM)
+            .map(kernel_core::device_host::pmcsr_offset);
+    let vendor_byte_offset = if kernel_core::hda::amd::is_amd_controller(vendor) {
+        Some(u16::from(kernel_core::hda::amd::ATI_SNOOP_REG))
+    } else {
+        None
+    };
+    if !kernel_core::device_host::config_write_permitted(
+        offset,
+        width,
+        pmcsr_offset,
+        vendor_byte_offset,
+    ) {
+        log::warn!(
+            "device_host.config_write_denied pid={} bdf={:04x}:{:02x}:{:02x}.{} offset={:#x} width={}",
+            pid,
+            segment,
+            bus,
+            dev,
+            func,
+            offset,
+            width,
+        );
+        return NEG_EACCES;
     }
     let off = offset as u8;
     match width {
