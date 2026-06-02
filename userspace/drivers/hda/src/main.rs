@@ -1,12 +1,12 @@
 //! Phase 80b — Intel HDA out-of-process ring-3 driver entry point.
 //!
 //! Run-time flow: write the boot marker, discover an HDA controller by PCI
-//! class (0x04/0x03/0x00, vendor-agnostic), claim it, map BAR0, bring up the
-//! controller (reset → STATESTS codec-ready → CORB/RIRB RUN-enable), create an
-//! IPC endpoint, register it as `"audio.hw"`, emit `HDA_SMOKE:server:READY`,
-//! and enter the `audio.hw` server loop serving the `driver_ipc::audio`
-//! protocol. The codec output path + stream descriptor are configured lazily
-//! on the first `OpenStream`.
+//! class (0x04/0x03, vendor- and prog_if-agnostic), claim it, map BAR0, bring
+//! up the controller (reset → STATESTS codec-ready → CORB/RIRB RUN-enable),
+//! create an IPC endpoint, register it as `"audio.hw"`, emit
+//! `HDA_SMOKE:server:READY`, and enter the `audio.hw` server loop serving the
+//! `driver_ipc::audio` protocol. The codec output path + stream descriptor are
+//! configured lazily on the first `OpenStream`.
 
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
@@ -90,16 +90,39 @@ impl DeviceCapHandle for DeviceCapView<'_> {
     }
 }
 
-/// Discover an HDA controller by PCI class (vendor-agnostic 0x04/0x03/0x00).
+/// Discover an HDA controller by PCI class (vendor-agnostic 0x04/0x03, prog_if
+/// agnostic).
 #[cfg(not(test))]
 fn find_hda() -> Option<driver_runtime::DeviceCapKey> {
-    let candidates = driver_runtime::enumerate_pci_class(
-        kernel_core::hda::ids::HDA_CLASS,
-        kernel_core::hda::ids::HDA_SUBCLASS,
-        kernel_core::hda::ids::HDA_PROG_IF,
-    )
-    .ok()?;
-    candidates.into_iter().next()
+    use kernel_core::device_host::pci_enum::PROG_IF_ANY;
+    use kernel_core::hda::ids::{HDA_CLASS, HDA_SUBCLASS, hda_pci_match};
+
+    // Enumerate every class 0x04 / subclass 0x03 controller regardless of its
+    // programming-interface byte. `hda_pci_match` documents (and tests) that an
+    // HDA controller may enumerate with a non-zero prog_if and must still be
+    // bound — the HD Audio spec only guarantees the class/subclass pair. A
+    // strict `(0x04, 0x03, 0x00)` enumerate would silently miss such hardware,
+    // and the driver would exit as if no HDA controller were present. Passing
+    // `PROG_IF_ANY` applies exactly the prog_if-agnostic class filter the
+    // predicate's primary branch encodes.
+    let candidates =
+        driver_runtime::enumerate_pci_class(HDA_CLASS, HDA_SUBCLASS, PROG_IF_ANY).ok()?;
+
+    // Confirm each candidate with the shared, host-tested predicate so the bind
+    // decision (vendor-agnostic class match + AC'97 exclusion + the
+    // `HDA_DEVICE_IDS` table) has a single source of truth. Read the reported
+    // class triple (config dword @0x08: class:24 / subclass:16 / prog_if:8) and
+    // vendor:device (@0x00); enumeration already guarantees class 0x04 /
+    // subclass 0x03, so on a config-read failure fall back to those guaranteed
+    // values rather than dropping real hardware.
+    candidates.into_iter().find(|&key| {
+        let (class, subclass, prog_if) = match driver_runtime::pci_config_read(key, 0x08, 4) {
+            Ok(reg) => kernel_core::device_host::pci_enum::decode_class_dword(reg),
+            Err(_) => (HDA_CLASS, HDA_SUBCLASS, PROG_IF_ANY),
+        };
+        let (vendor, device) = driver_runtime::read_vendor_device(key).unwrap_or((0, 0));
+        hda_pci_match(class, subclass, prog_if, vendor, device)
+    })
 }
 
 #[cfg(not(test))]
