@@ -1,17 +1,21 @@
 # HDA + Realtek empirical capture (Phase 80 Track F.1)
 
-**Status:** Driver-side work **complete**; codec enumeration under VFIO
-**confirmed blocked by a platform limitation, not a driver bug**. The AMD-codec
+**Status:** Driver-side work **complete**; codec enumeration **was not reached
+under this VFIO config** (not a driver bug — see the leading-hypothesis caveat
+below). The AMD-codec
 follow-up landed 2026-06-01 (a `sys_device_config_write` syscall + Linux-correct
 bring-up: PCI **D0** power-up, in-reset **PLL-settle delay**, AMD/ATI snoop) and
 was re-run on the real AMD `1022:15e3` controller via VFIO on 2026-06-02. Result
 (see "Re-run result" below): the new syscall works on real silicon (snoop write
 succeeds), the controller is already in D0 and fully up (`GCAP=0x4401`,
-`GCTL=0x1`), **yet `STATESTS=0x0000` persists** — the ALC1220 block is power/clock
--gated at the SoC level when only `10:00.6` is passed through (the ACPI `_PS0`
-codec-rail enable is not replayed in the guest). The driver now brings the
-controller up exactly as Linux does; **audible output requires bare-metal
-validation** (or passing through the codec's power dependency), which is an
+`GCTL=0x1`), **yet `STATESTS=0x0000` persists**. The **leading hypothesis** is
+that the ALC1220 codec rail is power/clock-gated when only `10:00.6` is passed
+through (the platform ACPI `_PS0` codec-rail enable is not replayed in the
+guest) — but this is **inferred by elimination (D0 confirmed, snoop works,
+Linux-correct reset timing applied), not proven** with an ACPI/register trace,
+and untried passthrough workarounds remain (see "Path to audible output"). The
+driver now brings the controller up exactly as Linux does; **audible output is
+validated only on bare metal** (the safe, recommended path), which is an
 environment choice outside m3OS code. QEMU `hda-smoke` remains green throughout.
 
 > This is the audio analog of `docs/research/` captures for the Phase 79
@@ -193,13 +197,32 @@ What this proves:
   and `GCTL=0x1` confirm the controller is fully up and out of reset.
 
 **Conclusion:** the controller function is fully accessible and now brought up
-exactly as Linux does, yet the ALC1220 still does not appear on any SDI line.
-Since the function is already in D0 and config-space programming works, the codec
-block is power/clock-gated at the **SoC level** — the ACPI power resources /
-`_PS0` that enable the analog codec link clock on this MSI/AMD APU laptop are not
-replayed in the guest when only `10:00.6` is passed through. This is a
-**VFIO/passthrough platform limitation, not a driver bug**, and Linux exposes no
-single config-space "enable codec link clock" bit for `15e3` to work around it.
+exactly as Linux does, yet the ALC1220 still does not appear on any SDI line
+under this VFIO config. Since the function is already in D0 and config-space
+programming works, the **leading hypothesis** is codec-rail power/clock gating —
+the ACPI power resources / `_PS0` that enable the analog codec link clock on this
+MSI/AMD APU laptop are not replayed in the guest when only `10:00.6` is passed
+through. **This mechanism is inferred by elimination, not proven** — no ACPI or
+register trace pins it to a specific power resource — so treat it as the working
+theory rather than an established fact. It is **not a driver bug**, and Linux
+exposes no single config-space "enable codec link clock" bit for `15e3`.
+
+Two caveats on how strongly to state this (added after a Phase 80 review pass):
+
+- **"Impossible under VFIO" would overstate it.** Internal HDA controllers *can*
+  be passed through and enumerate their codecs in general (documented cases: an
+  Intel HDA → Realtek ALC298 in-guest; onboard AMD HDA after a no-FLR quirk), so
+  the block is specific to this unit plus the workarounds we did **not** try
+  (below), not a property of VFIO itself. The AMD-FLR-reset bug is **not** a good
+  fit here: it targets desktop Matisse `0x1487/148c/149c` (not the `0x15e3` APU)
+  and its signature is the *controller* hanging — the opposite of our symptom,
+  where the controller is fully up (`GCAP`/`GCTL`/cfg-write all succeed).
+- **Same-silicon evidence supports the power-rail theory.** A reported bare-metal
+  `1022:15e3` enumeration failure ("no AFG/MFG node" on warm boot) that recovers
+  only after a **cold power cycle** is consistent with the codec needing a full
+  firmware/ACPI power-rail init a guest cannot perform — favoring the power/clock
+  hypothesis over a reset-state one, while still leaving the precise mechanism
+  unproven.
 
 **Path to audible output from here (operator choices, all outside the driver):**
 
@@ -214,6 +237,14 @@ single config-space "enable codec link clock" bit for `15e3` to work around it.
 3. **Pass through the codec's power dependency too** — if a future investigation
    identifies the device that gates the rail (ACP / SMU / a GPIO controller),
    adding it to the VFIO group may wake the codec. Out of scope here.
+4. **Untried `vfio-pci` levers (cheap to attempt before bare metal)** — none of
+   these were tried on this unit: `vfio-pci.disable_idle_d3=1` (keep the function
+   out of idle-D3 under passthrough — sometimes counterproductive, so test both
+   ways), and a forced codec-slot probe analogous to Linux `probe_mask` bit 8
+   (`0x100`) to distinguish "`STATESTS` is under-reporting" from "the codec is
+   truly dark". Option 2 (host-powered handoff) is the most direct test of the
+   power-rail hypothesis and was likewise not run — so the hypothesis above
+   remains untested against the cheapest disproof.
 
 The driver-side work for Track F is complete; remaining work is platform/operator
 environment, not m3OS code.
@@ -243,3 +274,16 @@ environment, not m3OS code.
   `intel-hda` (the `hda-smoke` gate asserts the driver's `stream IRQ (BCIS
   cleared)` log line). `SDnLPIB` polling remains the authoritative *position*
   path. Note here whether the BCIS IRQ is likewise observed on real hardware.
+- **CI coverage of the Realtek path (and an optional regression idea).** The
+  Realtek verb *builders* and selection logic (`kernel_core::hda::realtek`,
+  `widget::select_codec`) are host-unit-tested, and the generic-codec end-to-end
+  pipeline is covered by `hda-smoke`. But the Realtek **over-the-wire emission**
+  path — `realtek_amp_enable_verbs` issued through `codec.rs` `configure_output` —
+  has **no execution coverage**: it is gated off on QEMU (the emulated codec
+  reports vendor `0x1af4`, not Realtek `0x10EC`) and the host tests exercise only
+  the builders, not the controller call path. A custom QEMU codec advertising
+  vendor `0x10EC` could exercise that gate + verb ordering as a regression guard.
+  It would prove only that the driver *emits* the right verbs (already
+  host-tested) — **not** that real silicon responds: EAPD/amp behaviour and
+  audibility stay bare-metal-only, since QEMU's codec ignores EAPD/GPIO/COEF and
+  its WAV backend is amp/mute-invisible.
