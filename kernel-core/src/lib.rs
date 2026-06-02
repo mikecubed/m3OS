@@ -25,6 +25,7 @@ pub mod log_ring;
 pub mod magazine;
 pub mod microcode;
 pub mod mm;
+pub mod mt792x;
 pub mod net;
 pub mod nic_ids;
 pub mod nvme;
