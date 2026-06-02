@@ -1306,6 +1306,7 @@ dependencies = [
  "driver_runtime",
  "kernel-core",
  "syscall-lib",
+ "wifi-core",
 ]
 
 [[package]]

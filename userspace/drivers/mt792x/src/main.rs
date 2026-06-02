@@ -25,11 +25,18 @@ use core::alloc::Layout;
 #[cfg(not(test))]
 use mt792x_hal::fw::firmware_blob;
 #[cfg(not(test))]
+use driver_runtime::ipc::EndpointCap;
+#[cfg(not(test))]
 use mt792x_hal::init::Mt792x;
 #[cfg(not(test))]
-use mt792x_hal::{FW_ABSENT_SENTINEL, SERVER_READY_SENTINEL, select_mt792x};
+use mt792x_hal::{
+    FW_ABSENT_SENTINEL, INGRESS_SERVICE_NAME, SERVER_READY_SENTINEL, SERVICE_NAME, io,
+    select_mt792x,
+};
 #[cfg(not(test))]
 use syscall_lib::STDOUT_FILENO;
+#[cfg(not(test))]
+use wifi_core::fsm::WifiFsm;
 #[cfg(not(test))]
 use syscall_lib::heap::BrkAllocator;
 
@@ -116,7 +123,7 @@ fn program_main(_args: &[&str]) -> i32 {
 
     // Bring up the hardware shell: claim, BAR map, WFDMA reset, MCU ring,
     // data rings, DMA enable.
-    let _mt792x = match Mt792x::bring_up(key, fw) {
+    let mt792x = match Mt792x::bring_up(key, fw) {
         Ok(dev) => dev,
         Err(mt792x_hal::init::BringUpError::ResetTimeout) => {
             syscall_lib::write_str(STDOUT_FILENO, "mt792x_driver: WFDMA reset timeout\n");
@@ -135,17 +142,87 @@ fn program_main(_args: &[&str]) -> i32 {
         }
     };
 
+    // Register the net.nic TX endpoint (shared service name across NIC families —
+    // only the present NIC registers it) and resolve the kernel ingress endpoint
+    // used to publish RX frames + link-state.
+    let ep = syscall_lib::create_endpoint();
+    let ep_u32 = match u32::try_from(ep) {
+        Ok(v) => v,
+        Err(_) => return 3,
+    };
+    if syscall_lib::ipc_register_service(ep_u32, SERVICE_NAME) == u64::MAX {
+        syscall_lib::write_str(STDOUT_FILENO, "mt792x_driver: net.nic register failed\n");
+        return 5;
+    }
+    let ingress = syscall_lib::ipc_lookup_service(INGRESS_SERVICE_NAME);
+    let ingress_cap = if ingress == u64::MAX {
+        None
+    } else {
+        u32::try_from(ingress).ok().map(EndpointCap::new)
+    };
+
+    // Station MAC (used as the 802.11 source address + link-state MAC).
+    let sta_mac = mt792x.mac();
+
+    // Load /etc/wpa.conf → WPA2-PSK supplicant FSM. Best-effort: if the config
+    // is absent or malformed the driver still serves as a passive L2 NIC.
+    let fsm = load_supplicant(sta_mac);
+    if fsm.is_none() {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "mt792x_driver: no usable /etc/wpa.conf — passive L2 mode\n",
+        );
+    }
+
     syscall_lib::write_str(STDOUT_FILENO, SERVER_READY_SENTINEL);
 
-    // Wave 3 (DRV-net): run_io_loop(...) — net.nic registration + RX/TX rewrite
-    // + EAPOL demux + key install go here.
-    //
-    // For this track (DRV-shell) we park the driver by blocking on the IRQ
-    // notification so the binary compiles and boots without burning CPU.
-    // The real net-IPC loop is wired in the DRV-net track.
-    loop {
-        let _bits = _mt792x.irq.wait();
-        // Discard interrupt bits — the net-IPC loop will process them in DRV-net.
-        core::hint::spin_loop();
+    // Enter the net.nic data path: serve kernel TX, drain WFDMA RX (demuxing
+    // EAPOL to the supplicant FSM), process FSM actions, emit link-state.
+    // (Scan/auth/assoc orchestration against a real radio is Track E.4.)
+    io::run_io_loop(mt792x, EndpointCap::new(ep_u32), ingress_cap, fsm, sta_mac)
+}
+
+/// Read `/etc/wpa.conf`, parse it, and build a WPA2-PSK supplicant FSM.
+///
+/// Returns `None` on any error (file absent, read error, malformed config, or
+/// out-of-range passphrase) so the driver degrades to a passive L2 NIC.
+#[cfg(not(test))]
+fn load_supplicant(sta_mac: [u8; 6]) -> Option<WifiFsm> {
+    // O_RDONLY = 0.
+    let fd = syscall_lib::open(b"/etc/wpa.conf\0", 0, 0);
+    if fd < 0 {
+        return None;
     }
+    let fd = fd as i32;
+    let mut data = alloc::vec::Vec::new();
+    let mut chunk = [0u8; 256];
+    loop {
+        let n = syscall_lib::read(fd, &mut chunk);
+        if n <= 0 {
+            break;
+        }
+        data.extend_from_slice(&chunk[..n as usize]);
+        if data.len() > 4096 {
+            break; // bound the read
+        }
+    }
+    let _ = syscall_lib::close(fd);
+
+    let text = core::str::from_utf8(&data).ok()?;
+    let cfg = wifi_core::config::parse_wpa_conf(text).ok()?;
+
+    // Draw a fresh, unpredictable SNonce from the kernel CSPRNG for the 4-way
+    // handshake (never the FSM's deterministic test seed). One SNonce per boot
+    // is sufficient for the single static association at 1.0.
+    let mut snonce = [0u8; 32];
+    if syscall_lib::getrandom(&mut snonce) != snonce.len() as isize {
+        syscall_lib::write_str(STDOUT_FILENO, "mt792x_driver: getrandom failed for SNonce\n");
+        return None;
+    }
+    Some(WifiFsm::new_with_snonce(
+        *cfg.pmk(),
+        cfg.ssid().to_vec(),
+        sta_mac,
+        snonce,
+    ))
 }

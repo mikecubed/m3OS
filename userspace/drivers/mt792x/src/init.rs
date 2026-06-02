@@ -227,6 +227,26 @@ impl Mt792x {
     pub fn log_chip_id(&self) {
         write_hex32("mt792x: chip_id=0x", self.chip_id);
     }
+
+    /// Station MAC address, used as the 802.11 source address and in link-state
+    /// events.
+    ///
+    /// The real address is read from the chip efuse / MAC-address registers via
+    /// the WM MCU `GET_NIC_CAPABILITY` query during association — a hardware-only
+    /// path (Track E.4). Until that capture lands, return a locally-administered
+    /// placeholder derived from the chip ID so the driver compiles and the L2
+    /// framing is well-formed. `[UNCERTAIN]` exact efuse register — resolved on
+    /// hardware (E.3 capture).
+    pub fn mac(&self) -> [u8; 6] {
+        [
+            0x02, // locally-administered, unicast
+            0x00,
+            (self.chip_id >> 24) as u8,
+            (self.chip_id >> 16) as u8,
+            (self.chip_id >> 8) as u8,
+            self.chip_id as u8,
+        ]
+    }
 }
 
 /// Log `label` followed by `val` as 8 hex digits + newline (no alloc/fmt).

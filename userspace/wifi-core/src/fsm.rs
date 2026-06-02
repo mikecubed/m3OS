@@ -137,8 +137,9 @@ pub struct WifiFsm {
     ptk: Option<Ptk>,
     /// Current FSM state.
     state: WifiState,
-    /// Optional injected SNonce for deterministic testing.
-    #[cfg(test)]
+    /// SNonce injected by the driver (from kernel `getrandom` entropy) or by
+    /// tests. When `Some`, `generate_snonce` returns it instead of the
+    /// deterministic fallback — this is the production handshake path.
     snonce_override: Option<[u8; 32]>,
 }
 
@@ -159,13 +160,15 @@ impl WifiFsm {
             last_replay_counter: 0,
             ptk: None,
             state: WifiState::Init,
-            #[cfg(test)]
             snonce_override: None,
         }
     }
 
-    /// Create a new FSM with a fixed SNonce (deterministic testing only).
-    #[cfg(test)]
+    /// Create a new FSM with a caller-supplied SNonce.
+    ///
+    /// The production driver passes a fresh 32-byte SNonce drawn from the kernel
+    /// CSPRNG (`getrandom`) so the 4-way handshake nonce is unpredictable; tests
+    /// pass a fixed vector for determinism.
     pub fn new_with_snonce(pmk: [u8; 32], ssid: Vec<u8>, spa: [u8; 6], snonce: [u8; 32]) -> Self {
         let mut fsm = Self::new(pmk, ssid, spa);
         fsm.snonce_override = Some(snonce);
@@ -416,15 +419,15 @@ impl WifiFsm {
     // ── SNonce generation ─────────────────────────────────────────────────────
 
     fn generate_snonce(&self) -> [u8; 32] {
-        #[cfg(test)]
+        // Production path: the driver injects a fresh SNonce from kernel entropy
+        // via `new_with_snonce`, so `snonce_override` is always `Some` for a real
+        // association. This is the only secure path.
         if let Some(s) = self.snonce_override {
             return s;
         }
-        // Production path: generate a fresh SNonce using the CSPRNG.
-        // In a `no_std` context without `getrandom`, we use CsprngState::from_seed
-        // with a fixed seed (0-filled) which would be insecure for production;
-        // the real driver is expected to seed this properly from hardware entropy.
-        // For now, use a deterministic fill to remain `no_std`-safe.
+        // Deterministic fallback for the entropy-less `new` constructor (used by
+        // passive/non-associating contexts and as a `no_std` safety net). This
+        // is NOT used by the driver, which always uses `new_with_snonce`.
         let mut rng = crypto_lib::random::CsprngState::from_seed([0xA5u8; 32]);
         let mut snonce = [0u8; 32];
         crypto_lib::random::csprng_fill(&mut rng, &mut snonce);

@@ -29,9 +29,17 @@ pub mod fw;
 #[cfg(not(test))]
 pub mod init;
 #[cfg(not(test))]
+pub mod key;
+#[cfg(not(test))]
 pub mod mcu;
 #[cfg(not(test))]
 pub mod rings;
+
+// The net.nic data path (Track DRV-net). Declared unconditionally: its pure
+// Ethernet⇄802.11 rewrite + EAPOL-demux functions are host-tested, while the
+// `run_io_loop` that touches the WFDMA rings / MCU / FSM is `#[cfg(not(test))]`
+// inside the module.
+pub mod io;
 
 /// Service name under which the present Wi-Fi NIC registers its TX endpoint.
 /// Shared across NIC families — only the NIC actually present registers it.
