@@ -1,6 +1,11 @@
-//! Hash functions: SHA-256, HMAC-SHA-256, HKDF.
+//! Hash functions: SHA-256, HMAC-SHA-256, HKDF, SHA-1, HMAC-SHA-1,
+//! PBKDF2-HMAC-SHA1, and wpa_pmk.
 
 use sha2::{Digest, Sha256};
+
+// ── SHA-1 / HMAC-SHA-1 re-exports ────────────────────────────────────────────
+
+pub use crate::sha1::{HmacSha1State, Sha1State, hmac_sha1, sha1};
 
 /// Compute SHA-256 digest of `data`.
 pub fn sha256(data: &[u8]) -> [u8; 32] {
@@ -87,6 +92,66 @@ pub fn hkdf_expand(prk: &[u8], info: &[u8], output: &mut [u8]) -> Result<(), cra
     let hk = Hkdf::<Sha256>::from_prk(prk).map_err(|_| crate::CryptoError::InvalidLength)?;
     hk.expand(info, output)
         .map_err(|_| crate::CryptoError::InvalidLength)
+}
+
+// ── PBKDF2-HMAC-SHA1 ─────────────────────────────────────────────────────────
+
+/// PBKDF2 with HMAC-SHA-1 as the PRF (RFC 2898 §5.2).
+///
+/// Writes `out.len()` bytes of derived key material.  The output length may be
+/// any value; the function produces as many 20-byte HMAC-SHA-1 blocks as
+/// required and truncates the last one.  No heap allocation is performed —
+/// all intermediate values live in fixed-size stack arrays.
+///
+/// # Arguments
+/// * `passphrase` — the password / passphrase bytes.
+/// * `salt`       — the salt (for WPA2-PSK this is the SSID verbatim).
+/// * `iterations` — iteration count (WPA2-PSK uses 4096).
+/// * `out`        — caller-provided buffer that receives the DK.
+pub fn pbkdf2_hmac_sha1(passphrase: &[u8], salt: &[u8], iterations: u32, out: &mut [u8]) {
+    // Each 20-byte block i is produced by:
+    //   U_1  = HMAC-SHA1(P, S || INT(i))
+    //   U_j  = HMAC-SHA1(P, U_{j-1})
+    //   T_i  = U_1 XOR U_2 XOR ... XOR U_c
+    let mut offset = 0usize;
+    let mut block_idx: u32 = 1;
+
+    while offset < out.len() {
+        // Compute U_1 = HMAC-SHA1(passphrase, salt || block_idx_be)
+        let mut u = {
+            let mut state = crate::sha1::HmacSha1State::new(passphrase);
+            state.update(salt);
+            state.update(&block_idx.to_be_bytes());
+            state.finalize()
+        };
+
+        let mut t = u;
+
+        // Compute U_2 … U_c, XOR-accumulating into t.
+        for _ in 1..iterations {
+            u = hmac_sha1(passphrase, &u);
+            for (ti, ui) in t.iter_mut().zip(u.iter()) {
+                *ti ^= ui;
+            }
+        }
+
+        // Copy as many bytes as needed from t into out.
+        let take = (out.len() - offset).min(20);
+        out[offset..offset + take].copy_from_slice(&t[..take]);
+        offset += take;
+        block_idx += 1;
+    }
+}
+
+/// Derive a WPA2-PSK PMK from a passphrase and SSID.
+///
+/// This is exactly `PBKDF2-HMAC-SHA1(passphrase, ssid, 4096, 32)` per
+/// IEEE 802.11i §H.4.  The SSID bytes are the salt verbatim (not null-terminated,
+/// not hashed).
+pub fn wpa_pmk(passphrase: &[u8], ssid: &[u8]) -> [u8; 32] {
+    let mut pmk = [0u8; 32];
+    pbkdf2_hmac_sha1(passphrase, ssid, 4096, &mut pmk);
+    pmk
 }
 
 #[cfg(test)]
@@ -187,6 +252,33 @@ mod tests {
             0xec, 0xc4, 0xc5, 0xbf, 0x34, 0x00, 0x72, 0x08, 0xd5, 0xb8, 0x87, 0x18, 0x58, 0x65,
         ];
         assert_eq!(okm, expected_okm);
+    }
+
+    #[test]
+    fn wpa_pmk_kat() {
+        // IEEE 802.11i §H.4 PSK published test vector.
+        // passphrase = "password", SSID = "IEEE", iterations = 4096, dkLen = 32.
+        let pmk = wpa_pmk(b"password", b"IEEE");
+        let expected: [u8; 32] = [
+            0xf4, 0x2c, 0x6f, 0xc5, 0x2d, 0xf0, 0xeb, 0xef, 0x9e, 0xbb, 0x4b, 0x90, 0xb3, 0x8a,
+            0x5f, 0x90, 0x2e, 0x83, 0xfe, 0x1b, 0x13, 0x5a, 0x70, 0xe2, 0x3a, 0xed, 0x76, 0x2e,
+            0x97, 0x10, 0xa1, 0x2e,
+        ];
+        assert_eq!(pmk, expected, "wpa_pmk IEEE 802.11i vector");
+    }
+
+    #[test]
+    fn pbkdf2_hmac_sha1_rfc6070_sanity() {
+        // RFC 6070 §2 Test Vector 1:
+        // P = "password", S = "salt", c = 1, dkLen = 20
+        // DK = 0c60c80f961f0e71f3a9b524af6012062fe037a6
+        let mut dk = [0u8; 20];
+        pbkdf2_hmac_sha1(b"password", b"salt", 1, &mut dk);
+        let expected: [u8; 20] = [
+            0x0c, 0x60, 0xc8, 0x0f, 0x96, 0x1f, 0x0e, 0x71, 0xf3, 0xa9, 0xb5, 0x24, 0xaf, 0x60,
+            0x12, 0x06, 0x2f, 0xe0, 0x37, 0xa6,
+        ];
+        assert_eq!(dk, expected, "RFC 6070 TC1 c=1");
     }
 
     #[test]
