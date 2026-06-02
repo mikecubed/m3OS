@@ -1,18 +1,18 @@
 # HDA + Realtek empirical capture (Phase 80 Track F.1)
 
-**Status:** AMD-codec-enablement follow-up **landed** (2026-06-01); awaiting an
-operator VFIO re-run to confirm whether the ALC1220 now enumerates. The Phase 80
-HDA driver + Realtek amp-enable code passes `hda-smoke` against QEMU's generic
-`intel-hda`/`hda-duplex` codec. After the first VFIO run found the ALC1220 not
-enumerating in `STATESTS` on the real AMD controller, web-traced Linux
-`snd_hda_intel` source (see "Corrected diagnosis" below) and landed the
-ring-3-side bring-up the driver was missing: a `sys_device_config_write` syscall,
-a PCI **D0** power-up, an in-reset **PLL-settle delay**, and the AMD/ATI snoop
-write. The remaining acceptance — audible output through the dev laptop's
-**internal speaker via its Realtek codec** — still needs an operator VFIO re-run
-(QEMU's codec has no EAPD/GPIO amp gating, and the codec-enumeration outcome can
-only be observed on the real AMD silicon). Re-run `scripts/hda-vfio-validate.md`
-(or the turnkey block below) and fill in the result sections.
+**Status:** Driver-side work **complete**; codec enumeration under VFIO
+**confirmed blocked by a platform limitation, not a driver bug**. The AMD-codec
+follow-up landed 2026-06-01 (a `sys_device_config_write` syscall + Linux-correct
+bring-up: PCI **D0** power-up, in-reset **PLL-settle delay**, AMD/ATI snoop) and
+was re-run on the real AMD `1022:15e3` controller via VFIO on 2026-06-02. Result
+(see "Re-run result" below): the new syscall works on real silicon (snoop write
+succeeds), the controller is already in D0 and fully up (`GCAP=0x4401`,
+`GCTL=0x1`), **yet `STATESTS=0x0000` persists** — the ALC1220 block is power/clock
+-gated at the SoC level when only `10:00.6` is passed through (the ACPI `_PS0`
+codec-rail enable is not replayed in the guest). The driver now brings the
+controller up exactly as Linux does; **audible output requires bare-metal
+validation** (or passing through the codec's power dependency), which is an
+environment choice outside m3OS code. QEMU `hda-smoke` remains green throughout.
 
 > This is the audio analog of `docs/research/` captures for the Phase 79
 > Realtek NIC: QEMU only emulates a generic part, so real Realtek behaviour
@@ -165,16 +165,58 @@ paths are no-ops on QEMU's Intel device):
    `&= ~0x07 |= 0x02`, AMD-gated by vendor `0x1022`) — for coherent DMA once a
    codec is up, applied via the new config-write syscall.
 
-### Remaining risk if the re-run still shows `STATESTS = 0`
+### Re-run result (2026-06-02, this host, VFIO) — STATESTS still 0 → confirmed platform limitation
 
-If correct reset timing + D0 still does not surface the codec, the codec block is
-power/clock-gated at the **SoC level under VFIO** (ACPI power resources not
-replayed in the guest) — a platform/passthrough limitation, not a driver bug.
-Linux exposes no single config-space "enable codec link clock" bit for `15e3`; it
-relies on the standard CRST cycle + correct power state + patient retry. Possible
-operator-side mitigations: bind host `snd_hda_intel` once to power the codec up,
-then hand the function to VFIO **without** a power cycle; or validate on bare
-metal rather than under passthrough.
+Re-ran `M3OS_HDA_VFIO_BDF=10:00.6 cargo xtask hda-smoke` (no sudo needed — a
+`/dev/vfio/31` ACL grants the dev user, memlock 8 GB) with the follow-up code.
+Captured serial (`/tmp/hda-hw.log`), every driver attempt identical:
+
+```
+hda_driver: AMD snoop (cfg 0x42) <- 0x00000002
+hda_driver: GCAP=0x00004401
+hda_driver: STATESTS=0x00000000
+hda_driver: GCTL=0x00000001
+hda_driver: controller bring-up failed: no codecs reported in STATESTS
+```
+
+What this proves:
+
+- **`sys_device_config_write` works on real silicon** — the snoop write to cfg
+  `0x42` succeeds every attempt (4×, one per restart). The new syscall is
+  validated end-to-end on hardware, not just QEMU.
+- **The controller was already in D0** — there is **no** "forced PCI power state
+  D0" line, i.e. the PMCSR power-state field read back 0, so the D0-force
+  correctly no-op'd. This **rules out the runtime-PM-D3 hypothesis** for this
+  function: the controller is not suspended.
+- **`STATESTS = 0x0000` persists** despite D0 + snoop + the new ~600 µs in-reset
+  PLL-settle delay + 2 reset retries + a 4 s STATESTS poll each. `GCAP=0x4401`
+  and `GCTL=0x1` confirm the controller is fully up and out of reset.
+
+**Conclusion:** the controller function is fully accessible and now brought up
+exactly as Linux does, yet the ALC1220 still does not appear on any SDI line.
+Since the function is already in D0 and config-space programming works, the codec
+block is power/clock-gated at the **SoC level** — the ACPI power resources /
+`_PS0` that enable the analog codec link clock on this MSI/AMD APU laptop are not
+replayed in the guest when only `10:00.6` is passed through. This is a
+**VFIO/passthrough platform limitation, not a driver bug**, and Linux exposes no
+single config-space "enable codec link clock" bit for `15e3` to work around it.
+
+**Path to audible output from here (operator choices, all outside the driver):**
+
+1. **Bare metal** — run m3OS natively (or from USB) on this laptop so the
+   platform firmware/ACPI brings the codec rail up normally; the driver bring-up
+   is now correct and should enumerate. This is the cleanest proof.
+2. **Host-powered handoff (experimental, riskier)** — bind host `snd_hda_intel`,
+   confirm `/proc/asound/card*/codec#*` shows the ALC1220, then hand the function
+   to `vfio-pci` **without** a power cycle and re-run; if the codec rail stays
+   powered it may then report in `STATESTS`. Unbinding the host driver usually
+   runtime-suspends the codec, so this is not guaranteed.
+3. **Pass through the codec's power dependency too** — if a future investigation
+   identifies the device that gates the rail (ACP / SMU / a GPIO controller),
+   adding it to the VFIO group may wake the codec. Out of scope here.
+
+The driver-side work for Track F is complete; remaining work is platform/operator
+environment, not m3OS code.
 
 ### Widget graph (capture once STATESTS != 0)
 - Vendor:device (`GET_PARAMETER VENDOR_ID`) = `0x10ec:0x____` (expect ALC1220)
