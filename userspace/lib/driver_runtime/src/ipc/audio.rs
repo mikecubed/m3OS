@@ -38,6 +38,10 @@ pub enum AudioIpcError {
     CallFailed,
     /// `ipc_take_pending_bulk` failed to retrieve the reply bulk.
     ReplyFailed,
+    /// The reply frame's label was not [`AUDIO_RESPONSE`] — the endpoint
+    /// replied with an unexpected/misrouted message, so its bulk must not be
+    /// decoded as an [`AudioResponse`].
+    UnexpectedReply,
     /// The reply bulk did not decode as an [`AudioResponse`].
     Decode(DecodeError),
 }
@@ -76,6 +80,13 @@ impl AudioDriverClient {
         if reply_label == u64::MAX {
             return Err(AudioIpcError::CallFailed);
         }
+        // Enforce the protocol's reply contract: a well-behaved driver replies
+        // with the AUDIO_RESPONSE label. A non-matching label means the endpoint
+        // was misrouted (or a peer is misbehaving), so decoding its bulk as an
+        // AudioResponse would be unsound — reject instead.
+        if reply_label != u64::from(AUDIO_RESPONSE) {
+            return Err(AudioIpcError::UnexpectedReply);
+        }
         let mut reply = [0u8; AUDIO_RESPONSE_MAX_SIZE];
         let m = syscall_lib::ipc_take_pending_bulk(&mut reply);
         if m == u64::MAX {
@@ -110,7 +121,12 @@ pub fn reply_response(
 ) -> Result<(), crate::DriverRuntimeError> {
     use super::IpcBackend;
     let mut buf = [0u8; AUDIO_RESPONSE_MAX_SIZE];
-    let n = audio::encode_response(rsp, &mut buf).unwrap_or(0);
+    // Treat an encode failure as an internal error rather than transmitting a
+    // 0-byte AUDIO_RESPONSE the client would mis-decode. encode_response only
+    // fails if a response exceeds AUDIO_RESPONSE_MAX_SIZE, which the fixed
+    // variants never do — so this guards a "must not happen" invariant.
+    let n = audio::encode_response(rsp, &mut buf)
+        .ok_or(kernel_core::device_host::DeviceHostError::Internal)?;
     backend.store_reply_bulk(&buf[..n])?;
     backend.reply(u64::from(AUDIO_RESPONSE), 0)
 }

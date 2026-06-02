@@ -20,6 +20,19 @@ proven on hardware.
 > codec; this runbook is the hardware-only confirmation and exists so it is
 > reproducible and authorized.
 
+> **Known limitation — VFIO on this dev laptop does NOT enumerate the codec.**
+> The 2026-06-02 VFIO re-run (see `docs/research/hda-realtek-capture.md`) proved
+> the syscall + controller path on real silicon — `sys_device_config_write`
+> lands the AMD snoop write, `GCTL=0x1` brings the controller out of reset — but
+> `STATESTS` stays `0x0000`: the ALC1220 codec block is power/clock-gated at the
+> SoC level when only the audio function (`10:00.6`) is passed through, because
+> the guest never replays the platform ACPI `_PS0` power resources that gate the
+> codec link clock. So VFIO here confirms **controller bring-up + config-space
+> write**, not codec enumeration or audible output — the latter requires
+> **bare-metal** validation (or passing through the codec's power dependency).
+> Run the steps below to reproduce the controller-side confirmation, not as a
+> path to audible sound.
+
 ## 0. Pre-flight (read-only, safe)
 
 ```bash

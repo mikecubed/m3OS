@@ -98,5 +98,5 @@ A codec is a graph of NID widgets. `codec.rs` walks root → Audio Function Grou
 
 - **Zero-copy PCM DMA across the seam** (entering shared frames into the driver's IOMMU domain) — the shipped design copies into the driver's own DMA buffer.
 - **Format/rate negotiation** — fixed 48 kHz / 2 ch / 16-bit; `QueryCaps` returns a fixed descriptor.
-- **Live HDA interrupt-driven completion** under QEMU — the IRQ is armed + handled but delivery is gated; `SDnLPIB` polling is the working path.
+- **Interrupt-driven completion as the authoritative position path** — live BCIS IRQ *delivery* to the ring-3 driver is proven under QEMU (the `hda-smoke` gate hard-waits on the driver's `stream IRQ (BCIS cleared)` line, emitted only from the notification path), but `SDnLPIB` polling remains the authoritative *position/completion* source; switching to IRQ-driven completion waits on the DMA position buffer below.
 - HDMI/DisplayPort audio, USB audio, microphone/line-in capture, HDA power management (D3/runtime suspend), the DMA position buffer (`DPLBASE`/`DPUBASE`), and per-destination multi-codec routing.

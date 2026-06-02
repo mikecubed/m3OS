@@ -20,6 +20,18 @@ const CHUNK: usize = 4096;
 const N_BDL: usize = PCM_BUF_BYTES / CHUNK;
 const POLL_BUDGET: u32 = 200_000;
 
+/// Spin up to `budget` reads waiting for `ready`; returns whether it became
+/// ready before the budget was exhausted (so callers can fail a stuck
+/// controller instead of proceeding on a half-completed handshake).
+fn poll_until(budget: u32, mut ready: impl FnMut() -> bool) -> bool {
+    for _ in 0..budget {
+        if ready() {
+            return true;
+        }
+    }
+    false
+}
+
 /// The output stream: cyclic PCM buffer + BDL + position tracking.
 pub struct OutputStream {
     pcm: DmaBuffer<[u8; PCM_BUF_BYTES]>,
@@ -74,18 +86,21 @@ impl OutputStream {
         let lvi = fmt::bdl_lvi(&entries);
 
         let ctl = self.sd(hda::SD_CTL);
-        // SRST reset: set → read-1 → clear → read-0.
+        // SRST reset: set → read-1 → clear → read-0. A controller that never
+        // acknowledges either edge would leave the descriptor half-reset and
+        // play silently, so a poll timeout is a hard error here (matching the
+        // RUN-bit readback check below) rather than a silent fall-through.
         mmio.write_reg::<u32>(ctl, mmio.read_reg::<u32>(ctl) | hda::SDCTL_SRST);
-        for _ in 0..POLL_BUDGET {
-            if mmio.read_reg::<u32>(ctl) & hda::SDCTL_SRST != 0 {
-                break;
-            }
+        if !poll_until(POLL_BUDGET, || {
+            mmio.read_reg::<u32>(ctl) & hda::SDCTL_SRST != 0
+        }) {
+            return Err("SDnCTL.SRST did not assert");
         }
         mmio.write_reg::<u32>(ctl, mmio.read_reg::<u32>(ctl) & !hda::SDCTL_SRST);
-        for _ in 0..POLL_BUDGET {
-            if mmio.read_reg::<u32>(ctl) & hda::SDCTL_SRST == 0 {
-                break;
-            }
+        if !poll_until(POLL_BUDGET, || {
+            mmio.read_reg::<u32>(ctl) & hda::SDCTL_SRST == 0
+        }) {
+            return Err("SDnCTL.SRST did not clear");
         }
 
         let bdl_iova = self.bdl.iova();
@@ -139,15 +154,20 @@ impl OutputStream {
         if in_flight + pcm.len() > PCM_BUF_BYTES {
             return false;
         }
-        let mut off = self.write_cursor % PCM_BUF_BYTES;
+        let off = self.write_cursor % PCM_BUF_BYTES;
         {
             let buf = &mut self.pcm[..];
-            for &b in pcm {
-                buf[off] = b;
-                off = (off + 1) % PCM_BUF_BYTES;
+            // Copy ahead of the DMA read position in at most two contiguous
+            // runs, split at the cyclic-buffer wrap point. The in-flight check
+            // above guarantees the wrapped tail cannot clobber unread data, so
+            // this is behaviour-identical to the previous byte-at-a-time copy.
+            let first = pcm.len().min(PCM_BUF_BYTES - off);
+            buf[off..off + first].copy_from_slice(&pcm[..first]);
+            if first < pcm.len() {
+                buf[..pcm.len() - first].copy_from_slice(&pcm[first..]);
             }
         }
-        self.write_cursor = off;
+        self.write_cursor = (off + pcm.len()) % PCM_BUF_BYTES;
         self.total_submitted = self.total_submitted.wrapping_add(pcm.len() as u64);
         true
     }

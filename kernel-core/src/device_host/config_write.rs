@@ -3,9 +3,12 @@
 //! Pure-logic validation for the `sys_device_config_write` syscall, which lets
 //! an authorized ring-3 driver write its **already-claimed** device's PCI
 //! configuration space. The motivating use is AMD HDA snoop enablement (see
-//! [`crate::hda::amd`]): the controller's codec does not enumerate until a
-//! vendor snoop bit is set in config space, and m3OS ships no kernel HDA quirk
-//! table, so the ring-3 driver performs the write itself.
+//! [`crate::hda::amd`]): Linux sets a vendor snoop bit in config space so the
+//! controller's DMA stays cache-coherent, and m3OS ships no kernel HDA quirk
+//! table, so the ring-3 driver performs the write itself. (Snoop is a
+//! DMA-coherency fix, **not** a codec-enumeration gate — the Phase 80 capture
+//! `docs/research/hda-realtek-capture.md` confirmed enumeration depends on reset
+//! timing + codec power, not snoop.)
 //!
 //! The offset/width/alignment rules are identical to a config-space *read*
 //! ([`super::config_read`]); a write adds one rule the read does not need: the

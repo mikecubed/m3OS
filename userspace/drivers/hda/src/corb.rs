@@ -59,11 +59,18 @@ impl CorbRirb {
         mmio.write_reg::<u16>(hda::REG_CORBWP, 0);
         self.corb_wp = 0;
 
-        // CORBRP reset handshake: set CORBRPRST → read-1 → clear → read-0.
+        // CORBRP reset handshake: set CORBRPRST → read-1 → clear → read-0. A
+        // controller that never acknowledges the reset would leave the ring in
+        // an unknown state, so fail bring-up here (matching the CORBRUN/RIRBDMAEN
+        // readback checks below) rather than continuing silently.
         mmio.write_reg::<u16>(hda::REG_CORBRP, hda::CORBRP_RST);
-        self.poll(|| verb::corbrp_reset_asserted(mmio.read_reg::<u16>(hda::REG_CORBRP)));
+        if !self.poll(|| verb::corbrp_reset_asserted(mmio.read_reg::<u16>(hda::REG_CORBRP))) {
+            return Err("CORBRP reset did not assert");
+        }
         mmio.write_reg::<u16>(hda::REG_CORBRP, 0);
-        self.poll(|| verb::corbrp_reset_cleared(mmio.read_reg::<u16>(hda::REG_CORBRP)));
+        if !self.poll(|| verb::corbrp_reset_cleared(mmio.read_reg::<u16>(hda::REG_CORBRP))) {
+            return Err("CORBRP reset did not clear");
+        }
 
         // RIRB base IOVA + size + write-pointer reset.
         let rirb_iova = self.rirb.iova();
@@ -183,11 +190,15 @@ impl CorbRirb {
         None
     }
 
-    fn poll(&self, mut ready: impl FnMut() -> bool) {
+    /// Spin up to `POLL_BUDGET` reads waiting for `ready`; returns whether it
+    /// became ready before the budget was exhausted, so callers can fail a
+    /// stuck handshake instead of proceeding on an unacknowledged reset.
+    fn poll(&self, mut ready: impl FnMut() -> bool) -> bool {
         for _ in 0..POLL_BUDGET {
             if ready() {
-                return;
+                return true;
             }
         }
+        false
     }
 }

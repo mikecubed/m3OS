@@ -165,11 +165,16 @@ pub const SYS_DEVICE_CONFIG_READ: u64 = 0x1128;
 ///
 /// Some controllers need vendor-specific configuration-space programming the
 /// generic register path cannot express. The motivating case is the AMD
-/// "Family 17h/19h HD Audio Controller" (`1022:15e3`): its Realtek codec does
-/// not assert SDI presence in `STATESTS` after the standard HDA `GCTL.CRST`
-/// sequence until the AMD/ATI **snoop** bit is enabled in config space (Linux
-/// `snd_hda_intel`'s `azx_init_pci`). m3OS ships no kernel HDA quirk table, so
-/// the ring-3 `hda_driver` performs this write itself.
+/// "Family 17h/19h HD Audio Controller" (`1022:15e3`): Linux's `snd_hda_intel`
+/// (`azx_init_pci`) sets an AMD/ATI **snoop** bit in config space so the
+/// controller's DMA stays cache-coherent. m3OS ships no kernel HDA quirk table,
+/// so the ring-3 `hda_driver` performs this write itself.
+///
+/// Note: the snoop write is a **DMA-coherency** fix, **not** a codec-enumeration
+/// gate. The Phase 80 VFIO capture (`docs/research/hda-realtek-capture.md`)
+/// confirmed a codec enumerates in `STATESTS` without it (playback would just be
+/// garbled); codec presence is gated by reset timing + codec power. Do not treat
+/// snoop as a bring-up dependency.
 ///
 /// Unlike [`SYS_DEVICE_CONFIG_READ`] — which is a *pre-claim* probe so a driver
 /// can read vendor:device before deciding which function to claim — a config
