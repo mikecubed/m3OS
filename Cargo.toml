@@ -80,6 +80,8 @@ members = [
     "userspace/drivers/ac97",
     # Phase 80b — ring-3 Intel HDA out-of-process audio hardware driver
     "userspace/drivers/hda",
+    # Phase 81 — userspace Wi-Fi management plane + WPA2-PSK supplicant library
+    "userspace/wifi-core",
     # Phase 55b Track F.3b — NVMe crash-and-restart end-to-end smoke client
     "userspace/nvme-crash-smoke",
     # Phase 55b Track F.3d-1 — max_restart 6-kill loop + permanently-stopped
