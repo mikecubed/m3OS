@@ -147,8 +147,8 @@ pub fn classify_and_rewrite_rx(frame: &[u8]) -> RxClass {
 mod runtime {
     use super::*;
     use crate::init::Mt792x;
-    use driver_runtime::ipc::net::{NetReply, NetServer};
     use driver_runtime::ipc::EndpointCap;
+    use driver_runtime::ipc::net::{NetReply, NetServer};
     use kernel_core::driver_ipc::net::{NetDriverError, NetLinkEvent};
     use wifi_core::fsm::{WifiAction, WifiEvent, WifiFsm, WifiState};
 
@@ -317,7 +317,13 @@ mod runtime {
                 WifiAction::Emit(_status) => {
                     // Reaching Connected marks the link up; a Failed/Init state
                     // (after a deauth) marks it down so TCP retransmit reacts.
-                    let up = matches!(*fsm.borrow().as_ref().map(|f| f.state()).unwrap_or(&WifiState::Init), WifiState::Connected);
+                    let up = matches!(
+                        *fsm.borrow()
+                            .as_ref()
+                            .map(|f| f.state())
+                            .unwrap_or(&WifiState::Init),
+                        WifiState::Connected
+                    );
                     let mac = *sta_mac;
                     let _ = net_server.publish_link_state(NetLinkEvent {
                         up,

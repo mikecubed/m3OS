@@ -15,7 +15,7 @@
 
 extern crate alloc;
 
-use kernel_core::mt792x::mcu::{encode_sta_rec_key, CIPHER_CCMP};
+use kernel_core::mt792x::mcu::{CIPHER_CCMP, encode_sta_rec_key};
 use wifi_core::fsm::KeyMaterial;
 
 use crate::mcu::{McuError, McuRing};

@@ -1245,6 +1245,7 @@ version = "0.57.0"
 dependencies = [
  "kernel-core",
  "syscall-lib",
+ "wifi-core",
 ]
 
 [[package]]

@@ -349,3 +349,45 @@ fn display_control_service_name_matches_daemon() {
     // Mirror invariant for the Phase 56 surface.
     assert_eq!(DISPLAY_CONTROL_SERVICE_NAME, "display-control");
 }
+
+// ---------------------------------------------------------------------------
+// Phase 81 (D.2) — `m3ctl wifi status` parsing + formatter.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wifi_status_parses_to_wifi_status_verb() {
+    assert_eq!(parse_verb("wifi", &["status"]), Ok(ParsedVerb::WifiStatus));
+}
+
+#[test]
+fn wifi_without_subcommand_is_missing_argument() {
+    assert!(matches!(
+        parse_verb("wifi", &[]),
+        Err(ParseError::MissingArgument(_))
+    ));
+    assert!(matches!(
+        parse_verb("wifi", &["bogus"]),
+        Err(ParseError::BadArgument(_))
+    ));
+}
+
+#[test]
+fn wifi_status_format() {
+    use alloc::vec::Vec;
+    let status = wifi_core::control::WifiStatus {
+        ssid: Vec::from(&b"HomeNet"[..]),
+        rssi: -47,
+        ipv4: [192, 168, 1, 42],
+    };
+    let rendered = format_wifi_status(&status);
+    assert!(rendered.contains("wifi: associated"));
+    assert!(rendered.contains("ssid: HomeNet"));
+    assert!(rendered.contains("signal: -47 dBm"));
+    assert!(rendered.contains("ipv4: 192.168.1.42"));
+}
+
+#[test]
+fn wifi_not_associated_message_is_stable() {
+    assert_eq!(WIFI_NOT_ASSOCIATED_MSG, "wifi: not associated");
+    assert_eq!(WIFI_CONTROL_SERVICE_NAME, "wifi.control");
+}

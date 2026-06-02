@@ -23,9 +23,9 @@ extern crate std;
 #[cfg(not(test))]
 use core::alloc::Layout;
 #[cfg(not(test))]
-use mt792x_hal::fw::firmware_blob;
-#[cfg(not(test))]
 use driver_runtime::ipc::EndpointCap;
+#[cfg(not(test))]
+use mt792x_hal::fw::firmware_blob;
 #[cfg(not(test))]
 use mt792x_hal::init::Mt792x;
 #[cfg(not(test))]
@@ -36,9 +36,9 @@ use mt792x_hal::{
 #[cfg(not(test))]
 use syscall_lib::STDOUT_FILENO;
 #[cfg(not(test))]
-use wifi_core::fsm::WifiFsm;
-#[cfg(not(test))]
 use syscall_lib::heap::BrkAllocator;
+#[cfg(not(test))]
+use wifi_core::fsm::WifiFsm;
 
 #[cfg(not(test))]
 #[global_allocator]
@@ -154,6 +154,10 @@ fn program_main(_args: &[&str]) -> i32 {
         syscall_lib::write_str(STDOUT_FILENO, "mt792x_driver: net.nic register failed\n");
         return 5;
     }
+    // Phase 81 (C.3): advertise the wireless-medium marker so the kernel marks
+    // this NIC wireless and prefers a link-up wired NIC over it for the default
+    // route. Best-effort — failure only loses the wired-over-wireless preference.
+    let _ = syscall_lib::ipc_register_service(ep_u32, "net.nic.wireless");
     let ingress = syscall_lib::ipc_lookup_service(INGRESS_SERVICE_NAME);
     let ingress_cap = if ingress == u64::MAX {
         None
@@ -216,7 +220,10 @@ fn load_supplicant(sta_mac: [u8; 6]) -> Option<WifiFsm> {
     // is sufficient for the single static association at 1.0.
     let mut snonce = [0u8; 32];
     if syscall_lib::getrandom(&mut snonce) != snonce.len() as isize {
-        syscall_lib::write_str(STDOUT_FILENO, "mt792x_driver: getrandom failed for SNonce\n");
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "mt792x_driver: getrandom failed for SNonce\n",
+        );
         return None;
     }
     Some(WifiFsm::new_with_snonce(

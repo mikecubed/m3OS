@@ -65,10 +65,12 @@ mod os_binary {
     };
     use m3ctl::{
         DISPLAY_CONTROL_SERVICE_NAME, LABEL_DISPLAY_CTL_CMD, LABEL_SESSION_CTL_CMD, ParseError,
-        ParsedVerb, SESSION_CONTROL_SERVICE_NAME, parse_verb,
+        ParsedVerb, SESSION_CONTROL_SERVICE_NAME, WIFI_CONTROL_SERVICE_NAME,
+        WIFI_NOT_ASSOCIATED_MSG, format_wifi_status, parse_verb,
     };
     use syscall_lib::STDOUT_FILENO;
     use syscall_lib::heap::BrkAllocator;
+    use wifi_core::control::{WIFI_STATUS, WifiStatus};
 
     #[global_allocator]
     static ALLOCATOR: BrkAllocator = BrkAllocator::new();
@@ -126,6 +128,57 @@ mod os_binary {
             ParsedVerb::Display(cmd) => dispatch_display(cmd),
             ParsedVerb::Session(verb) => dispatch_session(verb),
             ParsedVerb::LockScreen => dispatch_lock(),
+            ParsedVerb::WifiStatus => dispatch_wifi_status(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 81 D.2 — Wi-Fi status dispatch
+    // -----------------------------------------------------------------------
+
+    /// `m3ctl wifi status` — query the mt792x driver's userspace control
+    /// endpoint for the current association status and print it.
+    ///
+    /// When the `wifi.control` service is absent (no Wi-Fi driver, or the radio
+    /// has not associated) or the driver reports `NotAssociated`, prints
+    /// "wifi: not associated" and exits 0 — a read-only diagnostic should not
+    /// error just because Wi-Fi is down.
+    fn dispatch_wifi_status() -> i32 {
+        let handle = match lookup_with_backoff(WIFI_CONTROL_SERVICE_NAME) {
+            Some(h) => h,
+            None => {
+                print_str(WIFI_NOT_ASSOCIATED_MSG);
+                print_str("\n");
+                return 0;
+            }
+        };
+
+        let reply_label = syscall_lib::ipc_call_buf(handle, WIFI_STATUS as u64, 0, &[]);
+        if reply_label == u64::MAX {
+            print_str(WIFI_NOT_ASSOCIATED_MSG);
+            print_str("\n");
+            return 0;
+        }
+
+        let mut reply_buf = vec![0u8; MAX_BULK_BYTES];
+        let n = syscall_lib::ipc_take_pending_bulk(&mut reply_buf);
+        if n == u64::MAX || n == 0 {
+            print_str(WIFI_NOT_ASSOCIATED_MSG);
+            print_str("\n");
+            return 0;
+        }
+
+        match WifiStatus::decode(&reply_buf[..n as usize]) {
+            Some(status) if !status.ssid.is_empty() => {
+                print_str(&format_wifi_status(&status));
+                0
+            }
+            // Empty SSID or undecodable reply ⇒ not associated.
+            _ => {
+                print_str(WIFI_NOT_ASSOCIATED_MSG);
+                print_str("\n");
+                0
+            }
         }
     }
 

@@ -28,3 +28,7 @@ syscall-lib = { path = "../syscall-lib", features = ["alloc"] }
 # (display) and `encode_verb` / `decode_reply` (session — Phase 57
 # I.2).
 kernel-core = { path = "../../kernel-core", default-features = false }
+# Phase 81 (D.2): reuse the userspace Wi-Fi control protocol (WIFI_STATUS query
+# + WifiStatus codec + WifiControlError) for `m3ctl wifi status` — no parallel
+# byte definitions (DRY).
+wifi-core = { path = "../wifi-core" }
