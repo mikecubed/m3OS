@@ -9,7 +9,7 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Host-testable AHCI substrate in `kernel-core/src/storage/`: HBA + per-port register/offset/bit defs, Command Header + Command Table + PRDT + H2D/D2H Register FIS + Received-FIS `#[repr(C)]` layouts with size **and offset** asserts, free command-slot allocator over `PxSACT \| PxCI`, ATA opcode + H2D-FIS encoders (with `FIS_TYPE_REG_H2D = 0x27`), signature classifier, with full host unit tests | Phase 55b, Phase 67 | Planned |
+| A | Host-testable AHCI substrate in `kernel-core/src/storage/`: HBA + per-port register/offset/bit defs, Command Header + Command Table + PRDT + H2D/D2H Register FIS + Received-FIS `#[repr(C)]` layouts with size **and offset** asserts, free command-slot allocator over `PxSACT \| PxCI`, ATA opcode + H2D-FIS encoders (with `FIS_TYPE_REG_H2D = 0x27`), signature classifier, with full host unit tests | Phase 55b, Phase 67 | Done ✅ |
 | B | HBA + port bring-up in `userspace/drivers/ahci/`: PCI class match + ABAR map, `GHC.AE`/`GHC.HR`, CAP2/BOHC handoff (QEMU-no-op), PI enumeration, port idle (stop engine ordering), DMA-structure program + FRE, COMRESET + presence detect, signature classify + non-`Sata` skip, port start | A | Planned |
 | C | Command issue + completion + errors: IDENTIFY, READ/WRITE DMA EXT (single + multi-block via PRDT), FLUSH CACHE EXT durability, slot issue + completion poll, IRQ-on-completion path (`PxIS` then host `IS` clear), `PxIS.TFES`/`PxSERR` error recovery mapped onto the `RemoteBlockDevice` restart semantics | A, B | Planned |
 | D | `RemoteBlockDevice` facade: register `"ahci.block"`, serve `BlkRequestHeader`/`BlkReplyHeader`, honor `MAX_SECTORS_PER_REQUEST` chunking, kernel cold-path lookup learns `"ahci.block"`, boot-time MBR partition probe, four-place binary wiring + `ahci_driver.conf` | C, Phase 8 | Planned |
@@ -38,8 +38,8 @@
 **Why it matters:** AGENTS.md mandates that pure-logic code be host-testable in `kernel-core` (the kernel is `no_std` and cannot be `cargo test`ed in QEMU); putting the AHCI register/struct/encode logic here makes it provable by `cargo xtask check` exactly like `kernel_core::nvme`, `kernel_core::hda`, and `kernel_core::r8169`.
 
 **Acceptance:**
-- [ ] `kernel-core/src/lib.rs` declares `pub mod storage;` alphabetically between `slab` and `time` (or wherever the existing ordering places it) and `cargo test -p kernel-core --target x86_64-unknown-linux-gnu` compiles the new module.
-- [ ] `cargo xtask check` builds with the new module present and runs its host tests (the logic stays in `kernel-core`, which is already in the check list, so no new crate entry is needed — recorded in F.3).
+- [x] `kernel-core/src/lib.rs` declares `pub mod storage;` alphabetically between `slab` and `time` (or wherever the existing ordering places it) and `cargo test -p kernel-core --target x86_64-unknown-linux-gnu` compiles the new module.
+- [x] `cargo xtask check` builds with the new module present and runs its host tests (the logic stays in `kernel-core`, which is already in the check list, so no new crate entry is needed — recorded in F.3).
 
 ### A.2 — HBA + per-port register map (offsets + bit constants)
 
@@ -48,10 +48,10 @@
 **Why it matters:** every register access in Track B is a literal offset/bit; pinning them in one host-tested table (cross-checked against Linux `ahci.h`, the AHCI 1.3.1 spec, and QEMU `ahci-internal.h`) means a transcription slip is a failing test, not a silent register write to the wrong offset — `PxCMD.CR`/`FR` are **read-only status** bits and `PxIS`/`PxSERR` are **write-1-to-clear**, which the bit names encode so call sites cannot mistreat them; the `FIS_TYPE_REG_H2D = 0x27` type byte is the constant every real HBA validates in the command FIS, so it lives in the table beside the rest.
 
 **Acceptance:**
-- [ ] Host test asserts the generic-host-control offsets equal `{CAP:0x00, GHC:0x04, IS:0x08, PI:0x0C, VS:0x10, CAP2:0x24, BOHC:0x28}` and `port_base(0)==0x100`, `port_base(1)==0x180`, `port_base(5)==0x380` (`kernel_core::storage::ahci::tests::register_offsets`).
-- [ ] Host test asserts the `PxCMD` bit values `ST=0x1, SUD=0x2, POD=0x4, CLO=0x8, FRE=0x10, FR=0x4000, CR=0x8000` and that `GHC_AE==1<<31`, `GHC_HR==1<<0`, `CAP2_BOH==1<<0` (`tests::cmd_bits`, `tests::ghc_bits`).
-- [ ] Host test asserts the FIS type bytes `FIS_TYPE_REG_H2D == 0x27` and `FIS_TYPE_REG_D2H == 0x34` (`tests::fis_type_bytes`).
-- [ ] Host test asserts `PX_IS_TFES == 1 << 30` and `SSTS_DET_PRESENT == 3` and that a `PxSSTS` value `0x113` decodes to DET=3 / IPM=1 (the QEMU device-present value) via a `port_present(ssts) -> bool` helper (`tests::ssts_present`).
+- [x] Host test asserts the generic-host-control offsets equal `{CAP:0x00, GHC:0x04, IS:0x08, PI:0x0C, VS:0x10, CAP2:0x24, BOHC:0x28}` and `port_base(0)==0x100`, `port_base(1)==0x180`, `port_base(5)==0x380` (`kernel_core::storage::ahci::tests::register_offsets`).
+- [x] Host test asserts the `PxCMD` bit values `ST=0x1, SUD=0x2, POD=0x4, CLO=0x8, FRE=0x10, FR=0x4000, CR=0x8000` and that `GHC_AE==1<<31`, `GHC_HR==1<<0`, `CAP2_BOH==1<<0` (`tests::cmd_bits`, `tests::ghc_bits`).
+- [x] Host test asserts the FIS type bytes `FIS_TYPE_REG_H2D == 0x27` and `FIS_TYPE_REG_D2H == 0x34` (`tests::fis_type_bytes`).
+- [x] Host test asserts `PX_IS_TFES == 1 << 30` and `SSTS_DET_PRESENT == 3` and that a `PxSSTS` value `0x113` decodes to DET=3 / IPM=1 (the QEMU device-present value) via a `port_present(ssts) -> bool` helper (`tests::ssts_present`).
 
 ### A.3 — Command-list / command-table / PRDT / FIS struct layouts (`#[repr(C)]` + size & offset asserts)
 
@@ -60,10 +60,10 @@
 **Why it matters:** the HBA DMA-reads these structures at the IOVAs programmed in B.4, so a wrong field width, a missing reserved gap, or a mis-placed PRDTL silently corrupts the command — DW0 of the command header is a full 32-bit dword (byte0 flags, byte1 flags, then **PRDTL at byte offset 2**); omitting byte 1 lands `prdtl` at offset 1 and the HBA reads the PRDT length from the wrong bytes, a corruption a passing `size_of == 32` assert (absorbed by trailing reserved padding) would *not* catch — so the layout is pinned with **offset** asserts, not just size; the AHCI command header is exactly 32 bytes (32 × 32 B = the 1 KiB command list), the PRDT entry exactly 16 bytes with the DBC N−1 encoding, and the H2D Register FIS exactly 20 bytes (`CFL = 5` dwords); compile-time asserts make a layout mistake a build failure, mirroring `kernel_core::mt792x::dma::Mt76Desc`'s 16-byte assert.
 
 **Acceptance:**
-- [ ] Compile-time `const _: () = assert!(...)` guarantees `size_of::<HbaCmdHeader>() == 32`, `size_of::<HbaPrdtEntry>() == 16`, `size_of::<FisRegH2D>() == 20`, and `size_of::<HbaFis>() == 256` (build fails otherwise).
-- [ ] Compile-time **offset** asserts guarantee `offset_of!(HbaCmdHeader, prdtl) == 2`, `offset_of!(HbaCmdHeader, prdbc) == 4`, `offset_of!(HbaCmdHeader, ctba) == 8`, `offset_of!(HbaCmdHeader, ctbau) == 12` (catches the DW0-byte-1 omission a size-only assert would miss).
-- [ ] Host test asserts `encode_dbc(8 * 512, false) == (8 * 512 - 1)` (no interrupt bit) and `encode_dbc(512, true) == (511 | (1 << 31))`, that the encoded count is always odd (low bit set), and that `encode_dbc(0, _)` is rejected/`debug_assert`-guarded (documented zero-length case) (`kernel_core::storage::ahci::tests::prdt_dbc_n_minus_1`, `tests::prdt_dbc_rejects_zero`).
-- [ ] Host test asserts the command-table PRDT region starts at byte offset `0x80` (`cfis` 64 + `acmd` 16 + reserved 48) and that `HbaCmdHeader`'s `cfl` accessor reads/writes the low 5 bits of byte 0 while the `w` (write) accessor is bit 6 (`tests::cmd_table_layout`, `tests::cmd_header_bitfields`).
+- [x] Compile-time `const _: () = assert!(...)` guarantees `size_of::<HbaCmdHeader>() == 32`, `size_of::<HbaPrdtEntry>() == 16`, `size_of::<FisRegH2D>() == 20`, and `size_of::<HbaFis>() == 256` (build fails otherwise).
+- [x] Compile-time **offset** asserts guarantee `offset_of!(HbaCmdHeader, prdtl) == 2`, `offset_of!(HbaCmdHeader, prdbc) == 4`, `offset_of!(HbaCmdHeader, ctba) == 8`, `offset_of!(HbaCmdHeader, ctbau) == 12` (catches the DW0-byte-1 omission a size-only assert would miss).
+- [x] Host test asserts `encode_dbc(8 * 512, false) == (8 * 512 - 1)` (no interrupt bit) and `encode_dbc(512, true) == (511 | (1 << 31))`, that the encoded count is always odd (low bit set), and that `encode_dbc(0, _)` is rejected/`debug_assert`-guarded (documented zero-length case) (`kernel_core::storage::ahci::tests::prdt_dbc_n_minus_1`, `tests::prdt_dbc_rejects_zero`).
+- [x] Host test asserts the command-table PRDT region starts at byte offset `0x80` (`cfis` 64 + `acmd` 16 + reserved 48) and that `HbaCmdHeader`'s `cfl` accessor reads/writes the low 5 bits of byte 0 while the `w` (write) accessor is bit 6 (`tests::cmd_table_layout`, `tests::cmd_header_bitfields`).
 
 ### A.4 — ATA opcode + H2D-FIS command encoders
 
@@ -72,10 +72,10 @@
 **Why it matters:** the H2D Register FIS is the single command channel to the drive — the `fis_type = 0x27` byte is validated by QEMU's `ich9-ahci` and every real HBA (a zero/wrong type makes the HBA reject the command), and an LBA byte split error or a missing C-bit yields a misaddressed transfer or a control update the drive ignores; encoding it once in a host-tested function (with `fis_type = 0x27`, `device = 1 << 6` LBA48, and the C-bit hard-wired) guarantees every command in Track C is well-formed, and `parse_identify` is where capacity/LBA48/flush-capability and the logical sector size come from to size the block device.
 
 **Acceptance:**
-- [ ] Host test asserts every encoder sets the FIS type byte: `encode_rw_fis(..).fis_type == 0x27`, `encode_identify_fis().fis_type == 0x27`, `encode_flush_fis().fis_type == 0x27` (`kernel_core::storage::ata::tests::fis_type_is_h2d`).
-- [ ] Host test asserts `encode_rw_fis(false, 0x01_0203_0405, 8)` produces `command == 0x25`, `device == 0x40`, `lba0..lba5 == [0x05,0x04,0x03,0x02,0x01,0x00]`, `countl == 8`, `counth == 0`, and the C-bit set; the `write=true` variant sets `command == 0x35`; a `sectors == 0` call is rejected/`debug_assert`-guarded (or its `0==65536` semantics documented) (`tests::rw_fis_lba48_split`, `tests::rw_fis_rejects_zero_count`).
-- [ ] Host test asserts `encode_identify_fis().command == 0xEC` and `encode_flush_fis().command == 0xEA` with the C-bit set and zero PRDT-bearing fields (non-data) (`tests::identify_fis`, `tests::flush_fis_is_non_data`).
-- [ ] Host test: `parse_identify` over a synthetic 256-word IDENTIFY block returns the LBA48 sector count assembled from words 100–103, `has_flush_ext = true` when the command-set bit is set, and `logical_sector_bytes == 512` for a block whose **word 106** indicates standard 512-byte sectors (QEMU `ide-hd`); computed capacity = `lba48_sectors * logical_sector_bytes` (`tests::parse_identify_capacity`, `tests::parse_identify_default_512`).
+- [x] Host test asserts every encoder sets the FIS type byte: `encode_rw_fis(..).fis_type == 0x27`, `encode_identify_fis().fis_type == 0x27`, `encode_flush_fis().fis_type == 0x27` (`kernel_core::storage::ata::tests::fis_type_is_h2d`).
+- [x] Host test asserts `encode_rw_fis(false, 0x01_0203_0405, 8)` produces `command == 0x25`, `device == 0x40`, `lba0..lba5 == [0x05,0x04,0x03,0x02,0x01,0x00]`, `countl == 8`, `counth == 0`, and the C-bit set; the `write=true` variant sets `command == 0x35`; a `sectors == 0` call is rejected/`debug_assert`-guarded (or its `0==65536` semantics documented) (`tests::rw_fis_lba48_split`, `tests::rw_fis_rejects_zero_count`).
+- [x] Host test asserts `encode_identify_fis().command == 0xEC` and `encode_flush_fis().command == 0xEA` with the C-bit set and zero PRDT-bearing fields (non-data) (`tests::identify_fis`, `tests::flush_fis_is_non_data`).
+- [x] Host test: `parse_identify` over a synthetic 256-word IDENTIFY block returns the LBA48 sector count assembled from words 100–103, `has_flush_ext = true` when the command-set bit is set, and `logical_sector_bytes == 512` for a block whose **word 106** indicates standard 512-byte sectors (QEMU `ide-hd`); computed capacity = `lba48_sectors * logical_sector_bytes` (`tests::parse_identify_capacity`, `tests::parse_identify_default_512`).
 
 ### A.5 — Free command-slot allocator over `PxSACT | PxCI` + NCS bound
 
@@ -84,9 +84,9 @@
 **Why it matters:** AHCI completion is "the slot's `PxCI` bit auto-clears" and a command may be issued only on a free slot (`PxSACT | PxCI` bit clear); pinning the slot scan and the NCS bound in host-tested pure functions makes the issue/reap loop in C.1 correct by construction and forward-compatible with NCQ (the same scan over `PxSACT` is what NCQ needs), exactly as the Redox `slot()` and OSDev `find_cmdslot` references do.
 
 **Acceptance:**
-- [ ] Host test: `ncs_from_cap` returns `32` for the QEMU CAP value (`NCS` field == 31) and the correct count for a synthetic CAP with `NCS = 0` → `1` (`kernel_core::storage::ahci::tests::ncs_from_cap`).
-- [ ] Host test: `find_free_slot(0, 0, 32)` returns `Some(0)`; with slots 0–2 busy in `ci` it returns `Some(3)`; with all `ncs` slots busy it returns `None`; a slot `>= ncs` is never returned (`tests::find_free_slot`).
-- [ ] Host test: `cmd_complete(ci, slot, is)` is `true` only when the slot bit is clear in `ci` and `is & PX_IS_TFES == 0`; an error bit set returns `false` even with `PxCI` clear (`tests::cmd_complete_requires_no_error`).
+- [x] Host test: `ncs_from_cap` returns `32` for the QEMU CAP value (`NCS` field == 31) and the correct count for a synthetic CAP with `NCS = 0` → `1` (`kernel_core::storage::ahci::tests::ncs_from_cap`).
+- [x] Host test: `find_free_slot(0, 0, 32)` returns `Some(0)`; with slots 0–2 busy in `ci` it returns `Some(3)`; with all `ncs` slots busy it returns `None`; a slot `>= ncs` is never returned (`tests::find_free_slot`).
+- [x] Host test: `cmd_complete(ci, slot, is)` is `true` only when the slot bit is clear in `ci` and `is & PX_IS_TFES == 0`; an error bit set returns `false` even with `PxCI` clear (`tests::cmd_complete_requires_no_error`).
 
 ### A.6 — Device-signature classifier
 
@@ -95,9 +95,9 @@
 **Why it matters:** the driver must drive only `SIG_ATA` ports and skip port multipliers / SEMB / ATAPI (out of 1.0 scope); classifying from `PxSIG` is the dispatch point, and `PxSIG` is only valid after FRE is enabled (the QEMU model returns `0xFFFFFFFF` until then), so the classifier folds in the presence check and the `is_driveable` gate keeps an enclosure/PM device on a real backplane from wedging bring-up.
 
 **Acceptance:**
-- [ ] Host test: `classify_signature(0x0000_0101) == Sata`, `0xEB14_0101 == Satapi`, `0x9669_0101 == PortMultiplier`, `0xC33C_0101 == Semb`, `0xFFFF_FFFF == Unknown(..)` (`kernel_core::storage::ahci::tests::classify_signature`).
-- [ ] Host test: `classify_port(0x113, 0x0000_0101) == Sata` (DET=3 present) but `classify_port(0x000, 0x0000_0101) == None` (no device) (`tests::classify_port_requires_present`).
-- [ ] Host test: `is_driveable(Sata) == true` and `is_driveable` is `false` for `Satapi`/`PortMultiplier`/`Semb`/`None`/`Unknown(..)` (`tests::only_sata_is_driveable`).
+- [x] Host test: `classify_signature(0x0000_0101) == Sata`, `0xEB14_0101 == Satapi`, `0x9669_0101 == PortMultiplier`, `0xC33C_0101 == Semb`, `0xFFFF_FFFF == Unknown(..)` (`kernel_core::storage::ahci::tests::classify_signature`).
+- [x] Host test: `classify_port(0x113, 0x0000_0101) == Sata` (DET=3 present) but `classify_port(0x000, 0x0000_0101) == None` (no device) (`tests::classify_port_requires_present`).
+- [x] Host test: `is_driveable(Sata) == true` and `is_driveable` is `false` for `Satapi`/`PortMultiplier`/`Semb`/`None`/`Unknown(..)` (`tests::only_sata_is_driveable`).
 
 ---
 
