@@ -28,7 +28,9 @@ use driver_runtime::ipc::EndpointCap;
 #[cfg(not(test))]
 use driver_runtime::ipc::block::{BlkReply, BlockServer};
 #[cfg(not(test))]
-use driver_runtime::{DeviceCapKey, DeviceHandle, Mmio};
+use driver_runtime::{DeviceCapKey, DeviceHandle, DriverRuntimeError, Mmio};
+#[cfg(not(test))]
+use kernel_core::device_host::DeviceHostError;
 #[cfg(not(test))]
 use kernel_core::driver_ipc::block::{
     BLK_READ, BLK_STATUS, BLK_WRITE, BlkReplyHeader, BlkRequestHeader, BlockDriverError,
@@ -119,6 +121,20 @@ fn program_main(_args: &[&str]) -> i32 {
     // early-boot pattern as nvme/hda).
     let device = match DeviceHandle::claim(key) {
         Ok(d) => d,
+        // The controller is already owned (e.g. the D.3 bootstrap instance that
+        // init spawned directly already claimed it, and the service-manager
+        // instance lost the race) or no device is present at the BDF. Both
+        // collapse to "the AHCI controller is not ours to drive" — exit cleanly
+        // (rc 0) so init's on-failure policy does not burn the restart budget.
+        Err(DriverRuntimeError::Device(
+            DeviceHostError::AlreadyClaimed | DeviceHostError::NotClaimed,
+        )) => {
+            write_str(
+                STDOUT_FILENO,
+                "ahci_driver: AHCI controller unavailable (claimed/absent) — exiting cleanly\n",
+            );
+            return 0;
+        }
         Err(_) => {
             write_str(
                 STDOUT_FILENO,

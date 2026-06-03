@@ -245,6 +245,10 @@ struct DeviceSet {
     /// drives the ring-3 `xhci_driver` host-controller bring-up and the
     /// `xhci-bringup-smoke` gate.
     xhci: bool,
+    /// Attach an `ich9-ahci` SATA controller and route the data disk to it
+    /// (instead of virtio-blk) via an `ide-hd`. Set via `--device ahci`. Phase
+    /// 82: drives the ring-3 `ahci_driver` bring-up + `RemoteBlockDevice` mount.
+    ahci: bool,
 }
 
 /// Parse `--device <name>` and `--iommu` flags out of `args`, returning the
@@ -361,9 +365,10 @@ fn apply_device_flag(name: &str, devices: &mut DeviceSet) -> Result<(), String> 
         "igb" => devices.igb = true,
         "audio" => devices.audio = true,
         "xhci" => devices.xhci = true,
+        "ahci" => devices.ahci = true,
         other => {
             return Err(format!(
-                "unknown `--device` value `{other}` (supported: nvme, e1000, e1000e, igb, audio, xhci)"
+                "unknown `--device` value `{other}` (supported: nvme, e1000, e1000e, igb, audio, xhci, ahci)"
             ));
         }
     }
@@ -590,6 +595,15 @@ fn main() {
                 std::process::exit(1);
             });
             cmd_hda_smoke(&smoke_args);
+        }
+        Some("ahci-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("ahci-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_ahci_smoke(&smoke_args);
         }
         Some("session-smoke") => {
             let smoke_args =
@@ -826,7 +840,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio|xhci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio|xhci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio|xhci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -4599,9 +4613,31 @@ fn qemu_args_with_devices_resolved(
     ]);
 
     // Phase 24: virtio-blk data disk.
+    // Phase 82: `--device ahci` routes the data disk to an `ich9-ahci` SATA
+    // controller (via an `ide-hd`) instead of virtio-blk, so the ring-3
+    // `ahci_driver` becomes the `RemoteBlockDevice` backing the data disk. The
+    // three-object chain is mandatory: `-drive if=none` (so QEMU does not
+    // auto-wire it to a legacy IDE controller) + the `ich9-ahci` controller +
+    // the `ide-hd` glued to `bus=ahci.0`.
     let data_disk = uefi_image.parent().unwrap().join("disk.img");
     if data_disk.exists() {
-        if devices.iommu {
+        if devices.ahci {
+            args.extend([
+                "-device".to_string(),
+                if devices.iommu {
+                    "ich9-ahci,id=ahci,addr=0x7".to_string()
+                } else {
+                    "ich9-ahci,id=ahci".to_string()
+                },
+                "-drive".to_string(),
+                format!(
+                    "file={},if=none,id=ahcidisk0,format=raw",
+                    data_disk.display()
+                ),
+                "-device".to_string(),
+                "ide-hd,drive=ahcidisk0,bus=ahci.0".to_string(),
+            ]);
+        } else if devices.iommu {
             let data_disk_addr = if devices.nvme { "0x5" } else { "0x4" };
             args.extend([
                 "-drive".to_string(),
@@ -8950,6 +8986,7 @@ fn cmd_xhci_bringup_smoke(args: &SmokeBootArgs) {
     };
     let devices = DeviceSet {
         xhci: true,
+        ahci: false,
         ..DeviceSet::default()
     };
     let mut qemu_args = qemu_args_with_devices(&uefi_image, &ovmf, display_mode, devices);
@@ -9063,6 +9100,7 @@ fn cmd_xhci_enum_smoke(args: &SmokeBootArgs) {
     };
     let devices = DeviceSet {
         xhci: true,
+        ahci: false,
         ..DeviceSet::default()
     };
     let mut qemu_args = qemu_args_with_devices(&uefi_image, &ovmf, display_mode, devices);
@@ -9193,6 +9231,7 @@ fn cmd_usb_smoke(args: &SmokeBootArgs) {
 
     let devices = DeviceSet {
         xhci: true,
+        ahci: false,
         ..DeviceSet::default()
     };
     let mut qemu_args =
@@ -9761,6 +9800,183 @@ fn cmd_hda_smoke(args: &SmokeBootArgs) {
             std::process::exit(SMOKE_EXIT_WAV_SILENT);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 82 — ahci-smoke: AHCI/SATA controller + ide-hd end-to-end gate.
+// ---------------------------------------------------------------------------
+
+/// Serial steps the `ahci-smoke` gate asserts: kernel boot, then the ring-3
+/// `ahci_driver`'s binding boot-self-test sentinel set against a blank scratch
+/// disk (IDENTIFY → WRITE DMA EXT → read-back byte-compare → FLUSH CACHE EXT →
+/// IDENTIFY-after-write), then the server-ready marker.
+fn ahci_smoke_steps() -> Vec<SmokeStep> {
+    vec![
+        SmokeStep::Wait {
+            pattern: "[m3os] Hello from kernel",
+            timeout_secs: 30,
+            label: "guest/ahci: kernel first message",
+        },
+        // The driver enumerates the HBA, brings up the SATA port through the
+        // engine stop/start ordering, and IDENTIFYs the disk.
+        SmokeStep::Wait {
+            pattern: "AHCI_SMOKE:identify:PASS",
+            timeout_secs: 90,
+            label: "guest/ahci: IDENTIFY DEVICE ok",
+        },
+        // WRITE DMA EXT (single + multi-block via one PRDT).
+        SmokeStep::Wait {
+            pattern: "AHCI_SMOKE:write:PASS",
+            timeout_secs: 30,
+            label: "guest/ahci: WRITE DMA EXT ok",
+        },
+        // The load-bearing assertion: the written pattern reads back byte-equal.
+        SmokeStep::Wait {
+            pattern: "AHCI_SMOKE:readback:PASS",
+            timeout_secs: 30,
+            label: "guest/ahci: read-back byte-compare equal",
+        },
+        // FLUSH CACHE EXT (0xEA, PRDTL=0) for write durability.
+        SmokeStep::Wait {
+            pattern: "AHCI_SMOKE:flush:PASS",
+            timeout_secs: 30,
+            label: "guest/ahci: FLUSH CACHE EXT durable",
+        },
+        // IDENTIFY again — the named IDENTIFY-after-write step.
+        SmokeStep::Wait {
+            pattern: "AHCI_SMOKE:identify2:PASS",
+            timeout_secs: 30,
+            label: "guest/ahci: IDENTIFY after write ok",
+        },
+        // The driver registers ahci.block and is about to enter the server loop.
+        SmokeStep::Wait {
+            pattern: "AHCI_SMOKE:server:READY",
+            timeout_secs: 30,
+            label: "guest/ahci: ahci.block server ready",
+        },
+    ]
+}
+
+/// QEMU args for the AHCI smoke: the normal virtio-blk data disk stays the root
+/// filesystem, and a **blank scratch disk** is attached to an `ich9-ahci`
+/// controller via an `ide-hd` so the driver runs its destructive boot
+/// self-test (no MBR on the scratch disk → the smoke path). The three-object
+/// chain (`ich9-ahci` controller + `-drive if=none` backend + `ide-hd`) is
+/// mandatory; `if=none` keeps QEMU from auto-wiring the drive to legacy IDE.
+fn ahci_smoke_qemu_args(
+    scratch_img: &Path,
+    uefi_image: &Path,
+    ovmf: &Path,
+    display: bool,
+) -> Vec<String> {
+    let display_mode = if display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(uefi_image, ovmf, display_mode, DeviceSet::default());
+    // Strip the hostfwd rules so parallel CI lanes do not collide on host
+    // ports 2222/2323 (same approach as `cmd_device_smoke` / `hda-smoke`).
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    qemu_args.extend([
+        "-device".to_string(),
+        "ich9-ahci,id=ahci".to_string(),
+        "-drive".to_string(),
+        format!(
+            "file={},if=none,id=ahcidisk0,format=raw",
+            scratch_img.display()
+        ),
+        "-device".to_string(),
+        "ide-hd,drive=ahcidisk0,bus=ahci.0".to_string(),
+    ]);
+    qemu_args
+}
+
+/// Run the AHCI smoke (model on `cmd_hda_smoke`).
+fn cmd_ahci_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    // Recreate the virtio-blk data disk (root filesystem) fresh.
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+
+    // Create a fresh, zeroed 64 MiB AHCI scratch disk. A blank LBA 0 (no MBR
+    // boot signature) is what tells the driver this is a scratch disk and makes
+    // it run the destructive write/read/flush self-test rather than a partition
+    // probe — so the smoke never touches the real data disk.
+    let scratch_img = uefi_image.parent().unwrap().join("ahci-scratch.img");
+    let _ = fs::remove_file(&scratch_img);
+    {
+        let f =
+            File::create(&scratch_img).unwrap_or_else(|e| panic!("create AHCI scratch image: {e}"));
+        f.set_len(64 * 1024 * 1024)
+            .unwrap_or_else(|e| panic!("size AHCI scratch image: {e}"));
+    }
+
+    let ovmf = find_ovmf();
+    let qemu_args = ahci_smoke_qemu_args(&scratch_img, &uefi_image, &ovmf, args.display);
+    let steps = ahci_smoke_steps();
+
+    println!(
+        "ahci-smoke: launching QEMU with ich9-ahci + ide-hd scratch disk (timeout {}s)",
+        args.timeout_secs
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!(
+                "ahci-smoke: serial script PASSED ({} steps in {elapsed}s)",
+                steps.len()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("ahci-smoke: FAILED\n{msg}");
+            std::process::exit(1);
+        }
+    }
+
+    // Bare-metal/VFIO-only items QEMU's `ich9-ahci` cannot exercise (it leaves
+    // CAP2.BOH=0 / CAP.SSS=0 and has no real SATA timing). Printed as a
+    // skip-with-reason, mirroring `wifi-smoke`/`multi-nic-smoke`.
+    println!(
+        "ahci-smoke: SKIP (bare-metal/VFIO-only): BIOS/OS handoff (CAP2.BOH=0 on QEMU), \
+         staggered spin-up (CAP.SSS=0), COMRESET timing, and a real completion interrupt are \
+         validated on hardware via VFIO passthrough — see docs/82-ahci-sata.md."
+    );
 }
 
 /// Build the QEMU arg vector for the audio smoke.
@@ -16688,6 +16904,7 @@ fn regression_tests() -> Vec<RegressionTest> {
                 kvm: false,
                 memory_mib: None,
                 xhci: false,
+                ahci: false,
             },
             wants_debug_crash_marker: false,
             wants_readback_marker: false,
@@ -16727,6 +16944,7 @@ fn regression_tests() -> Vec<RegressionTest> {
                 kvm: false,
                 memory_mib: None,
                 xhci: false,
+                ahci: false,
             },
             wants_debug_crash_marker: false,
             wants_readback_marker: false,
@@ -16763,6 +16981,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             kvm: false,
             memory_mib: None,
             xhci: false,
+            ahci: false,
         },
         wants_debug_crash_marker: false,
         wants_readback_marker: false,
@@ -16796,6 +17015,7 @@ fn regression_tests() -> Vec<RegressionTest> {
                 kvm: false,
                 memory_mib: None,
                 xhci: false,
+                ahci: false,
             },
             wants_debug_crash_marker: false,
             wants_readback_marker: false,
@@ -20010,6 +20230,7 @@ mod tests {
                 kvm: true,
                 memory_mib: Some(4096),
                 xhci: false,
+                ahci: false,
             },
             None,
         );
@@ -20069,6 +20290,7 @@ mod tests {
                 kvm: false,
                 memory_mib: None,
                 xhci: false,
+                ahci: false,
             },
         );
         assert!(
@@ -20102,6 +20324,7 @@ mod tests {
                 kvm: false,
                 memory_mib: None,
                 xhci: false,
+                ahci: false,
             },
             Some(fake_nvme),
         );
@@ -20130,6 +20353,76 @@ mod tests {
         );
     }
 
+    // Phase 82 E.1 — `--device ahci` flag parsing + QEMU arg emission.
+
+    #[test]
+    fn apply_device_flag_accepts_ahci() {
+        let mut devices = DeviceSet::default();
+        apply_device_flag("ahci", &mut devices).expect("ahci is a supported --device value");
+        assert!(devices.ahci, "--device ahci must set DeviceSet::ahci");
+        // No standalone --ahci alias: only the --device <name> form is accepted.
+        // The error message for an unknown value lists ahci among supported names.
+        let mut d2 = DeviceSet::default();
+        let err = apply_device_flag("bogus", &mut d2).expect_err("unknown value must error");
+        assert!(
+            err.contains("ahci"),
+            "the supported-values error message must list ahci, got: {err}"
+        );
+    }
+
+    #[test]
+    fn qemu_args_with_ahci_routes_data_disk_to_ich9_ahci() {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // The AHCI data-disk routing only fires when disk.img exists, so create
+        // a hermetic temp workspace with a zero-length disk.img marker.
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_root = std::env::temp_dir().join(format!("m3os-xtask-ahci-{unique}"));
+        fs::create_dir_all(&temp_root).unwrap();
+        let uefi = temp_root.join("boot-uefi-m3os.img");
+        fs::write(&uefi, b"").unwrap();
+        fs::write(temp_root.join("disk.img"), b"").unwrap();
+
+        let args = qemu_args_with_devices_resolved(
+            &uefi,
+            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
+            QemuDisplayMode::Headless,
+            DeviceSet {
+                ahci: true,
+                ..Default::default()
+            },
+            None,
+        );
+
+        // Exactly the three-object AHCI chain.
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-device", "ich9-ahci,id=ahci"]),
+            "expected -device ich9-ahci,id=ahci"
+        );
+        assert!(
+            args.iter()
+                .any(|a| a.contains("if=none,id=ahcidisk0,format=raw")),
+            "expected the AHCI backing drive with if=none,id=ahcidisk0"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-device", "ide-hd,drive=ahcidisk0,bus=ahci.0"]),
+            "expected -device ide-hd,drive=ahcidisk0,bus=ahci.0"
+        );
+        // The data disk is NOT also attached via virtio-blk when on AHCI.
+        assert!(
+            !args.iter().any(|a| a.contains("if=virtio")),
+            "the data disk must move off virtio-blk when routed to AHCI"
+        );
+
+        fs::remove_dir_all(&temp_root).ok();
+    }
+
     #[test]
     fn qemu_args_with_iommu_pin_driver_sentinel_slots() {
         let fake_nvme = Path::new("/tmp/m3os-test-nvme-iommu-never-created.img");
@@ -20147,6 +20440,7 @@ mod tests {
                 kvm: false,
                 memory_mib: None,
                 xhci: false,
+                ahci: false,
             },
             Some(fake_nvme),
         );
@@ -20192,6 +20486,7 @@ mod tests {
                 kvm: false,
                 memory_mib: None,
                 xhci: false,
+                ahci: false,
             },
             Some(Path::new("/tmp/m3os-test-nvme-rootdisk-never-created.img")),
         );
@@ -20249,6 +20544,7 @@ mod tests {
                 kvm: false,
                 memory_mib: None,
                 xhci: false,
+                ahci: false,
             },
             None,
         );
@@ -20311,6 +20607,7 @@ mod tests {
                 kvm: false,
                 memory_mib: None,
                 xhci: false,
+                ahci: false,
             },
             None,
         );
@@ -20346,6 +20643,7 @@ mod tests {
                 kvm: false,
                 memory_mib: None,
                 xhci: false,
+                ahci: false,
             },
             None,
         );
@@ -20573,6 +20871,7 @@ mod tests {
             kvm: false,
             memory_mib: None,
             xhci: false,
+            ahci: false,
         });
         let iommu = device_smoke_steps(DeviceSet {
             nvme: true,
@@ -20584,6 +20883,7 @@ mod tests {
             kvm: false,
             memory_mib: None,
             xhci: false,
+            ahci: false,
         });
 
         assert_eq!(smoke_step_labels(&iommu), smoke_step_labels(&base));
