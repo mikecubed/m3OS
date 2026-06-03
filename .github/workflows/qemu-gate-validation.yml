@@ -1,0 +1,93 @@
+name: QEMU Gate Validation (trial)
+
+# Trial workflow to measure whether the headless QEMU gates run reliably enough
+# on GitHub's TCG runners (no KVM) to gate PRs. Each gate is an INDEPENDENT
+# matrix leg with `fail-fast: false`, so one flaky/failing gate does not mask
+# the others — every run yields a per-gate pass/fail sample. Timeouts are
+# deliberately generous (vs. build.yml's tight 90s lanes) to separate "genuine
+# failure / hang" from "TCG-slowness vs. a tight timeout". A non-IOMMU
+# device-smoke leg isolates whether the IOMMU path is the culprit.
+#
+# Trigger it repeatedly via `gh workflow run qemu-gate-validation.yml
+# --ref ci/qemu-gate-validation` to accumulate a reliability distribution.
+# This file is a trial; it is NOT wired into the PR merge gate.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qemu-gate:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: smoke-test
+            cmd: "smoke-test --timeout 600"
+          - id: regression
+            cmd: "regression --timeout 180"
+          - id: device-nvme-no-iommu
+            cmd: "device-smoke --device nvme --timeout 150"
+          - id: device-nvme-iommu
+            cmd: "device-smoke --device nvme --iommu --timeout 180"
+          - id: device-e1000-iommu
+            cmd: "device-smoke --device e1000 --iommu --timeout 180"
+    name: "gate:${{ matrix.id }}"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          targets: x86_64-unknown-linux-musl
+          components: rustfmt, clippy, rust-src
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 ovmf musl-tools qemu-utils e2fsprogs
+
+      - name: Cargo cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: TCC build cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            target/tcc-src
+            target/tcc-staging
+          key: ${{ runner.os }}-tcc-${{ hashFiles('xtask/src/main.rs') }}
+          restore-keys: ${{ runner.os }}-tcc-
+
+      - name: Fetch Nerd Font asset
+        run: cargo xtask fetch-fonts
+
+      - name: "Run gate: cargo xtask ${{ matrix.cmd }}"
+        run: |
+          # Force a fresh data disk so a stale cached image cannot mask a
+          # build/boot regression (mirrors build.yml's smoke-test recipe).
+          rm -f target/x86_64-unknown-none/release/disk.img || true
+          cargo xtask ${{ matrix.cmd }}
+
+      - name: Upload serial/regression artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: gate-${{ matrix.id }}-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            target/regression/
+          retention-days: 7
+          if-no-files-found: ignore
