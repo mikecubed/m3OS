@@ -4,12 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**m3OS** (technical name: `m3os`) is a bootable microkernel OS in Rust: x86_64, UEFI boot, kernel **v0.81.0**. Ring 0 handles memory, scheduling, IPC/capabilities, interrupt routing, and in-kernel drivers; ring 3 hosts everything else.
+**m3OS** (technical name: `m3os`) is a bootable microkernel OS in Rust: x86_64, UEFI boot, kernel **v0.82.0**. Ring 0 handles memory, scheduling, IPC/capabilities, interrupt routing, and in-kernel drivers; ring 3 hosts everything else.
 
 Capabilities now present in the tree:
 
 - **Userspace**: init (PID 1), shell (sh0) + ion, coreutils, multi-user (login/su/passwd/adduser), editor, service manager, PTY, telnet/SSH servers, crypto.
-- **Networking & storage**: IPv4/TCP/UDP stack, AF_UNIX sockets, NVMe + modern NIC ring-3 drivers — Intel e1000 (82540EM), e1000e/igb/igc and Realtek RTL8111/8168 (r8169) + RTL8125 2.5G — with device-ID matching over a bounded multi-NIC registry, on a VirtIO baseline.
+- **Networking & storage**: IPv4/TCP/UDP stack, AF_UNIX sockets, NVMe + AHCI/SATA ring-3 block drivers (single-queue, IOMMU-routed command list/FIS/PRDT, FLUSH-CACHE-EXT durability, presenting as `RemoteBlockDevice` over the shared block protocol — a SATA disk mounts the root off `ahci.block`) and modern NIC ring-3 drivers — Intel e1000 (82540EM), e1000e/igb/igc and Realtek RTL8111/8168 (r8169) + RTL8125 2.5G — with device-ID matching over a bounded multi-NIC registry, on a VirtIO baseline.
 - **Wireless**: ring-3 MediaTek mt792x Wi-Fi driver (MT7921/MT7922 connac2, MT7925 in the same registry) — firmware-blob download, WM MCU command ring, WFDMA TX/RX rings, soft-MAC 802.11 mgmt FSM + WPA2-PSK 4-way handshake (host crypto in `wifi-core`/`crypto-lib`) with chipset CCMP offload, presenting as an L2 `RemoteNic`; no QEMU mt76 model, so logic is host-tested and the radio is VFIO/bare-metal validated.
 - **IOMMU substrate**: ACPI DMAR/IVRS parsing, per-device VT-d / AMD-Vi domains, IOMMU-routed `DmaBuffer<T>`, fault ISRs, VT-d queued invalidation.
 - **Ring-3 driver hosting**: capability-gated device-host syscalls, supervised userspace NVMe/e1000 with `RemoteBlockDevice`/`RemoteNic` facades.
@@ -35,7 +35,7 @@ cargo xtask run-gui      # build + launch in QEMU (GUI with framebuffer)
 cargo xtask run-gui --fresh  # same, but recreate data disk first
 cargo xtask image        # build bootable disk image (UEFI raw + VHDX)
 cargo xtask image --sign # build + sign EFI binary for Secure Boot
-cargo xtask check        # clippy (-D warnings) + rustfmt + host tests for kernel-core, passwd, driver_runtime, audio_client, audio_server, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, wifi-core, mt792x_driver, m3ctl
+cargo xtask check        # clippy (-D warnings) + rustfmt + host tests for kernel-core (incl. storage::{ahci,ata}), passwd, driver_runtime, audio_client, audio_server, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, wifi-core, mt792x_driver, ahci_driver, m3ctl
 cargo xtask fmt --fix    # auto-format all workspace source
 cargo xtask test         # run all kernel tests in QEMU via ISA debug exit
 cargo xtask test --test <name>  # run a single QEMU test binary
@@ -107,6 +107,7 @@ This sets `core.hooksPath` to `.githooks/`. **pre-commit** runs `cargo xtask che
 | `multi-nic-smoke` (e1000 + e1000e + igb arms) | `M3OS_MULTI_NIC_REGRESSION=1` |
 | `hda-smoke` (`-device intel-hda -device hda-duplex`, non-silent WAV) | `M3OS_HDA_REGRESSION=1` |
 | `wifi-smoke` (no QEMU mt76 model — skip-with-reason; radio validated via VFIO) | `M3OS_WIFI_REGRESSION=1` |
+| `ahci-smoke` (`-device ich9-ahci` + scratch `ide-hd`; IDENTIFY/write/read-back-compare/flush/IDENTIFY-after-write/induced-TFES-recovery; BOHC/SSS/hot-plug skip-with-reason on QEMU, validated via VFIO) **and** `ahci-root-smoke` (real ext2 data disk routed to AHCI; asserts the root mounts off `ahci.block` end-to-end — virtio root absent → driver MBR/ext2 probe → owner-gate accept → `init: / mounted (ext2 via ring-3 ahci.block)` → login prompt) | `M3OS_AHCI_REGRESSION=1` |
 
 The `tls-smoke`/`dns-smoke` gates assert the musl-built smoke stage actually
 `PASS`ed rather than `SKIP`ped — a `SKIP` means the musl cross-compiler was

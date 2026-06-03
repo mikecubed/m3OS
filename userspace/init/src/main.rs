@@ -57,12 +57,12 @@ fn alloc_error(_layout: Layout) -> ! {
 // ---------------------------------------------------------------------------
 
 // `KNOWN_CONFIGS` below lists the service paths (Phase 73's 25 + the 78a/78b/78c
-// USB driver configs + Phase 80 `ac97_driver`/`hda_driver`). The fallback loader
-// (`load_services_from_known_configs`) and the dir-scan path both stop adding
-// services once `self.count >= MAX_SERVICES`, so the ceiling must exceed the
-// number of `.conf` files actually present (the ext2 staging now writes 31) or
-// the last entries are silently dropped. Sized with headroom for future
-// additions; the extra slots cost a few hundred bytes.
+// USB driver configs + Phase 80 `ac97_driver`/`hda_driver` + Phase 82
+// `ahci_driver`). The fallback loader (`load_services_from_known_configs`) and
+// the dir-scan path both stop adding services once `self.count >= MAX_SERVICES`,
+// so the ceiling must exceed the number of `.conf` files actually present (the
+// ext2 staging now writes 32) or the last entries are silently dropped. Sized
+// with headroom for future additions; the extra slots cost a few hundred bytes.
 const MAX_SERVICES: usize = 34;
 const MAX_DISCOVERED_DISABLED: usize = 24;
 const MAX_PIDS: usize = 64;
@@ -224,6 +224,8 @@ const KNOWN_CONFIGS: &[&[u8]] = &[
     b"/etc/services.d/ac97.conf\0",
     // Phase 80b: hda_driver — out-of-process Intel HDA hardware driver.
     b"/etc/services.d/hda.conf\0",
+    // Phase 82: ahci_driver — out-of-process AHCI/SATA storage hardware driver.
+    b"/etc/services.d/ahci_driver.conf\0",
     // Phase 72b — `term.conf` is staged only in smoke-test mode (or
     // when `M3OS_LEGACY_TERM_CONF=1` is passed to `xtask`). In default
     // GUI mode and graphical-only mode, `term` is launched via the
@@ -2556,6 +2558,65 @@ fn spawn_smoke_runner() -> i32 {
     pid as i32
 }
 
+/// Phase 82 D.3 bootstrap: when the initial ext2-root mount fails because the
+/// data disk is behind a ring-3 block driver (e.g. `cargo xtask run --device
+/// ahci` routes the data disk to an AHCI controller served by `/drivers/ahci`),
+/// spawn the AHCI storage driver directly from the ramdisk and retry the mount.
+///
+/// The driver brings up the HBA + first SATA port and registers `ahci.block`;
+/// the kernel's MBR probe then routes sector-0 reads through the block facade
+/// to it. The driver exits cleanly when no AHCI controller is present, so this
+/// is a harmless no-op on a normal virtio-blk root (where the first mount
+/// already succeeded and this path is never reached). Returns `0` if the retry
+/// mount succeeded, the negative errno of the last failed mount otherwise.
+#[allow(clippy::manual_c_str_literals)]
+fn bootstrap_ring3_root_disk() -> isize {
+    const AHCI_DRIVER_PATH: &[u8] = b"/drivers/ahci\0";
+    let pid = fork();
+    if pid == 0 {
+        // Child: exec the AHCI driver. It runs the HBA/port bring-up, registers
+        // ahci.block, and enters its block server loop (never returns).
+        let envp: [*const u8; 5] = [
+            ENV_PATH.as_ptr(),
+            ENV_HOME.as_ptr(),
+            ENV_TERM.as_ptr(),
+            ENV_EDITOR.as_ptr(),
+            core::ptr::null(),
+        ];
+        let argv: [*const u8; 2] = [AHCI_DRIVER_PATH.as_ptr(), core::ptr::null()];
+        // execve only returns on failure; log the negative errno (matching
+        // spawn_login/spawn_smoke_runner) so a missing or non-executable
+        // /drivers/ahci binary is diagnosable from the boot log.
+        let ret = execve(AHCI_DRIVER_PATH, &argv, &envp);
+        write_str(STDOUT_FILENO, "init: /drivers/ahci execve failed (");
+        write_u64(STDOUT_FILENO, (-ret) as u64);
+        write_str(STDOUT_FILENO, ")\n");
+        exit(1);
+    }
+    if pid < 0 {
+        write_str(STDOUT_FILENO, "init: failed to fork /drivers/ahci\n");
+        // Propagate fork()'s negative errno rather than flattening it to -1, so
+        // the failure is diagnosable and matches this function's documented
+        // "negative errno ... otherwise" contract.
+        return pid;
+    }
+    // Retry the mount up to 40 × 100 ms = 4 s, giving the driver time to reset
+    // the HBA, bring up the port (COMRESET), IDENTIFY the disk, and register
+    // ahci.block. Bring-up takes well under a second on QEMU; the headroom
+    // covers a slow bare-metal COMRESET.
+    let mut ret: isize = -19; // -ENODEV
+    let mut attempts = 0u32;
+    while attempts < 40 {
+        let _ = nanosleep_for(0, 100_000_000); // 100 ms
+        ret = mount(b"/dev/blk0\0".as_ptr(), b"/\0".as_ptr(), b"ext2\0".as_ptr());
+        if ret == 0 {
+            return 0;
+        }
+        attempts += 1;
+    }
+    ret
+}
+
 fn smoke_test_mode_enabled() -> bool {
     let fd = open(SMOKE_MODE_PATH, O_RDONLY, 0);
     if fd < 0 {
@@ -2651,6 +2712,25 @@ pub extern "C" fn _start() -> ! {
         write_str(STDOUT_FILENO, "init: / mount failed (");
         write_u64(STDOUT_FILENO, (-ret) as u64);
         write_str(STDOUT_FILENO, ")\n");
+        // Phase 82 D.3: the data disk may be behind a ring-3 AHCI driver
+        // (`--device ahci`). Spawn `/drivers/ahci` and retry the mount before
+        // falling back to the ramdisk built-in defaults. No-op on a virtio-blk
+        // root (the first mount already succeeded, so this branch is skipped).
+        write_str(
+            STDOUT_FILENO,
+            "init: retrying ext2 root via ring-3 storage driver (ahci)\n",
+        );
+        if bootstrap_ring3_root_disk() == 0 {
+            write_str(
+                STDOUT_FILENO,
+                "init: / mounted (ext2 via ring-3 ahci.block)\n",
+            );
+        } else {
+            write_str(
+                STDOUT_FILENO,
+                "init: ring-3 root retry failed — continuing with ramdisk defaults\n",
+            );
+        }
     }
 
     // Make /tmp world-writable.

@@ -80,6 +80,8 @@ members = [
     "userspace/drivers/ac97",
     # Phase 80b — ring-3 Intel HDA out-of-process audio hardware driver
     "userspace/drivers/hda",
+    # Phase 82 — ring-3 AHCI/SATA out-of-process storage hardware driver
+    "userspace/drivers/ahci",
     # Phase 81 — userspace Wi-Fi management plane + WPA2-PSK supplicant library
     "userspace/wifi-core",
     # Phase 81 — ring-3 MediaTek mt792x Wi-Fi device-host driver
