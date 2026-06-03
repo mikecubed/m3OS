@@ -1,20 +1,22 @@
-name: QEMU Gate Validation (trial)
+name: QEMU Gate Reliability (manual)
 
-# Trial workflow to measure whether the headless QEMU gates run reliably enough
-# on GitHub's TCG runners (no KVM) to gate PRs. Each gate is an INDEPENDENT
-# matrix leg with `fail-fast: false`, so one flaky/failing gate does not mask
-# the others — every run yields a per-gate pass/fail sample. Timeouts are
-# deliberately generous (vs. build.yml's tight 90s lanes) to separate "genuine
-# failure / hang" from "TCG-slowness vs. a tight timeout". A non-IOMMU
-# device-smoke leg isolates whether the IOMMU path is the culprit.
+# On-demand harness to measure whether a headless QEMU gate runs reliably
+# enough on GitHub's TCG runners (no KVM) before wiring it into the PR merge
+# gate. Each gate is an INDEPENDENT matrix leg with `fail-fast: false`, so one
+# flaky gate does not mask the others — every run yields a clean per-gate
+# pass/fail sample. (This is how the NVMe device-smoke MSI-X bug was isolated:
+# the non-IOMMU vs. IOMMU legs proved the IOMMU path was not the trigger.)
+# Timeouts are deliberately generous to separate a genuine failure/hang from
+# TCG-slowness against a tight timeout.
 #
-# Trigger it repeatedly via `gh workflow run qemu-gate-validation.yml
-# --ref ci/qemu-gate-validation` to accumulate a reliability distribution.
-# This file is a trial; it is NOT wired into the PR merge gate.
+# The PR merge gate itself is pr.yml's `qemu-gates` job; this workflow is NOT
+# part of it and does NOT run on `pull_request` (that would duplicate the
+# coverage with extra parallel legs on every PR). Run it on demand to build a
+# reliability distribution — e.g. when onboarding a new gate:
+#   gh workflow run qemu-gate-validation.yml --ref <branch>
+#   gh run list --workflow=qemu-gate-validation.yml --limit 5
 
 on:
-  pull_request:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
