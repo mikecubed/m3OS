@@ -1,0 +1,30 @@
+[package]
+name = "ahci_driver"
+version = "0.82.0"
+edition = "2024"
+description = "Phase 82 — ring-3 AHCI/SATA storage hardware driver (out-of-process RemoteBlockDevice)."
+
+# The library target exposes the driver-internal modules + the host-testable
+# request-sizing / completion-decision helpers for host-side tests on
+# x86_64-unknown-linux-gnu without the OS binary's _start symbol. (The
+# authoritative register/struct/FIS/slot/classifier logic lives in
+# kernel-core::storage; this crate's modules are production register-poking.)
+[lib]
+name = "ahci_driver"
+path = "src/lib.rs"
+
+# The binary defines _start via syscall_lib::entry_point!. Gate it on
+# "os-binary" so `cargo test --target x86_64-unknown-linux-gnu` skips the
+# [[bin]] target; xtask adds --features os-binary for the OS image.
+[features]
+os-binary = []
+
+[[bin]]
+name = "ahci_driver"
+path = "src/main.rs"
+required-features = ["os-binary"]
+
+[dependencies]
+driver_runtime = { path = "../../lib/driver_runtime" }
+syscall-lib = { path = "../../syscall-lib", features = ["alloc"] }
+kernel-core = { path = "../../../kernel-core", default-features = false }

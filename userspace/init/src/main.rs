@@ -224,6 +224,8 @@ const KNOWN_CONFIGS: &[&[u8]] = &[
     b"/etc/services.d/ac97.conf\0",
     // Phase 80b: hda_driver — out-of-process Intel HDA hardware driver.
     b"/etc/services.d/hda.conf\0",
+    // Phase 82: ahci_driver — out-of-process AHCI/SATA storage hardware driver.
+    b"/etc/services.d/ahci_driver.conf\0",
     // Phase 72b — `term.conf` is staged only in smoke-test mode (or
     // when `M3OS_LEGACY_TERM_CONF=1` is passed to `xtask`). In default
     // GUI mode and graphical-only mode, `term` is launched via the

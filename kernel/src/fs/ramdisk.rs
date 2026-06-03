@@ -204,6 +204,8 @@ static E1000_DRIVER_ELF: &[u8] = generated_initrd_asset!("e1000_driver");
 static AC97_DRIVER_ELF: &[u8] = generated_initrd_asset!("ac97_driver");
 // Phase 80b: ring-3 Intel HDA out-of-process audio hardware driver.
 static HDA_DRIVER_ELF: &[u8] = generated_initrd_asset!("hda_driver");
+// Phase 82: ring-3 AHCI/SATA out-of-process storage hardware driver.
+static AHCI_DRIVER_ELF: &[u8] = generated_initrd_asset!("ahci_driver");
 // Phase 79: ring-3 modern NIC drivers (Intel e1000e/igb/igc, Realtek r8169/r8125).
 static E1000E_DRIVER_ELF: &[u8] = generated_initrd_asset!("e1000e_driver");
 static IGB_DRIVER_ELF: &[u8] = generated_initrd_asset!("igb_driver");
@@ -1241,6 +1243,17 @@ static DRIVERS_ENTRIES: &[(&str, RamdiskNode)] = &[
         "hda_driver",
         RamdiskNode::File {
             content: HDA_DRIVER_ELF,
+        },
+    ),
+    // Phase 82: ring-3 AHCI/SATA driver → /drivers/ahci. Lives under
+    // `/drivers/` so `is_authorized_driver_process` accepts its
+    // `sys_device_claim` for the class-0x010601 AHCI controller, and so the
+    // `blk::remote` cold-path owner-trust gate authorizes its `ahci.block`
+    // registration.
+    (
+        "ahci",
+        RamdiskNode::File {
+            content: AHCI_DRIVER_ELF,
         },
     ),
     // Phase 78a Track B.2: ring-3 xHCI driver. Lives under `/drivers/` so

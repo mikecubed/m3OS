@@ -93,14 +93,15 @@ pub fn register(endpoint_name: &str, device_name: &str) -> Result<(), ()> {
 /// `true` when a remote driver is installed and ready.
 ///
 /// On the cold path (no endpoint cached yet) performs a one-shot lookup of
-/// `"nvme.block"` in the IPC service registry.  If the ring-3 NVMe driver
-/// has published its endpoint under that name **and** the publishing task
-/// is a supervised driver process, the facade installs it and returns
-/// `true` — so the block dispatch layer immediately starts routing through
-/// the ring-3 path without any explicit boot-time wiring call.
+/// `"nvme.block"` and then `"ahci.block"` in the IPC service registry.  If a
+/// ring-3 NVMe **or** AHCI/SATA driver has published its endpoint under one of
+/// those names **and** the publishing task is a supervised driver process, the
+/// facade installs it and returns `true` — so the block dispatch layer
+/// immediately starts routing through the ring-3 path without any explicit
+/// boot-time wiring call. `"nvme.block"` is preferred when both are present.
 ///
 /// **Owner gate:** the auto-registration only fires when the owner of the
-/// `nvme.block` service registration is a trusted driver process — its
+/// `nvme.block` / `ahci.block` service registration is a trusted driver process — its
 /// `exec_path` must live under `/drivers/` (the same prefix
 /// `sys_device_claim` uses to authorize PCI claims). An arbitrary ring-3
 /// task that grabs the name first is ignored: `ipc_register_service`
@@ -135,11 +136,20 @@ pub fn is_registered() -> bool {
     if crate::blk::virtio_blk::VIRTIO_BLK_READY.load(core::sync::atomic::Ordering::Acquire) {
         return false;
     }
-    // Cold path — attempt a one-shot service-registry lookup *with owner*.
-    let (ep, owner_task_id) = match registry::lookup_endpoint_with_owner("nvme.block") {
-        Some(pair) => pair,
-        None => return false,
-    };
+    // Cold path — attempt a one-shot service-registry lookup *with owner*. A
+    // trusted `/drivers/` process may publish either `"nvme.block"` (Phase 55b
+    // NVMe) or `"ahci.block"` (Phase 82 AHCI/SATA); whichever a trusted driver
+    // registered first wins. This is the one scoped data-path kernel change the
+    // AHCI phase makes (Phase 82 D.2) — the analog of Phase 81's
+    // `default_route_index_by_link`.
+    let (service_name, device_name, ep, owner_task_id) =
+        match registry::lookup_endpoint_with_owner("nvme.block") {
+            Some((ep, owner)) => ("nvme.block", "nvme0", ep, owner),
+            None => match registry::lookup_endpoint_with_owner("ahci.block") {
+                Some((ep, owner)) => ("ahci.block", "ahci0", ep, owner),
+                None => return false,
+            },
+        };
     // Owner gate: reject registrations from processes that are not
     // supervised drivers. `owner == 0` (kernel-registered) is treated as
     // trusted so the boot-time wiring path still works.
@@ -147,8 +157,9 @@ pub fn is_registered() -> bool {
         // Log once per cold-path miss so a spoofed registration is
         // visible in the boot log without spamming every VFS call.
         log::warn!(
-            "[blk::remote] ignoring 'nvme.block' registration from untrusted \
+            "[blk::remote] ignoring '{}' registration from untrusted \
              task_id={} (not a /drivers/ process)",
+            service_name,
             owner_task_id
         );
         return false;
@@ -156,12 +167,14 @@ pub fn is_registered() -> bool {
     let mut g = REMOTE_BLOCK.lock();
     // Guard against a race where two callers both hit the cold path.
     if !g.state.is_registered() {
-        g.state.register("nvme0");
+        g.state.register(device_name);
         g.endpoint = Some(ep);
         REMOTE_BLOCK_REGISTERED.store(true, Ordering::Release);
         log::info!(
-            "[blk::remote] auto-registered ring-3 NVMe driver via service \
-             registry ('nvme.block' → endpoint {:?}, owner task_id={})",
+            "[blk::remote] auto-registered ring-3 '{}' driver via service \
+             registry ({} → endpoint {:?}, owner task_id={})",
+            device_name,
+            service_name,
             ep,
             owner_task_id
         );

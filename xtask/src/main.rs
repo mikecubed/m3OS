@@ -75,6 +75,10 @@ const USERSPACE_LIB_HOST_TEST_PACKAGES: &[(&str, &[&str])] = &[
     ("ac97_driver", &[]),
     // Phase 80b: hda_driver lib host build (logic is host-tested in kernel_core::hda).
     ("hda_driver", &[]),
+    // Phase 82: ahci_driver lib host tests (request-sizing + issue/await
+    // completion decision over the kernel_core::storage::ahci predicates). The
+    // authoritative register/struct/FIS logic is host-tested in kernel_core::storage.
+    ("ahci_driver", &[]),
     // Phase 81: userspace Wi-Fi mgmt plane + WPA2-PSK supplicant (mgmt/fsm/eapol/
     // kdf/control/config) — the primary correctness gate since QEMU has no mt76.
     ("wifi-core", &[]),
@@ -985,6 +989,9 @@ fn build_userspace_bins() {
         ("ac97_driver", "ac97_driver", true),
         // Phase 80b: ring-3 Intel HDA out-of-process audio hardware driver.
         ("hda_driver", "hda_driver", true),
+        // Phase 82: ring-3 AHCI/SATA out-of-process storage hardware driver
+        // (`needs_alloc = true` for driver_runtime + kernel-core deps).
+        ("ahci_driver", "ahci_driver", true),
         // Phase 55b Track F.3b: NVMe crash-and-restart end-to-end smoke
         // client. No alloc dependency — syscall_lib only.
         ("nvme-crash-smoke", "nvme-crash-smoke", false),
@@ -1182,6 +1189,8 @@ fn build_userspace_bins() {
             // so the [[bin]] target is skipped on host-test builds.
             "ac97_driver" => &["--features", "os-binary"],
             "hda_driver" => &["--features", "os-binary"],
+            // Phase 82: ahci_driver uses the same lib/bin os-binary split.
+            "ahci_driver" => &["--features", "os-binary"],
             _ => &[],
         };
 
@@ -13775,6 +13784,13 @@ fn populate_ext2_files(
     // machine the ac97 driver serves `audio.hw` instead.
     let hda_driver_conf = "name=hda_driver\ncommand=/drivers/hda_driver\ntype=daemon\nrestart=on-failure\nmax_restart=3\n";
 
+    // Phase 82 — ring-3 AHCI/SATA out-of-process storage hardware driver. Same
+    // supervised-driver shape as nvme: no `depends=` (the device-host substrate
+    // is kernel-internal init), restart=on-failure max_restart=5. Exits cleanly
+    // (rc 0) when no AHCI controller is present, so a non-SATA machine is fine.
+    let ahci_driver_conf =
+        "name=ahci_driver\ncommand=/drivers/ahci\ntype=daemon\nrestart=on-failure\nmax_restart=5\n";
+
     // Phase 56 Track C.1: ring-3 display server (compositor) scaffold.
     // Depends on `kbd` so input arrives before the compositor binds the
     // framebuffer.  restart=on-failure mirrors the driver shape: supervised
@@ -14131,6 +14147,7 @@ fn populate_ext2_files(
     let usb_hid_conf_tmp = output_dir.join("_tmp_usb_hid_conf");
     let ac97_driver_conf_tmp = output_dir.join("_tmp_ac97_driver_conf");
     let hda_driver_conf_tmp = output_dir.join("_tmp_hda_driver_conf");
+    let ahci_driver_conf_tmp = output_dir.join("_tmp_ahci_driver_conf");
     let display_server_conf_tmp = output_dir.join("_tmp_display_server_conf");
     let session_manager_conf_tmp = output_dir.join("_tmp_session_manager_conf");
     let audio_server_conf_tmp = output_dir.join("_tmp_audio_server_conf");
@@ -14173,6 +14190,7 @@ fn populate_ext2_files(
     fs::write(&usb_hid_conf_tmp, usb_hid_conf).expect("write temp usb-hid.conf");
     fs::write(&ac97_driver_conf_tmp, ac97_driver_conf).expect("write temp ac97.conf");
     fs::write(&hda_driver_conf_tmp, hda_driver_conf).expect("write temp hda.conf");
+    fs::write(&ahci_driver_conf_tmp, ahci_driver_conf).expect("write temp ahci_driver.conf");
     fs::write(&display_server_conf_tmp, display_server_conf)
         .expect("write temp display_server.conf");
     fs::write(&session_manager_conf_tmp, session_manager_conf)
@@ -14770,6 +14788,10 @@ fn populate_ext2_files(
          sif etc/services.d/hda.conf mode 0x81A4\n\
          sif etc/services.d/hda.conf uid 0\n\
          sif etc/services.d/hda.conf gid 0\n\
+         write \"{ahci_driver_conf}\" etc/services.d/ahci_driver.conf\n\
+         sif etc/services.d/ahci_driver.conf mode 0x81A4\n\
+         sif etc/services.d/ahci_driver.conf uid 0\n\
+         sif etc/services.d/ahci_driver.conf gid 0\n\
          write \"{display_server_conf}\" etc/services.d/display_server.conf\n\
          sif etc/services.d/display_server.conf mode 0x81A4\n\
          sif etc/services.d/display_server.conf uid 0\n\
@@ -14826,6 +14848,7 @@ fn populate_ext2_files(
         usb_hid_conf = usb_hid_conf_tmp.display(),
         ac97_driver_conf = ac97_driver_conf_tmp.display(),
         hda_driver_conf = hda_driver_conf_tmp.display(),
+        ahci_driver_conf = ahci_driver_conf_tmp.display(),
         display_server_conf = display_server_conf_tmp.display(),
         session_manager_conf = session_manager_conf_tmp.display(),
         audio_server_conf = audio_server_conf_tmp.display(),
