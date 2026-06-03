@@ -10,6 +10,7 @@ extern crate alloc;
 pub mod asymmetric;
 pub mod hash;
 pub mod random;
+pub mod sha1;
 pub mod symmetric;
 
 /// Error type for cryptographic operations.

@@ -1103,7 +1103,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.80.0"
+version = "0.81.0"
 dependencies = [
  "bootloader_api",
  "kernel-core",
@@ -1245,6 +1245,7 @@ version = "0.57.0"
 dependencies = [
  "kernel-core",
  "syscall-lib",
+ "wifi-core",
 ]
 
 [[package]]
@@ -1297,6 +1298,16 @@ version = "0.56.0"
 dependencies = [
  "kernel-core",
  "syscall-lib",
+]
+
+[[package]]
+name = "mt792x_driver"
+version = "0.1.0"
+dependencies = [
+ "driver_runtime",
+ "kernel-core",
+ "syscall-lib",
+ "wifi-core",
 ]
 
 [[package]]
@@ -2539,6 +2550,13 @@ name = "whoami"
 version = "0.1.0"
 dependencies = [
  "syscall-lib",
+]
+
+[[package]]
+name = "wifi-core"
+version = "0.1.0"
+dependencies = [
+ "crypto-lib",
 ]
 
 [[package]]

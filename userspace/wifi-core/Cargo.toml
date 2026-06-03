@@ -1,0 +1,16 @@
+[package]
+name = "wifi-core"
+version = "0.1.0"
+edition = "2024"
+
+# Phase 81 — userspace 802.11 management plane + WPA2-PSK supplicant.
+# `#![no_std] + alloc`, host-tested like `crypto-lib`. Depends on `crypto-lib`
+# for the WPA2 KDF/MIC/key-wrap primitives. NOT in `kernel-core` (which cannot
+# depend on `crypto-lib`).
+
+[lib]
+name = "wifi_core"
+path = "src/lib.rs"
+
+[dependencies]
+crypto-lib = { path = "../crypto-lib", features = ["alloc"] }

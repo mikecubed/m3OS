@@ -332,3 +332,15 @@ if [ "${M3OS_HDA_REGRESSION:-0}" = "1" ]; then
         exit 1
     fi
 fi
+
+# Phase 81 — opt-in Wi-Fi regression gate. There is NO QEMU mt76 device model,
+# so `wifi-smoke` is a skip-with-reason diagnostic (always exits 0); the radio
+# path is validated on real hardware via VFIO passthrough
+# (scripts/mt792x-vfio-validate.md). The real CI coverage is the
+# kernel-core/wifi-core/crypto-lib/mt792x_driver host tests under
+# `cargo xtask check`. Set M3OS_WIFI_REGRESSION=1 to surface the reminder; no
+# exit-on-failure guard is needed because the gate cannot fail here.
+if [ "${M3OS_WIFI_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask wifi-smoke..."
+    cargo xtask wifi-smoke
+fi

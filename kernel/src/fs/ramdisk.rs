@@ -210,6 +210,8 @@ static IGB_DRIVER_ELF: &[u8] = generated_initrd_asset!("igb_driver");
 static IGC_DRIVER_ELF: &[u8] = generated_initrd_asset!("igc_driver");
 static R8169_DRIVER_ELF: &[u8] = generated_initrd_asset!("r8169_driver");
 static R8125_DRIVER_ELF: &[u8] = generated_initrd_asset!("r8125_driver");
+// Phase 81: ring-3 MediaTek mt792x Wi-Fi driver.
+static MT792X_DRIVER_ELF: &[u8] = generated_initrd_asset!("mt792x_driver");
 // Phase 78a Track B.2: ring-3 xHCI USB host-controller driver.
 static XHCI_DRIVER_ELF: &[u8] = generated_initrd_asset!("xhci_driver");
 // Phase 78b Track B: ring-3 USB hub class driver.
@@ -1205,6 +1207,13 @@ static DRIVERS_ENTRIES: &[(&str, RamdiskNode)] = &[
         "r8125",
         RamdiskNode::File {
             content: R8125_DRIVER_ELF,
+        },
+    ),
+    // Phase 81: ring-3 MediaTek mt792x Wi-Fi driver → /drivers/mt792x.
+    (
+        "mt792x",
+        RamdiskNode::File {
+            content: MT792X_DRIVER_ELF,
         },
     ),
     // Phase 63 driver-host fix: audio_server is a ring-3 driver and must

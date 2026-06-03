@@ -100,6 +100,131 @@ pub fn aes256_ctr_decrypt(
     aes256_ctr_encrypt(key, nonce, ciphertext, output)
 }
 
+// ── AES Key-Wrap / RFC 3394 (AES-128-KW) ────────────────────────────────────
+//
+// no software AES-CCM — CCMP is chipset-offloaded; the host only key-wraps/unwraps the GTK.
+//
+// Reuses the `aes` crate already in the dependency tree (for `Aes128`).
+// The `alloc` feature is required because the output length is dynamic.
+
+#[cfg(feature = "alloc")]
+pub use kw::aes_key_unwrap;
+#[cfg(feature = "alloc")]
+pub use kw::aes_key_wrap;
+
+#[cfg(feature = "alloc")]
+mod kw {
+    use aes::Aes128;
+    use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit, generic_array::GenericArray};
+
+    use crate::CryptoError;
+
+    /// RFC 3394 §2.2.1 default IV.
+    const IV: [u8; 8] = [0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6];
+
+    /// Wrap `key` with the 128-bit key-encryption key `kek` (RFC 3394 §2.2.1).
+    ///
+    /// `key.len()` must be a multiple of 8 and at least 16; otherwise
+    /// `Err(CryptoError::InvalidLength)` is returned. A malformed KDE (or a
+    /// future caller bug) must not panic the whole driver/process, so this
+    /// returns a `CryptoError` rather than asserting — mirroring
+    /// [`aes_key_unwrap`] and the rest of `crypto-lib`.
+    /// On success returns a `Vec<u8>` of length `key.len() + 8`.
+    pub fn aes_key_wrap(kek: &[u8; 16], key: &[u8]) -> Result<alloc::vec::Vec<u8>, CryptoError> {
+        if key.len() < 16 || !key.len().is_multiple_of(8) {
+            return Err(CryptoError::InvalidLength);
+        }
+
+        let n = key.len() / 8; // number of 64-bit blocks
+        let cipher = Aes128::new(GenericArray::from_slice(kek));
+
+        // Initialise: A = IV, R[1..n] = key split into 8-byte blocks.
+        let mut a = u64::from_be_bytes(IV);
+        let mut r: alloc::vec::Vec<u64> = (0..n)
+            .map(|i| u64::from_be_bytes(key[i * 8..(i + 1) * 8].try_into().unwrap()))
+            .collect();
+
+        // 6 wrapping rounds.
+        for j in 0..6u64 {
+            for (i, ri) in r.iter_mut().enumerate() {
+                // B = AES(A || R[i])
+                let mut block = [0u8; 16];
+                block[..8].copy_from_slice(&a.to_be_bytes());
+                block[8..].copy_from_slice(&ri.to_be_bytes());
+                let mut ga = GenericArray::from(block);
+                cipher.encrypt_block(&mut ga);
+
+                // A = MSB(64, B) XOR t  where  t = n*j + (i+1)
+                let t = (n as u64) * j + (i as u64 + 1);
+                a = u64::from_be_bytes(ga[..8].try_into().unwrap()) ^ t;
+                *ri = u64::from_be_bytes(ga[8..].try_into().unwrap());
+            }
+        }
+
+        // Output: A || R[1] || … || R[n]
+        let mut out = alloc::vec::Vec::with_capacity(8 + key.len());
+        out.extend_from_slice(&a.to_be_bytes());
+        for ri in r {
+            out.extend_from_slice(&ri.to_be_bytes());
+        }
+        Ok(out)
+    }
+
+    /// Unwrap a wrapped key produced by [`aes_key_wrap`] (RFC 3394 §2.2.2).
+    ///
+    /// Returns `Err(CryptoError::InvalidLength)` if `wrapped.len()` is not a
+    /// multiple of 8, less than 24, or otherwise malformed.
+    /// Returns `Err(CryptoError::AuthenticationFailed)` if the integrity check
+    /// value does not match `A6A6A6A6A6A6A6A6`.
+    pub fn aes_key_unwrap(
+        kek: &[u8; 16],
+        wrapped: &[u8],
+    ) -> Result<alloc::vec::Vec<u8>, CryptoError> {
+        if wrapped.len() < 24 || !wrapped.len().is_multiple_of(8) {
+            return Err(CryptoError::InvalidLength);
+        }
+
+        let n = (wrapped.len() / 8) - 1; // number of plaintext 64-bit blocks
+        let cipher = Aes128::new(GenericArray::from_slice(kek));
+
+        // Initialise: A = wrapped[0], R[1..n] = rest.
+        let mut a = u64::from_be_bytes(wrapped[..8].try_into().unwrap());
+        let mut r: alloc::vec::Vec<u64> = (0..n)
+            .map(|i| u64::from_be_bytes(wrapped[(i + 1) * 8..(i + 2) * 8].try_into().unwrap()))
+            .collect();
+
+        // 6 unwrapping rounds (reverse order).
+        for j in (0..6u64).rev() {
+            for (rev_i, ri) in r.iter_mut().rev().enumerate() {
+                // Original forward index: i = n - 1 - rev_i
+                let i = n - 1 - rev_i;
+                let t = (n as u64) * j + (i as u64 + 1);
+                // B = AES_inv((A XOR t) || R[i])
+                let mut block = [0u8; 16];
+                block[..8].copy_from_slice(&(a ^ t).to_be_bytes());
+                block[8..].copy_from_slice(&ri.to_be_bytes());
+                let mut ga = GenericArray::from(block);
+                cipher.decrypt_block(&mut ga);
+
+                a = u64::from_be_bytes(ga[..8].try_into().unwrap());
+                *ri = u64::from_be_bytes(ga[8..].try_into().unwrap());
+            }
+        }
+
+        // Verify the integrity check value.
+        if a.to_be_bytes() != IV {
+            return Err(CryptoError::AuthenticationFailed);
+        }
+
+        // Serialise output.
+        let mut out = alloc::vec::Vec::with_capacity(n * 8);
+        for ri in r {
+            out.extend_from_slice(&ri.to_be_bytes());
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,6 +322,65 @@ mod tests {
         let mut pt = [0u8; 64];
         aes256_ctr_decrypt(&key, &nonce, &ct[..plaintext.len()], &mut pt).unwrap();
         assert_eq!(&pt[..plaintext.len()], plaintext);
+    }
+
+    // ── AES Key-Wrap (RFC 3394) tests — require alloc feature ──────────────
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn aes_kw_rfc3394() {
+        // RFC 3394 §4.1 — 128-bit KEK, 128-bit key data.
+        // KEK  = 000102030405060708090A0B0C0D0E0F
+        // PT   = 00112233445566778899AABBCCDDEEFF
+        // CT   = 1FA68B0A8112B447AEF34BD8FB5A7B829D3E862371D2CFE5
+        let kek: [u8; 16] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+            0x0E, 0x0F,
+        ];
+        let key_data: [u8; 16] = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
+            0xEE, 0xFF,
+        ];
+        let expected_wrapped: [u8; 24] = [
+            0x1F, 0xA6, 0x8B, 0x0A, 0x81, 0x12, 0xB4, 0x47, 0xAE, 0xF3, 0x4B, 0xD8, 0xFB, 0x5A,
+            0x7B, 0x82, 0x9D, 0x3E, 0x86, 0x23, 0x71, 0xD2, 0xCF, 0xE5,
+        ];
+
+        let wrapped = aes_key_wrap(&kek, &key_data).expect("16-byte key wraps");
+        assert_eq!(
+            wrapped.as_slice(),
+            &expected_wrapped[..],
+            "RFC 3394 §4.1 wrap"
+        );
+
+        let unwrapped = aes_key_unwrap(&kek, &wrapped).unwrap();
+        assert_eq!(
+            unwrapped.as_slice(),
+            &key_data[..],
+            "RFC 3394 §4.1 unwrap round-trip"
+        );
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn aes_kw_rejects_tampered() {
+        let kek: [u8; 16] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+            0x0E, 0x0F,
+        ];
+        let key_data: [u8; 16] = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
+            0xEE, 0xFF,
+        ];
+        let mut wrapped = aes_key_wrap(&kek, &key_data).expect("16-byte key wraps");
+        // Flip one byte of the wrapped blob.
+        wrapped[5] ^= 0xFF;
+        let result = aes_key_unwrap(&kek, &wrapped);
+        assert_eq!(
+            result,
+            Err(CryptoError::AuthenticationFailed),
+            "tampered blob must be rejected"
+        );
     }
 
     #[test]

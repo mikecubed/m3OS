@@ -84,6 +84,49 @@ pub enum ParsedVerb {
     /// new lockscreen exiting immediately when it cannot register the
     /// singleton `"lockscreen"` IPC service name.
     LockScreen,
+    /// Phase 81 (D.2) — `m3ctl wifi status`. The binary looks up the
+    /// `wifi.control` service the mt792x driver exposes, sends a
+    /// `WIFI_STATUS` query over the userspace Wi-Fi control protocol
+    /// (`wifi_core::control`), and prints the associated SSID, RSSI, and
+    /// assigned IPv4 — or "not associated" when no link is up.
+    WifiStatus,
+}
+
+/// Service-registry name of the mt792x Wi-Fi driver's userspace control
+/// endpoint (Phase 81 D.2). The scan/connect/status protocol flows
+/// driver ↔ `m3ctl` here, never through the kernel `RemoteNic` facade.
+pub const WIFI_CONTROL_SERVICE_NAME: &str = "wifi.control";
+
+/// Message printed by `m3ctl wifi status` when the driver reports it is not
+/// associated (or no Wi-Fi driver is present).
+pub const WIFI_NOT_ASSOCIATED_MSG: &str = "wifi: not associated";
+
+/// Render a [`wifi_core::control::WifiStatus`] into the human-readable lines
+/// `m3ctl wifi status` prints. Pure + host-tested (`wifi_status_format`).
+pub fn format_wifi_status(status: &wifi_core::control::WifiStatus) -> String {
+    use alloc::string::ToString;
+    let ssid = match core::str::from_utf8(&status.ssid) {
+        Ok(s) if !s.is_empty() => s,
+        _ => "(hidden)",
+    };
+    let mut out = String::new();
+    out.push_str("wifi: associated\n");
+    out.push_str("  ssid: ");
+    out.push_str(ssid);
+    out.push('\n');
+    out.push_str("  signal: ");
+    out.push_str(&status.rssi.to_string());
+    out.push_str(" dBm\n");
+    out.push_str("  ipv4: ");
+    out.push_str(&status.ipv4[0].to_string());
+    out.push('.');
+    out.push_str(&status.ipv4[1].to_string());
+    out.push('.');
+    out.push_str(&status.ipv4[2].to_string());
+    out.push('.');
+    out.push_str(&status.ipv4[3].to_string());
+    out.push('\n');
+    out
 }
 
 /// Parser-level error. Variants are *data*; callers `match` to surface
@@ -144,6 +187,12 @@ pub fn parse_verb(verb: &str, args: &[&str]) -> Result<ParsedVerb, ParseError> {
         // command so it works on any boot mode without extending the
         // wire protocol.
         "lock" => Ok(ParsedVerb::LockScreen),
+        // Phase 81 (D.2) — `m3ctl wifi status` (read-only diagnostics).
+        "wifi" => match args.first().copied() {
+            Some("status") => Ok(ParsedVerb::WifiStatus),
+            Some(_) => Err(ParseError::BadArgument("wifi: only `status` is supported")),
+            None => Err(ParseError::MissingArgument("wifi: expected `status`")),
+        },
         // Phase 56 — display control verbs.
         "version" => Ok(ParsedVerb::Display(ControlCommand::Version)),
         "list-surfaces" => Ok(ParsedVerb::Display(ControlCommand::ListSurfaces)),

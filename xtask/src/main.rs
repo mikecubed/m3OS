@@ -35,7 +35,13 @@ const USERSPACE_LIB_HOST_TEST_PACKAGES: &[(&str, &[&str])] = &[
     ("audio_client", &[]),
     ("audio_server", &[]),
     ("surface_buffer", &[]),
-    ("crypto-lib", &[]),
+    // Enable `alloc` so the RFC 3394 AES-Key-Wrap conformance vector
+    // (`aes_kw_rfc3394`) and the integrity-tamper rejection test
+    // (`aes_kw_rejects_tampered`) run in the merge gate — these gate the
+    // WPA2 GTK-unwrap path against the published standard. The
+    // alloc-gated functions still compile under the default (no-alloc)
+    // build; only the conformance assertions live behind the feature.
+    ("crypto-lib", &["--features", "alloc"]),
     ("term", &["--lib"]),
     // Phase 63a Track A — pure-logic mixer with C-ABI surface
     ("audio_mixer", &[]),
@@ -69,6 +75,15 @@ const USERSPACE_LIB_HOST_TEST_PACKAGES: &[(&str, &[&str])] = &[
     ("ac97_driver", &[]),
     // Phase 80b: hda_driver lib host build (logic is host-tested in kernel_core::hda).
     ("hda_driver", &[]),
+    // Phase 81: userspace Wi-Fi mgmt plane + WPA2-PSK supplicant (mgmt/fsm/eapol/
+    // kdf/control/config) — the primary correctness gate since QEMU has no mt76.
+    ("wifi-core", &[]),
+    // Phase 81: mt792x driver lib host tests (select_mt792x + io rewrite/EAPOL
+    // demux + fw_proto opcode/decode pinning).
+    ("mt792x_driver", &[]),
+    // Phase 57 I.2 + Phase 81 D.2: m3ctl verb parser + `wifi status` codec.
+    // Default features (NOT `os-binary`) so the host `#[cfg(test)]` path builds.
+    ("m3ctl", &[]),
 ];
 
 /// QEMU arguments enabling an emulated Intel VT-d IOMMU on the q35 machine.
@@ -499,6 +514,9 @@ fn main() {
         Some("multi-nic-smoke") => {
             cmd_multi_nic_smoke();
         }
+        Some("wifi-smoke") => {
+            cmd_wifi_smoke();
+        }
         Some("device-smoke") => {
             let device_smoke_args = parse_device_smoke_args(&args[2..]).unwrap_or_else(|err| {
                 eprintln!("Error: {err}");
@@ -858,9 +876,45 @@ fn ensure_generated_libs_dir(root: &Path) -> PathBuf {
 /// Phase 20 init + shell. Each is compiled for `x86_64-unknown-none`
 /// (statically linked, no libc) in release mode. The resulting ELF files
 /// are embedded in the kernel's ramdisk via `include_bytes!`.
+/// Phase 81 (Task A.8): stage the MediaTek mt792x Wi-Fi firmware blobs.
+///
+/// The blobs are MediaTek "Redistributable" firmware (license recorded in
+/// `docs/legal/firmware-licenses.md`); their bytes are NOT committed to the
+/// repository. The operator drops the license-cleared blobs under
+/// `kernel/initrd/lib/firmware/mt7961/` (and `mt7922/`, `mt7925/`). This step
+/// reports what was staged and **degrades gracefully** — an absent blob prints a
+/// skip-with-reason and never fails the build (the driver's `firmware_blob()`
+/// returns `None` and emits its `FW_ABSENT_SENTINEL` at runtime). Wiring lands
+/// as code independently of the blob bytes so the F.3 license review is never
+/// bypassed.
+fn stage_wifi_firmware(root: &std::path::Path) {
+    let fw_root = root.join("kernel/initrd/lib/firmware");
+    let mut staged = 0usize;
+    for chip in ["mt7961", "mt7922", "mt7925"] {
+        let dir = fw_root.join(chip);
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()) == Some("bin") {
+                    println!("wifi-firmware: staged {}", p.display());
+                    staged += 1;
+                }
+            }
+        }
+    }
+    if staged == 0 {
+        println!(
+            "wifi-firmware: SKIP — no mt792x firmware blob present under \
+             kernel/initrd/lib/firmware/ (Wi-Fi disabled; the driver degrades \
+             gracefully — see docs/legal/firmware-licenses.md)"
+        );
+    }
+}
+
 fn build_userspace_bins() {
     let root = workspace_root();
     let initrd = ensure_generated_initrd_dir(&root);
+    stage_wifi_firmware(&root);
 
     // (package, binary, needs_alloc)
     let bins: &[(&str, &str, bool)] = &[
@@ -915,6 +969,8 @@ fn build_userspace_bins() {
         ("igc_driver", "igc_driver", true),
         ("r8169_driver", "r8169_driver", true),
         ("r8125_driver", "r8125_driver", true),
+        // Phase 81: ring-3 MediaTek mt792x Wi-Fi driver.
+        ("mt792x_driver", "mt792x_driver", true),
         // Phase 78a Track B.2: ring-3 xHCI USB host-controller driver
         // (`needs_alloc = true` for driver_runtime + kernel-core deps).
         ("xhci_driver", "xhci_driver", true),
@@ -1092,6 +1148,8 @@ fn build_userspace_bins() {
             "e1000e_driver" | "igb_driver" | "igc_driver" | "r8169_driver" | "r8125_driver" => {
                 &["--features", "os-binary"]
             }
+            // Phase 81: mt792x Wi-Fi driver uses the same lib/bin os-binary split.
+            "mt792x_driver" => &["--features", "os-binary"],
             // Phase 57 Track D: audio_server uses the same os-binary
             // gate so the [[bin]] target is skipped on host-test
             // builds (where Scrt1.o would otherwise duplicate _start).
@@ -5055,6 +5113,11 @@ fn cmd_check() {
         "surface_buffer",
         // Phase 76 Track E — dynamic linker (no_std PIE).
         "ld-musl-x86_64-so-1",
+        // NOTE: Phase 81 `wifi-core` / `mt792x_driver` are clippy-checked in a
+        // SEPARATE invocation below — they pull `crypto-lib/alloc`, and cargo's
+        // feature unification in this combined invocation would otherwise turn
+        // `alloc` on for `crypto-lib` in `coreutils-rs` too, breaking its
+        // no-allocator `genkey` bin.
     ];
     let mut clippy_args = vec![
         "clippy".to_string(),
@@ -5077,6 +5140,33 @@ fn cmd_check() {
 
     if !status.success() {
         eprintln!("userspace clippy reported errors");
+        std::process::exit(1);
+    }
+
+    // Phase 81: clippy the Wi-Fi crates in their OWN invocation. They depend on
+    // `crypto-lib/alloc`; isolating them keeps cargo feature unification from
+    // turning `alloc` on for `crypto-lib` in the combined invocation above (which
+    // would break `coreutils-rs`'s no-allocator `genkey` bin).
+    let status = Command::new(env!("CARGO"))
+        .current_dir(&root)
+        .args([
+            "clippy",
+            "--package",
+            "wifi-core",
+            "--package",
+            "mt792x_driver",
+            "--target",
+            "x86_64-unknown-none",
+            "-Zbuild-std=core,compiler_builtins,alloc",
+            "-Zbuild-std-features=compiler-builtins-mem",
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .status()
+        .expect("failed to run Phase 81 Wi-Fi clippy");
+    if !status.success() {
+        eprintln!("wifi-core / mt792x_driver clippy reported errors");
         std::process::exit(1);
     }
 
@@ -5252,7 +5342,7 @@ fn cmd_check() {
     doom_c_test_step(&root);
 
     println!(
-        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, ac97_driver, hda_driver, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, shadow, and ldso_core host tests pass; doom platform-layer C tests pass"
+        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, ac97_driver, hda_driver, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, shadow, ldso_core, wifi-core, mt792x_driver, and m3ctl host tests pass; doom platform-layer C tests pass"
     );
 }
 
@@ -8458,6 +8548,45 @@ fn qemu_version() -> Option<(u32, u32)> {
 /// `IGB_SMOKE:link:PASS`). igc and all Realtek families have **no QEMU model**
 /// (QEMU emulates only the RTL8139, a different chip), so they are
 /// skipped-with-reason unless their `M3OS_*_REGRESSION` env var is set.
+/// Phase 81 (Task E.2) — Wi-Fi smoke gate. **Skip-with-reason by construction:**
+/// there is NO QEMU mt76/mt792x device model at all, so neither the serial smoke
+/// harness nor the QMP/PPM framebuffer harness can exercise the radio. The real
+/// coverage is the `kernel-core`/`wifi-core`/`crypto-lib` host tests (firmware
+/// parsers, MCU/TXD/TLV encoders, ring/descriptor/token math, the 802.11 mgmt
+/// builders + RSN IE, the association FSM, and the entire WPA2 crypto chain),
+/// which `cargo xtask check` runs. This gate must never masquerade as a radio
+/// test; it prints the reason and points at the VFIO runbook.
+///
+/// Without `M3OS_WIFI_REGRESSION=1` it prints the skip reason and exits success.
+/// With the env var set it additionally references the operator VFIO runbook
+/// (`scripts/mt792x-vfio-validate.md`) — real-radio assertions
+/// (`init: driver.registered name=mt792x_driver`, `MT792X_SMOKE:server:READY`,
+/// association) run only on the dev laptop, never in CI/QEMU.
+fn cmd_wifi_smoke() {
+    let opted_in = std::env::var("M3OS_WIFI_REGRESSION").is_ok();
+    if opted_in {
+        println!(
+            "wifi-smoke: mt792x (MediaTek MT7921/MT7922) opted in via \
+             M3OS_WIFI_REGRESSION, but QEMU has no mt76 model — run on real \
+             hardware via VFIO passthrough (see scripts/mt792x-vfio-validate.md). \
+             On the dev laptop expect: `init: driver.registered name=mt792x_driver`, \
+             `MT792X_SMOKE:server:READY`, then association. The kernel-core / \
+             wifi-core / crypto-lib host tests are the CI coverage."
+        );
+    } else {
+        println!(
+            "wifi-smoke: SKIP — no QEMU mt76 model exists; the radio path is \
+             hardware-only. Coverage is the kernel-core/wifi-core/crypto-lib host \
+             tests (firmware parsers, MCU/TXD/TLV encoders, DMA descriptor/token \
+             math, 802.11 mgmt + RSN IE, association FSM, WPA2 PMK/PTK/MIC/GTK). \
+             Set M3OS_WIFI_REGRESSION=1 to acknowledge hardware-only validation \
+             via scripts/mt792x-vfio-validate.md."
+        );
+    }
+    // Skip-with-reason gates always exit success — the assertion is "the host
+    // tests passed", which `cargo xtask check` enforces separately.
+}
+
 fn cmd_multi_nic_smoke() {
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
@@ -13623,6 +13752,8 @@ fn populate_ext2_files(
         "name=igc_driver\ncommand=/drivers/igc\ntype=daemon\nrestart=on-failure\nmax_restart=5\n";
     let r8169_driver_conf = "name=r8169_driver\ncommand=/drivers/r8169\ntype=daemon\nrestart=on-failure\nmax_restart=5\n";
     let r8125_driver_conf = "name=r8125_driver\ncommand=/drivers/r8125\ntype=daemon\nrestart=on-failure\nmax_restart=5\n";
+    // Phase 81: mt792x Wi-Fi driver service definition.
+    let mt792x_driver_conf = "name=mt792x_driver\ncommand=/drivers/mt792x\ntype=daemon\nrestart=on-failure\nmax_restart=5\n";
     // Phase 78a Track B.2 — ring-3 xHCI USB host-controller driver.  Same
     // supervised-driver shape as nvme/e1000: no `depends=` (the device-host
     // substrate is kernel-internal init), restart=on-failure max_restart=5.
@@ -13994,6 +14125,7 @@ fn populate_ext2_files(
     let igc_driver_conf_tmp = output_dir.join("_tmp_igc_driver_conf");
     let r8169_driver_conf_tmp = output_dir.join("_tmp_r8169_driver_conf");
     let r8125_driver_conf_tmp = output_dir.join("_tmp_r8125_driver_conf");
+    let mt792x_driver_conf_tmp = output_dir.join("_tmp_mt792x_driver_conf");
     let xhci_driver_conf_tmp = output_dir.join("_tmp_xhci_driver_conf");
     let usbhub_conf_tmp = output_dir.join("_tmp_usbhub_conf");
     let usb_hid_conf_tmp = output_dir.join("_tmp_usb_hid_conf");
@@ -14035,6 +14167,7 @@ fn populate_ext2_files(
     fs::write(&igc_driver_conf_tmp, igc_driver_conf).expect("write temp igc_driver.conf");
     fs::write(&r8169_driver_conf_tmp, r8169_driver_conf).expect("write temp r8169_driver.conf");
     fs::write(&r8125_driver_conf_tmp, r8125_driver_conf).expect("write temp r8125_driver.conf");
+    fs::write(&mt792x_driver_conf_tmp, mt792x_driver_conf).expect("write temp mt792x_driver.conf");
     fs::write(&xhci_driver_conf_tmp, xhci_driver_conf).expect("write temp xhci_driver.conf");
     fs::write(&usbhub_conf_tmp, usbhub_conf).expect("write temp usbhub.conf");
     fs::write(&usb_hid_conf_tmp, usb_hid_conf).expect("write temp usb-hid.conf");
@@ -14613,6 +14746,10 @@ fn populate_ext2_files(
          sif etc/services.d/r8125_driver.conf mode 0x81A4\n\
          sif etc/services.d/r8125_driver.conf uid 0\n\
          sif etc/services.d/r8125_driver.conf gid 0\n\
+         write \"{mt792x_driver_conf}\" etc/services.d/mt792x_driver.conf\n\
+         sif etc/services.d/mt792x_driver.conf mode 0x81A4\n\
+         sif etc/services.d/mt792x_driver.conf uid 0\n\
+         sif etc/services.d/mt792x_driver.conf gid 0\n\
          write \"{xhci_driver_conf}\" etc/services.d/xhci_driver.conf\n\
          sif etc/services.d/xhci_driver.conf mode 0x81A4\n\
          sif etc/services.d/xhci_driver.conf uid 0\n\
@@ -14683,6 +14820,7 @@ fn populate_ext2_files(
         igc_driver_conf = igc_driver_conf_tmp.display(),
         r8169_driver_conf = r8169_driver_conf_tmp.display(),
         r8125_driver_conf = r8125_driver_conf_tmp.display(),
+        mt792x_driver_conf = mt792x_driver_conf_tmp.display(),
         xhci_driver_conf = xhci_driver_conf_tmp.display(),
         usbhub_conf = usbhub_conf_tmp.display(),
         usb_hid_conf = usb_hid_conf_tmp.display(),

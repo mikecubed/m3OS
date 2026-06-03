@@ -80,6 +80,14 @@ struct NicEntry {
     /// Pending RX frames: raw Ethernet bytes staged by the net-ingress IPC
     /// task and later dispatched by the shared net task.
     rx_queue: VecDeque<alloc::vec::Vec<u8>>,
+    /// Phase 81 (C.3): true when this NIC is a wireless (802.11) adapter. Set
+    /// when the registering driver also advertises the `net.nic.wireless` marker
+    /// service (the mt792x Wi-Fi driver). Wired NICs leave this `false`.
+    is_wireless: bool,
+    /// Phase 81 (C.3): last link state reported via `NET_LINK_STATE`. Drives the
+    /// link/medium-aware default-route selection so a link-up wired NIC is
+    /// preferred over a link-up wireless NIC.
+    link_up: bool,
 }
 
 /// Global slot for the registered `RemoteNic`. `None` while no ring-3 NIC
@@ -154,6 +162,8 @@ impl RemoteNic {
                 mac,
                 tx_queue: VecDeque::new(),
                 rx_queue: VecDeque::new(),
+                is_wireless: false,
+                link_up: false,
             };
             if let Some(slot) = nics.iter_mut().find(|e| e.endpoint == endpoint) {
                 // Same endpoint re-registers — refresh in place.
@@ -249,11 +259,17 @@ impl RemoteNic {
                 // Guard against a concurrent cold-path race — only bootstrap a
                 // primary entry when the registry is still empty.
                 if nics.is_empty() {
+                    // Phase 81 (C.3): a NIC whose endpoint also answers
+                    // `net.nic.wireless` is a wireless adapter (mt792x driver).
+                    let is_wireless =
+                        crate::ipc::registry::lookup_endpoint_id("net.nic.wireless") == Some(ep);
                     nics.push(NicEntry {
                         endpoint: ep,
                         mac: [0u8; 6],
                         tx_queue: VecDeque::new(),
                         rx_queue: VecDeque::new(),
+                        is_wireless,
+                        link_up: false,
                     });
                 }
             }
@@ -631,11 +647,52 @@ impl RemoteNic {
                 event.mac[5],
             );
         }
+        // Phase 81 (C.3): record the link state on the matching NIC entry and
+        // re-evaluate the link/medium-aware default route (wired-up preferred
+        // over wireless-up). A no-op for wired-only boots.
+        {
+            let mut nics = REMOTE_NIC.lock();
+            if let Some(entry) = nics.iter_mut().find(|e| e.mac == event.mac) {
+                entry.link_up = event.up;
+            } else if let Some(entry) = nics.first_mut() {
+                entry.link_up = event.up;
+            }
+        }
+        Self::recompute_default_route();
+
         if !event.up {
             // One-line hook: link-down resets TCP retransmit timers per Phase 16.
             super::tcp::on_link_down();
         }
         crate::net::virtio_net::wake_net_task();
+    }
+
+    /// Phase 81 (C.3): re-order the NIC registry so index 0 (the default route
+    /// the TX hot path uses via `first()`) is the link/medium-preferred NIC —
+    /// first link-up wired, else first link-up wireless. Implemented with the
+    /// host-tested `kernel_core::nic_ids::default_route_index_by_link` helper.
+    ///
+    /// Guarded to a no-op unless a wireless NIC is present, so wired-only and
+    /// single-NIC (QEMU/CI) boots keep their exact prior "first-registered"
+    /// default route — no Phase 77/79 regression.
+    fn recompute_default_route() {
+        use kernel_core::nic_ids::{NicRoute, default_route_index_by_link};
+        let mut nics = REMOTE_NIC.lock();
+        if !nics.iter().any(|e| e.is_wireless) {
+            return; // wired-only / single-NIC: preserve registration order.
+        }
+        let routes: alloc::vec::Vec<NicRoute> = nics
+            .iter()
+            .map(|e| NicRoute {
+                is_wireless: e.is_wireless,
+                link_up: e.link_up,
+            })
+            .collect();
+        if let Some(idx) = default_route_index_by_link(&routes)
+            && idx != 0
+        {
+            nics.swap(0, idx);
+        }
     }
 
     fn ensure_link_event_entry(
@@ -646,15 +703,23 @@ impl RemoteNic {
         {
             let mut nics = REMOTE_NIC.lock();
             if let Some(ep) = fallback_endpoint {
+                // Phase 81 (C.3): a NIC whose endpoint also answers the
+                // `net.nic.wireless` marker service is a wireless adapter (the
+                // mt792x driver registers both `net.nic` and `net.nic.wireless`).
+                let is_wireless =
+                    crate::ipc::registry::lookup_endpoint_id("net.nic.wireless") == Some(ep);
                 if let Some(entry) = nics.first_mut() {
                     entry.endpoint = ep;
                     entry.mac = mac;
+                    entry.is_wireless = is_wireless;
                 } else {
                     nics.push(NicEntry {
                         endpoint: ep,
                         mac,
                         tx_queue: VecDeque::new(),
                         rx_queue: VecDeque::new(),
+                        is_wireless,
+                        link_up: false,
                     });
                 }
                 live_endpoint = Some(ep);

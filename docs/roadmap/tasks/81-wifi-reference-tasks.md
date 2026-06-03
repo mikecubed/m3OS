@@ -31,10 +31,10 @@
 **Why it matters:** the m3OS NIC-binding discipline is "match by device ID over a bounded registry, never by marketing name" (Phase 79). Wi-Fi controllers are PCI class `0x02` subclass `0x80` ("Other Network controller"), **not** the Ethernet `0x02/0x00` triple, so a distinct class triple plus the MediaTek vendor (`0x14C3` — not the existing Intel/Realtek consts) is required; the research flags real mis-binding (MT7927 sharing `0x7925`'s architecture), so strict by-ID matching is the defense, and the family slice means the laptop's actual chip (unconfirmed) binds without a code change.
 
 **Acceptance:**
-- [ ] `is_mt7921(0x7961)`, `is_mt7922(0x0616)`, `is_mt7925(0x7925)` return `true`; the Ethernet IDs (`0x100E`, `0x8125`) and a foreign MediaTek BT ID return `false` from all `is_mt792x` predicates (host test `kernel_core::nic_ids::tests::mt792x_predicates`).
-- [ ] The mt792x family slices are pairwise-disjoint with no intra-family duplicates, asserted by tests modeled on `all_intel_families_pairwise_disjoint` / `no_duplicate_ids_within_a_family` (new `mt792x_families_pairwise_disjoint`, `no_duplicate_ids_within_mt792x_family`).
-- [ ] `(WIFI_CLASS, WIFI_SUBCLASS, WIFI_PROG_IF) == (0x02, 0x80, 0x00)` and is distinct from `(ETHERNET_CLASS, ETHERNET_SUBCLASS, ETHERNET_PROG_IF)` (host-asserted).
-- [ ] `MAX_NICS` is **unchanged** — one combined registry covers Ethernet + Wi-Fi NICs and the Wi-Fi NIC consumes one `NicEntry` slot (host-asserted by a registry-bound test).
+- [x] `is_mt7921(0x7961)`, `is_mt7922(0x0616)`, `is_mt7925(0x7925)` return `true`; the Ethernet IDs (`0x100E`, `0x8125`) and a foreign MediaTek BT ID return `false` from all `is_mt792x` predicates (host test `kernel_core::nic_ids::tests::mt792x_predicates`).
+- [x] The mt792x family slices are pairwise-disjoint with no intra-family duplicates, asserted by tests modeled on `all_intel_families_pairwise_disjoint` / `no_duplicate_ids_within_a_family` (new `mt792x_families_pairwise_disjoint`, `no_duplicate_ids_within_mt792x_family`).
+- [x] `(WIFI_CLASS, WIFI_SUBCLASS, WIFI_PROG_IF) == (0x02, 0x80, 0x00)` and is distinct from `(ETHERNET_CLASS, ETHERNET_SUBCLASS, ETHERNET_PROG_IF)` (host-asserted).
+- [x] `MAX_NICS` is **unchanged** — one combined registry covers Ethernet + Wi-Fi NICs and the Wi-Fi NIC consumes one `NicEntry` slot (host-asserted by a registry-bound test).
 
 ### A.2 — Wi-Fi PCI enumeration + chipset selection in `driver_runtime`
 
@@ -46,9 +46,9 @@
 **Why it matters:** Phase 79 already factored device selection into `select_nic(functions, vendor, is_family: fn(u16)->bool)`; the Wi-Fi driver adds exactly one enumerator (the Wi-Fi class triple) and one `select_*` call, reusing the proven `SYS_DEVICE_PCI_ENUMERATE`/`SYS_DEVICE_CONFIG_READ` path and the `/drivers/` exec-path authorization gate with **zero new syscalls**.
 
 **Acceptance:**
-- [ ] `enumerate_wifi_functions()` enumerates class `0x02`/subclass `0x80` and returns `PciFunctionId{key, vendor, device}` entries (compiles + host-tested where the syscall surface is mockable; live enumeration is exercised under Track E.4).
-- [ ] `select_mt792x` returns the first MediaTek mt792x-matching function and `None` otherwise — host test over a synthetic `Vec<PciFunctionId>` (`mt792x_driver::tests::select_prefers_mt792x`).
-- [ ] The driver crate builds `--features os-binary` (lib/bin split, like `r8169`/`r8125`) so the selection + frame-rewrite logic is host-testable in the `lib` target.
+- [x] `enumerate_wifi_functions()` enumerates class `0x02`/subclass `0x80` and returns `PciFunctionId{key, vendor, device}` entries (compiles + host-tested where the syscall surface is mockable; live enumeration is exercised under Track E.4).
+- [x] `select_mt792x` returns the first MediaTek mt792x-matching function and `None` otherwise — host test over a synthetic `Vec<PciFunctionId>` (`mt792x_driver::tests::select_prefers_mt792x`).
+- [x] The driver crate builds `--features os-binary` (lib/bin split, like `r8169`/`r8125`) so the selection + frame-rewrite logic is host-testable in the `lib` target.
 
 ### A.3 — BAR0 MMIO map + WFDMA register file + controller reset
 
@@ -60,7 +60,7 @@
 **Why it matters:** the WFDMA register window lives in PCI **BAR0** (CPU MMIO via `sys_device_mmio_map` — *never* an IOVA); the reset + GLO_CFG ordering (reset DTX/DRX pointers, then enable TX/RX DMA only after rings are programmed) is the documented "WFDMA enable ordering" pitfall — out-of-order leaves `*_DMA_BUSY` stuck. Keeping offsets/predicates in `kernel-core` makes the bit math host-testable like `kernel_core::r8169::REG_*`.
 
 **Acceptance:**
-- [ ] Host test asserts the register-offset constants equal the values above and that `reset_complete` reports done only when both `TX_DMA_BUSY` and `RX_DMA_BUSY` are clear (`kernel_core::mt792x::regs::tests::offsets`, `reset_predicate`).
+- [x] Host test asserts the register-offset constants equal the values above and that `reset_complete` reports done only when both `TX_DMA_BUSY` and `RX_DMA_BUSY` are clear (`kernel_core::mt792x::regs::tests::offsets`, `reset_predicate`).
 - [ ] *(Hardware-only / E.4.)* The driver claims the device, maps BAR0 via `Mmio::map(handle, MT792X_BAR_INDEX, expected_len)`, asserts a plausible chip-id readback (`mt76_chip` raw hex ∈ {`0x7921`,`0x7922`,`0x7920`,`0x7902`,`0x7925`}), and completes `soft_reset` with `*_DMA_BUSY` cleared.
 - [ ] *(Hardware-only / E.4.)* The IOMMU fault ISR (Phase 67) is confirmed subscribed/armed **before** the first DMA is issued (driver logs the fault-handler arming) — the research's #1 first-driver hazard.
 
@@ -70,14 +70,15 @@
 - `kernel-core/src/mt792x/firmware.rs` (new; host-testable parsers — model on `kernel_core::r8169::parse_rtl_fw` / `validate_good_firmware`, which test against **synthetic crafted** blobs, not vendor firmware)
 - `userspace/drivers/mt792x/src/fw.rs` (new; the on-the-wire download sequence)
 
-**Symbol:** `parse_patch_header(blob) -> Result<PatchHdr, FirmwareError>` decoding `mt76_connac2_patch_hdr` (**big-endian** `hw_sw_ver`/`patch_ver`/`checksum` + `desc.n_region`) and the `mt76_connac2_patch_sec` entries; `parse_fw_trailer(blob) -> Result<FwImage, FirmwareError>` decoding the **trailing** `mt76_connac2_fw_trailer` (`chip_id`/`eco_code`/`n_region`/`format_ver`/`fw_ver[10]`/`crc`, **little-endian**) + the `n_region` × `mt76_connac2_fw_region` (`addr`/`len`/`feature_set`/`type`); `FirmwareError{TooShort, BadMagic, BadRegionCount, BadChecksum, UnalignedRegion, TrailerOutOfBounds}`; a `FirmwareSet{ rom_patch, ram_code }` selected by chip-id; the driver-side `download_firmware(...)` implementing: (1) `PATCH_SEM_GET` → branch on `PATCH_IS_DL` (skip) vs `PATCH_NOT_DL_SEM_SUCCESS` (proceed); (2) per-section `init_download` (`PATCH_START_REQ`, load addr `MCU_PATCH_ADDRESS = 0x200000`) + `FW_SCATTER` chunked at **4096 bytes**; (3) `PATCH_FINISH_REQ`; (4) `PATCH_SEM_RELEASE`; (5) per-region RAM `init_download` (`TARGET_ADDRESS_LEN_REQ` with **`addr = region.addr`, `len = region.len`** — each region carries its own load address, not a fixed one; mode from `feature_set` honoring `FW_FEATURE_OVERRIDE_ADDR`; the encrypt path is declined for retail blobs) + `FW_SCATTER`; (6) `FW_START_REQ` (`FW_START_OVERRIDE`/`FW_START_WORKING_PDA_CR4`); (7) poll firmware-running.
+**Symbol:** `parse_patch_header(blob) -> Result<PatchHdr, FirmwareError>` decoding `mt76_connac2_patch_hdr` (**big-endian** `hw_sw_ver`/`patch_ver`/`checksum` + `desc.n_region`) and the `mt76_connac2_patch_sec` entries; `parse_fw_trailer(blob) -> Result<FwImage, FirmwareError>` decoding the **trailing** `mt76_connac2_fw_trailer` (`chip_id`/`eco_code`/`n_region`/`format_ver`/`fw_ver[10]`/`crc`, **little-endian**) + the `n_region` × `mt76_connac2_fw_region` (`addr`/`len`/`feature_set`/`type`); `FirmwareError{TooShort, BadMagic, BadRegionCount, BadChecksum, UnalignedRegion, TrailerOutOfBounds}`; a `FirmwareSet{ rom_patch, ram_code }` selected by chip-id; the driver-side `download_firmware(...)` implementing, with the **established upstream connac2 `MCU_CMD_*` opcodes** (`mt76_connac_mcu.h`, pinned host-side in `mt792x_hal::fw_proto::cmd`, NOT guesses): (1) `PATCH_SEM_CONTROL` (payload op = get) → `decode_patch_sem` branch on `PATCH_IS_DL` (skip) vs `PATCH_NOT_DL_SEM_SUCCESS` (proceed); (2) for each parsed `mt76_connac2_patch_sec` (`parse_patch_sections`), `PATCH_START_REQ` at the **section's own `addr`** + `FW_SCATTER` of the section's `[offs, offs+size)` slice chunked at **4096 bytes**; (3) `PATCH_FINISH_REQ`; (4) `PATCH_SEM_CONTROL` (payload op = release); (5) per-region RAM `TARGET_ADDRESS_LEN_REQ` with **`addr = region.addr`, `len = region.len`** (each region carries its own load address; mode from `feature_set` honoring `FW_FEATURE_OVERRIDE_ADDR = BIT(5)`) + `FW_SCATTER`; (6) `FW_START_REQ`; (7) poll firmware-running via `kernel_core::mt792x::regs::fw_n9_ready(MT_CONN_ON_MISC)`. (`MCU_PATCH_ADDRESS = 0x200000` remains as the connac default base for blobs that do not carry per-section addresses.)
 **Why it matters:** firmware is **mandatory** for mt792x (unlike the *optional* r8169 PHY firmware) — the chip does nothing until the WM MCU is running. The patch header is big-endian and the RAM image is trailer-based little-endian, so an endianness slip corrupts section addresses (research pitfall #4); the patch-semaphore must skip re-download on `PATCH_IS_DL` or it wedges the MCU (pitfall #3); each RAM region loads to its **own** `region.addr`. Host-testing the parsers against **synthetic crafted** headers/trailers catches these before any DMA, exactly as `r8169::validate_good_firmware` does — committing the real vendor blob is deferred to the F.3 license clearance and exercised only on hardware (E.4).
 
 **Acceptance:**
-- [ ] Host test builds **synthetic** patch/trailer blobs and asserts `parse_patch_header` returns the crafted `n_region` + big-endian version and `parse_fw_trailer` returns regions whose `addr`/`len` are in-bounds (`kernel_core::mt792x::firmware::tests::parse_synthetic_patch`, `parse_synthetic_ram_trailer`).
-- [ ] Host test asserts every `FirmwareError` variant on crafted-malformed inputs (truncated, bad magic, region count overflowing the blob, trailer past EOF) — no parser panics on adversarial input.
-- [ ] Host test models the scatter chunking: a blob of length `N` produces `ceil(N/4096)` `FW_SCATTER` chunks, the last short (`chunking_4096`); and the patch-semaphore branch: `PATCH_IS_DL` → zero patch sections downloaded, `PATCH_NOT_DL_SEM_SUCCESS` → all sections downloaded then released (`patch_sem_branch`).
-- [ ] *(Hardware-only / E.4.)* The full handshake completes against the operator-supplied real blob and the firmware-running poll returns ready before any MCU init command is issued. **The exact firmware-running poll register/value is `[UNCERTAIN]` in the upstream research and is lifted from `mt7921/mcu.c` + captured under E.3.**
+- [x] Host test builds **synthetic** patch/trailer blobs and asserts `parse_patch_header` returns the crafted `n_region` + big-endian version and `parse_fw_trailer` returns regions whose `addr`/`len` are in-bounds (`kernel_core::mt792x::firmware::tests::parse_synthetic_patch`, `parse_synthetic_ram_trailer`).
+- [x] Host test asserts every `FirmwareError` variant on crafted-malformed inputs (truncated, bad magic, region count overflowing the blob, trailer past EOF) — no parser panics on adversarial input.
+- [x] Host test models the scatter chunking: a blob of length `N` produces `ceil(N/4096)` `FW_SCATTER` chunks, the last short (`chunking_4096`); and the patch-semaphore branch: `PATCH_IS_DL` → zero patch sections downloaded, `PATCH_NOT_DL_SEM_SUCCESS` → all sections downloaded then released (`patch_sem_branch`).
+- [x] Host test parses per-section `mt76_connac2_patch_sec` entries — each carries its **own** big-endian `type`/`offs`/`size`/`info.addr` and the download uses that addr (not a single fixed base), with `[offs, offs+size)` bounds-checked against the blob (`parse_synthetic_patch_sections`, `patch_section_offs_past_blob_is_out_of_bounds`). The driver-side opcodes + semaphore decode are pinned host-side (`mt792x_hal::fw_proto::tests::{fw_constants_match_upstream, patch_sem_decode}`).
+- [ ] *(Hardware-only / E.4.)* The full handshake completes against the operator-supplied real blob and the firmware-running poll returns ready before any MCU init command is issued. **The poll register offset + mask are now upstream-derived and host-pinned** (`kernel_core::mt792x::regs::{MT_CONN_ON_MISC, MT_TOP_MISC2_FW_N9_RDY, fw_n9_ready}`, from `mt7921/mcu.c`); the only `[UNCERTAIN]` remainder is the **BAR0 reg-remap window** that maps the connac `0x1800_0000` bus range and the live ready-transition timing, both confirmed under E.3.
 
 ### A.5 — WM MCU command ring (FWDL/WM TX queues + MCU RX queue) + TXD/TLV encoders
 
@@ -89,9 +90,9 @@
 **Why it matters:** MCU commands are DMA-submitted and replies arrive **asynchronously** on a separate RX queue, matched by `seq` — failing to match by sequence number (or to time out) deadlocks on the wrong event (research pitfall #5). First bring-up needs only the **WM** co-processor (skip WA); keeping the TXD/TLV packing + seq-matching in `kernel-core` makes the wire format host-testable.
 
 **Acceptance:**
-- [ ] Host test asserts `encode_mcu_txd` sets `pkt_type == 0xA0`, the `s2d_index` byte for HOST→WM, and round-trips `cid`/`seq` (`kernel_core::mt792x::mcu::tests::txd_encode`).
-- [ ] Host test asserts `push_tlv` produces tag/len/value with correct length framing and 4-byte alignment (`tlv_framing`).
-- [ ] Host test asserts `match_response` returns `Matched` only for the live `seq`, `Stale` for an older `seq`, and `Mismatch` otherwise (`seq_matching`).
+- [x] Host test asserts `encode_mcu_txd` sets `pkt_type == 0xA0`, the `s2d_index` byte for HOST→WM, and round-trips `cid`/`seq` (`kernel_core::mt792x::mcu::tests::txd_encode`).
+- [x] Host test asserts `push_tlv` produces tag/len/value with correct length framing and 4-byte alignment (`tlv_framing`).
+- [x] Host test asserts `match_response` returns `Matched` only for the live `seq`, `Stale` for an older `seq`, and `Mismatch` otherwise (`seq_matching`).
 - [ ] *(Hardware-only / E.4.)* A `GET_NIC_CAPABILITY` (or equivalent init query) issued on `MT_MCUQ_WM` returns a matched reply on `MT_RXQ_MCU` within the timeout.
 
 ### A.6 — WFDMA TX/RX data rings with IOVA from `DmaBuffer` + token model
@@ -104,9 +105,9 @@
 **Why it matters:** every address in a descriptor (`buf0`/`buf1`), every ring `desc_base`, and every FW-staging buffer is a **device DMA address the chipset dereferences** — under VT-d/AMD-Vi it **must** be the `DmaBuffer` IOVA, never host-physical (research pitfall #1, the single most likely first-driver bug). The TX **token must be allocated before** the buffer list is written into the descriptor, or DMA mappings leak (a mainline CVE-class fix, pitfall #2) — encoding the ordering in the host-tested `encode_tx_desc` + `TokenPool` API makes it impossible to reverse silently.
 
 **Acceptance:**
-- [ ] Host test asserts `size_of::<Mt76Desc>() == 16` (compile-time `const _`) and that `encode_tx_desc(iova, len, token)` places `split_iova(iova).0` in `buf0` and `.1` in `buf1` (proves the argument is plumbed into the descriptor; `kernel_core::mt792x::dma::tests::tx_desc_iova`).
-- [ ] Host test asserts `rx_desc_done`/`rx_desc_len`: for a `ctrl` word with the DMA-done bit set and length field `L`, `rx_desc_done` returns `true` and `rx_desc_len` returns `L`; with the done bit clear, `rx_desc_done` returns `false` (`rx_decode`).
-- [ ] Host test asserts the token-before-buffer ordering at the API level: `encode_tx_desc` **requires** a `token` argument acquired from `TokenPool` (grep-verifiable: no `encode_tx_desc` overload without a token), and `acquire`/`release` round-trip without leaking under `MAX_TOKENS` churn (`token_pool_roundtrip`).
+- [x] Host test asserts `size_of::<Mt76Desc>() == 16` (compile-time `const _`) and that `encode_tx_desc(iova, len, token)` places `split_iova(iova).0` in `buf0` and `.1` in `buf1` (proves the argument is plumbed into the descriptor; `kernel_core::mt792x::dma::tests::tx_desc_iova`).
+- [x] Host test asserts `rx_desc_done`/`rx_desc_len`: for a `ctrl` word with the DMA-done bit set and length field `L`, `rx_desc_done` returns `true` and `rx_desc_len` returns `L`; with the done bit clear, `rx_desc_done` returns `false` (`rx_decode`).
+- [x] Host test asserts the token-before-buffer ordering at the API level: `encode_tx_desc` **requires** a `token` argument acquired from `TokenPool` (grep-verifiable: no `encode_tx_desc` overload without a token), and `acquire`/`release` round-trip without leaking under `MAX_TOKENS` churn (`token_pool_roundtrip`).
 - [ ] *(Hardware-only / E.4.)* The descriptor-IOVA correctness — that the value passed to `encode_tx_desc` and to a ring `desc_base` is `DmaBuffer::iova()` and **not** `user_ptr()` — is confirmed by the IOMMU fault ISR staying silent across sustained DMA; `MT_WFDMA0_GLO_CFG` is set to `TX_DMA_EN | RX_DMA_EN` only **after** rings are programmed and DTX/DRX pointers reset. *(The host test above proves only that the supplied argument is plumbed into the descriptor, not that it is the IOVA — that distinction is hardware-only.)*
 
 ### A.7 — Four-place binary wiring (`mt792x` driver) + `wifi-core` workspace member
@@ -116,16 +117,16 @@
 - `xtask/src/main.rs` (`build_userspace` `bins` array + `--features os-binary` map + `populate_ext2_files` service conf)
 - `kernel/src/fs/ramdisk.rs` (`generated_initrd_asset!` static + the `/drivers/mt792x` `DRIVERS_ENTRIES`/`BIN_ENTRIES` tuple)
 - `userspace/init/src/main.rs` (`KNOWN_CONFIGS`)
-- `kernel/initrd/etc/services.d/mt792x.conf` (via `populate_ext2_files`)
+- `kernel/initrd/etc/services.d/mt792x_driver.conf` (via `populate_ext2_files`)
 
-**Symbol:** the four AGENTS.md wiring places for a new userspace binary, applied to `mt792x_driver`, plus the `wifi-core` lib as a workspace member; the service conf `name=mt792x\ncommand=/drivers/mt792x\ntype=daemon\nrestart=on-failure\nmax_restart=5\n`
+**Symbol:** the four AGENTS.md wiring places for a new userspace binary, applied to `mt792x_driver`, plus the `wifi-core` lib as a workspace member; the service conf `name=mt792x_driver\ncommand=/drivers/mt792x\ntype=daemon\nrestart=on-failure\nmax_restart=5\n` (the service `name` is `mt792x_driver`; `/drivers/mt792x` is the `command=` ramdisk path)
 **Why it matters:** AGENTS.md "Adding a New Userspace Binary" requires **four distinct** wiring places — miss the `bins` array and the driver is never built into the image; miss the ramdisk entry and `execve` returns `ENOENT`; miss the `.conf`/`KNOWN_CONFIGS` and `init` never spawns it. `r8169`/`r8125` each appear in all four. `wifi-core` is a **lib only** (no binary, no ramdisk/conf entry) but must still be a workspace member or it is not built or checked.
 
 **Acceptance:**
-- [ ] `userspace/drivers/mt792x` **and** `userspace/wifi-core` are added to root `Cargo.toml` `members`.
-- [ ] `mt792x_driver` is added to the `bins` array in `build_userspace` with `needs_alloc = true` (it uses `alloc`/`kernel-core`) and the `--features os-binary` map.
-- [ ] `static MT792X_DRIVER_ELF = generated_initrd_asset!("mt792x_driver")` + a `/drivers/mt792x` ramdisk tuple are added to `kernel/src/fs/ramdisk.rs`.
-- [ ] `mt792x.conf` is present in `populate_ext2_files` **and** `KNOWN_CONFIGS`; after `cargo xtask clean` + boot, `init` logs `init: driver.registered name=mt792x` (the daemon spawns).
+- [x] `userspace/drivers/mt792x` **and** `userspace/wifi-core` are added to root `Cargo.toml` `members`.
+- [x] `mt792x_driver` is added to the `bins` array in `build_userspace` with `needs_alloc = true` (it uses `alloc`/`kernel-core`) and the `--features os-binary` map.
+- [x] `static MT792X_DRIVER_ELF = generated_initrd_asset!("mt792x_driver")` + a `/drivers/mt792x` ramdisk tuple are added to `kernel/src/fs/ramdisk.rs`.
+- [x] `mt792x_driver.conf` is present in `populate_ext2_files` **and** `KNOWN_CONFIGS`; after `cargo xtask clean` + boot, `init` logs `init: driver.registered name=mt792x_driver` (the daemon spawns).
 
 ### A.8 — Firmware-staging pipeline (operator-supplied blob; graceful absence)
 
@@ -138,8 +139,8 @@
 **Why it matters:** the design doc's Implementation Outline step 1 is "land the firmware-blob staging path"; the anchors confirm there is **no** `request_firmware` syscall, so the established `include_bytes!`-in-driver-crate pattern is the default. The pipeline must land as code **independently of the blob bytes**, because committing the real MediaTek blob is the F.3 redistribution decision — so an absent blob produces a clean skip, never a build break.
 
 **Acceptance:**
-- [ ] The xtask firmware-staging step + `firmware_blob()` seam land; with **no** blob present, `cargo xtask check` and the build succeed and the driver logs a clear "firmware blob absent — Wi-Fi disabled, see docs/legal/firmware-licenses.md" message (no panic, no build break).
-- [ ] The `include_bytes!`-vs-initrd-asset delivery decision is recorded in F.3 (driver-ELF size vs initrd asset trade-off), not silently chosen.
+- [x] The xtask firmware-staging step + `firmware_blob()` seam land; with **no** blob present, `cargo xtask check` and the build succeed and the driver logs a clear "firmware blob absent — Wi-Fi disabled, see docs/legal/firmware-licenses.md" message (no panic, no build break).
+- [x] The `include_bytes!`-vs-initrd-asset delivery decision is recorded in F.3 (driver-ELF size vs initrd asset trade-off), not silently chosen.
 - [ ] When the operator supplies the cleared blob at the staged path, `firmware_blob()` returns `Some(..)` and A.4's download path consumes it (exercised on hardware, E.4).
 
 ---
@@ -158,8 +159,8 @@
 **Why it matters:** the anchors confirm SHA-1 and HMAC-SHA1 are **MISSING** from the workspace (`crypto-lib` ships only the SHA-256 family + `hmac_sha256` + HKDF). WPA2-PSK's PRF, the PBKDF2 PMK derivation, and the EAPOL-Key MIC (key-descriptor version 2) all require HMAC-SHA1 — without it the 4-way handshake cannot be computed at all. *(The design doc's claim that "Phase 42 covers SHA-1 and HMAC" is false and is corrected in F.4.)*
 
 **Acceptance:**
-- [ ] Host test: `sha1(b"abc")` matches the FIPS-180 known-answer vector; `hmac_sha1` matches the RFC 2202 test vectors (`crypto_lib::hash::tests::sha1_kat`, `hmac_sha1_rfc2202`).
-- [ ] SHA-1 is documented as used **only** for the WPA2 KDF/MIC (not any security-sensitive new use), recorded in the learning doc + Documentation Notes.
+- [x] Host test: `sha1(b"abc")` matches the FIPS-180 known-answer vector; `hmac_sha1` matches the RFC 2202 test vectors (`crypto_lib::hash::tests::sha1_kat`, `hmac_sha1_rfc2202`).
+- [x] SHA-1 is documented as used **only** for the WPA2 KDF/MIC (not any security-sensitive new use), recorded in the learning doc + Documentation Notes.
 
 ### B.2 — Add missing crypto primitive: PBKDF2-HMAC-SHA1 (PMK derivation)
 
@@ -168,8 +169,8 @@
 **Why it matters:** the anchors confirm **no `pbkdf2` crate** exists. WPA2-PSK derives the 256-bit PMK as `PBKDF2(HMAC-SHA1, passphrase, SSID, 4096, 32)` where the **raw SSID bytes are the salt** (not null-terminated, not hashed). Computed once per network and cached.
 
 **Acceptance:**
-- [ ] Host test: `wpa_pmk(b"password", b"IEEE")` matches the published IEEE 802.11i PSK test vector (`crypto_lib::hash::tests::wpa_pmk_kat`).
-- [ ] Host test asserts the SSID is used verbatim as the salt and the iteration count is exactly 4096 (vector-checked, not just structurally).
+- [x] Host test: `wpa_pmk(b"password", b"IEEE")` matches the published IEEE 802.11i PSK test vector (`crypto_lib::hash::tests::wpa_pmk_kat`).
+- [x] Host test asserts the SSID is used verbatim as the salt and the iteration count is exactly 4096 (vector-checked, not just structurally).
 
 ### B.3 — Add missing crypto primitive: AES Key-Wrap / RFC 3394 (GTK)
 
@@ -181,9 +182,9 @@
 **Why it matters:** the anchors confirm **no `aes-kw` crate** exists, but the `aes` block cipher is already a dependency (used today only via `Aes256`). The GTK delivered in EAPOL M3 key-data is AES-Key-Wrapped under the KEK (PTK bytes 16..32); unwrapping it is the **only** AES primitive the host needs — per-packet CCMP is done by the chipset, so **no software AES-CCM is required**. Implementing both wrap and unwrap lets the canonical RFC 3394 §4.1 vector (a *wrap* vector) be checked directly.
 
 **Acceptance:**
-- [ ] Host test: `aes_key_wrap` reproduces the RFC 3394 §4.1 128-bit-KEK / 128-bit-key wrap vector and `aes_key_unwrap` inverts it back to the plaintext key (`crypto_lib::symmetric::tests::aes_kw_rfc3394`).
-- [ ] Host test asserts the integrity-check value (the `A6A6…` IV) is verified and a tampered wrapped blob returns `Err(CryptoError)` (`aes_kw_rejects_tampered`).
-- [ ] A `// no software AES-CCM` comment + Documentation Notes entry records that CCMP is chipset-offloaded (TK installed via MCU; the host never encrypts a data frame).
+- [x] Host test: `aes_key_wrap` reproduces the RFC 3394 §4.1 128-bit-KEK / 128-bit-key wrap vector and `aes_key_unwrap` inverts it back to the plaintext key (`crypto_lib::symmetric::tests::aes_kw_rfc3394`).
+- [x] Host test asserts the integrity-check value (the `A6A6…` IV) is verified and a tampered wrapped blob returns `Err(CryptoError)` (`aes_kw_rejects_tampered`).
+- [x] A `// no software AES-CCM` comment + Documentation Notes entry records that CCMP is chipset-offloaded (TK installed via MCU; the host never encrypts a data frame).
 
 ### B.4 — 802.11 management-frame builders + RSN IE encode/decode
 
@@ -192,9 +193,9 @@
 **Why it matters:** WPA2-PSK uses **Open-System** 802.11 auth (the real auth is the later 4-way handshake), then an Assoc-Request carrying the station's RSN IE. The station's emitted RSN IE must be **byte-identical** to the one re-sent in EAPOL M2 (the AP cross-checks it for downgrade) — encoding it once in a host-tested builder guarantees that invariant. This is the soft-MAC management plane the chip does **not** run.
 
 **Acceptance:**
-- [ ] Host test asserts `RsnIe::ccmp_psk().encode()` equals the exact 22-byte sequence above (`wifi_core::mgmt::tests::rsn_ie_ccmp_psk`).
-- [ ] Host test round-trips a synthetic Probe-Response and asserts `parse_probe_response` extracts the SSID/channel and accepts CCMP+PSK / rejects a TKIP-only or WPA1 AP (`probe_response_rsn_accept`, `rejects_tkip_only`).
-- [ ] Host test asserts the Auth frame sets Auth-Algorithm = 0 (Open), Seq = 1, Status = 0 (`auth_open_open_system`).
+- [x] Host test asserts `RsnIe::ccmp_psk().encode()` equals the exact 22-byte sequence above (`wifi_core::mgmt::tests::rsn_ie_ccmp_psk`).
+- [x] Host test round-trips a synthetic Probe-Response and asserts `parse_probe_response` extracts the SSID/channel and accepts CCMP+PSK / rejects a TKIP-only or WPA1 AP (`probe_response_rsn_accept`, `rejects_tkip_only`).
+- [x] Host test asserts the Auth frame sets Auth-Algorithm = 0 (Open), Seq = 1, Status = 0 (`auth_open_open_system`).
 
 ### B.5 — Association FSM (scan → auth → assoc → handshake → connected)
 
@@ -203,10 +204,10 @@
 **Why it matters:** this is the host-supplied 802.11 state machine that `mac80211` + `wpa_supplicant` run in Linux and that mt792x firmware does **not** run for the STA path (soft-MAC-with-offload, not full-MAC). Keeping it a pure reducer in `wifi-core` makes the whole connection lifecycle host-testable with synthetic events, no radio required.
 
 **Acceptance:**
-- [ ] Host test drives the happy path `Init → Scanning →(ProbeResp)→ Authenticating →(AuthResp)→ Associating →(AssocResp)→ Handshake →(M1..M4)→ Connected` and asserts the emitted action sequence (`wifi_core::fsm::tests::happy_path`).
-- [ ] Host test asserts each failure edge: AssocResp status 43/45 → `Failed(BadRsnParams)` with no retry; 4-way global timeout → `Deauth` + `Failed(HandshakeTimeout)` (the "wrong passphrase" manifestation); M3 MIC-verify failure → frame dropped, **no** `InstallKey` emitted (`assoc_status_fail`, `handshake_timeout`, `m3_mic_fail_no_install`).
-- [ ] Host test asserts `Deauth`/disconnect emits `PurgeKeys` so stale keys leave the chipset (`disconnect_purges_keys`).
-- [ ] Host test asserts replay-counter handling: the FSM answers the **latest** EAPOL replay counter and ignores a stale one (`replay_counter_monotonic`).
+- [x] Host test drives the happy path `Init → Scanning →(ProbeResp)→ Authenticating →(AuthResp)→ Associating →(AssocResp)→ Handshake →(M1..M4)→ Connected` and asserts the emitted action sequence (`wifi_core::fsm::tests::happy_path`).
+- [x] Host test asserts each failure edge: AssocResp status 43/45 → `Failed(BadRsnParams)` with no retry; 4-way global timeout → `Deauth` + `Failed(HandshakeTimeout)` (the "wrong passphrase" manifestation); M3 MIC-verify failure → frame dropped, **no** `InstallKey` emitted (`assoc_status_fail`, `handshake_timeout`, `m3_mic_fail_no_install`).
+- [x] Host test asserts `Deauth`/disconnect emits `PurgeKeys` so stale keys leave the chipset (`disconnect_purges_keys`).
+- [x] Host test asserts replay-counter handling: the FSM answers the **latest** EAPOL replay counter and ignores a stale one (`replay_counter_monotonic`).
 
 ### B.6 — WPA2-PSK 4-way handshake: PTK derivation + EAPOL-Key MIC + GTK unwrap
 
@@ -218,11 +219,11 @@
 **Why it matters:** this realizes the **HOST-vs-CHIPSET crypto split** precisely. **Host** computes PMK (B.2), the random SNonce (`crypto_lib` CSPRNG), PTK (PRF-512), the EAPOL-Key MIC (HMAC-SHA1-128 under KCK over the zeroed-MIC body), and the GTK unwrap (RFC 3394 under KEK). **Chipset** does per-packet CCMP once the 16-byte TK is installed. The byte-exact frame layout + key-info constants + min/max byte-wise nonce/MAC ordering are the easy-to-corrupt details, so they are host-tested against published vectors.
 
 **Acceptance:**
-- [ ] Host test: `derive_ptk` reproduces a published WPA2 PTK vector (PMK + AA/SPA + ANonce/SNonce → KCK/KEK/TK), including the `min`/`max` byte-wise lexicographic ordering of MACs and nonces (`wifi_core::kdf::tests::ptk_vector`).
-- [ ] Host test: `KeyInfo` encodes M1/M2/M3/M4 to `0x008A`/`0x010A`/`0x13CA`/`0x030A` and decodes the Install/ACK/MIC/Secure/Encrypted bits back (`eapol::tests::key_info_per_message`).
-- [ ] Host test: `mic_sha1_128` is checked against a **reproducible** vector — the KCK from the same published PTK vector (above) is used to MIC a fixed, documented EAPOL M2/M4 body with the MIC field zeroed, so the expected MIC is deterministic and reviewer-recomputable; a one-bit corruption flips the MIC (`eapol::tests::mic_zeroed_field`). *(If a captured frame is used instead, a named pcap — e.g. Wireshark `wpa-Induction.pcap` — is checked in with its provenance recorded, mirroring A.4's fixture discipline.)*
-- [ ] Host test: `unwrap_gtk` extracts the GTK from a synthetic AES-Key-Wrapped M3 key-data blob and rejects a tampered one (`kdf::tests::gtk_unwrap`).
-- [ ] Host test asserts the M2 RSN IE equals the B.4 Assoc-Request RSN IE byte-for-byte (downgrade-protection invariant) (`eapol::tests::m2_rsn_ie_matches_assoc`).
+- [x] Host test: `derive_ptk` reproduces a published WPA2 PTK vector (PMK + AA/SPA + ANonce/SNonce → KCK/KEK/TK), including the `min`/`max` byte-wise lexicographic ordering of MACs and nonces (`wifi_core::kdf::tests::ptk_vector`).
+- [x] Host test: `KeyInfo` encodes M1/M2/M3/M4 to `0x008A`/`0x010A`/`0x13CA`/`0x030A` and decodes the Install/ACK/MIC/Secure/Encrypted bits back (`eapol::tests::key_info_per_message`).
+- [x] Host test: `mic_sha1_128` is checked against a **reproducible** vector — the KCK from the same published PTK vector (above) is used to MIC a fixed, documented EAPOL M2/M4 body with the MIC field zeroed, so the expected MIC is deterministic and reviewer-recomputable; a one-bit corruption flips the MIC (`eapol::tests::mic_zeroed_field`). *(If a captured frame is used instead, a named pcap — e.g. Wireshark `wpa-Induction.pcap` — is checked in with its provenance recorded, mirroring A.4's fixture discipline.)*
+- [x] Host test: `unwrap_gtk` extracts the GTK from a synthetic AES-Key-Wrapped M3 key-data blob and rejects a tampered one (`kdf::tests::gtk_unwrap`).
+- [x] Host test asserts the M2 RSN IE equals the B.4 Assoc-Request RSN IE byte-for-byte (downgrade-protection invariant) (`eapol::tests::m2_rsn_ie_matches_assoc`).
 
 ### B.7 — Key-install seam (host → chipset TK/GTK via MCU STA_REC)
 
@@ -234,8 +235,8 @@
 **Why it matters:** this is the one point where the host's derived keys cross into the chipset. After the 4-way handshake, the 16-byte TK (and GTK) are installed into the WTBL via MCU command, and **all subsequent CCMP encrypt/decrypt + replay is done in hardware** — the host hands the chip plaintext frames thereafter. Installing the TK only **after** validating M3 (enforced by B.5) avoids the nonce-reuse/forgery class. The TLV encoder is pure byte-packing of an already-derived key, so it belongs in `kernel_core::mt792x` (no crypto dependency), while the key derivation stays in `wifi-core`.
 
 **Acceptance:**
-- [ ] Host test asserts the `STA_REC_KEY` TLV encoding for a CCMP pairwise key (cipher selector, key index, 16-byte TK) (`kernel_core::mt792x::mcu::tests::sta_rec_key_ccmp`).
-- [ ] Host test asserts `install_pairwise_key` is only reachable from the FSM `InstallKey` action (structural/grep check: no path installs a key before `Handshake` reaches the install step).
+- [x] Host test asserts the `STA_REC_KEY` TLV encoding for a CCMP pairwise key (cipher selector, key index, 16-byte TK) (`kernel_core::mt792x::mcu::tests::sta_rec_key_ccmp`).
+- [x] Host test asserts `install_pairwise_key` is only reachable from the FSM `InstallKey` action (structural/grep check: no path installs a key before `Handshake` reaches the install step).
 - [ ] *(Hardware-only / E.4.)* After a real association the TK install MCU command is acknowledged and data frames flow (CCMP done by the chip).
 
 ---
@@ -252,10 +253,10 @@
 **Why it matters:** the anchors confirm `RemoteNic` registers purely by service name `net.nic` + `net.nic.ingress` and the `driver_ipc::net` seam is **L2-frame-only** — a Wi-Fi NIC presenting Ethernet-shaped frames plugs into the kernel TCP/IP stack with **zero kernel changes** ("Wi-Fi terminates at the data-link layer"). The EAPOL demux is essential: the 4-way-handshake frames arrive as 802.11 *data* frames and must reach the supplicant FSM, not the kernel IP stack — without the demux, M1/M3 would be handed to TCP/IP and the handshake would never complete.
 
 **Acceptance:**
-- [ ] The driver registers `net.nic` and emits a `MT792X_SMOKE:server:READY\n` sentinel before its event loop (model on `R8169_SMOKE:server:READY`).
-- [ ] Host test asserts the Ethernet→802.11 TX rewrite (LLC/SNAP `AA AA 03 00 00 00` + ethertype + 802.11 header) and the 802.11→Ethernet RX rewrite round-trip a frame (`mt792x_driver::io::tests::eth_80211_roundtrip`).
-- [ ] Host test asserts the RX demux: a frame with LLC/SNAP ethertype `0x888E` is routed to `WifiEvent::Eapol` and **not** emitted as `NET_RX_FRAME`; a normal IPv4 frame is emitted as `NET_RX_FRAME` (`io::tests::eapol_demux`).
-- [ ] `MAX_FRAME_BYTES` (1522) and the `NetFrameHeader` framing are reused unchanged from `driver_ipc::net` (no new L2 message labels).
+- [x] The driver registers `net.nic` and emits a `MT792X_SMOKE:server:READY\n` sentinel before its event loop (model on `R8169_SMOKE:server:READY`).
+- [x] Host test asserts the Ethernet→802.11 TX rewrite (LLC/SNAP `AA AA 03 00 00 00` + ethertype + 802.11 header) and the 802.11→Ethernet RX rewrite round-trip a frame (`mt792x_driver::io::tests::eth_80211_roundtrip`).
+- [x] Host test asserts the RX demux: a frame with LLC/SNAP ethertype `0x888E` is routed to `WifiEvent::Eapol` and **not** emitted as `NET_RX_FRAME`; a normal IPv4 frame is emitted as `NET_RX_FRAME` (`io::tests::eapol_demux`).
+- [x] `MAX_FRAME_BYTES` (1522) and the `NetFrameHeader` framing are reused unchanged from `driver_ipc::net` (no new L2 message labels).
 
 ### C.2 — Link-state event on association + userspace Wi-Fi control protocol
 
@@ -269,8 +270,8 @@
 
 **Acceptance:**
 - [ ] On association the driver emits `NET_LINK_STATE{up:true,...}` and the kernel `RemoteNic` registry marks the NIC link-up (host test of the `apply_link_event` path + a Track-E.4 live observation); on deauth it emits `up:false` and `tcp::on_link_down()` is invoked.
-- [ ] The `wifi_core::control` labels encode/decode `WIFI_SCAN_RESULT{bssid, ssid, rssi, channel}` and `WIFI_STATUS{ssid, rssi, ipv4}` round-trip byte-for-byte (host test `wifi_core::control::tests::roundtrip`).
-- [ ] `WifiControlError::NotAssociated` lives in the userspace control protocol (not `NetDriverError`); the kernel `driver_ipc::net` seam gains **no** Wi-Fi-specific variant (host-asserted: `NetDriverError::to_byte()` mappings unchanged).
+- [x] The `wifi_core::control` labels encode/decode `WIFI_SCAN_RESULT{bssid, ssid, rssi, channel}` and `WIFI_STATUS{ssid, rssi, ipv4}` round-trip byte-for-byte (host test `wifi_core::control::tests::roundtrip`).
+- [x] `WifiControlError::NotAssociated` lives in the userspace control protocol (not `NetDriverError`); the kernel `driver_ipc::net` seam gains **no** Wi-Fi-specific variant (host-asserted: `NetDriverError::to_byte()` mappings unchanged).
 
 ### C.3 — DHCP + DNS over the wireless link + link/medium-aware default route
 
@@ -282,8 +283,8 @@
 **Why it matters:** the design doc's acceptance requires DHCP + DNS over wireless **and** "the routing default picks wired over wireless when both are available." The existing `default_route_index(nic_count)` is **purely count-based** — it always returns `Some(0)` and has no notion of medium or link state, so it **cannot** express wired-over-wireless. This is therefore a **genuine (small) kernel change**, not free reuse: a new link/medium-aware helper plus the plumbing to feed it. (Relying on registration order is rejected — the Wi-Fi driver could register before a wired NIC links up, making the default route non-deterministic.)
 
 **Acceptance:**
-- [ ] Host test: `default_route_index_by_link` returns the wired index when a link-up wired + link-up Wi-Fi NIC are present; the Wi-Fi index when only Wi-Fi is up; `None` when all are down (`kernel_core::nic_ids::tests::route_prefers_wired_when_both_up`, `falls_back_to_wifi`, `none_when_all_down`).
-- [ ] The QEMU-testable `dns-smoke` and `multi-nic-smoke` gates still **PASS** after the new route helper + plumbing land (no Phase 77/79 regression — the wired/QEMU path *is* testable even though the radio is not).
+- [x] Host test: `default_route_index_by_link` returns the wired index when a link-up wired + link-up Wi-Fi NIC are present; the Wi-Fi index when only Wi-Fi is up; `None` when all are down (`kernel_core::nic_ids::tests::route_prefers_wired_when_both_up`, `falls_back_to_wifi`, `none_when_all_down`).
+- [x] The QEMU-testable `dns-smoke` and `multi-nic-smoke` gates still **PASS** after the new route helper + plumbing land (no Phase 77/79 regression — the wired/QEMU path *is* testable even though the radio is not).
 - [ ] *(Hardware-only / E.4.)* After association the existing DHCP client pulls a lease over the wireless interface; `ping <gateway>` returns ICMP echo replies (0% loss over N packets).
 - [ ] *(Hardware-only / E.4.)* The Phase 77 DNS resolver succeeds over the wireless link — `getaddrinfo("github.com", ...)` returns ≥1 A record.
 - [ ] *(Hardware-only / E.4.)* With a wired NIC also up, the default route is the wired NIC (the helper's preference is exercised end-to-end).
@@ -296,15 +297,15 @@
 
 **Files:**
 - `userspace/wifi-core/src/config.rs` (new; host-testable parser)
-- `kernel/initrd/etc/wpa.conf` (staged via `populate_ext2_files` — the **service** `.conf` + `KNOWN_CONFIGS` wiring is A.7)
+- `/etc/wpa.conf` — **operator-supplied** at runtime, NOT committed/staged (it holds the live SSID + PSK credentials, like the operator-staged firmware blob in A.8). The driver reads it best-effort: absent/malformed ⇒ `mt792x_driver: no usable /etc/wpa.conf — passive L2 mode`. The **service** `.conf` (`mt792x_driver.conf`) + `KNOWN_CONFIGS` wiring is A.7 and is unrelated to this credential file.
 
 **Symbol:** `wifi_core::config::parse_wpa_conf(text) -> Result<WpaConfig, ConfigError>` parsing `ssid=...`, `psk=...`, optional `freq=2.4|5` into `WpaConfig{ ssid, psk, freq: Band }`
 **Why it matters:** the design doc scopes config to a single static `/etc/wpa.conf` read at boot (no `wpa_supplicant` daemon at 1.0). Keeping the parser in `wifi-core` makes the (untrusted, on-disk) config parsing host-testable. The PSK→PMK conversion (B.2) happens at config load and the plaintext passphrase is zeroed once the PMK is cached.
 
 **Acceptance:**
-- [ ] Host test parses `ssid=Home\npsk=secret123\nfreq=5\n` into `WpaConfig{ssid, psk, freq: Band::Ghz5}` and rejects malformed/missing-PSK input with a typed `ConfigError` (`wifi_core::config::tests::parse_valid`, `rejects_missing_psk`).
-- [ ] Host test asserts the 8–63-char passphrase length bound (the PBKDF2 input constraint) is enforced (`rejects_short_psk`).
-- [ ] The PSK is converted to the PMK via B.2 at config load and the plaintext passphrase is zeroed afterward (documented + a test asserting the `WpaConfig` exposes the PMK, not the raw passphrase, after `finalize()`).
+- [x] Host test parses `ssid=Home\npsk=secret123\nfreq=5\n` into `WpaConfig{ssid, psk, freq: Band::Ghz5}` and rejects malformed/missing-PSK input with a typed `ConfigError` (`wifi_core::config::tests::parse_valid`, `rejects_missing_psk`).
+- [x] Host test asserts the 8–63-char passphrase length bound (the PBKDF2 input constraint) is enforced (`rejects_short_psk`).
+- [x] The PSK is converted to the PMK via B.2 at config load and the plaintext passphrase buffer is volatile-zeroed afterward (`config.rs` `zero_secret`) — `WpaConfig` exposes only the derived PMK (`pmk()`), never the raw passphrase (`config::tests::no_passphrase_getter`).
 
 ### D.2 — `m3ctl wifi status` read-only diagnostics
 
@@ -316,9 +317,10 @@
 **Why it matters:** the design doc's acceptance requires `m3ctl wifi status` to report SSID, signal strength, and IPv4 — a read-only diagnostic so the operator can confirm association without a packet capture. It reuses the C.2 control labels (userspace↔userspace), adding no kernel path.
 
 **Acceptance:**
-- [ ] Host test asserts the `m3ctl wifi status` formatter renders a `WIFI_STATUS{ssid, rssi, ipv4}` value into the expected human-readable lines (`m3ctl::tests::wifi_status_format`).
-- [ ] When not associated, `m3ctl wifi status` prints "not associated" (driven by `WifiControlError::NotAssociated`) rather than erroring.
-- [ ] *(Hardware-only / E.4.)* `m3ctl wifi status` on the dev laptop reports the associated SSID, a plausible RSSI, and the DHCP-assigned IPv4.
+- [x] Host test asserts the `m3ctl wifi status` formatter renders a `WIFI_STATUS{ssid, rssi, ipv4}` value into the expected human-readable lines (`m3ctl::tests::wifi_status_format`).
+- [x] When not associated, `m3ctl wifi status` prints "not associated" (driven by `WifiControlError::NotAssociated`) rather than erroring.
+- [x] The driver-side responder logic — mapping supplicant state → `WifiStatus` (associated ⇒ SSID populated; otherwise empty-SSID) — is host-tested (`wifi_core::control::WifiStatus::for_connection` + `control::tests::status_for_connection`).
+- [ ] *(Hardware-only / E.4.)* `m3ctl wifi status` on the dev laptop reports the associated SSID, a plausible RSSI, and the DHCP-assigned IPv4. **Driver-side wiring note:** the driver's `run_io_loop` blocks on the single `net.nic` `NetServer::handle_next` endpoint, and `NetServer` does not surface non-net labels; multiplexing the read-only `wifi.control` responder onto the driver's IPC endpoint (so `m3ctl` can query it live) is the remaining E.4 hardware step — the `WifiStatus::for_connection` responder it calls is implemented + host-tested above, but serving it live is exercised only on the radio (no QEMU mt76 model). Until then `m3ctl wifi status` degrades to "not associated".
 
 ---
 
@@ -336,9 +338,9 @@
 **Why it matters:** because **QEMU cannot exercise the radio**, the host tests are the *primary* correctness gate — they cover firmware parsing (synthetic crafted fixtures), MCU/TXD/TLV encoding, ring/descriptor/token math, the mgmt-frame builders + RSN IE, the association FSM, and the entire WPA2 crypto chain (PMK/PTK/MIC/GTK) against published vectors. This mirrors Phase 79/80 putting `nic_ids`/`r8169`/`hda` host tests in `kernel-core`, and `crypto-lib`'s existing host-test treatment now extends to `wifi-core`.
 
 **Acceptance:**
-- [ ] `cargo test -p kernel-core --target x86_64-unknown-linux-gnu` passes the new `mt792x` test modules; `cargo test -p wifi-core --target x86_64-unknown-linux-gnu` passes the mgmt/fsm/eapol/kdf/config/control modules.
-- [ ] `cargo xtask check` (clippy `-D warnings` + rustfmt + host tests) passes with `mt792x_driver` and `wifi-core` added to the check list and the new `crypto-lib` vectors green.
-- [ ] Firmware-parser tests use **synthetic crafted** blobs (BE patch header + LE trailer, every `FirmwareError` variant) — the `r8169` precedent — so the real vendor blob is **not** a checked-in CI fixture (license-gated; parsed against shipping firmware only on hardware, E.4).
+- [x] `cargo test -p kernel-core --target x86_64-unknown-linux-gnu` passes the new `mt792x` test modules; `cargo test -p wifi-core --target x86_64-unknown-linux-gnu` passes the mgmt/fsm/eapol/kdf/config/control modules.
+- [x] `cargo xtask check` (clippy `-D warnings` + rustfmt + host tests) passes with `mt792x_driver` and `wifi-core` added to the check list and the new `crypto-lib` vectors green.
+- [x] Firmware-parser tests use **synthetic crafted** blobs (BE patch header + LE trailer, every `FirmwareError` variant) — the `r8169` precedent — so the real vendor blob is **not** a checked-in CI fixture (license-gated; parsed against shipping firmware only on hardware, E.4).
 
 ### E.2 — `wifi-smoke` xtask gate (skip-with-reason; no QEMU mt76 model)
 
@@ -350,9 +352,9 @@
 **Why it matters:** the anchors confirm `multi-nic-smoke` already handles QEMU-unmodeled NICs (igc/r8169/r8125) by **skipping with a reason** and pointing at the VFIO runbook + the host tests. A Wi-Fi NIC has **no** QEMU model at all, so `wifi-smoke` is structurally a skip-with-reason gate whose real assertion is "the host tests passed" — it must not silently masquerade as a radio test.
 
 **Acceptance:**
-- [ ] `cargo xtask wifi-smoke` without `M3OS_WIFI_REGRESSION=1` prints the skip-with-reason and exits success, explicitly stating QEMU has no mt76 model and that the host tests are the coverage.
-- [ ] With `M3OS_WIFI_REGRESSION=1` the gate references the E.3 VFIO runbook and (on the dev laptop only) asserts `init: driver.registered name=mt792x` + `MT792X_SMOKE:server:READY` + the association sentinel.
-- [ ] The gate is registered in the AGENTS.md opt-in table with env var `M3OS_WIFI_REGRESSION=1`.
+- [x] `cargo xtask wifi-smoke` without `M3OS_WIFI_REGRESSION=1` prints the skip-with-reason and exits success, explicitly stating QEMU has no mt76 model and that the host tests are the coverage.
+- [x] With `M3OS_WIFI_REGRESSION=1` the gate references the E.3 VFIO runbook and (on the dev laptop only) asserts `init: driver.registered name=mt792x_driver` + `MT792X_SMOKE:server:READY` + the association sentinel.
+- [x] The gate is registered in the AGENTS.md opt-in table with env var `M3OS_WIFI_REGRESSION=1`.
 
 ### E.3 — Hardware-only VFIO / bare-metal validation runbook + `docs/research/` capture
 
@@ -364,9 +366,9 @@
 **Why it matters:** Phase 79 (`r8125-vfio-validate.md`) and Phase 80 (`hda-vfio-validate.md` + `hda-realtek-capture.md`) established that QEMU-unmodeled hardware is validated via a VFIO passthrough runbook plus a `docs/research/` capture. Wi-Fi is the strongest case: **none** of the radio path is QEMU-testable, and the firmware-running poll register is explicitly unknown until observed on hardware.
 
 **Acceptance:**
-- [ ] `scripts/mt792x-vfio-validate.md` exists with the full unbind-host → bind-vfio-pci → pass-through → restore sequence + the expected serial sentinels, pinned to a PCI slot clear of the e1000/nvme/ac97/xhci fixed-BDF sentinels.
-- [ ] `docs/research/mt792x-wifi-capture.md` exists and records (or has placeholder slots for) the real chip-id, firmware version, the **resolved firmware-running poll register/value** (the A.4 `[UNCERTAIN]` item), and the MCU init sequence.
-- [ ] The runbook is explicit that this build host is **not** the user's laptop and the association/DHCP/`ping` steps require operator root + a real AP.
+- [x] `scripts/mt792x-vfio-validate.md` exists with the full unbind-host → bind-vfio-pci → pass-through → restore sequence + the expected serial sentinels, pinned to a PCI slot clear of the e1000/nvme/ac97/xhci fixed-BDF sentinels.
+- [x] `docs/research/mt792x-wifi-capture.md` exists and records (or has placeholder slots for) the real chip-id, firmware version, the **resolved firmware-running poll register/value** (the A.4 `[UNCERTAIN]` item), and the MCU init sequence.
+- [x] The runbook is explicit that this build host is **not** the user's laptop and the association/DHCP/`ping` steps require operator root + a real AP.
 
 ### E.4 — Real-radio bring-up on the dev laptop (hardware-only)
 
@@ -398,9 +400,9 @@
 **Why it matters:** the kernel version is the release marker for the phase; the AGENTS.md maintenance policy permits the version bump and (because Wi-Fi is a genuinely new capability class) exactly one new capability bullet.
 
 **Acceptance:**
-- [ ] `kernel/Cargo.toml` reads `version = "0.81.0"` and `AGENTS.md` reads `kernel **v0.81.0**`; `cargo xtask check` passes.
-- [ ] A scoped check confirms no **build** file (`Cargo.toml` / Rust source) still reads `0.80.0` — `grep -rn '0\.80\.0' kernel/ userspace/ kernel-core/ xtask/ --include=*.toml --include=*.rs` returns nothing (the broad repo grep is **not** used; landed phase docs under `docs/roadmap/` legitimately retain prior versions).
-- [ ] AGENTS.md gains one Wireless bullet (e.g. "**Wireless**: ring-3 MediaTek mt792x Wi-Fi driver — firmware-blob download, WM MCU command ring, WFDMA TX/RX rings, soft-MAC 802.11 mgmt FSM + WPA2-PSK 4-way handshake (host crypto in `wifi-core`/`crypto-lib`) with chipset CCMP offload, presenting as an L2 `RemoteNic`").
+- [x] `kernel/Cargo.toml` reads `version = "0.81.0"` and `AGENTS.md` reads `kernel **v0.81.0**`; `cargo xtask check` passes.
+- [x] A scoped check confirms the **kernel release marker** no longer reads `0.80.0`: `kernel/Cargo.toml` reads `version = "0.81.0"` and AGENTS.md reads `kernel **v0.81.0**`. The only remaining matches of `grep -rn '0\.80\.0' kernel/ userspace/ kernel-core/ xtask/ --include=*.toml --include=*.rs` are `userspace/drivers/hda/Cargo.toml` and `userspace/drivers/ac97/Cargo.toml` — independently-versioned Phase-80 audio-driver crate manifests, NOT the kernel release marker, which Phase 81 deliberately does not touch. (The broad repo grep is not used; landed phase docs under `docs/roadmap/` legitimately retain prior versions.)
+- [x] AGENTS.md gains one Wireless bullet (e.g. "**Wireless**: ring-3 MediaTek mt792x Wi-Fi driver — firmware-blob download, WM MCU command ring, WFDMA TX/RX rings, soft-MAC 802.11 mgmt FSM + WPA2-PSK 4-way handshake (host crypto in `wifi-core`/`crypto-lib`) with chipset CCMP offload, presenting as an L2 `RemoteNic`").
 
 ### F.2 — Author `docs/81-wifi-reference.md` learning doc + cross-link
 
@@ -412,8 +414,8 @@
 **Why it matters:** AGENTS.md mandates a learning doc per phase (Phase 79 shipped `docs/79-modern-nic.md`, Phase 80 `docs/80-intel-hda-audio.md`).
 
 **Acceptance:**
-- [ ] `docs/81-wifi-reference.md` exists and conforms to the design-doc template sections.
-- [ ] It covers: the layering (PCIe MMIO + firmware download → WM MCU → host 802.11 mgmt FSM → IP stack); why mt792x is **soft-MAC-with-offload** not full-MAC (host runs the MLME + the WPA2 supplicant **inside the ring-3 driver**, not a daemon); the precise **HOST-vs-CHIPSET crypto split** (host: PMK/PTK/EAPOL-MIC/GTK-unwrap; chipset: per-packet CCMP); the **IOVA-vs-host-phys-vs-MCU-address** distinction; the firmware ROM-patch + RAM-code format + download handshake + patch-semaphore branch; **where the code lives** (`kernel_core::mt792x` hardware logic vs userspace `wifi-core` supplicant vs `crypto-lib` primitives, and why kernel-core cannot host the crypto); and why the kernel TCP/IP stack is unchanged (Wi-Fi terminates at L2 and emits Ethernet-shaped frames through `RemoteNic`).
+- [x] `docs/81-wifi-reference.md` exists and conforms to the design-doc template sections.
+- [x] It covers: the layering (PCIe MMIO + firmware download → WM MCU → host 802.11 mgmt FSM → IP stack); why mt792x is **soft-MAC-with-offload** not full-MAC (host runs the MLME + the WPA2 supplicant **inside the ring-3 driver**, not a daemon); the precise **HOST-vs-CHIPSET crypto split** (host: PMK/PTK/EAPOL-MIC/GTK-unwrap; chipset: per-packet CCMP); the **IOVA-vs-host-phys-vs-MCU-address** distinction; the firmware ROM-patch + RAM-code format + download handshake + patch-semaphore branch; **where the code lives** (`kernel_core::mt792x` hardware logic vs userspace `wifi-core` supplicant vs `crypto-lib` primitives, and why kernel-core cannot host the crypto); and why the kernel TCP/IP stack is unchanged (Wi-Fi terminates at L2 and emits Ethernet-shaped frames through `RemoteNic`).
 
 ### F.3 — Firmware-redistribution license doc (prerequisite for committing any real blob)
 
@@ -425,9 +427,9 @@
 **Why it matters:** the design doc's acceptance requires the MediaTek firmware redistribution license to be reviewed and recorded **before merge**, and Tracks A.4/E.1 are explicitly written to need **no** committed vendor blob (synthetic fixtures + operator-supplied bytes) precisely so this review is not bypassed. The blobs are "Redistributable" in linux-firmware's `WHENCE` (MediaTek's terms, not GPL) — shippable unmodified but the exact license block must be reproduced; same model as Intel `iwlwifi`.
 
 **Acceptance:**
-- [ ] `docs/legal/firmware-licenses.md` exists and reproduces the verbatim `WHENCE` "Redistributable" block for each mt792x blob the project intends to ship, with the upstream linux-firmware source path + commit recorded.
-- [ ] The doc states the blobs are shipped unmodified and names the exact filenames staged under `kernel/initrd/lib/firmware/`.
-- [ ] The A.8 firmware-delivery decision (`include_bytes!`-in-driver vs `generated_initrd_asset!`/`populate_ext2_files` initrd asset) is recorded, with the driver-ELF-size vs initrd-asset trade-off noted.
+- [x] `docs/legal/firmware-licenses.md` exists and reproduces the verbatim `WHENCE` "Redistributable" block for each mt792x blob the project intends to ship, with the upstream linux-firmware source path + commit recorded.
+- [x] The doc states the blobs are shipped unmodified and names the exact filenames staged under `kernel/initrd/lib/firmware/`.
+- [x] The A.8 firmware-delivery decision (`include_bytes!`-in-driver vs `generated_initrd_asset!`/`populate_ext2_files` initrd asset) is recorded, with the driver-ELF-size vs initrd-asset trade-off noted.
 
 ### F.4 — Roadmap README row flip + design-doc reconciliation + gate table
 
@@ -440,13 +442,13 @@
 **Why it matters:** the roadmap README is the canonical status index, and the design doc currently contains several claims that this plan contradicts and must reconcile so an implementer reading only the design doc is not misled.
 
 **Acceptance:**
-- [ ] On this planning PR, README row 81 Tasks cell links `./tasks/81-wifi-reference-tasks.md` (replacing "Deferred until implementation planning"); on landing, Status flips `Planned → Complete` (or the Phase-80-style honest "Driver-side complete; radio validation hardware-only").
-- [ ] **Chipset target reconciled:** the design doc names MT7925; this plan targets the **mt792x family** (MT7921/MT7922 connac2 first, MT7925 in the same registry). The design doc's `Builds on`, `Feature Scope` Track A, `Acceptance Criteria`, and `Deferred Until Later` are updated to the family framing (the laptop's exact chip is unconfirmed; the family registry binds whatever is present).
-- [ ] **False crypto claim struck:** the design-doc lines "Reuses Phase 42's HMAC-SHA1 and PBKDF2" and "The Phase 42 crypto primitives cover SHA-1 and HMAC; PBKDF2 is a thin wrapper" are corrected — SHA-1/HMAC-SHA1/PBKDF2/AES-Key-Wrap are **absent** from the workspace and are introduced by Track B.1–B.3.
-- [ ] **`wifi-core` relocation recorded:** the design doc's Primary Components `userspace/drivers/wifi-core/` and `kernel-core/src/net/wifi/` are corrected to `userspace/wifi-core/` (a lib linked into the driver) + the top-level `kernel_core::mt792x` hardware module — reflecting that the supplicant/MLME is userspace policy and kernel-core cannot depend on `crypto-lib`.
-- [ ] **Dangling reference repointed:** the design doc's "Phase 74a §3 documents the laptop reality" is repointed to `docs/appendix/audit-status/74a-pre-1.0-audit.md` (74a is an audit artifact, not a phase).
-- [ ] **Cross-OS section made honest:** the design doc's "How Real OS Implementations Differ" is updated to state Wi-Fi is greenfield with no peer Rust-microkernel reference (Redox/Managarm/SerenityOS are wired-only) and to cite Fuchsia's SME/MLME split and FreeBSD `net80211` + userspace `wpa_supplicant` + hardware CCMP as the borrowed references.
-- [ ] AGENTS.md gate table lists `wifi-smoke` under `M3OS_WIFI_REGRESSION=1` in the exact `| Gate | Env var |` row shape used by `multi-nic-smoke`/`hda-smoke`.
+- [x] On this planning PR, README row 81 Tasks cell links `./tasks/81-wifi-reference-tasks.md` (replacing "Deferred until implementation planning"); on landing, Status flips `Planned → Complete` (or the Phase-80-style honest "Driver-side complete; radio validation hardware-only").
+- [x] **Chipset target reconciled:** the design doc names MT7925; this plan targets the **mt792x family** (MT7921/MT7922 connac2 first, MT7925 in the same registry). The design doc's `Builds on`, `Feature Scope` Track A, `Acceptance Criteria`, and `Deferred Until Later` are updated to the family framing (the laptop's exact chip is unconfirmed; the family registry binds whatever is present).
+- [x] **False crypto claim struck:** the design-doc lines "Reuses Phase 42's HMAC-SHA1 and PBKDF2" and "The Phase 42 crypto primitives cover SHA-1 and HMAC; PBKDF2 is a thin wrapper" are corrected — SHA-1/HMAC-SHA1/PBKDF2/AES-Key-Wrap are **absent** from the workspace and are introduced by Track B.1–B.3.
+- [x] **`wifi-core` relocation recorded:** the design doc's Primary Components `userspace/drivers/wifi-core/` and `kernel-core/src/net/wifi/` are corrected to `userspace/wifi-core/` (a lib linked into the driver) + the top-level `kernel_core::mt792x` hardware module — reflecting that the supplicant/MLME is userspace policy and kernel-core cannot depend on `crypto-lib`.
+- [x] **Dangling reference repointed:** the design doc's "Phase 74a §3 documents the laptop reality" is repointed to `docs/appendix/audit-status/74a-pre-1.0-audit.md` (74a is an audit artifact, not a phase).
+- [x] **Cross-OS section made honest:** the design doc's "How Real OS Implementations Differ" is updated to state Wi-Fi is greenfield with no peer Rust-microkernel reference (Redox/Managarm/SerenityOS are wired-only) and to cite Fuchsia's SME/MLME split and FreeBSD `net80211` + userspace `wpa_supplicant` + hardware CCMP as the borrowed references.
+- [x] AGENTS.md gate table lists `wifi-smoke` under `M3OS_WIFI_REGRESSION=1` in the exact `| Gate | Env var |` row shape used by `multi-nic-smoke`/`hda-smoke`.
 
 ---
 
