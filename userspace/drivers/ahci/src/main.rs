@@ -191,16 +191,43 @@ fn program_main(_args: &[&str]) -> i32 {
         ),
     );
 
-    // Read LBA 0 once and decide: a blank scratch disk (no valid MBR) → run the
-    // destructive boot self-test (the `ahci-smoke` gate path); a disk with a
-    // valid MBR → probe its partition table without writing (the `--device
-    // ahci` data-disk path) so a mounted filesystem is never corrupted. A LBA-0
-    // read *error* fails CLOSED — neither branch runs — because a transient read
-    // failure must never fall through to the destructive self-test and clobber a
-    // real filesystem (the driver carries no scratch-vs-data flag in argv, so
-    // this classification is the only safeguard).
+    // The whole driver — `SECTOR_BYTES`, the self-test, the MBR walker, the
+    // block facade, and the kernel's 512-byte sector copy — assumes 512-byte
+    // logical sectors. A drive reporting any other size (e.g. a 4Kn "4096-byte
+    // logical" disk) would make every READ/WRITE length, MBR offset, and kernel
+    // sector copy inconsistent and corrupt I/O. Fail CLOSED: log and exit
+    // cleanly (rc 0, like the no-driveable-port path) without writing, probing,
+    // or serving the block protocol. The size is fixed for a given drive, so a
+    // restart cannot help — exiting non-zero would only burn init's restart
+    // budget. QEMU `ide-hd` presents 512-byte sectors, so this never trips on
+    // the smoke/data-disk paths; it guards real 4Kn hardware.
+    if id.logical_sector_bytes != SECTOR_BYTES as u32 {
+        write_str(
+            STDOUT_FILENO,
+            &alloc::format!(
+                "AHCI: unsupported logical sector size {} (only {} supported) — exiting cleanly\n",
+                id.logical_sector_bytes,
+                SECTOR_BYTES
+            ),
+        );
+        return 0;
+    }
+
+    // Read LBA 0 once and decide what to do with the disk. The driver carries no
+    // scratch-vs-data flag in argv, so this sector-0 classification is the only
+    // safeguard against the destructive self-test clobbering a real disk:
+    //   * an *obviously blank* scratch disk (LBA 0 is all zero) → run the
+    //     destructive boot self-test (the `ahci-smoke` gate path, whose scratch
+    //     `ide-hd` is freshly zeroed each run);
+    //   * ANY other disk — a valid MBR, a raw filesystem superblock, GPT-less
+    //     data, or a corrupted/non-`0x55AA` sector 0 → take the read-only
+    //     `partition_probe`, NEVER the destructive write. Gating on "blank"
+    //     instead of "not a valid MBR" is what keeps the self-test from
+    //     destroying a real non-MBR disk.
+    //   * a LBA-0 read *error* fails CLOSED — neither branch runs — because a
+    //     transient read failure must never fall through to a destructive write.
     match read_lba0(&mut port) {
-        Some(s) if parse_mbr(&s).is_err() => run_self_test(&mut port, &id),
+        Some(s) if is_blank_scratch(&s) => run_self_test(&mut port, &id),
         Some(s) => partition_probe(&s),
         None => {
             write_str(
@@ -256,7 +283,15 @@ fn bring_up_first_sata_port<'a>(
         };
         // Spec stop/start ordering: stop → program DMA structures → FRE →
         // COMRESET → wait ready → classify → (skip non-SATA) → clear W1C → start.
-        port.stop_engine();
+        // If the engine refuses to stop, never reprogram PxCLB/PxFB on a live
+        // engine — skip this port instead of corrupting its command-list pointer.
+        if !port.stop_engine() {
+            write_str(
+                STDOUT_FILENO,
+                &alloc::format!("AHCI: port {} engine stop failed — skipping\n", index),
+            );
+            continue;
+        }
         port.program_dma_structures();
         port.enable_fis_rx();
         port.comreset();
@@ -301,6 +336,16 @@ fn bring_up_first_sata_port<'a>(
         return Some(port);
     }
     None
+}
+
+/// `true` when LBA 0 is entirely zero — an obviously-blank scratch disk that is
+/// safe for the destructive boot self-test. Any non-zero byte (an MBR/partition
+/// table, a raw filesystem superblock, or stale data) marks the disk as "real"
+/// and routes it to the read-only partition probe instead, so the self-test can
+/// never write over a disk that holds data.
+#[cfg(not(test))]
+fn is_blank_scratch(sector0: &[u8; SECTOR_BYTES]) -> bool {
+    sector0.iter().all(|&b| b == 0)
 }
 
 /// Read LBA 0 into an owned 512-byte buffer, or `None` on I/O error.

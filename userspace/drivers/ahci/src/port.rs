@@ -127,7 +127,14 @@ impl<'a> Port<'a> {
     /// Stop the command + FIS-receive engines in the spec-mandated order:
     /// clear `ST`, wait `CR == 0`, then clear `FRE`, wait `FR == 0`. Bounded so
     /// a wedged engine cannot hang the driver.
-    pub fn stop_engine(&self) {
+    ///
+    /// Returns `true` only if **both** `CR` and `FR` actually reached 0 within
+    /// the spin budget. A `false` return means the engine is still running: the
+    /// caller MUST NOT proceed to reprogram `PxCLB`/`PxFB` (doing so on a live
+    /// engine corrupts the command-list pointer). The timeout is logged so a
+    /// wedged bring-up/recovery is diagnosable rather than silently continuing.
+    #[must_use]
+    pub fn stop_engine(&self) -> bool {
         // Clear ST, then wait for CR to clear.
         let cmd = self.pread(PX_CMD);
         self.pwrite(PX_CMD, cmd & !CMD_ST);
@@ -136,6 +143,7 @@ impl<'a> Port<'a> {
             core::hint::spin_loop();
             i += 1;
         }
+        let cr_cleared = self.pread(PX_CMD) & CMD_CR == 0;
         // Clear FRE, then wait for FR to clear.
         let cmd = self.pread(PX_CMD);
         self.pwrite(PX_CMD, cmd & !CMD_FRE);
@@ -144,6 +152,19 @@ impl<'a> Port<'a> {
             core::hint::spin_loop();
             i += 1;
         }
+        let fr_cleared = self.pread(PX_CMD) & CMD_FR == 0;
+        if !cr_cleared || !fr_cleared {
+            write_str(
+                STDOUT_FILENO,
+                &alloc::format!(
+                    "AHCI: port {} stop_engine timeout (CR cleared={} FR cleared={})\n",
+                    self.index,
+                    cr_cleared,
+                    fr_cleared
+                ),
+            );
+        }
+        cr_cleared && fr_cleared
     }
 
     /// Program `PxCLB`/`PxCLBU`/`PxFB`/`PxFBU` and each command header's
@@ -327,7 +348,19 @@ impl<'a> Port<'a> {
                 serr
             ),
         );
-        self.stop_engine();
+        if !self.stop_engine() {
+            // The engine never quiesced — reprogramming/restarting on a live
+            // engine is undefined, so abort recovery and report failure rather
+            // than silently pressing on.
+            write_str(
+                STDOUT_FILENO,
+                &alloc::format!(
+                    "AHCI: port {} recover: engine did not stop — aborting recovery\n",
+                    self.index
+                ),
+            );
+            return false;
+        }
         // Clear the W1C latches in order: SERR then IS.
         self.pwrite(PX_SERR, self.pread(PX_SERR));
         self.pwrite(PX_IS, self.pread(PX_IS));

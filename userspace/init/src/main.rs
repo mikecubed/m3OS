@@ -2589,7 +2589,10 @@ fn bootstrap_ring3_root_disk() -> isize {
     }
     if pid < 0 {
         write_str(STDOUT_FILENO, "init: failed to fork /drivers/ahci\n");
-        return -1;
+        // Propagate fork()'s negative errno rather than flattening it to -1, so
+        // the failure is diagnosable and matches this function's documented
+        // "negative errno ... otherwise" contract.
+        return pid;
     }
     // Retry the mount up to 40 × 100 ms = 4 s, giving the driver time to reset
     // the HBA, bring up the port (COMRESET), IDENTIFY the disk, and register
