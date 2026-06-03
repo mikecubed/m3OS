@@ -6219,6 +6219,14 @@ pub fn watchdog_scan() {
                 // without holding scheduler locks across the dump.
                 if !TRACE_DUMP_FIRED.swap(true, Ordering::AcqRel) {
                     TRACE_DUMP_PENDING.store(true, Ordering::Release);
+                    // Dump notification waiter/pending/signal state to classify
+                    // a BlockedOnNotif strand (lost-wakeup-after-register vs a
+                    // never-fired device IRQ). Safe here: SCHEDULER.lock is
+                    // released, so acquiring WAITERS does not invert lock order.
+                    if matches!(state, super::TaskState::BlockedOnNotif) {
+                        crate::ipc::notification::debug_dump_active_notifs();
+                        crate::arch::x86_64::interrupts::dump_device_irq_hits();
+                    }
                 }
             }
             WatchdogVerdict::StuckDeadlineExpired => {

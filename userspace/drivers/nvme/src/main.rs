@@ -449,32 +449,17 @@ fn run_io_server(mut ctx: BringUpContext) -> Result<(), InitError> {
     let mut io_queue = IoQueuePair::allocate(&ctx.device, ctx.doorbell_stride)?;
     syscall_lib::write_str(STDOUT_FILENO, "nvme_driver: io queue allocated\n");
 
-    // Step 2: Create I/O CQ (admin 0x05). Must run before Create I/O SQ
-    // so the SQ has a CQ to target.
-    let entries = io_queue.bookkeeping.entries();
-    {
-        let cmd = build_create_io_cq_command(0, IO_QUEUE_ID, entries, io_queue.cq_iova(), 0);
-        let status = submit_admin_command(&ctx.mmio, &mut ctx.admin, ctx.doorbell_stride, cmd);
-        if status != 0 {
-            return Err(InitError::BringUp(BringUpError::AdminCommandFailed));
-        }
-    }
-    syscall_lib::write_str(STDOUT_FILENO, "nvme_driver: io cq created\n");
-
-    // Step 3: Create I/O SQ (admin 0x01).
-    {
-        let cmd =
-            build_create_io_sq_command(0, IO_QUEUE_ID, entries, io_queue.sq_iova(), IO_QUEUE_ID);
-        let status = submit_admin_command(&ctx.mmio, &mut ctx.admin, ctx.doorbell_stride, cmd);
-        if status != 0 {
-            return Err(InitError::BringUp(BringUpError::AdminCommandFailed));
-        }
-    }
-    syscall_lib::write_str(STDOUT_FILENO, "nvme_driver: io sq created\n");
-
-    // Step 4: subscribe the MSI-X vector on a best-effort basis. A
-    // subscription failure is logged but the driver continues on the
-    // polled fallback in `IoQueuePair::wait_completion`.
+    // Step 2: subscribe the MSI-X vector on a best-effort basis BEFORE
+    // creating the I/O completion queue. The Create I/O CQ command binds the
+    // queue's interrupt vector (IV=0, IEN=1); QEMU's nvme model only routes
+    // completions to MSI-X if MSI-X is enabled at the PCI level *when the
+    // interrupt is asserted*, but enabling MSI-X (which resets the function's
+    // MSI-X state) after the CQ is already armed leaves the first completion's
+    // interrupt undelivered under slow TCG timing (the device-smoke hang:
+    // completion posted, `signals=0`, never woken). Enabling MSI-X first makes
+    // vector 0 live before any completion can be raised. A subscription failure
+    // is logged but the driver continues on the polled fallback in
+    // `IoQueuePair::wait_completion`.
     match IrqNotification::subscribe(&DeviceCap(&ctx.device), None) {
         Ok(irq) => {
             syscall_lib::write_str(STDOUT_FILENO, "nvme_driver: msi-x subscribed\n");
@@ -487,6 +472,29 @@ fn run_io_server(mut ctx: BringUpContext) -> Result<(), InitError> {
             );
         }
     }
+
+    // Step 3: Create I/O CQ (admin 0x05). Must run before Create I/O SQ
+    // so the SQ has a CQ to target.
+    let entries = io_queue.bookkeeping.entries();
+    {
+        let cmd = build_create_io_cq_command(0, IO_QUEUE_ID, entries, io_queue.cq_iova(), 0);
+        let status = submit_admin_command(&ctx.mmio, &mut ctx.admin, ctx.doorbell_stride, cmd);
+        if status != 0 {
+            return Err(InitError::BringUp(BringUpError::AdminCommandFailed));
+        }
+    }
+    syscall_lib::write_str(STDOUT_FILENO, "nvme_driver: io cq created\n");
+
+    // Step 4: Create I/O SQ (admin 0x01).
+    {
+        let cmd =
+            build_create_io_sq_command(0, IO_QUEUE_ID, entries, io_queue.sq_iova(), IO_QUEUE_ID);
+        let status = submit_admin_command(&ctx.mmio, &mut ctx.admin, ctx.doorbell_stride, cmd);
+        if status != 0 {
+            return Err(InitError::BringUp(BringUpError::AdminCommandFailed));
+        }
+    }
+    syscall_lib::write_str(STDOUT_FILENO, "nvme_driver: io sq created\n");
 
     // Step 5: Phase 55b F.4b — 512 B LBA-0 round-trip self-test.
     // Executes before the IPC endpoint is exposed so no concurrent
