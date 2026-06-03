@@ -2288,6 +2288,44 @@ pub fn device_irq_hits(vector: u8) -> u64 {
     DEVICE_IRQ_HITS[idx].load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Diagnostic: log the per-vector device-IRQ hit counts for every occupied
+/// stub. Called by the stuck-task watchdog so a `BlockedOnNotif` strand can be
+/// classified: a non-zero count for the parked driver's vector means the IRQ
+/// reached the IDT stub but the notification shim failed to wake the waiter; a
+/// zero count means the MSI/MSI-X (or INTx) interrupt was never delivered to
+/// the CPU at all (a device-side enable / table-programming / routing bug).
+pub fn dump_device_irq_hits() {
+    // Snapshot (vector, hits, bound) tuples under the table lock, then log
+    // after releasing it — log macros may allocate, and we must not hold the
+    // device-IRQ table lock across an allocation.
+    let mut snap: [(usize, u64, bool); DEVICE_IRQ_VECTOR_COUNT as usize] =
+        [(0, 0, false); DEVICE_IRQ_VECTOR_COUNT as usize];
+    let mut n = 0usize;
+    {
+        let table = DEVICE_IRQ_TABLE.lock();
+        for (off, (hits_slot, table_slot)) in DEVICE_IRQ_HITS.iter().zip(table.iter()).enumerate() {
+            let hits = hits_slot.load(core::sync::atomic::Ordering::Relaxed);
+            let bound = table_slot.is_some();
+            if hits != 0 || bound {
+                snap[n] = (DEVICE_IRQ_VECTOR_BASE as usize + off, hits, bound);
+                n += 1;
+            }
+        }
+    }
+    log::warn!(
+        "[sched][irq-diag] device-IRQ stub hit counts (base {:#x}):",
+        DEVICE_IRQ_VECTOR_BASE
+    );
+    for &(vector, hits, bound) in &snap[..n] {
+        log::warn!(
+            "[sched][irq-diag]   vector={:#x} hits={} bound={}",
+            vector,
+            hits,
+            bound,
+        );
+    }
+}
+
 /// Install `entry` at `vector`. Returns `Err` if the vector is outside the
 /// device-IRQ bank or already occupied.
 ///

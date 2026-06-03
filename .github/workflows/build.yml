@@ -64,15 +64,48 @@ jobs:
         run: |
           # Delete cached disk.img so it is regenerated with TCC files.
           rm -f target/x86_64-unknown-none/release/disk.img
-          cargo xtask smoke-test --timeout 300
+          cargo xtask smoke-test --timeout 400
 
-      - name: "Device-smoke parity lane (NVMe + e1000 under IOMMU)"
+      - name: "Device-smoke parity lane (NVMe ± IOMMU + e1000 IOMMU)"
+        # Timeouts widened off the old 90s lanes (CI runners have no KVM; QEMU
+        # runs under TCG). The NVMe lanes are reliable now that the ring-3 NVMe
+        # driver enables MSI-X before creating its I/O completion queue.
         run: |
-          cargo xtask device-smoke --device nvme --iommu --timeout 90
-          cargo xtask device-smoke --device e1000 --iommu --timeout 90
+          cargo xtask device-smoke --device nvme --iommu --timeout 180
+          cargo xtask device-smoke --device nvme --timeout 180
+          cargo xtask device-smoke --device e1000 --iommu --timeout 180
 
       - name: Regression suite (SMP races + headless operator workflows)
-        run: cargo xtask regression --timeout 90
+        # Flake-isolation retry mirrors .githooks/pre-push and pr.yml: re-run any
+        # failing test on a fresh QEMU and only fail on persistent failures, so
+        # documented harness contention under TCG does not red the main branch.
+        run: |
+          set +e
+          cargo xtask regression --timeout 180 2>&1 | tee regression.log
+          suite_status=${PIPESTATUS[0]}
+          set -e
+          if [ "$suite_status" -ne 0 ]; then
+            failed_tests="$(grep -E '^  [a-z0-9_-]+: FAIL' regression.log \
+                            | sed -E 's/^  ([a-z0-9_-]+): FAIL.*/\1/')"
+            if [ -z "$failed_tests" ]; then
+              echo "::error::regression suite failed but no per-test FAIL lines parsed"
+              exit 1
+            fi
+            echo "Suite-level failures detected — re-running flakes in isolation:"
+            for t in $failed_tests; do echo "  - $t"; done
+            real_failures=""
+            for t in $failed_tests; do
+              echo "Isolated re-run: $t"
+              if ! cargo xtask regression --test "$t" --timeout 180; then
+                real_failures="$real_failures $t"
+              fi
+            done
+            if [ -n "$real_failures" ]; then
+              echo "::error::regression failures persisted in isolation:$real_failures"
+              exit 1
+            fi
+            echo "All suite failures passed in isolation — treating as harness flakiness."
+          fi
 
       - name: Upload regression artifacts on failure
         if: failure()

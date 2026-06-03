@@ -122,6 +122,22 @@ static PENDING: [AtomicU64; MAX_NOTIFS] = {
     [ZERO; MAX_NOTIFS]
 };
 
+/// Per-notification cumulative signal counter (diagnostic only).
+///
+/// Incremented every time a bit is set on a notification via [`signal`],
+/// [`signal_irq`], or [`signal_irq_bit`]. The stuck-task watchdog dumps this
+/// alongside `PENDING` / `WAITERS` so a `BlockedOnNotif` strand can be
+/// classified as a *lost-wakeup-after-register* (signals were delivered but
+/// the waiter was consumed without being woken → `signals > 0`, `PENDING != 0`,
+/// no live waiter) versus a *never-signaled* wait (the device IRQ never fired
+/// → `signals == 0`). This is the single data point that distinguishes a
+/// notification-protocol race from a missed-IRQ-delivery bug.
+#[allow(clippy::declare_interior_mutable_const)]
+static SIGNAL_COUNT: [core::sync::atomic::AtomicU32; MAX_NOTIFS] = {
+    const ZERO: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    [ZERO; MAX_NOTIFS]
+};
+
 /// Lock-free mapping from hardware IRQ line (0–15) to `NotifId`.
 ///
 /// `0xff` means the IRQ line is not registered.  Written once at boot (before
@@ -405,6 +421,9 @@ pub fn signal_irq(irq: u8) {
     if let Some(pending) = PENDING.get(idx as usize) {
         pending.fetch_or(1u64 << (irq as u32), Ordering::Release);
     }
+    if let Some(c) = SIGNAL_COUNT.get(idx as usize) {
+        c.fetch_add(1, Ordering::Relaxed);
+    }
 
     // Phase 52: push waiter to per-core ISR wakeup queue (lock-free).
     // Use compare_exchange to atomically claim the waiter, preventing
@@ -472,6 +491,7 @@ pub fn signal_irq_bit(notif_id: NotifId, bit: u8) {
     // concurrent ISRs targeting the same notification accumulate bits
     // without loss.
     PENDING[idx].fetch_or(1u64 << (bit as u32), Ordering::Release);
+    SIGNAL_COUNT[idx].fetch_add(1, Ordering::Relaxed);
 
     // Push the waiter (if any) to the per-core ISR wake queue — mirrors
     // the logic in `signal_irq` but without the `IRQ_MAP` indirection.
@@ -526,6 +546,7 @@ pub fn signal(notif_id: NotifId, bits: u64) {
     }
     // Set pending bits (lock-free).
     PENDING[idx].fetch_or(bits, Ordering::Release);
+    SIGNAL_COUNT[idx].fetch_add(1, Ordering::Relaxed);
 
     // Wake the waiter (if any) via the mutex-protected layer.
     // Safe to call here because signal() only runs in task context
@@ -668,6 +689,55 @@ pub(super) fn lookup_bound_notif(task_sched_idx: usize) -> Option<NotifId> {
 /// the bound notification rather than a `wake_deadline`.
 pub(crate) fn task_has_bound_notif(task_sched_idx: usize) -> bool {
     lookup_bound_notif(task_sched_idx).is_some()
+}
+
+/// Diagnostic dump of every notification slot that looks active.
+///
+/// Called by the scheduler's stuck-task watchdog on its first `StuckNoWaker`
+/// hit per boot to classify a `BlockedOnNotif` strand. For each notification
+/// with a non-default `PENDING`, `SIGNAL_COUNT`, `WAITERS`, `ISR_WAITERS`, or
+/// `BOUND_TCB` it logs the full tuple. The decisive signature of a
+/// lost-wakeup-after-register (the bare `wait()` register-then-block race) is
+/// `signals > 0` and `pending != 0` while no live `WAITERS`/`ISR_WAITERS`
+/// entry remains for the parked task — i.e. a delivered signal whose waiter
+/// was consumed without a wake. `signals == 0` instead points at a never-fired
+/// device IRQ (a delivery bug, not a notification race).
+///
+/// Snapshots under `WAITERS.lock()` then logs after release: the watchdog
+/// already holds no lock here (it released `SCHEDULER.lock` before logging), so
+/// acquiring `WAITERS` cannot invert the `WAITERS → SCHEDULER` order that
+/// `drain_pending_waiters` relies on, and we never log while holding the lock.
+pub(crate) fn debug_dump_active_notifs() {
+    // (idx, pending, signals, waiter_present, isr_waiter_idx, bound_tcb)
+    let mut snap: [(u8, u64, u32, bool, i32, i32); MAX_NOTIFS] =
+        [(0, 0, 0, false, -1, -1); MAX_NOTIFS];
+    let mut n = 0usize;
+    {
+        let waiters = WAITERS.lock();
+        for idx in 0..MAX_NOTIFS {
+            let pending = PENDING[idx].load(Ordering::Acquire);
+            let signals = SIGNAL_COUNT[idx].load(Ordering::Acquire);
+            let isr = ISR_WAITERS[idx].load(Ordering::Acquire);
+            let bound = BOUND_TCB[idx].load(Ordering::Acquire);
+            let waiter_present = waiters[idx].is_some();
+            if pending != 0 || signals != 0 || isr >= 0 || bound >= 0 || waiter_present {
+                snap[n] = (idx as u8, pending, signals, waiter_present, isr, bound);
+                n += 1;
+            }
+        }
+    }
+    log::warn!("[sched][notif-diag] active notification slots:");
+    for &(idx, pending, signals, waiter, isr, bound) in &snap[..n] {
+        log::warn!(
+            "[sched][notif-diag]   notif={} pending={:#x} signals={} waiter_present={} isr_waiter_idx={} bound_tcb={}",
+            idx,
+            pending,
+            signals,
+            waiter,
+            isr,
+            bound,
+        );
+    }
 }
 
 /// Return the pending bits for the notification bound to a scheduler task slot.

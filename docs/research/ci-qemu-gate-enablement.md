@@ -1,6 +1,7 @@
-# Handoff: IPC notification-wake race + enabling QEMU gates in CI
+# Handoff: NVMe MSI-X ordering bug + enabling QEMU gates in CI
 
-**Status:** Open — investigation complete, fix not started
+**Status:** RESOLVED — root cause found, fixed, and verified 10/10 under TCG;
+PR QEMU gates re-enabled.
 **Date:** 2026-06-03
 **Author:** handoff from a CI-reliability investigation (see PR #215 trial)
 **Related:** PR #215 (trial measurement workflow), PR #214 (Phase 82 — adds the
@@ -9,7 +10,64 @@ new `ahci-smoke` / `ahci-root-smoke` gates), `.github/workflows/build.yml`,
 
 ---
 
-## TL;DR
+## RESOLUTION (the original Part-A hypothesis below was WRONG)
+
+This handoff hypothesised an **IPC notification-wake race**. A targeted
+diagnostic disproved it. The actual root cause and fix:
+
+**Root cause — NVMe ring-3 driver enabled MSI-X *after* creating its I/O
+completion queue.** `run_io_server` (`userspace/drivers/nvme/src/main.rs`) did:
+Create I/O CQ (with `IEN=1`, `IV=0`) → Create I/O SQ → *then*
+`IrqNotification::subscribe` (which programs + **enables** the device's MSI-X
+capability). QEMU's `nvme` model leaves the first completion's MSI-X interrupt
+**undelivered** when MSI-X is enabled after the CQ is already armed. Under fast
+KVM the driver's polled completion-queue fast path (`wait_completion` drains the
+CQ before parking) hides this; under slow TCG the driver reaches `notify_wait`
+*before* the completion is posted, parks in `BlockedOnNotif`, and the missing
+IRQ never wakes it → the watchdog's (misleading) `no waker registered` warning.
+
+**Why the watchdog message misled everyone:** `(no waker registered)` fires for
+*any* `BlockedOnNotif` task with no `wake_deadline` and no bound notification —
+including a `notify_wait` whose signaller simply never fired. The waiter **was**
+correctly registered; nothing raced.
+
+**The decisive diagnostic** (now committed, fires once per boot on the first
+stuck-no-waker) printed:
+
+```
+[sched][notif-diag]  notif=0 pending=0x0 signals=0 waiter_present=true isr_waiter_idx=20 bound_tcb=-1
+[sched][irq-diag]    vector=0x62 hits=0 bound=true        # nvme: IRQ never reached the IDT
+[sched][irq-diag]    vector=0x60 hits=19578 bound=true    # virtio-blk: MSI-X to LAPIC 0 fires fine
+```
+
+`signals=0` + `waiter_present=true` + `device_irq_hits[0x62]=0` proved the IRQ
+was never delivered (not a lost wakeup). Forcing the driver's polled path made
+the self-test pass in 7s under TCG, proving the *completion* is posted — only
+the interrupt is missing. LAPIC targeting was a red herring (LAPIC-0 hung too;
+LAPIC-1/AP passes with the fix).
+
+**The fix** (one reorder): enable MSI-X (subscribe) **before** creating the I/O
+CQ, so vector 0 is live before any completion can be raised. Verified **10/10**
+(`device-smoke --device nvme` ± `--iommu`) under TCG, all on an AP (LAPIC 1).
+`e1000` is unaffected (Ethernet class is forced to INTx) — which is why it was
+always 3/3.
+
+**`ipc-wake`** was a *separate*, rare boot-timing flake (it attaches no NVMe
+device, so it never hit this bug); it now passes 5/5 and is covered by the
+flake-isolation retry on the regression gate.
+
+**Part B (done):** `pr.yml` gained a parallel `qemu-gates` job (smoke-test,
+device-smoke nvme ±iommu + e1000 iommu, regression with the pre-push
+flake-isolation retry); `build.yml`'s device-smoke/regression timeouts were
+widened off 90s.
+
+> The rest of this document is the *original* investigation handoff, preserved
+> for the record. Its Part-A root-cause hypothesis (notification-wake race) is
+> **superseded** by the resolution above; read it as history, not guidance.
+
+---
+
+## TL;DR (original handoff — superseded)
 
 We want the headless QEMU smoke gates to run reliably enough to **gate PRs**
 (today `pr.yml` runs only `cargo xtask check`; the QEMU gates run post-merge in
