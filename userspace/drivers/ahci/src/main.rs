@@ -194,17 +194,20 @@ fn program_main(_args: &[&str]) -> i32 {
     // Read LBA 0 once and decide: a blank scratch disk (no valid MBR) → run the
     // destructive boot self-test (the `ahci-smoke` gate path); a disk with a
     // valid MBR → probe its partition table without writing (the `--device
-    // ahci` data-disk path) so a mounted filesystem is never corrupted.
-    let sector0 = read_lba0(&mut port);
-    let is_scratch = match &sector0 {
-        Some(s) => parse_mbr(s).is_err(),
-        None => true,
-    };
-
-    if is_scratch {
-        run_self_test(&mut port, &id);
-    } else if let Some(s) = &sector0 {
-        partition_probe(s);
+    // ahci` data-disk path) so a mounted filesystem is never corrupted. A LBA-0
+    // read *error* fails CLOSED — neither branch runs — because a transient read
+    // failure must never fall through to the destructive self-test and clobber a
+    // real filesystem (the driver carries no scratch-vs-data flag in argv, so
+    // this classification is the only safeguard).
+    match read_lba0(&mut port) {
+        Some(s) if parse_mbr(&s).is_err() => run_self_test(&mut port, &id),
+        Some(s) => partition_probe(&s),
+        None => {
+            write_str(
+                STDOUT_FILENO,
+                "AHCI: LBA0 read failed — skipping self-test (fail-safe, no destructive write)\n",
+            );
+        }
     }
 
     write_str(STDOUT_FILENO, SERVER_READY_SENTINEL);
@@ -368,6 +371,32 @@ fn run_self_test(port: &mut Port, id: &AtaIdentify) {
         ),
         Err(_) => write_str(STDOUT_FILENO, "AHCI_SMOKE:identify2:FAIL\n"),
     };
+
+    // Track C.4 error recovery, exercised under QEMU: issue a READ at an
+    // out-of-range LBA (one past the last addressable sector). QEMU's IDE core
+    // aborts the command (ABRT), the AHCI layer latches `PxIS.TFES`, and
+    // `cmd::run_command` routes through `Port::recover_port` (stop engine →
+    // clear `PxSERR`/`PxIS` → COMRESET → restart). Then prove the port is
+    // recovered, not wedged: the command engine is running again (`PxCMD.CR`)
+    // and a valid READ at LBA 0 completes. This is the gate assertion behind the
+    // C.4 acceptance — without it the recovery path would ride unverified.
+    let bad_lba = id.lba48_sectors.max(1);
+    let induced_err = cmd::read_sectors(port, bad_lba, 1).is_err();
+    let engine_up = port.engine_running();
+    let revalidated = cmd::read_sectors(port, 0, 1).is_ok();
+    if induced_err && engine_up && revalidated {
+        write_str(STDOUT_FILENO, "AHCI_SMOKE:recover:PASS\n");
+    } else {
+        write_str(
+            STDOUT_FILENO,
+            &alloc::format!(
+                "AHCI_SMOKE:recover:FAIL induced_err={} engine_up={} revalidated={}\n",
+                induced_err,
+                engine_up,
+                revalidated
+            ),
+        );
+    }
 }
 
 /// Probe the MBR partition table (the `--device ahci` data-disk path) and log

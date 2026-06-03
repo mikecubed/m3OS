@@ -218,7 +218,7 @@
 
 **Acceptance:**
 - [x] Host test: `is_fatal(is)` is `true` for any of `PX_IS_TFES`/`IS_HBFS`/`IS_HBDS`/`IS_IFS` and `false` otherwise (`kernel_core::storage::ahci::tests::is_fatal`).
-- [x] Under QEMU, issuing a command for an out-of-range LBA sets `PxTFD.ERR` and `PxIS.TFES`, leaves the slot's `PxCI` bit set, and `recover_port` clears `PxSERR`/`PxIS`, restarts the engine (`CR` reads back 1), and the next valid command succeeds (proves recovery, not a wedged port).
+- [x] Under QEMU, issuing a command for an out-of-range LBA sets `PxTFD.ERR` and `PxIS.TFES`, leaves the slot's `PxCI` bit set, and `recover_port` clears `PxSERR`/`PxIS`, restarts the engine (`CR` reads back 1), and the next valid command succeeds (proves recovery, not a wedged port) — asserted by the `ahci-smoke` gate's `AHCI_SMOKE:recover:PASS` sentinel (`run_self_test` reads one-past-the-last sector, then re-reads LBA 0 after the automatic `recover_port`).
 - [x] A command timeout (no completion within the budget) routes through `recover_port` and surfaces a `BlockDriverError::IoError`/`DriverRestarting`-class result to the facade (D.2), never a hang.
 
 ### C.5 — IRQ-on-completion path (`PxIE`/`GHC.IE`/`PxIS`/host-`IS` clear) — polling-primary
@@ -311,11 +311,11 @@
 ### E.2 — `cmd_ahci_smoke` gate (IDENTIFY + write + read-back + flush + IDENTIFY-after-write)
 
 **File:** `xtask/src/main.rs`
-**Symbol:** `cmd_ahci_smoke` + `ahci_smoke_steps` + `ahci_smoke_qemu_args` (model on `cmd_hda_smoke`/`cmd_multi_nic_smoke`); injects `-device ich9-ahci` + `-drive if=none` + `-device ide-hd`, asserts `AHCI_SMOKE:server:READY`, then drives IDENTIFY → write a known pattern at an LBA → read it back and byte-compare → FLUSH CACHE EXT → IDENTIFY again, asserting the **binding** per-step serial sentinel set; register the subcommand in the dispatch `match` + help
+**Symbol:** `cmd_ahci_smoke` + `ahci_smoke_steps` + `ahci_smoke_qemu_args` (model on `cmd_hda_smoke`/`cmd_multi_nic_smoke`); injects `-device ich9-ahci` + `-drive if=none` + `-device ide-hd`, asserts `AHCI_SMOKE:server:READY`, then drives IDENTIFY → write a known pattern at an LBA → read it back and byte-compare → FLUSH CACHE EXT → IDENTIFY again → induce an out-of-range-LBA `TFES` and recover the port, asserting the **binding** per-step serial sentinel set; register the subcommand in the dispatch `match` + help
 **Why it matters:** a serial-sentinel gate proves the AHCI driver enumerates, moves data both directions, and flushes for durability in CI — the same way `hda-smoke` proves HDA and `multi-nic-smoke` proves the NICs; the write→read-back byte-compare is the load-bearing "the driver actually transfers data" assertion (a `READY` sentinel alone only proves the process started).
 
 **Acceptance:**
-- [x] `cargo xtask ahci-smoke` boots with `-device ich9-ahci` + `ide-hd`, asserts `AHCI_SMOKE:server:READY`, and asserts the full **binding** five-step sentinel set `AHCI_SMOKE:identify:PASS`, `AHCI_SMOKE:write:PASS`, `AHCI_SMOKE:readback:PASS`, `AHCI_SMOKE:flush:PASS`, `AHCI_SMOKE:identify2:PASS` (the IDENTIFY-after-write step is named, not advisory).
+- [x] `cargo xtask ahci-smoke` boots with `-device ich9-ahci` + `ide-hd`, asserts `AHCI_SMOKE:server:READY`, and asserts the full **binding** six-step sentinel set `AHCI_SMOKE:identify:PASS`, `AHCI_SMOKE:write:PASS`, `AHCI_SMOKE:readback:PASS`, `AHCI_SMOKE:flush:PASS`, `AHCI_SMOKE:identify2:PASS`, `AHCI_SMOKE:recover:PASS` (the IDENTIFY-after-write and induced-TFES-recovery steps are named, not advisory).
 - [x] The read-back byte-compare of the written LBA pattern is asserted equal (the gate fails if the data path is silently broken).
 - [x] The subcommand is registered in the xtask dispatch `match` and the usage/help string; the gate is added to the AGENTS.md opt-in gate table under `M3OS_AHCI_REGRESSION` (F.3).
 - [x] *(Bare-metal/VFIO-only.)* The BOHC handoff (B.3), COMRESET (B.5), and a real completion interrupt (C.5) are validated on hardware — QEMU's `ich9-ahci` leaves `CAP2.BOH=0` / `CAP.SSS=0` and has no real SATA timing, so the gate prints a skip-with-reason for those (mirroring `wifi-smoke`/`multi-nic-smoke` skips).
@@ -335,7 +335,7 @@
 
 **Acceptance:**
 - [x] `kernel/Cargo.toml` reads `version = "0.82.0"` and `AGENTS.md` reads `kernel **v0.82.0**`; `cargo xtask check` passes.
-- [x] A **scoped** check confirms the kernel release marker no longer reads `0.81.0`: `grep -rn '0\.81\.0' kernel/ kernel-core/ xtask/ --include=*.toml --include=*.rs` returns no live kernel-version or check-list hit. The expected non-kernel matches of a broader grep are the independently-versioned driver-crate manifests (`userspace/drivers/hda/Cargo.toml`, `userspace/drivers/ac97/Cargo.toml` from Phase 80, and the new `userspace/drivers/ahci/Cargo.toml`), which Phase 82 deliberately does not touch; landed phase docs under `docs/roadmap/` legitimately retain prior versions.
+- [x] A **scoped** check confirms the kernel release marker no longer reads `0.81.0`: `grep -rn '0\.81\.0' kernel/ kernel-core/ xtask/ --include=*.toml --include=*.rs` returns no live kernel-version or check-list hit. The independently-versioned driver-crate manifests (`userspace/drivers/hda/Cargo.toml`, `userspace/drivers/ac97/Cargo.toml` from Phase 80 — untouched here — and the new `userspace/drivers/ahci/Cargo.toml` this phase adds) carry their own crate versions distinct from the kernel release marker, and live under `userspace/` outside the scoped grep; landed phase docs under `docs/roadmap/` legitimately retain prior versions.
 - [x] The AGENTS.md storage capability bullet reflects AHCI/SATA beside NVMe (rewritten, not appended), only if AHCI is a new capability class.
 
 ### F.2 — Author `docs/82-ahci-sata.md` learning doc + cross-link

@@ -4,7 +4,7 @@
 **Source Ref:** phase-82
 **Depends on:** Phase 55b (Ring-3 Driver Hosting), Phase 67 (IOMMU Substrate), Phase 8 (VFS + MBR partition walker), Phase 74 (IPC Capability Grants)
 **Builds on:** the NVMe-only ring-3 storage matrix — adds an AHCI-mode SATA block driver as a second `RemoteBlockDevice` behind the **same** block IPC protocol NVMe already speaks, so a SATA disk drops in beside NVMe with one scoped kernel change.
-**Primary Components:** `kernel-core/src/storage/{ahci,ata}.rs` (host-tested register/struct/FIS/PRDT/slot/classifier logic), `userspace/drivers/ahci/{init,port,cmd,io,main}.rs` (the ring-3 driver), `kernel/src/blk/remote.rs` (cold-path `ahci.block` lookup) + `kernel/src/blk/mbr.rs` (facade-aware MBR probe), `userspace/init/src/main.rs` (SATA-root bootstrap), the `ahci-smoke` gate.
+**Primary Components:** `kernel-core/src/storage/{ahci,ata}.rs` (host-tested register/struct/FIS/PRDT/slot/classifier logic), `userspace/drivers/ahci/{lib,init,port,cmd,io,main}.rs` (the ring-3 driver — `lib.rs` is the host-testable `os-binary`/lib split), `kernel/src/blk/remote.rs` (cold-path `ahci.block` lookup) + `kernel/src/blk/mbr.rs` (facade-aware MBR probe), `userspace/init/src/main.rs` (SATA-root bootstrap), the `ahci-smoke` gate.
 
 ## Milestone Goal
 
@@ -98,6 +98,16 @@ AHCI defines exactly one command queue per port (32 slots). It cannot match NVMe
 
 The CI tier runs against `-device ich9-ahci` + `ide-hd` (PCI class `0x010601`, VID:DID `8086:2922`, `CAP.NCS = 31` → 32 slots, `S64A`, `VS = 0x00010000`, `PI = 0x3f`). The hardware/VFIO tier — BIOS/OS handoff (`CAP2.BOH = 0` on QEMU), staggered spin-up (`CAP.SSS = 0`), COMRESET timing, hot-plug, and real completion-interrupt routing — is **skip-with-reason** in CI and validated on bare metal, mirroring how `wifi-smoke` is skip-with-reason and the Phase 79 Realtek/igc tracks are hardware-only. A QEMU ordering trap to honor: `PxSIG` reads `0xFFFFFFFF` until `PxCMD.FRE` is enabled and the initial D2H FIS is delivered, so device classification must follow FRE, never precede it — `port.rs` classifies after `enable_fis_rx`.
 
+## Important Components and How They Work
+
+- **`kernel-core/src/storage/{ahci,ata}.rs` — the host-tested substrate.** Every register offset, struct (command header / command table / PRDT / received-FIS), FIS byte layout (`FIS_TYPE_REG_H2D = 0x27`), PRDT `DBC` N−1 encoding, slot allocator (`find_free_slot` over `PxSACT | PxCI`), signature classifier (`classify_port`/`is_driveable`), and the ATA opcode/LBA48/IDENTIFY-parse helpers live here, pinned by compile-time size/offset asserts and 34 host tests. None of it pokes hardware, so `cargo xtask check` proves it with no QEMU.
+- **`userspace/drivers/ahci/lib.rs` — the `os-binary`/lib split.** Holds the driver-side decision logic that *can* be host-tested without a syscall surface: `request_is_oversized`, `pick_slot`, and `poll_outcome` (the issue/reap classifier that checks `is_fatal` *before* `cmd_complete`, so a host-bus error never reads as success). The production register-poking modules below are `#[cfg(not(test))]`-gated so the lib target stays host-testable.
+- **`init.rs` / `port.rs` / `cmd.rs` — the production hardware path.** `init.rs` enables AHCI, resets the HBA, re-reads `CAP`/`PI`/`VS`, and runs the `CAP2.BOH` handoff gate. `port.rs` brings a port up through the stop → program-DMA(IOVA) → FRE → COMRESET → classify → clear-W1C → start ordering and owns `recover_port`. `cmd.rs` is the single-in-flight engine: build header + command table (CFIS + one PRDT at the bounce-buffer IOVA), issue on `PxCI`, poll `poll_outcome`, recover on a fatal `PxIS`.
+- **`io.rs` — the (bare-metal-only) interrupt path.** `arm_interrupts`/`handle_irq` (PxIS-then-global-IS clear order) are written and unit-tested but unwired from the main loop because the data path is polling-primary under QEMU; the IRQ path is reserved for VFIO/bare-metal (Track C.5).
+- **`main.rs` — the entry point and block server.** Discovers the controller by PCI class `0x010601`, brings up the first driveable SATA port, IDENTIFYs, then either runs the destructive boot self-test (a *blank* scratch disk — the `ahci-smoke` path) or read-only-probes the MBR (a disk with a valid MBR — the data-disk path); a LBA-0 read *error* fails closed. It registers `ahci.block` and serves `BLK_READ`/`BLK_WRITE` (write followed by `FLUSH CACHE EXT`) over the `driver_ipc::block` protocol.
+- **`kernel/src/blk/remote.rs` + `kernel/src/blk/mbr.rs` — the two scoped kernel changes.** `is_registered()` learns the `"ahci.block"` name (preserving the `/drivers/`-owner trust gate and the `VIRTIO_BLK_READY` deferral so a SATA driver can never hijack the virtio root); `read_mbr()` reads sector 0 through the `blk::read_sectors` facade so the mount-time partition probe can reach a SATA root.
+- **`userspace/init/src/main.rs` — the SATA-root bootstrap.** Spawns `/drivers/ahci` from the ramdisk and retries the ext2 mount only when the initial virtio-blk mount fails, so the normal virtio boot is untouched.
+
 ## How This Builds on Earlier Phases
 
 - Reuses the Phase 55b ring-3 device-host primitives unchanged: `sys_device_claim` (which auto-enables Memory Space + Bus Master), `sys_device_mmio_map` (BAR5/ABAR), `sys_device_dma_alloc` (`DmaBuffer<T>`), `sys_device_irq_subscribe`.
@@ -118,7 +128,7 @@ The CI tier runs against `-device ich9-ahci` + `ide-hd` (PCI class `0x010601`, V
 ## Acceptance Criteria
 
 - `cargo xtask run --device ahci` boots with the data disk on AHCI; the boot log shows `CAP.NCS=32 S64A=1`, `PI=0x0000003f`, `ports_found=1`, `port 0 classified SATA`, `identify sectors=2097152 sector_bytes=512 flush=1`, `ext2 partition found`, `auto-registered ring-3 'ahci0' driver ... (ahci.block ...)`, and `/ mounted (ext2 via ring-3 ahci.block)` — then reaches the login shell.
-- `cargo xtask ahci-smoke` boots `-device ich9-ahci` + a blank scratch `ide-hd` and asserts the binding sentinel set `AHCI_SMOKE:identify:PASS` / `write:PASS` / `readback:PASS` / `flush:PASS` / `identify2:PASS` / `server:READY`; the read-back byte-compare is the load-bearing assertion.
+- `cargo xtask ahci-smoke` boots `-device ich9-ahci` + a blank scratch `ide-hd` and asserts the binding sentinel set `AHCI_SMOKE:identify:PASS` / `write:PASS` / `readback:PASS` / `flush:PASS` / `identify2:PASS` / `recover:PASS` / `server:READY`; the read-back byte-compare is the load-bearing assertion, and `recover:PASS` exercises C.4 error recovery (an out-of-range LBA latches `PxIS.TFES`, `recover_port` restarts the engine, and a valid read then succeeds).
 - No NVMe regression — both back-ends coexist; the standard `smoke-test` (virtio root) still passes 22 steps.
 - `cargo xtask check` passes (clippy `-D warnings`, rustfmt, host tests).
 

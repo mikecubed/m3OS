@@ -107,7 +107,7 @@ This sets `core.hooksPath` to `.githooks/`. **pre-commit** runs `cargo xtask che
 | `multi-nic-smoke` (e1000 + e1000e + igb arms) | `M3OS_MULTI_NIC_REGRESSION=1` |
 | `hda-smoke` (`-device intel-hda -device hda-duplex`, non-silent WAV) | `M3OS_HDA_REGRESSION=1` |
 | `wifi-smoke` (no QEMU mt76 model — skip-with-reason; radio validated via VFIO) | `M3OS_WIFI_REGRESSION=1` |
-| `ahci-smoke` (`-device ich9-ahci` + scratch `ide-hd`; IDENTIFY/write/read-back-compare/flush/IDENTIFY-after-write; BOHC/SSS/hot-plug skip-with-reason on QEMU, validated via VFIO) | `M3OS_AHCI_REGRESSION=1` |
+| `ahci-smoke` (`-device ich9-ahci` + scratch `ide-hd`; IDENTIFY/write/read-back-compare/flush/IDENTIFY-after-write/induced-TFES-recovery; BOHC/SSS/hot-plug skip-with-reason on QEMU, validated via VFIO) | `M3OS_AHCI_REGRESSION=1` |
 
 The `tls-smoke`/`dns-smoke` gates assert the musl-built smoke stage actually
 `PASS`ed rather than `SKIP`ped — a `SKIP` means the musl cross-compiler was

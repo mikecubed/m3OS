@@ -9809,7 +9809,8 @@ fn cmd_hda_smoke(args: &SmokeBootArgs) {
 /// Serial steps the `ahci-smoke` gate asserts: kernel boot, then the ring-3
 /// `ahci_driver`'s binding boot-self-test sentinel set against a blank scratch
 /// disk (IDENTIFY → WRITE DMA EXT → read-back byte-compare → FLUSH CACHE EXT →
-/// IDENTIFY-after-write), then the server-ready marker.
+/// IDENTIFY-after-write → induced-TFES error recovery), then the server-ready
+/// marker.
 fn ahci_smoke_steps() -> Vec<SmokeStep> {
     vec![
         SmokeStep::Wait {
@@ -9847,6 +9848,15 @@ fn ahci_smoke_steps() -> Vec<SmokeStep> {
             pattern: "AHCI_SMOKE:identify2:PASS",
             timeout_secs: 30,
             label: "guest/ahci: IDENTIFY after write ok",
+        },
+        // C.4 error recovery: induce a TFES on an out-of-range LBA, run
+        // recover_port (engine restart), and complete a valid read — proves the
+        // port recovers instead of wedging. Without this the recovery path would
+        // ride unverified.
+        SmokeStep::Wait {
+            pattern: "AHCI_SMOKE:recover:PASS",
+            timeout_secs: 30,
+            label: "guest/ahci: TFES error recovery + engine restart",
         },
         // The driver registers ahci.block and is about to enter the server loop.
         SmokeStep::Wait {

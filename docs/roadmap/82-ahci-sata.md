@@ -84,7 +84,7 @@ AHCI defines exactly one command queue per port (with 32 slots). It cannot match
 
 - `cargo xtask run --device ahci` boots m3OS with the data disk on AHCI instead of VirtIO-blk and the smoke run passes.
 - Multi-block read / write throughput exceeds 50 MB/s on QEMU AHCI emulation (sanity check, not a perf target).
-- A new `cargo xtask ahci-smoke` gate exercises the IDENTIFY + read + write + read-back-compare + IDENTIFY-after-write paths.
+- A new `cargo xtask ahci-smoke` gate exercises the IDENTIFY + read + write + read-back-compare + IDENTIFY-after-write + induced-TFES error-recovery paths.
 - The write path is durable: a `WRITE DMA EXT` is followed by `FLUSH CACHE EXT` and reported durable only after the flush completes without `PxIS.TFES`; the `ahci-smoke` gate asserts the FLUSH CACHE EXT step (`0xEA`, `PRDTL = 0`) completes successfully after a write.
 - No regression in NVMe — both back-ends coexist; the disk-probe path discovers whichever is attached.
 - If shipped pre-1.0: kernel bumped to `0.82.0`. If deferred: doc reflects the deferral and Phase 83's support matrix lists "NVMe only" explicitly.
@@ -92,6 +92,7 @@ AHCI defines exactly one command queue per port (with 32 slots). It cannot match
 ## Companion Task List
 
 - [Phase 82 Task List](./tasks/82-ahci-sata-tasks.md)
+- [Phase 82 Learning Doc](../82-ahci-sata.md)
 
 ## How Real OS Implementations Differ
 

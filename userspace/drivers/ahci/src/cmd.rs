@@ -205,9 +205,16 @@ pub fn read_sectors(port: &mut Port, lba: u64, count: u16) -> Result<(), CmdErro
 pub fn write_sectors(port: &mut Port, lba: u64, count: u16, data: &[u8]) -> Result<(), CmdError> {
     let byte_count = count as usize * 512;
     let n = byte_count.min(data.len()).min(crate::DATA_BOUNCE_BYTES);
-    // SAFETY: the bounce buffer is `DATA_BOUNCE_BYTES` long and `n` is clamped.
+    // SAFETY: build the destination slice over the *fixed* bounce-buffer length,
+    // never `byte_count` — a caller passing `count > MAX_SECTORS_PER_REQUEST`
+    // would otherwise construct a slice longer than the allocation, which is UB
+    // even though only `[..n]` is written. The buffer is `DATA_BOUNCE_BYTES`
+    // long and live for the port's lifetime; `n` is clamped to it above.
     let dst = unsafe {
-        core::slice::from_raw_parts_mut(port.data_bounce.user_ptr() as *mut u8, byte_count)
+        core::slice::from_raw_parts_mut(
+            port.data_bounce.user_ptr() as *mut u8,
+            crate::DATA_BOUNCE_BYTES,
+        )
     };
     dst[..n].copy_from_slice(&data[..n]);
     let fis = encode_rw_fis(true, lba, count);

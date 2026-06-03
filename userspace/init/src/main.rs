@@ -57,12 +57,12 @@ fn alloc_error(_layout: Layout) -> ! {
 // ---------------------------------------------------------------------------
 
 // `KNOWN_CONFIGS` below lists the service paths (Phase 73's 25 + the 78a/78b/78c
-// USB driver configs + Phase 80 `ac97_driver`/`hda_driver`). The fallback loader
-// (`load_services_from_known_configs`) and the dir-scan path both stop adding
-// services once `self.count >= MAX_SERVICES`, so the ceiling must exceed the
-// number of `.conf` files actually present (the ext2 staging now writes 31) or
-// the last entries are silently dropped. Sized with headroom for future
-// additions; the extra slots cost a few hundred bytes.
+// USB driver configs + Phase 80 `ac97_driver`/`hda_driver` + Phase 82
+// `ahci_driver`). The fallback loader (`load_services_from_known_configs`) and
+// the dir-scan path both stop adding services once `self.count >= MAX_SERVICES`,
+// so the ceiling must exceed the number of `.conf` files actually present (the
+// ext2 staging now writes 32) or the last entries are silently dropped. Sized
+// with headroom for future additions; the extra slots cost a few hundred bytes.
 const MAX_SERVICES: usize = 34;
 const MAX_DISCOVERED_DISABLED: usize = 24;
 const MAX_PIDS: usize = 64;

@@ -135,7 +135,7 @@ pub fn poll_outcome(ci: u32, slot: u8, is: u32) -> CmdOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kernel_core::storage::ahci::{IS_DHRS, PX_IS_TFES};
+    use kernel_core::storage::ahci::{IS_DHRS, IS_HBDS, IS_HBFS, IS_IFS, PX_IS_TFES};
 
     #[test]
     fn request_oversize_gate() {
@@ -168,6 +168,15 @@ mod tests {
             poll_outcome(ci_issued, slot, PX_IS_TFES),
             CmdOutcome::Failed
         );
+
+        // All four fatal sources must win over a cleared PxCI bit. The
+        // `is_fatal`-before-`cmd_complete` ordering in `poll_outcome` is
+        // load-bearing: `cmd_complete` only inspects TFES, so a host-bus error
+        // (HBFS/HBDS) or interface fatal (IFS) with the slot bit already cleared
+        // must still classify `Failed`, never `Complete`.
+        assert_eq!(poll_outcome(0, slot, IS_HBFS), CmdOutcome::Failed);
+        assert_eq!(poll_outcome(0, slot, IS_HBDS), CmdOutcome::Failed);
+        assert_eq!(poll_outcome(0, slot, IS_IFS), CmdOutcome::Failed);
     }
 
     #[test]

@@ -277,8 +277,8 @@ impl<'a> Port<'a> {
         self.pwrite(PX_IS, is); // W1C
     }
 
-    /// Start the command engine: confirm `CR == 0`, then set `FRE` and `ST`.
-    /// Returns `true` once `CR` reads back 1.
+    /// Start the command engine: confirm `CR == 0`, set `FRE` **before** `ST`,
+    /// then confirm `CR` reads back 1.
     pub fn start_engine(&self) -> bool {
         // Never re-arm ST while CR is set.
         let mut i = 0u64;
@@ -286,14 +286,28 @@ impl<'a> Port<'a> {
             core::hint::spin_loop();
             i += 1;
         }
+        // AHCI 1.3.1 §10.3.1: FRE must be set before ST. On bring-up
+        // `enable_fis_rx` already set FRE; on the recovery path `stop_engine`
+        // cleared it, so set FRE first and let a posted-write read-back flush it
+        // before arming ST — a strict HBA may begin processing the instant ST is
+        // set and must find the FIS-receive engine already enabled.
         let cmd = self.pread(PX_CMD);
-        self.pwrite(PX_CMD, cmd | CMD_FRE | CMD_ST);
+        self.pwrite(PX_CMD, cmd | CMD_FRE);
+        let cmd = self.pread(PX_CMD); // posted-write flush: FRE visible before ST
+        self.pwrite(PX_CMD, cmd | CMD_ST);
         // Confirm the command engine is running.
         let mut i = 0u64;
         while self.pread(PX_CMD) & CMD_CR == 0 && i < MMIO_SPIN_BUDGET {
             core::hint::spin_loop();
             i += 1;
         }
+        self.pread(PX_CMD) & CMD_CR != 0
+    }
+
+    /// `true` while the command engine is running (`PxCMD.CR == 1`). Lets the
+    /// C.4 self-test confirm `recover_port` restarted the engine after an
+    /// induced task-file error instead of leaving the port wedged.
+    pub fn engine_running(&self) -> bool {
         self.pread(PX_CMD) & CMD_CR != 0
     }
 
