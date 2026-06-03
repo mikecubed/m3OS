@@ -124,9 +124,11 @@ static PENDING: [AtomicU64; MAX_NOTIFS] = {
 
 /// Per-notification cumulative signal counter (diagnostic only).
 ///
-/// Incremented every time a bit is set on a notification via [`signal`],
-/// [`signal_irq`], or [`signal_irq_bit`]. The stuck-task watchdog dumps this
-/// alongside `PENDING` / `WAITERS` so a `BlockedOnNotif` strand can be
+/// Incremented once per [`signal`] / [`signal_irq`] / [`signal_irq_bit`] call
+/// that delivers to this notification — i.e. it counts signal *events*, not
+/// bits (a single `signal()` that sets several bits at once counts as one).
+/// The stuck-task watchdog dumps this alongside `PENDING` / `WAITERS` so a
+/// `BlockedOnNotif` strand can be
 /// classified as a *lost-wakeup-after-register* (signals were delivered but
 /// the waiter was consumed without being woken → `signals > 0`, `PENDING != 0`,
 /// no live waiter) versus a *never-signaled* wait (the device IRQ never fired
