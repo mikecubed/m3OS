@@ -355,10 +355,23 @@ fi
 # M3OS_AHCI_REGRESSION=1 because it boots a full QEMU run; set it on branches
 # touching userspace/drivers/ahci, kernel_core::storage, the blk::remote
 # cold-path lookup, or the init SATA-root bootstrap.
+#
+# `ahci-root-smoke` is the companion end-to-end gate: it routes the real ext2
+# data disk to the AHCI controller (the `--device ahci` topology) and asserts
+# the entire system boots with its root filesystem served over `ahci.block`
+# (virtio root absent -> driver MBR/ext2 probe -> owner-gate accept -> `init: /
+# mounted (ext2 via ring-3 ahci.block)` -> login prompt). It is the CI proof of
+# the headline "a SATA disk mounts the root off ahci.block" that the isolated
+# `ahci-smoke` self-test does not cover.
 if [ "${M3OS_AHCI_REGRESSION:-0}" = "1" ]; then
     echo "pre-push: running cargo xtask ahci-smoke..."
     if ! cargo xtask ahci-smoke --timeout 240; then
         echo "pre-push: cargo xtask ahci-smoke failed" >&2
+        exit 1
+    fi
+    echo "pre-push: running cargo xtask ahci-root-smoke..."
+    if ! cargo xtask ahci-root-smoke --timeout 240; then
+        echo "pre-push: cargo xtask ahci-root-smoke failed" >&2
         exit 1
     fi
 fi

@@ -272,7 +272,7 @@
 
 **Acceptance:**
 - [x] `find_ext2_partition` / `find_fat32_partition` (already host-tested in `kernel-core/src/fs/mbr.rs`) are the partition walkers used; the AHCI path adds no new partition-table code.
-- [x] Under `cargo xtask run --device ahci` (data disk on AHCI), the boot log shows the ext2 partition discovered on the SATA device and the VFS mounting it (the same `find_ext2_partition(...) == Some((start, count))` shape virtio/NVMe produce).
+- [x] Under `cargo xtask run --device ahci` (data disk on AHCI), the boot log shows the ext2 partition discovered on the SATA device and the VFS mounting it (the same `find_ext2_partition(...) == Some((start, count))` shape virtio/NVMe produce). **CI-gated** by `cargo xtask ahci-root-smoke` (post-landing follow-up), which asserts `AHCI: ext2 partition found start=` → owner-gate `auto-registered ring-3 'ahci0' driver` → `init: / mounted (ext2 via ring-3 ahci.block)` → `m3OS login:`, replacing the prior manual-only validation of this criterion.
 - [x] No file under `kernel/src/fs/` is modified for the SATA mount (grep-verifiable: the only data-path kernel diff is D.2's `blk/remote.rs` lookup).
 
 ### D.4 — Four-place binary wiring (`ahci_driver`) + `ahci_driver.conf`
@@ -318,6 +318,7 @@
 - [x] `cargo xtask ahci-smoke` boots with `-device ich9-ahci` + `ide-hd`, asserts `AHCI_SMOKE:server:READY`, and asserts the full **binding** six-step sentinel set `AHCI_SMOKE:identify:PASS`, `AHCI_SMOKE:write:PASS`, `AHCI_SMOKE:readback:PASS`, `AHCI_SMOKE:flush:PASS`, `AHCI_SMOKE:identify2:PASS`, `AHCI_SMOKE:recover:PASS` (the IDENTIFY-after-write and induced-TFES-recovery steps are named, not advisory).
 - [x] The read-back byte-compare of the written LBA pattern is asserted equal (the gate fails if the data path is silently broken).
 - [x] The subcommand is registered in the xtask dispatch `match` and the usage/help string; the gate is added to the AGENTS.md opt-in gate table under `M3OS_AHCI_REGRESSION` (F.3).
+- [x] **Post-landing follow-up — `cmd_ahci_root_smoke` (`cargo xtask ahci-root-smoke`).** `ahci-smoke` exercises the driver in isolation against a blank scratch disk and keeps the root on virtio; it does **not** prove the headline "a SATA disk mounts the root off `ahci.block`". The companion `ahci-root-smoke` gate routes the real ext2 data disk to AHCI (`qemu_args_with_devices` with `DeviceSet{ahci:true}`) and asserts the full end-to-end chain: kernel boot → `init: / mount failed (` (virtio root absent) → `AHCI: ext2 partition found start=` (read-only MBR probe, not the self-test) → `[blk::remote] auto-registered ring-3 'ahci0' driver` (owner trust gate accepts) → `init: / mounted (ext2 via ring-3 ahci.block)` → `m3OS login:`. Passes 6/6 in ~8s. Unit-pinned by `ahci_root_smoke_asserts_root_mounted_over_ahci_block`; opt-in under the same `M3OS_AHCI_REGRESSION=1` pre-push gate. Closes the gap where the root-over-SATA acceptance criteria were validated only by a manual interactive run.
 - [x] *(Bare-metal/VFIO-only.)* The BOHC handoff (B.3), COMRESET (B.5), and a real completion interrupt (C.5) are validated on hardware — QEMU's `ich9-ahci` leaves `CAP2.BOH=0` / `CAP.SSS=0` and has no real SATA timing, so the gate prints a skip-with-reason for those (mirroring `wifi-smoke`/`multi-nic-smoke` skips).
 
 ---

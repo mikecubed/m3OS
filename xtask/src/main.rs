@@ -605,6 +605,15 @@ fn main() {
                 });
             cmd_ahci_smoke(&smoke_args);
         }
+        Some("ahci-root-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("ahci-root-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_ahci_root_smoke(&smoke_args);
+        }
         Some("session-smoke") => {
             let smoke_args =
                 parse_smoke_boot_args("session-smoke", &args[2..]).unwrap_or_else(|err| {
@@ -840,7 +849,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -9987,6 +9996,182 @@ fn cmd_ahci_smoke(args: &SmokeBootArgs) {
          staggered spin-up (CAP.SSS=0), COMRESET timing, and a real completion interrupt are \
          validated on hardware via VFIO passthrough — see docs/82-ahci-sata.md."
     );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 82 — ahci-root-smoke: ext2 ROOT mounted off `ahci.block` end-to-end.
+// ---------------------------------------------------------------------------
+
+/// Serial steps the `ahci-root-smoke` gate asserts.
+///
+/// Unlike `ahci-smoke` (which keeps the root on virtio-blk and runs the
+/// driver's destructive self-test against a *blank scratch* disk), this gate
+/// routes the **real ext2 data disk to the AHCI controller** — the
+/// `cargo xtask run --device ahci` topology — so the entire system boots with
+/// its root filesystem served by the ring-3 `ahci_driver` over `ahci.block`.
+/// It is the CI proof of the Phase 82 headline claim "a SATA disk mounts the
+/// root off `ahci.block`", which was previously validated only by a manual
+/// interactive run.
+///
+/// The proof chain (each marker is a precondition for the next):
+/// 1. kernel boot;
+/// 2. init's first ext2 mount FAILS — the data disk is not on virtio-blk
+///    (`VIRTIO_BLK_READY == false`), so the cold path is eligible;
+/// 3. the driver takes the read-only `partition_probe` path (NOT the
+///    destructive self-test, because the data disk's LBA 0 is a real MBR) and
+///    finds the ext2 root partition on the SATA disk;
+/// 4. the kernel's `blk::remote` cold path auto-registers `ahci.block` — this
+///    fires the **owner trust gate** (`exec_path` under `/drivers/`) and is the
+///    only executing coverage of that security gate;
+/// 5. init's retry mount succeeds **through `ahci.block`** — the load-bearing
+///    assertion;
+/// 6. the system reaches the login prompt. Getting there requires init to scan
+///    and read `/etc/services.d/*` back off the AHCI-served root (those configs
+///    live on the ext2 data disk, not the ramdisk) and complete service boot —
+///    i.e. the filesystem genuinely serves directory and file reads, not just a
+///    `mount()` that returned 0. (The unforgeable proof is step 5's mount
+///    marker; this step corroborates a full, healthy boot off the SATA root.)
+fn ahci_root_smoke_steps() -> Vec<SmokeStep> {
+    vec![
+        SmokeStep::Wait {
+            pattern: "[m3os] Hello from kernel",
+            timeout_secs: 30,
+            label: "guest/ahci-root: kernel first message",
+        },
+        // The data disk is on AHCI, not virtio-blk, so the in-kernel virtio
+        // root mount must fail first — this is what makes the ring-3 cold path
+        // eligible. Asserting it proves the disk really moved off virtio.
+        SmokeStep::Wait {
+            pattern: "init: / mount failed (",
+            timeout_secs: 30,
+            label: "guest/ahci-root: virtio-blk root absent (data disk is on AHCI)",
+        },
+        // The driver IDENTIFYs the real data disk and walks its MBR (the
+        // read-only partition_probe path — never the destructive self-test,
+        // because LBA 0 is a valid MBR, not a blank scratch sector).
+        SmokeStep::Wait {
+            pattern: "AHCI: ext2 partition found start=",
+            timeout_secs: 90,
+            label: "guest/ahci-root: driver found the ext2 root partition on the SATA disk",
+        },
+        // The kernel cold path validates the publisher's exec_path is under
+        // /drivers/ (the owner trust gate) and binds ahci.block. This is the
+        // only place that security gate executes end-to-end.
+        SmokeStep::Wait {
+            pattern: "[blk::remote] auto-registered ring-3 'ahci0' driver",
+            timeout_secs: 30,
+            label: "guest/ahci-root: owner-gate accepted /drivers/ahci → ahci.block bound",
+        },
+        // The load-bearing assertion: the ext2 root is mounted THROUGH the
+        // ring-3 AHCI driver's block facade.
+        SmokeStep::Wait {
+            pattern: "init: / mounted (ext2 via ring-3 ahci.block)",
+            timeout_secs: 30,
+            label: "guest/ahci-root: ext2 / mounted off ahci.block",
+        },
+        // Full userspace boot off the SATA root: reaching the login prompt
+        // means init scanned and read /etc/services.d/* (which live on the ext2
+        // data disk, not the ramdisk) back over ahci.block and finished service
+        // boot — directory + file reads genuinely served by the SATA root, not
+        // just a `mount()` that returned 0. Step 5's marker is the unforgeable
+        // proof; this corroborates a full, healthy boot.
+        SmokeStep::Wait {
+            pattern: "m3OS login:",
+            timeout_secs: 90,
+            label: "guest/ahci-root: reached login — root FS serves /etc/services.d reads over ahci.block",
+        },
+    ]
+}
+
+/// Run the AHCI-root smoke: boot with the data disk routed to `ich9-ahci` and
+/// assert the ext2 root mounts off `ahci.block` end-to-end (model on
+/// `cmd_ahci_smoke`, but the data disk *is* the SATA disk rather than a
+/// separate scratch disk).
+fn cmd_ahci_root_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    // Recreate the ext2 data disk fresh so the run is hermetic. This disk is
+    // the ROOT filesystem and is routed to AHCI below (not virtio-blk).
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    // DeviceSet { ahci: true } routes the data disk to an ich9-ahci/ide-hd
+    // chain and omits the virtio-blk data disk entirely (see
+    // `qemu_args_with_devices`; pinned by the
+    // `qemu_args_with_ahci_routes_data_disk_to_ich9_ahci` unit test).
+    let mut qemu_args = qemu_args_with_devices(
+        &uefi_image,
+        &ovmf,
+        display_mode,
+        DeviceSet {
+            ahci: true,
+            ..DeviceSet::default()
+        },
+    );
+    // Strip the hostfwd rules so parallel CI lanes do not collide on host
+    // ports 2222/2323 (same approach as `cmd_ahci_smoke` / `hda-smoke`).
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+
+    let steps = ahci_root_smoke_steps();
+
+    println!(
+        "ahci-root-smoke: launching QEMU with the ext2 data disk on ich9-ahci \
+         (root over ahci.block, timeout {}s)",
+        args.timeout_secs
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!(
+                "ahci-root-smoke: serial script PASSED ({} steps in {elapsed}s) — \
+                 ext2 root mounted and served over ahci.block",
+                steps.len()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("ahci-root-smoke: FAILED\n{msg}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Build the QEMU arg vector for the audio smoke.
@@ -20431,6 +20616,51 @@ mod tests {
         );
 
         fs::remove_dir_all(&temp_root).ok();
+    }
+
+    /// The `ahci-root-smoke` gate must assert the full root-over-AHCI proof
+    /// chain, not a weaker subset. If a future edit drops the load-bearing
+    /// mount marker or the boot-completion proof, this test fails — guarding
+    /// against the gate silently degrading into a no-op green.
+    #[test]
+    fn ahci_root_smoke_asserts_root_mounted_over_ahci_block() {
+        let patterns: Vec<&str> = ahci_root_smoke_steps()
+            .iter()
+            .filter_map(|s| match s {
+                SmokeStep::Wait { pattern, .. } => Some(*pattern),
+                _ => None,
+            })
+            .collect();
+
+        // The load-bearing assertion: the ext2 root mounts THROUGH ahci.block.
+        assert!(
+            patterns
+                .iter()
+                .any(|p| *p == "init: / mounted (ext2 via ring-3 ahci.block)"),
+            "ahci-root-smoke must assert the ext2 root mounted via ring-3 ahci.block, got: {patterns:?}"
+        );
+        // The driver must take the read-only MBR partition_probe path on the
+        // real data disk (proves it is NOT the destructive blank-scratch
+        // self-test path that `ahci-smoke` exercises).
+        assert!(
+            patterns
+                .iter()
+                .any(|p| p.starts_with("AHCI: ext2 partition found start=")),
+            "ahci-root-smoke must assert the driver found the ext2 partition on the SATA disk, got: {patterns:?}"
+        );
+        // The owner trust gate must execute and accept the /drivers/ publisher.
+        assert!(
+            patterns
+                .iter()
+                .any(|p| p.contains("auto-registered ring-3 'ahci0' driver")),
+            "ahci-root-smoke must assert the kernel owner-gate bound ahci.block, got: {patterns:?}"
+        );
+        // The FS must actually serve reads end-to-end (login requires reading
+        // service configs + the login ELF + /etc/passwd off the AHCI root).
+        assert!(
+            patterns.iter().any(|p| *p == "m3OS login:"),
+            "ahci-root-smoke must assert the system reached login off the AHCI root, got: {patterns:?}"
+        );
     }
 
     #[test]

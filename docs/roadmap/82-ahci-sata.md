@@ -85,6 +85,7 @@ AHCI defines exactly one command queue per port (with 32 slots). It cannot match
 - `cargo xtask run --device ahci` boots m3OS with the data disk on AHCI instead of VirtIO-blk and the smoke run passes.
 - Multi-block read / write throughput exceeds 50 MB/s on QEMU AHCI emulation (sanity check, not a perf target).
 - A new `cargo xtask ahci-smoke` gate exercises the IDENTIFY + read + write + read-back-compare + IDENTIFY-after-write + induced-TFES error-recovery paths.
+- A new `cargo xtask ahci-root-smoke` gate proves the headline end-to-end in CI: it routes the real ext2 data disk to `ich9-ahci` (the `--device ahci` topology) and asserts the full chain — virtio root absent → driver MBR/ext2 probe on the SATA disk → kernel owner-gate accepts `/drivers/ahci` and binds `ahci.block` → `init: / mounted (ext2 via ring-3 ahci.block)` → login prompt (so the root FS genuinely serves directory/file/ELF reads, not just a `mount()` that returned 0). This replaces the prior manual-only validation of the root-over-SATA path.
 - The write path is durable: a `WRITE DMA EXT` is followed by `FLUSH CACHE EXT` and reported durable only after the flush completes without `PxIS.TFES`; the `ahci-smoke` gate asserts the FLUSH CACHE EXT step (`0xEA`, `PRDTL = 0`) completes successfully after a write.
 - No regression in NVMe — both back-ends coexist; the disk-probe path discovers whichever is attached.
 - If shipped pre-1.0: kernel bumped to `0.82.0`. If deferred: doc reflects the deferral and Phase 83's support matrix lists "NVMe only" explicitly.
