@@ -1,14 +1,16 @@
 # Phase 82 - AHCI / SATA Storage
 
-**Status:** Planned (optional pre-1.0)
+**Status:** Complete ✅ (landed pre-1.0; kernel `0.82.0`)
 **Source Ref:** phase-82
 **Depends on:** Phase 55b (Ring-3 Driver Hosting) ✅, Phase 67 (IOMMU Substrate) ✅
 **Builds on:** Adds AHCI-mode SATA storage support to the project's NVMe-only storage matrix. Optional for 1.0 — the Phase 74a §1 audit grades AHCI as HIGH (not BLOCKER) because most 2018+ systems are NVMe-only, but older systems and many enterprise deployments still depend on SATA
 **Primary Components:** `userspace/drivers/ahci/` (new), `kernel-core/src/storage/` (host-testable AHCI command-table layout), `kernel/initrd/etc/services.d/ahci_driver.conf` (new)
 
+> **As-built reconciliation (landing).** The shipped phase matches this design with two clarifications. (1) **Kernel changes**: the data-path change is the `blk::remote::is_registered()` cold-path lookup learning `"ahci.block"` (D.2, as planned). Making a SATA disk serve the **root** required one further small, no-regression kernel change the original design under-specified — `kernel/src/blk/mbr.rs::read_mbr()` now reads the sector-0 partition probe through the `blk::read_sectors` facade (which routes to a registered `ahci.block`/`nvme.block` driver when virtio-blk is not the root) instead of reading virtio-blk directly. (2) **Bootstrap**: the kernel mounts the root before any ring-3 driver exists, so `init` spawns `/drivers/ahci` from the ramdisk and retries the ext2 mount when the initial virtio-blk mount fails (gated on mount-failure, so the normal virtio boot is untouched). The IRQ syscall is `sys_device_irq_subscribe`; the xtask flag is `cargo xtask run --device ahci` and the QEMU device is `-device ich9-ahci` (`ahci` is the QEMU alias).
+
 ## Milestone Goal
 
-m3OS finds and uses a SATA SSD or HDD attached to an AHCI-mode host controller. The driver is a ring-3 userspace process on top of the Phase 55b host primitives, registers as a `RemoteBlockDevice` (the same facade NVMe uses today), and lets the existing VFS/ext2 stack mount a SATA partition with a single small kernel change — the `blk::remote` cold-path service lookup learns the `"ahci.block"` name; everything else in the VFS path is unchanged.
+m3OS finds and uses a SATA SSD or HDD attached to an AHCI-mode host controller. The driver is a ring-3 userspace process on top of the Phase 55b host primitives, registers as a `RemoteBlockDevice` (the same facade NVMe uses today), and lets the existing VFS/ext2 stack mount a SATA partition with a small scoped kernel change — the `blk::remote` cold-path service lookup learns the `"ahci.block"` name (and the `blk::mbr` probe reads through the block facade so the mount-time partition probe can reach a SATA root); everything else in the VFS path is unchanged.
 
 ## Why This Phase Exists
 

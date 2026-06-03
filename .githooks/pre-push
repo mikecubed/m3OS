@@ -344,3 +344,21 @@ if [ "${M3OS_WIFI_REGRESSION:-0}" = "1" ]; then
     echo "pre-push: running cargo xtask wifi-smoke..."
     cargo xtask wifi-smoke
 fi
+
+# Phase 82 — opt-in AHCI/SATA regression gate. `ahci-smoke` boots QEMU with
+# `-device ich9-ahci` + a blank scratch `ide-hd`, brings up the ring-3 AHCI
+# driver (HBA reset + port engine stop/start + COMRESET + IDENTIFY), and asserts
+# the binding self-test sentinel set (IDENTIFY -> WRITE DMA EXT -> read-back
+# byte-compare -> FLUSH CACHE EXT -> IDENTIFY-after-write -> server ready). The
+# BOHC handoff / staggered spin-up / real completion interrupt are
+# skip-with-reason on QEMU (validated via VFIO). Gated behind
+# M3OS_AHCI_REGRESSION=1 because it boots a full QEMU run; set it on branches
+# touching userspace/drivers/ahci, kernel_core::storage, the blk::remote
+# cold-path lookup, or the init SATA-root bootstrap.
+if [ "${M3OS_AHCI_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask ahci-smoke..."
+    if ! cargo xtask ahci-smoke --timeout 240; then
+        echo "pre-push: cargo xtask ahci-smoke failed" >&2
+        exit 1
+    fi
+fi
