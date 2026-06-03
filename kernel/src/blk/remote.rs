@@ -95,10 +95,13 @@ pub fn register(endpoint_name: &str, device_name: &str) -> Result<(), ()> {
 /// On the cold path (no endpoint cached yet) performs a one-shot lookup of
 /// `"nvme.block"` and then `"ahci.block"` in the IPC service registry.  If a
 /// ring-3 NVMe **or** AHCI/SATA driver has published its endpoint under one of
-/// those names **and** the publishing task is a supervised driver process, the
-/// facade installs it and returns `true` — so the block dispatch layer
-/// immediately starts routing through the ring-3 path without any explicit
-/// boot-time wiring call. `"nvme.block"` is preferred when both are present.
+/// those names **and** the publishing task is a trusted `/drivers/` process
+/// (its `exec_path` starts with `/drivers/` — see the owner gate below; note
+/// this includes a driver init spawns directly, not only service-manager
+/// supervised ones), the facade installs it and returns `true` — so the block
+/// dispatch layer immediately starts routing through the ring-3 path without
+/// any explicit boot-time wiring call. `"nvme.block"` is preferred when both
+/// are present.
 ///
 /// **Owner gate:** the auto-registration only fires when the owner of the
 /// `nvme.block` / `ahci.block` service registration is a trusted driver process — its
@@ -138,8 +141,9 @@ pub fn is_registered() -> bool {
     }
     // Cold path — attempt a one-shot service-registry lookup *with owner*. A
     // trusted `/drivers/` process may publish either `"nvme.block"` (Phase 55b
-    // NVMe) or `"ahci.block"` (Phase 82 AHCI/SATA); whichever a trusted driver
-    // registered first wins. This is the one scoped data-path kernel change the
+    // NVMe) or `"ahci.block"` (Phase 82 AHCI/SATA); `"nvme.block"` takes priority
+    // when both are present (it is looked up first regardless of which driver
+    // registered earlier). This is the one scoped data-path kernel change the
     // AHCI phase makes (Phase 82 D.2) — the analog of Phase 81's
     // `default_route_index_by_link`.
     let (service_name, device_name, ep, owner_task_id) =
@@ -150,9 +154,10 @@ pub fn is_registered() -> bool {
                 None => return false,
             },
         };
-    // Owner gate: reject registrations from processes that are not
-    // supervised drivers. `owner == 0` (kernel-registered) is treated as
-    // trusted so the boot-time wiring path still works.
+    // Owner gate: reject registrations from processes whose `exec_path` is not
+    // under `/drivers/` (see `is_trusted_driver_task`). `owner == 0`
+    // (kernel-registered) is treated as trusted so the boot-time wiring path
+    // still works.
     if owner_task_id != 0 && !is_trusted_driver_task(owner_task_id) {
         // Log once per cold-path miss so a spoofed registration is
         // visible in the boot log without spamming every VFS call.
@@ -182,7 +187,7 @@ pub fn is_registered() -> bool {
     true
 }
 
-/// `true` when `owner_task_id` belongs to a supervised driver process —
+/// `true` when `owner_task_id` belongs to a trusted `/drivers/` process —
 /// i.e. its `exec_path` starts with `/drivers/`. Mirrors the authorization
 /// gate in `sys_device_claim` so the kernel's trust classification is
 /// consistent across the device-host and the block-dispatch entry points.

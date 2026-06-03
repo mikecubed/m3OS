@@ -2584,7 +2584,13 @@ fn bootstrap_ring3_root_disk() -> isize {
             core::ptr::null(),
         ];
         let argv: [*const u8; 2] = [AHCI_DRIVER_PATH.as_ptr(), core::ptr::null()];
-        let _ = execve(AHCI_DRIVER_PATH, &argv, &envp);
+        // execve only returns on failure; log the negative errno (matching
+        // spawn_login/spawn_smoke_runner) so a missing or non-executable
+        // /drivers/ahci binary is diagnosable from the boot log.
+        let ret = execve(AHCI_DRIVER_PATH, &argv, &envp);
+        write_str(STDOUT_FILENO, "init: /drivers/ahci execve failed (");
+        write_u64(STDOUT_FILENO, (-ret) as u64);
+        write_str(STDOUT_FILENO, ")\n");
         exit(1);
     }
     if pid < 0 {
