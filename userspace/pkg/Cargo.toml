@@ -1,0 +1,30 @@
+[package]
+name = "pkg"
+version = "0.85.0"
+edition = "2024"
+description = "Phase 85a Track C — offline .m3pkg installer + installed-file DB for m3OS"
+
+# Phase 85a: a [lib] holds pure DB + install-planning logic (host-testable);
+# the [[bin]] is the no_std OS binary gated on `os-binary` (same lib+bin split
+# as `m3ctl`, `term`, `session_manager`).  `cargo test -p pkg --target
+# x86_64-unknown-linux-gnu` exercises the lib on the host; the xtask builds the
+# bin with `--features os-binary` for the bare-metal target.
+[lib]
+name = "pkg_app"
+path = "src/lib.rs"
+
+[features]
+os-binary = []
+
+[[bin]]
+name = "pkg"
+path = "src/main.rs"
+required-features = ["os-binary"]
+
+[dependencies]
+# syscall-lib: fs syscalls (open/read/write/close/mkdir/symlink/chmod) + heap
+# allocator + entry_point! macro.  `alloc` feature brings Vec/String into scope.
+syscall-lib = { path = "../syscall-lib", features = ["alloc"] }
+# pkg-format: parse/verify .m3pkg + content_hash/to_hex.  no_std surface:
+# `default-features = false` omits the std-only pack/unpack helpers.
+pkg-format = { path = "../../pkg-format", default-features = false }

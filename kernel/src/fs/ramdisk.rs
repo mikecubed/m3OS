@@ -429,6 +429,9 @@ static NOTIFY_SEND_ELF: &[u8] = generated_initrd_asset!("notify-send");
 
 // Phase 73 — lockscreen Layer-shell stub (exclusive keyboard grab).
 static LOCKSCREEN_ELF: &[u8] = generated_initrd_asset!("lockscreen");
+// Phase 85a Track C — offline .m3pkg package installer + installed-file DB.
+// Not a daemon: no `.conf` (invoked from the shell, one-shot CLI).
+static PKG_ELF: &[u8] = generated_initrd_asset!("pkg");
 
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
@@ -1082,6 +1085,9 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
             content: LOCKSCREEN_ELF,
         },
     ),
+    // Phase 85a Track C — offline package installer. Not a daemon; invoked
+    // from the shell as `pkg install <name>` / `pkg list` / `pkg verify <name>`.
+    ("pkg", RamdiskNode::File { content: PKG_ELF }),
 ];
 
 static ETC_ENTRIES: &[(&str, RamdiskNode)] = &[

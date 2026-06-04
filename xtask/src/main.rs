@@ -1179,6 +1179,8 @@ fn build_userspace_bins() {
         ("notifyd", "notify-send", true),
         // Phase 73 — lockscreen Layer-shell stub.
         ("lockscreen", "lockscreen", true),
+        // Phase 85a Track C — offline package installer (alloc for Vec/String + pkg-format).
+        ("pkg", "pkg", true),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -1234,6 +1236,9 @@ fn build_userspace_bins() {
             "hda_driver" => &["--features", "os-binary"],
             // Phase 82: ahci_driver uses the same lib/bin os-binary split.
             "ahci_driver" => &["--features", "os-binary"],
+            // Phase 85a Track C: pkg uses the same lib/bin os-binary split so
+            // the [[bin]] _start entry point is skipped on host-test builds.
+            "pkg" => &["--features", "os-binary"],
             _ => &[],
         };
 
