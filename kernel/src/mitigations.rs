@@ -102,6 +102,15 @@ pub fn init_bsp() -> &'static MitigationState {
 
         let ibpb_active = !off && features.ibrs_ibpb;
 
+        // Track A.4 — KPTI GLOBAL-bit guard. m3OS marks no kernel PTE GLOBAL, so
+        // this must be 0; a nonzero count means a future CR4.PGE optimization
+        // introduced global kernel PTEs that would survive a KPTI CR3 switch.
+        let global_kernel_ptes = crate::mm::count_global_kernel_leaf_ptes();
+        debug_assert_eq!(
+            global_kernel_ptes, 0,
+            "Track A.4: {global_kernel_ptes} GLOBAL kernel leaf PTE(s) would survive a KPTI CR3 switch"
+        );
+
         let state = MitigationState {
             level,
             level_recognized,
@@ -115,7 +124,7 @@ pub fn init_bsp() -> &'static MitigationState {
         };
 
         log::info!(
-            "[sec] mitigations={:?}{} ibrs={:?} ibpb={} stibp_avail={} rdcl_no={} kpti(policy={} active={})",
+            "[sec] mitigations={:?}{} ibrs={:?} ibpb={} stibp_avail={} rdcl_no={} kpti(policy={} active={}) global_kernel_ptes={}",
             state.level,
             if state.level_recognized { "" } else { " (unrecognized→auto)" },
             state.ibrs_mode,
@@ -124,6 +133,7 @@ pub fn init_bsp() -> &'static MitigationState {
             state.features.rdcl_no,
             state.kpti_policy,
             state.kpti_active,
+            global_kernel_ptes,
         );
         state
     })

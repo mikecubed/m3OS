@@ -21,6 +21,7 @@ pub mod init;
 pub mod input;
 pub mod iommu;
 pub mod ipc;
+pub mod kpti;
 pub mod log_ring;
 pub mod magazine;
 pub mod microcode;
