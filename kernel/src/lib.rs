@@ -38,6 +38,7 @@ pub mod flock;
 pub mod fs;
 pub mod iommu;
 pub mod ipc;
+pub mod mitigations;
 pub mod mm;
 pub mod net;
 pub mod panic_diag;
@@ -306,6 +307,15 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
     // woken). A no-op clean skip on QEMU / non-AMD CPUs (no MSR write unless a
     // strictly-newer matching patch is found in the embedded blob).
     arch::x86_64::microcode::apply_microcode_on_cpu(0);
+
+    // Phase 84 Track D.2 / C.2 — decide the Spectre mitigation policy and apply
+    // the boot-time-applicable mitigations (eIBRS set-once) on the BSP. Runs
+    // before `boot_aps()`; each AP re-applies its own per-core eIBRS in the AP
+    // boot path. The `mitigations=off|auto|full` level is a build-time default
+    // (see the `mitigations` module — m3OS has no kernel boot cmdline).
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        crate::mitigations::init_bsp();
+    });
 
     // Phase 16: Initialize NIC drivers.  Phase 55b E.5: the in-kernel e1000
     // driver has been deleted; device-specific 82540EM code now lives in
