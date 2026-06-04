@@ -397,6 +397,39 @@ fn port_deps(name: &str) -> &'static [&'static str] {
     }
 }
 
+/// Phase 85a (B.2) — compute the portable content key for `name` (the port at
+/// `port_dir`), folding in the active toolchain identity and the resolved
+/// package keys of its direct dependencies. Shared by the resolve-before-build
+/// path and [`pkgcache_artifact_path`] so the key is computed one way only.
+fn compute_port_key(name: &str, port_dir: &Path) -> Result<String, String> {
+    let tc = toolchain_id();
+    let dep_keys: Vec<String> = port_deps(name)
+        .iter()
+        .map(|dep| {
+            let dep_dir = find_port_dir(dep)
+                .ok_or_else(|| format!("dep port {dep} not found in ports/ tree"))?;
+            // Deps here have no deps of their own (ncurses/libevent have no
+            // build deps); the empty slice keeps the recursion correct for the
+            // common case and the signature handles deeper chains unchanged.
+            package_key(&dep_dir, &tc, &[])
+        })
+        .collect::<Result<_, String>>()?;
+    package_key(port_dir, &tc, &dep_keys)
+}
+
+/// Phase 85a (D.1) — the `target/pkgcache/<key>.m3pkg` path a built `name` would
+/// seal to. Used by the image populator to locate each port's sealed artifact
+/// (to bundle into `/usr/pkg/` and pre-install from). Returns the path whether
+/// or not the file exists — callers check existence + [`pkg_format::verify`].
+pub fn pkgcache_artifact_path(name: &str) -> Result<PathBuf, String> {
+    let port_dir =
+        find_port_dir(name).ok_or_else(|| format!("port {name} not found in ports/ tree"))?;
+    let key = compute_port_key(name, &port_dir)?;
+    Ok(workspace_root()
+        .join("target/pkgcache")
+        .join(format!("{key}.m3pkg")))
+}
+
 /// Phase 85a (B.1) — pack the DESTDIR-staged tree into a deterministic
 /// `.m3pkg` artifact and write it atomically to `target/pkgcache/<key>.m3pkg`.
 ///
@@ -425,10 +458,13 @@ fn seal_package(name: &str, stage: &Path, key: &str) -> Result<(), String> {
     fs::rename(&tmp, &artifact)
         .map_err(|e| format!("seal_package({name}): rename into place: {e}"))?;
 
-    // Record the key alongside the stage for diagnostics; does not affect cache
+    // Record the key in a sibling file (NOT inside `stage`) for diagnostics, so
+    // the cache metadata never lands inside a packed artifact (and thus never
+    // ends up at `/.pkgkey` on a future `pkg install`). Does not affect cache
     // lookup (the key is always recomputed from Portfile + toolchain + deps).
-    let pkgkey_file = stage.join(".pkgkey");
-    let _ = fs::write(&pkgkey_file, key);
+    if let Some(stage_root) = stage.parent() {
+        let _ = fs::write(stage_root.join(format!("{name}.pkgkey")), key);
+    }
 
     println!(
         "PKGCACHE: sealed {name} → {} ({} bytes)",
@@ -478,19 +514,13 @@ fn port_build(name: &str) -> Result<(), String> {
     // portable content key already exists and verifies, install directly from
     // it — skipping configure/make/install entirely. This is the "never rebuild"
     // half of the pkgcache (complement of B.1's "build once").
-    let tc = toolchain_id();
-    let dep_keys: Vec<String> = port_deps(name)
-        .iter()
-        .map(|dep| {
-            let dep_dir = find_port_dir(dep)
-                .ok_or_else(|| format!("dep port {dep} not found in ports/ tree"))?;
-            // Deps here have no deps of their own (ncurses, libevent have no
-            // build deps), so we pass an empty slice.  The function signature is
-            // written so deeper chains would work correctly if needed.
-            package_key(&dep_dir, &tc, &[])
-        })
-        .collect::<Result<_, String>>()?;
-    let key = package_key(&port_dir, &tc, &dep_keys)?;
+    //
+    // The `.stamp` (same-machine fast path) lives in a SIBLING file
+    // `target/port-stage/<name>.stamp`, NOT inside `stage`, so the staged tree
+    // packed into the `.m3pkg` is pure package content (no cache metadata leaks
+    // into the artifact or onto `/` at install time).
+    let key = compute_port_key(name, &port_dir)?;
+    let stamp = stage_root.join(format!("{name}.stamp"));
     let pkgcache_artifact = root.join("target/pkgcache").join(format!("{key}.m3pkg"));
     if pkgcache_artifact.exists() {
         if let Ok(bytes) = fs::read(&pkgcache_artifact) {
@@ -511,11 +541,7 @@ fn port_build(name: &str) -> Result<(), String> {
                 // Prime the same-machine `.stamp` fast-path so subsequent calls
                 // skip even the key computation on the same machine.
                 let fingerprint = port_fingerprint(&port_dir);
-                let stamp = stage.join(".stamp");
                 let _ = fs::write(&stamp, &fingerprint);
-
-                // Record key for diagnostics.
-                let _ = fs::write(stage.join(".pkgkey"), &key);
 
                 return Ok(());
             }
@@ -526,7 +552,6 @@ fn port_build(name: &str) -> Result<(), String> {
     println!("PKGCACHE: miss {key} (building)");
 
     let fingerprint = port_fingerprint(&port_dir);
-    let stamp = stage.join(".stamp");
     let cached_stamp = fs::read_to_string(&stamp).unwrap_or_default();
     if cached_stamp.trim() == fingerprint && stage.is_dir() {
         // Same-machine inner-loop fast path: stage is current per local stamp.

@@ -110,6 +110,7 @@ This sets `core.hooksPath` to `.githooks/`. **pre-commit** runs `cargo xtask che
 | `ahci-smoke` (`-device ich9-ahci` + scratch `ide-hd`; IDENTIFY/write/read-back-compare/flush/IDENTIFY-after-write/induced-TFES-recovery; BOHC/SSS/hot-plug skip-with-reason on QEMU, validated via VFIO) **and** `ahci-root-smoke` (real ext2 data disk routed to AHCI; asserts the root mounts off `ahci.block` end-to-end — virtio root absent → driver MBR/ext2 probe → owner-gate accept → `init: / mounted (ext2 via ring-3 ahci.block)` → login prompt) | `M3OS_AHCI_REGRESSION=1` |
 | `mitigations-status-smoke` (Phase 84: boots + asserts the `[sec] mitigations=… global_kernel_ptes=0` boot-policy log and the `m3ctl mitigations status` reporter output — per-vuln Meltdown line + compiled-in retpoline line + UNADDRESSED enumeration; KPTI-independent default boot) | `M3OS_MITIGATIONS_REGRESSION=1` |
 | `pkgcache-hit-check` (Phase 85a: second build of a warmed-cache port performs zero compiler invocations — pure `.m3pkg` hit; requires a musl cross-compiler for the initial warm build) | `M3OS_PKGCACHE_REGRESSION=1` |
+| `pkg-smoke` (Phase 85a: boots m3OS, then `pkg install less` from the bundled offline `/usr/pkg/less.m3pkg` → `pkg list` shows it → `pkg verify less` reports the installed binary OK; proves the `.m3pkg` round-trips build → image → in-OS install) | `M3OS_PKG_REGRESSION=1` |
 
 The `tls-smoke`/`dns-smoke` gates assert the musl-built smoke stage actually
 `PASS`ed rather than `SKIP`ped — a `SKIP` means the musl cross-compiler was

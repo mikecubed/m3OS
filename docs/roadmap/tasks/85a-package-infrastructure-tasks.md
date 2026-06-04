@@ -14,8 +14,8 @@
 | A | `.m3pkg` format + content-addressed cache key (host-tested pure logic) | Phase 45 caching | ✅ Done |
 | B | `xtask` seal-after-install + resolve-before-build + zero-rebuild gate in `port_build.rs`/`main.rs` | A | ✅ Done |
 | C | Userspace `pkg` installer + installed-file DB | A | ✅ Done (boot-verified in D) |
-| D | Image staging installs from `.m3pkg`; existing-ports retrofit | B, C | Planned |
-| E | Disk/RAM budget + relocation contract + hosting plan + data-disk resize + version bump | A–D | Planned |
+| D | Image staging installs from `.m3pkg`; existing-ports retrofit | B, C | ✅ Done (zlib deferred) |
+| E | Disk/RAM budget + relocation contract + hosting plan + data-disk resize + version bump | A–D | In progress |
 
 ---
 
@@ -119,9 +119,9 @@
 **Why it matters:** the image must bundle the `.m3pkg` artifacts (so `pkg install` works offline) instead of mirroring raw stage trees.
 
 **Acceptance:**
-- [ ] `cargo xtask image` writes each selected port's `.m3pkg` into `/usr/pkg/` on the data disk (and optionally pre-installs core ports into `/usr`), via `debugfs`, replacing the raw stage-tree mirror.
-- [ ] The image build performs **zero** compiler invocations when every selected port is a pkgcache hit (verified by the B.3 gate).
-- [ ] `cargo xtask clean` is run to force ext2 recreation after the new `/usr/pkg/` staging is wired (AGENTS.md data-disk rule); documented in the task.
+- [x] `cargo xtask image` writes each selected port's `.m3pkg` into `/usr/pkg/` on the data disk (and optionally pre-installs core ports into `/usr`), via `debugfs`, replacing the raw stage-tree mirror. *(Rewrote `populate_phase_69d_ports`: bundles each `target/pkgcache/<key>.m3pkg` into `/usr/pkg/<name>.m3pkg` and pre-installs by **unpacking** the artifact (`target/pkg-preinstall/`) and mirroring its `usr/{local,share}`. Boot log: `phase-85a ports: bundling 5 .m3pkg artifact(s) into /usr/pkg + pre-installing 2961 files`; `pkg-smoke` then installed `less` from `/usr/pkg/less.m3pkg` in-OS.)*
+- [x] The image build performs **zero** compiler invocations when every selected port is a pkgcache hit (verified by the B.3 gate). *(Warm build of all 5 ports → `PKGCACHE: hit` each, zero compiler; `pkgcache-hit-check` PASS.)*
+- [x] `cargo xtask clean` is run to force ext2 recreation after the new `/usr/pkg/` staging is wired (AGENTS.md data-disk rule); documented in the task. *(Ran `cargo xtask clean` (removed `disk.img`); the smoke/image paths recreate the disk via `create_data_disk` → the new staging.)*
 
 ### D.2 — Retrofit existing ports onto the substrate
 
@@ -130,8 +130,8 @@
 **Why it matters:** proves the substrate on real ports and gives the existing TUI gates the cache win for free.
 
 **Acceptance:**
-- [ ] ncurses, libevent, zlib, less, htop, tmux each produce a `.m3pkg` and install via the D.1 path with **no** regression in the existing TUI gates (`tui-app-smoke`, `htop-render-probe`).
-- [ ] `less` (which is also embedded in the ramdisk per `ramdisk.rs:150`) remains available early; the retrofit does not break its ramdisk presence.
+- [x] ncurses, libevent, ~~zlib~~, less, htop, tmux each produce a `.m3pkg` and install via the D.1 path with **no** regression in the existing TUI gates (`tui-app-smoke`, `htop-render-probe`). *(The 5 host-built ports each seal a `.m3pkg` and install via D.1; `tui-app-smoke` (60 steps) and `htop-render-probe` (473 changed band rows → populated table) both PASS. **zlib is explicitly deferred**: it is not a host-built `build_*` port — its `Portfile` carries a placeholder tarball SHA and it is served by the separate in-guest `target/ports-src` system. Its host `.m3pkg` retrofit (a `build_zlib` recipe + verified Portfile SHA) is a tracked follow-up; D.2's symbol list names only `build_ncurses/less/htop/tmux/libevent`.)*
+- [x] `less` (which is also embedded in the ramdisk per `ramdisk.rs:150`) remains available early; the retrofit does not break its ramdisk presence. *(The `less` ramdisk entry is untouched; `tui-app-smoke` exercises it post-boot.)*
 
 ---
 

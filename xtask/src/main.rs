@@ -183,6 +183,12 @@ const SMOKE_EXIT_TERMIOS_SMOKE_FAILED: i32 = 68;
 /// immediately rather than letting the step time out.
 const SMOKE_EXIT_TUI_APP_SMOKE_FAILED: i32 = 69;
 
+/// Phase 85a Track C/D — `cargo xtask pkg-smoke` exit code. Distinct from the
+/// other gates (70 = doom-concurrent, 72 = tiling) so CI can route a
+/// pkg-install failure separately. Boots m3OS, installs a bundled `.m3pkg` from
+/// the offline `/usr/pkg/` repo, and asserts `pkg list`/`pkg verify` see it.
+const SMOKE_EXIT_PKG_SMOKE_FAILED: i32 = 73;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
     Headless,
@@ -688,6 +694,17 @@ fn main() {
                 });
             cmd_termios_smoke(&smoke_args);
         }
+        // Phase 85a Track C/D — `cargo xtask pkg-smoke` boots m3OS, then drives
+        // `pkg install`/`list`/`verify` against the offline `/usr/pkg/` repo
+        // that the image build bundled. Boot-level proof of the in-OS installer.
+        Some("pkg-smoke") => {
+            let smoke_args = parse_smoke_boot_args("pkg-smoke", &args[2..]).unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            cmd_pkg_smoke(&smoke_args);
+        }
         // Phase 63a Track H — DOOM SFX + music end-to-end smoke. Boots
         // with WAV AC'97 backend, launches `/bin/doom -warp 1 1` with
         // an auto-quit budget so the engine's Shutdown emits the
@@ -869,7 +886,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -13176,6 +13193,152 @@ fn termios_smoke_steps() -> Vec<SmokeStep> {
     steps
 }
 
+/// Phase 85a Track C/D — `cargo xtask pkg-smoke`.
+///
+/// Boots m3OS (serial autologin path), then drives the offline `pkg` installer
+/// against the bundled local repo that Track D staged into `/usr/pkg/`:
+///   1. `pkg list` on a fresh boot → `(no packages installed)` (empty DB).
+///   2. `pkg install less` → reads `/usr/pkg/less.m3pkg`, verifies its SHA-256
+///      hashes, lays the files under `/usr`, records `/var/lib/pkg/db`.
+///   3. `pkg list` → shows `less`.
+///   4. `pkg verify less` → re-hashes the installed binary → `OK`.
+///
+/// This is the boot-level proof for the C.1 acceptance ("`pkg install` installs
+/// a bundled `.m3pkg` into `/usr` inside m3OS and `pkg list` shows it; verified
+/// on a boot") and exercises the full D.1 staging round-trip (pack at build →
+/// bundle into the image → unpack/install in-OS).
+fn cmd_pkg_smoke(args: &SmokeBootArgs) {
+    // Build the host ports so their `.m3pkg` artifacts exist for Track D to
+    // bundle into `/usr/pkg/` (zero compiler invocations on a warm pkgcache).
+    if let Err(msg) = port_build::build_phase_69d_ports() {
+        eprintln!("pkg-smoke: precondition failed (port build): {msg}");
+        std::process::exit(SMOKE_EXIT_PKG_SMOKE_FAILED);
+    }
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false, // graphical_login — autologin / serial path
+    );
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, display_mode, DeviceSet::default());
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    let steps = pkg_smoke_steps();
+
+    println!(
+        "pkg-smoke: launching QEMU (timeout {}s, {} steps)",
+        args.timeout_secs,
+        steps.len()
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!("pkg-smoke: PASSED ({} steps in {elapsed}s)", steps.len());
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("pkg-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_PKG_SMOKE_FAILED);
+        }
+    }
+}
+
+fn pkg_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/pkg-smoke: kernel first message",
+    }];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    // 1. Fresh boot: the installed-file DB does not exist yet.
+    steps.push(SmokeStep::Send {
+        input: "pkg list\n",
+        label: "pkg-smoke: list (empty DB)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "(no packages installed)",
+        timeout_secs: 15,
+        label: "pkg-smoke: empty DB reported",
+    });
+
+    // 2. Install `less` from the bundled offline repo /usr/pkg/less.m3pkg.
+    steps.push(SmokeStep::Send {
+        input: "pkg install less\n",
+        label: "pkg-smoke: install less",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "pkg install: less: OK",
+        fail_prefix: "pkg install: cannot",
+        timeout_secs: 30,
+        label: "pkg-smoke: install less OK",
+        exit_code_on_fail: SMOKE_EXIT_PKG_SMOKE_FAILED,
+    });
+
+    // 3. `pkg list` now shows the installed package.
+    steps.push(SmokeStep::Send {
+        input: "pkg list\n",
+        label: "pkg-smoke: list after install",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "less",
+        timeout_secs: 15,
+        label: "pkg-smoke: less appears in list",
+    });
+
+    // 4. `pkg verify` re-hashes the installed binary against the DB → OK.
+    steps.push(SmokeStep::Send {
+        input: "pkg verify less\n",
+        label: "pkg-smoke: verify less",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "OK      /usr/local/bin/less",
+        timeout_secs: 15,
+        label: "pkg-smoke: verify reports installed file OK",
+    });
+
+    steps
+}
+
 /// Phase 63a Track H — `cargo xtask doom-audio-smoke` exit codes.
 /// Originally 65 (collided with `SMOKE_EXIT_SESSION_RESTART_FAILED`); bumped
 /// to 67 in PR 168 round-3 review so each smoke-mode failure exits with a
@@ -16147,44 +16310,109 @@ fn populate_ports_tree(part_path: &Path, workspace_root: &Path, ports_src: &Path
 }
 
 /// Phase 69d Track A.3 / B.1 / C.1 / D.1 / D.2 — mirror every staged
-/// Phase 69d port (target/port-stage/<name>/usr/local/{bin,lib,include,share})
-/// onto the ext2 partition. Only ports whose stage exists are copied; the
-/// function is a no-op if `cargo xtask port build` has not been run.
+/// Phase 85a (D.1) — install the host-built ports onto the ext2 partition
+/// **through the `.m3pkg` substrate** rather than mirroring raw stage trees:
+///
+///  1. Each port's sealed `target/pkgcache/<key>.m3pkg` (Track B) is bundled
+///     into `/usr/pkg/<name>.m3pkg` on the data disk — the offline local repo
+///     the in-OS `pkg install` (Track C) reads.
+///  2. Core ports are **pre-installed** by unpacking the same `.m3pkg` into
+///     `target/pkg-preinstall/<name>/` and mirroring its `usr/{local,share}`
+///     tree onto `/usr` — so the binaries are present at boot (no behaviour
+///     change for the `tui-app-smoke` / `htop-render-probe` gates) and the
+///     `.m3pkg` round-trips end-to-end (pack at build → unpack at staging).
+///
+/// If a port has no sealed artifact (e.g. built the legacy way, or no musl
+/// toolchain), it falls back to mirroring the raw stage tree so nothing
+/// regresses. The function is a no-op when neither artifacts nor stages exist.
+///
+/// Note: zlib is built by the separate in-guest `target/ports-src` system
+/// (its Portfile carries a placeholder tarball SHA), so it is not part of this
+/// host-built `.m3pkg` set; its host retrofit is a tracked follow-up.
 fn populate_phase_69d_ports(part_path: &Path, workspace_root: &Path) {
     const PORTS: &[&str] = &["ncurses", "libevent", "less", "htop", "tmux"];
     let stage_root = workspace_root.join("target/port-stage");
-    if !stage_root.is_dir() {
-        return;
-    }
+    let preinstall_root = workspace_root.join("target/pkg-preinstall");
+    // Fresh pre-install scratch each run so a stale unpack never leaks in.
+    let _ = fs::remove_dir_all(&preinstall_root);
 
     let mut dirs: Vec<String> = Vec::new();
     let mut files: Vec<(String, PathBuf)> = Vec::new();
     let mut execs: Vec<String> = Vec::new();
+    // (.m3pkg ext2 path, host artifact path) — the bundled offline repo.
+    let mut m3pkg_files: Vec<(String, PathBuf)> = Vec::new();
 
     for port in PORTS {
-        let local = stage_root.join(port).join("usr/local");
-        if local.is_dir() {
-            collect_phase_69d_entries(&local, "usr/local", &mut dirs, &mut files, &mut execs);
+        // Prefer the sealed .m3pkg artifact: bundle it into /usr/pkg/ and
+        // pre-install by unpacking it (proves the artifact round-trips).
+        let mut staged_from_artifact = false;
+        if let Ok(artifact) = port_build::pkgcache_artifact_path(port) {
+            if artifact.is_file() {
+                match fs::read(&artifact) {
+                    Ok(bytes) if pkg_format::verify(&bytes) => {
+                        m3pkg_files.push((format!("usr/pkg/{port}.m3pkg"), artifact.clone()));
+                        let dest = preinstall_root.join(port);
+                        let _ = fs::create_dir_all(&dest);
+                        match pkg_format::unpack(&bytes, &dest) {
+                            Ok(_) => {
+                                let local = dest.join("usr/local");
+                                if local.is_dir() {
+                                    collect_phase_69d_entries(
+                                        &local,
+                                        "usr/local",
+                                        &mut dirs,
+                                        &mut files,
+                                        &mut execs,
+                                    );
+                                }
+                                let share = dest.join("usr/share");
+                                if share.is_dir() {
+                                    collect_phase_69d_entries(
+                                        &share,
+                                        "usr/share",
+                                        &mut dirs,
+                                        &mut files,
+                                        &mut execs,
+                                    );
+                                }
+                                staged_from_artifact = true;
+                            }
+                            Err(e) => {
+                                eprintln!("phase-85a: unpack {port}.m3pkg failed: {e}");
+                            }
+                        }
+                    }
+                    Ok(_) => eprintln!("phase-85a: {port}.m3pkg failed verify — skipping bundle"),
+                    Err(e) => eprintln!("phase-85a: read {} failed: {e}", artifact.display()),
+                }
+            }
         }
-        // Phase 69 Track A.2 — terminfo database lives under
-        // /usr/share/terminfo on the target. Mirror it from the ncurses
-        // stage so apps that call setupterm("m3os-term") at runtime
-        // find the compiled entry.
-        let share = stage_root.join(port).join("usr/share");
-        if share.is_dir() {
-            collect_phase_69d_entries(&share, "usr/share", &mut dirs, &mut files, &mut execs);
+
+        // Legacy fallback: mirror the raw stage tree when no artifact exists.
+        if !staged_from_artifact {
+            let local = stage_root.join(port).join("usr/local");
+            if local.is_dir() {
+                collect_phase_69d_entries(&local, "usr/local", &mut dirs, &mut files, &mut execs);
+            }
+            // Phase 69 Track A.2 — terminfo database lives under
+            // /usr/share/terminfo on the target so apps that call
+            // setupterm("m3os-term") at runtime find the compiled entry.
+            let share = stage_root.join(port).join("usr/share");
+            if share.is_dir() {
+                collect_phase_69d_entries(&share, "usr/share", &mut dirs, &mut files, &mut execs);
+            }
         }
     }
 
-    if files.is_empty() {
+    if files.is_empty() && m3pkg_files.is_empty() {
         return;
     }
 
     println!(
-        "phase-69d ports: mirroring {} files ({} executables) from {} into ext2",
+        "phase-85a ports: bundling {} .m3pkg artifact(s) into /usr/pkg + pre-installing {} files ({} executables)",
+        m3pkg_files.len(),
         files.len(),
-        execs.len(),
-        stage_root.display()
+        execs.len()
     );
 
     let mut cmds = String::new();
@@ -16198,6 +16426,8 @@ fn populate_phase_69d_ports(part_path: &Path, workspace_root: &Path) {
         "usr/local/lib",
         "usr/local/include",
         "usr/share",
+        // Phase 85a — the offline local package repo `pkg install` reads from.
+        "usr/pkg",
     ] {
         cmds.push_str(&format!("mkdir {d}\n"));
     }
@@ -16217,11 +16447,21 @@ fn populate_phase_69d_ports(part_path: &Path, workspace_root: &Path) {
         cmds.push_str(&format!("write \"{}\" {ext2_path}\n", host_path.display()));
     }
 
+    // Bundle the .m3pkg artifacts into /usr/pkg/ (the offline repo).
+    for (ext2_path, host_path) in &m3pkg_files {
+        cmds.push_str(&format!("write \"{}\" {ext2_path}\n", host_path.display()));
+    }
+
     // Mark every directory 0755, every file 0644.
+    cmds.push_str("sif usr/pkg mode 0x41ED\n");
     for dir in &dirs {
         cmds.push_str(&format!("sif {dir} mode 0x41ED\n"));
     }
     for (ext2_path, _) in &files {
+        cmds.push_str(&format!("sif {ext2_path} mode 0x81A4\n"));
+    }
+    // The bundled .m3pkg artifacts are plain data files (0644).
+    for (ext2_path, _) in &m3pkg_files {
         cmds.push_str(&format!("sif {ext2_path} mode 0x81A4\n"));
     }
     // Executables get 0755.
