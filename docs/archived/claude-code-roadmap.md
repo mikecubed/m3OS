@@ -213,7 +213,7 @@ disk image (Mozilla's CA bundle is ~200 KB).
 
 ### Phase A: Python on m3OS (easiest runtime milestone)
 
-See [Python roadmap](./python-roadmap.md). Proves the cross-compilation
+See [Python roadmap](../python-roadmap.md). Proves the cross-compilation
 pipeline and memory management work.
 
 ### Phase B: Node.js on m3OS (hardest runtime prerequisite)

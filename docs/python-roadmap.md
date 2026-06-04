@@ -1,4 +1,11 @@
-> Archived 2026-05-08 — post-1.0 language port plan. Original content preserved below for historical reference.
+> Revived 2026-06-04 for **Phase 85c — Python**. This is the per-tool
+> reference for the Phase 85 cross-compiled-toolchain work. Its **Stage 1
+> (minimal CPython interpreter + stdlib, no networking)** is in Phase 85c scope;
+> its **Stage 2 (networking / `ssl` / pip)** is deferred to
+> [Phase 86 — Networking and GitHub](./roadmap/86-networking-and-github.md).
+> Where this historical doc and the live phase docs disagree, the
+> [Phase 85 umbrella](./roadmap/85-cross-compiled-toolchains.md) and
+> [Phase 85c task list](./roadmap/tasks/85c-python-tasks.md) are authoritative.
 
 # Road to Python on m3OS
 
