@@ -5404,10 +5404,11 @@ fn cmd_check() {
     // Phase 85a — host tests for the content-addressed package substrate.
     // `pkg-format` carries the `.m3pkg` pack/unpack/verify + content-key
     // pure logic (A.1/A.2); `xtask`'s own self-tests cover the Portfile
-    // parser, `package_key`, and the pkgcache resolve/seal helpers (Track B).
-    // Both are host crates, so they build against the host target rather than
-    // the workspace-default bare-metal target.
-    for pkg in ["pkg-format", "xtask"] {
+    // parser, `package_key`, and the pkgcache resolve/seal helpers (Track B);
+    // `pkg`'s `[lib]` (`pkg_app`) carries the installed-file DB serialize/parse
+    // + idempotent-upsert + install-path logic (C.2). All build against the
+    // host target rather than the workspace-default bare-metal target.
+    for pkg in ["pkg-format", "xtask", "pkg"] {
         let status = Command::new(env!("CARGO"))
             .current_dir(&root)
             .args([
@@ -5455,7 +5456,7 @@ fn cmd_check() {
     retpoline_objdump_gate();
 
     println!(
-        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, ac97_driver, hda_driver, ahci_driver, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, shadow, ldso_core, wifi-core, mt792x_driver, m3ctl, pkg-format, and xtask host tests pass; doom platform-layer C tests pass; retpoline indirect-branch gate pass"
+        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, ac97_driver, hda_driver, ahci_driver, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, shadow, ldso_core, wifi-core, mt792x_driver, m3ctl, pkg-format, xtask, and pkg host tests pass; doom platform-layer C tests pass; retpoline indirect-branch gate pass"
     );
 }
 

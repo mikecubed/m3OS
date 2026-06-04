@@ -12,8 +12,8 @@
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
 | A | `.m3pkg` format + content-addressed cache key (host-tested pure logic) | Phase 45 caching | ✅ Done |
-| B | `xtask` seal-after-install + resolve-before-build + zero-rebuild gate in `port_build.rs`/`main.rs` | A | In progress |
-| C | Userspace `pkg` installer + installed-file DB | A | In progress |
+| B | `xtask` seal-after-install + resolve-before-build + zero-rebuild gate in `port_build.rs`/`main.rs` | A | ✅ Done |
+| C | Userspace `pkg` installer + installed-file DB | A | ✅ Done (boot-verified in D) |
 | D | Image staging installs from `.m3pkg`; existing-ports retrofit | B, C | Planned |
 | E | Disk/RAM budget + relocation contract + hosting plan + data-disk resize + version bump | A–D | Planned |
 
@@ -56,8 +56,8 @@
 **Why it matters:** this is the "build once" half — every successful build produces a reusable artifact keyed by A.1.
 
 **Acceptance:**
-- [ ] After a port builds, its `target/port-stage/<name>/` tree is packed into `target/pkgcache/<key>.m3pkg`; the key is recorded alongside the existing `.stamp`.
-- [ ] The pkgcache survives across `cargo xtask clean` of the disk image (it is build output, not disk state) — documented which `clean` targets do/don't purge it.
+- [x] After a port builds, its `target/port-stage/<name>/` tree is packed into `target/pkgcache/<key>.m3pkg`; the key is recorded alongside the existing `.stamp`. *(`seal_package` in `port_build.rs` — atomic `.tmp`+rename; writes `<stage>/.pkgkey`. Test `seal_package_creates_valid_m3pkg`.)*
+- [x] The pkgcache survives across `cargo xtask clean` of the disk image (it is build output, not disk state) — documented which `clean` targets do/don't purge it. *(Documented in `seal_package`'s doc comment: `cargo xtask clean` removes only the disk image and does NOT purge `target/pkgcache/`.)*
 
 ### B.2 — Resolve-before-build: install from cache on a key hit
 
@@ -66,8 +66,8 @@
 **Why it matters:** this is the "never rebuild" half — a key hit short-circuits configure/make/install entirely, exactly as the `.stamp` check does today but keyed portably.
 
 **Acceptance:**
-- [ ] When `target/pkgcache/<key>.m3pkg` exists for the computed key, the build is skipped and the stage is materialized from the artifact; a log line states "pkgcache hit (key …), zero compiler invocations".
-- [ ] On a key miss the port builds normally and B.1 seals the result; the existing `.stamp` fast-path is preserved as the same-machine inner loop.
+- [x] When `target/pkgcache/<key>.m3pkg` exists for the computed key, the build is skipped and the stage is materialized from the artifact; a log line states "pkgcache hit (key …), zero compiler invocations". *(Resolve block in `port_build()`; prints `PKGCACHE: hit <key>` + the human line, then `pkg_format::unpack` into the stage. Verified end-to-end by the B.3 gate — see validation log in the PR.)*
+- [x] On a key miss the port builds normally and B.1 seals the result; the existing `.stamp` fast-path is preserved as the same-machine inner loop. *(Prints `PKGCACHE: miss <key> (building)`, builds, then `seal_package`; the `.stamp` fingerprint check is retained and also seals to prime the cache. Test `seal_then_resolve_round_trips_stage`.)*
 
 ### B.3 — Zero-rebuild assertion gate
 
@@ -76,8 +76,8 @@
 **Why it matters:** "a second build does zero compiler invocations" is the headline acceptance of the whole umbrella phase; it must be a mechanically-checked gate, not a hand-waved log read, so a cache regression fails the build.
 
 **Acceptance:**
-- [ ] `cmd_pkgcache_hit_check` runs a build of a target port twice (warm cache) and **fails** if the second run logs any compiler/`make`/`cmake`/`ninja` invocation; it passes only on a pure pkgcache hit.
-- [ ] The gate is the artifact referenced by the B.2 / D.1 / 85d B.1 "zero compiler invocations" acceptance items, and is wired as an opt-in regression row in `AGENTS.md`.
+- [x] `cmd_pkgcache_hit_check` runs a build of a target port twice (warm cache) and **fails** if the second run logs any compiler/`make`/`cmake`/`ninja` invocation; it passes only on a pure pkgcache hit. *(`cmd_pkgcache_hit_check` in `main.rs`. **Validated with a real ncurses build:** first run sealed `7a7e4e27….m3pkg` (7.7 MB, 1833-entry terminfo db); after wiping the stage, the second run logged `PKGCACHE: hit` with zero compiler/make/cmake/ninja/`configure:` tokens → `pkgcache-hit-check: PASS`.)*
+- [x] The gate is the artifact referenced by the B.2 / D.1 / 85d B.1 "zero compiler invocations" acceptance items, and is wired as an opt-in regression row in `AGENTS.md`. *(Row `pkgcache-hit-check` / `M3OS_PKGCACHE_REGRESSION=1` added.)*
 
 ---
 
@@ -93,10 +93,10 @@
 **Why it matters:** this is the in-OS apt/pacman analogue; offline install from a bundled local repo is the part that fits inside the pre-networking Phase 85 boundary.
 
 **Acceptance:**
-- [ ] `pkg install <name>` reads `/usr/pkg/<name>.m3pkg` (the local on-disk repo), verifies hashes (A.2), and extracts entries under `/usr`, recording `/var/lib/pkg/db`.
-- [ ] `pkg list` prints installed packages from the DB; `pkg verify <name>` re-checks installed files against the DB hashes.
-- [ ] `pkg` performs **no** network access (a grep/SBOM check confirms no socket syscalls); the networked path is explicitly a Phase 86 task.
-- [ ] `pkg` is wired with `needs_alloc = true` in the `bins` array, defines `syscall_lib::heap::BrkAllocator` as its `#[global_allocator]`, and enables the `alloc` feature on `syscall-lib` (it uses `Vec`/`String` to parse the package DB) — per AGENTS.md step 2.
+- [x] `pkg install <name>` reads `/usr/pkg/<name>.m3pkg` (the local on-disk repo), verifies hashes (A.2), and extracts entries under `/usr`, recording `/var/lib/pkg/db`. *(`cmd_install` in `userspace/pkg/src/main.rs`: read→`pkg_format::verify`→`parse`→mkdir parents→write+chmod (or symlink)→`db_update`. Boot-verified in D.)*
+- [x] `pkg list` prints installed packages from the DB; `pkg verify <name>` re-checks installed files against the DB hashes. *(`cmd_list`/`cmd_verify`; verify re-hashes each recorded file and reports OK/MISMATCH/MISSING + summary.)*
+- [x] `pkg` performs **no** network access (a grep/SBOM check confirms no socket syscalls); the networked path is explicitly a Phase 86 task. *(`grep -rnE "socket|connect|bind|sendto|recvfrom|AF_INET|AF_UNIX" userspace/pkg/src` → only a doc comment; deps are `syscall-lib` + `pkg-format` only.)*
+- [x] `pkg` is wired with `needs_alloc = true` in the `bins` array, defines `syscall_lib::heap::BrkAllocator` as its `#[global_allocator]`, and enables the `alloc` feature on `syscall-lib` (it uses `Vec`/`String` to parse the package DB) — per AGENTS.md step 2. *(All four wiring places done; `pkg` builds for `x86_64-unknown-none` and embeds in the ramdisk.)*
 
 ### C.2 — Installed-file database
 
@@ -105,8 +105,8 @@
 **Why it matters:** a record of what each package owns is the minimum needed for `list`/`verify` and for a future remove/upgrade.
 
 **Acceptance:**
-- [ ] The DB records, per package: name, version, content key, and the list of installed paths + hashes; format is documented and forward-compatible.
-- [ ] Re-installing the same package is idempotent (no duplicate DB entries).
+- [x] The DB records, per package: name, version, content key, and the list of installed paths + hashes; format is documented and forward-compatible. *(`# m3pkg-db v1` line-based `[pkg]…[end]` blocks in `userspace/pkg/src/lib.rs`; `version` from optional `/usr/pkg/<name>.meta`, `key` = SHA-256 of the artifact; unknown keys ignored on read. Tests `db_roundtrip`, `db_tolerates_unknown_key`.)*
+- [x] Re-installing the same package is idempotent (no duplicate DB entries). *(`db_upsert` replaces an existing same-name block in place; tests `db_upsert_idempotent`, `db_upsert_preserves_other_records`.)*
 
 ---
 
