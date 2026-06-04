@@ -1,4 +1,10 @@
-> Archived 2026-05-08 — post-1.0 toolchain plan; no shipped phase covers it. Original content preserved below for historical reference.
+> Revived 2026-06-04 for **Phase 85d — Clang/LLVM/LLD**. This is the per-tool
+> reference for the Phase 85 cross-compiled-toolchain work. Its **Stage 1
+> (host-cross-built static Clang + LLD, X86-only, bundled on the image)** is in
+> Phase 85d scope; its **Stage 2 (self-hosting LLVM inside m3OS)** remains
+> deferred. Where this historical doc and the live phase docs disagree, the
+> [Phase 85 umbrella](./roadmap/85-cross-compiled-toolchains.md) and
+> [Phase 85d task list](./roadmap/tasks/85d-clang-llvm-tasks.md) are authoritative.
 
 # Road to Clang/LLVM on m3OS
 

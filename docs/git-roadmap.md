@@ -1,4 +1,10 @@
-> Archived 2026-05-08 — post-1.0 tooling plan; not implementation-blocking. Original content preserved below for historical reference.
+> Revived 2026-06-04 for **Phase 85b — git (local)**. This is the per-tool
+> reference for the Phase 85 cross-compiled-toolchain work. Its **Stage 1
+> (local git, `NO_CURL NO_OPENSSL`)** is in Phase 85b scope; its **Stage 2
+> (HTTPS/TLS remotes)** is deferred to [Phase 86 — Networking and GitHub](./roadmap/86-networking-and-github.md).
+> Where this historical doc and the live phase docs disagree, the
+> [Phase 85 umbrella](./roadmap/85-cross-compiled-toolchains.md) and
+> [Phase 85b task list](./roadmap/tasks/85b-git-local-tasks.md) are authoritative.
 
 # Road to git on m3OS
 

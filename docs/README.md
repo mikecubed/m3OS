@@ -90,13 +90,13 @@ and a roadmap toward stronger service isolation and broader platform support.
 
 | Document | Description |
 |---|---|
-| [Clang/LLVM Roadmap](./clang-llvm-roadmap.md) | Clang/LLVM cross-compilation strategy |
-| [Python Roadmap](./python-roadmap.md) | Python cross-compilation strategy |
-| [Node.js Roadmap](./nodejs-roadmap.md) | Node.js cross-compilation strategy |
-| [git Roadmap](./git-roadmap.md) | git cross-compilation strategy |
-| [GitHub CLI Roadmap](./github-cli-roadmap.md) | gh CLI cross-compilation strategy |
-| [Claude Code Roadmap](./claude-code-roadmap.md) | Claude Code on m3OS strategy |
-| [Rust Crate Acceleration](./rust-crate-acceleration.md) | Rust crate porting strategy |
+| [Clang/LLVM Roadmap](./clang-llvm-roadmap.md) | Clang/LLVM cross-compilation strategy — revived for [Phase 85d](./roadmap/85d-clang-llvm.md) |
+| [Python Roadmap](./python-roadmap.md) | Python cross-compilation strategy — revived for [Phase 85c](./roadmap/85c-python.md) |
+| [git Roadmap](./git-roadmap.md) | git cross-compilation strategy — revived for [Phase 85b](./roadmap/85b-git-local.md) |
+| [Node.js Roadmap](./archived/nodejs-roadmap.md) | Node.js cross-compilation strategy (archived; future post-85 phase) |
+| [GitHub CLI Roadmap](./archived/github-cli-roadmap.md) | gh CLI cross-compilation strategy (archived; [Phase 86](./roadmap/86-networking-and-github.md)) |
+| [Claude Code Roadmap](./archived/claude-code-roadmap.md) | Claude Code on m3OS strategy (archived; future post-85 phase) |
+| [Rust Crate Acceleration](./archived/rust-crate-acceleration.md) | Rust crate porting strategy (archived) |
 
 ### Evaluation
 
