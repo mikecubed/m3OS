@@ -1,0 +1,22 @@
+[package]
+name = "pkg-format"
+version = "0.85.0"
+edition = "2024"
+description = "Phase 85a — content-addressed .m3pkg package format + content key (host + no_std)"
+
+[features]
+# `std` brings in the filesystem packer/unpacker (pack/unpack) used by xtask.
+# The userspace `pkg` installer depends on this crate with
+# `default-features = false` for the no_std parse/verify surface.
+default = ["std"]
+std = []
+
+[dependencies]
+# No external dependencies: SHA-256 is a compact in-crate pure-u32
+# implementation (see the `sha256` module). The RustCrypto `sha2` crate fails to
+# codegen on the soft-float / no-SSE `x86_64-unknown-none` target the userspace
+# `pkg` installer builds for. blake3/zstd are unavailable offline; SHA-256 is the
+# recorded v1 choice (docs/roadmap/85a-package-infrastructure.md).
+
+[dev-dependencies]
+tempfile = "3.25.0"

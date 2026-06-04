@@ -181,6 +181,82 @@ fn port_fingerprint(port_dir: &Path) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Compute a stable, portable recipe-identity digest for a port: the Portfile
+/// content plus every file under `patches/`. Unlike [`port_fingerprint`] this
+/// deliberately **excludes** the `port_build.rs` source bytes, so editing an
+/// unrelated port recipe does not invalidate this port's cached `.m3pkg`. A
+/// recipe whose configure flags live in the Rust `build_*` function should
+/// bump the optional Portfile `BUILD_FLAGS=` field (folded in via the Portfile
+/// content) to self-invalidate on a recipe change.
+fn recipe_digest(port_dir: &Path) -> String {
+    let mut hasher = Sha256::new();
+    let portfile = port_dir.join("Portfile");
+    if let Ok(bytes) = fs::read(&portfile) {
+        hasher.update(b"Portfile\0");
+        hasher.update(&bytes);
+    }
+    let patches = port_dir.join("patches");
+    if let Ok(entries) = fs::read_dir(&patches) {
+        let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        paths.sort();
+        for p in paths {
+            if let Some(name) = p.file_name() {
+                hasher.update(name.to_string_lossy().as_bytes());
+                hasher.update(b"\0");
+            }
+            if let Ok(bytes) = fs::read(&p) {
+                hasher.update(&bytes);
+            }
+        }
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// Phase 85a (A.1) — portable, content-addressed package key for a port.
+///
+/// Generalizes [`port_fingerprint`] into a key that is reusable across machines
+/// and a moved tree: it folds in the source tarball SHA-256 (from the Portfile),
+/// the resolved musl toolchain identity, the recipe digest (Portfile + patches),
+/// and the sorted package keys of direct build dependencies — but **not** any
+/// absolute/`target` path nor the `port_build.rs` source bytes. See
+/// [`pkg_format::compute_package_key`] for the in/out-of-key contract.
+pub fn package_key(
+    port_dir: &Path,
+    toolchain_id: &str,
+    dep_keys: &[String],
+) -> Result<String, String> {
+    let meta = parse_portfile(&port_dir.join("Portfile"))?;
+    let tarball_sha = meta
+        .get("SHA256")
+        .cloned()
+        .ok_or_else(|| format!("Portfile {} missing SHA256", port_dir.display()))?;
+    let build_flags = recipe_digest(port_dir);
+    Ok(pkg_format::compute_package_key(
+        &tarball_sha,
+        toolchain_id,
+        &build_flags,
+        dep_keys,
+    ))
+}
+
+/// A stable identity string for the active musl toolchain, folded into the
+/// package key so an artifact built with a different cross-gcc is not reused.
+/// Best-effort: the compiler name plus its reported version line.
+pub fn toolchain_id() -> String {
+    let cc = musl_cc().unwrap_or("unknown-musl-cc");
+    let version = Command::new(cc)
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|o| {
+            String::from_utf8(o.stdout)
+                .ok()
+                .and_then(|s| s.lines().next().map(|l| l.to_string()))
+        })
+        .unwrap_or_default();
+    format!("{cc}|{version}")
+}
+
 /// Fetch the upstream tarball into `cache_dir/<basename>` if missing or
 /// SHA-mismatched. Returns the cached path on success.
 fn fetch_tarball(url: &str, sha: &str, cache_dir: &Path) -> Result<PathBuf, String> {

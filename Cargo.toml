@@ -3,6 +3,9 @@ members = [
     "kernel",
     "kernel-core",
     "xtask",
+    # Phase 85a — content-addressed .m3pkg package format + content key
+    # (host packer via xtask, no_std reader via the userspace `pkg` installer)
+    "pkg-format",
     # Phase 11 userspace test binaries
     "userspace/syscall-lib",
     "userspace/exit0",

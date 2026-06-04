@@ -11,9 +11,9 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | `.m3pkg` format + content-addressed cache key (host-tested pure logic) | Phase 45 caching | Planned |
-| B | `xtask` seal-after-install + resolve-before-build + zero-rebuild gate in `port_build.rs`/`main.rs` | A | Planned |
-| C | Userspace `pkg` installer + installed-file DB | A | Planned |
+| A | `.m3pkg` format + content-addressed cache key (host-tested pure logic) | Phase 45 caching | ✅ Done |
+| B | `xtask` seal-after-install + resolve-before-build + zero-rebuild gate in `port_build.rs`/`main.rs` | A | In progress |
+| C | Userspace `pkg` installer + installed-file DB | A | In progress |
 | D | Image staging installs from `.m3pkg`; existing-ports retrofit | B, C | Planned |
 | E | Disk/RAM budget + relocation contract + hosting plan + data-disk resize + version bump | A–D | Planned |
 
@@ -28,8 +28,8 @@
 **Why it matters:** the key is what lets an unchanged tool skip its (multi-GB, for 85d) build. It must be portable across machines, unlike the current `.stamp` which folds in `port_build.rs`'s own bytes.
 
 **Acceptance:**
-- [ ] `package_key` hashes `{source tarball SHA-256 from the Portfile, the resolved musl toolchain identity, the build flags, and the sorted dependency artifact keys}` into a stable hex string; two invocations with identical inputs produce identical keys (host test).
-- [ ] Changing any input (tarball SHA, toolchain, a flag, a dep key) changes the key; documented which inputs are in vs out of the key (e.g. `target` dir path is excluded so the cache survives a moved tree).
+- [x] `package_key` hashes `{source tarball SHA-256 from the Portfile, the resolved musl toolchain identity, the build flags, and the sorted dependency artifact keys}` into a stable hex string; two invocations with identical inputs produce identical keys (host test). *(`pkg_format::compute_package_key` + `port_build::package_key`/`toolchain_id`; tests `key_is_stable_for_identical_inputs`, `key_dep_order_does_not_matter`.)*
+- [x] Changing any input (tarball SHA, toolchain, a flag, a dep key) changes the key; documented which inputs are in vs out of the key (e.g. `target` dir path is excluded so the cache survives a moved tree). *(test `changing_any_input_changes_the_key`; IN/OUT contract documented on `compute_package_key`. `port_build.rs` source bytes are deliberately OUT — the old `.stamp` over-invalidated by folding them in.)*
 
 ### A.2 — `.m3pkg` pack/unpack + verify (host-tested)
 
@@ -41,9 +41,9 @@
 **Why it matters:** the artifact format is the unit the cache stores and the installer consumes; getting pack/unpack/verify right in host tests prevents silent corruption of a 1 GB Clang artifact.
 
 **Acceptance:**
-- [ ] `.m3pkg` v1 = a header (format version + per-entry path/mode/BLAKE3 content hash + entry index) plus a data blob; documented byte layout. (A `.tar.zst` + `.sha256` sidecar is an acceptable v1 fallback if the custom header is descoped — but the choice is recorded.)
-- [ ] `pack` then `unpack` round-trips a staged tree byte-for-byte including file modes (host test); `verify` detects a flipped byte (host test).
-- [ ] Optional ed25519 signature field is reserved in the header even if unsigned in v1 (forward-compat for the Phase 86 networked repo).
+- [x] `.m3pkg` v1 = a header (format version + per-entry path/mode/SHA-256 content hash + entry index) plus a data blob; documented byte layout. *(Custom binary header in `pkg-format/src/lib.rs`. **Recorded choice:** SHA-256 (in-crate pure-`u32` impl) instead of BLAKE3, and a custom header instead of `.tar.zst` — `blake3`/`zstd` are unavailable offline and `sha2` does not codegen on the soft-float bare-metal target; the A.2 fallback clause permits this.)*
+- [x] `pack` then `unpack` round-trips a staged tree byte-for-byte including file modes (host test); `verify` detects a flipped byte (host test). *(tests `pack_unpack_round_trips_bytes_and_modes` [files + symlink + modes], `pack_is_deterministic`, `verify_detects_a_flipped_content_byte`, `verify_rejects_bad_magic_and_truncation`.)*
+- [x] Optional ed25519 signature field is reserved in the header even if unsigned in v1 (forward-compat for the Phase 86 networked repo). *(64-byte zeroed `signature` + `sig_present` byte; test `header_reserves_zeroed_signature_field`.)*
 
 ---
 
