@@ -66,7 +66,7 @@ mod os_binary {
     use m3ctl::{
         DISPLAY_CONTROL_SERVICE_NAME, LABEL_DISPLAY_CTL_CMD, LABEL_SESSION_CTL_CMD, ParseError,
         ParsedVerb, SESSION_CONTROL_SERVICE_NAME, WIFI_CONTROL_SERVICE_NAME,
-        WIFI_NOT_ASSOCIATED_MSG, format_wifi_status, parse_verb,
+        WIFI_NOT_ASSOCIATED_MSG, format_mitigations, format_wifi_status, parse_verb,
     };
     use syscall_lib::STDOUT_FILENO;
     use syscall_lib::heap::BrkAllocator;
@@ -129,6 +129,46 @@ mod os_binary {
             ParsedVerb::Session(verb) => dispatch_session(verb),
             ParsedVerb::LockScreen => dispatch_lock(),
             ParsedVerb::WifiStatus => dispatch_wifi_status(),
+            ParsedVerb::MitigationsStatus => dispatch_mitigations_status(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 84 D.3 — `m3ctl mitigations status`
+    // -----------------------------------------------------------------------
+
+    /// `m3ctl mitigations status` — call the m3OS-native `SYS_MITIGATIONS_STATUS`
+    /// syscall, decode the boot `MitigationReport`, and print the per-vuln
+    /// status (Meltdown reflects actual KPTI state), the compiled-in retpoline
+    /// line, the UNADDRESSED classes, and the Grimsdal caveat. Read-only.
+    fn dispatch_mitigations_status() -> i32 {
+        use kernel_core::spectre::{
+            MITIGATION_REPORT_WIRE_LEN, MitigationReport, SYS_MITIGATIONS_STATUS,
+        };
+        let mut buf = [0u8; MITIGATION_REPORT_WIRE_LEN];
+        // SAFETY: m3OS-native read-only syscall; the kernel writes at most
+        // `buf.len()` bytes into `buf` and returns the count (or a negative
+        // errno encoded as a large u64).
+        let n = unsafe {
+            syscall_lib::syscall2(
+                SYS_MITIGATIONS_STATUS,
+                buf.as_mut_ptr() as u64,
+                buf.len() as u64,
+            )
+        };
+        if (n as i64) < 0 || (n as usize) < MITIGATION_REPORT_WIRE_LEN {
+            print_str("m3ctl: mitigations status syscall failed\n");
+            return 1;
+        }
+        match MitigationReport::decode(&buf[..n as usize]) {
+            Some(report) => {
+                print_str(&format_mitigations(&report));
+                0
+            }
+            None => {
+                print_str("m3ctl: failed to decode mitigation report\n");
+                1
+            }
         }
     }
 

@@ -5196,6 +5196,31 @@ pub fn run() -> ! {
                 }
                 let pc_mut = pc as *const crate::smp::PerCoreData as *mut crate::smp::PerCoreData;
                 unsafe { (*pc_mut).current_addrspace = new_as_ptr };
+
+                // Phase 84 C.3 — IBPB at the cross-process security boundary:
+                // flush the indirect-branch predictor the *previous* address
+                // space may have trained, before the new process runs. Only on
+                // a switch to a DISTINCT user address space (pid != 0,
+                // old_as != new_as) — not thread-to-thread within one process,
+                // and not the kernel idle task. Gated on the feature + the one
+                // global mitigations off-switch (no-op on silicon without IBPB,
+                // e.g. the QEMU test lanes).
+                if pid != 0 && old_as_ptr != new_as_ptr && crate::mitigations::ibpb_enabled() {
+                    // SAFETY: `ibpb_enabled()` implies the CPU advertised IBPB
+                    // (`ibrs_ibpb`) and the off-switch is not engaged.
+                    unsafe { crate::arch::x86_64::cpuid::issue_ibpb() };
+                }
+
+                // Phase 84 C.4 — apply this task's per-process STIBP opt-in.
+                // Gated on STIBP-capable silicon + off-switch (no-op on the
+                // QEMU test lanes), so the opt-in registry lock is only ever
+                // touched here on hardware that actually has STIBP.
+                if pid != 0 && crate::mitigations::stibp_available() {
+                    let want = crate::mitigations::stibp_opt_in(pid);
+                    // SAFETY: `stibp_available()` implies the CPU advertised
+                    // STIBP and SPEC_CTRL is present.
+                    unsafe { crate::arch::x86_64::cpuid::set_stibp(want) };
+                }
             }
         }
 

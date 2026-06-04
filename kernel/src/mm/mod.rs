@@ -181,6 +181,77 @@ pub fn restore_kernel_cr3() {
     }
 }
 
+/// Phase 84 Track A.4 — KPTI `GLOBAL`-bit guard.
+///
+/// PTEs marked `GLOBAL` survive a CR3 reload, so under KPTI a global kernel TLB
+/// entry would persist into userspace and let a Meltdown PoC read kernel data
+/// from a stale translation even after the CR3 switch — the most insidious
+/// silent-failure mode of a first KPTI (Redox's `startup/memory.rs` encodes
+/// exactly this). m3OS marks **no** kernel PTE `GLOBAL` (verified: no
+/// `PageTableFlags::GLOBAL` site in `kernel/src/mm`), so this is a **guard**, not
+/// a removal: it walks the kernel upper half and returns the number of `GLOBAL`
+/// **leaf** entries (4 KiB PTE or huge PDE/PDPTE — the only levels where the bit
+/// is architecturally meaningful), which must be `0`. If a future `CR4.PGE`
+/// throughput optimization ever introduces `GLOBAL` kernel PTEs, this fires.
+///
+/// Bounded: only present entries are visited, and the direct map uses huge
+/// pages, so the upper half is a few hundred table entries — cheap at boot.
+pub fn count_global_kernel_leaf_ptes() -> usize {
+    use x86_64::structures::paging::{PageTable, PageTableFlags};
+    let phys_off = phys_offset();
+    let kpml4_phys = *KERNEL_PML4_PHYS.get().expect("mm not initialized");
+    let mut global = 0usize;
+    let table = |phys: u64| -> &'static PageTable {
+        // SAFETY: every kernel page table is reachable through the
+        // physical-memory direct map; we only read.
+        unsafe { &*((phys_off + phys) as *const PageTable) }
+    };
+    let pml4 = table(kpml4_phys);
+    // Kernel upper half (256..512): heap, direct map, stacks.
+    for p4i in 256..512 {
+        let p4e = &pml4[p4i];
+        if !p4e.flags().contains(PageTableFlags::PRESENT) {
+            continue;
+        }
+        let pdpt = table(p4e.addr().as_u64());
+        for p3e in pdpt.iter() {
+            let f3 = p3e.flags();
+            if !f3.contains(PageTableFlags::PRESENT) {
+                continue;
+            }
+            if f3.contains(PageTableFlags::HUGE_PAGE) {
+                // 1 GiB leaf.
+                if f3.contains(PageTableFlags::GLOBAL) {
+                    global += 1;
+                }
+                continue;
+            }
+            let pd = table(p3e.addr().as_u64());
+            for p2e in pd.iter() {
+                let f2 = p2e.flags();
+                if !f2.contains(PageTableFlags::PRESENT) {
+                    continue;
+                }
+                if f2.contains(PageTableFlags::HUGE_PAGE) {
+                    // 2 MiB leaf.
+                    if f2.contains(PageTableFlags::GLOBAL) {
+                        global += 1;
+                    }
+                    continue;
+                }
+                let pt = table(p2e.addr().as_u64());
+                for pte in pt.iter() {
+                    let f1 = pte.flags();
+                    if f1.contains(PageTableFlags::PRESENT) && f1.contains(PageTableFlags::GLOBAL) {
+                        global += 1;
+                    }
+                }
+            }
+        }
+    }
+    global
+}
+
 pub fn init(boot_info: &'static mut BootInfo) {
     // Capture the kernel's PML4 frame before any CR3 switches occur.
     {

@@ -23,9 +23,10 @@
 //! message.  The probe does **not** require CR4.OSXSAVE — that bit reflects
 //! runtime state and is 0 until [`enable_xsave_state`] sets it.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use spin::Once;
+use x86_64::registers::model_specific::Msr;
 
 /// XSAVE state-component mask for the 1.0 release: x87 (bit 0) + SSE (bit 1) +
 /// AVX (bit 2).  AVX-512 (bit 5) is intentionally deferred.
@@ -352,6 +353,188 @@ pub fn debug_assert_smap_enforcing() {
         !cr4_smap_enabled() || !eflags_ac_set(),
         "SMAP enabled but EFLAGS.AC=1 — SMAP is non-enforcing on this ring-0 path"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 84 Track C — IA32_SPEC_CTRL family (IBRS / eIBRS / IBPB / STIBP)
+// ---------------------------------------------------------------------------
+//
+// Mirrors the Phase 77 SMEP/SMAP detect→enable→status shape. Every bit of raw
+// CPUID/MSR decode lives in host-tested `kernel_core::spectre`; this file only
+// performs the privileged probe + MSR writes, each gated on the decoded feature
+// bits so a CPU lacking SPEC_CTRL never `#GP`s. On the QEMU test lanes
+// (`qemu64`, and `-cpu host` on AMD which advertises IBRS via its own
+// `Fn8000_0008_EBX` leaf rather than `CPUID.07H.0:EDX[26]`) the Intel bit is
+// absent, so `IbrsMode::None` is reported and **no** SPEC_CTRL/PRED_CMD write
+// is performed — the path is exercised by the `kernel_core::spectre` host tests
+// and by the dedicated `mitigations=full` spectre gate with a spec-ctrl CPU.
+
+pub use kernel_core::spectre::{IbrsMode, SpecCtrlFeatures, classify_ibrs};
+
+/// `IA32_SPEC_CTRL` — IBRS (bit 0), STIBP (bit 1), SSBD (bit 2).
+const MSR_IA32_SPEC_CTRL: u32 = 0x48;
+/// `IA32_PRED_CMD` — **write-only**; bit 0 = IBPB.
+const MSR_IA32_PRED_CMD: u32 = 0x49;
+/// `IA32_ARCH_CAPABILITIES` — RDCL_NO (bit 0), IBRS_ALL (bit 1).
+const MSR_IA32_ARCH_CAPABILITIES: u32 = 0x10A;
+
+/// `IA32_SPEC_CTRL.IBRS` (bit 0).
+const SPEC_CTRL_IBRS: u64 = 1 << 0;
+/// `IA32_SPEC_CTRL.STIBP` (bit 1).
+const SPEC_CTRL_STIBP: u64 = 1 << 1;
+/// `IA32_PRED_CMD.IBPB` (bit 0).
+const PRED_CMD_IBPB: u64 = 1 << 0;
+
+static SPEC_CTRL_FEATURES: Once<SpecCtrlFeatures> = Once::new();
+/// The (guarded) raw `(CPUID.07H.0:EDX, IA32_ARCH_CAPABILITIES)` behind
+/// [`probe_spec_ctrl`]. Cached so the D.3 report wire can carry them verbatim.
+static SPEC_CTRL_RAW: Once<(u32, u64)> = Once::new();
+
+/// Cached `IA32_SPEC_CTRL` value (mirrors Linux `x86_spec_ctrl_base`). The MSR
+/// is write-mostly, so we never re-`rdmsr` it as an "is it active?" signal:
+/// `spec_ctrl_active()` reads this snapshot, and every write ORs the desired
+/// bits into the base so a blind write cannot clobber IBRS/STIBP/SSBD set by
+/// another path. Holds the **always-on** bits (eIBRS); per-task bits (STIBP
+/// opt-in) are OR'd on top per-core at the call site, not stored here.
+static SPEC_CTRL_BASE: AtomicU64 = AtomicU64::new(0);
+
+/// Probe the `IA32_SPEC_CTRL` feature surface. Idempotent — first call wins.
+///
+/// Reads `CPUID.07H.0:EDX` (guarded by the max-basic-leaf check — see
+/// [`probe_smep_smap`]) and, **only** when `EDX[29]` (ARCH_CAPABILITIES) is set,
+/// `IA32_ARCH_CAPABILITIES` (MSR `0x10A`); an unguarded `rdmsr` of `0x10A`
+/// `#GP`s on a CPU lacking it. Decode is the host-tested
+/// [`kernel_core::spectre::SpecCtrlFeatures::from_cpuid_guarded`].
+pub fn probe_spec_ctrl() -> &'static SpecCtrlFeatures {
+    SPEC_CTRL_FEATURES.call_once(|| {
+        let (leaf7_edx, arch_caps) = spec_ctrl_raw_regs();
+        // `spec_ctrl_raw_regs` already applied the max-basic-leaf guard
+        // (leaf7_edx == 0 when CPUID.0:EAX < 7), so `from_cpuid` here is
+        // equivalent to `from_cpuid_guarded` (host-tested in kernel_core).
+        SpecCtrlFeatures::from_cpuid(leaf7_edx, arch_caps)
+    })
+}
+
+/// The cached **guarded** raw `(CPUID.07H.0:EDX, IA32_ARCH_CAPABILITIES)` pair.
+///
+/// `leaf7_edx` is `0` when the max basic leaf (`CPUID.0:EAX`) is `< 7` (the
+/// trap [`probe_smep_smap`] defends); `arch_caps` is `0` unless `EDX[29]` is set
+/// — an unguarded `rdmsr` of `0x10A` `#GP`s on a CPU lacking it. Idempotent;
+/// the D.3 reporter ships these verbatim so a reader reconstructs the identical
+/// [`SpecCtrlFeatures`] via the same host-tested decode.
+pub fn spec_ctrl_raw_regs() -> (u32, u64) {
+    *SPEC_CTRL_RAW.call_once(|| {
+        let max_leaf = cpuid_raw(0, 0).eax;
+        let leaf7_edx = if max_leaf >= 0x07 {
+            cpuid_raw(0x07, 0).edx
+        } else {
+            0
+        };
+        let arch_caps = if (leaf7_edx & (1 << 29)) != 0 {
+            // SAFETY: 0x10A is read only when CPUID advertised it (EDX[29]).
+            unsafe { Msr::new(MSR_IA32_ARCH_CAPABILITIES).read() }
+        } else {
+            0
+        };
+        (leaf7_edx, arch_caps)
+    })
+}
+
+/// The cached SPEC_CTRL features. Must be called after [`probe_spec_ctrl`].
+pub fn spec_ctrl_features() -> &'static SpecCtrlFeatures {
+    SPEC_CTRL_FEATURES
+        .get()
+        .expect("spec_ctrl_features() called before probe_spec_ctrl()")
+}
+
+/// Write the cached always-on base value (eIBRS) on the **current** core. Used
+/// to enable eIBRS once per core at boot.
+///
+/// # Safety
+/// `IA32_SPEC_CTRL` (0x48) must be present (`ibrs_ibpb`); ring 0 only.
+unsafe fn write_spec_ctrl_base() {
+    let base = SPEC_CTRL_BASE.load(Ordering::Acquire);
+    unsafe {
+        Msr::new(MSR_IA32_SPEC_CTRL).write(base);
+    }
+}
+
+/// Detect and apply IBRS per the silicon's capability, returning the mode.
+///
+/// * `IbrsMode::Enhanced` (`IBRS_ALL`) → set `SPEC_CTRL.IBRS` **once on this
+///   core** (folded into the cached base) — protects unconditionally with no
+///   per-entry toggle. Call on the BSP and each AP at boot.
+/// * `IbrsMode::Legacy` → IBRS is the per-kernel-entry toggle that lives in the
+///   KPTI A.2/A.3 trampolines; **not** set here (retpoline, which is
+///   compile-time-unconditional, already covers Spectre-v2 BTI in the interim).
+/// * `IbrsMode::None` → nothing (no SPEC_CTRL write; no `#GP`).
+///
+/// Requires [`probe_spec_ctrl`] to have run.
+///
+/// # Safety
+/// Writes `IA32_SPEC_CTRL` on Enhanced parts; ring 0, boot context.
+pub unsafe fn enable_ibrs() -> IbrsMode {
+    let f = spec_ctrl_features();
+    let mode = classify_ibrs(f);
+    if mode == IbrsMode::Enhanced {
+        // SAFETY: Enhanced implies ibrs_ibpb (classify_ibrs requires the bit
+        // path); SPEC_CTRL is present.
+        unsafe {
+            // Fold IBRS into the global base, then write this core's MSR.
+            SPEC_CTRL_BASE.fetch_or(SPEC_CTRL_IBRS, Ordering::AcqRel);
+            write_spec_ctrl_base();
+        }
+    }
+    mode
+}
+
+/// Issue an IBPB (Indirect Branch Prediction Barrier) on the current core.
+///
+/// `IA32_PRED_CMD` (`0x49`) is **write-only** — an `rdmsr` of it `#GP`s, so we
+/// never read it. Caller MUST gate on `features.ibrs_ibpb` and the global
+/// mitigations off-switch. Used between **distinct** address spaces on the
+/// context-switch path (C.3).
+///
+/// # Safety
+/// `IA32_PRED_CMD` (0x49) must be present (`ibrs_ibpb`); ring 0 only.
+pub unsafe fn issue_ibpb() {
+    unsafe {
+        Msr::new(MSR_IA32_PRED_CMD).write(PRED_CMD_IBPB);
+    }
+}
+
+/// Set or clear `SPEC_CTRL.STIBP` (bit 1) on the **current** core for the task
+/// about to run, composing it on top of the cached always-on base (so eIBRS is
+/// preserved). Caller MUST gate on `features.stibp` and the global off-switch.
+/// (C.4)
+///
+/// STIBP is a **per-core / per-task** control, so this composes the value into
+/// *this core's* MSR only and never writes the per-task bit back into the shared
+/// [`SPEC_CTRL_BASE`] (which holds always-on bits only). Storing STIBP in the
+/// process-global base would let a dispatch on one core perturb the bit another
+/// core composes for its own running task — the MSR write here is the single
+/// source of truth for the current core's STIBP state.
+///
+/// # Safety
+/// `IA32_SPEC_CTRL` (0x48) must be present; ring 0 only.
+pub unsafe fn set_stibp(on: bool) {
+    // Read the always-on base (eIBRS); never mutate it for a per-task bit.
+    let base = SPEC_CTRL_BASE.load(Ordering::Acquire);
+    let value = if on {
+        base | SPEC_CTRL_STIBP
+    } else {
+        base & !SPEC_CTRL_STIBP
+    };
+    unsafe {
+        Msr::new(MSR_IA32_SPEC_CTRL).write(value);
+    }
+}
+
+/// True if the kernel has IBRS active (per the cached base snapshot — never a
+/// re-`rdmsr` of the write-mostly MSR). Reflects eIBRS set-once; legacy-IBRS
+/// per-entry state is not represented here (it is transient in the trampoline).
+pub fn spec_ctrl_active() -> bool {
+    SPEC_CTRL_BASE.load(Ordering::Acquire) & SPEC_CTRL_IBRS != 0
 }
 
 #[derive(Clone, Copy)]

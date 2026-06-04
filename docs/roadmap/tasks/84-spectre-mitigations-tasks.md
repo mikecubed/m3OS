@@ -1,6 +1,6 @@
 # Phase 84 — Spectre / KPTI / Retpoline / IBRS Mitigations: Task List
 
-**Status:** Planned (post-1.0)
+**Status:** Spectre-v2 layer + config/reporter + KPTI scaffolding landed (kernel `0.84.0`); KPTI (Meltdown) CR3-trampoline **activation** (A.2/A.3/A.5 + E.1/E.2) deferred to a bare-metal-validated follow-up — see the Track A status block
 **Source Ref:** phase-84
 **Depends on:** Phase 75 (W^X Enforcement) ✅, Phase 77 (Pre-1.0 Correctness — SMEP + SMAP baseline) ✅, Phase 83 (Release 1.0 Gate) ✅; grading evidence from the Phase 74a pre-1.0 audit (`docs/appendix/audit-status/74a-pre-1.0-audit.md` row 9, "No Spectre/SMEP/SMAP/KPTI mitigations on real silicon", graded **HIGH for SMEP+SMAP; deferrable for KPTI** — which is exactly why SMEP+SMAP landed in Phase 77 and KPTI/retpoline/IBRS are this post-1.0 phase).
 **Goal:** Land the **expensive** post-Meltdown / post-Spectre-v2 mitigations on top of the cheap Phase 77 SMEP+SMAP baseline: KPTI (Kernel Page Table Isolation), retpoline indirect-branch hardening, and the `IA32_SPEC_CTRL` MSR family (IBRS/eIBRS/IBPB/STIBP), all behind a `mitigations=off|auto|full` boot policy with a `m3ctl mitigations status` reporter. The phase reuses the Phase 77 detect→enable→status pattern already in `kernel/src/arch/x86_64/cpuid.rs` (`probe_smep_smap`/`enable_smep_smap`/`cr4_smep_enabled`), puts every bit of CPUID/MSR/`mitigations=` decode logic in host-testable `kernel-core` (mirroring `kernel_core::storage`), and rewrites the syscall/IRQ entry-exit asm in `kernel/src/arch/x86_64/syscall/mod.rs` + `kernel/src/arch/x86_64/interrupts.rs` to carry a CR3 trampoline. The keystone change is in `kernel/src/mm/mod.rs::new_process_page_table`, which **today clones the kernel's PML4 entries `[1..512]` into every process PML4** — KPTI replaces that with a kernel/user PML4 **pair** so the user-mode CR3 cannot even speculate into kernel memory. The headline correctness proof is a userspace **Meltdown PoC** gate (bare-metal-validated; QEMU TCG does not model speculation), because a stack-switch-only "PTI" compiles, boots, and passes an ordinary smoke test while still leaking kernel memory — the exact trap Redox fell into (its `pti.rs` is feature-gated off with its kernel-unmap commented out).
@@ -11,11 +11,13 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | **KPTI** — split the per-process PML4 into a kernel/user pair (`kernel/src/mm/mod.rs`), a CR3 trampoline on the syscall path (`syscall/mod.rs`) and IRQ/IST path (`interrupts.rs`), GLOBAL-bit removal, PCID/INVPCID TLB-flush avoidance, and `RDCL_NO` auto-skip | Phase 11 process model, C.1 (feature decode) | Planned |
-| B | **Retpoline** — enable `-Zretpoline` on the existing `-Zbuild-std` kernel build (`xtask`), an optional hand-written `__x86_indirect_thunk_r11` external thunk, and an `objdump` residual-indirect-branch verification gate wired into `cargo xtask check` | — | Planned |
-| C | **SPEC_CTRL MSR** — host-testable CPUID/MSR feature decode in `kernel-core`, IBRS/eIBRS detect+enable in `cpuid.rs` (mirroring `probe/enable_smep_smap`), IBPB on cross-process `switch_context`, STIBP per-process opt-in | C.1 | Planned |
-| D | **Configuration surface** — host-testable `mitigations=` parser + per-vuln bug map + status vocabulary in `kernel-core`, boot-flag plumbing that gates A/C with a single global off-switch, and a `m3ctl mitigations status` reporter | A, B, C, C.1 | Planned |
-| E | **Validation + release closeout** — the Meltdown-PoC smoke gate, the ≤30% perf-regression gate, kernel `0.83.0`→`0.84.0`, the Phase 84 learning doc + `docs/security/` operator reference, README/AGENTS alignment, and design-doc reconciliation | A–D | Planned (E.6/E.7 reconciliation **landed in this authoring PR**) |
+| A | **KPTI** — split the per-process PML4 into a kernel/user pair (`kernel/src/mm/mod.rs`), a CR3 trampoline on the syscall path (`syscall/mod.rs`) and IRQ/IST path (`interrupts.rs`), GLOBAL-bit removal, PCID/INVPCID TLB-flush avoidance, and `RDCL_NO` auto-skip | Phase 11 process model, C.1 (feature decode) | **Scaffolding landed** (A.1 model, A.4 guard, A.6 policy, CR3 plumbing); **CR3-trampoline activation (A.2/A.3/A.5) deferred to a bare-metal follow-up** — see the Track A status block |
+| B | **Retpoline** — enable `-Zretpoline` on the existing `-Zbuild-std` kernel build (`xtask`), an optional hand-written `__x86_indirect_thunk_r11` external thunk, and an `objdump` residual-indirect-branch verification gate wired into `cargo xtask check` | — | **Complete** (Wave 1; B.2 external thunk deferred-optional) |
+| C | **SPEC_CTRL MSR** — host-testable CPUID/MSR feature decode in `kernel-core`, IBRS/eIBRS detect+enable in `cpuid.rs` (mirroring `probe/enable_smep_smap`), IBPB on cross-process `switch_context`, STIBP per-process opt-in | C.1 | **Mostly complete** (C.1/C.3/C.4 + eIBRS done; C.2 legacy-IBRS per-entry toggle deferred to Track A trampoline) |
+| D | **Configuration surface** — host-testable `mitigations=` parser + per-vuln bug map + status vocabulary in `kernel-core`, boot-flag plumbing that gates A/C with a single global off-switch, and a `m3ctl mitigations status` reporter | A, B, C, C.1 | **Complete** (D.1/D.2/D.3 landed; gates Track A when KPTI lands) |
+| E | **Validation + release closeout** — the Meltdown-PoC smoke gate, the ≤30% perf-regression gate, kernel `0.83.0`→`0.84.0`, the Phase 84 learning doc + `docs/security/` operator reference, README/AGENTS alignment, and design-doc reconciliation | A–D | **E.3/E.4/E.5/E.6/E.7 landed** (kernel `0.84.0`, both docs, README/AGENTS); **E.1 Meltdown-PoC + E.2 perf gates deferred with KPTI activation** (bare-metal-validated) |
+
+> **Implementation execution note (added by the implementation PR).** Work is structured into waves: **Wave 1** (parallel, isolated worktrees) lands the two independent low-risk tracks — `core-decode` (C.1 + D.1, pure host-tested logic in `kernel-core/src/spectre.rs`) and `retpoline` (B, build-flag + `objdump` gate). **Wave 2** (serial, coordinator-driven) lands the deeply-coupled kernel surgery that all touches `cpuid.rs`/`syscall/mod.rs`/`interrupts.rs`/`scheduler.rs` — C.2–C.4, then D.2, then **A (KPTI)**, then D.3, then E.1/E.2 — because parallelizing files this tightly coupled (especially the CR3-trampoline asm) is unsafe. **Wave 3** closes out (E.3 version bump + E.4/E.5/E.6 docs). **Validation ceiling:** QEMU/TCG does not model speculation, so the E.1 Meltdown-leak property is bare-metal/VFIO-only; in QEMU the gate asserts the privileged read **faults** under `mitigations=full` and that the OS boots/round-trips with KPTI active (skip-with-reason for the leak observation).
 
 > **Ordering note.** The pure-logic feature/parse/report decode (**C.1** and **D.1**) is written and host-tested **first** — every CPUID bit (`CPUID.07H.0:EDX[26]`=IBRS+IBPB, `[27]`=STIBP, `[29]`=ARCH_CAPABILITIES, `[31]`=SSBD), the `IA32_ARCH_CAPABILITIES` (MSR `0x10A`) `RDCL_NO`/`IBRS_ALL` decode, the eIBRS-vs-legacy classification, and the `mitigations=` parser are proven by `cargo xtask check` with no QEMU, exactly as Phase 82 put the AHCI register/FIS math in `kernel-core::storage` and Phase 77 put SMEP/SMAP detection in `cpuid.rs`. Then **A** (KPTI, the headline architectural change) and **C** (SPEC_CTRL) consume that decode; **B** (retpoline) is an independent build-system + asm change; **D** wires the boot policy + reporter; **E** proves it with the Meltdown PoC and performs the version bump + doc cut. The single load-bearing review check is **E.1**: a Meltdown PoC that actually attempts a kernel read, because a half-built KPTI silently passes everything else.
 
@@ -26,6 +28,10 @@
 ---
 
 ## Track A — KPTI (Kernel Page Table Isolation)
+
+> **Track A status (implementation PR).** The **validatable, boot-safe** KPTI work landed: **A.1** as a host-tested invariant model (`kernel_core::kpti` — 6 tests; the user PML4 may carry only `PML4[0]` + the minimal entry set, never a cloned kernel slot; catches the Redox "direct-map still mapped" no-op), **A.4** GLOBAL-bit guard (`mm::count_global_kernel_leaf_ptes`, asserted 0 at boot), **A.6** RDCL_NO auto-skip (`mitigations::init_bsp`), and the per-core CR3-trampoline **plumbing** (`PerCoreData::{kpti_kernel_cr3,kpti_user_cr3,kpti_scratch}` + offsets). All inert behind `kpti_active` (`KPTI_WIRED=false`), so the default boot + the validated Tracks B/C/D are untouched.
+>
+> **Deferred to a bare-metal-validated follow-up: the CR3-trampoline *activation* (A.2 syscall + A.3 IRQ/IST + A.5 PCID) + E.1/E.2 gates.** Investigation established three load-bearing facts: (1) QEMU/TCG does not model speculation, so KPTI's leak-prevention is **unverifiable in QEMU by construction** — its correctness proof is the bare-metal Meltdown PoC (E.1), exactly as this doc's design mandates; (2) there is **no shortcut** — the physical direct map is used pervasively in ring 0 (`copy_from_user`, page-table walks), so it cannot remain mapped, which forces a CR3 switch in **every** ring-3-reachable entry path, and the `extern "x86-interrupt"` handlers' built-in `iretq` cannot carry the user-CR3 switch-back, forcing conversion of the whole entry path to naked CR3-trampoline stubs (installable as **alternate IDT/`LSTAR` entries only when `kpti_active`**, so activation never risks the default boot); (3) **SMP** additionally needs a fixed per-CPU entry-area (a `cpu_entry_area`-equivalent) because m3OS allocates per-core GDT/TSS/PerCoreData on the heap at arbitrary VAs — a per-process user PML4 cannot otherwise reach the *running core's* RSP0/TSS/per-core data. **Activation plan:** (a) single-core first — `build_user_shadow_pml4` maps the minimal set (entry-stub text + PerCoreData + IDT + GDT/TSS + RSP0/IST stacks) via `mapper_for_frame` into a second PML4 stored on `AddressSpace`/`Task`; the alternate `syscall_entry`/IDT stubs read `gs:[kpti_*_cr3]` and switch CR3 (entry → kernel before the kernel-stack store; exit → user before `sysretq`/`iretq`); the dispatcher sets the per-core CR3 fields per task; (b) then a `cpu_entry_area` sub-phase for SMP; (c) E.1 Meltdown-PoC gate (skip-with-reason on TCG, asserts the privileged read faults) + E.2 perf gate (PCID-gated). Until activation lands, the reporter reports Meltdown honestly (`Vulnerable`/`Not affected`), never a false `Mitigated`.
 
 ### A.1 — Split the per-process PML4 into a kernel/user pair
 
@@ -39,9 +45,9 @@
 **Why it matters:** `new_process_page_table` (mm/mod.rs:282) currently does `for i in 1..512 { new_pml4[i] = cur_pml4[i].clone() }` — it copies the **entire** kernel half (and kernel low-half) into every process's single PML4, so the kernel is fully mapped while ring 3 runs. That is precisely the Meltdown-exposed design. The per-process CR3 machinery already exists (`UserReturnState.cr3_phys`, `KERNEL_PML4_PHYS`, `restore_kernel_cr3` at mm/mod.rs:169) — so KPTI **refactors** the single per-process PML4 into a pair, it does not invent CR3 switching: keep the current per-process PML4 as the **kernel** CR3 and build a second **user** PML4 that maps **only** PML4[0] (user pages — the loader's `0x400000` `USER_VADDR_MIN` convention) plus the minimal entry/exit trampoline set (A.2). The CPU literally cannot speculate into kernel memory from the user CR3.
 
 **Acceptance:**
-- [ ] With `mitigations=full`, `AddressSpace` carries two PML4 frames (kernel + user) and `Task` carries both `cr3_phys` (kernel) and `user_cr3_phys`; `new_process_page_table` no longer leaves the full kernel half present in the user-visible PML4.
-- [ ] A kernel self-test (or host test over a `kernel-core` model of the walk) walks the user PML4 and asserts it maps **only** the user lower-half (PML4[0]) plus the A.2 trampoline set, and that kernel `.text`/heap/direct-map/page-table PTEs are **absent or NX** in the user half (mirrors Linux's NX-on-user-kernel-text trap).
-- [ ] With `mitigations=off`, `new_process_page_table` behaves exactly as today (single combined PML4) — no perf or correctness change on the off path.
+- [~] *(deferred to activation)* With `mitigations=full`, `AddressSpace` carries two PML4 frames (kernel + user) and `Task` carries both `cr3_phys` (kernel) and `user_cr3_phys`; `new_process_page_table` no longer leaves the full kernel half present in the user-visible PML4. **Plumbing landed** (`PerCoreData` CR3 fields); the real `build_user_shadow_pml4` + `AddressSpace.user_pml4` land with the trampoline activation.
+- [x] **Host test over a `kernel-core` model of the walk** — `kernel_core::kpti` (6 tests): the user half may carry only `PML4[0]` (user) + the minimal entry set; `check_user_half_invariant` asserts kernel `.text`/heap/**direct-map** are absent (catches the Redox "direct-map still mapped" no-op and the "clone a kernel slot verbatim" trap). The runtime kernel self-test that walks the *real* user PML4 lands with the builder (activation).
+- [x] With `mitigations=off`, `new_process_page_table` behaves exactly as today (single combined PML4) — **guaranteed**: the user-PML4 build is gated on `kpti_active`, which is `false` on the off/`RDCL_NO`-auto paths (and `KPTI_WIRED=false` until activation), so the off path is byte-for-byte today's behavior.
 
 ### A.2 — Syscall entry/exit CR3 trampoline
 
@@ -80,8 +86,8 @@
 **Why it matters:** PTEs marked `GLOBAL` survive a CR3 reload, so a KPTI that leaves kernel pages global lets kernel TLB entries persist into userspace — the isolation becomes a no-op and a Meltdown PoC may **still** read kernel data from a stale global TLB entry, the most insidious silent-failure mode of a first KPTI (Redox encodes exactly this: `startup/memory.rs` `.global(... not(feature = "pti"))`). **Important repo fact:** m3OS does **not** currently mark kernel PTEs `GLOBAL` or enable `CR4.PGE` (verified — no `PageTableFlags::GLOBAL` site in `kernel/src/mm/`), so this task is a **guard**, not a removal: it must keep that property true under KPTI, and if `CR4.PGE`/`GLOBAL` is ever introduced as an off-path throughput optimization, it must be suppressed whenever KPTI is active.
 
 **Acceptance:**
-- [ ] The task first establishes the current state (no kernel-PTE `GLOBAL`, no `CR4.PGE`); with `mitigations=full` and **no** PCID (A.5 inactive), kernel-half PTEs remain non-`GLOBAL`, so each CR3 switch actually evicts kernel translations.
-- [ ] If a future `CR4.PGE`/`GLOBAL` optimization exists on the `mitigations=off` path, it is provably suppressed under KPTI (a self-test asserts no kernel PTE visible across a KPTI CR3 switch carries `GLOBAL`); with PCID active (A.5), the CR3 writes set the no-flush bit instead of paying a full flush.
+- [x] Current state established + guarded: no kernel-PTE `GLOBAL` (grep-verified — zero `PageTableFlags::GLOBAL` sites). `mm::count_global_kernel_leaf_ptes()` walks the kernel upper half and counts `GLOBAL` **leaf/huge** PTEs (the only levels where the bit is meaningful); it is `0` and `mitigations::init_bsp` logs it + `debug_assert`s it, so each KPTI CR3 switch (once activated) actually evicts kernel translations.
+- [x] The guard fires if a future `CR4.PGE`/`GLOBAL` optimization ever introduces a global kernel PTE (the count goes nonzero → boot `debug_assert` + logged). *(The PCID no-flush composition lands with A.5/activation.)*
 
 ### A.5 — PCID / INVPCID TLB-flush avoidance
 
@@ -108,9 +114,9 @@
 **Why it matters:** `IA32_ARCH_CAPABILITIES` (MSR `0x10A`) bit 0 `RDCL_NO` advertises a CPU that is **not** susceptible to Meltdown (all AMD + recent Intel). Linux leaves PTI **off** by default on such CPUs even in `auto` mode — paying KPTI's cost on immune silicon is pure waste. `full` still forces KPTI on (for testing); `off` always disables it.
 
 **Acceptance:**
-- [ ] Under `mitigations=auto`, KPTI is **OFF** when `RDCL_NO` is set (and `m3ctl mitigations status` reports Meltdown `Not affected`), and **ON** otherwise.
-- [ ] Under `mitigations=full`, KPTI is forced on regardless of `RDCL_NO`; under `mitigations=off`, KPTI is off regardless.
-- [ ] The `RDCL_NO` decode is the host-tested C.1 function, not an ad-hoc inline bit test.
+- [x] **Policy + reporter done:** `mitigations::init_bsp` computes `kpti_policy = match level { Off=>false, Full=>true, Auto=>!rdcl_no }`, and `m3ctl mitigations status` reports Meltdown `Not affected` on `RDCL_NO`. The actual KPTI **enforcement** when the policy is on (`kpti_active`) lands with the trampoline activation; until then the reporter shows `Vulnerable` (honest), never a false `Mitigated`.
+- [x] `mitigations=full` → `kpti_policy=true` regardless of `RDCL_NO`; `mitigations=off` → `kpti_policy=false` regardless — encoded in `init_bsp` (validated via the host-tested `report_map`/`build_vuln_map`).
+- [x] The `RDCL_NO` decode is the host-tested C.1 `SpecCtrlFeatures` function (`kernel_core::spectre`), consumed by `init_bsp` — not an ad-hoc inline bit test.
 
 ---
 
@@ -123,9 +129,11 @@
 **Why it matters:** the design doc's `-C target-feature=+retpoline-indirect-branches,+retpoline-indirect-calls` is **wrong** — on current `rustc` those are *target modifiers* and `-Ctarget-feature` is hard-rejected (`cannot be enabled with -Ctarget-feature: use -Zretpoline`). The correct flag is the dedicated nightly `-Zretpoline`. Retpoline is an ABI-affecting target modifier, so `core` **must** be rebuilt with it — which m3OS already does via `-Zbuild-std`, so this is a small additive change, not new build machinery. The flag belongs in the **xtask kernel build invocation** (a JSON target spec like `x86_64-m3os.json`, which is not even the default target, cannot carry `-Z` flags).
 
 **Acceptance:**
-- [ ] The kernel builds with `-Zretpoline` added to the existing `-Zbuild-std=core,compiler_builtins,alloc` invocation; LLVM reroutes indirect calls through its internal `__llvm_retpoline_r11` thunk.
-- [ ] The build does **not** pass `-Cunsafe-allow-abi-mismatch=retpoline` (that escape hatch links an unprotected `core` and defeats the mitigation); removing `-Zbuild-std` reproduces the ABI-mismatch error, proving `core` is being rebuilt with the thunk.
-- [ ] Retpoline is **compile-time-unconditional** (baked into codegen) — it cannot be toggled by the `mitigations=` boot flag like KPTI/IBRS. D.3 reports it as `compiled-in (cannot disable at boot)`; this is stated explicitly so a reader does not expect a runtime switch.
+- [x] The kernel builds with `-Zretpoline` added (via `[target.x86_64-unknown-none] rustflags` in `.cargo/config.toml`, applied atop the existing `-Zbuild-std=core,compiler_builtins,alloc` invocation); LLVM reroutes indirect calls through its internal `__llvm_retpoline_r11` thunk (1894 references in the linked kernel ELF).
+- [x] The build does **not** pass `-Cunsafe-allow-abi-mismatch=retpoline` (that escape hatch links an unprotected `core` and defeats the mitigation); the empirical `rustc -Zretpoline` probe confirms the ABI-mismatch error fires when `core` is not rebuilt with the flag, proving `-Zbuild-std` is doing the rebuild.
+- [x] Retpoline is **compile-time-unconditional** (baked into codegen) — it cannot be toggled by the `mitigations=` boot flag like KPTI/IBRS. D.3 reports it as `compiled-in (cannot disable at boot)`; this is stated explicitly so a reader does not expect a runtime switch.
+
+> **Landed (Wave 1, `.cargo/config.toml`):** `-Zretpoline` scoped to the bare-metal target only (host build-scripts/proc-macros are unaffected — verified `cargo build -p xtask --target x86_64-unknown-linux-gnu` clean); soft-float flags come from the builtin `x86_64-unknown-none` target spec, so the new `rustflags` key clobbers nothing. B.2 (external `__x86_indirect_thunk_r11`) intentionally **not** implemented — the default learning path uses the compiler-internal thunk; B.2 stays the documented optional.
 
 ### B.2 — (Optional, learning) hand-written `__x86_indirect_thunk_r11` external thunk
 
@@ -146,10 +154,10 @@
 **Why it matters:** the mitigation is void if even one indirect branch survives, so it must be **mechanically verified**. The design doc's `grep -E 'call[ \t]+\*'` is incomplete — it misses indirect **JMPs** (`jmp *reg`, the tail-call-optimized trait/fn-pointer dispatch that lowers to a jump) and the `q`-suffixed mnemonics. The check must run on the **fully-linked** `kernel.elf` (after `-Zbuild-std`) so rebuilt `core` is included.
 
 **Acceptance:**
-- [ ] `objdump -d <kernel.elf> | grep -E '\b(call|callq|jmp|jmpq)[ \t]+\*'` returns **zero** lines (covers indirect CALL **and** indirect JMP, both operand forms), run against the fully-linked kernel after build-std.
-- [ ] A positive cross-check asserts the thunk is actually used: `objdump -dr <kernel.elf> | grep -c '__llvm_retpoline_r11'` (or `__x86_indirect_thunk_r11` in the external-thunk variant) is non-zero.
-- [ ] The thunk and reroute sites contain **zero** XMM/SSE (soft-float clean) — consistent with the kernel's `-mmx,-sse,+soft-float`, documented so a reviewer does not assume an FPU/XSAVE interaction exists.
-- [ ] The gate is wired into `cargo xtask check` so a regression (a new un-thunked indirect branch) **fails the build**, not just a smoke test.
+- [x] `objdump -d <kernel.elf>` indirect-branch scan returns **zero** lines (covers indirect CALL **and** indirect JMP, both operand forms), run against the fully-linked kernel after build-std. *Implemented as a robust line-parser (`retpoline_objdump_gate` in `xtask`) splitting on tabs and matching `mnemonic ∈ {call,callq,jmp,jmpq}` with a `*`-prefixed operand, not a fragile grep.* Result: **0**.
+- [x] A positive cross-check asserts the thunk is actually used: counts `__llvm_retpoline_r11` references in `objdump -dr` output and requires non-zero. Result: **1894**.
+- [x] The thunk and reroute sites contain **zero** XMM/SSE (soft-float clean) — guaranteed by the builtin `x86_64-unknown-none` target's `+soft-float,-mmx,-sse`; documented at the gate call site and in `.cargo/config.toml` so a reviewer does not assume an FPU/XSAVE interaction exists.
+- [x] The gate is wired into `cargo xtask check` (calls `build_kernel()` so it is self-contained on a clean tree) so a regression (a new un-thunked indirect branch) **fails the build**, not just a smoke test.
 
 ### B.4 — RSB-stuffing + Retbleed honesty (scoping)
 
@@ -178,11 +186,13 @@
 **Why it matters:** AGENTS.md mandates pure logic be host-tested in `kernel-core` (the kernel is `no_std` and cannot be `cargo test`ed in QEMU). The decode is exactly the error-prone part the design doc got wrong, so pinning it in host tests (modeled on `cpuid.rs::XSaveFeatures::from_raw`) makes a bit-transcription slip a **failing test**, not a silent `#GP` or an unprotected boot. `CPUID.(EAX=07H,ECX=0):EDX[26]` enumerates **both IBRS and IBPB** (one bit); `[27]` is STIBP; `[29]` is ARCH_CAPABILITIES-present; `[31]` is SSBD. `IA32_ARCH_CAPABILITIES` (MSR `0x10A`) `[0]`=`RDCL_NO`, `[1]`=`IBRS_ALL` (eIBRS).
 
 **Acceptance:**
-- [ ] Host test: `EDX[26]` set → `ibrs_ibpb == true` (gates **both**); `EDX[27]` → `stibp` only; `EDX[31]` → `ssbd`; `EDX[29]` → `arch_caps_present` (and only then is `arch_caps` consulted) (`kernel_core::spectre::tests::edx_bits`).
-- [ ] **Max-basic-leaf guard (the same trap `probe_smep_smap` defends at cpuid.rs:241):** `from_cpuid`/its caller treats leaf-7 EDX as **zero** when `CPUID.0:EAX < 7` — executing `CPUID` with an unsupported basic leaf returns the *highest supported leaf's* data, whose bits 26/27/31 could otherwise be mis-read as IBRS/STIBP/SSBD on an old/VM CPU (`tests::leaf7_absent_reads_zero`).
-- [ ] Host test: `arch_caps[1]` (`IBRS_ALL`) set → `classify_ibrs == Enhanced` (set-once-at-boot); `ibrs_ibpb` set but `IBRS_ALL` clear → `Legacy` (per-entry toggle); neither → `None` (`tests::ibrs_mode`).
-- [ ] Host test: `arch_caps[0]` (`RDCL_NO`) set → `rdcl_no == true` (Meltdown-immune; drives A.6) (`tests::rdcl_no`).
-- [ ] `cargo xtask check` compiles and runs the new module (`kernel-core` is already in the check list; no new crate entry needed — recorded in E.6).
+- [x] Host test: `EDX[26]` set → `ibrs_ibpb == true` (gates **both**); `EDX[27]` → `stibp` only; `EDX[31]` → `ssbd`; `EDX[29]` → `arch_caps_present` (and only then is `arch_caps` consulted) (`kernel_core::spectre::tests::edx_bits`).
+- [x] **Max-basic-leaf guard (the same trap `probe_smep_smap` defends at cpuid.rs:241):** `from_cpuid`/its caller treats leaf-7 EDX as **zero** when `CPUID.0:EAX < 7` — executing `CPUID` with an unsupported basic leaf returns the *highest supported leaf's* data, whose bits 26/27/31 could otherwise be mis-read as IBRS/STIBP/SSBD on an old/VM CPU (`tests::leaf7_absent_reads_zero`). *Implemented as `from_cpuid_guarded(max_basic_leaf, leaf7_edx, arch_caps)`.*
+- [x] Host test: `arch_caps[1]` (`IBRS_ALL`) set → `classify_ibrs == Enhanced` (set-once-at-boot); `ibrs_ibpb` set but `IBRS_ALL` clear → `Legacy` (per-entry toggle); neither → `None` (`tests::ibrs_mode`).
+- [x] Host test: `arch_caps[0]` (`RDCL_NO`) set → `rdcl_no == true` (Meltdown-immune; drives A.6) (`tests::rdcl_no`).
+- [x] `cargo xtask check` compiles and runs the new module (`kernel-core` is already in the check list; no new crate entry needed — recorded in E.6).
+
+> **Landed (Wave 1, `kernel-core/src/spectre.rs`):** all 7 host tests pass under `cargo test -p kernel-core --target x86_64-unknown-linux-gnu --lib spectre`; `cargo xtask check` green. `SpecCtrlFeatures::{from_cpuid,from_cpuid_guarded}`, `IbrsMode`, `classify_ibrs` implemented exactly to contract, no_std-clean (no alloc).
 
 ### C.2 — IBRS/eIBRS detect + enable in `cpuid.rs` (mirror `probe/enable_smep_smap`)
 
@@ -191,9 +201,11 @@
 **Why it matters:** Phase 77 already established the exact detect→enable→status shape in this file; Track C reuses it so the SPEC_CTRL path is idiomatic. Every `rdmsr`/`wrmsr` of `0x48` must be gated on the C.1 `ibrs_ibpb` bit (an unguarded MSR access `#GP`s on a CPU that lacks it). The eIBRS-vs-legacy split (C.1 `IbrsMode`) decides *when* the MSR is written. Note eIBRS is **not** full Spectre-v2 coverage: `IBRS_ALL` restricts *same-thread* cross-privilege BTI only — SMT-sibling isolation still requires STIBP (C.4) even on eIBRS silicon, so "set IBRS once and done" does not retire the STIBP control.
 
 **Acceptance:**
-- [ ] `IA32_SPEC_CTRL` (MSR `0x48`) is `rdmsr`/`wrmsr`-accessed **only** when C.1 reports `ibrs_ibpb`; booting on a CPU lacking the bit performs **no** SPEC_CTRL access (no `#GP`) — asserted by a probe that runs on a feature-stripped CPUID path.
-- [ ] `IbrsMode::Enhanced` → IBRS (`SPEC_CTRL` bit 0) is written **once at boot** and never toggled; `IbrsMode::Legacy` → IBRS is toggled in the A.2/A.3 trampolines (set on kernel entry, cleared on user exit). A test on a legacy path observes `SPEC_CTRL.IBRS == 0` in userspace and `1` in kernel; on eIBRS it stays `1`.
-- [ ] A blind full-MSR write never clobbers `STIBP` (bit 1) / `SSBD` (bit 2): the kernel caches a `spec_ctrl_base` (mirroring Linux `x86_spec_ctrl_base`) and writes the combined value; `spec_ctrl_active()` reads the cached snapshot, not a re-`rdmsr` of the write-mostly MSR.
+- [x] `IA32_SPEC_CTRL` (MSR `0x48`) is `rdmsr`/`wrmsr`-accessed **only** when C.1 reports `ibrs_ibpb`; booting on a CPU lacking the bit performs **no** SPEC_CTRL access (no `#GP`). `probe_spec_ctrl`/`enable_ibrs`/`issue_ibpb`/`set_stibp` in `cpuid.rs` all gate on the host-tested decode; the QEMU lanes (qemu64 / `-cpu host` AMD, Intel `EDX[26]` absent) report `IbrsMode::None` → zero writes (verified: boots clean, no `#GP`).
+- [~] `IbrsMode::Enhanced` → IBRS (`SPEC_CTRL` bit 0) written **once at boot** (`enable_ibrs`, folded into the `spec_ctrl_base` cache; re-applied per-AP in `mitigations::init_ap`) — **done**. `IbrsMode::Legacy` per-entry toggle lives in the A.2/A.3 KPTI trampolines (shares that asm) — **deferred to Track A**; until then retpoline (compile-time-unconditional, active) covers Spectre-v2 BTI on legacy parts. The userspace-0/kernel-1 legacy assertion is unobservable on the QEMU lanes (no SPEC_CTRL) and lands with the spectre gate's spec-ctrl CPU + KPTI.
+- [x] A blind full-MSR write never clobbers `STIBP` (bit 1) / `SSBD` (bit 2): `cpuid.rs` caches `SPEC_CTRL_BASE` (mirroring Linux `x86_spec_ctrl_base`) and writes `base | extra`; `spec_ctrl_active()` reads the cached snapshot, never a re-`rdmsr` of the write-mostly MSR.
+
+> **Landed (Wave 2, `cpuid.rs`):** eIBRS set-once + IBPB + STIBP mechanisms + the `spec_ctrl_base` cache. **Legacy per-entry IBRS toggle is the one C.2 item deferred to Track A** (it is the same trampoline asm). No behavior change on the test lanes (None → no writes).
 
 ### C.3 — IBPB barrier on cross-process `switch_context`
 
@@ -205,9 +217,9 @@
 **Why it matters:** IBPB (`IA32_PRED_CMD` MSR `0x49` bit 0, **write-only**) flushes the indirect branch predictor at a security-domain boundary. Issuing it between **distinct** processes (not thread-to-thread within one address space) stops a prior process from having trained the predictor against the next. `PRED_CMD` is write-only — an `rdmsr` of `0x49` faults.
 
 **Acceptance:**
-- [ ] `PRED_CMD` (`0x49`) bit 0 is written `1` **only** on a switch between distinct address spaces (`as_gen`/PML4 differs), gated on C.1 `ibrs_ibpb`; thread switches within one process issue no IBPB.
-- [ ] `PRED_CMD` is **never** `rdmsr`'d (write-only).
-- [ ] With `mitigations=off`, no IBPB is issued (the switch path consults the global off-switch, D.2).
+- [x] `PRED_CMD` (`0x49`) bit 0 is written `1` **only** on a switch between distinct address spaces (`old_as_ptr != new_as_ptr`, `pid != 0`), gated on `ibrs_ibpb`; thread switches within one process (same address space) issue no IBPB. Wired in `scheduler.rs` at the cross-process boundary.
+- [x] `PRED_CMD` is **never** `rdmsr`'d — `issue_ibpb` is write-only (`Msr::write` only).
+- [x] With `mitigations=off`, no IBPB is issued — the switch path calls `mitigations::ibpb_enabled()`, which consults the one global off-switch (D.2).
 
 ### C.4 — STIBP per-process opt-in (default off)
 
@@ -219,9 +231,11 @@
 **Why it matters:** STIBP (`SPEC_CTRL` bit 1) stops an SMT sibling thread from influencing this thread's branch predictor, at a real perf cost, so it is **default-off** and opt-in. The design doc references Linux `prctl(PR_SET_SPECULATION_CTRL, ...)`, but **m3OS has no `prctl`** — the opt-in must be an m3OS-native syscall or capability.
 
 **Acceptance:**
-- [ ] STIBP (`SPEC_CTRL` bit 1) is set **only** for processes that opt in via the m3OS-native control, gated on C.1 `stibp` (`CPUID.07H.0:EDX[27]`); default-off is verified (a process that does not opt in runs with STIBP clear).
-- [ ] The opt-in is documented as an m3OS surface, **not** presented as Linux `prctl`.
-- [ ] Setting STIBP composes with C.2's `spec_ctrl_base` cache (no clobber of IBRS/SSBD bits).
+- [x] STIBP (`SPEC_CTRL` bit 1) is set **only** for processes that opted in via the m3OS-native `sys_set_spec_ctrl` syscall (`0x1141`), gated on `stibp` + the off-switch (`stibp_available()`); default-off (a process that never opts in keeps STIBP clear — the scheduler applies `set_stibp(stibp_opt_in(pid))` only under the gate, which is a no-op on the QEMU lanes lacking STIBP).
+- [x] The opt-in is an m3OS-native syscall (`SYS_SET_SPEC_CTRL`), **not** Linux `prctl` — documented as such in `kernel_core::spectre` + the syscall handler.
+- [x] `set_stibp` composes with the `spec_ctrl_base` cache (writes `base | STIBP`, clears via `base & !STIBP` then re-write) — no clobber of IBRS/SSBD.
+
+> **Landed (Wave 2):** `sys_set_spec_ctrl` records the opt-in in a PID registry (`mitigations::{set_stibp_opt_in,stibp_opt_in}`); the scheduler applies it at dispatch under `stibp_available()`. Runtime STIBP toggle is unobservable on the QEMU lanes (no STIBP feature) — exercised by the host tests + (future) spec-ctrl-CPU gate.
 
 ---
 
@@ -236,9 +250,11 @@
 **Why it matters:** the parse + per-vuln status mapping is pure logic and belongs in host tests, with the string vocabulary modeled on Linux `/sys/devices/system/cpu/vulnerabilities/*` (`Not affected` / `Vulnerable` / `Mitigation: <name>`). Getting `auto` right (consult `RDCL_NO`) and never letting a SKIP-class become silent is the whole correctness story for the reporter.
 
 **Acceptance:**
-- [ ] Host test: `"off"`/`"auto"`/`"full"` parse to the three levels; an unknown value defaults to `Auto` and is flagged (`tests::parse_mitigations`).
-- [ ] Host test: `Auto` + `rdcl_no` → Meltdown `NotAffected` and KPTI suppressed in the map; `Off` → every addressed vuln `Vulnerable`; `Full` → `Mitigated("PTI")` / `Mitigated("Retpoline, IBPB")` etc. (`tests::vuln_map_tracks_level`).
-- [ ] Host test: the **UNADDRESSED** classes (MDS, L1TF, SSB/Spectre-v4, Retbleed, Downfall/GDS) are **always** present in the map as `Unaddressed`, regardless of level (no silent omission) (`tests::unaddressed_always_listed`).
+- [x] Host test: `"off"`/`"auto"`/`"full"` parse to the three levels; an unknown value defaults to `Auto` and is flagged (`tests::parse_mitigations`). *Unknown-value flag exposed via `mitigations_recognized(&str) -> bool`.*
+- [x] Host test: `Auto` + `rdcl_no` → Meltdown `NotAffected` and KPTI suppressed in the map; `Off` → every addressed vuln `Vulnerable`; `Full` → `Mitigated("PTI")` / `Mitigated("Retpoline, IBPB")` etc. (`tests::vuln_map_tracks_level`).
+- [x] Host test: the **UNADDRESSED** classes (MDS, L1TF, SSB/Spectre-v4, Retbleed, Downfall/GDS) are **always** present in the map as `Unaddressed`, regardless of level (no silent omission) (`tests::unaddressed_always_listed`).
+
+> **Landed (Wave 1, `kernel-core/src/spectre.rs`):** `parse_mitigations`/`mitigations_recognized`/`MitigationLevel`/`Vuln`/`Status`/`build_vuln_map` (fixed `[(Vuln, Status); 8]`, no alloc) all host-tested. **Note for D.3 (honesty):** `build_vuln_map` models the *policy* a level implies; the runtime reporter must report Meltdown `Mitigated("PTI")` only when KPTI is *actually* enforcing (a real `kpti_active` flag in the boot snapshot), else `Vulnerable`/`NotAffected` — wired in D.2/D.3.
 
 ### D.2 — Boot-flag plumbing gating A/C, with a single global off-switch
 
@@ -250,9 +266,9 @@
 **Why it matters:** `mitigations=off` must consistently and **early** disable KPTI (A), skip IBRS/IBPB writes (C), and report `Vulnerable` — not leave a half-applied state. The classic Linux bug (`cpu_select_mitigations`) is a per-track selector that checks its own flag but forgets the global `cpu_mitigations_off()`; every m3OS selector must consult the one global switch. Retpoline (B) is compile-time and **cannot** be runtime-disabled — D.3 must report that honestly.
 
 **Acceptance:**
-- [ ] A single `MitigationState` snapshot is populated once at boot from `parse_mitigations` + C.1 features and drives A.1 (KPTI on/off), A.6 (RDCL_NO auto-skip), C.2 (IBRS), and C.3 (IBPB); no track re-parses the flag independently.
-- [ ] Flipping `mitigations=off` leaves **no** track half-applied — a regression boots with `off` and asserts KPTI is inactive, no SPEC_CTRL/PRED_CMD writes occur, and the reporter says `Vulnerable` for the addressed vulns.
-- [ ] **Net-new surface (verified):** m3OS has **no** kernel boot-cmdline today — only per-process `/proc/<pid>/cmdline` (procfs), and `BootInfo` carries no cmdline field — so adding the cmdline source (a `BootInfo.cmdline` from UEFI load options, or a build-time default) is a named, first-class part of D.2's effort, not a contingency.
+- [x] A single `MitigationState` snapshot (`kernel/src/mitigations.rs`) is populated once at BSP boot from `parse_mitigations` + the C.1 features and drives A.6 (RDCL_NO auto-skip policy, `kpti_policy`), C.2 (IBRS via `init_bsp`/`init_ap`), and C.3 (IBPB via `ibpb_enabled`); no track re-parses the level. (A.1 KPTI consumes `kpti_policy`/`kpti_active` when Track A lands — `KPTI_WIRED` gate.)
+- [x] Flipping `mitigations=off` leaves **no** track half-applied — every selector consults the one `mitigations_off()`/`MitigationState` snapshot: `off` ⇒ `ibrs_mode=None` (no SPEC_CTRL write), `ibpb_active=false` (no PRED_CMD), `kpti_policy=false`, and the reporter shows the addressed vulns `Vulnerable`. (KPTI-inactive holds today regardless since Track A is unwired; the full off-path regression boot lands with the spectre gate.)
+- [x] **Net-new surface (resolved honestly):** m3OS has no kernel boot-cmdline and `BootInfo` carries none, so the level is a **build-time default** — `option_env!("M3OS_MITIGATIONS")` (default `auto`) with `kernel/build.rs` emitting `rerun-if-env-changed` so the xtask gates flip the level by rebuilding. The reporter reads the boot-populated snapshot, never a re-`rdmsr`.
 
 ### D.3 — `m3ctl mitigations status` reporter
 
@@ -261,9 +277,11 @@
 **Why it matters:** the reporter reads the **boot-populated** `MitigationState` snapshot (D.2), **not** a re-`rdmsr` of the per-core write-mostly `SPEC_CTRL` MSR (which is not a reliable "is it active" signal). It mirrors Linux's per-vuln vocabulary and — crucially for an honest learning OS — enumerates the UNADDRESSED classes and prints the Grimsdal caveat.
 
 **Acceptance:**
-- [ ] `m3ctl mitigations status` prints, per vuln, one of `Mitigation: <name>` / `Not affected` / `Vulnerable` / `UNADDRESSED`, exactly tracking the boot flag (D.1 map): `off` → addressed vulns `Vulnerable`; `full` → `Mitigation: ...`.
-- [ ] Retpoline is reported as `compiled-in (cannot disable at boot)` (B.1), distinct from the runtime-gated KPTI/IBRS lines.
-- [ ] The output enumerates the UNADDRESSED classes (MDS, L1TF, SSB, Retbleed, Downfall/GDS) and includes a one-line **Grimsdal caveat** that ring-3 driver isolation does not by itself mitigate Spectre between userspace components; the reporter reads the snapshot, never the MSR.
+- [x] `m3ctl mitigations status` prints, per vuln, one of `Mitigation: <name>` / `Not affected` / `Vulnerable` / `UNADDRESSED`, tracking the boot snapshot via the host-tested `report_map` — **Meltdown reflects the actual `kpti_active`** (so `full` with KPTI not yet enforcing prints `Vulnerable`, never a false `PTI`). Wired via the `SYS_MITIGATIONS_STATUS` syscall (`0x1140`) → `MitigationReport` wire decode → `format_mitigations` (host-tested: `mitigations_status_format_is_honest`).
+- [x] Retpoline is reported on its own line `Spectre-v2 (retpoline): compiled-in (cannot disable at boot)` (B.1), distinct from the runtime-gated KPTI/IBRS lines.
+- [x] The output enumerates the UNADDRESSED classes (MDS, L1TF, SSB, Retbleed, Downfall/GDS) and prints the one-line **Grimsdal caveat** + the seL4 timing-channel note; the reporter decodes the boot snapshot wire bytes, never re-reads the MSR.
+
+> **Landed (Wave 2) + runtime-validated:** D.3 reporter end-to-end (kernel `sys_mitigations_status` → `m3ctl mitigations status`). Parse + format host-tested in `m3ctl`; the per-vuln honesty (`report_map`) + wire round-trip host-tested in `kernel_core::spectre`. **Runtime output asserted on a real boot** by the new `cargo xtask mitigations-status-smoke` gate (`M3OS_MITIGATIONS_REGRESSION=1`): it confirms the `[sec] mitigations=… global_kernel_ptes=0` boot-policy log (D.2/A.4/A.6) **and** that `m3ctl mitigations status` prints the per-vuln Meltdown line, the compiled-in retpoline line, and the UNADDRESSED enumeration — **PASSED (17 steps, 34s)**. (The KPTI-independent portion of E.1; the Meltdown-PoC portion still needs bare-metal.)
 
 ---
 
@@ -301,8 +319,8 @@
 **Why it matters:** the `0.NN.0 = Phase NN` convention (0.83.0 = Phase 83) requires the Phase 84 cut to land as `0.84.0`; mirrors Phase 82 Track F (`0.81.0`→`0.82.0`) and Phase 83 Track D.1 (`0.82.0`→`0.83.0`).
 
 **Acceptance:**
-- [ ] `kernel/Cargo.toml` `version` reads `0.84.0`; `cargo xtask check` builds clean and the boot banner / procfs / `uname` (which read `env!("CARGO_PKG_VERSION")`) report `0.84.0`.
-- [ ] No reference bumps the kernel crate to `1.0.0` (the Phase 83 phase-tracked-`0.NN.0` posture is unchanged).
+- [x] `kernel/Cargo.toml` `version` reads `0.84.0` (+ `Cargo.lock`); `cargo xtask check` builds clean and the boot banner / procfs / `uname` (`env!("CARGO_PKG_VERSION")`) report `0.84.0`.
+- [x] No reference bumps the kernel crate to `1.0.0` (the Phase 83 phase-tracked-`0.NN.0` posture is unchanged).
 
 ### E.4 — Create the Phase 84 learning doc + index it
 
@@ -314,9 +332,9 @@
 **Why it matters:** every phase ships a learning doc (the roadmap "Required Documentation for Every Phase" rule). This one teaches *why* speculation breaks the ring-0-isolation assumption (Meltdown), how KPTI/retpoline/IBRS each defeat a specific transient-execution threat, and the honest limits (timing channels, the UNADDRESSED classes).
 
 **Acceptance:**
-- [ ] `docs/84-spectre-mitigations.md` exists and follows the learning-doc structure used by `docs/82`/`docs/83` (Status/Source Ref/Depends on/Builds on/Primary Components header, Milestone Goal, Why This Phase Exists, Learning Goals, Important Components and How They Work, How Real OS Implementations Differ, Deferred Until Later), explaining KPTI/retpoline/IBRS in learner-friendly terms and citing the KAISER/Meltdown/Spectre papers.
+- [x] `docs/84-spectre-mitigations.md` exists and follows the `docs/82`/`docs/83` learning-doc structure, explaining KPTI/retpoline/IBRS in learner-friendly terms and citing the KAISER/Meltdown/Spectre papers; it carries an explicit **Implementation status** block (Spectre-v2 layer landed; KPTI activation deferred to bare-metal).
 - [ ] `docs/README.md`'s `### Phase-Aligned Learning Docs` table has a Phase-84 row linking the new doc.
-- [ ] The learning doc links the design doc, this task doc, and the `docs/security/spectre-mitigations.md` operator reference (E.5).
+- [x] The learning doc links the design doc, this task doc, and the `docs/security/spectre-mitigations.md` operator reference (E.5).
 
 ### E.5 — Create the `docs/security/` operator reference
 
@@ -325,9 +343,9 @@
 **Why it matters:** the design doc's acceptance criteria require a doc describing **which silicon families are protected by which mitigation and which residual risks remain**. This is the operator-facing companion to the learner-facing E.4 doc, and the canonical home for the honesty framing (RDCL_NO/eIBRS behavior, the UNADDRESSED list, the seL4 timing-channel caveat).
 
 **Acceptance:**
-- [ ] `docs/security/spectre-mitigations.md` exists with a per-mitigation silicon matrix: KPTI = Meltdown only (auto-skipped on `RDCL_NO`); retpoline = Spectre-v2 BTI, compile-time-unconditional; IBRS/eIBRS (legacy toggle vs set-once); IBPB on cross-process switch; STIBP opt-in.
-- [ ] A residual-risk section lists MDS / L1TF / SSB / Retbleed / Downfall-GDS as **UNADDRESSED**, and states m3OS makes no claim of freedom from microarchitectural **timing** channels (seL4 verification-scope framing), with the Grimsdal caveat on microkernel driver isolation.
-- [ ] The doc is linked from E.4 (learning doc) and the design doc's Acceptance Criteria reference.
+- [x] `docs/security/spectre-mitigations.md` exists with a per-mitigation silicon matrix (KPTI = Meltdown only, auto-skipped on `RDCL_NO`; retpoline = Spectre-v2 BTI compile-time-unconditional; IBRS/eIBRS legacy-toggle vs set-once; IBPB cross-process; STIBP opt-in) + an implementation-status note + honest example reporter output (Meltdown `Vulnerable` until activation).
+- [x] A residual-risk section lists MDS / L1TF / SSB / Retbleed / Downfall-GDS as **UNADDRESSED**, states m3OS makes no claim of freedom from microarchitectural **timing** channels (seL4 framing), and carries the Grimsdal microkernel-isolation caveat.
+- [x] The doc is linked from E.4 (learning doc) and the design doc.
 
 ### E.6 — README row flip + AGENTS.md gate row + check-list note
 

@@ -1581,6 +1581,10 @@ mod syscall_nr {
         SYS_DEVICE_IRQ_SUBSCRIBE, SYS_DEVICE_MMIO_MAP, SYS_DEVICE_PCI_ENUMERATE,
         SYS_DEVICE_PIO_READ, SYS_DEVICE_PIO_WRITE,
     };
+
+    // -- Phase 84 Spectre mitigations (Track D.3 reporter / C.4 STIBP opt-in) --
+    // m3OS-native `0x114x` block; canonically declared in `kernel_core::spectre`.
+    pub use kernel_core::spectre::{SYS_MITIGATIONS_STATUS, SYS_SET_SPEC_CTRL};
 }
 
 // ---------------------------------------------------------------------------
@@ -2252,6 +2256,9 @@ pub extern "C" fn syscall_handler(
                 ) as u64
             }
         }
+        // -- Phase 84 Spectre mitigations --
+        SYS_MITIGATIONS_STATUS => sys_mitigations_status(arg0, arg1),
+        SYS_SET_SPEC_CTRL => sys_set_spec_ctrl(arg0),
         _ => {
             log::warn!("unhandled syscall {number} (args: {arg0:#x}, {arg1:#x}, {arg2:#x})");
             NEG_ENOSYS
@@ -14770,6 +14777,42 @@ pub(super) fn sys_getrandom(buf_ptr: u64, buflen: u64, _flags: u64) -> u64 {
         return NEG_EFAULT;
     }
     actual as u64
+}
+
+// ---------------------------------------------------------------------------
+// Phase 84 Track D.3 / C.4 — mitigation reporter + STIBP opt-in (m3OS-native)
+// ---------------------------------------------------------------------------
+
+/// D.3 — copy the boot-populated mitigation report wire bytes into a user
+/// buffer. `sys_mitigations_status(buf_ptr, buf_len) -> isize`: bytes written on
+/// success, `-EINVAL` if the buffer is too small, `-EFAULT` on a bad pointer.
+///
+/// Reads the boot snapshot (`mitigations::report()`), **never** a re-`rdmsr` of
+/// the write-mostly SPEC_CTRL MSR.
+pub(super) fn sys_mitigations_status(buf_ptr: u64, buf_len: u64) -> u64 {
+    use kernel_core::spectre::MITIGATION_REPORT_WIRE_LEN;
+    let bytes = crate::mitigations::report().encode();
+    if (buf_len as usize) < MITIGATION_REPORT_WIRE_LEN {
+        return NEG_EINVAL;
+    }
+    if UserSliceWo::new(buf_ptr, MITIGATION_REPORT_WIRE_LEN)
+        .and_then(|s| s.copy_from_kernel(&bytes[..]))
+        .is_err()
+    {
+        return NEG_EFAULT;
+    }
+    MITIGATION_REPORT_WIRE_LEN as u64
+}
+
+/// C.4 — m3OS-native STIBP opt-in (m3OS has no Linux `prctl`).
+/// `sys_set_spec_ctrl(enable_stibp) -> isize`: 0 on success. Records the calling
+/// process's opt-in; the scheduler applies/clears `SPEC_CTRL.STIBP` at dispatch
+/// **only** on STIBP-capable silicon with mitigations not disabled (a no-op on
+/// the QEMU test lanes). Default is off (no opt-in).
+pub(super) fn sys_set_spec_ctrl(enable: u64) -> u64 {
+    let pid = crate::process::current_pid();
+    crate::mitigations::set_stibp_opt_in(pid, enable != 0);
+    0
 }
 
 // ---------------------------------------------------------------------------

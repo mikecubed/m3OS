@@ -90,6 +90,12 @@ pub enum ParsedVerb {
     /// (`wifi_core::control`), and prints the associated SSID, RSSI, and
     /// assigned IPv4 — or "not associated" when no link is up.
     WifiStatus,
+    /// Phase 84 (D.3) — `m3ctl mitigations status`. The binary calls the
+    /// m3OS-native `SYS_MITIGATIONS_STATUS` syscall, decodes the boot
+    /// [`kernel_core::spectre::MitigationReport`], and prints the per-vuln
+    /// status, the compiled-in retpoline line, the UNADDRESSED classes, and
+    /// the Grimsdal microkernel-isolation caveat.
+    MitigationsStatus,
 }
 
 /// Service-registry name of the mt792x Wi-Fi driver's userspace control
@@ -126,6 +132,62 @@ pub fn format_wifi_status(status: &wifi_core::control::WifiStatus) -> String {
     out.push('.');
     out.push_str(&status.ipv4[3].to_string());
     out.push('\n');
+    out
+}
+
+/// Render a [`kernel_core::spectre::MitigationReport`] into the human-readable
+/// `m3ctl mitigations status` output. Pure + host-tested
+/// (`mitigations_status_format`).
+///
+/// Per-vuln status comes from the host-tested `report_map` (so Meltdown tracks
+/// the *actual* KPTI state, never a false "Mitigated"). Retpoline is reported
+/// separately as compiled-in (it cannot be disabled at boot, B.1). The
+/// UNADDRESSED classes and the Grimsdal caveat are always printed so a deferred
+/// class can never silently read as covered.
+pub fn format_mitigations(report: &kernel_core::spectre::MitigationReport) -> String {
+    use kernel_core::spectre::{MitigationLevel, Status};
+    let mut out = String::new();
+
+    out.push_str("mitigations: level=");
+    out.push_str(match report.level {
+        MitigationLevel::Off => "off",
+        MitigationLevel::Auto => "auto",
+        MitigationLevel::Full => "full",
+    });
+    if !report.level_recognized {
+        out.push_str(" (unrecognized value → auto)");
+    }
+    out.push('\n');
+
+    for (vuln, status) in report.vuln_map().iter() {
+        out.push_str("  ");
+        out.push_str(vuln.name());
+        out.push_str(": ");
+        match status {
+            Status::NotAffected => out.push_str("Not affected"),
+            Status::Vulnerable => out.push_str("Vulnerable"),
+            Status::Mitigated(name) => {
+                out.push_str("Mitigation: ");
+                out.push_str(name);
+            }
+            Status::Unaddressed => out.push_str("UNADDRESSED"),
+        }
+        out.push('\n');
+    }
+
+    // Retpoline is compile-time-unconditional (B.1): reported separately from
+    // the runtime-gated KPTI/IBRS lines so a reader does not expect a switch.
+    out.push_str("  Spectre-v2 (retpoline): compiled-in (cannot disable at boot)\n");
+
+    // Honesty: enumerate the UNADDRESSED classes + the microkernel caveat.
+    out.push_str(
+        "note: UNADDRESSED — Spectre-v1, MDS, L1TF, SSB, Retbleed, Downfall/GDS are not mitigated.\n",
+    );
+    out.push_str(
+        "note: ring-3 driver isolation does not by itself mitigate Spectre between userspace \
+         components (Grimsdal et al., NordSec 2019); m3OS makes no claim of freedom from \
+         microarchitectural timing channels (seL4 verification-scope framing).\n",
+    );
     out
 }
 
@@ -192,6 +254,16 @@ pub fn parse_verb(verb: &str, args: &[&str]) -> Result<ParsedVerb, ParseError> {
             Some("status") => Ok(ParsedVerb::WifiStatus),
             Some(_) => Err(ParseError::BadArgument("wifi: only `status` is supported")),
             None => Err(ParseError::MissingArgument("wifi: expected `status`")),
+        },
+        // Phase 84 (D.3) — `m3ctl mitigations status` (read-only diagnostics).
+        "mitigations" => match args.first().copied() {
+            Some("status") => Ok(ParsedVerb::MitigationsStatus),
+            Some(_) => Err(ParseError::BadArgument(
+                "mitigations: only `status` is supported",
+            )),
+            None => Err(ParseError::MissingArgument(
+                "mitigations: expected `status`",
+            )),
         },
         // Phase 56 — display control verbs.
         "version" => Ok(ParsedVerb::Display(ControlCommand::Version)),

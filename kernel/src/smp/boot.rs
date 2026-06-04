@@ -431,6 +431,12 @@ extern "C" fn ap_entry(per_core_data_ptr: *mut super::PerCoreData) -> ! {
     unsafe {
         crate::arch::x86_64::cpuid::clear_ac_for_smap();
     }
+
+    // Phase 84 C.2 — re-apply this core's per-core eIBRS (IA32_SPEC_CTRL is
+    // per-core, not inherited via the CR4 trampoline copy). No-op unless the
+    // BSP decided Enhanced IBRS and the silicon supports it.
+    crate::mitigations::init_ap();
+
     log::info!(
         "[sec] AP CR4.SMEP {} CR4.SMAP {}",
         if crate::arch::x86_64::cpuid::cr4_smep_enabled() {

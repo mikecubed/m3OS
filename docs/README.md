@@ -67,6 +67,7 @@ and a roadmap toward stronger service isolation and broader platform support.
 | [Display and Input Architecture](./56-display-and-input-architecture.md) | 56 | Ring-3 `display_server` owns the framebuffer; focus-aware input dispatch via `kbd_server` / `mouse_server`; layer-shell-equivalent surface roles; control socket for `m3ctl`-style tooling; supervised crash recovery and text-mode fallback |
 | [Audio and Local Session](./57-audio-and-local-session.md) | 57 | First audio path (Intel AC'97 ring-3 driver, single-client PCM-out via `audio_server`); fixed-boot graphical session orchestrator (`session_manager`) with `text-fallback` recovery contract and `m3ctl` control-socket verbs; first useful graphical client (`term`) composing PTY + ANSI parser + Phase 56 display-server client + audio bell |
 | [Release 1.0 Gate](./83-release-1-0-gate.md) | 83 | The 1.0 release contract — closed status legend, target×workflow [support matrix](./release/1.0-release-gate.md) with a mutually-exhaustive evidence trail, QEMU/host/bare-metal honesty tiering, first-class non-goals, and the phase-tracked `0.83.0` versioning posture ("1.0" is quality-bar language, not SemVer `1.0.0`) |
+| [Spectre / KPTI Mitigations](./84-spectre-mitigations.md) | 84 | Post-1.0 transient-execution hardening — KPTI (Meltdown), retpoline (Spectre-v2 BTI), IBRS/eIBRS/IBPB/STIBP, `mitigations=off\|auto\|full` boot policy, host-tested CPUID/MSR decode, and an honest accounting of the UNADDRESSED classes (Spectre-v1, MDS, L1TF, SSB, Retbleed, Downfall) |
 
 ### Roadmap
 

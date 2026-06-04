@@ -391,3 +391,64 @@ fn wifi_not_associated_message_is_stable() {
     assert_eq!(WIFI_NOT_ASSOCIATED_MSG, "wifi: not associated");
     assert_eq!(WIFI_CONTROL_SERVICE_NAME, "wifi.control");
 }
+
+// ---------------------------------------------------------------------------
+// Phase 84 (D.3) — `m3ctl mitigations status` parsing + formatter.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mitigations_status_parses_to_verb() {
+    assert_eq!(
+        parse_verb("mitigations", &["status"]),
+        Ok(ParsedVerb::MitigationsStatus)
+    );
+    assert!(matches!(
+        parse_verb("mitigations", &[]),
+        Err(ParseError::MissingArgument(_))
+    ));
+    assert!(matches!(
+        parse_verb("mitigations", &["bogus"]),
+        Err(ParseError::BadArgument(_))
+    ));
+}
+
+#[test]
+fn mitigations_status_format_is_honest() {
+    use kernel_core::spectre::{IbrsMode, MitigationLevel, MitigationReport};
+
+    // Full level but KPTI NOT enforcing → Meltdown must read Vulnerable
+    // (never a false "Mitigation: PTI"), and the honesty notes are present.
+    let report = MitigationReport {
+        level: MitigationLevel::Full,
+        level_recognized: true,
+        kpti_active: false,
+        ibpb_active: true,
+        ibrs_mode: IbrsMode::None,
+        leaf7_edx: 0,
+        arch_caps: 0,
+    };
+    let r = format_mitigations(&report);
+    assert!(r.contains("level=full"));
+    assert!(r.contains("Meltdown: Vulnerable"));
+    assert!(r.contains("retpoline): compiled-in"));
+    assert!(r.contains("UNADDRESSED"));
+    // The honesty note must enumerate Spectre-v1 (report_map marks it
+    // Status::Unaddressed) — the note is not an exhaustive list otherwise.
+    assert!(r.contains("UNADDRESSED — Spectre-v1, MDS"));
+    assert!(r.contains("Grimsdal"));
+
+    // KPTI enforcing → Meltdown reads "Mitigation: PTI".
+    let report2 = MitigationReport {
+        kpti_active: true,
+        ..report
+    };
+    assert!(format_mitigations(&report2).contains("Meltdown: Mitigation: PTI"));
+
+    // RDCL_NO silicon → "Not affected" regardless of kpti_active.
+    let report3 = MitigationReport {
+        leaf7_edx: 1 << 29,
+        arch_caps: 0b01,
+        ..report
+    };
+    assert!(format_mitigations(&report3).contains("Meltdown: Not affected"));
+}

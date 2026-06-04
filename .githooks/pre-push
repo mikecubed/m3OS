@@ -281,6 +281,19 @@ if [ "${M3OS_HTOP_REGRESSION:-0}" = "1" ]; then
     cargo xtask htop-render-probe --timeout 300
 fi
 
+# Phase 84 — Spectre mitigations reporter gate. Gated behind
+# M3OS_MITIGATIONS_REGRESSION=1 because it boots the OS and asserts, at runtime,
+# the boot mitigation-policy log (`[sec] mitigations=... global_kernel_ptes=0`)
+# AND the `m3ctl mitigations status` reporter output (per-vuln Meltdown line +
+# the compiled-in retpoline line + the UNADDRESSED enumeration). KPTI-independent
+# (default boot). Set on branches touching kernel/src/mitigations.rs,
+# kernel-core/src/spectre.rs, the SPEC_CTRL path in cpuid.rs, or m3ctl's
+# mitigations subcommand.
+if [ "${M3OS_MITIGATIONS_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask mitigations-status-smoke..."
+    cargo xtask mitigations-status-smoke --timeout 150
+fi
+
 # Phase 78a — xHCI host-controller bring-up gate. Gated behind
 # M3OS_USB_REGRESSION=1 because it boots QEMU with `-device qemu-xhci` and
 # asserts the ring-3 xhci_driver reaches a first Enable Slot Command
