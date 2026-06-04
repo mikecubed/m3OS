@@ -245,8 +245,10 @@ pub fn to_hex(bytes: &[u8]) -> String {
 /// - any absolute or `target/` directory path,
 /// - the `xtask`/`port_build.rs` source bytes (so editing an *unrelated* recipe
 ///   does not invalidate this package — the old `.stamp` folded these in, which
-///   over-invalidated; recipe-specific flag changes are captured via the
-///   Portfile `BUILD_FLAGS` field folded into `build_flags` instead),
+///   over-invalidated; recipe-specific changes are instead captured by the
+///   `build_flags` argument, which xtask composes per-port from the Portfile
+///   content + patches digest and the recipe's configure flags via
+///   `recipe_digest` / `build_recipe_id`),
 /// - wall-clock time and the build host's identity.
 pub fn compute_package_key(
     tarball_sha: &str,

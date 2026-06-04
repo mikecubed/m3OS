@@ -262,21 +262,38 @@ fn install_one(name: &str) -> i32 {
             target.push(0);
             let mut link_path = abs.as_bytes().to_vec();
             link_path.push(0);
+            // Remove any node already at the link path first, so a reinstall or
+            // upgrade refreshes a *changed* target instead of silently keeping
+            // the old one: symlink(2) returns EEXIST when a node is present, and
+            // ignoring it would leave the on-disk link stale while the DB below
+            // records the new content hash — a guaranteed `pkg verify` MISMATCH.
+            // A missing-path unlink error is fine (nothing to remove); the
+            // symlink call is the real gate.
+            let _ = syscall_lib::unlink(&link_path);
             let rc = syscall_lib::symlink(&target, &link_path);
             if (rc as i64) < 0 {
-                // Ignore EEXIST (symlink already present from a prior install).
-                // Any other error is non-fatal: warn and continue.
-                if rc != -17 {
-                    // -17 = EEXIST
-                    eprint_str("pkg install: symlink warning for ");
-                    eprint_str(&entry.path);
-                    eprint_str("\n");
-                }
+                // The DB is about to record this path's hash, so a link we could
+                // not create would surface as a phantom MISSING/MISMATCH on
+                // `pkg verify`. Fail the install, mirroring the regular-file
+                // open/write error handling below.
+                eprint_str("pkg install: cannot create symlink ");
+                eprint_str(&entry.path);
+                eprint_str("\n");
+                return 1;
             }
         } else {
             // 5d. Regular file: open/write/close/chmod.
             let mut file_path = abs.as_bytes().to_vec();
             file_path.push(0);
+
+            // Remove any node already at this path first (mirrors the symlink
+            // branch). `O_TRUNC` truncates an existing *regular* file in place,
+            // but if a prior version installed this path as a *symlink* the open
+            // would follow the link and write through to its target, leaving the
+            // symlink in place while the DB records this path's hash — the same
+            // FS/DB divergence the symlink branch guards against. Unlinking first
+            // turns an upgrade type-change into a clean fresh create.
+            let _ = syscall_lib::unlink(&file_path);
 
             let flags = syscall_lib::O_WRONLY | syscall_lib::O_CREAT | syscall_lib::O_TRUNC;
             let fd = syscall_lib::open(&file_path, flags, 0o644);
@@ -405,14 +422,33 @@ fn cmd_verify(name: &str) -> i32 {
         // regular file, so probe it first: opening a symlink `O_RDONLY` would
         // follow it and hash the wrong bytes, spuriously reporting MISMATCH for
         // every link (e.g. all of ncurses' alias links).
-        let mut link_buf = [0u8; 1024];
-        let ln = syscall_lib::readlink(&file_path, &mut link_buf);
-        let actual_hex: Option<String> = if ln >= 0 {
-            Some(to_hex(&content_hash(&link_buf[..ln as usize])))
-        } else {
-            match read_file_bytes(&file_path) {
-                Ok(data) => Some(to_hex(&content_hash(&data))),
-                Err(_) => None,
+        // `readlink` returns the byte count written, with no NUL and no
+        // truncation flag: a return equal to the buffer length means the target
+        // may have been truncated, which would hash to a false MISMATCH. Start
+        // with a small buffer and, only on a full read, retry once with a
+        // PATH_MAX-class buffer. A negative return means it is not a symlink
+        // (regular file) — fall back to hashing the file content.
+        let actual_hex: Option<String> = {
+            let mut link_buf = [0u8; 1024];
+            let ln = syscall_lib::readlink(&file_path, &mut link_buf);
+            if ln < 0 {
+                match read_file_bytes(&file_path) {
+                    Ok(data) => Some(to_hex(&content_hash(&data))),
+                    Err(_) => None,
+                }
+            } else if (ln as usize) < link_buf.len() {
+                Some(to_hex(&content_hash(&link_buf[..ln as usize])))
+            } else {
+                // Buffer filled exactly — the target may be longer; re-read with
+                // a 4096-byte (PATH_MAX) buffer.
+                let mut big = [0u8; 4096];
+                let ln2 = syscall_lib::readlink(&file_path, &mut big);
+                if ln2 >= 0 {
+                    Some(to_hex(&content_hash(&big[..ln2 as usize])))
+                } else {
+                    // Unexpected retry failure: hash what the first read gave us.
+                    Some(to_hex(&content_hash(&link_buf[..ln as usize])))
+                }
             }
         };
 

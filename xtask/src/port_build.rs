@@ -438,10 +438,13 @@ fn apply_patches(patches_dir: &Path, src_dir: &Path) -> Result<usize, String> {
 /// `port_build` to compute `dep_keys` for [`package_key`].
 ///
 /// Only one level of dependencies is listed here; ports with no deps
-/// return an empty slice. Ports that are depended upon (e.g. `ncurses`)
-/// themselves have no deps, so there is no recursion needed in practice.
-/// The function signature is written to handle deeper dependency chains
-/// without change.
+/// return an empty slice. Every port currently depended upon (`ncurses`,
+/// `libevent`) is itself a leaf with no build deps, so `compute_port_key`'s
+/// non-recursive key computation is correct as written. Introducing a
+/// *transitive* build dependency would require `compute_port_key` to recurse
+/// (folding each dep's own resolved dep-keys into its key); this function's
+/// `&[&str]` return type would not need to change, but the key computation
+/// would — it does not handle deep chains today.
 pub fn port_deps(name: &str) -> &'static [&'static str] {
     match name {
         "less" => &["ncurses"],
@@ -475,9 +478,11 @@ fn compute_port_key(name: &str, port_dir: &Path) -> Result<String, String> {
         .map(|dep| {
             let dep_dir = find_port_dir(dep)
                 .ok_or_else(|| format!("dep port {dep} not found in ports/ tree"))?;
-            // Deps here have no deps of their own (ncurses/libevent have no
-            // build deps); the empty slice keeps the recursion correct for the
-            // common case and the signature handles deeper chains unchanged.
+            // Every current dep is a leaf (ncurses/libevent have no build deps
+            // of their own), so an empty dep-key slice computes the correct key.
+            // A *transitive* dep would instead need its own resolved dep-keys
+            // folded in here (i.e. recurse via `compute_port_key`); that is not
+            // handled yet because no such chain exists in the ports tree.
             package_key(&dep_dir, &tc, &[])
         })
         .collect::<Result<_, String>>()?;
@@ -1506,12 +1511,17 @@ mod tests {
 
     // ── B.1 — seal_package ───────────────────────────────────────────────
 
-    /// Build a minimal fake stage under `tmp`, call `seal_package`, and
-    /// assert that:
+    /// Exercise `seal_package`'s constituent steps — `pkg_format::pack` plus the
+    /// atomic temp-write/rename into `target/pkgcache/<key>.m3pkg` — on a minimal
+    /// fake stage, and assert that:
     ///   - `target/pkgcache/<key>.m3pkg` is created
     ///   - `pkg_format::verify` passes on the resulting bytes
-    ///   - the `.pkgkey` diagnostic file is written to the stage
-    /// No compiler is invoked — this is pure filesystem logic.
+    ///
+    /// The steps are reproduced inline rather than calling `seal_package`
+    /// directly because that function resolves `workspace_root()` internally
+    /// (xtask-specific). The `.pkgkey` diagnostic sidecar that the real
+    /// `seal_package` writes alongside the artifact is therefore out of scope
+    /// for this unit test. No compiler is invoked — this is pure filesystem logic.
     #[test]
     fn seal_package_creates_valid_m3pkg() {
         let tmp = tempfile::tempdir().unwrap();

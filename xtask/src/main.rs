@@ -20793,6 +20793,31 @@ fn cmd_soak(args: &SoakArgs) {
     }
 }
 
+/// Build-output tokens that indicate a compiler/build tool ran — i.e. the
+/// second build was NOT a pure pkgcache hit. Returns the tokens found (empty
+/// when the output shows no compiler invocation, which is the PASS condition).
+///
+/// `make` is matched per-line (anchored to a line start, robust to the first
+/// line of output and to `\r\n` line endings via `str::lines`) so it is caught
+/// even at the very start of output, while still not matching unrelated
+/// substrings such as "makefile" or path components like "/x/make-tools".
+fn pkgcache_compiler_tokens_found(combined: &str) -> Vec<&'static str> {
+    const SUBSTR_TOKENS: &[&str] = &["gcc", "cmake", "ninja", "configure:"];
+    let mut found: Vec<&'static str> = SUBSTR_TOKENS
+        .iter()
+        .copied()
+        .filter(|tok| combined.contains(tok))
+        .collect();
+    let make_invoked = combined.lines().any(|line| {
+        let t = line.trim_start();
+        t == "make" || t.starts_with("make ") || t.starts_with("make[")
+    });
+    if make_invoked {
+        found.push("make");
+    }
+    found
+}
+
 /// Phase 85a (B.3) — zero-rebuild assertion gate.
 ///
 /// Gated by `M3OS_PKGCACHE_REGRESSION=1` (requires a musl cross-compiler).
@@ -20863,17 +20888,21 @@ fn cmd_pkgcache_hit_check(port_name: Option<&str>) -> i32 {
     let combined = format!("{stdout}{stderr}");
 
     // Step 4 — evaluate pass/fail criteria.
+    // The second build must also *succeed*: a non-zero exit that still happened
+    // to print 'PKGCACHE: hit' (e.g. a later staging failure) is a FAIL, not a
+    // hit — the gate's promise is a clean zero-rebuild, not just the log line.
+    let build_ok = output.status.success();
     let has_hit = combined.contains("PKGCACHE: hit ");
     let has_miss = combined.contains("PKGCACHE: miss ");
     // Compiler / build-tool tokens that must NOT appear in a pure cache hit.
-    let compiler_tokens: &[&str] = &["gcc", "\nmake", "cmake", "ninja", "configure:"];
-    let has_compiler = compiler_tokens.iter().any(|tok| combined.contains(tok));
+    let compiler_found = pkgcache_compiler_tokens_found(&combined);
+    let has_compiler = !compiler_found.is_empty();
 
     println!("--- second build output ---");
     print!("{combined}");
     println!("--- end output ---");
 
-    if has_hit && !has_miss && !has_compiler {
+    if build_ok && has_hit && !has_miss && !has_compiler {
         println!(
             "pkgcache-hit-check: PASS — port '{name}' second build was a pure pkgcache hit \
              (no compiler invocations)"
@@ -20881,6 +20910,12 @@ fn cmd_pkgcache_hit_check(port_name: Option<&str>) -> i32 {
         0
     } else {
         eprintln!("pkgcache-hit-check: FAIL");
+        if !build_ok {
+            eprintln!(
+                "  - second build exited non-zero ({}) — a pure cache hit must still succeed",
+                output.status
+            );
+        }
         if !has_hit {
             eprintln!("  - expected 'PKGCACHE: hit ' in output but it was absent");
         }
@@ -20888,12 +20923,7 @@ fn cmd_pkgcache_hit_check(port_name: Option<&str>) -> i32 {
             eprintln!("  - 'PKGCACHE: miss ' appeared — cache was not warm");
         }
         if has_compiler {
-            let found: Vec<&str> = compiler_tokens
-                .iter()
-                .copied()
-                .filter(|tok| combined.contains(tok))
-                .collect();
-            eprintln!("  - compiler/build tokens found (cache not used): {found:?}");
+            eprintln!("  - compiler/build tokens found (cache not used): {compiler_found:?}");
         }
         1
     }
@@ -20905,6 +20935,38 @@ mod tests {
 
     fn string_args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| part.to_string()).collect()
+    }
+
+    #[test]
+    fn pkgcache_compiler_detection_edges() {
+        // `make` at the very start of output is caught (the old "\nmake"
+        // substring check missed a line with no preceding newline).
+        assert_eq!(
+            pkgcache_compiler_tokens_found("make all-am\n..."),
+            vec!["make"]
+        );
+        // `make` after a CRLF line ending is caught (str::lines strips the \r).
+        assert_eq!(
+            pkgcache_compiler_tokens_found("PKGCACHE: hit x\r\nmake[1]: Entering"),
+            vec!["make"]
+        );
+        // A bare `make` line is caught.
+        assert_eq!(pkgcache_compiler_tokens_found("foo\nmake\n"), vec!["make"]);
+        // Substrings like "makefile" / "Makefile" / path components must NOT
+        // trigger a spurious make match.
+        assert!(
+            pkgcache_compiler_tokens_found("reading Makefile.in\nusing /x/make-tools/y\n")
+                .is_empty()
+        );
+        // The substring tokens still match anywhere in the output.
+        assert_eq!(
+            pkgcache_compiler_tokens_found("... configure: creating Makefile ..."),
+            vec!["configure:"]
+        );
+        // A clean pure-hit output reports no compiler tokens.
+        assert!(
+            pkgcache_compiler_tokens_found("PKGCACHE: hit abcd.m3pkg\nstaged 5 files\n").is_empty()
+        );
     }
 
     fn smoke_step_labels(steps: &[SmokeStep]) -> Vec<&'static str> {
