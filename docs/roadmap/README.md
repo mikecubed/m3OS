@@ -431,7 +431,7 @@ These phases were drafted 2026-05-08 in response to the phase-completion audit (
 
 | Phase | Theme | Primary Outcome | Status | Source Ref | Milestone | Tasks |
 |---|---|---|---|---|---|---|
-| 84 | Spectre / KPTI / Retpoline / IBRS Mitigations | Post-1.0 expensive security mitigations layered on top of the Phase 77 SMEP+SMAP baseline | Planned | `phase-84` | [Phase 84](./84-spectre-mitigations.md) | Deferred until implementation planning |
+| 84 | Spectre / KPTI / Retpoline / IBRS Mitigations | Post-1.0 expensive security mitigations layered on top of the Phase 77 SMEP+SMAP baseline | Planned | `phase-84` | [Phase 84](./84-spectre-mitigations.md) | [Tasks](./tasks/84-spectre-mitigations-tasks.md) |
 | 85 | Cross-Compiled Toolchains | git, Python, and Clang are bundled as a supported post-1.0 developer-toolchain set | Planned | `phase-85` | [Phase 85](./85-cross-compiled-toolchains.md) | Deferred until implementation planning |
 | 86 | Networking and GitHub | Outbound developer workflows add DNS, HTTPS, git remotes, and GitHub CLI support | Planned | `phase-86` | [Phase 86](./86-networking-and-github.md) | Deferred until implementation planning |
 | 87 | Node.js | A supported Node.js and npm environment runs natively inside m3OS | Planned | `phase-87` | [Phase 87](./87-nodejs.md) | Deferred until implementation planning |
