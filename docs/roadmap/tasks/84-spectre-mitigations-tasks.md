@@ -12,7 +12,7 @@
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
 | A | **KPTI** — split the per-process PML4 into a kernel/user pair (`kernel/src/mm/mod.rs`), a CR3 trampoline on the syscall path (`syscall/mod.rs`) and IRQ/IST path (`interrupts.rs`), GLOBAL-bit removal, PCID/INVPCID TLB-flush avoidance, and `RDCL_NO` auto-skip | Phase 11 process model, C.1 (feature decode) | In progress (Wave 2 — serial) |
-| B | **Retpoline** — enable `-Zretpoline` on the existing `-Zbuild-std` kernel build (`xtask`), an optional hand-written `__x86_indirect_thunk_r11` external thunk, and an `objdump` residual-indirect-branch verification gate wired into `cargo xtask check` | — | In progress (Wave 1 — parallel) |
+| B | **Retpoline** — enable `-Zretpoline` on the existing `-Zbuild-std` kernel build (`xtask`), an optional hand-written `__x86_indirect_thunk_r11` external thunk, and an `objdump` residual-indirect-branch verification gate wired into `cargo xtask check` | — | **Complete** (Wave 1; B.2 external thunk deferred-optional) |
 | C | **SPEC_CTRL MSR** — host-testable CPUID/MSR feature decode in `kernel-core`, IBRS/eIBRS detect+enable in `cpuid.rs` (mirroring `probe/enable_smep_smap`), IBPB on cross-process `switch_context`, STIBP per-process opt-in | C.1 | In progress (C.1 Wave 1; C.2–C.4 Wave 2) |
 | D | **Configuration surface** — host-testable `mitigations=` parser + per-vuln bug map + status vocabulary in `kernel-core`, boot-flag plumbing that gates A/C with a single global off-switch, and a `m3ctl mitigations status` reporter | A, B, C, C.1 | In progress (D.1 Wave 1; D.2–D.3 Wave 2) |
 | E | **Validation + release closeout** — the Meltdown-PoC smoke gate, the ≤30% perf-regression gate, kernel `0.83.0`→`0.84.0`, the Phase 84 learning doc + `docs/security/` operator reference, README/AGENTS alignment, and design-doc reconciliation | A–D | In progress (E.6/E.7 reconciliation landed in authoring PR; E.1–E.5 Wave 2/3) |
@@ -125,9 +125,11 @@
 **Why it matters:** the design doc's `-C target-feature=+retpoline-indirect-branches,+retpoline-indirect-calls` is **wrong** — on current `rustc` those are *target modifiers* and `-Ctarget-feature` is hard-rejected (`cannot be enabled with -Ctarget-feature: use -Zretpoline`). The correct flag is the dedicated nightly `-Zretpoline`. Retpoline is an ABI-affecting target modifier, so `core` **must** be rebuilt with it — which m3OS already does via `-Zbuild-std`, so this is a small additive change, not new build machinery. The flag belongs in the **xtask kernel build invocation** (a JSON target spec like `x86_64-m3os.json`, which is not even the default target, cannot carry `-Z` flags).
 
 **Acceptance:**
-- [ ] The kernel builds with `-Zretpoline` added to the existing `-Zbuild-std=core,compiler_builtins,alloc` invocation; LLVM reroutes indirect calls through its internal `__llvm_retpoline_r11` thunk.
-- [ ] The build does **not** pass `-Cunsafe-allow-abi-mismatch=retpoline` (that escape hatch links an unprotected `core` and defeats the mitigation); removing `-Zbuild-std` reproduces the ABI-mismatch error, proving `core` is being rebuilt with the thunk.
-- [ ] Retpoline is **compile-time-unconditional** (baked into codegen) — it cannot be toggled by the `mitigations=` boot flag like KPTI/IBRS. D.3 reports it as `compiled-in (cannot disable at boot)`; this is stated explicitly so a reader does not expect a runtime switch.
+- [x] The kernel builds with `-Zretpoline` added (via `[target.x86_64-unknown-none] rustflags` in `.cargo/config.toml`, applied atop the existing `-Zbuild-std=core,compiler_builtins,alloc` invocation); LLVM reroutes indirect calls through its internal `__llvm_retpoline_r11` thunk (1894 references in the linked kernel ELF).
+- [x] The build does **not** pass `-Cunsafe-allow-abi-mismatch=retpoline` (that escape hatch links an unprotected `core` and defeats the mitigation); the empirical `rustc -Zretpoline` probe confirms the ABI-mismatch error fires when `core` is not rebuilt with the flag, proving `-Zbuild-std` is doing the rebuild.
+- [x] Retpoline is **compile-time-unconditional** (baked into codegen) — it cannot be toggled by the `mitigations=` boot flag like KPTI/IBRS. D.3 reports it as `compiled-in (cannot disable at boot)`; this is stated explicitly so a reader does not expect a runtime switch.
+
+> **Landed (Wave 1, `.cargo/config.toml`):** `-Zretpoline` scoped to the bare-metal target only (host build-scripts/proc-macros are unaffected — verified `cargo build -p xtask --target x86_64-unknown-linux-gnu` clean); soft-float flags come from the builtin `x86_64-unknown-none` target spec, so the new `rustflags` key clobbers nothing. B.2 (external `__x86_indirect_thunk_r11`) intentionally **not** implemented — the default learning path uses the compiler-internal thunk; B.2 stays the documented optional.
 
 ### B.2 — (Optional, learning) hand-written `__x86_indirect_thunk_r11` external thunk
 
@@ -148,10 +150,10 @@
 **Why it matters:** the mitigation is void if even one indirect branch survives, so it must be **mechanically verified**. The design doc's `grep -E 'call[ \t]+\*'` is incomplete — it misses indirect **JMPs** (`jmp *reg`, the tail-call-optimized trait/fn-pointer dispatch that lowers to a jump) and the `q`-suffixed mnemonics. The check must run on the **fully-linked** `kernel.elf` (after `-Zbuild-std`) so rebuilt `core` is included.
 
 **Acceptance:**
-- [ ] `objdump -d <kernel.elf> | grep -E '\b(call|callq|jmp|jmpq)[ \t]+\*'` returns **zero** lines (covers indirect CALL **and** indirect JMP, both operand forms), run against the fully-linked kernel after build-std.
-- [ ] A positive cross-check asserts the thunk is actually used: `objdump -dr <kernel.elf> | grep -c '__llvm_retpoline_r11'` (or `__x86_indirect_thunk_r11` in the external-thunk variant) is non-zero.
-- [ ] The thunk and reroute sites contain **zero** XMM/SSE (soft-float clean) — consistent with the kernel's `-mmx,-sse,+soft-float`, documented so a reviewer does not assume an FPU/XSAVE interaction exists.
-- [ ] The gate is wired into `cargo xtask check` so a regression (a new un-thunked indirect branch) **fails the build**, not just a smoke test.
+- [x] `objdump -d <kernel.elf>` indirect-branch scan returns **zero** lines (covers indirect CALL **and** indirect JMP, both operand forms), run against the fully-linked kernel after build-std. *Implemented as a robust line-parser (`retpoline_objdump_gate` in `xtask`) splitting on tabs and matching `mnemonic ∈ {call,callq,jmp,jmpq}` with a `*`-prefixed operand, not a fragile grep.* Result: **0**.
+- [x] A positive cross-check asserts the thunk is actually used: counts `__llvm_retpoline_r11` references in `objdump -dr` output and requires non-zero. Result: **1894**.
+- [x] The thunk and reroute sites contain **zero** XMM/SSE (soft-float clean) — guaranteed by the builtin `x86_64-unknown-none` target's `+soft-float,-mmx,-sse`; documented at the gate call site and in `.cargo/config.toml` so a reviewer does not assume an FPU/XSAVE interaction exists.
+- [x] The gate is wired into `cargo xtask check` (calls `build_kernel()` so it is self-contained on a clean tree) so a regression (a new un-thunked indirect branch) **fails the build**, not just a smoke test.
 
 ### B.4 — RSB-stuffing + Retbleed honesty (scoping)
 
@@ -180,11 +182,13 @@
 **Why it matters:** AGENTS.md mandates pure logic be host-tested in `kernel-core` (the kernel is `no_std` and cannot be `cargo test`ed in QEMU). The decode is exactly the error-prone part the design doc got wrong, so pinning it in host tests (modeled on `cpuid.rs::XSaveFeatures::from_raw`) makes a bit-transcription slip a **failing test**, not a silent `#GP` or an unprotected boot. `CPUID.(EAX=07H,ECX=0):EDX[26]` enumerates **both IBRS and IBPB** (one bit); `[27]` is STIBP; `[29]` is ARCH_CAPABILITIES-present; `[31]` is SSBD. `IA32_ARCH_CAPABILITIES` (MSR `0x10A`) `[0]`=`RDCL_NO`, `[1]`=`IBRS_ALL` (eIBRS).
 
 **Acceptance:**
-- [ ] Host test: `EDX[26]` set → `ibrs_ibpb == true` (gates **both**); `EDX[27]` → `stibp` only; `EDX[31]` → `ssbd`; `EDX[29]` → `arch_caps_present` (and only then is `arch_caps` consulted) (`kernel_core::spectre::tests::edx_bits`).
-- [ ] **Max-basic-leaf guard (the same trap `probe_smep_smap` defends at cpuid.rs:241):** `from_cpuid`/its caller treats leaf-7 EDX as **zero** when `CPUID.0:EAX < 7` — executing `CPUID` with an unsupported basic leaf returns the *highest supported leaf's* data, whose bits 26/27/31 could otherwise be mis-read as IBRS/STIBP/SSBD on an old/VM CPU (`tests::leaf7_absent_reads_zero`).
-- [ ] Host test: `arch_caps[1]` (`IBRS_ALL`) set → `classify_ibrs == Enhanced` (set-once-at-boot); `ibrs_ibpb` set but `IBRS_ALL` clear → `Legacy` (per-entry toggle); neither → `None` (`tests::ibrs_mode`).
-- [ ] Host test: `arch_caps[0]` (`RDCL_NO`) set → `rdcl_no == true` (Meltdown-immune; drives A.6) (`tests::rdcl_no`).
-- [ ] `cargo xtask check` compiles and runs the new module (`kernel-core` is already in the check list; no new crate entry needed — recorded in E.6).
+- [x] Host test: `EDX[26]` set → `ibrs_ibpb == true` (gates **both**); `EDX[27]` → `stibp` only; `EDX[31]` → `ssbd`; `EDX[29]` → `arch_caps_present` (and only then is `arch_caps` consulted) (`kernel_core::spectre::tests::edx_bits`).
+- [x] **Max-basic-leaf guard (the same trap `probe_smep_smap` defends at cpuid.rs:241):** `from_cpuid`/its caller treats leaf-7 EDX as **zero** when `CPUID.0:EAX < 7` — executing `CPUID` with an unsupported basic leaf returns the *highest supported leaf's* data, whose bits 26/27/31 could otherwise be mis-read as IBRS/STIBP/SSBD on an old/VM CPU (`tests::leaf7_absent_reads_zero`). *Implemented as `from_cpuid_guarded(max_basic_leaf, leaf7_edx, arch_caps)`.*
+- [x] Host test: `arch_caps[1]` (`IBRS_ALL`) set → `classify_ibrs == Enhanced` (set-once-at-boot); `ibrs_ibpb` set but `IBRS_ALL` clear → `Legacy` (per-entry toggle); neither → `None` (`tests::ibrs_mode`).
+- [x] Host test: `arch_caps[0]` (`RDCL_NO`) set → `rdcl_no == true` (Meltdown-immune; drives A.6) (`tests::rdcl_no`).
+- [x] `cargo xtask check` compiles and runs the new module (`kernel-core` is already in the check list; no new crate entry needed — recorded in E.6).
+
+> **Landed (Wave 1, `kernel-core/src/spectre.rs`):** all 7 host tests pass under `cargo test -p kernel-core --target x86_64-unknown-linux-gnu --lib spectre`; `cargo xtask check` green. `SpecCtrlFeatures::{from_cpuid,from_cpuid_guarded}`, `IbrsMode`, `classify_ibrs` implemented exactly to contract, no_std-clean (no alloc).
 
 ### C.2 — IBRS/eIBRS detect + enable in `cpuid.rs` (mirror `probe/enable_smep_smap`)
 
@@ -238,9 +242,11 @@
 **Why it matters:** the parse + per-vuln status mapping is pure logic and belongs in host tests, with the string vocabulary modeled on Linux `/sys/devices/system/cpu/vulnerabilities/*` (`Not affected` / `Vulnerable` / `Mitigation: <name>`). Getting `auto` right (consult `RDCL_NO`) and never letting a SKIP-class become silent is the whole correctness story for the reporter.
 
 **Acceptance:**
-- [ ] Host test: `"off"`/`"auto"`/`"full"` parse to the three levels; an unknown value defaults to `Auto` and is flagged (`tests::parse_mitigations`).
-- [ ] Host test: `Auto` + `rdcl_no` → Meltdown `NotAffected` and KPTI suppressed in the map; `Off` → every addressed vuln `Vulnerable`; `Full` → `Mitigated("PTI")` / `Mitigated("Retpoline, IBPB")` etc. (`tests::vuln_map_tracks_level`).
-- [ ] Host test: the **UNADDRESSED** classes (MDS, L1TF, SSB/Spectre-v4, Retbleed, Downfall/GDS) are **always** present in the map as `Unaddressed`, regardless of level (no silent omission) (`tests::unaddressed_always_listed`).
+- [x] Host test: `"off"`/`"auto"`/`"full"` parse to the three levels; an unknown value defaults to `Auto` and is flagged (`tests::parse_mitigations`). *Unknown-value flag exposed via `mitigations_recognized(&str) -> bool`.*
+- [x] Host test: `Auto` + `rdcl_no` → Meltdown `NotAffected` and KPTI suppressed in the map; `Off` → every addressed vuln `Vulnerable`; `Full` → `Mitigated("PTI")` / `Mitigated("Retpoline, IBPB")` etc. (`tests::vuln_map_tracks_level`).
+- [x] Host test: the **UNADDRESSED** classes (MDS, L1TF, SSB/Spectre-v4, Retbleed, Downfall/GDS) are **always** present in the map as `Unaddressed`, regardless of level (no silent omission) (`tests::unaddressed_always_listed`).
+
+> **Landed (Wave 1, `kernel-core/src/spectre.rs`):** `parse_mitigations`/`mitigations_recognized`/`MitigationLevel`/`Vuln`/`Status`/`build_vuln_map` (fixed `[(Vuln, Status); 8]`, no alloc) all host-tested. **Note for D.3 (honesty):** `build_vuln_map` models the *policy* a level implies; the runtime reporter must report Meltdown `Mitigated("PTI")` only when KPTI is *actually* enforcing (a real `kpti_active` flag in the boot snapshot), else `Vulnerable`/`NotAffected` — wired in D.2/D.3.
 
 ### D.2 — Boot-flag plumbing gating A/C, with a single global off-switch
 

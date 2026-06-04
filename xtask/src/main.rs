@@ -5401,7 +5401,7 @@ fn cmd_check() {
     // The retpoline thunk is soft-float clean: the kernel builds with
     // -mmx,-sse,+soft-float, so __llvm_retpoline_r11 contains no XMM/SSE
     // instructions — reviewers should not expect any FPU/XSAVE interaction.
-    retpoline_objdump_gate(&root);
+    retpoline_objdump_gate();
 
     println!(
         "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, ac97_driver, hda_driver, ahci_driver, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, shadow, ldso_core, wifi-core, mt792x_driver, and m3ctl host tests pass; doom platform-layer C tests pass; retpoline indirect-branch gate pass"
@@ -5497,11 +5497,17 @@ fn doom_c_test_step(root: &std::path::Path) {
 /// Note on soft-float cleanliness: the kernel is built with
 /// `-mmx,-sse,+soft-float`, so `__llvm_retpoline_r11` contains no XMM/SSE
 /// instructions.  Reviewers should not look for FPU/XSAVE interactions here.
-fn retpoline_objdump_gate(root: &std::path::Path) {
-    let kernel_elf = root.join("target/x86_64-unknown-none/release/kernel");
+fn retpoline_objdump_gate() {
+    // Build (incrementally — cargo-cached) the fully-linked kernel ELF so the
+    // gate is self-contained inside `cargo xtask check`: it must hold on a
+    // clean tree, not depend on a prior `cargo xtask image`. The kernel embeds
+    // the ramdisk (include_bytes! of generated-initrd), so there is no lighter
+    // path to a linked ELF than the full `build_kernel()` pipeline; subsequent
+    // runs are mostly cache hits + the final link.
+    let kernel_elf = build_kernel();
     if !kernel_elf.exists() {
         eprintln!(
-            "retpoline gate: kernel ELF not found at {} — run `cargo xtask image` first",
+            "retpoline gate: build_kernel() did not produce {}",
             kernel_elf.display()
         );
         std::process::exit(1);
@@ -5537,9 +5543,12 @@ fn retpoline_objdump_gate(root: &std::path::Path) {
             // Indirect operands look like: `call   *%rax` or `jmpq   *(%rax)`.
             let after_tab = line.split('\t').nth(2).unwrap_or("");
             let mnemonic = after_tab.split_whitespace().next().unwrap_or("");
-            let operand = after_tab.splitn(2, char::is_whitespace).nth(1).unwrap_or("").trim_start();
-            matches!(mnemonic, "call" | "callq" | "jmp" | "jmpq")
-                && operand.starts_with('*')
+            let operand = after_tab
+                .splitn(2, char::is_whitespace)
+                .nth(1)
+                .unwrap_or("")
+                .trim_start();
+            matches!(mnemonic, "call" | "callq" | "jmp" | "jmpq") && operand.starts_with('*')
         })
         .count();
 
@@ -5591,7 +5600,9 @@ fn retpoline_objdump_gate(root: &std::path::Path) {
         std::process::exit(1);
     }
 
-    println!("retpoline gate PASS: 0 residual indirect branches, {thunk_count} retpoline thunk references");
+    println!(
+        "retpoline gate PASS: 0 residual indirect branches, {thunk_count} retpoline thunk references"
+    );
 }
 
 #[derive(Debug, Clone)]
