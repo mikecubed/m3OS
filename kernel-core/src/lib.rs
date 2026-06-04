@@ -44,6 +44,7 @@ pub mod session_events;
 pub mod session_supervisor;
 pub mod size_class;
 pub mod slab;
+pub mod spectre;
 pub mod storage;
 pub mod time;
 pub mod trace_ring;
