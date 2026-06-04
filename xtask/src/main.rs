@@ -845,6 +845,17 @@ fn main() {
             });
             cmd_soak(&soak_args);
         }
+        // Phase 85a Track B.3 — zero-rebuild assertion gate.
+        // Builds a port once to warm the pkgcache, removes the stage so the
+        // same-machine `.stamp` fast-path cannot short-circuit, then builds
+        // again and asserts the second run logged a pure `PKGCACHE: hit`
+        // with zero compiler/make/cmake/ninja/configure invocations.
+        // Gated by M3OS_PKGCACHE_REGRESSION=1 (requires a musl cross-compiler).
+        Some("pkgcache-hit-check") => {
+            let port_name = args.get(2).cloned();
+            let code = cmd_pkgcache_hit_check(port_name.as_deref());
+            std::process::exit(code);
+        }
         Some(other) => {
             eprintln!("Unknown subcommand: {other}");
             eprintln!("Usage: {}", usage());
@@ -858,7 +869,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -20395,6 +20406,112 @@ fn cmd_soak(args: &SoakArgs) {
         std::process::exit(1);
     } else {
         println!("soak: ACCEPTANCE PASSED");
+    }
+}
+
+/// Phase 85a (B.3) — zero-rebuild assertion gate.
+///
+/// Gated by `M3OS_PKGCACHE_REGRESSION=1` (requires a musl cross-compiler).
+///
+/// Algorithm:
+///   1. Run `port_build::cmd_port_build(name)` once to warm the pkgcache.
+///   2. Remove `target/port-stage/<name>/` (and its `.stamp`) so the
+///      same-machine fast-path cannot short-circuit — forcing the resolver
+///      to prove the pkgcache path.
+///   3. Run the build again, capturing all stdout+stderr.
+///   4. PASS only if:
+///        - captured output contains "PKGCACHE: hit "
+///        - captured output does NOT contain "PKGCACHE: miss "
+///        - captured output does NOT contain gcc / make / cmake / ninja /
+///          configure: tokens (no real compiler was invoked)
+///
+/// Because step 1 performs a real musl build, the coordinator runs this gate
+/// rather than the implementer — it is only invoked when the env var is set.
+fn cmd_pkgcache_hit_check(port_name: Option<&str>) -> i32 {
+    let name = port_name.unwrap_or("ncurses");
+
+    if std::env::var("M3OS_PKGCACHE_REGRESSION").is_err() {
+        println!(
+            "pkgcache-hit-check: SKIP — set M3OS_PKGCACHE_REGRESSION=1 to enable \
+             (requires a musl cross-compiler and may take several minutes for the \
+             initial warm build)"
+        );
+        return 0;
+    }
+
+    println!("pkgcache-hit-check: step 1 — warming pkgcache for port '{name}'");
+    let warm_result = port_build::cmd_port_build(name);
+    if warm_result != 0 {
+        eprintln!("pkgcache-hit-check: FAIL — warm build of '{name}' failed (exit {warm_result})");
+        return 1;
+    }
+
+    // Remove the stage dir so the same-machine .stamp fast-path cannot fire.
+    let root_output = std::process::Command::new(env!("CARGO"))
+        .args(["locate-project", "--workspace", "--message-format=plain"])
+        .output()
+        .expect("cargo locate-project");
+    let workspace_root = PathBuf::from(
+        String::from_utf8(root_output.stdout)
+            .unwrap()
+            .trim()
+            .to_string(),
+    )
+    .parent()
+    .expect("workspace root has parent")
+    .to_path_buf();
+    let stage_dir = workspace_root.join("target/port-stage").join(name);
+    println!(
+        "pkgcache-hit-check: step 2 — removing stage dir {} to disable .stamp fast-path",
+        stage_dir.display()
+    );
+    let _ = std::fs::remove_dir_all(&stage_dir);
+
+    // Step 3 — run the build again capturing all output.
+    println!("pkgcache-hit-check: step 3 — second build (must be a pure pkgcache hit)");
+    let output = std::process::Command::new(env!("CARGO"))
+        .args(["xtask", "port", "build", name])
+        .output()
+        .unwrap_or_else(|e| panic!("pkgcache-hit-check: failed to spawn second build: {e}"));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}{stderr}");
+
+    // Step 4 — evaluate pass/fail criteria.
+    let has_hit = combined.contains("PKGCACHE: hit ");
+    let has_miss = combined.contains("PKGCACHE: miss ");
+    // Compiler / build-tool tokens that must NOT appear in a pure cache hit.
+    let compiler_tokens: &[&str] = &["gcc", "\nmake", "cmake", "ninja", "configure:"];
+    let has_compiler = compiler_tokens.iter().any(|tok| combined.contains(tok));
+
+    println!("--- second build output ---");
+    print!("{combined}");
+    println!("--- end output ---");
+
+    if has_hit && !has_miss && !has_compiler {
+        println!(
+            "pkgcache-hit-check: PASS — port '{name}' second build was a pure pkgcache hit \
+             (no compiler invocations)"
+        );
+        0
+    } else {
+        eprintln!("pkgcache-hit-check: FAIL");
+        if !has_hit {
+            eprintln!("  - expected 'PKGCACHE: hit ' in output but it was absent");
+        }
+        if has_miss {
+            eprintln!("  - 'PKGCACHE: miss ' appeared — cache was not warm");
+        }
+        if has_compiler {
+            let found: Vec<&str> = compiler_tokens
+                .iter()
+                .copied()
+                .filter(|tok| combined.contains(tok))
+                .collect();
+            eprintln!("  - compiler/build tokens found (cache not used): {found:?}");
+        }
+        1
     }
 }
 
