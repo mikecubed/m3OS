@@ -130,7 +130,7 @@
 **Why it matters:** proves the substrate on real ports and gives the existing TUI gates the cache win for free.
 
 **Acceptance:**
-- [x] ncurses, libevent, ~~zlib~~, less, htop, tmux each produce a `.m3pkg` and install via the D.1 path with **no** regression in the existing TUI gates (`tui-app-smoke`, `htop-render-probe`). *(The 5 host-built ports each seal a `.m3pkg` and install via D.1; `tui-app-smoke` (60 steps) and `htop-render-probe` (473 changed band rows → populated table) both PASS. **zlib is explicitly deferred**: it is not a host-built `build_*` port — its `Portfile` carries a placeholder tarball SHA and it is served by the separate in-guest `target/ports-src` system. Its host `.m3pkg` retrofit (a `build_zlib` recipe + verified Portfile SHA) is a tracked follow-up; D.2's symbol list names only `build_ncurses/less/htop/tmux/libevent`.)*
+- [x] ncurses, libevent, zlib, less, htop, tmux each produce a `.m3pkg` and install via the D.1 path with **no** regression in the existing TUI gates (`tui-app-smoke`, `htop-render-probe`). *(All 6 ports seal a `.m3pkg`; `tui-app-smoke` (60 steps) and `htop-render-probe` (476 changed band rows → populated table) both PASS. **zlib retrofit landed in Track F**: a `build_zlib` recipe + verified Portfile SHA (`9a93b2b7…`) added it to the host-built set — `cargo xtask port build zlib` seals a 0.25 MB `.m3pkg`.)*
 - [x] `less` (which is also embedded in the ramdisk per `ramdisk.rs:150`) remains available early; the retrofit does not break its ramdisk presence. *(The `less` ramdisk entry is untouched; `tui-app-smoke` exercises it post-boot.)*
 
 ---
@@ -178,6 +178,46 @@
 **Acceptance:**
 - [x] If E.1 shows insufficient headroom, `DISK_SIZE` (and the raw-image/QEMU sizing) is increased, gated/documented so the default (no-Clang) image is unchanged; an opt-in Clang image builds **and boots** with the artifact present and `pkg install clang` succeeding. *(Not triggered for 85a: 1 GB is sufficient for the 85a + git + Python footprints. The opt-in Clang resize is deferred to Phase 85d where the artifact exists — documented in design doc E.4, so the default image is never enlarged for an artifact that does not yet exist.)*
 - [x] If E.1 shows the 1 GB disk is sufficient, that finding is recorded explicitly (no silent assumption). *(Design doc E.4: 1 GB sufficient for 85a (~34 MB / ~3 %); no resize performed.)*
+
+---
+
+## Track F — Package-manager completion (post-85a follow-up)
+
+Cleared the previously-unscheduled "Deferred Until Later" backlog (everything
+except binary deltas, which remain a deferred optimization since full updates
+are supported). This promotes `pkg` from the original flat install-only model to
+a dependency-aware manager with remove/upgrade.
+
+### F.1 — zlib host `.m3pkg` retrofit
+
+**File:** `ports/lib/zlib/Portfile`, `xtask/src/port_build.rs`
+**Symbol:** new `build_zlib` + dispatch arm; real `SHA256`
+**Acceptance:**
+- [x] zlib gains a host `build_zlib` recipe (`--static --prefix=/usr/local`, cross via `CC`/`AR`/`RANLIB`) and a verified Portfile SHA (`9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23`, obtained through the in-tree fetch path). `cargo xtask port build zlib` seals `usr/local/lib/libz.a` into a 0.25 MB `.m3pkg`; zlib is in `build_phase_69d_ports` + the image populator set.
+
+### F.2 — Strip executables/`.so` before sealing (E.1 contract)
+
+**File:** `xtask/src/port_build.rs` (`seal_package` → `strip_stage`)
+**Acceptance:**
+- [x] `seal_package` strips ELF executables/shared objects (skipping `.a` and non-ELF files) before packing. Verified: artifacts shrank (less 0.75→0.66 MB, htop 0.80→0.70 MB, tmux 1.75→1.56 MB) with **no** TUI-gate regression (`tui-app-smoke` 60 steps, `htop-render-probe` 476 band rows). The bigger win is reserved for the 85d Clang artifact.
+
+### F.3 — `pkg remove` / `pkg upgrade` (DB-backed)
+
+**File:** `userspace/pkg/src/{lib.rs,main.rs}`
+**Acceptance:**
+- [x] `pkg remove <name>` unlinks every file recorded in `/var/lib/pkg/db` for the package and drops its DB block (idempotent; `db_remove` host-tested). `pkg upgrade <name>` performs a full update: prunes files the old version owned but the new `.m3pkg` does not, then reinstalls (pulling any new deps). Boot-verified by `pkg-smoke` (upgrade + remove + verify-after-remove steps).
+
+### F.4 — Dependency solver
+
+**File:** `userspace/pkg/src/lib.rs` (`topo_install_order`, `parse_meta`), `xtask/src/main.rs` (`.meta` staging)
+**Acceptance:**
+- [x] Each port is staged with a `/usr/pkg/<name>.meta` sidecar (`VERSION=` + `DEPS=` from `port_build::{port_version,port_deps}`). `pkg install <name>` reads the sidecars, builds a dependency graph, and installs in dependency-first topological order, skipping already-installed packages and rejecting cycles. Host-tested (`solver_orders_deps_before_dependents`, `solver_skips_already_installed`, `solver_detects_cycles`, `solver_no_deps_is_singleton`). Boot-verified: `pkg install tmux` engages the solver and auto-installs the `libevent` dependency (`pkg-smoke` step). The heavy ncurses chain is covered by the host tests rather than a multi-minute boot wait (the ~1833-entry terminfo DB is slow to write over the ring-3 VFS).
+
+### F.5 — Honest capability framing + gate
+
+**File:** `AGENTS.md`, `docs/roadmap/85a-package-infrastructure.md`, `userspace/pkg/src/main.rs` (mkdir dedup)
+**Acceptance:**
+- [x] `install_one` deduplicates parent-directory `mkdir`s within a package (cut the per-file mkdir storm over the slow ring-3 VFS). `pkg-smoke` (`M3OS_PKG_REGRESSION=1`) extended to cover install/list/verify/upgrade/remove + solver. AGENTS.md + the design doc updated: `pkg` is now a dependency-aware manager (not flat install-only); only **binary delta packages** remain deferred.
 
 ---
 

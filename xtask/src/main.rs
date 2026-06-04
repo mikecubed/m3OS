@@ -13301,16 +13301,17 @@ fn pkg_smoke_steps() -> Vec<SmokeStep> {
         label: "pkg-smoke: empty DB reported",
     });
 
-    // 2. Install `less` from the bundled offline repo /usr/pkg/less.m3pkg.
+    // 2. Install a leaf package (libevent has no deps → fast) from the bundled
+    //    offline repo /usr/pkg/libevent.m3pkg.
     steps.push(SmokeStep::Send {
-        input: "pkg install less\n",
-        label: "pkg-smoke: install less",
+        input: "pkg install libevent\n",
+        label: "pkg-smoke: install libevent",
     });
     steps.push(SmokeStep::WaitPassOrFail {
-        pass_pattern: "pkg install: less: OK",
+        pass_pattern: "pkg install: libevent: OK",
         fail_prefix: "pkg install: cannot",
-        timeout_secs: 30,
-        label: "pkg-smoke: install less OK",
+        timeout_secs: 60,
+        label: "pkg-smoke: install libevent OK",
         exit_code_on_fail: SMOKE_EXIT_PKG_SMOKE_FAILED,
     });
 
@@ -13320,20 +13321,79 @@ fn pkg_smoke_steps() -> Vec<SmokeStep> {
         label: "pkg-smoke: list after install",
     });
     steps.push(SmokeStep::Wait {
-        pattern: "less",
-        timeout_secs: 15,
-        label: "pkg-smoke: less appears in list",
+        pattern: "libevent",
+        timeout_secs: 30,
+        label: "pkg-smoke: libevent appears in list",
     });
 
-    // 4. `pkg verify` re-hashes the installed binary against the DB → OK.
+    // 4. `pkg verify` re-hashes the installed static lib against the DB → OK.
     steps.push(SmokeStep::Send {
-        input: "pkg verify less\n",
-        label: "pkg-smoke: verify less",
+        input: "pkg verify libevent\n",
+        label: "pkg-smoke: verify libevent",
     });
     steps.push(SmokeStep::Wait {
-        pattern: "OK      /usr/local/bin/less",
-        timeout_secs: 15,
+        pattern: "OK      /usr/local/lib/libevent.a",
+        timeout_secs: 30,
         label: "pkg-smoke: verify reports installed file OK",
+    });
+
+    // 5. `pkg upgrade` re-installs (full update, prunes orphans → 0 here).
+    steps.push(SmokeStep::Send {
+        input: "pkg upgrade libevent\n",
+        label: "pkg-smoke: upgrade libevent",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "pkg upgrade: libevent: OK",
+        timeout_secs: 60,
+        label: "pkg-smoke: upgrade OK",
+    });
+
+    // 6. `pkg remove` unlinks the recorded files + drops the DB entry.
+    steps.push(SmokeStep::Send {
+        input: "pkg remove libevent\n",
+        label: "pkg-smoke: remove libevent",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "pkg remove: libevent: removed",
+        timeout_secs: 30,
+        label: "pkg-smoke: remove OK",
+    });
+    // 7. After removal, verify reports the package is no longer installed.
+    steps.push(SmokeStep::Send {
+        input: "pkg verify libevent\n",
+        label: "pkg-smoke: verify after remove",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "libevent: not installed",
+        timeout_secs: 30,
+        label: "pkg-smoke: removed package gone from DB",
+    });
+
+    // 8. Dependency solver: `pkg install tmux` must auto-resolve + install its
+    //    dependencies before tmux. tmux's deps are ordered libevent (a small
+    //    static lib) before ncurses, so the solver installs libevent FIRST —
+    //    we assert that as proof the solver resolved + installed a dependency
+    //    in-OS, then end the gate. We deliberately do NOT wait for the full
+    //    chain: ncurses ships a ~1833-entry terminfo DB whose per-file writes
+    //    over the ring-3 VFS take minutes — that path is covered by the
+    //    host-side solver unit tests (order / skip-installed / cycle), not by
+    //    a multi-minute boot wait. (`libevent` was removed in step 6, so its
+    //    reinstall here can only come from the solver resolving tmux's deps.)
+    steps.push(SmokeStep::Send {
+        input: "pkg install tmux\n",
+        label: "pkg-smoke: install tmux (+deps via solver)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "pkg install: resolving tmux + dependencies",
+        timeout_secs: 30,
+        label: "pkg-smoke: solver engaged",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "pkg install: libevent: OK",
+        fail_prefix: "pkg install: cannot",
+        timeout_secs: 60,
+        label: "pkg-smoke: solver auto-installed the libevent dependency",
+        exit_code_on_fail: SMOKE_EXIT_PKG_SMOKE_FAILED,
     });
 
     steps
@@ -16330,7 +16390,7 @@ fn populate_ports_tree(part_path: &Path, workspace_root: &Path, ports_src: &Path
 /// (its Portfile carries a placeholder tarball SHA), so it is not part of this
 /// host-built `.m3pkg` set; its host retrofit is a tracked follow-up.
 fn populate_phase_69d_ports(part_path: &Path, workspace_root: &Path) {
-    const PORTS: &[&str] = &["ncurses", "libevent", "less", "htop", "tmux"];
+    const PORTS: &[&str] = &["zlib", "ncurses", "libevent", "less", "htop", "tmux"];
     let stage_root = workspace_root.join("target/port-stage");
     let preinstall_root = workspace_root.join("target/pkg-preinstall");
     // Fresh pre-install scratch each run so a stale unpack never leaks in.
@@ -16351,6 +16411,18 @@ fn populate_phase_69d_ports(part_path: &Path, workspace_root: &Path) {
                 match fs::read(&artifact) {
                     Ok(bytes) if pkg_format::verify(&bytes) => {
                         m3pkg_files.push((format!("usr/pkg/{port}.m3pkg"), artifact.clone()));
+                        // Write the `.meta` sidecar (VERSION + DEPS) the in-OS
+                        // dependency solver reads — e.g. `pkg install tmux`
+                        // auto-installs ncurses + libevent first.
+                        let version = port_build::port_version(port).unwrap_or_default();
+                        let deps = port_build::port_deps(port).join(" ");
+                        let meta_host = preinstall_root.join(format!("{port}.meta"));
+                        let _ = fs::create_dir_all(&preinstall_root);
+                        if fs::write(&meta_host, format!("VERSION={version}\nDEPS={deps}\n"))
+                            .is_ok()
+                        {
+                            m3pkg_files.push((format!("usr/pkg/{port}.meta"), meta_host));
+                        }
                         let dest = preinstall_root.join(port);
                         let _ = fs::create_dir_all(&dest);
                         match pkg_format::unpack(&bytes, &dest) {

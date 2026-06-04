@@ -253,6 +253,119 @@ pub fn parent_components(abs_path: &str) -> Vec<String> {
     components
 }
 
+/// Remove the record named `name` from `records`, returning it (with its file
+/// list) if it was present. Makes `pkg remove` idempotent and gives the caller
+/// the installed paths to unlink.
+pub fn db_remove(records: &mut Vec<PkgRecord>, name: &str) -> Option<PkgRecord> {
+    if let Some(idx) = records.iter().position(|r| r.name == name) {
+        Some(records.remove(idx))
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Package metadata sidecar (`/usr/pkg/<name>.meta`) — version + dependencies
+// ---------------------------------------------------------------------------
+
+/// Parsed `/usr/pkg/<name>.meta` sidecar. Forward-compatible: unknown keys are
+/// ignored. Format (one `KEY=value` per line):
+/// ```text
+/// VERSION=1.3.1
+/// DEPS=ncurses libevent
+/// ```
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Meta {
+    /// Package version (empty if absent).
+    pub version: String,
+    /// Direct dependency package names (space-separated in the file).
+    pub deps: Vec<String>,
+}
+
+/// Parse a `.meta` sidecar. Missing file → caller passes `""` → empty `Meta`.
+pub fn parse_meta(text: &str) -> Meta {
+    let mut meta = Meta::default();
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(v) = line.strip_prefix("VERSION=") {
+            meta.version = v.trim().into();
+        } else if let Some(v) = line.strip_prefix("DEPS=") {
+            meta.deps = v.split_whitespace().map(|s| s.into()).collect();
+        }
+        // Unknown keys ignored (forward-compat).
+    }
+    meta
+}
+
+/// Serialize a `.meta` sidecar (used by the image builder to stage deps).
+pub fn meta_serialize(version: &str, deps: &[&str]) -> String {
+    let mut s = String::new();
+    s.push_str("VERSION=");
+    s.push_str(version);
+    s.push('\n');
+    s.push_str("DEPS=");
+    s.push_str(&deps.join(" "));
+    s.push('\n');
+    s
+}
+
+// ---------------------------------------------------------------------------
+// Dependency solver — topological install order
+// ---------------------------------------------------------------------------
+
+/// Compute the install order for `target` given a dependency map (each name →
+/// its direct deps) and the set of already-installed package names. Returns the
+/// names to install in dependency-first order (a dep always precedes anything
+/// that needs it), omitting anything already installed. Detects cycles.
+///
+/// Pure logic: the in-OS installer builds `deps` by reading `.meta` sidecars,
+/// then installs each returned name in order. Host-tested.
+pub fn topo_install_order(
+    target: &str,
+    deps: &alloc::collections::BTreeMap<String, Vec<String>>,
+    installed: &alloc::collections::BTreeSet<String>,
+) -> Result<Vec<String>, &'static str> {
+    let mut order = Vec::new();
+    // visiting = on the current DFS stack (cycle detection);
+    // done = fully emitted.
+    let mut done = alloc::collections::BTreeSet::new();
+    let mut visiting = alloc::collections::BTreeSet::new();
+    fn visit(
+        name: &str,
+        deps: &alloc::collections::BTreeMap<String, Vec<String>>,
+        installed: &alloc::collections::BTreeSet<String>,
+        order: &mut Vec<String>,
+        done: &mut alloc::collections::BTreeSet<String>,
+        visiting: &mut alloc::collections::BTreeSet<String>,
+    ) -> Result<(), &'static str> {
+        if done.contains(name) || installed.contains(name) {
+            return Ok(());
+        }
+        if visiting.contains(name) {
+            return Err("dependency cycle detected");
+        }
+        visiting.insert(name.into());
+        if let Some(children) = deps.get(name) {
+            for child in children {
+                visit(child, deps, installed, order, done, visiting)?;
+            }
+        }
+        visiting.remove(name);
+        done.insert(name.into());
+        order.push(name.into());
+        Ok(())
+    }
+    visit(
+        target,
+        deps,
+        installed,
+        &mut order,
+        &mut done,
+        &mut visiting,
+    )?;
+    Ok(order)
+}
+
 // ---------------------------------------------------------------------------
 // Host-only tests
 // ---------------------------------------------------------------------------
@@ -260,6 +373,7 @@ pub fn parent_components(abs_path: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::collections::{BTreeMap, BTreeSet};
 
     fn make_pkg(name: &str, version: &str, key: &str, files: &[(&str, &str)]) -> PkgRecord {
         PkgRecord {
@@ -406,5 +520,98 @@ mod tests {
         let bar = records.iter().find(|r| r.name == "bar").unwrap();
         assert_eq!(foo.version, "1.1");
         assert_eq!(bar.version, "2.0");
+    }
+
+    // -----------------------------------------------------------------------
+    // pkg remove — DB removal returns the record (with its file list)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn db_remove_returns_and_drops_record() {
+        let mut records = vec![
+            make_pkg("foo", "1.0", "a", &[("/usr/bin/foo", "h1")]),
+            make_pkg("bar", "2.0", "b", &[("/usr/bin/bar", "h2")]),
+        ];
+        let removed = db_remove(&mut records, "foo").expect("foo present");
+        assert_eq!(removed.name, "foo");
+        assert_eq!(removed.files.len(), 1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].name, "bar");
+        // Removing a missing package is a no-op returning None (idempotent).
+        assert!(db_remove(&mut records, "foo").is_none());
+        assert_eq!(records.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // .meta sidecar parse / serialize round-trip + forward-compat
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn meta_roundtrip_and_forward_compat() {
+        let text = meta_serialize("1.3.1", &["ncurses", "libevent"]);
+        let m = parse_meta(&text);
+        assert_eq!(m.version, "1.3.1");
+        assert_eq!(m.deps, vec!["ncurses".to_string(), "libevent".to_string()]);
+        // Empty deps.
+        let m0 = parse_meta(&meta_serialize("2.0", &[]));
+        assert_eq!(m0.version, "2.0");
+        assert!(m0.deps.is_empty());
+        // Unknown key ignored; missing file (empty) → default.
+        let m1 = parse_meta("VERSION=9\nFUTURE=x\nDEPS=a b\n");
+        assert_eq!(m1.version, "9");
+        assert_eq!(m1.deps, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(parse_meta(""), Meta::default());
+    }
+
+    // -----------------------------------------------------------------------
+    // dependency solver — topological install order
+    // -----------------------------------------------------------------------
+
+    fn deps_map(pairs: &[(&str, &[&str])]) -> BTreeMap<String, Vec<String>> {
+        pairs
+            .iter()
+            .map(|(n, ds)| ((*n).into(), ds.iter().map(|d| (*d).into()).collect()))
+            .collect()
+    }
+
+    #[test]
+    fn solver_orders_deps_before_dependents() {
+        // tmux → ncurses, libevent ; less → ncurses
+        let deps = deps_map(&[
+            ("tmux", &["ncurses", "libevent"]),
+            ("less", &["ncurses"]),
+            ("ncurses", &[]),
+            ("libevent", &[]),
+        ]);
+        let order = topo_install_order("tmux", &deps, &BTreeSet::new()).unwrap();
+        // tmux must be last; both deps must precede it.
+        assert_eq!(order.last().unwrap(), "tmux");
+        let pos = |n: &str| order.iter().position(|x| x == n).unwrap();
+        assert!(pos("ncurses") < pos("tmux"));
+        assert!(pos("libevent") < pos("tmux"));
+        assert_eq!(order.len(), 3);
+    }
+
+    #[test]
+    fn solver_skips_already_installed() {
+        let deps = deps_map(&[("tmux", &["ncurses", "libevent"])]);
+        let mut installed = BTreeSet::new();
+        installed.insert("ncurses".to_string());
+        let order = topo_install_order("tmux", &deps, &installed).unwrap();
+        assert!(!order.contains(&"ncurses".to_string()));
+        assert_eq!(order, vec!["libevent".to_string(), "tmux".to_string()]);
+    }
+
+    #[test]
+    fn solver_detects_cycles() {
+        let deps = deps_map(&[("a", &["b"]), ("b", &["a"])]);
+        assert!(topo_install_order("a", &deps, &BTreeSet::new()).is_err());
+    }
+
+    #[test]
+    fn solver_no_deps_is_singleton() {
+        let deps = deps_map(&[("ncurses", &[])]);
+        let order = topo_install_order("ncurses", &deps, &BTreeSet::new()).unwrap();
+        assert_eq!(order, vec!["ncurses".to_string()]);
     }
 }

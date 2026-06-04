@@ -73,18 +73,17 @@ A `no_std` userspace binary that opens a `.m3pkg`, verifies its hashes, and extr
 
 - Redox `pkgar` carries full ed25519 signing + a fixed 136-byte remote header for partial fetch; 85a's v1 may ship hash-only verification and add signing later.
 - Yocto/Nix recurse the dependency-hash graph to the full transitive closure; 85a keys on direct dependency artifact keys only.
-- Mature managers ship a dependency solver, multiple repos, and atomic upgrades; 85a is a flat install-only model.
+- Mature managers ship multiple repos, atomic transactions, and binary deltas. 85a (with the Track F follow-up) has a single-level dependency solver + `remove`/`upgrade` over one local repo — but installs/removes are per-file (not transactional/atomic) and updates are full-artifact (no binary deltas).
 
 ## Deferred Until Later
 
 - Networked `pkg install`/`update` over HTTPS, `/etc/pkg.d/` remote repos, signing-key distribution — Phase 86.
-- A dependency solver, package removal/upgrade transactions, and delta packages.
-- **zlib host `.m3pkg` retrofit** — zlib is currently served by the separate
-  in-guest `target/ports-src` system (its `Portfile` carries a placeholder
-  tarball SHA) and has no host `build_zlib` recipe; folding it onto the host
-  `.m3pkg` substrate (a `build_zlib` recipe + a verified Portfile SHA) is a
-  small follow-up. The 5 host-built ports (ncurses, libevent, less, htop, tmux)
-  are retrofitted in 85a.
+- **Binary delta packages** (incremental updates) — full-artifact updates are supported via `pkg upgrade`; deltas are a size optimization deferred until a networked repo makes them worthwhile.
+- Transactional/atomic install+rollback and multiple repositories.
+
+> The previously-deferred zlib host retrofit, strip-before-seal, dependency
+> solver, and `pkg remove`/`upgrade` all landed as the **Track F** follow-up
+> (see the task list).
 
 ## Resource Budget, Relocation Contract & Hosting (Track E)
 
@@ -122,9 +121,10 @@ Recipes that feed the `.m3pkg` substrate MUST:
    so the packed tree's entry paths are prefix-relative (`usr/...`) and the
    `pkg` installer lays them under `/` unchanged.
 2. **Strip executables and shared objects before sealing** to keep artifacts
-   small (mandatory for the multi-hundred-MB Clang artifact; the 85a
-   ncurses-class binaries are not yet stripped — a minor future optimization,
-   recorded here for honesty).
+   small. Implemented in `seal_package` → `strip_stage` (Track F): ELF
+   executables/`.so`s are stripped, `.a` archives and non-ELF files left intact.
+   Modest on the 85a ncurses-class binaries (less 0.75→0.66 MB, tmux 1.75→1.56
+   MB); the large payoff is the multi-hundred-MB Clang artifact in 85d.
 3. Keep **relocatable internal layout**: Clang's resource dir is resolved
    relative to the binary; Python uses a fixed relative `bin/` + `lib/pythonX.Y/`
    layout. No build-prefix-absolute paths baked into the installed files.

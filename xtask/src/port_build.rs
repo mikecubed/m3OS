@@ -388,13 +388,26 @@ fn apply_patches(patches_dir: &Path, src_dir: &Path) -> Result<usize, String> {
 /// themselves have no deps, so there is no recursion needed in practice.
 /// The function signature is written to handle deeper dependency chains
 /// without change.
-fn port_deps(name: &str) -> &'static [&'static str] {
+pub fn port_deps(name: &str) -> &'static [&'static str] {
     match name {
         "less" => &["ncurses"],
         "htop" => &["ncurses"],
-        "tmux" => &["ncurses", "libevent"],
+        // Order is irrelevant to the content key (deps are sorted in
+        // `compute_package_key`); it only sets the install sequence the in-OS
+        // solver follows — libevent (a small static lib) before the heavyweight
+        // ncurses terminfo DB.
+        "tmux" => &["libevent", "ncurses"],
         _ => &[],
     }
+}
+
+/// Phase 85a (D.1 / solver) — the `VERSION` field from a port's Portfile, used
+/// by the image populator to write the `/usr/pkg/<name>.meta` sidecar the in-OS
+/// dependency solver reads. Returns `None` if the port or field is absent.
+pub fn port_version(name: &str) -> Option<String> {
+    let port_dir = find_port_dir(name)?;
+    let meta = parse_portfile(&port_dir.join("Portfile")).ok()?;
+    meta.get("VERSION").cloned()
 }
 
 /// Phase 85a (B.2) — compute the portable content key for `name` (the port at
@@ -450,6 +463,14 @@ fn seal_package(name: &str, stage: &Path, key: &str) -> Result<(), String> {
     let artifact = cache_dir.join(format!("{key}.m3pkg"));
     let tmp = cache_dir.join(format!("{key}.m3pkg.tmp"));
 
+    // Phase 85a (E.1 relocation contract) — strip symbol tables from ELF
+    // executables / shared objects in the stage before packing, so the sealed
+    // artifact (and the on-image pre-install) carries no debug/symbol bloat.
+    // Mandatory for the multi-hundred-MB Clang artifact; a smaller win for the
+    // ncurses-class binaries. Static archives (.a) and non-ELF files (terminfo,
+    // headers, data) are left untouched so dependent links still resolve.
+    strip_stage(stage);
+
     let bytes =
         pkg_format::pack(stage).map_err(|e| format!("seal_package({name}): pack failed: {e}"))?;
 
@@ -472,6 +493,46 @@ fn seal_package(name: &str, stage: &Path, key: &str) -> Result<(), String> {
         bytes.len()
     );
     Ok(())
+}
+
+/// Recursively strip ELF executables and shared objects under `dir` in place
+/// (best-effort). Only files whose first four bytes are the ELF magic are
+/// touched, so static archives (`!<arch>` magic), terminfo entries, headers,
+/// and scripts are left alone — keeping dependent links intact. Failures are
+/// ignored: a missing `strip` or an unstrippable file must not abort the build.
+fn strip_stage(dir: &Path) {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if fs::symlink_metadata(&path)
+            .map(|m| m.is_symlink())
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        if path.is_dir() {
+            strip_stage(&path);
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+        let mut magic = [0u8; 4];
+        let is_elf = File::open(&path)
+            .and_then(|mut f| f.read(&mut magic))
+            .map(|n| n == 4 && &magic == b"\x7fELF")
+            .unwrap_or(false);
+        if is_elf {
+            let _ = Command::new("strip")
+                .arg(&path)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
 }
 
 /// Top-level entry point invoked by `cargo xtask port build <name>`.
@@ -587,6 +648,7 @@ fn port_build(name: &str) -> Result<(), String> {
     match name {
         "ncurses" => build_ncurses(&extracted, &stage, &toolchain)?,
         "libevent" => build_libevent(&extracted, &stage, &toolchain)?,
+        "zlib" => build_zlib(&extracted, &stage, &toolchain)?,
         "less" => build_less(&extracted, &stage, &toolchain, &ncurses_stage)?,
         "htop" => build_htop(&extracted, &stage, &toolchain, &ncurses_stage)?,
         "tmux" => build_tmux(
@@ -793,6 +855,57 @@ fn build_libevent(
         return Err(format!("libevent build missing {}", lib.display()));
     }
     println!("libevent: produced libevent.a");
+    Ok(())
+}
+
+/// Phase 85a (D.2 follow-up) — cross-compile zlib 1.3.1 as a static library.
+///
+/// zlib ships a hand-written `configure` (not autotools), so there is no
+/// `--host` flag; cross-compilation is selected purely through the `CC` / `AR` /
+/// `RANLIB` environment. `--static` skips the shared object (m3OS links static),
+/// `--prefix=/usr/local` bakes the runtime prefix, and `make install DESTDIR=`
+/// stages `usr/local/{lib/libz.a, include/{zlib,zconf}.h, lib/pkgconfig/zlib.pc,
+/// share/man}`. The resulting stage is sealed into a `.m3pkg` by the shared
+/// pkgcache path exactly like the other ports.
+fn build_zlib(
+    src: &Path,
+    stage: &Path,
+    (cc, ar, ranlib): &(&'static str, String, String),
+) -> Result<(), String> {
+    let stage_prefix = stage.join("usr/local");
+    fs::create_dir_all(&stage_prefix).map_err(|e| format!("mkdir: {e}"))?;
+
+    let mut configure_cmd = Command::new("sh");
+    configure_cmd
+        .current_dir(src)
+        .arg("./configure")
+        .arg("--static")
+        .arg("--prefix=/usr/local")
+        .env("CC", cc)
+        .env("AR", ar)
+        .env("RANLIB", ranlib)
+        .env("CFLAGS", "-O2");
+    run(&mut configure_cmd, "zlib configure")?;
+
+    let mut make_cmd = Command::new("make");
+    make_cmd.current_dir(src).arg(format!("-j{}", num_jobs()));
+    run(&mut make_cmd, "zlib make")?;
+
+    let mut install_cmd = Command::new("make");
+    install_cmd
+        .current_dir(src)
+        .arg("install")
+        .arg(format!("DESTDIR={}", stage.display()));
+    run(&mut install_cmd, "zlib install")?;
+
+    let lib = stage_prefix.join("lib/libz.a");
+    if !lib.exists() {
+        return Err(format!("zlib build missing {}", lib.display()));
+    }
+    println!(
+        "zlib: produced /usr/local/lib/libz.a ({} bytes)",
+        file_size(&lib)
+    );
     Ok(())
 }
 
@@ -1248,7 +1361,7 @@ pub fn build_phase_69d_ports() -> Result<(), String> {
             "no musl cross-compiler on PATH (install musl-tools or musl-gcc-cross-bin)".to_string(),
         );
     }
-    for name in &["ncurses", "libevent", "less", "htop", "tmux"] {
+    for name in &["zlib", "ncurses", "libevent", "less", "htop", "tmux"] {
         port_build(name).map_err(|e| format!("port {name}: {e}"))?;
     }
     Ok(())

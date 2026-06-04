@@ -24,8 +24,10 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::alloc::Layout;
 
+use alloc::collections::{BTreeMap, BTreeSet};
 use pkg_app::{
-    FileRecord, PkgRecord, db_parse, db_serialize, db_upsert, install_path, parent_components,
+    FileRecord, Meta, PkgRecord, db_parse, db_remove, db_serialize, db_upsert, install_path,
+    parent_components, parse_meta, topo_install_order,
 };
 use pkg_format::{content_hash, to_hex};
 use syscall_lib::{STDERR_FILENO, STDOUT_FILENO, heap::BrkAllocator};
@@ -68,6 +70,22 @@ fn program_main(args: &[&str]) -> i32 {
                 2
             }
         },
+        Some("remove") => match args.get(2).copied() {
+            Some(name) => cmd_remove(name),
+            None => {
+                eprint_str("pkg remove: missing package name\n");
+                print_usage();
+                2
+            }
+        },
+        Some("upgrade") => match args.get(2).copied() {
+            Some(name) => cmd_upgrade(name),
+            None => {
+                eprint_str("pkg upgrade: missing package name\n");
+                print_usage();
+                2
+            }
+        },
         _ => {
             print_usage();
             2
@@ -86,10 +104,76 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 }
 
 // ---------------------------------------------------------------------------
-// cmd_install — C.1
+// cmd_install — C.1 + dependency solver (Phase 85a follow-up)
 // ---------------------------------------------------------------------------
 
+/// Install `name` and its (transitive) dependencies. Reads each package's
+/// `/usr/pkg/<n>.meta` sidecar to build a dependency graph, computes a
+/// dependency-first install order skipping packages already in the DB, and
+/// installs each in turn. With no `.meta` (or empty `DEPS=`) this degrades to a
+/// single-package install — preserving the original flat behaviour.
 fn cmd_install(name: &str) -> i32 {
+    // Build the dependency map by reading .meta sidecars transitively.
+    let mut deps: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    collect_deps(name, &mut deps);
+
+    // Already-installed set (names) from the DB.
+    let installed: BTreeSet<String> = db_read()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| r.name)
+        .collect();
+
+    let order = match topo_install_order(name, &deps, &installed) {
+        Ok(o) => o,
+        Err(e) => {
+            eprint_str("pkg install: ");
+            eprint_str(e);
+            eprint_str("\n");
+            return 1;
+        }
+    };
+
+    if order.is_empty() {
+        print_str("pkg install: ");
+        print_str(name);
+        print_str(": already installed\n");
+        return 0;
+    }
+    if order.len() > 1 {
+        print_str("pkg install: resolving ");
+        print_str(name);
+        print_str(" + dependencies\n");
+    }
+
+    for pkg in &order {
+        let rc = install_one(pkg);
+        if rc != 0 {
+            return rc;
+        }
+    }
+    0
+}
+
+/// Recursively read `<name>.meta` (DEPS=) into `deps`, terminating on
+/// already-visited names (which also breaks cycles for the collection phase;
+/// `topo_install_order` reports the cycle as an error).
+fn collect_deps(name: &str, deps: &mut BTreeMap<String, Vec<String>>) {
+    if deps.contains_key(name) {
+        return;
+    }
+    let meta = read_meta(name);
+    deps.insert(name.into(), meta.deps.clone());
+    for d in &meta.deps {
+        collect_deps(d, deps);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// install_one — single-package install (C.1 core)
+// ---------------------------------------------------------------------------
+
+fn install_one(name: &str) -> i32 {
     // ---- 1. Build the path to the local package file. ----
     // /usr/pkg/<name>.m3pkg  (NUL-terminated for syscall)
     let mut pkg_path = build_path(b"/usr/pkg/", name.as_bytes(), b".m3pkg\0");
@@ -132,17 +216,25 @@ fn cmd_install(name: &str) -> i32 {
 
     // ---- 5. Extract entries. ----
     let mut installed_files: Vec<FileRecord> = Vec::new();
+    // Track directories already created during this install so a package with
+    // many files in the same tree (e.g. ncurses' ~1833-entry terminfo DB) does
+    // not re-issue a `mkdir` per file — that mkdir storm dominated the install
+    // time over the ring-3 VFS. Each unique component is created at most once.
+    let mut created_dirs: BTreeSet<String> = BTreeSet::new();
 
     for entry in &manifest.entries {
         let abs = install_path(&entry.path);
 
-        // 5a. Ensure parent directories exist (mkdir each component, ignore EEXIST).
-        let dirs = parent_components(&abs);
-        for dir in &dirs {
+        // 5a. Ensure parent directories exist (mkdir each *new* component once).
+        for dir in parent_components(&abs) {
+            if created_dirs.contains(&dir) {
+                continue;
+            }
             let mut dir_path = dir.as_bytes().to_vec();
             dir_path.push(0);
-            // Ignore errors: directory may already exist.
+            // Ignore errors: directory may already exist on disk.
             let _ = syscall_lib::mkdir(&dir_path, 0o755);
+            created_dirs.insert(dir);
         }
 
         // 5b. Borrow the entry content from the artifact buffer.
@@ -211,7 +303,7 @@ fn cmd_install(name: &str) -> i32 {
     }
 
     // ---- 6. Read optional sidecar .meta for VERSION=. ----
-    let version = read_meta_version(name);
+    let version = read_meta(name).version;
 
     // ---- 7. Compute the artifact content key. ----
     let artifact_key = to_hex(&content_hash(&pkg_bytes));
@@ -331,6 +423,146 @@ fn cmd_verify(name: &str) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// cmd_remove — delete a package's recorded files + DB entry
+// ---------------------------------------------------------------------------
+
+fn cmd_remove(name: &str) -> i32 {
+    let mut records = match db_read() {
+        Ok(r) => r,
+        Err(_) => {
+            eprint_str("pkg remove: DB not found (nothing installed)\n");
+            return 1;
+        }
+    };
+    let removed = match db_remove(&mut records, name) {
+        Some(r) => r,
+        None => {
+            eprint_str("pkg remove: ");
+            eprint_str(name);
+            eprint_str(": not installed\n");
+            return 1;
+        }
+    };
+
+    let mut unlinked = 0u32;
+    for f in &removed.files {
+        let mut p = f.path.as_bytes().to_vec();
+        p.push(0);
+        if syscall_lib::unlink(&p) >= 0 {
+            unlinked += 1;
+        }
+        // Missing files are tolerated (already gone) — remove stays idempotent.
+    }
+
+    if let Err(e) = db_write(&records) {
+        eprint_str("pkg remove: DB write error: ");
+        eprint_str(e);
+        eprint_str("\n");
+        return 1;
+    }
+
+    print_str("pkg remove: ");
+    print_str(name);
+    print_str(": removed ");
+    syscall_lib::write_u64(STDOUT_FILENO, unlinked as u64);
+    print_str(" file(s)\n");
+    0
+}
+
+// ---------------------------------------------------------------------------
+// cmd_upgrade — full update: prune orphaned files, then (re)install
+// ---------------------------------------------------------------------------
+
+fn cmd_upgrade(name: &str) -> i32 {
+    let records = db_read().unwrap_or_default();
+    let old = match records.iter().find(|r| r.name == name).cloned() {
+        Some(r) => r,
+        None => {
+            // Not installed yet — upgrade degrades to a fresh (solver) install.
+            print_str("pkg upgrade: ");
+            print_str(name);
+            print_str(" not installed — installing\n");
+            return cmd_install(name);
+        }
+    };
+
+    // Compute the NEW package's file set from /usr/pkg/<name>.m3pkg.
+    let pkg_path = build_path(b"/usr/pkg/", name.as_bytes(), b".m3pkg\0");
+    let bytes = match read_file_bytes(&pkg_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprint_str("pkg upgrade: cannot read ");
+            eprint_str(name);
+            eprint_str(": ");
+            eprint_str(e);
+            eprint_str("\n");
+            return 1;
+        }
+    };
+    if !pkg_format::verify(&bytes) {
+        eprint_str("pkg upgrade: integrity check FAILED for ");
+        eprint_str(name);
+        eprint_str("\n");
+        return 1;
+    }
+    let manifest = match pkg_format::parse(&bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            eprint_str("pkg upgrade: parse error: ");
+            eprint_str(e);
+            eprint_str("\n");
+            return 1;
+        }
+    };
+    let mut new_paths: BTreeSet<String> = BTreeSet::new();
+    for e in &manifest.entries {
+        new_paths.insert(install_path(&e.path));
+    }
+
+    // Prune files the old version owned but the new one does not (orphans).
+    let mut pruned = 0u32;
+    for f in &old.files {
+        if !new_paths.contains(&f.path) {
+            let mut p = f.path.as_bytes().to_vec();
+            p.push(0);
+            if syscall_lib::unlink(&p) >= 0 {
+                pruned += 1;
+            }
+        }
+    }
+
+    // Reinstall the target (forced) plus any newly-introduced dependencies:
+    // build the dep graph, treat `name` as NOT installed so it is reinstalled,
+    // and let the solver pull in any missing deps.
+    let mut deps: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    collect_deps(name, &mut deps);
+    let mut installed: BTreeSet<String> = records.iter().map(|r| r.name.clone()).collect();
+    installed.remove(name);
+    let order = match topo_install_order(name, &deps, &installed) {
+        Ok(o) => o,
+        Err(e) => {
+            eprint_str("pkg upgrade: ");
+            eprint_str(e);
+            eprint_str("\n");
+            return 1;
+        }
+    };
+    for pkg in &order {
+        let rc = install_one(pkg);
+        if rc != 0 {
+            return rc;
+        }
+    }
+
+    print_str("pkg upgrade: ");
+    print_str(name);
+    print_str(": OK (pruned ");
+    syscall_lib::write_u64(STDOUT_FILENO, pruned as u64);
+    print_str(" orphan(s))\n");
+    0
+}
+
+// ---------------------------------------------------------------------------
 // DB helpers
 // ---------------------------------------------------------------------------
 
@@ -345,18 +577,13 @@ fn db_read() -> Result<Vec<PkgRecord>, &'static str> {
     db_parse(text).map_err(|_| "DB parse error")
 }
 
-/// Upsert a `PkgRecord` into the DB on disk (atomic: write then close).
-fn db_update(rec: PkgRecord) -> Result<(), &'static str> {
-    // Read existing records (empty if DB absent).
-    let mut records = db_read().unwrap_or_default();
-    db_upsert(&mut records, rec);
-
-    // Ensure /var/lib/pkg/ exists.
+/// Write the full record set to the DB on disk (creates `/var/lib/pkg/`).
+fn db_write(records: &[PkgRecord]) -> Result<(), &'static str> {
     let _ = syscall_lib::mkdir(b"/var\0", 0o755);
     let _ = syscall_lib::mkdir(b"/var/lib\0", 0o755);
     let _ = syscall_lib::mkdir(b"/var/lib/pkg\0", 0o755);
 
-    let text = db_serialize(&records);
+    let text = db_serialize(records);
     let flags = syscall_lib::O_WRONLY | syscall_lib::O_CREAT | syscall_lib::O_TRUNC;
     let fd = syscall_lib::open(DB_PATH, flags, 0o644);
     if (fd as i64) < 0 {
@@ -368,26 +595,27 @@ fn db_update(rec: PkgRecord) -> Result<(), &'static str> {
     if ok { Ok(()) } else { Err("DB write error") }
 }
 
+/// Upsert a `PkgRecord` into the DB on disk.
+fn db_update(rec: PkgRecord) -> Result<(), &'static str> {
+    let mut records = db_read().unwrap_or_default();
+    db_upsert(&mut records, rec);
+    db_write(&records)
+}
+
 // ---------------------------------------------------------------------------
-// Read /usr/pkg/<name>.meta for VERSION=<…>
+// Read /usr/pkg/<name>.meta (VERSION= + DEPS=)
 // ---------------------------------------------------------------------------
 
-fn read_meta_version(name: &str) -> String {
+fn read_meta(name: &str) -> Meta {
     let meta_path = build_path(b"/usr/pkg/", name.as_bytes(), b".meta\0");
     let data = match read_file_bytes(&meta_path) {
         Ok(d) => d,
-        Err(_) => return String::new(),
+        Err(_) => return Meta::default(),
     };
-    let text = match core::str::from_utf8(&data) {
-        Ok(t) => t,
-        Err(_) => return String::new(),
-    };
-    for line in text.lines() {
-        if let Some(v) = line.strip_prefix("VERSION=") {
-            return v.trim().into();
-        }
+    match core::str::from_utf8(&data) {
+        Ok(t) => parse_meta(t),
+        Err(_) => Meta::default(),
     }
-    String::new()
 }
 
 // ---------------------------------------------------------------------------
@@ -456,7 +684,9 @@ fn eprint_str(s: &str) {
 fn print_usage() {
     print_str(
         "Usage:\n  \
-         pkg install <name>   Install /usr/pkg/<name>.m3pkg (offline)\n  \
+         pkg install <name>   Install /usr/pkg/<name>.m3pkg + its deps (offline)\n  \
+         pkg remove <name>    Remove an installed package's files + DB entry\n  \
+         pkg upgrade <name>   Reinstall <name>, pruning orphaned files\n  \
          pkg list             List installed packages\n  \
          pkg verify <name>    Verify installed files against the DB\n\n\
          Note: pkg is offline-only in Phase 85a; networked install is Phase 86.\n",
