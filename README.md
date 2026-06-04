@@ -1,20 +1,22 @@
 # m³OS
 
 A serious, still-maturing bootable operating system written in Rust, targeting
-**x86_64** with a **microkernel-inspired architecture**. Built for learning and
-experimentation, with a real userspace, networking, remote access, a bounded
-set of real-hardware drivers (NVMe storage, Intel 82540EM classic e1000
-networking) on top of the VirtIO baseline, an IOMMU substrate that routes
-device DMA through per-device VT-d / AMD-Vi translation domains, a ring-3
-display server with focus-aware input dispatch and layer-shell-equivalent
-surface roles, and a roadmap toward stronger service isolation and broader
-platform support.
+**x86_64** with **UEFI** boot and a **microkernel-inspired architecture**. Built for
+learning and experimentation, it runs a real ring-3 userspace with multi-user login,
+an IPv4 TCP/UDP + AF_UNIX network stack, SSH/telnet remote administration,
+IOMMU-routed ring-3 block drivers (NVMe and AHCI/SATA, ext2 root) and NIC drivers
+(Intel e1000/e1000e/igb/igc and Realtek r8169/RTL8125) on a VirtIO baseline, a
+MediaTek mt792x Wi-Fi driver, a USB host stack with HID keyboard/mouse input, and a
+screenshot-validated graphical session (ring-3 display server + compositor clients +
+`term` + HDA/AC'97 audio). The **recommended administration path is SSH-first /
+headless**; the local graphical session is a supported workflow. See the
+[**1.0 release gate**](docs/release/1.0-release-gate.md) for the authoritative support
+matrix — what is supported, on which targets, and what is explicitly out of scope.
 
-**Current kernel version:** v0.57.0 (Phase 55 hardware substrate + Phase 55a
-IOMMU substrate + Phase 55b ring-3 driver host + Phase 55c ring-3 driver correctness
-closure + Phase 56 display and input architecture + Phase 57 audio and local
-session — `audio_server` AC'97 driver, `session_manager` graphical-session
-orchestrator, `term` graphical terminal emulator).
+**Current kernel version:** v0.83.0 — **phase-tracked** (`0.NN.0 = Phase NN`). Note
+"1.0" is a quality-bar milestone, **not** a SemVer `1.0.0` commitment: no public
+syscall/userspace ABI is frozen yet. See the
+[1.0 release gate](docs/release/1.0-release-gate.md#versioning-posture).
 
 ## Quick Start
 

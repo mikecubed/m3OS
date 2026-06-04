@@ -42,6 +42,11 @@ minimal userspace display server with at least a terminal and launcher. If that
 late graphical work is not ready, it is healthier to ship **0.9** than to force
 desktop scope in early and distort the earlier phases.
 
+> **Settled (Phase 83).** The graphical stack *is* ready: 1.0 **includes** the
+> local-system/graphical branch (greeter → compositor → `term`/launcher/bar),
+> screenshot-validated, with SSH-first headless as the recommended admin path. See the
+> [Phase 83 release scope decision](../../release/1.0-release-gate.md#release-scope-decision).
+
 ### What 1.0 should and should not mean
 
 | 1.0 should mean | 1.0 should not mean |
@@ -158,10 +163,13 @@ Examples:
 - [Phases 55–57](../../roadmap/55-hardware-substrate.md) cover the official
   hardware and local-system branch for **R08**, **R09**, and the optional GUI
   path discussed in **R10**
-- [Phase 58](../../roadmap/58-release-1-0-gate.md) is the explicit official
-  implementation of the **R10** release gate
-- [Phases 59–62](../../roadmap/59-cross-compiled-toolchains.md) are explicitly
-  **post-1.0 growth**, not hidden early release blockers
+- [Phase 83](../../roadmap/83-release-1-0-gate.md) is the explicit official
+  implementation of the **R10** release gate (authoritative artifact:
+  [`docs/release/1.0-release-gate.md`](../../release/1.0-release-gate.md))
+- [Phases 84–89](../../roadmap/84-spectre-mitigations.md) (Spectre/KPTI, toolchains,
+  GitHub, Node.js, Claude Code, IPv6/DHCPv6) are explicitly **post-1.0 growth**, not
+  hidden early release blockers
+  *(these were Phases 58–62 in earlier drafts of this overlay, since renumbered)*
 
 Because phases 1-47 are already complete, missing behavior in those areas should
 usually be read as a quality gap in the shipped base or as explicit later-phase
