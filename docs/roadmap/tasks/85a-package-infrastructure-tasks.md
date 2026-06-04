@@ -14,7 +14,7 @@
 | A | `.m3pkg` format + content-addressed cache key (host-tested pure logic) | Phase 45 caching | ✅ Done |
 | B | `xtask` seal-after-install + resolve-before-build + zero-rebuild gate in `port_build.rs`/`main.rs` | A | ✅ Done |
 | C | Userspace `pkg` installer + installed-file DB | A | ✅ Done (boot-verified in D) |
-| D | Image staging installs from `.m3pkg`; existing-ports retrofit | B, C | ✅ Done (zlib deferred) |
+| D | Image staging installs from `.m3pkg`; existing-ports retrofit | B, C | ✅ Done (zlib retrofit completed in Track F) |
 | E | Disk/RAM budget + relocation contract + hosting plan + data-disk resize + version bump | A–D | ✅ Done |
 
 ---
@@ -56,7 +56,7 @@
 **Why it matters:** this is the "build once" half — every successful build produces a reusable artifact keyed by A.1.
 
 **Acceptance:**
-- [x] After a port builds, its `target/port-stage/<name>/` tree is packed into `target/pkgcache/<key>.m3pkg`; the key is recorded alongside the existing `.stamp`. *(`seal_package` in `port_build.rs` — atomic `.tmp`+rename; writes `<stage>/.pkgkey`. Test `seal_package_creates_valid_m3pkg`.)*
+- [x] After a port builds, its `target/port-stage/<name>/` tree is packed into `target/pkgcache/<key>.m3pkg`; the key is recorded alongside the existing `.stamp`. *(`seal_package` in `port_build.rs` — atomic `.tmp`+rename; writes the key to the sibling `target/port-stage/<name>.pkgkey` (NOT inside the staged tree, so cache metadata never ends up packed into the artifact or laid down at `/.pkgkey` on install). Test `seal_package_creates_valid_m3pkg`.)*
 - [x] The pkgcache survives across `cargo xtask clean` of the disk image (it is build output, not disk state) — documented which `clean` targets do/don't purge it. *(Documented in `seal_package`'s doc comment: `cargo xtask clean` removes only the disk image and does NOT purge `target/pkgcache/`.)*
 
 ### B.2 — Resolve-before-build: install from cache on a key hit
@@ -119,7 +119,7 @@
 **Why it matters:** the image must bundle the `.m3pkg` artifacts (so `pkg install` works offline) instead of mirroring raw stage trees.
 
 **Acceptance:**
-- [x] `cargo xtask image` writes each selected port's `.m3pkg` into `/usr/pkg/` on the data disk (and optionally pre-installs core ports into `/usr`), via `debugfs`, replacing the raw stage-tree mirror. *(Rewrote `populate_phase_69d_ports`: bundles each `target/pkgcache/<key>.m3pkg` into `/usr/pkg/<name>.m3pkg` and pre-installs by **unpacking** the artifact (`target/pkg-preinstall/`) and mirroring its `usr/{local,share}`. Boot log: `phase-85a ports: bundling 5 .m3pkg artifact(s) into /usr/pkg + pre-installing 2961 files`; `pkg-smoke` then installed `less` from `/usr/pkg/less.m3pkg` in-OS.)*
+- [x] `cargo xtask image` writes each selected port's `.m3pkg` into `/usr/pkg/` on the data disk (and optionally pre-installs core ports into `/usr`), via `debugfs`, replacing the raw stage-tree mirror. *(Rewrote `populate_phase_69d_ports`: bundles each `target/pkgcache/<key>.m3pkg` into `/usr/pkg/<name>.m3pkg` (plus a `/usr/pkg/<name>.meta` `VERSION=`/`DEPS=` sidecar) and pre-installs by **unpacking** the artifact (`target/pkg-preinstall/`) and mirroring its `usr/{local,share}`. Boot log: `phase-85a ports: bundling 6 .m3pkg artifact(s) into /usr/pkg + pre-installing N files`; `pkg-smoke` then installs `libevent` from `/usr/pkg/libevent.m3pkg` in-OS and resolves `tmux`'s deps via the solver.)*
 - [x] The image build performs **zero** compiler invocations when every selected port is a pkgcache hit (verified by the B.3 gate). *(Warm build of all 5 ports → `PKGCACHE: hit` each, zero compiler; `pkgcache-hit-check` PASS.)*
 - [x] `cargo xtask clean` is run to force ext2 recreation after the new `/usr/pkg/` staging is wired (AGENTS.md data-disk rule); documented in the task. *(Ran `cargo xtask clean` (removed `disk.img`); the smoke/image paths recreate the disk via `create_data_disk` → the new staging.)*
 
@@ -145,7 +145,7 @@
 
 **Acceptance:**
 - [x] The `DISK_SIZE` (currently 1 GB) headroom is assessed against the 85b/85c/85d footprints (git tens of MB, Python tens of MB, Clang several hundred MB — verify on a real build) and an explicit budget is recorded (incl. whether the data disk must grow for the opt-in Clang artifact — see E.4). *(Measured 85a footprint table in the design doc: 5 ports ≈ 34 MB / ~3 % of 1 GB; umbrella projections recorded.)*
-- [x] The DESTDIR + relocation contract is documented: build at `prefix=/usr`, `make install DESTDIR=<stage>`; **strip executables and `.so`s before sealing**; Clang resource dir relative to the binary; Python `bin/`+`lib/pythonX.Y/` fixed relative layout. *(Design doc "DESTDIR + relocation contract"; notes the 85a ncurses-class binaries are not yet stripped — honest caveat.)*
+- [x] The DESTDIR + relocation contract is documented: build at `prefix=/usr`, `make install DESTDIR=<stage>`; **strip executables and `.so`s before sealing**; Clang resource dir relative to the binary; Python `bin/`+`lib/pythonX.Y/` fixed relative layout. *(Design doc "DESTDIR + relocation contract"; the 85a binaries ARE stripped before sealing via `seal_package` → `strip_stage` (Track F.2) — ELF executables/`.so`s stripped, `.a` archives and non-ELF files left intact.)*
 - [x] The **host-build** RAM/link-memory requirement (Clang links with many GB of RAM) is recorded with any CI-runner implication, distinct from the on-image disk budget. *(Recorded: 85a ports < 1 GB RAM; Clang+LLD LTO link ≈ 8–16 GB+ — the reason toolchains are built once and shipped as artifacts.)*
 
 ### E.2 — Hosting/distribution plan (network fetch deferred to Phase 86)

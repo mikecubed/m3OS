@@ -236,7 +236,8 @@ pub fn to_hex(bytes: &[u8]) -> String {
 /// - `tarball_sha`  — the upstream source tarball's SHA-256 (from the Portfile).
 /// - `toolchain_id` — the resolved musl toolchain identity string.
 /// - `build_flags`  — a recipe-identity string (e.g. the Portfile content +
-///   patches digest, composed by [`package_key_from_recipe`]).
+///   patches digest plus the port's configure flags, composed by xtask's
+///   `recipe_digest` / `package_key`).
 /// - `dep_keys`     — the package keys of direct build dependencies (sorted
 ///   internally so caller ordering is irrelevant).
 ///
@@ -367,15 +368,37 @@ pub fn parse(bytes: &[u8]) -> Result<Manifest, Error> {
     }
     let index = &bytes[index_start..data_start];
 
+    // Reject an `entry_count` that cannot possibly fit in the index region
+    // *before* reserving for it. A corrupt/hostile count (up to u32::MAX) must
+    // surface as a parse error, not an unbounded `Vec::with_capacity` — which
+    // `panic = "abort"` turns into an installer abort in the no_std `pkg`
+    // binary. The minimum bytes per index entry is fixed at 56 (path_len u32 +
+    // mode u32 + content_len u64 + content_hash 32 + data_offset u64), plus a
+    // zero-length path; so at most `index_len / 56` entries can be encoded.
+    const MIN_ENTRY_BYTES: usize = 4 + 4 + 8 + 32 + 8;
+    if entry_count > index.len() / MIN_ENTRY_BYTES {
+        return Err("entry_count exceeds index capacity");
+    }
+
     let mut entries = Vec::with_capacity(entry_count);
     let mut cur = 0usize;
     for _ in 0..entry_count {
         let path_len = read_u32(index, cur)? as usize;
         cur += 4;
         let path_bytes = index.get(cur..cur + path_len).ok_or("truncated path")?;
-        let path = core::str::from_utf8(path_bytes)
-            .map_err(|_| "path not utf-8")?
-            .into();
+        let path_str = core::str::from_utf8(path_bytes).map_err(|_| "path not utf-8")?;
+        // Path-traversal containment: every entry path MUST be relative and
+        // free of `..` components, so neither the host `unpack` nor the in-OS
+        // installer can be steered to write outside the install prefix by a
+        // malformed/hostile artifact. (The packer only ever emits prefix-
+        // relative `usr/...` paths, so no legitimate artifact is rejected.)
+        if path_str.is_empty()
+            || path_str.starts_with('/')
+            || path_str.split('/').any(|c| c == "..")
+        {
+            return Err("unsafe entry path (absolute or contains '..')");
+        }
+        let path = path_str.into();
         cur += path_len;
         let mode = read_u32(index, cur)?;
         cur += 4;
@@ -792,6 +815,39 @@ mod nostd_logic_tests {
             to_hex(&content_hash(&[b'x'; 56])),
             "04c26261370ee7541549d16dee320c723e3fd14671e66a099afe0a377c16888e"
         );
+    }
+
+    #[test]
+    fn parse_rejects_path_traversal_and_absolute_paths() {
+        // A hostile artifact whose entry path escapes the install prefix must
+        // be rejected at parse time (so unpack/install can never write OOB).
+        for evil in ["../etc/passwd", "/etc/passwd", "usr/../../etc/x", ".."] {
+            let bytes = serialize(&[OwnedEntry {
+                path: evil.into(),
+                mode: 0o100644,
+                content: b"x".to_vec(),
+            }]);
+            assert!(
+                parse(&bytes).is_err(),
+                "parse must reject unsafe path {evil:?}"
+            );
+            assert!(!verify(&bytes), "verify must reject unsafe path {evil:?}");
+        }
+    }
+
+    #[test]
+    fn parse_rejects_oversized_entry_count_without_huge_alloc() {
+        // Craft a valid one-entry artifact, then corrupt entry_count (bytes
+        // [71..75]) to u32::MAX. parse must Err on the capacity check rather
+        // than reserving a multi-GB Vec (which would abort the no_std installer).
+        let mut bytes = serialize(&[OwnedEntry {
+            path: "file".into(),
+            mode: 0o100644,
+            content: b"x".to_vec(),
+        }]);
+        bytes[71..75].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(parse(&bytes).is_err());
+        assert!(!verify(&bytes));
     }
 
     #[test]

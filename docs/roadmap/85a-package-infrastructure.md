@@ -73,7 +73,7 @@ A `no_std` userspace binary that opens a `.m3pkg`, verifies its hashes, and extr
 
 - Redox `pkgar` carries full ed25519 signing + a fixed 136-byte remote header for partial fetch; 85a's v1 may ship hash-only verification and add signing later.
 - Yocto/Nix recurse the dependency-hash graph to the full transitive closure; 85a keys on direct dependency artifact keys only.
-- Mature managers ship multiple repos, atomic transactions, and binary deltas. 85a (with the Track F follow-up) has a single-level dependency solver + `remove`/`upgrade` over one local repo — but installs/removes are per-file (not transactional/atomic) and updates are full-artifact (no binary deltas).
+- Mature managers ship multiple repos, atomic transactions, and binary deltas. 85a (with the Track F follow-up) has a dependency solver that resolves each package's direct `DEPS=` transitively (dependency-first topological order) + `remove`/`upgrade` over one local repo — but installs/removes are per-file (not transactional/atomic) and updates are full-artifact (no binary deltas).
 
 ## Deferred Until Later
 
@@ -89,12 +89,12 @@ A `no_std` userspace binary that opens a `.m3pkg`, verifies its hashes, and extr
 
 ### E.1 — Disk / RAM budget
 
-**On-image disk (measured on a real 85a build).** The 5 retrofitted ports add
+**On-image disk (measured on a real 85a build).** The six retrofitted ports add
 ~34 MB to the 1 GB ext2 data disk:
 
 | Component | Size |
 |---|---|
-| `/usr/pkg/*.m3pkg` (offline repo: ncurses 7.75 MB, tmux 1.75 MB, libevent 1.57 MB, htop 0.80 MB, less 0.75 MB) | ~13 MB |
+| `/usr/pkg/*.m3pkg` (offline repo: ncurses 7.75 MB, tmux 1.75 MB, libevent 1.57 MB, htop 0.80 MB, less 0.75 MB, zlib 0.25 MB) | ~13 MB |
 | Pre-installed tree under `/usr` (ncurses terminfo DB ≈ 12 MB dominates) | ~21 MB |
 | **85a total** | **~34 MB (~3 % of the 1 GB disk)** |
 
@@ -157,7 +157,7 @@ the Phase 86 signed networked repo.
 
 ### E.4 — Data-disk sizing finding
 
-**The existing 1 GB `DISK_SIZE` is sufficient for Phase 85a** (5-port retrofit
+**The existing 1 GB `DISK_SIZE` is sufficient for Phase 85a** (six-port retrofit
 ≈ 34 MB; ~3 % utilisation) and for the projected git + Python footprints, so
 **no resize is performed in 85a** — the default image stays 1 GB. The only
 component that would overflow 1 GB is the opt-in **Clang** artifact (several

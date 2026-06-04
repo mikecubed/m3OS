@@ -257,11 +257,10 @@ pub fn parent_components(abs_path: &str) -> Vec<String> {
 /// list) if it was present. Makes `pkg remove` idempotent and gives the caller
 /// the installed paths to unlink.
 pub fn db_remove(records: &mut Vec<PkgRecord>, name: &str) -> Option<PkgRecord> {
-    if let Some(idx) = records.iter().position(|r| r.name == name) {
-        Some(records.remove(idx))
-    } else {
-        None
-    }
+    records
+        .iter()
+        .position(|r| r.name == name)
+        .map(|idx| records.remove(idx))
 }
 
 // ---------------------------------------------------------------------------

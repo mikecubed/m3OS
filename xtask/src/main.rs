@@ -5291,6 +5291,63 @@ fn cmd_check() {
         std::process::exit(1);
     }
 
+    // Phase 85a — clippy the package-management crates with `-D warnings`.
+    //
+    // `pkg-format` is checked on the host target for BOTH feature surfaces:
+    // the default (`std`) host packer/unpacker, and `--no-default-features`
+    // for the `no_std` parse/verify surface the in-OS installer links. `pkg`
+    // is checked on the kernel's `x86_64-unknown-none` target with
+    // `--features os-binary` (so the `[[bin]]` `_start` path is linted, not
+    // just the host-testable `[lib]`), in its OWN invocation — mirroring the
+    // Wi-Fi block above so cargo feature unification cannot leak `pkg`'s
+    // `syscall-lib/alloc` onto the combined userspace clippy run.
+    for (pkg, extra) in [
+        ("pkg-format", &["--no-default-features"][..]),
+        ("pkg-format", &[][..]),
+    ] {
+        let mut a = vec![
+            "clippy",
+            "--package",
+            pkg,
+            "--target",
+            KERNEL_CORE_HOST_TARGET,
+        ];
+        a.extend_from_slice(extra);
+        a.extend(["--", "-D", "warnings"]);
+        let status = Command::new(env!("CARGO"))
+            .current_dir(&root)
+            .args(&a)
+            .status()
+            .expect("failed to run pkg-format clippy");
+        if !status.success() {
+            eprintln!("pkg-format clippy reported errors (features: {extra:?})");
+            std::process::exit(1);
+        }
+    }
+
+    let status = Command::new(env!("CARGO"))
+        .current_dir(&root)
+        .args([
+            "clippy",
+            "--package",
+            "pkg",
+            "--features",
+            "os-binary",
+            "--target",
+            "x86_64-unknown-none",
+            "-Zbuild-std=core,compiler_builtins,alloc",
+            "-Zbuild-std-features=compiler-builtins-mem",
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .status()
+        .expect("failed to run pkg clippy");
+    if !status.success() {
+        eprintln!("pkg clippy reported errors");
+        std::process::exit(1);
+    }
+
     // Host-side allocator/property coverage uses:
     //   cargo test -p kernel-core --target x86_64-unknown-linux-gnu
     // Password-shadow rewrite regression coverage uses:
@@ -13196,16 +13253,25 @@ fn termios_smoke_steps() -> Vec<SmokeStep> {
 /// Phase 85a Track C/D — `cargo xtask pkg-smoke`.
 ///
 /// Boots m3OS (serial autologin path), then drives the offline `pkg` installer
-/// against the bundled local repo that Track D staged into `/usr/pkg/`:
+/// against the bundled local repo that Track D staged into `/usr/pkg/`. The
+/// gate uses `libevent` (a dependency-free leaf whose payload is a single
+/// `/usr/local/lib/libevent.a`) so install/verify complete in seconds rather
+/// than waiting on ncurses' ~1833-entry terminfo write over the ring-3 VFS:
 ///   1. `pkg list` on a fresh boot → `(no packages installed)` (empty DB).
-///   2. `pkg install less` → reads `/usr/pkg/less.m3pkg`, verifies its SHA-256
-///      hashes, lays the files under `/usr`, records `/var/lib/pkg/db`.
-///   3. `pkg list` → shows `less`.
-///   4. `pkg verify less` → re-hashes the installed binary → `OK`.
+///   2. `pkg install libevent` → reads `/usr/pkg/libevent.m3pkg`, verifies its
+///      SHA-256 hashes, lays the files under `/usr`, records `/var/lib/pkg/db`.
+///   3. `pkg list` → shows `libevent`.
+///   4. `pkg verify libevent` → re-hashes `/usr/local/lib/libevent.a` → `OK`.
+///   5. `pkg upgrade libevent` → full re-install (0 orphans pruned).
+///   6. `pkg remove libevent` → unlinks its files + drops the DB block.
+///   7. `pkg verify libevent` → `not installed` (gone from the DB).
+///   8. `pkg install tmux` → the dependency solver engages and auto-installs
+///      tmux's `libevent` dependency first (asserts both the "resolving … +
+///      dependencies" line and `libevent: OK`).
 ///
-/// This is the boot-level proof for the C.1 acceptance ("`pkg install` installs
-/// a bundled `.m3pkg` into `/usr` inside m3OS and `pkg list` shows it; verified
-/// on a boot") and exercises the full D.1 staging round-trip (pack at build →
+/// This is the boot-level proof for the Track C/D/F acceptance (`pkg`
+/// install/list/verify/upgrade/remove + solver against bundled `.m3pkg`
+/// artifacts) and exercises the full D.1 staging round-trip (pack at build →
 /// bundle into the image → unpack/install in-OS).
 fn cmd_pkg_smoke(args: &SmokeBootArgs) {
     // Build the host ports so their `.m3pkg` artifacts exist for Track D to
@@ -16386,9 +16452,9 @@ fn populate_ports_tree(part_path: &Path, workspace_root: &Path, ports_src: &Path
 /// toolchain), it falls back to mirroring the raw stage tree so nothing
 /// regresses. The function is a no-op when neither artifacts nor stages exist.
 ///
-/// Note: zlib is built by the separate in-guest `target/ports-src` system
-/// (its Portfile carries a placeholder tarball SHA), so it is not part of this
-/// host-built `.m3pkg` set; its host retrofit is a tracked follow-up.
+/// zlib is a first-class host-built `.m3pkg` member of this set (Track F:
+/// `build_zlib`, verified Portfile SHA), bundled and pre-installed exactly like
+/// the other five ports.
 fn populate_phase_69d_ports(part_path: &Path, workspace_root: &Path) {
     const PORTS: &[&str] = &["zlib", "ncurses", "libevent", "less", "htop", "tmux"];
     let stage_root = workspace_root.join("target/port-stage");

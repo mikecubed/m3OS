@@ -184,10 +184,12 @@ fn port_fingerprint(port_dir: &Path) -> String {
 /// Compute a stable, portable recipe-identity digest for a port: the Portfile
 /// content plus every file under `patches/`. Unlike [`port_fingerprint`] this
 /// deliberately **excludes** the `port_build.rs` source bytes, so editing an
-/// unrelated port recipe does not invalidate this port's cached `.m3pkg`. A
-/// recipe whose configure flags live in the Rust `build_*` function should
-/// bump the optional Portfile `BUILD_FLAGS=` field (folded in via the Portfile
-/// content) to self-invalidate on a recipe change.
+/// *unrelated* port recipe does not invalidate this port's cached `.m3pkg`.
+///
+/// The configure flags that live in the Rust `build_*` function (not the
+/// Portfile) are folded into the key separately, via [`build_recipe_id`] in
+/// [`package_key`] — so a flag change there DOES self-invalidate this port's
+/// artifact without over-invalidating every other port.
 fn recipe_digest(port_dir: &Path) -> String {
     let mut hasher = Sha256::new();
     let portfile = port_dir.join("Portfile");
@@ -230,13 +232,65 @@ pub fn package_key(
         .get("SHA256")
         .cloned()
         .ok_or_else(|| format!("Portfile {} missing SHA256", port_dir.display()))?;
-    let build_flags = recipe_digest(port_dir);
+    // build_flags = recipe digest (Portfile + patches) PLUS the configure-flag
+    // identity from the Rust build_* function (which is not in the Portfile).
+    // Folding the latter in means changing a port's configure flags invalidates
+    // its cached .m3pkg — closing the stale-artifact gap that existed when only
+    // the Portfile was hashed. The port name is the Portfile's directory name.
+    let port_name = port_dir.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let build_flags = format!(
+        "{}|recipe={}",
+        recipe_digest(port_dir),
+        build_recipe_id(port_name)
+    );
     Ok(pkg_format::compute_package_key(
         &tarball_sha,
         toolchain_id,
         &build_flags,
         dep_keys,
     ))
+}
+
+/// A stable identity for a port's configure flags as defined in its Rust
+/// `build_*` function (the part of the recipe that does **not** live in the
+/// Portfile, so [`recipe_digest`] cannot see it). Folded into the content key
+/// by [`package_key`].
+///
+/// ⚠ **Contract:** when you change a port's `build_*` configure flags (or add a
+/// new host-built port), update its arm here so the change invalidates the
+/// cached `.m3pkg`. This is the real, wired replacement for the never-parsed
+/// `BUILD_FLAGS=` Portfile field referenced by earlier drafts. The strings need
+/// only be *stable + distinct per flag-set* — transcribing the actual configure
+/// args keeps them self-documenting. CFLAGS that embed build-host-absolute
+/// include paths are intentionally omitted (they vary by machine and would
+/// break the cache's cross-machine portability).
+fn build_recipe_id(name: &str) -> &'static str {
+    match name {
+        "zlib" => "configure:--static --prefix=/usr/local;cflags:-O2",
+        "ncurses" => {
+            "configure:--without-shared --with-normal --with-termlib --without-debug \
+             --without-ada --without-manpages --without-cxx-binding --without-tests \
+             --disable-stripping --enable-overwrite --prefix=/usr/local --datadir=/usr/share \
+             --host=x86_64-linux-musl;passes:narrow(--disable-widec),wide(--enable-widec);\
+             cflags:-O2 -fPIC"
+        }
+        "libevent" => {
+            "configure:--disable-shared --disable-openssl --disable-samples \
+             --disable-debug-mode --disable-libevent-regress --host=x86_64-linux-musl \
+             --prefix=/usr/local;cflags:-O2 -fPIC"
+        }
+        "less" => "configure:--with-regex=posix --host=x86_64-linux-musl --prefix=/usr/local",
+        "htop" => {
+            "configure:--disable-hwloc --enable-unicode --disable-affinity \
+             --disable-capabilities --disable-sensors --disable-static --enable-static-link \
+             --host=x86_64-linux-musl --prefix=/usr/local"
+        }
+        "tmux" => {
+            "configure:--enable-utempter=no --enable-systemd=no --disable-utf8proc \
+             --host=x86_64-linux-musl --prefix=/usr/local"
+        }
+        _ => "",
+    }
 }
 
 /// A stable identity string for the active musl toolchain, folded into the
@@ -1570,5 +1624,25 @@ mod tests {
         assert_eq!(port_deps("libevent"), &[] as &[&str]);
         // Unknown port returns empty.
         assert_eq!(port_deps("clang"), &[] as &[&str]);
+    }
+
+    // ── M5 — build_recipe_id (configure-flag identity folded into the key) ──
+
+    #[test]
+    fn build_recipe_id_is_distinct_and_nonempty_per_host_port() {
+        // Every host-built port must have a non-empty, distinct configure-flag
+        // identity so a flag change self-invalidates its cached .m3pkg and two
+        // ports never collide on the recipe component of the key.
+        let ports = ["zlib", "ncurses", "libevent", "less", "htop", "tmux"];
+        let ids: Vec<&str> = ports.iter().map(|p| build_recipe_id(p)).collect();
+        for (p, id) in ports.iter().zip(&ids) {
+            assert!(!id.is_empty(), "{p} must have a build_recipe_id");
+        }
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ids.len(), "build_recipe_ids must be distinct");
+        // Unknown ports yield the empty identity (no recipe contribution).
+        assert_eq!(build_recipe_id("clang"), "");
     }
 }

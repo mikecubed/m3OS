@@ -117,12 +117,18 @@ fn cmd_install(name: &str) -> i32 {
     let mut deps: BTreeMap<String, Vec<String>> = BTreeMap::new();
     collect_deps(name, &mut deps);
 
-    // Already-installed set (names) from the DB.
-    let installed: BTreeSet<String> = db_read()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|r| r.name)
-        .collect();
+    // Already-installed set (names) from the DB. A corrupt DB is fatal here
+    // (rather than treated as empty) so we never proceed to write files +
+    // overwrite a DB we could not read; DB-absent is `Ok(empty)`.
+    let installed: BTreeSet<String> = match db_read() {
+        Ok(recs) => recs.into_iter().map(|r| r.name).collect(),
+        Err(e) => {
+            eprint_str("pkg install: ");
+            eprint_str(e);
+            eprint_str("\n");
+            return 1;
+        }
+    };
 
     let order = match topo_install_order(name, &deps, &installed) {
         Ok(o) => o,
@@ -336,10 +342,12 @@ fn install_one(name: &str) -> i32 {
 fn cmd_list() -> i32 {
     let records = match db_read() {
         Ok(r) => r,
-        Err(_) => {
-            // No DB yet — nothing installed.
-            print_str("(no packages installed)\n");
-            return 0;
+        Err(e) => {
+            // DB-absent is `Ok(empty)`; a real `Err` is a corrupt/unreadable DB.
+            eprint_str("pkg list: ");
+            eprint_str(e);
+            eprint_str("\n");
+            return 1;
         }
     };
 
@@ -366,8 +374,10 @@ fn cmd_list() -> i32 {
 fn cmd_verify(name: &str) -> i32 {
     let records = match db_read() {
         Ok(r) => r,
-        Err(_) => {
-            eprint_str("pkg verify: DB not found (no packages installed)\n");
+        Err(e) => {
+            eprint_str("pkg verify: ");
+            eprint_str(e);
+            eprint_str("\n");
             return 1;
         }
     };
@@ -389,22 +399,37 @@ fn cmd_verify(name: &str) -> i32 {
         let mut file_path = f.path.as_bytes().to_vec();
         file_path.push(0);
 
-        match read_file_bytes(&file_path) {
-            Ok(data) => {
-                let actual_hex = to_hex(&content_hash(&data));
-                if actual_hex == f.hash_hex {
-                    print_str("OK      ");
-                    print_str(&f.path);
-                    print_str("\n");
-                    ok_count += 1;
-                } else {
-                    print_str("MISMATCH ");
-                    print_str(&f.path);
-                    print_str("\n");
-                    mismatch_count += 1;
-                }
+        // A symlink entry records SHA-256(link-target-bytes) — NOT the content
+        // of the file it points at (see `install_one`/`pkg_format::pack`).
+        // `readlink` returns the target for a symlink and `EINVAL` (<0) for a
+        // regular file, so probe it first: opening a symlink `O_RDONLY` would
+        // follow it and hash the wrong bytes, spuriously reporting MISMATCH for
+        // every link (e.g. all of ncurses' alias links).
+        let mut link_buf = [0u8; 1024];
+        let ln = syscall_lib::readlink(&file_path, &mut link_buf);
+        let actual_hex: Option<String> = if ln >= 0 {
+            Some(to_hex(&content_hash(&link_buf[..ln as usize])))
+        } else {
+            match read_file_bytes(&file_path) {
+                Ok(data) => Some(to_hex(&content_hash(&data))),
+                Err(_) => None,
             }
-            Err(_) => {
+        };
+
+        match actual_hex {
+            Some(hex) if hex == f.hash_hex => {
+                print_str("OK      ");
+                print_str(&f.path);
+                print_str("\n");
+                ok_count += 1;
+            }
+            Some(_) => {
+                print_str("MISMATCH ");
+                print_str(&f.path);
+                print_str("\n");
+                mismatch_count += 1;
+            }
+            None => {
                 print_str("MISSING  ");
                 print_str(&f.path);
                 print_str("\n");
@@ -429,8 +454,12 @@ fn cmd_verify(name: &str) -> i32 {
 fn cmd_remove(name: &str) -> i32 {
     let mut records = match db_read() {
         Ok(r) => r,
-        Err(_) => {
-            eprint_str("pkg remove: DB not found (nothing installed)\n");
+        Err(e) => {
+            // DB-absent is `Ok(empty)` (→ "not installed" below); a real `Err`
+            // is a corrupt/unreadable DB — surface it rather than wiping.
+            eprint_str("pkg remove: ");
+            eprint_str(e);
+            eprint_str("\n");
             return 1;
         }
     };
@@ -474,7 +503,16 @@ fn cmd_remove(name: &str) -> i32 {
 // ---------------------------------------------------------------------------
 
 fn cmd_upgrade(name: &str) -> i32 {
-    let records = db_read().unwrap_or_default();
+    // A corrupt DB is fatal (don't treat it as empty); DB-absent is `Ok(empty)`.
+    let records = match db_read() {
+        Ok(r) => r,
+        Err(e) => {
+            eprint_str("pkg upgrade: ");
+            eprint_str(e);
+            eprint_str("\n");
+            return 1;
+        }
+    };
     let old = match records.iter().find(|r| r.name == name).cloned() {
         Some(r) => r,
         None => {
@@ -486,7 +524,8 @@ fn cmd_upgrade(name: &str) -> i32 {
         }
     };
 
-    // Compute the NEW package's file set from /usr/pkg/<name>.m3pkg.
+    // Validate the NEW artifact and compute its file set up front, so a corrupt
+    // replacement package aborts the upgrade before anything is touched.
     let pkg_path = build_path(b"/usr/pkg/", name.as_bytes(), b".m3pkg\0");
     let bytes = match read_file_bytes(&pkg_path) {
         Ok(b) => b,
@@ -519,21 +558,10 @@ fn cmd_upgrade(name: &str) -> i32 {
         new_paths.insert(install_path(&e.path));
     }
 
-    // Prune files the old version owned but the new one does not (orphans).
-    let mut pruned = 0u32;
-    for f in &old.files {
-        if !new_paths.contains(&f.path) {
-            let mut p = f.path.as_bytes().to_vec();
-            p.push(0);
-            if syscall_lib::unlink(&p) >= 0 {
-                pruned += 1;
-            }
-        }
-    }
-
-    // Reinstall the target (forced) plus any newly-introduced dependencies:
-    // build the dep graph, treat `name` as NOT installed so it is reinstalled,
-    // and let the solver pull in any missing deps.
+    // Reinstall the target (forced) plus any newly-introduced dependencies
+    // FIRST: build the dep graph, treat `name` as NOT installed so it is
+    // reinstalled, and let the solver pull in any missing deps. `install_one`
+    // upserts the new DB record.
     let mut deps: BTreeMap<String, Vec<String>> = BTreeMap::new();
     collect_deps(name, &mut deps);
     let mut installed: BTreeSet<String> = records.iter().map(|r| r.name.clone()).collect();
@@ -554,6 +582,22 @@ fn cmd_upgrade(name: &str) -> i32 {
         }
     }
 
+    // Only AFTER a successful reinstall + DB upsert do we prune files the old
+    // version owned but the new one does not. Doing this last means a
+    // mid-reinstall failure never leaves files deleted on disk while the DB
+    // still lists them (the reorder that fixes that state-corruption window;
+    // full atomic rollback remains a Phase 86 concern).
+    let mut pruned = 0u32;
+    for f in &old.files {
+        if !new_paths.contains(&f.path) {
+            let mut p = f.path.as_bytes().to_vec();
+            p.push(0);
+            if syscall_lib::unlink(&p) >= 0 {
+                pruned += 1;
+            }
+        }
+    }
+
     print_str("pkg upgrade: ");
     print_str(name);
     print_str(": OK (pruned ");
@@ -569,11 +613,42 @@ fn cmd_upgrade(name: &str) -> i32 {
 /// Path to the DB file.
 const DB_PATH: &[u8] = b"/var/lib/pkg/db\0";
 
-/// Read and parse the installed-file DB.  Returns `Err` if the file does not
-/// exist or cannot be parsed.
+/// Read and parse the installed-file DB.
+///
+/// Distinguishes **DB-absent** from **DB-corrupt**, which matters because a
+/// mutating caller (`install`/`upgrade`/`db_update`) rewrites the file with
+/// `O_TRUNC`: collapsing both cases to an empty record set (the old
+/// `unwrap_or_default()`) would silently wipe every other package's record the
+/// first time the DB failed to parse. So:
+///   - the DB file not existing (`ENOENT`) returns `Ok(empty)` — the correct,
+///     non-destructive interpretation of "nothing installed yet";
+///   - any other open/read failure, a non-UTF-8 body, or a parse error returns
+///     `Err`, so the caller refuses to overwrite a DB it could not read.
 fn db_read() -> Result<Vec<PkgRecord>, &'static str> {
-    let data = read_file_bytes(DB_PATH).map_err(|_| "cannot read DB")?;
-    let text = core::str::from_utf8(&data).map_err(|_| "DB is not UTF-8")?;
+    const ENOENT: isize = -2;
+    let fd = syscall_lib::open(DB_PATH, syscall_lib::O_RDONLY, 0);
+    if (fd as i64) < 0 {
+        if (fd as isize) == ENOENT {
+            return Ok(Vec::new());
+        }
+        return Err("cannot open DB");
+    }
+    let fd = fd as i32;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = syscall_lib::read(fd, &mut chunk);
+        if n < 0 {
+            let _ = syscall_lib::close(fd);
+            return Err("DB read error");
+        }
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n as usize]);
+    }
+    let _ = syscall_lib::close(fd);
+    let text = core::str::from_utf8(&buf).map_err(|_| "DB is not UTF-8")?;
     db_parse(text).map_err(|_| "DB parse error")
 }
 
@@ -597,7 +672,11 @@ fn db_write(records: &[PkgRecord]) -> Result<(), &'static str> {
 
 /// Upsert a `PkgRecord` into the DB on disk.
 fn db_update(rec: PkgRecord) -> Result<(), &'static str> {
-    let mut records = db_read().unwrap_or_default();
+    // Never fall back to an empty DB on a read failure (that would discard
+    // every other package's record on the next `O_TRUNC` write). `db_read`
+    // already maps DB-absent to `Ok(empty)`, so a real `Err` here is a corrupt
+    // DB and must abort the update.
+    let mut records = db_read()?;
     db_upsert(&mut records, rec);
     db_write(&records)
 }
