@@ -447,24 +447,11 @@ pub fn spec_ctrl_features() -> &'static SpecCtrlFeatures {
         .expect("spec_ctrl_features() called before probe_spec_ctrl()")
 }
 
-/// Write `IA32_SPEC_CTRL = SPEC_CTRL_BASE | extra` on the **current** core,
-/// folding `extra` into the cached base. Caller MUST have gated on
-/// `features.ibrs_ibpb` — the MSR `#GP`s on a CPU without it.
+/// Write the cached always-on base value (eIBRS) on the **current** core. Used
+/// to enable eIBRS once per core at boot.
 ///
 /// # Safety
 /// `IA32_SPEC_CTRL` (0x48) must be present (`ibrs_ibpb`); ring 0 only.
-unsafe fn write_spec_ctrl_or(extra: u64) {
-    let combined = SPEC_CTRL_BASE.fetch_or(extra, Ordering::AcqRel) | extra;
-    unsafe {
-        Msr::new(MSR_IA32_SPEC_CTRL).write(combined);
-    }
-}
-
-/// Write the bare base value (no extra) on the **current** core. Used to enable
-/// eIBRS once per core, and to clear a per-task STIBP that a prior task set.
-///
-/// # Safety
-/// Same as [`write_spec_ctrl_or`].
 unsafe fn write_spec_ctrl_base() {
     let base = SPEC_CTRL_BASE.load(Ordering::Acquire);
     unsafe {
@@ -517,21 +504,29 @@ pub unsafe fn issue_ibpb() {
 }
 
 /// Set or clear `SPEC_CTRL.STIBP` (bit 1) on the **current** core for the task
-/// about to run, composing with the cached base (so eIBRS is preserved).
-/// Caller MUST gate on `features.stibp` and the global off-switch. (C.4)
+/// about to run, composing it on top of the cached always-on base (so eIBRS is
+/// preserved). Caller MUST gate on `features.stibp` and the global off-switch.
+/// (C.4)
+///
+/// STIBP is a **per-core / per-task** control, so this composes the value into
+/// *this core's* MSR only and never writes the per-task bit back into the shared
+/// [`SPEC_CTRL_BASE`] (which holds always-on bits only). Storing STIBP in the
+/// process-global base would let a dispatch on one core perturb the bit another
+/// core composes for its own running task — the MSR write here is the single
+/// source of truth for the current core's STIBP state.
 ///
 /// # Safety
 /// `IA32_SPEC_CTRL` (0x48) must be present; ring 0 only.
 pub unsafe fn set_stibp(on: bool) {
+    // Read the always-on base (eIBRS); never mutate it for a per-task bit.
+    let base = SPEC_CTRL_BASE.load(Ordering::Acquire);
+    let value = if on {
+        base | SPEC_CTRL_STIBP
+    } else {
+        base & !SPEC_CTRL_STIBP
+    };
     unsafe {
-        if on {
-            write_spec_ctrl_or(SPEC_CTRL_STIBP);
-        } else {
-            // Clear STIBP from the *effective* value without disturbing the
-            // always-on base bits: clear it in the base copy first.
-            SPEC_CTRL_BASE.fetch_and(!SPEC_CTRL_STIBP, Ordering::AcqRel);
-            write_spec_ctrl_base();
-        }
+        Msr::new(MSR_IA32_SPEC_CTRL).write(value);
     }
 }
 

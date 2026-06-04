@@ -136,7 +136,7 @@ This must return zero lines. The check covers indirect JMPs (tail calls, trait d
 
 ### Compile-Time Unconditional
 
-Retpoline is baked into the compiled binary. It is not a runtime toggle — the `mitigations=` boot flag cannot disable it. `m3ctl mitigations status` reports it as `compiled-in (cannot disable at boot)`.
+Retpoline is baked into the compiled binary. It is not a runtime toggle — the `mitigations=` build-time policy cannot disable it (and m3OS has no boot command line). `m3ctl mitigations status` reports it as `compiled-in (cannot disable at boot)`.
 
 ### Retpoline Is Not Complete Spectre-v2 Coverage
 
@@ -187,11 +187,11 @@ eIBRS covers **same-thread** cross-privilege BTI. It does not protect SMT siblin
 
 ### The `spec_ctrl_base` Convention
 
-The kernel never blindly overwrites `IA32_SPEC_CTRL`. It maintains a cached `spec_ctrl_base` value that tracks the current base setting (IBRS + any per-process STIBP). Every write OR-s in the requested bits over the base, so no write silently clears STIBP while setting IBRS, or vice versa.
+The kernel never blindly overwrites `IA32_SPEC_CTRL`. It maintains a cached `spec_ctrl_base` value holding the **always-on** bits (eIBRS, set once per core at boot). Per-process STIBP is a per-core/per-task control, so it is composed *on top of* the base at the dispatch site (`IA32_SPEC_CTRL = spec_ctrl_base | STIBP`) and written to that core's MSR only — it is never stored back into the shared base. Keeping the per-task bit out of the process-global base means a dispatch on one core cannot perturb the STIBP another core has composed for its own running task; the boot-time eIBRS write OR-s into the base so it never silently clears IBRS.
 
-## The `mitigations=` Boot Policy
+## The `mitigations=` Policy
 
-m3OS exposes a `mitigations=` boot command-line flag with three levels:
+m3OS selects the `mitigations=` policy at **build time** — it has no kernel boot command line, so the level comes from the `M3OS_MITIGATIONS` environment variable (default `auto`), baked into the kernel via `option_env!`. The three levels:
 
 | Level | KPTI | IBRS/IBPB | Notes |
 |---|---|---|---|

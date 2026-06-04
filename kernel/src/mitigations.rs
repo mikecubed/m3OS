@@ -104,9 +104,14 @@ pub fn init_bsp() -> &'static MitigationState {
 
         // Track A.4 — KPTI GLOBAL-bit guard. m3OS marks no kernel PTE GLOBAL, so
         // this must be 0; a nonzero count means a future CR4.PGE optimization
-        // introduced global kernel PTEs that would survive a KPTI CR3 switch.
+        // introduced global kernel PTEs that would survive a KPTI CR3 switch and
+        // silently defeat the isolation. This is a security invariant, so it is a
+        // hard `assert_eq!` that fires in release builds too (a `debug_assert!`
+        // is compiled out of the `--release` kernel and would never catch the
+        // regression on a shipping image). The count is 0 today, so the assert
+        // is inert until such a regression is introduced.
         let global_kernel_ptes = crate::mm::count_global_kernel_leaf_ptes();
-        debug_assert_eq!(
+        assert_eq!(
             global_kernel_ptes, 0,
             "Track A.4: {global_kernel_ptes} GLOBAL kernel leaf PTE(s) would survive a KPTI CR3 switch"
         );

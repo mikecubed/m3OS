@@ -95,7 +95,9 @@ pub fn classify_ibrs(features: &SpecCtrlFeatures) -> IbrsMode {
 
 // ── D.1: mitigations= parser, vuln map, status vocabulary ───────────────────
 
-/// Kernel command-line `mitigations=` level.
+/// `mitigations=` policy level. In m3OS this is selected at **build time** via
+/// the `M3OS_MITIGATIONS` environment variable (there is no kernel boot command
+/// line); this pure-logic crate only parses/classifies the value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MitigationLevel {
     /// `mitigations=off` — all mitigations disabled.
@@ -107,7 +109,8 @@ pub enum MitigationLevel {
     Full,
 }
 
-/// Parse the `mitigations=` command-line value.
+/// Parse a `mitigations=` policy value (the build-time `M3OS_MITIGATIONS`
+/// string in m3OS — see [`MitigationLevel`]).
 ///
 /// Accepts exactly `"off"`, `"auto"`, or `"full"` (lowercase, no trim).
 /// Any other value returns `Auto` — see `mitigations_recognized` for a

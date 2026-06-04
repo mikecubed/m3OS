@@ -22,29 +22,53 @@ This command reads the boot-populated `MitigationState` snapshot and prints a pe
 Example output **at the current implementation stage** (Meltdown-susceptible silicon, `mitigations=auto`) — KPTI activation pending, so Meltdown is reported honestly as `Vulnerable`:
 
 ```
-Meltdown:       Vulnerable          # KPTI designed + scaffolded; activation is a bare-metal follow-up
-Spectre v2:     Mitigation: Retpoline, IBPB
-MDS:            UNADDRESSED
-L1TF:           UNADDRESSED
-Spectre v4/SSB: UNADDRESSED
-Retbleed:       UNADDRESSED
-Downfall/GDS:   UNADDRESSED
-Retpoline:      compiled-in (cannot disable at boot)
+mitigations: level=auto
+  Meltdown: Vulnerable
+  Spectre-v1: UNADDRESSED
+  Spectre-v2: Mitigation: Retpoline, IBPB
+  MDS: UNADDRESSED
+  L1TF: UNADDRESSED
+  SSB (Spectre-v4): UNADDRESSED
+  Retbleed: UNADDRESSED
+  Downfall/GDS: UNADDRESSED
+  Spectre-v2 (retpoline): compiled-in (cannot disable at boot)
+note: UNADDRESSED — MDS, L1TF, SSB, Retbleed, Downfall/GDS are not mitigated.
+note: ring-3 driver isolation does not by itself mitigate Spectre between userspace components (Grimsdal et al., NordSec 2019); m3OS makes no claim of freedom from microarchitectural timing channels (seL4 verification-scope framing).
 ```
 
-Once KPTI activation lands and `mitigations=full` (or `auto` on susceptible silicon) is in effect, the Meltdown line becomes `Mitigation: PTI`. On Meltdown-immune silicon (`RDCL_NO` set) the Meltdown line is already `Not affected` regardless of KPTI activation:
+`Meltdown: Vulnerable` because KPTI is designed + scaffolded but its activation is a bare-metal follow-up — the reporter never prints a false `Mitigation: PTI` while KPTI is not enforcing. Note that retpoline is reported on its own `Spectre-v2 (retpoline): compiled-in` line, distinct from the runtime-gated `Spectre-v2:` (IBRS/IBPB) line.
+
+Once KPTI activation lands and `mitigations=full` (or `auto` on susceptible silicon) is in effect, the `Meltdown` line becomes `Mitigation: PTI`. On Meltdown-immune silicon (`RDCL_NO` set) the `Meltdown` line is already `Not affected` regardless of KPTI activation:
 
 ```
-Meltdown:       Not affected
-Spectre v2:     Mitigation: Retpoline, IBPB
-...
+mitigations: level=auto
+  Meltdown: Not affected
+  Spectre-v1: UNADDRESSED
+  Spectre-v2: Mitigation: Retpoline, IBPB
+  MDS: UNADDRESSED
+  L1TF: UNADDRESSED
+  SSB (Spectre-v4): UNADDRESSED
+  Retbleed: UNADDRESSED
+  Downfall/GDS: UNADDRESSED
+  Spectre-v2 (retpoline): compiled-in (cannot disable at boot)
+note: UNADDRESSED — MDS, L1TF, SSB, Retbleed, Downfall/GDS are not mitigated.
+note: ring-3 driver isolation does not by itself mitigate Spectre between userspace components (Grimsdal et al., NordSec 2019); m3OS makes no claim of freedom from microarchitectural timing channels (seL4 verification-scope framing).
 ```
+
+(The two `note:` lines are always printed — the formatter appends them unconditionally after the retpoline line.)
 
 ---
 
-## Boot-Time Configuration
+## Configuration (Build-Time Policy)
 
-The `mitigations=` kernel command-line flag (default `auto`) selects the policy:
+m3OS has no kernel boot command line (`bootloader_api::BootInfo` carries none), so the `mitigations=` policy is selected at **build time**, not at boot. The level comes from the `M3OS_MITIGATIONS` environment variable (default `auto`), baked into the kernel via `option_env!`; `kernel/build.rs` re-runs the build when the value changes:
+
+```
+M3OS_MITIGATIONS=full cargo xtask run     # build + boot with mitigations=full
+M3OS_MITIGATIONS=off  cargo xtask run     # build + boot with mitigations=off
+```
+
+The selected level (default `auto`) maps to the policy:
 
 | Value | Effect |
 |---|---|
