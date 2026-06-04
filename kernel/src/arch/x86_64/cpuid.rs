@@ -386,6 +386,9 @@ const SPEC_CTRL_STIBP: u64 = 1 << 1;
 const PRED_CMD_IBPB: u64 = 1 << 0;
 
 static SPEC_CTRL_FEATURES: Once<SpecCtrlFeatures> = Once::new();
+/// The (guarded) raw `(CPUID.07H.0:EDX, IA32_ARCH_CAPABILITIES)` behind
+/// [`probe_spec_ctrl`]. Cached so the D.3 report wire can carry them verbatim.
+static SPEC_CTRL_RAW: Once<(u32, u64)> = Once::new();
 
 /// Cached `IA32_SPEC_CTRL` value (mirrors Linux `x86_spec_ctrl_base`). The MSR
 /// is write-mostly, so we never re-`rdmsr` it as an "is it active?" signal:
@@ -404,6 +407,23 @@ static SPEC_CTRL_BASE: AtomicU64 = AtomicU64::new(0);
 /// [`kernel_core::spectre::SpecCtrlFeatures::from_cpuid_guarded`].
 pub fn probe_spec_ctrl() -> &'static SpecCtrlFeatures {
     SPEC_CTRL_FEATURES.call_once(|| {
+        let (leaf7_edx, arch_caps) = spec_ctrl_raw_regs();
+        // `spec_ctrl_raw_regs` already applied the max-basic-leaf guard
+        // (leaf7_edx == 0 when CPUID.0:EAX < 7), so `from_cpuid` here is
+        // equivalent to `from_cpuid_guarded` (host-tested in kernel_core).
+        SpecCtrlFeatures::from_cpuid(leaf7_edx, arch_caps)
+    })
+}
+
+/// The cached **guarded** raw `(CPUID.07H.0:EDX, IA32_ARCH_CAPABILITIES)` pair.
+///
+/// `leaf7_edx` is `0` when the max basic leaf (`CPUID.0:EAX`) is `< 7` (the
+/// trap [`probe_smep_smap`] defends); `arch_caps` is `0` unless `EDX[29]` is set
+/// — an unguarded `rdmsr` of `0x10A` `#GP`s on a CPU lacking it. Idempotent;
+/// the D.3 reporter ships these verbatim so a reader reconstructs the identical
+/// [`SpecCtrlFeatures`] via the same host-tested decode.
+pub fn spec_ctrl_raw_regs() -> (u32, u64) {
+    *SPEC_CTRL_RAW.call_once(|| {
         let max_leaf = cpuid_raw(0, 0).eax;
         let leaf7_edx = if max_leaf >= 0x07 {
             cpuid_raw(0x07, 0).edx
@@ -416,7 +436,7 @@ pub fn probe_spec_ctrl() -> &'static SpecCtrlFeatures {
         } else {
             0
         };
-        SpecCtrlFeatures::from_cpuid_guarded(max_leaf, leaf7_edx, arch_caps)
+        (leaf7_edx, arch_caps)
     })
 }
 

@@ -218,6 +218,133 @@ pub fn build_vuln_map(
     ]
 }
 
+/// Honest per-vulnerability map for the runtime reporter (D.3).
+///
+/// Starts from the policy model [`build_vuln_map`] (keyed on `level`), then
+/// **overrides Meltdown with the actual KPTI state** (`kpti_active`): a `Full`
+/// level on a boot where KPTI is not enforcing reports `Vulnerable`, not a false
+/// `Mitigated("PTI")` — a half-built KPTI can never read as mitigated. Shared by
+/// the kernel snapshot and the `m3ctl` formatter so the honesty rule lives in
+/// exactly one host-tested place.
+pub fn report_map(
+    features: &SpecCtrlFeatures,
+    level: MitigationLevel,
+    kpti_active: bool,
+) -> [(Vuln, Status); VULNS] {
+    let mut map = build_vuln_map(features, level);
+    for entry in map.iter_mut() {
+        if entry.0 == Vuln::Meltdown {
+            entry.1 = if features.rdcl_no {
+                Status::NotAffected
+            } else if kpti_active {
+                Status::Mitigated("PTI")
+            } else {
+                Status::Vulnerable
+            };
+        }
+    }
+    map
+}
+
+// ── D.3 / C.4: syscall numbers + report wire format ─────────────────────────
+//
+// m3OS-native syscall numbers in the custom `0x1000–0x1FFF` range. The
+// device-host family occupies `0x112x`; the mitigations family takes `0x114x`.
+// Declared here (single source of truth, like `device_host::syscalls`) so the
+// kernel dispatcher and the `m3ctl` userspace wrapper share the same constants.
+
+/// `m3ctl mitigations status` — copy the boot [`MitigationReport`] wire bytes
+/// into a user buffer. `sys_mitigations_status(buf_ptr, buf_len) -> isize`
+/// (bytes written, or a negative errno).
+pub const SYS_MITIGATIONS_STATUS: u64 = 0x1140;
+
+/// Per-process STIBP opt-in (C.4) — m3OS-native (m3OS has no Linux `prctl`).
+/// `sys_set_spec_ctrl(enable_stibp) -> isize` (0 on success, negative errno).
+pub const SYS_SET_SPEC_CTRL: u64 = 0x1141;
+
+/// Fixed wire length of an encoded [`MitigationReport`].
+pub const MITIGATION_REPORT_WIRE_LEN: usize = 16;
+
+/// The boot mitigation snapshot in a compact, fixed-layout, host-testable wire
+/// form. The kernel encodes its boot snapshot; `m3ctl` decodes and formats. The
+/// CPU feature surface travels as the raw `leaf7_edx` + `arch_caps` so the
+/// reader reconstructs [`SpecCtrlFeatures`] via the same decode (DRY).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MitigationReport {
+    pub level: MitigationLevel,
+    pub level_recognized: bool,
+    pub kpti_active: bool,
+    pub ibpb_active: bool,
+    pub ibrs_mode: IbrsMode,
+    pub leaf7_edx: u32,
+    pub arch_caps: u64,
+}
+
+impl MitigationReport {
+    /// Reconstruct the decoded feature surface from the carried raw registers.
+    pub fn features(&self) -> SpecCtrlFeatures {
+        SpecCtrlFeatures::from_cpuid(self.leaf7_edx, self.arch_caps)
+    }
+
+    /// The honest per-vulnerability map (see [`report_map`]).
+    pub fn vuln_map(&self) -> [(Vuln, Status); VULNS] {
+        report_map(&self.features(), self.level, self.kpti_active)
+    }
+
+    /// Encode to the fixed `MITIGATION_REPORT_WIRE_LEN` byte layout (LE).
+    pub fn encode(&self) -> [u8; MITIGATION_REPORT_WIRE_LEN] {
+        let mut b = [0u8; MITIGATION_REPORT_WIRE_LEN];
+        b[0] = match self.level {
+            MitigationLevel::Off => 0,
+            MitigationLevel::Auto => 1,
+            MitigationLevel::Full => 2,
+        };
+        b[1] = (self.level_recognized as u8)
+            | ((self.kpti_active as u8) << 1)
+            | ((self.ibpb_active as u8) << 2);
+        b[2] = match self.ibrs_mode {
+            IbrsMode::None => 0,
+            IbrsMode::Legacy => 1,
+            IbrsMode::Enhanced => 2,
+        };
+        b[3] = 1; // wire version
+        b[4..8].copy_from_slice(&self.leaf7_edx.to_le_bytes());
+        b[8..16].copy_from_slice(&self.arch_caps.to_le_bytes());
+        b
+    }
+
+    /// Decode from the wire layout. Returns `None` on short or malformed input.
+    pub fn decode(buf: &[u8]) -> Option<Self> {
+        if buf.len() < MITIGATION_REPORT_WIRE_LEN {
+            return None;
+        }
+        let level = match buf[0] {
+            0 => MitigationLevel::Off,
+            1 => MitigationLevel::Auto,
+            2 => MitigationLevel::Full,
+            _ => return None,
+        };
+        let flags = buf[1];
+        let ibrs_mode = match buf[2] {
+            0 => IbrsMode::None,
+            1 => IbrsMode::Legacy,
+            2 => IbrsMode::Enhanced,
+            _ => return None,
+        };
+        let leaf7_edx = u32::from_le_bytes(buf[4..8].try_into().ok()?);
+        let arch_caps = u64::from_le_bytes(buf[8..16].try_into().ok()?);
+        Some(Self {
+            level,
+            level_recognized: flags & 0b001 != 0,
+            kpti_active: flags & 0b010 != 0,
+            ibpb_active: flags & 0b100 != 0,
+            ibrs_mode,
+            leaf7_edx,
+            arch_caps,
+        })
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -401,5 +528,93 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── D.3 / C.4 tests ──────────────────────────────────────────────────────
+
+    /// `report_map` overrides Meltdown with the ACTUAL kpti state so a
+    /// half-built KPTI cannot read as `Mitigated`.
+    #[test]
+    fn report_map_meltdown_tracks_actual_kpti() {
+        let plain = SpecCtrlFeatures::from_cpuid(0, 0);
+        let meltdown =
+            |m: &[(Vuln, Status); VULNS]| m.iter().find(|(v, _)| *v == Vuln::Meltdown).unwrap().1;
+
+        // Full level but KPTI NOT enforcing → Vulnerable (not a false PTI claim).
+        let m = report_map(&plain, MitigationLevel::Full, false);
+        assert_eq!(meltdown(&m), Status::Vulnerable);
+
+        // Full level and KPTI enforcing → Mitigated("PTI").
+        let m = report_map(&plain, MitigationLevel::Full, true);
+        assert_eq!(meltdown(&m), Status::Mitigated("PTI"));
+
+        // RDCL_NO silicon → NotAffected regardless of kpti_active / level.
+        let immune = SpecCtrlFeatures::from_cpuid(1 << 29, 0b01);
+        assert!(immune.rdcl_no);
+        assert_eq!(
+            meltdown(&report_map(&immune, MitigationLevel::Full, false)),
+            Status::NotAffected
+        );
+        assert_eq!(
+            meltdown(&report_map(&immune, MitigationLevel::Auto, false)),
+            Status::NotAffected
+        );
+
+        // Off → Vulnerable (no rdcl_no).
+        assert_eq!(
+            meltdown(&report_map(&plain, MitigationLevel::Off, false)),
+            Status::Vulnerable
+        );
+
+        // Unaddressed classes are still always Unaddressed through report_map.
+        let m = report_map(&plain, MitigationLevel::Full, true);
+        for v in [
+            Vuln::Mds,
+            Vuln::L1tf,
+            Vuln::Ssb,
+            Vuln::Retbleed,
+            Vuln::Downfall,
+        ] {
+            assert_eq!(
+                m.iter().find(|(x, _)| *x == v).unwrap().1,
+                Status::Unaddressed
+            );
+        }
+    }
+
+    /// `MitigationReport` survives an encode→decode round-trip across all
+    /// levels / IBRS modes, and reconstructs the feature surface.
+    #[test]
+    fn mitigation_report_wire_round_trip() {
+        for level in [
+            MitigationLevel::Off,
+            MitigationLevel::Auto,
+            MitigationLevel::Full,
+        ] {
+            for ibrs_mode in [IbrsMode::None, IbrsMode::Legacy, IbrsMode::Enhanced] {
+                let r = MitigationReport {
+                    level,
+                    level_recognized: matches!(level, MitigationLevel::Full),
+                    kpti_active: matches!(ibrs_mode, IbrsMode::Enhanced),
+                    ibpb_active: !matches!(level, MitigationLevel::Off),
+                    ibrs_mode,
+                    leaf7_edx: (1 << 26) | (1 << 29),
+                    arch_caps: 0b11,
+                };
+                let bytes = r.encode();
+                assert_eq!(bytes.len(), MITIGATION_REPORT_WIRE_LEN);
+                let back = MitigationReport::decode(&bytes).expect("decode");
+                assert_eq!(back, r);
+                // features() reconstructs from the carried raw registers.
+                let f = back.features();
+                assert!(f.ibrs_ibpb && f.arch_caps_present && f.rdcl_no && f.eibrs);
+            }
+        }
+        // Short buffer → None.
+        assert!(MitigationReport::decode(&[0u8; 4]).is_none());
+        // Bad level tag → None.
+        let mut bad = [0u8; MITIGATION_REPORT_WIRE_LEN];
+        bad[0] = 9;
+        assert!(MitigationReport::decode(&bad).is_none());
     }
 }

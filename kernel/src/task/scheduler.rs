@@ -5210,6 +5210,17 @@ pub fn run() -> ! {
                     // (`ibrs_ibpb`) and the off-switch is not engaged.
                     unsafe { crate::arch::x86_64::cpuid::issue_ibpb() };
                 }
+
+                // Phase 84 C.4 — apply this task's per-process STIBP opt-in.
+                // Gated on STIBP-capable silicon + off-switch (no-op on the
+                // QEMU test lanes), so the opt-in registry lock is only ever
+                // touched here on hardware that actually has STIBP.
+                if pid != 0 && crate::mitigations::stibp_available() {
+                    let want = crate::mitigations::stibp_opt_in(pid);
+                    // SAFETY: `stibp_available()` implies the CPU advertised
+                    // STIBP and SPEC_CTRL is present.
+                    unsafe { crate::arch::x86_64::cpuid::set_stibp(want) };
+                }
             }
         }
 

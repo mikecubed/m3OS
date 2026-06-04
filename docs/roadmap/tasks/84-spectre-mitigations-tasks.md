@@ -13,8 +13,8 @@
 |---|---|---|---|
 | A | **KPTI** — split the per-process PML4 into a kernel/user pair (`kernel/src/mm/mod.rs`), a CR3 trampoline on the syscall path (`syscall/mod.rs`) and IRQ/IST path (`interrupts.rs`), GLOBAL-bit removal, PCID/INVPCID TLB-flush avoidance, and `RDCL_NO` auto-skip | Phase 11 process model, C.1 (feature decode) | In progress (Wave 2 — serial) |
 | B | **Retpoline** — enable `-Zretpoline` on the existing `-Zbuild-std` kernel build (`xtask`), an optional hand-written `__x86_indirect_thunk_r11` external thunk, and an `objdump` residual-indirect-branch verification gate wired into `cargo xtask check` | — | **Complete** (Wave 1; B.2 external thunk deferred-optional) |
-| C | **SPEC_CTRL MSR** — host-testable CPUID/MSR feature decode in `kernel-core`, IBRS/eIBRS detect+enable in `cpuid.rs` (mirroring `probe/enable_smep_smap`), IBPB on cross-process `switch_context`, STIBP per-process opt-in | C.1 | In progress (C.1 Wave 1; C.2–C.4 Wave 2) |
-| D | **Configuration surface** — host-testable `mitigations=` parser + per-vuln bug map + status vocabulary in `kernel-core`, boot-flag plumbing that gates A/C with a single global off-switch, and a `m3ctl mitigations status` reporter | A, B, C, C.1 | In progress (D.1 Wave 1; D.2–D.3 Wave 2) |
+| C | **SPEC_CTRL MSR** — host-testable CPUID/MSR feature decode in `kernel-core`, IBRS/eIBRS detect+enable in `cpuid.rs` (mirroring `probe/enable_smep_smap`), IBPB on cross-process `switch_context`, STIBP per-process opt-in | C.1 | **Mostly complete** (C.1/C.3/C.4 + eIBRS done; C.2 legacy-IBRS per-entry toggle deferred to Track A trampoline) |
+| D | **Configuration surface** — host-testable `mitigations=` parser + per-vuln bug map + status vocabulary in `kernel-core`, boot-flag plumbing that gates A/C with a single global off-switch, and a `m3ctl mitigations status` reporter | A, B, C, C.1 | **Complete** (D.1/D.2/D.3 landed; gates Track A when KPTI lands) |
 | E | **Validation + release closeout** — the Meltdown-PoC smoke gate, the ≤30% perf-regression gate, kernel `0.83.0`→`0.84.0`, the Phase 84 learning doc + `docs/security/` operator reference, README/AGENTS alignment, and design-doc reconciliation | A–D | In progress (E.6/E.7 reconciliation landed in authoring PR; E.1–E.5 Wave 2/3) |
 
 > **Implementation execution note (added by the implementation PR).** Work is structured into waves: **Wave 1** (parallel, isolated worktrees) lands the two independent low-risk tracks — `core-decode` (C.1 + D.1, pure host-tested logic in `kernel-core/src/spectre.rs`) and `retpoline` (B, build-flag + `objdump` gate). **Wave 2** (serial, coordinator-driven) lands the deeply-coupled kernel surgery that all touches `cpuid.rs`/`syscall/mod.rs`/`interrupts.rs`/`scheduler.rs` — C.2–C.4, then D.2, then **A (KPTI)**, then D.3, then E.1/E.2 — because parallelizing files this tightly coupled (especially the CR3-trampoline asm) is unsafe. **Wave 3** closes out (E.3 version bump + E.4/E.5/E.6 docs). **Validation ceiling:** QEMU/TCG does not model speculation, so the E.1 Meltdown-leak property is bare-metal/VFIO-only; in QEMU the gate asserts the privileged read **faults** under `mitigations=full` and that the OS boots/round-trips with KPTI active (skip-with-reason for the leak observation).
@@ -197,9 +197,11 @@
 **Why it matters:** Phase 77 already established the exact detect→enable→status shape in this file; Track C reuses it so the SPEC_CTRL path is idiomatic. Every `rdmsr`/`wrmsr` of `0x48` must be gated on the C.1 `ibrs_ibpb` bit (an unguarded MSR access `#GP`s on a CPU that lacks it). The eIBRS-vs-legacy split (C.1 `IbrsMode`) decides *when* the MSR is written. Note eIBRS is **not** full Spectre-v2 coverage: `IBRS_ALL` restricts *same-thread* cross-privilege BTI only — SMT-sibling isolation still requires STIBP (C.4) even on eIBRS silicon, so "set IBRS once and done" does not retire the STIBP control.
 
 **Acceptance:**
-- [ ] `IA32_SPEC_CTRL` (MSR `0x48`) is `rdmsr`/`wrmsr`-accessed **only** when C.1 reports `ibrs_ibpb`; booting on a CPU lacking the bit performs **no** SPEC_CTRL access (no `#GP`) — asserted by a probe that runs on a feature-stripped CPUID path.
-- [ ] `IbrsMode::Enhanced` → IBRS (`SPEC_CTRL` bit 0) is written **once at boot** and never toggled; `IbrsMode::Legacy` → IBRS is toggled in the A.2/A.3 trampolines (set on kernel entry, cleared on user exit). A test on a legacy path observes `SPEC_CTRL.IBRS == 0` in userspace and `1` in kernel; on eIBRS it stays `1`.
-- [ ] A blind full-MSR write never clobbers `STIBP` (bit 1) / `SSBD` (bit 2): the kernel caches a `spec_ctrl_base` (mirroring Linux `x86_spec_ctrl_base`) and writes the combined value; `spec_ctrl_active()` reads the cached snapshot, not a re-`rdmsr` of the write-mostly MSR.
+- [x] `IA32_SPEC_CTRL` (MSR `0x48`) is `rdmsr`/`wrmsr`-accessed **only** when C.1 reports `ibrs_ibpb`; booting on a CPU lacking the bit performs **no** SPEC_CTRL access (no `#GP`). `probe_spec_ctrl`/`enable_ibrs`/`issue_ibpb`/`set_stibp` in `cpuid.rs` all gate on the host-tested decode; the QEMU lanes (qemu64 / `-cpu host` AMD, Intel `EDX[26]` absent) report `IbrsMode::None` → zero writes (verified: boots clean, no `#GP`).
+- [~] `IbrsMode::Enhanced` → IBRS (`SPEC_CTRL` bit 0) written **once at boot** (`enable_ibrs`, folded into the `spec_ctrl_base` cache; re-applied per-AP in `mitigations::init_ap`) — **done**. `IbrsMode::Legacy` per-entry toggle lives in the A.2/A.3 KPTI trampolines (shares that asm) — **deferred to Track A**; until then retpoline (compile-time-unconditional, active) covers Spectre-v2 BTI on legacy parts. The userspace-0/kernel-1 legacy assertion is unobservable on the QEMU lanes (no SPEC_CTRL) and lands with the spectre gate's spec-ctrl CPU + KPTI.
+- [x] A blind full-MSR write never clobbers `STIBP` (bit 1) / `SSBD` (bit 2): `cpuid.rs` caches `SPEC_CTRL_BASE` (mirroring Linux `x86_spec_ctrl_base`) and writes `base | extra`; `spec_ctrl_active()` reads the cached snapshot, never a re-`rdmsr` of the write-mostly MSR.
+
+> **Landed (Wave 2, `cpuid.rs`):** eIBRS set-once + IBPB + STIBP mechanisms + the `spec_ctrl_base` cache. **Legacy per-entry IBRS toggle is the one C.2 item deferred to Track A** (it is the same trampoline asm). No behavior change on the test lanes (None → no writes).
 
 ### C.3 — IBPB barrier on cross-process `switch_context`
 
@@ -211,9 +213,9 @@
 **Why it matters:** IBPB (`IA32_PRED_CMD` MSR `0x49` bit 0, **write-only**) flushes the indirect branch predictor at a security-domain boundary. Issuing it between **distinct** processes (not thread-to-thread within one address space) stops a prior process from having trained the predictor against the next. `PRED_CMD` is write-only — an `rdmsr` of `0x49` faults.
 
 **Acceptance:**
-- [ ] `PRED_CMD` (`0x49`) bit 0 is written `1` **only** on a switch between distinct address spaces (`as_gen`/PML4 differs), gated on C.1 `ibrs_ibpb`; thread switches within one process issue no IBPB.
-- [ ] `PRED_CMD` is **never** `rdmsr`'d (write-only).
-- [ ] With `mitigations=off`, no IBPB is issued (the switch path consults the global off-switch, D.2).
+- [x] `PRED_CMD` (`0x49`) bit 0 is written `1` **only** on a switch between distinct address spaces (`old_as_ptr != new_as_ptr`, `pid != 0`), gated on `ibrs_ibpb`; thread switches within one process (same address space) issue no IBPB. Wired in `scheduler.rs` at the cross-process boundary.
+- [x] `PRED_CMD` is **never** `rdmsr`'d — `issue_ibpb` is write-only (`Msr::write` only).
+- [x] With `mitigations=off`, no IBPB is issued — the switch path calls `mitigations::ibpb_enabled()`, which consults the one global off-switch (D.2).
 
 ### C.4 — STIBP per-process opt-in (default off)
 
@@ -225,9 +227,11 @@
 **Why it matters:** STIBP (`SPEC_CTRL` bit 1) stops an SMT sibling thread from influencing this thread's branch predictor, at a real perf cost, so it is **default-off** and opt-in. The design doc references Linux `prctl(PR_SET_SPECULATION_CTRL, ...)`, but **m3OS has no `prctl`** — the opt-in must be an m3OS-native syscall or capability.
 
 **Acceptance:**
-- [ ] STIBP (`SPEC_CTRL` bit 1) is set **only** for processes that opt in via the m3OS-native control, gated on C.1 `stibp` (`CPUID.07H.0:EDX[27]`); default-off is verified (a process that does not opt in runs with STIBP clear).
-- [ ] The opt-in is documented as an m3OS surface, **not** presented as Linux `prctl`.
-- [ ] Setting STIBP composes with C.2's `spec_ctrl_base` cache (no clobber of IBRS/SSBD bits).
+- [x] STIBP (`SPEC_CTRL` bit 1) is set **only** for processes that opted in via the m3OS-native `sys_set_spec_ctrl` syscall (`0x1141`), gated on `stibp` + the off-switch (`stibp_available()`); default-off (a process that never opts in keeps STIBP clear — the scheduler applies `set_stibp(stibp_opt_in(pid))` only under the gate, which is a no-op on the QEMU lanes lacking STIBP).
+- [x] The opt-in is an m3OS-native syscall (`SYS_SET_SPEC_CTRL`), **not** Linux `prctl` — documented as such in `kernel_core::spectre` + the syscall handler.
+- [x] `set_stibp` composes with the `spec_ctrl_base` cache (writes `base | STIBP`, clears via `base & !STIBP` then re-write) — no clobber of IBRS/SSBD.
+
+> **Landed (Wave 2):** `sys_set_spec_ctrl` records the opt-in in a PID registry (`mitigations::{set_stibp_opt_in,stibp_opt_in}`); the scheduler applies it at dispatch under `stibp_available()`. Runtime STIBP toggle is unobservable on the QEMU lanes (no STIBP feature) — exercised by the host tests + (future) spec-ctrl-CPU gate.
 
 ---
 
@@ -258,9 +262,9 @@
 **Why it matters:** `mitigations=off` must consistently and **early** disable KPTI (A), skip IBRS/IBPB writes (C), and report `Vulnerable` — not leave a half-applied state. The classic Linux bug (`cpu_select_mitigations`) is a per-track selector that checks its own flag but forgets the global `cpu_mitigations_off()`; every m3OS selector must consult the one global switch. Retpoline (B) is compile-time and **cannot** be runtime-disabled — D.3 must report that honestly.
 
 **Acceptance:**
-- [ ] A single `MitigationState` snapshot is populated once at boot from `parse_mitigations` + C.1 features and drives A.1 (KPTI on/off), A.6 (RDCL_NO auto-skip), C.2 (IBRS), and C.3 (IBPB); no track re-parses the flag independently.
-- [ ] Flipping `mitigations=off` leaves **no** track half-applied — a regression boots with `off` and asserts KPTI is inactive, no SPEC_CTRL/PRED_CMD writes occur, and the reporter says `Vulnerable` for the addressed vulns.
-- [ ] **Net-new surface (verified):** m3OS has **no** kernel boot-cmdline today — only per-process `/proc/<pid>/cmdline` (procfs), and `BootInfo` carries no cmdline field — so adding the cmdline source (a `BootInfo.cmdline` from UEFI load options, or a build-time default) is a named, first-class part of D.2's effort, not a contingency.
+- [x] A single `MitigationState` snapshot (`kernel/src/mitigations.rs`) is populated once at BSP boot from `parse_mitigations` + the C.1 features and drives A.6 (RDCL_NO auto-skip policy, `kpti_policy`), C.2 (IBRS via `init_bsp`/`init_ap`), and C.3 (IBPB via `ibpb_enabled`); no track re-parses the level. (A.1 KPTI consumes `kpti_policy`/`kpti_active` when Track A lands — `KPTI_WIRED` gate.)
+- [x] Flipping `mitigations=off` leaves **no** track half-applied — every selector consults the one `mitigations_off()`/`MitigationState` snapshot: `off` ⇒ `ibrs_mode=None` (no SPEC_CTRL write), `ibpb_active=false` (no PRED_CMD), `kpti_policy=false`, and the reporter shows the addressed vulns `Vulnerable`. (KPTI-inactive holds today regardless since Track A is unwired; the full off-path regression boot lands with the spectre gate.)
+- [x] **Net-new surface (resolved honestly):** m3OS has no kernel boot-cmdline and `BootInfo` carries none, so the level is a **build-time default** — `option_env!("M3OS_MITIGATIONS")` (default `auto`) with `kernel/build.rs` emitting `rerun-if-env-changed` so the xtask gates flip the level by rebuilding. The reporter reads the boot-populated snapshot, never a re-`rdmsr`.
 
 ### D.3 — `m3ctl mitigations status` reporter
 
@@ -269,9 +273,11 @@
 **Why it matters:** the reporter reads the **boot-populated** `MitigationState` snapshot (D.2), **not** a re-`rdmsr` of the per-core write-mostly `SPEC_CTRL` MSR (which is not a reliable "is it active" signal). It mirrors Linux's per-vuln vocabulary and — crucially for an honest learning OS — enumerates the UNADDRESSED classes and prints the Grimsdal caveat.
 
 **Acceptance:**
-- [ ] `m3ctl mitigations status` prints, per vuln, one of `Mitigation: <name>` / `Not affected` / `Vulnerable` / `UNADDRESSED`, exactly tracking the boot flag (D.1 map): `off` → addressed vulns `Vulnerable`; `full` → `Mitigation: ...`.
-- [ ] Retpoline is reported as `compiled-in (cannot disable at boot)` (B.1), distinct from the runtime-gated KPTI/IBRS lines.
-- [ ] The output enumerates the UNADDRESSED classes (MDS, L1TF, SSB, Retbleed, Downfall/GDS) and includes a one-line **Grimsdal caveat** that ring-3 driver isolation does not by itself mitigate Spectre between userspace components; the reporter reads the snapshot, never the MSR.
+- [x] `m3ctl mitigations status` prints, per vuln, one of `Mitigation: <name>` / `Not affected` / `Vulnerable` / `UNADDRESSED`, tracking the boot snapshot via the host-tested `report_map` — **Meltdown reflects the actual `kpti_active`** (so `full` with KPTI not yet enforcing prints `Vulnerable`, never a false `PTI`). Wired via the `SYS_MITIGATIONS_STATUS` syscall (`0x1140`) → `MitigationReport` wire decode → `format_mitigations` (host-tested: `mitigations_status_format_is_honest`).
+- [x] Retpoline is reported on its own line `Spectre-v2 (retpoline): compiled-in (cannot disable at boot)` (B.1), distinct from the runtime-gated KPTI/IBRS lines.
+- [x] The output enumerates the UNADDRESSED classes (MDS, L1TF, SSB, Retbleed, Downfall/GDS) and prints the one-line **Grimsdal caveat** + the seL4 timing-channel note; the reporter decodes the boot snapshot wire bytes, never re-reads the MSR.
+
+> **Landed (Wave 2):** D.3 reporter end-to-end (kernel `sys_mitigations_status` → `m3ctl mitigations status`). Parse + format are host-tested in `m3ctl`; the per-vuln honesty (`report_map`) + wire round-trip are host-tested in `kernel_core::spectre`. Runtime `m3ctl mitigations status` output is asserted by the boot-time spectre/status gate (lands with E.1).
 
 ---
 

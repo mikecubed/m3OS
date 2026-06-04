@@ -17,11 +17,13 @@
 //! changes. The reporter reads this boot-populated snapshot, never a re-`rdmsr`
 //! of the write-mostly SPEC_CTRL MSR.
 
-use spin::Once;
+use alloc::collections::BTreeSet;
+
+use spin::{Mutex, Once};
 
 pub use kernel_core::spectre::{
-    IbrsMode, MitigationLevel, SpecCtrlFeatures, Status, VULNS, Vuln, build_vuln_map,
-    mitigations_recognized, parse_mitigations,
+    IbrsMode, MitigationLevel, MitigationReport, SpecCtrlFeatures, Status, VULNS, Vuln,
+    build_vuln_map, mitigations_recognized, parse_mitigations, report_map,
 };
 
 use crate::arch::x86_64::cpuid;
@@ -59,6 +61,10 @@ pub struct MitigationState {
     pub kpti_active: bool,
     /// IBPB issued on cross-process switch this boot.
     pub ibpb_active: bool,
+    /// Guarded raw `CPUID.07H.0:EDX` (for the D.3 report wire).
+    pub leaf7_edx: u32,
+    /// Guarded raw `IA32_ARCH_CAPABILITIES` (for the D.3 report wire).
+    pub arch_caps: u64,
 }
 
 static STATE: Once<MitigationState> = Once::new();
@@ -71,6 +77,7 @@ pub fn init_bsp() -> &'static MitigationState {
         let level = parse_mitigations(MITIGATIONS_DEFAULT);
         let level_recognized = mitigations_recognized(MITIGATIONS_DEFAULT);
         let features = *cpuid::probe_spec_ctrl();
+        let (leaf7_edx, arch_caps) = cpuid::spec_ctrl_raw_regs();
         let off = matches!(level, MitigationLevel::Off);
 
         // IBRS: apply eIBRS set-once when on and supported; otherwise leave the
@@ -103,6 +110,8 @@ pub fn init_bsp() -> &'static MitigationState {
             kpti_policy,
             kpti_active,
             ibpb_active,
+            leaf7_edx,
+            arch_caps,
         };
 
         log::info!(
@@ -168,6 +177,35 @@ pub fn stibp_available() -> bool {
         .unwrap_or(false)
 }
 
+// ── C.4: per-process STIBP opt-in registry ──────────────────────────────────
+//
+// STIBP is default-off and opt-in (a real perf cost), so we track the set of
+// PIDs that opted in via the `sys_set_spec_ctrl` syscall and have the scheduler
+// apply/clear `SPEC_CTRL.STIBP` at dispatch — but only when [`stibp_available`]
+// (a no-op on silicon without STIBP, e.g. every QEMU test lane). The set is
+// consulted from the dispatch path **only** under that gate, so the lock is
+// never taken on the common (no-STIBP) hardware. A reused PID could inherit a
+// stale opt-in (harmless STIBP over-protection, STIBP-hardware only) — acceptable
+// for this niche default-off control; explicit teardown is deferred.
+static STIBP_OPT_IN: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
+
+/// Record (or clear) a process's STIBP opt-in (C.4). Called from
+/// `sys_set_spec_ctrl`.
+pub fn set_stibp_opt_in(pid: u32, on: bool) {
+    let mut set = STIBP_OPT_IN.lock();
+    if on {
+        set.insert(pid);
+    } else {
+        set.remove(&pid);
+    }
+}
+
+/// Whether `pid` opted into STIBP. Consulted by the scheduler dispatch path
+/// under the [`stibp_available`] gate.
+pub fn stibp_opt_in(pid: u32) -> bool {
+    STIBP_OPT_IN.lock().contains(&pid)
+}
+
 /// Build the honest per-vulnerability status map for the reporter (D.3).
 ///
 /// Starts from the host-tested policy model [`build_vuln_map`] (keyed on level),
@@ -177,21 +215,38 @@ pub fn stibp_available() -> bool {
 /// is reported separately by the reporter, so the SpectreV2 entry here reflects
 /// only the runtime-gated IBRS/IBPB layer (per the D.1 contract).
 pub fn vuln_map() -> [(Vuln, Status); VULNS] {
-    let Some(s) = STATE.get() else {
-        // Pre-init: report the conservative default-on policy with no features.
-        return build_vuln_map(&SpecCtrlFeatures::from_cpuid(0, 0), MitigationLevel::Auto);
-    };
-    let mut map = build_vuln_map(&s.features, s.level);
-    for entry in map.iter_mut() {
-        if entry.0 == Vuln::Meltdown {
-            entry.1 = if s.features.rdcl_no {
-                Status::NotAffected
-            } else if s.kpti_active {
-                Status::Mitigated("PTI")
-            } else {
-                Status::Vulnerable
-            };
-        }
+    match STATE.get() {
+        Some(s) => report_map(&s.features, s.level, s.kpti_active),
+        // Pre-init: conservative default-on policy with no features.
+        None => report_map(
+            &SpecCtrlFeatures::from_cpuid(0, 0),
+            MitigationLevel::Auto,
+            false,
+        ),
     }
-    map
+}
+
+/// The wire-serializable boot report for the `m3ctl mitigations status` syscall
+/// (D.3). Reflects the actual applied state — never a re-`rdmsr`.
+pub fn report() -> MitigationReport {
+    match STATE.get() {
+        Some(s) => MitigationReport {
+            level: s.level,
+            level_recognized: s.level_recognized,
+            kpti_active: s.kpti_active,
+            ibpb_active: s.ibpb_active,
+            ibrs_mode: s.ibrs_mode,
+            leaf7_edx: s.leaf7_edx,
+            arch_caps: s.arch_caps,
+        },
+        None => MitigationReport {
+            level: MitigationLevel::Auto,
+            level_recognized: true,
+            kpti_active: false,
+            ibpb_active: false,
+            ibrs_mode: IbrsMode::None,
+            leaf7_edx: 0,
+            arch_caps: 0,
+        },
+    }
 }
