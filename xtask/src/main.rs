@@ -5395,8 +5395,16 @@ fn cmd_check() {
     // CI without a full kernel boot.
     doom_c_test_step(&root);
 
+    // Phase 84 B.3 — Retpoline residual-indirect-branch gate.
+    // Operates on the fully-linked kernel ELF (after -Zbuild-std, so the
+    // rebuilt core/compiler_builtins are included in the scan).
+    // The retpoline thunk is soft-float clean: the kernel builds with
+    // -mmx,-sse,+soft-float, so __llvm_retpoline_r11 contains no XMM/SSE
+    // instructions — reviewers should not expect any FPU/XSAVE interaction.
+    retpoline_objdump_gate(&root);
+
     println!(
-        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, ac97_driver, hda_driver, ahci_driver, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, shadow, ldso_core, wifi-core, mt792x_driver, and m3ctl host tests pass; doom platform-layer C tests pass"
+        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, ac97_driver, hda_driver, ahci_driver, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, shadow, ldso_core, wifi-core, mt792x_driver, and m3ctl host tests pass; doom platform-layer C tests pass; retpoline indirect-branch gate pass"
     );
 }
 
@@ -5467,6 +5475,123 @@ fn doom_c_test_step(root: &std::path::Path) {
             std::process::exit(1);
         }
     }
+}
+
+/// Phase 84 B.3 — Retpoline residual-indirect-branch verification gate.
+///
+/// Runs two `objdump` checks against the fully-linked kernel ELF to verify
+/// that `-Zretpoline` (B.1) is in effect end-to-end, including the rebuilt
+/// `core` and `compiler_builtins` crates from `-Zbuild-std`.
+///
+/// **Negative gate (must be zero):** scans the disassembly for any remaining
+/// indirect `call *`/`callq *`/`jmp *`/`jmpq *` instructions.  A non-zero
+/// count means at least one crate was compiled without retpoline or the thunk
+/// linkage failed, and the check is failed hard.
+///
+/// **Positive cross-check (must be non-zero):** counts occurrences of the
+/// symbol `__llvm_retpoline_r11` in the relocation-annotated disassembly.
+/// A zero count means retpoline was either silently disabled or the indirect
+/// calls were all optimised away (unlikely for a full kernel); the check is
+/// failed hard to surface that ambiguity.
+///
+/// Note on soft-float cleanliness: the kernel is built with
+/// `-mmx,-sse,+soft-float`, so `__llvm_retpoline_r11` contains no XMM/SSE
+/// instructions.  Reviewers should not look for FPU/XSAVE interactions here.
+fn retpoline_objdump_gate(root: &std::path::Path) {
+    let kernel_elf = root.join("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() {
+        eprintln!(
+            "retpoline gate: kernel ELF not found at {} — run `cargo xtask image` first",
+            kernel_elf.display()
+        );
+        std::process::exit(1);
+    }
+
+    // ── Negative gate ─────────────────────────────────────────────────────
+    // Disassemble and grep for any surviving indirect CALL or JMP (both the
+    // plain and `q`-suffixed AT&T forms).  `grep -c` returns the match count
+    // on stdout and exits 0 when at least one match is found, 1 for zero
+    // matches, 2+ for errors.
+    let objdump_neg = Command::new("objdump")
+        .args(["-d", kernel_elf.to_str().unwrap()])
+        .output()
+        .expect("retpoline gate: failed to spawn objdump -d");
+
+    if !objdump_neg.status.success() {
+        eprintln!(
+            "retpoline gate: objdump -d exited with status {}",
+            objdump_neg.status
+        );
+        std::process::exit(1);
+    }
+
+    let disasm = String::from_utf8_lossy(&objdump_neg.stdout);
+    // Match `call *`, `callq *`, `jmp *`, `jmpq *` — the leading \b
+    // is not needed because the instruction mnemonics always follow
+    // a tab in objdump output; matching the tab prefix avoids false
+    // positives from symbol names that happen to contain these strings.
+    let indirect_count = disasm
+        .lines()
+        .filter(|line| {
+            // objdump disasm lines: "  <addr>:\t<hex>\t<mnemonic> <args>"
+            // Indirect operands look like: `call   *%rax` or `jmpq   *(%rax)`.
+            let after_tab = line.split('\t').nth(2).unwrap_or("");
+            let mnemonic = after_tab.split_whitespace().next().unwrap_or("");
+            let operand = after_tab.splitn(2, char::is_whitespace).nth(1).unwrap_or("").trim_start();
+            matches!(mnemonic, "call" | "callq" | "jmp" | "jmpq")
+                && operand.starts_with('*')
+        })
+        .count();
+
+    println!(
+        "retpoline gate [negative]: residual indirect branches = {indirect_count} (must be 0)"
+    );
+    if indirect_count != 0 {
+        eprintln!(
+            "retpoline gate FAIL: found {indirect_count} residual indirect branch(es) in kernel ELF.\n\
+             Reproduce with: objdump -d {} | grep -E '\\b(call|callq|jmp|jmpq)[ \\t]+\\*'",
+            kernel_elf.display()
+        );
+        std::process::exit(1);
+    }
+
+    // ── Positive cross-check ───────────────────────────────────────────────
+    // Disassemble with relocation annotations and count `__llvm_retpoline_r11`
+    // references.  A zero count indicates the thunk was not emitted at all,
+    // which would mean retpoline had no effect.
+    let objdump_pos = Command::new("objdump")
+        .args(["-dr", kernel_elf.to_str().unwrap()])
+        .output()
+        .expect("retpoline gate: failed to spawn objdump -dr");
+
+    if !objdump_pos.status.success() {
+        eprintln!(
+            "retpoline gate: objdump -dr exited with status {}",
+            objdump_pos.status
+        );
+        std::process::exit(1);
+    }
+
+    let disasm_r = String::from_utf8_lossy(&objdump_pos.stdout);
+    let thunk_count = disasm_r
+        .lines()
+        .filter(|line| line.contains("__llvm_retpoline_r11"))
+        .count();
+
+    println!(
+        "retpoline gate [positive]: __llvm_retpoline_r11 references = {thunk_count} (must be > 0)"
+    );
+    if thunk_count == 0 {
+        eprintln!(
+            "retpoline gate FAIL: __llvm_retpoline_r11 not found in kernel ELF — \
+             retpoline may not be active or all indirect calls were optimised away.\n\
+             Reproduce with: objdump -dr {} | grep -c '__llvm_retpoline_r11'",
+            kernel_elf.display()
+        );
+        std::process::exit(1);
+    }
+
+    println!("retpoline gate PASS: 0 residual indirect branches, {thunk_count} retpoline thunk references");
 }
 
 #[derive(Debug, Clone)]
