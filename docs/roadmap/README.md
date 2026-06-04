@@ -425,7 +425,7 @@ These phases were drafted 2026-05-08 in response to the phase-completion audit (
 
 | Phase | Theme | Primary Outcome | Status | Source Ref | Milestone | Tasks |
 |---|---|---|---|---|---|---|
-| 83 | Release 1.0 Gate | The project defines and validates an honest 1.0 support matrix — local-system/graphical branch in scope (screenshot-validated); kernel stays phase-tracked at `0.83.0` with "1.0" as quality-bar language, not SemVer `1.0.0` | Planned | `phase-83` | [Phase 83](./83-release-1-0-gate.md) | [Tasks](./tasks/83-release-1-0-gate-tasks.md) |
+| 83 | Release 1.0 Gate | The project defines and validates an honest 1.0 support matrix — local-system/graphical branch in scope (screenshot-validated); kernel stays phase-tracked at `0.83.0` with "1.0" as quality-bar language, not SemVer `1.0.0`. Authoritative artifact: [`docs/release/1.0-release-gate.md`](../release/1.0-release-gate.md) | Complete ✅ (kernel `0.83.0`) | `phase-83` | [Phase 83](./83-release-1-0-gate.md) | [Tasks](./tasks/83-release-1-0-gate-tasks.md) |
 
 ### Post-1.0 Platform Growth
 

@@ -203,9 +203,9 @@
 **Why it matters:** every phase ships a learning doc (the design doc's "Learning Documentation Requirement"); this one teaches why release engineering is architecture — the support matrix, the gate bundle, the headless-vs-local decision, and the versioning posture — and links the authoritative `docs/release/1.0-release-gate.md`.
 
 **Acceptance:**
-- [ ] `docs/83-release-1-0-gate.md` exists and follows the learning-doc template (Overview / What This Doc Covers / Core Implementation / Key Files / How This Phase Differs / Related Roadmap Docs / Deferred), explaining the matrix, gate bundle, scope decision, and versioning posture in learner-friendly terms.
-- [ ] `docs/README.md`'s `### Phase-Aligned Learning Docs` table has a `Release 1.0 Gate | 83 | …` row linking the new doc.
-- [ ] The learning doc links the authoritative `docs/release/1.0-release-gate.md` and the design + task docs.
+- [x] `docs/83-release-1-0-gate.md` exists and follows the learning-doc template (Overview / What This Doc Covers / Core Implementation / Key Files / How This Phase Differs / Related Roadmap Docs / Deferred), explaining the matrix, gate bundle, scope decision, and versioning posture in learner-friendly terms.
+- [x] `docs/README.md`'s `### Phase-Aligned Learning Docs` table has a `Release 1.0 Gate | 83 | …` row linking the new doc.
+- [x] The learning doc links the authoritative `docs/release/1.0-release-gate.md` and the design + task docs.
 
 ### D.3 — Flip the roadmap README row + Tasks link
 
@@ -214,8 +214,8 @@
 **Why it matters:** the roadmap README is the authoritative phase index; the Tasks-link + scope/version reconciliation landed with this task list, so the residual work is just the on-landing status flip.
 
 **Acceptance:**
-- [ ] (Verify — landed in this PR) the Phase 83 row's Tasks cell links `./tasks/83-release-1-0-gate-tasks.md` and the Primary-Outcome reflects the local-system-in-scope decision and `0.83.0` (not "headless-only").
-- [ ] On landing, the row's Status flips `Planned` → `Complete` (kernel `0.83.0`).
+- [x] (Verify — landed in this PR) the Phase 83 row's Tasks cell links `./tasks/83-release-1-0-gate-tasks.md` and the Primary-Outcome reflects the local-system-in-scope decision and `0.83.0` (not "headless-only").
+- [x] On landing, the row's Status flips `Planned` → `Complete` (kernel `0.83.0`).
 
 ### D.4 — Align top-level `README.md` + `docs/README.md` release language
 
@@ -227,8 +227,8 @@
 **Why it matters:** the design doc requires top-level docs to tell the same release story; once the support matrix exists, the top-level README must point to it and describe the system as the matrix does (graphical-capable, SSH-first-recommended, `0.83.0` / "1.0 quality-bar") — neither over- nor under-claiming.
 
 **Acceptance:**
-- [ ] `README.md` links the authoritative release-gate doc and its one-line system description matches the A.2 matrix scope (every claim it makes appears in the matrix).
-- [ ] `docs/README.md` links `docs/release/1.0-release-gate.md` from its documentation index.
+- [x] `README.md` links the authoritative release-gate doc and its one-line system description matches the A.2 matrix scope (every claim it makes appears in the matrix).
+- [x] `docs/README.md` links `docs/release/1.0-release-gate.md` from its documentation index.
 
 ### D.5 — Reconcile the evaluation R10 doc + stale release cross-refs
 
@@ -240,8 +240,8 @@
 **Why it matters:** R10 still points at the pre-renumber phase IDs (58–62) and frames the GUI-vs-headless question as open; aligning it to the current IDs (83, 84–89) and recording the resolved decision keeps the evaluation roadmap from contradicting the shipped gate.
 
 **Acceptance:**
-- [ ] R10's phase cross-references point to the current IDs (Phase 83 release gate; 85/86/87/88/89 post-1.0), not the stale 58–62.
-- [ ] R10's Open-Question about headless-vs-GUI is marked **resolved** (local-system in scope) or removed, consistent with C.1.
+- [x] R10's phase cross-references point to the current IDs (Phase 83 release gate; 85/86/87/88/89 post-1.0), not the stale 58–62.
+- [x] R10's Open-Question about headless-vs-GUI is marked **resolved** (local-system in scope) or removed, consistent with C.1.
 
 ### D.6 — Design-doc reconciliation + AGENTS.md closeout
 
@@ -253,10 +253,10 @@
 **Why it matters:** the design doc was reconciled alongside this task list, but two open-decision fragments survived — the **Critical-and-Non-Deferrable-Items** row "Explicit headless vs local-system decision" and the **Deferred-Until-Later** bullet "A full desktop claim if the local-system branch is not yet ready" — and the canonical Phase 53 [support boundary](../53-headless-hardening.md#support-boundary) still lists "GUI / compositor / graphical session" and "Mouse input or audio" as *Out of scope* (delivered in Phase 56/57); AGENTS.md is the always-loaded inventory and must reflect the version bump on landing.
 
 **Acceptance:**
-- [ ] (Verify — landed in this PR) the design doc's Companion Task List links the task doc, and Feature Scope / Evaluation Gate / Implementation Outline / Acceptance Criteria / Related-Documentation read local-system-in-scope + `0.83.0` with no `1.0.0` crate bump.
-- [ ] The two **residual** design-doc fragments are rewritten to the settled posture: the Critical-Items "Explicit headless vs local-system decision" row → "Recorded scope decision: local-system in scope, SSH-first headless recommended"; and the Deferred-Until-Later "full desktop claim if … not yet ready" → a scope boundary (a full general-purpose desktop beyond the screenshot-validated greeter → compositor → `term`/launcher/bar session), not a readiness contingency.
-- [ ] Phase 53's now-superseded support-boundary rows ("GUI / compositor / graphical session"; "Mouse input or audio" = *Out of scope*) are reconciled — struck or footnoted as **superseded by Phase 56/57/83** — and the new release-gate doc states it **extends** (does not replace) the Phase 53 support boundary + gate bundle.
-- [ ] On landing, AGENTS.md's kernel version reads `0.83.0`; a release-gate capability bullet is added **only** if the gate introduces a new capability class (otherwise the inventory is left unchanged per the maintenance policy).
+- [x] (Verify — landed in this PR) the design doc's Companion Task List links the task doc, and Feature Scope / Evaluation Gate / Implementation Outline / Acceptance Criteria / Related-Documentation read local-system-in-scope + `0.83.0` with no `1.0.0` crate bump.
+- [x] The two **residual** design-doc fragments are rewritten to the settled posture: the Critical-Items "Explicit headless vs local-system decision" row → "Recorded scope decision: local-system in scope, SSH-first headless recommended"; and the Deferred-Until-Later "full desktop claim if … not yet ready" → a scope boundary (a full general-purpose desktop beyond the screenshot-validated greeter → compositor → `term`/launcher/bar session), not a readiness contingency. *(Verified already-settled in the design doc; no edit needed.)*
+- [x] Phase 53's now-superseded support-boundary rows ("GUI / compositor / graphical session"; "Mouse input or audio" = *Out of scope*) are reconciled — struck or footnoted as **superseded by Phase 56/57/83** — and the new release-gate doc states it **extends** (does not replace) the Phase 53 support boundary + gate bundle.
+- [x] On landing, AGENTS.md's kernel version reads `0.83.0`; a release-gate capability bullet is added **only** if the gate introduces a new capability class (otherwise the inventory is left unchanged per the maintenance policy). *(Release gate is not a new capability class → version bump only.)*
 
 ---
 

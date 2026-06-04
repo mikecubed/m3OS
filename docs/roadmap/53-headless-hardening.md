@@ -250,8 +250,8 @@ Closure evidence lives in the same places the tooling already produces today:
 
 | Area | Status | When |
 |---|---|---|
-| GUI / display compositor / graphical session | Out of scope | Phase 56–57 |
-| Mouse input or audio | Out of scope | Phase 56–57 |
+| ~~GUI / display compositor / graphical session~~ | ~~Out of scope~~ → **superseded** | **Delivered in Phase 56/57; in 1.0 scope per [Phase 83 release gate](../release/1.0-release-gate.md)** |
+| ~~Mouse input or audio~~ | ~~Out of scope~~ → **superseded** | **Delivered in Phase 56/57 (+ USB-HID Phase 78, HDA Phase 80); in 1.0 scope per [Phase 83 release gate](../release/1.0-release-gate.md)** |
 | Broad hardware certification (bare-metal, non-QEMU) | Out of scope | Phase 55 |
 | Large runtime ecosystems (Python, Node.js, JVM) | Out of scope | Post-1.0 (Phase 59–62) |
 | Outbound HTTPS/TLS client tooling | Deferred | Post-1.0 |
@@ -261,8 +261,16 @@ Closure evidence lives in the same places the tooling already produces today:
 | Dynamic linking / shared libraries | Delivered in Phase 76 (`ld-musl-x86_64.so.1` + `dlopen`/`dlsym`/`dlclose` + PLT lazy resolve + GNU hash + symbol versioning) | Phase 76 |
 | Full POSIX compliance testing | Deferred | Post-1.0 |
 
-The support boundary is intentionally narrow. Phase 58 (Release 1.0 Gate) builds
-on exactly this bounded baseline rather than assuming broader coverage.
+The support boundary is intentionally narrow. The [Phase 83 release
+gate](../release/1.0-release-gate.md) **extends** (does not replace) this bounded
+baseline — it builds on exactly this support boundary and gate bundle, and supersedes
+the two struck rows above (GUI / compositor / graphical session and mouse/audio,
+delivered in Phase 56/57 and now in 1.0 scope, screenshot-validated).
+
+> **Note (superseded by Phase 56/57/83).** The first two *Out of scope* rows above were
+> written before the GUI/audio stack existed. They are kept (struck) for historical
+> accuracy; the live support boundary for those capabilities is now the
+> [Phase 83 support matrix](../release/1.0-release-gate.md#support-matrix).
 
 ---
 

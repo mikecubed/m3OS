@@ -12,11 +12,14 @@
 [Phase 55b](../../roadmap/55b-ring-3-driver-host.md),
 [Phase 56](../../roadmap/56-display-and-input-architecture.md),
 [Phase 57](../../roadmap/57-audio-and-local-session.md),
-[Phase 58](../../roadmap/58-release-1-0-gate.md),
-[Phase 59](../../roadmap/59-cross-compiled-toolchains.md),
-[Phase 60](../../roadmap/60-networking-and-github.md),
-[Phase 61](../../roadmap/61-nodejs.md),
-[Phase 62](../../roadmap/62-claude-code.md)
+[Phase 83 — Release 1.0 Gate](../../roadmap/83-release-1-0-gate.md),
+[Phase 84 — Spectre/KPTI Mitigations](../../roadmap/84-spectre-mitigations.md),
+[Phase 85 — Cross-Compiled Toolchains](../../roadmap/85-cross-compiled-toolchains.md),
+[Phase 86 — Networking and GitHub](../../roadmap/86-networking-and-github.md),
+[Phase 87 — Node.js](../../roadmap/87-nodejs.md),
+[Phase 88 — Claude Code](../../roadmap/88-claude-code.md),
+[Phase 89 — IPv6 / DHCPv6](../../roadmap/89-ipv6-dhcpv6.md)
+<br>*(Phases 58–62 in earlier drafts of this overlay were renumbered: the release gate is now Phase 83; the post-1.0 ecosystem work is Phases 84–89.)*
 **Primary evaluation docs:** [Usability Roadmap](../usability-roadmap.md),
 [Rust OS Comparison](../rust-os-comparison.md),
 [GUI Strategy](../gui-strategy.md)
@@ -115,12 +118,16 @@ that enforces its architectural direction and knows its support boundaries.
 - [Path to a Usable State](../usability-roadmap.md)
 - [m3OS Compared with Redox and Other Rust OS Projects](../rust-os-comparison.md)
 - [GUI Strategy](../gui-strategy.md)
-- [Phase 58 — Release 1.0 Gate](../../roadmap/58-release-1-0-gate.md)
-- [Phase 62 — Claude Code](../../roadmap/62-claude-code.md)
+- [Phase 83 — Release 1.0 Gate](../../roadmap/83-release-1-0-gate.md) (the official implementation; **authoritative artifact:** [`docs/release/1.0-release-gate.md`](../../release/1.0-release-gate.md))
+- [Phase 88 — Claude Code](../../roadmap/88-claude-code.md)
 
 ## Open Questions
 
-- Should 1.0 be explicitly defined as a headless/reference-system release unless
-  the GUI path reaches a terminal/launcher milestone?
+- ~~Should 1.0 be explicitly defined as a headless/reference-system release unless
+  the GUI path reaches a terminal/launcher milestone?~~ **Resolved** by
+  [Phase 83](../../roadmap/83-release-1-0-gate.md): 1.0 **includes** the
+  local-system/graphical branch (greeter → compositor → `term`/launcher/bar),
+  screenshot-validated, with SSH-first headless as the *recommended admin* path. See the
+  [release scope decision](../../release/1.0-release-gate.md#release-scope-decision).
 - Which larger toolchains or ecosystem features are strategically valuable soon
   after 1.0, and which are mostly showcase items?
