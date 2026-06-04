@@ -7,6 +7,8 @@
 
 This document is the operator-facing reference for the transient-execution mitigations introduced in Phase 84. It describes which silicon families are protected by which mitigation, how each is enabled, and — critically — which vulnerability classes remain unaddressed.
 
+> **Implementation status (read first).** The **Spectre-v2 layer is active**: retpoline is compiled in (verified — zero residual indirect branches in the kernel ELF), and eIBRS / IBPB / STIBP are applied per the CPU's capabilities. **KPTI (the Meltdown mitigation) is designed and scaffolded but its CR3-trampoline *activation* is deferred to a bare-metal-validated follow-up** (QEMU cannot model speculation, so KPTI's leak-prevention is unverifiable there; SMP also needs a per-CPU entry-area first). Until KPTI activation lands, `m3ctl mitigations status` reports Meltdown **honestly** — `Vulnerable` on susceptible silicon (never a false `Mitigation: PTI`), or `Not affected` on `RDCL_NO` parts (all AMD + recent Intel, where Meltdown does not apply).
+
 ---
 
 ## Checking What Is Active
@@ -17,12 +19,11 @@ m3ctl mitigations status
 
 This command reads the boot-populated `MitigationState` snapshot and prints a per-vulnerability line using the vocabulary below. It does **not** re-read the `IA32_SPEC_CTRL` MSR at runtime. Retpoline is reported separately as `compiled-in (cannot disable at boot)`.
 
-Example output (on Meltdown-vulnerable silicon, `mitigations=auto`):
+Example output **at the current implementation stage** (Meltdown-susceptible silicon, `mitigations=auto`) — KPTI activation pending, so Meltdown is reported honestly as `Vulnerable`:
 
 ```
-Meltdown:       Mitigation: PTI
+Meltdown:       Vulnerable          # KPTI designed + scaffolded; activation is a bare-metal follow-up
 Spectre v2:     Mitigation: Retpoline, IBPB
-STIBP:          Vulnerable (opt-in only; see capability surface)
 MDS:            UNADDRESSED
 L1TF:           UNADDRESSED
 Spectre v4/SSB: UNADDRESSED
@@ -31,10 +32,10 @@ Downfall/GDS:   UNADDRESSED
 Retpoline:      compiled-in (cannot disable at boot)
 ```
 
-On Meltdown-immune silicon (`RDCL_NO` set, `mitigations=auto`):
+Once KPTI activation lands and `mitigations=full` (or `auto` on susceptible silicon) is in effect, the Meltdown line becomes `Mitigation: PTI`. On Meltdown-immune silicon (`RDCL_NO` set) the Meltdown line is already `Not affected` regardless of KPTI activation:
 
 ```
-Meltdown:       Not affected (RDCL_NO)
+Meltdown:       Not affected
 Spectre v2:     Mitigation: Retpoline, IBPB
 ...
 ```

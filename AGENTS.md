@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**m3OS** (technical name: `m3os`) is a bootable microkernel OS in Rust: x86_64, UEFI boot, kernel **v0.83.0**. Ring 0 handles memory, scheduling, IPC/capabilities, interrupt routing, and in-kernel drivers; ring 3 hosts everything else.
+**m3OS** (technical name: `m3os`) is a bootable microkernel OS in Rust: x86_64, UEFI boot, kernel **v0.84.0**. Ring 0 handles memory, scheduling, IPC/capabilities, interrupt routing, and in-kernel drivers; ring 3 hosts everything else.
 
 Capabilities now present in the tree:
 
@@ -18,7 +18,7 @@ Capabilities now present in the tree:
 - **Audio**: out-of-process ring-3 audio drivers — `ac97` and `hda` (Intel HD Audio controller + generic zero-quirk widget-graph codec, CORB/RIRB IOVA rings, BDL/`SDnFMT` output stream) — behind a `driver_ipc::audio` seam; `audio_server` is a pure policy/mixer (32-ch DMX→S16LE mix, DOOM audio + bell) that forwards PCM over a persistent `sys_shm` ring.
 - **Terminal**: `term` emulator, full termios/line-discipline, UTF-8 + TTF/Nerd Font glyphs, ncurses + less/htop/tmux ports.
 - **Dynamic linking**: `ld-musl-x86_64.so.1` with `ldso_core`, PT_INTERP support, dlopen/dlsym/dlclose, PLT lazy resolve, DT_GNU_HASH, symbol versioning, LD_BIND_NOW, W^X enforcement.
-- **CPU hardening**: SMEP + SMAP enforced on every core, per-CPU microcode application (AMD container), PT_TLS-backed pthreads, RFC 6298 TCP retransmission.
+- **CPU hardening**: SMEP + SMAP enforced on every core, per-CPU microcode application (AMD container), PT_TLS-backed pthreads, RFC 6298 TCP retransmission. **Spectre-v2**: retpoline kernel codegen (`-Zretpoline`, objdump-gated) + `IA32_SPEC_CTRL` family (eIBRS set-once / IBPB on cross-process switch / STIBP opt-in), behind a `mitigations=off|auto|full` policy with `m3ctl mitigations status`. KPTI (Meltdown) is designed + scaffolded; its CR3-trampoline activation is a tracked bare-metal-validated follow-up (Phase 84 Track A).
 
 > **Phase history is NOT maintained here.** For the detailed per-phase record (Phase 55a → 76d and onward) and the full workspace/source layout, read `docs/roadmap/README.md` and `docs/appendix/codebase-map.md`. Read the relevant phase doc under `docs/roadmap/` before changing a subsystem.
 
@@ -35,7 +35,7 @@ cargo xtask run-gui      # build + launch in QEMU (GUI with framebuffer)
 cargo xtask run-gui --fresh  # same, but recreate data disk first
 cargo xtask image        # build bootable disk image (UEFI raw + VHDX)
 cargo xtask image --sign # build + sign EFI binary for Secure Boot
-cargo xtask check        # clippy (-D warnings) + rustfmt + host tests for kernel-core (incl. storage::{ahci,ata}), passwd, driver_runtime, audio_client, audio_server, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, wifi-core, mt792x_driver, ahci_driver, m3ctl
+cargo xtask check        # clippy (-D warnings) + rustfmt + host tests for kernel-core (incl. storage::{ahci,ata}, spectre, kpti), passwd, driver_runtime, audio_client, audio_server, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, wifi-core, mt792x_driver, ahci_driver, m3ctl + the Phase 84 retpoline objdump indirect-branch gate
 cargo xtask fmt --fix    # auto-format all workspace source
 cargo xtask test         # run all kernel tests in QEMU via ISA debug exit
 cargo xtask test --test <name>  # run a single QEMU test binary

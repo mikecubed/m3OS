@@ -1,6 +1,6 @@
 # Phase 84 — Spectre / KPTI / Retpoline / IBRS Mitigations (Learning Doc)
 
-**Status:** Implemented — kernel 0.84.0
+**Status:** Spectre-v2 layer implemented (kernel 0.84.0); KPTI (Meltdown) **activation** is a bare-metal-validated follow-up
 **Source Ref:** phase-84
 **Depends on:** Phase 75 (W^X Enforcement), Phase 77 (Pre-1.0 Correctness — SMEP + SMAP baseline), Phase 83 (Release 1.0 Gate)
 **Builds on:** the Phase 77 SMEP + SMAP baseline — those two CR4 bit flips are the cheap class of CPU mitigations; this phase adds the expensive class: KPTI (Kernel Page Table Isolation) for Meltdown, retpoline for Spectre-v2 branch-target injection, and the `IA32_SPEC_CTRL` MSR family (IBRS/eIBRS/IBPB/STIBP), each targeting a distinct transient-execution threat.
@@ -8,7 +8,17 @@
 
 ## Milestone Goal
 
-m3OS implements the post-Meltdown / post-Spectre-v2 mitigations that mature OSes shipped between 2018 and 2020. Kernel/user address spaces are isolated via KPTI; indirect branches in kernel code are retpoline-protected; and the `IA32_SPEC_CTRL` MSR family (IBRS/IBPB/STIBP) is applied per each CPU's capabilities, all behind a `mitigations=off|auto|full` boot policy. This is an explicitly post-1.0 phase because the work is large (~2000 LOC) and the 1.0 cohort (Phase 77's SMEP + SMAP) already captures the cheap class of mitigations.
+m3OS implements the post-Meltdown / post-Spectre-v2 mitigations that mature OSes shipped between 2018 and 2020. Indirect branches in kernel code are retpoline-protected; the `IA32_SPEC_CTRL` MSR family (IBRS/eIBRS/IBPB/STIBP) is applied per each CPU's capabilities; and kernel/user address-space isolation (KPTI, for Meltdown) is **designed and scaffolded** — all behind a `mitigations=off|auto|full` boot policy with an honest `m3ctl mitigations status` reporter. This is an explicitly post-1.0 phase because the work is large (~2000 LOC) and the 1.0 cohort (Phase 77's SMEP + SMAP) already captures the cheap class of mitigations.
+
+> ## Implementation status (be precise — this is a learning OS)
+>
+> **Landed and validated (kernel 0.84.0):**
+> - **Retpoline (Spectre-v2 BTI):** active and verified — the linked kernel ELF has **zero** residual indirect branches and ~1900 `__llvm_retpoline_r11` thunk references (a `cargo xtask check` gate enforces this).
+> - **`IA32_SPEC_CTRL` family:** eIBRS set-once + IBPB-on-cross-process-switch + STIBP opt-in mechanisms, all gated on the host-tested CPUID/MSR decode (no `#GP` on CPUs lacking the bits). The *legacy* per-entry IBRS toggle shares the KPTI trampoline asm and lands with KPTI activation.
+> - **`mitigations=off|auto|full` policy + `m3ctl mitigations status` reporter** — the reporter reads the boot snapshot and reports Meltdown honestly (`Vulnerable` / `Not affected` on `RDCL_NO`), **never** a false `Mitigated` while KPTI is not enforcing.
+> - **KPTI scaffolding:** the host-tested user-shadow-PML4 invariant model (`kernel_core::kpti`), the GLOBAL-bit guard (A.4), the `RDCL_NO` auto-skip policy (A.6), and the per-core CR3-trampoline plumbing.
+>
+> **Deferred to a bare-metal-validated follow-up:** the KPTI **activation** — the CR3-trampoline rewrite of the syscall + all IRQ/IST entry paths (A.2/A.3), PCID (A.5), and the Meltdown-PoC gate (E.1). QEMU/TCG does not model speculation, so KPTI's leak-prevention property is unverifiable in QEMU by construction; its correctness proof is the bare-metal Meltdown PoC. SMP additionally requires a fixed per-CPU entry-area (`cpu_entry_area`-equivalent) so a per-process user PML4 can reach the running core's RSP0/TSS/per-core data — m3OS allocates those per-core on the heap today. See the task list's Track A for the precise activation plan.
 
 ## Why This Phase Exists
 

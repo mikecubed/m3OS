@@ -364,6 +364,22 @@ pub struct PerCoreData {
     /// that retarget store / counter-helper load can use `Release` / `Acquire`
     /// ordering for cross-core visibility on retarget boundaries.
     pub current_preempt_count_ptr: AtomicPtr<AtomicI32>,
+
+    // ----- Phase 84 Track A (KPTI): per-core CR3 trampoline state -----
+    //
+    // Read by the KPTI entry/exit asm via `gs:[OFFSET]` (valid on EITHER CR3
+    // because the PerCoreData page is in the user-PML4 minimal entry set). Set
+    // by the scheduler on dispatch when `kpti_active`. All zero / unused when
+    // KPTI is inactive (the default boot path installs the non-KPTI stubs and
+    // never reads these).
+    /// Kernel-half PML4 phys for the active task (the CR3 to load on ring-3→0).
+    pub kpti_kernel_cr3: u64,
+    /// User-half PML4 phys for the active task (the CR3 to load on 0→ring-3).
+    pub kpti_user_cr3: u64,
+    /// Scratch slot the entry asm spills a register into across the CR3 switch
+    /// (the SYSCALL path has no free GPR at entry; this lives in the user
+    /// minimal set so it is writable on the user CR3).
+    pub kpti_scratch: u64,
 }
 
 // Safety: PerCoreData is only accessed by its owning core (via gs_base) or
@@ -569,6 +585,12 @@ pub mod offsets {
         core::mem::offset_of!(PerCoreData, current_syscall_snapshot_ptr);
     pub const CURRENT_PID: usize = core::mem::offset_of!(PerCoreData, current_pid);
     pub const FORK_ENTRY_CTX: usize = core::mem::offset_of!(PerCoreData, fork_entry_ctx);
+
+    // Phase 84 Track A (KPTI) — CR3 trampoline state read from `gs:` by the
+    // entry/exit asm.
+    pub const KPTI_KERNEL_CR3: usize = core::mem::offset_of!(PerCoreData, kpti_kernel_cr3);
+    pub const KPTI_USER_CR3: usize = core::mem::offset_of!(PerCoreData, kpti_user_cr3);
+    pub const KPTI_SCRATCH: usize = core::mem::offset_of!(PerCoreData, kpti_scratch);
 }
 
 // ---------------------------------------------------------------------------
@@ -688,6 +710,9 @@ pub fn init_bsp_per_core() {
         current_preempt_count_ptr: AtomicPtr::new(
             &SCHED_PREEMPT_COUNT_DUMMY[0] as *const AtomicI32 as *mut AtomicI32,
         ),
+        kpti_kernel_cr3: 0,
+        kpti_user_cr3: 0,
+        kpti_scratch: 0,
     }));
 
     // Fill self-pointer and store in global array.
@@ -804,6 +829,9 @@ pub fn init_ap_per_core(core_id: u8, apic_id: u8) -> *mut PerCoreData {
         current_preempt_count_ptr: AtomicPtr::new(
             &SCHED_PREEMPT_COUNT_DUMMY[core_id as usize] as *const AtomicI32 as *mut AtomicI32,
         ),
+        kpti_kernel_cr3: 0,
+        kpti_user_cr3: 0,
+        kpti_scratch: 0,
     }));
 
     unsafe {
