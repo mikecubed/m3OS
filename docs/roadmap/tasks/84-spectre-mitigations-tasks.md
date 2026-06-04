@@ -281,7 +281,7 @@
 - [x] Retpoline is reported on its own line `Spectre-v2 (retpoline): compiled-in (cannot disable at boot)` (B.1), distinct from the runtime-gated KPTI/IBRS lines.
 - [x] The output enumerates the UNADDRESSED classes (MDS, L1TF, SSB, Retbleed, Downfall/GDS) and prints the one-line **Grimsdal caveat** + the seL4 timing-channel note; the reporter decodes the boot snapshot wire bytes, never re-reads the MSR.
 
-> **Landed (Wave 2):** D.3 reporter end-to-end (kernel `sys_mitigations_status` → `m3ctl mitigations status`). Parse + format are host-tested in `m3ctl`; the per-vuln honesty (`report_map`) + wire round-trip are host-tested in `kernel_core::spectre`. Runtime `m3ctl mitigations status` output is asserted by the boot-time spectre/status gate (lands with E.1).
+> **Landed (Wave 2) + runtime-validated:** D.3 reporter end-to-end (kernel `sys_mitigations_status` → `m3ctl mitigations status`). Parse + format host-tested in `m3ctl`; the per-vuln honesty (`report_map`) + wire round-trip host-tested in `kernel_core::spectre`. **Runtime output asserted on a real boot** by the new `cargo xtask mitigations-status-smoke` gate (`M3OS_MITIGATIONS_REGRESSION=1`): it confirms the `[sec] mitigations=… global_kernel_ptes=0` boot-policy log (D.2/A.4/A.6) **and** that `m3ctl mitigations status` prints the per-vuln Meltdown line, the compiled-in retpoline line, and the UNADDRESSED enumeration — **PASSED (17 steps, 34s)**. (The KPTI-independent portion of E.1; the Meltdown-PoC portion still needs bare-metal.)
 
 ---
 
