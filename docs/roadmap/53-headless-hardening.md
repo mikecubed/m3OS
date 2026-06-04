@@ -29,7 +29,7 @@ This phase exists to make the headless/reference-system claim honest before the 
 
 The following workflow is the single normal operator path through the headless
 system. Every step must be exercised by the gate bundle (§ Gate Bundle) before
-Phase 53 can feed into Phase 58.
+Phase 53 can feed into Phase 83 (the Release 1.0 Gate).
 
 ### 1. Boot and login
 
@@ -253,7 +253,7 @@ Closure evidence lives in the same places the tooling already produces today:
 | ~~GUI / display compositor / graphical session~~ | ~~Out of scope~~ → **superseded** | **Delivered in Phase 56/57; in 1.0 scope per [Phase 83 release gate](../release/1.0-release-gate.md)** |
 | ~~Mouse input or audio~~ | ~~Out of scope~~ → **superseded** | **Delivered in Phase 56/57 (+ USB-HID Phase 78, HDA Phase 80); in 1.0 scope per [Phase 83 release gate](../release/1.0-release-gate.md)** |
 | Broad hardware certification (bare-metal, non-QEMU) | Out of scope | Phase 55 |
-| Large runtime ecosystems (Python, Node.js, JVM) | Out of scope | Post-1.0 (Phase 59–62) |
+| Large runtime ecosystems (Python, Node.js, JVM) | Out of scope | Post-1.0 (Phase 85–89) |
 | Outbound HTTPS/TLS client tooling | Deferred | Post-1.0 |
 | `git`, `gh`, GitHub integration | Deferred | Post-1.0 |
 | DNS resolution and general outbound networking | DNS delivered in Phase 77 (Track D.1: `/etc/resolv.conf` + unbound-UDP ephemeral source port + `recvmsg`-on-AF_INET reply delivery, commit `8303990`); `getaddrinfo` resolves A records end to end. Outbound HTTPS/TLS client tooling remains deferred (see row above); DNS caching / search domains / IPv6 / DNSSEC are post-1.0 | Phase 77 |
@@ -297,7 +297,7 @@ produced after 53a.
 
 This rule applies identically in the evaluation docs
 (`docs/evaluation/roadmap/R06-hardening-and-operational-polish.md`) and in the
-release gate (`docs/roadmap/58-release-1-0-gate.md`).
+release gate (`docs/roadmap/83-release-1-0-gate.md`).
 
 ---
 
@@ -355,7 +355,7 @@ Services, logs, package behavior, and boot/shutdown flows together define whethe
 
 ### Support matrix and expectation management
 
-Release quality is partly about saying no. The support boundary (§ Support Boundary) defines what m3OS supports in its headless/reference mode and what remains later work. Phase 58 builds on exactly this boundary.
+Release quality is partly about saying no. The support boundary (§ Support Boundary) defines what m3OS supports in its headless/reference mode and what remains later work. Phase 83 (the Release 1.0 Gate) builds on exactly this boundary.
 
 ## How This Builds on Earlier Phases
 
@@ -395,7 +395,7 @@ Release quality is partly about saying no. The support boundary (§ Support Boun
 - SSH is the documented default remote-admin path; telnet is documented as a non-default testing posture only.
 - Broad outbound developer tooling (HTTPS clients, git, DNS) is explicitly deferred as a non-goal.
 - GUI/local-session features, broad hardware certification, and large runtime ecosystems are explicitly out of scope.
-- The support boundary is narrow enough to feed Phase 58 without reopening Phase 53 scope.
+- The support boundary is narrow enough to feed Phase 83 (the Release 1.0 Gate) without reopening Phase 53 scope.
 - The Phase 53 / Phase 53a closure contract states which decisions are defined now versus satisfied only after the published gates pass on the allocator-sensitive baseline.
 - The post-53a closure bundle names the exact final-close commands and manual checks, records where regression/stress evidence lives, and states that smoke output remains stdout-only until the harness writes a dedicated artifact.
 - Nightly `cargo xtask stress --test ssh-overlap --iterations 50 --timeout 90` is explicitly classified as sustaining evidence rather than a per-PR or final-close rerun.

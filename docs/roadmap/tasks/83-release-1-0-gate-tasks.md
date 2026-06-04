@@ -190,7 +190,7 @@
 **Why it matters:** the `0.NN.0 = Phase NN` convention (0.82.0 = Phase 82) requires the Phase 83 release-gate cut to land as `0.83.0`; per Track C the crate stays phase-tracked even though the public milestone language is "1.0". This is the explicit version bump the release closeout performs, mirroring Phase 82 Track F's `0.81.0` → `0.82.0`.
 
 **Acceptance:**
-- [ ] `kernel/Cargo.toml` `version` reads `0.83.0`; `cargo xtask check` builds clean and the boot banner / version reporting reflects `0.83.0`.
+- [x] `kernel/Cargo.toml` `version` reads `0.83.0`; `cargo xtask check` builds clean and the boot banner / version reporting reflects `0.83.0`. *(Validated: `cargo xtask check` exit 0; `smoke-test` build line shows "Compiling kernel v0.83.0" and boots 22 steps; banner/procfs/uname read `env!("CARGO_PKG_VERSION")`.)*
 - [x] No reference bumps the kernel crate to `1.0.0` (grep-verifiable: `1.0.0` does not appear as a crate version); "1.0" appears only as milestone/public language per Track C.
 
 ### D.2 — Create + index the learning doc `docs/83-release-1-0-gate.md`
