@@ -9,6 +9,17 @@ runner = "cargo xtask runner"
 
 [target.x86_64-unknown-none]
 runner = "cargo xtask runner"
+# Phase 84 B.1 — Retpoline: reroute all indirect calls/jumps through
+# __llvm_retpoline_r11 to mitigate Spectre variant 2 (BTI).  Scoped to
+# x86_64-unknown-none so host build-scripts and proc-macro crates are
+# never compiled with this flag (they link against the host std which
+# has no retpoline ABI contract and would produce an ABI-mismatch error).
+# -Zbuild-std in the kernel cargo invocation ensures core + compiler_builtins
+# are also rebuilt with -Zretpoline, satisfying the ABI coherency requirement.
+# Note: the retpoline thunk is soft-float clean — the kernel already
+# builds with -mmx,-sse,+soft-float, so the thunk contains no XMM/SSE
+# instructions; no FPU/XSAVE interaction to worry about here.
+rustflags = ["-Zretpoline"]
 
 [alias]
 xtask = "run --package xtask --target x86_64-unknown-linux-gnu --"
