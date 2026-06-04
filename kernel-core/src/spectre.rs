@@ -316,9 +316,16 @@ impl MitigationReport {
         b
     }
 
-    /// Decode from the wire layout. Returns `None` on short or malformed input.
+    /// Decode from the wire layout. Returns `None` on short or malformed input,
+    /// including an unrecognized wire-version byte (`b[3]`) — a future,
+    /// incompatible layout is refused rather than silently mis-decoded.
     pub fn decode(buf: &[u8]) -> Option<Self> {
         if buf.len() < MITIGATION_REPORT_WIRE_LEN {
+            return None;
+        }
+        // Wire version (written as `b[3] = 1` by `encode()`). Reject anything we
+        // do not know how to parse so a bumped format fails cleanly here.
+        if buf[3] != 1 {
             return None;
         }
         let level = match buf[0] {
@@ -619,5 +626,19 @@ mod tests {
         let mut bad = [0u8; MITIGATION_REPORT_WIRE_LEN];
         bad[0] = 9;
         assert!(MitigationReport::decode(&bad).is_none());
+        // Unrecognized wire version → None (a valid encode otherwise).
+        let mut wrong_ver = MitigationReport {
+            level: MitigationLevel::Auto,
+            level_recognized: true,
+            kpti_active: false,
+            ibpb_active: true,
+            ibrs_mode: IbrsMode::None,
+            leaf7_edx: 0,
+            arch_caps: 0,
+        }
+        .encode();
+        assert!(MitigationReport::decode(&wrong_ver).is_some());
+        wrong_ver[3] = 2; // bump the version byte
+        assert!(MitigationReport::decode(&wrong_ver).is_none());
     }
 }

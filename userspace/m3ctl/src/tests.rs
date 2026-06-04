@@ -432,6 +432,9 @@ fn mitigations_status_format_is_honest() {
     assert!(r.contains("Meltdown: Vulnerable"));
     assert!(r.contains("retpoline): compiled-in"));
     assert!(r.contains("UNADDRESSED"));
+    // The honesty note must enumerate Spectre-v1 (report_map marks it
+    // Status::Unaddressed) — the note is not an exhaustive list otherwise.
+    assert!(r.contains("UNADDRESSED — Spectre-v1, MDS"));
     assert!(r.contains("Grimsdal"));
 
     // KPTI enforcing → Meltdown reads "Mitigation: PTI".

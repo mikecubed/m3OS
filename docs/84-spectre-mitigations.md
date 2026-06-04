@@ -209,7 +209,7 @@ Every track (KPTI, IBRS, IBPB) consults a **single global off-switch** populated
 
 All CPUID bit extraction, `IA32_ARCH_CAPABILITIES` parsing, the eIBRS-vs-legacy classification, the `mitigations=` string parser, and the per-vulnerability status map live here. This mirrors the Phase 82 pattern of putting AHCI register/FIS math in `kernel-core::storage`: the logic is proven by `cargo xtask check` with no QEMU, so a bit-transcription error is a failing test, not a silent `#GP` at boot. The CPUID max-leaf guard (the same guard `probe_smep_smap` enforces at `cpuid.rs:241`) is exercised here too.
 
-The status vocabulary mirrors Linux's `/sys/devices/system/cpu/vulnerabilities/*`: `Not affected`, `Vulnerable`, `Mitigation: <name>`, or `UNADDRESSED`. The UNADDRESSED classes (MDS, L1TF, SSB, Retbleed, Downfall/GDS) are always present in the map regardless of the `mitigations=` level — a deferred vulnerability cannot read as covered.
+The status vocabulary mirrors Linux's `/sys/devices/system/cpu/vulnerabilities/*`: `Not affected`, `Vulnerable`, `Mitigation: <name>`, or `UNADDRESSED`. The UNADDRESSED classes (Spectre-v1, MDS, L1TF, SSB, Retbleed, Downfall/GDS) are always present in the map regardless of the `mitigations=` level — a deferred vulnerability cannot read as covered.
 
 ### KPTI Page-Table Pair: `kernel/src/mm/mod.rs`
 

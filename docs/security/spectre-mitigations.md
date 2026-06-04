@@ -32,7 +32,7 @@ mitigations: level=auto
   Retbleed: UNADDRESSED
   Downfall/GDS: UNADDRESSED
   Spectre-v2 (retpoline): compiled-in (cannot disable at boot)
-note: UNADDRESSED — MDS, L1TF, SSB, Retbleed, Downfall/GDS are not mitigated.
+note: UNADDRESSED — Spectre-v1, MDS, L1TF, SSB, Retbleed, Downfall/GDS are not mitigated.
 note: ring-3 driver isolation does not by itself mitigate Spectre between userspace components (Grimsdal et al., NordSec 2019); m3OS makes no claim of freedom from microarchitectural timing channels (seL4 verification-scope framing).
 ```
 
@@ -51,7 +51,7 @@ mitigations: level=auto
   Retbleed: UNADDRESSED
   Downfall/GDS: UNADDRESSED
   Spectre-v2 (retpoline): compiled-in (cannot disable at boot)
-note: UNADDRESSED — MDS, L1TF, SSB, Retbleed, Downfall/GDS are not mitigated.
+note: UNADDRESSED — Spectre-v1, MDS, L1TF, SSB, Retbleed, Downfall/GDS are not mitigated.
 note: ring-3 driver isolation does not by itself mitigate Spectre between userspace components (Grimsdal et al., NordSec 2019); m3OS makes no claim of freedom from microarchitectural timing channels (seL4 verification-scope framing).
 ```
 

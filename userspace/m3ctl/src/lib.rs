@@ -180,7 +180,9 @@ pub fn format_mitigations(report: &kernel_core::spectre::MitigationReport) -> St
     out.push_str("  Spectre-v2 (retpoline): compiled-in (cannot disable at boot)\n");
 
     // Honesty: enumerate the UNADDRESSED classes + the microkernel caveat.
-    out.push_str("note: UNADDRESSED — MDS, L1TF, SSB, Retbleed, Downfall/GDS are not mitigated.\n");
+    out.push_str(
+        "note: UNADDRESSED — Spectre-v1, MDS, L1TF, SSB, Retbleed, Downfall/GDS are not mitigated.\n",
+    );
     out.push_str(
         "note: ring-3 driver isolation does not by itself mitigate Spectre between userspace \
          components (Grimsdal et al., NordSec 2019); m3OS makes no claim of freedom from \

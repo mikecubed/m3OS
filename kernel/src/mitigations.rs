@@ -59,7 +59,9 @@ pub struct MitigationState {
     pub kpti_policy: bool,
     /// KPTI **actually enforcing** this boot — the reporter's source of truth.
     pub kpti_active: bool,
-    /// IBPB issued on cross-process switch this boot.
+    /// IBPB **enabled** this boot: when `true`, an IBPB is issued on every
+    /// cross-process switch. Set once from policy + CPU features at boot — this
+    /// is a configuration flag, not a counter of barriers actually issued.
     pub ibpb_active: bool,
     /// Guarded raw `CPUID.07H.0:EDX` (for the D.3 report wire).
     pub leaf7_edx: u32,
