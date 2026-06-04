@@ -36,7 +36,7 @@ cargo xtask run-gui      # build + launch in QEMU (GUI with framebuffer)
 cargo xtask run-gui --fresh  # same, but recreate data disk first
 cargo xtask image        # build bootable disk image (UEFI raw + VHDX)
 cargo xtask image --sign # build + sign EFI binary for Secure Boot
-cargo xtask check        # clippy (-D warnings) + rustfmt + host tests for kernel-core (incl. storage::{ahci,ata}, spectre, kpti), passwd, driver_runtime, audio_client, audio_server, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, wifi-core, mt792x_driver, ahci_driver, m3ctl + the Phase 84 retpoline objdump indirect-branch gate
+cargo xtask check        # clippy (-D warnings) + rustfmt + host tests for kernel-core (incl. storage::{ahci,ata}, spectre, kpti), passwd, driver_runtime, audio_client, audio_server, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, wifi-core, mt792x_driver, ahci_driver, m3ctl, pkg-format (Phase 85a .m3pkg pack/unpack/verify + content-key), pkg (Phase 85a installed-file DB), xtask (Phase 85a Portfile parser + package_key + pkgcache seal/resolve) + the Phase 84 retpoline objdump indirect-branch gate
 cargo xtask fmt --fix    # auto-format all workspace source
 cargo xtask test         # run all kernel tests in QEMU via ISA debug exit
 cargo xtask test --test <name>  # run a single QEMU test binary
