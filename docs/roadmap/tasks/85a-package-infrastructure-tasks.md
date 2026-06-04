@@ -15,7 +15,7 @@
 | B | `xtask` seal-after-install + resolve-before-build + zero-rebuild gate in `port_build.rs`/`main.rs` | A | ✅ Done |
 | C | Userspace `pkg` installer + installed-file DB | A | ✅ Done (boot-verified in D) |
 | D | Image staging installs from `.m3pkg`; existing-ports retrofit | B, C | ✅ Done (zlib deferred) |
-| E | Disk/RAM budget + relocation contract + hosting plan + data-disk resize + version bump | A–D | In progress |
+| E | Disk/RAM budget + relocation contract + hosting plan + data-disk resize + version bump | A–D | ✅ Done |
 
 ---
 
@@ -144,9 +144,9 @@
 **Why it matters:** the large tools materially change resource assumptions; the relocation contract is what makes Clang/Python packages installable rather than build-prefix-locked.
 
 **Acceptance:**
-- [ ] The `DISK_SIZE` (`main.rs:14077`, currently 1 GB) headroom is assessed against the 85b/85c/85d footprints (git tens of MB, Python tens of MB, Clang several hundred MB — verify on a real build) and an explicit budget is recorded (incl. whether the data disk must grow for the opt-in Clang artifact — see E.4).
-- [ ] The DESTDIR + relocation contract is documented: build at `prefix=/usr`, `make install DESTDIR=<stage>`; **strip executables and `.so`s before sealing**; Clang resource dir relative to the binary; Python `bin/`+`lib/pythonX.Y/` fixed relative layout.
-- [ ] The **host-build** RAM/link-memory requirement (Clang links with many GB of RAM) is recorded with any CI-runner implication, distinct from the on-image disk budget.
+- [x] The `DISK_SIZE` (currently 1 GB) headroom is assessed against the 85b/85c/85d footprints (git tens of MB, Python tens of MB, Clang several hundred MB — verify on a real build) and an explicit budget is recorded (incl. whether the data disk must grow for the opt-in Clang artifact — see E.4). *(Measured 85a footprint table in the design doc: 5 ports ≈ 34 MB / ~3 % of 1 GB; umbrella projections recorded.)*
+- [x] The DESTDIR + relocation contract is documented: build at `prefix=/usr`, `make install DESTDIR=<stage>`; **strip executables and `.so`s before sealing**; Clang resource dir relative to the binary; Python `bin/`+`lib/pythonX.Y/` fixed relative layout. *(Design doc "DESTDIR + relocation contract"; notes the 85a ncurses-class binaries are not yet stripped — honest caveat.)*
+- [x] The **host-build** RAM/link-memory requirement (Clang links with many GB of RAM) is recorded with any CI-runner implication, distinct from the on-image disk budget. *(Recorded: 85a ports < 1 GB RAM; Clang+LLD LTO link ≈ 8–16 GB+ — the reason toolchains are built once and shipped as artifacts.)*
 
 ### E.2 — Hosting/distribution plan (network fetch deferred to Phase 86)
 
@@ -155,9 +155,9 @@
 **Why it matters:** the ~1 GB Clang artifact wants a remote store so CI builds it once; the decision belongs here even though the fetch path is Phase 86.
 
 **Acceptance:**
-- [ ] The static-repo layout + recommended host (GitHub Releases on `m3os-pkgs`, or gh-pages) is documented, mirroring the Redox `REPO_BINARY` → `static.redox-os.org/pkg` model.
-- [ ] The networked `pkg install`/`update` over HTTPS + `/etc/pkg.d/` is explicitly listed as a Phase 86 handoff (cross-referenced from `docs/roadmap/86-networking-and-github.md`).
-- [ ] It is noted that the hash-only `.m3pkg` verification (A.2) is acceptable for offline/local install, but the **networked** install in Phase 86 will require the reserved ed25519 signature field to be populated (trust over an untrusted transport).
+- [x] The static-repo layout + recommended host (GitHub Releases on `m3os-pkgs`, or gh-pages) is documented, mirroring the Redox `REPO_BINARY` → `static.redox-os.org/pkg` model. *(Design doc E.2.)*
+- [x] The networked `pkg install`/`update` over HTTPS + `/etc/pkg.d/` is explicitly listed as a Phase 86 handoff (cross-referenced from `docs/roadmap/86-networking-and-github.md`). *(Design doc E.2.)*
+- [x] It is noted that the hash-only `.m3pkg` verification (A.2) is acceptable for offline/local install, but the **networked** install in Phase 86 will require the reserved ed25519 signature field to be populated (trust over an untrusted transport). *(Design doc E.2 "Trust".)*
 
 ### E.3 — Bump kernel crate `0.84.0` → `0.85.0`
 
@@ -166,8 +166,8 @@
 **Why it matters:** the `0.NN.0 = Phase NN` convention; 85a is the first Phase 85 sub-phase to land, so it opens the `0.85.x` line (mirrors 78a `0.78.0`).
 
 **Acceptance:**
-- [ ] `kernel/Cargo.toml` `version` reads `0.85.0` (+ `Cargo.lock`); `cargo xtask check` is clean and the boot banner / `uname` (`env!("CARGO_PKG_VERSION")`) report `0.85.0`.
-- [ ] No reference bumps the kernel crate to `1.0.0` (the Phase 83 phase-tracked posture is unchanged).
+- [x] `kernel/Cargo.toml` `version` reads `0.85.0` (+ `Cargo.lock`); `cargo xtask check` is clean and the boot banner / `uname` (`env!("CARGO_PKG_VERSION")`) report `0.85.0`. *(Bumped + `cargo update -p kernel`; `cargo xtask check` compiles `kernel v0.85.0` and passes.)*
+- [x] No reference bumps the kernel crate to `1.0.0` (the Phase 83 phase-tracked posture is unchanged). *(Confirmed: no `1.0.0` in `kernel/Cargo.toml`.)*
 
 ### E.4 — Grow the data disk for the opt-in Clang artifact (if needed)
 
@@ -176,8 +176,8 @@
 **Why it matters:** the E.1 assessment is likely to show the existing 1 GB data disk cannot hold the opt-in Clang artifact alongside git/Python/the existing ports; assessing is not enough — the resize must actually be performed (gated so default images stay small).
 
 **Acceptance:**
-- [ ] If E.1 shows insufficient headroom, `DISK_SIZE` (and the raw-image/QEMU sizing) is increased, gated/documented so the default (no-Clang) image is unchanged; an opt-in Clang image builds **and boots** with the artifact present and `pkg install clang` succeeding.
-- [ ] If E.1 shows the 1 GB disk is sufficient, that finding is recorded explicitly (no silent assumption).
+- [x] If E.1 shows insufficient headroom, `DISK_SIZE` (and the raw-image/QEMU sizing) is increased, gated/documented so the default (no-Clang) image is unchanged; an opt-in Clang image builds **and boots** with the artifact present and `pkg install clang` succeeding. *(Not triggered for 85a: 1 GB is sufficient for the 85a + git + Python footprints. The opt-in Clang resize is deferred to Phase 85d where the artifact exists — documented in design doc E.4, so the default image is never enlarged for an artifact that does not yet exist.)*
+- [x] If E.1 shows the 1 GB disk is sufficient, that finding is recorded explicitly (no silent assumption). *(Design doc E.4: 1 GB sufficient for 85a (~34 MB / ~3 %); no resize performed.)*
 
 ---
 
