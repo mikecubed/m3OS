@@ -5917,11 +5917,15 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                         }
                         break n as u64;
                     }
-                    // n == 0: stdin EOF (read consumed the EOF flag).
-                    // Fall through to re-check on next iteration —
-                    // has_data will return false now and we'll either
-                    // return EAGAIN (nonblock) or block.
-                    continue;
+                    // n == 0 with has_data() true means the EOF flag was set
+                    // (^D / VEOF on an empty line) and `read` just consumed it.
+                    // A read() that hits EOF MUST return 0 to userspace — not
+                    // loop and re-block — so the reader sees end-of-input. This is
+                    // what lets `^D` exit the Python REPL (and any fgets/readline
+                    // loop) over the serial / kernel console; without it the EOF
+                    // is silently swallowed and the read re-blocks. The flag is
+                    // one-shot, so the next read blocks again as normal.
+                    break 0;
                 }
                 if nonblock {
                     crate::stdin::STDIN_WAITQUEUE.deregister(task_id);
