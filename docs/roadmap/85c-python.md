@@ -1,6 +1,6 @@
 # Phase 85c - Python (CPython)
 
-**Status:** Planned
+**Status:** Implemented (kernel `0.85.2`; `python-smoke` gate green)
 **Source Ref:** phase-85c
 **Depends on:** Phase 85a (Package & Build-Cache Infrastructure), Phase 36 (Expanded Memory) ✅, Phase 45 (Ports System) ✅
 **Builds on:** Adds a host-cross-built CPython interpreter + comprehensive non-networked standard library on top of the Phase 85a packaging substrate, using a two-stage (host-then-target) cross build.
@@ -28,13 +28,21 @@ Build a host CPython of the exact target version, then cross-configure: `--host=
 
 ### Area B — Comprehensive stdlib staging + validation
 
-Stage `bin/python3` + `lib/pythonX.Y/` (the stdlib `.py` + `lib-dynload/*.so`) in fixed relative layout; seal into a `.m3pkg`; `pkg install python`; validate REPL + scripts inside m3OS. Comprehensive scope = build every C extension whose dependency is already present (zlib via `ports/lib/zlib`; `hashlib` built-ins), explicitly excluding networking/TLS extensions (Phase 86).
+Stage `bin/python3` + `lib/pythonX.Y/` (the stdlib `.py`; all C extensions are builtin — see "Static interpreter" below, so there is no `lib-dynload`) in fixed relative layout; seal into a `.m3pkg`; `pkg install python`; validate REPL + scripts inside m3OS. Comprehensive scope = build every C extension whose dependency is already present (zlib via `ports/lib/zlib`; `hashlib` built-ins), explicitly excluding networking/TLS extensions (Phase 86).
 
 ## Important Components and How They Work
 
 ### `build_python` in `port_build.rs`
 
-A new port `build_*` function: build the host interpreter, then the cross interpreter via the musl toolchain plumbing, DESTDIR-install the full prefix, and hand the staged tree to the 85a sealing step. Registered in `PORTS` + dispatch.
+A new port `build_*` function: build the host interpreter, then the cross interpreter via the musl toolchain plumbing, DESTDIR-install the full prefix, and hand the staged tree to the 85a sealing step. Registered in the dispatch + `build_python_port()` entry point + bundled via `BUNDLE_ONLY_PORTS`.
+
+### Static interpreter (the model that runs on m3OS)
+
+The interpreter is **fully static**: `MODULE_BUILDTYPE=static` builds every stdlib C extension *into* `python3`, and `LDFLAGS=-static` embeds musl libc — no `PT_INTERP`, no `lib-dynload`, no `dlopen`. This is not the usual desktop CPython layout; it is forced by m3OS reality. m3OS's `/lib/ld-musl-x86_64.so.1` is a *custom Rust loader reimplementation* (`userspace/ld-musl-x86_64.so.1/`) and m3OS ships **no real musl `libc.so`** (the userland is `no_std` Rust). A dynamic CPython faults at startup the moment the loader hits the interpreter's `DT_NEEDED libc.so` — there is nothing to satisfy it, let alone the thousands of libc symbols a real C program needs. So Python is shipped static, exactly like the `git` port. (The dynamic build was implemented first and surfaced this in the first in-m3OS gate: `ldso: DT_NEEDED not found: libc.so`.) Lifting this is a Phase 86 concern (a real musl libc/`lib-dynload` story for m3OS).
+
+### Frozen stdlib in `python312.zip`
+
+m3OS's ring-3 VFS is slow (`vfs_server: slow req … STAT_PATH elapsed_us=80000-200000` — 80-200 ms per path stat), so the ~1700 loose stdlib files made `pkg install python` and every cold `import` (a per-module `sys.path` stat storm) take minutes — the first static gate run timed out installing. `build_python` therefore byte-compiles the stdlib and freezes it into a single `lib/python312.zip` of `.pyc` (already on CPython's default `sys.path`; zipimport reads the archive directory once, no per-file stats). The package drops from ~1700 files to a few hundred, install + import become fast, and only the `os.py` getpath landmark is kept as a loose file so `sys.prefix` still resolves.
 
 ### Relocation contract
 

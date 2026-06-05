@@ -21,10 +21,14 @@ MAINTAINER=m3os
 #   --host=x86_64-linux-musl --build=$(gcc -dumpmachine)  — triples differ, so
 #       autoconf enters cross-compile mode and honours the ac_cv_* cache answers.
 #   --with-build-python=<stage1 host python>  — the same-version build interpreter.
-#   --disable-shared      — no libpython3.12.so; it is static-linked into python3
-#                           (python3 itself stays a normal dynamic musl ELF that
-#                           dlopen()s its lib-dynload/*.so extensions via the
-#                           ld-musl-x86_64.so.1 loader already on the data disk).
+#   --disable-shared + MODULE_BUILDTYPE=static + LDFLAGS=-static — a FULLY STATIC
+#                           interpreter: every stdlib C extension is built *into*
+#                           python3 (no lib-dynload, no dlopen) and musl libc is
+#                           embedded (no PT_INTERP). This is the ONLY model that
+#                           runs on m3OS — its `/lib/ld-musl-x86_64.so.1` is a
+#                           custom Rust loader with no real `libc.so`, so a
+#                           dynamic CPython faults at startup on `DT_NEEDED
+#                           libc.so`. Same model as the static `git` port.
 #   --disable-ipv6        — no IPv6 (and sidesteps the cross getaddrinfo probe).
 #   --without-ensurepip   — no bundled pip (no networked installer; Phase 86).
 #   --without-pymalloc    — use the libc allocator directly.
@@ -33,8 +37,9 @@ MAINTAINER=m3os
 #       target device nodes; supply the answers so configure does not guess.
 #
 # DEPS=zlib provides the `zlib`/`gzip`/`zipfile` compression extensions (links
-# the staged `libz.a` from ports/lib/zlib). zlib is built with -fPIC so its
-# static archive can be linked into a shared lib-dynload `.so`.
+# the staged `libz.a` from ports/lib/zlib statically into the interpreter). zlib
+# is built `-fPIC` (harmless for the static link, and keeps the archive reusable
+# for any future shared consumer).
 #
 # Deferred to Phase 86 (deliberately NOT built — absence is documented, not
 # silently broken): `_ssl`/`_hashlib`-OpenSSL (TLS), DNS/getaddrinfo name
