@@ -1,11 +1,11 @@
 # Phase 85c — Python (CPython): Task List
 
-**Status:** Planned (authored ahead of implementation)
+**Status:** In Progress (feat/phase-85c-python)
 **Source Ref:** phase-85c
 **Depends on:** Phase 85a (Package & Build-Cache Infrastructure), Phase 36 (Expanded Memory) ✅, Phase 45 (Ports System) ✅
 **Goal:** Two-stage cross-build a CPython interpreter + comprehensive non-networked standard library, package it via the Phase 85a `.m3pkg` substrate, install it with `pkg install python`, and validate REPL + script workloads inside m3OS.
 
-> **Planning task list authored ahead of implementation.** All acceptance items are intentionally **unchecked `[ ]`**. Builds on the 85a substrate; do not start before 85a lands.
+> **Implementation underway on `feat/phase-85c-python`.** Acceptance items are checked `[x]` as each is implemented and validated. Builds on the 85a substrate.
 
 ## Track Layout
 

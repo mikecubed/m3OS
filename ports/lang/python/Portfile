@@ -1,0 +1,43 @@
+NAME=python
+VERSION=3.12.8
+DESCRIPTION="CPython interpreter (non-networked core: no ssl/DNS/pip)"
+CATEGORY=lang
+DEPS=zlib
+URL=https://www.python.org/ftp/python/3.12.8/Python-3.12.8.tar.xz
+SHA256=c909157bb25ec114e5869124cc2a9c4a4d4c1e957ca4ff553f1edc692101154e
+MAINTAINER=m3os
+
+# Phase 85c — CPython is the second real cross-compiled toolchain on top of the
+# Phase 85a `.m3pkg` substrate (after Phase 85b's git). Unlike git's plain
+# Makefile, CPython needs a *two-stage* cross build: a build-platform interpreter
+# of the EXACT same version (`--with-build-python`) must exist before the target
+# interpreter can cross-configure (it runs target-version bytecode at build time
+# — freezing the importlib bootstrap, generating `_sysconfigdata`, byte-compiling
+# the stdlib). The host stage and the target stage are both driven from this one
+# source extraction via out-of-tree (VPATH) build dirs. See `build_python` in
+# xtask/src/port_build.rs for the full recipe.
+#
+# Cross flags (Track A.2):
+#   --host=x86_64-linux-musl --build=$(gcc -dumpmachine)  — triples differ, so
+#       autoconf enters cross-compile mode and honours the ac_cv_* cache answers.
+#   --with-build-python=<stage1 host python>  — the same-version build interpreter.
+#   --disable-shared      — no libpython3.12.so; it is static-linked into python3
+#                           (python3 itself stays a normal dynamic musl ELF that
+#                           dlopen()s its lib-dynload/*.so extensions via the
+#                           ld-musl-x86_64.so.1 loader already on the data disk).
+#   --disable-ipv6        — no IPv6 (and sidesteps the cross getaddrinfo probe).
+#   --without-ensurepip   — no bundled pip (no networked installer; Phase 86).
+#   --without-pymalloc    — use the libc allocator directly.
+#   --disable-test-modules — drop the multi-MB `test` package from the install.
+#   ac_cv_file__dev_ptmx=no ac_cv_file__dev_ptc=no — the cross stage cannot stat
+#       target device nodes; supply the answers so configure does not guess.
+#
+# DEPS=zlib provides the `zlib`/`gzip`/`zipfile` compression extensions (links
+# the staged `libz.a` from ports/lib/zlib). zlib is built with -fPIC so its
+# static archive can be linked into a shared lib-dynload `.so`.
+#
+# Deferred to Phase 86 (deliberately NOT built — absence is documented, not
+# silently broken): `_ssl`/`_hashlib`-OpenSSL (TLS), DNS/getaddrinfo name
+# resolution, `http.client`/`urllib`, `pip`, `venv`, `asyncio`, `ctypes`/`_ctypes`
+# (needs libffi), `sqlite3`, `readline`/`curses`, `tkinter`. `hashlib` still works
+# via CPython's built-in HACL*-backed `_md5`/`_sha*` modules (no OpenSSL).
