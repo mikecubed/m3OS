@@ -2671,12 +2671,45 @@ fn display_server_inject_key_enabled() -> bool {
 /// init skips the serial autologin path so the Phase 71 GUI greeter
 /// is the sole user-session entry point.
 fn graphical_only_enabled() -> bool {
+    // Launch-time fw_cfg override (exposed by the kernel at /proc/m3os-boot-mode)
+    // wins over the on-disk marker, so `cargo xtask run` / `run-gui` pick the
+    // boot mode per launch without rewriting the persistent data disk. "graphical"
+    // → on, "serial" → off; "auto" / unreadable → fall back to the disk marker
+    // (standalone `cargo xtask image`, real hardware, smoke disks).
+    if let Some(graphical) = boot_mode_override() {
+        return graphical;
+    }
     let fd = open(GRAPHICAL_ONLY_MARKER_PATH, O_RDONLY, 0);
     if fd < 0 {
         return false;
     }
     close(fd as i32);
     true
+}
+
+/// Read the kernel's `/proc/m3os-boot-mode` launch-time override:
+/// `Some(true)` for graphical, `Some(false)` for serial, `None` for `auto` /
+/// no override / unreadable (caller falls back to the on-disk marker).
+fn boot_mode_override() -> Option<bool> {
+    const BOOT_MODE_PROC_PATH: &[u8] = b"/proc/m3os-boot-mode\0";
+    let fd = open(BOOT_MODE_PROC_PATH, O_RDONLY, 0);
+    if fd < 0 {
+        return None;
+    }
+    let mut buf = [0u8; 16];
+    let n = read(fd as i32, &mut buf);
+    close(fd as i32);
+    if n <= 0 {
+        return None;
+    }
+    let s = &buf[..n as usize];
+    if s.starts_with(b"graphical") {
+        Some(true)
+    } else if s.starts_with(b"serial") {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------

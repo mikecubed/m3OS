@@ -4857,12 +4857,21 @@ fn launch_qemu_with_devices_audio(
     display_mode: QemuDisplayMode,
     devices: DeviceSet,
     with_audio: bool,
+    boot_mode: &str,
 ) {
     let ovmf = find_ovmf();
     let mut args = qemu_run_args_with_devices(uefi_image, &ovmf, display_mode, devices);
     if with_audio {
         append_ac97_audio_flags_gui(&mut args);
     }
+    // Pass the launch-time boot mode to the guest via QEMU `fw_cfg`. The kernel
+    // reads `opt/m3os/boot-mode` at boot and exposes it at `/proc/m3os-boot-mode`,
+    // which init prefers over the on-disk `/etc/m3os-graphical-only` marker — so
+    // `run` (serial) and `run-gui` (graphical) boot the SAME persistent data disk
+    // either way without `--fresh`. (Smoke/test launches don't set this and fall
+    // back to the disk marker, keeping CI behaviour byte-for-byte unchanged.)
+    args.push("-fw_cfg".to_string());
+    args.push(format!("name=opt/m3os/boot-mode,string={boot_mode}"));
 
     if display_mode == QemuDisplayMode::Gui {
         println!(
@@ -18118,7 +18127,15 @@ fn cmd_run(fresh: bool, devices: DeviceSet, with_audio: bool) {
         false,
         false, // graphical_login — autologin / serial path
     );
-    launch_qemu_with_devices_audio(&uefi_image, QemuDisplayMode::Headless, devices, with_audio);
+    // `cargo xtask run` is the headless serial path → boot serial regardless of
+    // how the data disk's on-disk marker was created.
+    launch_qemu_with_devices_audio(
+        &uefi_image,
+        QemuDisplayMode::Headless,
+        devices,
+        with_audio,
+        "serial",
+    );
 }
 
 fn cmd_run_gui(fresh: bool, devices: DeviceSet, with_audio: bool, skip_login: bool) {
@@ -18145,7 +18162,19 @@ fn cmd_run_gui(fresh: bool, devices: DeviceSet, with_audio: bool, skip_login: bo
         false,
         graphical_login, // Phase 71 — gated by --skip-login
     );
-    launch_qemu_with_devices_audio(&uefi_image, QemuDisplayMode::Gui, devices, with_audio);
+    // `run-gui` boots the GUI greeter by default; `--skip-login` (graphical_login
+    // = false) flips to the serial autologin path on the framebuffer.
+    launch_qemu_with_devices_audio(
+        &uefi_image,
+        QemuDisplayMode::Gui,
+        devices,
+        with_audio,
+        if graphical_login {
+            "graphical"
+        } else {
+            "serial"
+        },
+    );
 }
 
 fn cmd_runner(kernel_binary: PathBuf) {

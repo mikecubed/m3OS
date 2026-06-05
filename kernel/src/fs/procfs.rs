@@ -62,9 +62,10 @@ pub fn path_node(abs_path: &str) -> Option<ProcfsNode> {
     let rel = path.strip_prefix("/proc/")?;
     let parts: Vec<&str> = rel.split('/').filter(|part| !part.is_empty()).collect();
     match parts.as_slice() {
-        ["meminfo" | "kmsg" | "stat" | "uptime" | "version" | "mounts" | "cpuinfo" | "loadavg"] => {
-            Some(ProcfsNode::File)
-        }
+        [
+            "meminfo" | "kmsg" | "stat" | "uptime" | "version" | "mounts" | "cpuinfo" | "loadavg"
+            | "m3os-boot-mode",
+        ] => Some(ProcfsNode::File),
         ["self"] => Some(ProcfsNode::Symlink(alloc::format!(
             "/proc/{}",
             current_pid()
@@ -208,6 +209,7 @@ pub fn read_file(abs_path: &str) -> Option<Vec<u8>> {
         ["mounts"] => render_mounts(),
         ["cpuinfo"] => render_cpuinfo(),
         ["loadavg"] => render_loadavg(),
+        ["m3os-boot-mode"] => render_boot_mode(),
         [pid, "status"] => render_status(process_snapshot(parse_pid_component(pid)?)?),
         [pid, "cmdline"] => render_cmdline(process_snapshot(parse_pid_component(pid)?)?),
         [pid, "maps"] => render_maps(process_snapshot(parse_pid_component(pid)?)?),
@@ -257,6 +259,7 @@ pub fn list_dir(abs_path: &str) -> Option<Vec<(String, bool)>> {
             (String::from("mounts"), false),
             (String::from("cpuinfo"), false),
             (String::from("loadavg"), false),
+            (String::from("m3os-boot-mode"), false),
         ];
         // Phase 72b — match Linux's default `/proc` policy: every
         // user can see every PID. Linux only hides PIDs under the
@@ -721,6 +724,18 @@ fn render_uptime() -> String {
     let secs = ticks / TICKS_PER_SEC;
     let centis = (ticks % TICKS_PER_SEC) * 100 / TICKS_PER_SEC;
     alloc::format!("{secs}.{centis:02} {secs}.{centis:02}\n")
+}
+
+/// `/proc/m3os-boot-mode` — the launch-time boot-mode override read from QEMU
+/// `fw_cfg` at boot: `graphical`, `serial`, or `auto` (no override, so `init`
+/// falls back to the `/etc/m3os-graphical-only` disk marker).
+fn render_boot_mode() -> String {
+    let mode = match crate::fwcfg::boot_mode() {
+        crate::fwcfg::BOOT_MODE_GRAPHICAL => "graphical",
+        crate::fwcfg::BOOT_MODE_SERIAL => "serial",
+        _ => "auto",
+    };
+    alloc::format!("{mode}\n")
 }
 
 fn render_version() -> String {
