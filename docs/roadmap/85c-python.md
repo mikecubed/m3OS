@@ -28,7 +28,7 @@ Build a host CPython of the exact target version, then cross-configure: `--host=
 
 ### Area B — Comprehensive stdlib staging + validation
 
-Stage `bin/python3` + `lib/pythonX.Y/` (the stdlib `.py`; all C extensions are builtin — see "Static interpreter" below, so there is no `lib-dynload`) in fixed relative layout; seal into a `.m3pkg`; `pkg install python`; validate REPL + scripts inside m3OS. Comprehensive scope = build every C extension whose dependency is already present (zlib via `ports/lib/zlib`; `hashlib` built-ins), explicitly excluding networking/TLS extensions (Phase 86).
+Stage `bin/python3` + `lib/pythonX.Y/` (the stdlib `.py`; all C extensions are builtin — see "Static interpreter" below, so there is no `lib-dynload`) in fixed relative layout; seal into a `.m3pkg`; `pkg install python`; validate REPL + scripts inside m3OS. Comprehensive scope = build every C extension whose dependency is already present — `zlib`/`gzip`/`zipfile` against `ports/lib/zlib`, `_curses`/`_curses_panel` against the ported wide `ports/lib/ncurses` (the same `libncursesw.a`/`libtinfow.a`/`libpanelw.a` archives less/htop/tmux link; `curses.ncurses_version` reports 6.5 inside m3OS), and `hashlib` via the HACL\* built-ins — explicitly excluding networking/TLS extensions (Phase 86) and `dlopen`-only extensions like `ctypes` (Phase 91). A module is deferred only when its external library is genuinely not yet ported (sqlite3, GNU readline, gdbm, Tk, libffi, libbz2, liblzma, libuuid) — never when the dependency is already in the tree.
 
 ## Important Components and How They Work
 
@@ -63,7 +63,7 @@ CPython derives `sys.prefix`/`sys.exec_prefix` by searching upward from the exec
 ## Acceptance Criteria
 
 - CPython builds reproducibly via `cargo xtask port build python` and seals into a `.m3pkg`.
-- Inside m3OS: `python3 -c "print('hello from m3OS')"` prints; `import json, re, math, datetime, argparse, hashlib` succeeds; a bundled `/usr/src/fibonacci.py` runs; a file write+read round-trips; `sys.platform` reports the expected value (serial-validated gate).
+- Inside m3OS: `python3 -c "print('hello from m3OS')"` prints; `import json, re, math, datetime, argparse, hashlib, curses, curses.panel, threading` succeeds (the static `_curses`/`_curses_panel` link the ported ncurses — `curses.ncurses_version` reports 6.5; `threading` rides the `_thread` builtin); a bundled `/usr/src/fibonacci.py` runs; a file write+read round-trips; `sys.platform` reports the expected value (serial-validated gate).
 - Python is installed via `pkg install python` from a bundled `.m3pkg`.
 - Networking/TLS modules (`ssl`, DNS/`getaddrinfo` name resolution, `pip`, `asyncio`) remain absent (deferred to Phase 86); their absence is documented, not silently failing. (`_socket` itself may build against the existing TCP/UDP + AF_UNIX stack; what is deferred is name resolution and TLS, not the extension as a whole.)
 
@@ -80,4 +80,5 @@ CPython derives `sys.prefix`/`sys.exec_prefix` by searching upward from the exec
 
 - **A dynamic interpreter** — a real musl `libc.so` + the syscall coverage a dynamic libc needs, then a dynamic `python3` with real `lib-dynload` `.so` extensions and `ctypes`/`dlopen` of arbitrary shared objects — is [Phase 91 (Dynamic C Runtime)](./91-dynamic-c-runtime.md). 85c ships fully static (every C extension builtin) because m3OS's Phase 76 loader has no `libc.so` to bind a dynamic C program against; Phase 91 lifts that.
 - `ssl`/`_hashlib`-OpenSSL, DNS/`getaddrinfo` name resolution, `http.client`/`urllib`, `pip`, `venv`, `asyncio` — Phase 86. (`hashlib` itself works via CPython's built-in HACL\*-backed `_md5`/`_sha*` modules with no OpenSSL.)
-- `threading`/`multiprocessing`, `ctypes`/cffi (needs `dlopen` at runtime → Phase 91), `sqlite3`, `readline`/`curses`, tkinter, NumPy/SciPy.
+- `multiprocessing` (fork/exec + POSIX-semaphore IPC) — note `threading` itself is **not** deferred: the `_thread` builtin is on and pure-Python `threading` works single-process today.
+- `ctypes`/cffi (needs `dlopen` at runtime → Phase 91), `sqlite3`, GNU `readline`, `tkinter`, `_bz2`/`_lzma`/`_uuid`/`_gdbm`, NumPy/SciPy — each deferred because its external library is not yet ported. (`curses` is **not** in this list: ncurses is already ported, so `_curses`/`_curses_panel` are built, per the Area B scope rule.)

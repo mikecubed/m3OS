@@ -13913,7 +13913,7 @@ fn python_smoke_steps() -> Vec<SmokeStep> {
         // CPython package is larger than git's (~50 MB of stdlib + lib-dynload),
         // so the per-step ceiling is generous; the global `--timeout` min-clamps
         // every step, so this is only fully available when nothing earlier ate
-        // the clock. Intended to run via pre-push at `--timeout 600`.
+        // the clock. Intended to run via pre-push at `--timeout 900`.
         fail_prefix: "pkg install: cannot",
         timeout_secs: 360,
         label: "python-smoke: python installed from .m3pkg",
@@ -13941,17 +13941,23 @@ fn python_smoke_steps() -> Vec<SmokeStep> {
     });
 
     // 3. REPL-equivalent `-c` run: imports the gate-required stdlib (every C
-    //    extension is builtin in the static interpreter — `math` resolves with no
-    //    dlopen), checks sys.platform, the HACL-backed hashlib digest (no
-    //    OpenSSL), and os.urandom/secrets (the getrandom syscall). Prints a
-    //    runtime sentinel; a Traceback from any failed import/exception is caught.
+    //    extension is builtin in the static interpreter — `math`/`curses` resolve
+    //    with no dlopen), checks sys.platform, the HACL-backed hashlib digest (no
+    //    OpenSSL), os.urandom/secrets (the getrandom syscall), the `_curses`
+    //    extension linked against the staged ncurses (`curses.ncurses_version`
+    //    reports 6.5 — proof the ported lib is statically embedded, not deferred),
+    //    `curses.panel` (the `_curses_panel` builtin), and `threading` (the
+    //    `_thread` builtin / PT_TLS pthread path). Prints runtime sentinels; a
+    //    Traceback from any failed import/exception is caught.
     steps.push(SmokeStep::Send {
-        input: "python3 -c \"import sys,json,re,math,datetime,argparse,hashlib,dataclasses,pathlib,os,secrets; \
+        input: "python3 -c \"import sys,json,re,math,datetime,argparse,hashlib,dataclasses,pathlib,os,secrets,threading,curses,curses.panel; \
                  print('PYSMOKE:platform='+sys.platform); \
                  print('PYSMOKE:sha='+hashlib.sha256(b'abc').hexdigest()[:12]); \
                  print('PYSMOKE:rand='+os.urandom(4).hex()+secrets.token_hex(2)); \
+                 print('PYSMOKE:curses=%d.%d' % curses.ncurses_version[:2]); \
+                 print('PYSMOKE:thread='+('ok' if threading.Lock() else 'no')); \
                  print('PYSMOKE:'+'imports'+'OK')\"\n",
-        label: "python-smoke: imports + platform + hashlib + randomness",
+        label: "python-smoke: imports + platform + hashlib + randomness + curses + threading",
     });
     // sys.platform == linux on musl/Linux. Big ceiling: this is the cold-import
     // step (dozens of modules over the slow VFS) — see the NOTE above.
@@ -13965,6 +13971,20 @@ fn python_smoke_steps() -> Vec<SmokeStep> {
         pattern: "PYSMOKE:sha=ba7816bf8f01",
         timeout_secs: 60,
         label: "python-smoke: hashlib sha256 (HACL built-in)",
+    });
+    // `_curses` linked against the staged ncurses 6.5 (not the false-matchable
+    // literal — the command builds it from curses.ncurses_version at runtime).
+    // Proves the curses deferral is closed: the ported dep is embedded statically.
+    steps.push(SmokeStep::Wait {
+        pattern: "PYSMOKE:curses=6.5",
+        timeout_secs: 60,
+        label: "python-smoke: _curses + _curses_panel (static ncurses 6.5)",
+    });
+    // `_thread`/threading works (PT_TLS pthread path); only multiprocessing is out.
+    steps.push(SmokeStep::Wait {
+        pattern: "PYSMOKE:thread=ok",
+        timeout_secs: 30,
+        label: "python-smoke: threading (_thread builtin)",
     });
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: "PYSMOKE:importsOK",
@@ -17172,7 +17192,7 @@ fn populate_phase_69d_ports(part_path: &Path, workspace_root: &Path) {
                 if fs::write(&meta_host, format!("VERSION={version}\nDEPS={deps}\n")).is_ok() {
                     m3pkg_files.push((format!("usr/pkg/{port}.meta"), meta_host));
                 }
-                println!("phase-85b: bundled {port}.m3pkg (bundle-only) into /usr/pkg");
+                println!("ports: bundled {port}.m3pkg (bundle-only) into /usr/pkg");
             }
             Ok(_) => eprintln!("phase-85b: {port}.m3pkg failed verify — skipping bundle"),
             Err(e) => eprintln!("phase-85b: read {} failed: {e}", artifact.display()),

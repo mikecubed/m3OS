@@ -338,6 +338,10 @@ fn build_recipe_id(name: &str) -> &'static str {
         // the checksharedmods neuter. Bump recipe-v whenever any of these change
         // so the cached .m3pkg self-invalidates. (The pinned CPython version +
         // its tarball SHA-256 are folded in separately via the Portfile digest.)
+        // The `ncurses-6.5` token pins the BUILD-only curses dependency (which is
+        // intentionally absent from `port_deps`, so its key is NOT folded in
+        // automatically): bump it in lockstep if ports/lib/ncurses's version or
+        // build recipe changes, so a stale curses link self-invalidates.
         "python" => {
             "two-stage-STATIC:host(--disable-test-modules --without-ensurepip)+\
              cross(MODULE_BUILDTYPE=static LDFLAGS=-static --host=x86_64-linux-musl \
@@ -345,12 +349,14 @@ fn build_recipe_id(name: &str) -> &'static str {
              --disable-ipv6 --without-ensurepip --without-pymalloc --disable-test-modules \
              --prefix=/usr);ac_cv:_dev_ptmx=no,_dev_ptc=no,buggy_getaddrinfo=no;\
              zlib:ZLIB_CFLAGS/ZLIB_LIBS=<staged -fPIC libz.a>;\
-             na=_ctypes,_ctypes_test,_ssl,_hashlib,_curses,_curses_panel,readline,\
+             curses(build-only,ncurses-6.5):CURSES_CFLAGS/CURSES_LIBS/PANEL_LIBS=\
+             <staged wide ncurses libncursesw/libtinfow/libpanelw>;\
+             na=_ctypes,_ctypes_test,_ssl,_hashlib,readline,\
              _sqlite3,_dbm,_gdbm,_tkinter,nis,_uuid,_bz2,_lzma,ossaudiodev,_crypt;\
              neuter=checksharedmods;\
              prune=libpython.a,pkgconfig,config-3.12,ensurepip,idlelib,tkinter,\
              turtledemo,turtle.py,lib2to3,asyncio,2to3,idle3,lib-dynload,__pycache__;\
-             freeze=stdlib->python312.zip(.pyc,STORED),keep=os.py;recipe-v=3"
+             freeze=stdlib->python312.zip(.pyc,STORED),keep=os.py;recipe-v=5"
         }
         _ => "",
     }
@@ -523,7 +529,14 @@ pub fn port_deps(name: &str) -> &'static [&'static str] {
         "git" => &["zlib"],
         // Phase 85c — CPython's `zlib`/`gzip`/`zipfile` extensions link the
         // staged (-fPIC) libz.a. zlib is a leaf, so the non-recursive dep-key
-        // computation is correct here too.
+        // computation is correct here too. NOTE: ncurses (for `_curses`/
+        // `_curses_panel`) is a BUILD-only dependency, deliberately NOT listed
+        // here — it is built explicitly by `build_python_port` and linked
+        // *statically* into the interpreter, so nothing needs to `pkg install`
+        // it at runtime (and its multi-thousand-file terminfo DB would blow the
+        // gate's install budget over m3OS's slow VFS — terminfo is already
+        // pre-installed via the phase-69d port mirror anyway). The ncurses
+        // version pin is folded into `build_recipe_id("python")` instead.
         "python" => &["zlib"],
         _ => &[],
     }
@@ -790,7 +803,7 @@ fn port_build(name: &str) -> Result<(), String> {
             &libevent_stage,
         )?,
         "git" => build_git(&extracted, &stage, &toolchain, &zlib_stage)?,
-        "python" => build_python(&extracted, &stage, &toolchain, &zlib_stage)?,
+        "python" => build_python(&extracted, &stage, &toolchain, &zlib_stage, &ncurses_stage)?,
         _ => return Err(format!("no host build recipe for port {name}")),
     }
 
@@ -1547,6 +1560,7 @@ fn build_python(
     stage: &Path,
     (cc, ar, ranlib): &(&'static str, String, String),
     zlib_stage: &Path,
+    ncurses_stage: &Path,
 ) -> Result<(), String> {
     let zlib_prefix = zlib_stage.join("usr/local");
     if !zlib_prefix.join("lib/libz.a").exists() {
@@ -1555,6 +1569,21 @@ fn build_python(
             zlib_prefix.join("lib/libz.a").display()
         ));
     }
+    // The wide ncurses the `_curses`/`_curses_panel` extensions statically link
+    // — the same archives less/htop/tmux consume (`build_ncurses` stages
+    // `libncursesw.a` + `libtinfow.a` + `libpanelw.a` and the widec headers
+    // directly under `include/`, the `--enable-overwrite` layout). `_curses` is
+    // a non-networked extension whose dependency (ncurses) is already a ported
+    // library, so the phase's "build every C extension whose dependency is
+    // already present" scope rule requires building it (not deferring it).
+    let ncurses_prefix = ncurses_stage.join("usr/local");
+    if !ncurses_prefix.join("lib/libncursesw.a").exists() {
+        return Err(format!(
+            "python build: staged ncurses not found at {} (build the ncurses port first)",
+            ncurses_prefix.join("lib/libncursesw.a").display()
+        ));
+    }
+    let have_panel = ncurses_prefix.join("lib/libpanelw.a").exists();
 
     // build-host / build-cross are siblings of the extracted source so a single
     // tarball extraction feeds both out-of-tree builds.
@@ -1597,33 +1626,62 @@ fn build_python(
     println!("python: stage 2 — cross configure (build={build_triple} host=x86_64-linux-musl)");
 
     let extra_ld = musl_extra_ldflags_joined();
-    let cppflags = format!("-I{}/include", zlib_prefix.display());
+    // Both staged ports on the include + link search path: zlib (zlib/gzip) and
+    // wide ncurses (curses). The `include/ncursesw` arm is harmless when absent
+    // (our `--enable-overwrite` ncurses installs the widec headers in `include/`).
+    let cppflags = format!(
+        "-I{0}/include -I{1}/include -I{1}/include/ncursesw",
+        zlib_prefix.display(),
+        ncurses_prefix.display()
+    );
     // `-static`: the interpreter embeds musl libc (no PT_INTERP) so it runs on
     // m3OS's loaderless static-binary path (see the why-static note above).
+    let lib_search = format!(
+        "-L{}/lib -L{}/lib",
+        zlib_prefix.display(),
+        ncurses_prefix.display()
+    );
     let ldflags = if extra_ld.is_empty() {
-        format!("-static -L{}/lib", zlib_prefix.display())
+        format!("-static {lib_search}")
     } else {
-        format!("-static -L{}/lib {extra_ld}", zlib_prefix.display())
+        format!("-static {lib_search} {extra_ld}")
     };
     // Force CPython's `zlib` extension onto OUR staged (-fPIC) libz.a, bypassing
     // any pkg-config that would otherwise point it at the build host's system
     // zlib (wrong libc). These two vars override the configure PKG_CHECK_MODULES.
     let zlib_cflags = format!("-I{}/include", zlib_prefix.display());
     let zlib_libs = format!("-L{}/lib -lz", zlib_prefix.display());
+    // Same override for `_curses`/`_curses_panel`: point CPython at OUR staged
+    // wide ncurses, not the build host's system curses (wrong libc). Mirrors
+    // build_htop's CURSES_CFLAGS/CURSES_LIBS. Static link order matters —
+    // panel → ncurses → tinfo. (`build_ncurses` splits tinfo via `--with-termlib`.)
+    let curses_cflags = format!(
+        "-I{0}/include -I{0}/include/ncursesw",
+        ncurses_prefix.display()
+    );
+    let curses_libs = format!("-L{}/lib -lncursesw -ltinfow", ncurses_prefix.display());
+    let panel_libs = format!(
+        "-L{}/lib -lpanelw -lncursesw -ltinfow",
+        ncurses_prefix.display()
+    );
 
     // Stdlib extensions whose external system library we do NOT provide for the
     // target. Forced to `n/a` so the build never *attempts* them — a build host
     // that happens to ship the -dev package (e.g. libffi for `_ctypes`) must not
     // change what gets cross-built (reproducibility). Per CPython 3.12 configure,
     // only `n/a` (not `disabled`) survives the per-module detection overwrite.
-    // All are Phase 86+ deferred; `zlib` is intentionally absent here (provided).
+    // `zlib` and `_curses`/`_curses_panel` are intentionally absent — their deps
+    // (zlib, ncurses) are ported and staged above, so they ARE built. The split:
+    //   • `_ctypes` (libffi + dlopen) → Phase 91 (Dynamic C Runtime).
+    //   • `_ssl`/`_hashlib`-OpenSSL → Phase 86 (TLS/networking).
+    //   • everything else here depends on a library m3OS has not ported yet
+    //     (GNU readline, sqlite3, gdbm, tk, libffi, libbz2, liblzma, libuuid,
+    //     libxcrypt) — genuine dependency-absent deferrals, not scope cuts.
     let disabled_modules = [
         "_ctypes",
         "_ctypes_test",
         "_ssl",
         "_hashlib",
-        "_curses",
-        "_curses_panel",
         "readline",
         "_sqlite3",
         "_dbm",
@@ -1663,6 +1721,12 @@ fn build_python(
         .env("LDFLAGS", &ldflags)
         .env("ZLIB_CFLAGS", &zlib_cflags)
         .env("ZLIB_LIBS", &zlib_libs)
+        // Point `_curses`/`_curses_panel` at the staged wide ncurses (overrides
+        // the configure pkg-config probe, exactly like ZLIB_CFLAGS/ZLIB_LIBS).
+        .env("CURSES_CFLAGS", &curses_cflags)
+        .env("CURSES_LIBS", &curses_libs)
+        .env("PANEL_CFLAGS", &curses_cflags)
+        .env("PANEL_LIBS", &panel_libs)
         // Cross cache answers: the target device nodes can't be stat'd, and the
         // getaddrinfo probe can't run, on the build host.
         .env("ac_cv_file__dev_ptmx", "no")
@@ -1685,6 +1749,12 @@ fn build_python(
     cross_make.current_dir(&build_cross).arg(&jobs);
     run(&mut cross_make, "python cross make")?;
 
+    // Fail fast (before the multi-minute in-OS gate) if configure silently
+    // skipped curses — `make` does NOT error when a module fails its detection
+    // probe, it just omits it. The generated builtin module table proves it was
+    // compiled *into* the static interpreter.
+    assert_curses_builtin(&build_cross, have_panel)?;
+
     println!(
         "python: stage 2 — cross install (DESTDIR={})",
         stage.display()
@@ -1699,6 +1769,47 @@ fn build_python(
     prune_python_stage(stage)?;
     freeze_stdlib_zip(stage, &host_py)?;
     assert_python_layout(stage)?;
+    Ok(())
+}
+
+/// Assert `_curses` (and, when `libpanelw.a` was staged, `_curses_panel`) were
+/// compiled **into** the interpreter. CPython's `make` is silent when a module
+/// fails its configure probe — it just omits it and the only symptom is a
+/// runtime `ImportError`. The generated builtin module table
+/// (`Modules/config.c`, written by `makesetup` during `make`) lists a
+/// `{"_curses", PyInit__curses}` entry for every statically-linked extension, so
+/// its presence is a direct build-time proof. Best-effort on path: if the
+/// generated table is not where we expect (an upstream layout change), warn and
+/// defer to the in-OS `import curses` gate rather than false-failing the build.
+fn assert_curses_builtin(build_cross: &Path, have_panel: bool) -> Result<(), String> {
+    let config_c = build_cross.join("Modules/config.c");
+    let Ok(content) = fs::read_to_string(&config_c) else {
+        eprintln!(
+            "python: warning: {} not found — cannot statically verify _curses; \
+             relying on the in-OS import gate",
+            config_c.display()
+        );
+        return Ok(());
+    };
+    if !content.contains("PyInit__curses") {
+        return Err(
+            "python build: _curses was NOT compiled into the interpreter (no PyInit__curses in \
+             Modules/config.c) — the configure curses probe failed; check CURSES_CFLAGS/CURSES_LIBS \
+             point at the staged wide ncurses"
+                .to_string(),
+        );
+    }
+    if have_panel && !content.contains("PyInit__curses_panel") {
+        return Err(
+            "python build: _curses_panel was NOT compiled in despite a staged libpanelw.a (no \
+             PyInit__curses_panel in Modules/config.c) — check PANEL_LIBS"
+                .to_string(),
+        );
+    }
+    println!(
+        "python: verified _curses{} builtin (linked against staged ncurses)",
+        if have_panel { " + _curses_panel" } else { "" }
+    );
     Ok(())
 }
 
@@ -1840,9 +1951,10 @@ fn freeze_stdlib_zip(stage: &Path, host_py: &Path) -> Result<(), String> {
         .arg(&pylib);
     let _ = compile.status();
 
-    // 2. Pack every .pyc into lib/python312.zip. STORED, not deflated: the host
-    //    build interpreter has no zlib module, and the `.m3pkg` packer compresses
-    //    the whole artifact anyway.
+    // 2. Pack every .pyc into lib/python312.zip. STORED, not deflated: the
+    //    `.m3pkg` packer already compresses the whole artifact, so per-entry
+    //    deflate is wasted work — and STORED avoids depending on the host build
+    //    interpreter's zlib extension being present.
     let script = "import sys,os,zipfile\n\
                   pylib,zp=sys.argv[1],sys.argv[2]\n\
                   n=0\n\
@@ -1951,8 +2063,8 @@ fn assert_python_layout(stage: &Path) -> Result<(), String> {
     }
     println!(
         "python: staged static /usr/bin/python3 + frozen stdlib (python{}.zip; all C \
-         extensions builtin; zlib/gzip + hashlib via built-in HACL _md5/_sha*; \
-         _ssl/_hashlib/_ctypes/DNS absent)",
+         extensions builtin; zlib/gzip + curses (wide ncurses) + hashlib via built-in HACL \
+         _md5/_sha*; _ssl/_hashlib/_ctypes/DNS absent)",
         PYTHON_XY.replace('.', "")
     );
     Ok(())
@@ -2191,11 +2303,17 @@ pub fn build_git_port() -> Result<(), String> {
     Ok(())
 }
 
-/// Phase 85c — build the zlib + python ports so their sealed `.m3pkg` artifacts
-/// exist for the image populator to bundle into `/usr/pkg/`. The first build
-/// two-stage cross-compiles CPython (several minutes); a warm pkgcache makes
-/// this a zero-compiler hit. zlib is built first so [`build_python`] finds the
-/// staged (-fPIC) `libz.a` for the `zlib`/`gzip` extensions.
+/// Phase 85c — build the zlib + ncurses + python ports so their sealed `.m3pkg`
+/// artifacts exist for the image populator to bundle into `/usr/pkg/`. The first
+/// build two-stage cross-compiles CPython (several minutes); a warm pkgcache
+/// makes this a zero-compiler hit. zlib + ncurses are built first so
+/// [`build_python`] finds the staged `libz.a` (zlib/gzip) and the staged wide
+/// `libncursesw.a`/`libtinfow.a`/`libpanelw.a` (`_curses`/`_curses_panel`).
+/// ncurses is a **build-only** dependency: it is linked *statically* into the
+/// interpreter, so python's runtime `DEPS` is just `zlib` — nothing `pkg
+/// install`s ncurses (its terminfo DB is already pre-installed via the
+/// phase-69d port mirror, and re-installing thousands of terminfo files over
+/// m3OS's slow VFS would blow the gate's install budget).
 pub fn build_python_port() -> Result<(), String> {
     if musl_cc().is_none() {
         return Err(
@@ -2203,6 +2321,7 @@ pub fn build_python_port() -> Result<(), String> {
         );
     }
     port_build("zlib").map_err(|e| format!("port zlib: {e}"))?;
+    port_build("ncurses").map_err(|e| format!("port ncurses: {e}"))?;
     port_build("python").map_err(|e| format!("port python: {e}"))?;
     Ok(())
 }
@@ -2472,6 +2591,11 @@ mod tests {
         assert_eq!(port_deps("libevent"), &[] as &[&str]);
         // Phase 85b — git's one mandatory dependency is zlib.
         assert_eq!(port_deps("git"), &["zlib"]);
+        // Phase 85c — python's one *runtime* dependency is zlib (zlib/gzip).
+        // ncurses (for the statically-linked _curses/_curses_panel) is a
+        // BUILD-only dep, deliberately absent here so the in-OS solver does not
+        // re-install its terminfo DB; its pin is folded via build_recipe_id.
+        assert_eq!(port_deps("python"), &["zlib"]);
         // Unknown port returns empty.
         assert_eq!(port_deps("clang"), &[] as &[&str]);
     }
@@ -2483,7 +2607,9 @@ mod tests {
         // Every host-built port must have a non-empty, distinct configure-flag
         // identity so a flag change self-invalidates its cached .m3pkg and two
         // ports never collide on the recipe component of the key.
-        let ports = ["zlib", "ncurses", "libevent", "less", "htop", "tmux", "git"];
+        let ports = [
+            "zlib", "ncurses", "libevent", "less", "htop", "tmux", "git", "python",
+        ];
         let ids: Vec<&str> = ports.iter().map(|p| build_recipe_id(p)).collect();
         for (p, id) in ports.iter().zip(&ids) {
             assert!(!id.is_empty(), "{p} must have a build_recipe_id");

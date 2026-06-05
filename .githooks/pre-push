@@ -404,12 +404,14 @@ if [ "${M3OS_GIT_REGRESSION:-0}" = "1" ]; then
 fi
 
 # Phase 85c — Python regression gate. Gated behind M3OS_PYTHON_REGRESSION=1
-# because it two-stage cross-compiles CPython (+ zlib) — a several-minute cold
-# build — before booting QEMU and driving `pkg install python` + REPL/import/
-# script/file-IO assertions. Set it on branches that touch ports/lang/python,
-# xtask's build_python / python bundling, the `pkg` installer, the musl dynamic
-# linker / dlopen path (CPython's lib-dynload extensions exercise it), or the
-# kernel mmap / fork-exec / getrandom / ext2 paths the interpreter exercises.
+# because it two-stage cross-compiles CPython (+ zlib + ncurses) — a
+# several-minute cold build — before booting QEMU and driving `pkg install
+# python` + REPL/import/script/file-IO assertions. The interpreter is fully
+# static (MODULE_BUILDTYPE=static, -static, no lib-dynload, no dlopen), so set
+# this on branches that touch ports/lang/python, xtask's build_python /
+# freeze_stdlib_zip / curses (ncurses) wiring / python bundling, the `pkg`
+# installer, or the kernel mmap / fork-exec / getrandom / ext2 paths the static
+# interpreter exercises.
 if [ "${M3OS_PYTHON_REGRESSION:-0}" = "1" ]; then
     echo "pre-push: running cargo xtask python-smoke..."
     if ! cargo xtask python-smoke --timeout 900; then

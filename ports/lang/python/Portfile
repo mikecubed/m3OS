@@ -36,13 +36,31 @@ MAINTAINER=m3os
 #   ac_cv_file__dev_ptmx=no ac_cv_file__dev_ptc=no — the cross stage cannot stat
 #       target device nodes; supply the answers so configure does not guess.
 #
-# DEPS=zlib provides the `zlib`/`gzip`/`zipfile` compression extensions (links
-# the staged `libz.a` from ports/lib/zlib statically into the interpreter). zlib
-# is built `-fPIC` (harmless for the static link, and keeps the archive reusable
-# for any future shared consumer).
+# Extensions whose dependency is already a ported library are built (not
+# deferred), matching the phase's "build every C extension whose dependency is
+# already present" scope rule:
+#   zlib    → `zlib`/`gzip`/`zipfile` (links the staged -fPIC `libz.a` from
+#             ports/lib/zlib statically into the interpreter). zlib is the one
+#             RUNTIME dependency (`DEPS=zlib`), so `pkg install python` pulls it.
+#   ncurses → `_curses`/`_curses_panel` (links the staged wide
+#             `libncursesw.a`/`libtinfow.a`/`libpanelw.a` from ports/lib/ncurses,
+#             the same archives less/htop/tmux use). `curses.ncurses_version`
+#             reports 6.5 inside m3OS. ncurses is a BUILD-only dependency — it is
+#             linked statically into `python3`, and its terminfo DB is already
+#             pre-installed via the phase-69d port mirror, so it is deliberately
+#             NOT in `DEPS` (re-installing thousands of terminfo files over
+#             m3OS's slow VFS would blow the in-OS install budget). `build_python`
+#             builds + stages ncurses itself; its version pin lives in
+#             `build_recipe_id("python")`.
 #
-# Deferred to Phase 86 (deliberately NOT built — absence is documented, not
-# silently broken): `_ssl`/`_hashlib`-OpenSSL (TLS), DNS/getaddrinfo name
-# resolution, `http.client`/`urllib`, `pip`, `venv`, `asyncio`, `ctypes`/`_ctypes`
-# (needs libffi), `sqlite3`, `readline`/`curses`, `tkinter`. `hashlib` still works
-# via CPython's built-in HACL*-backed `_md5`/`_sha*` modules (no OpenSSL).
+# NOT built (absence documented, not silently broken), grouped by WHY:
+#   • Phase 86 (TLS/networking): `_ssl`/`_hashlib`-OpenSSL, DNS/getaddrinfo name
+#     resolution, `http.client`/`urllib`, `pip`, `venv`, `asyncio`.
+#   • Phase 91 (Dynamic C Runtime): `ctypes`/`_ctypes` — needs libffi *and*
+#     runtime `dlopen`, which the static loaderless interpreter cannot provide.
+#   • Dependency not yet ported (genuine library gap, not a scope cut):
+#     `sqlite3` (libsqlite3), `readline` (GNU readline), `_dbm`/`_gdbm` (gdbm),
+#     `tkinter` (Tk), `_bz2` (libbz2), `_lzma` (liblzma), `_uuid` (libuuid).
+# `hashlib` still works via CPython's built-in HACL*-backed `_md5`/`_sha*`
+# modules (no OpenSSL). `threading` works (the `_thread` builtin is on); only
+# `multiprocessing` (fork/exec + POSIX semaphore IPC) is out of scope.

@@ -1,19 +1,19 @@
 # Phase 85c — Python (CPython): Task List
 
-**Status:** In Progress (feat/phase-85c-python)
+**Status:** Implemented (feat/phase-85c-python; `python-smoke` gate green)
 **Source Ref:** phase-85c
 **Depends on:** Phase 85a (Package & Build-Cache Infrastructure), Phase 36 (Expanded Memory) ✅, Phase 45 (Ports System) ✅
 **Goal:** Two-stage cross-build a CPython interpreter + comprehensive non-networked standard library, package it via the Phase 85a `.m3pkg` substrate, install it with `pkg install python`, and validate REPL + script workloads inside m3OS.
 
-> **Implementation underway on `feat/phase-85c-python`.** Acceptance items are checked `[x]` as each is implemented and validated. Builds on the 85a substrate.
+> **Implemented on `feat/phase-85c-python`.** All acceptance items are checked `[x]` — each was implemented and validated (the `python-smoke` gate passes end-to-end inside m3OS). Builds on the 85a substrate.
 
 ## Track Layout
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Host interpreter + cross `configure` | 85a | Planned |
-| B | stdlib + `lib-dynload` staging + relocation | A | Planned |
-| C | Packaging + install + validation gate + version bump | B, 85a | Planned |
+| A | Host interpreter + cross `configure` | 85a | Complete |
+| B | stdlib staging (all extensions builtin) + relocation | A | Complete |
+| C | Packaging + install + validation gate + version bump | B, 85a | Complete |
 
 ---
 
@@ -79,9 +79,9 @@
 > getpath landmark is kept loose.
 
 **Acceptance:**
-- [x] `make install DESTDIR=<stage>` lays `bin/python3` (→`python3.12`) + `lib/python3.12/` (stdlib `.py`); **every** stdlib C extension is compiled **into** the interpreter (`MODULE_BUILDTYPE=static`) rather than as `lib-dynload/*.so`; the `zlib`/`gzip` extensions build against the staged `ports/lib/zlib` (now `-fPIC`) and `hashlib` works via CPython's built-in HACL\*-backed `_md5`/`_sha*` (no OpenSSL) — host-validated: `import json,re,math,…,zlib,gzip,socket` all succeed, `hashlib.sha256(b'abc')` = `ba7816bf…`.
+- [x] `make install DESTDIR=<stage>` lays `bin/python3` (→`python3.12`) + `lib/python3.12/` (stdlib `.py`); **every** stdlib C extension whose dependency is present is compiled **into** the interpreter (`MODULE_BUILDTYPE=static`) rather than as `lib-dynload/*.so`. `zlib`/`gzip` build against the staged `ports/lib/zlib` (now `-fPIC`); **`_curses`/`_curses_panel` build against the ported wide `ports/lib/ncurses`** (`CURSES_CFLAGS`/`CURSES_LIBS`/`PANEL_LIBS` → staged `libncursesw.a`/`libtinfow.a`/`libpanelw.a`; `assert_curses_builtin` proves `PyInit__curses`/`PyInit__curses_panel` are in the builtin table before the gate runs); `hashlib` works via the built-in HACL\*-backed `_md5`/`_sha*` (no OpenSSL). In-m3OS-validated by the gate: `import json,re,math,…,zlib,gzip,curses,curses.panel,threading` all succeed, `curses.ncurses_version` = 6.5, `hashlib.sha256(b'abc')` = `ba7816bf…`.
 - [x] The interpreter is **stripped** before sealing (`seal_package`→`strip_stage`; stripped static `python3.12` ≈ 9.8 MB). `prune_python_stage` removes the demo-only `lib-dynload/` (and hard-fails if any *real* extension leaked there as shared — a static-build correctness probe).
-- [x] The TLS/name-resolution extensions (`_ssl`, `_hashlib`-OpenSSL, `getaddrinfo`/DNS) are **not** built: every external-lib module is forced `py_cv_module_*=n/a`, and `assert_python_layout` proves the interpreter is static (no `/lib/ld-musl…` interp string). `_socket` *is* builtin (TCP/UDP + AF_UNIX); only DNS resolution + TLS are deferred to Phase 86.
+- [x] The TLS/name-resolution extensions (`_ssl`, `_hashlib`-OpenSSL, `getaddrinfo`/DNS) are **not** built: every external-lib module *whose library is not ported* is forced `py_cv_module_*=n/a`, and `assert_python_layout` proves the interpreter is static (no `/lib/ld-musl…` interp string). `_socket` *is* builtin (TCP/UDP + AF_UNIX); only DNS resolution + TLS are deferred to Phase 86. (`ctypes` → Phase 91; `curses` is **not** deferred — ncurses is a ported dep.)
 
 ### B.2 — Relocation contract (`sys.prefix` landmark)
 
@@ -131,6 +131,6 @@
 
 ## Documentation Notes
 
-- **What changed relative to the standalone roadmap.** `docs/python-roadmap.md` Stage 1 is this sub-phase; its Stage 2 (networking/`ssl`/pip/threading) is Phase 86+.
-- **Honesty.** No `ssl`/DNS resolution/`pip`/`asyncio` here; the docs must state these are deferred, not present-but-broken.
+- **What changed relative to the standalone roadmap.** `docs/python-roadmap.md` Stage 1 is this sub-phase; its Stage 2 (networking/`ssl`/pip/`multiprocessing`) is Phase 86+. (`threading` is **not** deferred — the `_thread` builtin is on and pure-Python `threading` works single-process.)
+- **Honesty.** No `ssl`/DNS resolution/`pip`/`asyncio` here; the docs must state these are deferred, not present-but-broken. `ctypes` is deferred to Phase 91 (needs `dlopen`), not Phase 86.
 - **Prefer exact targets.** Reference the exact cross-configure flags + `CONFIG_SITE` cache answers, not "the cross flags".
