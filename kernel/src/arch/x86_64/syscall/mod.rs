@@ -7394,22 +7394,13 @@ pub(crate) fn read_file_from_disk(path: &str) -> Result<alloc::vec::Vec<u8>, u64
 /// - `/tmp` or `/run` → `Some("tmp")` / `Some("run")` (the mount-point dir).
 /// - `/tmp/foo/bar` → `Some("tmp/foo/bar")`.
 /// - Anything else, or a path with `.`, `..`, or empty segments → `None`.
+///
+/// The logic lives in `kernel-core` ([`kernel_core::fs::tmpfs::mount_relative_path`])
+/// so it is host-unit-tested — the convention must stay in lockstep with the
+/// `Tmpfs::components` keying, and a past divergence (a hand-rolled
+/// `strip_prefix("/tmp")`) silently broke chmod/chown on `/tmp` until Phase 85b.
 fn tmpfs_relative_path(path: &str) -> Option<&str> {
-    let trimmed = path.trim_start_matches('/');
-    let rest = match trimmed {
-        "tmp" | "run" => trimmed,
-        _ if trimmed.starts_with("tmp/") || trimmed.starts_with("run/") => trimmed,
-        _ => return None,
-    };
-
-    // Reject `.`, `..`, and empty segments anywhere in the path.
-    for segment in rest.split('/') {
-        if segment.is_empty() || segment == "." || segment == ".." {
-            return None;
-        }
-    }
-
-    Some(rest)
+    kernel_core::fs::tmpfs::mount_relative_path(path)
 }
 
 /// Return the relative path within `/data` if this path starts with `/data`.
@@ -8564,12 +8555,13 @@ fn privileged_exec_credentials(path: &str, exec_is_static_ramdisk: bool) -> Opti
 /// all other fields are zero.  This satisfies musl's `fstat` use in `fopen`.
 /// Get uid/gid/mode for a directory path from the appropriate filesystem.
 fn dir_metadata(path: &str) -> (u32, u32, u16) {
-    // Tmpfs directories (under /tmp)
-    if path.starts_with("/tmp") || path == "tmp" {
-        let rel = path.strip_prefix("/tmp").unwrap_or(path);
-        let lookup = if rel.is_empty() { "/" } else { rel };
+    // Tmpfs directories (under /tmp or /run) — use the shared mount-relative
+    // convention (`tmpfs_relative_path`) so the lookup key matches what
+    // open/read/write/stat/chmod use. (A previous hand-rolled
+    // `strip_prefix("/tmp")` dropped the `tmp/` prefix and ignored /run.)
+    if let Some(rel) = tmpfs_relative_path(path) {
         let tmpfs = crate::fs::tmpfs::TMPFS.lock();
-        if let Ok(s) = tmpfs.stat(lookup) {
+        if let Ok(s) = tmpfs.stat(rel) {
             return (s.uid, s.gid, s.mode);
         }
     }
@@ -9120,8 +9112,16 @@ enum FsTarget {
 }
 
 fn resolve_fs_target(abs_path: &str) -> FsTarget {
-    if abs_path.starts_with("/tmp/") || abs_path == "/tmp" {
-        let rel = abs_path.strip_prefix("/tmp").unwrap_or("/");
+    // `/tmp` and `/run` are the kernel tmpfs mounts. Route them through
+    // `tmpfs_relative_path` so the mount-prefix convention (`tmp/…`, `run/…`)
+    // matches every other tmpfs syscall path (open/read/write/stat/getdents).
+    // The previous hand-rolled `strip_prefix("/tmp")` dropped the mount prefix
+    // (yielding a bare `/foo`) and ignored `/run` entirely, so chmod/chown/
+    // symlink looked up the wrong tmpfs subtree and returned ENOENT for a file
+    // that open/write had just created under `tmp/…`. Phase 85b surfaced this:
+    // `git init` does `chmod(.git/config.lock)` on a lockfile it just created in
+    // a `/tmp` repo and got "No such file or directory", aborting the init.
+    if let Some(rel) = tmpfs_relative_path(abs_path) {
         return FsTarget::Tmpfs(alloc::string::String::from(rel));
     }
     // /data paths always go to disk data (FAT32 or ext2 /data fallback),

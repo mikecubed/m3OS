@@ -1,10 +1,18 @@
 > Revived 2026-06-04 for **Phase 85b — git (local)**. This is the per-tool
 > reference for the Phase 85 cross-compiled-toolchain work. Its **Stage 1
-> (local git, `NO_CURL NO_OPENSSL`)** is in Phase 85b scope; its **Stage 2
-> (HTTPS/TLS remotes)** is deferred to [Phase 86 — Networking and GitHub](./roadmap/86-networking-and-github.md).
+> (local git, `NO_CURL NO_OPENSSL`)** was **delivered in Phase 85b (kernel
+> 0.85.1)** — git 2.44.0 is cross-built into a `.m3pkg`, installed with
+> `pkg install git`, and the local `init`/`add`/`commit`/`diff`/`log`/`branch`/
+> `merge`/`status` workflow is exercised by the `git-local-smoke` gate. Its
+> **Stage 2 (HTTPS/TLS remotes)** is deferred to [Phase 86 — Networking and
+> GitHub](./roadmap/86-networking-and-github.md).
 > Where this historical doc and the live phase docs disagree, the
 > [Phase 85 umbrella](./roadmap/85-cross-compiled-toolchains.md) and
 > [Phase 85b task list](./roadmap/tasks/85b-git-local-tasks.md) are authoritative.
+>
+> The OS-requirements table immediately below reflects the as-built Phase 85b
+> state. The historical mermaid/gantt diagrams further down retain their
+> original pre-implementation framing as a planning artifact.
 
 # Road to git on m3OS
 
@@ -61,22 +69,22 @@ requirements:
 | Requirement | git component | Status in m3OS |
 |---|---|---|
 | File I/O (open, read, write, stat) | All of git | Working |
-| `mmap()` / `munmap()` | Pack file access, index | Phase 33 (in progress) |
+| `mmap()` / `munmap()` | Pack file access, index | Working (Phase 33 ✅) |
 | `fork()` / `exec()` | Subcommands, pager, hooks | Working |
 | Pipes | Subcommand communication | Working |
 | `getcwd()` / `chdir()` | Repository discovery | Working |
 | Environment variables | `GIT_DIR`, `HOME`, `EDITOR` | Working |
 | `/tmp` directory | Temporary files during merge | Working (tmpfs) |
 | `rename()` | Atomic file updates | Working |
-| `chmod()` | Executable bit tracking | Working (ext2) |
-| `readlink()` | Symlink resolution | Phase 38 (planned) |
+| `chmod()` | Executable bit tracking | Working (ext2 + tmpfs) |
+| `readlink()` | Symlink resolution | Working (Phase 38 ✅) |
 | `mkstemp()` | Temporary file creation | Should work via musl |
 | SHA-1 / SHA-256 | Object hashing | Built-in (no external lib needed) |
 | `zlib` | Object compression, pack files | Must be statically linked |
 | Regex | `git grep`, `.gitignore` | Built-in or musl regex |
-| `select()` / `poll()` | Pager, interactive commands | Phase 37 (planned) |
+| `select()` / `poll()` | Pager, interactive commands | Working (Phase 37 ✅) |
 | POSIX shell (`/bin/sh`) | git scripts, hooks | Working (sh0/ion) |
-| `less` / pager | `git log`, `git diff` output | Phase 41 (planned) |
+| `less` / pager | `git log`, `git diff` output | Working (Phase 41 ✅, shipped port) |
 
 **Key insight:** Local git operations (init, add, commit, log, diff, status,
 branch, merge) need almost nothing beyond what m3OS already has. The main
@@ -246,7 +254,7 @@ flowchart LR
 
 ## Kernel/OS Prerequisites for Stage 1
 
-### Phase 33 -- Kernel Memory Improvements (in progress, assumed ready)
+### Phase 33 -- Kernel Memory Improvements (✅ complete)
 
 **Why git needs it:** git uses `mmap()` to read pack files and the index
 file. Without working `munmap()`, every git operation leaks the mapped
@@ -317,6 +325,11 @@ Expanded Memory + disk expansion. git is pure C, no threads, no epoll, no
 C++ runtime.
 
 ## Stage 1 Acceptance Criteria
+
+> ✅ **Delivered in Phase 85b (kernel 0.85.1).** This workflow is exercised
+> headlessly by the `git-local-smoke` gate (`M3OS_GIT_REGRESSION=1`), which boots
+> m3OS, runs `pkg install git`, and drives `init`/`add`/`commit`/`diff`/`log`/
+> `branch`/`merge`/`status` end-to-end. The transcript below is illustrative.
 
 ```bash
 # Init, add, commit

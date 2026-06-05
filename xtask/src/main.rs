@@ -189,6 +189,12 @@ const SMOKE_EXIT_TUI_APP_SMOKE_FAILED: i32 = 69;
 /// the offline `/usr/pkg/` repo, and asserts `pkg list`/`pkg verify` see it.
 const SMOKE_EXIT_PKG_SMOKE_FAILED: i32 = 73;
 
+/// Phase 85b — `cargo xtask git-local-smoke` exit code. Distinct from the other
+/// gates so CI can route a git-workflow failure separately. Boots m3OS,
+/// `pkg install git` from the bundled `.m3pkg`, then drives a scripted local
+/// repository workflow (init/add/commit/diff/log/branch/merge/status).
+const SMOKE_EXIT_GIT_SMOKE_FAILED: i32 = 74;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
     Headless,
@@ -705,6 +711,20 @@ fn main() {
             });
             cmd_pkg_smoke(&smoke_args);
         }
+        // Phase 85b — `cargo xtask git-local-smoke` boots m3OS, installs the
+        // bundled local-only `git` `.m3pkg` via `pkg install git`, then drives a
+        // scripted local repository workflow (init/add/commit/diff/log/branch/
+        // merge/status) and asserts each step. Proof that git actually works
+        // inside m3OS, not merely that it cross-compiled.
+        Some("git-local-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("git-local-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_git_local_smoke(&smoke_args);
+        }
         // Phase 63a Track H — DOOM SFX + music end-to-end smoke. Boots
         // with WAV AC'97 backend, launches `/bin/doom -warp 1 1` with
         // an auto-quit budget so the engine's Shutdown emits the
@@ -886,7 +906,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -13465,6 +13485,300 @@ fn pkg_smoke_steps() -> Vec<SmokeStep> {
     steps
 }
 
+/// Phase 85b — `cargo xtask git-local-smoke`. Cross-builds the local-only `git`
+/// (+ its zlib dep) into `.m3pkg` artifacts, builds a fresh image with them
+/// bundled into the offline `/usr/pkg/` repo and a minimal `/etc/gitconfig`
+/// staged, boots m3OS, `pkg install git`, then drives a scripted local
+/// repository workflow over serial — proof that git actually *runs* inside m3OS.
+fn cmd_git_local_smoke(args: &SmokeBootArgs) {
+    // Build git (+ zlib) so the `.m3pkg` artifacts exist for the data disk to
+    // bundle into `/usr/pkg/`. The first build cross-compiles git (a few
+    // minutes); a warm pkgcache makes this a zero-compiler hit.
+    if let Err(msg) = port_build::build_git_port() {
+        eprintln!("git-local-smoke: precondition failed (git port build): {msg}");
+        std::process::exit(SMOKE_EXIT_GIT_SMOKE_FAILED);
+    }
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    // Always rebuild the data disk so the freshly-bundled git `.m3pkg` and the
+    // `/etc/gitconfig` fixture are present, and so the installed-package DB and
+    // /tmp working tree start clean.
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false, // graphical_login — autologin / serial path
+    );
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, display_mode, DeviceSet::default());
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    let steps = git_local_smoke_steps();
+
+    println!(
+        "git-local-smoke: launching QEMU (timeout {}s, {} steps)",
+        args.timeout_secs,
+        steps.len()
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!(
+                "git-local-smoke: PASSED ({} steps in {elapsed}s)",
+                steps.len()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("git-local-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_GIT_SMOKE_FAILED);
+        }
+    }
+}
+
+/// The serial script for `git-local-smoke`. Wait-patterns are git's own output
+/// (never a substring of the command that triggers them) because the serial
+/// console echoes typed input; `Send` clears the scrollback so each assertion
+/// only sees the current command's output.
+fn git_local_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/git-local-smoke: kernel first message",
+    }];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    // 1. Install git from the bundled offline repo. The dependency solver reads
+    //    git.meta's `DEPS=zlib` and installs zlib first, then git.
+    steps.push(SmokeStep::Send {
+        input: "pkg install git\n",
+        label: "git-local-smoke: pkg install git",
+    });
+    // This line is printed by the installer only when the resolved order has >1
+    // entry (userspace/pkg/src/main.rs) — i.e. when at least one dependency is
+    // actually pulled. The gate relies on zlib being *bundled* into /usr/pkg/
+    // but NOT registered in /var/lib/pkg/db (its files are pre-mirrored onto
+    // /usr by populate_phase_69d_ports, which does not touch the pkg DB), so the
+    // solver always pulls zlib for git and the order is [zlib, git]. If zlib were
+    // ever DB-registered at boot, the solver would skip it, this line would not
+    // print, and this Wait would (correctly) flag the changed behaviour.
+    steps.push(SmokeStep::Wait {
+        pattern: "pkg install: resolving git + dependencies",
+        timeout_secs: 30,
+        label: "git-local-smoke: dependency solver engaged",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "pkg install: git: OK",
+        // `cannot` covers the cannot-read/open/create-symlink failure family; any
+        // other install error (integrity/parse/write/DB) still fails the gate via
+        // this step's timeout. 180 s is a generous per-step *ceiling* for the
+        // ~7.4 MB install (it normally completes in seconds), NOT reserved time:
+        // the global `--timeout` is a single shared cap that min-clamps every
+        // step, so this budget is only fully available when nothing earlier has
+        // eaten the clock. The gate is intended to run via pre-push at
+        // `--timeout 360` (.githooks/pre-push); under the bare default it shares
+        // the budget with boot/login and the trailing git workflow.
+        fail_prefix: "pkg install: cannot",
+        timeout_secs: 180,
+        label: "git-local-smoke: git installed from .m3pkg",
+        exit_code_on_fail: SMOKE_EXIT_GIT_SMOKE_FAILED,
+    });
+
+    // 2. git resolves on PATH (/usr/bin) and reports the pinned version.
+    steps.push(SmokeStep::Send {
+        input: "git --version\n",
+        label: "git-local-smoke: git --version",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "git version 2.44.0",
+        timeout_secs: 20,
+        label: "git-local-smoke: version 2.44.0",
+    });
+
+    // 3. Fresh repo in tmpfs. /etc/gitconfig's `init.defaultBranch=main` makes
+    //    `git init` create the `main` branch the later checkout/merge assume.
+    steps.push(SmokeStep::Send {
+        input: "mkdir -p /tmp/gitsmoke\n",
+        label: "git-local-smoke: mkdir repo",
+    });
+    steps.push(SmokeStep::Sleep { millis: 200 });
+    steps.push(SmokeStep::Send {
+        input: "cd /tmp/gitsmoke\n",
+        label: "git-local-smoke: cd repo",
+    });
+    steps.push(SmokeStep::Sleep { millis: 200 });
+    steps.push(SmokeStep::Send {
+        input: "git init\n",
+        label: "git-local-smoke: git init",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Initialized empty Git repository",
+        timeout_secs: 20,
+        label: "git-local-smoke: repo initialized",
+    });
+
+    // 4. Stage + commit the first file (commit identity comes from /etc/gitconfig).
+    steps.push(SmokeStep::Send {
+        input: "echo hello > README && git add README && git commit -m commit-one\n",
+        label: "git-local-smoke: first commit",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "root-commit",
+        timeout_secs: 30,
+        label: "git-local-smoke: first (root) commit created",
+    });
+
+    // 5. Edit the file; `git diff` must show the added line (`+world`; the bare
+    //    word `world` is in the command but `+world` only appears in the diff).
+    steps.push(SmokeStep::Send {
+        input: "echo world >> README\n",
+        label: "git-local-smoke: edit README",
+    });
+    steps.push(SmokeStep::Sleep { millis: 200 });
+    steps.push(SmokeStep::Send {
+        input: "git diff\n",
+        label: "git-local-smoke: git diff",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "+world",
+        timeout_secs: 20,
+        label: "git-local-smoke: diff shows the added line",
+    });
+
+    // 6. Second commit.
+    steps.push(SmokeStep::Send {
+        input: "git add README && git commit -m commit-two\n",
+        label: "git-local-smoke: second commit",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "1 file changed",
+        timeout_secs: 30,
+        label: "git-local-smoke: second commit recorded",
+    });
+
+    // 7. `git log --oneline` shows both commits (subjects appear in git's output,
+    //    not in the `git log --oneline` command).
+    steps.push(SmokeStep::Send {
+        input: "git log --oneline\n",
+        label: "git-local-smoke: git log --oneline",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "commit-two",
+        timeout_secs: 20,
+        label: "git-local-smoke: log shows second commit",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "commit-one",
+        timeout_secs: 20,
+        label: "git-local-smoke: log shows first commit (two total)",
+    });
+
+    // 8. Branch + commit a new file on `feature`.
+    steps.push(SmokeStep::Send {
+        input: "git checkout -b feature\n",
+        label: "git-local-smoke: create feature branch",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Switched to a new branch",
+        timeout_secs: 20,
+        label: "git-local-smoke: on feature branch",
+    });
+    steps.push(SmokeStep::Send {
+        input: "echo feature-line > feature.txt && git add feature.txt && git commit -m commit-feature\n",
+        label: "git-local-smoke: feature commit",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "create mode 100644 feature.txt",
+        timeout_secs: 30,
+        label: "git-local-smoke: feature.txt committed",
+    });
+
+    // 9. Back to main, merge feature (fast-forward); both files must be tracked.
+    steps.push(SmokeStep::Send {
+        input: "git checkout main\n",
+        label: "git-local-smoke: switch to main",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Switched to branch",
+        timeout_secs: 20,
+        label: "git-local-smoke: on main branch",
+    });
+    steps.push(SmokeStep::Send {
+        input: "git merge feature\n",
+        label: "git-local-smoke: merge feature into main",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Fast-forward",
+        timeout_secs: 20,
+        label: "git-local-smoke: merge fast-forwarded",
+    });
+    // `git ls-files` names neither file in the command, so the tracked-file
+    // output is an uncontaminated assertion that both survived the merge.
+    steps.push(SmokeStep::Send {
+        input: "git ls-files\n",
+        label: "git-local-smoke: list tracked files",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "feature.txt",
+        timeout_secs: 20,
+        label: "git-local-smoke: feature.txt present after merge",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "README",
+        timeout_secs: 20,
+        label: "git-local-smoke: README present after merge",
+    });
+
+    // 10. Working tree clean.
+    steps.push(SmokeStep::Send {
+        input: "git status\n",
+        label: "git-local-smoke: git status",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "nothing to commit, working tree clean",
+        timeout_secs: 20,
+        label: "git-local-smoke: clean working tree",
+    });
+
+    steps
+}
+
 /// Phase 63a Track H — `cargo xtask doom-audio-smoke` exit codes.
 /// Originally 65 (collided with `SMOKE_EXIT_SESSION_RESTART_FAILED`); bumped
 /// to 67 in PR 168 round-3 review so each smoke-mode failure exits with a
@@ -14729,6 +15043,21 @@ fn populate_ext2_files(
     // Override the nameserver for a different deployment by editing /etc/resolv.conf.
     let resolv_conf_content = "nameserver 10.0.2.3\noptions timeout:5 attempts:3\n";
 
+    // Phase 85b — a minimal system `/etc/gitconfig` so a freshly-installed git
+    // has a commit identity (fresh git aborts `git commit` with "Author identity
+    // unknown" otherwise) and a deterministic default branch. With `prefix=/usr`
+    // git's Makefile resolves its system config to `/etc/gitconfig`, so this is
+    // the right place for it. `init.defaultBranch = main` makes `git init` create
+    // `main` (the branch the smoke's `git checkout main` / `git merge feature`
+    // assume); `core.pager = cat` keeps `git log`/`git diff` from invoking an
+    // interactive pager that would stall the serial smoke. No `safe.directory`
+    // override is needed: the smoke logs in as root and tmpfs `mkdir`/`git init`
+    // create `/tmp/gitsmoke` (and its `.git`) owned by the caller's euid (0), so
+    // git's dubious-ownership guard never fires — globally disabling it with
+    // `safe.directory = *` would only weaken safety for future multi-user use.
+    // Tabs match git's own config style.
+    let gitconfig_content = "[user]\n\tname = m3OS Tester\n\temail = git-smoke@m3os.local\n[init]\n\tdefaultBranch = main\n[core]\n\tpager = cat\n";
+
     // Phase 46: service definition files.
     let sshd_conf = "name=sshd\ncommand=/bin/sshd\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=syslogd\n";
     let telnetd_conf = "name=telnetd\ncommand=/bin/telnetd\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=syslogd\n";
@@ -15171,10 +15500,12 @@ fn populate_ext2_files(
     let smoke_mode_tmp = output_dir.join("_tmp_smoke_mode");
     let empty_tmp = output_dir.join("_tmp_empty");
     let resolv_conf_tmp = output_dir.join("_tmp_resolv_conf");
+    let gitconfig_tmp = output_dir.join("_tmp_gitconfig");
     fs::write(&passwd_tmp, passwd_content).expect("write temp passwd");
     fs::write(&shadow_tmp, shadow_content).expect("write temp shadow");
     fs::write(&group_tmp, group_content).expect("write temp group");
     fs::write(&resolv_conf_tmp, resolv_conf_content).expect("write temp resolv.conf");
+    fs::write(&gitconfig_tmp, gitconfig_content).expect("write temp gitconfig");
     fs::write(&sshd_conf_tmp, sshd_conf).expect("write temp sshd.conf");
     fs::write(&syslogd_conf_tmp, syslogd_conf).expect("write temp syslogd.conf");
     fs::write(&crond_conf_tmp, crond_conf).expect("write temp crond.conf");
@@ -15572,6 +15903,10 @@ fn populate_ext2_files(
          sif etc/resolv.conf mode 0x81A4\n\
          sif etc/resolv.conf uid 0\n\
          sif etc/resolv.conf gid 0\n\
+         write \"{gitconfig}\" etc/gitconfig\n\
+         sif etc/gitconfig mode 0x81A4\n\
+         sif etc/gitconfig uid 0\n\
+         sif etc/gitconfig gid 0\n\
          write \"{empty}\" root/.local/share/ion/history\n\
          write \"{empty}\" home/user/.local/share/ion/history\n\
          sif bin mode 0x41ED\n\
@@ -15832,6 +16167,7 @@ fn populate_ext2_files(
         shadow = shadow_tmp.display(),
         group = group_tmp.display(),
         resolv_conf = resolv_conf_tmp.display(),
+        gitconfig = gitconfig_tmp.display(),
         sshd_conf = sshd_conf_tmp.display(),
         telnetd_cmds = telnetd_cmds,
         syslogd_conf = syslogd_conf_tmp.display(),
@@ -15913,6 +16249,7 @@ fn populate_ext2_files(
     let _ = fs::remove_file(&passwd_tmp);
     let _ = fs::remove_file(&shadow_tmp);
     let _ = fs::remove_file(&group_tmp);
+    let _ = fs::remove_file(&gitconfig_tmp);
     let _ = fs::remove_file(&sshd_conf_tmp);
     if enable_telnet {
         let _ = fs::remove_file(output_dir.join("_tmp_telnetd_conf"));
@@ -16539,6 +16876,42 @@ fn populate_phase_69d_ports(part_path: &Path, workspace_root: &Path) {
             if share.is_dir() {
                 collect_phase_69d_entries(&share, "usr/share", &mut dirs, &mut files, &mut execs);
             }
+        }
+    }
+
+    // Phase 85b — bundle-only ports: their `.m3pkg` + `.meta` are placed in the
+    // offline `/usr/pkg/` repo but they are NOT pre-installed at boot, so the
+    // `git-local-smoke` gate exercises the real `pkg install git` path from a
+    // clean tree (rather than re-installing an already-present binary). git
+    // installs to `prefix=/usr` (`usr/bin`, `usr/libexec/git-core`,
+    // `usr/share/git-core`) — `pkg install` lays that whole prefix-relative tree
+    // under `/` from the artifact. The artifact only exists once the git port
+    // has been built (the gate does so first); on a routine image build it is
+    // absent and this is a no-op, so nothing regresses.
+    const BUNDLE_ONLY_PORTS: &[&str] = &["git"];
+    for port in BUNDLE_ONLY_PORTS {
+        let Ok(artifact) = port_build::pkgcache_artifact_path(port) else {
+            continue;
+        };
+        if !artifact.is_file() {
+            continue;
+        }
+        match fs::read(&artifact) {
+            Ok(bytes) if pkg_format::verify(&bytes) => {
+                m3pkg_files.push((format!("usr/pkg/{port}.m3pkg"), artifact.clone()));
+                // The `.meta` sidecar (VERSION + DEPS) the in-OS dependency
+                // solver reads — `pkg install git` auto-installs its `zlib` dep.
+                let version = port_build::port_version(port).unwrap_or_default();
+                let deps = port_build::port_deps(port).join(" ");
+                let meta_host = preinstall_root.join(format!("{port}.meta"));
+                let _ = fs::create_dir_all(&preinstall_root);
+                if fs::write(&meta_host, format!("VERSION={version}\nDEPS={deps}\n")).is_ok() {
+                    m3pkg_files.push((format!("usr/pkg/{port}.meta"), meta_host));
+                }
+                println!("phase-85b: bundled {port}.m3pkg (bundle-only) into /usr/pkg");
+            }
+            Ok(_) => eprintln!("phase-85b: {port}.m3pkg failed verify — skipping bundle"),
+            Err(e) => eprintln!("phase-85b: read {} failed: {e}", artifact.display()),
         }
     }
 
