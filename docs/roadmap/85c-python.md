@@ -1,6 +1,6 @@
 # Phase 85c - Python (CPython)
 
-**Status:** Planned
+**Status:** Implemented (kernel `0.85.2`; `python-smoke` gate green)
 **Source Ref:** phase-85c
 **Depends on:** Phase 85a (Package & Build-Cache Infrastructure), Phase 36 (Expanded Memory) ✅, Phase 45 (Ports System) ✅
 **Builds on:** Adds a host-cross-built CPython interpreter + comprehensive non-networked standard library on top of the Phase 85a packaging substrate, using a two-stage (host-then-target) cross build.
@@ -28,13 +28,21 @@ Build a host CPython of the exact target version, then cross-configure: `--host=
 
 ### Area B — Comprehensive stdlib staging + validation
 
-Stage `bin/python3` + `lib/pythonX.Y/` (the stdlib `.py` + `lib-dynload/*.so`) in fixed relative layout; seal into a `.m3pkg`; `pkg install python`; validate REPL + scripts inside m3OS. Comprehensive scope = build every C extension whose dependency is already present (zlib via `ports/lib/zlib`; `hashlib` built-ins), explicitly excluding networking/TLS extensions (Phase 86).
+Stage `bin/python3` + `lib/pythonX.Y/` (the stdlib `.py`; all C extensions are builtin — see "Static interpreter" below, so there is no `lib-dynload`) in fixed relative layout; seal into a `.m3pkg`; `pkg install python`; validate REPL + scripts inside m3OS. Comprehensive scope = build every C extension whose dependency is already present — `zlib`/`gzip`/`zipfile` against `ports/lib/zlib`, `_curses`/`_curses_panel` against the ported wide `ports/lib/ncurses` (the same `libncursesw.a`/`libtinfow.a`/`libpanelw.a` archives less/htop/tmux link; `curses.ncurses_version` reports 6.5 inside m3OS), and `hashlib` via the HACL\* built-ins — explicitly excluding networking/TLS extensions (Phase 86) and `dlopen`-only extensions like `ctypes` (Phase 91). A module is deferred only when its external library is genuinely not yet ported (sqlite3, GNU readline, gdbm, Tk, libffi, libbz2, liblzma, libuuid) — never when the dependency is already in the tree.
 
 ## Important Components and How They Work
 
 ### `build_python` in `port_build.rs`
 
-A new port `build_*` function: build the host interpreter, then the cross interpreter via the musl toolchain plumbing, DESTDIR-install the full prefix, and hand the staged tree to the 85a sealing step. Registered in `PORTS` + dispatch.
+A new port `build_*` function: build the host interpreter, then the cross interpreter via the musl toolchain plumbing, DESTDIR-install the full prefix, and hand the staged tree to the 85a sealing step. Registered in the dispatch + `build_python_port()` entry point + bundled via `BUNDLE_ONLY_PORTS`.
+
+### Static interpreter (the model that runs on m3OS)
+
+The interpreter is **fully static**: `MODULE_BUILDTYPE=static` builds every stdlib C extension *into* `python3`, and `LDFLAGS=-static` embeds musl libc — no `PT_INTERP`, no `lib-dynload`, no `dlopen`. This is not the usual desktop CPython layout; it is forced by m3OS reality. m3OS's `/lib/ld-musl-x86_64.so.1` is a *custom Rust loader reimplementation* (`userspace/ld-musl-x86_64.so.1/`) and m3OS ships **no real musl `libc.so`** (the userland is `no_std` Rust). A dynamic CPython faults at startup the moment the loader hits the interpreter's `DT_NEEDED libc.so` — there is nothing to satisfy it, let alone the thousands of libc symbols a real C program needs. So Python is shipped static, exactly like the `git` port. (The dynamic build was implemented first and surfaced this in the first in-m3OS gate: `ldso: DT_NEEDED not found: libc.so`.) Lifting this — shipping a real musl `libc.so` + closing the syscall gaps a dynamic libc needs, then re-enabling a dynamic `python3` with real `lib-dynload` + `ctypes` — is [Phase 91 (Dynamic C Runtime)](./91-dynamic-c-runtime.md).
+
+### Frozen stdlib in `python312.zip`
+
+m3OS's ring-3 VFS is slow (`vfs_server: slow req … STAT_PATH elapsed_us=80000-200000` — 80-200 ms per path stat), so the ~1700 loose stdlib files made `pkg install python` and every cold `import` (a per-module `sys.path` stat storm) take minutes — the first static gate run timed out installing. `build_python` therefore byte-compiles the stdlib and freezes it into a single `lib/python312.zip` of `.pyc` (already on CPython's default `sys.path`; zipimport reads the archive directory once, no per-file stats). The package drops from ~1700 files to a few hundred, install + import become fast, and only the `os.py` getpath landmark is kept as a loose file so `sys.prefix` still resolves.
 
 ### Relocation contract
 
@@ -55,7 +63,7 @@ CPython derives `sys.prefix`/`sys.exec_prefix` by searching upward from the exec
 ## Acceptance Criteria
 
 - CPython builds reproducibly via `cargo xtask port build python` and seals into a `.m3pkg`.
-- Inside m3OS: `python3 -c "print('hello from m3OS')"` prints; `import json, re, math, datetime, argparse, hashlib` succeeds; a bundled `/usr/src/fibonacci.py` runs; a file write+read round-trips; `sys.platform` reports the expected value (serial-validated gate).
+- Inside m3OS: `python3 -c "print('hello from m3OS')"` prints; `import json, re, math, datetime, argparse, hashlib, curses, curses.panel, threading` succeeds (the static `_curses`/`_curses_panel` link the ported ncurses — `curses.ncurses_version` reports 6.5; `threading` rides the `_thread` builtin); a bundled `/usr/src/fibonacci.py` runs; a file write+read round-trips; `sys.platform` reports the expected value (serial-validated gate).
 - Python is installed via `pkg install python` from a bundled `.m3pkg`.
 - Networking/TLS modules (`ssl`, DNS/`getaddrinfo` name resolution, `pip`, `asyncio`) remain absent (deferred to Phase 86); their absence is documented, not silently failing. (`_socket` itself may build against the existing TCP/UDP + AF_UNIX stack; what is deferred is name resolution and TLS, not the extension as a whole.)
 
@@ -70,5 +78,7 @@ CPython derives `sys.prefix`/`sys.exec_prefix` by searching upward from the exec
 
 ## Deferred Until Later
 
+- **A dynamic interpreter** — a real musl `libc.so` + the syscall coverage a dynamic libc needs, then a dynamic `python3` with real `lib-dynload` `.so` extensions and `ctypes`/`dlopen` of arbitrary shared objects — is [Phase 91 (Dynamic C Runtime)](./91-dynamic-c-runtime.md). 85c ships fully static (every C extension builtin) because m3OS's Phase 76 loader has no `libc.so` to bind a dynamic C program against; Phase 91 lifts that.
 - `ssl`/`_hashlib`-OpenSSL, DNS/`getaddrinfo` name resolution, `http.client`/`urllib`, `pip`, `venv`, `asyncio` — Phase 86. (`hashlib` itself works via CPython's built-in HACL\*-backed `_md5`/`_sha*` modules with no OpenSSL.)
-- `threading`/`multiprocessing`, `ctypes`/cffi (needs dlopen at runtime), `sqlite3`, `readline`/`curses`, tkinter, NumPy/SciPy.
+- `multiprocessing` (fork/exec + POSIX-semaphore IPC) — note `threading` itself is **not** deferred: the `_thread` builtin is on and pure-Python `threading` works single-process today.
+- `ctypes`/cffi (needs `dlopen` at runtime → Phase 91), `sqlite3`, GNU `readline`, `tkinter`, `_bz2`/`_lzma`/`_uuid`/`_gdbm`, NumPy/SciPy — each deferred because its external library is not yet ported. (`curses` is **not** in this list: ncurses is already ported, so `_curses`/`_curses_panel` are built, per the Area B scope rule.)

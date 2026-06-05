@@ -195,6 +195,12 @@ const SMOKE_EXIT_PKG_SMOKE_FAILED: i32 = 73;
 /// repository workflow (init/add/commit/diff/log/branch/merge/status).
 const SMOKE_EXIT_GIT_SMOKE_FAILED: i32 = 74;
 
+/// Phase 85c — `cargo xtask python-smoke` exit code. Distinct so CI can route a
+/// Python-workflow failure separately. Boots m3OS, `pkg install python` from the
+/// bundled `.m3pkg`, then drives REPL/import/script/file-IO assertions over
+/// serial — proof the cross-built interpreter + stdlib actually run inside m3OS.
+const SMOKE_EXIT_PYTHON_SMOKE_FAILED: i32 = 75;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
     Headless,
@@ -725,6 +731,19 @@ fn main() {
                 });
             cmd_git_local_smoke(&smoke_args);
         }
+        // Phase 85c — `cargo xtask python-smoke` boots m3OS, installs the bundled
+        // CPython `.m3pkg` via `pkg install python`, then drives REPL/import/
+        // script/file-IO assertions over serial. Proof the cross-built
+        // interpreter + stdlib actually run inside m3OS, not merely cross-compile.
+        Some("python-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("python-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_python_smoke(&smoke_args);
+        }
         // Phase 63a Track H — DOOM SFX + music end-to-end smoke. Boots
         // with WAV AC'97 backend, launches `/bin/doom -warp 1 1` with
         // an auto-quit budget so the engine's Shutdown emits the
@@ -906,7 +925,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -4838,12 +4857,21 @@ fn launch_qemu_with_devices_audio(
     display_mode: QemuDisplayMode,
     devices: DeviceSet,
     with_audio: bool,
+    boot_mode: &str,
 ) {
     let ovmf = find_ovmf();
     let mut args = qemu_run_args_with_devices(uefi_image, &ovmf, display_mode, devices);
     if with_audio {
         append_ac97_audio_flags_gui(&mut args);
     }
+    // Pass the launch-time boot mode to the guest via QEMU `fw_cfg`. The kernel
+    // reads `opt/m3os/boot-mode` at boot and exposes it at `/proc/m3os-boot-mode`,
+    // which init prefers over the on-disk `/etc/m3os-graphical-only` marker — so
+    // `run` (serial) and `run-gui` (graphical) boot the SAME persistent data disk
+    // either way without `--fresh`. (Smoke/test launches don't set this and fall
+    // back to the disk marker, keeping CI behaviour byte-for-byte unchanged.)
+    args.push("-fw_cfg".to_string());
+    args.push(format!("name=opt/m3os/boot-mode,string={boot_mode}"));
 
     if display_mode == QemuDisplayMode::Gui {
         println!(
@@ -13267,6 +13295,48 @@ fn termios_smoke_steps() -> Vec<SmokeStep> {
             exit_code_on_fail: SMOKE_EXIT_TERMIOS_SMOKE_FAILED,
         });
     }
+
+    // VEOF (^D) over the serial / kernel console — regression guard for the
+    // console-EOF fix. `/bin/tcsmoke` above exercises the PTY termios path; this
+    // covers the *console* read path that previously swallowed EOF: the fd-0
+    // read loop consumed the EOF flag but looped instead of returning 0, so ^D
+    // never exited a console reader (the Python REPL only quit via `exit()`).
+    //
+    // Start `cat` (reads the console to EOF), feed it a line so it is provably
+    // the foreground reader, then send a bare ^D (0x04) on an empty line — cat
+    // must get read()==0 and exit. Prove control returned to the SHELL (not cat)
+    // by running `id`: the shell *executes* it and prints `uid=…`, which cat
+    // would only ever echo back as the literal text "id". If ^D were swallowed,
+    // cat stays foreground, `id` is echoed without `uid=`, and this times out.
+    steps.push(SmokeStep::Send {
+        input: "cat\n",
+        label: "guest/tcsmoke: ^D EOF — start cat",
+    });
+    steps.push(SmokeStep::Sleep { millis: 1500 });
+    steps.push(SmokeStep::Send {
+        input: "veof-probe\n",
+        label: "guest/tcsmoke: ^D EOF — feed cat a line",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "veof-probe",
+        timeout_secs: 10,
+        label: "guest/tcsmoke: ^D EOF — cat is the foreground reader",
+    });
+    steps.push(SmokeStep::Send {
+        input: "\x04",
+        label: "guest/tcsmoke: ^D EOF — send VEOF (0x04) on an empty line",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "id\n",
+        label: "guest/tcsmoke: ^D EOF — run id after cat should have exited",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "uid=",
+        timeout_secs: 10,
+        label: "guest/tcsmoke: ^D delivered console EOF → cat exited → shell ran id",
+    });
+
     steps
 }
 
@@ -13774,6 +13844,236 @@ fn git_local_smoke_steps() -> Vec<SmokeStep> {
         pattern: "nothing to commit, working tree clean",
         timeout_secs: 20,
         label: "git-local-smoke: clean working tree",
+    });
+
+    steps
+}
+
+/// Phase 85c — `cargo xtask python-smoke`. Cross-builds the CPython (+ zlib)
+/// `.m3pkg`s, boots m3OS, `pkg install python` from the bundled offline
+/// `/usr/pkg/` repo (exercising the `DEPS=zlib` solver), then drives REPL /
+/// import / script / file-IO assertions over serial — proof the cross-built
+/// interpreter + stdlib actually run inside m3OS.
+fn cmd_python_smoke(args: &SmokeBootArgs) {
+    // Build python (+ zlib) so the `.m3pkg` artifacts exist for the data disk to
+    // bundle into `/usr/pkg/`. The first build two-stage cross-compiles CPython
+    // (several minutes); a warm pkgcache makes this a zero-compiler hit.
+    if let Err(msg) = port_build::build_python_port() {
+        eprintln!("python-smoke: precondition failed (python port build): {msg}");
+        std::process::exit(SMOKE_EXIT_PYTHON_SMOKE_FAILED);
+    }
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    // Always rebuild the data disk so the freshly-bundled python `.m3pkg` + the
+    // `/usr/src/fibonacci.py` fixture are present, and so the installed-package
+    // DB and /tmp working area start clean.
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false, // graphical_login — autologin / serial path
+    );
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, display_mode, DeviceSet::default());
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    let steps = python_smoke_steps();
+
+    println!(
+        "python-smoke: launching QEMU (timeout {}s, {} steps)",
+        args.timeout_secs,
+        steps.len()
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!("python-smoke: PASSED ({} steps in {elapsed}s)", steps.len());
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("python-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_PYTHON_SMOKE_FAILED);
+        }
+    }
+}
+
+/// The serial script for `python-smoke`. Wait-patterns are runtime-constructed
+/// sentinels (e.g. `'PYSMOKE:platform='+sys.platform` → `PYSMOKE:platform=linux`)
+/// so a Wait never matches the echoed command line — the same discipline the git
+/// gate uses (`Send` clears scrollback; the typed command is still echoed, so
+/// the assertion must look only at output the command itself does not contain).
+fn python_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/python-smoke: kernel first message",
+    }];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    // 1. Install python from the bundled offline repo. The dependency solver
+    //    reads python.meta's `DEPS=zlib` and installs zlib first, then python.
+    steps.push(SmokeStep::Send {
+        input: "pkg install python\n",
+        label: "python-smoke: pkg install python",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "pkg install: resolving python + dependencies",
+        timeout_secs: 30,
+        label: "python-smoke: dependency solver engaged",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "pkg install: python: OK",
+        // `cannot` covers the cannot-read/open/create-symlink failure family; any
+        // other install error still fails the gate via the step timeout. The
+        // CPython package is sizable — far larger than git's — carrying the frozen
+        // `python312.zip` stdlib plus the fully-static `python3` interpreter (no
+        // `lib-dynload`), so the per-step ceiling is generous; the global
+        // `--timeout` min-clamps
+        // every step, so this is only fully available when nothing earlier ate
+        // the clock. Intended to run via pre-push at `--timeout 900`.
+        fail_prefix: "pkg install: cannot",
+        timeout_secs: 360,
+        label: "python-smoke: python installed from .m3pkg",
+        exit_code_on_fail: SMOKE_EXIT_PYTHON_SMOKE_FAILED,
+    });
+
+    // NOTE on the generous timeouts below: m3OS's ring-3 VFS is slow
+    // (`vfs_server: slow req … STAT_PATH/LIST_DIR elapsed_us=80000-200000` — i.e.
+    // 80-200 ms *per* path stat), and a cold CPython import touches dozens of
+    // stdlib modules → hundreds of stats + source reads + in-memory compiles
+    // (plus musl's realloc fallback for the unimplemented `mremap` syscall). A
+    // single `python3 -c "import …"` therefore legitimately runs for minutes on
+    // the first invocation. `python3 --version` stays fast (it exits before the
+    // full import machinery), so a short timeout there still guards a hang.
+
+    // 2. python resolves on PATH (/usr/bin) and reports the pinned version.
+    steps.push(SmokeStep::Send {
+        input: "python3 --version\n",
+        label: "python-smoke: python3 --version",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Python 3.12.8",
+        timeout_secs: 60,
+        label: "python-smoke: version 3.12.8",
+    });
+
+    // 3. REPL-equivalent `-c` run: imports the gate-required stdlib (every C
+    //    extension is builtin in the static interpreter — `math`/`curses` resolve
+    //    with no dlopen), checks sys.platform, the HACL-backed hashlib digest (no
+    //    OpenSSL), os.urandom/secrets (the getrandom syscall), the `_curses`
+    //    extension linked against the staged ncurses (`curses.ncurses_version`
+    //    reports 6.5 — proof the ported lib is statically embedded, not deferred),
+    //    `curses.panel` (the `_curses_panel` builtin), and `threading` (the
+    //    `_thread` builtin / PT_TLS pthread path). Prints runtime sentinels; a
+    //    Traceback from any failed import/exception is caught.
+    steps.push(SmokeStep::Send {
+        input: "python3 -c \"import sys,json,re,math,datetime,argparse,hashlib,dataclasses,pathlib,os,secrets,threading,curses,curses.panel; \
+                 print('PYSMOKE:platform='+sys.platform); \
+                 print('PYSMOKE:sha='+hashlib.sha256(b'abc').hexdigest()[:12]); \
+                 print('PYSMOKE:rand='+os.urandom(4).hex()+secrets.token_hex(2)); \
+                 print('PYSMOKE:curses=%d.%d' % curses.ncurses_version[:2]); \
+                 print('PYSMOKE:thread='+('ok' if threading.Lock() else 'no')); \
+                 print('PYSMOKE:'+'imports'+'OK')\"\n",
+        label: "python-smoke: imports + platform + hashlib + randomness + curses + threading",
+    });
+    // sys.platform == linux on musl/Linux. Big ceiling: this is the cold-import
+    // step (dozens of modules over the slow VFS) — see the NOTE above.
+    steps.push(SmokeStep::Wait {
+        pattern: "PYSMOKE:platform=linux",
+        timeout_secs: 360,
+        label: "python-smoke: sys.platform=linux",
+    });
+    // SHA-256("abc") prefix — proves the built-in HACL _sha2 works without OpenSSL.
+    steps.push(SmokeStep::Wait {
+        pattern: "PYSMOKE:sha=ba7816bf8f01",
+        timeout_secs: 60,
+        label: "python-smoke: hashlib sha256 (HACL built-in)",
+    });
+    // `_curses` linked against the staged ncurses 6.5 (not the false-matchable
+    // literal — the command builds it from curses.ncurses_version at runtime).
+    // Proves the curses deferral is closed: the ported dep is embedded statically.
+    steps.push(SmokeStep::Wait {
+        pattern: "PYSMOKE:curses=6.5",
+        timeout_secs: 60,
+        label: "python-smoke: _curses + _curses_panel (static ncurses 6.5)",
+    });
+    // `_thread`/threading works (PT_TLS pthread path); only multiprocessing is out.
+    steps.push(SmokeStep::Wait {
+        pattern: "PYSMOKE:thread=ok",
+        timeout_secs: 30,
+        label: "python-smoke: threading (_thread builtin)",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "PYSMOKE:importsOK",
+        fail_prefix: "Traceback (most recent call last)",
+        timeout_secs: 60,
+        label: "python-smoke: stdlib imports succeeded",
+        exit_code_on_fail: SMOKE_EXIT_PYTHON_SMOKE_FAILED,
+    });
+
+    // 4. Script execution: the bundled /usr/src/fibonacci.py fixture (a fresh
+    //    interpreter → another cold startup over the slow VFS, hence 240 s).
+    steps.push(SmokeStep::Send {
+        input: "python3 /usr/src/fibonacci.py\n",
+        label: "python-smoke: run /usr/src/fibonacci.py",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "0 1 1 2 3 5 8 13 21 34",
+        timeout_secs: 240,
+        label: "python-smoke: fibonacci sequence",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "FIBONACCI_OK",
+        timeout_secs: 30,
+        label: "python-smoke: fibonacci script completed",
+    });
+
+    // 5. /tmp file write + read round-trip (runtime-constructed payload so the
+    //    Wait can't match the echoed command). Another fresh interpreter startup.
+    steps.push(SmokeStep::Send {
+        input: "python3 -c \"p='/tmp/pyio.txt'; open(p,'w').write('round'+'trip'); print('PYIO:'+open(p).read())\"\n",
+        label: "python-smoke: /tmp file round-trip",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "PYIO:roundtrip",
+        timeout_secs: 240,
+        label: "python-smoke: file write+read round-trip",
     });
 
     steps
@@ -15058,6 +15358,23 @@ fn populate_ext2_files(
     // Tabs match git's own config style.
     let gitconfig_content = "[user]\n\tname = m3OS Tester\n\temail = git-smoke@m3os.local\n[init]\n\tdefaultBranch = main\n[core]\n\tpager = cat\n";
 
+    // Phase 85c — the `python-smoke` script fixture. Staged at /usr/src so a
+    // freshly-installed CPython has a real script to execute (and any
+    // `cargo xtask run` user can `python3 /usr/src/fibonacci.py`). Prints a
+    // deterministic sequence + an `FIBONACCI_OK` sentinel the gate waits on.
+    let fibonacci_py_content = "#!/usr/bin/env python3\n\
+        # Phase 85c python-smoke fixture: prints the first 10 Fibonacci numbers.\n\
+        def fib(n):\n\
+        \x20   a, b = 0, 1\n\
+        \x20   out = []\n\
+        \x20   for _ in range(n):\n\
+        \x20       out.append(a)\n\
+        \x20       a, b = b, a + b\n\
+        \x20   return out\n\
+        \n\
+        print(\"fib: \" + \" \".join(str(x) for x in fib(10)))\n\
+        print(\"FIBONACCI_OK\")\n";
+
     // Phase 46: service definition files.
     let sshd_conf = "name=sshd\ncommand=/bin/sshd\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=syslogd\n";
     let telnetd_conf = "name=telnetd\ncommand=/bin/telnetd\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=syslogd\n";
@@ -15501,11 +15818,13 @@ fn populate_ext2_files(
     let empty_tmp = output_dir.join("_tmp_empty");
     let resolv_conf_tmp = output_dir.join("_tmp_resolv_conf");
     let gitconfig_tmp = output_dir.join("_tmp_gitconfig");
+    let fibonacci_py_tmp = output_dir.join("_tmp_fibonacci_py");
     fs::write(&passwd_tmp, passwd_content).expect("write temp passwd");
     fs::write(&shadow_tmp, shadow_content).expect("write temp shadow");
     fs::write(&group_tmp, group_content).expect("write temp group");
     fs::write(&resolv_conf_tmp, resolv_conf_content).expect("write temp resolv.conf");
     fs::write(&gitconfig_tmp, gitconfig_content).expect("write temp gitconfig");
+    fs::write(&fibonacci_py_tmp, fibonacci_py_content).expect("write temp fibonacci.py");
     fs::write(&sshd_conf_tmp, sshd_conf).expect("write temp sshd.conf");
     fs::write(&syslogd_conf_tmp, syslogd_conf).expect("write temp syslogd.conf");
     fs::write(&crond_conf_tmp, crond_conf).expect("write temp crond.conf");
@@ -15726,6 +16045,21 @@ fn populate_ext2_files(
          sif etc/compositor.conf uid 0\n\
          sif etc/compositor.conf gid 0\n",
         compositor_conf_tmp.display(),
+    );
+
+    // Phase 85c — stage /usr/src/fibonacci.py (the python-smoke script fixture)
+    // on every disk image. `usr` is created earlier in the debugfs script; here
+    // we create usr/src and write the fixture 0644 root:root.
+    let fibonacci_cmds = format!(
+        "mkdir usr/src\n\
+         sif usr/src mode 0x41ED\n\
+         sif usr/src uid 0\n\
+         sif usr/src gid 0\n\
+         write \"{}\" usr/src/fibonacci.py\n\
+         sif usr/src/fibonacci.py mode 0x81A4\n\
+         sif usr/src/fibonacci.py uid 0\n\
+         sif usr/src/fibonacci.py gid 0\n",
+        fibonacci_py_tmp.display(),
     );
 
     // Phase 73 — stage the three desktop-daemon service confs only
@@ -16149,6 +16483,7 @@ fn populate_ext2_files(
          sif etc/services.d/audio_server.conf gid 0\n\
          {greeter_or_term_cmds}\
          {compositor_conf_cmds}\
+         {fibonacci_cmds}\
          {phase73_daemon_cmds}\
          write \"{hostname}\" etc/hostname\n\
          sif etc/hostname mode 0x81A4\n\
@@ -16198,6 +16533,7 @@ fn populate_ext2_files(
         audio_server_conf = audio_server_conf_tmp.display(),
         greeter_or_term_cmds = greeter_or_term_cmds,
         compositor_conf_cmds = compositor_conf_cmds,
+        fibonacci_cmds = fibonacci_cmds,
         phase73_daemon_cmds = phase73_daemon_cmds,
         hostname = hostname_tmp.display(),
         empty = empty_tmp.display(),
@@ -16250,6 +16586,7 @@ fn populate_ext2_files(
     let _ = fs::remove_file(&shadow_tmp);
     let _ = fs::remove_file(&group_tmp);
     let _ = fs::remove_file(&gitconfig_tmp);
+    let _ = fs::remove_file(&fibonacci_py_tmp);
     let _ = fs::remove_file(&sshd_conf_tmp);
     if enable_telnet {
         let _ = fs::remove_file(output_dir.join("_tmp_telnetd_conf"));
@@ -16888,7 +17225,7 @@ fn populate_phase_69d_ports(part_path: &Path, workspace_root: &Path) {
     // under `/` from the artifact. The artifact only exists once the git port
     // has been built (the gate does so first); on a routine image build it is
     // absent and this is a no-op, so nothing regresses.
-    const BUNDLE_ONLY_PORTS: &[&str] = &["git"];
+    const BUNDLE_ONLY_PORTS: &[&str] = &["git", "python"];
     for port in BUNDLE_ONLY_PORTS {
         let Ok(artifact) = port_build::pkgcache_artifact_path(port) else {
             continue;
@@ -16908,7 +17245,7 @@ fn populate_phase_69d_ports(part_path: &Path, workspace_root: &Path) {
                 if fs::write(&meta_host, format!("VERSION={version}\nDEPS={deps}\n")).is_ok() {
                     m3pkg_files.push((format!("usr/pkg/{port}.meta"), meta_host));
                 }
-                println!("phase-85b: bundled {port}.m3pkg (bundle-only) into /usr/pkg");
+                println!("ports: bundled {port}.m3pkg (bundle-only) into /usr/pkg");
             }
             Ok(_) => eprintln!("phase-85b: {port}.m3pkg failed verify — skipping bundle"),
             Err(e) => eprintln!("phase-85b: read {} failed: {e}", artifact.display()),
@@ -17790,7 +18127,15 @@ fn cmd_run(fresh: bool, devices: DeviceSet, with_audio: bool) {
         false,
         false, // graphical_login — autologin / serial path
     );
-    launch_qemu_with_devices_audio(&uefi_image, QemuDisplayMode::Headless, devices, with_audio);
+    // `cargo xtask run` is the headless serial path → boot serial regardless of
+    // how the data disk's on-disk marker was created.
+    launch_qemu_with_devices_audio(
+        &uefi_image,
+        QemuDisplayMode::Headless,
+        devices,
+        with_audio,
+        "serial",
+    );
 }
 
 fn cmd_run_gui(fresh: bool, devices: DeviceSet, with_audio: bool, skip_login: bool) {
@@ -17817,7 +18162,19 @@ fn cmd_run_gui(fresh: bool, devices: DeviceSet, with_audio: bool, skip_login: bo
         false,
         graphical_login, // Phase 71 — gated by --skip-login
     );
-    launch_qemu_with_devices_audio(&uefi_image, QemuDisplayMode::Gui, devices, with_audio);
+    // `run-gui` boots the GUI greeter by default; `--skip-login` (graphical_login
+    // = false) flips to the serial autologin path on the framebuffer.
+    launch_qemu_with_devices_audio(
+        &uefi_image,
+        QemuDisplayMode::Gui,
+        devices,
+        with_audio,
+        if graphical_login {
+            "graphical"
+        } else {
+            "serial"
+        },
+    );
 }
 
 fn cmd_runner(kernel_binary: PathBuf) {

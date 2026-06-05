@@ -36,6 +36,7 @@ pub mod epoll;
 pub mod fb;
 pub mod flock;
 pub mod fs;
+pub mod fwcfg;
 pub mod iommu;
 pub mod ipc;
 pub mod mitigations;
@@ -179,6 +180,11 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
 
     // P15: ACPI table discovery — parse RSDP, RSDT/XSDT, MADT, FADT.
     acpi::init(rsdp_addr);
+
+    // Read the launch-time boot-mode override from QEMU fw_cfg (if present) so
+    // `/proc/m3os-boot-mode` reflects it before `init` makes its greeter-vs-serial
+    // decision. Safe no-op on real hardware (no fw_cfg).
+    fwcfg::init();
 
     // Phase 55a (B): IOMMU discovery — consume decoded DMAR / IVRS tables,
     // build unit descriptor list, device-to-unit map, and reserved-region
