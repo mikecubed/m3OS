@@ -1600,6 +1600,23 @@ fn build_python(
     fs::create_dir_all(&build_host).map_err(|e| format!("mkdir build-host: {e}"))?;
     fs::create_dir_all(&build_cross).map_err(|e| format!("mkdir build-cross: {e}"))?;
 
+    // Isolate pkg-config for the CROSS configure (env wired into `cross_cfg`
+    // below): an empty search dir hides the build host's `.pc` files so its
+    // libraries (wrong libc/arch) cannot leak into the target build. This is the
+    // same reproducibility guarantee the `disabled_modules` `n/a` overrides give,
+    // extended to pkg-config-detected optional libs. Concretely it fixes
+    // `_blake2`: CPython 3.12 prefers system `libb2` whenever pkg-config reports
+    // it (gh-91251; reverted to a vendored HACL* impl only in 3.13), defining
+    // `HAVE_LIBB2` so `blake2module.h` compiles `#include <blake2.h>` — a header
+    // the musl cross-gcc has no sysroot copy of, aborting the build with
+    // "blake2.h: No such file or directory" on any host that ships libb2. With
+    // libb2 hidden, `_blake2` falls back to its always-present vendored impl
+    // (Modules/_blake2/impl/, no external dep). zlib and ncurses are unaffected:
+    // they are fed explicitly via the ZLIB_*/CURSES_*/PANEL_* vars below, which
+    // PKG_CHECK_MODULES consumes directly without consulting pkg-config.
+    let pkgconfig_empty = work.join("pkgconfig-empty");
+    fs::create_dir_all(&pkgconfig_empty).map_err(|e| format!("mkdir pkgconfig-empty: {e}"))?;
+
     let configure = src.join("configure");
     let jobs = format!("-j{}", num_jobs());
 
@@ -1714,6 +1731,12 @@ fn build_python(
         .env("CC", cc)
         .env("AR", ar)
         .env("RANLIB", ranlib)
+        // Hide the build host's pkg-config metadata (see pkgconfig_empty above):
+        // keeps optional system libs — notably libb2 for `_blake2` — out of the
+        // cross build. PKG_CONFIG_PATH is cleared too so an inherited value can't
+        // re-add a search dir alongside PKG_CONFIG_LIBDIR.
+        .env("PKG_CONFIG_LIBDIR", &pkgconfig_empty)
+        .env("PKG_CONFIG_PATH", "")
         // Build every stdlib C extension *into* the interpreter rather than as a
         // dlopen-able lib-dynload `.so`. `${MODULE_BUILDTYPE:-shared}` in
         // configure honours this pre-set value (it is exactly CPython's official
