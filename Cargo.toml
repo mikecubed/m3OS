@@ -3,6 +3,9 @@ members = [
     "kernel",
     "kernel-core",
     "xtask",
+    # Phase 85a — content-addressed .m3pkg package format + content key
+    # (host packer via xtask, no_std reader via the userspace `pkg` installer)
+    "pkg-format",
     # Phase 11 userspace test binaries
     "userspace/syscall-lib",
     "userspace/exit0",
@@ -193,6 +196,8 @@ members = [
     # transfer-only stub; Phase 76b grows it into a real bring-up
     # linker that walks DT_NEEDED and applies relocations.
     "userspace/ld-musl-x86_64.so.1",
+    # Phase 85a Track C — offline .m3pkg package installer + installed-file DB.
+    "userspace/pkg",
 ]
 
 # Exclude xtask and userspace from default build — kernel only

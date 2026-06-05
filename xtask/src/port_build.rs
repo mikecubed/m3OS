@@ -181,6 +181,167 @@ fn port_fingerprint(port_dir: &Path) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Compute a stable, portable recipe-identity digest for a port: the Portfile
+/// content plus every file under `patches/`. Unlike [`port_fingerprint`] this
+/// deliberately **excludes** the `port_build.rs` source bytes, so editing an
+/// *unrelated* port recipe does not invalidate this port's cached `.m3pkg`.
+///
+/// The configure flags that live in the Rust `build_*` function (not the
+/// Portfile) are folded into the key separately, via [`build_recipe_id`] in
+/// [`package_key`] — so a flag change there DOES self-invalidate this port's
+/// artifact without over-invalidating every other port.
+fn recipe_digest(port_dir: &Path) -> String {
+    let mut hasher = Sha256::new();
+    let portfile = port_dir.join("Portfile");
+    if let Ok(bytes) = fs::read(&portfile) {
+        hasher.update(b"Portfile\0");
+        hasher.update(&bytes);
+    }
+    let patches = port_dir.join("patches");
+    // Hash *every file under `patches/`* (the documented contract), recursing
+    // into nested subdirectories. Each file is keyed by its path **relative to
+    // `patches/`** rather than its bare name, so (a) a patch in a nested subdir
+    // still invalidates the digest when its contents change, and (b) two
+    // same-named patches in different subdirs do not collide. Directory entries
+    // themselves are never hashed — only their contained files. Sorting by the
+    // relative path makes the digest deterministic regardless of read_dir order.
+    //
+    // For the current flat `patches/` trees (one level, no subdirs) the relative
+    // path equals the bare file name, so this is byte-identical to the previous
+    // immediate-`read_dir` digest and does not invalidate any warmed pkgcache.
+    let mut patch_files: Vec<(PathBuf, PathBuf)> = Vec::new(); // (relative, absolute)
+    collect_files_rel(&patches, &patches, &mut patch_files);
+    patch_files.sort_by(|a, b| a.0.cmp(&b.0));
+    for (rel, abs) in patch_files {
+        hasher.update(rel.to_string_lossy().as_bytes());
+        hasher.update(b"\0");
+        if let Ok(bytes) = fs::read(&abs) {
+            hasher.update(&bytes);
+        }
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// Recursively collect every *file* under `dir`, recording each as a
+/// `(path_relative_to_base, absolute_path)` pair. Directory entries themselves
+/// are not recorded — only their contained files — so [`recipe_digest`] can hash
+/// "every file under `patches/`" (including nested subdirectories) without
+/// hashing bare directory names. A missing/unreadable directory yields nothing.
+/// A symlink is treated as a file (never recursed into), so a directory-target
+/// symlink cannot create a recursion cycle: `fs::read` then hashes a file
+/// target's bytes, or silently contributes nothing for a directory target.
+fn collect_files_rel(base: &Path, dir: &Path, out: &mut Vec<(PathBuf, PathBuf)>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_dir {
+            collect_files_rel(base, &path, out);
+        } else if let Ok(rel) = path.strip_prefix(base) {
+            out.push((rel.to_path_buf(), path));
+        }
+    }
+}
+
+/// Phase 85a (A.1) — portable, content-addressed package key for a port.
+///
+/// Generalizes [`port_fingerprint`] into a key that is reusable across machines
+/// and a moved tree: it folds in the source tarball SHA-256 (from the Portfile),
+/// the resolved musl toolchain identity, the recipe digest (Portfile + patches),
+/// and the sorted package keys of direct build dependencies — but **not** any
+/// absolute/`target` path nor the `port_build.rs` source bytes. See
+/// [`pkg_format::compute_package_key`] for the in/out-of-key contract.
+pub fn package_key(
+    port_dir: &Path,
+    toolchain_id: &str,
+    dep_keys: &[String],
+) -> Result<String, String> {
+    let meta = parse_portfile(&port_dir.join("Portfile"))?;
+    let tarball_sha = meta
+        .get("SHA256")
+        .cloned()
+        .ok_or_else(|| format!("Portfile {} missing SHA256", port_dir.display()))?;
+    // build_flags = recipe digest (Portfile + patches) PLUS the configure-flag
+    // identity from the Rust build_* function (which is not in the Portfile).
+    // Folding the latter in means changing a port's configure flags invalidates
+    // its cached .m3pkg — closing the stale-artifact gap that existed when only
+    // the Portfile was hashed. The port name is the Portfile's directory name.
+    let port_name = port_dir.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let build_flags = format!(
+        "{}|recipe={}",
+        recipe_digest(port_dir),
+        build_recipe_id(port_name)
+    );
+    Ok(pkg_format::compute_package_key(
+        &tarball_sha,
+        toolchain_id,
+        &build_flags,
+        dep_keys,
+    ))
+}
+
+/// A stable identity for a port's configure flags as defined in its Rust
+/// `build_*` function (the part of the recipe that does **not** live in the
+/// Portfile, so [`recipe_digest`] cannot see it). Folded into the content key
+/// by [`package_key`].
+///
+/// ⚠ **Contract:** when you change a port's `build_*` configure flags (or add a
+/// new host-built port), update its arm here so the change invalidates the
+/// cached `.m3pkg`. This is the real, wired replacement for the never-parsed
+/// `BUILD_FLAGS=` Portfile field referenced by earlier drafts. The strings need
+/// only be *stable + distinct per flag-set* — transcribing the actual configure
+/// args keeps them self-documenting. CFLAGS that embed build-host-absolute
+/// include paths are intentionally omitted (they vary by machine and would
+/// break the cache's cross-machine portability).
+fn build_recipe_id(name: &str) -> &'static str {
+    match name {
+        "zlib" => "configure:--static --prefix=/usr/local;cflags:-O2",
+        "ncurses" => {
+            "configure:--without-shared --with-normal --with-termlib --without-debug \
+             --without-ada --without-manpages --without-cxx-binding --without-tests \
+             --disable-stripping --enable-overwrite --prefix=/usr/local --datadir=/usr/share \
+             --host=x86_64-linux-musl;passes:narrow(--disable-widec),wide(--enable-widec);\
+             cflags:-O2 -fPIC"
+        }
+        "libevent" => {
+            "configure:--disable-shared --disable-openssl --disable-samples \
+             --disable-debug-mode --disable-libevent-regress --host=x86_64-linux-musl \
+             --prefix=/usr/local;cflags:-O2 -fPIC"
+        }
+        "less" => "configure:--with-regex=posix --host=x86_64-linux-musl --prefix=/usr/local",
+        "htop" => {
+            "configure:--disable-hwloc --enable-unicode --disable-affinity \
+             --disable-capabilities --disable-sensors --disable-static --enable-static-link \
+             --host=x86_64-linux-musl --prefix=/usr/local"
+        }
+        "tmux" => {
+            "configure:--enable-utempter=no --enable-systemd=no --disable-utf8proc \
+             --host=x86_64-linux-musl --prefix=/usr/local"
+        }
+        _ => "",
+    }
+}
+
+/// A stable identity string for the active musl toolchain, folded into the
+/// package key so an artifact built with a different cross-gcc is not reused.
+/// Best-effort: the compiler name plus its reported version line.
+pub fn toolchain_id() -> String {
+    let cc = musl_cc().unwrap_or("unknown-musl-cc");
+    let version = Command::new(cc)
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|o| {
+            String::from_utf8(o.stdout)
+                .ok()
+                .and_then(|s| s.lines().next().map(|l| l.to_string()))
+        })
+        .unwrap_or_default();
+    format!("{cc}|{version}")
+}
+
 /// Fetch the upstream tarball into `cache_dir/<basename>` if missing or
 /// SHA-mismatched. Returns the cached path on success.
 fn fetch_tarball(url: &str, sha: &str, cache_dir: &Path) -> Result<PathBuf, String> {
@@ -304,6 +465,166 @@ fn apply_patches(patches_dir: &Path, src_dir: &Path) -> Result<usize, String> {
     Ok(count)
 }
 
+/// Phase 85a (B.1) — direct build dependencies for a port, used by
+/// `port_build` to compute `dep_keys` for [`package_key`].
+///
+/// Only one level of dependencies is listed here; ports with no deps
+/// return an empty slice. Every port currently depended upon (`ncurses`,
+/// `libevent`) is itself a leaf with no build deps, so `compute_port_key`'s
+/// non-recursive key computation is correct as written. Introducing a
+/// *transitive* build dependency would require `compute_port_key` to recurse
+/// (folding each dep's own resolved dep-keys into its key); this function's
+/// `&[&str]` return type would not need to change, but the key computation
+/// would — it does not handle deep chains today.
+pub fn port_deps(name: &str) -> &'static [&'static str] {
+    match name {
+        "less" => &["ncurses"],
+        "htop" => &["ncurses"],
+        // Order is irrelevant to the content key (deps are sorted in
+        // `compute_package_key`); it only sets the install sequence the in-OS
+        // solver follows — libevent (a small static lib) before the heavyweight
+        // ncurses terminfo DB.
+        "tmux" => &["libevent", "ncurses"],
+        _ => &[],
+    }
+}
+
+/// Phase 85a (D.1 / solver) — the `VERSION` field from a port's Portfile, used
+/// by the image populator to write the `/usr/pkg/<name>.meta` sidecar the in-OS
+/// dependency solver reads. Returns `None` if the port or field is absent.
+pub fn port_version(name: &str) -> Option<String> {
+    let port_dir = find_port_dir(name)?;
+    let meta = parse_portfile(&port_dir.join("Portfile")).ok()?;
+    meta.get("VERSION").cloned()
+}
+
+/// Phase 85a (B.2) — compute the portable content key for `name` (the port at
+/// `port_dir`), folding in the active toolchain identity and the resolved
+/// package keys of its direct dependencies. Shared by the resolve-before-build
+/// path and [`pkgcache_artifact_path`] so the key is computed one way only.
+fn compute_port_key(name: &str, port_dir: &Path) -> Result<String, String> {
+    let tc = toolchain_id();
+    let dep_keys: Vec<String> = port_deps(name)
+        .iter()
+        .map(|dep| {
+            let dep_dir = find_port_dir(dep)
+                .ok_or_else(|| format!("dep port {dep} not found in ports/ tree"))?;
+            // Every current dep is a leaf (ncurses/libevent have no build deps
+            // of their own), so an empty dep-key slice computes the correct key.
+            // A *transitive* dep would instead need its own resolved dep-keys
+            // folded in here (i.e. recurse via `compute_port_key`); that is not
+            // handled yet because no such chain exists in the ports tree.
+            package_key(&dep_dir, &tc, &[])
+        })
+        .collect::<Result<_, String>>()?;
+    package_key(port_dir, &tc, &dep_keys)
+}
+
+/// Phase 85a (D.1) — the `target/pkgcache/<key>.m3pkg` path a built `name` would
+/// seal to. Used by the image populator to locate each port's sealed artifact
+/// (to bundle into `/usr/pkg/` and pre-install from). Returns the path whether
+/// or not the file exists — callers check existence + [`pkg_format::verify`].
+pub fn pkgcache_artifact_path(name: &str) -> Result<PathBuf, String> {
+    let port_dir =
+        find_port_dir(name).ok_or_else(|| format!("port {name} not found in ports/ tree"))?;
+    let key = compute_port_key(name, &port_dir)?;
+    Ok(workspace_root()
+        .join("target/pkgcache")
+        .join(format!("{key}.m3pkg")))
+}
+
+/// Phase 85a (B.1) — pack the DESTDIR-staged tree into a deterministic
+/// `.m3pkg` artifact and write it atomically to `target/pkgcache/<key>.m3pkg`.
+///
+/// **Atomicity**: the bytes are first written to `<key>.m3pkg.tmp`, then
+/// renamed into place, so a concurrent reader never sees a partial file.
+///
+/// `target/pkgcache/` is **build output** — `cargo xtask clean` (which
+/// removes only the disk image) does NOT purge it. This is intentional:
+/// the pkgcache must survive across `clean` cycles so that a warmed cache
+/// on one build machine can be preserved (or archived / shared) without
+/// rebuilding from source. Only a manual `rm -rf target/pkgcache/` or a
+/// toolchain upgrade that changes the content key will invalidate an entry.
+fn seal_package(name: &str, stage: &Path, key: &str) -> Result<(), String> {
+    let root = workspace_root();
+    let cache_dir = root.join("target/pkgcache");
+    fs::create_dir_all(&cache_dir).map_err(|e| format!("mkdir pkgcache: {e}"))?;
+
+    let artifact = cache_dir.join(format!("{key}.m3pkg"));
+    let tmp = cache_dir.join(format!("{key}.m3pkg.tmp"));
+
+    // Phase 85a (E.1 relocation contract) — strip symbol tables from ELF
+    // executables / shared objects in the stage before packing, so the sealed
+    // artifact (and the on-image pre-install) carries no debug/symbol bloat.
+    // Mandatory for the multi-hundred-MB Clang artifact; a smaller win for the
+    // ncurses-class binaries. Static archives (.a) and non-ELF files (terminfo,
+    // headers, data) are left untouched so dependent links still resolve.
+    strip_stage(stage);
+
+    let bytes =
+        pkg_format::pack(stage).map_err(|e| format!("seal_package({name}): pack failed: {e}"))?;
+
+    // Atomic write: write to .tmp then rename so readers never see partial data.
+    fs::write(&tmp, &bytes).map_err(|e| format!("seal_package({name}): write tmp: {e}"))?;
+    fs::rename(&tmp, &artifact)
+        .map_err(|e| format!("seal_package({name}): rename into place: {e}"))?;
+
+    // Record the key in a sibling file (NOT inside `stage`) for diagnostics, so
+    // the cache metadata never lands inside a packed artifact (and thus never
+    // ends up at `/.pkgkey` on a future `pkg install`). Does not affect cache
+    // lookup (the key is always recomputed from Portfile + toolchain + deps).
+    if let Some(stage_root) = stage.parent() {
+        let _ = fs::write(stage_root.join(format!("{name}.pkgkey")), key);
+    }
+
+    println!(
+        "PKGCACHE: sealed {name} → {} ({} bytes)",
+        artifact.display(),
+        bytes.len()
+    );
+    Ok(())
+}
+
+/// Recursively strip ELF executables and shared objects under `dir` in place
+/// (best-effort). Only files whose first four bytes are the ELF magic are
+/// touched, so static archives (`!<arch>` magic), terminfo entries, headers,
+/// and scripts are left alone — keeping dependent links intact. Failures are
+/// ignored: a missing `strip` or an unstrippable file must not abort the build.
+fn strip_stage(dir: &Path) {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if fs::symlink_metadata(&path)
+            .map(|m| m.is_symlink())
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        if path.is_dir() {
+            strip_stage(&path);
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+        let mut magic = [0u8; 4];
+        let is_elf = File::open(&path)
+            .and_then(|mut f| f.read(&mut magic))
+            .map(|n| n == 4 && &magic == b"\x7fELF")
+            .unwrap_or(false);
+        if is_elf {
+            let _ = Command::new("strip")
+                .arg(&path)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+}
+
 /// Top-level entry point invoked by `cargo xtask port build <name>`.
 pub fn cmd_port_build(name: &str) -> i32 {
     match port_build(name) {
@@ -340,11 +661,57 @@ fn port_build(name: &str) -> Result<(), String> {
     fs::create_dir_all(&stage_root).map_err(|e| format!("mkdir stage_root: {e}"))?;
     fs::create_dir_all(&work_root).map_err(|e| format!("mkdir work_root: {e}"))?;
 
+    // Phase 85a (B.2) — resolve-before-build: if a pkgcache artifact for the
+    // portable content key already exists and verifies, install directly from
+    // it — skipping configure/make/install entirely. This is the "never rebuild"
+    // half of the pkgcache (complement of B.1's "build once").
+    //
+    // The `.stamp` (same-machine fast path) lives in a SIBLING file
+    // `target/port-stage/<name>.stamp`, NOT inside `stage`, so the staged tree
+    // packed into the `.m3pkg` is pure package content (no cache metadata leaks
+    // into the artifact or onto `/` at install time).
+    let key = compute_port_key(name, &port_dir)?;
+    let stamp = stage_root.join(format!("{name}.stamp"));
+    let pkgcache_artifact = root.join("target/pkgcache").join(format!("{key}.m3pkg"));
+    if pkgcache_artifact.exists() {
+        if let Ok(bytes) = fs::read(&pkgcache_artifact) {
+            if pkg_format::verify(&bytes) {
+                // Cache hit — materialize the stage from the artifact.
+                let short_key = key.get(..16).unwrap_or(&key);
+                println!("PKGCACHE: hit {key}");
+                println!(
+                    "ports: {name} pkgcache hit (key {short_key}…), zero compiler invocations"
+                );
+
+                // Reset the stage dir and unpack.
+                let _ = fs::remove_dir_all(&stage);
+                fs::create_dir_all(&stage).map_err(|e| format!("mkdir stage (cache hit): {e}"))?;
+                pkg_format::unpack(&bytes, &stage)
+                    .map_err(|e| format!("unpack pkgcache({name}): {e}"))?;
+
+                // Prime the same-machine `.stamp` fast-path so subsequent calls
+                // skip even the key computation on the same machine.
+                let fingerprint = port_fingerprint(&port_dir);
+                let _ = fs::write(&stamp, &fingerprint);
+
+                return Ok(());
+            }
+        }
+    }
+    // Cache miss — log it, then fall through to the same-machine stamp check
+    // and the real build.
+    println!("PKGCACHE: miss {key} (building)");
+
     let fingerprint = port_fingerprint(&port_dir);
-    let stamp = stage.join(".stamp");
     let cached_stamp = fs::read_to_string(&stamp).unwrap_or_default();
     if cached_stamp.trim() == fingerprint && stage.is_dir() {
+        // Same-machine inner-loop fast path: stage is current per local stamp.
+        // Seal it into the pkgcache so subsequent (portable) lookups hit too.
         println!("ports: {name}-{version} stage is up-to-date (fingerprint match)");
+        if let Err(e) = seal_package(name, &stage, &key) {
+            // Sealing is best-effort; a failure here should not abort the build.
+            eprintln!("pkgcache: warning: seal failed for {name}: {e}");
+        }
         return Ok(());
     }
 
@@ -371,6 +738,7 @@ fn port_build(name: &str) -> Result<(), String> {
     match name {
         "ncurses" => build_ncurses(&extracted, &stage, &toolchain)?,
         "libevent" => build_libevent(&extracted, &stage, &toolchain)?,
+        "zlib" => build_zlib(&extracted, &stage, &toolchain)?,
         "less" => build_less(&extracted, &stage, &toolchain, &ncurses_stage)?,
         "htop" => build_htop(&extracted, &stage, &toolchain, &ncurses_stage)?,
         "tmux" => build_tmux(
@@ -382,6 +750,10 @@ fn port_build(name: &str) -> Result<(), String> {
         )?,
         _ => return Err(format!("no host build recipe for port {name}")),
     }
+
+    // Phase 85a (B.1) — seal the built stage into the pkgcache BEFORE writing
+    // the `.stamp`, so a subsequent run on this machine does not race.
+    seal_package(name, &stage, &key)?;
 
     fs::write(&stamp, &fingerprint).map_err(|e| format!("write stamp: {e}"))?;
     println!(
@@ -573,6 +945,57 @@ fn build_libevent(
         return Err(format!("libevent build missing {}", lib.display()));
     }
     println!("libevent: produced libevent.a");
+    Ok(())
+}
+
+/// Phase 85a (D.2 follow-up) — cross-compile zlib 1.3.1 as a static library.
+///
+/// zlib ships a hand-written `configure` (not autotools), so there is no
+/// `--host` flag; cross-compilation is selected purely through the `CC` / `AR` /
+/// `RANLIB` environment. `--static` skips the shared object (m3OS links static),
+/// `--prefix=/usr/local` bakes the runtime prefix, and `make install DESTDIR=`
+/// stages `usr/local/{lib/libz.a, include/{zlib,zconf}.h, lib/pkgconfig/zlib.pc,
+/// share/man}`. The resulting stage is sealed into a `.m3pkg` by the shared
+/// pkgcache path exactly like the other ports.
+fn build_zlib(
+    src: &Path,
+    stage: &Path,
+    (cc, ar, ranlib): &(&'static str, String, String),
+) -> Result<(), String> {
+    let stage_prefix = stage.join("usr/local");
+    fs::create_dir_all(&stage_prefix).map_err(|e| format!("mkdir: {e}"))?;
+
+    let mut configure_cmd = Command::new("sh");
+    configure_cmd
+        .current_dir(src)
+        .arg("./configure")
+        .arg("--static")
+        .arg("--prefix=/usr/local")
+        .env("CC", cc)
+        .env("AR", ar)
+        .env("RANLIB", ranlib)
+        .env("CFLAGS", "-O2");
+    run(&mut configure_cmd, "zlib configure")?;
+
+    let mut make_cmd = Command::new("make");
+    make_cmd.current_dir(src).arg(format!("-j{}", num_jobs()));
+    run(&mut make_cmd, "zlib make")?;
+
+    let mut install_cmd = Command::new("make");
+    install_cmd
+        .current_dir(src)
+        .arg("install")
+        .arg(format!("DESTDIR={}", stage.display()));
+    run(&mut install_cmd, "zlib install")?;
+
+    let lib = stage_prefix.join("lib/libz.a");
+    if !lib.exists() {
+        return Err(format!("zlib build missing {}", lib.display()));
+    }
+    println!(
+        "zlib: produced /usr/local/lib/libz.a ({} bytes)",
+        file_size(&lib)
+    );
     Ok(())
 }
 
@@ -1028,7 +1451,7 @@ pub fn build_phase_69d_ports() -> Result<(), String> {
             "no musl cross-compiler on PATH (install musl-tools or musl-gcc-cross-bin)".to_string(),
         );
     }
-    for name in &["ncurses", "libevent", "less", "htop", "tmux"] {
+    for name in &["zlib", "ncurses", "libevent", "less", "htop", "tmux"] {
         port_build(name).map_err(|e| format!("port {name}: {e}"))?;
     }
     Ok(())
@@ -1115,5 +1538,209 @@ mod tests {
         // Sanity: the Phase 69d Portfile must be discoverable.
         let p = find_port_dir("ncurses").expect("ncurses Portfile staged in repo");
         assert!(p.join("Portfile").exists());
+    }
+
+    // ── A.1 — recipe_digest hashes every file under patches/, recursively ──
+
+    /// Regression: `recipe_digest` documents that it folds in *every file under
+    /// `patches/`*. A patch placed in a **nested** subdirectory must therefore
+    /// invalidate the digest when its contents change — otherwise a hierarchical
+    /// patches tree could let a patch edit ride a stale cached `.m3pkg`.
+    #[test]
+    fn recipe_digest_includes_nested_patch_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let port = tmp.path();
+        fs::write(port.join("Portfile"), b"NAME=demo\nSHA256=abc\n").unwrap();
+        let nested = port.join("patches").join("series");
+        fs::create_dir_all(&nested).unwrap();
+        let patch = nested.join("0001-fix.patch");
+        fs::write(&patch, b"--- a\n+++ b\n@@ original @@\n").unwrap();
+
+        let before = recipe_digest(port);
+
+        // Editing the *nested* patch's contents must change the digest.
+        fs::write(&patch, b"--- a\n+++ b\n@@ edited @@\n").unwrap();
+        let after = recipe_digest(port);
+
+        assert_ne!(
+            before, after,
+            "a change to a nested patch file must invalidate the recipe digest"
+        );
+    }
+
+    /// Same-named patch files in different subdirectories must not collide:
+    /// the digest keys each file by its path **relative to `patches/`**, so
+    /// swapping two equally-named files' contents across subdirs changes the
+    /// digest. The previous immediate-`read_dir` digest never recursed into
+    /// subdirs at all, so it would have missed this swap entirely.
+    #[test]
+    fn recipe_digest_keys_patches_by_relative_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let port = tmp.path();
+        fs::write(port.join("Portfile"), b"NAME=demo\nSHA256=abc\n").unwrap();
+        let a = port.join("patches").join("a");
+        let b = port.join("patches").join("b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        fs::write(a.join("p.patch"), b"AAA").unwrap();
+        fs::write(b.join("p.patch"), b"BBB").unwrap();
+        let before = recipe_digest(port);
+
+        // Swap the two same-named files' contents across subdirs.
+        fs::write(a.join("p.patch"), b"BBB").unwrap();
+        fs::write(b.join("p.patch"), b"AAA").unwrap();
+        let after = recipe_digest(port);
+
+        assert_ne!(
+            before, after,
+            "relative-path keying must distinguish same-named patches in different subdirs"
+        );
+    }
+
+    // ── B.1 — seal_package ───────────────────────────────────────────────
+
+    /// Exercise `seal_package`'s constituent steps — `pkg_format::pack` plus the
+    /// atomic temp-write/rename into `target/pkgcache/<key>.m3pkg` — on a minimal
+    /// fake stage, and assert that:
+    ///   - `target/pkgcache/<key>.m3pkg` is created
+    ///   - `pkg_format::verify` passes on the resulting bytes
+    ///
+    /// The steps are reproduced inline rather than calling `seal_package`
+    /// directly because that function resolves `workspace_root()` internally
+    /// (xtask-specific). The `.pkgkey` diagnostic sidecar that the real
+    /// `seal_package` writes alongside the artifact is therefore out of scope
+    /// for this unit test. No compiler is invoked — this is pure filesystem logic.
+    #[test]
+    fn seal_package_creates_valid_m3pkg() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stage = tmp.path().join("stage");
+        fs::create_dir_all(stage.join("usr/local/bin")).unwrap();
+        fs::write(stage.join("usr/local/bin/foo"), b"fake-elf-bytes").unwrap();
+        fs::write(stage.join("usr/local/bin/bar"), b"another-binary").unwrap();
+
+        // Use a temp directory as the workspace-root substitute: redirect
+        // target/pkgcache/ inside tmp so we do not pollute the real build tree.
+        let fake_root = tmp.path().join("fake-root");
+        let pkgcache = fake_root.join("target/pkgcache");
+        fs::create_dir_all(&pkgcache).unwrap();
+
+        // We test seal_package's constituent steps directly (pack + atomic write)
+        // rather than calling the private function through the crate, because
+        // `seal_package` calls `workspace_root()` internally (xtask-specific).
+        // Instead, reproduce the logic verbatim so the test is self-contained.
+        let key = "0000000000000000000000000000000000000000000000000000000000000001";
+        let artifact = pkgcache.join(format!("{key}.m3pkg"));
+        let tmp_file = pkgcache.join(format!("{key}.m3pkg.tmp"));
+
+        let bytes = pkg_format::pack(&stage).expect("pack should succeed");
+        fs::write(&tmp_file, &bytes).unwrap();
+        fs::rename(&tmp_file, &artifact).unwrap();
+
+        // Artifact exists.
+        assert!(artifact.exists(), "artifact must be created by seal");
+
+        // Content is valid.
+        let read_back = fs::read(&artifact).unwrap();
+        assert!(
+            pkg_format::verify(&read_back),
+            "verify must pass on the sealed artifact"
+        );
+    }
+
+    /// `pack` then `unpack` round-trips the stage tree: every file that went in
+    /// comes back out with identical bytes.  This test exercises the
+    /// seal→resolve pipeline without a musl cross-compiler.
+    #[test]
+    fn seal_then_resolve_round_trips_stage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stage = tmp.path().join("stage-original");
+        fs::create_dir_all(stage.join("usr/local/lib")).unwrap();
+        fs::create_dir_all(stage.join("usr/local/bin")).unwrap();
+        fs::write(
+            stage.join("usr/local/lib/libfoo.a"),
+            b"\x7fELF-fake-archive",
+        )
+        .unwrap();
+        fs::write(stage.join("usr/local/bin/mytool"), b"#!/bin/sh\necho hi\n").unwrap();
+
+        // Seal.
+        let bytes = pkg_format::pack(&stage).expect("pack");
+        assert!(pkg_format::verify(&bytes), "verify after pack");
+
+        // Resolve into a fresh dest.
+        let dest = tmp.path().join("stage-restored");
+        fs::create_dir_all(&dest).unwrap();
+        let n = pkg_format::unpack(&bytes, &dest).expect("unpack");
+        assert_eq!(n, 2, "two files should round-trip");
+
+        // Content matches.
+        assert_eq!(
+            fs::read(dest.join("usr/local/lib/libfoo.a")).unwrap(),
+            b"\x7fELF-fake-archive"
+        );
+        assert_eq!(
+            fs::read(dest.join("usr/local/bin/mytool")).unwrap(),
+            b"#!/bin/sh\necho hi\n"
+        );
+    }
+
+    /// A single flipped byte must cause `verify` to return `false` (integrity
+    /// protection check for the pkgcache — prevents silent stage corruption).
+    #[test]
+    fn verify_detects_single_flipped_byte() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stage = tmp.path().join("stage");
+        fs::create_dir_all(stage.join("bin")).unwrap();
+        fs::write(stage.join("bin/x"), b"original content").unwrap();
+
+        let mut bytes = pkg_format::pack(&stage).expect("pack");
+        assert!(pkg_format::verify(&bytes), "baseline must verify");
+
+        // Flip the last byte of the data blob.
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        assert!(
+            !pkg_format::verify(&bytes),
+            "verify must fail after bit flip"
+        );
+    }
+
+    // ── B.2 — port_deps ──────────────────────────────────────────────────
+
+    #[test]
+    fn port_deps_known_ports() {
+        assert_eq!(port_deps("less"), &["ncurses"]);
+        assert_eq!(port_deps("htop"), &["ncurses"]);
+        // tmux depends on both ncurses and libevent (order matters for
+        // sorted dep key computation — sorted internally by compute_package_key).
+        let tmux_deps = port_deps("tmux");
+        assert!(
+            tmux_deps.contains(&"ncurses") && tmux_deps.contains(&"libevent"),
+            "tmux must list both ncurses and libevent as deps"
+        );
+        assert_eq!(port_deps("ncurses"), &[] as &[&str]);
+        assert_eq!(port_deps("libevent"), &[] as &[&str]);
+        // Unknown port returns empty.
+        assert_eq!(port_deps("clang"), &[] as &[&str]);
+    }
+
+    // ── M5 — build_recipe_id (configure-flag identity folded into the key) ──
+
+    #[test]
+    fn build_recipe_id_is_distinct_and_nonempty_per_host_port() {
+        // Every host-built port must have a non-empty, distinct configure-flag
+        // identity so a flag change self-invalidates its cached .m3pkg and two
+        // ports never collide on the recipe component of the key.
+        let ports = ["zlib", "ncurses", "libevent", "less", "htop", "tmux"];
+        let ids: Vec<&str> = ports.iter().map(|p| build_recipe_id(p)).collect();
+        for (p, id) in ports.iter().zip(&ids) {
+            assert!(!id.is_empty(), "{p} must have a build_recipe_id");
+        }
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ids.len(), "build_recipe_ids must be distinct");
+        // Unknown ports yield the empty identity (no recipe contribution).
+        assert_eq!(build_recipe_id("clang"), "");
     }
 }

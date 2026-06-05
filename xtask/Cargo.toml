@@ -14,3 +14,6 @@ tempfile = "3.25.0"
 # canonical `$sha256i$10000$` format the in-guest passwd helper uses.
 sha2 = { workspace = true, default-features = false }
 passwd = { path = "../userspace/passwd", default-features = false }
+# Phase 85a — host packer for the content-addressed .m3pkg store (default
+# features bring in the std pack/unpack surface).
+pkg-format = { path = "../pkg-format" }

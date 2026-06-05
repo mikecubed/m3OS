@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**m3OS** (technical name: `m3os`) is a bootable microkernel OS in Rust: x86_64, UEFI boot, kernel **v0.84.0**. Ring 0 handles memory, scheduling, IPC/capabilities, interrupt routing, and in-kernel drivers; ring 3 hosts everything else.
+**m3OS** (technical name: `m3os`) is a bootable microkernel OS in Rust: x86_64, UEFI boot, kernel **v0.85.0**. Ring 0 handles memory, scheduling, IPC/capabilities, interrupt routing, and in-kernel drivers; ring 3 hosts everything else.
 
 Capabilities now present in the tree:
 
@@ -14,6 +14,7 @@ Capabilities now present in the tree:
 - **IOMMU substrate**: ACPI DMAR/IVRS parsing, per-device VT-d / AMD-Vi domains, IOMMU-routed `DmaBuffer<T>`, fault ISRs, VT-d queued invalidation.
 - **Ring-3 driver hosting**: capability-gated device-host syscalls, supervised userspace NVMe/e1000 with `RemoteBlockDevice`/`RemoteNic` facades.
 - **USB host stack**: ring-3 xHCI host driver (MSI-X, BME, TRB/event rings) + `usb-core`/hub + a HID Boot-Protocol class driver (`usb-hid`) injecting keyboard/mouse into `kbd_server`/`mouse_server` — modern PS/2-less machines get USB keyboard/mouse input.
+- **Package management**: content-addressed prebuilt-package substrate — a relocatable `.m3pkg` format + portable content key (`pkg-format`, host-tested), an `xtask` seal-after-install / resolve-before-build pkgcache (`target/pkgcache/`, strip-before-seal, zero-rebuild gate), and an offline in-OS `pkg install`/`remove`/`upgrade`/`list`/`verify` installer with a transitive dependency solver (resolving each package's `/usr/pkg/<name>.meta` `DEPS=` in dependency-first topological order) reading a local `/usr/pkg/` repo + `/var/lib/pkg/db`. The ncurses-class ports (+zlib) build once and install as artifacts; networked fetch + binary deltas are deferred to Phase 86.
 - **Graphical stack**: `display_server` (framebuffer owner, focus-aware input, layer-shell surface roles, damage tracking, animations/decorations), `kbd_server`/`mouse_server`, compositor clients (`wallpaper`, `bar`, `launcher`, `notifyd`, `lockscreen`), `greeter` GUI login, `session_manager` lifecycle supervision.
 - **Audio**: out-of-process ring-3 audio drivers — `ac97` and `hda` (Intel HD Audio controller + generic zero-quirk widget-graph codec, CORB/RIRB IOVA rings, BDL/`SDnFMT` output stream) — behind a `driver_ipc::audio` seam; `audio_server` is a pure policy/mixer (32-ch DMX→S16LE mix, DOOM audio + bell) that forwards PCM over a persistent `sys_shm` ring.
 - **Terminal**: `term` emulator, full termios/line-discipline, UTF-8 + TTF/Nerd Font glyphs, ncurses + less/htop/tmux ports.
@@ -35,7 +36,7 @@ cargo xtask run-gui      # build + launch in QEMU (GUI with framebuffer)
 cargo xtask run-gui --fresh  # same, but recreate data disk first
 cargo xtask image        # build bootable disk image (UEFI raw + VHDX)
 cargo xtask image --sign # build + sign EFI binary for Secure Boot
-cargo xtask check        # clippy (-D warnings) + rustfmt + host tests for kernel-core (incl. storage::{ahci,ata}, spectre, kpti), passwd, driver_runtime, audio_client, audio_server, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, wifi-core, mt792x_driver, ahci_driver, m3ctl + the Phase 84 retpoline objdump indirect-branch gate
+cargo xtask check        # clippy (-D warnings) + rustfmt + host tests for kernel-core (incl. storage::{ahci,ata}, spectre, kpti), passwd, driver_runtime, audio_client, audio_server, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, wifi-core, mt792x_driver, ahci_driver, m3ctl, pkg-format (Phase 85a .m3pkg pack/unpack/verify + content-key), pkg (Phase 85a installed-file DB), xtask (Phase 85a Portfile parser + package_key + pkgcache seal/resolve) + the Phase 84 retpoline objdump indirect-branch gate
 cargo xtask fmt --fix    # auto-format all workspace source
 cargo xtask test         # run all kernel tests in QEMU via ISA debug exit
 cargo xtask test --test <name>  # run a single QEMU test binary
@@ -109,6 +110,8 @@ This sets `core.hooksPath` to `.githooks/`. **pre-commit** runs `cargo xtask che
 | `wifi-smoke` (no QEMU mt76 model — skip-with-reason; radio validated via VFIO) | `M3OS_WIFI_REGRESSION=1` |
 | `ahci-smoke` (`-device ich9-ahci` + scratch `ide-hd`; IDENTIFY/write/read-back-compare/flush/IDENTIFY-after-write/induced-TFES-recovery; BOHC/SSS/hot-plug skip-with-reason on QEMU, validated via VFIO) **and** `ahci-root-smoke` (real ext2 data disk routed to AHCI; asserts the root mounts off `ahci.block` end-to-end — virtio root absent → driver MBR/ext2 probe → owner-gate accept → `init: / mounted (ext2 via ring-3 ahci.block)` → login prompt) | `M3OS_AHCI_REGRESSION=1` |
 | `mitigations-status-smoke` (Phase 84: boots + asserts the `[sec] mitigations=… global_kernel_ptes=0` boot-policy log and the `m3ctl mitigations status` reporter output — per-vuln Meltdown line + compiled-in retpoline line + UNADDRESSED enumeration; KPTI-independent default boot) | `M3OS_MITIGATIONS_REGRESSION=1` |
+| `pkgcache-hit-check` (Phase 85a: second build of a warmed-cache port performs zero compiler invocations — pure `.m3pkg` hit; requires a musl cross-compiler for the initial warm build) | `M3OS_PKGCACHE_REGRESSION=1` |
+| `pkg-smoke` (Phase 85a: boots m3OS, then exercises the offline `pkg` manager against the bundled `/usr/pkg/` repo — `install`/`list`/`verify`/`upgrade`/`remove` of the dependency-free `libevent` leaf (verifying `/usr/local/lib/libevent.a`), then `pkg install tmux` to prove the dependency solver auto-installs tmux's `libevent` dep; proves the `.m3pkg` round-trips build → image → in-OS install) | `M3OS_PKG_REGRESSION=1` |
 
 The `tls-smoke`/`dns-smoke` gates assert the musl-built smoke stage actually
 `PASS`ed rather than `SKIP`ped — a `SKIP` means the musl cross-compiler was

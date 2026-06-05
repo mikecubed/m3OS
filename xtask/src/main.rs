@@ -183,6 +183,12 @@ const SMOKE_EXIT_TERMIOS_SMOKE_FAILED: i32 = 68;
 /// immediately rather than letting the step time out.
 const SMOKE_EXIT_TUI_APP_SMOKE_FAILED: i32 = 69;
 
+/// Phase 85a Track C/D — `cargo xtask pkg-smoke` exit code. Distinct from the
+/// other gates (70 = doom-concurrent, 72 = tiling) so CI can route a
+/// pkg-install failure separately. Boots m3OS, installs a bundled `.m3pkg` from
+/// the offline `/usr/pkg/` repo, and asserts `pkg list`/`pkg verify` see it.
+const SMOKE_EXIT_PKG_SMOKE_FAILED: i32 = 73;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
     Headless,
@@ -688,6 +694,17 @@ fn main() {
                 });
             cmd_termios_smoke(&smoke_args);
         }
+        // Phase 85a Track C/D — `cargo xtask pkg-smoke` boots m3OS, then drives
+        // `pkg install`/`list`/`verify` against the offline `/usr/pkg/` repo
+        // that the image build bundled. Boot-level proof of the in-OS installer.
+        Some("pkg-smoke") => {
+            let smoke_args = parse_smoke_boot_args("pkg-smoke", &args[2..]).unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            cmd_pkg_smoke(&smoke_args);
+        }
         // Phase 63a Track H — DOOM SFX + music end-to-end smoke. Boots
         // with WAV AC'97 backend, launches `/bin/doom -warp 1 1` with
         // an auto-quit budget so the engine's Shutdown emits the
@@ -845,6 +862,17 @@ fn main() {
             });
             cmd_soak(&soak_args);
         }
+        // Phase 85a Track B.3 — zero-rebuild assertion gate.
+        // Builds a port once to warm the pkgcache, removes the stage so the
+        // same-machine `.stamp` fast-path cannot short-circuit, then builds
+        // again and asserts the second run logged a pure `PKGCACHE: hit`
+        // with zero compiler/make/cmake/ninja/configure invocations.
+        // Gated by M3OS_PKGCACHE_REGRESSION=1 (requires a musl cross-compiler).
+        Some("pkgcache-hit-check") => {
+            let port_name = args.get(2).cloned();
+            let code = cmd_pkgcache_hit_check(port_name.as_deref());
+            std::process::exit(code);
+        }
         Some(other) => {
             eprintln!("Unknown subcommand: {other}");
             eprintln!("Usage: {}", usage());
@@ -858,7 +886,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -1168,6 +1196,8 @@ fn build_userspace_bins() {
         ("notifyd", "notify-send", true),
         // Phase 73 — lockscreen Layer-shell stub.
         ("lockscreen", "lockscreen", true),
+        // Phase 85a Track C — offline package installer (alloc for Vec/String + pkg-format).
+        ("pkg", "pkg", true),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -1223,6 +1253,9 @@ fn build_userspace_bins() {
             "hda_driver" => &["--features", "os-binary"],
             // Phase 82: ahci_driver uses the same lib/bin os-binary split.
             "ahci_driver" => &["--features", "os-binary"],
+            // Phase 85a Track C: pkg uses the same lib/bin os-binary split so
+            // the [[bin]] _start entry point is skipped on host-test builds.
+            "pkg" => &["--features", "os-binary"],
             _ => &[],
         };
 
@@ -5258,6 +5291,63 @@ fn cmd_check() {
         std::process::exit(1);
     }
 
+    // Phase 85a — clippy the package-management crates with `-D warnings`.
+    //
+    // `pkg-format` is checked on the host target for BOTH feature surfaces:
+    // the default (`std`) host packer/unpacker, and `--no-default-features`
+    // for the `no_std` parse/verify surface the in-OS installer links. `pkg`
+    // is checked on the kernel's `x86_64-unknown-none` target with
+    // `--features os-binary` (so the `[[bin]]` `_start` path is linted, not
+    // just the host-testable `[lib]`), in its OWN invocation — mirroring the
+    // Wi-Fi block above so cargo feature unification cannot leak `pkg`'s
+    // `syscall-lib/alloc` onto the combined userspace clippy run.
+    for (pkg, extra) in [
+        ("pkg-format", &["--no-default-features"][..]),
+        ("pkg-format", &[][..]),
+    ] {
+        let mut a = vec![
+            "clippy",
+            "--package",
+            pkg,
+            "--target",
+            KERNEL_CORE_HOST_TARGET,
+        ];
+        a.extend_from_slice(extra);
+        a.extend(["--", "-D", "warnings"]);
+        let status = Command::new(env!("CARGO"))
+            .current_dir(&root)
+            .args(&a)
+            .status()
+            .expect("failed to run pkg-format clippy");
+        if !status.success() {
+            eprintln!("pkg-format clippy reported errors (features: {extra:?})");
+            std::process::exit(1);
+        }
+    }
+
+    let status = Command::new(env!("CARGO"))
+        .current_dir(&root)
+        .args([
+            "clippy",
+            "--package",
+            "pkg",
+            "--features",
+            "os-binary",
+            "--target",
+            "x86_64-unknown-none",
+            "-Zbuild-std=core,compiler_builtins,alloc",
+            "-Zbuild-std-features=compiler-builtins-mem",
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .status()
+        .expect("failed to run pkg clippy");
+    if !status.success() {
+        eprintln!("pkg clippy reported errors");
+        std::process::exit(1);
+    }
+
     // Host-side allocator/property coverage uses:
     //   cargo test -p kernel-core --target x86_64-unknown-linux-gnu
     // Password-shadow rewrite regression coverage uses:
@@ -5385,6 +5475,33 @@ fn cmd_check() {
         }
     }
 
+    // Phase 85a — host tests for the content-addressed package substrate.
+    // `pkg-format` carries the `.m3pkg` pack/unpack/verify + content-key
+    // pure logic (A.1/A.2); `xtask`'s own self-tests cover the Portfile
+    // parser, `package_key`, and the pkgcache resolve/seal helpers (Track B);
+    // `pkg`'s `[lib]` (`pkg_app`) carries the installed-file DB serialize/parse
+    // + idempotent-upsert + install-path logic (C.2). All build against the
+    // host target rather than the workspace-default bare-metal target.
+    for pkg in ["pkg-format", "xtask", "pkg"] {
+        let status = Command::new(env!("CARGO"))
+            .current_dir(&root)
+            .args([
+                "test",
+                "--package",
+                pkg,
+                "--target",
+                KERNEL_CORE_HOST_TARGET,
+            ])
+            .status()
+            .unwrap_or_else(|e| panic!("failed to spawn {pkg} host tests: {e}"));
+        if !status.success() {
+            eprintln!(
+                "{pkg} host tests failed — rerun `cargo test -p {pkg} --target {KERNEL_CORE_HOST_TARGET}`"
+            );
+            std::process::exit(1);
+        }
+    }
+
     // Format check for both kernel and kernel-core.
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
@@ -5413,7 +5530,7 @@ fn cmd_check() {
     retpoline_objdump_gate();
 
     println!(
-        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, ac97_driver, hda_driver, ahci_driver, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, shadow, ldso_core, wifi-core, mt792x_driver, and m3ctl host tests pass; doom platform-layer C tests pass; retpoline indirect-branch gate pass"
+        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, ac97_driver, hda_driver, ahci_driver, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, shadow, ldso_core, wifi-core, mt792x_driver, m3ctl, pkg-format, xtask, and pkg host tests pass; doom platform-layer C tests pass; retpoline indirect-branch gate pass"
     );
 }
 
@@ -13133,6 +13250,221 @@ fn termios_smoke_steps() -> Vec<SmokeStep> {
     steps
 }
 
+/// Phase 85a Track C/D — `cargo xtask pkg-smoke`.
+///
+/// Boots m3OS (serial autologin path), then drives the offline `pkg` installer
+/// against the bundled local repo that Track D staged into `/usr/pkg/`. The
+/// gate uses `libevent` (a dependency-free leaf whose payload is a single
+/// `/usr/local/lib/libevent.a`) so install/verify complete in seconds rather
+/// than waiting on ncurses' ~1833-entry terminfo write over the ring-3 VFS:
+///   1. `pkg list` on a fresh boot → `(no packages installed)` (empty DB).
+///   2. `pkg install libevent` → reads `/usr/pkg/libevent.m3pkg`, verifies its
+///      SHA-256 hashes, lays the files under `/usr`, records `/var/lib/pkg/db`.
+///   3. `pkg list` → shows `libevent`.
+///   4. `pkg verify libevent` → re-hashes `/usr/local/lib/libevent.a` → `OK`.
+///   5. `pkg upgrade libevent` → full re-install (0 orphans pruned).
+///   6. `pkg remove libevent` → unlinks its files + drops the DB block.
+///   7. `pkg verify libevent` → `not installed` (gone from the DB).
+///   8. `pkg install tmux` → the dependency solver engages and auto-installs
+///      tmux's `libevent` dependency first (asserts both the "resolving … +
+///      dependencies" line and `libevent: OK`).
+///
+/// This is the boot-level proof for the Track C/D/F acceptance (`pkg`
+/// install/list/verify/upgrade/remove + solver against bundled `.m3pkg`
+/// artifacts) and exercises the full D.1 staging round-trip (pack at build →
+/// bundle into the image → unpack/install in-OS).
+fn cmd_pkg_smoke(args: &SmokeBootArgs) {
+    // Build the host ports so their `.m3pkg` artifacts exist for Track D to
+    // bundle into `/usr/pkg/` (zero compiler invocations on a warm pkgcache).
+    if let Err(msg) = port_build::build_phase_69d_ports() {
+        eprintln!("pkg-smoke: precondition failed (port build): {msg}");
+        std::process::exit(SMOKE_EXIT_PKG_SMOKE_FAILED);
+    }
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false, // graphical_login — autologin / serial path
+    );
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, display_mode, DeviceSet::default());
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    let steps = pkg_smoke_steps();
+
+    println!(
+        "pkg-smoke: launching QEMU (timeout {}s, {} steps)",
+        args.timeout_secs,
+        steps.len()
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!("pkg-smoke: PASSED ({} steps in {elapsed}s)", steps.len());
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("pkg-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_PKG_SMOKE_FAILED);
+        }
+    }
+}
+
+fn pkg_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/pkg-smoke: kernel first message",
+    }];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    // 1. Fresh boot: the installed-file DB does not exist yet.
+    steps.push(SmokeStep::Send {
+        input: "pkg list\n",
+        label: "pkg-smoke: list (empty DB)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "(no packages installed)",
+        timeout_secs: 15,
+        label: "pkg-smoke: empty DB reported",
+    });
+
+    // 2. Install a leaf package (libevent has no deps → fast) from the bundled
+    //    offline repo /usr/pkg/libevent.m3pkg.
+    steps.push(SmokeStep::Send {
+        input: "pkg install libevent\n",
+        label: "pkg-smoke: install libevent",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "pkg install: libevent: OK",
+        fail_prefix: "pkg install: cannot",
+        timeout_secs: 60,
+        label: "pkg-smoke: install libevent OK",
+        exit_code_on_fail: SMOKE_EXIT_PKG_SMOKE_FAILED,
+    });
+
+    // 3. `pkg list` now shows the installed package.
+    steps.push(SmokeStep::Send {
+        input: "pkg list\n",
+        label: "pkg-smoke: list after install",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "libevent",
+        timeout_secs: 30,
+        label: "pkg-smoke: libevent appears in list",
+    });
+
+    // 4. `pkg verify` re-hashes the installed static lib against the DB → OK.
+    steps.push(SmokeStep::Send {
+        input: "pkg verify libevent\n",
+        label: "pkg-smoke: verify libevent",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "OK      /usr/local/lib/libevent.a",
+        timeout_secs: 30,
+        label: "pkg-smoke: verify reports installed file OK",
+    });
+
+    // 5. `pkg upgrade` re-installs (full update, prunes orphans → 0 here).
+    steps.push(SmokeStep::Send {
+        input: "pkg upgrade libevent\n",
+        label: "pkg-smoke: upgrade libevent",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "pkg upgrade: libevent: OK",
+        timeout_secs: 60,
+        label: "pkg-smoke: upgrade OK",
+    });
+
+    // 6. `pkg remove` unlinks the recorded files + drops the DB entry.
+    steps.push(SmokeStep::Send {
+        input: "pkg remove libevent\n",
+        label: "pkg-smoke: remove libevent",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "pkg remove: libevent: removed",
+        timeout_secs: 30,
+        label: "pkg-smoke: remove OK",
+    });
+    // 7. After removal, verify reports the package is no longer installed.
+    steps.push(SmokeStep::Send {
+        input: "pkg verify libevent\n",
+        label: "pkg-smoke: verify after remove",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "libevent: not installed",
+        timeout_secs: 30,
+        label: "pkg-smoke: removed package gone from DB",
+    });
+
+    // 8. Dependency solver: `pkg install tmux` must auto-resolve + install its
+    //    dependencies before tmux. tmux's deps are ordered libevent (a small
+    //    static lib) before ncurses, so the solver installs libevent FIRST —
+    //    we assert that as proof the solver resolved + installed a dependency
+    //    in-OS, then end the gate. We deliberately do NOT wait for the full
+    //    chain: ncurses ships a ~1833-entry terminfo DB whose per-file writes
+    //    over the ring-3 VFS take minutes — that path is covered by the
+    //    host-side solver unit tests (order / skip-installed / cycle), not by
+    //    a multi-minute boot wait. (`libevent` was removed in step 6, so its
+    //    reinstall here can only come from the solver resolving tmux's deps.)
+    steps.push(SmokeStep::Send {
+        input: "pkg install tmux\n",
+        label: "pkg-smoke: install tmux (+deps via solver)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "pkg install: resolving tmux + dependencies",
+        timeout_secs: 30,
+        label: "pkg-smoke: solver engaged",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "pkg install: libevent: OK",
+        fail_prefix: "pkg install: cannot",
+        timeout_secs: 60,
+        label: "pkg-smoke: solver auto-installed the libevent dependency",
+        exit_code_on_fail: SMOKE_EXIT_PKG_SMOKE_FAILED,
+    });
+
+    steps
+}
+
 /// Phase 63a Track H — `cargo xtask doom-audio-smoke` exit codes.
 /// Originally 65 (collided with `SMOKE_EXIT_SESSION_RESTART_FAILED`); bumped
 /// to 67 in PR 168 round-3 review so each smoke-mode failure exits with a
@@ -16104,44 +16436,121 @@ fn populate_ports_tree(part_path: &Path, workspace_root: &Path, ports_src: &Path
 }
 
 /// Phase 69d Track A.3 / B.1 / C.1 / D.1 / D.2 — mirror every staged
-/// Phase 69d port (target/port-stage/<name>/usr/local/{bin,lib,include,share})
-/// onto the ext2 partition. Only ports whose stage exists are copied; the
-/// function is a no-op if `cargo xtask port build` has not been run.
+/// Phase 85a (D.1) — install the host-built ports onto the ext2 partition
+/// **through the `.m3pkg` substrate** rather than mirroring raw stage trees:
+///
+///  1. Each port's sealed `target/pkgcache/<key>.m3pkg` (Track B) is bundled
+///     into `/usr/pkg/<name>.m3pkg` on the data disk — the offline local repo
+///     the in-OS `pkg install` (Track C) reads.
+///  2. Core ports are **pre-installed** by unpacking the same `.m3pkg` into
+///     `target/pkg-preinstall/<name>/` and mirroring its `usr/{local,share}`
+///     tree onto `/usr` — so the binaries are present at boot (no behaviour
+///     change for the `tui-app-smoke` / `htop-render-probe` gates) and the
+///     `.m3pkg` round-trips end-to-end (pack at build → unpack at staging).
+///
+/// If a port has no sealed artifact (e.g. built the legacy way, or no musl
+/// toolchain), it falls back to mirroring the raw stage tree so nothing
+/// regresses. The function is a no-op when neither artifacts nor stages exist.
+///
+/// zlib is a first-class host-built `.m3pkg` member of this set (Track F:
+/// `build_zlib`, verified Portfile SHA), bundled and pre-installed exactly like
+/// the other five ports.
 fn populate_phase_69d_ports(part_path: &Path, workspace_root: &Path) {
-    const PORTS: &[&str] = &["ncurses", "libevent", "less", "htop", "tmux"];
+    const PORTS: &[&str] = &["zlib", "ncurses", "libevent", "less", "htop", "tmux"];
     let stage_root = workspace_root.join("target/port-stage");
-    if !stage_root.is_dir() {
-        return;
-    }
+    let preinstall_root = workspace_root.join("target/pkg-preinstall");
+    // Fresh pre-install scratch each run so a stale unpack never leaks in.
+    let _ = fs::remove_dir_all(&preinstall_root);
 
     let mut dirs: Vec<String> = Vec::new();
     let mut files: Vec<(String, PathBuf)> = Vec::new();
     let mut execs: Vec<String> = Vec::new();
+    // (.m3pkg ext2 path, host artifact path) — the bundled offline repo.
+    let mut m3pkg_files: Vec<(String, PathBuf)> = Vec::new();
 
     for port in PORTS {
-        let local = stage_root.join(port).join("usr/local");
-        if local.is_dir() {
-            collect_phase_69d_entries(&local, "usr/local", &mut dirs, &mut files, &mut execs);
+        // Prefer the sealed .m3pkg artifact: bundle it into /usr/pkg/ and
+        // pre-install by unpacking it (proves the artifact round-trips).
+        let mut staged_from_artifact = false;
+        if let Ok(artifact) = port_build::pkgcache_artifact_path(port) {
+            if artifact.is_file() {
+                match fs::read(&artifact) {
+                    Ok(bytes) if pkg_format::verify(&bytes) => {
+                        m3pkg_files.push((format!("usr/pkg/{port}.m3pkg"), artifact.clone()));
+                        // Write the `.meta` sidecar (VERSION + DEPS) the in-OS
+                        // dependency solver reads — e.g. `pkg install tmux`
+                        // auto-installs ncurses + libevent first.
+                        let version = port_build::port_version(port).unwrap_or_default();
+                        let deps = port_build::port_deps(port).join(" ");
+                        let meta_host = preinstall_root.join(format!("{port}.meta"));
+                        let _ = fs::create_dir_all(&preinstall_root);
+                        if fs::write(&meta_host, format!("VERSION={version}\nDEPS={deps}\n"))
+                            .is_ok()
+                        {
+                            m3pkg_files.push((format!("usr/pkg/{port}.meta"), meta_host));
+                        }
+                        let dest = preinstall_root.join(port);
+                        let _ = fs::create_dir_all(&dest);
+                        match pkg_format::unpack(&bytes, &dest) {
+                            Ok(_) => {
+                                let local = dest.join("usr/local");
+                                if local.is_dir() {
+                                    collect_phase_69d_entries(
+                                        &local,
+                                        "usr/local",
+                                        &mut dirs,
+                                        &mut files,
+                                        &mut execs,
+                                    );
+                                }
+                                let share = dest.join("usr/share");
+                                if share.is_dir() {
+                                    collect_phase_69d_entries(
+                                        &share,
+                                        "usr/share",
+                                        &mut dirs,
+                                        &mut files,
+                                        &mut execs,
+                                    );
+                                }
+                                staged_from_artifact = true;
+                            }
+                            Err(e) => {
+                                eprintln!("phase-85a: unpack {port}.m3pkg failed: {e}");
+                            }
+                        }
+                    }
+                    Ok(_) => eprintln!("phase-85a: {port}.m3pkg failed verify — skipping bundle"),
+                    Err(e) => eprintln!("phase-85a: read {} failed: {e}", artifact.display()),
+                }
+            }
         }
-        // Phase 69 Track A.2 — terminfo database lives under
-        // /usr/share/terminfo on the target. Mirror it from the ncurses
-        // stage so apps that call setupterm("m3os-term") at runtime
-        // find the compiled entry.
-        let share = stage_root.join(port).join("usr/share");
-        if share.is_dir() {
-            collect_phase_69d_entries(&share, "usr/share", &mut dirs, &mut files, &mut execs);
+
+        // Legacy fallback: mirror the raw stage tree when no artifact exists.
+        if !staged_from_artifact {
+            let local = stage_root.join(port).join("usr/local");
+            if local.is_dir() {
+                collect_phase_69d_entries(&local, "usr/local", &mut dirs, &mut files, &mut execs);
+            }
+            // Phase 69 Track A.2 — terminfo database lives under
+            // /usr/share/terminfo on the target so apps that call
+            // setupterm("m3os-term") at runtime find the compiled entry.
+            let share = stage_root.join(port).join("usr/share");
+            if share.is_dir() {
+                collect_phase_69d_entries(&share, "usr/share", &mut dirs, &mut files, &mut execs);
+            }
         }
     }
 
-    if files.is_empty() {
+    if files.is_empty() && m3pkg_files.is_empty() {
         return;
     }
 
     println!(
-        "phase-69d ports: mirroring {} files ({} executables) from {} into ext2",
+        "phase-85a ports: bundling {} .m3pkg artifact(s) into /usr/pkg + pre-installing {} files ({} executables)",
+        m3pkg_files.len(),
         files.len(),
-        execs.len(),
-        stage_root.display()
+        execs.len()
     );
 
     let mut cmds = String::new();
@@ -16155,6 +16564,8 @@ fn populate_phase_69d_ports(part_path: &Path, workspace_root: &Path) {
         "usr/local/lib",
         "usr/local/include",
         "usr/share",
+        // Phase 85a — the offline local package repo `pkg install` reads from.
+        "usr/pkg",
     ] {
         cmds.push_str(&format!("mkdir {d}\n"));
     }
@@ -16174,11 +16585,21 @@ fn populate_phase_69d_ports(part_path: &Path, workspace_root: &Path) {
         cmds.push_str(&format!("write \"{}\" {ext2_path}\n", host_path.display()));
     }
 
+    // Bundle the .m3pkg artifacts into /usr/pkg/ (the offline repo).
+    for (ext2_path, host_path) in &m3pkg_files {
+        cmds.push_str(&format!("write \"{}\" {ext2_path}\n", host_path.display()));
+    }
+
     // Mark every directory 0755, every file 0644.
+    cmds.push_str("sif usr/pkg mode 0x41ED\n");
     for dir in &dirs {
         cmds.push_str(&format!("sif {dir} mode 0x41ED\n"));
     }
     for (ext2_path, _) in &files {
+        cmds.push_str(&format!("sif {ext2_path} mode 0x81A4\n"));
+    }
+    // The bundled .m3pkg artifacts are plain data files (0644).
+    for (ext2_path, _) in &m3pkg_files {
         cmds.push_str(&format!("sif {ext2_path} mode 0x81A4\n"));
     }
     // Executables get 0755.
@@ -20372,12 +20793,180 @@ fn cmd_soak(args: &SoakArgs) {
     }
 }
 
+/// Build-output tokens that indicate a compiler/build tool ran — i.e. the
+/// second build was NOT a pure pkgcache hit. Returns the tokens found (empty
+/// when the output shows no compiler invocation, which is the PASS condition).
+///
+/// `make` is matched per-line (anchored to a line start, robust to the first
+/// line of output and to `\r\n` line endings via `str::lines`) so it is caught
+/// even at the very start of output, while still not matching unrelated
+/// substrings such as "makefile" or path components like "/x/make-tools".
+fn pkgcache_compiler_tokens_found(combined: &str) -> Vec<&'static str> {
+    const SUBSTR_TOKENS: &[&str] = &["gcc", "cmake", "ninja", "configure:"];
+    let mut found: Vec<&'static str> = SUBSTR_TOKENS
+        .iter()
+        .copied()
+        .filter(|tok| combined.contains(tok))
+        .collect();
+    let make_invoked = combined.lines().any(|line| {
+        let t = line.trim_start();
+        t == "make" || t.starts_with("make ") || t.starts_with("make[")
+    });
+    if make_invoked {
+        found.push("make");
+    }
+    found
+}
+
+/// Phase 85a (B.3) — zero-rebuild assertion gate.
+///
+/// Gated by `M3OS_PKGCACHE_REGRESSION=1` (requires a musl cross-compiler).
+///
+/// Algorithm:
+///   1. Run `port_build::cmd_port_build(name)` once to warm the pkgcache.
+///   2. Remove `target/port-stage/<name>/` (and its `.stamp`) so the
+///      same-machine fast-path cannot short-circuit — forcing the resolver
+///      to prove the pkgcache path.
+///   3. Run the build again, capturing all stdout+stderr.
+///   4. PASS only if:
+///        - captured output contains "PKGCACHE: hit "
+///        - captured output does NOT contain "PKGCACHE: miss "
+///        - captured output does NOT contain gcc / make / cmake / ninja /
+///          configure: tokens (no real compiler was invoked)
+///
+/// Because step 1 performs a real musl build, the coordinator runs this gate
+/// rather than the implementer — it is only invoked when the env var is set.
+fn cmd_pkgcache_hit_check(port_name: Option<&str>) -> i32 {
+    let name = port_name.unwrap_or("ncurses");
+
+    if std::env::var("M3OS_PKGCACHE_REGRESSION").is_err() {
+        println!(
+            "pkgcache-hit-check: SKIP — set M3OS_PKGCACHE_REGRESSION=1 to enable \
+             (requires a musl cross-compiler and may take several minutes for the \
+             initial warm build)"
+        );
+        return 0;
+    }
+
+    println!("pkgcache-hit-check: step 1 — warming pkgcache for port '{name}'");
+    let warm_result = port_build::cmd_port_build(name);
+    if warm_result != 0 {
+        eprintln!("pkgcache-hit-check: FAIL — warm build of '{name}' failed (exit {warm_result})");
+        return 1;
+    }
+
+    // Remove the stage dir so the same-machine .stamp fast-path cannot fire.
+    let root_output = std::process::Command::new(env!("CARGO"))
+        .args(["locate-project", "--workspace", "--message-format=plain"])
+        .output()
+        .expect("cargo locate-project");
+    let workspace_root = PathBuf::from(
+        String::from_utf8(root_output.stdout)
+            .unwrap()
+            .trim()
+            .to_string(),
+    )
+    .parent()
+    .expect("workspace root has parent")
+    .to_path_buf();
+    let stage_dir = workspace_root.join("target/port-stage").join(name);
+    println!(
+        "pkgcache-hit-check: step 2 — removing stage dir {} to disable .stamp fast-path",
+        stage_dir.display()
+    );
+    let _ = std::fs::remove_dir_all(&stage_dir);
+
+    // Step 3 — run the build again capturing all output.
+    println!("pkgcache-hit-check: step 3 — second build (must be a pure pkgcache hit)");
+    let output = std::process::Command::new(env!("CARGO"))
+        .args(["xtask", "port", "build", name])
+        .output()
+        .unwrap_or_else(|e| panic!("pkgcache-hit-check: failed to spawn second build: {e}"));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}{stderr}");
+
+    // Step 4 — evaluate pass/fail criteria.
+    // The second build must also *succeed*: a non-zero exit that still happened
+    // to print 'PKGCACHE: hit' (e.g. a later staging failure) is a FAIL, not a
+    // hit — the gate's promise is a clean zero-rebuild, not just the log line.
+    let build_ok = output.status.success();
+    let has_hit = combined.contains("PKGCACHE: hit ");
+    let has_miss = combined.contains("PKGCACHE: miss ");
+    // Compiler / build-tool tokens that must NOT appear in a pure cache hit.
+    let compiler_found = pkgcache_compiler_tokens_found(&combined);
+    let has_compiler = !compiler_found.is_empty();
+
+    println!("--- second build output ---");
+    print!("{combined}");
+    println!("--- end output ---");
+
+    if build_ok && has_hit && !has_miss && !has_compiler {
+        println!(
+            "pkgcache-hit-check: PASS — port '{name}' second build was a pure pkgcache hit \
+             (no compiler invocations)"
+        );
+        0
+    } else {
+        eprintln!("pkgcache-hit-check: FAIL");
+        if !build_ok {
+            eprintln!(
+                "  - second build exited non-zero ({}) — a pure cache hit must still succeed",
+                output.status
+            );
+        }
+        if !has_hit {
+            eprintln!("  - expected 'PKGCACHE: hit ' in output but it was absent");
+        }
+        if has_miss {
+            eprintln!("  - 'PKGCACHE: miss ' appeared — cache was not warm");
+        }
+        if has_compiler {
+            eprintln!("  - compiler/build tokens found (cache not used): {compiler_found:?}");
+        }
+        1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn string_args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| part.to_string()).collect()
+    }
+
+    #[test]
+    fn pkgcache_compiler_detection_edges() {
+        // `make` at the very start of output is caught (the old "\nmake"
+        // substring check missed a line with no preceding newline).
+        assert_eq!(
+            pkgcache_compiler_tokens_found("make all-am\n..."),
+            vec!["make"]
+        );
+        // `make` after a CRLF line ending is caught (str::lines strips the \r).
+        assert_eq!(
+            pkgcache_compiler_tokens_found("PKGCACHE: hit x\r\nmake[1]: Entering"),
+            vec!["make"]
+        );
+        // A bare `make` line is caught.
+        assert_eq!(pkgcache_compiler_tokens_found("foo\nmake\n"), vec!["make"]);
+        // Substrings like "makefile" / "Makefile" / path components must NOT
+        // trigger a spurious make match.
+        assert!(
+            pkgcache_compiler_tokens_found("reading Makefile.in\nusing /x/make-tools/y\n")
+                .is_empty()
+        );
+        // The substring tokens still match anywhere in the output.
+        assert_eq!(
+            pkgcache_compiler_tokens_found("... configure: creating Makefile ..."),
+            vec!["configure:"]
+        );
+        // A clean pure-hit output reports no compiler tokens.
+        assert!(
+            pkgcache_compiler_tokens_found("PKGCACHE: hit abcd.m3pkg\nstaged 5 files\n").is_empty()
+        );
     }
 
     fn smoke_step_labels(steps: &[SmokeStep]) -> Vec<&'static str> {
