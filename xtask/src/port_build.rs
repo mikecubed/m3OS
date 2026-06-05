@@ -1697,6 +1697,19 @@ fn build_python(
     //   • everything else here depends on a library m3OS has not ported yet
     //     (GNU readline, sqlite3, gdbm, tk, libffi, libbz2, liblzma, libuuid,
     //     libxcrypt) — genuine dependency-absent deferrals, not scope cuts.
+    //
+    // The list ALSO carries `xxlimited`/`xxlimited_35` for a different reason:
+    // they are Limited-API *demo* modules CPython builds SHARED in a non-debug
+    // build regardless of MODULE_BUILDTYPE (they are gated on `with_pydebug=no`,
+    // not TEST_MODULES, so `--disable-test-modules` does not cover them). Those
+    // are the only `.so` links in this otherwise fully-static build, and their
+    // link inherits our `-static` LDFLAGS, yielding a contradictory
+    // `-static -shared` that drags in the non-PIC static CRT (`crtbeginT.o`).
+    // Strict linkers (modern binutils) reject it — "R_X86_64_32 against hidden
+    // symbol `__TMC_END__' can not be used when making a shared object" —
+    // aborting `make`; lenient ones merely tolerate it. They are demos pruned
+    // from the install anyway (see `prune_python_stage`), so disable them
+    // outright rather than build-then-delete a link that breaks portability.
     let disabled_modules = [
         "_ctypes",
         "_ctypes_test",
@@ -1713,6 +1726,9 @@ fn build_python(
         "_lzma",
         "ossaudiodev",
         "_crypt",
+        // Limited-API demo modules — shared-only, pruned anyway (see note above).
+        "xxlimited",
+        "xxlimited_35",
     ];
 
     let mut cross_cfg = Command::new("sh");
@@ -1903,17 +1919,18 @@ fn prune_python_stage(stage: &Path) -> Result<(), String> {
         let _ = fs::remove_file(usr.join("bin").join(b));
     }
 
-    // With MODULE_BUILDTYPE=static every real stdlib extension is builtin, so
-    // `lib-dynload/` holds only CPython's `xxlimited*` *demo* modules (always
-    // built shared). Those can't `dlopen` on m3OS's static-binary path anyway —
-    // but their presence is also a correctness probe: if any *non-demo* `.so`
-    // survived here, a real module slipped through as shared and the static
-    // interpreter would fail to `import` it. Fail the build in that case.
+    // With MODULE_BUILDTYPE=static every real stdlib extension is builtin, and
+    // the only modules CPython would otherwise build shared — the `xxlimited*`
+    // demos — are forced `n/a` at configure time (see `disabled_modules`). So
+    // `lib-dynload/` should be empty or absent. Any `.so` that survives here is a
+    // correctness failure: a real module slipped through as shared and the static
+    // interpreter would fail to `import` it (no `dlopen` on m3OS's static-binary
+    // path). Fail the build in that case.
     let lib_dynload = pylib.join("lib-dynload");
     if let Ok(entries) = fs::read_dir(&lib_dynload) {
         for e in entries.flatten() {
             let n = e.file_name().to_string_lossy().to_string();
-            if n.ends_with(".so") && !n.starts_with("xxlimited") {
+            if n.ends_with(".so") {
                 return Err(format!(
                     "python build: unexpected shared extension {n} in lib-dynload — \
                      MODULE_BUILDTYPE=static did not make it builtin (it would fail to \
@@ -1922,8 +1939,8 @@ fn prune_python_stage(stage: &Path) -> Result<(), String> {
             }
         }
     }
-    // Drop the (demo-only) lib-dynload dir entirely — nothing in it is loadable
-    // on m3OS, and a static interpreter needs no runtime `.so`.
+    // Drop the lib-dynload dir entirely — a static interpreter needs no runtime
+    // `.so`, and nothing in it would be loadable on m3OS anyway.
     let _ = fs::remove_dir_all(&lib_dynload);
 
     remove_pycache_recursive(&pylib);
