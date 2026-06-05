@@ -46,6 +46,23 @@ fn alloc_error(_layout: Layout) -> ! {
 }
 
 // ---------------------------------------------------------------------------
+// Tuning constants
+// ---------------------------------------------------------------------------
+
+/// Read the `.m3pkg` artifact in 256 KiB chunks. The dominant cost of an install
+/// over m3OS's slow ring-3 VFS is the per-request round-trip, not the bytes
+/// moved, so a large chunk cuts the read syscall/IPC count ~64x versus a 4 KiB
+/// loop (a 21 MiB package drops from ~5400 reads to ~84). The deeper fix —
+/// bulk transfer via page grants + VFS fairness so a big install does not starve
+/// interactive clients — is the VFS bulk-I/O phase (docs/roadmap/92-vfs-bulk-io).
+const READ_CHUNK: usize = 256 * 1024;
+
+/// Files at or above this size get an individual progress line during install,
+/// so a multi-MiB write (e.g. the ~15 MiB static `python3`) is visibly in
+/// progress rather than a silent stall. Smaller files are covered by the count.
+const LARGE_FILE: usize = 1024 * 1024;
+
+// ---------------------------------------------------------------------------
 // Entry point — uses entry_point! macro (same as m3ctl).
 // ---------------------------------------------------------------------------
 
@@ -184,6 +201,10 @@ fn install_one(name: &str) -> i32 {
     // /usr/pkg/<name>.m3pkg  (NUL-terminated for syscall)
     let pkg_path = build_path(b"/usr/pkg/", name.as_bytes(), b".m3pkg\0");
 
+    print_str("pkg install: ");
+    print_str(name);
+    print_str(": reading package\n");
+
     // ---- 2. Read the .m3pkg artifact into memory. ----
     let pkg_bytes = match read_file_bytes(&pkg_path) {
         Ok(b) => b,
@@ -196,6 +217,17 @@ fn install_one(name: &str) -> i32 {
             return 1;
         }
     };
+
+    print_str("pkg install: ");
+    print_str(name);
+    print_str(": ");
+    let read_mib = pkg_bytes.len() / (1024 * 1024);
+    if read_mib > 0 {
+        print_str("read ");
+        syscall_lib::write_u64(STDOUT_FILENO, read_mib as u64);
+        print_str(" MiB, ");
+    }
+    print_str("verifying\n");
 
     // ---- 3. Integrity check. ----
     if !pkg_format::verify(&pkg_bytes) {
@@ -226,6 +258,12 @@ fn install_one(name: &str) -> i32 {
     // time over the ring-3 VFS. Each unique component is created at most once.
     let mut created_dirs: BTreeSet<String> = BTreeSet::new();
 
+    print_str("pkg install: ");
+    print_str(name);
+    print_str(": installing ");
+    syscall_lib::write_u64(STDOUT_FILENO, manifest.entries.len() as u64);
+    print_str(" files\n");
+
     for entry in &manifest.entries {
         let abs = install_path(&entry.path);
 
@@ -253,6 +291,16 @@ fn install_one(name: &str) -> i32 {
                 return 1;
             }
         };
+
+        // Show a per-file line for large writes so a multi-MiB file (e.g. the
+        // static `python3`) is visibly in progress rather than a silent stall.
+        if content.len() >= LARGE_FILE {
+            print_str("  ");
+            print_str(&entry.path);
+            print_str(" (");
+            syscall_lib::write_u64(STDOUT_FILENO, (content.len() / (1024 * 1024)) as u64);
+            print_str(" MiB)\n");
+        }
 
         if entry.is_symlink() {
             // 5c. Symlink: content = link target bytes.
@@ -742,8 +790,18 @@ fn read_file_bytes(path: &[u8]) -> Result<Vec<u8>, &'static str> {
         return Err("open failed");
     }
     let fd = fd as i32;
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 4096];
+    // Pre-size the buffer from the file's stat so a multi-MiB package (the
+    // ~21 MiB python.m3pkg) lands in one allocation. Without this the Vec doubles
+    // repeatedly, and m3OS's musl has no `mremap`, so every grow is an
+    // alloc-copy-free of the whole buffer — wasted work that scales with size.
+    let mut st = syscall_lib::Stat::zeroed();
+    let mut buf = if syscall_lib::fstat(fd, &mut st) >= 0 && st.st_size > 0 {
+        Vec::with_capacity(st.st_size as usize)
+    } else {
+        Vec::new()
+    };
+    // Large read chunk: see READ_CHUNK — far fewer VFS round-trips than 4 KiB.
+    let mut chunk = alloc::vec![0u8; READ_CHUNK];
     loop {
         let n = syscall_lib::read(fd, &mut chunk);
         if n < 0 {

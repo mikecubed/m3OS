@@ -1994,10 +1994,14 @@ fn freeze_stdlib_zip(stage: &Path, host_py: &Path) -> Result<(), String> {
         .arg(&pylib);
     let _ = compile.status();
 
-    // 2. Pack every .pyc into lib/python312.zip. STORED, not deflated: the
-    //    `.m3pkg` packer already compresses the whole artifact, so per-entry
-    //    deflate is wasted work — and STORED avoids depending on the host build
-    //    interpreter's zlib extension being present.
+    // 2. Pack every .pyc into lib/python312.zip. STORED, not deflated: keeps the
+    //    freeze independent of the host build interpreter's zlib extension (which
+    //    we don't configure for the stage-1 build, so it may be absent). NOTE:
+    //    the `.m3pkg` is itself an *uncompressed* archive — `pkg_format::serialize`
+    //    concatenates raw file bytes with per-entry SHA-256 hashes, no deflate —
+    //    so nothing else compresses this payload. Deflating here (or compressing
+    //    the `.m3pkg`) is a real package-size / install-read-cost win, tracked in
+    //    the VFS bulk-I/O phase (docs/roadmap/92-vfs-bulk-io).
     let script = "import sys,os,zipfile\n\
                   pylib,zp=sys.argv[1],sys.argv[2]\n\
                   n=0\n\
