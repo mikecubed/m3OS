@@ -13590,6 +13590,14 @@ fn git_local_smoke_steps() -> Vec<SmokeStep> {
         input: "pkg install git\n",
         label: "git-local-smoke: pkg install git",
     });
+    // This line is printed by the installer only when the resolved order has >1
+    // entry (userspace/pkg/src/main.rs) — i.e. when at least one dependency is
+    // actually pulled. The gate relies on zlib being *bundled* into /usr/pkg/
+    // but NOT registered in /var/lib/pkg/db (its files are pre-mirrored onto
+    // /usr by populate_phase_69d_ports, which does not touch the pkg DB), so the
+    // solver always pulls zlib for git and the order is [zlib, git]. If zlib were
+    // ever DB-registered at boot, the solver would skip it, this line would not
+    // print, and this Wait would (correctly) flag the changed behaviour.
     steps.push(SmokeStep::Wait {
         pattern: "pkg install: resolving git + dependencies",
         timeout_secs: 30,
@@ -13599,9 +13607,13 @@ fn git_local_smoke_steps() -> Vec<SmokeStep> {
         pass_pattern: "pkg install: git: OK",
         // `cannot` covers the cannot-read/open/create-symlink failure family; any
         // other install error (integrity/parse/write/DB) still fails the gate via
-        // this step's timeout. ~7.4 MB installs in well under this budget — it
-        // stays under the 240 s default global timeout so a bare invocation
-        // (no --timeout) does not clip it.
+        // this step's timeout. 180 s is a generous per-step *ceiling* for the
+        // ~7.4 MB install (it normally completes in seconds), NOT reserved time:
+        // the global `--timeout` is a single shared cap that min-clamps every
+        // step, so this budget is only fully available when nothing earlier has
+        // eaten the clock. The gate is intended to run via pre-push at
+        // `--timeout 360` (.githooks/pre-push); under the bare default it shares
+        // the budget with boot/login and the trailing git workflow.
         fail_prefix: "pkg install: cannot",
         timeout_secs: 180,
         label: "git-local-smoke: git installed from .m3pkg",

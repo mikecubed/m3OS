@@ -527,6 +527,42 @@ impl Default for Tmpfs {
     }
 }
 
+/// Map an absolute syscall path to the tmpfs-internal relative key when (and
+/// only when) it falls under the `/tmp` or `/run` tmpfs mounts, returning
+/// `None` for any path tmpfs does not own.
+///
+/// The returned key keeps the mount-prefix component (`tmp/…`, `run/…`) and
+/// drops the leading slash, so it matches the keys [`Tmpfs::components`] derives
+/// for `open`/`read`/`write`/`stat` etc. This is the single source of truth for
+/// that convention: the kernel's syscall layer delegates `/tmp`+`/run` routing
+/// (open/read/write/stat/getdents/chmod/chown/symlink/rename) to it so every
+/// path agrees on the same key. A hand-rolled `strip_prefix("/tmp")` once
+/// diverged here — it dropped the `tmp/` prefix (yielding a bare `/foo`) and
+/// ignored `/run` — so a file created under `tmp/…` was invisible to a later
+/// `chmod`/`chown`, returning ENOENT (Phase 85b: `git init` chmod'ing a lockfile
+/// it had just created). Keeping the logic here, host-tested, guards against a
+/// silent regression.
+///
+/// `.`, `..`, and empty path segments are rejected (returns `None`) so callers
+/// never traverse outside the mount via a relative component.
+pub fn mount_relative_path(path: &str) -> Option<&str> {
+    let trimmed = path.trim_start_matches('/');
+    let rest = match trimmed {
+        "tmp" | "run" => trimmed,
+        _ if trimmed.starts_with("tmp/") || trimmed.starts_with("run/") => trimmed,
+        _ => return None,
+    };
+
+    // Reject `.`, `..`, and empty segments anywhere in the path.
+    for segment in rest.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return None;
+        }
+    }
+
+    Some(rest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -748,5 +784,43 @@ mod tests {
     fn stat_dir_not_symlink() {
         let st = Tmpfs::new().stat("/").unwrap();
         assert!(!st.is_symlink);
+    }
+
+    #[test]
+    fn mount_relative_path_routes_tmp_and_run() {
+        // The mount-prefix component is kept and the leading slash dropped, so
+        // the key matches what `components()` derives for open/read/write/stat.
+        assert_eq!(mount_relative_path("/tmp"), Some("tmp"));
+        assert_eq!(mount_relative_path("/run"), Some("run"));
+        assert_eq!(mount_relative_path("/tmp/foo"), Some("tmp/foo"));
+        assert_eq!(mount_relative_path("/run/bar"), Some("run/bar"));
+        assert_eq!(
+            mount_relative_path("/tmp/gitsmoke/.git/config.lock"),
+            Some("tmp/gitsmoke/.git/config.lock")
+        );
+        // A node created via this key must be findable via the same key — the
+        // exact invariant the Phase 85b chmod-on-/tmp fix restored. (`/tmp` is a
+        // top-level dir created by the kernel's tmpfs init; mirror that here.)
+        let mut fs = Tmpfs::new();
+        fs.mkdir(mount_relative_path("/tmp").unwrap()).unwrap();
+        fs.create_file(mount_relative_path("/tmp/lock").unwrap())
+            .unwrap();
+        assert!(fs.stat(mount_relative_path("/tmp/lock").unwrap()).is_ok());
+    }
+
+    #[test]
+    fn mount_relative_path_rejects_non_tmpfs_and_traversal() {
+        // Paths tmpfs does not own.
+        assert_eq!(mount_relative_path("/etc/passwd"), None);
+        assert_eq!(mount_relative_path("/data/x"), None);
+        assert_eq!(mount_relative_path("/"), None);
+        assert_eq!(mount_relative_path("/tmpfoo"), None); // not a /tmp child
+        assert_eq!(mount_relative_path("/running"), None); // not a /run child
+        // `.`, `..`, empty segments rejected anywhere.
+        assert_eq!(mount_relative_path("/tmp/.."), None);
+        assert_eq!(mount_relative_path("/tmp/../etc"), None);
+        assert_eq!(mount_relative_path("/run/./x"), None);
+        assert_eq!(mount_relative_path("/tmp//x"), None);
+        assert_eq!(mount_relative_path("/tmp/"), None); // trailing slash → empty segment
     }
 }

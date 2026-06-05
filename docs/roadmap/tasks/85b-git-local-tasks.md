@@ -1,11 +1,11 @@
 # Phase 85b — git (Local): Task List
 
-**Status:** Planned (authored ahead of implementation)
+**Status:** Implemented (kernel 0.85.1)
 **Source Ref:** phase-85b
 **Depends on:** Phase 85a (Package & Build-Cache Infrastructure), Phase 45 (Ports System) ✅
 **Goal:** Cross-build a musl `git` configured for local-only repository work (`NO_CURL NO_OPENSSL` + zlib), package it via the Phase 85a `.m3pkg` substrate, install it with `pkg install git`, and validate the local repo workflow inside m3OS — making git the first real toolchain to exercise the 85a pipeline end-to-end.
 
-> **Planning task list authored ahead of implementation.** All acceptance items are intentionally **unchecked `[ ]`**. Builds on the 85a substrate; do not start before 85a lands.
+> **Landed.** All three tracks are Done and every acceptance item below is checked `[x]`. The task list was authored ahead of implementation (intentionally all-unchecked at the time); it now records the as-built result.
 
 ## Track Layout
 
@@ -23,9 +23,12 @@
 > `.git/config.lock` it just created, so init aborted. Fixed by routing
 > `/tmp` + `/run` through the same `tmpfs_relative_path` convention every other
 > tmpfs syscall uses (`kernel/src/arch/x86_64/syscall/mod.rs`). This is the
-> "a port surfaces a kernel bug" pattern (cf. tmux/PTY); the `git-local-smoke`
-> gate is the regression test. `docs/git-roadmap.md`'s "chmod — Working" row was
-> aspirational for `/tmp`; it is now actually true.
+> "a port surfaces a kernel bug" pattern (cf. tmux/PTY). Regression guards: a
+> `kernel-core` host unit test for `mount_relative_path` (runs in `cargo xtask
+> check`) plus the end-to-end `git-local-smoke` gate. `docs/git-roadmap.md`'s
+> chmod requirement row claimed "Working (ext2)" while chmod on the `/tmp`
+> tmpfs was in fact broken; this phase fixes that and updates the row to
+> "Working (ext2 + tmpfs)".
 
 ---
 

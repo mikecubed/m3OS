@@ -7394,22 +7394,13 @@ pub(crate) fn read_file_from_disk(path: &str) -> Result<alloc::vec::Vec<u8>, u64
 /// - `/tmp` or `/run` → `Some("tmp")` / `Some("run")` (the mount-point dir).
 /// - `/tmp/foo/bar` → `Some("tmp/foo/bar")`.
 /// - Anything else, or a path with `.`, `..`, or empty segments → `None`.
+///
+/// The logic lives in `kernel-core` ([`kernel_core::fs::tmpfs::mount_relative_path`])
+/// so it is host-unit-tested — the convention must stay in lockstep with the
+/// `Tmpfs::components` keying, and a past divergence (a hand-rolled
+/// `strip_prefix("/tmp")`) silently broke chmod/chown on `/tmp` until Phase 85b.
 fn tmpfs_relative_path(path: &str) -> Option<&str> {
-    let trimmed = path.trim_start_matches('/');
-    let rest = match trimmed {
-        "tmp" | "run" => trimmed,
-        _ if trimmed.starts_with("tmp/") || trimmed.starts_with("run/") => trimmed,
-        _ => return None,
-    };
-
-    // Reject `.`, `..`, and empty segments anywhere in the path.
-    for segment in rest.split('/') {
-        if segment.is_empty() || segment == "." || segment == ".." {
-            return None;
-        }
-    }
-
-    Some(rest)
+    kernel_core::fs::tmpfs::mount_relative_path(path)
 }
 
 /// Return the relative path within `/data` if this path starts with `/data`.
@@ -8564,12 +8555,13 @@ fn privileged_exec_credentials(path: &str, exec_is_static_ramdisk: bool) -> Opti
 /// all other fields are zero.  This satisfies musl's `fstat` use in `fopen`.
 /// Get uid/gid/mode for a directory path from the appropriate filesystem.
 fn dir_metadata(path: &str) -> (u32, u32, u16) {
-    // Tmpfs directories (under /tmp)
-    if path.starts_with("/tmp") || path == "tmp" {
-        let rel = path.strip_prefix("/tmp").unwrap_or(path);
-        let lookup = if rel.is_empty() { "/" } else { rel };
+    // Tmpfs directories (under /tmp or /run) — use the shared mount-relative
+    // convention (`tmpfs_relative_path`) so the lookup key matches what
+    // open/read/write/stat/chmod use. (A previous hand-rolled
+    // `strip_prefix("/tmp")` dropped the `tmp/` prefix and ignored /run.)
+    if let Some(rel) = tmpfs_relative_path(path) {
         let tmpfs = crate::fs::tmpfs::TMPFS.lock();
-        if let Ok(s) = tmpfs.stat(lookup) {
+        if let Ok(s) = tmpfs.stat(rel) {
             return (s.uid, s.gid, s.mode);
         }
     }
