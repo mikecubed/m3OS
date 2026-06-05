@@ -794,12 +794,17 @@ fn read_file_bytes(path: &[u8]) -> Result<Vec<u8>, &'static str> {
     // ~21 MiB python.m3pkg) lands in one allocation. Without this the Vec doubles
     // repeatedly, and m3OS's musl has no `mremap`, so every grow is an
     // alloc-copy-free of the whole buffer — wasted work that scales with size.
+    // `prealloc_hint` clamps the raw `st_size` (PR #223): a corrupted/malicious
+    // size must not drive an unbounded `Vec::with_capacity`, which would abort
+    // `pkg` via the allocator error path. The hint is a ceiling only — the read
+    // loop below still grows `buf` to fit a genuinely larger file.
     let mut st = syscall_lib::Stat::zeroed();
-    let mut buf = if syscall_lib::fstat(fd, &mut st) >= 0 && st.st_size > 0 {
-        Vec::with_capacity(st.st_size as usize)
+    let hint = if syscall_lib::fstat(fd, &mut st) >= 0 {
+        pkg_app::prealloc_hint(st.st_size)
     } else {
-        Vec::new()
+        0
     };
+    let mut buf = Vec::with_capacity(hint);
     // Large read chunk: see READ_CHUNK — far fewer VFS round-trips than 4 KiB.
     let mut chunk = alloc::vec![0u8; READ_CHUNK];
     loop {

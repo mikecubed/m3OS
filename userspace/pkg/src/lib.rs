@@ -374,6 +374,35 @@ pub fn topo_install_order(
 }
 
 // ---------------------------------------------------------------------------
+// I/O sizing
+// ---------------------------------------------------------------------------
+
+/// Pre-allocation ceiling for [`prealloc_hint`].  A file reader pre-sizes its
+/// buffer from the file's `fstat` size so a multi-MiB package lands in one
+/// allocation (m3OS's musl has no `mremap`, so every `Vec` grow is a full
+/// alloc-copy-free).  The size is clamped to this cap so a corrupted or hostile
+/// `st_size` cannot drive an unbounded `Vec::with_capacity`, which on m3OS
+/// aborts the process via the allocator error path — a reliable DoS for `pkg
+/// install`/`upgrade` from a bad `.m3pkg`/meta file.  The cap is a *hint only*:
+/// a genuinely larger file still reads in full, its buffer just grows past the
+/// cap as bytes arrive.  64 MiB covers the largest real package (the ~21 MiB
+/// python.m3pkg) with ample headroom.
+pub const PREALLOC_CAP: usize = 64 * 1024 * 1024;
+
+/// Clamp a raw `fstat` `st_size` (`i64`) into a safe `Vec::with_capacity` hint.
+///
+/// Returns `0` for non-positive or unrepresentable sizes (the caller then
+/// allocates nothing up front), and never exceeds [`PREALLOC_CAP`].  Using
+/// `try_from` rather than an `as usize` cast means a negative/garbage `st_size`
+/// becomes `0` instead of a giant wrapped value.
+pub fn prealloc_hint(st_size: i64) -> usize {
+    match usize::try_from(st_size) {
+        Ok(n) => n.min(PREALLOC_CAP),
+        Err(_) => 0,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Host-only tests
 // ---------------------------------------------------------------------------
 
@@ -395,6 +424,35 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // prealloc_hint — DoS-safe Vec::with_capacity sizing (PR #223 review)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn prealloc_hint_passes_through_normal_sizes() {
+        assert_eq!(prealloc_hint(0), 0);
+        assert_eq!(prealloc_hint(4096), 4096);
+        // The largest real package (~21 MiB python.m3pkg) is kept exactly.
+        assert_eq!(prealloc_hint(21 * 1024 * 1024), 21 * 1024 * 1024);
+        // Exactly the cap is preserved.
+        assert_eq!(prealloc_hint(PREALLOC_CAP as i64), PREALLOC_CAP);
+    }
+
+    #[test]
+    fn prealloc_hint_clamps_hostile_sizes() {
+        // Anything above the cap is clamped — a corrupted/malicious st_size
+        // cannot drive an unbounded Vec::with_capacity (which would abort pkg).
+        assert_eq!(prealloc_hint(PREALLOC_CAP as i64 + 1), PREALLOC_CAP);
+        assert_eq!(prealloc_hint(i64::MAX), PREALLOC_CAP);
+    }
+
+    #[test]
+    fn prealloc_hint_guards_negative_sizes() {
+        // try_from rejects negatives -> 0, never a giant wrapped `as usize`.
+        assert_eq!(prealloc_hint(-1), 0);
+        assert_eq!(prealloc_hint(i64::MIN), 0);
     }
 
     // -----------------------------------------------------------------------
