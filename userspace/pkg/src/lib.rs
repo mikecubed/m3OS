@@ -158,14 +158,22 @@ pub fn db_parse(text: &str) -> Result<Vec<PkgRecord>, &'static str> {
             } else if let Some(v) = inner.strip_prefix("key=") {
                 key = v.into();
             } else if let Some(v) = inner.strip_prefix("file=") {
-                // Format: `<path> <hash>`
-                if let Some(sp) = v.rfind(' ') {
-                    files.push(FileRecord {
-                        path: v[..sp].into(),
-                        hash_hex: v[sp + 1..].into(),
-                    });
-                }
-                // Lines without a space hash are silently dropped (malformed).
+                // Format: `<path> <hash>`. A `file=` record with no
+                // space-separated hash is malformed. The DB is written by the
+                // installer itself, so this can only mean corruption/tampering —
+                // reject it (fatal, like every other DB parse error) rather than
+                // silently dropping it. A dropped record would shrink the `files`
+                // list, making `pkg verify`/`remove`/`upgrade` ignore that path
+                // (orphaned files, missing integrity checks) while still treating
+                // the DB as successfully parsed. `rfind` splits on the *last*
+                // space, so paths containing spaces are preserved.
+                let Some(sp) = v.rfind(' ') else {
+                    return Err("malformed file= record (missing hash)");
+                };
+                files.push(FileRecord {
+                    path: v[..sp].into(),
+                    hash_hex: v[sp + 1..].into(),
+                });
             }
             // Unknown keys are silently ignored (forward-compat).
         }
@@ -454,6 +462,38 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].name, "foo");
         assert_eq!(records[0].files.len(), 1);
+    }
+
+    #[test]
+    fn db_rejects_malformed_file_record() {
+        // A `file=` line with no space-separated hash is corruption: parsing
+        // must fail fatally rather than silently dropping the record (which
+        // would desync the DB's file list from disk and let `pkg verify`/
+        // `remove`/`upgrade` ignore that path).
+        let text = "# m3pkg-db v1\n\
+                    [pkg]\n\
+                    name=foo\n\
+                    version=1.0\n\
+                    key=aaa\n\
+                    file=/usr/bin/foo\n\
+                    [end]\n";
+        assert!(
+            db_parse(text).is_err(),
+            "a file= record without a hash must be rejected, not silently dropped"
+        );
+
+        // A path containing spaces (split on the *last* space) is still valid.
+        let ok = "# m3pkg-db v1\n\
+                  [pkg]\n\
+                  name=foo\n\
+                  version=1.0\n\
+                  key=aaa\n\
+                  file=/usr/share/my docs/foo aaa\n\
+                  [end]\n";
+        let records = db_parse(ok).expect("path with spaces must parse");
+        assert_eq!(records[0].files.len(), 1);
+        assert_eq!(records[0].files[0].path, "/usr/share/my docs/foo");
+        assert_eq!(records[0].files[0].hash_hex, "aaa");
     }
 
     // -----------------------------------------------------------------------

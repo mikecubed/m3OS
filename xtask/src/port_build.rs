@@ -198,20 +198,51 @@ fn recipe_digest(port_dir: &Path) -> String {
         hasher.update(&bytes);
     }
     let patches = port_dir.join("patches");
-    if let Ok(entries) = fs::read_dir(&patches) {
-        let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
-        paths.sort();
-        for p in paths {
-            if let Some(name) = p.file_name() {
-                hasher.update(name.to_string_lossy().as_bytes());
-                hasher.update(b"\0");
-            }
-            if let Ok(bytes) = fs::read(&p) {
-                hasher.update(&bytes);
-            }
+    // Hash *every file under `patches/`* (the documented contract), recursing
+    // into nested subdirectories. Each file is keyed by its path **relative to
+    // `patches/`** rather than its bare name, so (a) a patch in a nested subdir
+    // still invalidates the digest when its contents change, and (b) two
+    // same-named patches in different subdirs do not collide. Directory entries
+    // themselves are never hashed — only their contained files. Sorting by the
+    // relative path makes the digest deterministic regardless of read_dir order.
+    //
+    // For the current flat `patches/` trees (one level, no subdirs) the relative
+    // path equals the bare file name, so this is byte-identical to the previous
+    // immediate-`read_dir` digest and does not invalidate any warmed pkgcache.
+    let mut patch_files: Vec<(PathBuf, PathBuf)> = Vec::new(); // (relative, absolute)
+    collect_files_rel(&patches, &patches, &mut patch_files);
+    patch_files.sort_by(|a, b| a.0.cmp(&b.0));
+    for (rel, abs) in patch_files {
+        hasher.update(rel.to_string_lossy().as_bytes());
+        hasher.update(b"\0");
+        if let Ok(bytes) = fs::read(&abs) {
+            hasher.update(&bytes);
         }
     }
     format!("{:x}", hasher.finalize())
+}
+
+/// Recursively collect every *file* under `dir`, recording each as a
+/// `(path_relative_to_base, absolute_path)` pair. Directory entries themselves
+/// are not recorded — only their contained files — so [`recipe_digest`] can hash
+/// "every file under `patches/`" (including nested subdirectories) without
+/// hashing bare directory names. A missing/unreadable directory yields nothing.
+/// A symlink is treated as a file (never recursed into), so a directory-target
+/// symlink cannot create a recursion cycle: `fs::read` then hashes a file
+/// target's bytes, or silently contributes nothing for a directory target.
+fn collect_files_rel(base: &Path, dir: &Path, out: &mut Vec<(PathBuf, PathBuf)>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_dir {
+            collect_files_rel(base, &path, out);
+        } else if let Ok(rel) = path.strip_prefix(base) {
+            out.push((rel.to_path_buf(), path));
+        }
+    }
 }
 
 /// Phase 85a (A.1) — portable, content-addressed package key for a port.
@@ -1507,6 +1538,63 @@ mod tests {
         // Sanity: the Phase 69d Portfile must be discoverable.
         let p = find_port_dir("ncurses").expect("ncurses Portfile staged in repo");
         assert!(p.join("Portfile").exists());
+    }
+
+    // ── A.1 — recipe_digest hashes every file under patches/, recursively ──
+
+    /// Regression: `recipe_digest` documents that it folds in *every file under
+    /// `patches/`*. A patch placed in a **nested** subdirectory must therefore
+    /// invalidate the digest when its contents change — otherwise a hierarchical
+    /// patches tree could let a patch edit ride a stale cached `.m3pkg`.
+    #[test]
+    fn recipe_digest_includes_nested_patch_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let port = tmp.path();
+        fs::write(port.join("Portfile"), b"NAME=demo\nSHA256=abc\n").unwrap();
+        let nested = port.join("patches").join("series");
+        fs::create_dir_all(&nested).unwrap();
+        let patch = nested.join("0001-fix.patch");
+        fs::write(&patch, b"--- a\n+++ b\n@@ original @@\n").unwrap();
+
+        let before = recipe_digest(port);
+
+        // Editing the *nested* patch's contents must change the digest.
+        fs::write(&patch, b"--- a\n+++ b\n@@ edited @@\n").unwrap();
+        let after = recipe_digest(port);
+
+        assert_ne!(
+            before, after,
+            "a change to a nested patch file must invalidate the recipe digest"
+        );
+    }
+
+    /// Same-named patch files in different subdirectories must not collide:
+    /// the digest keys each file by its path **relative to `patches/`**, so
+    /// swapping two equally-named files' contents across subdirs changes the
+    /// digest. The previous immediate-`read_dir` digest never recursed into
+    /// subdirs at all, so it would have missed this swap entirely.
+    #[test]
+    fn recipe_digest_keys_patches_by_relative_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let port = tmp.path();
+        fs::write(port.join("Portfile"), b"NAME=demo\nSHA256=abc\n").unwrap();
+        let a = port.join("patches").join("a");
+        let b = port.join("patches").join("b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        fs::write(a.join("p.patch"), b"AAA").unwrap();
+        fs::write(b.join("p.patch"), b"BBB").unwrap();
+        let before = recipe_digest(port);
+
+        // Swap the two same-named files' contents across subdirs.
+        fs::write(a.join("p.patch"), b"BBB").unwrap();
+        fs::write(b.join("p.patch"), b"AAA").unwrap();
+        let after = recipe_digest(port);
+
+        assert_ne!(
+            before, after,
+            "relative-path keying must distinguish same-named patches in different subdirs"
+        );
     }
 
     // ── B.1 — seal_package ───────────────────────────────────────────────

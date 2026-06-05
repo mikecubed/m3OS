@@ -182,7 +182,7 @@ fn collect_deps(name: &str, deps: &mut BTreeMap<String, Vec<String>>) {
 fn install_one(name: &str) -> i32 {
     // ---- 1. Build the path to the local package file. ----
     // /usr/pkg/<name>.m3pkg  (NUL-terminated for syscall)
-    let mut pkg_path = build_path(b"/usr/pkg/", name.as_bytes(), b".m3pkg\0");
+    let pkg_path = build_path(b"/usr/pkg/", name.as_bytes(), b".m3pkg\0");
 
     // ---- 2. Read the .m3pkg artifact into memory. ----
     let pkg_bytes = match read_file_bytes(&pkg_path) {
@@ -196,8 +196,6 @@ fn install_one(name: &str) -> i32 {
             return 1;
         }
     };
-    // Drop the NUL before using as a display path string.
-    pkg_path.pop();
 
     // ---- 3. Integrity check. ----
     if !pkg_format::verify(&pkg_bytes) {
