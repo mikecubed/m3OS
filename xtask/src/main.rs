@@ -15049,9 +15049,14 @@ fn populate_ext2_files(
     // git's Makefile resolves its system config to `/etc/gitconfig`, so this is
     // the right place for it. `init.defaultBranch = main` makes `git init` create
     // `main` (the branch the smoke's `git checkout main` / `git merge feature`
-    // assume); `safe.directory = *` avoids the dubious-ownership guard on repos
-    // created under the smoke's working dir. Tabs match git's own config style.
-    let gitconfig_content = "[user]\n\tname = m3OS Tester\n\temail = git-smoke@m3os.local\n[init]\n\tdefaultBranch = main\n[safe]\n\tdirectory = *\n[core]\n\tpager = cat\n";
+    // assume); `core.pager = cat` keeps `git log`/`git diff` from invoking an
+    // interactive pager that would stall the serial smoke. No `safe.directory`
+    // override is needed: the smoke logs in as root and tmpfs `mkdir`/`git init`
+    // create `/tmp/gitsmoke` (and its `.git`) owned by the caller's euid (0), so
+    // git's dubious-ownership guard never fires — globally disabling it with
+    // `safe.directory = *` would only weaken safety for future multi-user use.
+    // Tabs match git's own config style.
+    let gitconfig_content = "[user]\n\tname = m3OS Tester\n\temail = git-smoke@m3os.local\n[init]\n\tdefaultBranch = main\n[core]\n\tpager = cat\n";
 
     // Phase 46: service definition files.
     let sshd_conf = "name=sshd\ncommand=/bin/sshd\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=syslogd\n";

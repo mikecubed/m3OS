@@ -1445,13 +1445,13 @@ fn build_git(
     // neither a libcurl nor an OpenSSL API symbol. These exact symbol names only
     // appear when remote-curl.c / the OpenSSL paths are compiled + linked, so
     // their absence is a direct, toolchain-independent proof of NO_CURL/NO_OPENSSL.
-    if binary_contains(&git_bin, b"curl_easy_perform") {
+    if binary_contains(&git_bin, b"curl_easy_perform")? {
         return Err(
             "git build: binary references libcurl (curl_easy_perform) — NO_CURL ineffective"
                 .to_string(),
         );
     }
-    if binary_contains(&git_bin, b"SSL_CTX_new") {
+    if binary_contains(&git_bin, b"SSL_CTX_new")? {
         return Err(
             "git build: binary references OpenSSL (SSL_CTX_new) — NO_OPENSSL ineffective"
                 .to_string(),
@@ -1466,18 +1466,26 @@ fn build_git(
     Ok(())
 }
 
-/// Best-effort substring search over a file's raw bytes. Used by [`build_git`]
-/// to assert the absence of libcurl / OpenSSL API symbols in the built binary.
-/// A read failure returns `false` (the caller treats "could not prove presence"
-/// as "absent" — the helper-file-absence check above is the primary guard).
-fn binary_contains(path: &Path, needle: &[u8]) -> bool {
-    let Ok(bytes) = fs::read(path) else {
-        return false;
-    };
+/// Substring search over a file's raw bytes. Used by [`build_git`] to assert
+/// the *absence* of libcurl / OpenSSL API symbols in the built binary.
+///
+/// This guard **fails closed**: a read failure returns `Err`, which the caller
+/// propagates as a build error. Returning `Ok(false)` ("symbol absent") on an
+/// unreadable file would silently weaken the NO_CURL/NO_OPENSSL assertion — the
+/// build would pass without ever proving the forbidden symbols are gone. The
+/// caller already verified the binary exists, so a read failure here is a
+/// genuine anomaly worth aborting on rather than skipping the check.
+fn binary_contains(path: &Path, needle: &[u8]) -> Result<bool, String> {
+    let bytes = fs::read(path).map_err(|e| {
+        format!(
+            "git build: cannot read {} to verify NO_CURL/NO_OPENSSL: {e}",
+            path.display()
+        )
+    })?;
     if needle.is_empty() || needle.len() > bytes.len() {
-        return false;
+        return Ok(false);
     }
-    bytes.windows(needle.len()).any(|window| window == needle)
+    Ok(bytes.windows(needle.len()).any(|window| window == needle))
 }
 
 fn file_size(p: &Path) -> u64 {
@@ -1978,5 +1986,54 @@ mod tests {
         assert_eq!(sorted.len(), ids.len(), "build_recipe_ids must be distinct");
         // Unknown ports yield the empty identity (no recipe contribution).
         assert_eq!(build_recipe_id("clang"), "");
+    }
+
+    // ── Phase 85b — binary_contains fails closed (NO_CURL/NO_OPENSSL guard) ──
+
+    /// The NO_CURL/NO_OPENSSL guard must **fail closed**: if the built `git`
+    /// binary cannot be read, [`binary_contains`] must return `Err` (aborting
+    /// the build) rather than `Ok(false)` — otherwise the security assertion
+    /// would silently pass without ever proving the forbidden symbols are gone.
+    #[test]
+    fn binary_contains_fails_closed_on_unreadable_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist.bin");
+        let r = binary_contains(&missing, b"curl_easy_perform");
+        assert!(
+            r.is_err(),
+            "an unreadable binary must error (fail closed), got {r:?}"
+        );
+    }
+
+    /// Positive/negative substring detection on a readable file.
+    #[test]
+    fn binary_contains_detects_present_and_absent_needle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("blob.bin");
+        fs::write(&f, b"....SSL_CTX_new....").unwrap();
+        assert_eq!(
+            binary_contains(&f, b"SSL_CTX_new").unwrap(),
+            true,
+            "present symbol must be detected"
+        );
+        assert_eq!(
+            binary_contains(&f, b"curl_easy_perform").unwrap(),
+            false,
+            "absent symbol must report false on a readable file"
+        );
+    }
+
+    /// An empty needle or a needle longer than the file is reported as absent
+    /// (`Ok(false)`), not an error — only an I/O failure is fail-closed.
+    #[test]
+    fn binary_contains_edge_cases_report_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("small.bin");
+        fs::write(&f, b"hi").unwrap();
+        assert_eq!(binary_contains(&f, b"").unwrap(), false);
+        assert_eq!(
+            binary_contains(&f, b"this-needle-is-longer").unwrap(),
+            false
+        );
     }
 }
