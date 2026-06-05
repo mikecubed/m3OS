@@ -334,7 +334,10 @@ fn build_recipe_id(name: &str) -> &'static str {
         }
         // Phase 85c — CPython's two-stage musl cross build. The identity is the
         // cross-configure flag set + the ac_cv_* cross cache answers + the
-        // `py_cv_module_*=n/a` deferred-module set + the staged-tree prune list +
+        // pkg-config isolation (empty PKG_CONFIG_LIBDIR → host libb2 hidden →
+        // vendored `_blake2`) + the `py_cv_module_*=n/a` deferred-module set
+        // (incl. the `xxlimited*` shared-only demos) + the staged-tree prune list
+        // (incl. the `/usr/include/python3.12` headers) +
         // the checksharedmods neuter. Bump recipe-v whenever any of these change
         // so the cached .m3pkg self-invalidates. (The pinned CPython version +
         // its tarball SHA-256 are folded in separately via the Portfile digest.)
@@ -348,15 +351,16 @@ fn build_recipe_id(name: &str) -> &'static str {
              --build=$(cc -dumpmachine) --with-build-python=<host> --disable-shared \
              --disable-ipv6 --without-ensurepip --without-pymalloc --disable-test-modules \
              --prefix=/usr);ac_cv:_dev_ptmx=no,_dev_ptc=no,buggy_getaddrinfo=no;\
+             pkgconfig=isolated(empty-PKG_CONFIG_LIBDIR->host-libb2-hidden->vendored-_blake2);\
              zlib:ZLIB_CFLAGS/ZLIB_LIBS=<staged -fPIC libz.a>;\
              curses(build-only,ncurses-6.5):CURSES_CFLAGS/CURSES_LIBS/PANEL_LIBS=\
              <staged wide ncurses libncursesw/libtinfow/libpanelw>;\
              na=_ctypes,_ctypes_test,_ssl,_hashlib,readline,\
-             _sqlite3,_dbm,_gdbm,_tkinter,nis,_uuid,_bz2,_lzma,ossaudiodev,_crypt;\
+             _sqlite3,_dbm,_gdbm,_tkinter,nis,_uuid,_bz2,_lzma,ossaudiodev,_crypt,xxlimited,xxlimited_35;\
              neuter=checksharedmods;\
-             prune=libpython.a,pkgconfig,config-3.12,ensurepip,idlelib,tkinter,\
+             prune=libpython.a,pkgconfig,config-3.12,include/python3.12,python-config,ensurepip,idlelib,tkinter,\
              turtledemo,turtle.py,lib2to3,asyncio,2to3,idle3,lib-dynload,__pycache__;\
-             freeze=stdlib->python312.zip(.pyc,STORED),keep=os.py;recipe-v=5"
+             freeze=stdlib->python312.zip(.pyc,STORED),keep=os.py;recipe-v=6"
         }
         _ => "",
     }
@@ -1892,6 +1896,26 @@ fn prune_python_stage(stage: &Path) -> Result<(), String> {
     // Embedding / build-only artifacts (not needed to run scripts).
     let _ = fs::remove_file(usr.join(format!("lib/libpython{PYTHON_XY}.a")));
     let _ = fs::remove_dir_all(usr.join("lib/pkgconfig"));
+    // The C extension / embedding headers (/usr/include/python3.NN/) — ~200 files
+    // used only to *compile* against Python (build C extensions, embed the
+    // interpreter). m3OS has no in-OS C compiler yet (Phase 85d), so they are dead
+    // weight — and at ~200 files they DOMINATE `pkg install python`'s write phase,
+    // since each file costs an unlink+open+write+close+chmod round-trip over the
+    // slow ring-3 VFS (224 install files → ~24 without these). This is exactly the
+    // "embedding / build-only artifacts" this function exists to drop; it was just
+    // missed. Re-add (or split a python-dev package) when in-OS extension builds
+    // land. The deeper per-file write cost is the VFS bulk-I/O phase
+    // (docs/roadmap/92-vfs-bulk-io).
+    let _ = fs::remove_dir_all(usr.join(format!("include/python{PYTHON_XY}")));
+    // python[3[.NN]]-config: shell helpers that report --cflags/--libs for building
+    // against the headers + libpython.a just stripped, so they are useless here.
+    for cfg in [
+        "python-config".to_string(),
+        "python3-config".to_string(),
+        format!("python{PYTHON_XY}-config"),
+    ] {
+        let _ = fs::remove_file(usr.join("bin").join(cfg));
+    }
     // The config-<X.Y>-<triple> embedding dir (Makefile + libpython.a copy).
     if let Ok(entries) = fs::read_dir(&pylib) {
         for e in entries.flatten() {
