@@ -38,7 +38,7 @@ A new port `build_*` function: build the host interpreter, then the cross interp
 
 ### Static interpreter (the model that runs on m3OS)
 
-The interpreter is **fully static**: `MODULE_BUILDTYPE=static` builds every stdlib C extension *into* `python3`, and `LDFLAGS=-static` embeds musl libc — no `PT_INTERP`, no `lib-dynload`, no `dlopen`. This is not the usual desktop CPython layout; it is forced by m3OS reality. m3OS's `/lib/ld-musl-x86_64.so.1` is a *custom Rust loader reimplementation* (`userspace/ld-musl-x86_64.so.1/`) and m3OS ships **no real musl `libc.so`** (the userland is `no_std` Rust). A dynamic CPython faults at startup the moment the loader hits the interpreter's `DT_NEEDED libc.so` — there is nothing to satisfy it, let alone the thousands of libc symbols a real C program needs. So Python is shipped static, exactly like the `git` port. (The dynamic build was implemented first and surfaced this in the first in-m3OS gate: `ldso: DT_NEEDED not found: libc.so`.) Lifting this is a Phase 86 concern (a real musl libc/`lib-dynload` story for m3OS).
+The interpreter is **fully static**: `MODULE_BUILDTYPE=static` builds every stdlib C extension *into* `python3`, and `LDFLAGS=-static` embeds musl libc — no `PT_INTERP`, no `lib-dynload`, no `dlopen`. This is not the usual desktop CPython layout; it is forced by m3OS reality. m3OS's `/lib/ld-musl-x86_64.so.1` is a *custom Rust loader reimplementation* (`userspace/ld-musl-x86_64.so.1/`) and m3OS ships **no real musl `libc.so`** (the userland is `no_std` Rust). A dynamic CPython faults at startup the moment the loader hits the interpreter's `DT_NEEDED libc.so` — there is nothing to satisfy it, let alone the thousands of libc symbols a real C program needs. So Python is shipped static, exactly like the `git` port. (The dynamic build was implemented first and surfaced this in the first in-m3OS gate: `ldso: DT_NEEDED not found: libc.so`.) Lifting this — shipping a real musl `libc.so` + closing the syscall gaps a dynamic libc needs, then re-enabling a dynamic `python3` with real `lib-dynload` + `ctypes` — is [Phase 91 (Dynamic C Runtime)](./91-dynamic-c-runtime.md).
 
 ### Frozen stdlib in `python312.zip`
 
@@ -78,5 +78,6 @@ CPython derives `sys.prefix`/`sys.exec_prefix` by searching upward from the exec
 
 ## Deferred Until Later
 
+- **A dynamic interpreter** — a real musl `libc.so` + the syscall coverage a dynamic libc needs, then a dynamic `python3` with real `lib-dynload` `.so` extensions and `ctypes`/`dlopen` of arbitrary shared objects — is [Phase 91 (Dynamic C Runtime)](./91-dynamic-c-runtime.md). 85c ships fully static (every C extension builtin) because m3OS's Phase 76 loader has no `libc.so` to bind a dynamic C program against; Phase 91 lifts that.
 - `ssl`/`_hashlib`-OpenSSL, DNS/`getaddrinfo` name resolution, `http.client`/`urllib`, `pip`, `venv`, `asyncio` — Phase 86. (`hashlib` itself works via CPython's built-in HACL\*-backed `_md5`/`_sha*` modules with no OpenSSL.)
-- `threading`/`multiprocessing`, `ctypes`/cffi (needs dlopen at runtime), `sqlite3`, `readline`/`curses`, tkinter, NumPy/SciPy.
+- `threading`/`multiprocessing`, `ctypes`/cffi (needs `dlopen` at runtime → Phase 91), `sqlite3`, `readline`/`curses`, tkinter, NumPy/SciPy.

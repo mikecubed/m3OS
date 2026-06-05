@@ -63,7 +63,9 @@
 > `PT_INTERP`, no `lib-dynload`, no `dlopen`) — the same model the static `git`
 > port uses, and the only one that runs on m3OS today. The substance of every
 > B.1 item is preserved; only the *packaging* of the extensions changed
-> (builtin, not `.so`).
+> (builtin, not `.so`). Lifting the static constraint — a real `libc.so` + a
+> dynamic `python3` with real `lib-dynload` + `ctypes` — is tracked as
+> [Phase 91 (Dynamic C Runtime)](../91-dynamic-c-runtime.md).
 >
 > **⚠ Second finding — frozen `python312.zip`.** The first static gate run also
 > showed m3OS's ring-3 VFS is slow (`vfs_server: slow req … STAT_PATH
