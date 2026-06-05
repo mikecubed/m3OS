@@ -13286,6 +13286,48 @@ fn termios_smoke_steps() -> Vec<SmokeStep> {
             exit_code_on_fail: SMOKE_EXIT_TERMIOS_SMOKE_FAILED,
         });
     }
+
+    // VEOF (^D) over the serial / kernel console — regression guard for the
+    // console-EOF fix. `/bin/tcsmoke` above exercises the PTY termios path; this
+    // covers the *console* read path that previously swallowed EOF: the fd-0
+    // read loop consumed the EOF flag but looped instead of returning 0, so ^D
+    // never exited a console reader (the Python REPL only quit via `exit()`).
+    //
+    // Start `cat` (reads the console to EOF), feed it a line so it is provably
+    // the foreground reader, then send a bare ^D (0x04) on an empty line — cat
+    // must get read()==0 and exit. Prove control returned to the SHELL (not cat)
+    // by running `id`: the shell *executes* it and prints `uid=…`, which cat
+    // would only ever echo back as the literal text "id". If ^D were swallowed,
+    // cat stays foreground, `id` is echoed without `uid=`, and this times out.
+    steps.push(SmokeStep::Send {
+        input: "cat\n",
+        label: "guest/tcsmoke: ^D EOF — start cat",
+    });
+    steps.push(SmokeStep::Sleep { millis: 1500 });
+    steps.push(SmokeStep::Send {
+        input: "veof-probe\n",
+        label: "guest/tcsmoke: ^D EOF — feed cat a line",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "veof-probe",
+        timeout_secs: 10,
+        label: "guest/tcsmoke: ^D EOF — cat is the foreground reader",
+    });
+    steps.push(SmokeStep::Send {
+        input: "\x04",
+        label: "guest/tcsmoke: ^D EOF — send VEOF (0x04) on an empty line",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "id\n",
+        label: "guest/tcsmoke: ^D EOF — run id after cat should have exited",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "uid=",
+        timeout_secs: 10,
+        label: "guest/tcsmoke: ^D delivered console EOF → cat exited → shell ran id",
+    });
+
     steps
 }
 
