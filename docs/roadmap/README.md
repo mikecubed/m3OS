@@ -239,6 +239,9 @@ flowchart TD
     P85 --> P86["Phase 86<br/>Networking and GitHub"]
     P86 --> P87["Phase 87<br/>Node.js"]
     P76 -.-> P87
+    P85 --> P91["Phase 91<br/>Dynamic C Runtime<br/>(libc.so)"]
+    P76 --> P91
+    P91 -.-> P87
     P87 --> P88["Phase 88<br/>Claude Code"]
     P83 --> P89["Phase 89<br/>IPv6 / DHCPv6"]
 ```
@@ -442,6 +445,7 @@ These phases were drafted 2026-05-08 in response to the phase-completion audit (
 | 88 | Claude Code | A modern CLI coding agent runs on the post-1.0 m3OS developer platform | Planned | `phase-88` | [Phase 88](./88-claude-code.md) | Deferred until implementation planning |
 | 89 | IPv6 / DHCPv6 | Dual-stack IPv6 layered on top of the IPv4-only 1.0 network promise | Planned | `phase-89` | [Phase 89](./89-ipv6-dhcpv6.md) | Deferred until implementation planning |
 | 90 | USB Class Expansion | Every USB feature deferred from Phase 78: external-hub multi-tier enumeration (devices behind a `usb-hub`), live HID Report Protocol (touchpads/gaming mice/multi-touch + keyboard LEDs), USB hot-plug event surface, USB mass storage (BBB/UAS bulk via the page-grant transport), USB audio (UAC) / video (UVC), and multi-controller concurrent IRQ servicing. | Planned | `phase-90` | [Phase 90](./90-usb-class-expansion.md) | Deferred until implementation planning |
+| 91 | Dynamic C Runtime (`libc.so` + shared objects) | Ship a real musl `libc.so` + close the syscall gaps a dynamic libc needs (`mremap`, …) so genuinely dynamically-linked C programs run: a dynamic `python3` with real `lib-dynload` `.so` extensions + `ctypes`/`dlopen` of arbitrary shared objects. Lifts the Phase 85c finding that m3OS's Phase 76 loader works but has no `libc.so` to load (`DT_NEEDED not found: libc.so`); the static path stays the fallback. Prerequisite for Node native addons (Phase 87) + pip C-extension wheels. | Planned | `phase-91` | [Phase 91](./91-dynamic-c-runtime.md) | Deferred until implementation planning |
 
 ## Suggested Delivery Rhythm
 
