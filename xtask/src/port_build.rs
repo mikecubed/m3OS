@@ -1030,9 +1030,12 @@ fn build_zlib(
         .env("CC", cc)
         .env("AR", ar)
         .env("RANLIB", ranlib)
-        // -fPIC so the static libz.a can be linked into a shared object — the
-        // Phase 85c CPython `zlib` lib-dynload extension (`zlib.*.so`) links it.
-        // A static link into a non-PIE executable (git) is unaffected by -fPIC.
+        // -fPIC keeps the static libz.a position-independent so the one archive
+        // links cleanly into either consumer regardless of PIE/PIC mode: the
+        // Phase 85b static `git` executable, and the Phase 85c fully-static
+        // CPython — where `zlib` is a *builtin* module compiled into the
+        // interpreter, so there is no `lib-dynload/zlib.*.so` in the static
+        // build. -fPIC is harmless for the non-PIE static links both produce.
         .env("CFLAGS", "-O2 -fPIC");
     run(&mut configure_cmd, "zlib configure")?;
 

@@ -13910,8 +13910,10 @@ fn python_smoke_steps() -> Vec<SmokeStep> {
         pass_pattern: "pkg install: python: OK",
         // `cannot` covers the cannot-read/open/create-symlink failure family; any
         // other install error still fails the gate via the step timeout. The
-        // CPython package is larger than git's (~50 MB of stdlib + lib-dynload),
-        // so the per-step ceiling is generous; the global `--timeout` min-clamps
+        // CPython package is sizable — far larger than git's — carrying the frozen
+        // `python312.zip` stdlib plus the fully-static `python3` interpreter (no
+        // `lib-dynload`), so the per-step ceiling is generous; the global
+        // `--timeout` min-clamps
         // every step, so this is only fully available when nothing earlier ate
         // the clock. Intended to run via pre-push at `--timeout 900`.
         fail_prefix: "pkg install: cannot",
