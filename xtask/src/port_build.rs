@@ -320,6 +320,18 @@ fn build_recipe_id(name: &str) -> &'static str {
             "configure:--enable-utempter=no --enable-systemd=no --disable-utf8proc \
              --host=x86_64-linux-musl --prefix=/usr/local"
         }
+        // Phase 85b — git's plain-Makefile build (no autotools configure): the
+        // identity is the NO_* knob set + the static-zlib link + prefix=/usr +
+        // the local-only post-install prune (see build_git). Bump the trailing
+        // recipe-version marker whenever the knob set or prune list changes so
+        // the cached .m3pkg self-invalidates.
+        "git" => {
+            "make:NO_CURL=1 NO_OPENSSL=1 NO_GETTEXT=1 NO_TCLTK=1 NO_PERL=1 NO_PYTHON=1 \
+             NO_ICONV=1 NO_EXPAT=1 NO_REGEX=NeedsStartEnd NEEDS_LIBICONV= \
+             SKIP_DASHED_BUILT_INS=YesPlease ZLIB_PATH=<zlib_stage>/usr/local \
+             SHELL_PATH=/bin/sh prefix=/usr;cflags:-O2;\
+             prune=scalar,git-shell,upload-pack,receive-pack,upload-archive,imap-send,http-backend,daemon,sh-i18n--envsubst;recipe-v=3"
+        }
         _ => "",
     }
 }
@@ -485,6 +497,10 @@ pub fn port_deps(name: &str) -> &'static [&'static str] {
         // solver follows — libevent (a small static lib) before the heavyweight
         // ncurses terminfo DB.
         "tmux" => &["libevent", "ncurses"],
+        // Phase 85b — git's one mandatory dependency is zlib (object/pack
+        // compression). zlib is a leaf with no build deps of its own, so
+        // `compute_port_key`'s non-recursive dep-key computation is correct.
+        "git" => &["zlib"],
         _ => &[],
     }
 }
@@ -734,6 +750,7 @@ fn port_build(name: &str) -> Result<(), String> {
 
     let ncurses_stage = stage_root.join("ncurses");
     let libevent_stage = stage_root.join("libevent");
+    let zlib_stage = stage_root.join("zlib");
 
     match name {
         "ncurses" => build_ncurses(&extracted, &stage, &toolchain)?,
@@ -748,6 +765,7 @@ fn port_build(name: &str) -> Result<(), String> {
             &ncurses_stage,
             &libevent_stage,
         )?,
+        "git" => build_git(&extracted, &stage, &toolchain, &zlib_stage)?,
         _ => return Err(format!("no host build recipe for port {name}")),
     }
 
@@ -1262,6 +1280,206 @@ fn build_tmux(
     Ok(())
 }
 
+/// Phase 85b — cross-build a local-only musl `git` (Stage 1: `NO_CURL`/
+/// `NO_OPENSSL`), statically linked against the staged zlib, and DESTDIR-install
+/// it at `prefix=/usr` into `stage`.
+///
+/// Unlike the ncurses-class ports, git has **no autotools `./configure`** — its
+/// build is a plain Makefile driven entirely by `CC=<musl-gcc>`, so there is no
+/// `--host` flag to pass; the cross is implied by the compiler. zlib (git's one
+/// mandatory dependency) is consumed from `zlib_stage/usr/local` via git's
+/// `ZLIB_PATH` Makefile knob plus explicit `-I`/`-L` flags.
+///
+/// `SKIP_DASHED_BUILT_INS=YesPlease` is essential here: git would otherwise
+/// install ~100 dashed `libexec/git-core/git-<builtin>` **hardlinks** to the
+/// main binary, and the `.m3pkg` packer ([`pkg_format::pack`]) stores file
+/// *content* per path with no inode/hardlink dedup — so those hardlinks would
+/// balloon the artifact by hundreds of MB. With this knob the dashed builtins
+/// are not installed at all; every smoke subcommand (`init`/`add`/`commit`/
+/// `log`/`diff`/`status`/`branch`/`merge`/`checkout`) is dispatched in-process
+/// by the single `git` binary, so nothing is lost.
+fn build_git(
+    src: &Path,
+    stage: &Path,
+    (cc, ar, _ranlib): &(&'static str, String, String),
+    zlib_stage: &Path,
+) -> Result<(), String> {
+    let zlib_prefix = zlib_stage.join("usr/local");
+    if !zlib_prefix.join("lib/libz.a").exists() {
+        return Err(format!(
+            "git build: staged zlib not found at {} (build the zlib port first)",
+            zlib_prefix.join("lib/libz.a").display()
+        ));
+    }
+    let stage_prefix = stage.join("usr");
+    fs::create_dir_all(&stage_prefix).map_err(|e| format!("mkdir: {e}"))?;
+
+    let cflags = format!("-O2 -I{}/include", zlib_prefix.display());
+    let extra_ld = musl_extra_ldflags_joined();
+    let ldflags = if extra_ld.is_empty() {
+        format!("-static -L{}/lib", zlib_prefix.display())
+    } else {
+        format!("-static -L{}/lib {extra_ld}", zlib_prefix.display())
+    };
+
+    // The NO_* knob set that carves git's minimal, dependency-light, offline
+    // build (see ports/util/git/Portfile for the per-knob rationale). Passed as
+    // `make VAR=val` arguments — the git Makefile convention. `prefix=/usr`
+    // additionally special-cases git's system config to `/etc/gitconfig`.
+    let common: Vec<String> = vec![
+        format!("CC={cc}"),
+        format!("AR={ar}"),
+        "NO_CURL=1".to_string(),
+        "NO_OPENSSL=1".to_string(),
+        "NO_GETTEXT=1".to_string(),
+        "NO_TCLTK=1".to_string(),
+        "NO_PERL=1".to_string(),
+        "NO_PYTHON=1".to_string(),
+        "NO_ICONV=1".to_string(),
+        "NO_EXPAT=1".to_string(),
+        "NO_REGEX=NeedsStartEnd".to_string(),
+        "NEEDS_LIBICONV=".to_string(),
+        "SKIP_DASHED_BUILT_INS=YesPlease".to_string(),
+        format!("ZLIB_PATH={}", zlib_prefix.display()),
+        "SHELL_PATH=/bin/sh".to_string(),
+        "prefix=/usr".to_string(),
+        format!("CFLAGS={cflags}"),
+        format!("LDFLAGS={ldflags}"),
+    ];
+
+    let mut make_cmd = Command::new("make");
+    make_cmd.current_dir(src).arg(format!("-j{}", num_jobs()));
+    for a in &common {
+        make_cmd.arg(a);
+    }
+    make_cmd.arg("all");
+    run(&mut make_cmd, "git make")?;
+
+    let mut install_cmd = Command::new("make");
+    install_cmd.current_dir(src);
+    for a in &common {
+        install_cmd.arg(a);
+    }
+    install_cmd
+        .arg(format!("DESTDIR={}", stage.display()))
+        .arg("install");
+    run(&mut install_cmd, "git install")?;
+
+    // ── Layout + the NO_CURL/NO_OPENSSL assertions ──────────────────────────
+    let git_bin = stage_prefix.join("bin/git");
+    if !git_bin.exists() {
+        return Err(format!("git build missing {}", git_bin.display()));
+    }
+    let git_core = stage_prefix.join("libexec/git-core");
+    if !git_core.is_dir() {
+        return Err(format!(
+            "git build missing libexec/git-core at {}",
+            git_core.display()
+        ));
+    }
+    let templates = stage_prefix.join("share/git-core/templates");
+    if !templates.is_dir() {
+        return Err(format!(
+            "git build missing share/git-core/templates at {}",
+            templates.display()
+        ));
+    }
+
+    // Phase 85b is the **local-only** git core. git's default build also produces
+    // several large (~2.3–3.7 MB each, statically linked) binaries that only
+    // serve network / server / email / large-repo workflows — none of which is
+    // in scope until Phase 86. Pruning them keeps the `.m3pkg` lean and the in-OS
+    // `pkg install git` fast: every binary is a multi-MB write over the ring-3
+    // VFS, and the no-dedup `.m3pkg` packer ([`pkg_format::pack`]) stores file
+    // *content* per path, so the three server-side pack helpers under `bin/`
+    // (`git-upload-pack`/`git-receive-pack`/`git-upload-archive`) — which install
+    // as **hardlinks** to the 3.7 MB `git` binary — would each pack as a full
+    // copy (~11 MB of pure duplication, the difference between a 19 MB and a
+    // 7.4 MB artifact, and minutes of install time over the VFS). They are the
+    // server half of clone/fetch/push (Phase 86); local single-repo work never
+    // invokes them. (With `SKIP_DASHED_BUILT_INS` these pack helpers exist only
+    // under `bin/`, not `libexec/git-core/`, so pruning `bin/` suffices.) There
+    // is no per-tool `NO_*` Makefile knob for these, so they are removed
+    // post-install (ignore-if-absent). git's in-process builtin dispatch is
+    // unaffected — every smoke subcommand (init/add/commit/diff/log/branch/
+    // merge/checkout/status) lives in the main `git` binary. The sealed artifact
+    // is ~7.4 MB: `bin/git` + the standard exec-path `libexec/git-core/git`
+    // copy + the shell-script helpers + templates (kept for general correctness;
+    // the no-dedup packer is why even two `git` copies dominate the size).
+    let prune = [
+        ("bin", "scalar"), // large-monorepo manager (clone/fetch heavy)
+        ("libexec", "scalar"),
+        ("bin", "git-shell"), // restricted git-over-ssh server login shell
+        ("libexec", "git-shell"),
+        ("bin", "git-upload-pack"), // server side of fetch/clone (Phase 86)
+        ("bin", "git-receive-pack"), // server side of push (Phase 86)
+        ("bin", "git-upload-archive"), // server side of archive --remote (Phase 86)
+        ("libexec", "git-imap-send"), // mails patches via IMAP
+        ("libexec", "git-http-backend"), // dumb/smart-HTTP server CGI
+        ("libexec", "git-daemon"),  // git:// protocol server daemon
+        ("libexec", "git-sh-i18n--envsubst"), // i18n helper, moot under NO_GETTEXT
+    ];
+    for (where_, name_) in prune {
+        let p = match where_ {
+            "bin" => stage_prefix.join("bin").join(name_),
+            _ => git_core.join(name_),
+        };
+        let _ = fs::remove_file(&p);
+    }
+
+    // NO_CURL ⇒ the curl-backed remote helpers are never built. Their presence
+    // would mean HTTPS rode in unverified, so assert they are absent.
+    for forbidden in [
+        "git-remote-https",
+        "git-remote-http",
+        "git-http-fetch",
+        "git-http-push",
+    ] {
+        if git_core.join(forbidden).exists() || stage_prefix.join("bin").join(forbidden).exists() {
+            return Err(format!(
+                "git build: {forbidden} present — NO_CURL did not take effect (HTTPS would ride in unverified)"
+            ));
+        }
+    }
+    // Belt-and-suspenders: the (still-unstripped) git binary must reference
+    // neither a libcurl nor an OpenSSL API symbol. These exact symbol names only
+    // appear when remote-curl.c / the OpenSSL paths are compiled + linked, so
+    // their absence is a direct, toolchain-independent proof of NO_CURL/NO_OPENSSL.
+    if binary_contains(&git_bin, b"curl_easy_perform") {
+        return Err(
+            "git build: binary references libcurl (curl_easy_perform) — NO_CURL ineffective"
+                .to_string(),
+        );
+    }
+    if binary_contains(&git_bin, b"SSL_CTX_new") {
+        return Err(
+            "git build: binary references OpenSSL (SSL_CTX_new) — NO_OPENSSL ineffective"
+                .to_string(),
+        );
+    }
+
+    println!(
+        "git: produced /usr/bin/git ({} bytes, unstripped) + libexec/git-core + templates; \
+         NO_CURL/NO_OPENSSL verified (no curl/OpenSSL linkage)",
+        file_size(&git_bin)
+    );
+    Ok(())
+}
+
+/// Best-effort substring search over a file's raw bytes. Used by [`build_git`]
+/// to assert the absence of libcurl / OpenSSL API symbols in the built binary.
+/// A read failure returns `false` (the caller treats "could not prove presence"
+/// as "absent" — the helper-file-absence check above is the primary guard).
+fn binary_contains(path: &Path, needle: &[u8]) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    if needle.is_empty() || needle.len() > bytes.len() {
+        return false;
+    }
+    bytes.windows(needle.len()).any(|window| window == needle)
+}
+
 fn file_size(p: &Path) -> u64 {
     fs::metadata(p).map(|m| m.len()).unwrap_or(0)
 }
@@ -1454,6 +1672,22 @@ pub fn build_phase_69d_ports() -> Result<(), String> {
     for name in &["zlib", "ncurses", "libevent", "less", "htop", "tmux"] {
         port_build(name).map_err(|e| format!("port {name}: {e}"))?;
     }
+    Ok(())
+}
+
+/// Phase 85b — build the local-only `git` toolchain and its single dependency
+/// (zlib) into their `.m3pkg` artifacts. Separate from [`build_phase_69d_ports`]
+/// so a routine image build does not pay git's multi-minute cross-compile; the
+/// `git-local-smoke` gate (and any explicit `cargo xtask port build git`) drives
+/// this. zlib is built first so [`build_git`] finds the staged `libz.a`.
+pub fn build_git_port() -> Result<(), String> {
+    if musl_cc().is_none() {
+        return Err(
+            "no musl cross-compiler on PATH (install musl-tools or musl-gcc-cross-bin)".to_string(),
+        );
+    }
+    port_build("zlib").map_err(|e| format!("port zlib: {e}"))?;
+    port_build("git").map_err(|e| format!("port git: {e}"))?;
     Ok(())
 }
 
@@ -1720,6 +1954,8 @@ mod tests {
         );
         assert_eq!(port_deps("ncurses"), &[] as &[&str]);
         assert_eq!(port_deps("libevent"), &[] as &[&str]);
+        // Phase 85b — git's one mandatory dependency is zlib.
+        assert_eq!(port_deps("git"), &["zlib"]);
         // Unknown port returns empty.
         assert_eq!(port_deps("clang"), &[] as &[&str]);
     }
@@ -1731,7 +1967,7 @@ mod tests {
         // Every host-built port must have a non-empty, distinct configure-flag
         // identity so a flag change self-invalidates its cached .m3pkg and two
         // ports never collide on the recipe component of the key.
-        let ports = ["zlib", "ncurses", "libevent", "less", "htop", "tmux"];
+        let ports = ["zlib", "ncurses", "libevent", "less", "htop", "tmux", "git"];
         let ids: Vec<&str> = ports.iter().map(|p| build_recipe_id(p)).collect();
         for (p, id) in ports.iter().zip(&ids) {
             assert!(!id.is_empty(), "{p} must have a build_recipe_id");

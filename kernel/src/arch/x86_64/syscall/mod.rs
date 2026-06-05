@@ -9120,8 +9120,16 @@ enum FsTarget {
 }
 
 fn resolve_fs_target(abs_path: &str) -> FsTarget {
-    if abs_path.starts_with("/tmp/") || abs_path == "/tmp" {
-        let rel = abs_path.strip_prefix("/tmp").unwrap_or("/");
+    // `/tmp` and `/run` are the kernel tmpfs mounts. Route them through
+    // `tmpfs_relative_path` so the mount-prefix convention (`tmp/…`, `run/…`)
+    // matches every other tmpfs syscall path (open/read/write/stat/getdents).
+    // The previous hand-rolled `strip_prefix("/tmp")` dropped the mount prefix
+    // (yielding a bare `/foo`) and ignored `/run` entirely, so chmod/chown/
+    // symlink looked up the wrong tmpfs subtree and returned ENOENT for a file
+    // that open/write had just created under `tmp/…`. Phase 85b surfaced this:
+    // `git init` does `chmod(.git/config.lock)` on a lockfile it just created in
+    // a `/tmp` repo and got "No such file or directory", aborting the init.
+    if let Some(rel) = tmpfs_relative_path(abs_path) {
         return FsTarget::Tmpfs(alloc::string::String::from(rel));
     }
     // /data paths always go to disk data (FAT32 or ext2 /data fallback),

@@ -1,6 +1,6 @@
 # Phase 85b - git (Local)
 
-**Status:** Planned
+**Status:** Implemented (kernel 0.85.1)
 **Source Ref:** phase-85b
 **Depends on:** Phase 85a (Package & Build-Cache Infrastructure), Phase 36 (Expanded Memory) ✅, Phase 45 (Ports System) ✅
 **Builds on:** Adds the first real toolchain on top of the Phase 85a packaging substrate — a host-cross-built musl `git` configured for local-only repository work, linking the existing `ports/lib/zlib`.
