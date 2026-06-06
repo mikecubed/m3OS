@@ -989,11 +989,12 @@ pub unsafe fn load_elf_into_with_interp(
 /// PT_LOAD segment's contents are streamed page-by-page into the mapped user pages
 /// via `src`'s buffered disk reads — so no giant kernel allocation is ever needed.
 ///
-/// Restricted to **static `ET_EXEC`** images (rejects PT_INTERP / PT_DYNAMIC): the
-/// dynamic-link / PIE-relocation paths would need the whole image in memory, and
-/// the only consumer (the `-static` clang/lld toolchain) never carries them. A
-/// streamed binary that does is rejected rather than silently mis-loaded. Static
-/// binaries take no auxv interpreter extras (`aux_extras: None`); musl's
+/// Restricted to **static `ET_EXEC`** images. It rejects PT_INTERP (a dynamic
+/// linker would need the PIE-relocation path, which wants the whole image in
+/// memory) but TOLERATES a benign PT_DYNAMIC — musl static binaries (clang,
+/// python, git) carry one, yet at fixed `ET_EXEC` vaddrs (load_bias == 0) it
+/// needs no relocations and is ignored, exactly as the in-memory loader does.
+/// Static binaries take no auxv interpreter extras (`aux_extras: None`); musl's
 /// `__init_tls` still finds any PT_TLS header via `AT_PHDR`/`AT_PHNUM`.
 ///
 /// # Safety
@@ -1031,17 +1032,22 @@ pub unsafe fn load_elf_streaming(
         let mut ph_buf = alloc::vec![0u8; phdr_table_bytes];
         src.read_at(phoff, &mut ph_buf)?;
 
-        // 3. First pass: find the minimum LOAD vaddr (for AT_PHDR) and reject the
-        //    dynamic-linking program headers this static-only path cannot honor.
+        // 3. First pass: find the minimum LOAD vaddr (for AT_PHDR), and reject only
+        //    PT_INTERP — a dynamic linker this static-only path cannot honor. A
+        //    *static* `ET_EXEC` commonly still carries a benign PT_DYNAMIC (e.g.
+        //    the musl static clang/python/git binaries): its segments are at fixed
+        //    vaddrs (load_bias == 0), so no runtime relocations are needed and the
+        //    `.dynamic` section is ignored — exactly as the in-memory loader does
+        //    (it only applies relocations when `load_bias != 0`, i.e. for PIE).
         let mut min_vaddr = u64::MAX;
         for i in 0..phnum {
             let base = i
                 .checked_mul(phentsize)
                 .ok_or(ElfError::TruncatedProgramHeader)?;
             let phdr = parse_phdr(&ph_buf[..], base, phentsize)?;
-            if phdr.p_type == PT_INTERP || phdr.p_type == PT_DYNAMIC {
+            if phdr.p_type == PT_INTERP {
                 return Err(ElfError::MappingFailed(
-                    "streamed binary carries PT_INTERP/PT_DYNAMIC (static-only path)",
+                    "streamed binary carries PT_INTERP (dynamic-linked; static-only path)",
                 ));
             }
             if phdr.p_type == PT_LOAD && phdr.p_memsz > 0 {
