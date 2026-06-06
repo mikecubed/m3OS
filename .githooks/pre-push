@@ -429,7 +429,7 @@ fi
 # paths the big static toolchain exercises. Requires host clang + cmake + ninja.
 if [ "${M3OS_CLANG_REGRESSION:-0}" = "1" ]; then
     echo "pre-push: running cargo xtask clang-smoke..."
-    if ! cargo xtask clang-smoke --timeout 2400; then
+    if ! cargo xtask clang-smoke --timeout 5400; then
         echo "pre-push: cargo xtask clang-smoke failed" >&2
         exit 1
     fi

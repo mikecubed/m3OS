@@ -14209,10 +14209,15 @@ fn clang_smoke_steps() -> Vec<SmokeStep> {
     steps.push(SmokeStep::Sleep { millis: 500 });
 
     // 1. Install clang from the bundled offline repo. clang has no runtime DEPS,
-    //    so the solver installs it directly. The package is the largest in the
-    //    tree (clang + lld + the bundled musl/libc++ sysroot + resource headers),
-    //    so the per-step ceiling is large; the global `--timeout` min-clamps every
-    //    step. Intended to run via pre-push at `--timeout 2400`.
+    //    so the solver installs it directly. The package is by far the largest in
+    //    the tree (≈125 MB: a 64 MiB static clang + 38 MiB lld + the bundled
+    //    musl/libc++ sysroot + resource headers — ~1500 files). `pkg install`
+    //    first READS the whole 124 MiB `.m3pkg` to verify its SHA-256, then writes
+    //    every file. m3OS's ring-3 VFS runs at ~200 KB/s
+    //    (`vfs_server: slow req … elapsed_us=50000-120000`), so verify (~10 min) +
+    //    the bulk writes legitimately take ~25 min. Hence the very large ceiling;
+    //    the global `--timeout` min-clamps every step. Intended to run via pre-push
+    //    at `--timeout 5400` (this is a deliberately heavy opt-in gate).
     steps.push(SmokeStep::Send {
         input: "pkg install clang\n",
         label: "clang-smoke: pkg install clang",
@@ -14220,7 +14225,7 @@ fn clang_smoke_steps() -> Vec<SmokeStep> {
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: "pkg install: clang: OK",
         fail_prefix: "pkg install: cannot",
-        timeout_secs: 900,
+        timeout_secs: 2400,
         label: "clang-smoke: clang installed from .m3pkg",
         exit_code_on_fail: SMOKE_EXIT_CLANG_SMOKE_FAILED,
     });
@@ -14230,9 +14235,11 @@ fn clang_smoke_steps() -> Vec<SmokeStep> {
         input: "clang --version\n",
         label: "clang-smoke: clang --version",
     });
+    // The first clang invocation cold-loads the 64 MiB binary over the slow VFS
+    // (~5 min); later invocations may reuse cached pages. Generous ceiling.
     steps.push(SmokeStep::Wait {
         pattern: "clang version 18.1.8",
-        timeout_secs: 180,
+        timeout_secs: 600,
         label: "clang-smoke: version 18.1.8",
     });
 
@@ -14245,7 +14252,7 @@ fn clang_smoke_steps() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::Wait {
         pattern: "/usr/lib/clang/18",
-        timeout_secs: 120,
+        timeout_secs: 600,
         label: "clang-smoke: resource dir under /usr (relocation contract)",
     });
 
@@ -14262,7 +14269,7 @@ fn clang_smoke_steps() -> Vec<SmokeStep> {
         pass_pattern: "CLANG_C_OK hello, world",
         // clang emits `error:`/`fatal error:` on a failed compile/link.
         fail_prefix: "fatal error:",
-        timeout_secs: 600,
+        timeout_secs: 1500,
         label: "clang-smoke: C program compiled, linked (lld) + ran",
         exit_code_on_fail: SMOKE_EXIT_CLANG_SMOKE_FAILED,
     });
@@ -14275,7 +14282,7 @@ fn clang_smoke_steps() -> Vec<SmokeStep> {
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: "CLANG_CPP_OK hello from libc++",
         fail_prefix: "fatal error:",
-        timeout_secs: 600,
+        timeout_secs: 1500,
         label: "clang-smoke: C++ program linked libc++ + ran",
         exit_code_on_fail: SMOKE_EXIT_CLANG_SMOKE_FAILED,
     });
@@ -14289,7 +14296,7 @@ fn clang_smoke_steps() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::Wait {
         pattern: "CLANG_C_OK hello, world",
-        timeout_secs: 600,
+        timeout_secs: 1500,
         label: "clang-smoke: LLD-linked binary ran",
     });
 
