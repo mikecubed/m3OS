@@ -1,11 +1,18 @@
 # Phase 85d — Clang/LLVM/LLD (+ Release): Task List
 
-**Status:** Planned (authored ahead of implementation)
+**Status:** In progress (branch `feat/phase-85d-clang-llvm`)
 **Source Ref:** phase-85d
 **Depends on:** Phase 85a (Package & Build-Cache Infrastructure); 85b + 85c land first
 **Goal:** Host-cross-build a static Clang + LLD (X86-only, `MinSizeRel`), package it via the Phase 85a `.m3pkg` substrate behind an opt-in image feature, install it with `pkg install clang`, validate C/C++ sample builds inside m3OS — and cut the umbrella learning doc + capability inventory + README finalization that close out the Phase 85 family.
 
-> **Planning task list authored ahead of implementation.** All acceptance items are intentionally **unchecked `[ ]`**. This is the "+ Release" sub-phase. Builds on the 85a substrate; lands last because its heavyweight artifact (multi-GB-RAM, multi-hour build; several-hundred-MB install) is exactly what the 85a content-addressed cache exists to make affordable.
+> **Planning task list authored ahead of implementation.** This is the "+ Release" sub-phase. Builds on the 85a substrate; lands last because its heavyweight artifact (multi-GB-RAM, multi-hour build; several-hundred-MB install) is exactly what the 85a content-addressed cache exists to make affordable.
+
+## Implementation Progress Log
+
+- **Toolchain decision:** this environment has **no musl C++ compiler** (only the Ubuntu `musl-tools` C-only wrapper). Per maintainer decision, Track A cross-builds with the host **clang 18** as the cross-compiler (`--target=x86_64-linux-musl` + an assembled musl sysroot), building `libc++`/`libc++abi`/`libunwind` as the C++ runtime first (chicken-and-egg: LLVM's own C++ needs a musl libc++ before it can target musl), then the static `clang`+`lld`. LLVM pinned to **18.1.8** (matches the host clang major, lowering C++ source/compiler skew).
+- Track A — `build_llvm` + Portfile: **in progress**.
+- Track B — packaging + smoke gate + fixtures: pending Track A artifact.
+- Track C — umbrella learning doc + README closeout: **in progress** (parallel).
 
 ## Track Layout
 
