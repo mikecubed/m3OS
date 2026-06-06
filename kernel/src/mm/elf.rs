@@ -833,7 +833,7 @@ pub unsafe fn load_elf_into_with_interp(
         }
 
         // For PIE (ET_DYN) binaries the segments are linked at vaddr 0.
-        // Compute a load bias so they land at USER_VADDR_MIN (4 MiB).
+        // Compute a load bias so they land at USER_VADDR_MIN (2 MiB).
         let load_bias = if ehdr.e_type == ET_DYN {
             if min_vaddr == u64::MAX {
                 0 // no LOAD segments — bias has no effect
