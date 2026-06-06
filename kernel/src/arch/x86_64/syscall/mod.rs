@@ -4709,7 +4709,7 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         }
     };
 
-    let (resolved_name, exec_owned, exec_static) = {
+    let (resolved_name, exec_owned, exec_static, exec_stream) = {
         // MOUNT_OP_LOCK intentionally not held — `resolve_existing_fs_path`
         // can issue blocking IPC via the VFS service (Phase 54). Per-volume
         // locks protect read consistency.
@@ -4755,11 +4755,26 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         }
 
         match crate::fs::ramdisk::get_file(&resolved) {
-            Some(data) => (resolved, None, Some(data)),
+            Some(data) => (resolved, None, Some(data), None),
             None => {
                 // Phase 31: try ext2, FAT32, and tmpfs before giving up.
                 match read_file_from_disk(&resolved) {
-                    Ok(buf) => (resolved, Some(buf), None),
+                    Ok(buf) => (resolved, Some(buf), None, None),
+                    // Phase 85d — a binary larger than the kernel-heap-able size
+                    // (e.g. the ~65 MiB static clang, which exceeds the entire
+                    // 64 MiB heap) cannot be buffered whole. Load it by STREAMING
+                    // its segments from disk into the mapped user pages instead.
+                    Err(errno) if errno == NEG_E2BIG => match open_exec_stream(&resolved) {
+                        Ok(src) => (resolved, None, None, Some(src)),
+                        Err(stream_errno) => {
+                            log::warn!(
+                                "[execve] large binary not streamable: {} (errno={})",
+                                resolved,
+                                stream_errno as i64
+                            );
+                            return stream_errno;
+                        }
+                    },
                     Err(errno) => {
                         log::warn!("[execve] file not found or rejected: {}", resolved);
                         #[cfg(feature = "exec-trace")]
@@ -4811,9 +4826,13 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         );
         return NEG_EBUSY;
     }
-    let data: &[u8] = match (exec_static, exec_owned.as_deref()) {
-        (Some(data), None) => data,
-        (None, Some(data)) => data,
+    // `data` is the whole-image buffer for the common path; `None` for the
+    // Phase 85d streaming path (large binaries loaded segment-by-segment from
+    // disk via `exec_stream`).
+    let data: Option<&[u8]> = match (exec_static, exec_owned.as_deref()) {
+        (Some(data), None) => Some(data),
+        (None, Some(data)) => Some(data),
+        (None, None) if exec_stream.is_some() => None,
         _ => return NEG_EIO,
     };
     let privileged_exec_override = privileged_exec_credentials(name, exec_static.is_some());
@@ -4861,15 +4880,24 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     let (loaded, user_rsp) = {
         // SAFETY: new_cr3 is freshly allocated; no other mapper exists.
         let mut mapper = unsafe { crate::mm::mapper_for_frame(new_cr3) };
-        let loaded = match unsafe {
-            crate::mm::elf::load_elf_into_with_interp(
-                &mut mapper,
-                phys_off,
-                data,
-                name,
-                Some(interp_reader_dyn),
-            )
-        } {
+        // Phase 85d — large binaries (e.g. the ~65 MiB static clang) are streamed
+        // from disk; everything else loads from the in-memory image as before.
+        let load_result = match (exec_stream.as_ref(), data) {
+            (Some(src), _) => unsafe {
+                crate::mm::elf::load_elf_streaming(&mut mapper, phys_off, src, name)
+            },
+            (None, Some(buf)) => unsafe {
+                crate::mm::elf::load_elf_into_with_interp(
+                    &mut mapper,
+                    phys_off,
+                    buf,
+                    name,
+                    Some(interp_reader_dyn),
+                )
+            },
+            (None, None) => return NEG_EIO,
+        };
+        let loaded = match load_result {
             Ok(l) => l,
             Err(crate::mm::elf::ElfError::OutOfFrames) => {
                 log::warn!("[execve] ELF load OOM for {}", name);
@@ -7379,6 +7407,129 @@ pub(crate) fn read_file_from_disk(path: &str) -> Result<alloc::vec::Vec<u8>, u64
         }
     }
 
+    Err(NEG_ENOENT)
+}
+
+/// Phase 85d — ceiling for a binary loaded via the streaming exec path. The
+/// streamed loader needs only a small windowed buffer, so this is generous (the
+/// ~65 MiB static clang fits with room to spare); above it `execve` returns
+/// E2BIG. Guards against a malformed/huge file driving unbounded segment reads.
+const LARGE_EXEC_MAX: usize = 512 * 1024 * 1024; // 512 MiB
+
+/// 1 MiB sliding window for [`DiskElfSource`]. Streaming a 65 MiB binary then
+/// costs ~65 ext2 reads instead of ~16000 page reads.
+const EXEC_STREAM_WINDOW: usize = 1024 * 1024;
+
+/// Buffered window backing [`DiskElfSource`] — the valid bytes are
+/// `data[0..len]`, covering file range `[offset, offset + len)`.
+struct ExecWindow {
+    offset: usize,
+    len: usize,
+    data: alloc::vec::Vec<u8>,
+}
+
+/// Phase 85d — a disk-backed, windowed [`crate::mm::elf::ElfBytes`] source for
+/// ext2-resident binaries too large to materialize in one kernel-heap buffer (the
+/// ~65 MiB static `clang` exceeds the entire 64 MiB heap). Reads ranges from the
+/// ext2 root on demand through a 1 MiB sliding window, so
+/// `mm::elf::load_elf_streaming` never needs a giant allocation. Only ext2 is
+/// supported — `clang` installs to `/usr` on the ext2 root; a large binary on
+/// another filesystem falls back to E2BIG (no such case exists in practice).
+struct DiskElfSource {
+    inode: kernel_core::fs::ext2::Ext2Inode,
+    size: usize,
+    window: spin::Mutex<ExecWindow>,
+}
+
+impl DiskElfSource {
+    /// Refill the window from the ext2 root so it starts at `offset`. Reads up to
+    /// `EXEC_STREAM_WINDOW` bytes (clamped to EOF).
+    fn refill(&self, win: &mut ExecWindow, offset: usize) -> Result<(), crate::mm::elf::ElfError> {
+        use crate::mm::elf::ElfError;
+        let to_read = EXEC_STREAM_WINDOW.min(self.size.saturating_sub(offset));
+        if win.data.len() < EXEC_STREAM_WINDOW {
+            win.data.resize(EXEC_STREAM_WINDOW, 0);
+        }
+        let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+        let vol = vol
+            .as_ref()
+            .ok_or(ElfError::MappingFailed("ext2 not mounted (streamed exec)"))?;
+        let n = vol
+            .read_file_data(&self.inode, offset as u64, &mut win.data[..to_read])
+            .map_err(|_| ElfError::MappingFailed("ext2 read failed (streamed exec)"))?;
+        win.offset = offset;
+        win.len = n;
+        Ok(())
+    }
+}
+
+impl crate::mm::elf::ElfBytes for DiskElfSource {
+    fn total_len(&self) -> usize {
+        self.size
+    }
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<(), crate::mm::elf::ElfError> {
+        use crate::mm::elf::ElfError;
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let end = offset
+            .checked_add(buf.len())
+            .ok_or(ElfError::TruncatedProgramHeader)?;
+        if end > self.size {
+            return Err(ElfError::TruncatedProgramHeader);
+        }
+        let mut win = self.window.lock();
+        let in_window = offset >= win.offset && end <= win.offset + win.len;
+        if !in_window {
+            // Window the read so the requested range starts at the window base.
+            // Every caller read is <= the phdr table (<= 64 KiB) or one page
+            // (4096), both <= EXEC_STREAM_WINDOW, so one refill at `offset`
+            // always covers it.
+            self.refill(&mut win, offset)?;
+            if win.len < buf.len() {
+                return Err(ElfError::TruncatedProgramHeader);
+            }
+        }
+        let start = offset - win.offset;
+        buf.copy_from_slice(&win.data[start..start + buf.len()]);
+        Ok(())
+    }
+}
+
+/// Phase 85d — resolve a large executable `path` to a streaming
+/// [`DiskElfSource`]. Only the ext2 root (where `/usr/bin/clang-18` lives) is
+/// supported; the caller falls back to E2BIG for large binaries elsewhere.
+fn open_exec_stream(path: &str) -> Result<DiskElfSource, u64> {
+    if crate::fs::ext2::is_mounted() && !path.starts_with("/data/") {
+        let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+        if let Some(vol) = vol.as_ref() {
+            let rel = path.trim_start_matches('/');
+            if let Ok(inode_num) = vol.resolve_path(rel)
+                && let Ok(inode) = vol.read_inode(inode_num)
+            {
+                let size = inode.size as usize;
+                if size > LARGE_EXEC_MAX {
+                    log::warn!(
+                        "[execve] file too large for streaming ({} bytes > {} limit): {}",
+                        size,
+                        LARGE_EXEC_MAX,
+                        path
+                    );
+                    return Err(NEG_E2BIG);
+                }
+                return Ok(DiskElfSource {
+                    inode,
+                    size,
+                    window: spin::Mutex::new(ExecWindow {
+                        offset: 0,
+                        len: 0,
+                        data: alloc::vec::Vec::new(),
+                    }),
+                });
+            }
+        }
+    }
     Err(NEG_ENOENT)
 }
 
