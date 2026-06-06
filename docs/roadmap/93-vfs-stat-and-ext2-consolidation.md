@@ -15,7 +15,9 @@
 Every file on m3OS reports **correct, complete, and consistent** `stat` metadata — the same
 `(st_dev, st_ino)`, size, mode, link count, and timestamps — **regardless of how it is
 accessed** (by path vs by fd; via the kernel ext2 driver vs the ring-3 `vfs_server`). The
-two ext2 implementations are reconciled so a fix in one is a fix in both. The learner sees
+two ext2 implementations are reconciled so a fix in one is a fix in both. The same
+VFS/fd-layer correctness pass also makes `pwrite64` truly positional (writing at an explicit
+offset without disturbing the shared fd position). The learner sees
 why POSIX file *identity* is load-bearing for real toolchains (clang/make/git/python all
 key off `(dev, ino, mtime)`), and how a microkernel that splits a filesystem across a kernel
 driver and a userspace server must guard the metadata contract at the seam.
@@ -64,10 +66,28 @@ collapsed `<stdio.h>` onto the open main source → recursive self-include. The 
 - A cross-implementation parity test and a `stat`-conformance test suite.
 - `statx` (syscall 332): implement (mapping onto `fill_stat`) or document the deliberate
   fallback to `fstat`.
+- **Atomic `pwrite64`** — make `sys_linux_pwrite64` truly positional: write at the explicit
+  offset *without* mutating the shared fd position, instead of today's
+  seek-`write`-restore (which is non-atomic under `CLONE_FILES` fd-table sharing). This
+  needs an offset-parameterized write primitive for each writable backend
+  (Tmpfs/Ext2/Fat32) — the write-side analog of the existing `kernel_read_fd_at` /
+  `pread64` path. Same VFS/fd-layer *correctness* theme as the stat work; surfaced by
+  Phase 85d (PR #225) review. (The ext2 write primitive lands naturally on the shared
+  `kernel_core::fs::ext2` `BlockReader`/writer surface this phase introduces.)
+- *(ancillary, xtask test-harness — not VFS)* Give `SmokeStep::WaitPassOrFail` a
+  **multi-pattern fail matcher** so the in-OS `clang-smoke` compile/link steps fast-fail on
+  non-fatal clang/lld diagnostics (`error:` / `ld.lld: error:`) instead of only `fatal
+  error:`. A bare `error:` substring is unsafe today (`find_terminated_fail_line` matches
+  over the un-drained, kernel-log-inclusive serial buffer), so the fix is *multiple* clang/
+  lld-specific fail patterns. Bundled here as an 85d test-quality follow-up; no kernel/VFS
+  impact.
 
 **Out of scope**
-- Bulk-I/O throughput / readahead / write-back / fairness (that is Phase 92).
-- On-disk ext2 format changes; writable-VFS feature growth.
+- Bulk-I/O *throughput* / readahead / write-back / fairness (that is Phase 92). Write-path
+  *correctness* (atomic `pwrite64`, above) is in scope here — the split is throughput→92,
+  correctness→93.
+- On-disk ext2 format changes; writable-VFS *feature* growth (atomic `pwrite64` is a
+  correctness fix to an existing syscall, not a new write feature).
 - A unified VFS that eliminates one of the two ext2 front-ends entirely (a possible
   *longer-term* architecture decision; this phase reduces divergence via shared logic).
 
@@ -106,7 +126,12 @@ lean on `make`/`git`/`stat` correctness.
 3. Extend `VFS_OPEN` to return the inode; drop the 85d kernel-side open-time resolve.
 4. Assign per-mount `st_dev`.
 5. Implement (or explicitly defer) `statx`.
-6. Land the conformance + parity + identity test suites (host + in-OS).
+6. Add offset-parameterized backend writes (the write-side analog of `kernel_read_fd_at`,
+   landing the ext2 writer on the shared `kernel_core::fs::ext2` surface) and rewrite
+   `sys_linux_pwrite64` to use them without mutating the fd position.
+7. Land the conformance + parity + identity test suites (host + in-OS).
+8. *(ancillary)* Extend `SmokeStep::WaitPassOrFail` to accept multiple fail patterns and
+   apply clang/lld-specific patterns to the `clang-smoke` compile/link steps.
 
 ## Acceptance Criteria
 
@@ -125,6 +150,13 @@ lean on `make`/`git`/`stat` correctness.
 - [ ] `M3OS_CLANG_STRESS` multi-compile mode is wired as a CI-able stat-identity regression
       guard (it directly exercises the dedup path that 85d broke).
 - [ ] `statx` implemented (onto `fill_stat`) or its `ENOSYS`-fallback documented + tested.
+- [ ] `pwrite64` writes at the given offset and leaves the fd position **unchanged**,
+      verified by a test that interleaves `pwrite64` with `write`/`lseek` on the same fd
+      (e.g. two `pwrite64`s at different offsets bracketing a `write`, asserting the
+      `write` lands at the pre-existing position) for the Tmpfs and ext2 backends.
+- [ ] *(ancillary)* `WaitPassOrFail` accepts multiple fail patterns; a deterministic
+      non-fatal clang/lld failure (`error:` / `ld.lld: error:`) in `clang-smoke` fast-fails
+      rather than burning the step timeout, with no false-fail on a clean compile.
 
 ## Companion Task List
 

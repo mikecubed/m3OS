@@ -15,6 +15,8 @@
 | D | `VFS_OPEN` returns inode; drop the 85d kernel-side open-time resolve | C | Planned |
 | E | `statx` (implement onto `fill_stat`, or document the ENOSYS fallback) | A | Planned |
 | F | Conformance + cross-impl parity test suites; promote `M3OS_CLANG_STRESS` to a CI gate | A, B, C | Planned |
+| G | Atomic `pwrite64` — offset-parameterized backend writes (write-path correctness) | C | Planned |
+| H | *(ancillary, test-harness)* Multi-pattern `WaitPassOrFail` fail matcher for `clang-smoke` | — | Planned |
 
 ---
 
@@ -130,6 +132,37 @@
 **Acceptance:**
 - [ ] `M3OS_CLANG_STRESS`-style repeated-compile coverage is documented and wired as an opt-in pre-push gate (like the other `M3OS_*_REGRESSION` gates).
 - [ ] Downstream stat consumers spot-checked: `make` incremental rebuild (mtime), `git status` on a clean tree (index identity), `python` `.pyc` reuse (source mtime).
+
+## Track G — Atomic `pwrite64` (write-path correctness)
+
+### G.1 — Offset-parameterized backend writes + positional `pwrite64`
+
+**File:** `kernel/src/arch/x86_64/syscall/mod.rs` (+ `kernel-core/src/fs/ext2.rs` for the ext2 writer)
+**Symbol:** `sys_linux_pwrite64`; the `sys_linux_write` backend arms (`FdBackend::Tmpfs`/`Fat32Disk`/`Ext2Disk`); a new `kernel_write_fd_at` (the write analog of `kernel_read_fd_at`)
+**Why it matters:** Today `sys_linux_pwrite64` seeks the shared fd to the offset, calls `write`, then restores the position — non-atomic under `CLONE_FILES` fd-table sharing, and inconsistent with the already-positional `pread64`. clang/lld write their output positionally; a correct positional write removes the latent race and matches POSIX `pwrite(2)`. (Declined in PR #225 as out-of-85d-scope precisely because it needs this per-backend write primitive.)
+
+**Acceptance:**
+- [ ] A `kernel_write_fd_at(pid, fd, offset, buf)` (or equivalent) writes at an explicit offset for the Tmpfs, ext2, and FAT32 backends **without** reading or mutating `entry.offset`.
+- [ ] `sys_linux_pwrite64` calls it directly; the seek/`write`/restore dance is removed.
+- [ ] A test interleaving `pwrite64` with `write`/`lseek` on a shared fd asserts `pwrite64` leaves the fd position unchanged and the `write` lands at the pre-existing position (Tmpfs + ext2 backends).
+- [ ] The ext2 positional write goes through the shared `kernel_core::fs::ext2` surface (Track C), not a duplicated body.
+
+---
+
+## Track H — Multi-pattern `clang-smoke` fail matcher *(ancillary, test-harness)*
+
+### H.1 — `WaitPassOrFail` accepts multiple fail patterns
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `SmokeStep::WaitPassOrFail` (`fail_prefix`), `find_terminated_fail_line`, `clang_smoke_steps`
+**Why it matters:** The in-OS `clang-smoke` compile/link steps only fast-fail on `fatal error:`; a deterministic *non-fatal* clang/lld failure (`error:` / `ld.lld: error:`) burns the full multi-minute step timeout. A bare `error:` substring is unsafe because `find_terminated_fail_line` matches over the *un-drained, kernel-log-inclusive* serial buffer (the preceding `Wait` steps are non-consuming), and an inline `|| echo SENTINEL` would match the command echo — so the fix is *multiple* clang/lld-specific fail patterns. No kernel/VFS impact; bundled here as an 85d test-quality follow-up.
+
+**Acceptance:**
+- [ ] `WaitPassOrFail` accepts a list of fail patterns (e.g. `fail_prefixes: &[&str]`); existing single-pattern call sites keep working.
+- [ ] The `clang-smoke` C/C++/stress steps match clang/lld diagnostic shapes (e.g. `: error:`, `ld.lld: error:`) in addition to `fatal error:`.
+- [ ] A clean compile does **not** false-fail (no incidental serial `error:` trips the gate); a deterministic non-fatal failure fast-fails instead of timing out — validated by running the `clang-smoke` gate.
+
+---
 
 ## Documentation Notes
 

@@ -101,4 +101,4 @@ Where fairness lives: a single client's bulk read/write must not hold the VFS (o
 - A full unified page cache + general writeback subsystem (this phase does targeted readahead + write-back, not a global page cache).
 - Asynchronous queue-pair (SQ/CQ) block submission to the ring-3 driver — this phase batches *synchronous* requests; a full async ring is a later driver-side change.
 - Network-FS / IPv6 bulk paths.
-- **Atomic `pwrite64`** (correctness rider, not a throughput goal) — `sys_linux_pwrite64` currently seeks/writes/restores the shared fd position, which is non-atomic under `CLONE_FILES`. Because this phase reworks the kernel write path, it is the natural place to fold in offset-parameterized backend writes (Tmpfs/Ext2/Fat32) — the write-side analog of `kernel_read_fd_at` — and make `pwrite64` truly positional. Surfaced by PR #225 (Phase 85d) review; primary tracking lives in `85d-clang-llvm.md` → Deferred Until Later.
+- Atomic `pwrite64` / write-path *correctness* — this phase is write-back *throughput*; positional-write correctness (`pwrite64` not mutating the shared fd offset) is a correctness concern tracked in **Phase 93**.
