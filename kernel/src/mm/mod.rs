@@ -382,14 +382,14 @@ pub fn new_process_page_table() -> Option<PhysFrame<Size4KiB>> {
         // virtual-address offset (e.g. 0x10000000000 → PML4[2]).  Without copying
         // these entries the CPU triple-faults immediately after CR3 switch because
         // the kernel's next instruction is unreachable in the new address space.
-        // ELF-loader user mappings always land in PML4[0] (USER_VADDR_MIN = 0x400000),
+        // ELF-loader user mappings always land in PML4[0] (USER_VADDR_MIN = 0x200000),
         // so shallow-copying PML4[1..256] never causes page-table contamination.
         for i in 1usize..512 {
             new_pml4[i] = cur_pml4[i].clone();
         }
 
         // PML4[0]: deep-copy the PDPT and each PD so the ELF loader can add user
-        // entries (at USER_VADDR_MIN = 0x400000) to a process-private PD rather
+        // entries (at USER_VADDR_MIN = 0x200000) to a process-private PD rather
         // than the shared kernel page structures.  If the kernel's PML4[0] is not
         // present (common case: kernel binary is in PML4[2]), this block is skipped
         // and the ELF loader creates a fresh PDPT/PD chain for the user mapping.

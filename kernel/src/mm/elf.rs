@@ -75,8 +75,16 @@ pub const STACK_PAGES: u64 = 64;
 /// Additional pages above this are demand-paged by the page fault handler
 /// when musl's TLS/TCB allocation writes above the initial RSP.
 const ABOVE_STACK_PAGES: u64 = 16;
-/// Lower bound for valid userspace virtual addresses (4 MiB, matching Linux).
-const USER_VADDR_MIN: u64 = 0x0040_0000;
+/// Lower bound for valid userspace virtual addresses (2 MiB). Lowered from 4 MiB
+/// in Phase 85d: LLD defaults its x86_64 `ET_EXEC` image base to **0x200000**
+/// (2 MiB), so the LLD-linked static `clang`/`lld` toolchain places its first
+/// PT_LOAD there — whereas GNU-ld bases at 0x400000 (4 MiB), where every prior
+/// binary loads. 2 MiB still leaves a generous unmapped null-deref guard (the low
+/// 2 MiB, 32x Linux's default `mmap_min_addr`), the per-process break (`BRK_BASE`
+/// = 8 GiB) and anonymous mmap base (128 GiB) sit far above any binary image, and
+/// existing 4 MiB-based binaries are unaffected (PIE images simply load 2 MiB
+/// lower, which is position-independent and benign).
+const USER_VADDR_MIN: u64 = 0x0020_0000;
 /// Upper bound (exclusive) for valid userspace virtual addresses (128 TiB canonical boundary).
 const USER_VADDR_MAX: u64 = 0x0000_8000_0000_0000;
 
@@ -303,6 +311,42 @@ fn segment_flags(p_flags: u32) -> PageTableFlags {
     flags
 }
 
+/// Phase 85d — a random-access byte source for an ELF image. Most binaries are
+/// read whole into a kernel buffer first (the `&[u8]` impl, byte-identical to the
+/// pre-85d path), but binaries larger than the kernel-heap-able size (e.g. the
+/// ~65 MiB static `clang`, which exceeds the entire 64 MiB heap) cannot be
+/// materialized in one allocation. Such binaries are loaded by *streaming*:
+/// [`map_load_segment`] reads each page's file bytes through this trait, and a
+/// disk-backed impl (in the syscall layer) fetches ranges from the on-disk
+/// filesystem on demand (with internal windowed buffering), so no giant kernel
+/// buffer is ever needed.
+pub trait ElfBytes {
+    /// Total length of the ELF image in bytes.
+    fn total_len(&self) -> usize;
+    /// Fill `buf` completely with the bytes `[offset, offset + buf.len())`.
+    /// Returns `TruncatedProgramHeader` if the range is out of bounds, or
+    /// `MappingFailed` if the underlying read fails.
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<(), ElfError>;
+}
+
+impl ElfBytes for &[u8] {
+    #[inline]
+    fn total_len(&self) -> usize {
+        (*self).len()
+    }
+    #[inline]
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<(), ElfError> {
+        let end = offset
+            .checked_add(buf.len())
+            .ok_or(ElfError::TruncatedProgramHeader)?;
+        let src = self
+            .get(offset..end)
+            .ok_or(ElfError::TruncatedProgramHeader)?;
+        buf.copy_from_slice(src);
+        Ok(())
+    }
+}
+
 /// Map a single PT_LOAD segment (P11-T002, T003, T004).
 ///
 /// Allocates fresh frames, maps them in `mapper`, zeroes them, then copies
@@ -324,7 +368,7 @@ fn segment_flags(p_flags: u32) -> PageTableFlags {
 unsafe fn map_load_segment(
     mapper: &mut OffsetPageTable<'_>,
     phys_off: u64,
-    data: &[u8],
+    src: &dyn ElfBytes,
     phdr: &Phdr,
     load_bias: u64,
     binary_name: &str,
@@ -366,7 +410,7 @@ unsafe fn map_load_segment(
             .p_offset
             .checked_add(phdr.p_filesz)
             .ok_or(ElfError::TruncatedProgramHeader)?;
-        if file_image_end > data.len() as u64 {
+        if file_image_end > src.total_len() as u64 {
             return Err(ElfError::TruncatedProgramHeader);
         }
 
@@ -429,16 +473,21 @@ unsafe fn map_load_segment(
                         .ok_or(ElfError::TruncatedProgramHeader)?,
                 )
                 .map_err(|_| ElfError::TruncatedProgramHeader)?;
-                let file_end = file_off
+                let _file_end = file_off
                     .checked_add(copy_len)
                     .ok_or(ElfError::TruncatedProgramHeader)?;
-                let src = data
-                    .get(file_off..file_end)
-                    .ok_or(ElfError::TruncatedProgramHeader)?;
-                // Offset within the frame.
+                // Read the segment's file bytes for this page DIRECTLY into the
+                // mapped frame — a slice copy for small binaries (byte-identical to
+                // pre-85d), or a buffered disk read when the image is streamed.
+                // `copy_len <= 4096` (the loop is page-bounded) and never needs a
+                // large kernel allocation; reading straight into `dst` avoids the
+                // extra per-page memcpy a temporary stack buffer would add (on every
+                // path, including the non-streaming `&[u8]` one). `read_at` writes
+                // exactly `copy_len` bytes and only on success — it returns before
+                // touching `dst` on error, and the frame is discarded on exec failure.
                 let frame_off = (copy_start - page_va_start) as usize;
                 let dst = core::slice::from_raw_parts_mut(frame_ptr.add(frame_off), copy_len);
-                dst.copy_from_slice(src);
+                src.read_at(file_off, dst)?;
             }
             // BSS portion already zeroed by allocate_frame_zeroed.
         }
@@ -785,7 +834,7 @@ pub unsafe fn load_elf_into_with_interp(
         }
 
         // For PIE (ET_DYN) binaries the segments are linked at vaddr 0.
-        // Compute a load bias so they land at USER_VADDR_MIN (4 MiB).
+        // Compute a load bias so they land at USER_VADDR_MIN (2 MiB).
         let load_bias = if ehdr.e_type == ET_DYN {
             if min_vaddr == u64::MAX {
                 0 // no LOAD segments — bias has no effect
@@ -812,7 +861,7 @@ pub unsafe fn load_elf_into_with_interp(
 
             let phdr = parse_phdr(data, base, phentsize)?;
             if phdr.p_type == PT_LOAD {
-                map_load_segment(mapper, phys_off, data, &phdr, load_bias, binary_name)?;
+                map_load_segment(mapper, phys_off, &data, &phdr, load_bias, binary_name)?;
             }
             if phdr.p_type == PT_DYNAMIC {
                 dyn_offset = Some((phdr.p_offset, phdr.p_filesz));
@@ -942,6 +991,116 @@ pub unsafe fn load_elf_into_with_interp(
     }
 }
 
+/// Phase 85d — load a LARGE static ELF executable by **streaming** its segments
+/// from disk, for binaries too big to materialize in one kernel-heap buffer (the
+/// ~65 MiB static `clang` is larger than the entire 64 MiB kernel heap). Only the
+/// ELF header + program-header table are read into a small kernel buffer; each
+/// PT_LOAD segment's contents are streamed page-by-page into the mapped user pages
+/// via `src`'s buffered disk reads — so no giant kernel allocation is ever needed.
+///
+/// Restricted to **static `ET_EXEC`** images. It rejects PT_INTERP (a dynamic
+/// linker would need the PIE-relocation path, which wants the whole image in
+/// memory) but TOLERATES a benign PT_DYNAMIC — musl static binaries (clang,
+/// python, git) carry one, yet at fixed `ET_EXEC` vaddrs (load_bias == 0) it
+/// needs no relocations and is ignored, exactly as the in-memory loader does.
+/// Static binaries take no auxv interpreter extras (`aux_extras: None`); musl's
+/// `__init_tls` still finds any PT_TLS header via `AT_PHDR`/`AT_PHNUM`.
+///
+/// # Safety
+/// Same constraints as [`load_elf_into`]: `mapper` must own its PML4 and
+/// `phys_off` must be the machine's physical-memory offset.
+pub unsafe fn load_elf_streaming(
+    mapper: &mut OffsetPageTable<'_>,
+    phys_off: u64,
+    src: &dyn ElfBytes,
+    binary_name: &str,
+) -> Result<LoadedElf, ElfError> {
+    unsafe {
+        // 1. Read + parse the ELF header (64 bytes) from the source.
+        let mut ehdr_buf = [0u8; 64];
+        src.read_at(0, &mut ehdr_buf)?;
+        let ehdr = parse_ehdr(&ehdr_buf[..])?;
+        if ehdr.e_type != ET_EXEC {
+            return Err(ElfError::MappingFailed(
+                "streamed binary is not static ET_EXEC",
+            ));
+        }
+        let phoff = ehdr.phoff as usize;
+        let phentsize = ehdr.phentsize as usize;
+        let phnum = ehdr.phnum as usize;
+        let phdr_table_bytes = phnum
+            .checked_mul(phentsize)
+            .ok_or(ElfError::TruncatedProgramHeader)?;
+        // The phdr table is normally well under 4 KiB; bound it so a malformed
+        // header cannot drive a huge kernel allocation.
+        if phdr_table_bytes == 0 || phdr_table_bytes > 64 * 1024 {
+            return Err(ElfError::TruncatedProgramHeader);
+        }
+        // 2. Read the whole program-header table into a small kernel buffer; the
+        //    per-phdr parse then indexes it at base `i * phentsize`.
+        let mut ph_buf = alloc::vec![0u8; phdr_table_bytes];
+        src.read_at(phoff, &mut ph_buf)?;
+
+        // 3. First pass: find the minimum LOAD vaddr (for AT_PHDR), and reject only
+        //    PT_INTERP — a dynamic linker this static-only path cannot honor. A
+        //    *static* `ET_EXEC` commonly still carries a benign PT_DYNAMIC (e.g.
+        //    the musl static clang/python/git binaries): its segments are at fixed
+        //    vaddrs (load_bias == 0), so no runtime relocations are needed and the
+        //    `.dynamic` section is ignored — exactly as the in-memory loader does
+        //    (it only applies relocations when `load_bias != 0`, i.e. for PIE).
+        let mut min_vaddr = u64::MAX;
+        for i in 0..phnum {
+            let base = i
+                .checked_mul(phentsize)
+                .ok_or(ElfError::TruncatedProgramHeader)?;
+            let phdr = parse_phdr(&ph_buf[..], base, phentsize)?;
+            if phdr.p_type == PT_INTERP {
+                return Err(ElfError::MappingFailed(
+                    "streamed binary carries PT_INTERP (dynamic-linked; static-only path)",
+                ));
+            }
+            if phdr.p_type == PT_LOAD && phdr.p_memsz > 0 {
+                min_vaddr = min_vaddr.min(phdr.p_vaddr);
+            }
+        }
+
+        // 4. Second pass: map each PT_LOAD, streaming its file bytes. ET_EXEC links
+        //    at fixed vaddrs, so load_bias is 0.
+        for i in 0..phnum {
+            let base = i
+                .checked_mul(phentsize)
+                .ok_or(ElfError::TruncatedProgramHeader)?;
+            let phdr = parse_phdr(&ph_buf[..], base, phentsize)?;
+            if phdr.p_type == PT_LOAD {
+                map_load_segment(mapper, phys_off, src, &phdr, 0, binary_name)?;
+            }
+        }
+
+        let stack_top = map_user_stack(mapper)?;
+        let phdr_vaddr = if min_vaddr < u64::MAX {
+            min_vaddr
+                .checked_add(ehdr.phoff)
+                .ok_or(ElfError::MappingFailed("phdr vaddr overflow"))?
+        } else {
+            0
+        };
+        log::info!(
+            "elf: streamed static binary={} entry={:#x} phnum={} (no heap copy)",
+            binary_name,
+            ehdr.entry,
+            phnum,
+        );
+        Ok(LoadedElf {
+            entry: ehdr.entry,
+            stack_top,
+            phdr_vaddr,
+            phentsize: ehdr.phentsize,
+            phnum: ehdr.phnum,
+            aux_extras: None,
+        })
+    }
+}
+
 /// Read the interpreter path string from a `PT_INTERP` segment. The
 /// segment carries a NUL-terminated UTF-8 path up to `p_filesz` bytes.
 fn read_interp_path(data: &[u8], p_offset: u64, p_filesz: u64) -> Result<&str, ElfError> {
@@ -1030,7 +1189,7 @@ unsafe fn map_interpreter(
                 .ok_or(ElfError::TruncatedProgramHeader)?;
             let phdr = parse_phdr(data, base, phentsize)?;
             if phdr.p_type == PT_LOAD {
-                map_load_segment(mapper, phys_off, data, &phdr, load_bias, interp_path)?;
+                map_load_segment(mapper, phys_off, &data, &phdr, load_bias, interp_path)?;
             }
             if phdr.p_type == PT_DYNAMIC {
                 dyn_offset = Some((phdr.p_offset, phdr.p_filesz));

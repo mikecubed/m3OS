@@ -201,6 +201,13 @@ const SMOKE_EXIT_GIT_SMOKE_FAILED: i32 = 74;
 /// serial — proof the cross-built interpreter + stdlib actually run inside m3OS.
 const SMOKE_EXIT_PYTHON_SMOKE_FAILED: i32 = 75;
 
+/// Phase 85d — `cargo xtask clang-smoke` exit code. Distinct so CI can route a
+/// Clang/LLVM-toolchain failure separately. Boots m3OS (built with the opt-in
+/// `M3OS_WITH_CLANG` image feature), `pkg install clang` from the bundled
+/// `.m3pkg`, then compiles + links + runs C and C++ sample programs INSIDE m3OS
+/// (clang + lld) — proof the cross-built toolchain actually works on the target.
+const SMOKE_EXIT_CLANG_SMOKE_FAILED: i32 = 76;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
     Headless,
@@ -744,6 +751,20 @@ fn main() {
                 });
             cmd_python_smoke(&smoke_args);
         }
+        // Phase 85d — Clang/LLVM/LLD toolchain smoke. Builds the image with the
+        // opt-in `M3OS_WITH_CLANG` feature (bundling the heavyweight clang
+        // `.m3pkg` into the offline `/usr/pkg/` repo), boots m3OS, `pkg install
+        // clang`, then compiles + links + RUNS a C and a C++ program inside m3OS
+        // (clang + lld) — the proof the cross-built toolchain works on target.
+        Some("clang-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("clang-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_clang_smoke(&smoke_args);
+        }
         // Phase 63a Track H — DOOM SFX + music end-to-end smoke. Boots
         // with WAV AC'97 backend, launches `/bin/doom -warp 1 1` with
         // an auto-quit budget so the engine's Shutdown emits the
@@ -925,7 +946,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -14079,6 +14100,264 @@ fn python_smoke_steps() -> Vec<SmokeStep> {
     steps
 }
 
+/// Phase 85d — `cargo xtask clang-smoke`: cross-build the opt-in Clang/LLVM/LLD
+/// toolchain into its `.m3pkg`, build a fresh image with `M3OS_WITH_CLANG` (so it
+/// is bundled into the offline `/usr/pkg/` repo), boot m3OS, `pkg install clang`,
+/// then compile + link + RUN a C and a C++ program INSIDE m3OS (clang + lld) —
+/// the proof the cross-built toolchain works on the target, not merely
+/// cross-compiles. Runs at a long `--timeout` because the several-hundred-MB
+/// install and each cold clang invocation over m3OS's slow ring-3 VFS take
+/// minutes.
+fn cmd_clang_smoke(args: &SmokeBootArgs) {
+    // Build the llvm port so the clang `.m3pkg` exists for the data disk to bundle.
+    // The first build cross-compiles Clang + LLD (multi-GB-RAM, multi-hour on a
+    // cold cache); a warm pkgcache makes it a zero-compiler hit.
+    if let Err(msg) = port_build::build_llvm_port() {
+        eprintln!("clang-smoke: precondition failed (llvm port build): {msg}");
+        std::process::exit(SMOKE_EXIT_CLANG_SMOKE_FAILED);
+    }
+
+    // Opt-in image feature: bundle the clang `.m3pkg` into /usr/pkg for this build.
+    // SAFETY: xtask is single-threaded here; the child image-build steps read the
+    // env. set_var is `unsafe` in Rust edition 2024 (cross-thread UB risk).
+    unsafe {
+        std::env::set_var("M3OS_WITH_CLANG", "1");
+    }
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    // Always rebuild the data disk so the freshly-bundled clang `.m3pkg` + the
+    // /usr/src/hello.{c,cpp} fixtures are present and the package DB starts clean.
+    //
+    // Fast-iteration escape hatch (M3OS_CLANG_FAST_ITER=1): REUSE an existing disk
+    // that already has clang installed (from a prior run), so a kernel-side exec
+    // fix can be validated without re-paying the ~26-min in-OS install. Paired with
+    // clang_smoke_steps() skipping the `pkg install` steps. Not for CI — the
+    // committed gate always recreates the disk + exercises `pkg install clang`.
+    let fast_iter = std::env::var("M3OS_CLANG_FAST_ITER").is_ok();
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if fast_iter && disk_img.exists() {
+        println!("clang-smoke: M3OS_CLANG_FAST_ITER — reusing existing disk (skipping install)");
+    } else {
+        if disk_img.exists() {
+            let _ = fs::remove_file(&disk_img);
+        }
+        create_data_disk(
+            uefi_image.parent().unwrap(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false, // graphical_login — autologin / serial path
+        );
+    }
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, display_mode, DeviceSet::default());
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    let steps = clang_smoke_steps();
+
+    println!(
+        "clang-smoke: launching QEMU (timeout {}s, {} steps)",
+        args.timeout_secs,
+        steps.len()
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!("clang-smoke: PASSED ({} steps in {elapsed}s)", steps.len());
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("clang-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_CLANG_SMOKE_FAILED);
+        }
+    }
+}
+
+/// The serial script for `clang-smoke`. The run-output sentinels
+/// (`CLANG_C_OK` / `CLANG_CPP_OK`) come from the bundled `/usr/src/hello.{c,cpp}`
+/// fixtures, NOT from the typed command line, so a Wait matches the program's
+/// actual output rather than the echoed command (the same discipline the git /
+/// python gates use). Timeouts are generous: the several-hundred-MB `pkg install`
+/// and each cold clang invocation (loading the big static binary + reading the
+/// resource/sysroot headers) run for minutes over m3OS's slow ring-3 VFS.
+fn clang_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/clang-smoke: kernel first message",
+    }];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    // Diagnostic mode (M3OS_CLANG_DIAG=1): boot + ONE verbose compile only — no
+    // install, no version/resource-dir — so a build-time M3OS_STRACE_COMM=clang
+    // trace stays small and pinpoints where clang aborts. Not a CI path.
+    if std::env::var("M3OS_CLANG_DIAG").is_ok() {
+        steps.push(SmokeStep::Send {
+            input: "clang -v -O2 /usr/src/hello.c -o /tmp/hello && /tmp/hello\n",
+            label: "clang-diag: verbose compile",
+        });
+        steps.push(SmokeStep::WaitPassOrFail {
+            pass_pattern: "CLANG_C_OK hello, world",
+            fail_prefix: "DIAGNEVERMATCH",
+            timeout_secs: 900,
+            label: "clang-diag: compile result",
+            exit_code_on_fail: SMOKE_EXIT_CLANG_SMOKE_FAILED,
+        });
+        return steps;
+    }
+
+    // 1. Install clang from the bundled offline repo. clang has no runtime DEPS,
+    //    so the solver installs it directly. The package is by far the largest in
+    //    the tree (≈125 MB: a 64 MiB static clang + 38 MiB lld + the bundled
+    //    musl/libc++ sysroot + resource headers — ~1500 files). `pkg install`
+    //    first READS the whole 124 MiB `.m3pkg` to verify its SHA-256, then writes
+    //    every file. m3OS's ring-3 VFS runs at ~200 KB/s
+    //    (`vfs_server: slow req … elapsed_us=50000-120000`), so verify (~10 min) +
+    //    the bulk writes legitimately take ~25 min. Hence the very large ceiling;
+    //    the global `--timeout` min-clamps every step. Intended to run via pre-push
+    //    at `--timeout 5400` (this is a deliberately heavy opt-in gate).
+    //    (Skipped under M3OS_CLANG_FAST_ITER, which reuses a disk where clang is
+    //    already installed — see cmd_clang_smoke.)
+    if std::env::var("M3OS_CLANG_FAST_ITER").is_err() {
+        steps.push(SmokeStep::Send {
+            input: "pkg install clang\n",
+            label: "clang-smoke: pkg install clang",
+        });
+        steps.push(SmokeStep::WaitPassOrFail {
+            pass_pattern: "pkg install: clang: OK",
+            fail_prefix: "pkg install: cannot",
+            timeout_secs: 2400,
+            label: "clang-smoke: clang installed from .m3pkg",
+            exit_code_on_fail: SMOKE_EXIT_CLANG_SMOKE_FAILED,
+        });
+    }
+
+    // 2. clang resolves on PATH and reports the pinned version.
+    steps.push(SmokeStep::Send {
+        input: "clang --version\n",
+        label: "clang-smoke: clang --version",
+    });
+    // The first clang invocation cold-loads the 64 MiB binary over the slow VFS
+    // (~5 min); later invocations may reuse cached pages. Generous ceiling.
+    steps.push(SmokeStep::Wait {
+        pattern: "clang version 18.1.8",
+        timeout_secs: 600,
+        label: "clang-smoke: version 18.1.8",
+    });
+
+    // 3. Relocation contract (A.3): the resource dir resolves RELATIVE to the
+    //    binary, under /usr. The printed path is NOT in the typed command, so the
+    //    Wait can't false-match the echo.
+    steps.push(SmokeStep::Send {
+        input: "clang -print-resource-dir\n",
+        label: "clang-smoke: clang -print-resource-dir",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "/usr/lib/clang/18",
+        timeout_secs: 600,
+        label: "clang-smoke: resource dir under /usr (relocation contract)",
+    });
+
+    // 4. C: compile + link (default lld) + RUN inside m3OS. The `CLANG_C_OK`
+    //    sentinel is printed by the running program (from the fixture), proving
+    //    the toolchain produced a working native binary — not merely cross-built.
+    //    First clang invocation is cold (big static binary + header reads over the
+    //    slow VFS), hence the large ceiling.
+    steps.push(SmokeStep::Send {
+        input: "clang -O2 /usr/src/hello.c -o /tmp/hello && /tmp/hello\n",
+        label: "clang-smoke: clang -O2 hello.c + run",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "CLANG_C_OK hello, world",
+        // clang emits `error:`/`fatal error:` on a failed compile/link.
+        fail_prefix: "fatal error:",
+        timeout_secs: 1500,
+        label: "clang-smoke: C program compiled, linked (lld) + ran",
+        exit_code_on_fail: SMOKE_EXIT_CLANG_SMOKE_FAILED,
+    });
+
+    // 5. C++: links the bundled self-contained libc++ (abi + unwinder merged).
+    steps.push(SmokeStep::Send {
+        input: "clang++ /usr/src/hello.cpp -o /tmp/happ && /tmp/happ\n",
+        label: "clang-smoke: clang++ hello.cpp + run",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "CLANG_CPP_OK hello from libc++",
+        fail_prefix: "fatal error:",
+        timeout_secs: 1500,
+        label: "clang-smoke: C++ program linked libc++ + ran",
+        exit_code_on_fail: SMOKE_EXIT_CLANG_SMOKE_FAILED,
+    });
+
+    // 6. Explicit `-fuse-ld=lld` link (the gate proves LLD links end-to-end). The
+    //    fresh `clang` run prints `CLANG_C_OK` again; the runner's stream position
+    //    has advanced past step 4's match, so this waits on the new occurrence.
+    steps.push(SmokeStep::Send {
+        input: "clang -fuse-ld=lld /usr/src/hello.c -o /tmp/hlld && /tmp/hlld\n",
+        label: "clang-smoke: clang -fuse-ld=lld hello.c + run",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "CLANG_C_OK hello, world",
+        timeout_secs: 1500,
+        label: "clang-smoke: LLD-linked binary ran",
+    });
+
+    // Phase 85d validation knob: under M3OS_CLANG_STRESS, repeat the C compile
+    // several more times. The flaky VFS-fstat-inode dedup mixup — clang's
+    // FileManager collapsing `<stdio.h>` onto the already-open main source
+    // (st_ino=0 collision) → recursive self-include → "redefinition of main" —
+    // hit ~1 compile in 2-3. Extra compiles shake out any residual flake in ONE
+    // run; with the inode fix every compile must succeed.
+    if std::env::var("M3OS_CLANG_STRESS").is_ok() {
+        for _ in 0..6 {
+            steps.push(SmokeStep::Send {
+                input: "clang -O2 /usr/src/hello.c -o /tmp/hstress && /tmp/hstress\n",
+                label: "clang-smoke: stress compile",
+            });
+            steps.push(SmokeStep::WaitPassOrFail {
+                pass_pattern: "CLANG_C_OK hello, world",
+                fail_prefix: "fatal error:",
+                timeout_secs: 600,
+                label: "clang-smoke: stress compile result",
+                exit_code_on_fail: SMOKE_EXIT_CLANG_SMOKE_FAILED,
+            });
+        }
+    }
+
+    steps
+}
+
 /// Phase 63a Track H — `cargo xtask doom-audio-smoke` exit codes.
 /// Originally 65 (collided with `SMOKE_EXIT_SESSION_RESTART_FAILED`); bumped
 /// to 67 in PR 168 round-3 review so each smoke-mode failure exits with a
@@ -15375,6 +15654,22 @@ fn populate_ext2_files(
         print(\"fib: \" + \" \".join(str(x) for x in fib(10)))\n\
         print(\"FIBONACCI_OK\")\n";
 
+    // Phase 85d — the `clang-smoke` C / C++ source fixtures. Staged at /usr/src so
+    // a freshly-installed clang has real programs to compile + link + run inside
+    // m3OS. Each prints a distinctive run-output sentinel (`CLANG_C_OK` /
+    // `CLANG_CPP_OK`) the gate waits on — the string lives in the program, not the
+    // typed compile command, so the Wait matches actual execution, not the echo.
+    let hello_c_content = "#include <stdio.h>\n\
+        int main(void) {\n\
+        \x20   printf(\"CLANG_C_OK hello, world\\n\");\n\
+        \x20   return 0;\n\
+        }\n";
+    let hello_cpp_content = "#include <iostream>\n\
+        int main() {\n\
+        \x20   std::cout << \"CLANG_CPP_OK hello from libc++\" << std::endl;\n\
+        \x20   return 0;\n\
+        }\n";
+
     // Phase 46: service definition files.
     let sshd_conf = "name=sshd\ncommand=/bin/sshd\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=syslogd\n";
     let telnetd_conf = "name=telnetd\ncommand=/bin/telnetd\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=syslogd\n";
@@ -15819,12 +16114,16 @@ fn populate_ext2_files(
     let resolv_conf_tmp = output_dir.join("_tmp_resolv_conf");
     let gitconfig_tmp = output_dir.join("_tmp_gitconfig");
     let fibonacci_py_tmp = output_dir.join("_tmp_fibonacci_py");
+    let hello_c_tmp = output_dir.join("_tmp_hello_c");
+    let hello_cpp_tmp = output_dir.join("_tmp_hello_cpp");
     fs::write(&passwd_tmp, passwd_content).expect("write temp passwd");
     fs::write(&shadow_tmp, shadow_content).expect("write temp shadow");
     fs::write(&group_tmp, group_content).expect("write temp group");
     fs::write(&resolv_conf_tmp, resolv_conf_content).expect("write temp resolv.conf");
     fs::write(&gitconfig_tmp, gitconfig_content).expect("write temp gitconfig");
     fs::write(&fibonacci_py_tmp, fibonacci_py_content).expect("write temp fibonacci.py");
+    fs::write(&hello_c_tmp, hello_c_content).expect("write temp hello.c");
+    fs::write(&hello_cpp_tmp, hello_cpp_content).expect("write temp hello.cpp");
     fs::write(&sshd_conf_tmp, sshd_conf).expect("write temp sshd.conf");
     fs::write(&syslogd_conf_tmp, syslogd_conf).expect("write temp syslogd.conf");
     fs::write(&crond_conf_tmp, crond_conf).expect("write temp crond.conf");
@@ -16050,6 +16349,8 @@ fn populate_ext2_files(
     // Phase 85c — stage /usr/src/fibonacci.py (the python-smoke script fixture)
     // on every disk image. `usr` is created earlier in the debugfs script; here
     // we create usr/src and write the fixture 0644 root:root.
+    // Phase 85d — also stage /usr/src/hello.{c,cpp} (the clang-smoke C/C++ source
+    // fixtures) in the same /usr/src dir, 0644 root:root.
     let fibonacci_cmds = format!(
         "mkdir usr/src\n\
          sif usr/src mode 0x41ED\n\
@@ -16058,8 +16359,18 @@ fn populate_ext2_files(
          write \"{}\" usr/src/fibonacci.py\n\
          sif usr/src/fibonacci.py mode 0x81A4\n\
          sif usr/src/fibonacci.py uid 0\n\
-         sif usr/src/fibonacci.py gid 0\n",
+         sif usr/src/fibonacci.py gid 0\n\
+         write \"{}\" usr/src/hello.c\n\
+         sif usr/src/hello.c mode 0x81A4\n\
+         sif usr/src/hello.c uid 0\n\
+         sif usr/src/hello.c gid 0\n\
+         write \"{}\" usr/src/hello.cpp\n\
+         sif usr/src/hello.cpp mode 0x81A4\n\
+         sif usr/src/hello.cpp uid 0\n\
+         sif usr/src/hello.cpp gid 0\n",
         fibonacci_py_tmp.display(),
+        hello_c_tmp.display(),
+        hello_cpp_tmp.display(),
     );
 
     // Phase 73 — stage the three desktop-daemon service confs only
@@ -16587,6 +16898,8 @@ fn populate_ext2_files(
     let _ = fs::remove_file(&group_tmp);
     let _ = fs::remove_file(&gitconfig_tmp);
     let _ = fs::remove_file(&fibonacci_py_tmp);
+    let _ = fs::remove_file(&hello_c_tmp);
+    let _ = fs::remove_file(&hello_cpp_tmp);
     let _ = fs::remove_file(&sshd_conf_tmp);
     if enable_telnet {
         let _ = fs::remove_file(output_dir.join("_tmp_telnetd_conf"));
@@ -17249,6 +17562,40 @@ fn populate_phase_69d_ports(part_path: &Path, workspace_root: &Path) {
             }
             Ok(_) => eprintln!("phase-85b: {port}.m3pkg failed verify — skipping bundle"),
             Err(e) => eprintln!("phase-85b: read {} failed: {e}", artifact.display()),
+        }
+    }
+
+    // Phase 85d — the opt-in Clang/LLVM/LLD toolchain. The heavyweight artifact
+    // (several-hundred-MB) is bundled into the offline `/usr/pkg/` repo ONLY when
+    // the `M3OS_WITH_CLANG` image feature is set, so default images stay small
+    // (the documented disk delta). The port is named `llvm`, but it installs
+    // in-OS as the user-facing `pkg install clang`, so its `.m3pkg` + `.meta` are
+    // bundled under `clang.*`. The 85a content-addressed cache makes the repeat
+    // image build a zero-compiler pkgcache hit — proven on the heaviest artifact.
+    if std::env::var("M3OS_WITH_CLANG").is_ok() {
+        match port_build::pkgcache_artifact_path("llvm") {
+            Ok(artifact) if artifact.is_file() => match fs::read(&artifact) {
+                Ok(bytes) if pkg_format::verify(&bytes) => {
+                    m3pkg_files.push(("usr/pkg/clang.m3pkg".to_string(), artifact.clone()));
+                    // clang has no runtime DEPS (zlib/zstd/terminfo are disabled;
+                    // the C++ runtime is statically linked + bundled in the sysroot).
+                    let version = port_build::port_version("llvm").unwrap_or_default();
+                    let deps = port_build::port_deps("llvm").join(" ");
+                    let meta_host = preinstall_root.join("clang.meta");
+                    let _ = fs::create_dir_all(&preinstall_root);
+                    if fs::write(&meta_host, format!("VERSION={version}\nDEPS={deps}\n")).is_ok() {
+                        m3pkg_files.push(("usr/pkg/clang.meta".to_string(), meta_host));
+                    }
+                    println!("ports: bundled clang.m3pkg (opt-in M3OS_WITH_CLANG) into /usr/pkg");
+                }
+                Ok(_) => eprintln!("phase-85d: clang(llvm).m3pkg failed verify — skipping bundle"),
+                Err(e) => eprintln!("phase-85d: read {} failed: {e}", artifact.display()),
+            },
+            Ok(_) => eprintln!(
+                "phase-85d: M3OS_WITH_CLANG set but the llvm .m3pkg is not built — \
+                 run `cargo xtask port build llvm` first (or the clang-smoke gate)"
+            ),
+            Err(e) => eprintln!("phase-85d: clang artifact path error: {e}"),
         }
     }
 

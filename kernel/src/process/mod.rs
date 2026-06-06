@@ -212,6 +212,16 @@ pub enum FdBackend {
         service_handle: u64,
         /// Cached file size (for stat / EOF).
         file_size: u32,
+        /// Real ext2 inode number for this path, resolved at open time.
+        ///
+        /// `fstat` MUST report this as `st_ino`. Without it (the historical
+        /// `st_ino = 0`), userspace tools that identify files by the
+        /// `(st_dev, st_ino)` UniqueID — notably clang's `FileManager` — collapse
+        /// every distinct VFS-backed file onto one entry, so e.g. `#include
+        /// <stdio.h>` resolves to the already-open main source and recursively
+        /// self-includes ("redefinition of main"). Must match what `fstatat`
+        /// reports for the same path.
+        inode: u32,
     },
 }
 

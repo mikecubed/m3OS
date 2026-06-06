@@ -1,0 +1,37 @@
+NAME=llvm
+VERSION=18.1.8
+DESCRIPTION="Clang + LLD C/C++ cross-toolchain (X86-only, static, MinSizeRel)"
+CATEGORY=lang
+URL=https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/llvm-project-18.1.8.src.tar.xz
+SHA256=0b58557a6d32ceee97c8d533a59b9212d87e0fc4d2833924eb6c611247db2f2a
+MAINTAINER=m3os
+
+# Phase 85d — Clang/LLVM/LLD is the THIRD and heaviest real cross-compiled
+# toolchain on top of the Phase 85a `.m3pkg` substrate (after 85b's git and
+# 85c's Python), and the one whose multi-GB-RAM / multi-hour rebuild cost is the
+# entire justification for 85a's content-addressed cache. It is X86-only,
+# `MinSizeRel`, statically linked, and gated behind an opt-in image feature
+# (`M3OS_WITH_CLANG`) so default images never carry the several-hundred-MB
+# artifact. No `opt`/`llc`/sanitizers, no self-hosting (Stage 2 of
+# `docs/clang-llvm-roadmap.md` remains deferred).
+#
+# Toolchain note — UNLIKE every prior port, llvm is NOT built with the musl-gcc
+# wrapper. LLVM/Clang is a large C++ codebase and `musl-tools` ships no C++
+# compiler. `build_llvm` instead drives the host **clang** as the cross-compiler
+# (`--target=x86_64-linux-musl` + an assembled musl sysroot), and builds the C++
+# runtime (`libc++`/`libc++abi`/`libunwind`) FIRST — the chicken-and-egg of
+# cross-building LLVM's own C++ for a libc with no C++ stdlib: a musl libc++ must
+# exist before clang's C++ can target musl. compiler-rt builtins are built for
+# the target so the in-OS clang has a complete link runtime. See `build_llvm` in
+# xtask/src/port_build.rs for the multi-stage recipe.
+#
+# Relocation contract (Phase 85a E.1, at its hardest here): Clang resolves its
+# resource dir (`lib/clang/<major>/{include,lib}` — builtin headers + builtins)
+# RELATIVE to the `clang` executable, and a bundled m3OS sysroot (musl headers,
+# CRT objects, libc.a, and the C++ runtime) supplies libc/libc++ at
+# `--sysroot`. `clang -print-resource-dir` inside m3OS therefore resolves under
+# `/usr`. `clang++` is provided (driver-mode dispatch / symlink to `clang`).
+#
+# No runtime DEPS: zlib/zstd/terminfo are all disabled (LLVM_ENABLE_*=OFF) and
+# the C++ runtime is statically linked into the toolchain, so the in-OS
+# `pkg install clang` pulls nothing else.

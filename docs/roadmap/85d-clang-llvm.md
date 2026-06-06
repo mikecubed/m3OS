@@ -1,6 +1,6 @@
 # Phase 85d - Clang/LLVM/LLD (+ Release)
 
-**Status:** Planned
+**Status:** Implemented (kernel `0.85.3`; `clang-smoke` gate green — clang compiles + links + runs C/C++ in-OS)
 **Source Ref:** phase-85d
 **Depends on:** Phase 85a (Package & Build-Cache Infrastructure); 85b and 85c land first (smaller artifacts validate the substrate before the ~1 GB one)
 **Builds on:** Adds the largest toolchain on the Phase 85a substrate — a host-cross-built static Clang + LLD — and carries the umbrella "+ Release" items for the whole Phase 85 family (learning doc, capability inventory, README finalization).
@@ -74,3 +74,5 @@ Clang's builtin headers + `compiler-rt` builtins install under `lib/clang/<ver>/
 
 - Self-hosting LLVM inside m3OS; multi-threaded compilation (`LLVM_ENABLE_THREADS=ON`); runtime sanitizers; dynamic linking of the toolchain.
 - Additional LLVM targets beyond X86; `opt`/`llc`/full tool suite.
+- **Atomic `pwrite64`** — the Phase 85d `sys_linux_pwrite64` (`kernel/src/arch/x86_64/syscall/mod.rs`) writes at an explicit offset by temporarily seeking the shared fd, delegating to `write`, then restoring the position. This is correct for the single-writer-per-fd clang/lld workload it was added for, and is no worse than the rest of m3OS's uniformly non-atomic fd-offset model (every write backend reads/writes `entry.offset`), but it is not atomic under `CLONE_FILES` fd-table sharing. A truly atomic `pwrite64` needs offset-parameterized write primitives for each backend (Tmpfs/Ext2/Fat32) — the write-side analog of the `pread64`-style `kernel_read_fd_at`. Now tracked as an **in-scope correctness item of Phase 93** (VFS `stat` conformance & ext2 consolidation — same VFS/fd-layer correctness theme; the ext2 writer lands on that phase's shared `kernel_core::fs::ext2` surface). Surfaced by PR #225 review.
+- **Multi-pattern `clang-smoke` fail matcher** — the in-OS compile/link steps' `WaitPassOrFail` (`xtask/src/main.rs`) uses a single `fail_prefix` (`fatal error:`), so a deterministic *non-fatal* clang/lld failure (a plain `error:` / `ld.lld: error:`) burns the full timeout instead of fast-failing (the error text is still surfaced in the timeout's serial-tail dump, so no diagnostic is lost). A bare `error:` prefix is unsafe here — `find_terminated_fail_line` substring-matches over the un-drained, kernel-log-inclusive serial buffer — so the real fix is to let `WaitPassOrFail` accept *multiple* fail patterns and match clang/lld diagnostic shapes specifically. xtask test-harness only (no kernel/feature impact); validation requires running the multi-hour `clang-smoke` gate. Tracked (ancillary) in **Phase 93**. Surfaced by PR #225 review.

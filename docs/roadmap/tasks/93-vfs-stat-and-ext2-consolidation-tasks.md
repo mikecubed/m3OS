@@ -1,0 +1,173 @@
+# Phase 93 — VFS `stat` Conformance & ext2 Consolidation: Task List
+
+**Status:** Planned
+**Source Ref:** phase-93
+**Depends on:** Phase 08 (Storage & VFS) ✅, Phase 28 (ext2) ✅, Phase 54 (vfs_server) ✅, Phase 18 (Directory VFS) ✅
+**Goal:** Make file metadata correct, complete, and consistent across every access path, and reconcile the two ext2 implementations so they cannot diverge. Implements the audit checklist from the post-mortem `docs/post-mortems/2026-06-06-vfs-fstat-inode-identity-and-ext2-dual-impl.md`.
+
+## Track Layout
+
+| Track | Scope | Dependencies | Status |
+|---|---|---|---|
+| A | Canonical `fill_stat()` serializer + migrate all stat syscalls onto it | — | Planned |
+| B | Complete VFS stat fields (dev/blocks/times) + per-mount `st_dev` + identity-consistency tests | A | Planned |
+| C | Reconcile ext2: `BlockReader` trait in `kernel_core`, share resolve/read logic | — | Planned |
+| D | `VFS_OPEN` returns inode; drop the 85d kernel-side open-time resolve | C | Planned |
+| E | `statx` (implement onto `fill_stat`, or document the ENOSYS fallback) | A | Planned |
+| F | Conformance + cross-impl parity test suites; promote `M3OS_CLANG_STRESS` to a CI gate | A, B, C | Planned |
+| G | Atomic `pwrite64` — offset-parameterized backend writes (write-path correctness) | C | Planned |
+| H | *(ancillary, test-harness)* Multi-pattern `WaitPassOrFail` fail matcher for `clang-smoke` | — | Planned |
+
+---
+
+## Track A — Canonical `fill_stat()` serializer
+
+### A.1 — Introduce `FileMeta` + `fill_stat()` and migrate the stat family
+
+**File:** `kernel/src/arch/x86_64/syscall/mod.rs`
+**Symbol:** `sys_linux_fstat`, `sys_linux_fstatat`, `sys_linux_stat`, `sys_linux_lstat` (+ a new `fill_stat`)
+**Why it matters:** The 85d bug was a single field (`st_ino`) omitted in one hand-assembled `stat` path; `st_dev`/`st_blocks`/timestamps are *still* omitted there. One serializer makes "forgot a field in one path" structurally impossible — the core defect class this phase closes.
+
+**Acceptance:**
+- [ ] A `FileMeta { dev, ino, nlink, mode, uid, gid, rdev, size, blksize, blocks, atime, mtime, ctime }` struct + `fill_stat(&FileMeta) -> [u8; 144]` exist.
+- [ ] `fstat`, `stat`, `lstat`, `newfstatat`/`fstatat` build a `FileMeta` per backend and call `fill_stat` — no syscall writes `stat[..]` byte offsets directly.
+- [ ] A `cargo xtask check` grep gate fails if a new `stat[<n>..` offset write is added outside `fill_stat`.
+- [ ] Behavior-preserving for already-correct paths (existing stat tests still pass).
+
+---
+
+## Track B — Complete VFS fields + unique identity
+
+### B.1 — Populate `st_dev`, `st_blocks`, and timestamps for VfsService `fstat`
+
+**File:** `kernel/src/arch/x86_64/syscall/mod.rs`
+**Symbol:** `sys_linux_fstat` (`FdBackend::VfsService` arm), `FdBackend::VfsService`
+**Why it matters:** `fstat(fd)` and `fstatat(path)` for the same VFS file still disagree on mtime/ctime/blocks (fstat returns 0). `make`/`git`/`python` key off mtime; this is the next 85d-class break.
+
+**Acceptance:**
+- [ ] `fstat` on a VfsService fd reports the same `st_mtim`/`st_ctim`/`st_atim`, `st_blocks`, and `st_size` as `fstatat` on the same path (needs the times/blocks plumbed onto the fd or fetched at stat time).
+- [ ] Host/in-OS test asserts `fstat(open(p)) == fstatat(p)` field-by-field for a VFS file.
+
+### B.2 — Distinct `st_dev` per mounted filesystem
+
+**File:** `kernel/src/arch/x86_64/syscall/mod.rs` (stat paths), mount/VFS routing
+**Symbol:** `fill_stat` callers; mount table
+**Why it matters:** `st_dev = 0` everywhere means a tmpfs file and an ext2 file with the same inode number share a `(dev, ino)` identity — a latent cross-fs dedup collision.
+
+**Acceptance:**
+- [ ] ext2-root, tmpfs, ramdisk, and procfs report distinct, stable `st_dev` values.
+- [ ] Test: a tmpfs file and an ext2 file never share `(st_dev, st_ino)`.
+
+### B.3 — Identity-consistency + `d_ino` test
+
+**File:** `kernel-core` host tests and/or an in-OS smoke
+**Symbol:** new tests
+**Why it matters:** This is the regression that would have caught 85d directly.
+
+**Acceptance:**
+- [ ] Same file by path vs by fd → identical `(st_dev, st_ino)`.
+- [ ] `getdents64` `d_ino` equals `stat` `st_ino` for the same entry.
+
+---
+
+## Track C — Reconcile the two ext2 implementations
+
+### C.1 — `BlockReader` trait + shared higher-level ext2 ops in `kernel_core`
+
+**File:** `kernel-core/src/fs/ext2.rs`
+**Symbol:** new `trait BlockReader`; move `resolve_path`/`read_inode`/`read_file_data`/`resolve_block`/dir-parsing onto it
+**Why it matters:** Today these are implemented twice (`kernel/src/fs/ext2.rs` and `userspace/vfs_server/src/main.rs`) and diverged at the stat seam; sharing one implementation makes a fix in one a fix in both.
+
+**Acceptance:**
+- [ ] `kernel_core::fs::ext2` exposes generic `resolve_path`/`read_inode`/`read_file_data`/`resolve_block`/`read_dir_entries` over a `BlockReader`.
+- [ ] `kernel/src/fs/ext2.rs` (over a `crate::blk` reader + its cache) and `userspace/vfs_server` (over a `sys_block_read` reader) both delegate to the shared functions; the duplicated bodies are deleted.
+
+### C.2 — Cross-implementation parity test
+
+**File:** `kernel-core` host tests
+**Symbol:** new test over a fixture ext2 image
+**Why it matters:** Proves the two readers agree (inode, size, contents, dir listing) across edge cases.
+
+**Acceptance:**
+- [ ] Parity asserted for regular files, directories, symlinks, sparse/hole files, single/double/triple-indirect blocks, large files (>12 blocks), and large directories (hundreds of entries).
+
+---
+
+## Track D — Inode via `VFS_OPEN` reply
+
+### D.1 — `vfs_server` returns the inode; kernel stops double-resolving
+
+**File:** `userspace/vfs_server/src/main.rs`, `kernel/src/arch/x86_64/syscall/mod.rs`
+**Symbol:** `handle_open` (reply), `open_via_vfs`, `FdBackend::VfsService`
+**Why it matters:** The 85d fix resolves the inode a *second* time via the kernel ext2 at open; the `vfs_server` already resolved it in `handle_open`. Returning it removes the double-resolve and the cross-implementation coupling.
+
+**Acceptance:**
+- [ ] `VFS_OPEN` reply carries the inode (in a reply data field) and the kernel seeds `FdBackend::VfsService.inode` from it.
+- [ ] The kernel-side `EXT2_VOLUME.resolve_path` call in `open_via_vfs` is removed.
+- [ ] clang-smoke (incl. `M3OS_CLANG_STRESS`) still passes.
+
+---
+
+## Track E — `statx`
+
+### E.1 — Implement `statx` (332) onto `fill_stat`, or document the fallback
+
+**File:** `kernel/src/arch/x86_64/syscall/mod.rs`
+**Symbol:** `statx` dispatch + handler
+**Why it matters:** Newer libc/toolchains prefer `statx`; an unimplemented `statx` (ENOSYS) silently routes callers back toward the older paths and is a compatibility cliff.
+
+**Acceptance:**
+- [ ] `statx` implemented (mapping `FileMeta` → `struct statx`), **or** a documented, tested decision that it returns ENOSYS and callers fall back cleanly.
+
+---
+
+## Track F — Regression coverage
+
+### F.1 — Promote `M3OS_CLANG_STRESS` to a stat-identity regression gate
+
+**File:** `xtask/src/main.rs`, `.githooks/pre-push`, `AGENTS.md`
+**Symbol:** `clang_smoke_steps` stress block; pre-push gate
+**Why it matters:** The stress multi-compile mode reliably exercises the `(dev, ino)` dedup path that 85d broke; promoting it from an ad-hoc env knob to a documented gate prevents regression.
+
+**Acceptance:**
+- [ ] `M3OS_CLANG_STRESS`-style repeated-compile coverage is documented and wired as an opt-in pre-push gate (like the other `M3OS_*_REGRESSION` gates).
+- [ ] Downstream stat consumers spot-checked: `make` incremental rebuild (mtime), `git status` on a clean tree (index identity), `python` `.pyc` reuse (source mtime).
+
+## Track G — Atomic `pwrite64` (write-path correctness)
+
+### G.1 — Offset-parameterized backend writes + positional `pwrite64`
+
+**File:** `kernel/src/arch/x86_64/syscall/mod.rs` (+ `kernel-core/src/fs/ext2.rs` for the ext2 writer)
+**Symbol:** `sys_linux_pwrite64`; the `sys_linux_write` backend arms (`FdBackend::Tmpfs`/`Fat32Disk`/`Ext2Disk`); a new `kernel_write_fd_at` (the write analog of `kernel_read_fd_at`)
+**Why it matters:** Today `sys_linux_pwrite64` seeks the shared fd to the offset, calls `write`, then restores the position — non-atomic under `CLONE_FILES` fd-table sharing, and inconsistent with the already-positional `pread64`. clang/lld write their output positionally; a correct positional write removes the latent race and matches POSIX `pwrite(2)`. (Declined in PR #225 as out-of-85d-scope precisely because it needs this per-backend write primitive.)
+
+**Acceptance:**
+- [ ] A `kernel_write_fd_at(pid, fd, offset, buf)` (or equivalent) writes at an explicit offset for the Tmpfs, ext2, and FAT32 backends **without** reading or mutating `entry.offset`.
+- [ ] `sys_linux_pwrite64` calls it directly; the seek/`write`/restore dance is removed.
+- [ ] A test interleaving `pwrite64` with `write`/`lseek` on a shared fd asserts `pwrite64` leaves the fd position unchanged and the `write` lands at the pre-existing position (Tmpfs + ext2 backends).
+- [ ] The ext2 positional write goes through the shared `kernel_core::fs::ext2` surface (Track C), not a duplicated body.
+
+---
+
+## Track H — Multi-pattern `clang-smoke` fail matcher *(ancillary, test-harness)*
+
+### H.1 — `WaitPassOrFail` accepts multiple fail patterns
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `SmokeStep::WaitPassOrFail` (`fail_prefix`), `find_terminated_fail_line`, `clang_smoke_steps`
+**Why it matters:** The in-OS `clang-smoke` compile/link steps only fast-fail on `fatal error:`; a deterministic *non-fatal* clang/lld failure (`error:` / `ld.lld: error:`) burns the full multi-minute step timeout. A bare `error:` substring is unsafe because `find_terminated_fail_line` matches over the *un-drained, kernel-log-inclusive* serial buffer (the preceding `Wait` steps are non-consuming), and an inline `|| echo SENTINEL` would match the command echo — so the fix is *multiple* clang/lld-specific fail patterns. No kernel/VFS impact; bundled here as an 85d test-quality follow-up.
+
+**Acceptance:**
+- [ ] `WaitPassOrFail` accepts a list of fail patterns (e.g. `fail_prefixes: &[&str]`); existing single-pattern call sites keep working.
+- [ ] The `clang-smoke` C/C++/stress steps match clang/lld diagnostic shapes (e.g. `: error:`, `ld.lld: error:`) in addition to `fatal error:`.
+- [ ] A clean compile does **not** false-fail (no incidental serial `error:` trips the gate); a deterministic non-fatal failure fast-fails instead of timing out — validated by running the `clang-smoke` gate.
+
+---
+
+## Documentation Notes
+
+- Update `docs/08-storage-and-vfs.md` / `docs/18-directory-vfs.md` with the **mount-routing
+  rule** (which paths resolve to `Ext2Disk` (kernel) vs `VfsService` (vfs_server), and which
+  kernel subsystems read ext2 directly — the exec loader, mount).
+- Update `docs/12-posix-compatibility-layer.md` with the `fill_stat` contract.
+- Close out the post-mortem's audit checklist (sections A–F) as tracks land.

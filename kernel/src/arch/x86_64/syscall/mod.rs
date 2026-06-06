@@ -1285,12 +1285,19 @@ mod syscall_nr {
     pub const FSTAT: u64 = 5;
     pub const LSTAT: u64 = 6;
     pub const LSEEK: u64 = 8;
+    // Phase 85d — positioned read/write. LLVM/clang reads source files (and
+    // writes outputs) via `pread64`/`pwrite64`, not the sequential read/write
+    // CPython uses, so these were the gap that blocked in-OS compilation.
+    pub const PREAD64: u64 = 17;
+    pub const PWRITE64: u64 = 18;
     pub const READV: u64 = 19;
     pub const WRITEV: u64 = 20;
     pub const ACCESS: u64 = 21;
     pub const DUP: u64 = 32;
     pub const DUP2: u64 = 33;
     pub const FCNTL: u64 = 72;
+    // Phase 85d — resource-limit queries (clang/musl probe RLIMIT_STACK etc.).
+    pub const GETRLIMIT: u64 = 97;
     pub const FSYNC: u64 = 74;
     pub const TRUNCATE: u64 = 76;
     pub const FTRUNCATE: u64 = 77;
@@ -1742,6 +1749,10 @@ pub extern "C" fn syscall_handler(
         // -- fs --
         READ => sys_linux_read(arg0, arg1, arg2),
         WRITE => sys_linux_write(arg0, arg1, arg2),
+        // Phase 85d — positioned I/O used by LLVM/clang.
+        PREAD64 => sys_linux_pread64(arg0, arg1, arg2, per_core_syscall_arg3()),
+        PWRITE64 => sys_linux_pwrite64(arg0, arg1, arg2, per_core_syscall_arg3()),
+        GETRLIMIT => sys_getrlimit(arg0, arg1),
         OPEN => sys_linux_open(arg0, arg1, arg2),
         CLOSE => sys_linux_close(arg0),
         STAT => sys_linux_fstatat(AT_FDCWD, arg0, arg1, 0),
@@ -1977,7 +1988,7 @@ pub extern "C" fn syscall_handler(
             sys_futex(arg0, arg1, arg2, val3)
         }
         SET_ROBUST_LIST => 0,
-        PRLIMIT64 => NEG_ENOSYS,
+        PRLIMIT64 => sys_prlimit64(arg0, arg1, arg2, per_core_syscall_arg3()),
         GETRANDOM => sys_getrandom(arg0, arg1, arg2),
         // -- m3OS custom --
         DEBUG_PRINT => sys_debug_print(arg0, arg1),
@@ -4709,7 +4720,7 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         }
     };
 
-    let (resolved_name, exec_owned, exec_static) = {
+    let (resolved_name, exec_owned, exec_static, exec_stream) = {
         // MOUNT_OP_LOCK intentionally not held — `resolve_existing_fs_path`
         // can issue blocking IPC via the VFS service (Phase 54). Per-volume
         // locks protect read consistency.
@@ -4755,11 +4766,26 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         }
 
         match crate::fs::ramdisk::get_file(&resolved) {
-            Some(data) => (resolved, None, Some(data)),
+            Some(data) => (resolved, None, Some(data), None),
             None => {
                 // Phase 31: try ext2, FAT32, and tmpfs before giving up.
                 match read_file_from_disk(&resolved) {
-                    Ok(buf) => (resolved, Some(buf), None),
+                    Ok(buf) => (resolved, Some(buf), None, None),
+                    // Phase 85d — a binary larger than the kernel-heap-able size
+                    // (e.g. the ~65 MiB static clang, which exceeds the entire
+                    // 64 MiB heap) cannot be buffered whole. Load it by STREAMING
+                    // its segments from disk into the mapped user pages instead.
+                    Err(errno) if errno == NEG_E2BIG => match open_exec_stream(&resolved) {
+                        Ok(src) => (resolved, None, None, Some(src)),
+                        Err(stream_errno) => {
+                            log::warn!(
+                                "[execve] large binary not streamable: {} (errno={})",
+                                resolved,
+                                stream_errno as i64
+                            );
+                            return stream_errno;
+                        }
+                    },
                     Err(errno) => {
                         log::warn!("[execve] file not found or rejected: {}", resolved);
                         #[cfg(feature = "exec-trace")]
@@ -4811,9 +4837,13 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         );
         return NEG_EBUSY;
     }
-    let data: &[u8] = match (exec_static, exec_owned.as_deref()) {
-        (Some(data), None) => data,
-        (None, Some(data)) => data,
+    // `data` is the whole-image buffer for the common path; `None` for the
+    // Phase 85d streaming path (large binaries loaded segment-by-segment from
+    // disk via `exec_stream`).
+    let data: Option<&[u8]> = match (exec_static, exec_owned.as_deref()) {
+        (Some(data), None) => Some(data),
+        (None, Some(data)) => Some(data),
+        (None, None) if exec_stream.is_some() => None,
         _ => return NEG_EIO,
     };
     let privileged_exec_override = privileged_exec_credentials(name, exec_static.is_some());
@@ -4861,15 +4891,24 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     let (loaded, user_rsp) = {
         // SAFETY: new_cr3 is freshly allocated; no other mapper exists.
         let mut mapper = unsafe { crate::mm::mapper_for_frame(new_cr3) };
-        let loaded = match unsafe {
-            crate::mm::elf::load_elf_into_with_interp(
-                &mut mapper,
-                phys_off,
-                data,
-                name,
-                Some(interp_reader_dyn),
-            )
-        } {
+        // Phase 85d — large binaries (e.g. the ~65 MiB static clang) are streamed
+        // from disk; everything else loads from the in-memory image as before.
+        let load_result = match (exec_stream.as_ref(), data) {
+            (Some(src), _) => unsafe {
+                crate::mm::elf::load_elf_streaming(&mut mapper, phys_off, src, name)
+            },
+            (None, Some(buf)) => unsafe {
+                crate::mm::elf::load_elf_into_with_interp(
+                    &mut mapper,
+                    phys_off,
+                    buf,
+                    name,
+                    Some(interp_reader_dyn),
+                )
+            },
+            (None, None) => return NEG_EIO,
+        };
+        let loaded = match load_result {
             Ok(l) => l,
             Err(crate::mm::elf::ElfError::OutOfFrames) => {
                 log::warn!("[execve] ELF load OOM for {}", name);
@@ -6492,6 +6531,129 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     }
 }
 
+/// Phase 85d — `pread64(fd, buf, count, offset)`: read `count` bytes from `fd` at
+/// file `offset` into `buf` WITHOUT advancing the fd position. LLVM/clang reads
+/// source files (and resource headers) this way — CPython uses sequential
+/// `read`, which is why python worked in-OS and clang did not. Backed by
+/// the ext2/tmpfs/fat32/ramdisk file backends (`kernel_read_fd_at`) AND the ring-3
+/// `VfsService` files clang opens under `/usr` (`vfs_service_read` — also
+/// offset-based). It reads at `offset` directly and NEVER mutates the fd
+/// position, so it is correct under concurrent access (unlike a
+/// seek/read/restore). A single non-VFS call is capped at 64 KiB (like `read`);
+/// callers loop on short reads.
+pub(super) fn sys_linux_pread64(fd: u64, buf_ptr: u64, count: u64, offset: u64) -> u64 {
+    let fd_us = fd as usize;
+    if fd_us >= MAX_FDS {
+        return NEG_EBADF;
+    }
+    let entry = match current_fd_entry(fd_us) {
+        Some(e) => e,
+        None => return NEG_EBADF,
+    };
+    if !entry.readable {
+        return NEG_EBADF;
+    }
+    match &entry.backend {
+        // The ring-3 VFS read is already offset-based and copies straight to the
+        // user buffer — no shared fd position to disturb.
+        FdBackend::VfsService { service_handle, .. } => {
+            vfs_service_read(*service_handle, offset as usize, buf_ptr, count as usize)
+        }
+        _ => {
+            let to_read = (count as usize).min(64 * 1024);
+            if to_read == 0 {
+                return 0;
+            }
+            let pid = crate::process::current_pid();
+            let mut kbuf = alloc::vec![0u8; to_read];
+            match kernel_read_fd_at(pid, fd_us, offset as usize, &mut kbuf) {
+                Ok(0) => 0,
+                Ok(n) => match UserSliceWo::new(buf_ptr, n)
+                    .and_then(|s| s.copy_from_kernel(&kbuf[..n]))
+                {
+                    Ok(()) => n as u64,
+                    Err(_) => NEG_EFAULT,
+                },
+                Err(e) => e as u64,
+            }
+        }
+    }
+}
+
+/// Phase 85d — `pwrite64(fd, buf, count, offset)`: write at `offset` without
+/// advancing the fd position. Implemented by temporarily seeking the fd to
+/// `offset`, delegating to the normal write path, then restoring the saved
+/// position. Single-writer semantics are sufficient for clang/lld's output
+/// writers; a concurrent writer racing the same fd's position is not a case the
+/// toolchain exercises.
+pub(super) fn sys_linux_pwrite64(fd: u64, buf_ptr: u64, count: u64, offset: u64) -> u64 {
+    let fd_us = fd as usize;
+    if fd_us >= MAX_FDS {
+        return NEG_EBADF;
+    }
+    let saved = match current_fd_entry(fd_us) {
+        Some(e) => e.offset,
+        None => return NEG_EBADF,
+    };
+    with_current_fd_mut(fd_us, |slot| {
+        if let Some(e) = slot {
+            e.offset = offset as usize;
+        }
+    });
+    let n = sys_linux_write(fd, buf_ptr, count);
+    with_current_fd_mut(fd_us, |slot| {
+        if let Some(e) = slot {
+            e.offset = saved;
+        }
+    });
+    n
+}
+
+/// Write a Linux `struct rlimit { rlim_cur, rlim_max }` (two `u64`) to `rlim_ptr`.
+/// m3OS does not enforce per-process resource limits, so it reports an
+/// effectively-unlimited value — except `RLIMIT_NOFILE`, bounded to the real
+/// `MAX_FDS` ceiling so callers see a truthful descriptor cap.
+fn write_rlimit(resource: u64, rlim_ptr: u64) -> u64 {
+    if rlim_ptr == 0 {
+        return NEG_EFAULT;
+    }
+    const RLIMIT_NOFILE: u64 = 7;
+    const RLIM_INFINITY: u64 = u64::MAX;
+    let (cur, max) = if resource == RLIMIT_NOFILE {
+        (MAX_FDS as u64, MAX_FDS as u64)
+    } else {
+        (RLIM_INFINITY, RLIM_INFINITY)
+    };
+    let mut buf = [0u8; 16];
+    buf[0..8].copy_from_slice(&cur.to_ne_bytes());
+    buf[8..16].copy_from_slice(&max.to_ne_bytes());
+    match UserSliceWo::new(rlim_ptr, 16).and_then(|s| s.copy_from_kernel(&buf)) {
+        Ok(()) => 0,
+        Err(_) => NEG_EFAULT,
+    }
+}
+
+/// Phase 85d — `getrlimit(resource, rlim)`. clang/musl probe RLIMIT_STACK /
+/// RLIMIT_NOFILE during startup; reporting generous limits is correct since m3OS
+/// does not enforce them.
+pub(super) fn sys_getrlimit(resource: u64, rlim_ptr: u64) -> u64 {
+    write_rlimit(resource, rlim_ptr)
+}
+
+/// Phase 85d — `prlimit64(pid, resource, new_rlim, old_rlim)`. m3OS does not
+/// enforce rlimits, so any `new_rlim` is accepted-and-ignored and, when
+/// `old_rlim` is non-null, the same generous limits `getrlimit` reports are
+/// written back. (musl routes get/setrlimit through prlimit64 on modern Linux.)
+pub(super) fn sys_prlimit64(_pid: u64, resource: u64, _new_rlim: u64, old_rlim: u64) -> u64 {
+    if old_rlim != 0 {
+        let r = write_rlimit(resource, old_rlim);
+        if (r as i64) < 0 {
+            return r;
+        }
+    }
+    0
+}
+
 // ---------------------------------------------------------------------------
 // T014: write(fd, buf, count)
 // ---------------------------------------------------------------------------
@@ -7382,6 +7544,135 @@ pub(crate) fn read_file_from_disk(path: &str) -> Result<alloc::vec::Vec<u8>, u64
     Err(NEG_ENOENT)
 }
 
+/// Phase 85d — ceiling for a binary loaded via the streaming exec path. The
+/// streamed loader needs only a small windowed buffer, so this is generous (the
+/// ~65 MiB static clang fits with room to spare); above it `execve` returns
+/// E2BIG. Guards against a malformed/huge file driving unbounded segment reads.
+const LARGE_EXEC_MAX: usize = 512 * 1024 * 1024; // 512 MiB
+
+/// 1 MiB sliding window for [`DiskElfSource`]. Streaming a 65 MiB binary then
+/// costs ~65 ext2 reads instead of ~16000 page reads.
+const EXEC_STREAM_WINDOW: usize = 1024 * 1024;
+
+/// Buffered window backing [`DiskElfSource`] — the valid bytes are
+/// `data[0..len]`, covering file range `[offset, offset + len)`.
+struct ExecWindow {
+    offset: usize,
+    len: usize,
+    data: alloc::vec::Vec<u8>,
+}
+
+/// Phase 85d — a disk-backed, windowed [`crate::mm::elf::ElfBytes`] source for
+/// ext2-resident binaries too large to materialize in one kernel-heap buffer (the
+/// ~65 MiB static `clang` exceeds the entire 64 MiB heap). Reads ranges from the
+/// ext2 root on demand through a 1 MiB sliding window, so
+/// `mm::elf::load_elf_streaming` never needs a giant allocation. Only ext2 is
+/// supported — `clang` installs to `/usr` on the ext2 root; a large binary on
+/// another filesystem falls back to E2BIG (no such case exists in practice).
+struct DiskElfSource {
+    inode: kernel_core::fs::ext2::Ext2Inode,
+    size: usize,
+    window: spin::Mutex<ExecWindow>,
+}
+
+impl DiskElfSource {
+    /// Refill the window from the ext2 root so it starts at `offset`. Reads up to
+    /// `EXEC_STREAM_WINDOW` bytes (clamped to EOF).
+    fn refill(&self, win: &mut ExecWindow, offset: usize) -> Result<(), crate::mm::elf::ElfError> {
+        use crate::mm::elf::ElfError;
+        let to_read = EXEC_STREAM_WINDOW.min(self.size.saturating_sub(offset));
+        if win.data.len() < EXEC_STREAM_WINDOW {
+            win.data.resize(EXEC_STREAM_WINDOW, 0);
+        }
+        let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+        let vol = vol
+            .as_ref()
+            .ok_or(ElfError::MappingFailed("ext2 not mounted (streamed exec)"))?;
+        let n = vol
+            .read_file_data(&self.inode, offset as u64, &mut win.data[..to_read])
+            .map_err(|_| ElfError::MappingFailed("ext2 read failed (streamed exec)"))?;
+        win.offset = offset;
+        win.len = n;
+        Ok(())
+    }
+}
+
+impl crate::mm::elf::ElfBytes for DiskElfSource {
+    fn total_len(&self) -> usize {
+        self.size
+    }
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<(), crate::mm::elf::ElfError> {
+        use crate::mm::elf::ElfError;
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let end = offset
+            .checked_add(buf.len())
+            .ok_or(ElfError::TruncatedProgramHeader)?;
+        if end > self.size {
+            return Err(ElfError::TruncatedProgramHeader);
+        }
+        let mut win = self.window.lock();
+        let in_window = offset >= win.offset && end <= win.offset + win.len;
+        if !in_window {
+            // Window the read so the requested range starts at the window base.
+            // Every caller read is <= the phdr table (<= 64 KiB) or one page
+            // (4096), both <= EXEC_STREAM_WINDOW, so one refill at `offset`
+            // always covers it.
+            self.refill(&mut win, offset)?;
+            if win.len < buf.len() {
+                return Err(ElfError::TruncatedProgramHeader);
+            }
+        }
+        let start = offset - win.offset;
+        buf.copy_from_slice(&win.data[start..start + buf.len()]);
+        Ok(())
+    }
+}
+
+/// Phase 85d — resolve a large executable `path` to a streaming
+/// [`DiskElfSource`]. Only the ext2 root (where `/usr/bin/clang-18` lives) is
+/// supported; the caller falls back to E2BIG for large binaries elsewhere.
+fn open_exec_stream(path: &str) -> Result<DiskElfSource, u64> {
+    if crate::fs::ext2::is_mounted() && !path.starts_with("/data/") {
+        let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+        if let Some(vol) = vol.as_ref() {
+            let rel = path.trim_start_matches('/');
+            if let Ok(inode_num) = vol.resolve_path(rel)
+                && let Ok(inode) = vol.read_inode(inode_num)
+            {
+                let size = inode.size as usize;
+                if size > LARGE_EXEC_MAX {
+                    log::warn!(
+                        "[execve] file too large for streaming ({} bytes > {} limit): {}",
+                        size,
+                        LARGE_EXEC_MAX,
+                        path
+                    );
+                    return Err(NEG_E2BIG);
+                }
+                return Ok(DiskElfSource {
+                    inode,
+                    size,
+                    window: spin::Mutex::new(ExecWindow {
+                        offset: 0,
+                        len: 0,
+                        data: alloc::vec::Vec::new(),
+                    }),
+                });
+            }
+        }
+    }
+    // The sole caller invokes this only after `read_file_from_disk` returned
+    // `NEG_E2BIG` — i.e. the file provably exists but is too large to buffer. If
+    // streaming is unavailable (ext2 not mounted, a `/data/`/FAT32 or tmpfs path,
+    // or the ext2 lookup failed), the binary is still "found but too large", so
+    // surface E2BIG rather than ENOENT (which would misreport "not found" for a
+    // large binary on a non-ext2 mount). Matches this fn's documented contract.
+    Err(NEG_E2BIG)
+}
+
 /// Check if a path targets the tmpfs mount at `/tmp`.
 ///
 /// Returns `Some(relative_path)` if so (e.g. "/tmp/foo" → "foo").
@@ -7583,10 +7874,21 @@ fn vfs_service_open(path: &str, flags: u64) -> u64 {
     let packed = reply.data[0];
     let handle = packed & 0xFFFF_FFFF;
     let file_size = (packed >> 32) as u32;
+    // Resolve the real ext2 inode for this path so `fstat` can report a stable,
+    // UNIQUE `st_ino` (see FdBackend::VfsService::inode). The kernel ext2 is
+    // serialized + coherent and shares the disk with the vfs_server, so it yields
+    // the same inode `fstatat`/`vfs_service_stat_path` report. `resolve_path`
+    // tolerates the leading '/'. 0 (unresolved) preserves the old behaviour.
+    let inode = crate::fs::ext2::EXT2_VOLUME
+        .lock()
+        .as_ref()
+        .and_then(|v| v.resolve_path(path).ok())
+        .unwrap_or(0);
     let entry = FdEntry {
         backend: FdBackend::VfsService {
             service_handle: handle,
             file_size,
+            inode,
         },
         offset: 0,
         readable: true,
@@ -8932,7 +9234,15 @@ pub(super) fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
             (0x8000 | m as u32, u, g, fallback_size, 0)
         }
         FdBackend::Epoll { .. } => (0x2000 | 0o600, 0, 0, 0, 0),
-        FdBackend::VfsService { file_size, .. } => (0x8000 | 0o444, 0, 0, *file_size as u64, 0),
+        FdBackend::VfsService {
+            file_size, inode, ..
+        } => {
+            // Report the real ext2 inode as st_ino so clang's FileManager (which
+            // dedups by (st_dev, st_ino)) does not collapse distinct VFS files
+            // onto one entry. Must match fstatat for the same path.
+            stat[8..16].copy_from_slice(&(*inode as u64).to_ne_bytes());
+            (0x8000 | 0o444, 0, 0, *file_size as u64, 0)
+        }
     };
 
     stat[24..28].copy_from_slice(&mode.to_ne_bytes());

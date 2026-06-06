@@ -419,3 +419,18 @@ if [ "${M3OS_PYTHON_REGRESSION:-0}" = "1" ]; then
         exit 1
     fi
 fi
+
+# Phase 85d — Clang/LLVM/LLD regression gate. Gated behind M3OS_CLANG_REGRESSION=1
+# because it host-cross-builds clang + lld + a self-contained libc++ — a
+# multi-GB-RAM, multi-hour cold build — before building an opt-in M3OS_WITH_CLANG
+# image, booting QEMU, `pkg install clang`, and compiling + linking + running C/C++
+# programs INSIDE m3OS. Set this on branches that touch ports/lang/llvm, xtask's
+# build_llvm / clang bundling / clang-smoke, or the kernel mmap / exec / ext2 / VFS
+# paths the big static toolchain exercises. Requires host clang + cmake + ninja.
+if [ "${M3OS_CLANG_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask clang-smoke..."
+    if ! cargo xtask clang-smoke --timeout 5400; then
+        echo "pre-push: cargo xtask clang-smoke failed" >&2
+        exit 1
+    fi
+fi

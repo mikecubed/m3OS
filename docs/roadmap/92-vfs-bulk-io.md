@@ -101,3 +101,4 @@ Where fairness lives: a single client's bulk read/write must not hold the VFS (o
 - A full unified page cache + general writeback subsystem (this phase does targeted readahead + write-back, not a global page cache).
 - Asynchronous queue-pair (SQ/CQ) block submission to the ring-3 driver — this phase batches *synchronous* requests; a full async ring is a later driver-side change.
 - Network-FS / IPv6 bulk paths.
+- Atomic `pwrite64` / write-path *correctness* — this phase is write-back *throughput*; positional-write correctness (`pwrite64` not mutating the shared fd offset) is a correctness concern tracked in **Phase 93**.

@@ -362,6 +362,36 @@ fn build_recipe_id(name: &str) -> &'static str {
              turtledemo,turtle.py,lib2to3,asyncio,2to3,idle3,lib-dynload,__pycache__;\
              freeze=stdlib->python312.zip(.pyc,STORED),keep=os.py;recipe-v=6"
         }
+        // Phase 85d — Clang/LLVM/LLD's two-stage host-clang cross build. The
+        // identity is: the host-clang cross flags (compiler-rt/lld/no-libgcc) +
+        // the Stage-B runtimes config (self-contained libc++: abi + unwinder
+        // merged) + the Stage-C size/target levers + the baked-in in-OS clang
+        // defaults (lld/compiler-rt/libc++/libunwind/DEFAULT_SYSROOT) + the
+        // resource-dir + bundled-sysroot staging. The `clang-host` token marks
+        // the recipe SHAPE (a host-clang cross build); the ACTUAL host compiler
+        // version is NOT pinned here — `toolchain_id()` only sees the musl-gcc
+        // wrapper, so `compute_port_key` folds the real host clang/clang++
+        // `--version` (via `host_cxx_toolchain_id`) into this port's key so two
+        // host clangs cannot collide on one cached `.m3pkg`. Bump recipe-v
+        // whenever the FLAGS below change so the cached .m3pkg self-invalidates.
+        // (The pinned LLVM version + tarball SHA-256 are folded in separately via
+        // the Portfile digest.)
+        "llvm" => {
+            "host-clang-cross(clang-host;target=x86_64-linux-musl;-rtlib=compiler-rt \
+             -unwindlib=none -fuse-ld=lld);\
+             stageB-runtimes(libcxx;libcxxabi;libunwind;compiler-rt-builtins;\
+             MUSL_LIBC=ON;self-contained-libc++:STATICALLY_LINK_ABI+UNWINDER=ON);\
+             stageC(LLVM_ENABLE_PROJECTS=clang;lld;TARGETS=X86;MinSizeRel;\
+             THREADS=OFF;ZLIB/ZSTD/TERMINFO/LIBXML2/LIBEDIT=OFF;RTTI/EH=OFF;\
+             INCLUDE_TESTS/BENCHMARKS/EXAMPLES/UTILS=OFF;\
+             CLANG_ENABLE_STATIC_ANALYZER/ARCMT=OFF;static;\
+             DEFAULT_LINKER=lld;DEFAULT_RTLIB=compiler-rt;DEFAULT_CXX_STDLIB=libc++;\
+             DEFAULT_UNWINDLIB=libunwind;DEFAULT_SYSROOT=/usr/lib/clang-sysroot;\
+             INSTALL_TOOLCHAIN_ONLY=ON);\
+             install=install-clang,install-clang-resource-headers,install-lld;\
+             stage=resource-dir-builtins+bundled-usr-sysroot(musl+libc++)+clang++-symlink;\
+             recipe-v=1"
+        }
         _ => "",
     }
 }
@@ -382,6 +412,38 @@ pub fn toolchain_id() -> String {
         })
         .unwrap_or_default();
     format!("{cc}|{version}")
+}
+
+/// Identity of the HOST clang/clang++ used to cross-build the `llvm` port
+/// (resolved exactly as [`build_llvm`] resolves them: `M3OS_LLVM_CLANG` /
+/// `M3OS_LLVM_CLANGXX`, else `clang` / `clang++` on PATH). musl-tools ships no
+/// C++ compiler, so the real cross-compiler for `llvm` is this host clang —
+/// which [`toolchain_id`] (the musl-gcc wrapper) cannot see. Folding its actual
+/// `--version` into the content key keeps the cache honest: artifacts built with
+/// different host clang versions get different keys instead of colliding (a stale
+/// cross-host pkgcache hit). Best-effort: each resolved compiler's name plus its
+/// reported version line (empty when the compiler is absent — a machine that
+/// cannot build `llvm` also cannot legitimately seal its `.m3pkg`).
+pub fn host_cxx_toolchain_id() -> String {
+    let first_version_line = |cc: &str| -> String {
+        Command::new(cc)
+            .arg("--version")
+            .output()
+            .ok()
+            .and_then(|o| {
+                String::from_utf8(o.stdout)
+                    .ok()
+                    .and_then(|s| s.lines().next().map(|l| l.to_string()))
+            })
+            .unwrap_or_default()
+    };
+    let clang = std::env::var("M3OS_LLVM_CLANG").unwrap_or_else(|_| "clang".to_string());
+    let clangxx = std::env::var("M3OS_LLVM_CLANGXX").unwrap_or_else(|_| "clang++".to_string());
+    format!(
+        "{clang}|{}|{clangxx}|{}",
+        first_version_line(&clang),
+        first_version_line(&clangxx)
+    )
 }
 
 /// Fetch the upstream tarball into `cache_dir/<basename>` if missing or
@@ -542,6 +604,11 @@ pub fn port_deps(name: &str) -> &'static [&'static str] {
         // pre-installed via the phase-69d port mirror anyway). The ncurses
         // version pin is folded into `build_recipe_id("python")` instead.
         "python" => &["zlib"],
+        // Phase 85d — Clang/LLVM/LLD has NO runtime deps: zlib/zstd/terminfo are
+        // all disabled (LLVM_ENABLE_*=OFF) and the C++ runtime is statically
+        // linked into the toolchain + bundled in the .m3pkg's sysroot, so in-OS
+        // `pkg install clang` pulls nothing else.
+        "llvm" => &[],
         _ => &[],
     }
 }
@@ -560,7 +627,17 @@ pub fn port_version(name: &str) -> Option<String> {
 /// package keys of its direct dependencies. Shared by the resolve-before-build
 /// path and [`pkgcache_artifact_path`] so the key is computed one way only.
 fn compute_port_key(name: &str, port_dir: &Path) -> Result<String, String> {
-    let tc = toolchain_id();
+    // The `llvm` port's real cross-compiler is the HOST clang (musl-tools has no
+    // C++ compiler), which `toolchain_id()` (the musl-gcc wrapper) does not see.
+    // Fold the actual host clang/clang++ `--version` into the key so two host
+    // clangs do not collide on one content-addressed `.m3pkg` (the static recipe
+    // token in `build_recipe_id` cannot carry a per-host version). Other ports are
+    // built entirely by the musl toolchain, so their key is unchanged.
+    let tc = if name == "llvm" {
+        format!("{}|host-cxx={}", toolchain_id(), host_cxx_toolchain_id())
+    } else {
+        toolchain_id()
+    };
     let dep_keys: Vec<String> = port_deps(name)
         .iter()
         .map(|dep| {
@@ -808,6 +885,7 @@ fn port_build(name: &str) -> Result<(), String> {
         )?,
         "git" => build_git(&extracted, &stage, &toolchain, &zlib_stage)?,
         "python" => build_python(&extracted, &stage, &toolchain, &zlib_stage, &ncurses_stage)?,
+        "llvm" => build_llvm(&extracted, &stage, &toolchain)?,
         _ => return Err(format!("no host build recipe for port {name}")),
     }
 
@@ -1818,6 +1896,520 @@ fn build_python(
     Ok(())
 }
 
+// ── Phase 85d — Clang/LLVM/LLD cross-build constants ──────────────────────────
+/// Pinned LLVM version (must match `ports/lang/llvm/Portfile` VERSION).
+const LLVM_VERSION: &str = "18.1.8";
+/// LLVM target triple for the m3OS userspace (static musl, X86-only).
+const LLVM_TRIPLE: &str = "x86_64-unknown-linux-musl";
+/// Clang resource-dir major version (LLVM 16+ uses the bare major). Keep in sync
+/// with the Portfile `VERSION` major and `build_recipe_id("llvm")`.
+const LLVM_MAJOR: &str = "18";
+/// On-target sysroot baked into the built clang (`DEFAULT_SYSROOT`). The `.m3pkg`
+/// installs the bundled musl + libc++ sysroot here, in the standard `usr/` layout,
+/// so a bare in-OS `clang hello.c` auto-finds libc/CRT/libc++. The clang resource
+/// dir (builtin headers + builtins) stays RELATIVE to the `clang` binary
+/// (`/usr/lib/clang/<major>`) — the Phase 85a relocation contract at its hardest.
+const LLVM_TGT_SYSROOT: &str = "/usr/lib/clang-sysroot";
+
+/// Phase 85d — host-cross-build a static **Clang + LLD** (X86-only, `MinSizeRel`)
+/// for m3OS, plus the C++ runtime it links against.
+///
+/// UNLIKE every other port, this does NOT use the musl-gcc wrapper (musl-tools
+/// ships no C++ compiler, and LLVM/Clang is C++). It drives the **host clang** as
+/// the cross-compiler (`--target=x86_64-linux-musl` + an assembled musl sysroot)
+/// across two stages — the chicken-and-egg of cross-building LLVM's own C++ for a
+/// libc with no C++ stdlib:
+///
+///   Stage B (runtimes): build `libc++`/`libc++abi`/`libunwind` + `compiler-rt`
+///     builtins for the target. libc++.a is made SELF-CONTAINED (abi + unwinder
+///     merged in) so a bare `-lc++` resolves everything. Installed into the
+///     sysroot, giving a musl C++ stdlib.
+///   Stage C (toolchain): build `clang` + `lld` (X86, MinSizeRel, statically
+///     linked against the Stage-B libc++), with the in-OS defaults baked in
+///     (`CLANG_DEFAULT_LINKER=lld` — m3OS has no GNU ld — compiler-rt / libc++ /
+///     libunwind defaults, `DEFAULT_SYSROOT`, musl default target triple).
+///
+/// The host clang's compiler-rt builtins (`libclang_rt.builtins-x86_64.a`) are
+/// freestanding and work for the musl target, so they bootstrap the link checks;
+/// the Stage-B target builtins are then bundled into the staged clang's resource
+/// dir. `CMAKE_CROSSCOMPILING` is deliberately left FALSE (only the compiler
+/// target + sysroot are set, no toolchain file) so LLVM builds tblgen as a
+/// static-musl x86_64 binary that runs on the same-arch build host — sidestepping
+/// the native-tblgen sub-build.
+fn build_llvm(
+    port_src: &Path,
+    stage: &Path,
+    _toolchain: &(&'static str, String, String),
+) -> Result<(), String> {
+    let root = workspace_root();
+    let jobs = format!("-j{}", num_jobs());
+
+    // Host clang/clang++ (overridable). musl-tools has no C++ compiler, so the
+    // shared musl-gcc plumbing does not apply here.
+    let clang = std::env::var("M3OS_LLVM_CLANG").unwrap_or_else(|_| "clang".to_string());
+    let clangxx = std::env::var("M3OS_LLVM_CLANGXX").unwrap_or_else(|_| "clang++".to_string());
+    for c in [clang.as_str(), clangxx.as_str()] {
+        if !probe_tool_on_path(c) {
+            return Err(format!(
+                "llvm build: host C/C++ compiler '{c}' not found on PATH. Phase 85d \
+                 cross-builds Clang with the host clang (set M3OS_LLVM_CLANG / \
+                 M3OS_LLVM_CLANGXX to override). Install clang (Debian/Ubuntu: \
+                 `apt install clang lld cmake ninja-build`)."
+            ));
+        }
+    }
+    if !probe_tool_on_path("cmake") || !probe_tool_on_path("ninja") {
+        return Err(
+            "llvm build: cmake and ninja are required (apt install cmake ninja-build)".into(),
+        );
+    }
+
+    // Persistent cross-build workspace, OUTSIDE the port work dir that
+    // `port_build` wipes + re-extracts each run. `port_build` re-extracts
+    // `port_src` with fresh mtimes every invocation, which would defeat ninja's
+    // incrementality and force a multi-hour Stage-C rebuild on every retry; a
+    // stable source tree + persistent build dirs make staging-bug iterations
+    // cheap, while the Phase 85a pkgcache still caches the sealed `.m3pkg` so a
+    // clean machine pays the full build exactly once.
+    let cross_root = root.join("target/llvm-cross");
+    fs::create_dir_all(&cross_root).map_err(|e| format!("mkdir llvm-cross: {e}"))?;
+    let sysroot = root.join("target/llvm-musl-sysroot");
+    let sysroot_usr = cross_root.join("sysroot-usr");
+    let build_rt = cross_root.join("build-runtimes");
+    let build_clang = cross_root.join("build-llvm");
+
+    // Stable source: extract the pinned tarball into `cross_root` once and reuse.
+    // (`port_src` is the port machinery's own freshly-extracted copy; we ignore it
+    // when a cached tarball is available so re-runs don't re-stat thousands of
+    // newer-mtime files into a multi-hour rebuild.)
+    let stable_src = cross_root.join(format!("llvm-project-{LLVM_VERSION}.src"));
+    let src: PathBuf = if stable_src.join("llvm/CMakeLists.txt").exists() {
+        stable_src
+    } else {
+        let tarball = root.join(format!(
+            "target/port-src/llvm-project-{LLVM_VERSION}.src.tar.xz"
+        ));
+        if tarball.exists() {
+            println!(
+                "llvm: extracting source to persistent {} (once)",
+                stable_src.display()
+            );
+            let extracted = extract_tarball(&tarball, &cross_root.join("src-extract"))?;
+            let _ = fs::remove_dir_all(&stable_src);
+            fs::rename(&extracted, &stable_src)
+                .map_err(|e| format!("llvm: stage stable source: {e}"))?;
+            stable_src
+        } else {
+            // No cached tarball — fall back to the port machinery's extracted tree.
+            println!(
+                "llvm: cached tarball absent; using port-extracted source {}",
+                port_src.display()
+            );
+            port_src.to_path_buf()
+        }
+    };
+    let src = src.as_path();
+
+    // Ubuntu clang defaults to rtlib=libgcc + a shared unwinder (libgcc_s.so.1),
+    // which a musl sysroot has none of. Force compiler-rt builtins, no shared
+    // unwinder, and lld so every cmake try-compile/link check passes.
+    let ldx = "-rtlib=compiler-rt -unwindlib=none -fuse-ld=lld";
+    let cfx = format!("-Wno-unused-command-line-argument {ldx}");
+    let cxxfx = format!("-Wno-unused-command-line-argument -stdlib=libc++ {ldx}");
+
+    // ── 1 + 2. assemble the musl sysroot + build the C++ runtime (Stage B) ─────
+    // The reuse check comes FIRST: `assemble_musl_sysroot` wipes the sysroot's
+    // include/lib (where Stage B installs libc++), so assembling unconditionally
+    // would clobber a prior runtime and defeat the skip. On reuse, the existing
+    // sysroot already carries musl + the self-contained libc++ + builtins.
+    if sysroot.join("lib/libc++.a").exists()
+        && sysroot
+            .join("lib/linux/libclang_rt.builtins-x86_64.a")
+            .exists()
+        && std::env::var("M3OS_LLVM_REBUILD_RUNTIMES").is_err()
+    {
+        println!(
+            "llvm: stage B — reusing existing C++ runtime in {} (set \
+             M3OS_LLVM_REBUILD_RUNTIMES=1 to force)",
+            sysroot.display()
+        );
+    } else {
+        assemble_musl_sysroot(&sysroot)?;
+        println!("llvm: stage B — runtimes (libc++/libc++abi/libunwind + compiler-rt builtins)");
+        let _ = fs::remove_dir_all(&build_rt);
+        let mut cfg = Command::new("cmake");
+        cfg.args(["-G", "Ninja", "-S"])
+            .arg(src.join("runtimes"))
+            .arg("-B")
+            .arg(&build_rt)
+            .arg("-DCMAKE_BUILD_TYPE=MinSizeRel")
+            .arg(format!("-DCMAKE_INSTALL_PREFIX={}", sysroot.display()))
+            .arg(format!("-DCMAKE_C_COMPILER={clang}"))
+            .arg(format!("-DCMAKE_CXX_COMPILER={clangxx}"))
+            .arg(format!("-DCMAKE_C_COMPILER_TARGET={LLVM_TRIPLE}"))
+            .arg(format!("-DCMAKE_CXX_COMPILER_TARGET={LLVM_TRIPLE}"))
+            .arg(format!("-DCMAKE_SYSROOT={}", sysroot.display()))
+            .arg(format!("-DCMAKE_C_FLAGS={cfx}"))
+            .arg(format!("-DCMAKE_CXX_FLAGS={cfx}"))
+            .arg(format!("-DCMAKE_EXE_LINKER_FLAGS={ldx}"))
+            .arg(format!("-DCMAKE_SHARED_LINKER_FLAGS={ldx}"))
+            .arg("-DLLVM_ENABLE_RUNTIMES=libcxx;libcxxabi;libunwind;compiler-rt")
+            .arg("-DLIBCXX_ENABLE_SHARED=OFF")
+            .arg("-DLIBCXXABI_ENABLE_SHARED=OFF")
+            .arg("-DLIBUNWIND_ENABLE_SHARED=OFF")
+            .arg("-DLIBCXX_ENABLE_STATIC=ON")
+            .arg("-DLIBCXXABI_ENABLE_STATIC=ON")
+            .arg("-DLIBUNWIND_ENABLE_STATIC=ON")
+            .arg("-DLIBCXX_HAS_MUSL_LIBC=ON")
+            .arg("-DLIBCXX_CXX_ABI=libcxxabi")
+            .arg("-DLIBCXXABI_USE_LLVM_UNWINDER=ON")
+            .arg("-DLIBCXXABI_ENABLE_STATIC_UNWINDER=ON")
+            // Merge libc++abi + libunwind INTO libc++.a so a bare `-lc++` is
+            // self-sufficient for in-OS `clang++ hello.cpp` (no -lc++abi/-lunwind).
+            .arg("-DLIBCXXABI_STATICALLY_LINK_UNWINDER_IN_STATIC_LIBRARY=ON")
+            .arg("-DLIBCXX_ENABLE_STATIC_ABI_LIBRARY=ON")
+            .arg("-DLIBCXX_STATICALLY_LINK_ABI_IN_STATIC_LIBRARY=ON")
+            .arg("-DLIBCXX_USE_COMPILER_RT=ON")
+            .arg("-DLIBCXXABI_USE_COMPILER_RT=ON")
+            .arg("-DLIBUNWIND_USE_COMPILER_RT=ON")
+            .arg("-DLIBCXX_INCLUDE_BENCHMARKS=OFF")
+            .arg("-DLIBCXX_INCLUDE_TESTS=OFF")
+            .arg("-DLIBCXXABI_INCLUDE_TESTS=OFF")
+            .arg("-DLIBUNWIND_INCLUDE_TESTS=OFF")
+            .arg("-DLLVM_INCLUDE_TESTS=OFF")
+            .arg("-DCOMPILER_RT_DEFAULT_TARGET_ONLY=ON")
+            .arg("-DCOMPILER_RT_BUILD_BUILTINS=ON")
+            .arg("-DCOMPILER_RT_BUILD_SANITIZERS=OFF")
+            .arg("-DCOMPILER_RT_BUILD_XRAY=OFF")
+            .arg("-DCOMPILER_RT_BUILD_LIBFUZZER=OFF")
+            .arg("-DCOMPILER_RT_BUILD_PROFILE=OFF")
+            .arg("-DCOMPILER_RT_BUILD_MEMPROF=OFF")
+            .arg("-DCOMPILER_RT_BUILD_ORC=OFF");
+        run(&mut cfg, "llvm runtimes configure")?;
+        let mut mk = Command::new("ninja");
+        mk.current_dir(&build_rt).arg(&jobs);
+        run(&mut mk, "llvm runtimes build")?;
+        let mut inst = Command::new("ninja");
+        inst.current_dir(&build_rt).arg("install");
+        run(&mut inst, "llvm runtimes install")?;
+    }
+    for need in ["lib/libc++.a", "lib/libc++abi.a", "lib/libunwind.a"] {
+        if !sysroot.join(need).exists() {
+            return Err(format!(
+                "llvm build: stage B did not produce {} — C++ runtime incomplete",
+                sysroot.join(need).display()
+            ));
+        }
+    }
+
+    // ── 3. usr/-layout sysroot view so the host clang building LLVM finds libc++ ─
+    make_usr_layout_sysroot(&sysroot, &sysroot_usr)?;
+
+    // ── 4. Stage C: clang + lld (X86, MinSizeRel, static musl) ─────────────────
+    // libc++ is self-contained, so a bare `-stdlib=libc++` suffices when linking
+    // the toolchain's own executables (clang/lld/tblgen).
+    let exeld = format!(
+        "-static -stdlib=libc++ -L{}/lib -rtlib=compiler-rt -unwindlib=libunwind -fuse-ld=lld",
+        sysroot.display()
+    );
+    println!("llvm: stage C — configure clang + lld (X86, MinSizeRel, static musl)");
+    // Do NOT wipe build_clang — a persistent build dir + stable source make ninja
+    // incremental, so a staging/validate fix re-runs in seconds, not a multi-hour
+    // rebuild. cmake re-configure with an unchanged cache is a fast no-op.
+    let mut cfg = Command::new("cmake");
+    cfg.args(["-G", "Ninja", "-S"])
+        .arg(src.join("llvm"))
+        .arg("-B")
+        .arg(&build_clang)
+        .arg("-DCMAKE_BUILD_TYPE=MinSizeRel")
+        .arg("-DCMAKE_INSTALL_PREFIX=/usr")
+        .arg(format!("-DCMAKE_C_COMPILER={clang}"))
+        .arg(format!("-DCMAKE_CXX_COMPILER={clangxx}"))
+        .arg(format!("-DCMAKE_C_COMPILER_TARGET={LLVM_TRIPLE}"))
+        .arg(format!("-DCMAKE_CXX_COMPILER_TARGET={LLVM_TRIPLE}"))
+        .arg(format!("-DCMAKE_SYSROOT={}", sysroot_usr.display()))
+        .arg(format!("-DCMAKE_C_FLAGS={cfx}"))
+        .arg(format!("-DCMAKE_CXX_FLAGS={cxxfx}"))
+        .arg(format!("-DCMAKE_EXE_LINKER_FLAGS={exeld}"))
+        .arg("-DLLVM_ENABLE_PROJECTS=clang;lld")
+        .arg("-DLLVM_TARGETS_TO_BUILD=X86")
+        .arg("-DLLVM_TARGET_ARCH=X86")
+        .arg(format!("-DLLVM_DEFAULT_TARGET_TRIPLE={LLVM_TRIPLE}"))
+        .arg(format!("-DLLVM_HOST_TRIPLE={LLVM_TRIPLE}"))
+        // Size levers (the difference between a few-hundred-MB and a multi-GB
+        // artifact) + a single-threaded m3OS target.
+        .arg("-DLLVM_ENABLE_THREADS=OFF")
+        .arg("-DLLVM_ENABLE_ZLIB=OFF")
+        .arg("-DLLVM_ENABLE_ZSTD=OFF")
+        .arg("-DLLVM_ENABLE_TERMINFO=OFF")
+        .arg("-DLLVM_ENABLE_LIBXML2=OFF")
+        .arg("-DLLVM_ENABLE_LIBEDIT=OFF")
+        .arg("-DLLVM_ENABLE_RTTI=OFF")
+        .arg("-DLLVM_ENABLE_EH=OFF")
+        .arg("-DLLVM_INCLUDE_TESTS=OFF")
+        .arg("-DLLVM_INCLUDE_BENCHMARKS=OFF")
+        .arg("-DLLVM_INCLUDE_EXAMPLES=OFF")
+        .arg("-DLLVM_INCLUDE_UTILS=OFF")
+        .arg("-DCLANG_ENABLE_STATIC_ANALYZER=OFF")
+        .arg("-DCLANG_ENABLE_ARCMT=OFF")
+        // In-OS defaults so a bare `clang hello.c` works flagless on m3OS: lld
+        // (m3OS has no GNU ld), compiler-rt builtins, libc++ + libunwind, and a
+        // fixed sysroot supplying libc headers/CRT.
+        .arg("-DCLANG_DEFAULT_LINKER=lld")
+        .arg("-DCLANG_DEFAULT_RTLIB=compiler-rt")
+        .arg("-DCLANG_DEFAULT_CXX_STDLIB=libc++")
+        .arg("-DCLANG_DEFAULT_UNWINDLIB=libunwind")
+        .arg(format!("-DDEFAULT_SYSROOT={LLVM_TGT_SYSROOT}"))
+        .arg("-DLLVM_INSTALL_TOOLCHAIN_ONLY=ON");
+    run(&mut cfg, "llvm configure")?;
+
+    println!("llvm: stage C — build clang + lld ({jobs}) [multi-hour on a cold cache]");
+    let mut mk = Command::new("ninja");
+    mk.current_dir(&build_clang)
+        .arg(&jobs)
+        .args(["clang", "lld"]);
+    run(&mut mk, "llvm build")?;
+
+    // ── 5. install clang + lld + resource headers into the DESTDIR stage ───────
+    println!("llvm: stage C — install (DESTDIR={})", stage.display());
+    let _ = fs::remove_dir_all(stage);
+    fs::create_dir_all(stage).map_err(|e| format!("mkdir stage: {e}"))?;
+    let mut inst = Command::new("ninja");
+    inst.current_dir(&build_clang).env("DESTDIR", stage).args([
+        "install-clang",
+        "install-clang-resource-headers",
+        "install-lld",
+    ]);
+    run(&mut inst, "llvm install")?;
+
+    assemble_llvm_stage(&sysroot, stage)?;
+    validate_staged_clang(stage)?;
+    assert_llvm_layout(stage)?;
+    Ok(())
+}
+
+/// Assemble a clean musl sysroot at `sysroot`: musl headers + Linux UAPI
+/// (`linux/`, `asm-generic/`, `asm/` — musl ships none) + libc.a/CRT. The C++
+/// runtime (Stage B) installs on top of this. Idempotent (wipes + rebuilds the
+/// header/lib copies; the UAPI dirs are symlinked).
+fn assemble_musl_sysroot(sysroot: &Path) -> Result<(), String> {
+    const MUSL_INC: &str = "/usr/include/x86_64-linux-musl";
+    const MUSL_LIB: &str = "/usr/lib/x86_64-linux-musl";
+    if !Path::new(MUSL_INC).join("stdio.h").exists() || !Path::new(MUSL_LIB).join("libc.a").exists()
+    {
+        return Err(format!(
+            "llvm build: musl headers/libs not found at {MUSL_INC} / {MUSL_LIB} \
+             (Debian/Ubuntu: `apt install musl-dev`)"
+        ));
+    }
+    let inc = sysroot.join("include");
+    let lib = sysroot.join("lib");
+    // Reset only the header/lib copies — the C++ runtime install lands in the same
+    // include/lib, so a clean assemble before Stage B avoids stale carry-over.
+    let _ = fs::remove_dir_all(&inc);
+    let _ = fs::remove_dir_all(&lib);
+    fs::create_dir_all(&inc).map_err(|e| format!("mkdir sysroot/include: {e}"))?;
+    fs::create_dir_all(&lib).map_err(|e| format!("mkdir sysroot/lib: {e}"))?;
+    // musl headers + libc.a/CRT via `cp -a` (a few dozen files; simpler than a
+    // hand-rolled recursive copy).
+    cp_a(
+        &format!("{MUSL_INC}/."),
+        inc.to_str().unwrap(),
+        "musl headers",
+    )?;
+    cp_a(&format!("{MUSL_LIB}/."), lib.to_str().unwrap(), "musl libs")?;
+    // Linux UAPI headers (musl ships none) — symlink the kernel uapi dirs.
+    let asm_dir = linux_uapi_arch_include().join("asm");
+    for (target, name) in [
+        ("/usr/include/linux", "linux"),
+        ("/usr/include/asm-generic", "asm-generic"),
+        (asm_dir.to_str().unwrap_or("/usr/include/asm"), "asm"),
+    ] {
+        let link = inc.join(name);
+        let _ = fs::remove_file(&link);
+        if Path::new(target).exists() {
+            std::os::unix::fs::symlink(target, &link)
+                .map_err(|e| format!("symlink sysroot/include/{name}: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Build a `usr/`-prefixed VIEW of `sysroot` at `usr_root` (symlinks
+/// `usr/include -> sysroot/include`, `usr/lib -> sysroot/lib`) so the host clang
+/// building LLVM finds libc++ at the standard `<sysroot>/usr/include/c++/v1`.
+fn make_usr_layout_sysroot(sysroot: &Path, usr_root: &Path) -> Result<(), String> {
+    let _ = fs::remove_dir_all(usr_root);
+    let usr = usr_root.join("usr");
+    fs::create_dir_all(&usr).map_err(|e| format!("mkdir sysroot-usr/usr: {e}"))?;
+    std::os::unix::fs::symlink(sysroot.join("include"), usr.join("include"))
+        .map_err(|e| format!("symlink usr/include: {e}"))?;
+    std::os::unix::fs::symlink(sysroot.join("lib"), usr.join("lib"))
+        .map_err(|e| format!("symlink usr/lib: {e}"))?;
+    Ok(())
+}
+
+/// After `install-clang`/`install-lld`, finish the staged `/usr` tree: copy the
+/// target compiler-rt builtins into the clang resource dir (so `-rtlib=compiler-rt`
+/// resolves relative to the binary), bundle the musl + libc++ sysroot at
+/// `DEFAULT_SYSROOT` in `usr/` layout, and ensure the `clang++` driver symlink.
+fn assemble_llvm_stage(sysroot: &Path, stage: &Path) -> Result<(), String> {
+    // compiler-rt builtins → clang resource dir (lib/clang/<major>/lib/linux/).
+    let reslib = stage.join(format!("usr/lib/clang/{LLVM_MAJOR}/lib/linux"));
+    fs::create_dir_all(&reslib).map_err(|e| format!("mkdir resource lib: {e}"))?;
+    let src_rtlib = sysroot.join("lib/linux");
+    if let Ok(entries) = fs::read_dir(&src_rtlib) {
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let n = name.to_string_lossy();
+            if n.starts_with("libclang_rt.") || n.starts_with("clang_rt.") {
+                fs::copy(e.path(), reslib.join(&name))
+                    .map_err(|err| format!("copy builtin {n}: {err}"))?;
+            }
+        }
+    }
+    if !reslib.join("libclang_rt.builtins-x86_64.a").exists() {
+        return Err(format!(
+            "llvm build: compiler-rt builtins missing from resource dir {}",
+            reslib.display()
+        ));
+    }
+    // Bundle the musl + libc++ sysroot at DEFAULT_SYSROOT in standard usr/ layout.
+    let tgt = stage
+        .join(LLVM_TGT_SYSROOT.trim_start_matches('/'))
+        .join("usr");
+    fs::create_dir_all(&tgt).map_err(|e| format!("mkdir bundled sysroot: {e}"))?;
+    cp_a(
+        sysroot.join("include").to_str().unwrap(),
+        tgt.join("include").to_str().unwrap(),
+        "bundle sysroot include",
+    )?;
+    cp_a(
+        sysroot.join("lib").to_str().unwrap(),
+        tgt.join("lib").to_str().unwrap(),
+        "bundle sysroot lib",
+    )?;
+    // clang++ driver symlink (install-clang usually creates it; ensure it for the
+    // A.5 acceptance — argv[0]-driven C++ driver mode).
+    let bin = stage.join("usr/bin");
+    let clangxx = bin.join("clang++");
+    if fs::symlink_metadata(&clangxx).is_err() {
+        std::os::unix::fs::symlink("clang", &clangxx)
+            .map_err(|e| format!("symlink clang++: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Validate the STAGED clang (a static-musl x86_64 binary that runs on the build
+/// host) actually compiles + links + runs a C and a C++ program using only the
+/// bundled sysroot — a strong host-side proxy for the in-OS gate.
+fn validate_staged_clang(stage: &Path) -> Result<(), String> {
+    let clang = stage.join("usr/bin/clang");
+    let clangxx = stage.join("usr/bin/clang++");
+    if !clang.exists() {
+        return Err(format!(
+            "llvm build: staged clang missing at {}",
+            clang.display()
+        ));
+    }
+    // The baked DEFAULT_SYSROOT does not exist on the host; point --sysroot at the
+    // staged bundle instead.
+    let hsys = stage.join(LLVM_TGT_SYSROOT.trim_start_matches('/'));
+    let tmp = workspace_root().join("target/llvm-validate");
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp).map_err(|e| format!("mkdir validate dir: {e}"))?;
+    let c_src = tmp.join("h.c");
+    let cpp_src = tmp.join("h.cpp");
+    fs::write(
+        &c_src,
+        "#include <stdio.h>\nint main(){puts(\"hello, world\");return 0;}\n",
+    )
+    .map_err(|e| format!("write h.c: {e}"))?;
+    fs::write(
+        &cpp_src,
+        "#include <iostream>\nint main(){std::cout<<\"hello, cpp\\n\";return 0;}\n",
+    )
+    .map_err(|e| format!("write h.cpp: {e}"))?;
+
+    // C: clang -O2 h.c -o h_c && run.
+    let c_out = tmp.join("h_c");
+    let mut cc = Command::new(&clang);
+    cc.arg(format!("--sysroot={}", hsys.display()))
+        .arg("-O2")
+        .arg(&c_src)
+        .arg("-o")
+        .arg(&c_out);
+    run(&mut cc, "llvm validate: clang compile h.c")?;
+    run(&mut Command::new(&c_out), "llvm validate: run C binary")?;
+
+    // C++: clang++ h.cpp -o h_cpp && run (links the self-contained libc++).
+    let cpp_out = tmp.join("h_cpp");
+    let mut cxx = Command::new(&clangxx);
+    cxx.arg(format!("--sysroot={}", hsys.display()))
+        .arg(&cpp_src)
+        .arg("-o")
+        .arg(&cpp_out);
+    run(&mut cxx, "llvm validate: clang++ compile h.cpp")?;
+    run(&mut Command::new(&cpp_out), "llvm validate: run C++ binary")?;
+
+    println!("llvm: staged clang validated (C + C++ compile/link/run via bundled sysroot)");
+    Ok(())
+}
+
+/// Assert the staged tree has the binaries + relocatable resource dir the m3OS
+/// install needs.
+fn assert_llvm_layout(stage: &Path) -> Result<(), String> {
+    for bin in [
+        "usr/bin/clang",
+        "usr/bin/clang++",
+        "usr/bin/lld",
+        "usr/bin/ld.lld",
+    ] {
+        let p = stage.join(bin);
+        if fs::symlink_metadata(&p).is_err() {
+            return Err(format!("llvm build: staged {} missing", p.display()));
+        }
+    }
+    let resinc = stage.join(format!("usr/lib/clang/{LLVM_MAJOR}/include/stddef.h"));
+    if !resinc.exists() {
+        return Err(format!(
+            "llvm build: clang resource headers missing ({})",
+            resinc.display()
+        ));
+    }
+    // The bundled sysroot must carry libc.a/CRT + the self-contained libc++.
+    let sysl = stage
+        .join(LLVM_TGT_SYSROOT.trim_start_matches('/'))
+        .join("usr/lib");
+    for need in ["libc.a", "crt1.o", "libc++.a"] {
+        if !sysl.join(need).exists() {
+            return Err(format!(
+                "llvm build: bundled sysroot missing {}",
+                sysl.join(need).display()
+            ));
+        }
+    }
+    println!(
+        "llvm: staged clang+lld (X86, static musl) + resource dir /usr/lib/clang/{LLVM_MAJOR} \
+         + bundled sysroot {LLVM_TGT_SYSROOT}"
+    );
+    Ok(())
+}
+
+/// `cp -a <src> <dst>` (archive copy; preserves symlinks/modes). Used for the
+/// musl sysroot assembly + bundling where a hand-rolled recursive copy would be
+/// noise. Errors propagate.
+fn cp_a(src: &str, dst: &str, label: &str) -> Result<(), String> {
+    let status = Command::new("cp")
+        .args(["-a", src, dst])
+        .status()
+        .map_err(|e| format!("{label}: cp -a spawn: {e}"))?;
+    if !status.success() {
+        return Err(format!("{label}: cp -a {src} {dst} exited {status}"));
+    }
+    Ok(())
+}
+
 /// Assert `_curses` (and, when `libpanelw.a` was staged, `_curses_panel`) were
 /// compiled **into** the interpreter. CPython's `make` is silent when a module
 /// fails its configure probe — it just omits it and the only symptom is a
@@ -2394,6 +2986,19 @@ pub fn build_python_port() -> Result<(), String> {
     port_build("zlib").map_err(|e| format!("port zlib: {e}"))?;
     port_build("ncurses").map_err(|e| format!("port ncurses: {e}"))?;
     port_build("python").map_err(|e| format!("port python: {e}"))?;
+    Ok(())
+}
+
+/// Phase 85d — build the Clang/LLVM/LLD toolchain into its `.m3pkg`. Separate
+/// from the routine ports (it is the heaviest artifact, multi-GB-RAM / multi-hour
+/// on a cold cache) so only the opt-in image feature + the `clang-smoke` gate +
+/// an explicit `cargo xtask port build llvm` drive it. Unlike the other ports it
+/// has no musl-gcc dependency (it cross-builds with the host clang); it has no
+/// runtime `DEPS`, so nothing else is built first. A warm pkgcache makes a repeat
+/// build a zero-compiler hit (the headline Phase 85a payoff, proven on the
+/// heaviest artifact).
+pub fn build_llvm_port() -> Result<(), String> {
+    port_build("llvm").map_err(|e| format!("port llvm: {e}"))?;
     Ok(())
 }
 
