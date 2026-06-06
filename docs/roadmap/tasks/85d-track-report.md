@@ -88,6 +88,30 @@ follow-up. **Resolved — maintainer chose the streaming loader (option 1):**
 - Kernel compiles clean (`-Zbuild-std`). clang-smoke rerun in progress to validate
   clang exec + in-OS compile end-to-end.
 
+## Kernel enablers (beyond the original 85d scope)
+
+Running a 65 MiB static clang in-OS surfaced several kernel gaps not anticipated by
+the task list. Each was a real, general fix (not a clang hack):
+
+1. **Streaming ELF exec loader** (`mm/elf.rs`, `syscall/mod.rs`) — clang-18 (65 MiB)
+   exceeds the entire 64 MiB kernel heap, so `sys_execve`'s read-whole-binary path
+   could not load it. Added an `ElfBytes` source + `load_elf_streaming` + a
+   windowed ext2 `DiskElfSource`, gated to large binaries.
+2. **PT_DYNAMIC tolerance in streamed static ET_EXEC** — clang/python/git static
+   binaries carry a benign `.dynamic`; reject only PT_INTERP.
+3. **`USER_VADDR_MIN` 4 MiB → 2 MiB** — LLD bases x86_64 `ET_EXEC` at 0x200000.
+4. **`pread64` (17) + `pwrite64` (18)** — LLVM reads/writes files **positionally**;
+   CPython uses sequential read, which is why python worked in-OS and clang didn't.
+   This was THE compile blocker. `pread64` is race-free (offset-based per backend:
+   `vfs_service_read` for `/usr` VFS files, `kernel_read_fd_at` otherwise).
+5. **`getrlimit` (97) + `prlimit64` (302)** — were ENOSYS; report generous limits.
+
+**Result — clang fully works in-OS.** A fast-iter gate run (`PASSED, 22 steps, 250s`)
+validated, inside m3OS: `clang --version`=18.1.8, `clang -print-resource-dir`
+=`/usr/lib/clang/18`, C compile+link(lld)+run (`CLANG_C_OK`), C++ compile+link
+(libc++)+run (`CLANG_CPP_OK`), and `-fuse-ld=lld`. The official gate (fresh disk +
+real `pkg install clang` + the full flow) is running as the definitive acceptance.
+
 ## Rescue history
 - **clang-smoke timeout (install).** Trigger: step-14 install exceeded the 900 s
   ceiling while still writing files (verify ~10 min + bulk write ~15 min over the

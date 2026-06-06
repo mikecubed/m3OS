@@ -58,7 +58,7 @@
 **Why it matters:** Clang locates builtin headers + builtins via the resource dir; if it is not relative to the executable, the `.m3pkg` is not relocatable — the hardest relocation case in the phase.
 
 **Acceptance:**
-- [ ] Clang resolves its resource dir (`lib/clang/<ver>/include` + builtins) relative to the `clang` binary, and a fixed `--sysroot` supplies libc headers/CRT; `clang -print-resource-dir` inside m3OS points under `/usr`.
+- [x] Clang resolves its resource dir (`lib/clang/<ver>/include` + builtins) relative to the `clang` binary, and a fixed `--sysroot` supplies libc headers/CRT; `clang -print-resource-dir` inside m3OS points under `/usr` (validated in-OS: prints `/usr/lib/clang/18`).
 
 ### A.4 — Bundle the C++ runtime
 
@@ -67,8 +67,8 @@
 **Why it matters:** the B.2 gate compiles `hello.cpp`; without `libc++`/`libc++abi`/`libunwind` and the `c++/v1` headers, a C++ program cannot **link**, so the C++ acceptance criterion would be impossible to satisfy. The standalone `docs/clang-llvm-roadmap.md` (lines 161–172) lists exactly these.
 
 **Acceptance:**
-- [ ] `libc++.a`, `libc++abi.a`, `libunwind.a` and the `c++/v1` headers are built (via `LLVM_ENABLE_RUNTIMES`, A.2) and staged into the `.m3pkg`.
-- [ ] `clang++ /usr/src/hello.cpp -o app && ./app` links against the bundled runtime and runs inside m3OS.
+- [x] `libc++.a`, `libc++abi.a`, `libunwind.a` and the `c++/v1` headers are built (via `LLVM_ENABLE_RUNTIMES`, A.2) and staged into the `.m3pkg` (self-contained `libc++.a` — abi + unwinder merged).
+- [x] `clang++ /usr/src/hello.cpp -o app && ./app` links against the bundled runtime and runs inside m3OS (validated in-OS: `CLANG_CPP_OK`).
 
 ### A.5 — Provide a working `clang++`
 
@@ -77,7 +77,7 @@
 **Why it matters:** `clang++` is normally a symlink to `clang`; the clang roadmap (lines 225–244) flags that symlink/`/proc/self/exe` behavior is the documented hazard on a from-scratch OS, and the B.2 gate runs `clang++` — so its provisioning must be explicit, not assumed.
 
 **Acceptance:**
-- [ ] `clang++` is provided as a symlink to `clang` if ext2 symlinks are reliable, else via `argv[0]` driver-mode dispatch or a copied binary; `clang++ --version` succeeds inside m3OS.
+- [x] `clang++` is provided (a symlink to `clang`); `clang++ --version` succeeds inside m3OS (validated in-OS, reports clang 18.1.8 via the `clang++` driver).
 
 ---
 
@@ -100,7 +100,7 @@
 **Why it matters:** proves Clang + LLD actually compile + link + run inside m3OS.
 
 **Acceptance:**
-- [ ] Inside m3OS: `clang -O2 /usr/src/hello.c -o hello && ./hello` prints "hello, world"; `clang++ /usr/src/hello.cpp` builds + runs (links the A.4 C++ runtime); `clang -fuse-ld=lld /usr/src/hello.c` links via LLD. _(In progress — `clang-smoke` rerun installing; install validated, in-OS compile pending. Host-side: the staged clang already compiled+linked+ran C and C++ via `validate_staged_clang`.)_
+- [x] Inside m3OS: `clang -O2 /usr/src/hello.c -o hello && ./hello` prints "hello, world" (`CLANG_C_OK`); `clang++ /usr/src/hello.cpp` builds + runs (links the A.4 C++ runtime, `CLANG_CPP_OK`); `clang -fuse-ld=lld /usr/src/hello.c` links via LLD. **Validated in-OS** (`clang-smoke: PASSED, 22 steps`). Required kernel enablers (streaming ELF exec loader for >heap binaries, PT_DYNAMIC tolerance, `USER_VADDR_MIN`→2 MiB for LLD's base, and **`pread64`/`pwrite64`** — LLVM reads/writes files positionally — plus `getrlimit`/`prlimit64`); see the track report.
 - [x] The `/usr/src/hello.c` + `/usr/src/hello.cpp` fixtures are written into the data disk via `populate_ext2_files` (sentinels `CLANG_C_OK`/`CLANG_CPP_OK`); the `clang-smoke` gate force-recreates the data disk each run.
 - [x] The gate is wired as an opt-in pre-push regression (`M3OS_CLANG_REGRESSION=1`) in `AGENTS.md` + `.githooks/pre-push` (`--timeout 5400`).
 
