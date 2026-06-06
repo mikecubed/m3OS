@@ -10,9 +10,11 @@
 ## Implementation Progress Log
 
 - **Toolchain decision:** this environment has **no musl C++ compiler** (only the Ubuntu `musl-tools` C-only wrapper). Per maintainer decision, Track A cross-builds with the host **clang 18** as the cross-compiler (`--target=x86_64-linux-musl` + an assembled musl sysroot), building `libc++`/`libc++abi`/`libunwind` as the C++ runtime first (chicken-and-egg: LLVM's own C++ needs a musl libc++ before it can target musl), then the static `clang`+`lld`. LLVM pinned to **18.1.8** (matches the host clang major, lowering C++ source/compiler skew).
-- Track A — `build_llvm` + Portfile: **in progress**.
-- Track B — packaging + smoke gate + fixtures: pending Track A artifact.
-- Track C — umbrella learning doc + README closeout: **in progress** (parallel).
+- **Recipe validated** end-to-end via a shell prototype before codifying: assembled a musl sysroot from Debian `musl-dev` + Linux UAPI; **Stage B** built `libc++`/`libc++abi`/`libunwind` + compiler-rt builtins for `x86_64-linux-musl` (self-contained `libc++.a` — abi + unwinder merged → bare `-lc++` links), proven by a static-musl `hello.cpp` that runs; **Stage C** configures clang+lld (X86, MinSizeRel, static, in-OS `lld`/`compiler-rt`/`libc++` defaults + `DEFAULT_SYSROOT`).
+- **Source**: GitHub's release CDN was throttled to ~15 KB/s here; pinned the byte-identical official tarball (same SHA-256) fetched from a fast Gentoo distfiles mirror.
+- Track A — `build_llvm` + Portfile + registration (dispatch/recipe-id/deps/port-entry): **code complete, compiles**; the real `cargo xtask port build llvm` (seals the `.m3pkg`) is **running**.
+- Track B — `cmd_clang_smoke` + `clang_smoke_steps` + `/usr/src/hello.{c,cpp}` fixtures + opt-in `M3OS_WITH_CLANG` bundle gate + exit code + usage: **code complete, compiles**; in-OS validation pending the Track A artifact.
+- Track C — umbrella learning doc + `docs/README` link + roadmap rows: **done** (parallel agent, pending review/merge); AGENTS.md capability bullet + `v0.85.3` + `clang-smoke` gate row, `kernel/Cargo.toml`/`Cargo.lock` `0.85.3`, pre-push `M3OS_CLANG_REGRESSION` gate: **done** (coordinator).
 
 ## Track Layout
 
