@@ -19,7 +19,7 @@ first**. The early ports (ncurses, less, htop, tmux) are small enough that
 rebuilding them from source on each image build is merely annoying. The new
 toolchains are not: a Clang + LLD build links with **many gigabytes of RAM over a
 multi-hour compile**, and even a stripped, static, X86-only install runs to
-**several hundred megabytes**. Recompiling that on every `cargo xtask image` is
+**≈125 MB**. Recompiling that on every `cargo xtask image` is
 intolerable, so Phase 85 first builds a content-addressed package cache (85a),
 then makes each toolchain a *consumer* of that cache. Build the artifact once;
 every later build installs it for free.
@@ -185,6 +185,21 @@ of thousands of tiny ones. Networking/TLS modules (`ssl`, socket DNS, `pip`,
 Clang is the artifact the whole substrate exists for, and it lands last, on a
 proven cache. It is a host-cross-built static **Clang + LLD**, configured for size:
 
+> **Why the host *clang* is the cross-compiler here.** Every other port cross-builds
+> with the musl-gcc wrapper — but `musl-tools` ships **no C++ compiler**, and
+> LLVM/Clang is a large C++ codebase. So 85d drives the **host `clang`** as the
+> cross-compiler (`--target=x86_64-linux-musl` over an assembled musl sysroot).
+> That exposes a chicken-and-egg: compiling LLVM's *own* C++ for musl needs a musl
+> C++ standard library that does not exist yet. The fix is a two-stage build —
+> first cross-build `libc++`/`libc++abi`/`libunwind` for the target (the runtimes
+> need only C headers), making a **self-contained `libc++.a`** (abi + unwinder
+> merged in, so a bare `-lc++` links); then build `clang`+`lld` against it. Because
+> the build host and target are the same arch (only the libc differs), the
+> just-built static-musl `tblgen` tools run directly on the host, sidestepping the
+> usual native-tooling sub-build. The built clang bakes in m3OS-friendly defaults —
+> `lld` as the linker (m3OS has no GNU `ld`), `compiler-rt`/`libc++`/`libunwind`,
+> and a fixed `DEFAULT_SYSROOT` — so a bare in-OS `clang hello.c` just works.
+
 ```
 cmake -DLLVM_ENABLE_PROJECTS="clang;lld" \
       -DLLVM_ENABLE_RUNTIMES="libcxx;libcxxabi;libunwind" \
@@ -225,18 +240,23 @@ The two costs are distinct: **on-image disk** vs **host-build RAM**.
 | 85a retrofit (ncurses/less/htop/tmux/libevent/zlib) | ~34 MB (~3% of the 1 GB disk) | Yes |
 | git (85b) | tens of MB | Yes |
 | Python (85c) | tens of MB | Yes |
-| Clang/LLD (85d) | several hundred MB packed, ~1 GB unpacked — `<DISK_DELTA_TBD>` | **No — opt-in only** |
+| Clang/LLD (85d) | **≈125 MB** packed `.m3pkg` (130,541,744 B); ≈125 MB installed under `/usr` | Fits, but **opt-in only** |
 
-<!-- TODO(coordinator): replace <DISK_DELTA_TBD> with the measured Clang `.m3pkg`
-     install-size delta from a real opt-in build (packed `.m3pkg` size and the
-     unpacked /usr delta). The plan only says "several hundred MB packed, ~1 GB
-     unpacked"; do not quote a precise number until a real build measures it. -->
+The Clang numbers come from a real opt-in build of LLVM 18.1.8 (`MinSizeRel`,
+X86-only, static, stripped): the sealed `clang.m3pkg` is **130,541,744 bytes
+(≈125 MB)**, and because the `.m3pkg` format is **uncompressed** (raw bytes + a
+per-entry SHA-256 index, no deflate), `pkg install clang` writes a comparable
+≈125 MB under `/usr` — the stripped static `clang` + `lld` plus the bundled
+musl + libc++ sysroot and the Clang resource headers/builtins.
 
-The default (no-Clang) image stays 1 GB: 85a measured the six-port retrofit at
-~34 MB, and git + Python fit comfortably alongside it. The **only** component that
-would overflow 1 GB is the opt-in Clang artifact, so growing `DISK_SIZE` is gated
-on that feature — the default image is never enlarged for a tool most users will
-not install.
+A ≈125 MB install does technically fit the default 1 GB data disk — but the
+artifact is kept **opt-in (`M3OS_WITH_CLANG`)** anyway, because the repo `.m3pkg`
+and the unpacked install coexist (≈250 MB of data-disk footprint after install),
+and a quarter-gigabyte of compiler is dead weight on every default image for a
+tool most users will not install. By contrast, 85a measured the six-port retrofit
+at ~34 MB and git + Python are each tens of MB, so they ride the default image
+without a second thought. (Compressing the `.m3pkg` payload — a real size win for
+this artifact — is tracked in the VFS bulk-I/O phase.)
 
 The **host-build** memory story is the real reason the cache exists. The
 ncurses-class ports and git/Python build in well under 1 GB of host RAM. The
