@@ -105,12 +105,22 @@ the task list. Each was a real, general fix (not a clang hack):
    This was THE compile blocker. `pread64` is race-free (offset-based per backend:
    `vfs_service_read` for `/usr` VFS files, `kernel_read_fd_at` otherwise).
 5. **`getrlimit` (97) + `prlimit64` (302)** — were ENOSYS; report generous limits.
+6. **VFS `fstat` inode identity** (`syscall/mod.rs`, `process/mod.rs`) — the
+   *official* gate (fresh disk + real install) failed intermittently with clang
+   `error: redefinition of 'main'`: `fstat`-by-fd returned `st_ino = 0` for
+   `vfs_server`-backed files while `fstatat`-by-path returned the real inode, so
+   clang's `(st_dev, st_ino)` file-dedup collapsed `<stdio.h>` onto the open main
+   source → recursive self-include. Fixed by resolving the real ext2 inode at
+   VFS open and reporting it as `st_ino`. Full root-cause + systemic findings:
+   `docs/post-mortems/2026-06-06-vfs-fstat-inode-identity-and-ext2-dual-impl.md`;
+   the systemic audit is tracked as **Phase 93**.
 
-**Result — clang fully works in-OS.** A fast-iter gate run (`PASSED, 22 steps, 250s`)
-validated, inside m3OS: `clang --version`=18.1.8, `clang -print-resource-dir`
+**Result — clang fully works in-OS, validated end-to-end.** Final validation: a
+fresh-disk `pkg install clang` + **9 in-OS compiles** (`M3OS_CLANG_STRESS`) all
+passed with **zero** recurrences — `clang --version`=18.1.8, `-print-resource-dir`
 =`/usr/lib/clang/18`, C compile+link(lld)+run (`CLANG_C_OK`), C++ compile+link
-(libc++)+run (`CLANG_CPP_OK`), and `-fuse-ld=lld`. The official gate (fresh disk +
-real `pkg install clang` + the full flow) is running as the definitive acceptance.
+(libc++)+run (`CLANG_CPP_OK`), `-fuse-ld=lld`, and 6 stress C compiles. The
+inode fix is deterministic (the bug was ~1-in-2-3 before it; 9/9 after).
 
 ## Rescue history
 - **clang-smoke timeout (install).** Trigger: step-14 install exceeded the 900 s

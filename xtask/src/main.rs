@@ -14333,6 +14333,28 @@ fn clang_smoke_steps() -> Vec<SmokeStep> {
         label: "clang-smoke: LLD-linked binary ran",
     });
 
+    // Phase 85d validation knob: under M3OS_CLANG_STRESS, repeat the C compile
+    // several more times. The flaky VFS-fstat-inode dedup mixup — clang's
+    // FileManager collapsing `<stdio.h>` onto the already-open main source
+    // (st_ino=0 collision) → recursive self-include → "redefinition of main" —
+    // hit ~1 compile in 2-3. Extra compiles shake out any residual flake in ONE
+    // run; with the inode fix every compile must succeed.
+    if std::env::var("M3OS_CLANG_STRESS").is_ok() {
+        for _ in 0..6 {
+            steps.push(SmokeStep::Send {
+                input: "clang -O2 /usr/src/hello.c -o /tmp/hstress && /tmp/hstress\n",
+                label: "clang-smoke: stress compile",
+            });
+            steps.push(SmokeStep::WaitPassOrFail {
+                pass_pattern: "CLANG_C_OK hello, world",
+                fail_prefix: "fatal error:",
+                timeout_secs: 600,
+                label: "clang-smoke: stress compile result",
+                exit_code_on_fail: SMOKE_EXIT_CLANG_SMOKE_FAILED,
+            });
+        }
+    }
+
     steps
 }
 

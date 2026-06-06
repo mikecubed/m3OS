@@ -7868,10 +7868,21 @@ fn vfs_service_open(path: &str, flags: u64) -> u64 {
     let packed = reply.data[0];
     let handle = packed & 0xFFFF_FFFF;
     let file_size = (packed >> 32) as u32;
+    // Resolve the real ext2 inode for this path so `fstat` can report a stable,
+    // UNIQUE `st_ino` (see FdBackend::VfsService::inode). The kernel ext2 is
+    // serialized + coherent and shares the disk with the vfs_server, so it yields
+    // the same inode `fstatat`/`vfs_service_stat_path` report. `resolve_path`
+    // tolerates the leading '/'. 0 (unresolved) preserves the old behaviour.
+    let inode = crate::fs::ext2::EXT2_VOLUME
+        .lock()
+        .as_ref()
+        .and_then(|v| v.resolve_path(path).ok())
+        .unwrap_or(0);
     let entry = FdEntry {
         backend: FdBackend::VfsService {
             service_handle: handle,
             file_size,
+            inode,
         },
         offset: 0,
         readable: true,
@@ -9217,7 +9228,15 @@ pub(super) fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
             (0x8000 | m as u32, u, g, fallback_size, 0)
         }
         FdBackend::Epoll { .. } => (0x2000 | 0o600, 0, 0, 0, 0),
-        FdBackend::VfsService { file_size, .. } => (0x8000 | 0o444, 0, 0, *file_size as u64, 0),
+        FdBackend::VfsService {
+            file_size, inode, ..
+        } => {
+            // Report the real ext2 inode as st_ino so clang's FileManager (which
+            // dedups by (st_dev, st_ino)) does not collapse distinct VFS files
+            // onto one entry. Must match fstatat for the same path.
+            stat[8..16].copy_from_slice(&(*inode as u64).to_ne_bytes());
+            (0x8000 | 0o444, 0, 0, *file_size as u64, 0)
+        }
     };
 
     stat[24..28].copy_from_slice(&mode.to_ne_bytes());
