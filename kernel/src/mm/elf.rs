@@ -75,8 +75,16 @@ pub const STACK_PAGES: u64 = 64;
 /// Additional pages above this are demand-paged by the page fault handler
 /// when musl's TLS/TCB allocation writes above the initial RSP.
 const ABOVE_STACK_PAGES: u64 = 16;
-/// Lower bound for valid userspace virtual addresses (4 MiB, matching Linux).
-const USER_VADDR_MIN: u64 = 0x0040_0000;
+/// Lower bound for valid userspace virtual addresses (2 MiB). Lowered from 4 MiB
+/// in Phase 85d: LLD defaults its x86_64 `ET_EXEC` image base to **0x200000**
+/// (2 MiB), so the LLD-linked static `clang`/`lld` toolchain places its first
+/// PT_LOAD there — whereas GNU-ld bases at 0x400000 (4 MiB), where every prior
+/// binary loads. 2 MiB still leaves a generous unmapped null-deref guard (the low
+/// 2 MiB, 32x Linux's default `mmap_min_addr`), the per-process break (`BRK_BASE`
+/// = 8 GiB) and anonymous mmap base (128 GiB) sit far above any binary image, and
+/// existing 4 MiB-based binaries are unaffected (PIE images simply load 2 MiB
+/// lower, which is position-independent and benign).
+const USER_VADDR_MIN: u64 = 0x0020_0000;
 /// Upper bound (exclusive) for valid userspace virtual addresses (128 TiB canonical boundary).
 const USER_VADDR_MAX: u64 = 0x0000_8000_0000_0000;
 
