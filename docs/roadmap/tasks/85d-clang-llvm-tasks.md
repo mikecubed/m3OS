@@ -38,8 +38,8 @@
 **Why it matters:** Clang/LLD is the largest artifact and the one whose rebuild cost justifies all of 85a; building it via the standard port path + 85a cache is what makes repeat image builds free.
 
 **Acceptance:**
-- [ ] `build_llvm` runs a CMake cross-build via `musl_toolchain()` for the C/C++ compilers, `CMAKE_SYSROOT` at the m3OS musl sysroot, `LLVM_HOST_TRIPLE` for the m3OS target, `DESTDIR` staging.
-- [ ] The Portfile pins the LLVM version + SHA-256.
+- [x] `build_llvm` runs a CMake cross-build with `CMAKE_SYSROOT` at the assembled m3OS musl sysroot, `LLVM_HOST_TRIPLE`/`LLVM_DEFAULT_TARGET_TRIPLE`=`x86_64-linux-musl`, `DESTDIR` staging. **Deviation (maintainer-approved):** the cross-compiler is the **host `clang`** (`--target=x86_64-linux-musl`), not `musl_toolchain()` — `musl-tools` ships no C++ compiler and LLVM/Clang is C++. The shared musl plumbing is only used for `ar`/`ranlib` fallback.
+- [x] The Portfile pins the LLVM version (18.1.8) + SHA-256 (`0b58557a…2f2a`).
 
 ### A.2 — Size-minimized configuration
 
@@ -48,8 +48,8 @@
 **Why it matters:** the size levers are the difference between a few-hundred-MB and a multi-GB artifact, and a single target (`X86`) is the biggest lever.
 
 **Acceptance:**
-- [ ] CMake configures with `-DLLVM_ENABLE_PROJECTS="clang;lld" -DLLVM_ENABLE_RUNTIMES="libcxx;libcxxabi;libunwind" -DLLVM_TARGETS_TO_BUILD="X86" -DCMAKE_BUILD_TYPE=MinSizeRel -DLLVM_ENABLE_THREADS=OFF -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DCLANG_ENABLE_STATIC_ANALYZER=OFF`, statically linked.
-- [ ] `ninja clang lld` builds; both binaries are `install/strip`-ped; the musl sysroot (`libc.a`, CRT objects), Clang builtin headers, and `compiler-rt` builtins are bundled.
+- [x] CMake configures with all of `-DLLVM_ENABLE_PROJECTS="clang;lld" -DLLVM_TARGETS_TO_BUILD="X86" -DCMAKE_BUILD_TYPE=MinSizeRel -DLLVM_ENABLE_THREADS=OFF -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DCLANG_ENABLE_STATIC_ANALYZER=OFF` (+ `RTTI/EH/LIBXML2/LIBEDIT/EXAMPLES/UTILS=OFF`), statically linked. The C++ runtimes (`libcxx;libcxxabi;libunwind`) are built in a separate **Stage B** (runtimes-first) so LLVM's own C++ can target musl.
+- [x] `ninja clang lld` builds; both binaries are `install/strip`-ped (sealed `.m3pkg` strips ELF); the musl sysroot (`libc.a`, CRT objects), Clang builtin headers, and `compiler-rt` builtins are bundled (verified by `assert_llvm_layout` + the sealed 125 MB `.m3pkg`).
 
 ### A.3 — Resource-dir relocation
 
@@ -90,8 +90,8 @@
 **Why it matters:** the heavyweight artifact must not bloat default images; it is opt-in, and the 85a cache makes its repeat builds free.
 
 **Acceptance:**
-- [ ] `cargo xtask port build llvm` produces a `.m3pkg`; a second image build is a pkgcache hit with **zero** compiler invocations (the 85a payoff, proven on the heaviest artifact).
-- [ ] The Clang `.m3pkg` is bundled only when the opt-in image feature is set; default images omit it and the disk delta is documented.
+- [x] `cargo xtask port build llvm` produces a `.m3pkg` (130,541,744 B); the second build logged `PKGCACHE: hit … zero compiler invocations` (the 85a payoff, **proven on the heaviest artifact**).
+- [x] The Clang `.m3pkg` is bundled only when the opt-in `M3OS_WITH_CLANG` feature is set (bundled as `clang.{m3pkg,meta}`); default images omit it and the ≈125 MB disk delta is documented in `docs/85-cross-compiled-toolchains.md`.
 
 ### B.2 — C/C++ build validation gate
 
@@ -100,9 +100,9 @@
 **Why it matters:** proves Clang + LLD actually compile + link + run inside m3OS.
 
 **Acceptance:**
-- [ ] Inside m3OS: `clang -O2 /usr/src/hello.c -o hello && ./hello` prints "hello, world"; `clang++ /usr/src/hello.cpp` builds + runs (links the A.4 C++ runtime); `clang -fuse-ld=lld /usr/src/hello.c` links via LLD.
-- [ ] The `/usr/src/hello.c` + `/usr/src/hello.cpp` fixtures are written into the data disk via `populate_ext2_files`, with `cargo xtask clean` run to recreate the disk.
-- [ ] The gate is wired as an opt-in pre-push regression (`M3OS_CLANG_REGRESSION=1`) in `AGENTS.md`.
+- [ ] Inside m3OS: `clang -O2 /usr/src/hello.c -o hello && ./hello` prints "hello, world"; `clang++ /usr/src/hello.cpp` builds + runs (links the A.4 C++ runtime); `clang -fuse-ld=lld /usr/src/hello.c` links via LLD. _(In progress — `clang-smoke` rerun installing; install validated, in-OS compile pending. Host-side: the staged clang already compiled+linked+ran C and C++ via `validate_staged_clang`.)_
+- [x] The `/usr/src/hello.c` + `/usr/src/hello.cpp` fixtures are written into the data disk via `populate_ext2_files` (sentinels `CLANG_C_OK`/`CLANG_CPP_OK`); the `clang-smoke` gate force-recreates the data disk each run.
+- [x] The gate is wired as an opt-in pre-push regression (`M3OS_CLANG_REGRESSION=1`) in `AGENTS.md` + `.githooks/pre-push` (`--timeout 5400`).
 
 ---
 
@@ -118,8 +118,8 @@
 **Why it matters:** every phase ships a learning doc (the roadmap "Required Documentation for Every Phase" rule); this teaches the build-once packaging substrate, the relocation contract, the disk/RAM implications, and how git/Python/Clang fit the post-1.0 developer story.
 
 **Acceptance:**
-- [ ] `docs/85-cross-compiled-toolchains.md` exists, follows the learning-doc template, explains 85a's content-addressed cache + `.m3pkg` + offline `pkg`, and covers git/Python/Clang in learner-friendly terms with the disk/RAM budget.
-- [ ] It is linked from `docs/README.md`'s phase-aligned learning-docs table and links the four 85a–d design + task docs.
+- [x] `docs/85-cross-compiled-toolchains.md` exists, follows the learning-doc template, explains 85a's content-addressed cache + `.m3pkg` + offline `pkg`, and covers git/Python/Clang in learner-friendly terms with the disk/RAM budget (the Clang disk delta is the **measured** ≈125 MB).
+- [x] It is linked from `docs/README.md`'s phase-aligned learning-docs table and links the four 85a–d design + task docs.
 
 ### C.2 — Capability inventory + README finalization
 
@@ -131,8 +131,8 @@
 **Why it matters:** AGENTS.md is the always-loaded inventory and the README is the authoritative phase index; both must reflect the landed toolchain capability class.
 
 **Acceptance:**
-- [ ] An AGENTS.md capability bullet is added for the cross-compiled developer-toolchain + packaging class (a genuinely new capability class per the maintenance policy), with the kernel version line reading `0.85.3` and the `git`/`python`/`clang` opt-in gate rows present.
-- [ ] The `docs/roadmap/README.md` umbrella 85 row + 85a–d rows are flipped to Complete with their `0.85.x` versions.
+- [x] The AGENTS.md capability bullet now covers the cross-compiled developer-toolchain + packaging class incl. Clang (the existing **Package management** bullet was rewritten to fold in Clang + the new "on-device native C/C++ compiler" capability, per the maintenance policy's "prefer rewriting an existing bullet"), with the kernel version line reading `v0.85.3` and the `git`/`python`/`clang` opt-in gate rows present.
+- [x] The `docs/roadmap/README.md` umbrella 85 row + 85a–d rows are flipped to Complete with their `0.85.x` versions.
 
 ### C.3 — Bump kernel crate `0.85.2` → `0.85.3`
 
@@ -141,7 +141,7 @@
 **Why it matters:** the 85d cut is the final Phase 85 sub-phase and the family's release version.
 
 **Acceptance:**
-- [ ] `kernel/Cargo.toml` reads `0.85.3` (+ `Cargo.lock`); `cargo xtask check` clean; boot banner / `uname` report `0.85.3`.
+- [x] `kernel/Cargo.toml` reads `0.85.3` (+ `Cargo.lock`); `cargo xtask check` clean (confirmed: "clippy clean, formatting correct, … host tests pass; retpoline gate pass"); boot banner (`kernel/src/lib.rs` `Hello from kernel! v{CARGO_PKG_VERSION}`) + `uname` release/version + `/proc/version` all emit `0.85.3`.
 
 ---
 

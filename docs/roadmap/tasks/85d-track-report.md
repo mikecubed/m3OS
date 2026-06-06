@@ -41,8 +41,28 @@ run on branch `feat/phase-85d-clang-llvm`. Updated as tracks progress.
 - **Worktree:** isolated worktree, separate agent, background.
 - **State:** active (parallel agent).
 
+## Progress
+
+- **Track A — DONE + validated.** `cargo xtask port build llvm` cross-built static
+  clang+lld (LLVM 18.1.8) and self-validated (the staged clang compiled+linked+ran
+  C and C++ host-side). Sealed `clang.m3pkg` = **130,541,744 B (≈125 MB)**.
+- **Track B / B.1 — DONE + validated.** Second build = `PKGCACHE: hit … zero
+  compiler invocations` (the 85a payoff, on the heaviest artifact). Opt-in
+  `M3OS_WITH_CLANG` bundled `clang.m3pkg` into `/usr/pkg`.
+- **Track C — DONE + merged.** Learning doc (disk-delta corrected to measured
+  125 MB + host-clang-cross note), README links, roadmap rows; AGENTS.md bullet +
+  `v0.85.3` + gate row; kernel `0.85.3`; pre-push `M3OS_CLANG_REGRESSION`.
+- **B.2 — in progress (rerun).** First `clang-smoke` run timed out mid-install
+  (not a fault): the installer reads+SHA-verifies the 124 MiB `.m3pkg` (~10 min)
+  then writes ~1500 files over the ~200 KB/s VFS (~25 min). Raised step ceilings +
+  `--timeout 5400`; rerunning.
+
 ## Rescue history
-- (none)
+- **clang-smoke timeout (install).** Trigger: step-14 install exceeded the 900 s
+  ceiling while still writing files (verify ~10 min + bulk write ~15 min over the
+  slow VFS). Action: raised install→2400 s, version/resource-dir→600 s,
+  compiles→1500 s, gate `--timeout`→5400; rerun. Same-config rerun (no rebuild —
+  pkgcache hit). No agent rescue; coordinator-driven fix.
 
 ## Outcome measures (filled at batch close)
 - discovery-reuse: n/a (coordinator inline discovery)
