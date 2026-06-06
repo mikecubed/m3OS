@@ -14130,19 +14130,30 @@ fn cmd_clang_smoke(args: &SmokeBootArgs) {
 
     // Always rebuild the data disk so the freshly-bundled clang `.m3pkg` + the
     // /usr/src/hello.{c,cpp} fixtures are present and the package DB starts clean.
+    //
+    // Fast-iteration escape hatch (M3OS_CLANG_FAST_ITER=1): REUSE an existing disk
+    // that already has clang installed (from a prior run), so a kernel-side exec
+    // fix can be validated without re-paying the ~26-min in-OS install. Paired with
+    // clang_smoke_steps() skipping the `pkg install` steps. Not for CI — the
+    // committed gate always recreates the disk + exercises `pkg install clang`.
+    let fast_iter = std::env::var("M3OS_CLANG_FAST_ITER").is_ok();
     let disk_img = uefi_image.parent().unwrap().join("disk.img");
-    if disk_img.exists() {
-        let _ = fs::remove_file(&disk_img);
+    if fast_iter && disk_img.exists() {
+        println!("clang-smoke: M3OS_CLANG_FAST_ITER — reusing existing disk (skipping install)");
+    } else {
+        if disk_img.exists() {
+            let _ = fs::remove_file(&disk_img);
+        }
+        create_data_disk(
+            uefi_image.parent().unwrap(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false, // graphical_login — autologin / serial path
+        );
     }
-    create_data_disk(
-        uefi_image.parent().unwrap(),
-        false,
-        false,
-        false,
-        false,
-        false,
-        false, // graphical_login — autologin / serial path
-    );
 
     let ovmf = find_ovmf();
     let display_mode = if args.display {
@@ -14208,6 +14219,24 @@ fn clang_smoke_steps() -> Vec<SmokeStep> {
     steps.extend(boot_and_login_steps());
     steps.push(SmokeStep::Sleep { millis: 500 });
 
+    // Diagnostic mode (M3OS_CLANG_DIAG=1): boot + ONE verbose compile only — no
+    // install, no version/resource-dir — so a build-time M3OS_STRACE_COMM=clang
+    // trace stays small and pinpoints where clang aborts. Not a CI path.
+    if std::env::var("M3OS_CLANG_DIAG").is_ok() {
+        steps.push(SmokeStep::Send {
+            input: "clang -v -O2 /usr/src/hello.c -o /tmp/hello && /tmp/hello\n",
+            label: "clang-diag: verbose compile",
+        });
+        steps.push(SmokeStep::WaitPassOrFail {
+            pass_pattern: "CLANG_C_OK hello, world",
+            fail_prefix: "DIAGNEVERMATCH",
+            timeout_secs: 900,
+            label: "clang-diag: compile result",
+            exit_code_on_fail: SMOKE_EXIT_CLANG_SMOKE_FAILED,
+        });
+        return steps;
+    }
+
     // 1. Install clang from the bundled offline repo. clang has no runtime DEPS,
     //    so the solver installs it directly. The package is by far the largest in
     //    the tree (≈125 MB: a 64 MiB static clang + 38 MiB lld + the bundled
@@ -14218,17 +14247,21 @@ fn clang_smoke_steps() -> Vec<SmokeStep> {
     //    the bulk writes legitimately take ~25 min. Hence the very large ceiling;
     //    the global `--timeout` min-clamps every step. Intended to run via pre-push
     //    at `--timeout 5400` (this is a deliberately heavy opt-in gate).
-    steps.push(SmokeStep::Send {
-        input: "pkg install clang\n",
-        label: "clang-smoke: pkg install clang",
-    });
-    steps.push(SmokeStep::WaitPassOrFail {
-        pass_pattern: "pkg install: clang: OK",
-        fail_prefix: "pkg install: cannot",
-        timeout_secs: 2400,
-        label: "clang-smoke: clang installed from .m3pkg",
-        exit_code_on_fail: SMOKE_EXIT_CLANG_SMOKE_FAILED,
-    });
+    //    (Skipped under M3OS_CLANG_FAST_ITER, which reuses a disk where clang is
+    //    already installed — see cmd_clang_smoke.)
+    if std::env::var("M3OS_CLANG_FAST_ITER").is_err() {
+        steps.push(SmokeStep::Send {
+            input: "pkg install clang\n",
+            label: "clang-smoke: pkg install clang",
+        });
+        steps.push(SmokeStep::WaitPassOrFail {
+            pass_pattern: "pkg install: clang: OK",
+            fail_prefix: "pkg install: cannot",
+            timeout_secs: 2400,
+            label: "clang-smoke: clang installed from .m3pkg",
+            exit_code_on_fail: SMOKE_EXIT_CLANG_SMOKE_FAILED,
+        });
+    }
 
     // 2. clang resolves on PATH and reports the pinned version.
     steps.push(SmokeStep::Send {

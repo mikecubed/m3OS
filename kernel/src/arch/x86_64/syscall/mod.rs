@@ -1285,12 +1285,19 @@ mod syscall_nr {
     pub const FSTAT: u64 = 5;
     pub const LSTAT: u64 = 6;
     pub const LSEEK: u64 = 8;
+    // Phase 85d — positioned read/write. LLVM/clang reads source files (and
+    // writes outputs) via `pread64`/`pwrite64`, not the sequential read/write
+    // CPython uses, so these were the gap that blocked in-OS compilation.
+    pub const PREAD64: u64 = 17;
+    pub const PWRITE64: u64 = 18;
     pub const READV: u64 = 19;
     pub const WRITEV: u64 = 20;
     pub const ACCESS: u64 = 21;
     pub const DUP: u64 = 32;
     pub const DUP2: u64 = 33;
     pub const FCNTL: u64 = 72;
+    // Phase 85d — resource-limit queries (clang/musl probe RLIMIT_STACK etc.).
+    pub const GETRLIMIT: u64 = 97;
     pub const FSYNC: u64 = 74;
     pub const TRUNCATE: u64 = 76;
     pub const FTRUNCATE: u64 = 77;
@@ -1742,6 +1749,10 @@ pub extern "C" fn syscall_handler(
         // -- fs --
         READ => sys_linux_read(arg0, arg1, arg2),
         WRITE => sys_linux_write(arg0, arg1, arg2),
+        // Phase 85d — positioned I/O used by LLVM/clang.
+        PREAD64 => sys_linux_pread64(arg0, arg1, arg2, per_core_syscall_arg3()),
+        PWRITE64 => sys_linux_pwrite64(arg0, arg1, arg2, per_core_syscall_arg3()),
+        GETRLIMIT => sys_getrlimit(arg0, arg1),
         OPEN => sys_linux_open(arg0, arg1, arg2),
         CLOSE => sys_linux_close(arg0),
         STAT => sys_linux_fstatat(AT_FDCWD, arg0, arg1, 0),
@@ -1977,7 +1988,7 @@ pub extern "C" fn syscall_handler(
             sys_futex(arg0, arg1, arg2, val3)
         }
         SET_ROBUST_LIST => 0,
-        PRLIMIT64 => NEG_ENOSYS,
+        PRLIMIT64 => sys_prlimit64(arg0, arg1, arg2, per_core_syscall_arg3()),
         GETRANDOM => sys_getrandom(arg0, arg1, arg2),
         // -- m3OS custom --
         DEBUG_PRINT => sys_debug_print(arg0, arg1),
@@ -6518,6 +6529,129 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             result
         }
     }
+}
+
+/// Phase 85d — `pread64(fd, buf, count, offset)`: read `count` bytes from `fd` at
+/// file `offset` into `buf` WITHOUT advancing the fd position. LLVM/clang reads
+/// source files (and resource headers) this way — CPython uses sequential
+/// `read`, which is why python worked in-OS and clang did not. Backed by
+/// the ext2/tmpfs/fat32/ramdisk file backends (`kernel_read_fd_at`) AND the ring-3
+/// `VfsService` files clang opens under `/usr` (`vfs_service_read` — also
+/// offset-based). It reads at `offset` directly and NEVER mutates the fd
+/// position, so it is correct under concurrent access (unlike a
+/// seek/read/restore). A single non-VFS call is capped at 64 KiB (like `read`);
+/// callers loop on short reads.
+pub(super) fn sys_linux_pread64(fd: u64, buf_ptr: u64, count: u64, offset: u64) -> u64 {
+    let fd_us = fd as usize;
+    if fd_us >= MAX_FDS {
+        return NEG_EBADF;
+    }
+    let entry = match current_fd_entry(fd_us) {
+        Some(e) => e,
+        None => return NEG_EBADF,
+    };
+    if !entry.readable {
+        return NEG_EBADF;
+    }
+    match &entry.backend {
+        // The ring-3 VFS read is already offset-based and copies straight to the
+        // user buffer — no shared fd position to disturb.
+        FdBackend::VfsService { service_handle, .. } => {
+            vfs_service_read(*service_handle, offset as usize, buf_ptr, count as usize)
+        }
+        _ => {
+            let to_read = (count as usize).min(64 * 1024);
+            if to_read == 0 {
+                return 0;
+            }
+            let pid = crate::process::current_pid();
+            let mut kbuf = alloc::vec![0u8; to_read];
+            match kernel_read_fd_at(pid, fd_us, offset as usize, &mut kbuf) {
+                Ok(0) => 0,
+                Ok(n) => match UserSliceWo::new(buf_ptr, n)
+                    .and_then(|s| s.copy_from_kernel(&kbuf[..n]))
+                {
+                    Ok(()) => n as u64,
+                    Err(_) => NEG_EFAULT,
+                },
+                Err(e) => e as u64,
+            }
+        }
+    }
+}
+
+/// Phase 85d — `pwrite64(fd, buf, count, offset)`: write at `offset` without
+/// advancing the fd position. Implemented by temporarily seeking the fd to
+/// `offset`, delegating to the normal write path, then restoring the saved
+/// position. Single-writer semantics are sufficient for clang/lld's output
+/// writers; a concurrent writer racing the same fd's position is not a case the
+/// toolchain exercises.
+pub(super) fn sys_linux_pwrite64(fd: u64, buf_ptr: u64, count: u64, offset: u64) -> u64 {
+    let fd_us = fd as usize;
+    if fd_us >= MAX_FDS {
+        return NEG_EBADF;
+    }
+    let saved = match current_fd_entry(fd_us) {
+        Some(e) => e.offset,
+        None => return NEG_EBADF,
+    };
+    with_current_fd_mut(fd_us, |slot| {
+        if let Some(e) = slot {
+            e.offset = offset as usize;
+        }
+    });
+    let n = sys_linux_write(fd, buf_ptr, count);
+    with_current_fd_mut(fd_us, |slot| {
+        if let Some(e) = slot {
+            e.offset = saved;
+        }
+    });
+    n
+}
+
+/// Write a Linux `struct rlimit { rlim_cur, rlim_max }` (two `u64`) to `rlim_ptr`.
+/// m3OS does not enforce per-process resource limits, so it reports an
+/// effectively-unlimited value — except `RLIMIT_NOFILE`, bounded to the real
+/// `MAX_FDS` ceiling so callers see a truthful descriptor cap.
+fn write_rlimit(resource: u64, rlim_ptr: u64) -> u64 {
+    if rlim_ptr == 0 {
+        return NEG_EFAULT;
+    }
+    const RLIMIT_NOFILE: u64 = 7;
+    const RLIM_INFINITY: u64 = u64::MAX;
+    let (cur, max) = if resource == RLIMIT_NOFILE {
+        (MAX_FDS as u64, MAX_FDS as u64)
+    } else {
+        (RLIM_INFINITY, RLIM_INFINITY)
+    };
+    let mut buf = [0u8; 16];
+    buf[0..8].copy_from_slice(&cur.to_ne_bytes());
+    buf[8..16].copy_from_slice(&max.to_ne_bytes());
+    match UserSliceWo::new(rlim_ptr, 16).and_then(|s| s.copy_from_kernel(&buf)) {
+        Ok(()) => 0,
+        Err(_) => NEG_EFAULT,
+    }
+}
+
+/// Phase 85d — `getrlimit(resource, rlim)`. clang/musl probe RLIMIT_STACK /
+/// RLIMIT_NOFILE during startup; reporting generous limits is correct since m3OS
+/// does not enforce them.
+pub(super) fn sys_getrlimit(resource: u64, rlim_ptr: u64) -> u64 {
+    write_rlimit(resource, rlim_ptr)
+}
+
+/// Phase 85d — `prlimit64(pid, resource, new_rlim, old_rlim)`. m3OS does not
+/// enforce rlimits, so any `new_rlim` is accepted-and-ignored and, when
+/// `old_rlim` is non-null, the same generous limits `getrlimit` reports are
+/// written back. (musl routes get/setrlimit through prlimit64 on modern Linux.)
+pub(super) fn sys_prlimit64(_pid: u64, resource: u64, _new_rlim: u64, old_rlim: u64) -> u64 {
+    if old_rlim != 0 {
+        let r = write_rlimit(resource, old_rlim);
+        if (r as i64) < 0 {
+            return r;
+        }
+    }
+    0
 }
 
 // ---------------------------------------------------------------------------
