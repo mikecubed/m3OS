@@ -57,6 +57,37 @@ run on branch `feat/phase-85d-clang-llvm`. Updated as tracks progress.
   then writes ~1500 files over the ~200 KB/s VFS (~25 min). Raised step ceilings +
   `--timeout 5400`; rerunning.
 
+## BLOCKER — clang exec exceeds the kernel heap
+
+`clang-smoke` rerun: **install succeeded** (`pkg install: clang: OK` — the timeout
+fix worked), but the first `clang --version` failed to exec:
+```
+[exec] file too large (68103968 bytes > 33554432 limit): /usr/bin/clang-18
+[execve] file not found or rejected: /usr/bin/clang-18
+```
+Root cause: `sys_execve` → `read_file_from_disk` loads the **whole** binary into one
+kernel-heap `Vec`, capped at `max_page_backed_allocation_bytes()` = buddy
+`MAX_ORDER`(13) → **32 MiB**. The clang-18 binary is **~65 MiB**, which is also
+larger than the **entire** `HEAP_MAX_SIZE` = **64 MiB** kernel heap. So clang
+cannot be exec'd without a kernel change. Fix options: (1) a **streaming ELF
+loader** that reads PT_LOAD segments from disk straight into the mapped user pages
+(no giant kernel buffer — the per-page copy in `map_load_segment` is already
+page-by-page); (2) raise `HEAP_MAX_SIZE` + buddy `MAX_ORDER` so a 65 MiB read
+buffer fits (simpler, but fragile — needs the buddy to form a 128 MiB block — and
+wasteful); (3) land the completed work and defer in-OS execution to a kernel
+follow-up. **Resolved — maintainer chose the streaming loader (option 1):**
+- `kernel/src/mm/elf.rs` — an `ElfBytes` byte-source trait (the `&[u8]` impl is
+  byte-identical to the pre-85d path); `map_load_segment` reads each page through
+  it; `load_elf_streaming` loads a large **static ET_EXEC** by reading only the
+  ELF header + phdr table, then streaming each PT_LOAD page-by-page into the user
+  pages (no giant kernel buffer; rejects PT_INTERP/PT_DYNAMIC).
+- `kernel/src/arch/x86_64/syscall/mod.rs` — `DiskElfSource` (a 1 MiB-windowed,
+  ext2-backed `ElfBytes`); `open_exec_stream`; `sys_execve` streams when
+  `read_file_from_disk` returns E2BIG, gated to large binaries so existing exec is
+  untouched. `resolve_block` handles clang's double-indirect blocks.
+- Kernel compiles clean (`-Zbuild-std`). clang-smoke rerun in progress to validate
+  clang exec + in-OS compile end-to-end.
+
 ## Rescue history
 - **clang-smoke timeout (install).** Trigger: step-14 install exceeded the 900 s
   ceiling while still writing files (verify ~10 min + bulk write ~15 min over the
