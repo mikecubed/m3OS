@@ -1,6 +1,6 @@
 # Phase 85d — Clang/LLVM/LLD (+ Release): Task List
 
-**Status:** In progress (branch `feat/phase-85d-clang-llvm`)
+**Status:** Complete — all acceptance items met; `clang-smoke` validated end-to-end in-OS (kernel `0.85.3`, branch `feat/phase-85d-clang-llvm`)
 **Source Ref:** phase-85d
 **Depends on:** Phase 85a (Package & Build-Cache Infrastructure); 85b + 85c land first
 **Goal:** Host-cross-build a static Clang + LLD (X86-only, `MinSizeRel`), package it via the Phase 85a `.m3pkg` substrate behind an opt-in image feature, install it with `pkg install clang`, validate C/C++ sample builds inside m3OS — and cut the umbrella learning doc + capability inventory + README finalization that close out the Phase 85 family.

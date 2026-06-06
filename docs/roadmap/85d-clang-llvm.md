@@ -1,6 +1,6 @@
 # Phase 85d - Clang/LLVM/LLD (+ Release)
 
-**Status:** Planned
+**Status:** Implemented (kernel `0.85.3`; `clang-smoke` gate green — clang compiles + links + runs C/C++ in-OS)
 **Source Ref:** phase-85d
 **Depends on:** Phase 85a (Package & Build-Cache Infrastructure); 85b and 85c land first (smaller artifacts validate the substrate before the ~1 GB one)
 **Builds on:** Adds the largest toolchain on the Phase 85a substrate — a host-cross-built static Clang + LLD — and carries the umbrella "+ Release" items for the whole Phase 85 family (learning doc, capability inventory, README finalization).
