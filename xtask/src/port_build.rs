@@ -367,14 +367,17 @@ fn build_recipe_id(name: &str) -> &'static str {
         // the Stage-B runtimes config (self-contained libc++: abi + unwinder
         // merged) + the Stage-C size/target levers + the baked-in in-OS clang
         // defaults (lld/compiler-rt/libc++/libunwind/DEFAULT_SYSROOT) + the
-        // resource-dir + bundled-sysroot staging. The `clang-18.1.3` token pins
-        // the HOST compiler identity (the real cross-compiler — `toolchain_id()`
-        // only sees the musl-gcc wrapper, so the host clang is folded in here).
-        // Bump recipe-v whenever any of these change so the cached .m3pkg
-        // self-invalidates. (The pinned LLVM version + tarball SHA-256 are folded
-        // in separately via the Portfile digest.)
+        // resource-dir + bundled-sysroot staging. The `clang-host` token marks
+        // the recipe SHAPE (a host-clang cross build); the ACTUAL host compiler
+        // version is NOT pinned here — `toolchain_id()` only sees the musl-gcc
+        // wrapper, so `compute_port_key` folds the real host clang/clang++
+        // `--version` (via `host_cxx_toolchain_id`) into this port's key so two
+        // host clangs cannot collide on one cached `.m3pkg`. Bump recipe-v
+        // whenever the FLAGS below change so the cached .m3pkg self-invalidates.
+        // (The pinned LLVM version + tarball SHA-256 are folded in separately via
+        // the Portfile digest.)
         "llvm" => {
-            "host-clang-cross(clang-18.1.3;target=x86_64-linux-musl;-rtlib=compiler-rt \
+            "host-clang-cross(clang-host;target=x86_64-linux-musl;-rtlib=compiler-rt \
              -unwindlib=none -fuse-ld=lld);\
              stageB-runtimes(libcxx;libcxxabi;libunwind;compiler-rt-builtins;\
              MUSL_LIBC=ON;self-contained-libc++:STATICALLY_LINK_ABI+UNWINDER=ON);\
@@ -409,6 +412,38 @@ pub fn toolchain_id() -> String {
         })
         .unwrap_or_default();
     format!("{cc}|{version}")
+}
+
+/// Identity of the HOST clang/clang++ used to cross-build the `llvm` port
+/// (resolved exactly as [`build_llvm`] resolves them: `M3OS_LLVM_CLANG` /
+/// `M3OS_LLVM_CLANGXX`, else `clang` / `clang++` on PATH). musl-tools ships no
+/// C++ compiler, so the real cross-compiler for `llvm` is this host clang —
+/// which [`toolchain_id`] (the musl-gcc wrapper) cannot see. Folding its actual
+/// `--version` into the content key keeps the cache honest: artifacts built with
+/// different host clang versions get different keys instead of colliding (a stale
+/// cross-host pkgcache hit). Best-effort: each resolved compiler's name plus its
+/// reported version line (empty when the compiler is absent — a machine that
+/// cannot build `llvm` also cannot legitimately seal its `.m3pkg`).
+pub fn host_cxx_toolchain_id() -> String {
+    let first_version_line = |cc: &str| -> String {
+        Command::new(cc)
+            .arg("--version")
+            .output()
+            .ok()
+            .and_then(|o| {
+                String::from_utf8(o.stdout)
+                    .ok()
+                    .and_then(|s| s.lines().next().map(|l| l.to_string()))
+            })
+            .unwrap_or_default()
+    };
+    let clang = std::env::var("M3OS_LLVM_CLANG").unwrap_or_else(|_| "clang".to_string());
+    let clangxx = std::env::var("M3OS_LLVM_CLANGXX").unwrap_or_else(|_| "clang++".to_string());
+    format!(
+        "{clang}|{}|{clangxx}|{}",
+        first_version_line(&clang),
+        first_version_line(&clangxx)
+    )
 }
 
 /// Fetch the upstream tarball into `cache_dir/<basename>` if missing or
@@ -592,7 +627,17 @@ pub fn port_version(name: &str) -> Option<String> {
 /// package keys of its direct dependencies. Shared by the resolve-before-build
 /// path and [`pkgcache_artifact_path`] so the key is computed one way only.
 fn compute_port_key(name: &str, port_dir: &Path) -> Result<String, String> {
-    let tc = toolchain_id();
+    // The `llvm` port's real cross-compiler is the HOST clang (musl-tools has no
+    // C++ compiler), which `toolchain_id()` (the musl-gcc wrapper) does not see.
+    // Fold the actual host clang/clang++ `--version` into the key so two host
+    // clangs do not collide on one content-addressed `.m3pkg` (the static recipe
+    // token in `build_recipe_id` cannot carry a per-host version). Other ports are
+    // built entirely by the musl toolchain, so their key is unchanged.
+    let tc = if name == "llvm" {
+        format!("{}|host-cxx={}", toolchain_id(), host_cxx_toolchain_id())
+    } else {
+        toolchain_id()
+    };
     let dep_keys: Vec<String> = port_deps(name)
         .iter()
         .map(|dep| {

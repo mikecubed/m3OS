@@ -476,17 +476,18 @@ unsafe fn map_load_segment(
                 let _file_end = file_off
                     .checked_add(copy_len)
                     .ok_or(ElfError::TruncatedProgramHeader)?;
-                // Read the segment's file bytes for this page through the source —
-                // a slice copy for small binaries (byte-identical to pre-85d), or a
-                // buffered disk read when the image is streamed. `copy_len <= 4096`
-                // (the loop is page-bounded), so a single page-sized stack buffer
-                // suffices and no large kernel allocation is ever needed.
-                let mut page_buf = [0u8; 4096];
-                src.read_at(file_off, &mut page_buf[..copy_len])?;
-                // Offset within the frame.
+                // Read the segment's file bytes for this page DIRECTLY into the
+                // mapped frame — a slice copy for small binaries (byte-identical to
+                // pre-85d), or a buffered disk read when the image is streamed.
+                // `copy_len <= 4096` (the loop is page-bounded) and never needs a
+                // large kernel allocation; reading straight into `dst` avoids the
+                // extra per-page memcpy a temporary stack buffer would add (on every
+                // path, including the non-streaming `&[u8]` one). `read_at` writes
+                // exactly `copy_len` bytes and only on success — it returns before
+                // touching `dst` on error, and the frame is discarded on exec failure.
                 let frame_off = (copy_start - page_va_start) as usize;
                 let dst = core::slice::from_raw_parts_mut(frame_ptr.add(frame_off), copy_len);
-                dst.copy_from_slice(&page_buf[..copy_len]);
+                src.read_at(file_off, dst)?;
             }
             // BSS portion already zeroed by allocate_frame_zeroed.
         }

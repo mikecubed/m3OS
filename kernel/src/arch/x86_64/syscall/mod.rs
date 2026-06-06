@@ -7664,7 +7664,13 @@ fn open_exec_stream(path: &str) -> Result<DiskElfSource, u64> {
             }
         }
     }
-    Err(NEG_ENOENT)
+    // The sole caller invokes this only after `read_file_from_disk` returned
+    // `NEG_E2BIG` — i.e. the file provably exists but is too large to buffer. If
+    // streaming is unavailable (ext2 not mounted, a `/data/`/FAT32 or tmpfs path,
+    // or the ext2 lookup failed), the binary is still "found but too large", so
+    // surface E2BIG rather than ENOENT (which would misreport "not found" for a
+    // large binary on a non-ext2 mount). Matches this fn's documented contract.
+    Err(NEG_E2BIG)
 }
 
 /// Check if a path targets the tmpfs mount at `/tmp`.
