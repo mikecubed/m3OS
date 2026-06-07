@@ -7204,6 +7204,14 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 20,
         label: "guest/log: smoke runner verified syslog marker",
     });
+    // Phase 86a — /dev/urandom + /dev/random are served by the kernel ChaCha20
+    // DRBG (the legacy xorshift Prng was deleted). The smoke runner reads both
+    // device nodes and asserts a full, non-all-zero result.
+    steps.push(SmokeStep::Wait {
+        pattern: "SMOKE:csprng-devrandom:PASS",
+        timeout_secs: 20,
+        label: "guest/csprng-devrandom: /dev/urandom + /dev/random source the CSPRNG",
+    });
     // Phase 74 Track B.3 — page-grant round-trip regression. Boot-time
     // smoke that proves `sys_page_grant_send` + `sys_page_grant_recv`
     // actually move 1024 pages without copying any bytes.
@@ -15622,6 +15630,14 @@ fn populate_ext2_files(
     // Override the nameserver for a different deployment by editing /etc/resolv.conf.
     let resolv_conf_content = "nameserver 10.0.2.3\noptions timeout:5 attempts:3\n";
 
+    // Phase 86a Track C.1 — stage /etc/hosts so the musl resolver checks
+    // local names first (musl's getaddrinfo reads /etc/hosts before sending
+    // a DNS query).  The IPv6 localhost alias is included so AF_INET6-aware
+    // tools that happen to resolve "localhost" do not emit spurious NXDOMAIN
+    // queries; AAAA resolution for external names remains scoped out (Phase 89).
+    let etc_hosts_content = "127.0.0.1\tlocalhost\n\
+                             ::1\tlocalhost ip6-localhost\n";
+
     // Phase 85b — a minimal system `/etc/gitconfig` so a freshly-installed git
     // has a commit identity (fresh git aborts `git commit` with "Author identity
     // unknown" otherwise) and a deterministic default branch. With `prefix=/usr`
@@ -16112,6 +16128,7 @@ fn populate_ext2_files(
     let smoke_mode_tmp = output_dir.join("_tmp_smoke_mode");
     let empty_tmp = output_dir.join("_tmp_empty");
     let resolv_conf_tmp = output_dir.join("_tmp_resolv_conf");
+    let etc_hosts_tmp = output_dir.join("_tmp_etc_hosts");
     let gitconfig_tmp = output_dir.join("_tmp_gitconfig");
     let fibonacci_py_tmp = output_dir.join("_tmp_fibonacci_py");
     let hello_c_tmp = output_dir.join("_tmp_hello_c");
@@ -16120,6 +16137,7 @@ fn populate_ext2_files(
     fs::write(&shadow_tmp, shadow_content).expect("write temp shadow");
     fs::write(&group_tmp, group_content).expect("write temp group");
     fs::write(&resolv_conf_tmp, resolv_conf_content).expect("write temp resolv.conf");
+    fs::write(&etc_hosts_tmp, etc_hosts_content).expect("write temp etc/hosts");
     fs::write(&gitconfig_tmp, gitconfig_content).expect("write temp gitconfig");
     fs::write(&fibonacci_py_tmp, fibonacci_py_content).expect("write temp fibonacci.py");
     fs::write(&hello_c_tmp, hello_c_content).expect("write temp hello.c");
@@ -16548,6 +16566,10 @@ fn populate_ext2_files(
          sif etc/resolv.conf mode 0x81A4\n\
          sif etc/resolv.conf uid 0\n\
          sif etc/resolv.conf gid 0\n\
+         write \"{etc_hosts}\" etc/hosts\n\
+         sif etc/hosts mode 0x81A4\n\
+         sif etc/hosts uid 0\n\
+         sif etc/hosts gid 0\n\
          write \"{gitconfig}\" etc/gitconfig\n\
          sif etc/gitconfig mode 0x81A4\n\
          sif etc/gitconfig uid 0\n\
@@ -16813,6 +16835,7 @@ fn populate_ext2_files(
         shadow = shadow_tmp.display(),
         group = group_tmp.display(),
         resolv_conf = resolv_conf_tmp.display(),
+        etc_hosts = etc_hosts_tmp.display(),
         gitconfig = gitconfig_tmp.display(),
         sshd_conf = sshd_conf_tmp.display(),
         telnetd_cmds = telnetd_cmds,
@@ -16896,6 +16919,8 @@ fn populate_ext2_files(
     let _ = fs::remove_file(&passwd_tmp);
     let _ = fs::remove_file(&shadow_tmp);
     let _ = fs::remove_file(&group_tmp);
+    let _ = fs::remove_file(&resolv_conf_tmp);
+    let _ = fs::remove_file(&etc_hosts_tmp);
     let _ = fs::remove_file(&gitconfig_tmp);
     let _ = fs::remove_file(&fibonacci_py_tmp);
     let _ = fs::remove_file(&hello_c_tmp);
@@ -17538,7 +17563,11 @@ fn populate_phase_69d_ports(part_path: &Path, workspace_root: &Path) {
     // under `/` from the artifact. The artifact only exists once the git port
     // has been built (the gate does so first); on a routine image build it is
     // absent and this is a no-op, so nothing regresses.
-    const BUNDLE_ONLY_PORTS: &[&str] = &["git", "python"];
+    // Phase 86a Track C.2 — ca-certificates is bundle-only: it installs to
+    // /etc/ssl/certs/ca-certificates.crt (not /usr/local), so it is NOT
+    // pre-installed at boot.  86c consumers (curl/git transport) `pkg install
+    // ca-certificates` from the bundled /usr/pkg/ offline repo on first use.
+    const BUNDLE_ONLY_PORTS: &[&str] = &["git", "python", "ca-certificates"];
     for port in BUNDLE_ONLY_PORTS {
         let Ok(artifact) = port_build::pkgcache_artifact_path(port) else {
             continue;

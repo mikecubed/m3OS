@@ -202,6 +202,16 @@ fn program_main(_args: &[&str]) -> i32 {
     }
     pass("log");
 
+    // Phase 86a — /dev/urandom + /dev/random are served by the kernel ChaCha20
+    // DRBG (FdBackend::DevUrandom); the legacy xorshift Prng was deleted. Prove
+    // a read returns the full request and is not all-zero (a stuck/zero source
+    // or a short read would fail here).
+    begin("csprng-devrandom");
+    if let Err(code) = verify_dev_random_nonzero() {
+        return code;
+    }
+    pass("csprng-devrandom");
+
     // Phase 74 Track B.3 — page-grant round-trip regression. Validates
     // that `sys_page_grant_send` + `sys_page_grant_recv` actually move
     // 1024 pages without copying any bytes and that the consume side is
@@ -874,6 +884,34 @@ fn file_contains(path: &[u8], needle: &[u8]) -> Result<bool, ()> {
     }
     let _ = close(fd);
     Ok(false)
+}
+
+/// Phase 86a: assert `/dev/urandom` and `/dev/random` both serve the kernel
+/// ChaCha20 DRBG. Each must return the full request length with non-all-zero
+/// content; a short read or an all-zero buffer (a stuck or unwired source)
+/// fails the gate.
+fn verify_dev_random_nonzero() -> Result<(), i32> {
+    verify_one_random_node(b"/dev/urandom\0")?;
+    verify_one_random_node(b"/dev/random\0")?;
+    Ok(())
+}
+
+fn verify_one_random_node(path: &[u8]) -> Result<(), i32> {
+    let fd = open(path, O_RDONLY, 0);
+    if fd < 0 {
+        return Err(fail("csprng-devrandom", "open failed", 1));
+    }
+    let fd = fd as i32;
+    let mut buf = [0u8; 64];
+    let n = read(fd, &mut buf);
+    let _ = close(fd);
+    if n != buf.len() as isize {
+        return Err(fail("csprng-devrandom", "short read", 1));
+    }
+    if buf.iter().all(|&b| b == 0) {
+        return Err(fail("csprng-devrandom", "all-zero output", 1));
+    }
+    Ok(())
 }
 
 fn run_command_expect_success(
