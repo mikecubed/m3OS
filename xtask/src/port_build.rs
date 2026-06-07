@@ -393,8 +393,9 @@ fn build_recipe_id(name: &str) -> &'static str {
              recipe-v=1"
         }
         // Phase 86b — dropbear's static client-only build. The identity is the
-        // `PROGRAMS=dbclient` single-program build + the static/no-zlib/no-harden
-        // configure flag set + the bundled-libtom software crypto + the
+        // `PROGRAMS=dbclient` single-program build + the no-zlib/no-harden
+        // configure flag set (the static link is forced by `-static` LDFLAGS +
+        // `--disable-harden`) + the bundled-libtom software crypto + the
         // post-install stage shape (prune the manpage, add the `ssh` copy of
         // `dbclient` so both names land on PATH). Bump recipe-v whenever any of
         // these change so the cached `.m3pkg` self-invalidates. (The pinned
@@ -402,11 +403,11 @@ fn build_recipe_id(name: &str) -> &'static str {
         // digest.)
         "dropbear" => {
             "client-only(make PROGRAMS=dbclient);\
-             configure(--enable-static --disable-zlib --disable-harden \
+             configure(--disable-zlib --disable-harden \
              --enable-bundled-libtom --disable-syslog --disable-lastlog \
              --disable-utmp --disable-utmpx --disable-wtmp --disable-wtmpx \
-             --host=x86_64-linux-musl --prefix=/usr);cflags:-O2;\
-             stage=prune(share/man)+ssh-copy(/usr/bin/ssh<-dbclient);recipe-v=1"
+             --host=x86_64-linux-musl --prefix=/usr);cflags:-O2;ldflags:-static;\
+             stage=prune(share/man)+ssh-copy(/usr/bin/ssh<-dbclient);recipe-v=2"
         }
         _ => "",
     }
@@ -1702,13 +1703,15 @@ fn build_machine_triple() -> String {
 ///
 /// CLIENT-ONLY (`make PROGRAMS=dbclient`): only dropbear's `dbclient` is built —
 /// not the `dropbear` server / `dropbearkey` / `dropbearconvert` — keeping the
-/// artifact a single ~250 KB static binary. The bundled libtomcrypt/libtommath
-/// software crypto is built pure-C (no x86 ASM): the SIMD-off contract. zlib is
-/// disabled (`--disable-zlib`) — SSH compression is optional and GitHub accepts
-/// `none`, so the client has no runtime dependency. `--disable-harden` drops the
-/// PIE flags that conflict with `-static` on the musl cross; the login
-/// bookkeeping (`syslog`/`utmp`/`wtmp`/`lastlog`) a client never uses is disabled
-/// too (musl provides none of it).
+/// artifact a single ~250 KB static binary. `--enable-bundled-libtom` uses
+/// dropbear's vendored libtomcrypt/libtommath software crypto, so the client
+/// links no system crypto library and stays dependency-free. zlib is disabled
+/// (`--disable-zlib`) — SSH compression is optional and GitHub accepts `none`, so
+/// the client has no runtime dependency. The static link is forced by `-static`
+/// in LDFLAGS plus `--disable-harden` (which drops the `-pie` flags that conflict
+/// with `-static` on the musl cross), the same mechanism the `git` port uses; the
+/// login bookkeeping (`syslog`/`utmp`/`wtmp`/`lastlog`) a client never uses is
+/// disabled too (musl provides none of it).
 ///
 /// Post-install the manpage is pruned and a second copy of `dbclient` is laid
 /// down as `/usr/bin/ssh`, so both the dropbear name (`dbclient -y/-i/-p`, used
@@ -1733,15 +1736,18 @@ fn build_dropbear(
     };
 
     // ./configure — static, client-suitable, no optional deps. The cross is
-    // driven by CC/AR/RANLIB + --host; the bundled libtom* software crypto is
-    // built pure-C (no x86 ASM) for the SIMD-off contract.
+    // driven by CC/AR/RANLIB + --host. The static link comes from `-static` in
+    // LDFLAGS + `--disable-harden` (which drops the conflicting `-pie`), the same
+    // mechanism the `git` port uses; dropbear's configure has no `--enable-static`
+    // knob. `--enable-bundled-libtom` uses dropbear's vendored libtomcrypt /
+    // libtommath so the client needs no system crypto library and stays
+    // dependency-free (DEPS= empty).
     let mut configure_cmd = Command::new("sh");
     configure_cmd
         .current_dir(src)
         .arg("./configure")
         .arg("--host=x86_64-linux-musl")
         .arg("--prefix=/usr")
-        .arg("--enable-static")
         .arg("--disable-zlib")
         .arg("--disable-harden")
         .arg("--enable-bundled-libtom")
@@ -1778,6 +1784,22 @@ fn build_dropbear(
     let dbclient = stage_prefix.join("bin/dbclient");
     if !dbclient.exists() {
         return Err(format!("dropbear build missing {}", dbclient.display()));
+    }
+
+    // The client MUST be static: m3OS's `ld-musl` is a custom loader with no real
+    // `libc.so`, so a dynamic build would carry a PT_INTERP referencing
+    // `/lib/ld-musl-x86_64.so.1` and fault at startup. A static musl ELF embeds
+    // libc and never names the loader, so the absence of that interp string is a
+    // direct proof of `-static` (the same guard `build_python` uses). This makes
+    // the static link verified-by-construction at build time, independent of the
+    // opt-in QEMU smoke — so a regression in the LDFLAGS=-static + --disable-harden
+    // mechanism fails the build immediately rather than at runtime on-device.
+    if binary_contains(&dbclient, b"/lib/ld-musl-x86_64.so.1")? {
+        return Err(format!(
+            "dropbear build: {} references the dynamic loader — `-static` did not take \
+             effect (m3OS's ld-musl has no real libc.so, so a dynamic dbclient cannot run)",
+            dbclient.display()
+        ));
     }
 
     // Client-only contract: the server half must NOT have been built. Its
@@ -2927,19 +2949,21 @@ fn assert_python_layout(stage: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Substring search over a file's raw bytes. Used by [`build_git`] to assert
-/// the *absence* of libcurl / OpenSSL API symbols in the built binary.
+/// Substring search over a file's raw bytes. Used to assert the *absence* of
+/// forbidden byte sequences in a built binary: libcurl / OpenSSL API symbols
+/// ([`build_git`]) and the dynamic-loader path that betrays a non-static link
+/// ([`build_python`], [`build_dropbear`]).
 ///
 /// This guard **fails closed**: a read failure returns `Err`, which the caller
-/// propagates as a build error. Returning `Ok(false)` ("symbol absent") on an
-/// unreadable file would silently weaken the NO_CURL/NO_OPENSSL assertion — the
-/// build would pass without ever proving the forbidden symbols are gone. The
-/// caller already verified the binary exists, so a read failure here is a
-/// genuine anomaly worth aborting on rather than skipping the check.
+/// propagates as a build error. Returning `Ok(false)` ("needle absent") on an
+/// unreadable file would silently weaken the assertion — the build would pass
+/// without ever proving the forbidden bytes are gone. The caller already
+/// verified the binary exists, so a read failure here is a genuine anomaly worth
+/// aborting on rather than skipping the check.
 fn binary_contains(path: &Path, needle: &[u8]) -> Result<bool, String> {
     let bytes = fs::read(path).map_err(|e| {
         format!(
-            "git build: cannot read {} to verify NO_CURL/NO_OPENSSL: {e}",
+            "binary_contains: cannot read {} to verify: {e}",
             path.display()
         )
     })?;

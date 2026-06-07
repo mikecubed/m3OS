@@ -62,7 +62,7 @@ TOFU and zero new harness. The dropbear branch of B/C was implemented.
 
 | Gate | Result |
 |---|---|
-| `cargo xtask port build dropbear` | ✅ `produced /usr/bin/dbclient + /usr/bin/ssh (static)` → sealed `…171f4d1c….m3pkg` (653 658 bytes); stripped binary runs `Dropbear v2024.86` |
+| `cargo xtask port build dropbear` | ✅ `produced /usr/bin/dbclient + /usr/bin/ssh (static)` → sealed a static `.m3pkg` (≈653 KB; the build's static guard confirms no dynamic-loader reference, i.e. no `PT_INTERP`); stripped binary runs `Dropbear v2024.86` |
 | `cargo xtask port build dropbear` (re-run) | ✅ `pkgcache hit … zero compiler invocations` |
 | `cargo xtask check` | ✅ `clippy clean, formatting correct, … retpoline gate pass`; kernel compiles as **v0.86.1** |
 | `cargo xtask git-ssh-smoke --timeout 600` | ✅ `PASSED core (22 steps in 150s)` — `pkg install: ssh: OK`, `pkg install: git: OK` (git reused, not rebuilt), `dbclient -V`/`ssh -V` → `Dropbear v2024.86` on m3OS, seeded GitHub ed25519 key round-trips the VFS; live clone **SKIPPED** (net=false clone=false) with the documented NOTE |

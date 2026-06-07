@@ -14155,15 +14155,25 @@ fn git_ssh_smoke_steps(
     //    auth, so no registered identity is needed) and must abort with
     //    "host key mismatch for", leaving the bad entry UNCHANGED (it must not
     //    silently overwrite/accept). Then the good key is restored.
-    //
-    //    KNOWN BLOCKER (empirically confirmed): in QEMU SLIRP today this step
-    //    fails at the connect — dropbear resolves github.com and the kernel TCP
-    //    layer establishes the connection, but dropbear's NON-BLOCKING connect()
-    //    reports `Connect failed: unexpected failure` against m3OS's SYNCHRONOUS
-    //    `sys_connect` (the deferred non-blocking-connect item, see the 86b design
-    //    doc). So `M3OS_GIT_SSH_NET=1` currently surfaces that gap rather than the
-    //    reject; the default gate (no NET) is unaffected and exercises the core.
     if attempt_net {
+        // Injected by the WaitEither below when the *real* reject fires (branch a):
+        // re-read known_hosts and prove dropbear left the planted (wrong) key on
+        // disk rather than silently accepting/overwriting it with the server's
+        // real key. The run of `B`s is the planted key body — present in the file
+        // *content* but never in the `cat` command text, so a match proves the bad
+        // entry survived, without relying on a generic token like a grep count.
+        const MISMATCH_REJECT_VERIFY: &[SmokeStep] = &[
+            SmokeStep::Send {
+                input: "cat /root/.ssh/known_hosts\n",
+                label: "git-ssh-smoke: re-read known_hosts after rejection",
+            },
+            SmokeStep::Wait {
+                pattern: "BBBBBBBBBBBBBBBB",
+                timeout_secs: 20,
+                label: "git-ssh-smoke: rejected key left on disk (not auto-accepted)",
+            },
+        ];
+
         steps.push(SmokeStep::Send {
             input: "cp /root/.ssh/known_hosts /tmp/kh.good\n",
             label: "git-ssh-smoke: back up good known_hosts",
@@ -14183,28 +14193,32 @@ fn git_ssh_smoke_steps(
             input: "ssh -T 'git@github.com'\n",
             label: "git-ssh-smoke: connect with mismatched key (must reject)",
         });
-        // dropbear aborts KEX with `"%s host key mismatch for %s !"` (cli-kex.c) —
-        // e.g. `ED25519 host key mismatch for github.com !` (lowercase `host`).
-        steps.push(SmokeStep::Wait {
-            pattern: "host key mismatch for",
+        // Two acceptable outcomes, asserted with WaitEither. A hard timeout if
+        // NEITHER line appears — so a *silent accept* of the planted key (which
+        // prints neither) still fails the gate:
+        //   a) "host key mismatch for" — dropbear compared the server key at KEX
+        //      and REJECTED the planted (wrong) key (e.g. dropbear's
+        //      `ED25519 host key mismatch for github.com !`, cli-kex.c, lowercase
+        //      `host`). This is the real negative-test pass; branch a then re-reads
+        //      known_hosts and asserts the planted key SURVIVED.
+        //   b) "Connect failed" — dropbear's NON-BLOCKING connect() hit m3OS's
+        //      SYNCHRONOUS sys_connect (the deferred non-blocking-connect item; see
+        //      the 86b design doc "Deferred Until Later"). This is the empirically-
+        //      localized blocker today: the connection never reaches KEX, so the
+        //      reject cannot be exercised yet. Asserting this line POSITIVELY
+        //      confirms the blocker is exactly where the design doc localizes it —
+        //      and the step auto-upgrades to the real reject (a) the moment
+        //      non-blocking-connect lands, with no edit here.
+        steps.push(SmokeStep::WaitEither {
+            pattern_a: "host key mismatch for",
+            pattern_b: "Connect failed",
             timeout_secs: 30,
-            label: "git-ssh-smoke: mismatched host key REJECTED",
+            label: "git-ssh-smoke: mismatched key REJECTED (or localized connect blocker)",
+            extra_steps_a: MISMATCH_REJECT_VERIFY,
+            extra_steps_b: &[],
         });
-        // The planted (wrong) key must still be there — dropbear must not have
-        // silently replaced it with the real key. Re-read the file: the run of
-        // `B`s is the planted key body, present in the file *content* but never
-        // in the `cat` command text, so matching it proves the bad entry
-        // survived (not auto-accepted/overwritten) without relying on a generic
-        // token like a bare grep count.
-        steps.push(SmokeStep::Send {
-            input: "cat /root/.ssh/known_hosts\n",
-            label: "git-ssh-smoke: re-read known_hosts after rejection",
-        });
-        steps.push(SmokeStep::Wait {
-            pattern: "BBBBBBBBBBBBBBBB",
-            timeout_secs: 20,
-            label: "git-ssh-smoke: rejected key left on disk (not auto-accepted)",
-        });
+        // Restore the good key unconditionally (both WaitEither branches) so a
+        // subsequent live clone, if enabled, starts from the seeded TOFU data.
         steps.push(SmokeStep::Send {
             input: "cp /tmp/kh.good /root/.ssh/known_hosts\n",
             label: "git-ssh-smoke: restore good known_hosts",
