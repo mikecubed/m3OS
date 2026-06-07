@@ -179,7 +179,7 @@ Required wiring in every port `build_*` function:
 3. **Pass `--host=x86_64-linux-musl`** to `./configure` so autotools picks the correct cross triple.
 4. **Use the `(cc, ar, ranlib)` tuple from `musl_toolchain()`** for `CC` / `AR` / `RANLIB` — the tuple's `ar`/`ranlib` already fall back to host `ar`/`ranlib` when the cross variants are absent (static archives are ELF-target-agnostic so this is safe).
 
-To register a new port: add the name to `PORTS` in `xtask/src/main.rs:10792`, add it to `match name` dispatch in `xtask/src/port_build.rs:port_build` (~line 366), implement `build_<name>` following the pattern above, and add the resulting binary path to `tui_app_smoke_steps` if the port participates in the gate.
+To register a new port: add the name to `PORTS` in `xtask/src/main.rs` (~line 17446), add it to the `match name` dispatch in `xtask/src/port_build.rs`'s `fn port_build` (~line 873), implement `build_<name>` following the pattern above, and add the resulting binary path to `tui_app_smoke_steps` if the port participates in the gate.
 
 ## Critical Conventions
 
