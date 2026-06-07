@@ -403,6 +403,26 @@ if [ "${M3OS_GIT_REGRESSION:-0}" = "1" ]; then
     fi
 fi
 
+# Phase 86b — git-over-SSH regression gate. Gated behind M3OS_GIT_SSH_REGRESSION=1
+# because it cross-compiles the static dropbear `ssh` client before booting QEMU.
+# The always-on core proves `pkg install ssh` + `pkg install git` (git reused
+# unchanged), the dropbear client runs on m3OS, and GitHub's host key is seeded.
+# The live `git clone ssh://git@github.com/...` and the host-key-mismatch reject
+# are opt-in (M3OS_GIT_SSH_NET=1 for the mismatch test; M3OS_GIT_SSH_KEY=<path>
+# for the clone) and skip-with-reason otherwise — so an unconfigured run still
+# exercises the transport plumbing without needing GitHub egress/creds. The long
+# (clang-class) timeout is a ceiling for the slow packfile transfer when the clone
+# is enabled; the core path finishes well under it. Set it on branches that touch
+# ports/util/dropbear, xtask's build_dropbear / ssh bundling / known_hosts
+# seeding, or the GIT_SSH_COMMAND wiring.
+if [ "${M3OS_GIT_SSH_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask git-ssh-smoke..."
+    if ! cargo xtask git-ssh-smoke --timeout 5400; then
+        echo "pre-push: cargo xtask git-ssh-smoke failed" >&2
+        exit 1
+    fi
+fi
+
 # Phase 85c — Python regression gate. Gated behind M3OS_PYTHON_REGRESSION=1
 # because it two-stage cross-compiles CPython (+ zlib + ncurses) — a
 # several-minute cold build — before booting QEMU and driving `pkg install

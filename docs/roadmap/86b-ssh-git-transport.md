@@ -85,6 +85,65 @@ The host key is **data with a rotation path**. dropbear's `dbclient` carries TOF
 
 - [Phase 86b Task List](./tasks/86b-ssh-git-transport-tasks.md)
 
+## Architecture Decision Record (ADR): dropbear vs sunset (Track A)
+
+**Status:** Accepted — **dropbear** (`dbclient`) is the 86b SSH client. The
+all-Rust `sunset` client is captured as the future migration path (see
+[`docs/appendix/sunset-local-fork.md`](../appendix/sunset-local-fork.md) §"A
+client harness budget").
+
+**Context.** git's SSH transport is "git speaks the protocol, an external program
+moves the bytes": git fork/execs an `ssh` binary (via `GIT_SSH_COMMAND`), so 86b
+needs exactly one new artifact — a static `ssh` client — and rebuilds no git code.
+The SIMD-off Rust userspace target rules out almost the entire Rust SSH field:
+russh, ssh-rs, thrussh, and ssh2/libssh2-FFI all hard-depend on `ring`/`aws-lc-rs`
+(asm/C crypto) or a C TLS library, none of which build on the no-SSE Rust
+userspace target. The two genuine candidates are **dropbear** (`dbclient`, mature
+C, self-contained `libtomcrypt` software crypto, built-in `known_hosts`/TOFU) and
+**sunset** (the only pure-RustCrypto SSH engine that fits — but **server-only
+today**: `Runner::new_client`/`open_client_session` (`sunset-local/src/runner.rs:73`/`:486`)
+have zero userspace callers, and host-key trust is only a `CheckHostkey` callback
+(`event.rs:40`) with **no `known_hosts` store**).
+
+**Scored matrix** (1 = poor … 5 = excellent; weight in parentheses):
+
+| Axis (weight) | dropbear | sunset | Notes |
+|---|---:|---:|---|
+| Drop-in subprocess fit (×3) | 5 | 2 | dropbear *is* an `ssh`-shaped binary git fork/execs unmodified; sunset is a library needing a from-scratch `userspace/ssh/` async harness over the `async-rt` `Reactor`. |
+| GitHub interop (×3) | 5 | 4 | Both satisfy the suite below; dropbear's interop is field-proven against GitHub, sunset's client path is unexercised. |
+| `known_hosts`/TOFU cost (×3) | 5 | 1 | dropbear has accept-on-first-use + reject-on-mismatch + the file format **built in**; sunset surfaces only `CheckHostkey` — the app must write the entire TOFU + `0600` file-I/O layer (`known_hosts.rs`). |
+| Binary size (×1) | 4 | 3 | dropbear static `dbclient` ≈ 300 KB stripped (proven: 382 KB unstripped → sealed `.m3pkg` 653 KB for the two-name copy); a Rust harness + crypto-lib is comparable-to-larger. |
+| Crypto reuse / audit surface (×2) | 3 | 5 | sunset reuses in-tree audited `crypto-lib` (the 86a CSPRNG feeds it); dropbear ships its own vetted `libtomcrypt` software crypto (a second, self-contained crypto stack). |
+| **Weighted total (max 60)** | **53** | **34** | dropbear wins decisively on the three ×3 axes that dominate 86b's cost. |
+
+**Decision.** Ship **dropbear** for 86b. It is +1 C port and **zero** new
+harness/TOFU code — it slots into the existing musl-toolchain port plumbing
+(`build_dropbear`, routed through `musl_toolchain()`/`musl_extra_ldflags_joined()`)
+exactly like `git`/Python/Clang, and its built-in `known_hosts` TOFU is the whole
+of Track B.2 on the consumer side. The **sunset budget**, by contrast, is a
+from-scratch async client harness (`userspace/ssh/` over `new_client` +
+`open_client_session`) **plus** a `known_hosts.rs` TOFU + file-I/O layer **plus**
+bundling — materially more code for 86b's "cheapest first secure transport" goal.
+The decision is reversible: sunset remains the documented all-Rust migration path
+once its client side and a TOFU store exist.
+
+**Interop contract** (satisfied by both candidates; dropbear's defaults already
+enable all of it, verified in the linked `chachapoly.o`/`ed25519.o`/`curve25519.o`
+objects):
+
+- **KEX:** `curve25519-sha256` (X25519 ephemeral, fed by the 86a CSPRNG).
+- **Host signature:** `ssh-ed25519` (GitHub's pinned ed25519 key).
+- **Ciphers:** `chacha20-poly1305@openssh.com` (primary) + `aes256-ctr` (fallback).
+- **MAC:** `hmac-sha2-256` (implicit AEAD MAC for chacha20-poly1305; explicit for aes256-ctr).
+
+**Risk note.** Interop rests on `chacha20-poly1305@openssh.com`: **dropbear has no
+AES-GCM**, and GitHub does not offer `aes*-ctr`+ETM in every config — but GitHub
+**does** accept `chacha20-poly1305@openssh.com`, which dropbear enables by default,
+so the single shared cipher carries the connection. AES-NI/AES-GCM acceleration of
+this path is deferred to [Phase 86f](./86-networking-and-github.md). If GitHub ever
+drops chacha20-poly1305 for clients, this contract must be revisited (the fallback
+`aes256-ctr` + `hmac-sha2-256` is the documented hedge).
+
 ## How Real OS Implementations Differ
 
 - git's SSH transport is a fork/exec shell-out with a fixed precedence: `GIT_SSH_COMMAND` > `core.sshCommand` > `GIT_SSH` > the builtin `ssh` — and `GIT_SSH` is invoked positionally, so a bare `GIT_SSH='dbclient -y'` with embedded args fails (use `GIT_SSH_COMMAND`).

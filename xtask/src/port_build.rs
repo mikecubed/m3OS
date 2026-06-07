@@ -392,6 +392,22 @@ fn build_recipe_id(name: &str) -> &'static str {
              stage=resource-dir-builtins+bundled-usr-sysroot(musl+libc++)+clang++-symlink;\
              recipe-v=1"
         }
+        // Phase 86b — dropbear's static client-only build. The identity is the
+        // `PROGRAMS=dbclient` single-program build + the static/no-zlib/no-harden
+        // configure flag set + the bundled-libtom software crypto + the
+        // post-install stage shape (prune the manpage, add the `ssh` copy of
+        // `dbclient` so both names land on PATH). Bump recipe-v whenever any of
+        // these change so the cached `.m3pkg` self-invalidates. (The pinned
+        // dropbear version + its tarball SHA-256 are folded in via the Portfile
+        // digest.)
+        "dropbear" => {
+            "client-only(make PROGRAMS=dbclient);\
+             configure(--enable-static --disable-zlib --disable-harden \
+             --enable-bundled-libtom --disable-syslog --disable-lastlog \
+             --disable-utmp --disable-utmpx --disable-wtmp --disable-wtmpx \
+             --host=x86_64-linux-musl --prefix=/usr);cflags:-O2;\
+             stage=prune(share/man)+ssh-copy(/usr/bin/ssh<-dbclient);recipe-v=1"
+        }
         _ => "",
     }
 }
@@ -507,6 +523,12 @@ fn extract_tarball(tarball: &Path, work_dir: &Path) -> Result<PathBuf, String> {
     fs::create_dir_all(work_dir).map_err(|e| format!("mkdir work_dir: {e}"))?;
     let tar_flag = if tarball.extension().is_some_and(|e| e == "xz") {
         "-xJf"
+    } else if tarball.extension().is_some_and(|e| e == "bz2") {
+        // Phase 86b — dropbear ships its releases as `.tar.bz2`; teach the
+        // shared extractor the bzip2 flag (`-j`) so its port routes through the
+        // same plumbing as the `.xz`/`.gz` ports rather than needing a bespoke
+        // unpack. Harmless for every existing port (none is `.bz2`).
+        "-xjf"
     } else {
         "-xzf"
     };
@@ -612,6 +634,11 @@ pub fn port_deps(name: &str) -> &'static [&'static str] {
         // Phase 86a Track C.2 — the Mozilla CA bundle is a self-contained data
         // file (no libraries required at build or install time).
         "ca-certificates" => &[],
+        // Phase 86b — dropbear is built `--disable-zlib` (SSH compression is
+        // optional; GitHub accepts `none`) and links its bundled libtomcrypt/
+        // libtommath statically, so the client has NO runtime dependency: in-OS
+        // `pkg install ssh` pulls nothing else.
+        "dropbear" => &[],
         _ => &[],
     }
 }
@@ -908,6 +935,7 @@ fn port_build(name: &str) -> Result<(), String> {
         "git" => build_git(&extracted, &stage, &toolchain, &zlib_stage)?,
         "python" => build_python(&extracted, &stage, &toolchain, &zlib_stage, &ncurses_stage)?,
         "llvm" => build_llvm(&extracted, &stage, &toolchain)?,
+        "dropbear" => build_dropbear(&extracted, &stage, &toolchain)?,
         _ => return Err(format!("no host build recipe for port {name}")),
     }
 
@@ -1661,6 +1689,124 @@ fn build_machine_triple() -> String {
         }
     }
     "x86_64-linux-gnu".to_string()
+}
+
+/// Phase 86b — cross-build dropbear's `dbclient` as a static, client-only SSH
+/// binary and DESTDIR-install it at `prefix=/usr` into `stage`.
+///
+/// This is the static `ssh` client that gives m3OS its first secure remote git
+/// transport: git speaks the SSH-transport protocol itself and merely
+/// fork/execs an `ssh` binary to move the bytes (`GIT_SSH_COMMAND`), so the
+/// Phase 85b `git` is reused **unchanged** and dropbear is the only new
+/// artifact.
+///
+/// CLIENT-ONLY (`make PROGRAMS=dbclient`): only dropbear's `dbclient` is built —
+/// not the `dropbear` server / `dropbearkey` / `dropbearconvert` — keeping the
+/// artifact a single ~250 KB static binary. The bundled libtomcrypt/libtommath
+/// software crypto is built pure-C (no x86 ASM): the SIMD-off contract. zlib is
+/// disabled (`--disable-zlib`) — SSH compression is optional and GitHub accepts
+/// `none`, so the client has no runtime dependency. `--disable-harden` drops the
+/// PIE flags that conflict with `-static` on the musl cross; the login
+/// bookkeeping (`syslog`/`utmp`/`wtmp`/`lastlog`) a client never uses is disabled
+/// too (musl provides none of it).
+///
+/// Post-install the manpage is pruned and a second copy of `dbclient` is laid
+/// down as `/usr/bin/ssh`, so both the dropbear name (`dbclient -y/-i/-p`, used
+/// by the smoke) and the OpenSSH name (`ssh -T git@github.com`) resolve on PATH.
+/// A copy, not a symlink: the `.m3pkg` packer stores file *content* per path with
+/// no symlink/hardlink dedup, so a symlink would not round-trip. dbclient is a
+/// single-program build whose behaviour does not switch on argv[0], so the copy
+/// IS a working ssh client.
+fn build_dropbear(
+    src: &Path,
+    stage: &Path,
+    (cc, ar, ranlib): &(&'static str, String, String),
+) -> Result<(), String> {
+    let stage_prefix = stage.join("usr");
+    fs::create_dir_all(&stage_prefix).map_err(|e| format!("mkdir: {e}"))?;
+
+    let extra_ld = musl_extra_ldflags_joined();
+    let ldflags = if extra_ld.is_empty() {
+        "-static".to_string()
+    } else {
+        format!("-static {extra_ld}")
+    };
+
+    // ./configure — static, client-suitable, no optional deps. The cross is
+    // driven by CC/AR/RANLIB + --host; the bundled libtom* software crypto is
+    // built pure-C (no x86 ASM) for the SIMD-off contract.
+    let mut configure_cmd = Command::new("sh");
+    configure_cmd
+        .current_dir(src)
+        .arg("./configure")
+        .arg("--host=x86_64-linux-musl")
+        .arg("--prefix=/usr")
+        .arg("--enable-static")
+        .arg("--disable-zlib")
+        .arg("--disable-harden")
+        .arg("--enable-bundled-libtom")
+        .arg("--disable-syslog")
+        .arg("--disable-lastlog")
+        .arg("--disable-utmp")
+        .arg("--disable-utmpx")
+        .arg("--disable-wtmp")
+        .arg("--disable-wtmpx")
+        .env("CC", cc)
+        .env("AR", ar)
+        .env("RANLIB", ranlib)
+        .env("CFLAGS", "-O2")
+        .env("LDFLAGS", &ldflags);
+    run(&mut configure_cmd, "dropbear configure")?;
+
+    // Build ONLY the client (PROGRAMS=dbclient) — not the server/keygen tools.
+    let mut make_cmd = Command::new("make");
+    make_cmd
+        .current_dir(src)
+        .arg(format!("-j{}", num_jobs()))
+        .arg("PROGRAMS=dbclient");
+    run(&mut make_cmd, "dropbear make dbclient")?;
+
+    let mut install_cmd = Command::new("make");
+    install_cmd
+        .current_dir(src)
+        .arg("PROGRAMS=dbclient")
+        .arg("install")
+        .arg(format!("DESTDIR={}", stage.display()))
+        .arg("prefix=/usr");
+    run(&mut install_cmd, "dropbear install")?;
+
+    let dbclient = stage_prefix.join("bin/dbclient");
+    if !dbclient.exists() {
+        return Err(format!("dropbear build missing {}", dbclient.display()));
+    }
+
+    // Client-only contract: the server half must NOT have been built. Its
+    // presence would mean PROGRAMS=dbclient did not take effect.
+    for forbidden in ["dropbear", "dropbearkey", "dropbearconvert"] {
+        if stage_prefix.join("bin").join(forbidden).exists()
+            || stage_prefix.join("sbin").join(forbidden).exists()
+        {
+            return Err(format!(
+                "dropbear build: {forbidden} present — PROGRAMS=dbclient did not take \
+                 effect (client-only contract broken)"
+            ));
+        }
+    }
+
+    // Prune the installed manpage: the slow ring-3 VFS + the no-dedup `.m3pkg`
+    // packer make every shipped file a real cost, and a man page earns none.
+    let _ = fs::remove_dir_all(stage_prefix.join("share/man"));
+
+    // Lay a second copy of dbclient down as `/usr/bin/ssh` (see fn doc). On Unix
+    // `fs::copy` carries the source's permission bits, so the copy stays +x.
+    let ssh = stage_prefix.join("bin/ssh");
+    fs::copy(&dbclient, &ssh).map_err(|e| format!("dropbear: copy dbclient->ssh: {e}"))?;
+
+    println!(
+        "dropbear: produced /usr/bin/dbclient + /usr/bin/ssh ({} bytes each, static)",
+        file_size(&dbclient)
+    );
+    Ok(())
 }
 
 /// Phase 85c — two-stage musl cross-build of CPython.
@@ -3047,6 +3193,22 @@ pub fn build_python_port() -> Result<(), String> {
 /// heaviest artifact).
 pub fn build_llvm_port() -> Result<(), String> {
     port_build("llvm").map_err(|e| format!("port llvm: {e}"))?;
+    Ok(())
+}
+
+/// Phase 86b — build the static client-only `dropbear` (`dbclient`) into its
+/// `.m3pkg` artifact so the image populator can bundle it into `/usr/pkg/` as
+/// `ssh.m3pkg`. dropbear has no runtime deps (`--disable-zlib`), so nothing is
+/// built first. The `git-ssh-smoke` gate (and any explicit
+/// `cargo xtask port build dropbear`) drives this; a warm pkgcache makes a
+/// repeat build a zero-compiler hit.
+pub fn build_dropbear_port() -> Result<(), String> {
+    if musl_cc().is_none() {
+        return Err(
+            "no musl cross-compiler on PATH (install musl-tools or musl-gcc-cross-bin)".to_string(),
+        );
+    }
+    port_build("dropbear").map_err(|e| format!("port dropbear: {e}"))?;
     Ok(())
 }
 

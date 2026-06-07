@@ -136,3 +136,46 @@ sunset's public API. To remove this patch:
 | 200ms poll timeout | sshd pattern | **Eliminated** (Phase 42b) | Was needed for manual poll loop |
 | Break-after-resume | sshd pattern | **Eliminated** (Phase 42b+) | Was needed in single-task loop |
 | Flush before progress | sshd pattern | **Eliminated** (Phase 42b+) | I/O task handles flushing independently |
+
+## A client harness budget (Phase 86b ADR)
+
+Phase 86b needed a static `ssh` client for git-over-SSH and chose **dropbear**
+over a sunset-based all-Rust client. This section records what the **sunset
+client path would cost**, so the decision (and its eventual reversal) is grounded.
+
+**sunset is server-only today.** The client primitives exist as library calls but
+have **zero userspace callers**:
+
+- `Runner::new_client` (`sunset-local/src/runner.rs:73`) and
+  `Runner::open_client_session` (`runner.rs:486`) — never invoked. The only
+  consumer, `userspace/sshd/src/session.rs:182` (`run_session`), wires the
+  **server** path (`Runner::new_server` + `ServEvent::*`).
+- Host-key trust is surfaced only as `CliEvent::Hostkey(CheckHostkey)`
+  (`event.rs:40`, struct `:148-162`, dispatched via `CliEventId::Hostkey`
+  `:182`/`:211-213`); `CheckHostkey::accept`/`reject` resume via
+  `Runner::resume_checkhostkey` (`runner.rs:168`). **There is no `known_hosts`
+  store** — the callback is the entire mechanism.
+
+**What a 86b sunset client would have required (the budget dropbear avoids):**
+
+1. **A from-scratch async client harness** `userspace/ssh/` — a client analog of
+   the three-task sshd architecture above (I/O task feeding `runner.input()` /
+   flushing `output_buf()`; progress task driving `runner.progress()` and handling
+   `CliEvent::*`; a channel-relay task), driving `new_client` +
+   `open_client_session` over the `async-rt` `Reactor` (`userspace/async-rt/src/reactor.rs:23`),
+   with CLI parsing (`-i`/`-p`/`-T`) and the `git`-compatible `host command`
+   invocation form.
+2. **A `known_hosts` TOFU + file-I/O layer** `userspace/ssh/src/known_hosts.rs` —
+   parsing/writing the `host ssh-ed25519 base64` format at mode `0600` over the
+   slow ring-3 VFS, accept-on-first-use, and **reject-on-mismatch**, all driven
+   from the `CheckHostkey` callback. dropbear ships this whole layer built in.
+3. **Identity-key handling** — loading the user's private key and the pubkey-auth
+   flow that GitHub requires (`CliEvent` auth events), versus dropbear's `-i`.
+4. **Packaging** — a new `userspace/` binary + ramdisk wiring rather than a
+   `.m3pkg` port that rides the existing musl-toolchain plumbing.
+
+dropbear delivers all four for the cost of one Portfile + one `build_dropbear`
+function. The sunset path remains the future all-Rust migration: when the client
+side and a `known_hosts` store exist (and `crypto-lib`, fed by the 86a CSPRNG,
+backs the KEX/cipher/MAC), a sunset `ssh` could replace the dropbear default and
+collapse the second (libtomcrypt) crypto stack into the in-tree audited one.

@@ -1,0 +1,41 @@
+NAME=dropbear
+VERSION=2024.86
+DESCRIPTION="Dropbear SSH client (dbclient) — static, client-only, the git-over-SSH transport"
+CATEGORY=util
+DEPS=
+URL=https://matt.ucc.asn.au/dropbear/releases/dropbear-2024.86.tar.bz2
+SHA256=e78936dffc395f2e0db099321d6be659190966b99712b55c530dd0a1822e0a5e
+MAINTAINER=m3os
+
+# Phase 86b Track B — the static `ssh` client that gives m3OS its first secure
+# remote git transport. Built CLIENT-ONLY (`make PROGRAMS=dbclient`): only
+# dropbear's `dbclient` is produced — not the `dropbear` server, `dropbearkey`,
+# or `dropbearconvert` — so the artifact stays a single ~250 KB static binary.
+# It is bundled into `/usr/pkg/` as `ssh.m3pkg` (port name ≠ package name, the
+# same indirection clang uses for the `llvm` port) and installed with
+# `pkg install ssh`; both `/usr/bin/dbclient` and an OpenSSH-named `/usr/bin/ssh`
+# copy land on PATH.
+#
+# git speaks the SSH-transport protocol itself and merely fork/execs an `ssh`
+# binary to move the bytes (`GIT_SSH_COMMAND`), so the Phase 85b `git` is reused
+# UNCHANGED — this port is the only new artifact for git-over-SSH.
+#
+# Build identity (see build_dropbear in xtask/src/port_build.rs):
+#   --enable-static                    — the m3OS `ld-musl` has no real `libc.so`;
+#                                        every port is a static binary.
+#   --disable-zlib                     — SSH compression is optional and GitHub
+#                                        accepts `none`; dropping it removes the
+#                                        only would-be dependency (so DEPS= empty).
+#   --enable-bundled-libtom            — use dropbear's bundled libtomcrypt /
+#                                        libtommath software crypto, built pure-C
+#                                        (no x86 ASM) — the SIMD-off contract.
+#   --disable-harden                   — drop the PIE/`-pie` hardening flags that
+#                                        conflict with `-static` on the musl cross.
+#   --disable-{syslog,lastlog,utmp,    — server/login bookkeeping a client never
+#     utmpx,wtmp,wtmpx}                  uses and musl does not provide.
+#
+# Default dropbear algorithms already satisfy GitHub's accepted SSH suite:
+# KEX curve25519-sha256, host-sig ssh-ed25519, ciphers
+# chacha20-poly1305@openssh.com + aes256-ctr, MAC hmac-sha2-256. Host-key trust
+# is dropbear's built-in `known_hosts` TOFU (accept-on-first-use,
+# reject-on-mismatch); GitHub's ed25519 key is pre-seeded as rotatable data.
