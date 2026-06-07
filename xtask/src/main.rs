@@ -16613,8 +16613,24 @@ fn populate_ext2_files(
     let ssh_identity_cmds = match std::env::var("M3OS_GIT_SSH_KEY") {
         Ok(path) if !path.is_empty() => match fs::read(&path) {
             Ok(key_bytes) => {
+                // Phase 86b — the staged identity is a *private key*. Its
+                // host-side temp copy must never be world-readable on shared
+                // CI / multi-user hosts during the (whole-ext2-population)
+                // window before cleanup at the end of this function. Mint the
+                // temp file fresh at 0600 (O_CREAT|O_EXCL via `create_new`, so
+                // it is never observable at the default 0644 and cannot follow
+                // a pre-planted symlink), and fail loudly if the lock-down does
+                // not stick.
+                use std::os::unix::fs::OpenOptionsExt;
                 let id_tmp = output_dir.join("_tmp_id_dropbear");
-                fs::write(&id_tmp, &key_bytes).expect("write temp ssh identity");
+                let _ = fs::remove_file(&id_tmp);
+                let mut id_f = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&id_tmp)
+                    .expect("create temp ssh identity at 0600");
+                id_f.write_all(&key_bytes).expect("write temp ssh identity");
                 format!(
                     "write \"{}\" root/.ssh/id_dropbear\n\
                      sif root/.ssh/id_dropbear mode 0x8180\n\
