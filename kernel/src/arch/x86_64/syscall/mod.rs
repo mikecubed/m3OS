@@ -15272,6 +15272,15 @@ fn getrandom_fill_user(buf_ptr: u64, len: usize, insecure: bool) -> Result<usize
         if insecure {
             kernel_core::csprng::global_fill_insecure(&mut chunk[..to_fill]);
         } else {
+            // Invariant: the DRBG transitions to READY monotonically — once
+            // READY it never reverts.  `sys_getrandom` pre-checks readiness
+            // before entering the secure branch (and falls back to insecure
+            // when still not ready), so `global_fill` here must always
+            // succeed.  A `NotReady` error here would be a logic bug.
+            debug_assert!(
+                kernel_core::csprng::global_ready(),
+                "getrandom secure branch entered while DRBG is not READY (monotonic invariant violated)"
+            );
             kernel_core::csprng::global_fill(&mut chunk[..to_fill]).map_err(|_| ())?;
         }
         UserSliceWo::new(buf_ptr + written as u64, to_fill)

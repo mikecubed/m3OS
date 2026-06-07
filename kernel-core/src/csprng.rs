@@ -332,6 +332,90 @@ impl Default for ChaChaDrbg {
 }
 
 // ---------------------------------------------------------------------------
+// SipHash-2-4 (RFC-standard one-way keyed hash)
+// ---------------------------------------------------------------------------
+
+/// SipHash-2-4 with a 128-bit key (`key0`, `key1`) over arbitrary `data`.
+///
+/// Implements the standard SipHash-2-4 specification:
+/// - 2 compression rounds per input block
+/// - 4 finalization rounds
+/// - Standard magic-constant initialization XOR'd with the 128-bit key
+///
+/// Pure-integer (no SIMD), `no_std`-compatible.  Used as the TCP ISN PRF
+/// (RFC 6528 §3): `siphash24(secret0, secret1, &four_tuple_bytes)` is
+/// one-way, so one observed ISN does not reveal the per-boot secret.
+pub fn siphash24(key0: u64, key1: u64, data: &[u8]) -> u64 {
+    // Standard SipHash initialization constants.
+    let mut v0: u64 = key0 ^ 0x736f_6d65_7073_6575;
+    let mut v1: u64 = key1 ^ 0x646f_7261_6e64_6f6d;
+    let mut v2: u64 = key0 ^ 0x6c79_6765_6e65_7261;
+    let mut v3: u64 = key1 ^ 0x7465_6462_7974_6573;
+
+    /// One SipRound.
+    #[inline(always)]
+    fn sip_round(v0: &mut u64, v1: &mut u64, v2: &mut u64, v3: &mut u64) {
+        *v0 = v0.wrapping_add(*v1);
+        *v1 = v1.rotate_left(13);
+        *v1 ^= *v0;
+        *v0 = v0.rotate_left(32);
+        *v2 = v2.wrapping_add(*v3);
+        *v3 = v3.rotate_left(16);
+        *v3 ^= *v2;
+        *v0 = v0.wrapping_add(*v3);
+        *v3 = v3.rotate_left(21);
+        *v3 ^= *v0;
+        *v2 = v2.wrapping_add(*v1);
+        *v1 = v1.rotate_left(17);
+        *v1 ^= *v2;
+        *v2 = v2.rotate_left(32);
+    }
+
+    // Process complete 8-byte blocks (2 compression rounds each).
+    let n_blocks = data.len() / 8;
+    for i in 0..n_blocks {
+        let block_bytes: [u8; 8] = [
+            data[i * 8],
+            data[i * 8 + 1],
+            data[i * 8 + 2],
+            data[i * 8 + 3],
+            data[i * 8 + 4],
+            data[i * 8 + 5],
+            data[i * 8 + 6],
+            data[i * 8 + 7],
+        ];
+        let m = u64::from_le_bytes(block_bytes);
+        v3 ^= m;
+        sip_round(&mut v0, &mut v1, &mut v2, &mut v3);
+        sip_round(&mut v0, &mut v1, &mut v2, &mut v3);
+        v0 ^= m;
+    }
+
+    // Build the final block: remaining bytes + length byte in the top byte.
+    let remainder = data.len() % 8;
+    let last_block_offset = n_blocks * 8;
+    let mut last: u64 = (data.len() as u64 & 0xff) << 56;
+    // Pack remaining bytes little-endian into the low bits.
+    for i in 0..remainder {
+        last |= (data[last_block_offset + i] as u64) << (i * 8);
+    }
+
+    v3 ^= last;
+    sip_round(&mut v0, &mut v1, &mut v2, &mut v3);
+    sip_round(&mut v0, &mut v1, &mut v2, &mut v3);
+    v0 ^= last;
+
+    // Finalization: 4 rounds.
+    v2 ^= 0xff;
+    sip_round(&mut v0, &mut v1, &mut v2, &mut v3);
+    sip_round(&mut v0, &mut v1, &mut v2, &mut v3);
+    sip_round(&mut v0, &mut v1, &mut v2, &mut v3);
+    sip_round(&mut v0, &mut v1, &mut v2, &mut v3);
+
+    v0 ^ v1 ^ v2 ^ v3
+}
+
+// ---------------------------------------------------------------------------
 // Global accessor (spin::Mutex-protected singleton)
 // ---------------------------------------------------------------------------
 
@@ -645,6 +729,76 @@ mod tests {
         assert_ne!(
             a, b,
             "consecutive draws must differ (fast-key-erasure advances state)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test F: SipHash-2-4 official test vectors
+    //
+    // Keys from the SipHash reference implementation / paper:
+    //   key0 = 0x0706050403020100
+    //   key1 = 0x0f0e0d0c0b0a0908
+    //
+    // Vectors from the official SipHash-2-4 reference output:
+    //   empty input  → 0x726fdb47dd0e0e31
+    //   input [0x00] → 0x74f839c593dc67fd
+    //   input [0x00,0x01,...,0x0f] (16 bytes) → 0xa129ca6149be45e5
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn t_siphash24_empty_vector() {
+        // Official SipHash-2-4 test vector: empty input.
+        // key0 = 0x0706050403020100, key1 = 0x0f0e0d0c0b0a0908
+        // Expected: 0x726fdb47dd0e0e31
+        let key0: u64 = 0x0706_0504_0302_0100;
+        let key1: u64 = 0x0f0e_0d0c_0b0a_0908;
+        let result = siphash24(key0, key1, &[]);
+        assert_eq!(
+            result, 0x726f_db47_dd0e_0e31,
+            "SipHash-2-4 empty vector mismatch: got {result:#018x}"
+        );
+    }
+
+    #[test]
+    fn t_siphash24_one_byte_vector() {
+        // Official SipHash-2-4 test vector: 1-byte input [0x00].
+        // key0 = 0x0706050403020100, key1 = 0x0f0e0d0c0b0a0908
+        // Expected: 0x74f839c593dc67fd
+        let key0: u64 = 0x0706_0504_0302_0100;
+        let key1: u64 = 0x0f0e_0d0c_0b0a_0908;
+        let result = siphash24(key0, key1, &[0x00]);
+        assert_eq!(
+            result, 0x74f8_39c5_93dc_67fd,
+            "SipHash-2-4 1-byte vector mismatch: got {result:#018x}"
+        );
+    }
+
+    #[test]
+    fn t_siphash24_fifteen_byte_vector() {
+        // Official SipHash-2-4 test vector: 15-byte input [0x00..=0x0e].
+        // key0 = 0x0706050403020100, key1 = 0x0f0e0d0c0b0a0908
+        // Expected: 0xa129ca6149be45e5  (from SipHash reference appendix A, row 15)
+        let key0: u64 = 0x0706_0504_0302_0100;
+        let key1: u64 = 0x0f0e_0d0c_0b0a_0908;
+        let input: [u8; 15] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e,
+        ];
+        let result = siphash24(key0, key1, &input);
+        assert_eq!(
+            result, 0xa129_ca61_49be_45e5,
+            "SipHash-2-4 15-byte vector mismatch: got {result:#018x}"
+        );
+    }
+
+    #[test]
+    fn t_siphash24_different_keys_differ() {
+        // Sanity: different keys produce different output for the same data.
+        let r1 = siphash24(0x0101_0101_0101_0101, 0x0202_0202_0202_0202, b"hello");
+        let r2 = siphash24(0x0303_0303_0303_0303, 0x0404_0404_0404_0404, b"hello");
+        assert_ne!(
+            r1, r2,
+            "different keys must produce different SipHash output"
         );
     }
 }

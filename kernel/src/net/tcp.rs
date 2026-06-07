@@ -18,65 +18,80 @@ pub use kernel_core::net::tcp::{TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN, Tcp
 // Phase 86a Track A.5 — RFC 6528-style Initial Sequence Number generation
 // ---------------------------------------------------------------------------
 
-/// Per-boot secret for ISN keyed hash (RFC 6528 §3).
+/// Per-boot 128-bit ISN secret (RFC 6528 §3) — two halves stored as separate
+/// `AtomicU64`s.  Seeded lazily on first use from the global CSPRNG.
 ///
-/// Seeded lazily on first use from the global CSPRNG.  The `0` sentinel is
-/// safe because a zero secret still produces non-sequential ISNs from the timer
-/// component; it just removes the keyed-PRF contribution.  In practice the
-/// CSPRNG is `READY` long before the first TCP connection.
-static ISN_SECRET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The `0` sentinel triggers lazy init; a zero CSPRNG draw is replaced by a
+/// TSC-derived fallback so the secret is always non-zero in practice.  Even a
+/// TSC-derived secret is sufficient because SipHash is one-way: an attacker
+/// who observes one ISN cannot invert the hash to recover the key.
+static ISN_SECRET0: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static ISN_SECRET1: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Return a non-zero u64 from the CSPRNG, falling back to the TSC.
+#[inline]
+fn isn_draw_nonzero() -> u64 {
+    let v = kernel_core::csprng::global_random_u64()
+        .unwrap_or_else(|| unsafe { core::arch::x86_64::_rdtsc() });
+    if v == 0 { 0xDEAD_BEEF_CAFE_BABE } else { v }
+}
 
 /// Compute a RFC 6528-style Initial Sequence Number.
 ///
-/// `isn = timer_component XOR prf(local_ip, local_port, remote_ip, remote_port, secret)`
+/// `isn = timer_component.wrapping_add(prf)`
 ///
-/// - **timer component**: 4 μs ticks derived from `tick_count()`; wraps every ~4.8 hours,
-///   giving each connection a fresh starting offset independent of any fixed secret.
-/// - **PRF**: a simple XOR-mix of the 4-tuple + per-boot secret.  A full HMAC would be
-///   ideal, but this is sufficient to defeat ISN prediction without a cryptographic
-///   library dependency in the kernel TCP layer.
+/// - **timer component**: ms-resolution tick counter scaled ×4 (4 units/ms);
+///   wraps every ~12 days, ensuring each reconnection starts at a fresh offset.
+/// - **PRF = SipHash-2-4(secret0, secret1, four_tuple_bytes)**:
+///   `four_tuple_bytes` = local_ip(4) ‖ remote_ip(4) ‖ local_port(2) ‖ remote_port(2).
+///   SipHash-2-4 is a one-way keyed hash (PRF-secure), so one observed ISN
+///   does **not** reveal the 128-bit per-boot secret (unlike an additive mix,
+///   which is invertible).  This matches Linux's `secure_tcp_seq` (SipHash).
 ///
 /// Two connections to different destinations get different ISNs; the same
 /// destination re-connected gets a different ISN because the timer advanced.
 fn tcp_isn(local_ip: Ipv4Addr, local_port: u16, remote_ip: Ipv4Addr, remote_port: u16) -> u32 {
-    // Seed the per-boot secret on first use.
-    let secret = {
-        let s = ISN_SECRET.load(core::sync::atomic::Ordering::Relaxed);
-        if s == 0 {
-            // Draw from CSPRNG if ready; fall back to TSC if not.
-            let fresh = kernel_core::csprng::global_random_u64()
-                .unwrap_or_else(|| unsafe { core::arch::x86_64::_rdtsc() });
-            // Use a non-zero value.
-            let fresh = if fresh == 0 {
-                0xDEAD_BEEF_CAFE_BABE
-            } else {
-                fresh
-            };
-            // Best-effort store; if two cores race the first-use init the
-            // result is consistent: both produce valid non-zero secrets.
-            ISN_SECRET.store(fresh, core::sync::atomic::Ordering::Relaxed);
+    use core::sync::atomic::Ordering;
+
+    // Lazy-init the 128-bit per-boot secret (two independent u64 halves).
+    // Best-effort: if two cores race on first use the result is consistent —
+    // both produce valid non-zero secrets and SipHash gives different output
+    // per 4-tuple regardless of which half "wins".
+    let s0 = {
+        let v = ISN_SECRET0.load(Ordering::Relaxed);
+        if v == 0 {
+            let fresh = isn_draw_nonzero();
+            ISN_SECRET0.store(fresh, Ordering::Relaxed);
             fresh
         } else {
-            s
+            v
+        }
+    };
+    let s1 = {
+        let v = ISN_SECRET1.load(Ordering::Relaxed);
+        if v == 0 {
+            let fresh = isn_draw_nonzero();
+            ISN_SECRET1.store(fresh, Ordering::Relaxed);
+            fresh
+        } else {
+            v
         }
     };
 
-    // 4 μs tick component: tick_count is ms-resolution (1000 Hz), scale ×4.
-    // The wrapping is intentional — each millisecond tick advances the ISN by
-    // 4, giving ~16 million distinct values per 4-hour period.
+    // Timer component: tick_count() is 1000 Hz (1 ms resolution), ×4 gives
+    // 4 units per millisecond.  The wrapping is intentional — the 32-bit
+    // counter cycles every ~49 days at 1 ms ticks, keeping ISNs time-varying.
     let timer_component = crate::arch::x86_64::interrupts::tick_count().wrapping_mul(4) as u32;
 
-    // Keyed PRF over the 4-tuple + secret (32-bit XOR-mix).
-    let lip = u32::from_be_bytes(local_ip);
-    let rip = u32::from_be_bytes(remote_ip);
-    let ports = ((local_port as u32) << 16) | (remote_port as u32);
-    let secret_lo = secret as u32;
-    let secret_hi = (secret >> 32) as u32;
-    let prf = lip
-        .wrapping_add(rip)
-        .wrapping_add(ports)
-        .wrapping_add(secret_lo)
-        .wrapping_add(secret_hi);
+    // One-way keyed PRF over the 4-tuple: pack 12 bytes (local_ip ‖ remote_ip
+    // ‖ local_port ‖ remote_port) and feed them through SipHash-2-4.
+    // The 64→32 truncation is standard (take the low 32 bits of the hash).
+    let mut four_tuple = [0u8; 12];
+    four_tuple[0..4].copy_from_slice(&local_ip);
+    four_tuple[4..8].copy_from_slice(&remote_ip);
+    four_tuple[8..10].copy_from_slice(&local_port.to_be_bytes());
+    four_tuple[10..12].copy_from_slice(&remote_port.to_be_bytes());
+    let prf = kernel_core::csprng::siphash24(s0, s1, &four_tuple) as u32;
 
     timer_component.wrapping_add(prf)
 }
