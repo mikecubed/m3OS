@@ -658,14 +658,31 @@ pub unsafe fn setup_abi_stack_with_envp(
         // Align cursor down to 8 bytes.
         cursor &= !7;
 
-        // Write 16 bytes of pseudo-random data on the stack for AT_RANDOM.
-        // musl uses this for stack canary / ASLR seed.  A fixed pattern is
-        // fine for a toy OS — the important thing is that the pointer is valid.
+        // Write 16 bytes of live CSPRNG data on the stack for AT_RANDOM.
+        // musl uses this for stack canary and ASLR seed; each process load
+        // must receive a distinct 16-byte value (Phase 86a Track A.5).
+        //
+        // We draw from the global CSPRNG DRBG.  If the DRBG is not yet READY
+        // (degraded TSC-only boot), `fill_insecure` is used — the output is
+        // statistically fine and non-repeating; it is never the old deterministic
+        // `(0xAB ^ i).wrapping_add(i)` pattern.
         cursor -= 16;
         let at_random_ptr = cursor;
-        for i in 0u64..16 {
-            let kptr = virt_to_kptr(cursor + i)?;
-            kptr.write((0xAB ^ i as u8).wrapping_add(i as u8));
+        {
+            let mut rand16 = [0u8; 16];
+            if kernel_core::csprng::global_fill(&mut rand16).is_err() {
+                // DRBG not READY (degraded path) — use fill_insecure.
+                kernel_core::csprng::global_fill_insecure(&mut rand16);
+            }
+            for (i, &byte) in rand16.iter().enumerate() {
+                // SAFETY: cursor was derived from user virtual address arithmetic
+                // above; virt_to_kptr maps it into kernel address space via the
+                // direct physical map, which is valid for the lifetime of this
+                // execve call.  We are inside the outer `unsafe {}` block that
+                // spans this entire function body (line 610).
+                let kptr = virt_to_kptr(cursor + i as u64)?;
+                kptr.write(byte);
+            }
         }
         cursor &= !7; // realign to 8 bytes
 

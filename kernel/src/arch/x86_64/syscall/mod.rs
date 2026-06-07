@@ -5751,11 +5751,165 @@ fn rdrand64() -> Option<u64> {
     None
 }
 
-/// Seed the PRNG state using RDRAND + TSC mixing.
+// ---------------------------------------------------------------------------
+// A.2 — RDSEED support (Phase 86a Track A)
+// ---------------------------------------------------------------------------
+
+/// Returns whether the current CPU supports the RDSEED instruction
+/// (CPUID leaf 07H, subleaf 0, EBX bit 18).
+fn cpu_has_rdseed() -> bool {
+    let ebx: u32;
+    unsafe {
+        // SAFETY: CPUID is a ring-0 read-only instruction; no side effects.
+        // We push/pop rbx because it is a callee-saved register and `asm!`
+        // would otherwise clobber it, which upsets the compiler's register
+        // allocator on some targets.
+        core::arch::asm!(
+            "push rbx",
+            "mov eax, 7",
+            "xor ecx, ecx",
+            "cpuid",
+            "mov {ebx:e}, ebx",
+            "pop rbx",
+            ebx = out(reg) ebx,
+            out("eax") _,
+            out("ecx") _,
+            out("edx") _,
+        );
+    }
+    ebx & (1 << 18) != 0
+}
+
+/// Cached RDSEED support: 0 = unchecked, 1 = supported, 2 = unsupported.
+static RDSEED_SUPPORT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Try to read a 64-bit full-entropy seed word via the RDSEED instruction.
 ///
-/// Uses RDRAND as the primary entropy source when available.
-/// Mixes with TSC to hedge against RDRAND-only failure modes.
-/// The fallback constant is only reachable if both sources return zero.
+/// Returns `Some(value)` if RDSEED is available and CF=1 (seed valid).
+/// Performs a bounded PAUSE-retry on CF=0 (seed pool momentarily empty).
+fn rdseed64() -> Option<u64> {
+    let cached = RDSEED_SUPPORT.load(core::sync::atomic::Ordering::Relaxed);
+    let supported = if cached == 0 {
+        let s = cpu_has_rdseed();
+        RDSEED_SUPPORT.store(if s { 1 } else { 2 }, core::sync::atomic::Ordering::Relaxed);
+        s
+    } else {
+        cached == 1
+    };
+    if !supported {
+        return None;
+    }
+    for _ in 0..10 {
+        let mut val: u64;
+        let ok: u8;
+        unsafe {
+            // SAFETY: RDSEED is a ring-0 / ring-3 safe instruction that reads
+            // from the hardware TRNG.  CF=1 indicates a valid seed word.
+            core::arch::asm!(
+                "rdseed {val}",
+                "setc {ok}",
+                val = out(reg) val,
+                ok = out(reg_byte) ok,
+            );
+        }
+        if ok != 0 {
+            return Some(val);
+        }
+        // RDSEED pool is momentarily empty; PAUSE before retry.
+        core::hint::spin_loop();
+    }
+    None
+}
+
+/// Collect 32 bytes of seed material for the CSPRNG.
+///
+/// Source preference:
+///   1. **RDSEED** × 4 (256 full-entropy bits, source tag `"rdseed"`)
+///   2. **RDRAND** × 4 (credit 256 bits from hardware DRBG, source tag `"rdrand"`)
+///   3. **TSC degraded** (credit 0 bits, source tag `"degraded"`)
+///
+/// In every case, extra TSC reads are XOR-mixed in as uncredited diffusion so
+/// that even the degraded path provides non-repeating seeds across reboots on
+/// the same hardware.
+pub(crate) fn gather_seed_entropy() -> ([u8; 32], usize, &'static str) {
+    let mut seed = [0u8; 32];
+
+    // Helper: write a u64 into 8 bytes of the seed buffer at a given offset.
+    #[inline(always)]
+    fn put_u64(buf: &mut [u8; 32], offset: usize, val: u64) {
+        buf[offset..offset + 8].copy_from_slice(&val.to_le_bytes());
+    }
+
+    // Extra TSC diffusion mixed into every path.
+    let tsc0 = unsafe { core::arch::x86_64::_rdtsc() };
+
+    // --- Try RDSEED first (full-entropy hardware TRNG) ---
+    if let (Some(a), Some(b), Some(c), Some(d)) = (rdseed64(), rdseed64(), rdseed64(), rdseed64()) {
+        put_u64(&mut seed, 0, a ^ tsc0);
+        put_u64(&mut seed, 8, b);
+        put_u64(&mut seed, 16, c);
+        let tsc1 = unsafe { core::arch::x86_64::_rdtsc() };
+        put_u64(&mut seed, 24, d ^ tsc1);
+        return (seed, 256, "rdseed");
+    }
+
+    // --- Fall back to RDRAND (hardware CTR_DRBG output) ---
+    if let (Some(a), Some(b), Some(c), Some(d)) = (rdrand64(), rdrand64(), rdrand64(), rdrand64()) {
+        put_u64(&mut seed, 0, a ^ tsc0);
+        put_u64(&mut seed, 8, b);
+        put_u64(&mut seed, 16, c);
+        let tsc1 = unsafe { core::arch::x86_64::_rdtsc() };
+        put_u64(&mut seed, 24, d ^ tsc1);
+        return (seed, 256, "rdrand");
+    }
+
+    // --- Degraded: TSC-only mixing (credited bits = 0) ---
+    // Mix several TSC samples with a non-zero constant to ensure the seed is
+    // never all-zeros (which would produce the degenerate all-zero ChaCha20 key
+    // that, while still functional, is not a good starting point).
+    let tsc1 = unsafe { core::arch::x86_64::_rdtsc() };
+    let tsc2 = unsafe { core::arch::x86_64::_rdtsc() };
+    let tsc3 = unsafe { core::arch::x86_64::_rdtsc() };
+    put_u64(&mut seed, 0, tsc0 ^ 0xDEAD_BEEF_CAFE_BABE);
+    put_u64(&mut seed, 8, tsc1 ^ 0x0123_4567_89AB_CDEF);
+    put_u64(&mut seed, 16, tsc2 ^ 0xFEDC_BA98_7654_3210);
+    put_u64(&mut seed, 24, tsc3 ^ 0xA5A5_A5A5_5A5A_5A5A);
+    (seed, 0, "degraded")
+}
+
+/// Seed the CSPRNG early in kernel boot from the best available hardware source.
+///
+/// Called from `kernel_main_entry` after `mm::init` + `task::kstack::init` and
+/// before `net::virtio_net::init` and `task::spawn(init_task, …)`.
+///
+/// On success the global DRBG transitions to `READY` (RDSEED/RDRAND path) or
+/// remains in `EARLY` (degraded path). The degraded path does NOT deadlock —
+/// `GRND_INSECURE` and the AT_RANDOM / TCP ISN fallbacks use `fill_insecure`.
+pub(crate) fn seed_csprng_early() {
+    let (seed, bits, source) = gather_seed_entropy();
+    kernel_core::csprng::seed_global(&seed, bits);
+    let state = if kernel_core::csprng::global_ready() {
+        "READY"
+    } else {
+        "EARLY"
+    };
+    log::info!(
+        "[csprng] seeded source={} credited_bits={} state={}",
+        source,
+        bits,
+        state
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Legacy pseudo-random helpers (retained for /dev/urandom; NOT on csprng path)
+// ---------------------------------------------------------------------------
+
+/// Seed the legacy PRNG state using RDRAND + TSC mixing.
+///
+/// **NOT on the getrandom/csprng path** (Phase 86a). Used only by
+/// `copy_pseudorandom_to_user` which serves `/dev/urandom` reads. If
+/// `/dev/urandom` is later migrated to the CSPRNG, delete this function.
 fn seed_pseudorandom_state() -> u64 {
     let rdrand_val = rdrand64().unwrap_or(0);
     let tsc_val = unsafe { core::arch::x86_64::_rdtsc() };
@@ -15068,29 +15222,125 @@ pub(super) fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// getrandom(buf, buflen, flags) — syscall 318
+// getrandom(buf, buflen, flags) — syscall 318 (Phase 86a Track A.4 rewrite)
 // ---------------------------------------------------------------------------
 
-/// Fill user buffer with pseudo-random bytes seeded from the TSC.
-pub(super) fn sys_getrandom(buf_ptr: u64, buflen: u64, _flags: u64) -> u64 {
+/// getrandom flags (Linux-compatible).
+const GRND_NONBLOCK: u64 = 0x0001;
+const GRND_RANDOM: u64 = 0x0002;
+const GRND_INSECURE: u64 = 0x0004;
+const GRND_KNOWN_FLAGS: u64 = GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE;
+
+/// Monotonic seconds-since-boot counter for reseed timing.
+/// Tracks seconds at last reseed (coarse: compare tick_count / TICKS_PER_SEC).
+static LAST_RESEED_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Reseed the CSPRNG if the output ceiling or 60-second interval has been reached.
+/// Non-blocking; uses `gather_seed_entropy()` which never sleeps.
+fn maybe_reseed_csprng() {
+    use core::sync::atomic::Ordering;
+    if kernel_core::csprng::global_needs_reseed() {
+        let (seed, bits, _src) = gather_seed_entropy();
+        kernel_core::csprng::global_reseed(&seed, bits);
+        let now = crate::arch::x86_64::interrupts::tick_count();
+        LAST_RESEED_TICKS.store(now, Ordering::Relaxed);
+        return;
+    }
+    // 60-second interval check (coarse, based on tick counter)
+    let now = crate::arch::x86_64::interrupts::tick_count();
+    let last = LAST_RESEED_TICKS.load(Ordering::Relaxed);
+    let elapsed_secs = now.saturating_sub(last) / TICKS_PER_SEC;
+    if elapsed_secs >= 60 {
+        let (seed, bits, _src) = gather_seed_entropy();
+        kernel_core::csprng::global_reseed(&seed, bits);
+        LAST_RESEED_TICKS.store(now, Ordering::Relaxed);
+    }
+}
+
+/// Fill the user buffer at `buf_ptr` (length `len`) from `fill_fn`, using a
+/// 256-byte stack chunk loop so we never allocate a large kernel buffer.
+///
+/// Preserves the ≤256-byte single-call atomicity required by
+/// `userspace/sshd/src/getrandom_impl.rs` (ret == len contract): the chunk
+/// loop fills the ENTIRE requested length and returns `len`, never a short
+/// count.
+fn getrandom_fill_user(buf_ptr: u64, len: usize, insecure: bool) -> Result<usize, ()> {
+    let mut chunk = [0u8; 256];
+    let mut written = 0usize;
+    while written < len {
+        let to_fill = (len - written).min(chunk.len());
+        if insecure {
+            kernel_core::csprng::global_fill_insecure(&mut chunk[..to_fill]);
+        } else {
+            kernel_core::csprng::global_fill(&mut chunk[..to_fill]).map_err(|_| ())?;
+        }
+        UserSliceWo::new(buf_ptr + written as u64, to_fill)
+            .and_then(|s| s.copy_from_kernel(&chunk[..to_fill]))?;
+        written += to_fill;
+    }
+    Ok(len)
+}
+
+/// `getrandom(buf, buflen, flags)` — syscall 318.
+///
+/// Flags:
+///   `GRND_NONBLOCK (0x01)` — return `EAGAIN` if DRBG is not yet `READY`.
+///   `GRND_RANDOM   (0x02)` — honored; same DRBG, not rejected.
+///   `GRND_INSECURE (0x04)` — serve even when DRBG is not `READY`.
+///   `GRND_INSECURE | GRND_RANDOM` together → `EINVAL` (Linux semantics).
+///   Unknown flag bits → `EINVAL`.
+///
+/// Always fills the exact requested length (no cap, no short count).
+/// Performs a best-effort reseed at the output ceiling or after 60 seconds.
+pub(super) fn sys_getrandom(buf_ptr: u64, buflen: u64, flags: u64) -> u64 {
     let len = buflen as usize;
     if len == 0 {
         return 0;
     }
-    // Cap at 256 bytes per call to avoid large kernel allocations.
-    let actual = len.min(256);
-    let mut out = [0u8; 256];
 
-    let mut state = seed_pseudorandom_state();
-    fill_pseudorandom_bytes(&mut state, &mut out[..actual]);
-
-    if UserSliceWo::new(buf_ptr, out[..actual].len())
-        .and_then(|s| s.copy_from_kernel(&out[..actual]))
-        .is_err()
-    {
-        return NEG_EFAULT;
+    // Validate flags.
+    if flags & !GRND_KNOWN_FLAGS != 0 {
+        return NEG_EINVAL;
     }
-    actual as u64
+    if flags & GRND_INSECURE != 0 && flags & GRND_RANDOM != 0 {
+        // Linux: GRND_INSECURE and GRND_RANDOM are mutually exclusive.
+        return NEG_EINVAL;
+    }
+
+    let insecure = flags & GRND_INSECURE != 0;
+
+    // Opportunistically reseed before serving (non-blocking).
+    maybe_reseed_csprng();
+
+    let result = if insecure {
+        // GRND_INSECURE: serve regardless of READY state.
+        getrandom_fill_user(buf_ptr, len, true)
+    } else {
+        // Secure path: check READY.
+        if !kernel_core::csprng::global_ready() {
+            if flags & GRND_NONBLOCK != 0 {
+                // GRND_NONBLOCK + not ready → EAGAIN.
+                return NEG_EAGAIN;
+            }
+            // Blocking-style: do a best-effort synchronous re-gather then serve.
+            // In practice the DRBG is already READY because A.3 seeds at boot
+            // before any userspace runs; this path is a safety net.
+            seed_csprng_early();
+        }
+        // After the best-effort re-seed, serve insecure if still not ready
+        // (degraded-TSC-only boot path) so we never deadlock.
+        let still_insecure = !kernel_core::csprng::global_ready();
+        getrandom_fill_user(buf_ptr, len, still_insecure)
+    };
+
+    match result {
+        Ok(n) => {
+            // Opportunistically reseed after serving too.
+            maybe_reseed_csprng();
+            n as u64
+        }
+        Err(()) => NEG_EFAULT,
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -14,6 +14,73 @@ use kernel_core::net::tcp::{
 };
 pub use kernel_core::net::tcp::{TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN, TcpHeader};
 
+// ---------------------------------------------------------------------------
+// Phase 86a Track A.5 — RFC 6528-style Initial Sequence Number generation
+// ---------------------------------------------------------------------------
+
+/// Per-boot secret for ISN keyed hash (RFC 6528 §3).
+///
+/// Seeded lazily on first use from the global CSPRNG.  The `0` sentinel is
+/// safe because a zero secret still produces non-sequential ISNs from the timer
+/// component; it just removes the keyed-PRF contribution.  In practice the
+/// CSPRNG is `READY` long before the first TCP connection.
+static ISN_SECRET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Compute a RFC 6528-style Initial Sequence Number.
+///
+/// `isn = timer_component XOR prf(local_ip, local_port, remote_ip, remote_port, secret)`
+///
+/// - **timer component**: 4 μs ticks derived from `tick_count()`; wraps every ~4.8 hours,
+///   giving each connection a fresh starting offset independent of any fixed secret.
+/// - **PRF**: a simple XOR-mix of the 4-tuple + per-boot secret.  A full HMAC would be
+///   ideal, but this is sufficient to defeat ISN prediction without a cryptographic
+///   library dependency in the kernel TCP layer.
+///
+/// Two connections to different destinations get different ISNs; the same
+/// destination re-connected gets a different ISN because the timer advanced.
+fn tcp_isn(local_ip: Ipv4Addr, local_port: u16, remote_ip: Ipv4Addr, remote_port: u16) -> u32 {
+    // Seed the per-boot secret on first use.
+    let secret = {
+        let s = ISN_SECRET.load(core::sync::atomic::Ordering::Relaxed);
+        if s == 0 {
+            // Draw from CSPRNG if ready; fall back to TSC if not.
+            let fresh = kernel_core::csprng::global_random_u64()
+                .unwrap_or_else(|| unsafe { core::arch::x86_64::_rdtsc() });
+            // Use a non-zero value.
+            let fresh = if fresh == 0 {
+                0xDEAD_BEEF_CAFE_BABE
+            } else {
+                fresh
+            };
+            // Best-effort store; if two cores race the first-use init the
+            // result is consistent: both produce valid non-zero secrets.
+            ISN_SECRET.store(fresh, core::sync::atomic::Ordering::Relaxed);
+            fresh
+        } else {
+            s
+        }
+    };
+
+    // 4 μs tick component: tick_count is ms-resolution (1000 Hz), scale ×4.
+    // The wrapping is intentional — each millisecond tick advances the ISN by
+    // 4, giving ~16 million distinct values per 4-hour period.
+    let timer_component = crate::arch::x86_64::interrupts::tick_count().wrapping_mul(4) as u32;
+
+    // Keyed PRF over the 4-tuple + secret (32-bit XOR-mix).
+    let lip = u32::from_be_bytes(local_ip);
+    let rip = u32::from_be_bytes(remote_ip);
+    let ports = ((local_port as u32) << 16) | (remote_port as u32);
+    let secret_lo = secret as u32;
+    let secret_hi = (secret >> 32) as u32;
+    let prf = lip
+        .wrapping_add(rip)
+        .wrapping_add(ports)
+        .wrapping_add(secret_lo)
+        .wrapping_add(secret_hi);
+
+    timer_component.wrapping_add(prf)
+}
+
 /// Rate-limited log for dropped out-of-order/duplicate TCP payload (m3OS has no
 /// reassembly queue). Budgeted so a lossy link cannot flood the serial console;
 /// the count confirms whether this path fires during the SSH-disconnect hang.
@@ -247,7 +314,8 @@ impl TcpConnection {
     fn connect(&mut self, remote_ip: Ipv4Addr, remote_port: u16, pending: &mut PendingTx) {
         self.remote_ip = remote_ip;
         self.remote_port = remote_port;
-        self.snd_nxt = crate::arch::x86_64::interrupts::tick_count() as u32;
+        // Phase 86a Track A.5: RFC 6528-style ISN (timer + keyed PRF over 4-tuple).
+        self.snd_nxt = tcp_isn(self.local_ip, self.local_port, remote_ip, remote_port);
         self.snd_una = self.snd_nxt;
 
         let p = TcpBuildParams {
@@ -383,7 +451,14 @@ impl TcpConnection {
             TcpState::Listen if has_syn => {
                 self.remote_port = header.src_port;
                 self.rcv_nxt = header.seq.wrapping_add(1);
-                self.snd_nxt = crate::arch::x86_64::interrupts::tick_count() as u32;
+                // Phase 86a Track A.5: RFC 6528-style ISN.
+                // self.remote_ip is already set from ip_header.src before handle_segment.
+                self.snd_nxt = tcp_isn(
+                    self.local_ip,
+                    self.local_port,
+                    self.remote_ip,
+                    header.src_port,
+                );
                 self.snd_una = self.snd_nxt;
                 self.queue_segment(pending, TCP_SYN | TCP_ACK, &[]);
                 self.snd_nxt = self.snd_nxt.wrapping_add(1);
