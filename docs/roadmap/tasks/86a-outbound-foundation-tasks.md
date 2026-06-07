@@ -1,6 +1,6 @@
 # Phase 86a — Outbound Foundation (CSPRNG, Wall-clock, Resolver, CA Trust): Task List
 
-**Status:** Planned
+**Status:** In Progress (`feat/phase-86a-outbound-foundation`)
 **Source Ref:** phase-86a
 **Depends on:** Phase 48 (Security Foundation) ✅, Phase 77 (Pre-1.0 Cleanup — DNS reply delivery D.1 + outbound TCP `connect` D.2) ✅, Phase 85a (Package & Build-Cache Infrastructure) ✅
 **Goal:** Land the entropy/time/trust foundation that all of Phase 86's transports (86b SSH, 86c HTTPS, 86e `gh`) silently depend on — a ChaCha20 DRBG `getrandom` (RDSEED→RDRAND→TSC seeded, flags honored, ≤256-byte atomicity preserved, the 256-byte cap removed), a fail-closed wall-clock floor so certificates can be validated, a validated IPv4/A-record resolver path, and the on-disk CA/`known_hosts`/credential conventions plus a SHA-256-pinned `ca-certificates` `.m3pkg` — with **no transport** landed here. Kernel `0.86.0`.
