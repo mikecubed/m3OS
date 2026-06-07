@@ -53,10 +53,10 @@ Step 6), keeping implementation and review judgment distinct.
 from-scratch async client harness + TOFU layer. dropbear is +1 C port with native
 TOFU and zero new harness. The dropbear branch of B/C was implemented.
 
-## Rescue history
+## Review + rescue history
 
-- **No rescues.** The two background tasks (the end-to-end smoke and the final
-  reviewer) ran to completion; no stalls, nudges, or replacements.
+- **Independent reviewer (`code-quality-reviewer`) on the integrated diff: APPROVE / PASS — mergeable.** No BLOCKER/MAJOR; six MINOR. Applied #1 (recipe-id distinctness test + `dropbear`/`llvm`), #3 (robust mismatch assertion via `cat` body match, not a bare grep-count), #4 (gate clone on key *readability*), #6 (AGENTS.md version bump). Skipped #2 (fail_prefix parity with every existing pkg-install smoke — reviewer recommended no action) and #5 (no action needed). `cargo xtask check` re-run clean.
+- **No rescues.** The background tasks (two core smokes, two live net-mode smokes, the reviewer) all ran to completion; no stalls, nudges, or replacements.
 
 ## Validation (coordinator-owned, on the integrated branch)
 
@@ -68,12 +68,22 @@ TOFU and zero new harness. The dropbear branch of B/C was implemented.
 | `cargo xtask git-ssh-smoke --timeout 600` | ✅ `PASSED core (22 steps in 150s)` — `pkg install: ssh: OK`, `pkg install: git: OK` (git reused, not rebuilt), `dbclient -V`/`ssh -V` → `Dropbear v2024.86` on m3OS, seeded GitHub ed25519 key round-trips the VFS; live clone **SKIPPED** (net=false clone=false) with the documented NOTE |
 | Banner / `uname` `0.86.1` | ✅ by construction — `kernel/src/lib.rs:75`, `procfs.rs:742`, `uname` utsname all use `env!("CARGO_PKG_VERSION")`, kernel recompiled at 0.86.1 |
 
-**Egress/cred-gated (implemented, SKIP in this environment — by design):** the live
-`ssh -T git@github.com` banner, `dbclient -p 443` connect, the host-key-mismatch
-reject negative test (`M3OS_GIT_SSH_NET=1`), and the live `git clone ssh://…`
-(`M3OS_GIT_SSH_KEY=<registered-key>`). These mirror the `tls-smoke`/`dns-smoke`
-PASS-vs-SKIP contract: the plumbing is wired and ready, but cannot run without
-GitHub SSH egress + a registered key.
+**Live-network path (opt-in `M3OS_GIT_SSH_NET=1`) — driven, blocker localized.**
+The mismatch-reject was run against `github.com:22` over SLIRP. Doing so surfaced
+(and fixed) four real defects in the opt-in path that only execution exposes —
+the reviewer could not run it: dropbear prints lowercase `host key mismatch for`
+(not `Host key mismatch`); `printf` is absent in m3OS (→ `echo`); the `ion` login
+shell mis-parses `git@github.com` as `@`-array expansion (→ single-quote); and
+dropbear's blocking `getrandom()` hangs under entropy-starved `qemu64` (→ advertise
+`+rdrand,+rdseed` so the 86a CSPRNG reaches READY). With those fixed, the run
+advanced all the way to: dropbear resolves the host and the **kernel TCP layer
+establishes the connection** (`connection established (active)`), but dropbear's
+**non-blocking** `connect()` then reports `Connect failed: unexpected failure`
+against m3OS's **synchronous** `sys_connect` — precisely the non-blocking-connect
+item the design doc defers. So the live host-key reject (and any `git clone`) is
+gated on m3OS gaining `EINPROGRESS`/writability connect semantics; the SSH client,
+TOFU seed, and `GIT_SSH_COMMAND` wiring are otherwise verified. (The default gate —
+`M3OS_GIT_SSH_REGRESSION=1` without `NET` — runs the network-free core and PASSES.)
 
 ## Batch outcome
 

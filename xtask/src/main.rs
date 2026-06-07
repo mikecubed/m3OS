@@ -14001,6 +14001,24 @@ fn cmd_git_ssh_smoke(args: &SmokeBootArgs) {
             *arg = "user,id=net0".to_string();
         }
     }
+    // The live network path (`M3OS_GIT_SSH_NET`) drives a real SSH KEX, whose
+    // ephemeral X25519 needs the 86a CSPRNG at READY — otherwise dropbear's
+    // blocking `getrandom()` hangs ("Waiting for kernel randomness to be
+    // initialised"). The default TCG `qemu64` model exposes no hardware RNG, so
+    // the CSPRNG never credits entropy; advertise RDRAND/RDSEED (TCG emulates
+    // both) so it reaches READY. Harmless to the network-free core, so only added
+    // when the network path is actually exercised.
+    if attempt_net {
+        for i in 0..qemu_args.len() {
+            if qemu_args[i] == "-cpu"
+                && let Some(cpu) = qemu_args.get_mut(i + 1)
+                && cpu.starts_with("qemu64")
+                && !cpu.contains("rdrand")
+            {
+                cpu.push_str(",+rdrand,+rdseed");
+            }
+        }
+    }
     let steps = git_ssh_smoke_steps(attempt_net, attempt_clone, repo);
 
     println!(
@@ -14135,25 +14153,40 @@ fn git_ssh_smoke_steps(
     //    seeded key with a deliberately wrong (but well-formed) ed25519 entry,
     //    then connect: dropbear compares the server's key during KEX (before
     //    auth, so no registered identity is needed) and must abort with
-    //    "Host key mismatch", leaving the bad entry UNCHANGED (it must not
+    //    "host key mismatch for", leaving the bad entry UNCHANGED (it must not
     //    silently overwrite/accept). Then the good key is restored.
+    //
+    //    KNOWN BLOCKER (empirically confirmed): in QEMU SLIRP today this step
+    //    fails at the connect — dropbear resolves github.com and the kernel TCP
+    //    layer establishes the connection, but dropbear's NON-BLOCKING connect()
+    //    reports `Connect failed: unexpected failure` against m3OS's SYNCHRONOUS
+    //    `sys_connect` (the deferred non-blocking-connect item, see the 86b design
+    //    doc). So `M3OS_GIT_SSH_NET=1` currently surfaces that gap rather than the
+    //    reject; the default gate (no NET) is unaffected and exercises the core.
     if attempt_net {
         steps.push(SmokeStep::Send {
             input: "cp /root/.ssh/known_hosts /tmp/kh.good\n",
             label: "git-ssh-smoke: back up good known_hosts",
         });
         steps.push(SmokeStep::Sleep { millis: 200 });
+        // `echo` (a real ramdisk binary in m3OS; `printf` is not) appends the
+        // trailing newline dropbear needs to parse the line.
         steps.push(SmokeStep::Send {
-            input: "printf 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\\n' > /root/.ssh/known_hosts\n",
+            input: "echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB' > /root/.ssh/known_hosts\n",
             label: "git-ssh-smoke: plant mismatched host key",
         });
         steps.push(SmokeStep::Sleep { millis: 200 });
+        // Single-quote `git@github.com`: the login shell is `ion`, which treats a
+        // bare `@host` as array-expansion syntax (`ion: expansion error: Variable
+        // "github" does not exist`) and would fail the command before ssh runs.
         steps.push(SmokeStep::Send {
-            input: "ssh -T git@github.com\n",
+            input: "ssh -T 'git@github.com'\n",
             label: "git-ssh-smoke: connect with mismatched key (must reject)",
         });
+        // dropbear aborts KEX with `"%s host key mismatch for %s !"` (cli-kex.c) —
+        // e.g. `ED25519 host key mismatch for github.com !` (lowercase `host`).
         steps.push(SmokeStep::Wait {
-            pattern: "Host key mismatch",
+            pattern: "host key mismatch for",
             timeout_secs: 30,
             label: "git-ssh-smoke: mismatched host key REJECTED",
         });
@@ -14190,8 +14223,10 @@ fn git_ssh_smoke_steps(
             label: "git-ssh-smoke: wire git -> dropbear via GIT_SSH_COMMAND",
         });
         steps.push(SmokeStep::Sleep { millis: 200 });
+        // Single-quote the URL — it contains `git@…`, which `ion` would otherwise
+        // mis-parse as array expansion (see the `ssh -T` note above).
         let clone_cmd: &'static str = Box::leak(
-            format!("git clone --depth 1 --single-branch {repo} /tmp/ghclone\n").into_boxed_str(),
+            format!("git clone --depth 1 --single-branch '{repo}' /tmp/ghclone\n").into_boxed_str(),
         );
         steps.push(SmokeStep::Send {
             input: clone_cmd,
