@@ -678,8 +678,8 @@ pub unsafe fn setup_abi_stack_with_envp(
                 // SAFETY: cursor was derived from user virtual address arithmetic
                 // above; virt_to_kptr maps it into kernel address space via the
                 // direct physical map, which is valid for the lifetime of this
-                // execve call.  We are inside the outer `unsafe {}` block that
-                // spans this entire function body (line 610).
+                // execve call.  This write is inside the outer `unsafe {}` block
+                // that spans the entire `setup_abi_stack_with_envp` body.
                 let kptr = virt_to_kptr(cursor + i as u64)?;
                 kptr.write(byte);
             }

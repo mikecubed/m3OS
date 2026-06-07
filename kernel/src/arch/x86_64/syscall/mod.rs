@@ -15290,8 +15290,18 @@ pub(super) fn sys_getrandom(buf_ptr: u64, buflen: u64, flags: u64) -> u64 {
             }
             // Blocking-style: do a best-effort synchronous re-gather then serve.
             // In practice the DRBG is already READY because A.3 seeds at boot
-            // before any userspace runs; this path is a safety net.
-            seed_csprng_early();
+            // before any userspace runs; this path is a safety net.  Gate it to
+            // at most one attempt per boot: on a degraded (no-RDSEED/RDRAND)
+            // boot `gather_seed_entropy()` credits 0 bits, so the DRBG can never
+            // reach READY and an ungated call would re-gather entropy and emit a
+            // "[csprng] seeded …" log line on *every* secure getrandom, flooding
+            // the serial console.  A second attempt adds no credited bits, so
+            // one is enough; thereafter we just serve insecure (below).
+            static SAFETY_RESEED_DONE: core::sync::atomic::AtomicBool =
+                core::sync::atomic::AtomicBool::new(false);
+            if !SAFETY_RESEED_DONE.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                seed_csprng_early();
+            }
         }
         // After the best-effort re-seed, serve insecure if still not ready
         // (degraded-TSC-only boot path) so we never deadlock.

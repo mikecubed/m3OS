@@ -22,9 +22,13 @@ pub use kernel_core::net::tcp::{TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN, Tcp
 /// `AtomicU64`s.  Seeded lazily on first use from the global CSPRNG.
 ///
 /// The `0` sentinel triggers lazy init; a zero CSPRNG draw is replaced by a
-/// TSC-derived fallback so the secret is always non-zero in practice.  Even a
-/// TSC-derived secret is sufficient because SipHash is one-way: an attacker
-/// who observes one ISN cannot invert the hash to recover the key.
+/// TSC-derived fallback so the secret is always non-zero in practice.  The TSC
+/// fallback is **best-effort and non-cryptographic**: it only applies on a
+/// degraded boot where the CSPRNG never reached READY, and a guessable / low-
+/// entropy TSC key could be brute-forced by searching plausible keys (SipHash's
+/// one-wayness only stops the key being recovered by *inverting* an observed
+/// ISN — it does not make a low-entropy key secret).  On a normally-seeded boot
+/// the secret is a full 128-bit CSPRNG draw and this caveat does not apply.
 static ISN_SECRET0: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static ISN_SECRET1: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -79,8 +83,10 @@ fn tcp_isn(local_ip: Ipv4Addr, local_port: u16, remote_ip: Ipv4Addr, remote_port
     };
 
     // Timer component: tick_count() is 1000 Hz (1 ms resolution), ×4 gives
-    // 4 units per millisecond.  The wrapping is intentional — the 32-bit
-    // counter cycles every ~49 days at 1 ms ticks, keeping ISNs time-varying.
+    // 4 units per millisecond.  The wrapping is intentional — at 4 units/ms the
+    // 32-bit counter cycles every ~12.4 days (2^32 / 4000 per second), keeping
+    // ISNs time-varying.  (This matches the ~12-day figure in the doc comment
+    // above; the ×4 scaling is what shortens the wrap from the unscaled ~49 d.)
     let timer_component = crate::arch::x86_64::interrupts::tick_count().wrapping_mul(4) as u32;
 
     // One-way keyed PRF over the 4-tuple: pack 12 bytes (local_ip ‖ remote_ip
