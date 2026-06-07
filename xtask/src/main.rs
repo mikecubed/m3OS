@@ -13948,10 +13948,15 @@ fn cmd_git_ssh_smoke(args: &SmokeBootArgs) {
     // only. `M3OS_GIT_SSH_KEY` is read by populate_ext2_files to stage the
     // identity into the image.
     let attempt_net = std::env::var("M3OS_GIT_SSH_NET").is_ok_and(|v| v == "1");
+    // Require the key to be *readable*, not merely present: `populate_ext2_files`
+    // stages the identity via `fs::read`, so gating `attempt_clone` on the same
+    // readability avoids running the clone steps against an image that carries no
+    // `/root/.ssh/id_dropbear` (which would fail the clone at runtime instead of
+    // cleanly skipping it).
     let key_present = std::env::var("M3OS_GIT_SSH_KEY")
         .ok()
-        .map(std::path::PathBuf::from)
-        .is_some_and(|p| p.is_file());
+        .filter(|p| !p.is_empty())
+        .is_some_and(|p| std::fs::read(&p).is_ok());
     let attempt_clone = attempt_net && key_present;
     // Repo URL is a literal by default (a famously tiny public repo); an env
     // override is leaked to `&'static` so it can ride in a SmokeStep.
@@ -14153,13 +14158,17 @@ fn git_ssh_smoke_steps(
             label: "git-ssh-smoke: mismatched host key REJECTED",
         });
         // The planted (wrong) key must still be there — dropbear must not have
-        // silently replaced it with the real key. `grep -c BBBBBBBB` prints `1`.
+        // silently replaced it with the real key. Re-read the file: the run of
+        // `B`s is the planted key body, present in the file *content* but never
+        // in the `cat` command text, so matching it proves the bad entry
+        // survived (not auto-accepted/overwritten) without relying on a generic
+        // token like a bare grep count.
         steps.push(SmokeStep::Send {
-            input: "grep -c BBBBBBBBBBBBBBBB /root/.ssh/known_hosts\n",
-            label: "git-ssh-smoke: bad key was not overwritten",
+            input: "cat /root/.ssh/known_hosts\n",
+            label: "git-ssh-smoke: re-read known_hosts after rejection",
         });
         steps.push(SmokeStep::Wait {
-            pattern: "1",
+            pattern: "BBBBBBBBBBBBBBBB",
             timeout_secs: 20,
             label: "git-ssh-smoke: rejected key left on disk (not auto-accepted)",
         });

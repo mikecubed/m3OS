@@ -3496,7 +3496,8 @@ mod tests {
         // identity so a flag change self-invalidates its cached .m3pkg and two
         // ports never collide on the recipe component of the key.
         let ports = [
-            "zlib", "ncurses", "libevent", "less", "htop", "tmux", "git", "python",
+            "zlib", "ncurses", "libevent", "less", "htop", "tmux", "git", "python", "llvm",
+            "dropbear",
         ];
         let ids: Vec<&str> = ports.iter().map(|p| build_recipe_id(p)).collect();
         for (p, id) in ports.iter().zip(&ids) {
