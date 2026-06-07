@@ -193,32 +193,62 @@ fn is_valid_datetime(year: u32, month: u32, day: u32, hour: u32, minute: u32, se
     day <= kernel_core::time::days_in_month(year, month)
 }
 
-/// Initialise the RTC: read the hardware clock, compute the boot epoch, and
-/// store it in [`BOOT_EPOCH_SECS`].
+/// Hardcoded fallback floor epoch used when `M3OS_BUILD_EPOCH` was not baked
+/// in at compile time (e.g. a very old toolchain invocation without the new
+/// `build.rs`).  Value: 2026-06-01 00:00:00 UTC = 1_748_736_000.
+const BUILD_EPOCH_FALLBACK: u64 = 1_748_736_000;
+
+/// Return the build-date floor epoch in Unix seconds.
+///
+/// Uses the `M3OS_BUILD_EPOCH` compile-time env var (emitted by `build.rs`
+/// during every normal build).  Falls back to [`BUILD_EPOCH_FALLBACK`] if the
+/// var is absent or cannot be parsed — the fallback is always a sane, recent
+/// date so the wall-clock can never silently revert to 1970.
+fn build_epoch_floor() -> u64 {
+    option_env!("M3OS_BUILD_EPOCH")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(BUILD_EPOCH_FALLBACK)
+}
+
+/// Initialise the RTC: read the hardware clock, compute the boot epoch
+/// (applying a build-date floor so `BOOT_EPOCH_SECS` can never be zero), and
+/// store the result in [`BOOT_EPOCH_SECS`].
+///
+/// The fail-closed contract: if the RTC is invalid **or** reads a time before
+/// the build date, the build-date floor is used instead.  This prevents
+/// `tsc_now_us` / `sys_clock_gettime` from returning a 1970 wall-clock, which
+/// would make every TLS certificate look `notBefore`-in-the-future.
 pub fn init_rtc() {
     let (year, month, day, hour, minute, second) = read_rtc();
-    if !is_valid_datetime(year, month, day, hour, minute, second) {
+    let floor = build_epoch_floor();
+
+    let rtc_epoch = if is_valid_datetime(year, month, day, hour, minute, second) {
+        Some(kernel_core::time::date_to_unix_timestamp(
+            year, month, day, hour, minute, second,
+        ))
+    } else {
+        None
+    };
+
+    let (boot_epoch, floored) = kernel_core::time::apply_clock_floor(rtc_epoch, floor);
+    BOOT_EPOCH_SECS.store(boot_epoch, Ordering::Relaxed);
+
+    if floored {
         log::warn!(
-            "RTC: invalid datetime {}-{:02}-{:02} {:02}:{:02}:{:02}, leaving BOOT_EPOCH_SECS = 0",
+            "[rtc] clock floor applied: BOOT_EPOCH_SECS={} (RTC invalid or behind build-date floor); \
+             certificate time checks may be skipped on first boot",
+            boot_epoch
+        );
+    } else {
+        log::info!(
+            "RTC: {}-{:02}-{:02} {:02}:{:02}:{:02} UTC (epoch={})",
             year,
             month,
             day,
             hour,
             minute,
-            second
+            second,
+            boot_epoch
         );
-        return;
     }
-    let epoch = kernel_core::time::date_to_unix_timestamp(year, month, day, hour, minute, second);
-    BOOT_EPOCH_SECS.store(epoch, Ordering::Relaxed);
-    log::info!(
-        "RTC: {}-{:02}-{:02} {:02}:{:02}:{:02} UTC (epoch={})",
-        year,
-        month,
-        day,
-        hour,
-        minute,
-        second,
-        epoch
-    );
 }

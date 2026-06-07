@@ -134,6 +134,25 @@ pub fn bcd_to_binary(bcd: u8) -> u8 {
     (bcd >> 4) * 10 + (bcd & 0x0F)
 }
 
+/// Decide the boot wall-clock epoch given the RTC reading and a build-date floor.
+///
+/// Returns `(boot_epoch_secs, floored)`:
+/// - `floored` is `true` when the floor was applied because the RTC was invalid
+///   or read a time strictly before the floor.
+/// - `floored` is `false` when the RTC reading is valid and ≥ the floor.
+///
+/// Semantics (fail-closed):
+/// - `None` (invalid / unreadable RTC) → `(build_floor, true)`
+/// - `Some(e)` where `e < build_floor` → `(build_floor, true)`
+/// - `Some(e)` where `e >= build_floor` → `(e, false)`
+pub fn apply_clock_floor(rtc_epoch: Option<u64>, build_floor: u64) -> (u64, bool) {
+    match rtc_epoch {
+        None => (build_floor, true),
+        Some(e) if e < build_floor => (build_floor, true),
+        Some(e) => (e, false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,5 +277,65 @@ mod tests {
         assert_eq!(dt.year, 2024);
         assert_eq!(dt.month, 3);
         assert_eq!(dt.day, 1);
+    }
+
+    // ---- apply_clock_floor tests ----
+
+    /// A representative 2026 build-date floor: 2026-01-01 00:00:00 UTC.
+    const FLOOR_2026: u64 = 1_767_225_600;
+
+    #[test]
+    fn test_floor_invalid_rtc_returns_floor() {
+        // None (invalid RTC) → floor is applied
+        let (epoch, floored) = apply_clock_floor(None, FLOOR_2026);
+        assert_eq!(epoch, FLOOR_2026);
+        assert!(floored, "floored must be true when RTC is invalid");
+    }
+
+    #[test]
+    fn test_floor_early_rtc_returns_floor() {
+        // Year-2000 epoch (946_684_800) is well before the 2026 floor
+        let y2k: u64 = 946_684_800;
+        assert!(y2k < FLOOR_2026, "precondition: y2k is before floor");
+        let (epoch, floored) = apply_clock_floor(Some(y2k), FLOOR_2026);
+        assert_eq!(epoch, FLOOR_2026);
+        assert!(floored, "floored must be true when RTC is behind floor");
+    }
+
+    #[test]
+    fn test_floor_valid_recent_rtc_unchanged() {
+        // A reading 10_000 seconds after the floor is accepted as-is
+        let recent = FLOOR_2026 + 10_000;
+        let (epoch, floored) = apply_clock_floor(Some(recent), FLOOR_2026);
+        assert_eq!(epoch, recent);
+        assert!(!floored, "floored must be false for a valid recent RTC");
+    }
+
+    #[test]
+    fn test_floor_boundary_equal_to_floor_not_floored() {
+        // e == build_floor → valid, not floored
+        let (epoch, floored) = apply_clock_floor(Some(FLOOR_2026), FLOOR_2026);
+        assert_eq!(epoch, FLOOR_2026);
+        assert!(
+            !floored,
+            "floored must be false when RTC equals floor exactly"
+        );
+    }
+
+    #[test]
+    fn test_floor_one_second_before_floor_is_floored() {
+        // e == build_floor - 1 → just below threshold, must be floored
+        let just_before = FLOOR_2026 - 1;
+        let (epoch, floored) = apply_clock_floor(Some(just_before), FLOOR_2026);
+        assert_eq!(epoch, FLOOR_2026);
+        assert!(floored);
+    }
+
+    #[test]
+    fn test_floor_zero_epoch_rtc_is_floored() {
+        // An RTC reading of epoch 0 (1970-01-01) is explicitly floored
+        let (epoch, floored) = apply_clock_floor(Some(0), FLOOR_2026);
+        assert_eq!(epoch, FLOOR_2026);
+        assert!(floored);
     }
 }
