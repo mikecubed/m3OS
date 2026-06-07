@@ -14,6 +14,88 @@ use kernel_core::net::tcp::{
 };
 pub use kernel_core::net::tcp::{TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN, TcpHeader};
 
+// ---------------------------------------------------------------------------
+// Phase 86a Track A.5 — RFC 6528-style Initial Sequence Number generation
+// ---------------------------------------------------------------------------
+
+/// Per-boot 128-bit ISN secret (RFC 6528 §3) — two halves stored as separate
+/// `AtomicU64`s.  Seeded lazily on first use from the global CSPRNG.
+///
+/// The `0` sentinel triggers lazy init; a zero CSPRNG draw is replaced by a
+/// TSC-derived fallback so the secret is always non-zero in practice.  Even a
+/// TSC-derived secret is sufficient because SipHash is one-way: an attacker
+/// who observes one ISN cannot invert the hash to recover the key.
+static ISN_SECRET0: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static ISN_SECRET1: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Return a non-zero u64 from the CSPRNG, falling back to the TSC.
+#[inline]
+fn isn_draw_nonzero() -> u64 {
+    let v = kernel_core::csprng::global_random_u64()
+        .unwrap_or_else(|| unsafe { core::arch::x86_64::_rdtsc() });
+    if v == 0 { 0xDEAD_BEEF_CAFE_BABE } else { v }
+}
+
+/// Compute a RFC 6528-style Initial Sequence Number.
+///
+/// `isn = timer_component.wrapping_add(prf)`
+///
+/// - **timer component**: ms-resolution tick counter scaled ×4 (4 units/ms);
+///   wraps every ~12 days, ensuring each reconnection starts at a fresh offset.
+/// - **PRF = SipHash-2-4(secret0, secret1, four_tuple_bytes)**:
+///   `four_tuple_bytes` = local_ip(4) ‖ remote_ip(4) ‖ local_port(2) ‖ remote_port(2).
+///   SipHash-2-4 is a one-way keyed hash (PRF-secure), so one observed ISN
+///   does **not** reveal the 128-bit per-boot secret (unlike an additive mix,
+///   which is invertible).  This matches Linux's `secure_tcp_seq` (SipHash).
+///
+/// Two connections to different destinations get different ISNs; the same
+/// destination re-connected gets a different ISN because the timer advanced.
+fn tcp_isn(local_ip: Ipv4Addr, local_port: u16, remote_ip: Ipv4Addr, remote_port: u16) -> u32 {
+    use core::sync::atomic::Ordering;
+
+    // Lazy-init the 128-bit per-boot secret (two independent u64 halves).
+    // Best-effort: if two cores race on first use the result is consistent —
+    // both produce valid non-zero secrets and SipHash gives different output
+    // per 4-tuple regardless of which half "wins".
+    let s0 = {
+        let v = ISN_SECRET0.load(Ordering::Relaxed);
+        if v == 0 {
+            let fresh = isn_draw_nonzero();
+            ISN_SECRET0.store(fresh, Ordering::Relaxed);
+            fresh
+        } else {
+            v
+        }
+    };
+    let s1 = {
+        let v = ISN_SECRET1.load(Ordering::Relaxed);
+        if v == 0 {
+            let fresh = isn_draw_nonzero();
+            ISN_SECRET1.store(fresh, Ordering::Relaxed);
+            fresh
+        } else {
+            v
+        }
+    };
+
+    // Timer component: tick_count() is 1000 Hz (1 ms resolution), ×4 gives
+    // 4 units per millisecond.  The wrapping is intentional — the 32-bit
+    // counter cycles every ~49 days at 1 ms ticks, keeping ISNs time-varying.
+    let timer_component = crate::arch::x86_64::interrupts::tick_count().wrapping_mul(4) as u32;
+
+    // One-way keyed PRF over the 4-tuple: pack 12 bytes (local_ip ‖ remote_ip
+    // ‖ local_port ‖ remote_port) and feed them through SipHash-2-4.
+    // The 64→32 truncation is standard (take the low 32 bits of the hash).
+    let mut four_tuple = [0u8; 12];
+    four_tuple[0..4].copy_from_slice(&local_ip);
+    four_tuple[4..8].copy_from_slice(&remote_ip);
+    four_tuple[8..10].copy_from_slice(&local_port.to_be_bytes());
+    four_tuple[10..12].copy_from_slice(&remote_port.to_be_bytes());
+    let prf = kernel_core::csprng::siphash24(s0, s1, &four_tuple) as u32;
+
+    timer_component.wrapping_add(prf)
+}
+
 /// Rate-limited log for dropped out-of-order/duplicate TCP payload (m3OS has no
 /// reassembly queue). Budgeted so a lossy link cannot flood the serial console;
 /// the count confirms whether this path fires during the SSH-disconnect hang.
@@ -247,7 +329,8 @@ impl TcpConnection {
     fn connect(&mut self, remote_ip: Ipv4Addr, remote_port: u16, pending: &mut PendingTx) {
         self.remote_ip = remote_ip;
         self.remote_port = remote_port;
-        self.snd_nxt = crate::arch::x86_64::interrupts::tick_count() as u32;
+        // Phase 86a Track A.5: RFC 6528-style ISN (timer + keyed PRF over 4-tuple).
+        self.snd_nxt = tcp_isn(self.local_ip, self.local_port, remote_ip, remote_port);
         self.snd_una = self.snd_nxt;
 
         let p = TcpBuildParams {
@@ -383,7 +466,14 @@ impl TcpConnection {
             TcpState::Listen if has_syn => {
                 self.remote_port = header.src_port;
                 self.rcv_nxt = header.seq.wrapping_add(1);
-                self.snd_nxt = crate::arch::x86_64::interrupts::tick_count() as u32;
+                // Phase 86a Track A.5: RFC 6528-style ISN.
+                // self.remote_ip is already set from ip_header.src before handle_segment.
+                self.snd_nxt = tcp_isn(
+                    self.local_ip,
+                    self.local_port,
+                    self.remote_ip,
+                    header.src_port,
+                );
                 self.snd_una = self.snd_nxt;
                 self.queue_segment(pending, TCP_SYN | TCP_ACK, &[]);
                 self.snd_nxt = self.snd_nxt.wrapping_add(1);

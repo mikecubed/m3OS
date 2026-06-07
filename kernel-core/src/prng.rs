@@ -1,6 +1,13 @@
 //! Xorshift64-multiply PRNG for kernel entropy (Phase 48).
 //!
-//! Extracted from the kernel syscall handler to enable host-side testing.
+//! **QUARANTINED (Phase 86a):** This module is NOT reachable from any
+//! `csprng` / `getrandom` call path as of Phase 86a. `getrandom` (syscall
+//! 318) and all downstream entropy consumers now use
+//! [`kernel_core::csprng::ChaChaDrbg`] seeded via RDSEED/RDRAND/TSC. This
+//! type is retained only for non-crypto statistical uses (e.g. deterministic
+//! layout fuzzing). If all remaining callers are removed, delete this module
+//! and its `pub mod prng;` entry in `lib.rs`.
+//!
 //! The PRNG is NOT cryptographically secure but provides reasonable
 //! statistical quality when seeded with hardware entropy (RDRAND).
 

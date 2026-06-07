@@ -1,11 +1,21 @@
 //! CSPRNG seeded from the kernel's `getrandom` syscall.
 //!
-//! **Entropy note:** The kernel `getrandom` implementation seeds its PRNG
-//! from RDRAND mixed with TSC, and reseeds from RDRAND every 256 bytes.
-//! This provides hardware-backed entropy on supported CPUs. The underlying
-//! xorshift64-multiply PRNG has not been audited for production use;
-//! generated keys are suitable for testing and development but should not
-//! be used to protect real secrets.
+//! **Entropy note (Phase 86a):** The kernel `getrandom` implementation now
+//! sources a **ChaCha20 DRBG** seeded from RDSEED → RDRAND → TSC (in
+//! preference order) during early boot.  The DRBG performs fast-key-erasure
+//! after each draw and reseeds at a 60-second or 1 MiB output ceiling.
+//! This supersedes the previous xorshift64-multiply PRNG that was seeded per
+//! call.
+//!
+//! **Key rotation note:** Secrets generated under the *previous* weak PRNG
+//! (any m3OS boot prior to Phase 86a) are NOT automatically rotated by this
+//! upgrade.  Affected artifacts that should be manually regenerated include:
+//!   - The `sshd` Ed25519 host key (`/etc/ssh/ssh_host_ed25519_key`)
+//!   - Any `passwd`/`shadow` password hashes (salts were derived from the
+//!     old PRNG)
+//!
+//! To regenerate the host key: delete the file and restart `sshd`.
+//! To regenerate password hashes: use `passwd` for each account.
 
 use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore, SeedableRng};

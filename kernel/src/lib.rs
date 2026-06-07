@@ -103,6 +103,39 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
     // `kstack::alloc` / `alloc_leaked_top`.
     task::kstack::init();
 
+    // Phase 86a Track A.3 — Seed the CSPRNG from hardware entropy as early as
+    // possible in the boot sequence.
+    //
+    // PLACEMENT RATIONALE — why here (after kstack::init, before everything else):
+    //   - mm::init must have completed so the kernel heap is available (the spin
+    //     Mutex in ChaChaDrbg requires no alloc, but log::info! may).
+    //   - Must be before net::virtio_net::init (~line 331) so the TCP ISN helper
+    //     draws from a seeded DRBG on the first connect/listen.
+    //   - Must be before task::spawn(init_task) (~line 373) so AT_RANDOM bytes in
+    //     every execve'd binary come from a seeded DRBG.
+    //   - The #[cfg(test)] harness below may skip the rest of boot, but it never
+    //     calls getrandom/exec/tcp, so running seed_csprng_early() before it is
+    //     harmless.
+    //
+    // PRE-SEED CONSUMER AUDIT (Phase 86a):
+    //   • Kernel stack canary:   m3OS uses panic-strategy=abort; there is no
+    //       -Z stack-protector enabled; no canary is drawn before this point.
+    //       Status: N/A.
+    //   • AT_RANDOM (kernel/src/mm/elf.rs ~line 666):
+    //       Called at execve time, which is after init_task spawns (line ~373)
+    //       and after this seed point.  Status: MOVED AFTER SEED.
+    //   • TCP ISN (kernel/src/net/tcp.rs ~line 250 and ~line 386):
+    //       TCP connect/listen happens after net::virtio_net::init (line ~331)
+    //       which is after this seed point.  Status: MOVED AFTER SEED.
+    //   • DNS transaction ID:
+    //       musl's resolver runs in userspace (ring 3) via getrandom.  getrandom
+    //       is only called after userspace processes start (after init_task),
+    //       which is well after this seed point.  Status: MOVED AFTER SEED.
+    //   • Degraded path (no RDSEED/RDRAND): DRBG stays Early; fill_insecure is
+    //       used by AT_RANDOM and TCP ISN fallbacks; boot reaches login prompt
+    //       without deadlock.  Status: ACCEPTED DEGRADED.
+    arch::x86_64::syscall::seed_csprng_early();
+
     // When built with `cargo test`, run the generated test harness and exit.
     // Placed after mm::init so that tests can use heap allocations.
     // `tmpfs::init()` is deferred to after this block so its heap / frame
