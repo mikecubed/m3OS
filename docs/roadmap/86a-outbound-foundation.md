@@ -1,6 +1,6 @@
 # Phase 86a - Outbound Foundation (CSPRNG, Wall-clock, Resolver, CA Trust)
 
-**Status:** Planned
+**Status:** Complete (PR #227) — kernel `0.86.0`
 **Source Ref:** phase-86a
 **Depends on:** Phase 48 (Security Foundation) ✅, Phase 77 (Pre-1.0 Cleanup — DNS reply delivery D.1 + outbound TCP `connect` D.2) ✅, Phase 85a (Package & Build-Cache Infrastructure) ✅
 **Builds on:** First sub-phase (86a) of the Phase 86 umbrella ([./86-networking-and-github.md](./86-networking-and-github.md)) — repairs the entropy/time/trust foundation that all of 86b–86f silently assume, without landing any transport.

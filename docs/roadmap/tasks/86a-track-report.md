@@ -24,10 +24,10 @@
 
 | Track | Tasks | Owned files | Branch | Worktree | State |
 |---|---|---|---|---|---|
-| A | A.1–A.5 (CSPRNG) | kernel-core/src/{csprng.rs,lib.rs,prng.rs}, kernel/src/arch/x86_64/syscall/mod.rs, kernel/src/lib.rs, kernel/src/mm/elf.rs, kernel/src/net/tcp.rs, userspace/crypto-lib/src/random.rs | `wt/phase-86a-track-a` | `../ostest-wt-track-a` | pending |
-| C | C.1–C.2 (DNS + CA) | xtask/src/main.rs, xtask/src/port_build.rs, ports/lib/ca-certificates/Portfile, userspace/dns-smoke/dns-smoke.c, docs/roadmap/86a-outbound-foundation.md (resolver DEFERRED note) | `wt/phase-86a-track-c` | `../ostest-wt-track-c` | pending |
-| B | B.1 (wall-clock floor) | kernel/build.rs, kernel/src/rtc.rs | `wt/phase-86a-track-b` | `../ostest-wt-track-b` | pending |
-| D | D.1 (version bump) | kernel/Cargo.toml, Cargo.lock | (coordinator, on integration branch) | — | pending |
+| A | A.1–A.5 (CSPRNG) | kernel-core/src/{csprng.rs,lib.rs,prng.rs}, kernel/src/arch/x86_64/syscall/mod.rs, kernel/src/lib.rs, kernel/src/mm/elf.rs, kernel/src/net/tcp.rs, userspace/crypto-lib/src/random.rs | `wt/phase-86a-track-a` | `../ostest-wt-track-a` | ✅ merged (e0938a1) |
+| C | C.1–C.2 (DNS + CA) | xtask/src/main.rs, xtask/src/port_build.rs, ports/lib/ca-certificates/Portfile, docs/roadmap/86a-outbound-foundation.md (resolver/trust notes); dns-smoke.c already AF_INET-correct (unchanged) | `wt/phase-86a-track-c` | `../ostest-wt-track-c` | ✅ merged (ca77e35) |
+| B | B.1 (wall-clock floor) | kernel/build.rs, kernel/src/rtc.rs, kernel-core/src/time.rs (pure floor helper) | `wt/phase-86a-track-b` | `../ostest-wt-track-b` | ✅ merged (cde45bf) |
+| D | D.1 (version bump) | kernel/Cargo.toml, Cargo.lock | (coordinator, on integration branch) | — | ✅ done (557b062) |
 
 ## Execution plan
 
@@ -39,8 +39,32 @@
 
 ## Rescue history
 
-(none yet)
+- **No rescues.** All four tracks' implementer agents returned final results; none stalled, none required a nudge or replacement.
+- **Track A — 1 revision round** (round 1 of 2): the independent reviewer (opus) flagged the TCP ISN PRF as an additive (invertible) mix — observing one ISN could solve for the global secret. Re-scoped to `tcp.rs` + `csprng.rs`; replaced with a one-way **SipHash-2-4** keyed PRF over the 4-tuple + a 128-bit per-boot secret, host-tested against official SipHash vectors. Converged in one round. (Two MINOR nits fixed in the same round: timer-comment accuracy; `getrandom` secure-fill invariant doc + `debug_assert`.)
+- Tracks B, C: reviewer **APPROVE**, no revision needed.
+
+## Validation (coordinator-owned, on the integrated branch)
+
+| Gate | Result |
+|---|---|
+| `cargo xtask check` (clippy -D warnings + rustfmt + all host tests incl. 16 csprng tests w/ SipHash vectors + 6 time-floor tests + xtask Portfile) | ✅ PASS |
+| `cargo xtask test` (kernel QEMU suite) | ✅ 12/12 |
+| `cargo xtask smoke-test` + `M3OS_DNS_REGRESSION=1` | ✅ 22 steps; `SMOKE:dns-smoke:PASS` |
+| `cargo xtask regression` | ✅ 11/11 |
+| Manual boot `+rdseed` | ✅ `[csprng] seeded source=rdseed credited_bits=256 state=READY` |
+| Manual boot default `qemu64` (no RDSEED/RDRAND) | ✅ degraded EARLY, boots to login (no deadlock) |
+| Manual boot `-rtc base=2000-01-01` | ✅ `[rtc] clock floor applied: BOOT_EPOCH_SECS=1780800303 … not 1970` |
+| `cargo xtask port build ca-certificates` | ✅ `verified cacert.pem (sha 86a1f33…)` → staged `etc/ssl/certs/ca-certificates.crt` → sealed `.m3pkg` |
+| Boot banner | ✅ `[m3os] Hello from kernel! v0.86.0` |
 
 ## Batch outcome
 
-(pending)
+- **Merged tracks:** A, B, C, D — all four integrated into `feat/phase-86a-outbound-foundation`.
+- **Retained/abandoned:** none.
+- **Integration branch:** committed + pushed; PR #227 (transitioned from draft to ready).
+- **Workflow outcome measures:**
+  - `discovery-reuse`: scout skipped (task doc was a fully-scoped brief); coordinator read every task site to ground the briefs — reused by all tracks.
+  - `rescue-attempts`: 0.
+  - `abandonment-events`: 0.
+  - `re-review-loops`: Track A = 1 (ISN PRF hardening); B = 0; C = 0.
+- **Temporary work surfaces:** the three external worktrees (`../ostest-wt-track-{a,b,c}`) were removed after merge.
