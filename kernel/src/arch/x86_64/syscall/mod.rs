@@ -15811,6 +15811,7 @@ const NEG_ENOPROTOOPT: u64 = (-92_i64) as u64;
 const NEG_EAFNOSUPPORT: u64 = (-97_i64) as u64;
 const NEG_EISCONN: u64 = (-106_i64) as u64;
 const NEG_EALREADY: u64 = (-114_i64) as u64;
+const NEG_EINPROGRESS: u64 = (-115_i64) as u64;
 
 // ===========================================================================
 // Phase 39: Unix domain socket syscall helpers
@@ -16597,6 +16598,19 @@ pub(super) fn sys_connect(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
 
     match proto {
         crate::net::SocketProtocol::Tcp => {
+            // Phase 86b — non-blocking connect re-issue guard. A poll-driven
+            // client (e.g. dropbear) calls connect() again after the first call
+            // returned EINPROGRESS; reject the re-issue BEFORE allocating a fresh
+            // TCP slot so retries cannot leak slots from the 64-entry table.
+            // Reconcile first so a connect that has since completed reports
+            // EISCONN rather than EALREADY.
+            crate::net::reconcile_connecting(handle);
+            match crate::net::with_socket(handle, |s| s.state) {
+                Some(crate::net::SocketState::Connected) => return NEG_EISCONN,
+                Some(crate::net::SocketState::Connecting) => return NEG_EALREADY,
+                _ => {}
+            }
+
             // Allocate a TCP connection slot
             let local_port = crate::net::with_socket(handle, |s| {
                 if s.local_port == 0 {
@@ -16620,6 +16634,24 @@ pub(super) fn sys_connect(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
                 s.local_port = local_port;
                 s.local_addr = crate::net::config::our_ip();
             });
+
+            // Phase 86b — non-blocking connect: the SYN is now in flight and the
+            // standing net_task drives the handshake to completion. Return
+            // EINPROGRESS immediately instead of busy-waiting; the caller detects
+            // completion via poll(POLLOUT) → getsockopt(SO_ERROR). Mark the socket
+            // Connecting so the poll/getsockopt paths can promote it (Established
+            // → Connected) or surface failure (Closed slot → POLLOUT|POLLERR,
+            // SO_ERROR=ECONNREFUSED). The TCP slot is intentionally NOT destroyed
+            // here — it must outlive this syscall and is reaped at close().
+            let nonblock = current_fd_entry(fd as usize)
+                .map(|e| e.nonblock)
+                .unwrap_or(false);
+            if nonblock {
+                crate::net::with_socket_mut(handle, |s| {
+                    s.state = crate::net::SocketState::Connecting;
+                });
+                return NEG_EINPROGRESS;
+            }
 
             // Block until connected or error
             let start_tick = crate::arch::x86_64::interrupts::tick_count();
@@ -16653,6 +16685,19 @@ pub(super) fn sys_connect(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
                             return NEG_ETIMEDOUT;
                         }
                         if has_pending_signal() {
+                            // Phase 86b — reap the in-flight TCP slot before
+                            // returning EINTR, mirroring the timeout/refused arms
+                            // above. Without this the SYN-SENT slot is orphaned:
+                            // a re-issued blocking connect() (state is still
+                            // Bound/Unbound, so the Connecting re-issue guard does
+                            // not catch it) calls tcp::create() again and
+                            // overwrites s.tcp_slot, leaking one of 64 slots until
+                            // reboot. (Pre-existing; surfaced by the 86b audit.)
+                            crate::net::tcp::destroy(tcp_idx);
+                            crate::net::with_socket_mut(handle, |s| {
+                                s.tcp_slot = None;
+                                s.state = crate::net::SocketState::Closed;
+                            });
                             return NEG_EINTR;
                         }
                         crate::task::yield_now();
@@ -17500,6 +17545,11 @@ pub(super) fn sys_getpeername(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 
         Ok(v) => v,
         Err(e) => return e,
     };
+    // Phase 86b — promote a completed non-blocking connect before reading
+    // s.state, so a client that lets connect() reach Established without ever
+    // poll()ing does not get a spurious ENOTCONN here. Keeps getpeername
+    // consistent with the other SocketState readers (connect/getsockopt/poll).
+    crate::net::reconcile_connecting(handle);
     let info = match crate::net::with_socket(handle, |s| (s.remote_addr, s.remote_port, s.state)) {
         Some(v) => v,
         None => return NEG_EBADF,
@@ -17607,6 +17657,7 @@ pub(super) fn sys_getsockopt(
     const SO_KEEPALIVE: u64 = 9;
     const SO_RCVBUF: u64 = 8;
     const SO_SNDBUF: u64 = 7;
+    const SO_ERROR: u64 = 4;
     const SO_PEERCRED: u64 = 17;
     const IPPROTO_TCP: u64 = 6;
     const TCP_NODELAY: u64 = 1;
@@ -17686,6 +17737,35 @@ pub(super) fn sys_getsockopt(
         }
         (IPPROTO_TCP, TCP_NODELAY) => {
             crate::net::with_socket(handle, |s| s.options.tcp_nodelay as i32).unwrap_or(0)
+        }
+        (SOL_SOCKET, SO_ERROR) => {
+            // Phase 86b — pending socket error, read once by clients after a
+            // non-blocking connect completes (poll POLLOUT → getsockopt SO_ERROR).
+            // Derived on demand and bounded to the connecting window: a connect
+            // that reached Established (now promoted to Connected) or is still in
+            // flight reports 0; a Connecting socket whose slot has gone Closed
+            // reports the POSITIVE errno ECONNREFUSED(111). A normally
+            // established/closed data socket reports 0 (no spurious error). The
+            // value written is the positive errno, not the kernel NEG_ encoding.
+            crate::net::reconcile_connecting(handle);
+            crate::net::with_socket(handle, |s| {
+                if matches!(s.state, crate::net::SocketState::Connecting) {
+                    match s.tcp_slot {
+                        Some(idx)
+                            if matches!(
+                                crate::net::tcp::state(idx),
+                                crate::net::tcp::TcpState::Closed
+                            ) =>
+                        {
+                            111
+                        }
+                        _ => 0,
+                    }
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0)
         }
         _ => return NEG_ENOPROTOOPT,
     };
@@ -18807,6 +18887,12 @@ fn fd_poll_events(entry: &FdEntry) -> i16 {
         }
         FdBackend::Socket { handle } => {
             let h = *handle;
+            // Phase 86b — promote a completed non-blocking connect
+            // (Connecting → Connected) before computing readiness, so the
+            // writable check below reports POLLOUT on connect success. A failed
+            // connect stays Connecting with a Closed slot and is surfaced as
+            // POLLOUT|POLLERR (see the writable + RST branches below).
+            crate::net::reconcile_connecting(h);
             crate::net::with_socket(h, |s| {
                 let mut revents: i16 = 0;
                 let readable = match s.protocol {
@@ -18836,10 +18922,22 @@ fn fd_poll_events(entry: &FdEntry) -> i16 {
                         .load(core::sync::atomic::Ordering::Acquire),
                 };
                 let writable = match s.protocol {
-                    crate::net::SocketProtocol::Tcp => {
-                        s.tcp_slot.is_some()
-                            && matches!(s.state, crate::net::SocketState::Connected)
-                    }
+                    crate::net::SocketProtocol::Tcp => match s.tcp_slot {
+                        // Connected (incl. a just-promoted non-blocking connect)
+                        // is writable. A socket still Connecting whose slot has
+                        // gone Closed is a *failed* connect — POSIX makes it
+                        // writable so the caller's select(writefds) wakes and
+                        // reads SO_ERROR. A slot still in SynSent is not writable.
+                        Some(idx) => {
+                            matches!(s.state, crate::net::SocketState::Connected)
+                                || (matches!(s.state, crate::net::SocketState::Connecting)
+                                    && matches!(
+                                        crate::net::tcp::state(idx),
+                                        crate::net::tcp::TcpState::Closed
+                                    ))
+                        }
+                        None => false,
+                    },
                     _ => true,
                 };
                 if readable {

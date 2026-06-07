@@ -134,6 +134,11 @@ pub enum SocketProtocol {
 pub enum SocketState {
     Unbound,
     Bound,
+    /// Phase 86b — a non-blocking `connect()` returned `EINPROGRESS`; the SYN is
+    /// in flight and the standing `net_task` is driving the handshake. The poll
+    /// and `getsockopt(SO_ERROR)` paths promote this to `Connected` on
+    /// completion (via [`reconcile_connecting`]) or surface failure.
+    Connecting,
     Connected,
     Listening,
     Closed,
@@ -366,6 +371,34 @@ where
 {
     let mut table = SOCKET_TABLE.lock();
     table.entries.get_mut(handle as usize)?.as_mut().map(f)
+}
+
+/// Phase 86b — reconcile a non-blocking TCP socket left in [`SocketState::Connecting`]
+/// after its `connect()` returned `EINPROGRESS`. The standing `net_task` advances
+/// the underlying TCP slot in the background; this promotes the socket's lifecycle
+/// state to match — `Connecting` → `Connected` once the slot reaches `Established`.
+///
+/// A *failed* connect is deliberately left as `Connecting` with a `Closed` slot
+/// (rather than collapsed straight to `Closed`) so the poll path can still surface
+/// `POLLOUT | POLLERR` and `getsockopt(SO_ERROR)` can report the errno; the slot is
+/// reaped at `close()`. Idempotent and cheap — a no-op for any socket that is not
+/// currently `Connecting`.
+///
+/// Lock order: acquires `SOCKET_TABLE`, then (via `tcp::state`) `TCP_CONNS` — the
+/// same order as `fd_poll_events`. The TCP segment handler drops `TCP_CONNS` before
+/// it touches the socket table (see `tcp::process_rx`), so this cannot invert.
+pub fn reconcile_connecting(handle: SocketHandle) {
+    with_socket_mut(handle, |s| {
+        if matches!(s.state, SocketState::Connecting)
+            && let Some(idx) = s.tcp_slot
+            && matches!(
+                crate::net::tcp::state(idx),
+                crate::net::tcp::TcpState::Established
+            )
+        {
+            s.state = SocketState::Connected;
+        }
+    });
 }
 
 /// Wake all sockets that reference a given TCP connection slot.

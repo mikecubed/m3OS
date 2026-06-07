@@ -120,6 +120,8 @@ static MMAP_LEAK_TEST_ELF: &[u8] = generated_initrd_asset!("mmap-leak-test");
 static TLS_SMOKE_ELF: &[u8] = generated_initrd_asset!("tls-smoke");
 // Phase 77 Track D.1: DNS resolution smoke test (musl resolver).
 static DNS_SMOKE_ELF: &[u8] = generated_initrd_asset!("dns-smoke");
+// Phase 86b: non-blocking connect() / EINPROGRESS + poll + SO_ERROR smoke test.
+static CONNECT_SMOKE_ELF: &[u8] = generated_initrd_asset!("connect-smoke");
 static MAKE_ELF: &[u8] = generated_initrd_asset!("make");
 static HEAD_ELF: &[u8] = generated_initrd_asset!("head");
 static TAIL_ELF: &[u8] = generated_initrd_asset!("tail");
@@ -845,6 +847,13 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "dns-smoke",
         RamdiskNode::File {
             content: DNS_SMOKE_ELF,
+        },
+    ),
+    // Phase 86b: non-blocking connect() smoke test
+    (
+        "connect-smoke",
+        RamdiskNode::File {
+            content: CONNECT_SMOKE_ELF,
         },
     ),
     // Phase 34: timekeeping utilities

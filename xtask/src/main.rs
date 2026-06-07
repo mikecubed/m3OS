@@ -2773,6 +2773,8 @@ fn build_musl_bins() {
         ("userspace/tls-smoke/tls-smoke.c", "tls-smoke"),
         // Phase 77 Track D.1: DNS resolution smoke test (musl resolver).
         ("userspace/dns-smoke/dns-smoke.c", "dns-smoke"),
+        // Phase 86b: non-blocking connect() / EINPROGRESS + poll + SO_ERROR.
+        ("userspace/connect-smoke/connect-smoke.c", "connect-smoke"),
     ];
 
     let cc = match find_musl_cc() {
@@ -7279,6 +7281,19 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         pattern_b: "SMOKE:dns-smoke:SKIP",
         timeout_secs: 30,
         label: "guest/dns-smoke: resolver path exercised or skipped",
+        extra_steps_a: &[],
+        extra_steps_b: &[],
+    });
+    // Phase 86b — non-blocking connect() / EINPROGRESS + poll(POLLOUT) +
+    // getsockopt(SO_ERROR) + EALREADY. The musl-built `/bin/connect-smoke`
+    // asserts the new semantics deterministically (no outbound network). PASS
+    // is the load-bearing verdict; SKIP only when the binary is absent (no musl
+    // toolchain at build). A FAIL surfaces as neither pattern → step timeout.
+    steps.push(SmokeStep::WaitEither {
+        pattern_a: "SMOKE:connect-smoke:PASS",
+        pattern_b: "SMOKE:connect-smoke:SKIP",
+        timeout_secs: 30,
+        label: "guest/connect-smoke: non-blocking connect EINPROGRESS/poll/SO_ERROR verified or skipped",
         extra_steps_a: &[],
         extra_steps_b: &[],
     });
@@ -16344,6 +16359,7 @@ fn populate_ext2_files(
     let empty_content = "";
     let udp_smoke_bin = generated_initrd_dir(&workspace_root()).join("udp-smoke");
     let dns_smoke_bin = generated_initrd_dir(&workspace_root()).join("dns-smoke");
+    let connect_smoke_bin = generated_initrd_dir(&workspace_root()).join("connect-smoke");
 
     // Phase 76 — `/lib/ld-musl-x86_64.so.1` source path. Built by
     // `build_ldso()` into `target/generated-libs/`. The on-disk
@@ -17055,6 +17071,10 @@ fn populate_ext2_files(
           sif bin/dns-smoke mode 0x81ED\n\
           sif bin/dns-smoke uid 0\n\
           sif bin/dns-smoke gid 0\n\
+          write \"{connect_smoke_bin}\" bin/connect-smoke\n\
+          sif bin/connect-smoke mode 0x81ED\n\
+          sif bin/connect-smoke uid 0\n\
+          sif bin/connect-smoke gid 0\n\
           sif home mode 0x41ED\n\
          sif home uid 0\n\
          sif home gid 0\n\
@@ -17342,6 +17362,7 @@ fn populate_ext2_files(
         inject_key_cmds = inject_key_cmds,
         udp_smoke_bin = udp_smoke_bin.display(),
         dns_smoke_bin = dns_smoke_bin.display(),
+        connect_smoke_bin = connect_smoke_bin.display(),
         // Phase 76 — host path of the staged dynamic linker; written
         // to `/lib/ld-musl-x86_64.so.1` on the ext2 disk.
         ldso_bin = ldso_bin.display(),

@@ -37,6 +37,14 @@ const TLS_SMOKE_PASS_NEEDLE: &[u8] = b"TLS_SMOKE:PASS";
 const DNS_SMOKE_PATH: &[u8] = b"/bin/dns-smoke\0";
 const DNS_SMOKE_ARGV0: &[u8] = b"dns-smoke\0";
 const DNS_SMOKE_NEEDLE: &[u8] = b"DNS_SMOKE:";
+// Phase 86b — non-blocking connect() smoke. connect-smoke asserts the new
+// EINPROGRESS / poll(POLLOUT) / getsockopt(SO_ERROR) / EALREADY semantics
+// deterministically (no network) and exits 0 with CONNECT_SMOKE:PASS, or
+// exits non-zero with CONNECT_SMOKE:FAIL. The needle is the PASS marker (not
+// the bare prefix) so a FAIL verdict fails the gate.
+const CONNECT_SMOKE_PATH: &[u8] = b"/bin/connect-smoke\0";
+const CONNECT_SMOKE_ARGV0: &[u8] = b"connect-smoke\0";
+const CONNECT_SMOKE_PASS_NEEDLE: &[u8] = b"CONNECT_SMOKE:PASS";
 // Phase 76 — `dynlink_smoke` is a musl-built dynamic ELF carrying
 // `PT_INTERP = /lib/ld-musl-x86_64.so.1` and zero `DT_NEEDED`
 // entries. Running it exercises the kernel `PT_INTERP` branch +
@@ -308,6 +316,32 @@ fn program_main(_args: &[&str]) -> i32 {
                 return code;
             }
             pass("dns-smoke");
+        }
+    }
+
+    // Phase 86b — non-blocking connect() / EINPROGRESS + poll(POLLOUT) +
+    // getsockopt(SO_ERROR) + EALREADY. connect-smoke asserts the new kernel
+    // semantics deterministically against an unroutable TEST-NET address (no
+    // outbound network needed) and exits 0 with CONNECT_SMOKE:PASS. Unlike
+    // dns/tls this gate requires the PASS marker (a FAIL fails the smoke). SKIP
+    // if the binary is absent (musl toolchain missing at build).
+    {
+        let mut probe = Stat::zeroed();
+        if stat(CONNECT_SMOKE_PATH, &mut probe) < 0 || probe.st_size == 0 {
+            skip("connect-smoke");
+        } else {
+            begin("connect-smoke");
+            let connect_argv = [CONNECT_SMOKE_ARGV0.as_ptr(), ptr::null()];
+            if let Err(code) = run_command_expect_output(
+                "connect-smoke",
+                CONNECT_SMOKE_PATH,
+                &connect_argv,
+                CONNECT_SMOKE_PASS_NEEDLE,
+                &mut command_output,
+            ) {
+                return code;
+            }
+            pass("connect-smoke");
         }
     }
 
