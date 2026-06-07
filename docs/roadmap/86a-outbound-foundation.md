@@ -110,6 +110,24 @@ A bundle-only port (no compiler invocation — it stages a verified data blob) r
 - **Redox `relibc` `netdb`/`lookup.rs`** resolves `/etc/hosts` first then a UDP `nameserver:53` with no daemon — the same shape m3OS validates here.
 - **curl `cacert.pem`** is the ~200 KB SHA-256-pinned Mozilla bundle this phase packages; distributions instead ship a system trust store managed by `update-ca-certificates`.
 
+## On-disk trust and credential conventions (Track C)
+
+The following canonical paths are fixed here and every later Phase 86 consumer (86b SSH, 86c curl/git-transport) must agree on them:
+
+- **CA bundle:** `/etc/ssl/certs/ca-certificates.crt` — the single path 86c's `curl --ca-bundle` and mbedTLS's trust-store lookup will reference.
+- **SSH known_hosts:** `~/.ssh/known_hosts` (user) + `/etc/ssh/known_hosts` (system seed, if present).
+- **Credentials:** `~/.git-credentials` (git credential helper) + `~/.netrc` (curl/wget basic-auth).
+
+## Deferred resolver limits (Track C)
+
+The musl resolver validated in this phase is deliberately minimal. The following are all explicitly out of scope for 86a:
+
+- **UDP-only** — no DNS-over-TCP fallback (large/truncated responses may fail silently).
+- **No EDNS0 or DNSSEC** — musl's stub resolver sends classic 512-byte UDP queries with no OPT record.
+- **AAAA / IPv6 resolution stubbed** — `AF_INET6` is unrecognized in `sys_socket`; dual-stack DNS deferred to Phase 89.
+- **No caching** — every `getaddrinfo` call issues a fresh UDP query to the single `/etc/resolv.conf` nameserver.
+- **`/etc/hosts` is checked first** — the musl resolver's `/etc/hosts` → nameserver order is preserved and `/etc/hosts` is staged with a minimal localhost entry so local name resolution always works.
+
 ## Deferred Until Later
 
 - IPv6 / AAAA / dual-stack resolution — Phase 89.
