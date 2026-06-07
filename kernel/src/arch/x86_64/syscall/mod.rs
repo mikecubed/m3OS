@@ -5902,33 +5902,8 @@ pub(crate) fn seed_csprng_early() {
 }
 
 // ---------------------------------------------------------------------------
-// Legacy pseudo-random helpers (retained for /dev/urandom; NOT on csprng path)
+// Device-node fill helpers (/dev/zero, /dev/full)
 // ---------------------------------------------------------------------------
-
-/// Seed the legacy PRNG state using RDRAND + TSC mixing.
-///
-/// **NOT on the getrandom/csprng path** (Phase 86a). Used only by
-/// `copy_pseudorandom_to_user` which serves `/dev/urandom` reads. If
-/// `/dev/urandom` is later migrated to the CSPRNG, delete this function.
-fn seed_pseudorandom_state() -> u64 {
-    let rdrand_val = rdrand64().unwrap_or(0);
-    let tsc_val = unsafe { core::arch::x86_64::_rdtsc() };
-    let mixed = rdrand_val ^ tsc_val;
-    if mixed == 0 {
-        0xDEAD_BEEF_CAFE_BABE
-    } else {
-        mixed
-    }
-}
-
-fn fill_pseudorandom_bytes(state: &mut u64, out: &mut [u8]) {
-    let mut prng = kernel_core::prng::Prng::new(*state);
-    prng.fill_bytes(out);
-    // Update caller's state for continuity
-    let mut state_bytes = [0u8; 8];
-    prng.fill_bytes(&mut state_bytes);
-    *state = u64::from_ne_bytes(state_bytes);
-}
 
 fn copy_byte_pattern_to_user(buf_ptr: u64, count: usize, byte: u8) -> Result<(), ()> {
     let chunk = [byte; 256];
@@ -5942,31 +5917,6 @@ fn copy_byte_pattern_to_user(buf_ptr: u64, count: usize, byte: u8) -> Result<(),
             return Err(());
         }
         written += len;
-    }
-    Ok(())
-}
-
-fn copy_pseudorandom_to_user(buf_ptr: u64, count: usize) -> Result<(), ()> {
-    let mut state = seed_pseudorandom_state();
-    let mut chunk = [0u8; 256];
-    let mut written = 0usize;
-    while written < count {
-        let len = (count - written).min(chunk.len());
-        fill_pseudorandom_bytes(&mut state, &mut chunk[..len]);
-        if UserSliceWo::new(buf_ptr + written as u64, chunk[..len].len())
-            .and_then(|s| s.copy_from_kernel(&chunk[..len]))
-            .is_err()
-        {
-            return Err(());
-        }
-        written += len;
-        // Reseed from RDRAND every 256 bytes to limit state-compromise damage
-        if let Some(entropy) = rdrand64() {
-            state ^= entropy;
-            if state == 0 {
-                state = 0xDEAD_BEEF_CAFE_BABE;
-            }
-        }
     }
     Ok(())
 }
@@ -6417,7 +6367,14 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             count
         }
         FdBackend::DevUrandom => {
-            if copy_pseudorandom_to_user(buf_ptr, count as usize).is_err() {
+            // Phase 86a: /dev/urandom and /dev/random serve the ChaCha20 CSPRNG
+            // (the same DRBG that backs getrandom). They never block — before the
+            // DRBG is READY (a degraded boot without RDSEED/RDRAND) they serve
+            // insecure DRBG output, matching Linux /dev/urandom semantics. READY
+            // is monotonic, so the readiness check below cannot race the fill.
+            maybe_reseed_csprng();
+            let insecure = !kernel_core::csprng::global_ready();
+            if getrandom_fill_user(buf_ptr, count as usize, insecure).is_err() {
                 return NEG_EFAULT;
             }
             count

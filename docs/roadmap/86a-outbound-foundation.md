@@ -4,7 +4,7 @@
 **Source Ref:** phase-86a
 **Depends on:** Phase 48 (Security Foundation) ✅, Phase 77 (Pre-1.0 Cleanup — DNS reply delivery D.1 + outbound TCP `connect` D.2) ✅, Phase 85a (Package & Build-Cache Infrastructure) ✅
 **Builds on:** First sub-phase (86a) of the Phase 86 umbrella ([./86-networking-and-github.md](./86-networking-and-github.md)) — repairs the entropy/time/trust foundation that all of 86b–86f silently assume, without landing any transport.
-**Primary Components:** `kernel-core/src/csprng.rs` (new), `kernel-core/src/prng.rs` (legacy, quarantined), `kernel/src/arch/x86_64/syscall/mod.rs` (`sys_getrandom`, `rdrand64`, new `rdseed64`), `kernel/src/lib.rs` (`kernel_main_entry`), `kernel/src/rtc.rs` (`init_rtc`, `BOOT_EPOCH_SECS`), `kernel/src/mm/elf.rs` (AT_RANDOM), `kernel/src/net/tcp.rs` (TCP ISN), `ports/lib/ca-certificates/Portfile` (new), `xtask/src/main.rs` (`populate_ext2_files` resolv.conf, ports registry), `userspace/dns-smoke/dns-smoke.c`
+**Primary Components:** `kernel-core/src/csprng.rs` (new), `kernel-core/src/prng.rs` (legacy — last caller removed and **deleted** in this phase), `kernel/src/arch/x86_64/syscall/mod.rs` (`sys_getrandom`, `rdrand64`, new `rdseed64`), `kernel/src/lib.rs` (`kernel_main_entry`), `kernel/src/rtc.rs` (`init_rtc`, `BOOT_EPOCH_SECS`), `kernel/src/mm/elf.rs` (AT_RANDOM), `kernel/src/net/tcp.rs` (TCP ISN), `ports/lib/ca-certificates/Portfile` (new), `xtask/src/main.rs` (`populate_ext2_files` resolv.conf, ports registry), `userspace/dns-smoke/dns-smoke.c`
 
 ## Milestone Goal
 
@@ -32,7 +32,7 @@ Doing this as a standalone sub-phase means the hard, security-critical foundatio
 
 ### Kernel CSPRNG (Track A)
 
-A new `kernel-core/src/csprng.rs` provides a ChaCha20 DRBG (`ChaChaDrbg`) fed by an `EntropyPool`, seeded ≥256 credited bits before it reports `READY`, with fast-key-erasure forward secrecy and a bounded reseed interval. The seed is drawn from a new `rdseed64()` (full-entropy, probed via `CPUID.07H:EBX[18]`) preferring over the existing `rdrand64()` (`kernel/src/arch/x86_64/syscall/mod.rs:5724`), with a TSC-mixed degraded path so a hypervisor lacking both still boots. `sys_getrandom` is rewritten to honor flags, source the DRBG, and drop the 256-byte cap while preserving ≤256-byte single-call atomicity. The two downstream consumers — `AT_RANDOM` (`kernel/src/mm/elf.rs:666`) and the TCP ISN (`kernel/src/net/tcp.rs:250`) — are switched from their deterministic patterns to the CSPRNG. The legacy `Prng` is quarantined so it is grep-unreachable from any crypto path.
+A new `kernel-core/src/csprng.rs` provides a ChaCha20 DRBG (`ChaChaDrbg`) fed by an `EntropyPool`, seeded ≥256 credited bits before it reports `READY`, with fast-key-erasure forward secrecy and a bounded reseed interval. The seed is drawn from a new `rdseed64()` (full-entropy, probed via `CPUID.07H:EBX[18]`) preferring over the existing `rdrand64()` (`kernel/src/arch/x86_64/syscall/mod.rs:5724`), with a TSC-mixed degraded path so a hypervisor lacking both still boots. `sys_getrandom` is rewritten to honor flags, source the DRBG, and drop the 256-byte cap while preserving ≤256-byte single-call atomicity. The two downstream consumers — `AT_RANDOM` (`kernel/src/mm/elf.rs:666`) and the TCP ISN (`kernel/src/net/tcp.rs:250`) — are switched from their deterministic patterns to the CSPRNG. `/dev/urandom` and `/dev/random` are migrated to the same DRBG as well (final-audit hardening), and with no remaining callers the legacy `Prng` (`kernel-core/src/prng.rs`) is **deleted from the tree** — no kernel path can fall back to a non-cryptographic PRNG.
 
 ### Wall-clock trust (Track B)
 
@@ -77,7 +77,7 @@ A bundle-only port (no compiler invocation — it stages a verified data blob) r
 
 ## Implementation Outline
 
-1. Add `kernel-core/src/csprng.rs` (`ChaChaDrbg` + `EntropyPool`, `EMPTY`/`EARLY`/`READY` states, fast-key-erasure, reseed bound) with host tests; quarantine the legacy `Prng`.
+1. Add `kernel-core/src/csprng.rs` (`ChaChaDrbg` + `EntropyPool`, `EMPTY`/`EARLY`/`READY` states, fast-key-erasure, reseed bound) with host tests; quarantine the legacy `Prng` (and, once its last caller is migrated, delete it).
 2. Add `rdseed64`/`cpu_has_rdseed` and the RDSEED→RDRAND→TSC seed selector with a boot log line naming the source + credited bits.
 3. Seed the DRBG in `kernel_main_entry` (`kernel/src/lib.rs:71`) synchronously right after `mm::init` and before `init_task`; audit and move/accept the pre-seed consumers (canary, ASLR slide, TCP ISN, DNS txid).
 4. Rewrite `sys_getrandom` to source the DRBG, honor `GRND_*` flags, drop the 256-byte cap, and preserve ≤256-byte single-call atomicity; reseed at the 60-second-or-output-ceiling bound.
@@ -88,7 +88,7 @@ A bundle-only port (no compiler invocation — it stages a verified data blob) r
 
 ## Acceptance Criteria
 
-- A `kernel-core` host test proves the DRBG reports `READY` only after ≥256 credited bits, that `GRND_NONBLOCK`→`EAGAIN` iff `!ready` while `GRND_INSECURE` serves pre-`READY`, that fast-key-erasure prevents a recovered post-draw state from reproducing prior output, and that 1 MiB of output passes monobit + chi-square — and the legacy xorshift `Prng` is grep-unreachable from any csprng path.
+- A `kernel-core` host test proves the DRBG reports `READY` only after ≥256 credited bits, that `GRND_NONBLOCK`→`EAGAIN` iff `!ready` while `GRND_INSECURE` serves pre-`READY`, that fast-key-erasure prevents a recovered post-draw state from reproducing prior output, and that 1 MiB of output passes monobit + chi-square — and the legacy xorshift `Prng` is **removed from the tree** (no kernel path uses it; `/dev/urandom`/`/dev/random` also source the DRBG, so `kernel-core/src/prng.rs` was deleted).
 - `rdseed64` probes `CPUID.07H:EBX[18]`, caches an `AtomicU8`, PAUSE-retries on `CF=0`, credits full-entropy only on `CF=1`; the boot log emits the seed source (`rdseed`|`rdrand`|`degraded`) + credited-bit count, and the degraded path still boots (no deadlock).
 - The DRBG is `READY` synchronously after `mm::init` and before `init_task`, asserted by boot-log ordering; an audit note enumerates every pre-seed consumer (stack canary, ASLR slide `kernel/src/mm/elf.rs`, TCP ISN `kernel/src/net/tcp.rs:250`, DNS txid) as moved-after-seed or accepted-degraded.
 - `sys_getrandom`: `GRND_RANDOM` honored, bad flag combo → `EINVAL`, every ≤256-byte call returns the exact length in one call, >256-byte succeeds (cap removed), reseed honored at the 60-second-or-output-ceiling bound.
@@ -133,5 +133,5 @@ The musl resolver validated in this phase is deliberately minimal. The following
 - IPv6 / AAAA / dual-stack resolution — Phase 89.
 - DNS caching, search domains, EDNS0, DNSSEC, and DNS-over-TCP fallback.
 - An entropy pool with interrupt harvesting (`add_interrupt_randomness`-style) — RDSEED/RDRAND at the seed point suffices for now.
-- Rotating already-persisted weak secrets generated under the old PRNG (the `sshd` Ed25519 host key at `userspace/sshd/src/host_key.rs:43`, `passwd`/`shadow` salts) — this phase documents a one-time rotation step + updates the `crypto-lib/src/random.rs` / `kernel-core/src/prng.rs:4` disclaimers, but does not auto-rotate.
+- Rotating already-persisted weak secrets generated under the old PRNG (the `sshd` Ed25519 host key at `userspace/sshd/src/host_key.rs:43`, `passwd`/`shadow` salts) — this phase documents a one-time rotation step + the `crypto-lib/src/random.rs` disclaimer (and the `csprng.rs` module note), but does not auto-rotate. New secrets are generated under the CSPRNG.
 - All transport (SSH 86b, HTTPS/TLS 86c), the Go runtime (86d), `gh` (86e), and the userspace SIMD / AES-NI capstone (86f).

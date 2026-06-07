@@ -7204,6 +7204,14 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 20,
         label: "guest/log: smoke runner verified syslog marker",
     });
+    // Phase 86a — /dev/urandom + /dev/random are served by the kernel ChaCha20
+    // DRBG (the legacy xorshift Prng was deleted). The smoke runner reads both
+    // device nodes and asserts a full, non-all-zero result.
+    steps.push(SmokeStep::Wait {
+        pattern: "SMOKE:csprng-devrandom:PASS",
+        timeout_secs: 20,
+        label: "guest/csprng-devrandom: /dev/urandom + /dev/random source the CSPRNG",
+    });
     // Phase 74 Track B.3 — page-grant round-trip regression. Boot-time
     // smoke that proves `sys_page_grant_send` + `sys_page_grant_recv`
     // actually move 1024 pages without copying any bytes.

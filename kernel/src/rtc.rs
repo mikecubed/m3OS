@@ -195,18 +195,21 @@ fn is_valid_datetime(year: u32, month: u32, day: u32, hour: u32, minute: u32, se
 
 /// Hardcoded fallback floor epoch used when `M3OS_BUILD_EPOCH` was not baked
 /// in at compile time (e.g. a very old toolchain invocation without the new
-/// `build.rs`).  Value: 2026-06-01 00:00:00 UTC = 1_748_736_000.
-const BUILD_EPOCH_FALLBACK: u64 = 1_748_736_000;
+/// `build.rs`).  Value: 2026-06-01 00:00:00 UTC = 1_780_272_000.
+const BUILD_EPOCH_FALLBACK: u64 = 1_780_272_000;
 
 /// Return the build-date floor epoch in Unix seconds.
 ///
 /// Uses the `M3OS_BUILD_EPOCH` compile-time env var (emitted by `build.rs`
 /// during every normal build).  Falls back to [`BUILD_EPOCH_FALLBACK`] if the
-/// var is absent or cannot be parsed — the fallback is always a sane, recent
-/// date so the wall-clock can never silently revert to 1970.
+/// var is absent or cannot be parsed.  The parsed value is additionally clamped
+/// up to [`BUILD_EPOCH_FALLBACK`], so even a degenerate builder-supplied
+/// `SOURCE_DATE_EPOCH` (e.g. `0`) can never lower the floor below a sane, recent
+/// date — the wall-clock can never silently revert to 1970.
 fn build_epoch_floor() -> u64 {
     option_env!("M3OS_BUILD_EPOCH")
         .and_then(|s| s.parse::<u64>().ok())
+        .map(|v| v.max(BUILD_EPOCH_FALLBACK))
         .unwrap_or(BUILD_EPOCH_FALLBACK)
 }
 

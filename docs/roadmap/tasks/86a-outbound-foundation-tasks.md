@@ -24,7 +24,7 @@
 
 **Files:**
 - `kernel-core/src/csprng.rs` (new)
-- `kernel-core/src/prng.rs` (legacy `Prng::new` at `:16`, "NOT cryptographically secure" doc at `:4` — quarantined)
+- `kernel-core/src/prng.rs` (legacy xorshift `Prng` — its last caller was migrated to the CSPRNG and the module was **deleted** in this phase)
 
 **Symbol:** `ChaChaDrbg`, `EntropyPool`
 **Why it matters:** SSH/TLS session keys and X25519 ephemerals all ride on `getrandom`; ChaCha20's pure-integer ARX core is SIMD-off-safe and host-testable, so the whole crypto stack can rest on a vetted, unit-tested DRBG instead of the legacy xorshift expansion.
@@ -32,7 +32,7 @@
 **Acceptance:**
 - [x] A `kernel-core` host test asserts ≥256 credited bits are required before the DRBG reports `READY`; `GRND_NONBLOCK`→`EAGAIN` iff `!ready`; `GRND_INSECURE` serves output pre-`READY`.
 - [x] A `kernel-core` host test proves fast-key-erasure: a recovered post-draw state cannot reproduce prior output; 1 MiB of DRBG output passes monobit + chi-square.
-- [x] The legacy xorshift `Prng` is grep-unreachable from any csprng path (it survives only on the `/dev/urandom` read path, which the design doc explicitly permits; `getrandom`/AT_RANDOM/ISN use only `kernel_core::csprng`).
+- [x] The legacy xorshift `Prng` is **removed from the tree entirely** — `/dev/urandom`/`/dev/random` were migrated to the ChaCha20 DRBG too (final-audit hardening), so after `getrandom`/AT_RANDOM/ISN there are no remaining callers; `kernel-core/src/prng.rs` and its `pub mod prng;` entry were deleted, so no kernel path can fall back to a non-cryptographic PRNG.
 
 > **Verified:** 16 csprng host tests pass under `cargo xtask check` (incl. the READY-gate, fast-key-erasure, and 1 MiB monobit+chi-square tests). The ChaCha20 core was independently validated against the RFC 7539 §2.3.2 test vector. A boot with `+rdseed` logs `[csprng] seeded source=rdseed credited_bits=256 state=READY`.
 
@@ -154,8 +154,8 @@
 ## Documentation Notes
 
 - **No transport here.** SSH (86b) and HTTPS/TLS (86c) both depend on this foundation; 86a deliberately lands only the CSPRNG, the wall-clock floor, the resolver validation, and the CA bundle.
-- **The RNG upgrade does not rotate already-persisted weak secrets.** The `sshd` Ed25519 host key (`/etc/ssh/ssh_host_ed25519_key`) and `passwd`/`shadow` salts were generated under the weak PRNG; the disclaimers in `userspace/crypto-lib/src/random.rs` and `kernel-core/src/prng.rs` were updated to call out the one-time manual rotation step.
+- **The RNG upgrade does not rotate already-persisted weak secrets.** The `sshd` Ed25519 host key (`/etc/ssh/ssh_host_ed25519_key`) and `passwd`/`shadow` salts were generated under the weak PRNG; the disclaimer in `userspace/crypto-lib/src/random.rs` (and the `kernel-core/src/csprng.rs` module note) calls out the one-time manual rotation step. New secrets are generated under the CSPRNG.
 - **Entropy atomicity is a hard contract.** `sshd`'s `getrandom` backend does not loop and requires `ret == len`; the ≤256-byte single-call atomicity in A.4 is preserved even though the cap is removed.
-- **`/dev/urandom` still serves the legacy xorshift `Prng`** (spec-permitted) — userspace crypto that reads `/dev/urandom` directly rather than `getrandom` does not yet benefit from the DRBG. Tracked as a follow-up.
+- **`/dev/urandom` and `/dev/random` source the ChaCha20 DRBG** (final-audit hardening) — the same DRBG that backs `getrandom`. They never block: pre-`READY` (a degraded boot without RDSEED/RDRAND) they serve insecure DRBG output, matching Linux `/dev/urandom`. The legacy xorshift `Prng` had its last caller removed and was deleted from the tree, so userspace crypto that reads `/dev/urandom` directly now also benefits from the DRBG.
 - **IPv6/AAAA is explicitly out** (Phase 89). The resolver stays IPv4-only, UDP-only, no caching, `/etc/hosts`-first.
 - **One canonical CA path.** Match Debian's `/etc/ssl/certs/ca-certificates.crt`; every later consumer (86c `curl`/`git`) must agree on it. Track CA-bundle provenance/staleness as refreshable data.

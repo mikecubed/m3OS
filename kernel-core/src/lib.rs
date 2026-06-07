@@ -35,7 +35,6 @@ pub mod pci;
 pub mod pipe;
 pub mod preempt_frame;
 pub mod preempt_model;
-pub mod prng;
 pub mod pty;
 pub mod r8169;
 pub mod sched_model;

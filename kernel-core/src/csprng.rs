@@ -12,12 +12,13 @@
 //! - **Global accessor**: a `spin::Mutex<ChaChaDrbg>` protected singleton with
 //!   free-function wrappers for use from the kernel without explicit locking.
 //!
-//! ## Phase 86a — QUARANTINE NOTE for `prng.rs`
+//! ## Phase 86a — legacy `prng.rs` removed
 //!
-//! The legacy `kernel_core::prng::Prng` (xorshift64-multiply) is NOT reachable
-//! from any csprng / `getrandom` call path as of Phase 86a.  It is retained
-//! only for non-crypto statistical uses; if all callers are eventually removed
-//! it can be deleted along with its `pub mod prng;` entry in `lib.rs`.
+//! The legacy `kernel_core::prng::Prng` (xorshift64-multiply) had its last
+//! caller removed in Phase 86a — `/dev/urandom` and `/dev/random` now source
+//! this ChaCha20 DRBG, and `getrandom` / `AT_RANDOM` / the TCP ISN already did.
+//! With no remaining callers the `prng` module was deleted from the tree, so no
+//! kernel path can fall back to a non-cryptographic PRNG.
 
 #[cfg(not(feature = "std"))]
 use core::fmt;

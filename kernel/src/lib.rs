@@ -109,31 +109,36 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
     // PLACEMENT RATIONALE — why here (after kstack::init, before everything else):
     //   - mm::init must have completed so the kernel heap is available (the spin
     //     Mutex in ChaChaDrbg requires no alloc, but log::info! may).
-    //   - Must be before net::virtio_net::init (~line 331) so the TCP ISN helper
-    //     draws from a seeded DRBG on the first connect/listen.
-    //   - Must be before task::spawn(init_task) (~line 373) so AT_RANDOM bytes in
-    //     every execve'd binary come from a seeded DRBG.
+    //   - Must be before net::virtio_net::init so the TCP ISN helper draws from
+    //     a seeded DRBG on the first connect/listen.
+    //   - Must be before task::spawn(init_task) so AT_RANDOM bytes in every
+    //     execve'd binary come from a seeded DRBG.
     //   - The #[cfg(test)] harness below may skip the rest of boot, but it never
     //     calls getrandom/exec/tcp, so running seed_csprng_early() before it is
     //     harmless.
     //
-    // PRE-SEED CONSUMER AUDIT (Phase 86a):
+    // PRE-SEED CONSUMER AUDIT (Phase 86a) — referenced by symbol, not line, so
+    // it does not drift:
     //   • Kernel stack canary:   m3OS uses panic-strategy=abort; there is no
     //       -Z stack-protector enabled; no canary is drawn before this point.
     //       Status: N/A.
-    //   • AT_RANDOM (kernel/src/mm/elf.rs ~line 666):
-    //       Called at execve time, which is after init_task spawns (line ~373)
-    //       and after this seed point.  Status: MOVED AFTER SEED.
-    //   • TCP ISN (kernel/src/net/tcp.rs ~line 250 and ~line 386):
-    //       TCP connect/listen happens after net::virtio_net::init (line ~331)
-    //       which is after this seed point.  Status: MOVED AFTER SEED.
+    //   • AT_RANDOM (the rand16 fill in mm::elf::load_elf):
+    //       Drawn at execve time, which is after init_task spawns and after this
+    //       seed point.  Status: MOVED AFTER SEED.
+    //   • TCP ISN (net::tcp::tcp_isn, used at both the active `connect` site and
+    //       the passive `TcpState::Listen` SYN-ACK site):
+    //       TCP connect/listen happens after net::virtio_net::init, which is
+    //       after this seed point.  Status: MOVED AFTER SEED.
+    //   • /dev/urandom + /dev/random (FdBackend::DevUrandom read handler):
+    //       Served from this DRBG; reads only happen once userspace runs, well
+    //       after this seed point.  Status: MOVED AFTER SEED.
     //   • DNS transaction ID:
     //       musl's resolver runs in userspace (ring 3) via getrandom.  getrandom
     //       is only called after userspace processes start (after init_task),
     //       which is well after this seed point.  Status: MOVED AFTER SEED.
     //   • Degraded path (no RDSEED/RDRAND): DRBG stays Early; fill_insecure is
-    //       used by AT_RANDOM and TCP ISN fallbacks; boot reaches login prompt
-    //       without deadlock.  Status: ACCEPTED DEGRADED.
+    //       used by AT_RANDOM, the TCP ISN fallback, and /dev/urandom; boot
+    //       reaches login prompt without deadlock.  Status: ACCEPTED DEGRADED.
     arch::x86_64::syscall::seed_csprng_early();
 
     // When built with `cargo test`, run the generated test harness and exit.

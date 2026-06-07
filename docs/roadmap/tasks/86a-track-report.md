@@ -68,3 +68,33 @@
   - `abandonment-events`: 0.
   - `re-review-loops`: Track A = 1 (ISN PRF hardening); B = 0; C = 0.
 - **Temporary work surfaces:** the three external worktrees (`../ostest-wt-track-{a,b,c}`) were removed after merge.
+
+## Final audit (post-merge hardening)
+
+A final multi-agent audit (7 dimension finders + adversarial verification of every
+finding) swept the whole branch against the acceptance criteria, hunted for bugs,
+and judged each deferral as needed vs unneeded. Outcome: **0 acceptance-criteria
+gaps** — the CSPRNG core (ChaCha20 vs RFC 7539, fast-key-erasure, SipHash-2-4
+vectors), `getrandom` flags/atomicity, wall-clock floor, DNS/CA paths, and all 21
+acceptance items were independently re-verified against the on-disk code. The audit
+surfaced one in-scope security residual and two doc/robustness nits, all fixed here
+rather than deferred:
+
+- **`/dev/urandom` + `/dev/random` migrated to the ChaCha20 DRBG.** These were the
+  last readers of the legacy xorshift `Prng` (`copy_pseudorandom_to_user`). They now
+  flow through `getrandom_fill_user` (insecure DRBG output pre-`READY`, never
+  blocking). With the last caller gone, the dead helpers
+  (`seed_pseudorandom_state` / `fill_pseudorandom_bytes` / `copy_pseudorandom_to_user`)
+  and the whole `kernel-core/src/prng.rs` module (+ its `pub mod prng;`) were
+  **deleted** — eliminating the non-cryptographic PRNG from the tree entirely
+  (stronger than the original "grep-unreachable / quarantined" criterion).
+- **Wall-clock floor robustness.** `BUILD_EPOCH_FALLBACK` value vs comment disagreed
+  (was `1_748_736_000` = 2025-06-01, intent 2026-06-01); corrected to
+  `1_780_272_000` (2026-06-01), and `build_epoch_floor()` now clamps the parsed
+  `M3OS_BUILD_EPOCH` up to the fallback (`.max(BUILD_EPOCH_FALLBACK)`) so even a
+  degenerate `SOURCE_DATE_EPOCH=0` can never drop the floor to 1970.
+- **Drift-proofed the pre-seed consumer audit comment** in `kernel/src/lib.rs` —
+  brittle/stale `~line` references replaced with symbol names, and `/dev/urandom`
+  added to the consumer enumeration.
+
+`cargo xtask check` + the smoke suite were re-run green after these changes.
