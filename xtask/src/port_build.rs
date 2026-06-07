@@ -609,6 +609,9 @@ pub fn port_deps(name: &str) -> &'static [&'static str] {
         // linked into the toolchain + bundled in the .m3pkg's sysroot, so in-OS
         // `pkg install clang` pulls nothing else.
         "llvm" => &[],
+        // Phase 86a Track C.2 — the Mozilla CA bundle is a self-contained data
+        // file (no libraries required at build or install time).
+        "ca-certificates" => &[],
         _ => &[],
     }
 }
@@ -849,8 +852,27 @@ fn port_build(name: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    let tarball = fetch_tarball(&url, &sha, &cache_dir)?;
-    let extracted = extract_tarball(&tarball, &work)?;
+    let blob = fetch_tarball(&url, &sha, &cache_dir)?;
+
+    // Phase 86a Track C.2 — bundle-only (data-blob) ports: no tarball to
+    // extract, no compiler needed. Fetch + SHA-256-verify the single file
+    // (done above by `fetch_tarball`), stage it, seal, stamp, and return
+    // before the extract / toolchain / configure paths run.
+    if name == "ca-certificates" {
+        // Reset stage dir.
+        let _ = fs::remove_dir_all(&stage);
+        fs::create_dir_all(&stage).map_err(|e| format!("mkdir stage: {e}"))?;
+        build_ca_certificates(&blob, &stage)?;
+        seal_package(name, &stage, &key)?;
+        fs::write(&stamp, &fingerprint).map_err(|e| format!("write stamp: {e}"))?;
+        println!(
+            "ports: {name}-{version} build complete (staged at {})",
+            stage.display()
+        );
+        return Ok(());
+    }
+
+    let extracted = extract_tarball(&blob, &work)?;
     let n = apply_patches(&port_dir.join("patches"), &extracted)?;
     if n > 0 {
         println!("ports: applied {n} patch(es) to {}", extracted.display());
@@ -1083,6 +1105,32 @@ fn build_libevent(
         return Err(format!("libevent build missing {}", lib.display()));
     }
     println!("libevent: produced libevent.a");
+    Ok(())
+}
+
+/// Phase 86a Track C.2 — bundle-only CA certificate port.
+///
+/// `cacert.pem` is NOT a tarball; the `fetch_tarball` call above already
+/// downloaded it and verified its SHA-256.  This function stages the
+/// already-verified single file to the canonical on-target path:
+///
+///   `etc/ssl/certs/ca-certificates.crt`
+///
+/// which `pkg install ca-certificates` lays under `/` so TLS consumers
+/// (Phase 86c `curl`, `git` transport) can pass `--ca-bundle
+/// /etc/ssl/certs/ca-certificates.crt`.  No compiler is invoked.
+///
+/// A SHA-256 mismatch is caught by `fetch_tarball` before this function
+/// is called, so no additional verify step is needed here.
+fn build_ca_certificates(blob: &Path, stage: &Path) -> Result<(), String> {
+    let dest_dir = stage.join("etc/ssl/certs");
+    fs::create_dir_all(&dest_dir).map_err(|e| format!("mkdir etc/ssl/certs: {e}"))?;
+    let dest = dest_dir.join("ca-certificates.crt");
+    fs::copy(blob, &dest).map_err(|e| format!("copy cacert.pem: {e}"))?;
+    println!(
+        "ca-certificates: staged cacert.pem → etc/ssl/certs/ca-certificates.crt ({} bytes)",
+        file_size(&dest)
+    );
     Ok(())
 }
 
@@ -3272,6 +3320,8 @@ mod tests {
         // BUILD-only dep, deliberately absent here so the in-OS solver does not
         // re-install its terminfo DB; its pin is folded via build_recipe_id.
         assert_eq!(port_deps("python"), &["zlib"]);
+        // Phase 86a Track C.2 — the CA bundle is a self-contained data file.
+        assert_eq!(port_deps("ca-certificates"), &[] as &[&str]);
         // Unknown port returns empty.
         assert_eq!(port_deps("clang"), &[] as &[&str]);
     }
