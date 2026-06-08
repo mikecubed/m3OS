@@ -10306,6 +10306,13 @@ pub(super) fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
 
     const MAP_PRIVATE: u64 = 0x02;
     const MAP_ANONYMOUS: u64 = 0x20;
+    // MAP_FIXED — Go's allocator (runtime/mem_linux.go) reserves an arena
+    // PROT_NONE, then commits it PROT_RW with MAP_FIXED at the *same* address
+    // and throws ("cannot map pages in arena address space") if the kernel
+    // relocates the mapping. Capture the bit from the raw flags before the
+    // mask below drops it (Phase 86d, Track A — hard blocker 1).
+    const MAP_FIXED: u64 = 0x10;
+    let map_fixed = flags & MAP_FIXED != 0;
 
     // Mask prot to supported bits only.
     const PROT_MASK: u64 = 0x7; // PROT_READ | PROT_WRITE | PROT_EXEC
@@ -10333,7 +10340,51 @@ pub(super) fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
         Some(s) => s,
         None => return NEG_EINVAL,
     };
-    // Hint address is ignored: always allocate linearly.
+
+    // MAP_FIXED — honor the *exact* requested address. This is the Go
+    // arena-commit contract: a prior PROT_NONE reservation is committed
+    // PROT_RW in place at the address the kernel handed back, and Go aborts
+    // if the returned address differs. Overwrite/split whatever currently
+    // occupies the range and return `addr_hint` unchanged.
+    if map_fixed {
+        const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
+        // The address must be page-aligned and the whole range must stay in
+        // canonical user space (~0xc000000000 fits well under USER_SPACE_END).
+        if addr_hint & 0xFFF != 0
+            || addr_hint
+                .checked_add(total_size)
+                .filter(|e| *e <= USER_SPACE_END)
+                .is_none()
+        {
+            return NEG_EINVAL;
+        }
+        // Clear whatever occupies [addr_hint, addr_hint+total_size): frees any
+        // committed frames, removes/splits the overlapping VMAs — neighbor VMAs
+        // outside the range are preserved by `VmaTree::remove_range` — and
+        // batches a TLB shootdown. For a PROT_NONE reservation this finds no
+        // mapped frames and is a cheap no-op that still drops the reservation
+        // VMA, so the insert below replaces it cleanly.
+        let _ = sys_linux_munmap(addr_hint, total_size);
+        // Record the committed VMA at the exact address; demand paging fills
+        // frames on first touch with the requested protection.
+        let _ = crate::process::with_shared_mm_mut(pid, |_brk_current, _mmap_next, vma_tree| {
+            vma_tree.insert(crate::process::MemoryMapping {
+                start: addr_hint,
+                len: total_size,
+                prot,
+                flags,
+            });
+        });
+        let table = crate::process::PROCESS_TABLE.lock();
+        if let Some(proc) = table.find(pid)
+            && let Some(ref addr_space) = proc.addr_space
+        {
+            addr_space.bump_generation();
+        }
+        return addr_hint;
+    }
+
+    // Hint address is ignored for non-fixed mappings: always allocate linearly.
     let _ = addr_hint;
     // Determine base address: use process mmap_next or default ANON_MMAP_BASE.
     const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
