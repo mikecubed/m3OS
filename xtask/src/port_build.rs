@@ -1708,10 +1708,13 @@ fn build_git(
         ));
     }
 
-    // Phase 85b is the **local-only** git core. git's default build also produces
-    // several large (~2.3–3.7 MB each, statically linked) binaries that only
-    // serve network / server / email / large-repo workflows — none of which is
-    // in scope until Phase 86. Pruning them keeps the `.m3pkg` lean and the in-OS
+    // git's default build also produces several large (~2.3–3.7 MB each,
+    // statically linked) binaries that serve the SERVER side of the protocol (the
+    // pack helpers below) plus email / large-repo workflows m3OS does not run. 86c
+    // KEEPS the client remote helpers (`git-remote-http`/`git-remote-https`/
+    // `git-http-fetch` — the HTTPS transport, asserted present below) but still
+    // prunes the server halves + the unused helpers. Pruning them keeps the
+    // `.m3pkg` lean and the in-OS
     // `pkg install git` fast: every binary is a multi-MB write over the ring-3
     // VFS, and the no-dedup `.m3pkg` packer ([`pkg_format::pack`]) stores file
     // *content* per path, so the three server-side pack helpers under `bin/`
@@ -3876,11 +3879,15 @@ pub fn build_phase_69d_ports() -> Result<(), String> {
     Ok(())
 }
 
-/// Phase 85b — build the local-only `git` toolchain and its single dependency
-/// (zlib) into their `.m3pkg` artifacts. Separate from [`build_phase_69d_ports`]
-/// so a routine image build does not pay git's multi-minute cross-compile; the
-/// `git-local-smoke` gate (and any explicit `cargo xtask port build git`) drives
-/// this. zlib is built first so [`build_git`] finds the staged `libz.a`.
+/// Phase 85b → 86c — build the `git` toolchain and its full dependency chain
+/// (`zlib → mbedtls → ca-certificates → curl → git`) into their `.m3pkg`
+/// artifacts. 85b shipped a local-only git; 86c rebuilds it WITH curl, so this
+/// now drives the whole HTTPS transport chain (see the body for the ordering and
+/// why `ca-certificates` precedes `curl`). Separate from [`build_phase_69d_ports`]
+/// so a routine image build does not pay the multi-minute cross-compile; the
+/// `git-local-smoke` / `git-https-smoke` gates (and any explicit
+/// `cargo xtask port build git`) drive this. A warm pkgcache makes each a
+/// zero-compiler hit.
 pub fn build_git_port() -> Result<(), String> {
     if musl_cc().is_none() {
         return Err(

@@ -742,10 +742,12 @@ fn main() {
             cmd_pkg_smoke(&smoke_args);
         }
         // Phase 85b — `cargo xtask git-local-smoke` boots m3OS, installs the
-        // bundled local-only `git` `.m3pkg` via `pkg install git`, then drives a
-        // scripted local repository workflow (init/add/commit/diff/log/branch/
-        // merge/status) and asserts each step. Proof that git actually works
-        // inside m3OS, not merely that it cross-compiled.
+        // bundled `git` `.m3pkg` via `pkg install git` (as of 86c the
+        // HTTPS-capable build pulling the curl chain), then drives a scripted
+        // LOCAL repository workflow (init/add/commit/diff/log/branch/merge/status)
+        // and asserts each step — a regression guard that the curl rebuild did not
+        // break local git. Proof that git actually works inside m3OS, not merely
+        // that it cross-compiled.
         Some("git-local-smoke") => {
             let smoke_args =
                 parse_smoke_boot_args("git-local-smoke", &args[2..]).unwrap_or_else(|err| {
