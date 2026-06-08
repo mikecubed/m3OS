@@ -13791,8 +13791,10 @@ fn git_local_smoke_steps() -> Vec<SmokeStep> {
         // the global `--timeout` is a single shared cap that min-clamps every
         // step, so this budget is only fully available when nothing earlier has
         // eaten the clock. The gate is intended to run via pre-push at
-        // `--timeout 360` (.githooks/pre-push); under the bare default it shares
-        // the budget with boot/login and the trailing git workflow.
+        // `--timeout 2400` (.githooks/pre-push — raised in Phase 86c, since the
+        // curl-dependent git install now pulls the whole HTTPS chain over the slow
+        // VFS); under the bare default it shares the budget with boot/login and
+        // the trailing git workflow.
         fail_prefix: "pkg install: cannot",
         // Phase 86c — git now depends on curl (HTTPS), so `pkg install git` pulls
         // the whole curl+mbedtls+ca-certificates chain (~27 MB of .m3pkg) over the
@@ -18497,10 +18499,12 @@ fn populate_phase_69d_ports(part_path: &Path, workspace_root: &Path) {
     // transport dependencies (git.meta DEPS=`zlib curl`; curl.meta DEPS=`zlib
     // mbedtls ca-certificates`), so `pkg install git` pulls them from /usr/pkg via
     // the solver in the order zlib -> mbedtls -> ca-certificates -> curl -> git.
-    // They are NOT
-    // pre-installed (they are build-time libraries whose code is already linked
-    // into the git helper); the .m3pkg only needs to exist for the solver to
-    // resolve. The artifacts exist once build_git_port has built the chain (the
+    // They are NOT pre-installed; the solver installs them on first `pkg install
+    // git`. (mbedtls is a pure build-time library whose code is statically linked
+    // into the curl/git binaries; curl ALSO ships a runtime CLI that is installed
+    // on-device and used there — e.g. `curl --version` in git-https-smoke — so it
+    // is not purely a build-time library.) The .m3pkg only needs to exist for the
+    // solver to resolve. The artifacts exist once build_git_port has built the chain (the
     // git-https-smoke gate does so first); on a routine image build where they
     // are absent this is a no-op, so nothing regresses.
     const BUNDLE_ONLY_PORTS: &[&str] = &["git", "python", "ca-certificates", "mbedtls", "curl"];

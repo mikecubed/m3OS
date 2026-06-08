@@ -721,6 +721,30 @@ pub fn port_version(name: &str) -> Option<String> {
 /// package keys of its direct dependencies. Shared by the resolve-before-build
 /// path and [`pkgcache_artifact_path`] so the key is computed one way only.
 fn compute_port_key(name: &str, port_dir: &Path) -> Result<String, String> {
+    // The dep recursion in `compute_port_key_inner` assumes `port_deps` forms a
+    // DAG. Guard against an accidentally-introduced cycle (which would otherwise
+    // recurse until a stack overflow) by threading the active dependency chain and
+    // failing fast with a readable "dependency cycle" error.
+    compute_port_key_inner(name, port_dir, &mut Vec::new())
+}
+
+/// Inner worker for [`compute_port_key`]. `chain` holds the in-progress
+/// dependency path (ancestors only — pushed on entry, popped on the way back
+/// up), so a port that re-appears as its own ancestor is a true cycle, while a
+/// diamond dependency (a shared leaf reached by two distinct paths) is recomputed
+/// exactly as the old un-guarded recursion did — content keys are unchanged.
+fn compute_port_key_inner(
+    name: &str,
+    port_dir: &Path,
+    chain: &mut Vec<String>,
+) -> Result<String, String> {
+    if chain.iter().any(|n| n == name) {
+        return Err(format!(
+            "ports dependency cycle detected: {} -> {name}",
+            chain.join(" -> ")
+        ));
+    }
+    chain.push(name.to_string());
     // The `llvm` port's real cross-compiler is the HOST clang (musl-tools has no
     // C++ compiler), which `toolchain_id()` (the musl-gcc wrapper) does not see.
     // Fold the actual host clang/clang++ `--version` into the key so two host
@@ -745,10 +769,11 @@ fn compute_port_key(name: &str, port_dir: &Path) -> Result<String, String> {
             // libevent) this recursion is byte-identical to the old empty-slice
             // computation — `compute_port_key(leaf) == package_key(leaf_dir, tc,
             // &[])` — so warmed leaf-dep caches stay valid. (The recursion is
-            // acyclic: the ports tree's DEPS form a DAG.)
-            compute_port_key(dep, &dep_dir)
+            // acyclic: the ports tree's DEPS form a DAG — now enforced above.)
+            compute_port_key_inner(dep, &dep_dir, chain)
         })
         .collect::<Result<_, String>>()?;
+    chain.pop();
     package_key(port_dir, &tc, &dep_keys)
 }
 
