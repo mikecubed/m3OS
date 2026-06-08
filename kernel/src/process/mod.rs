@@ -173,6 +173,10 @@ pub enum FdBackend {
     PipeRead { pipe_id: usize },
     /// Write end of a kernel pipe (Phase 14).
     PipeWrite { pipe_id: usize },
+    /// `eventfd(2)` counter object (Phase 86d Track D) — Go's runtime M-wakeup
+    /// primitive. One fd is both readable and writable; backed by
+    /// `crate::eventfd` keyed by `id`.
+    EventFd { id: usize },
     /// Directory file descriptor (Phase 18).
     Dir { path: String },
     /// /dev/null — reads return EOF, writes are silently discarded (Phase 21).

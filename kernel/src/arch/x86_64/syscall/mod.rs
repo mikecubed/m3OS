@@ -1403,6 +1403,9 @@ mod syscall_nr {
     // Phase 86d Track D — Go's netpoll (runtime/netpoll_epoll.go) issues
     // `epoll_pwait`, not `epoll_wait`. Same args plus a (nil, for Go) sigmask.
     pub const EPOLL_PWAIT: u64 = 281;
+    // Phase 86d Track D — Go 1.21+ uses an eventfd as its cross-thread M-wakeup
+    // primitive (`netpollBreak`).
+    pub const EVENTFD2: u64 = 290;
 
     // -- time --
     pub const NANOSLEEP: u64 = 35;
@@ -1974,6 +1977,7 @@ pub extern "C" fn syscall_handler(
             sys_pselect6(arg0, arg1, arg2, exceptfds, timeout_ptr)
         }
         EPOLL_CREATE1 => sys_epoll_create1(arg0),
+        EVENTFD2 => sys_eventfd2(arg0, arg1),
         PIPE2 => {
             // Phase 69d follow-up (PR #177 third-pass review fix):
             // reject unknown pipe2 flag bits with EINVAL.  Linux only
@@ -3790,6 +3794,7 @@ pub(super) fn sys_dup(oldfd: u64) -> u64 {
             match &backend_clone {
                 FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_add_reader(*pipe_id),
                 FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_add_writer(*pipe_id),
+                FdBackend::EventFd { id } => crate::eventfd::eventfd_add_ref(*id),
                 FdBackend::PtyMaster { pty_id } => crate::pty::add_master_ref(*pty_id),
                 FdBackend::PtySlave { pty_id } => crate::pty::add_slave_ref(*pty_id),
                 FdBackend::Socket { handle } => crate::net::add_socket_ref(*handle),
@@ -3848,6 +3853,7 @@ pub(super) fn sys_dup2(oldfd: u64, newfd: u64) -> u64 {
     match &entry.backend {
         FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_add_reader(*pipe_id),
         FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_add_writer(*pipe_id),
+        FdBackend::EventFd { id } => crate::eventfd::eventfd_add_ref(*id),
         FdBackend::PtyMaster { pty_id } => crate::pty::add_master_ref(*pty_id),
         FdBackend::PtySlave { pty_id } => crate::pty::add_slave_ref(*pty_id),
         FdBackend::Socket { handle } => crate::net::add_socket_ref(*handle),
@@ -6064,6 +6070,51 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     }
 
     match &entry.backend {
+        FdBackend::EventFd { id } => {
+            // Phase 86d Track D — eventfd read: an 8-byte counter, drained on
+            // read. Go's eventfd is non-blocking (EAGAIN when empty); a blocking
+            // eventfd parks on the object's wait queue until a write makes it
+            // readable (mirrors the pipe read pattern).
+            let id = *id;
+            if (count as usize) < 8 {
+                return NEG_EINVAL;
+            }
+            let nonblock = entry.nonblock;
+            let task_id = match crate::task::scheduler::current_task_id() {
+                Some(t) => t,
+                None => return NEG_EINTR,
+            };
+            let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+            loop {
+                woken.store(false, core::sync::atomic::Ordering::Release);
+                crate::eventfd::eventfd_register_waiter(id, task_id, &woken);
+                if let Some(val) = crate::eventfd::eventfd_read(id) {
+                    crate::eventfd::eventfd_deregister_waiter(id, task_id);
+                    let bytes = val.to_ne_bytes();
+                    if UserSliceWo::new(buf_ptr, bytes.len())
+                        .and_then(|s| s.copy_from_kernel(&bytes))
+                        .is_err()
+                    {
+                        return NEG_EFAULT;
+                    }
+                    return 8;
+                }
+                if nonblock {
+                    crate::eventfd::eventfd_deregister_waiter(id, task_id);
+                    return NEG_EAGAIN;
+                }
+                if has_pending_signal() {
+                    crate::eventfd::eventfd_deregister_waiter(id, task_id);
+                    return NEG_EINTR;
+                }
+                let _ = crate::task::scheduler::block_current_until(
+                    crate::task::TaskState::BlockedOnRecv,
+                    &woken,
+                    None,
+                );
+                crate::eventfd::eventfd_deregister_waiter(id, task_id);
+            }
+        }
         FdBackend::Stdin | FdBackend::DeviceTTY { .. } => {
             // Read from kernel stdin buffer.
             let capped = (count as usize).min(4096);
@@ -6860,6 +6911,27 @@ pub(super) fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     }
 
     match &entry.backend {
+        FdBackend::EventFd { id } => {
+            // Phase 86d Track D — eventfd write: add an 8-byte value to the
+            // counter and wake epoll/poll waiters (Go's netpollBreak wakeup).
+            if (count as usize) < 8 {
+                return NEG_EINVAL;
+            }
+            let mut bytes = [0u8; 8];
+            if UserSliceRo::new(buf_ptr, bytes.len())
+                .and_then(|s| s.copy_to_kernel(&mut bytes))
+                .is_err()
+            {
+                return NEG_EFAULT;
+            }
+            let val = u64::from_ne_bytes(bytes);
+            match crate::eventfd::eventfd_write(*id, val) {
+                Ok(()) => 8,
+                Err(crate::eventfd::EventFdWriteErr::Invalid) => NEG_EINVAL,
+                Err(crate::eventfd::EventFdWriteErr::WouldBlock) => NEG_EAGAIN,
+                Err(crate::eventfd::EventFdWriteErr::BadFd) => NEG_EBADF,
+            }
+        }
         FdBackend::Stdout | FdBackend::DeviceTTY { .. } => {
             // stdout/stderr/tty go to serial + framebuffer console.
             let len = (count as usize).min(4096);
@@ -9229,6 +9301,7 @@ pub(super) fn sys_linux_close(fd: u64) -> u64 {
         match &entry.backend {
             FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_close_reader(*pipe_id),
             FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_close_writer(*pipe_id),
+            FdBackend::EventFd { id } => crate::eventfd::eventfd_close(*id),
             FdBackend::Socket { handle } => crate::net::release_socket_pub(*handle),
             FdBackend::UnixSocket { handle } => crate::net::unix::free_unix_socket(*handle),
             FdBackend::PtyMaster { pty_id } => crate::pty::close_master(*pty_id),
@@ -9713,7 +9786,9 @@ pub(super) fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
         }
         FdBackend::Socket { .. } | FdBackend::UnixSocket { .. } => (0xC000 | 0o755, 0, 0, 0, 0),
         FdBackend::Stdout | FdBackend::Stdin => (0x2000 | 0o620, 0, 0, 0, 0),
-        FdBackend::PipeRead { .. } | FdBackend::PipeWrite { .. } => (0x1000 | 0o600, 0, 0, 0, 0),
+        FdBackend::PipeRead { .. } | FdBackend::PipeWrite { .. } | FdBackend::EventFd { .. } => {
+            (0x1000 | 0o600, 0, 0, 0, 0)
+        }
         FdBackend::Ramdisk { content_len, .. } => {
             // Ramdisk files: root-owned, mode 0o755 (all files, including non-executables)
             (0x8000 | 0o755, 0, 0, *content_len as u64, 0)
@@ -9861,7 +9936,9 @@ pub(super) fn sys_fstatfs(fd: u64, buf_ptr: u64) -> u64 {
         | FdBackend::PtySlave { .. }
         | FdBackend::Epoll { .. } => ramdisk_statfs(),
         FdBackend::Stdin | FdBackend::Stdout => ramdisk_statfs(),
-        FdBackend::PipeRead { .. } | FdBackend::PipeWrite { .. } => pipefs_statfs(),
+        FdBackend::PipeRead { .. } | FdBackend::PipeWrite { .. } | FdBackend::EventFd { .. } => {
+            pipefs_statfs()
+        }
         FdBackend::Socket { .. } | FdBackend::UnixSocket { .. } => sockfs_statfs(),
         FdBackend::VfsService { .. } => ext2_statfs(),
     };
@@ -10216,7 +10293,8 @@ pub(super) fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
         | FdBackend::Proc { .. }
         | FdBackend::Socket { .. }
         | FdBackend::UnixSocket { .. }
-        | FdBackend::Epoll { .. } => return NEG_EINVAL, // not seekable
+        | FdBackend::Epoll { .. }
+        | FdBackend::EventFd { .. } => return NEG_EINVAL, // not seekable
         FdBackend::Ramdisk { content_len, .. } => *content_len,
         FdBackend::Tmpfs { path } => {
             let tmpfs = crate::fs::tmpfs::TMPFS.lock();
@@ -14662,7 +14740,8 @@ pub(super) fn sys_linux_ftruncate(fd: u64, length: u64) -> u64 {
         | FdBackend::Proc { .. }
         | FdBackend::Socket { .. }
         | FdBackend::UnixSocket { .. }
-        | FdBackend::Epoll { .. } => NEG_EINVAL,
+        | FdBackend::Epoll { .. }
+        | FdBackend::EventFd { .. } => NEG_EINVAL,
         FdBackend::Ramdisk { .. } => NEG_EROFS,
         FdBackend::Tmpfs { path } => {
             let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
@@ -18547,6 +18626,7 @@ fn acquire_inflight_anc_backend(backend: &FdBackend) {
     match backend {
         FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_add_reader(*pipe_id),
         FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_add_writer(*pipe_id),
+        FdBackend::EventFd { id } => crate::eventfd::eventfd_add_ref(*id),
         FdBackend::Socket { handle } => crate::net::add_socket_ref(*handle),
         FdBackend::UnixSocket { handle } => crate::net::unix::add_unix_socket_ref(*handle),
         FdBackend::PtyMaster { pty_id } => crate::pty::add_master_ref(*pty_id),
@@ -19595,6 +19675,19 @@ fn fd_poll_events(entry: &FdEntry) -> i16 {
                 None => POLLERR | POLLHUP, // reader closed (EPIPE)
             }
         }
+        FdBackend::EventFd { id } => {
+            // Phase 86d Track D — eventfd readiness: POLLIN when the counter is
+            // non-zero, POLLOUT when it is below the cap (effectively always).
+            // This drives Go's netpoll epoll wakeup on `netpollBreak` writes.
+            let mut revents: i16 = 0;
+            if crate::eventfd::eventfd_readable(*id) {
+                revents |= POLLIN;
+            }
+            if crate::eventfd::eventfd_writable(*id) {
+                revents |= POLLOUT;
+            }
+            revents
+        }
         FdBackend::DeviceTTY { .. } | FdBackend::Stdin => {
             let mut revents: i16 = 0;
             if entry.readable && crate::stdin::has_data() {
@@ -19882,6 +19975,7 @@ fn fd_register_waiter(
             }
             false
         }
+        FdBackend::EventFd { id } => crate::eventfd::eventfd_register_waiter(*id, task_id, woken),
         FdBackend::DeviceTTY { .. } | FdBackend::Stdin => {
             crate::stdin::STDIN_WAITQUEUE.register(task_id, woken);
             true
@@ -19930,6 +20024,7 @@ fn fd_deregister_waiter(entry: &FdEntry, task_id: crate::task::TaskId) {
         FdBackend::PtySlave { pty_id } => {
             crate::pty::PTY_SLAVE_WQ[*pty_id as usize].deregister(task_id);
         }
+        FdBackend::EventFd { id } => crate::eventfd::eventfd_deregister_waiter(*id, task_id),
         _ => {}
     }
 }
@@ -20547,6 +20642,41 @@ pub(super) fn sys_epoll_create1(flags: u64) -> u64 {
         Some(fd) => fd as u64,
         None => {
             epoll_free(instance_id);
+            NEG_EMFILE
+        }
+    }
+}
+
+/// eventfd2(initval, flags) — syscall 290. Phase 86d Track D.
+///
+/// Go 1.21+'s runtime creates an eventfd (`EFD_CLOEXEC | EFD_NONBLOCK`) as its
+/// cross-thread M-wakeup primitive. Returns a single fd that is both readable
+/// and writable, backed by `crate::eventfd`.
+pub(super) fn sys_eventfd2(initval: u64, flags: u64) -> u64 {
+    use crate::eventfd::{EFD_CLOEXEC, EFD_KNOWN_FLAGS, EFD_NONBLOCK, EFD_SEMAPHORE};
+    if flags & !EFD_KNOWN_FLAGS != 0 {
+        return NEG_EINVAL;
+    }
+    let semaphore = flags & EFD_SEMAPHORE != 0;
+    let cloexec = flags & EFD_CLOEXEC != 0;
+    let nonblock = flags & EFD_NONBLOCK != 0;
+
+    let id = match crate::eventfd::eventfd_create(initval, semaphore) {
+        Some(id) => id,
+        None => return NEG_ENOMEM,
+    };
+    let entry = FdEntry {
+        backend: FdBackend::EventFd { id },
+        offset: 0,
+        readable: true,
+        writable: true,
+        cloexec,
+        nonblock,
+    };
+    match alloc_fd(0, entry) {
+        Some(fd) => fd as u64,
+        None => {
+            crate::eventfd::eventfd_close(id);
             NEG_EMFILE
         }
     }
