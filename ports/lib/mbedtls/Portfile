@@ -1,0 +1,45 @@
+NAME=mbedtls
+VERSION=3.6.2
+DESCRIPTION="mbedTLS — small static TLS 1.3 client + X.509 (curl --with-mbedtls backend)"
+CATEGORY=lib
+DEPS=
+URL=https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-3.6.2/mbedtls-3.6.2.tar.bz2
+SHA256=8b54fb9bcf4d5a7078028e0520acddefb7900b3e66fec7f7175bb5b7d85ccdca
+MAINTAINER=m3os
+
+# Phase 86c Track A — the TLS backend curl (and through curl, the rebuilt git)
+# links for HTTPS git transport. The SIMD-off Rust userspace target rules out
+# `ring`/`aws-lc-rs` and therefore every mainstream Rust TLS stack, but NOT a C
+# TLS library: mbedTLS is the small, static, musl-friendly TLS 1.3 client with
+# full X.509 that drops into the existing `ports/` pipeline next to `zlib`. It is
+# a build-time dependency only (its archives are linked statically into
+# `libcurl`/`git`), so it ships no binaries of its own and nothing `pkg install`s
+# it directly — curl's `.m3pkg` carries the linked code.
+#
+# The RELEASE-asset tarball (not the auto-generated tag tarball) is pinned
+# because only the release asset bundles the `framework/` submodule + the
+# pre-generated PSA driver-wrapper sources, so the cross build needs no network
+# submodule fetch and no Python codegen step.
+#
+# Build identity (see build_mbedtls in xtask/src/port_build.rs):
+#   make lib (static archives only) — libmbedcrypto.a + libmbedx509.a + libmbedtls.a;
+#                                     no programs, no tests.
+#   custom mbedtls_config.h         — derived from the shipped default via
+#                                     scripts/config.py: CLIENT-ONLY (SSL_SRV_C
+#                                     off, DTLS off), TLS 1.2 + 1.3, ChaCha20-
+#                                     Poly1305 + ECDHE-ECDSA-P256 (p256-m) +
+#                                     ECDHE-RSA + X509_CRT_PARSE + PEM_PARSE on.
+#                                     The same header is installed so curl/git
+#                                     compile against the EXACT config the libs
+#                                     were built with (no struct-size ABI skew).
+#   ENTROPY_HARDWARE_ALT +          — CTR_DRBG seeds from the Phase 86a
+#     NO_PLATFORM_ENTROPY             `sys_getrandom` CSPRNG via a
+#                                     `mbedtls_hardware_poll` shim (getrandom(2),
+#                                     syscall 318); NO /dev/urandom / file-I/O
+#                                     entropy path is compiled in.
+#
+# GitHub serves TLS 1.3 with an ECDSA P-256 leaf (Sectigo → USERTrust ECC) and
+# offers TLS_CHACHA20_POLY1305_SHA256. With no hardware AES-NI until Phase 86f,
+# m3OS prefers ChaCha20-Poly1305 over soft AES-GCM. The CA roots are the
+# SHA-256-pinned Phase 86a `ca-certificates` bundle at
+# /etc/ssl/certs/ca-certificates.crt.

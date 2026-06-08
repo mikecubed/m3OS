@@ -1,26 +1,34 @@
 NAME=git
 VERSION=2.44.0
-DESCRIPTION="Distributed version control system (local-only: NO_CURL NO_OPENSSL)"
+DESCRIPTION="Distributed version control system (HTTPS via curl --with-mbedtls; SSH via dropbear)"
 CATEGORY=util
-DEPS=zlib
+DEPS=zlib curl
 URL=https://mirrors.edge.kernel.org/pub/software/scm/git/git-2.44.0.tar.xz
 SHA256=e358738dcb5b5ea340ce900a0015c03ae86e804e7ff64e47aa4631ddee681de3
 MAINTAINER=m3os
 
 # Phase 85b Track A: git is the first real cross-compiled toolchain on top of
-# the Phase 85a `.m3pkg` packaging substrate. It is built local-only — the
-# `NO_CURL`/`NO_OPENSSL` knobs drop all HTTP(S)/TLS transport (and the libcurl
-# + OpenSSL link dependencies) so HTTPS cannot ride in unverified; remote
-# workflows (clone/fetch/push over HTTPS or SSH) are deferred to Phase 86.
+# the Phase 85a `.m3pkg` packaging substrate. Phase 86c REBUILDS it WITH curl:
+# the `NO_CURL` knob is removed and a static `libcurl --with-mbedtls` is linked,
+# so `git clone https://github.com/…` works over real TLS (cert chain + hostname
+# validated against the Phase 86a CA bundle). `NO_OPENSSL=1` stays — the TLS
+# backend is mbedTLS-via-curl, not OpenSSL. SSH clone/fetch/push (Phase 86b) is
+# served by the separate `ssh`/dropbear port via `GIT_SSH`; the SSH transport is
+# orthogonal to git's curl linkage, so this same HTTPS-capable git binary serves
+# both transports.
 #
 # git's build is plain-Makefile (not autotools `./configure`), so the cross is
 # driven entirely by `CC=x86_64-linux-musl-gcc` — there is no `--host` flag to
-# pass. The one mandatory hard dependency is zlib (object/pack compression);
-# SHA-1/SHA-256 are git built-ins. zlib is consumed from the staged
-# `target/port-stage/zlib/usr/local` tree via git's `ZLIB_PATH` Makefile knob.
+# pass. Dependencies: zlib (object/pack compression) + curl (HTTPS transport,
+# transitively pulling mbedtls + ca-certificates). The solver resolves the
+# dependency-first order zlib -> mbedtls -> ca-certificates -> curl -> git
+# (ca-certificates is curl's runtime trust store, so it precedes curl).
+# zlib is consumed via git's `ZLIB_PATH`; curl via `CURL_CFLAGS`/`CURL_LDFLAGS`
+# (the static libcurl+mbedtls+zlib link line). SHA-1/SHA-256 are git built-ins.
 #
 # Build knobs (see build_git in xtask/src/port_build.rs):
-#   NO_CURL=1 NO_OPENSSL=1 — local-only, no HTTPS/TLS (Phase 86 lifts these).
+#   (NO_CURL removed)      — curl is LINKED for HTTPS smart-HTTP transport.
+#   NO_OPENSSL=1           — TLS backend is mbedTLS-via-curl, not OpenSSL.
 #   NO_GETTEXT=1           — no i18n message catalogs.
 #   NO_TCLTK=1             — no gitk / git-gui.
 #   NO_PERL=1 NO_PYTHON=1  — drop the scripted subcommands; the core C builtins

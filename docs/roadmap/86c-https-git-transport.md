@@ -1,6 +1,6 @@
 # Phase 86c - HTTPS/TLS + git smart-HTTP
 
-**Status:** Planned
+**Status:** ✅ Complete — `git-https-smoke` PASSED 36/36 on m3OS (live `https://` clone + bad-cert reject); kernel `0.86.2`
 **Source Ref:** phase-86c
 **Depends on:** Phase 86a (Outbound Foundation — CSPRNG, wall-clock floor, `ca-certificates` `.m3pkg`), Phase 86b (git build pattern + smoke template), Phase 77 (DNS reply delivery D.1 + outbound TCP `connect` D.2) ✅, Phase 85 (Cross-Compiled Toolchains) ✅
 **Builds on:** Sub-phase 86c of the Phase 86 (Networking and GitHub) umbrella — see [`./86-networking-and-github.md`](./86-networking-and-github.md). It is the heavier of the two git-transport sub-phases: where 86b reused in-tree audited crypto and skipped X.509 entirely, 86c adds the full TLS 1.3 + X.509/CA/hostname stack and rebuilds the git binary with `NO_CURL` removed.
@@ -27,7 +27,7 @@ The pure-Rust rustls path is explicitly **deferred**, not chosen-against-and-rev
 - How git smart-HTTP actually works: `GET info/refs?service=git-upload-pack` returns `application/x-git-upload-pack-advertisement` (a 5-byte pkt-line magic), then `POST git-upload-pack` returns a side-band-64k packfile result; a `text/plain` reply triggers the dumb-HTTP fallback m3OS does not support.
 - Why hostname verification is **separate** from chain validation (`mbedtls_ssl_set_hostname` / curl `SSL_VERIFYHOST=2`) and why a negative certificate-rejection test is mandatory.
 - Why the SIMD-off constraint forces a C TLS stack and a ChaCha20-Poly1305 cipher preference (no hardware AES-NI until Phase 86f → soft AES-GCM is slow and cache-timing-exposed; GitHub offers `TLS_CHACHA20_POLY1305_SHA256`).
-- How a multi-package dependency chain (`zlib → mbedtls → curl → ca-certificates → git`) flows through the Phase 85a `.m3pkg` topological solver, including a data-only `ca-certificates` package.
+- How a multi-package dependency chain (`zlib → mbedtls → ca-certificates → curl → git`) flows through the Phase 85a `.m3pkg` topological solver, including a data-only `ca-certificates` package.
 
 ## Feature Scope
 
@@ -37,7 +37,7 @@ A new static musl `ports/lib/mbedtls` with a trimmed, client-only configuration:
 
 ### Area B — curl + git HTTPS rebuild
 
-A new static musl `ports/util/curl` built `--with-mbedtls --with-ca-bundle=<86a path>` (HTTP/HTTPS only), plus a rebuild of git **with** curl that **inverts** the Phase 85b absence-assertions. The Phase 85b assertions HARD-FAIL the build if any curl/OpenSSL linkage is present; 86c reverses them to **require** `curl_easy_perform`/`SSL_CTX_new` and adds the curl dependency to git's `DEPS` (transitively pulling mbedtls + ca-certificates). The git Portfile's `DEPS` encodes the dependency-first order `zlib → mbedtls → curl → ca-certificates → git`. The server-side pack helpers (`git-upload-pack`/`git-receive-pack`/`git-upload-archive`) **stay pruned** — un-pruning them would be wrong, as they are the server half of the protocol.
+A new static musl `ports/util/curl` built `--with-mbedtls --with-ca-bundle=<86a path>` (HTTP/HTTPS only), plus a rebuild of git **with** curl that **inverts** the Phase 85b absence-assertions. The Phase 85b assertions HARD-FAIL the build if any curl/OpenSSL linkage is present; 86c reverses them to **require** `curl_multi_perform` + `mbedtls_ssl_handshake` (keeping `SSL_CTX_new` **absent**, since the backend is mbedTLS not OpenSSL) and adds the curl dependency to git's `DEPS` (transitively pulling mbedtls + ca-certificates). The git Portfile's `DEPS` encodes the dependency-first order `zlib → mbedtls → ca-certificates → curl → git`. The server-side pack helpers (`git-upload-pack`/`git-receive-pack`/`git-upload-archive`) **stay pruned** — un-pruning them would be wrong, as they are the server half of the protocol.
 
 ### Area C — Cert validation, credentials, smoke, version
 
@@ -55,7 +55,7 @@ A new `build_curl` that links the staged mbedtls and zlib. `--with-mbedtls` sele
 
 ### `build_git` rebuild + inverted assertions in `port_build.rs`
 
-`build_git` (`xtask/src/port_build.rs:1427`) currently sets `NO_CURL=1`/`NO_OPENSSL=1` (lines 1458–1459) and **hard-fails** if any curl helper is present — the curl-helper-present check (`~line 1566`), then `curl_easy_perform` (1574) and `SSL_CTX_new` (1580) symbol checks. 86c removes `NO_CURL` and inverts those into **presence** requirements: `git-remote-https`/`git-http-fetch` must exist, and the binary must contain `curl_easy_perform`/`SSL_CTX_new`. Critically, **the inversion and the curl `DEPS` addition must land together** — otherwise `build_git` hard-fails the moment curl helpers appear. The server-side pack-helper prune (`~line 1535`, the `bin/git-upload-pack`/`git-receive-pack`/`git-upload-archive` removal) is **correct and stays**; a doc note records that un-pruning them would expose a server m3OS does not run.
+`build_git` previously set `NO_CURL=1`/`NO_OPENSSL=1` and **hard-failed** if any curl helper was present (a curl-helper-present check, then `curl_easy_perform` and `SSL_CTX_new` symbol checks). 86c removes `NO_CURL` (keeping `NO_OPENSSL` — the backend is mbedTLS-via-curl, not OpenSSL) and inverts those into **presence** requirements: `git-remote-http`/`git-remote-https`/`git-http-fetch` must exist, and the `git-remote-http` helper must reference `curl_multi_perform` (the curl-multi entry git 2.44 actually calls — strip-robust, unlike `curl_easy_perform`) **and** `mbedtls_ssl_handshake` (positive proof the TLS backend linked). `SSL_CTX_new` is kept as an **absence** assertion — its presence would mean OpenSSL crept in. Critically, **the inversion and the curl `DEPS` addition must land together** — otherwise `build_git` hard-fails the moment curl helpers appear. The server-side pack-helper prune (the `bin/git-upload-pack`/`git-receive-pack`/`git-upload-archive` removal) is **correct and stays**, now also positively asserted; a doc note records that un-pruning them would expose a server m3OS does not run.
 
 ### `/etc/gitconfig` + credentials (xtask staging)
 
@@ -64,6 +64,18 @@ The bundled `/etc/gitconfig` is staged by `populate_ext2_files` (`xtask/src/main
 ### `cmd_git_https_smoke` (xtask gate)
 
 A new serial gate modeled on `cmd_git_local_smoke` (`xtask/src/main.rs:13584`). It has two mandatory arms: (1) a positive clone whose `info/refs` response is validated by the `application/x-git-upload-pack-advertisement` Content-Type plus the 5-byte pkt-line magic; (2) a negative arm where an expired / wrong-host / self-signed certificate is **rejected**. The negative arm needs no secret and is the proof that verification is not silently disabled.
+
+## Trust Model (86c)
+
+The HTTPS git transport's security posture, recorded explicitly so a future reader knows what is *intentionally* in or out of scope:
+
+- **Cipher preference: ChaCha20-Poly1305 first.** With no hardware AES-NI until Phase 86f, software AES-GCM is both slower and cache-timing-exposed, so the mbedTLS client prefers `TLS_CHACHA20_POLY1305_SHA256` (which GitHub offers) over soft AES-GCM. AES-GCM stays compiled in as an interop fallback, not the default.
+- **Trust store + CAINFO agreement.** The single source of trust is the SHA-256-pinned Phase 86a Mozilla CA bundle at `/etc/ssl/certs/ca-certificates.crt`. This exact path is wired in three places that **must** agree: curl's compiled-in `--with-ca-bundle`, git's `/etc/gitconfig` `http.sslCAInfo`, and the `GIT_SSL_CAINFO` env override. A per-invocation override is possible via `git -c http.sslCAInfo=…` / `GIT_SSL_CAINFO=…`, but the default must never diverge or trust breaks silently.
+- **Chain validation is separate from hostname verification.** mbedTLS validates the X.509 chain to a trusted root *and* (via curl's `SSL_VERIFYHOST = 2`, the verified default) checks the leaf's SAN/CN against the requested host. A passing chain with no hostname check is still broken; the mandatory negative smoke arm (wrong-host / self-signed / expired → **rejected**) guards both.
+- **Wall-clock dependency.** Certificate validity (`notBefore`/`notAfter`) is meaningful only with a trustworthy clock — a hard dependency on Phase 86a Track B's build-date floor. Under `BOOT_EPOCH_SECS = 0` every cert reads "not yet valid" and TLS fails-closed for the *wrong* reason; 86c must not be validated against that clock.
+- **Entropy.** TLS session keys + X25519/ECDHE ephemerals come from the Phase 86a `sys_getrandom` CSPRNG via the mbedTLS `mbedtls_hardware_poll` shim — never a file-I/O entropy path (no `/dev/urandom` compiled in).
+- **Credentials: PAT only, plaintext-at-rest tradeoff.** GitHub rejects password-over-HTTPS, so authentication is a Personal Access Token used as the password. `/etc/gitconfig` sets `credential.helper = store`, which persists the token in `~/.git-credentials` as **plaintext** (mode 0600). This is the documented tradeoff: m3OS has no secret-service/keyring yet, so a PAT supplied for a clone is readable by anything running as that user. Tokens are supplied at clone time, never baked into the image, and the smoke gate **redacts** them from serial output. `~/.netrc` is the equivalent alternative.
+- **Deferred (intentionally out of scope).** No OCSP/CRL revocation checking; TLS session resumption / tickets are off; client certificates are unsupported; the stack is IPv4 / A-record only (no AAAA/IPv6 — Phase 89); only smart-HTTP is supported (the dumb-HTTP `git-http-fetch` walker is pruned-adjacent and unused). These match what a production stack would add and 86c deliberately does not.
 
 ## How This Builds on Earlier Phases
 
@@ -86,7 +98,7 @@ A new serial gate modeled on `cmd_git_local_smoke` (`xtask/src/main.rs:13584`). 
 
 - `build_mbedtls` produces a static mbedTLS ≥3.6.1 with `MBEDTLS_SSL_CLI_C` on / `MBEDTLS_SSL_SRV_C` off, ChaCha20-Poly1305 + ECDHE-ECDSA-P256 + ECDHE-RSA + `MBEDTLS_X509_CRT_PARSE_C` + `MBEDTLS_PEM_PARSE_C` on, DTLS off, and its CTR_DRBG entropy callback bound to `sys_getrandom` (no file-I/O entropy path).
 - `build_curl` produces a static `libcurl --with-mbedtls --with-ca-bundle=/etc/ssl/certs/ca-certificates.crt` (HTTP/HTTPS only); an HTTPS GET to a controllable endpoint succeeds with SNI + `SSL_VERIFYHOST=2`.
-- A curl-enabled git variant has `git-remote-https` + `git-http-fetch` present; the inverted assertions **require** `curl_easy_perform`/`SSL_CTX_new`; git's `DEPS` gains `curl` (transitively mbedtls + ca-certificates) in the topo order `zlib → mbedtls → curl → ca-certificates → git`; the server-side pack helpers remain pruned.
+- A curl-enabled git variant has `git-remote-http` + `git-remote-https` + `git-http-fetch` present; the inverted assertions **require** `curl_multi_perform` + `mbedtls_ssl_handshake` (and keep `SSL_CTX_new` **absent**, since the backend is mbedTLS not OpenSSL); git's `DEPS` gains `curl` (transitively mbedtls + ca-certificates) in the topo order `zlib → mbedtls → ca-certificates → curl → git`; the server-side pack helpers remain pruned.
 - `/etc/gitconfig` sets `http.sslVerify=true` and `http.sslCAInfo=/etc/ssl/certs/ca-certificates.crt`; the PAT mechanism is configured and documented; tokens are redacted from serial.
 - `git-https-smoke` (env `M3OS_GIT_HTTPS_REGRESSION=1`): (1) a clone succeeds with `info/refs` validated by `application/x-git-upload-pack-advertisement` Content-Type + 5-byte pkt-line magic; (2) expired / wrong-host / self-signed certificates are **rejected**.
 - `kernel/Cargo.toml` reads `0.86.2`; `cargo xtask check` is clean; the boot banner reports `0.86.2`.
