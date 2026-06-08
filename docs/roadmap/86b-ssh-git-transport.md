@@ -8,7 +8,7 @@
 
 ## Milestone Goal
 
-`git clone --depth 1 --single-branch ssh://git@github.com/<owner>/<repo>` succeeds inside m3OS — the packfile arrives and `HEAD` checks out — with **zero changes to the git binary**. git's SSH transport shells out to a static `ssh` client on `PATH` (wired through `GIT_SSH_COMMAND`), so m3OS supplies the transport while upstream git speaks the protocol and moves the bytes. The `ssh` client is chosen by an in-phase **dropbear-vs-sunset spike + ADR**, ships as a `.m3pkg`, and performs `known_hosts`/TOFU host-key verification against GitHub's pinned ed25519 keys. Kernel bumps to **0.86.1**.
+`git clone --depth 1 --single-branch ssh://git@github.com/<owner>/<repo>` succeeds inside m3OS — the packfile arrives and `HEAD` checks out — with **zero changes to the git binary**. git's SSH transport shells out to a static `ssh` client on `PATH` (wired through `GIT_SSH`), so m3OS supplies the transport while upstream git speaks the protocol and moves the bytes. The `ssh` client is chosen by an in-phase **dropbear-vs-sunset spike + ADR**, ships as a `.m3pkg`, and performs `known_hosts`/TOFU host-key verification against GitHub's pinned ed25519 keys. Kernel bumps to **0.86.1**.
 
 ## Why This Phase Exists
 
@@ -37,7 +37,7 @@ Build the chosen client as a static `.m3pkg` landing in `/usr/pkg/`, installable
 
 ### Area C — git wiring + smoke + version
 
-Wire git to the client via `GIT_SSH_COMMAND` (never a bare `GIT_SSH`, which fails on argument handling) plus a bundled `/etc/gitconfig`, then validate a shallow single-branch `git clone` over an `ssh://` URL with an opt-in serial smoke gate. Bump the kernel to `0.86.1`.
+Wire git to the client via `GIT_SSH` (a bare program path, exec'd directly; `GIT_SSH_COMMAND` is unusable on m3OS because git runs it via `/bin/sh -c`, which m3OS's `/bin/sh` rejects) plus a bundled `/etc/gitconfig`, then validate a shallow single-branch `git clone` over an `ssh://` URL with an opt-in serial smoke gate. Bump the kernel to `0.86.1`.
 
 ## Important Components and How They Work
 
@@ -55,7 +55,7 @@ The host key is **data with a rotation path**. dropbear's `dbclient` carries TOF
 
 ### git wiring (no git changes)
 
-`GIT_SSH_COMMAND` points git at the installed client; a bundled `/etc/gitconfig` (staged via `xtask/src/main.rs`'s `populate_ext2_files` at `:15586`) carries the commit identity and any `core.sshCommand`/`~/.ssh/config` alias. **The Phase 85b `build_git` (`xtask/src/port_build.rs:1427`) is untouched** — in particular the server-side pack helpers it prunes (`git-upload-pack`/`git-receive-pack`/`git-upload-archive`, `port_build.rs:1535`+) stay pruned, because those run on the *remote*, not the client. A clone uses the remote's `git-upload-pack` over the SSH channel; m3OS supplies only the client transport.
+`GIT_SSH` points git at the installed client (direct exec; `GIT_SSH_COMMAND` is unusable on m3OS — git runs it via `/bin/sh -c`); a bundled `/etc/gitconfig` (staged via `xtask/src/main.rs`'s `populate_ext2_files` at `:15586`) carries the commit identity and any `core.sshCommand`/`~/.ssh/config` alias. **The Phase 85b `build_git` (`xtask/src/port_build.rs:1427`) is untouched** — in particular the server-side pack helpers it prunes (`git-upload-pack`/`git-receive-pack`/`git-upload-archive`, `port_build.rs:1535`+) stay pruned, because those run on the *remote*, not the client. A clone uses the remote's `git-upload-pack` over the SSH channel; m3OS supplies only the client transport.
 
 ## How This Builds on Earlier Phases
 
@@ -69,7 +69,7 @@ The host key is **data with a rotation path**. dropbear's `dbclient` carries TOF
 1. **Spike + ADR (Track A).** Score dropbear vs sunset on the five axes; write the decision into this doc + `docs/appendix/sunset-local-fork.md`; document the KEX/host-sig/cipher/MAC interop contract with the chacha20-poly1305 risk note.
 2. **Build the chosen client (Track B.1).** dropbear: add `ports/util/dropbear/Portfile` + `build_dropbear` (bundled-libtom crypto, `-static` musl plumbing), register in `PORTS`/dispatch. sunset: build a `userspace/ssh/` harness over `new_client`/`open_client_session` + the `async-rt` `Reactor`. Seal the `.m3pkg`.
 3. **TOFU + pinned host keys (Track B.2).** Seed `github.com` + `ssh.github.com` ed25519 entries as data; implement/verify TOFU accept-on-first-use and mismatch-reject; document rotation.
-4. **git wiring + smoke (Track C.1).** Stage `/etc/gitconfig` + `known_hosts`; wire `GIT_SSH_COMMAND`; add `cmd_git_ssh_smoke` (modeled on `cmd_git_local_smoke`, `xtask/src/main.rs:13584`); clone a tiny repo `--depth 1 --single-branch` over `ssh://`.
+4. **git wiring + smoke (Track C.1).** Stage `/etc/gitconfig` + `known_hosts`; wire `GIT_SSH`; add `cmd_git_ssh_smoke` (modeled on `cmd_git_local_smoke`, `xtask/src/main.rs:13584`); clone a tiny repo `--depth 1 --single-branch` over `ssh://`.
 5. **Version bump (Track C.2).** `kernel/Cargo.toml` `0.86.0` → `0.86.1`; `cargo xtask check` clean; banner/`uname` report `0.86.1`.
 
 ## Acceptance Criteria
@@ -77,7 +77,7 @@ The host key is **data with a rotation path**. dropbear's `dbclient` carries TOF
 - A scored dropbear-vs-sunset matrix (drop-in subprocess fit, GitHub interop, `known_hosts`/TOFU cost, binary size, crypto reuse) and a written ADR exist; the interop contract (KEX `curve25519-sha256`, host-sig `ssh-ed25519`, ciphers `chacha20-poly1305@openssh.com`+`aes256-ctr`, MAC `hmac-sha2-256`) is documented with the chacha20-poly1305 risk note.
 - The chosen `ssh` client builds **static**, lands as a `.m3pkg` in `/usr/pkg/`, and `pkg install ssh` succeeds; `ssh -T git@github.com` returns the GitHub banner and exit code 1.
 - `github.com` **and** `ssh.github.com` `ssh-ed25519` entries are seeded as data (`SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU`); a **mismatched host key is REJECTED** (negative test); the `known_hosts` format (`host ssh-ed25519 base64`, mode `0600`) round-trips the slow VFS and rotation is documented.
-- `git clone --depth 1 --single-branch ssh://git@github.com/<owner>/<repo>` succeeds inside m3OS — the packfile arrives and `HEAD` checks out (serial-asserted) — over an `ssh://` URL or `~/.ssh/config` alias (never scp-like for non-22 ports), via `GIT_SSH_COMMAND`, with the Phase 85b git binary **not rebuilt**.
+- `git clone --depth 1 --single-branch ssh://git@github.com/<owner>/<repo>` succeeds inside m3OS — the packfile arrives and `HEAD` checks out (serial-asserted) — over an `ssh://` URL or `~/.ssh/config` alias (never scp-like for non-22 ports), via `GIT_SSH`, with the Phase 85b git binary **not rebuilt**.
 - `cargo xtask git-ssh-smoke` exists and is wired as an opt-in `M3OS_GIT_SSH_REGRESSION=1` pre-push gate (in `AGENTS.md` + `.githooks/pre-push`), skipping-with-reason when SSH key/creds are absent (mirroring `tls-smoke`/`dns-smoke` PASS-vs-SKIP).
 - `kernel/Cargo.toml` reads `0.86.1`; `cargo xtask check` is clean; boot banner / `uname` report `0.86.1`.
 
@@ -146,7 +146,7 @@ drops chacha20-poly1305 for clients, this contract must be revisited (the fallba
 
 ## How Real OS Implementations Differ
 
-- git's SSH transport is a fork/exec shell-out with a fixed precedence: `GIT_SSH_COMMAND` > `core.sshCommand` > `GIT_SSH` > the builtin `ssh` — and `GIT_SSH` is invoked positionally, so a bare `GIT_SSH='dbclient -y'` with embedded args fails (use `GIT_SSH_COMMAND`).
+- git's SSH transport is a fork/exec shell-out with a fixed precedence: `GIT_SSH_COMMAND` > `core.sshCommand` > `GIT_SSH` > the builtin `ssh` — and `GIT_SSH` is invoked positionally, so a bare `GIT_SSH='dbclient -y'` with embedded args fails — but `GIT_SSH` pointing at a bare program with no args (`/usr/bin/dbclient`) works, and m3OS uses that because `GIT_SSH_COMMAND` runs via `/bin/sh -c`, which m3OS's `/bin/sh` rejects.
 - scp-like remotes (`git@github.com:owner/repo`) **cannot carry a non-22 port** — reaching `ssh.github.com:443` requires an `ssh://` URL or a `~/.ssh/config` alias.
 - GitHub's SSH endpoint is a **restricted shell**: `ssh -T git@github.com` greets and exits 1; it is pubkey-only ed25519, on port 22 or `ssh.github.com:443`.
 - GitHub host keys are **pinned as data** (ed25519/ecdsa/rsa fingerprints; the RSA key rotated in 2023), so a static system must treat its known-good keys as rotatable, not compiled-in.

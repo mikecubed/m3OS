@@ -3,7 +3,7 @@
 **Status:** Implemented — network-free acceptance **verified** on m3OS; the mismatch-reject negative test is now **verified live** against `github.com:22` (the non-blocking-`connect` kernel blocker was closed in this sub-phase, so `M3OS_GIT_SSH_NET=1` auto-upgraded to dropbear's real `host key mismatch for` reject); the real `clone` remains **credential/egress-gated** (needs a GitHub-registered key), skipping-with-reason in unconfigured CI (the documented `tls-smoke`/`dns-smoke` PASS-vs-SKIP contract).
 **Source Ref:** phase-86b
 **Depends on:** Phase 86a (Outbound Foundation), Phase 85b (git Local) ✅, Phase 77 (DNS reply delivery D.1 + outbound TCP `connect` D.2) ✅
-**Goal:** Land a static `ssh` client (chosen by an in-phase dropbear-vs-sunset spike + ADR) with `known_hosts`/TOFU host-key verification, wire it to the **unchanged** Phase 85b `git` via `GIT_SSH_COMMAND`, and prove a shallow single-branch `git clone ... ssh://git@github.com/<repo>` succeeds end-to-end inside m3OS — the cheapest first secure remote transport, reusing in-tree audited crypto and skipping the entire X.509/CA stack. Kernel bumps to `0.86.1`.
+**Goal:** Land a static `ssh` client (chosen by an in-phase dropbear-vs-sunset spike + ADR) with `known_hosts`/TOFU host-key verification, wire it to the **unchanged** Phase 85b `git` via `GIT_SSH`, and prove a shallow single-branch `git clone ... ssh://git@github.com/<repo>` succeeds end-to-end inside m3OS — the cheapest first secure remote transport, reusing in-tree audited crypto and skipping the entire X.509/CA stack. Kernel bumps to `0.86.1`.
 
 > **Verification status (post-implementation).** `[x]` = verified on m3OS or by `cargo xtask check`. Items tagged **[…-gated]** are implemented but cannot complete in this environment (no GitHub-registered key) — they SKIP/gate, like `tls-smoke`/`dns-smoke` PASS-vs-SKIP. Evidence: `cargo xtask git-ssh-smoke` → `PASSED core (30 steps in ~145s)` — `pkg install ssh`/`git` OK (git **reused**, not rebuilt), `dbclient -V`/`ssh -V` report `Dropbear v2024.86`, seeded GitHub ed25519 key round-trips the VFS; `cargo xtask port build dropbear` seals a static `.m3pkg` (rebuild = zero-compiler pkgcache hit); `cargo xtask check` clean at kernel **v0.86.1**. **Non-blocking `connect` is now implemented** (≈140 LOC kernel, adversarially reviewed to APPROVE) and proven egress-free by `connect-smoke` (`EINPROGRESS` + `poll(POLLOUT)` + `getsockopt(SO_ERROR)` + `EALREADY`, in the main smoke flow). The opt-in `M3OS_GIT_SSH_NET=1` live mismatch-reject, driven against `github.com:22`, **auto-upgraded** accordingly: dropbear's non-blocking `connect()` now establishes (previously `Connect failed: unexpected failure` against the synchronous `sys_connect`), reaches KEX, and the `WaitEither` matched branch **a** — dropbear's real `host key mismatch for` reject — with the planted bad key left on disk (not auto-accepted). Only the real `clone` remains key-gated.
 
@@ -15,7 +15,7 @@
 |---|---|---|---|
 | A | dropbear-vs-sunset spike + scored matrix + written ADR | 86a | Planned |
 | B | Static `ssh` client `.m3pkg` + `known_hosts`/TOFU + pinned GitHub keys | A, 86a (CSPRNG + `known_hosts` path) | Planned |
-| C | `GIT_SSH_COMMAND` wiring + ssh-clone smoke gate + version bump | B, 85b (git untouched) | Planned |
+| C | `GIT_SSH` wiring + ssh-clone smoke gate + version bump | B, 85b (git untouched) | Planned |
 
 ---
 
@@ -68,7 +68,7 @@
 
 ## Track C — git wiring + smoke + version
 
-### C.1 — Wire git via `GIT_SSH_COMMAND` + an ssh-clone smoke gate
+### C.1 — Wire git via `GIT_SSH` + an ssh-clone smoke gate
 
 **Files:**
 - `xtask/src/main.rs` (`cmd_git_ssh_smoke`, modeled on `cmd_git_local_smoke` at `main.rs:13584`; `/etc/gitconfig` + `known_hosts` staging via `populate_ext2_files` at `main.rs:15586`)
@@ -76,11 +76,11 @@
 - `.githooks/pre-push` (gate wiring)
 
 **Symbol:** `cmd_git_ssh_smoke`
-**Why it matters:** the Phase 85b `git` is sufficient **unchanged** — `build_git` (`xtask/src/port_build.rs:1427`) is untouched and the server-side pack helpers it prunes (`git-upload-pack`/`git-receive-pack`/`git-upload-archive`, `port_build.rs:1535`+) stay pruned (they run on the *remote*); a bare `GIT_SSH='dbclient -y'` fails on positional args, and scp-like syntax cannot carry `:443`, so the wiring must use `GIT_SSH_COMMAND` and an `ssh://` URL or config alias.
+**Why it matters:** the Phase 85b `git` is sufficient **unchanged** — `build_git` (`xtask/src/port_build.rs:1427`) is untouched and the server-side pack helpers it prunes (`git-upload-pack`/`git-receive-pack`/`git-upload-archive`, `port_build.rs:1535`+) stay pruned (they run on the *remote*); a bare `GIT_SSH='dbclient -y'` with embedded args fails on positional args, and scp-like syntax cannot carry `:443`, so the wiring uses `GIT_SSH=/usr/bin/dbclient` (a bare program path — `dbclient` needs no extra args and auto-loads `~/.ssh/id_dropbear`) with an `ssh://` URL or config alias; `GIT_SSH_COMMAND` is unusable on m3OS because git runs it via `/bin/sh -c`, which m3OS's `/bin/sh` rejects.
 
 **Acceptance:**
 - [~] `M3OS_GIT_SSH_REGRESSION=1` boots m3OS, `pkg install`s `git` + `ssh`, and `git clone --depth 1 --single-branch ssh://git@github.com/<owner>/<repo>` succeeds — the packfile arrives and `HEAD` checks out (both serial-asserted). **[cred-gated only — the non-blocking-connect blocker is now closed]** — the boot + `pkg install ssh`/`git` half is **verified** (smoke core, 30 steps), and the transport layer is unblocked (the B.2 reject now reaches a live KEX). The live clone still needs a GitHub-registered key (`M3OS_GIT_SSH_KEY=<key>` + `M3OS_GIT_SSH_NET=1`). Asserts the packfile (`Receiving objects`) + a checked-out file once a key is supplied.
-- [x] The clone uses an `ssh://` URL or a `~/.ssh/config` alias (never scp-like for non-22 ports) and is driven through `GIT_SSH_COMMAND` (never a bare `GIT_SSH`). *(Implemented: `export GIT_SSH_COMMAND='dbclient -i …'` + `git clone … ssh://git@github.com/…`.)*
+- [x] The clone uses an `ssh://` URL or a `~/.ssh/config` alias (never scp-like for non-22 ports) and is driven through `GIT_SSH` (direct exec), because git runs `GIT_SSH_COMMAND` via `/bin/sh -c` which m3OS's `/bin/sh` rejects. *(Implemented: `export GIT_SSH=/usr/bin/dbclient` + `git clone … ssh://git@github.com/…`; `dbclient` auto-loads `~/.ssh/id_dropbear`, so no `-i` is needed.)*
 - [x] The gate runs at a long `--timeout` (clang-gate class, e.g. 5400 s) because the packfile transfer over the ~200 KB/s ring-3 VFS is slow, and clones a tiny repo with `--depth 1 --single-branch` to bound the packfile. *(pre-push wires `--timeout 5400`; default clone target `octocat/Hello-World` with `--depth 1 --single-branch`.)*
 - [x] The gate confirms **no git rebuild** occurred (the bundled Phase 85b `git` `.m3pkg` is reused) and **skips-with-reason** when the SSH key/creds are absent (mirroring `tls-smoke`/`dns-smoke` PASS-vs-SKIP). *(Verified: `build_git` untouched, git pkgcache hit; smoke prints the SKIP NOTE and `PASSED core` when net/creds absent.)*
 - [x] `cargo xtask git-ssh-smoke` exists and is wired into both `AGENTS.md`'s pre-push gate table and `.githooks/pre-push` behind `M3OS_GIT_SSH_REGRESSION=1`. *(Verified: subcommand runs; AGENTS.md row + pre-push block added.)*
@@ -100,9 +100,9 @@
 
 ## Documentation Notes
 
-- **What changed relative to Phase 85b.** Phase 85b's `git` binary is reused **unchanged** — `build_git` (`xtask/src/port_build.rs:1427`) is not touched and its pruned server-side pack helpers (`port_build.rs:1535`+) stay pruned; the only new artifacts are the static `ssh` client `.m3pkg` and the `known_hosts`/`GIT_SSH_COMMAND` wiring. HTTPS/curl/TLS remain absent ([86c](./86c-https-git-transport.md)).
+- **What changed relative to Phase 85b.** Phase 85b's `git` binary is reused **unchanged** — `build_git` (`xtask/src/port_build.rs:1427`) is not touched and its pruned server-side pack helpers (`port_build.rs:1535`+) stay pruned; the only new artifacts are the static `ssh` client `.m3pkg` and the `known_hosts`/`GIT_SSH` wiring. HTTPS/curl/TLS remain absent ([86c](./86c-https-git-transport.md)).
 - **Spike-conditional task count.** Record the ADR outcome before implementing Track B/C — dropbear is +1 C port with native TOFU; sunset is +a from-scratch client harness (`userspace/ssh/`) + a `known_hosts.rs` TOFU layer + bundling.
 - **Host keys are rotatable data, not compiled-in.** Seed `github.com` + `ssh.github.com` ed25519 entries; the mandatory mismatch negative test (B.2) is what proves verification is real and not a green-but-broken pass.
-- **Use `GIT_SSH_COMMAND` + `ssh://`/config alias, never scp-like for `:443`.** scp-like remotes cannot carry a non-22 port, and `GIT_SSH` is invoked positionally.
+- **Use `GIT_SSH=/usr/bin/dbclient` (direct exec) + `ssh://`/config alias, never scp-like for `:443`.** scp-like remotes cannot carry a non-22 port; `GIT_SSH_COMMAND` is unusable on m3OS (git runs it via `/bin/sh -c`, which m3OS's `/bin/sh` rejects), and a bare `GIT_SSH` program path works because `dbclient` needs no extra args.
 - **Clone-cost caveat.** The packfile over the ~200 KB/s VFS plus the `sys_connect` 3 s synchronous-connect cap and the no-TCP-reassembly drop path (`kernel/src/net/tcp.rs:20`) make a lossy SLIRP clone a known risk; `--depth 1 --single-branch` on a tiny repo plus a clang-class `--timeout` is the mitigation.
 - **Prefer exact symbols** — `Runner::new_client`/`open_client_session`/`resume_checkhostkey`, `CliEvent::Hostkey`, `build_git`, `cmd_git_local_smoke`, `populate_ext2_files`, `musl_toolchain` — over generic descriptions.

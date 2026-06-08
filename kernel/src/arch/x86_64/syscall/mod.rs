@@ -9418,8 +9418,15 @@ fn open_ext2_file(
             .map(|v| v.resolve_path(rel).is_ok());
         match exists {
             Some(true) => {
-                if truncate && writable && vfs_service_truncate(name, 0).is_err() {
-                    return NEG_EIO;
+                // Propagate the vfs_server-provided negative errno (e.g.
+                // ENOENT/EACCES) rather than collapsing every failure to EIO, so
+                // the routed O_TRUNC path matches the in-kernel fallback and the
+                // sibling O_CREAT branch below (which also returns the vfs errno).
+                if truncate
+                    && writable
+                    && let Err(e) = vfs_service_truncate(name, 0)
+                {
+                    return e;
                 }
             }
             Some(false) => {

@@ -212,7 +212,7 @@ const SMOKE_EXIT_CLANG_SMOKE_FAILED: i32 = 76;
 /// git-over-SSH failure separately. Boots m3OS, `pkg install ssh` (the static
 /// dropbear client) + reuses the Phase 85b `git` UNCHANGED, verifies the client
 /// runs and GitHub's host key is seeded, then — when SSH egress/creds are
-/// configured — clones a repo over `ssh://` via `GIT_SSH_COMMAND`.
+/// configured — clones a repo over `ssh://` via `GIT_SSH`.
 const SMOKE_EXIT_GIT_SSH_SMOKE_FAILED: i32 = 77;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -748,7 +748,7 @@ fn main() {
         // Phase 86b — `cargo xtask git-ssh-smoke` boots m3OS, `pkg install ssh`
         // (the static dropbear client) + reuses git unchanged, proves the client
         // runs + GitHub's host key is seeded, and (opt-in, with egress/creds)
-        // clones a repo over `ssh://` via GIT_SSH_COMMAND.
+        // clones a repo over `ssh://` via GIT_SSH.
         Some("git-ssh-smoke") => {
             let smoke_args =
                 parse_smoke_boot_args("git-ssh-smoke", &args[2..]).unwrap_or_else(|err| {
@@ -14267,7 +14267,8 @@ fn git_ssh_smoke_steps(
 
     // 6. (Opt-in, needs egress + registered key) The real clone. git speaks the
     //    SSH transport itself and fork/execs the dropbear client via
-    //    GIT_SSH_COMMAND; the `ssh://` URL carries the host (and any non-22 port,
+    //    GIT_SSH (direct exec; GIT_SSH_COMMAND is unusable on m3OS — git runs it via /bin/sh -c,
+    //    which m3OS's /bin/sh rejects — see below); the `ssh://` URL carries the host (and any non-22 port,
     //    which scp-like syntax cannot). The packfile arriving + HEAD checking out
     //    is proven by reading a file from the cloned tree.
     if attempt_clone {
