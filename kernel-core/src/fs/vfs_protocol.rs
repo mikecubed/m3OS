@@ -73,6 +73,90 @@ pub const VFS_MOUNT_POLICY: u64 = 16;
 /// Resolve umount policy for a target path.
 pub const VFS_UMOUNT_POLICY: u64 = 17;
 
+// ---------------------------------------------------------------------------
+// Phase 93 — ext2 write authority. These ops make `vfs_server` the SINGLE
+// owner of the ext2 root (reads AND writes), eliminating the dual-engine
+// read-incoherence hazard (kernel `EXT2_VOLUME` vs vfs_server `Ext2State`).
+// The kernel routes mutating ext2 syscalls through these ops when the `vfs`
+// service is registered, and falls back to its in-kernel engine otherwise.
+//
+// All write ops are **path-based** (like `VFS_STAT_PATH`/`VFS_ACCESS_PATH`)
+// rather than handle-based, so they share the path-resolution authority the
+// service already owns and never need writable open-handle state.
+// ---------------------------------------------------------------------------
+
+/// Read file data by resolved path + byte offset.
+///
+/// Used by the kernel's `Ext2Disk` read path so that a writer reading back its
+/// own writable fd sees the coherent vfs_server view (not a stale kernel
+/// block-cache snapshot).
+///
+/// Request: bulk = UTF-8 path bytes, `data[0]` = path length,
+///          `data[1]` = byte offset, `data[2]` = max bytes.
+/// Reply:   label = 0 on success (negative errno on error),
+///          `data[0]` = bytes actually read, reply bulk = file data.
+pub const VFS_PREAD: u64 = 18;
+
+/// Write file data by resolved path at a byte offset, allocating blocks as
+/// needed and growing the file. Mirrors the kernel engine's `write_file_data`.
+///
+/// Request: bulk = UTF-8 path bytes followed by the data bytes,
+///          `data[0]` = path length, `data[1]` = byte offset,
+///          `data[2]` = data length.
+/// Reply:   label = 0 on success (negative errno on error),
+///          `data[0]` packs `bytes_written` in the low 32 bits and the new
+///          file size in the high 32 bits.
+pub const VFS_WRITE: u64 = 19;
+
+/// Truncate a file by resolved path to `length` bytes (freeing data blocks
+/// when shrinking to zero; growth via subsequent writes).
+///
+/// Request: bulk = UTF-8 path bytes, `data[0]` = path length,
+///          `data[1]` = new length.
+/// Reply:   label = 0 on success (negative errno on error).
+pub const VFS_TRUNCATE: u64 = 20;
+
+/// Create a regular file, directory, or symlink in a parent directory.
+///
+/// The IPC message has only four `data` words, so the create parameters are
+/// packed:
+///
+/// Request: bulk = parent path bytes || name bytes || symlink-target bytes,
+///          `data[0]` packs parent-path length (low 32) and name length
+///          (high 32); `data[1]` packs `mode` (low 16 bits), `kind`
+///          (bits 16..18: [`VFS_NODE_FILE`]/[`VFS_NODE_DIR`]/
+///          [`VFS_NODE_SYMLINK`]), and symlink-target length (high 32, only for
+///          [`VFS_NODE_SYMLINK`]); `data[2]` = uid; `data[3]` = gid.
+/// Reply:   label = 0 on success (negative errno on error),
+///          `data[0]` = new inode number.
+pub const VFS_CREATE: u64 = 21;
+
+/// Remove a directory entry (file or empty directory) by parent + name.
+///
+/// Request: bulk = parent path bytes || name bytes, `data[0]` = parent path
+///          length, `data[1]` = name length, `data[2]` = 1 to require a
+///          directory (rmdir), 0 to require a non-directory (unlink).
+/// Reply:   label = 0 on success (negative errno on error).
+pub const VFS_UNLINK: u64 = 22;
+
+/// Rename/move an entry from `old` to `new` (both absolute resolved paths).
+///
+/// Request: bulk = old path bytes || new path bytes, `data[0]` = old path
+///          length, `data[1]` = new path length.
+/// Reply:   label = 0 on success (negative errno on error).
+pub const VFS_RENAME: u64 = 23;
+
+/// Hard-link `new` to the existing target inode at the resolved `target` path.
+///
+/// Request: bulk = target path bytes || new-parent path bytes || new-name
+///          bytes, `data[0]` = target path length, `data[1]` = new-parent
+///          path length, `data[2]` = new-name length.
+/// Reply:   label = 0 on success (negative errno on error).
+pub const VFS_LINK: u64 = 24;
+
+/// Node-kind selector encoded in `VFS_CREATE` `data[2]` bits 16..18.
+pub const VFS_CREATE_KIND_SHIFT: u32 = 16;
+
 /// Maximum bytes per single VFS_READ reply bulk payload.
 pub const VFS_MAX_READ: usize = 4096;
 
@@ -116,6 +200,34 @@ mod tests {
         assert_ne!(VFS_STAT_PATH, VFS_LIST_DIR);
         assert_ne!(VFS_ACCESS_PATH, VFS_MOUNT_POLICY);
         assert_ne!(VFS_MOUNT_POLICY, VFS_UMOUNT_POLICY);
+    }
+
+    #[test]
+    fn write_op_labels_are_unique() {
+        // Phase 93 — the ext2-write authority ops must not collide with each
+        // other or with any pre-existing label.
+        let labels = [
+            VFS_OPEN,
+            VFS_READ,
+            VFS_CLOSE,
+            VFS_STAT_PATH,
+            VFS_LIST_DIR,
+            VFS_ACCESS_PATH,
+            VFS_MOUNT_POLICY,
+            VFS_UMOUNT_POLICY,
+            VFS_PREAD,
+            VFS_WRITE,
+            VFS_TRUNCATE,
+            VFS_CREATE,
+            VFS_UNLINK,
+            VFS_RENAME,
+            VFS_LINK,
+        ];
+        for (i, a) in labels.iter().enumerate() {
+            for b in &labels[i + 1..] {
+                assert_ne!(a, b, "VFS protocol labels must be distinct");
+            }
+        }
     }
 
     #[test]

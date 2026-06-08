@@ -234,6 +234,18 @@ impl Ext2Volume {
             .map_err(|_| Ext2Error::IoError)
     }
 
+    /// Drop the entire read-through block cache (Phase 93).
+    ///
+    /// When `vfs_server` is the ext2 write authority, mutations land on disk
+    /// out-of-band from this engine's cache. The kernel still reads ext2
+    /// metadata directly (e.g. `resolve_path` for `fstat` st_ino, the exec
+    /// loader) so its cache must be flushed after a routed mutation, or it
+    /// would serve a stale directory/inode/bitmap block. Cheap insurance: the
+    /// next read repopulates from disk.
+    pub fn invalidate_block_cache(&self) {
+        self.block_cache.lock().clear();
+    }
+
     // -----------------------------------------------------------------------
     // Inode operations (P28-T010)
     // -----------------------------------------------------------------------
@@ -1528,6 +1540,17 @@ pub fn is_mounted() -> bool {
 
 pub fn unmount_ext2() {
     *EXT2_VOLUME.lock() = None;
+}
+
+/// Flush the kernel ext2 read cache (Phase 93).
+///
+/// Called by the syscall layer after it routes a mutating ext2 op to the
+/// `vfs_server` write authority, so the kernel's own metadata reads
+/// (`resolve_path`, exec loader) don't serve a stale cached block.
+pub fn invalidate_cache() {
+    if let Some(vol) = EXT2_VOLUME.lock().as_ref() {
+        vol.invalidate_block_cache();
+    }
 }
 
 /// Get uid/gid/mode for an ext2 file by its root-relative path.

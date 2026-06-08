@@ -45,6 +45,14 @@ const DNS_SMOKE_NEEDLE: &[u8] = b"DNS_SMOKE:";
 const CONNECT_SMOKE_PATH: &[u8] = b"/bin/connect-smoke\0";
 const CONNECT_SMOKE_ARGV0: &[u8] = b"connect-smoke\0";
 const CONNECT_SMOKE_PASS_NEEDLE: &[u8] = b"CONNECT_SMOKE:PASS";
+// Phase 93 — ext2 cross-process read-coherence regression (Bug B). A full-musl
+// static binary that writes an ext2 file, churns unrelated ext2 metadata, then
+// reads the file back from a FRESHLY fork/exec'd process and asserts it sees the
+// new bytes. PASS is the load-bearing verdict; SKIP only when the binary is
+// absent (no musl toolchain at build). A FAIL is a hard gate failure.
+const EXT2_COHERENCE_SMOKE_PATH: &[u8] = b"/bin/ext2-coherence-smoke\0";
+const EXT2_COHERENCE_SMOKE_ARGV0: &[u8] = b"ext2-coherence-smoke\0";
+const EXT2_COHERENCE_SMOKE_PASS_NEEDLE: &[u8] = b"EXT2_COHERENCE:PASS";
 // Phase 76 — `dynlink_smoke` is a musl-built dynamic ELF carrying
 // `PT_INTERP = /lib/ld-musl-x86_64.so.1` and zero `DT_NEEDED`
 // entries. Running it exercises the kernel `PT_INTERP` branch +
@@ -190,6 +198,31 @@ fn program_main(_args: &[&str]) -> i32 {
         return code;
     }
     pass("storage");
+
+    // Phase 93 — ext2 cross-process read-coherence regression (Bug B). Writes an
+    // ext2 file, churns unrelated ext2 metadata, then reads it back from a fresh
+    // fork/exec'd process and asserts the new bytes are visible. SKIP if the
+    // binary is absent (musl toolchain missing at build); otherwise PASS is
+    // required and a FAIL fails the smoke.
+    {
+        let mut probe = Stat::zeroed();
+        if stat(EXT2_COHERENCE_SMOKE_PATH, &mut probe) < 0 || probe.st_size == 0 {
+            skip("ext2-coherence");
+        } else {
+            begin("ext2-coherence");
+            let coh_argv = [EXT2_COHERENCE_SMOKE_ARGV0.as_ptr(), ptr::null()];
+            if let Err(code) = run_command_expect_output(
+                "ext2-coherence",
+                EXT2_COHERENCE_SMOKE_PATH,
+                &coh_argv,
+                EXT2_COHERENCE_SMOKE_PASS_NEEDLE,
+                &mut command_output,
+            ) {
+                return code;
+            }
+            pass("ext2-coherence");
+        }
+    }
 
     begin("net");
     let udp_smoke_argv = [UDP_SMOKE_PATH.as_ptr(), ptr::null()];

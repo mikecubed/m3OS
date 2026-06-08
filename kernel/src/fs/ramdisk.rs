@@ -122,6 +122,8 @@ static TLS_SMOKE_ELF: &[u8] = generated_initrd_asset!("tls-smoke");
 static DNS_SMOKE_ELF: &[u8] = generated_initrd_asset!("dns-smoke");
 // Phase 86b: non-blocking connect() / EINPROGRESS + poll + SO_ERROR smoke test.
 static CONNECT_SMOKE_ELF: &[u8] = generated_initrd_asset!("connect-smoke");
+// Phase 93: ext2 cross-process read-coherence regression (Bug B).
+static EXT2_COHERENCE_SMOKE_ELF: &[u8] = generated_initrd_asset!("ext2-coherence-smoke");
 static MAKE_ELF: &[u8] = generated_initrd_asset!("make");
 static HEAD_ELF: &[u8] = generated_initrd_asset!("head");
 static TAIL_ELF: &[u8] = generated_initrd_asset!("tail");
@@ -854,6 +856,13 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "connect-smoke",
         RamdiskNode::File {
             content: CONNECT_SMOKE_ELF,
+        },
+    ),
+    // Phase 93: ext2 cross-process read-coherence regression (Bug B).
+    (
+        "ext2-coherence-smoke",
+        RamdiskNode::File {
+            content: EXT2_COHERENCE_SMOKE_ELF,
         },
     ),
     // Phase 34: timekeeping utilities

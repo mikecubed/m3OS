@@ -2775,6 +2775,11 @@ fn build_musl_bins() {
         ("userspace/dns-smoke/dns-smoke.c", "dns-smoke"),
         // Phase 86b: non-blocking connect() / EINPROGRESS + poll + SO_ERROR.
         ("userspace/connect-smoke/connect-smoke.c", "connect-smoke"),
+        // Phase 93: ext2 cross-process read-coherence regression (Bug B).
+        (
+            "userspace/ext2-coherence-smoke/ext2-coherence-smoke.c",
+            "ext2-coherence-smoke",
+        ),
     ];
 
     let cc = match find_musl_cc() {
@@ -7215,6 +7220,21 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         pattern: "SMOKE:storage:PASS",
         timeout_secs: 20,
         label: "guest/storage: smoke runner verified ext2 file lifecycle",
+    });
+    // Phase 93 — ext2 cross-process read-coherence regression (Bug B). The
+    // smoke-runner execs `/bin/ext2-coherence-smoke`, which writes an ext2 file,
+    // churns unrelated ext2 metadata, then reads it back from a FRESHLY
+    // fork/exec'd process and asserts the new content is visible. PASS proves
+    // the dual-engine ext2 read-incoherence is fixed; SKIP only when the binary
+    // is absent (no musl toolchain at build). A FAIL surfaces as neither pattern
+    // → step timeout.
+    steps.push(SmokeStep::WaitEither {
+        pattern_a: "SMOKE:ext2-coherence:PASS",
+        pattern_b: "SMOKE:ext2-coherence:SKIP",
+        timeout_secs: 30,
+        label: "guest/ext2-coherence: cross-process ext2 read-coherence verified or skipped",
+        extra_steps_a: &[],
+        extra_steps_b: &[],
     });
     steps.push(SmokeStep::Wait {
         pattern: "SMOKE:net:PASS",

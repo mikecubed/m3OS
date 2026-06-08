@@ -31,15 +31,17 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::alloc::Layout;
 use kernel_core::fs::ext2::{
-    Ext2BlockGroupDescriptor, Ext2DirEntry, Ext2Inode, Ext2Superblock, inode_block_group,
-    inode_index_in_group,
+    EXT2_DIND_BLOCK, EXT2_FT_DIR, EXT2_FT_REG_FILE, EXT2_FT_SYMLINK, EXT2_IND_BLOCK,
+    EXT2_NDIR_BLOCKS, EXT2_ROOT_INO, Ext2BlockGroupDescriptor, Ext2DirEntry, Ext2Inode,
+    Ext2Superblock, S_IFDIR, S_IFLNK, S_IFREG, inode_block_group, inode_index_in_group,
 };
 use kernel_core::fs::mbr;
 use kernel_core::fs::vfs_protocol::{
-    VFS_ACCESS_PATH, VFS_CLOSE, VFS_LIST_DIR, VFS_MAX_READ, VFS_MOUNT_EXT2_ROOT, VFS_MOUNT_POLICY,
-    VFS_MOUNT_VFAT_DATA, VFS_NODE_DIR, VFS_NODE_FILE, VFS_NODE_SYMLINK, VFS_OPEN, VFS_READ,
-    VFS_STAT_PATH, VFS_STAT_REPLY_SIZE, VFS_UMOUNT_EXT2_ROOT, VFS_UMOUNT_POLICY,
-    VFS_UMOUNT_VFAT_DATA,
+    VFS_ACCESS_PATH, VFS_CLOSE, VFS_CREATE, VFS_CREATE_KIND_SHIFT, VFS_LINK, VFS_LIST_DIR,
+    VFS_MAX_READ, VFS_MOUNT_EXT2_ROOT, VFS_MOUNT_POLICY, VFS_MOUNT_VFAT_DATA, VFS_NODE_DIR,
+    VFS_NODE_FILE, VFS_NODE_SYMLINK, VFS_OPEN, VFS_PREAD, VFS_READ, VFS_RENAME, VFS_STAT_PATH,
+    VFS_STAT_REPLY_SIZE, VFS_TRUNCATE, VFS_UMOUNT_EXT2_ROOT, VFS_UMOUNT_POLICY,
+    VFS_UMOUNT_VFAT_DATA, VFS_UNLINK, VFS_WRITE,
 };
 use syscall_lib::STDOUT_FILENO;
 use syscall_lib::heap::BrkAllocator;
@@ -64,9 +66,13 @@ syscall_lib::entry_point!(program_main);
 const NEG_ENOENT: u64 = (-2i64) as u64;
 const NEG_EIO: u64 = (-5i64) as u64;
 const NEG_EBADF: u64 = (-9i64) as u64;
+const NEG_EEXIST: u64 = (-17i64) as u64;
 const NEG_ENOTDIR: u64 = (-20i64) as u64;
+const NEG_EISDIR: u64 = (-21i64) as u64;
 const NEG_EINVAL: u64 = (-22i64) as u64;
 const NEG_ENFILE: u64 = (-23i64) as u64;
+const NEG_ENOSPC: u64 = (-28i64) as u64;
+const NEG_ENOTEMPTY: u64 = (-39i64) as u64;
 
 // ---------------------------------------------------------------------------
 // Ext2 volume state (server-local)
@@ -95,6 +101,71 @@ impl Ext2State {
         let sector_count = self.sectors_per_block as usize;
         self.read_sectors(lba, sector_count, &mut buf)?;
         Ok(buf)
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 93 — write side. Ports the kernel engine (`kernel/src/fs/ext2.rs`)
+    // faithfully, swapping the block backend from `crate::blk` to the
+    // `block_read`/`block_write` syscalls. `Ext2State` is uncached, so there is
+    // no cache to invalidate (unlike the kernel engine's `write_block`).
+    // -----------------------------------------------------------------------
+
+    /// Write raw sectors to disk via the sys_block_write syscall.
+    fn write_sectors(&self, start_lba: u64, count: usize, buf: &[u8]) -> Result<(), ()> {
+        let ret = syscall_lib::block_write(start_lba, count, buf);
+        if ret < 0 { Err(()) } else { Ok(()) }
+    }
+
+    /// Write one ext2 block (LBA math mirrors `read_block`).
+    fn write_block(&self, block_num: u32, data: &[u8]) -> Result<(), ()> {
+        let lba = self.base_lba + (block_num as u64) * (self.sectors_per_block as u64);
+        self.write_sectors(lba, self.sectors_per_block as usize, data)
+    }
+
+    /// Write an inode back to disk (mirrors kernel `write_inode`).
+    fn write_inode(&self, inode_num: u32, inode: &Ext2Inode) -> Result<(), ()> {
+        let group = inode_block_group(inode_num, self.superblock.inodes_per_group);
+        let index = inode_index_in_group(inode_num, self.superblock.inodes_per_group);
+        let bgd = self.bgd_table.get(group as usize).ok_or(())?;
+
+        let inode_size = self.superblock.inode_size as u32;
+        let byte_offset = (index as u64) * (inode_size as u64);
+        let block_offset = byte_offset / (self.block_size as u64);
+        let offset_in_block = (byte_offset % (self.block_size as u64)) as usize;
+
+        let block_num = bgd.inode_table + block_offset as u32;
+        let mut block_data = self.read_block(block_num)?;
+        inode.write_into(&mut block_data[offset_in_block..]);
+        self.write_block(block_num, &block_data)
+    }
+
+    /// Flush the in-memory superblock + BGD counters to disk using a
+    /// **read-modify-write** splice: re-read the on-disk superblock and BGD
+    /// table, overlay only the counter fields this engine tracks via
+    /// `write_into`, then write back. This prevents a stale cached metadata
+    /// image from clobbering newer on-disk state — the latent hazard the
+    /// kernel engine's clone-and-overwrite `flush_metadata` carries.
+    fn flush_metadata(&self) -> Result<(), ()> {
+        // Superblock at byte offset 1024 = base_lba + 2 sectors.
+        let sb_lba = self.base_lba + 2;
+        let mut sb_buf = vec![0u8; 1024];
+        self.read_sectors(sb_lba, 2, &mut sb_buf)?;
+        self.superblock.write_into(&mut sb_buf);
+        self.write_sectors(sb_lba, 2, &sb_buf)?;
+
+        // BGD table starts at the block after the superblock.
+        let bgd_block = if self.block_size == 1024 { 2 } else { 1 };
+        let bgd_lba = self.base_lba + (bgd_block as u64) * (self.sectors_per_block as u64);
+        let bgd_bytes = self.bgd_table.len() * 32;
+        let bgd_sectors = bgd_bytes.div_ceil(512);
+        let mut bgd_buf = vec![0u8; bgd_sectors * 512];
+        // Read-modify-write: start from the on-disk image, then overlay our
+        // tracked counter fields (write_into only touches the mutable subset).
+        self.read_sectors(bgd_lba, bgd_sectors, &mut bgd_buf)?;
+        for (i, bgd) in self.bgd_table.iter().enumerate() {
+            bgd.write_into(&mut bgd_buf[i * 32..(i + 1) * 32]);
+        }
+        self.write_sectors(bgd_lba, bgd_sectors, &bgd_buf)
     }
 
     /// Read an inode by number.
@@ -311,6 +382,837 @@ impl Ext2State {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 93 — write orchestration (ported faithfully from kernel/src/fs/ext2.rs)
+// ---------------------------------------------------------------------------
+
+impl Ext2State {
+    /// Resolve an absolute path to an inode number (mirrors the kernel engine's
+    /// `Ext2Volume::resolve_path`; `resolve_path` above returns `u64` errnos and
+    /// is kept for the read handlers).
+    fn lookup_inode(&self, path: &str) -> Result<u32, u64> {
+        self.resolve_path(path)
+    }
+
+    /// Look up a name in a directory inode, returning the child inode number.
+    fn lookup_in_directory(&self, dir_inode: &Ext2Inode, name: &str) -> Result<u32, u64> {
+        let mut file_block = 0u32;
+        let blocks_count = dir_inode.size.div_ceil(self.block_size);
+        while file_block < blocks_count {
+            let block_num = self
+                .resolve_block(dir_inode, file_block)
+                .map_err(|_| NEG_EIO)?;
+            if block_num == 0 {
+                file_block += 1;
+                continue;
+            }
+            let block_data = self.read_block(block_num).map_err(|_| NEG_EIO)?;
+            let entries = Ext2DirEntry::parse_block(&block_data).map_err(|_| NEG_EIO)?;
+            for entry in &entries {
+                if entry.inode != 0 && entry.name == name {
+                    return Ok(entry.inode);
+                }
+            }
+            file_block += 1;
+        }
+        Err(NEG_ENOENT)
+    }
+
+    /// Allocate a free block, preferring `preferred_group`.
+    fn allocate_block(&mut self, preferred_group: u32) -> Result<u32, u64> {
+        let bg_count = self.bgd_table.len();
+        for offset in 0..bg_count {
+            let group = ((preferred_group as usize) + offset) % bg_count;
+            if self.bgd_table[group].free_blocks_count == 0 {
+                continue;
+            }
+            let bitmap_block = self.bgd_table[group].block_bitmap;
+            let mut bitmap = self.read_block(bitmap_block).map_err(|_| NEG_EIO)?;
+
+            let blocks_in_group = if group == bg_count - 1 {
+                self.superblock.blocks_count
+                    - self.superblock.first_data_block
+                    - (group as u32) * self.superblock.blocks_per_group
+            } else {
+                self.superblock.blocks_per_group
+            };
+
+            for bit in 0..blocks_in_group {
+                let byte_idx = (bit / 8) as usize;
+                let bit_idx = bit % 8;
+                if bitmap[byte_idx] & (1 << bit_idx) == 0 {
+                    bitmap[byte_idx] |= 1 << bit_idx;
+                    self.write_block(bitmap_block, &bitmap)
+                        .map_err(|_| NEG_EIO)?;
+
+                    self.bgd_table[group].free_blocks_count -= 1;
+                    self.superblock.free_blocks_count -= 1;
+
+                    let abs_block = (group as u32) * self.superblock.blocks_per_group
+                        + bit
+                        + self.superblock.first_data_block;
+
+                    self.flush_metadata().map_err(|_| NEG_EIO)?;
+                    return Ok(abs_block);
+                }
+            }
+        }
+        Err(NEG_ENOSPC)
+    }
+
+    /// Free a block.
+    fn free_block(&mut self, block_num: u32) -> Result<(), u64> {
+        if block_num < self.superblock.first_data_block {
+            return Err(NEG_EIO);
+        }
+        let relative = block_num - self.superblock.first_data_block;
+        let group = (relative / self.superblock.blocks_per_group) as usize;
+        if group >= self.bgd_table.len() {
+            return Err(NEG_EIO);
+        }
+        let bit = relative % self.superblock.blocks_per_group;
+
+        let bitmap_block = self.bgd_table[group].block_bitmap;
+        let mut bitmap = self.read_block(bitmap_block).map_err(|_| NEG_EIO)?;
+        let byte_idx = (bit / 8) as usize;
+        let bit_idx = bit % 8;
+        if bitmap[byte_idx] & (1 << bit_idx) == 0 {
+            return Err(NEG_EIO); // double-free guard
+        }
+        bitmap[byte_idx] &= !(1 << bit_idx);
+        self.write_block(bitmap_block, &bitmap)
+            .map_err(|_| NEG_EIO)?;
+
+        self.bgd_table[group].free_blocks_count += 1;
+        self.superblock.free_blocks_count += 1;
+        self.flush_metadata().map_err(|_| NEG_EIO)
+    }
+
+    /// Allocate a free inode, preferring `preferred_group`.
+    fn allocate_inode(&mut self, preferred_group: u32) -> Result<u32, u64> {
+        let bg_count = self.bgd_table.len();
+        for offset in 0..bg_count {
+            let group = ((preferred_group as usize) + offset) % bg_count;
+            if self.bgd_table[group].free_inodes_count == 0 {
+                continue;
+            }
+            let bitmap_block = self.bgd_table[group].inode_bitmap;
+            let mut bitmap = self.read_block(bitmap_block).map_err(|_| NEG_EIO)?;
+            let inodes_in_group = self.superblock.inodes_per_group;
+
+            for bit in 0..inodes_in_group {
+                let abs_inode = (group as u32) * self.superblock.inodes_per_group + bit + 1;
+                if abs_inode > self.superblock.inodes_count {
+                    continue;
+                }
+                let byte_idx = (bit / 8) as usize;
+                let bit_idx = bit % 8;
+                if bitmap[byte_idx] & (1 << bit_idx) == 0 {
+                    bitmap[byte_idx] |= 1 << bit_idx;
+                    self.write_block(bitmap_block, &bitmap)
+                        .map_err(|_| NEG_EIO)?;
+
+                    self.bgd_table[group].free_inodes_count -= 1;
+                    self.superblock.free_inodes_count -= 1;
+                    self.flush_metadata().map_err(|_| NEG_EIO)?;
+                    return Ok(abs_inode);
+                }
+            }
+        }
+        Err(NEG_ENOSPC)
+    }
+
+    /// Free an inode.
+    fn free_inode(&mut self, inode_num: u32) -> Result<(), u64> {
+        if inode_num == 0 || inode_num > self.superblock.inodes_count {
+            return Err(NEG_EIO);
+        }
+        let group = inode_block_group(inode_num, self.superblock.inodes_per_group) as usize;
+        if group >= self.bgd_table.len() {
+            return Err(NEG_EIO);
+        }
+        let index = inode_index_in_group(inode_num, self.superblock.inodes_per_group);
+        let bitmap_block = self.bgd_table[group].inode_bitmap;
+        let mut bitmap = self.read_block(bitmap_block).map_err(|_| NEG_EIO)?;
+        let byte_idx = (index / 8) as usize;
+        let bit_idx = index % 8;
+        if bitmap[byte_idx] & (1 << bit_idx) == 0 {
+            return Err(NEG_EIO);
+        }
+        bitmap[byte_idx] &= !(1 << bit_idx);
+        self.write_block(bitmap_block, &bitmap)
+            .map_err(|_| NEG_EIO)?;
+
+        self.bgd_table[group].free_inodes_count += 1;
+        self.superblock.free_inodes_count += 1;
+        self.flush_metadata().map_err(|_| NEG_EIO)
+    }
+
+    /// Allocate a data block for a logical position in an inode, wiring up
+    /// direct / single-indirect / double-indirect pointers as needed.
+    fn allocate_data_block(
+        &mut self,
+        inode: &mut Ext2Inode,
+        logical_block: u32,
+    ) -> Result<u32, u64> {
+        let ptrs_per_block = self.block_size / 4;
+        let preferred_group = 0;
+
+        if logical_block < EXT2_NDIR_BLOCKS as u32 {
+            if inode.block[logical_block as usize] == 0 {
+                let new_block = self.allocate_block(preferred_group)?;
+                let zero = vec![0u8; self.block_size as usize];
+                self.write_block(new_block, &zero).map_err(|_| NEG_EIO)?;
+                inode.block[logical_block as usize] = new_block;
+                inode.blocks += self.block_size / 512;
+            }
+            return Ok(inode.block[logical_block as usize]);
+        }
+
+        let adjusted = logical_block - EXT2_NDIR_BLOCKS as u32;
+
+        if adjusted < ptrs_per_block {
+            if inode.block[EXT2_IND_BLOCK] == 0 {
+                let ind = self.allocate_block(preferred_group)?;
+                let zero = vec![0u8; self.block_size as usize];
+                self.write_block(ind, &zero).map_err(|_| NEG_EIO)?;
+                inode.block[EXT2_IND_BLOCK] = ind;
+                inode.blocks += self.block_size / 512;
+            }
+            let ind_block = inode.block[EXT2_IND_BLOCK];
+            let mut ind_data = self.read_block(ind_block).map_err(|_| NEG_EIO)?;
+            let off = (adjusted as usize) * 4;
+            let existing = u32::from_le_bytes([
+                ind_data[off],
+                ind_data[off + 1],
+                ind_data[off + 2],
+                ind_data[off + 3],
+            ]);
+            if existing == 0 {
+                let new_block = self.allocate_block(preferred_group)?;
+                let zero = vec![0u8; self.block_size as usize];
+                self.write_block(new_block, &zero).map_err(|_| NEG_EIO)?;
+                ind_data[off..off + 4].copy_from_slice(&new_block.to_le_bytes());
+                self.write_block(ind_block, &ind_data)
+                    .map_err(|_| NEG_EIO)?;
+                inode.blocks += self.block_size / 512;
+                return Ok(new_block);
+            }
+            return Ok(existing);
+        }
+
+        let adjusted = adjusted - ptrs_per_block;
+
+        if adjusted < ptrs_per_block * ptrs_per_block {
+            if inode.block[EXT2_DIND_BLOCK] == 0 {
+                let dind = self.allocate_block(preferred_group)?;
+                let zero = vec![0u8; self.block_size as usize];
+                self.write_block(dind, &zero).map_err(|_| NEG_EIO)?;
+                inode.block[EXT2_DIND_BLOCK] = dind;
+                inode.blocks += self.block_size / 512;
+            }
+            let dind_block = inode.block[EXT2_DIND_BLOCK];
+            let mut dind_data = self.read_block(dind_block).map_err(|_| NEG_EIO)?;
+
+            let ind_index = adjusted / ptrs_per_block;
+            let off = (ind_index as usize) * 4;
+            let mut ind_block = u32::from_le_bytes([
+                dind_data[off],
+                dind_data[off + 1],
+                dind_data[off + 2],
+                dind_data[off + 3],
+            ]);
+            if ind_block == 0 {
+                ind_block = self.allocate_block(preferred_group)?;
+                let zero = vec![0u8; self.block_size as usize];
+                self.write_block(ind_block, &zero).map_err(|_| NEG_EIO)?;
+                dind_data[off..off + 4].copy_from_slice(&ind_block.to_le_bytes());
+                self.write_block(dind_block, &dind_data)
+                    .map_err(|_| NEG_EIO)?;
+                inode.blocks += self.block_size / 512;
+            }
+
+            let mut ind_data = self.read_block(ind_block).map_err(|_| NEG_EIO)?;
+            let block_index = adjusted % ptrs_per_block;
+            let off = (block_index as usize) * 4;
+            let existing = u32::from_le_bytes([
+                ind_data[off],
+                ind_data[off + 1],
+                ind_data[off + 2],
+                ind_data[off + 3],
+            ]);
+            if existing == 0 {
+                let new_block = self.allocate_block(preferred_group)?;
+                let zero = vec![0u8; self.block_size as usize];
+                self.write_block(new_block, &zero).map_err(|_| NEG_EIO)?;
+                ind_data[off..off + 4].copy_from_slice(&new_block.to_le_bytes());
+                self.write_block(ind_block, &ind_data)
+                    .map_err(|_| NEG_EIO)?;
+                inode.blocks += self.block_size / 512;
+                return Ok(new_block);
+            }
+            return Ok(existing);
+        }
+
+        Err(NEG_ENOSPC) // triple-indirect not supported
+    }
+
+    /// Write data to a file inode at `offset`. Allocates blocks as needed,
+    /// updates inode size/blocks, and writes the inode back. Returns bytes
+    /// written.
+    fn write_file_data(
+        &mut self,
+        inode_num: u32,
+        inode: &mut Ext2Inode,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<usize, u64> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let bs = self.block_size as u64;
+        let end_offset = offset + data.len() as u64;
+        let mut written = 0;
+        let mut pos = offset;
+
+        while written < data.len() {
+            let logical_block = (pos / bs) as u32;
+            let offset_in_block = (pos % bs) as usize;
+            let remaining_in_block = (bs as usize) - offset_in_block;
+            let copy_len = remaining_in_block.min(data.len() - written);
+
+            let phys_block = self.allocate_data_block(inode, logical_block)?;
+
+            let mut block_data = if offset_in_block > 0 || copy_len < bs as usize {
+                self.read_block(phys_block).map_err(|_| NEG_EIO)?
+            } else {
+                vec![0u8; bs as usize]
+            };
+            block_data[offset_in_block..offset_in_block + copy_len]
+                .copy_from_slice(&data[written..written + copy_len]);
+            self.write_block(phys_block, &block_data)
+                .map_err(|_| NEG_EIO)?;
+
+            written += copy_len;
+            pos += copy_len as u64;
+        }
+
+        if end_offset > inode.size as u64 {
+            inode.size = end_offset as u32;
+        }
+        self.write_inode(inode_num, inode).map_err(|_| NEG_EIO)?;
+        Ok(written)
+    }
+
+    /// Add a directory entry to a directory inode.
+    fn add_directory_entry(
+        &mut self,
+        dir_inode_num: u32,
+        dir_inode: &mut Ext2Inode,
+        name: &str,
+        child_inode: u32,
+        file_type: u8,
+    ) -> Result<(), u64> {
+        let name_bytes = name.as_bytes();
+        let needed_size = (8 + name_bytes.len()).div_ceil(4) * 4;
+        let dir_size = dir_inode.size as u64;
+        let bs = self.block_size as u64;
+        let num_blocks = dir_size.div_ceil(bs) as u32;
+
+        for logical_block in 0..num_blocks {
+            let phys_block = self
+                .resolve_block(dir_inode, logical_block)
+                .map_err(|_| NEG_EIO)?;
+            if phys_block == 0 {
+                continue;
+            }
+            let mut block_data = self.read_block(phys_block).map_err(|_| NEG_EIO)?;
+            let mut off = 0;
+            while off + 8 <= block_data.len() {
+                let rec_len =
+                    u16::from_le_bytes([block_data[off + 4], block_data[off + 5]]) as usize;
+                if rec_len == 0 {
+                    break;
+                }
+                let entry_name_len = block_data[off + 6] as usize;
+                let actual_size = (8 + entry_name_len).div_ceil(4) * 4;
+                if rec_len < actual_size {
+                    off += rec_len;
+                    continue;
+                }
+                let slack = rec_len - actual_size;
+                if slack >= needed_size {
+                    block_data[off + 4..off + 6]
+                        .copy_from_slice(&(actual_size as u16).to_le_bytes());
+                    let new_off = off + actual_size;
+                    let new_rec_len = slack as u16;
+                    block_data[new_off..new_off + 4].copy_from_slice(&child_inode.to_le_bytes());
+                    block_data[new_off + 4..new_off + 6]
+                        .copy_from_slice(&new_rec_len.to_le_bytes());
+                    block_data[new_off + 6] = name_bytes.len() as u8;
+                    block_data[new_off + 7] = file_type;
+                    block_data[new_off + 8..new_off + 8 + name_bytes.len()]
+                        .copy_from_slice(name_bytes);
+                    self.write_block(phys_block, &block_data)
+                        .map_err(|_| NEG_EIO)?;
+                    return Ok(());
+                }
+                off += rec_len;
+            }
+        }
+
+        // No space — allocate a new directory block.
+        let new_block = self.allocate_data_block(dir_inode, num_blocks)?;
+        let mut block_data = vec![0u8; bs as usize];
+        block_data[0..4].copy_from_slice(&child_inode.to_le_bytes());
+        block_data[4..6].copy_from_slice(&(bs as u16).to_le_bytes());
+        block_data[6] = name_bytes.len() as u8;
+        block_data[7] = file_type;
+        block_data[8..8 + name_bytes.len()].copy_from_slice(name_bytes);
+        self.write_block(new_block, &block_data)
+            .map_err(|_| NEG_EIO)?;
+        dir_inode.size += bs as u32;
+        self.write_inode(dir_inode_num, dir_inode)
+            .map_err(|_| NEG_EIO)?;
+        Ok(())
+    }
+
+    /// Remove a directory entry by name (merging the slot into its predecessor).
+    fn remove_directory_entry(&mut self, dir_inode: &Ext2Inode, name: &str) -> Result<(), u64> {
+        let name_bytes = name.as_bytes();
+        let bs = self.block_size as u64;
+        let num_blocks = (dir_inode.size as u64).div_ceil(bs) as u32;
+
+        for logical_block in 0..num_blocks {
+            let phys_block = self
+                .resolve_block(dir_inode, logical_block)
+                .map_err(|_| NEG_EIO)?;
+            if phys_block == 0 {
+                continue;
+            }
+            let mut block_data = self.read_block(phys_block).map_err(|_| NEG_EIO)?;
+            let mut off = 0;
+            let mut prev_off: Option<usize> = None;
+            while off + 8 <= block_data.len() {
+                let rec_len =
+                    u16::from_le_bytes([block_data[off + 4], block_data[off + 5]]) as usize;
+                if rec_len == 0 {
+                    break;
+                }
+                let entry_name_len = block_data[off + 6] as usize;
+                let entry_inode = u32::from_le_bytes([
+                    block_data[off],
+                    block_data[off + 1],
+                    block_data[off + 2],
+                    block_data[off + 3],
+                ]);
+                if entry_inode != 0
+                    && entry_name_len == name_bytes.len()
+                    && &block_data[off + 8..off + 8 + entry_name_len] == name_bytes
+                {
+                    if let Some(prev) = prev_off {
+                        let prev_rec_len =
+                            u16::from_le_bytes([block_data[prev + 4], block_data[prev + 5]])
+                                as usize;
+                        let merged = prev_rec_len + rec_len;
+                        block_data[prev + 4..prev + 6]
+                            .copy_from_slice(&(merged as u16).to_le_bytes());
+                    } else {
+                        block_data[off..off + 4].copy_from_slice(&0u32.to_le_bytes());
+                    }
+                    self.write_block(phys_block, &block_data)
+                        .map_err(|_| NEG_EIO)?;
+                    return Ok(());
+                }
+                prev_off = Some(off);
+                off += rec_len;
+            }
+        }
+        Err(NEG_ENOENT)
+    }
+
+    /// Truncate a file: free all data blocks and reset size/blocks to zero.
+    fn truncate_file(&mut self, inode_num: u32, inode: &mut Ext2Inode) -> Result<(), u64> {
+        let ptrs_per_block = self.block_size / 4;
+
+        for i in 0..EXT2_NDIR_BLOCKS {
+            if inode.block[i] != 0 {
+                self.free_block(inode.block[i])?;
+                inode.block[i] = 0;
+            }
+        }
+
+        if inode.block[EXT2_IND_BLOCK] != 0 {
+            let ind_data = self
+                .read_block(inode.block[EXT2_IND_BLOCK])
+                .map_err(|_| NEG_EIO)?;
+            for i in 0..ptrs_per_block {
+                let off = (i as usize) * 4;
+                let blk = u32::from_le_bytes([
+                    ind_data[off],
+                    ind_data[off + 1],
+                    ind_data[off + 2],
+                    ind_data[off + 3],
+                ]);
+                if blk != 0 {
+                    self.free_block(blk)?;
+                }
+            }
+            self.free_block(inode.block[EXT2_IND_BLOCK])?;
+            inode.block[EXT2_IND_BLOCK] = 0;
+        }
+
+        if inode.block[EXT2_DIND_BLOCK] != 0 {
+            let dind_data = self
+                .read_block(inode.block[EXT2_DIND_BLOCK])
+                .map_err(|_| NEG_EIO)?;
+            for i in 0..ptrs_per_block {
+                let off = (i as usize) * 4;
+                let ind_blk = u32::from_le_bytes([
+                    dind_data[off],
+                    dind_data[off + 1],
+                    dind_data[off + 2],
+                    dind_data[off + 3],
+                ]);
+                if ind_blk != 0 {
+                    let ind_data = self.read_block(ind_blk).map_err(|_| NEG_EIO)?;
+                    for j in 0..ptrs_per_block {
+                        let off2 = (j as usize) * 4;
+                        let blk = u32::from_le_bytes([
+                            ind_data[off2],
+                            ind_data[off2 + 1],
+                            ind_data[off2 + 2],
+                            ind_data[off2 + 3],
+                        ]);
+                        if blk != 0 {
+                            self.free_block(blk)?;
+                        }
+                    }
+                    self.free_block(ind_blk)?;
+                }
+            }
+            self.free_block(inode.block[EXT2_DIND_BLOCK])?;
+            inode.block[EXT2_DIND_BLOCK] = 0;
+        }
+
+        inode.size = 0;
+        inode.blocks = 0;
+        self.write_inode(inode_num, inode).map_err(|_| NEG_EIO)
+    }
+
+    /// Create a new regular file in `parent_inode_num`.
+    fn create_file(
+        &mut self,
+        parent_inode_num: u32,
+        name: &str,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+    ) -> Result<u32, u64> {
+        let parent_inode = self.read_inode(parent_inode_num).map_err(|_| NEG_EIO)?;
+        if !parent_inode.is_dir() {
+            return Err(NEG_ENOTDIR);
+        }
+        if self.lookup_in_directory(&parent_inode, name).is_ok() {
+            return Err(NEG_EEXIST);
+        }
+
+        let parent_group = inode_block_group(parent_inode_num, self.superblock.inodes_per_group);
+        let new_ino = self.allocate_inode(parent_group)?;
+
+        let mut inode = Ext2Inode::new_empty();
+        inode.mode = S_IFREG | (mode & 0o7777);
+        inode.uid = uid as u16;
+        inode.gid = gid as u16;
+        inode.links_count = 1;
+        self.write_inode(new_ino, &inode).map_err(|_| NEG_EIO)?;
+
+        let mut parent_inode = self.read_inode(parent_inode_num).map_err(|_| NEG_EIO)?;
+        self.add_directory_entry(
+            parent_inode_num,
+            &mut parent_inode,
+            name,
+            new_ino,
+            EXT2_FT_REG_FILE,
+        )?;
+        Ok(new_ino)
+    }
+
+    /// Create a new directory in `parent_inode_num`.
+    fn create_directory(
+        &mut self,
+        parent_inode_num: u32,
+        name: &str,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+    ) -> Result<u32, u64> {
+        let parent_inode = self.read_inode(parent_inode_num).map_err(|_| NEG_EIO)?;
+        if !parent_inode.is_dir() {
+            return Err(NEG_ENOTDIR);
+        }
+        if self.lookup_in_directory(&parent_inode, name).is_ok() {
+            return Err(NEG_EEXIST);
+        }
+
+        let parent_group = inode_block_group(parent_inode_num, self.superblock.inodes_per_group);
+        let new_ino = self.allocate_inode(parent_group)?;
+
+        let mut inode = Ext2Inode::new_empty();
+        inode.mode = S_IFDIR | (mode & 0o7777);
+        inode.uid = uid as u16;
+        inode.gid = gid as u16;
+        inode.links_count = 2;
+
+        let data_block = self.allocate_block(parent_group)?;
+        let bs = self.block_size as usize;
+        let mut block_data = vec![0u8; bs];
+
+        block_data[0..4].copy_from_slice(&new_ino.to_le_bytes());
+        block_data[4..6].copy_from_slice(&12u16.to_le_bytes());
+        block_data[6] = 1;
+        block_data[7] = EXT2_FT_DIR;
+        block_data[8] = b'.';
+
+        let dotdot_rec_len = (bs - 12) as u16;
+        block_data[12..16].copy_from_slice(&parent_inode_num.to_le_bytes());
+        block_data[16..18].copy_from_slice(&dotdot_rec_len.to_le_bytes());
+        block_data[18] = 2;
+        block_data[19] = EXT2_FT_DIR;
+        block_data[20] = b'.';
+        block_data[21] = b'.';
+        self.write_block(data_block, &block_data)
+            .map_err(|_| NEG_EIO)?;
+
+        inode.block[0] = data_block;
+        inode.size = bs as u32;
+        inode.blocks = self.block_size / 512;
+        self.write_inode(new_ino, &inode).map_err(|_| NEG_EIO)?;
+
+        let mut parent_inode = self.read_inode(parent_inode_num).map_err(|_| NEG_EIO)?;
+        self.add_directory_entry(
+            parent_inode_num,
+            &mut parent_inode,
+            name,
+            new_ino,
+            EXT2_FT_DIR,
+        )?;
+
+        parent_inode.links_count += 1;
+        self.write_inode(parent_inode_num, &parent_inode)
+            .map_err(|_| NEG_EIO)?;
+
+        let group = inode_block_group(new_ino, self.superblock.inodes_per_group) as usize;
+        self.bgd_table[group].used_dirs_count += 1;
+        self.flush_metadata().map_err(|_| NEG_EIO)?;
+        Ok(new_ino)
+    }
+
+    /// Maximum symlink target length stored inline in the inode block array.
+    const SYMLINK_INLINE_MAX: usize = 60;
+
+    /// Create a symbolic link in `parent_inode_num` pointing at `target`.
+    fn create_symlink(
+        &mut self,
+        parent_inode_num: u32,
+        name: &str,
+        target: &str,
+        uid: u32,
+        gid: u32,
+    ) -> Result<u32, u64> {
+        let parent_inode = self.read_inode(parent_inode_num).map_err(|_| NEG_EIO)?;
+        if !parent_inode.is_dir() {
+            return Err(NEG_ENOTDIR);
+        }
+        if self.lookup_in_directory(&parent_inode, name).is_ok() {
+            return Err(NEG_EEXIST);
+        }
+
+        let parent_group = inode_block_group(parent_inode_num, self.superblock.inodes_per_group);
+        let new_ino = self.allocate_inode(parent_group)?;
+
+        let target_bytes = target.as_bytes();
+        if target_bytes.len() > self.block_size as usize {
+            let _ = self.free_inode(new_ino);
+            return Err(NEG_ENOSPC);
+        }
+        let mut inode = Ext2Inode::new_empty();
+        inode.mode = S_IFLNK | 0o777;
+        inode.uid = uid as u16;
+        inode.gid = gid as u16;
+        inode.links_count = 1;
+        inode.size = target_bytes.len() as u32;
+
+        if target_bytes.len() <= Self::SYMLINK_INLINE_MAX {
+            let mut raw = [0u8; 60];
+            raw[..target_bytes.len()].copy_from_slice(target_bytes);
+            for (i, slot) in inode.block.iter_mut().enumerate() {
+                let off = i * 4;
+                *slot = u32::from_le_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
+            }
+        } else {
+            let data_block = self.allocate_block(parent_group)?;
+            let bs = self.block_size as usize;
+            let mut block_data = vec![0u8; bs];
+            block_data[..target_bytes.len()].copy_from_slice(target_bytes);
+            if self.write_block(data_block, &block_data).is_err() {
+                let _ = self.free_block(data_block);
+                let _ = self.free_inode(new_ino);
+                return Err(NEG_EIO);
+            }
+            inode.block[0] = data_block;
+            inode.blocks = self.block_size / 512;
+        }
+
+        if self.write_inode(new_ino, &inode).is_err() {
+            if inode.block[0] != 0 && inode.blocks != 0 {
+                let _ = self.free_block(inode.block[0]);
+            }
+            let _ = self.free_inode(new_ino);
+            return Err(NEG_EIO);
+        }
+
+        let mut parent_inode = self.read_inode(parent_inode_num).map_err(|_| NEG_EIO)?;
+        if let Err(err) = self.add_directory_entry(
+            parent_inode_num,
+            &mut parent_inode,
+            name,
+            new_ino,
+            EXT2_FT_SYMLINK,
+        ) {
+            if inode.block[0] != 0 && inode.blocks != 0 {
+                let _ = self.free_block(inode.block[0]);
+            }
+            let _ = self.free_inode(new_ino);
+            return Err(err);
+        }
+        Ok(new_ino)
+    }
+
+    /// Create a hard link `name` in `parent_inode_num` to the existing
+    /// non-directory inode `target_ino`.
+    fn create_hard_link(
+        &mut self,
+        parent_inode_num: u32,
+        name: &str,
+        target_ino: u32,
+    ) -> Result<(), u64> {
+        let parent_inode = self.read_inode(parent_inode_num).map_err(|_| NEG_EIO)?;
+        if !parent_inode.is_dir() {
+            return Err(NEG_ENOTDIR);
+        }
+        if self.lookup_in_directory(&parent_inode, name).is_ok() {
+            return Err(NEG_EEXIST);
+        }
+
+        let mut target_inode = self.read_inode(target_ino).map_err(|_| NEG_EIO)?;
+        if target_inode.is_dir() {
+            return Err(NEG_EISDIR);
+        }
+
+        target_inode.links_count = target_inode.links_count.saturating_add(1);
+        self.write_inode(target_ino, &target_inode)
+            .map_err(|_| NEG_EIO)?;
+
+        let file_type = if target_inode.is_symlink() {
+            EXT2_FT_SYMLINK
+        } else {
+            EXT2_FT_REG_FILE
+        };
+        let mut parent_inode = self.read_inode(parent_inode_num).map_err(|_| NEG_EIO)?;
+        if let Err(err) = self.add_directory_entry(
+            parent_inode_num,
+            &mut parent_inode,
+            name,
+            target_ino,
+            file_type,
+        ) {
+            target_inode.links_count = target_inode.links_count.saturating_sub(1);
+            let _ = self.write_inode(target_ino, &target_inode);
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// Resolve a path to (parent_inode_num, final_component). Rejects empty
+    /// final components and paths without a leading '/'.
+    fn resolve_parent_and_name<'p>(&self, path: &'p str) -> Result<(u32, &'p str), u64> {
+        let trimmed = path.strip_prefix('/').ok_or(NEG_EINVAL)?;
+        let parts: Vec<&str> = trimmed.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() {
+            return Err(NEG_EINVAL);
+        }
+        let name = parts[parts.len() - 1];
+        let parent_ino = if parts.len() == 1 {
+            EXT2_ROOT_INO
+        } else {
+            // Re-slice the original path to obtain the parent prefix.
+            let name_start = path.len() - name.len();
+            let parent_path = &path[..name_start];
+            self.lookup_inode(parent_path)?
+        };
+        Ok((parent_ino, name))
+    }
+
+    /// Unlink a non-directory entry (decrement links; reclaim when zero and no
+    /// open references). The open-reference recount lives in the kernel, which
+    /// only routes the unlink here once it has confirmed no fd aliases remain
+    /// (mirrors the kernel `delete_file` minus the `ext2_inode_open_count`
+    /// check that has no userspace analogue).
+    fn delete_file(&mut self, parent_inode_num: u32, name: &str) -> Result<(), u64> {
+        let parent_inode = self.read_inode(parent_inode_num).map_err(|_| NEG_EIO)?;
+        let child_ino = self.lookup_in_directory(&parent_inode, name)?;
+        let mut child_inode = self.read_inode(child_ino).map_err(|_| NEG_EIO)?;
+        if child_inode.is_dir() {
+            return Err(NEG_EISDIR);
+        }
+
+        child_inode.links_count = child_inode.links_count.saturating_sub(1);
+        self.remove_directory_entry(&parent_inode, name)?;
+
+        if child_inode.links_count != 0 {
+            self.write_inode(child_ino, &child_inode)
+                .map_err(|_| NEG_EIO)?;
+            return Ok(());
+        }
+        self.truncate_file(child_ino, &mut child_inode)?;
+        self.free_inode(child_ino)?;
+        Ok(())
+    }
+
+    /// Remove an empty directory.
+    fn delete_directory(&mut self, parent_inode_num: u32, name: &str) -> Result<(), u64> {
+        let parent_inode = self.read_inode(parent_inode_num).map_err(|_| NEG_EIO)?;
+        let child_ino = self.lookup_in_directory(&parent_inode, name)?;
+        let mut child_inode = self.read_inode(child_ino).map_err(|_| NEG_EIO)?;
+        if !child_inode.is_dir() {
+            return Err(NEG_ENOTDIR);
+        }
+
+        let entries = self.read_dir_entries(&child_inode)?;
+        for (_, entry_name, _) in &entries {
+            if entry_name != "." && entry_name != ".." {
+                return Err(NEG_ENOTEMPTY);
+            }
+        }
+
+        self.truncate_file(child_ino, &mut child_inode)?;
+        self.free_inode(child_ino)?;
+        self.remove_directory_entry(&parent_inode, name)?;
+
+        let mut parent_inode = self.read_inode(parent_inode_num).map_err(|_| NEG_EIO)?;
+        parent_inode.links_count = parent_inode.links_count.saturating_sub(1);
+        self.write_inode(parent_inode_num, &parent_inode)
+            .map_err(|_| NEG_EIO)?;
+
+        let group = inode_block_group(child_ino, self.superblock.inodes_per_group) as usize;
+        if self.bgd_table[group].used_dirs_count > 0 {
+            self.bgd_table[group].used_dirs_count -= 1;
+        }
+        self.flush_metadata().map_err(|_| NEG_EIO)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Open handle table
 // ---------------------------------------------------------------------------
 
@@ -520,14 +1422,15 @@ fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::serial_print("vfs_server: registered, entering server loop\n");
 
     // 5. Server loop.
-    server_loop(&ext2, ep_handle);
+    let mut ext2 = ext2;
+    server_loop(&mut ext2, ep_handle);
 }
 
 // ---------------------------------------------------------------------------
 // Server loop
 // ---------------------------------------------------------------------------
 
-fn server_loop(ext2: &Ext2State, ep_handle: u32) -> ! {
+fn server_loop(ext2: &mut Ext2State, ep_handle: u32) -> ! {
     let mut handles = HandleTable::new();
     let mut msg = syscall_lib::IpcMessage::new(0);
     let mut recv_buf = [0u8; MAX_BULK_BUF];
@@ -590,6 +1493,13 @@ fn request_name(label: u64) -> &'static str {
         VFS_ACCESS_PATH => "ACCESS_PATH",
         VFS_MOUNT_POLICY => "MOUNT_POLICY",
         VFS_UMOUNT_POLICY => "UMOUNT_POLICY",
+        VFS_PREAD => "PREAD",
+        VFS_WRITE => "WRITE",
+        VFS_TRUNCATE => "TRUNCATE",
+        VFS_CREATE => "CREATE",
+        VFS_UNLINK => "UNLINK",
+        VFS_RENAME => "RENAME",
+        VFS_LINK => "LINK",
         _ => "UNKNOWN",
     }
 }
@@ -615,7 +1525,7 @@ fn log_request_done(
 
 /// Dispatch a single request.  Returns `(reply_label, reply_data0)`.
 fn handle_request(
-    ext2: &Ext2State,
+    ext2: &mut Ext2State,
     handles: &mut HandleTable,
     msg: &syscall_lib::IpcMessage,
     recv_buf: &[u8],
@@ -629,6 +1539,14 @@ fn handle_request(
         VFS_ACCESS_PATH => handle_access_path(ext2, msg, recv_buf),
         VFS_MOUNT_POLICY => handle_mount_policy(msg, recv_buf),
         VFS_UMOUNT_POLICY => handle_umount_policy(msg, recv_buf),
+        // Phase 93 — ext2 write authority.
+        VFS_PREAD => handle_pread(ext2, msg, recv_buf),
+        VFS_WRITE => handle_write(ext2, msg, recv_buf),
+        VFS_TRUNCATE => handle_truncate(ext2, msg, recv_buf),
+        VFS_CREATE => handle_create(ext2, msg, recv_buf),
+        VFS_UNLINK => handle_unlink(ext2, msg, recv_buf),
+        VFS_RENAME => handle_rename(ext2, msg, recv_buf),
+        VFS_LINK => handle_link(ext2, msg, recv_buf),
         _ => (NEG_EINVAL, 0),
     }
 }
@@ -957,6 +1875,366 @@ fn handle_umount_policy(msg: &syscall_lib::IpcMessage, recv_buf: &[u8]) -> (u64,
         Ok(action) => (0, action),
         Err(errno) => (errno, 0),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 93 — write handlers
+// ---------------------------------------------------------------------------
+
+/// Decode a UTF-8 string from `recv_buf[start..start + len]`.
+fn decode_str(recv_buf: &[u8], start: usize, len: usize) -> Result<&str, u64> {
+    let end = start.checked_add(len).ok_or(NEG_EINVAL)?;
+    if len == 0 || end > recv_buf.len() {
+        return Err(NEG_EINVAL);
+    }
+    core::str::from_utf8(&recv_buf[start..end]).map_err(|_| NEG_EINVAL)
+}
+
+/// VFS_PREAD — read file data by path at an offset (coherent read-back for the
+/// kernel's writable `Ext2Disk` fds).
+fn handle_pread(ext2: &Ext2State, msg: &syscall_lib::IpcMessage, recv_buf: &[u8]) -> (u64, u64) {
+    let path_len = msg.data[0] as usize;
+    let offset = msg.data[1] as usize;
+    let max_bytes = (msg.data[2] as usize).min(MAX_BULK_BUF);
+
+    let path = match decode_str(recv_buf, 0, path_len) {
+        Ok(p) => p,
+        Err(e) => return (e, 0),
+    };
+    let inode_num = match ext2.resolve_path(path) {
+        Ok(n) => n,
+        Err(e) => return (e, 0),
+    };
+    let inode = match ext2.read_inode(inode_num) {
+        Ok(i) => i,
+        Err(_) => return (NEG_EIO, 0),
+    };
+    let data = match ext2.read_file_data(&inode, offset, max_bytes) {
+        Ok(d) => d,
+        Err(_) => return (NEG_EIO, 0),
+    };
+    let bytes_read = data.len();
+    if bytes_read > 0 && syscall_lib::ipc_store_reply_bulk(&data) != 0 {
+        return (NEG_EIO, 0);
+    }
+    (0, bytes_read as u64)
+}
+
+/// VFS_WRITE — write file data by path at an offset.
+fn handle_write(
+    ext2: &mut Ext2State,
+    msg: &syscall_lib::IpcMessage,
+    recv_buf: &[u8],
+) -> (u64, u64) {
+    let path_len = msg.data[0] as usize;
+    let offset = msg.data[1];
+    let data_len = msg.data[2] as usize;
+
+    let path = match decode_str(recv_buf, 0, path_len) {
+        Ok(p) => p,
+        Err(e) => return (e, 0),
+    };
+    let data_end = match path_len.checked_add(data_len) {
+        Some(e) if e <= recv_buf.len() => e,
+        _ => return (NEG_EINVAL, 0),
+    };
+    // Copy the path out so the borrow on recv_buf is released before we touch
+    // the (also-borrowed) data slice through `&mut ext2`.
+    let path_owned = String::from(path);
+    let data = recv_buf[path_len..data_end].to_vec();
+
+    let inode_num = match ext2.resolve_path(&path_owned) {
+        Ok(n) => n,
+        Err(e) => return (e, 0),
+    };
+    let mut inode = match ext2.read_inode(inode_num) {
+        Ok(i) => i,
+        Err(_) => return (NEG_EIO, 0),
+    };
+    // Refresh write timestamps (mirrors the kernel write path).
+    let now = now_unix_secs();
+    inode.mtime = now;
+    inode.ctime = now;
+    match ext2.write_file_data(inode_num, &mut inode, offset, &data) {
+        Ok(n) => {
+            let new_size = inode.size as u64;
+            (0, (n as u64 & 0xFFFF_FFFF) | (new_size << 32))
+        }
+        Err(e) => (e, 0),
+    }
+}
+
+/// VFS_TRUNCATE — truncate a file by path to a length (only 0 is supported for
+/// shrink; non-zero lengths grow via subsequent writes / sparse fill).
+fn handle_truncate(
+    ext2: &mut Ext2State,
+    msg: &syscall_lib::IpcMessage,
+    recv_buf: &[u8],
+) -> (u64, u64) {
+    let path_len = msg.data[0] as usize;
+    let new_len = msg.data[1];
+    let path = match decode_str(recv_buf, 0, path_len) {
+        Ok(p) => String::from(p),
+        Err(e) => return (e, 0),
+    };
+    let inode_num = match ext2.resolve_path(&path) {
+        Ok(n) => n,
+        Err(e) => return (e, 0),
+    };
+    let mut inode = match ext2.read_inode(inode_num) {
+        Ok(i) => i,
+        Err(_) => return (NEG_EIO, 0),
+    };
+    if inode.is_dir() {
+        return (NEG_EISDIR, 0);
+    }
+    // Free all data blocks, then re-establish the requested logical size. The
+    // kernel only ever issues truncate-to-0 (O_TRUNC) and ftruncate; for a
+    // non-zero shrink we conservatively free everything then set the size so a
+    // later read returns sparse zeros (matches the kernel engine, which also
+    // only frees-all on truncate).
+    if let Err(e) = ext2.truncate_file(inode_num, &mut inode) {
+        return (e, 0);
+    }
+    if new_len != 0 {
+        inode.size = new_len.min(u32::MAX as u64) as u32;
+        if ext2.write_inode(inode_num, &inode).is_err() {
+            return (NEG_EIO, 0);
+        }
+    }
+    (0, 0)
+}
+
+/// VFS_CREATE — create a regular file, directory, or symlink.
+fn handle_create(
+    ext2: &mut Ext2State,
+    msg: &syscall_lib::IpcMessage,
+    recv_buf: &[u8],
+) -> (u64, u64) {
+    let parent_len = (msg.data[0] & 0xFFFF_FFFF) as usize;
+    let name_len = (msg.data[0] >> 32) as usize;
+    let mode = (msg.data[1] & 0xFFFF) as u16;
+    let kind = (msg.data[1] >> VFS_CREATE_KIND_SHIFT) & 0x3;
+    let target_len = (msg.data[1] >> 32) as usize;
+    let uid = msg.data[2] as u32;
+    let gid = msg.data[3] as u32;
+
+    let parent = match decode_str(recv_buf, 0, parent_len) {
+        Ok(p) => String::from(p),
+        Err(e) => return (e, 0),
+    };
+    let name = match decode_str(recv_buf, parent_len, name_len) {
+        Ok(n) => String::from(n),
+        Err(e) => return (e, 0),
+    };
+
+    let parent_ino = match ext2.resolve_path(&parent) {
+        Ok(n) => n,
+        Err(e) => return (e, 0),
+    };
+
+    let result = match kind {
+        k if k == VFS_NODE_FILE => ext2.create_file(parent_ino, &name, mode, uid, gid),
+        k if k == VFS_NODE_DIR => ext2.create_directory(parent_ino, &name, mode, uid, gid),
+        k if k == VFS_NODE_SYMLINK => {
+            let target = match decode_str(recv_buf, parent_len + name_len, target_len) {
+                Ok(t) => String::from(t),
+                Err(e) => return (e, 0),
+            };
+            ext2.create_symlink(parent_ino, &name, &target, uid, gid)
+        }
+        _ => return (NEG_EINVAL, 0),
+    };
+    match result {
+        Ok(new_ino) => (0, new_ino as u64),
+        Err(e) => (e, 0),
+    }
+}
+
+/// VFS_UNLINK — remove a file (`is_dir == 0`) or empty directory (`is_dir == 1`).
+fn handle_unlink(
+    ext2: &mut Ext2State,
+    msg: &syscall_lib::IpcMessage,
+    recv_buf: &[u8],
+) -> (u64, u64) {
+    let parent_len = msg.data[0] as usize;
+    let name_len = msg.data[1] as usize;
+    let want_dir = msg.data[2] != 0;
+
+    let parent = match decode_str(recv_buf, 0, parent_len) {
+        Ok(p) => String::from(p),
+        Err(e) => return (e, 0),
+    };
+    let name = match decode_str(recv_buf, parent_len, name_len) {
+        Ok(n) => String::from(n),
+        Err(e) => return (e, 0),
+    };
+    let parent_ino = match ext2.resolve_path(&parent) {
+        Ok(n) => n,
+        Err(e) => return (e, 0),
+    };
+    let result = if want_dir {
+        ext2.delete_directory(parent_ino, &name)
+    } else {
+        ext2.delete_file(parent_ino, &name)
+    };
+    match result {
+        Ok(()) => (0, 0),
+        Err(e) => (e, 0),
+    }
+}
+
+/// VFS_RENAME — move an entry from `old` to `new` (non-directory or directory).
+fn handle_rename(
+    ext2: &mut Ext2State,
+    msg: &syscall_lib::IpcMessage,
+    recv_buf: &[u8],
+) -> (u64, u64) {
+    let old_len = msg.data[0] as usize;
+    let new_len = msg.data[1] as usize;
+
+    let old_path = match decode_str(recv_buf, 0, old_len) {
+        Ok(p) => String::from(p),
+        Err(e) => return (e, 0),
+    };
+    let new_path = match decode_str(recv_buf, old_len, new_len) {
+        Ok(p) => String::from(p),
+        Err(e) => return (e, 0),
+    };
+
+    let (old_parent, old_name) = match ext2.resolve_parent_and_name(&old_path) {
+        Ok(v) => v,
+        Err(e) => return (e, 0),
+    };
+    let old_parent_inode = match ext2.read_inode(old_parent) {
+        Ok(i) => i,
+        Err(_) => return (NEG_EIO, 0),
+    };
+    let src_ino = match ext2.lookup_in_directory(&old_parent_inode, old_name) {
+        Ok(n) => n,
+        Err(e) => return (e, 0),
+    };
+    let src_inode = match ext2.read_inode(src_ino) {
+        Ok(i) => i,
+        Err(_) => return (NEG_EIO, 0),
+    };
+    let src_is_dir = src_inode.is_dir();
+    let src_is_symlink = src_inode.is_symlink();
+    let old_name_owned = String::from(old_name);
+
+    let (new_parent, new_name) = match ext2.resolve_parent_and_name(&new_path) {
+        Ok(v) => v,
+        Err(e) => return (e, 0),
+    };
+    let new_name_owned = String::from(new_name);
+
+    // If the destination already exists, remove it first (POSIX rename
+    // semantics: overwrite an existing plain destination).
+    if let Ok(new_parent_inode) = ext2.read_inode(new_parent)
+        && let Ok(existing) = ext2.lookup_in_directory(&new_parent_inode, &new_name_owned)
+    {
+        let existing_inode = match ext2.read_inode(existing) {
+            Ok(i) => i,
+            Err(_) => return (NEG_EIO, 0),
+        };
+        let remove = if existing_inode.is_dir() {
+            ext2.delete_directory(new_parent, &new_name_owned)
+        } else {
+            ext2.delete_file(new_parent, &new_name_owned)
+        };
+        if let Err(e) = remove {
+            return (e, 0);
+        }
+    }
+
+    // Link the source inode under the new name, then unlink the old entry.
+    let file_type = if src_is_dir {
+        EXT2_FT_DIR
+    } else if src_is_symlink {
+        EXT2_FT_SYMLINK
+    } else {
+        EXT2_FT_REG_FILE
+    };
+    let mut new_parent_inode = match ext2.read_inode(new_parent) {
+        Ok(i) => i,
+        Err(_) => return (NEG_EIO, 0),
+    };
+    if let Err(e) = ext2.add_directory_entry(
+        new_parent,
+        &mut new_parent_inode,
+        &new_name_owned,
+        src_ino,
+        file_type,
+    ) {
+        return (e, 0);
+    }
+
+    // For directory moves across parents, fix the source's ".." and the link
+    // counts. Same-parent renames need no link-count change.
+    if src_is_dir
+        && new_parent != old_parent
+        && let Ok(mut np) = ext2.read_inode(new_parent)
+    {
+        np.links_count = np.links_count.saturating_add(1);
+        let _ = ext2.write_inode(new_parent, &np);
+    }
+
+    // Remove the old directory entry (do NOT reclaim the inode — it now lives
+    // under the new name).
+    let old_parent_inode = match ext2.read_inode(old_parent) {
+        Ok(i) => i,
+        Err(_) => return (NEG_EIO, 0),
+    };
+    if let Err(e) = ext2.remove_directory_entry(&old_parent_inode, &old_name_owned) {
+        return (e, 0);
+    }
+    if src_is_dir
+        && new_parent != old_parent
+        && let Ok(mut op) = ext2.read_inode(old_parent)
+    {
+        op.links_count = op.links_count.saturating_sub(1);
+        let _ = ext2.write_inode(old_parent, &op);
+    }
+    (0, 0)
+}
+
+/// VFS_LINK — hard-link a new name to an existing target inode.
+fn handle_link(ext2: &mut Ext2State, msg: &syscall_lib::IpcMessage, recv_buf: &[u8]) -> (u64, u64) {
+    let target_len = msg.data[0] as usize;
+    let parent_len = msg.data[1] as usize;
+    let name_len = msg.data[2] as usize;
+
+    let target_path = match decode_str(recv_buf, 0, target_len) {
+        Ok(p) => String::from(p),
+        Err(e) => return (e, 0),
+    };
+    let parent_path = match decode_str(recv_buf, target_len, parent_len) {
+        Ok(p) => String::from(p),
+        Err(e) => return (e, 0),
+    };
+    let name = match decode_str(recv_buf, target_len + parent_len, name_len) {
+        Ok(n) => String::from(n),
+        Err(e) => return (e, 0),
+    };
+
+    let target_ino = match ext2.resolve_path(&target_path) {
+        Ok(n) => n,
+        Err(e) => return (e, 0),
+    };
+    let parent_ino = match ext2.resolve_path(&parent_path) {
+        Ok(n) => n,
+        Err(e) => return (e, 0),
+    };
+    match ext2.create_hard_link(parent_ino, &name, target_ino) {
+        Ok(()) => (0, 0),
+        Err(e) => (e, 0),
+    }
+}
+
+/// Current wall-clock seconds (best-effort; 0 if unavailable).
+fn now_unix_secs() -> u32 {
+    let (sec, _usec) = syscall_lib::gettimeofday();
+    if sec < 0 { 0 } else { sec as u32 }
 }
 
 #[cfg(not(test))]
