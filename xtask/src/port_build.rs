@@ -325,12 +325,25 @@ fn build_recipe_id(name: &str) -> &'static str {
         // the local-only post-install prune (see build_git). Bump the trailing
         // recipe-version marker whenever the knob set or prune list changes so
         // the cached .m3pkg self-invalidates.
+        // Phase 86c Track B — git REBUILT WITH curl (NO_CURL removed; NO_OPENSSL
+        // kept since the TLS backend is mbedTLS-via-curl, not OpenSSL). The curl
+        // link is wired through CURL_CFLAGS/CURL_LDFLAGS (the static libcurl +
+        // mbedtls + zlib link line) + CURL_CONFIG=true (neutralizes the host
+        // curl-config --vernum probe). The 85b absence-assertions are INVERTED to
+        // presence: git-remote-https/git-remote-http/git-http-fetch must exist and
+        // the remote-http helper must reference curl_easy_perform + a mbedTLS TLS
+        // symbol; SSL_CTX_new must stay ABSENT (NO_OPENSSL). The server-side
+        // pack-helper prune is unchanged. Bump recipe-v on any knob/assertion
+        // change. (curl/mbedtls dep keys fold in via compute_port_key.)
         "git" => {
-            "make:NO_CURL=1 NO_OPENSSL=1 NO_GETTEXT=1 NO_TCLTK=1 NO_PERL=1 NO_PYTHON=1 \
+            "make:NO_OPENSSL=1 NO_GETTEXT=1 NO_TCLTK=1 NO_PERL=1 NO_PYTHON=1 \
              NO_ICONV=1 NO_EXPAT=1 NO_REGEX=NeedsStartEnd NEEDS_LIBICONV= \
              SKIP_DASHED_BUILT_INS=YesPlease ZLIB_PATH=<zlib_stage>/usr/local \
+             CURL_CONFIG=true CURL_CFLAGS=<curl_stage include> \
+             CURL_LDFLAGS=<static libcurl+mbedtls+zlib link line> \
              SHELL_PATH=/bin/sh prefix=/usr;cflags:-O2;\
-             prune=scalar,git-shell,upload-pack,receive-pack,upload-archive,imap-send,http-backend,daemon,sh-i18n--envsubst;recipe-v=3"
+             curl=ENABLED(git-remote-https+git-http-fetch present,curl_easy_perform+mbedtls_ssl symbol required,SSL_CTX_new absent);\
+             prune=scalar,git-shell,upload-pack,receive-pack,upload-archive,imap-send,http-backend,daemon,sh-i18n--envsubst;recipe-v=4"
         }
         // Phase 85c — CPython's two-stage musl cross build. The identity is the
         // cross-configure flag set + the ac_cv_* cross cache answers + the
@@ -422,9 +435,26 @@ fn build_recipe_id(name: &str) -> &'static str {
              config.py(from-default unset:SSL_SRV_C,SSL_PROTO_DTLS,SSL_DTLS_ANTI_REPLAY,\
              SSL_DTLS_HELLO_VERIFY,SSL_DTLS_SRTP,SSL_DTLS_CONNECTION_ID,NET_C \
              set:SSL_PROTO_TLS1_3,NO_PLATFORM_ENTROPY,ENTROPY_HARDWARE_ALT);\
-             entropy:mbedtls_hardware_poll->getrandom(318),ar-into-libmbedcrypto;\
+             entropy:mbedtls_hardware_poll->getrandom(318)+failclosed-on-0,ar-into-libmbedcrypto;\
              verify:config-on/off+entropy-self-test+no-/dev/urandom;\
-             install:headers(mbedtls,psa)+libmbed{crypto,x509,tls}.a->/usr/local;recipe-v=1"
+             install:headers(mbedtls,psa,idempotent)+libmbed{crypto,x509,tls}.a->/usr/local;recipe-v=2"
+        }
+        // Phase 86c Track B — curl static HTTP/HTTPS client (mbedTLS backend).
+        // Identity: the autotools configure flag set (static, --with-mbedtls +
+        // --with-ca-bundle to the Phase 86a path, HTTP/HTTPS only, sync resolver,
+        // every optional dep dropped) + the staged zlib/mbedtls link + the
+        // build-time verification (static, mbedTLS-backend, HTTPS, embedded
+        // CAINFO). Bump recipe-v whenever the flags change so the cached .m3pkg
+        // self-invalidates. (curl version + tarball SHA-256 fold in via the
+        // Portfile digest; the mbedtls/zlib dep keys fold in via compute_port_key.)
+        "curl" => {
+            "configure(--host=x86_64-linux-musl --prefix=/usr/local --disable-shared \
+             --enable-static --with-mbedtls=<staged> --with-zlib=<staged> \
+             --with-ca-bundle=/etc/ssl/certs/ca-certificates.crt --disable-threaded-resolver \
+             --disable-{ldap,ldaps,ftp,file,dict,gopher,imap,pop3,smtp,telnet,tftp,rtsp,smb,mqtt} \
+             --without-{libpsl,libidn2,brotli,zstd,nghttp2,nghttp3,ngtcp2,libssh2,libssh,librtmp,gssapi} \
+             --disable-manual);cflags:-O2;configure-ldflags:-static;make-ldflags:-all-static(libtool fully-static CLI);\
+             verify:static+mbedTLS-backend+HTTPS+embedded-CAINFO;recipe-v=2"
         }
         _ => "",
     }
@@ -629,10 +659,17 @@ pub fn port_deps(name: &str) -> &'static [&'static str] {
         // solver follows — libevent (a small static lib) before the heavyweight
         // ncurses terminfo DB.
         "tmux" => &["libevent", "ncurses"],
-        // Phase 85b — git's one mandatory dependency is zlib (object/pack
-        // compression). zlib is a leaf with no build deps of its own, so
-        // `compute_port_key`'s non-recursive dep-key computation is correct.
-        "git" => &["zlib"],
+        // Phase 86c Track B — git now also depends on curl (the HTTPS smart-HTTP
+        // transport), which transitively pulls mbedtls + ca-certificates. zlib
+        // (object/pack compression) stays a direct dep too. The in-OS solver reads
+        // these from the `.meta` sidecars; `compute_port_key` folds curl's full
+        // (transitive) key in via recursion. The resolved install order is
+        // zlib -> mbedtls -> curl -> ca-certificates -> git.
+        "git" => &["zlib", "curl"],
+        // Phase 86c Track B — curl links the staged static mbedtls (TLS backend)
+        // + zlib (transfer decompression). Both are direct build deps; their keys
+        // fold into curl's content key via compute_port_key's recursion.
+        "curl" => &["zlib", "mbedtls"],
         // Phase 85c — CPython's `zlib`/`gzip`/`zipfile` extensions link the
         // staged (-fPIC) libz.a. zlib is a leaf, so the non-recursive dep-key
         // computation is correct here too. NOTE: ncurses (for `_curses`/
@@ -695,12 +732,15 @@ fn compute_port_key(name: &str, port_dir: &Path) -> Result<String, String> {
         .map(|dep| {
             let dep_dir = find_port_dir(dep)
                 .ok_or_else(|| format!("dep port {dep} not found in ports/ tree"))?;
-            // Every current dep is a leaf (ncurses/libevent have no build deps
-            // of their own), so an empty dep-key slice computes the correct key.
-            // A *transitive* dep would instead need its own resolved dep-keys
-            // folded in here (i.e. recurse via `compute_port_key`); that is not
-            // handled yet because no such chain exists in the ports tree.
-            package_key(&dep_dir, &tc, &[])
+            // Recurse so a TRANSITIVE dep's own resolved dep-keys are folded in:
+            // Phase 86c introduces `curl -> {zlib, mbedtls}` and `git -> curl`, so
+            // git's key must reflect curl's full (transitive) identity, not just a
+            // bare curl Portfile digest. For the pre-86c leaf deps (zlib, ncurses,
+            // libevent) this recursion is byte-identical to the old empty-slice
+            // computation — `compute_port_key(leaf) == package_key(leaf_dir, tc,
+            // &[])` — so warmed leaf-dep caches stay valid. (The recursion is
+            // acyclic: the ports tree's DEPS form a DAG.)
+            compute_port_key(dep, &dep_dir)
         })
         .collect::<Result<_, String>>()?;
     package_key(port_dir, &tc, &dep_keys)
@@ -940,6 +980,8 @@ fn port_build(name: &str) -> Result<(), String> {
     let ncurses_stage = stage_root.join("ncurses");
     let libevent_stage = stage_root.join("libevent");
     let zlib_stage = stage_root.join("zlib");
+    let mbedtls_stage = stage_root.join("mbedtls");
+    let curl_stage = stage_root.join("curl");
 
     match name {
         "ncurses" => build_ncurses(&extracted, &stage, &toolchain)?,
@@ -954,11 +996,19 @@ fn port_build(name: &str) -> Result<(), String> {
             &ncurses_stage,
             &libevent_stage,
         )?,
-        "git" => build_git(&extracted, &stage, &toolchain, &zlib_stage)?,
+        "git" => build_git(
+            &extracted,
+            &stage,
+            &toolchain,
+            &zlib_stage,
+            &curl_stage,
+            &mbedtls_stage,
+        )?,
         "python" => build_python(&extracted, &stage, &toolchain, &zlib_stage, &ncurses_stage)?,
         "llvm" => build_llvm(&extracted, &stage, &toolchain)?,
         "dropbear" => build_dropbear(&extracted, &stage, &toolchain)?,
         "mbedtls" => build_mbedtls(&extracted, &stage, &toolchain)?,
+        "curl" => build_curl(&extracted, &stage, &toolchain, &zlib_stage, &mbedtls_stage)?,
         _ => return Err(format!("no host build recipe for port {name}")),
     }
 
@@ -1505,15 +1555,24 @@ fn build_tmux(
     Ok(())
 }
 
-/// Phase 85b — cross-build a local-only musl `git` (Stage 1: `NO_CURL`/
-/// `NO_OPENSSL`), statically linked against the staged zlib, and DESTDIR-install
-/// it at `prefix=/usr` into `stage`.
+/// Phase 86c Track B — cross-build a static musl `git` REBUILT **with** curl
+/// (HTTPS smart-HTTP transport), statically linked against the staged zlib +
+/// curl + mbedtls, and DESTDIR-install it at `prefix=/usr` into `stage`.
+///
+/// Phase 85b built git local-only (`NO_CURL`); 86c removes `NO_CURL` and links
+/// the static `libcurl --with-mbedtls` so `git clone https://…` works. The TLS
+/// backend is mbedTLS-via-curl, **not** OpenSSL, so `NO_OPENSSL=1` stays — git
+/// pulls in no OpenSSL. git does not implement TLS itself: only the
+/// `git-remote-http` helper links libcurl, so the curl flags are wired through
+/// git's `CURL_CFLAGS`/`CURL_LDFLAGS` knobs (the explicit static
+/// libcurl+mbedtls+zlib link line), with `CURL_CONFIG=true` to neutralize the
+/// Makefile's host `curl-config --vernum` probe.
 ///
 /// Unlike the ncurses-class ports, git has **no autotools `./configure`** — its
 /// build is a plain Makefile driven entirely by `CC=<musl-gcc>`, so there is no
-/// `--host` flag to pass; the cross is implied by the compiler. zlib (git's one
-/// mandatory dependency) is consumed from `zlib_stage/usr/local` via git's
-/// `ZLIB_PATH` Makefile knob plus explicit `-I`/`-L` flags.
+/// `--host` flag to pass; the cross is implied by the compiler. zlib (git's
+/// object/pack-compression dependency) is consumed from `zlib_stage/usr/local`
+/// via git's `ZLIB_PATH` Makefile knob plus explicit `-I`/`-L` flags.
 ///
 /// `SKIP_DASHED_BUILT_INS=YesPlease` is essential here: git would otherwise
 /// install ~100 dashed `libexec/git-core/git-<builtin>` **hardlinks** to the
@@ -1522,18 +1581,37 @@ fn build_tmux(
 /// balloon the artifact by hundreds of MB. With this knob the dashed builtins
 /// are not installed at all; every smoke subcommand (`init`/`add`/`commit`/
 /// `log`/`diff`/`status`/`branch`/`merge`/`checkout`) is dispatched in-process
-/// by the single `git` binary, so nothing is lost.
+/// by the single `git` binary, so nothing is lost. The curl-backed remote
+/// helpers (`git-remote-http`/`git-remote-https`/`git-http-fetch`) are NOT
+/// dashed builtins, so they install under `libexec/git-core/` regardless.
 fn build_git(
     src: &Path,
     stage: &Path,
     (cc, ar, _ranlib): &(&'static str, String, String),
     zlib_stage: &Path,
+    curl_stage: &Path,
+    mbedtls_stage: &Path,
 ) -> Result<(), String> {
     let zlib_prefix = zlib_stage.join("usr/local");
     if !zlib_prefix.join("lib/libz.a").exists() {
         return Err(format!(
             "git build: staged zlib not found at {} (build the zlib port first)",
             zlib_prefix.join("lib/libz.a").display()
+        ));
+    }
+    // Phase 86c — the staged static libcurl + mbedTLS the HTTPS transport links.
+    let curl_prefix = curl_stage.join("usr/local");
+    if !curl_prefix.join("lib/libcurl.a").exists() {
+        return Err(format!(
+            "git build: staged curl not found at {} (build the curl port first)",
+            curl_prefix.join("lib/libcurl.a").display()
+        ));
+    }
+    let mbedtls_prefix = mbedtls_stage.join("usr/local");
+    if !mbedtls_prefix.join("lib/libmbedtls.a").exists() {
+        return Err(format!(
+            "git build: staged mbedtls not found at {} (build the mbedtls port first)",
+            mbedtls_prefix.join("lib/libmbedtls.a").display()
         ));
     }
     let stage_prefix = stage.join("usr");
@@ -1546,15 +1624,24 @@ fn build_git(
     } else {
         format!("-static -L{}/lib {extra_ld}", zlib_prefix.display())
     };
+    // git's curl knobs: headers from the staged curl prefix; the link line is the
+    // full static libcurl+mbedtls+zlib set in dependency order (-lcurl before its
+    // mbedtls/z deps). CURL_CONFIG=true neutralizes the host curl-config probe.
+    let curl_cflags = format!("-I{}/include", curl_prefix.display());
+    let curl_ldflags = curl_static_link_line(&curl_prefix, &mbedtls_prefix, &zlib_prefix);
 
-    // The NO_* knob set that carves git's minimal, dependency-light, offline
-    // build (see ports/util/git/Portfile for the per-knob rationale). Passed as
+    // The knob set that carves git's minimal, dependency-light build (see
+    // ports/util/git/Portfile for the per-knob rationale). Passed as
     // `make VAR=val` arguments — the git Makefile convention. `prefix=/usr`
     // additionally special-cases git's system config to `/etc/gitconfig`.
+    //
+    // Phase 86c: NO_CURL is REMOVED (curl is now linked for HTTPS); NO_OPENSSL
+    // stays (the TLS backend is mbedTLS-via-curl). NO_EXPAT stays too — it only
+    // drops `git-http-push` (dumb-HTTP WebDAV push, which needs expat); smart-HTTP
+    // clone/fetch/push over `git-remote-https` needs no expat.
     let common: Vec<String> = vec![
         format!("CC={cc}"),
         format!("AR={ar}"),
-        "NO_CURL=1".to_string(),
         "NO_OPENSSL=1".to_string(),
         "NO_GETTEXT=1".to_string(),
         "NO_TCLTK=1".to_string(),
@@ -1566,6 +1653,11 @@ fn build_git(
         "NEEDS_LIBICONV=".to_string(),
         "SKIP_DASHED_BUILT_INS=YesPlease".to_string(),
         format!("ZLIB_PATH={}", zlib_prefix.display()),
+        // curl (HTTPS smart-HTTP transport): explicit cflags + the full static
+        // link line; CURL_CONFIG=true neutralizes the host curl-config probe.
+        "CURL_CONFIG=true".to_string(),
+        format!("CURL_CFLAGS={curl_cflags}"),
+        format!("CURL_LDFLAGS={curl_ldflags}"),
         "SHELL_PATH=/bin/sh".to_string(),
         "prefix=/usr".to_string(),
         format!("CFLAGS={cflags}"),
@@ -1643,6 +1735,12 @@ fn build_git(
         ("libexec", "git-http-backend"), // dumb/smart-HTTP server CGI
         ("libexec", "git-daemon"),  // git:// protocol server daemon
         ("libexec", "git-sh-i18n--envsubst"), // i18n helper, moot under NO_GETTEXT
+        // Phase 86c — curl enables the remote-curl ALIASES git-remote-ftp/ftps as
+        // copies of git-remote-http; m3OS does no ftp:// clones (curl is built
+        // --disable-ftp), and the no-dedup packer would store each as a full copy
+        // of the multi-MB helper. Prune them; keep git-remote-http/https.
+        ("libexec", "git-remote-ftp"),
+        ("libexec", "git-remote-ftps"),
     ];
     for (where_, name_) in prune {
         let p = match where_ {
@@ -1652,40 +1750,73 @@ fn build_git(
         let _ = fs::remove_file(&p);
     }
 
-    // NO_CURL ⇒ the curl-backed remote helpers are never built. Their presence
-    // would mean HTTPS rode in unverified, so assert they are absent.
-    for forbidden in [
-        "git-remote-https",
-        "git-remote-http",
-        "git-http-fetch",
-        "git-http-push",
-    ] {
-        if git_core.join(forbidden).exists() || stage_prefix.join("bin").join(forbidden).exists() {
+    // Phase 86c — INVERTED assertions. With curl linked, the smart-HTTP remote
+    // helpers MUST be present (they are the HTTPS transport). git-remote-https is
+    // an alias of git-remote-http; git-http-fetch is the dumb-HTTP object fetcher
+    // (built with curl alone — no expat). git-http-push is NOT required: it needs
+    // expat (NO_EXPAT=1), and smart-HTTP needs no dumb-HTTP push.
+    let remote_http = git_core.join("git-remote-http");
+    for required in ["git-remote-http", "git-remote-https", "git-http-fetch"] {
+        if !git_core.join(required).exists() && !stage_prefix.join("bin").join(required).exists() {
             return Err(format!(
-                "git build: {forbidden} present — NO_CURL did not take effect (HTTPS would ride in unverified)"
+                "git build: {required} MISSING — curl did not take effect (HTTPS transport absent)"
             ));
         }
     }
-    // Belt-and-suspenders: the (still-unstripped) git binary must reference
-    // neither a libcurl nor an OpenSSL API symbol. These exact symbol names only
-    // appear when remote-curl.c / the OpenSSL paths are compiled + linked, so
-    // their absence is a direct, toolchain-independent proof of NO_CURL/NO_OPENSSL.
-    if binary_contains(&git_bin, b"curl_easy_perform")? {
+    if !remote_http.exists() {
+        return Err(format!(
+            "git build: {} missing (the curl helper that carries the TLS link)",
+            remote_http.display()
+        ));
+    }
+    // Positive proof the curl + mbedTLS TLS path actually linked into the helper:
+    // these exact symbol names only land in the (still-unstripped) git-remote-http
+    // when remote-curl.c links libcurl and curl's vtls/mbedtls backend links
+    // mbedTLS. Their presence is a direct, toolchain-independent proof that HTTPS
+    // rode in over the trusted stack (the inverse of the 85b absence check).
+    if !binary_contains(&remote_http, b"curl_easy_perform")? {
         return Err(
-            "git build: binary references libcurl (curl_easy_perform) — NO_CURL ineffective"
+            "git build: git-remote-http does not reference libcurl (curl_easy_perform) — \
+             curl did not link (HTTPS would not work)"
                 .to_string(),
         );
     }
-    if binary_contains(&git_bin, b"SSL_CTX_new")? {
+    if !binary_contains(&remote_http, b"mbedtls_ssl_handshake")? {
         return Err(
-            "git build: binary references OpenSSL (SSL_CTX_new) — NO_OPENSSL ineffective"
+            "git build: git-remote-http does not reference mbedTLS (mbedtls_ssl_handshake) — \
+             the mbedTLS TLS backend did not link (cert validation would not run)"
                 .to_string(),
         );
+    }
+    // NO_OPENSSL still holds: the TLS backend is mbedTLS, so the OpenSSL API
+    // symbol must remain ABSENT from both the main binary and the curl helper.
+    // (Un-pruning the server pack helpers, or accidentally adopting OpenSSL, would
+    // trip this.)
+    for (label, p) in [("git", &git_bin), ("git-remote-http", &remote_http)] {
+        if binary_contains(p, b"SSL_CTX_new")? {
+            return Err(format!(
+                "git build: {label} references OpenSSL (SSL_CTX_new) — NO_OPENSSL ineffective \
+                 (the TLS backend must be mbedTLS-via-curl, not OpenSSL)"
+            ));
+        }
+    }
+    // The server-side pack helpers must STAY pruned — they are the server half of
+    // the protocol m3OS does not run; un-pruning them would ship a server.
+    for server_half in ["git-upload-pack", "git-receive-pack", "git-upload-archive"] {
+        if stage_prefix.join("bin").join(server_half).exists()
+            || git_core.join(server_half).exists()
+        {
+            return Err(format!(
+                "git build: {server_half} present — the server-side pack helper prune regressed \
+                 (86c is a client; un-pruning these would ship a server m3OS does not run)"
+            ));
+        }
     }
 
     println!(
         "git: produced /usr/bin/git ({} bytes, unstripped) + libexec/git-core + templates; \
-         NO_CURL/NO_OPENSSL verified (no curl/OpenSSL linkage)",
+         curl+mbedTLS HTTPS verified (git-remote-https + curl_easy_perform + mbedtls_ssl_handshake \
+         present, SSL_CTX_new absent, server pack helpers pruned)",
         file_size(&git_bin)
     );
     Ok(())
@@ -1878,6 +2009,8 @@ int mbedtls_hardware_poll(void *data, unsigned char *output,
                 continue;
             return -0x003C; /* MBEDTLS_ERR_ENTROPY_SOURCE_FAILED */
         }
+        if (r == 0)
+            return -0x003C; /* fail closed: never spin on a 0-byte return */
         got += (size_t) r;
     }
     *olen = got;
@@ -2122,11 +2255,19 @@ fn build_mbedtls(
     // copy explicitly. The installed mbedtls_config.h IS the trimmed one, so curl
     // and git compile against the exact config the archives were built with.
     for hdr in ["mbedtls", "psa"] {
+        // Remove any prior copy first so `cp -r src dest/` cannot nest a second
+        // level (`include/mbedtls/mbedtls/…`) on a warm, non-wiped stage.
+        let _ = fs::remove_dir_all(prefix.join("include").join(hdr));
         let mut cp = Command::new("cp");
         cp.arg("-r")
             .arg(src.join("include").join(hdr))
             .arg(prefix.join("include"));
         run(&mut cp, &format!("mbedtls cp include/{hdr}"))?;
+    }
+    if prefix.join("include/mbedtls/mbedtls").exists() {
+        return Err(
+            "mbedtls build: header tree double-nested (include/mbedtls/mbedtls)".to_string(),
+        );
     }
     for a in ["libmbedcrypto.a", "libmbedx509.a", "libmbedtls.a"] {
         fs::copy(library.join(a), prefix.join("lib").join(a))
@@ -2142,6 +2283,246 @@ fn build_mbedtls(
         file_size(&prefix.join("lib/libmbedcrypto.a")),
         file_size(&prefix.join("lib/libmbedx509.a")),
         file_size(&prefix.join("lib/libmbedtls.a")),
+    );
+    Ok(())
+}
+
+/// The static link line for libcurl + its mbedTLS/zlib dependencies, in the
+/// dependency-first order a static link requires (a library must precede the
+/// libraries it references): `-lcurl` → `-lmbedtls` → `-lmbedx509` →
+/// `-lmbedcrypto` → `-lz`. Built from the STAGED host prefixes (not the on-target
+/// `/usr/local`), so it is reused both by curl's own verification and by git's
+/// `CURL_LDFLAGS` when it links `git-remote-http`. The mbedTLS entropy shim
+/// (`mbedtls_hardware_poll`) lives inside `libmbedcrypto.a`, so `getrandom` (libc)
+/// is the only further symbol and resolves from musl.
+fn curl_static_link_line(curl_prefix: &Path, mbedtls_prefix: &Path, zlib_prefix: &Path) -> String {
+    format!(
+        "-L{}/lib -L{}/lib -L{}/lib -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lz",
+        curl_prefix.display(),
+        mbedtls_prefix.display(),
+        zlib_prefix.display(),
+    )
+}
+
+/// Phase 86c Track B — cross-compile curl/libcurl as a static HTTP/HTTPS client
+/// with the mbedTLS TLS backend, linking the staged static mbedtls + zlib.
+///
+/// git's smart-HTTP transport does not implement TLS itself: its
+/// `git-remote-http` helper links `libcurl`, and libcurl carries the mbedTLS
+/// backend that validates GitHub's TLS 1.3 cert chain + hostname. So this builds
+/// a static `libcurl.a` (+ the `curl` CLI, used here for build-time verification)
+/// configured `--with-mbedtls --with-ca-bundle=/etc/ssl/certs/ca-certificates.crt`
+/// — the SAME CAINFO path the Phase 86a bundle stages and `/etc/gitconfig`'s
+/// `http.sslCAInfo` names, so git and curl agree on trust. Every protocol but
+/// HTTP/HTTPS is disabled to keep the binary small; the synchronous resolver
+/// (`--disable-threaded-resolver`) avoids a pthread dependency and uses musl's
+/// `getaddrinfo` (Phase 77 DNS). SNI + `SSL_VERIFYHOST=2` (curl's verified default)
+/// stay on — hostname verification is separate from chain validation.
+fn build_curl(
+    src: &Path,
+    stage: &Path,
+    (cc, ar, ranlib): &(&'static str, String, String),
+    zlib_stage: &Path,
+    mbedtls_stage: &Path,
+) -> Result<(), String> {
+    let zlib_prefix = zlib_stage.join("usr/local");
+    if !zlib_prefix.join("lib/libz.a").exists() {
+        return Err(format!(
+            "curl build: staged zlib not found at {} (build the zlib port first)",
+            zlib_prefix.join("lib/libz.a").display()
+        ));
+    }
+    let mbedtls_prefix = mbedtls_stage.join("usr/local");
+    if !mbedtls_prefix.join("lib/libmbedtls.a").exists() {
+        return Err(format!(
+            "curl build: staged mbedtls not found at {} (build the mbedtls port first)",
+            mbedtls_prefix.join("lib/libmbedtls.a").display()
+        ));
+    }
+    // ABI-skew guard (the Track A reviewer's note): the mbedtls headers curl will
+    // compile against MUST be the trimmed config the archives were built with —
+    // i.e. carry the hardware-entropy macro. A mismatched (e.g. system) header
+    // would skew struct sizes and silently corrupt the TLS context.
+    let mbedtls_config = mbedtls_prefix.join("include/mbedtls/mbedtls_config.h");
+    let mbedtls_config_text = fs::read_to_string(&mbedtls_config).map_err(|e| {
+        format!(
+            "curl build: read staged mbedtls config {}: {e}",
+            mbedtls_config.display()
+        )
+    })?;
+    if !mbedtls_config_enabled(&mbedtls_config_text, "MBEDTLS_ENTROPY_HARDWARE_ALT") {
+        return Err(
+            "curl build: staged mbedtls_config.h is not the trimmed m3OS config \
+             (MBEDTLS_ENTROPY_HARDWARE_ALT absent) — ABI skew risk; rebuild the mbedtls port"
+                .to_string(),
+        );
+    }
+
+    let stage_prefix = stage.join("usr/local");
+    fs::create_dir_all(&stage_prefix).map_err(|e| format!("mkdir: {e}"))?;
+
+    let extra_ld = musl_extra_ldflags_joined();
+    let ldflags = if extra_ld.is_empty() {
+        format!(
+            "-static -L{}/lib -L{}/lib",
+            zlib_prefix.display(),
+            mbedtls_prefix.display()
+        )
+    } else {
+        format!(
+            "-static -L{}/lib -L{}/lib {extra_ld}",
+            zlib_prefix.display(),
+            mbedtls_prefix.display()
+        )
+    };
+    let cppflags = format!(
+        "-I{}/include -I{}/include",
+        zlib_prefix.display(),
+        mbedtls_prefix.display()
+    );
+
+    // ── configure: static, mbedTLS backend, HTTP/HTTPS only ───────────────────
+    let mut configure_cmd = Command::new("sh");
+    configure_cmd
+        .current_dir(src)
+        .arg("./configure")
+        .arg("--host=x86_64-linux-musl")
+        .arg("--prefix=/usr/local")
+        .arg("--disable-shared")
+        .arg("--enable-static")
+        .arg(format!("--with-mbedtls={}", mbedtls_prefix.display()))
+        .arg(format!("--with-zlib={}", zlib_prefix.display()))
+        // curl's compiled-in default CAINFO == the Phase 86a bundle path == git's
+        // http.sslCAInfo, so trust does not silently diverge across the two.
+        .arg("--with-ca-bundle=/etc/ssl/certs/ca-certificates.crt")
+        // Synchronous resolver (no pthread dep); musl getaddrinfo + Phase 77 DNS.
+        .arg("--disable-threaded-resolver")
+        // HTTP/HTTPS only — disable every other protocol to keep the binary small.
+        .arg("--disable-ldap")
+        .arg("--disable-ldaps")
+        .arg("--disable-ftp")
+        .arg("--disable-file")
+        .arg("--disable-dict")
+        .arg("--disable-gopher")
+        .arg("--disable-imap")
+        .arg("--disable-pop3")
+        .arg("--disable-smtp")
+        .arg("--disable-telnet")
+        .arg("--disable-tftp")
+        .arg("--disable-rtsp")
+        .arg("--disable-smb")
+        .arg("--disable-mqtt")
+        // Drop optional deps m3OS does not ship (each would be a link failure or a
+        // silent feature m3OS cannot serve).
+        .arg("--without-libpsl")
+        .arg("--without-libidn2")
+        .arg("--without-brotli")
+        .arg("--without-zstd")
+        .arg("--without-nghttp2")
+        .arg("--without-nghttp3")
+        .arg("--without-ngtcp2")
+        .arg("--without-libssh2")
+        .arg("--without-libssh")
+        .arg("--without-librtmp")
+        .arg("--without-gssapi")
+        .arg("--disable-manual")
+        .env("CC", cc)
+        .env("AR", ar)
+        .env("RANLIB", ranlib)
+        .env("CFLAGS", "-O2")
+        .env("CPPFLAGS", &cppflags)
+        .env("LDFLAGS", &ldflags);
+    run(&mut configure_cmd, "curl configure")?;
+
+    // curl links the `curl` CLI through libtool, which treats a bare `-static`
+    // as "use static *libtool* libraries" — NOT "produce a fully static binary",
+    // so the tool would keep a PT_INTERP and fault on m3OS (no real libc.so).
+    // libtool's `-all-static` IS the fully-static request; gcc never sees it
+    // (libtool parses + expands it), so it cannot go in the configure LDFLAGS
+    // (gcc runs the configure link probes directly and would reject it). Pass it
+    // only at `make`, as a command-line LDFLAGS override that keeps the staged
+    // `-L` paths + the musl static-compat stubs. libcurl.a (an `ar` archive) is
+    // unaffected. This is the standard libtool fully-static idiom.
+    let make_ldflags = if extra_ld.is_empty() {
+        format!(
+            "-all-static -L{}/lib -L{}/lib",
+            zlib_prefix.display(),
+            mbedtls_prefix.display()
+        )
+    } else {
+        format!(
+            "-all-static -L{}/lib -L{}/lib {extra_ld}",
+            zlib_prefix.display(),
+            mbedtls_prefix.display()
+        )
+    };
+    let mut make_cmd = Command::new("make");
+    make_cmd
+        .current_dir(src)
+        .arg(format!("-j{}", num_jobs()))
+        .arg(format!("LDFLAGS={make_ldflags}"));
+    run(&mut make_cmd, "curl make")?;
+
+    let mut install_cmd = Command::new("make");
+    install_cmd
+        .current_dir(src)
+        .arg(format!("LDFLAGS={make_ldflags}"))
+        .arg("install")
+        .arg(format!("DESTDIR={}", stage.display()));
+    run(&mut install_cmd, "curl install")?;
+
+    // ── Verify the static libcurl + mbedTLS backend (B.1) ─────────────────────
+    let libcurl = stage_prefix.join("lib/libcurl.a");
+    if !libcurl.exists() {
+        return Err(format!("curl build missing {}", libcurl.display()));
+    }
+    let curl_bin = stage_prefix.join("bin/curl");
+    if !curl_bin.exists() {
+        return Err(format!("curl build missing {}", curl_bin.display()));
+    }
+    // The curl CLI must be static (m3OS's ld-musl has no real libc.so).
+    if binary_contains(&curl_bin, b"/lib/ld-musl-x86_64.so.1")? {
+        return Err(format!(
+            "curl build: {} references the dynamic loader — `-static` did not take effect",
+            curl_bin.display()
+        ));
+    }
+    // The static `curl` binary is a musl x86-64 ELF that runs on the build host:
+    // `curl --version` reports its TLS backend + feature flags. Assert mbedTLS is
+    // the backend and HTTPS is a supported protocol (the small-footprint TLS path).
+    let ver = Command::new(&curl_bin)
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("curl build: run curl --version: {e}"))?;
+    let ver_out = String::from_utf8_lossy(&ver.stdout);
+    if !ver.status.success() || !ver_out.contains("mbedTLS") {
+        return Err(format!(
+            "curl build: curl --version did not report the mbedTLS backend (got {:?})",
+            ver_out.trim()
+        ));
+    }
+    if !ver_out.to_lowercase().contains("https") {
+        return Err(format!(
+            "curl build: curl --version does not list HTTPS as a protocol (got {:?})",
+            ver_out.trim()
+        ));
+    }
+    // The compiled-in CAINFO must be the Phase 86a path (so git + curl agree).
+    if !binary_contains(&curl_bin, b"/etc/ssl/certs/ca-certificates.crt")? {
+        return Err(
+            "curl build: binary does not embed the CAINFO path /etc/ssl/certs/ca-certificates.crt \
+             (--with-ca-bundle did not take effect — trust would diverge from git)"
+                .to_string(),
+        );
+    }
+    let _ = ranlib; // consumed via .env("RANLIB", ..) above
+
+    println!(
+        "curl: produced static libcurl.a ({} bytes) + curl CLI ({} bytes); {}; \
+         CAINFO=/etc/ssl/certs/ca-certificates.crt",
+        file_size(&libcurl),
+        file_size(&curl_bin),
+        ver_out.lines().next().unwrap_or("").trim(),
     );
     Ok(())
 }
@@ -3494,7 +3875,13 @@ pub fn build_git_port() -> Result<(), String> {
             "no musl cross-compiler on PATH (install musl-tools or musl-gcc-cross-bin)".to_string(),
         );
     }
+    // Phase 86c — git is now rebuilt WITH curl, so the full transport chain is
+    // built in dependency-first order: zlib -> mbedtls -> curl -> git. A warm
+    // pkgcache makes each a zero-compiler hit. (ca-certificates is a data-only
+    // package bundled separately; the in-OS solver installs it from git's DEPS.)
     port_build("zlib").map_err(|e| format!("port zlib: {e}"))?;
+    port_build("mbedtls").map_err(|e| format!("port mbedtls: {e}"))?;
+    port_build("curl").map_err(|e| format!("port curl: {e}"))?;
     port_build("git").map_err(|e| format!("port git: {e}"))?;
     Ok(())
 }
@@ -3814,8 +4201,16 @@ mod tests {
         );
         assert_eq!(port_deps("ncurses"), &[] as &[&str]);
         assert_eq!(port_deps("libevent"), &[] as &[&str]);
-        // Phase 85b — git's one mandatory dependency is zlib.
-        assert_eq!(port_deps("git"), &["zlib"]);
+        // Phase 86c — git now depends on zlib + curl (HTTPS transport); curl
+        // transitively pulls mbedtls + ca-certificates via the solver.
+        assert_eq!(port_deps("git"), &["zlib", "curl"]);
+        // Phase 86c — mbedtls is a leaf; curl links the staged zlib + mbedtls.
+        assert_eq!(port_deps("mbedtls"), &[] as &[&str]);
+        let curl_deps = port_deps("curl");
+        assert!(
+            curl_deps.contains(&"zlib") && curl_deps.contains(&"mbedtls"),
+            "curl must list both zlib and mbedtls as deps"
+        );
         // Phase 85c — python's one *runtime* dependency is zlib (zlib/gzip).
         // ncurses (for the statically-linked _curses/_curses_panel) is a
         // BUILD-only dep, deliberately absent here so the in-OS solver does not
@@ -3836,7 +4231,7 @@ mod tests {
         // ports never collide on the recipe component of the key.
         let ports = [
             "zlib", "ncurses", "libevent", "less", "htop", "tmux", "git", "python", "llvm",
-            "dropbear",
+            "dropbear", "mbedtls", "curl",
         ];
         let ids: Vec<&str> = ports.iter().map(|p| build_recipe_id(p)).collect();
         for (p, id) in ports.iter().zip(&ids) {

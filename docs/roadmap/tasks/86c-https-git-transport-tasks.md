@@ -14,8 +14,8 @@
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
 | A | mbedTLS port (trimmed client-only, CSPRNG entropy) | 86a Track A | ✅ Done (built + entropy self-test PASS) |
-| B | curl port + git HTTPS rebuild (invert `NO_CURL` assertions) | A, 86b | In progress |
-| C | Cert/hostname validation + PAT creds + smoke gate + version | B, 86a Track B/C | Planned |
+| B | curl port + git HTTPS rebuild (invert `NO_CURL` assertions) | A, 86b | ✅ Done (curl libcurl/8.15 mbedTLS/3.6.2; git inverted assertions PASS) |
+| C | Cert/hostname validation + PAT creds + smoke gate + version | B, 86a Track B/C | In progress |
 
 ---
 
@@ -58,8 +58,8 @@
 **Why it matters:** `curl --with-mbedtls` is curl's documented small-footprint TLS backend (curl 8.15 dropped BearSSL), and `--with-ca-bundle` must compile in the **same** CAINFO path the Phase 86a bundle stages so git and curl agree.
 
 **Acceptance:**
-- [ ] `build_curl` builds a **static** `libcurl` (HTTP/HTTPS only — other protocols disabled), linking the staged mbedtls + zlib; the curl `Portfile` `DEPS` and git's `DEPS` together encode the dependency-first order `zlib → mbedtls → curl → ca-certificates → git`.
-- [ ] curl is configured `--with-mbedtls --with-ca-bundle=/etc/ssl/certs/ca-certificates.crt` (matching the Phase 86a path); an HTTPS GET to a controllable endpoint succeeds with SNI sent and `SSL_VERIFYHOST=2`.
+- [x] `build_curl` builds a **static** `libcurl.a` (1.28 MB) + a fully-static `curl` CLI (HTTP/HTTPS only — every other protocol `--disable`d), linking the staged mbedtls + zlib. The fully-static CLI needs libtool's `-all-static` at the `make` step (a bare `-static` only selects static libtool libs); configure keeps `-static`. The curl `Portfile` `DEPS=zlib mbedtls` and git's `DEPS=zlib curl` together encode the dependency-first order `zlib → mbedtls → curl → ca-certificates → git` (curl pulls mbedtls; git pulls curl).
+- [x] curl is configured `--with-mbedtls --with-ca-bundle=/etc/ssl/certs/ca-certificates.crt` (matching the Phase 86a path). Build-time verified: `curl --version` reports `libcurl/8.15.0 mbedTLS/3.6.2 zlib/1.3.1`, HTTPS is a listed protocol, and the binary embeds the `/etc/ssl/certs/ca-certificates.crt` CAINFO string. The live HTTPS GET with SNI + `SSL_VERIFYHOST=2` (curl's verified default) is exercised on-device by the `git-https-smoke` gate (C.2) — a network test, not a reproducible build step.
 
 ### B.2 — Rebuild git WITH curl + invert the `NO_CURL` assertions
 
@@ -71,9 +71,9 @@
 **Why it matters:** `build_git` currently **hard-fails** if any curl/OpenSSL linkage is present, so removing `NO_CURL` and adding the curl dependency must land **together**; the server-side prune is correct and must survive the inversion.
 
 **Acceptance:**
-- [ ] `NO_CURL=1` (and `NO_OPENSSL=1` if OpenSSL is not adopted) is removed from the git `make` invocation; the curl-helper-present check (`~:1566`) and the `curl_easy_perform` (`:1574`) / `SSL_CTX_new` (`:1580`) symbol checks are **inverted** to REQUIRE those symbols/helpers, so a curl-enabled git variant builds with `git-remote-https` + `git-http-fetch` **present**.
-- [ ] `ports/util/git/Portfile` `DEPS` (`:5`) gains `curl` (transitively pulling mbedtls + ca-certificates); the inversion and the `DEPS` addition land in the **same** change so `build_git` never hard-fails mid-flight.
-- [ ] The server-side `git-upload-pack`/`git-receive-pack`/`git-upload-archive` prune (`~:1535`) **remains**; a code/doc note records that un-pruning them would be wrong (they are the server half of the protocol m3OS does not run).
+- [x] `NO_CURL=1` is removed from the git `make` invocation (curl is now linked via `CURL_CFLAGS`/`CURL_LDFLAGS` + `CURL_CONFIG=true`); the 85b absence-assertions are **inverted** to presence-requirements: `git-remote-http`/`git-remote-https`/`git-http-fetch` must be **present** and `git-remote-http` must reference `curl_easy_perform`. *(`NO_OPENSSL=1` is KEPT — the TLS backend is mbedTLS-via-curl, **not** OpenSSL, so the 85b `SSL_CTX_new` check is kept as an ABSENCE assertion (proving no OpenSSL crept in), and a new `mbedtls_ssl_handshake` PRESENCE assertion is the positive TLS proof. This corrects the task's literal "require `SSL_CTX_new`", which assumed an OpenSSL backend — with mbedTLS that symbol is intentionally absent.)* Build output: `git-remote-https + curl_easy_perform + mbedtls_ssl_handshake present, SSL_CTX_new absent`. `git-http-push` is not required (it needs expat; `NO_EXPAT=1`).
+- [x] `ports/util/git/Portfile` `DEPS` gains `curl` (→ `DEPS=zlib curl`, transitively pulling mbedtls + ca-certificates); the assertion inversion, the `make`-knob change, and the `DEPS` addition all land in the **same** change so `build_git` never hard-fails mid-flight. `compute_port_key` was made to **recurse** so git's content key folds in curl's full transitive identity (new in 86c — previously only leaf deps existed).
+- [x] The server-side `git-upload-pack`/`git-receive-pack`/`git-upload-archive` prune **remains** and is now also **asserted** (a positive guard that un-pruning them regresses); a code note records that un-pruning would ship a server m3OS does not run. The `git-remote-ftp`/`ftps` curl aliases are additionally pruned (curl is `--disable-ftp`; m3OS does no ftp clones).
 
 ---
 
