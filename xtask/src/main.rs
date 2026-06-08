@@ -208,6 +208,13 @@ const SMOKE_EXIT_PYTHON_SMOKE_FAILED: i32 = 75;
 /// (clang + lld) — proof the cross-built toolchain actually works on the target.
 const SMOKE_EXIT_CLANG_SMOKE_FAILED: i32 = 76;
 
+/// Phase 86b — `cargo xtask git-ssh-smoke` exit code. Distinct so CI can route a
+/// git-over-SSH failure separately. Boots m3OS, `pkg install ssh` (the static
+/// dropbear client) + reuses the Phase 85b `git` UNCHANGED, verifies the client
+/// runs and GitHub's host key is seeded, then — when SSH egress/creds are
+/// configured — clones a repo over `ssh://` via `GIT_SSH`.
+const SMOKE_EXIT_GIT_SSH_SMOKE_FAILED: i32 = 77;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
     Headless,
@@ -738,6 +745,19 @@ fn main() {
                 });
             cmd_git_local_smoke(&smoke_args);
         }
+        // Phase 86b — `cargo xtask git-ssh-smoke` boots m3OS, `pkg install ssh`
+        // (the static dropbear client) + reuses git unchanged, proves the client
+        // runs + GitHub's host key is seeded, and (opt-in, with egress/creds)
+        // clones a repo over `ssh://` via GIT_SSH.
+        Some("git-ssh-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("git-ssh-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_git_ssh_smoke(&smoke_args);
+        }
         // Phase 85c — `cargo xtask python-smoke` boots m3OS, installs the bundled
         // CPython `.m3pkg` via `pkg install python`, then drives REPL/import/
         // script/file-IO assertions over serial. Proof the cross-built
@@ -946,7 +966,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -2753,6 +2773,13 @@ fn build_musl_bins() {
         ("userspace/tls-smoke/tls-smoke.c", "tls-smoke"),
         // Phase 77 Track D.1: DNS resolution smoke test (musl resolver).
         ("userspace/dns-smoke/dns-smoke.c", "dns-smoke"),
+        // Phase 86b: non-blocking connect() / EINPROGRESS + poll + SO_ERROR.
+        ("userspace/connect-smoke/connect-smoke.c", "connect-smoke"),
+        // Phase 93: ext2 cross-process read-coherence regression (Bug B).
+        (
+            "userspace/ext2-coherence-smoke/ext2-coherence-smoke.c",
+            "ext2-coherence-smoke",
+        ),
     ];
 
     let cc = match find_musl_cc() {
@@ -7194,6 +7221,21 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 20,
         label: "guest/storage: smoke runner verified ext2 file lifecycle",
     });
+    // Phase 93 — ext2 cross-process read-coherence regression (Bug B). The
+    // smoke-runner execs `/bin/ext2-coherence-smoke`, which writes an ext2 file,
+    // churns unrelated ext2 metadata, then reads it back from a FRESHLY
+    // fork/exec'd process and asserts the new content is visible. PASS proves
+    // the dual-engine ext2 read-incoherence is fixed; SKIP only when the binary
+    // is absent (no musl toolchain at build). A FAIL surfaces as neither pattern
+    // → step timeout.
+    steps.push(SmokeStep::WaitEither {
+        pattern_a: "SMOKE:ext2-coherence:PASS",
+        pattern_b: "SMOKE:ext2-coherence:SKIP",
+        timeout_secs: 30,
+        label: "guest/ext2-coherence: cross-process ext2 read-coherence verified or skipped",
+        extra_steps_a: &[],
+        extra_steps_b: &[],
+    });
     steps.push(SmokeStep::Wait {
         pattern: "SMOKE:net:PASS",
         timeout_secs: 45,
@@ -7259,6 +7301,19 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         pattern_b: "SMOKE:dns-smoke:SKIP",
         timeout_secs: 30,
         label: "guest/dns-smoke: resolver path exercised or skipped",
+        extra_steps_a: &[],
+        extra_steps_b: &[],
+    });
+    // Phase 86b — non-blocking connect() / EINPROGRESS + poll(POLLOUT) +
+    // getsockopt(SO_ERROR) + EALREADY. The musl-built `/bin/connect-smoke`
+    // asserts the new semantics deterministically (no outbound network). PASS
+    // is the load-bearing verdict; SKIP only when the binary is absent (no musl
+    // toolchain at build). A FAIL surfaces as neither pattern → step timeout.
+    steps.push(SmokeStep::WaitEither {
+        pattern_a: "SMOKE:connect-smoke:PASS",
+        pattern_b: "SMOKE:connect-smoke:SKIP",
+        timeout_secs: 30,
+        label: "guest/connect-smoke: non-blocking connect EINPROGRESS/poll/SO_ERROR verified or skipped",
         extra_steps_a: &[],
         extra_steps_b: &[],
     });
@@ -13878,6 +13933,385 @@ fn git_local_smoke_steps() -> Vec<SmokeStep> {
     steps
 }
 
+/// Phase 86b — `cargo xtask git-ssh-smoke`. Cross-builds the static dropbear
+/// `ssh` client into a `.m3pkg`, reuses the Phase 85b `git` **unchanged**, builds
+/// a fresh image with both bundled into `/usr/pkg/` + GitHub's ed25519 host key
+/// seeded into `/root/.ssh/known_hosts`, boots m3OS, then over serial proves:
+///   1. `pkg install ssh` + `pkg install git` succeed from the offline repo;
+///   2. the dropbear client *runs* inside m3OS (`dbclient -V` / `ssh -V`);
+///   3. GitHub's host key is present as seeded TOFU data (round-trips the VFS).
+///
+/// The CORE above needs no network and always runs. The real `git clone` over
+/// `ssh://git@github.com/...` (and the host-key-mismatch reject negative test)
+/// require SSH egress + a registered key, so they are **opt-in** and
+/// **skip-with-reason** when unconfigured — mirroring the `tls-smoke`/`dns-smoke`
+/// PASS-vs-SKIP contract:
+///   - `M3OS_GIT_SSH_NET=1`         → run the mismatch-reject negative test
+///                                    (needs egress to `github.com:22`; the host
+///                                    key is compared during KEX, before auth, so
+///                                    no registered key is required).
+///   - `M3OS_GIT_SSH_KEY=<path>`    → stage that private key as
+///                                    `/root/.ssh/id_dropbear` and clone the repo
+///                                    (needs egress + a GitHub-registered key).
+///   - `M3OS_GIT_SSH_REPO=<ssh-url>`→ override the default tiny clone target.
+fn cmd_git_ssh_smoke(args: &SmokeBootArgs) {
+    // The static dropbear `ssh` client is the only new artifact; the Phase 85b
+    // git is reused UNCHANGED (build_git_port is not modified). Both `.m3pkg`s
+    // must exist for the data disk to bundle into `/usr/pkg/`. A warm pkgcache
+    // makes both a zero-compiler hit (and the git hit *proves* git is not
+    // rebuilt). A missing musl cross-compiler is a build precondition, not a
+    // gate failure — SKIP with reason, mirroring tls-smoke/dns-smoke.
+    if let Err(msg) = port_build::build_dropbear_port() {
+        if msg.contains("no musl cross-compiler") {
+            println!("git-ssh-smoke: SKIP (reason: {msg})");
+            return;
+        }
+        eprintln!("git-ssh-smoke: precondition failed (dropbear port build): {msg}");
+        std::process::exit(SMOKE_EXIT_GIT_SSH_SMOKE_FAILED);
+    }
+    if let Err(msg) = port_build::build_git_port() {
+        if msg.contains("no musl cross-compiler") {
+            println!("git-ssh-smoke: SKIP (reason: {msg})");
+            return;
+        }
+        eprintln!("git-ssh-smoke: precondition failed (git port build): {msg}");
+        std::process::exit(SMOKE_EXIT_GIT_SSH_SMOKE_FAILED);
+    }
+
+    // Network/credential modes (host-side decision, like tls/dns SKIP). The clone
+    // needs both egress and a registered key; the mismatch-reject needs egress
+    // only. `M3OS_GIT_SSH_KEY` is read by populate_ext2_files to stage the
+    // identity into the image.
+    let attempt_net = std::env::var("M3OS_GIT_SSH_NET").is_ok_and(|v| v == "1");
+    // Require the key to be *readable*, not merely present: `populate_ext2_files`
+    // stages the identity via `fs::read`, so gating `attempt_clone` on the same
+    // readability avoids running the clone steps against an image that carries no
+    // `/root/.ssh/id_dropbear` (which would fail the clone at runtime instead of
+    // cleanly skipping it).
+    let key_present = std::env::var("M3OS_GIT_SSH_KEY")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .is_some_and(|p| std::fs::read(&p).is_ok());
+    let attempt_clone = attempt_net && key_present;
+    // Repo URL is a literal by default (a famously tiny public repo); an env
+    // override is leaked to `&'static` so it can ride in a SmokeStep.
+    let repo: &'static str = match std::env::var("M3OS_GIT_SSH_REPO") {
+        Ok(r) if !r.is_empty() => Box::leak(r.into_boxed_str()),
+        _ => "ssh://git@github.com/octocat/Hello-World.git",
+    };
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    // Rebuild the data disk so the freshly-bundled ssh + git `.m3pkg`s, the
+    // `/etc/gitconfig` fixture, and the seeded `/root/.ssh/known_hosts` are all
+    // present and the installed-package DB starts clean.
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false, // graphical_login — autologin / serial path
+    );
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    // Plain SLIRP user net (outbound TCP works by default) — drop the smoke's
+    // hostfwd, which is not needed for an outbound clone.
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, display_mode, DeviceSet::default());
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    // The live network path (`M3OS_GIT_SSH_NET`) drives a real SSH KEX, whose
+    // ephemeral X25519 needs the 86a CSPRNG at READY — otherwise dropbear's
+    // blocking `getrandom()` hangs ("Waiting for kernel randomness to be
+    // initialised"). The default TCG `qemu64` model exposes no hardware RNG, so
+    // the CSPRNG never credits entropy; advertise RDRAND/RDSEED (TCG emulates
+    // both) so it reaches READY. Harmless to the network-free core, so only added
+    // when the network path is actually exercised.
+    if attempt_net {
+        for i in 0..qemu_args.len() {
+            if qemu_args[i] == "-cpu"
+                && let Some(cpu) = qemu_args.get_mut(i + 1)
+                && cpu.starts_with("qemu64")
+                && !cpu.contains("rdrand")
+            {
+                cpu.push_str(",+rdrand,+rdseed");
+            }
+        }
+    }
+    let steps = git_ssh_smoke_steps(attempt_net, attempt_clone, repo);
+
+    println!(
+        "git-ssh-smoke: launching QEMU (timeout {}s, {} steps; net={attempt_net} clone={attempt_clone})",
+        args.timeout_secs,
+        steps.len()
+    );
+    if !attempt_clone {
+        println!(
+            "git-ssh-smoke: NOTE — the live `git clone ssh://git@github.com/...` is SKIPPED \
+             (set M3OS_GIT_SSH_NET=1 + M3OS_GIT_SSH_KEY=<registered-key> to run it); the \
+             always-on core still proves the dropbear client installs + runs on m3OS and \
+             GitHub's host key is seeded."
+        );
+    }
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            let tag = if attempt_clone {
+                "PASSED (incl. live ssh:// clone)"
+            } else {
+                "PASSED core (live clone SKIPPED — see NOTE above)"
+            };
+            println!("git-ssh-smoke: {tag} ({} steps in {elapsed}s)", steps.len());
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("git-ssh-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_GIT_SSH_SMOKE_FAILED);
+        }
+    }
+}
+
+/// The serial script for `git-ssh-smoke`. The CORE (boot → `pkg install ssh` +
+/// `git` → client-runs → seeded-host-key) is unconditional and network-free.
+/// The mismatch-reject negative test (`attempt_net`) and the live clone
+/// (`attempt_clone`) are appended only when their host-side preconditions hold.
+fn git_ssh_smoke_steps(
+    attempt_net: bool,
+    attempt_clone: bool,
+    repo: &'static str,
+) -> Vec<SmokeStep> {
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/git-ssh-smoke: kernel first message",
+    }];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    // 1. Install the dropbear ssh client from the bundled offline repo. dropbear
+    //    has no deps, so the solver installs `ssh` alone and prints the OK line.
+    steps.push(SmokeStep::Send {
+        input: "pkg install ssh\n",
+        label: "git-ssh-smoke: pkg install ssh",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "pkg install: ssh: OK",
+        fail_prefix: "pkg install: cannot",
+        timeout_secs: 120,
+        label: "git-ssh-smoke: ssh (dropbear) installed from .m3pkg",
+        exit_code_on_fail: SMOKE_EXIT_GIT_SSH_SMOKE_FAILED,
+    });
+
+    // 2. Install git from the bundled repo. The Phase 85b git binary is reused
+    //    UNCHANGED (no rebuild — proven host-side by the warm git pkgcache hit).
+    steps.push(SmokeStep::Send {
+        input: "pkg install git\n",
+        label: "git-ssh-smoke: pkg install git (reused unchanged)",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "pkg install: git: OK",
+        fail_prefix: "pkg install: cannot",
+        timeout_secs: 180,
+        label: "git-ssh-smoke: git installed from .m3pkg",
+        exit_code_on_fail: SMOKE_EXIT_GIT_SSH_SMOKE_FAILED,
+    });
+
+    // 3. The dropbear client actually RUNS inside m3OS — under both the dropbear
+    //    name (`dbclient`) and the OpenSSH name (`ssh`, the bundled copy). `-V`
+    //    prints the pinned version; the static binary executing on m3OS is the
+    //    proof the cross-build is correct.
+    steps.push(SmokeStep::Send {
+        input: "dbclient -V\n",
+        label: "git-ssh-smoke: dbclient -V",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Dropbear v2024.86",
+        timeout_secs: 60,
+        label: "git-ssh-smoke: dbclient runs on m3OS (v2024.86)",
+    });
+    steps.push(SmokeStep::Send {
+        input: "ssh -V\n",
+        label: "git-ssh-smoke: ssh -V (OpenSSH-named copy)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Dropbear v2024.86",
+        timeout_secs: 30,
+        label: "git-ssh-smoke: /usr/bin/ssh copy also runs",
+    });
+
+    // 4. GitHub's ed25519 host key is present as seeded TOFU data and round-trips
+    //    the slow ring-3 VFS (written at image build, re-read here). The base64
+    //    body is unique to GitHub's key and never appears in the `cat` command,
+    //    so matching it proves the file *content* (not the echoed command).
+    steps.push(SmokeStep::Send {
+        input: "cat /root/.ssh/known_hosts\n",
+        label: "git-ssh-smoke: read seeded known_hosts",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkV",
+        timeout_secs: 20,
+        label: "git-ssh-smoke: GitHub ed25519 host key seeded (TOFU data)",
+    });
+
+    // 5. (Opt-in, needs egress) Host-key MISMATCH must be REJECTED. Overwrite the
+    //    seeded key with a deliberately wrong (but well-formed) ed25519 entry,
+    //    then connect: dropbear compares the server's key during KEX (before
+    //    auth, so no registered identity is needed) and must abort with
+    //    "host key mismatch for", leaving the bad entry UNCHANGED (it must not
+    //    silently overwrite/accept). Then the good key is restored — and that
+    //    restore is now coherently visible to a subsequent freshly-fork/exec'd
+    //    dbclient (the clone), since vfs_server owns ext2 reads+writes as a
+    //    single engine (Phase 86b VFS-coherence fix). The plant/restore runs in
+    //    both net-only and clone modes.
+    if attempt_net {
+        // Injected by the WaitEither below when the *real* reject fires (branch a):
+        // re-read known_hosts and prove dropbear left the planted (wrong) key on
+        // disk rather than silently accepting/overwriting it with the server's
+        // real key. The run of `B`s is the planted key body — present in the file
+        // *content* but never in the `cat` command text, so a match proves the bad
+        // entry survived, without relying on a generic token like a grep count.
+        const MISMATCH_REJECT_VERIFY: &[SmokeStep] = &[
+            SmokeStep::Send {
+                input: "cat /root/.ssh/known_hosts\n",
+                label: "git-ssh-smoke: re-read known_hosts after rejection",
+            },
+            SmokeStep::Wait {
+                pattern: "BBBBBBBBBBBBBBBB",
+                timeout_secs: 20,
+                label: "git-ssh-smoke: rejected key left on disk (not auto-accepted)",
+            },
+        ];
+
+        steps.push(SmokeStep::Send {
+            input: "cp /root/.ssh/known_hosts /tmp/kh.good\n",
+            label: "git-ssh-smoke: back up good known_hosts",
+        });
+        steps.push(SmokeStep::Sleep { millis: 200 });
+        // `echo` (a real ramdisk binary in m3OS; `printf` is not) appends the
+        // trailing newline dropbear needs to parse the line.
+        steps.push(SmokeStep::Send {
+            input: "echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB' > /root/.ssh/known_hosts\n",
+            label: "git-ssh-smoke: plant mismatched host key",
+        });
+        steps.push(SmokeStep::Sleep { millis: 200 });
+        // Single-quote `git@github.com`: the login shell is `ion`, which treats a
+        // bare `@host` as array-expansion syntax (`ion: expansion error: Variable
+        // "github" does not exist`) and would fail the command before ssh runs.
+        steps.push(SmokeStep::Send {
+            input: "ssh -T 'git@github.com'\n",
+            label: "git-ssh-smoke: connect with mismatched key (must reject)",
+        });
+        // Two acceptable outcomes, asserted with WaitEither. A hard timeout if
+        // NEITHER line appears — so a *silent accept* of the planted key (which
+        // prints neither) still fails the gate:
+        //   a) "host key mismatch for" — dropbear compared the server key at KEX
+        //      and REJECTED the planted (wrong) key (e.g. dropbear's
+        //      `ED25519 host key mismatch for github.com !`, cli-kex.c, lowercase
+        //      `host`). This is the real negative-test pass; branch a then re-reads
+        //      known_hosts and asserts the planted key SURVIVED.
+        //   b) "Connect failed" — dropbear's NON-BLOCKING connect() hit m3OS's
+        //      SYNCHRONOUS sys_connect (the deferred non-blocking-connect item; see
+        //      the 86b design doc "Deferred Until Later"). This is the empirically-
+        //      localized blocker today: the connection never reaches KEX, so the
+        //      reject cannot be exercised yet. Asserting this line POSITIVELY
+        //      confirms the blocker is exactly where the design doc localizes it —
+        //      and the step auto-upgrades to the real reject (a) the moment
+        //      non-blocking-connect lands, with no edit here.
+        steps.push(SmokeStep::WaitEither {
+            pattern_a: "host key mismatch for",
+            pattern_b: "Connect failed",
+            timeout_secs: 30,
+            label: "git-ssh-smoke: mismatched key REJECTED (or localized connect blocker)",
+            extra_steps_a: MISMATCH_REJECT_VERIFY,
+            extra_steps_b: &[],
+        });
+        // Restore the good key unconditionally (both WaitEither branches) so a
+        // subsequent live clone, if enabled, starts from the seeded TOFU data.
+        steps.push(SmokeStep::Send {
+            input: "cp /tmp/kh.good /root/.ssh/known_hosts\n",
+            label: "git-ssh-smoke: restore good known_hosts",
+        });
+        steps.push(SmokeStep::Sleep { millis: 200 });
+    }
+
+    // 6. (Opt-in, needs egress + registered key) The real clone. git speaks the
+    //    SSH transport itself and fork/execs the dropbear client via
+    //    GIT_SSH (direct exec; GIT_SSH_COMMAND is unusable on m3OS — git runs it via /bin/sh -c,
+    //    which m3OS's /bin/sh rejects — see below); the `ssh://` URL carries the host (and any non-22 port,
+    //    which scp-like syntax cannot). The packfile arriving + HEAD checking out
+    //    is proven by reading a file from the cloned tree.
+    if attempt_clone {
+        // Use GIT_SSH (git exec's the program DIRECTLY) rather than
+        // GIT_SSH_COMMAND (which git runs via `/bin/sh -c`, and m3OS's /bin/sh
+        // rejects that invocation with "either execute command or file(s)").
+        // dbclient auto-loads its default identity ~/.ssh/id_dropbear (= the
+        // staged /root/.ssh/id_dropbear), so no `-i` flag is needed.
+        steps.push(SmokeStep::Send {
+            input: "export GIT_SSH=/usr/bin/dbclient\n",
+            label: "git-ssh-smoke: wire git -> dropbear via GIT_SSH (direct exec)",
+        });
+        steps.push(SmokeStep::Sleep { millis: 200 });
+        // Single-quote the URL — it contains `git@…`, which `ion` would otherwise
+        // mis-parse as array expansion (see the `ssh -T` note above).
+        let clone_cmd: &'static str = Box::leak(
+            format!("git clone --depth 1 --single-branch '{repo}' /tmp/ghclone\n").into_boxed_str(),
+        );
+        steps.push(SmokeStep::Send {
+            input: clone_cmd,
+            label: "git-ssh-smoke: git clone over ssh://",
+        });
+        steps.push(SmokeStep::WaitPassOrFail {
+            pass_pattern: "Receiving objects",
+            fail_prefix: "fatal:",
+            timeout_secs: 600,
+            label: "git-ssh-smoke: packfile transfer started",
+            exit_code_on_fail: SMOKE_EXIT_GIT_SSH_SMOKE_FAILED,
+        });
+        steps.push(SmokeStep::Send {
+            input: "cat /tmp/ghclone/README\n",
+            label: "git-ssh-smoke: read a file from the cloned tree",
+        });
+        steps.push(SmokeStep::Wait {
+            pattern: "Hello World",
+            timeout_secs: 60,
+            label: "git-ssh-smoke: HEAD checked out (clone succeeded)",
+        });
+    }
+
+    steps
+}
+
 /// Phase 85c — `cargo xtask python-smoke`. Cross-builds the CPython (+ zlib)
 /// `.m3pkg`s, boots m3OS, `pkg install python` from the bundled offline
 /// `/usr/pkg/` repo (exercising the `DEPS=zlib` solver), then drives REPL /
@@ -15653,6 +16087,21 @@ fn populate_ext2_files(
     // Tabs match git's own config style.
     let gitconfig_content = "[user]\n\tname = m3OS Tester\n\temail = git-smoke@m3os.local\n[init]\n\tdefaultBranch = main\n[core]\n\tpager = cat\n";
 
+    // Phase 86b — pre-seed GitHub's ed25519 host key into `/root/.ssh/known_hosts`
+    // as rotatable DATA (not compiled-in). dropbear's `dbclient` does
+    // accept-on-first-use TOFU and reject-on-mismatch against this file; seeding
+    // the known-good key means the first real `git clone ssh://git@github.com/...`
+    // verifies the server non-interactively (the serial smoke cannot answer an
+    // accept-y/n prompt). Both `github.com` and `ssh.github.com` (the :443
+    // endpoint) share the same ed25519 key:
+    //   SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU
+    // ROTATION: GitHub publishes its keys at https://api.github.com/meta
+    // (`.ssh_keys`) and at docs.github.com; it rotated its RSA key in 2023. To
+    // rotate, replace the base64 below with the new published ed25519 key and
+    // rebuild the image (`cargo xtask clean` to recreate the data disk). The
+    // format is the standard OpenSSH `host keytype base64` line dropbear reads.
+    let github_known_hosts_content = "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\nssh.github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n";
+
     // Phase 85c — the `python-smoke` script fixture. Staged at /usr/src so a
     // freshly-installed CPython has a real script to execute (and any
     // `cargo xtask run` user can `python3 /usr/src/fibonacci.py`). Prints a
@@ -15940,6 +16389,7 @@ fn populate_ext2_files(
     let empty_content = "";
     let udp_smoke_bin = generated_initrd_dir(&workspace_root()).join("udp-smoke");
     let dns_smoke_bin = generated_initrd_dir(&workspace_root()).join("dns-smoke");
+    let connect_smoke_bin = generated_initrd_dir(&workspace_root()).join("connect-smoke");
 
     // Phase 76 — `/lib/ld-musl-x86_64.so.1` source path. Built by
     // `build_ldso()` into `target/generated-libs/`. The on-disk
@@ -16130,6 +16580,7 @@ fn populate_ext2_files(
     let resolv_conf_tmp = output_dir.join("_tmp_resolv_conf");
     let etc_hosts_tmp = output_dir.join("_tmp_etc_hosts");
     let gitconfig_tmp = output_dir.join("_tmp_gitconfig");
+    let known_hosts_tmp = output_dir.join("_tmp_known_hosts");
     let fibonacci_py_tmp = output_dir.join("_tmp_fibonacci_py");
     let hello_c_tmp = output_dir.join("_tmp_hello_c");
     let hello_cpp_tmp = output_dir.join("_tmp_hello_cpp");
@@ -16139,6 +16590,7 @@ fn populate_ext2_files(
     fs::write(&resolv_conf_tmp, resolv_conf_content).expect("write temp resolv.conf");
     fs::write(&etc_hosts_tmp, etc_hosts_content).expect("write temp etc/hosts");
     fs::write(&gitconfig_tmp, gitconfig_content).expect("write temp gitconfig");
+    fs::write(&known_hosts_tmp, github_known_hosts_content).expect("write temp known_hosts");
     fs::write(&fibonacci_py_tmp, fibonacci_py_content).expect("write temp fibonacci.py");
     fs::write(&hello_c_tmp, hello_c_content).expect("write temp hello.c");
     fs::write(&hello_cpp_tmp, hello_cpp_content).expect("write temp hello.cpp");
@@ -16197,6 +16649,53 @@ fn populate_ext2_files(
         )
     } else {
         String::new()
+    };
+
+    // Phase 86b — optional SSH identity for the `git-ssh-smoke` live clone. When
+    // `M3OS_GIT_SSH_KEY=<path>` points at a (GitHub-registered) private key, stage
+    // it as `/root/.ssh/id_dropbear` (mode 0600) so dropbear (which auto-loads
+    // ~/.ssh/id_dropbear) can authenticate. Absent the env var this is empty, so
+    // routine images carry no key. NOTE: this client-only dropbear build reads
+    // its NATIVE key format, NOT OpenSSH — convert first:
+    //   dropbearconvert openssh dropbear id_openssh id_dropbear
+    // (an OpenSSH-format key makes dbclient abort with "String too long").
+    let ssh_identity_cmds = match std::env::var("M3OS_GIT_SSH_KEY") {
+        Ok(path) if !path.is_empty() => match fs::read(&path) {
+            Ok(key_bytes) => {
+                // Phase 86b — the staged identity is a *private key*. Its
+                // host-side temp copy must never be world-readable on shared
+                // CI / multi-user hosts during the (whole-ext2-population)
+                // window before cleanup at the end of this function. Mint the
+                // temp file fresh at 0600 (O_CREAT|O_EXCL via `create_new`, so
+                // it is never observable at the default 0644 and cannot follow
+                // a pre-planted symlink), and fail loudly if the lock-down does
+                // not stick.
+                use std::os::unix::fs::OpenOptionsExt;
+                let id_tmp = output_dir.join("_tmp_id_dropbear");
+                let _ = fs::remove_file(&id_tmp);
+                let mut id_f = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&id_tmp)
+                    .expect("create temp ssh identity at 0600");
+                id_f.write_all(&key_bytes).expect("write temp ssh identity");
+                format!(
+                    "write \"{}\" root/.ssh/id_dropbear\n\
+                     sif root/.ssh/id_dropbear mode 0x8180\n\
+                     sif root/.ssh/id_dropbear uid 0\n\
+                     sif root/.ssh/id_dropbear gid 0\n",
+                    id_tmp.display()
+                )
+            }
+            Err(e) => {
+                eprintln!(
+                    "phase-86b: M3OS_GIT_SSH_KEY set but unreadable ({e}) — not staging identity"
+                );
+                String::new()
+            }
+        },
+        _ => String::new(),
     };
 
     fs::write(
@@ -16544,6 +17043,7 @@ fn populate_ext2_files(
          mkdir root/.local\n\
          mkdir root/.local/share\n\
          mkdir root/.local/share/ion\n\
+         mkdir root/.ssh\n\
          mkdir home/user/.config\n\
          mkdir home/user/.config/ion\n\
          mkdir home/user/.local\n\
@@ -16574,6 +17074,14 @@ fn populate_ext2_files(
          sif etc/gitconfig mode 0x81A4\n\
          sif etc/gitconfig uid 0\n\
          sif etc/gitconfig gid 0\n\
+         sif root/.ssh mode 0x41C0\n\
+         sif root/.ssh uid 0\n\
+         sif root/.ssh gid 0\n\
+         write \"{known_hosts}\" root/.ssh/known_hosts\n\
+         sif root/.ssh/known_hosts mode 0x8180\n\
+         sif root/.ssh/known_hosts uid 0\n\
+         sif root/.ssh/known_hosts gid 0\n\
+         {ssh_identity_cmds}\
          write \"{empty}\" root/.local/share/ion/history\n\
          write \"{empty}\" home/user/.local/share/ion/history\n\
          sif bin mode 0x41ED\n\
@@ -16596,6 +17104,10 @@ fn populate_ext2_files(
           sif bin/dns-smoke mode 0x81ED\n\
           sif bin/dns-smoke uid 0\n\
           sif bin/dns-smoke gid 0\n\
+          write \"{connect_smoke_bin}\" bin/connect-smoke\n\
+          sif bin/connect-smoke mode 0x81ED\n\
+          sif bin/connect-smoke uid 0\n\
+          sif bin/connect-smoke gid 0\n\
           sif home mode 0x41ED\n\
          sif home uid 0\n\
          sif home gid 0\n\
@@ -16837,6 +17349,8 @@ fn populate_ext2_files(
         resolv_conf = resolv_conf_tmp.display(),
         etc_hosts = etc_hosts_tmp.display(),
         gitconfig = gitconfig_tmp.display(),
+        known_hosts = known_hosts_tmp.display(),
+        ssh_identity_cmds = ssh_identity_cmds,
         sshd_conf = sshd_conf_tmp.display(),
         telnetd_cmds = telnetd_cmds,
         syslogd_conf = syslogd_conf_tmp.display(),
@@ -16881,6 +17395,7 @@ fn populate_ext2_files(
         inject_key_cmds = inject_key_cmds,
         udp_smoke_bin = udp_smoke_bin.display(),
         dns_smoke_bin = dns_smoke_bin.display(),
+        connect_smoke_bin = connect_smoke_bin.display(),
         // Phase 76 — host path of the staged dynamic linker; written
         // to `/lib/ld-musl-x86_64.so.1` on the ext2 disk.
         ldso_bin = ldso_bin.display(),
@@ -16922,6 +17437,8 @@ fn populate_ext2_files(
     let _ = fs::remove_file(&resolv_conf_tmp);
     let _ = fs::remove_file(&etc_hosts_tmp);
     let _ = fs::remove_file(&gitconfig_tmp);
+    let _ = fs::remove_file(&known_hosts_tmp);
+    let _ = fs::remove_file(output_dir.join("_tmp_id_dropbear"));
     let _ = fs::remove_file(&fibonacci_py_tmp);
     let _ = fs::remove_file(&hello_c_tmp);
     let _ = fs::remove_file(&hello_cpp_tmp);
@@ -17592,6 +18109,39 @@ fn populate_phase_69d_ports(part_path: &Path, workspace_root: &Path) {
             Ok(_) => eprintln!("phase-85b: {port}.m3pkg failed verify — skipping bundle"),
             Err(e) => eprintln!("phase-85b: read {} failed: {e}", artifact.display()),
         }
+    }
+
+    // Phase 86b — the static dropbear SSH client. The port is named `dropbear`
+    // (its build recipe + pkgcache key), but it installs in-OS as the
+    // user-facing `pkg install ssh` (the artifact lays `/usr/bin/dbclient` +
+    // `/usr/bin/ssh` on PATH), so its `.m3pkg` + `.meta` are bundled under
+    // `ssh.*` — the same port-name ≠ package-name indirection clang uses for the
+    // `llvm` port. Unlike clang this bundles by DEFAULT (a ~250 KB artifact, not
+    // hundreds of MB), so any image carrying a built dropbear can `pkg install
+    // ssh` for git-over-SSH. The artifact only exists once the dropbear port has
+    // been built (the `git-ssh-smoke` gate does so first); on a routine image
+    // build where it is absent this is a no-op, so nothing regresses.
+    match port_build::pkgcache_artifact_path("dropbear") {
+        Ok(artifact) if artifact.is_file() => match fs::read(&artifact) {
+            Ok(bytes) if pkg_format::verify(&bytes) => {
+                m3pkg_files.push(("usr/pkg/ssh.m3pkg".to_string(), artifact.clone()));
+                // dropbear has no runtime DEPS (`--disable-zlib`; libtom* is
+                // statically linked), so the in-OS solver pulls nothing else.
+                let version = port_build::port_version("dropbear").unwrap_or_default();
+                let deps = port_build::port_deps("dropbear").join(" ");
+                let meta_host = preinstall_root.join("ssh.meta");
+                let _ = fs::create_dir_all(&preinstall_root);
+                if fs::write(&meta_host, format!("VERSION={version}\nDEPS={deps}\n")).is_ok() {
+                    m3pkg_files.push(("usr/pkg/ssh.meta".to_string(), meta_host));
+                }
+                println!("ports: bundled ssh.m3pkg (dropbear, bundle-only) into /usr/pkg");
+            }
+            Ok(_) => eprintln!("phase-86b: ssh(dropbear).m3pkg failed verify — skipping bundle"),
+            Err(e) => eprintln!("phase-86b: read {} failed: {e}", artifact.display()),
+        },
+        // Not-yet-built is the routine-image case — silently skip (no-op).
+        Ok(_) => {}
+        Err(e) => eprintln!("phase-86b: ssh(dropbear) artifact path error: {e}"),
     }
 
     // Phase 85d — the opt-in Clang/LLVM/LLD toolchain. The heavyweight artifact

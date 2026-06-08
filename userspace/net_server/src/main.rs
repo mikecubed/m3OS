@@ -233,13 +233,22 @@ fn handle_bind(table: &mut HandleTable, handle: u64, port: u64, ip_u32: u64) -> 
         return (NEG_EINVAL, 0); // already bound
     }
 
-    if !table.bind_port(port) {
+    // Phase 86b — a bind to port 0 is a WILDCARD ("assign me any source port"),
+    // not a request for the literal port 0. It must NOT reserve a port-0 entry
+    // in `bound_ports`: `handle_close` skips unbinding port 0 (`if port != 0`),
+    // so a reserved 0 leaks and the SECOND wildcard bind returns EADDRINUSE —
+    // which is exactly what musl's resolver hits on its second back-to-back
+    // `getaddrinfo` (it `bind`s the query socket to port 0). The real source
+    // port is assigned lazily by `alloc_ephemeral` on the first `sendto`
+    // (`handle_sendto`/`handle_connect`), which updates `h.local_port` so close
+    // frees it. Reserve a port only for a concrete (non-zero) requested port.
+    if port != 0 && !table.bind_port(port) {
         return (NEG_EADDRINUSE, 0);
     }
 
     // Re-borrow after bind_port
     let h = table.get_mut(idx).unwrap();
-    h.local_port = port;
+    h.local_port = port; // 0 == wildcard; the real port is assigned at sendto
     h.local_ip = ip;
     h.bound = true;
     h.state = HandleState::Bound;
