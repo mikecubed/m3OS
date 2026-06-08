@@ -664,7 +664,8 @@ pub fn port_deps(name: &str) -> &'static [&'static str] {
         // (object/pack compression) stays a direct dep too. The in-OS solver reads
         // these from the `.meta` sidecars; `compute_port_key` folds curl's full
         // (transitive) key in via recursion. The resolved install order is
-        // zlib -> mbedtls -> curl -> ca-certificates -> git.
+        // zlib -> mbedtls -> ca-certificates -> curl -> git (ca-certificates is
+        // curl's runtime trust store, so it precedes curl).
         "git" => &["zlib", "curl"],
         // Phase 86c Track B — curl links the staged static mbedtls (TLS backend)
         // + zlib (transfer decompression) at BUILD time, and needs the
@@ -737,9 +738,10 @@ fn compute_port_key(name: &str, port_dir: &Path) -> Result<String, String> {
             let dep_dir = find_port_dir(dep)
                 .ok_or_else(|| format!("dep port {dep} not found in ports/ tree"))?;
             // Recurse so a TRANSITIVE dep's own resolved dep-keys are folded in:
-            // Phase 86c introduces `curl -> {zlib, mbedtls}` and `git -> curl`, so
-            // git's key must reflect curl's full (transitive) identity, not just a
-            // bare curl Portfile digest. For the pre-86c leaf deps (zlib, ncurses,
+            // Phase 86c introduces `curl -> {zlib, mbedtls, ca-certificates}` and
+            // `git -> curl`, so git's key must reflect curl's full (transitive)
+            // identity, not just a bare curl Portfile digest. For the pre-86c leaf
+            // deps (zlib, ncurses,
             // libevent) this recursion is byte-identical to the old empty-slice
             // computation — `compute_port_key(leaf) == package_key(leaf_dir, tc,
             // &[])` — so warmed leaf-dep caches stay valid. (The recursion is

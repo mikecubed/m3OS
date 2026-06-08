@@ -13,14 +13,16 @@ MAINTAINER=m3os
 # so `git clone https://github.com/…` works over real TLS (cert chain + hostname
 # validated against the Phase 86a CA bundle). `NO_OPENSSL=1` stays — the TLS
 # backend is mbedTLS-via-curl, not OpenSSL. SSH clone/fetch/push (Phase 86b) is
-# served by the separate `ssh`/dropbear port via `GIT_SSH_COMMAND`, with git
-# reused unchanged there.
+# served by the separate `ssh`/dropbear port via `GIT_SSH`; the SSH transport is
+# orthogonal to git's curl linkage, so this same HTTPS-capable git binary serves
+# both transports.
 #
 # git's build is plain-Makefile (not autotools `./configure`), so the cross is
 # driven entirely by `CC=x86_64-linux-musl-gcc` — there is no `--host` flag to
 # pass. Dependencies: zlib (object/pack compression) + curl (HTTPS transport,
 # transitively pulling mbedtls + ca-certificates). The solver resolves the
-# dependency-first order zlib -> mbedtls -> curl -> ca-certificates -> git.
+# dependency-first order zlib -> mbedtls -> ca-certificates -> curl -> git
+# (ca-certificates is curl's runtime trust store, so it precedes curl).
 # zlib is consumed via git's `ZLIB_PATH`; curl via `CURL_CFLAGS`/`CURL_LDFLAGS`
 # (the static libcurl+mbedtls+zlib link line). SHA-1/SHA-256 are git built-ins.
 #

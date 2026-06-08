@@ -398,8 +398,11 @@ fi
 if [ "${M3OS_GIT_REGRESSION:-0}" = "1" ]; then
     echo "pre-push: running cargo xtask git-local-smoke..."
     # Phase 86c raised the timeout: git now depends on curl, so `pkg install git`
-    # pulls the curl+mbedtls+ca-certificates chain (~27 MB) over the slow VFS.
-    if ! cargo xtask git-local-smoke --timeout 1800; then
+    # pulls the curl+mbedtls+ca-certificates chain (~27 MB) over the slow VFS. The
+    # global is set above the 1800 s install-step ceiling so the boot/login + the
+    # local-repo workflow (init/add/commit/diff/log/branch/merge/status) keep
+    # headroom even if the install runs slow.
+    if ! cargo xtask git-local-smoke --timeout 2400; then
         echo "pre-push: cargo xtask git-local-smoke failed" >&2
         exit 1
     fi

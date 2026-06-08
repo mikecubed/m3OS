@@ -2,7 +2,7 @@ NAME=curl
 VERSION=8.15.0
 DESCRIPTION="curl/libcurl — static HTTP/HTTPS client (mbedTLS backend) for git smart-HTTP"
 CATEGORY=util
-DEPS=zlib mbedtls
+DEPS=zlib mbedtls ca-certificates
 URL=https://curl.se/download/curl-8.15.0.tar.xz
 SHA256=6cd0a8a5b126ddfda61c94dc2c3fc53481ba7a35461cf7c5ab66aa9d6775b609
 MAINTAINER=m3os
@@ -14,9 +14,11 @@ MAINTAINER=m3os
 # the rebuilt HTTPS git: its `.m3pkg` carries the linked TLS code, and git's
 # `DEPS` pulls it in (transitively pulling mbedtls + ca-certificates).
 #
-# DEPS encode the dependency-first build order zlib -> mbedtls -> curl (and git
-# then adds curl + ca-certificates), so the Phase 85a topological solver resolves
-# zlib -> mbedtls -> curl -> ca-certificates -> git.
+# DEPS = zlib + mbedtls (linked at build time) + ca-certificates (the runtime
+# trust store curl validates certs against). git adds curl, so the Phase 85a
+# topological solver resolves the dependency-first order
+# zlib -> mbedtls -> ca-certificates -> curl -> git (ca-certificates precedes curl
+# because curl depends on it).
 #
 # Build identity (see build_curl in xtask/src/port_build.rs):
 #   --with-mbedtls                  — curl's documented small-footprint TLS backend

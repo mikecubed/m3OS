@@ -210,9 +210,10 @@ const SMOKE_EXIT_CLANG_SMOKE_FAILED: i32 = 76;
 
 /// Phase 86b — `cargo xtask git-ssh-smoke` exit code. Distinct so CI can route a
 /// git-over-SSH failure separately. Boots m3OS, `pkg install ssh` (the static
-/// dropbear client) + reuses the Phase 85b `git` UNCHANGED, verifies the client
-/// runs and GitHub's host key is seeded, then — when SSH egress/creds are
-/// configured — clones a repo over `ssh://` via `GIT_SSH`.
+/// dropbear client) + reuses `git` via `GIT_SSH` (the SSH transport is orthogonal
+/// to git's internals; as of 86c that git is the HTTPS-capable build), verifies
+/// the client runs and GitHub's host key is seeded, then — when SSH egress/creds
+/// are configured — clones a repo over `ssh://` via `GIT_SSH`.
 const SMOKE_EXIT_GIT_SSH_SMOKE_FAILED: i32 = 77;
 
 /// Phase 86c — `cargo xtask git-https-smoke` exit code. Distinct so CI can route
@@ -13960,9 +13961,10 @@ fn git_local_smoke_steps() -> Vec<SmokeStep> {
 }
 
 /// Phase 86b — `cargo xtask git-ssh-smoke`. Cross-builds the static dropbear
-/// `ssh` client into a `.m3pkg`, reuses the Phase 85b `git` **unchanged**, builds
-/// a fresh image with both bundled into `/usr/pkg/` + GitHub's ed25519 host key
-/// seeded into `/root/.ssh/known_hosts`, boots m3OS, then over serial proves:
+/// `ssh` client into a `.m3pkg`, reuses `git` via `GIT_SSH` (the SSH transport is
+/// orthogonal to git's internals; as of 86c that git is the HTTPS-capable build),
+/// builds a fresh image with both bundled into `/usr/pkg/` + GitHub's ed25519 host
+/// key seeded into `/root/.ssh/known_hosts`, boots m3OS, then over serial proves:
 ///   1. `pkg install ssh` + `pkg install git` succeed from the offline repo;
 ///   2. the dropbear client *runs* inside m3OS (`dbclient -V` / `ssh -V`);
 ///   3. GitHub's host key is present as seeded TOFU data (round-trips the VFS).
@@ -13981,12 +13983,16 @@ fn git_local_smoke_steps() -> Vec<SmokeStep> {
 ///                                    (needs egress + a GitHub-registered key).
 ///   - `M3OS_GIT_SSH_REPO=<ssh-url>`→ override the default tiny clone target.
 fn cmd_git_ssh_smoke(args: &SmokeBootArgs) {
-    // The static dropbear `ssh` client is the only new artifact; the Phase 85b
-    // git is reused UNCHANGED (build_git_port is not modified). Both `.m3pkg`s
-    // must exist for the data disk to bundle into `/usr/pkg/`. A warm pkgcache
-    // makes both a zero-compiler hit (and the git hit *proves* git is not
-    // rebuilt). A missing musl cross-compiler is a build precondition, not a
-    // gate failure — SKIP with reason, mirroring tls-smoke/dns-smoke.
+    // The static dropbear `ssh` client is the only NEW artifact for git-over-SSH;
+    // git is reused via `GIT_SSH` (the SSH transport is orthogonal to git's
+    // internals). NOTE: as of Phase 86c, `build_git_port` builds the HTTPS-capable
+    // git (rebuilt WITH curl) and drives the whole zlib->mbedtls->ca-certificates->
+    // curl->git chain — so the git here is the 86c build, not the 85b local-only
+    // one. That is fine: git's SSH transport does not depend on whether git also
+    // links curl, and the SSH gate exercises only the ssh:// path. Both `.m3pkg`s
+    // must exist for the data disk to bundle into `/usr/pkg/`; a warm pkgcache
+    // makes them a zero-compiler hit. A missing musl cross-compiler is a build
+    // precondition, not a gate failure — SKIP with reason, mirroring tls/dns-smoke.
     if let Err(msg) = port_build::build_dropbear_port() {
         if msg.contains("no musl cross-compiler") {
             println!("git-ssh-smoke: SKIP (reason: {msg})");
@@ -14579,8 +14585,10 @@ fn git_https_smoke_steps(
     //    a "## Bundle of CA Root Certificates" comment header — distinctive text
     //    in the file CONTENT, never in the `head` command, so matching it proves
     //    the installed bundle is the real Mozilla root set, not an empty stub.
+    // m3OS's `head` supports only `-n N` (not the `-N` shorthand or `-c`), so use
+    // the POSIX `-n 2` form (a bare `-2` prints a usage error + exits).
     steps.push(SmokeStep::Send {
-        input: "head -2 /etc/ssl/certs/ca-certificates.crt\n",
+        input: "head -n 2 /etc/ssl/certs/ca-certificates.crt\n",
         label: "git-https-smoke: read the installed CA bundle header",
     });
     steps.push(SmokeStep::Wait {
@@ -14633,8 +14641,11 @@ fn git_https_smoke_steps(
     if attempt_net {
         let refs_url: &'static str =
             Box::leak(format!("{repo}/info/refs?service=git-upload-pack").into_boxed_str());
+        // `-L` follows any redirect so /tmp/h.txt holds the FINAL response headers
+        // (GitHub serves info/refs directly today, but stays robust if that changes
+        // or for a redirecting host).
         let refs_cmd: &'static str = Box::leak(
-            format!("curl -sS -D /tmp/h.txt -o /tmp/refs.txt '{refs_url}'\n").into_boxed_str(),
+            format!("curl -sSL -D /tmp/h.txt -o /tmp/refs.txt '{refs_url}'\n").into_boxed_str(),
         );
         steps.push(SmokeStep::Send {
             input: refs_cmd,
@@ -14650,8 +14661,11 @@ fn git_https_smoke_steps(
             timeout_secs: 60,
             label: "git-https-smoke: Content-Type is the smart-HTTP advertisement",
         });
+        // The first pkt-line of the body is `001e# service=git-upload-pack`; read
+        // it with `head -n 1` (m3OS head has no `-c`). The string only appears in
+        // the file content, never in this `head` command text.
         steps.push(SmokeStep::Send {
-            input: "head -c 30 /tmp/refs.txt\n",
+            input: "head -n 1 /tmp/refs.txt\n",
             label: "git-https-smoke: read info/refs pkt-line magic",
         });
         steps.push(SmokeStep::Wait {
@@ -18479,8 +18493,9 @@ fn populate_phase_69d_ports(part_path: &Path, workspace_root: &Path) {
     //
     // Phase 86c — mbedtls + curl are bundle-only too: they are git's HTTPS
     // transport dependencies (git.meta DEPS=`zlib curl`; curl.meta DEPS=`zlib
-    // mbedtls`), so `pkg install git` pulls them from /usr/pkg via the solver in
-    // the order zlib -> mbedtls -> curl -> ca-certificates -> git. They are NOT
+    // mbedtls ca-certificates`), so `pkg install git` pulls them from /usr/pkg via
+    // the solver in the order zlib -> mbedtls -> ca-certificates -> curl -> git.
+    // They are NOT
     // pre-installed (they are build-time libraries whose code is already linked
     // into the git helper); the .m3pkg only needs to exist for the solver to
     // resolve. The artifacts exist once build_git_port has built the chain (the
