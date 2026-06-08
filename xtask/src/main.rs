@@ -14189,7 +14189,11 @@ fn git_ssh_smoke_steps(
     //    then connect: dropbear compares the server's key during KEX (before
     //    auth, so no registered identity is needed) and must abort with
     //    "host key mismatch for", leaving the bad entry UNCHANGED (it must not
-    //    silently overwrite/accept). Then the good key is restored.
+    //    silently overwrite/accept). Then the good key is restored — and that
+    //    restore is now coherently visible to a subsequent freshly-fork/exec'd
+    //    dbclient (the clone), since vfs_server owns ext2 reads+writes as a
+    //    single engine (Phase 86b VFS-coherence fix). The plant/restore runs in
+    //    both net-only and clone modes.
     if attempt_net {
         // Injected by the WaitEither below when the *real* reject fires (branch a):
         // re-read known_hosts and prove dropbear left the planted (wrong) key on
@@ -14267,9 +14271,14 @@ fn git_ssh_smoke_steps(
     //    which scp-like syntax cannot). The packfile arriving + HEAD checking out
     //    is proven by reading a file from the cloned tree.
     if attempt_clone {
+        // Use GIT_SSH (git exec's the program DIRECTLY) rather than
+        // GIT_SSH_COMMAND (which git runs via `/bin/sh -c`, and m3OS's /bin/sh
+        // rejects that invocation with "either execute command or file(s)").
+        // dbclient auto-loads its default identity ~/.ssh/id_dropbear (= the
+        // staged /root/.ssh/id_dropbear), so no `-i` flag is needed.
         steps.push(SmokeStep::Send {
-            input: "export GIT_SSH_COMMAND='dbclient -i /root/.ssh/id_dropbear'\n",
-            label: "git-ssh-smoke: wire git -> dropbear via GIT_SSH_COMMAND",
+            input: "export GIT_SSH=/usr/bin/dbclient\n",
+            label: "git-ssh-smoke: wire git -> dropbear via GIT_SSH (direct exec)",
         });
         steps.push(SmokeStep::Sleep { millis: 200 });
         // Single-quote the URL — it contains `git@…`, which `ion` would otherwise
@@ -16643,9 +16652,12 @@ fn populate_ext2_files(
 
     // Phase 86b — optional SSH identity for the `git-ssh-smoke` live clone. When
     // `M3OS_GIT_SSH_KEY=<path>` points at a (GitHub-registered) private key, stage
-    // it as `/root/.ssh/id_dropbear` (mode 0600) so dropbear's `dbclient -i
-    // /root/.ssh/id_dropbear` can authenticate. Absent the env var this is empty,
-    // so routine images carry no key. dropbear reads OpenSSH-format private keys.
+    // it as `/root/.ssh/id_dropbear` (mode 0600) so dropbear (which auto-loads
+    // ~/.ssh/id_dropbear) can authenticate. Absent the env var this is empty, so
+    // routine images carry no key. NOTE: this client-only dropbear build reads
+    // its NATIVE key format, NOT OpenSSH — convert first:
+    //   dropbearconvert openssh dropbear id_openssh id_dropbear
+    // (an OpenSSH-format key makes dbclient abort with "String too long").
     let ssh_identity_cmds = match std::env::var("M3OS_GIT_SSH_KEY") {
         Ok(path) if !path.is_empty() => match fs::read(&path) {
             Ok(key_bytes) => {
