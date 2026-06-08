@@ -244,6 +244,26 @@ flowchart TD
     P91 -.-> P87
     P87 --> P88["Phase 88<br/>Claude Code"]
     P83 --> P89["Phase 89<br/>IPv6 / DHCPv6"]
+
+    %% USB class expansion (every USB feature deferred from Phase 78)
+    P78 --> P90["Phase 90<br/>USB Class Expansion"]
+
+    %% VFS throughput + stat correctness (surfaced by Phase 85; feed the heavy-I/O phases)
+    P85 --> P92["Phase 92<br/>VFS Bulk-I/O<br/>Throughput & Fairness"]
+    P85 --> P93["Phase 93<br/>VFS stat Conformance<br/>+ ext2 Consolidation"]
+    P92 --> P87
+    P93 --> P87
+    P92 --> P88
+    P93 --> P88
+
+    %% Rust toolchain growth: host-cross ports -> on-device toolchain
+    P44 --> P94["Phase 94<br/>Rust-Cargo Ports<br/>+ uutils"]
+    P85 --> P94
+    P91 --> P95["Phase 95<br/>Native Rust Toolchain<br/>(on-device rustc)"]
+    P94 --> P95
+    P85 --> P95
+    P92 -.-> P95
+    P93 -.-> P95
 ```
 
 ## Milestone Summary
