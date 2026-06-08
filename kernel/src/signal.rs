@@ -142,8 +142,12 @@ pub const SIGFRAME_SIZE: usize = 8 + 8 + 8 + 24 + SIGCONTEXT_SIZE + SIGMASK_SIZE
 
 // Offsets within the sigframe (from the frame base).
 const OFF_PRETCODE: usize = 0;
-#[allow(dead_code)] // layout constant for SA_SIGINFO support
-const OFF_UC_FLAGS: usize = 8;
+/// Base of the `ucontext_t` within the frame (immediately after `pretcode`).
+/// `uc_flags` is its first field. Phase 86d Track C — exposed so the signal
+/// dispatcher can hand the handler a valid `ucontext` pointer (RDX, the 3rd
+/// `SA_SIGINFO` argument); Go's `doSigPreempt` reads `uc_mcontext.gregs[RIP]`
+/// at `ucontext + 0xa8`, which faults if RDX is null.
+pub const OFF_UCONTEXT: usize = 8;
 #[allow(dead_code)] // layout constant for nested ucontext
 const OFF_UC_LINK: usize = 16;
 const OFF_UC_STACK: usize = 24;
@@ -173,7 +177,10 @@ const MC_RFLAGS: usize = 136;
 // Total sigcontext = 144 + 8 + 104 = 256 bytes ✓
 
 const OFF_SIGMASK: usize = OFF_MCONTEXT + SIGCONTEXT_SIZE; // 48 + 256 = 304
-const OFF_SIGINFO: usize = OFF_SIGMASK + SIGMASK_SIZE; // 304 + 128 = 432
+/// Offset of the `siginfo_t` within the frame. Phase 86d Track C — exposed so
+/// the dispatcher can pass the handler a valid `siginfo` pointer (RSI, the 2nd
+/// `SA_SIGINFO` argument).
+pub const OFF_SIGINFO: usize = OFF_SIGMASK + SIGMASK_SIZE; // 304 + 128 = 432
 
 /// User-space addresses on x86_64 must be in the lower canonical half
 /// (bit 47 clear).  The highest valid user address is 0x0000_7FFF_FFFF_FFFF.

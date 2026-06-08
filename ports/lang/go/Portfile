@@ -1,0 +1,27 @@
+NAME=go
+VERSION=1.24.6
+DESCRIPTION="Static Go runtime demonstrator (CGO_ENABLED=0, GOTOOLCHAIN=local)"
+CATEGORY=lang
+DEPS=
+URL=https://dl.google.com/go/go1.24.6.linux-amd64.tar.gz
+SHA256=bbca37cc395c974ffa4893ee35819ad23ebb27426df87af92e93a9ec66ef8712
+MAINTAINER=m3os
+
+# Phase 86d Track D — the Go-runtime gate. This port does NOT self-host the Go
+# toolchain on m3OS (self-hosting `go build` on-device is a Phase 86 deferral);
+# it downloads the official Go 1.24.6 binary toolchain *host-side* and uses it
+# to cross-compile a fully **static** linux/amd64 Go program — the same binary
+# class as static CPython/Clang, because m3OS's custom `ld-musl` has no real
+# `libc.so`. Build knobs (see build_go in xtask/src/port_build.rs):
+#   GOOS=linux GOARCH=amd64  — m3OS speaks the Linux x86_64 syscall ABI.
+#   CGO_ENABLED=0            — no C runtime; pure-Go static binary.
+#   GOTOOLCHAIN=local        — never auto-download a different toolchain.
+#   -trimpath -ldflags="-s -w" — reproducible, stripped.
+# The program (src/runtime_probe.go) exercises the runtime end-to-end: the
+# scheduler/GC start (GO_HELLO_OK), a goroutine on a second OS thread completes
+# a channel rendezvous (GO_GOROUTINE_OK), and a plaintext HTTP GET runs over the
+# in-kernel TCP stack (GO_HTTP_OK). No TLS — HTTPS-over-Go rides 86c (86e). The
+# runtime depends on the three Phase 86d kernel blockers being cleared: mmap
+# MAP_FIXED arena commit (Track A), edge-triggered epoll (Track B), and
+# SIGURG/tgkill (Track C), plus 86a's getrandom/AT_RANDOM. It is run with
+# GODEBUG=asyncpreemptoff=1 (the as-built preempt-delivery decision).

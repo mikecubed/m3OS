@@ -1400,6 +1400,9 @@ mod syscall_nr {
     pub const PSELECT6: u64 = 270;
     pub const EPOLL_CREATE1: u64 = 291;
     pub const PIPE2: u64 = 293;
+    // Phase 86d Track D — Go's netpoll (runtime/netpoll_epoll.go) issues
+    // `epoll_pwait`, not `epoll_wait`. Same args plus a (nil, for Go) sigmask.
+    pub const EPOLL_PWAIT: u64 = 281;
 
     // -- time --
     pub const NANOSLEEP: u64 = 35;
@@ -1950,6 +1953,14 @@ pub extern "C" fn syscall_handler(
             sys_select(arg0, arg1, arg2, exceptfds, timeout_ptr)
         }
         EPOLL_WAIT => {
+            let timeout = per_core_syscall_arg3();
+            sys_epoll_wait(arg0, arg1, arg2, timeout)
+        }
+        EPOLL_PWAIT => {
+            // Phase 86d Track D — Go's netpoll path. Args mirror epoll_wait
+            // (epfd, events, maxevents, timeout=r10); the sigmask (r8) /
+            // sigsetsize (r9) temporary mask-swap is ignored — Go always passes
+            // a nil sigmask, for which epoll_pwait is identical to epoll_wait.
             let timeout = per_core_syscall_arg3();
             sys_epoll_wait(arg0, arg1, arg2, timeout)
         }
@@ -2506,14 +2517,30 @@ fn deliver_user_signal(
     );
 
     // 4. Enter ring 3 at the handler address.
-    //    RIP = handler_entry, RSP = frame_rsp, RDI = signum (first arg).
-    //
-    //    We use a custom iretq sequence that also sets RDI.
-    unsafe { enter_signal_handler(handler_entry, frame_rsp, signum as u64, &regs) }
+    //    RIP = handler_entry, RSP = frame_rsp, and the System V handler ABI
+    //    args: RDI = signum, RSI = &siginfo, RDX = &ucontext. The latter two
+    //    are required by SA_SIGINFO handlers (Go installs one); without them a
+    //    handler that reads `ucontext->uc_mcontext.gregs[RIP]` (Go's
+    //    `doSigPreempt`, at ucontext+0xa8) dereferences a stale/null RDX and
+    //    faults. They are harmless for legacy non-SA_SIGINFO handlers, which
+    //    ignore RSI/RDX — Linux likewise always sets them for rt_sigframe.
+    let siginfo_ptr = frame_rsp + crate::signal::OFF_SIGINFO as u64;
+    let ucontext_ptr = frame_rsp + crate::signal::OFF_UCONTEXT as u64;
+    unsafe {
+        enter_signal_handler(
+            handler_entry,
+            frame_rsp,
+            signum as u64,
+            siginfo_ptr,
+            ucontext_ptr,
+            &regs,
+        )
+    }
 }
 
-/// Enter ring 3 at `handler` with `rsp` as the stack pointer and `rdi`
-/// set to the signal number (first argument to the handler).
+/// Enter ring 3 at `handler` with `rsp` as the stack pointer and the System V
+/// signal-handler arguments set: `rdi` = signal number, `rsi` = pointer to the
+/// `siginfo_t`, `rdx` = pointer to the `ucontext_t` (both within the sigframe).
 ///
 /// # Safety
 ///
@@ -2522,16 +2549,21 @@ unsafe fn enter_signal_handler(
     handler: u64,
     rsp: u64,
     sig: u64,
+    siginfo_ptr: u64,
+    ucontext_ptr: u64,
     saved_regs: &crate::signal::SavedUserRegs,
 ) -> ! {
     unsafe {
         // Build a modified copy of the interrupted user context: RIP→handler,
-        // RSP→sigframe, RDI→signal number. All other GPRs retain the
-        // interrupted values so no kernel register state leaks to ring 3.
+        // RSP→sigframe, and the handler ABI args (RDI/RSI/RDX). All other GPRs
+        // retain the interrupted values so no kernel register state leaks to
+        // ring 3.
         let mut regs = *saved_regs;
         regs.rip = handler;
         regs.rsp = rsp;
         regs.rdi = sig;
+        regs.rsi = siginfo_ptr;
+        regs.rdx = ucontext_ptr;
         restore_and_enter_userspace(&regs)
     }
 }
