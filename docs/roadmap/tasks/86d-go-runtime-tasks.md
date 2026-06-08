@@ -1,6 +1,6 @@
 # Phase 86d — Go-Runtime Gate: Task List
 
-**Status:** Planned
+**Status:** In Progress
 **Source Ref:** phase-86d
 **Depends on:** Phase 86a (Outbound Foundation — `getrandom` CSPRNG + `AT_RANDOM`), Phase 37 (I/O Multiplexing) ✅, Phase 40 (Threading) ✅, Phase 36 (Expanded Memory) ✅, Phase 45 (Ports System) ✅, Phase 85 (Cross-Compiled Toolchains) ✅
 **Goal:** Clear the three kernel blockers that stop a static (`CGO_ENABLED=0`) Go binary from running — `mmap` `MAP_FIXED` + `PROT_NONE` arena reservations (hard), edge-triggered `EPOLLET` + `EPOLLRDHUP` (hard), and `SIGURG`-based async preemption via `tgkill` (soft) — then ship `ports/lang/go` as a `.m3pkg` and prove the runtime with a goroutine rendezvous + plaintext HTTP GET over the in-kernel TCP stack, all without 86c. Bump the kernel to `0.86.3`.
@@ -11,10 +11,12 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | `mmap` `MAP_FIXED` exact-address commit + `PROT_NONE` reservations (hard blocker 1) | 86a | Planned |
-| B | Edge-triggered `epoll` — `EPOLLET` per-interest edge state + `EPOLLRDHUP` (hard blocker 2) | — | Planned |
+| A | `mmap` `MAP_FIXED` exact-address commit + `PROT_NONE` reservations (hard blocker 1) | 86a | In Progress |
+| B | Edge-triggered `epoll` — `EPOLLET` per-interest edge state + `EPOLLRDHUP` (hard blocker 2) | — | In Progress |
 | C | Signals — `SIGURG`/`tgkill`/`sched_yield`/`madvise` + preempt-delivery decision (soft blocker) | A, B | Planned |
 | D | `ports/lang/go` + split plaintext smoke gate + version bump | A, B, C | Planned |
+
+> **Execution note (parallel-impl).** Tracks A and B are independent (disjoint regions of `mod.rs`, ~10k lines apart) and run as parallel implementer tracks (concurrency cap 2). Track C depends on A+B and Track D on all, so they run serially after. Integration, all `cargo xtask check`/QEMU validation, and the Go smoke gate are owned by the coordinator. Branch: `feat/86d-go-runtime`.
 
 ---
 
