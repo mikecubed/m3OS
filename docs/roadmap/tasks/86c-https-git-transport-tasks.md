@@ -15,7 +15,7 @@
 |---|---|---|---|
 | A | mbedTLS port (trimmed client-only, CSPRNG entropy) | 86a Track A | ✅ Done (built + entropy self-test PASS) |
 | B | curl port + git HTTPS rebuild (invert `NO_CURL` assertions) | A, 86b | ✅ Done (curl libcurl/8.15 mbedTLS/3.6.2; git inverted assertions PASS) |
-| C | Cert/hostname validation + PAT creds + smoke gate + version | B, 86a Track B/C | In progress |
+| C | Cert/hostname validation + PAT creds + smoke gate + version | B, 86a Track B/C | ✅ Done (gitconfig trust + PAT, git-https-smoke gate, kernel 0.86.2) |
 
 ---
 

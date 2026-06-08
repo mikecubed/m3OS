@@ -14592,12 +14592,17 @@ fn git_https_smoke_steps(
     // 5. (Opt-in, needs egress) NEGATIVE arm — a bad certificate must be REJECTED.
     //    self-signed.badssl.com presents a self-signed leaf; with http.sslVerify
     //    on, git's curl+mbedTLS path must FAIL the TLS handshake at chain
-    //    validation rather than proceed. Two acceptable curl/mbedTLS rejection
-    //    phrasings are matched; a successful transfer ("Cloning into" reaching
-    //    "Receiving objects") would mean verification was off — the WaitEither
-    //    times out on any non-rejection outcome (no "Receiving objects" can appear
-    //    for a self-signed host whose handshake aborts), failing the gate. This
-    //    arm needs NO secret — the cert is compared before any auth.
+    //    validation rather than proceed. The exact curl+mbedTLS verify-failure
+    //    wording varies (curl's generic "SSL certificate problem", curl's
+    //    "server certificate verification failed", or mbedTLS's "X509 -
+    //    Certificate verification failed"), so the WaitEither matches the
+    //    lowercase "certificate" OR the capitalized "Certificate" substring — a
+    //    strict superset that covers every known phrasing while still being
+    //    cert-specific (a successful clone or a non-TLS error prints neither). A
+    //    successful transfer would mean verification was off — the WaitEither
+    //    times out on any non-rejection outcome (a self-signed host whose
+    //    handshake aborts never reaches "Receiving objects"), failing the gate.
+    //    This arm needs NO secret — the cert is compared before any auth.
     if attempt_net {
         let bad_clone_cmd: &'static str =
             Box::leak(format!("git clone --depth 1 '{bad_repo}' /tmp/badclone\n").into_boxed_str());
@@ -14606,10 +14611,10 @@ fn git_https_smoke_steps(
             label: "git-https-smoke: clone a self-signed-cert host (must reject)",
         });
         steps.push(SmokeStep::WaitEither {
-            // curl's generic verify-fail wording (CURLE_PEER_FAILED_VERIFICATION)…
-            pattern_a: "SSL certificate problem",
-            // …or the mbedTLS/curl backend's explicit verify-failure wording.
-            pattern_b: "certificate verif",
+            // Any cert-rejection wording contains "certificate" or "Certificate";
+            // a clone success / non-TLS failure contains neither.
+            pattern_a: "certificate",
+            pattern_b: "Certificate",
             timeout_secs: 120,
             label: "git-https-smoke: self-signed cert REJECTED (TLS fails closed)",
             extra_steps_a: &[],
