@@ -713,6 +713,11 @@ impl Ext2State {
         file_type: u8,
     ) -> Result<(), u64> {
         let name_bytes = name.as_bytes();
+        // ext2 stores `name_len` in a single byte; a longer name would truncate
+        // via the `as u8` writes below and corrupt the directory. Reject it.
+        if name_bytes.len() > 255 {
+            return Err(NEG_EINVAL);
+        }
         let needed_size = (8 + name_bytes.len()).div_ceil(4) * 4;
         let dir_size = dir_inode.size as u64;
         let bs = self.block_size as u64;
@@ -774,6 +779,44 @@ impl Ext2State {
         self.write_inode(dir_inode_num, dir_inode)
             .map_err(|_| NEG_EIO)?;
         Ok(())
+    }
+
+    /// Repoint a directory's ".." entry to `new_parent`. Used after a directory
+    /// is moved across parents so `<new_parent>/<dir>/..` resolves correctly
+    /// (`resolve_path` treats ".." as a normal directory entry).
+    fn update_dotdot(&mut self, dir_inode: &Ext2Inode, new_parent: u32) -> Result<(), u64> {
+        let bs = self.block_size as u64;
+        let num_blocks = (dir_inode.size as u64).div_ceil(bs) as u32;
+
+        for logical_block in 0..num_blocks {
+            let phys_block = self
+                .resolve_block(dir_inode, logical_block)
+                .map_err(|_| NEG_EIO)?;
+            if phys_block == 0 {
+                continue;
+            }
+            let mut block_data = self.read_block(phys_block).map_err(|_| NEG_EIO)?;
+            let mut off = 0;
+            while off + 8 <= block_data.len() {
+                let rec_len =
+                    u16::from_le_bytes([block_data[off + 4], block_data[off + 5]]) as usize;
+                if rec_len == 0 {
+                    break;
+                }
+                let entry_name_len = block_data[off + 6] as usize;
+                if entry_name_len == 2
+                    && off + 10 <= block_data.len()
+                    && &block_data[off + 8..off + 10] == b".."
+                {
+                    block_data[off..off + 4].copy_from_slice(&new_parent.to_le_bytes());
+                    self.write_block(phys_block, &block_data)
+                        .map_err(|_| NEG_EIO)?;
+                    return Ok(());
+                }
+                off += rec_len;
+            }
+        }
+        Err(NEG_EIO)
     }
 
     /// Remove a directory entry by name (merging the slot into its predecessor).
@@ -2177,6 +2220,9 @@ fn handle_rename(
     {
         np.links_count = np.links_count.saturating_add(1);
         let _ = ext2.write_inode(new_parent, &np);
+        // Repoint the moved directory's ".." at its new parent so
+        // /new_parent/dir/.. no longer resolves to the old parent.
+        let _ = ext2.update_dotdot(&src_inode, new_parent);
     }
 
     // Remove the old directory entry (do NOT reclaim the inode — it now lives

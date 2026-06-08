@@ -414,7 +414,7 @@ fi
 # (clang-class) timeout is a ceiling for the slow packfile transfer when the clone
 # is enabled; the core path finishes well under it. Set it on branches that touch
 # ports/util/dropbear, xtask's build_dropbear / ssh bundling / known_hosts
-# seeding, or the GIT_SSH_COMMAND wiring.
+# seeding, or the GIT_SSH wiring.
 if [ "${M3OS_GIT_SSH_REGRESSION:-0}" = "1" ]; then
     echo "pre-push: running cargo xtask git-ssh-smoke..."
     if ! cargo xtask git-ssh-smoke --timeout 5400; then
