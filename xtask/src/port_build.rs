@@ -409,6 +409,23 @@ fn build_recipe_id(name: &str) -> &'static str {
              --host=x86_64-linux-musl --prefix=/usr);cflags:-O2;ldflags:-static;\
              stage=prune(share/man)+ssh-copy(/usr/bin/ssh<-dbclient);recipe-v=2"
         }
+        // Phase 86c Track A — mbedTLS static archives (curl --with-mbedtls
+        // backend). Identity: `make lib` (no programs/tests) + the config.py
+        // trim from the shipped default (client-only: SSL_SRV_C/DTLS off, NET_C
+        // off; TLS1.3 on) + the sys_getrandom entropy swap (NO_PLATFORM_ENTROPY +
+        // ENTROPY_HARDWARE_ALT + the mbedtls_hardware_poll shim) + the manual
+        // headers(mbedtls,psa)+3-archive install. Bump recipe-v whenever any of
+        // these change so the cached .m3pkg self-invalidates. (The pinned mbedTLS
+        // version + its tarball SHA-256 are folded in via the Portfile digest.)
+        "mbedtls" => {
+            "make:lib(static archives only,CC/AR cross,CFLAGS=-O2);\
+             config.py(from-default unset:SSL_SRV_C,SSL_PROTO_DTLS,SSL_DTLS_ANTI_REPLAY,\
+             SSL_DTLS_HELLO_VERIFY,SSL_DTLS_SRTP,SSL_DTLS_CONNECTION_ID,NET_C \
+             set:SSL_PROTO_TLS1_3,NO_PLATFORM_ENTROPY,ENTROPY_HARDWARE_ALT);\
+             entropy:mbedtls_hardware_poll->getrandom(318),ar-into-libmbedcrypto;\
+             verify:config-on/off+entropy-self-test+no-/dev/urandom;\
+             install:headers(mbedtls,psa)+libmbed{crypto,x509,tls}.a->/usr/local;recipe-v=1"
+        }
         _ => "",
     }
 }
@@ -635,6 +652,10 @@ pub fn port_deps(name: &str) -> &'static [&'static str] {
         // Phase 86a Track C.2 — the Mozilla CA bundle is a self-contained data
         // file (no libraries required at build or install time).
         "ca-certificates" => &[],
+        // Phase 86c Track A — mbedTLS is a leaf: its static archives are linked
+        // into curl/git at build time, so it has no build or runtime deps of its
+        // own (and nothing `pkg install`s it directly — curl carries the code).
+        "mbedtls" => &[],
         // Phase 86b — dropbear is built `--disable-zlib` (SSH compression is
         // optional; GitHub accepts `none`) and links its bundled libtomcrypt/
         // libtommath statically, so the client has NO runtime dependency: in-OS
@@ -937,6 +958,7 @@ fn port_build(name: &str) -> Result<(), String> {
         "python" => build_python(&extracted, &stage, &toolchain, &zlib_stage, &ncurses_stage)?,
         "llvm" => build_llvm(&extracted, &stage, &toolchain)?,
         "dropbear" => build_dropbear(&extracted, &stage, &toolchain)?,
+        "mbedtls" => build_mbedtls(&extracted, &stage, &toolchain)?,
         _ => return Err(format!("no host build recipe for port {name}")),
     }
 
@@ -1827,6 +1849,299 @@ fn build_dropbear(
     println!(
         "dropbear: produced /usr/bin/dbclient + /usr/bin/ssh ({} bytes each, static)",
         file_size(&dbclient)
+    );
+    Ok(())
+}
+
+/// Phase 86c Track A — the hardware-entropy poll the trimmed mbedTLS config binds
+/// CTR_DRBG to. `MBEDTLS_ENTROPY_HARDWARE_ALT` makes mbedTLS call this symbol as
+/// its strong entropy source; `MBEDTLS_NO_PLATFORM_ENTROPY` removes the
+/// `/dev/urandom` / file-I/O path, so this is the SOLE source. It reads the
+/// Phase 86a CSPRNG via `getrandom(2)` (Linux syscall 318, which m3OS implements
+/// as `sys_getrandom`). The loop tolerates short reads + `EINTR`; any other error
+/// returns `MBEDTLS_ERR_ENTROPY_SOURCE_FAILED` (-0x003C) so the handshake
+/// fails-closed rather than seeding from a weak source.
+const M3OS_MBEDTLS_HW_ENTROPY_C: &str = r#"/* Phase 86c — m3OS mbedTLS hardware-entropy shim (sys_getrandom CSPRNG). */
+#include <stddef.h>
+#include <errno.h>
+#include <sys/random.h>
+
+int mbedtls_hardware_poll(void *data, unsigned char *output,
+                          size_t len, size_t *olen)
+{
+    (void) data;
+    size_t got = 0;
+    while (got < len) {
+        ssize_t r = getrandom(output + got, len - got, 0);
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;
+            return -0x003C; /* MBEDTLS_ERR_ENTROPY_SOURCE_FAILED */
+        }
+        got += (size_t) r;
+    }
+    *olen = got;
+    return 0;
+}
+"#;
+
+/// Phase 86c Track A.2 — build-time self-test of the entropy callback (linked
+/// against the same shim object that ships in `libmbedcrypto.a`). On the build
+/// host `getrandom(2)` is also syscall 318, so this exercises the real shim:
+/// it asserts (a) the callback fills exactly the requested length and (b) two
+/// successive draws differ (non-constant). A regression in the shim or in the
+/// `NO_PLATFORM_ENTROPY`/`HARDWARE_ALT` config fails the build immediately.
+const M3OS_MBEDTLS_ENTROPY_TEST_C: &str = r#"#include <stdio.h>
+#include <string.h>
+#include <stddef.h>
+int mbedtls_hardware_poll(void *, unsigned char *, size_t, size_t *);
+int main(void) {
+    unsigned char a[32], b[32];
+    size_t oa = 0, ob = 0;
+    if (mbedtls_hardware_poll((void*)0, a, sizeof a, &oa) != 0) { printf("FAIL poll a\n"); return 2; }
+    if (mbedtls_hardware_poll((void*)0, b, sizeof b, &ob) != 0) { printf("FAIL poll b\n"); return 3; }
+    if (oa != sizeof a || ob != sizeof b) { printf("FAIL olen %zu %zu\n", oa, ob); return 4; }
+    if (memcmp(a, b, sizeof a) == 0) { printf("FAIL constant\n"); return 5; }
+    printf("ENTROPY_OK olen=%zu\n", oa);
+    return 0;
+}
+"#;
+
+/// True iff `header` has an ACTIVE (non-commented) `#define <sym>` line — i.e. the
+/// option is enabled. `scripts/config.py unset` rewrites `#define X` to
+/// `//#define X`, so a commented line correctly reads as disabled.
+fn mbedtls_config_enabled(header: &str, sym: &str) -> bool {
+    let exact = format!("#define {sym}");
+    let valued = format!("#define {sym} ");
+    header
+        .lines()
+        .map(str::trim_start)
+        .any(|l| l == exact || l.starts_with(&valued))
+}
+
+/// Phase 86c Track A — cross-compile mbedTLS ≥3.6.1 as static archives for the
+/// curl `--with-mbedtls` TLS backend (and, through curl, the rebuilt HTTPS git).
+///
+/// mbedTLS is a build-time library only: its three archives
+/// (`libmbedcrypto.a` + `libmbedx509.a` + `libmbedtls.a`) are linked statically
+/// into `libcurl`/`git`, so it ships no binaries and nothing `pkg install`s it
+/// directly. The trimmed config is derived from the shipped DEFAULT via
+/// `scripts/config.py` (guaranteed self-consistent, passes `check_config.h`),
+/// edited IN PLACE so the installed `mbedtls_config.h` is byte-identical to the
+/// one the libraries were compiled with — curl/git then see the exact same config
+/// (no struct-size ABI skew). The trim: CLIENT-ONLY (`MBEDTLS_SSL_SRV_C` off,
+/// DTLS off), TLS 1.2 + 1.3, with ChaCha20-Poly1305 + ECDHE-ECDSA-P256 (the
+/// constant-time p256-m, no assembly) + ECDHE-RSA + `MBEDTLS_X509_CRT_PARSE_C` +
+/// `MBEDTLS_PEM_PARSE_C` (all on in the default and verified-by-construction
+/// below). The CTR_DRBG entropy source is swapped to the Phase 86a `sys_getrandom`
+/// CSPRNG (`MBEDTLS_ENTROPY_HARDWARE_ALT` + the `mbedtls_hardware_poll` shim) with
+/// the `/dev/urandom` platform path removed (`MBEDTLS_NO_PLATFORM_ENTROPY`).
+fn build_mbedtls(
+    src: &Path,
+    stage: &Path,
+    (cc, ar, ranlib): &(&'static str, String, String),
+) -> Result<(), String> {
+    let prefix = stage.join("usr/local");
+    fs::create_dir_all(prefix.join("lib")).map_err(|e| format!("mkdir lib: {e}"))?;
+    fs::create_dir_all(prefix.join("include")).map_err(|e| format!("mkdir include: {e}"))?;
+
+    // ── 1) Derive the trimmed client-only config from the shipped default ─────
+    // `scripts/config.py` edits `include/mbedtls/mbedtls_config.h` in place. The
+    // default config is a complete, check_config-passing TLS client+server config;
+    // we unset the server/DTLS surface and swap the entropy source. Each op is
+    // individually safe (the default already satisfies every crypto dependency).
+    let config_py = src.join("scripts/config.py");
+    if !config_py.exists() {
+        return Err(format!(
+            "mbedtls build: {} missing (the RELEASE-asset tarball is required, not the tag tarball)",
+            config_py.display()
+        ));
+    }
+    let config_ops: &[(&str, &str)] = &[
+        // Client-only: drop the server half of TLS entirely.
+        ("unset", "MBEDTLS_SSL_SRV_C"),
+        // No DTLS (and its sub-features) — git speaks HTTPS over TCP only.
+        ("unset", "MBEDTLS_SSL_PROTO_DTLS"),
+        ("unset", "MBEDTLS_SSL_DTLS_ANTI_REPLAY"),
+        ("unset", "MBEDTLS_SSL_DTLS_HELLO_VERIFY"),
+        ("unset", "MBEDTLS_SSL_DTLS_SRTP"),
+        ("unset", "MBEDTLS_SSL_DTLS_CONNECTION_ID"),
+        // curl owns the socket I/O (mbedtls_ssl_set_bio with curl's send/recv),
+        // so mbedTLS's own BSD-socket layer is unused.
+        ("unset", "MBEDTLS_NET_C"),
+        // TLS 1.3 (GitHub serves it); idempotent if already on in the default.
+        ("set", "MBEDTLS_SSL_PROTO_TLS1_3"),
+        // Entropy: sys_getrandom CSPRNG only — no /dev/urandom / file-I/O path.
+        ("set", "MBEDTLS_NO_PLATFORM_ENTROPY"),
+        ("set", "MBEDTLS_ENTROPY_HARDWARE_ALT"),
+    ];
+    for (op, sym) in config_ops {
+        let mut c = Command::new("python3");
+        c.current_dir(src).arg("scripts/config.py").arg(op).arg(sym);
+        run(&mut c, &format!("mbedtls config.py {op} {sym}"))?;
+    }
+
+    // Verify-by-construction (A.1): the installed config must match the spec.
+    let config_path = src.join("include/mbedtls/mbedtls_config.h");
+    let config_text = fs::read_to_string(&config_path)
+        .map_err(|e| format!("mbedtls: read config {}: {e}", config_path.display()))?;
+    for must_on in [
+        "MBEDTLS_SSL_CLI_C",
+        "MBEDTLS_SSL_PROTO_TLS1_2",
+        "MBEDTLS_SSL_PROTO_TLS1_3",
+        "MBEDTLS_CHACHAPOLY_C",
+        "MBEDTLS_CHACHA20_C",
+        "MBEDTLS_POLY1305_C",
+        "MBEDTLS_ECDH_C",
+        "MBEDTLS_ECDSA_C",
+        "MBEDTLS_X509_CRT_PARSE_C",
+        "MBEDTLS_PEM_PARSE_C",
+        "MBEDTLS_CTR_DRBG_C",
+        "MBEDTLS_ENTROPY_C",
+        "MBEDTLS_ENTROPY_HARDWARE_ALT",
+        "MBEDTLS_NO_PLATFORM_ENTROPY",
+    ] {
+        if !mbedtls_config_enabled(&config_text, must_on) {
+            return Err(format!(
+                "mbedtls build: required option {must_on} is not enabled in the trimmed config"
+            ));
+        }
+    }
+    for must_off in [
+        "MBEDTLS_SSL_SRV_C",
+        "MBEDTLS_SSL_PROTO_DTLS",
+        "MBEDTLS_NET_C",
+    ] {
+        if mbedtls_config_enabled(&config_text, must_off) {
+            return Err(format!(
+                "mbedtls build: option {must_off} is still enabled — client-only trim did not take effect"
+            ));
+        }
+    }
+    // SECP256R1 (the GitHub leaf curve) must be present for ECDHE-ECDSA-P256.
+    if !mbedtls_config_enabled(&config_text, "MBEDTLS_ECP_DP_SECP256R1_ENABLED") {
+        return Err(
+            "mbedtls build: SECP256R1 (P-256) curve disabled — cannot validate GitHub's ECDSA leaf"
+                .to_string(),
+        );
+    }
+
+    // ── 2) Build ONLY the static libraries (no programs, no tests) ────────────
+    // mbedTLS uses a plain Makefile (not autotools); the cross is driven by
+    // CC/AR passed as make ARGUMENTS (command-line assignments override the
+    // Makefile's `?=` defaults). CFLAGS is fixed to -O2; the Makefile's own
+    // WARNING_CFLAGS + `-I../include` live in LOCAL_CFLAGS and are unaffected.
+    let mut make_cmd = Command::new("make");
+    make_cmd
+        .current_dir(src)
+        .arg(format!("-j{}", num_jobs()))
+        .arg(format!("CC={cc}"))
+        .arg(format!("AR={ar}"))
+        .arg("CFLAGS=-O2")
+        .arg("lib");
+    run(&mut make_cmd, "mbedtls make lib")?;
+
+    let library = src.join("library");
+    let libcrypto = library.join("libmbedcrypto.a");
+    for a in ["libmbedcrypto.a", "libmbedx509.a", "libmbedtls.a"] {
+        let p = library.join(a);
+        if !p.exists() {
+            return Err(format!("mbedtls build missing {}", p.display()));
+        }
+    }
+
+    // ── 3) Compile the entropy shim + fold it into libmbedcrypto.a ────────────
+    // MBEDTLS_ENTROPY_HARDWARE_ALT makes the entropy module reference an external
+    // `mbedtls_hardware_poll`; adding the object to the crypto archive resolves it
+    // for every downstream link (curl, git) with no extra link flags.
+    let shim_c = library.join("m3os_hw_entropy.c");
+    fs::write(&shim_c, M3OS_MBEDTLS_HW_ENTROPY_C)
+        .map_err(|e| format!("mbedtls: write entropy shim: {e}"))?;
+    let shim_o = library.join("m3os_hw_entropy.o");
+    let mut cc_cmd = Command::new(cc);
+    cc_cmd
+        .current_dir(src)
+        .arg("-O2")
+        .arg("-Iinclude")
+        .arg("-c")
+        .arg("library/m3os_hw_entropy.c")
+        .arg("-o")
+        .arg("library/m3os_hw_entropy.o");
+    run(&mut cc_cmd, "mbedtls entropy-shim compile")?;
+    let mut ar_cmd = Command::new(ar);
+    ar_cmd.arg("r").arg(&libcrypto).arg(&shim_o);
+    run(&mut ar_cmd, "mbedtls ar add entropy-shim")?;
+    let mut ranlib_cmd = Command::new(ranlib);
+    ranlib_cmd.arg(&libcrypto);
+    run(&mut ranlib_cmd, "mbedtls ranlib libmbedcrypto.a")?;
+
+    // ── 4) A.2 — build-time entropy self-test (length + non-constant) ─────────
+    let test_c = src.join("m3os_entropy_test.c");
+    fs::write(&test_c, M3OS_MBEDTLS_ENTROPY_TEST_C)
+        .map_err(|e| format!("mbedtls: write entropy test: {e}"))?;
+    let test_bin = src.join("m3os_entropy_test");
+    let mut test_cc = Command::new(cc);
+    test_cc
+        .current_dir(src)
+        .arg("-O2")
+        .arg("-static")
+        .arg("m3os_entropy_test.c")
+        .arg("library/m3os_hw_entropy.o")
+        .arg("-o")
+        .arg("m3os_entropy_test");
+    run(&mut test_cc, "mbedtls entropy self-test compile")?;
+    let test_out = Command::new(&test_bin)
+        .output()
+        .map_err(|e| format!("mbedtls entropy self-test: spawn: {e}"))?;
+    let test_stdout = String::from_utf8_lossy(&test_out.stdout);
+    if !test_out.status.success() || !test_stdout.contains("ENTROPY_OK") {
+        return Err(format!(
+            "mbedtls build: entropy callback self-test FAILED (status {:?}, stdout {:?}, stderr {:?})",
+            test_out.status.code(),
+            test_stdout.trim(),
+            String::from_utf8_lossy(&test_out.stderr).trim()
+        ));
+    }
+    println!("mbedtls: entropy self-test: {}", test_stdout.trim());
+
+    // ── 5) Prove no file-I/O entropy path is linked ───────────────────────────
+    // The platform poll's "/dev/urandom" string only lands in entropy_poll.o when
+    // MBEDTLS_NO_PLATFORM_ENTROPY is undefined; with it set, that code is #if'd
+    // out so the archive cannot contain the string. Direct, toolchain-independent
+    // proof that entropy is sys_getrandom-only.
+    if binary_contains(&libcrypto, b"/dev/urandom")? {
+        return Err(
+            "mbedtls build: libmbedcrypto.a references /dev/urandom — NO_PLATFORM_ENTROPY \
+             ineffective (entropy must be sys_getrandom only)"
+                .to_string(),
+        );
+    }
+
+    // ── 6) Install: headers (incl. the in-place-edited config) + the archives ──
+    // mbedTLS's `make install` uses a confusing DESTDIR-as-prefix convention, so
+    // copy explicitly. The installed mbedtls_config.h IS the trimmed one, so curl
+    // and git compile against the exact config the archives were built with.
+    for hdr in ["mbedtls", "psa"] {
+        let mut cp = Command::new("cp");
+        cp.arg("-r")
+            .arg(src.join("include").join(hdr))
+            .arg(prefix.join("include"));
+        run(&mut cp, &format!("mbedtls cp include/{hdr}"))?;
+    }
+    for a in ["libmbedcrypto.a", "libmbedx509.a", "libmbedtls.a"] {
+        fs::copy(library.join(a), prefix.join("lib").join(a))
+            .map_err(|e| format!("mbedtls: install {a}: {e}"))?;
+    }
+    if !prefix.join("include/mbedtls/ssl.h").exists() {
+        return Err("mbedtls build: installed headers missing mbedtls/ssl.h".to_string());
+    }
+
+    println!(
+        "mbedtls: produced static libmbedcrypto.a ({} bytes) + libmbedx509.a ({} bytes) + \
+         libmbedtls.a ({} bytes); client-only TLS1.2/1.3, entropy=sys_getrandom (no /dev/urandom)",
+        file_size(&prefix.join("lib/libmbedcrypto.a")),
+        file_size(&prefix.join("lib/libmbedx509.a")),
+        file_size(&prefix.join("lib/libmbedtls.a")),
     );
     Ok(())
 }

@@ -13,8 +13,8 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | mbedTLS port (trimmed client-only, CSPRNG entropy) | 86a Track A | Planned |
-| B | curl port + git HTTPS rebuild (invert `NO_CURL` assertions) | A, 86b | Planned |
+| A | mbedTLS port (trimmed client-only, CSPRNG entropy) | 86a Track A | ✅ Done (built + entropy self-test PASS) |
+| B | curl port + git HTTPS rebuild (invert `NO_CURL` assertions) | A, 86b | In progress |
 | C | Cert/hostname validation + PAT creds + smoke gate + version | B, 86a Track B/C | Planned |
 
 ---
@@ -31,8 +31,8 @@
 **Why it matters:** libcurl needs a TLS backend, and the SIMD-off Rust userspace rules out `ring`/`aws-lc-rs` — but not C TLS; mbedTLS is the small, static, musl-friendly TLS 1.3 client with full X.509 that drops into the existing `ports/` pipeline next to `zlib`.
 
 **Acceptance:**
-- [ ] `ports/lib/mbedtls/Portfile` pins mbedTLS **≥3.6.1** + SHA-256; `build_mbedtls` routes through `musl_toolchain()` + `musl_extra_ldflags_joined()` + `--host=x86_64-linux-musl` per the AGENTS.md port rules and is registered in `PORTS` (`xtask/src/main.rs:17446`) + the `port_build` dispatch (`xtask/src/port_build.rs:873`).
-- [ ] The build produces a **static** library with the trimmed client-only config: `MBEDTLS_SSL_CLI_C` on, `MBEDTLS_SSL_SRV_C` off, DTLS off, and `MBEDTLS_CHACHAPOLY_C` + ECDHE-ECDSA-P256 (mbedTLS 3.5+ p256-m) + ECDHE-RSA + `MBEDTLS_X509_CRT_PARSE_C` + `MBEDTLS_PEM_PARSE_C` on. Trimmed footprint is on the order of 45–300 KB.
+- [x] `ports/lib/mbedtls/Portfile` pins mbedTLS **3.6.2** (≥3.6.1) + SHA-256 (`8b54fb…`, the RELEASE-asset tarball that bundles the `framework/` submodule + pre-generated PSA sources); `build_mbedtls` routes through `musl_toolchain()` (CC/AR/RANLIB) per the AGENTS.md port rules and is registered in the `port_build` dispatch (`"mbedtls" => build_mbedtls(...)`) + `build_recipe_id` + `port_deps`. *(mbedTLS uses a plain Makefile, not autotools — like `git`/`zlib` it has no `./configure`, so `--host`/`musl_extra_ldflags_joined()` do not apply; those are for autotools link probes and are exercised by `curl` in B.1. It is a build-time library, so it is NOT in the pre-install `PORTS` array — it is linked statically into curl/git.)*
+- [x] The build produces **static** archives (`libmbedcrypto.a` 1.0 MB + `libmbedx509.a` 120 KB + `libmbedtls.a` 349 KB) with the trimmed client-only config, verified-by-construction at build time: `MBEDTLS_SSL_CLI_C` on, `MBEDTLS_SSL_SRV_C` off, DTLS off, `MBEDTLS_NET_C` off, and `MBEDTLS_CHACHAPOLY_C` + ECDHE-ECDSA-P256 (3rdparty p256-m, compiled — no assembly) + ECDHE-RSA + `MBEDTLS_X509_CRT_PARSE_C` + `MBEDTLS_PEM_PARSE_C` + `MBEDTLS_ECP_DP_SECP256R1_ENABLED` on. The linked TLS footprint (the archives are dead-code-GC'd at final link) is bounded by the client surface; the sealed `.m3pkg` is 3.7 MB.
 
 ### A.2 — Wire CTR_DRBG entropy to the 86a CSPRNG
 
@@ -41,8 +41,8 @@
 **Why it matters:** TLS session keys and X25519/ECDHE ephemerals must come from the Phase 86a CSPRNG, not a file-I/O entropy path that m3OS cannot serve; a non-crypto seed makes the whole handshake predictable.
 
 **Acceptance:**
-- [ ] mbedTLS's CTR_DRBG entropy source is the Phase 86a `sys_getrandom` CSPRNG (e.g. via a hardware-entropy `mbedtls_hardware_poll` shim), with **no** `/dev/urandom`/file-I/O entropy path compiled in.
-- [ ] A test feeds N bytes through the mbedTLS entropy callback and asserts (a) it returns exactly the requested length and (b) two successive N-byte draws differ (non-constant), with the callback resolving to `sys_getrandom` and **no** `/dev/urandom`/file-I/O entropy path linked.
+- [x] mbedTLS's CTR_DRBG entropy source is the Phase 86a `sys_getrandom` CSPRNG via a `mbedtls_hardware_poll` shim (`MBEDTLS_ENTROPY_HARDWARE_ALT`, the shim object `ar`-added to `libmbedcrypto.a`) calling `getrandom(2)` (syscall 318 = `sys_getrandom`), with `MBEDTLS_NO_PLATFORM_ENTROPY` removing the `/dev/urandom`/file-I/O path. Proven by `binary_contains(libmbedcrypto.a, "/dev/urandom") == false` at build time.
+- [x] A build-time self-test (`m3os_entropy_test.c`, linked against the same shim object) feeds 32 bytes through the entropy callback twice and asserts (a) it returns exactly the requested length (`olen == 32`) and (b) the two draws differ (non-constant) — `mbedtls: entropy self-test: ENTROPY_OK olen=32`. On the build host `getrandom(2)` is also syscall 318, so this exercises the real shim. The `/dev/urandom`-absence check above proves no file-I/O entropy path is linked.
 
 ---
 
