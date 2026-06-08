@@ -1,6 +1,6 @@
 # Phase 86d — Go-Runtime Gate: Task List
 
-**Status:** In Progress
+**Status:** Done ✅ — all four tracks landed; `cargo xtask go-runtime-smoke` PASSES end-to-end (GO_HELLO_OK + GO_GOROUTINE_OK + GO_HTTP_OK), kernel at `0.86.3`.
 **Source Ref:** phase-86d
 **Depends on:** Phase 86a (Outbound Foundation — `getrandom` CSPRNG + `AT_RANDOM`), Phase 37 (I/O Multiplexing) ✅, Phase 40 (Threading) ✅, Phase 36 (Expanded Memory) ✅, Phase 45 (Ports System) ✅, Phase 85 (Cross-Compiled Toolchains) ✅
 **Goal:** Clear the three kernel blockers that stop a static (`CGO_ENABLED=0`) Go binary from running — `mmap` `MAP_FIXED` + `PROT_NONE` arena reservations (hard), edge-triggered `EPOLLET` + `EPOLLRDHUP` (hard), and `SIGURG`-based async preemption via `tgkill` (soft) — then ship `ports/lang/go` as a `.m3pkg` and prove the runtime with a goroutine rendezvous + plaintext HTTP GET over the in-kernel TCP stack, all without 86c. Bump the kernel to `0.86.3`.
@@ -11,12 +11,14 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | `mmap` `MAP_FIXED` exact-address commit + `PROT_NONE` reservations (hard blocker 1) | 86a | Implemented — gate green, reviewed ✅ |
-| B | Edge-triggered `epoll` — `EPOLLET` per-interest edge state + `EPOLLRDHUP` (hard blocker 2) | — | Implemented — gate green |
-| C | Signals — `SIGURG`/`tgkill`/`sched_yield`/`madvise` + preempt-delivery decision (soft blocker) | A, B | In Progress |
-| D | `ports/lang/go` + split plaintext smoke gate + version bump | A, B, C | Planned |
+| A | `mmap` `MAP_FIXED` exact-address commit + `PROT_NONE` reservations (hard blocker 1) | 86a | Done ✅ — gate green, reviewed |
+| B | Edge-triggered `epoll` — `EPOLLET` per-interest edge state + `EPOLLRDHUP` (hard blocker 2) | — | Done ✅ — gate green, reviewed |
+| C | Signals — `SIGURG`/`tgkill`/`sched_yield`/`madvise` + preempt-delivery decision (soft blocker) | A, B | Done ✅ — gate green, reviewed |
+| D | `ports/lang/go` + split plaintext smoke gate + version bump | A, B, C | Done ✅ — `go-runtime-smoke` PASSES |
 
-> **Execution note (parallel-impl).** Tracks A and B are independent (disjoint regions of `mod.rs`, ~10k lines apart) and run as parallel implementer tracks (concurrency cap 2). Track C depends on A+B and Track D on all, so they run serially after. Integration, all `cargo xtask check`/QEMU validation, and the Go smoke gate are owned by the coordinator. Branch: `feat/86d-go-runtime`.
+> **Execution note (parallel-impl).** Implementation was serialized (A→B→C→D) — all four tracks edit the single 21k-line `mod.rs`, so per Core Rule 1 ("if in doubt, serialize") the tracks shared one code region; each was independently reviewed (PASS) and validated by the coordinator. Branch: `feat/86d-go-runtime`.
+>
+> **Bring-up addenda (discovered by running a real Go 1.24 binary, beyond the originally-scoped substrate).** Three additional kernel capabilities were required and added: (1) **`epoll_pwait`(281)** — Go's netpoll uses it, not `epoll_wait`; (2) **SA_SIGINFO `ucontext`** — the signal dispatcher now passes `rsi`=siginfo + `rdx`=ucontext, so Go's `SIGURG` handler (`doSigPreempt`, which reads `ucontext->uc_mcontext.gregs[RIP]` at `+0xa8`) no longer faults; (3) **`eventfd2`(290)** — Go 1.21+'s cross-thread M-wakeup primitive (new `crate::eventfd` object). The `go-runtime-smoke` runs **single-core** (`-smp 1`) — Go is still exercised across multiple OS threads (`clone`), but pinning to one core avoids cross-core SMP futex/IPC races; and the host HTTP server is reached via a SLIRP **`guestfwd`** rule.
 
 ---
 
@@ -89,13 +91,13 @@
 **Why it matters:** static Go is the same class as static CPython/Clang (no `libc.so`); splitting the gate lets the plaintext smoke validate the **runtime** without waiting on 86c (Go carries its own `crypto/tls`).
 
 **Acceptance:**
-- [ ] `ports/lang/go/Portfile` pins Go 1.24+ (SHA-256), and `build_go` produces a fully **static** Go (`GOTOOLCHAIN=local`, `CGO_ENABLED=0`, `-trimpath -ldflags=-s -w`), sealed into a `target/pkgcache/<key>.m3pkg` (a warm second build is a pkgcache hit, zero compiler invocations).
-- [ ] The `go` `.m3pkg` is bundled on the data disk via `BUNDLE_ONLY_PORTS` and `pkg install go` lays it into `/usr`.
-- [ ] Inside m3OS: a static Go program prints `GO_HELLO_OK`, then a goroutine scheduled on a second OS thread (via `clone(CLONE_THREAD)`) completes a channel rendezvous printing `GO_GOROUTINE_OK`.
-- [ ] A plaintext HTTP GET over the in-kernel TCP stack (Phase 77 `sys_connect` → `tcp::connect`) succeeds, printing `GO_HTTP_OK` — with **no** 86c/TLS dependency.
-- [ ] `os.Executable` resolves via `/proc/self/exe` (`procfs.rs:88`); `GOMAXPROCS` derives from `sched_getaffinity` (`mod.rs:1864`).
-- [ ] The gate is wired as `cargo xtask go-runtime-smoke` and as an opt-in pre-push regression (`M3OS_GO_REGRESSION=1`) in both `AGENTS.md` and `.githooks/pre-push`, with a long `--timeout` (clang-gate class — the cold install + slow ring-3 VFS take many minutes).
-- [ ] HTTPS-over-Go is **not** exercised here; the doc records it as deferred until after 86c (rides 86e).
+- [x] `ports/lang/go/Portfile` pins Go 1.24+ (SHA-256), and `build_go` produces a fully **static** Go (`GOTOOLCHAIN=local`, `CGO_ENABLED=0`, `-trimpath -ldflags=-s -w`), sealed into a `target/pkgcache/<key>.m3pkg` (a warm second build is a pkgcache hit, zero compiler invocations). *(Go 1.24.6; `build_go` branches before the musl-toolchain requirement — no musl dep, no runtime DEPS; observed pkgcache hit on warm rebuild.)*
+- [x] The `go` `.m3pkg` is bundled on the data disk via `BUNDLE_ONLY_PORTS` and `pkg install go` lays it into `/usr`. *(`pkg install: go: OK` — smoke step 14.)*
+- [x] Inside m3OS: a static Go program prints `GO_HELLO_OK`, then a goroutine scheduled on a second OS thread (via `clone(CLONE_THREAD)`) completes a channel rendezvous printing `GO_GOROUTINE_OK`. *(`runtime_probe.go` uses `LockOSThread` → `clone(CLONE_THREAD)` (observed `clone_thread(flags=0xd0f00)`) + an unbuffered channel rendezvous; both sentinels observed.)*
+- [x] A plaintext HTTP GET over the in-kernel TCP stack (Phase 77 `sys_connect` → `tcp::connect`) succeeds, printing `GO_HTTP_OK` — with **no** 86c/TLS dependency. *(`GO_HTTP_STATUS=200 GO_HTTP_LEN=16` + `GO_HTTP_OK`; the host HTTP server logged `accepted a guest connection`, proving the connect reached it via SLIRP `guestfwd`.)*
+- [x] `os.Executable` resolves via `/proc/self/exe` (`procfs.rs:88`); `GOMAXPROCS` derives from `sched_getaffinity` (`mod.rs:1864`). *(`GO_EXE=/usr/bin/go-runtime-probe`; `GO_GOMAXPROCS=1 GO_NUMCPU=1`.)*
+- [x] The gate is wired as `cargo xtask go-runtime-smoke` and as an opt-in pre-push regression (`M3OS_GO_REGRESSION=1`) in both `AGENTS.md` and `.githooks/pre-push`, with a long `--timeout`. *(Gate PASSES; bring-up additions epoll_pwait/SA_SIGINFO-ucontext/eventfd2 + single-core run are documented in the design doc / commit history.)*
+- [x] HTTPS-over-Go is **not** exercised here; the doc records it as deferred until after 86c (rides 86e). *(Plaintext only; design doc "Deferred Until Later" unchanged.)*
 
 ### D.2 — Bump kernel crate `0.86.2` → `0.86.3`
 
@@ -104,9 +106,9 @@
 **Why it matters:** the 86d cut is the fourth Phase 86 sub-phase (`0.86.0` → `0.86.5`); the version bump is how the sub-phase's landing is recorded in the boot banner and `uname`.
 
 **Acceptance:**
-- [ ] `kernel/Cargo.toml` line 3 reads `version = "0.86.3"` (+ `Cargo.lock` updated).
-- [ ] `cargo xtask check` is clean (clippy `-D warnings` + rustfmt + host tests + retpoline gate).
-- [ ] The boot banner / `uname` reports `0.86.3`.
+- [x] `kernel/Cargo.toml` line 3 reads `version = "0.86.3"` (+ `Cargo.lock` updated).
+- [x] `cargo xtask check` is clean (clippy `-D warnings` + rustfmt + host tests + retpoline gate). *(Final integration gate: `check passed` / exit 0.)*
+- [x] The boot banner / `uname` reports `0.86.3`. *(banner + `uname` + procfs derive from `env!("CARGO_PKG_VERSION")`; the kernel boots as `v0.86.3` in the smoke.)*
 
 ---
 

@@ -1,6 +1,6 @@
 # Phase 86d - Go-Runtime Gate
 
-**Status:** Planned
+**Status:** Done ✅ — `go-runtime-smoke` PASSES (GO_HELLO_OK + GO_GOROUTINE_OK + GO_HTTP_OK); kernel at `0.86.3`. See "As-built notes" below for the kernel capabilities the real Go 1.24 binary required beyond the originally-scoped substrate.
 **Source Ref:** phase-86d
 **Depends on:** Phase 86a (Outbound Foundation — `getrandom` CSPRNG + `AT_RANDOM`), Phase 37 (I/O Multiplexing) ✅, Phase 40 (Threading) ✅, Phase 36 (Expanded Memory) ✅, Phase 45 (Ports System) ✅, Phase 85 (Cross-Compiled Toolchains) ✅
 **Builds on:** Sub-phase **86d** of the [Phase 86 umbrella](./86-networking-and-github.md); it consumes 86a's CSPRNG/`AT_RANDOM` foundation and clears three concrete kernel gaps so a static (`CGO_ENABLED=0`) Go binary runs, then ships `ports/lang/go` the same way Phase 85 shipped CPython/Clang. It does **not** depend on 86c (HTTPS/TLS) for the plaintext gate.
@@ -108,10 +108,20 @@ The reservation path records a VMA with no committed frames at the requested add
 - **Go random bootstrap** (`runtime/rand.go`): `randinit` XORs `AT_RANDOM` then calls `getrandom` with `GRND_NONBLOCK`; Linux supplies a full CSPRNG, which m3OS only got in 86a.
 - **Static Go** on a full Linux is uncommon (most distros ship dynamic `cgo`-enabled Go); m3OS pins `GOTOOLCHAIN=local` + `CGO_ENABLED=0` + `-trimpath -ldflags=-s -w` because the custom `ld-musl` has no real `libc.so`.
 
+## As-built notes (bring-up beyond the originally-scoped substrate)
+
+Running a real static **Go 1.24.6** binary surfaced three kernel capabilities the plan's "runtime substrate already exists" list did **not** anticipate; all three were added and are exercised by the passing gate:
+
+1. **`epoll_pwait`(281)** — Go's netpoll (`runtime/netpoll_epoll.go`) issues `epoll_pwait`, not `epoll_wait`. Dispatched to `sys_epoll_wait` (Go passes a nil sigmask).
+2. **SA_SIGINFO `ucontext`** — the signal dispatcher (`enter_signal_handler`) now passes the System V handler args `rsi`=`&siginfo` and `rdx`=`&ucontext`. Go's `SIGURG` handler (`doSigPreempt`) reads `ucontext->uc_mcontext.gregs[REG_RIP]` at `ucontext+0xa8`; without a valid `rdx` it faulted at `0xa8`. `restore_sigframe` already restores a handler's RIP rewrite, so Go's async preemption now works at syscall-return delivery points (consistent with the path-(b) decision — no IRQ-return delivery).
+3. **`eventfd2`(290)** — Go 1.21+'s cross-thread M-wakeup primitive (`netpollBreak`); new `crate::eventfd` object (8-byte counter + `WaitQueue`), wired through the fd surface (read/write/poll/epoll-wake/close/dup/fstat).
+
+**Run configuration.** `go-runtime-smoke` runs the guest **single-core** (`-smp 1`): Go is still exercised across multiple OS threads (`LockOSThread` → `clone(CLONE_THREAD)`), but a single core avoids cross-core SMP futex/IPC races that otherwise made the heavy Go-load + slow-VFS pipeline intermittently deadlock — a tracked multi-core robustness follow-up, independent of the runtime correctness this gate proves. The acceptance requires a second OS *thread* (a clone), not a second core. The host HTTP server is reached via a SLIRP **`guestfwd`** rule (`10.0.2.100:80` → host loopback).
+
 ## Deferred Until Later
 
 - **HTTPS-over-Go** — Go's own `crypto/tls` needs 86c's CA bundle; deferred until after 86c and exercised in 86e (`gh`).
-- **True async preemption of compute-bound goroutines**, if the `asyncpreemptoff` path is chosen instead of the IRQ-return delivery path.
-- **Non-blocking `connect`** semantics — Go expects a non-blocking dial, but m3OS's `sys_connect` is a 3 s synchronous cap; reconciling the two is out of scope for the plaintext gate.
+- **Multi-core (`-smp > 1`) Go runs** — the single-core gate proves runtime correctness; eliminating the cross-core SMP futex/IPC deadlock observed under heavy Go load is a tracked scheduler-robustness follow-up.
+- **True async preemption of compute-bound goroutines** — `SIGURG` is delivered at syscall-return (path b), not via an IRQ-return path, so a tight compute loop with no safepoints won't async-preempt.
 - **Self-hosting the Go toolchain** inside m3OS (building Go *on* m3OS) — Phase 86 umbrella deferral.
 - The `gh` binary itself — Phase 86e.
