@@ -65,6 +65,7 @@ The three tracks are **not independent** in the sense `parallel-impl` requires: 
   - **NEGATIVE arm:** `git clone https://self-signed.badssl.com/...` was **REJECTED** (TLS failed closed at chain validation — `certificate`/`Certificate` matched).
   - **POSITIVE arm:** the `info/refs` response Content-Type was `application/x-git-upload-pack-advertisement` and its pkt-line body began `# service=git-upload-pack`; then a real `git clone https://github.com/octocat/Hello-World.git` reached `Receiving objects` and checked out HEAD (`Hello World` from the README).
   - **Bug caught by the gate (then fixed):** m3OS's `head` supports only `-n N`; the original `head -2` / `head -c 30` printed a usage error and timed the gate out. Fixed to `head -n 2` / `head -n 1` (commit `89368be`). A clean demonstration that the on-device gate exercises real m3OS tooling, not just the build.
+- `git-local-smoke` (`--timeout 2400`) — **PASSED, 47/47 steps in 943s** (regression check: confirms the curl-rebuilt HTTPS-capable git still runs the full LOCAL workflow — init/add/commit/diff/log/branch/merge/status — and that `pkg install git` now pulling the ~27 MB curl chain fits the raised timeout). The git rebuild did not regress local git ops.
 
 ## Workflow outcome measures
 
