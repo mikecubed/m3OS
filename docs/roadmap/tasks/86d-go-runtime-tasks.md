@@ -67,11 +67,11 @@
 **Why it matters:** Go uses `tgkill(tid, SIGURG)` + `doSigPreempt` for goroutine preemption and GC stop-the-world; m3OS delivers signals only at syscall-return. Adding `check_pending_signals` to the timer-IRQ-return path would build a signal frame in a context that today only ever builds one at syscall-return — a destabilization risk that must be decided deliberately, not stumbled into.
 
 **Acceptance:**
-- [ ] `SIGURG`(23) is added to the signal constants (default disposition ignore) and is deliverable; `sys_rt_sigaction` accepts it.
-- [ ] `tgkill`(234) dispatches as `tkill`-by-tid (reusing the `TKILL` machinery), `sched_yield`(24) yields, and `madvise`(28) returns success as a no-op — none returns `ENOSYS`.
-- [ ] A written decision in the docs picks **IRQ-return delivery path** vs **`asyncpreemptoff` + `tgkill`-for-STW-only**; the rationale (destabilization risk vs preemption coverage) is recorded.
-- [ ] If the IRQ-path is chosen: a smoke confirms a compute-bound goroutine is preempted (e.g. a tight loop yields to another goroutine within a bounded interval). If `asyncpreemptoff` is chosen: the limitation is documented (compute-bound goroutines won't async-preempt; GC stop-the-world still works via `tgkill`).
-- [ ] The futex single-thread fast-path (`mod.rs:15305`) is confirmed **not** to misfire if Go futex-sleeps before its first `newosproc` thread is created (no spurious zero-and-return that would corrupt Go's runtime locks).
+- [x] `SIGURG`(23) is added to the signal constants (default disposition ignore) and is deliverable; `sys_rt_sigaction` accepts it. *(`process::SIGURG = 23` added to the `Ignore` arm of `default_signal_action` — the catch-all is `Terminate`, so this is required; `sys_rt_sigaction` already accepts signals 1–31, so SIGURG installs.)*
+- [x] `tgkill`(234) dispatches as `tkill`-by-tid (reusing the `TKILL` machinery), `sched_yield`(24) yields, and `madvise`(28) returns success as a no-op — none returns `ENOSYS`. *(`TGKILL => sys_tkill(arg1, arg2)`, `SCHED_YIELD => yield_now()`, `MADVISE => 0` in the dispatch.)*
+- [x] A written decision in the docs picks **IRQ-return delivery path** vs **`asyncpreemptoff` + `tgkill`-for-STW-only**; the rationale (destabilization risk vs preemption coverage) is recorded. *(Path (b) — `asyncpreemptoff`; see "As-built decision (86d)" in [86d-go-runtime.md](../86d-go-runtime.md).)*
+- [x] If the IRQ-path is chosen: a smoke confirms a compute-bound goroutine is preempted. If `asyncpreemptoff` is chosen: the limitation is documented (compute-bound goroutines won't async-preempt; GC stop-the-world still works via `tgkill`). *(Path (b) chosen; the limitation is documented in the design doc. The smoke runs Go with `GODEBUG=asyncpreemptoff=1`.)*
+- [x] The futex single-thread fast-path (`sys_futex` `FUTEX_WAIT`) is confirmed **not** to misfire if Go futex-sleeps before its first `newosproc` thread is created. *(Analysis in the design doc: the fast path fires only while `thread_group.is_none()` (pre-first-`clone`), a window in which Go's uncontended futex mutexes never reach `futexsleep`; left unchanged to avoid regressing musl's `__lock`. Empirically reconfirmed by the Track D `go-runtime-smoke`.)*
 
 ---
 

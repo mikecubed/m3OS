@@ -1361,6 +1361,12 @@ mod syscall_nr {
     pub const SCHED_GETAFFINITY: u64 = 204;
     pub const SET_TID_ADDRESS: u64 = 218;
     pub const EXIT_GROUP: u64 = 231;
+    // Phase 86d Track C — Go runtime: tgkill(tgid, tid, SIGURG) for goroutine
+    // preemption / GC stop-the-world, sched_yield from the runtime's spin
+    // loops, madvise(MADV_FREE/DONTNEED) from the allocator's scavenger.
+    pub const SCHED_YIELD: u64 = 24;
+    pub const MADVISE: u64 = 28;
+    pub const TGKILL: u64 = 234;
 
     // -- net --
     pub const SOCKET: u64 = 41;
@@ -1841,6 +1847,19 @@ pub extern "C" fn syscall_handler(
         GETSID => sys_getsid(arg0),
         GETTID => sys_gettid(),
         TKILL => sys_tkill(arg0, arg1),
+        // Phase 86d Track C — Go runtime syscalls.
+        // tgkill(tgid, tid, sig): target the specific thread `tid` (a Pid in
+        // m3OS); the tgid (arg0) is advisory here since each thread is its own
+        // PROCESS_TABLE entry, so reuse the tkill-by-tid machinery.
+        TGKILL => sys_tkill(arg1, arg2),
+        SCHED_YIELD => {
+            crate::task::yield_now();
+            0
+        }
+        // madvise is purely advisory; honoring it (MADV_FREE/DONTNEED page
+        // release) is an optimization, never a correctness requirement, so a
+        // success no-op is a valid implementation.
+        MADVISE => 0,
         SCHED_SETAFFINITY => {
             if arg2 == 0 {
                 NEG_EFAULT

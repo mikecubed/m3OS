@@ -620,6 +620,11 @@ pub const SIGCHLD: u32 = 17;
 pub const SIGCONT: u32 = 18;
 pub const SIGSTOP: u32 = 19;
 pub const SIGTSTP: u32 = 20;
+/// Phase 86d Track C — Go's runtime uses `tgkill(tid, SIGURG)` → `doSigPreempt`
+/// for goroutine preemption and GC stop-the-world. Default disposition is
+/// Ignore (Linux), so an un-handled SIGURG is harmless rather than fatal — the
+/// kernel's catch-all is Terminate, so SIGURG must be listed explicitly below.
+pub const SIGURG: u32 = 23;
 pub const SIGWINCH: u32 = 28;
 
 /// sigaltstack flag: currently executing on the alt stack.
@@ -652,7 +657,7 @@ pub enum SignalAction {
 /// Default action table: terminate or ignore.
 pub fn default_signal_action(sig: u32) -> SignalDisposition {
     match sig {
-        SIGCHLD | SIGWINCH => SignalDisposition::Ignore,
+        SIGCHLD | SIGWINCH | SIGURG => SignalDisposition::Ignore,
         SIGCONT => SignalDisposition::Continue,
         SIGSTOP | SIGTSTP => SignalDisposition::Stop,
         SIGKILL | SIGINT | SIGTERM | SIGHUP | SIGBUS | SIGFPE | SIGSEGV | SIGPIPE | SIGALRM
