@@ -6087,7 +6087,13 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
             loop {
                 woken.store(false, core::sync::atomic::Ordering::Release);
-                crate::eventfd::eventfd_register_waiter(id, task_id, &woken);
+                if !crate::eventfd::eventfd_register_waiter(id, task_id, &woken) {
+                    // The eventfd object was freed (last fd reference closed,
+                    // possibly by a peer thread while we were blocked here).
+                    // Return EOF rather than dead-block on a wait queue that no
+                    // longer exists — mirrors a pipe reader seeing writer-close.
+                    return 0;
+                }
                 if let Some(val) = crate::eventfd::eventfd_read(id) {
                     crate::eventfd::eventfd_deregister_waiter(id, task_id);
                     let bytes = val.to_ne_bytes();
@@ -19691,6 +19697,22 @@ fn fd_poll_events(entry: &FdEntry) -> i16 {
             // Phase 86d Track D — eventfd readiness: POLLIN when the counter is
             // non-zero, POLLOUT when it is below the cap (effectively always).
             // This drives Go's netpoll epoll wakeup on `netpollBreak` writes.
+            if !crate::eventfd::eventfd_exists(*id) {
+                // The object was freed out from under us (last fd closed while a
+                // peer was blocked here). Report a terminal "readable + hung up
+                // + error" so every waiter type gets a ready event and exits
+                // instead of spinning:
+                //   - POLLIN  — a freed eventfd is at EOF (a `read` returns 0),
+                //     so it is "readable"; this is what `select`'s readfds arm
+                //     keys on (it only sets the read bit on POLLIN), mirroring
+                //     the PipeRead closed-writer path where `pipe_read_ready`
+                //     reports EOF as readable.
+                //   - POLLHUP — drives `poll`/`epoll_wait`, which pass HUP/ERR
+                //     through unconditionally regardless of the interest mask
+                //     (POLLNVAL would be masked out by poll's filter).
+                //   - POLLERR — drives `select`'s exceptfds arm.
+                return POLLIN | POLLHUP | POLLERR;
+            }
             let mut revents: i16 = 0;
             if crate::eventfd::eventfd_readable(*id) {
                 revents |= POLLIN;

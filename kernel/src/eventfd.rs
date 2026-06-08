@@ -130,6 +130,19 @@ pub fn eventfd_write(id: usize, val: u64) -> Result<(), EventFdWriteErr> {
     Ok(())
 }
 
+/// Whether the eventfd object `id` still refers to a live object. The
+/// poll/epoll/select readiness scan uses this to surface a terminal
+/// `POLLIN|POLLHUP|POLLERR` when the object was freed out from under a blocked
+/// waiter (last fd closed mid-block), mirroring the pipe path's closed-peer
+/// reporting.
+pub fn eventfd_exists(id: usize) -> bool {
+    EVENTFD_TABLE
+        .lock()
+        .get(id)
+        .map(|s| s.is_some())
+        .unwrap_or(false)
+}
+
 /// Whether a read would return data (counter > 0) — drives `POLLIN`.
 pub fn eventfd_readable(id: usize) -> bool {
     EVENTFD_TABLE
@@ -188,15 +201,48 @@ pub fn eventfd_add_ref(id: usize) {
 
 /// Decrement the object refcount; free it (and its wait queue) at zero.
 pub fn eventfd_close(id: usize) {
-    let mut table = EVENTFD_TABLE.lock();
-    if let Some(obj) = table.get_mut(id).and_then(|s| s.as_mut()) {
-        obj.refcount = obj.refcount.saturating_sub(1);
-        if obj.refcount == 0 {
-            table[id] = None;
-            let mut wqs = EVENTFD_WAITQUEUES.lock();
-            if id < wqs.len() {
-                wqs[id] = None;
+    let freed = {
+        let mut table = EVENTFD_TABLE.lock();
+        match table.get_mut(id).and_then(|s| s.as_mut()) {
+            Some(obj) => {
+                obj.refcount = obj.refcount.saturating_sub(1);
+                if obj.refcount == 0 {
+                    table[id] = None;
+                    true
+                } else {
+                    false
+                }
             }
+            None => false,
+        }
+    };
+    if freed {
+        // Wake any task blocked on this eventfd (a blocking `read`, or
+        // `poll`/`epoll_wait`) and tear down its wait queue under a SINGLE
+        // `EVENTFD_WAITQUEUES` acquisition. If a peer closes the last fd
+        // reference while we are blocked, dropping the wait queue without
+        // waking would strand us forever — so we must wake, like
+        // `pipe_close_reader`/`pipe_close_writer` do on close.
+        //
+        // The wake and the teardown must be atomic. Splitting them into two
+        // lock acquisitions (wake, unlock, re-lock, free) opens a
+        // register-after-wake-before-free window: a reader looping in
+        // `sys_linux_read` could register on the still-present queue *after*
+        // `wake_all` has run but *before* the slot is nulled, then block on a
+        // queue that is freed out from under it. The pipe path tolerates that
+        // gap only because a parked pipe reader keeps `reader_count > 0` (so
+        // the object can't free underneath it) and `pipe_read` returns EOF on a
+        // freed object; an eventfd has neither guarantee (no per-waiter
+        // refcount, and `eventfd_read` can't distinguish "freed" from "empty").
+        // Holding the lock across both makes a racing `eventfd_register_waiter`
+        // either run before the wake (and get woken) or after the teardown (and
+        // fail to register → EOF in the read loop / terminal event in poll).
+        let mut wqs = EVENTFD_WAITQUEUES.lock();
+        if let Some(Some(wq)) = wqs.get(id) {
+            wq.wake_all();
+        }
+        if id < wqs.len() {
+            wqs[id] = None;
         }
     }
 }
