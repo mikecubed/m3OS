@@ -1,6 +1,6 @@
 # Phase 86c - HTTPS/TLS + git smart-HTTP
 
-**Status:** Planned
+**Status:** ✅ Complete — `git-https-smoke` PASSED 36/36 on m3OS (live `https://` clone + bad-cert reject); kernel `0.86.2`
 **Source Ref:** phase-86c
 **Depends on:** Phase 86a (Outbound Foundation — CSPRNG, wall-clock floor, `ca-certificates` `.m3pkg`), Phase 86b (git build pattern + smoke template), Phase 77 (DNS reply delivery D.1 + outbound TCP `connect` D.2) ✅, Phase 85 (Cross-Compiled Toolchains) ✅
 **Builds on:** Sub-phase 86c of the Phase 86 (Networking and GitHub) umbrella — see [`./86-networking-and-github.md`](./86-networking-and-github.md). It is the heavier of the two git-transport sub-phases: where 86b reused in-tree audited crypto and skipped X.509 entirely, 86c adds the full TLS 1.3 + X.509/CA/hostname stack and rebuilds the git binary with `NO_CURL` removed.

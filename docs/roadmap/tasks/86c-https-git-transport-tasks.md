@@ -1,11 +1,11 @@
 # Phase 86c — HTTPS/TLS + git smart-HTTP: Task List
 
-**Status:** Planned
+**Status:** ✅ Complete — all tracks landed; `git-https-smoke` PASSED 36/36 on m3OS (incl. live bad-cert reject + `https://` clone)
 **Source Ref:** phase-86c
 **Depends on:** Phase 86a (Outbound Foundation — CSPRNG `sys_getrandom`, build-date wall-clock floor, `ca-certificates` `.m3pkg`), Phase 86b (git build pattern + smoke template), Phase 77 (DNS D.1 + outbound TCP `connect` D.2) ✅, Phase 85 (Cross-Compiled Toolchains) ✅
 **Goal:** Rebuild the static musl `git` **with** curl (`NO_CURL` removed) against a static musl `libcurl --with-mbedtls`, validate GitHub's TLS 1.3 cert chain + hostname against the SHA-256-pinned Phase 86a CA bundle, handle PAT credentials, and prove `git clone https://…` works inside m3OS with both a success and a rejected-bad-cert arm — the HTTPS half of the Phase 86 git-transport arc.
 
-> **Authored ahead of implementation.** Every acceptance item below is intentionally unchecked `[ ]`; it records the planned, measurable result, not a delivered one. (Mirror the 92-vfs-bulk-io style.)
+> **Delivered.** Authored ahead of implementation, then implemented: every acceptance item below is now checked `[x]` with the delivered, measured result. The end-to-end `git-https-smoke` gate PASSED 36/36 steps on m3OS (incl. the opt-in live bad-cert reject + `https://` clone). See [`./86c-track-report.md`](./86c-track-report.md) for the batch summary.
 
 > **Hard cross-phase dependency.** Certificate-validity checking is impossible until **Phase 86a Track B**'s build-date wall-clock floor lands — with `BOOT_EPOCH_SECS = 0` every cert is "not yet valid" and TLS fails-closed for the wrong reason. Likewise the CTR_DRBG entropy callback requires **86a Track A** (`sys_getrandom` CSPRNG) and the trust store requires **86a Track C** (the `ca-certificates` `.m3pkg`). 86c must not be marked done while any of those is absent.
 
@@ -15,7 +15,7 @@
 |---|---|---|---|
 | A | mbedTLS port (trimmed client-only, CSPRNG entropy) | 86a Track A | ✅ Done (built + entropy self-test PASS) |
 | B | curl port + git HTTPS rebuild (invert `NO_CURL` assertions) | A, 86b | ✅ Done (curl libcurl/8.15 mbedTLS/3.6.2; git inverted assertions PASS) |
-| C | Cert/hostname validation + PAT creds + smoke gate + version | B, 86a Track B/C | ✅ Done (gitconfig trust + PAT, git-https-smoke gate, kernel 0.86.2) |
+| C | Cert/hostname validation + PAT creds + smoke gate + version | B, 86a Track B/C | ✅ Done (gitconfig trust + PAT, git-https-smoke PASSED 36/36 incl. live arms, kernel 0.86.2) |
 
 ---
 

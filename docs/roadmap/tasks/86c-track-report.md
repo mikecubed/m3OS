@@ -48,7 +48,8 @@ The three tracks are **not independent** in the sense `parallel-impl` requires: 
 
 - **Track A reviewer (`code-quality-reviewer`): no blockers.** Applied the two cheap correctness items — entropy shim fails closed on `getrandom()==0` (no infinite spin) and idempotent mbedTLS header install (remove-before-`cp` + double-nest guard). The "mock the short-read loop" suggestion was addressed by hardening the C shim itself rather than testing a Rust mirror of C code (documented).
 - **Track B reviewer (`code-quality-reviewer`): one flagged item, resolved.** The reviewer flagged the `curl_easy_perform` presence assertion. Root cause was subtler than reported (the assertion runs pre-strip, so it actually passed), but the underlying point was valid — git 2.44 never *calls* `curl_easy_perform` (it uses the curl **multi** interface), so it was only a symtab artifact. Switched to `curl_multi_perform` (a symbol git actually calls — strip-robust, semantically meaningful). Re-verified: the `git` rebuild asserts `curl_multi_perform + mbedtls_ssl_handshake present, SSL_CTX_new absent`. The reviewer separately confirmed the static link order, the recursion's acyclicity + warm-cache preservation, the libtool `-all-static` idiom, and the curl configure flag set are all sound.
-- **No rescues.** All background tasks (three port-chain builds, two reviewers, the end-to-end smoke) ran to completion; no stalls, nudges, or replacements.
+- **Track C / integration reviewer (`code-quality-reviewer`): no blockers, 1 major + minors, all applied.** M1 — corrected the now-false "git reused UNCHANGED / not rebuilt" claims in `cmd_git_ssh_smoke` + AGENTS.md + the git Portfile (as of 86c `build_git_port` builds the HTTPS-capable git; the SSH transport is orthogonal). m1 — corrected the install topo order to `zlib → mbedtls → ca-certificates → curl → git` everywhere. m2 — curl Portfile `DEPS` gains `ca-certificates`. m4 — raised the git-local-smoke pre-push global to 2400 (> the 1800 install-step ceiling). The reviewer verified the echo-match safety, solver/bundling coherence, the version bump, and the gitconfig/shell-quoting were all sound. (m3 — bare no-`--timeout` invocation clamps to the 240s default — left as-is: every wired invocation passes an explicit `--timeout`.)
+- **No rescues.** All background tasks (three port-chain builds, three reviewers, two end-to-end smoke runs) ran to completion; no stalls, nudges, or replacements. The first smoke run surfaced the `head -2`/`-c` bug, which was fixed and the rerun passed all 36 steps.
 
 ## Validation outcomes
 
@@ -57,7 +58,13 @@ The three tracks are **not independent** in the sense `parallel-impl` requires: 
   - **mbedTLS:** static `libmbedcrypto.a`/`x509.a`/`tls.a`; entropy self-test `ENTROPY_OK olen=32`; no `/dev/urandom` in the archive. ✅
   - **curl:** static `libcurl.a` + static CLI; `curl 8.15.0 … libcurl/8.15.0 mbedTLS/3.6.2 zlib/1.3.1`; embedded CAINFO `/etc/ssl/certs/ca-certificates.crt`. ✅
   - **git:** `git-remote-https + curl_multi_perform + mbedtls_ssl_handshake present, SSL_CTX_new absent, server pack helpers pruned`. ✅
-- `git-https-smoke` (`M3OS_GIT_HTTPS_NET=1 --timeout 5400`) — **see the run result appended on completion.** (Pending at time of writing; the network-free core + the build-chain verification above already prove the stack compiles, seals, installs-resolvable, and asserts correctly.)
+- `git-https-smoke` (`M3OS_GIT_HTTPS_NET=1 --timeout 5400`) — **PASSED, 36/36 steps in 904s** (full end-to-end on m3OS, including the live network arms). On-device proof:
+  - `pkg install git: OK` — the solver resolved + installed the whole `zlib → mbedtls → ca-certificates → curl → git` chain (~27 MB) from `/usr/pkg`.
+  - `curl 8.15.0 (x86_64-pc-linux-musl) libcurl/8.15.0 mbedTLS/3.6.2 zlib/1.3.1` — the static cross-built curl+mbedTLS **runs on m3OS**.
+  - `http.sslCAInfo` = `/etc/ssl/certs/ca-certificates.crt`, `http.sslVerify` = `true`, and the installed CA bundle's `Bundle of CA Root Certificates` header is on disk.
+  - **NEGATIVE arm:** `git clone https://self-signed.badssl.com/...` was **REJECTED** (TLS failed closed at chain validation — `certificate`/`Certificate` matched).
+  - **POSITIVE arm:** the `info/refs` response Content-Type was `application/x-git-upload-pack-advertisement` and its pkt-line body began `# service=git-upload-pack`; then a real `git clone https://github.com/octocat/Hello-World.git` reached `Receiving objects` and checked out HEAD (`Hello World` from the README).
+  - **Bug caught by the gate (then fixed):** m3OS's `head` supports only `-n N`; the original `head -2` / `head -c 30` printed a usage error and timed the gate out. Fixed to `head -n 2` / `head -n 1` (commit `89368be`). A clean demonstration that the on-device gate exercises real m3OS tooling, not just the build.
 
 ## Workflow outcome measures
 
