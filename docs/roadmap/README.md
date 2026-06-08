@@ -244,6 +244,26 @@ flowchart TD
     P91 -.-> P87
     P87 --> P88["Phase 88<br/>Claude Code"]
     P83 --> P89["Phase 89<br/>IPv6 / DHCPv6"]
+
+    %% USB class expansion (every USB feature deferred from Phase 78)
+    P78 --> P90["Phase 90<br/>USB Class Expansion"]
+
+    %% VFS throughput + stat correctness (surfaced by Phase 85; feed the heavy-I/O phases)
+    P85 --> P92["Phase 92<br/>VFS Bulk-I/O<br/>Throughput & Fairness"]
+    P85 --> P93["Phase 93<br/>VFS stat Conformance<br/>+ ext2 Consolidation"]
+    P92 --> P87
+    P93 --> P87
+    P92 --> P88
+    P93 --> P88
+
+    %% Rust toolchain growth: host-cross ports -> on-device toolchain
+    P44 --> P94["Phase 94<br/>Rust-Cargo Ports<br/>+ uutils"]
+    P85 --> P94
+    P91 --> P95["Phase 95<br/>Native Rust Toolchain<br/>(on-device rustc)"]
+    P94 --> P95
+    P85 --> P95
+    P92 -.-> P95
+    P93 -.-> P95
 ```
 
 ## Milestone Summary
@@ -455,6 +475,7 @@ These phases were drafted 2026-05-08 in response to the phase-completion audit (
 | 92 | VFS Bulk-I/O Throughput & Fairness | Batched multi-block ext2 reads/writes + readahead/write-back + VFS fairness so large file I/O over the ring-3 block path (canonically `pkg install python`, a 21 MiB package — ~5,376 single-block ring0↔ring3 round-trips today) is fast and no longer freezes interactive clients (compositor/`term`) in GUI mode. Surfaced by Phase 85c; userspace `pkg` chunked-read + install progress baseline already landed there. Prerequisite for the heavy-I/O Phases 87 (Node.js) + 88 (Claude Code). | Planned | `phase-92` | [Phase 92](./92-vfs-bulk-io.md) | [Tasks](./tasks/92-vfs-bulk-io-tasks.md) |
 | 93 | VFS `stat` Conformance & ext2 Consolidation | Make file metadata correct, complete, and **consistent across every access path** — same `(st_dev, st_ino)`, size, mode, and timestamps whether stat'd by path or by fd, via the kernel ext2 or the ring-3 `vfs_server` — via one canonical `fill_stat()` serializer; and reconcile the **two independent ext2 implementations** (kernel `EXT2_VOLUME` + vfs_server `Ext2State`) by sharing their resolve/read logic in `kernel_core` so they can't diverge; the same VFS/fd-layer correctness pass also makes `pwrite64` positional (write at offset without disturbing the shared fd position). Surfaced acutely by Phase 85d (in-OS clang's `redefinition of 'main'` from `fstat` returning `st_ino=0` for VFS files, collapsing distinct files onto one identity; the `pwrite64` and `clang-smoke`-matcher follow-ups were also surfaced by 85d's PR #225 review); see the post-mortem. Quality prerequisite for the `make`/`git`/`stat`-dependent toolchain phases (87, 88); complements Phase 92 (same layer, throughput). | Planned | `phase-93` | [Phase 93](./93-vfs-stat-and-ext2-consolidation.md) | [Tasks](./tasks/93-vfs-stat-and-ext2-consolidation-tasks.md) |
 | 94 | Rust-Cargo Ports & uutils Coreutils | Establish the project's first Rust-cargo cross-compiled port class (`x86_64-unknown-linux-musl`, prebuilt-std, self-contained — no external musl-gcc) on the Phase 85a `.m3pkg` substrate, then deliver upstream [uutils/coreutils](https://github.com/uutils/coreutils) as a single static multicall binary + per-applet symlinks installed by `pkg install coreutils` into `/usr/local/bin`, where it shadows the hand-built `coreutils-rs` set by PATH precedence. Runs unmodified on the existing Phase 12 Linux-syscall compat layer (no kernel change expected); the ramdisk `no_std` floor is preserved for early boot + uninstall fallback. `DEPS=` empty (pure-Rust feature set). | Planned | `phase-94` | [Phase 94](./94-rust-cargo-uutils.md) | [Tasks](./tasks/94-rust-cargo-uutils-tasks.md) |
+| 95 | Native Rust Toolchain (on-device `rustc`) | Run the Rust *toolchain itself* on m3OS — not just host-cross-compiled Rust programs (Phases 44/94), which already work. A fully-static musl `rustc`, packaged behind an `M3OS_WITH_RUST` image feature, compiles a Rust source file to a native ELF, links it with the bundled `rust-lld`, and runs it on-device (`rustc hello.rs && ./hello`) against a prebuilt std sysroot resolved relative to the binary — the Rust analog of Phase 85d's on-device Clang (the correct precedent; Phase 86d only *runs* a pre-built Go binary, its compiler never runs on-device). Reuses the Phase 85d streaming-exec / `pread64` / large-heap kernel work + LLD. The **proc-macro** half (`cargo` + derive macros) is gated on **Phase 91**'s `libc.so` + loader TLS, because a proc-macro is a `.so` that `rustc` `dlopen`s at compile time. `mrustc` noted as a smaller, LLVM-free, Phase-91-independent first cut. | Planned | `phase-95` | [Phase 95](./95-native-rust-toolchain.md) | Deferred until implementation planning |
 
 ## Suggested Delivery Rhythm
 
