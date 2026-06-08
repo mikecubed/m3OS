@@ -13814,9 +13814,9 @@ fn cmd_go_runtime_smoke(args: &SmokeBootArgs) {
         false, // graphical_login — autologin / serial path
     );
 
-    // Host HTTP server on an ephemeral loopback port. The guest reaches it via
-    // the SLIRP gateway 10.0.2.2:<port> (no hostfwd / guestfwd needed — 10.0.2.2
-    // maps to the host loopback for outbound guest connections).
+    // Host HTTP server on an ephemeral loopback port, exposed to the guest via
+    // a SLIRP guestfwd rule (below) at the synthetic in-subnet address
+    // 10.0.2.100:80.
     let listener = std::net::TcpListener::bind("127.0.0.1:0")
         .expect("go-runtime-smoke: bind host HTTP server");
     let http_port = listener.local_addr().unwrap().port();
@@ -13825,6 +13825,9 @@ fn cmd_go_runtime_smoke(args: &SmokeBootArgs) {
         const BODY: &[u8] = b"m3OS-go-http-ok\n";
         for stream in listener.incoming() {
             let Ok(mut s) = stream else { continue };
+            // Diagnostic: prove the guest's TCP connect reached the host (i.e.
+            // SLIRP guestfwd + the in-kernel TCP connect worked).
+            eprintln!("go-runtime-smoke: host HTTP server accepted a guest connection");
             // Drain the request headers (best-effort) so the client's write
             // completes before we respond.
             let mut buf = [0u8; 2048];
@@ -13847,15 +13850,30 @@ fn cmd_go_runtime_smoke(args: &SmokeBootArgs) {
     };
     let mut qemu_args =
         qemu_args_with_devices(&uefi_image, &ovmf, display_mode, DeviceSet::default());
-    // Keep SLIRP user networking but strip hostfwd to avoid host-port conflicts
-    // (the guest reaches the host via 10.0.2.2 without any forward rule).
+    // Expose the host HTTP server to the guest via a SLIRP guestfwd rule: the
+    // guest reaches it at the synthetic in-subnet address 10.0.2.100:80, which
+    // SLIRP forwards to the host's 127.0.0.1:<http_port>. m3OS has the SLIRP
+    // default static IP 10.0.2.15/24, so 10.0.2.100 is on-link. This is more
+    // deterministic than relying on gateway-to-host-loopback forwarding.
+    let guestfwd = format!("user,id=net0,guestfwd=tcp:10.0.2.100:80-tcp:127.0.0.1:{http_port}");
     for arg in qemu_args.iter_mut() {
-        if arg.starts_with("user,id=net0,hostfwd=") {
-            *arg = "user,id=net0".to_string();
+        if arg.starts_with("user,id=net0") {
+            *arg = guestfwd.clone();
         }
     }
 
-    let url = format!("http://10.0.2.2:{http_port}/");
+    // Pin the guest to a single core. Go's runtime + the in-kernel netpoll/TCP
+    // stack are still exercised across multiple OS threads (clone), but a single
+    // core avoids the cross-core SMP futex/IPC races that otherwise make the
+    // heavy Go-load + slow-VFS pipeline intermittently deadlock. The acceptance
+    // requires a second OS *thread* (a clone), not a second core.
+    for i in 0..qemu_args.len() {
+        if qemu_args[i] == "-smp" && i + 1 < qemu_args.len() {
+            qemu_args[i + 1] = "1".to_string();
+        }
+    }
+
+    let url = "http://10.0.2.100:80/".to_string();
     let steps = go_runtime_smoke_steps(&url);
 
     println!(

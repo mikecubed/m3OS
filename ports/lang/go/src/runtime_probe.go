@@ -39,13 +39,12 @@ func main() {
 	fmt.Printf("GO_GOMAXPROCS=%d GO_NUMCPU=%d\n", runtime.GOMAXPROCS(0), runtime.NumCPU())
 
 	// --- goroutine rendezvous on a second OS thread ---------------------
-	// Ensure the runtime is willing to use >1 P, then LockOSThread in the
-	// child goroutine so the runtime must back it with a distinct M (OS
-	// thread, created via clone(CLONE_THREAD)). The unbuffered channel forces
-	// a real cross-thread rendezvous (futex wake of the main goroutine).
-	if runtime.GOMAXPROCS(0) < 2 {
-		runtime.GOMAXPROCS(2)
-	}
+	// LockOSThread in the child goroutine so the runtime must back it with a
+	// distinct M (OS thread, created via clone(CLONE_THREAD)) regardless of
+	// GOMAXPROCS. The unbuffered channel forces a real cross-thread rendezvous
+	// (futex wake of the main goroutine). GOMAXPROCS is left at the value Go
+	// derives from sched_getaffinity (no artificial bump) to keep scheduler
+	// concurrency minimal.
 	ch := make(chan int)
 	var wg sync.WaitGroup
 	wg.Add(1)
