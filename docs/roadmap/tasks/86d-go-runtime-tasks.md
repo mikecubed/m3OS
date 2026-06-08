@@ -11,9 +11,9 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | `mmap` `MAP_FIXED` exact-address commit + `PROT_NONE` reservations (hard blocker 1) | 86a | In Progress |
-| B | Edge-triggered `epoll` — `EPOLLET` per-interest edge state + `EPOLLRDHUP` (hard blocker 2) | — | In Progress |
-| C | Signals — `SIGURG`/`tgkill`/`sched_yield`/`madvise` + preempt-delivery decision (soft blocker) | A, B | Planned |
+| A | `mmap` `MAP_FIXED` exact-address commit + `PROT_NONE` reservations (hard blocker 1) | 86a | Implemented — gate green, reviewed ✅ |
+| B | Edge-triggered `epoll` — `EPOLLET` per-interest edge state + `EPOLLRDHUP` (hard blocker 2) | — | Implemented — gate green |
+| C | Signals — `SIGURG`/`tgkill`/`sched_yield`/`madvise` + preempt-delivery decision (soft blocker) | A, B | In Progress |
 | D | `ports/lang/go` + split plaintext smoke gate + version bump | A, B, C | Planned |
 
 > **Execution note (parallel-impl).** Tracks A and B are independent (disjoint regions of `mod.rs`, ~10k lines apart) and run as parallel implementer tracks (concurrency cap 2). Track C depends on A+B and Track D on all, so they run serially after. Integration, all `cargo xtask check`/QEMU validation, and the Go smoke gate are owned by the coordinator. Branch: `feat/86d-go-runtime`.
@@ -29,11 +29,11 @@
 **Why it matters:** Go's allocator (`runtime/mem_linux.go`) reserves an arena `PROT_NONE` `MAP_ANON` then commits it `PROT_RW` `MAP_FIXED` at the **same** address, throwing if the returned address differs; today `sys_linux_mmap` discards the address hint and masks `MAP_FIXED`, so the first arena commit lands at `ANON_MMAP_BASE` and Go aborts. The `MAP_FIXED` overwrite/split of the reservation VMA must interact correctly with demand-paging/CoW/TLB-shootdown — a bug corrupts **other** VMAs.
 
 **Acceptance:**
-- [ ] An `mmap` `PROT_NONE` `MAP_ANON` records a VMA mapping **no** committed frames at the requested address.
-- [ ] A subsequent `MAP_FIXED` `PROT_RW` `MAP_ANON` at the **same** address returns **exactly** that address (not relocated to `ANON_MMAP_BASE`) and commits in place, overwriting/splitting the reservation VMA via `with_shared_mm_mut` without corrupting neighbor VMAs.
-- [ ] An address near `~0xc000000000` is placeable within `USER_SPACE_END` (`0x0000_8000_0000_0000`).
-- [ ] `PROT_NONE` guard pages still `SIGSEGV` on access (the guard mark at `mod.rs:10407` is preserved through the reserve→commit→`mprotect` sequence).
-- [ ] A `kernel-core`/QEMU regression exercises reserve-then-commit-same-address and asserts a neighboring VMA's bytes are unchanged after the in-place commit.
+- [x] An `mmap` `PROT_NONE` `MAP_ANON` records a VMA mapping **no** committed frames at the requested address. *(unchanged behavior — anon mmap records a frameless VMA with `prot==0`; demand paging never commits a `prot==0` page.)*
+- [x] A subsequent `MAP_FIXED` `PROT_RW` `MAP_ANON` at the **same** address returns **exactly** that address (not relocated to `ANON_MMAP_BASE`) and commits in place, overwriting/splitting the reservation VMA via `with_shared_mm_mut` without corrupting neighbor VMAs. *(`sys_linux_mmap` MAP_FIXED branch: clears the range via `sys_linux_munmap` then inserts the committed VMA; neighbor preservation proven by host-tested `VmaTree::remove_range`.)*
+- [x] An address near `~0xc000000000` is placeable within `USER_SPACE_END` (`0x0000_8000_0000_0000`). *(asserted in `map_fixed_full_commit_replaces_reservation_in_place`.)*
+- [x] `PROT_NONE` guard pages still `SIGSEGV` on access. *(`demand_map_vma_page` refuses a `prot==0` VMA → page-fault → SIGSEGV; reviewer-confirmed. Also hardened: `MAP_FIXED` now rejects addresses below the `mmap_min_addr` floor `0x10000`, so a fixed mapping can't map the NULL guard page.)*
+- [x] A `kernel-core`/QEMU regression exercises reserve-then-commit-same-address and asserts a neighboring VMA's bytes are unchanged after the in-place commit. *(kernel-core arm: `map_fixed_full_commit_replaces_reservation_in_place` + `map_fixed_subrange_commit_splits_reservation` in `kernel-core/src/mm.rs`. End-to-end QEMU arm — Go's arena allocator does reserve→commit-same-address→RW-touch — is covered by the Track D `go-runtime-smoke` gate.)*
 
 ---
 
@@ -46,11 +46,11 @@
 **Why it matters:** Go's netpoll (`runtime/netpoll_epoll.go`) registers each fd `EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET`; m3OS is level-triggered only, so Go busy-loops or hangs. Edge state must be **per-interest** (not per-fd — the same fd can be registered in multiple epoll instances) plus `EPOLLRDHUP` half-close.
 
 **Acceptance:**
-- [ ] `sys_epoll_ctl` stores `EPOLLET` (and tolerates `EPOLLONESHOT`) on the epoll **entry**, tracking last-reported readiness per entry, not on the fd.
-- [ ] An `EPOLLET` interest reports an event **only** on a not-ready→ready transition: a still-readable fd is **not** re-reported on a subsequent `epoll_wait` until it is drained then refilled.
-- [ ] `EPOLLRDHUP` fires on peer half-close (derived from the fd's half-close state).
-- [ ] The 12-byte `epoll_event` wire layout is unchanged.
-- [ ] Level-triggered behavior is preserved for the existing `async-rt` and `sshd` consumers (no regression in their smoke gates).
+- [x] `sys_epoll_ctl` stores `EPOLLET` (and tolerates `EPOLLONESHOT`) on the epoll **entry**, tracking last-reported readiness per entry, not on the fd. *(`EpollInterest.last_ready`; `EPOLLET`/`EPOLLONESHOT` stripped as `EPOLL_CONTROL_BITS` before matching.)*
+- [x] An `EPOLLET` interest reports an event **only** on a not-ready→ready transition: a still-readable fd is **not** re-reported on a subsequent `epoll_wait` until it is drained then refilled. *(host-tested `kernel_core::epoll::evaluate_interest`: `edge_triggered_suppressed_when_already_reported` + `edge_triggered_re_triggers_after_drain_then_refill`; `epoll_wait` is edge-aware in both the emit loop and the TOCTOU re-check to avoid a busy-loop.)*
+- [x] `EPOLLRDHUP` fires on peer half-close (derived from the fd's half-close state). *(`fd_poll_events` sets `POLLRDHUP` for TCP `CloseWait`/`LastAck`/`TimeWait`/`Closed`.)*
+- [x] The 12-byte `epoll_event` wire layout is unchanged. *(only kernel-internal `EpollInterest` gained a field; userspace struct untouched.)*
+- [x] Level-triggered behavior is preserved for the existing `async-rt` and `sshd` consumers (no regression in their smoke gates). *(LT path is byte-identical — `evaluate_interest` with `is_et=false` matches the prior `matched|unconditional` logic; `RDHUP` only surfaced when requested. Validated by `cargo xtask check` + the smoke/regression gate on push.)*
 
 ---
 
