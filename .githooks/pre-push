@@ -397,7 +397,9 @@ fi
 # kernel mmap / fork-exec / ext2 paths git exercises.
 if [ "${M3OS_GIT_REGRESSION:-0}" = "1" ]; then
     echo "pre-push: running cargo xtask git-local-smoke..."
-    if ! cargo xtask git-local-smoke --timeout 360; then
+    # Phase 86c raised the timeout: git now depends on curl, so `pkg install git`
+    # pulls the curl+mbedtls+ca-certificates chain (~27 MB) over the slow VFS.
+    if ! cargo xtask git-local-smoke --timeout 1800; then
         echo "pre-push: cargo xtask git-local-smoke failed" >&2
         exit 1
     fi
@@ -419,6 +421,28 @@ if [ "${M3OS_GIT_SSH_REGRESSION:-0}" = "1" ]; then
     echo "pre-push: running cargo xtask git-ssh-smoke..."
     if ! cargo xtask git-ssh-smoke --timeout 5400; then
         echo "pre-push: cargo xtask git-ssh-smoke failed" >&2
+        exit 1
+    fi
+fi
+
+# Phase 86c — git-over-HTTPS regression gate. Gated behind M3OS_GIT_HTTPS_REGRESSION=1
+# because it cross-compiles the HTTPS transport chain (mbedtls -> curl -> git,
+# + ca-certificates) before booting QEMU. The always-on core proves `pkg install
+# git` pulls + installs the whole curl+mbedtls+ca-certificates chain, the static
+# curl+mbedTLS stack RUNS on m3OS (`curl --version` reports mbedTLS), and the
+# gitconfig trust settings + CA bundle are wired. The live bad-cert REJECT
+# (self-signed.badssl.com) and the public `git clone https://...` are opt-in
+# (M3OS_GIT_HTTPS_NET=1, egress to :443, no secret) and skip-with-reason otherwise
+# — so an unconfigured run still exercises the install + on-device-stack plumbing.
+# The long (clang-class) timeout is a ceiling for the ~27 MB install over the slow
+# VFS + the packfile transfer when the network arms run; the core finishes well
+# under it. Set it on branches that touch ports/lib/mbedtls, ports/util/curl,
+# xtask's build_mbedtls / build_curl / build_git / curl+mbedtls bundling, or the
+# /etc/gitconfig HTTPS trust settings.
+if [ "${M3OS_GIT_HTTPS_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask git-https-smoke..."
+    if ! cargo xtask git-https-smoke --timeout 5400; then
+        echo "pre-push: cargo xtask git-https-smoke failed" >&2
         exit 1
     fi
 fi

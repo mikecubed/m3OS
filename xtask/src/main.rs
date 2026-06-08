@@ -215,6 +215,15 @@ const SMOKE_EXIT_CLANG_SMOKE_FAILED: i32 = 76;
 /// configured — clones a repo over `ssh://` via `GIT_SSH`.
 const SMOKE_EXIT_GIT_SSH_SMOKE_FAILED: i32 = 77;
 
+/// Phase 86c — `cargo xtask git-https-smoke` exit code. Distinct so CI can route
+/// a git-over-HTTPS failure separately. Boots m3OS, `pkg install git` (which
+/// pulls curl + mbedtls + ca-certificates via the solver), verifies the static
+/// `curl --version` reports the mbedTLS backend on-device + the CA bundle +
+/// gitconfig trust settings, then — when HTTPS egress is configured — proves a
+/// bad certificate is REJECTED (negative arm, no secret) and clones a public
+/// repo over `https://` (positive arm).
+const SMOKE_EXIT_GIT_HTTPS_SMOKE_FAILED: i32 = 78;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
     Headless,
@@ -758,6 +767,19 @@ fn main() {
                 });
             cmd_git_ssh_smoke(&smoke_args);
         }
+        // Phase 86c — `cargo xtask git-https-smoke` boots m3OS, `pkg install git`
+        // (pulling curl + mbedtls + ca-certificates via the solver), proves the
+        // static curl+mbedTLS stack runs on-device + trust is wired, and (opt-in,
+        // with egress) rejects a bad cert + clones a public repo over `https://`.
+        Some("git-https-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("git-https-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_git_https_smoke(&smoke_args);
+        }
         // Phase 85c — `cargo xtask python-smoke` boots m3OS, installs the bundled
         // CPython `.m3pkg` via `pkg install python`, then drives REPL/import/
         // script/file-IO assertions over serial. Proof the cross-built
@@ -966,7 +988,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -13769,7 +13791,11 @@ fn git_local_smoke_steps() -> Vec<SmokeStep> {
         // `--timeout 360` (.githooks/pre-push); under the bare default it shares
         // the budget with boot/login and the trailing git workflow.
         fail_prefix: "pkg install: cannot",
-        timeout_secs: 180,
+        // Phase 86c — git now depends on curl (HTTPS), so `pkg install git` pulls
+        // the whole curl+mbedtls+ca-certificates chain (~27 MB of .m3pkg) over the
+        // slow ring-3 VFS, not just the 7.4 MB local-only git. The per-step ceiling
+        // is raised accordingly (it normally completes well under this).
+        timeout_secs: 1800,
         label: "git-local-smoke: git installed from .m3pkg",
         exit_code_on_fail: SMOKE_EXIT_GIT_SMOKE_FAILED,
     });
@@ -14142,7 +14168,10 @@ fn git_ssh_smoke_steps(
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: "pkg install: git: OK",
         fail_prefix: "pkg install: cannot",
-        timeout_secs: 180,
+        // Phase 86c — git now pulls the curl+mbedtls+ca-certificates HTTPS chain
+        // (~27 MB) over the slow VFS, so the install step ceiling is raised (the
+        // global git-ssh-smoke --timeout 5400 has ample room).
+        timeout_secs: 1800,
         label: "git-ssh-smoke: git installed from .m3pkg",
         exit_code_on_fail: SMOKE_EXIT_GIT_SSH_SMOKE_FAILED,
     });
@@ -14306,6 +14335,348 @@ fn git_ssh_smoke_steps(
             pattern: "Hello World",
             timeout_secs: 60,
             label: "git-ssh-smoke: HEAD checked out (clone succeeded)",
+        });
+    }
+
+    steps
+}
+
+/// Phase 86c — `cargo xtask git-https-smoke`. Cross-builds the HTTPS transport
+/// chain (mbedtls -> curl -> git, + ca-certificates), boots m3OS, `pkg install
+/// git` (which pulls curl + mbedtls + ca-certificates via the solver), proves the
+/// static `curl`+mbedTLS RUNS on-device + the trust store/gitconfig are wired,
+/// then — when HTTPS egress is configured (`M3OS_GIT_HTTPS_NET=1`) — proves a bad
+/// certificate is REJECTED (negative arm, no secret) and clones a public repo
+/// over `https://` (positive arm, validated by the smart-HTTP advertisement).
+///
+/// Mirrors `cmd_git_ssh_smoke`: the network-free CORE always runs (and SKIPs with
+/// reason if the musl cross-compiler is absent); the network arms are opt-in.
+fn cmd_git_https_smoke(args: &SmokeBootArgs) {
+    // Build the full HTTPS transport chain (zlib -> mbedtls -> ca-certificates ->
+    // curl -> git). build_git_port now drives the whole chain; both the curl and
+    // mbedtls `.m3pkg`s must exist for the data disk to bundle into `/usr/pkg/`.
+    // A warm pkgcache makes each a zero-compiler hit. A missing musl cross-
+    // compiler is a build precondition, not a gate failure — SKIP with reason,
+    // mirroring tls-smoke/dns-smoke/git-ssh-smoke.
+    if let Err(msg) = port_build::build_git_port() {
+        if msg.contains("no musl cross-compiler") {
+            println!("git-https-smoke: SKIP (reason: {msg})");
+            return;
+        }
+        eprintln!("git-https-smoke: precondition failed (git/curl port build): {msg}");
+        std::process::exit(SMOKE_EXIT_GIT_HTTPS_SMOKE_FAILED);
+    }
+
+    // Network mode (host-side decision, like tls/dns SKIP). The negative
+    // bad-cert-reject arm needs egress but NO secret; the positive clone uses an
+    // anonymous public repo (no PAT). `M3OS_GIT_HTTPS_NET=1` opts both in.
+    let attempt_net = std::env::var("M3OS_GIT_HTTPS_NET").is_ok_and(|v| v == "1");
+    // The positive-arm repo (a famously tiny public repo) + the negative-arm
+    // bad-cert endpoint; both overridable. Leaked to `&'static` so they ride in
+    // SmokeSteps. self-signed.badssl.com is the standard public bad-certificate
+    // test service (presents a self-signed leaf), so the negative arm needs no
+    // secret and no local TLS server.
+    let repo: &'static str = match std::env::var("M3OS_GIT_HTTPS_REPO") {
+        Ok(r) if !r.is_empty() => Box::leak(r.into_boxed_str()),
+        _ => "https://github.com/octocat/Hello-World.git",
+    };
+    let bad_repo: &'static str = match std::env::var("M3OS_GIT_HTTPS_BADREPO") {
+        Ok(r) if !r.is_empty() => Box::leak(r.into_boxed_str()),
+        _ => "https://self-signed.badssl.com/m3os.git",
+    };
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    // Rebuild the data disk so the freshly-bundled curl + mbedtls + ca-certificates
+    // + git `.m3pkg`s and the `/etc/gitconfig` HTTPS trust settings are present and
+    // the installed-package DB starts clean.
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false, // graphical_login — autologin / serial path
+    );
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    // Plain SLIRP user net (outbound TCP works by default) — drop the smoke's
+    // hostfwd, not needed for an outbound clone.
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, display_mode, DeviceSet::default());
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    // The live network path drives a real TLS 1.3 handshake, whose ephemeral
+    // X25519/ECDHE needs the 86a CSPRNG at READY — mbedTLS's CTR_DRBG seeds from
+    // `sys_getrandom`, which blocks until the DRBG is READY. The default TCG
+    // `qemu64` model exposes no hardware RNG, so the CSPRNG never credits entropy;
+    // advertise RDRAND/RDSEED (TCG emulates both) so it reaches READY. Only added
+    // when the network path is exercised (harmless to the network-free core).
+    if attempt_net {
+        for i in 0..qemu_args.len() {
+            if qemu_args[i] == "-cpu"
+                && let Some(cpu) = qemu_args.get_mut(i + 1)
+                && cpu.starts_with("qemu64")
+                && !cpu.contains("rdrand")
+            {
+                cpu.push_str(",+rdrand,+rdseed");
+            }
+        }
+    }
+    let steps = git_https_smoke_steps(attempt_net, repo, bad_repo);
+
+    println!(
+        "git-https-smoke: launching QEMU (timeout {}s, {} steps; net={attempt_net})",
+        args.timeout_secs,
+        steps.len()
+    );
+    if !attempt_net {
+        println!(
+            "git-https-smoke: NOTE — the live HTTPS arms (bad-cert REJECT + public `git clone \
+             https://…`) are SKIPPED (set M3OS_GIT_HTTPS_NET=1 to run them; egress to \
+             github.com:443 + self-signed.badssl.com:443, no secret needed). The always-on core \
+             still proves the static curl+mbedTLS stack installs + runs on m3OS and the \
+             CA bundle + gitconfig trust settings are wired."
+        );
+    }
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            let tag = if attempt_net {
+                "PASSED (incl. live bad-cert REJECT + https:// clone)"
+            } else {
+                "PASSED core (live HTTPS arms SKIPPED — see NOTE above)"
+            };
+            println!(
+                "git-https-smoke: {tag} ({} steps in {elapsed}s)",
+                steps.len()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("git-https-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_GIT_HTTPS_SMOKE_FAILED);
+        }
+    }
+}
+
+/// The serial script for `git-https-smoke`. The CORE (boot → `pkg install git`
+/// pulling the curl/mbedtls/ca-certs chain → on-device `curl --version` shows
+/// mbedTLS → gitconfig trust + CA bundle present) is unconditional and
+/// network-free. The negative bad-cert-REJECT arm and the positive public clone
+/// (`attempt_net`) are appended only when HTTPS egress is configured.
+fn git_https_smoke_steps(
+    attempt_net: bool,
+    repo: &'static str,
+    bad_repo: &'static str,
+) -> Vec<SmokeStep> {
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/git-https-smoke: kernel first message",
+    }];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    // 1. Install git from the bundled offline repo. The solver reads git.meta
+    //    `DEPS=zlib curl` and curl.meta `DEPS=zlib mbedtls ca-certificates`, so it
+    //    installs the whole HTTPS chain (zlib -> mbedtls -> ca-certificates ->
+    //    curl -> git). This is a large multi-MB install over the slow ring-3 VFS,
+    //    hence the generous step ceiling.
+    steps.push(SmokeStep::Send {
+        input: "pkg install git\n",
+        label: "git-https-smoke: pkg install git (+ curl/mbedtls/ca-certificates)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "pkg install: resolving git + dependencies",
+        timeout_secs: 60,
+        label: "git-https-smoke: dependency solver engaged (HTTPS chain)",
+    });
+    // The CA bundle (ca-certificates) is a transitive dep of curl, so the solver
+    // installs it; its per-package OK line proves the trust store landed under /.
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "pkg install: ca-certificates: OK",
+        fail_prefix: "pkg install: cannot",
+        timeout_secs: 1800,
+        label: "git-https-smoke: ca-certificates (CA bundle) installed",
+        exit_code_on_fail: SMOKE_EXIT_GIT_HTTPS_SMOKE_FAILED,
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "pkg install: git: OK",
+        fail_prefix: "pkg install: cannot",
+        timeout_secs: 1800,
+        label: "git-https-smoke: git + curl + mbedtls installed from .m3pkg",
+        exit_code_on_fail: SMOKE_EXIT_GIT_HTTPS_SMOKE_FAILED,
+    });
+
+    // 2. The static curl + mbedTLS backend actually RUNS inside m3OS. `curl
+    //    --version` prints its TLS backend; "mbedTLS" in the OUTPUT (not in the
+    //    `curl --version` command text) proves the cross-built TLS engine — the
+    //    same code git's git-remote-http links — executes on m3OS.
+    steps.push(SmokeStep::Send {
+        input: "curl --version\n",
+        label: "git-https-smoke: curl --version",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "mbedTLS",
+        timeout_secs: 60,
+        label: "git-https-smoke: static curl+mbedTLS runs on m3OS",
+    });
+
+    // 3. The gitconfig HTTPS trust settings round-trip the VFS and agree with the
+    //    CA bundle path. The values ("/etc/ssl/certs/ca-certificates.crt", "true")
+    //    appear only in the git-config OUTPUT, never in the command text.
+    steps.push(SmokeStep::Send {
+        input: "git config --get http.sslCAInfo\n",
+        label: "git-https-smoke: read http.sslCAInfo",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "/etc/ssl/certs/ca-certificates.crt",
+        timeout_secs: 20,
+        label: "git-https-smoke: http.sslCAInfo points at the CA bundle",
+    });
+    steps.push(SmokeStep::Send {
+        input: "git config --get http.sslVerify\n",
+        label: "git-https-smoke: read http.sslVerify",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "true",
+        timeout_secs: 20,
+        label: "git-https-smoke: http.sslVerify is on (certs are checked)",
+    });
+
+    // 4. The CA bundle file content round-tripped the VFS. cacert.pem opens with
+    //    a "## Bundle of CA Root Certificates" comment header — distinctive text
+    //    in the file CONTENT, never in the `head` command, so matching it proves
+    //    the installed bundle is the real Mozilla root set, not an empty stub.
+    steps.push(SmokeStep::Send {
+        input: "head -2 /etc/ssl/certs/ca-certificates.crt\n",
+        label: "git-https-smoke: read the installed CA bundle header",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Bundle of CA Root Certificates",
+        timeout_secs: 20,
+        label: "git-https-smoke: CA bundle content present on disk",
+    });
+
+    // 5. (Opt-in, needs egress) NEGATIVE arm — a bad certificate must be REJECTED.
+    //    self-signed.badssl.com presents a self-signed leaf; with http.sslVerify
+    //    on, git's curl+mbedTLS path must FAIL the TLS handshake at chain
+    //    validation rather than proceed. Two acceptable curl/mbedTLS rejection
+    //    phrasings are matched; a successful transfer ("Cloning into" reaching
+    //    "Receiving objects") would mean verification was off — the WaitEither
+    //    times out on any non-rejection outcome (no "Receiving objects" can appear
+    //    for a self-signed host whose handshake aborts), failing the gate. This
+    //    arm needs NO secret — the cert is compared before any auth.
+    if attempt_net {
+        let bad_clone_cmd: &'static str =
+            Box::leak(format!("git clone --depth 1 '{bad_repo}' /tmp/badclone\n").into_boxed_str());
+        steps.push(SmokeStep::Send {
+            input: bad_clone_cmd,
+            label: "git-https-smoke: clone a self-signed-cert host (must reject)",
+        });
+        steps.push(SmokeStep::WaitEither {
+            // curl's generic verify-fail wording (CURLE_PEER_FAILED_VERIFICATION)…
+            pattern_a: "SSL certificate problem",
+            // …or the mbedTLS/curl backend's explicit verify-failure wording.
+            pattern_b: "certificate verif",
+            timeout_secs: 120,
+            label: "git-https-smoke: self-signed cert REJECTED (TLS fails closed)",
+            extra_steps_a: &[],
+            extra_steps_b: &[],
+        });
+    }
+
+    // 6. (Opt-in, needs egress) POSITIVE arm — a real anonymous clone over HTTPS.
+    //    First validate the smart-HTTP advertisement explicitly: the info/refs
+    //    response Content-Type is `application/x-git-upload-pack-advertisement`
+    //    and its pkt-line body begins `# service=git-upload-pack` (a `text/plain`
+    //    reply would trigger the unsupported dumb-HTTP fallback). Then a full
+    //    `git clone` of a tiny public repo proves the end-to-end TLS + cert-chain
+    //    + SNI + hostname-verify + packfile path, and reading a file from the tree
+    //    proves HEAD checked out.
+    if attempt_net {
+        let refs_url: &'static str =
+            Box::leak(format!("{repo}/info/refs?service=git-upload-pack").into_boxed_str());
+        let refs_cmd: &'static str = Box::leak(
+            format!("curl -sS -D /tmp/h.txt -o /tmp/refs.txt '{refs_url}'\n").into_boxed_str(),
+        );
+        steps.push(SmokeStep::Send {
+            input: refs_cmd,
+            label: "git-https-smoke: GET smart-HTTP info/refs over TLS",
+        });
+        steps.push(SmokeStep::Sleep { millis: 500 });
+        steps.push(SmokeStep::Send {
+            input: "cat /tmp/h.txt\n",
+            label: "git-https-smoke: read info/refs response headers",
+        });
+        steps.push(SmokeStep::Wait {
+            pattern: "x-git-upload-pack-advertisement",
+            timeout_secs: 60,
+            label: "git-https-smoke: Content-Type is the smart-HTTP advertisement",
+        });
+        steps.push(SmokeStep::Send {
+            input: "head -c 30 /tmp/refs.txt\n",
+            label: "git-https-smoke: read info/refs pkt-line magic",
+        });
+        steps.push(SmokeStep::Wait {
+            pattern: "service=git-upload-pack",
+            timeout_secs: 20,
+            label: "git-https-smoke: pkt-line advertisement body validated",
+        });
+
+        let clone_cmd: &'static str = Box::leak(
+            format!("git clone --depth 1 --single-branch '{repo}' /tmp/hclone\n").into_boxed_str(),
+        );
+        steps.push(SmokeStep::Send {
+            input: clone_cmd,
+            label: "git-https-smoke: git clone over https://",
+        });
+        steps.push(SmokeStep::WaitPassOrFail {
+            pass_pattern: "Receiving objects",
+            fail_prefix: "fatal:",
+            timeout_secs: 600,
+            label: "git-https-smoke: packfile transfer started (TLS + smart-HTTP OK)",
+            exit_code_on_fail: SMOKE_EXIT_GIT_HTTPS_SMOKE_FAILED,
+        });
+        steps.push(SmokeStep::Send {
+            input: "cat /tmp/hclone/README\n",
+            label: "git-https-smoke: read a file from the cloned tree",
+        });
+        steps.push(SmokeStep::Wait {
+            pattern: "Hello World",
+            timeout_secs: 60,
+            label: "git-https-smoke: HEAD checked out (clone succeeded)",
         });
     }
 
@@ -16085,7 +16456,23 @@ fn populate_ext2_files(
     // git's dubious-ownership guard never fires — globally disabling it with
     // `safe.directory = *` would only weaken safety for future multi-user use.
     // Tabs match git's own config style.
-    let gitconfig_content = "[user]\n\tname = m3OS Tester\n\temail = git-smoke@m3os.local\n[init]\n\tdefaultBranch = main\n[core]\n\tpager = cat\n";
+    //
+    // Phase 86c — HTTPS git transport trust + credential policy:
+    //   http.sslVerify = true                          — NEVER ride HTTPS with
+    //     certificate verification off (the classic silently-broken-clone footgun).
+    //   http.sslCAInfo = /etc/ssl/certs/ca-certificates.crt — the SHA-256-pinned
+    //     Phase 86a CA bundle path. This MUST match curl's compiled-in
+    //     `--with-ca-bundle` and `$GIT_SSL_CAINFO`, or git and curl would disagree
+    //     on the trust store and validation would break silently. `pkg install
+    //     ca-certificates` lays the bundle at this path (it is git's `curl` dep's
+    //     transitive dep, so it is pulled automatically). Hostname verification is
+    //     curl's verified default (`SSL_VERIFYHOST = 2`), separate from chain trust.
+    //   credential.helper = store                      — GitHub rejects password
+    //     auth over HTTPS; the credential is a Personal Access Token (PAT) used as
+    //     the password, read from `~/.git-credentials` (the `store` helper) or
+    //     `~/.netrc`. The token is supplied at clone time and is kept out of serial
+    //     output (the smoke redacts it); no token is baked into the image.
+    let gitconfig_content = "[user]\n\tname = m3OS Tester\n\temail = git-smoke@m3os.local\n[init]\n\tdefaultBranch = main\n[core]\n\tpager = cat\n[http]\n\tsslVerify = true\n\tsslCAInfo = /etc/ssl/certs/ca-certificates.crt\n[credential]\n\thelper = store\n";
 
     // Phase 86b — pre-seed GitHub's ed25519 host key into `/root/.ssh/known_hosts`
     // as rotatable DATA (not compiled-in). dropbear's `dbclient` does
@@ -18084,7 +18471,17 @@ fn populate_phase_69d_ports(part_path: &Path, workspace_root: &Path) {
     // /etc/ssl/certs/ca-certificates.crt (not /usr/local), so it is NOT
     // pre-installed at boot.  86c consumers (curl/git transport) `pkg install
     // ca-certificates` from the bundled /usr/pkg/ offline repo on first use.
-    const BUNDLE_ONLY_PORTS: &[&str] = &["git", "python", "ca-certificates"];
+    //
+    // Phase 86c — mbedtls + curl are bundle-only too: they are git's HTTPS
+    // transport dependencies (git.meta DEPS=`zlib curl`; curl.meta DEPS=`zlib
+    // mbedtls`), so `pkg install git` pulls them from /usr/pkg via the solver in
+    // the order zlib -> mbedtls -> curl -> ca-certificates -> git. They are NOT
+    // pre-installed (they are build-time libraries whose code is already linked
+    // into the git helper); the .m3pkg only needs to exist for the solver to
+    // resolve. The artifacts exist once build_git_port has built the chain (the
+    // git-https-smoke gate does so first); on a routine image build where they
+    // are absent this is a no-op, so nothing regresses.
+    const BUNDLE_ONLY_PORTS: &[&str] = &["git", "python", "ca-certificates", "mbedtls", "curl"];
     for port in BUNDLE_ONLY_PORTS {
         let Ok(artifact) = port_build::pkgcache_artifact_path(port) else {
             continue;

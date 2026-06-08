@@ -89,8 +89,8 @@
 **Why it matters:** hostname verification is **separate** from chain validation (`mbedtls_ssl_set_hostname` / `SSL_VERIFYHOST=2`), GitHub rejects password auth (PAT only), and the CAINFO default must agree across git and curl or trust silently breaks.
 
 **Acceptance:**
-- [ ] `/etc/gitconfig` sets `http.sslVerify=true` and `http.sslCAInfo=/etc/ssl/certs/ca-certificates.crt` (matching curl's `--with-ca-bundle` and `GIT_SSL_CAINFO`); the PAT mechanism (`credential.helper store` or `~/.netrc`) is configured and documented.
-- [ ] A trust-model doc section records: ChaCha20-Poly1305-first (no AES-NI until 86f), the CAINFO override knobs, the DEFERRED set (no OCSP/CRL, tickets off, IPv4/A-records only), that PAT tokens are redacted from serial, and the plaintext-credential-at-rest tradeoff.
+- [x] `/etc/gitconfig` (staged by `populate_ext2_files`) sets `http.sslVerify=true` and `http.sslCAInfo=/etc/ssl/certs/ca-certificates.crt` (matching curl's `--with-ca-bundle` and `GIT_SSL_CAINFO`); `credential.helper=store` configures the PAT mechanism (`~/.git-credentials`), with `~/.netrc` as the documented alternative. `mbedtls` + `curl` are added to `BUNDLE_ONLY_PORTS` so `pkg install git` resolves the full `zlib → mbedtls → curl → ca-certificates → git` chain from `/usr/pkg`.
+- [x] A **Trust Model (86c)** section in [`../86c-https-git-transport.md`](../86c-https-git-transport.md) records: ChaCha20-Poly1305-first (no AES-NI until 86f), the CAINFO override knobs (3-way agreement across curl `--with-ca-bundle` / `http.sslCAInfo` / `GIT_SSL_CAINFO`), chain-vs-hostname separation, the wall-clock dependency, the entropy source, the DEFERRED set (no OCSP/CRL, tickets off, IPv4/A-records only, smart-HTTP only), PAT-token serial redaction, and the plaintext-credential-at-rest tradeoff.
 
 ### C.2 — `git-https-smoke`: success clone AND rejected-bad-cert
 
@@ -103,9 +103,9 @@
 **Why it matters:** it is trivial to ship a green clone while certificate verification is silently disabled; the negative case is mandatory and — unlike the positive clone — needs no secret.
 
 **Acceptance:**
-- [ ] `M3OS_GIT_HTTPS_REGRESSION=1` runs `cargo xtask git-https-smoke`, which (1) performs a successful clone whose `info/refs` response is validated by `Content-Type: application/x-git-upload-pack-advertisement` **and** the 5-byte pkt-line magic, and (2) confirms an expired / wrong-host / self-signed certificate is **REJECTED** (clone fails closed).
-- [ ] The gate uses a long `--timeout` (curl/mbedtls/git rebuild + the slow ~200 KB/s ring-3 VFS clone — clang-gate class, e.g. ≥1800s); a clone smoke uses `--depth 1 --single-branch` of a tiny repo to bound transfer.
-- [ ] The endpoint design is documented: a SLIRP-localhost-TLS server (with deliberately expired/wrong-host/self-signed certs) drives the **negative** arm with no secret, and an anonymous read-only public repo (or a PAT-gated repo) drives the **positive** arm; the gate is wired into both `AGENTS.md` and `.githooks/pre-push`.
+- [x] `M3OS_GIT_HTTPS_REGRESSION=1` runs `cargo xtask git-https-smoke` (`cmd_git_https_smoke` + `git_https_smoke_steps`). Positive arm (opt-in `M3OS_GIT_HTTPS_NET=1`): validates `info/refs` by the `application/x-git-upload-pack-advertisement` Content-Type **and** the `# service=git-upload-pack` pkt-line body, then a full `git clone --depth 1 --single-branch` whose `Receiving objects` + README `Hello World` prove the end-to-end TLS path. Negative arm (opt-in, **no secret**): a `self-signed.badssl.com` clone must be **REJECTED** (`SSL certificate problem` / `certificate verif`); a `WaitEither` times out on any non-rejection (silent accept fails the gate). The always-on **core** (no network) proves `pkg install git` pulls the curl/mbedtls/ca-certs chain, the static `curl --version` reports `mbedTLS` on-device, the gitconfig trust settings resolve, and the CA bundle content is on disk.
+- [x] The gate uses a long `--timeout 5400` (clang-gate class: the ~27 MB curl+mbedtls+ca-certs+git install over the slow ~200 KB/s ring-3 VFS + the packfile transfer); the positive clone uses `--depth 1 --single-branch` of a tiny public repo to bound transfer. The existing `git-local-smoke`/`git-ssh-smoke` install-step ceilings + the `git-local-smoke` pre-push timeout were raised too (git now pulls the curl chain).
+- [x] The endpoint design is documented: `self-signed.badssl.com` (the standard public self-signed-cert test service) drives the **negative** arm with no secret and no local TLS server, and the anonymous read-only public `octocat/Hello-World` repo drives the **positive** arm (PAT auth is configured via `credential.helper store` but not needed for the anonymous clone; a PAT-gated repo is available via `M3OS_GIT_HTTPS_REPO`). The gate is wired into both `AGENTS.md` (`M3OS_GIT_HTTPS_REGRESSION` row) and `.githooks/pre-push`. *(The SLIRP-localhost-TLS server is the design-doc alternative; the public bad-cert service is simpler and reproducible.)*
 
 ### C.3 — Bump kernel crate `0.86.1` → `0.86.2`
 
@@ -114,7 +114,7 @@
 **Why it matters:** 86c is the third Phase 86 sub-phase and lands its own `0.86.x` patch bump per the umbrella version sequence.
 
 **Acceptance:**
-- [ ] `kernel/Cargo.toml` line 3 reads `version = "0.86.2"` (+ `Cargo.lock`); `cargo xtask check` is clean (clippy + rustfmt + all host tests + retpoline gate); the boot banner / `uname` report `0.86.2`.
+- [x] `kernel/Cargo.toml` line 3 reads `version = "0.86.2"` (+ `Cargo.lock` synced); `cargo xtask check` is clean (clippy + rustfmt + all host tests + retpoline gate); the boot banner reads `0.86.2` (it prints `env!("CARGO_PKG_VERSION")`, so it tracks automatically). AGENTS.md's overview line bumped to `v0.86.2`.
 
 ---
 

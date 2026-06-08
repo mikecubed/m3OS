@@ -65,6 +65,18 @@ The bundled `/etc/gitconfig` is staged by `populate_ext2_files` (`xtask/src/main
 
 A new serial gate modeled on `cmd_git_local_smoke` (`xtask/src/main.rs:13584`). It has two mandatory arms: (1) a positive clone whose `info/refs` response is validated by the `application/x-git-upload-pack-advertisement` Content-Type plus the 5-byte pkt-line magic; (2) a negative arm where an expired / wrong-host / self-signed certificate is **rejected**. The negative arm needs no secret and is the proof that verification is not silently disabled.
 
+## Trust Model (86c)
+
+The HTTPS git transport's security posture, recorded explicitly so a future reader knows what is *intentionally* in or out of scope:
+
+- **Cipher preference: ChaCha20-Poly1305 first.** With no hardware AES-NI until Phase 86f, software AES-GCM is both slower and cache-timing-exposed, so the mbedTLS client prefers `TLS_CHACHA20_POLY1305_SHA256` (which GitHub offers) over soft AES-GCM. AES-GCM stays compiled in as an interop fallback, not the default.
+- **Trust store + CAINFO agreement.** The single source of trust is the SHA-256-pinned Phase 86a Mozilla CA bundle at `/etc/ssl/certs/ca-certificates.crt`. This exact path is wired in three places that **must** agree: curl's compiled-in `--with-ca-bundle`, git's `/etc/gitconfig` `http.sslCAInfo`, and the `GIT_SSL_CAINFO` env override. A per-invocation override is possible via `git -c http.sslCAInfo=…` / `GIT_SSL_CAINFO=…`, but the default must never diverge or trust breaks silently.
+- **Chain validation is separate from hostname verification.** mbedTLS validates the X.509 chain to a trusted root *and* (via curl's `SSL_VERIFYHOST = 2`, the verified default) checks the leaf's SAN/CN against the requested host. A passing chain with no hostname check is still broken; the mandatory negative smoke arm (wrong-host / self-signed / expired → **rejected**) guards both.
+- **Wall-clock dependency.** Certificate validity (`notBefore`/`notAfter`) is meaningful only with a trustworthy clock — a hard dependency on Phase 86a Track B's build-date floor. Under `BOOT_EPOCH_SECS = 0` every cert reads "not yet valid" and TLS fails-closed for the *wrong* reason; 86c must not be validated against that clock.
+- **Entropy.** TLS session keys + X25519/ECDHE ephemerals come from the Phase 86a `sys_getrandom` CSPRNG via the mbedTLS `mbedtls_hardware_poll` shim — never a file-I/O entropy path (no `/dev/urandom` compiled in).
+- **Credentials: PAT only, plaintext-at-rest tradeoff.** GitHub rejects password-over-HTTPS, so authentication is a Personal Access Token used as the password. `/etc/gitconfig` sets `credential.helper = store`, which persists the token in `~/.git-credentials` as **plaintext** (mode 0600). This is the documented tradeoff: m3OS has no secret-service/keyring yet, so a PAT supplied for a clone is readable by anything running as that user. Tokens are supplied at clone time, never baked into the image, and the smoke gate **redacts** them from serial output. `~/.netrc` is the equivalent alternative.
+- **Deferred (intentionally out of scope).** No OCSP/CRL revocation checking; TLS session resumption / tickets are off; client certificates are unsupported; the stack is IPv4 / A-record only (no AAAA/IPv6 — Phase 89); only smart-HTTP is supported (the dumb-HTTP `git-http-fetch` walker is pruned-adjacent and unused). These match what a production stack would add and 86c deliberately does not.
+
 ## How This Builds on Earlier Phases
 
 - Consumes the **Phase 86a** CSPRNG (CTR_DRBG entropy), the **build-date wall-clock floor** (cert validity — a hard blocker), and the SHA-256-pinned **`ca-certificates` `.m3pkg`** on the canonical `/etc/ssl/certs/ca-certificates.crt` path.

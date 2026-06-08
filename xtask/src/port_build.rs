@@ -331,7 +331,7 @@ fn build_recipe_id(name: &str) -> &'static str {
         // mbedtls + zlib link line) + CURL_CONFIG=true (neutralizes the host
         // curl-config --vernum probe). The 85b absence-assertions are INVERTED to
         // presence: git-remote-https/git-remote-http/git-http-fetch must exist and
-        // the remote-http helper must reference curl_easy_perform + a mbedTLS TLS
+        // the remote-http helper must reference curl_multi_perform + a mbedTLS TLS
         // symbol; SSL_CTX_new must stay ABSENT (NO_OPENSSL). The server-side
         // pack-helper prune is unchanged. Bump recipe-v on any knob/assertion
         // change. (curl/mbedtls dep keys fold in via compute_port_key.)
@@ -342,7 +342,7 @@ fn build_recipe_id(name: &str) -> &'static str {
              CURL_CONFIG=true CURL_CFLAGS=<curl_stage include> \
              CURL_LDFLAGS=<static libcurl+mbedtls+zlib link line> \
              SHELL_PATH=/bin/sh prefix=/usr;cflags:-O2;\
-             curl=ENABLED(git-remote-https+git-http-fetch present,curl_easy_perform+mbedtls_ssl symbol required,SSL_CTX_new absent);\
+             curl=ENABLED(git-remote-https+git-http-fetch present,curl_multi_perform+mbedtls_ssl symbol required,SSL_CTX_new absent);\
              prune=scalar,git-shell,upload-pack,receive-pack,upload-archive,imap-send,http-backend,daemon,sh-i18n--envsubst;recipe-v=4"
         }
         // Phase 85c — CPython's two-stage musl cross build. The identity is the
@@ -667,9 +667,13 @@ pub fn port_deps(name: &str) -> &'static [&'static str] {
         // zlib -> mbedtls -> curl -> ca-certificates -> git.
         "git" => &["zlib", "curl"],
         // Phase 86c Track B — curl links the staged static mbedtls (TLS backend)
-        // + zlib (transfer decompression). Both are direct build deps; their keys
-        // fold into curl's content key via compute_port_key's recursion.
-        "curl" => &["zlib", "mbedtls"],
+        // + zlib (transfer decompression) at BUILD time, and needs the
+        // ca-certificates trust store (the Mozilla CA bundle at
+        // /etc/ssl/certs/ca-certificates.crt) at RUNTIME to validate certs. All
+        // three are deps so the in-OS solver installs the CA bundle when git pulls
+        // curl; their keys fold into curl's content key via compute_port_key's
+        // recursion. (ca-certificates is a data-only package — no compiler.)
+        "curl" => &["zlib", "mbedtls", "ca-certificates"],
         // Phase 85c — CPython's `zlib`/`gzip`/`zipfile` extensions link the
         // staged (-fPIC) libz.a. zlib is a leaf, so the non-recursive dep-key
         // computation is correct here too. NOTE: ncurses (for `_curses`/
@@ -1770,13 +1774,19 @@ fn build_git(
         ));
     }
     // Positive proof the curl + mbedTLS TLS path actually linked into the helper:
-    // these exact symbol names only land in the (still-unstripped) git-remote-http
-    // when remote-curl.c links libcurl and curl's vtls/mbedtls backend links
-    // mbedTLS. Their presence is a direct, toolchain-independent proof that HTTPS
-    // rode in over the trusted stack (the inverse of the 85b absence check).
-    if !binary_contains(&remote_http, b"curl_easy_perform")? {
+    // these symbol names land in git-remote-http when remote-curl.c links libcurl
+    // and curl's vtls/mbedtls backend links mbedTLS. The check runs here in
+    // `build_git` — which executes BEFORE `seal_package`'s `strip_stage`, so the
+    // staged helper is still unstripped and carries its symbol table. We assert
+    // on `curl_multi_perform` (NOT `curl_easy_perform`): git 2.44 drives transfers
+    // through curl's MULTI interface (`http.c` calls `curl_multi_perform`), so it
+    // is a symbol git actually CALLS — a semantically meaningful, strip-robust
+    // proof, where `curl_easy_perform` would be only a symtab artifact git never
+    // invokes. Presence is direct, toolchain-independent proof that HTTPS rode in
+    // over the trusted stack (the inverse of the 85b absence check).
+    if !binary_contains(&remote_http, b"curl_multi_perform")? {
         return Err(
-            "git build: git-remote-http does not reference libcurl (curl_easy_perform) — \
+            "git build: git-remote-http does not reference libcurl (curl_multi_perform) — \
              curl did not link (HTTPS would not work)"
                 .to_string(),
         );
@@ -1815,7 +1825,7 @@ fn build_git(
 
     println!(
         "git: produced /usr/bin/git ({} bytes, unstripped) + libexec/git-core + templates; \
-         curl+mbedTLS HTTPS verified (git-remote-https + curl_easy_perform + mbedtls_ssl_handshake \
+         curl+mbedTLS HTTPS verified (git-remote-https + curl_multi_perform + mbedtls_ssl_handshake \
          present, SSL_CTX_new absent, server pack helpers pruned)",
         file_size(&git_bin)
     );
@@ -3876,11 +3886,14 @@ pub fn build_git_port() -> Result<(), String> {
         );
     }
     // Phase 86c — git is now rebuilt WITH curl, so the full transport chain is
-    // built in dependency-first order: zlib -> mbedtls -> curl -> git. A warm
-    // pkgcache makes each a zero-compiler hit. (ca-certificates is a data-only
-    // package bundled separately; the in-OS solver installs it from git's DEPS.)
+    // built in dependency-first order: zlib -> mbedtls -> ca-certificates ->
+    // curl -> git. ca-certificates is a data-only package (download + stage, no
+    // compiler) that curl lists as a runtime dep (the trust store), so its
+    // `.m3pkg` must exist for the image to bundle it + the in-OS solver to install
+    // it under git. A warm pkgcache makes each a zero-compiler hit.
     port_build("zlib").map_err(|e| format!("port zlib: {e}"))?;
     port_build("mbedtls").map_err(|e| format!("port mbedtls: {e}"))?;
+    port_build("ca-certificates").map_err(|e| format!("port ca-certificates: {e}"))?;
     port_build("curl").map_err(|e| format!("port curl: {e}"))?;
     port_build("git").map_err(|e| format!("port git: {e}"))?;
     Ok(())
@@ -4204,12 +4217,16 @@ mod tests {
         // Phase 86c — git now depends on zlib + curl (HTTPS transport); curl
         // transitively pulls mbedtls + ca-certificates via the solver.
         assert_eq!(port_deps("git"), &["zlib", "curl"]);
-        // Phase 86c — mbedtls is a leaf; curl links the staged zlib + mbedtls.
+        // Phase 86c — mbedtls is a leaf; curl links the staged zlib + mbedtls and
+        // needs ca-certificates (the runtime trust store) so the solver installs
+        // the CA bundle when git pulls curl.
         assert_eq!(port_deps("mbedtls"), &[] as &[&str]);
         let curl_deps = port_deps("curl");
         assert!(
-            curl_deps.contains(&"zlib") && curl_deps.contains(&"mbedtls"),
-            "curl must list both zlib and mbedtls as deps"
+            curl_deps.contains(&"zlib")
+                && curl_deps.contains(&"mbedtls")
+                && curl_deps.contains(&"ca-certificates"),
+            "curl must list zlib, mbedtls, and ca-certificates as deps"
         );
         // Phase 85c — python's one *runtime* dependency is zlib (zlib/gzip).
         // ncurses (for the statically-linked _curses/_curses_panel) is a
