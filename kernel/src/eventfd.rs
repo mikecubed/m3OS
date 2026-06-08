@@ -4,9 +4,13 @@
 //! Go 1.21+'s runtime creates an eventfd (`EFD_CLOEXEC | EFD_NONBLOCK`) as its
 //! cross-thread M-wakeup primitive (`netpollBreak`): write 8 bytes to signal,
 //! read 8 bytes to drain, and `epoll` for readability. Go's eventfd is
-//! non-blocking, so this implementation never parks a reader or writer — it
-//! drives only the `epoll`/`poll` wake path so a blocked `epoll_wait` resumes
-//! when another thread writes.
+//! non-blocking (an empty read returns `EAGAIN`), so for Go the hot path is the
+//! `epoll`/`poll` wake path that resumes a blocked `epoll_wait` when another
+//! thread writes. A *blocking* eventfd read (no `EFD_NONBLOCK`) is also
+//! supported: the reader parks on the object's wait queue until a write makes
+//! the counter non-zero (see the `FdBackend::EventFd` arm in `sys_linux_read`),
+//! mirroring the pipe read pattern. Writes never block here — Go's
+//! single-increment writes never approach the counter cap.
 //!
 //! The object is keyed by an integer id stored in `FdBackend::EventFd`, shared
 //! across the threads of a process via the shared fd table (`CLONE_FILES`),
@@ -30,8 +34,9 @@ pub const EFD_NONBLOCK: u64 = 0x0000_0800;
 pub const EFD_KNOWN_FLAGS: u64 = EFD_SEMAPHORE | EFD_CLOEXEC | EFD_NONBLOCK;
 
 /// Linux caps the eventfd counter at `2^64 - 2`; a write that would reach
-/// `2^64 - 1` blocks (or `EAGAIN`s for non-blocking fds).
-const EVENTFD_COUNTER_MAX: u64 = u64::MAX - 1;
+/// `2^64 - 1` blocks (or `EAGAIN`s for non-blocking fds). Sourced from the
+/// host-tested `kernel_core::eventfd` so the cap can't drift from the logic.
+const EVENTFD_COUNTER_MAX: u64 = kernel_core::eventfd::EVENTFD_COUNTER_MAX;
 /// Upper bound on concurrently-live eventfd objects.
 const EVENTFD_MAX: usize = 128;
 
@@ -93,37 +98,32 @@ fn id_align(wqs: &mut Vec<Option<WaitQueue>>, len: usize) {
 /// non-blocking). With `EFD_SEMAPHORE`, returns 1 and decrements; otherwise
 /// returns the whole counter and resets it to 0.
 pub fn eventfd_read(id: usize) -> Option<u64> {
+    use kernel_core::eventfd::ReadOutcome;
     let mut table = EVENTFD_TABLE.lock();
     let obj = table.get_mut(id)?.as_mut()?;
-    if obj.counter == 0 {
-        return None;
+    match kernel_core::eventfd::read_outcome(obj.counter, obj.semaphore) {
+        ReadOutcome::Empty => None,
+        ReadOutcome::Value(val, new_counter) => {
+            obj.counter = new_counter;
+            Some(val)
+        }
     }
-    let val = if obj.semaphore {
-        obj.counter -= 1;
-        1
-    } else {
-        let v = obj.counter;
-        obj.counter = 0;
-        v
-    };
-    Some(val)
 }
 
 /// Add `val` to the counter and wake any `epoll`/`poll` waiters. The counter is
 /// mutated under the table lock; the wake happens after the lock is released.
 pub fn eventfd_write(id: usize, val: u64) -> Result<(), EventFdWriteErr> {
+    use kernel_core::eventfd::WriteOutcome;
     {
         let mut table = EVENTFD_TABLE.lock();
         let obj = match table.get_mut(id).and_then(|s| s.as_mut()) {
             Some(o) => o,
             None => return Err(EventFdWriteErr::BadFd),
         };
-        if val == u64::MAX {
-            return Err(EventFdWriteErr::Invalid);
-        }
-        match obj.counter.checked_add(val) {
-            Some(sum) if sum <= EVENTFD_COUNTER_MAX => obj.counter = sum,
-            _ => return Err(EventFdWriteErr::WouldBlock),
+        match kernel_core::eventfd::write_outcome(obj.counter, val) {
+            WriteOutcome::Ok(sum) => obj.counter = sum,
+            WriteOutcome::Invalid => return Err(EventFdWriteErr::Invalid),
+            WriteOutcome::WouldBlock => return Err(EventFdWriteErr::WouldBlock),
         }
     }
     wake_eventfd(id);

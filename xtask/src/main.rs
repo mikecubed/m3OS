@@ -807,11 +807,12 @@ fn main() {
         // Phase 86d — `cargo xtask go-runtime-smoke` boots m3OS, installs the
         // bundled static-Go `.m3pkg` (`pkg install go`), and runs the runtime
         // probe over serial: GO_HELLO_OK (runtime up), GO_GOROUTINE_OK (a
-        // goroutine on a second OS thread completes a channel rendezvous), and
+        // LockOSThread goroutine completes a channel rendezvous), and
         // GO_HTTP_OK (a plaintext HTTP GET over the in-kernel TCP stack to a
-        // host server reached via the SLIRP gateway 10.0.2.2). Proves the three
-        // Phase 86d kernel blockers (mmap MAP_FIXED, edge-triggered epoll,
-        // SIGURG/tgkill) are cleared; no TLS (HTTPS-over-Go rides 86c → 86e).
+        // host server reached via a SLIRP guestfwd rule at 10.0.2.100:80).
+        // Proves the three Phase 86d kernel blockers (mmap MAP_FIXED,
+        // edge-triggered epoll, SIGURG/tgkill) are cleared; no TLS
+        // (HTTPS-over-Go rides 86c → 86e).
         Some("go-runtime-smoke") => {
             let smoke_args =
                 parse_smoke_boot_args("go-runtime-smoke", &args[2..]).unwrap_or_else(|err| {
@@ -13780,11 +13781,12 @@ fn cmd_git_local_smoke(args: &SmokeBootArgs) {
 /// Builds the static-Go `.m3pkg`, bundles it on the data disk, boots m3OS,
 /// installs it (`pkg install go`), and runs the runtime probe over serial. A
 /// tiny host HTTP server is started on an ephemeral loopback port; the guest
-/// reaches it through the QEMU SLIRP gateway at `10.0.2.2:<port>`, so the
-/// plaintext HTTP GET exercises the in-kernel TCP stack with no real egress and
-/// no DNS (the URL is a literal IP). Proves the three Phase 86d kernel blockers
-/// (mmap MAP_FIXED arena commit, edge-triggered epoll, SIGURG/tgkill) are
-/// cleared end-to-end; no TLS.
+/// reaches it via a SLIRP `guestfwd` rule at the synthetic in-subnet address
+/// `10.0.2.100:80` (forwarded to the host's `127.0.0.1:<ephemeral port>`), so
+/// the plaintext HTTP GET exercises the in-kernel TCP stack with no real egress
+/// and no DNS (the URL is a literal IP). Proves the three Phase 86d kernel
+/// blockers (mmap MAP_FIXED arena commit, edge-triggered epoll, SIGURG/tgkill)
+/// are cleared end-to-end; no TLS.
 fn cmd_go_runtime_smoke(args: &SmokeBootArgs) {
     // Build the static-Go `.m3pkg` so the data disk can bundle it into
     // `/usr/pkg/`. The first build downloads the Go toolchain + cross-compiles

@@ -485,9 +485,10 @@ fi
 # Phase 86d — Go-runtime regression gate. Gated behind M3OS_GO_REGRESSION=1
 # because it cross-builds a fully static (CGO_ENABLED=0) Go 1.24 program with the
 # downloaded official toolchain, bundles it, boots QEMU, `pkg install go`, and
-# runs the runtime probe: GO_HELLO_OK (runtime up) + GO_GOROUTINE_OK (a goroutine
-# on a 2nd OS thread completes a channel rendezvous) + GO_HTTP_OK (a plaintext
-# HTTP GET over the in-kernel TCP stack via the SLIRP gateway 10.0.2.2 — no TLS).
+# runs the runtime probe: GO_HELLO_OK (runtime up) + GO_GOROUTINE_OK (a
+# LockOSThread goroutine completes a channel rendezvous) + GO_HTTP_OK (a plaintext
+# HTTP GET over the in-kernel TCP stack via a SLIRP guestfwd rule at 10.0.2.100:80
+# — no TLS).
 # Proves the three Phase 86d kernel blockers (mmap MAP_FIXED, edge-triggered
 # epoll/epoll_pwait, SIGURG/tgkill). Set this on branches that touch ports/lang/go,
 # xtask's build_go / go-runtime-smoke, or the kernel mmap / epoll / signal / exec

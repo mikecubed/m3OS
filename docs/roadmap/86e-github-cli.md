@@ -61,7 +61,7 @@ Documented (not the primary path): a small Rust client that issues raw HTTPS `GE
 ## How This Builds on Earlier Phases
 
 - **Extends Phase 86c** by reusing its curl + mbedTLS + X.509 + PAT machinery as the *transport* under the `gh` credential helper, instead of writing a new git-over-HTTPS path.
-- **Builds on Phase 86d** by running the `gh` Go binary on the runtime that 86d brought up (`MAP_FIXED`, edge-`epoll`, `SIGURG`/`asyncpreemptoff`); `gh` is I/O-bound, so `asyncpreemptoff` is acceptable.
+- **Builds on Phase 86d** by running the `gh` Go binary on the runtime that 86d brought up (`MAP_FIXED`, edge-`epoll`, `SIGURG`/`tgkill` preemption delivered at syscall-return); `gh` is I/O-bound, so syscall-return preemption (no timer-IRQ-return path) is sufficient.
 - **Builds on Phase 86a (transitively)** for the CSPRNG (Go `crypto/tls` ephemerals), the wall-clock floor (cert `notBefore`/`notAfter`), DNS (`api.github.com` A-record), and the shared CA bundle reached via `SSL_CERT_FILE`.
 - **Reuses Phase 85**'s `.m3pkg` substrate + `M3OS_WITH_CLANG`-style opt-in image-feature pattern + `BUNDLE_ONLY_PORTS` bundling, without pulling those phases back onto the release-critical path.
 

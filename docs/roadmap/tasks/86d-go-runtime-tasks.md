@@ -52,7 +52,7 @@
 - [x] An `EPOLLET` interest reports an event **only** on a not-ready→ready transition: a still-readable fd is **not** re-reported on a subsequent `epoll_wait` until it is drained then refilled. *(host-tested `kernel_core::epoll::evaluate_interest`: `edge_triggered_suppressed_when_already_reported` + `edge_triggered_re_triggers_after_drain_then_refill`; `epoll_wait` is edge-aware in both the emit loop and the TOCTOU re-check to avoid a busy-loop.)*
 - [x] `EPOLLRDHUP` fires on peer half-close (derived from the fd's half-close state). *(`fd_poll_events` sets `POLLRDHUP` for TCP `CloseWait`/`LastAck`/`TimeWait`/`Closed`.)*
 - [x] The 12-byte `epoll_event` wire layout is unchanged. *(only kernel-internal `EpollInterest` gained a field; userspace struct untouched.)*
-- [x] Level-triggered behavior is preserved for the existing `async-rt` and `sshd` consumers (no regression in their smoke gates). *(LT path is byte-identical — `evaluate_interest` with `is_et=false` matches the prior `matched|unconditional` logic; `RDHUP` only surfaced when requested. Validated by `cargo xtask check` + the smoke/regression gate on push.)*
+- [x] Existing readiness consumers are preserved: the `poll()`-based `async-rt`/`sshd` (`fd_poll_events` is shared across `poll`/`select`/`epoll`) and the level-triggered `epoll` path (`epoll-smoke`). *(LT path is byte-identical — `evaluate_interest` with `is_et=false` matches the prior `matched|unconditional` logic; `RDHUP` only surfaced when requested, so `poll`/`select` callers that didn't ask for it never see it. Validated by `cargo xtask check` + the smoke/regression gate on push.)*
 
 ---
 
@@ -71,8 +71,8 @@
 **Acceptance:**
 - [x] `SIGURG`(23) is added to the signal constants (default disposition ignore) and is deliverable; `sys_rt_sigaction` accepts it. *(`process::SIGURG = 23` added to the `Ignore` arm of `default_signal_action` — the catch-all is `Terminate`, so this is required; `sys_rt_sigaction` already accepts signals 1–31, so SIGURG installs.)*
 - [x] `tgkill`(234) dispatches as `tkill`-by-tid (reusing the `TKILL` machinery), `sched_yield`(24) yields, and `madvise`(28) returns success as a no-op — none returns `ENOSYS`. *(`TGKILL => sys_tkill(arg1, arg2)`, `SCHED_YIELD => yield_now()`, `MADVISE => 0` in the dispatch.)*
-- [x] A written decision in the docs picks **IRQ-return delivery path** vs **`asyncpreemptoff` + `tgkill`-for-STW-only**; the rationale (destabilization risk vs preemption coverage) is recorded. *(Path (b) — `asyncpreemptoff`; see "As-built decision (86d)" in [86d-go-runtime.md](../86d-go-runtime.md).)*
-- [x] If the IRQ-path is chosen: a smoke confirms a compute-bound goroutine is preempted. If `asyncpreemptoff` is chosen: the limitation is documented (compute-bound goroutines won't async-preempt; GC stop-the-world still works via `tgkill`). *(Path (b) chosen; the limitation is documented in the design doc. The smoke runs Go with `GODEBUG=asyncpreemptoff=1`.)*
+- [x] A written decision in the docs records the preempt-delivery path and its rationale (destabilization risk vs preemption coverage). *(As-built: async preemption left **enabled** (default `GODEBUG`, no `asyncpreemptoff`); `SIGURG` delivered at **syscall-return** (not via the timer-IRQ-return path, which is deferred). See "As-built decision (86d)" in [86d-go-runtime.md](../86d-go-runtime.md).)*
+- [x] The chosen path's behavior + limitation is documented. *(Documented: a `tgkill(SIGURG)` wakes a thread blocked in a syscall and preempts at that boundary, so I/O-bound goroutines and GC stop-the-world preempt cooperatively; the **one** uncovered case is a syscall-free compute-bound goroutine — it has no syscall boundary at which the pending `SIGURG` can be delivered until the deferred IRQ-return path lands. The smoke runs Go with its **default** `GODEBUG` — `asyncpreemptoff` is not set; the SA_SIGINFO/`ucontext` fix this phase ships is reachable precisely because async preemption is on.)*
 - [x] The futex single-thread fast-path (`sys_futex` `FUTEX_WAIT`) is confirmed **not** to misfire if Go futex-sleeps before its first `newosproc` thread is created. *(Analysis in the design doc: the fast path fires only while `thread_group.is_none()` (pre-first-`clone`), a window in which Go's uncontended futex mutexes never reach `futexsleep`; left unchanged to avoid regressing musl's `__lock`. Empirically reconfirmed by the Track D `go-runtime-smoke`.)*
 
 ---
@@ -83,7 +83,7 @@
 
 **Files:**
 - `ports/lang/go/Portfile` (new)
-- `xtask/src/port_build.rs` (new `build_go`, registered in `PORTS` + the `port_build` `match name` dispatch)
+- `xtask/src/port_build.rs` (new `build_go`, dispatched by an early `if name == "go"` branch in `port_build` — like `git`/`python`/`llvm`, it is *not* in the routine-image `PORTS` set; the public `build_go_port` wrapper is what `go-runtime-smoke` calls)
 - `xtask/src/main.rs` (`cmd_go_runtime_smoke` modeled on `cmd_git_local_smoke` `main.rs:13584`; bundle via `BUNDLE_ONLY_PORTS` `main.rs:17541`)
 - `AGENTS.md` + `.githooks/pre-push` (opt-in `M3OS_GO_REGRESSION=1` gate row)
 
@@ -93,7 +93,7 @@
 **Acceptance:**
 - [x] `ports/lang/go/Portfile` pins Go 1.24+ (SHA-256), and `build_go` produces a fully **static** Go (`GOTOOLCHAIN=local`, `CGO_ENABLED=0`, `-trimpath -ldflags=-s -w`), sealed into a `target/pkgcache/<key>.m3pkg` (a warm second build is a pkgcache hit, zero compiler invocations). *(Go 1.24.6; `build_go` branches before the musl-toolchain requirement — no musl dep, no runtime DEPS; observed pkgcache hit on warm rebuild.)*
 - [x] The `go` `.m3pkg` is bundled on the data disk via `BUNDLE_ONLY_PORTS` and `pkg install go` lays it into `/usr`. *(`pkg install: go: OK` — smoke step 14.)*
-- [x] Inside m3OS: a static Go program prints `GO_HELLO_OK`, then a goroutine scheduled on a second OS thread (via `clone(CLONE_THREAD)`) completes a channel rendezvous printing `GO_GOROUTINE_OK`. *(`runtime_probe.go` uses `LockOSThread` → `clone(CLONE_THREAD)` (observed `clone_thread(flags=0xd0f00)`) + an unbuffered channel rendezvous; both sentinels observed.)*
+- [x] Inside m3OS: a static Go program prints `GO_HELLO_OK`, then a `LockOSThread` goroutine completes a channel rendezvous printing `GO_GOROUTINE_OK`. *(`runtime_probe.go` uses `LockOSThread` + an unbuffered channel rendezvous; at `GOMAXPROCS=1` the rendezvous may complete on a single M, so it proves the scheduler/channel/futex hand-off, not a cross-OS-thread hop. The kernel `clone(CLONE_THREAD)` path is independently exercised by the runtime's own threads — observed `clone_thread(flags=0xd0f00)` for `sysmon` — and is a prerequisite of `GO_HELLO_OK`.)*
 - [x] A plaintext HTTP GET over the in-kernel TCP stack (Phase 77 `sys_connect` → `tcp::connect`) succeeds, printing `GO_HTTP_OK` — with **no** 86c/TLS dependency. *(`GO_HTTP_STATUS=200 GO_HTTP_LEN=16` + `GO_HTTP_OK`; the host HTTP server logged `accepted a guest connection`, proving the connect reached it via SLIRP `guestfwd`.)*
 - [x] `os.Executable` resolves via `/proc/self/exe` (`procfs.rs:88`); `GOMAXPROCS` derives from `sched_getaffinity` (`mod.rs:1864`). *(`GO_EXE=/usr/bin/go-runtime-probe`; `GO_GOMAXPROCS=1 GO_NUMCPU=1`.)*
 - [x] The gate is wired as `cargo xtask go-runtime-smoke` and as an opt-in pre-push regression (`M3OS_GO_REGRESSION=1`) in both `AGENTS.md` and `.githooks/pre-push`, with a long `--timeout`. *(Gate PASSES; bring-up additions epoll_pwait/SA_SIGINFO-ucontext/eventfd2 + single-core run are documented in the design doc / commit history.)*

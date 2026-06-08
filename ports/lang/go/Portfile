@@ -18,10 +18,13 @@ MAINTAINER=m3os
 #   GOTOOLCHAIN=local        — never auto-download a different toolchain.
 #   -trimpath -ldflags="-s -w" — reproducible, stripped.
 # The program (src/runtime_probe.go) exercises the runtime end-to-end: the
-# scheduler/GC start (GO_HELLO_OK), a goroutine on a second OS thread completes
-# a channel rendezvous (GO_GOROUTINE_OK), and a plaintext HTTP GET runs over the
-# in-kernel TCP stack (GO_HTTP_OK). No TLS — HTTPS-over-Go rides 86c (86e). The
-# runtime depends on the three Phase 86d kernel blockers being cleared: mmap
-# MAP_FIXED arena commit (Track A), edge-triggered epoll (Track B), and
-# SIGURG/tgkill (Track C), plus 86a's getrandom/AT_RANDOM. It is run with
-# GODEBUG=asyncpreemptoff=1 (the as-built preempt-delivery decision).
+# scheduler/GC start (GO_HELLO_OK), a LockOSThread goroutine completes a channel
+# rendezvous with the main goroutine (GO_GOROUTINE_OK), and a plaintext HTTP GET
+# runs over the in-kernel TCP stack (GO_HTTP_OK). No TLS — HTTPS-over-Go rides
+# 86c (86e). The runtime depends on the three Phase 86d kernel blockers being
+# cleared: mmap MAP_FIXED arena commit (Track A), edge-triggered epoll (Track B),
+# and SIGURG/tgkill (Track C), plus 86a's getrandom/AT_RANDOM — and on the
+# clone(CLONE_THREAD)/futex/ARCH_SET_FS path the runtime uses to spin up its
+# sysmon M. It runs with Go's DEFAULT GODEBUG (async preemption enabled; SIGURG
+# delivered at syscall-return — see the as-built preempt-delivery decision in
+# docs/roadmap/86d-go-runtime.md).

@@ -6,9 +6,12 @@
 //
 //	GO_HELLO_OK      the Go runtime started — scheduler, GC, and the random
 //	                 bootstrap (getrandom/AT_RANDOM) are alive.
-//	GO_GOROUTINE_OK  a goroutine pinned to a *second* OS thread (forced via
-//	                 runtime.LockOSThread → clone(CLONE_THREAD)) completed a
-//	                 channel rendezvous with the main goroutine.
+//	GO_GOROUTINE_OK  a runtime.LockOSThread goroutine completed an unbuffered
+//	                 channel rendezvous with the main goroutine — exercising the
+//	                 scheduler + a cross-goroutine futex wake. (The Go runtime
+//	                 also creates real OS threads via clone(CLONE_THREAD) — e.g.
+//	                 sysmon at startup — which GO_HELLO_OK already depends on; at
+//	                 GOMAXPROCS=1 the rendezvous itself need not span two Ms.)
 //	GO_HTTP_OK       a plaintext HTTP GET completed over the in-kernel TCP
 //	                 stack (sys_connect → tcp::connect), status 200.
 //
@@ -38,13 +41,15 @@ func main() {
 	// GOMAXPROCS derives from sched_getaffinity; report it alongside NumCPU.
 	fmt.Printf("GO_GOMAXPROCS=%d GO_NUMCPU=%d\n", runtime.GOMAXPROCS(0), runtime.NumCPU())
 
-	// --- goroutine rendezvous on a second OS thread ---------------------
-	// LockOSThread in the child goroutine so the runtime must back it with a
-	// distinct M (OS thread, created via clone(CLONE_THREAD)) regardless of
-	// GOMAXPROCS. The unbuffered channel forces a real cross-thread rendezvous
-	// (futex wake of the main goroutine). GOMAXPROCS is left at the value Go
-	// derives from sched_getaffinity (no artificial bump) to keep scheduler
-	// concurrency minimal.
+	// --- goroutine channel rendezvous -----------------------------------
+	// The child goroutine calls LockOSThread (wiring it to its M) and then
+	// completes an unbuffered channel rendezvous with main — a real scheduler
+	// hand-off + futex wake. GOMAXPROCS is left at the value Go derives from
+	// sched_getaffinity (=1 here, no artificial bump) to keep concurrency
+	// minimal; at GOMAXPROCS=1 the rendezvous may complete on a single M, so
+	// this proves the scheduler/channel/futex path, not a cross-OS-thread hop.
+	// The kernel clone(CLONE_THREAD) path is independently exercised by the
+	// runtime's own threads (sysmon etc.) and is a prerequisite of GO_HELLO_OK.
 	ch := make(chan int)
 	var wg sync.WaitGroup
 	wg.Add(1)

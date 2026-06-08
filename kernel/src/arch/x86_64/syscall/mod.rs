@@ -15906,6 +15906,13 @@ pub(super) fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
                         FdBackend::Epoll { instance_id } => {
                             epoll_add_ref(*instance_id);
                         }
+                        // Phase 86d Track D — eventfd is refcounted like the
+                        // other dup paths (sys_dup/sys_dup2); fcntl(F_DUPFD)
+                        // must bump it too, else closing either fd frees the
+                        // object under the other.
+                        FdBackend::EventFd { id } => {
+                            crate::eventfd::eventfd_add_ref(*id);
+                        }
                         _ => {}
                     }
                     new_fd as u64
@@ -18660,6 +18667,10 @@ fn anc_backend_is_refcounted(backend: &FdBackend) -> bool {
         backend,
         FdBackend::PipeRead { .. }
             | FdBackend::PipeWrite { .. }
+            // Phase 86d Track D — eventfd is cycle-safe (no anc_queue like
+            // UnixSocket), refcounted, and Linux permits passing it via
+            // SCM_RIGHTS; keep it symmetric with the acquire/release helpers.
+            | FdBackend::EventFd { .. }
             | FdBackend::Socket { .. }
             | FdBackend::PtyMaster { .. }
             | FdBackend::PtySlave { .. }
@@ -18676,6 +18687,7 @@ fn release_inflight_anc_backend(backend: &FdBackend) {
     match backend {
         FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_close_reader(*pipe_id),
         FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_close_writer(*pipe_id),
+        FdBackend::EventFd { id } => crate::eventfd::eventfd_close(*id),
         FdBackend::Socket { handle } => crate::net::release_socket_pub(*handle),
         FdBackend::UnixSocket { handle } => crate::net::unix::free_unix_socket(*handle),
         FdBackend::PtyMaster { pty_id } => crate::pty::close_master(*pty_id),
@@ -20500,8 +20512,12 @@ const EPOLLHUP: u32 = 0x010;
 // EPOLLRDHUP mirrors POLLRDHUP (0x2000). EPOLLET (1<<31) and EPOLLONESHOT
 // (1<<30) are carried in the events word but are NOT readiness bits, so they
 // are stripped before matching against fd readiness.
-#[allow(dead_code)]
 const EPOLLRDHUP: u32 = 0x2000;
+// The RDHUP bit flows from `fd_poll_events` (an `i16` POLLRDHUP) through the
+// `as u16 as u32` widening in `sys_epoll_wait` and must land exactly on
+// EPOLLRDHUP. Assert that numeric coincidence at compile time so the two
+// constants can never silently drift apart (and so EPOLLRDHUP is not dead).
+const _: () = assert!(EPOLLRDHUP == POLLRDHUP as u16 as u32);
 const EPOLLONESHOT: u32 = 0x4000_0000;
 const EPOLLET: u32 = 0x8000_0000;
 const EPOLL_CONTROL_BITS: u32 = EPOLLET | EPOLLONESHOT;
@@ -20874,6 +20890,19 @@ pub(super) fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout
 
         // Persist refreshed ET watermarks onto the live interests (matched by
         // fd; a concurrently removed/modified interest is simply skipped).
+        //
+        // Known benign race (Phase 86d Track B): the readiness scan above runs
+        // on a *clone* of the interest list with the table lock dropped (so
+        // `fd_poll_events` can descend into the net/pipe layers). If another
+        // thread issues `EPOLL_CTL_MOD` for the same fd in that window — which
+        // resets `last_ready` to 0 to re-arm the edge — this write-back can
+        // overwrite that fresh 0 with the stale watermark computed before the
+        // MOD, costing one spurious or missed edge. It is never memory-unsafe
+        // (the fd match just lands on the re-armed interest). The robust fix is
+        // a per-interest epoch captured in the clone and compared here; it is a
+        // tracked follow-up — no in-tree consumer MODs an fd concurrently with
+        // a sibling thread's `epoll_wait`, and Go (the 86d driver) does not MOD
+        // in its netpoll hot path. The gate also pins `-smp 1`.
         if !et_updates.is_empty() {
             let mut table = EPOLL_TABLE.lock();
             if let Some(inst) = table.get_mut(instance_id).and_then(|s| s.as_mut()) {

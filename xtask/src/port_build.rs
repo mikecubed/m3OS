@@ -174,6 +174,23 @@ fn port_fingerprint(port_dir: &Path) -> String {
             }
         }
     }
+    // Phase 86d Track D — also hash `src/` (the in-repo program built by ports
+    // like `go`), recursively + sorted, so editing `src/runtime_probe.go`
+    // invalidates the same-machine stamp. Mirrors the portable `recipe_digest`.
+    let src = port_dir.join("src");
+    let mut src_files: Vec<(PathBuf, PathBuf)> = Vec::new();
+    collect_files_rel(&src, &src, &mut src_files);
+    src_files.sort_by(|a, b| a.0.cmp(&b.0));
+    if !src_files.is_empty() {
+        hasher.update(b"\0src\0");
+    }
+    for (rel, abs) in src_files {
+        hasher.update(rel.to_string_lossy().as_bytes());
+        hasher.update(b"\0");
+        if let Ok(bytes) = fs::read(&abs) {
+            hasher.update(&bytes);
+        }
+    }
     // Include the port_build.rs source content so editing the build
     // recipe re-runs every staged port on the next invocation.
     hasher.update(b"\0port_build.rs\0");
@@ -182,9 +199,11 @@ fn port_fingerprint(port_dir: &Path) -> String {
 }
 
 /// Compute a stable, portable recipe-identity digest for a port: the Portfile
-/// content plus every file under `patches/`. Unlike [`port_fingerprint`] this
-/// deliberately **excludes** the `port_build.rs` source bytes, so editing an
-/// *unrelated* port recipe does not invalidate this port's cached `.m3pkg`.
+/// content plus every file under `patches/` **and** `src/`. Unlike
+/// [`port_fingerprint`] this deliberately **excludes** the `port_build.rs`
+/// source bytes, so editing an *unrelated* port recipe does not invalidate this
+/// port's cached `.m3pkg`. `src/` is included because a port (notably `go`) may
+/// build an in-repo program rather than the downloaded tarball.
 ///
 /// The configure flags that live in the Rust `build_*` function (not the
 /// Portfile) are folded into the key separately, via [`build_recipe_id`] in
@@ -213,6 +232,28 @@ fn recipe_digest(port_dir: &Path) -> String {
     collect_files_rel(&patches, &patches, &mut patch_files);
     patch_files.sort_by(|a, b| a.0.cmp(&b.0));
     for (rel, abs) in patch_files {
+        hasher.update(rel.to_string_lossy().as_bytes());
+        hasher.update(b"\0");
+        if let Ok(bytes) = fs::read(&abs) {
+            hasher.update(&bytes);
+        }
+    }
+    // Phase 86d Track D — also hash every file under `src/`. For the `go` port
+    // the built artifact IS the in-repo source (`src/runtime_probe.go`), not the
+    // downloaded tarball, so without this a probe edit would leave the content
+    // key unchanged and serve a stale `.m3pkg`. Hashed identically to `patches/`
+    // (relative-path keyed, recursive, sorted). Ports with no `src/` dir are
+    // unaffected; ports that DO have one (go, and a few vestigial trees) simply
+    // re-cache once. Keyed under a distinct `src\0` prefix so a file cannot
+    // collide with a same-named patch.
+    let src = port_dir.join("src");
+    let mut src_files: Vec<(PathBuf, PathBuf)> = Vec::new();
+    collect_files_rel(&src, &src, &mut src_files);
+    src_files.sort_by(|a, b| a.0.cmp(&b.0));
+    if !src_files.is_empty() {
+        hasher.update(b"src\0");
+    }
+    for (rel, abs) in src_files {
         hasher.update(rel.to_string_lossy().as_bytes());
         hasher.update(b"\0");
         if let Ok(bytes) = fs::read(&abs) {
@@ -455,6 +496,18 @@ fn build_recipe_id(name: &str) -> &'static str {
              --without-{libpsl,libidn2,brotli,zstd,nghttp2,nghttp3,ngtcp2,libssh2,libssh,librtmp,gssapi} \
              --disable-manual);cflags:-O2;configure-ldflags:-static;make-ldflags:-all-static(libtool fully-static CLI);\
              verify:static+mbedTLS-backend+HTTPS+embedded-CAINFO;recipe-v=2"
+        }
+        // Phase 86d Track D — the static Go runtime probe. Unlike every other
+        // port the built artifact is NOT the downloaded tarball (that is the Go
+        // *toolchain*, folded in via the Portfile SHA-256); it is the in-repo
+        // program `src/runtime_probe.go`, whose bytes are folded in separately
+        // because `recipe_digest` now also hashes `src/`. This arm pins the
+        // cross-build knob set so a flag change self-invalidates the cached
+        // `.m3pkg`. Bump recipe-v whenever the `build_go` flags below change.
+        "go" => {
+            "go-build:GOOS=linux GOARCH=amd64 CGO_ENABLED=0 GOTOOLCHAIN=local \
+             GOPROXY=off GOFLAGS=-mod=mod;build:-trimpath -ldflags='-s -w';\
+             stage=/usr/bin/go-runtime-probe+/usr/src/runtime_probe.go;recipe-v=1"
         }
         _ => "",
     }
@@ -4412,7 +4465,7 @@ mod tests {
         // ports never collide on the recipe component of the key.
         let ports = [
             "zlib", "ncurses", "libevent", "less", "htop", "tmux", "git", "python", "llvm",
-            "dropbear", "mbedtls", "curl",
+            "dropbear", "mbedtls", "curl", "go",
         ];
         let ids: Vec<&str> = ports.iter().map(|p| build_recipe_id(p)).collect();
         for (p, id) in ports.iter().zip(&ids) {
