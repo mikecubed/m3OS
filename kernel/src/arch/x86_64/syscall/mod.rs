@@ -10348,9 +10348,15 @@ pub(super) fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
     // occupies the range and return `addr_hint` unchanged.
     if map_fixed {
         const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
+        // mmap_min_addr floor (Linux default): never honor a fixed mapping over
+        // the low NULL-guard pages, so a fixed request can't defeat the
+        // null-pointer-deref trap. Go's arena hints start ~0xc000000000, well
+        // above this. (Phase 86d Track A reviewer follow-up.)
+        const MMAP_MIN_ADDR: u64 = 0x1_0000;
         // The address must be page-aligned and the whole range must stay in
         // canonical user space (~0xc000000000 fits well under USER_SPACE_END).
-        if addr_hint & 0xFFF != 0
+        if addr_hint < MMAP_MIN_ADDR
+            || addr_hint & 0xFFF != 0
             || addr_hint
                 .checked_add(total_size)
                 .filter(|e| *e <= USER_SPACE_END)
@@ -19506,6 +19512,10 @@ const POLLOUT: i16 = 0x004;
 const POLLERR: i16 = 0x008;
 const POLLHUP: i16 = 0x010;
 const POLLNVAL: i16 = 0x020;
+// Phase 86d Track B — peer half-close (read side hung up). Value matches Linux
+// POLLRDHUP/EPOLLRDHUP (0x2000) so the bit survives the `as u16 as u32`
+// widening in epoll_wait and maps straight onto EPOLLRDHUP.
+const POLLRDHUP: i16 = 0x2000;
 
 /// Query current readiness events for a file descriptor.
 ///
@@ -19607,6 +19617,24 @@ fn fd_poll_events(entry: &FdEntry) -> i16 {
                 }
                 if matches!(s.state, crate::net::SocketState::Closed) {
                     revents |= POLLHUP;
+                }
+                // Phase 86d Track B — EPOLLRDHUP: the peer has shut down its
+                // writing half (we received a FIN), so the read side is done.
+                // Go's netpoll registers EPOLLRDHUP to learn of remote close.
+                // Derived from the connection's half-close state; only surfaced
+                // to callers that requested POLLRDHUP (poll masks by `events`,
+                // select ignores it, epoll matches it against the interest).
+                if let Some(tcp_idx) = s.tcp_slot
+                    && !matches!(s.state, crate::net::SocketState::Listening)
+                    && matches!(
+                        crate::net::tcp::state(tcp_idx),
+                        crate::net::tcp::TcpState::CloseWait
+                            | crate::net::tcp::TcpState::LastAck
+                            | crate::net::tcp::TcpState::TimeWait
+                            | crate::net::tcp::TcpState::Closed
+                    )
+                {
+                    revents |= POLLRDHUP;
                 }
                 // TCP RST → POLLERR
                 if let Some(tcp_idx) = s.tcp_slot
@@ -20322,6 +20350,17 @@ const EPOLLIN: u32 = 0x001;
 const EPOLLOUT: u32 = 0x004;
 const EPOLLERR: u32 = 0x008;
 const EPOLLHUP: u32 = 0x010;
+// Phase 86d Track B — peer half-close + edge-triggered / one-shot control bits.
+// EPOLLRDHUP mirrors POLLRDHUP (0x2000). EPOLLET (1<<31) and EPOLLONESHOT
+// (1<<30) are carried in the events word but are NOT readiness bits, so they
+// are stripped before matching against fd readiness.
+#[allow(dead_code)]
+const EPOLLRDHUP: u32 = 0x2000;
+const EPOLLONESHOT: u32 = 0x4000_0000;
+const EPOLLET: u32 = 0x8000_0000;
+const EPOLL_CONTROL_BITS: u32 = EPOLLET | EPOLLONESHOT;
+// Always-reported bits: surfaced even if the interest did not request them.
+const EPOLL_UNCONDITIONAL: u32 = EPOLLHUP | EPOLLERR;
 
 const EPOLL_CTL_ADD: u64 = 1;
 const EPOLL_CTL_DEL: u64 = 2;
@@ -20335,6 +20374,14 @@ struct EpollInterest {
     fd: usize,
     events: u32,
     data: u64,
+    /// Phase 86d Track B — for edge-triggered (`EPOLLET`) interests, the
+    /// readiness set last reported to userspace. An edge event fires only when
+    /// the current readiness rises above this watermark (not-ready→ready). The
+    /// watermark is refreshed every `epoll_wait` scan so a drain lowers it and
+    /// a refill re-triggers. Unused for level-triggered interests. Per-interest
+    /// (not per-fd): the same fd in two epoll instances tracks edges
+    /// independently.
+    last_ready: u32,
 }
 
 /// An epoll instance — tracks the interest set (which FDs to monitor).
@@ -20524,6 +20571,9 @@ pub(super) fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u64 
                 fd: fd_idx,
                 events,
                 data,
+                // Fresh interest: empty watermark so an already-ready ET fd
+                // fires its first edge immediately.
+                last_ready: 0,
             });
             0
         }
@@ -20531,6 +20581,9 @@ pub(super) fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u64 
             if let Some(entry) = inst.interests.iter_mut().find(|i| i.fd == fd_idx) {
                 entry.events = events;
                 entry.data = data;
+                // Re-arm the edge state: EPOLL_CTL_MOD resets the ET watermark
+                // so the modified interest re-reports current readiness.
+                entry.last_ready = 0;
                 0
             } else {
                 const NEG_ENOENT: u64 = (-2_i64) as u64;
@@ -20590,23 +20643,39 @@ pub(super) fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout
             }
         };
 
+        // Edge-aware scan: a level-triggered interest emits whenever a
+        // requested/unconditional bit is ready; an edge-triggered (EPOLLET)
+        // interest emits only on a not-ready→ready transition relative to its
+        // per-interest watermark. The decision is the pure, host-tested
+        // `kernel_core::epoll::evaluate_interest`. The scan runs on a clone (no
+        // table lock held across `fd_poll_events`), so the refreshed ET
+        // watermarks are persisted back to the table afterwards.
+        let mut et_updates: alloc::vec::Vec<(usize, u32)> = alloc::vec::Vec::new();
         for interest in &interests {
             if out_count >= maxevents {
                 break;
             }
             if let Some(entry) = current_fd_entry(interest.fd) {
-                let ready = fd_poll_events(&entry);
-                let ready_u32 = ready as u16 as u32;
-                let matched = ready_u32 & interest.events;
-                // Also report unconditional events.
-                let unconditional = ready_u32 & (EPOLLHUP | EPOLLERR);
-                if matched != 0 || unconditional != 0 {
+                let ready_u32 = fd_poll_events(&entry) as u16 as u32;
+                let event_mask = interest.events & !EPOLL_CONTROL_BITS;
+                let is_et = interest.events & EPOLLET != 0;
+                let eval = kernel_core::epoll::evaluate_interest(
+                    ready_u32,
+                    event_mask,
+                    EPOLL_UNCONDITIONAL,
+                    interest.last_ready,
+                    is_et,
+                );
+                if is_et {
+                    et_updates.push((interest.fd, eval.new_last_ready));
+                }
+                if eval.emit {
                     // Write epoll_event to userspace: packed { events: u32, data: u64 } = 12 bytes
                     let base = match events_ptr.checked_add((out_count * 12) as u64) {
                         Some(a) => a,
                         None => return NEG_EFAULT,
                     };
-                    let ev_out = (matched | unconditional).to_ne_bytes();
+                    let ev_out = eval.revents.to_ne_bytes();
                     let data_out = interest.data.to_ne_bytes();
                     let mut buf = [0u8; 12];
                     buf[0..4].copy_from_slice(&ev_out);
@@ -20618,6 +20687,19 @@ pub(super) fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout
                         return NEG_EFAULT;
                     }
                     out_count += 1;
+                }
+            }
+        }
+
+        // Persist refreshed ET watermarks onto the live interests (matched by
+        // fd; a concurrently removed/modified interest is simply skipped).
+        if !et_updates.is_empty() {
+            let mut table = EPOLL_TABLE.lock();
+            if let Some(inst) = table.get_mut(instance_id).and_then(|s| s.as_mut()) {
+                for (fd, new_last) in et_updates {
+                    if let Some(it) = inst.interests.iter_mut().find(|i| i.fd == fd) {
+                        it.last_ready = new_last;
+                    }
                 }
             }
         }
@@ -20659,13 +20741,31 @@ pub(super) fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout
             continue;
         }
 
-        // Re-check readiness after registration (TOCTOU).
+        // Re-check readiness after registration (TOCTOU). Re-read fresh
+        // interests so the ET watermarks updated above are honored: an
+        // already-reported, still-ready ET fd is NOT a fresh edge and must not
+        // wake us — otherwise a persistently-readable ET fd would busy-loop.
+        let recheck = {
+            let table = EPOLL_TABLE.lock();
+            match table.get(instance_id).and_then(|s| s.as_ref()) {
+                Some(inst) => inst.interests.clone(),
+                None => alloc::vec::Vec::new(),
+            }
+        };
         let mut any_ready = false;
-        for interest in &interests {
+        for interest in &recheck {
             if let Some(entry) = current_fd_entry(interest.fd) {
-                let ready = fd_poll_events(&entry);
-                let ready_u32 = ready as u16 as u32;
-                if (ready_u32 & interest.events) != 0 || (ready_u32 & (EPOLLHUP | EPOLLERR)) != 0 {
+                let ready_u32 = fd_poll_events(&entry) as u16 as u32;
+                let event_mask = interest.events & !EPOLL_CONTROL_BITS;
+                let is_et = interest.events & EPOLLET != 0;
+                let eval = kernel_core::epoll::evaluate_interest(
+                    ready_u32,
+                    event_mask,
+                    EPOLL_UNCONDITIONAL,
+                    interest.last_ready,
+                    is_et,
+                );
+                if eval.emit {
                     any_ready = true;
                     break;
                 }

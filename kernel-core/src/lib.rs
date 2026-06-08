@@ -14,6 +14,7 @@ pub mod driver_ipc;
 pub mod driver_runtime;
 pub mod e1000;
 pub mod elf;
+pub mod epoll;
 pub mod fb;
 pub mod font;
 pub mod fs;
