@@ -173,6 +173,10 @@ pub enum FdBackend {
     PipeRead { pipe_id: usize },
     /// Write end of a kernel pipe (Phase 14).
     PipeWrite { pipe_id: usize },
+    /// `eventfd(2)` counter object (Phase 86d Track D) — Go's runtime M-wakeup
+    /// primitive. One fd is both readable and writable; backed by
+    /// `crate::eventfd` keyed by `id`.
+    EventFd { id: usize },
     /// Directory file descriptor (Phase 18).
     Dir { path: String },
     /// /dev/null — reads return EOF, writes are silently discarded (Phase 21).
@@ -267,6 +271,11 @@ pub fn add_fd_refs(fd_table: &[Option<FdEntry>; MAX_FDS]) {
             FdBackend::Epoll { instance_id } => {
                 crate::arch::x86_64::syscall::epoll_add_ref_pub(*instance_id)
             }
+            // Phase 86d Track D — eventfd is refcounted like a pipe/socket; a
+            // fork (non-CLONE_FILES) copies the fd table, so the underlying
+            // object gains a reference per copied fd. Without this the child's
+            // close would free the object out from under the parent.
+            FdBackend::EventFd { id } => crate::eventfd::eventfd_add_ref(*id),
             _ => {}
         }
     }
@@ -281,6 +290,7 @@ pub fn close_cloexec_fds(pid: Pid) {
     let mut sockets = alloc::vec::Vec::new();
     let mut unix_sockets = alloc::vec::Vec::new();
     let mut epolls = alloc::vec::Vec::new();
+    let mut eventfds = alloc::vec::Vec::new();
     let mut ext2_inodes = alloc::vec::Vec::new();
     let mut vfs_handles = alloc::vec::Vec::new();
     let mut ext2_last_alias = alloc::vec::Vec::new();
@@ -323,6 +333,7 @@ pub fn close_cloexec_fds(pid: Pid) {
                         cleared_unix_handles.push((*handle, i as u32));
                     }
                     FdBackend::Epoll { instance_id } => epolls.push(*instance_id),
+                    FdBackend::EventFd { id } => eventfds.push(*id),
                     FdBackend::Ext2Disk { inode_num, .. } => ext2_inodes.push(*inode_num),
                     FdBackend::VfsService { service_handle, .. } => {
                         vfs_handles.push(*service_handle)
@@ -390,6 +401,12 @@ pub fn close_cloexec_fds(pid: Pid) {
     for id in epolls {
         crate::epoll::epoll_free_pub(id);
     }
+    // Phase 86d Track D — release one eventfd reference per cloexec-closed fd
+    // (refcount drops to 0 → object + wait queue freed). Go opens its
+    // M-wakeup eventfd with EFD_CLOEXEC, so execve must release it.
+    for id in eventfds {
+        crate::eventfd::eventfd_close(id);
+    }
     for inode_num in ext2_last_alias {
         crate::fs::ext2::reap_unused_ext2_inode(inode_num);
     }
@@ -414,6 +431,7 @@ pub fn close_all_fds_for(pid: Pid) {
     let mut sockets = alloc::vec::Vec::new();
     let mut unix_sockets = alloc::vec::Vec::new();
     let mut epolls = alloc::vec::Vec::new();
+    let mut eventfds = alloc::vec::Vec::new();
     let mut ext2_inodes = alloc::vec::Vec::new();
     let mut vfs_handles = alloc::vec::Vec::new();
     let mut ext2_last_alias = alloc::vec::Vec::new();
@@ -434,6 +452,7 @@ pub fn close_all_fds_for(pid: Pid) {
                     FdBackend::Socket { handle } => sockets.push(*handle),
                     FdBackend::UnixSocket { handle } => unix_sockets.push(*handle),
                     FdBackend::Epoll { instance_id } => epolls.push(*instance_id),
+                    FdBackend::EventFd { id } => eventfds.push(*id),
                     FdBackend::Ext2Disk { inode_num, .. } => ext2_inodes.push(*inode_num),
                     FdBackend::VfsService { service_handle, .. } => {
                         vfs_handles.push(*service_handle)
@@ -481,6 +500,13 @@ pub fn close_all_fds_for(pid: Pid) {
     }
     for id in epolls {
         crate::epoll::epoll_free_pub(id);
+    }
+    // Phase 86d Track D — release one eventfd reference per open fd on exit
+    // (refcount → 0 frees the object + wait queue). Without this every Go
+    // program — which always creates an EFD for its M-wakeup — would leak an
+    // eventfd slot (cap EVENTFD_MAX) for the lifetime of the kernel.
+    for id in eventfds {
+        crate::eventfd::eventfd_close(id);
     }
     for inode_num in ext2_last_alias {
         crate::fs::ext2::reap_unused_ext2_inode(inode_num);
@@ -620,6 +646,11 @@ pub const SIGCHLD: u32 = 17;
 pub const SIGCONT: u32 = 18;
 pub const SIGSTOP: u32 = 19;
 pub const SIGTSTP: u32 = 20;
+/// Phase 86d Track C — Go's runtime uses `tgkill(tid, SIGURG)` → `doSigPreempt`
+/// for goroutine preemption and GC stop-the-world. Default disposition is
+/// Ignore (Linux), so an un-handled SIGURG is harmless rather than fatal — the
+/// kernel's catch-all is Terminate, so SIGURG must be listed explicitly below.
+pub const SIGURG: u32 = 23;
 pub const SIGWINCH: u32 = 28;
 
 /// sigaltstack flag: currently executing on the alt stack.
@@ -652,7 +683,7 @@ pub enum SignalAction {
 /// Default action table: terminate or ignore.
 pub fn default_signal_action(sig: u32) -> SignalDisposition {
     match sig {
-        SIGCHLD | SIGWINCH => SignalDisposition::Ignore,
+        SIGCHLD | SIGWINCH | SIGURG => SignalDisposition::Ignore,
         SIGCONT => SignalDisposition::Continue,
         SIGSTOP | SIGTSTP => SignalDisposition::Stop,
         SIGKILL | SIGINT | SIGTERM | SIGHUP | SIGBUS | SIGFPE | SIGSEGV | SIGPIPE | SIGALRM

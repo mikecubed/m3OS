@@ -586,4 +586,110 @@ mod tests {
         assert!(t.any(|m| m.flags & 0x100 != 0));
         assert!(!t.any(|m| m.flags & 0x200 != 0));
     }
+
+    // -- Phase 86d Track A: Go arena reserve→commit (MAP_FIXED) ------------
+    //
+    // These model the VMA-tree side of `sys_linux_mmap`'s MAP_FIXED path:
+    // a PROT_NONE reservation is committed PROT_RW *at the same address* by
+    // `remove_range` (overwrite/split) followed by `insert`. The neighbor
+    // VMAs flanking the arena MUST be left byte-for-byte intact — that is the
+    // GC-arena hazard the phase calls out.
+
+    const PROT_NONE: u64 = 0x0;
+    const PROT_RW: u64 = 0x3; // PROT_READ | PROT_WRITE
+    const MAP_ANON_PRIV: u64 = 0x22; // MAP_PRIVATE | MAP_ANONYMOUS
+    // Go reserves arenas near ~0xc000000000; well under USER_SPACE_END (128 TiB).
+    const ARENA: u64 = 0x0000_00c0_0000_0000;
+    const ARENA_LEN: u64 = 0x0400_0000; // 64 MiB, one Go heapArena
+    const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
+
+    fn reserve_then_commit(commit_start: u64, commit_len: u64) -> VmaTree {
+        let mut t = VmaTree::new();
+        // Neighbors immediately below and above the arena.
+        let below = MemoryMapping {
+            start: 0x1000,
+            len: 0x1000,
+            prot: PROT_RW,
+            flags: MAP_ANON_PRIV,
+        };
+        let above = MemoryMapping {
+            start: ARENA + ARENA_LEN,
+            len: 0x1000,
+            prot: PROT_RW,
+            flags: MAP_ANON_PRIV,
+        };
+        t.insert(below);
+        t.insert(above);
+        // sysReserveOS: PROT_NONE reservation, no committed frames.
+        t.insert(MemoryMapping {
+            start: ARENA,
+            len: ARENA_LEN,
+            prot: PROT_NONE,
+            flags: MAP_ANON_PRIV,
+        });
+        // sysMapOS: commit PROT_RW MAP_FIXED — overwrite/split then insert.
+        t.remove_range(commit_start, commit_len);
+        t.insert(MemoryMapping {
+            start: commit_start,
+            len: commit_len,
+            prot: PROT_RW,
+            flags: MAP_ANON_PRIV,
+        });
+        t
+    }
+
+    #[test]
+    fn map_fixed_full_commit_replaces_reservation_in_place() {
+        let t = reserve_then_commit(ARENA, ARENA_LEN);
+        // The committed mapping lands at the EXACT arena address, PROT_RW.
+        let committed = t.find_containing(ARENA).unwrap();
+        assert_eq!(committed.start, ARENA);
+        assert_eq!(committed.len, ARENA_LEN);
+        assert_eq!(committed.prot, PROT_RW);
+        // No PROT_NONE reservation byte survives the commit.
+        assert!(!t.any(|m| m.prot == PROT_NONE));
+        // Arena fits inside canonical user space.
+        assert!(ARENA + ARENA_LEN <= USER_SPACE_END);
+        // Neighbors are byte-for-byte intact.
+        let below = t.find_containing(0x1000).unwrap();
+        assert_eq!(
+            (below.start, below.len, below.prot),
+            (0x1000, 0x1000, PROT_RW)
+        );
+        let above = t.find_containing(ARENA + ARENA_LEN).unwrap();
+        assert_eq!(
+            (above.start, above.len, above.prot),
+            (ARENA + ARENA_LEN, 0x1000, PROT_RW)
+        );
+        // below + committed-arena + above.
+        assert_eq!(t.len(), 3);
+    }
+
+    #[test]
+    fn map_fixed_subrange_commit_splits_reservation() {
+        // Go also commits a sub-window of a larger reservation; the reservation
+        // must split into head(PROT_NONE) + committed-mid(PROT_RW) + tail(PROT_NONE).
+        let mid_start = ARENA + 0x0010_0000; // 1 MiB into the arena
+        let mid_len = 0x0010_0000; // commit a 1 MiB window
+        let t = reserve_then_commit(mid_start, mid_len);
+        // Committed window is exactly placed and writable.
+        let mid = t.find_containing(mid_start).unwrap();
+        assert_eq!(
+            (mid.start, mid.len, mid.prot),
+            (mid_start, mid_len, PROT_RW)
+        );
+        // Head of the reservation stays PROT_NONE at the arena base.
+        let head = t.find_containing(ARENA).unwrap();
+        assert_eq!((head.start, head.prot), (ARENA, PROT_NONE));
+        assert_eq!(head.len, mid_start - ARENA);
+        // Tail of the reservation stays PROT_NONE up to the arena end.
+        let tail = t.find_containing(mid_start + mid_len).unwrap();
+        assert_eq!((tail.start, tail.prot), (mid_start + mid_len, PROT_NONE));
+        assert_eq!(tail.len, (ARENA + ARENA_LEN) - (mid_start + mid_len));
+        // Neighbors untouched.
+        assert_eq!(t.find_containing(0x1000).unwrap().prot, PROT_RW);
+        assert_eq!(t.find_containing(ARENA + ARENA_LEN).unwrap().prot, PROT_RW);
+        // below + head + mid + tail + above.
+        assert_eq!(t.len(), 5);
+    }
 }

@@ -33,6 +33,7 @@ pub mod acpi;
 pub mod arch;
 pub mod blk;
 pub mod epoll;
+pub mod eventfd;
 pub mod fb;
 pub mod flock;
 pub mod fs;

@@ -174,6 +174,23 @@ fn port_fingerprint(port_dir: &Path) -> String {
             }
         }
     }
+    // Phase 86d Track D — also hash `src/` (the in-repo program built by ports
+    // like `go`), recursively + sorted, so editing `src/runtime_probe.go`
+    // invalidates the same-machine stamp. Mirrors the portable `recipe_digest`.
+    let src = port_dir.join("src");
+    let mut src_files: Vec<(PathBuf, PathBuf)> = Vec::new();
+    collect_files_rel(&src, &src, &mut src_files);
+    src_files.sort_by(|a, b| a.0.cmp(&b.0));
+    if !src_files.is_empty() {
+        hasher.update(b"\0src\0");
+    }
+    for (rel, abs) in src_files {
+        hasher.update(rel.to_string_lossy().as_bytes());
+        hasher.update(b"\0");
+        if let Ok(bytes) = fs::read(&abs) {
+            hasher.update(&bytes);
+        }
+    }
     // Include the port_build.rs source content so editing the build
     // recipe re-runs every staged port on the next invocation.
     hasher.update(b"\0port_build.rs\0");
@@ -182,9 +199,11 @@ fn port_fingerprint(port_dir: &Path) -> String {
 }
 
 /// Compute a stable, portable recipe-identity digest for a port: the Portfile
-/// content plus every file under `patches/`. Unlike [`port_fingerprint`] this
-/// deliberately **excludes** the `port_build.rs` source bytes, so editing an
-/// *unrelated* port recipe does not invalidate this port's cached `.m3pkg`.
+/// content plus every file under `patches/` **and** `src/`. Unlike
+/// [`port_fingerprint`] this deliberately **excludes** the `port_build.rs`
+/// source bytes, so editing an *unrelated* port recipe does not invalidate this
+/// port's cached `.m3pkg`. `src/` is included because a port (notably `go`) may
+/// build an in-repo program rather than the downloaded tarball.
 ///
 /// The configure flags that live in the Rust `build_*` function (not the
 /// Portfile) are folded into the key separately, via [`build_recipe_id`] in
@@ -213,6 +232,28 @@ fn recipe_digest(port_dir: &Path) -> String {
     collect_files_rel(&patches, &patches, &mut patch_files);
     patch_files.sort_by(|a, b| a.0.cmp(&b.0));
     for (rel, abs) in patch_files {
+        hasher.update(rel.to_string_lossy().as_bytes());
+        hasher.update(b"\0");
+        if let Ok(bytes) = fs::read(&abs) {
+            hasher.update(&bytes);
+        }
+    }
+    // Phase 86d Track D — also hash every file under `src/`. For the `go` port
+    // the built artifact IS the in-repo source (`src/runtime_probe.go`), not the
+    // downloaded tarball, so without this a probe edit would leave the content
+    // key unchanged and serve a stale `.m3pkg`. Hashed identically to `patches/`
+    // (relative-path keyed, recursive, sorted). Ports with no `src/` dir are
+    // unaffected; ports that DO have one (go, and a few vestigial trees) simply
+    // re-cache once. Keyed under a distinct `src\0` prefix so a file cannot
+    // collide with a same-named patch.
+    let src = port_dir.join("src");
+    let mut src_files: Vec<(PathBuf, PathBuf)> = Vec::new();
+    collect_files_rel(&src, &src, &mut src_files);
+    src_files.sort_by(|a, b| a.0.cmp(&b.0));
+    if !src_files.is_empty() {
+        hasher.update(b"src\0");
+    }
+    for (rel, abs) in src_files {
         hasher.update(rel.to_string_lossy().as_bytes());
         hasher.update(b"\0");
         if let Ok(bytes) = fs::read(&abs) {
@@ -455,6 +496,18 @@ fn build_recipe_id(name: &str) -> &'static str {
              --without-{libpsl,libidn2,brotli,zstd,nghttp2,nghttp3,ngtcp2,libssh2,libssh,librtmp,gssapi} \
              --disable-manual);cflags:-O2;configure-ldflags:-static;make-ldflags:-all-static(libtool fully-static CLI);\
              verify:static+mbedTLS-backend+HTTPS+embedded-CAINFO;recipe-v=2"
+        }
+        // Phase 86d Track D — the static Go runtime probe. Unlike every other
+        // port the built artifact is NOT the downloaded tarball (that is the Go
+        // *toolchain*, folded in via the Portfile SHA-256); it is the in-repo
+        // program `src/runtime_probe.go`, whose bytes are folded in separately
+        // because `recipe_digest` now also hashes `src/`. This arm pins the
+        // cross-build knob set so a flag change self-invalidates the cached
+        // `.m3pkg`. Bump recipe-v whenever the `build_go` flags below change.
+        "go" => {
+            "go-build:GOOS=linux GOARCH=amd64 CGO_ENABLED=0 GOTOOLCHAIN=local \
+             GOPROXY=off GOFLAGS=-mod=mod;build:-trimpath -ldflags='-s -w';\
+             stage=/usr/bin/go-runtime-probe+/usr/src/runtime_probe.go;recipe-v=1"
         }
         _ => "",
     }
@@ -1002,6 +1055,20 @@ fn port_build(name: &str) -> Result<(), String> {
     let _ = fs::remove_dir_all(&stage);
     fs::create_dir_all(&stage).map_err(|e| format!("mkdir stage: {e}"))?;
 
+    // Phase 86d Track D — `go` cross-builds with the *downloaded* Go toolchain
+    // (CGO_ENABLED=0), not the musl cross-compiler, so branch before the
+    // musl_toolchain() requirement below — the port has no musl dependency.
+    if name == "go" {
+        build_go(&extracted, &stage, &port_dir)?;
+        seal_package(name, &stage, &key)?;
+        fs::write(&stamp, &fingerprint).map_err(|e| format!("write stamp: {e}"))?;
+        println!(
+            "ports: {name}-{version} build complete (staged at {})",
+            stage.display()
+        );
+        return Ok(());
+    }
+
     let toolchain = musl_toolchain().ok_or_else(|| {
         "no musl cross-compiler found on PATH (install musl-tools or \
                                                 musl-gcc-cross-bin)"
@@ -1051,6 +1118,111 @@ fn port_build(name: &str) -> Result<(), String> {
     println!(
         "ports: {name}-{version} build complete (staged at {})",
         stage.display()
+    );
+    Ok(())
+}
+
+/// Phase 86d Track D — cross-compile the static Go runtime probe.
+///
+/// `extracted` is the unpacked official Go binary toolchain (the tarball's
+/// top-level `go/` directory). `port_dir` is `ports/lang/go`, holding the
+/// program source under `src/`. We invoke the downloaded `go` to build a fully
+/// static (`CGO_ENABLED=0`) linux/amd64 binary and stage it at
+/// `/usr/bin/go-runtime-probe`, with the source copied to `/usr/src` for
+/// reference. No musl toolchain is used — the binary embeds the Go runtime and
+/// makes Linux syscalls directly (the same static-binary class as CPython /
+/// Clang, since m3OS's `ld-musl` has no real `libc.so`).
+fn build_go(extracted: &Path, stage: &Path, port_dir: &Path) -> Result<(), String> {
+    // Locate the `go` binary inside the unpacked toolchain. `extract_tarball`
+    // returns the single top-level directory; the official tarball's is `go/`,
+    // so the binary is `<extracted>/bin/go` — but tolerate a nested `go/go/`.
+    let go_bin = {
+        let direct = extracted.join("bin/go");
+        let nested = extracted.join("go/bin/go");
+        if direct.is_file() {
+            direct
+        } else if nested.is_file() {
+            nested
+        } else {
+            return Err(format!(
+                "go toolchain binary not found under {} (looked for bin/go, go/bin/go)",
+                extracted.display()
+            ));
+        }
+    };
+    let goroot = go_bin
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| "cannot derive GOROOT from go binary path".to_string())?
+        .to_path_buf();
+
+    let src = port_dir.join("src/runtime_probe.go");
+    if !src.is_file() {
+        return Err(format!("go program source missing: {}", src.display()));
+    }
+
+    // A self-contained module dir so `go build` never needs the network or a
+    // GOPATH layout (the program imports only the standard library).
+    let root = workspace_root();
+    let scratch = root.join("target/port-build/go-scratch");
+    let builddir = scratch.join("probe");
+    let gocache = scratch.join("gocache");
+    let home = scratch.join("home");
+    let _ = fs::remove_dir_all(&builddir);
+    for d in [&builddir, &gocache, &home] {
+        fs::create_dir_all(d).map_err(|e| format!("mkdir {}: {e}", d.display()))?;
+    }
+    fs::copy(&src, builddir.join("main.go")).map_err(|e| format!("stage go source: {e}"))?;
+    fs::write(
+        builddir.join("go.mod"),
+        "module m3os.local/go-runtime-probe\n\ngo 1.24\n",
+    )
+    .map_err(|e| format!("write go.mod: {e}"))?;
+
+    // Stage layout: /usr/bin/<probe> + /usr/src/runtime_probe.go.
+    let bindir = stage.join("usr/bin");
+    let srcdir = stage.join("usr/src");
+    fs::create_dir_all(&bindir).map_err(|e| format!("mkdir {}: {e}", bindir.display()))?;
+    fs::create_dir_all(&srcdir).map_err(|e| format!("mkdir {}: {e}", srcdir.display()))?;
+    let out_bin = bindir.join("go-runtime-probe");
+
+    println!(
+        "ports: go — cross-building static runtime probe (GOROOT={}, CGO_ENABLED=0)",
+        goroot.display()
+    );
+    run(
+        Command::new(&go_bin)
+            .current_dir(&builddir)
+            .env("GOROOT", &goroot)
+            .env("GOOS", "linux")
+            .env("GOARCH", "amd64")
+            .env("CGO_ENABLED", "0")
+            .env("GOTOOLCHAIN", "local")
+            .env("GOCACHE", &gocache)
+            .env("GOPATH", scratch.join("gopath"))
+            .env("HOME", &home)
+            .env("GOPROXY", "off")
+            .env("GOFLAGS", "-mod=mod")
+            .arg("build")
+            .arg("-trimpath")
+            .arg("-ldflags=-s -w")
+            .arg("-o")
+            .arg(&out_bin)
+            .arg("."),
+        "go build runtime_probe",
+    )?;
+
+    if !out_bin.is_file() {
+        return Err(format!(
+            "go build produced no binary at {}",
+            out_bin.display()
+        ));
+    }
+    fs::copy(&src, srcdir.join("runtime_probe.go")).map_err(|e| format!("copy go source: {e}"))?;
+    let len = fs::metadata(&out_bin).map(|m| m.len()).unwrap_or(0);
+    println!(
+        "ports: go — built static probe {} ({len} bytes)",
+        out_bin.display()
     );
     Ok(())
 }
@@ -3956,6 +4128,17 @@ pub fn build_python_port() -> Result<(), String> {
     Ok(())
 }
 
+/// Phase 86d Track D — build the `go` port into its `.m3pkg`. Unlike the other
+/// ports it has **no musl dependency** (it cross-builds with the downloaded Go
+/// toolchain, `CGO_ENABLED=0`) and **no runtime `DEPS`** (the binary is fully
+/// static, so nothing else is built first). Separate from the routine ports so
+/// only the `go-runtime-smoke` gate (and an explicit `cargo xtask port build
+/// go`) pays the toolchain download + cross-build; a warm pkgcache makes a
+/// repeat a zero-compiler hit.
+pub fn build_go_port() -> Result<(), String> {
+    port_build("go").map_err(|e| format!("port go: {e}"))
+}
+
 /// Phase 85d — build the Clang/LLVM/LLD toolchain into its `.m3pkg`. Separate
 /// from the routine ports (it is the heaviest artifact, multi-GB-RAM / multi-hour
 /// on a cold cache) so only the opt-in image feature + the `clang-smoke` gate +
@@ -4282,7 +4465,7 @@ mod tests {
         // ports never collide on the recipe component of the key.
         let ports = [
             "zlib", "ncurses", "libevent", "less", "htop", "tmux", "git", "python", "llvm",
-            "dropbear", "mbedtls", "curl",
+            "dropbear", "mbedtls", "curl", "go",
         ];
         let ids: Vec<&str> = ports.iter().map(|p| build_recipe_id(p)).collect();
         for (p, id) in ports.iter().zip(&ids) {

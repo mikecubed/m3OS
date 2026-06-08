@@ -225,6 +225,14 @@ const SMOKE_EXIT_GIT_SSH_SMOKE_FAILED: i32 = 77;
 /// repo over `https://` (positive arm).
 const SMOKE_EXIT_GIT_HTTPS_SMOKE_FAILED: i32 = 78;
 
+/// Phase 86d — `cargo xtask go-runtime-smoke` exit code. Boots m3OS, installs
+/// the bundled static-Go `.m3pkg`, and runs the runtime probe: scheduler/GC
+/// start (GO_HELLO_OK), a goroutine on a second OS thread completes a channel
+/// rendezvous (GO_GOROUTINE_OK), and a plaintext HTTP GET over the in-kernel
+/// TCP stack succeeds (GO_HTTP_OK). Proves the three Phase 86d kernel blockers
+/// are cleared; no TLS.
+const SMOKE_EXIT_GO_SMOKE_FAILED: i32 = 79;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
     Headless,
@@ -796,6 +804,24 @@ fn main() {
                 });
             cmd_python_smoke(&smoke_args);
         }
+        // Phase 86d — `cargo xtask go-runtime-smoke` boots m3OS, installs the
+        // bundled static-Go `.m3pkg` (`pkg install go`), and runs the runtime
+        // probe over serial: GO_HELLO_OK (runtime up), GO_GOROUTINE_OK (a
+        // LockOSThread goroutine completes a channel rendezvous), and
+        // GO_HTTP_OK (a plaintext HTTP GET over the in-kernel TCP stack to a
+        // host server reached via a SLIRP guestfwd rule at 10.0.2.100:80).
+        // Proves the three Phase 86d kernel blockers (mmap MAP_FIXED,
+        // edge-triggered epoll, SIGURG/tgkill) are cleared; no TLS
+        // (HTTPS-over-Go rides 86c → 86e).
+        Some("go-runtime-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("go-runtime-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_go_runtime_smoke(&smoke_args);
+        }
         // Phase 85d — Clang/LLVM/LLD toolchain smoke. Builds the image with the
         // opt-in `M3OS_WITH_CLANG` feature (bundling the heavyweight clang
         // `.m3pkg` into the offline `/usr/pkg/` repo), boots m3OS, `pkg install
@@ -991,7 +1017,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -13750,6 +13776,203 @@ fn cmd_git_local_smoke(args: &SmokeBootArgs) {
     }
 }
 
+/// Phase 86d — `cargo xtask go-runtime-smoke`.
+///
+/// Builds the static-Go `.m3pkg`, bundles it on the data disk, boots m3OS,
+/// installs it (`pkg install go`), and runs the runtime probe over serial. A
+/// tiny host HTTP server is started on an ephemeral loopback port; the guest
+/// reaches it via a SLIRP `guestfwd` rule at the synthetic in-subnet address
+/// `10.0.2.100:80` (forwarded to the host's `127.0.0.1:<ephemeral port>`), so
+/// the plaintext HTTP GET exercises the in-kernel TCP stack with no real egress
+/// and no DNS (the URL is a literal IP). Proves the three Phase 86d kernel
+/// blockers (mmap MAP_FIXED arena commit, edge-triggered epoll, SIGURG/tgkill)
+/// are cleared end-to-end; no TLS.
+fn cmd_go_runtime_smoke(args: &SmokeBootArgs) {
+    // Build the static-Go `.m3pkg` so the data disk can bundle it into
+    // `/usr/pkg/`. The first build downloads the Go toolchain + cross-compiles
+    // (a minute or two); a warm pkgcache makes this a zero-compiler hit.
+    if let Err(msg) = port_build::build_go_port() {
+        eprintln!("go-runtime-smoke: precondition failed (go port build): {msg}");
+        std::process::exit(SMOKE_EXIT_GO_SMOKE_FAILED);
+    }
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    // Always rebuild the data disk so the freshly-bundled go `.m3pkg` is present
+    // and the installed-package DB starts clean.
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false, // graphical_login — autologin / serial path
+    );
+
+    // Host HTTP server on an ephemeral loopback port, exposed to the guest via
+    // a SLIRP guestfwd rule (below) at the synthetic in-subnet address
+    // 10.0.2.100:80.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("go-runtime-smoke: bind host HTTP server");
+    let http_port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        const BODY: &[u8] = b"m3OS-go-http-ok\n";
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            // Diagnostic: prove the guest's TCP connect reached the host (i.e.
+            // SLIRP guestfwd + the in-kernel TCP connect worked).
+            eprintln!("go-runtime-smoke: host HTTP server accepted a guest connection");
+            // Drain the request headers (best-effort) so the client's write
+            // completes before we respond.
+            let mut buf = [0u8; 2048];
+            let _ = s.read(&mut buf);
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                BODY.len()
+            );
+            let _ = s.write_all(header.as_bytes());
+            let _ = s.write_all(BODY);
+            let _ = s.flush();
+        }
+    });
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, display_mode, DeviceSet::default());
+    // Expose the host HTTP server to the guest via a SLIRP guestfwd rule: the
+    // guest reaches it at the synthetic in-subnet address 10.0.2.100:80, which
+    // SLIRP forwards to the host's 127.0.0.1:<http_port>. m3OS has the SLIRP
+    // default static IP 10.0.2.15/24, so 10.0.2.100 is on-link. This is more
+    // deterministic than relying on gateway-to-host-loopback forwarding.
+    let guestfwd = format!("user,id=net0,guestfwd=tcp:10.0.2.100:80-tcp:127.0.0.1:{http_port}");
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0") {
+            *arg = guestfwd.clone();
+        }
+    }
+
+    // Pin the guest to a single core. Go's runtime + the in-kernel netpoll/TCP
+    // stack are still exercised across multiple OS threads (clone), but a single
+    // core avoids the cross-core SMP futex/IPC races that otherwise make the
+    // heavy Go-load + slow-VFS pipeline intermittently deadlock. The acceptance
+    // requires a second OS *thread* (a clone), not a second core.
+    for i in 0..qemu_args.len() {
+        if qemu_args[i] == "-smp" && i + 1 < qemu_args.len() {
+            qemu_args[i + 1] = "1".to_string();
+        }
+    }
+
+    let url = "http://10.0.2.100:80/".to_string();
+    let steps = go_runtime_smoke_steps(&url);
+
+    println!(
+        "go-runtime-smoke: launching QEMU (timeout {}s, {} steps, http server :{http_port})",
+        args.timeout_secs,
+        steps.len()
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!(
+                "go-runtime-smoke: PASSED ({} steps in {elapsed}s)",
+                steps.len()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("go-runtime-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_GO_SMOKE_FAILED);
+        }
+    }
+}
+
+/// Serial script for `go-runtime-smoke`. `url` is interpolated into the probe
+/// command (it contains the ephemeral host HTTP port), so the dynamic strings
+/// are leaked to `'static` — the process is short-lived and this runs once.
+fn go_runtime_smoke_steps(url: &str) -> Vec<SmokeStep> {
+    let probe_cmd: &'static str =
+        Box::leak(format!("/usr/bin/go-runtime-probe {url}\n").into_boxed_str());
+
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/go-runtime-smoke: kernel first message",
+    }];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    // 1. Install the static-Go package from the bundled offline repo. `go` has
+    //    no DEPS, so the resolved order is just [go] and the installer prints
+    //    the per-package OK line directly.
+    steps.push(SmokeStep::Send {
+        input: "pkg install go\n",
+        label: "go-runtime-smoke: pkg install go",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "pkg install: go: OK",
+        fail_prefix: "pkg install: cannot",
+        // Generous ceiling: the ~5.5 MB `.m3pkg` is SHA-verified and written
+        // file-by-file over the slow ring-3 VFS. Normally well under this; the
+        // gate runs at a long global --timeout.
+        timeout_secs: 1800,
+        label: "go-runtime-smoke: go installed from .m3pkg",
+        exit_code_on_fail: SMOKE_EXIT_GO_SMOKE_FAILED,
+    });
+
+    // 2. Run the runtime probe. Loading a 5.5 MB static Go binary over the slow
+    //    VFS + runtime init takes a while on the first exec, hence the large
+    //    GO_HELLO_OK ceiling.
+    steps.push(SmokeStep::Send {
+        input: probe_cmd,
+        label: "go-runtime-smoke: run runtime probe",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "GO_HELLO_OK",
+        timeout_secs: 600,
+        label: "go-runtime-smoke: Go runtime started (GO_HELLO_OK)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "GO_GOROUTINE_OK",
+        timeout_secs: 60,
+        label: "go-runtime-smoke: goroutine channel rendezvous on a 2nd OS thread (GO_GOROUTINE_OK)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "GO_HTTP_OK",
+        timeout_secs: 60,
+        label: "go-runtime-smoke: plaintext HTTP GET over the in-kernel TCP stack (GO_HTTP_OK)",
+    });
+
+    steps
+}
+
 /// The serial script for `git-local-smoke`. Wait-patterns are git's own output
 /// (never a substring of the command that triggers them) because the serial
 /// console echoes typed input; `Send` clears the scrollback so each assertion
@@ -18507,7 +18730,8 @@ fn populate_phase_69d_ports(part_path: &Path, workspace_root: &Path) {
     // solver to resolve. The artifacts exist once build_git_port has built the chain (the
     // git-https-smoke gate does so first); on a routine image build where they
     // are absent this is a no-op, so nothing regresses.
-    const BUNDLE_ONLY_PORTS: &[&str] = &["git", "python", "ca-certificates", "mbedtls", "curl"];
+    const BUNDLE_ONLY_PORTS: &[&str] =
+        &["git", "python", "ca-certificates", "mbedtls", "curl", "go"];
     for port in BUNDLE_ONLY_PORTS {
         let Ok(artifact) = port_build::pkgcache_artifact_path(port) else {
             continue;

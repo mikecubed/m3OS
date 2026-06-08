@@ -72,7 +72,7 @@ Running a static (`CGO_ENABLED=0`) Go binary is gated on three specific gaps, su
 
 - **Blocker 1 — `mmap` `MAP_FIXED` + `PROT_NONE` reservations.** Go's allocator reserves arenas `PROT_NONE` then commits them `PROT_RW` `MAP_FIXED` *at the same address*; `sys_linux_mmap` currently discards the address hint and masks `MAP_FIXED`.
 - **Blocker 2 — edge-triggered `epoll`.** Go's netpoll registers `EPOLLET`+`EPOLLRDHUP`; m3OS `epoll` is **level-triggered only** (the `EPOLLET` flag is silently ignored), so Go busy-loops or hangs.
-- **Soft — async preemption.** `SIGURG` is undefined and signals are delivered only at syscall-return; Go uses `tgkill(SIGURG)` for goroutine preemption + GC stop-the-world. The sub-phase decides between an IRQ-return delivery path and `asyncpreemptoff` + `tgkill`-for-STW.
+- **Soft — async preemption.** `SIGURG` is undefined and signals are delivered only at syscall-return; Go uses `tgkill(SIGURG)` for goroutine preemption + GC stop-the-world. 86d's as-built: async preemption is left **enabled** and `SIGURG` is delivered at **syscall-return** (opportunistic — covers I/O-bound goroutines + GC stop-the-world); the timer-IRQ-return delivery path that would also preempt a syscall-free compute loop is deferred.
 
 Most of the runtime substrate already exists (`clone(CLONE_THREAD|…)`, `futex`, `arch_prctl ARCH_SET_FS`, `/proc/self/exe`, `clock_gettime`, `sched_getaffinity`), so this is targeted bring-up, not greenfield.
 

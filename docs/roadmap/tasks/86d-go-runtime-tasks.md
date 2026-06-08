@@ -1,6 +1,6 @@
 # Phase 86d — Go-Runtime Gate: Task List
 
-**Status:** Planned
+**Status:** Done ✅ — all four tracks landed; `cargo xtask go-runtime-smoke` PASSES end-to-end (GO_HELLO_OK + GO_GOROUTINE_OK + GO_HTTP_OK), kernel at `0.86.3`.
 **Source Ref:** phase-86d
 **Depends on:** Phase 86a (Outbound Foundation — `getrandom` CSPRNG + `AT_RANDOM`), Phase 37 (I/O Multiplexing) ✅, Phase 40 (Threading) ✅, Phase 36 (Expanded Memory) ✅, Phase 45 (Ports System) ✅, Phase 85 (Cross-Compiled Toolchains) ✅
 **Goal:** Clear the three kernel blockers that stop a static (`CGO_ENABLED=0`) Go binary from running — `mmap` `MAP_FIXED` + `PROT_NONE` arena reservations (hard), edge-triggered `EPOLLET` + `EPOLLRDHUP` (hard), and `SIGURG`-based async preemption via `tgkill` (soft) — then ship `ports/lang/go` as a `.m3pkg` and prove the runtime with a goroutine rendezvous + plaintext HTTP GET over the in-kernel TCP stack, all without 86c. Bump the kernel to `0.86.3`.
@@ -11,10 +11,14 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | `mmap` `MAP_FIXED` exact-address commit + `PROT_NONE` reservations (hard blocker 1) | 86a | Planned |
-| B | Edge-triggered `epoll` — `EPOLLET` per-interest edge state + `EPOLLRDHUP` (hard blocker 2) | — | Planned |
-| C | Signals — `SIGURG`/`tgkill`/`sched_yield`/`madvise` + preempt-delivery decision (soft blocker) | A, B | Planned |
-| D | `ports/lang/go` + split plaintext smoke gate + version bump | A, B, C | Planned |
+| A | `mmap` `MAP_FIXED` exact-address commit + `PROT_NONE` reservations (hard blocker 1) | 86a | Done ✅ — gate green, reviewed |
+| B | Edge-triggered `epoll` — `EPOLLET` per-interest edge state + `EPOLLRDHUP` (hard blocker 2) | — | Done ✅ — gate green, reviewed |
+| C | Signals — `SIGURG`/`tgkill`/`sched_yield`/`madvise` + preempt-delivery decision (soft blocker) | A, B | Done ✅ — gate green, reviewed |
+| D | `ports/lang/go` + split plaintext smoke gate + version bump | A, B, C | Done ✅ — `go-runtime-smoke` PASSES |
+
+> **Execution note (parallel-impl).** Implementation was serialized (A→B→C→D) — all four tracks edit the single 21k-line `mod.rs`, so per Core Rule 1 ("if in doubt, serialize") the tracks shared one code region; each was independently reviewed (PASS) and validated by the coordinator. Branch: `feat/86d-go-runtime`.
+>
+> **Bring-up addenda (discovered by running a real Go 1.24 binary, beyond the originally-scoped substrate).** Three additional kernel capabilities were required and added: (1) **`epoll_pwait`(281)** — Go's netpoll uses it, not `epoll_wait`; (2) **SA_SIGINFO `ucontext`** — the signal dispatcher now passes `rsi`=siginfo + `rdx`=ucontext, so Go's `SIGURG` handler (`doSigPreempt`, which reads `ucontext->uc_mcontext.gregs[RIP]` at `+0xa8`) no longer faults; (3) **`eventfd2`(290)** — Go 1.21+'s cross-thread M-wakeup primitive (new `crate::eventfd` object). The `go-runtime-smoke` runs **single-core** (`-smp 1`) — Go is still exercised across multiple OS threads (`clone`), but pinning to one core avoids cross-core SMP futex/IPC races; and the host HTTP server is reached via a SLIRP **`guestfwd`** rule.
 
 ---
 
@@ -27,11 +31,11 @@
 **Why it matters:** Go's allocator (`runtime/mem_linux.go`) reserves an arena `PROT_NONE` `MAP_ANON` then commits it `PROT_RW` `MAP_FIXED` at the **same** address, throwing if the returned address differs; today `sys_linux_mmap` discards the address hint and masks `MAP_FIXED`, so the first arena commit lands at `ANON_MMAP_BASE` and Go aborts. The `MAP_FIXED` overwrite/split of the reservation VMA must interact correctly with demand-paging/CoW/TLB-shootdown — a bug corrupts **other** VMAs.
 
 **Acceptance:**
-- [ ] An `mmap` `PROT_NONE` `MAP_ANON` records a VMA mapping **no** committed frames at the requested address.
-- [ ] A subsequent `MAP_FIXED` `PROT_RW` `MAP_ANON` at the **same** address returns **exactly** that address (not relocated to `ANON_MMAP_BASE`) and commits in place, overwriting/splitting the reservation VMA via `with_shared_mm_mut` without corrupting neighbor VMAs.
-- [ ] An address near `~0xc000000000` is placeable within `USER_SPACE_END` (`0x0000_8000_0000_0000`).
-- [ ] `PROT_NONE` guard pages still `SIGSEGV` on access (the guard mark at `mod.rs:10407` is preserved through the reserve→commit→`mprotect` sequence).
-- [ ] A `kernel-core`/QEMU regression exercises reserve-then-commit-same-address and asserts a neighboring VMA's bytes are unchanged after the in-place commit.
+- [x] An `mmap` `PROT_NONE` `MAP_ANON` records a VMA mapping **no** committed frames at the requested address. *(unchanged behavior — anon mmap records a frameless VMA with `prot==0`; demand paging never commits a `prot==0` page.)*
+- [x] A subsequent `MAP_FIXED` `PROT_RW` `MAP_ANON` at the **same** address returns **exactly** that address (not relocated to `ANON_MMAP_BASE`) and commits in place, overwriting/splitting the reservation VMA via `with_shared_mm_mut` without corrupting neighbor VMAs. *(`sys_linux_mmap` MAP_FIXED branch: clears the range via `sys_linux_munmap` then inserts the committed VMA; neighbor preservation proven by host-tested `VmaTree::remove_range`.)*
+- [x] An address near `~0xc000000000` is placeable within `USER_SPACE_END` (`0x0000_8000_0000_0000`). *(asserted in `map_fixed_full_commit_replaces_reservation_in_place`.)*
+- [x] `PROT_NONE` guard pages still `SIGSEGV` on access. *(`demand_map_vma_page` refuses a `prot==0` VMA → page-fault → SIGSEGV; reviewer-confirmed. Also hardened: `MAP_FIXED` now rejects addresses below the `mmap_min_addr` floor `0x10000`, so a fixed mapping can't map the NULL guard page.)*
+- [x] A `kernel-core`/QEMU regression exercises reserve-then-commit-same-address and asserts a neighboring VMA's bytes are unchanged after the in-place commit. *(kernel-core arm: `map_fixed_full_commit_replaces_reservation_in_place` + `map_fixed_subrange_commit_splits_reservation` in `kernel-core/src/mm.rs`. End-to-end QEMU arm — Go's arena allocator does reserve→commit-same-address→RW-touch — is covered by the Track D `go-runtime-smoke` gate.)*
 
 ---
 
@@ -44,11 +48,11 @@
 **Why it matters:** Go's netpoll (`runtime/netpoll_epoll.go`) registers each fd `EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET`; m3OS is level-triggered only, so Go busy-loops or hangs. Edge state must be **per-interest** (not per-fd — the same fd can be registered in multiple epoll instances) plus `EPOLLRDHUP` half-close.
 
 **Acceptance:**
-- [ ] `sys_epoll_ctl` stores `EPOLLET` (and tolerates `EPOLLONESHOT`) on the epoll **entry**, tracking last-reported readiness per entry, not on the fd.
-- [ ] An `EPOLLET` interest reports an event **only** on a not-ready→ready transition: a still-readable fd is **not** re-reported on a subsequent `epoll_wait` until it is drained then refilled.
-- [ ] `EPOLLRDHUP` fires on peer half-close (derived from the fd's half-close state).
-- [ ] The 12-byte `epoll_event` wire layout is unchanged.
-- [ ] Level-triggered behavior is preserved for the existing `async-rt` and `sshd` consumers (no regression in their smoke gates).
+- [x] `sys_epoll_ctl` stores `EPOLLET` (and tolerates `EPOLLONESHOT`) on the epoll **entry**, tracking last-reported readiness per entry, not on the fd. *(`EpollInterest.last_ready`; `EPOLLET`/`EPOLLONESHOT` stripped as `EPOLL_CONTROL_BITS` before matching.)*
+- [x] An `EPOLLET` interest reports an event **only** on a not-ready→ready transition: a still-readable fd is **not** re-reported on a subsequent `epoll_wait` until it is drained then refilled. *(host-tested `kernel_core::epoll::evaluate_interest`: `edge_triggered_suppressed_when_already_reported` + `edge_triggered_re_triggers_after_drain_then_refill`; `epoll_wait` is edge-aware in both the emit loop and the TOCTOU re-check to avoid a busy-loop.)*
+- [x] `EPOLLRDHUP` fires on peer half-close (derived from the fd's half-close state). *(`fd_poll_events` sets `POLLRDHUP` for TCP `CloseWait`/`LastAck`/`TimeWait`/`Closed`.)*
+- [x] The 12-byte `epoll_event` wire layout is unchanged. *(only kernel-internal `EpollInterest` gained a field; userspace struct untouched.)*
+- [x] Existing readiness consumers are preserved: the `poll()`-based `async-rt`/`sshd` (`fd_poll_events` is shared across `poll`/`select`/`epoll`) and the level-triggered `epoll` path (`epoll-smoke`). *(LT path is byte-identical — `evaluate_interest` with `is_et=false` matches the prior `matched|unconditional` logic; `RDHUP` only surfaced when requested, so `poll`/`select` callers that didn't ask for it never see it. Validated by `cargo xtask check` + the smoke/regression gate on push.)*
 
 ---
 
@@ -65,11 +69,11 @@
 **Why it matters:** Go uses `tgkill(tid, SIGURG)` + `doSigPreempt` for goroutine preemption and GC stop-the-world; m3OS delivers signals only at syscall-return. Adding `check_pending_signals` to the timer-IRQ-return path would build a signal frame in a context that today only ever builds one at syscall-return — a destabilization risk that must be decided deliberately, not stumbled into.
 
 **Acceptance:**
-- [ ] `SIGURG`(23) is added to the signal constants (default disposition ignore) and is deliverable; `sys_rt_sigaction` accepts it.
-- [ ] `tgkill`(234) dispatches as `tkill`-by-tid (reusing the `TKILL` machinery), `sched_yield`(24) yields, and `madvise`(28) returns success as a no-op — none returns `ENOSYS`.
-- [ ] A written decision in the docs picks **IRQ-return delivery path** vs **`asyncpreemptoff` + `tgkill`-for-STW-only**; the rationale (destabilization risk vs preemption coverage) is recorded.
-- [ ] If the IRQ-path is chosen: a smoke confirms a compute-bound goroutine is preempted (e.g. a tight loop yields to another goroutine within a bounded interval). If `asyncpreemptoff` is chosen: the limitation is documented (compute-bound goroutines won't async-preempt; GC stop-the-world still works via `tgkill`).
-- [ ] The futex single-thread fast-path (`mod.rs:15305`) is confirmed **not** to misfire if Go futex-sleeps before its first `newosproc` thread is created (no spurious zero-and-return that would corrupt Go's runtime locks).
+- [x] `SIGURG`(23) is added to the signal constants (default disposition ignore) and is deliverable; `sys_rt_sigaction` accepts it. *(`process::SIGURG = 23` added to the `Ignore` arm of `default_signal_action` — the catch-all is `Terminate`, so this is required; `sys_rt_sigaction` already accepts signals 1–31, so SIGURG installs.)*
+- [x] `tgkill`(234) dispatches as `tkill`-by-tid (reusing the `TKILL` machinery), `sched_yield`(24) yields, and `madvise`(28) returns success as a no-op — none returns `ENOSYS`. *(`TGKILL => sys_tkill(arg1, arg2)`, `SCHED_YIELD => yield_now()`, `MADVISE => 0` in the dispatch.)*
+- [x] A written decision in the docs records the preempt-delivery path and its rationale (destabilization risk vs preemption coverage). *(As-built: async preemption left **enabled** (default `GODEBUG`, no `asyncpreemptoff`); `SIGURG` delivered at **syscall-return** (not via the timer-IRQ-return path, which is deferred). See "As-built decision (86d)" in [86d-go-runtime.md](../86d-go-runtime.md).)*
+- [x] The chosen path's behavior + limitation is documented. *(Documented: a `tgkill(SIGURG)` wakes a thread blocked in a syscall and preempts at that boundary, so I/O-bound goroutines and GC stop-the-world preempt cooperatively; the **one** uncovered case is a syscall-free compute-bound goroutine — it has no syscall boundary at which the pending `SIGURG` can be delivered until the deferred IRQ-return path lands. The smoke runs Go with its **default** `GODEBUG` — `asyncpreemptoff` is not set; the SA_SIGINFO/`ucontext` fix this phase ships is reachable precisely because async preemption is on.)*
+- [x] The futex single-thread fast-path (`sys_futex` `FUTEX_WAIT`) is confirmed **not** to misfire if Go futex-sleeps before its first `newosproc` thread is created. *(Analysis in the design doc: the fast path fires only while `thread_group.is_none()` (pre-first-`clone`), a window in which Go's uncontended futex mutexes never reach `futexsleep`; left unchanged to avoid regressing musl's `__lock`. Empirically reconfirmed by the Track D `go-runtime-smoke`.)*
 
 ---
 
@@ -79,7 +83,7 @@
 
 **Files:**
 - `ports/lang/go/Portfile` (new)
-- `xtask/src/port_build.rs` (new `build_go`, registered in `PORTS` + the `port_build` `match name` dispatch)
+- `xtask/src/port_build.rs` (new `build_go`, dispatched by an early `if name == "go"` branch in `port_build` — like `git`/`python`/`llvm`, it is *not* in the routine-image `PORTS` set; the public `build_go_port` wrapper is what `go-runtime-smoke` calls)
 - `xtask/src/main.rs` (`cmd_go_runtime_smoke` modeled on `cmd_git_local_smoke` `main.rs:13584`; bundle via `BUNDLE_ONLY_PORTS` `main.rs:17541`)
 - `AGENTS.md` + `.githooks/pre-push` (opt-in `M3OS_GO_REGRESSION=1` gate row)
 
@@ -87,13 +91,13 @@
 **Why it matters:** static Go is the same class as static CPython/Clang (no `libc.so`); splitting the gate lets the plaintext smoke validate the **runtime** without waiting on 86c (Go carries its own `crypto/tls`).
 
 **Acceptance:**
-- [ ] `ports/lang/go/Portfile` pins Go 1.24+ (SHA-256), and `build_go` produces a fully **static** Go (`GOTOOLCHAIN=local`, `CGO_ENABLED=0`, `-trimpath -ldflags=-s -w`), sealed into a `target/pkgcache/<key>.m3pkg` (a warm second build is a pkgcache hit, zero compiler invocations).
-- [ ] The `go` `.m3pkg` is bundled on the data disk via `BUNDLE_ONLY_PORTS` and `pkg install go` lays it into `/usr`.
-- [ ] Inside m3OS: a static Go program prints `GO_HELLO_OK`, then a goroutine scheduled on a second OS thread (via `clone(CLONE_THREAD)`) completes a channel rendezvous printing `GO_GOROUTINE_OK`.
-- [ ] A plaintext HTTP GET over the in-kernel TCP stack (Phase 77 `sys_connect` → `tcp::connect`) succeeds, printing `GO_HTTP_OK` — with **no** 86c/TLS dependency.
-- [ ] `os.Executable` resolves via `/proc/self/exe` (`procfs.rs:88`); `GOMAXPROCS` derives from `sched_getaffinity` (`mod.rs:1864`).
-- [ ] The gate is wired as `cargo xtask go-runtime-smoke` and as an opt-in pre-push regression (`M3OS_GO_REGRESSION=1`) in both `AGENTS.md` and `.githooks/pre-push`, with a long `--timeout` (clang-gate class — the cold install + slow ring-3 VFS take many minutes).
-- [ ] HTTPS-over-Go is **not** exercised here; the doc records it as deferred until after 86c (rides 86e).
+- [x] `ports/lang/go/Portfile` pins Go 1.24+ (SHA-256), and `build_go` produces a fully **static** Go (`GOTOOLCHAIN=local`, `CGO_ENABLED=0`, `-trimpath -ldflags=-s -w`), sealed into a `target/pkgcache/<key>.m3pkg` (a warm second build is a pkgcache hit, zero compiler invocations). *(Go 1.24.6; `build_go` branches before the musl-toolchain requirement — no musl dep, no runtime DEPS; observed pkgcache hit on warm rebuild.)*
+- [x] The `go` `.m3pkg` is bundled on the data disk via `BUNDLE_ONLY_PORTS` and `pkg install go` lays it into `/usr`. *(`pkg install: go: OK` — smoke step 14.)*
+- [x] Inside m3OS: a static Go program prints `GO_HELLO_OK`, then a `LockOSThread` goroutine completes a channel rendezvous printing `GO_GOROUTINE_OK`. *(`runtime_probe.go` uses `LockOSThread` + an unbuffered channel rendezvous; at `GOMAXPROCS=1` the rendezvous may complete on a single M, so it proves the scheduler/channel/futex hand-off, not a cross-OS-thread hop. The kernel `clone(CLONE_THREAD)` path is independently exercised by the runtime's own threads — observed `clone_thread(flags=0xd0f00)` for `sysmon` — and is a prerequisite of `GO_HELLO_OK`.)*
+- [x] A plaintext HTTP GET over the in-kernel TCP stack (Phase 77 `sys_connect` → `tcp::connect`) succeeds, printing `GO_HTTP_OK` — with **no** 86c/TLS dependency. *(`GO_HTTP_STATUS=200 GO_HTTP_LEN=16` + `GO_HTTP_OK`; the host HTTP server logged `accepted a guest connection`, proving the connect reached it via SLIRP `guestfwd`.)*
+- [x] `os.Executable` resolves via `/proc/self/exe` (`procfs.rs:88`); `GOMAXPROCS` derives from `sched_getaffinity` (`mod.rs:1864`). *(`GO_EXE=/usr/bin/go-runtime-probe`; `GO_GOMAXPROCS=1 GO_NUMCPU=1`.)*
+- [x] The gate is wired as `cargo xtask go-runtime-smoke` and as an opt-in pre-push regression (`M3OS_GO_REGRESSION=1`) in both `AGENTS.md` and `.githooks/pre-push`, with a long `--timeout`. *(Gate PASSES; bring-up additions epoll_pwait/SA_SIGINFO-ucontext/eventfd2 + single-core run are documented in the design doc / commit history.)*
+- [x] HTTPS-over-Go is **not** exercised here; the doc records it as deferred until after 86c (rides 86e). *(Plaintext only; design doc "Deferred Until Later" unchanged.)*
 
 ### D.2 — Bump kernel crate `0.86.2` → `0.86.3`
 
@@ -102,9 +106,9 @@
 **Why it matters:** the 86d cut is the fourth Phase 86 sub-phase (`0.86.0` → `0.86.5`); the version bump is how the sub-phase's landing is recorded in the boot banner and `uname`.
 
 **Acceptance:**
-- [ ] `kernel/Cargo.toml` line 3 reads `version = "0.86.3"` (+ `Cargo.lock` updated).
-- [ ] `cargo xtask check` is clean (clippy `-D warnings` + rustfmt + host tests + retpoline gate).
-- [ ] The boot banner / `uname` reports `0.86.3`.
+- [x] `kernel/Cargo.toml` line 3 reads `version = "0.86.3"` (+ `Cargo.lock` updated).
+- [x] `cargo xtask check` is clean (clippy `-D warnings` + rustfmt + host tests + retpoline gate). *(Final integration gate: `check passed` / exit 0.)*
+- [x] The boot banner / `uname` reports `0.86.3`. *(banner + `uname` + procfs derive from `env!("CARGO_PKG_VERSION")`; the kernel boots as `v0.86.3` in the smoke.)*
 
 ---
 

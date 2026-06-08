@@ -1361,6 +1361,12 @@ mod syscall_nr {
     pub const SCHED_GETAFFINITY: u64 = 204;
     pub const SET_TID_ADDRESS: u64 = 218;
     pub const EXIT_GROUP: u64 = 231;
+    // Phase 86d Track C — Go runtime: tgkill(tgid, tid, SIGURG) for goroutine
+    // preemption / GC stop-the-world, sched_yield from the runtime's spin
+    // loops, madvise(MADV_FREE/DONTNEED) from the allocator's scavenger.
+    pub const SCHED_YIELD: u64 = 24;
+    pub const MADVISE: u64 = 28;
+    pub const TGKILL: u64 = 234;
 
     // -- net --
     pub const SOCKET: u64 = 41;
@@ -1394,6 +1400,12 @@ mod syscall_nr {
     pub const PSELECT6: u64 = 270;
     pub const EPOLL_CREATE1: u64 = 291;
     pub const PIPE2: u64 = 293;
+    // Phase 86d Track D — Go's netpoll (runtime/netpoll_epoll.go) issues
+    // `epoll_pwait`, not `epoll_wait`. Same args plus a (nil, for Go) sigmask.
+    pub const EPOLL_PWAIT: u64 = 281;
+    // Phase 86d Track D — Go 1.21+ uses an eventfd as its cross-thread M-wakeup
+    // primitive (`netpollBreak`).
+    pub const EVENTFD2: u64 = 290;
 
     // -- time --
     pub const NANOSLEEP: u64 = 35;
@@ -1841,6 +1853,19 @@ pub extern "C" fn syscall_handler(
         GETSID => sys_getsid(arg0),
         GETTID => sys_gettid(),
         TKILL => sys_tkill(arg0, arg1),
+        // Phase 86d Track C — Go runtime syscalls.
+        // tgkill(tgid, tid, sig): target the specific thread `tid` (a Pid in
+        // m3OS); the tgid (arg0) is advisory here since each thread is its own
+        // PROCESS_TABLE entry, so reuse the tkill-by-tid machinery.
+        TGKILL => sys_tkill(arg1, arg2),
+        SCHED_YIELD => {
+            crate::task::yield_now();
+            0
+        }
+        // madvise is purely advisory; honoring it (MADV_FREE/DONTNEED page
+        // release) is an optimization, never a correctness requirement, so a
+        // success no-op is a valid implementation.
+        MADVISE => 0,
         SCHED_SETAFFINITY => {
             if arg2 == 0 {
                 NEG_EFAULT
@@ -1934,6 +1959,14 @@ pub extern "C" fn syscall_handler(
             let timeout = per_core_syscall_arg3();
             sys_epoll_wait(arg0, arg1, arg2, timeout)
         }
+        EPOLL_PWAIT => {
+            // Phase 86d Track D — Go's netpoll path. Args mirror epoll_wait
+            // (epfd, events, maxevents, timeout=r10); the sigmask (r8) /
+            // sigsetsize (r9) temporary mask-swap is ignored — Go always passes
+            // a nil sigmask, for which epoll_pwait is identical to epoll_wait.
+            let timeout = per_core_syscall_arg3();
+            sys_epoll_wait(arg0, arg1, arg2, timeout)
+        }
         EPOLL_CTL => {
             let event_ptr = per_core_syscall_arg3();
             sys_epoll_ctl(arg0, arg1, arg2, event_ptr)
@@ -1944,6 +1977,7 @@ pub extern "C" fn syscall_handler(
             sys_pselect6(arg0, arg1, arg2, exceptfds, timeout_ptr)
         }
         EPOLL_CREATE1 => sys_epoll_create1(arg0),
+        EVENTFD2 => sys_eventfd2(arg0, arg1),
         PIPE2 => {
             // Phase 69d follow-up (PR #177 third-pass review fix):
             // reject unknown pipe2 flag bits with EINVAL.  Linux only
@@ -2487,14 +2521,30 @@ fn deliver_user_signal(
     );
 
     // 4. Enter ring 3 at the handler address.
-    //    RIP = handler_entry, RSP = frame_rsp, RDI = signum (first arg).
-    //
-    //    We use a custom iretq sequence that also sets RDI.
-    unsafe { enter_signal_handler(handler_entry, frame_rsp, signum as u64, &regs) }
+    //    RIP = handler_entry, RSP = frame_rsp, and the System V handler ABI
+    //    args: RDI = signum, RSI = &siginfo, RDX = &ucontext. The latter two
+    //    are required by SA_SIGINFO handlers (Go installs one); without them a
+    //    handler that reads `ucontext->uc_mcontext.gregs[RIP]` (Go's
+    //    `doSigPreempt`, at ucontext+0xa8) dereferences a stale/null RDX and
+    //    faults. They are harmless for legacy non-SA_SIGINFO handlers, which
+    //    ignore RSI/RDX — Linux likewise always sets them for rt_sigframe.
+    let siginfo_ptr = frame_rsp + crate::signal::OFF_SIGINFO as u64;
+    let ucontext_ptr = frame_rsp + crate::signal::OFF_UCONTEXT as u64;
+    unsafe {
+        enter_signal_handler(
+            handler_entry,
+            frame_rsp,
+            signum as u64,
+            siginfo_ptr,
+            ucontext_ptr,
+            &regs,
+        )
+    }
 }
 
-/// Enter ring 3 at `handler` with `rsp` as the stack pointer and `rdi`
-/// set to the signal number (first argument to the handler).
+/// Enter ring 3 at `handler` with `rsp` as the stack pointer and the System V
+/// signal-handler arguments set: `rdi` = signal number, `rsi` = pointer to the
+/// `siginfo_t`, `rdx` = pointer to the `ucontext_t` (both within the sigframe).
 ///
 /// # Safety
 ///
@@ -2503,16 +2553,21 @@ unsafe fn enter_signal_handler(
     handler: u64,
     rsp: u64,
     sig: u64,
+    siginfo_ptr: u64,
+    ucontext_ptr: u64,
     saved_regs: &crate::signal::SavedUserRegs,
 ) -> ! {
     unsafe {
         // Build a modified copy of the interrupted user context: RIP→handler,
-        // RSP→sigframe, RDI→signal number. All other GPRs retain the
-        // interrupted values so no kernel register state leaks to ring 3.
+        // RSP→sigframe, and the handler ABI args (RDI/RSI/RDX). All other GPRs
+        // retain the interrupted values so no kernel register state leaks to
+        // ring 3.
         let mut regs = *saved_regs;
         regs.rip = handler;
         regs.rsp = rsp;
         regs.rdi = sig;
+        regs.rsi = siginfo_ptr;
+        regs.rdx = ucontext_ptr;
         restore_and_enter_userspace(&regs)
     }
 }
@@ -3739,6 +3794,7 @@ pub(super) fn sys_dup(oldfd: u64) -> u64 {
             match &backend_clone {
                 FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_add_reader(*pipe_id),
                 FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_add_writer(*pipe_id),
+                FdBackend::EventFd { id } => crate::eventfd::eventfd_add_ref(*id),
                 FdBackend::PtyMaster { pty_id } => crate::pty::add_master_ref(*pty_id),
                 FdBackend::PtySlave { pty_id } => crate::pty::add_slave_ref(*pty_id),
                 FdBackend::Socket { handle } => crate::net::add_socket_ref(*handle),
@@ -3797,6 +3853,7 @@ pub(super) fn sys_dup2(oldfd: u64, newfd: u64) -> u64 {
     match &entry.backend {
         FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_add_reader(*pipe_id),
         FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_add_writer(*pipe_id),
+        FdBackend::EventFd { id } => crate::eventfd::eventfd_add_ref(*id),
         FdBackend::PtyMaster { pty_id } => crate::pty::add_master_ref(*pty_id),
         FdBackend::PtySlave { pty_id } => crate::pty::add_slave_ref(*pty_id),
         FdBackend::Socket { handle } => crate::net::add_socket_ref(*handle),
@@ -6013,6 +6070,57 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     }
 
     match &entry.backend {
+        FdBackend::EventFd { id } => {
+            // Phase 86d Track D — eventfd read: an 8-byte counter, drained on
+            // read. Go's eventfd is non-blocking (EAGAIN when empty); a blocking
+            // eventfd parks on the object's wait queue until a write makes it
+            // readable (mirrors the pipe read pattern).
+            let id = *id;
+            if (count as usize) < 8 {
+                return NEG_EINVAL;
+            }
+            let nonblock = entry.nonblock;
+            let task_id = match crate::task::scheduler::current_task_id() {
+                Some(t) => t,
+                None => return NEG_EINTR,
+            };
+            let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+            loop {
+                woken.store(false, core::sync::atomic::Ordering::Release);
+                if !crate::eventfd::eventfd_register_waiter(id, task_id, &woken) {
+                    // The eventfd object was freed (last fd reference closed,
+                    // possibly by a peer thread while we were blocked here).
+                    // Return EOF rather than dead-block on a wait queue that no
+                    // longer exists — mirrors a pipe reader seeing writer-close.
+                    return 0;
+                }
+                if let Some(val) = crate::eventfd::eventfd_read(id) {
+                    crate::eventfd::eventfd_deregister_waiter(id, task_id);
+                    let bytes = val.to_ne_bytes();
+                    if UserSliceWo::new(buf_ptr, bytes.len())
+                        .and_then(|s| s.copy_from_kernel(&bytes))
+                        .is_err()
+                    {
+                        return NEG_EFAULT;
+                    }
+                    return 8;
+                }
+                if nonblock {
+                    crate::eventfd::eventfd_deregister_waiter(id, task_id);
+                    return NEG_EAGAIN;
+                }
+                if has_pending_signal() {
+                    crate::eventfd::eventfd_deregister_waiter(id, task_id);
+                    return NEG_EINTR;
+                }
+                let _ = crate::task::scheduler::block_current_until(
+                    crate::task::TaskState::BlockedOnRecv,
+                    &woken,
+                    None,
+                );
+                crate::eventfd::eventfd_deregister_waiter(id, task_id);
+            }
+        }
         FdBackend::Stdin | FdBackend::DeviceTTY { .. } => {
             // Read from kernel stdin buffer.
             let capped = (count as usize).min(4096);
@@ -6809,6 +6917,27 @@ pub(super) fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     }
 
     match &entry.backend {
+        FdBackend::EventFd { id } => {
+            // Phase 86d Track D — eventfd write: add an 8-byte value to the
+            // counter and wake epoll/poll waiters (Go's netpollBreak wakeup).
+            if (count as usize) < 8 {
+                return NEG_EINVAL;
+            }
+            let mut bytes = [0u8; 8];
+            if UserSliceRo::new(buf_ptr, bytes.len())
+                .and_then(|s| s.copy_to_kernel(&mut bytes))
+                .is_err()
+            {
+                return NEG_EFAULT;
+            }
+            let val = u64::from_ne_bytes(bytes);
+            match crate::eventfd::eventfd_write(*id, val) {
+                Ok(()) => 8,
+                Err(crate::eventfd::EventFdWriteErr::Invalid) => NEG_EINVAL,
+                Err(crate::eventfd::EventFdWriteErr::WouldBlock) => NEG_EAGAIN,
+                Err(crate::eventfd::EventFdWriteErr::BadFd) => NEG_EBADF,
+            }
+        }
         FdBackend::Stdout | FdBackend::DeviceTTY { .. } => {
             // stdout/stderr/tty go to serial + framebuffer console.
             let len = (count as usize).min(4096);
@@ -9178,6 +9307,7 @@ pub(super) fn sys_linux_close(fd: u64) -> u64 {
         match &entry.backend {
             FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_close_reader(*pipe_id),
             FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_close_writer(*pipe_id),
+            FdBackend::EventFd { id } => crate::eventfd::eventfd_close(*id),
             FdBackend::Socket { handle } => crate::net::release_socket_pub(*handle),
             FdBackend::UnixSocket { handle } => crate::net::unix::free_unix_socket(*handle),
             FdBackend::PtyMaster { pty_id } => crate::pty::close_master(*pty_id),
@@ -9662,7 +9792,9 @@ pub(super) fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
         }
         FdBackend::Socket { .. } | FdBackend::UnixSocket { .. } => (0xC000 | 0o755, 0, 0, 0, 0),
         FdBackend::Stdout | FdBackend::Stdin => (0x2000 | 0o620, 0, 0, 0, 0),
-        FdBackend::PipeRead { .. } | FdBackend::PipeWrite { .. } => (0x1000 | 0o600, 0, 0, 0, 0),
+        FdBackend::PipeRead { .. } | FdBackend::PipeWrite { .. } | FdBackend::EventFd { .. } => {
+            (0x1000 | 0o600, 0, 0, 0, 0)
+        }
         FdBackend::Ramdisk { content_len, .. } => {
             // Ramdisk files: root-owned, mode 0o755 (all files, including non-executables)
             (0x8000 | 0o755, 0, 0, *content_len as u64, 0)
@@ -9810,7 +9942,9 @@ pub(super) fn sys_fstatfs(fd: u64, buf_ptr: u64) -> u64 {
         | FdBackend::PtySlave { .. }
         | FdBackend::Epoll { .. } => ramdisk_statfs(),
         FdBackend::Stdin | FdBackend::Stdout => ramdisk_statfs(),
-        FdBackend::PipeRead { .. } | FdBackend::PipeWrite { .. } => pipefs_statfs(),
+        FdBackend::PipeRead { .. } | FdBackend::PipeWrite { .. } | FdBackend::EventFd { .. } => {
+            pipefs_statfs()
+        }
         FdBackend::Socket { .. } | FdBackend::UnixSocket { .. } => sockfs_statfs(),
         FdBackend::VfsService { .. } => ext2_statfs(),
     };
@@ -10165,7 +10299,8 @@ pub(super) fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
         | FdBackend::Proc { .. }
         | FdBackend::Socket { .. }
         | FdBackend::UnixSocket { .. }
-        | FdBackend::Epoll { .. } => return NEG_EINVAL, // not seekable
+        | FdBackend::Epoll { .. }
+        | FdBackend::EventFd { .. } => return NEG_EINVAL, // not seekable
         FdBackend::Ramdisk { content_len, .. } => *content_len,
         FdBackend::Tmpfs { path } => {
             let tmpfs = crate::fs::tmpfs::TMPFS.lock();
@@ -10306,6 +10441,13 @@ pub(super) fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
 
     const MAP_PRIVATE: u64 = 0x02;
     const MAP_ANONYMOUS: u64 = 0x20;
+    // MAP_FIXED — Go's allocator (runtime/mem_linux.go) reserves an arena
+    // PROT_NONE, then commits it PROT_RW with MAP_FIXED at the *same* address
+    // and throws ("cannot map pages in arena address space") if the kernel
+    // relocates the mapping. Capture the bit from the raw flags before the
+    // mask below drops it (Phase 86d, Track A — hard blocker 1).
+    const MAP_FIXED: u64 = 0x10;
+    let map_fixed = flags & MAP_FIXED != 0;
 
     // Mask prot to supported bits only.
     const PROT_MASK: u64 = 0x7; // PROT_READ | PROT_WRITE | PROT_EXEC
@@ -10333,7 +10475,57 @@ pub(super) fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
         Some(s) => s,
         None => return NEG_EINVAL,
     };
-    // Hint address is ignored: always allocate linearly.
+
+    // MAP_FIXED — honor the *exact* requested address. This is the Go
+    // arena-commit contract: a prior PROT_NONE reservation is committed
+    // PROT_RW in place at the address the kernel handed back, and Go aborts
+    // if the returned address differs. Overwrite/split whatever currently
+    // occupies the range and return `addr_hint` unchanged.
+    if map_fixed {
+        const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
+        // mmap_min_addr floor (Linux default): never honor a fixed mapping over
+        // the low NULL-guard pages, so a fixed request can't defeat the
+        // null-pointer-deref trap. Go's arena hints start ~0xc000000000, well
+        // above this. (Phase 86d Track A reviewer follow-up.)
+        const MMAP_MIN_ADDR: u64 = 0x1_0000;
+        // The address must be page-aligned and the whole range must stay in
+        // canonical user space (~0xc000000000 fits well under USER_SPACE_END).
+        if addr_hint < MMAP_MIN_ADDR
+            || addr_hint & 0xFFF != 0
+            || addr_hint
+                .checked_add(total_size)
+                .filter(|e| *e <= USER_SPACE_END)
+                .is_none()
+        {
+            return NEG_EINVAL;
+        }
+        // Clear whatever occupies [addr_hint, addr_hint+total_size): frees any
+        // committed frames, removes/splits the overlapping VMAs — neighbor VMAs
+        // outside the range are preserved by `VmaTree::remove_range` — and
+        // batches a TLB shootdown. For a PROT_NONE reservation this finds no
+        // mapped frames and is a cheap no-op that still drops the reservation
+        // VMA, so the insert below replaces it cleanly.
+        let _ = sys_linux_munmap(addr_hint, total_size);
+        // Record the committed VMA at the exact address; demand paging fills
+        // frames on first touch with the requested protection.
+        let _ = crate::process::with_shared_mm_mut(pid, |_brk_current, _mmap_next, vma_tree| {
+            vma_tree.insert(crate::process::MemoryMapping {
+                start: addr_hint,
+                len: total_size,
+                prot,
+                flags,
+            });
+        });
+        let table = crate::process::PROCESS_TABLE.lock();
+        if let Some(proc) = table.find(pid)
+            && let Some(ref addr_space) = proc.addr_space
+        {
+            addr_space.bump_generation();
+        }
+        return addr_hint;
+    }
+
+    // Hint address is ignored for non-fixed mappings: always allocate linearly.
     let _ = addr_hint;
     // Determine base address: use process mmap_next or default ANON_MMAP_BASE.
     const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
@@ -14554,7 +14746,8 @@ pub(super) fn sys_linux_ftruncate(fd: u64, length: u64) -> u64 {
         | FdBackend::Proc { .. }
         | FdBackend::Socket { .. }
         | FdBackend::UnixSocket { .. }
-        | FdBackend::Epoll { .. } => NEG_EINVAL,
+        | FdBackend::Epoll { .. }
+        | FdBackend::EventFd { .. } => NEG_EINVAL,
         FdBackend::Ramdisk { .. } => NEG_EROFS,
         FdBackend::Tmpfs { path } => {
             let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
@@ -15718,6 +15911,13 @@ pub(super) fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
                         }
                         FdBackend::Epoll { instance_id } => {
                             epoll_add_ref(*instance_id);
+                        }
+                        // Phase 86d Track D — eventfd is refcounted like the
+                        // other dup paths (sys_dup/sys_dup2); fcntl(F_DUPFD)
+                        // must bump it too, else closing either fd frees the
+                        // object under the other.
+                        FdBackend::EventFd { id } => {
+                            crate::eventfd::eventfd_add_ref(*id);
                         }
                         _ => {}
                     }
@@ -18439,6 +18639,7 @@ fn acquire_inflight_anc_backend(backend: &FdBackend) {
     match backend {
         FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_add_reader(*pipe_id),
         FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_add_writer(*pipe_id),
+        FdBackend::EventFd { id } => crate::eventfd::eventfd_add_ref(*id),
         FdBackend::Socket { handle } => crate::net::add_socket_ref(*handle),
         FdBackend::UnixSocket { handle } => crate::net::unix::add_unix_socket_ref(*handle),
         FdBackend::PtyMaster { pty_id } => crate::pty::add_master_ref(*pty_id),
@@ -18472,6 +18673,10 @@ fn anc_backend_is_refcounted(backend: &FdBackend) -> bool {
         backend,
         FdBackend::PipeRead { .. }
             | FdBackend::PipeWrite { .. }
+            // Phase 86d Track D — eventfd is cycle-safe (no anc_queue like
+            // UnixSocket), refcounted, and Linux permits passing it via
+            // SCM_RIGHTS; keep it symmetric with the acquire/release helpers.
+            | FdBackend::EventFd { .. }
             | FdBackend::Socket { .. }
             | FdBackend::PtyMaster { .. }
             | FdBackend::PtySlave { .. }
@@ -18488,6 +18693,7 @@ fn release_inflight_anc_backend(backend: &FdBackend) {
     match backend {
         FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_close_reader(*pipe_id),
         FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_close_writer(*pipe_id),
+        FdBackend::EventFd { id } => crate::eventfd::eventfd_close(*id),
         FdBackend::Socket { handle } => crate::net::release_socket_pub(*handle),
         FdBackend::UnixSocket { handle } => crate::net::unix::free_unix_socket(*handle),
         FdBackend::PtyMaster { pty_id } => crate::pty::close_master(*pty_id),
@@ -19455,6 +19661,10 @@ const POLLOUT: i16 = 0x004;
 const POLLERR: i16 = 0x008;
 const POLLHUP: i16 = 0x010;
 const POLLNVAL: i16 = 0x020;
+// Phase 86d Track B — peer half-close (read side hung up). Value matches Linux
+// POLLRDHUP/EPOLLRDHUP (0x2000) so the bit survives the `as u16 as u32`
+// widening in epoll_wait and maps straight onto EPOLLRDHUP.
+const POLLRDHUP: i16 = 0x2000;
 
 /// Query current readiness events for a file descriptor.
 ///
@@ -19482,6 +19692,35 @@ fn fd_poll_events(entry: &FdEntry) -> i16 {
                 Some(false) => 0,          // full but reader alive
                 None => POLLERR | POLLHUP, // reader closed (EPIPE)
             }
+        }
+        FdBackend::EventFd { id } => {
+            // Phase 86d Track D — eventfd readiness: POLLIN when the counter is
+            // non-zero, POLLOUT when it is below the cap (effectively always).
+            // This drives Go's netpoll epoll wakeup on `netpollBreak` writes.
+            if !crate::eventfd::eventfd_exists(*id) {
+                // The object was freed out from under us (last fd closed while a
+                // peer was blocked here). Report a terminal "readable + hung up
+                // + error" so every waiter type gets a ready event and exits
+                // instead of spinning:
+                //   - POLLIN  — a freed eventfd is at EOF (a `read` returns 0),
+                //     so it is "readable"; this is what `select`'s readfds arm
+                //     keys on (it only sets the read bit on POLLIN), mirroring
+                //     the PipeRead closed-writer path where `pipe_read_ready`
+                //     reports EOF as readable.
+                //   - POLLHUP — drives `poll`/`epoll_wait`, which pass HUP/ERR
+                //     through unconditionally regardless of the interest mask
+                //     (POLLNVAL would be masked out by poll's filter).
+                //   - POLLERR — drives `select`'s exceptfds arm.
+                return POLLIN | POLLHUP | POLLERR;
+            }
+            let mut revents: i16 = 0;
+            if crate::eventfd::eventfd_readable(*id) {
+                revents |= POLLIN;
+            }
+            if crate::eventfd::eventfd_writable(*id) {
+                revents |= POLLOUT;
+            }
+            revents
         }
         FdBackend::DeviceTTY { .. } | FdBackend::Stdin => {
             let mut revents: i16 = 0;
@@ -19556,6 +19795,24 @@ fn fd_poll_events(entry: &FdEntry) -> i16 {
                 }
                 if matches!(s.state, crate::net::SocketState::Closed) {
                     revents |= POLLHUP;
+                }
+                // Phase 86d Track B — EPOLLRDHUP: the peer has shut down its
+                // writing half (we received a FIN), so the read side is done.
+                // Go's netpoll registers EPOLLRDHUP to learn of remote close.
+                // Derived from the connection's half-close state; only surfaced
+                // to callers that requested POLLRDHUP (poll masks by `events`,
+                // select ignores it, epoll matches it against the interest).
+                if let Some(tcp_idx) = s.tcp_slot
+                    && !matches!(s.state, crate::net::SocketState::Listening)
+                    && matches!(
+                        crate::net::tcp::state(tcp_idx),
+                        crate::net::tcp::TcpState::CloseWait
+                            | crate::net::tcp::TcpState::LastAck
+                            | crate::net::tcp::TcpState::TimeWait
+                            | crate::net::tcp::TcpState::Closed
+                    )
+                {
+                    revents |= POLLRDHUP;
                 }
                 // TCP RST → POLLERR
                 if let Some(tcp_idx) = s.tcp_slot
@@ -19752,6 +20009,7 @@ fn fd_register_waiter(
             }
             false
         }
+        FdBackend::EventFd { id } => crate::eventfd::eventfd_register_waiter(*id, task_id, woken),
         FdBackend::DeviceTTY { .. } | FdBackend::Stdin => {
             crate::stdin::STDIN_WAITQUEUE.register(task_id, woken);
             true
@@ -19800,6 +20058,7 @@ fn fd_deregister_waiter(entry: &FdEntry, task_id: crate::task::TaskId) {
         FdBackend::PtySlave { pty_id } => {
             crate::pty::PTY_SLAVE_WQ[*pty_id as usize].deregister(task_id);
         }
+        FdBackend::EventFd { id } => crate::eventfd::eventfd_deregister_waiter(*id, task_id),
         _ => {}
     }
 }
@@ -20271,6 +20530,21 @@ const EPOLLIN: u32 = 0x001;
 const EPOLLOUT: u32 = 0x004;
 const EPOLLERR: u32 = 0x008;
 const EPOLLHUP: u32 = 0x010;
+// Phase 86d Track B — peer half-close + edge-triggered / one-shot control bits.
+// EPOLLRDHUP mirrors POLLRDHUP (0x2000). EPOLLET (1<<31) and EPOLLONESHOT
+// (1<<30) are carried in the events word but are NOT readiness bits, so they
+// are stripped before matching against fd readiness.
+const EPOLLRDHUP: u32 = 0x2000;
+// The RDHUP bit flows from `fd_poll_events` (an `i16` POLLRDHUP) through the
+// `as u16 as u32` widening in `sys_epoll_wait` and must land exactly on
+// EPOLLRDHUP. Assert that numeric coincidence at compile time so the two
+// constants can never silently drift apart (and so EPOLLRDHUP is not dead).
+const _: () = assert!(EPOLLRDHUP == POLLRDHUP as u16 as u32);
+const EPOLLONESHOT: u32 = 0x4000_0000;
+const EPOLLET: u32 = 0x8000_0000;
+const EPOLL_CONTROL_BITS: u32 = EPOLLET | EPOLLONESHOT;
+// Always-reported bits: surfaced even if the interest did not request them.
+const EPOLL_UNCONDITIONAL: u32 = EPOLLHUP | EPOLLERR;
 
 const EPOLL_CTL_ADD: u64 = 1;
 const EPOLL_CTL_DEL: u64 = 2;
@@ -20284,6 +20558,14 @@ struct EpollInterest {
     fd: usize,
     events: u32,
     data: u64,
+    /// Phase 86d Track B — for edge-triggered (`EPOLLET`) interests, the
+    /// readiness set last reported to userspace. An edge event fires only when
+    /// the current readiness rises above this watermark (not-ready→ready). The
+    /// watermark is refreshed every `epoll_wait` scan so a drain lowers it and
+    /// a refill re-triggers. Unused for level-triggered interests. Per-interest
+    /// (not per-fd): the same fd in two epoll instances tracks edges
+    /// independently.
+    last_ready: u32,
 }
 
 /// An epoll instance — tracks the interest set (which FDs to monitor).
@@ -20403,6 +20685,41 @@ pub(super) fn sys_epoll_create1(flags: u64) -> u64 {
     }
 }
 
+/// eventfd2(initval, flags) — syscall 290. Phase 86d Track D.
+///
+/// Go 1.21+'s runtime creates an eventfd (`EFD_CLOEXEC | EFD_NONBLOCK`) as its
+/// cross-thread M-wakeup primitive. Returns a single fd that is both readable
+/// and writable, backed by `crate::eventfd`.
+pub(super) fn sys_eventfd2(initval: u64, flags: u64) -> u64 {
+    use crate::eventfd::{EFD_CLOEXEC, EFD_KNOWN_FLAGS, EFD_NONBLOCK, EFD_SEMAPHORE};
+    if flags & !EFD_KNOWN_FLAGS != 0 {
+        return NEG_EINVAL;
+    }
+    let semaphore = flags & EFD_SEMAPHORE != 0;
+    let cloexec = flags & EFD_CLOEXEC != 0;
+    let nonblock = flags & EFD_NONBLOCK != 0;
+
+    let id = match crate::eventfd::eventfd_create(initval, semaphore) {
+        Some(id) => id,
+        None => return NEG_ENOMEM,
+    };
+    let entry = FdEntry {
+        backend: FdBackend::EventFd { id },
+        offset: 0,
+        readable: true,
+        writable: true,
+        cloexec,
+        nonblock,
+    };
+    match alloc_fd(0, entry) {
+        Some(fd) => fd as u64,
+        None => {
+            crate::eventfd::eventfd_close(id);
+            NEG_EMFILE
+        }
+    }
+}
+
 /// epoll_ctl(epfd, op, fd, event_ptr) — syscall 233
 pub(super) fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u64 {
     let epfd_idx = epfd as usize;
@@ -20473,6 +20790,9 @@ pub(super) fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u64 
                 fd: fd_idx,
                 events,
                 data,
+                // Fresh interest: empty watermark so an already-ready ET fd
+                // fires its first edge immediately.
+                last_ready: 0,
             });
             0
         }
@@ -20480,6 +20800,9 @@ pub(super) fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u64 
             if let Some(entry) = inst.interests.iter_mut().find(|i| i.fd == fd_idx) {
                 entry.events = events;
                 entry.data = data;
+                // Re-arm the edge state: EPOLL_CTL_MOD resets the ET watermark
+                // so the modified interest re-reports current readiness.
+                entry.last_ready = 0;
                 0
             } else {
                 const NEG_ENOENT: u64 = (-2_i64) as u64;
@@ -20539,23 +20862,39 @@ pub(super) fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout
             }
         };
 
+        // Edge-aware scan: a level-triggered interest emits whenever a
+        // requested/unconditional bit is ready; an edge-triggered (EPOLLET)
+        // interest emits only on a not-ready→ready transition relative to its
+        // per-interest watermark. The decision is the pure, host-tested
+        // `kernel_core::epoll::evaluate_interest`. The scan runs on a clone (no
+        // table lock held across `fd_poll_events`), so the refreshed ET
+        // watermarks are persisted back to the table afterwards.
+        let mut et_updates: alloc::vec::Vec<(usize, u32)> = alloc::vec::Vec::new();
         for interest in &interests {
             if out_count >= maxevents {
                 break;
             }
             if let Some(entry) = current_fd_entry(interest.fd) {
-                let ready = fd_poll_events(&entry);
-                let ready_u32 = ready as u16 as u32;
-                let matched = ready_u32 & interest.events;
-                // Also report unconditional events.
-                let unconditional = ready_u32 & (EPOLLHUP | EPOLLERR);
-                if matched != 0 || unconditional != 0 {
+                let ready_u32 = fd_poll_events(&entry) as u16 as u32;
+                let event_mask = interest.events & !EPOLL_CONTROL_BITS;
+                let is_et = interest.events & EPOLLET != 0;
+                let eval = kernel_core::epoll::evaluate_interest(
+                    ready_u32,
+                    event_mask,
+                    EPOLL_UNCONDITIONAL,
+                    interest.last_ready,
+                    is_et,
+                );
+                if is_et {
+                    et_updates.push((interest.fd, eval.new_last_ready));
+                }
+                if eval.emit {
                     // Write epoll_event to userspace: packed { events: u32, data: u64 } = 12 bytes
                     let base = match events_ptr.checked_add((out_count * 12) as u64) {
                         Some(a) => a,
                         None => return NEG_EFAULT,
                     };
-                    let ev_out = (matched | unconditional).to_ne_bytes();
+                    let ev_out = eval.revents.to_ne_bytes();
                     let data_out = interest.data.to_ne_bytes();
                     let mut buf = [0u8; 12];
                     buf[0..4].copy_from_slice(&ev_out);
@@ -20567,6 +20906,32 @@ pub(super) fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout
                         return NEG_EFAULT;
                     }
                     out_count += 1;
+                }
+            }
+        }
+
+        // Persist refreshed ET watermarks onto the live interests (matched by
+        // fd; a concurrently removed/modified interest is simply skipped).
+        //
+        // Known benign race (Phase 86d Track B): the readiness scan above runs
+        // on a *clone* of the interest list with the table lock dropped (so
+        // `fd_poll_events` can descend into the net/pipe layers). If another
+        // thread issues `EPOLL_CTL_MOD` for the same fd in that window — which
+        // resets `last_ready` to 0 to re-arm the edge — this write-back can
+        // overwrite that fresh 0 with the stale watermark computed before the
+        // MOD, costing one spurious or missed edge. It is never memory-unsafe
+        // (the fd match just lands on the re-armed interest). The robust fix is
+        // a per-interest epoch captured in the clone and compared here; it is a
+        // tracked follow-up — no in-tree consumer MODs an fd concurrently with
+        // a sibling thread's `epoll_wait`, and Go (the 86d driver) does not MOD
+        // in its netpoll hot path. The gate also pins `-smp 1`.
+        if !et_updates.is_empty() {
+            let mut table = EPOLL_TABLE.lock();
+            if let Some(inst) = table.get_mut(instance_id).and_then(|s| s.as_mut()) {
+                for (fd, new_last) in et_updates {
+                    if let Some(it) = inst.interests.iter_mut().find(|i| i.fd == fd) {
+                        it.last_ready = new_last;
+                    }
                 }
             }
         }
@@ -20608,13 +20973,31 @@ pub(super) fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout
             continue;
         }
 
-        // Re-check readiness after registration (TOCTOU).
+        // Re-check readiness after registration (TOCTOU). Re-read fresh
+        // interests so the ET watermarks updated above are honored: an
+        // already-reported, still-ready ET fd is NOT a fresh edge and must not
+        // wake us — otherwise a persistently-readable ET fd would busy-loop.
+        let recheck = {
+            let table = EPOLL_TABLE.lock();
+            match table.get(instance_id).and_then(|s| s.as_ref()) {
+                Some(inst) => inst.interests.clone(),
+                None => alloc::vec::Vec::new(),
+            }
+        };
         let mut any_ready = false;
-        for interest in &interests {
+        for interest in &recheck {
             if let Some(entry) = current_fd_entry(interest.fd) {
-                let ready = fd_poll_events(&entry);
-                let ready_u32 = ready as u16 as u32;
-                if (ready_u32 & interest.events) != 0 || (ready_u32 & (EPOLLHUP | EPOLLERR)) != 0 {
+                let ready_u32 = fd_poll_events(&entry) as u16 as u32;
+                let event_mask = interest.events & !EPOLL_CONTROL_BITS;
+                let is_et = interest.events & EPOLLET != 0;
+                let eval = kernel_core::epoll::evaluate_interest(
+                    ready_u32,
+                    event_mask,
+                    EPOLL_UNCONDITIONAL,
+                    interest.last_ready,
+                    is_et,
+                );
+                if eval.emit {
                     any_ready = true;
                     break;
                 }
