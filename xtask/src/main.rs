@@ -1017,6 +1017,24 @@ fn main() {
             });
             cmd_soak(&soak_args);
         }
+        // Phase 86f Track C.3 — userspace SIMD + AES-NI smoke.
+        // Static objdump gate: asserts crypto-test (x86_64-m3os.json,
+        // hardware-float) contains XMM-register instructions and AES-NI
+        // (aesenc/aesenclast) while the kernel ELF (x86_64-unknown-none,
+        // soft-float) contains none. Dynamic gate: boots m3OS, runs
+        // `crypto-test` (assert "all tests PASSED" — SSE binary runs
+        // fault-free on the 16-aligned entry stack), then runs
+        // `crypto-test --bench` (assert BENCH:aes-ctr: sentinel — AES-NI
+        // executed in-OS).
+        Some("userspace-simd-smoke") => {
+            let smoke_args = parse_smoke_boot_args("userspace-simd-smoke", &args[2..])
+                .unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_userspace_simd_smoke(&smoke_args);
+        }
         // Phase 85a Track B.3 — zero-rebuild assertion gate.
         // Builds a port once to warm the pkgcache, removes the stage so the
         // same-machine `.stamp` fast-path cannot short-circuit, then builds
@@ -1041,7 +1059,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -4714,9 +4732,15 @@ fn qemu_args_with_devices_resolved(
         // probe reports "unsupported" and the mitigations would be silently
         // untested on the CI/headless lanes.  `-cpu host` (KVM) already exposes
         // them on any modern host.
+        // Phase 86f Track C.3: also advertise +aes so TCG emulates AES-NI
+        // instructions (AESENC/AESENCLAST etc.).  The x86_64-m3os.json
+        // userspace target has "+aes" in its feature string, meaning the `aes`
+        // crate's cpufeatures check always evaluates to true and AES-NI
+        // instructions are emitted unconditionally; without this flag QEMU TCG
+        // raises an Invalid-Opcode exception the moment crypto-test runs.
         args.extend([
             "-cpu".to_string(),
-            "qemu64,+xsave,+avx,+xsaveopt,+smep,+smap".to_string(),
+            "qemu64,+xsave,+avx,+xsaveopt,+smep,+smap,+aes".to_string(),
         ]);
     }
 
@@ -11546,6 +11570,271 @@ fn cmd_mitigations_status_smoke(args: &SmokeBootArgs) {
             let _ = child.kill();
             let _ = child.wait();
             eprintln!("mitigations-status-smoke: FAILED\n{msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 86f Track C.3 — userspace-simd-smoke: static objdump + QEMU runtime
+// ---------------------------------------------------------------------------
+
+/// Smoke step list for `cargo xtask userspace-simd-smoke` (runtime half).
+///
+/// Asserts, over serial:
+/// 1. `crypto-test` (SSE+AES-NI-heavy) runs fault-free and prints the
+///    "all tests PASSED" sentinel (Track B.2 — signal-frame FPU + 16-aligned
+///    entry stack falsifiable proof).
+/// 2. `crypto-test --bench` prints a `BENCH:aes-ctr:` line (Track C.1 —
+///    the AES-NI execution path ran in-OS; throughput number is NOT asserted
+///    because TCG/KVM rates vary wildly).
+fn userspace_simd_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+    // Run the correctness suite — proves the SSE-spilling binary runs without
+    // a #GP misalignment or signal-frame corruption fault (Track B.2).
+    steps.push(SmokeStep::Send {
+        input: "/bin/crypto-test\n",
+        label: "guest/simd-smoke: run crypto-test correctness suite",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "crypto-test: all tests PASSED",
+        timeout_secs: 180,
+        label: "guest/simd-smoke: crypto-test correctness PASSED (SSE binary runs fault-free)",
+    });
+    // Run the benchmark — proves AES-NI executes in-OS (Track C.1).
+    // TCG distorts throughput numbers so we only assert the sentinel appears,
+    // not any specific MiB/s value.
+    steps.push(SmokeStep::Send {
+        input: "/bin/crypto-test --bench\n",
+        label: "guest/simd-smoke: run crypto-test --bench (AES-NI path exercise)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "BENCH:aes-ctr:",
+        timeout_secs: 60,
+        label: "guest/simd-smoke: BENCH:aes-ctr: sentinel appeared (AES-NI path executed)",
+    });
+    steps
+}
+
+/// Static objdump assertions for `cargo xtask userspace-simd-smoke`.
+///
+/// Asserts, without booting QEMU:
+/// - `objdump -d` of `crypto-test` (userspace, `x86_64-m3os.json`) contains
+///   XMM-register operands (`%xmm0`..`%xmm15`) on instruction lines (count > 0).
+///   Matching is restricted to instruction lines (leading whitespace) to avoid
+///   false positives from mangled symbol names containing "xmm".
+/// - `objdump -d` of the kernel ELF (`x86_64-unknown-none`) contains ZERO such
+///   lines — the kernel stays soft-float.
+/// - `objdump -d` of `crypto-test` contains `aesenc` or `aesenclast` (AES-NI).
+fn userspace_simd_objdump_gate(root: &std::path::Path) {
+    let userspace_elf = root.join("target/x86_64-m3os/release/crypto-test");
+    let kernel_elf = root.join("target/x86_64-unknown-none/release/kernel");
+
+    for path in &[&userspace_elf, &kernel_elf] {
+        if !path.exists() {
+            eprintln!(
+                "userspace-simd-smoke: objdump gate: binary not found: {}",
+                path.display()
+            );
+            eprintln!("userspace-simd-smoke: run `cargo xtask image` first to build all binaries");
+            std::process::exit(1);
+        }
+    }
+
+    // ── Helper: disassemble and return the text ───────────────────────────────
+    let disasm = |path: &std::path::Path| -> String {
+        let out = Command::new("objdump")
+            .args(["-d", path.to_str().unwrap()])
+            .output()
+            .unwrap_or_else(|_| {
+                panic!(
+                    "userspace-simd-smoke: failed to spawn objdump -d {}",
+                    path.display()
+                )
+            });
+        if !out.status.success() {
+            eprintln!(
+                "userspace-simd-smoke: objdump -d {} exited with status {}",
+                path.display(),
+                out.status
+            );
+            std::process::exit(1);
+        }
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // ── Count XMM operands on instruction lines ───────────────────────────────
+    //
+    // objdump disasm lines have the form:
+    //   "  <addr>:\t<hex>\t<mnemonic> <operands>"
+    // They always start with whitespace.  Symbol-name lines look like:
+    //   "<addr> <sym_name>:"
+    // and do NOT start with whitespace, so restricting to lines that start
+    // with at least one space eliminates false positives from mangled names
+    // that happen to contain "xmm".
+    let count_xmm = |text: &str| -> usize {
+        text.lines()
+            .filter(|line| {
+                // Must be an instruction line (starts with whitespace).
+                let Some(first) = line.chars().next() else {
+                    return false;
+                };
+                if !first.is_whitespace() {
+                    return false;
+                }
+                // Must contain an XMM register operand (%xmm0..%xmm15).
+                // We look for literal "%xmm" anywhere on the line; valid
+                // operands are "%xmm0".."%xmm15" so this substring match is
+                // precise enough.
+                line.contains("%xmm")
+            })
+            .count()
+    };
+
+    let userspace_disasm = disasm(&userspace_elf);
+    let kernel_disasm = disasm(&kernel_elf);
+
+    let userspace_xmm = count_xmm(&userspace_disasm);
+    let kernel_xmm = count_xmm(&kernel_disasm);
+
+    println!(
+        "userspace-simd-smoke [objdump/xmm-userspace]: instruction lines with %xmm operands = {userspace_xmm} (must be > 0)"
+    );
+    if userspace_xmm == 0 {
+        eprintln!(
+            "userspace-simd-smoke FAIL [objdump/xmm-userspace]: no XMM-register instructions \
+             found in {}.\n\
+             Expected SSE/AES codegen from the x86_64-m3os.json hardware-float target.\n\
+             Reproduce: objdump -d {} | grep -c '%xmm'",
+            userspace_elf.display(),
+            userspace_elf.display()
+        );
+        std::process::exit(1);
+    }
+
+    println!(
+        "userspace-simd-smoke [objdump/xmm-kernel]: instruction lines with %xmm operands in kernel = {kernel_xmm} (must be 0)"
+    );
+    if kernel_xmm != 0 {
+        eprintln!(
+            "userspace-simd-smoke FAIL [objdump/xmm-kernel]: found {kernel_xmm} XMM-register \
+             instruction(s) in the kernel ELF {}.\n\
+             The kernel must stay soft-float (x86_64-unknown-none, -sse).\n\
+             Reproduce: objdump -d {} | grep -E '^\\s' | grep -c '%xmm'",
+            kernel_elf.display(),
+            kernel_elf.display()
+        );
+        std::process::exit(1);
+    }
+
+    // ── AES-NI positive gate ──────────────────────────────────────────────────
+    // Count `aesenc` and `aesenclast` instructions in the userspace binary.
+    // These are emitted by the `aes` crate's AES-NI backend when the target
+    // permits XMM/AES-NI codegen.
+    let aesni_count = userspace_disasm
+        .lines()
+        .filter(|line| {
+            let Some(first) = line.chars().next() else {
+                return false;
+            };
+            if !first.is_whitespace() {
+                return false;
+            }
+            line.contains("aesenc") || line.contains("aesenclast")
+        })
+        .count();
+
+    println!(
+        "userspace-simd-smoke [objdump/aes-ni]: aesenc/aesenclast instruction lines = {aesni_count} (must be > 0)"
+    );
+    if aesni_count == 0 {
+        eprintln!(
+            "userspace-simd-smoke FAIL [objdump/aes-ni]: no aesenc/aesenclast instructions \
+             found in {}.\n\
+             Expected hardware AES-NI from the `aes` crate's cpufeatures backend on the \
+             x86_64-m3os.json (+aes) target.\n\
+             Reproduce: objdump -d {} | grep -E '(aesenc|aesenclast)'",
+            userspace_elf.display(),
+            userspace_elf.display()
+        );
+        std::process::exit(1);
+    }
+
+    println!(
+        "userspace-simd-smoke [objdump]: PASS — {userspace_xmm} XMM lines in userspace, \
+         0 in kernel, {aesni_count} AES-NI lines in userspace"
+    );
+}
+
+/// `cargo xtask userspace-simd-smoke` — Phase 86f Track C.3.
+///
+/// Two-phase gate:
+/// 1. **Static (objdump):** build + disassemble `crypto-test` (userspace,
+///    x86_64-m3os.json) and the kernel ELF (x86_64-unknown-none); assert
+///    userspace has XMM-register instructions and AES-NI (aesenc/aesenclast),
+///    and the kernel has none.
+/// 2. **Dynamic (QEMU serial):** boot m3OS, log in, run `crypto-test` (assert
+///    "all tests PASSED" — SSE binary fault-free on the 16-aligned entry
+///    stack), then run `crypto-test --bench` (assert `BENCH:aes-ctr:` sentinel
+///    — AES-NI executed in-OS).
+fn cmd_userspace_simd_smoke(args: &SmokeBootArgs) {
+    // Phase 1: build + static objdump checks.
+    let kernel_binary = build_kernel();
+    let root = workspace_root();
+    userspace_simd_objdump_gate(&root);
+
+    // Phase 2: QEMU runtime checks.
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false, // graphical_login — serial autologin path
+    );
+
+    let ovmf = find_ovmf();
+    let qemu_args = session_smoke_qemu_args(&uefi_image, &ovmf, args.display);
+    let steps = userspace_simd_smoke_steps();
+
+    println!(
+        "userspace-simd-smoke: launching QEMU (timeout {}s)",
+        args.timeout_secs
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("userspace-simd-smoke: failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!(
+                "userspace-simd-smoke: PASS ({} steps in {elapsed}s)",
+                steps.len()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("userspace-simd-smoke: FAILED\n{msg}");
             std::process::exit(1);
         }
     }
