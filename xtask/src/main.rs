@@ -21753,6 +21753,26 @@ fn serverization_fallback_steps() -> Vec<SmokeStep> {
 /// Guest steps for the log-pipeline regression: inject a tagged message via
 /// `logger` and verify it appears in `/var/log/messages` through the syslogd
 /// /dev/log → file pipeline.
+///
+/// Synchronization uses deterministic `/bin/echo <MARKER>` substring markers —
+/// NOT a `# ` shell-prompt suffix match — mirroring `boot_and_login_steps`'
+/// `__LOGIN_READY__` idiom. Rationale (this gate flaked in CI on the suffix
+/// match): the shell prints the `# ` prompt exactly once after a command and
+/// then idles. The regression image boots ~6 optional NIC/audio/AHCI drivers
+/// that probe absent QEMU hardware and exit, and on a slow/loaded runner their
+/// asynchronous `session_manager:`/`init:` exit log lines (which can interleave
+/// byte-for-byte with the shell on the shared serial console) land *after* the
+/// prompt. The prompt matcher (`find_serial_match` → `prompt_suffix_end`) only
+/// matches when the buffer *ends with* `# `, so that trailing async noise
+/// defeats it and the wait times out — a flake with nothing to do with syslog.
+/// A unique substring marker is matched anywhere in the stream (the non-prompt
+/// branch of `find_serial_match` uses `.find()`), so trailing noise cannot
+/// displace it. The file-read assertion below cannot false-match the echoed
+/// `logger REGTEST_LOG_MARKER` command line because `Wait` is non-consuming but
+/// each `Send` clears `serial_buf` before writing (the documented reset boundary
+/// on `SmokeStep::Send`): the two `Send`s between the `logger` echo and the
+/// final marker `Wait` (the sync `echo` and the `cat`) wipe that echo, so the
+/// matched marker can only come from `cat`'s file output.
 fn log_pipeline_steps() -> Vec<SmokeStep> {
     let mut steps = boot_and_login_steps();
     steps.push(SmokeStep::Sleep { millis: 500 });
@@ -21760,14 +21780,24 @@ fn log_pipeline_steps() -> Vec<SmokeStep> {
         input: "/bin/logger REGTEST_LOG_MARKER\n",
         label: "guest/log: inject log message via /dev/log",
     });
-    steps.push(SmokeStep::Wait {
-        pattern: "# ",
-        timeout_secs: 15,
-        label: "guest/log: prompt after logger",
-    });
-    // Small delay for syslogd to flush to disk.
+    // Give logger time to run, then sync past it (and its echo) with a
+    // noise-immune marker instead of a fragile `# ` prompt suffix.
     steps.push(SmokeStep::Sleep { millis: 1000 });
-    // Read file contents directly so the awaited marker cannot come from the echoed command line.
+    steps.push(SmokeStep::Send {
+        input: "/bin/echo __LOGGER_SYNC_DONE__\n",
+        label: "guest/log: sync past logger via deterministic marker",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "__LOGGER_SYNC_DONE__",
+        timeout_secs: 30,
+        label: "guest/log: logger sync marker",
+    });
+    // Small delay for syslogd to flush /dev/log → /var/log/messages.
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    // Read file contents directly. The `logger` command echo (which contains the
+    // marker substring) was cleared by the intervening `Send`s — each `Send`
+    // clears `serial_buf` before writing — so this marker match can only come
+    // from the file output, not the echoed command line.
     steps.push(SmokeStep::Send {
         input: "/bin/cat /var/log/messages\n",
         label: "guest/log: verify message in syslog",
@@ -21777,10 +21807,16 @@ fn log_pipeline_steps() -> Vec<SmokeStep> {
         timeout_secs: 15,
         label: "guest/log: marker found in /var/log/messages",
     });
+    // Final sync — again a deterministic marker, not a `# ` suffix — so the gate
+    // ends cleanly even if late async log lines are still trailing.
+    steps.push(SmokeStep::Send {
+        input: "/bin/echo __LOG_READ_DONE__\n",
+        label: "guest/log: sync past log read via deterministic marker",
+    });
     steps.push(SmokeStep::Wait {
-        pattern: "# ",
-        timeout_secs: 5,
-        label: "guest/log: prompt after log read",
+        pattern: "__LOG_READ_DONE__",
+        timeout_secs: 15,
+        label: "guest/log: log read sync marker",
     });
     steps
 }
@@ -24970,6 +25006,44 @@ mod tests {
             send_input_for_label(&log_pipeline_steps(), "guest/log: verify message in syslog");
 
         assert_eq!(log_check, Some("/bin/cat /var/log/messages\n"));
+    }
+
+    /// Regression guard for the CI flake fix: `log_pipeline_steps` must NOT sync
+    /// on a `# ` shell-prompt suffix match. Trailing asynchronous driver-exit log
+    /// lines displace the prompt from the end of the serial buffer, so the
+    /// suffix-only prompt matcher times out. The gate must instead sync on unique
+    /// substring markers (matched anywhere in the stream, immune to trailing
+    /// noise). This test fails if anyone reintroduces a `# ` wait here.
+    #[test]
+    fn log_pipeline_sync_uses_markers_not_prompt_suffix() {
+        let steps = log_pipeline_steps();
+        // No step in the gate waits on the fragile `# ` (or `$ `) prompt suffix.
+        let prompt_waits = steps
+            .iter()
+            .filter(|s| matches!(s, SmokeStep::Wait { pattern, .. } if *pattern == "# " || *pattern == "$ "))
+            .count();
+        assert_eq!(
+            prompt_waits, 0,
+            "log_pipeline_steps must not sync on a `# `/`$ ` prompt suffix (CI-flaky); use substring markers"
+        );
+        // The post-logger sync waits on the deterministic substring marker, and
+        // it is preceded by the `/bin/echo` that emits it.
+        assert_eq!(
+            wait_pattern_for_label(&steps, "guest/log: logger sync marker"),
+            Some("__LOGGER_SYNC_DONE__")
+        );
+        assert_eq!(
+            send_input_for_label(
+                &steps,
+                "guest/log: sync past logger via deterministic marker"
+            ),
+            Some("/bin/echo __LOGGER_SYNC_DONE__\n")
+        );
+        // The file-content assertion (the real check) is still present.
+        assert_eq!(
+            wait_pattern_for_label(&steps, "guest/log: marker found in /var/log/messages"),
+            Some("REGTEST_LOG_MARKER")
+        );
     }
 
     #[test]
