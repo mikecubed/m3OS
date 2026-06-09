@@ -167,9 +167,18 @@ pub const VFS_MAX_READ: usize = 4096;
 /// the small fixed request buffer, so reads can be served in 64 KiB chunks
 /// instead of one 4 KiB block per round-trip. With vfs_server's contiguous-run
 /// coalescing this collapses a multi-MiB read into a few multi-block requests.
-/// Must stay `<= MAX_BULK_LEN` and 512-aligned. (Writes still chunk by
-/// `VFS_MAX_READ`, which also bounds the request recv buffer — left unchanged.)
+/// Must stay `<= MAX_BULK_LEN` and 512-aligned.
 pub const VFS_MAX_PREAD: usize = 64 * 1024;
+
+/// Phase 87 — maximum bytes per single `VFS_WRITE` request (path + data),
+/// raised from `VFS_MAX_READ` (4 KiB). The write request packs the path AND the
+/// data into one bulk buffer that lands in vfs_server's `recv_buf`, so this also
+/// sizes that buffer (now heap-allocated, not a stack array). A 64 KiB write
+/// chunk lets vfs_server write up to ~16 blocks per request — 16x fewer IPC
+/// round-trips, and the per-`write_file_data` inode flush is amortized over the
+/// whole chunk instead of per 4 KiB block. Must stay `<= MAX_BULK_LEN` (80 KiB)
+/// and 512-aligned.
+pub const VFS_MAX_PWRITE: usize = 64 * 1024;
 
 /// Reply-bulk size for `VFS_STAT_PATH`.
 ///

@@ -8547,19 +8547,18 @@ fn vfs_service_pread(path: &str, offset: usize, user_buf_ptr: u64, count: usize)
 fn vfs_service_write(path: &str, offset: u64, data: &[u8]) -> Result<(usize, u32), u64> {
     use crate::ipc::{endpoint, message::Message, registry};
     use crate::task::scheduler;
-    use kernel_core::fs::vfs_protocol::{VFS_MAX_READ, VFS_WRITE};
+    use kernel_core::fs::vfs_protocol::{VFS_MAX_PWRITE, VFS_WRITE};
 
     let vfs_ep = registry::lookup_endpoint_id("vfs").ok_or(NEG_EIO)?;
     let task_id = scheduler::current_task_id().ok_or(NEG_EINVAL)?;
     let abs = vfs_abs_path(path);
-    // The bulk transport caps a single message at VFS_MAX_READ, and this
-    // request packs BOTH the path AND the data into that one buffer — so the
-    // data chunk must leave room for the path, else vfs_server's recv_buf
-    // (sized VFS_MAX_READ) overflows and its `path_len + data_len <= recv_buf`
-    // bounds check rejects the write with EINVAL (the bug that broke large
-    // files like a 250 KB binary while small config files still fit). Callers
-    // loop for larger writes.
-    let chunk = data.len().min(VFS_MAX_READ.saturating_sub(abs.len()));
+    // The request packs BOTH the path AND the data into one bulk buffer that
+    // lands in vfs_server's recv_buf (sized VFS_MAX_PWRITE), so the data chunk
+    // must leave room for the path, else the `path_len + data_len <= recv_buf`
+    // bounds check rejects the write with EINVAL. Phase 87 raised this from
+    // VFS_MAX_READ (4 KiB) to VFS_MAX_PWRITE (64 KiB) so a write moves up to ~16
+    // blocks per round-trip. Callers loop for larger writes.
+    let chunk = data.len().min(VFS_MAX_PWRITE.saturating_sub(abs.len()));
     if chunk == 0 {
         // Path alone fills the buffer — no room for data (pathological).
         return Err(NEG_EINVAL);

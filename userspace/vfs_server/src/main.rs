@@ -40,7 +40,7 @@ use kernel_core::fs::ext2::{
 use kernel_core::fs::mbr;
 use kernel_core::fs::vfs_protocol::{
     VFS_ACCESS_PATH, VFS_CLOSE, VFS_CREATE, VFS_CREATE_KIND_SHIFT, VFS_LINK, VFS_LIST_DIR,
-    VFS_MAX_PREAD, VFS_MAX_READ, VFS_MOUNT_EXT2_ROOT, VFS_MOUNT_POLICY, VFS_MOUNT_VFAT_DATA,
+    VFS_MAX_PREAD, VFS_MAX_PWRITE, VFS_MOUNT_EXT2_ROOT, VFS_MOUNT_POLICY, VFS_MOUNT_VFAT_DATA,
     VFS_NODE_DIR, VFS_NODE_FILE, VFS_NODE_SYMLINK, VFS_OPEN, VFS_PREAD, VFS_READ, VFS_RENAME,
     VFS_STAT_PATH, VFS_STAT_REPLY_SIZE, VFS_TRUNCATE, VFS_UMOUNT_EXT2_ROOT, VFS_UMOUNT_POLICY,
     VFS_UMOUNT_VFAT_DATA, VFS_UNLINK, VFS_WRITE,
@@ -1498,7 +1498,10 @@ fn decode_handle(handle: u64) -> (u16, u16) {
 // IPC constants
 // ---------------------------------------------------------------------------
 
-const MAX_BULK_BUF: usize = VFS_MAX_READ;
+// Phase 87 — the per-request receive buffer holds the largest request: a
+// VFS_WRITE's path + data (up to VFS_MAX_PWRITE). Heap-allocated (see
+// `server_loop`) because 64 KiB is too large for the serve-loop stack frame.
+const MAX_BULK_BUF: usize = VFS_MAX_PWRITE;
 const SLOW_REQUEST_USEC: u64 = 50_000;
 
 // ---------------------------------------------------------------------------
@@ -1612,7 +1615,9 @@ fn program_main(_args: &[&str]) -> i32 {
 fn server_loop(ext2: &mut Ext2State, ep_handle: u32) -> ! {
     let mut handles = HandleTable::new();
     let mut msg = syscall_lib::IpcMessage::new(0);
-    let mut recv_buf = [0u8; MAX_BULK_BUF];
+    // Phase 87 — heap-allocated (64 KiB) so a large VFS_WRITE's path+data fits
+    // without blowing the serve-loop stack frame.
+    let mut recv_buf = vec![0u8; MAX_BULK_BUF];
     let mut req_seq: u64 = 0;
 
     // First receive — blocks until the kernel sends us a request.
