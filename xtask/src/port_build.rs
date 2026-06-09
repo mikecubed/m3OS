@@ -509,6 +509,20 @@ fn build_recipe_id(name: &str) -> &'static str {
              GOPROXY=off GOFLAGS=-mod=mod;build:-trimpath -ldflags='-s -w';\
              stage=/usr/bin/go-runtime-probe+/usr/src/runtime_probe.go;recipe-v=1"
         }
+        // Phase 86e — the static GitHub CLI. Like `go`, the built artifact is NOT
+        // the downloaded tarball (that is the gh SOURCE, folded in via the
+        // Portfile SHA-256); it is the compiled `gh` binary. This arm pins the
+        // cross-build knob set so a flag change self-invalidates the cached
+        // `.m3pkg`. The Go toolchain version is NOT auto-folded into the key
+        // (`toolchain_id()` only sees the irrelevant musl-gcc), so it is named
+        // here as `toolchain=go1.24.6` — bump recipe-v (or this token) whenever
+        // the pinned Go toolchain OR the build_gh flags below change.
+        "gh" => {
+            "go-build:GOOS=linux GOARCH=amd64 CGO_ENABLED=0 GOTOOLCHAIN=local \
+             GOPROXY=proxy.golang.org,direct GOFLAGS=-mod=mod;\
+             build:-trimpath -ldflags='-s -w -X .../v2/internal/build.Version';\
+             toolchain=go1.24.6;stage=/usr/bin/gh;recipe-v=1"
+        }
         _ => "",
     }
 }
@@ -1069,6 +1083,20 @@ fn port_build(name: &str) -> Result<(), String> {
         return Ok(());
     }
 
+    // Phase 86e Track A — `gh` cross-builds with the *downloaded* Go toolchain
+    // (CGO_ENABLED=0), not the musl cross-compiler, so branch before the
+    // musl_toolchain() requirement below — the port has no musl dependency.
+    if name == "gh" {
+        build_gh(&extracted, &stage, &port_dir)?;
+        seal_package(name, &stage, &key)?;
+        fs::write(&stamp, &fingerprint).map_err(|e| format!("write stamp: {e}"))?;
+        println!(
+            "ports: {name}-{version} build complete (staged at {})",
+            stage.display()
+        );
+        return Ok(());
+    }
+
     let toolchain = musl_toolchain().ok_or_else(|| {
         "no musl cross-compiler found on PATH (install musl-tools or \
                                                 musl-gcc-cross-bin)"
@@ -1222,6 +1250,119 @@ fn build_go(extracted: &Path, stage: &Path, port_dir: &Path) -> Result<(), Strin
     let len = fs::metadata(&out_bin).map(|m| m.len()).unwrap_or(0);
     println!(
         "ports: go — built static probe {} ({len} bytes)",
+        out_bin.display()
+    );
+    Ok(())
+}
+
+/// Phase 86e Track A — cross-compile the static GitHub CLI (`gh`) from source.
+///
+/// `extracted` is the unpacked `cli/cli` source tree (`cli-<version>/`),
+/// `port_dir` is `ports/util/gh`. Like the `go` port the cross is driven by the
+/// **downloaded official Go toolchain** (`CGO_ENABLED=0`) — not the musl
+/// cross-compiler — so the result is a fully static linux/amd64 binary (no
+/// `PT_INTERP`), the same binary class as the 86d runtime probe / static
+/// CPython / Clang.
+///
+/// The Go toolchain is resolved from the **`go` port's Portfile** (URL + SHA-256
+/// of go1.24.6) so gh and the 86d probe always cross with the identical pinned
+/// Go — one place to bump the version. gh's go.mod `go` directive must be `<=`
+/// that toolchain minor (v2.82.1 is `go 1.24.0`), since `GOTOOLCHAIN=local`
+/// refuses to auto-upgrade. gh's module dependencies are fetched via GOPROXY
+/// during this host build (network, like the `go` port's toolchain download);
+/// the build is reproducible because gh's committed `go.sum` pins every hash.
+fn build_gh(extracted: &Path, stage: &Path, port_dir: &Path) -> Result<(), String> {
+    let version = parse_portfile(&port_dir.join("Portfile"))?
+        .get("VERSION")
+        .cloned()
+        .unwrap_or_default();
+
+    let root = workspace_root();
+
+    // Resolve + fetch the Go toolchain from the `go` port's Portfile (URL+SHA).
+    let go_portfile = root.join("ports/lang/go/Portfile");
+    let go_meta =
+        parse_portfile(&go_portfile).map_err(|e| format!("read go Portfile for toolchain: {e}"))?;
+    let go_url = go_meta
+        .get("URL")
+        .cloned()
+        .ok_or_else(|| "go Portfile missing URL (needed for the gh cross-build)".to_string())?;
+    let go_sha = go_meta
+        .get("SHA256")
+        .cloned()
+        .ok_or_else(|| "go Portfile missing SHA256 (needed for the gh cross-build)".to_string())?;
+
+    let cache_dir = root.join("target/port-src");
+    let go_tarball = fetch_tarball(&go_url, &go_sha, &cache_dir)?;
+    // Extract the toolchain into a gh-dedicated dir (NOT the gh source `work`
+    // dir, which extract_tarball would wipe). The Go tarball's top-level is `go/`.
+    let tc_work = root.join("target/port-build/gh-go-toolchain");
+    let goroot = extract_tarball(&go_tarball, &tc_work)?;
+    let go_bin = goroot.join("bin/go");
+    if !go_bin.is_file() {
+        return Err(format!(
+            "go toolchain binary not found at {} (after extracting {})",
+            go_bin.display(),
+            go_tarball.display()
+        ));
+    }
+
+    // Module/build caches outside the source tree so the build never mutates
+    // `extracted` (and a stale cache never leaks into the artifact key).
+    let scratch = root.join("target/port-build/gh-scratch");
+    let gocache = scratch.join("gocache");
+    let gomod = scratch.join("gomod");
+    let home = scratch.join("home");
+    for d in [&gocache, &gomod, &home] {
+        fs::create_dir_all(d).map_err(|e| format!("mkdir {}: {e}", d.display()))?;
+    }
+
+    // Stage layout: /usr/bin/gh (installs to prefix=/usr, like git).
+    let bindir = stage.join("usr/bin");
+    fs::create_dir_all(&bindir).map_err(|e| format!("mkdir {}: {e}", bindir.display()))?;
+    let out_bin = bindir.join("gh");
+
+    // `-X internal/build.Version` stamps `gh --version`; `-s -w` strips.
+    let ldflags = format!("-s -w -X github.com/cli/cli/v2/internal/build.Version={version}");
+    println!(
+        "ports: gh — cross-building static GitHub CLI v{version} (GOROOT={}, CGO_ENABLED=0)",
+        goroot.display()
+    );
+    run(
+        Command::new(&go_bin)
+            .current_dir(extracted)
+            .env("GOROOT", &goroot)
+            .env("GOOS", "linux")
+            .env("GOARCH", "amd64")
+            .env("CGO_ENABLED", "0")
+            .env("GOTOOLCHAIN", "local")
+            .env("GOCACHE", &gocache)
+            .env("GOMODCACHE", &gomod)
+            .env("GOPATH", scratch.join("gopath"))
+            .env("HOME", &home)
+            .env("GOFLAGS", "-mod=mod")
+            // gh's deps are not vendored in the source tarball; fetch via the
+            // public proxy (network). go.sum pins every hash so this is
+            // reproducible.
+            .env("GOPROXY", "https://proxy.golang.org,direct")
+            .arg("build")
+            .arg("-trimpath")
+            .arg(format!("-ldflags={ldflags}"))
+            .arg("-o")
+            .arg(&out_bin)
+            .arg("./cmd/gh"),
+        "go build gh",
+    )?;
+
+    if !out_bin.is_file() {
+        return Err(format!(
+            "go build produced no gh binary at {}",
+            out_bin.display()
+        ));
+    }
+    let len = fs::metadata(&out_bin).map(|m| m.len()).unwrap_or(0);
+    println!(
+        "ports: gh — built static gh {} ({len} bytes)",
         out_bin.display()
     );
     Ok(())
@@ -4137,6 +4278,17 @@ pub fn build_python_port() -> Result<(), String> {
 /// repeat a zero-compiler hit.
 pub fn build_go_port() -> Result<(), String> {
     port_build("go").map_err(|e| format!("port go: {e}"))
+}
+
+/// Phase 86e Track A — build the `gh` port (static GitHub CLI) into its
+/// `.m3pkg`. Like `go` it has **no musl dependency** (it cross-builds with the
+/// downloaded Go toolchain, `CGO_ENABLED=0`) and **no runtime `DEPS`** (the
+/// binary is fully static). Separate from the routine ports so only the
+/// `gh-smoke` gate, the opt-in `M3OS_WITH_GH` image feature, and an explicit
+/// `cargo xtask port build gh` pay the toolchain download + cross-build; a warm
+/// pkgcache makes a repeat a zero-compiler hit.
+pub fn build_gh_port() -> Result<(), String> {
+    port_build("gh").map_err(|e| format!("port gh: {e}"))
 }
 
 /// Phase 85d — build the Clang/LLVM/LLD toolchain into its `.m3pkg`. Separate

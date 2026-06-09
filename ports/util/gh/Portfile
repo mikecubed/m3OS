@@ -1,0 +1,45 @@
+NAME=gh
+VERSION=2.82.1
+DESCRIPTION="GitHub CLI — static Go (CGO_ENABLED=0) build from cli/cli source"
+CATEGORY=util
+DEPS=
+URL=https://github.com/cli/cli/archive/refs/tags/v2.82.1.tar.gz
+SHA256=999bdea5c8baf3d03fe0314127c2c393d6c0f7a504a573ad0c107072973af973
+MAINTAINER=m3os
+
+# Phase 86e — the GitHub CLI on m3OS. Build knobs (see build_gh in
+# xtask/src/port_build.rs):
+#   GOOS=linux GOARCH=amd64  — m3OS speaks the Linux x86_64 syscall ABI.
+#   CGO_ENABLED=0            — no C runtime; pure-Go fully-static binary, the
+#                             same binary class as the 86d runtime probe /
+#                             static CPython / Clang (m3OS's `ld-musl` has no
+#                             real `libc.so`, so a dynamic gh could not run).
+#   GOTOOLCHAIN=local        — never auto-download a different toolchain.
+#   -trimpath -ldflags='-s -w -X github.com/cli/cli/v2/internal/build.Version=<v>'
+#                             — reproducible, stripped, version stamped.
+#
+# BUILD PROVENANCE (the recorded decision): **built-from-source**, NOT prebuilt.
+# We pin the gh SOURCE tarball (URL + SHA-256 above) and compile it with the
+# SAME Go toolchain the 86d `go` port pins (go1.24.6, read from
+# ports/lang/go/Portfile by build_gh — one place to bump the Go version). That
+# keeps the embedded Go runtime byte-for-byte the runtime Phase 86d validated on
+# m3OS, minimizing the chance gh trips a syscall the 86d bring-up did not
+# implement. Because GOTOOLCHAIN=local refuses to upgrade, gh's go.mod `go`
+# directive must be <= the pinned toolchain minor: v2.82.1 is `go 1.24.0` — the
+# NEWEST gh that builds with Go 1.24.6 (v2.83.0 jumped to `go 1.25`). To move to
+# a newer gh, bump the `go` port's toolchain in lockstep (and the build_gh
+# recipe-v key). DEPS is empty: a fully static binary has no runtime package
+# dependency, and the Go toolchain is a host-side build input, not an m3OS pkg.
+#
+# ALTERNATIVE PROVENANCE (documented, not used): the official prebuilt release
+# binary `gh_<v>_linux_amd64.tar.gz` is also a CGO_ENABLED=0 pure-Go static
+# binary (goreleaser) and would need no Go toolchain — but from-source is what
+# consumes the 86d toolchain and lets us stamp internal/build.Version, so it is
+# the chosen path (mirrors how build_git notes git's plain-Makefile cross).
+#
+# gh's module dependencies are NOT vendored in this source tarball; build_gh
+# fetches them via GOPROXY during the host build (network, exactly like the `go`
+# port's toolchain download). The build is reproducible because gh's committed
+# go.sum pins every module hash. A warm pkgcache makes a repeat a zero-compiler
+# hit. gh is ~55 MB, so it is gated behind the M3OS_WITH_GH image feature
+# (mirroring M3OS_WITH_CLANG) and omitted from default images.

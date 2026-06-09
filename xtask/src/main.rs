@@ -233,6 +233,14 @@ const SMOKE_EXIT_GIT_HTTPS_SMOKE_FAILED: i32 = 78;
 /// are cleared; no TLS.
 const SMOKE_EXIT_GO_SMOKE_FAILED: i32 = 79;
 
+/// Phase 86e — `cargo xtask gh-smoke` exit code. Builds a fresh image with the
+/// opt-in `M3OS_WITH_GH` feature, boots m3OS, `pkg install gh`, and runs the
+/// static Go `gh` (`gh --version`) — proving the ~55 MB GitHub CLI runs on the
+/// 86d runtime. When `GH_TOKEN` is set it also authenticates non-interactively
+/// and runs read/write GitHub workflows over the 86c HTTPS path; absent the
+/// token those arms are skip-with-reason (a secret can never live in repo/CI).
+const SMOKE_EXIT_GH_SMOKE_FAILED: i32 = 80;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
     Headless,
@@ -836,6 +844,22 @@ fn main() {
                 });
             cmd_clang_smoke(&smoke_args);
         }
+        // Phase 86e — GitHub CLI (`gh`) smoke. Builds the image with the opt-in
+        // `M3OS_WITH_GH` feature (bundling the ~55 MB static-Go `gh` `.m3pkg`
+        // into the offline `/usr/pkg/` repo), boots m3OS, `pkg install gh`, and
+        // runs `gh --version` (proves the heavy TLS-capable Go binary RUNS on
+        // the 86d runtime). When `GH_TOKEN` is set it also authenticates
+        // non-interactively and runs read/write GitHub workflows over the 86c
+        // HTTPS path with secret-hygiene asserts; absent the token those arms
+        // are skip-with-reason.
+        Some("gh-smoke") => {
+            let smoke_args = parse_smoke_boot_args("gh-smoke", &args[2..]).unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            cmd_gh_smoke(&smoke_args);
+        }
         // Phase 63a Track H — DOOM SFX + music end-to-end smoke. Boots
         // with WAV AC'97 backend, launches `/bin/doom -warp 1 1` with
         // an auto-quit budget so the engine's Shutdown emits the
@@ -1017,7 +1041,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -13973,6 +13997,309 @@ fn go_runtime_smoke_steps(url: &str) -> Vec<SmokeStep> {
     steps
 }
 
+/// Phase 86e — `cargo xtask gh-smoke`.
+///
+/// The CORE (build a `M3OS_WITH_GH` image → boot → `pkg install gh` →
+/// `gh --version`) always runs and proves the ~55 MB static Go GitHub CLI RUNS
+/// on the 86d runtime — that needs **no secret**. The authenticated read/write
+/// GitHub workflows run only when `GH_TOKEN` is set (a PAT can never live in the
+/// repo/CI); absent it they are skip-with-reason, mirroring the
+/// `tls-smoke`/`dns-smoke`/`git-https-smoke` PASS-vs-SKIP convention. The WRITE
+/// workflow additionally requires `M3OS_GH_WRITE=1` + `M3OS_GH_WRITE_REPO`
+/// (it mutates a real GitHub repo), else it too is skip-with-reason.
+fn cmd_gh_smoke(args: &SmokeBootArgs) {
+    let token = std::env::var("GH_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty());
+    let attempt_auth = token.is_some();
+
+    // Build the static-Go `gh` `.m3pkg` so the data disk can bundle it. The first
+    // build downloads the Go toolchain + gh's modules + cross-compiles (a few
+    // minutes); a warm pkgcache makes this a zero-compiler hit.
+    if let Err(msg) = port_build::build_gh_port() {
+        eprintln!("gh-smoke: precondition failed (gh port build): {msg}");
+        std::process::exit(SMOKE_EXIT_GH_SMOKE_FAILED);
+    }
+
+    // Opt-in image feature: bundle the gh `.m3pkg` into /usr/pkg for this build.
+    // SAFETY: xtask is single-threaded here; the child image-build steps read the
+    // env. set_var is `unsafe` in Rust edition 2024 (cross-thread UB risk).
+    unsafe {
+        std::env::set_var("M3OS_WITH_GH", "1");
+    }
+    if let Some(tok) = token.as_ref() {
+        // Seed the token onto the data disk (mode 0600) so the guest can export
+        // GH_TOKEN without the value ever crossing the serial console. Read by
+        // populate_ext2_files under this DEDICATED name (not the bare GH_TOKEN)
+        // so a user's ambient GH_TOKEN never bakes into a routine image build.
+        // SAFETY: as above — single-threaded, pre-fork env setup.
+        unsafe {
+            std::env::set_var("M3OS_GH_SMOKE_TOKEN", tok);
+        }
+    }
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    // Always rebuild the data disk so the freshly-bundled gh `.m3pkg` (and, when
+    // authenticating, the seeded 0600 token) are present and the installed-package
+    // DB starts clean.
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false, // graphical_login — autologin / serial path
+    );
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    // Plain SLIRP user net (outbound TCP works by default) — drop the smoke's
+    // hostfwd; the auth arm needs real egress to api.github.com:443.
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, display_mode, DeviceSet::default());
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    // Go's `crypto/tls` X25519/ChaCha20 ephemerals need the 86a CSPRNG at READY;
+    // mbedTLS-style, it seeds from `sys_getrandom`, which blocks until the DRBG is
+    // READY. The default TCG `qemu64` model exposes no hardware RNG, so advertise
+    // RDRAND/RDSEED (TCG emulates both) so it credits entropy. Only when the auth
+    // arm runs (harmless to the network-free core).
+    if attempt_auth {
+        for i in 0..qemu_args.len() {
+            if qemu_args[i] == "-cpu"
+                && let Some(cpu) = qemu_args.get_mut(i + 1)
+                && cpu.starts_with("qemu64")
+                && !cpu.contains("rdrand")
+            {
+                cpu.push_str(",+rdrand,+rdseed");
+            }
+        }
+    }
+
+    let attempt_write = std::env::var("M3OS_GH_WRITE").is_ok_and(|v| v == "1");
+    let read_repo: &'static str = match std::env::var("M3OS_GH_REPO") {
+        Ok(r) if !r.is_empty() => Box::leak(r.into_boxed_str()),
+        _ => "cli/cli",
+    };
+    let write_repo: Option<&'static str> = match std::env::var("M3OS_GH_WRITE_REPO") {
+        Ok(r) if !r.is_empty() => Some(Box::leak(r.into_boxed_str())),
+        _ => None,
+    };
+    let do_write = attempt_auth && attempt_write && write_repo.is_some();
+
+    let steps = gh_smoke_steps(attempt_auth, do_write, read_repo, write_repo);
+
+    println!(
+        "gh-smoke: launching QEMU (timeout {}s, {} steps; auth={attempt_auth} write={do_write})",
+        args.timeout_secs,
+        steps.len()
+    );
+    if !attempt_auth {
+        println!(
+            "gh-smoke: NOTE — the authenticated read/write GitHub arms are SKIPPED (set \
+             GH_TOKEN=<pat> to run them; egress to api.github.com:443, no secret in repo/CI). \
+             The always-on core still proves the static Go gh installs from the \
+             M3OS_WITH_GH-bundled .m3pkg and `gh --version` RUNS on the 86d runtime."
+        );
+    } else if !do_write {
+        println!(
+            "gh-smoke: NOTE — the WRITE workflow (gh issue create) is SKIPPED (set \
+             M3OS_GH_WRITE=1 + M3OS_GH_WRITE_REPO=<owner/repo you control> to run it; it mutates \
+             a real GitHub repo). The auth + read (gh pr list) + secret-hygiene asserts still run."
+        );
+    }
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            let tag = if do_write {
+                "PASSED (incl. authenticated read + write GitHub workflows)"
+            } else if attempt_auth {
+                "PASSED (incl. authenticated read workflow; WRITE skipped — see NOTE)"
+            } else {
+                "PASSED core (authenticated arms SKIPPED — see NOTE)"
+            };
+            println!("gh-smoke: {tag} ({} steps in {elapsed}s)", steps.len());
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("gh-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_GH_SMOKE_FAILED);
+        }
+    }
+}
+
+/// The serial script for `gh-smoke`. The CORE (boot → `pkg install gh` →
+/// `gh --version`) is unconditional and needs no secret. The authenticated arms
+/// (`auth`) and the mutating write (`write`) are appended only when enabled.
+///
+/// Secret hygiene is enforced BY CONSTRUCTION: the token value is seeded to the
+/// data disk at mode 0600 and exported with `$(cat <file>)`, so it NEVER crosses
+/// the serial console (the gate sends only the *path*, never the value); gh does
+/// not print tokens. The hosts.yml-0600 assertion reads the mode string (not the
+/// token), and the token is written only under `~/.config/gh` (0600), never to
+/// `/tmp`.
+fn gh_smoke_steps(
+    auth: bool,
+    write: bool,
+    read_repo: &'static str,
+    write_repo: Option<&'static str>,
+) -> Vec<SmokeStep> {
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/gh-smoke: kernel first message",
+    }];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    // 1. Install gh from the bundled offline repo. gh has no DEPS, so the resolved
+    //    order is just [gh]. The ~55 MB `.m3pkg` is SHA-verified and written
+    //    file-by-file over the slow ring-3 VFS, hence the generous ceiling.
+    steps.push(SmokeStep::Send {
+        input: "pkg install gh\n",
+        label: "gh-smoke: pkg install gh",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "pkg install: gh: OK",
+        fail_prefix: "pkg install: cannot",
+        timeout_secs: 2400,
+        label: "gh-smoke: gh installed from .m3pkg",
+        exit_code_on_fail: SMOKE_EXIT_GH_SMOKE_FAILED,
+    });
+
+    // 2. The static Go gh RUNS on the 86d runtime. `gh --version` stamps
+    //    `gh version 2.82.1` (the `-X internal/build.Version` ldflag) — the
+    //    string appears in the OUTPUT, never in the typed command, so the Wait
+    //    matches actual execution, not the echo. Loading a 55 MB static binary
+    //    over the slow VFS + Go runtime init takes a while on the first exec.
+    steps.push(SmokeStep::Send {
+        input: "gh --version\n",
+        label: "gh-smoke: run gh --version",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "gh version 2.82.1",
+        timeout_secs: 600,
+        label: "gh-smoke: static Go gh runs on the 86d runtime (gh version)",
+    });
+
+    if !auth {
+        return steps;
+    }
+
+    // 3. (Opt-in, needs GH_TOKEN) Non-interactive auth. Export the token from the
+    //    seeded 0600 file (the VALUE never crosses serial — only the path is
+    //    sent) and point Go's `crypto/tls` at the 86a CA bundle via SSL_CERT_FILE.
+    steps.push(SmokeStep::Send {
+        input: "export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt\n",
+        label: "gh-smoke: export SSL_CERT_FILE for Go crypto/tls",
+    });
+    steps.push(SmokeStep::Send {
+        input: "export GH_TOKEN=\"$(cat /root/.config/gh/token)\"\n",
+        label: "gh-smoke: export GH_TOKEN from seeded 0600 file (no value on serial)",
+    });
+
+    // 4. `gh auth setup-git` registers gh as the https://github.com git credential
+    //    helper, so HTTPS `git` ops reuse the 86c curl+TLS+PAT path. It prints
+    //    nothing on success, so assert via the `$?` marker (only in the output).
+    steps.push(SmokeStep::Send {
+        input: "gh auth setup-git; echo GH_SETUP_GIT_RC=$?\n",
+        label: "gh-smoke: gh auth setup-git (register credential helper)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "GH_SETUP_GIT_RC=0",
+        timeout_secs: 120,
+        label: "gh-smoke: credential helper registered (setup-git exit 0)",
+    });
+
+    // 5. READ workflow over 86c HTTPS — `gh pr list` against a public repo. The
+    //    RC=0 marker (only in output) is the deterministic success signal: it
+    //    requires the full Go crypto/tls handshake to api.github.com, cert-chain
+    //    validation against the CA bundle, and a 200 response.
+    let prlist_cmd: &'static str = Box::leak(
+        format!(
+            "gh pr list --repo {read_repo} --limit 1 > /tmp/prs.txt 2>&1; echo GH_READ_RC=$?\n"
+        )
+        .into_boxed_str(),
+    );
+    steps.push(SmokeStep::Send {
+        input: prlist_cmd,
+        label: "gh-smoke: read workflow (gh pr list) over 86c HTTPS",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "GH_READ_RC=0",
+        timeout_secs: 300,
+        label: "gh-smoke: authenticated read over HTTPS succeeded (gh pr list exit 0)",
+    });
+
+    // 6. Secret hygiene — the credential at rest is mode 0600. `ls -l` prints the
+    //    mode string `-rw-------` (in the output, never the command); a wider mode
+    //    would not match. The token VALUE is never printed.
+    steps.push(SmokeStep::Send {
+        input: "ls -l /root/.config/gh/hosts.yml\n",
+        label: "gh-smoke: check hosts.yml permissions",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "-rw-------",
+        timeout_secs: 20,
+        label: "gh-smoke: hosts.yml is mode 0600 (credential at rest locked down)",
+    });
+
+    // 7. (Opt-in, needs M3OS_GH_WRITE=1 + a repo you control) WRITE workflow over
+    //    86c HTTPS — open an issue. RC=0 marker proves the authenticated POST
+    //    succeeded. Gated separately because it MUTATES a real GitHub repo.
+    if write && let Some(wrepo) = write_repo {
+        let issue_cmd: &'static str = Box::leak(
+            format!(
+                "gh issue create --repo {wrepo} --title 'm3OS gh-smoke' \
+                 --body 'Opened by the m3OS Phase 86e gh-smoke gate over 86c HTTPS.' \
+                 > /tmp/issue.txt 2>&1; echo GH_WRITE_RC=$?\n"
+            )
+            .into_boxed_str(),
+        );
+        steps.push(SmokeStep::Send {
+            input: issue_cmd,
+            label: "gh-smoke: write workflow (gh issue create) over 86c HTTPS",
+        });
+        steps.push(SmokeStep::Wait {
+            pattern: "GH_WRITE_RC=0",
+            timeout_secs: 300,
+            label: "gh-smoke: authenticated write over HTTPS succeeded (gh issue create exit 0)",
+        });
+    }
+
+    steps
+}
+
 /// The serial script for `git-local-smoke`. Wait-patterns are git's own output
 /// (never a substring of the command that triggers them) because the serial
 /// console echoes typed input; `Send` clears the scrollback so each assertion
@@ -17331,6 +17658,58 @@ fn populate_ext2_files(
         _ => String::new(),
     };
 
+    // Phase 86e — optional gh credential for the `gh-smoke` auth arm. When
+    // `M3OS_GH_SMOKE_TOKEN=<pat>` is set (cmd_gh_smoke copies GH_TOKEN into it —
+    // NOT the bare GH_TOKEN, so a user's ambient token can never bake into a
+    // routine image), seed it at mode 0600 under `/root/.config/gh/` so the guest
+    // can `export GH_TOKEN="$(cat …)"` without the value ever crossing serial, and
+    // write a matching hosts.yml (gh's at-rest credential file, also 0600 — the
+    // file the gate's hygiene step asserts is `-rw-------`). Absent the env var
+    // this is empty, so routine images carry no token (zero common-path change).
+    let gh_token_cmds = match std::env::var("M3OS_GH_SMOKE_TOKEN") {
+        Ok(tok) if !tok.is_empty() => {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Mint each temp secret fresh at 0600 (O_CREAT|O_EXCL) so it is never
+            // observable at the default 0644 and cannot follow a planted symlink.
+            let write_secret = |name: &str, content: &str| -> PathBuf {
+                let p = output_dir.join(name);
+                let _ = fs::remove_file(&p);
+                let mut f = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&p)
+                    .expect("create temp gh secret at 0600");
+                f.write_all(content.as_bytes())
+                    .expect("write temp gh secret");
+                p
+            };
+            let token_tmp = write_secret("_tmp_gh_token", &format!("{tok}\n"));
+            let hosts_tmp = write_secret(
+                "_tmp_gh_hosts_yml",
+                &format!("github.com:\n    oauth_token: {tok}\n    git_protocol: https\n"),
+            );
+            // 0x41C0 = 0o40700 (dir rwx------); 0x8180 = 0o100600 (file rw-------).
+            format!(
+                "mkdir root/.config/gh\n\
+                 sif root/.config/gh mode 0x41C0\n\
+                 sif root/.config/gh uid 0\n\
+                 sif root/.config/gh gid 0\n\
+                 write \"{}\" root/.config/gh/token\n\
+                 sif root/.config/gh/token mode 0x8180\n\
+                 sif root/.config/gh/token uid 0\n\
+                 sif root/.config/gh/token gid 0\n\
+                 write \"{}\" root/.config/gh/hosts.yml\n\
+                 sif root/.config/gh/hosts.yml mode 0x8180\n\
+                 sif root/.config/gh/hosts.yml uid 0\n\
+                 sif root/.config/gh/hosts.yml gid 0\n",
+                token_tmp.display(),
+                hosts_tmp.display()
+            )
+        }
+        _ => String::new(),
+    };
+
     fs::write(
         &smoke_mode_tmp,
         if smoke_test_mode { b"1\n" } else { b"0\n" },
@@ -17715,6 +18094,7 @@ fn populate_ext2_files(
          sif root/.ssh/known_hosts uid 0\n\
          sif root/.ssh/known_hosts gid 0\n\
          {ssh_identity_cmds}\
+         {gh_token_cmds}\
          write \"{empty}\" root/.local/share/ion/history\n\
          write \"{empty}\" home/user/.local/share/ion/history\n\
          sif bin mode 0x41ED\n\
@@ -18072,6 +18452,10 @@ fn populate_ext2_files(
     let _ = fs::remove_file(&gitconfig_tmp);
     let _ = fs::remove_file(&known_hosts_tmp);
     let _ = fs::remove_file(output_dir.join("_tmp_id_dropbear"));
+    // Phase 86e — the gh-smoke token + hosts.yml temp secrets (0600, present only
+    // when M3OS_GH_SMOKE_TOKEN was set) are removed from the host scratch dir.
+    let _ = fs::remove_file(output_dir.join("_tmp_gh_token"));
+    let _ = fs::remove_file(output_dir.join("_tmp_gh_hosts_yml"));
     let _ = fs::remove_file(&fibonacci_py_tmp);
     let _ = fs::remove_file(&hello_c_tmp);
     let _ = fs::remove_file(&hello_cpp_tmp);
@@ -18822,6 +19206,40 @@ fn populate_phase_69d_ports(part_path: &Path, workspace_root: &Path) {
                  run `cargo xtask port build llvm` first (or the clang-smoke gate)"
             ),
             Err(e) => eprintln!("phase-85d: clang artifact path error: {e}"),
+        }
+    }
+
+    // Phase 86e — the opt-in GitHub CLI (`gh`). The ~55 MB static-Go artifact is
+    // bundled into the offline `/usr/pkg/` repo ONLY when the `M3OS_WITH_GH`
+    // image feature is set, so default images stay small (mirroring
+    // `M3OS_WITH_CLANG`). Unlike the llvm→clang / dropbear→ssh remaps, the port
+    // name IS the package name (`gh`). gh has no runtime DEPS (a fully static
+    // `CGO_ENABLED=0` binary). The artifact only exists once `cargo xtask port
+    // build gh` (or the `gh-smoke` gate) has built it; on a routine image build
+    // where the feature is unset OR the artifact is absent this is a no-op, so
+    // nothing regresses and default images carry no `gh.m3pkg`.
+    if std::env::var("M3OS_WITH_GH").is_ok() {
+        match port_build::pkgcache_artifact_path("gh") {
+            Ok(artifact) if artifact.is_file() => match fs::read(&artifact) {
+                Ok(bytes) if pkg_format::verify(&bytes) => {
+                    m3pkg_files.push(("usr/pkg/gh.m3pkg".to_string(), artifact.clone()));
+                    let version = port_build::port_version("gh").unwrap_or_default();
+                    let deps = port_build::port_deps("gh").join(" ");
+                    let meta_host = preinstall_root.join("gh.meta");
+                    let _ = fs::create_dir_all(&preinstall_root);
+                    if fs::write(&meta_host, format!("VERSION={version}\nDEPS={deps}\n")).is_ok() {
+                        m3pkg_files.push(("usr/pkg/gh.meta".to_string(), meta_host));
+                    }
+                    println!("ports: bundled gh.m3pkg (opt-in M3OS_WITH_GH) into /usr/pkg");
+                }
+                Ok(_) => eprintln!("phase-86e: gh.m3pkg failed verify — skipping bundle"),
+                Err(e) => eprintln!("phase-86e: read {} failed: {e}", artifact.display()),
+            },
+            Ok(_) => eprintln!(
+                "phase-86e: M3OS_WITH_GH set but the gh .m3pkg is not built — \
+                 run `cargo xtask port build gh` first (or the gh-smoke gate)"
+            ),
+            Err(e) => eprintln!("phase-86e: gh artifact path error: {e}"),
         }
     }
 
