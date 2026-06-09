@@ -500,3 +500,23 @@ if [ "${M3OS_GO_REGRESSION:-0}" = "1" ]; then
         exit 1
     fi
 fi
+
+# Phase 86e — GitHub CLI (gh) regression gate. Gated behind M3OS_GH_REGRESSION=1
+# because it cross-builds the static (CGO_ENABLED=0) ~55 MB gh 2.82.1 from source
+# with the pinned Go 1.24.6 toolchain, builds a fresh M3OS_WITH_GH image, boots
+# QEMU, `pkg install gh`, and proves `gh --version` RUNS on the 86d runtime (the
+# always-on core). When GH_TOKEN is set it also authenticates non-interactively,
+# runs `gh auth setup-git` + a `gh pr list` read over real HTTPS to api.github.com,
+# and asserts hosts.yml is 0600; the mutating write (gh issue create) needs
+# M3OS_GH_WRITE=1 + M3OS_GH_WRITE_REPO. Absent GH_TOKEN the auth arms are
+# skip-with-reason (a secret can never live in repo/CI). Set this on branches that
+# touch ports/util/gh, xtask's build_gh / gh-smoke / the M3OS_WITH_GH bundling, or
+# the kernel paths the heavy static Go gh exercises. clang-gate-class --timeout
+# (the ~55 MB install + cold Go runs over the slow VFS take tens of minutes).
+if [ "${M3OS_GH_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask gh-smoke..."
+    if ! cargo xtask gh-smoke --timeout 5400; then
+        echo "pre-push: cargo xtask gh-smoke failed" >&2
+        exit 1
+    fi
+fi

@@ -1,5 +1,71 @@
 > Archived 2026-05-08 — post-1.0 tooling plan; not implementation-blocking. Original content preserved below for historical reference.
 
+## Phase 86e Addendum — Native Rust GitHub-REST Fallback
+
+**Added 2026-06-08. This section reflects the as-built Phase 86e decision; the original roadmap content below is historical.**
+
+### Why a fallback exists
+
+The original roadmap assumed that once the Go runtime cleared its kernel blockers (Phase 86d — `mmap MAP_FIXED`, edge-triggered `epoll`, `SIGURG`/`tgkill`, `eventfd2`), `gh` would follow straightforwardly. That remains the goal: `gh` is the primary GitHub CLI path. However, `gh` carries Go's pure-Go `crypto/tls` implementation, which performs AES-GCM in software when AES-NI is not available. Under m3OS's kernel SIMD-off constraint (the `-mmx,-sse` target flag that keeps ring-0 soft-float clean), software AES is slow enough that a `gh` invocation touching `api.github.com` may stall noticeably while negotiating TLS. AES-NI enablement is the Phase 86f capstone; until that lands, a lighter fallback is warranted.
+
+The fallback is a **native Rust GitHub-REST client** — a small userspace tool that issues raw HTTPS `GET`/`POST` requests to `api.github.com` using an `Authorization: Bearer <PAT>` header. It is not a replacement for `gh`; it is a narrowly-scoped fallback for the window between Phase 86d (Go runtime) and Phase 86f (AES-NI).
+
+### What the fallback covers
+
+The fallback covers the **read subset** of the GitHub REST API:
+
+- **`repo view`** — `GET /repos/{owner}/{repo}` returns repository metadata (name, description, default branch, open issues count).
+- **`pr list`** — `GET /repos/{owner}/{repo}/pulls` returns open pull requests (number, title, head/base refs, state).
+
+Example requests (illustrative):
+
+```
+GET /repos/owner/repo HTTP/1.1
+Host: api.github.com
+Authorization: Bearer ghp_xxxxxxxxxxxx
+Accept: application/vnd.github+json
+User-Agent: m3os-gh-rest/0.1
+```
+
+Write operations (e.g. `POST /repos/{owner}/{repo}/issues` to file an issue) follow the same Bearer pattern and are mechanically straightforward, but are **out of the fallback's guaranteed scope** — they are not exercised by Phase 86e smoke tests. Use `gh` for writes once Phase 86f unblocks it.
+
+### Transport: the Phase 86c TLS path
+
+The fallback uses the same transport layer that `git` HTTPS clone uses: **mbedTLS 3.6.2 + libcurl 8.15.0**, linked statically and installed via `pkg install`. No new TLS implementation is introduced. The trust roots come from the **Phase 86a CA bundle** (`/etc/ssl/certs/ca-certificates.crt`), referenced via curl's `--cacert` option (or the `CURLOPT_CAINFO` equivalent in the Rust binding). It is "the same trust roots, a different client" — not a new TLS stack.
+
+To authenticate, export a personal access token before invoking the client:
+
+```bash
+export GH_TOKEN="ghp_xxxxxxxxxxxx"   # read by the native Rust client (and by gh)
+export SSL_CERT_FILE="/etc/ssl/certs/ca-certificates.crt"   # consumed by Go's crypto/tls (gh)
+# The native Rust client passes the CA bundle to curl via --cacert; SSL_CERT_FILE
+# is the Go path's equivalent (advisory for the Rust/curl client).
+```
+
+### The double-TLS-stack fact
+
+As of Phase 86e, m3OS carries **two distinct TLS implementations**:
+
+| Stack | Used by | Implementation | CA bundle path |
+|---|---|---|---|
+| Go `crypto/tls` | `gh` (primary path) | Pure Go — no mbedTLS | `SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt` |
+| C mbedTLS 3.6.2 | `git` HTTPS, `curl`, native Rust fallback | C library, static musl link | `--cacert /etc/ssl/certs/ca-certificates.crt` |
+
+Both stacks consume the **same Phase 86a CA bundle**. They reach it differently: Go's `crypto/x509` checks the `SSL_CERT_FILE` environment variable at runtime; curl uses the path compiled in via `--with-ca-bundle` or passed at call time. Both stacks depend on the same **trustworthy wall clock** for certificate `notBefore`/`notAfter` validation, and both rely on the same Phase 86a CSPRNG (`sys_getrandom`) and DNS foundation for HTTPS establishment.
+
+The two stacks are not redundant by design — they arrived as part of distinct ports (`gh` brings Go's stdlib; `git`/`curl` bring mbedTLS). Carrying both is an unavoidable consequence of static linking. The implication for maintainers: **a CA bundle update must be re-installed** (via `pkg install ca-certificates`) to take effect for both stacks on next boot.
+
+### SIMD-off cipher preference
+
+Under the kernel SIMD-off constraint, all software cipher work runs on the scalar ALU. AES-GCM without AES-NI is several times slower than ChaCha20-Poly1305. Both TLS stacks should therefore prefer **ChaCha20-Poly1305** cipher suites where possible:
+
+- **mbedTLS**: the default TLS 1.3 cipher list already places `TLS_CHACHA20_POLY1305_SHA256` alongside `TLS_AES_128_GCM_SHA256`; no override is needed as long as the server supports it (GitHub does).
+- **Go `crypto/tls`**: Go 1.24 similarly advertises ChaCha20 in its default TLS 1.3 preference list. No application-level override is needed.
+
+This preference becomes moot once Phase 86f delivers AES-NI to the userspace FPU/XSAVE context, at which point `crypto/tls`'s AES-GCM path becomes fast and `gh` becomes the natural primary client without any latency caveat.
+
+---
+
 # Road to GitHub CLI (gh) on m3OS
 
 This document details the path to running the GitHub CLI (`gh`) inside m3OS.

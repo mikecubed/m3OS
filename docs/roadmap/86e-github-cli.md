@@ -1,6 +1,6 @@
 # Phase 86e - GitHub CLI (`gh`) + Native Fallback
 
-**Status:** Planned
+**Status:** 🟡 Implemented — `gh-smoke` core PASSED on m3OS (static Go `gh` 2.82.1 builds, bundles behind `M3OS_WITH_GH`, installs, and `gh --version` runs on the 86d runtime; kernel `0.86.4`). The authenticated read/write GitHub workflows are implemented but `GH_TOKEN`-gated (skip-with-reason without a secret); live-auth verification awaits a maintainer with a PAT.
 **Source Ref:** phase-86e
 **Depends on:** Phase 86c (HTTPS/TLS + CA + PAT) — see [86c-https-git-transport.md](./86c-https-git-transport.md), Phase 86d (Go runtime) — see [86d-go-runtime.md](./86d-go-runtime.md), Phase 86a (entropy/clock/DNS/CA bundle, transitively), Phase 85 (Cross-Compiled Toolchains) ✅, Phase 77 (DNS reply delivery + outbound TCP `connect`) ✅
 **Builds on:** Sub-phase **86e** of the Phase 86 umbrella ([86-networking-and-github.md](./86-networking-and-github.md)). It sits *on top of* the 86c HTTPS/TLS + CA + PAT machinery (`gh auth setup-git` registers `gh` as a git credential helper) and consumes the 86d Go runtime to run the `gh` binary; it adds no kernel surface.
