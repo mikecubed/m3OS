@@ -1133,6 +1133,8 @@ fn stage_wifi_firmware(root: &std::path::Path) {
 fn build_userspace_bins() {
     let root = workspace_root();
     let initrd = ensure_generated_initrd_dir(&root);
+    let userspace_target = root.join("x86_64-m3os.json");
+    let userspace_target_str = userspace_target.to_str().unwrap().to_string();
     stage_wifi_firmware(&root);
 
     // (package, binary, needs_alloc)
@@ -1422,9 +1424,10 @@ fn build_userspace_bins() {
             "--bin",
             bin,
             "--target",
-            "x86_64-unknown-none",
+            userspace_target_str.as_str(),
             build_std,
             "-Zbuild-std-features=compiler-builtins-mem",
+            "-Zjson-target-spec",
         ];
         build_args.extend_from_slice(extra_features);
 
@@ -1439,7 +1442,7 @@ fn build_userspace_bins() {
             std::process::exit(1);
         }
 
-        let src = root.join(format!("target/x86_64-unknown-none/release/{bin}"));
+        let src = root.join(format!("target/x86_64-m3os/release/{bin}"));
         let dst = initrd.join(format!("{bin}"));
         fs::copy(&src, &dst).unwrap_or_else(|e| {
             panic!("failed to copy {bin} to initrd: {e}");
@@ -1530,9 +1533,10 @@ fn build_userspace_bins() {
             "coreutils-rs",
             "--bins",
             "--target",
-            "x86_64-unknown-none",
+            userspace_target_str.as_str(),
             "-Zbuild-std=core,compiler_builtins",
             "-Zbuild-std-features=compiler-builtins-mem",
+            "-Zjson-target-spec",
         ])
         .status()
         .expect("failed to build coreutils-rs");
@@ -1543,7 +1547,7 @@ fn build_userspace_bins() {
     }
 
     for bin in coreutils_bins {
-        let src = root.join(format!("target/x86_64-unknown-none/release/{bin}"));
+        let src = root.join(format!("target/x86_64-m3os/release/{bin}"));
         let dst = initrd.join(format!("{bin}"));
         fs::copy(&src, &dst).unwrap_or_else(|e| {
             panic!("failed to copy {bin} to initrd: {e}");
@@ -1565,6 +1569,8 @@ fn build_userspace_bins() {
 fn build_ldso() {
     let root = workspace_root();
     let libs = ensure_generated_libs_dir(&root);
+    let userspace_target = root.join("x86_64-m3os.json");
+    let userspace_target_str = userspace_target.to_str().unwrap().to_string();
 
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
@@ -1576,9 +1582,10 @@ fn build_ldso() {
             "--bin",
             "ld-musl-x86_64-so-1",
             "--target",
-            "x86_64-unknown-none",
+            userspace_target_str.as_str(),
             "-Zbuild-std=core,compiler_builtins",
             "-Zbuild-std-features=compiler-builtins-mem",
+            "-Zjson-target-spec",
         ])
         .status()
         .expect("failed to invoke cargo build for ld-musl-x86_64-so-1");
@@ -1588,7 +1595,7 @@ fn build_ldso() {
         std::process::exit(1);
     }
 
-    let src = root.join("target/x86_64-unknown-none/release/ld-musl-x86_64-so-1");
+    let src = root.join("target/x86_64-m3os/release/ld-musl-x86_64-so-1");
     let dst = libs.join("ld-musl-x86_64.so.1");
     fs::copy(&src, &dst).unwrap_or_else(|e| {
         panic!("failed to copy ld.so to {}: {e}", dst.display());
@@ -5350,7 +5357,10 @@ fn cmd_check() {
         std::process::exit(1);
     }
 
-    // Clippy for all userspace crates (same target as kernel).
+    let userspace_target = root.join("x86_64-m3os.json");
+    let userspace_target_str = userspace_target.to_str().unwrap().to_string();
+
+    // Clippy for all userspace crates (hardware-float x86_64-m3os target).
     let userspace_pkgs = [
         "syscall-lib",
         "exit0",
@@ -5389,9 +5399,10 @@ fn cmd_check() {
     let mut clippy_args = vec![
         "clippy".to_string(),
         "--target".to_string(),
-        "x86_64-unknown-none".to_string(),
+        userspace_target_str.clone(),
         "-Zbuild-std=core,compiler_builtins,alloc".to_string(),
         "-Zbuild-std-features=compiler-builtins-mem".to_string(),
+        "-Zjson-target-spec".to_string(),
     ];
     for pkg in &userspace_pkgs {
         clippy_args.push("--package".to_string());
@@ -5423,9 +5434,10 @@ fn cmd_check() {
             "--package",
             "mt792x_driver",
             "--target",
-            "x86_64-unknown-none",
+            userspace_target_str.as_str(),
             "-Zbuild-std=core,compiler_builtins,alloc",
             "-Zbuild-std-features=compiler-builtins-mem",
+            "-Zjson-target-spec",
             "--",
             "-D",
             "warnings",
@@ -5447,9 +5459,10 @@ fn cmd_check() {
             "--features",
             "alloc",
             "--target",
-            "x86_64-unknown-none",
+            userspace_target_str.as_str(),
             "-Zbuild-std=core,compiler_builtins,alloc",
             "-Zbuild-std-features=compiler-builtins-mem",
+            "-Zjson-target-spec",
             "--",
             "-D",
             "warnings",
@@ -5467,7 +5480,7 @@ fn cmd_check() {
     // `pkg-format` is checked on the host target for BOTH feature surfaces:
     // the default (`std`) host packer/unpacker, and `--no-default-features`
     // for the `no_std` parse/verify surface the in-OS installer links. `pkg`
-    // is checked on the kernel's `x86_64-unknown-none` target with
+    // is checked on the userspace `x86_64-m3os` target with
     // `--features os-binary` (so the `[[bin]]` `_start` path is linted, not
     // just the host-testable `[lib]`), in its OWN invocation — mirroring the
     // Wi-Fi block above so cargo feature unification cannot leak `pkg`'s
@@ -5505,9 +5518,10 @@ fn cmd_check() {
             "--features",
             "os-binary",
             "--target",
-            "x86_64-unknown-none",
+            userspace_target_str.as_str(),
             "-Zbuild-std=core,compiler_builtins,alloc",
             "-Zbuild-std-features=compiler-builtins-mem",
+            "-Zjson-target-spec",
             "--",
             "-D",
             "warnings",

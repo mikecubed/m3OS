@@ -21,5 +21,8 @@ runner = "cargo xtask runner"
 # instructions; no FPU/XSAVE interaction to worry about here.
 rustflags = ["-Zretpoline"]
 
+[target.x86_64-m3os]
+rustflags = ["-Zretpoline"]
+
 [alias]
 xtask = "run --package xtask --target x86_64-unknown-linux-gnu --"
