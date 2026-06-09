@@ -293,6 +293,85 @@ fn xsave_header_sanitize_rejects_bad_fields() {
     );
 }
 
+/// Phase 86f Track B.1 BLOCKER 1 (rev3) — attacker-controlled MXCSR_MASK negative test.
+///
+/// Verifies that an attacker-supplied MXCSR_MASK=0xFFFFFFFF cannot allow
+/// reserved MXCSR bits to survive sanitization.  This is the specific attack
+/// described in rev3 FIX 1: if the sanitizer masks MXCSR against the buffer's
+/// own MXCSR_MASK field, an attacker sets MXCSR_MASK=0xFFFFFFFF so that a
+/// reserved bit (e.g. bit 16) is passed through, causing xrstor64 to #GP in
+/// ring 0 — a kernel DoS.
+///
+/// The fix ignores buf[28..32] and always uses SAFE_MXCSR_MASK = 0xFFBF.
+/// This test verifies that a reserved bit (bit 16, which is not a valid MXCSR
+/// bit on any x86_64) is cleared regardless of the MXCSR_MASK field value.
+#[test_case]
+fn xsave_sanitize_ignores_attacker_mxcsr_mask() {
+    use alloc::vec;
+    use kernel::arch::x86_64::cpuid::XSAVE_AREA_SIZE;
+    use kernel::task::scheduler::sanitize_xsave_header;
+
+    // Bit 16 is above the architecturally-defined MXCSR bits (bits 0–15 are
+    // the valid range on Intel/AMD x86_64; bits 16–31 are reserved and will
+    // cause xrstor64 to raise #GP if set).
+    const RESERVED_BIT: u32 = 1u32 << 16;
+    // MXCSR with a reserved bit set — this would normally be caught by masking
+    // against 0xFFBF, but with an attacker-supplied MXCSR_MASK=0xFFFFFFFF the
+    // old (buggy) code would pass it through.
+    let bad_mxcsr: u32 = 0x1F80 | RESERVED_BIT;
+
+    // Attacker supplies MXCSR_MASK=0xFFFFFFFF — the maximum possible, which
+    // would allow every bit to survive if the sanitizer trusted this field.
+    let attacker_mxcsr_mask: u32 = 0xFFFF_FFFF;
+
+    let mut buf = vec![0u8; XSAVE_AREA_SIZE];
+    // x87 CW = 0x037F (architectural init).
+    buf[0] = 0x7f;
+    buf[1] = 0x03;
+    // Poison MXCSR with the reserved bit.
+    buf[24..28].copy_from_slice(&bad_mxcsr.to_le_bytes());
+    // Attacker-supplied MXCSR_MASK — MUST be ignored by the sanitizer.
+    buf[28..32].copy_from_slice(&attacker_mxcsr_mask.to_le_bytes());
+    // XSTATE_BV = 0x3 (x87 + SSE present) — valid.
+    buf[512] = 0x03;
+
+    sanitize_xsave_header(&mut buf);
+
+    let mxcsr_after = u32::from_le_bytes(buf[24..28].try_into().unwrap());
+    // The reserved bit MUST be cleared regardless of the attacker-supplied mask.
+    assert_eq!(
+        mxcsr_after & RESERVED_BIT,
+        0,
+        "xsave_sanitize_ignores_attacker_mxcsr_mask: BLOCKER — reserved MXCSR bit 16 \
+         survived sanitization despite attacker MXCSR_MASK=0xFFFFFFFF: mxcsr_after={:#010x}",
+        mxcsr_after,
+    );
+    // The MXCSR_MASK field itself must be overwritten to the canonical safe value.
+    let mxcsr_mask_after = u32::from_le_bytes(buf[28..32].try_into().unwrap());
+    assert_eq!(
+        mxcsr_mask_after, 0xFFBF,
+        "xsave_sanitize_ignores_attacker_mxcsr_mask: MXCSR_MASK field not overwritten \
+         to canonical 0xFFBF (got {:#010x})",
+        mxcsr_mask_after,
+    );
+    // Verify valid MXCSR bits are preserved (0x1F80 & 0xFFBF = 0x1F80 since bit 6
+    // is not in 0x1F80).
+    let expected_mxcsr = bad_mxcsr & 0xFFBF;
+    assert_eq!(
+        mxcsr_after, expected_mxcsr,
+        "xsave_sanitize_ignores_attacker_mxcsr_mask: valid MXCSR bits altered: \
+         got {:#010x}, expected {:#010x}",
+        mxcsr_after, expected_mxcsr,
+    );
+
+    kernel::serial_println!(
+        "[signal-fpu-test] xsave_sanitize_ignores_attacker_mxcsr_mask: PASS \
+         (mxcsr_after={:#010x} mxcsr_mask_after={:#010x})",
+        mxcsr_after,
+        mxcsr_mask_after,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // FPU save/restore roundtrip (runs inside a scheduler task)
 // ---------------------------------------------------------------------------
@@ -604,4 +683,256 @@ fn xmm_survives_signal() {
     }
 
     kernel::serial_println!("[signal-fpu-test] xmm_survives_signal: PASS");
+}
+
+// ---------------------------------------------------------------------------
+// FIX 3 (MAJOR) — real signal-frame path test
+// ---------------------------------------------------------------------------
+
+/// Phase 86f Track B.1 rev3 — honest signal-frame round-trip through the
+/// production `setup_signal_frame` / `restore_sigframe` code paths.
+///
+/// Steps:
+///   1. Map scratch user-accessible pages in the test address space.
+///   2. Write pattern-A into XMM0–XMM3; `with_current_task_fpu_saved` captures
+///      the live FPU state (pre-signal snapshot, as signal delivery would).
+///   3. Call the REAL `kernel::signal::setup_signal_frame` targeting the scratch
+///      stack — exercises MC_FPSTATE pointer write, user-copy paths, frame layout.
+///   4. Clobber XMM0–XMM3 with pattern-B (simulate signal handler).
+///   5. Call the REAL `kernel::signal::restore_sigframe(frame_rsp + 8)` —
+///      exercises the pretcode-pop adjustment, fpstate pointer validation, and
+///      user-copy readback.
+///   6. Feed the returned FPU bytes through `restore_current_task_fpu_from_bytes`.
+///   7. Read XMM0–XMM3 back and assert bit-identical to pattern-A.
+///   8. Unmap the scratch pages.
+///
+/// This exercises the production frame layout, MC_FPSTATE pointer write/validation,
+/// and user-copy paths — the minimum honest signal-frame path test possible
+/// within the QEMU kernel-test harness.
+#[test_case]
+fn xmm_survives_signal_frame_path() {
+    use alloc::vec;
+    use kernel::arch::x86_64::cpuid::XSAVE_AREA_SIZE;
+    use kernel::signal::{
+        SIGFRAME_EXTENDED_SIZE, SavedUserRegs, restore_sigframe, setup_signal_frame,
+    };
+    use x86_64::structures::paging::PageTableFlags;
+
+    // Must run inside a scheduler task.
+    assert!(
+        kernel::task::scheduler::get_current_task_idx().is_some(),
+        "xmm_survives_signal_frame_path must run inside a scheduled kernel task"
+    );
+
+    // -----------------------------------------------------------------------
+    // 1. Map scratch user pages at a known address.
+    //
+    // We need enough space for the extended sigframe (SIGFRAME_EXTENDED_SIZE =
+    // SIGFRAME_SIZE + FPU_AREA_SIZE ≈ 1392 bytes) plus head-room for alignment
+    // and the RSP we'll pass in.  4 pages = 16 384 bytes is comfortable.
+    //
+    // Choose a test VA in the lower canonical half, well away from any real
+    // userspace load address.  The kernel test environment has the frame
+    // allocator and page mapper active after init_minimal_smp.
+    // -----------------------------------------------------------------------
+    const SCRATCH_VBASE: u64 = 0x0000_6FFE_0000_0000;
+    const SCRATCH_PAGES: u64 = 4;
+    const SCRATCH_BYTES: u64 = SCRATCH_PAGES * 4096;
+
+    let flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE;
+
+    let mut mapper = unsafe { kernel::mm::paging::get_mapper() };
+    unsafe {
+        kernel::mm::user_space::map_user_pages(&mut mapper, SCRATCH_VBASE, SCRATCH_PAGES, flags)
+            .expect("xmm_survives_signal_frame_path: map_user_pages failed");
+    }
+
+    // -----------------------------------------------------------------------
+    // 2. Write pattern-A into XMM0–XMM3 and save live FPU state.
+    // -----------------------------------------------------------------------
+    kernel::task::scheduler::reset_current_task_fpu_state();
+
+    let pattern_a = AlignedBuf16({
+        let mut b = [0u8; 64];
+        for x in &mut b[0..16] {
+            *x = 0xAA;
+        }
+        for x in &mut b[16..32] {
+            *x = 0xBB;
+        }
+        for x in &mut b[32..48] {
+            *x = 0xCC;
+        }
+        for x in &mut b[48..64] {
+            *x = 0xDD;
+        }
+        b
+    });
+    let expected = unsafe { write_xmm_patterns(&pattern_a) };
+
+    let snapshot = kernel::task::scheduler::with_current_task_fpu_saved(|bytes| {
+        let mut copy = vec![0u8; bytes.len()];
+        copy.copy_from_slice(bytes);
+        copy
+    })
+    .expect("with_current_task_fpu_saved must succeed inside task");
+    assert_eq!(snapshot.len(), XSAVE_AREA_SIZE);
+
+    // Verify pattern-A was captured in the XMM region (offsets 160–175 = XMM0).
+    assert_eq!(
+        &snapshot[160..176],
+        &expected[0..16],
+        "xmm_survives_signal_frame_path: XMM0 not in xsave snapshot"
+    );
+
+    // -----------------------------------------------------------------------
+    // 3. Call the real setup_signal_frame targeting the scratch stack.
+    //
+    // We place user RSP near the top of the scratch region.  setup_signal_frame
+    // computes the frame position as (rsp - SIGFRAME_EXTENDED_SIZE) & !15 - 8.
+    // With SCRATCH_VBASE=0x6FFE_0000_0000 and SCRATCH_BYTES=16384, the top is
+    // at 0x6FFE_0000_4000 — but we use SCRATCH_VBASE+SCRATCH_BYTES-8 as the
+    // "original user RSP" so the computed frame lands inside our mapped region.
+    // -----------------------------------------------------------------------
+    let user_rsp_for_setup = SCRATCH_VBASE + SCRATCH_BYTES - 8;
+
+    // Dummy saved register state — only rsp matters for frame layout.
+    let regs = SavedUserRegs {
+        rax: 0,
+        rbx: 0,
+        rcx: 0,
+        rdx: 0,
+        rsi: 0,
+        rdi: 0,
+        rbp: 0,
+        rsp: user_rsp_for_setup,
+        r8: 0,
+        r9: 0,
+        r10: 0,
+        r11: 0,
+        r12: 0,
+        r13: 0,
+        r14: 0,
+        r15: 0,
+        rip: 0x4000_0000,    // dummy user RIP (anywhere in user space)
+        rflags: 0x0000_0202, // IF set, minimal flags
+    };
+
+    // Restorer address: any canonical user address is fine for this test.
+    let restorer = 0x4000_1000u64;
+    let blocked_signals = 0u64;
+    let signal_num = 10u32; // SIGUSR1
+
+    let frame_rsp = setup_signal_frame(
+        &regs,
+        blocked_signals,
+        signal_num,
+        restorer,
+        None, // no alt stack
+        Some(&snapshot),
+    )
+    .expect("xmm_survives_signal_frame_path: setup_signal_frame returned None");
+
+    // Verify the frame landed inside our scratch region.
+    assert!(
+        frame_rsp >= SCRATCH_VBASE,
+        "xmm_survives_signal_frame_path: frame_rsp {:#x} < SCRATCH_VBASE {:#x}",
+        frame_rsp,
+        SCRATCH_VBASE,
+    );
+    assert!(
+        frame_rsp + SIGFRAME_EXTENDED_SIZE as u64 <= SCRATCH_VBASE + SCRATCH_BYTES,
+        "xmm_survives_signal_frame_path: frame_rsp+SIGFRAME_EXTENDED_SIZE overflows scratch"
+    );
+
+    // -----------------------------------------------------------------------
+    // 4. Clobber XMM0–XMM3 with pattern-B (simulate signal handler clobber).
+    // -----------------------------------------------------------------------
+    let pattern_b = AlignedBuf16({
+        let mut b = [0u8; 64];
+        for x in &mut b {
+            *x = 0xFF;
+        }
+        b
+    });
+    unsafe { write_xmm_patterns(&pattern_b) };
+
+    // -----------------------------------------------------------------------
+    // 5. Call the real restore_sigframe.
+    //
+    // The production sigreturn path calls restore_sigframe(user_rsp) where
+    // user_rsp is the user RSP at sigreturn time — i.e. after the handler's
+    // `ret` popped pretcode, so RSP = frame_rsp + 8.
+    // -----------------------------------------------------------------------
+    let sigreturn_rsp = frame_rsp + 8;
+    let (_restored_regs, _restored_mask, fpu_bytes_opt) = restore_sigframe(sigreturn_rsp)
+        .expect("xmm_survives_signal_frame_path: restore_sigframe returned None");
+
+    let fpu_bytes = fpu_bytes_opt
+        .expect("xmm_survives_signal_frame_path: restore_sigframe returned no FPU bytes");
+    assert_eq!(
+        fpu_bytes.len(),
+        XSAVE_AREA_SIZE,
+        "xmm_survives_signal_frame_path: fpu_bytes length mismatch"
+    );
+
+    // Verify the XMM region round-trips the frame (snapshot → frame → readback).
+    assert_eq!(
+        &fpu_bytes[160..176],
+        &expected[0..16],
+        "xmm_survives_signal_frame_path: XMM0 not in restored FPU bytes"
+    );
+
+    // -----------------------------------------------------------------------
+    // 6. Feed returned FPU bytes through restore_current_task_fpu_from_bytes.
+    // -----------------------------------------------------------------------
+    kernel::task::scheduler::restore_current_task_fpu_from_bytes(&fpu_bytes);
+
+    // -----------------------------------------------------------------------
+    // 7. Read XMM0–XMM3 back and assert bit-identical to pattern-A.
+    // -----------------------------------------------------------------------
+    let mut readback = AlignedBuf16::zeroed();
+    unsafe { read_xmm_to_buf(&mut readback) };
+
+    for reg in 0..4usize {
+        let off = reg * 16;
+        assert_eq!(
+            &readback.0[off..off + 16],
+            &expected[off..off + 16],
+            "xmm_survives_signal_frame_path: XMM{} not restored through frame path \
+             (got {:02x?}, expected {:02x?})",
+            reg,
+            &readback.0[off..off + 16],
+            &expected[off..off + 16],
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 8. Unmap the scratch pages.
+    // -----------------------------------------------------------------------
+    {
+        use x86_64::{
+            VirtAddr,
+            structures::paging::{Mapper, Page, Size4KiB},
+        };
+        let mut frame_addrs = [0u64; SCRATCH_PAGES as usize];
+        for i in 0..SCRATCH_PAGES {
+            let vaddr = VirtAddr::new(SCRATCH_VBASE + i * 4096);
+            let page = Page::<Size4KiB>::containing_address(vaddr);
+            if let Ok((frame, flush)) = mapper.unmap(page) {
+                flush.flush();
+                frame_addrs[i as usize] = frame.start_address().as_u64();
+            }
+        }
+        for &phys in &frame_addrs {
+            if phys != 0 {
+                kernel::mm::frame_allocator::free_frame(phys);
+            }
+        }
+    }
+
+    kernel::serial_println!("[signal-fpu-test] xmm_survives_signal_frame_path: PASS");
 }

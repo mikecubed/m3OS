@@ -2488,11 +2488,18 @@ fn deliver_user_signal(
     if let Some((base, size)) = alt_stack_region
         && let Some(top) = alt_stack_rsp
     {
-        // The frame occupies [frame_rsp, top) — conservatively estimate
-        // frame_rsp as top minus the extended frame size.
+        // The frame occupies [frame_rsp, top) — compute frame_rsp exactly
+        // the same way setup_signal_frame does so the bound check is tight:
+        //   frame_rsp = (top - SIGFRAME_EXTENDED_SIZE) & !15 - 8
+        // Use saturating arithmetic throughout; if top is too small the
+        // saturating_sub will produce 0 and the frame_rsp_est < base check
+        // will correctly reject it.
         let frame_size = crate::signal::SIGFRAME_EXTENDED_SIZE as u64;
-        // Underflow-safe: if top < frame_size the subtraction would wrap.
-        let frame_rsp_est = top.saturating_sub(frame_size + 8); // +8 for alignment pad
+        // Phase 86f rev3 FIX 4: use the same aligned formula as setup_signal_frame.
+        // The old estimate (top - frame_size - 8) under-estimated by up to 15
+        // bytes vs the real (top - frame_size) & !15 - 8, allowing a frame that
+        // barely overflows the alt-stack base to pass the guard.
+        let frame_rsp_est = (top.saturating_sub(frame_size) & !15u64).saturating_sub(8);
         if frame_rsp_est < base {
             log::warn!(
                 "[p{}] signal {}: extended frame ({} bytes) overflows alt stack \

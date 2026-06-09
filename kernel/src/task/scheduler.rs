@@ -2831,8 +2831,14 @@ pub fn with_current_task_fpu_saved<R>(f: impl FnOnce(&[u8]) -> R) -> Option<R> {
 ///   (non-compacted) `xrstor64` format; bit 63 set would trigger compacted mode
 ///   and raise #GP.
 /// * Reserved header bytes (offsets 528–575, 48 bytes): zero unconditionally.
-/// * `MXCSR` (offset 24, 4 bytes): mask against `MXCSR_MASK` (offset 28, or
-///   0xFFBF when the mask field is zero) to prevent #GP from reserved bits.
+/// * `MXCSR` (offset 24, 4 bytes): mask against the fixed constant `SAFE_MXCSR_MASK`
+///   (0xFFBF — all bits valid except bit 6, which is architecturally reserved
+///   on all x86_64 hardware) to prevent #GP from reserved bits.  The buffer's
+///   own MXCSR_MASK field (offset 28) is **ignored as a mask source** because
+///   the buffer is user-controlled; trusting it with an attacker-supplied
+///   0xFFFFFFFF would let reserved bits survive and cause `xrstor64` #GP in
+///   ring 0.  We also write the canonical mask value back to offset 28 for
+///   internal consistency.
 ///   `xrstor64` with XSTATE_BV bit 1 will load MXCSR; bad reserved bits fault.
 ///
 /// The `buf` slice must be exactly `XSAVE_AREA_SIZE` bytes; a shorter slice is
@@ -2846,15 +2852,19 @@ pub fn sanitize_xsave_header(buf: &mut [u8]) {
         return;
     }
 
-    // MXCSR (offset 24) masked against MXCSR_MASK (offset 28).
-    // When MXCSR_MASK is 0 (hardware did not write it), fall back to 0xFFBF
-    // (all bits valid except bit 6 which is reserved on all x86_64 hardware).
-    let mxcsr_mask = {
-        let m = u32::from_le_bytes(buf[28..32].try_into().unwrap());
-        if m == 0 { 0xFFBFu32 } else { m }
-    };
+    // MXCSR (offset 24): mask against the architecturally-safe constant.
+    // We intentionally ignore buf[28..32] (the buffer's own MXCSR_MASK field)
+    // because the buffer is user-controlled: an attacker could set MXCSR_MASK
+    // to 0xFFFFFFFF so that reserved bits survive the mask, causing xrstor64
+    // to #GP in ring 0 (DoS via controlled sigframe fpstate).
+    // SAFE_MXCSR_MASK = 0xFFBF: bit 6 is the sole architecturally-reserved bit
+    // on all x86_64; all other bits are valid control/status bits per Intel SDM.
+    const SAFE_MXCSR_MASK: u32 = 0xFFBF;
     let mxcsr = u32::from_le_bytes(buf[24..28].try_into().unwrap());
-    buf[24..28].copy_from_slice(&(mxcsr & mxcsr_mask).to_le_bytes());
+    buf[24..28].copy_from_slice(&(mxcsr & SAFE_MXCSR_MASK).to_le_bytes());
+    // Overwrite MXCSR_MASK (offset 28) with the canonical value so that any
+    // consumer of this field also sees a safe mask rather than attacker data.
+    buf[28..32].copy_from_slice(&SAFE_MXCSR_MASK.to_le_bytes());
 
     // XSTATE_BV (offset 512): keep only bits within XSAVE_FEATURE_MASK.
     let xstate_bv = u64::from_le_bytes(buf[512..520].try_into().unwrap());

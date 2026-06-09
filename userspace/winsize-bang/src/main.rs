@@ -46,8 +46,18 @@ const COLS: u16 = 60;
 /// outraces the first `Tasks:` print on a slow CI host.
 const DELAY_SECONDS: u64 = 5;
 
+// Phase 86f FIX 2: naked _start trampoline.  This binary ignores argv/envp.
+#[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
+    core::arch::naked_asm!(
+        "xor rbp, rbp",
+        "call {f}",
+        f = sym winsize_bang_main,
+    );
+}
+
+fn winsize_bang_main() -> ! {
     let pid = fork();
     if pid < 0 {
         write_str(STDOUT_FILENO, "winsize-bang: fork failed\n");

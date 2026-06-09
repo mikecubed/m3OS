@@ -12,8 +12,18 @@ const PASSWD_PATH: &[u8] = b"/etc/passwd\0";
 const SHADOW_PATH: &[u8] = b"/etc/shadow\0";
 const LOGIN_FILE_READ_RETRIES: usize = 5;
 
+// Phase 86f FIX 2: naked _start trampoline.  This binary ignores argv/envp.
+#[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
+    core::arch::naked_asm!(
+        "xor rbp, rbp",
+        "call {f}",
+        f = sym login_entry,
+    );
+}
+
+fn login_entry() -> ! {
     loop {
         login_once();
     }

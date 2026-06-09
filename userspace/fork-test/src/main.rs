@@ -110,8 +110,18 @@ fn nested_prompt_like_test() {
     }
 }
 
+// Phase 86f FIX 2: naked _start trampoline.  This binary ignores argv/envp.
+#[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
+    core::arch::naked_asm!(
+        "xor rbp, rbp",
+        "call {f}",
+        f = sym fork_test_main,
+    );
+}
+
+fn fork_test_main() -> ! {
     basic_wait_test();
     nested_prompt_like_test();
     serial_print("fork-test: PASS — basic and nested flows succeeded\n");

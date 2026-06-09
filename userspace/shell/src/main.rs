@@ -18,8 +18,18 @@ const MAX_PATH: usize = 128;
 /// PATH directories to search for commands.
 const PATH_DIRS: [&[u8]; 4] = [b"/usr/local/bin", b"/bin", b"/sbin", b"/usr/bin"];
 
+// Phase 86f FIX 2: naked _start trampoline.  This binary ignores argv/envp.
+#[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
+    core::arch::naked_asm!(
+        "xor rbp, rbp",
+        "call {f}",
+        f = sym shell_entry,
+    );
+}
+
+fn shell_entry() -> ! {
     main_loop();
 }
 
