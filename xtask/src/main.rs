@@ -14074,6 +14074,17 @@ fn cmd_gh_smoke(args: &SmokeBootArgs) {
             *arg = "user,id=net0".to_string();
         }
     }
+    // Pin the guest to a single core — same rationale as `go-runtime-smoke`: gh
+    // is a static Go binary, and a single core avoids the cross-core SMP
+    // futex/IPC races that otherwise make the heavy Go-load + slow-VFS pipeline
+    // intermittently deadlock. gh's runtime still spins up multiple OS threads
+    // (clone), so the runtime thread-creation path is exercised; it just does not
+    // need a second CORE.
+    for i in 0..qemu_args.len() {
+        if qemu_args[i] == "-smp" && i + 1 < qemu_args.len() {
+            qemu_args[i + 1] = "1".to_string();
+        }
+    }
     // Go's `crypto/tls` X25519/ChaCha20 ephemerals need the 86a CSPRNG at READY;
     // mbedTLS-style, it seeds from `sys_getrandom`, which blocks until the DRBG is
     // READY. The default TCG `qemu64` model exposes no hardware RNG, so advertise
@@ -14126,6 +14137,13 @@ fn cmd_gh_smoke(args: &SmokeBootArgs) {
 
     let mut child = Command::new("qemu-system-x86_64")
         .args(&qemu_args)
+        // Scrub the PAT from the long-running QEMU child's environment — the guest
+        // reads the token from the seeded 0600 disk file, NOT from env, so neither
+        // GH_TOKEN nor M3OS_GH_SMOKE_TOKEN needs to be visible via
+        // /proc/<qemu-pid>/environ for the duration of the run. (The data disk was
+        // already built above, where populate_ext2_files consumed the seed var.)
+        .env_remove("GH_TOKEN")
+        .env_remove("M3OS_GH_SMOKE_TOKEN")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -18434,6 +18452,15 @@ fn populate_ext2_files(
             .expect("write debugfs commands");
     }
     let debugfs_output = debugfs.wait_with_output().expect("debugfs wait");
+    // SECRET SCRUB — runs on BOTH the success and the failure (`exit(1)`) paths.
+    // debugfs has already read these host temp files (or failed trying), so the
+    // credential-bearing temps (the gh PAT + hosts.yml, and the dropbear private
+    // key) must be removed before the early `exit(1)` below — otherwise a debugfs
+    // failure would leave a live secret on disk in the build output dir. (Phase
+    // 86e hardening; closes the inherited dropbear-class gap for the live PAT.)
+    let _ = fs::remove_file(output_dir.join("_tmp_gh_token"));
+    let _ = fs::remove_file(output_dir.join("_tmp_gh_hosts_yml"));
+    let _ = fs::remove_file(output_dir.join("_tmp_id_dropbear"));
     if !debugfs_output.status.success() {
         let stderr = String::from_utf8_lossy(&debugfs_output.stderr);
         eprintln!(
@@ -18443,7 +18470,8 @@ fn populate_ext2_files(
         std::process::exit(1);
     }
 
-    // Clean up temp files.
+    // Clean up temp files. (The credential-bearing temps were already scrubbed
+    // above so they are gone even on the debugfs-failure path.)
     let _ = fs::remove_file(&passwd_tmp);
     let _ = fs::remove_file(&shadow_tmp);
     let _ = fs::remove_file(&group_tmp);
@@ -18451,11 +18479,8 @@ fn populate_ext2_files(
     let _ = fs::remove_file(&etc_hosts_tmp);
     let _ = fs::remove_file(&gitconfig_tmp);
     let _ = fs::remove_file(&known_hosts_tmp);
-    let _ = fs::remove_file(output_dir.join("_tmp_id_dropbear"));
-    // Phase 86e — the gh-smoke token + hosts.yml temp secrets (0600, present only
-    // when M3OS_GH_SMOKE_TOKEN was set) are removed from the host scratch dir.
-    let _ = fs::remove_file(output_dir.join("_tmp_gh_token"));
-    let _ = fs::remove_file(output_dir.join("_tmp_gh_hosts_yml"));
+    // (_tmp_id_dropbear, _tmp_gh_token, _tmp_gh_hosts_yml are scrubbed earlier —
+    // immediately after debugfs — so they never survive a debugfs-failure exit.)
     let _ = fs::remove_file(&fibonacci_py_tmp);
     let _ = fs::remove_file(&hello_c_tmp);
     let _ = fs::remove_file(&hello_cpp_tmp);
