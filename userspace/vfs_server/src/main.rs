@@ -100,6 +100,15 @@ struct Ext2State {
     /// off the per-allocation path removes ~2 device reads + 2 device writes per
     /// allocated block.
     meta_dirty_ops: u32,
+    /// Phase 87 — multi-block allocation reservation. `claim_block_run` claims a
+    /// contiguous run of free blocks in ONE bitmap read-modify-write and stashes
+    /// the unused tail here as `(next_block, remaining)`; `allocate_block` hands
+    /// them out without further bitmap writes. The unused tail is returned to the
+    /// free pool by `release_block_reservation` at each request boundary, so a
+    /// claimed-but-unmapped block never leaks. Collapses the per-block bitmap
+    /// write (the dominant remaining write cost + WRITE-request latency driver)
+    /// into one write per run.
+    block_reservation: Option<(u32, u32)>,
 }
 
 /// Max ext2 blocks held in the vfs_server read-through cache (4 KiB blocks →
@@ -112,6 +121,13 @@ const BLOCK_CACHE_MAX: usize = 4096;
 /// free-count drift to this many ops, which `fsck` reconciles from the
 /// already-persisted bitmaps.
 const META_FLUSH_THRESHOLD: u32 = 256;
+
+/// Phase 87 — how many contiguous blocks `claim_block_run` claims per bitmap
+/// read-modify-write. Sized to cover a 64 KiB write's 16 data blocks (plus a
+/// little headroom for the indirect pointer block) so a full-chunk file write
+/// costs one bitmap write instead of 16. The unused tail is freed at the
+/// request boundary, so an over-claim never leaks.
+const RESERVATION_RUN: u32 = 20;
 
 impl Ext2State {
     /// Read raw sectors from disk via the sys_block_read syscall.
@@ -575,7 +591,31 @@ impl Ext2State {
     }
 
     /// Allocate a free block, preferring `preferred_group`.
+    ///
+    /// Phase 87 — serves from a pre-claimed contiguous reservation first (no
+    /// bitmap write); only when the reservation is empty does it claim a fresh
+    /// run. A burst of allocations (a 16-block file write) therefore costs ONE
+    /// bitmap read-modify-write for the whole run instead of one per block — the
+    /// dominant remaining write cost and the driver of WRITE-request latency.
     fn allocate_block(&mut self, preferred_group: u32) -> Result<u32, u64> {
+        if let Some((next, remaining)) = self.block_reservation {
+            if remaining > 0 {
+                self.block_reservation = if remaining == 1 {
+                    None
+                } else {
+                    Some((next + 1, remaining - 1))
+                };
+                return Ok(next);
+            }
+        }
+        self.claim_block_run(preferred_group)
+    }
+
+    /// Claim a contiguous run of up to `RESERVATION_RUN` free blocks in one
+    /// bitmap read-modify-write, returning the first block and stashing the rest
+    /// in `block_reservation`. The free counters are decremented by the whole
+    /// run length now; the unused tail is restored by `release_block_reservation`.
+    fn claim_block_run(&mut self, preferred_group: u32) -> Result<u32, u64> {
         let bg_count = self.bgd_table.len();
         for offset in 0..bg_count {
             let group = ((preferred_group as usize) + offset) % bg_count;
@@ -593,27 +633,79 @@ impl Ext2State {
                 self.superblock.blocks_per_group
             };
 
+            // Find the first free bit in this group.
+            let mut start_bit = None;
             for bit in 0..blocks_in_group {
                 let byte_idx = (bit / 8) as usize;
                 let bit_idx = bit % 8;
                 if bitmap[byte_idx] & (1 << bit_idx) == 0 {
-                    bitmap[byte_idx] |= 1 << bit_idx;
-                    self.write_block(bitmap_block, &bitmap)
-                        .map_err(|_| NEG_EIO)?;
-
-                    self.bgd_table[group].free_blocks_count -= 1;
-                    self.superblock.free_blocks_count -= 1;
-
-                    let abs_block = (group as u32) * self.superblock.blocks_per_group
-                        + bit
-                        + self.superblock.first_data_block;
-
-                    self.mark_meta_dirty().map_err(|_| NEG_EIO)?;
-                    return Ok(abs_block);
+                    start_bit = Some(bit);
+                    break;
                 }
             }
+            // The free-count summary said this group had room; if the bitmap
+            // disagrees (a stale deferred count), move on to the next group.
+            let Some(start_bit) = start_bit else { continue };
+
+            // Claim a contiguous run of free bits from there, bounded by the run
+            // cap and the group end.
+            let mut run_len = 0u32;
+            while run_len < RESERVATION_RUN && start_bit + run_len < blocks_in_group {
+                let bit = start_bit + run_len;
+                let byte_idx = (bit / 8) as usize;
+                let bit_idx = bit % 8;
+                if bitmap[byte_idx] & (1 << bit_idx) != 0 {
+                    break; // run ends at the first used bit
+                }
+                bitmap[byte_idx] |= 1 << bit_idx;
+                run_len += 1;
+            }
+            // start_bit was free, so run_len >= 1.
+            self.write_block(bitmap_block, &bitmap)
+                .map_err(|_| NEG_EIO)?;
+            self.bgd_table[group].free_blocks_count -= run_len as u16;
+            self.superblock.free_blocks_count -= run_len;
+            self.mark_meta_dirty().map_err(|_| NEG_EIO)?;
+
+            let first_abs = (group as u32) * self.superblock.blocks_per_group
+                + start_bit
+                + self.superblock.first_data_block;
+            if run_len > 1 {
+                self.block_reservation = Some((first_abs + 1, run_len - 1));
+            }
+            return Ok(first_abs);
         }
         Err(NEG_ENOSPC)
+    }
+
+    /// Return the unused tail of the block reservation to the free pool in one
+    /// bitmap read-modify-write. Called at every request boundary, so a request
+    /// that claimed a run but mapped fewer blocks than it reserved never leaks
+    /// (and a request that errored mid-way is cleaned up too). The reserved tail
+    /// is contiguous and was claimed within a single group, so a single bitmap
+    /// block covers it.
+    fn release_block_reservation(&mut self) -> Result<(), u64> {
+        let (next, remaining) = match self.block_reservation.take() {
+            Some(r) if r.1 > 0 => r,
+            _ => return Ok(()),
+        };
+        let relative = next - self.superblock.first_data_block;
+        let group = (relative / self.superblock.blocks_per_group) as usize;
+        let group_base = (group as u32) * self.superblock.blocks_per_group;
+        let bitmap_block = self.bgd_table[group].block_bitmap;
+        let mut bitmap = self.read_block(bitmap_block).map_err(|_| NEG_EIO)?;
+        for blk in next..next + remaining {
+            let bit = blk - self.superblock.first_data_block - group_base;
+            let byte_idx = (bit / 8) as usize;
+            let bit_idx = bit % 8;
+            bitmap[byte_idx] &= !(1 << bit_idx);
+        }
+        self.write_block(bitmap_block, &bitmap)
+            .map_err(|_| NEG_EIO)?;
+        self.bgd_table[group].free_blocks_count += remaining as u16;
+        self.superblock.free_blocks_count += remaining;
+        self.mark_meta_dirty().map_err(|_| NEG_EIO)?;
+        Ok(())
     }
 
     /// Free a block.
@@ -1662,6 +1754,7 @@ fn program_main(_args: &[&str]) -> i32 {
         sectors_per_block,
         block_cache: RefCell::new(BTreeMap::new()),
         meta_dirty_ops: 0,
+        block_reservation: None,
     };
 
     syscall_lib::write_str(STDOUT_FILENO, "vfs_server: ext2 mounted\n");
@@ -1708,6 +1801,10 @@ fn server_loop(ext2: &mut Ext2State, ep_handle: u32) -> ! {
         req_seq = req_seq.wrapping_add(1);
         let start_us = now_usec();
         let (reply_label, reply_data0) = handle_request(ext2, &mut handles, &msg, &recv_buf);
+        // Phase 87 — return any over-claimed block-reservation tail to the free
+        // pool at the request boundary (covers success and error paths), so a
+        // multi-block allocation never leaks claimed-but-unmapped blocks.
+        let _ = ext2.release_block_reservation();
         let elapsed_us = now_usec().saturating_sub(start_us);
         // H9 follow-up: per-request start/done logging was investigative
         // only and added ~24 syscalls per request via write_str chains.
