@@ -2788,6 +2788,67 @@ pub fn reset_current_task_fpu_state() {
     }
 }
 
+/// Phase 86f Track B.1 — save the current task's live hardware FPU state into
+/// its `XSaveArea` and then call `f` with the raw bytes.
+///
+/// Signal delivery runs on the syscall-return path while the task is still ON
+/// CPU: the FPU registers hold the **live** userspace state, which has not yet
+/// been xsaved to the task's `XSaveArea` (that save happens during context
+/// switch, not on syscall entry). This helper captures the live state before
+/// the kernel builds the signal frame, so the frame's FPU snapshot is current.
+///
+/// Returns `None` if there is no current task (kernel task context).
+pub fn with_current_task_fpu_saved<R>(f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+    let idx = get_current_task_idx()?;
+    let mut sched = scheduler_lock();
+    if let Some(area) = sched.fpu_states.get_mut(idx) {
+        // Save live hardware FPU state into the task's XSaveArea so it is
+        // current for the signal-frame copy.  The xsave instruction writes the
+        // architectural state components enabled by XCR0 (x87 + SSE + AVX on
+        // m3OS today); we pass the same component mask used during context
+        // switch.  This is safe to call from the syscall-return path because:
+        //   a) interrupts are disabled at this point (the asm stub ran `cli`
+        //      before calling `syscall_return_maybe_preempt`), so no nested
+        //      FPU dirtying can occur;
+        //   b) `save_fpu_state` is inlined and does no allocation or IPC.
+        unsafe { save_fpu_state(area.as_mut()) };
+        let bytes = area.as_ref().as_bytes();
+        Some(f(bytes))
+    } else {
+        None
+    }
+}
+
+/// Phase 86f Track B.1 — copy FPU bytes from a signal frame back into the
+/// current task's `XSaveArea` and restore them to hardware.
+///
+/// Called from `sys_sigreturn` after the frame's fpstate bytes have been
+/// validated.  The restore step re-arms the hardware FPU so the task returns
+/// to ring 3 with the pre-signal vector register state.
+///
+/// `bytes` must be exactly `XSAVE_AREA_SIZE` bytes; if it is not (caller bug),
+/// the restore is skipped and the existing (signal-handler) FPU state is left
+/// in hardware — incorrect but not a safety violation.
+pub fn restore_current_task_fpu_from_bytes(bytes: &[u8]) {
+    if bytes.len() != crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE {
+        log::warn!(
+            "[signal] restore_current_task_fpu_from_bytes: wrong size {} (expected {})",
+            bytes.len(),
+            crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE,
+        );
+        return;
+    }
+    if let Some(idx) = get_current_task_idx() {
+        let mut sched = scheduler_lock();
+        if let Some(area) = sched.fpu_states.get_mut(idx) {
+            area.copy_from_bytes(bytes);
+            // Restore from the XSaveArea to hardware so the task resumes with
+            // the pre-signal vector register values.
+            unsafe { restore_fpu_state(area.as_ref()) };
+        }
+    }
+}
+
 pub fn take_current_task_fork_ctx() -> Option<crate::process::ForkChildCtx> {
     let idx = get_current_task_idx()?;
     let mut sched = scheduler_lock();

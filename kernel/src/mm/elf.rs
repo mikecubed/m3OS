@@ -756,6 +756,19 @@ pub unsafe fn setup_abi_stack_with_envp(
         let kptr = virt_to_kptr(cursor)?;
         (kptr as *mut u64).write(argv.len() as u64);
 
+        // Phase 86f Track B.2 — assert the ABI contract: at `_start` RSP must
+        // satisfy (RSP + 8) ≡ 0 (mod 16), i.e. RSP ≡ 8 (mod 16).  This is
+        // the SysV AMD64 process-entry requirement (psABI §3.4.1): the first
+        // `call` from `_start` pushes 8 bytes, leaving the callee with a
+        // 16-byte-aligned RSP — the minimum for SSE `movaps` stack spills.
+        // Fires only in debug builds; release builds skip it with zero cost.
+        debug_assert_eq!(
+            cursor % 16,
+            8,
+            "setup_abi_stack_with_envp: RSP {:#x} is not 8 mod 16 at _start (SysV AMD64 ABI violation)",
+            cursor,
+        );
+
         // Return rsp pointing at argc.
         Ok(cursor)
     }

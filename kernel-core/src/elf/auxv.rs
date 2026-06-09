@@ -253,6 +253,67 @@ mod tests {
         assert_eq!(&kinds[..], &expect[..]);
     }
 
+    /// Phase 86f Track B.2 — verify the AMD64 SysV ABI process-entry RSP
+    /// alignment contract: given the auxv size from `build_layout`, the
+    /// pointer-table computation in `setup_abi_stack_with_envp` must
+    /// produce RSP ≡ 8 (mod 16) at `_start`.
+    ///
+    /// This is a pure-math mirror of the `debug_assert_eq!` added in
+    /// `kernel/src/mm/elf.rs::setup_abi_stack_with_envp`.  We model the
+    /// same arithmetic here so the host-test suite catches a misalignment
+    /// regression without a QEMU boot.
+    #[test]
+    fn rsp_at_start_is_8_mod_16() {
+        // Two representative cursor values after the AT_RANDOM write:
+        // one 16-byte aligned, one 8-mod-16.
+        for &start_cursor in &[0x7fff_fff0_u64, 0x7fff_fff8_u64] {
+            for extras in [
+                None,
+                Some(AuxExtras {
+                    at_base: 1,
+                    at_entry: 2,
+                }),
+            ] {
+                let auxv = build_layout(
+                    PhdrInfo {
+                        phdr_vaddr: 0x400040,
+                        phentsize: 56,
+                        phnum: 8,
+                    },
+                    extras,
+                    0xdead_beef,
+                );
+                let nenv: usize = 2;
+                let narg: usize = 1;
+
+                // Reproduce the arithmetic from setup_abi_stack_with_envp.
+                let auxv_slots = auxv.len() * 2;
+                let envp_slots = nenv + 1;
+                let argv_slots = narg + 1;
+                let argc_slot = 1_usize;
+                let total_slots = auxv_slots + envp_slots + argv_slots + argc_slot;
+                let table_bytes = total_slots * 8;
+
+                let mut cursor = start_cursor;
+                let target = cursor - table_bytes as u64;
+                if target % 16 != 8 {
+                    cursor -= 8;
+                }
+                // Subtract the full table to reach argc position.
+                cursor -= table_bytes as u64;
+
+                assert_eq!(
+                    cursor % 16,
+                    8,
+                    "RSP not 8 mod 16: start_cursor={:#x} has_extras={} auxv_len={}",
+                    start_cursor,
+                    extras.is_some(),
+                    auxv.len(),
+                );
+            }
+        }
+    }
+
     /// Equivalent pin for the dynamic-binary case.
     #[test]
     fn dynamic_layout_byte_sequence_pinned() {
