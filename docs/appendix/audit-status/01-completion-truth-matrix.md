@@ -76,7 +76,7 @@ Every cell is sourced from `findings/01-*.md` through `findings/06-*.md`. If a c
 | 43a | Crash Diagnostics | Complete | All checked; clean phase | ✅ | — |
 | 43b | Kernel Trace Ring | Complete | **Zero checked checkboxes across all 9 tracks** | 🛑 | Same pattern as 42b |
 | 43c | Regression and Stress CI | Complete | **Zero checked checkboxes across all 11 tracks** | 🛑 | Same pattern; widest unchecked scope |
-| 44 | Rust Cross-Compilation | Complete | All checked; `x86_64-m3os.json` is naming-only; musl crates not workspace members | ✅ | — |
+| 44 | Rust Cross-Compilation | Complete | All checked; musl crates not workspace members. **Note (post-86f update):** `x86_64-m3os.json` is no longer naming-only — it is the live hardware-float Rust userspace target (Phase 86f: `+sse,+sse2`, `+soft-float` removed, `build_userspace_bins` pointed at it). The original Phase-44 claim "naming-only" was accurate at the time of the audit. | ✅ | Phase-44 acceptance met; 86f repurposed the file (see Phase 86f row) |
 | 45 | Ports System | Complete | All checked; `/var/run → /run` symlink deferred | ✅ | — |
 | 46 | System Services | Complete | **Zero checked checkboxes across all 8 tracks (22 tasks)**: service manager, syslogd, crond, sys_reboot, shutdown/reboot all unverified in the task doc despite shipping per AGENTS.md | 🛑 | Largest unchecked surface in 33–47 |
 | 47 | DOOM | Complete | **Zero checked checkboxes across all 6 tracks**: all three new kernel framebuffer/input syscalls (0x1002–0x1004), the entire doomgeneric platform layer, and xtask integration unverified | 🛑 | Phase 56 builds on this baseline |

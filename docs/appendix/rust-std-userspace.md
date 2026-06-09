@@ -87,12 +87,15 @@ workspace default target is `x86_64-unknown-none` and the musl crates are
 non-workspace members (each musl crate's `Cargo.toml` opens with `[workspace]`
 to detach it).
 
-`x86_64-m3os.json` at the project root produces functionally identical machine
-code to `x86_64-unknown-none`; its only purpose is `"os": "m3os"` so shared
-crates can branch on `#[cfg(target_os = "m3os")]`. It is a **kernel/no_std**
-target — soft-float, `code-model: kernel`, `has-thread-local: false` — and is
-**not** usable as a userspace target (a fact that matters for Phase 95: a native
-on-device toolchain needs a separate userspace target spec).
+`x86_64-m3os.json` at the project root is the **live Rust userspace
+hardware-float target** as of Phase 86f. It carries `+sse,+sse2` (AES-NI
+enabled), `+soft-float` removed, `disable-redzone: true`, `panic-strategy: abort`,
+and `"os": "m3os"` so shared crates can branch on
+`#[cfg(target_os = "m3os")]`. `xtask`'s `build_userspace_bins` points all three
+userspace `--target` invocations at it. The **kernel** stays on the built-in
+`x86_64-unknown-none` (soft-float, `-sse`) — the two are deliberately
+decoupled. (Phase 95 still needs a separate userspace *std* target spec for a
+native on-device `rustc`; `x86_64-m3os.json` is `no_std`, not a `std` sysroot.)
 
 ## What Phase 44 Shipped (and where it is now)
 
