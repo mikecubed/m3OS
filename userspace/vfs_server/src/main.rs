@@ -228,6 +228,29 @@ impl Ext2State {
         Ok(())
     }
 
+    /// Phase 87 — write a contiguous run of `count` whole blocks in one
+    /// multi-block `block_write` (the write analog of the read coalescer).
+    /// `data.len()` must be exactly `count * block_size`. The run is file
+    /// payload, not hot metadata, so its blocks are *invalidated* from the cache
+    /// (a later read re-reads the fresh disk content) rather than refreshed —
+    /// caching a multi-block sequential write would thrash the metadata-oriented
+    /// cache, exactly as the read path bypasses the cache for bulk runs.
+    /// `sys_block_write` caps a request at 128 sectors, so callers bound `count`
+    /// to `128 / sectors_per_block`.
+    fn write_block_run(&self, start_block: u32, count: usize, data: &[u8]) -> Result<(), ()> {
+        let lba = self.block_to_lba(start_block);
+        let sectors = count * self.sectors_per_block as usize;
+        let ret = syscall_lib::block_write(lba, sectors, data);
+        // Invalidate every block in the run (on success the disk now holds the
+        // new payload and the cache is clear so reads re-read it; on failure we
+        // never serve a value we cannot prove landed).
+        let mut cache = self.block_cache.borrow_mut();
+        for i in 0..count as u32 {
+            cache.remove(&(start_block + i));
+        }
+        if ret < 0 { Err(()) } else { Ok(()) }
+    }
+
     /// Write an inode back to disk (mirrors kernel `write_inode`).
     fn write_inode(&self, inode_num: u32, inode: &Ext2Inode) -> Result<(), ()> {
         let group = inode_block_group(inode_num, self.superblock.inodes_per_group);
@@ -683,10 +706,21 @@ impl Ext2State {
 
     /// Allocate a data block for a logical position in an inode, wiring up
     /// direct / single-indirect / double-indirect pointers as needed.
+    ///
+    /// Phase 87 — `zero_fill` controls whether a *newly allocated data block* is
+    /// zeroed on disk. A caller that immediately writes the **whole** block
+    /// (`write_file_data`'s coalesced full-block path) passes `false` to skip a
+    /// redundant zero-write that the payload overwrites anyway — this halves the
+    /// per-data-block write count. A caller that only partially fills the block
+    /// (unaligned head/tail, or a fresh directory block) passes `true` so the
+    /// unwritten remainder reads back as zero rather than stale freed content.
+    /// Indirect *pointer* blocks are always zeroed regardless — they are
+    /// metadata and garbage pointers would corrupt the file.
     fn allocate_data_block(
         &mut self,
         inode: &mut Ext2Inode,
         logical_block: u32,
+        zero_fill: bool,
     ) -> Result<u32, u64> {
         let ptrs_per_block = self.block_size / 4;
         let preferred_group = 0;
@@ -694,8 +728,10 @@ impl Ext2State {
         if logical_block < EXT2_NDIR_BLOCKS as u32 {
             if inode.block[logical_block as usize] == 0 {
                 let new_block = self.allocate_block(preferred_group)?;
-                let zero = vec![0u8; self.block_size as usize];
-                self.write_block(new_block, &zero).map_err(|_| NEG_EIO)?;
+                if zero_fill {
+                    let zero = vec![0u8; self.block_size as usize];
+                    self.write_block(new_block, &zero).map_err(|_| NEG_EIO)?;
+                }
                 inode.block[logical_block as usize] = new_block;
                 inode.blocks += self.block_size / 512;
             }
@@ -723,8 +759,10 @@ impl Ext2State {
             ]);
             if existing == 0 {
                 let new_block = self.allocate_block(preferred_group)?;
-                let zero = vec![0u8; self.block_size as usize];
-                self.write_block(new_block, &zero).map_err(|_| NEG_EIO)?;
+                if zero_fill {
+                    let zero = vec![0u8; self.block_size as usize];
+                    self.write_block(new_block, &zero).map_err(|_| NEG_EIO)?;
+                }
                 ind_data[off..off + 4].copy_from_slice(&new_block.to_le_bytes());
                 self.write_block(ind_block, &ind_data)
                     .map_err(|_| NEG_EIO)?;
@@ -776,8 +814,10 @@ impl Ext2State {
             ]);
             if existing == 0 {
                 let new_block = self.allocate_block(preferred_group)?;
-                let zero = vec![0u8; self.block_size as usize];
-                self.write_block(new_block, &zero).map_err(|_| NEG_EIO)?;
+                if zero_fill {
+                    let zero = vec![0u8; self.block_size as usize];
+                    self.write_block(new_block, &zero).map_err(|_| NEG_EIO)?;
+                }
                 ind_data[off..off + 4].copy_from_slice(&new_block.to_le_bytes());
                 self.write_block(ind_block, &ind_data)
                     .map_err(|_| NEG_EIO)?;
@@ -804,30 +844,70 @@ impl Ext2State {
             return Ok(0);
         }
         let bs = self.block_size as u64;
+        let bs_usize = self.block_size as usize;
         let end_offset = offset + data.len() as u64;
-        let mut written = 0;
+        // sys_block_write caps a request at 128 sectors.
+        let max_run_blocks = (128 / self.sectors_per_block).max(1) as usize;
+        let mut written = 0usize;
         let mut pos = offset;
+
+        // Phase 87 — accumulate a run of physically-contiguous WHOLE blocks and
+        // flush it in one multi-block `write_block_run`, instead of one
+        // `write_block` per block. Full blocks are also allocated with
+        // `zero_fill = false` (the run write covers the whole block, so the
+        // separate zero-write is redundant). The unaligned head/tail keep the
+        // single-block read-modify-write path. Tuple: (start_phys, data_offset
+        // of the run start, run_len in blocks).
+        let mut run: Option<(u32, usize, usize)> = None;
 
         while written < data.len() {
             let logical_block = (pos / bs) as u32;
             let offset_in_block = (pos % bs) as usize;
-            let remaining_in_block = (bs as usize) - offset_in_block;
+            let remaining_in_block = bs_usize - offset_in_block;
             let copy_len = remaining_in_block.min(data.len() - written);
 
-            let phys_block = self.allocate_data_block(inode, logical_block)?;
+            if offset_in_block != 0 || copy_len < bs_usize {
+                // Partial (head/tail) block — read-modify-write a single block.
+                // Flush any pending whole-block run first so on-disk ordering
+                // matches the logical write order.
+                if let Some((rp, rstart, rlen)) = run.take() {
+                    self.write_block_run(rp, rlen, &data[rstart..rstart + rlen * bs_usize])
+                        .map_err(|_| NEG_EIO)?;
+                }
+                let phys_block = self.allocate_data_block(inode, logical_block, true)?;
+                let mut block_data = self.read_block(phys_block).map_err(|_| NEG_EIO)?;
+                block_data[offset_in_block..offset_in_block + copy_len]
+                    .copy_from_slice(&data[written..written + copy_len]);
+                self.write_block(phys_block, &block_data)
+                    .map_err(|_| NEG_EIO)?;
+                written += copy_len;
+                pos += copy_len as u64;
+                continue;
+            }
 
-            let mut block_data = if offset_in_block > 0 || copy_len < bs as usize {
-                self.read_block(phys_block).map_err(|_| NEG_EIO)?
-            } else {
-                vec![0u8; bs as usize]
-            };
-            block_data[offset_in_block..offset_in_block + copy_len]
-                .copy_from_slice(&data[written..written + copy_len]);
-            self.write_block(phys_block, &block_data)
+            // Whole block — allocate (no zero-fill, the run write covers it) and
+            // extend the contiguous run, or flush + start a new one.
+            let phys_block = self.allocate_data_block(inode, logical_block, false)?;
+            match run {
+                Some((rp, rstart, rlen))
+                    if phys_block == rp + rlen as u32 && rlen < max_run_blocks =>
+                {
+                    run = Some((rp, rstart, rlen + 1));
+                }
+                _ => {
+                    if let Some((rp, rstart, rlen)) = run.take() {
+                        self.write_block_run(rp, rlen, &data[rstart..rstart + rlen * bs_usize])
+                            .map_err(|_| NEG_EIO)?;
+                    }
+                    run = Some((phys_block, written, 1));
+                }
+            }
+            written += bs_usize;
+            pos += bs;
+        }
+        if let Some((rp, rstart, rlen)) = run.take() {
+            self.write_block_run(rp, rlen, &data[rstart..rstart + rlen * bs_usize])
                 .map_err(|_| NEG_EIO)?;
-
-            written += copy_len;
-            pos += copy_len as u64;
         }
 
         if end_offset > inode.size as u64 {
@@ -899,8 +979,9 @@ impl Ext2State {
             }
         }
 
-        // No space — allocate a new directory block.
-        let new_block = self.allocate_data_block(dir_inode, num_blocks)?;
+        // No space — allocate a new directory block (zero-filled: the entry
+        // below fills only the head, and the remainder must read back as zero).
+        let new_block = self.allocate_data_block(dir_inode, num_blocks, true)?;
         let mut block_data = vec![0u8; bs as usize];
         block_data[0..4].copy_from_slice(&child_inode.to_le_bytes());
         block_data[4..6].copy_from_slice(&(bs as u16).to_le_bytes());
