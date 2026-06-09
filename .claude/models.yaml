@@ -9,15 +9,15 @@
 # Update this file when switching to a newer model release.
 
 # plan
-planner: claude-opus-4.7
-reviewer: claude-opus-4.7
+planner: claude-opus-4.8
+reviewer: claude-opus-4.8
 
 # parallel-impl and pr-resolve
 implementer: claude-sonnet-4.6
 
 # pr-ready
-structured-check: claude-opus-4.7
-final-reviewer: claude-opus-4.7
+structured-check: claude-opus-4.8
+final-reviewer: claude-opus-4.8
 
 # bounded discovery/triage (all skills)
 scout: claude-haiku-4.5

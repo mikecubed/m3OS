@@ -11,9 +11,9 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | SSE/AES-enabled Rust userspace target (`x86_64-m3os.json` + `build_userspace_bins`) | — | Planned |
-| B | Signal-frame FPU save/restore + `_start` RSP/auxv alignment | A | Planned |
-| C | AES-NI backend in `crypto-lib` + full re-validation + smoke gate | A, B | Planned |
+| A | SSE/AES-enabled Rust userspace target (`x86_64-m3os.json` + `build_userspace_bins`) | — | Landed |
+| B | Signal-frame FPU save/restore + `_start` RSP/auxv alignment | A | In Progress |
+| C | AES-NI backend in `crypto-lib` + full re-validation + smoke gate | A, B | In Progress (C.1 landed) |
 | D | Learning doc + roadmap reconcile + version bump (capstone close-out) | A, B, C | Planned |
 
 ---
@@ -30,9 +30,9 @@
 **Why it matters:** Enabling SIMD is primarily a build-system change — the per-switch XSAVE cost is already paid (Phase 57e/60) — and the kernel must stay `-sse` so IRQ/exception handlers never emit XMM.
 
 **Acceptance:**
-- [ ] `x86_64-m3os.json` `"features"` field is changed to a hardware-float list (`+sse,+sse2`, optionally `+avx,+aes`) with `+soft-float` removed; all other fields (`disable-redzone`, `panic-strategy: abort`, `relocation-model`, data-layout) unchanged.
-- [ ] The three `build_userspace_bins` userspace cargo invocations use `--target <repo>/x86_64-m3os.json` (not `x86_64-unknown-none`); the kernel build path (`build_kernel`) still uses the built-in `x86_64-unknown-none`.
-- [ ] All userspace crates compile against the new target; `cargo xtask check` is clean (clippy `-D warnings` + rustfmt + host tests + retpoline gate).
+- [x] `x86_64-m3os.json` `"features"` field is changed to a hardware-float list (`-mmx,+sse,+sse2,+aes`; `+avx` deliberately omitted to bound blast radius) with `+soft-float` removed; all other fields unchanged except `target-pointer-width`/`target-c-int-width` string→integer (forced by current nightly target-spec schema).
+- [x] The `build_userspace_bins` userspace cargo invocations (per-binary loop + coreutils batch) use `--target <repo>/x86_64-m3os.json` with `-Zjson-target-spec`; the kernel build path (`build_kernel`) still uses the built-in `x86_64-unknown-none`. **Deviation:** `build_ldso` stays on `x86_64-unknown-none` — the dynamic linker must be PIE (`ET_DYN`) and the m3os target is `position-independent-executables: false`; an SSE ldso is not needed (Track B review finding, dynlink-smoke regression fix).
+- [x] All userspace crates compile against the new target; `cargo xtask check` is clean (clippy `-D warnings` + rustfmt + host tests + retpoline gate). Userspace keeps `-Zretpoline` via a `[target.x86_64-m3os]` section in `.cargo/config.toml` (verified: retpoline thunk refs present in built userspace bins). Note: the target flip changes userspace ELFs from PIE (`ET_DYN`) to fixed-address `ET_EXEC` — verified supported by the loader (`load_bias = 0` path, same as the Phase 85d static clang binaries).
 
 ### A.2 — Prove userspace emits XMM and the kernel does not
 
@@ -44,8 +44,8 @@
 **Why it matters:** The whole point of the split is hardware SIMD in ring 3 with zero XMM in ring-0 IRQ/retpoline paths; this is the falsifiable proof.
 
 **Acceptance:**
-- [ ] `objdump -d` of a representative userspace binary (e.g. a `crypto-lib` consumer) shows `xmm` register use.
-- [ ] `objdump -d` of the kernel image shows **no** `xmm`/SSE instructions on its IRQ/exception/retpoline code paths.
+- [x] `objdump -d` of a representative userspace binary (e.g. a `crypto-lib` consumer) shows `xmm` register use (`init`: 630 XMM instructions, `crypto-test`: 3962, `sshd`: 5505).
+- [x] `objdump -d` of the kernel image shows **no** `xmm`/SSE instructions on its IRQ/exception/retpoline code paths (0 XMM opcodes in the whole kernel image; permanent gate wired in C.3).
 
 ---
 
@@ -82,9 +82,9 @@
 **Why it matters:** The `aes` crate (0.8.x) autodetects AES-NI at runtime via `cpufeatures` on x86_64 (compile-time `+aes` is only a force path); the real m3OS enabler is the soft-float→hardware-float userspace target, which permits XMM/AES-NI codegen at all — this is what unlocks the throughput payoff for the SSH/TLS symmetric path.
 
 **Acceptance:**
-- [ ] `objdump -d` of a rebuilt userspace binary that exercises AES shows `aesenc`/`aesenclast` (hardware AES-NI) rather than the table-driven software S-box, confirming the `aes` crate's `cpufeatures` runtime detection engages once the hardware-float target permits XMM codegen.
-- [ ] A microbenchmark (a fixed payload through the `aes`/`aes-gcm` AEAD encrypt path, fixed iteration count) records throughput in MiB/s for the soft-float build vs the `+sse`/`+aes` build; the AES-NI AES path is **≥ 2×** the soft-float AES path (the factor justified in the learning doc), and `objdump -d` of the rebuilt binary shows `aesenc`/`aesenclast` rather than the table-driven software S-box.
-- [ ] ChaCha20/Poly1305 round-trip vectors still pass (`crypto-lib` / `crypto-test` host tests unchanged-green); no AEAD correctness regression.
+- [x] `objdump -d` of a rebuilt userspace binary that exercises AES shows `aesenc`/`aesenclast` (hardware AES-NI) rather than the table-driven software S-box (`crypto-test`: 208 `aesenc`, 16 `aesenclast`, 13 `aeskeygenassist`), confirming the `aes` crate's `cpufeatures` runtime detection engages once the hardware-float target permits XMM codegen.
+- [x] A microbenchmark (1 MiB payload × 32 iterations through the AES-256-CTR path — crypto-lib has no `aes-gcm` dep; AES-CTR is its real AES consumer) records throughput in MiB/s: hardware AES-NI **5459 MiB/s** vs forced-soft (`--cfg aes_force_soft`, fixsliced backend) **203 MiB/s** ≈ **27×**, far above the ≥ 2× criterion (factor to be justified in the learning doc, Track D). An in-OS `crypto-test --bench` mode prints `BENCH:<cipher>:<MiB/s>` sentinels via `CLOCK_MONOTONIC` for the C.3 harness (QEMU runs TCG by default, so the host A/B is the authoritative comparison).
+- [x] ChaCha20/Poly1305 round-trip vectors still pass (31 crypto-lib host tests green under both hardware and forced-soft backends); NIST SP 800-38A §F.5.5 CTR-AES256 conformance vectors added; no AEAD correctness regression.
 
 ### C.2 — Full re-validation: recompile all userspace with SSE, re-run every gate
 
