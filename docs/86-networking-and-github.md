@@ -252,19 +252,21 @@ the *consumers*.
 
 **The principled split.** `x86_64-m3os.json` — formerly vestigial, carrying an
 explicit `-mmx,-sse,-sse2,…,-avx,-avx2,+soft-float` list — is repurposed to a
-hardware-float Rust userspace target with `+sse,+sse2` and the `+soft-float`
-feature removed. `xtask`'s `build_userspace_bins` (the three userspace
-`--target` invocations) are pointed at this target. The **kernel** stays on the
+hardware-float Rust userspace target with `+sse,+sse2,+aes` and the
+`+soft-float` feature removed. `xtask`'s `build_userspace_bins` userspace
+`--target` invocations are pointed at this target (the dynamic linker
+`ld-musl` deliberately stays on `x86_64-unknown-none` — it must remain
+PIE/`ET_DYN`, and the loader has no need for SSE). The **kernel** stays on the
 built-in `x86_64-unknown-none` (`-sse`, `+soft-float`) unchanged. The two are
 deliberately decoupled:
 
 - Ring 0 stays soft-float: IRQ/exception handlers never emit XMM, no FPU save
   is needed in interrupt entry, and the existing task-boundary XSAVE save/
   restore stays sufficient.
-- Ring 3 (Rust userspace) gains `+sse,+sse2`: the `aes` crate's runtime
+- Ring 3 (Rust userspace) gains `+sse,+sse2,+aes`: the `aes` crate's runtime
   AES-NI autodetection via `cpufeatures` can now select the hardware backend
-  (XMM codegen is permitted), and the whole Rust userspace tree gets SSE2
-  register availability for free.
+  (XMM/AES-NI codegen is permitted), and the whole Rust userspace tree gets
+  SSE2 register availability for free.
 
 **Signal-frame FPU.** The signal frame already reserved an `fpstate` slot in
 `kernel/src/signal.rs`. 86f completes the path: save the task's FPU state into

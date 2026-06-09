@@ -1,6 +1,6 @@
 # Phase 86f - Userspace SIMD / AES-NI Capstone
 
-**Status:** In Progress
+**Status:** Done ✅ — userspace builds hardware-float SSE/SSE2+AES on `x86_64-m3os.json` (kernel soft-float unchanged); signal-frame FPU save/restore landed with a sanitized-XSAVE-header sigreturn; `_start` entry stack fixed to the psABI 16-byte alignment (18 naked-trampoline conversions); AES-NI measured ≈27× over forced-soft AES-CTR (host A/B); kernel at `0.86.5`. Deviation: `ld-musl` stays on `x86_64-unknown-none` (must remain PIE/`ET_DYN`).
 **Source Ref:** phase-86f
 **Depends on:** Phase 86c (HTTPS/TLS — ship correctness on software crypto first), Phase 57e/60 (per-task FPU/XSAVE save/restore) ✅, Phase 85 (Cross-Compiled Toolchains) ✅, Phase 77 (Pre-1.0 Cleanup) ✅
 **Builds on:** Sub-phase **86f** of the [Phase 86 umbrella](./86-networking-and-github.md). It is the **last** sub-phase: it flips userspace from soft-float to an SSE/AES-enabled Rust target, finishes the signal-frame FPU path, re-validates the whole tree, and — per the Phase 85 precedent where the last sub-phase (85d) cut the family learning doc — owns the umbrella learning doc, the capability inventory cut, and the final kernel version bump.
