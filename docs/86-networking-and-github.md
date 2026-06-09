@@ -298,13 +298,24 @@ not a prediction of real-silicon throughput.
 crate's `cpufeatures` runtime detection engaged once the hardware-float target
 permitted XMM codegen.
 
-**Deliberate deviations.** The ldso (`ld-musl-x86_64.so.1`) stays soft-float/
-PIE on `x86_64-unknown-none` — it is kernel-adjacent and the dynamic linker's
-entry path must never touch XMM before the task's MXCSR is initialised.
-Userspace ELFs built with `x86_64-m3os.json` are `relocation-model: static`
-→ ET_EXEC (not PIE), consistent with the Phase 44/85 `no_std` userspace
-pattern. AVX (and AVX-512) is deferred — `+avx` would require bumping
-`XSAVE_FEATURE_MASK`/`XSAVE_AREA_SIZE` and the XCR0 mask.
+**Deliberate deviations.** The ldso (`ld-musl-x86_64.so.1`) stays on
+`x86_64-unknown-none` — the dynamic linker must remain PIE/`ET_DYN` (the
+m3os target is `position-independent-executables: false`) and the loader has
+no need for SSE. Userspace ELFs built with `x86_64-m3os.json` are
+`relocation-model: static` → ET_EXEC (not PIE), consistent with the Phase
+44/85 `no_std` userspace pattern. `+avx` is deferred conservatively to bound
+the rebuild's blast radius (the Phase 57e/60 XSAVE substrate already saves
+YMM state; only AVX-512 would require bumping
+`XSAVE_FEATURE_MASK`/`XSAVE_AREA_SIZE` and the XCR0 mask). The target's
+`"os"` field must stay `"none"` — a non-`"none"` value flips `target_os` and
+silently compiles `driver_runtime`'s `cfg(target_os = "none")` device-host
+syscall wrappers to their host-test fallbacks (found the hard way: the
+vestigial `"os": "m3os"` blinded every ring-3 PCI driver until the
+`e1000-restart-crash` regression arm caught it). Finally, compile-time `+aes`
+makes the `aes` crate's `cpufeatures` check constant-fold to "available", so
+SSE-userspace m3OS now assumes AES-NI hardware (any post-2010 x86_64; QEMU
+TCG runs gained `+aes` in the shared `-cpu` flags since `qemu64` does not
+advertise it).
 
 **What enabling SSE does NOT unlock.** Enabling SSE/AES does not make
 `ring`/`aws-lc-rs` build on m3OS. Those crates fail due to their asm/C build

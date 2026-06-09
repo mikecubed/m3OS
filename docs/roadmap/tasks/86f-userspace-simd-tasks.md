@@ -1,6 +1,6 @@
 # Phase 86f — Userspace SIMD / AES-NI Capstone: Task List
 
-**Status:** In Progress
+**Status:** Done ✅ — all four tracks landed; every acceptance item below is checked with its as-built evidence; kernel `0.86.5`.
 **Source Ref:** phase-86f
 **Depends on:** Phase 86c (HTTPS/TLS — ship correctness on software crypto first), Phase 57e/60 (per-task FPU/XSAVE save/restore) ✅, Phase 85 (Cross-Compiled Toolchains) ✅, Phase 77 (Pre-1.0 Cleanup) ✅
 **Goal:** Flip the Rust userspace target from soft-float to an SSE/SSE2 (+AES) hardware-float target so `crypto-lib` and the 86b/86c crypto consumers get hardware AES-NI, while the kernel stays soft-float (no XMM in IRQ handlers); finish the signal-frame FPU save/restore path; verify `_start` RSP/auxv 16-byte alignment; re-validate the entire userspace tree against every gate; and — as the last Phase 86 sub-phase — cut the umbrella learning doc, reconcile the roadmap README, and bump the kernel to `0.86.5`.
@@ -13,8 +13,8 @@
 |---|---|---|---|
 | A | SSE/AES-enabled Rust userspace target (`x86_64-m3os.json` + `build_userspace_bins`) | — | Landed |
 | B | Signal-frame FPU save/restore + `_start` RSP/auxv alignment | A | Landed |
-| C | AES-NI backend in `crypto-lib` + full re-validation + smoke gate | A, B | In Progress (C.1 landed) |
-| D | Learning doc + roadmap reconcile + version bump (capstone close-out) | A, B, C | Planned |
+| C | AES-NI backend in `crypto-lib` + full re-validation + smoke gate | A, B | Landed |
+| D | Learning doc + roadmap reconcile + version bump (capstone close-out) | A, B, C | Landed |
 
 ---
 
@@ -96,9 +96,9 @@
 **Why it matters:** Every userspace binary recompiles with SSE — the real cost is blast radius (alignment/ABI surprises), not difficulty — so the whole gate suite must pass on the rebuilt tree.
 
 **Acceptance:**
-- [ ] `cargo xtask smoke-test` and `regression` PASS on the SSE-rebuilt userspace.
-- [ ] `cargo xtask tui-app-smoke`, `doom-audio-smoke`, and `doom-concurrent-smoke` PASS on the SSE-rebuilt userspace.
-- [ ] Any ABI/alignment surprise surfaced by the rebuild is fixed (no skipped or quarantined gate); no regression versus the pre-SSE baseline.
+- [x] `cargo xtask smoke-test` and `regression` (11/11 arms, incl. `e1000-restart-crash`) PASS on the SSE-rebuilt userspace.
+- [x] `cargo xtask tui-app-smoke` (60 steps), `doom-audio-smoke`, and `doom-concurrent-smoke` (two concurrent DOOMs) PASS on the SSE-rebuilt userspace.
+- [x] Every ABI/alignment surprise surfaced by the rebuild was fixed (no skipped or quarantined gate; no regression vs the pre-SSE baseline): (1) entry RSP ≡ 8 → ≡ 0 mod 16 + 18 naked-trampoline `_start` conversions (Track B); (2) `ld-musl` kept on `x86_64-unknown-none` (must stay PIE/`ET_DYN`); (3) `x86_64-m3os.json` `"os"` restored to `"none"` — the vestigial `"m3os"` value flipped `target_os` and compiled `driver_runtime`'s 23 `cfg(target_os = "none")` device-host syscall wrappers to host-test fallbacks, blinding every ring-3 PCI driver (caught by `e1000-restart-crash`, root-caused via instrumented driver + kernel + disassembly, bisected against a green `main` baseline).
 
 ### C.3 — `userspace-simd-smoke` gate + pre-push wiring
 
@@ -111,8 +111,8 @@
 **Why it matters:** Locks in the SIMD/AES-NI win so a later change cannot silently revert userspace to soft-float or break the signal-frame FPU path; mirrors the existing opt-in gate pattern.
 
 **Acceptance:**
-- [ ] The gate asserts a userspace binary disassembles with `xmm` use and the kernel image has none on IRQ/retpoline paths (Track A.2), the SSE-spilling binary runs fault-free (Track B.2), and the AES-NI backend is active (Track C.1).
-- [ ] The gate is wired as `cargo xtask userspace-simd-smoke` and as an opt-in pre-push regression behind `M3OS_SIMD_REGRESSION=1` in both `AGENTS.md`'s gate table and `.githooks/pre-push`.
+- [x] The gate asserts a userspace binary disassembles with `xmm` use (`crypto-test`: >0 instruction-line matches) and the kernel image has none (0; instruction-line matcher immune to symbol-name false positives) plus `aesenc`/`aesenclast` present (Track A.2 + C.1 static proof), and boots QEMU to run `/bin/crypto-test` ("all tests PASSED" — the SSE+AES binary runs fault-free on the 16-aligned entry stack, Track B.2) and `/bin/crypto-test --bench` (`BENCH:aes-ctr:` — the AES path executes in-OS, Track C.1). Negative-sanity proven (an inverted assertion fails the gate). Note: QEMU TCG's `-cpu qemu64` does not advertise AES, and compile-time `+aes` makes `cpufeatures` short-circuit, so `+aes` was added to the shared TCG `-cpu` flags (KVM `-cpu host` path untouched) — on real hardware this sets an AES-NI hardware floor for userspace.
+- [x] The gate is wired as `cargo xtask userspace-simd-smoke` (`--timeout`/`--display` like siblings) and as an opt-in pre-push regression behind `M3OS_SIMD_REGRESSION=1` in both `AGENTS.md`'s gate table and `.githooks/pre-push`.
 
 ---
 
@@ -131,10 +131,10 @@
 **Why it matters:** This is the **last** sub-phase, so per the Phase 85 precedent (the family learning doc owned by the last sub-phase, 85d) it owns the umbrella learning doc, the capability cut, and the README reconcile; the umbrella was authored against the a–f split (carrying the Sub-Phase Decomposition table and the six task links as forward-looking `Planned` rows), so 86f reconciles those rows, links, and version lines with what actually landed and cuts the learning doc.
 
 **Acceptance:**
-- [ ] `docs/86-networking-and-github.md` is created per the aligned learning-doc template, covering the whole 86a–f arc (CSPRNG/clock/trust foundation, SSH vs HTTPS trust models, the Go runtime, `gh`, and SIMD/AES-NI).
-- [ ] `docs/README.md` gains a Phase 86 learning row linking the umbrella doc and all six sub-phase design docs.
-- [ ] `docs/roadmap/README.md`'s 86 + 86a–f rows are reconciled (Theme/Outcome/Status/Source Ref/Milestone/Tasks columns consistent with the umbrella decomposition table).
-- [ ] `docs/research/simd-enablement.md` is marked scheduled/landed in 86f; the `AGENTS.md` target-flags note is updated to reflect SSE-enabled userspace + soft-float kernel (the stale "to avoid FPU state save/restore" rationale removed), with a userspace-SIMD capability bullet added if it introduces a new capability class.
+- [x] `docs/86-networking-and-github.md` is created per the aligned learning-doc template (matched to the `docs/85-cross-compiled-toolchains.md` structure), covering the whole 86a–f arc (CSPRNG/clock/trust foundation, SSH vs HTTPS trust models, the Go runtime, `gh`, and SIMD/AES-NI incl. the measured 27× and the `ring`/`aws-lc-rs`-not-unlocked caveat); reviewer-verified factually accurate against the landed code with all links resolving.
+- [x] `docs/README.md` gains a Phase 86 learning row linking the umbrella doc and all six sub-phase design docs.
+- [x] `docs/roadmap/README.md`'s 86 + 86a–f rows are reconciled (column format verified consistent; 86/86f marked Complete at kernel `0.86.5`).
+- [x] `docs/research/simd-enablement.md` is marked landed in 86f (with pointers to the design + learning docs); the `AGENTS.md` target-flags note reflects SSE-enabled userspace + soft-float kernel (stale rationale removed), and the existing CPU-hardening capability bullet was extended in place (no new capability class added, per the file's maintenance policy).
 
 ### D.2 — Bump kernel crate `0.85.3` → `0.86.5`
 
@@ -143,8 +143,8 @@
 **Why it matters:** 86f is the final Phase 86 sub-phase, so it carries the umbrella aggregate version (`0.86.0` → `0.86.5`), mirroring the Phase 85 sequence where 85d cut `0.85.3`.
 
 **Acceptance:**
-- [ ] `kernel/Cargo.toml` reads `version = "0.86.5"` (+ `Cargo.lock` updated); `cargo xtask check` is clean.
-- [ ] The boot banner / `uname` report `0.86.5` (`env!("CARGO_PKG_VERSION")` → kernel built as `v0.86.5`).
+- [x] `kernel/Cargo.toml` reads `version = "0.86.5"` (+ `Cargo.lock` updated); `cargo xtask check` is clean.
+- [x] The boot banner / `uname` report `0.86.5` (`env!("CARGO_PKG_VERSION")` → kernel compiled as `v0.86.5` in every gate build; the banner string is a compile-time constant of that version).
 
 ---
 
