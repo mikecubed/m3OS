@@ -539,3 +539,18 @@ if [ "${M3OS_SIMD_REGRESSION:-0}" = "1" ]; then
         exit 1
     fi
 fi
+
+# Phase 92 — VFS bulk-I/O throughput regression gate. Gated behind
+# M3OS_VFS_BULKIO_REGRESSION=1. Boots m3OS, `pkg install`s mbedtls, and asserts
+# the /proc/blkstats read_calls delta stayed under the batching threshold — the
+# regression guard for the contiguous-run coalescing (kernel + vfs_server), the
+# vfs_server write-through block cache, and the 64 KiB VFS_MAX_PREAD read cap.
+# Set this on branches that touch kernel/src/fs/ext2.rs, kernel/src/blk/, the
+# vfs_server ext2 read/write path, or the VFS read protocol (VFS_MAX_READ/PREAD).
+if [ "${M3OS_VFS_BULKIO_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask vfs-bulkio-smoke..."
+    if ! cargo xtask vfs-bulkio-smoke --timeout 1800; then
+        echo "pre-push: cargo xtask vfs-bulkio-smoke failed" >&2
+        exit 1
+    fi
+fi

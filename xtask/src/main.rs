@@ -241,6 +241,14 @@ const SMOKE_EXIT_GO_SMOKE_FAILED: i32 = 79;
 /// token those arms are skip-with-reason (a secret can never live in repo/CI).
 const SMOKE_EXIT_GH_SMOKE_FAILED: i32 = 80;
 
+/// Phase 92 — `cargo xtask vfs-bulkio-smoke` exit code. Boots m3OS, reads
+/// `/proc/blkstats` before + after a `pkg install` of a multi-MiB package
+/// (whose `.m3pkg` is read in 256 KiB chunks → coalesced into multi-block
+/// `read_sectors` by Track B.1), and asserts the block-request count for that
+/// read stayed under the batching threshold — the regression guard that the
+/// contiguous-run coalescing did not silently revert to per-block round-trips.
+const SMOKE_EXIT_VFS_BULKIO_FAILED: i32 = 81;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
     Headless,
@@ -829,6 +837,21 @@ fn main() {
                     std::process::exit(1);
                 });
             cmd_go_runtime_smoke(&smoke_args);
+        }
+        // Phase 92 — VFS bulk-I/O throughput gate. Boots m3OS, reads
+        // /proc/blkstats before + after a `pkg install` of a multi-MiB package
+        // (read in 256 KiB chunks → coalesced into multi-block read_sectors by
+        // Track B.1), and asserts the block-request count for that read stayed
+        // under the batching threshold (a regression to per-block round-trips
+        // would blow past it).
+        Some("vfs-bulkio-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("vfs-bulkio-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_vfs_bulkio_smoke(&smoke_args);
         }
         // Phase 85d — Clang/LLVM/LLD toolchain smoke. Builds the image with the
         // opt-in `M3OS_WITH_CLANG` feature (bundling the heavyweight clang
@@ -14706,6 +14729,195 @@ fn gh_smoke_steps(
             label: "gh-smoke: authenticated write over HTTPS succeeded (gh issue create exit 0)",
         });
     }
+
+    steps
+}
+
+/// Phase 92 — `cargo xtask vfs-bulkio-smoke`.
+///
+/// Proves the Track B.1 contiguous-run batching end-to-end: it reads
+/// `/proc/blkstats` (the Track A counters) before and after a `pkg install` of a
+/// multi-MiB, dependency-free package (`mbedtls`, ~3.8 MiB, bundle-only on the
+/// default image). `pkg` reads the `.m3pkg` in 256 KiB chunks, so each
+/// `read_file_data` call spans 64 blocks and coalesces into ONE `read_sectors`
+/// per contiguous run — the `read_calls` delta for that read must stay well
+/// under the per-block count (~960+ for a 3.8 MiB file). A regression to
+/// per-block round-trips would blow past the threshold and fail the gate.
+fn cmd_vfs_bulkio_smoke(args: &SmokeBootArgs) {
+    // The package to install + read. Dependency-free + bundle-only (not
+    // pre-installed) so the install reads its `.m3pkg` fresh off the data disk.
+    const PKG: &str = "mbedtls";
+    // Regression guard for the read-side throughput work. A `pkg install` is NOT
+    // a pure read: ext2 metadata updates are sub-block (one allocation-bitmap
+    // bit, one directory entry, one inode in a shared table block), so each write
+    // is a read-modify-write of the whole block. Measured `read_calls` for this
+    // ~3.8 MiB install at each stage:
+    //   * pre-Phase-92 (uncached vfs_server, 4 KiB per-block reads):   ~36,200
+    //   * + block cache (invalidate-on-write) + 64 KiB cap + coalescing: ~8,900
+    //   * + write-through-update cache (RMW reads hit instead of re-read): ~4,300
+    // → ~8.4x fewer reads. The residual is cold working-set reads + the write side
+    // (~970 bitmap writes still happen — Track C.2 write-back would cut those).
+    // This threshold catches a regression of the cache POLICY (back to
+    // invalidate, ~8,900) or of the cache/cap/coalescing entirely (~36k); the
+    // tight coalescing correctness itself is proven by the kernel-core host tests.
+    const MAX_READ_CALLS_DELTA: u64 = 8_000;
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    // Fresh data disk so the package is un-installed and the block cache + pkg DB
+    // start clean (a warm cache would hide the device round-trips we measure).
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let qemu_args = qemu_args_with_devices(&uefi_image, &ovmf, display_mode, DeviceSet::default());
+
+    // Capture the full serial transcript so we can parse the two `read_calls`
+    // values in Rust (no fragile in-guest arithmetic). run_smoke_script dumps the
+    // serial history to this path on exit (success or failure) when the env var
+    // is set. SAFETY: xtask is single-threaded here.
+    let dump_path = uefi_image.parent().unwrap().join("vfs-bulkio-serial.txt");
+    let _ = fs::remove_file(&dump_path);
+    unsafe {
+        std::env::set_var("M3OS_SMOKE_SERIAL_DUMP", &dump_path);
+    }
+
+    let steps = vfs_bulkio_smoke_steps(PKG);
+    println!(
+        "vfs-bulkio-smoke: launching QEMU (timeout {}s, {} steps; measuring `pkg install {PKG}` read batching)",
+        args.timeout_secs,
+        steps.len()
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    let run_result = run_smoke_script(&mut child, &steps, global_timeout);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    if let Err(msg) = run_result {
+        eprintln!("vfs-bulkio-smoke: FAILED\n{msg}");
+        std::process::exit(SMOKE_EXIT_VFS_BULKIO_FAILED);
+    }
+
+    // Parse the two `read_calls N` lines (baseline, then post-install) from the
+    // captured serial. `cat /proc/blkstats` is the only thing that prints
+    // `read_calls`, so the first two matches are the before/after snapshots.
+    let transcript = fs::read_to_string(&dump_path).unwrap_or_default();
+    let read_calls: Vec<u64> = transcript
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("read_calls "))
+        .filter_map(|n| n.trim().parse::<u64>().ok())
+        .collect();
+    if read_calls.len() < 2 {
+        eprintln!(
+            "vfs-bulkio-smoke: FAILED — could not parse two `read_calls` snapshots from \
+             /proc/blkstats (found {}). Serial dump: {}",
+            read_calls.len(),
+            dump_path.display()
+        );
+        std::process::exit(SMOKE_EXIT_VFS_BULKIO_FAILED);
+    }
+    let (baseline, after) = (read_calls[0], read_calls[1]);
+    let delta = after.saturating_sub(baseline);
+    let elapsed = start.elapsed().as_secs();
+
+    println!(
+        "vfs-bulkio-smoke: `pkg install {PKG}` issued Δ {delta} block reads (read_calls {baseline} → {after})"
+    );
+    if delta > MAX_READ_CALLS_DELTA {
+        eprintln!(
+            "vfs-bulkio-smoke: FAILED — Δread_calls {delta} exceeds {MAX_READ_CALLS_DELTA}; the \
+             vfs_server block cache / 64 KiB read cap / contiguous-run coalescing appear to have \
+             regressed toward per-block, uncached reads (~36k baseline)."
+        );
+        std::process::exit(SMOKE_EXIT_VFS_BULKIO_FAILED);
+    }
+    println!(
+        "vfs-bulkio-smoke: PASSED — install read cost {delta} block requests (≤ {MAX_READ_CALLS_DELTA}; \
+         ~36k before the vfs_server write-through block cache + 64 KiB read cap + coalescing — a ~8x \
+         reduction; the residual is cold working-set + the write side, Track C.2) in {elapsed}s"
+    );
+}
+
+/// Serial script for `vfs-bulkio-smoke`: snapshot `/proc/blkstats`, install a
+/// multi-MiB package (reads its `.m3pkg` through the batched path), snapshot
+/// again. The two `read_calls` lines are parsed host-side from the serial dump.
+fn vfs_bulkio_smoke_steps(pkg: &'static str) -> Vec<SmokeStep> {
+    let install_cmd: &'static str = Box::leak(format!("pkg install {pkg}\n").into_boxed_str());
+    let ok_pattern: &'static str = Box::leak(format!("pkg install: {pkg}: OK").into_boxed_str());
+
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/vfs-bulkio-smoke: kernel first message",
+    }];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    // Baseline snapshot. `cat /proc/blkstats` prints the `read_calls N` line we
+    // parse host-side; the command text contains no `read_calls`, so only the
+    // output matches.
+    steps.push(SmokeStep::Send {
+        input: "cat /proc/blkstats\n",
+        label: "vfs-bulkio-smoke: baseline /proc/blkstats",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "read_calls ",
+        timeout_secs: 20,
+        label: "vfs-bulkio-smoke: baseline blkstats read",
+    });
+
+    // The measured operation: install reads the `.m3pkg` in 256 KiB chunks.
+    steps.push(SmokeStep::Send {
+        input: install_cmd,
+        label: "vfs-bulkio-smoke: pkg install (batched read of the .m3pkg)",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: ok_pattern,
+        fail_prefix: "pkg install: cannot",
+        timeout_secs: 1800,
+        label: "vfs-bulkio-smoke: package installed",
+        exit_code_on_fail: SMOKE_EXIT_VFS_BULKIO_FAILED,
+    });
+
+    // Post-install snapshot.
+    steps.push(SmokeStep::Send {
+        input: "cat /proc/blkstats\n",
+        label: "vfs-bulkio-smoke: post-install /proc/blkstats",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "write_calls ",
+        timeout_secs: 20,
+        label: "vfs-bulkio-smoke: post-install blkstats read",
+    });
 
     steps
 }
