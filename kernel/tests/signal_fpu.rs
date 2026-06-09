@@ -16,8 +16,16 @@
 //! - `FPU_AREA_SIZE > 0` (not accidentally zeroed)
 //!
 //! `sigframe_mc_fpstate_offset` — asserts the `fpstate` pointer sits at the
-//! expected offset within mcontext (176 bytes into mcontext, 224 bytes from
+//! expected offset within mcontext (184 bytes into mcontext, 232 bytes from
 //! frame base) to match the Linux `sigcontext` layout that musl reads.
+//!
+//! ## XSAVE header sanitizer negative test
+//!
+//! `xsave_header_sanitize_rejects_bad_fields` — feeds a buffer with all the
+//! fields that `xrstor64` would #GP on (XCOMP_BV bit 63 set, reserved header
+//! bytes non-zero, XSTATE_BV bits outside XCR0 mask 0x7, MXCSR reserved bits
+//! set) through `sanitize_xsave_header` and asserts each field is corrected.
+//! This is the TDD negative test for BLOCKER 1.
 //!
 //! ## FPU save/restore roundtrip (requires scheduler dispatch)
 //!
@@ -27,16 +35,25 @@
 //! Proves the kernel API correctly reads back the XSave area bytes after a
 //! save-and-restore cycle.
 //!
-//! # `#[ignore]` stubs
+//! ## XMM survives signal frame round-trip
 //!
-//! `xmm_survives_signal` — the end-to-end acceptance criterion (a user task
-//! fills XMM0–XMM3 with a known pattern, raises a signal whose handler
-//! clobbers XMM0–XMM3, returns via sigreturn, then asserts the values are
-//! bit-identical to the pre-signal values) cannot be driven from within a
-//! kernel task: it requires a ring-3 process with a registered signal
-//! handler and a full `setup_signal_frame` / `restore_sigframe` round-trip
-//! through the actual delivery path.  This test is kept as a documented
-//! placeholder for a future smoke-gate integration.
+//! `xmm_survives_signal` — runs inside a scheduler task.  Uses hand-encoded
+//! SSE asm bytes to write distinct 128-bit patterns to XMM0–XMM3 (the compiler
+//! cannot emit SSE on the soft-float kernel target, so raw `.byte` sequences
+//! are used), then calls the kernel's signal-frame FPU save/restore path:
+//!
+//!   1. `with_current_task_fpu_saved` — captures live XMM values (pre-signal
+//!      snapshot, as signal delivery would).
+//!   2. Hand-encoded SSE stores a different pattern into XMM0–XMM3 (simulates
+//!      the signal handler clobbering registers).
+//!   3. `restore_current_task_fpu_from_bytes` — restores from the snapshot
+//!      (as sigreturn would).
+//!   4. Hand-encoded SSE reads XMM0–XMM3 back and asserts bit-exact equality
+//!      with the pre-signal values.
+//!
+//! This exercises the exact kernel-side save/restore path that signal delivery
+//! and `sys_sigreturn` use; the ring-3 wrapper (a live user process with a
+//! real SA_SIGINFO handler) is the `signal-fpu-smoke` gate in Phase 86f Track C.
 //!
 //! Source ref: phase-86f-track-B.1
 
@@ -125,7 +142,7 @@ fn sigframe_fpu_layout_constants() {
     );
 }
 
-/// Verify that the fpstate pointer sits at offset 224 from frame base,
+/// Verify that the fpstate pointer sits at offset 232 from frame base,
 /// i.e. OFF_MCONTEXT (48) + MC_FPSTATE (184) = 232 within the frame.
 ///
 /// This offset is the Linux kernel / musl `sigcontext.fpstate` contract.
@@ -156,6 +173,123 @@ fn sigframe_mc_fpstate_offset() {
     assert!(
         expected_fpstate_field < fpu_offset_in_extended_frame,
         "fpstate pointer field must be before the FPU area it points to"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// BLOCKER 1 negative test — XSAVE header sanitizer
+// ---------------------------------------------------------------------------
+
+/// Phase 86f Track B.1 BLOCKER 1 — TDD negative test for `sanitize_xsave_header`.
+///
+/// Feeds a buffer containing all the fields that make `xrstor64` raise #GP in
+/// ring 0:
+///   - MXCSR (offset 24): reserved bits set above the MXCSR_MASK (0xFFBF)
+///   - XSTATE_BV (offset 512): bits outside XSAVE_FEATURE_MASK (0x7) set
+///   - XCOMP_BV (offset 520): bit 63 set (compacted format — faults with standard xrstor64)
+///   - Reserved header bytes (offsets 528–575): non-zero garbage
+///
+/// After sanitization every one of these must be corrected without changing the
+/// payload bytes (XMM region at 160–415).
+#[test_case]
+fn xsave_header_sanitize_rejects_bad_fields() {
+    use alloc::vec;
+    use kernel::arch::x86_64::cpuid::XSAVE_AREA_SIZE;
+    use kernel::arch::x86_64::cpuid::XSAVE_FEATURE_MASK;
+    use kernel::task::scheduler::sanitize_xsave_header;
+
+    let mut buf = vec![0u8; XSAVE_AREA_SIZE];
+
+    // Write a valid x87 CW and well-formed MXCSR_MASK first.
+    buf[0] = 0x7f;
+    buf[1] = 0x03; // x87 CW = 0x037F
+
+    // MXCSR (offset 24): set reserved bit 6 (should be cleared by sanitizer).
+    // Valid MXCSR bits: mask 0xFFBF (bit 6 is reserved on all x86_64).
+    let bad_mxcsr: u32 = 0x1F80 | (1u32 << 6); // 0x1FC0 — bit 6 is bad
+    buf[24..28].copy_from_slice(&bad_mxcsr.to_le_bytes());
+
+    // MXCSR_MASK (offset 28): use 0xFFBF (normal value).
+    let mxcsr_mask: u32 = 0xFFBF;
+    buf[28..32].copy_from_slice(&mxcsr_mask.to_le_bytes());
+
+    // Fill XMM region (offsets 160–415) with a distinctive payload.
+    for b in &mut buf[160..416] {
+        *b = 0xA5;
+    }
+
+    // XSTATE_BV (offset 512): set bits outside XSAVE_FEATURE_MASK (0x7),
+    // e.g., bit 8 (for a hypothetical AVX-512 component) to poison the header.
+    let bad_xstate_bv: u64 = 0x7 | (1u64 << 8);
+    buf[512..520].copy_from_slice(&bad_xstate_bv.to_le_bytes());
+
+    // XCOMP_BV (offset 520): bit 63 set — triggers compacted format in xrstor64
+    // and raises #GP with the standard non-compacted xrstor64 m3OS uses.
+    let bad_xcomp_bv: u64 = 1u64 << 63;
+    buf[520..528].copy_from_slice(&bad_xcomp_bv.to_le_bytes());
+
+    // Reserved header bytes (offsets 528–575): fill with garbage.
+    for b in &mut buf[528..576] {
+        *b = 0xFF;
+    }
+
+    // Sanitize.
+    sanitize_xsave_header(&mut buf);
+
+    // MXCSR must have reserved bit 6 cleared.
+    let mxcsr_after = u32::from_le_bytes(buf[24..28].try_into().unwrap());
+    assert_eq!(
+        mxcsr_after & !mxcsr_mask,
+        0,
+        "sanitize_xsave_header: MXCSR reserved bits not cleared: {:#010x}",
+        mxcsr_after,
+    );
+
+    // XSTATE_BV must be masked to XSAVE_FEATURE_MASK (0x7).
+    let xstate_bv_after = u64::from_le_bytes(buf[512..520].try_into().unwrap());
+    assert_eq!(
+        xstate_bv_after,
+        0x7 & XSAVE_FEATURE_MASK,
+        "sanitize_xsave_header: XSTATE_BV not masked to XSAVE_FEATURE_MASK: {:#018x}",
+        xstate_bv_after,
+    );
+
+    // XCOMP_BV must be zero.
+    let xcomp_bv_after = u64::from_le_bytes(buf[520..528].try_into().unwrap());
+    assert_eq!(
+        xcomp_bv_after, 0,
+        "sanitize_xsave_header: XCOMP_BV not cleared (was {:#018x})",
+        xcomp_bv_after,
+    );
+
+    // Reserved header bytes must be zeroed.
+    for (i, &b) in buf[528..576].iter().enumerate() {
+        assert_eq!(
+            b,
+            0,
+            "sanitize_xsave_header: reserved header byte at offset {} not zeroed (got {:#04x})",
+            528 + i,
+            b,
+        );
+    }
+
+    // Payload bytes must be unchanged.
+    for (i, &b) in buf[160..416].iter().enumerate() {
+        assert_eq!(
+            b,
+            0xA5,
+            "sanitize_xsave_header: XMM payload byte at offset {} corrupted (got {:#04x})",
+            160 + i,
+            b,
+        );
+    }
+
+    kernel::serial_println!(
+        "[signal-fpu-test] xsave_header_sanitize_rejects_bad_fields: PASS \
+         (mxcsr_after={:#010x} xstate_bv_after={:#018x} xcomp_bv_after={:#018x})",
+        mxcsr_after,
+        xstate_bv_after,
+        xcomp_bv_after,
     );
 }
 
@@ -278,39 +412,196 @@ fn fpu_save_restore_roundtrip() {
 }
 
 // ---------------------------------------------------------------------------
-// `#[ignore]` stub — end-to-end XMM-survives-signal
+// End-to-end XMM survives signal frame round-trip
 // ---------------------------------------------------------------------------
 
-/// Phase 86f Track B.1 end-to-end acceptance: a user task fills XMM0–XMM3
-/// with a known 128-bit pattern, installs a signal handler that clobbers
-/// XMM0–XMM3 with a different pattern, raises the signal mid-computation,
-/// and asserts after sigreturn that the XMM values are bit-identical to the
-/// pre-signal pattern.
+/// Aligned storage for SSE pattern data.  The kernel is soft-float so we
+/// cannot use `[u128; N]` layout with `movaps` directly — instead carry two
+/// `u64` halves per register and use raw-byte SSE asm.
+#[repr(C, align(16))]
+struct AlignedBuf16([u8; 64]); // 4 × 128-bit patterns
+
+impl AlignedBuf16 {
+    const fn zeroed() -> Self {
+        Self([0u8; 64])
+    }
+}
+
+/// Write known 128-bit patterns into XMM0–XMM3 using raw SSE asm bytes and
+/// return the patterns so the caller can compare after a restore cycle.
 ///
-/// This test requires:
-///   1. A ring-3 user process with a registered SA_SIGINFO signal handler.
-///   2. The kernel's `setup_signal_frame` / `restore_sigframe` FPU path to be
-///      live (delivered by Phase 86f Track B.1).
-///   3. The userspace target compiled with SSE (`+sse,+sse2`) so the binary
-///      emits `movaps` register operations (Track A).
+/// The kernel target forbids SSE register constraints, so we use raw `.byte`
+/// sequences to encode `movdqu xmmR, [rax]` (load from memory).
 ///
-/// Until a full QEMU smoke gate for userspace-simd is wired (Track C.3 of
-/// Phase 86f), this remains an `#[ignore]` stub documenting the intended
-/// assertion protocol.  The kernel-side path is exercised by
-/// `fpu_save_restore_roundtrip` above.
+/// Encoding: F3 0F 6F /r with ModRM=mod00, r/m=000 (rax):
+///   xmm0: F3 0F 6F 00
+///   xmm1: F3 0F 6F 08
+///   xmm2: F3 0F 6F 10
+///   xmm3: F3 0F 6F 18
+///
+/// Returns `[u8; 64]` — four 16-byte patterns for XMM0..XMM3 respectively.
+///
+/// # Safety
+///
+/// Caller must ensure the kernel has called `enable_xsave_state()` (i.e.,
+/// OSXSAVE is set and the SSE unit is usable).  This is guaranteed after
+/// `init_minimal_smp`.
+unsafe fn write_xmm_patterns(patterns: &AlignedBuf16) -> [u8; 64] {
+    let ptr = patterns.0.as_ptr();
+
+    // Each asm block loads one XMM register from the address in rax.
+    // xmm registers are not in the register allocator on the soft-float target
+    // so they need not be declared as outputs.
+    core::arch::asm!(
+        ".byte 0xF3, 0x0F, 0x6F, 0x00", // movdqu xmm0, [rax]
+        in("rax") ptr,
+        options(nostack, preserves_flags),
+    );
+    core::arch::asm!(
+        ".byte 0xF3, 0x0F, 0x6F, 0x08", // movdqu xmm1, [rax]
+        in("rax") ptr.add(16),
+        options(nostack, preserves_flags),
+    );
+    core::arch::asm!(
+        ".byte 0xF3, 0x0F, 0x6F, 0x10", // movdqu xmm2, [rax]
+        in("rax") ptr.add(32),
+        options(nostack, preserves_flags),
+    );
+    core::arch::asm!(
+        ".byte 0xF3, 0x0F, 0x6F, 0x18", // movdqu xmm3, [rax]
+        in("rax") ptr.add(48),
+        options(nostack, preserves_flags),
+    );
+
+    // Return a copy of the patterns we loaded.
+    patterns.0
+}
+
+/// Read XMM0–XMM3 into a 64-byte buffer.
+///
+/// movdqu [rax], xmmR  → F3 0F 7F /r with ModRM for [rax]:
+///   xmm0: F3 0F 7F 00
+///   xmm1: F3 0F 7F 08
+///   xmm2: F3 0F 7F 10
+///   xmm3: F3 0F 7F 18
+unsafe fn read_xmm_to_buf(out: &mut AlignedBuf16) {
+    let ptr = out.0.as_mut_ptr();
+    core::arch::asm!(
+        ".byte 0xF3, 0x0F, 0x7F, 0x00",
+        in("rax") ptr,
+        options(nostack, preserves_flags),
+    );
+    core::arch::asm!(
+        ".byte 0xF3, 0x0F, 0x7F, 0x08",
+        in("rax") ptr.add(16),
+        options(nostack, preserves_flags),
+    );
+    core::arch::asm!(
+        ".byte 0xF3, 0x0F, 0x7F, 0x10",
+        in("rax") ptr.add(32),
+        options(nostack, preserves_flags),
+    );
+    core::arch::asm!(
+        ".byte 0xF3, 0x0F, 0x7F, 0x18",
+        in("rax") ptr.add(48),
+        options(nostack, preserves_flags),
+    );
+}
+
+/// Phase 86f Track B.1 end-to-end acceptance: verify that the kernel's signal
+/// frame FPU save/restore path preserves XMM0–XMM3 across a signal-handler
+/// clobber.
+///
+/// Runs entirely in a kernel scheduler task using hand-encoded SSE asm bytes
+/// (the compiler cannot emit SSE for the soft-float kernel target).  Steps:
+///
+///   1. Write pattern-A (0x11...) into XMM0–XMM3 via raw SSE asm.
+///   2. Call `with_current_task_fpu_saved` — captures the live hardware
+///      FPU state into the task's XSaveArea (mirrors signal delivery).
+///   3. Write pattern-B (0xCC...) into XMM0–XMM3 (mimics handler clobber).
+///   4. Call `restore_current_task_fpu_from_bytes` with the saved bytes
+///      — restores the task's FPU to the pre-signal state (mirrors sigreturn).
+///   5. Read XMM0–XMM3 back and assert they equal pattern-A.
 #[test_case]
-#[ignore = "requires ring-3 SSE-capable user task + signal delivery — activate in Track C.3 smoke gate"]
 fn xmm_survives_signal() {
-    // Track C.3 activation pending: spawn a user task that does:
-    //
-    //   1. movaps xmm0, [pattern_a]   // fill XMM0–XMM3 with pattern A
-    //   2. raise(SIGUSR1)              // kernel delivers SIGUSR1
-    //   3. (handler) movaps xmm0, [pattern_b]  // clobber XMM0–XMM3 with B
-    //   4. (handler) return via sigreturn
-    //   5. movaps [check], xmm0       // read back
-    //   6. assert [check] == pattern_a // must equal pre-signal values
-    //
-    // The kernel-side implementation (this phase) saves/restores the XSaveArea
-    // on delivery/sigreturn; the signal handler running in ring 3 observes
-    // pattern A unchanged after returning from the handler.
+    use alloc::vec;
+    use kernel::arch::x86_64::cpuid::XSAVE_AREA_SIZE;
+
+    // Must run inside a scheduler task.
+    assert!(
+        kernel::task::scheduler::get_current_task_idx().is_some(),
+        "xmm_survives_signal must run inside a scheduled kernel task"
+    );
+
+    // Reset FPU state for a clean baseline.
+    kernel::task::scheduler::reset_current_task_fpu_state();
+
+    // Pattern A: all XMM0–XMM3 bytes = 0x11, 0x22, 0x33, 0x44 respectively.
+    let pattern_a = AlignedBuf16({
+        let mut b = [0u8; 64];
+        for x in &mut b[0..16] {
+            *x = 0x11;
+        }
+        for x in &mut b[16..32] {
+            *x = 0x22;
+        }
+        for x in &mut b[32..48] {
+            *x = 0x33;
+        }
+        for x in &mut b[48..64] {
+            *x = 0x44;
+        }
+        b
+    });
+
+    // Step 1: write pattern A into XMM0–XMM3.
+    let expected = unsafe { write_xmm_patterns(&pattern_a) };
+
+    // Step 2: save live FPU state (mirrors signal delivery).
+    let snapshot = kernel::task::scheduler::with_current_task_fpu_saved(|bytes| {
+        let mut copy = vec![0u8; bytes.len()];
+        copy.copy_from_slice(bytes);
+        copy
+    })
+    .expect("with_current_task_fpu_saved must succeed inside task");
+    assert_eq!(snapshot.len(), XSAVE_AREA_SIZE);
+
+    // Verify pattern A survived the xsave: XMM region at offsets 160–415.
+    assert_eq!(
+        &snapshot[160..176],
+        &expected[0..16],
+        "xmm_survives_signal: XMM0 pattern not captured by xsave"
+    );
+
+    // Step 3: write pattern B (0xCC) into XMM0–XMM3 — simulates handler clobber.
+    let pattern_b = AlignedBuf16({
+        let mut b = [0u8; 64];
+        for x in &mut b {
+            *x = 0xCC;
+        }
+        b
+    });
+    unsafe { write_xmm_patterns(&pattern_b) };
+
+    // Step 4: restore from pre-signal snapshot (mirrors sigreturn).
+    kernel::task::scheduler::restore_current_task_fpu_from_bytes(&snapshot);
+
+    // Step 5: read XMM0–XMM3 back and compare to pattern A.
+    let mut readback = AlignedBuf16::zeroed();
+    unsafe { read_xmm_to_buf(&mut readback) };
+
+    for reg in 0..4usize {
+        let off = reg * 16;
+        assert_eq!(
+            &readback.0[off..off + 16],
+            &expected[off..off + 16],
+            "xmm_survives_signal: XMM{} not restored after sigreturn-path restore \
+             (got {:?}, expected {:?})",
+            reg,
+            &readback.0[off..off + 16],
+            &expected[off..off + 16],
+        );
+    }
+
+    kernel::serial_println!("[signal-fpu-test] xmm_survives_signal: PASS");
 }

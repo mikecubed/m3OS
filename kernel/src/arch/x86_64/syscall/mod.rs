@@ -2448,7 +2448,9 @@ fn deliver_user_signal(
     let regs = unsafe { crate::signal::read_saved_user_regs(syscall_result) };
 
     // 2. Read and update the process's blocked_signals; check alt stack.
-    let (old_blocked, alt_stack_rsp) = {
+    // `alt_stack_region` carries (base, size) when the alt stack is active so
+    // we can bounds-check that the extended signal frame fits before writing it.
+    let (old_blocked, alt_stack_rsp, alt_stack_region) = {
         let mut table = crate::process::PROCESS_TABLE.lock();
         let proc = match table.find_mut(pid) {
             Some(p) => p,
@@ -2475,8 +2477,35 @@ fn deliver_user_signal(
         } else {
             None
         };
-        (old, alt_rsp)
+        let region = alt_rsp.map(|_| (proc.alt_stack_base, proc.alt_stack_size));
+        (old, alt_rsp, region)
     };
+
+    // Bounds-check the extended frame against the alt-stack region: the frame
+    // must fit entirely within [base, base+size).  If it does not, fail closed
+    // (fall through to the SIGSEGV kill path) rather than writing below the
+    // alt-stack region.
+    if let Some((base, size)) = alt_stack_region
+        && let Some(top) = alt_stack_rsp
+    {
+        // The frame occupies [frame_rsp, top) — conservatively estimate
+        // frame_rsp as top minus the extended frame size.
+        let frame_size = crate::signal::SIGFRAME_EXTENDED_SIZE as u64;
+        // Underflow-safe: if top < frame_size the subtraction would wrap.
+        let frame_rsp_est = top.saturating_sub(frame_size + 8); // +8 for alignment pad
+        if frame_rsp_est < base {
+            log::warn!(
+                "[p{}] signal {}: extended frame ({} bytes) overflows alt stack \
+                 [base={:#x}, size={}]; killing with SIGSEGV",
+                pid,
+                signum,
+                frame_size,
+                base,
+                size,
+            );
+            sys_exit(-11); // SIGSEGV
+        }
+    }
 
     // 3. Save the current task's live hardware FPU state so it can be
     //    embedded in the signal frame.  Signal delivery runs on the

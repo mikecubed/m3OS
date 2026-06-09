@@ -256,14 +256,19 @@ mod tests {
     /// Phase 86f Track B.2 — verify the AMD64 SysV ABI process-entry RSP
     /// alignment contract: given the auxv size from `build_layout`, the
     /// pointer-table computation in `setup_abi_stack_with_envp` must
-    /// produce RSP ≡ 8 (mod 16) at `_start`.
+    /// produce RSP ≡ 0 (mod 16) at `_start`.
+    ///
+    /// The m3OS `_start` stubs do `mov rdi, rsp; call entry` — for the callee
+    /// to see RSP ≡ 8 (mod 16) after the `call` push, `_start` must be entered
+    /// with RSP ≡ 0 (mod 16).  This is the SysV AMD64 process-entry contract
+    /// (psABI §3.4.1) required for SSE `movaps` stack spills.
     ///
     /// This is a pure-math mirror of the `debug_assert_eq!` added in
     /// `kernel/src/mm/elf.rs::setup_abi_stack_with_envp`.  We model the
     /// same arithmetic here so the host-test suite catches a misalignment
     /// regression without a QEMU boot.
     #[test]
-    fn rsp_at_start_is_8_mod_16() {
+    fn rsp_at_start_is_0_mod_16() {
         // Two representative cursor values after the AT_RANDOM write:
         // one 16-byte aligned, one 8-mod-16.
         for &start_cursor in &[0x7fff_fff0_u64, 0x7fff_fff8_u64] {
@@ -296,7 +301,7 @@ mod tests {
 
                 let mut cursor = start_cursor;
                 let target = cursor - table_bytes as u64;
-                if target % 16 != 8 {
+                if target % 16 != 0 {
                     cursor -= 8;
                 }
                 // Subtract the full table to reach argc position.
@@ -304,8 +309,8 @@ mod tests {
 
                 assert_eq!(
                     cursor % 16,
-                    8,
-                    "RSP not 8 mod 16: start_cursor={:#x} has_extras={} auxv_len={}",
+                    0,
+                    "RSP not 0 mod 16: start_cursor={:#x} has_extras={} auxv_len={}",
                     start_cursor,
                     extras.is_some(),
                     auxv.len(),

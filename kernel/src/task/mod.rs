@@ -294,6 +294,14 @@ impl XSaveArea {
         &self.bytes
     }
 
+    /// Phase 86f Track B.1 — return a mutable slice of the raw saved bytes.
+    ///
+    /// Used by `sanitize_xsave_header` after `copy_from_bytes` to patch the
+    /// header fields before `xrstor64`.
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes
+    }
+
     /// Phase 86f Track B.1 — overwrite the saved bytes from a slice.
     ///
     /// `src` must be exactly `XSAVE_AREA_SIZE` bytes; panics if not

@@ -701,7 +701,10 @@ pub unsafe fn setup_abi_stack_with_envp(
             at_random_ptr,
         );
 
-        // SysV AMD64 ABI: RSP at `_start` must be 8 mod 16.
+        // SysV AMD64 ABI: RSP at `_start` must be 0 mod 16.
+        // m3OS `_start` stubs do `mov rdi, rsp; call entry` — so for the callee
+        // to see RSP ≡ 8 (mod 16) after the `call` push, `_start` must be entered
+        // with RSP ≡ 0 (mod 16).
         // Calculate the total size of the pointer table so we can align
         // BEFORE writing it, keeping argc/argv/envp contiguous.
         let auxv_slots = auxv_entries.len() * 2; // each entry = (key, value)
@@ -710,9 +713,9 @@ pub unsafe fn setup_abi_stack_with_envp(
         let argc_slot = 1;
         let total_slots = auxv_slots + envp_slots + argv_slots + argc_slot;
         let table_bytes = total_slots * 8;
-        // After subtracting table_bytes, cursor must be 8 mod 16.
+        // After subtracting table_bytes, cursor must be 0 mod 16.
         let target = cursor - table_bytes as u64;
-        if target % 16 != 8 {
+        if !target.is_multiple_of(16) {
             cursor -= 8; // alignment pad goes ABOVE the auxv
         }
 
@@ -757,15 +760,15 @@ pub unsafe fn setup_abi_stack_with_envp(
         (kptr as *mut u64).write(argv.len() as u64);
 
         // Phase 86f Track B.2 — assert the ABI contract: at `_start` RSP must
-        // satisfy (RSP + 8) ≡ 0 (mod 16), i.e. RSP ≡ 8 (mod 16).  This is
-        // the SysV AMD64 process-entry requirement (psABI §3.4.1): the first
-        // `call` from `_start` pushes 8 bytes, leaving the callee with a
-        // 16-byte-aligned RSP — the minimum for SSE `movaps` stack spills.
+        // be 0 mod 16.  The m3OS `_start` stubs do `mov rdi, rsp; call entry`,
+        // so the callee sees RSP ≡ 8 (mod 16) after `call` — the SysV AMD64
+        // requirement (psABI §3.4.1) for SSE `movaps` stack spills.  The kernel
+        // must therefore hand `_start` a 16-byte-aligned RSP pointing at argc.
         // Fires only in debug builds; release builds skip it with zero cost.
         debug_assert_eq!(
             cursor % 16,
-            8,
-            "setup_abi_stack_with_envp: RSP {:#x} is not 8 mod 16 at _start (SysV AMD64 ABI violation)",
+            0,
+            "setup_abi_stack_with_envp: RSP {:#x} is not 0 mod 16 at _start (SysV AMD64 ABI violation)",
             cursor,
         );
 
