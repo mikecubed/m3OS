@@ -382,28 +382,37 @@ fn extract_pid_from_status(text: &str, name: &str) -> Option<i32> {
 ///   0 — SIGKILL delivered successfully
 ///   1 — service not found, not running, or kill(2) failed
 fn cmd_kill(name: &str) -> i32 {
-    let mut buf = [0u8; 4096];
-    let n = read_file(STATUS_PATH, &mut buf);
-    if n <= 0 {
-        write_str(STDERR_FILENO, "service: no status available\n");
-        return 1;
-    }
-    if n as usize >= buf.len() {
-        write_str(
-            STDERR_FILENO,
-            "service: status file too large or truncated\n",
-        );
-        return 1;
-    }
-    let text = match core::str::from_utf8(&buf[..n as usize]) {
-        Ok(s) => s,
-        Err(_) => {
-            write_str(STDERR_FILENO, "service: invalid UTF-8 in status file\n");
-            return 1;
+    // init rewrites /run/services.status with O_TRUNC + per-line write()s on
+    // every state transition, so a single read can race the rewrite and see a
+    // truncated file missing this service's line (observed intermittently in
+    // the e1000-restart-crash regression when a burst of driver exits rewrites
+    // the file around the kill). Retry across the rewrite window before
+    // declaring the service absent.
+    const KILL_STATUS_ATTEMPTS: u32 = 5;
+    let mut pid: Option<i32> = None;
+    let mut attempt = 0;
+    while attempt < KILL_STATUS_ATTEMPTS {
+        if attempt > 0 {
+            syscall_lib::nanosleep_for(0, 200_000_000); // 200 ms between reads
         }
-    };
+        attempt += 1;
 
-    let pid = match extract_pid_from_status(text, name) {
+        let mut buf = [0u8; 4096];
+        let n = read_file(STATUS_PATH, &mut buf);
+        if n <= 0 || n as usize >= buf.len() {
+            continue; // absent/oversized: re-read after the rewrite settles
+        }
+        let text = match core::str::from_utf8(&buf[..n as usize]) {
+            Ok(s) => s,
+            Err(_) => continue, // torn mid-rewrite read
+        };
+        if let Some(p) = extract_pid_from_status(text, name) {
+            pid = Some(p);
+            break;
+        }
+    }
+
+    let pid = match pid {
         Some(p) => p,
         None => {
             write_str(STDERR_FILENO, "service: '");
