@@ -45,7 +45,7 @@ const DNS_SMOKE_NEEDLE: &[u8] = b"DNS_SMOKE:";
 const CONNECT_SMOKE_PATH: &[u8] = b"/bin/connect-smoke\0";
 const CONNECT_SMOKE_ARGV0: &[u8] = b"connect-smoke\0";
 const CONNECT_SMOKE_PASS_NEEDLE: &[u8] = b"CONNECT_SMOKE:PASS";
-// Phase 93 — ext2 cross-process read-coherence regression (Bug B). A full-musl
+// Phase 88 — ext2 cross-process read-coherence regression (Bug B). A full-musl
 // static binary that writes an ext2 file, churns unrelated ext2 metadata, then
 // reads the file back from a FRESHLY fork/exec'd process and asserts it sees the
 // new bytes. PASS is the load-bearing verdict; SKIP only when the binary is
@@ -199,7 +199,7 @@ fn program_main(_args: &[&str]) -> i32 {
     }
     pass("storage");
 
-    // Phase 93 — ext2 cross-process read-coherence regression (Bug B). Writes an
+    // Phase 88 — ext2 cross-process read-coherence regression (Bug B). Writes an
     // ext2 file, churns unrelated ext2 metadata, then reads it back from a fresh
     // fork/exec'd process and asserts the new bytes are visible. SKIP if the
     // binary is absent (musl toolchain missing at build); otherwise PASS is

@@ -1,7 +1,7 @@
-# Phase 87 - Node.js
+# Phase 89 - Node.js
 
 **Status:** Planned
-**Source Ref:** phase-87
+**Source Ref:** phase-89
 **Depends on:** Phase 37 (I/O Multiplexing) ✅, Phase 40 (Threading) ✅, Phase 42 (Crypto Primitives) ✅, Phase 76 (Dynamic Linker), Phase 85 (Cross-Compiled Toolchains), Phase 86 (Networking and GitHub)
 **Builds on:** Extends the post-1.0 developer platform into a heavier managed runtime with JIT, async I/O, and package-management expectations that stress more of the system than the earlier toolchain phases
 **Primary Components:** Node.js runtime build pipeline, libuv integration expectations, V8 memory behavior, npm packaging path, docs/nodejs-roadmap.md
@@ -88,7 +88,7 @@ The runtime only becomes strategically useful once the package path needed for l
 
 ## Learning Documentation Requirement
 
-- Create `docs/87-nodejs.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
+- Create `docs/89-nodejs.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
 - Explain the chosen Node configuration, runtime expectations, event-loop integration, npm path, and explicit non-goals.
 - Link the learning doc from `docs/README.md` when this phase lands.
 
@@ -109,7 +109,7 @@ The runtime only becomes strategically useful once the package path needed for l
 
 ## Companion Task List
 
-- Phase 87 task list — defer until implementation planning begins.
+- Phase 89 task list — defer until implementation planning begins.
 
 ## How Real OS Implementations Differ
 

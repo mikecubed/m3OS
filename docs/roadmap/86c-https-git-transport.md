@@ -75,7 +75,7 @@ The HTTPS git transport's security posture, recorded explicitly so a future read
 - **Wall-clock dependency.** Certificate validity (`notBefore`/`notAfter`) is meaningful only with a trustworthy clock — a hard dependency on Phase 86a Track B's build-date floor. Under `BOOT_EPOCH_SECS = 0` every cert reads "not yet valid" and TLS fails-closed for the *wrong* reason; 86c must not be validated against that clock.
 - **Entropy.** TLS session keys + X25519/ECDHE ephemerals come from the Phase 86a `sys_getrandom` CSPRNG via the mbedTLS `mbedtls_hardware_poll` shim — never a file-I/O entropy path (no `/dev/urandom` compiled in).
 - **Credentials: PAT only, plaintext-at-rest tradeoff.** GitHub rejects password-over-HTTPS, so authentication is a Personal Access Token used as the password. `/etc/gitconfig` sets `credential.helper = store`, which persists the token in `~/.git-credentials` as **plaintext** (mode 0600). This is the documented tradeoff: m3OS has no secret-service/keyring yet, so a PAT supplied for a clone is readable by anything running as that user. Tokens are supplied at clone time, never baked into the image, and the smoke gate **redacts** them from serial output. `~/.netrc` is the equivalent alternative.
-- **Deferred (intentionally out of scope).** No OCSP/CRL revocation checking; TLS session resumption / tickets are off; client certificates are unsupported; the stack is IPv4 / A-record only (no AAAA/IPv6 — Phase 89); only smart-HTTP is supported (the dumb-HTTP `git-http-fetch` walker is pruned-adjacent and unused). These match what a production stack would add and 86c deliberately does not.
+- **Deferred (intentionally out of scope).** No OCSP/CRL revocation checking; TLS session resumption / tickets are off; client certificates are unsupported; the stack is IPv4 / A-record only (no AAAA/IPv6 — Phase 91); only smart-HTTP is supported (the dumb-HTTP `git-http-fetch` walker is pruned-adjacent and unused). These match what a production stack would add and 86c deliberately does not.
 
 ## How This Builds on Earlier Phases
 
@@ -120,6 +120,6 @@ The HTTPS git transport's security posture, recorded explicitly so a future read
 - A pure-Rust rustls + RustCrypto TLS path — explicitly deferred; the blocking lift is the missing `p256`/`ecdsa`/`rustls`/`webpki` crates (none in `Cargo.lock`) plus `rustls-rustcrypto`'s do-not-use-in-production + std-leaning posture, and it would not serve the C git binary regardless.
 - The legacy dumb-HTTP transport (`git-http-fetch` over loose objects) — only smart-HTTP is supported.
 - TLS revocation (OCSP/CRL), session resumption/tickets, and client certificates.
-- IPv6 / AAAA HTTPS endpoints (the stack is IPv4 / A-record only — Phase 89).
+- IPv6 / AAAA HTTPS endpoints (the stack is IPv4 / A-record only — Phase 91).
 - Hardware-AES-NI-accelerated TLS crypto (Phase 86f); 86c runs on software ChaCha20-Poly1305.
 - Networked `pkg install` over HTTPS + ed25519 package signing (unblocked by 86c, tracked separately).

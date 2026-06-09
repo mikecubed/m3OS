@@ -2,7 +2,7 @@
 
 **Status:** Planned
 **Source Ref:** phase-95
-**Depends on:** Phase 91 (Dynamic C Runtime — `libc.so` for proc-macro `dlopen`), Phase 94 (Rust-cargo musl port class), Phase 85d ✅ (Clang/LLVM/LLD on-device precedent + large-exec / `pread64` kernel fixes), Phase 92 (VFS bulk-I/O — the large install), Phase 93 (VFS `stat` conformance), Phase 44 ✅ (Rust cross-compilation lineage)
+**Depends on:** Phase 93 (Dynamic C Runtime — `libc.so` for proc-macro `dlopen`), Phase 94 (Rust-cargo musl port class), Phase 85d ✅ (Clang/LLVM/LLD on-device precedent + large-exec / `pread64` kernel fixes), Phase 87 (VFS bulk-I/O — the large install), Phase 88 (VFS `stat` conformance), Phase 44 ✅ (Rust cross-compilation lineage)
 **Builds on:** Extends the Phase 44 → 94 "Rust runs in the OS" lineage from *running* host-cross-compiled Rust to *running the Rust toolchain itself* on-device. Reuses the Phase 85d Clang/LLVM/LLD delivery pattern (the project's only existing on-device native code generator) and the Phase 85a `.m3pkg` substrate. It is the Rust analog of Phase 85d, not of Phase 86d.
 **Primary Components:** `ports/lang/rust/Portfile`, `xtask/src/port_build.rs` (`build_rust`), the bundled `rust-lld` linker (or a `DEPS=clang` dependency on the Phase 85d LLD), a userspace Rust target spec + a prebuilt `std`/`core` sysroot, the `M3OS_WITH_RUST` image feature, the `rustc-smoke` / `cargo-smoke` gates
 
@@ -17,7 +17,7 @@ C/C++.
 
 A stretch milestone adds `cargo build` of a small **proc-macro-free** crate.
 Full `cargo` against the mainstream crate ecosystem (which is saturated with
-derive macros) and crates.io registry access are explicitly gated on Phase 91
+derive macros) and crates.io registry access are explicitly gated on Phase 93
 (a real `libc.so` for proc-macro `dlopen`) and a registry-fetch path, and are
 called out under *Deferred Until Later*.
 
@@ -68,7 +68,7 @@ code on the device. They share the `.m3pkg` substrate and nothing else.
   *self-hosting* the toolchain on the device (this phase), and why the latter is
   a categorically larger problem.
 - Why Rust **proc-macros** require the compiler to `dlopen` a shared object at
-  compile time, and therefore why a real `libc.so` (Phase 91) — not just the
+  compile time, and therefore why a real `libc.so` (Phase 93) — not just the
   dynamic-linker machinery (Phase 76, already done) — is a hard prerequisite for
   the mainstream crate ecosystem, even though the toolchain *binary* itself is
   static.
@@ -88,7 +88,7 @@ A new `build_rust()` dispatch in `xtask/src/port_build.rs`, paralleling
 `x86_64-unknown-linux-musl` `rustc` (and, for Area D, `cargo`). Upstream Rust
 ships a dynamically-linked toolchain, so this is a deliberate static build —
 the same constraint that forced static clang/python/go, because m3OS's
-`ld-musl` has no real `libc.so` until Phase 91. The host's own Rust toolchain
+`ld-musl` has no real `libc.so` until Phase 93. The host's own Rust toolchain
 is the build compiler (the analog of "host clang cross-compiles LLVM" in 85d).
 
 ### Area B — Bundled linker + sysroot relocation contract
@@ -110,12 +110,12 @@ is the build compiler (the analog of "host clang cross-compiles LLVM" in 85d).
 
 Prove that the installed `rustc` compiles a Rust source file to a native ELF
 on m3OS, links it via the bundled LLD, and runs it — the Rust analog of the
-Phase 85d `CLANG_C_OK` gate. This is achievable **without** Phase 91 as long as
+Phase 85d `CLANG_C_OK` gate. This is achievable **without** Phase 93 as long as
 the compiled program and its dependency graph use **no proc-macros** (the
 distribution sysroot's `std` is precompiled, so the milestone program links
 against rlibs and never asks `rustc` to `dlopen` anything).
 
-### Area D — `cargo` + proc-macros (gated on Phase 91) — stretch
+### Area D — `cargo` + proc-macros (gated on Phase 93) — stretch
 
 `cargo build` of a real crate almost always pulls a proc-macro crate
 (`serde_derive`, `thiserror`, …). A proc-macro is a `cdylib`/`dylib` `.so` that
@@ -125,7 +125,7 @@ undefined and the load fails. So:
 
 - A static `rustc` compiling **proc-macro-free** crates works after Areas A–C.
 - Anything using derive macros — i.e. most of the ecosystem — requires
-  **Phase 91** (`libc.so`) **and** loader TLS support first. This is the Rust
+  **Phase 93** (`libc.so`) **and** loader TLS support first. This is the Rust
   analog of the same "static-only because no `libc.so`" wall that clang, Python,
   and Go all hit, and it is hit harder here because proc-macros are pervasive.
 
@@ -160,12 +160,12 @@ the std sysroot) that `seal_package` strips and packs.
 
 The dynamic-linker *machinery* is already complete (Phase 76 → 76d: dlopen,
 PLT lazy resolve, GNU-hash, symbol versioning). What is missing — and what
-Phase 91 supplies — is a real `libc.so` for a loaded `.so` to bind its
+Phase 93 supplies — is a real `libc.so` for a loaded `.so` to bind its
 `malloc`/`memcpy`/`__errno_location` relocations against, plus the loader
 extensions a real libc forces that the synthetic test `.so`s never exercised:
 **TLS** (general-dynamic, `TPOFF`/`DTPMOD`), copy relocations, and IFUNC. TLS is
-the dominant risk inside Phase 91 — it is unstarted, has no owning phase, and is
-required by both `__libc_start_main` and all of Rust `std`. Until Phase 91 lands
+the dominant risk inside Phase 93 — it is unstarted, has no owning phase, and is
+required by both `__libc_start_main` and all of Rust `std`. Until Phase 93 lands
 TLS + `libc.so`, on-device Rust is limited to proc-macro-free compilation.
 
 ### The linker (reused)
@@ -189,14 +189,14 @@ the **streaming ELF exec loader** + `DiskElfSource` (binaries far larger than
 the kernel heap; 512 MiB cap), **`pread64`/`pwrite64`** ("THE compile blocker"
 for LLVM-class positional I/O), `getrlimit`/`prlimit64`, and the `fstat`
 inode-identity fix (recursive-include dedup; the residual systemic pass is
-Phase 93). The "binary exceeds the kernel heap" class is permanently closed.
+Phase 88). The "binary exceeds the kernel heap" class is permanently closed.
 
 ### Alternative bootstrap: `mrustc` (smaller, no LLVM, no proc-macro `dlopen`)
 
 If "compile *some* Rust on-device" is acceptable short of the full toolchain,
 `mrustc` (a C++ Rust-subset compiler that emits C and needs no LLVM) is a far
 smaller on-device target and sidesteps proc-macro `dlopen` for its bootstrap
-subset. It is a legitimate first cut that does not depend on Phase 91, at the
+subset. It is a legitimate first cut that does not depend on Phase 93, at the
 cost of language-version and feature coverage. Recorded as an option, not the
 recommended path for a *general* Rust toolchain.
 
@@ -207,12 +207,12 @@ recommended path for a *general* Rust toolchain.
   positional I/O, rlimits, fstat identity) that running clang already forced.
 - **Reuses the Phase 85a** `.m3pkg`/pkgcache substrate and the `M3OS_WITH_*`
   opt-in image-feature pattern unchanged.
-- **Depends on Phase 91** for proc-macro support (the dynamic `libc.so` + loader
+- **Depends on Phase 93** for proc-macro support (the dynamic `libc.so` + loader
   TLS), which is the gate to the mainstream crate ecosystem.
 - **Depends on Phase 94** for the host-side Rust-cargo port-class plumbing and
   the userspace musl target lineage it establishes.
-- **Benefits from Phases 92 and 93**: the large install rides the VFS bulk-I/O
-  throughput work (92), and `cargo`/`build.rs` correctness benefits from the
+- **Benefits from Phases 87 and 88**: the large install rides the VFS bulk-I/O
+  throughput work (87), and `cargo`/`build.rs` correctness benefits from the
   `stat` conformance pass (93).
 - **Continues the Phase 44 → 94** "Rust in the OS" lineage by flipping it from
   host-compiled to device-compiled.
@@ -232,8 +232,8 @@ recommended path for a *general* Rust toolchain.
 5. **Packaging (Track E).** Portfile + `build_rust` + `build_recipe_id` arm;
    bundle behind `M3OS_WITH_RUST`; `pkg install rust`; `rustc-smoke` gate at a
    long `--timeout` (the multi-hundred-MB install + cold rustc load over the
-   slow ring-3 VFS — mitigated by Phase 92).
-6. **(Post-91, stretch) cargo + proc-macros (Track D).** Once Phase 91 ships
+   slow ring-3 VFS — mitigated by Phase 87).
+6. **(Post-91, stretch) cargo + proc-macros (Track D).** Once Phase 93 ships
    `libc.so` + loader TLS, bundle `cargo`, prove `cargo build` of a
    proc-macro-free crate, then a derive-macro crate via on-device `dlopen` of
    the proc-macro `.so`; `cargo-smoke` gate.
@@ -254,7 +254,7 @@ recommended path for a *general* Rust toolchain.
 - `rustc-smoke` PASSES end-to-end in CI under an opt-in
   `M3OS_RUST_REGRESSION=1` gate (skip-with-reason when the host Rust toolchain is
   absent, mirroring `clang-smoke` / `git-https-smoke`).
-- **Area D (post-91, may be a separate sub-phase):** with Phase 91's `libc.so` +
+- **Area D (post-91, may be a separate sub-phase):** with Phase 93's `libc.so` +
   loader TLS present, `cargo build` of a proc-macro-free crate succeeds
   on-device, and a derive-macro crate compiles via on-device `dlopen` of the
   proc-macro `.so` (`CARGO_PROCMACRO_OK`).
@@ -264,7 +264,7 @@ recommended path for a *general* Rust toolchain.
 ## Companion Task List
 
 - Phase 95 task list — defer until implementation planning begins (gated behind
-  the unbuilt Phase 91 prerequisite for the proc-macro half; the Area A–C half
+  the unbuilt Phase 93 prerequisite for the proc-macro half; the Area A–C half
   can be planned once Phase 94's port-class plumbing lands).
 
 ## How Real OS Implementations Differ
@@ -272,11 +272,11 @@ recommended path for a *general* Rust toolchain.
 - A real distro ships a **dynamic** `rustc`/`cargo` linked against the system
   `libc.so` and `librustc_driver.so`, installed via `rustup`/the package manager
   onto a writable root, with full crates.io registry access over TLS. m3OS must
-  build the toolchain **fully static** (no `libc.so` until Phase 91) and installs
+  build the toolchain **fully static** (no `libc.so` until Phase 93) and installs
   it offline from a bundled `.m3pkg`.
 - Real toolchains support proc-macros out of the box because the host always has
   a dynamic libc to `dlopen` a `.so` against; on m3OS that capability is a
-  distinct, sequenced prerequisite (Phase 91).
+  distinct, sequenced prerequisite (Phase 93).
 - Distros do not carry a separate bare-metal `no_std` floor; m3OS keeps its
   `x86_64-unknown-none` kernel/userspace lineage entirely separate from this
   userspace `x86_64-unknown-linux-musl` toolchain.
@@ -286,7 +286,7 @@ recommended path for a *general* Rust toolchain.
 
 ## Deferred Until Later
 
-- **Mainstream `cargo` + proc-macros** until Phase 91 ships `libc.so` + loader
+- **Mainstream `cargo` + proc-macros** until Phase 93 ships `libc.so` + loader
   TLS (the hard gate; may itself be split into a `95b` once 91 lands).
 - **crates.io registry access** (cargo HTTPS fetch wired to the Phase 86c TLS
   stack) and **`build.rs` with `cc`-crates** (on-device clang invocation).
@@ -294,7 +294,7 @@ recommended path for a *general* Rust toolchain.
   analog of clang self-hosting, itself still deferred in Phase 85d.
 - **Incremental compilation, parallel codegen, and performance** — correctness
   and "it compiles at all" come first; the slow ring-3 VFS makes performance a
-  Phase 92-dependent concern regardless.
+  Phase 87-dependent concern regardless.
 - **Remote debugging (gdb stub) for Rust programs.**
 - **A userspace SIMD-enabled target** for the toolchain's own code — orthogonal;
   see Phase 86f.

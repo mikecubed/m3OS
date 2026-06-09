@@ -93,7 +93,7 @@ The shell searches `/usr/local/bin` first. No shell change is needed; installing
 ## How Real OS Implementations Differ
 
 - A real distro ships uutils (or GNU coreutils) as the **base** `/usr/bin` set installed by the package manager onto a writable root, with no separate "ramdisk floor" — the initramfs and the installed root are the same userland lineage. m3OS keeps a distinct bare-metal `no_std` floor because its earliest boot predates the data-disk mount.
-- Distros build uutils dynamically against the system `libc.so`; m3OS must build it **fully static** because its `ld-musl` has no real `libc.so` (the same constraint that forced static Python in Phase 85c; lifted only by the future Phase 91 dynamic C runtime).
+- Distros build uutils dynamically against the system `libc.so`; m3OS must build it **fully static** because its `ld-musl` has no real `libc.so` (the same constraint that forced static Python in Phase 85c; lifted only by the future Phase 93 dynamic C runtime).
 - Real package managers resolve and update from a network repo with signatures; m3OS installs offline from a bundled `/usr/pkg/` with content-addressed `.m3pkg`s.
 
 ## Deferred Until Later
@@ -101,5 +101,5 @@ The shell searches `/usr/local/bin` first. No shell change is needed; installing
 - **Fully-offline vendored build.** A pre-vendored source tarball (uutils + `cargo vendor`) pinned by SHA-256 for hermetic, network-free, reproducible host builds. The first cut allows cargo to fetch crates during the host build (`--locked`).
 - **Promotion into the ramdisk.** Selectively replacing individual `no_std` floor applets with uutils is out of scope; this phase is coexist-only.
 - **SELinux / locale-heavy applets.** `chcon`/`runcon` and any applet depending on facilities m3OS lacks are excluded from the feature set, not stubbed.
-- **`stat`/inode-identity rigor.** uutils is stricter about `(st_dev, st_ino)` than the hand-built tools (e.g. `ls -i`, hardlink detection in `du`/`cp`), so it may surface the VFS `st_ino` inconsistency that **Phase 93** addresses; full correctness there rides on Phase 93.
+- **`stat`/inode-identity rigor.** uutils is stricter about `(st_dev, st_ino)` than the hand-built tools (e.g. `ls -i`, hardlink detection in `du`/`cp`), so it may surface the VFS `st_ino` inconsistency that **Phase 88** addresses; full correctness there rides on Phase 88.
 - **`findutils`/`diffutils`/other uutils projects.** Only `uutils/coreutils` is in scope; the Rust-cargo port class this phase establishes makes them straightforward follow-ons.

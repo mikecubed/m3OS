@@ -1,7 +1,7 @@
-# Phase 93 — VFS `stat` Conformance & ext2 Consolidation: Task List
+# Phase 88 — VFS `stat` Conformance & ext2 Consolidation: Task List
 
 **Status:** Planned
-**Source Ref:** phase-93
+**Source Ref:** phase-88
 **Depends on:** Phase 08 (Storage & VFS) ✅, Phase 28 (ext2) ✅, Phase 54 (vfs_server) ✅, Phase 18 (Directory VFS) ✅
 **Goal:** Make file metadata correct, complete, and consistent across every access path, and reconcile the two ext2 implementations so they cannot diverge. Implements the audit checklist from the post-mortem `docs/post-mortems/2026-06-06-vfs-fstat-inode-identity-and-ext2-dual-impl.md`.
 

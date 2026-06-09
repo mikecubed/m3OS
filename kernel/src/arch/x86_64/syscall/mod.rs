@@ -6493,7 +6493,7 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             let offset = entry.offset;
             let path = path.clone();
 
-            // Phase 93: when the vfs_server ext2 authority is registered, read
+            // Phase 88: when the vfs_server ext2 authority is registered, read
             // through it (VFS_PREAD by path) so a writer reading back its own
             // writable fd — or any reader after an out-of-band write — sees the
             // coherent vfs_server view, not a stale kernel block-cache snapshot.
@@ -7224,7 +7224,7 @@ pub(super) fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             }
             let data = &data[..copied];
 
-            // Phase 93: route the write to the vfs_server ext2 authority when
+            // Phase 88: route the write to the vfs_server ext2 authority when
             // it is registered, so a later read (this fd or any other process)
             // sees coherent bytes. Chunk to the reply-bulk cap; on transport
             // failure fall back to the in-kernel engine.
@@ -8465,7 +8465,7 @@ fn vfs_service_close(handle: u64) {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 93 — kernel-side clients for the ext2 write-authority IPC ops.
+// Phase 88 — kernel-side clients for the ext2 write-authority IPC ops.
 //
 // These make `vfs_server` the single ext2 owner: when the `vfs` service is
 // registered, mutating ext2 syscalls route here; otherwise the caller falls
@@ -9601,7 +9601,7 @@ fn open_ext2_file(
         return NEG_EISDIR;
     }
 
-    // Phase 93: when the vfs_server ext2 authority is registered, route the
+    // Phase 88: when the vfs_server ext2 authority is registered, route the
     // *mutations* (O_TRUNC of an existing file, O_CREAT of a new one) through
     // it BEFORE touching the kernel engine — and crucially before taking the
     // EXT2_VOLUME spinlock, since the IPC call blocks the task (holding a
@@ -13640,7 +13640,7 @@ pub(super) fn sys_symlinkat(target_ptr: u64, dirfd: u64, linkpath_ptr: u64) -> u
             let link_name = parts[parts.len() - 1];
             let (_, _, euid, egid) = current_process_ids();
 
-            // Phase 93: route ext2 symlink creation to the vfs_server authority
+            // Phase 88: route ext2 symlink creation to the vfs_server authority
             // when registered (before taking the EXT2_VOLUME spinlock).
             if vfs_write_routable() {
                 let name_start = resolved.len() - link_name.len();
@@ -13803,7 +13803,7 @@ pub(super) fn sys_linkat(
         return NEG_EROFS;
     };
 
-    // Phase 93: route ext2 hard-link to the vfs_server authority when
+    // Phase 88: route ext2 hard-link to the vfs_server authority when
     // registered (before taking the EXT2_VOLUME spinlock).
     if vfs_write_routable() {
         let parts: alloc::vec::Vec<&str> = new_rel.split('/').filter(|s| !s.is_empty()).collect();
@@ -14003,7 +14003,7 @@ pub(super) fn sys_linux_mkdir(path_ptr: u64, mode: u64) -> u64 {
         }
     }
 
-    // Phase 93: route ext2 mkdir to the vfs_server authority when registered
+    // Phase 88: route ext2 mkdir to the vfs_server authority when registered
     // (before taking the EXT2_VOLUME spinlock — the IPC blocks the task).
     if crate::fs::ext2::is_mounted()
         && vfs_write_routable()
@@ -14183,7 +14183,7 @@ pub(super) fn sys_linux_rmdir(path_ptr: u64) -> u64 {
         }
     }
 
-    // Phase 93: route ext2 rmdir to the vfs_server authority when registered.
+    // Phase 88: route ext2 rmdir to the vfs_server authority when registered.
     if crate::fs::ext2::is_mounted()
         && vfs_write_routable()
         && let Some(rel) = ext2_root_path(name)
@@ -14268,7 +14268,7 @@ pub(super) fn sys_linux_unlink(path_ptr: u64) -> u64 {
         }
     }
 
-    // Phase 93: route ext2 unlink to the vfs_server authority when registered
+    // Phase 88: route ext2 unlink to the vfs_server authority when registered
     // AND no open fd aliases the target inode. When a fd still aliases it
     // (delete-on-close), the in-kernel engine below is used: it correctly
     // DEFERS inode/block reclamation until the last close (its
@@ -14495,7 +14495,7 @@ pub(super) fn sys_linux_rename(old_ptr: u64, new_ptr: u64) -> u64 {
         }
     }
 
-    // Phase 93: ext2 rename routes to the vfs_server authority when both paths
+    // Phase 88: ext2 rename routes to the vfs_server authority when both paths
     // live on the ext2 root and the service is registered. Cross-filesystem
     // renames (one side tmpfs/ext2) remain EXDEV/EROFS as before.
     if crate::fs::ext2::is_mounted()
@@ -14833,7 +14833,7 @@ pub(super) fn sys_linux_ftruncate(fd: u64, length: u64) -> u64 {
         } => {
             let path = path.clone();
             let inode_num = *inode_num;
-            // Phase 93: route ext2 ftruncate to the vfs_server authority when
+            // Phase 88: route ext2 ftruncate to the vfs_server authority when
             // registered (coherent), else fall back to the in-kernel engine.
             if vfs_write_routable() {
                 match vfs_service_truncate(&path, length) {

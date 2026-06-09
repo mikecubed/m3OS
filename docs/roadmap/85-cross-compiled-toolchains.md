@@ -173,5 +173,5 @@ The toolchains matter only if they fit the supported developer workflow on m3OS 
 - Networked git operations and GitHub integration — Phase 86.
 - Python package installation (`pip`) and networking-heavy modules (`ssl`, `socket` DNS, `asyncio`) — Phase 86.
 - Self-hosting the larger toolchains inside m3OS (building LLVM on m3OS) — beyond Phase 85.
-- Broader language/runtime stacks (Node.js, etc.) beyond the documented git/Python/Clang set — Phase 87+.
+- Broader language/runtime stacks (Node.js, etc.) beyond the documented git/Python/Clang set — Phase 89+.
 - Package signing-key management and a dependency solver — only a flat install model is in 85a scope.

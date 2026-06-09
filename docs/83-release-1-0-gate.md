@@ -107,8 +107,8 @@ Two decisions are recorded with evidence rather than asserted:
   the evidence trail, the honesty tiering, and the versioning posture.
 - A later phase will need to **freeze a public syscall/userspace ABI** before an actual
   SemVer `1.0.0` can be declared (the headline non-goal recorded here).
-- Later phases (84 Spectre/KPTI, 85 toolchains, 86 GitHub, 87 Node.js, 88 Claude Code,
-  89 IPv6/DHCPv6) are explicitly **1.x growth**, framed against this gate rather than
+- Later phases (84 Spectre/KPTI, 85 toolchains, 86 GitHub, 89 Node.js, 90 Claude Code,
+  91 IPv6/DHCPv6) are explicitly **1.x growth**, framed against this gate rather than
   allowed to hold the release hostage.
 - A dedicated **greeter render probe** (so the greeter row can graduate from
   `Experimental` to `Supported`) is a tracked follow-up, deliberately not built here.

@@ -1,11 +1,11 @@
-# Phase 92 — VFS Bulk-I/O Throughput & Fairness: Task List
+# Phase 87 — VFS Bulk-I/O Throughput & Fairness: Task List
 
 **Status:** 🟡 Read-side landed (Tracks A + B + E). `pkg install mbedtls` block reads **36,183 → 4,282 (~8.4x)**, validated by `vfs-bulkio-smoke` + smoke-test + regression. Tracks C (readahead/write-back), D (fairness), F (optional) remain.
-**Source Ref:** phase-92
+**Source Ref:** phase-87
 **Depends on:** Phase 08 (Storage & VFS) ✅, Phase 55b (Ring-3 Driver Hosting) ✅, Phase 85a (Package Infrastructure) ✅
 **Goal:** Make multi-megabyte VFS I/O fast and fair: coalesce ext2 block reads/writes into multi-block ring-3 driver requests, add readahead/write-back, and stop a bulk transfer from starving interactive clients — with `pkg install python` (21 MiB) as the motivating, measured case.
 
-> **As-built architectural finding (not anticipated by the design doc).** The design doc's "Primary Components" listed only the kernel `Ext2Fs::read_file_data`. In fact **userspace file reads (incl. `pkg install`) route through the ring-3 `vfs_server`** (the Phase 93 write authority) when the "vfs" service is registered — which has its **own** ext2 reader that was **uncached** and served **one 4 KiB block per `VFS_PREAD`**. The kernel `read_file_data` (Track B.1) is used by **exec / binary loading** + the fallback; the `pkg install` bottleneck was the vfs_server path. So the read-side fix spans BOTH readers + the VFS read protocol:
+> **As-built architectural finding (not anticipated by the design doc).** The design doc's "Primary Components" listed only the kernel `Ext2Fs::read_file_data`. In fact **userspace file reads (incl. `pkg install`) route through the ring-3 `vfs_server`** (the Phase 88 write authority) when the "vfs" service is registered — which has its **own** ext2 reader that was **uncached** and served **one 4 KiB block per `VFS_PREAD`**. The kernel `read_file_data` (Track B.1) is used by **exec / binary loading** + the fallback; the `pkg install` bottleneck was the vfs_server path. So the read-side fix spans BOTH readers + the VFS read protocol:
 > - **Track B.1 (kernel)** — `kernel_core::fs::ext2::read_file_data_coalesced` coalesces contiguous runs (capped to the block driver's `MAX_SECTORS_PER_REQUEST`), wired into `Ext2Fs::read_file_data`. Host-tested. Speeds up exec/binary loads.
 > - **vfs_server read path (the actual `pkg install` fix)** — the same shared coalescer in `vfs_server`'s `read_file_data`, a **write-through block cache** on `Ext2State` (so the sub-block read-modify-write of allocation bitmaps / inode-table / directory blocks hits the cache instead of re-reading), and a **64 KiB `VFS_MAX_PREAD`** read cap (decoupled from the 4 KiB request buffer; the IPC bulk reply already carries up to 80 KiB).
 > - **Residual** is the write side (~970 bitmap writes per install) — the clean Track C.2 (write-back) follow-up.
@@ -118,7 +118,7 @@
 **Why it matters:** Locks in the throughput + fairness wins so a later change cannot silently regress them; mirrors the existing opt-in gate pattern.
 
 **Acceptance:**
-- [x] Boots m3OS, reads a ≥16 MiB file, and asserts the block-request count is ≤ a threshold and wall-clock ≤ a threshold (Track A counters). **As-built (reframed):** measures a `pkg install mbedtls` (~3.8 MiB read through the VFS) rather than a pure ≥16 MiB read — no shell tool reads with a ≥64 KiB buffer, so a pure-read measurement isn't available from the serial console; the install exercises the same coalesced read path + the cache. Asserts the `read_calls` delta ≤ 8,000 (~4,300 as-built, ~36,200 pre-Phase-92).
+- [x] Boots m3OS, reads a ≥16 MiB file, and asserts the block-request count is ≤ a threshold and wall-clock ≤ a threshold (Track A counters). **As-built (reframed):** measures a `pkg install mbedtls` (~3.8 MiB read through the VFS) rather than a pure ≥16 MiB read — no shell tool reads with a ≥64 KiB buffer, so a pure-read measurement isn't available from the serial console; the install exercises the same coalesced read path + the cache. Asserts the `read_calls` delta ≤ 8,000 (~4,300 as-built, ~36,200 pre-Phase-87).
 - [ ] Asserts interactive responsiveness during a concurrent bulk transfer (Track D probe). _Pending Track D (fairness) — not yet implemented._
 - [x] Added to `AGENTS.md`'s pre-push gate table behind an `M3OS_VFS_BULKIO_REGRESSION=1` env var. **As-built:** AGENTS.md row + `.githooks/pre-push` block + `cargo xtask vfs-bulkio-smoke`.
 
@@ -155,6 +155,6 @@
 ## Documentation Notes
 
 - This phase changes **no on-disk format** and **no block-protocol wire format** — it changes request *granularity* and *scheduling* in the kernel FS layer, plus an already-landed userspace baseline (`pkg` chunked read + progress, Phase 85c).
-- The motivating regression is `pkg install python` (Phase 85c); the heavy-I/O consumers are Phases 87 (Node.js) and 88 (Claude Code).
+- The motivating regression is `pkg install python` (Phase 85c); the heavy-I/O consumers are Phases 89 (Node.js) and 88 (Claude Code).
 - Prefer exact symbols: `Ext2Fs::read_file_data`, `blk::read_sectors`, `resolve_block`, `read_block_into_slice`.
 - Track A must land first — every other track's acceptance is stated in terms of its counters.

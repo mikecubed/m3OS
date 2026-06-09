@@ -189,7 +189,7 @@ kbd_server/mouse_server → rendered prompt.
 | `userspace/drivers/xhci/src/controller.rs` | xHCI register access, command/event TRB ring, DMA structures, interrupt-IN Normal-TRB enqueue/decode |
 | `userspace/drivers/xhci/src/enumerate.rs` | Live enumeration: implements `UsbHostOps` over real DMA rings; EP0 control transfers via Setup/Data/Status TRBs |
 | `userspace/drivers/xhci/src/server.rs` | IPC server: registers `usb`, `sys_notif_bind` IRQ wiring, `ipc_recv_msg` multiplex loop, device table |
-| `userspace/drivers/usbhub/src/main.rs` | Hub class driver — **Phase 78b stub**: logs, exercises the `kernel_core::usb::hub` classifier, and exits cleanly. Live external-hub `SetPortFeature(PORT_POWER)` / `PORT_RESET` + downstream enumeration is deferred to Phase 90 (USB Class Expansion) |
+| `userspace/drivers/usbhub/src/main.rs` | Hub class driver — **Phase 78b stub**: logs, exercises the `kernel_core::usb::hub` classifier, and exits cleanly. Live external-hub `SetPortFeature(PORT_POWER)` / `PORT_RESET` + downstream enumeration is deferred to Phase 92 (USB Class Expansion) |
 | `userspace/drivers/usb-hid/src/main.rs` | HID class daemon; Boot keyboard + mouse decode, `KBD_EVENT_INJECT`/`MOUSE_EVENT_INJECT` |
 | `userspace/lib/usb-core/src/protocol.rs` | `AttachNotice`/`UsbRequest`/`UsbReply` wire codec; `USB_SERVICE_NAME = "usb"` |
 | `kernel-core/src/usb/descriptor.rs` | USB descriptor model and parser (device/config/interface/endpoint); host-tested |

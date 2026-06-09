@@ -47,7 +47,7 @@ This is the architecture every sub-phase consumes; the per-sub-phase detail live
 - **CSPRNG.** Replace the xorshift `getrandom` with a Linux-`random.c`-style **ChaCha20 DRBG** (`kernel-core/src/csprng.rs`), seeded ≥256 credited bits from **RDSEED** (full-entropy) preferring over **RDRAND**, fast-key-erasure forward secrecy, reseeded on an interval, seeded **early** (right after `mm::init`, before `init_task`), with `GRND_RANDOM`/`GRND_NONBLOCK`/`GRND_INSECURE` honored and the 256-byte cap removed (but ≤256-byte atomicity preserved, because `sshd`'s `getrandom` consumer does not loop). ChaCha20's ARX core is pure-integer — **SIMD-off-safe** and host-testable. The legacy `Prng` is quarantined.
 - **Downstream entropy consumers.** `AT_RANDOM` (currently a deterministic `0xAB ^ i` pattern → identical stack canaries/ASLR across binaries) and the **TCP ISN** (currently `tick_count()` → hijackable) are switched to the CSPRNG.
 - **Wall-clock.** `init_rtc` gets a **build-date floor** instead of `0` on a bad RTC, so cert `notBefore`/`notAfter` checks fail-closed-but-sane rather than rejecting every certificate as future-dated.
-- **Resolver + trust paths.** The IPv4/A-record resolver path (`/etc/hosts` first, then a single-nameserver `/etc/resolv.conf` over the Phase 77 `sys_recvmsg_inet` UDP path) is validated; AAAA/IPv6 is explicitly scoped out (the stack is IPv4-only — Phase 89). A SHA-256-pinned **`ca-certificates` `.m3pkg`** stages the Mozilla root bundle to one canonical path (`/etc/ssl/certs/ca-certificates.crt`) that both `git`/`curl` and any other consumer agree on.
+- **Resolver + trust paths.** The IPv4/A-record resolver path (`/etc/hosts` first, then a single-nameserver `/etc/resolv.conf` over the Phase 77 `sys_recvmsg_inet` UDP path) is validated; AAAA/IPv6 is explicitly scoped out (the stack is IPv4-only — Phase 91). A SHA-256-pinned **`ca-certificates` `.m3pkg`** stages the Mozilla root bundle to one canonical path (`/etc/ssl/certs/ca-certificates.crt`) that both `git`/`curl` and any other consumer agree on.
 
 ### SSH transport (86b) — the elegant first secure clone
 
@@ -247,9 +247,9 @@ This belongs in Phase 86 (with the local git binary in Phase 85), **not** as a "
 
 - Full workstation-grade browser and GUI networking stack
 - Rich credential-helper ecosystems beyond a single documented mechanism
-- IPv6 / AAAA / dual-stack resolution — **Phase 89**
+- IPv6 / AAAA / dual-stack resolution — **Phase 91**
 - DNS caching, search domains, EDNS0, DNSSEC, and DNS-over-TCP fallback
 - TLS revocation (OCSP/CRL), session resumption/tickets, and client certificates
 - Networked `pkg install`/`update` over HTTPS + ed25519 package signing (unblocked here, tracked separately)
-- Broader language/runtime stacks beyond git/Go (`gh`) — Node.js is Phase 87
+- Broader language/runtime stacks beyond git/Go (`gh`) — Node.js is Phase 89
 - Self-hosting the Go toolchain inside m3OS (building Go on m3OS)

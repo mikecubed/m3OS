@@ -241,7 +241,7 @@ const SMOKE_EXIT_GO_SMOKE_FAILED: i32 = 79;
 /// token those arms are skip-with-reason (a secret can never live in repo/CI).
 const SMOKE_EXIT_GH_SMOKE_FAILED: i32 = 80;
 
-/// Phase 92 — `cargo xtask vfs-bulkio-smoke` exit code. Boots m3OS, reads
+/// Phase 87 — `cargo xtask vfs-bulkio-smoke` exit code. Boots m3OS, reads
 /// `/proc/blkstats` before + after a `pkg install` of a multi-MiB package
 /// (whose `.m3pkg` is read in 256 KiB chunks → coalesced into multi-block
 /// `read_sectors` by Track B.1), and asserts the block-request count for that
@@ -838,7 +838,7 @@ fn main() {
                 });
             cmd_go_runtime_smoke(&smoke_args);
         }
-        // Phase 92 — VFS bulk-I/O throughput gate. Boots m3OS, reads
+        // Phase 87 — VFS bulk-I/O throughput gate. Boots m3OS, reads
         // /proc/blkstats before + after a `pkg install` of a multi-MiB package
         // (read in 256 KiB chunks → coalesced into multi-block read_sectors by
         // Track B.1), and asserts the block-request count for that read stayed
@@ -2914,7 +2914,7 @@ fn build_musl_bins() {
         ("userspace/dns-smoke/dns-smoke.c", "dns-smoke"),
         // Phase 86b: non-blocking connect() / EINPROGRESS + poll + SO_ERROR.
         ("userspace/connect-smoke/connect-smoke.c", "connect-smoke"),
-        // Phase 93: ext2 cross-process read-coherence regression (Bug B).
+        // Phase 88: ext2 cross-process read-coherence regression (Bug B).
         (
             "userspace/ext2-coherence-smoke/ext2-coherence-smoke.c",
             "ext2-coherence-smoke",
@@ -7422,7 +7422,7 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 20,
         label: "guest/storage: smoke runner verified ext2 file lifecycle",
     });
-    // Phase 93 — ext2 cross-process read-coherence regression (Bug B). The
+    // Phase 88 — ext2 cross-process read-coherence regression (Bug B). The
     // smoke-runner execs `/bin/ext2-coherence-smoke`, which writes an ext2 file,
     // churns unrelated ext2 metadata, then reads it back from a FRESHLY
     // fork/exec'd process and asserts the new content is visible. PASS proves
@@ -14733,7 +14733,7 @@ fn gh_smoke_steps(
     steps
 }
 
-/// Phase 92 — `cargo xtask vfs-bulkio-smoke`.
+/// Phase 87 — `cargo xtask vfs-bulkio-smoke`.
 ///
 /// Proves the Track B.1 contiguous-run batching end-to-end: it reads
 /// `/proc/blkstats` (the Track A counters) before and after a `pkg install` of a
@@ -14752,7 +14752,7 @@ fn cmd_vfs_bulkio_smoke(args: &SmokeBootArgs) {
     // bit, one directory entry, one inode in a shared table block), so each write
     // is a read-modify-write of the whole block. Measured `read_calls` for this
     // ~3.8 MiB install at each stage:
-    //   * pre-Phase-92 (uncached vfs_server, 4 KiB per-block reads):   ~36,200
+    //   * pre-Phase-87 (uncached vfs_server, 4 KiB per-block reads):   ~36,200
     //   * + block cache (invalidate-on-write) + 64 KiB cap + coalescing: ~8,900
     //   * + write-through-update cache (RMW reads hit instead of re-read): ~4,300
     // → ~8.4x fewer reads. The residual is cold working-set reads + the write side
@@ -17634,7 +17634,7 @@ fn populate_ext2_files(
     // local names first (musl's getaddrinfo reads /etc/hosts before sending
     // a DNS query).  The IPv6 localhost alias is included so AF_INET6-aware
     // tools that happen to resolve "localhost" do not emit spurious NXDOMAIN
-    // queries; AAAA resolution for external names remains scoped out (Phase 89).
+    // queries; AAAA resolution for external names remains scoped out (Phase 91).
     let etc_hosts_content = "127.0.0.1\tlocalhost\n\
                              ::1\tlocalhost ip6-localhost\n";
 

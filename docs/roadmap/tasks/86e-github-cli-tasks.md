@@ -5,7 +5,7 @@
 **Depends on:** Phase 86c (HTTPS/TLS + CA + PAT) — see [86c-https-git-transport-tasks.md](./86c-https-git-transport-tasks.md), Phase 86d (Go runtime) — see [86d-go-runtime-tasks.md](./86d-go-runtime-tasks.md), Phase 86a (entropy/clock/DNS/CA bundle, transitively), Phase 85 (Cross-Compiled Toolchains) ✅, Phase 77 (DNS reply delivery + outbound TCP `connect`) ✅
 **Goal:** Ship `gh` (~40 MB Go) as a `.m3pkg` behind an `M3OS_WITH_GH` image feature, authenticate non-interactively via `GH_TOKEN`, register `gh` as a git credential helper (`gh auth setup-git`) so HTTPS `git` ops reuse the 86c curl + TLS + PAT machinery, validate authenticated read + write GitHub workflows over 86c HTTPS, document a native Rust GitHub-REST fallback, and bump the kernel to `0.86.4` — sitting strictly on top of 86c (transport) and 86d (runtime), with no new kernel surface.
 
-> **Authored ahead of implementation.** Every acceptance item below is intentionally unchecked `[ ]`; it records the planned, measurable result, not a delivered one. (Mirrors the `92-vfs-bulk-io` style.)
+> **Authored ahead of implementation.** Every acceptance item below is intentionally unchecked `[ ]`; it records the planned, measurable result, not a delivered one. (Mirrors the `87-vfs-bulk-io` style.)
 
 ## Track Layout
 

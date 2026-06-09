@@ -78,7 +78,7 @@
 - [x] A standalone `## Non-Goals and Known Limitations` section exists; every item is specific and bounded (names the exact missing capability) — vague phrasing like "not production-ready" is disallowed.
 - [x] The **"no frozen public syscall/userspace ABI"** limitation is listed explicitly as the headline reason 1.0 is a quality-bar milestone rather than a SemVer `1.0.0` (cross-refs the C.2 versioning posture).
 - [x] Concrete bounded non-goals are enumerated (e.g. NCQ, AHCI hot-plug/staggered-spin-up, IPv6/DHCPv6, SMP CPU hot-unplug, the QEMU-absent mt76 radio model, non-`Sata` AHCI signatures, GPU acceleration, **FAT32 writes — `fat_server` is a permanent ENOSYS stub (Phase 65); ext2 is the supported on-disk filesystem**), each with its one-line reason.
-- [x] Post-1.0 phases (84 Spectre/KPTI, 85 toolchains, 86 GitHub, 87 Node.js, 88 Claude Code, 89 IPv6/DHCPv6) are listed as explicit 1.x scope, **not** 1.0 blockers.
+- [x] Post-1.0 phases (84 Spectre/KPTI, 85 toolchains, 86 GitHub, 89 Node.js, 90 Claude Code, 91 IPv6/DHCPv6) are listed as explicit 1.x scope, **not** 1.0 blockers.
 
 ---
 

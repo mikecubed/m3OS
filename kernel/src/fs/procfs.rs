@@ -745,9 +745,9 @@ fn render_version() -> String {
     alloc::format!("m3OS version {}\n", env!("CARGO_PKG_VERSION"))
 }
 
-/// Phase 92 Track A — `/proc/blkstats`: the per-boot block-request counters.
+/// Phase 87 Track A — `/proc/blkstats`: the per-boot block-request counters.
 /// One `read_calls`/`write_calls` increment == one kernel↔driver round-trip;
-/// the `*_sectors` lines track 512-byte sectors moved. The Phase 92 batching
+/// the `*_sectors` lines track 512-byte sectors moved. The Phase 87 batching
 /// work is measured against `read_calls` (a 21 MiB / 16 MiB sequential read
 /// should issue far fewer requests once contiguous runs are coalesced).
 fn render_blkstats() -> String {

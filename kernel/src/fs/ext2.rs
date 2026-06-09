@@ -234,7 +234,7 @@ impl Ext2Volume {
             .map_err(|_| Ext2Error::IoError)
     }
 
-    /// Phase 92 Track B.1 — read `count` physically-contiguous WHOLE blocks
+    /// Phase 87 Track B.1 — read `count` physically-contiguous WHOLE blocks
     /// starting at physical block `start_block` directly into `dst`, in ONE
     /// `blk::read_sectors` round-trip. `dst.len()` must equal
     /// `count * block_size`. This is the coalesced bulk path: the blocks are
@@ -263,7 +263,7 @@ impl Ext2Volume {
         .map_err(|_| Ext2Error::IoError)
     }
 
-    /// Drop the entire read-through block cache (Phase 93).
+    /// Drop the entire read-through block cache (Phase 88).
     ///
     /// When `vfs_server` is the ext2 write authority, mutations land on disk
     /// out-of-band from this engine's cache. The kernel still reads ext2
@@ -404,7 +404,7 @@ impl Ext2Volume {
     /// Read file data from an inode starting at `offset` into `buf`.
     /// Returns the number of bytes actually read.
     ///
-    /// Phase 92 Track B.1 — coalesces runs of physically-contiguous whole blocks
+    /// Phase 87 Track B.1 — coalesces runs of physically-contiguous whole blocks
     /// into single multi-block `blk::read_sectors` calls (see
     /// `kernel_core::fs::ext2::read_file_data_coalesced`), collapsing the
     /// per-block kernel↔driver round-trips that dominate large sequential reads
@@ -1562,7 +1562,7 @@ pub fn unmount_ext2() {
     *EXT2_VOLUME.lock() = None;
 }
 
-/// Flush the kernel ext2 read cache (Phase 93).
+/// Flush the kernel ext2 read cache (Phase 88).
 ///
 /// Called by the syscall layer after it routes a mutating ext2 op to the
 /// `vfs_server` write authority, so the kernel's own metadata reads

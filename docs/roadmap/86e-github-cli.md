@@ -103,4 +103,4 @@ Documented (not the primary path): a small Rust client that issues raw HTTPS `GE
 - The umbrella learning doc `docs/86-networking-and-github.md` — owned by 86f.
 - `gh` extensions, `gh codespace`, `gh copilot`, and other large subcommand families beyond the read/write workflow subset.
 - Self-hosting the Go toolchain (building Go, or `gh`, inside m3OS) — umbrella-level deferral.
-- IPv6 / AAAA resolution of GitHub endpoints — Phase 89.
+- IPv6 / AAAA resolution of GitHub endpoints — Phase 91.

@@ -38,7 +38,7 @@ is built `NO_CURL NO_OPENSSL` — local repository workflows only. Python is a
 fully static interpreter with a non-networked stdlib — no `ssl`, no `pip`, no
 `ctypes`/`dlopen`. Clang is opt-in, X86-only, statically linked against
 musl + libc++, with no `opt`/`llc`/sanitizers and no self-hosting. The networked
-half of each tool is a deliberate Phase 86 (DNS + TLS) / Phase 91 (dynamic
+half of each tool is a deliberate Phase 86 (DNS + TLS) / Phase 93 (dynamic
 `libc.so`) handoff, not an oversight.
 
 ## What This Doc Covers
@@ -61,7 +61,7 @@ half of each tool is a deliberate Phase 86 (DNS + TLS) / Phase 91 (dynamic
 - **The disk / RAM budget** — why git and Python fit the default 1 GB image but
   Clang is feature-gated, and the host-build memory implications.
 - **Where the family stops** — the networked-transport and dynamic-linking
-  deferrals to Phases 86 and 91.
+  deferrals to Phases 86 and 93.
 
 ## Core Implementation
 
@@ -171,7 +171,7 @@ The interpreter is **fully static**: `MODULE_BUILDTYPE=static` makes every C
 extension a builtin (no `lib-dynload`/`dlopen`), and `-static` embeds musl libc.
 This is not a stylistic choice — m3OS's `ld-musl-x86_64.so.1` is a custom loader
 with **no real `libc.so` to load**, so a dynamic interpreter simply cannot run
-(this finding is exactly what motivates Phase 91). "Comprehensive stdlib" means
+(this finding is exactly what motivates Phase 93). "Comprehensive stdlib" means
 every C extension whose dependency is *already ported* is builtin: `zlib`/`gzip`
 against `ports/lib/zlib`; `_curses`/`_curses_panel` against the ported wide
 ncurses (the same archives less/htop/tmux link); and `hashlib` via the built-in
@@ -297,7 +297,7 @@ serial gate.
   integration are **Phase 86** (DNS + TLS). 85b is local-only.
 - **Python TLS/DNS, `pip`, and `asyncio`** are **Phase 86**; `ctypes`/`dlopen`
   and a *dynamic* `python3` with real `lib-dynload` `.so` extensions are
-  **Phase 91** (Dynamic C Runtime — m3OS needs a real `libc.so` first).
+  **Phase 93** (Dynamic C Runtime — m3OS needs a real `libc.so` first).
 - **Networked `pkg install`/`update` over HTTPS** from the hosted `m3os-pkgs`
   static repo, `/etc/pkg.d/` remote registration, and signed `.m3pkg`
   verification (populating the reserved ed25519 field) are **Phase 86**. 85a is
@@ -332,10 +332,10 @@ serial gate.
 - Networked `pkg install`/`update`, networked git, Python TLS/DNS/`pip`/`asyncio`,
   signed remote `.m3pkg` repos — Phase 86
 - `ctypes`/`dlopen` + a dynamic `python3` with real `lib-dynload` extensions,
-  and a real musl `libc.so` — Phase 91 (Dynamic C Runtime)
+  and a real musl `libc.so` — Phase 93 (Dynamic C Runtime)
 - Self-hosting LLVM inside m3OS; additional LLVM targets; `opt`/`llc`; runtime
   sanitizers; dynamic linking of the toolchain — beyond Phase 85
   (`docs/clang-llvm-roadmap.md` Stage 2)
 - Broader language/runtime stacks (Node.js, etc.) beyond git/Python/Clang —
-  Phase 87+
+  Phase 89+
 - Binary delta packages, transactional/atomic installs, and multiple repositories

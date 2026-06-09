@@ -5,7 +5,7 @@
 **Depends on:** Phase 86c (HTTPS/TLS — ship correctness on software crypto first), Phase 57e/60 (per-task FPU/XSAVE save/restore) ✅, Phase 85 (Cross-Compiled Toolchains) ✅, Phase 77 (Pre-1.0 Cleanup) ✅
 **Goal:** Flip the Rust userspace target from soft-float to an SSE/SSE2 (+AES) hardware-float target so `crypto-lib` and the 86b/86c crypto consumers get hardware AES-NI, while the kernel stays soft-float (no XMM in IRQ handlers); finish the signal-frame FPU save/restore path; verify `_start` RSP/auxv 16-byte alignment; re-validate the entire userspace tree against every gate; and — as the last Phase 86 sub-phase — cut the umbrella learning doc, reconcile the roadmap README, and bump the kernel to `0.86.5`.
 
-> **Authored ahead of implementation.** Every acceptance item below is intentionally unchecked `[ ]`; it records the planned, measurable result, not a delivered one. (Mirrors the `92-vfs-bulk-io-tasks.md` style.)
+> **Authored ahead of implementation.** Every acceptance item below is intentionally unchecked `[ ]`; it records the planned, measurable result, not a delivered one. (Mirrors the `87-vfs-bulk-io-tasks.md` style.)
 
 ## Track Layout
 

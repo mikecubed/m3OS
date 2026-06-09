@@ -1,9 +1,9 @@
-# Phase 93 - VFS `stat` Conformance & ext2 Dual-Implementation Consolidation
+# Phase 88 - VFS `stat` Conformance & ext2 Dual-Implementation Consolidation
 
 **Status:** Planned
-**Source Ref:** phase-93
+**Source Ref:** phase-88
 **Depends on:** Phase 08 (Storage & VFS) ✅, Phase 28 (ext2 Filesystem) ✅, Phase 54 (Deep Serverization / `vfs_server`) ✅, Phase 18 (Directory VFS) ✅
-**Builds on:** Hardens the filesystem **metadata** path (`stat` family + file identity) and removes the long-standing **two-independent-ext2-implementations** hazard (kernel `EXT2_VOLUME` vs the ring-3 `vfs_server`'s `Ext2State`). Adjacent to Phase 92 (VFS Bulk-I/O), which addresses the same layer's **throughput**; this phase addresses its **correctness/consistency**. No on-disk format change.
+**Builds on:** Hardens the filesystem **metadata** path (`stat` family + file identity) and removes the long-standing **two-independent-ext2-implementations** hazard (kernel `EXT2_VOLUME` vs the ring-3 `vfs_server`'s `Ext2State`). Adjacent to Phase 87 (VFS Bulk-I/O), which addresses the same layer's **throughput**; this phase addresses its **correctness/consistency**. No on-disk format change.
 **Primary Components:** `kernel/src/arch/x86_64/syscall/mod.rs` (the `stat` family + `vfs_service_stat_path` + `open_via_vfs`), `kernel/src/fs/ext2.rs`, `userspace/vfs_server/src/main.rs`, `kernel-core/src/fs/ext2.rs`, `kernel/src/process/mod.rs` (`FdBackend`)
 
 > **Origin:** Surfaced in Phase 85d (in-OS clang). See the post-mortem
@@ -83,7 +83,7 @@ collapsed `<stdio.h>` onto the open main source → recursive self-include. The 
   impact.
 
 **Out of scope**
-- Bulk-I/O *throughput* / readahead / write-back / fairness (that is Phase 92). Write-path
+- Bulk-I/O *throughput* / readahead / write-back / fairness (that is Phase 87). Write-path
   *correctness* (atomic `pwrite64`, above) is in scope here — the split is throughput→92,
   correctness→93.
 - On-disk ext2 format changes; writable-VFS *feature* growth (atomic `pwrite64` is a
@@ -113,8 +113,8 @@ collapsed `<stdio.h>` onto the open main source → recursive self-include. The 
 Phase 28 built the kernel ext2; Phase 54 moved the userspace-facing filesystem behind the
 ring-3 `vfs_server` (introducing the second ext2 implementation); Phase 18 built the
 directory VFS. This phase pays down the metadata/consistency debt those splits accrued,
-which Phase 85d made acute. It is complementary to Phase 92 (same layer, throughput) and a
-prerequisite-quality gate for the heavy-toolchain phases (87 Node.js, 88 Claude Code) that
+which Phase 85d made acute. It is complementary to Phase 87 (same layer, throughput) and a
+prerequisite-quality gate for the heavy-toolchain phases (89 Node.js, 90 Claude Code) that
 lean on `make`/`git`/`stat` correctness.
 
 ## Implementation Outline
@@ -160,7 +160,7 @@ lean on `make`/`git`/`stat` correctness.
 
 ## Companion Task List
 
-See [Phase 93 Tasks](./tasks/93-vfs-stat-and-ext2-consolidation-tasks.md).
+See [Phase 88 Tasks](./tasks/88-vfs-stat-and-ext2-consolidation-tasks.md).
 
 ## How Real OS Implementations Differ
 
@@ -180,4 +180,4 @@ a single filesystem server authoritative per mount. This phase moves m3OS toward
   obtain binaries through the VFS, or a kernel-only boot reader with a hard read-only
   contract). Tracked as a future decision.
 - Extended attributes, ACLs, `O_PATH`/`AT_EMPTY_PATH` corner cases, `st_birthtime`.
-- Performance work (Phase 92).
+- Performance work (Phase 87).

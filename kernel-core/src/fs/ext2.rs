@@ -500,12 +500,12 @@ pub fn inode_index_in_group(inode_num: u32, inodes_per_group: u32) -> u32 {
     (inode_num - 1) % inodes_per_group
 }
 
-/// Phase 92 Track B.1 — coalesced file-data read.
+/// Phase 87 Track B.1 — coalesced file-data read.
 ///
 /// Reads up to `buf.len()` bytes of file data starting at byte `offset`,
 /// **coalescing runs of physically-contiguous whole blocks into single
 /// multi-block device reads** instead of one device round-trip per logical
-/// block. This is the dominant Phase 92 throughput win: a 21 MiB file whose
+/// block. This is the dominant Phase 87 throughput win: a 21 MiB file whose
 /// blocks are laid out contiguously collapses from ~5,376 per-block reads to a
 /// small multiple of its contiguous-run count.
 ///
@@ -1004,7 +1004,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Phase 92 Track B.1 — coalesced read tests
+    // Phase 87 Track B.1 — coalesced read tests
     // -----------------------------------------------------------------------
 
     use core::cell::Cell;
@@ -1036,7 +1036,7 @@ mod tests {
         }
     }
 
-    /// Naive per-block reference reader — exactly the pre-Phase-92 loop shape.
+    /// Naive per-block reference reader — exactly the pre-Phase-87 loop shape.
     fn reference_read(file_size: u64, offset: u64, buf: &mut [u8]) -> usize {
         let bs = TEST_BS as u64;
         if offset >= file_size {
@@ -1065,7 +1065,7 @@ mod tests {
 
     /// Run the coalesced reader against the mocks, returning (bytes, output,
     /// run_calls, partial_calls). `run_calls` is the device-round-trip count the
-    /// Phase 92 acceptance is measured on.
+    /// Phase 87 acceptance is measured on.
     fn coalesced_read(file_size: u64, offset: u64, len: usize) -> (usize, Vec<u8>, usize, usize) {
         // A generous cap so the existing run-coalescing tests are unaffected; the
         // cap behaviour itself is covered by `coalesced_read_caps_run_length`.
@@ -1151,7 +1151,7 @@ mod tests {
             partials, 0,
             "no partial reads expected for an aligned whole-file read"
         );
-        // The whole-file read is FAR under the Phase 92 ≤512-request acceptance.
+        // The whole-file read is FAR under the Phase 87 ≤512-request acceptance.
         assert!(
             runs < 512,
             "run count {runs} must be well under the 512 ceiling"

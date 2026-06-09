@@ -4,7 +4,7 @@
 **Status:** Research / Evaluation — no code changes
 **Source Ref:** ext4-btrfs-feasibility
 **Date:** 2026-06-08
-**Related:** [`codebase-map.md`](./codebase-map.md), [`legacy-os-comparison.md`](./legacy-os-comparison.md), Phase 54 (ring-3 VFS migration), Phase 93 (ext2 ring-3 write authority)
+**Related:** [`codebase-map.md`](./codebase-map.md), [`legacy-os-comparison.md`](./legacy-os-comparison.md), Phase 54 (ring-3 VFS migration), Phase 88 (ext2 ring-3 write authority)
 
 ## Executive Summary
 

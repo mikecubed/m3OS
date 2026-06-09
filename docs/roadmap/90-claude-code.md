@@ -1,8 +1,8 @@
-# Phase 88 - Claude Code
+# Phase 90 - Claude Code
 
 **Status:** Planned
-**Source Ref:** phase-88
-**Depends on:** Phase 85 (Cross-Compiled Toolchains), Phase 86 (Networking and GitHub), Phase 87 (Node.js)
+**Source Ref:** phase-90
+**Depends on:** Phase 85 (Cross-Compiled Toolchains), Phase 86 (Networking and GitHub), Phase 89 (Node.js)
 **Builds on:** Uses the post-1.0 toolchain, networking, and Node runtime phases to run a modern CLI coding agent natively inside m3OS
 **Primary Components:** Node.js package installation path, CLI runtime environment, git and GitHub CLI integration, shell and terminal tooling, docs/claude-code-roadmap.md
 
@@ -53,7 +53,7 @@ Be explicit about what parts of the broader agent ecosystem are supported and wh
 
 | Check | Required state before closing the phase | If missing, add it to this phase |
 |---|---|---|
-| Runtime baseline | Phase 87 provides the documented Node/npm environment needed by the tool | Pull missing runtime or packaging work into this phase |
+| Runtime baseline | Phase 89 provides the documented Node/npm environment needed by the tool | Pull missing runtime or packaging work into this phase |
 | Developer-workflow baseline | Phases 85 and 86 provide the documented file, shell, git, and network capabilities | Add missing workflow support before claiming success |
 | Credential baseline | The platform has a documented way to handle the tool's credentials safely enough for the supported story | Add the missing credential-handling guidance or tooling |
 | Scope-discipline baseline | Optional integrations and protocol extensions are explicitly out of scope unless supported | Add the missing non-goal documentation here |
@@ -88,7 +88,7 @@ Cloud-connected developer tooling raises trust, secret-handling, and support-bou
 
 ## Learning Documentation Requirement
 
-- Create `docs/88-claude-code.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
+- Create `docs/90-claude-code.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
 - Explain the install path, runtime dependencies, file/shell/git integration, credential handling, and the exact supported workflow.
 - Link the learning doc from `docs/README.md` when this phase lands.
 
@@ -109,7 +109,7 @@ Cloud-connected developer tooling raises trust, secret-handling, and support-bou
 
 ## Companion Task List
 
-- Phase 88 task list — defer until implementation planning begins.
+- Phase 90 task list — defer until implementation planning begins.
 
 ## How Real OS Implementations Differ
 

@@ -3,7 +3,7 @@
 **Status:** Planned
 **Source Ref:** phase-76c
 **Depends on:** Phase 76 ✅, Phase 76b
-**Builds on:** Adds the runtime plugin-loading API (`dlopen`, `dlsym`, `dlclose`, `dlerror`) on top of the Phase 76b dependency-graph + relocation machinery. Required for Node.js native modules (Phase 87) and any application that loads backend implementations at runtime.
+**Builds on:** Adds the runtime plugin-loading API (`dlopen`, `dlsym`, `dlclose`, `dlerror`) on top of the Phase 76b dependency-graph + relocation machinery. Required for Node.js native modules (Phase 89) and any application that loads backend implementations at runtime.
 **Primary Components:** `userspace/ld-musl-x86_64.so.1/src/dl.rs`, `userspace/ld-musl-x86_64.so.1/src/handle.rs`, `userspace/dlopen_test/`
 
 ## Milestone Goal

@@ -1,7 +1,7 @@
-# Phase 92 - VFS Bulk-I/O Throughput & Fairness
+# Phase 87 - VFS Bulk-I/O Throughput & Fairness
 
 **Status:** Planned
-**Source Ref:** phase-92
+**Source Ref:** phase-87
 **Depends on:** Phase 08 (Storage & VFS) ✅, Phase 55b (Ring-3 Driver Hosting / `RemoteBlockDevice`) ✅, Phase 85a (Package Infrastructure) ✅
 **Builds on:** Extends the kernel VFS + ext2 read/write path and the kernel→ring-3 block-driver round-trip with request batching, readahead, write-back, and server fairness — without changing the on-disk format or the block protocol's isolation/safety model.
 **Primary Components:** `kernel/src/fs/ext2.rs`, `kernel/src/blk/mod.rs`, `kernel/src/fs/vfs.rs`, `kernel/src/fs/protocol.rs`, `userspace/pkg`
@@ -67,7 +67,7 @@ Where fairness lives: a single client's bulk read/write must not hold the VFS (o
 - Extends Phase 08's ext2 `read_file_data`/`read_block` with contiguous-run batching, readahead, and write-back.
 - Reuses Phase 55b's `RemoteBlockDevice` block protocol **unchanged** — same isolation model, just larger per-request transfers.
 - Reuses Phase 74's capability page-grant / `sys_shm` for the optional bulk-transfer path (Area D).
-- Motivated by Phase 85c (`pkg install python`) and a prerequisite for the heavy-I/O Phases 87 (Node.js) and 88 (Claude Code), which move far more data than Python.
+- Motivated by Phase 85c (`pkg install python`) and a prerequisite for the heavy-I/O Phases 89 (Node.js) and 88 (Claude Code), which move far more data than Python.
 
 ## Implementation Outline
 
@@ -88,7 +88,7 @@ Where fairness lives: a single client's bulk read/write must not hold the VFS (o
 
 ## Companion Task List
 
-- [Phase 92 Task List](./tasks/92-vfs-bulk-io-tasks.md)
+- [Phase 87 Task List](./tasks/87-vfs-bulk-io-tasks.md)
 
 ## How Real OS Implementations Differ
 
@@ -101,4 +101,4 @@ Where fairness lives: a single client's bulk read/write must not hold the VFS (o
 - A full unified page cache + general writeback subsystem (this phase does targeted readahead + write-back, not a global page cache).
 - Asynchronous queue-pair (SQ/CQ) block submission to the ring-3 driver — this phase batches *synchronous* requests; a full async ring is a later driver-side change.
 - Network-FS / IPv6 bulk paths.
-- Atomic `pwrite64` / write-path *correctness* — this phase is write-back *throughput*; positional-write correctness (`pwrite64` not mutating the shared fd offset) is a correctness concern tracked in **Phase 93**.
+- Atomic `pwrite64` / write-path *correctness* — this phase is write-back *throughput*; positional-write correctness (`pwrite64` not mutating the shared fd offset) is a correctness concern tracked in **Phase 88**.

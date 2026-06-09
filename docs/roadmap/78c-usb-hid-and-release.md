@@ -81,11 +81,11 @@ For a HID interface (`bInterfaceClass 0x03`), `SET_PROTOCOL(0)` selects fixed bo
 
 ## Deferred Until Later
 
-All deferrals below are assigned to **[Phase 90 — USB Class Expansion](./90-usb-class-expansion.md)** (post-1.0). The original 78c deltas (single-slot controller, host-test-only mouse, kbd_server-only smoke) were **closed** in the 78c "100%" pass — multi-slot now serves a keyboard **and** mouse simultaneously, live mouse is asserted end-to-end, and the `usb-smoke` gate screendump-verifies a typed USB key rendering at the focused term prompt.
+All deferrals below are assigned to **[Phase 92 — USB Class Expansion](./92-usb-class-expansion.md)** (post-1.0). The original 78c deltas (single-slot controller, host-test-only mouse, kbd_server-only smoke) were **closed** in the 78c "100%" pass — multi-slot now serves a keyboard **and** mouse simultaneously, live mouse is asserted end-to-end, and the `usb-smoke` gate screendump-verifies a typed USB key rendering at the focused term prompt.
 
-- USB Report Protocol live use (touchpads, gaming mice, multi-touch, keyboard LEDs) — skeleton host-tested only → **Phase 90**
-- External-hub multi-tier enumeration (devices behind a `usb-hub`); `usbhub` becomes a live `usb`-service consumer → **Phase 90**
-- USB hot-plug event surface to userspace (`AttachNotice attached=false`, dynamic re-enumeration) → **Phase 90**
-- USB mass storage (BBB/UAS bulk via the `PageGrant` transport), audio (UAC — HDA is the 1.0 audio bet, Phase 80), video (UVC) → **Phase 90**
-- Multi-controller concurrent IRQ servicing → **Phase 90**
-- USB-C / Power Delivery / DisplayPort alternate mode; xHCI Debug Capability → **Phase 90 (Deferred Until Later)**
+- USB Report Protocol live use (touchpads, gaming mice, multi-touch, keyboard LEDs) — skeleton host-tested only → **Phase 92**
+- External-hub multi-tier enumeration (devices behind a `usb-hub`); `usbhub` becomes a live `usb`-service consumer → **Phase 92**
+- USB hot-plug event surface to userspace (`AttachNotice attached=false`, dynamic re-enumeration) → **Phase 92**
+- USB mass storage (BBB/UAS bulk via the `PageGrant` transport), audio (UAC — HDA is the 1.0 audio bet, Phase 80), video (UVC) → **Phase 92**
+- Multi-controller concurrent IRQ servicing → **Phase 92**
+- USB-C / Power Delivery / DisplayPort alternate mode; xHCI Debug Capability → **Phase 92 (Deferred Until Later)**

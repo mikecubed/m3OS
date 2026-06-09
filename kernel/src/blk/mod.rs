@@ -28,11 +28,11 @@ pub use virtio_blk::VIRTIO_BLK_READY;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-/// Phase 92 Track A — per-boot block-request counters on the kernel↔driver
+/// Phase 87 Track A — per-boot block-request counters on the kernel↔driver
 /// round-trip. Every `read_sectors`/`write_sectors` call (one ring0↔ring3 IPC
 /// round-trip to the ring-3 block driver, or one VirtIO-blk request) increments
 /// the call counter; the sector counters track the bytes moved. These are the
-/// measurement the Phase 92 batching work is judged against — they make the
+/// measurement the Phase 87 batching work is judged against — they make the
 /// "21 MiB → ≤512 requests" acceptance falsifiable, and prove a batched read
 /// actually collapsed the round-trips. Compiled in unconditionally (cheap
 /// relaxed atomics), so the regression gate works on a release image. Read via
@@ -72,7 +72,7 @@ pub fn init() {
 /// by the driver).
 #[allow(dead_code)]
 pub fn read_sectors(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(), u8> {
-    // Phase 92 Track A — count the round-trip + sectors moved (one call == one
+    // Phase 87 Track A — count the round-trip + sectors moved (one call == one
     // kernel↔driver request, the cost the batching work collapses).
     BLK_READ_CALLS.fetch_add(1, Ordering::Relaxed);
     BLK_READ_SECTORS.fetch_add(count as u64, Ordering::Relaxed);
@@ -92,7 +92,7 @@ pub fn read_sectors(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(
 /// bulk buffer.
 #[allow(dead_code)]
 pub fn write_sectors(start_sector: u64, count: usize, buf: &[u8]) -> Result<(), u8> {
-    // Phase 92 Track A — count the round-trip + sectors moved.
+    // Phase 87 Track A — count the round-trip + sectors moved.
     BLK_WRITE_CALLS.fetch_add(1, Ordering::Relaxed);
     BLK_WRITE_SECTORS.fetch_add(count as u64, Ordering::Relaxed);
     if remote::is_registered() {

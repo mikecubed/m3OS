@@ -1,7 +1,7 @@
-# Phase 91 - Dynamic C Runtime (`libc.so` + shared objects)
+# Phase 93 - Dynamic C Runtime (`libc.so` + shared objects)
 
 **Status:** Planned
-**Source Ref:** phase-91
+**Source Ref:** phase-93
 **Depends on:** Phase 76 (Dynamic Linker) ✅, Phase 36 (Expanded Memory) ✅, Phase 85c (Python — surfaced the gap), the kernel syscall layer
 **Builds on:** Completes the dynamic-linking story begun in Phase 76: the linker *machinery* exists, but m3OS ships no dynamic C library for it to load, so real dynamic C programs (and runtime-`dlopen` users) cannot run. This phase provides the missing `libc.so` and the syscall coverage a dynamic libc needs.
 **Primary Components:** a real musl `libc.so` for m3OS (`userspace/ld-musl-x86_64.so.1/` loader, the kernel syscall surface), the `ports/lang/python` recipe (re-enable a dynamic build + real `lib-dynload`), `ctypes`, `docs/python-roadmap.md`
@@ -20,7 +20,7 @@ Consequences of the gap, all of which this phase unblocks:
 - **Real `lib-dynload`** — CPython's natural extension layout (`*.cpython-*.so` loaded by `dlopen`) instead of the all-static, frozen-`python312.zip` workaround Phase 85c shipped.
 - **`ctypes` / cffi** — runtime `dlopen` of arbitrary shared objects.
 - **pip C-extension wheels** — compiled wheels are shared objects loaded at runtime.
-- **Node.js native addons** (Phase 87) — `.node` files are `dlopen`ed shared objects.
+- **Node.js native addons** (Phase 89) — `.node` files are `dlopen`ed shared objects.
 - **A shared-library userland generally** — multiple programs sharing one mapped `libc.so` instead of each statically embedding a copy.
 
 ## Learning Goals
@@ -89,7 +89,7 @@ A static interpreter embeds libc and never performs a `libc.so` lookup, so it ru
 
 - Consumes Phase 76's dynamic linker (relocations, symbol resolution, `dlopen`) — the machinery that already works.
 - Builds on Phase 36's demand-paging/large-mmap baseline and the kernel syscall layer.
-- Directly lifts the Phase 85c deferral (dynamic `python3` + real `lib-dynload` + `ctypes`) and is a prerequisite for Phase 87 (Node.js native addons) and a fuller Python (`pip` C-extension wheels).
+- Directly lifts the Phase 85c deferral (dynamic `python3` + real `lib-dynload` + `ctypes`) and is a prerequisite for Phase 89 (Node.js native addons) and a fuller Python (`pip` C-extension wheels).
 
 ## Implementation Outline
 
@@ -101,7 +101,7 @@ A static interpreter embeds libc and never performs a `libc.so` lookup, so it ru
 
 ## Learning Documentation Requirement
 
-- Create `docs/91-dynamic-c-runtime.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
+- Create `docs/93-dynamic-c-runtime.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
 - Explain the loader-vs-libc split, the libc-provider decision, the syscall gap audit, and the dynamic-vs-static trade-offs CPython exposed.
 - Link it from `docs/README.md` when the phase lands.
 
@@ -123,7 +123,7 @@ A static interpreter embeds libc and never performs a `libc.so` lookup, so it ru
 
 ## Companion Task List
 
-- Phase 91 task list — defer until implementation planning begins.
+- Phase 93 task list — defer until implementation planning begins.
 
 ## How Real OS Implementations Differ
 
