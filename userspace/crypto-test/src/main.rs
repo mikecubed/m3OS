@@ -1,4 +1,9 @@
 //! Crypto integration test — exercises all crypto-lib primitives inside m3OS.
+//!
+//! Pass `--bench` as the first argument to run the AES-CTR + ChaCha20-Poly1305
+//! throughput microbenchmark instead of the correctness test suite.  The bench
+//! mode prints `BENCH:<name>:<MiB/s>` sentinel lines over stdout/serial so the
+//! automated smoke harness can scrape them.
 #![no_std]
 #![no_main]
 #![feature(alloc_error_handler)]
@@ -19,7 +24,15 @@ fn alloc_error(_layout: Layout) -> ! {
 
 syscall_lib::entry_point!(main);
 
-fn main(_args: &[&str]) -> i32 {
+fn main(args: &[&str]) -> i32 {
+    // Check for --bench flag.
+    let run_bench = args.contains(&"--bench");
+
+    if run_bench {
+        run_benchmarks();
+        return 0;
+    }
+
     let mut failures = 0;
     failures += test_sha256();
     failures += test_hmac();
@@ -37,6 +50,121 @@ fn main(_args: &[&str]) -> i32 {
         syscall_lib::write(1, b"crypto-test: some tests FAILED\n");
         1
     }
+}
+
+// ── Microbenchmark mode ──────────────────────────────────────────────────────
+
+/// Read CLOCK_MONOTONIC and return nanoseconds since the epoch.
+/// Returns 0 on error (clock unavailable — in that case callers should
+/// treat the measurement as "unavailable" and skip the bench output).
+fn clock_ns() -> u64 {
+    let (sec, nsec) = syscall_lib::clock_gettime(syscall_lib::CLOCK_MONOTONIC);
+    if sec < 0 {
+        return 0;
+    }
+    (sec as u64) * 1_000_000_000u64 + (nsec as u64)
+}
+
+/// Simple no_std u64 → ASCII decimal writer.
+fn write_u64(n: u64) {
+    if n == 0 {
+        syscall_lib::write(1, b"0");
+        return;
+    }
+    let mut buf = [b'0'; 20];
+    let mut i = 20usize;
+    let mut v = n;
+    while v > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    syscall_lib::write(1, &buf[i..]);
+}
+
+/// Print a `BENCH:<name>:<mib_tenths> MiB/s` sentinel line.
+/// `mib_tenths` is throughput in 1/10 MiB/s units (e.g. 1234 → 123.4 MiB/s).
+fn print_bench_line(name: &[u8], mib_tenths: u64) {
+    syscall_lib::write(1, b"BENCH:");
+    syscall_lib::write(1, name);
+    syscall_lib::write(1, b":");
+    write_u64(mib_tenths / 10);
+    syscall_lib::write(1, b".");
+    write_u64(mib_tenths % 10);
+    syscall_lib::write(1, b" MiB/s\n");
+}
+
+/// Run AES-256-CTR and ChaCha20-Poly1305 throughput benchmarks.
+///
+/// A fixed 256 KiB payload is encrypted for a fixed number of iterations.
+/// CLOCK_MONOTONIC is used for timing; if unavailable the benchmark is skipped.
+/// Output lines use the `BENCH:<name>:<MiB/s>` sentinel format that the C.3
+/// smoke gate will match with `Wait("BENCH:")` steps.
+fn run_benchmarks() {
+    use crypto_lib::symmetric::{aes256_ctr_encrypt, chacha20poly1305_seal};
+
+    syscall_lib::write(1, b"crypto-test: running benchmarks\n");
+
+    // Use a 256 KiB buffer so it fits comfortably in the userspace heap.
+    // Run enough iterations to make the timer resolution meaningful.
+    const BUF_SIZE: usize = 256 * 1024; // 256 KiB
+    const ITERATIONS: usize = 16; // 4 MiB total per cipher
+
+    let key = [0x60u8; 32];
+    let aes_nonce = [0xf0u8; 16];
+    let cc_nonce = [0x01u8; 12];
+    let aad = b"";
+
+    // Allocate plaintext and ciphertext buffers on the heap.
+    let plaintext = alloc::vec![0x5au8; BUF_SIZE];
+    let mut ct_aes = alloc::vec![0u8; BUF_SIZE];
+    let mut ct_cc = alloc::vec![0u8; BUF_SIZE + 16];
+
+    // ── AES-256-CTR bench ──────────────────────────────────────────────────
+    // Warm-up pass (primes the cpufeatures AES-NI detection and caches).
+    let _ = aes256_ctr_encrypt(&key, &aes_nonce, &plaintext, &mut ct_aes);
+
+    let t0 = clock_ns();
+    for _ in 0..ITERATIONS {
+        let _ = aes256_ctr_encrypt(&key, &aes_nonce, &plaintext, &mut ct_aes);
+    }
+    let t1 = clock_ns();
+
+    if t0 > 0 && t1 > t0 {
+        let elapsed_ns = t1 - t0;
+        let total_bytes = (BUF_SIZE * ITERATIONS) as u64;
+        // MiB/s * 10 = (bytes * 10) / (elapsed_ns / 1e9) / (1024*1024)
+        //            = (bytes * 10 * 1_000_000_000) / (elapsed_ns * 1024 * 1024)
+        let mib_tenths = (total_bytes * 10 * 1_000_000_000u64)
+            .checked_div(elapsed_ns * 1024 * 1024)
+            .unwrap_or(0);
+        print_bench_line(b"aes-ctr", mib_tenths);
+    } else {
+        syscall_lib::write(1, b"BENCH:aes-ctr:unavailable (clock error)\n");
+    }
+
+    // ── ChaCha20-Poly1305 bench ────────────────────────────────────────────
+    // Warm-up.
+    let _ = chacha20poly1305_seal(&key, &cc_nonce, &plaintext, aad, &mut ct_cc);
+
+    let t0 = clock_ns();
+    for _ in 0..ITERATIONS {
+        let _ = chacha20poly1305_seal(&key, &cc_nonce, &plaintext, aad, &mut ct_cc);
+    }
+    let t1 = clock_ns();
+
+    if t0 > 0 && t1 > t0 {
+        let elapsed_ns = t1 - t0;
+        let total_bytes = (BUF_SIZE * ITERATIONS) as u64;
+        let mib_tenths = (total_bytes * 10 * 1_000_000_000u64)
+            .checked_div(elapsed_ns * 1024 * 1024)
+            .unwrap_or(0);
+        print_bench_line(b"chacha20poly1305", mib_tenths);
+    } else {
+        syscall_lib::write(1, b"BENCH:chacha20poly1305:unavailable (clock error)\n");
+    }
+
+    syscall_lib::write(1, b"crypto-test: benchmarks complete\n");
 }
 
 fn test_sha256() -> i32 {
