@@ -6625,6 +6625,35 @@ fn prompt_suffix_end(buf: &str, prompt: &str) -> Option<usize> {
     Some(trimmed.len())
 }
 
+/// How long the serial console must stay quiet before a visible-but-not-trailing
+/// shell prompt is treated as matched. See [`idle_prompt_fallback_matches`].
+const PROMPT_IDLE_FALLBACK: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// Trailing-noise-tolerant fallback for the `# ` / `$ ` shell-prompt patterns.
+///
+/// The strict matcher ([`prompt_suffix_end`], used first inside
+/// [`find_serial_match`]) only fires when the captured buffer *ends with* the
+/// prompt. But after a command completes, asynchronous post-login log noise —
+/// `session_manager:`/`init:` driver-exit lines, `display_server:`/`term:`/
+/// `vfs_server:` startup chatter, sometimes byte-interleaved on the shared
+/// serial console — can land *after* the prompt, displacing it from the end so
+/// the strict matcher never matches (the CI flake this addresses). Once the
+/// console then goes quiet for [`PROMPT_IDLE_FALLBACK`], the shell is idle and
+/// waiting at the prompt regardless of the trailing noise, so a *substring*
+/// occurrence of the prompt is sufficient evidence.
+///
+/// This is an ADDITIVE fallback: it is consulted only after the strict matcher
+/// has already failed, and only for the two prompt patterns, so it can never
+/// change the no-trailing-noise fast path. `buf_has_prompt` is the caller's
+/// `stripped.contains(pattern)`; `idle` is time since the last serial byte.
+fn idle_prompt_fallback_matches(
+    pattern: &str,
+    buf_has_prompt: bool,
+    idle: std::time::Duration,
+) -> bool {
+    matches!(pattern, "# " | "$ ") && buf_has_prompt && idle >= PROMPT_IDLE_FALLBACK
+}
+
 /// Background serial output reader.
 ///
 /// Spawns a thread that reads from `stdout` and sends chunks over the channel.
@@ -6764,10 +6793,17 @@ fn run_smoke_script(
                 let global_deadline = global_start + global_timeout;
                 let deadline = step_deadline.min(global_deadline);
 
+                // Track console quiet for the idle-gated prompt fallback by the
+                // arrival time of the last serial byte (updated at BOTH receive
+                // points below). Tracking receipt — not `serial_buf.len()` — is
+                // robust to `append_serial_chunk`'s 64 KB ring-trim, which can hold
+                // the length steady while data still flows.
+                let mut last_change_at = std::time::Instant::now();
                 loop {
                     // Drain any available output.
                     while let Ok(chunk) = rx.try_recv() {
                         append_serial_chunk(&mut serial_buf, &mut serial_history, &chunk);
+                        last_change_at = std::time::Instant::now();
                     }
 
                     // Check for pattern in stripped output.  Also try with
@@ -6780,6 +6816,18 @@ fn run_smoke_script(
                         // Non-consuming: see `SmokeStep::Wait` doc. We deliberately
                         // do NOT drain through the match, so a later `Wait` for an
                         // earlier-arrived marker still observes its line.
+                        break;
+                    }
+
+                    // Additive fallback (only after the strict matcher failed): a
+                    // `# `/`$ ` prompt that appeared but was displaced from the
+                    // buffer end by trailing async log noise still counts once the
+                    // console has gone quiet. Non-consuming, as above.
+                    if idle_prompt_fallback_matches(
+                        pattern,
+                        stripped.contains(pattern),
+                        last_change_at.elapsed(),
+                    ) {
                         break;
                     }
 
@@ -6800,6 +6848,7 @@ fn run_smoke_script(
                     match rx.recv_timeout(std::time::Duration::from_millis(100)) {
                         Ok(chunk) => {
                             append_serial_chunk(&mut serial_buf, &mut serial_history, &chunk);
+                            last_change_at = std::time::Instant::now();
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -21134,11 +21183,10 @@ fn exit_group_teardown_steps() -> Vec<SmokeStep> {
         timeout_secs: 30,
         label: "thread-test exit_group teardown passed",
     });
-    steps.push(SmokeStep::Wait {
-        pattern: "# ",
-        timeout_secs: 30,
-        label: "shell prompt after thread-test exit_group",
-    });
+    // No trailing `# ` prompt wait: the `... PASS` marker above is the robust
+    // verdict. thread-test's exit_group teardown is exactly the kind of process-
+    // teardown that floods the serial console, which is what made a prompt-suffix
+    // sync here flaky.
     steps
 }
 
@@ -21218,9 +21266,12 @@ fn driver_restart_guest_steps() -> Vec<SmokeStep> {
     // Let nvme_driver finish init and stabilise before querying status.
     steps.push(SmokeStep::Sleep { millis: 3000 });
 
-    // Step 1 — verify nvme_driver is listed.
+    // Step 1 — verify nvme_driver is listed. Sync past the command with a
+    // `; /bin/echo MARKER:$?` exit-code marker (substring-matched, immune to the
+    // async driver-exit/restart serial flood this gate provokes) instead of a
+    // fragile `# ` prompt-suffix wait. The `:0` also asserts the command succeeded.
     steps.push(SmokeStep::Send {
-        input: "/bin/service status nvme_driver\n",
+        input: "/bin/service status nvme_driver ; /bin/echo __DRV_SYNC__:$?\n",
         label: "guest/driver-restart: query nvme_driver status",
     });
     steps.push(SmokeStep::Wait {
@@ -21229,14 +21280,15 @@ fn driver_restart_guest_steps() -> Vec<SmokeStep> {
         label: "guest/driver-restart: status shows Name field",
     });
     steps.push(SmokeStep::Wait {
-        pattern: "# ",
+        pattern: "__DRV_SYNC__:0",
         timeout_secs: 15,
-        label: "guest/driver-restart: prompt after status",
+        label: "guest/driver-restart: sync after status (exit 0)",
     });
 
-    // Step 2 — deliver SIGKILL to nvme_driver.
+    // Step 2 — deliver SIGKILL to nvme_driver. This restart is exactly when the
+    // serial console floods, so use the exit-code marker sync, not a `# ` wait.
     steps.push(SmokeStep::Send {
-        input: "/bin/service kill nvme_driver\n",
+        input: "/bin/service kill nvme_driver ; /bin/echo __DRV_SYNC__:$?\n",
         label: "guest/driver-restart: deliver SIGKILL to nvme_driver",
     });
     steps.push(SmokeStep::Wait {
@@ -21245,9 +21297,9 @@ fn driver_restart_guest_steps() -> Vec<SmokeStep> {
         label: "guest/driver-restart: confirm SIGKILL delivered",
     });
     steps.push(SmokeStep::Wait {
-        pattern: "# ",
+        pattern: "__DRV_SYNC__:0",
         timeout_secs: 15,
-        label: "guest/driver-restart: prompt after kill",
+        label: "guest/driver-restart: sync after kill (exit 0)",
     });
 
     // Step 3 — wait for init to restart nvme_driver.
@@ -21269,11 +21321,7 @@ fn driver_restart_guest_steps() -> Vec<SmokeStep> {
         timeout_secs: 15,
         label: "guest/driver-restart: status after restart shows State field",
     });
-    steps.push(SmokeStep::Wait {
-        pattern: "# ",
-        timeout_secs: 15,
-        label: "guest/driver-restart: final prompt",
-    });
+    // No trailing `# ` prompt wait: `State:` is the robust verdict.
 
     steps
 }
@@ -21337,11 +21385,8 @@ fn driver_restart_crash_steps() -> Vec<SmokeStep> {
         timeout_secs: 15,
         label: "guest/crash-smoke: PASS",
     });
-    steps.push(SmokeStep::Wait {
-        pattern: "# ",
-        timeout_secs: 15,
-        label: "guest/crash-smoke: shell prompt after smoke",
-    });
+    // No trailing `# ` prompt wait: `NVME_CRASH_SMOKE:PASS` is the robust verdict
+    // (substring-matched, immune to the post-kill/restart serial flood).
 
     steps
 }
@@ -21402,11 +21447,8 @@ fn max_restart_exceeded_steps() -> Vec<SmokeStep> {
         timeout_secs: 20,
         label: "guest/max-restart: PASS (permanently-stopped confirmed)",
     });
-    steps.push(SmokeStep::Wait {
-        pattern: "# ",
-        timeout_secs: 15,
-        label: "guest/max-restart: shell prompt after smoke",
-    });
+    // No trailing `# ` prompt wait: `MAX_RESTART_SMOKE:PASS` is the robust verdict
+    // (substring-matched, immune to the repeated-restart serial flood).
 
     steps
 }
@@ -21479,11 +21521,9 @@ fn e1000_restart_crash_steps() -> Vec<SmokeStep> {
         timeout_secs: 15,
         label: "guest/e1000-crash-smoke: exit code 0",
     });
-    steps.push(SmokeStep::Wait {
-        pattern: "# ",
-        timeout_secs: 15,
-        label: "guest/e1000-crash-smoke: shell prompt after smoke",
-    });
+    // No trailing `# ` prompt wait: the `:exit:0` marker above is the robust
+    // verdict (matched as a substring, immune to trailing async log noise), so a
+    // fragile prompt-suffix sync after it would only reintroduce CI flake risk.
 
     steps
 }
@@ -21630,12 +21670,8 @@ fn display_server_crash_recovery_steps() -> Vec<SmokeStep> {
         timeout_secs: 15,
         label: "guest/display-crash: exit code 0",
     });
-
-    steps.push(SmokeStep::Wait {
-        pattern: "# ",
-        timeout_secs: 15,
-        label: "guest/display-crash: shell prompt after smoke",
-    });
+    // No trailing `# ` prompt wait: the `:exit:0` marker is the robust verdict
+    // (substring-matched, immune to the post-crash/restart serial flood).
 
     steps
 }
@@ -24828,6 +24864,86 @@ mod tests {
         assert_eq!(
             wait_pattern_for_label(&steps, "guest/e1000-crash-smoke: exit code 0"),
             Some("E1000_CRASH_SMOKE:exit:0")
+        );
+    }
+
+    /// Part 1 (broad idle-gated prompt fallback) — the pure decision helper.
+    /// The fallback must fire ONLY for the two prompt patterns, ONLY when the
+    /// prompt is present in the buffer, and ONLY after the console has been quiet
+    /// for at least the threshold. Anything else must not match (it is an additive
+    /// fallback layered after the strict suffix matcher).
+    #[test]
+    fn idle_prompt_fallback_only_for_quiet_visible_prompt() {
+        let over = PROMPT_IDLE_FALLBACK + std::time::Duration::from_millis(1);
+        let under = PROMPT_IDLE_FALLBACK
+            .checked_sub(std::time::Duration::from_millis(1))
+            .unwrap();
+        // Visible prompt + quiet console -> match (both prompt flavors).
+        assert!(idle_prompt_fallback_matches("# ", true, over));
+        assert!(idle_prompt_fallback_matches("$ ", true, over));
+        // Console not yet quiet -> no match (avoid matching mid-flood).
+        assert!(!idle_prompt_fallback_matches("# ", true, under));
+        // Prompt not present in buffer -> no match (never invent a prompt).
+        assert!(!idle_prompt_fallback_matches("# ", false, over));
+        // Non-prompt patterns are never handled by this fallback.
+        assert!(!idle_prompt_fallback_matches(
+            "REGTEST_LOG_MARKER",
+            true,
+            over
+        ));
+        assert!(!idle_prompt_fallback_matches(
+            "NVME_CRASH_SMOKE:PASS",
+            true,
+            over
+        ));
+    }
+
+    /// Part 2 (marker conversion of the noisy driver-restart/teardown gates) —
+    /// these gates provoke async driver-exit/restart serial floods, so NONE of
+    /// them may sync on a `# `/`$ ` prompt-suffix wait (the CI-flaky pattern).
+    /// They must end on / sync via robust substring markers instead. This test
+    /// fails if a prompt-suffix wait is reintroduced into any of them.
+    #[test]
+    fn driver_restart_and_teardown_gates_have_no_prompt_suffix_waits() {
+        let gates: [(&str, Vec<SmokeStep>); 6] = [
+            ("driver_restart_guest", driver_restart_guest_steps()),
+            ("driver_restart_crash", driver_restart_crash_steps()),
+            ("max_restart_exceeded", max_restart_exceeded_steps()),
+            ("e1000_restart_crash", e1000_restart_crash_steps()),
+            (
+                "display_server_crash_recovery",
+                display_server_crash_recovery_steps(),
+            ),
+            ("exit_group_teardown", exit_group_teardown_steps()),
+        ];
+        for (name, steps) in gates {
+            let prompt_waits = steps
+                .iter()
+                .filter(|s| matches!(s, SmokeStep::Wait { pattern, .. } if *pattern == "# " || *pattern == "$ "))
+                .count();
+            assert_eq!(
+                prompt_waits, 0,
+                "{name} must not sync on a `# `/`$ ` prompt suffix (CI-flaky under the \
+                 driver-restart serial flood); use substring markers"
+            );
+        }
+        // The driver_restart_guest mid-gate syncs use the `:$?` exit-code marker
+        // idiom and assert exit 0, and the gate still asserts the real fields.
+        let g = driver_restart_guest_steps();
+        assert_eq!(
+            send_input_for_label(&g, "guest/driver-restart: query nvme_driver status"),
+            Some("/bin/service status nvme_driver ; /bin/echo __DRV_SYNC__:$?\n")
+        );
+        assert_eq!(
+            wait_pattern_for_label(&g, "guest/driver-restart: sync after kill (exit 0)"),
+            Some("__DRV_SYNC__:0")
+        );
+        assert_eq!(
+            wait_pattern_for_label(
+                &g,
+                "guest/driver-restart: status after restart shows State field"
+            ),
+            Some("State:")
         );
     }
 
