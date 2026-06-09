@@ -1,6 +1,6 @@
 # Phase 86f — Userspace SIMD / AES-NI Capstone: Task List
 
-**Status:** Planned
+**Status:** In Progress
 **Source Ref:** phase-86f
 **Depends on:** Phase 86c (HTTPS/TLS — ship correctness on software crypto first), Phase 57e/60 (per-task FPU/XSAVE save/restore) ✅, Phase 85 (Cross-Compiled Toolchains) ✅, Phase 77 (Pre-1.0 Cleanup) ✅
 **Goal:** Flip the Rust userspace target from soft-float to an SSE/SSE2 (+AES) hardware-float target so `crypto-lib` and the 86b/86c crypto consumers get hardware AES-NI, while the kernel stays soft-float (no XMM in IRQ handlers); finish the signal-frame FPU save/restore path; verify `_start` RSP/auxv 16-byte alignment; re-validate the entire userspace tree against every gate; and — as the last Phase 86 sub-phase — cut the umbrella learning doc, reconcile the roadmap README, and bump the kernel to `0.86.5`.
