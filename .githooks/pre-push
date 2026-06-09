@@ -520,3 +520,22 @@ if [ "${M3OS_GH_REGRESSION:-0}" = "1" ]; then
         exit 1
     fi
 fi
+
+# Phase 86f Track C.3 — userspace SIMD + AES-NI smoke gate. Gated behind
+# M3OS_SIMD_REGRESSION=1. Runs in two phases: (1) static objdump asserts that
+# crypto-test (x86_64-m3os.json hardware-float) contains XMM-register
+# instructions and AES-NI (aesenc/aesenclast) while the kernel ELF
+# (x86_64-unknown-none soft-float) contains none; (2) boots m3OS and asserts
+# `crypto-test` runs fault-free (SSE binary on the 16-aligned entry stack),
+# then `crypto-test --bench` emits a BENCH:aes-ctr: sentinel (AES-NI executes
+# in-OS). Set this on branches that touch x86_64-m3os.json (the hardware-float
+# target), xtask's build_userspace_bins target selection, the signal-frame FPU
+# save/restore path (kernel/src/signal.rs), the ABI stack alignment
+# (kernel/src/mm/elf.rs setup_abi_stack_with_envp), or the crypto-lib AES path.
+if [ "${M3OS_SIMD_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask userspace-simd-smoke..."
+    if ! cargo xtask userspace-simd-smoke --timeout 300; then
+        echo "pre-push: cargo xtask userspace-simd-smoke failed" >&2
+        exit 1
+    fi
+fi
