@@ -6498,7 +6498,7 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             // writable fd — or any reader after an out-of-band write — sees the
             // coherent vfs_server view, not a stale kernel block-cache snapshot.
             if vfs_write_routable() {
-                let capped = capped_count.min(kernel_core::fs::vfs_protocol::VFS_MAX_READ);
+                let capped = capped_count.min(kernel_core::fs::vfs_protocol::VFS_MAX_PREAD);
                 let ret = vfs_service_pread(&path, offset, buf_ptr, capped);
                 if (ret as i64) >= 0 {
                     let n = ret as usize;
@@ -8403,7 +8403,7 @@ fn vfs_service_should_route(path: &str, flags: u64) -> bool {
 fn vfs_service_read(handle: u64, offset: usize, user_buf_ptr: u64, count: usize) -> u64 {
     use crate::ipc::{endpoint, message::Message, registry};
     use crate::task::scheduler;
-    use kernel_core::fs::vfs_protocol::{VFS_MAX_READ, VFS_READ};
+    use kernel_core::fs::vfs_protocol::{VFS_MAX_PREAD, VFS_READ};
 
     let vfs_ep = match registry::lookup_endpoint_id("vfs") {
         Some(ep) => ep,
@@ -8413,7 +8413,7 @@ fn vfs_service_read(handle: u64, offset: usize, user_buf_ptr: u64, count: usize)
         Some(id) => id,
         None => return NEG_EINVAL,
     };
-    let capped = count.min(VFS_MAX_READ);
+    let capped = count.min(VFS_MAX_PREAD);
 
     let mut msg = Message::new(VFS_READ);
     msg.data[0] = handle;
@@ -8497,7 +8497,7 @@ fn vfs_abs_path(rel_or_abs: &str) -> alloc::string::String {
 fn vfs_service_pread(path: &str, offset: usize, user_buf_ptr: u64, count: usize) -> u64 {
     use crate::ipc::{endpoint, message::Message, registry};
     use crate::task::scheduler;
-    use kernel_core::fs::vfs_protocol::{VFS_MAX_READ, VFS_PREAD};
+    use kernel_core::fs::vfs_protocol::{VFS_MAX_PREAD, VFS_PREAD};
 
     let vfs_ep = match registry::lookup_endpoint_id("vfs") {
         Some(ep) => ep,
@@ -8508,7 +8508,7 @@ fn vfs_service_pread(path: &str, offset: usize, user_buf_ptr: u64, count: usize)
         None => return NEG_EINVAL,
     };
     let abs = vfs_abs_path(path);
-    let capped = count.min(VFS_MAX_READ);
+    let capped = count.min(VFS_MAX_PREAD);
 
     let mut msg = Message::new(VFS_PREAD);
     msg.data[0] = abs.len() as u64;

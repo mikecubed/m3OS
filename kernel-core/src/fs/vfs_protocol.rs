@@ -160,6 +160,17 @@ pub const VFS_CREATE_KIND_SHIFT: u32 = 16;
 /// Maximum bytes per single VFS_READ reply bulk payload.
 pub const VFS_MAX_READ: usize = 4096;
 
+/// Phase 92 — maximum bytes per single `VFS_PREAD` reply bulk payload.
+///
+/// Decoupled from (and larger than) `VFS_MAX_READ`: a read reply travels in the
+/// unbounded bulk `Vec` (capped only by the IPC `MAX_BULK_LEN` = 80 KiB), not in
+/// the small fixed request buffer, so reads can be served in 64 KiB chunks
+/// instead of one 4 KiB block per round-trip. With vfs_server's contiguous-run
+/// coalescing this collapses a multi-MiB read into a few multi-block requests.
+/// Must stay `<= MAX_BULK_LEN` and 512-aligned. (Writes still chunk by
+/// `VFS_MAX_READ`, which also bounds the request recv buffer — left unchanged.)
+pub const VFS_MAX_PREAD: usize = 64 * 1024;
+
 /// Reply-bulk size for `VFS_STAT_PATH`.
 ///
 /// Base layout: 11 little-endian `u64` values:
@@ -234,6 +245,15 @@ mod tests {
     fn max_read_is_block_aligned() {
         assert!(VFS_MAX_READ > 0);
         assert_eq!(VFS_MAX_READ % 512, 0);
+    }
+
+    #[test]
+    fn max_pread_is_valid() {
+        // 512-aligned, larger than a single 4 KiB block, and within the IPC
+        // bulk-reply ceiling (MAX_BULK_LEN = 80 KiB in kernel/src/ipc/mod.rs).
+        assert_eq!(VFS_MAX_PREAD % 512, 0);
+        assert!(VFS_MAX_PREAD >= VFS_MAX_READ);
+        assert!(VFS_MAX_PREAD <= 81920);
     }
 
     #[test]
