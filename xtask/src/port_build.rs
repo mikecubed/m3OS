@@ -503,7 +503,10 @@ fn build_recipe_id(name: &str) -> &'static str {
         // program `src/runtime_probe.go`, whose bytes are folded in separately
         // because `recipe_digest` now also hashes `src/`. This arm pins the
         // cross-build knob set so a flag change self-invalidates the cached
-        // `.m3pkg`. Bump recipe-v whenever the `build_go` flags below change.
+        // `.m3pkg`. The Go toolchain identity IS now auto-folded into the content
+        // key via `go_toolchain_id()` (see `compute_port_key_inner`), so a Go
+        // version bump auto-invalidates this cache; bump recipe-v only when the
+        // `build_go` flags below change.
         "go" => {
             "go-build:GOOS=linux GOARCH=amd64 CGO_ENABLED=0 GOTOOLCHAIN=local \
              GOPROXY=off GOFLAGS=-mod=mod;build:-trimpath -ldflags='-s -w';\
@@ -513,14 +516,14 @@ fn build_recipe_id(name: &str) -> &'static str {
         // the downloaded tarball (that is the gh SOURCE, folded in via the
         // Portfile SHA-256); it is the compiled `gh` binary. This arm pins the
         // cross-build knob set so a flag change self-invalidates the cached
-        // `.m3pkg`. The Go toolchain version is NOT auto-folded into the key
-        // (`toolchain_id()` only sees the irrelevant musl-gcc), so it is named
-        // here as `toolchain=go1.24.6` — bump recipe-v (or this token) whenever
-        // the pinned Go toolchain OR the build_gh flags below change.
+        // `.m3pkg`. The Go toolchain identity IS now auto-folded into the content
+        // key via `go_toolchain_id()` (see `compute_port_key_inner`), so a Go
+        // version bump auto-invalidates this cache without needing a recipe-v bump;
+        // `toolchain=go1.24.6` here is human-readable documentation only.
         "gh" => {
             "go-build:GOOS=linux GOARCH=amd64 CGO_ENABLED=0 GOTOOLCHAIN=local \
-             GOPROXY=proxy.golang.org,direct GOFLAGS=-mod=mod;\
-             build:-trimpath -ldflags='-s -w -X .../v2/internal/build.Version';\
+             GOPROXY=https://proxy.golang.org,direct GOFLAGS=-mod=mod;\
+             build:-trimpath -ldflags='-s -w -X github.com/cli/cli/v2/internal/build.Version=<version>';\
              toolchain=go1.24.6;stage=/usr/bin/gh;recipe-v=1"
         }
         _ => "",
@@ -543,6 +546,33 @@ pub fn toolchain_id() -> String {
         })
         .unwrap_or_default();
     format!("{cc}|{version}")
+}
+
+/// Identity of the DOWNLOADED Go toolchain used to cross-build the `go` and
+/// `gh` ports. Unlike every other port, `go` and `gh` are built with
+/// `CGO_ENABLED=0` using the official Go binary toolchain downloaded from
+/// `ports/lang/go/Portfile` — not the musl cross-compiler. Therefore
+/// [`toolchain_id`] (the musl-gcc wrapper) is irrelevant to their artifacts:
+/// folding the Go toolchain's Portfile VERSION+SHA into the content key instead
+/// keeps the content-addressed pkgcache honest — bumping `ports/lang/go/Portfile`
+/// auto-invalidates `go` and `gh` `.m3pkg`s, and a musl-gcc change does NOT
+/// spuriously invalidate them. This is the per-port toolchain identity analogous
+/// to how `llvm` folds `host_cxx_toolchain_id()`. Best-effort: on read/parse
+/// failure or missing fields, returns a stable sentinel so the calling key
+/// computation never panics (a machine without the Portfile cannot build `go`/`gh`
+/// either, so the sentinel makes the cache miss deterministic).
+pub fn go_toolchain_id() -> String {
+    let portfile = workspace_root().join("ports/lang/go/Portfile");
+    let meta = match parse_portfile(&portfile) {
+        Ok(m) => m,
+        Err(_) => return "go-toolchain|unknown".to_string(),
+    };
+    let version = meta.get("VERSION").cloned().unwrap_or_default();
+    let sha = meta.get("SHA256").cloned().unwrap_or_default();
+    if version.is_empty() || sha.is_empty() {
+        return "go-toolchain|unknown".to_string();
+    }
+    format!("go-toolchain|{version}|{sha}")
 }
 
 /// Identity of the HOST clang/clang++ used to cross-build the `llvm` port
@@ -812,16 +842,27 @@ fn compute_port_key_inner(
         ));
     }
     chain.push(name.to_string());
-    // The `llvm` port's real cross-compiler is the HOST clang (musl-tools has no
-    // C++ compiler), which `toolchain_id()` (the musl-gcc wrapper) does not see.
-    // Fold the actual host clang/clang++ `--version` into the key so two host
-    // clangs do not collide on one content-addressed `.m3pkg` (the static recipe
-    // token in `build_recipe_id` cannot carry a per-host version). Other ports are
-    // built entirely by the musl toolchain, so their key is unchanged.
-    let tc = if name == "llvm" {
-        format!("{}|host-cxx={}", toolchain_id(), host_cxx_toolchain_id())
-    } else {
-        toolchain_id()
+    // Each port's "toolchain" component of the content key must reflect the
+    // compiler that actually produced the artifact — not the generic musl-gcc:
+    //
+    //   llvm  — built by the HOST clang/clang++ (musl-tools has no C++ compiler).
+    //           Fold the actual `--version` so two host clangs don't collide on
+    //           one `.m3pkg`; musl-gcc is irrelevant.
+    //
+    //   go/gh — cross-built with the DOWNLOADED Go toolchain (CGO_ENABLED=0).
+    //           Phase 86e: fold the Go Portfile VERSION+SHA instead of musl-gcc so
+    //           a Go bump auto-invalidates go/gh caches and a musl change does NOT
+    //           spuriously invalidate them. Analogous to how `llvm` folds host-cxx.
+    //
+    //   *     — all other ports are built entirely by the musl cross-compiler, so
+    //           `toolchain_id()` (musl-gcc name + `--version`) is the right key.
+    let tc = match name {
+        "llvm" => format!("{}|host-cxx={}", toolchain_id(), host_cxx_toolchain_id()),
+        // Phase 86e — go/gh cross-build with the downloaded Go toolchain, not the
+        // musl cross-compiler; fold the Go toolchain identity (not musl) so a Go
+        // bump auto-invalidates and a musl change does not spuriously invalidate.
+        "go" | "gh" => go_toolchain_id(),
+        _ => toolchain_id(),
     };
     let dep_keys: Vec<String> = port_deps(name)
         .iter()
@@ -4617,7 +4658,7 @@ mod tests {
         // ports never collide on the recipe component of the key.
         let ports = [
             "zlib", "ncurses", "libevent", "less", "htop", "tmux", "git", "python", "llvm",
-            "dropbear", "mbedtls", "curl", "go",
+            "dropbear", "mbedtls", "curl", "go", "gh",
         ];
         let ids: Vec<&str> = ports.iter().map(|p| build_recipe_id(p)).collect();
         for (p, id) in ports.iter().zip(&ids) {
@@ -4629,6 +4670,40 @@ mod tests {
         assert_eq!(sorted.len(), ids.len(), "build_recipe_ids must be distinct");
         // Unknown ports yield the empty identity (no recipe contribution).
         assert_eq!(build_recipe_id("clang"), "");
+    }
+
+    // ── Phase 86e — go_toolchain_id folds the Go Portfile into go/gh keys ────
+
+    /// `go_toolchain_id()` must read the committed `ports/lang/go/Portfile` and
+    /// return a string of the form `"go-toolchain|<version>|<sha>"`. This keeps
+    /// the content-addressed pkgcache honest for the `go` and `gh` ports: bumping
+    /// `ports/lang/go/Portfile` auto-invalidates their `.m3pkg`s, and a musl-gcc
+    /// change does NOT spuriously invalidate them (musl is irrelevant to a pure-Go
+    /// `CGO_ENABLED=0` build). The test is hermetic — it reads the committed
+    /// Portfile (workspace_root() resolves to the repo root at test time).
+    #[test]
+    fn go_toolchain_id_folds_go_portfile_version_and_sha() {
+        let id = go_toolchain_id();
+        // Must start with the well-known prefix.
+        assert!(
+            id.starts_with("go-toolchain|"),
+            "go_toolchain_id must start with 'go-toolchain|', got: {id:?}"
+        );
+        // Must contain the pinned Go version from ports/lang/go/Portfile.
+        assert!(
+            id.contains("1.24.6"),
+            "go_toolchain_id must contain the pinned version '1.24.6', got: {id:?}"
+        );
+        // Must contain a recognisable prefix of the pinned SHA-256.
+        assert!(
+            id.contains("bbca37cc"),
+            "go_toolchain_id must contain the SHA-256 prefix 'bbca37cc', got: {id:?}"
+        );
+        // Must NOT be the unknown sentinel (the Portfile is present in the repo).
+        assert_ne!(
+            id, "go-toolchain|unknown",
+            "go_toolchain_id must not return the sentinel when the Portfile is present"
+        );
     }
 
     // ── Phase 85b — binary_contains fails closed (NO_CURL/NO_OPENSSL guard) ──

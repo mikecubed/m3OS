@@ -14227,16 +14227,22 @@ fn gh_smoke_steps(
     });
 
     // 2. The static Go gh RUNS on the 86d runtime. `gh --version` stamps
-    //    `gh version 2.82.1` (the `-X internal/build.Version` ldflag) — the
-    //    string appears in the OUTPUT, never in the typed command, so the Wait
+    //    `gh version <VERSION>` (the `-X internal/build.Version` ldflag, where
+    //    <VERSION> is read from `ports/util/gh/Portfile` via `port_version("gh")`
+    //    — so for VERSION=2.82.1 the produced string is `gh version 2.82.1`,
+    //    byte-identical to the prior hardcode but immune to future version bumps).
+    //    The string appears in the OUTPUT, never in the typed command, so the Wait
     //    matches actual execution, not the echo. Loading a 55 MB static binary
     //    over the slow VFS + Go runtime init takes a while on the first exec.
+    let gh_version = port_build::port_version("gh").unwrap_or_default();
+    let version_pattern: &'static str =
+        Box::leak(format!("gh version {gh_version}").into_boxed_str());
     steps.push(SmokeStep::Send {
         input: "gh --version\n",
         label: "gh-smoke: run gh --version",
     });
     steps.push(SmokeStep::Wait {
-        pattern: "gh version 2.82.1",
+        pattern: version_pattern,
         // Cold-loading a 55 MB static binary over the ~200 KB/s ring-3 VFS + Go
         // runtime init is the slowest single step. The token-free core run clears
         // it under 600s, but in the AUTH configuration (the install has just
