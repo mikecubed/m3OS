@@ -521,18 +521,31 @@ pub fn inode_index_in_group(inode_num: u32, inodes_per_group: u32) -> u32 {
 ///   the single block `phys` at byte offset `block_off` — the unaligned head /
 ///   short tail of the range (kept on the cache-aware per-block path in-kernel).
 ///
+/// `max_run_blocks` bounds how many blocks a single `read_run` may span — the
+/// block driver caps a single request (`remote::read_sectors`'s
+/// `MAX_SECTORS_PER_REQUEST` = 256 sectors = 32 blocks; the `sys_block_read`
+/// path 128 sectors = 16 blocks), so a run longer than that would be rejected.
+/// A contiguous file longer than the cap is split into back-to-back runs of at
+/// most `max_run_blocks` (still a huge win over per-block). Must be `>= 1`.
+///
 /// Returns the number of bytes read (`min(buf.len(), file_size - offset)`),
 /// byte-for-byte identical to a naive per-block reader over the same data.
 /// Holes break a run and are zero-filled without a device request.
+// The geometry (size/block_size/offset/buf/cap) plus the three device closures
+// (resolve / read_run / read_partial) are all irreducible inputs of a pure
+// orchestrator; bundling them into a struct would only obscure the call sites.
+#[allow(clippy::too_many_arguments)]
 pub fn read_file_data_coalesced<E>(
     file_size: u64,
     block_size: u32,
     offset: u64,
     buf: &mut [u8],
+    max_run_blocks: u32,
     mut resolve: impl FnMut(u32) -> Result<u32, E>,
     mut read_run: impl FnMut(u32, u32, &mut [u8]) -> Result<(), E>,
     mut read_partial: impl FnMut(u32, usize, &mut [u8]) -> Result<(), E>,
 ) -> Result<usize, E> {
+    let max_run_blocks = max_run_blocks.max(1);
     if offset >= file_size {
         return Ok(0);
     }
@@ -560,10 +573,14 @@ pub fn read_file_data_coalesced<E>(
                 pos += bs;
                 continue;
             }
-            // Extend the run while the next whole block is physically contiguous
-            // AND a full block still fits in the remaining request.
+            // Extend the run while the next whole block is physically contiguous,
+            // a full block still fits in the remaining request, AND the run stays
+            // within the device's max-sectors-per-request bound.
             let mut run_len: u32 = 1;
             loop {
+                if run_len >= max_run_blocks {
+                    break; // device single-request cap
+                }
                 if (run_len as usize + 1) * bs as usize > remaining {
                     break;
                 }
@@ -1050,6 +1067,19 @@ mod tests {
     /// run_calls, partial_calls). `run_calls` is the device-round-trip count the
     /// Phase 92 acceptance is measured on.
     fn coalesced_read(file_size: u64, offset: u64, len: usize) -> (usize, Vec<u8>, usize, usize) {
+        // A generous cap so the existing run-coalescing tests are unaffected; the
+        // cap behaviour itself is covered by `coalesced_read_caps_run_length`.
+        coalesced_read_capped(file_size, offset, len, u32::MAX)
+    }
+
+    /// As `coalesced_read`, but with an explicit `max_run_blocks` so a test can
+    /// exercise the device single-request cap.
+    fn coalesced_read_capped(
+        file_size: u64,
+        offset: u64,
+        len: usize,
+        max_run_blocks: u32,
+    ) -> (usize, Vec<u8>, usize, usize) {
         let bs = TEST_BS as usize;
         let runs = Cell::new(0usize);
         let partials = Cell::new(0usize);
@@ -1059,8 +1089,13 @@ mod tests {
             TEST_BS,
             offset,
             &mut buf,
+            max_run_blocks,
             |lb| Ok(mock_resolve(lb)),
             |phys, count, dst| {
+                assert!(
+                    count <= max_run_blocks,
+                    "read_run issued {count} blocks, exceeding the cap {max_run_blocks}"
+                );
                 runs.set(runs.get() + 1);
                 for k in 0..count {
                     mock_block_bytes(phys + k, &mut dst[k as usize * bs..(k as usize + 1) * bs]);
@@ -1142,5 +1177,28 @@ mod tests {
         assert_eq!(n, 0);
         assert_eq!(runs, 0);
         assert_eq!(partials, 0);
+    }
+
+    #[test]
+    fn coalesced_read_caps_run_length_to_device_max() {
+        // Read 64 contiguous blocks (logical 100..164 → phys 1100..1164, all in
+        // the first contiguous run) with a 16-block device cap. The run must be
+        // split into ceil(64/16) = 4 runs of <=16 blocks each — never one
+        // 64-block request the driver would reject — and stay byte-identical.
+        let file_size = 2500 * TEST_BS as u64;
+        let off = 100 * TEST_BS as u64;
+        let len = 64 * TEST_BS as usize;
+        let (n, got, runs, partials) = coalesced_read_capped(file_size, off, len, 16);
+        assert_eq!(n, len);
+        assert_eq!(
+            runs, 4,
+            "64 blocks at a 16-block cap must split into 4 runs"
+        );
+        assert_eq!(partials, 0);
+        // Byte-identical to the naive reader (the read_run closure also asserts
+        // count <= 16 on every call).
+        let mut want = alloc::vec![0u8; len];
+        reference_read(file_size, off, &mut want);
+        assert_eq!(got, want);
     }
 }

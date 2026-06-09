@@ -419,11 +419,18 @@ impl Ext2Volume {
         offset: u64,
         buf: &mut [u8],
     ) -> Result<usize, Ext2Error> {
+        // Bound each coalesced run to the block driver's max-sectors-per-request
+        // (256 sectors) so a long contiguous file never issues a single
+        // read_sectors the ring-3 driver would reject. `sectors_per_block` is
+        // 2/4/8 for 1K/2K/4K blocks → 128/64/32 blocks per run.
+        let max_run_blocks =
+            kernel_core::driver_ipc::block::MAX_SECTORS_PER_REQUEST / self.sectors_per_block;
         kernel_core::fs::ext2::read_file_data_coalesced(
             inode.size as u64,
             self.block_size,
             offset,
             buf,
+            max_run_blocks,
             |logical_block| self.resolve_block(inode, logical_block),
             |start_block, count, dst| self.read_run_into_slice(start_block, count, dst),
             |phys_block, offset_in_block, dst| {
