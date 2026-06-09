@@ -95,12 +95,23 @@ struct Ext2State {
     /// write authority never serves stale data (mirrors the kernel engine's
     /// `block_cache` + invalidate-on-write). Bounded at `BLOCK_CACHE_MAX` blocks.
     block_cache: RefCell<BTreeMap<u32, Vec<u8>>>,
+    /// Phase 87 — metadata write-back. Count of alloc/free ops since the last
+    /// superblock+BGD flush (see `mark_meta_dirty`). Deferring the summary flush
+    /// off the per-allocation path removes ~2 device reads + 2 device writes per
+    /// allocated block.
+    meta_dirty_ops: u32,
 }
 
 /// Max ext2 blocks held in the vfs_server read-through cache (4 KiB blocks →
 /// ~16 MiB ceiling). Large enough to hold a package's metadata working set
 /// (dir/inode/bitmap/indirect blocks) across an install without unbounded growth.
 const BLOCK_CACHE_MAX: usize = 4096;
+
+/// Phase 87 — flush the superblock + BGD free-count summaries to disk after at
+/// most this many alloc/free ops (instead of on every one). Bounds a crash's
+/// free-count drift to this many ops, which `fsck` reconciles from the
+/// already-persisted bitmaps.
+const META_FLUSH_THRESHOLD: u32 = 256;
 
 impl Ext2State {
     /// Read raw sectors from disk via the sys_block_read syscall.
@@ -261,6 +272,31 @@ impl Ext2State {
             bgd.write_into(&mut bgd_buf[i * 32..(i + 1) * 32]);
         }
         self.write_sectors(bgd_lba, bgd_sectors, &bgd_buf)
+    }
+
+    /// Phase 87 — record an alloc/free against the in-memory superblock+BGD and
+    /// flush the on-disk summaries only once per `META_FLUSH_THRESHOLD` ops. The
+    /// in-memory `superblock`/`bgd_table` are updated by the caller and remain
+    /// authoritative; the bitmaps are persisted immediately by `write_block`, so
+    /// the deferred summary flush never affects allocation correctness — only how
+    /// often the expensive sb+BGD read-modify-write hits the disk.
+    fn mark_meta_dirty(&mut self) -> Result<(), ()> {
+        self.meta_dirty_ops += 1;
+        if self.meta_dirty_ops >= META_FLUSH_THRESHOLD {
+            self.flush_metadata()?;
+            self.meta_dirty_ops = 0;
+        }
+        Ok(())
+    }
+
+    /// Flush any pending superblock+BGD summary changes (at a clean boundary —
+    /// e.g. unmount). No-op when nothing is dirty.
+    fn flush_metadata_if_dirty(&mut self) -> Result<(), ()> {
+        if self.meta_dirty_ops > 0 {
+            self.flush_metadata()?;
+            self.meta_dirty_ops = 0;
+        }
+        Ok(())
     }
 
     /// Read an inode by number.
@@ -549,7 +585,7 @@ impl Ext2State {
                         + bit
                         + self.superblock.first_data_block;
 
-                    self.flush_metadata().map_err(|_| NEG_EIO)?;
+                    self.mark_meta_dirty().map_err(|_| NEG_EIO)?;
                     return Ok(abs_block);
                 }
             }
@@ -582,7 +618,7 @@ impl Ext2State {
 
         self.bgd_table[group].free_blocks_count += 1;
         self.superblock.free_blocks_count += 1;
-        self.flush_metadata().map_err(|_| NEG_EIO)
+        self.mark_meta_dirty().map_err(|_| NEG_EIO)
     }
 
     /// Allocate a free inode, preferring `preferred_group`.
@@ -611,7 +647,7 @@ impl Ext2State {
 
                     self.bgd_table[group].free_inodes_count -= 1;
                     self.superblock.free_inodes_count -= 1;
-                    self.flush_metadata().map_err(|_| NEG_EIO)?;
+                    self.mark_meta_dirty().map_err(|_| NEG_EIO)?;
                     return Ok(abs_inode);
                 }
             }
@@ -642,7 +678,7 @@ impl Ext2State {
 
         self.bgd_table[group].free_inodes_count += 1;
         self.superblock.free_inodes_count += 1;
-        self.flush_metadata().map_err(|_| NEG_EIO)
+        self.mark_meta_dirty().map_err(|_| NEG_EIO)
     }
 
     /// Allocate a data block for a logical position in an inode, wiring up
@@ -1144,7 +1180,7 @@ impl Ext2State {
 
         let group = inode_block_group(new_ino, self.superblock.inodes_per_group) as usize;
         self.bgd_table[group].used_dirs_count += 1;
-        self.flush_metadata().map_err(|_| NEG_EIO)?;
+        self.mark_meta_dirty().map_err(|_| NEG_EIO)?;
         Ok(new_ino)
     }
 
@@ -1349,7 +1385,7 @@ impl Ext2State {
         if self.bgd_table[group].used_dirs_count > 0 {
             self.bgd_table[group].used_dirs_count -= 1;
         }
-        self.flush_metadata().map_err(|_| NEG_EIO)
+        self.mark_meta_dirty().map_err(|_| NEG_EIO)
     }
 }
 
@@ -1541,6 +1577,7 @@ fn program_main(_args: &[&str]) -> i32 {
         block_size,
         sectors_per_block,
         block_cache: RefCell::new(BTreeMap::new()),
+        meta_dirty_ops: 0,
     };
 
     syscall_lib::write_str(STDOUT_FILENO, "vfs_server: ext2 mounted\n");

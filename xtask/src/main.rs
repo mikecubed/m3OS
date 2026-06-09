@@ -14747,20 +14747,17 @@ fn cmd_vfs_bulkio_smoke(args: &SmokeBootArgs) {
     // The package to install + read. Dependency-free + bundle-only (not
     // pre-installed) so the install reads its `.m3pkg` fresh off the data disk.
     const PKG: &str = "mbedtls";
-    // Regression guard for the read-side throughput work. A `pkg install` is NOT
-    // a pure read: ext2 metadata updates are sub-block (one allocation-bitmap
-    // bit, one directory entry, one inode in a shared table block), so each write
-    // is a read-modify-write of the whole block. Measured `read_calls` for this
-    // ~3.8 MiB install at each stage:
-    //   * pre-Phase-87 (uncached vfs_server, 4 KiB per-block reads):   ~36,200
-    //   * + block cache (invalidate-on-write) + 64 KiB cap + coalescing: ~8,900
-    //   * + write-through-update cache (RMW reads hit instead of re-read): ~4,300
-    // → ~8.4x fewer reads. The residual is cold working-set reads + the write side
-    // (~970 bitmap writes still happen — Track C.2 write-back would cut those).
-    // This threshold catches a regression of the cache POLICY (back to
-    // invalidate, ~8,900) or of the cache/cap/coalescing entirely (~36k); the
-    // tight coalescing correctness itself is proven by the kernel-core host tests.
-    const MAX_READ_CALLS_DELTA: u64 = 8_000;
+    // Regression guard for the read-side throughput work. Measured `read_calls`
+    // for this ~3.8 MiB install at each stage:
+    //   * pre-Phase-87 (uncached vfs_server, 4 KiB per-block reads):    ~36,200
+    //   * + block cache + 64 KiB read cap + contiguous-run coalescing:   ~8,900
+    //   * + write-through-update cache (metadata RMW reads hit):         ~4,300
+    //   * + deferred metadata flush (no sb/BGD read per allocation):     ~2,100
+    // The threshold catches a regression of any of those (next stage up ~4,300).
+    // `write_calls` is reported (~5,800 here) but not yet asserted — the write
+    // side (data/bitmap/inode writes) is still being reduced (cap-raise + write
+    // coalescing + multi-block alloc).
+    const MAX_READ_CALLS_DELTA: u64 = 3_500;
 
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
@@ -14827,43 +14824,50 @@ fn cmd_vfs_bulkio_smoke(args: &SmokeBootArgs) {
         std::process::exit(SMOKE_EXIT_VFS_BULKIO_FAILED);
     }
 
-    // Parse the two `read_calls N` lines (baseline, then post-install) from the
-    // captured serial. `cat /proc/blkstats` is the only thing that prints
-    // `read_calls`, so the first two matches are the before/after snapshots.
+    // Parse the two `read_calls N` / `write_calls N` lines (baseline, then
+    // post-install) from the captured serial — `cat /proc/blkstats` is the only
+    // thing that prints them, so the first two matches of each are the snapshots.
     let transcript = fs::read_to_string(&dump_path).unwrap_or_default();
-    let read_calls: Vec<u64> = transcript
-        .lines()
-        .filter_map(|l| l.trim().strip_prefix("read_calls "))
-        .filter_map(|n| n.trim().parse::<u64>().ok())
-        .collect();
-    if read_calls.len() < 2 {
+    let parse_counter = |key: &str| -> Vec<u64> {
+        transcript
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix(key))
+            .filter_map(|n| n.trim().parse::<u64>().ok())
+            .collect()
+    };
+    let read_calls = parse_counter("read_calls ");
+    let write_calls = parse_counter("write_calls ");
+    if read_calls.len() < 2 || write_calls.len() < 2 {
         eprintln!(
-            "vfs-bulkio-smoke: FAILED — could not parse two `read_calls` snapshots from \
-             /proc/blkstats (found {}). Serial dump: {}",
+            "vfs-bulkio-smoke: FAILED — could not parse two read_calls/write_calls snapshots from \
+             /proc/blkstats (read={}, write={}). Serial dump: {}",
             read_calls.len(),
+            write_calls.len(),
             dump_path.display()
         );
         std::process::exit(SMOKE_EXIT_VFS_BULKIO_FAILED);
     }
     let (baseline, after) = (read_calls[0], read_calls[1]);
     let delta = after.saturating_sub(baseline);
+    let write_delta = write_calls[1].saturating_sub(write_calls[0]);
     let elapsed = start.elapsed().as_secs();
 
     println!(
-        "vfs-bulkio-smoke: `pkg install {PKG}` issued Δ {delta} block reads (read_calls {baseline} → {after})"
+        "vfs-bulkio-smoke: `pkg install {PKG}` issued Δ {delta} block reads + Δ {write_delta} block writes \
+         (read_calls {baseline} → {after})"
     );
     if delta > MAX_READ_CALLS_DELTA {
         eprintln!(
             "vfs-bulkio-smoke: FAILED — Δread_calls {delta} exceeds {MAX_READ_CALLS_DELTA}; the \
-             vfs_server block cache / 64 KiB read cap / contiguous-run coalescing appear to have \
-             regressed toward per-block, uncached reads (~36k baseline)."
+             vfs_server block cache / 64 KiB read cap / contiguous-run coalescing / deferred metadata \
+             flush appear to have regressed (next stage up ~4,300, then ~8,900, then ~36k)."
         );
         std::process::exit(SMOKE_EXIT_VFS_BULKIO_FAILED);
     }
     println!(
-        "vfs-bulkio-smoke: PASSED — install read cost {delta} block requests (≤ {MAX_READ_CALLS_DELTA}; \
-         ~36k before the vfs_server write-through block cache + 64 KiB read cap + coalescing — a ~8x \
-         reduction; the residual is cold working-set + the write side, Track C.2) in {elapsed}s"
+        "vfs-bulkio-smoke: PASSED — install I/O: {delta} block reads + {write_delta} block writes \
+         (reads ~36k → {delta} via the write-through cache + 64 KiB read cap + coalescing + deferred \
+         metadata flush; the write side is still being reduced) in {elapsed}s"
     );
 }
 
