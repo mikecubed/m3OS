@@ -14200,6 +14200,17 @@ fn gh_smoke_steps(
     steps.extend(boot_and_login_steps());
     steps.push(SmokeStep::Sleep { millis: 500 });
 
+    // 0. Headless gh hygiene (set once, persists for every gh call in this shell):
+    //    GH_NO_UPDATE_NOTIFIER stops gh's background "new release" check — which,
+    //    once a hosts.yml is present, would otherwise fire a network call to
+    //    api.github.com from `gh --version` and stall it on the slow in-kernel
+    //    TLS path; GH_PAGER=cat / GH_PROMPT_DISABLED keep gh non-interactive so it
+    //    never blocks on a pager or a TTY prompt over the serial console.
+    steps.push(SmokeStep::Send {
+        input: "export GH_NO_UPDATE_NOTIFIER=1 GH_PAGER=cat GH_PROMPT_DISABLED=1\n",
+        label: "gh-smoke: headless gh env (no update-check / pager / prompt)",
+    });
+
     // 1. Install gh from the bundled offline repo. gh has no DEPS, so the resolved
     //    order is just [gh]. The ~55 MB `.m3pkg` is SHA-verified and written
     //    file-by-file over the slow ring-3 VFS, hence the generous ceiling.
@@ -14226,7 +14237,14 @@ fn gh_smoke_steps(
     });
     steps.push(SmokeStep::Wait {
         pattern: "gh version 2.82.1",
-        timeout_secs: 600,
+        // Cold-loading a 55 MB static binary over the ~200 KB/s ring-3 VFS + Go
+        // runtime init is the slowest single step. The token-free core run clears
+        // it under 600s, but in the AUTH configuration (the install has just
+        // written ~55 MB + the seeded config, leaving the VFS more loaded) it has
+        // been observed to exceed even 1200s — this step is VFS-throughput-bound,
+        // the exact bottleneck Phase 92 (VFS bulk I/O) targets. 1200s is the step
+        // ceiling; the global --timeout is the real backstop.
+        timeout_secs: 1200,
         label: "gh-smoke: static Go gh runs on the 86d runtime (gh version)",
     });
 
