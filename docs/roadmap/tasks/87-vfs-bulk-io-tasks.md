@@ -1,6 +1,6 @@
 # Phase 87 — VFS Bulk-I/O Throughput & Fairness: Task List
 
-**Status:** 🟡 Read-side landed (Tracks A + B + E). `pkg install mbedtls` block reads **36,183 → 4,282 (~8.4x)**, validated by `vfs-bulkio-smoke` + smoke-test + regression. Tracks C (readahead/write-back), D (fairness), F (optional) remain.
+**Status:** 🟡 Throughput landed (Tracks A + B + the C.2 write-back + B.2 cap-raise + E). `pkg install mbedtls` total device I/O **~44,000 → ~6,200 ops (~7x)**: reads **36,183 → 2,106** (read cache + 64 KiB read cap + contiguous-run coalescing + deferred metadata flush) and writes **~7,800 → 4,083** (deferred metadata flush + 64 KiB write cap). All validated by `vfs-bulkio-smoke` + smoke-test + regression (storage-roundtrip). Remaining: **Track D (fairness)** — next; the deeper write-coalescing + multi-block-allocation (further write reduction), **C.1 (readahead)**, and **F (optional)** are lower-priority follow-ups.
 **Source Ref:** phase-87
 **Depends on:** Phase 08 (Storage & VFS) ✅, Phase 55b (Ring-3 Driver Hosting) ✅, Phase 85a (Package Infrastructure) ✅
 **Goal:** Make multi-megabyte VFS I/O fast and fair: coalesce ext2 block reads/writes into multi-block ring-3 driver requests, add readahead/write-back, and stop a bulk transfer from starving interactive clients — with `pkg install python` (21 MiB) as the motivating, measured case.
@@ -16,8 +16,8 @@
 |---|---|---|---|
 | A | Baseline instrumentation (block-request + timing counters) | — | ✅ Done — `/proc/blkstats` |
 | B | Contiguous-run batched reads (ext2 → multi-sector `read_sectors`) | A | ✅ Done — **both** the kernel engine AND vfs_server (shared coalescer) + vfs_server write-through block cache + 64 KiB read cap |
-| C | Readahead + large-write write-back | B | Planned (C.2 write-back would cut the residual ~970 bitmap writes) |
-| D | VFS fairness (bounded quanta / yield so bulk jobs don't freeze the UI) | B | Planned |
+| C | Readahead + large-write write-back | B | 🟡 C.2 write-back done — **deferred vfs_server metadata flush** (sb/BGD summary no longer flushed per allocation; bounded by `META_FLUSH_THRESHOLD`); cut writes ~2,000 + reads ~2,000. Plus the **64 KiB write cap** (B.2): writes 5,759 → 4,083. C.1 readahead remains. |
+| D | VFS fairness (bounded quanta / yield so bulk jobs don't freeze the UI) | B | **Next** — measure-first (the read cache + flush deferral already make interactive STATs cache-fast; validate keystroke-echo < 500 ms during a bulk install, add fairness only if needed) |
 | E | `vfs-bulkio-smoke` regression gate + pre-push wiring | B, C, D | ✅ Done — read-throughput regression guard (`M3OS_VFS_BULKIO_REGRESSION=1`) |
 | F | (Optional) bulk page-grant transfer + `.m3pkg` compression | B | Planned |
 
@@ -60,9 +60,12 @@
 **Symbol:** the ext2 file-write routine that loops `write_block`
 **Why it matters:** Installing `python3` writes ~15 MiB; per-block writes have the same round-trip problem as reads.
 
+> **As-built:** the write path that matters is **vfs_server** (not the kernel `ext2.rs`), same as the read side. Two write-throughput changes landed; the third (data-block coalescing) is a lower-priority follow-up.
+
 **Acceptance:**
-- [ ] Contiguous allocated blocks are flushed in one `write_sectors(count = N)` call.
-- [ ] `pkg verify python` still reports 0 MISMATCH after a batched-write install.
+- [x] **64 KiB write cap** (`VFS_MAX_PWRITE`, the analog of the read cap): vfs_server's `recv_buf` moved to the heap; a `VFS_WRITE` now moves up to ~16 blocks per round-trip (16× fewer write IPC round-trips, and `write_file_data`'s inode flush amortized over the whole chunk). Writes 5,759 → 4,083 (`pkg install mbedtls`); smoke-test + regression (storage-roundtrip) pass.
+- [ ] Contiguous allocated blocks are flushed in one `write_sectors(count = N)` call. _Lower-priority follow-up — data-block write coalescing + multi-block allocation would cut ~2,000 more writes but restructure the allocator (FS-corruption-sensitive); deferred since the ~7× total-I/O reduction is already landed._
+- [ ] `pkg verify python` still reports 0 MISMATCH after a batched-write install. _(mbedtls install + regression storage-roundtrip pass as the proxy; python isn't bundled by default.)_
 
 ---
 
