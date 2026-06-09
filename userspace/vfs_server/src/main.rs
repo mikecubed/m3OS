@@ -32,6 +32,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::cell::RefCell;
+use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_core::fs::ext2::{
     EXT2_DIND_BLOCK, EXT2_FT_DIR, EXT2_FT_REG_FILE, EXT2_FT_SYMLINK, EXT2_IND_BLOCK,
     EXT2_NDIR_BLOCKS, EXT2_ROOT_INO, Ext2BlockGroupDescriptor, Ext2DirEntry, Ext2Inode,
@@ -1773,6 +1774,12 @@ fn program_main(_args: &[&str]) -> i32 {
         return 1;
     }
 
+    // Drain deferred metadata on orderly shutdown: install a SIGTERM handler so
+    // init's stop sequence flushes the superblock/BGD free-count summaries (see
+    // server_loop / shutdown_flush_and_exit) before exiting. Without it, the
+    // default SIGTERM action would terminate us with the residual unflushed.
+    let _ = syscall_lib::rt_sigaction_simple(syscall_lib::SIGTERM as usize, sigterm_handler);
+
     // Do not write to stdout after publishing the service name: clients may
     // immediately send IPC and block until this server reaches ipc_recv_msg.
     syscall_lib::serial_print("vfs_server: registered, entering server loop\n");
@@ -1786,6 +1793,29 @@ fn program_main(_args: &[&str]) -> i32 {
 // Server loop
 // ---------------------------------------------------------------------------
 
+/// Set by the SIGTERM handler so the server loop can drain deferred metadata
+/// before exiting (see `server_loop`). Async-signal-safe: the handler performs
+/// only an atomic store and never touches the block cache's `RefCell`.
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn sigterm_handler(_sig: i32) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+}
+
+/// Flush any pending deferred superblock/BGD free-count summaries and exit
+/// cleanly. Called only from the server loop (never the signal handler), at a
+/// point where no request is in flight, so no `RefCell` borrow is live and the
+/// flush's `read_block`/`write_sectors` cannot double-borrow. The allocation
+/// bitmaps are already persisted on every alloc/free, so this only converges the
+/// on-disk free-count *summaries* — without it a clean stop leaves them lagging
+/// by up to `META_FLUSH_THRESHOLD` ops (fsck-reconcilable, but a clean stop
+/// should be clean).
+fn shutdown_flush_and_exit(ext2: &mut Ext2State) -> ! {
+    let _ = ext2.flush_metadata_if_dirty();
+    syscall_lib::serial_print("vfs_server: SIGTERM — flushed deferred metadata, exiting\n");
+    syscall_lib::exit(0)
+}
+
 fn server_loop(ext2: &mut Ext2State, ep_handle: u32) -> ! {
     let mut handles = HandleTable::new();
     let mut msg = syscall_lib::IpcMessage::new(0);
@@ -1798,6 +1828,14 @@ fn server_loop(ext2: &mut Ext2State, ep_handle: u32) -> ! {
     syscall_lib::ipc_recv_msg(ep_handle, &mut msg, &mut recv_buf);
 
     loop {
+        // Orderly shutdown (init SIGTERMs services on poweroff): a SIGTERM that
+        // interrupted the blocking recv above returns early, and this check
+        // drains deferred metadata + exits before processing a now-meaningless
+        // message — and before init's SIGKILL grace expires.
+        if SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
+            shutdown_flush_and_exit(ext2);
+        }
+
         req_seq = req_seq.wrapping_add(1);
         let start_us = now_usec();
         let (reply_label, reply_data0) = handle_request(ext2, &mut handles, &msg, &recv_buf);
@@ -1827,6 +1865,13 @@ fn server_loop(ext2: &mut Ext2State, ep_handle: u32) -> ! {
             }
         } else {
             syscall_lib::serial_print("vfs_server: request missing reply cap\n");
+        }
+
+        // Catch a SIGTERM that arrived while servicing this request (not during
+        // a blocking recv) — otherwise we would block on the next recv with no
+        // further request coming during shutdown, leaving the residual unflushed.
+        if SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
+            shutdown_flush_and_exit(ext2);
         }
 
         msg = syscall_lib::IpcMessage::new(0);

@@ -266,6 +266,18 @@ mod tests {
     }
 
     #[test]
+    fn max_pwrite_is_valid() {
+        // The write-side analog of `max_pread_is_valid`. VFS_MAX_PWRITE sizes
+        // vfs_server's heap `recv_buf` (MAX_BULK_BUF) and bounds the write chunk
+        // (`data.len().min(VFS_MAX_PWRITE - path_len)`); it must stay 512-aligned
+        // and within the IPC bulk ceiling (MAX_BULK_LEN = 80 KiB) so a path+data
+        // request can never overflow the receive buffer.
+        assert_eq!(VFS_MAX_PWRITE % 512, 0);
+        assert!(VFS_MAX_PWRITE >= VFS_MAX_READ);
+        assert!(VFS_MAX_PWRITE <= 81920);
+    }
+
+    #[test]
     fn stat_reply_is_word_aligned() {
         assert_eq!(VFS_STAT_REPLY_SIZE % core::mem::size_of::<u64>(), 0);
     }

@@ -1201,4 +1201,176 @@ mod tests {
         reference_read(file_size, off, &mut want);
         assert_eq!(got, want);
     }
+
+    #[test]
+    fn coalesced_read_byte_identical_across_real_indirect_blocks() {
+        // Unlike the arithmetic `mock_resolve` above, this drives the coalescer
+        // through a REAL ext2 indirect walk: the resolve closure reads
+        // single- and double-indirect *pointer blocks* from an in-memory store,
+        // exactly as `resolve_block` does on disk. It proves the coalescer
+        // MERGES a physically-contiguous run across the direct→single-indirect
+        // (logical 11→12) and single→double-indirect (logical 267→268)
+        // transitions — the boundaries the Phase 87 acceptance criterion names —
+        // and BREAKS at a real discontiguity (a jump) and a hole, all
+        // byte-for-byte identical to a naive per-block reader over the same walk.
+        use alloc::collections::BTreeMap;
+        let bs = TEST_BS as usize;
+        let ptrs = TEST_BS as usize / 4; // 256 pointers per 1 KiB block
+
+        // Physical DATA-block layout for logical block `lb`:
+        //   0..280  → one contiguous run (phys 2000+lb) spanning BOTH boundaries
+        //   280..285 → a second run reached by a discontiguous jump
+        //   285      → a sparse hole (phys 0)
+        //   286..    → a third contiguous run
+        let phys_for_logical = |lb: u32| -> u32 {
+            if lb == 285 {
+                0
+            } else if lb < 280 {
+                2000 + lb
+            } else if lb < 285 {
+                900_000 + (lb - 280)
+            } else {
+                700_000 + lb
+            }
+        };
+
+        // Materialise the pointer-block tree. Metadata pointer blocks live at
+        // 100.. (never used as a data address by `phys_for_logical`).
+        let sind_phys: u32 = 100; // single-indirect block (logical 12..12+ptrs)
+        let dind_phys: u32 = 101; // double-indirect block (logical 12+ptrs..)
+        let dind_l1_phys: u32 = 102; // its first second-level block
+        let mut store: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+
+        let mut direct = [0u32; 12];
+        for (lb, d) in direct.iter_mut().enumerate() {
+            *d = phys_for_logical(lb as u32);
+        }
+        let mut sind = alloc::vec![0u8; bs];
+        for i in 0..ptrs {
+            let p = phys_for_logical(12 + i as u32);
+            sind[i * 4..i * 4 + 4].copy_from_slice(&p.to_le_bytes());
+        }
+        store.insert(sind_phys, sind);
+        let mut dind = alloc::vec![0u8; bs];
+        dind[0..4].copy_from_slice(&dind_l1_phys.to_le_bytes());
+        store.insert(dind_phys, dind);
+        let mut dind_l1 = alloc::vec![0u8; bs];
+        for k in 0..ptrs {
+            let p = phys_for_logical(12 + ptrs as u32 + k as u32); // logical 268+k
+            dind_l1[k * 4..k * 4 + 4].copy_from_slice(&p.to_le_bytes());
+        }
+        store.insert(dind_l1_phys, dind_l1);
+
+        // The REAL indirect walk (direct / single / double-indirect), reading
+        // pointer blocks from `store` — the same shape as `resolve_block`.
+        let real_resolve = |lb: u32| -> u32 {
+            let read_ptr = |phys: u32, idx: usize| -> u32 {
+                let blk = store.get(&phys).expect("pointer block present");
+                u32::from_le_bytes([
+                    blk[idx * 4],
+                    blk[idx * 4 + 1],
+                    blk[idx * 4 + 2],
+                    blk[idx * 4 + 3],
+                ])
+            };
+            if (lb as usize) < 12 {
+                direct[lb as usize]
+            } else if (lb as usize) < 12 + ptrs {
+                read_ptr(sind_phys, lb as usize - 12)
+            } else {
+                let d = lb as usize - 12 - ptrs;
+                let l1 = read_ptr(dind_phys, d / ptrs);
+                read_ptr(l1, d % ptrs)
+            }
+        };
+
+        // The walk reproduces the intended layout at every boundary of interest.
+        for lb in [0u32, 11, 12, 13, 267, 268, 279, 280, 284, 285, 286, 299] {
+            assert_eq!(
+                real_resolve(lb),
+                phys_for_logical(lb),
+                "walk mismatch at lb={lb}"
+            );
+        }
+
+        let file_size = 300 * TEST_BS as u64;
+        let read_with = |offset: u64, len: usize, runs: &Cell<usize>| -> Vec<u8> {
+            let mut buf = alloc::vec![0u8; len];
+            read_file_data_coalesced::<()>(
+                file_size,
+                TEST_BS,
+                offset,
+                &mut buf,
+                u32::MAX,
+                |lb| Ok(real_resolve(lb)),
+                |phys, count, dst| {
+                    runs.set(runs.get() + 1);
+                    for k in 0..count {
+                        mock_block_bytes(
+                            phys + k,
+                            &mut dst[k as usize * bs..(k as usize + 1) * bs],
+                        );
+                    }
+                    Ok(())
+                },
+                |phys, off, dst| {
+                    let mut blk = alloc::vec![0u8; bs];
+                    mock_block_bytes(phys, &mut blk);
+                    dst.copy_from_slice(&blk[off..off + dst.len()]);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            buf
+        };
+        let ref_read = |offset: u64, len: usize| -> Vec<u8> {
+            let bs64 = TEST_BS as u64;
+            let mut buf = alloc::vec![0u8; len];
+            let to_read = len.min((file_size - offset) as usize);
+            let (mut done, mut pos) = (0usize, offset);
+            while done < to_read {
+                let lb = (pos / bs64) as u32;
+                let off = (pos % bs64) as usize;
+                let n = (bs - off).min(to_read - done);
+                let phys = real_resolve(lb);
+                if phys == 0 {
+                    buf[done..done + n].fill(0);
+                } else {
+                    let mut blk = alloc::vec![0u8; bs];
+                    mock_block_bytes(phys, &mut blk);
+                    buf[done..done + n].copy_from_slice(&blk[off..off + n]);
+                }
+                done += n;
+                pos += n as u64;
+            }
+            buf
+        };
+
+        for &(off, len) in &[
+            (0u64, 300 * bs),               // whole file across both boundaries
+            (11 * TEST_BS as u64, 4 * bs),  // straddle direct→single (11→12)
+            (267 * TEST_BS as u64, 4 * bs), // straddle single→double (267→268)
+            (279 * TEST_BS as u64, 8 * bs), // across the jump at 280
+            (284 * TEST_BS as u64, 4 * bs), // across the hole at 285
+        ] {
+            let runs = Cell::new(0);
+            let got = read_with(off, len, &runs);
+            let want = ref_read(off, len);
+            assert_eq!(got, want, "content mismatch at off={off} len={len}");
+        }
+
+        // The whole-file read collapses to exactly 3 device runs (logical
+        // 0..280, 280..285, 286..300) plus the zero-filled hole at 285 (no
+        // request): the coalescer merged across BOTH indirect boundaries (no
+        // spurious break at logical 12 or 268) yet broke at the real jump and
+        // the hole.
+        let runs = Cell::new(0);
+        let _ = read_with(0, 300 * bs, &runs);
+        assert_eq!(
+            runs.get(),
+            3,
+            "expected exactly 3 contiguous runs across the real indirect layout, got {}",
+            runs.get()
+        );
+    }
 }
