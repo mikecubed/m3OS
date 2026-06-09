@@ -14754,10 +14754,19 @@ fn cmd_vfs_bulkio_smoke(args: &SmokeBootArgs) {
     //   * + write-through-update cache (metadata RMW reads hit):         ~4,300
     //   * + deferred metadata flush (no sb/BGD read per allocation):     ~2,100
     // The threshold catches a regression of any of those (next stage up ~4,300).
-    // `write_calls` is reported (~5,800 here) but not yet asserted — the write
-    // side (data/bitmap/inode writes) is still being reduced (cap-raise + write
-    // coalescing + multi-block alloc).
     const MAX_READ_CALLS_DELTA: u64 = 3_500;
+    // Regression guard for the WRITE-side throughput work. Measured `write_calls`
+    // for this install at each stage:
+    //   * deferred metadata flush only (per-block data+zero+bitmap writes): ~5,759
+    //   * + 64 KiB write cap (inode flush amortized):                       ~4,083
+    //   * + data-write coalescing + zero-fill skip:                         ~2,546
+    //   * + multi-block allocation (one bitmap write per run):              ~1,836
+    // The write reduction IS the fairness mechanism — fewer device writes per
+    // WRITE request means lower per-request latency, so this also guards Track D
+    // (the >1 s WRITE requests that the multi-block alloc eliminated). The
+    // threshold catches a regression that loses the multi-block alloc (~2,546) or
+    // the coalescing (~4,083).
+    const MAX_WRITE_CALLS_DELTA: u64 = 2_400;
 
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
@@ -14864,10 +14873,20 @@ fn cmd_vfs_bulkio_smoke(args: &SmokeBootArgs) {
         );
         std::process::exit(SMOKE_EXIT_VFS_BULKIO_FAILED);
     }
+    if write_delta > MAX_WRITE_CALLS_DELTA {
+        eprintln!(
+            "vfs-bulkio-smoke: FAILED — Δwrite_calls {write_delta} exceeds {MAX_WRITE_CALLS_DELTA}; the \
+             64 KiB write cap / data-write coalescing / zero-fill skip / multi-block allocation appear \
+             to have regressed (next stage up ~2,546, then ~4,083). This also guards Track D fairness — \
+             more writes per WRITE request means higher per-request latency."
+        );
+        std::process::exit(SMOKE_EXIT_VFS_BULKIO_FAILED);
+    }
     println!(
         "vfs-bulkio-smoke: PASSED — install I/O: {delta} block reads + {write_delta} block writes \
-         (reads ~36k → {delta} via the write-through cache + 64 KiB read cap + coalescing + deferred \
-         metadata flush; the write side is still being reduced) in {elapsed}s"
+         (≤ {MAX_READ_CALLS_DELTA} / {MAX_WRITE_CALLS_DELTA}; from ~36k reads + ~7.8k writes originally — \
+         read cache + 64 KiB caps + read/write coalescing + deferred metadata flush + multi-block \
+         allocation, a ~11x total-I/O reduction) in {elapsed}s"
     );
 }
 
