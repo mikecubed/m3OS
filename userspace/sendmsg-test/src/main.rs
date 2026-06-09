@@ -53,8 +53,18 @@ fn fail(reason: &[u8]) -> ! {
     exit(2)
 }
 
+// Phase 86f FIX 2: naked _start trampoline.  This binary ignores argv/envp.
+#[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
+    core::arch::naked_asm!(
+        "xor rbp, rbp",
+        "call {f}",
+        f = sym sendmsg_test_main,
+    );
+}
+
+fn sendmsg_test_main() -> ! {
     let _ = write(STDOUT_FILENO, b"SENDMSG_SMOKE:scm-rights:begin\n");
 
     // 1. Pipe.

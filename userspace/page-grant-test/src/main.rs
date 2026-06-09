@@ -51,8 +51,18 @@ fn sentinel_byte_for_page(page_index: usize) -> u8 {
     0x40 + ((page_index & 0x3F) as u8)
 }
 
+// Phase 86f FIX 2: naked _start trampoline.  This binary ignores argv/envp.
+#[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
+    core::arch::naked_asm!(
+        "xor rbp, rbp",
+        "call {f}",
+        f = sym page_grant_test_main,
+    );
+}
+
+fn page_grant_test_main() -> ! {
     let _ = write(STDOUT_FILENO, b"PAGE_GRANT_SMOKE:roundtrip:begin\n");
 
     // 1. Reserve REGION_BYTES of contiguous heap via brk. The initial brk

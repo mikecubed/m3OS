@@ -56,8 +56,18 @@ const EINVAL_NEG: i64 = -22;
 
 const PAGE: u64 = 4096;
 
+// Phase 86f FIX 2: naked _start trampoline.  This binary ignores argv/envp.
+#[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
+    core::arch::naked_asm!(
+        "xor rbp, rbp",
+        "call {f}",
+        f = sym wx_violation_main,
+    );
+}
+
+fn wx_violation_main() -> ! {
     let _ = write(STDOUT_FILENO, b"WX_VIOLATION:smoke:begin\n");
 
     // 1. Allocate one anonymous RW page. fd is ignored for MAP_ANONYMOUS,

@@ -288,6 +288,27 @@ impl XSaveArea {
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
         self.bytes.as_mut_ptr()
     }
+
+    /// Phase 86f Track B.1 — return a slice of the raw saved bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Phase 86f Track B.1 — return a mutable slice of the raw saved bytes.
+    ///
+    /// Used by `sanitize_xsave_header` after `copy_from_bytes` to patch the
+    /// header fields before `xrstor64`.
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes
+    }
+
+    /// Phase 86f Track B.1 — overwrite the saved bytes from a slice.
+    ///
+    /// `src` must be exactly `XSAVE_AREA_SIZE` bytes; panics if not
+    /// (caller bug — the signal frame always writes a full area).
+    pub fn copy_from_bytes(&mut self, src: &[u8]) {
+        self.bytes.copy_from_slice(src);
+    }
 }
 
 /// Phase 57e Bug #3 fix — per-task user GPR snapshot.

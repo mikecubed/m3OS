@@ -6,8 +6,18 @@
 
 use syscall_lib::exit;
 
+// Phase 86f FIX 2: naked _start trampoline.  This binary ignores argv/envp.
+#[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
+    core::arch::naked_asm!(
+        "xor rbp, rbp",
+        "call {f}",
+        f = sym exit0_main,
+    );
+}
+
+fn exit0_main() -> ! {
     exit(0)
 }
 

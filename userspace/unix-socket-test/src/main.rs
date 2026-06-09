@@ -297,8 +297,18 @@ fn test_datagram() -> bool {
     true
 }
 
+// Phase 86f FIX 2: naked _start trampoline.  This binary ignores argv/envp.
+#[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
+    core::arch::naked_asm!(
+        "xor rbp, rbp",
+        "call {f}",
+        f = sym unix_socket_test_main,
+    );
+}
+
+fn unix_socket_test_main() -> ! {
     write_str(1, "=== Unix Domain Socket Tests ===\n");
 
     let mut pass = 0;

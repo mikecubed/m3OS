@@ -658,7 +658,12 @@ pub const SS_ONSTACK: u32 = 1;
 /// sigaltstack flag: alt stack is disabled.
 pub const SS_DISABLE: u32 = 2;
 /// Minimum signal stack size (bytes).
-pub const MINSIGSTKSZ: u64 = 2048;
+///
+/// The extended signal frame (Phase 86f) is SIGFRAME_SIZE (560) + FPU area
+/// (832) = 1392 bytes.  One frame + handler locals + alignment padding
+/// overflows a 2048-byte stack, so we raise the minimum to 4096 bytes —
+/// matching the Linux AT_MINSIGSTKSZ precedent for x86_64 with XSAVE.
+pub const MINSIGSTKSZ: u64 = 4096;
 
 /// What to do when a signal is delivered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

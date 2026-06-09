@@ -2731,8 +2731,30 @@ extern "C" fn sigterm_handler(_sig: i32) {
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// Naked trampoline that satisfies the SysV AMD64 ABI process-entry contract.
+///
+/// The kernel hands control here with RSP ≡ 0 (mod 16) — the psABI §3.4.1
+/// process-entry requirement.  `_start` is naked (no compiler-generated
+/// prologue), so RSP is not yet decremented by a `push rbp`.  We do a `call`
+/// to `init_main`, which pushes an 8-byte return address → RSP ≡ 8 (mod 16)
+/// at `init_main`'s entry.  `init_main`'s compiler-generated prologue then
+/// does `push rbp` → RSP ≡ 0 (mod 16) → `sub rsp, N` (N % 16 == 0) →
+/// RSP ≡ 0 (mod 16).  SSE `movaps` stack spills inside `init_main` are
+/// therefore 16-byte aligned, as required.
+///
+/// Phase 86f Track B rev2 — fixing MAJOR 1: make init consistent with the
+/// `entry_point!` naked-`_start` convention used by every other userspace
+/// binary.
+#[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
+    core::arch::naked_asm!(
+        "call {entry}",
+        entry = sym init_main,
+    );
+}
+
+fn init_main() -> ! {
     // Fds 0/1/2 are pre-opened by the kernel for PID 1.
     write_str(STDOUT_FILENO, "\nm3OS init (PID 1) — service manager\n");
 

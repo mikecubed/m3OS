@@ -1569,9 +1569,26 @@ fn build_userspace_bins() {
 fn build_ldso() {
     let root = workspace_root();
     let libs = ensure_generated_libs_dir(&root);
-    let userspace_target = root.join("x86_64-m3os.json");
-    let userspace_target_str = userspace_target.to_str().unwrap().to_string();
 
+    // Phase 86f rev2 — keep `build_ldso` on `x86_64-unknown-none` (the built-in
+    // Rust target) rather than the `x86_64-m3os.json` custom target.
+    //
+    // The built-in `x86_64-unknown-none` target has
+    // `"position-independent-executables": true` (PIE), so rust-lld produces
+    // an `ET_DYN` binary — which is what the kernel's `load_interp_elf` requires
+    // when it maps the interpreter for any `PT_INTERP`-bearing dynamic ELF.
+    //
+    // The `x86_64-m3os.json` custom target has
+    // `"position-independent-executables": false` (for the kernel and static
+    // userspace binaries), so building `ld-musl` against it would produce
+    // `ET_EXEC` and break `dynlink-smoke`.
+    //
+    // The dynamic linker does not need SSE — it does no floating-point work
+    // of its own — so compiling it soft-float (`x86_64-unknown-none` still has
+    // `-mmx,-sse`) is safe: the FPU state passes through ldso untouched.
+    //
+    // The `build.rs` link-arg gate (`if target == "x86_64-unknown-none"`)
+    // therefore remains correct and does not need updating.
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
         .args([
@@ -1582,10 +1599,9 @@ fn build_ldso() {
             "--bin",
             "ld-musl-x86_64-so-1",
             "--target",
-            userspace_target_str.as_str(),
+            "x86_64-unknown-none",
             "-Zbuild-std=core,compiler_builtins",
             "-Zbuild-std-features=compiler-builtins-mem",
-            "-Zjson-target-spec",
         ])
         .status()
         .expect("failed to invoke cargo build for ld-musl-x86_64-so-1");
@@ -1595,7 +1611,7 @@ fn build_ldso() {
         std::process::exit(1);
     }
 
-    let src = root.join("target/x86_64-m3os/release/ld-musl-x86_64-so-1");
+    let src = root.join("target/x86_64-unknown-none/release/ld-musl-x86_64-so-1");
     let dst = libs.join("ld-musl-x86_64.so.1");
     fs::copy(&src, &dst).unwrap_or_else(|e| {
         panic!("failed to copy ld.so to {}: {e}", dst.display());

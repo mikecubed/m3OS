@@ -6,8 +6,18 @@ use syscall_lib::{
     O_RDONLY, STDOUT_FILENO, close, exit, geteuid, open, read, write, write_str, write_u64,
 };
 
+// Phase 86f FIX 2: naked _start trampoline.  This binary ignores argv/envp.
+#[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
+    core::arch::naked_asm!(
+        "xor rbp, rbp",
+        "call {f}",
+        f = sym whoami_main,
+    );
+}
+
+fn whoami_main() -> ! {
     let euid = geteuid();
 
     let mut passwd_buf = [0u8; 2048];
