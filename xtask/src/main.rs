@@ -244,9 +244,12 @@ const SMOKE_EXIT_GH_SMOKE_FAILED: i32 = 80;
 /// Phase 87 — `cargo xtask vfs-bulkio-smoke` exit code. Boots m3OS, reads
 /// `/proc/blkstats` before + after a `pkg install` of a multi-MiB package
 /// (whose `.m3pkg` is read in 256 KiB chunks → coalesced into multi-block
-/// `read_sectors` by Track B.1), and asserts the block-request count for that
-/// read stayed under the batching threshold — the regression guard that the
-/// contiguous-run coalescing did not silently revert to per-block round-trips.
+/// `read_sectors`, and written back through the batched write path), and asserts
+/// BOTH the `read_calls` AND `write_calls` deltas stayed under their batching
+/// thresholds — the regression guard that the contiguous-run read/write coalescing
+/// did not silently revert to per-block round-trips. Then `pkg verify` re-reads
+/// every installed file and SHA-checks it (read-back-compare guarding the
+/// zero-fill-skip write path).
 const SMOKE_EXIT_VFS_BULKIO_FAILED: i32 = 81;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -840,10 +843,11 @@ fn main() {
         }
         // Phase 87 — VFS bulk-I/O throughput gate. Boots m3OS, reads
         // /proc/blkstats before + after a `pkg install` of a multi-MiB package
-        // (read in 256 KiB chunks → coalesced into multi-block read_sectors by
-        // Track B.1), and asserts the block-request count for that read stayed
-        // under the batching threshold (a regression to per-block round-trips
-        // would blow past it).
+        // (read in 256 KiB chunks → coalesced into multi-block read_sectors, and
+        // written back through the batched write path), and asserts BOTH the
+        // read_calls AND write_calls deltas stayed under their batching thresholds
+        // (a regression to per-block round-trips would blow past them), then runs
+        // `pkg verify` as a read-back-compare.
         Some("vfs-bulkio-smoke") => {
             let smoke_args =
                 parse_smoke_boot_args("vfs-bulkio-smoke", &args[2..]).unwrap_or_else(|err| {
@@ -14911,8 +14915,9 @@ fn cmd_vfs_bulkio_smoke(args: &SmokeBootArgs) {
 }
 
 /// Serial script for `vfs-bulkio-smoke`: snapshot `/proc/blkstats`, install a
-/// multi-MiB package (reads its `.m3pkg` through the batched path), snapshot
-/// again. The two `read_calls` lines are parsed host-side from the serial dump.
+/// multi-MiB package (reads its `.m3pkg` through the batched path and writes it
+/// back through the batched write path), snapshot again. Both the `read_calls`
+/// and `write_calls` before/after lines are parsed host-side from the serial dump.
 fn vfs_bulkio_smoke_steps(pkg: &'static str) -> Vec<SmokeStep> {
     let install_cmd: &'static str = Box::leak(format!("pkg install {pkg}\n").into_boxed_str());
     let ok_pattern: &'static str = Box::leak(format!("pkg install: {pkg}: OK").into_boxed_str());

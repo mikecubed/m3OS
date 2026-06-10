@@ -526,7 +526,9 @@ pub fn inode_index_in_group(inode_num: u32, inodes_per_group: u32) -> u32 {
 /// `MAX_SECTORS_PER_REQUEST` = 256 sectors = 32 blocks; the `sys_block_read`
 /// path 128 sectors = 16 blocks), so a run longer than that would be rejected.
 /// A contiguous file longer than the cap is split into back-to-back runs of at
-/// most `max_run_blocks` (still a huge win over per-block). Must be `>= 1`.
+/// most `max_run_blocks` (still a huge win over per-block). A value of `0` is
+/// clamped up to `1` (see `max_run_blocks.max(1)` below) so the run loop always
+/// makes progress.
 ///
 /// Returns the number of bytes read (`min(buf.len(), file_size - offset)`),
 /// byte-for-byte identical to a naive per-block reader over the same data.
