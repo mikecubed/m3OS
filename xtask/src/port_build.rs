@@ -3527,6 +3527,12 @@ fn build_llvm(
             .arg(format!("-DCMAKE_CXX_FLAGS={cfx}"))
             .arg(format!("-DCMAKE_EXE_LINKER_FLAGS={ldx}"))
             .arg(format!("-DCMAKE_SHARED_LINKER_FLAGS={ldx}"))
+            // The musl sysroot has no C++ stdlib yet (libc++ is what THIS stage
+            // builds), so cmake's default link-based compiler ABI check fails
+            // pulling `-lstdc++` (clang defaults to libstdc++ on Linux — notably
+            // on Arch). Make the checks compile-only (build a static lib, no
+            // link) — the canonical LLVM-runtimes cross-build setting.
+            .arg("-DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY")
             .arg("-DLLVM_ENABLE_RUNTIMES=libcxx;libcxxabi;libunwind;compiler-rt")
             .arg("-DLIBCXX_ENABLE_SHARED=OFF")
             .arg("-DLIBCXXABI_ENABLE_SHARED=OFF")
@@ -3535,6 +3541,12 @@ fn build_llvm(
             .arg("-DLIBCXXABI_ENABLE_STATIC=ON")
             .arg("-DLIBUNWIND_ENABLE_STATIC=ON")
             .arg("-DLIBCXX_HAS_MUSL_LIBC=ON")
+            // musl does NOT provide glibc's `__cxa_thread_atexit_impl`, and with
+            // STATIC_LIBRARY try-compiles the auto-detection can't link-probe for
+            // it, so state it explicitly: libc++abi uses its own pthread-key
+            // thread_local-dtor fallback instead of the (absent) libc symbol —
+            // otherwise the final `lld` link fails `undefined: __cxa_thread_atexit_impl`.
+            .arg("-DLIBCXXABI_HAS_CXA_THREAD_ATEXIT_IMPL=OFF")
             .arg("-DLIBCXX_CXX_ABI=libcxxabi")
             .arg("-DLIBCXXABI_USE_LLVM_UNWINDER=ON")
             .arg("-DLIBCXXABI_ENABLE_STATIC_UNWINDER=ON")
