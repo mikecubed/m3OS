@@ -3426,6 +3426,17 @@ fn build_llvm(
             "llvm build: cmake and ninja are required (apt install cmake ninja-build)".into(),
         );
     }
+    // The cross-build links the runtimes + clang with `-fuse-ld=lld`, so the
+    // host clang needs LLVM's linker on PATH. On Debian the clang package bundles
+    // it; Arch ships it as a separate `lld` package.
+    if !probe_tool_on_path("ld.lld") {
+        return Err(
+            "llvm build: `ld.lld` not found on PATH — the cross-build links with \
+             `-fuse-ld=lld`. Install LLVM's linker (Debian/Ubuntu: `apt install lld`; \
+             Arch: `pacman -S lld`)."
+                .into(),
+        );
+    }
 
     // Persistent cross-build workspace, OUTSIDE the port work dir that
     // `port_build` wipes + re-extracts each run. `port_build` re-extracts
@@ -3692,7 +3703,11 @@ fn assemble_musl_sysroot(sysroot: &Path) -> Result<(), String> {
         "musl headers",
     )?;
     cp_a(&format!("{musl_lib}/."), lib.to_str().unwrap(), "musl libs")?;
-    // Linux UAPI headers (musl ships none) — symlink the kernel uapi dirs.
+    // Linux UAPI headers — symlink the host kernel uapi dirs into the sysroot.
+    // Debian's `musl-dev` ships NO UAPI, so the symlink provides it. Arch's
+    // `musl` package BUNDLES the UAPI (`linux/`, `asm/`, `asm-generic/`), so the
+    // `cp_a` above already copied them — in that case the dir is present and we
+    // leave it (symlinking over a populated dir fails with EEXIST).
     let asm_dir = linux_uapi_arch_include().join("asm");
     for (target, name) in [
         ("/usr/include/linux", "linux"),
@@ -3700,7 +3715,10 @@ fn assemble_musl_sysroot(sysroot: &Path) -> Result<(), String> {
         (asm_dir.to_str().unwrap_or("/usr/include/asm"), "asm"),
     ] {
         let link = inc.join(name);
-        let _ = fs::remove_file(&link);
+        if link.exists() {
+            // Already provided (Arch musl bundles the UAPI) — keep it.
+            continue;
+        }
         if Path::new(target).exists() {
             std::os::unix::fs::symlink(target, &link)
                 .map_err(|e| format!("symlink sysroot/include/{name}: {e}"))?;
