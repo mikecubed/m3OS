@@ -13,7 +13,7 @@
 | B | Complete VFS stat fields (dev/blocks/times) + per-mount `st_dev` + identity-consistency tests | A | ✅ Done |
 | C | Reconcile ext2: `BlockReader` trait in `kernel_core`, share resolve/read logic | — | In progress |
 | D | `VFS_OPEN` returns inode; drop the 85d kernel-side open-time resolve | C | ✅ Done (impl; clang-smoke at checkpoint) |
-| E | `statx` (implement onto `fill_stat`, or document the ENOSYS fallback) | A | Planned |
+| E | `statx` (implement onto `fill_stat`, or document the ENOSYS fallback) | A | ✅ Done (documented ENOSYS) |
 | F | Conformance + cross-impl parity test suites; promote `M3OS_CLANG_STRESS` to a CI gate | A, B, C | Planned |
 | G | Atomic `pwrite64` — offset-parameterized backend writes (write-path correctness) | C | Planned |
 | H | *(ancillary, test-harness)* Multi-pattern `WaitPassOrFail` fail matcher for `clang-smoke` | — | ✅ Done |
@@ -117,7 +117,7 @@
 **Why it matters:** Newer libc/toolchains prefer `statx`; an unimplemented `statx` (ENOSYS) silently routes callers back toward the older paths and is a compatibility cliff.
 
 **Acceptance:**
-- [ ] `statx` implemented (mapping `FileMeta` → `struct statx`), **or** a documented, tested decision that it returns ENOSYS and callers fall back cleanly.
+- [x] Documented, tested decision: `statx`(332) returns **ENOSYS** via a dedicated `sys_linux_statx` handler (doc-commented with the rationale). Now that Track A made `fstatat` fully correct via `fill_stat`, the libc `statx → newfstatat` fallback is **lossless** — the "compatibility cliff" the post-mortem warned of is gone. Tested in-OS: `smoke-runner`'s `stat-identity` stage asserts a raw `statx(332)` returns `-ENOSYS`; the clang/python toolchain gates exercise the libc fallback end-to-end.
 
 ---
 

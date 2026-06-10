@@ -946,6 +946,29 @@ fn verify_stat_identity() -> Result<(), i32> {
         }
     }
 
+    // (4) Phase 88 Track E — statx(332) is intentionally unimplemented; the
+    // kernel must report -ENOSYS so libc falls back to the (now-correct,
+    // fill_stat-complete) newfstatat. A 0/positive return would mean a
+    // half-built statx is leaking uninitialised metadata to callers.
+    let mut statxbuf = [0u8; 256];
+    let statx_ret = unsafe {
+        syscall_lib::syscall5(
+            332,
+            (-100_i64) as u64,            // AT_FDCWD
+            STAT_ID_FILE.as_ptr() as u64, // pathname
+            0,                            // flags
+            0x7ff,                        // STATX_BASIC_STATS mask
+            statxbuf.as_mut_ptr() as u64, // statxbuf
+        )
+    };
+    if (statx_ret as i64) != -38 {
+        return Err(fail(
+            "stat-identity",
+            "statx(332) did not return -ENOSYS",
+            89,
+        ));
+    }
+
     Ok(())
 }
 

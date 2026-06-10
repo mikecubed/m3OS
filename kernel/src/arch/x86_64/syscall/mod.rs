@@ -1321,6 +1321,7 @@ mod syscall_nr {
     pub const GETDENTS64: u64 = 217;
     pub const OPENAT: u64 = 257;
     pub const NEWFSTATAT: u64 = 262;
+    pub const STATX: u64 = 332;
     pub const LINKAT: u64 = 265;
     pub const SYMLINKAT: u64 = 266;
     pub const READLINKAT: u64 = 267;
@@ -1809,6 +1810,7 @@ pub extern "C" fn syscall_handler(
         GETDENTS64 => sys_linux_getdents64(arg0, arg1, arg2),
         OPENAT => sys_linux_openat(arg0, arg1, arg2),
         NEWFSTATAT => sys_linux_fstatat(arg0, arg1, arg2, per_core_syscall_arg3()),
+        STATX => sys_linux_statx(),
         LINKAT => sys_linkat(
             arg0,
             arg1,
@@ -10190,6 +10192,26 @@ pub(super) fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
     // (st_dev, st_ino) is unique across filesystems.
     meta.dev = stat_dev_for_backend(&entry.backend);
     write_stat_to_user(stat_ptr, &meta)
+}
+
+/// Phase 88 Track E — `statx(2)` (332). m3OS intentionally returns `-ENOSYS`
+/// here rather than implementing the `struct statx` layout natively.
+///
+/// Rationale (a *documented* decision, not an oversight): glibc and musl's
+/// `statx()` wrappers fall back to `newfstatat` when the kernel reports
+/// `ENOSYS`, and Phase 88 Track A made that fallback **lossless** — the
+/// `fill_stat` serializer populates every `struct stat` field
+/// (dev/ino/nlink/mode/uid/gid/size/blocks/times) that `statx` would report, so
+/// no metadata is dropped on the fallback path. The earlier post-mortem flagged
+/// an ENOSYS `statx` as a "compatibility cliff" specifically because the older
+/// `fstat`/`fstatat` paths were themselves buggy (the `st_ino = 0` defect); with
+/// those paths now correct and consistent (`fstat == fstatat`), the cliff is
+/// gone. A native `statx` (transcoding `FileMeta` → `struct statx` with the
+/// `STATX_*` request mask) is a low-value deferred follow-up. The contract is
+/// verified by the in-OS `statx → ENOSYS` assertion in `smoke-runner` and by the
+/// clang/python toolchain gates, which call `statx` via libc and fall back.
+fn sys_linux_statx() -> u64 {
+    NEG_ENOSYS
 }
 
 pub(super) fn sys_statfs(path_ptr: u64, buf_ptr: u64) -> u64 {
