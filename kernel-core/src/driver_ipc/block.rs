@@ -32,6 +32,14 @@ pub const BLK_WRITE: u16 = 0x5502;
 /// IPC message label for a block status / reply envelope.
 pub const BLK_STATUS: u16 = 0x5503;
 
+/// IPC message label for a cache-flush request — commit the device's volatile
+/// write-back cache to media. Lets a write-back driver (one that returns from
+/// `BLK_WRITE` as soon as the data is in the drive cache, rather than issuing a
+/// durability barrier per write) be told to make prior writes durable at a
+/// clean shutdown boundary. Reuses [`BlkRequestHeader`] (lba / sector_count /
+/// flags = 0, no payload) and [`BlkReplyHeader`] (status only, bytes = 0).
+pub const BLK_FLUSH: u16 = 0x5504;
+
 /// Hard upper bound on the number of sectors a single request may carry.
 ///
 /// The bound is enforced at the `RemoteBlockDevice` facade (Phase 55b Track

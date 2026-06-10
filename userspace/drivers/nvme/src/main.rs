@@ -59,7 +59,9 @@ use driver_runtime::{
     DeviceCapKey, DeviceHandle, DmaBuffer, DriverRuntimeError, IrqNotification, Mmio,
 };
 #[cfg(not(test))]
-use kernel_core::driver_ipc::block::{BLK_READ, BLK_STATUS, BLK_WRITE, BlockDriverError};
+use kernel_core::driver_ipc::block::{
+    BLK_FLUSH, BLK_READ, BLK_STATUS, BLK_WRITE, BlockDriverError,
+};
 #[cfg(not(test))]
 use kernel_core::nvme as knvme;
 #[cfg(not(test))]
@@ -74,8 +76,8 @@ use crate::init::{
 };
 #[cfg(not(test))]
 use crate::io::{
-    IO_QUEUE_ID, IoQueuePair, build_create_io_cq_command, build_create_io_sq_command, handle_read,
-    handle_write,
+    IO_QUEUE_ID, IoQueuePair, build_create_io_cq_command, build_create_io_sq_command, handle_flush,
+    handle_read, handle_write,
 };
 
 #[cfg(not(test))]
@@ -567,6 +569,14 @@ fn run_io_server(mut ctx: BringUpContext) -> Result<(), InitError> {
                             status: BlockDriverError::Ok,
                             bytes: 0,
                         },
+                        payload_grant: 0,
+                        bulk: alloc::vec::Vec::new(),
+                    }
+                }
+                BLK_FLUSH => {
+                    let header = handle_flush(&ctx.mmio, &mut io_queue, ctx.nsid, &req.header);
+                    BlkReply {
+                        header,
                         payload_grant: 0,
                         bulk: alloc::vec::Vec::new(),
                     }

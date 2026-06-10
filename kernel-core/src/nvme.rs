@@ -121,6 +121,9 @@ pub const OP_CREATE_IO_SQ: u8 = 0x01;
 pub const OP_IO_READ: u8 = 0x02;
 /// I/O Write (NVM command set).
 pub const OP_IO_WRITE: u8 = 0x01;
+/// I/O Flush (NVM command set) — commit the controller's volatile write cache
+/// for the namespace to non-volatile media. No data transfer.
+pub const OP_IO_FLUSH: u8 = 0x00;
 
 /// Identify CNS: namespace structure.
 pub const IDENTIFY_CNS_NAMESPACE: u32 = 0x00;

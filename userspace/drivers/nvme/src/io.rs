@@ -165,6 +165,14 @@ pub fn build_write_command(
     cmd
 }
 
+/// Encode an NVMe I/O Flush command (opcode 0x00) — commit the namespace's
+/// volatile write cache to media. No PRP, no data, no command dwords.
+pub fn build_flush_command(nsid: u32, cid: u16) -> knvme::NvmeCommand {
+    let mut cmd = knvme::NvmeCommand::new(knvme::OP_IO_FLUSH, cid);
+    cmd.nsid = nsid;
+    cmd
+}
+
 // ---------------------------------------------------------------------------
 // Create I/O CQ / SQ admin command encoders
 // ---------------------------------------------------------------------------
@@ -762,6 +770,32 @@ mod driver_layer {
         }
     }
 
+    /// Serve one `BLK_FLUSH`: commit the namespace's volatile write cache to
+    /// media via an NVMe Flush command. Writes complete write-back (no per-write
+    /// flush), so this is the durability barrier — issued by the kernel at clean
+    /// shutdown via `blk::flush`.
+    pub fn handle_flush(
+        mmio: &Mmio<NvmeRegsTag>,
+        queue: &mut IoQueuePair,
+        nsid: u32,
+        header: &BlkRequestHeader,
+    ) -> BlkReplyHeader {
+        let (cid, _tail) = queue.bookkeeping.allocate_slot();
+        let cmd = build_flush_command(nsid, cid);
+        let slot_index = (queue.bookkeeping.sq_tail() + queue.bookkeeping.entries() - 1)
+            % queue.bookkeeping.entries();
+        queue.submit_command(slot_index, cmd);
+        queue.ring_sq_doorbell(mmio);
+        match queue.wait_completion(mmio, cid) {
+            Some(slot) if slot.status_code == 0 => BlkReplyHeader {
+                cmd_id: header.cmd_id,
+                status: BlockDriverError::Ok,
+                bytes: 0,
+            },
+            _ => error_reply(header.cmd_id, BlockDriverError::IoError),
+        }
+    }
+
     /// Build an error reply header.
     fn error_reply(cmd_id: u64, status: BlockDriverError) -> BlkReplyHeader {
         BlkReplyHeader {
@@ -806,7 +840,9 @@ mod driver_layer {
 }
 
 #[cfg(not(test))]
-pub use driver_layer::{DRAIN_MAX_PASS, IO_SPIN_BUDGET, IoQueuePair, handle_read, handle_write};
+pub use driver_layer::{
+    DRAIN_MAX_PASS, IO_SPIN_BUDGET, IoQueuePair, handle_flush, handle_read, handle_write,
+};
 
 // ---------------------------------------------------------------------------
 // Tests
