@@ -14639,7 +14639,7 @@ fn gh_smoke_steps(
         // it under 600s, but in the AUTH configuration (the install has just
         // written ~55 MB + the seeded config, leaving the VFS more loaded) it has
         // been observed to exceed even 1200s — this step is VFS-throughput-bound,
-        // the exact bottleneck Phase 92 (VFS bulk I/O) targets. 1200s is the step
+        // the exact bottleneck Phase 87 (VFS bulk I/O) targets. 1200s is the step
         // ceiling; the global --timeout is the real backstop.
         timeout_secs: 1200,
         label: "gh-smoke: static Go gh runs on the 86d runtime (gh version)",

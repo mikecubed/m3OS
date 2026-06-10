@@ -72,8 +72,14 @@ pub fn init() {
 /// by the driver).
 #[allow(dead_code)]
 pub fn read_sectors(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(), u8> {
-    // Phase 87 Track A — count the round-trip + sectors moved (one call == one
-    // kernel↔driver request, the cost the batching work collapses).
+    // Phase 87 Track A — count the blk-layer dispatch call + sectors moved. This
+    // deliberately counts one per `read_sectors` invocation (the kernel↔driver
+    // round-trip the ext2/vfs coalescing collapses), NOT device-level requests:
+    // the VirtIO backend fans a single call out to `count` per-sector requests
+    // internally, but that is below the layer Phase 87 optimizes — counting it
+    // here would make coalescing N one-sector calls into one N-sector call show no
+    // gain. `BLK_READ_SECTORS` records the sector volume, so the per-call vs
+    // per-sector dimensions stay separable regardless of backend.
     BLK_READ_CALLS.fetch_add(1, Ordering::Relaxed);
     BLK_READ_SECTORS.fetch_add(count as u64, Ordering::Relaxed);
     if remote::is_registered() {
@@ -92,7 +98,9 @@ pub fn read_sectors(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(
 /// bulk buffer.
 #[allow(dead_code)]
 pub fn write_sectors(start_sector: u64, count: usize, buf: &[u8]) -> Result<(), u8> {
-    // Phase 87 Track A — count the round-trip + sectors moved.
+    // Phase 87 Track A — count the blk-layer dispatch call + sectors moved (see
+    // `read_sectors`: one per invocation — the round-trip coalescing collapses,
+    // NOT device-level requests, which the VirtIO backend fans out per sector).
     BLK_WRITE_CALLS.fetch_add(1, Ordering::Relaxed);
     BLK_WRITE_SECTORS.fetch_add(count as u64, Ordering::Relaxed);
     if remote::is_registered() {

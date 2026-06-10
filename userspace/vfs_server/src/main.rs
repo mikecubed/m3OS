@@ -91,10 +91,14 @@ struct Ext2State {
     /// Phase 87 — bounded read-through block cache. vfs_server was previously
     /// uncached, so every path-resolution re-read its directory / inode / bitmap
     /// / indirect blocks from disk (a `pkg install` issued tens of thousands of
-    /// per-block `block_read` round-trips). This caches recently-read ext2 blocks
-    /// by block number; `write_sectors` invalidates any overlapping block so the
-    /// write authority never serves stale data (mirrors the kernel engine's
-    /// `block_cache` + invalidate-on-write). Bounded at `BLOCK_CACHE_MAX` blocks.
+    /// per-block `block_read` round-trips). This caches ext2 blocks by block
+    /// number; insertion is fill-only — once `BLOCK_CACHE_MAX` blocks are held it
+    /// stops admitting new blocks (no eviction), so it retains the first N distinct
+    /// blocks seen rather than an LRU working set. `BLOCK_CACHE_MAX` is sized
+    /// (16 MiB) to hold a whole package's metadata working set across an install,
+    /// so the cap is not reached for the target workload. `write_sectors`
+    /// invalidates any overlapping block so the write authority never serves stale
+    /// data (mirrors the kernel engine's `block_cache` + invalidate-on-write).
     block_cache: RefCell<BTreeMap<u32, Vec<u8>>>,
     /// Phase 87 — metadata write-back. Count of alloc/free ops since the last
     /// superblock+BGD flush (see `mark_meta_dirty`). Deferring the summary flush

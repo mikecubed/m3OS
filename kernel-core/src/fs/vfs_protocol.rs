@@ -157,10 +157,14 @@ pub const VFS_LINK: u64 = 24;
 /// Node-kind selector encoded in `VFS_CREATE` `data[2]` bits 16..18.
 pub const VFS_CREATE_KIND_SHIFT: u32 = 16;
 
-/// Maximum bytes per single VFS_READ reply bulk payload.
+/// Legacy 4 KiB (one ext2 block) size baseline. Phase 87 split the read-reply cap
+/// into `VFS_MAX_PREAD` (64 KiB) and the write-request cap into `VFS_MAX_PWRITE`,
+/// so `VFS_READ`/`VFS_PREAD` replies are no longer bounded by this constant — it
+/// now only serves as the minimum/sanity floor those larger caps are validated
+/// against (see the asserts below).
 pub const VFS_MAX_READ: usize = 4096;
 
-/// Phase 92 — maximum bytes per single `VFS_PREAD` reply bulk payload.
+/// Phase 87 — maximum bytes per single `VFS_PREAD` reply bulk payload.
 ///
 /// Decoupled from (and larger than) `VFS_MAX_READ`: a read reply travels in the
 /// unbounded bulk `Vec` (capped only by the IPC `MAX_BULK_LEN` = 80 KiB), not in
