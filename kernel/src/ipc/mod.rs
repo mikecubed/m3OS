@@ -555,6 +555,20 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
                 _ => 0,
             }
         }
+        29 => {
+            // Phase 87: ipc_recv_msg_timeout(ep_cap, msg_ptr, buf_ptr, buf_len,
+            // deadline_ns) — like ipc_recv_msg (opcode 15) but with an absolute
+            // CLOCK_MONOTONIC-ns deadline. Returns the message label on a
+            // message wake, or NEG_ETIMEDOUT if the deadline expires first. Lets
+            // a request server wake periodically (when otherwise idle) to flush
+            // deferred state instead of blocking indefinitely in recv.
+            match cap {
+                Capability::Endpoint(ep_id) => {
+                    ipc_recv_msg_timeout(task_id, ep_id, arg1, arg2, arg3, arg4)
+                }
+                _ => u64::MAX,
+            }
+        }
         _ => u64::MAX,
     }
 }
@@ -1023,6 +1037,58 @@ fn ipc_recv_msg(
     } else {
         msg.label
     }
+}
+
+/// Phase 87 — deadline variant of [`ipc_recv_msg`]. Blocks on `ep_id` until a
+/// message arrives or the absolute `deadline_ns` (CLOCK_MONOTONIC) expires. On a
+/// message wake, writes the header + bulk to userspace exactly like
+/// `ipc_recv_msg` and returns the label; on deadline expiry, writes nothing and
+/// returns `NEG_ETIMEDOUT` (-110). No notification fast-path — request servers
+/// using this (vfs_server's periodic-flush loop) have no bound notification.
+fn ipc_recv_msg_timeout(
+    task_id: crate::task::TaskId,
+    ep_id: endpoint::EndpointId,
+    msg_ptr: u64,
+    buf_ptr: u64,
+    buf_len: u64,
+    deadline_ns: u64,
+) -> u64 {
+    use crate::task::scheduler;
+    const NEG_ETIMEDOUT: u64 = (-110_i64) as u64;
+
+    let deadline_ticks = deadline_ns_to_ticks(deadline_ns);
+    let msg = endpoint::recv_msg_with_deadline(task_id, ep_id, Some(deadline_ticks));
+
+    if msg.label == NEG_ETIMEDOUT {
+        return NEG_ETIMEDOUT;
+    }
+    if msg.label == u64::MAX {
+        return u64::MAX;
+    }
+
+    // Header + bulk copy is identical to `ipc_recv_msg`'s message path.
+    if msg_ptr != 0 {
+        let header = build_cap_msg_wire(&msg);
+        if UserSliceWo::new(msg_ptr, header.len())
+            .and_then(|s| s.copy_from_kernel(&header))
+            .is_err()
+        {
+            return u64::MAX;
+        }
+    }
+    if buf_ptr != 0
+        && let Some(bulk) = scheduler::take_bulk_data(task_id)
+    {
+        let copy_len = bulk.len().min(buf_len as usize);
+        if copy_len > 0
+            && UserSliceWo::new(buf_ptr, copy_len)
+                .and_then(|s| s.copy_from_kernel(&bulk[..copy_len]))
+                .is_err()
+        {
+            return u64::MAX;
+        }
+    }
+    msg.label
 }
 
 /// Syscall 20 (0x1113): non-blocking variant of [`ipc_recv_msg`].

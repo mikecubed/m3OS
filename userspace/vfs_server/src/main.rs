@@ -150,6 +150,19 @@ const META_FLUSH_THRESHOLD: u32 = 256;
 /// files. Also flushed on SIGTERM (clean shutdown).
 const DIRTY_FLUSH_THRESHOLD: usize = 512;
 
+/// Phase 87 durability — periodic write-back flush interval (ns). When idle in
+/// the request loop, the server wakes this often to commit deferred state to
+/// **media** via `block_flush` (a device FLUSH), bounding a host crash /
+/// power-loss data-loss window to ~this interval instead of "since the last
+/// clean shutdown". (An abrupt QEMU *process* kill is already covered without a
+/// device flush — completed writes live in the host page cache, which outlives
+/// the process; this interval is for host-level crash durability.) Mirrors the
+/// ext3/ext4 commit-interval model. 5 s balances durability vs. flush overhead.
+const FLUSH_INTERVAL_NS: u64 = 5_000_000_000;
+
+/// `NEG_ETIMEDOUT` as returned by `ipc_recv_msg_timeout` on deadline expiry.
+const NEG_ETIMEDOUT: u64 = (-110_i64) as u64;
+
 /// Phase 87 — how many contiguous blocks `claim_block_run` claims per bitmap
 /// read-modify-write. Sized to cover a 64 KiB write's 16 data blocks (plus a
 /// little headroom for the indirect pointer block) so a full-chunk file write
@@ -332,6 +345,13 @@ impl Ext2State {
             }
         }
         Ok(())
+    }
+
+    /// True if any write-back state is buffered in this server (deferred pointer
+    /// blocks or un-flushed sb/BGD summary ops). The periodic flush uses this to
+    /// skip a pointless device FLUSH when the server is idle with nothing dirty.
+    fn has_pending_writes(&self) -> bool {
+        !self.dirty_blocks.borrow().is_empty() || self.meta_dirty_ops > 0
     }
 
     /// Phase 87 — write a contiguous run of `count` whole blocks in one
@@ -1911,6 +1931,45 @@ fn shutdown_flush_and_exit(ext2: &mut Ext2State) -> ! {
     syscall_lib::exit(0)
 }
 
+/// Block for the next request, waking every `FLUSH_INTERVAL_NS` while idle to
+/// commit deferred write-back state to media (`block_flush`), so a host crash
+/// loses at most ~one interval of buffered writes. Returns once a real message
+/// arrives (`msg` + `recv_buf` filled) or on a recv error (the caller's normal
+/// handling covers both). Drains + exits on a shutdown request observed on a
+/// wake. The device FLUSH is issued only when something was actually pending,
+/// so an idle server with a clean cache just re-arms the timer.
+fn recv_with_periodic_flush(
+    ext2: &mut Ext2State,
+    ep_handle: u32,
+    msg: &mut syscall_lib::IpcMessage,
+    recv_buf: &mut [u8],
+) {
+    loop {
+        let (sec, nsec) = syscall_lib::clock_gettime(syscall_lib::CLOCK_MONOTONIC);
+        let now_ns = (sec.max(0) as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(nsec.max(0) as u64);
+        let deadline_ns = now_ns.saturating_add(FLUSH_INTERVAL_NS);
+
+        let label = syscall_lib::ipc_recv_msg_timeout(ep_handle, msg, recv_buf, deadline_ns);
+        if label != NEG_ETIMEDOUT {
+            // A real request (or a recv error) — hand back to the caller.
+            return;
+        }
+
+        // Idle wake. Drain on shutdown, else commit any deferred state to media.
+        if SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
+            shutdown_flush_and_exit(ext2);
+        }
+        if ext2.has_pending_writes() {
+            let _ = ext2.flush_dirty_blocks();
+            let _ = ext2.flush_metadata_if_dirty();
+            // Commit the device write-back cache to physical media.
+            let _ = syscall_lib::block_flush();
+        }
+    }
+}
+
 fn server_loop(ext2: &mut Ext2State, ep_handle: u32) -> ! {
     let mut handles = HandleTable::new();
     let mut msg = syscall_lib::IpcMessage::new(0);
@@ -1919,8 +1978,9 @@ fn server_loop(ext2: &mut Ext2State, ep_handle: u32) -> ! {
     let mut recv_buf = vec![0u8; MAX_BULK_BUF];
     let mut req_seq: u64 = 0;
 
-    // First receive — blocks until the kernel sends us a request.
-    syscall_lib::ipc_recv_msg(ep_handle, &mut msg, &mut recv_buf);
+    // First receive — blocks until the kernel sends us a request, waking
+    // periodically to flush deferred write-back state to media.
+    recv_with_periodic_flush(ext2, ep_handle, &mut msg, &mut recv_buf);
 
     loop {
         // Orderly shutdown (init SIGTERMs services on poweroff): a SIGTERM that
@@ -1983,7 +2043,7 @@ fn server_loop(ext2: &mut Ext2State, ep_handle: u32) -> ! {
         }
 
         msg = syscall_lib::IpcMessage::new(0);
-        syscall_lib::ipc_recv_msg(ep_handle, &mut msg, &mut recv_buf);
+        recv_with_periodic_flush(ext2, ep_handle, &mut msg, &mut recv_buf);
     }
 }
 
