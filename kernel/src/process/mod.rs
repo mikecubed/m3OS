@@ -214,19 +214,43 @@ pub enum FdBackend {
     VfsService {
         /// Opaque handle returned by the vfs_server on open.
         service_handle: u64,
-        /// Cached file size (for stat / EOF).
-        file_size: u32,
-        /// Real ext2 inode number for this path, resolved at open time.
-        ///
-        /// `fstat` MUST report this as `st_ino`. Without it (the historical
-        /// `st_ino = 0`), userspace tools that identify files by the
-        /// `(st_dev, st_ino)` UniqueID — notably clang's `FileManager` — collapse
-        /// every distinct VFS-backed file onto one entry, so e.g. `#include
-        /// <stdio.h>` resolves to the already-open main source and recursively
-        /// self-includes ("redefinition of main"). Must match what `fstatat`
-        /// reports for the same path.
-        inode: u32,
+        /// Full ext2 metadata snapshot captured from the `VFS_OPEN` reply at
+        /// open time (Phase 88 Track B.1/D). See [`VfsFileMeta`]. `fstat` builds
+        /// its entire `struct stat` from this snapshot — no second ext2 resolve.
+        meta: VfsFileMeta,
     },
+}
+
+/// A snapshot of a VFS-backed file's ext2 metadata, captured at open time from
+/// the `VFS_OPEN` reply (Phase 88 Track B.1/D).
+///
+/// Lets `fstat(fd)` report the SAME complete `struct stat` as `fstatat(path)` —
+/// real inode, mode, link count, size, block count, and a/m/c times — instead
+/// of the historical `st_ino = 0` (+ zero `st_dev`/`st_blocks`/timestamps) that
+/// broke clang's `(st_dev, st_ino)` file-identity dedup. The `/usr` files served
+/// by the read-only `vfs_server` do not change under an open fd, so a snapshot
+/// is coherent with a fresh `fstatat`. Sourcing it from the open reply (rather
+/// than re-resolving the inode through the in-kernel ext2 engine) also removes
+/// the cross-implementation coupling the 85d acute fix introduced.
+#[derive(Clone, Copy)]
+pub struct VfsFileMeta {
+    /// ext2 inode number (`st_ino`).
+    pub inode: u32,
+    /// File mode incl. format bits (`st_mode`).
+    pub mode: u32,
+    /// Owner uid / gid.
+    pub uid: u32,
+    pub gid: u32,
+    /// Hard-link count (`st_nlink`).
+    pub nlink: u32,
+    /// File size in bytes (`st_size`; also EOF for reads).
+    pub size: u64,
+    /// Count of 512-byte blocks allocated (`st_blocks`).
+    pub blocks: u64,
+    /// Access / modification / change times (`st_atim`/`st_mtim`/`st_ctim`).
+    pub atime: i64,
+    pub mtime: i64,
+    pub ctime: i64,
 }
 
 /// A single open-file entry in the per-process FD table.

@@ -9,14 +9,14 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Canonical `fill_stat()` serializer + migrate all stat syscalls onto it | — | Planned |
-| B | Complete VFS stat fields (dev/blocks/times) + per-mount `st_dev` + identity-consistency tests | A | Planned |
+| A | Canonical `fill_stat()` serializer + migrate all stat syscalls onto it | — | ✅ Done |
+| B | Complete VFS stat fields (dev/blocks/times) + per-mount `st_dev` + identity-consistency tests | A | In progress |
 | C | Reconcile ext2: `BlockReader` trait in `kernel_core`, share resolve/read logic | — | Planned |
 | D | `VFS_OPEN` returns inode; drop the 85d kernel-side open-time resolve | C | Planned |
 | E | `statx` (implement onto `fill_stat`, or document the ENOSYS fallback) | A | Planned |
 | F | Conformance + cross-impl parity test suites; promote `M3OS_CLANG_STRESS` to a CI gate | A, B, C | Planned |
 | G | Atomic `pwrite64` — offset-parameterized backend writes (write-path correctness) | C | Planned |
-| H | *(ancillary, test-harness)* Multi-pattern `WaitPassOrFail` fail matcher for `clang-smoke` | — | Planned |
+| H | *(ancillary, test-harness)* Multi-pattern `WaitPassOrFail` fail matcher for `clang-smoke` | — | ✅ Done |
 
 ---
 
@@ -29,10 +29,10 @@
 **Why it matters:** The 85d bug was a single field (`st_ino`) omitted in one hand-assembled `stat` path; `st_dev`/`st_blocks`/timestamps are *still* omitted there. One serializer makes "forgot a field in one path" structurally impossible — the core defect class this phase closes.
 
 **Acceptance:**
-- [ ] A `FileMeta { dev, ino, nlink, mode, uid, gid, rdev, size, blksize, blocks, atime, mtime, ctime }` struct + `fill_stat(&FileMeta) -> [u8; 144]` exist.
-- [ ] `fstat`, `stat`, `lstat`, `newfstatat`/`fstatat` build a `FileMeta` per backend and call `fill_stat` — no syscall writes `stat[..]` byte offsets directly.
-- [ ] A `cargo xtask check` grep gate fails if a new `stat[<n>..` offset write is added outside `fill_stat`.
-- [ ] Behavior-preserving for already-correct paths (existing stat tests still pass).
+- [x] A `FileMeta { dev, ino, nlink, mode, uid, gid, rdev, size, blksize, blocks, atime, mtime, ctime }` struct + `fill_stat(&FileMeta) -> [u8; 144]` exist.
+- [x] `fstat`, `stat`, `lstat`, `newfstatat`/`fstatat` build a `FileMeta` per backend and call `fill_stat` — no syscall writes `stat[..]` byte offsets directly. (`stat`/`lstat`/`newfstatat` route through `sys_linux_fstatat`; only `sys_linux_fstat` + `sys_linux_fstatat` assemble metadata.)
+- [x] A `cargo xtask check` grep gate (`stat_assembly_gate`) fails if a new `stat[<n>..` offset write is added outside `fill_stat`. Verified: 0 residual offset writes.
+- [x] Behavior-preserving for already-correct paths (existing stat tests + smoke-test still pass).
 
 ---
 
@@ -45,8 +45,8 @@
 **Why it matters:** `fstat(fd)` and `fstatat(path)` for the same VFS file still disagree on mtime/ctime/blocks (fstat returns 0). `make`/`git`/`python` key off mtime; this is the next 85d-class break.
 
 **Acceptance:**
-- [ ] `fstat` on a VfsService fd reports the same `st_mtim`/`st_ctim`/`st_atim`, `st_blocks`, and `st_size` as `fstatat` on the same path (needs the times/blocks plumbed onto the fd or fetched at stat time).
-- [ ] Host/in-OS test asserts `fstat(open(p)) == fstatat(p)` field-by-field for a VFS file.
+- [x] `fstat` on a VfsService fd reports the same `st_mtim`/`st_ctim`/`st_atim`, `st_blocks`, and `st_size` as `fstatat` on the same path. Implemented by plumbing a full `VfsFileMeta` snapshot onto the fd from the `VFS_OPEN` reply bulk (the vfs_server's `encode_stat_header`, extended with `st_blocks`).
+- [x] Host/in-OS test asserts `fstat(open(p)) == fstatat(p)` field-by-field for a VFS file — the always-on `smoke-runner` `stat-identity` stage (`SMOKE:stat-identity:PASS`) compares dev/ino/size/mode/nlink/mtime/ctime/blocks.
 
 ### B.2 — Distinct `st_dev` per mounted filesystem
 
@@ -55,8 +55,8 @@
 **Why it matters:** `st_dev = 0` everywhere means a tmpfs file and an ext2 file with the same inode number share a `(dev, ino)` identity — a latent cross-fs dedup collision.
 
 **Acceptance:**
-- [ ] ext2-root, tmpfs, ramdisk, and procfs report distinct, stable `st_dev` values.
-- [ ] Test: a tmpfs file and an ext2 file never share `(st_dev, st_ino)`.
+- [x] ext2-root, tmpfs, ramdisk, and procfs report distinct, stable `st_dev` values (`DEV_EXT2_ROOT`/`DEV_TMPFS`/`DEV_RAMDISK`/`DEV_PROCFS`/`DEV_FAT32`/`DEV_DEVFS`; assigned uniformly via `stat_dev_for_backend` for `fstat` and per-branch for `fstatat`).
+- [x] Test: a tmpfs file and an ext2 file never share `(st_dev, st_ino)` — the `stat-identity` stage asserts `tmpfs.st_dev != ext2.st_dev`.
 
 ### B.3 — Identity-consistency + `d_ino` test
 
@@ -65,8 +65,8 @@
 **Why it matters:** This is the regression that would have caught 85d directly.
 
 **Acceptance:**
-- [ ] Same file by path vs by fd → identical `(st_dev, st_ino)`.
-- [ ] `getdents64` `d_ino` equals `stat` `st_ino` for the same entry.
+- [x] Same file by path vs by fd → identical `(st_dev, st_ino)` (`stat-identity` stage, part 1).
+- [x] `getdents64` `d_ino` equals `stat` `st_ino` for the same entry (`stat-identity` stage, part 3 — parses the `/etc` dirents and compares the `passwd` `d_ino` to `stat("/etc/passwd").st_ino`).
 
 ---
 
@@ -102,9 +102,9 @@
 **Why it matters:** The 85d fix resolves the inode a *second* time via the kernel ext2 at open; the `vfs_server` already resolved it in `handle_open`. Returning it removes the double-resolve and the cross-implementation coupling.
 
 **Acceptance:**
-- [ ] `VFS_OPEN` reply carries the inode (in a reply data field) and the kernel seeds `FdBackend::VfsService.inode` from it.
-- [ ] The kernel-side `EXT2_VOLUME.resolve_path` call in `open_via_vfs` is removed.
-- [ ] clang-smoke (incl. `M3OS_CLANG_STRESS`) still passes.
+- [x] `VFS_OPEN` reply carries the inode (and the full stat header in the reply bulk) and the kernel seeds `FdBackend::VfsService.meta` (a `VfsFileMeta` snapshot) from it.
+- [x] The kernel-side `EXT2_VOLUME.resolve_path` call in `vfs_service_open` (the 85d double-resolve) is removed.
+- [ ] clang-smoke (incl. `M3OS_CLANG_STRESS`) still passes. *(pending — runs at the integration checkpoint.)*
 
 ---
 

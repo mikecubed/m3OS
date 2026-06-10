@@ -2260,6 +2260,8 @@ fn encode_stat_header(
         inode.atime as u64,
         inode.mtime as u64,
         inode.ctime as u64,
+        // Phase 88 Track B.1 — st_blocks (512-byte units) so fstat/fstatat agree.
+        inode.blocks as u64,
     ];
     let mut out = [0u8; VFS_STAT_REPLY_SIZE];
     for (idx, word) in words.iter().enumerate() {
@@ -2333,15 +2335,36 @@ fn handle_open(
 
     let file_size = inode.size;
 
+    // Phase 88 Track B.1/D — serialize the full stat header (the same layout as
+    // VFS_STAT_PATH) ready for the reply bulk so the kernel can seed a complete,
+    // consistent fstat snapshot onto the fd (real inode, mode, uid, gid, nlink,
+    // size, blocks, a/m/c times) WITHOUT resolving the inode a second time
+    // through the in-kernel ext2 engine. Regular files only (verified above), so
+    // no symlink target is appended. Encode before allocating the handle so an
+    // encode failure does not leak a half-allocated handle.
+    let stat_header = match encode_stat_header(ext2, inode_num, &inode) {
+        Ok(h) => h,
+        Err(errno) => return (errno, 0),
+    };
+
     // Allocate a handle.
     let handle = match handles.alloc(inode_num, file_size) {
         Some(h) => h,
         None => return (NEG_ENFILE, 0),
     };
 
+    // Store the stat header as the reply bulk only on the committed success
+    // path (matches handle_read's convention — never leave a stale pending_bulk
+    // behind an error reply).
+    if syscall_lib::ipc_store_reply_bulk(&stat_header) != 0 {
+        handles.free(handle);
+        return (NEG_EIO, 0);
+    }
+
     // Reply: label=0, data[0] packs the handle in the low 32 bits and the
     // file size (clamped to u32::MAX) in the high 32 bits. The kernel
-    // unpacks both fields to seed its FdBackend::VfsService entry — see
+    // unpacks both fields to seed its FdBackend::VfsService entry, and reads
+    // the reply bulk above for the rest of the metadata — see
     // kernel_core::fs::vfs_protocol::VFS_OPEN for the canonical contract.
     let packed = handle | ((file_size as u64) << 32);
     (0, packed)

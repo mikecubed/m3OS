@@ -8,7 +8,7 @@
 //!
 //! | Label | Operation | Request | Reply |
 //! |---|---|---|---|
-//! | [`VFS_OPEN`] | Open file by path | bulk=path, data[0]=flags, data[1]=path_len | data[0]=handle \| (file_size << 32) |
+//! | [`VFS_OPEN`] | Open file by path | bulk=path, data[0]=flags, data[1]=path_len | data[0]=handle \| (file_size << 32), reply_bulk=`VFS_STAT_REPLY_SIZE` stat header |
 //! | [`VFS_READ`] | Read from handle | data[0]=handle, data[1]=offset, data[2]=count | data[0]=bytes_read, reply_bulk=data |
 //! | [`VFS_CLOSE`] | Close handle | data[0]=handle | label=0 ack |
 //! | [`VFS_STAT_PATH`] | Stat resolved path | bulk=path, data[0]=path_len | reply_bulk=`VFS_STAT_REPLY_SIZE` bytes + optional symlink target |
@@ -35,6 +35,12 @@
 ///          stale `VFS_CLOSE` whose generation no longer matches the live
 ///          slot is rejected as `EBADF` without affecting the recycled
 ///          handle's file.
+///
+/// Phase 88 (Track B.1/D): the reply ALSO carries a reply bulk of
+/// `VFS_STAT_REPLY_SIZE` bytes (the same stat header as `VFS_STAT_PATH`), so the
+/// kernel seeds a full, consistent `fstat` snapshot (inode, mode, uid, gid,
+/// nlink, size, blocks, a/m/c times) onto the fd at open time instead of
+/// resolving the inode a second time through the in-kernel ext2 engine.
 pub const VFS_OPEN: u64 = 10;
 
 /// Read bytes from an open handle.
@@ -184,9 +190,12 @@ pub const VFS_MAX_PREAD: usize = 64 * 1024;
 /// and 512-aligned.
 pub const VFS_MAX_PWRITE: usize = 64 * 1024;
 
-/// Reply-bulk size for `VFS_STAT_PATH`.
+/// Reply-bulk size for `VFS_STAT_PATH` (and the `VFS_OPEN` reply bulk — Phase 88
+/// Track B.1/D: the same header is returned on open so the kernel can seed a
+/// complete, consistent `fstat` snapshot onto the fd without a second ext2
+/// resolve).
 ///
-/// Base layout: 11 little-endian `u64` values:
+/// Base layout: 12 little-endian `u64` values:
 /// 1. node kind
 /// 2. mode
 /// 3. uid
@@ -198,10 +207,11 @@ pub const VFS_MAX_PWRITE: usize = 64 * 1024;
 /// 9. atime
 /// 10. mtime
 /// 11. ctime
+/// 12. blocks (count of 512-byte blocks allocated — `st_blocks`)
 ///
 /// If `node kind == VFS_NODE_SYMLINK`, the reply bulk appends the raw symlink
 /// target bytes immediately after this fixed-size header.
-pub const VFS_STAT_REPLY_SIZE: usize = 11 * core::mem::size_of::<u64>();
+pub const VFS_STAT_REPLY_SIZE: usize = 12 * core::mem::size_of::<u64>();
 
 pub const VFS_NODE_FILE: u64 = 1;
 pub const VFS_NODE_DIR: u64 = 2;

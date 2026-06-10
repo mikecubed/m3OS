@@ -8148,6 +8148,8 @@ struct VfsPathStat {
     atime: i64,
     mtime: i64,
     ctime: i64,
+    /// st_blocks — count of 512-byte blocks allocated (Phase 88 Track B.1).
+    blocks: u64,
     symlink_target: Option<alloc::string::String>,
 }
 
@@ -8228,6 +8230,7 @@ fn vfs_service_parse_stat_reply(bulk: &[u8]) -> Result<VfsPathStat, u64> {
         atime: read_word(8) as i64,
         mtime: read_word(9) as i64,
         ctime: read_word(10) as i64,
+        blocks: read_word(11),
         symlink_target,
     })
 }
@@ -8262,21 +8265,53 @@ fn vfs_service_open(path: &str, flags: u64) -> u64 {
     let packed = reply.data[0];
     let handle = packed & 0xFFFF_FFFF;
     let file_size = (packed >> 32) as u32;
-    // Resolve the real ext2 inode for this path so `fstat` can report a stable,
-    // UNIQUE `st_ino` (see FdBackend::VfsService::inode). The kernel ext2 is
-    // serialized + coherent and shares the disk with the vfs_server, so it yields
-    // the same inode `fstatat`/`vfs_service_stat_path` report. `resolve_path`
-    // tolerates the leading '/'. 0 (unresolved) preserves the old behaviour.
-    let inode = crate::fs::ext2::EXT2_VOLUME
-        .lock()
-        .as_ref()
-        .and_then(|v| v.resolve_path(path).ok())
-        .unwrap_or(0);
+
+    // Phase 88 Track B.1/D — the vfs_server returns the full stat header in the
+    // reply bulk; parse it into the fd's metadata snapshot. This replaces the
+    // 85d double-resolve (a second `EXT2_VOLUME.resolve_path(path)` here) and the
+    // cross-implementation coupling it introduced: fstat now reports the
+    // vfs_server's own inode/mode/uid/gid/nlink/size/blocks/times, guaranteed to
+    // match what `fstatat` (also served by the vfs_server) reports for the path.
+    let meta = match scheduler::take_bulk_data(task_id)
+        .ok_or(NEG_EIO)
+        .and_then(|bulk| vfs_service_parse_stat_reply(&bulk))
+    {
+        Ok(st) => crate::process::VfsFileMeta {
+            inode: st.ino as u32,
+            mode: st.mode,
+            uid: st.uid,
+            gid: st.gid,
+            nlink: st.nlink as u32,
+            size: st.size,
+            blocks: st.blocks,
+            atime: st.atime,
+            mtime: st.mtime,
+            ctime: st.ctime,
+        },
+        Err(_) => {
+            // Unreachable in practice (handle_open always sends a valid header
+            // for a regular file). Defensive: seed a minimal snapshot from
+            // data[0] rather than failing the open — the read path only needs
+            // the handle. fstat then degrades to the pre-85d shape.
+            log::warn!("[vfs] open reply missing/invalid stat header for {path}");
+            crate::process::VfsFileMeta {
+                inode: 0,
+                mode: 0x8000 | 0o444,
+                uid: 0,
+                gid: 0,
+                nlink: 1,
+                size: file_size as u64,
+                blocks: 0,
+                atime: 0,
+                mtime: 0,
+                ctime: 0,
+            }
+        }
+    };
     let entry = FdEntry {
         backend: FdBackend::VfsService {
             service_handle: handle,
-            file_size,
-            inode,
+            meta,
         },
         offset: 0,
         readable: true,
@@ -9808,6 +9843,23 @@ fn data_is_mounted() -> bool {
     crate::fs::ext2::is_mounted() || crate::fs::fat32::is_mounted()
 }
 
+// Phase 88 Track B.2 — synthetic `st_dev` per mounted filesystem.
+//
+// POSIX file identity is `(st_dev, st_ino)`: two paths name the same file iff
+// the pair matches, and the pair must be unique across filesystems. Leaving
+// `st_dev = 0` everywhere let a tmpfs file and an ext2 file that happen to share
+// an inode number collide on identity. Each filesystem class gets a stable,
+// distinct, nonzero device id below. Values are arbitrary but fixed; the
+// in-kernel ext2 root (`Ext2Disk`) and the ring-3 `vfs_server` view of the same
+// on-disk filesystem (`VfsService`) deliberately share one id so the SAME file
+// reached either way keeps one identity.
+const DEV_EXT2_ROOT: u64 = 0x01;
+const DEV_TMPFS: u64 = 0x02;
+const DEV_RAMDISK: u64 = 0x03;
+const DEV_PROCFS: u64 = 0x04;
+const DEV_FAT32: u64 = 0x05;
+const DEV_DEVFS: u64 = 0x06;
+
 /// Phase 88 Track A — normalized file metadata for the `stat` family.
 ///
 /// Every stat-producing syscall (`fstat`, `stat`/`lstat`/`newfstatat` →
@@ -9899,6 +9951,43 @@ fn write_stat_to_user(stat_ptr: u64, meta: &FileMeta) -> u64 {
     }
 }
 
+/// Phase 88 Track B.2 — the synthetic `st_dev` for an fd's backend.
+///
+/// Each filesystem class gets a stable, distinct, nonzero id so that
+/// `(st_dev, st_ino)` is unique across filesystems. The in-kernel ext2 root
+/// (`Ext2Disk`) and the ring-3 `vfs_server` view of the SAME on-disk fs
+/// (`VfsService`) share one id so a file reached either way keeps one identity.
+/// Identity-irrelevant backends (sockets, pipes, stdio, epoll, eventfd) report
+/// `dev = 0`.
+fn stat_dev_for_backend(backend: &FdBackend) -> u64 {
+    match backend {
+        FdBackend::Ext2Disk { .. } | FdBackend::VfsService { .. } => DEV_EXT2_ROOT,
+        FdBackend::Tmpfs { .. } => DEV_TMPFS,
+        FdBackend::Ramdisk { .. } => DEV_RAMDISK,
+        FdBackend::Proc { .. } => DEV_PROCFS,
+        FdBackend::Fat32Disk { .. } => DEV_FAT32,
+        FdBackend::DevNull
+        | FdBackend::DevZero
+        | FdBackend::DevUrandom
+        | FdBackend::DevFull
+        | FdBackend::DeviceTTY { .. }
+        | FdBackend::PtyMaster { .. }
+        | FdBackend::PtySlave { .. } => DEV_DEVFS,
+        // A directory fd's backend does not say which fs it lives on; re-derive
+        // from the path the same way the fstat `Dir` arm builds its metadata.
+        FdBackend::Dir { path } => {
+            if crate::fs::procfs::stat(path).is_some() {
+                DEV_PROCFS
+            } else if tmpfs_relative_path(path).is_some() {
+                DEV_TMPFS
+            } else {
+                DEV_EXT2_ROOT
+            }
+        }
+        _ => 0,
+    }
+}
+
 pub(super) fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
     let fd_idx = fd as usize;
     if fd_idx >= MAX_FDS {
@@ -9911,7 +10000,7 @@ pub(super) fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
 
     // Build a normalized FileMeta per backend (preserving each backend's prior
     // field values), then serialize once via `fill_stat`.
-    let meta: FileMeta = match &entry.backend {
+    let mut meta: FileMeta = match &entry.backend {
         FdBackend::Dir { path } => {
             if let Some(st) = crate::fs::procfs::stat(path) {
                 let mut m = FileMeta::new();
@@ -10057,6 +10146,7 @@ pub(super) fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
                 m.gid = inode.gid as u32;
                 m.size = inode.size as u64; // use inode size, not cached FD size
                 m.blksize = vol.block_size as u64;
+                m.blocks = inode.blocks as u64;
                 m.atime = inode.atime as i64;
                 m.mtime = inode.mtime as i64;
                 m.ctime = inode.ctime as i64;
@@ -10074,20 +10164,31 @@ pub(super) fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
             m.mode = 0x2000 | 0o600;
             m
         }
-        FdBackend::VfsService {
-            file_size, inode, ..
-        } => {
-            // Report the real ext2 inode as st_ino so clang's FileManager (which
-            // dedups by (st_dev, st_ino)) does not collapse distinct VFS files
-            // onto one entry. Must match fstatat for the same path.
+        FdBackend::VfsService { meta, .. } => {
+            // Phase 88 Track B.1/D — report the full metadata snapshot captured
+            // from the VFS_OPEN reply (real inode/mode/uid/gid/nlink/size/blocks/
+            // times) so fstat(fd) matches fstatat(path) field-for-field. The
+            // st_ino was the field whose absence broke clang's (st_dev, st_ino)
+            // dedup; st_dev, st_blocks, and the timestamps were silently zero too.
+            // st_dev is assigned uniformly after the match.
             let mut m = FileMeta::new();
-            m.ino = *inode as u64;
-            m.mode = 0x8000 | 0o444;
-            m.size = *file_size as u64;
+            m.ino = meta.inode as u64;
+            m.nlink = meta.nlink as u64;
+            m.mode = meta.mode;
+            m.uid = meta.uid;
+            m.gid = meta.gid;
+            m.size = meta.size;
+            m.blocks = meta.blocks;
+            m.atime = meta.atime;
+            m.mtime = meta.mtime;
+            m.ctime = meta.ctime;
             m
         }
     };
 
+    // Phase 88 Track B.2 — assign the per-filesystem st_dev uniformly so
+    // (st_dev, st_ino) is unique across filesystems.
+    meta.dev = stat_dev_for_backend(&entry.backend);
     write_stat_to_user(stat_ptr, &meta)
 }
 
@@ -10508,7 +10609,7 @@ pub(super) fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
         FdBackend::Fat32Disk { file_size, .. } | FdBackend::Ext2Disk { file_size, .. } => {
             *file_size as usize
         }
-        FdBackend::VfsService { file_size, .. } => *file_size as usize,
+        FdBackend::VfsService { meta, .. } => meta.size as usize,
     };
 
     let offset = offset as i64;
@@ -13533,6 +13634,7 @@ pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags:
 
     if let Some(st) = crate::fs::procfs::stat(name) {
         let mut m = FileMeta::new();
+        m.dev = DEV_PROCFS;
         m.ino = st.ino;
         m.nlink = st.nlink;
         m.mode = st.mode;
@@ -13572,6 +13674,7 @@ pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags:
             0x8000 | st.mode as u32
         };
         let mut m = FileMeta::new();
+        m.dev = DEV_TMPFS;
         m.ino = st.ino;
         m.nlink = st.nlink;
         m.mode = mode;
@@ -13586,12 +13689,14 @@ pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags:
     match crate::fs::ramdisk::ramdisk_lookup(name) {
         Some(crate::fs::ramdisk::RamdiskNode::File { content }) => {
             let mut m = FileMeta::new();
+            m.dev = DEV_RAMDISK;
             m.mode = 0x8000 | 0o755; // S_IFREG + executable (ramdisk binaries)
             m.size = content.len() as u64;
             write_stat_to_user(stat_ptr, &m)
         }
         Some(crate::fs::ramdisk::RamdiskNode::Dir { .. }) => {
             let mut m = FileMeta::new();
+            m.dev = DEV_RAMDISK;
             m.mode = 0x4000 | 0o755; // S_IFDIR
             write_stat_to_user(stat_ptr, &m)
         }
@@ -13604,6 +13709,7 @@ pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags:
                     && let Ok(vfs_stat) = vfs_service_stat_path(name)
                 {
                     let mut m = FileMeta::new();
+                    m.dev = DEV_EXT2_ROOT;
                     m.ino = vfs_stat.ino;
                     m.nlink = vfs_stat.nlink;
                     m.mode = vfs_stat.mode;
@@ -13611,6 +13717,7 @@ pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags:
                     m.gid = vfs_stat.gid;
                     m.size = vfs_stat.size;
                     m.blksize = vfs_stat.blksize;
+                    m.blocks = vfs_stat.blocks;
                     m.atime = vfs_stat.atime;
                     m.mtime = vfs_stat.mtime;
                     m.ctime = vfs_stat.ctime;
@@ -13622,6 +13729,7 @@ pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags:
                     && let Ok(inode) = vol.read_inode(ino)
                 {
                     let mut m = FileMeta::new();
+                    m.dev = DEV_EXT2_ROOT;
                     m.ino = ino as u64;
                     m.nlink = inode.links_count as u64;
                     m.mode = inode.mode as u32;
@@ -13629,6 +13737,7 @@ pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags:
                     m.gid = inode.gid as u32;
                     m.size = inode.size as u64;
                     m.blksize = vol.block_size as u64;
+                    m.blocks = inode.blocks as u64;
                     // Phase 32: populate timestamps from ext2 inode.
                     m.atime = inode.atime as i64;
                     m.mtime = inode.mtime as i64;
@@ -13646,12 +13755,14 @@ pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags:
                 || name.starts_with("/dev/pts/")
             {
                 let mut m = FileMeta::new();
+                m.dev = DEV_DEVFS;
                 m.mode = 0x2000 | 0o666; // S_IFCHR | rw-rw-rw-
                 return write_stat_to_user(stat_ptr, &m);
             }
             // Also handle "/" specially.
             if name == "/" {
                 let mut m = FileMeta::new();
+                m.dev = DEV_EXT2_ROOT;
                 m.mode = 0x4000 | 0o755;
                 return write_stat_to_user(stat_ptr, &m);
             }
@@ -14988,6 +15099,41 @@ pub(super) fn sys_linux_fsync(fd: u64) -> u64 {
 // Phase 13: getdents64(fd, buf, count) — syscall 217
 // ---------------------------------------------------------------------------
 
+/// Phase 88 Track B.3 — the real inode number for `abs_path`, resolved by the
+/// SAME routing `stat` uses, so `getdents64` `d_ino` always matches `stat`
+/// `st_ino` for the same entry (the prior synthetic `idx + 1` `d_ino` violated
+/// that POSIX invariant). Returns 0 for backends with no real inode (ramdisk,
+/// fat32, device nodes) — consistent with their `st_ino = 0`.
+fn path_ino(abs_path: &str) -> u64 {
+    if let Some(st) = crate::fs::procfs::stat(abs_path) {
+        return st.ino;
+    }
+    if let Some(rel) = tmpfs_relative_path(abs_path) {
+        let tmpfs = crate::fs::tmpfs::TMPFS.lock();
+        return tmpfs.stat(rel).map(|s| s.ino).unwrap_or(0);
+    }
+    if crate::fs::ext2::is_mounted()
+        && let Some(rel) = ext2_root_path(abs_path)
+    {
+        let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+        if let Some(vol) = vol.as_ref()
+            && let Ok(ino) = vol.resolve_path(rel)
+        {
+            return ino as u64;
+        }
+    }
+    0
+}
+
+/// The parent-directory path of `path` (e.g. `/etc` → `/`, `/a/b` → `/a`,
+/// `/` → `/`). Used to give the `..` dirent its real inode.
+fn parent_dir(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(0) | None => "/",
+        Some(i) => &path[..i],
+    }
+}
+
 pub(super) fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     let fd_idx = fd as usize;
     if fd_idx >= MAX_FDS {
@@ -15203,7 +15349,19 @@ pub(super) fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         let start = out.len();
         out.resize(start + reclen, 0); // zero-pad
 
-        let d_ino: u64 = (idx + 1) as u64;
+        // Phase 88 Track B.3 — emit the entry's REAL inode (matching `stat`
+        // `st_ino`), not a synthetic `idx + 1`. Reconstruct the entry's absolute
+        // path and resolve it the same way `stat` does.
+        let child_abs = if name.as_str() == "." {
+            dir_path.clone()
+        } else if name.as_str() == ".." {
+            alloc::string::String::from(parent_dir(&dir_path))
+        } else if dir_path == "/" {
+            alloc::format!("/{name}")
+        } else {
+            alloc::format!("{dir_path}/{name}")
+        };
+        let d_ino: u64 = path_ino(&child_abs);
         let d_off: i64 = (idx + 1) as i64;
         out[start..start + 8].copy_from_slice(&d_ino.to_ne_bytes());
         out[start + 8..start + 16].copy_from_slice(&d_off.to_ne_bytes());
