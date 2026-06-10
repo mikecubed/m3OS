@@ -6403,14 +6403,14 @@ enum SmokeStep {
     ///
     /// Behaviour:
     /// - If a line containing `pass_pattern` is found → step passes.
-    /// - If a line starting with `fail_prefix` is found → the rest of
-    ///   the matched line (after `fail_prefix`) is captured and the
-    ///   step exits via `exit_code_on_fail` with the captured text in
+    /// - If a line containing any entry in `fail_prefixes` is found → the
+    ///   rest of the matched line (after the matched prefix) is captured and
+    ///   the step exits via `exit_code_on_fail` with the captured text in
     ///   the error message.
     /// - If neither is found within `timeout_secs` → generic timeout error.
     WaitPassOrFail {
         pass_pattern: &'static str,
-        fail_prefix: &'static str,
+        fail_prefixes: &'static [&'static str],
         timeout_secs: u64,
         label: &'static str,
         exit_code_on_fail: i32,
@@ -6509,19 +6509,28 @@ fn starts_with_background_noise(input: &str) -> bool {
 }
 
 /// Find a complete newline-terminated FAIL line in `serial` and return
-/// the text between `fail_prefix` and the terminating `\n`.
+/// the text between the matched prefix and the terminating `\n`.
 ///
-/// Returns `None` if `fail_prefix` is not present *or* if the prefix is
-/// present but the line has not yet been terminated. Without this, the
-/// `WaitPassOrFail` step fires the moment the prefix appears, kills
+/// Scans `fail_prefixes` in order; returns the captured suffix for the
+/// first prefix whose match is terminated by `\n`. Returns `None` if no
+/// prefix is present *or* if every matching prefix is present but the
+/// line has not yet been terminated. Without the newline gate, the
+/// `WaitPassOrFail` step fires the moment a prefix appears, kills
 /// QEMU mid-write, and the captured suffix is truncated — losing the
 /// `variant=<AudioClientError>` diagnostic that points at the
 /// underlying server-side failure.
-fn find_terminated_fail_line(serial: &str, fail_prefix: &str) -> Option<String> {
-    let start = serial.find(fail_prefix)?;
-    let after_prefix = start + fail_prefix.len();
-    let end = serial[after_prefix..].find('\n')?;
-    Some(serial[after_prefix..after_prefix + end].to_owned())
+fn find_terminated_fail_line(serial: &str, fail_prefixes: &[&str]) -> Option<String> {
+    for fail_prefix in fail_prefixes {
+        let start = match serial.find(*fail_prefix) {
+            Some(s) => s,
+            None => continue,
+        };
+        let after_prefix = start + fail_prefix.len();
+        if let Some(end) = serial[after_prefix..].find('\n') {
+            return Some(serial[after_prefix..after_prefix + end].to_owned());
+        }
+    }
+    None
 }
 
 fn strip_background_noise(input: &str) -> String {
@@ -7270,7 +7279,7 @@ fn run_smoke_script(
 
             SmokeStep::WaitPassOrFail {
                 pass_pattern,
-                fail_prefix,
+                fail_prefixes,
                 timeout_secs,
                 label,
                 exit_code_on_fail,
@@ -7297,14 +7306,14 @@ fn run_smoke_script(
                         drain_serial_through_match(&mut serial_buf, &stripped, mode, match_end);
                         break;
                     }
-                    // Scan for a line starting with fail_prefix. Require a
-                    // newline after the prefix so we capture the complete
-                    // line (with the `variant=...` suffix) instead of a
-                    // partial buffer — killing QEMU mid-write of the FAIL
-                    // line truncates the variant tag and hides which
+                    // Scan for any of the fail_prefixes. Require a newline
+                    // after the prefix so we capture the complete line
+                    // (with the `variant=...` suffix) instead of a partial
+                    // buffer — killing QEMU mid-write of the FAIL line
+                    // truncates the variant tag and hides which
                     // `AudioClientError` actually fired.
-                    let fail_capture = find_terminated_fail_line(&cleaned, fail_prefix)
-                        .or_else(|| find_terminated_fail_line(&stripped, fail_prefix));
+                    let fail_capture = find_terminated_fail_line(&cleaned, fail_prefixes)
+                        .or_else(|| find_terminated_fail_line(&stripped, fail_prefixes));
                     if let Some(captured) = fail_capture {
                         let _ = child.kill();
                         let _ = child.wait();
@@ -10239,7 +10248,7 @@ fn audio_smoke_steps() -> Vec<SmokeStep> {
     // with SMOKE_EXIT_AUDIO_DEMO_FAILED and surfaces the failing stage.
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: "AUDIO_DEMO:PASS",
-        fail_prefix: "AUDIO_DEMO:FAIL stage=",
+        fail_prefixes: &["AUDIO_DEMO:FAIL stage="],
         timeout_secs: 30,
         label: "guest/audio: audio-demo PASS sentinel",
         exit_code_on_fail: SMOKE_EXIT_AUDIO_DEMO_FAILED,
@@ -10269,7 +10278,7 @@ fn audio_smoke_steps() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: "AUDIO_DEMO:PASS",
-        fail_prefix: "AUDIO_DEMO:FAIL stage=",
+        fail_prefixes: &["AUDIO_DEMO:FAIL stage="],
         timeout_secs: 30,
         label: "guest/audio: audio-demo PASS sentinel (run #2)",
         exit_code_on_fail: SMOKE_EXIT_AUDIO_DEMO_FAILED,
@@ -10329,7 +10338,7 @@ fn hda_smoke_steps() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: "AUDIO_DEMO:PASS",
-        fail_prefix: "AUDIO_DEMO:FAIL stage=",
+        fail_prefixes: &["AUDIO_DEMO:FAIL stage="],
         timeout_secs: 30,
         label: "guest/hda: audio-demo PASS sentinel",
         exit_code_on_fail: SMOKE_EXIT_AUDIO_DEMO_FAILED,
@@ -10940,7 +10949,7 @@ fn ahci_rw_smoke_steps() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: "EXT2_COHERENCE:PASS",
-        fail_prefix: "EXT2_COHERENCE:FAIL",
+        fail_prefixes: &["EXT2_COHERENCE:FAIL"],
         timeout_secs: 180,
         label: "guest/ahci-rw: 200 KiB write + fresh-process read-back over ahci.block",
         exit_code_on_fail: 1,
@@ -12484,7 +12493,7 @@ fn bell_smoke_steps() -> Vec<SmokeStep> {
     // prompt round-trip, plus headroom for slower CI.
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: "BELL_TEST:PASS",
-        fail_prefix: "BELL_TEST:FAIL",
+        fail_prefixes: &["BELL_TEST:FAIL"],
         timeout_secs: 15,
         label: "guest/bell-smoke: frames_consumed > 0 after Bell::ring",
         exit_code_on_fail: SMOKE_EXIT_BELL_SMOKE_FAILED,
@@ -12784,9 +12793,14 @@ fn tui_smoke_steps() -> Vec<SmokeStep> {
             input,
             label: "guest/tui-smoke: send subcommand",
         });
+        // `fail` is a `&&str` (iterated from a `&'static [(..., &str)]`);
+        // deref once to get a `&'static str`, then wrap into a
+        // `&'static [&'static str]` by leaking a single-element box.
+        let fail_str: &'static str = *fail;
+        let fail_prefixes: &'static [&'static str] = Box::leak(Box::new([fail_str]));
         steps.push(SmokeStep::WaitPassOrFail {
             pass_pattern: pass,
-            fail_prefix: fail,
+            fail_prefixes,
             timeout_secs: 15,
             label,
             exit_code_on_fail: SMOKE_EXIT_TUI_SMOKE_FAILED,
@@ -12923,7 +12937,7 @@ fn tui_app_smoke_steps() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: "TUI_APP_SMOKE:less:ok",
-        fail_prefix: "TUI_APP_SMOKE:less:fail",
+        fail_prefixes: &["TUI_APP_SMOKE:less:fail"],
         timeout_secs: 15,
         label: "guest/tui-app-smoke: less :ok",
         exit_code_on_fail: SMOKE_EXIT_TUI_APP_SMOKE_FAILED,
@@ -13040,7 +13054,7 @@ fn tui_app_smoke_steps() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: "TUI_APP_SMOKE:htop:ok",
-        fail_prefix: "TUI_APP_SMOKE:htop:fail",
+        fail_prefixes: &["TUI_APP_SMOKE:htop:fail"],
         timeout_secs: 15,
         label: "guest/tui-app-smoke: htop :ok",
         exit_code_on_fail: SMOKE_EXIT_TUI_APP_SMOKE_FAILED,
@@ -13059,7 +13073,7 @@ fn tui_app_smoke_steps() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: "SENDMSG_SMOKE:scm-rights:ok",
-        fail_prefix: "SENDMSG_SMOKE:scm-rights:fail",
+        fail_prefixes: &["SENDMSG_SMOKE:scm-rights:fail"],
         timeout_secs: 30,
         label: "guest/tui-app-smoke: sendmsg-test SCM_RIGHTS",
         exit_code_on_fail: SMOKE_EXIT_TUI_APP_SMOKE_FAILED,
@@ -13167,7 +13181,7 @@ fn tui_app_smoke_steps() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: "TUI_APP_SMOKE:tmux:reconnect-ok",
-        fail_prefix: "access not allowed",
+        fail_prefixes: &["access not allowed"],
         timeout_secs: 15,
         label: "guest/tui-app-smoke: tmux reconnect after kill-session",
         exit_code_on_fail: SMOKE_EXIT_TUI_APP_SMOKE_FAILED,
@@ -13188,7 +13202,7 @@ fn tui_app_smoke_steps() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: "TUI_APP_SMOKE:tmux:ok",
-        fail_prefix: "TUI_APP_SMOKE:tmux:fail",
+        fail_prefixes: &["TUI_APP_SMOKE:tmux:fail"],
         timeout_secs: 15,
         label: "guest/tui-app-smoke: tmux :ok",
         exit_code_on_fail: SMOKE_EXIT_TUI_APP_SMOKE_FAILED,
@@ -14357,9 +14371,14 @@ fn termios_smoke_steps() -> Vec<SmokeStep> {
             input,
             label: "guest/tcsmoke: send subcommand",
         });
+        // `fail` is a `&&str` (iterated from a `&'static [(..., &str)]`);
+        // deref once to get a `&'static str`, then wrap into a
+        // `&'static [&'static str]` by leaking a single-element box.
+        let fail_str: &'static str = *fail;
+        let fail_prefixes: &'static [&'static str] = Box::leak(Box::new([fail_str]));
         steps.push(SmokeStep::WaitPassOrFail {
             pass_pattern: pass,
-            fail_prefix: fail,
+            fail_prefixes,
             timeout_secs: 15,
             label,
             exit_code_on_fail: SMOKE_EXIT_TERMIOS_SMOKE_FAILED,
@@ -14535,7 +14554,7 @@ fn pkg_smoke_steps() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: "pkg install: libevent: OK",
-        fail_prefix: "pkg install: cannot",
+        fail_prefixes: &["pkg install: cannot"],
         timeout_secs: 60,
         label: "pkg-smoke: install libevent OK",
         exit_code_on_fail: SMOKE_EXIT_PKG_SMOKE_FAILED,
@@ -14616,7 +14635,7 @@ fn pkg_smoke_steps() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: "pkg install: libevent: OK",
-        fail_prefix: "pkg install: cannot",
+        fail_prefixes: &["pkg install: cannot"],
         timeout_secs: 60,
         label: "pkg-smoke: solver auto-installed the libevent dependency",
         exit_code_on_fail: SMOKE_EXIT_PKG_SMOKE_FAILED,
@@ -14873,7 +14892,7 @@ fn go_runtime_smoke_steps(url: &str) -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: "pkg install: go: OK",
-        fail_prefix: "pkg install: cannot",
+        fail_prefixes: &["pkg install: cannot"],
         // Generous ceiling: the ~5.5 MB `.m3pkg` is SHA-verified and written
         // file-by-file over the slow ring-3 VFS. Normally well under this; the
         // gate runs at a long global --timeout.
@@ -15131,7 +15150,7 @@ fn gh_smoke_steps(
     });
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: "pkg install: gh: OK",
-        fail_prefix: "pkg install: cannot",
+        fail_prefixes: &["pkg install: cannot"],
         timeout_secs: 2400,
         label: "gh-smoke: gh installed from .m3pkg",
         exit_code_on_fail: SMOKE_EXIT_GH_SMOKE_FAILED,
@@ -15466,7 +15485,7 @@ fn vfs_bulkio_smoke_steps(pkg: &'static str) -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: ok_pattern,
-        fail_prefix: "pkg install: cannot",
+        fail_prefixes: &["pkg install: cannot"],
         timeout_secs: 1800,
         label: "vfs-bulkio-smoke: package installed",
         exit_code_on_fail: SMOKE_EXIT_VFS_BULKIO_FAILED,
@@ -15498,7 +15517,7 @@ fn vfs_bulkio_smoke_steps(pkg: &'static str) -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: ", 0 MISMATCH",
-        fail_prefix: "MISMATCH ",
+        fail_prefixes: &["MISMATCH "],
         timeout_secs: 600,
         label: "vfs-bulkio-smoke: installed files verify clean",
         exit_code_on_fail: SMOKE_EXIT_VFS_BULKIO_FAILED,
@@ -15552,7 +15571,7 @@ fn git_local_smoke_steps() -> Vec<SmokeStep> {
         // curl-dependent git install now pulls the whole HTTPS chain over the slow
         // VFS); under the bare default it shares the budget with boot/login and
         // the trailing git workflow.
-        fail_prefix: "pkg install: cannot",
+        fail_prefixes: &["pkg install: cannot"],
         // Phase 86c — git now depends on curl (HTTPS), so `pkg install git` pulls
         // the whole curl+mbedtls+ca-certificates chain (~27 MB of .m3pkg) over the
         // slow ring-3 VFS, not just the 7.4 MB local-only git. The per-step ceiling
@@ -15920,7 +15939,7 @@ fn git_ssh_smoke_steps(
     });
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: "pkg install: ssh: OK",
-        fail_prefix: "pkg install: cannot",
+        fail_prefixes: &["pkg install: cannot"],
         timeout_secs: 120,
         label: "git-ssh-smoke: ssh (dropbear) installed from .m3pkg",
         exit_code_on_fail: SMOKE_EXIT_GIT_SSH_SMOKE_FAILED,
@@ -15934,7 +15953,7 @@ fn git_ssh_smoke_steps(
     });
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: "pkg install: git: OK",
-        fail_prefix: "pkg install: cannot",
+        fail_prefixes: &["pkg install: cannot"],
         // Phase 86c — git now pulls the curl+mbedtls+ca-certificates HTTPS chain
         // (~27 MB) over the slow VFS, so the install step ceiling is raised (the
         // global git-ssh-smoke --timeout 5400 has ample room).
@@ -16089,7 +16108,7 @@ fn git_ssh_smoke_steps(
         });
         steps.push(SmokeStep::WaitPassOrFail {
             pass_pattern: "Receiving objects",
-            fail_prefix: "fatal:",
+            fail_prefixes: &["fatal:"],
             timeout_secs: 600,
             label: "git-ssh-smoke: packfile transfer started",
             exit_code_on_fail: SMOKE_EXIT_GIT_SSH_SMOKE_FAILED,
@@ -16293,14 +16312,14 @@ fn git_https_smoke_steps(
     // installs it; its per-package OK line proves the trust store landed under /.
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: "pkg install: ca-certificates: OK",
-        fail_prefix: "pkg install: cannot",
+        fail_prefixes: &["pkg install: cannot"],
         timeout_secs: 1800,
         label: "git-https-smoke: ca-certificates (CA bundle) installed",
         exit_code_on_fail: SMOKE_EXIT_GIT_HTTPS_SMOKE_FAILED,
     });
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: "pkg install: git: OK",
-        fail_prefix: "pkg install: cannot",
+        fail_prefixes: &["pkg install: cannot"],
         timeout_secs: 1800,
         label: "git-https-smoke: git + curl + mbedtls installed from .m3pkg",
         exit_code_on_fail: SMOKE_EXIT_GIT_HTTPS_SMOKE_FAILED,
@@ -16444,7 +16463,7 @@ fn git_https_smoke_steps(
         });
         steps.push(SmokeStep::WaitPassOrFail {
             pass_pattern: "Receiving objects",
-            fail_prefix: "fatal:",
+            fail_prefixes: &["fatal:"],
             timeout_secs: 600,
             label: "git-https-smoke: packfile transfer started (TLS + smart-HTTP OK)",
             exit_code_on_fail: SMOKE_EXIT_GIT_HTTPS_SMOKE_FAILED,
@@ -16581,7 +16600,7 @@ fn python_smoke_steps() -> Vec<SmokeStep> {
         // `--timeout` min-clamps
         // every step, so this is only fully available when nothing earlier ate
         // the clock. Intended to run via pre-push at `--timeout 900`.
-        fail_prefix: "pkg install: cannot",
+        fail_prefixes: &["pkg install: cannot"],
         timeout_secs: 360,
         label: "python-smoke: python installed from .m3pkg",
         exit_code_on_fail: SMOKE_EXIT_PYTHON_SMOKE_FAILED,
@@ -16655,7 +16674,7 @@ fn python_smoke_steps() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: "PYSMOKE:importsOK",
-        fail_prefix: "Traceback (most recent call last)",
+        fail_prefixes: &["Traceback (most recent call last)"],
         timeout_secs: 60,
         label: "python-smoke: stdlib imports succeeded",
         exit_code_on_fail: SMOKE_EXIT_PYTHON_SMOKE_FAILED,
@@ -16822,7 +16841,7 @@ fn clang_smoke_steps() -> Vec<SmokeStep> {
         });
         steps.push(SmokeStep::WaitPassOrFail {
             pass_pattern: "CLANG_C_OK hello, world",
-            fail_prefix: "DIAGNEVERMATCH",
+            fail_prefixes: &["DIAGNEVERMATCH"],
             timeout_secs: 900,
             label: "clang-diag: compile result",
             exit_code_on_fail: SMOKE_EXIT_CLANG_SMOKE_FAILED,
@@ -16849,7 +16868,7 @@ fn clang_smoke_steps() -> Vec<SmokeStep> {
         });
         steps.push(SmokeStep::WaitPassOrFail {
             pass_pattern: "pkg install: clang: OK",
-            fail_prefix: "pkg install: cannot",
+            fail_prefixes: &["pkg install: cannot"],
             timeout_secs: 2400,
             label: "clang-smoke: clang installed from .m3pkg",
             exit_code_on_fail: SMOKE_EXIT_CLANG_SMOKE_FAILED,
@@ -16893,8 +16912,9 @@ fn clang_smoke_steps() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: "CLANG_C_OK hello, world",
-        // clang emits `error:`/`fatal error:` on a failed compile/link.
-        fail_prefix: "fatal error:",
+        // clang emits `fatal error:` / `: error:` on failed compile,
+        // lld emits `ld.lld: error:` on failed link.
+        fail_prefixes: &["fatal error:", ": error:", "ld.lld: error:"],
         timeout_secs: 1500,
         label: "clang-smoke: C program compiled, linked (lld) + ran",
         exit_code_on_fail: SMOKE_EXIT_CLANG_SMOKE_FAILED,
@@ -16907,7 +16927,7 @@ fn clang_smoke_steps() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: "CLANG_CPP_OK hello from libc++",
-        fail_prefix: "fatal error:",
+        fail_prefixes: &["fatal error:", ": error:", "ld.lld: error:"],
         timeout_secs: 1500,
         label: "clang-smoke: C++ program linked libc++ + ran",
         exit_code_on_fail: SMOKE_EXIT_CLANG_SMOKE_FAILED,
@@ -16940,7 +16960,7 @@ fn clang_smoke_steps() -> Vec<SmokeStep> {
             });
             steps.push(SmokeStep::WaitPassOrFail {
                 pass_pattern: "CLANG_C_OK hello, world",
-                fail_prefix: "fatal error:",
+                fail_prefixes: &["fatal error:", ": error:", "ld.lld: error:"],
                 timeout_secs: 600,
                 label: "clang-smoke: stress compile result",
                 exit_code_on_fail: SMOKE_EXIT_CLANG_SMOKE_FAILED,
@@ -17169,7 +17189,7 @@ fn doom_audio_smoke_steps() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: "BELL_TEST:PASS",
-        fail_prefix: "BELL_TEST:FAIL",
+        fail_prefixes: &["BELL_TEST:FAIL"],
         timeout_secs: 30,
         label: "guest/doom-audio: BEL re-arm PASS",
         exit_code_on_fail: SMOKE_EXIT_DOOM_AUDIO_FAILED,
@@ -23713,7 +23733,7 @@ fn run_smoke_steps_with_capture(
 
             SmokeStep::WaitPassOrFail {
                 pass_pattern,
-                fail_prefix,
+                fail_prefixes,
                 timeout_secs,
                 label,
                 exit_code_on_fail,
@@ -23735,8 +23755,8 @@ fn run_smoke_steps_with_capture(
                         drain_serial_through_match(&mut serial_buf, &stripped, mode, match_end);
                         break;
                     }
-                    let fail_capture = find_terminated_fail_line(&cleaned, fail_prefix)
-                        .or_else(|| find_terminated_fail_line(&stripped, fail_prefix));
+                    let fail_capture = find_terminated_fail_line(&cleaned, fail_prefixes)
+                        .or_else(|| find_terminated_fail_line(&stripped, fail_prefixes));
                     if let Some(captured) = fail_capture {
                         let _ = child.kill();
                         let _ = child.wait();
@@ -27190,13 +27210,16 @@ mod tests {
         match step {
             SmokeStep::WaitPassOrFail {
                 pass_pattern,
-                fail_prefix,
+                fail_prefixes,
                 exit_code_on_fail,
                 timeout_secs,
                 ..
             } => {
                 assert_eq!(*pass_pattern, "AUDIO_DEMO:PASS");
-                assert_eq!(*fail_prefix, "AUDIO_DEMO:FAIL stage=");
+                assert!(
+                    fail_prefixes.contains(&"AUDIO_DEMO:FAIL stage="),
+                    "fail_prefixes must contain \"AUDIO_DEMO:FAIL stage=\""
+                );
                 assert_eq!(
                     *exit_code_on_fail, SMOKE_EXIT_AUDIO_DEMO_FAILED,
                     "exit_code_on_fail must be SMOKE_EXIT_AUDIO_DEMO_FAILED"
@@ -27211,10 +27234,10 @@ mod tests {
     fn wait_pass_or_fail_captures_stage_from_fail_line() {
         // D.1 fix acceptance: when a serial buffer contains
         // `AUDIO_DEMO:FAIL stage=drain` the captured stage text must be
-        // "drain variant=Server" (everything after the fail_prefix).
-        let fail_prefix = "AUDIO_DEMO:FAIL stage=";
+        // "drain variant=Server" (everything after the matched prefix).
+        let fail_prefixes = &["AUDIO_DEMO:FAIL stage="];
         let serial_output = "AUDIO_DEMO:BEGIN\nAUDIO_DEMO:FAIL stage=drain variant=Server\n";
-        let captured = find_terminated_fail_line(serial_output, fail_prefix);
+        let captured = find_terminated_fail_line(serial_output, fail_prefixes);
         assert_eq!(captured.as_deref(), Some("drain variant=Server"));
     }
 
@@ -27225,9 +27248,45 @@ mod tests {
         // when QEMU was killed mid-write, hiding the
         // `variant=<AudioClientError>` diagnostic. With newline-gating,
         // an unterminated FAIL line must not produce a match.
-        let fail_prefix = "AUDIO_DEMO:FAIL stage=";
+        let fail_prefixes = &["AUDIO_DEMO:FAIL stage="];
         let serial_output = "AUDIO_DEMO:BEGIN\nAUDIO_DEMO:FAIL stage=submit vari";
-        assert!(find_terminated_fail_line(serial_output, fail_prefix).is_none());
+        assert!(find_terminated_fail_line(serial_output, fail_prefixes).is_none());
+    }
+
+    #[test]
+    fn wait_pass_or_fail_multi_pattern_matches_clang_error() {
+        // Phase 88 Track H: a line containing `: error:` must trip the
+        // multi-pattern clang/lld matcher.
+        let fail_prefixes = &["fatal error:", ": error:", "ld.lld: error:"];
+        let serial_output = "hello.c:5:3: error: use of undeclared identifier 'x'\n";
+        let captured = find_terminated_fail_line(serial_output, fail_prefixes);
+        assert!(
+            captured.is_some(),
+            "`: error:` should match the multi-pattern fail_prefixes"
+        );
+    }
+
+    #[test]
+    fn wait_pass_or_fail_multi_pattern_clean_line_no_match() {
+        // A line with no fail pattern must not match.
+        let fail_prefixes = &["fatal error:", ": error:", "ld.lld: error:"];
+        let serial_output = "CLANG_C_OK hello, world\n";
+        assert!(
+            find_terminated_fail_line(serial_output, fail_prefixes).is_none(),
+            "a clean pass line must not match any fail prefix"
+        );
+    }
+
+    #[test]
+    fn wait_pass_or_fail_multi_pattern_command_echo_no_match() {
+        // A command echo `|| echo CLANG_C_OK` must not trip `: error:`
+        // because the echo does not contain the pattern.
+        let fail_prefixes = &["fatal error:", ": error:", "ld.lld: error:"];
+        let serial_output = "clang -O2 hello.c -o /tmp/hello || echo CLANG_C_OK\n";
+        assert!(
+            find_terminated_fail_line(serial_output, fail_prefixes).is_none(),
+            "command echo must not match `: error:` fail prefix"
+        );
     }
 
     /// Build a minimal valid RIFF/WAVE file with S16LE PCM data.
@@ -27676,7 +27735,7 @@ mod tests {
             );
         let SmokeStep::WaitPassOrFail {
             pass_pattern,
-            fail_prefix,
+            fail_prefixes,
             exit_code_on_fail,
             ..
         } = bell_step
@@ -27684,7 +27743,10 @@ mod tests {
             unreachable!("guarded by .find(matches!) above")
         };
         assert_eq!(*pass_pattern, "BELL_TEST:PASS");
-        assert_eq!(*fail_prefix, "BELL_TEST:FAIL");
+        assert!(
+            fail_prefixes.contains(&"BELL_TEST:FAIL"),
+            "fail_prefixes must contain \"BELL_TEST:FAIL\""
+        );
         assert_eq!(*exit_code_on_fail, SMOKE_EXIT_BELL_SMOKE_FAILED);
     }
 
