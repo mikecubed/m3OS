@@ -68,7 +68,7 @@
 **Why it matters:** SSE `movaps`/register spills `#GP` on misalignment; musl `_start` realigns, but the kernel-built initial stack + auxv must already land 16-byte aligned for any early SSE-spilling path.
 
 **Acceptance:**
-- [x] The initial RSP handed to `_start` is 16-byte aligned (SysV psABI process-entry contract: RSP ≡ 0 mod 16 with argc at RSP), and the auxv table lands aligned; `setup_abi_stack_with_envp` carries a `debug_assert` and `kernel-core` a host test. **Finding:** the pre-86f code landed RSP ≡ 8 mod 16 — a latent SSE `#GP`; additionally all 18 hand-written non-naked `_start` stubs (compiler prologues assuming the called-function convention) were converted to `#[unsafe(naked)]` trampolines matching the `entry_point!` idiom.
+- [x] The initial RSP handed to `_start` is 16-byte aligned (SysV psABI process-entry contract: RSP ≡ 0 mod 16 with argc at RSP), and the auxv table lands aligned; `setup_abi_stack_with_envp` carries a `debug_assert` and `kernel-core` a host test. **Finding:** the pre-86f code landed RSP ≡ 8 mod 16 — a latent SSE `#GP`; additionally all 19 hand-written non-naked `_start` stubs (compiler prologues assuming the called-function convention) were converted to `#[unsafe(naked)]` trampolines matching the `entry_point!` idiom.
 - [x] An SSE-spilling userspace binary starts and runs to completion with no `#GP`/misalignment fault (`smoke-test` 25/25 green on the SSE-rebuilt userspace incl. converted `sh0`/`login`/`id`; locked in permanently by the C.3 gate).
 
 ---
@@ -98,7 +98,7 @@
 **Acceptance:**
 - [x] `cargo xtask smoke-test` and `regression` (11/11 arms, incl. `e1000-restart-crash`) PASS on the SSE-rebuilt userspace.
 - [x] `cargo xtask tui-app-smoke` (60 steps), `doom-audio-smoke`, and `doom-concurrent-smoke` (two concurrent DOOMs) PASS on the SSE-rebuilt userspace.
-- [x] Every ABI/alignment surprise surfaced by the rebuild was fixed (no skipped or quarantined gate; no regression vs the pre-SSE baseline): (1) entry RSP ≡ 8 → ≡ 0 mod 16 + 18 naked-trampoline `_start` conversions (Track B); (2) `ld-musl` kept on `x86_64-unknown-none` (must stay PIE/`ET_DYN`); (3) `x86_64-m3os.json` `"os"` restored to `"none"` — the vestigial `"m3os"` value flipped `target_os` and compiled `driver_runtime`'s 23 `cfg(target_os = "none")` device-host syscall wrappers to host-test fallbacks, blinding every ring-3 PCI driver (caught by `e1000-restart-crash`, root-caused via instrumented driver + kernel + disassembly, bisected against a green `main` baseline).
+- [x] Every ABI/alignment surprise surfaced by the rebuild was fixed (no skipped or quarantined gate; no regression vs the pre-SSE baseline): (1) entry RSP ≡ 8 → ≡ 0 mod 16 + 19 naked-trampoline `_start` conversions (Track B); (2) `ld-musl` kept on `x86_64-unknown-none` (must stay PIE/`ET_DYN`); (3) `x86_64-m3os.json` `"os"` restored to `"none"` — the vestigial `"m3os"` value flipped `target_os` and compiled `driver_runtime`'s 23 `cfg(target_os = "none")` device-host syscall wrappers to host-test fallbacks, blinding every ring-3 PCI driver (caught by `e1000-restart-crash`, root-caused via instrumented driver + kernel + disassembly, bisected against a green `main` baseline).
 
 ### C.3 — `userspace-simd-smoke` gate + pre-push wiring
 
