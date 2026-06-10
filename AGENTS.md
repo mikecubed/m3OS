@@ -167,7 +167,7 @@ Adding a new userspace binary requires changes in **four** places. Missing any o
 
 ### Adding a New Cross-Compiled Port (ncurses-style)
 
-Ports live under `ports/<category>/<name>/Portfile` and are built host-side by `cargo xtask port build <name>`, which dispatches to a `build_<name>` function in `xtask/src/port_build.rs`. **Every new `build_*` function MUST route through the shared musl-toolchain plumbing or it will fail on toolchains that ship without empty static-compat archives** (Arch `musl-cross-tools`, raiden, hand-built `musl-cross-make`, anything that omits `libdl.a` / `libpthread.a` / `librt.a`). The "C compiler cannot create executables" configure error during the link probe is the symptom.
+Ports live under `ports/<category>/<name>/Portfile` and are built host-side by `cargo xtask port build <name>`, which dispatches to a `build_<name>` function in `xtask/src/port_build.rs`. Use `cargo xtask port list` to see every Portfile (version, deps, whether it has a host build recipe, whether it's built on this machine), and `cargo xtask port build all` to build the whole recipe set in `DEPS=`-topological order (skipping pkgcache hits, skipping dependents of a failed port, with a PASS/FAIL/SKIP summary). **Every new `build_*` function MUST route through the shared musl-toolchain plumbing or it will fail on toolchains that ship without empty static-compat archives** (Arch `musl-cross-tools`, raiden, hand-built `musl-cross-make`, anything that omits `libdl.a` / `libpthread.a` / `librt.a`). The "C compiler cannot create executables" configure error during the link probe is the symptom.
 
 Required wiring in every port `build_*` function:
 
