@@ -376,6 +376,14 @@ fi
 # mounted (ext2 via ring-3 ahci.block)` -> login prompt). It is the CI proof of
 # the headline "a SATA disk mounts the root off ahci.block" that the isolated
 # `ahci-smoke` self-test does not cover.
+#
+# `ahci-rw-smoke` (Phase 87) closes the WRITE-path gap both of the above leave:
+# they only prove the root MOUNTS and serves READS over `ahci.block`, while a
+# payload WRITE through `blk::remote::write_sectors` -> `do_write_ipc` -> the
+# ring-3 `ahci_driver` was never exercised by any gate. It logs in and runs
+# `ext2-coherence-smoke` ON the AHCI root: a 200 KiB file write + fresh-process
+# byte-verify read-back. A `data[1]` or driver-recv-buffer regression truncates
+# the write at the driver and fails the gate. Skip-with-reason without musl.
 if [ "${M3OS_AHCI_REGRESSION:-0}" = "1" ]; then
     echo "pre-push: running cargo xtask ahci-smoke..."
     if ! cargo xtask ahci-smoke --timeout 240; then
@@ -385,6 +393,11 @@ if [ "${M3OS_AHCI_REGRESSION:-0}" = "1" ]; then
     echo "pre-push: running cargo xtask ahci-root-smoke..."
     if ! cargo xtask ahci-root-smoke --timeout 240; then
         echo "pre-push: cargo xtask ahci-root-smoke failed" >&2
+        exit 1
+    fi
+    echo "pre-push: running cargo xtask ahci-rw-smoke..."
+    if ! cargo xtask ahci-rw-smoke --timeout 300; then
+        echo "pre-push: cargo xtask ahci-rw-smoke failed" >&2
         exit 1
     fi
 fi

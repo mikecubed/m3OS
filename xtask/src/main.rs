@@ -683,6 +683,15 @@ fn main() {
                 });
             cmd_ahci_root_smoke(&smoke_args);
         }
+        Some("ahci-rw-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("ahci-rw-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_ahci_rw_smoke(&smoke_args);
+        }
         Some("session-smoke") => {
             let smoke_args =
                 parse_smoke_boot_args("session-smoke", &args[2..]).unwrap_or_else(|err| {
@@ -1086,7 +1095,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -10768,6 +10777,164 @@ fn cmd_ahci_root_smoke(args: &SmokeBootArgs) {
             let _ = child.kill();
             let _ = child.wait();
             eprintln!("ahci-root-smoke: FAILED\n{msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Serial steps for `ahci-rw-smoke`: boot the AHCI-root topology, log in, and run
+/// the ext2 write + fresh-process read-back self-test ON the AHCI-served root so
+/// the WRITE path (`blk::remote::write_sectors` → `do_write_ipc` → ring-3
+/// `ahci_driver` `handle_write`) is exercised end-to-end — coverage that
+/// `ahci-root-smoke` lacks (it only proves the root MOUNTS and serves READS).
+///
+/// `ext2-coherence-smoke` sub-test 3 writes a 200 KiB file (dozens of 4 KiB ext2
+/// blocks → multi-sector `block_write`s, each far larger than the old 1522 B
+/// driver recv buffer) and a freshly fork/exec'd process byte-verifies every
+/// byte against a deterministic per-offset pattern. A `data[1]` or recv-buffer
+/// regression in the ring-3 write path truncates those writes at the driver
+/// (`InvalidRequest`) and fails the gate — making this the deterministic guard
+/// for the Phase 87 ring-3 write fixes.
+fn ahci_rw_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+    // Settle after the credential transition so the shell is attached before
+    // input is delivered (mirrors fork_overlap_steps).
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/ext2-coherence-smoke\n",
+        label: "run ext2 write+read-back over ahci.block",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "EXT2_COHERENCE:PASS",
+        fail_prefix: "EXT2_COHERENCE:FAIL",
+        timeout_secs: 180,
+        label: "guest/ahci-rw: 200 KiB write + fresh-process read-back over ahci.block",
+        exit_code_on_fail: 1,
+    });
+    steps
+}
+
+/// Run the AHCI write + read-back smoke: boot with the ext2 data disk routed to
+/// `ich9-ahci` (root over `ahci.block`, like `ahci-root-smoke`), log in, and run
+/// `ext2-coherence-smoke` so a real 200 KiB file write + fresh-process read-back
+/// round-trips through the ring-3 AHCI driver's WRITE path. `ahci-root-smoke`
+/// only proves the root MOUNTS and serves READS over `ahci.block`; nothing
+/// exercised a payload WRITE through `blk::remote` to a ring-3 driver until this
+/// gate (the Phase 87 `do_write_ipc` `data[1]` + block-server recv-buffer fixes).
+///
+/// SKIP-with-reason when the musl cross-compiler is absent (the C self-test is
+/// then a 0-byte placeholder and cannot run) — the same PASS-vs-SKIP discipline
+/// as `tls-smoke` / `dns-smoke`.
+fn cmd_ahci_rw_smoke(args: &SmokeBootArgs) {
+    // The write+read-back self-test is a static musl C binary; without a musl
+    // cross-compiler it is replaced by a 0-byte placeholder and cannot run.
+    // Skip with a clear reason instead of booting QEMU to a guaranteed timeout.
+    if find_musl_cc().is_none() {
+        println!(
+            "ahci-rw-smoke: SKIP — musl cross-compiler not found, so \
+             ext2-coherence-smoke is not built (install musl-tools on \
+             Debian/Ubuntu or musl-gcc-cross-bin on Arch to enable)"
+        );
+        return;
+    }
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    // Defensive: even with a musl probe hit, a prior failed build can leave a
+    // 0-byte placeholder. If the staged self-test is empty, skip rather than
+    // boot to a timeout.
+    let coh = workspace_root().join("target/generated-initrd/ext2-coherence-smoke");
+    let coh_ok = std::fs::metadata(&coh)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false);
+    if !coh_ok {
+        println!(
+            "ahci-rw-smoke: SKIP — staged ext2-coherence-smoke is missing or empty \
+             at {} (musl build produced no binary)",
+            coh.display()
+        );
+        return;
+    }
+
+    // Recreate the ext2 data disk fresh so the run is hermetic. This disk is the
+    // ROOT filesystem and is routed to AHCI below (not virtio-blk). Mirrors
+    // cmd_ahci_root_smoke's disk creation (all flags false → serial-login mode).
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    // DeviceSet { ahci: true } routes the data disk to an ich9-ahci/ide-hd chain
+    // and omits the virtio-blk data disk entirely, so writes go through the
+    // ring-3 ahci_driver over ahci.block.
+    let mut qemu_args = qemu_args_with_devices(
+        &uefi_image,
+        &ovmf,
+        display_mode,
+        DeviceSet {
+            ahci: true,
+            ..DeviceSet::default()
+        },
+    );
+    // Strip the hostfwd rules so parallel CI lanes do not collide on host ports
+    // 2222/2323 (same approach as cmd_ahci_root_smoke / cmd_ahci_smoke).
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+
+    let steps = ahci_rw_smoke_steps();
+
+    println!(
+        "ahci-rw-smoke: launching QEMU with the ext2 data disk on ich9-ahci \
+         (root over ahci.block; ext2 200 KiB write + read-back self-test, timeout {}s)",
+        args.timeout_secs
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!(
+                "ahci-rw-smoke: serial script PASSED ({} steps in {elapsed}s) — \
+                 ext2 200 KiB write + fresh-process read-back round-tripped over ahci.block",
+                steps.len()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("ahci-rw-smoke: FAILED\n{msg}");
             std::process::exit(1);
         }
     }
