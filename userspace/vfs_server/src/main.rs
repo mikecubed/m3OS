@@ -1938,6 +1938,19 @@ fn server_loop(ext2: &mut Ext2State, ep_handle: u32) -> ! {
         // pool at the request boundary (covers success and error paths), so a
         // multi-block allocation never leaks claimed-but-unmapped blocks.
         let _ = ext2.release_block_reservation();
+        // Phase 87 durability — flush the deferred indirect/pointer-block
+        // write-back at the request boundary (no-op when nothing is dirty). The
+        // pointer blocks then reach the device cache / host page cache, so a
+        // *completed* write survives an abrupt QEMU process kill (host page cache
+        // outlives the QEMU process); the loss window is bounded to the single
+        // in-flight request rather than "everything since the last threshold /
+        // clean shutdown". Cheap with the write-back cache (one indirect write
+        // per 64 KiB chunk — still ~16x fewer than the pre-deferral per-block
+        // rewrites). HOST-crash durability (physical media) still relies on the
+        // VIRTIO_BLK_T_FLUSH at clean shutdown; sb/BGD free-count summaries stay
+        // on their op-count threshold (fsck reconciles them from the
+        // write-through bitmaps).
+        let _ = ext2.flush_dirty_blocks();
         let elapsed_us = now_usec().saturating_sub(start_us);
         // H9 follow-up: per-request start/done logging was investigative
         // only and added ~24 syscalls per request via write_str chains.
