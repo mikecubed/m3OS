@@ -35,7 +35,7 @@ use core::cell::{Cell, RefCell};
 use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_core::fs::ext2::{
     EXT2_DIND_BLOCK, EXT2_FT_DIR, EXT2_FT_REG_FILE, EXT2_FT_SYMLINK, EXT2_IND_BLOCK,
-    EXT2_NDIR_BLOCKS, EXT2_ROOT_INO, Ext2BlockGroupDescriptor, Ext2DirEntry, Ext2Error, Ext2Inode,
+    EXT2_NDIR_BLOCKS, EXT2_ROOT_INO, Ext2BlockGroupDescriptor, Ext2Error, Ext2Inode,
     Ext2Superblock, S_IFDIR, S_IFLNK, S_IFREG, inode_block_group, inode_index_in_group,
 };
 use kernel_core::fs::mbr;

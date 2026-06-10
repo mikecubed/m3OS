@@ -62,6 +62,7 @@ const NEG_EROFS: u64 = (-30_i64) as u64;
 const NEG_ENOTDIR: u64 = (-20_i64) as u64;
 const NEG_EISDIR: u64 = (-21_i64) as u64;
 const NEG_ENOSYS: u64 = (-38_i64) as u64;
+const NEG_ESPIPE: u64 = (-29_i64) as u64;
 const NEG_ESRCH: u64 = (-3_i64) as u64;
 const NEG_EINTR: u64 = (-4_i64) as u64;
 const NEG_ENOTEMPTY: u64 = (-39_i64) as u64;
@@ -6907,33 +6908,39 @@ pub(super) fn sys_linux_pread64(fd: u64, buf_ptr: u64, count: u64, offset: u64) 
     }
 }
 
-/// Phase 85d — `pwrite64(fd, buf, count, offset)`: write at `offset` without
-/// advancing the fd position. Implemented by temporarily seeking the fd to
-/// `offset`, delegating to the normal write path, then restoring the saved
-/// position. Single-writer semantics are sufficient for clang/lld's output
-/// writers; a concurrent writer racing the same fd's position is not a case the
-/// toolchain exercises.
+/// `pwrite64(fd, buf, count, offset)`: write at `offset` without touching the
+/// fd's shared position.
+///
+/// Phase 88 Track G — now ATOMIC. The Phase 85d implementation seeked the fd to
+/// `offset`, called the normal write path, then restored the saved position;
+/// under `CLONE_FILES` fd-table sharing that briefly published a bogus position
+/// (a concurrent `write`/`lseek` on the same fd could observe it), and it was
+/// inconsistent with the already-positional `pread64`. The write is now routed
+/// through `kernel_write_fd_at` (the write analog of `kernel_read_fd_at`), which
+/// writes at the explicit offset and never reads or mutates `entry.offset` —
+/// matching POSIX `pwrite(2)`. Non-seekable fds (pipe/socket/tty) report
+/// `ESPIPE`, as POSIX requires.
 pub(super) fn sys_linux_pwrite64(fd: u64, buf_ptr: u64, count: u64, offset: u64) -> u64 {
     let fd_us = fd as usize;
     if fd_us >= MAX_FDS {
         return NEG_EBADF;
     }
-    let saved = match current_fd_entry(fd_us) {
-        Some(e) => e.offset,
-        None => return NEG_EBADF,
-    };
-    with_current_fd_mut(fd_us, |slot| {
-        if let Some(e) = slot {
-            e.offset = offset as usize;
-        }
-    });
-    let n = sys_linux_write(fd, buf_ptr, count);
-    with_current_fd_mut(fd_us, |slot| {
-        if let Some(e) = slot {
-            e.offset = saved;
-        }
-    });
-    n
+    let to_write = (count as usize).min(64 * 1024);
+    if to_write == 0 {
+        return 0;
+    }
+    let mut kbuf = alloc::vec![0u8; to_write];
+    if UserSliceRo::new(buf_ptr, to_write)
+        .and_then(|s| s.copy_to_kernel(&mut kbuf))
+        .is_err()
+    {
+        return NEG_EFAULT;
+    }
+    let pid = crate::process::current_pid();
+    match kernel_write_fd_at(pid, fd_us, offset as usize, &kbuf) {
+        Ok(n) => n as u64,
+        Err(e) => e as u64,
+    }
 }
 
 /// Write a Linux `struct rlimit { rlim_cur, rlim_max }` (two `u64`) to `rlim_ptr`.
@@ -10750,6 +10757,156 @@ fn kernel_read_fd_at(pid: u32, fd: usize, offset: usize, buf: &mut [u8]) -> Resu
             }
         }
         _ => Err(NEG_EINVAL as i64),
+    }
+}
+
+/// Phase 88 Track G — the write analog of [`kernel_read_fd_at`]: write `buf` at
+/// an explicit byte `offset` for the seekable file backends (Tmpfs, ext2,
+/// FAT32), WITHOUT reading or mutating the fd's shared position. This makes
+/// `pwrite64` atomic under `CLONE_FILES` fd-table sharing and POSIX-correct
+/// (non-seekable fds report `ESPIPE`). It mirrors the per-backend write
+/// bookkeeping in `sys_linux_write` — ext2 routes to the `vfs_server` write
+/// authority when registered (else the in-kernel engine); FAT32 may relocate the
+/// start cluster — but updates only the file-identity cache (`file_size` /
+/// `start_cluster`), never `entry.offset`.
+fn kernel_write_fd_at(pid: u32, fd: usize, offset: usize, buf: &[u8]) -> Result<usize, i64> {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    let entry = {
+        let table = crate::process::PROCESS_TABLE.lock();
+        match table.find(pid) {
+            Some(p) => p.fd_get(fd),
+            None => return Err(NEG_EBADF as i64),
+        }
+    };
+    let entry = match entry {
+        Some(e) => e,
+        None => return Err(NEG_EBADF as i64),
+    };
+    if !entry.writable {
+        return Err(NEG_EBADF as i64);
+    }
+    match &entry.backend {
+        FdBackend::Tmpfs { path } => {
+            let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
+            match tmpfs.write_file(path, offset, buf) {
+                Ok(()) => Ok(buf.len()),
+                Err(crate::fs::tmpfs::TmpfsError::NoSpace) => Err(NEG_ENOSPC as i64),
+                Err(crate::fs::tmpfs::TmpfsError::NotFound) => Err(NEG_EBADF as i64),
+                Err(_) => Err(NEG_EINVAL as i64),
+            }
+        }
+        FdBackend::Ext2Disk {
+            inode_num, path, ..
+        } => {
+            let inode_num = *inode_num;
+            let path = path.clone();
+            // Route to the vfs_server ext2 write authority when registered, so a
+            // later read (this fd or any process) sees coherent bytes.
+            if vfs_write_routable() {
+                let mut total = 0usize;
+                let mut cur_off = offset as u64;
+                let mut new_size: Option<u32> = None;
+                while total < buf.len() {
+                    match vfs_service_write(&path, cur_off, &buf[total..]) {
+                        Ok((0, _)) => break,
+                        Ok((n, sz)) => {
+                            total += n;
+                            cur_off += n as u64;
+                            new_size = Some(sz);
+                        }
+                        Err(e) => {
+                            if total == 0 {
+                                return Err(e as i64);
+                            }
+                            break;
+                        }
+                    }
+                }
+                if let Some(sz) = new_size {
+                    with_current_fd_mut(fd, |slot| {
+                        if let Some(e) = slot
+                            && let FdBackend::Ext2Disk {
+                                file_size: ref mut fs,
+                                ..
+                            } = e.backend
+                        {
+                            *fs = sz;
+                        }
+                    });
+                }
+                return Ok(total);
+            }
+            // In-kernel ext2 engine fallback.
+            let mut vol = crate::fs::ext2::EXT2_VOLUME.lock();
+            let Some(vol) = vol.as_mut() else {
+                return Err(NEG_EIO as i64);
+            };
+            let mut inode = vol.read_inode(inode_num).map_err(|_| NEG_EIO as i64)?;
+            let now = current_unix_time();
+            inode.mtime = now;
+            inode.ctime = now;
+            match vol.write_file_data(inode_num, &mut inode, offset as u64, buf) {
+                Ok(n) => {
+                    let new_size = inode.size;
+                    with_current_fd_mut(fd, |slot| {
+                        if let Some(e) = slot
+                            && let FdBackend::Ext2Disk {
+                                file_size: ref mut fs,
+                                ..
+                            } = e.backend
+                        {
+                            *fs = new_size;
+                        }
+                    });
+                    Ok(n)
+                }
+                Err(_) => Err(NEG_EIO as i64),
+            }
+        }
+        FdBackend::Fat32Disk {
+            start_cluster,
+            file_size,
+            dir_cluster,
+            path,
+        } => {
+            let start_cluster = *start_cluster;
+            let current_file_size = *file_size as usize;
+            let dir_cluster = *dir_cluster;
+            let path = path.clone();
+            let mut vol = crate::fs::fat32::FAT32_VOLUME.lock();
+            let Some(vol) = vol.as_mut() else {
+                return Err(NEG_EIO as i64);
+            };
+            match vol.write_file(start_cluster, offset, buf, current_file_size) {
+                Ok((new_start, new_size)) => {
+                    let file_name = path.rsplit('/').next().unwrap_or(&path);
+                    if vol
+                        .update_dir_entry(dir_cluster, file_name, new_start, new_size as u32)
+                        .is_err()
+                    {
+                        return Err(NEG_EIO as i64);
+                    }
+                    with_current_fd_mut(fd, |slot| {
+                        if let Some(e) = slot
+                            && let FdBackend::Fat32Disk {
+                                start_cluster: ref mut sc,
+                                file_size: ref mut fs,
+                                ..
+                            } = e.backend
+                        {
+                            *sc = new_start;
+                            *fs = new_size as u32;
+                        }
+                    });
+                    Ok(buf.len())
+                }
+                Err(_) => Err(NEG_EIO as i64),
+            }
+        }
+        // POSIX pwrite on a non-seekable fd (pipe/FIFO/socket/tty) → ESPIPE.
+        _ => Err(NEG_ESPIPE as i64),
     }
 }
 

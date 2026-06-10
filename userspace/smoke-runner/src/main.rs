@@ -4,9 +4,9 @@
 use core::ptr;
 
 use syscall_lib::{
-    O_CREAT, O_DIRECTORY, O_RDONLY, O_TRUNC, O_WRONLY, STDERR_FILENO, STDOUT_FILENO, Stat, close,
-    dup2, execve, exit, fork, fstat, getdents64, geteuid, getpid, open, read, stat, unlink,
-    waitpid, write, write_str,
+    O_CREAT, O_DIRECTORY, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, SEEK_CUR, SEEK_SET, STDERR_FILENO,
+    STDOUT_FILENO, Stat, close, dup2, execve, exit, fork, fstat, getdents64, geteuid, getpid,
+    lseek, open, read, stat, unlink, waitpid, write, write_str,
 };
 
 const TCC_PATH: &[u8] = b"/usr/bin/tcc\0";
@@ -23,6 +23,10 @@ const STAT_ID_FILE: &[u8] = b"/etc/passwd\0";
 const STAT_ID_DIR: &[u8] = b"/etc\0";
 const STAT_ID_ENTRY: &[u8] = b"passwd";
 const STAT_ID_TMP: &[u8] = b"/tmp/stat-id-probe\0";
+
+// Phase 88 Track G — pwrite64 atomicity regression inputs.
+const PWRITE_TMPFS: &[u8] = b"/tmp/pwrite-atomic\0";
+const PWRITE_EXT2: &[u8] = b"/root/pwrite-atomic-e\0";
 const UDP_SMOKE_PATH: &[u8] = b"/root/udp-smoke\0";
 const PAGE_GRANT_TEST_PATH: &[u8] = b"/bin/page-grant-test\0";
 const PAGE_GRANT_TEST_ARGV0: &[u8] = b"page-grant-test\0";
@@ -219,6 +223,16 @@ fn program_main(_args: &[&str]) -> i32 {
         return code;
     }
     pass("stat-identity");
+
+    // Phase 88 Track G — pwrite64 must be atomic: it writes at an explicit
+    // offset without moving the shared fd position. Interleave it with
+    // write/lseek and assert the position is untouched and the following write
+    // lands at the pre-existing position.
+    begin("pwrite-atomic");
+    if let Err(code) = verify_pwrite_atomic() {
+        return code;
+    }
+    pass("pwrite-atomic");
 
     // Phase 88 — ext2 cross-process read-coherence regression (Bug B). Writes an
     // ext2 file, churns unrelated ext2 metadata, then reads it back from a fresh
@@ -967,6 +981,100 @@ fn verify_stat_identity() -> Result<(), i32> {
             "statx(332) did not return -ENOSYS",
             89,
         ));
+    }
+
+    Ok(())
+}
+
+/// Phase 88 Track G — pwrite64 atomicity regression. Interleaves `pwrite64` (via
+/// the raw syscall — no libc wrapper exists) with `write`/`lseek` on a shared fd
+/// and asserts `pwrite` leaves the fd position unchanged and the SUBSEQUENT
+/// `write` lands at the pre-existing position, not the `pwrite` offset. Covers
+/// the Tmpfs path fully (content read-back) and the ext2 path's position
+/// invariant.
+fn verify_pwrite_atomic() -> Result<(), i32> {
+    // --- Tmpfs: full interleave + content read-back ---
+    let raw = open(PWRITE_TMPFS, O_RDWR | O_CREAT | O_TRUNC, 0o644);
+    if raw < 0 {
+        return Err(fail("pwrite-atomic", "open tmpfs file failed", 70));
+    }
+    let fd = raw as i32;
+    if write(fd, b"AAAA") != 4 {
+        close(fd);
+        let _ = unlink(PWRITE_TMPFS);
+        return Err(fail("pwrite-atomic", "tmpfs write AAAA failed", 71));
+    }
+    // pwrite64(fd, "BB", 2, offset=10) — syscall 18.
+    let pw = unsafe { syscall_lib::syscall4(18, fd as u64, b"BB".as_ptr() as u64, 2, 10) };
+    if (pw as i64) != 2 {
+        close(fd);
+        let _ = unlink(PWRITE_TMPFS);
+        return Err(fail(
+            "pwrite-atomic",
+            "tmpfs pwrite returned wrong count",
+            72,
+        ));
+    }
+    if lseek(fd, 0, SEEK_CUR) != 4 {
+        close(fd);
+        let _ = unlink(PWRITE_TMPFS);
+        return Err(fail(
+            "pwrite-atomic",
+            "tmpfs pwrite moved the fd position",
+            73,
+        ));
+    }
+    if write(fd, b"CC") != 2 {
+        close(fd);
+        let _ = unlink(PWRITE_TMPFS);
+        return Err(fail("pwrite-atomic", "tmpfs write CC failed", 74));
+    }
+    if lseek(fd, 0, SEEK_CUR) != 6 {
+        close(fd);
+        let _ = unlink(PWRITE_TMPFS);
+        return Err(fail("pwrite-atomic", "tmpfs position wrong after CC", 75));
+    }
+    let _ = lseek(fd, 0, SEEK_SET);
+    let mut rb = [0u8; 12];
+    let n = read(fd, &mut rb);
+    close(fd);
+    let _ = unlink(PWRITE_TMPFS);
+    if n != 12 {
+        return Err(fail("pwrite-atomic", "tmpfs read-back short", 76));
+    }
+    // "AAAA" at 0, "CC" at 4 (pre-pwrite position), "BB" at 10 (pwrite offset).
+    if &rb[0..4] != b"AAAA" || &rb[4..6] != b"CC" || &rb[10..12] != b"BB" {
+        return Err(fail(
+            "pwrite-atomic",
+            "tmpfs content landed at wrong offsets",
+            77,
+        ));
+    }
+
+    // --- ext2: pwrite must not move the shared fd position. Best-effort: if the
+    // create is unavailable in a minimal config, skip rather than fail. ---
+    let eraw = open(PWRITE_EXT2, O_RDWR | O_CREAT | O_TRUNC, 0o644);
+    if eraw >= 0 {
+        let efd = eraw as i32;
+        let _ = write(efd, b"AAAA"); // position 4
+        let epw = unsafe { syscall_lib::syscall4(18, efd as u64, b"BB".as_ptr() as u64, 2, 100) };
+        let epos = lseek(efd, 0, SEEK_CUR);
+        close(efd);
+        let _ = unlink(PWRITE_EXT2);
+        if (epw as i64) != 2 {
+            return Err(fail(
+                "pwrite-atomic",
+                "ext2 pwrite returned wrong count",
+                78,
+            ));
+        }
+        if epos != 4 {
+            return Err(fail(
+                "pwrite-atomic",
+                "ext2 pwrite moved the fd position",
+                79,
+            ));
+        }
     }
 
     Ok(())
