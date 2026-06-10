@@ -616,6 +616,222 @@ pub fn read_file_data_coalesced<E>(
 }
 
 // ---------------------------------------------------------------------------
+// Phase 88 Track C — shared higher-level ext2 read logic over a `BlockReader`.
+//
+// `resolve_path` / `read_inode` / `read_file_data` / `resolve_block` /
+// `read_directory_entries` were historically implemented TWICE — once in the
+// kernel (`kernel/src/fs/ext2.rs`, `Ext2Volume`) and once in the ring-3
+// `vfs_server` (`Ext2State`) — and they diverged at the metadata seam (the 85d
+// post-mortem's finding #2). They now live here ONCE, generic over a
+// `BlockReader` that supplies only the block source + geometry, so a fix in one
+// is a fix in both. The kernel supplies a `crate::blk`-backed reader (with its
+// block cache); the vfs_server supplies a `sys_block_read`-backed reader (with
+// its own cache + write-back shadow). Only the byte-struct parsing was shared
+// before; the *logic* is now shared too.
+// ---------------------------------------------------------------------------
+
+/// A source of ext2 blocks plus the geometry needed to walk inodes and paths.
+///
+/// Implementors own the I/O strategy (caching, multi-block device reads); the
+/// shared functions below contain the filesystem logic. `read_block` returns a
+/// freshly-owned `block_size`-byte buffer.
+pub trait BlockReader {
+    /// ext2 block size in bytes (`1024 << log_block_size`).
+    fn block_size(&self) -> u32;
+    /// Inodes per block group (from the superblock).
+    fn inodes_per_group(&self) -> u32;
+    /// On-disk inode size in bytes (128 for rev 0).
+    fn inode_size(&self) -> u32;
+    /// First block of the inode table for block group `group` (from the BGD).
+    fn inode_table_block(&self, group: u32) -> Result<u32, Ext2Error>;
+    /// Read one whole ext2 block (`block_size` bytes).
+    fn read_block(&self, block_num: u32) -> Result<Vec<u8>, Ext2Error>;
+
+    /// Maximum number of physically-contiguous blocks a single coalesced run may
+    /// span (the device's per-request cap). Default 1 (no coalescing).
+    fn max_run_blocks(&self) -> u32 {
+        1
+    }
+    /// Read `count` physically-contiguous whole blocks starting at `start_block`
+    /// into `dst` (`dst.len() == count * block_size`). The default reads them one
+    /// at a time; implementors override for a single multi-block device read.
+    fn read_block_run(
+        &self,
+        start_block: u32,
+        count: u32,
+        dst: &mut [u8],
+    ) -> Result<(), Ext2Error> {
+        let bs = self.block_size() as usize;
+        for i in 0..count {
+            let block = self.read_block(start_block + i)?;
+            let off = i as usize * bs;
+            dst[off..off + bs].copy_from_slice(&block);
+        }
+        Ok(())
+    }
+    /// Copy `dst.len()` bytes from within block `block_num` at byte offset
+    /// `block_offset` into `dst`. The default reads the whole block then slices;
+    /// implementors override for a cache-aware copy.
+    fn read_block_into(
+        &self,
+        block_num: u32,
+        block_offset: usize,
+        dst: &mut [u8],
+    ) -> Result<(), Ext2Error> {
+        let block = self.read_block(block_num)?;
+        dst.copy_from_slice(&block[block_offset..block_offset + dst.len()]);
+        Ok(())
+    }
+}
+
+/// Read a little-endian `u32` block pointer at pointer-index `idx`, bounds-safe.
+fn read_block_ptr(block: &[u8], idx: usize) -> Result<u32, Ext2Error> {
+    let off = idx * 4;
+    let bytes = block.get(off..off + 4).ok_or(Ext2Error::TruncatedInput)?;
+    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+/// Read inode `inode_num` (1-based) via the `BlockReader`.
+pub fn read_inode<R: BlockReader + ?Sized>(r: &R, inode_num: u32) -> Result<Ext2Inode, Ext2Error> {
+    let ipg = r.inodes_per_group();
+    if ipg == 0 {
+        return Err(Ext2Error::CorruptedEntry);
+    }
+    let group = inode_block_group(inode_num, ipg);
+    let index = inode_index_in_group(inode_num, ipg);
+    let inode_table = r.inode_table_block(group)?;
+    let bs = r.block_size() as u64;
+    let byte_offset = index as u64 * r.inode_size() as u64;
+    let block_offset = (byte_offset / bs) as u32;
+    let offset_in_block = (byte_offset % bs) as usize;
+    let block = r.read_block(inode_table + block_offset)?;
+    Ext2Inode::parse(&block[offset_in_block..])
+}
+
+/// Resolve logical block `logical_block` of `inode` to a physical block number,
+/// walking direct / single-indirect / double-indirect pointers. Returns 0 for a
+/// sparse hole. Triple-indirect is unsupported (`CorruptedEntry`).
+pub fn resolve_block<R: BlockReader + ?Sized>(
+    r: &R,
+    inode: &Ext2Inode,
+    logical_block: u32,
+) -> Result<u32, Ext2Error> {
+    let ptrs_per_block = r.block_size() / 4;
+
+    if logical_block < EXT2_NDIR_BLOCKS as u32 {
+        return Ok(inode.block[logical_block as usize]);
+    }
+    let adjusted = logical_block - EXT2_NDIR_BLOCKS as u32;
+
+    if adjusted < ptrs_per_block {
+        let ind = inode.block[EXT2_IND_BLOCK];
+        if ind == 0 {
+            return Ok(0);
+        }
+        let data = r.read_block(ind)?;
+        return read_block_ptr(&data, adjusted as usize);
+    }
+    let adjusted = adjusted - ptrs_per_block;
+
+    if adjusted < ptrs_per_block * ptrs_per_block {
+        let dind = inode.block[EXT2_DIND_BLOCK];
+        if dind == 0 {
+            return Ok(0);
+        }
+        let dind_data = r.read_block(dind)?;
+        let ind = read_block_ptr(&dind_data, (adjusted / ptrs_per_block) as usize)?;
+        if ind == 0 {
+            return Ok(0);
+        }
+        let ind_data = r.read_block(ind)?;
+        return read_block_ptr(&ind_data, (adjusted % ptrs_per_block) as usize);
+    }
+
+    Err(Ext2Error::CorruptedEntry)
+}
+
+/// Read up to `buf.len()` bytes of `inode`'s data starting at byte `offset`,
+/// coalescing physically-contiguous whole-block runs (see
+/// [`read_file_data_coalesced`]). Returns the number of bytes read.
+pub fn read_file_data<R: BlockReader + ?Sized>(
+    r: &R,
+    inode: &Ext2Inode,
+    offset: u64,
+    buf: &mut [u8],
+) -> Result<usize, Ext2Error> {
+    read_file_data_coalesced(
+        inode.size as u64,
+        r.block_size(),
+        offset,
+        buf,
+        r.max_run_blocks(),
+        |logical_block| resolve_block(r, inode, logical_block),
+        |start_block, count, dst| r.read_block_run(start_block, count, dst),
+        |phys_block, offset_in_block, dst| r.read_block_into(phys_block, offset_in_block, dst),
+    )
+}
+
+/// Read all directory entries of `inode` (a directory), including `.` and `..`,
+/// skipping deleted (inode==0) entries. Returns `(name, inode, file_type)` where
+/// `file_type` is the raw ext2 dir-entry type byte (`EXT2_FT_*`).
+pub fn read_directory_entries<R: BlockReader + ?Sized>(
+    r: &R,
+    inode: &Ext2Inode,
+) -> Result<Vec<(String, u32, u8)>, Ext2Error> {
+    if !inode.is_dir() {
+        return Err(Ext2Error::NotDirectory);
+    }
+    let bs = r.block_size() as u64;
+    let num_blocks = (inode.size as u64).div_ceil(bs) as u32;
+    let mut result = Vec::new();
+    for logical_block in 0..num_blocks {
+        let phys = resolve_block(r, inode, logical_block)?;
+        if phys == 0 {
+            continue;
+        }
+        let block = r.read_block(phys)?;
+        for entry in Ext2DirEntry::parse_block(&block)? {
+            if entry.inode != 0 {
+                result.push((entry.name, entry.inode, entry.file_type));
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Look up `name` in directory `dir_inode`, returning its inode number.
+pub fn lookup_in_directory<R: BlockReader + ?Sized>(
+    r: &R,
+    dir_inode: &Ext2Inode,
+    name: &str,
+) -> Result<u32, Ext2Error> {
+    for (entry_name, ino, _ft) in read_directory_entries(r, dir_inode)? {
+        if entry_name == name {
+            return Ok(ino);
+        }
+    }
+    Err(Ext2Error::NotFound)
+}
+
+/// Resolve a path to an inode number, walking from the root inode. Empty
+/// components and `.` are skipped (so a leading `/` is tolerated). Symlinks in
+/// intermediate components are NOT followed (matches both prior implementations).
+pub fn resolve_path<R: BlockReader + ?Sized>(r: &R, path: &str) -> Result<u32, Ext2Error> {
+    let mut current = EXT2_ROOT_INO;
+    for component in path.split('/').filter(|s| !s.is_empty()) {
+        if component == "." {
+            continue;
+        }
+        let inode = read_inode(r, current)?;
+        if !inode.is_dir() {
+            return Err(Ext2Error::NotDirectory);
+        }
+        current = lookup_in_directory(r, &inode, component)?;
+    }
+    Ok(current)
+}
+
+// ---------------------------------------------------------------------------
 // Tests (P28-T008, P28-T009)
 // ---------------------------------------------------------------------------
 

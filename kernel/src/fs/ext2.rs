@@ -14,8 +14,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 use kernel_core::fs::ext2::{
     EXT2_DIND_BLOCK, EXT2_FT_DIR, EXT2_FT_REG_FILE, EXT2_FT_SYMLINK, EXT2_IND_BLOCK,
-    EXT2_NDIR_BLOCKS, EXT2_ROOT_INO, Ext2BlockGroupDescriptor, Ext2DirEntry, Ext2Error, Ext2Inode,
-    Ext2Superblock, S_IFDIR, S_IFLNK, S_IFREG,
+    EXT2_NDIR_BLOCKS, Ext2BlockGroupDescriptor, Ext2Error, Ext2Inode, Ext2Superblock, S_IFDIR,
+    S_IFLNK, S_IFREG,
 };
 
 use spin::Mutex;
@@ -77,6 +77,51 @@ pub struct Ext2Volume {
 /// `IrqSafeMutex` is unnecessary defensive coverage that is now
 /// actively harmful.
 pub static EXT2_VOLUME: Mutex<Option<Ext2Volume>> = Mutex::new(None);
+
+/// Phase 88 Track C — expose the kernel `Ext2Volume` as a `BlockReader` so the
+/// higher-level read logic (resolve_path / read_inode / read_file_data /
+/// resolve_block / dir parsing) lives once in `kernel_core::fs::ext2` and is
+/// shared with the ring-3 `vfs_server`. The block source is this volume's
+/// cache-aware `read_block`; runs use the Phase 87 multi-block path.
+impl kernel_core::fs::ext2::BlockReader for Ext2Volume {
+    fn block_size(&self) -> u32 {
+        self.block_size
+    }
+    fn inodes_per_group(&self) -> u32 {
+        self.superblock.inodes_per_group
+    }
+    fn inode_size(&self) -> u32 {
+        self.superblock.inode_size as u32
+    }
+    fn inode_table_block(&self, group: u32) -> Result<u32, Ext2Error> {
+        self.bgd_table
+            .get(group as usize)
+            .map(|b| b.inode_table)
+            .ok_or(Ext2Error::CorruptedEntry)
+    }
+    fn read_block(&self, block_num: u32) -> Result<Vec<u8>, Ext2Error> {
+        Ext2Volume::read_block(self, block_num)
+    }
+    fn max_run_blocks(&self) -> u32 {
+        kernel_core::driver_ipc::block::MAX_SECTORS_PER_REQUEST / self.sectors_per_block
+    }
+    fn read_block_run(
+        &self,
+        start_block: u32,
+        count: u32,
+        dst: &mut [u8],
+    ) -> Result<(), Ext2Error> {
+        self.read_run_into_slice(start_block, count, dst)
+    }
+    fn read_block_into(
+        &self,
+        block_num: u32,
+        block_offset: usize,
+        dst: &mut [u8],
+    ) -> Result<(), Ext2Error> {
+        self.read_block_into_slice(block_num, block_offset, dst)
+    }
+}
 
 impl Ext2Volume {
     /// Mount an ext2 partition at the given base LBA (P28-T019).
@@ -279,29 +324,10 @@ impl Ext2Volume {
     // Inode operations (P28-T010)
     // -----------------------------------------------------------------------
 
-    /// Read an inode by number (1-based).
+    /// Read an inode by number (1-based). Phase 88 Track C — delegates to the
+    /// shared `kernel_core::fs::ext2::read_inode` over this volume's `BlockReader`.
     pub fn read_inode(&self, inode_num: u32) -> Result<Ext2Inode, Ext2Error> {
-        let group =
-            kernel_core::fs::ext2::inode_block_group(inode_num, self.superblock.inodes_per_group);
-        let index = kernel_core::fs::ext2::inode_index_in_group(
-            inode_num,
-            self.superblock.inodes_per_group,
-        );
-
-        let bgd = self
-            .bgd_table
-            .get(group as usize)
-            .ok_or(Ext2Error::CorruptedEntry)?;
-
-        let inode_size = self.superblock.inode_size as u32;
-        let byte_offset = (index as u64) * (inode_size as u64);
-        let block_offset = byte_offset / (self.block_size as u64);
-        let offset_in_block = (byte_offset % (self.block_size as u64)) as usize;
-
-        let block_num = bgd.inode_table + block_offset as u32;
-        let block_data = self.read_block(block_num)?;
-
-        Ext2Inode::parse(&block_data[offset_in_block..])
+        kernel_core::fs::ext2::read_inode(self, inode_num)
     }
 
     /// Write an inode back to disk (P28-T033).
@@ -335,66 +361,10 @@ impl Ext2Volume {
     // -----------------------------------------------------------------------
 
     /// Resolve a logical block index to a physical block number.
-    /// Returns 0 for sparse/hole blocks.
+    /// Returns 0 for sparse/hole blocks. Phase 88 Track C — delegates to the
+    /// shared `kernel_core::fs::ext2::resolve_block`.
     fn resolve_block(&self, inode: &Ext2Inode, logical_block: u32) -> Result<u32, Ext2Error> {
-        let ptrs_per_block = self.block_size / 4; // u32 entries per block
-
-        // Direct blocks (0–11)
-        if logical_block < EXT2_NDIR_BLOCKS as u32 {
-            return Ok(inode.block[logical_block as usize]);
-        }
-
-        let adjusted = logical_block - EXT2_NDIR_BLOCKS as u32;
-
-        // Single-indirect (P28-T012)
-        if adjusted < ptrs_per_block {
-            let ind_block = inode.block[EXT2_IND_BLOCK];
-            if ind_block == 0 {
-                return Ok(0);
-            }
-            let data = self.read_block(ind_block)?;
-            let off = (adjusted as usize) * 4;
-            return Ok(u32::from_le_bytes([
-                data[off],
-                data[off + 1],
-                data[off + 2],
-                data[off + 3],
-            ]));
-        }
-
-        let adjusted = adjusted - ptrs_per_block;
-
-        // Double-indirect (P28-T013)
-        if adjusted < ptrs_per_block * ptrs_per_block {
-            let dind_block = inode.block[EXT2_DIND_BLOCK];
-            if dind_block == 0 {
-                return Ok(0);
-            }
-            let dind_data = self.read_block(dind_block)?;
-            let ind_index = adjusted / ptrs_per_block;
-            let off = (ind_index as usize) * 4;
-            let ind_block = u32::from_le_bytes([
-                dind_data[off],
-                dind_data[off + 1],
-                dind_data[off + 2],
-                dind_data[off + 3],
-            ]);
-            if ind_block == 0 {
-                return Ok(0);
-            }
-            let ind_data = self.read_block(ind_block)?;
-            let block_index = adjusted % ptrs_per_block;
-            let off = (block_index as usize) * 4;
-            return Ok(u32::from_le_bytes([
-                ind_data[off],
-                ind_data[off + 1],
-                ind_data[off + 2],
-                ind_data[off + 3],
-            ]));
-        }
-
-        // Triple-indirect — deferred; files this large shouldn't exist on our 64MB filesystem.
-        Err(Ext2Error::CorruptedEntry)
+        kernel_core::fs::ext2::resolve_block(self, inode, logical_block)
     }
 
     // -----------------------------------------------------------------------
@@ -419,24 +389,12 @@ impl Ext2Volume {
         offset: u64,
         buf: &mut [u8],
     ) -> Result<usize, Ext2Error> {
-        // Bound each coalesced run to the block driver's max-sectors-per-request
-        // (256 sectors) so a long contiguous file never issues a single
-        // read_sectors the ring-3 driver would reject. `sectors_per_block` is
-        // 2/4/8 for 1K/2K/4K blocks → 128/64/32 blocks per run.
-        let max_run_blocks =
-            kernel_core::driver_ipc::block::MAX_SECTORS_PER_REQUEST / self.sectors_per_block;
-        kernel_core::fs::ext2::read_file_data_coalesced(
-            inode.size as u64,
-            self.block_size,
-            offset,
-            buf,
-            max_run_blocks,
-            |logical_block| self.resolve_block(inode, logical_block),
-            |start_block, count, dst| self.read_run_into_slice(start_block, count, dst),
-            |phys_block, offset_in_block, dst| {
-                self.read_block_into_slice(phys_block, offset_in_block, dst)
-            },
-        )
+        // Phase 88 Track C — delegates to the shared
+        // `kernel_core::fs::ext2::read_file_data`, which drives the Phase 87
+        // contiguous-run coalescer over this volume's `BlockReader`
+        // (`max_run_blocks` = device cap, `read_block_run` = the multi-block
+        // device read, `read_block_into` = the cache-aware partial read).
+        kernel_core::fs::ext2::read_file_data(self, inode, offset, buf)
     }
 
     // -----------------------------------------------------------------------
@@ -444,63 +402,25 @@ impl Ext2Volume {
     // -----------------------------------------------------------------------
 
     /// Read all directory entries from a directory inode (P28-T015).
+    /// Phase 88 Track C — delegates to the shared
+    /// `kernel_core::fs::ext2::read_directory_entries`.
     pub fn read_directory_entries(
         &self,
         inode: &Ext2Inode,
     ) -> Result<Vec<(String, u32, u8)>, Ext2Error> {
-        if !inode.is_dir() {
-            return Err(Ext2Error::NotDirectory);
-        }
-
-        let dir_size = inode.size as u64;
-        let bs = self.block_size as u64;
-        let num_blocks = dir_size.div_ceil(bs) as u32;
-        let mut result = Vec::new();
-
-        for logical_block in 0..num_blocks {
-            let phys_block = self.resolve_block(inode, logical_block)?;
-            if phys_block == 0 {
-                continue;
-            }
-            let block_data = self.read_block(phys_block)?;
-            let entries = Ext2DirEntry::parse_block(&block_data)?;
-            for entry in entries {
-                if entry.inode != 0 {
-                    result.push((entry.name, entry.inode, entry.file_type));
-                }
-            }
-        }
-
-        Ok(result)
+        kernel_core::fs::ext2::read_directory_entries(self, inode)
     }
 
-    /// Look up a name in a directory inode (P28-T016).
+    /// Look up a name in a directory inode (P28-T016). Phase 88 Track C —
+    /// delegates to the shared `kernel_core::fs::ext2::lookup_in_directory`.
     pub fn lookup_in_directory(&self, dir_inode: &Ext2Inode, name: &str) -> Result<u32, Ext2Error> {
-        let entries = self.read_directory_entries(dir_inode)?;
-        for (entry_name, inode_num, _) in entries {
-            if entry_name == name {
-                return Ok(inode_num);
-            }
-        }
-        Err(Ext2Error::NotFound)
+        kernel_core::fs::ext2::lookup_in_directory(self, dir_inode, name)
     }
 
-    /// Resolve an absolute path to an inode number (P28-T017).
+    /// Resolve an absolute path to an inode number (P28-T017). Phase 88 Track C —
+    /// delegates to the shared `kernel_core::fs::ext2::resolve_path`.
     pub fn resolve_path(&self, path: &str) -> Result<u32, Ext2Error> {
-        let mut current_ino = EXT2_ROOT_INO;
-
-        for component in path.split('/').filter(|s| !s.is_empty()) {
-            if component == "." {
-                continue;
-            }
-            let inode = self.read_inode(current_ino)?;
-            if !inode.is_dir() {
-                return Err(Ext2Error::NotDirectory);
-            }
-            current_ino = self.lookup_in_directory(&inode, component)?;
-        }
-
-        Ok(current_ino)
+        kernel_core::fs::ext2::resolve_path(self, path)
     }
 
     // -----------------------------------------------------------------------

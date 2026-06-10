@@ -10,9 +10,9 @@
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
 | A | Canonical `fill_stat()` serializer + migrate all stat syscalls onto it | — | ✅ Done |
-| B | Complete VFS stat fields (dev/blocks/times) + per-mount `st_dev` + identity-consistency tests | A | In progress |
-| C | Reconcile ext2: `BlockReader` trait in `kernel_core`, share resolve/read logic | — | Planned |
-| D | `VFS_OPEN` returns inode; drop the 85d kernel-side open-time resolve | C | Planned |
+| B | Complete VFS stat fields (dev/blocks/times) + per-mount `st_dev` + identity-consistency tests | A | ✅ Done |
+| C | Reconcile ext2: `BlockReader` trait in `kernel_core`, share resolve/read logic | — | In progress |
+| D | `VFS_OPEN` returns inode; drop the 85d kernel-side open-time resolve | C | ✅ Done (impl; clang-smoke at checkpoint) |
 | E | `statx` (implement onto `fill_stat`, or document the ENOSYS fallback) | A | Planned |
 | F | Conformance + cross-impl parity test suites; promote `M3OS_CLANG_STRESS` to a CI gate | A, B, C | Planned |
 | G | Atomic `pwrite64` — offset-parameterized backend writes (write-path correctness) | C | Planned |

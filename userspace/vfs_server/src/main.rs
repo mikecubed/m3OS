@@ -35,7 +35,7 @@ use core::cell::{Cell, RefCell};
 use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_core::fs::ext2::{
     EXT2_DIND_BLOCK, EXT2_FT_DIR, EXT2_FT_REG_FILE, EXT2_FT_SYMLINK, EXT2_IND_BLOCK,
-    EXT2_NDIR_BLOCKS, EXT2_ROOT_INO, Ext2BlockGroupDescriptor, Ext2DirEntry, Ext2Inode,
+    EXT2_NDIR_BLOCKS, EXT2_ROOT_INO, Ext2BlockGroupDescriptor, Ext2DirEntry, Ext2Error, Ext2Inode,
     Ext2Superblock, S_IFDIR, S_IFLNK, S_IFREG, inode_block_group, inode_index_in_group,
 };
 use kernel_core::fs::mbr;
@@ -179,6 +179,46 @@ const NEG_ETIMEDOUT: u64 = (-110_i64) as u64;
 /// costs one bitmap write instead of 16. The unused tail is freed at the
 /// request boundary, so an over-claim never leaks.
 const RESERVATION_RUN: u32 = 20;
+
+/// Phase 88 Track C — expose `Ext2State` as a `BlockReader` so the higher-level
+/// read logic (resolve_path / read_inode / read_file_data / resolve_block / dir
+/// parsing) is the SAME code the kernel runs (`kernel_core::fs::ext2`), not a
+/// second hand-maintained copy. The block source is this server's cache- and
+/// write-back-aware `read_block` (so reads observe pending pointer-block writes);
+/// runs use the Phase 87 multi-block `read_sectors` path.
+impl kernel_core::fs::ext2::BlockReader for Ext2State {
+    fn block_size(&self) -> u32 {
+        self.block_size
+    }
+    fn inodes_per_group(&self) -> u32 {
+        self.superblock.inodes_per_group
+    }
+    fn inode_size(&self) -> u32 {
+        self.superblock.inode_size as u32
+    }
+    fn inode_table_block(&self, group: u32) -> Result<u32, Ext2Error> {
+        self.bgd_table
+            .get(group as usize)
+            .map(|b| b.inode_table)
+            .ok_or(Ext2Error::CorruptedEntry)
+    }
+    fn read_block(&self, block_num: u32) -> Result<Vec<u8>, Ext2Error> {
+        Ext2State::read_block(self, block_num).map_err(|_| Ext2Error::IoError)
+    }
+    fn max_run_blocks(&self) -> u32 {
+        (128 / self.sectors_per_block).max(1)
+    }
+    fn read_block_run(
+        &self,
+        start_block: u32,
+        count: u32,
+        dst: &mut [u8],
+    ) -> Result<(), Ext2Error> {
+        let lba = self.block_to_lba(start_block);
+        self.read_sectors(lba, count as usize * self.sectors_per_block as usize, dst)
+            .map_err(|_| Ext2Error::IoError)
+    }
+}
 
 impl Ext2State {
     /// Read raw sectors from disk via the sys_block_read syscall.
@@ -504,133 +544,41 @@ impl Ext2State {
     }
 
     /// Read an inode by number.
+    /// Read an inode by number. Phase 88 Track C — delegates to the shared
+    /// `kernel_core::fs::ext2::read_inode` over this server's `BlockReader`.
     fn read_inode(&self, inode_num: u32) -> Result<Ext2Inode, ()> {
-        let bg = inode_block_group(inode_num, self.superblock.inodes_per_group);
-        let idx = inode_index_in_group(inode_num, self.superblock.inodes_per_group);
-        let bgd = self.bgd_table.get(bg as usize).ok_or(())?;
-
-        let inode_size = self.superblock.inode_size as u32;
-        let byte_offset = idx * inode_size;
-        let block_offset = byte_offset / self.block_size;
-        let offset_in_block = (byte_offset % self.block_size) as usize;
-
-        let inode_table_block = bgd.inode_table + block_offset;
-        let block_data = self.read_block(inode_table_block)?;
-
-        Ext2Inode::parse(&block_data[offset_in_block..]).map_err(|_| ())
+        kernel_core::fs::ext2::read_inode(self, inode_num).map_err(|_| ())
     }
 
-    /// Resolve a block pointer from an inode, handling indirect blocks.
+    /// Resolve a block pointer from an inode, handling indirect blocks. Phase 88
+    /// Track C — delegates to the shared `kernel_core::fs::ext2::resolve_block`.
     fn resolve_block(&self, inode: &Ext2Inode, file_block: u32) -> Result<u32, ()> {
-        let ptrs_per_block = self.block_size / 4;
-
-        if file_block < 12 {
-            return Ok(inode.block[file_block as usize]);
-        }
-
-        let file_block = file_block - 12;
-        if file_block < ptrs_per_block {
-            // Single indirect.
-            let indirect_block = inode.block[12];
-            if indirect_block == 0 {
-                return Ok(0);
-            }
-            let data = self.read_block(indirect_block)?;
-            let off = (file_block as usize) * 4;
-            return Ok(u32::from_le_bytes([
-                data[off],
-                data[off + 1],
-                data[off + 2],
-                data[off + 3],
-            ]));
-        }
-
-        let file_block = file_block - ptrs_per_block;
-        if file_block < ptrs_per_block * ptrs_per_block {
-            // Double indirect.
-            let dind_block = inode.block[13];
-            if dind_block == 0 {
-                return Ok(0);
-            }
-            let dind_data = self.read_block(dind_block)?;
-            let idx1 = (file_block / ptrs_per_block) as usize;
-            let off1 = idx1 * 4;
-            let ind_block = u32::from_le_bytes([
-                dind_data[off1],
-                dind_data[off1 + 1],
-                dind_data[off1 + 2],
-                dind_data[off1 + 3],
-            ]);
-            if ind_block == 0 {
-                return Ok(0);
-            }
-            let ind_data = self.read_block(ind_block)?;
-            let idx2 = (file_block % ptrs_per_block) as usize;
-            let off2 = idx2 * 4;
-            return Ok(u32::from_le_bytes([
-                ind_data[off2],
-                ind_data[off2 + 1],
-                ind_data[off2 + 2],
-                ind_data[off2 + 3],
-            ]));
-        }
-
-        // Triple indirect — not needed for /etc/ config files.
-        Err(())
+        kernel_core::fs::ext2::resolve_block(self, inode, file_block).map_err(|_| ())
     }
 
     /// Resolve a path like "/etc/passwd" to its inode number.
     ///
     /// `path` must start with "/" — relative paths are rejected with
-    /// `NEG_EINVAL`. Walks from root inode (2).
+    /// `NEG_EINVAL`. Phase 88 Track C — the walk itself is the shared
+    /// `kernel_core::fs::ext2::resolve_path`; this maps the leading-slash
+    /// contract and the `Ext2Error` → errno translation.
     fn resolve_path(&self, path: &str) -> Result<u32, u64> {
-        let path = path.strip_prefix('/').ok_or(NEG_EINVAL)?;
-        let mut current_inode_num: u32 = 2; // root inode
-
-        for component in path.split('/') {
-            if component.is_empty() || component == "." {
-                continue;
-            }
-            // Read current inode — must be a directory.
-            let inode = self.read_inode(current_inode_num).map_err(|_| NEG_EIO)?;
-            if !inode.is_dir() {
-                return Err(NEG_ENOTDIR);
-            }
-            // Scan directory entries.
-            let mut found = false;
-            let mut file_block = 0u32;
-            let blocks_count = inode.size.div_ceil(self.block_size);
-            while file_block < blocks_count {
-                let block_num = self
-                    .resolve_block(&inode, file_block)
-                    .map_err(|_| NEG_EIO)?;
-                if block_num == 0 {
-                    file_block += 1;
-                    continue;
-                }
-                let block_data = self.read_block(block_num).map_err(|_| NEG_EIO)?;
-                let entries = Ext2DirEntry::parse_block(&block_data).map_err(|_| NEG_EIO)?;
-                for entry in &entries {
-                    if entry.inode != 0 && entry.name == component {
-                        current_inode_num = entry.inode;
-                        found = true;
-                        break;
-                    }
-                }
-                if found {
-                    break;
-                }
-                file_block += 1;
-            }
-            if !found {
-                return Err(NEG_ENOENT);
-            }
+        if !path.starts_with('/') {
+            return Err(NEG_EINVAL);
         }
-
-        Ok(current_inode_num)
+        kernel_core::fs::ext2::resolve_path(self, path).map_err(|e| match e {
+            Ext2Error::NotFound => NEG_ENOENT,
+            Ext2Error::NotDirectory => NEG_ENOTDIR,
+            _ => NEG_EIO,
+        })
     }
 
-    /// Read file data from an inode at a given byte offset.
+    /// Read file data from an inode at a given byte offset. Phase 88 Track C —
+    /// the coalesced read itself is the shared `kernel_core::fs::ext2::read_file_data`
+    /// (driving the Phase 87 run-coalescer over this server's `BlockReader`:
+    /// `max_run_blocks`/`read_block_run` = the cache-bypassing multi-block
+    /// `read_sectors`, `read_block_into` = the cache-aware partial read); this
+    /// wrapper keeps the `(offset, max_bytes) -> Vec` shape the read handlers use.
     fn read_file_data(
         &self,
         inode: &Ext2Inode,
@@ -643,33 +591,10 @@ impl Ext2State {
         }
         let available = file_size - offset as u64;
         let to_read = (max_bytes as u64).min(available) as usize;
-
-        // Phase 87 — coalesce contiguous whole blocks into multi-block
-        // `block_read`s (shared with the kernel engine). The bulk run path
-        // bypasses the block cache (a multi-MiB sequential read would thrash it,
-        // and the cache is for hot metadata, not file payload); the unaligned
-        // head/tail keeps the cache-aware `read_block`. `sys_block_read` caps a
-        // request at 128 sectors, so a run spans at most 128/sectors_per_block
-        // blocks.
-        let max_run_blocks = (128 / self.sectors_per_block).max(1);
         let mut result = vec![0u8; to_read];
-        kernel_core::fs::ext2::read_file_data_coalesced::<()>(
-            file_size,
-            self.block_size,
-            offset as u64,
-            &mut result,
-            max_run_blocks,
-            |logical_block| self.resolve_block(inode, logical_block),
-            |start_block, count, dst| {
-                let lba = self.block_to_lba(start_block);
-                self.read_sectors(lba, count as usize * self.sectors_per_block as usize, dst)
-            },
-            |phys_block, offset_in_block, dst| {
-                let block = self.read_block(phys_block)?;
-                dst.copy_from_slice(&block[offset_in_block..offset_in_block + dst.len()]);
-                Ok(())
-            },
-        )?;
+        let n = kernel_core::fs::ext2::read_file_data(self, inode, offset as u64, &mut result)
+            .map_err(|_| ())?;
+        result.truncate(n);
         Ok(result)
     }
 
@@ -690,30 +615,18 @@ impl Ext2State {
         }
     }
 
+    /// List a directory's entries as `(inode, name, dirent_type)`. Phase 88
+    /// Track C — the block walk + parse is the shared
+    /// `kernel_core::fs::ext2::read_directory_entries`; this wrapper reads each
+    /// entry's inode to derive the `DT_*` dirent type (mode-based, more robust
+    /// than the on-disk file-type byte), preserving the prior behaviour.
     fn read_dir_entries(&self, inode: &Ext2Inode) -> Result<Vec<(u32, String, u8)>, u64> {
-        let mut entries = Vec::new();
-        let mut file_block = 0u32;
-        let blocks_count = inode.size.div_ceil(self.block_size);
-        while file_block < blocks_count {
-            let block_num = self.resolve_block(inode, file_block).map_err(|_| NEG_EIO)?;
-            if block_num == 0 {
-                file_block += 1;
-                continue;
-            }
-            let block_data = self.read_block(block_num).map_err(|_| NEG_EIO)?;
-            let block_entries = Ext2DirEntry::parse_block(&block_data).map_err(|_| NEG_EIO)?;
-            for entry in block_entries {
-                if entry.inode == 0 {
-                    continue;
-                }
-                let entry_inode = self.read_inode(entry.inode).map_err(|_| NEG_EIO)?;
-                entries.push((
-                    entry.inode,
-                    entry.name,
-                    inode_kind_to_dirent_type(&entry_inode),
-                ));
-            }
-            file_block += 1;
+        let raw =
+            kernel_core::fs::ext2::read_directory_entries(self, inode).map_err(|_| NEG_EIO)?;
+        let mut entries = Vec::with_capacity(raw.len());
+        for (name, ino, _ft) in raw {
+            let entry_inode = self.read_inode(ino).map_err(|_| NEG_EIO)?;
+            entries.push((ino, name, inode_kind_to_dirent_type(&entry_inode)));
         }
         Ok(entries)
     }
@@ -732,27 +645,13 @@ impl Ext2State {
     }
 
     /// Look up a name in a directory inode, returning the child inode number.
+    /// Phase 88 Track C — delegates to the shared
+    /// `kernel_core::fs::ext2::lookup_in_directory`.
     fn lookup_in_directory(&self, dir_inode: &Ext2Inode, name: &str) -> Result<u32, u64> {
-        let mut file_block = 0u32;
-        let blocks_count = dir_inode.size.div_ceil(self.block_size);
-        while file_block < blocks_count {
-            let block_num = self
-                .resolve_block(dir_inode, file_block)
-                .map_err(|_| NEG_EIO)?;
-            if block_num == 0 {
-                file_block += 1;
-                continue;
-            }
-            let block_data = self.read_block(block_num).map_err(|_| NEG_EIO)?;
-            let entries = Ext2DirEntry::parse_block(&block_data).map_err(|_| NEG_EIO)?;
-            for entry in &entries {
-                if entry.inode != 0 && entry.name == name {
-                    return Ok(entry.inode);
-                }
-            }
-            file_block += 1;
-        }
-        Err(NEG_ENOENT)
+        kernel_core::fs::ext2::lookup_in_directory(self, dir_inode, name).map_err(|e| match e {
+            Ext2Error::NotFound => NEG_ENOENT,
+            _ => NEG_EIO,
+        })
     }
 
     /// Allocate a free block, preferring `preferred_group`.
