@@ -111,3 +111,17 @@ pub fn write_sectors(start_sector: u64, count: usize, buf: &[u8]) -> Result<(), 
     }
     virtio_blk::write_sectors(start_sector, count, buf)
 }
+
+/// Commit any device write-back cache to media. Called at clean shutdown
+/// (`kernel_shutdown`) so buffered writes persist across a poweroff/restart.
+///
+/// Only the in-kernel virtio-blk device runs a write-back cache reachable from
+/// here (and it self-guards: a no-op unless `VIRTIO_BLK_F_FLUSH` was negotiated
+/// and the device is ready). The remote (NVMe/AHCI) ring-3 drivers manage their
+/// own write durability, so there is nothing to flush for them at this layer.
+#[allow(dead_code)]
+pub fn flush() {
+    if let Err(status) = virtio_blk::flush() {
+        log::warn!("[blk] virtio-blk flush failed (status {status}) — buffered writes may be lost");
+    }
+}

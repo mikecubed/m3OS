@@ -100,6 +100,21 @@ struct Ext2State {
     /// invalidates any overlapping block so the write authority never serves stale
     /// data (mirrors the kernel engine's `block_cache` + invalidate-on-write).
     block_cache: RefCell<BTreeMap<u32, Vec<u8>>>,
+    /// Phase 87 follow-up — write-back buffer for indirect/double-indirect
+    /// **pointer** blocks. Mapping each data block of a large file wires one
+    /// pointer into its indirect block; writing that whole 4 KiB block through to
+    /// disk per pointer rewrote the *same* indirect block up to 256 times (one
+    /// device write per data block — the dominant large-file write cost, ~2/3 of
+    /// all device writes for a 9 MiB file). Instead, `write_block_deferred`
+    /// accumulates the dirty pointer-block content here and `flush_dirty_blocks`
+    /// writes each ONCE (at the request/threshold/SIGTERM boundary), so a
+    /// contiguous file costs ~one indirect write per 256 blocks instead of 256.
+    /// `read_block` consults this first, so in-process reads see pending content;
+    /// vfs_server is the single ext2 authority, so no other reader can observe an
+    /// un-flushed block. Crash-consistency matches the deferred sb/BGD flush:
+    /// data blocks + bitmaps persist immediately, so a lost pointer block leaves
+    /// reclaimable orphaned blocks that `fsck` reconciles (no journaling).
+    dirty_blocks: RefCell<BTreeMap<u32, Vec<u8>>>,
     /// Phase 87 — metadata write-back. Count of alloc/free ops since the last
     /// superblock+BGD flush (see `mark_meta_dirty`). Deferring the summary flush
     /// off the per-allocation path removes ~2 device reads + 2 device writes per
@@ -126,6 +141,14 @@ const BLOCK_CACHE_MAX: usize = 4096;
 /// free-count drift to this many ops, which `fsck` reconciles from the
 /// already-persisted bitmaps.
 const META_FLUSH_THRESHOLD: u32 = 256;
+
+/// Phase 87 follow-up — flush the deferred indirect/pointer-block write-back
+/// buffer once it holds this many dirty blocks, bounding its memory (each entry
+/// is one `block_size` buffer). A single large file touches only ~one indirect
+/// block per 256 data blocks (≈11 for a 9 MiB file), so this is effectively
+/// per-file write-back; the cap only matters for a long burst spanning many
+/// files. Also flushed on SIGTERM (clean shutdown).
+const DIRTY_FLUSH_THRESHOLD: usize = 512;
 
 /// Phase 87 — how many contiguous blocks `claim_block_run` claims per bitmap
 /// read-modify-write. Sized to cover a 64 KiB write's 16 data blocks (plus a
@@ -154,6 +177,12 @@ impl Ext2State {
     /// `BLOCK_CACHE_MAX`). The cache holds clean disk content: `write_sectors`
     /// invalidates any overlapping block, so a hit never serves stale data.
     fn read_block(&self, block_num: u32) -> Result<Vec<u8>, ()> {
+        // Deferred (write-back) pointer blocks shadow the clean cache + disk: a
+        // read must see the pending content, else a follow-on pointer update
+        // would read-modify-write a stale image and drop earlier pointers.
+        if let Some(dirty) = self.dirty_blocks.borrow().get(&block_num) {
+            return Ok(dirty.clone());
+        }
         if let Some(cached) = self.block_cache.borrow().get(&block_num) {
             return Ok(cached.clone());
         }
@@ -245,6 +274,62 @@ impl Ext2State {
             // Defensive: a short/odd write can't refresh a full cached block, so
             // drop it rather than cache a malformed entry (no caller does this).
             cache.remove(&block_num);
+        }
+        Ok(())
+    }
+
+    /// Deferred (write-back) update of an indirect/pointer **metadata** block:
+    /// stash the new full-block content in `dirty_blocks` WITHOUT a device write.
+    /// The block is flushed later by `flush_dirty_blocks` (threshold / SIGTERM).
+    /// This is the write analog of the read cache for the case where the *same*
+    /// pointer block is rewritten once per data block — it collapses those N
+    /// rewrites into one. Use ONLY for blocks whose authoritative state this
+    /// server fully owns in memory (indirect/double-indirect pointer blocks);
+    /// bitmaps stay write-through so allocation survives a crash. `read_block`
+    /// consults `dirty_blocks` first, so the deferral is invisible to readers.
+    /// `data.len()` must equal `block_size`.
+    fn write_block_deferred(&self, block_num: u32, data: &[u8]) -> Result<(), ()> {
+        if data.len() != self.block_size as usize {
+            return Err(());
+        }
+        {
+            let mut dirty = self.dirty_blocks.borrow_mut();
+            dirty.insert(block_num, data.to_vec());
+            // A dirty entry shadows any clean cache copy; drop the cache copy so
+            // the two can't disagree (read_block checks dirty first anyway).
+            self.block_cache.borrow_mut().remove(&block_num);
+            if dirty.len() < DIRTY_FLUSH_THRESHOLD {
+                return Ok(());
+            }
+        }
+        self.flush_dirty_blocks()
+    }
+
+    /// Flush every deferred pointer block to disk in one device write each, then
+    /// hand the content to the read-through cache (it's now clean on disk).
+    /// No-op when nothing is dirty. Called at the threshold and on SIGTERM.
+    fn flush_dirty_blocks(&self) -> Result<(), ()> {
+        let pending: Vec<(u32, Vec<u8>)> = {
+            let mut dirty = self.dirty_blocks.borrow_mut();
+            if dirty.is_empty() {
+                return Ok(());
+            }
+            core::mem::take(&mut *dirty).into_iter().collect()
+        };
+        for (block_num, data) in pending {
+            let lba = self.block_to_lba(block_num);
+            let ret = syscall_lib::block_write(lba, self.sectors_per_block as usize, &data);
+            if ret < 0 {
+                // Could not persist — drop any cache copy so a later read
+                // re-reads the actual on-disk state, and surface the error.
+                self.block_cache.borrow_mut().remove(&block_num);
+                return Err(());
+            }
+            // Now clean on disk — refresh the read cache (bounded insert).
+            let mut cache = self.block_cache.borrow_mut();
+            if cache.contains_key(&block_num) || cache.len() < BLOCK_CACHE_MAX {
+                cache.insert(block_num, data);
+            }
         }
         Ok(())
     }
@@ -841,7 +926,7 @@ impl Ext2State {
             if inode.block[EXT2_IND_BLOCK] == 0 {
                 let ind = self.allocate_block(preferred_group)?;
                 let zero = vec![0u8; self.block_size as usize];
-                self.write_block(ind, &zero).map_err(|_| NEG_EIO)?;
+                self.write_block_deferred(ind, &zero).map_err(|_| NEG_EIO)?;
                 inode.block[EXT2_IND_BLOCK] = ind;
                 inode.blocks += self.block_size / 512;
             }
@@ -861,7 +946,7 @@ impl Ext2State {
                     self.write_block(new_block, &zero).map_err(|_| NEG_EIO)?;
                 }
                 ind_data[off..off + 4].copy_from_slice(&new_block.to_le_bytes());
-                self.write_block(ind_block, &ind_data)
+                self.write_block_deferred(ind_block, &ind_data)
                     .map_err(|_| NEG_EIO)?;
                 inode.blocks += self.block_size / 512;
                 return Ok(new_block);
@@ -875,7 +960,8 @@ impl Ext2State {
             if inode.block[EXT2_DIND_BLOCK] == 0 {
                 let dind = self.allocate_block(preferred_group)?;
                 let zero = vec![0u8; self.block_size as usize];
-                self.write_block(dind, &zero).map_err(|_| NEG_EIO)?;
+                self.write_block_deferred(dind, &zero)
+                    .map_err(|_| NEG_EIO)?;
                 inode.block[EXT2_DIND_BLOCK] = dind;
                 inode.blocks += self.block_size / 512;
             }
@@ -893,9 +979,10 @@ impl Ext2State {
             if ind_block == 0 {
                 ind_block = self.allocate_block(preferred_group)?;
                 let zero = vec![0u8; self.block_size as usize];
-                self.write_block(ind_block, &zero).map_err(|_| NEG_EIO)?;
+                self.write_block_deferred(ind_block, &zero)
+                    .map_err(|_| NEG_EIO)?;
                 dind_data[off..off + 4].copy_from_slice(&ind_block.to_le_bytes());
-                self.write_block(dind_block, &dind_data)
+                self.write_block_deferred(dind_block, &dind_data)
                     .map_err(|_| NEG_EIO)?;
                 inode.blocks += self.block_size / 512;
             }
@@ -916,7 +1003,7 @@ impl Ext2State {
                     self.write_block(new_block, &zero).map_err(|_| NEG_EIO)?;
                 }
                 ind_data[off..off + 4].copy_from_slice(&new_block.to_le_bytes());
-                self.write_block(ind_block, &ind_data)
+                self.write_block_deferred(ind_block, &ind_data)
                     .map_err(|_| NEG_EIO)?;
                 inode.blocks += self.block_size / 512;
                 return Ok(new_block);
@@ -1758,6 +1845,7 @@ fn program_main(_args: &[&str]) -> i32 {
         block_size,
         sectors_per_block,
         block_cache: RefCell::new(BTreeMap::new()),
+        dirty_blocks: RefCell::new(BTreeMap::new()),
         meta_dirty_ops: 0,
         block_reservation: None,
     };
@@ -1815,6 +1903,9 @@ extern "C" fn sigterm_handler(_sig: i32) {
 /// by up to `META_FLUSH_THRESHOLD` ops (fsck-reconcilable, but a clean stop
 /// should be clean).
 fn shutdown_flush_and_exit(ext2: &mut Ext2State) -> ! {
+    // Drain deferred pointer-block write-back first (the inode/indirect pointers
+    // that make on-disk file content reachable), then the sb/BGD summaries.
+    let _ = ext2.flush_dirty_blocks();
     let _ = ext2.flush_metadata_if_dirty();
     syscall_lib::serial_print("vfs_server: SIGTERM — flushed deferred metadata, exiting\n");
     syscall_lib::exit(0)

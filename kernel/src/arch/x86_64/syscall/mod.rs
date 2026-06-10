@@ -4174,6 +4174,11 @@ fn kernel_shutdown() {
         // Holding the lock ensures no concurrent writes while we hold it;
         // the block driver will flush on drop if applicable.
     }
+    // Commit the block device's write-back cache to media. virtio-blk now runs
+    // write-back (VIRTIO_BLK_F_FLUSH) so writes complete fast against the cache;
+    // this explicit FLUSH at the clean-shutdown boundary is what makes a normal
+    // poweroff/restart durable. No-op on a write-through device.
+    crate::blk::flush();
     log::info!("kernel_shutdown: filesystem sync complete.");
 }
 
