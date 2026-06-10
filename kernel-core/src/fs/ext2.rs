@@ -1591,4 +1591,725 @@ mod tests {
             runs.get()
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Phase 88 Track C.2 — cross-implementation ext2 parity host tests
+    //
+    // These tests exercise the six shared functions (`read_inode`, `resolve_block`,
+    // `read_file_data`, `read_directory_entries`, `lookup_in_directory`,
+    // `resolve_path`) over an entirely in-memory `MockExt2` that implements the
+    // `BlockReader` trait. A fix to any shared function is immediately visible to
+    // both the kernel `Ext2Volume` and the ring-3 `vfs_server` `Ext2State`.
+    // -----------------------------------------------------------------------
+
+    use alloc::collections::BTreeMap;
+
+    // Geometry constants for MockExt2 tests.
+    const MOCK_BS: u32 = 1024; // block size
+    const MOCK_INODE_SIZE: u32 = 128; // inode size
+    const MOCK_IPG: u32 = 1024; // inodes per group (all in group 0)
+    const MOCK_INODE_TABLE: u32 = 5; // first block of inode table for group 0
+    // ptrs per block: 1024 / 4 = 256
+    const MOCK_PTRS: u32 = MOCK_BS / 4;
+
+    /// In-memory ext2 block store implementing `BlockReader`.
+    ///
+    /// Geometry: 1 KiB blocks, 128-byte inodes, 1024 inodes per group, inode
+    /// table at block 5. Only group 0 is supported.
+    struct MockExt2 {
+        blocks: BTreeMap<u32, Vec<u8>>,
+    }
+
+    impl MockExt2 {
+        fn new() -> Self {
+            MockExt2 {
+                blocks: BTreeMap::new(),
+            }
+        }
+
+        /// Write `inode` (1-based) into the inode table.
+        ///
+        /// inode_size = 128, block_size = 1024 → 8 inodes per block.
+        /// Inode `n` lives at byte offset `(n-1) * 128` from the start of the
+        /// inode table.  Slot falls in block `MOCK_INODE_TABLE + byte_off/1024`,
+        /// at `byte_off % 1024` within that block.
+        fn put_inode(&mut self, num: u32, inode: &Ext2Inode) {
+            let byte_off = (num - 1) as usize * MOCK_INODE_SIZE as usize;
+            let blk = MOCK_INODE_TABLE + (byte_off / MOCK_BS as usize) as u32;
+            let off_in_blk = byte_off % MOCK_BS as usize;
+            let block = self
+                .blocks
+                .entry(blk)
+                .or_insert_with(|| alloc::vec![0u8; MOCK_BS as usize]);
+            inode.write_into(&mut block[off_in_blk..]);
+        }
+
+        /// Store a raw data block (zero-padded / truncated to `MOCK_BS`).
+        fn put_data_block(&mut self, phys: u32, data: &[u8]) {
+            let mut buf = alloc::vec![0u8; MOCK_BS as usize];
+            let n = data.len().min(MOCK_BS as usize);
+            buf[..n].copy_from_slice(&data[..n]);
+            self.blocks.insert(phys, buf);
+        }
+
+        /// Serialize a sequence of `(name, inode, file_type)` directory entries
+        /// into one ext2 dir block and store it at `phys`.
+        ///
+        /// Entry layout (mirrors `parse_directory_entries` byte layout):
+        ///   [inode u32 LE][rec_len u16 LE][name_len u8][file_type u8][name…]
+        /// Each entry is 4-byte aligned via `(8 + name_len + 3) & !3`.  The last
+        /// entry's `rec_len` is stretched to reach the end of the block.
+        fn put_dir_block(&mut self, phys: u32, entries: &[(&str, u32, u8)]) {
+            let mut buf = alloc::vec![0u8; MOCK_BS as usize];
+            let mut off = 0usize;
+            let n = entries.len();
+            for (i, &(name, ino, ft)) in entries.iter().enumerate() {
+                let name_bytes = name.as_bytes();
+                let name_len = name_bytes.len() as u8;
+                let natural = (8 + name_len as usize + 3) & !3;
+                let rec_len = if i == n - 1 {
+                    MOCK_BS as usize - off // last entry fills to block end
+                } else {
+                    natural
+                };
+                buf[off..off + 4].copy_from_slice(&ino.to_le_bytes());
+                buf[off + 4..off + 6].copy_from_slice(&(rec_len as u16).to_le_bytes());
+                buf[off + 6] = name_len;
+                buf[off + 7] = ft;
+                buf[off + 8..off + 8 + name_bytes.len()].copy_from_slice(name_bytes);
+                off += rec_len;
+            }
+            self.blocks.insert(phys, buf);
+        }
+
+        /// Write a block whose content is a sequence of `u32 LE` block pointers.
+        /// `ptrs[i] = 0` encodes a sparse hole.
+        fn put_ptr_block(&mut self, phys: u32, ptrs: &[u32]) {
+            let mut buf = alloc::vec![0u8; MOCK_BS as usize];
+            for (i, &p) in ptrs.iter().enumerate() {
+                buf[i * 4..i * 4 + 4].copy_from_slice(&p.to_le_bytes());
+            }
+            self.blocks.insert(phys, buf);
+        }
+    }
+
+    impl BlockReader for MockExt2 {
+        fn block_size(&self) -> u32 {
+            MOCK_BS
+        }
+        fn inodes_per_group(&self) -> u32 {
+            MOCK_IPG
+        }
+        fn inode_size(&self) -> u32 {
+            MOCK_INODE_SIZE
+        }
+        fn inode_table_block(&self, group: u32) -> Result<u32, Ext2Error> {
+            if group == 0 {
+                Ok(MOCK_INODE_TABLE)
+            } else {
+                Err(Ext2Error::CorruptedEntry)
+            }
+        }
+        fn read_block(&self, block_num: u32) -> Result<Vec<u8>, Ext2Error> {
+            self.blocks
+                .get(&block_num)
+                .cloned()
+                .ok_or(Ext2Error::IoError)
+        }
+        // Use the default `max_run_blocks` / `read_block_run` / `read_block_into`
+        // so this test also exercises those trait-default paths.
+    }
+
+    // -----------------------------------------------------------------------
+    // Fixture builder: small filesystem used by most tests.
+    //
+    //   /            inode #2  (dir)
+    //   /file.txt    inode #11 (regular, 2+ blocks of data)
+    //   /sub         inode #12 (dir)
+    //   /link        inode #13 (symlink)
+    //   /sub/deep.txt inode #16 (regular)
+    //
+    // Data-block numbers used (must not overlap inode table or ptr blocks):
+    //   root dir block 0: phys 50
+    //   file.txt block 0: phys 200, block 1: phys 201
+    //   sub dir block 0:  phys 60
+    //   deep.txt block 0: phys 210
+    //
+    // Inode table: block 5 (inodes 1-8), block 6 (inodes 9-16).
+    // -----------------------------------------------------------------------
+
+    fn build_basic_fs() -> MockExt2 {
+        let mut fs = MockExt2::new();
+
+        // ------- root inode (#2, dir) -------
+        let mut root = Ext2Inode::new_empty();
+        root.mode = S_IFDIR | 0o755;
+        root.links_count = 2;
+        root.size = MOCK_BS; // one dir block
+        root.block[0] = 50; // phys block 50
+        fs.put_inode(2, &root);
+
+        // root dir block: ., .., file.txt, sub, link
+        fs.put_dir_block(
+            50,
+            &[
+                (".", 2, EXT2_FT_DIR),
+                ("..", 2, EXT2_FT_DIR),
+                ("file.txt", 11, EXT2_FT_REG_FILE),
+                ("sub", 12, EXT2_FT_DIR),
+                ("link", 13, EXT2_FT_SYMLINK),
+            ],
+        );
+
+        // ------- file.txt inode (#11, regular, 2 full blocks) -------
+        let mut file_inode = Ext2Inode::new_empty();
+        file_inode.mode = S_IFREG | 0o644;
+        file_inode.links_count = 1;
+        file_inode.size = 2 * MOCK_BS; // exactly 2 blocks
+        file_inode.block[0] = 200;
+        file_inode.block[1] = 201;
+        fs.put_inode(11, &file_inode);
+
+        // file.txt data: block 200 = bytes 0x41..., block 201 = bytes 0x61...
+        let block0: Vec<u8> = (0..MOCK_BS as usize)
+            .map(|i| 0x41u8.wrapping_add(i as u8))
+            .collect();
+        let block1: Vec<u8> = (0..MOCK_BS as usize)
+            .map(|i| 0x61u8.wrapping_add(i as u8))
+            .collect();
+        fs.put_data_block(200, &block0);
+        fs.put_data_block(201, &block1);
+
+        // ------- sub inode (#12, dir) -------
+        let mut sub_inode = Ext2Inode::new_empty();
+        sub_inode.mode = S_IFDIR | 0o755;
+        sub_inode.links_count = 2;
+        sub_inode.size = MOCK_BS;
+        sub_inode.block[0] = 60;
+        fs.put_inode(12, &sub_inode);
+
+        // sub dir block: ., .., deep.txt
+        fs.put_dir_block(
+            60,
+            &[
+                (".", 12, EXT2_FT_DIR),
+                ("..", 2, EXT2_FT_DIR),
+                ("deep.txt", 16, EXT2_FT_REG_FILE),
+            ],
+        );
+
+        // ------- link inode (#13, symlink) -------
+        let mut link_inode = Ext2Inode::new_empty();
+        link_inode.mode = S_IFLNK | 0o777;
+        link_inode.links_count = 1;
+        link_inode.size = 8; // short inline symlink
+        fs.put_inode(13, &link_inode);
+
+        // ------- deep.txt inode (#16, regular, 1 block) -------
+        // Inode 16: index 15 (0-based) → byte offset 15*128 = 1920 → block 5 + 1920/1024 = block 6
+        let mut deep_inode = Ext2Inode::new_empty();
+        deep_inode.mode = S_IFREG | 0o644;
+        deep_inode.links_count = 1;
+        deep_inode.size = 42;
+        deep_inode.block[0] = 210;
+        fs.put_inode(16, &deep_inode);
+
+        let deep_data = b"deep content for deep.txt in sub dir!!!!";
+        fs.put_data_block(210, deep_data);
+
+        fs
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 1: path resolution and basic inode type checks
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn shared_resolve_path_walks_nested_dirs() {
+        let fs = build_basic_fs();
+
+        assert_eq!(
+            resolve_path(&fs, "/").unwrap(),
+            EXT2_ROOT_INO,
+            "root path resolves to inode 2"
+        );
+        assert_eq!(
+            resolve_path(&fs, "/file.txt").unwrap(),
+            11,
+            "/file.txt must resolve to inode 11"
+        );
+        assert_eq!(
+            resolve_path(&fs, "/sub").unwrap(),
+            12,
+            "/sub must resolve to inode 12"
+        );
+        assert_eq!(
+            resolve_path(&fs, "/sub/deep.txt").unwrap(),
+            16,
+            "/sub/deep.txt must resolve to inode 16"
+        );
+
+        // NotFound for a missing entry.
+        assert_eq!(
+            resolve_path(&fs, "/nope").unwrap_err(),
+            Ext2Error::NotFound,
+            "/nope must be NotFound"
+        );
+
+        // NotDirectory when traversing through a regular file.
+        assert_eq!(
+            resolve_path(&fs, "/file.txt/x").unwrap_err(),
+            Ext2Error::NotDirectory,
+            "/file.txt/x must be NotDirectory (file.txt is not a dir)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 2: inode type predicates
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn shared_read_inode_returns_correct_types() {
+        let fs = build_basic_fs();
+
+        let root = read_inode(&fs, 2).unwrap();
+        assert!(root.is_dir(), "inode 2 (root) must be a directory");
+        assert!(!root.is_regular(), "root must not be regular");
+
+        let file = read_inode(&fs, 11).unwrap();
+        assert!(file.is_regular(), "inode 11 (file.txt) must be regular");
+        assert!(!file.is_dir(), "file.txt must not be a dir");
+
+        let link = read_inode(&fs, 13).unwrap();
+        assert!(link.is_symlink(), "inode 13 (link) must be a symlink");
+        assert!(!link.is_dir(), "link must not be a dir");
+        assert!(!link.is_regular(), "link must not be regular");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 3: read_directory_entries returns all entries including . and ..
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn shared_read_directory_entries_returns_all_entries() {
+        let fs = build_basic_fs();
+        let root = read_inode(&fs, 2).unwrap();
+
+        let entries = read_directory_entries(&fs, &root).unwrap();
+        // Must have 5 entries: ., .., file.txt, sub, link
+        assert_eq!(entries.len(), 5, "root dir must have 5 entries");
+
+        // Check specific entries are present with correct metadata.
+        let dot = entries.iter().find(|(n, _, _)| n == ".").expect(". entry");
+        assert_eq!(dot.1, 2, ". must point to inode 2");
+        assert_eq!(dot.2, EXT2_FT_DIR, ". must have dir file_type");
+
+        let dotdot = entries
+            .iter()
+            .find(|(n, _, _)| n == "..")
+            .expect(".. entry");
+        assert_eq!(dotdot.1, 2, ".. must point to inode 2 at root");
+        assert_eq!(dotdot.2, EXT2_FT_DIR, ".. must have dir file_type");
+
+        let ftxt = entries
+            .iter()
+            .find(|(n, _, _)| n == "file.txt")
+            .expect("file.txt entry");
+        assert_eq!(ftxt.1, 11, "file.txt must be inode 11");
+        assert_eq!(
+            ftxt.2, EXT2_FT_REG_FILE,
+            "file.txt must be EXT2_FT_REG_FILE"
+        );
+
+        let sub = entries
+            .iter()
+            .find(|(n, _, _)| n == "sub")
+            .expect("sub entry");
+        assert_eq!(sub.1, 12, "sub must be inode 12");
+        assert_eq!(sub.2, EXT2_FT_DIR, "sub must be EXT2_FT_DIR");
+
+        let lnk = entries
+            .iter()
+            .find(|(n, _, _)| n == "link")
+            .expect("link entry");
+        assert_eq!(lnk.1, 13, "link must be inode 13");
+        assert_eq!(lnk.2, EXT2_FT_SYMLINK, "link must be EXT2_FT_SYMLINK");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 4: lookup_in_directory finds and misses correctly
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn shared_lookup_in_directory_finds_and_misses() {
+        let fs = build_basic_fs();
+        let root = read_inode(&fs, 2).unwrap();
+
+        assert_eq!(
+            lookup_in_directory(&fs, &root, "sub").unwrap(),
+            12,
+            "lookup 'sub' must return inode 12"
+        );
+        assert_eq!(
+            lookup_in_directory(&fs, &root, "file.txt").unwrap(),
+            11,
+            "lookup 'file.txt' must return inode 11"
+        );
+        assert_eq!(
+            lookup_in_directory(&fs, &root, "missing").unwrap_err(),
+            Ext2Error::NotFound,
+            "lookup of missing name must be NotFound"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 5: read_file_data with direct blocks — full read, offset read,
+    //         and past-EOF read
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn shared_read_file_data_direct_blocks() {
+        let fs = build_basic_fs();
+        let inode = read_inode(&fs, 11).unwrap();
+        let file_size = 2 * MOCK_BS as usize;
+
+        // Build the expected full content.
+        let expected: Vec<u8> = (0..MOCK_BS as usize)
+            .map(|i| 0x41u8.wrapping_add(i as u8))
+            .chain((0..MOCK_BS as usize).map(|i| 0x61u8.wrapping_add(i as u8)))
+            .collect();
+
+        // Full read.
+        let mut buf = alloc::vec![0u8; file_size];
+        let n = read_file_data(&fs, &inode, 0, &mut buf).unwrap();
+        assert_eq!(
+            n, file_size,
+            "full read must return exactly file_size bytes"
+        );
+        assert_eq!(&buf[..n], &expected[..], "full read must be byte-identical");
+
+        // Offset read: start mid-way through block 0.
+        let offset = 500usize;
+        let read_len = 600usize; // straddles the block boundary
+        let mut buf2 = alloc::vec![0u8; read_len];
+        let n2 = read_file_data(&fs, &inode, offset as u64, &mut buf2).unwrap();
+        assert_eq!(n2, read_len, "mid-file read must return read_len bytes");
+        assert_eq!(
+            &buf2[..n2],
+            &expected[offset..offset + read_len],
+            "mid-file read must match expected slice"
+        );
+
+        // Read past EOF returns 0.
+        let mut buf3 = alloc::vec![0u8; 64];
+        let n3 = read_file_data(&fs, &inode, file_size as u64 + 1, &mut buf3).unwrap();
+        assert_eq!(n3, 0, "read past EOF must return 0");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 6: sparse/hole file — block[k]==0 reads back as zeros
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn shared_read_file_data_sparse_hole_reads_as_zeros() {
+        let mut fs = MockExt2::new();
+
+        // File with 3 blocks: real(phys 300), hole(block[1]=0), real(phys 302).
+        let mut inode = Ext2Inode::new_empty();
+        inode.mode = S_IFREG | 0o644;
+        inode.links_count = 1;
+        inode.size = 3 * MOCK_BS;
+        inode.block[0] = 300;
+        inode.block[1] = 0; // sparse hole
+        inode.block[2] = 302;
+        fs.put_inode(11, &inode);
+
+        let data_a: Vec<u8> = (0..MOCK_BS as usize)
+            .map(|i| 0xAAu8.wrapping_add(i as u8))
+            .collect();
+        let data_c: Vec<u8> = (0..MOCK_BS as usize)
+            .map(|i| 0xCCu8.wrapping_add(i as u8))
+            .collect();
+        fs.put_data_block(300, &data_a);
+        fs.put_data_block(302, &data_c);
+
+        let inode = read_inode(&fs, 11).unwrap();
+        let mut buf = alloc::vec![0u8; 3 * MOCK_BS as usize];
+        let n = read_file_data(&fs, &inode, 0, &mut buf).unwrap();
+        assert_eq!(n, 3 * MOCK_BS as usize);
+
+        // Block 0 matches data_a.
+        assert_eq!(
+            &buf[..MOCK_BS as usize],
+            data_a.as_slice(),
+            "block 0 must match data_a"
+        );
+        // Block 1 is a hole — must be all zeros.
+        assert!(
+            buf[MOCK_BS as usize..2 * MOCK_BS as usize]
+                .iter()
+                .all(|&b| b == 0),
+            "sparse hole (block[1]=0) must read as zeros"
+        );
+        // Block 2 matches data_c.
+        assert_eq!(
+            &buf[2 * MOCK_BS as usize..],
+            data_c.as_slice(),
+            "block 2 must match data_c"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 7: resolve_block across direct→single and single→double boundaries,
+    //         and read_file_data byte-correctness across indirect boundaries
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn shared_read_file_data_spans_indirect_boundaries() {
+        let mut fs = MockExt2::new();
+        // ptrs per 1 KiB block = 256.
+        // single-indirect spans logical 12..12+256 = 12..268.
+        // double-indirect spans logical 268..268+256*256 = 268..65804.
+        //
+        // Build a file of 270 blocks (covers both boundaries):
+        //   logical 0..12  → direct (phys 1000+lb)
+        //   logical 12..268 → single-indirect, contiguous (phys 1000+lb)
+        //   logical 268..270 → double-indirect (phys 1000+lb)
+        // All blocks are in one contiguous physical run starting at phys 1000.
+        //
+        // Pointer block layout:
+        //   block[EXT2_IND_BLOCK]  = phys 900 (single-indirect ptr block)
+        //   block[EXT2_DIND_BLOCK] = phys 901 (double-indirect L0 block)
+        //   phys 902 = L1 block for the first double-indirect L1 pointer block
+
+        let file_blocks: u32 = 270;
+        let phys_base: u32 = 1000;
+        let sind_phys: u32 = 900;
+        let dind_phys: u32 = 901;
+        let dind_l1_phys: u32 = 902;
+
+        // Direct blocks: block[0..12] = phys 1000..1012.
+        let mut inode = Ext2Inode::new_empty();
+        inode.mode = S_IFREG | 0o644;
+        inode.links_count = 1;
+        inode.size = file_blocks * MOCK_BS;
+        for lb in 0..12u32 {
+            inode.block[lb as usize] = phys_base + lb;
+        }
+        inode.block[EXT2_IND_BLOCK] = sind_phys;
+        inode.block[EXT2_DIND_BLOCK] = dind_phys;
+        fs.put_inode(2, &inode); // use any free inode slot
+
+        // Single-indirect pointer block: logical 12..268 → phys 1012..1268.
+        let sind_ptrs: Vec<u32> = (0..MOCK_PTRS).map(|i| phys_base + 12 + i).collect();
+        fs.put_ptr_block(sind_phys, &sind_ptrs);
+
+        // Double-indirect L0: first entry points to L1 block at phys 902.
+        let mut dind_ptrs = alloc::vec![0u32; MOCK_PTRS as usize];
+        dind_ptrs[0] = dind_l1_phys;
+        fs.put_ptr_block(dind_phys, &dind_ptrs);
+
+        // Double-indirect L1: logical 268..270 → phys 1268..1270 (only 2 entries needed).
+        let mut dind_l1_ptrs = alloc::vec![0u32; MOCK_PTRS as usize];
+        for i in 0..2u32 {
+            dind_l1_ptrs[i as usize] = phys_base + 268 + i;
+        }
+        fs.put_ptr_block(dind_l1_phys, &dind_l1_ptrs);
+
+        // Populate all 270 data blocks with a recognizable pattern.
+        for lb in 0..file_blocks {
+            let phys = phys_base + lb;
+            let data: Vec<u8> = (0..MOCK_BS as usize)
+                .map(|i| (phys as usize).wrapping_add(i) as u8)
+                .collect();
+            fs.put_data_block(phys, &data);
+        }
+
+        // --- resolve_block at the direct→single boundary ---
+        let lb11 = resolve_block(&fs, &inode, 11).unwrap();
+        assert_eq!(
+            lb11,
+            phys_base + 11,
+            "logical 11 (last direct) must resolve to phys 1011"
+        );
+        let lb12 = resolve_block(&fs, &inode, 12).unwrap();
+        assert_eq!(
+            lb12,
+            phys_base + 12,
+            "logical 12 (first single-indirect) must resolve to phys 1012"
+        );
+
+        // --- resolve_block at the single→double boundary ---
+        let lb267 = resolve_block(&fs, &inode, 267).unwrap();
+        assert_eq!(
+            lb267,
+            phys_base + 267,
+            "logical 267 (last single-indirect) must resolve to phys 1267"
+        );
+        let lb268 = resolve_block(&fs, &inode, 268).unwrap();
+        assert_eq!(
+            lb268,
+            phys_base + 268,
+            "logical 268 (first double-indirect) must resolve to phys 1268"
+        );
+
+        // --- read_file_data byte-correctness across both boundaries ---
+        // Read 4 blocks straddling direct→single (lb 11..15).
+        let off_a = 11 * MOCK_BS as u64;
+        let len_a = 4 * MOCK_BS as usize;
+        let mut buf_a = alloc::vec![0u8; len_a];
+        let na = read_file_data(&fs, &inode, off_a, &mut buf_a).unwrap();
+        assert_eq!(
+            na, len_a,
+            "read across direct→single must return len_a bytes"
+        );
+        for lb in 11u32..15 {
+            let phys = phys_base + lb;
+            let blk_off = (lb - 11) as usize * MOCK_BS as usize;
+            let expected: Vec<u8> = (0..MOCK_BS as usize)
+                .map(|i| (phys as usize).wrapping_add(i) as u8)
+                .collect();
+            assert_eq!(
+                &buf_a[blk_off..blk_off + MOCK_BS as usize],
+                expected.as_slice(),
+                "block lb={lb} content mismatch across direct→single boundary"
+            );
+        }
+
+        // Read 4 blocks straddling single→double (lb 267..271 but file only has 270).
+        let off_b = 267 * MOCK_BS as u64;
+        let len_b = 3 * MOCK_BS as usize; // only 3 blocks left (267, 268, 269)
+        let mut buf_b = alloc::vec![0u8; len_b];
+        let nb = read_file_data(&fs, &inode, off_b, &mut buf_b).unwrap();
+        assert_eq!(
+            nb, len_b,
+            "read across single→double must return len_b bytes"
+        );
+        for lb in 267u32..270 {
+            let phys = phys_base + lb;
+            let blk_off = (lb - 267) as usize * MOCK_BS as usize;
+            let expected: Vec<u8> = (0..MOCK_BS as usize)
+                .map(|i| (phys as usize).wrapping_add(i) as u8)
+                .collect();
+            assert_eq!(
+                &buf_b[blk_off..blk_off + MOCK_BS as usize],
+                expected.as_slice(),
+                "block lb={lb} content mismatch across single→double boundary"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 8: triple-indirect is unsupported — resolve_block returns CorruptedEntry
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn shared_resolve_block_triple_indirect_unsupported() {
+        // ptrs_per_block = 256; double-indirect range = 256*256 = 65536 blocks.
+        // Triple-indirect begins at logical 12 + 256 + 256*256 = 65804.
+        let mut fs = MockExt2::new();
+        let mut inode = Ext2Inode::new_empty();
+        inode.mode = S_IFREG | 0o644;
+        inode.size = 0; // size doesn't matter for resolve_block
+        inode.block[EXT2_TIND_BLOCK] = 999; // triple-indirect pointer set
+        fs.put_inode(2, &inode);
+
+        let inode = read_inode(&fs, 2).unwrap();
+        // Any logical block beyond the double-indirect range (12 + 256 + 65536 = 65804)
+        // must return CorruptedEntry.
+        assert_eq!(
+            resolve_block(&fs, &inode, 65804).unwrap_err(),
+            Ext2Error::CorruptedEntry,
+            "logical block 65804 (start of triple-indirect range) must be CorruptedEntry"
+        );
+        assert_eq!(
+            resolve_block(&fs, &inode, 70000).unwrap_err(),
+            Ext2Error::CorruptedEntry,
+            "logical block 70000 (well into triple-indirect range) must be CorruptedEntry"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 9: large directory spanning multiple blocks — read_directory_entries
+    //         returns all entries; lookup finds one in the last block
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn shared_read_directory_entries_multi_block() {
+        let mut fs = MockExt2::new();
+
+        // How many entries fit in one 1 KiB block?
+        // Each entry uses (8 + name_len + 3) & !3 bytes.
+        // With a 3-char name: natural = (8+3+3)&!3 = 12 bytes → 1024/12 = 85 entries.
+        // We'll use 80 entries per block to be safe, spread across 4 blocks.
+        // Total: 320 entries, in 4 dir blocks (block[0..4]).
+        const ENTRIES_PER_BLOCK: usize = 80;
+        const NUM_BLOCKS: usize = 4;
+        const TOTAL: usize = ENTRIES_PER_BLOCK * NUM_BLOCKS;
+
+        // Assign data blocks for the dir: phys 70, 71, 72, 73.
+        let phys_base = 70u32;
+
+        let mut dir_inode = Ext2Inode::new_empty();
+        dir_inode.mode = S_IFDIR | 0o755;
+        dir_inode.links_count = 2;
+        dir_inode.size = (NUM_BLOCKS * MOCK_BS as usize) as u32;
+        for b in 0..NUM_BLOCKS {
+            dir_inode.block[b] = phys_base + b as u32;
+        }
+        fs.put_inode(2, &dir_inode);
+
+        // Build a 3-char name like "f00", "f01", ..., "f319".
+        // We'll use 4-char names "e000"..."e319" to keep them unique and same size.
+        let all_names: Vec<String> = (0..TOTAL).map(|i| alloc::format!("e{i:03}")).collect();
+        // Inode numbers: start at 100.
+        let all_inodes: Vec<u32> = (0..TOTAL as u32).map(|i| 100 + i).collect();
+
+        for blk in 0..NUM_BLOCKS {
+            let start = blk * ENTRIES_PER_BLOCK;
+            let end = start + ENTRIES_PER_BLOCK;
+            let entries: Vec<(&str, u32, u8)> = (start..end)
+                .map(|i| (all_names[i].as_str(), all_inodes[i], EXT2_FT_REG_FILE))
+                .collect();
+            fs.put_dir_block(phys_base + blk as u32, &entries);
+        }
+
+        let dir_inode = read_inode(&fs, 2).unwrap();
+
+        // read_directory_entries must return all TOTAL entries.
+        let entries = read_directory_entries(&fs, &dir_inode).unwrap();
+        assert_eq!(
+            entries.len(),
+            TOTAL,
+            "large dir must return all {TOTAL} entries"
+        );
+
+        // Verify the first entry (block 0) and the last entry (block 3).
+        assert_eq!(
+            entries[0],
+            (alloc::string::String::from("e000"), 100, EXT2_FT_REG_FILE),
+            "first entry must be e000 → inode 100"
+        );
+        let last_name = alloc::format!("e{:03}", TOTAL - 1);
+        let last_ino = 100 + TOTAL as u32 - 1;
+        assert_eq!(
+            entries[TOTAL - 1],
+            (last_name.clone(), last_ino, EXT2_FT_REG_FILE),
+            "last entry must be {last_name} → inode {last_ino}"
+        );
+
+        // lookup_in_directory must find an entry in the last block.
+        let found = lookup_in_directory(&fs, &dir_inode, &last_name).unwrap();
+        assert_eq!(
+            found, last_ino,
+            "lookup of last-block entry must return {last_ino}"
+        );
+
+        // lookup_in_directory must return NotFound for a non-existent name.
+        assert_eq!(
+            lookup_in_directory(&fs, &dir_inode, "ghost").unwrap_err(),
+            Ext2Error::NotFound,
+            "lookup of non-existent 'ghost' in large dir must be NotFound"
+        );
+    }
 }
