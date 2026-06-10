@@ -12604,9 +12604,12 @@ const BLOCK_WRITE_ALLOWED: &[&str] = &["/bin/vfs_server", "/bin/fat_server"];
 /// crash / power-loss data-loss window. Gated identically to `sys_block_write`
 /// (euid == `STORAGE_SERVICE_UID` and exec path in `BLOCK_WRITE_ALLOWED`).
 ///
-/// Returns 0 on success or `NEG_EPERM` if the caller is not an authorized
-/// storage service. The flush itself is best-effort: `blk::flush` logs a
-/// warning on driver error rather than failing, mirroring the shutdown flush.
+/// Returns 0 when the caller is authorized — regardless of whether the device
+/// flush actually succeeded — or `NEG_EPERM` if the caller is not an authorized
+/// storage service. The flush is best-effort: `blk::flush` logs a warning on
+/// driver error and its result is intentionally NOT surfaced through this
+/// return value, mirroring the shutdown flush. Callers must not treat a 0
+/// return as proof the write-back cache reached media.
 fn sys_block_flush() -> u64 {
     {
         let pid = crate::process::current_pid();

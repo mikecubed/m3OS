@@ -322,23 +322,41 @@ impl Ext2State {
     /// hand the content to the read-through cache (it's now clean on disk).
     /// No-op when nothing is dirty. Called at the threshold and on SIGTERM.
     fn flush_dirty_blocks(&self) -> Result<(), ()> {
-        let pending: Vec<(u32, Vec<u8>)> = {
-            let mut dirty = self.dirty_blocks.borrow_mut();
+        // Snapshot the dirty block numbers, then flush one at a time, removing
+        // each from `dirty_blocks` ONLY after its device write succeeds. If a
+        // write fails, the un-flushed entries (the failed block and every block
+        // not yet reached) stay in `dirty_blocks` — they are this server's
+        // authoritative in-memory copy of the indirect/pointer blocks, so
+        // dropping them on a transient I/O error would silently lose / corrupt
+        // that metadata. Keeping them lets a later flush (threshold / SIGTERM)
+        // retry, and `read_block` still consults `dirty_blocks` first so reads
+        // observe the pending values meanwhile.
+        let block_nums: Vec<u32> = {
+            let dirty = self.dirty_blocks.borrow();
             if dirty.is_empty() {
                 return Ok(());
             }
-            core::mem::take(&mut *dirty).into_iter().collect()
+            dirty.keys().copied().collect()
         };
-        for (block_num, data) in pending {
+        for block_num in block_nums {
+            // Clone the pending content out under a short borrow so the device
+            // write does not hold the `dirty_blocks` borrow.
+            let data = match self.dirty_blocks.borrow().get(&block_num) {
+                Some(d) => d.clone(),
+                None => continue,
+            };
             let lba = self.block_to_lba(block_num);
             let ret = syscall_lib::block_write(lba, self.sectors_per_block as usize, &data);
             if ret < 0 {
-                // Could not persist — drop any cache copy so a later read
-                // re-reads the actual on-disk state, and surface the error.
+                // Could not persist — drop any clean cache copy so a later read
+                // re-reads the actual on-disk state, leave the block in
+                // `dirty_blocks` for a later retry, and surface the error.
                 self.block_cache.borrow_mut().remove(&block_num);
                 return Err(());
             }
-            // Now clean on disk — refresh the read cache (bounded insert).
+            // Persisted — now clean on disk: drop it from the dirty set and
+            // refresh the read cache (bounded insert).
+            self.dirty_blocks.borrow_mut().remove(&block_num);
             let mut cache = self.block_cache.borrow_mut();
             if cache.contains_key(&block_num) || cache.len() < BLOCK_CACHE_MAX {
                 cache.insert(block_num, data);

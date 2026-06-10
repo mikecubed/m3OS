@@ -160,6 +160,21 @@ pub trait IpcBackend {
     /// if the underlying syscall reports an error.
     fn recv(&mut self, endpoint: EndpointCap) -> Result<RecvResult, crate::DriverRuntimeError>;
 
+    /// Block on the endpoint like [`Self::recv`], but receive into a bulk buffer
+    /// of `capacity` bytes instead of the backend's default. Backends that do
+    /// not size their recv buffer (test mocks, simple transports) may ignore
+    /// `capacity`; the default delegates to [`Self::recv`]. The production
+    /// [`SyscallBackend`] honours it — the block server uses this so an oversized
+    /// `BLK_WRITE` payload (a 4 KiB+ ext2 block) is not truncated at the driver.
+    fn recv_with_capacity(
+        &mut self,
+        endpoint: EndpointCap,
+        capacity: usize,
+    ) -> Result<RecvResult, crate::DriverRuntimeError> {
+        let _ = capacity;
+        self.recv(endpoint)
+    }
+
     /// Non-blocking poll of the endpoint. Returns `Ok(Some(..))` when a message
     /// or bound notification was pending, `Ok(None)` when nothing is pending.
     ///
@@ -306,8 +321,9 @@ impl SyscallBackend {
     ///
     /// Phase 63 driver-host fix: introduced for `audio_server` because
     /// audio is the first driver class whose IPC payload exceeds the
-    /// net frame size. Block / net drivers continue to use [`recv`] and
-    /// pay only the 1522-byte heap allocation per loop iteration.
+    /// net frame size. Phase 87: the block server also recvs through this
+    /// (sized for a full `BLK_WRITE`); net drivers continue to use [`recv`]
+    /// and pay only the 1522-byte heap allocation per loop iteration.
     pub fn recv_with_capacity(
         &mut self,
         endpoint: EndpointCap,
@@ -336,6 +352,19 @@ impl SyscallBackend {
 impl IpcBackend for SyscallBackend {
     fn recv(&mut self, endpoint: EndpointCap) -> Result<RecvResult, crate::DriverRuntimeError> {
         self.recv_with_capacity(endpoint, Self::MAX_BULK_RECV)
+    }
+
+    fn recv_with_capacity(
+        &mut self,
+        endpoint: EndpointCap,
+        capacity: usize,
+    ) -> Result<RecvResult, crate::DriverRuntimeError> {
+        // Honour the requested capacity by dispatching to the inherent
+        // implementation. UFCS (`SyscallBackend::...`) resolves to the inherent
+        // method, not this trait method, so there is no recursion — and a
+        // generic `B: IpcBackend` caller (the block server) gets the real
+        // capacity-aware recv instead of the trait default.
+        SyscallBackend::recv_with_capacity(self, endpoint, capacity)
     }
 
     fn try_recv(
