@@ -9808,6 +9808,97 @@ fn data_is_mounted() -> bool {
     crate::fs::ext2::is_mounted() || crate::fs::fat32::is_mounted()
 }
 
+/// Phase 88 Track A — normalized file metadata for the `stat` family.
+///
+/// Every stat-producing syscall (`fstat`, `stat`/`lstat`/`newfstatat` →
+/// `fstatat`, and `statx`) builds one of these per backend and serializes it
+/// through the single [`fill_stat`] routine. No syscall hand-assembles a
+/// `struct stat` byte-by-byte anymore: that pattern is what let the historical
+/// `st_ino = 0` for `VfsService` `fstat` (and the still-zero `st_dev` /
+/// `st_blocks` / timestamps) ship unnoticed and break clang's
+/// `(st_dev, st_ino)` file-identity dedup. A forgotten field is now
+/// structurally impossible — a missing field is a `FileMeta::new()` default,
+/// not a silently-skipped offset write. A `cargo xtask check` grep gate
+/// (`stat[<n>..` writes) enforces that no new offset assembly creeps back in.
+#[derive(Clone, Copy)]
+pub(super) struct FileMeta {
+    pub dev: u64,
+    pub ino: u64,
+    pub nlink: u64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub rdev: u64,
+    pub size: u64,
+    pub blksize: u64,
+    pub blocks: u64,
+    pub atime: i64,
+    pub mtime: i64,
+    pub ctime: i64,
+}
+
+impl FileMeta {
+    /// A zeroed `FileMeta` with a sane default `st_blksize` of 4096 — the value
+    /// every stat path used for non-ext2 backends. ext2 backends override it
+    /// with the real on-disk block size.
+    pub(super) const fn new() -> Self {
+        FileMeta {
+            dev: 0,
+            ino: 0,
+            nlink: 0,
+            mode: 0,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            size: 0,
+            blksize: 4096,
+            blocks: 0,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
+        }
+    }
+}
+
+/// Serialize a [`FileMeta`] into a 144-byte x86_64 Linux `struct stat`.
+///
+/// This is the ONLY place `struct stat` offsets are written. Layout:
+/// ```text
+///  0: st_dev (u64)       8: st_ino (u64)     16: st_nlink (u64)
+/// 24: st_mode (u32)     28: st_uid (u32)     32: st_gid (u32)
+/// 36: __pad0 (u32)      40: st_rdev (u64)    48: st_size (i64)
+/// 56: st_blksize (i64)  64: st_blocks (i64)
+/// 72: st_atim {tv_sec, tv_nsec}   88: st_mtim   104: st_ctim
+/// ```
+pub(super) fn fill_stat(m: &FileMeta) -> [u8; 144] {
+    let mut s = [0u8; 144];
+    s[0..8].copy_from_slice(&m.dev.to_ne_bytes());
+    s[8..16].copy_from_slice(&m.ino.to_ne_bytes());
+    s[16..24].copy_from_slice(&m.nlink.to_ne_bytes());
+    s[24..28].copy_from_slice(&m.mode.to_ne_bytes());
+    s[28..32].copy_from_slice(&m.uid.to_ne_bytes());
+    s[32..36].copy_from_slice(&m.gid.to_ne_bytes());
+    // 36..40 __pad0 stays zero.
+    s[40..48].copy_from_slice(&m.rdev.to_ne_bytes());
+    s[48..56].copy_from_slice(&m.size.to_ne_bytes());
+    s[56..64].copy_from_slice(&m.blksize.to_ne_bytes());
+    s[64..72].copy_from_slice(&m.blocks.to_ne_bytes());
+    // tv_sec only (1 s granularity); the tv_nsec halves at 80/96/112 stay zero.
+    s[72..80].copy_from_slice(&m.atime.to_ne_bytes());
+    s[88..96].copy_from_slice(&m.mtime.to_ne_bytes());
+    s[104..112].copy_from_slice(&m.ctime.to_ne_bytes());
+    s
+}
+
+/// Serialize `meta` and copy it to the user `struct stat` at `stat_ptr`.
+fn write_stat_to_user(stat_ptr: u64, meta: &FileMeta) -> u64 {
+    let bytes = fill_stat(meta);
+    match UserSliceWo::new(stat_ptr, bytes.len()).and_then(|s| s.copy_from_kernel(&bytes)) {
+        Ok(()) => 0,
+        Err(_) => NEG_EFAULT,
+    }
+}
+
 pub(super) fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
     let fd_idx = fd as usize;
     if fd_idx >= MAX_FDS {
@@ -9817,75 +9908,106 @@ pub(super) fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
         Some(e) => e,
         None => return NEG_EBADF,
     };
-    // x86_64 stat struct layout (144 bytes):
-    //  0: st_dev (u64)      8: st_ino (u64)    16: st_nlink (u64)
-    // 24: st_mode (u32)    28: st_uid (u32)    32: st_gid (u32)
-    // 36: __pad0 (u32)     40: st_rdev (u64)   48: st_size (i64)
-    // 56: st_blksize (i64) 64: st_blocks (i64)
-    let mut stat = [0u8; 144];
-    let blksize: u64 = 4096;
 
-    // Determine mode, uid, gid, size, rdev based on backend type.
-    let (mode, uid, gid, size, rdev): (u32, u32, u32, u64, u64) = match &entry.backend {
+    // Build a normalized FileMeta per backend (preserving each backend's prior
+    // field values), then serialize once via `fill_stat`.
+    let meta: FileMeta = match &entry.backend {
         FdBackend::Dir { path } => {
             if let Some(st) = crate::fs::procfs::stat(path) {
-                stat[8..16].copy_from_slice(&st.ino.to_ne_bytes());
-                stat[16..24].copy_from_slice(&st.nlink.to_ne_bytes());
-                (st.mode, st.uid, st.gid, st.size, 0)
+                let mut m = FileMeta::new();
+                m.ino = st.ino;
+                m.nlink = st.nlink;
+                m.mode = st.mode;
+                m.uid = st.uid;
+                m.gid = st.gid;
+                m.size = st.size;
+                m
             } else if let Some(rel) = tmpfs_relative_path(path) {
                 let tmpfs = crate::fs::tmpfs::TMPFS.lock();
                 match tmpfs.stat(rel) {
                     Ok(st) => {
-                        stat[8..16].copy_from_slice(&st.ino.to_ne_bytes());
-                        stat[16..24].copy_from_slice(&st.nlink.to_ne_bytes());
-                        (0x4000 | st.mode as u32, st.uid, st.gid, st.size as u64, 0)
+                        let mut m = FileMeta::new();
+                        m.ino = st.ino;
+                        m.nlink = st.nlink;
+                        m.mode = 0x4000 | st.mode as u32;
+                        m.uid = st.uid;
+                        m.gid = st.gid;
+                        m.size = st.size as u64;
+                        m
                     }
                     Err(_) => return NEG_ENOENT,
                 }
             } else {
-                let (u, g, m) = dir_metadata(path);
-                (0x4000 | m as u32, u, g, 0, 0)
+                let (u, g, mode) = dir_metadata(path);
+                let mut m = FileMeta::new();
+                m.mode = 0x4000 | mode as u32;
+                m.uid = u;
+                m.gid = g;
+                m
             }
         }
         FdBackend::DevNull | FdBackend::DevZero | FdBackend::DevUrandom | FdBackend::DevFull => {
-            (0x2000 | 0o666, 0, 0, 0, 0)
+            let mut m = FileMeta::new();
+            m.mode = 0x2000 | 0o666;
+            m
         }
         FdBackend::Proc { path } => {
             let Some(st) = crate::fs::procfs::stat(path) else {
                 return NEG_ENOENT;
             };
-            stat[8..16].copy_from_slice(&st.ino.to_ne_bytes());
-            stat[16..24].copy_from_slice(&st.nlink.to_ne_bytes());
-            (st.mode, st.uid, st.gid, st.size, 0)
+            let mut m = FileMeta::new();
+            m.ino = st.ino;
+            m.nlink = st.nlink;
+            m.mode = st.mode;
+            m.uid = st.uid;
+            m.gid = st.gid;
+            m.size = st.size;
+            m
         }
         FdBackend::DeviceTTY { tty_id } => {
-            (0x2000 | 0o620, 0, 0, 0, ((5u64) << 8) | (*tty_id as u64))
+            let mut m = FileMeta::new();
+            m.mode = 0x2000 | 0o620;
+            m.rdev = ((5u64) << 8) | (*tty_id as u64);
+            m
         }
-        FdBackend::PtyMaster { pty_id } => (
-            0x2000 | 0o620,
-            0,
-            0,
-            0,
-            ((5u64) << 8) | (2 + *pty_id as u64),
-        ),
+        FdBackend::PtyMaster { pty_id } => {
+            let mut m = FileMeta::new();
+            m.mode = 0x2000 | 0o620;
+            m.rdev = ((5u64) << 8) | (2 + *pty_id as u64);
+            m
+        }
         FdBackend::PtySlave { pty_id } => {
-            (0x2000 | 0o620, 0, 0, 0, ((136u64) << 8) | (*pty_id as u64))
+            let mut m = FileMeta::new();
+            m.mode = 0x2000 | 0o620;
+            m.rdev = ((136u64) << 8) | (*pty_id as u64);
+            m
         }
-        FdBackend::Socket { .. } | FdBackend::UnixSocket { .. } => (0xC000 | 0o755, 0, 0, 0, 0),
-        FdBackend::Stdout | FdBackend::Stdin => (0x2000 | 0o620, 0, 0, 0, 0),
+        FdBackend::Socket { .. } | FdBackend::UnixSocket { .. } => {
+            let mut m = FileMeta::new();
+            m.mode = 0xC000 | 0o755;
+            m
+        }
+        FdBackend::Stdout | FdBackend::Stdin => {
+            let mut m = FileMeta::new();
+            m.mode = 0x2000 | 0o620;
+            m
+        }
         FdBackend::PipeRead { .. } | FdBackend::PipeWrite { .. } | FdBackend::EventFd { .. } => {
-            (0x1000 | 0o600, 0, 0, 0, 0)
+            let mut m = FileMeta::new();
+            m.mode = 0x1000 | 0o600;
+            m
         }
         FdBackend::Ramdisk { content_len, .. } => {
-            // Ramdisk files: root-owned, mode 0o755 (all files, including non-executables)
-            (0x8000 | 0o755, 0, 0, *content_len as u64, 0)
+            // Ramdisk files: root-owned, mode 0o755 (all files, including non-executables).
+            let mut m = FileMeta::new();
+            m.mode = 0x8000 | 0o755;
+            m.size = *content_len as u64;
+            m
         }
         FdBackend::Tmpfs { path } => {
             let tmpfs = crate::fs::tmpfs::TMPFS.lock();
             match tmpfs.stat(path) {
                 Ok(s) => {
-                    stat[8..16].copy_from_slice(&s.ino.to_ne_bytes());
-                    stat[16..24].copy_from_slice(&s.nlink.to_ne_bytes());
                     let mode = if s.is_symlink {
                         0xA000 | 0o777
                     } else if s.is_dir {
@@ -9893,7 +10015,14 @@ pub(super) fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
                     } else {
                         0x8000 | s.mode as u32
                     };
-                    (mode, s.uid, s.gid, s.size as u64, 0)
+                    let mut m = FileMeta::new();
+                    m.ino = s.ino;
+                    m.nlink = s.nlink;
+                    m.mode = mode;
+                    m.uid = s.uid;
+                    m.gid = s.gid;
+                    m.size = s.size as u64;
+                    m
                 }
                 Err(_) => return NEG_ENOENT,
             }
@@ -9901,8 +10030,13 @@ pub(super) fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
         FdBackend::Fat32Disk {
             path, file_size, ..
         } => {
-            let (u, g, m) = data_file_metadata(path).unwrap_or((0, 0, 0o755));
-            (0x8000 | m as u32, u, g, *file_size as u64, 0)
+            let (u, g, mode) = data_file_metadata(path).unwrap_or((0, 0, 0o755));
+            let mut m = FileMeta::new();
+            m.mode = 0x8000 | mode as u32;
+            m.uid = u;
+            m.gid = g;
+            m.size = *file_size as u64;
+            m
         }
         FdBackend::Ext2Disk {
             inode_num,
@@ -9915,65 +10049,46 @@ pub(super) fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
             if let Some(vol) = vol.as_ref()
                 && let Ok(inode) = vol.read_inode(inode_num)
             {
-                let mode = inode.mode as u32;
-                let uid = inode.uid as u32;
-                let gid = inode.gid as u32;
-                let size = inode.size as u64; // use inode size, not cached FD size
-                let nlink = inode.links_count as u64;
-                let blk = vol.block_size as u64;
-                let ino = inode_num as u64;
-                stat[8..16].copy_from_slice(&ino.to_ne_bytes());
-                stat[16..24].copy_from_slice(&nlink.to_ne_bytes());
-                stat[24..28].copy_from_slice(&mode.to_ne_bytes());
-                stat[28..32].copy_from_slice(&uid.to_ne_bytes());
-                stat[32..36].copy_from_slice(&gid.to_ne_bytes());
-                stat[48..56].copy_from_slice(&size.to_ne_bytes());
-                stat[56..64].copy_from_slice(&blk.to_ne_bytes());
-                let atime = inode.atime as i64;
-                let mtime = inode.mtime as i64;
-                let ctime = inode.ctime as i64;
-                stat[72..80].copy_from_slice(&atime.to_ne_bytes());
-                stat[88..96].copy_from_slice(&mtime.to_ne_bytes());
-                stat[104..112].copy_from_slice(&ctime.to_ne_bytes());
-                if UserSliceWo::new(stat_ptr, stat.len())
-                    .and_then(|s| s.copy_from_kernel(&stat))
-                    .is_err()
-                {
-                    return NEG_EFAULT;
-                }
-                return 0;
+                let mut m = FileMeta::new();
+                m.ino = inode_num as u64;
+                m.nlink = inode.links_count as u64;
+                m.mode = inode.mode as u32;
+                m.uid = inode.uid as u32;
+                m.gid = inode.gid as u32;
+                m.size = inode.size as u64; // use inode size, not cached FD size
+                m.blksize = vol.block_size as u64;
+                m.atime = inode.atime as i64;
+                m.mtime = inode.mtime as i64;
+                m.ctime = inode.ctime as i64;
+                m
+            } else {
+                // Fallback if inode read fails — use cached FD size.
+                let mut m = FileMeta::new();
+                m.mode = 0x8000 | 0o755;
+                m.size = *file_size as u64;
+                m
             }
-            // Fallback if inode read fails — use cached FD size
-            let fallback_size = *file_size as u64;
-            let (u, g, m) = (0u32, 0u32, 0o755u16);
-            (0x8000 | m as u32, u, g, fallback_size, 0)
         }
-        FdBackend::Epoll { .. } => (0x2000 | 0o600, 0, 0, 0, 0),
+        FdBackend::Epoll { .. } => {
+            let mut m = FileMeta::new();
+            m.mode = 0x2000 | 0o600;
+            m
+        }
         FdBackend::VfsService {
             file_size, inode, ..
         } => {
             // Report the real ext2 inode as st_ino so clang's FileManager (which
             // dedups by (st_dev, st_ino)) does not collapse distinct VFS files
             // onto one entry. Must match fstatat for the same path.
-            stat[8..16].copy_from_slice(&(*inode as u64).to_ne_bytes());
-            (0x8000 | 0o444, 0, 0, *file_size as u64, 0)
+            let mut m = FileMeta::new();
+            m.ino = *inode as u64;
+            m.mode = 0x8000 | 0o444;
+            m.size = *file_size as u64;
+            m
         }
     };
 
-    stat[24..28].copy_from_slice(&mode.to_ne_bytes());
-    stat[28..32].copy_from_slice(&uid.to_ne_bytes());
-    stat[32..36].copy_from_slice(&gid.to_ne_bytes());
-    stat[40..48].copy_from_slice(&rdev.to_ne_bytes());
-    stat[48..56].copy_from_slice(&size.to_ne_bytes());
-    stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
-
-    if UserSliceWo::new(stat_ptr, stat.len())
-        .and_then(|s| s.copy_from_kernel(&stat))
-        .is_err()
-    {
-        return NEG_EFAULT;
-    }
-    0
+    write_stat_to_user(stat_ptr, &meta)
 }
 
 pub(super) fn sys_statfs(path_ptr: u64, buf_ptr: u64) -> u64 {
@@ -13417,22 +13532,14 @@ pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags:
     let name: &str = &resolved;
 
     if let Some(st) = crate::fs::procfs::stat(name) {
-        let mut stat = [0u8; 144];
-        stat[8..16].copy_from_slice(&st.ino.to_ne_bytes());
-        stat[16..24].copy_from_slice(&st.nlink.to_ne_bytes());
-        stat[24..28].copy_from_slice(&st.mode.to_ne_bytes());
-        stat[28..32].copy_from_slice(&st.uid.to_ne_bytes());
-        stat[32..36].copy_from_slice(&st.gid.to_ne_bytes());
-        stat[48..56].copy_from_slice(&st.size.to_ne_bytes());
-        let blksize: u64 = 4096;
-        stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
-        if UserSliceWo::new(stat_ptr, stat.len())
-            .and_then(|s| s.copy_from_kernel(&stat))
-            .is_err()
-        {
-            return NEG_EFAULT;
-        }
-        return 0;
+        let mut m = FileMeta::new();
+        m.ino = st.ino;
+        m.nlink = st.nlink;
+        m.mode = st.mode;
+        m.uid = st.uid;
+        m.gid = st.gid;
+        m.size = st.size;
+        return write_stat_to_user(stat_ptr, &m);
     }
 
     // Check tmpfs first.
@@ -13464,57 +13571,29 @@ pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags:
         } else {
             0x8000 | st.mode as u32
         };
-        let mut stat = [0u8; 144];
-        stat[8..16].copy_from_slice(&st.ino.to_ne_bytes());
-        stat[16..24].copy_from_slice(&st.nlink.to_ne_bytes());
-        stat[24..28].copy_from_slice(&mode.to_ne_bytes());
-        stat[28..32].copy_from_slice(&st.uid.to_ne_bytes());
-        stat[32..36].copy_from_slice(&st.gid.to_ne_bytes());
-        let size = st.size as u64;
-        stat[48..56].copy_from_slice(&size.to_ne_bytes());
-        let blksize: u64 = 4096;
-        stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
+        let mut m = FileMeta::new();
+        m.ino = st.ino;
+        m.nlink = st.nlink;
+        m.mode = mode;
+        m.uid = st.uid;
+        m.gid = st.gid;
+        m.size = st.size as u64;
         drop(tmpfs);
-        if UserSliceWo::new(stat_ptr, stat.len())
-            .and_then(|s| s.copy_from_kernel(&stat))
-            .is_err()
-        {
-            return NEG_EFAULT;
-        }
-        return 0;
+        return write_stat_to_user(stat_ptr, &m);
     }
 
     // Check ramdisk tree (supports directories and hierarchical paths).
     match crate::fs::ramdisk::ramdisk_lookup(name) {
         Some(crate::fs::ramdisk::RamdiskNode::File { content }) => {
-            let mut stat = [0u8; 144];
-            let mode: u32 = 0x8000 | 0o755; // S_IFREG + executable (ramdisk binaries)
-            stat[24..28].copy_from_slice(&mode.to_ne_bytes());
-            let size = content.len() as u64;
-            stat[48..56].copy_from_slice(&size.to_ne_bytes());
-            let blksize: u64 = 4096;
-            stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
-            if UserSliceWo::new(stat_ptr, stat.len())
-                .and_then(|s| s.copy_from_kernel(&stat))
-                .is_err()
-            {
-                return NEG_EFAULT;
-            }
-            0
+            let mut m = FileMeta::new();
+            m.mode = 0x8000 | 0o755; // S_IFREG + executable (ramdisk binaries)
+            m.size = content.len() as u64;
+            write_stat_to_user(stat_ptr, &m)
         }
         Some(crate::fs::ramdisk::RamdiskNode::Dir { .. }) => {
-            let mut stat = [0u8; 144];
-            let mode: u32 = 0x4000 | 0o755; // S_IFDIR
-            stat[24..28].copy_from_slice(&mode.to_ne_bytes());
-            let blksize: u64 = 4096;
-            stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
-            if UserSliceWo::new(stat_ptr, stat.len())
-                .and_then(|s| s.copy_from_kernel(&stat))
-                .is_err()
-            {
-                return NEG_EFAULT;
-            }
-            0
+            let mut m = FileMeta::new();
+            m.mode = 0x4000 | 0o755; // S_IFDIR
+            write_stat_to_user(stat_ptr, &m)
         }
         None => {
             // ext2 root filesystem: stat any path.
@@ -13524,60 +13603,37 @@ pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags:
                 if vfs_service_can_handle_path(name)
                     && let Ok(vfs_stat) = vfs_service_stat_path(name)
                 {
-                    let mut stat = [0u8; 144];
-                    stat[8..16].copy_from_slice(&vfs_stat.ino.to_ne_bytes());
-                    stat[16..24].copy_from_slice(&vfs_stat.nlink.to_ne_bytes());
-                    stat[24..28].copy_from_slice(&vfs_stat.mode.to_ne_bytes());
-                    stat[28..32].copy_from_slice(&vfs_stat.uid.to_ne_bytes());
-                    stat[32..36].copy_from_slice(&vfs_stat.gid.to_ne_bytes());
-                    stat[48..56].copy_from_slice(&vfs_stat.size.to_ne_bytes());
-                    stat[56..64].copy_from_slice(&vfs_stat.blksize.to_ne_bytes());
-                    stat[72..80].copy_from_slice(&vfs_stat.atime.to_ne_bytes());
-                    stat[88..96].copy_from_slice(&vfs_stat.mtime.to_ne_bytes());
-                    stat[104..112].copy_from_slice(&vfs_stat.ctime.to_ne_bytes());
-                    if UserSliceWo::new(stat_ptr, stat.len())
-                        .and_then(|s| s.copy_from_kernel(&stat))
-                        .is_err()
-                    {
-                        return NEG_EFAULT;
-                    }
-                    return 0;
+                    let mut m = FileMeta::new();
+                    m.ino = vfs_stat.ino;
+                    m.nlink = vfs_stat.nlink;
+                    m.mode = vfs_stat.mode;
+                    m.uid = vfs_stat.uid;
+                    m.gid = vfs_stat.gid;
+                    m.size = vfs_stat.size;
+                    m.blksize = vfs_stat.blksize;
+                    m.atime = vfs_stat.atime;
+                    m.mtime = vfs_stat.mtime;
+                    m.ctime = vfs_stat.ctime;
+                    return write_stat_to_user(stat_ptr, &m);
                 }
                 let vol = crate::fs::ext2::EXT2_VOLUME.lock();
                 if let Some(vol) = vol.as_ref()
                     && let Ok(ino) = vol.resolve_path(rel)
                     && let Ok(inode) = vol.read_inode(ino)
                 {
-                    let mode = inode.mode as u32;
-                    let uid = inode.uid as u32;
-                    let gid = inode.gid as u32;
-                    let size = inode.size as u64;
-                    let nlink = inode.links_count as u64;
-                    let blksize = vol.block_size as u64;
-                    let ino = ino as u64;
-                    let mut stat = [0u8; 144];
-                    stat[8..16].copy_from_slice(&ino.to_ne_bytes());
-                    // st_nlink at offset 16 (u64 on x86_64 stat)
-                    stat[16..24].copy_from_slice(&nlink.to_ne_bytes());
-                    stat[24..28].copy_from_slice(&mode.to_ne_bytes());
-                    stat[28..32].copy_from_slice(&uid.to_ne_bytes());
-                    stat[32..36].copy_from_slice(&gid.to_ne_bytes());
-                    stat[48..56].copy_from_slice(&size.to_ne_bytes());
-                    stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
-                    // Phase 32: populate timestamps from ext2 inode
-                    let atime = inode.atime as i64;
-                    let mtime = inode.mtime as i64;
-                    let ctime = inode.ctime as i64;
-                    stat[72..80].copy_from_slice(&atime.to_ne_bytes());
-                    stat[88..96].copy_from_slice(&mtime.to_ne_bytes());
-                    stat[104..112].copy_from_slice(&ctime.to_ne_bytes());
-                    if UserSliceWo::new(stat_ptr, stat.len())
-                        .and_then(|s| s.copy_from_kernel(&stat))
-                        .is_err()
-                    {
-                        return NEG_EFAULT;
-                    }
-                    return 0;
+                    let mut m = FileMeta::new();
+                    m.ino = ino as u64;
+                    m.nlink = inode.links_count as u64;
+                    m.mode = inode.mode as u32;
+                    m.uid = inode.uid as u32;
+                    m.gid = inode.gid as u32;
+                    m.size = inode.size as u64;
+                    m.blksize = vol.block_size as u64;
+                    // Phase 32: populate timestamps from ext2 inode.
+                    m.atime = inode.atime as i64;
+                    m.mtime = inode.mtime as i64;
+                    m.ctime = inode.ctime as i64;
+                    return write_stat_to_user(stat_ptr, &m);
                 }
             }
             // Device special files.
@@ -13589,31 +13645,15 @@ pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags:
                 || name == "/dev/ptmx"
                 || name.starts_with("/dev/pts/")
             {
-                let mut stat = [0u8; 144];
-                let mode: u32 = 0x2000 | 0o666; // S_IFCHR | rw-rw-rw-
-                stat[24..28].copy_from_slice(&mode.to_ne_bytes());
-                if UserSliceWo::new(stat_ptr, stat.len())
-                    .and_then(|s| s.copy_from_kernel(&stat))
-                    .is_err()
-                {
-                    return NEG_EFAULT;
-                }
-                return 0;
+                let mut m = FileMeta::new();
+                m.mode = 0x2000 | 0o666; // S_IFCHR | rw-rw-rw-
+                return write_stat_to_user(stat_ptr, &m);
             }
             // Also handle "/" specially.
             if name == "/" {
-                let mut stat = [0u8; 144];
-                let mode: u32 = 0x4000 | 0o755;
-                stat[24..28].copy_from_slice(&mode.to_ne_bytes());
-                let blksize: u64 = 4096;
-                stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
-                if UserSliceWo::new(stat_ptr, stat.len())
-                    .and_then(|s| s.copy_from_kernel(&stat))
-                    .is_err()
-                {
-                    return NEG_EFAULT;
-                }
-                return 0;
+                let mut m = FileMeta::new();
+                m.mode = 0x4000 | 0o755;
+                return write_stat_to_user(stat_ptr, &m);
             }
             NEG_ENOENT
         }

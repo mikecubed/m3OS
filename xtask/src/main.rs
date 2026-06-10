@@ -5799,8 +5799,15 @@ fn cmd_check() {
     // instructions — reviewers should not expect any FPU/XSAVE interaction.
     retpoline_objdump_gate();
 
+    // Phase 88 Track A — stat-assembly gate. Fails if any syscall hand-assembles
+    // a `struct stat` via `stat[<n>..` byte-offset writes; the single permitted
+    // serializer is `fill_stat` (which writes a local `s[<n>..`). A new
+    // offset-write outside `fill_stat` is the exact defect class (a forgotten
+    // field, e.g. the historical `st_ino = 0`) that Phase 88 closes.
+    stat_assembly_gate();
+
     println!(
-        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, ac97_driver, hda_driver, ahci_driver, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, shadow, ldso_core, wifi-core, mt792x_driver, m3ctl, pkg-format, xtask, and pkg host tests pass; doom platform-layer C tests pass; retpoline indirect-branch gate pass"
+        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, ac97_driver, hda_driver, ahci_driver, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, shadow, ldso_core, wifi-core, mt792x_driver, m3ctl, pkg-format, xtask, and pkg host tests pass; doom platform-layer C tests pass; retpoline indirect-branch gate pass; stat-assembly gate pass"
     );
 }
 
@@ -5999,6 +6006,50 @@ fn retpoline_objdump_gate() {
     println!(
         "retpoline gate PASS: 0 residual indirect branches, {thunk_count} retpoline thunk references"
     );
+}
+
+/// Phase 88 Track A — fail the check if any syscall hand-assembles a
+/// `struct stat` via `stat[<n>..` byte-offset writes outside the canonical
+/// `fill_stat` serializer (which uses a local named `s`, never `stat`). The
+/// 85d clang bug was a single omitted field (`st_ino`) in one such
+/// hand-assembled path; routing every stat through `fill_stat` makes "forgot a
+/// field in one path" structurally impossible, and this gate keeps it that way.
+fn stat_assembly_gate() {
+    let path = workspace_root().join("kernel/src/arch/x86_64/syscall/mod.rs");
+    let src = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("stat-assembly gate: cannot read {}: {e}", path.display()));
+    let mut offenders = Vec::new();
+    for (lineno, line) in src.lines().enumerate() {
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        // Find every `stat[` immediately followed by ASCII digit(s) then `..`
+        // (a `struct stat` byte-offset write). `fill_stat`'s local is named `s`,
+        // so it never matches; `stat.len()` / `stat[idx]` never match either.
+        while let Some(pos) = line[i..].find("stat[") {
+            let start = i + pos + "stat[".len();
+            let mut j = start;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > start && line[j..].starts_with("..") {
+                offenders.push((lineno + 1, line.trim().to_string()));
+            }
+            i = start;
+        }
+    }
+    if !offenders.is_empty() {
+        eprintln!(
+            "stat-assembly gate FAIL: {} `stat[<n>..` byte-offset write(s) in \
+             kernel/src/arch/x86_64/syscall/mod.rs. Build a `FileMeta` and route \
+             through `fill_stat` instead of writing `struct stat` offsets directly:",
+            offenders.len()
+        );
+        for (lineno, text) in &offenders {
+            eprintln!("  mod.rs:{lineno}: {text}");
+        }
+        std::process::exit(1);
+    }
+    println!("stat-assembly gate PASS: 0 `stat[<n>..` offset writes outside fill_stat");
 }
 
 #[derive(Debug, Clone)]
