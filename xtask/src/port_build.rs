@@ -3656,15 +3656,26 @@ fn build_llvm(
 /// runtime (Stage B) installs on top of this. Idempotent (wipes + rebuilds the
 /// header/lib copies; the UAPI dirs are symlinked).
 fn assemble_musl_sysroot(sysroot: &Path) -> Result<(), String> {
-    const MUSL_INC: &str = "/usr/include/x86_64-linux-musl";
-    const MUSL_LIB: &str = "/usr/lib/x86_64-linux-musl";
-    if !Path::new(MUSL_INC).join("stdio.h").exists() || !Path::new(MUSL_LIB).join("libc.a").exists()
-    {
-        return Err(format!(
-            "llvm build: musl headers/libs not found at {MUSL_INC} / {MUSL_LIB} \
-             (Debian/Ubuntu: `apt install musl-dev`)"
-        ));
-    }
+    // musl headers/libs live at distro-specific paths:
+    //   Debian/Ubuntu (`musl-dev`): /usr/include/x86_64-linux-musl + /usr/lib/x86_64-linux-musl
+    //   Arch (`musl`):              /usr/lib/musl/include          + /usr/lib/musl/lib
+    let (musl_inc, musl_lib) = [
+        (
+            "/usr/include/x86_64-linux-musl",
+            "/usr/lib/x86_64-linux-musl",
+        ),
+        ("/usr/lib/musl/include", "/usr/lib/musl/lib"),
+    ]
+    .into_iter()
+    .find(|(inc, lib)| {
+        Path::new(inc).join("stdio.h").exists() && Path::new(lib).join("libc.a").exists()
+    })
+    .ok_or_else(|| {
+        "llvm build: musl headers/libs not found (Debian/Ubuntu: `apt install musl-dev`; \
+         Arch: `pacman -S musl`). Checked /usr/include/x86_64-linux-musl + \
+         /usr/lib/x86_64-linux-musl and /usr/lib/musl/{include,lib}."
+            .to_string()
+    })?;
     let inc = sysroot.join("include");
     let lib = sysroot.join("lib");
     // Reset only the header/lib copies — the C++ runtime install lands in the same
@@ -3676,11 +3687,11 @@ fn assemble_musl_sysroot(sysroot: &Path) -> Result<(), String> {
     // musl headers + libc.a/CRT via `cp -a` (a few dozen files; simpler than a
     // hand-rolled recursive copy).
     cp_a(
-        &format!("{MUSL_INC}/."),
+        &format!("{musl_inc}/."),
         inc.to_str().unwrap(),
         "musl headers",
     )?;
-    cp_a(&format!("{MUSL_LIB}/."), lib.to_str().unwrap(), "musl libs")?;
+    cp_a(&format!("{musl_lib}/."), lib.to_str().unwrap(), "musl libs")?;
     // Linux UAPI headers (musl ships none) — symlink the kernel uapi dirs.
     let asm_dir = linux_uapi_arch_include().join("asm");
     for (target, name) in [
