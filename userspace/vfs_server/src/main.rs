@@ -31,7 +31,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::alloc::Layout;
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_core::fs::ext2::{
     EXT2_DIND_BLOCK, EXT2_FT_DIR, EXT2_FT_REG_FILE, EXT2_FT_SYMLINK, EXT2_IND_BLOCK,
@@ -129,6 +129,16 @@ struct Ext2State {
     /// write (the dominant remaining write cost + WRITE-request latency driver)
     /// into one write per run.
     block_reservation: Option<(u32, u32)>,
+    /// Phase 87 durability — set by every device write (`write_block`,
+    /// `write_block_run`, `write_sectors`, `flush_dirty_blocks`), cleared after a
+    /// device `block_flush`. The periodic write-back flush gates its device FLUSH
+    /// on THIS, not `has_pending_writes()`: a pure **in-place overwrite** of an
+    /// already-allocated file allocates nothing and defers no pointer block, so it
+    /// leaves `dirty_blocks` empty and `meta_dirty_ops == 0` — yet its bytes sit
+    /// in the device/host write-back cache. Without this flag that workload would
+    /// never get a periodic device FLUSH, silently breaking the documented
+    /// "host crash → bounded ~5 s" guarantee for overwrite-heavy clients.
+    writes_since_flush: Cell<bool>,
 }
 
 /// Max ext2 blocks held in the vfs_server read-through cache (4 KiB blocks →
@@ -252,7 +262,12 @@ impl Ext2State {
     fn write_sectors(&self, start_lba: u64, count: usize, buf: &[u8]) -> Result<(), ()> {
         self.invalidate_lba_range(start_lba, count);
         let ret = syscall_lib::block_write(start_lba, count, buf);
-        if ret < 0 { Err(()) } else { Ok(()) }
+        if ret < 0 {
+            Err(())
+        } else {
+            self.writes_since_flush.set(true);
+            Ok(())
+        }
     }
 
     /// Write one ext2 block to disk and **write-through update** the cache with
@@ -277,6 +292,7 @@ impl Ext2State {
             self.block_cache.borrow_mut().remove(&block_num);
             return Err(());
         }
+        self.writes_since_flush.set(true);
         let mut cache = self.block_cache.borrow_mut();
         if data.len() == self.block_size as usize {
             // Update if present (the hot path); otherwise insert while bounded.
@@ -354,6 +370,7 @@ impl Ext2State {
                 self.block_cache.borrow_mut().remove(&block_num);
                 return Err(());
             }
+            self.writes_since_flush.set(true);
             // Persisted — now clean on disk: drop it from the dirty set and
             // refresh the read cache (bounded insert).
             self.dirty_blocks.borrow_mut().remove(&block_num);
@@ -370,6 +387,21 @@ impl Ext2State {
     /// skip a pointless device FLUSH when the server is idle with nothing dirty.
     fn has_pending_writes(&self) -> bool {
         !self.dirty_blocks.borrow().is_empty() || self.meta_dirty_ops > 0
+    }
+
+    /// True if any device write has landed since the last device `block_flush`.
+    /// Unlike `has_pending_writes` (buffered-in-*this-server* state), this also
+    /// covers a pure in-place overwrite that bypasses the deferral buffers — its
+    /// bytes are in the device/host write-back cache and still need a periodic
+    /// device FLUSH to bound host-crash loss. See `writes_since_flush`.
+    fn needs_device_flush(&self) -> bool {
+        self.writes_since_flush.get()
+    }
+
+    /// Record that a device `block_flush` just committed the write-back cache to
+    /// media, so the next periodic wake skips a redundant FLUSH until a new write.
+    fn mark_device_flushed(&self) {
+        self.writes_since_flush.set(false);
     }
 
     /// Phase 87 — write a contiguous run of `count` whole blocks in one
@@ -392,7 +424,12 @@ impl Ext2State {
         for i in 0..count as u32 {
             cache.remove(&(start_block + i));
         }
-        if ret < 0 { Err(()) } else { Ok(()) }
+        if ret < 0 {
+            Err(())
+        } else {
+            self.writes_since_flush.set(true);
+            Ok(())
+        }
     }
 
     /// Write an inode back to disk (mirrors kernel `write_inode`).
@@ -788,11 +825,21 @@ impl Ext2State {
                 bitmap[byte_idx] |= 1 << bit_idx;
                 run_len += 1;
             }
-            // start_bit was free, so run_len >= 1.
+            // start_bit was free, so run_len >= 1. Decrement the free counters
+            // saturatingly: the bitmap is authoritative, but an unclean crash
+            // can leave the on-disk free-count summary LOWER than the bitmap's
+            // actual free bits (frees whose deferred sb/BGD flush was lost), so
+            // on remount a run can claim more bits than a stale counter admits.
+            // Saturating to 0 then degrades to the documented fsck-reconcilable
+            // state (the group looks full, its surplus free bits leak until
+            // fsck) instead of wrapping the count to a huge bogus value.
             self.write_block(bitmap_block, &bitmap)
                 .map_err(|_| NEG_EIO)?;
-            self.bgd_table[group].free_blocks_count -= run_len as u16;
-            self.superblock.free_blocks_count -= run_len;
+            self.bgd_table[group].free_blocks_count = self.bgd_table[group]
+                .free_blocks_count
+                .saturating_sub(run_len as u16);
+            self.superblock.free_blocks_count =
+                self.superblock.free_blocks_count.saturating_sub(run_len);
             self.mark_meta_dirty().map_err(|_| NEG_EIO)?;
 
             let first_abs = (group as u32) * self.superblock.blocks_per_group
@@ -858,6 +905,17 @@ impl Ext2State {
         bitmap[byte_idx] &= !(1 << bit_idx);
         self.write_block(bitmap_block, &bitmap)
             .map_err(|_| NEG_EIO)?;
+
+        // The block is now free on disk: any buffered content for it is stale.
+        // Purge it from the write-back buffer AND the read cache so a later
+        // reallocation of this block can never (a) serve the stale deferred
+        // pointer-block bytes on read, nor (b) have `flush_dirty_blocks` write
+        // that stale content over the block's new data. `flush_dirty_blocks`
+        // normally drains at every request boundary so `dirty_blocks` is empty
+        // here, but that flush result is best-effort (discarded on I/O error),
+        // so make the freed-block invariant explicit rather than implicit.
+        self.dirty_blocks.borrow_mut().remove(&block_num);
+        self.block_cache.borrow_mut().remove(&block_num);
 
         self.bgd_table[group].free_blocks_count += 1;
         self.superblock.free_blocks_count += 1;
@@ -1886,6 +1944,7 @@ fn program_main(_args: &[&str]) -> i32 {
         dirty_blocks: RefCell::new(BTreeMap::new()),
         meta_dirty_ops: 0,
         block_reservation: None,
+        writes_since_flush: Cell::new(false),
     };
 
     syscall_lib::write_str(STDOUT_FILENO, "vfs_server: ext2 mounted\n");
@@ -1979,11 +2038,19 @@ fn recv_with_periodic_flush(
         if SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
             shutdown_flush_and_exit(ext2);
         }
+        // First drain this server's buffered write-back state (deferred pointer
+        // blocks + sb/BGD summaries) so it reaches the device.
         if ext2.has_pending_writes() {
             let _ = ext2.flush_dirty_blocks();
             let _ = ext2.flush_metadata_if_dirty();
-            // Commit the device write-back cache to physical media.
+        }
+        // Then, if ANY device write has landed since the last device FLUSH —
+        // including a pure in-place overwrite that buffered nothing in this
+        // server — commit the device write-back cache to physical media. Checked
+        // AFTER the drain so the drain's own writes are covered by this FLUSH.
+        if ext2.needs_device_flush() {
             let _ = syscall_lib::block_flush();
+            ext2.mark_device_flushed();
         }
     }
 }

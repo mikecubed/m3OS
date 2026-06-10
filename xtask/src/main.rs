@@ -10909,14 +10909,33 @@ fn ahci_rw_smoke_steps() -> Vec<SmokeStep> {
 /// then a 0-byte placeholder and cannot run) — the same PASS-vs-SKIP discipline
 /// as `tls-smoke` / `dns-smoke`.
 fn cmd_ahci_rw_smoke(args: &SmokeBootArgs) {
+    // When `M3OS_AHCI_RW_REQUIRE_PASS=1` (set by the always-on CI step), a SKIP is
+    // a hard failure: this gate is the ONLY CI coverage of the ring-3 write path,
+    // and a silent SKIP (exit 0 = green) would let a missing musl toolchain — e.g.
+    // musl-tools accidentally dropped from pr.yml — turn the "always-on write-path
+    // proof" vacuous with no alarm. Mirrors tls-smoke/dns-smoke's PASS-not-SKIP.
+    let require_pass = std::env::var("M3OS_AHCI_RW_REQUIRE_PASS")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let skip = |reason: &str| {
+        if require_pass {
+            eprintln!(
+                "ahci-rw-smoke: FAIL — M3OS_AHCI_RW_REQUIRE_PASS=1 but the gate \
+                 could not run: {reason}"
+            );
+            std::process::exit(1);
+        }
+        println!("ahci-rw-smoke: SKIP — {reason}");
+    };
+
     // The write+read-back self-test is a static musl C binary; without a musl
     // cross-compiler it is replaced by a 0-byte placeholder and cannot run.
     // Skip with a clear reason instead of booting QEMU to a guaranteed timeout.
     if find_musl_cc().is_none() {
-        println!(
-            "ahci-rw-smoke: SKIP — musl cross-compiler not found, so \
-             ext2-coherence-smoke is not built (install musl-tools on \
-             Debian/Ubuntu or musl-gcc-cross-bin on Arch to enable)"
+        skip(
+            "musl cross-compiler not found, so ext2-coherence-smoke is not built \
+             (install musl-tools on Debian/Ubuntu or musl-gcc-cross-bin on Arch \
+             to enable)",
         );
         return;
     }
@@ -10933,11 +10952,11 @@ fn cmd_ahci_rw_smoke(args: &SmokeBootArgs) {
         .map(|m| m.len() > 0)
         .unwrap_or(false);
     if !coh_ok {
-        println!(
-            "ahci-rw-smoke: SKIP — staged ext2-coherence-smoke is missing or empty \
-             at {} (musl build produced no binary)",
+        skip(&format!(
+            "staged ext2-coherence-smoke is missing or empty at {} (musl build \
+             produced no binary)",
             coh.display()
-        );
+        ));
         return;
     }
 

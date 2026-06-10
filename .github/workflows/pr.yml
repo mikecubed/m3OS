@@ -125,8 +125,11 @@ jobs:
         # only exercise in-kernel virtio-blk; the AHCI/NVMe gates elsewhere only
         # read or run a driver-internal self-test, so a data[1]/recv-buffer
         # regression in the ring-3 write path would otherwise ship untested.
-        # musl-tools is installed above, so the C self-test is built (no SKIP).
-        run: cargo xtask ahci-rw-smoke --timeout 300
+        # musl-tools is installed above, so the C self-test is built. REQUIRE_PASS
+        # makes a SKIP (e.g. if musl-tools is ever dropped from the apt list above)
+        # a hard CI failure rather than a silent green — this gate is the only CI
+        # coverage of the ring-3 write path, so a vacuous pass must not be possible.
+        run: M3OS_AHCI_RW_REQUIRE_PASS=1 cargo xtask ahci-rw-smoke --timeout 300
 
       - name: "AHCI reboot persistence (write → reboot → re-read off the same ahci.block disk)"
         # Phase 87: proves a write to the ring-3 AHCI root SURVIVES a reboot, not
