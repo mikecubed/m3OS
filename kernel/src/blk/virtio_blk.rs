@@ -74,6 +74,16 @@ const VIRTIO_STATUS_FEATURES_OK: u8 = 8;
 
 const VIRTIO_BLK_T_IN: u32 = 0;
 const VIRTIO_BLK_T_OUT: u32 = 1;
+/// VirtIO block FLUSH request — commit the device write-back cache to media.
+const VIRTIO_BLK_T_FLUSH: u32 = 4;
+
+/// `VIRTIO_BLK_F_FLUSH` (feature bit 9): the device exposes a write-back cache
+/// and honors `VIRTIO_BLK_T_FLUSH`. Negotiating it is what lets writes complete
+/// against the cache (fast) instead of being forced write-through (durable per
+/// request) — the latter made every 512-byte write ~20x slower than a read.
+/// With it negotiated we issue an explicit FLUSH at the clean-shutdown boundary
+/// (`kernel_shutdown`) so a normal poweroff still persists.
+const VIRTIO_BLK_F_FLUSH: u32 = 1 << 9;
 
 // ===========================================================================
 // Virtqueue structures
@@ -114,6 +124,15 @@ struct VirtqUsedHeader {
 
 const MAX_QUEUE_SIZE: u16 = 256;
 const SECTOR_SIZE: usize = 512;
+
+/// Max sectors transferred in a single batched virtio request (= the persistent
+/// DMA buffer size / SECTOR_SIZE). Replacing the historical one-request-per-512-
+/// byte-sector loop with one request per up-to-`MAX_REQUEST_SECTORS` run cuts
+/// the device round-trips (and IRQs / task parks) for a 64 KiB transfer from 128
+/// to 1 — the read coalescer + ext2 write runs already hand us contiguous
+/// multi-block ranges, so this is where that batching reaches the device. 128
+/// sectors = 64 KiB matches the VFS/`sys_block_read` request cap.
+const MAX_REQUEST_SECTORS: usize = 128;
 
 /// One waiter slot: (TaskId blocked on this in-flight req, woken-flag).
 /// Indexed by head descriptor id (0..queue_size).
@@ -420,6 +439,12 @@ static DRIVER: Mutex<Option<VirtioBlkDriver>> = Mutex::new(None);
 
 pub static VIRTIO_BLK_READY: AtomicBool = AtomicBool::new(false);
 
+/// Set during init when `VIRTIO_BLK_F_FLUSH` is negotiated — the device then
+/// runs in write-back mode and `flush()` issues a real `VIRTIO_BLK_T_FLUSH`.
+/// When false (device didn't offer it), the device is write-through and a
+/// flush is unnecessary (and unsupported), so `flush()` is a no-op.
+static FLUSH_NEGOTIATED: AtomicBool = AtomicBool::new(false);
+
 // The legacy virtio-blk implementation still uses one shared descriptor
 // chain, one scratch page, one DMA buffer, and one wake flag. Serialize that
 // shared hardware state with a scheduler-blocking single-flight slot.
@@ -720,22 +745,28 @@ pub fn read_sectors(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(
         return Err(0xFF);
     }
 
-    for i in 0..count {
+    // Batch into runs of up to MAX_REQUEST_SECTORS: one device request (one IRQ,
+    // one task park) per run instead of one per 512-byte sector.
+    let mut done = 0usize;
+    while done < count {
+        let chunk = (count - done).min(MAX_REQUEST_SECTORS);
+        let chunk_bytes = chunk * SECTOR_SIZE;
         let _request_slot = RequestSlot::acquire()?;
-        let sector = start_sector + i as u64;
-        let status = do_request(VIRTIO_BLK_T_IN, sector)?;
+        let sector = start_sector + done as u64;
+        let status = do_request(VIRTIO_BLK_T_IN, sector, chunk_bytes)?;
         if status != 0 {
             log::error!(
-                "[virtio-blk] read_sectors: sector {} failed with status {}",
+                "[virtio-blk] read_sectors: run [{}, {}) failed with status {}",
                 sector,
+                sector + chunk as u64,
                 status
             );
             return Err(status);
         }
-        // Copy from DMA buffer to caller's buffer. See Fix 1 note in
-        // `do_request`: the driver lock must be taken with IF off to stay
-        // out of the ISR's way. Phase 57b G.1.c — `with_driver` wraps the
-        // `preempt_disable` + `without_interrupts` boilerplate.
+        // Copy the whole run from the DMA buffer to the caller's buffer. See
+        // Fix 1 note in `do_request`: the driver lock must be taken with IF off
+        // to stay out of the ISR's way. Phase 57b G.1.c — `with_driver` wraps
+        // the `preempt_disable` + `without_interrupts` boilerplate.
         let dma_virt: *mut u8 = with_driver(|d| match d.as_ref() {
             Some(d) => d.dma_virt,
             None => core::ptr::null_mut(),
@@ -743,12 +774,13 @@ pub fn read_sectors(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(
         if dma_virt.is_null() {
             return Err(0xFF);
         }
-        let offset = i * SECTOR_SIZE;
-        // SAFETY: dma_virt is a persistent driver-owned scratch page; it's
-        // live as long as the driver exists.
+        let offset = done * SECTOR_SIZE;
+        // SAFETY: dma_virt is a persistent driver-owned DMA buffer of
+        // MAX_REQUEST_SECTORS*SECTOR_SIZE bytes; chunk_bytes <= that size.
         unsafe {
-            core::ptr::copy_nonoverlapping(dma_virt, buf[offset..].as_mut_ptr(), SECTOR_SIZE);
+            core::ptr::copy_nonoverlapping(dma_virt, buf[offset..].as_mut_ptr(), chunk_bytes);
         }
+        done += chunk;
     }
     Ok(())
 }
@@ -765,37 +797,69 @@ pub fn write_sectors(start_sector: u64, count: usize, buf: &[u8]) -> Result<(), 
         return Err(0xFF);
     }
 
-    for i in 0..count {
+    // Batch into runs of up to MAX_REQUEST_SECTORS: stage the whole run into the
+    // DMA buffer and issue ONE device request for it, instead of one per sector.
+    let mut done = 0usize;
+    while done < count {
+        let chunk = (count - done).min(MAX_REQUEST_SECTORS);
+        let chunk_bytes = chunk * SECTOR_SIZE;
+        let offset = done * SECTOR_SIZE;
         let _request_slot = RequestSlot::acquire()?;
-        let sector = start_sector + i as u64;
-        let offset = i * SECTOR_SIZE;
-        // Stage the sector into the DMA buffer. See Fix 1 note in
+        let sector = start_sector + done as u64;
+        // Stage the whole run into the DMA buffer. See Fix 1 note in
         // `do_request`: the driver lock must be taken with IF off to stay
         // out of the ISR's way. Phase 57b G.1.c — `with_driver` wraps the
         // `preempt_disable` + `without_interrupts` boilerplate.
         let stage_result: Result<(), u8> = with_driver(|d| {
             let driver = d.as_mut().ok_or(0xFFu8)?;
-            // SAFETY: dma_virt is driver-owned scratch; only one task writes
-            // at a time (DRIVER lock).
+            // SAFETY: dma_virt is the driver-owned DMA buffer of
+            // MAX_REQUEST_SECTORS*SECTOR_SIZE bytes; chunk_bytes <= that size,
+            // and only one task writes at a time (DRIVER lock).
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     buf[offset..].as_ptr(),
                     driver.dma_virt,
-                    SECTOR_SIZE,
+                    chunk_bytes,
                 );
             }
             Ok(())
         });
         stage_result?;
-        let status = do_request(VIRTIO_BLK_T_OUT, sector)?;
+        let status = do_request(VIRTIO_BLK_T_OUT, sector, chunk_bytes)?;
         if status != 0 {
             log::error!(
-                "[virtio-blk] write_sectors: sector {} failed with status {}",
+                "[virtio-blk] write_sectors: run [{}, {}) failed with status {}",
                 sector,
+                sector + chunk as u64,
                 status
             );
             return Err(status);
         }
+        done += chunk;
+    }
+    Ok(())
+}
+
+/// Flush the device write-back cache to media (`VIRTIO_BLK_T_FLUSH`).
+///
+/// No-op when `VIRTIO_BLK_F_FLUSH` was not negotiated (the device is
+/// write-through — every write is already durable) or the device isn't ready.
+/// Called from `kernel_shutdown` so a clean poweroff/restart commits any
+/// buffered writes; the error is surfaced so the caller can warn rather than
+/// silently risk data loss. QEMU ignores the (unused) data descriptor on a
+/// flush request, so we reuse the standard single-request path with sector 0.
+#[allow(dead_code)]
+pub fn flush() -> Result<(), u8> {
+    if !FLUSH_NEGOTIATED.load(Ordering::Acquire) || !VIRTIO_BLK_READY.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let _request_slot = RequestSlot::acquire()?;
+    // A FLUSH carries no data; QEMU ignores the data descriptor. Pass SECTOR_SIZE
+    // so the standard well-formed descriptor chain is reused (sector 0).
+    let status = do_request(VIRTIO_BLK_T_FLUSH, 0, SECTOR_SIZE)?;
+    if status != 0 {
+        log::error!("[virtio-blk] flush: device returned status {status}");
+        return Err(status);
     }
     Ok(())
 }
@@ -818,7 +882,11 @@ pub fn write_sectors(start_sector: u64, count: usize, buf: &[u8]) -> Result<(), 
 /// so any IRQ that fires between submit and `block_current_until` is visible
 /// at step 3 of the CAS protocol; the task self-reverts to `Running`
 /// without descending into `switch_context`.
-fn do_request(req_type: u32, sector: u64) -> Result<u8, u8> {
+/// `bytes` is the data-descriptor length: `count * SECTOR_SIZE` for a batched
+/// multi-sector transfer (one request, one IRQ, one wake for the whole run), or
+/// `SECTOR_SIZE` for a single-sector / flush request. Must be `<= the DMA
+/// buffer size` (the caller chunks to `MAX_REQUEST_SECTORS`).
+fn do_request(req_type: u32, sector: u64, bytes: usize) -> Result<u8, u8> {
     // Phase 1: enqueue under the DRIVER lock.
     //
     // Correctness: the kick write to VIRTIO_QUEUE_NOTIFY at the end of
@@ -838,10 +906,13 @@ fn do_request(req_type: u32, sector: u64) -> Result<u8, u8> {
     // `without_interrupts` boilerplate around the IRQ-shared `DRIVER` lock.
     let status_virt_result: Result<*mut u8, u8> = with_driver(|d| {
         let driver = d.as_mut().ok_or(0xFFu8)?;
-        if sector >= driver.capacity_sectors {
+        // Bounds-check the whole batched range [sector, sector+sectors).
+        let sectors = (bytes / SECTOR_SIZE).max(1) as u64;
+        if sector >= driver.capacity_sectors || sector + sectors > driver.capacity_sectors {
             log::error!(
-                "[virtio-blk] request: sector {} out of bounds (capacity {})",
+                "[virtio-blk] request: range [{}, {}) out of bounds (capacity {})",
                 sector,
+                sector + sectors,
                 driver.capacity_sectors
             );
             return Err(0xFF);
@@ -853,7 +924,7 @@ fn do_request(req_type: u32, sector: u64) -> Result<u8, u8> {
             req_type,
             sector,
             dma_phys,
-            SECTOR_SIZE,
+            bytes,
             scratch_phys,
             scratch_virt,
             &REQ_WOKEN,
@@ -991,7 +1062,20 @@ fn probe(handle: pci::PciDeviceHandle) -> DriverProbeResult {
 
     let device_features = port.read_reg::<u32>(VIRTIO_DEVICE_FEATURES);
     log::info!("[virtio-blk] device features: {:#010x}", device_features);
-    port.write_reg::<u32>(VIRTIO_DRIVER_FEATURES, 0);
+    // Negotiate VIRTIO_BLK_F_FLUSH when the device offers it: this puts the
+    // device in write-back mode so writes complete against its cache instead of
+    // being forced durable per request (the ~20x write penalty). Durability is
+    // restored by an explicit FLUSH at clean shutdown (see `flush` /
+    // `kernel_shutdown`). We negotiate ONLY this bit; everything else stays at
+    // the previous behavior.
+    let driver_features = device_features & VIRTIO_BLK_F_FLUSH;
+    port.write_reg::<u32>(VIRTIO_DRIVER_FEATURES, driver_features);
+    FLUSH_NEGOTIATED.store(driver_features & VIRTIO_BLK_F_FLUSH != 0, Ordering::Release);
+    if driver_features & VIRTIO_BLK_F_FLUSH != 0 {
+        log::info!("[virtio-blk] negotiated VIRTIO_BLK_F_FLUSH (write-back + explicit flush)");
+    } else {
+        log::info!("[virtio-blk] device has no FLUSH feature — staying write-through");
+    }
 
     // Try to set FEATURES_OK for transitional devices.
     let status = port.read_reg::<u8>(VIRTIO_DEVICE_STATUS);
@@ -1027,7 +1111,9 @@ fn probe(handle: pci::PciDeviceHandle) -> DriverProbeResult {
     let scratch_phys = scratch.bus_address();
     let scratch_virt = scratch.as_ptr() as *mut u8;
 
-    let dma = match DmaBuffer::<[u8]>::allocate(&handle, 4096) {
+    // Data DMA buffer sized for a full batched run (MAX_REQUEST_SECTORS) so one
+    // device request can carry up to 64 KiB instead of a single 512-byte sector.
+    let dma = match DmaBuffer::<[u8]>::allocate(&handle, MAX_REQUEST_SECTORS * SECTOR_SIZE) {
         Ok(b) => b,
         Err(_) => return DriverProbeResult::Failed("data DMA alloc failed"),
     };

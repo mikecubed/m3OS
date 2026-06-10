@@ -32,6 +32,14 @@ pub const BLK_WRITE: u16 = 0x5502;
 /// IPC message label for a block status / reply envelope.
 pub const BLK_STATUS: u16 = 0x5503;
 
+/// IPC message label for a cache-flush request — commit the device's volatile
+/// write-back cache to media. Lets a write-back driver (one that returns from
+/// `BLK_WRITE` as soon as the data is in the drive cache, rather than issuing a
+/// durability barrier per write) be told to make prior writes durable at a
+/// clean shutdown boundary. Reuses [`BlkRequestHeader`] (lba / sector_count /
+/// flags = 0, no payload) and [`BlkReplyHeader`] (status only, bytes = 0).
+pub const BLK_FLUSH: u16 = 0x5504;
+
 /// Hard upper bound on the number of sectors a single request may carry.
 ///
 /// The bound is enforced at the `RemoteBlockDevice` facade (Phase 55b Track
@@ -254,15 +262,18 @@ pub const fn encode_blk_request(
 /// the decoded header plus the trailing `payload_grant` handle on success.
 ///
 /// Rejects slices shorter than [`BLK_REQUEST_HEADER_SIZE`] and rejects any
-/// `kind` value that does not match one of the three documented labels —
-/// both paths surface as `Err(DecodeError)` rather than a panic so the
-/// caller can treat a malformed peer as a protocol error.
+/// `kind` value that does not match one of the four documented labels
+/// ([`BLK_READ`] / [`BLK_WRITE`] / [`BLK_STATUS`] / [`BLK_FLUSH`]) — both
+/// paths surface as `Err(DecodeError)` rather than a panic so the caller can
+/// treat a malformed peer as a protocol error. `BLK_FLUSH` carries no
+/// payload, so the driver's dispatch reaches its flush arm with an empty
+/// trailing bulk.
 pub fn decode_blk_request(bytes: &[u8]) -> Result<(BlkRequestHeader, u32), DecodeError> {
     if bytes.len() < BLK_REQUEST_HEADER_SIZE {
         return Err(DecodeError::Truncated);
     }
     let kind = u16::from_le_bytes([bytes[0], bytes[1]]);
-    if kind != BLK_READ && kind != BLK_WRITE && kind != BLK_STATUS {
+    if kind != BLK_READ && kind != BLK_WRITE && kind != BLK_STATUS && kind != BLK_FLUSH {
         return Err(DecodeError::UnknownKind);
     }
     let cmd_id = u64::from_le_bytes([
@@ -600,6 +611,24 @@ mod tests {
         bytes[1] = 0x12;
         let r = decode_blk_request(&bytes);
         assert_eq!(r, Err(DecodeError::UnknownKind));
+    }
+
+    #[test]
+    fn decode_blk_request_accepts_flush() {
+        // Phase 87: BLK_FLUSH is a valid request kind (no payload). It must
+        // decode so the driver dispatch reaches its flush arm rather than
+        // rejecting the frame as UnknownKind before the cache-flush runs.
+        let hdr = BlkRequestHeader {
+            kind: BLK_FLUSH,
+            cmd_id: 0,
+            lba: 0,
+            sector_count: 0,
+            flags: 0,
+        };
+        let bytes = encode_blk_request(hdr, 0);
+        let (decoded, grant) = decode_blk_request(&bytes).expect("BLK_FLUSH must decode");
+        assert_eq!(decoded.kind, BLK_FLUSH);
+        assert_eq!(grant, 0);
     }
 
     #[test]

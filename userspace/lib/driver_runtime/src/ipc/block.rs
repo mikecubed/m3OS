@@ -83,6 +83,16 @@ pub struct BlkReply {
 // BlockServer — closure-dispatch server helper.
 // ---------------------------------------------------------------------------
 
+/// Recv-buffer capacity for the block server, large enough to hold a full
+/// `BLK_WRITE` request: the encoded header plus a maximum-size payload
+/// (`MAX_SECTORS_PER_REQUEST` × 512-byte sectors). The default
+/// [`SyscallBackend::MAX_BULK_RECV`] (1522 B, net-frame-sized) truncates any
+/// write whose header + payload exceeds it — including every 4 KiB ext2-block
+/// write — at the driver, so the block server recvs with this capacity instead.
+/// Mirrors the `audio_server`'s `recv_with_capacity` for oversized payloads.
+const BLOCK_BULK_RECV_CAP: usize =
+    BLK_REQUEST_HEADER_SIZE + (MAX_SECTORS_PER_REQUEST as usize) * 512;
+
 /// Driver-side block server: pulls one request at a time off
 /// `endpoint`, dispatches to a caller-supplied closure, replies.
 ///
@@ -169,7 +179,14 @@ impl<B: IpcBackend> BlockServer<B> {
         F: FnMut(BlkRequest) -> BlkReply,
         N: FnMut(u64),
     {
-        let frame: RecvFrame = match self.backend.lock().recv(self.endpoint)? {
+        // Recv with the block-sized capacity (not the default net-frame
+        // `MAX_BULK_RECV`) so a full `BLK_WRITE` payload arrives intact rather
+        // than truncated at the driver. See [`BLOCK_BULK_RECV_CAP`].
+        let frame: RecvFrame = match self
+            .backend
+            .lock()
+            .recv_with_capacity(self.endpoint, BLOCK_BULK_RECV_CAP)?
+        {
             RecvResult::Notification(bits) => {
                 on_notification(bits);
                 return Ok(());

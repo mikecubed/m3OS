@@ -116,6 +116,31 @@ jobs:
           cargo xtask device-smoke --device nvme --timeout 180
           cargo xtask device-smoke --device e1000 --iommu --timeout 180
 
+      - name: "AHCI ring-3 write path (root over ahci.block, 200 KiB write+read-back)"
+        # Phase 87: the ONLY CI coverage of a payload WRITE through the ring-3
+        # block path (blk::remote::write_sectors -> do_write_ipc -> ahci_driver
+        # handle_write). Boots with the ext2 root routed to ich9-ahci, logs in,
+        # and runs ext2-coherence-smoke (200 KiB write + fresh-process byte
+        # read-back) ON the AHCI root. The default smoke-test/regression suites
+        # only exercise in-kernel virtio-blk; the AHCI/NVMe gates elsewhere only
+        # read or run a driver-internal self-test, so a data[1]/recv-buffer
+        # regression in the ring-3 write path would otherwise ship untested.
+        # musl-tools is installed above, so the C self-test is built. REQUIRE_PASS
+        # makes a SKIP (e.g. if musl-tools is ever dropped from the apt list above)
+        # a hard CI failure rather than a silent green — this gate is the only CI
+        # coverage of the ring-3 write path, so a vacuous pass must not be possible.
+        run: M3OS_AHCI_RW_REQUIRE_PASS=1 cargo xtask ahci-rw-smoke --timeout 300
+
+      - name: "AHCI reboot persistence (write → reboot → re-read off the same ahci.block disk)"
+        # Phase 87: proves a write to the ring-3 AHCI root SURVIVES a reboot, not
+        # just a within-boot read-back. Two boots against the same ext2 disk:
+        # boot 1 writes a marker + idles past one periodic write-back flush (so
+        # deferred ext2 metadata drains + BLK_FLUSH is issued), then boot 2 mounts
+        # ext2 fresh and re-reads it. Also asserts boot 1 logged no
+        # "[blk] remote block flush failed". Validates on-disk/remount consistency
+        # + the BLK_FLUSH IPC path. echo/cat only — no musl dependency.
+        run: cargo xtask ahci-persist-smoke --timeout 300
+
       - name: "Regression suite (with flake-isolation retry)"
         # `cargo xtask regression` is not test-isolated; suite-level QEMU
         # contention occasionally yields spurious per-test timeouts under TCG.

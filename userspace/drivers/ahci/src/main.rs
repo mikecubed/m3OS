@@ -33,7 +33,7 @@ use driver_runtime::{DeviceCapKey, DeviceHandle, DriverRuntimeError, Mmio};
 use kernel_core::device_host::DeviceHostError;
 #[cfg(not(test))]
 use kernel_core::driver_ipc::block::{
-    BLK_READ, BLK_STATUS, BLK_WRITE, BlkReplyHeader, BlkRequestHeader, BlockDriverError,
+    BLK_FLUSH, BLK_READ, BLK_STATUS, BLK_WRITE, BlkReplyHeader, BlkRequestHeader, BlockDriverError,
 };
 #[cfg(not(test))]
 use kernel_core::fs::mbr::{find_ext2_partition, find_fat32_partition, parse_mbr};
@@ -536,6 +536,26 @@ fn run_block_server(port: &mut Port) -> i32 {
                 payload_grant: 0,
                 bulk: Vec::new(),
             },
+            BLK_FLUSH => {
+                // Commit the drive's volatile write cache to media. Writes are
+                // now write-back (handle_write no longer flushes per request),
+                // so this is the durability barrier — issued by the kernel at
+                // clean shutdown via blk::flush.
+                let status = if cmd::flush(port).is_ok() {
+                    BlockDriverError::Ok
+                } else {
+                    BlockDriverError::IoError
+                };
+                BlkReply {
+                    header: BlkReplyHeader {
+                        cmd_id: req.header.cmd_id,
+                        status,
+                        bytes: 0,
+                    },
+                    payload_grant: 0,
+                    bulk: Vec::new(),
+                }
+            }
             _ => BlkReply {
                 header: BlkReplyHeader {
                     cmd_id: req.header.cmd_id,
@@ -601,8 +621,16 @@ fn handle_read(port: &mut Port, hdr: &BlkRequestHeader) -> (BlkReplyHeader, Vec<
     }
 }
 
-/// Serve one `BLK_WRITE`: write the request bulk, then FLUSH CACHE EXT for
-/// durability before reporting success.
+/// Serve one `BLK_WRITE`: write the request bulk and report success once it
+/// reaches the drive's (volatile) write-back cache.
+///
+/// Write-back: a `WRITE DMA EXT` completion lands in the drive cache, not yet on
+/// media. We deliberately do NOT issue a per-write `FLUSH CACHE EXT` — that
+/// durability barrier per request was ~20x slower than the transfer itself. The
+/// kernel issues one `BLK_FLUSH` (→ `cmd::flush`) at clean shutdown via
+/// `blk::flush`, matching the virtio-blk write-back model. Within a boot, reads
+/// see prior writes (drive cache is coherent); a host crash / power loss before
+/// the shutdown flush loses cached writes (standard write-back tradeoff).
 #[cfg(not(test))]
 fn handle_write(port: &mut Port, hdr: &BlkRequestHeader, bulk: &[u8]) -> BlkReplyHeader {
     let count = hdr.sector_count;
@@ -615,22 +643,11 @@ fn handle_write(port: &mut Port, hdr: &BlkRequestHeader, bulk: &[u8]) -> BlkRepl
         };
     }
     match cmd::write_sectors(port, hdr.lba, count as u16, bulk) {
-        Ok(()) => {
-            // Durability: a WRITE DMA EXT completion only reaches the drive's
-            // volatile cache, so flush before reporting the write durable.
-            if cmd::flush(port).is_err() {
-                return BlkReplyHeader {
-                    cmd_id: hdr.cmd_id,
-                    status: BlockDriverError::IoError,
-                    bytes: 0,
-                };
-            }
-            BlkReplyHeader {
-                cmd_id: hdr.cmd_id,
-                status: BlockDriverError::Ok,
-                bytes: needed as u32,
-            }
-        }
+        Ok(()) => BlkReplyHeader {
+            cmd_id: hdr.cmd_id,
+            status: BlockDriverError::Ok,
+            bytes: needed as u32,
+        },
         Err(e) => BlkReplyHeader {
             cmd_id: hdr.cmd_id,
             status: e.into(),

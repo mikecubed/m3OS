@@ -1460,6 +1460,12 @@ mod syscall_nr {
     pub const BLOCK_READ: u64 = 0x1011;
     /// Phase 55b Track F.3d-2: write raw disk sectors from userspace.
     pub const BLOCK_WRITE: u64 = 0x1012;
+    /// Phase 87: commit the block device's write-back cache to media. Lets a
+    /// ring-3 storage service (vfs_server) request a periodic / on-demand device
+    /// FLUSH so write-back buffered writes become durable on physical media
+    /// without waiting for clean shutdown. (Next free slot — the 0x101x block is
+    /// full; 0x1013 is `NET_SEND`.)
+    pub const BLOCK_FLUSH: u64 = 0x1023;
     /// Phase 55c Track G.3 (resend): transmit a raw Ethernet frame.
     ///
     /// `sys_net_send(sock_fd, buf_ptr, len)` — the caller must own an open
@@ -1583,7 +1589,10 @@ mod syscall_nr {
     // Phase 78c review follow-up: `sys_ipc_peer_is_driver` (0x111B) lets an
     // input server authenticate the caller of its inject path via the reply
     // cap, so only authorized driver processes can forge synthetic input.
-    pub const IPC_LAST: u64 = 0x111B;
+    // Phase 87: `ipc_recv_msg_timeout` (0x111C, dispatch opcode 29) is the
+    // deadline-capable bulk-message receive — `ipc_recv_msg` + a deadline — so a
+    // request server (vfs_server) can wake to flush deferred state when idle.
+    pub const IPC_LAST: u64 = 0x111C;
 
     // -- device host (Phase 55b Track B) --
     //
@@ -2057,6 +2066,7 @@ pub extern "C" fn syscall_handler(
         PUSH_RAW_INPUT => sys_push_raw_input(arg0),
         BLOCK_READ => sys_block_read(arg0, arg1, arg2, per_core_syscall_arg3()),
         BLOCK_WRITE => sys_block_write(arg0, arg1, arg2, per_core_syscall_arg3()),
+        BLOCK_FLUSH => sys_block_flush(),
         NET_SEND => {
             // arg0 = sock_fd, arg1 = buf_ptr, arg2 = len
             //
@@ -4174,6 +4184,11 @@ fn kernel_shutdown() {
         // Holding the lock ensures no concurrent writes while we hold it;
         // the block driver will flush on drop if applicable.
     }
+    // Commit the block device's write-back cache to media. virtio-blk now runs
+    // write-back (VIRTIO_BLK_F_FLUSH) so writes complete fast against the cache;
+    // this explicit FLUSH at the clean-shutdown boundary is what makes a normal
+    // poweroff/restart durable. No-op on a write-through device.
+    crate::blk::flush();
     log::info!("kernel_shutdown: filesystem sync complete.");
 }
 
@@ -12580,6 +12595,35 @@ const BLOCK_WRITE_ALLOWED: &[&str] = &[
 ];
 #[cfg(feature = "hardened")]
 const BLOCK_WRITE_ALLOWED: &[&str] = &["/bin/vfs_server", "/bin/fat_server"];
+
+/// Phase 87: commit the block device's write-back cache to media (`blk::flush`).
+///
+/// Lets the supervised storage service (vfs_server) force a device `FLUSH`
+/// periodically / on demand so write-back buffered writes become durable on
+/// physical media without waiting for clean shutdown — bounding a host
+/// crash / power-loss data-loss window. Gated identically to `sys_block_write`
+/// (euid == `STORAGE_SERVICE_UID` and exec path in `BLOCK_WRITE_ALLOWED`).
+///
+/// Returns 0 when the caller is authorized — regardless of whether the device
+/// flush actually succeeded — or `NEG_EPERM` if the caller is not an authorized
+/// storage service. The flush is best-effort: `blk::flush` logs a warning on
+/// driver error and its result is intentionally NOT surfaced through this
+/// return value, mirroring the shutdown flush. Callers must not treat a 0
+/// return as proof the write-back cache reached media.
+fn sys_block_flush() -> u64 {
+    {
+        let pid = crate::process::current_pid();
+        let table = crate::process::PROCESS_TABLE.lock();
+        let allowed = table.find(pid).is_some_and(|p| {
+            p.euid == STORAGE_SERVICE_UID && BLOCK_WRITE_ALLOWED.iter().any(|a| p.exec_path == *a)
+        });
+        if !allowed {
+            return NEG_EPERM;
+        }
+    }
+    crate::blk::flush();
+    0
+}
 
 /// Write raw disk sectors from a userspace buffer.
 ///

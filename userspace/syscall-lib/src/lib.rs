@@ -446,6 +446,13 @@ pub const SYS_IPC_RECV_TIMEOUT: u64 = 0x111A;
 /// inject path so only the driver TCB can forge synthetic input.
 pub const SYS_IPC_PEER_IS_DRIVER: u64 = 0x111B;
 
+/// Phase 87: `ipc_recv_msg_timeout(ep_cap, msg_ptr, buf_ptr, buf_len,
+/// deadline_ns)`. Like [`ipc_recv_msg`] but with an absolute CLOCK_MONOTONIC-ns
+/// deadline; returns the message label on a wake, or `NEG_ETIMEDOUT` (-110) if
+/// the deadline expires first. Lets a request server wake to flush deferred
+/// state when otherwise idle.
+pub const SYS_IPC_RECV_MSG_TIMEOUT: u64 = 0x111C;
+
 /// Phase 74 Track B: `sys_page_grant_send(pages_vaddr, n_pages)`. Hands
 /// `n_pages` contiguous user-space pages starting at `pages_vaddr` to
 /// the kernel as a `PageGrant`. Returns the new capability handle on
@@ -464,6 +471,11 @@ pub const SYS_BLOCK_READ: u64 = 0x1011;
 
 /// Write raw disk sectors from userspace (Phase 55b Track F.3d-2).
 pub const SYS_BLOCK_WRITE: u64 = 0x1012;
+
+/// Commit the block device's write-back cache to media (Phase 87). Lets a
+/// supervised storage service request a device FLUSH so buffered writes become
+/// durable without waiting for clean shutdown.
+pub const SYS_BLOCK_FLUSH: u64 = 0x1023;
 
 // ===========================================================================
 // IPC wrappers (Phase 52)
@@ -833,6 +845,30 @@ pub fn ipc_recv_msg(ep_cap_handle: u32, msg: &mut IpcMessage, buf: &mut [u8]) ->
     }
 }
 
+/// Like [`ipc_recv_msg`] but with an absolute CLOCK_MONOTONIC-ns `deadline_ns`
+/// (Phase 87). Returns the message label on a wake, or `NEG_ETIMEDOUT`
+/// (`(-110i64) as u64`) if the deadline expires with no message — in which case
+/// `msg`/`buf` are untouched. Lets a request server wake to flush deferred state
+/// when otherwise idle. `deadline_ns` is the position the kernel reads as arg4.
+pub fn ipc_recv_msg_timeout(
+    ep_cap_handle: u32,
+    msg: &mut IpcMessage,
+    buf: &mut [u8],
+    deadline_ns: u64,
+) -> u64 {
+    unsafe {
+        syscall6(
+            SYS_IPC_RECV_MSG_TIMEOUT,
+            ep_cap_handle as u64,
+            msg as *mut IpcMessage as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            deadline_ns,
+            0,
+        )
+    }
+}
+
 /// Reply to a caller and immediately receive the next message with bulk data.
 ///
 /// Combines reply + recv_msg in one syscall.  The reply carries only a
@@ -1167,6 +1203,14 @@ pub fn block_write(start_sector: u64, count: usize, buf: &[u8]) -> i64 {
             0,
         ) as i64
     }
+}
+
+/// Commit the block device's write-back cache to media (Phase 87). Returns 0 on
+/// success or a negative errno (`-1`/`EPERM` if the caller is not an authorized
+/// storage service). Best-effort: the kernel logs a warning on driver error
+/// rather than failing, mirroring the clean-shutdown flush.
+pub fn block_flush() -> i64 {
+    unsafe { syscall0(SYS_BLOCK_FLUSH) as i64 }
 }
 
 /// Push bytes from a userspace buffer into the kernel stdin buffer.

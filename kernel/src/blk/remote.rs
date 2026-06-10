@@ -26,8 +26,9 @@ use kernel_core::driver_ipc::blk_dispatch::{
     BlockDispatchState, GrantIdTracker, RemoteDeviceError, WaitOutcome,
 };
 use kernel_core::driver_ipc::block::{
-    BLK_READ, BLK_REPLY_HEADER_SIZE, BLK_REQUEST_HEADER_SIZE, BLK_WRITE, BlkRequestHeader,
-    BlockDriverError, MAX_SECTORS_PER_REQUEST, decode_blk_reply, encode_blk_request,
+    BLK_FLUSH, BLK_READ, BLK_REPLY_HEADER_SIZE, BLK_REQUEST_HEADER_SIZE, BLK_WRITE,
+    BlkRequestHeader, BlockDriverError, MAX_SECTORS_PER_REQUEST, decode_blk_reply,
+    encode_blk_request,
 };
 
 use crate::ipc::EndpointId;
@@ -394,9 +395,18 @@ fn do_write_ipc(
     let mut bulk = alloc::vec![0u8; BLK_REQUEST_HEADER_SIZE + buf.len()];
     bulk[..BLK_REQUEST_HEADER_SIZE].copy_from_slice(&encoded);
     bulk[BLK_REQUEST_HEADER_SIZE..].copy_from_slice(buf);
+    let bulk_len = bulk.len();
     scheduler::deliver_bulk(task, bulk);
     let mut msg = Message::new(BLK_WRITE as u64);
     msg.data[0] = start_sector;
+    // `data[1]` is the bulk length the driver's `decode_recv_result` truncates
+    // the received request to (same convention as `do_read_ipc` / `flush`).
+    // Without it the write request — header + payload — was truncated to an
+    // empty slice, so the ring-3 driver rejected every write-with-payload as a
+    // malformed frame. Latent since Phase 55b: only the in-kernel virtio-blk
+    // path (which does not use this IPC) and read-only AHCI/NVMe boots masked
+    // it; no gate exercises a payload write over `blk::remote`.
+    msg.data[1] = bulk_len as u64;
     let reply = endpoint::call_msg(task, ep, msg);
     if reply.label == u64::MAX {
         on_ipc_error();
@@ -409,6 +419,45 @@ fn do_write_ipc(
     let bulk_r = scheduler::take_bulk_data(task).ok_or(0xFFu8)?;
     let (reply_hdr, _) =
         decode_blk_reply(bulk_r.get(..BLK_REPLY_HEADER_SIZE).ok_or(0xFFu8)?).map_err(|_| 0xFFu8)?;
+    if reply_hdr.status != BlockDriverError::Ok {
+        return Err(reply_hdr.status.to_byte());
+    }
+    Ok(())
+}
+
+/// Ask the ring-3 driver to commit its volatile write-back cache to media
+/// (`BLK_FLUSH`). Issued at the clean-shutdown boundary so a write-back driver's
+/// buffered writes persist across a poweroff/restart. Best-effort: a driver that
+/// is write-through (or does not implement `BLK_FLUSH`) may reply Ok or an error;
+/// the caller (`blk::flush`) only logs a warning, never blocks shutdown. No
+/// payload, no retry — shutdown is not the place to spin on a restart window.
+pub fn flush() -> Result<(), u8> {
+    let (ep, task) = endpoint_and_task()?;
+    let hdr = BlkRequestHeader {
+        kind: BLK_FLUSH,
+        cmd_id: 0,
+        lba: 0,
+        sector_count: 0,
+        flags: 0,
+    };
+    let encoded = encode_blk_request(hdr, 0u32);
+    scheduler::deliver_bulk(task, alloc::vec::Vec::from(encoded.as_slice()));
+    let mut msg = Message::new(BLK_FLUSH as u64);
+    // `data[0]` is the per-request identifier (0 — flush has no LBA); `data[1]`
+    // is the bulk length the driver's `decode_recv_result` truncates the
+    // received request buffer to (the header-only payload, exactly the
+    // `do_read_ipc` convention above). Putting the length in `data[0]` left
+    // `data[1] = 0`, which truncated the flush request to an empty slice so the
+    // driver rejected it as a malformed frame before the cache flush ran.
+    msg.data[0] = 0;
+    msg.data[1] = BLK_REQUEST_HEADER_SIZE as u64;
+    let reply = endpoint::call_msg(task, ep, msg);
+    if reply.label == u64::MAX {
+        return Err(BlockDriverError::DriverRestarting.to_byte());
+    }
+    let bulk = scheduler::take_bulk_data(task).ok_or(0xFFu8)?;
+    let (reply_hdr, _) =
+        decode_blk_reply(bulk.get(..BLK_REPLY_HEADER_SIZE).ok_or(0xFFu8)?).map_err(|_| 0xFFu8)?;
     if reply_hdr.status != BlockDriverError::Ok {
         return Err(reply_hdr.status.to_byte());
     }
