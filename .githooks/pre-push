@@ -400,6 +400,17 @@ if [ "${M3OS_AHCI_REGRESSION:-0}" = "1" ]; then
         echo "pre-push: cargo xtask ahci-rw-smoke failed" >&2
         exit 1
     fi
+    # `ahci-rw-smoke` proves a write+read-back WITHIN one boot; `ahci-persist-smoke`
+    # proves the write survives a REBOOT: it writes a marker to the AHCI root, idles
+    # past one periodic write-back flush (so deferred ext2 metadata drains + BLK_FLUSH
+    # is issued), tears QEMU down, then re-boots off the SAME disk and re-reads the
+    # marker from a fresh ext2 mount. It also asserts boot 1 logged no
+    # `[blk] remote block flush failed`. No musl needed (echo/cat).
+    echo "pre-push: running cargo xtask ahci-persist-smoke..."
+    if ! cargo xtask ahci-persist-smoke --timeout 300; then
+        echo "pre-push: cargo xtask ahci-persist-smoke failed" >&2
+        exit 1
+    fi
 fi
 
 # Phase 85b — local git regression gate. Gated behind M3OS_GIT_REGRESSION=1

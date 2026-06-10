@@ -692,6 +692,15 @@ fn main() {
                 });
             cmd_ahci_rw_smoke(&smoke_args);
         }
+        Some("ahci-persist-smoke") => {
+            let smoke_args = parse_smoke_boot_args("ahci-persist-smoke", &args[2..])
+                .unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_ahci_persist_smoke(&smoke_args);
+        }
         Some("session-smoke") => {
             let smoke_args =
                 parse_smoke_boot_args("session-smoke", &args[2..]).unwrap_or_else(|err| {
@@ -1095,7 +1104,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -10782,6 +10791,81 @@ fn cmd_ahci_root_smoke(args: &SmokeBootArgs) {
     }
 }
 
+/// Boot + login steps tolerant of the AHCI cold-path boot, which is slower than
+/// the virtio boot that [`boot_and_login_steps`] is tuned for: init's in-kernel
+/// virtio-blk mount fails, then it retries the ext2 root via the ring-3 ahci
+/// driver (cold-path spawn → HBA bring-up → mount over `ahci.block`), and a
+/// second service-launched `ahci_driver` finds the controller already claimed
+/// and exits cleanly. That extra work pushes the login prompt well past the
+/// 25 s+20 s budget the virtio helper allows. These steps anchor on the
+/// `ahci.block` mount marker and use the same generous 90 s login wait that
+/// `ahci-root-smoke` already proves reliable, then do the standard root/root
+/// login and a deterministic `__LOGIN_READY__` shell marker.
+fn ahci_boot_and_login_steps() -> Vec<SmokeStep> {
+    const RETRY_AFTER_PASSWD_MISS: &[SmokeStep] = &[
+        SmokeStep::Wait {
+            pattern: "m3OS login:",
+            timeout_secs: 30,
+            label: "ahci: retry login prompt",
+        },
+        SmokeStep::Sleep { millis: 2000 },
+        SmokeStep::Send {
+            input: "root\n",
+            label: "ahci: retry username after passwd miss",
+        },
+        SmokeStep::Wait {
+            pattern: "Password:",
+            timeout_secs: 20,
+            label: "ahci: password prompt after retry",
+        },
+    ];
+    vec![
+        // Load-bearing slow step: the ext2 root mounts over ahci.block only after
+        // the virtio mount fails and the ring-3 ahci cold path completes.
+        SmokeStep::Wait {
+            pattern: "init: / mounted (ext2 via ring-3 ahci.block)",
+            timeout_secs: 120,
+            label: "ahci: ext2 root mounted over ahci.block",
+        },
+        SmokeStep::Wait {
+            pattern: "m3OS login:",
+            timeout_secs: 90,
+            label: "ahci: login prompt",
+        },
+        SmokeStep::Send {
+            input: "root\n",
+            label: "ahci: username",
+        },
+        SmokeStep::WaitEither {
+            pattern_a: "Password:",
+            pattern_b: "login: cannot read /etc/passwd",
+            timeout_secs: 20,
+            label: "ahci: password prompt or retryable passwd miss",
+            extra_steps_a: &[],
+            extra_steps_b: RETRY_AFTER_PASSWD_MISS,
+        },
+        SmokeStep::Send {
+            input: "root\n",
+            label: "ahci: password",
+        },
+        SmokeStep::Wait {
+            pattern: "[security] credential transition complete",
+            timeout_secs: 60,
+            label: "ahci: credential transition",
+        },
+        SmokeStep::Sleep { millis: 500 },
+        SmokeStep::Send {
+            input: "/bin/echo __LOGIN_READY__\n",
+            label: "ahci: bootstrap shell with deterministic ready marker",
+        },
+        SmokeStep::Wait {
+            pattern: "__LOGIN_READY__",
+            timeout_secs: 30,
+            label: "ahci: login ready marker",
+        },
+    ]
+}
+
 /// Serial steps for `ahci-rw-smoke`: boot the AHCI-root topology, log in, and run
 /// the ext2 write + fresh-process read-back self-test ON the AHCI-served root so
 /// the WRITE path (`blk::remote::write_sectors` → `do_write_ipc` → ring-3
@@ -10796,9 +10880,8 @@ fn cmd_ahci_root_smoke(args: &SmokeBootArgs) {
 /// (`InvalidRequest`) and fails the gate — making this the deterministic guard
 /// for the Phase 87 ring-3 write fixes.
 fn ahci_rw_smoke_steps() -> Vec<SmokeStep> {
-    let mut steps = boot_and_login_steps();
-    // Settle after the credential transition so the shell is attached before
-    // input is delivered (mirrors fork_overlap_steps).
+    let mut steps = ahci_boot_and_login_steps();
+    // Settle after the shell-ready marker before delivering input.
     steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/ext2-coherence-smoke\n",
@@ -10935,6 +11018,202 @@ fn cmd_ahci_rw_smoke(args: &SmokeBootArgs) {
             let _ = child.kill();
             let _ = child.wait();
             eprintln!("ahci-rw-smoke: FAILED\n{msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Boot-1 steps for `ahci-persist-smoke`: write a marker file to the AHCI-served
+/// ext2 root, confirm it wrote+read back in-boot, then idle past one periodic
+/// write-back flush window (`vfs_server`'s `FLUSH_INTERVAL_NS` = 5 s) so deferred
+/// ext2 metadata (inode/directory/indirect blocks + sb/BGD summaries) is drained
+/// to the device and a device `BLK_FLUSH` is issued before this boot is torn
+/// down. Uses `echo`/`cat` (coreutils), so no musl is required.
+fn ahci_persist_write_steps() -> Vec<SmokeStep> {
+    let mut steps = ahci_boot_and_login_steps();
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "echo AHCI_PERSIST_MARKER_OK > /root/persist-marker.txt\n",
+        label: "write marker file to the ext2 root over ahci.block",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 15,
+        label: "shell prompt after marker write",
+    });
+    steps.push(SmokeStep::Send {
+        input: "cat /root/persist-marker.txt\n",
+        label: "read the marker back in boot 1 (confirms the write landed)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "AHCI_PERSIST_MARKER_OK",
+        timeout_secs: 15,
+        label: "boot-1 in-boot read-back of the marker",
+    });
+    // Idle ~8 s: ≥1 periodic write-back flush (5 s) fires, draining deferred ext2
+    // metadata to the device and issuing BLK_FLUSH, so the file is on the virtual
+    // disk before boot 1 is killed.
+    steps.push(SmokeStep::Sleep { millis: 8000 });
+    steps
+}
+
+/// Boot-2 steps for `ahci-persist-smoke`: a FRESH boot off the SAME disk (fresh
+/// kernel, fresh `vfs_server`, fresh ext2 mount + caches). Reading the marker
+/// proves it reached the on-disk ext2 structure in boot 1 and survives a reboot
+/// — i.e. it was not merely served from a within-boot cache.
+fn ahci_persist_verify_steps() -> Vec<SmokeStep> {
+    let mut steps = ahci_boot_and_login_steps();
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "cat /root/persist-marker.txt\n",
+        label: "read the marker after reboot (off the same ahci.block disk)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "AHCI_PERSIST_MARKER_OK",
+        timeout_secs: 30,
+        label: "guest/ahci-persist: marker survived the reboot + fresh ext2 remount",
+    });
+    steps
+}
+
+/// Run the AHCI reboot-persistence smoke: a TWO-boot gate against the SAME ext2
+/// data disk routed to `ich9-ahci`. Boot 1 writes a marker file to the root over
+/// `ahci.block` and idles past one periodic write-back flush so deferred ext2
+/// metadata is drained to the device; QEMU is then torn down. Boot 2 re-attaches
+/// the unchanged disk, mounts ext2 fresh, and re-reads the marker. A pass proves
+/// the write reached the durable on-disk structure (not a within-boot cache) and
+/// the filesystem is remount-consistent after a reboot.
+///
+/// It also asserts the kernel did NOT log `[blk] remote block flush failed`
+/// during boot 1 (captured via `M3OS_SMOKE_SERIAL_DUMP`): the periodic flush
+/// exercises the `BLK_FLUSH` IPC, and a malformed flush request (e.g. a
+/// `decode_blk_request`/`data[1]` regression) makes `remote::flush()` return
+/// `Err` and logs that warning.
+///
+/// Caveat (documented honestly): QEMU's default writeback drive cache keeps
+/// already-written data in the host page cache across a QEMU process restart, so
+/// this gate cannot isolate host-power-loss durability of the device FLUSH — it
+/// proves reboot persistence + on-disk/remount consistency + that BLK_FLUSH does
+/// not error. No musl needed (echo/cat only).
+fn cmd_ahci_persist_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    // Fresh data disk for boot 1 (hermetic: no stale marker from a prior run).
+    let parent = uefi_image.parent().unwrap().to_path_buf();
+    let disk_img = parent.join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(&parent, false, false, false, false, false, false);
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    // Identical QEMU args for both boots: same uefi_image → same disk.img on the
+    // ich9-ahci/ide-hd chain. Boot 2 must NOT recreate the disk.
+    let make_qemu_args = || {
+        let mut a = qemu_args_with_devices(
+            &uefi_image,
+            &ovmf,
+            display_mode,
+            DeviceSet {
+                ahci: true,
+                ..DeviceSet::default()
+            },
+        );
+        for arg in a.iter_mut() {
+            if arg.starts_with("user,id=net0,hostfwd=") {
+                *arg = "user,id=net0".to_string();
+            }
+        }
+        a
+    };
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+
+    // ---- Boot 1: write the marker + drain deferred metadata; capture serial ----
+    let boot1_serial = parent.join("ahci-persist-boot1-serial.log");
+    // SAFETY: the gate is single-threaded here (no QEMU/serial-reader thread has
+    // been spawned yet); the var only tunes run_smoke_script's diagnostic capture
+    // for this process and is removed before boot 2.
+    unsafe {
+        std::env::set_var("M3OS_SMOKE_SERIAL_DUMP", &boot1_serial);
+    }
+
+    println!(
+        "ahci-persist-smoke: boot 1 — writing marker to the ext2 root over ahci.block \
+         (timeout {}s)",
+        args.timeout_secs
+    );
+    let write_steps = ahci_persist_write_steps();
+    let mut child1 = Command::new("qemu-system-x86_64")
+        .args(make_qemu_args())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU (boot 1)");
+    let r1 = run_smoke_script(&mut child1, &write_steps, global_timeout);
+    let _ = child1.kill();
+    let _ = child1.wait();
+    // SAFETY: same single-threaded teardown window as the set above.
+    unsafe {
+        std::env::remove_var("M3OS_SMOKE_SERIAL_DUMP");
+    }
+    if let Err(msg) = r1 {
+        eprintln!("ahci-persist-smoke: FAILED (boot 1 — marker write)\n{msg}");
+        std::process::exit(1);
+    }
+
+    // Flush-path assertion: the periodic write-back flush fired during boot 1's
+    // idle window. A malformed BLK_FLUSH makes remote::flush() return Err and the
+    // kernel logs "[blk] remote block flush failed"; its absence is a positive
+    // signal the BLK_FLUSH IPC round-tripped to the driver's flush arm.
+    let boot1_log = std::fs::read_to_string(&boot1_serial).unwrap_or_default();
+    if boot1_log.contains("remote block flush failed") {
+        eprintln!(
+            "ahci-persist-smoke: FAILED — kernel logged '[blk] remote block flush failed' \
+             during boot 1 (BLK_FLUSH did not reach the ring-3 driver's flush arm)"
+        );
+        std::process::exit(1);
+    }
+
+    // ---- Boot 2: reboot off the SAME disk; verify the marker persisted ----
+    println!(
+        "ahci-persist-smoke: boot 2 — verifying the marker survived the reboot \
+         (same disk, fresh ext2 mount)"
+    );
+    let verify_steps = ahci_persist_verify_steps();
+    let mut child2 = Command::new("qemu-system-x86_64")
+        .args(make_qemu_args())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU (boot 2)");
+    let start = std::time::Instant::now();
+    match run_smoke_script(&mut child2, &verify_steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            let _ = child2.kill();
+            let _ = child2.wait();
+            println!(
+                "ahci-persist-smoke: PASSED — marker written over ahci.block in boot 1 \
+                 survived a reboot + fresh ext2 remount in boot 2 ({elapsed}s), and no \
+                 remote block flush failure was logged"
+            );
+        }
+        Err(msg) => {
+            let _ = child2.kill();
+            let _ = child2.wait();
+            eprintln!(
+                "ahci-persist-smoke: FAILED (boot 2 — marker did not survive the reboot)\n{msg}"
+            );
             std::process::exit(1);
         }
     }

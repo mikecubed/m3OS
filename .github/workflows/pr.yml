@@ -128,6 +128,16 @@ jobs:
         # musl-tools is installed above, so the C self-test is built (no SKIP).
         run: cargo xtask ahci-rw-smoke --timeout 300
 
+      - name: "AHCI reboot persistence (write → reboot → re-read off the same ahci.block disk)"
+        # Phase 87: proves a write to the ring-3 AHCI root SURVIVES a reboot, not
+        # just a within-boot read-back. Two boots against the same ext2 disk:
+        # boot 1 writes a marker + idles past one periodic write-back flush (so
+        # deferred ext2 metadata drains + BLK_FLUSH is issued), then boot 2 mounts
+        # ext2 fresh and re-reads it. Also asserts boot 1 logged no
+        # "[blk] remote block flush failed". Validates on-disk/remount consistency
+        # + the BLK_FLUSH IPC path. echo/cat only — no musl dependency.
+        run: cargo xtask ahci-persist-smoke --timeout 300
+
       - name: "Regression suite (with flake-isolation retry)"
         # `cargo xtask regression` is not test-isolated; suite-level QEMU
         # contention occasionally yields spurious per-test timeouts under TCG.
