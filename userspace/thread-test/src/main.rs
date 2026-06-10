@@ -486,8 +486,18 @@ fn test_exit_group_teardown() -> bool {
     }
 }
 
+// Phase 86f FIX 2: naked _start trampoline.  This binary ignores argv/envp.
+#[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
+    core::arch::naked_asm!(
+        "xor rbp, rbp",
+        "call {f}",
+        f = sym thread_test_main,
+    );
+}
+
+fn thread_test_main() -> ! {
     serial_print("thread-test: starting threading primitive tests\n");
 
     let mut passed = 0u32;

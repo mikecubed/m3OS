@@ -1,6 +1,6 @@
 # Phase 86 - Networking and GitHub (Umbrella)
 
-**Status:** Planned
+**Status:** Done ✅ — all six sub-phases (86a–86f) landed; umbrella aggregate kernel `0.86.5`; learning doc cut at `docs/86-networking-and-github.md` (owned by 86f per the Phase 85 → 85d precedent).
 **Source Ref:** phase-86
 **Depends on:** Phase 37 (I/O Multiplexing) ✅, Phase 40 (Threading) ✅, Phase 42 (Crypto Primitives) ✅, Phase 48 (Security Foundation) ✅, Phase 77 (Pre-1.0 Cleanup — DNS reply delivery D.1 + outbound TCP `connect` D.2) ✅, Phase 85 (Cross-Compiled Toolchains) ✅
 **Builds on:** Extends the post-1.0 local developer platform from Phase 85 (local `git`, Python, Clang installed from `.m3pkg`) into **authenticated outbound networking** — a trustworthy CSPRNG + wall-clock + resolver foundation, then SSH and HTTPS git remotes, the Go runtime, and the GitHub CLI — without dragging any of it back into the release-critical path.

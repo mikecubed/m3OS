@@ -127,7 +127,7 @@ const SIGINFO_SIZE: usize = 128;
 /// Size of the signal mask in the ucontext (128 bytes for musl compat).
 const SIGMASK_SIZE: usize = 128;
 
-/// Total size of the signal frame pushed to user stack.
+/// Total size of the core signal frame (GPR state + masks + siginfo).
 ///
 /// Layout:
 ///   pretcode:       8 bytes
@@ -137,8 +137,20 @@ const SIGMASK_SIZE: usize = 128;
 ///   uc_mcontext:    256 bytes (sigcontext)
 ///   uc_sigmask:     128 bytes
 ///   siginfo:        128 bytes
-///   Total:          560 bytes → aligned to 16 bytes = 560
+///   Total:          560 bytes
+///
+/// The FPU save area (`FPU_AREA_SIZE` bytes) is appended immediately above
+/// this at `frame_rsp + SIGFRAME_SIZE`.  It is written unaligned in memory
+/// (no hardware xsave constraint because we copy bytes, not xsave into it),
+/// and the fpstate pointer in mcontext is set to its user-space address.
 pub const SIGFRAME_SIZE: usize = 8 + 8 + 8 + 24 + SIGCONTEXT_SIZE + SIGMASK_SIZE + SIGINFO_SIZE;
+
+/// Size of the FPU save area appended above the core sigframe.
+/// Must equal `crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE` (832 bytes).
+pub const FPU_AREA_SIZE: usize = crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE; // 832
+
+/// Total size of the extended signal frame including the FPU save area.
+pub const SIGFRAME_EXTENDED_SIZE: usize = SIGFRAME_SIZE + FPU_AREA_SIZE;
 
 // Offsets within the sigframe (from the frame base).
 const OFF_PRETCODE: usize = 0;
@@ -173,8 +185,9 @@ const MC_RSP: usize = 120;
 const MC_RIP: usize = 128;
 const MC_RFLAGS: usize = 136;
 // cs(2) + gs(2) + fs(2) + pad(2) = 8 bytes at offset 144
-// err(8) + trapno(8) + oldmask(8) + cr2(8) + fpstate(8) + reserved(64) = 104
-// Total sigcontext = 144 + 8 + 104 = 256 bytes ✓
+// err(8) at 152, trapno(8) at 160, oldmask(8) at 168, cr2(8) at 176,
+// fpstate(8) at 184, reserved(64) at 192 → total 192+64 = 256 ✓
+const MC_FPSTATE: usize = 184; // pointer to FPU save area, within mcontext
 
 const OFF_SIGMASK: usize = OFF_MCONTEXT + SIGCONTEXT_SIZE; // 48 + 256 = 304
 /// Offset of the `siginfo_t` within the frame. Phase 86d Track C — exposed so
@@ -188,6 +201,16 @@ const USER_ADDR_LIMIT: u64 = 0x0000_8000_0000_0000;
 
 /// Write the signal frame to the user stack and return the new user RSP.
 ///
+/// When `fpu_bytes` is `Some`, the caller must supply exactly
+/// `FPU_AREA_SIZE` bytes (the current task's XSaveArea snapshot).  These
+/// are written to the FPU area appended above the core frame, and the
+/// `fpstate` pointer in `uc_mcontext` is set to the user-space address of
+/// that area so a signal handler (and `sigreturn`) can read/restore it.
+///
+/// When `fpu_bytes` is `None` (kernel task or no current task), the FPU
+/// area is zeroed and `fpstate` is set to 0 — safe for handlers that do
+/// not inspect the mcontext FPU state.
+///
 /// Returns `None` if the computed stack address is invalid (would write into
 /// kernel space), in which case the caller should terminate with SIGSEGV.
 pub fn setup_signal_frame(
@@ -196,16 +219,17 @@ pub fn setup_signal_frame(
     signal_num: u32,
     restorer: u64,
     alt_stack_rsp: Option<u64>,
+    fpu_bytes: Option<&[u8]>,
 ) -> Option<u64> {
     // Start from the alt stack if provided, else from the interrupted user RSP.
     let base_rsp = alt_stack_rsp.unwrap_or(regs.rsp);
 
-    // Compute aligned frame position.
-    // Subtract frame size, then align down to 16 bytes, then subtract 8
-    // for the call-convention "return address slot" alignment (the CPU
-    // expects RSP % 16 == 8 at a CALL instruction, so RSP % 16 == 0
-    // at function entry after the CALL pushes the return address).
-    let frame_rsp = base_rsp.checked_sub(SIGFRAME_SIZE as u64)? & !15u64;
+    // Compute aligned frame position.  We allocate the extended frame
+    // (core + FPU area) as one contiguous region.  Subtract the extended
+    // size, align down to 16 bytes, then subtract 8 so that the handler
+    // sees RSP % 16 == 8 (the call-convention alignment: after the handler
+    // executes `call`, RSP % 16 == 0).
+    let frame_rsp = base_rsp.checked_sub(SIGFRAME_EXTENDED_SIZE as u64)? & !15u64;
     let frame_rsp = frame_rsp.checked_sub(8)?;
 
     // Validate: frame must be in user space.
@@ -213,7 +237,8 @@ pub fn setup_signal_frame(
         return None;
     }
 
-    // Zero-fill the frame, then write fields.
+    // Zero-fill the core part of the frame.  The FPU area (if any) is
+    // written separately below.
     let frame_buf = [0u8; SIGFRAME_SIZE];
     if UserSliceWo::new(frame_rsp, frame_buf.len())
         .and_then(|s| s.copy_from_kernel(&frame_buf))
@@ -262,6 +287,40 @@ pub fn setup_signal_frame(
         return None;
     }
 
+    // Phase 86f Track B.1 — write the FPU save area and point fpstate at it.
+    // The FPU area starts at frame_rsp + SIGFRAME_SIZE (immediately after the
+    // core frame bytes).  We copy into it rather than xsaving directly, so
+    // hardware alignment constraints on xsave64 do not apply here.
+    let fpu_area_ptr = frame_rsp + SIGFRAME_SIZE as u64;
+    match fpu_bytes {
+        Some(bytes) if bytes.len() == FPU_AREA_SIZE => {
+            if UserSliceWo::new(fpu_area_ptr, bytes.len())
+                .and_then(|s| s.copy_from_kernel(bytes))
+                .is_err()
+            {
+                return None;
+            }
+            // Write the fpstate pointer into mcontext so the kernel's own
+            // sigreturn path (and any SA_SIGINFO handler that inspects it)
+            // finds the FPU bytes.
+            if !write_u64(mc + MC_FPSTATE, fpu_area_ptr) {
+                return None;
+            }
+        }
+        _ => {
+            // No FPU bytes (kernel task) — zero the FPU area and leave
+            // fpstate = 0 (already zeroed from the frame_buf above).
+            // Zero FPU area.
+            let zero_fpu = [0u8; FPU_AREA_SIZE];
+            if UserSliceWo::new(fpu_area_ptr, zero_fpu.len())
+                .and_then(|s| s.copy_from_kernel(&zero_fpu))
+                .is_err()
+            {
+                return None;
+            }
+        }
+    }
+
     // uc_sigmask — save the current blocked_signals mask so sigreturn
     // can restore it.
     if !write_u64(OFF_SIGMASK, blocked_signals) {
@@ -274,24 +333,36 @@ pub fn setup_signal_frame(
     }
 
     log::debug!(
-        "[signal] sigframe at {:#x}, sig={}, handler ret→{:#x}, rip={:#x}",
+        "[signal] sigframe at {:#x}, sig={}, handler ret→{:#x}, rip={:#x}, fpu={}",
         frame_rsp,
         signal_num,
         restorer,
         regs.rip,
+        if fpu_bytes.is_some() {
+            "saved"
+        } else {
+            "zeroed"
+        },
     );
 
     Some(frame_rsp)
 }
 
-/// Restore saved registers and signal mask from a sigframe on the user stack.
+/// Restore saved registers, signal mask, and FPU bytes from a sigframe on the
+/// user stack.
 ///
 /// `user_rsp` is the user RSP at the time of the `sigreturn` syscall
 /// (i.e., after the handler's `ret` popped pretcode).
 ///
-/// Returns the restored register state and saved signal mask,
-/// or `None` if the sigframe pointer is invalid.
-pub fn restore_sigframe(user_rsp: u64) -> Option<(SavedUserRegs, u64)> {
+/// Returns `(regs, saved_mask, fpu_bytes)`.  `fpu_bytes` is `Some` when the
+/// frame contains a valid FPU save area (fpstate != 0 and within the frame);
+/// it is `None` for frames written before Phase 86f (fpstate == 0) or kernel-
+/// task frames — the caller must treat a `None` as "leave hardware FPU as-is".
+///
+/// Returns `None` if the sigframe pointer is invalid.
+pub fn restore_sigframe(
+    user_rsp: u64,
+) -> Option<(SavedUserRegs, u64, Option<[u8; FPU_AREA_SIZE]>)> {
     // The frame starts 8 bytes before the current RSP (the `ret` from
     // the handler popped pretcode, advancing RSP by 8).
     let frame_rsp = user_rsp.wrapping_sub(8);
@@ -333,10 +404,32 @@ pub fn restore_sigframe(user_rsp: u64) -> Option<(SavedUserRegs, u64)> {
 
     let saved_mask = read_u64(OFF_SIGMASK)?;
 
+    // Phase 86f Track B.1 — read back the FPU area if fpstate is set.
+    // We only trust a pointer that is exactly at frame_rsp + SIGFRAME_SIZE
+    // (the fixed offset written by setup_signal_frame).  Any other value is
+    // treated as absent — either a pre-86f frame (fpstate == 0) or a
+    // tampered frame; in both cases we leave the hardware FPU untouched.
+    let expected_fpu_ptr = frame_rsp + SIGFRAME_SIZE as u64;
+    let fpstate_ptr = read_u64(mc + MC_FPSTATE).unwrap_or(0);
+    let fpu_bytes: Option<[u8; FPU_AREA_SIZE]> = if fpstate_ptr == expected_fpu_ptr {
+        let mut buf = [0u8; FPU_AREA_SIZE];
+        if UserSliceRo::new(fpstate_ptr, buf.len())
+            .and_then(|s| s.copy_to_kernel(&mut buf))
+            .is_ok()
+        {
+            Some(buf)
+        } else {
+            None
+        }
+    } else {
+        // fpstate == 0 (pre-86f frame) or tampered — skip FPU restore.
+        None
+    };
+
     // Note: rflags sanitization (clearing IOPL, NT, VM, etc.) is done
     // by restore_and_enter_userspace in syscall.rs before the iretq.
 
-    Some((regs, saved_mask))
+    Some((regs, saved_mask, fpu_bytes))
 }
 
 /// Write the `uc_stack` (stack_t) into a sigframe at the given frame_rsp.

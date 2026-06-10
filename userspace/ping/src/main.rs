@@ -14,8 +14,18 @@ use syscall_lib::{
 const DEFAULT_TARGET: [u8; 4] = [10, 0, 2, 2];
 const PING_COUNT: u16 = 4;
 
+// Phase 86f FIX 2: naked _start trampoline.  This binary ignores argv/envp.
+#[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
+    core::arch::naked_asm!(
+        "xor rbp, rbp",
+        "call {f}",
+        f = sym ping_main,
+    );
+}
+
+fn ping_main() -> ! {
     let target = DEFAULT_TARGET;
 
     // Print header

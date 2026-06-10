@@ -2788,6 +2788,132 @@ pub fn reset_current_task_fpu_state() {
     }
 }
 
+/// Phase 86f Track B.1 — save the current task's live hardware FPU state into
+/// its `XSaveArea` and then call `f` with the raw bytes.
+///
+/// Signal delivery runs on the syscall-return path while the task is still ON
+/// CPU: the FPU registers hold the **live** userspace state, which has not yet
+/// been xsaved to the task's `XSaveArea` (that save happens during context
+/// switch, not on syscall entry). This helper captures the live state before
+/// the kernel builds the signal frame, so the frame's FPU snapshot is current.
+///
+/// Returns `None` if there is no current task (kernel task context).
+pub fn with_current_task_fpu_saved<R>(f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+    let idx = get_current_task_idx()?;
+    let mut sched = scheduler_lock();
+    if let Some(area) = sched.fpu_states.get_mut(idx) {
+        // Save live hardware FPU state into the task's XSaveArea so it is
+        // current for the signal-frame copy.  The xsave instruction writes the
+        // architectural state components enabled by XCR0 (x87 + SSE + AVX on
+        // m3OS today); we pass the same component mask used during context
+        // switch.  This is safe to call from the syscall-return path because:
+        //   a) the IRQ-safe scheduler lock is held across the xsave and the
+        //      subsequent byte copy, preventing a concurrent context switch from
+        //      racing with the snapshot;
+        //   b) `save_fpu_state` is inlined and does no allocation or IPC.
+        unsafe { save_fpu_state(area.as_mut()) };
+        let bytes = area.as_ref().as_bytes();
+        Some(f(bytes))
+    } else {
+        None
+    }
+}
+
+/// Phase 86f Track B.1 — sanitize the 64-byte XSAVE header in a user-supplied
+/// buffer before passing it to `xrstor64`.
+///
+/// A malformed XSAVE header makes `xrstor64` raise #GP in ring 0 — an
+/// unprivileged kernel DoS.  We apply three corrections:
+///
+/// * `XSTATE_BV` (offset 512, 8 bytes): mask to `XSAVE_FEATURE_MASK` (0x7) so
+///   only x87 + SSE + AVX bits survive.
+/// * `XCOMP_BV` (offset 520, 8 bytes): force to 0 — m3OS uses the standard
+///   (non-compacted) `xrstor64` format; bit 63 set would trigger compacted mode
+///   and raise #GP.
+/// * Reserved header bytes (offsets 528–575, 48 bytes): zero unconditionally.
+/// * `MXCSR` (offset 24, 4 bytes): mask against the fixed constant `SAFE_MXCSR_MASK`
+///   (0xFFBF — all bits valid except bit 6, which is architecturally reserved
+///   on all x86_64 hardware) to prevent #GP from reserved bits.  The buffer's
+///   own MXCSR_MASK field (offset 28) is **ignored as a mask source** because
+///   the buffer is user-controlled; trusting it with an attacker-supplied
+///   0xFFFFFFFF would let reserved bits survive and cause `xrstor64` #GP in
+///   ring 0.  We also write the canonical mask value back to offset 28 for
+///   internal consistency.
+///   `xrstor64` with XSTATE_BV bit 1 will load MXCSR; bad reserved bits fault.
+///
+/// The `buf` slice must be exactly `XSAVE_AREA_SIZE` bytes; a shorter slice is
+/// a caller bug and is silently returned unchanged (the subsequent size check in
+/// `restore_current_task_fpu_from_bytes` will reject it).
+pub fn sanitize_xsave_header(buf: &mut [u8]) {
+    use crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE;
+    use crate::arch::x86_64::cpuid::XSAVE_FEATURE_MASK;
+
+    if buf.len() != XSAVE_AREA_SIZE {
+        return;
+    }
+
+    // MXCSR (offset 24): mask against the architecturally-safe constant.
+    // We intentionally ignore buf[28..32] (the buffer's own MXCSR_MASK field)
+    // because the buffer is user-controlled: an attacker could set MXCSR_MASK
+    // to 0xFFFFFFFF so that reserved bits survive the mask, causing xrstor64
+    // to #GP in ring 0 (DoS via controlled sigframe fpstate).
+    // SAFE_MXCSR_MASK = 0xFFBF: bit 6 is the sole architecturally-reserved bit
+    // on all x86_64; all other bits are valid control/status bits per Intel SDM.
+    const SAFE_MXCSR_MASK: u32 = 0xFFBF;
+    let mxcsr = u32::from_le_bytes(buf[24..28].try_into().unwrap());
+    buf[24..28].copy_from_slice(&(mxcsr & SAFE_MXCSR_MASK).to_le_bytes());
+    // Overwrite MXCSR_MASK (offset 28) with the canonical value so that any
+    // consumer of this field also sees a safe mask rather than attacker data.
+    buf[28..32].copy_from_slice(&SAFE_MXCSR_MASK.to_le_bytes());
+
+    // XSTATE_BV (offset 512): keep only bits within XSAVE_FEATURE_MASK.
+    let xstate_bv = u64::from_le_bytes(buf[512..520].try_into().unwrap());
+    buf[512..520].copy_from_slice(&(xstate_bv & XSAVE_FEATURE_MASK).to_le_bytes());
+
+    // XCOMP_BV (offset 520): force to 0 (standard xrstor format, not compacted).
+    buf[520..528].fill(0);
+
+    // Reserved header bytes (offsets 528–575): zero.
+    buf[528..576].fill(0);
+}
+
+/// Phase 86f Track B.1 — copy FPU bytes from a signal frame back into the
+/// current task's `XSaveArea` and restore them to hardware.
+///
+/// Called from `sys_sigreturn` after the frame's fpstate bytes have been
+/// validated.  The restore step re-arms the hardware FPU so the task returns
+/// to ring 3 with the pre-signal vector register state.
+///
+/// `bytes` must be exactly `XSAVE_AREA_SIZE` bytes; if it is not (caller bug),
+/// the restore is skipped and the existing (signal-handler) FPU state is left
+/// in hardware — incorrect but not a safety violation.
+pub fn restore_current_task_fpu_from_bytes(bytes: &[u8]) {
+    use crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE;
+    if bytes.len() != XSAVE_AREA_SIZE {
+        log::warn!(
+            "[signal] restore_current_task_fpu_from_bytes: wrong size {} (expected {})",
+            bytes.len(),
+            XSAVE_AREA_SIZE,
+        );
+        return;
+    }
+    if let Some(idx) = get_current_task_idx() {
+        let mut sched = scheduler_lock();
+        if let Some(area) = sched.fpu_states.get_mut(idx) {
+            area.copy_from_bytes(bytes);
+            // Sanitize the header before xrstor64: bad XCOMP_BV / XSTATE_BV /
+            // reserved bits / MXCSR reserved bits all cause #GP in ring 0.
+            {
+                let raw = area.as_bytes_mut();
+                sanitize_xsave_header(raw);
+            }
+            // Restore from the XSaveArea to hardware so the task resumes with
+            // the pre-signal vector register values.
+            unsafe { restore_fpu_state(area.as_ref()) };
+        }
+    }
+}
+
 pub fn take_current_task_fork_ctx() -> Option<crate::process::ForkChildCtx> {
     let idx = get_current_task_idx()?;
     let mut sched = scheduler_lock();

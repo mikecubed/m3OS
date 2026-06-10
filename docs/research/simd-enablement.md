@@ -1,8 +1,8 @@
 # Enabling SIMD (SSE/AVX) for Userspace — Feasibility Findings
 
-**Status:** Findings (captured 2026-05-29, branch `feat/phase-77-pre-1-0-cleanup`)
+**Status:** Landed — Phase 86f (Userspace SIMD / AES-NI Capstone, kernel `0.86.5`). Findings captured 2026-05-29; all open questions resolved in 86f (single userspace target shipped; soft-float-ABI audit passed re-validation; `cpufeatures` runtime AES-NI confirmed). See [Phase 86f design doc](../roadmap/86f-userspace-simd.md) and the [Phase 86 learning doc](../86-networking-and-github.md) for the full implementation record.
 **Scope:** What it would take to let userspace use SSE/AVX (incl. hardware AES-NI), given the current SIMD-disabled build.
-**Relevant phases:** informs Phase 86 (Networking and GitHub — crypto throughput) and any future "userspace SIMD" perf track.
+**Relevant phases:** Phase 86f (landed); informed by Phase 86 (Networking and GitHub) crypto throughput need.
 
 ---
 

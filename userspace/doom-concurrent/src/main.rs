@@ -95,8 +95,18 @@ fn fork_doom(map_arg: &[u8]) -> isize {
     pid
 }
 
+// Phase 86f FIX 2: naked _start trampoline.  This binary ignores argv/envp.
+#[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
+    core::arch::naked_asm!(
+        "xor rbp, rbp",
+        "call {f}",
+        f = sym doom_concurrent_main,
+    );
+}
+
+fn doom_concurrent_main() -> ! {
     // Fork DOOM #1 first. Parent continues immediately to fork #2 —
     // both DOOMs are running concurrently before the first waitpid.
     let pid1 = fork_doom(DOOM1_ARG_M1);

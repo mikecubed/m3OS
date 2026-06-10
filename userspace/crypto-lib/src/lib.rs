@@ -6,6 +6,10 @@
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
+// Host tests run under std (x86_64-unknown-linux-gnu) — pull in `std` so that
+// `#[test]` modules can use `std::time::Instant`, `vec!`, and `println!`.
+#[cfg(test)]
+extern crate std;
 
 pub mod asymmetric;
 pub mod hash;

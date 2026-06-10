@@ -3,6 +3,12 @@ name = "crypto-lib"
 version = "0.1.0"
 edition = "2024"
 
+# Allow the `aes_force_soft` rustc cfg used by the host-side A/B bench
+# (passed as RUSTFLAGS='--cfg aes_force_soft' to force the fixsliced software
+# AES backend for the soft-path throughput measurement).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aes_force_soft)'] }
+
 [features]
 default = []
 alloc = []

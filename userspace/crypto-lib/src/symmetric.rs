@@ -228,6 +228,8 @@ mod kw {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(test)]
+    use std::{println, vec};
 
     #[test]
     fn test_chacha20poly1305_roundtrip() {
@@ -415,5 +417,160 @@ mod tests {
         let mut pt = [0u8; 16];
         aes256_ctr_decrypt(&key, &nonce, &ct, &mut pt).unwrap();
         assert_eq!(pt, plaintext);
+    }
+
+    /// NIST SP 800-38A F.5.5: CTR-AES256.Encrypt — all four blocks.
+    ///
+    /// This is a stronger conformance test than the single-block variant above:
+    /// it exercises the counter increment path (blocks 2-4) and is the primary
+    /// AES-NI correctness anchor.  Hardware AES-NI and the fixsliced software
+    /// backend must produce identical ciphertext for these published vectors.
+    #[test]
+    fn test_aes256_ctr_nist_sp800_38a_f55_all_blocks() {
+        // NIST SP 800-38A §F.5.5 key and initial counter block.
+        let key: [u8; 32] = [
+            0x60, 0x3d, 0xeb, 0x10, 0x15, 0xca, 0x71, 0xbe, 0x2b, 0x73, 0xae, 0xf0, 0x85, 0x7d,
+            0x77, 0x81, 0x1f, 0x35, 0x2c, 0x07, 0x3b, 0x61, 0x08, 0xd7, 0x2d, 0x98, 0x10, 0xa3,
+            0x09, 0x14, 0xdf, 0xf4,
+        ];
+        let nonce: [u8; 16] = [
+            0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd,
+            0xfe, 0xff,
+        ];
+        // Four consecutive plaintext blocks (64 bytes total).
+        let plaintext: [u8; 64] = [
+            // Block 1
+            0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96, 0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93,
+            0x17, 0x2a, // Block 2
+            0xae, 0x2d, 0x8a, 0x57, 0x1e, 0x03, 0xac, 0x9c, 0x9e, 0xb7, 0x6f, 0xac, 0x45, 0xaf,
+            0x8e, 0x51, // Block 3
+            0x30, 0xc8, 0x1c, 0x46, 0xa3, 0x5c, 0xe4, 0x11, 0xe5, 0xfb, 0xc1, 0x19, 0x1a, 0x0a,
+            0x52, 0xef, // Block 4
+            0xf6, 0x9f, 0x24, 0x45, 0xdf, 0x4f, 0x9b, 0x17, 0xad, 0x2b, 0x41, 0x7b, 0xe6, 0x6c,
+            0x37, 0x10,
+        ];
+        // Expected ciphertext from NIST SP 800-38A §F.5.5.
+        let expected_ct: [u8; 64] = [
+            // Block 1
+            0x60, 0x1e, 0xc3, 0x13, 0x77, 0x57, 0x89, 0xa5, 0xb7, 0xa7, 0xf5, 0x04, 0xbb, 0xf3,
+            0xd2, 0x28, // Block 2
+            0xf4, 0x43, 0xe3, 0xca, 0x4d, 0x62, 0xb5, 0x9a, 0xca, 0x84, 0xe9, 0x90, 0xca, 0xca,
+            0xf5, 0xc5, // Block 3
+            0x2b, 0x09, 0x30, 0xda, 0xa2, 0x3d, 0xe9, 0x4c, 0xe8, 0x70, 0x17, 0xba, 0x2d, 0x84,
+            0x98, 0x8d, // Block 4
+            0xdf, 0xc9, 0xc5, 0x8d, 0xb6, 0x7a, 0xad, 0xa6, 0x13, 0xc2, 0xdd, 0x08, 0x45, 0x79,
+            0x41, 0xa6,
+        ];
+
+        let mut ct = [0u8; 64];
+        aes256_ctr_encrypt(&key, &nonce, &plaintext, &mut ct).unwrap();
+        assert_eq!(
+            ct, expected_ct,
+            "CTR-AES256 4-block ciphertext mismatch (AES-NI vs expected NIST vector)"
+        );
+
+        // Decrypt must recover the original plaintext.
+        let mut pt = [0u8; 64];
+        aes256_ctr_decrypt(&key, &nonce, &ct, &mut pt).unwrap();
+        assert_eq!(pt, plaintext, "CTR-AES256 decrypt round-trip failed");
+    }
+
+    // ── Host-side A/B microbenchmark (AES-CTR hardware vs. forced-soft) ────────
+    //
+    // Run the hardware benchmark:
+    //   cargo test -p crypto-lib --target x86_64-unknown-linux-gnu \
+    //     --features alloc --release -- bench_aes_ctr --nocapture
+    //
+    // Run the forced-software benchmark (aes_force_soft cfg forces fixsliced soft):
+    //   RUSTFLAGS='--cfg aes_force_soft' \
+    //   cargo test -p crypto-lib --target x86_64-unknown-linux-gnu \
+    //     --features alloc --release -- bench_aes_ctr --nocapture
+    //
+    // The ratio (hardware / soft) must be ≥ 2× on any x86_64 host with AES-NI.
+    // Under QEMU/TCG (no KVM) AES-NI is emulated and the ratio may be < 2×
+    // — the host A/B run is the authoritative comparison.
+    #[test]
+    fn bench_aes_ctr() {
+        use std::time::Instant;
+
+        const PAYLOAD_BYTES: usize = 1024 * 1024; // 1 MiB per iteration
+        const ITERATIONS: usize = 32; // 32 MiB total per run
+
+        let key = [0x60u8; 32];
+        let nonce = [0xf0u8; 16];
+
+        // Allocate a reusable heap buffer so we don't measure allocation.
+        let plaintext = vec![0x5au8; PAYLOAD_BYTES];
+        let mut ct = vec![0u8; PAYLOAD_BYTES];
+
+        // Warm-up: one full pass to prime caches and AES-NI cpufeatures detection.
+        aes256_ctr_encrypt(&key, &nonce, &plaintext, &mut ct).unwrap();
+
+        let start = Instant::now();
+        for _ in 0..ITERATIONS {
+            aes256_ctr_encrypt(&key, &nonce, &plaintext, &mut ct).unwrap();
+        }
+        let elapsed = start.elapsed();
+
+        let total_mib = (PAYLOAD_BYTES * ITERATIONS) as f64 / (1024.0 * 1024.0);
+        let mib_per_sec = total_mib / elapsed.as_secs_f64();
+
+        #[cfg(aes_force_soft)]
+        let backend = "soft";
+        #[cfg(not(aes_force_soft))]
+        let backend = "hw";
+
+        println!(
+            "BENCH:aes-ctr-{backend}: {:.1} MiB/s  ({total_mib:.0} MiB in {:.3}s)",
+            mib_per_sec,
+            elapsed.as_secs_f64()
+        );
+
+        // Sanity: output must differ from input (cipher actually ran).
+        assert_ne!(&ct[..32], &plaintext[..32], "AES-CTR produced no-op output");
+    }
+
+    /// ChaCha20-Poly1305 throughput reference (no A/B — ChaCha is always
+    /// software; printed alongside AES-CTR for comparison).
+    #[test]
+    fn bench_chacha20poly1305() {
+        use std::time::Instant;
+
+        const PAYLOAD_BYTES: usize = 1024 * 1024; // 1 MiB per iteration
+        const ITERATIONS: usize = 32;
+
+        let key = [0x42u8; 32];
+        let nonce = [0x01u8; 12];
+        let aad = b"";
+
+        let plaintext = vec![0x5au8; PAYLOAD_BYTES];
+        let mut ct = vec![0u8; PAYLOAD_BYTES + 16];
+
+        // Warm-up.
+        chacha20poly1305_seal(&key, &nonce, &plaintext, aad, &mut ct).unwrap();
+
+        let start = Instant::now();
+        for _ in 0..ITERATIONS {
+            chacha20poly1305_seal(&key, &nonce, &plaintext, aad, &mut ct).unwrap();
+        }
+        let elapsed = start.elapsed();
+
+        let total_mib = (PAYLOAD_BYTES * ITERATIONS) as f64 / (1024.0 * 1024.0);
+        let mib_per_sec = total_mib / elapsed.as_secs_f64();
+
+        println!(
+            "BENCH:chacha20poly1305: {:.1} MiB/s  ({total_mib:.0} MiB in {:.3}s)",
+            mib_per_sec,
+            elapsed.as_secs_f64()
+        );
+
+        // Sanity: output is valid ciphertext+tag (decrypt succeeds).
+        let ct_len = PAYLOAD_BYTES + 16;
+        let mut pt_out = vec![0u8; PAYLOAD_BYTES];
+        chacha20poly1305_open(&key, &nonce, &ct[..ct_len], aad, &mut pt_out).unwrap();
+        assert_eq!(
+            pt_out, plaintext,
+            "ChaCha20-Poly1305 bench round-trip failed"
+        );
     }
 }

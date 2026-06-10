@@ -2448,7 +2448,9 @@ fn deliver_user_signal(
     let regs = unsafe { crate::signal::read_saved_user_regs(syscall_result) };
 
     // 2. Read and update the process's blocked_signals; check alt stack.
-    let (old_blocked, alt_stack_rsp) = {
+    // `alt_stack_region` carries (base, size) when the alt stack is active so
+    // we can bounds-check that the extended signal frame fits before writing it.
+    let (old_blocked, alt_stack_rsp, alt_stack_region) = {
         let mut table = crate::process::PROCESS_TABLE.lock();
         let proc = match table.find_mut(pid) {
             Some(p) => p,
@@ -2475,16 +2477,71 @@ fn deliver_user_signal(
         } else {
             None
         };
-        (old, alt_rsp)
+        let region = alt_rsp.map(|_| (proc.alt_stack_base, proc.alt_stack_size));
+        (old, alt_rsp, region)
     };
 
-    // 3. Build the sigframe on the user stack (or alt stack).
+    // Bounds-check the extended frame against the alt-stack region: the frame
+    // must fit entirely within [base, base+size).  If it does not, fail closed
+    // (fall through to the SIGSEGV kill path) rather than writing below the
+    // alt-stack region.
+    if let Some((base, size)) = alt_stack_region
+        && let Some(top) = alt_stack_rsp
+    {
+        // The frame occupies [frame_rsp, top) — compute frame_rsp exactly
+        // the same way setup_signal_frame does so the bound check is tight:
+        //   frame_rsp = (top - SIGFRAME_EXTENDED_SIZE) & !15 - 8
+        // Use saturating arithmetic throughout; if top is too small the
+        // saturating_sub will produce 0 and the frame_rsp_est < base check
+        // will correctly reject it.
+        let frame_size = crate::signal::SIGFRAME_EXTENDED_SIZE as u64;
+        // Phase 86f rev3 FIX 4: use the same aligned formula as setup_signal_frame.
+        // The old estimate (top - frame_size - 8) under-estimated by up to 15
+        // bytes vs the real (top - frame_size) & !15 - 8, allowing a frame that
+        // barely overflows the alt-stack base to pass the guard.
+        let frame_rsp_est = (top.saturating_sub(frame_size) & !15u64).saturating_sub(8);
+        if frame_rsp_est < base {
+            log::warn!(
+                "[p{}] signal {}: extended frame ({} bytes) overflows alt stack \
+                 [base={:#x}, size={}]; killing with SIGSEGV",
+                pid,
+                signum,
+                frame_size,
+                base,
+                size,
+            );
+            sys_exit(-11); // SIGSEGV
+        }
+    }
+
+    // 3. Save the current task's live hardware FPU state so it can be
+    //    embedded in the signal frame.  Signal delivery runs on the
+    //    syscall-return path while the task is still ON CPU: the FPU
+    //    registers hold the interrupted userspace state, which was NOT
+    //    yet xsaved by the scheduler (that save only happens during a
+    //    context switch).  We explicitly xsave here so the frame carries
+    //    a bit-exact snapshot of the pre-signal vector register file.
+    //
+    //    `with_current_task_fpu_saved` holds the scheduler lock while
+    //    copying the bytes; the lock is released before the frame write.
+    // Phase 86f Track B.1 — FPU save-on-delivery.
+    use crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE;
+    let fpu_snapshot: Option<[u8; XSAVE_AREA_SIZE]> =
+        crate::task::scheduler::with_current_task_fpu_saved(|bytes| {
+            let mut arr = [0u8; XSAVE_AREA_SIZE];
+            arr.copy_from_slice(bytes);
+            arr
+        });
+
+    // 4. Build the sigframe on the user stack (or alt stack).
+    let fpu_bytes_ref: Option<&[u8]> = fpu_snapshot.as_ref().map(|a| a.as_slice());
     let frame_rsp = match crate::signal::setup_signal_frame(
         &regs,
         old_blocked,
         signum,
         restorer,
         alt_stack_rsp,
+        fpu_bytes_ref,
     ) {
         Some(rsp) => rsp,
         None => {
@@ -3220,8 +3277,8 @@ pub(super) fn sys_tkill(tid: u64, sig: u64) -> u64 {
 pub(super) fn sys_sigreturn(user_rsp: u64) -> ! {
     let pid = crate::process::current_pid();
 
-    // Restore registers and signal mask from the sigframe.
-    let (regs, saved_mask) = match crate::signal::restore_sigframe(user_rsp) {
+    // Restore registers, signal mask, and FPU state from the sigframe.
+    let (regs, saved_mask, fpu_bytes) = match crate::signal::restore_sigframe(user_rsp) {
         Some(r) => r,
         None => {
             log::warn!(
@@ -3232,6 +3289,16 @@ pub(super) fn sys_sigreturn(user_rsp: u64) -> ! {
             sys_exit(-11); // SIGSEGV
         }
     };
+
+    // Phase 86f Track B.1 — restore pre-signal FPU state to hardware.
+    // This must happen before we return to ring 3 via iretq so that the
+    // interrupted context resumes with the correct XMM/YMM register values.
+    // If fpu_bytes is None (pre-86f frame or kernel task), we leave the
+    // hardware FPU untouched — the handler's FPU state persists, which is
+    // wrong but acceptable as a safe degraded path for old frames.
+    if let Some(ref bytes) = fpu_bytes {
+        crate::task::scheduler::restore_current_task_fpu_from_bytes(bytes.as_slice());
+    }
 
     // Restore the signal mask and clear SS_ONSTACK based on kernel state
     // (not user-provided uc_stack flags, which userspace could corrupt).
