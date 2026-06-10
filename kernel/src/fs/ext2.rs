@@ -234,7 +234,36 @@ impl Ext2Volume {
             .map_err(|_| Ext2Error::IoError)
     }
 
-    /// Drop the entire read-through block cache (Phase 93).
+    /// Phase 87 Track B.1 — read `count` physically-contiguous WHOLE blocks
+    /// starting at physical block `start_block` directly into `dst`, in ONE
+    /// `blk::read_sectors` round-trip. `dst.len()` must equal
+    /// `count * block_size`. This is the coalesced bulk path: the blocks are
+    /// physically contiguous so their LBAs are contiguous, so a single
+    /// multi-block device request fills `dst` in logical order — collapsing the
+    /// per-block round-trips that dominate large sequential reads.
+    ///
+    /// Cache-bypassing on purpose: a multi-MiB sequential read (a `pkg install`
+    /// payload, a cold binary load) would otherwise thrash the bounded
+    /// `BLOCK_CACHE_MAX` cache; and the block cache is a clean read-through copy
+    /// of disk (`write_block` invalidates then writes through, and out-of-band
+    /// `vfs_server` writes call `invalidate_block_cache`), so reading straight
+    /// from disk always returns current data. Head/tail partial blocks still go
+    /// through the cache-aware `read_block_into_slice`.
+    fn read_run_into_slice(
+        &self,
+        start_block: u32,
+        count: u32,
+        dst: &mut [u8],
+    ) -> Result<(), Ext2Error> {
+        crate::blk::read_sectors(
+            self.block_to_lba(start_block),
+            count as usize * self.sectors_per_block as usize,
+            dst,
+        )
+        .map_err(|_| Ext2Error::IoError)
+    }
+
+    /// Drop the entire read-through block cache (Phase 88).
     ///
     /// When `vfs_server` is the ext2 write authority, mutations land on disk
     /// out-of-band from this engine's cache. The kernel still reads ext2
@@ -374,49 +403,40 @@ impl Ext2Volume {
 
     /// Read file data from an inode starting at `offset` into `buf`.
     /// Returns the number of bytes actually read.
+    ///
+    /// Phase 87 Track B.1 — coalesces runs of physically-contiguous whole blocks
+    /// into single multi-block `blk::read_sectors` calls (see
+    /// `kernel_core::fs::ext2::read_file_data_coalesced`), collapsing the
+    /// per-block kernel↔driver round-trips that dominate large sequential reads
+    /// (a 21 MiB package read drops from ~5,376 requests to a small multiple of
+    /// its contiguous-run count). Byte-for-byte identical to the prior per-block
+    /// loop (host-verified). Whole-block runs read straight into `buf`
+    /// (cache-bypassing); the unaligned head / short tail keep the cache-aware
+    /// `read_block_into_slice` path; sparse holes are zero-filled with no request.
     pub fn read_file_data(
         &self,
         inode: &Ext2Inode,
         offset: u64,
         buf: &mut [u8],
     ) -> Result<usize, Ext2Error> {
-        let file_size = inode.size as u64;
-        if offset >= file_size {
-            return Ok(0);
-        }
-
-        let available = (file_size - offset) as usize;
-        let to_read = buf.len().min(available);
-        let bs = self.block_size as u64;
-
-        let mut bytes_read = 0;
-        let mut pos = offset;
-
-        while bytes_read < to_read {
-            let logical_block = (pos / bs) as u32;
-            let offset_in_block = (pos % bs) as usize;
-            let remaining_in_block = (bs as usize) - offset_in_block;
-            let copy_len = remaining_in_block.min(to_read - bytes_read);
-
-            let phys_block = self.resolve_block(inode, logical_block)?;
-            if phys_block == 0 {
-                // Sparse hole: fill with zeros.
-                buf[bytes_read..bytes_read + copy_len].fill(0);
-            } else {
-                // Use the zero-copy helper: copies directly from cache (or disk on miss)
-                // into the output slice without allocating an intermediate Vec.
-                self.read_block_into_slice(
-                    phys_block,
-                    offset_in_block,
-                    &mut buf[bytes_read..bytes_read + copy_len],
-                )?;
-            }
-
-            bytes_read += copy_len;
-            pos += copy_len as u64;
-        }
-
-        Ok(bytes_read)
+        // Bound each coalesced run to the block driver's max-sectors-per-request
+        // (256 sectors) so a long contiguous file never issues a single
+        // read_sectors the ring-3 driver would reject. `sectors_per_block` is
+        // 2/4/8 for 1K/2K/4K blocks → 128/64/32 blocks per run.
+        let max_run_blocks =
+            kernel_core::driver_ipc::block::MAX_SECTORS_PER_REQUEST / self.sectors_per_block;
+        kernel_core::fs::ext2::read_file_data_coalesced(
+            inode.size as u64,
+            self.block_size,
+            offset,
+            buf,
+            max_run_blocks,
+            |logical_block| self.resolve_block(inode, logical_block),
+            |start_block, count, dst| self.read_run_into_slice(start_block, count, dst),
+            |phys_block, offset_in_block, dst| {
+                self.read_block_into_slice(phys_block, offset_in_block, dst)
+            },
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -1542,7 +1562,7 @@ pub fn unmount_ext2() {
     *EXT2_VOLUME.lock() = None;
 }
 
-/// Flush the kernel ext2 read cache (Phase 93).
+/// Flush the kernel ext2 read cache (Phase 88).
 ///
 /// Called by the syscall layer after it routes a mutating ext2 op to the
 /// `vfs_server` write authority, so the kernel's own metadata reads

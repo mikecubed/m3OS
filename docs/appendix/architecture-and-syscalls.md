@@ -665,7 +665,7 @@ guarantees, in increasing scope:
 
 ### JIT Code Generation Pattern
 
-A JIT engine (Phase 87 Node.js, future Cranelift / V8 ports, etc.)
+A JIT engine (Phase 89 Node.js, future Cranelift / V8 ports, etc.)
 cannot map a single page as `PROT_WRITE | PROT_EXEC` — `sys_mprotect`
 rejects that combination with `EINVAL`. The supported pattern is the
 classic two-step toggle:
@@ -690,7 +690,7 @@ mprotect(code, size, PROT_READ | PROT_EXEC);
 guard in `sys_mprotect` rejects the combination unconditionally. JIT
 engines must commit to the two-step toggle.
 
-Phase 87 (Node.js) is the first in-tree consumer of this pattern.
+Phase 89 (Node.js) is the first in-tree consumer of this pattern.
 
 ---
 

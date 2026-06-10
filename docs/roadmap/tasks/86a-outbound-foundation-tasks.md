@@ -116,7 +116,7 @@
 
 **Acceptance:**
 - [x] `getaddrinfo("github.com", AF_INET)` resolves an A record over `sys_recvmsg_inet` and `dns-smoke` reports **PASS** (not SKIP), traced to `open(/etc/resolv.conf)` + `/etc/hosts`-checked-first.
-- [x] A DEFERRED note in the design doc documents the resolver limits: UDP-only, no EDNS0/DNSSEC, AAAA stubbed (IPv6 → Phase 89), no caching, `/etc/hosts` checked first.
+- [x] A DEFERRED note in the design doc documents the resolver limits: UDP-only, no EDNS0/DNSSEC, AAAA stubbed (IPv6 → Phase 91), no caching, `/etc/hosts` checked first.
 
 > **Verified:** `/etc/hosts` is now staged into the ext2 data disk (`127.0.0.1 localhost` + `::1 localhost`) mirroring the resolv.conf staging. `smoke-test` run with `M3OS_DNS_REGRESSION=1` (which **requires** PASS, fails on SKIP) → step 14 matched `SMOKE:dns-smoke:PASS`. The resolver-limits DEFERRED note is in `docs/roadmap/86a-outbound-foundation.md`.
 
@@ -157,5 +157,5 @@
 - **The RNG upgrade does not rotate already-persisted weak secrets.** The `sshd` Ed25519 host key (`/etc/ssh/ssh_host_ed25519_key`) and `passwd`/`shadow` salts were generated under the weak PRNG; the disclaimer in `userspace/crypto-lib/src/random.rs` (and the `kernel-core/src/csprng.rs` module note) calls out the one-time manual rotation step. New secrets are generated under the CSPRNG.
 - **Entropy atomicity is a hard contract.** `sshd`'s `getrandom` backend does not loop and requires `ret == len`; the ≤256-byte single-call atomicity in A.4 is preserved even though the cap is removed.
 - **`/dev/urandom` and `/dev/random` source the ChaCha20 DRBG** (final-audit hardening) — the same DRBG that backs `getrandom`. They never block: pre-`READY` (a degraded boot without RDSEED/RDRAND) they serve insecure DRBG output, matching Linux `/dev/urandom`. The legacy xorshift `Prng` had its last caller removed and was deleted from the tree, so userspace crypto that reads `/dev/urandom` directly now also benefits from the DRBG.
-- **IPv6/AAAA is explicitly out** (Phase 89). The resolver stays IPv4-only, UDP-only, no caching, `/etc/hosts`-first.
+- **IPv6/AAAA is explicitly out** (Phase 91). The resolver stays IPv4-only, UDP-only, no caching, `/etc/hosts`-first.
 - **One canonical CA path.** Match Debian's `/etc/ssl/certs/ca-certificates.crt`; every later consumer (86c `curl`/`git`) must agree on it. Track CA-bundle provenance/staleness as refreshable data.

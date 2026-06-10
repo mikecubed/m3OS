@@ -5,7 +5,7 @@
 **Depends on:** Phase 86a (Outbound Foundation — `getrandom` CSPRNG + `AT_RANDOM`), Phase 37 (I/O Multiplexing) ✅, Phase 40 (Threading) ✅, Phase 36 (Expanded Memory) ✅, Phase 45 (Ports System) ✅, Phase 85 (Cross-Compiled Toolchains) ✅
 **Goal:** Clear the three kernel blockers that stop a static (`CGO_ENABLED=0`) Go binary from running — `mmap` `MAP_FIXED` + `PROT_NONE` arena reservations (hard), edge-triggered `EPOLLET` + `EPOLLRDHUP` (hard), and `SIGURG`-based async preemption via `tgkill` (soft) — then ship `ports/lang/go` as a `.m3pkg` and prove the runtime with a goroutine rendezvous + plaintext HTTP GET over the in-kernel TCP stack, all without 86c. Bump the kernel to `0.86.3`.
 
-> **Authored ahead of implementation.** Every acceptance item below is intentionally unchecked `[ ]`; it records the planned, measurable result, not a delivered one. (Mirrors the [Phase 92 task-list style](./92-vfs-bulk-io-tasks.md).)
+> **Authored ahead of implementation.** Every acceptance item below is intentionally unchecked `[ ]`; it records the planned, measurable result, not a delivered one. (Mirrors the [Phase 87 task-list style](./87-vfs-bulk-io-tasks.md).)
 
 ## Track Layout
 

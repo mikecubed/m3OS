@@ -124,13 +124,13 @@ The musl resolver validated in this phase is deliberately minimal. The following
 
 - **UDP-only** — no DNS-over-TCP fallback (large/truncated responses may fail silently).
 - **No EDNS0 or DNSSEC** — musl's stub resolver sends classic 512-byte UDP queries with no OPT record.
-- **AAAA / IPv6 resolution stubbed** — `AF_INET6` is unrecognized in `sys_socket`; dual-stack DNS deferred to Phase 89.
+- **AAAA / IPv6 resolution stubbed** — `AF_INET6` is unrecognized in `sys_socket`; dual-stack DNS deferred to Phase 91.
 - **No caching** — every `getaddrinfo` call issues a fresh UDP query to the single `/etc/resolv.conf` nameserver.
 - **`/etc/hosts` is checked first** — the musl resolver's `/etc/hosts` → nameserver order is preserved and `/etc/hosts` is staged with a minimal localhost entry so local name resolution always works.
 
 ## Deferred Until Later
 
-- IPv6 / AAAA / dual-stack resolution — Phase 89.
+- IPv6 / AAAA / dual-stack resolution — Phase 91.
 - DNS caching, search domains, EDNS0, DNSSEC, and DNS-over-TCP fallback.
 - An entropy pool with interrupt harvesting (`add_interrupt_randomness`-style) — RDSEED/RDRAND at the seed point suffices for now.
 - Rotating already-persisted weak secrets generated under the old PRNG (the `sshd` Ed25519 host key at `userspace/sshd/src/host_key.rs:43`, `passwd`/`shadow` salts) — this phase documents a one-time rotation step + the `crypto-lib/src/random.rs` disclaimer (and the `csprng.rs` module note), but does not auto-rotate. New secrets are generated under the CSPRNG.

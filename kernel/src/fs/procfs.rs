@@ -64,7 +64,7 @@ pub fn path_node(abs_path: &str) -> Option<ProcfsNode> {
     match parts.as_slice() {
         [
             "meminfo" | "kmsg" | "stat" | "uptime" | "version" | "mounts" | "cpuinfo" | "loadavg"
-            | "m3os-boot-mode",
+            | "m3os-boot-mode" | "blkstats",
         ] => Some(ProcfsNode::File),
         ["self"] => Some(ProcfsNode::Symlink(alloc::format!(
             "/proc/{}",
@@ -210,6 +210,7 @@ pub fn read_file(abs_path: &str) -> Option<Vec<u8>> {
         ["cpuinfo"] => render_cpuinfo(),
         ["loadavg"] => render_loadavg(),
         ["m3os-boot-mode"] => render_boot_mode(),
+        ["blkstats"] => render_blkstats(),
         [pid, "status"] => render_status(process_snapshot(parse_pid_component(pid)?)?),
         [pid, "cmdline"] => render_cmdline(process_snapshot(parse_pid_component(pid)?)?),
         [pid, "maps"] => render_maps(process_snapshot(parse_pid_component(pid)?)?),
@@ -259,6 +260,7 @@ pub fn list_dir(abs_path: &str) -> Option<Vec<(String, bool)>> {
             (String::from("mounts"), false),
             (String::from("cpuinfo"), false),
             (String::from("loadavg"), false),
+            (String::from("blkstats"), false),
             (String::from("m3os-boot-mode"), false),
         ];
         // Phase 72b — match Linux's default `/proc` policy: every
@@ -741,6 +743,18 @@ fn render_boot_mode() -> String {
 
 fn render_version() -> String {
     alloc::format!("m3OS version {}\n", env!("CARGO_PKG_VERSION"))
+}
+
+/// Phase 87 Track A — `/proc/blkstats`: the per-boot block-request counters.
+/// One `read_calls`/`write_calls` increment == one kernel↔driver round-trip;
+/// the `*_sectors` lines track 512-byte sectors moved. The Phase 87 batching
+/// work is measured against `read_calls` (a 21 MiB / 16 MiB sequential read
+/// should issue far fewer requests once contiguous runs are coalesced).
+fn render_blkstats() -> String {
+    let (read_calls, read_sectors, write_calls, write_sectors) = crate::blk::blkstats_snapshot();
+    alloc::format!(
+        "read_calls {read_calls}\nread_sectors {read_sectors}\nwrite_calls {write_calls}\nwrite_sectors {write_sectors}\n"
+    )
 }
 
 fn render_mounts() -> String {

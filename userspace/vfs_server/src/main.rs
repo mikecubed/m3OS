@@ -26,10 +26,13 @@
 
 extern crate alloc;
 
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::alloc::Layout;
+use core::cell::RefCell;
+use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_core::fs::ext2::{
     EXT2_DIND_BLOCK, EXT2_FT_DIR, EXT2_FT_REG_FILE, EXT2_FT_SYMLINK, EXT2_IND_BLOCK,
     EXT2_NDIR_BLOCKS, EXT2_ROOT_INO, Ext2BlockGroupDescriptor, Ext2DirEntry, Ext2Inode,
@@ -38,9 +41,9 @@ use kernel_core::fs::ext2::{
 use kernel_core::fs::mbr;
 use kernel_core::fs::vfs_protocol::{
     VFS_ACCESS_PATH, VFS_CLOSE, VFS_CREATE, VFS_CREATE_KIND_SHIFT, VFS_LINK, VFS_LIST_DIR,
-    VFS_MAX_READ, VFS_MOUNT_EXT2_ROOT, VFS_MOUNT_POLICY, VFS_MOUNT_VFAT_DATA, VFS_NODE_DIR,
-    VFS_NODE_FILE, VFS_NODE_SYMLINK, VFS_OPEN, VFS_PREAD, VFS_READ, VFS_RENAME, VFS_STAT_PATH,
-    VFS_STAT_REPLY_SIZE, VFS_TRUNCATE, VFS_UMOUNT_EXT2_ROOT, VFS_UMOUNT_POLICY,
+    VFS_MAX_PREAD, VFS_MAX_PWRITE, VFS_MOUNT_EXT2_ROOT, VFS_MOUNT_POLICY, VFS_MOUNT_VFAT_DATA,
+    VFS_NODE_DIR, VFS_NODE_FILE, VFS_NODE_SYMLINK, VFS_OPEN, VFS_PREAD, VFS_READ, VFS_RENAME,
+    VFS_STAT_PATH, VFS_STAT_REPLY_SIZE, VFS_TRUNCATE, VFS_UMOUNT_EXT2_ROOT, VFS_UMOUNT_POLICY,
     VFS_UMOUNT_VFAT_DATA, VFS_UNLINK, VFS_WRITE,
 };
 use syscall_lib::STDOUT_FILENO;
@@ -85,7 +88,51 @@ struct Ext2State {
     bgd_table: Vec<Ext2BlockGroupDescriptor>,
     block_size: u32,
     sectors_per_block: u32,
+    /// Phase 87 — bounded read-through block cache. vfs_server was previously
+    /// uncached, so every path-resolution re-read its directory / inode / bitmap
+    /// / indirect blocks from disk (a `pkg install` issued tens of thousands of
+    /// per-block `block_read` round-trips). This caches ext2 blocks by block
+    /// number; insertion is fill-only — once `BLOCK_CACHE_MAX` blocks are held it
+    /// stops admitting new blocks (no eviction), so it retains the first N distinct
+    /// blocks seen rather than an LRU working set. `BLOCK_CACHE_MAX` is sized
+    /// (16 MiB) to hold a whole package's metadata working set across an install,
+    /// so the cap is not reached for the target workload. `write_sectors`
+    /// invalidates any overlapping block so the write authority never serves stale
+    /// data (mirrors the kernel engine's `block_cache` + invalidate-on-write).
+    block_cache: RefCell<BTreeMap<u32, Vec<u8>>>,
+    /// Phase 87 — metadata write-back. Count of alloc/free ops since the last
+    /// superblock+BGD flush (see `mark_meta_dirty`). Deferring the summary flush
+    /// off the per-allocation path removes ~2 device reads + 2 device writes per
+    /// allocated block.
+    meta_dirty_ops: u32,
+    /// Phase 87 — multi-block allocation reservation. `claim_block_run` claims a
+    /// contiguous run of free blocks in ONE bitmap read-modify-write and stashes
+    /// the unused tail here as `(next_block, remaining)`; `allocate_block` hands
+    /// them out without further bitmap writes. The unused tail is returned to the
+    /// free pool by `release_block_reservation` at each request boundary, so a
+    /// claimed-but-unmapped block never leaks. Collapses the per-block bitmap
+    /// write (the dominant remaining write cost + WRITE-request latency driver)
+    /// into one write per run.
+    block_reservation: Option<(u32, u32)>,
 }
+
+/// Max ext2 blocks held in the vfs_server read-through cache (4 KiB blocks →
+/// ~16 MiB ceiling). Large enough to hold a package's metadata working set
+/// (dir/inode/bitmap/indirect blocks) across an install without unbounded growth.
+const BLOCK_CACHE_MAX: usize = 4096;
+
+/// Phase 87 — flush the superblock + BGD free-count summaries to disk after at
+/// most this many alloc/free ops (instead of on every one). Bounds a crash's
+/// free-count drift to this many ops, which `fsck` reconciles from the
+/// already-persisted bitmaps.
+const META_FLUSH_THRESHOLD: u32 = 256;
+
+/// Phase 87 — how many contiguous blocks `claim_block_run` claims per bitmap
+/// read-modify-write. Sized to cover a 64 KiB write's 16 data blocks (plus a
+/// little headroom for the indirect pointer block) so a full-chunk file write
+/// costs one bitmap write instead of 16. The unused tail is freed at the
+/// request boundary, so an over-claim never leaks.
+const RESERVATION_RUN: u32 = 20;
 
 impl Ext2State {
     /// Read raw sectors from disk via the sys_block_read syscall.
@@ -94,32 +141,135 @@ impl Ext2State {
         if ret < 0 { Err(()) } else { Ok(()) }
     }
 
-    /// Read one ext2 block into a freshly allocated buffer.
+    /// First-block LBA of ext2 block `block_num`.
+    fn block_to_lba(&self, block_num: u32) -> u64 {
+        self.base_lba + (block_num as u64) * (self.sectors_per_block as u64)
+    }
+
+    /// Read one ext2 block into a freshly allocated buffer (Phase 87: cached).
+    ///
+    /// Cache hit returns a clone of the cached block — no `block_read` syscall,
+    /// which is the whole win (the ring0↔ring3↔driver round-trip, not the
+    /// userspace copy). On miss, read from disk and insert (bounded by
+    /// `BLOCK_CACHE_MAX`). The cache holds clean disk content: `write_sectors`
+    /// invalidates any overlapping block, so a hit never serves stale data.
     fn read_block(&self, block_num: u32) -> Result<Vec<u8>, ()> {
-        let lba = self.base_lba + (block_num as u64) * (self.sectors_per_block as u64);
+        if let Some(cached) = self.block_cache.borrow().get(&block_num) {
+            return Ok(cached.clone());
+        }
+        let lba = self.block_to_lba(block_num);
         let mut buf = vec![0u8; self.block_size as usize];
         let sector_count = self.sectors_per_block as usize;
         self.read_sectors(lba, sector_count, &mut buf)?;
+        {
+            let mut cache = self.block_cache.borrow_mut();
+            if cache.len() < BLOCK_CACHE_MAX {
+                cache.insert(block_num, buf.clone());
+            }
+        }
         Ok(buf)
     }
 
+    /// Invalidate any cached blocks overlapping the raw LBA range
+    /// `[start_lba, start_lba + count)`. The single choke point for cache
+    /// coherence: every write (block-level via `write_block`, or raw
+    /// superblock/BGD via `write_sectors`) routes through `write_sectors`, so
+    /// dropping the overlapping blocks here keeps the read-through cache coherent
+    /// with the on-disk state the write authority just produced.
+    fn invalidate_lba_range(&self, start_lba: u64, count: usize) {
+        let spb = self.sectors_per_block as u64;
+        if spb == 0 || start_lba < self.base_lba {
+            // Below the data region (shouldn't happen) — clear all to be safe.
+            self.block_cache.borrow_mut().clear();
+            return;
+        }
+        let first = (start_lba - self.base_lba) / spb;
+        let end_lba = start_lba + count as u64;
+        let last = (end_lba - self.base_lba).div_ceil(spb);
+        let mut cache = self.block_cache.borrow_mut();
+        for b in first..last {
+            cache.remove(&(b as u32));
+        }
+    }
+
     // -----------------------------------------------------------------------
-    // Phase 93 — write side. Ports the kernel engine (`kernel/src/fs/ext2.rs`)
+    // Phase 88 — write side. Ports the kernel engine (`kernel/src/fs/ext2.rs`)
     // faithfully, swapping the block backend from `crate::blk` to the
-    // `block_read`/`block_write` syscalls. `Ext2State` is uncached, so there is
-    // no cache to invalidate (unlike the kernel engine's `write_block`).
+    // `block_read`/`block_write` syscalls. Phase 87 added a read-through block
+    // cache, so `write_sectors` now invalidates overlapping blocks (the single
+    // coherence choke point — `write_block` routes through here).
     // -----------------------------------------------------------------------
 
     /// Write raw sectors to disk via the sys_block_write syscall.
+    ///
+    /// Phase 87 — only the raw superblock / block-group-descriptor writes use
+    /// this directly now (block writes go through `write_block`, which is
+    /// write-through). Since this can land sub-block / multi-block content the
+    /// cache can't refresh in place, it invalidates any overlapping cached block
+    /// so a later read re-reads the new on-disk content rather than stale data.
     fn write_sectors(&self, start_lba: u64, count: usize, buf: &[u8]) -> Result<(), ()> {
+        self.invalidate_lba_range(start_lba, count);
         let ret = syscall_lib::block_write(start_lba, count, buf);
         if ret < 0 { Err(()) } else { Ok(()) }
     }
 
-    /// Write one ext2 block (LBA math mirrors `read_block`).
+    /// Write one ext2 block to disk and **write-through update** the cache with
+    /// the new content (LBA math mirrors `read_block`).
+    ///
+    /// Phase 87 — refreshing the cache instead of invalidating it is the whole
+    /// point for metadata: ext2 updates are sub-block (one allocation-bitmap bit,
+    /// one directory entry, one inode in a shared table block), so the code reads
+    /// the whole block, modifies it, and writes it back. Across a burst of
+    /// allocations the *same* bitmap / table / directory block is rewritten over
+    /// and over; keeping the just-written copy in cache means the read half of
+    /// each read-modify-write is a cache hit instead of a fresh disk round-trip
+    /// (invalidate-on-write would force ~one re-read per allocation). The cache
+    /// stays coherent — it holds exactly what was just written to disk.
     fn write_block(&self, block_num: u32, data: &[u8]) -> Result<(), ()> {
-        let lba = self.base_lba + (block_num as u64) * (self.sectors_per_block as u64);
-        self.write_sectors(lba, self.sectors_per_block as usize, data)
+        let lba = self.block_to_lba(block_num);
+        let ret = syscall_lib::block_write(lba, self.sectors_per_block as usize, data);
+        if ret < 0 {
+            // Write failed — drop any cached copy so a later read re-reads the
+            // actual (possibly partially-written) on-disk state, never a value
+            // we cannot prove landed.
+            self.block_cache.borrow_mut().remove(&block_num);
+            return Err(());
+        }
+        let mut cache = self.block_cache.borrow_mut();
+        if data.len() == self.block_size as usize {
+            // Update if present (the hot path); otherwise insert while bounded.
+            if cache.contains_key(&block_num) || cache.len() < BLOCK_CACHE_MAX {
+                cache.insert(block_num, data.to_vec());
+            }
+        } else {
+            // Defensive: a short/odd write can't refresh a full cached block, so
+            // drop it rather than cache a malformed entry (no caller does this).
+            cache.remove(&block_num);
+        }
+        Ok(())
+    }
+
+    /// Phase 87 — write a contiguous run of `count` whole blocks in one
+    /// multi-block `block_write` (the write analog of the read coalescer).
+    /// `data.len()` must be exactly `count * block_size`. The run is file
+    /// payload, not hot metadata, so its blocks are *invalidated* from the cache
+    /// (a later read re-reads the fresh disk content) rather than refreshed —
+    /// caching a multi-block sequential write would thrash the metadata-oriented
+    /// cache, exactly as the read path bypasses the cache for bulk runs.
+    /// `sys_block_write` caps a request at 128 sectors, so callers bound `count`
+    /// to `128 / sectors_per_block`.
+    fn write_block_run(&self, start_block: u32, count: usize, data: &[u8]) -> Result<(), ()> {
+        let lba = self.block_to_lba(start_block);
+        let sectors = count * self.sectors_per_block as usize;
+        let ret = syscall_lib::block_write(lba, sectors, data);
+        // Invalidate every block in the run (on success the disk now holds the
+        // new payload and the cache is clear so reads re-read it; on failure we
+        // never serve a value we cannot prove landed).
+        let mut cache = self.block_cache.borrow_mut();
+        for i in 0..count as u32 {
+            cache.remove(&(start_block + i));
+        }
+        if ret < 0 { Err(()) } else { Ok(()) }
     }
 
     /// Write an inode back to disk (mirrors kernel `write_inode`).
@@ -166,6 +316,31 @@ impl Ext2State {
             bgd.write_into(&mut bgd_buf[i * 32..(i + 1) * 32]);
         }
         self.write_sectors(bgd_lba, bgd_sectors, &bgd_buf)
+    }
+
+    /// Phase 87 — record an alloc/free against the in-memory superblock+BGD and
+    /// flush the on-disk summaries only once per `META_FLUSH_THRESHOLD` ops. The
+    /// in-memory `superblock`/`bgd_table` are updated by the caller and remain
+    /// authoritative; the bitmaps are persisted immediately by `write_block`, so
+    /// the deferred summary flush never affects allocation correctness — only how
+    /// often the expensive sb+BGD read-modify-write hits the disk.
+    fn mark_meta_dirty(&mut self) -> Result<(), ()> {
+        self.meta_dirty_ops += 1;
+        if self.meta_dirty_ops >= META_FLUSH_THRESHOLD {
+            self.flush_metadata()?;
+            self.meta_dirty_ops = 0;
+        }
+        Ok(())
+    }
+
+    /// Flush any pending superblock+BGD summary changes (at a clean boundary —
+    /// e.g. unmount). No-op when nothing is dirty.
+    fn flush_metadata_if_dirty(&mut self) -> Result<(), ()> {
+        if self.meta_dirty_ops > 0 {
+            self.flush_metadata()?;
+            self.meta_dirty_ops = 0;
+        }
+        Ok(())
     }
 
     /// Read an inode by number.
@@ -302,36 +477,39 @@ impl Ext2State {
         offset: usize,
         max_bytes: usize,
     ) -> Result<Vec<u8>, ()> {
-        let file_size = inode.size as usize;
-        if offset >= file_size {
+        let file_size = inode.size as u64;
+        if offset as u64 >= file_size {
             return Ok(Vec::new()); // EOF
         }
-        let available = file_size - offset;
-        let to_read = max_bytes.min(available);
-        let bs = self.block_size as usize;
+        let available = file_size - offset as u64;
+        let to_read = (max_bytes as u64).min(available) as usize;
 
-        let mut result = Vec::with_capacity(to_read);
-        let mut remaining = to_read;
-        let mut pos = offset;
-
-        while remaining > 0 {
-            let file_block = (pos / bs) as u32;
-            let offset_in_block = pos % bs;
-            let chunk = remaining.min(bs - offset_in_block);
-
-            let block_num = self.resolve_block(inode, file_block).map_err(|_| ())?;
-            if block_num == 0 {
-                // Sparse block — zeros.
-                result.extend(core::iter::repeat(0u8).take(chunk));
-            } else {
-                let block_data = self.read_block(block_num)?;
-                result.extend_from_slice(&block_data[offset_in_block..offset_in_block + chunk]);
-            }
-
-            pos += chunk;
-            remaining -= chunk;
-        }
-
+        // Phase 87 — coalesce contiguous whole blocks into multi-block
+        // `block_read`s (shared with the kernel engine). The bulk run path
+        // bypasses the block cache (a multi-MiB sequential read would thrash it,
+        // and the cache is for hot metadata, not file payload); the unaligned
+        // head/tail keeps the cache-aware `read_block`. `sys_block_read` caps a
+        // request at 128 sectors, so a run spans at most 128/sectors_per_block
+        // blocks.
+        let max_run_blocks = (128 / self.sectors_per_block).max(1);
+        let mut result = vec![0u8; to_read];
+        kernel_core::fs::ext2::read_file_data_coalesced::<()>(
+            file_size,
+            self.block_size,
+            offset as u64,
+            &mut result,
+            max_run_blocks,
+            |logical_block| self.resolve_block(inode, logical_block),
+            |start_block, count, dst| {
+                let lba = self.block_to_lba(start_block);
+                self.read_sectors(lba, count as usize * self.sectors_per_block as usize, dst)
+            },
+            |phys_block, offset_in_block, dst| {
+                let block = self.read_block(phys_block)?;
+                dst.copy_from_slice(&block[offset_in_block..offset_in_block + dst.len()]);
+                Ok(())
+            },
+        )?;
         Ok(result)
     }
 
@@ -382,7 +560,7 @@ impl Ext2State {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 93 — write orchestration (ported faithfully from kernel/src/fs/ext2.rs)
+// Phase 88 — write orchestration (ported faithfully from kernel/src/fs/ext2.rs)
 // ---------------------------------------------------------------------------
 
 impl Ext2State {
@@ -418,7 +596,31 @@ impl Ext2State {
     }
 
     /// Allocate a free block, preferring `preferred_group`.
+    ///
+    /// Phase 87 — serves from a pre-claimed contiguous reservation first (no
+    /// bitmap write); only when the reservation is empty does it claim a fresh
+    /// run. A burst of allocations (a 16-block file write) therefore costs ONE
+    /// bitmap read-modify-write for the whole run instead of one per block — the
+    /// dominant remaining write cost and the driver of WRITE-request latency.
     fn allocate_block(&mut self, preferred_group: u32) -> Result<u32, u64> {
+        if let Some((next, remaining)) = self.block_reservation {
+            if remaining > 0 {
+                self.block_reservation = if remaining == 1 {
+                    None
+                } else {
+                    Some((next + 1, remaining - 1))
+                };
+                return Ok(next);
+            }
+        }
+        self.claim_block_run(preferred_group)
+    }
+
+    /// Claim a contiguous run of up to `RESERVATION_RUN` free blocks in one
+    /// bitmap read-modify-write, returning the first block and stashing the rest
+    /// in `block_reservation`. The free counters are decremented by the whole
+    /// run length now; the unused tail is restored by `release_block_reservation`.
+    fn claim_block_run(&mut self, preferred_group: u32) -> Result<u32, u64> {
         let bg_count = self.bgd_table.len();
         for offset in 0..bg_count {
             let group = ((preferred_group as usize) + offset) % bg_count;
@@ -436,27 +638,79 @@ impl Ext2State {
                 self.superblock.blocks_per_group
             };
 
+            // Find the first free bit in this group.
+            let mut start_bit = None;
             for bit in 0..blocks_in_group {
                 let byte_idx = (bit / 8) as usize;
                 let bit_idx = bit % 8;
                 if bitmap[byte_idx] & (1 << bit_idx) == 0 {
-                    bitmap[byte_idx] |= 1 << bit_idx;
-                    self.write_block(bitmap_block, &bitmap)
-                        .map_err(|_| NEG_EIO)?;
-
-                    self.bgd_table[group].free_blocks_count -= 1;
-                    self.superblock.free_blocks_count -= 1;
-
-                    let abs_block = (group as u32) * self.superblock.blocks_per_group
-                        + bit
-                        + self.superblock.first_data_block;
-
-                    self.flush_metadata().map_err(|_| NEG_EIO)?;
-                    return Ok(abs_block);
+                    start_bit = Some(bit);
+                    break;
                 }
             }
+            // The free-count summary said this group had room; if the bitmap
+            // disagrees (a stale deferred count), move on to the next group.
+            let Some(start_bit) = start_bit else { continue };
+
+            // Claim a contiguous run of free bits from there, bounded by the run
+            // cap and the group end.
+            let mut run_len = 0u32;
+            while run_len < RESERVATION_RUN && start_bit + run_len < blocks_in_group {
+                let bit = start_bit + run_len;
+                let byte_idx = (bit / 8) as usize;
+                let bit_idx = bit % 8;
+                if bitmap[byte_idx] & (1 << bit_idx) != 0 {
+                    break; // run ends at the first used bit
+                }
+                bitmap[byte_idx] |= 1 << bit_idx;
+                run_len += 1;
+            }
+            // start_bit was free, so run_len >= 1.
+            self.write_block(bitmap_block, &bitmap)
+                .map_err(|_| NEG_EIO)?;
+            self.bgd_table[group].free_blocks_count -= run_len as u16;
+            self.superblock.free_blocks_count -= run_len;
+            self.mark_meta_dirty().map_err(|_| NEG_EIO)?;
+
+            let first_abs = (group as u32) * self.superblock.blocks_per_group
+                + start_bit
+                + self.superblock.first_data_block;
+            if run_len > 1 {
+                self.block_reservation = Some((first_abs + 1, run_len - 1));
+            }
+            return Ok(first_abs);
         }
         Err(NEG_ENOSPC)
+    }
+
+    /// Return the unused tail of the block reservation to the free pool in one
+    /// bitmap read-modify-write. Called at every request boundary, so a request
+    /// that claimed a run but mapped fewer blocks than it reserved never leaks
+    /// (and a request that errored mid-way is cleaned up too). The reserved tail
+    /// is contiguous and was claimed within a single group, so a single bitmap
+    /// block covers it.
+    fn release_block_reservation(&mut self) -> Result<(), u64> {
+        let (next, remaining) = match self.block_reservation.take() {
+            Some(r) if r.1 > 0 => r,
+            _ => return Ok(()),
+        };
+        let relative = next - self.superblock.first_data_block;
+        let group = (relative / self.superblock.blocks_per_group) as usize;
+        let group_base = (group as u32) * self.superblock.blocks_per_group;
+        let bitmap_block = self.bgd_table[group].block_bitmap;
+        let mut bitmap = self.read_block(bitmap_block).map_err(|_| NEG_EIO)?;
+        for blk in next..next + remaining {
+            let bit = blk - self.superblock.first_data_block - group_base;
+            let byte_idx = (bit / 8) as usize;
+            let bit_idx = bit % 8;
+            bitmap[byte_idx] &= !(1 << bit_idx);
+        }
+        self.write_block(bitmap_block, &bitmap)
+            .map_err(|_| NEG_EIO)?;
+        self.bgd_table[group].free_blocks_count += remaining as u16;
+        self.superblock.free_blocks_count += remaining;
+        self.mark_meta_dirty().map_err(|_| NEG_EIO)?;
+        Ok(())
     }
 
     /// Free a block.
@@ -484,7 +738,7 @@ impl Ext2State {
 
         self.bgd_table[group].free_blocks_count += 1;
         self.superblock.free_blocks_count += 1;
-        self.flush_metadata().map_err(|_| NEG_EIO)
+        self.mark_meta_dirty().map_err(|_| NEG_EIO)
     }
 
     /// Allocate a free inode, preferring `preferred_group`.
@@ -513,7 +767,7 @@ impl Ext2State {
 
                     self.bgd_table[group].free_inodes_count -= 1;
                     self.superblock.free_inodes_count -= 1;
-                    self.flush_metadata().map_err(|_| NEG_EIO)?;
+                    self.mark_meta_dirty().map_err(|_| NEG_EIO)?;
                     return Ok(abs_inode);
                 }
             }
@@ -544,15 +798,26 @@ impl Ext2State {
 
         self.bgd_table[group].free_inodes_count += 1;
         self.superblock.free_inodes_count += 1;
-        self.flush_metadata().map_err(|_| NEG_EIO)
+        self.mark_meta_dirty().map_err(|_| NEG_EIO)
     }
 
     /// Allocate a data block for a logical position in an inode, wiring up
     /// direct / single-indirect / double-indirect pointers as needed.
+    ///
+    /// Phase 87 — `zero_fill` controls whether a *newly allocated data block* is
+    /// zeroed on disk. A caller that immediately writes the **whole** block
+    /// (`write_file_data`'s coalesced full-block path) passes `false` to skip a
+    /// redundant zero-write that the payload overwrites anyway — this halves the
+    /// per-data-block write count. A caller that only partially fills the block
+    /// (unaligned head/tail, or a fresh directory block) passes `true` so the
+    /// unwritten remainder reads back as zero rather than stale freed content.
+    /// Indirect *pointer* blocks are always zeroed regardless — they are
+    /// metadata and garbage pointers would corrupt the file.
     fn allocate_data_block(
         &mut self,
         inode: &mut Ext2Inode,
         logical_block: u32,
+        zero_fill: bool,
     ) -> Result<u32, u64> {
         let ptrs_per_block = self.block_size / 4;
         let preferred_group = 0;
@@ -560,8 +825,10 @@ impl Ext2State {
         if logical_block < EXT2_NDIR_BLOCKS as u32 {
             if inode.block[logical_block as usize] == 0 {
                 let new_block = self.allocate_block(preferred_group)?;
-                let zero = vec![0u8; self.block_size as usize];
-                self.write_block(new_block, &zero).map_err(|_| NEG_EIO)?;
+                if zero_fill {
+                    let zero = vec![0u8; self.block_size as usize];
+                    self.write_block(new_block, &zero).map_err(|_| NEG_EIO)?;
+                }
                 inode.block[logical_block as usize] = new_block;
                 inode.blocks += self.block_size / 512;
             }
@@ -589,8 +856,10 @@ impl Ext2State {
             ]);
             if existing == 0 {
                 let new_block = self.allocate_block(preferred_group)?;
-                let zero = vec![0u8; self.block_size as usize];
-                self.write_block(new_block, &zero).map_err(|_| NEG_EIO)?;
+                if zero_fill {
+                    let zero = vec![0u8; self.block_size as usize];
+                    self.write_block(new_block, &zero).map_err(|_| NEG_EIO)?;
+                }
                 ind_data[off..off + 4].copy_from_slice(&new_block.to_le_bytes());
                 self.write_block(ind_block, &ind_data)
                     .map_err(|_| NEG_EIO)?;
@@ -642,8 +911,10 @@ impl Ext2State {
             ]);
             if existing == 0 {
                 let new_block = self.allocate_block(preferred_group)?;
-                let zero = vec![0u8; self.block_size as usize];
-                self.write_block(new_block, &zero).map_err(|_| NEG_EIO)?;
+                if zero_fill {
+                    let zero = vec![0u8; self.block_size as usize];
+                    self.write_block(new_block, &zero).map_err(|_| NEG_EIO)?;
+                }
                 ind_data[off..off + 4].copy_from_slice(&new_block.to_le_bytes());
                 self.write_block(ind_block, &ind_data)
                     .map_err(|_| NEG_EIO)?;
@@ -670,30 +941,70 @@ impl Ext2State {
             return Ok(0);
         }
         let bs = self.block_size as u64;
+        let bs_usize = self.block_size as usize;
         let end_offset = offset + data.len() as u64;
-        let mut written = 0;
+        // sys_block_write caps a request at 128 sectors.
+        let max_run_blocks = (128 / self.sectors_per_block).max(1) as usize;
+        let mut written = 0usize;
         let mut pos = offset;
+
+        // Phase 87 — accumulate a run of physically-contiguous WHOLE blocks and
+        // flush it in one multi-block `write_block_run`, instead of one
+        // `write_block` per block. Full blocks are also allocated with
+        // `zero_fill = false` (the run write covers the whole block, so the
+        // separate zero-write is redundant). The unaligned head/tail keep the
+        // single-block read-modify-write path. Tuple: (start_phys, data_offset
+        // of the run start, run_len in blocks).
+        let mut run: Option<(u32, usize, usize)> = None;
 
         while written < data.len() {
             let logical_block = (pos / bs) as u32;
             let offset_in_block = (pos % bs) as usize;
-            let remaining_in_block = (bs as usize) - offset_in_block;
+            let remaining_in_block = bs_usize - offset_in_block;
             let copy_len = remaining_in_block.min(data.len() - written);
 
-            let phys_block = self.allocate_data_block(inode, logical_block)?;
+            if offset_in_block != 0 || copy_len < bs_usize {
+                // Partial (head/tail) block — read-modify-write a single block.
+                // Flush any pending whole-block run first so on-disk ordering
+                // matches the logical write order.
+                if let Some((rp, rstart, rlen)) = run.take() {
+                    self.write_block_run(rp, rlen, &data[rstart..rstart + rlen * bs_usize])
+                        .map_err(|_| NEG_EIO)?;
+                }
+                let phys_block = self.allocate_data_block(inode, logical_block, true)?;
+                let mut block_data = self.read_block(phys_block).map_err(|_| NEG_EIO)?;
+                block_data[offset_in_block..offset_in_block + copy_len]
+                    .copy_from_slice(&data[written..written + copy_len]);
+                self.write_block(phys_block, &block_data)
+                    .map_err(|_| NEG_EIO)?;
+                written += copy_len;
+                pos += copy_len as u64;
+                continue;
+            }
 
-            let mut block_data = if offset_in_block > 0 || copy_len < bs as usize {
-                self.read_block(phys_block).map_err(|_| NEG_EIO)?
-            } else {
-                vec![0u8; bs as usize]
-            };
-            block_data[offset_in_block..offset_in_block + copy_len]
-                .copy_from_slice(&data[written..written + copy_len]);
-            self.write_block(phys_block, &block_data)
+            // Whole block — allocate (no zero-fill, the run write covers it) and
+            // extend the contiguous run, or flush + start a new one.
+            let phys_block = self.allocate_data_block(inode, logical_block, false)?;
+            match run {
+                Some((rp, rstart, rlen))
+                    if phys_block == rp + rlen as u32 && rlen < max_run_blocks =>
+                {
+                    run = Some((rp, rstart, rlen + 1));
+                }
+                _ => {
+                    if let Some((rp, rstart, rlen)) = run.take() {
+                        self.write_block_run(rp, rlen, &data[rstart..rstart + rlen * bs_usize])
+                            .map_err(|_| NEG_EIO)?;
+                    }
+                    run = Some((phys_block, written, 1));
+                }
+            }
+            written += bs_usize;
+            pos += bs;
+        }
+        if let Some((rp, rstart, rlen)) = run.take() {
+            self.write_block_run(rp, rlen, &data[rstart..rstart + rlen * bs_usize])
                 .map_err(|_| NEG_EIO)?;
-
-            written += copy_len;
-            pos += copy_len as u64;
         }
 
         if end_offset > inode.size as u64 {
@@ -765,8 +1076,9 @@ impl Ext2State {
             }
         }
 
-        // No space — allocate a new directory block.
-        let new_block = self.allocate_data_block(dir_inode, num_blocks)?;
+        // No space — allocate a new directory block (zero-filled: the entry
+        // below fills only the head, and the remainder must read back as zero).
+        let new_block = self.allocate_data_block(dir_inode, num_blocks, true)?;
         let mut block_data = vec![0u8; bs as usize];
         block_data[0..4].copy_from_slice(&child_inode.to_le_bytes());
         block_data[4..6].copy_from_slice(&(bs as u16).to_le_bytes());
@@ -1046,7 +1358,7 @@ impl Ext2State {
 
         let group = inode_block_group(new_ino, self.superblock.inodes_per_group) as usize;
         self.bgd_table[group].used_dirs_count += 1;
-        self.flush_metadata().map_err(|_| NEG_EIO)?;
+        self.mark_meta_dirty().map_err(|_| NEG_EIO)?;
         Ok(new_ino)
     }
 
@@ -1251,7 +1563,7 @@ impl Ext2State {
         if self.bgd_table[group].used_dirs_count > 0 {
             self.bgd_table[group].used_dirs_count -= 1;
         }
-        self.flush_metadata().map_err(|_| NEG_EIO)
+        self.mark_meta_dirty().map_err(|_| NEG_EIO)
     }
 }
 
@@ -1364,7 +1676,10 @@ fn decode_handle(handle: u64) -> (u16, u16) {
 // IPC constants
 // ---------------------------------------------------------------------------
 
-const MAX_BULK_BUF: usize = VFS_MAX_READ;
+// Phase 87 — the per-request receive buffer holds the largest request: a
+// VFS_WRITE's path + data (up to VFS_MAX_PWRITE). Heap-allocated (see
+// `server_loop`) because 64 KiB is too large for the serve-loop stack frame.
+const MAX_BULK_BUF: usize = VFS_MAX_PWRITE;
 const SLOW_REQUEST_USEC: u64 = 50_000;
 
 // ---------------------------------------------------------------------------
@@ -1442,6 +1757,9 @@ fn program_main(_args: &[&str]) -> i32 {
         bgd_table,
         block_size,
         sectors_per_block,
+        block_cache: RefCell::new(BTreeMap::new()),
+        meta_dirty_ops: 0,
+        block_reservation: None,
     };
 
     syscall_lib::write_str(STDOUT_FILENO, "vfs_server: ext2 mounted\n");
@@ -1460,6 +1778,12 @@ fn program_main(_args: &[&str]) -> i32 {
         return 1;
     }
 
+    // Drain deferred metadata on orderly shutdown: install a SIGTERM handler so
+    // init's stop sequence flushes the superblock/BGD free-count summaries (see
+    // server_loop / shutdown_flush_and_exit) before exiting. Without it, the
+    // default SIGTERM action would terminate us with the residual unflushed.
+    let _ = syscall_lib::rt_sigaction_simple(syscall_lib::SIGTERM as usize, sigterm_handler);
+
     // Do not write to stdout after publishing the service name: clients may
     // immediately send IPC and block until this server reaches ipc_recv_msg.
     syscall_lib::serial_print("vfs_server: registered, entering server loop\n");
@@ -1473,19 +1797,56 @@ fn program_main(_args: &[&str]) -> i32 {
 // Server loop
 // ---------------------------------------------------------------------------
 
+/// Set by the SIGTERM handler so the server loop can drain deferred metadata
+/// before exiting (see `server_loop`). Async-signal-safe: the handler performs
+/// only an atomic store and never touches the block cache's `RefCell`.
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn sigterm_handler(_sig: i32) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+}
+
+/// Flush any pending deferred superblock/BGD free-count summaries and exit
+/// cleanly. Called only from the server loop (never the signal handler), at a
+/// point where no request is in flight, so no `RefCell` borrow is live and the
+/// flush's `read_block`/`write_sectors` cannot double-borrow. The allocation
+/// bitmaps are already persisted on every alloc/free, so this only converges the
+/// on-disk free-count *summaries* — without it a clean stop leaves them lagging
+/// by up to `META_FLUSH_THRESHOLD` ops (fsck-reconcilable, but a clean stop
+/// should be clean).
+fn shutdown_flush_and_exit(ext2: &mut Ext2State) -> ! {
+    let _ = ext2.flush_metadata_if_dirty();
+    syscall_lib::serial_print("vfs_server: SIGTERM — flushed deferred metadata, exiting\n");
+    syscall_lib::exit(0)
+}
+
 fn server_loop(ext2: &mut Ext2State, ep_handle: u32) -> ! {
     let mut handles = HandleTable::new();
     let mut msg = syscall_lib::IpcMessage::new(0);
-    let mut recv_buf = [0u8; MAX_BULK_BUF];
+    // Phase 87 — heap-allocated (64 KiB) so a large VFS_WRITE's path+data fits
+    // without blowing the serve-loop stack frame.
+    let mut recv_buf = vec![0u8; MAX_BULK_BUF];
     let mut req_seq: u64 = 0;
 
     // First receive — blocks until the kernel sends us a request.
     syscall_lib::ipc_recv_msg(ep_handle, &mut msg, &mut recv_buf);
 
     loop {
+        // Orderly shutdown (init SIGTERMs services on poweroff): a SIGTERM that
+        // interrupted the blocking recv above returns early, and this check
+        // drains deferred metadata + exits before processing a now-meaningless
+        // message — and before init's SIGKILL grace expires.
+        if SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
+            shutdown_flush_and_exit(ext2);
+        }
+
         req_seq = req_seq.wrapping_add(1);
         let start_us = now_usec();
         let (reply_label, reply_data0) = handle_request(ext2, &mut handles, &msg, &recv_buf);
+        // Phase 87 — return any over-claimed block-reservation tail to the free
+        // pool at the request boundary (covers success and error paths), so a
+        // multi-block allocation never leaks claimed-but-unmapped blocks.
+        let _ = ext2.release_block_reservation();
         let elapsed_us = now_usec().saturating_sub(start_us);
         // H9 follow-up: per-request start/done logging was investigative
         // only and added ~24 syscalls per request via write_str chains.
@@ -1508,6 +1869,13 @@ fn server_loop(ext2: &mut Ext2State, ep_handle: u32) -> ! {
             }
         } else {
             syscall_lib::serial_print("vfs_server: request missing reply cap\n");
+        }
+
+        // Catch a SIGTERM that arrived while servicing this request (not during
+        // a blocking recv) — otherwise we would block on the next recv with no
+        // further request coming during shutdown, leaving the residual unflushed.
+        if SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
+            shutdown_flush_and_exit(ext2);
         }
 
         msg = syscall_lib::IpcMessage::new(0);
@@ -1582,7 +1950,7 @@ fn handle_request(
         VFS_ACCESS_PATH => handle_access_path(ext2, msg, recv_buf),
         VFS_MOUNT_POLICY => handle_mount_policy(msg, recv_buf),
         VFS_UMOUNT_POLICY => handle_umount_policy(msg, recv_buf),
-        // Phase 93 — ext2 write authority.
+        // Phase 88 — ext2 write authority.
         VFS_PREAD => handle_pread(ext2, msg, recv_buf),
         VFS_WRITE => handle_write(ext2, msg, recv_buf),
         VFS_TRUNCATE => handle_truncate(ext2, msg, recv_buf),
@@ -1741,7 +2109,8 @@ fn handle_read(
 ) -> (u64, u64) {
     let handle_id = msg.data[0];
     let offset = msg.data[1] as usize;
-    let max_bytes = (msg.data[2] as usize).min(MAX_BULK_BUF);
+    // Phase 87 — see handle_pread: reads serve up to VFS_MAX_PREAD via reply bulk.
+    let max_bytes = (msg.data[2] as usize).min(VFS_MAX_PREAD);
 
     let handle = match handles.get(handle_id) {
         Some(h) => h,
@@ -1921,7 +2290,7 @@ fn handle_umount_policy(msg: &syscall_lib::IpcMessage, recv_buf: &[u8]) -> (u64,
 }
 
 // ---------------------------------------------------------------------------
-// Phase 93 — write handlers
+// Phase 88 — write handlers
 // ---------------------------------------------------------------------------
 
 /// Decode a UTF-8 string from `recv_buf[start..start + len]`.
@@ -1938,7 +2307,9 @@ fn decode_str(recv_buf: &[u8], start: usize, len: usize) -> Result<&str, u64> {
 fn handle_pread(ext2: &Ext2State, msg: &syscall_lib::IpcMessage, recv_buf: &[u8]) -> (u64, u64) {
     let path_len = msg.data[0] as usize;
     let offset = msg.data[1] as usize;
-    let max_bytes = (msg.data[2] as usize).min(MAX_BULK_BUF);
+    // Phase 87 — reads are served in up to VFS_MAX_PREAD (64 KiB) chunks via the
+    // unbounded reply bulk, NOT bounded by the small request buffer (MAX_BULK_BUF).
+    let max_bytes = (msg.data[2] as usize).min(VFS_MAX_PREAD);
 
     let path = match decode_str(recv_buf, 0, path_len) {
         Ok(p) => p,

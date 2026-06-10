@@ -500,6 +500,121 @@ pub fn inode_index_in_group(inode_num: u32, inodes_per_group: u32) -> u32 {
     (inode_num - 1) % inodes_per_group
 }
 
+/// Phase 87 Track B.1 — coalesced file-data read.
+///
+/// Reads up to `buf.len()` bytes of file data starting at byte `offset`,
+/// **coalescing runs of physically-contiguous whole blocks into single
+/// multi-block device reads** instead of one device round-trip per logical
+/// block. This is the dominant Phase 87 throughput win: a 21 MiB file whose
+/// blocks are laid out contiguously collapses from ~5,376 per-block reads to a
+/// small multiple of its contiguous-run count.
+///
+/// Pure orchestration — the caller supplies block resolution and the device
+/// primitives, so this is host-testable with in-memory mocks while the kernel
+/// passes the real ext2 resolver + `blk::read_sectors`:
+/// - `resolve(logical) -> phys`: physical block for a logical block, `0` == a
+///   sparse hole.
+/// - `read_run(phys, block_count, dst)`: read `block_count` physically-
+///   contiguous WHOLE blocks starting at `phys` straight into `dst`
+///   (`dst.len() == block_count * block_size`). **One device round-trip.**
+/// - `read_partial(phys, block_off, dst)`: read `dst.len()` bytes from within
+///   the single block `phys` at byte offset `block_off` — the unaligned head /
+///   short tail of the range (kept on the cache-aware per-block path in-kernel).
+///
+/// `max_run_blocks` bounds how many blocks a single `read_run` may span — the
+/// block driver caps a single request (`remote::read_sectors`'s
+/// `MAX_SECTORS_PER_REQUEST` = 256 sectors = 32 blocks; the `sys_block_read`
+/// path 128 sectors = 16 blocks), so a run longer than that would be rejected.
+/// A contiguous file longer than the cap is split into back-to-back runs of at
+/// most `max_run_blocks` (still a huge win over per-block). A value of `0` is
+/// clamped up to `1` (see `max_run_blocks.max(1)` below) so the run loop always
+/// makes progress.
+///
+/// Returns the number of bytes read (`min(buf.len(), file_size - offset)`),
+/// byte-for-byte identical to a naive per-block reader over the same data.
+/// Holes break a run and are zero-filled without a device request.
+// The geometry (size/block_size/offset/buf/cap) plus the three device closures
+// (resolve / read_run / read_partial) are all irreducible inputs of a pure
+// orchestrator; bundling them into a struct would only obscure the call sites.
+#[allow(clippy::too_many_arguments)]
+pub fn read_file_data_coalesced<E>(
+    file_size: u64,
+    block_size: u32,
+    offset: u64,
+    buf: &mut [u8],
+    max_run_blocks: u32,
+    mut resolve: impl FnMut(u32) -> Result<u32, E>,
+    mut read_run: impl FnMut(u32, u32, &mut [u8]) -> Result<(), E>,
+    mut read_partial: impl FnMut(u32, usize, &mut [u8]) -> Result<(), E>,
+) -> Result<usize, E> {
+    let max_run_blocks = max_run_blocks.max(1);
+    if offset >= file_size {
+        return Ok(0);
+    }
+    let bs = block_size as u64;
+    let available = (file_size - offset) as usize;
+    let to_read = buf.len().min(available);
+
+    let mut bytes_read = 0usize;
+    let mut pos = offset;
+
+    while bytes_read < to_read {
+        let logical_block = (pos / bs) as u32;
+        let offset_in_block = (pos % bs) as usize;
+        let remaining = to_read - bytes_read;
+
+        // Aligned whole-block region: coalesce a contiguous run read straight
+        // into `buf`. Requires the position to be block-aligned and at least one
+        // full block remaining; otherwise fall through to the partial path.
+        if offset_in_block == 0 && remaining >= bs as usize {
+            let phys = resolve(logical_block)?;
+            if phys == 0 {
+                // Hole: zero-fill exactly one block (a hole terminates any run).
+                buf[bytes_read..bytes_read + bs as usize].fill(0);
+                bytes_read += bs as usize;
+                pos += bs;
+                continue;
+            }
+            // Extend the run while the next whole block is physically contiguous,
+            // a full block still fits in the remaining request, AND the run stays
+            // within the device's max-sectors-per-request bound.
+            let mut run_len: u32 = 1;
+            loop {
+                if run_len >= max_run_blocks {
+                    break; // device single-request cap
+                }
+                if (run_len as usize + 1) * bs as usize > remaining {
+                    break;
+                }
+                if resolve(logical_block + run_len)? != phys + run_len {
+                    break; // discontiguity or hole ends the run
+                }
+                run_len += 1;
+            }
+            let run_bytes = run_len as usize * bs as usize;
+            read_run(phys, run_len, &mut buf[bytes_read..bytes_read + run_bytes])?;
+            bytes_read += run_bytes;
+            pos += run_bytes as u64;
+        } else {
+            // Unaligned head, or a short tail of < one block: single-block copy.
+            let copy_len = (bs as usize - offset_in_block).min(remaining);
+            let phys = resolve(logical_block)?;
+            if phys == 0 {
+                buf[bytes_read..bytes_read + copy_len].fill(0);
+            } else {
+                read_partial(
+                    phys,
+                    offset_in_block,
+                    &mut buf[bytes_read..bytes_read + copy_len],
+                )?;
+            }
+            bytes_read += copy_len;
+            pos += copy_len as u64;
+        }
+    }
+    Ok(bytes_read)
+}
+
 // ---------------------------------------------------------------------------
 // Tests (P28-T008, P28-T009)
 // ---------------------------------------------------------------------------
@@ -888,5 +1003,376 @@ mod tests {
             out[off..off + 4].copy_from_slice(&slot.to_le_bytes());
         }
         assert_eq!(&out[..target.len()], target);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 87 Track B.1 — coalesced read tests
+    // -----------------------------------------------------------------------
+
+    use core::cell::Cell;
+
+    const TEST_BS: u32 = 1024;
+
+    /// A deterministic mock "disk": physical block `p` is filled with the byte
+    /// pattern `(p + i) as u8` for byte `i`. Lets a test assert byte-for-byte
+    /// equality between the coalesced reader and a naive per-block reader.
+    fn mock_block_bytes(p: u32, out: &mut [u8]) {
+        for (i, b) in out.iter_mut().enumerate() {
+            *b = (p as usize).wrapping_add(i) as u8;
+        }
+    }
+
+    /// The logical→physical map under test: a long contiguous run, a single
+    /// hole, and a jump to a second contiguous run (a discontiguity). `0` is a
+    /// hole. This crosses the 12-direct / single-indirect / double-indirect
+    /// boundaries by logical-block count (for `TEST_BS`, ptrs_per_block = 256, so
+    /// double-indirect begins at logical 12 + 256 = 268); the coalescer is
+    /// resolution-agnostic, so what matters is the physical layout it sees.
+    fn mock_resolve(lb: u32) -> u32 {
+        if lb == 50 {
+            0 // a sparse hole, well inside the first run
+        } else if lb < 2000 {
+            1000 + lb // first contiguous run (phys 1000..)
+        } else {
+            500_000 + (lb - 2000) // jump to a second contiguous run
+        }
+    }
+
+    /// Naive per-block reference reader — exactly the pre-Phase-87 loop shape.
+    fn reference_read(file_size: u64, offset: u64, buf: &mut [u8]) -> usize {
+        let bs = TEST_BS as u64;
+        if offset >= file_size {
+            return 0;
+        }
+        let to_read = buf.len().min((file_size - offset) as usize);
+        let mut done = 0;
+        let mut pos = offset;
+        while done < to_read {
+            let lb = (pos / bs) as u32;
+            let off = (pos % bs) as usize;
+            let n = (bs as usize - off).min(to_read - done);
+            let phys = mock_resolve(lb);
+            if phys == 0 {
+                buf[done..done + n].fill(0);
+            } else {
+                let mut blk = alloc::vec![0u8; bs as usize];
+                mock_block_bytes(phys, &mut blk);
+                buf[done..done + n].copy_from_slice(&blk[off..off + n]);
+            }
+            done += n;
+            pos += n as u64;
+        }
+        done
+    }
+
+    /// Run the coalesced reader against the mocks, returning (bytes, output,
+    /// run_calls, partial_calls). `run_calls` is the device-round-trip count the
+    /// Phase 87 acceptance is measured on.
+    fn coalesced_read(file_size: u64, offset: u64, len: usize) -> (usize, Vec<u8>, usize, usize) {
+        // A generous cap so the existing run-coalescing tests are unaffected; the
+        // cap behaviour itself is covered by `coalesced_read_caps_run_length`.
+        coalesced_read_capped(file_size, offset, len, u32::MAX)
+    }
+
+    /// As `coalesced_read`, but with an explicit `max_run_blocks` so a test can
+    /// exercise the device single-request cap.
+    fn coalesced_read_capped(
+        file_size: u64,
+        offset: u64,
+        len: usize,
+        max_run_blocks: u32,
+    ) -> (usize, Vec<u8>, usize, usize) {
+        let bs = TEST_BS as usize;
+        let runs = Cell::new(0usize);
+        let partials = Cell::new(0usize);
+        let mut buf = alloc::vec![0u8; len];
+        let n = read_file_data_coalesced::<()>(
+            file_size,
+            TEST_BS,
+            offset,
+            &mut buf,
+            max_run_blocks,
+            |lb| Ok(mock_resolve(lb)),
+            |phys, count, dst| {
+                assert!(
+                    count <= max_run_blocks,
+                    "read_run issued {count} blocks, exceeding the cap {max_run_blocks}"
+                );
+                runs.set(runs.get() + 1);
+                for k in 0..count {
+                    mock_block_bytes(phys + k, &mut dst[k as usize * bs..(k as usize + 1) * bs]);
+                }
+                Ok(())
+            },
+            |phys, off, dst| {
+                partials.set(partials.get() + 1);
+                let mut blk = alloc::vec![0u8; bs];
+                mock_block_bytes(phys, &mut blk);
+                dst.copy_from_slice(&blk[off..off + dst.len()]);
+                Ok(())
+            },
+        )
+        .unwrap();
+        (n, buf, runs.get(), partials.get())
+    }
+
+    #[test]
+    fn coalesced_read_is_byte_identical_to_per_block() {
+        let file_size = 2500 * TEST_BS as u64; // spans both runs + the hole
+        for &(off, len) in &[
+            (0u64, 2500 * TEST_BS as usize),               // whole file
+            (0, 100 * TEST_BS as usize),                   // first run incl. the hole
+            (5, 300 * TEST_BS as usize + 17),              // unaligned head + tail
+            (1999 * TEST_BS as u64 - 10, 40),              // straddle the run jump
+            ((TEST_BS as u64) * 50, TEST_BS as usize * 2), // start exactly on the hole
+        ] {
+            let (n, got, _, _) = coalesced_read(file_size, off, len);
+            let mut want = alloc::vec![0u8; len];
+            let want_n = reference_read(file_size, off, &mut want);
+            assert_eq!(n, want_n, "byte count mismatch at off={off} len={len}");
+            assert_eq!(got, want, "content mismatch at off={off} len={len}");
+        }
+    }
+
+    #[test]
+    fn coalesced_read_collapses_contiguous_runs_into_few_requests() {
+        // Read the whole 2500-block file. Layout = run[0..50) + hole + run[51..2000)
+        // + jump + run[2000..2500). A naive reader would issue ~2499 block reads;
+        // the coalescer must issue only a handful (one per contiguous run), and
+        // the hole must issue NO device request.
+        let file_size = 2500 * TEST_BS as u64;
+        let (n, _, runs, partials) = coalesced_read(file_size, 0, file_size as usize);
+        assert_eq!(n, file_size as usize);
+        // Three contiguous whole-block runs (pre-hole, post-hole, post-jump).
+        assert!(
+            runs <= 4,
+            "expected <=4 coalesced runs for a near-contiguous file, got {runs}"
+        );
+        // The interior hole is whole-block aligned → zero-filled with no request.
+        assert_eq!(
+            partials, 0,
+            "no partial reads expected for an aligned whole-file read"
+        );
+        // The whole-file read is FAR under the Phase 87 ≤512-request acceptance.
+        assert!(
+            runs < 512,
+            "run count {runs} must be well under the 512 ceiling"
+        );
+    }
+
+    #[test]
+    fn coalesced_read_handles_holes_without_device_requests() {
+        // A read entirely inside the hole returns zeros and issues no requests.
+        let file_size = 2500 * TEST_BS as u64;
+        let (n, got, runs, partials) =
+            coalesced_read(file_size, 50 * TEST_BS as u64, TEST_BS as usize);
+        assert_eq!(n, TEST_BS as usize);
+        assert!(got.iter().all(|&b| b == 0), "hole must read as zeros");
+        assert_eq!(runs, 0);
+        assert_eq!(partials, 0);
+    }
+
+    #[test]
+    fn coalesced_read_offset_past_eof_is_empty() {
+        let file_size = 10 * TEST_BS as u64;
+        let (n, _, runs, partials) = coalesced_read(file_size, file_size, 4096);
+        assert_eq!(n, 0);
+        assert_eq!(runs, 0);
+        assert_eq!(partials, 0);
+    }
+
+    #[test]
+    fn coalesced_read_caps_run_length_to_device_max() {
+        // Read 64 contiguous blocks (logical 100..164 → phys 1100..1164, all in
+        // the first contiguous run) with a 16-block device cap. The run must be
+        // split into ceil(64/16) = 4 runs of <=16 blocks each — never one
+        // 64-block request the driver would reject — and stay byte-identical.
+        let file_size = 2500 * TEST_BS as u64;
+        let off = 100 * TEST_BS as u64;
+        let len = 64 * TEST_BS as usize;
+        let (n, got, runs, partials) = coalesced_read_capped(file_size, off, len, 16);
+        assert_eq!(n, len);
+        assert_eq!(
+            runs, 4,
+            "64 blocks at a 16-block cap must split into 4 runs"
+        );
+        assert_eq!(partials, 0);
+        // Byte-identical to the naive reader (the read_run closure also asserts
+        // count <= 16 on every call).
+        let mut want = alloc::vec![0u8; len];
+        reference_read(file_size, off, &mut want);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn coalesced_read_byte_identical_across_real_indirect_blocks() {
+        // Unlike the arithmetic `mock_resolve` above, this drives the coalescer
+        // through a REAL ext2 indirect walk: the resolve closure reads
+        // single- and double-indirect *pointer blocks* from an in-memory store,
+        // exactly as `resolve_block` does on disk. It proves the coalescer
+        // MERGES a physically-contiguous run across the direct→single-indirect
+        // (logical 11→12) and single→double-indirect (logical 267→268)
+        // transitions — the boundaries the Phase 87 acceptance criterion names —
+        // and BREAKS at a real discontiguity (a jump) and a hole, all
+        // byte-for-byte identical to a naive per-block reader over the same walk.
+        use alloc::collections::BTreeMap;
+        let bs = TEST_BS as usize;
+        let ptrs = TEST_BS as usize / 4; // 256 pointers per 1 KiB block
+
+        // Physical DATA-block layout for logical block `lb`:
+        //   0..280  → one contiguous run (phys 2000+lb) spanning BOTH boundaries
+        //   280..285 → a second run reached by a discontiguous jump
+        //   285      → a sparse hole (phys 0)
+        //   286..    → a third contiguous run
+        let phys_for_logical = |lb: u32| -> u32 {
+            if lb == 285 {
+                0
+            } else if lb < 280 {
+                2000 + lb
+            } else if lb < 285 {
+                900_000 + (lb - 280)
+            } else {
+                700_000 + lb
+            }
+        };
+
+        // Materialise the pointer-block tree. Metadata pointer blocks live at
+        // 100.. (never used as a data address by `phys_for_logical`).
+        let sind_phys: u32 = 100; // single-indirect block (logical 12..12+ptrs)
+        let dind_phys: u32 = 101; // double-indirect block (logical 12+ptrs..)
+        let dind_l1_phys: u32 = 102; // its first second-level block
+        let mut store: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+
+        let mut direct = [0u32; 12];
+        for (lb, d) in direct.iter_mut().enumerate() {
+            *d = phys_for_logical(lb as u32);
+        }
+        let mut sind = alloc::vec![0u8; bs];
+        for i in 0..ptrs {
+            let p = phys_for_logical(12 + i as u32);
+            sind[i * 4..i * 4 + 4].copy_from_slice(&p.to_le_bytes());
+        }
+        store.insert(sind_phys, sind);
+        let mut dind = alloc::vec![0u8; bs];
+        dind[0..4].copy_from_slice(&dind_l1_phys.to_le_bytes());
+        store.insert(dind_phys, dind);
+        let mut dind_l1 = alloc::vec![0u8; bs];
+        for k in 0..ptrs {
+            let p = phys_for_logical(12 + ptrs as u32 + k as u32); // logical 268+k
+            dind_l1[k * 4..k * 4 + 4].copy_from_slice(&p.to_le_bytes());
+        }
+        store.insert(dind_l1_phys, dind_l1);
+
+        // The REAL indirect walk (direct / single / double-indirect), reading
+        // pointer blocks from `store` — the same shape as `resolve_block`.
+        let real_resolve = |lb: u32| -> u32 {
+            let read_ptr = |phys: u32, idx: usize| -> u32 {
+                let blk = store.get(&phys).expect("pointer block present");
+                u32::from_le_bytes([
+                    blk[idx * 4],
+                    blk[idx * 4 + 1],
+                    blk[idx * 4 + 2],
+                    blk[idx * 4 + 3],
+                ])
+            };
+            if (lb as usize) < 12 {
+                direct[lb as usize]
+            } else if (lb as usize) < 12 + ptrs {
+                read_ptr(sind_phys, lb as usize - 12)
+            } else {
+                let d = lb as usize - 12 - ptrs;
+                let l1 = read_ptr(dind_phys, d / ptrs);
+                read_ptr(l1, d % ptrs)
+            }
+        };
+
+        // The walk reproduces the intended layout at every boundary of interest.
+        for lb in [0u32, 11, 12, 13, 267, 268, 279, 280, 284, 285, 286, 299] {
+            assert_eq!(
+                real_resolve(lb),
+                phys_for_logical(lb),
+                "walk mismatch at lb={lb}"
+            );
+        }
+
+        let file_size = 300 * TEST_BS as u64;
+        let read_with = |offset: u64, len: usize, runs: &Cell<usize>| -> Vec<u8> {
+            let mut buf = alloc::vec![0u8; len];
+            read_file_data_coalesced::<()>(
+                file_size,
+                TEST_BS,
+                offset,
+                &mut buf,
+                u32::MAX,
+                |lb| Ok(real_resolve(lb)),
+                |phys, count, dst| {
+                    runs.set(runs.get() + 1);
+                    for k in 0..count {
+                        mock_block_bytes(
+                            phys + k,
+                            &mut dst[k as usize * bs..(k as usize + 1) * bs],
+                        );
+                    }
+                    Ok(())
+                },
+                |phys, off, dst| {
+                    let mut blk = alloc::vec![0u8; bs];
+                    mock_block_bytes(phys, &mut blk);
+                    dst.copy_from_slice(&blk[off..off + dst.len()]);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            buf
+        };
+        let ref_read = |offset: u64, len: usize| -> Vec<u8> {
+            let bs64 = TEST_BS as u64;
+            let mut buf = alloc::vec![0u8; len];
+            let to_read = len.min((file_size - offset) as usize);
+            let (mut done, mut pos) = (0usize, offset);
+            while done < to_read {
+                let lb = (pos / bs64) as u32;
+                let off = (pos % bs64) as usize;
+                let n = (bs - off).min(to_read - done);
+                let phys = real_resolve(lb);
+                if phys == 0 {
+                    buf[done..done + n].fill(0);
+                } else {
+                    let mut blk = alloc::vec![0u8; bs];
+                    mock_block_bytes(phys, &mut blk);
+                    buf[done..done + n].copy_from_slice(&blk[off..off + n]);
+                }
+                done += n;
+                pos += n as u64;
+            }
+            buf
+        };
+
+        for &(off, len) in &[
+            (0u64, 300 * bs),               // whole file across both boundaries
+            (11 * TEST_BS as u64, 4 * bs),  // straddle direct→single (11→12)
+            (267 * TEST_BS as u64, 4 * bs), // straddle single→double (267→268)
+            (279 * TEST_BS as u64, 8 * bs), // across the jump at 280
+            (284 * TEST_BS as u64, 4 * bs), // across the hole at 285
+        ] {
+            let runs = Cell::new(0);
+            let got = read_with(off, len, &runs);
+            let want = ref_read(off, len);
+            assert_eq!(got, want, "content mismatch at off={off} len={len}");
+        }
+
+        // The whole-file read collapses to exactly 3 device runs (logical
+        // 0..280, 280..285, 286..300) plus the zero-filled hole at 285 (no
+        // request): the coalescer merged across BOTH indirect boundaries (no
+        // spurious break at logical 12 or 268) yet broke at the real jump and
+        // the hole.
+        let runs = Cell::new(0);
+        let _ = read_with(0, 300 * bs, &runs);
+        assert_eq!(
+            runs.get(),
+            3,
+            "expected exactly 3 contiguous runs across the real indirect layout, got {}",
+            runs.get()
+        );
     }
 }

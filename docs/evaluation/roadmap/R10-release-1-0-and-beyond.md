@@ -16,9 +16,9 @@
 [Phase 84 — Spectre/KPTI Mitigations](../../roadmap/84-spectre-mitigations.md),
 [Phase 85 — Cross-Compiled Toolchains](../../roadmap/85-cross-compiled-toolchains.md),
 [Phase 86 — Networking and GitHub](../../roadmap/86-networking-and-github.md),
-[Phase 87 — Node.js](../../roadmap/87-nodejs.md),
-[Phase 88 — Claude Code](../../roadmap/88-claude-code.md),
-[Phase 89 — IPv6 / DHCPv6](../../roadmap/89-ipv6-dhcpv6.md)
+[Phase 89 — Node.js](../../roadmap/89-nodejs.md),
+[Phase 90 — Claude Code](../../roadmap/90-claude-code.md),
+[Phase 91 — IPv6 / DHCPv6](../../roadmap/91-ipv6-dhcpv6.md)
 <br>*(Phases 58–62 in earlier drafts of this overlay were renumbered: the release gate is now Phase 83; the post-1.0 ecosystem work is Phases 84–89.)*
 **Primary evaluation docs:** [Usability Roadmap](../usability-roadmap.md),
 [Rust OS Comparison](../rust-os-comparison.md),
@@ -119,7 +119,7 @@ that enforces its architectural direction and knows its support boundaries.
 - [m3OS Compared with Redox and Other Rust OS Projects](../rust-os-comparison.md)
 - [GUI Strategy](../gui-strategy.md)
 - [Phase 83 — Release 1.0 Gate](../../roadmap/83-release-1-0-gate.md) (the official implementation; **authoritative artifact:** [`docs/release/1.0-release-gate.md`](../../release/1.0-release-gate.md))
-- [Phase 88 — Claude Code](../../roadmap/88-claude-code.md)
+- [Phase 90 — Claude Code](../../roadmap/90-claude-code.md)
 
 ## Open Questions
 

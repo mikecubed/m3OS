@@ -56,7 +56,7 @@ Hardware target for §3: the user's actual laptop (HP OmniBook, AMD Ryzen AI 9 3
 | 12 | TCP retransmit + 4-connection-slot limit | Code | Phase 77 (Track D.2) | MEDIUM (real internet is broken without it) |
 | 13 | `PT_TLS` segment not parsed — musl works around it via reserved stack space; multi-threaded TLS is fragile | Code | Phase 77 (Track C) | MEDIUM |
 | 14 | Phase 10 (Secure Boot) never validated on real hardware | Validation | Phase 59 | MEDIUM |
-| 15 | DNS resolver absent (user must type IPs); IPv6 / DHCPv6 absent | Code | Phase 77 (Track D.1, DNS) + Phase 89 (IPv6 post-1.0) | MEDIUM |
+| 15 | DNS resolver absent (user must type IPs); IPv6 / DHCPv6 absent | Code | Phase 77 (Track D.1, DNS) + Phase 91 (IPv6 post-1.0) | MEDIUM |
 | 16 | No CPU microcode loading on real hardware | Correctness/Security | Phase 77 (Track E) | MEDIUM |
 | 17 | `epoll_*` RESOLVED — `epoll_create1`/`epoll_ctl`/`epoll_wait` all fully implemented (`syscall/mod.rs:18453/18551/18593`); verified by the `epoll-smoke` gate (Phase 77 Track F). The PARTIAL flag was a source-search miss. | Code | Phase 77 (Track F) ✅ | RESOLVED |
 | 18 | virtio-input migration status unclear from 2026-05-04 handoff | Handoff | Phase 77 (Track G.3) or Phase 59 | LOW |
@@ -81,7 +81,7 @@ These are the items where source grep confirmed the deferral is still real:
 - **IPC timeouts and cancellation** (Phase 6 deferred list) — closed by Phase 74 ✅ (merged 2026-05-26).
 - **W^X enforcement** (Phase 11 / Phase 36 deferred lists) — closed by Phase 75 ✅ (merged 2026-05-26).
 - **TCP retransmission timer + multi-connection slots** (Phase 16 deferred list) — kernel TCP has fixed 4-slot array and no retransmit on loss; networking outside an idle LAN will hang. → Phase 77 Track D.2.
-- **IPv6 / DHCP / DNS resolver** (Phase 16 / 23 deferred list) — IPv4 only; no in-OS resolver. → DNS resolver in Phase 77 Track D.1; IPv6 / DHCPv6 in Phase 89 (post-1.0).
+- **IPv6 / DHCP / DNS resolver** (Phase 16 / 23 deferred list) — IPv4 only; no in-OS resolver. → DNS resolver in Phase 77 Track D.1; IPv6 / DHCPv6 in Phase 91 (post-1.0).
 - **`epoll` proper** (Phase 23 deferred list) — **wired and verified** (Phase 77 Track F). All three handlers are fully implemented in `kernel/src/arch/x86_64/syscall/mod.rs`: `sys_epoll_create1` (line 18453), `sys_epoll_ctl` (line 18551), `sys_epoll_wait` (line 18593), with the `EpollInstance`/`EpollInterest`/`EPOLL_TABLE` machinery (FD-table integration, interest lists, `WaitQueue`-backed blocking, close-on-exec cleanup) at 18355-18720. The earlier PARTIAL flag was a source-search miss, not an absence. The new `userspace/epoll-smoke` regression (gate `SMOKE:epoll-smoke:PASS` in `cargo xtask smoke-test`) exercises `EPOLL_CTL_ADD`/`MOD`/`DEL`, `epoll_wait` readiness + event-mask + `data`-token reporting, and the timeout path end to end against a pipe.
 - **Setuid bit on executables + supplementary groups + privilege separation in sshd** (Phase 48 deferred) — `sshd` still runs as root for the entire session.
 - **Argon2id password hashing** (Phase 48 deferred) — iterated SHA-256 only. Acceptable for local-only systems; below modern standards.
@@ -119,7 +119,7 @@ Source: `docs/handoffs/`, `docs/post-mortems/`.
 | 65 | Planned | fat_server real implementation. Hard 1.0 gate. |
 | 74 | Complete (merged 2026-05-26) | IPC capability grants + bulk transfers. Closes Phase 6/50 deferrals. |
 | 75 | Complete (merged 2026-05-26) | W^X enforcement. Closes audit § E1. |
-| 76 | Planned | Dynamic linker. Optional pre-1.0; required for Node.js (Phase 87). |
+| 76 | Planned | Dynamic linker. Optional pre-1.0; required for Node.js (Phase 89). |
 | 77 | Planned | Pre-1.0 Correctness, Cheap Security, and Network Polish (bundle phase). Hard 1.0 gate. |
 | 78 | Planned | USB Host Foundation. Hard 1.0 gate (single biggest unblocker). |
 | 79 | Planned | Modern Intel/Realtek NIC. Hard 1.0 gate. |
@@ -236,7 +236,7 @@ In dependency order, the code-only items that should block 1.0:
 7. **Phase 77 Track D.1 — `/etc/resolv.conf` DNS resolver** — no on-target resolver; user must type IPs. Trivial port of musl's stub resolver against a Phase 23 socket; bundled into Phase 77.
 8. **Phase 77 Track E — microcode loading** — ~300 LOC, real correctness impact on the dev laptop's Strix Halo silicon (multiple known errata patched only via microcode updates).
 9. **Phase 77 Track F — `epoll_*` verify-and-implement-if-missing** — `sys_poll` exists; audit could not confirm `epoll_*` syscall handlers. If absent, implement against the existing `WaitQueue` infrastructure.
-10. **Phase 89 — IPv6 / DHCPv6** — explicitly deferred to post-1.0. Phase 83 Release Gate documents the IPv4-only-for-1.0 promise.
+10. **Phase 91 — IPv6 / DHCPv6** — explicitly deferred to post-1.0. Phase 83 Release Gate documents the IPv4-only-for-1.0 promise.
 
 (Phase 74's IPC capability grants and bulk transfers merged 2026-05-26 — that closes the Phase 6 timeout/cancellation deferrals and the Phase 50 page-grant gap that were previously on this list. Phase 75's W^X enforcement merged 2026-05-26 — that closes the Phase 11 / Phase 36 deferred-W^X notes.)
 
@@ -313,13 +313,13 @@ Concrete LOC estimates are rough; refer to each phase doc for full scope.
 - **[Phase 84 — KPTI + retpoline + IBRS](../../roadmap/84-spectre-mitigations.md)** — the expensive Spectre mitigations. Phase 77 covered SMEP + SMAP.
 - **[Phase 85 — Cross-Compiled Toolchains](../../roadmap/85-cross-compiled-toolchains.md)** — git, Python, Clang. tcc covers 1.0.
 - **[Phase 86 — Networking and GitHub](../../roadmap/86-networking-and-github.md)**
-- **[Phase 87 — Node.js](../../roadmap/87-nodejs.md)** — depends on Phase 76 (dynamic linker).
-- **[Phase 88 — Claude Code](../../roadmap/88-claude-code.md)**
-- **[Phase 89 — IPv6 / DHCPv6](../../roadmap/89-ipv6-dhcpv6.md)**
+- **[Phase 89 — Node.js](../../roadmap/89-nodejs.md)** — depends on Phase 76 (dynamic linker).
+- **[Phase 90 — Claude Code](../../roadmap/90-claude-code.md)**
+- **[Phase 91 — IPv6 / DHCPv6](../../roadmap/91-ipv6-dhcpv6.md)**
 
 Optional pre-1.0 (defer if the rest slips):
 
-- **Phase 76** — Dynamic linker. Required for Phase 87 Node.js but not for 1.0 itself.
+- **Phase 76** — Dynamic linker. Required for Phase 89 Node.js but not for 1.0 itself.
 - **Phase 67/55b follow-ups** — multiqueue NVMe, MSI-X per-core steering, interrupt remapping.
 
 ---
@@ -334,7 +334,7 @@ To keep 1.0 honest and shippable, the Release Gate should commit in writing to:
 - **No international keymaps beyond US QWERTY.**
 - **No setuid programs / no supplementary groups / no sshd privilege separation.**
 - **No multi-client kernel audio mixing** (userspace mixer in `audio_mixer` is the answer for 1.0).
-- **No IPv6 / DHCPv6** — Phase 89, post-1.0.
+- **No IPv6 / DHCPv6** — Phase 91, post-1.0.
 - **No KPTI / retpoline / IBRS** — Phase 84, post-1.0. SMEP + SMAP land in Phase 77.
 - **No SR-IOV, no hot-plug, no live driver update.**
 - **No clang/llvm/gcc on-target** — tcc only. Cross-compiled toolchains land in Phase 85.
@@ -382,9 +382,9 @@ m3OS at 1.0 is justified in deferring GPU/Wi-Fi-breadth/multi-seat/Spectre-retpo
 - Phase 84 Spectre / KPTI / retpoline / IBRS
 - Phase 85 cross-compiled toolchains (git, Python, Clang)
 - Phase 86 networking + GitHub
-- Phase 87 Node.js
-- Phase 88 Claude Code
-- Phase 89 IPv6 / DHCPv6
+- Phase 89 Node.js
+- Phase 90 Claude Code
+- Phase 91 IPv6 / DHCPv6
 - Multi-output / multi-seat compositor
 - Hardware-accelerated composition (KMS/DRM/GL)
 - Wi-Fi breadth beyond the reference chipset (MT7925)

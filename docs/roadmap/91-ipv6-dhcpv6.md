@@ -1,7 +1,7 @@
-# Phase 89 - IPv6 / DHCPv6
+# Phase 91 - IPv6 / DHCPv6
 
 **Status:** Planned (post-1.0)
-**Source Ref:** phase-89
+**Source Ref:** phase-91
 **Depends on:** Phase 16 (Network) ✅, Phase 77 (Pre-1.0 Correctness — TCP retransmission + DNS stub), Phase 83 (Release 1.0 Gate)
 **Builds on:** Adds IPv6 + DHCPv6 + IPv6-aware DNS to the IPv4-only 1.0 network stack
 **Primary Components:** `kernel/src/net/ipv6.rs` (new), `kernel/src/net/icmpv6.rs` (new), `kernel/src/net/ndp.rs` (new — Neighbor Discovery Protocol), `kernel/src/net/dhcpv6.rs` (new), `userspace/syscall-lib/src/net/` (AF_INET6 socket surface), `userspace/syscall-lib/src/dns/` (AAAA record support)
@@ -86,7 +86,7 @@ When both endpoints support v4 and v6, the kernel must pick which family to conn
 
 ## Companion Task List
 
-- [Phase 89 Task List](./tasks/89-ipv6-dhcpv6-tasks.md) — to be authored when implementation planning begins.
+- [Phase 91 Task List](./tasks/91-ipv6-dhcpv6-tasks.md) — to be authored when implementation planning begins.
 
 ## How Real OS Implementations Differ
 

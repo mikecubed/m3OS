@@ -5,9 +5,9 @@ heavy `pkg install`, with `error: redefinition of 'main'` — `#include <stdio.h
 was being resolved to the program's own source file (`/usr/src/hello.c`), which
 then recursively `#include`d itself ~16 levels deep.
 **Status:** Acute bug fixed (Phase 85d, branch `feat/phase-85d-clang-llvm`). Systemic
-issues (this doc) tracked as **[Phase 93 — VFS `stat` Conformance & ext2
-Consolidation](../roadmap/93-vfs-stat-and-ext2-consolidation.md)**
-([tasks](../roadmap/tasks/93-vfs-stat-and-ext2-consolidation-tasks.md)), which implements
+issues (this doc) tracked as **[Phase 88 — VFS `stat` Conformance & ext2
+Consolidation](../roadmap/88-vfs-stat-and-ext2-consolidation.md)**
+([tasks](../roadmap/tasks/88-vfs-stat-and-ext2-consolidation-tasks.md)), which implements
 the audit checklist below.
 **Severity:** Medium-High — flaky (~1 compile in 2–3 after a fresh install), blocked the
 Phase 85d in-OS clang acceptance gate non-deterministically. The *underlying* defect is a

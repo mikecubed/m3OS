@@ -1,4 +1,4 @@
-// Phase 93 — ext2 cross-process read-coherence regression (Bug B).
+// Phase 88 — ext2 cross-process read-coherence regression (Bug B).
 //
 // Reproduces the dual-engine ext2 read-incoherence hazard: writes a file on the
 // ext2 root through the kernel write path, churns unrelated ext2 metadata, then

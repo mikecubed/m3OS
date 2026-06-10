@@ -65,7 +65,7 @@
 > B.1 item is preserved; only the *packaging* of the extensions changed
 > (builtin, not `.so`). Lifting the static constraint — a real `libc.so` + a
 > dynamic `python3` with real `lib-dynload` + `ctypes` — is tracked as
-> [Phase 91 (Dynamic C Runtime)](../91-dynamic-c-runtime.md).
+> [Phase 93 (Dynamic C Runtime)](../93-dynamic-c-runtime.md).
 >
 > **⚠ Second finding — frozen `python312.zip`.** The first static gate run also
 > showed m3OS's ring-3 VFS is slow (`vfs_server: slow req … STAT_PATH
@@ -81,7 +81,7 @@
 **Acceptance:**
 - [x] `make install DESTDIR=<stage>` lays `bin/python3` (→`python3.12`) + `lib/python3.12/` (stdlib `.py`); **every** stdlib C extension whose dependency is present is compiled **into** the interpreter (`MODULE_BUILDTYPE=static`) rather than as `lib-dynload/*.so`. `zlib`/`gzip` build against the staged `ports/lib/zlib` (now `-fPIC`); **`_curses`/`_curses_panel` build against the ported wide `ports/lib/ncurses`** (`CURSES_CFLAGS`/`CURSES_LIBS`/`PANEL_LIBS` → staged `libncursesw.a`/`libtinfow.a`/`libpanelw.a`; `assert_curses_builtin` proves `PyInit__curses`/`PyInit__curses_panel` are in the builtin table before the gate runs); `hashlib` works via the built-in HACL\*-backed `_md5`/`_sha*` (no OpenSSL). In-m3OS-validated by the gate: `import json,re,math,…,zlib,gzip,curses,curses.panel,threading` all succeed, `curses.ncurses_version` = 6.5, `hashlib.sha256(b'abc')` = `ba7816bf…`.
 - [x] The interpreter is **stripped** before sealing (`seal_package`→`strip_stage`; stripped static `python3.12` ≈ 9.8 MB). `prune_python_stage` removes the demo-only `lib-dynload/` (and hard-fails if any *real* extension leaked there as shared — a static-build correctness probe).
-- [x] The TLS/name-resolution extensions (`_ssl`, `_hashlib`-OpenSSL, `getaddrinfo`/DNS) are **not** built: every external-lib module *whose library is not ported* is forced `py_cv_module_*=n/a`, and `assert_python_layout` proves the interpreter is static (no `/lib/ld-musl…` interp string). `_socket` *is* builtin (TCP/UDP + AF_UNIX); only DNS resolution + TLS are deferred to Phase 86. (`ctypes` → Phase 91; `curses` is **not** deferred — ncurses is a ported dep.)
+- [x] The TLS/name-resolution extensions (`_ssl`, `_hashlib`-OpenSSL, `getaddrinfo`/DNS) are **not** built: every external-lib module *whose library is not ported* is forced `py_cv_module_*=n/a`, and `assert_python_layout` proves the interpreter is static (no `/lib/ld-musl…` interp string). `_socket` *is* builtin (TCP/UDP + AF_UNIX); only DNS resolution + TLS are deferred to Phase 86. (`ctypes` → Phase 93; `curses` is **not** deferred — ncurses is a ported dep.)
 
 ### B.2 — Relocation contract (`sys.prefix` landmark)
 
@@ -132,5 +132,5 @@
 ## Documentation Notes
 
 - **What changed relative to the standalone roadmap.** `docs/python-roadmap.md` Stage 1 is this sub-phase; its Stage 2 (networking/`ssl`/pip/`multiprocessing`) is Phase 86+. (`threading` is **not** deferred — the `_thread` builtin is on and pure-Python `threading` works single-process.)
-- **Honesty.** No `ssl`/DNS resolution/`pip`/`asyncio` here; the docs must state these are deferred, not present-but-broken. `ctypes` is deferred to Phase 91 (needs `dlopen`), not Phase 86.
+- **Honesty.** No `ssl`/DNS resolution/`pip`/`asyncio` here; the docs must state these are deferred, not present-but-broken. `ctypes` is deferred to Phase 93 (needs `dlopen`), not Phase 86.
 - **Prefer exact targets.** Reference the exact cross-configure flags + `CONFIG_SITE` cache answers, not "the cross flags".

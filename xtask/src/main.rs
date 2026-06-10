@@ -241,6 +241,17 @@ const SMOKE_EXIT_GO_SMOKE_FAILED: i32 = 79;
 /// token those arms are skip-with-reason (a secret can never live in repo/CI).
 const SMOKE_EXIT_GH_SMOKE_FAILED: i32 = 80;
 
+/// Phase 87 — `cargo xtask vfs-bulkio-smoke` exit code. Boots m3OS, reads
+/// `/proc/blkstats` before + after a `pkg install` of a multi-MiB package
+/// (whose `.m3pkg` is read in 256 KiB chunks → coalesced into multi-block
+/// `read_sectors`, and written back through the batched write path), and asserts
+/// BOTH the `read_calls` AND `write_calls` deltas stayed under their batching
+/// thresholds — the regression guard that the contiguous-run read/write coalescing
+/// did not silently revert to per-block round-trips. Then `pkg verify` re-reads
+/// every installed file and SHA-checks it (read-back-compare guarding the
+/// zero-fill-skip write path).
+const SMOKE_EXIT_VFS_BULKIO_FAILED: i32 = 81;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
     Headless,
@@ -830,6 +841,22 @@ fn main() {
                 });
             cmd_go_runtime_smoke(&smoke_args);
         }
+        // Phase 87 — VFS bulk-I/O throughput gate. Boots m3OS, reads
+        // /proc/blkstats before + after a `pkg install` of a multi-MiB package
+        // (read in 256 KiB chunks → coalesced into multi-block read_sectors, and
+        // written back through the batched write path), and asserts BOTH the
+        // read_calls AND write_calls deltas stayed under their batching thresholds
+        // (a regression to per-block round-trips would blow past them), then runs
+        // `pkg verify` as a read-back-compare.
+        Some("vfs-bulkio-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("vfs-bulkio-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_vfs_bulkio_smoke(&smoke_args);
+        }
         // Phase 85d — Clang/LLVM/LLD toolchain smoke. Builds the image with the
         // opt-in `M3OS_WITH_CLANG` feature (bundling the heavyweight clang
         // `.m3pkg` into the offline `/usr/pkg/` repo), boots m3OS, `pkg install
@@ -1059,7 +1086,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -2891,7 +2918,7 @@ fn build_musl_bins() {
         ("userspace/dns-smoke/dns-smoke.c", "dns-smoke"),
         // Phase 86b: non-blocking connect() / EINPROGRESS + poll + SO_ERROR.
         ("userspace/connect-smoke/connect-smoke.c", "connect-smoke"),
-        // Phase 93: ext2 cross-process read-coherence regression (Bug B).
+        // Phase 88: ext2 cross-process read-coherence regression (Bug B).
         (
             "userspace/ext2-coherence-smoke/ext2-coherence-smoke.c",
             "ext2-coherence-smoke",
@@ -7399,7 +7426,7 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 20,
         label: "guest/storage: smoke runner verified ext2 file lifecycle",
     });
-    // Phase 93 — ext2 cross-process read-coherence regression (Bug B). The
+    // Phase 88 — ext2 cross-process read-coherence regression (Bug B). The
     // smoke-runner execs `/bin/ext2-coherence-smoke`, which writes an ext2 file,
     // churns unrelated ext2 metadata, then reads it back from a FRESHLY
     // fork/exec'd process and asserts the new content is visible. PASS proves
@@ -14616,7 +14643,7 @@ fn gh_smoke_steps(
         // it under 600s, but in the AUTH configuration (the install has just
         // written ~55 MB + the seeded config, leaving the VFS more loaded) it has
         // been observed to exceed even 1200s — this step is VFS-throughput-bound,
-        // the exact bottleneck Phase 92 (VFS bulk I/O) targets. 1200s is the step
+        // the exact bottleneck Phase 87 (VFS bulk I/O) targets. 1200s is the step
         // ceiling; the global --timeout is the real backstop.
         timeout_secs: 1200,
         label: "gh-smoke: static Go gh runs on the 86d runtime (gh version)",
@@ -14706,6 +14733,260 @@ fn gh_smoke_steps(
             label: "gh-smoke: authenticated write over HTTPS succeeded (gh issue create exit 0)",
         });
     }
+
+    steps
+}
+
+/// Phase 87 — `cargo xtask vfs-bulkio-smoke`.
+///
+/// Proves the Track B.1 contiguous-run batching end-to-end: it reads
+/// `/proc/blkstats` (the Track A counters) before and after a `pkg install` of a
+/// multi-MiB, dependency-free package (`mbedtls`, ~3.8 MiB, bundle-only on the
+/// default image). `pkg` reads the `.m3pkg` in 256 KiB chunks, so each
+/// `read_file_data` call spans 64 blocks and coalesces into ONE `read_sectors`
+/// per contiguous run — the `read_calls` delta for that read must stay well
+/// under the per-block count (~960+ for a 3.8 MiB file). A regression to
+/// per-block round-trips would blow past the threshold and fail the gate.
+fn cmd_vfs_bulkio_smoke(args: &SmokeBootArgs) {
+    // The package to install + read. Dependency-free + bundle-only (not
+    // pre-installed) so the install reads its `.m3pkg` fresh off the data disk.
+    const PKG: &str = "mbedtls";
+    // Regression guard for the read-side throughput work. Measured `read_calls`
+    // for this ~3.8 MiB install at each stage:
+    //   * pre-Phase-87 (uncached vfs_server, 4 KiB per-block reads):    ~36,200
+    //   * + block cache + 64 KiB read cap + contiguous-run coalescing:   ~8,900
+    //   * + write-through-update cache (metadata RMW reads hit):         ~4,300
+    //   * + deferred metadata flush (no sb/BGD read per allocation):     ~2,100
+    // The threshold catches a regression of any of those (next stage up ~4,300).
+    const MAX_READ_CALLS_DELTA: u64 = 3_500;
+    // Regression guard for the WRITE-side throughput work. Measured `write_calls`
+    // for this install at each stage:
+    //   * deferred metadata flush only (per-block data+zero+bitmap writes): ~5,759
+    //   * + 64 KiB write cap (inode flush amortized):                       ~4,083
+    //   * + data-write coalescing + zero-fill skip:                         ~2,546
+    //   * + multi-block allocation (one bitmap write per run):              ~1,836
+    // The write reduction IS the fairness mechanism — fewer device writes per
+    // WRITE request means lower per-request latency, so this also guards Track D
+    // (the >1 s WRITE requests that the multi-block alloc eliminated). The
+    // threshold catches a regression that loses the multi-block alloc (~2,546) or
+    // the coalescing (~4,083).
+    const MAX_WRITE_CALLS_DELTA: u64 = 2_400;
+
+    // Precondition: `mbedtls` is a bundle-only port — the image stages its
+    // `.m3pkg` only if the pkgcache artifact already exists, and (unlike
+    // git-https-smoke / go-runtime-smoke) this gate does NOT build the port. If
+    // it is absent, `pkg install mbedtls` would fail inside the guest with
+    // `cannot read mbedtls`. Fail fast here with an actionable message instead of
+    // booting QEMU only to discover the missing artifact.
+    match port_build::pkgcache_artifact_path(PKG) {
+        Ok(p) if p.exists() => {}
+        _ => {
+            eprintln!(
+                "vfs-bulkio-smoke: FAILED — the `{PKG}` port artifact is not in the pkgcache, so \
+                 the image cannot bundle it and `pkg install {PKG}` would fail. Build it first \
+                 (e.g. `cargo xtask port build {PKG}`, or run `git-https-smoke` once which builds \
+                 the mbedtls→curl→git chain). This gate bundles the prebuilt artifact; it does not \
+                 build the port. Requires a musl cross-compiler for that initial build."
+            );
+            std::process::exit(SMOKE_EXIT_VFS_BULKIO_FAILED);
+        }
+    }
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    // Fresh data disk so the package is un-installed and the block cache + pkg DB
+    // start clean (a warm cache would hide the device round-trips we measure).
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let qemu_args = qemu_args_with_devices(&uefi_image, &ovmf, display_mode, DeviceSet::default());
+
+    // Capture the full serial transcript so we can parse the two `read_calls`
+    // values in Rust (no fragile in-guest arithmetic). run_smoke_script dumps the
+    // serial history to this path on exit (success or failure) when the env var
+    // is set. SAFETY: xtask is single-threaded here.
+    let dump_path = uefi_image.parent().unwrap().join("vfs-bulkio-serial.txt");
+    let _ = fs::remove_file(&dump_path);
+    unsafe {
+        std::env::set_var("M3OS_SMOKE_SERIAL_DUMP", &dump_path);
+    }
+
+    let steps = vfs_bulkio_smoke_steps(PKG);
+    println!(
+        "vfs-bulkio-smoke: launching QEMU (timeout {}s, {} steps; measuring `pkg install {PKG}` read batching)",
+        args.timeout_secs,
+        steps.len()
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    let run_result = run_smoke_script(&mut child, &steps, global_timeout);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    if let Err(msg) = run_result {
+        eprintln!("vfs-bulkio-smoke: FAILED\n{msg}");
+        std::process::exit(SMOKE_EXIT_VFS_BULKIO_FAILED);
+    }
+
+    // Parse the two `read_calls N` / `write_calls N` lines (baseline, then
+    // post-install) from the captured serial — `cat /proc/blkstats` is the only
+    // thing that prints them, so the first two matches of each are the snapshots.
+    let transcript = fs::read_to_string(&dump_path).unwrap_or_default();
+    let parse_counter = |key: &str| -> Vec<u64> {
+        transcript
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix(key))
+            .filter_map(|n| n.trim().parse::<u64>().ok())
+            .collect()
+    };
+    let read_calls = parse_counter("read_calls ");
+    let write_calls = parse_counter("write_calls ");
+    if read_calls.len() < 2 || write_calls.len() < 2 {
+        eprintln!(
+            "vfs-bulkio-smoke: FAILED — could not parse two read_calls/write_calls snapshots from \
+             /proc/blkstats (read={}, write={}). Serial dump: {}",
+            read_calls.len(),
+            write_calls.len(),
+            dump_path.display()
+        );
+        std::process::exit(SMOKE_EXIT_VFS_BULKIO_FAILED);
+    }
+    let (baseline, after) = (read_calls[0], read_calls[1]);
+    let delta = after.saturating_sub(baseline);
+    let write_delta = write_calls[1].saturating_sub(write_calls[0]);
+    let elapsed = start.elapsed().as_secs();
+
+    println!(
+        "vfs-bulkio-smoke: `pkg install {PKG}` issued Δ {delta} block reads + Δ {write_delta} block writes \
+         (read_calls {baseline} → {after})"
+    );
+    if delta > MAX_READ_CALLS_DELTA {
+        eprintln!(
+            "vfs-bulkio-smoke: FAILED — Δread_calls {delta} exceeds {MAX_READ_CALLS_DELTA}; the \
+             vfs_server block cache / 64 KiB read cap / contiguous-run coalescing / deferred metadata \
+             flush appear to have regressed (next stage up ~4,300, then ~8,900, then ~36k)."
+        );
+        std::process::exit(SMOKE_EXIT_VFS_BULKIO_FAILED);
+    }
+    if write_delta > MAX_WRITE_CALLS_DELTA {
+        eprintln!(
+            "vfs-bulkio-smoke: FAILED — Δwrite_calls {write_delta} exceeds {MAX_WRITE_CALLS_DELTA}; the \
+             64 KiB write cap / data-write coalescing / zero-fill skip / multi-block allocation appear \
+             to have regressed (next stage up ~2,546, then ~4,083). This also guards Track D fairness — \
+             more writes per WRITE request means higher per-request latency."
+        );
+        std::process::exit(SMOKE_EXIT_VFS_BULKIO_FAILED);
+    }
+    println!(
+        "vfs-bulkio-smoke: PASSED — install I/O: {delta} block reads + {write_delta} block writes \
+         (≤ {MAX_READ_CALLS_DELTA} / {MAX_WRITE_CALLS_DELTA}; from ~36k reads + ~7.8k writes originally — \
+         read cache + 64 KiB caps + read/write coalescing + deferred metadata flush + multi-block \
+         allocation, a ~11x total-I/O reduction) in {elapsed}s"
+    );
+}
+
+/// Serial script for `vfs-bulkio-smoke`: snapshot `/proc/blkstats`, install a
+/// multi-MiB package (reads its `.m3pkg` through the batched path and writes it
+/// back through the batched write path), snapshot again. Both the `read_calls`
+/// and `write_calls` before/after lines are parsed host-side from the serial dump.
+fn vfs_bulkio_smoke_steps(pkg: &'static str) -> Vec<SmokeStep> {
+    let install_cmd: &'static str = Box::leak(format!("pkg install {pkg}\n").into_boxed_str());
+    let ok_pattern: &'static str = Box::leak(format!("pkg install: {pkg}: OK").into_boxed_str());
+
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/vfs-bulkio-smoke: kernel first message",
+    }];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    // Baseline snapshot. `cat /proc/blkstats` prints the `read_calls N` line we
+    // parse host-side; the command text contains no `read_calls`, so only the
+    // output matches.
+    steps.push(SmokeStep::Send {
+        input: "cat /proc/blkstats\n",
+        label: "vfs-bulkio-smoke: baseline /proc/blkstats",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "read_calls ",
+        timeout_secs: 20,
+        label: "vfs-bulkio-smoke: baseline blkstats read",
+    });
+
+    // The measured operation: install reads the `.m3pkg` in 256 KiB chunks.
+    steps.push(SmokeStep::Send {
+        input: install_cmd,
+        label: "vfs-bulkio-smoke: pkg install (batched read of the .m3pkg)",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: ok_pattern,
+        fail_prefix: "pkg install: cannot",
+        timeout_secs: 1800,
+        label: "vfs-bulkio-smoke: package installed",
+        exit_code_on_fail: SMOKE_EXIT_VFS_BULKIO_FAILED,
+    });
+
+    // Post-install snapshot.
+    steps.push(SmokeStep::Send {
+        input: "cat /proc/blkstats\n",
+        label: "vfs-bulkio-smoke: post-install /proc/blkstats",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "write_calls ",
+        timeout_secs: 20,
+        label: "vfs-bulkio-smoke: post-install blkstats read",
+    });
+
+    // Read-back-compare: `pkg verify` re-reads every installed file and checks
+    // its SHA-256 against the hash recorded at pack time. This is the always-on
+    // correctness guard for the write path — in particular the zero-fill-skip
+    // multi-block write (`allocate_data_block(zero_fill=false)` + `write_block_run`):
+    // if a batched write ever left stale block content, verify would report a
+    // MISMATCH. Runs AFTER the post-install snapshot so its reads do not inflate
+    // the measured `read_calls`/`write_calls` deltas. The summary line prints
+    // `, 0 MISMATCH` iff every installed file's content round-tripped intact.
+    let verify_cmd: &'static str = Box::leak(format!("pkg verify {pkg}\n").into_boxed_str());
+    steps.push(SmokeStep::Send {
+        input: verify_cmd,
+        label: "vfs-bulkio-smoke: pkg verify (write read-back-compare)",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: ", 0 MISMATCH",
+        fail_prefix: "MISMATCH ",
+        timeout_secs: 600,
+        label: "vfs-bulkio-smoke: installed files verify clean",
+        exit_code_on_fail: SMOKE_EXIT_VFS_BULKIO_FAILED,
+    });
 
     steps
 }
@@ -17422,7 +17703,7 @@ fn populate_ext2_files(
     // local names first (musl's getaddrinfo reads /etc/hosts before sending
     // a DNS query).  The IPv6 localhost alias is included so AF_INET6-aware
     // tools that happen to resolve "localhost" do not emit spurious NXDOMAIN
-    // queries; AAAA resolution for external names remains scoped out (Phase 89).
+    // queries; AAAA resolution for external names remains scoped out (Phase 91).
     let etc_hosts_content = "127.0.0.1\tlocalhost\n\
                              ::1\tlocalhost ip6-localhost\n";
 

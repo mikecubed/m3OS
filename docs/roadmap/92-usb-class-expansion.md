@@ -1,7 +1,7 @@
-# Phase 90 - USB Class Expansion
+# Phase 92 - USB Class Expansion
 
 **Status:** Planned (post-1.0)
-**Source Ref:** phase-90
+**Source Ref:** phase-92
 **Depends on:** Phase 78a (xHCI Host Bring-Up) ✅, Phase 78b (USB Enumeration + Hub) ✅, Phase 78c (HID Boot Protocol + usb IPC service) ✅, Phase 83 (Release 1.0 Gate)
 **Builds on:** Extends the Phase 78 USB foundation — xHCI host driver, root-hub enumeration, HID Boot-Protocol keyboard + mouse, and the `usb` IPC service — with the full set of USB features explicitly deferred from 78c
 **Primary Components:** `userspace/drivers/usbhub` (live hub walker), `userspace/drivers/xhci` (the `usb` IPC server in `src/server.rs` — GetDescriptors, multi-tier slot assignment, isochronous scheduling), `kernel-core/src/usb/hid_report.rs` (Report Protocol wiring), `userspace/drivers/usb_mass_storage` (new — BOT + UAS facade), `userspace/drivers/usb_audio` (new — UAC isochronous PCM), `userspace/drivers/usb_video` (new — UVC isochronous frames)
@@ -12,7 +12,7 @@ m3OS supports the full USB class ecosystem deferred from the 1.0 release: multi-
 
 ## Why This Phase Exists
 
-Phase 78a/78b/78c were deliberately scoped to "minimum credible USB at 1.0": xHCI bring-up, root-hub enumeration, and HID Boot Protocol for one keyboard and one mouse. Every item in this phase is documented in the 78c design doc or task list with an explicit "→ Phase 90" deferral. Phase 90 makes good on those deferrals after the 1.0 gate, bringing m3OS to the USB class coverage expected of a general-purpose OS.
+Phase 78a/78b/78c were deliberately scoped to "minimum credible USB at 1.0": xHCI bring-up, root-hub enumeration, and HID Boot Protocol for one keyboard and one mouse. Every item in this phase is documented in the 78c design doc or task list with an explicit "→ Phase 92" deferral. Phase 92 makes good on those deferrals after the 1.0 gate, bringing m3OS to the USB class coverage expected of a general-purpose OS.
 
 ## Learning Goals
 
@@ -66,15 +66,15 @@ Phase 78a/78b/78c were deliberately scoped to "minimum credible USB at 1.0": xHC
 
 ### Hub enumeration and slot assignment
 
-A USB hub is itself a USB device — it enumerates like any other, then the host driver reads its Hub Descriptor to learn how many downstream ports it has. The hub drives power and reset to each port; the host then assigns a new slot to each downstream device exactly as it would for a root-hub port. The result is a device tree of arbitrary depth (up to the USB spec's 7-tier limit). The Phase 78b xHCI server only calls `Enable Slot` for root-hub ports; Phase 90 generalises slot assignment so `usbhub` can trigger it for tier-2+ devices via IPC.
+A USB hub is itself a USB device — it enumerates like any other, then the host driver reads its Hub Descriptor to learn how many downstream ports it has. The hub drives power and reset to each port; the host then assigns a new slot to each downstream device exactly as it would for a root-hub port. The result is a device tree of arbitrary depth (up to the USB spec's 7-tier limit). The Phase 78b xHCI server only calls `Enable Slot` for root-hub ports; Phase 92 generalises slot assignment so `usbhub` can trigger it for tier-2+ devices via IPC.
 
 ### HID Report vs. Boot Protocol
 
-Boot Protocol is a fixed 8-byte keyboard report and a fixed 3-byte mouse report — simple enough to parse in BIOS firmware. Report Protocol uses a descriptor that encodes each field's usage, size, and count; a touchpad might report X/Y/pressure as separate signed 16-bit fields plus multi-touch contact IDs. `parse_report_descriptor` in `kernel-core` already handles the descriptor language; Phase 90 connects its output to the running input pipeline so class drivers can drive arbitrary HID devices.
+Boot Protocol is a fixed 8-byte keyboard report and a fixed 3-byte mouse report — simple enough to parse in BIOS firmware. Report Protocol uses a descriptor that encodes each field's usage, size, and count; a touchpad might report X/Y/pressure as separate signed 16-bit fields plus multi-touch contact IDs. `parse_report_descriptor` in `kernel-core` already handles the descriptor language; Phase 92 connects its output to the running input pipeline so class drivers can drive arbitrary HID devices.
 
 ### Bulk-Only Transport and the block-device facade
 
-BOT wraps SCSI commands in a 31-byte Command Block Wrapper sent over the bulk-out endpoint and reads status from a 13-byte Command Status Wrapper on bulk-in. The `SubmitTransfer` page-grant mechanism in the `usb` IPC service can carry the data phase; Phase 90 programs the TRBs on the xHCI side and surfaces the result as a `RemoteBlockDevice` so the VFS mount path needs no modification.
+BOT wraps SCSI commands in a 31-byte Command Block Wrapper sent over the bulk-out endpoint and reads status from a 13-byte Command Status Wrapper on bulk-in. The `SubmitTransfer` page-grant mechanism in the `usb` IPC service can carry the data phase; Phase 92 programs the TRBs on the xHCI side and surfaces the result as a `RemoteBlockDevice` so the VFS mount path needs no modification.
 
 ## How This Builds on Earlier Phases
 
@@ -107,13 +107,13 @@ BOT wraps SCSI commands in a 31-byte Command Block Wrapper sent over the bulk-ou
 
 ## Companion Task List
 
-- [Phase 90 Task List](./tasks/90-usb-class-expansion-tasks.md) — to be authored when implementation planning begins.
+- [Phase 92 Task List](./tasks/92-usb-class-expansion-tasks.md) — to be authored when implementation planning begins.
 
 ## How Real OS Implementations Differ
 
-- Linux's `usbcore` + `hub.c` handle arbitrary hub depth natively; the driver framework makes multi-tier enumeration transparent. m3OS at Phase 90 wires this explicitly through the `usb` IPC service boundary.
+- Linux's `usbcore` + `hub.c` handle arbitrary hub depth natively; the driver framework makes multi-tier enumeration transparent. m3OS at Phase 92 wires this explicitly through the `usb` IPC service boundary.
 - Linux's HID subsystem uses Report Descriptors universally — Boot Protocol is only a BIOS fallback. m3OS ships Boot Protocol at 1.0 because it covers the 99% case with zero descriptor-parsing risk at bring-up.
-- Real OS hot-plug is interrupt-driven and fully asynchronous at every layer. m3OS at Phase 90 adds the Port Status Change → event surface path but may still serialize some re-enumeration steps through the xHCI server's single-threaded IPC loop.
+- Real OS hot-plug is interrupt-driven and fully asynchronous at every layer. m3OS at Phase 92 adds the Port Status Change → event surface path but may still serialize some re-enumeration steps through the xHCI server's single-threaded IPC loop.
 - BOT is considered legacy in the USB 3.x era; UAS is the preferred SCSI transport for USB 3.0 drives. m3OS ships both and selects UAS when the device advertises it.
 - Production OSes support UAC 2.0 and UAC 3.0 (high-speed isochronous, multiple sampling rates, feedback endpoints). m3OS at this phase targets UAC 1.0 full-speed isochronous only.
 - UVC device profiles, format negotiation, and compressed streams (H.264, MJPEG) — deferred.
@@ -134,14 +134,14 @@ BOT wraps SCSI commands in a 31-byte Command Block Wrapper sent over the bulk-ou
 
 These are latent in the 78c xHCI server because the live HID-boot path never
 exercises them (it issues only zero-length `SET_PROTOCOL`/`SET_IDLE` control
-transfers and never reads descriptors over IPC), but the Phase 90 tracks that
+transfers and never reads descriptors over IPC), but the Phase 92 tracks that
 make `GetDescriptors` / `ControlRequest`-with-data / `SubmitTransfer` live must
 address them:
 
 - **DMA-buffer lifetime for repeated control reads.** `control_transfer`
   allocates a fresh `DmaBuffer` per data-stage IN transfer, and `DmaBuffer::drop`
   does **not** free the region (the kernel reclaims DMA only on process exit). In
-  the never-exiting USB server, a Phase-90 caller issuing many control IN reads
+  the never-exiting USB server, a Phase-92 caller issuing many control IN reads
   would leak monotonically. Fix when the path goes live: a persistent per-slot
   control bounce buffer (as interrupt endpoints already keep), or a DMA-free
   syscall.

@@ -113,7 +113,7 @@ the task list. Each was a real, general fix (not a clang hack):
    source → recursive self-include. Fixed by resolving the real ext2 inode at
    VFS open and reporting it as `st_ino`. Full root-cause + systemic findings:
    `docs/post-mortems/2026-06-06-vfs-fstat-inode-identity-and-ext2-dual-impl.md`;
-   the systemic audit is tracked as **Phase 93**.
+   the systemic audit is tracked as **Phase 88**.
 
 **Result — clang fully works in-OS, validated end-to-end.** Final validation: a
 fresh-disk `pkg install clang` + **9 in-OS compiles** (`M3OS_CLANG_STRESS`) all

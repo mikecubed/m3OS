@@ -1,13 +1,13 @@
 # Rust on m3OS: `std` Userspace, Dynamic libc, and a Native Toolchain
 
 **Aligned Roadmap Phase:** Phase 44 — Rust Cross-Compilation (this doc), with
-forward dependencies on Phase 91 (Dynamic C Runtime), Phase 94 (Rust-Cargo
+forward dependencies on Phase 93 (Dynamic C Runtime), Phase 94 (Rust-Cargo
 Ports), and Phase 95 (Native Rust Toolchain)
 **Status:** Phase 44 complete; re-evaluated against the current tree (post-85d /
 86d). Residual gaps and the path to a native toolchain tracked here.
 **Source Ref:** phase-44
 **Related:** [Phase 44 design doc](../roadmap/44-rust-cross-compilation.md),
-[Phase 91 — Dynamic C Runtime](../roadmap/91-dynamic-c-runtime.md),
+[Phase 93 — Dynamic C Runtime](../roadmap/93-dynamic-c-runtime.md),
 [Phase 94 — Rust-Cargo Ports](../roadmap/94-rust-cargo-uutils.md),
 [Phase 95 — Native Rust Toolchain](../roadmap/95-native-rust-toolchain.md),
 [`architecture-and-syscalls.md`](./architecture-and-syscalls.md)
@@ -27,7 +27,7 @@ maturities. Keeping them apart is the single most important thing this doc does:
 | Goal | What it means | Status | Gating work |
 |---|---|---|---|
 | **A. Run Rust `std` *programs*** | A Rust binary compiled on the host runs in m3OS | ✅ **Done** (Phase 44), and far sturdier than the original doc claimed | This doc + Phase 94 extends it to cargo-cross ports |
-| **B. Dynamic libc** | A real `libc.so` exists so dynamic objects (incl. proc-macro `.so`s) can bind | 🟡 Linker machinery done (Phase 76 → 76d); **no `libc.so` yet** | **Phase 91** (Planned) |
+| **B. Dynamic libc** | A real `libc.so` exists so dynamic objects (incl. proc-macro `.so`s) can bind | 🟡 Linker machinery done (Phase 76 → 76d); **no `libc.so` yet** | **Phase 93** (Planned) |
 | **C. Run the Rust *toolchain* on-device** | `rustc`/`cargo` compile Rust *inside* m3OS | ❌ Not started | Phase 95 (needs B for proc-macros) |
 
 The common confusion is to treat C as a small extension of "Go runs on m3OS"
@@ -198,7 +198,7 @@ memory (47) work that closed several entries. Current status:
 |---|---|---|
 | `prlimit64` (302) / `getrlimit` (97) | **Phase 85d** | `sys_prlimit64` accepts-and-ignores `new_rlim`, writes generous defaults; LLVM-class tools probe rlimits |
 | File-backed `mmap` (was anonymous-only) | **Phase 47** (Strategy A, eager-load) | `MAP_PRIVATE`/`MAP_SHARED` file-backed; demand-paged Strategy B still deferred |
-| `pread64` (17) / `pwrite64` (18) | **Phase 85d** | Positional I/O — "THE compile blocker" for LLVM; `pwrite64` non-atomicity tracked in Phase 93 |
+| `pread64` (17) / `pwrite64` (18) | **Phase 85d** | Positional I/O — "THE compile blocker" for LLVM; `pwrite64` non-atomicity tracked in Phase 88 |
 | `epoll_pwait` (281) | **Phase 86d** | Delegates to `sys_epoll_wait` (Go passes a nil sigmask) |
 | `eventfd2` (290) | **Phase 86d** | Full `EFD_SEMAPHORE`/`EFD_NONBLOCK`/`EFD_CLOEXEC` + epoll/poll wakeup |
 | `MAP_FIXED` arena commit + `PROT_NONE` reservations | **Phase 86d** | The Go runtime's reserve-then-commit arena contract |
@@ -218,7 +218,7 @@ phase here because they may not yet be on `main` when this doc is read.)*
 | `pidfd_*` | Not implemented. `std::process` does not require it. |
 | `prctl` / `personality` | Partial / stubs. Sandboxing libraries, not `std`. |
 | `utimensat` on **tmpfs** | `-ENOSYS` on tmpfs; **works on ext2** (sets atime/mtime/ctime). See timestamps below. |
-| `mremap` (25) | Not implemented. musl `realloc` of large mmap chunks falls back to map-copy-unmap; **explicitly in Phase 91 scope** (a dynamic libc exercises it). |
+| `mremap` (25) | Not implemented. musl `realloc` of large mmap chunks falls back to map-copy-unmap; **explicitly in Phase 93 scope** (a dynamic libc exercises it). |
 
 ### Catch-all behavior
 
@@ -244,7 +244,7 @@ the project's primary syscall-gap discovery mechanism.
 > **Important distinction for dynamic linking:** this is *static-binary* TLS
 > (the kernel sets `FS` for a statically-linked musl thread). It is **not**
 > dynamic-loader TLS — the from-scratch `ld-musl` loader has **no** TLS-block /
-> `TPOFF`/`DTPMOD` handling. That gap is a Phase 91 prerequisite and the
+> `TPOFF`/`DTPMOD` handling. That gap is a Phase 93 prerequisite and the
 > dominant risk there (see Dynamic Linking below).
 
 Atomics work: the target spec sets `max-atomic-width: 64` and cores have native
@@ -264,7 +264,7 @@ atomics.
 - **`stat` identity.** Phase 85d fixed the acute `fstat`-by-fd `st_ino=0` bug
   (recursive-`#include` dedup collapse). The systemic pass — one canonical
   `fill_stat()` serializer, same `(st_dev, st_ino)` by path or fd, kernel-ext2
-  vs `vfs_server` reconciliation — is **Phase 93** (and matters for `cargo`'s
+  vs `vfs_server` reconciliation — is **Phase 88** (and matters for `cargo`'s
   build-graph correctness, hence a Phase 95 dependency).
 - **Path lookup.** `openat(AT_FDCWD, …)` and relative-to-dirfd lookups work.
 
@@ -296,12 +296,12 @@ atomics.
   `brk` (honored); thread stacks get guard pages during `clone`.
 - No `mmap`-flag divergence has bitten the demo/port set, but a real dynamic
   libc will exercise `mremap` and tighter `MAP_*`/`PROT_*` flag coverage
-  (Phase 91).
+  (Phase 93).
 - Binary size: a stripped/LTO'd musl `std` hello-world is ~300 KB; the five
   demos add ~1.5–2 MB to the initrd. (Phase 94 ports ship as on-disk `.m3pkg`s,
   not initrd, so size pressure there is the install/VFS cost, not the kernel ELF.)
 
-## Dynamic Linking and a Real `libc.so` (Phase 91)
+## Dynamic Linking and a Real `libc.so` (Phase 93)
 
 The original doc said: *"All Rust `std` programs are statically linked against
 musl by design and there is no plan to support `.so` loading."* **Both halves
@@ -325,7 +325,7 @@ static** precisely to dodge this. The synthetic test `.so`s (`libhello.so`, the
 cyclic pair, the GNU-hash/versioned demos) reference *no* libc symbols, which is
 why the gap stayed hidden until CPython.
 
-**Phase 91 (Dynamic C Runtime, Planned)** closes it:
+**Phase 93 (Dynamic C Runtime, Planned)** closes it:
 - **Area A** — ship a real upstream musl `libc.so` at `/usr/lib/libc.so`
   (recommended: make `/lib/ld-musl-x86_64.so.1` *be* upstream musl).
 - **Area B** — close the syscalls a dynamic libc invokes at startup; `mremap`
@@ -343,8 +343,8 @@ is low–medium; TLS is high; copy-relocs/IFUNC medium-high.
 (`serde_derive`, `thiserror`, …) are `cdylib` `.so`s that `rustc` **`dlopen`s at
 compile time**. With no `libc.so` in scope, every external relocation in that
 `.so` is undefined and the load fails. So a native on-device `rustc` could
-compile *proc-macro-free* crates without Phase 91, but the mainstream ecosystem
-needs Phase 91's `libc.so` + loader TLS first. This is the same wall clang,
+compile *proc-macro-free* crates without Phase 93, but the mainstream ecosystem
+needs Phase 93's `libc.so` + loader TLS first. This is the same wall clang,
 Python, and Go all hit — harder here, because proc-macros are pervasive.
 
 ## Native On-Device Toolchain (Phase 95)
@@ -361,12 +361,12 @@ is its own phase. The full design is in
   on-device **LLD** (rustc's default `rust-lld`).
 - **New / hard:** a fully-static musl `rustc` bootstrap; a **userspace** target
   spec + prebuilt std sysroot (the kernel `x86_64-m3os.json` is unusable for
-  userspace); proc-macro support (gated on Phase 91); cargo registry + `build.rs`;
+  userspace); proc-macro support (gated on Phase 93); cargo registry + `build.rs`;
   and absorbing a 200–500 MB artifact through the ~200 KB/s ring-3 VFS
-  (mitigated by Phase 92).
+  (mitigated by Phase 87).
 - **Smaller alternative:** `mrustc` (a C++ Rust-subset compiler emitting C, no
   LLVM, no proc-macro `dlopen`) is a legitimate first cut that does not need
-  Phase 91, at the cost of language coverage.
+  Phase 93, at the cost of language coverage.
 
 ## Recommended Sequencing
 
@@ -375,13 +375,13 @@ Dependency-ordered path from "Rust programs run" to "Rust compiles on-device":
 1. **Keep this doc current** (done — this revision).
 2. **Phase 94** — the cargo-musl port class + uutils. No kernel work; proves the
    Rust-port machinery. Do regardless of the toolchain ambition.
-3. **Phase 91** — the dynamic `libc.so` keystone. Unblocks dynamic linking
+3. **Phase 93** — the dynamic `libc.so` keystone. Unblocks dynamic linking
    generally, dynamic Python/`ctypes`, *and* proc-macros. Budget heavily for
    loader **TLS**.
 4. **Phase 95** — native rustc. Clang-class port: static bootstrap, bundled LLD,
    userspace target + prebuilt std, `M3OS_WITH_RUST`. First milestone:
    `rustc hello.rs && ./hello` (proc-macro-free). `cargo` + derive macros ride
-   Phase 91.
+   Phase 93.
 
 ## When to Choose Each Path (for new userspace work today)
 
@@ -418,7 +418,7 @@ To confirm the `std` pipeline still works after kernel changes:
   cross-compilation milestone.
 - [Phase 94 — Rust-Cargo Ports & uutils](../roadmap/94-rust-cargo-uutils.md) —
   the cargo-cross port class that succeeds Phase 44's ramdisk pipeline.
-- [Phase 91 — Dynamic C Runtime](../roadmap/91-dynamic-c-runtime.md) — the
+- [Phase 93 — Dynamic C Runtime](../roadmap/93-dynamic-c-runtime.md) — the
   `libc.so` keystone (and the proc-macro prerequisite).
 - [Phase 95 — Native Rust Toolchain](../roadmap/95-native-rust-toolchain.md) —
   on-device `rustc`/`cargo`.

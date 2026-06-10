@@ -141,7 +141,7 @@ A per-connection RTO timer (one-shot, rescheduled on every ack). The four-slot a
 
 - KPTI, retpoline, IBRS toggling — Phase 84
 - TCP congestion control beyond Reno-style retransmission — post-1.0
-- IPv6 and DHCPv6 — Phase 89
+- IPv6 and DHCPv6 — Phase 91
 - DNS caching and DNSSEC — post-1.0
 - Microcode update via online package management — never (rebuild the disk image)
 - `tlsdesc` and `PT_TLS` for `dlopen`-loaded `.so` modules — Phase 76 (dynamic linker) territory
