@@ -1001,6 +1001,163 @@ pub fn cmd_port_build(name: &str) -> i32 {
     }
 }
 
+/// Ports with a host build recipe (the `port_build` dispatch arms + the
+/// `go`/`gh` early-return branches). Other Portfiles in the tree (`bc`, `sbase`,
+/// `mandoc`, `lua`, `minizip`, `ca-certificates`) are built via the legacy
+/// Phase-69d path or staged differently and are not driven by `port build`.
+pub const BUILDABLE_PORTS: &[&str] = &[
+    "zlib", "ncurses", "libevent", "mbedtls", "dropbear", "llvm", "go", "gh", "python", "less",
+    "htop", "tmux", "curl", "git",
+];
+
+/// A port's declared `DEPS=` (whitespace-separated), restricted to `within` —
+/// the set we're ordering. Returns empty on a missing/unreadable Portfile.
+fn port_deps_within(name: &str, within: &[&str]) -> Vec<String> {
+    let Some(dir) = find_port_dir(name) else {
+        return Vec::new();
+    };
+    let Ok(meta) = parse_portfile(&dir.join("Portfile")) else {
+        return Vec::new();
+    };
+    meta.get("DEPS")
+        .map(|d| {
+            d.split_whitespace()
+                .filter(|dep| within.contains(dep))
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Topologically order `ports` so each port's (in-set) dependencies precede it.
+/// Depth-first; duplicates and out-of-set deps are ignored.
+fn topo_order(ports: &[&str]) -> Vec<String> {
+    fn visit(n: &str, ports: &[&str], out: &mut Vec<String>) {
+        if out.iter().any(|x| x == n) {
+            return;
+        }
+        for d in port_deps_within(n, ports) {
+            visit(&d, ports, out);
+        }
+        if !out.iter().any(|x| x == n) {
+            out.push(n.to_string());
+        }
+    }
+    let mut out = Vec::new();
+    for p in ports {
+        visit(p, ports, &mut out);
+    }
+    out
+}
+
+/// `cargo xtask port list` — every Portfile in the tree with its version, deps,
+/// whether `port build` can build it, and whether it is built on this machine.
+pub fn cmd_port_list() -> i32 {
+    let root = workspace_root();
+    let stage_root = root.join("target/port-stage");
+    let ports_dir = root.join("ports");
+    let mut entries: Vec<(String, String, String, bool, bool)> = Vec::new();
+    for cat in ["lib", "util", "core", "doc", "lang", "math"] {
+        let Ok(rd) = fs::read_dir(ports_dir.join(cat)) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let pf = e.path().join("Portfile");
+            if !pf.exists() {
+                continue;
+            }
+            let Ok(meta) = parse_portfile(&pf) else {
+                continue;
+            };
+            let name = meta
+                .get("NAME")
+                .cloned()
+                .unwrap_or_else(|| e.file_name().to_string_lossy().into_owned());
+            let ver = meta.get("VERSION").cloned().unwrap_or_default();
+            let deps = meta.get("DEPS").cloned().unwrap_or_default();
+            let recipe = BUILDABLE_PORTS.contains(&name.as_str());
+            let built = stage_root.join(format!("{name}.stamp")).exists();
+            entries.push((name, ver, deps, recipe, built));
+        }
+    }
+    entries.sort();
+    println!(
+        "{:<16} {:<10} {:<7} {:<6} DEPS",
+        "PORT", "VERSION", "RECIPE", "BUILT"
+    );
+    for (name, ver, deps, recipe, built) in &entries {
+        println!(
+            "{:<16} {:<10} {:<7} {:<6} {}",
+            name,
+            ver,
+            if *recipe { "yes" } else { "no" },
+            if *built { "yes" } else { "-" },
+            if deps.is_empty() { "-" } else { deps }
+        );
+    }
+    println!(
+        "\n{} Portfiles, {} with a host build recipe. \
+         `cargo xtask port build all` builds the recipe set in dependency order; \
+         `cargo xtask port build <name>` builds one (deps must be built first — \
+         or use `build all`).",
+        entries.len(),
+        BUILDABLE_PORTS.len()
+    );
+    0
+}
+
+/// `cargo xtask port build all` — build every recipe port in dependency order,
+/// skipping pkgcache hits. A failed port causes its (in-set) dependents to be
+/// skipped; the run continues and prints a PASS/FAIL/SKIP summary. Exit code is
+/// nonzero if any port failed. Note: the heavy ports (`go`/`gh`/`llvm`/`python`)
+/// need their own toolchains (Go download, host clang/cmake/ninja, musl cross);
+/// missing prerequisites surface as a FAIL for that port without aborting the rest.
+pub fn cmd_port_build_all() -> i32 {
+    let order = topo_order(BUILDABLE_PORTS);
+    println!(
+        "ports: build all — dependency order: {}",
+        order.join(" -> ")
+    );
+    let mut passed: Vec<String> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    for name in &order {
+        let blocked: Vec<String> = port_deps_within(name, BUILDABLE_PORTS)
+            .into_iter()
+            .filter(|d| failed.contains(d) || skipped.contains(d))
+            .collect();
+        if !blocked.is_empty() {
+            println!(
+                "ports: SKIP {name} (dependency not built: {})",
+                blocked.join(", ")
+            );
+            skipped.push(name.clone());
+            continue;
+        }
+        println!("\nports: ===== building {name} =====");
+        match port_build(name) {
+            Ok(()) => passed.push(name.clone()),
+            Err(msg) => {
+                eprintln!("ports: FAIL {name}: {msg}");
+                failed.push(name.clone());
+            }
+        }
+    }
+    println!(
+        "\nports: build all summary — {} passed, {} failed, {} skipped",
+        passed.len(),
+        failed.len(),
+        skipped.len()
+    );
+    if !failed.is_empty() {
+        println!("  failed:  {}", failed.join(", "));
+    }
+    if !skipped.is_empty() {
+        println!("  skipped: {}", skipped.join(", "));
+    }
+    if failed.is_empty() { 0 } else { 1 }
+}
+
 fn port_build(name: &str) -> Result<(), String> {
     let port_dir =
         find_port_dir(name).ok_or_else(|| format!("port {name} not found in ports/ tree"))?;
