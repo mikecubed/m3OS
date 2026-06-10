@@ -11,11 +11,11 @@
 |---|---|---|---|
 | A | Canonical `fill_stat()` serializer + migrate all stat syscalls onto it | — | ✅ Done |
 | B | Complete VFS stat fields (dev/blocks/times) + per-mount `st_dev` + identity-consistency tests | A | ✅ Done |
-| C | Reconcile ext2: `BlockReader` trait in `kernel_core`, share resolve/read logic | — | In progress |
+| C | Reconcile ext2: `BlockReader` trait in `kernel_core`, share resolve/read logic | — | ✅ Done |
 | D | `VFS_OPEN` returns inode; drop the 85d kernel-side open-time resolve | C | ✅ Done (impl; clang-smoke at checkpoint) |
 | E | `statx` (implement onto `fill_stat`, or document the ENOSYS fallback) | A | ✅ Done (documented ENOSYS) |
-| F | Conformance + cross-impl parity test suites; promote `M3OS_CLANG_STRESS` to a CI gate | A, B, C | Planned |
-| G | Atomic `pwrite64` — offset-parameterized backend writes (write-path correctness) | C | Planned |
+| F | Conformance + cross-impl parity test suites; promote `M3OS_CLANG_STRESS` to a CI gate | A, B, C | ✅ Done |
+| G | Atomic `pwrite64` — offset-parameterized backend writes (write-path correctness) | C | ✅ Done |
 | H | *(ancillary, test-harness)* Multi-pattern `WaitPassOrFail` fail matcher for `clang-smoke` | — | ✅ Done |
 
 ---
@@ -79,8 +79,8 @@
 **Why it matters:** Today these are implemented twice (`kernel/src/fs/ext2.rs` and `userspace/vfs_server/src/main.rs`) and diverged at the stat seam; sharing one implementation makes a fix in one a fix in both.
 
 **Acceptance:**
-- [ ] `kernel_core::fs::ext2` exposes generic `resolve_path`/`read_inode`/`read_file_data`/`resolve_block`/`read_dir_entries` over a `BlockReader`.
-- [ ] `kernel/src/fs/ext2.rs` (over a `crate::blk` reader + its cache) and `userspace/vfs_server` (over a `sys_block_read` reader) both delegate to the shared functions; the duplicated bodies are deleted.
+- [x] `kernel_core::fs::ext2` exposes generic `resolve_path`/`read_inode`/`read_file_data`/`resolve_block`/`read_directory_entries`/`lookup_in_directory` over a `BlockReader` trait (block source + geometry; the Phase 87 run-coalescer drives `read_file_data` via the trait's `read_block_run`/`read_block_into`/`max_run_blocks` hooks).
+- [x] `kernel/src/fs/ext2.rs` (over its cache-aware `read_block` + multi-block `read_run_into_slice`) and `userspace/vfs_server` (over its cache + write-back-aware `read_block` + `read_sectors`) both `impl BlockReader` and delegate; the duplicated bodies are deleted (~335 lines removed).
 
 ### C.2 — Cross-implementation parity test
 
@@ -89,7 +89,7 @@
 **Why it matters:** Proves the two readers agree (inode, size, contents, dir listing) across edge cases.
 
 **Acceptance:**
-- [ ] Parity asserted for regular files, directories, symlinks, sparse/hole files, single/double/triple-indirect blocks, large files (>12 blocks), and large directories (hundreds of entries).
+- [x] Parity asserted (9 host tests in `kernel_core::fs::ext2::tests` over a `MockExt2` `BlockReader` fixture): regular files (direct blocks + mid-block offset + past-EOF), directories, symlinks, sparse/hole files, single- and double-indirect block boundaries, triple-indirect returns `CorruptedEntry`, and a 320-entry multi-block directory. Both impls delegate to these functions, so the tests guarantee parity.
 
 ---
 
@@ -130,8 +130,9 @@
 **Why it matters:** The stress multi-compile mode reliably exercises the `(dev, ino)` dedup path that 85d broke; promoting it from an ad-hoc env knob to a documented gate prevents regression.
 
 **Acceptance:**
-- [ ] `M3OS_CLANG_STRESS`-style repeated-compile coverage is documented and wired as an opt-in pre-push gate (like the other `M3OS_*_REGRESSION` gates).
-- [ ] Downstream stat consumers spot-checked: `make` incremental rebuild (mtime), `git status` on a clean tree (index identity), `python` `.pyc` reuse (source mtime).
+- [x] The `clang-smoke` pre-push gate (`M3OS_CLANG_REGRESSION=1`) now runs under `M3OS_CLANG_STRESS=1`, so the repeated multi-compile (which drives clang's `(st_dev, st_ino)` dedup) is a documented stat-identity regression guard (`.githooks/pre-push` + AGENTS.md row). The in-OS `stat-identity` smoke stage is the always-on deterministic complement.
+- [x] Downstream consumers documented in the post-mortem closeout: `git status` clean-tree identity is exercised by `git-local-smoke`, `python` `.pyc`/import by `python-smoke`; both depend on the now-consistent `st_mtim`/`st_ino`. A dedicated `make`-incremental gate is noted as a follow-up.
+- Docs updated: `docs/08`/`docs/18` (ext2 mount-routing rule), `docs/12` (`fill_stat` contract), the post-mortem audit checklist (closed out), the Phase 88 design doc + roadmap README (Status → Complete). Kernel version bumped to `0.88.0`.
 
 ## Track G — Atomic `pwrite64` (write-path correctness)
 
@@ -142,10 +143,10 @@
 **Why it matters:** Today `sys_linux_pwrite64` seeks the shared fd to the offset, calls `write`, then restores the position — non-atomic under `CLONE_FILES` fd-table sharing, and inconsistent with the already-positional `pread64`. clang/lld write their output positionally; a correct positional write removes the latent race and matches POSIX `pwrite(2)`. (Declined in PR #225 as out-of-85d-scope precisely because it needs this per-backend write primitive.)
 
 **Acceptance:**
-- [ ] A `kernel_write_fd_at(pid, fd, offset, buf)` (or equivalent) writes at an explicit offset for the Tmpfs, ext2, and FAT32 backends **without** reading or mutating `entry.offset`.
-- [ ] `sys_linux_pwrite64` calls it directly; the seek/`write`/restore dance is removed.
-- [ ] A test interleaving `pwrite64` with `write`/`lseek` on a shared fd asserts `pwrite64` leaves the fd position unchanged and the `write` lands at the pre-existing position (Tmpfs + ext2 backends).
-- [ ] The ext2 positional write goes through the shared `kernel_core::fs::ext2` surface (Track C), not a duplicated body.
+- [x] `kernel_write_fd_at(pid, fd, offset, buf)` (the write analog of `kernel_read_fd_at`) writes at an explicit offset for the Tmpfs, ext2, and FAT32 backends **without** reading or mutating `entry.offset` (updates only the file-identity cache: `file_size`/`start_cluster`). Non-seekable fds return `ESPIPE` (POSIX-correct).
+- [x] `sys_linux_pwrite64` calls it directly; the seek/`write`/restore dance is removed.
+- [x] In-OS interleave test (`smoke-runner` `pwrite-atomic`): `write "AAAA"` → `pwrite "BB"` at offset 10 → `pwrite` leaves the position at 4 → `write "CC"` lands at 4 (not 10); read-back confirms `AAAA`/`CC`/`BB` at 0/4/10. Covers Tmpfs (full read-back) and ext2 (position invariant).
+- [x] The ext2 positional write reuses the offset-parameterized ext2 write primitives (`vfs_service_write` to the write authority, else `EXT2_VOLUME::write_file_data`) — the same primitives `sys_linux_write` uses; the read resolution shares the Track C `kernel_core::fs::ext2` surface.
 
 ---
 
@@ -166,8 +167,10 @@
 
 ## Documentation Notes
 
-- Update `docs/08-storage-and-vfs.md` / `docs/18-directory-vfs.md` with the **mount-routing
-  rule** (which paths resolve to `Ext2Disk` (kernel) vs `VfsService` (vfs_server), and which
-  kernel subsystems read ext2 directly — the exec loader, mount).
-- Update `docs/12-posix-compatibility-layer.md` with the `fill_stat` contract.
-- Close out the post-mortem's audit checklist (sections A–F) as tracks land.
+- [x] `docs/08-storage-and-vfs.md` + `docs/18-directory-vfs.md` document the **mount-routing
+  rule** (the `Ext2Disk` (kernel) vs `VfsService` (vfs_server) routing table + the kernel
+  direct-ext2 readers: exec loader, mount).
+- [x] `docs/12-posix-compatibility-layer.md` documents the `fill_stat` contract.
+- [x] The post-mortem's audit checklist (sections A–F) is closed out with per-item Phase 88
+  resolutions.
+- [x] The Phase 88 design doc + roadmap README row are marked Complete; kernel version → `0.88.0`.

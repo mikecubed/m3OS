@@ -293,6 +293,30 @@ The `is_directory()` helper checks all backends in order: root `/`
 itself, tmpfs via `stat`, then ramdisk via `ramdisk_lookup`. This
 function is used by `chdir`, `open` with `O_DIRECTORY`, and `openat`.
 
+### ext2 root: `Ext2Disk` (kernel) vs `VfsService` (vfs_server) — Phase 88
+
+The ext2 root filesystem (`/`, mounted by `init` via the `vfs_server`) is read
+by **two** engines, and which one serves a given access is non-obvious — this
+cost real diagnosis time in the 85d incident, so the rule is pinned here:
+
+| Access | Backend | Engine |
+|---|---|---|
+| `open(O_RDONLY)` of a **regular** ext2 file | `VfsService` | ring-3 `vfs_server` |
+| `open` for **write** / `O_CREAT` / `O_TRUNC` / non-regular | `Ext2Disk` | in-kernel `EXT2_VOLUME` (writes route to the `vfs_server` write authority via `vfs_service_write`) |
+| `stat`/`fstatat` of an ext2 path | `vfs_server` `VFS_STAT_PATH` when routable, else in-kernel `EXT2_VOLUME` | — |
+| `getdents64` of an ext2 subdir | `vfs_server` `VFS_LIST_DIR` when `vfs_service_can_list_dir`, else the in-kernel merge path | — |
+| The **exec loader** (`DiskElfSource`) and early **mount** | always in-kernel `EXT2_VOLUME` | — |
+
+The gate is `vfs_service_should_route(path, flags)` — it routes only **read-only,
+non-creating, non-truncating** opens of **regular** ext2 files to the
+`vfs_server`. Everything else (writes, directories reached via the overlay merge,
+the exec loader, mount) reads the in-kernel `EXT2_VOLUME` directly. Both engines
+read through the **same shared logic** since Phase 88 Track C
+(`kernel_core::fs::ext2` over a `BlockReader`), so the inode numbers / sizes /
+contents they return are identical by construction; `fstat` for a `VfsService` fd
+reports a `VfsFileMeta` snapshot captured from the `VFS_OPEN` reply, so it matches
+`fstatat` for the same path. The `vfs_server` is the ext2 **write authority**.
+
 ## Limitations
 
 These features are deferred to future phases:

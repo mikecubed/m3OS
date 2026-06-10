@@ -253,3 +253,31 @@ Each user process gets a private PML4 with three regions:
 - **Kernel PML4**: Stored once in `KERNEL_PML4_PHYS` during `mm::init` and used
   by `new_process_page_table` instead of `Cr3::read()` to avoid inheriting a
   dead process's mappings.
+
+## File Metadata: the `fill_stat` contract (Phase 88)
+
+`stat` correctness used to depend on each syscall hand-assembling a `struct stat`
+field-by-field. A single omitted field (`st_ino`, on one backend) shipped
+unnoticed and broke clang (the 85d incident). Phase 88 made this defect class
+structurally impossible:
+
+- **One normalized struct, one serializer.** `FileMeta { dev, ino, nlink, mode,
+  uid, gid, rdev, size, blksize, blocks, atime, mtime, ctime }` is the canonical
+  in-kernel file metadata. `fill_stat(&FileMeta) -> [u8; 144]` is the **only**
+  place `struct stat` byte offsets are written. Every stat-producing syscall —
+  `fstat`(5), and `stat`(4)/`lstat`(6)/`newfstatat`(262) via `sys_linux_fstatat`
+  — builds a `FileMeta` per backend and serializes through `fill_stat`. A missing
+  field is now a `FileMeta::new()` default, not a silently-skipped write.
+- **Enforced.** A `cargo xtask check` *stat-assembly gate* fails the build if any
+  new `stat[<n>..` byte-offset write appears outside `fill_stat`.
+- **Consistency.** A `VfsService` (vfs_server-backed) fd's `fstat` reports a
+  `VfsFileMeta` snapshot captured from the `VFS_OPEN` reply, so it equals
+  `fstatat` for the same path field-for-field (no second ext2 resolve). Each
+  filesystem gets a distinct synthetic `st_dev` (`stat_dev_for_backend`) so
+  `(st_dev, st_ino)` is unique across filesystems. `getdents64` `d_ino` is the
+  entry's real inode (`path_ino`), matching `stat` `st_ino`.
+- **`statx`(332)** intentionally returns **ENOSYS**; glibc/musl fall back to
+  `newfstatat`, which `fill_stat` makes lossless. See the Phase 88 design doc.
+
+The always-on `smoke-runner` `stat-identity` stage asserts these invariants in-OS
+(`fstat == fstatat`, distinct `st_dev`, `d_ino == st_ino`, `statx → ENOSYS`).
