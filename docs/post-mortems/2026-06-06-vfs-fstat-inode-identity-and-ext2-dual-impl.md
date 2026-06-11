@@ -294,6 +294,13 @@ Phase 88 implemented this checklist. Boxes below are checked with the resolution
 **F. Downstream consumers (regression-grade)**
 - [x] clang multi-header compile (the original symptom): the `clang-smoke` gate runs under
       `M3OS_CLANG_STRESS=1` as a promoted pre-push stat-identity regression guard (Track F).
+      **NOTE — separate pre-existing failure surfaced:** the `clang-smoke` gate currently
+      fails (confirmed identical on the pre-Phase-88 commit `ef1b6b21`): clang compiles fine,
+      but `lld`'s `PROT_WRITE` file-backed-mmap output on `/tmp` is not written back →
+      all-zeros binary (`cannot find _start` / `InvalidMagic`). This is a Phase 86/87
+      file-backed-mmap-write-back regression unrelated to the stat work — tracked as a
+      follow-up. The deterministic `stat-identity` smoke stage is the green stat-identity
+      guard meanwhile.
 - [~] `make`/`git`/`python` rely on the now-correct, consistent `st_mtim`/`st_ino`; the
       existing `git-local-smoke` (clean-tree `git status`) and `python-smoke` gates
       exercise them. A dedicated `make`-incremental gate is a follow-up.

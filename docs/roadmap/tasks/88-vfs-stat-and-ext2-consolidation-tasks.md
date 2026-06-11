@@ -134,6 +134,21 @@
 - [x] Downstream consumers documented in the post-mortem closeout: `git status` clean-tree identity is exercised by `git-local-smoke`, `python` `.pyc`/import by `python-smoke`; both depend on the now-consistent `st_mtim`/`st_ino`. A dedicated `make`-incremental gate is noted as a follow-up.
 - Docs updated: `docs/08`/`docs/18` (ext2 mount-routing rule), `docs/12` (`fill_stat` contract), the post-mortem audit checklist (closed out), the Phase 88 design doc + roadmap README (Status → Complete). Kernel version bumped to `0.88.0`.
 
+> **⚠️ Follow-up surfaced by promoting the gate (NOT a Phase 88 regression).**
+> Running `clang-smoke` (incl. `M3OS_CLANG_STRESS`) currently **fails**, but the
+> failure is **pre-existing** — confirmed by running the gate unchanged on
+> `ef1b6b21` (Phase 87 tip, before any Phase 88 commit): it fails **identically**
+> (`ld.lld: cannot find entry symbol _start` → `/tmp/hello: InvalidMagic`). Phase
+> 88 is exonerated: clang **compiles** fine (every VFS read works → a valid
+> `hello.o`); the corruption is in **lld's output write** — its `PROT_WRITE`
+> file-backed mmap of the `/tmp` (tmpfs) output never writes the dirty pages back,
+> so the linked binary is all-zeros. That path (file-backed-mmap write-back) is
+> untouched by Phase 88's stat/ext2-read/`pwrite` work; the gate is opt-in and was
+> not run during Phase 86/87, which reworked the mmap/write paths. **Tracked as a
+> separate follow-up** (file-backed `MAP_SHARED` `PROT_WRITE` write-back on
+> munmap/msync). The deterministic always-on `stat-identity` smoke stage is the
+> green stat-identity guard in the meantime.
+
 ## Track G — Atomic `pwrite64` (write-path correctness)
 
 ### G.1 — Offset-parameterized backend writes + positional `pwrite64`
