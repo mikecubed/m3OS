@@ -184,6 +184,20 @@ teaching `vfs_server` a mount table without changing `fat_server` or any client.
 | 9 | Mount table; path prefix routing to multiple backends |
 | 10+ | Per-process mount namespaces; capability-checked access per path |
 
+### ext2 routing today (Phase 88)
+
+The shipping system mounts an **ext2 root** read by two engines — the in-kernel
+`EXT2_VOLUME` and the ring-3 `vfs_server` `Ext2State` (the **write authority**).
+Which engine serves a given access is governed by `vfs_service_should_route`
+(read-only regular-file opens → `vfs_server`; writes / directories / the exec
+loader / mount → in-kernel ext2). The exact rule, including `getdents64` and
+`stat` routing, is tabulated in
+[`docs/18-directory-vfs.md` → ext2 root routing](18-directory-vfs.md#ext2-root-ext2disk-kernel-vs-vfsservice-vfs_server--phase-88).
+Since Phase 88 Track C both engines share **one** `kernel_core::fs::ext2`
+read implementation over a `BlockReader` trait, so they cannot diverge; and `stat`
+metadata is consistent across path-vs-fd and engine-vs-engine via the
+[`fill_stat` contract](12-posix-compatibility-layer.md#file-metadata-the-fill_stat-contract-phase-88).
+
 ---
 
 ## Bootstrap Sequence

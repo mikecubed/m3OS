@@ -498,9 +498,16 @@ fi
 # programs INSIDE m3OS. Set this on branches that touch ports/lang/llvm, xtask's
 # build_llvm / clang bundling / clang-smoke, or the kernel mmap / exec / ext2 / VFS
 # paths the big static toolchain exercises. Requires host clang + cmake + ninja.
+#
+# Phase 88 — runs under M3OS_CLANG_STRESS=1 so the gate also exercises the
+# repeated multi-compile path, which reliably drives clang's (st_dev, st_ino)
+# FileManager dedup — the exact 85d stat-identity defect. This makes the clang
+# gate a stat-identity regression guard for the fill_stat / vfs-reply-metadata /
+# ext2-consolidation work (any reintroduced st_ino=0 / fstat≠fstatat collision
+# resurfaces as `redefinition of 'main'`).
 if [ "${M3OS_CLANG_REGRESSION:-0}" = "1" ]; then
-    echo "pre-push: running cargo xtask clang-smoke..."
-    if ! cargo xtask clang-smoke --timeout 5400; then
+    echo "pre-push: running cargo xtask clang-smoke (M3OS_CLANG_STRESS stat-identity)..."
+    if ! M3OS_CLANG_STRESS=1 cargo xtask clang-smoke --timeout 5400; then
         echo "pre-push: cargo xtask clang-smoke failed" >&2
         exit 1
     fi

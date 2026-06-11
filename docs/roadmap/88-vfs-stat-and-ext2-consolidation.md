@@ -1,6 +1,6 @@
 # Phase 88 - VFS `stat` Conformance & ext2 Dual-Implementation Consolidation
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-88
 **Depends on:** Phase 08 (Storage & VFS) ✅, Phase 28 (ext2 Filesystem) ✅, Phase 54 (Deep Serverization / `vfs_server`) ✅, Phase 18 (Directory VFS) ✅
 **Builds on:** Hardens the filesystem **metadata** path (`stat` family + file identity) and removes the long-standing **two-independent-ext2-implementations** hazard (kernel `EXT2_VOLUME` vs the ring-3 `vfs_server`'s `Ext2State`). Adjacent to Phase 87 (VFS Bulk-I/O), which addresses the same layer's **throughput**; this phase addresses its **correctness/consistency**. No on-disk format change.
@@ -135,26 +135,26 @@ lean on `make`/`git`/`stat` correctness.
 
 ## Acceptance Criteria
 
-- [ ] A host test opens the same ext2 file by path (`fstatat`) and by fd (`open`+`fstat`)
+- [x] A host test opens the same ext2 file by path (`fstatat`) and by fd (`open`+`fstat`)
       and asserts byte-identical `struct stat` (incl. `st_ino`, `st_dev`, `st_mtim`,
       `st_blocks`).
-- [ ] A test reaching the same file through the kernel ext2 (`Ext2Disk`) and the
+- [x] A test reaching the same file through the kernel ext2 (`Ext2Disk`) and the
       `vfs_server` (`VfsService`) asserts identical `(st_dev, st_ino)`, size, mode, times.
-- [ ] No stat syscall assembles a `stat` buffer by offset; all route through `fill_stat()`
+- [x] No stat syscall assembles a `stat` buffer by offset; all route through `fill_stat()`
       (enforced by review + a grep gate in `cargo xtask check`).
-- [ ] `getdents64` `d_ino` equals `stat` `st_ino` for the same entry.
-- [ ] Distinct `st_dev` for ext2 vs tmpfs vs ramdisk vs procfs (no cross-fs identity
+- [x] `getdents64` `d_ino` equals `stat` `st_ino` for the same entry.
+- [x] Distinct `st_dev` for ext2 vs tmpfs vs ramdisk vs procfs (no cross-fs identity
       collision).
-- [ ] A cross-implementation parity test (regular/dir/symlink/sparse/indirect/large-file/
+- [x] A cross-implementation parity test (regular/dir/symlink/sparse/indirect/large-file/
       large-dir corpus) passes between kernel ext2 and `vfs_server` ext2.
-- [ ] `M3OS_CLANG_STRESS` multi-compile mode is wired as a CI-able stat-identity regression
+- [x] `M3OS_CLANG_STRESS` multi-compile mode is wired as a CI-able stat-identity regression
       guard (it directly exercises the dedup path that 85d broke).
-- [ ] `statx` implemented (onto `fill_stat`) or its `ENOSYS`-fallback documented + tested.
-- [ ] `pwrite64` writes at the given offset and leaves the fd position **unchanged**,
+- [x] `statx` implemented (onto `fill_stat`) or its `ENOSYS`-fallback documented + tested.
+- [x] `pwrite64` writes at the given offset and leaves the fd position **unchanged**,
       verified by a test that interleaves `pwrite64` with `write`/`lseek` on the same fd
       (e.g. two `pwrite64`s at different offsets bracketing a `write`, asserting the
       `write` lands at the pre-existing position) for the Tmpfs and ext2 backends.
-- [ ] *(ancillary)* `WaitPassOrFail` accepts multiple fail patterns; a deterministic
+- [x] *(ancillary)* `WaitPassOrFail` accepts multiple fail patterns; a deterministic
       non-fatal clang/lld failure (`error:` / `ld.lld: error:`) in `clang-smoke` fast-fails
       rather than burning the step timeout, with no false-fail on a clean compile.
 

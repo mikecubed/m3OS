@@ -62,6 +62,7 @@ const NEG_EROFS: u64 = (-30_i64) as u64;
 const NEG_ENOTDIR: u64 = (-20_i64) as u64;
 const NEG_EISDIR: u64 = (-21_i64) as u64;
 const NEG_ENOSYS: u64 = (-38_i64) as u64;
+const NEG_ESPIPE: u64 = (-29_i64) as u64;
 const NEG_ESRCH: u64 = (-3_i64) as u64;
 const NEG_EINTR: u64 = (-4_i64) as u64;
 const NEG_ENOTEMPTY: u64 = (-39_i64) as u64;
@@ -1321,6 +1322,7 @@ mod syscall_nr {
     pub const GETDENTS64: u64 = 217;
     pub const OPENAT: u64 = 257;
     pub const NEWFSTATAT: u64 = 262;
+    pub const STATX: u64 = 332;
     pub const LINKAT: u64 = 265;
     pub const SYMLINKAT: u64 = 266;
     pub const READLINKAT: u64 = 267;
@@ -1809,6 +1811,7 @@ pub extern "C" fn syscall_handler(
         GETDENTS64 => sys_linux_getdents64(arg0, arg1, arg2),
         OPENAT => sys_linux_openat(arg0, arg1, arg2),
         NEWFSTATAT => sys_linux_fstatat(arg0, arg1, arg2, per_core_syscall_arg3()),
+        STATX => sys_linux_statx(),
         LINKAT => sys_linkat(
             arg0,
             arg1,
@@ -6905,33 +6908,39 @@ pub(super) fn sys_linux_pread64(fd: u64, buf_ptr: u64, count: u64, offset: u64) 
     }
 }
 
-/// Phase 85d — `pwrite64(fd, buf, count, offset)`: write at `offset` without
-/// advancing the fd position. Implemented by temporarily seeking the fd to
-/// `offset`, delegating to the normal write path, then restoring the saved
-/// position. Single-writer semantics are sufficient for clang/lld's output
-/// writers; a concurrent writer racing the same fd's position is not a case the
-/// toolchain exercises.
+/// `pwrite64(fd, buf, count, offset)`: write at `offset` without touching the
+/// fd's shared position.
+///
+/// Phase 88 Track G — now ATOMIC. The Phase 85d implementation seeked the fd to
+/// `offset`, called the normal write path, then restored the saved position;
+/// under `CLONE_FILES` fd-table sharing that briefly published a bogus position
+/// (a concurrent `write`/`lseek` on the same fd could observe it), and it was
+/// inconsistent with the already-positional `pread64`. The write is now routed
+/// through `kernel_write_fd_at` (the write analog of `kernel_read_fd_at`), which
+/// writes at the explicit offset and never reads or mutates `entry.offset` —
+/// matching POSIX `pwrite(2)`. Non-seekable fds (pipe/socket/tty) report
+/// `ESPIPE`, as POSIX requires.
 pub(super) fn sys_linux_pwrite64(fd: u64, buf_ptr: u64, count: u64, offset: u64) -> u64 {
     let fd_us = fd as usize;
     if fd_us >= MAX_FDS {
         return NEG_EBADF;
     }
-    let saved = match current_fd_entry(fd_us) {
-        Some(e) => e.offset,
-        None => return NEG_EBADF,
-    };
-    with_current_fd_mut(fd_us, |slot| {
-        if let Some(e) = slot {
-            e.offset = offset as usize;
-        }
-    });
-    let n = sys_linux_write(fd, buf_ptr, count);
-    with_current_fd_mut(fd_us, |slot| {
-        if let Some(e) = slot {
-            e.offset = saved;
-        }
-    });
-    n
+    let to_write = (count as usize).min(64 * 1024);
+    if to_write == 0 {
+        return 0;
+    }
+    let mut kbuf = alloc::vec![0u8; to_write];
+    if UserSliceRo::new(buf_ptr, to_write)
+        .and_then(|s| s.copy_to_kernel(&mut kbuf))
+        .is_err()
+    {
+        return NEG_EFAULT;
+    }
+    let pid = crate::process::current_pid();
+    match kernel_write_fd_at(pid, fd_us, offset as usize, &kbuf) {
+        Ok(n) => n as u64,
+        Err(e) => e as u64,
+    }
 }
 
 /// Write a Linux `struct rlimit { rlim_cur, rlim_max }` (two `u64`) to `rlim_ptr`.
@@ -8148,6 +8157,8 @@ struct VfsPathStat {
     atime: i64,
     mtime: i64,
     ctime: i64,
+    /// st_blocks — count of 512-byte blocks allocated (Phase 88 Track B.1).
+    blocks: u64,
     symlink_target: Option<alloc::string::String>,
 }
 
@@ -8228,6 +8239,7 @@ fn vfs_service_parse_stat_reply(bulk: &[u8]) -> Result<VfsPathStat, u64> {
         atime: read_word(8) as i64,
         mtime: read_word(9) as i64,
         ctime: read_word(10) as i64,
+        blocks: read_word(11),
         symlink_target,
     })
 }
@@ -8261,22 +8273,51 @@ fn vfs_service_open(path: &str, flags: u64) -> u64 {
 
     let packed = reply.data[0];
     let handle = packed & 0xFFFF_FFFF;
-    let file_size = (packed >> 32) as u32;
-    // Resolve the real ext2 inode for this path so `fstat` can report a stable,
-    // UNIQUE `st_ino` (see FdBackend::VfsService::inode). The kernel ext2 is
-    // serialized + coherent and shares the disk with the vfs_server, so it yields
-    // the same inode `fstatat`/`vfs_service_stat_path` report. `resolve_path`
-    // tolerates the leading '/'. 0 (unresolved) preserves the old behaviour.
-    let inode = crate::fs::ext2::EXT2_VOLUME
-        .lock()
-        .as_ref()
-        .and_then(|v| v.resolve_path(path).ok())
-        .unwrap_or(0);
+
+    // Phase 88 Track B.1/D — the vfs_server returns the full stat header in the
+    // reply bulk; parse it into the fd's metadata snapshot. This replaces the
+    // 85d double-resolve (a second `EXT2_VOLUME.resolve_path(path)` here) and the
+    // cross-implementation coupling it introduced: fstat now reports the
+    // vfs_server's own inode/mode/uid/gid/nlink/size/blocks/times, guaranteed to
+    // match what `fstatat` (also served by the vfs_server) reports for the path.
+    //
+    // A successful (label==0) VFS_OPEN reply is contractually GUARANTEED to carry
+    // the stat header: `vfs_server::handle_open` only replies label==0 after
+    // `ipc_store_reply_bulk(&stat_header)` succeeds (otherwise it replies EIO).
+    // A missing/unparseable bulk here therefore means a protocol/version mismatch
+    // or a scheduler bug, not a normal open — so return EIO rather than silently
+    // seeding inode=0 (the 85d stat-identity defect this track exists to prevent).
+    // Our sole caller treats this EIO as a fall-back trigger and re-opens via the
+    // in-kernel ext2 engine (`open_resolved_path`), which builds a complete, real
+    // metadata snapshot — so no degraded inode=0 fd is ever constructed and the
+    // open transparently recovers. The committed server-side handle is abandoned
+    // on this should-never-happen path; that is strictly preferable to a bad fd.
+    let meta = match scheduler::take_bulk_data(task_id)
+        .ok_or(NEG_EIO)
+        .and_then(|bulk| vfs_service_parse_stat_reply(&bulk))
+    {
+        Ok(st) => crate::process::VfsFileMeta {
+            inode: st.ino as u32,
+            mode: st.mode,
+            uid: st.uid,
+            gid: st.gid,
+            nlink: st.nlink as u32,
+            size: st.size,
+            blksize: st.blksize,
+            blocks: st.blocks,
+            atime: st.atime,
+            mtime: st.mtime,
+            ctime: st.ctime,
+        },
+        Err(_) => {
+            log::warn!("[vfs] open reply missing/invalid stat header for {path}");
+            return NEG_EIO;
+        }
+    };
     let entry = FdEntry {
         backend: FdBackend::VfsService {
             service_handle: handle,
-            file_size,
-            inode,
+            meta,
         },
         offset: 0,
         readable: true,
@@ -9509,32 +9550,6 @@ fn privileged_exec_credentials(path: &str, exec_is_static_ramdisk: bool) -> Opti
 ///
 /// Only `st_size` (offset 48) and `st_mode` (offset 24) are filled in;
 /// all other fields are zero.  This satisfies musl's `fstat` use in `fopen`.
-/// Get uid/gid/mode for a directory path from the appropriate filesystem.
-fn dir_metadata(path: &str) -> (u32, u32, u16) {
-    // Tmpfs directories (under /tmp or /run) — use the shared mount-relative
-    // convention (`tmpfs_relative_path`) so the lookup key matches what
-    // open/read/write/stat/chmod use. (A previous hand-rolled
-    // `strip_prefix("/tmp")` dropped the `tmp/` prefix and ignored /run.)
-    if let Some(rel) = tmpfs_relative_path(path) {
-        let tmpfs = crate::fs::tmpfs::TMPFS.lock();
-        if let Ok(s) = tmpfs.stat(rel) {
-            return (s.uid, s.gid, s.mode);
-        }
-    }
-    // ext2 root filesystem directories.
-    if crate::fs::ext2::is_mounted()
-        && let Some(rel) = ext2_root_path(path)
-    {
-        return data_file_metadata(rel).unwrap_or((0, 0, 0o755));
-    }
-    // Legacy: /data paths for FAT32 fallback.
-    if let Some(rel) = path.strip_prefix("/data/") {
-        return data_file_metadata(rel).unwrap_or((0, 0, 0o755));
-    }
-    // Default for ramdisk and other directories
-    (0, 0, 0o755)
-}
-
 /// Get uid/gid/mode for a file on the data partition (ext2 or FAT32).
 /// Returns `None` if the file is not found or the volume is not mounted.
 fn data_file_metadata(rel: &str) -> Option<(u32, u32, u16)> {
@@ -9808,6 +9823,155 @@ fn data_is_mounted() -> bool {
     crate::fs::ext2::is_mounted() || crate::fs::fat32::is_mounted()
 }
 
+// Phase 88 Track B.2 — synthetic `st_dev` per mounted filesystem.
+//
+// POSIX file identity is `(st_dev, st_ino)`: two paths name the same file iff
+// the pair matches, and the pair must be unique across filesystems. Leaving
+// `st_dev = 0` everywhere let a tmpfs file and an ext2 file that happen to share
+// an inode number collide on identity. Each filesystem class gets a stable,
+// distinct, nonzero device id below. Values are arbitrary but fixed; the
+// in-kernel ext2 root (`Ext2Disk`) and the ring-3 `vfs_server` view of the same
+// on-disk filesystem (`VfsService`) deliberately share one id so the SAME file
+// reached either way keeps one identity.
+const DEV_EXT2_ROOT: u64 = 0x01;
+const DEV_TMPFS: u64 = 0x02;
+const DEV_RAMDISK: u64 = 0x03;
+const DEV_PROCFS: u64 = 0x04;
+const DEV_FAT32: u64 = 0x05;
+const DEV_DEVFS: u64 = 0x06;
+
+/// Phase 88 Track A — normalized file metadata for the `stat` family.
+///
+/// Every stat-producing syscall (`fstat`, `stat`/`lstat`/`newfstatat` →
+/// `fstatat`, and `statx`) builds one of these per backend and serializes it
+/// through the single [`fill_stat`] routine. No syscall hand-assembles a
+/// `struct stat` byte-by-byte anymore: that pattern is what let the historical
+/// `st_ino = 0` for `VfsService` `fstat` (and the still-zero `st_dev` /
+/// `st_blocks` / timestamps) ship unnoticed and break clang's
+/// `(st_dev, st_ino)` file-identity dedup. A forgotten field is now
+/// structurally impossible — a missing field is a `FileMeta::new()` default,
+/// not a silently-skipped offset write. A `cargo xtask check` grep gate
+/// (`stat[<n>..` writes) enforces that no new offset assembly creeps back in.
+#[derive(Clone, Copy)]
+pub(super) struct FileMeta {
+    pub dev: u64,
+    pub ino: u64,
+    pub nlink: u64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub rdev: u64,
+    pub size: u64,
+    pub blksize: u64,
+    pub blocks: u64,
+    pub atime: i64,
+    pub mtime: i64,
+    pub ctime: i64,
+}
+
+impl FileMeta {
+    /// A zeroed `FileMeta` with a sane default `st_blksize` of 4096 — the value
+    /// every stat path used for non-ext2 backends. ext2 backends override it
+    /// with the real on-disk block size.
+    pub(super) const fn new() -> Self {
+        FileMeta {
+            dev: 0,
+            ino: 0,
+            nlink: 0,
+            mode: 0,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            size: 0,
+            blksize: 4096,
+            blocks: 0,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
+        }
+    }
+}
+
+/// Serialize a [`FileMeta`] into a 144-byte x86_64 Linux `struct stat`.
+///
+/// This is the ONLY place `struct stat` offsets are written. Layout:
+/// ```text
+///  0: st_dev (u64)       8: st_ino (u64)     16: st_nlink (u64)
+/// 24: st_mode (u32)     28: st_uid (u32)     32: st_gid (u32)
+/// 36: __pad0 (u32)      40: st_rdev (u64)    48: st_size (i64)
+/// 56: st_blksize (i64)  64: st_blocks (i64)
+/// 72: st_atim {tv_sec, tv_nsec}   88: st_mtim   104: st_ctim
+/// ```
+pub(super) fn fill_stat(m: &FileMeta) -> [u8; 144] {
+    let mut s = [0u8; 144];
+    s[0..8].copy_from_slice(&m.dev.to_ne_bytes());
+    s[8..16].copy_from_slice(&m.ino.to_ne_bytes());
+    s[16..24].copy_from_slice(&m.nlink.to_ne_bytes());
+    s[24..28].copy_from_slice(&m.mode.to_ne_bytes());
+    s[28..32].copy_from_slice(&m.uid.to_ne_bytes());
+    s[32..36].copy_from_slice(&m.gid.to_ne_bytes());
+    // 36..40 __pad0 stays zero.
+    s[40..48].copy_from_slice(&m.rdev.to_ne_bytes());
+    s[48..56].copy_from_slice(&m.size.to_ne_bytes());
+    s[56..64].copy_from_slice(&m.blksize.to_ne_bytes());
+    s[64..72].copy_from_slice(&m.blocks.to_ne_bytes());
+    // tv_sec only (1 s granularity); the tv_nsec halves at 80/96/112 stay zero.
+    s[72..80].copy_from_slice(&m.atime.to_ne_bytes());
+    s[88..96].copy_from_slice(&m.mtime.to_ne_bytes());
+    s[104..112].copy_from_slice(&m.ctime.to_ne_bytes());
+    s
+}
+
+/// Serialize `meta` and copy it to the user `struct stat` at `stat_ptr`.
+fn write_stat_to_user(stat_ptr: u64, meta: &FileMeta) -> u64 {
+    let bytes = fill_stat(meta);
+    match UserSliceWo::new(stat_ptr, bytes.len()).and_then(|s| s.copy_from_kernel(&bytes)) {
+        Ok(()) => 0,
+        Err(_) => NEG_EFAULT,
+    }
+}
+
+/// Phase 88 Track B.2 — the synthetic `st_dev` for an fd's backend.
+///
+/// Each filesystem class gets a stable, distinct, nonzero id so that
+/// `(st_dev, st_ino)` is unique across filesystems. The in-kernel ext2 root
+/// (`Ext2Disk`) and the ring-3 `vfs_server` view of the SAME on-disk fs
+/// (`VfsService`) share one id so a file reached either way keeps one identity.
+/// Identity-irrelevant backends (sockets, pipes, stdio, epoll, eventfd) report
+/// `dev = 0`.
+fn stat_dev_for_backend(backend: &FdBackend) -> u64 {
+    match backend {
+        FdBackend::Ext2Disk { .. } | FdBackend::VfsService { .. } => DEV_EXT2_ROOT,
+        FdBackend::Tmpfs { .. } => DEV_TMPFS,
+        FdBackend::Ramdisk { .. } => DEV_RAMDISK,
+        FdBackend::Proc { .. } => DEV_PROCFS,
+        FdBackend::Fat32Disk { .. } => DEV_FAT32,
+        FdBackend::DevNull
+        | FdBackend::DevZero
+        | FdBackend::DevUrandom
+        | FdBackend::DevFull
+        | FdBackend::DeviceTTY { .. }
+        | FdBackend::PtyMaster { .. }
+        | FdBackend::PtySlave { .. } => DEV_DEVFS,
+        // A directory fd's backend does not say which fs it lives on; re-derive
+        // from the path in the SAME routing order `sys_linux_fstatat` /
+        // `path_filemeta` use (procfs → tmpfs → ramdisk → ext2), so fstat and
+        // fstatat report the same `st_dev` for the same directory.
+        FdBackend::Dir { path } => {
+            if crate::fs::procfs::stat(path).is_some() {
+                DEV_PROCFS
+            } else if tmpfs_relative_path(path).is_some() {
+                DEV_TMPFS
+            } else if crate::fs::ramdisk::ramdisk_lookup(path).is_some() {
+                DEV_RAMDISK
+            } else {
+                DEV_EXT2_ROOT
+            }
+        }
+        _ => 0,
+    }
+}
+
 pub(super) fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
     let fd_idx = fd as usize;
     if fd_idx >= MAX_FDS {
@@ -9817,75 +9981,80 @@ pub(super) fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
         Some(e) => e,
         None => return NEG_EBADF,
     };
-    // x86_64 stat struct layout (144 bytes):
-    //  0: st_dev (u64)      8: st_ino (u64)    16: st_nlink (u64)
-    // 24: st_mode (u32)    28: st_uid (u32)    32: st_gid (u32)
-    // 36: __pad0 (u32)     40: st_rdev (u64)   48: st_size (i64)
-    // 56: st_blksize (i64) 64: st_blocks (i64)
-    let mut stat = [0u8; 144];
-    let blksize: u64 = 4096;
 
-    // Determine mode, uid, gid, size, rdev based on backend type.
-    let (mode, uid, gid, size, rdev): (u32, u32, u32, u64, u64) = match &entry.backend {
-        FdBackend::Dir { path } => {
-            if let Some(st) = crate::fs::procfs::stat(path) {
-                stat[8..16].copy_from_slice(&st.ino.to_ne_bytes());
-                stat[16..24].copy_from_slice(&st.nlink.to_ne_bytes());
-                (st.mode, st.uid, st.gid, st.size, 0)
-            } else if let Some(rel) = tmpfs_relative_path(path) {
-                let tmpfs = crate::fs::tmpfs::TMPFS.lock();
-                match tmpfs.stat(rel) {
-                    Ok(st) => {
-                        stat[8..16].copy_from_slice(&st.ino.to_ne_bytes());
-                        stat[16..24].copy_from_slice(&st.nlink.to_ne_bytes());
-                        (0x4000 | st.mode as u32, st.uid, st.gid, st.size as u64, 0)
-                    }
-                    Err(_) => return NEG_ENOENT,
-                }
-            } else {
-                let (u, g, m) = dir_metadata(path);
-                (0x4000 | m as u32, u, g, 0, 0)
-            }
-        }
+    // Build a normalized FileMeta per backend (preserving each backend's prior
+    // field values), then serialize once via `fill_stat`.
+    let mut meta: FileMeta = match &entry.backend {
+        // Phase 88 — a directory fd reports the SAME metadata `fstatat` reports
+        // for its path, via the shared `path_filemeta` source of truth. The
+        // previous hand-rolled arm left an ext2 directory fd's ino/nlink/size/
+        // times at 0 (an `fstat`-vs-`fstatat` identity divergence).
+        FdBackend::Dir { path } => match path_filemeta(path) {
+            Ok(m) => m,
+            Err(err) => return err,
+        },
         FdBackend::DevNull | FdBackend::DevZero | FdBackend::DevUrandom | FdBackend::DevFull => {
-            (0x2000 | 0o666, 0, 0, 0, 0)
+            let mut m = FileMeta::new();
+            m.mode = 0x2000 | 0o666;
+            m
         }
         FdBackend::Proc { path } => {
             let Some(st) = crate::fs::procfs::stat(path) else {
                 return NEG_ENOENT;
             };
-            stat[8..16].copy_from_slice(&st.ino.to_ne_bytes());
-            stat[16..24].copy_from_slice(&st.nlink.to_ne_bytes());
-            (st.mode, st.uid, st.gid, st.size, 0)
+            let mut m = FileMeta::new();
+            m.ino = st.ino;
+            m.nlink = st.nlink;
+            m.mode = st.mode;
+            m.uid = st.uid;
+            m.gid = st.gid;
+            m.size = st.size;
+            m
         }
         FdBackend::DeviceTTY { tty_id } => {
-            (0x2000 | 0o620, 0, 0, 0, ((5u64) << 8) | (*tty_id as u64))
+            let mut m = FileMeta::new();
+            m.mode = 0x2000 | 0o620;
+            m.rdev = ((5u64) << 8) | (*tty_id as u64);
+            m
         }
-        FdBackend::PtyMaster { pty_id } => (
-            0x2000 | 0o620,
-            0,
-            0,
-            0,
-            ((5u64) << 8) | (2 + *pty_id as u64),
-        ),
+        FdBackend::PtyMaster { pty_id } => {
+            let mut m = FileMeta::new();
+            m.mode = 0x2000 | 0o620;
+            m.rdev = ((5u64) << 8) | (2 + *pty_id as u64);
+            m
+        }
         FdBackend::PtySlave { pty_id } => {
-            (0x2000 | 0o620, 0, 0, 0, ((136u64) << 8) | (*pty_id as u64))
+            let mut m = FileMeta::new();
+            m.mode = 0x2000 | 0o620;
+            m.rdev = ((136u64) << 8) | (*pty_id as u64);
+            m
         }
-        FdBackend::Socket { .. } | FdBackend::UnixSocket { .. } => (0xC000 | 0o755, 0, 0, 0, 0),
-        FdBackend::Stdout | FdBackend::Stdin => (0x2000 | 0o620, 0, 0, 0, 0),
+        FdBackend::Socket { .. } | FdBackend::UnixSocket { .. } => {
+            let mut m = FileMeta::new();
+            m.mode = 0xC000 | 0o755;
+            m
+        }
+        FdBackend::Stdout | FdBackend::Stdin => {
+            let mut m = FileMeta::new();
+            m.mode = 0x2000 | 0o620;
+            m
+        }
         FdBackend::PipeRead { .. } | FdBackend::PipeWrite { .. } | FdBackend::EventFd { .. } => {
-            (0x1000 | 0o600, 0, 0, 0, 0)
+            let mut m = FileMeta::new();
+            m.mode = 0x1000 | 0o600;
+            m
         }
         FdBackend::Ramdisk { content_len, .. } => {
-            // Ramdisk files: root-owned, mode 0o755 (all files, including non-executables)
-            (0x8000 | 0o755, 0, 0, *content_len as u64, 0)
+            // Ramdisk files: root-owned, mode 0o755 (all files, including non-executables).
+            let mut m = FileMeta::new();
+            m.mode = 0x8000 | 0o755;
+            m.size = *content_len as u64;
+            m
         }
         FdBackend::Tmpfs { path } => {
             let tmpfs = crate::fs::tmpfs::TMPFS.lock();
             match tmpfs.stat(path) {
                 Ok(s) => {
-                    stat[8..16].copy_from_slice(&s.ino.to_ne_bytes());
-                    stat[16..24].copy_from_slice(&s.nlink.to_ne_bytes());
                     let mode = if s.is_symlink {
                         0xA000 | 0o777
                     } else if s.is_dir {
@@ -9893,7 +10062,14 @@ pub(super) fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
                     } else {
                         0x8000 | s.mode as u32
                     };
-                    (mode, s.uid, s.gid, s.size as u64, 0)
+                    let mut m = FileMeta::new();
+                    m.ino = s.ino;
+                    m.nlink = s.nlink;
+                    m.mode = mode;
+                    m.uid = s.uid;
+                    m.gid = s.gid;
+                    m.size = s.size as u64;
+                    m
                 }
                 Err(_) => return NEG_ENOENT,
             }
@@ -9901,8 +10077,13 @@ pub(super) fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
         FdBackend::Fat32Disk {
             path, file_size, ..
         } => {
-            let (u, g, m) = data_file_metadata(path).unwrap_or((0, 0, 0o755));
-            (0x8000 | m as u32, u, g, *file_size as u64, 0)
+            let (u, g, mode) = data_file_metadata(path).unwrap_or((0, 0, 0o755));
+            let mut m = FileMeta::new();
+            m.mode = 0x8000 | mode as u32;
+            m.uid = u;
+            m.gid = g;
+            m.size = *file_size as u64;
+            m
         }
         FdBackend::Ext2Disk {
             inode_num,
@@ -9915,65 +10096,79 @@ pub(super) fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
             if let Some(vol) = vol.as_ref()
                 && let Ok(inode) = vol.read_inode(inode_num)
             {
-                let mode = inode.mode as u32;
-                let uid = inode.uid as u32;
-                let gid = inode.gid as u32;
-                let size = inode.size as u64; // use inode size, not cached FD size
-                let nlink = inode.links_count as u64;
-                let blk = vol.block_size as u64;
-                let ino = inode_num as u64;
-                stat[8..16].copy_from_slice(&ino.to_ne_bytes());
-                stat[16..24].copy_from_slice(&nlink.to_ne_bytes());
-                stat[24..28].copy_from_slice(&mode.to_ne_bytes());
-                stat[28..32].copy_from_slice(&uid.to_ne_bytes());
-                stat[32..36].copy_from_slice(&gid.to_ne_bytes());
-                stat[48..56].copy_from_slice(&size.to_ne_bytes());
-                stat[56..64].copy_from_slice(&blk.to_ne_bytes());
-                let atime = inode.atime as i64;
-                let mtime = inode.mtime as i64;
-                let ctime = inode.ctime as i64;
-                stat[72..80].copy_from_slice(&atime.to_ne_bytes());
-                stat[88..96].copy_from_slice(&mtime.to_ne_bytes());
-                stat[104..112].copy_from_slice(&ctime.to_ne_bytes());
-                if UserSliceWo::new(stat_ptr, stat.len())
-                    .and_then(|s| s.copy_from_kernel(&stat))
-                    .is_err()
-                {
-                    return NEG_EFAULT;
-                }
-                return 0;
+                let mut m = FileMeta::new();
+                m.ino = inode_num as u64;
+                m.nlink = inode.links_count as u64;
+                m.mode = inode.mode as u32;
+                m.uid = inode.uid as u32;
+                m.gid = inode.gid as u32;
+                m.size = inode.size as u64; // use inode size, not cached FD size
+                m.blksize = vol.block_size as u64;
+                m.blocks = inode.blocks as u64;
+                m.atime = inode.atime as i64;
+                m.mtime = inode.mtime as i64;
+                m.ctime = inode.ctime as i64;
+                m
+            } else {
+                // Fallback if inode read fails — use cached FD size.
+                let mut m = FileMeta::new();
+                m.mode = 0x8000 | 0o755;
+                m.size = *file_size as u64;
+                m
             }
-            // Fallback if inode read fails — use cached FD size
-            let fallback_size = *file_size as u64;
-            let (u, g, m) = (0u32, 0u32, 0o755u16);
-            (0x8000 | m as u32, u, g, fallback_size, 0)
         }
-        FdBackend::Epoll { .. } => (0x2000 | 0o600, 0, 0, 0, 0),
-        FdBackend::VfsService {
-            file_size, inode, ..
-        } => {
-            // Report the real ext2 inode as st_ino so clang's FileManager (which
-            // dedups by (st_dev, st_ino)) does not collapse distinct VFS files
-            // onto one entry. Must match fstatat for the same path.
-            stat[8..16].copy_from_slice(&(*inode as u64).to_ne_bytes());
-            (0x8000 | 0o444, 0, 0, *file_size as u64, 0)
+        FdBackend::Epoll { .. } => {
+            let mut m = FileMeta::new();
+            m.mode = 0x2000 | 0o600;
+            m
+        }
+        FdBackend::VfsService { meta, .. } => {
+            // Phase 88 Track B.1/D — report the full metadata snapshot captured
+            // from the VFS_OPEN reply (real inode/mode/uid/gid/nlink/size/blocks/
+            // times) so fstat(fd) matches fstatat(path) field-for-field. The
+            // st_ino was the field whose absence broke clang's (st_dev, st_ino)
+            // dedup; st_dev, st_blocks, and the timestamps were silently zero too.
+            // st_dev is assigned uniformly after the match.
+            let mut m = FileMeta::new();
+            m.ino = meta.inode as u64;
+            m.nlink = meta.nlink as u64;
+            m.mode = meta.mode;
+            m.uid = meta.uid;
+            m.gid = meta.gid;
+            m.size = meta.size;
+            m.blksize = meta.blksize;
+            m.blocks = meta.blocks;
+            m.atime = meta.atime;
+            m.mtime = meta.mtime;
+            m.ctime = meta.ctime;
+            m
         }
     };
 
-    stat[24..28].copy_from_slice(&mode.to_ne_bytes());
-    stat[28..32].copy_from_slice(&uid.to_ne_bytes());
-    stat[32..36].copy_from_slice(&gid.to_ne_bytes());
-    stat[40..48].copy_from_slice(&rdev.to_ne_bytes());
-    stat[48..56].copy_from_slice(&size.to_ne_bytes());
-    stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
+    // Phase 88 Track B.2 — assign the per-filesystem st_dev uniformly so
+    // (st_dev, st_ino) is unique across filesystems.
+    meta.dev = stat_dev_for_backend(&entry.backend);
+    write_stat_to_user(stat_ptr, &meta)
+}
 
-    if UserSliceWo::new(stat_ptr, stat.len())
-        .and_then(|s| s.copy_from_kernel(&stat))
-        .is_err()
-    {
-        return NEG_EFAULT;
-    }
-    0
+/// Phase 88 Track E — `statx(2)` (332). m3OS intentionally returns `-ENOSYS`
+/// here rather than implementing the `struct statx` layout natively.
+///
+/// Rationale (a *documented* decision, not an oversight): glibc and musl's
+/// `statx()` wrappers fall back to `newfstatat` when the kernel reports
+/// `ENOSYS`, and Phase 88 Track A made that fallback **lossless** — the
+/// `fill_stat` serializer populates every `struct stat` field
+/// (dev/ino/nlink/mode/uid/gid/size/blocks/times) that `statx` would report, so
+/// no metadata is dropped on the fallback path. The earlier post-mortem flagged
+/// an ENOSYS `statx` as a "compatibility cliff" specifically because the older
+/// `fstat`/`fstatat` paths were themselves buggy (the `st_ino = 0` defect); with
+/// those paths now correct and consistent (`fstat == fstatat`), the cliff is
+/// gone. A native `statx` (transcoding `FileMeta` → `struct statx` with the
+/// `STATX_*` request mask) is a low-value deferred follow-up. The contract is
+/// verified by the in-OS `statx → ENOSYS` assertion in `smoke-runner` and by the
+/// clang/python toolchain gates, which call `statx` via libc and fall back.
+fn sys_linux_statx() -> u64 {
+    NEG_ENOSYS
 }
 
 pub(super) fn sys_statfs(path_ptr: u64, buf_ptr: u64) -> u64 {
@@ -10393,7 +10588,7 @@ pub(super) fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
         FdBackend::Fat32Disk { file_size, .. } | FdBackend::Ext2Disk { file_size, .. } => {
             *file_size as usize
         }
-        FdBackend::VfsService { file_size, .. } => *file_size as usize,
+        FdBackend::VfsService { meta, .. } => meta.size as usize,
     };
 
     let offset = offset as i64;
@@ -10515,6 +10710,156 @@ fn kernel_read_fd_at(pid: u32, fd: usize, offset: usize, buf: &mut [u8]) -> Resu
     }
 }
 
+/// Phase 88 Track G — the write analog of [`kernel_read_fd_at`]: write `buf` at
+/// an explicit byte `offset` for the seekable file backends (Tmpfs, ext2,
+/// FAT32), WITHOUT reading or mutating the fd's shared position. This makes
+/// `pwrite64` atomic under `CLONE_FILES` fd-table sharing and POSIX-correct
+/// (non-seekable fds report `ESPIPE`). It mirrors the per-backend write
+/// bookkeeping in `sys_linux_write` — ext2 routes to the `vfs_server` write
+/// authority when registered (else the in-kernel engine); FAT32 may relocate the
+/// start cluster — but updates only the file-identity cache (`file_size` /
+/// `start_cluster`), never `entry.offset`.
+fn kernel_write_fd_at(pid: u32, fd: usize, offset: usize, buf: &[u8]) -> Result<usize, i64> {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    let entry = {
+        let table = crate::process::PROCESS_TABLE.lock();
+        match table.find(pid) {
+            Some(p) => p.fd_get(fd),
+            None => return Err(NEG_EBADF as i64),
+        }
+    };
+    let entry = match entry {
+        Some(e) => e,
+        None => return Err(NEG_EBADF as i64),
+    };
+    if !entry.writable {
+        return Err(NEG_EBADF as i64);
+    }
+    match &entry.backend {
+        FdBackend::Tmpfs { path } => {
+            let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
+            match tmpfs.write_file(path, offset, buf) {
+                Ok(()) => Ok(buf.len()),
+                Err(crate::fs::tmpfs::TmpfsError::NoSpace) => Err(NEG_ENOSPC as i64),
+                Err(crate::fs::tmpfs::TmpfsError::NotFound) => Err(NEG_EBADF as i64),
+                Err(_) => Err(NEG_EINVAL as i64),
+            }
+        }
+        FdBackend::Ext2Disk {
+            inode_num, path, ..
+        } => {
+            let inode_num = *inode_num;
+            let path = path.clone();
+            // Route to the vfs_server ext2 write authority when registered, so a
+            // later read (this fd or any process) sees coherent bytes.
+            if vfs_write_routable() {
+                let mut total = 0usize;
+                let mut cur_off = offset as u64;
+                let mut new_size: Option<u32> = None;
+                while total < buf.len() {
+                    match vfs_service_write(&path, cur_off, &buf[total..]) {
+                        Ok((0, _)) => break,
+                        Ok((n, sz)) => {
+                            total += n;
+                            cur_off += n as u64;
+                            new_size = Some(sz);
+                        }
+                        Err(e) => {
+                            if total == 0 {
+                                return Err(e as i64);
+                            }
+                            break;
+                        }
+                    }
+                }
+                if let Some(sz) = new_size {
+                    with_current_fd_mut(fd, |slot| {
+                        if let Some(e) = slot
+                            && let FdBackend::Ext2Disk {
+                                file_size: ref mut fs,
+                                ..
+                            } = e.backend
+                        {
+                            *fs = sz;
+                        }
+                    });
+                }
+                return Ok(total);
+            }
+            // In-kernel ext2 engine fallback.
+            let mut vol = crate::fs::ext2::EXT2_VOLUME.lock();
+            let Some(vol) = vol.as_mut() else {
+                return Err(NEG_EIO as i64);
+            };
+            let mut inode = vol.read_inode(inode_num).map_err(|_| NEG_EIO as i64)?;
+            let now = current_unix_time();
+            inode.mtime = now;
+            inode.ctime = now;
+            match vol.write_file_data(inode_num, &mut inode, offset as u64, buf) {
+                Ok(n) => {
+                    let new_size = inode.size;
+                    with_current_fd_mut(fd, |slot| {
+                        if let Some(e) = slot
+                            && let FdBackend::Ext2Disk {
+                                file_size: ref mut fs,
+                                ..
+                            } = e.backend
+                        {
+                            *fs = new_size;
+                        }
+                    });
+                    Ok(n)
+                }
+                Err(_) => Err(NEG_EIO as i64),
+            }
+        }
+        FdBackend::Fat32Disk {
+            start_cluster,
+            file_size,
+            dir_cluster,
+            path,
+        } => {
+            let start_cluster = *start_cluster;
+            let current_file_size = *file_size as usize;
+            let dir_cluster = *dir_cluster;
+            let path = path.clone();
+            let mut vol = crate::fs::fat32::FAT32_VOLUME.lock();
+            let Some(vol) = vol.as_mut() else {
+                return Err(NEG_EIO as i64);
+            };
+            match vol.write_file(start_cluster, offset, buf, current_file_size) {
+                Ok((new_start, new_size)) => {
+                    let file_name = path.rsplit('/').next().unwrap_or(&path);
+                    if vol
+                        .update_dir_entry(dir_cluster, file_name, new_start, new_size as u32)
+                        .is_err()
+                    {
+                        return Err(NEG_EIO as i64);
+                    }
+                    with_current_fd_mut(fd, |slot| {
+                        if let Some(e) = slot
+                            && let FdBackend::Fat32Disk {
+                                start_cluster: ref mut sc,
+                                file_size: ref mut fs,
+                                ..
+                            } = e.backend
+                        {
+                            *sc = new_start;
+                            *fs = new_size as u32;
+                        }
+                    });
+                    Ok(buf.len())
+                }
+                Err(_) => Err(NEG_EIO as i64),
+            }
+        }
+        // POSIX pwrite on a non-seekable fd (pipe/FIFO/socket/tty) → ESPIPE.
+        _ => Err(NEG_ESPIPE as i64),
+    }
+}
+
 pub(super) fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
     // Read flags from SYSCALL_ARG3 (r10 at syscall entry).
     // SAFETY: single-CPU, read after every SYSCALL entry stores to SYSCALL_ARG3.
@@ -10595,6 +10940,7 @@ pub(super) fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
                 len: total_size,
                 prot,
                 flags,
+                file_backing: None, // anonymous mapping
             });
         });
         let table = crate::process::PROCESS_TABLE.lock();
@@ -10648,6 +10994,7 @@ pub(super) fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
                 len: total_size,
                 prot,
                 flags,
+                file_backing: None, // anonymous (demand-paged) mapping
             });
         });
         // Phase 52d B.3: bump generation — the address space changed
@@ -10680,6 +11027,13 @@ fn sys_mmap_file_backed(
     file_offset: usize,
 ) -> u64 {
     if len == 0 || fd >= crate::process::MAX_FDS {
+        return NEG_EINVAL;
+    }
+    // POSIX mmap(2): the file offset must be a multiple of the page size.
+    // A misaligned offset would make both the per-page read offsets
+    // (`file_offset + i*4096`) and the `FileBacking` write-back offset
+    // ill-defined, so reject it up front like Linux/x86_64 does.
+    if file_offset & 0xFFF != 0 {
         return NEG_EINVAL;
     }
 
@@ -10851,6 +11205,21 @@ fn sys_mmap_file_backed(
         return NEG_EINVAL;
     }
 
+    // Phase 88 follow-up — record file write-back info for a MAP_SHARED writable
+    // file mapping so munmap/msync flush the dirty pages back to the file. m3OS
+    // eager-loads file mmaps into anonymous frames, so without this the writes
+    // are lost (which left `lld`'s mmap'd output all-zeros → `InvalidMagic`).
+    // MAP_PRIVATE / read-only mappings are never written back.
+    const MAP_SHARED: u64 = 0x1;
+    let file_backing = if prot & PROT_WRITE != 0 && flags & MAP_SHARED != 0 {
+        Some(crate::process::FileBacking {
+            fd: fd as u32,
+            offset: file_offset as u64,
+        })
+    } else {
+        None
+    };
+
     // Record the VMA — uses the shared-mm lock, independent of the
     // page-table lock.  Order (PT mutation before VMA insert) is preserved
     // from the original code.
@@ -10860,6 +11229,7 @@ fn sys_mmap_file_backed(
             len: total_size,
             prot,
             flags,
+            file_backing,
         });
     });
     if let Some(addr_space) = addr_space.as_ref() {
@@ -10911,6 +11281,26 @@ pub(super) fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
     let mut frames_to_free: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
     let mut fb_fully_unmapped = false;
     let mut vma_changed = false;
+
+    // Phase 88 follow-up — snapshot file-backed MAP_SHARED writable VMAs that
+    // overlap the unmapped range, so each page's dirty contents can be written
+    // back to the file before its frame is freed. Empty for the common case
+    // (anonymous mappings), which keeps the unmap path unchanged.
+    let writeback_vmas: alloc::vec::Vec<(u64, u64, u32, u64)> = // (start, end, fd, file_offset)
+        crate::process::with_shared_mm_mut(pid, |_b, _m, vma_tree| {
+            vma_tree
+                .iter()
+                .filter_map(|m| {
+                    m.file_backing
+                        .filter(|_| m.start < addr + total_size && addr < m.start + m.len)
+                        .map(|fb| (m.start, m.start + m.len, fb.fd, fb.offset))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // (frame_phys, fd, file_offset) for each unmapped page of a writable file VMA.
+    let mut writeback: alloc::vec::Vec<(u64, u32, u64)> = alloc::vec::Vec::new();
+
     {
         // SAFETY: current CR3 is the calling process's page table; this is the
         // same approach used by sys_linux_mmap.
@@ -10994,10 +11384,21 @@ pub(super) fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
                     // Skip the local TLB flush here — we batch a single shootdown
                     // (which includes a local invlpg) after the loop.
                     flush.ignore();
+                    let frame_phys = frame.start_address().as_u64();
                     if !is_device_frame {
                         // Only return system-RAM frames to the allocator after the
                         // batched shootdown has invalidated every stale translation.
-                        frames_to_free.push(frame.start_address().as_u64());
+                        frames_to_free.push(frame_phys);
+                    }
+                    // Phase 88 follow-up — queue this page for write-back if it
+                    // belongs to a file-backed MAP_SHARED writable mapping.
+                    if !writeback_vmas.is_empty() {
+                        for &(vs, ve, fd, foff) in &writeback_vmas {
+                            if page_addr >= vs && page_addr < ve {
+                                writeback.push((frame_phys, fd, foff + (page_addr - vs)));
+                                break;
+                            }
+                        }
                     }
                     unmapped_addrs.push(page_addr);
                 }
@@ -11035,6 +11436,32 @@ pub(super) fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
             crate::smp::tlb::tlb_shootdown_range(addr_space, range_start, range_end);
         }
     }
+    // Phase 88 follow-up — write file-backed MAP_SHARED writable mappings back to
+    // the file BEFORE the frames are freed. There is no per-page dirty-bit
+    // tracking: EVERY unmapped page of such a mapping is written back (correct, if
+    // conservative — a never-written page just rewrites identical bytes). Runs
+    // after the page-table guard is released (kernel_write_fd_at may block on
+    // disk; holding the guard across a block is the Bug #9 hazard) and reads each
+    // frame physically through the phys-offset window (the unmapped vaddr is gone,
+    // but the frame is still allocated). The fd must still be open + writable —
+    // the common mmap/write/munmap/close order — else the write-back is skipped.
+    if !writeback.is_empty() {
+        let phys_off = crate::mm::phys_offset();
+        let mut page_buf = alloc::vec![0u8; 4096];
+        for (frame_phys, fd, file_off) in writeback {
+            // SAFETY: frame_phys is an allocated user mmap frame (not yet freed);
+            // read its 4096 bytes through the kernel's phys-offset window.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    (phys_off + frame_phys) as *const u8,
+                    page_buf.as_mut_ptr(),
+                    4096,
+                );
+            }
+            let _ = kernel_write_fd_at(pid, fd as usize, file_off as usize, &page_buf);
+        }
+    }
+
     for frame_phys in frames_to_free {
         crate::mm::frame_allocator::free_frame(frame_phys);
     }
@@ -11627,6 +12054,7 @@ pub(super) fn sys_framebuffer_mmap() -> u64 {
                 len: total_size,
                 prot: 3,                    // PROT_READ | PROT_WRITE
                 flags: 1 | FB_MAPPING_FLAG, // MAP_SHARED + internal FB marker
+                file_backing: None,         // framebuffer device mapping
             });
         });
         virt_addr
@@ -11868,6 +12296,7 @@ pub(super) fn sys_shm_map(shm_id_arg: u64) -> u64 {
                 len: total_size,
                 prot: 3, // PROT_READ | PROT_WRITE
                 flags: shm_vma_flags(id),
+                file_backing: None, // shared-memory mapping
             });
         });
         virt_addr
@@ -13399,40 +13828,25 @@ pub(super) fn sys_linux_uname(buf_ptr: u64) -> u64 {
 // T026 (via path): newfstatat(dirfd, path, stat_ptr, flags)
 // ---------------------------------------------------------------------------
 
-pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) -> u64 {
-    let mut buf = [0u8; 512];
-    let raw_name = match read_user_cstr(path_ptr, &mut buf) {
-        Some(n) => n,
-        None => return NEG_EFAULT,
-    };
-
-    let lexical = match resolve_path_from_dirfd(dirfd, raw_name) {
-        Ok(path) => path,
-        Err(err) => return err,
-    };
-    let resolved = match resolve_existing_fs_path(&lexical, flags & AT_SYMLINK_NOFOLLOW == 0) {
-        Ok(path) => path,
-        Err(err) => return err,
-    };
-    let name: &str = &resolved;
-
+/// Phase 88 — the single source of truth for *path-based* `stat` metadata.
+///
+/// Given an already-resolved absolute path, build the full [`FileMeta`] for it
+/// (with `st_dev` set per filesystem), or an errno on failure. `sys_linux_fstatat`
+/// (by path) AND `sys_linux_fstat`'s `FdBackend::Dir` arm (by fd) both call this,
+/// so the by-path and by-fd answers cannot diverge — closing the exact
+/// `(st_dev, st_ino)`/metadata inconsistency Phase 88 exists to eliminate (the
+/// `fstat`-on-a-directory-fd path previously reported `ino=nlink=size=times=0`).
+fn path_filemeta(name: &str) -> Result<FileMeta, u64> {
     if let Some(st) = crate::fs::procfs::stat(name) {
-        let mut stat = [0u8; 144];
-        stat[8..16].copy_from_slice(&st.ino.to_ne_bytes());
-        stat[16..24].copy_from_slice(&st.nlink.to_ne_bytes());
-        stat[24..28].copy_from_slice(&st.mode.to_ne_bytes());
-        stat[28..32].copy_from_slice(&st.uid.to_ne_bytes());
-        stat[32..36].copy_from_slice(&st.gid.to_ne_bytes());
-        stat[48..56].copy_from_slice(&st.size.to_ne_bytes());
-        let blksize: u64 = 4096;
-        stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
-        if UserSliceWo::new(stat_ptr, stat.len())
-            .and_then(|s| s.copy_from_kernel(&stat))
-            .is_err()
-        {
-            return NEG_EFAULT;
-        }
-        return 0;
+        let mut m = FileMeta::new();
+        m.dev = DEV_PROCFS;
+        m.ino = st.ino;
+        m.nlink = st.nlink;
+        m.mode = st.mode;
+        m.uid = st.uid;
+        m.gid = st.gid;
+        m.size = st.size;
+        return Ok(m);
     }
 
     // Check tmpfs first.
@@ -13440,11 +13854,11 @@ pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags:
         let tmpfs = crate::fs::tmpfs::TMPFS.lock();
         let st = match tmpfs.stat(rel) {
             Ok(s) => s,
-            Err(crate::fs::tmpfs::TmpfsError::NotFound) => return NEG_ENOENT,
+            Err(crate::fs::tmpfs::TmpfsError::NotFound) => return Err(NEG_ENOENT),
             Err(crate::fs::tmpfs::TmpfsError::NotADirectory) => {
-                return NEG_ENOTDIR;
+                return Err(NEG_ENOTDIR);
             }
-            Err(_) => return NEG_EINVAL,
+            Err(_) => return Err(NEG_EINVAL),
         };
         // Phase 69d follow-up: if this tmpfs path is currently bound
         // to a Unix-domain socket, stat must report `S_IFSOCK`
@@ -13464,57 +13878,32 @@ pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags:
         } else {
             0x8000 | st.mode as u32
         };
-        let mut stat = [0u8; 144];
-        stat[8..16].copy_from_slice(&st.ino.to_ne_bytes());
-        stat[16..24].copy_from_slice(&st.nlink.to_ne_bytes());
-        stat[24..28].copy_from_slice(&mode.to_ne_bytes());
-        stat[28..32].copy_from_slice(&st.uid.to_ne_bytes());
-        stat[32..36].copy_from_slice(&st.gid.to_ne_bytes());
-        let size = st.size as u64;
-        stat[48..56].copy_from_slice(&size.to_ne_bytes());
-        let blksize: u64 = 4096;
-        stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
+        let mut m = FileMeta::new();
+        m.dev = DEV_TMPFS;
+        m.ino = st.ino;
+        m.nlink = st.nlink;
+        m.mode = mode;
+        m.uid = st.uid;
+        m.gid = st.gid;
+        m.size = st.size as u64;
         drop(tmpfs);
-        if UserSliceWo::new(stat_ptr, stat.len())
-            .and_then(|s| s.copy_from_kernel(&stat))
-            .is_err()
-        {
-            return NEG_EFAULT;
-        }
-        return 0;
+        return Ok(m);
     }
 
     // Check ramdisk tree (supports directories and hierarchical paths).
     match crate::fs::ramdisk::ramdisk_lookup(name) {
         Some(crate::fs::ramdisk::RamdiskNode::File { content }) => {
-            let mut stat = [0u8; 144];
-            let mode: u32 = 0x8000 | 0o755; // S_IFREG + executable (ramdisk binaries)
-            stat[24..28].copy_from_slice(&mode.to_ne_bytes());
-            let size = content.len() as u64;
-            stat[48..56].copy_from_slice(&size.to_ne_bytes());
-            let blksize: u64 = 4096;
-            stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
-            if UserSliceWo::new(stat_ptr, stat.len())
-                .and_then(|s| s.copy_from_kernel(&stat))
-                .is_err()
-            {
-                return NEG_EFAULT;
-            }
-            0
+            let mut m = FileMeta::new();
+            m.dev = DEV_RAMDISK;
+            m.mode = 0x8000 | 0o755; // S_IFREG + executable (ramdisk binaries)
+            m.size = content.len() as u64;
+            Ok(m)
         }
         Some(crate::fs::ramdisk::RamdiskNode::Dir { .. }) => {
-            let mut stat = [0u8; 144];
-            let mode: u32 = 0x4000 | 0o755; // S_IFDIR
-            stat[24..28].copy_from_slice(&mode.to_ne_bytes());
-            let blksize: u64 = 4096;
-            stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
-            if UserSliceWo::new(stat_ptr, stat.len())
-                .and_then(|s| s.copy_from_kernel(&stat))
-                .is_err()
-            {
-                return NEG_EFAULT;
-            }
-            0
+            let mut m = FileMeta::new();
+            m.dev = DEV_RAMDISK;
+            m.mode = 0x4000 | 0o755; // S_IFDIR
+            Ok(m)
         }
         None => {
             // ext2 root filesystem: stat any path.
@@ -13524,60 +13913,41 @@ pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags:
                 if vfs_service_can_handle_path(name)
                     && let Ok(vfs_stat) = vfs_service_stat_path(name)
                 {
-                    let mut stat = [0u8; 144];
-                    stat[8..16].copy_from_slice(&vfs_stat.ino.to_ne_bytes());
-                    stat[16..24].copy_from_slice(&vfs_stat.nlink.to_ne_bytes());
-                    stat[24..28].copy_from_slice(&vfs_stat.mode.to_ne_bytes());
-                    stat[28..32].copy_from_slice(&vfs_stat.uid.to_ne_bytes());
-                    stat[32..36].copy_from_slice(&vfs_stat.gid.to_ne_bytes());
-                    stat[48..56].copy_from_slice(&vfs_stat.size.to_ne_bytes());
-                    stat[56..64].copy_from_slice(&vfs_stat.blksize.to_ne_bytes());
-                    stat[72..80].copy_from_slice(&vfs_stat.atime.to_ne_bytes());
-                    stat[88..96].copy_from_slice(&vfs_stat.mtime.to_ne_bytes());
-                    stat[104..112].copy_from_slice(&vfs_stat.ctime.to_ne_bytes());
-                    if UserSliceWo::new(stat_ptr, stat.len())
-                        .and_then(|s| s.copy_from_kernel(&stat))
-                        .is_err()
-                    {
-                        return NEG_EFAULT;
-                    }
-                    return 0;
+                    let mut m = FileMeta::new();
+                    m.dev = DEV_EXT2_ROOT;
+                    m.ino = vfs_stat.ino;
+                    m.nlink = vfs_stat.nlink;
+                    m.mode = vfs_stat.mode;
+                    m.uid = vfs_stat.uid;
+                    m.gid = vfs_stat.gid;
+                    m.size = vfs_stat.size;
+                    m.blksize = vfs_stat.blksize;
+                    m.blocks = vfs_stat.blocks;
+                    m.atime = vfs_stat.atime;
+                    m.mtime = vfs_stat.mtime;
+                    m.ctime = vfs_stat.ctime;
+                    return Ok(m);
                 }
                 let vol = crate::fs::ext2::EXT2_VOLUME.lock();
                 if let Some(vol) = vol.as_ref()
                     && let Ok(ino) = vol.resolve_path(rel)
                     && let Ok(inode) = vol.read_inode(ino)
                 {
-                    let mode = inode.mode as u32;
-                    let uid = inode.uid as u32;
-                    let gid = inode.gid as u32;
-                    let size = inode.size as u64;
-                    let nlink = inode.links_count as u64;
-                    let blksize = vol.block_size as u64;
-                    let ino = ino as u64;
-                    let mut stat = [0u8; 144];
-                    stat[8..16].copy_from_slice(&ino.to_ne_bytes());
-                    // st_nlink at offset 16 (u64 on x86_64 stat)
-                    stat[16..24].copy_from_slice(&nlink.to_ne_bytes());
-                    stat[24..28].copy_from_slice(&mode.to_ne_bytes());
-                    stat[28..32].copy_from_slice(&uid.to_ne_bytes());
-                    stat[32..36].copy_from_slice(&gid.to_ne_bytes());
-                    stat[48..56].copy_from_slice(&size.to_ne_bytes());
-                    stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
-                    // Phase 32: populate timestamps from ext2 inode
-                    let atime = inode.atime as i64;
-                    let mtime = inode.mtime as i64;
-                    let ctime = inode.ctime as i64;
-                    stat[72..80].copy_from_slice(&atime.to_ne_bytes());
-                    stat[88..96].copy_from_slice(&mtime.to_ne_bytes());
-                    stat[104..112].copy_from_slice(&ctime.to_ne_bytes());
-                    if UserSliceWo::new(stat_ptr, stat.len())
-                        .and_then(|s| s.copy_from_kernel(&stat))
-                        .is_err()
-                    {
-                        return NEG_EFAULT;
-                    }
-                    return 0;
+                    let mut m = FileMeta::new();
+                    m.dev = DEV_EXT2_ROOT;
+                    m.ino = ino as u64;
+                    m.nlink = inode.links_count as u64;
+                    m.mode = inode.mode as u32;
+                    m.uid = inode.uid as u32;
+                    m.gid = inode.gid as u32;
+                    m.size = inode.size as u64;
+                    m.blksize = vol.block_size as u64;
+                    m.blocks = inode.blocks as u64;
+                    // Phase 32: populate timestamps from ext2 inode.
+                    m.atime = inode.atime as i64;
+                    m.mtime = inode.mtime as i64;
+                    m.ctime = inode.ctime as i64;
+                    return Ok(m);
                 }
             }
             // Device special files.
@@ -13589,34 +13959,42 @@ pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags:
                 || name == "/dev/ptmx"
                 || name.starts_with("/dev/pts/")
             {
-                let mut stat = [0u8; 144];
-                let mode: u32 = 0x2000 | 0o666; // S_IFCHR | rw-rw-rw-
-                stat[24..28].copy_from_slice(&mode.to_ne_bytes());
-                if UserSliceWo::new(stat_ptr, stat.len())
-                    .and_then(|s| s.copy_from_kernel(&stat))
-                    .is_err()
-                {
-                    return NEG_EFAULT;
-                }
-                return 0;
+                let mut m = FileMeta::new();
+                m.dev = DEV_DEVFS;
+                m.mode = 0x2000 | 0o666; // S_IFCHR | rw-rw-rw-
+                return Ok(m);
             }
             // Also handle "/" specially.
             if name == "/" {
-                let mut stat = [0u8; 144];
-                let mode: u32 = 0x4000 | 0o755;
-                stat[24..28].copy_from_slice(&mode.to_ne_bytes());
-                let blksize: u64 = 4096;
-                stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
-                if UserSliceWo::new(stat_ptr, stat.len())
-                    .and_then(|s| s.copy_from_kernel(&stat))
-                    .is_err()
-                {
-                    return NEG_EFAULT;
-                }
-                return 0;
+                let mut m = FileMeta::new();
+                m.dev = DEV_EXT2_ROOT;
+                m.mode = 0x4000 | 0o755;
+                return Ok(m);
             }
-            NEG_ENOENT
+            Err(NEG_ENOENT)
         }
+    }
+}
+
+pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) -> u64 {
+    let mut buf = [0u8; 512];
+    let raw_name = match read_user_cstr(path_ptr, &mut buf) {
+        Some(n) => n,
+        None => return NEG_EFAULT,
+    };
+
+    let lexical = match resolve_path_from_dirfd(dirfd, raw_name) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let resolved = match resolve_existing_fs_path(&lexical, flags & AT_SYMLINK_NOFOLLOW == 0) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+
+    match path_filemeta(&resolved) {
+        Ok(m) => write_stat_to_user(stat_ptr, &m),
+        Err(err) => err,
     }
 }
 
@@ -14948,6 +15326,41 @@ pub(super) fn sys_linux_fsync(fd: u64) -> u64 {
 // Phase 13: getdents64(fd, buf, count) — syscall 217
 // ---------------------------------------------------------------------------
 
+/// Phase 88 Track B.3 — the real inode number for `abs_path`, resolved by the
+/// SAME routing `stat` uses, so `getdents64` `d_ino` always matches `stat`
+/// `st_ino` for the same entry (the prior synthetic `idx + 1` `d_ino` violated
+/// that POSIX invariant). Returns 0 for backends with no real inode (ramdisk,
+/// fat32, device nodes) — consistent with their `st_ino = 0`.
+fn path_ino(abs_path: &str) -> u64 {
+    if let Some(st) = crate::fs::procfs::stat(abs_path) {
+        return st.ino;
+    }
+    if let Some(rel) = tmpfs_relative_path(abs_path) {
+        let tmpfs = crate::fs::tmpfs::TMPFS.lock();
+        return tmpfs.stat(rel).map(|s| s.ino).unwrap_or(0);
+    }
+    if crate::fs::ext2::is_mounted()
+        && let Some(rel) = ext2_root_path(abs_path)
+    {
+        let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+        if let Some(vol) = vol.as_ref()
+            && let Ok(ino) = vol.resolve_path(rel)
+        {
+            return ino as u64;
+        }
+    }
+    0
+}
+
+/// The parent-directory path of `path` (e.g. `/etc` → `/`, `/a/b` → `/a`,
+/// `/` → `/`). Used to give the `..` dirent its real inode.
+fn parent_dir(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(0) | None => "/",
+        Some(i) => &path[..i],
+    }
+}
+
 pub(super) fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     let fd_idx = fd as usize;
     if fd_idx >= MAX_FDS {
@@ -15163,7 +15576,19 @@ pub(super) fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         let start = out.len();
         out.resize(start + reclen, 0); // zero-pad
 
-        let d_ino: u64 = (idx + 1) as u64;
+        // Phase 88 Track B.3 — emit the entry's REAL inode (matching `stat`
+        // `st_ino`), not a synthetic `idx + 1`. Reconstruct the entry's absolute
+        // path and resolve it the same way `stat` does.
+        let child_abs = if name.as_str() == "." {
+            dir_path.clone()
+        } else if name.as_str() == ".." {
+            alloc::string::String::from(parent_dir(&dir_path))
+        } else if dir_path == "/" {
+            alloc::format!("/{name}")
+        } else {
+            alloc::format!("{dir_path}/{name}")
+        };
+        let d_ino: u64 = path_ino(&child_abs);
         let d_off: i64 = (idx + 1) as i64;
         out[start..start + 8].copy_from_slice(&d_ino.to_ne_bytes());
         out[start + 8..start + 16].copy_from_slice(&d_off.to_ne_bytes());

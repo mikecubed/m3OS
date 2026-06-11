@@ -4,8 +4,9 @@
 use core::ptr;
 
 use syscall_lib::{
-    O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, STDERR_FILENO, STDOUT_FILENO, Stat, close, dup2, execve,
-    exit, fork, geteuid, getpid, open, read, stat, unlink, waitpid, write, write_str,
+    O_CREAT, O_DIRECTORY, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, SEEK_CUR, SEEK_SET, STDERR_FILENO,
+    STDOUT_FILENO, Stat, close, dup2, execve, exit, fork, fstat, getdents64, geteuid, getpid,
+    lseek, open, read, stat, unlink, waitpid, write, write_str,
 };
 
 const TCC_PATH: &[u8] = b"/usr/bin/tcc\0";
@@ -13,6 +14,22 @@ const HELLO_SOURCE_PATH: &[u8] = b"/usr/src/hello.c\0";
 const HELLO_BIN_PATH: &[u8] = b"/tmp/h\0";
 const SKIP_TCC_MARKER: &[u8] = b"/etc/m3os-skip-tcc-compile\0";
 const PASSWD_PATH: &[u8] = b"/etc/passwd\0";
+
+// Phase 88 Track B.3 — POSIX file-identity regression inputs. `/etc/passwd` is a
+// regular ext2 file on the root, served to userspace through the `vfs_server`
+// (`VfsService`) — the exact backend whose `fstat` returned `st_ino = 0` and
+// broke clang in 85d.
+const STAT_ID_FILE: &[u8] = b"/etc/passwd\0";
+const STAT_ID_DIR: &[u8] = b"/etc\0";
+const STAT_ID_ENTRY: &[u8] = b"passwd";
+const STAT_ID_TMP: &[u8] = b"/tmp/stat-id-probe\0";
+/// A real ext2-backed directory (not ramdisk- or tmpfs-shadowed, unlike `/etc`),
+/// used to prove an ext2 directory fd reports its real inode via `fstat`.
+const STAT_ID_EXT2_DIR: &[u8] = b"/root\0";
+
+// Phase 88 Track G — pwrite64 atomicity regression inputs.
+const PWRITE_TMPFS: &[u8] = b"/tmp/pwrite-atomic\0";
+const PWRITE_EXT2: &[u8] = b"/root/pwrite-atomic-e\0";
 const UDP_SMOKE_PATH: &[u8] = b"/root/udp-smoke\0";
 const PAGE_GRANT_TEST_PATH: &[u8] = b"/bin/page-grant-test\0";
 const PAGE_GRANT_TEST_ARGV0: &[u8] = b"page-grant-test\0";
@@ -198,6 +215,27 @@ fn program_main(_args: &[&str]) -> i32 {
         return code;
     }
     pass("storage");
+
+    // Phase 88 Track B.3 — POSIX file-identity regression. The test that would
+    // have caught the 85d clang `(st_dev, st_ino)` dedup bug directly: a VFS
+    // file's `fstat(fd)` must agree with `stat(path)` field-for-field, distinct
+    // filesystems must report distinct `st_dev`, and `getdents64` `d_ino` must
+    // equal `stat` `st_ino` for the same entry.
+    begin("stat-identity");
+    if let Err(code) = verify_stat_identity() {
+        return code;
+    }
+    pass("stat-identity");
+
+    // Phase 88 Track G — pwrite64 must be atomic: it writes at an explicit
+    // offset without moving the shared fd position. Interleave it with
+    // write/lseek and assert the position is untouched and the following write
+    // lands at the pre-existing position.
+    begin("pwrite-atomic");
+    if let Err(code) = verify_pwrite_atomic() {
+        return code;
+    }
+    pass("pwrite-atomic");
 
     // Phase 88 — ext2 cross-process read-coherence regression (Bug B). Writes an
     // ext2 file, churns unrelated ext2 metadata, then reads it back from a fresh
@@ -806,6 +844,321 @@ fn run_command_expect_nonzero_with_env(
         // dl_entry returned 0). Both count as failure-as-expected.
         _ => Ok(()),
     }
+}
+
+/// Phase 88 Track B.3 — POSIX file-identity regression.
+///
+/// (1) `fstat(open(p))` must equal `stat(p)` field-for-field for a VFS-served
+///     ext2 file — the historical `VfsService` `fstat` returned `st_ino = 0`
+///     (and zero `st_dev`/`st_blocks`/times) while `stat` returned the real
+///     values, colliding clang's `(st_dev, st_ino)` UniqueID. Also asserts
+///     `st_ino`/`st_dev` are nonzero.
+/// (2) A tmpfs file and the ext2 file must report DISTINCT `st_dev` (B.2) so
+///     `(st_dev, st_ino)` cannot collide across filesystems.
+/// (3) `getdents64` `d_ino` must equal `stat` `st_ino` for the same entry (B.3).
+fn verify_stat_identity() -> Result<(), i32> {
+    // (1) fstat(fd) == stat(path) for the same VFS file.
+    let raw_fd = open(STAT_ID_FILE, O_RDONLY, 0);
+    if raw_fd < 0 {
+        return Err(fail("stat-identity", "open /etc/passwd failed", 80));
+    }
+    let fd = raw_fd as i32;
+    let mut by_fd = Stat::zeroed();
+    let frc = fstat(fd, &mut by_fd);
+    close(fd);
+    if frc < 0 {
+        return Err(fail("stat-identity", "fstat failed", 81));
+    }
+    let mut by_path = Stat::zeroed();
+    if stat(STAT_ID_FILE, &mut by_path) < 0 {
+        return Err(fail("stat-identity", "stat failed", 82));
+    }
+    if by_fd.st_ino == 0 {
+        return Err(fail(
+            "stat-identity",
+            "fstat st_ino is zero (the 85d bug)",
+            83,
+        ));
+    }
+    if by_fd.st_dev == 0 {
+        return Err(fail("stat-identity", "fstat st_dev is zero", 84));
+    }
+    if by_fd.st_dev != by_path.st_dev
+        || by_fd.st_ino != by_path.st_ino
+        || by_fd.st_size != by_path.st_size
+        || by_fd.st_mode != by_path.st_mode
+        || by_fd.st_nlink != by_path.st_nlink
+        || by_fd.st_mtime != by_path.st_mtime
+        || by_fd.st_ctime != by_path.st_ctime
+        || by_fd.st_blocks != by_path.st_blocks
+        || by_fd.st_blksize != by_path.st_blksize
+    {
+        return Err(fail("stat-identity", "fstat != stat field mismatch", 85));
+    }
+
+    // (2) A tmpfs file and the ext2 file must not share st_dev. `/tmp` is a
+    // required part of the smoke flow, so a failed create/stat must FAIL the
+    // gate rather than silently skip the Track B.2 distinct-st_dev check.
+    let traw = open(STAT_ID_TMP, O_CREAT | O_WRONLY | O_TRUNC, 0o644);
+    if traw < 0 {
+        return Err(fail("stat-identity", "open /tmp probe failed", 90));
+    }
+    let tfd = traw as i32;
+    let _ = write(tfd, b"x");
+    close(tfd);
+    let mut tmp_stat = Stat::zeroed();
+    let rc = stat(STAT_ID_TMP, &mut tmp_stat);
+    let _ = unlink(STAT_ID_TMP);
+    if rc < 0 {
+        return Err(fail("stat-identity", "stat /tmp probe failed", 91));
+    }
+    if tmp_stat.st_dev == by_path.st_dev {
+        return Err(fail("stat-identity", "tmpfs and ext2 share st_dev", 86));
+    }
+
+    // (2a) Phase 88 — fstat on an EXT2 directory fd must equal stat on the same
+    // path field-for-field, with a REAL (nonzero) inode. `/root` is a real
+    // ext2-backed directory (not ramdisk/tmpfs-shadowed), so this exercises the
+    // consolidated `path_filemeta` source of truth: the historical fstat `Dir`
+    // arm left an ext2 directory's ino/nlink/size/times at 0 (an fstat-vs-fstatat
+    // identity divergence).
+    let rdraw = open(STAT_ID_EXT2_DIR, O_RDONLY | O_DIRECTORY, 0);
+    if rdraw < 0 {
+        return Err(fail("stat-identity", "open /root dir failed", 94));
+    }
+    let rdfd = rdraw as i32;
+    let mut rfd_st = Stat::zeroed();
+    let rrc = fstat(rdfd, &mut rfd_st);
+    close(rdfd);
+    let mut rpath_st = Stat::zeroed();
+    if rrc < 0 || stat(STAT_ID_EXT2_DIR, &mut rpath_st) < 0 {
+        return Err(fail("stat-identity", "fstat/stat(/root) failed", 95));
+    }
+    if rfd_st.st_dev != rpath_st.st_dev
+        || rfd_st.st_ino != rpath_st.st_ino
+        || rfd_st.st_ino == 0
+        || rfd_st.st_size != rpath_st.st_size
+        || rfd_st.st_mode != rpath_st.st_mode
+        || rfd_st.st_nlink != rpath_st.st_nlink
+        || rfd_st.st_mtime != rpath_st.st_mtime
+    {
+        return Err(fail(
+            "stat-identity",
+            "ext2 dir fstat != stat (or ino=0)",
+            96,
+        ));
+    }
+
+    // (3) getdents64 d_ino must equal stat st_ino for the same entry. `/etc`
+    // is required infrastructure (it holds passwd), so a failed open must FAIL
+    // the gate rather than silently skip the Track B.3 d_ino check.
+    let draw = open(STAT_ID_DIR, O_RDONLY | O_DIRECTORY, 0);
+    if draw < 0 {
+        return Err(fail("stat-identity", "open /etc dir failed", 92));
+    }
+    {
+        let dfd = draw as i32;
+
+        // (3a) Phase 88 — a directory fd reports the SAME metadata `fstatat`
+        // reports for its path. `/etc` is ramdisk-shadowed (so `st_ino` is
+        // legitimately 0), but `fstat` and `stat` must still AGREE field-for-
+        // field — in particular on `st_dev` (the historical fstat `Dir` arm
+        // reported `DEV_EXT2_ROOT` while `fstatat` reported `DEV_RAMDISK`).
+        let mut dir_by_fd = Stat::zeroed();
+        if fstat(dfd, &mut dir_by_fd) < 0 {
+            close(dfd);
+            return Err(fail("stat-identity", "fstat(/etc dir fd) failed", 97));
+        }
+        let mut dir_by_path = Stat::zeroed();
+        if stat(STAT_ID_DIR, &mut dir_by_path) < 0 {
+            close(dfd);
+            return Err(fail("stat-identity", "stat(/etc) failed", 98));
+        }
+        if dir_by_fd.st_dev != dir_by_path.st_dev
+            || dir_by_fd.st_ino != dir_by_path.st_ino
+            || dir_by_fd.st_size != dir_by_path.st_size
+            || dir_by_fd.st_mode != dir_by_path.st_mode
+            || dir_by_fd.st_nlink != dir_by_path.st_nlink
+            || dir_by_fd.st_mtime != dir_by_path.st_mtime
+        {
+            close(dfd);
+            return Err(fail(
+                "stat-identity",
+                "ramdisk dir fstat != stat field mismatch",
+                99,
+            ));
+        }
+
+        let mut dbuf = [0u8; 4096];
+        let mut found = false;
+        loop {
+            let n = getdents64(dfd, &mut dbuf);
+            if n <= 0 {
+                break;
+            }
+            let n = n as usize;
+            let mut off = 0usize;
+            // linux_dirent64: u64 d_ino; i64 d_off; u16 d_reclen; u8 d_type; name[].
+            while off + 19 <= n {
+                let d_ino = u64::from_ne_bytes([
+                    dbuf[off],
+                    dbuf[off + 1],
+                    dbuf[off + 2],
+                    dbuf[off + 3],
+                    dbuf[off + 4],
+                    dbuf[off + 5],
+                    dbuf[off + 6],
+                    dbuf[off + 7],
+                ]);
+                let d_reclen = u16::from_ne_bytes([dbuf[off + 16], dbuf[off + 17]]) as usize;
+                if d_reclen < 19 || off + d_reclen > n {
+                    break;
+                }
+                let name_start = off + 19;
+                let mut name_end = name_start;
+                while name_end < off + d_reclen && dbuf[name_end] != 0 {
+                    name_end += 1;
+                }
+                if &dbuf[name_start..name_end] == STAT_ID_ENTRY {
+                    if d_ino != by_path.st_ino {
+                        close(dfd);
+                        return Err(fail("stat-identity", "getdents64 d_ino != stat st_ino", 87));
+                    }
+                    found = true;
+                }
+                off += d_reclen;
+            }
+        }
+        close(dfd);
+        if !found {
+            return Err(fail(
+                "stat-identity",
+                "passwd entry not found via getdents64",
+                88,
+            ));
+        }
+    }
+
+    // (4) Phase 88 Track E — statx(332) is intentionally unimplemented; the
+    // kernel must report -ENOSYS so libc falls back to the (now-correct,
+    // fill_stat-complete) newfstatat. A 0/positive return would mean a
+    // half-built statx is leaking uninitialised metadata to callers.
+    let mut statxbuf = [0u8; 256];
+    let statx_ret = unsafe {
+        syscall_lib::syscall5(
+            332,
+            (-100_i64) as u64,            // AT_FDCWD
+            STAT_ID_FILE.as_ptr() as u64, // pathname
+            0,                            // flags
+            0x7ff,                        // STATX_BASIC_STATS mask
+            statxbuf.as_mut_ptr() as u64, // statxbuf
+        )
+    };
+    if (statx_ret as i64) != -38 {
+        return Err(fail(
+            "stat-identity",
+            "statx(332) did not return -ENOSYS",
+            89,
+        ));
+    }
+
+    Ok(())
+}
+
+/// Phase 88 Track G — pwrite64 atomicity regression. Interleaves `pwrite64` (via
+/// the raw syscall — no libc wrapper exists) with `write`/`lseek` on a shared fd
+/// and asserts `pwrite` leaves the fd position unchanged and the SUBSEQUENT
+/// `write` lands at the pre-existing position, not the `pwrite` offset. Covers
+/// the Tmpfs path fully (content read-back) and the ext2 path's position
+/// invariant.
+fn verify_pwrite_atomic() -> Result<(), i32> {
+    // --- Tmpfs: full interleave + content read-back ---
+    let raw = open(PWRITE_TMPFS, O_RDWR | O_CREAT | O_TRUNC, 0o644);
+    if raw < 0 {
+        return Err(fail("pwrite-atomic", "open tmpfs file failed", 70));
+    }
+    let fd = raw as i32;
+    if write(fd, b"AAAA") != 4 {
+        close(fd);
+        let _ = unlink(PWRITE_TMPFS);
+        return Err(fail("pwrite-atomic", "tmpfs write AAAA failed", 71));
+    }
+    // pwrite64(fd, "BB", 2, offset=10) — syscall 18.
+    let pw = unsafe { syscall_lib::syscall4(18, fd as u64, b"BB".as_ptr() as u64, 2, 10) };
+    if (pw as i64) != 2 {
+        close(fd);
+        let _ = unlink(PWRITE_TMPFS);
+        return Err(fail(
+            "pwrite-atomic",
+            "tmpfs pwrite returned wrong count",
+            72,
+        ));
+    }
+    if lseek(fd, 0, SEEK_CUR) != 4 {
+        close(fd);
+        let _ = unlink(PWRITE_TMPFS);
+        return Err(fail(
+            "pwrite-atomic",
+            "tmpfs pwrite moved the fd position",
+            73,
+        ));
+    }
+    if write(fd, b"CC") != 2 {
+        close(fd);
+        let _ = unlink(PWRITE_TMPFS);
+        return Err(fail("pwrite-atomic", "tmpfs write CC failed", 74));
+    }
+    if lseek(fd, 0, SEEK_CUR) != 6 {
+        close(fd);
+        let _ = unlink(PWRITE_TMPFS);
+        return Err(fail("pwrite-atomic", "tmpfs position wrong after CC", 75));
+    }
+    let _ = lseek(fd, 0, SEEK_SET);
+    let mut rb = [0u8; 12];
+    let n = read(fd, &mut rb);
+    close(fd);
+    let _ = unlink(PWRITE_TMPFS);
+    if n != 12 {
+        return Err(fail("pwrite-atomic", "tmpfs read-back short", 76));
+    }
+    // "AAAA" at 0, "CC" at 4 (pre-pwrite position), "BB" at 10 (pwrite offset).
+    if &rb[0..4] != b"AAAA" || &rb[4..6] != b"CC" || &rb[10..12] != b"BB" {
+        return Err(fail(
+            "pwrite-atomic",
+            "tmpfs content landed at wrong offsets",
+            77,
+        ));
+    }
+
+    // --- ext2: pwrite must not move the shared fd position. /root is created
+    // unconditionally by the ext2 disk populator, so a failed open must FAIL the
+    // gate rather than silently skip the ext2 arm of this Track G regression. ---
+    let eraw = open(PWRITE_EXT2, O_RDWR | O_CREAT | O_TRUNC, 0o644);
+    if eraw < 0 {
+        return Err(fail("pwrite-atomic", "open ext2 /root probe failed", 93));
+    }
+    let efd = eraw as i32;
+    let _ = write(efd, b"AAAA"); // position 4
+    let epw = unsafe { syscall_lib::syscall4(18, efd as u64, b"BB".as_ptr() as u64, 2, 100) };
+    let epos = lseek(efd, 0, SEEK_CUR);
+    close(efd);
+    let _ = unlink(PWRITE_EXT2);
+    if (epw as i64) != 2 {
+        return Err(fail(
+            "pwrite-atomic",
+            "ext2 pwrite returned wrong count",
+            78,
+        ));
+    }
+    if epos != 4 {
+        return Err(fail(
+            "pwrite-atomic",
+            "ext2 pwrite moved the fd position",
+            79,
+        ));
+    }
+
+    Ok(())
 }
 
 fn verify_required_storage_files() -> Result<(), i32> {

@@ -240,59 +240,78 @@ large workloads.
 
 ---
 
-## Audit checklist (for the planned spec-conformance pass)
+## Audit checklist — RESOLVED by [Phase 88](../roadmap/88-vfs-stat-and-ext2-consolidation.md)
+
+Phase 88 implemented this checklist. Boxes below are checked with the resolution.
 
 **A. `stat` family conformance (highest priority — this is where the bug lived)**
-- [ ] Enumerate every stat-producing syscall: `stat`(4), `lstat`(6), `fstat`(5),
-      `newfstatat`/`fstatat`(262), and `statx`(332) if/when added.
-- [ ] For each × every `FdBackend` and path type (Ext2Disk, VfsService, Tmpfs, Ramdisk,
-      Proc, Fat32, device nodes, sockets, pipes, epoll): verify **every** `struct stat`
-      field is populated correctly: `st_dev, st_ino, st_nlink, st_mode, st_uid, st_gid,
-      st_rdev, st_size, st_blksize, st_blocks, st_atim, st_mtim, st_ctim`.
-- [ ] **Identity consistency test:** open the same file (a) by path via `stat`, (b) by fd
-      via `open`+`fstat`, (c) through the kernel ext2 (`Ext2Disk`) and the vfs_server
-      (`VfsService`) where both can reach it — assert **identical** `(st_dev, st_ino)` and
-      consistent size/mode/times across all four.
-- [ ] Verify `(st_dev, st_ino)` is **unique across filesystems** (tmpfs vs ext2 vs
-      ramdisk) — i.e. fix `st_dev = 0` everywhere.
-- [ ] Replace per-path hand-assembly with a single `fill_stat` (finding #1).
+- [x] Stat syscalls enumerated: `stat`(4)/`lstat`(6)/`newfstatat`(262) all route through
+      `sys_linux_fstatat`; `fstat`(5) is `sys_linux_fstat`; `statx`(332) returns a
+      *documented* ENOSYS so libc falls back to the now-correct `newfstatat` (Track E).
+- [x] Every `struct stat` field populated per backend via the canonical
+      `FileMeta`/`fill_stat` builders; `VfsService` `fstat` now carries a full
+      `VfsFileMeta` snapshot (dev/ino/nlink/mode/uid/gid/size/blocks/a-m-c-times) seeded
+      from the `VFS_OPEN` reply (Track A/B/D).
+- [x] **Identity consistency** asserted in-OS: `smoke-runner`'s always-on `stat-identity`
+      stage checks `fstat(open(p)) == fstatat(p)` field-for-field for a VFS file (Track B.3).
+- [x] `(st_dev, st_ino)` unique across filesystems — synthetic per-mount `st_dev`
+      (`DEV_EXT2_ROOT`/`DEV_TMPFS`/`DEV_RAMDISK`/`DEV_PROCFS`/`DEV_FAT32`/`DEV_DEVFS`) via
+      `stat_dev_for_backend`; `st_dev = 0` no longer used for real files (Track B.2).
+- [x] Per-path hand-assembly replaced by the single `fill_stat`; a `cargo xtask check`
+      stat-assembly gate fails any reintroduced `stat[<n>..` offset write (Track A).
 
 **B. Two-implementation parity (kernel ext2 vs vfs_server ext2)**
-- [ ] Parity test: for a corpus of paths (regular files, dirs, symlinks, sparse/hole
-      files, files using single/double/triple-indirect blocks, large files >12 blocks,
-      deep paths, large directories with hundreds of entries), assert the kernel and
-      vfs_server return identical inode numbers, sizes, file contents, and directory
-      listings.
-- [ ] Diff the two `resolve_path` / `read_inode` / `read_file_data` / `resolve_block`
-      implementations for behavioral drift; ideally collapse onto shared `kernel_core`
-      logic (finding #2).
-- [ ] Confirm symlink resolution, `.`/`..`, trailing slashes, and `AT_SYMLINK_NOFOLLOW`
-      behave identically in both.
+- [x] Parity host tests (`kernel_core::fs::ext2::tests`, 9 tests over a `MockExt2`
+      `BlockReader`): regular/dir/symlink/sparse/single+double-indirect/large-dir, plus
+      triple-indirect-unsupported (Track C.2).
+- [x] The two `resolve_path`/`read_inode`/`read_file_data`/`resolve_block`/dir-parsing
+      copies are **collapsed onto one shared `kernel_core::fs::ext2` implementation** over
+      a `BlockReader` trait; both engines delegate (Track C.1, finding #2 closed).
+- [x] Symlink/`.`/`..`/`AT_SYMLINK_NOFOLLOW` behaviour is identical **by construction** —
+      there is now a single `resolve_path`.
 
 **C. Directory / `readdir` consistency**
-- [ ] `getdents64` `d_ino` must equal `stat` `st_ino` for the same entry.
-- [ ] `st_nlink` for directories (`2 + subdir_count`) is correct.
+- [x] `getdents64` `d_ino` now equals `stat` `st_ino` — the synthetic `d_ino = idx+1` was
+      replaced by `path_ino()` (same routing `stat` uses); asserted in `stat-identity`
+      (Track B.3).
+- [x] `st_nlink` for directories: the ext2 inode's on-disk `links_count` is reported
+      directly for ext2-backed dirs by BOTH `fstatat(dir)` and `fstat(open(dir))` — the
+      `fstat` directory-fd arm and `fstatat` now build metadata through one shared
+      `path_filemeta()` source of truth, so a directory fd no longer reports
+      `nlink=ino=size=times=0` (it previously did, an `fstat`-vs-`fstatat` divergence). A
+      synthetic `2 + subdir_count` for virtual dirs is out of scope.
 
-**D. Block cache & coherency**
-- [ ] Confirm every disk *mutation* routes through `write_block` (cache-invalidating);
-      audit the two direct `write_sectors` (superblock/BGD) for any cached-block overlap.
-- [ ] Stress the cache past `BLOCK_CACHE_MAX` and confirm correctness (not just the perf
-      cliff); consider eviction (finding #4).
-- [ ] Confirm kernel-ext2 writes are observable by subsequent vfs_server raw reads
-      (device-level coherency) under load.
+**D. Block cache & coherency** — largely owned by Phase 87/88 throughput work, not the
+   stat pass; recorded here as cross-references.
+- [x] Mutations route through the write-through cache; out-of-band routed writes call
+      `invalidate_block_cache` (Phase 87/88).
+- [ ] LRU/clock eviction past `BLOCK_CACHE_MAX` (finding #4) — **deferred** (still
+      fill-and-hold).
+- [x] Cross-process write→read coherency is covered by the always-on `ext2-coherence`
+      smoke (Phase 88).
 
 **E. Mount routing**
-- [ ] Document, in `docs/08-storage-and-vfs.md` / `docs/18-directory-vfs.md`, the exact
-      rule for which paths resolve to `Ext2Disk` (kernel) vs `VfsService` (vfs_server),
-      and which kernel subsystems read ext2 directly (exec loader, mount, etc.).
+- [x] Documented in `docs/08-storage-and-vfs.md` + `docs/18-directory-vfs.md` (the
+      `Ext2Disk` vs `VfsService` rule + the kernel direct-ext2 readers) — Track F.
 
 **F. Downstream consumers (regression-grade)**
-- [ ] `make`/`ninja` incremental rebuild correctness (mtime).
-- [ ] `git status` on a clean tree (index `st_ino`/`st_mtim` stability).
-- [ ] clang multi-header compile (the original symptom) — covered by `clang-smoke`
-      (consider promoting the `M3OS_CLANG_STRESS` multi-compile mode into CI as a
-      stat-identity regression guard).
-- [ ] `python` `importlib` `.pyc` reuse (source mtime).
+- [x] clang multi-header compile (the original symptom): the `clang-smoke` gate runs under
+      `M3OS_CLANG_STRESS=1` as a promoted pre-push stat-identity regression guard (Track F).
+      **NOTE — promoting the gate surfaced 3 pre-existing Phase 86/87 regressions; all
+      FIXED, gate now green (CLANG_C_OK + CLANG_CPP_OK + `-fuse-ld=lld`, incl. stress):**
+      (1) file-backed mmap write-back — `lld`'s `PROT_WRITE MAP_SHARED` output was never
+      written back (`munmap`/`msync` no-op) → all-zeros binary (`InvalidMagic`); fixed via a
+      `MemoryMapping` fd+offset + `munmap` flush over Track G's `kernel_write_fd_at`. (2) the
+      strip-before-seal stripped the relocatable crt objects, deleting `_start` from crt1.o
+      (`cannot find entry symbol _start`); fixed by skipping ET_REL in `strip_stage` + a
+      seal guard. (3) clang defaulted to a dynamic/PIE link (unrunnable — no `libc.so`);
+      fixed with a static-default `clang.cfg` + `CLANG_CONFIG_FILE_SYSTEM_DIR`. (Plus a
+      kernel user-stack bump 256 KiB → 4 MiB for clang's C++ frontend.) All confirmed
+      identical on `ef1b6b21`, so Phase 88's stat work is exonerated; the deterministic
+      `stat-identity` smoke stage was the green guard throughout.
+- [~] `make`/`git`/`python` rely on the now-correct, consistent `st_mtim`/`st_ino`; the
+      existing `git-local-smoke` (clean-tree `git status`) and `python-smoke` gates
+      exercise them. A dedicated `make`-incremental gate is a follow-up.
 
 ---
 
