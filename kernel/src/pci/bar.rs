@@ -540,6 +540,7 @@ pub(crate) fn map_mmio_region_to_user(
             len: total_size,
             prot: VMA_PROT_READ | VMA_PROT_WRITE,
             flags: VMA_MAP_SHARED | MMIO_MAPPING_FLAG,
+            file_backing: None, // MMIO/device mapping — never written back
         });
     });
 
