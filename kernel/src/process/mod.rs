@@ -177,6 +177,10 @@ pub enum FdBackend {
     /// primitive. One fd is both readable and writable; backed by
     /// `crate::eventfd` keyed by `id`.
     EventFd { id: usize },
+    /// `timerfd(2)` object (Phase 89 Track A.1) — libuv's event-loop due-timer
+    /// fd. Read-only and pollable: becomes readable on expiry, `read` returns
+    /// the `u64` expiration count. Backed by `crate::timerfd` keyed by `id`.
+    TimerFd { id: usize },
     /// Directory file descriptor (Phase 18).
     Dir { path: String },
     /// /dev/null — reads return EOF, writes are silently discarded (Phase 21).

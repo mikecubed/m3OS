@@ -50,6 +50,7 @@ pub mod slab;
 pub mod spectre;
 pub mod storage;
 pub mod time;
+pub mod timerfd;
 pub mod trace_ring;
 pub mod tty;
 pub mod types;

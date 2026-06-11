@@ -547,6 +547,7 @@ fn fd_target(backend: &FdBackend) -> Option<String> {
             Some(alloc::format!("anon_inode:[eventpoll:{instance_id}]"))
         }
         FdBackend::EventFd { id } => Some(alloc::format!("anon_inode:[eventfd:{id}]")),
+        FdBackend::TimerFd { id } => Some(alloc::format!("anon_inode:[timerfd:{id}]")),
         FdBackend::VfsService { service_handle, .. } => {
             Some(alloc::format!("vfs:[handle={service_handle}]"))
         }

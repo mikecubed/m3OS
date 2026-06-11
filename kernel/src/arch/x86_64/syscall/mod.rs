@@ -1408,6 +1408,11 @@ mod syscall_nr {
     // Phase 86d Track D — Go 1.21+ uses an eventfd as its cross-thread M-wakeup
     // primitive (`netpollBreak`).
     pub const EVENTFD2: u64 = 290;
+    // Phase 89 Track A.1 — libuv's event-loop due-timer fd. `timerfd_create`
+    // takes (clockid, flags); `timerfd_settime`/`gettime` operate on the fd.
+    pub const TIMERFD_CREATE: u64 = 283;
+    pub const TIMERFD_SETTIME: u64 = 286;
+    pub const TIMERFD_GETTIME: u64 = 287;
 
     // -- time --
     pub const NANOSLEEP: u64 = 35;
@@ -1990,6 +1995,14 @@ pub extern "C" fn syscall_handler(
         }
         EPOLL_CREATE1 => sys_epoll_create1(arg0),
         EVENTFD2 => sys_eventfd2(arg0, arg1),
+        // Phase 89 Track A.1 — timerfd. `settime` needs a 4th arg (old_value
+        // ptr) from r10, like PSELECT6's timeout ptr.
+        TIMERFD_CREATE => sys_timerfd_create(arg0, arg1),
+        TIMERFD_SETTIME => {
+            let old_value_ptr = per_core_syscall_arg3();
+            sys_timerfd_settime(arg0, arg1, arg2, old_value_ptr)
+        }
+        TIMERFD_GETTIME => sys_timerfd_gettime(arg0, arg1),
         PIPE2 => {
             // Phase 69d follow-up (PR #177 third-pass review fix):
             // reject unknown pipe2 flag bits with EINVAL.  Linux only
@@ -3875,6 +3888,7 @@ pub(super) fn sys_dup(oldfd: u64) -> u64 {
                 FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_add_reader(*pipe_id),
                 FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_add_writer(*pipe_id),
                 FdBackend::EventFd { id } => crate::eventfd::eventfd_add_ref(*id),
+                FdBackend::TimerFd { id } => crate::timerfd::timerfd_add_ref(*id),
                 FdBackend::PtyMaster { pty_id } => crate::pty::add_master_ref(*pty_id),
                 FdBackend::PtySlave { pty_id } => crate::pty::add_slave_ref(*pty_id),
                 FdBackend::Socket { handle } => crate::net::add_socket_ref(*handle),
@@ -3934,6 +3948,7 @@ pub(super) fn sys_dup2(oldfd: u64, newfd: u64) -> u64 {
         FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_add_reader(*pipe_id),
         FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_add_writer(*pipe_id),
         FdBackend::EventFd { id } => crate::eventfd::eventfd_add_ref(*id),
+        FdBackend::TimerFd { id } => crate::timerfd::timerfd_add_ref(*id),
         FdBackend::PtyMaster { pty_id } => crate::pty::add_master_ref(*pty_id),
         FdBackend::PtySlave { pty_id } => crate::pty::add_slave_ref(*pty_id),
         FdBackend::Socket { handle } => crate::net::add_socket_ref(*handle),
@@ -6206,6 +6221,59 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                 crate::eventfd::eventfd_deregister_waiter(id, task_id);
             }
         }
+        FdBackend::TimerFd { id } => {
+            // Phase 89 Track A.1 — timerfd read: an 8-byte u64 expiration count,
+            // drained on read. A blocking read parks until the next expiry; the
+            // wake is driven by the scheduler `wake_deadline` (clamped to the
+            // timer's next-expiry tick — the IRQ-safe wake path) or by a
+            // `timerfd_settime` re-arm. TFD_NONBLOCK returns EAGAIN when unfired.
+            let id = *id;
+            if (count as usize) < 8 {
+                return NEG_EINVAL;
+            }
+            let nonblock = entry.nonblock;
+            let task_id = match crate::task::scheduler::current_task_id() {
+                Some(t) => t,
+                None => return NEG_EINTR,
+            };
+            let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+            loop {
+                woken.store(false, core::sync::atomic::Ordering::Release);
+                if !crate::timerfd::timerfd_register_waiter(id, task_id, &woken) {
+                    return 0; // object freed under us → EOF
+                }
+                if let Some(expirations) = crate::timerfd::timerfd_read(id) {
+                    crate::timerfd::timerfd_deregister_waiter(id, task_id);
+                    let bytes = expirations.to_ne_bytes();
+                    if UserSliceWo::new(buf_ptr, bytes.len())
+                        .and_then(|s| s.copy_from_kernel(&bytes))
+                        .is_err()
+                    {
+                        return NEG_EFAULT;
+                    }
+                    return 8;
+                }
+                if nonblock {
+                    crate::timerfd::timerfd_deregister_waiter(id, task_id);
+                    return NEG_EAGAIN;
+                }
+                if has_pending_signal() {
+                    crate::timerfd::timerfd_deregister_waiter(id, task_id);
+                    return NEG_EINTR;
+                }
+                // Block until the next expiry (or indefinitely if disarmed,
+                // woken by a later settime). Clamping the block deadline to the
+                // timer's next tick lets the scheduler's IRQ-safe deadline
+                // scanner wake us — `WaitQueue::wake_all` can't run from the ISR.
+                let deadline = crate::timerfd::timerfd_next_expiry_tick(id);
+                let _ = crate::task::scheduler::block_current_until(
+                    crate::task::TaskState::BlockedOnRecv,
+                    &woken,
+                    deadline,
+                );
+                crate::timerfd::timerfd_deregister_waiter(id, task_id);
+            }
+        }
         FdBackend::Stdin | FdBackend::DeviceTTY { .. } => {
             // Read from kernel stdin buffer.
             let capped = (count as usize).min(4096);
@@ -7029,6 +7097,8 @@ pub(super) fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                 Err(crate::eventfd::EventFdWriteErr::BadFd) => NEG_EBADF,
             }
         }
+        // Phase 89 Track A.1 — a timerfd is read-only; write(2) returns EINVAL.
+        FdBackend::TimerFd { .. } => NEG_EINVAL,
         FdBackend::Stdout | FdBackend::DeviceTTY { .. } => {
             // stdout/stderr/tty go to serial + framebuffer console.
             let len = (count as usize).min(4096);
@@ -9430,6 +9500,7 @@ pub(super) fn sys_linux_close(fd: u64) -> u64 {
             FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_close_reader(*pipe_id),
             FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_close_writer(*pipe_id),
             FdBackend::EventFd { id } => crate::eventfd::eventfd_close(*id),
+            FdBackend::TimerFd { id } => crate::timerfd::timerfd_close(*id),
             FdBackend::Socket { handle } => crate::net::release_socket_pub(*handle),
             FdBackend::UnixSocket { handle } => crate::net::unix::free_unix_socket(*handle),
             FdBackend::PtyMaster { pty_id } => crate::pty::close_master(*pty_id),
@@ -10039,7 +10110,10 @@ pub(super) fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
             m.mode = 0x2000 | 0o620;
             m
         }
-        FdBackend::PipeRead { .. } | FdBackend::PipeWrite { .. } | FdBackend::EventFd { .. } => {
+        FdBackend::PipeRead { .. }
+        | FdBackend::PipeWrite { .. }
+        | FdBackend::EventFd { .. }
+        | FdBackend::TimerFd { .. } => {
             let mut m = FileMeta::new();
             m.mode = 0x1000 | 0o600;
             m
@@ -10218,9 +10292,10 @@ pub(super) fn sys_fstatfs(fd: u64, buf_ptr: u64) -> u64 {
         | FdBackend::PtySlave { .. }
         | FdBackend::Epoll { .. } => ramdisk_statfs(),
         FdBackend::Stdin | FdBackend::Stdout => ramdisk_statfs(),
-        FdBackend::PipeRead { .. } | FdBackend::PipeWrite { .. } | FdBackend::EventFd { .. } => {
-            pipefs_statfs()
-        }
+        FdBackend::PipeRead { .. }
+        | FdBackend::PipeWrite { .. }
+        | FdBackend::EventFd { .. }
+        | FdBackend::TimerFd { .. } => pipefs_statfs(),
         FdBackend::Socket { .. } | FdBackend::UnixSocket { .. } => sockfs_statfs(),
         FdBackend::VfsService { .. } => ext2_statfs(),
     };
@@ -10576,7 +10651,8 @@ pub(super) fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
         | FdBackend::Socket { .. }
         | FdBackend::UnixSocket { .. }
         | FdBackend::Epoll { .. }
-        | FdBackend::EventFd { .. } => return NEG_EINVAL, // not seekable
+        | FdBackend::EventFd { .. }
+        | FdBackend::TimerFd { .. } => return NEG_EINVAL, // not seekable
         FdBackend::Ramdisk { content_len, .. } => *content_len,
         FdBackend::Tmpfs { path } => {
             let tmpfs = crate::fs::tmpfs::TMPFS.lock();
@@ -15235,7 +15311,8 @@ pub(super) fn sys_linux_ftruncate(fd: u64, length: u64) -> u64 {
         | FdBackend::Socket { .. }
         | FdBackend::UnixSocket { .. }
         | FdBackend::Epoll { .. }
-        | FdBackend::EventFd { .. } => NEG_EINVAL,
+        | FdBackend::EventFd { .. }
+        | FdBackend::TimerFd { .. } => NEG_EINVAL,
         FdBackend::Ramdisk { .. } => NEG_EROFS,
         FdBackend::Tmpfs { path } => {
             let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
@@ -20257,6 +20334,20 @@ fn fd_poll_events(entry: &FdEntry) -> i16 {
             }
             revents
         }
+        FdBackend::TimerFd { id } => {
+            // Phase 89 Track A.1 — timerfd readiness: POLLIN once the timer has
+            // fired (level-triggered while expirations remain; the epoll ET
+            // watermark handles edge mode). Never writable. A freed object
+            // reports a terminal event so blocked waiters exit (mirrors eventfd).
+            if !crate::timerfd::timerfd_exists(*id) {
+                return POLLIN | POLLHUP | POLLERR;
+            }
+            if crate::timerfd::timerfd_readable(*id) {
+                POLLIN
+            } else {
+                0
+            }
+        }
         FdBackend::DeviceTTY { .. } | FdBackend::Stdin => {
             let mut revents: i16 = 0;
             if entry.readable && crate::stdin::has_data() {
@@ -20545,6 +20636,7 @@ fn fd_register_waiter(
             false
         }
         FdBackend::EventFd { id } => crate::eventfd::eventfd_register_waiter(*id, task_id, woken),
+        FdBackend::TimerFd { id } => crate::timerfd::timerfd_register_waiter(*id, task_id, woken),
         FdBackend::DeviceTTY { .. } | FdBackend::Stdin => {
             crate::stdin::STDIN_WAITQUEUE.register(task_id, woken);
             true
@@ -20594,7 +20686,53 @@ fn fd_deregister_waiter(entry: &FdEntry, task_id: crate::task::TaskId) {
             crate::pty::PTY_SLAVE_WQ[*pty_id as usize].deregister(task_id);
         }
         FdBackend::EventFd { id } => crate::eventfd::eventfd_deregister_waiter(*id, task_id),
+        FdBackend::TimerFd { id } => crate::timerfd::timerfd_deregister_waiter(*id, task_id),
         _ => {}
+    }
+}
+
+/// Nearest armed-timerfd next-expiry tick among `entries[..nfds]`, for clamping a
+/// `poll`/`select` block deadline (Phase 89 Track A.1). `None` when none is
+/// armed-and-pending — an already-expired timerfd is readable, so the poll
+/// returns without blocking and needs no clamp.
+fn nearest_timerfd_deadline_entries(entries: &[Option<FdEntry>], nfds: usize) -> Option<u64> {
+    let mut nearest: Option<u64> = None;
+    for entry in entries.iter().take(nfds).flatten() {
+        if let FdBackend::TimerFd { id } = &entry.backend
+            && let Some(d) = crate::timerfd::timerfd_next_expiry_tick(*id)
+        {
+            nearest = Some(nearest.map_or(d, |m| m.min(d)));
+        }
+    }
+    nearest
+}
+
+/// Nearest armed-timerfd next-expiry tick among the given fds — `epoll_wait`
+/// tracks interest fds rather than `FdEntry`s, so it resolves each fd fresh.
+fn nearest_timerfd_deadline_fds(fds: impl Iterator<Item = usize>) -> Option<u64> {
+    let mut nearest: Option<u64> = None;
+    for fd in fds {
+        if let Some(entry) = current_fd_entry(fd)
+            && let FdBackend::TimerFd { id } = &entry.backend
+            && let Some(d) = crate::timerfd::timerfd_next_expiry_tick(*id)
+        {
+            nearest = Some(nearest.map_or(d, |m| m.min(d)));
+        }
+    }
+    nearest
+}
+
+/// Clamp a `poll`/`epoll_wait` user block deadline to the nearest armed-timerfd
+/// expiry — whichever is first. This is what lets a blocked (including
+/// indefinite, `timeout == -1`) waiter wake when a timerfd fires: the scheduler's
+/// IRQ-safe `wake_deadline` scanner fires at the clamped deadline, the waiter
+/// re-scans, and finds the timerfd readable. A timerfd cannot signal its wait
+/// queue from the timer ISR (`WaitQueue::wake_all` is task-context only).
+fn clamp_block_deadline(user: Option<u64>, timerfd: Option<u64>) -> Option<u64> {
+    match (user, timerfd) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, t) => t,
     }
 }
 
@@ -20746,12 +20884,19 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
 
         // Block until woken by an FD event or timeout.  If a wake
         // fired between register and now, `woken` is already true and
-        // `block_current_until` returns immediately.
-        if registered_any || deadline_tick.is_some() {
+        // `block_current_until` returns immediately. The deadline is clamped to
+        // the nearest armed timerfd expiry (Phase 89 A.1) so a blocked poller
+        // wakes when a timerfd fires even on an indefinite (-1) poll — the timer
+        // ISR can't signal the timerfd's wait queue.
+        let block_deadline = clamp_block_deadline(
+            deadline_tick,
+            nearest_timerfd_deadline_entries(&entries, nfds),
+        );
+        if registered_any || block_deadline.is_some() {
             let _ = crate::task::scheduler::block_current_until(
                 crate::task::TaskState::BlockedOnRecv,
                 &woken,
-                deadline_tick,
+                block_deadline,
             );
         } else {
             crate::task::yield_now();
@@ -21255,6 +21400,209 @@ pub(super) fn sys_eventfd2(initval: u64, flags: u64) -> u64 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 89 Track A.1 — timerfd_create / timerfd_settime / timerfd_gettime
+// ---------------------------------------------------------------------------
+
+/// Current time of `clockid` in nanoseconds, for `TFD_TIMER_ABSTIME`
+/// resolution. Monotonic uses the same TSC/tick source as `clock_gettime`.
+fn clock_now_nanos(clockid: u32) -> u64 {
+    if clockid == crate::timerfd::CLOCK_REALTIME {
+        let (s, us) = tsc_now_us();
+        s.saturating_mul(1_000_000_000)
+            .saturating_add(us.saturating_mul(1_000))
+    } else {
+        // CLOCK_MONOTONIC / CLOCK_BOOTTIME — elapsed since boot in ns, mirroring
+        // the CLOCK_MONOTONIC branch of `sys_clock_gettime`.
+        let tsc_per_ms = crate::arch::x86_64::apic::tsc_per_ms();
+        if tsc_per_ms == 0 {
+            let ticks = crate::arch::x86_64::interrupts::tick_count();
+            ticks.saturating_mul(1_000_000_000 / TICKS_PER_SEC)
+        } else {
+            let boot_tsc = crate::arch::x86_64::apic::boot_tsc();
+            let now_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+            let elapsed_tsc = now_tsc.wrapping_sub(boot_tsc);
+            let elapsed_ms = elapsed_tsc.checked_div(tsc_per_ms).unwrap_or(0);
+            let frac_ns = elapsed_tsc
+                .checked_rem(tsc_per_ms)
+                .and_then(|r| r.checked_mul(1_000_000))
+                .and_then(|v| v.checked_div(tsc_per_ms))
+                .unwrap_or(0);
+            elapsed_ms.saturating_mul(1_000_000).saturating_add(frac_ns)
+        }
+    }
+}
+
+/// timerfd_create(clockid, flags) — syscall 283.
+pub(super) fn sys_timerfd_create(clockid: u64, flags: u64) -> u64 {
+    use crate::timerfd::{TFD_CLOEXEC, TFD_CREATE_KNOWN_FLAGS, TFD_NONBLOCK};
+    let clockid = clockid as u32;
+    match clockid {
+        crate::timerfd::CLOCK_REALTIME
+        | crate::timerfd::CLOCK_MONOTONIC
+        | crate::timerfd::CLOCK_BOOTTIME => {}
+        _ => return NEG_EINVAL, // CPU-time and other clocks are unsupported
+    }
+    if flags & !TFD_CREATE_KNOWN_FLAGS != 0 {
+        return NEG_EINVAL;
+    }
+    let cloexec = flags & TFD_CLOEXEC != 0;
+    let nonblock = flags & TFD_NONBLOCK != 0;
+    let id = match crate::timerfd::timerfd_create(clockid) {
+        Some(id) => id,
+        None => return NEG_ENOMEM,
+    };
+    let entry = FdEntry {
+        backend: FdBackend::TimerFd { id },
+        offset: 0,
+        readable: true,
+        writable: false,
+        cloexec,
+        nonblock,
+    };
+    match alloc_fd(0, entry) {
+        Some(fd) => fd as u64,
+        None => {
+            crate::timerfd::timerfd_close(id);
+            NEG_EMFILE
+        }
+    }
+}
+
+/// timerfd_settime(fd, flags, new_value, old_value) — syscall 286.
+pub(super) fn sys_timerfd_settime(
+    fd: u64,
+    flags: u64,
+    new_value_ptr: u64,
+    old_value_ptr: u64,
+) -> u64 {
+    use crate::timerfd::{TFD_SETTIME_KNOWN_FLAGS, TFD_TIMER_ABSTIME};
+    if flags & !TFD_SETTIME_KNOWN_FLAGS != 0 {
+        return NEG_EINVAL;
+    }
+    let fd_idx = fd as usize;
+    if fd_idx >= MAX_FDS {
+        return NEG_EBADF;
+    }
+    let id = match current_fd_entry(fd_idx) {
+        Some(e) => match e.backend {
+            FdBackend::TimerFd { id } => id,
+            _ => return NEG_EINVAL,
+        },
+        None => return NEG_EBADF,
+    };
+    if new_value_ptr == 0 {
+        return NEG_EFAULT;
+    }
+    // struct itimerspec: it_interval{sec,nsec} then it_value{sec,nsec} = 32 bytes.
+    let mut buf = [0u8; 32];
+    if UserSliceRo::new(new_value_ptr, buf.len())
+        .and_then(|s| s.copy_to_kernel(&mut buf))
+        .is_err()
+    {
+        return NEG_EFAULT;
+    }
+    let rd = |o: usize| -> i64 { i64::from_ne_bytes(buf[o..o + 8].try_into().unwrap()) };
+    let it_interval_sec = rd(0);
+    let it_interval_nsec = rd(8);
+    let it_value_sec = rd(16);
+    let it_value_nsec = rd(24);
+    // Linux rejects out-of-range nanoseconds and negative components with EINVAL.
+    if !(0..1_000_000_000).contains(&it_interval_nsec)
+        || !(0..1_000_000_000).contains(&it_value_nsec)
+        || it_interval_sec < 0
+        || it_value_sec < 0
+    {
+        return NEG_EINVAL;
+    }
+    let interval_ns = (it_interval_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(it_interval_nsec as u64);
+    let value_ns = (it_value_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(it_value_nsec as u64);
+    let interval_tick = kernel_core::timerfd::ns_to_ticks_ceil(interval_ns);
+
+    let now_tick = crate::arch::x86_64::interrupts::tick_count();
+    let (armed, expiry_tick) = if it_value_sec == 0 && it_value_nsec == 0 {
+        (false, 0) // it_value == 0 disarms the timer
+    } else if flags & TFD_TIMER_ABSTIME != 0 {
+        // Absolute deadline on the timer's clock → relative duration → tick
+        // deadline. A past deadline yields a 0-duration (fires immediately).
+        let clockid =
+            crate::timerfd::timerfd_clockid(id).unwrap_or(crate::timerfd::CLOCK_MONOTONIC);
+        let dur_ns = value_ns.saturating_sub(clock_now_nanos(clockid));
+        (
+            true,
+            now_tick.saturating_add(kernel_core::timerfd::ns_to_ticks_ceil(dur_ns)),
+        )
+    } else {
+        (
+            true,
+            now_tick.saturating_add(kernel_core::timerfd::ns_to_ticks_ceil(value_ns)),
+        )
+    };
+
+    let (old_remaining_tick, old_interval_tick) =
+        match crate::timerfd::timerfd_settime(id, armed, expiry_tick, interval_tick) {
+            Some(o) => o,
+            None => return NEG_EBADF,
+        };
+
+    if old_value_ptr != 0 {
+        let old_value_ns = kernel_core::timerfd::ticks_to_ns(old_remaining_tick);
+        let old_interval_ns = kernel_core::timerfd::ticks_to_ns(old_interval_tick);
+        let mut out = [0u8; 32];
+        out[0..8].copy_from_slice(&((old_interval_ns / 1_000_000_000) as i64).to_ne_bytes());
+        out[8..16].copy_from_slice(&((old_interval_ns % 1_000_000_000) as i64).to_ne_bytes());
+        out[16..24].copy_from_slice(&((old_value_ns / 1_000_000_000) as i64).to_ne_bytes());
+        out[24..32].copy_from_slice(&((old_value_ns % 1_000_000_000) as i64).to_ne_bytes());
+        if UserSliceWo::new(old_value_ptr, out.len())
+            .and_then(|s| s.copy_from_kernel(&out))
+            .is_err()
+        {
+            return NEG_EFAULT;
+        }
+    }
+    0
+}
+
+/// timerfd_gettime(fd, curr_value) — syscall 287.
+pub(super) fn sys_timerfd_gettime(fd: u64, curr_value_ptr: u64) -> u64 {
+    let fd_idx = fd as usize;
+    if fd_idx >= MAX_FDS {
+        return NEG_EBADF;
+    }
+    let id = match current_fd_entry(fd_idx) {
+        Some(e) => match e.backend {
+            FdBackend::TimerFd { id } => id,
+            _ => return NEG_EINVAL,
+        },
+        None => return NEG_EBADF,
+    };
+    if curr_value_ptr == 0 {
+        return NEG_EFAULT;
+    }
+    let (remaining_tick, interval_tick) = match crate::timerfd::timerfd_gettime(id) {
+        Some(v) => v,
+        None => return NEG_EBADF,
+    };
+    let value_ns = kernel_core::timerfd::ticks_to_ns(remaining_tick);
+    let interval_ns = kernel_core::timerfd::ticks_to_ns(interval_tick);
+    let mut out = [0u8; 32];
+    out[0..8].copy_from_slice(&((interval_ns / 1_000_000_000) as i64).to_ne_bytes());
+    out[8..16].copy_from_slice(&((interval_ns % 1_000_000_000) as i64).to_ne_bytes());
+    out[16..24].copy_from_slice(&((value_ns / 1_000_000_000) as i64).to_ne_bytes());
+    out[24..32].copy_from_slice(&((value_ns % 1_000_000_000) as i64).to_ne_bytes());
+    if UserSliceWo::new(curr_value_ptr, out.len())
+        .and_then(|s| s.copy_from_kernel(&out))
+        .is_err()
+    {
+        return NEG_EFAULT;
+    }
+    0
+}
+
 /// epoll_ctl(epfd, op, fd, event_ptr) — syscall 233
 pub(super) fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u64 {
     let epfd_idx = epfd as usize;
@@ -21552,10 +21900,17 @@ pub(super) fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout
         // Under v1, retain yield_now() for positive timeout and
         // block_current_unless_woken for indefinite timeout.
         {
+            // Clamp to the nearest armed timerfd expiry so a timerfd in the
+            // interest set wakes a blocked (incl. indefinite) epoll_wait — the
+            // libuv event-loop due-timer path (Phase 89 A.1).
+            let block_deadline = clamp_block_deadline(
+                deadline_tick,
+                nearest_timerfd_deadline_fds(interests.iter().map(|i| i.fd)),
+            );
             let _ = crate::task::scheduler::block_current_until(
                 crate::task::TaskState::BlockedOnRecv,
                 &woken,
-                deadline_tick,
+                block_deadline,
             );
             for interest in &interests {
                 if let Some(entry) = current_fd_entry(interest.fd) {
