@@ -69,8 +69,16 @@ const PF_R: u32 = 0x4; // Read — assumed present on every PT_LOAD m3OS loads,
 /// Set well below the canonical boundary (0x0000_8000_0000_0000) to leave
 /// room for musl's TLS/TCB allocation above the initial RSP during startup.
 pub const ELF_STACK_TOP: u64 = 0x0000_7FFF_FF00_0000;
-/// Number of pages to allocate for the user stack (256 KiB — ion/musl needs more than 32 KiB).
-pub const STACK_PAGES: u64 = 64;
+/// Number of pages to allocate for the user stack (4 MiB). The stack is eager-
+/// mapped with an unmapped guard page below it and does NOT grow downward on
+/// fault, so this is the hard per-process stack limit. clang's C++ frontend
+/// (cc1) recurses deeply parsing template-heavy headers (`<iostream>`) and
+/// overflowed the previous 256 KiB stack — `cannot find _start`-class crt bugs
+/// aside, a write fault just below the stack bottom killed cc1 mid-compile. The
+/// C frontend fits comfortably; 4 MiB matches a typical default and gives the
+/// C++ frontend ample headroom. (A future demand-paged stack would avoid the
+/// eager cost for the many small daemons that never need it.)
+pub const STACK_PAGES: u64 = 1024;
 /// Extra pages pre-mapped above ELF_STACK_TOP for the ABI stack layout.
 /// Additional pages above this are demand-paged by the page fault handler
 /// when musl's TLS/TCB allocation writes above the initial RSP.
