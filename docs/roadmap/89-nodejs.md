@@ -53,7 +53,7 @@ Be explicit about what parts of the larger Node ecosystem are still outside scop
 
 | Check | Required state before closing the phase | If missing, add it to this phase |
 |---|---|---|
-| Toolchain and network baseline | Phases 59 and 60 are already stable enough to support a heavier runtime | Pull missing toolchain or network prerequisites into this phase |
+| Toolchain and network baseline | Phases 85 and 86 are already stable enough to support a heavier runtime | Pull missing toolchain or network prerequisites into this phase |
 | Memory/runtime baseline | The supported memory and execution-permission behavior can carry the chosen Node configuration | Add the missing runtime support or narrow the scope explicitly |
 | Package-path baseline | The project has a documented installation path for global or system-level packages | Add the missing npm/install-layout work before closing |
 | Scope-discipline baseline | The phase explicitly defines what parts of the Node ecosystem are supported | Add the missing support-boundary docs here |
@@ -109,7 +109,7 @@ The runtime only becomes strategically useful once the package path needed for l
 
 ## Companion Task List
 
-- Phase 89 task list — defer until implementation planning begins.
+- [Phase 89 Task List](./tasks/89-nodejs-tasks.md)
 
 ## How Real OS Implementations Differ
 
