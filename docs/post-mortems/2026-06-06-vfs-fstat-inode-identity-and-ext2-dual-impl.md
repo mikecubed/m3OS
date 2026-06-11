@@ -294,13 +294,18 @@ Phase 88 implemented this checklist. Boxes below are checked with the resolution
 **F. Downstream consumers (regression-grade)**
 - [x] clang multi-header compile (the original symptom): the `clang-smoke` gate runs under
       `M3OS_CLANG_STRESS=1` as a promoted pre-push stat-identity regression guard (Track F).
-      **NOTE — separate pre-existing failure surfaced:** the `clang-smoke` gate currently
-      fails (confirmed identical on the pre-Phase-88 commit `ef1b6b21`): clang compiles fine,
-      but `lld`'s `PROT_WRITE` file-backed-mmap output on `/tmp` is not written back →
-      all-zeros binary (`cannot find _start` / `InvalidMagic`). This is a Phase 86/87
-      file-backed-mmap-write-back regression unrelated to the stat work — tracked as a
-      follow-up. The deterministic `stat-identity` smoke stage is the green stat-identity
-      guard meanwhile.
+      **NOTE — promoting the gate surfaced 3 pre-existing Phase 86/87 regressions; all
+      FIXED, gate now green (CLANG_C_OK + CLANG_CPP_OK + `-fuse-ld=lld`, incl. stress):**
+      (1) file-backed mmap write-back — `lld`'s `PROT_WRITE MAP_SHARED` output was never
+      written back (`munmap`/`msync` no-op) → all-zeros binary (`InvalidMagic`); fixed via a
+      `MemoryMapping` fd+offset + `munmap` flush over Track G's `kernel_write_fd_at`. (2) the
+      strip-before-seal stripped the relocatable crt objects, deleting `_start` from crt1.o
+      (`cannot find entry symbol _start`); fixed by skipping ET_REL in `strip_stage` + a
+      seal guard. (3) clang defaulted to a dynamic/PIE link (unrunnable — no `libc.so`);
+      fixed with a static-default `clang.cfg` + `CLANG_CONFIG_FILE_SYSTEM_DIR`. (Plus a
+      kernel user-stack bump 256 KiB → 4 MiB for clang's C++ frontend.) All confirmed
+      identical on `ef1b6b21`, so Phase 88's stat work is exonerated; the deterministic
+      `stat-identity` smoke stage was the green guard throughout.
 - [~] `make`/`git`/`python` rely on the now-correct, consistent `st_mtim`/`st_ino`; the
       existing `git-local-smoke` (clean-tree `git status`) and `python-smoke` gates
       exercise them. A dedicated `make`-incremental gate is a follow-up.

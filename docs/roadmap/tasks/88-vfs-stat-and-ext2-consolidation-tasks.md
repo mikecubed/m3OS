@@ -134,20 +134,32 @@
 - [x] Downstream consumers documented in the post-mortem closeout: `git status` clean-tree identity is exercised by `git-local-smoke`, `python` `.pyc`/import by `python-smoke`; both depend on the now-consistent `st_mtim`/`st_ino`. A dedicated `make`-incremental gate is noted as a follow-up.
 - Docs updated: `docs/08`/`docs/18` (ext2 mount-routing rule), `docs/12` (`fill_stat` contract), the post-mortem audit checklist (closed out), the Phase 88 design doc + roadmap README (Status → Complete). Kernel version bumped to `0.88.0`.
 
-> **⚠️ Follow-up surfaced by promoting the gate (NOT a Phase 88 regression).**
-> Running `clang-smoke` (incl. `M3OS_CLANG_STRESS`) currently **fails**, but the
-> failure is **pre-existing** — confirmed by running the gate unchanged on
-> `ef1b6b21` (Phase 87 tip, before any Phase 88 commit): it fails **identically**
-> (`ld.lld: cannot find entry symbol _start` → `/tmp/hello: InvalidMagic`). Phase
-> 88 is exonerated: clang **compiles** fine (every VFS read works → a valid
-> `hello.o`); the corruption is in **lld's output write** — its `PROT_WRITE`
-> file-backed mmap of the `/tmp` (tmpfs) output never writes the dirty pages back,
-> so the linked binary is all-zeros. That path (file-backed-mmap write-back) is
-> untouched by Phase 88's stat/ext2-read/`pwrite` work; the gate is opt-in and was
-> not run during Phase 86/87, which reworked the mmap/write paths. **Tracked as a
-> separate follow-up** (file-backed `MAP_SHARED` `PROT_WRITE` write-back on
-> munmap/msync). The deterministic always-on `stat-identity` smoke stage is the
-> green stat-identity guard in the meantime.
+> **Follow-up surfaced by promoting the gate — RESOLVED (3 pre-existing Phase
+> 86/87 regressions, NOT Phase 88).** Promoting `clang-smoke` exposed a chain of
+> pre-existing breakage (confirmed identical on `ef1b6b21`, the Phase 87 tip, so
+> Phase 88 is exonerated). All fixed; `clang-smoke` is now **green end-to-end**
+> (CLANG_C_OK + CLANG_CPP_OK + the `-fuse-ld=lld` link, incl. `M3OS_CLANG_STRESS`):
+>
+> 1. **File-backed mmap write-back** — m3OS eager-loads file mmaps into anon
+>    frames but never wrote dirty pages back (`msync` unimplemented; `munmap`
+>    only freed frames), so lld's `PROT_WRITE MAP_SHARED` output stayed the
+>    ftruncate'd zeros → `InvalidMagic`. Fixed: `MemoryMapping` records the backing
+>    fd+offset and `munmap` flushes via the Track-G `kernel_write_fd_at` primitive.
+> 2. **clang crt objects were stripped** — `strip_stage` ran `strip --strip-all`
+>    on every ELF incl. the relocatable crt objects, deleting `_start` from
+>    `crt1.o` → `ld.lld: cannot find entry symbol _start`. Fixed: `strip_stage`
+>    skips `ET_REL` objects; a `seal_package` guard asserts `crt1.o` keeps
+>    `_start`.
+> 3. **No static default** — clang defaulted to a dynamic/PIE link, unrunnable on
+>    m3OS (no real `libc.so`). Fixed: stage `clang.cfg`/`clang++.cfg` (`-static`)
+>    + bake `CLANG_CONFIG_FILE_SYSTEM_DIR=.`; `validate_staged_clang` asserts the
+>    flagless output is static.
+> 4. (kernel) **C++ frontend stack overflow** — clang's cc1 C++ frontend overflowed
+>    the 256 KiB user stack; raised to 4 MiB (`STACK_PAGES` 64 → 1024).
+>
+> These land outside Phase 88's stat/ext2 scope (kernel mm, clang port, kernel
+> stack) but are what made the promoted keystone gate — the original 85d
+> stat-identity repro — pass for real.
 
 ## Track G — Atomic `pwrite64` (write-path correctness)
 
