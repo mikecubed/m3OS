@@ -10,9 +10,11 @@
 Phase 89 brings a statically-linked Node.js 22 LTS runtime inside m3OS as a
 content-addressed `.m3pkg` — extending the post-1.0 developer platform into its
 first JIT-capable managed runtime. The headline outcome is `cargo xtask
-node-smoke` passing five local sentinels (NODE_HELLO_OK, NODE_FS_OK,
-NODE_TIMER_OK, NODE_EVENTLOOP_OK, NODE_HTTP_OK) plus an opt-in `npm install`
-arm (Track D, `M3OS_NODE_NET=1`), followed by a kernel bump to `0.89.0`.
+node-smoke` passing the always-on sentinels (NODE_HELLO_OK, NODE_FS_OK,
+NODE_PROC_OK, NODE_EVENTLOOP_OK, NODE_TIMER_OK, **NODE_EGRESS_OK** — a full
+libuv `http.get` cycle over the in-kernel TCP stack — and NODE_TLSDNS_OK) plus
+opt-in live-HTTPS + `npm install` arms (Track D, `M3OS_NODE_NET=1`, real
+internet only), followed by a kernel bump to `0.89.0`.
 
 The central lesson is how a JIT-heavy managed runtime stresses execution
 permissions differently from a static CLI. CPython, Go, and Clang all load
@@ -210,16 +212,24 @@ PASSES** (validated under `M3OS_KVM=1`, ~30 s once booted).
 > that stops at the first `EBADF` — so on m3OS that loop busy-spun to millions of
 > fds and never returned. `F_SETFD` now returns `EBADF` for invalid fds.
 
-> **Networking is a tracked follow-up — `M3OS_NODE_NET`-gated.** node's
-> `http.get` does **not** complete on m3OS yet: the TCP connect *reaches* the
-> host (the gate's host `TcpListener` logs the guest connection, so the in-kernel
-> TCP stack + SLIRP work), but node then **deadlocks in libuv's threadpool** on
-> the DNS-resolve futex handoff — the main thread and the `clone-thread` workers
-> all go `BlockedOnFutex "no waker registered"`, a futex lost-wakeup under
-> libuv's threadpool condvar pattern. Separately, m3OS has **no 127.0.0.1
-> loopback** interface. So the egress (`NODE_EGRESS_OK`), live HTTPS, and
-> `npm install` arms are behind `M3OS_NODE_NET`, pending that futex fix — which
-> is the gating work for the Phase 90 npm dependency.
+> **Networking works — the futex fix (a second real kernel bug).** node's
+> `http.get` now completes a full request/response cycle over the in-kernel TCP
+> stack: the always-on `NODE_EGRESS_OK` arm GETs `http://10.0.2.100:80/` (a SLIRP
+> host server) and the gate's host `TcpListener` logs the guest connection. This
+> required implementing **`FUTEX_REQUEUE` / `FUTEX_CMP_REQUEUE`** in `sys_futex`:
+> they were silent no-ops, but musl's `pthread_cond_signal`/`broadcast` *requeues*
+> cond-waiters from the condition's futex onto the associated mutex's futex. With
+> the op a no-op, libuv's threadpool condvar deadlocked — a worker parked on a
+> futex no one ever woke (`BlockedOnFutex "no waker registered"`), so `http.get`
+> /`getaddrinfo` hung indefinitely. Now the requeue moves the waiters correctly
+> (and the `FUTEX_WAIT` return path dequeues robustly from *whichever* queue a
+> waiter was requeued to). So the **in-kernel-TCP egress is always-on** and is the
+> `FUTEX_CMP_REQUEUE` regression guard. The remaining `M3OS_NODE_NET`-gated arms
+> are only the ones that need **real outbound internet** — a live HTTPS
+> cert-validate against `example.com` and `npm install` from `registry.npmjs.org`
+> — which repo CI can't reach (mirroring `git-https-smoke`'s `M3OS_GIT_HTTPS_NET`).
+> Separately, m3OS still has **no 127.0.0.1 loopback** interface, but the egress
+> arm exercises the TCP path regardless.
 
 The gate is wired opt-in via `M3OS_NODE_REGRESSION=1` at `--timeout 5400`
 (much faster under `M3OS_KVM=1`, which the gate honors; `M3OS_NODE_FAST_ITER`

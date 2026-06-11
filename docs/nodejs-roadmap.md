@@ -1,8 +1,11 @@
 > Revived 2026-06-11 for **Phase 89 — Node.js**. This is the per-tool
 > reference for the Phase 89 Node.js porting work. Its **Stage 1 (local
-> runtime — fs/timers/console/event-loop/loopback HTTP, no npm networking)**
-> is in Phase 89 scope (Tracks B + C); its **Stage 2 (TLS + DNS + `npm install`
-> over HTTPS)** is Track D of Phase 89, opt-in (`M3OS_NODE_NET=1`) and the
+> runtime — fs/timers/console/event-loop + a full libuv `http.get` cycle over
+> the in-kernel TCP stack, `NODE_EGRESS_OK`, always-on)** is landed in Phase 89
+> (Tracks B + C + D.1; the networking path required implementing kernel
+> `FUTEX_REQUEUE`/`FUTEX_CMP_REQUEUE`); its **Stage 2 (live HTTPS + `npm install`
+> over the real internet)** is the remaining opt-in part of Track D
+> (`M3OS_NODE_NET=1`, real egress only) and the
 > prerequisite for [Phase 90 — Claude Code](./roadmap/90-claude-code.md).
 > Where this historical doc and the live phase docs disagree, the
 > [Phase 89 design doc](./roadmap/89-nodejs.md) and
@@ -141,7 +144,8 @@ the tracked follow-up; it needs a kernel `pkey_mprotect`/MPK story.
 | C++ runtime (libc++) | Done (Phase 85d sysroot) | All of Node.js and V8 |
 | `epoll_create/ctl/wait` | Done (Phase 37) | libuv event loop |
 | `clone(CLONE_THREAD)` | Done (Phase 40) | libuv thread pool |
-| `futex()` | Done (Phase 40) | libuv synchronization |
+| `futex()` WAIT/WAKE | Done (Phase 40) | libuv synchronization |
+| `futex()` REQUEUE/CMP_REQUEUE | **Phase 89** | musl `pthread_cond` → libuv threadpool condvar (the silent no-op deadlocked `http.get`) |
 | Thread-local storage | Done (Phase 40) | V8 isolates |
 | `getrandom()` / `AT_RANDOM` | Done (Phase 86a) | crypto module, V8 entropy bootstrap |
 | `eventfd()` | Done (Phase 86d) | libuv async handles |

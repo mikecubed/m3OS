@@ -244,11 +244,13 @@ const SMOKE_EXIT_GH_SMOKE_FAILED: i32 = 80;
 /// Phase 89 — `cargo xtask node-smoke` exit code. Builds a fresh image with the
 /// opt-in `M3OS_WITH_NODE` feature, boots m3OS, `pkg install node`, and runs the
 /// fully-static jitless Node.js 22 (`node --version`, an fs/event-loop/timer
-/// probe, a loopback HTTP server, and a plaintext HTTP GET over the in-kernel
-/// TCP stack via SLIRP guestfwd) — proving the ~100 MB Node runtime runs on
-/// target. The TLS/DNS/`npm install` arms are opt-in (`M3OS_NODE_NET=1`) and
-/// skip-with-reason otherwise; absent a host C++ toolchain + the llvm musl
-/// sysroot the whole gate skips with reason (success exit).
+/// probe, a plaintext HTTP GET over the in-kernel TCP stack via SLIRP guestfwd —
+/// a full libuv `http.get` cycle, the FUTEX_CMP_REQUEUE regression guard — and
+/// the TLS/DNS/crypto builtins loading) — proving the ~100 MB Node runtime runs
+/// on target. The real-internet arms (live HTTPS cert-validate + `npm install`)
+/// are opt-in (`M3OS_NODE_NET=1`) and skip-with-reason otherwise; absent a host
+/// C++ toolchain + the llvm musl sysroot the whole gate skips with reason
+/// (success exit).
 const SMOKE_EXIT_NODE_SMOKE_FAILED: i32 = 81;
 
 /// Phase 87 — `cargo xtask vfs-bulkio-smoke` exit code. Boots m3OS, reads
@@ -919,11 +921,13 @@ fn main() {
         // `M3OS_WITH_NODE` feature (bundling the ~100 MB fully-static jitless
         // Node.js 22 + npm `.m3pkg` into the offline `/usr/pkg/` repo), boots
         // m3OS, `pkg install node`, and runs `node --version` + an
-        // fs/event-loop/timer probe + a loopback HTTP server + a plaintext HTTP
-        // GET over the in-kernel TCP stack (proves the heavy Node runtime RUNS
-        // on the 86d runtime). The TLS/DNS/`npm install` arms are opt-in
-        // (`M3OS_NODE_NET=1`); absent them they are skip-with-reason. Absent a
-        // host C++ toolchain + the llvm musl sysroot the whole gate skips.
+        // fs/event-loop/timer probe + a plaintext HTTP GET over the in-kernel
+        // TCP stack (a full libuv `http.get` cycle — the FUTEX_CMP_REQUEUE
+        // regression guard) + the TLS/DNS/crypto builtins (proves the heavy Node
+        // runtime RUNS on the 86d runtime). The real-internet arms (live HTTPS +
+        // `npm install`) are opt-in (`M3OS_NODE_NET=1`); absent them they are
+        // skip-with-reason. Absent a host C++ toolchain + the llvm musl sysroot
+        // the whole gate skips.
         Some("node-smoke") => {
             let smoke_args =
                 parse_smoke_boot_args("node-smoke", &args[2..]).unwrap_or_else(|err| {
@@ -14967,11 +14971,13 @@ fn go_runtime_smoke_steps(url: &str) -> Vec<SmokeStep> {
 /// + npm `.m3pkg` into the offline `/usr/pkg/` repo), boots m3OS, `pkg install
 /// node`, then over serial exercises: `node --version` (the ~100 MB static
 /// binary RUNS on target), an fs/process/event-loop/timer probe (the A.1
-/// timerfd event-loop path), a loopback `http.createServer`+`http.get`, and a
-/// plaintext HTTP GET over the in-kernel TCP stack to a host server reached via
-/// a SLIRP guestfwd rule at 10.0.2.100:80 — all always-on, no secret. The
-/// TLS/DNS/`npm install` arms are opt-in (`M3OS_NODE_NET=1`, real egress to a
-/// public host); absent it they are skip-with-reason. Absent a host C++
+/// timerfd event-loop path), a plaintext HTTP GET over the in-kernel TCP stack
+/// to a host server reached via a SLIRP guestfwd rule at 10.0.2.100:80 (a full
+/// libuv `http.get` request/response cycle — the FUTEX_CMP_REQUEUE regression
+/// guard), and the TLS/DNS/crypto builtins loading — all always-on, no secret.
+/// The real-internet arms (live HTTPS cert-validate + `npm install`) are opt-in
+/// (`M3OS_NODE_NET=1`, real egress to a public host); absent it they are
+/// skip-with-reason. Absent a host C++
 /// toolchain (clang/clang++/ld.lld/python3/make) + the llvm musl sysroot the
 /// whole gate skips with reason (success exit), mirroring clang-smoke's
 /// build-precondition SKIP.
@@ -15131,8 +15137,9 @@ fn cmd_node_smoke(args: &SmokeBootArgs) {
 
     if !attempt_net {
         println!(
-            "node-smoke: NOTE — the TLS/DNS/npm-install network arms are SKIPPED \
-             (set M3OS_NODE_NET=1 to run them)"
+            "node-smoke: NOTE — the real-internet arms (live HTTPS + npm install) \
+             are SKIPPED (set M3OS_NODE_NET=1 to run them); the always-on egress \
+             GET already proves the libuv/in-kernel-TCP http.get cycle"
         );
     }
 
@@ -15171,12 +15178,13 @@ fn cmd_node_smoke(args: &SmokeBootArgs) {
 }
 
 /// Serial script for `node-smoke`. The always-on core installs node, asserts the
-/// version banner, then runs the fs/event-loop/timer probe, a loopback HTTP
-/// round-trip, and a plaintext egress GET to the SLIRP host server (`egress_url`
-/// carries the synthetic 10.0.2.100:80 target). When `attempt_net` is set the
-/// live arms (HTTPS cert-validate + `npm install` over real egress) are
-/// appended. Dynamic strings that interpolate `egress_url` are leaked to
-/// `'static` — the process is short-lived and this runs once.
+/// version banner, runs the fs/event-loop/timer probe, a plaintext egress GET to
+/// the SLIRP host server (`egress_url` carries the synthetic 10.0.2.100:80
+/// target — a full libuv/`http.get`/in-kernel-TCP cycle, the FUTEX_CMP_REQUEUE
+/// regression guard), and loads the TLS/DNS/crypto builtins. When `attempt_net`
+/// is set the live arms (real HTTPS cert-validate + `npm install` over real
+/// egress) are appended. Dynamic strings that interpolate `egress_url` are leaked
+/// to `'static` — the process is short-lived and this runs once.
 fn node_smoke_steps(attempt_net: bool, fast_iter: bool, egress_url: &str) -> Vec<SmokeStep> {
     let egress_cmd: &'static str =
         Box::leak(format!("node /usr/src/node-http-egress.js {egress_url}\n").into_boxed_str());
@@ -15257,16 +15265,28 @@ fn node_smoke_steps(attempt_net: bool, fast_iter: bool, egress_url: &str) -> Vec
     //    no 127.0.0.1 loopback interface, so it can never route. The SLIRP egress
     //    below (real TCP to a host server) is the in-kernel-TCP proof instead.)
 
-    // 5. The plaintext egress GET (node-http-egress.js) is gated under
-    //    M3OS_NODE_NET with the other networking arms below — node's `http.get`
-    //    deadlocks in libuv's threadpool on the DNS-resolve futex handoff (the
-    //    main thread + clone-thread workers go BlockedOnFutex "no waker
-    //    registered"); the host sees the TCP connect, but node never completes
-    //    the request cycle. Tracked follow-up (libuv-threadpool futex lost-wakeup
-    //    + no 127.0.0.1 loopback). The non-networking checks below stay always-on.
+    // 5. ALWAYS-ON plaintext egress GET (node-http-egress.js -> the SLIRP host
+    //    server at 10.0.2.100:80). This drives a full `http.get` request/response
+    //    cycle through libuv's threadpool + the in-kernel TCP stack — the exact
+    //    path that deadlocked before Phase 89's FUTEX_CMP_REQUEUE fix (musl's
+    //    pthread_cond requeues cond-waiters onto the mutex; the silent no-op
+    //    FUTEX_REQUEUE/CMP_REQUEUE left the libuv worker BlockedOnFutex with "no
+    //    waker registered"). It needs NO real internet (the host server is a local
+    //    guestfwd target), so it is the CI-viable in-kernel-TCP proof — mirroring
+    //    the Go gate's always-on GO_HTTP_OK. A regression in the requeue path
+    //    resurfaces here as a hang (BlockedOnFutex), not a silent pass.
+    steps.push(SmokeStep::Send {
+        input: egress_cmd,
+        label: "node-smoke: run node-http-egress.js",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "NODE_EGRESS_OK",
+        timeout_secs: 600,
+        label: "node-smoke: plaintext HTTP GET over the in-kernel TCP stack (NODE_EGRESS_OK)",
+    });
 
     // 6. D.2 always-on: the TLS/DNS/crypto builtins load (no network — module
-    //    require only, no threadpool), and npm is present on disk.
+    //    require only).
     steps.push(SmokeStep::Send {
         input:
             "node -e \"require('tls');require('dns');require('crypto');console.log('NODE_TLSDNS_OK')\"\n",
@@ -15278,25 +15298,16 @@ fn node_smoke_steps(attempt_net: bool, fast_iter: bool, egress_url: &str) -> Vec
         label: "node-smoke: tls/dns/crypto require() OK (NODE_TLSDNS_OK)",
     });
     // (npm presence is asserted host-side by `assert_node_layout` — it requires
-    // `usr/bin/npm` in the staged tree before sealing the `.m3pkg`. An on-device
-    // `existsSync('/usr/bin/npm')` check is omitted: `/usr/bin/npm` is a symlink,
-    // and resolving it on-device tickles the same libuv threadpool/futex stall as
-    // the http path — a tracked follow-up, not an npm-packaging problem.)
+    // `usr/bin/npm` in the staged tree before sealing the `.m3pkg`.)
 
-    // 7. Opt-in network arms (M3OS_NODE_NET=1): the plaintext SLIRP egress GET,
-    //    plus a real HTTPS cert-validate + an `npm install` over real egress.
-    //    All exercise node's `http(s).get`, which currently deadlocks on the
-    //    libuv-threadpool DNS futex — so they are opt-in until that lands.
+    // 7. Opt-in network arms (M3OS_NODE_NET=1): a real HTTPS cert-validate +
+    //    an `npm install` over real egress. Both need actual outbound internet
+    //    (example.com:443, registry.npmjs.org) which repo CI does not have, so
+    //    they are skip-with-reason by default — mirroring git-https-smoke's
+    //    M3OS_GIT_HTTPS_NET. The always-on egress GET above already proves the
+    //    libuv/TCP request cycle; these add real-DNS + TLS handshake + a package
+    //    download on top.
     if attempt_net {
-        steps.push(SmokeStep::Send {
-            input: egress_cmd,
-            label: "node-smoke: run node-http-egress.js (M3OS_NODE_NET)",
-        });
-        steps.push(SmokeStep::Wait {
-            pattern: "NODE_EGRESS_OK",
-            timeout_secs: 600,
-            label: "node-smoke: plaintext HTTP GET over the in-kernel TCP stack (NODE_EGRESS_OK)",
-        });
         steps.push(SmokeStep::Send {
             input:
                 "node -e \"require('https').get('https://example.com/', r => { if (r.statusCode === 200) console.log('NODE_HTTPS_OK'); r.resume(); }).on('error', e => console.log('NODE_HTTPS_ERR '+e.message))\"\n",

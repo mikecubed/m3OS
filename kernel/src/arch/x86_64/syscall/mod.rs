@@ -16902,13 +16902,19 @@ pub(super) fn sys_clock_gettime(clk_id: u64, tp_ptr: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// Futex wait/wake implementation for thread synchronization.
-/// Supports WAIT, WAKE, WAIT_BITSET, WAKE_BITSET with real blocking queues.
+/// Supports WAIT, WAKE, WAIT_BITSET, WAKE_BITSET, REQUEUE, CMP_REQUEUE with real
+/// blocking queues.
 ///
-/// Supports `FUTEX_WAIT`, `FUTEX_WAKE`, `FUTEX_WAIT_BITSET`, and
-/// `FUTEX_WAKE_BITSET` operations with the `FUTEX_PRIVATE_FLAG`.
+/// Supports `FUTEX_WAIT`, `FUTEX_WAKE`, `FUTEX_WAIT_BITSET`, `FUTEX_WAKE_BITSET`,
+/// `FUTEX_REQUEUE`, and `FUTEX_CMP_REQUEUE` operations with the
+/// `FUTEX_PRIVATE_FLAG`. (REQUEUE/CMP_REQUEUE are what musl's `pthread_cond`
+/// uses to hand cond-waiters to the associated mutex — required for libuv's
+/// threadpool condvar, Phase 89.)
 pub(super) fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
     const FUTEX_WAIT: u64 = 0;
     const FUTEX_WAKE: u64 = 1;
+    const FUTEX_REQUEUE: u64 = 3;
+    const FUTEX_CMP_REQUEUE: u64 = 4;
     const FUTEX_WAIT_BITSET: u64 = 9;
     const FUTEX_WAKE_BITSET: u64 = 10;
     const FUTEX_PRIVATE_FLAG: u64 = 128;
@@ -17041,11 +17047,20 @@ pub(super) fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
             // wake-removed-us path.
             {
                 let mut table = FUTEX_TABLE.lock();
-                if let Some(waiters) = table.get_mut(&key) {
+                // Remove our waiter from WHEREVER it is. FUTEX_CMP_REQUEUE may
+                // have moved it from `key` to a different queue (uaddr2) while we
+                // were blocked, so retaining only on `key` would leave a stale
+                // entry that absorbs a future wake meant for a real waiter. Scan
+                // all queues (the table is small) and drop our tid everywhere.
+                let mut empty_keys = alloc::vec::Vec::new();
+                for (k, waiters) in table.iter_mut() {
                     waiters.retain(|w| w.tid != tid);
                     if waiters.is_empty() {
-                        table.remove(&key);
+                        empty_keys.push(*k);
                     }
+                }
+                for k in empty_keys {
+                    table.remove(&k);
                 }
             }
 
@@ -17114,7 +17129,92 @@ pub(super) fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
             actual_woken as u64
         }
 
-        _ => 0, // Unknown ops succeed silently (Linux compat).
+        FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
+            // futex(uaddr, op, nr_wake, nr_requeue(r10), uaddr2(r8), val3(r9)).
+            // Wake up to `nr_wake` waiters on uaddr, then MOVE up to `nr_requeue`
+            // of the remaining waiters onto uaddr2's queue. musl's
+            // `pthread_cond_signal`/`broadcast` requeues cond-waiters onto the
+            // associated mutex this way; without it (the old silent no-op default)
+            // libuv's threadpool condvar deadlocks — a worker parks on a futex no
+            // one ever wakes, so Node's `http.get`/getaddrinfo hangs and the
+            // main + `clone-thread` workers go `BlockedOnFutex "no waker registered"`.
+            let nr_wake = val as usize;
+            let nr_requeue = per_core_syscall_arg3() as usize;
+            let uaddr2 = per_core_syscall_user_r8();
+            let key2 = (futex_root, uaddr2);
+
+            let mut woken_tids = alloc::vec::Vec::new();
+            let mut requeued = 0usize;
+            {
+                let mut table = FUTEX_TABLE.lock();
+                // CMP_REQUEUE re-checks `*uaddr == val3` under the table lock (so a
+                // racing waker/writer can't slip between the check and the move)
+                // before touching any queue; mismatch → EAGAIN, like Linux.
+                if cmd == FUTEX_CMP_REQUEUE {
+                    let mut cur = [0u8; 4];
+                    if UserSliceRo::new(uaddr, cur.len())
+                        .and_then(|s| s.copy_to_kernel(&mut cur))
+                        .is_err()
+                    {
+                        return NEG_EFAULT;
+                    }
+                    if u32::from_ne_bytes(cur) as u64 != val3 {
+                        return NEG_EAGAIN;
+                    }
+                }
+                if let Some(mut waiters) = table.remove(&key) {
+                    while woken_tids.len() < nr_wake && !waiters.is_empty() {
+                        let w = waiters.remove(0);
+                        w.woken.store(true, core::sync::atomic::Ordering::Release);
+                        woken_tids.push(w.tid);
+                    }
+                    let mut to_requeue = alloc::vec::Vec::new();
+                    while to_requeue.len() < nr_requeue && !waiters.is_empty() {
+                        to_requeue.push(waiters.remove(0));
+                    }
+                    requeued = to_requeue.len();
+                    if !to_requeue.is_empty() {
+                        // Moved waiters keep their `woken` Arc + tid; a later
+                        // FUTEX_WAKE on uaddr2 wakes them via the normal path, and
+                        // the requeue-robust dequeue in FUTEX_WAIT removes them
+                        // from whichever key they end up on.
+                        table.entry(key2).or_default().extend(to_requeue);
+                    }
+                    if !waiters.is_empty() {
+                        table.insert(key, waiters);
+                    }
+                }
+            }
+            let mut actual_woken = 0usize;
+            for tid in woken_tids {
+                use crate::task::scheduler::WakeOutcome;
+                if matches!(
+                    crate::task::scheduler::wake_task_v2(tid),
+                    WakeOutcome::Woken
+                ) {
+                    actual_woken += 1;
+                }
+            }
+            // Linux returns the total number woken + requeued.
+            (actual_woken + requeued) as u64
+        }
+
+        _ => {
+            // Futex ops we don't implement (FUTEX_WAKE_OP, FUTEX_LOCK_PI, …).
+            // Returns 0 (most Linux callers tolerate a no-op), but surface it,
+            // rate-limited, so a runtime deadlocking on a missing op is visible
+            // instead of silently hanging.
+            use core::sync::atomic::{AtomicU32, Ordering};
+            static UNIMPL_N: AtomicU32 = AtomicU32::new(0);
+            let n = UNIMPL_N.fetch_add(1, Ordering::Relaxed);
+            if n < 8 || n.is_multiple_of(4096) {
+                log::warn!(
+                    "[futex] unimplemented op cmd={cmd} pid={}",
+                    crate::process::current_pid()
+                );
+            }
+            0
+        }
     }
 }
 
