@@ -241,6 +241,16 @@ const SMOKE_EXIT_GO_SMOKE_FAILED: i32 = 79;
 /// token those arms are skip-with-reason (a secret can never live in repo/CI).
 const SMOKE_EXIT_GH_SMOKE_FAILED: i32 = 80;
 
+/// Phase 89 — `cargo xtask node-smoke` exit code. Builds a fresh image with the
+/// opt-in `M3OS_WITH_NODE` feature, boots m3OS, `pkg install node`, and runs the
+/// fully-static jitless Node.js 22 (`node --version`, an fs/event-loop/timer
+/// probe, a loopback HTTP server, and a plaintext HTTP GET over the in-kernel
+/// TCP stack via SLIRP guestfwd) — proving the ~100 MB Node runtime runs on
+/// target. The TLS/DNS/`npm install` arms are opt-in (`M3OS_NODE_NET=1`) and
+/// skip-with-reason otherwise; absent a host C++ toolchain + the llvm musl
+/// sysroot the whole gate skips with reason (success exit).
+const SMOKE_EXIT_NODE_SMOKE_FAILED: i32 = 81;
+
 /// Phase 87 — `cargo xtask vfs-bulkio-smoke` exit code. Boots m3OS, reads
 /// `/proc/blkstats` before + after a `pkg install` of a multi-MiB package
 /// (whose `.m3pkg` is read in 256 KiB chunks → coalesced into multi-block
@@ -905,6 +915,24 @@ fn main() {
             });
             cmd_gh_smoke(&smoke_args);
         }
+        // Phase 89 — Node.js runtime smoke. Builds the image with the opt-in
+        // `M3OS_WITH_NODE` feature (bundling the ~100 MB fully-static jitless
+        // Node.js 22 + npm `.m3pkg` into the offline `/usr/pkg/` repo), boots
+        // m3OS, `pkg install node`, and runs `node --version` + an
+        // fs/event-loop/timer probe + a loopback HTTP server + a plaintext HTTP
+        // GET over the in-kernel TCP stack (proves the heavy Node runtime RUNS
+        // on the 86d runtime). The TLS/DNS/`npm install` arms are opt-in
+        // (`M3OS_NODE_NET=1`); absent them they are skip-with-reason. Absent a
+        // host C++ toolchain + the llvm musl sysroot the whole gate skips.
+        Some("node-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("node-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_node_smoke(&smoke_args);
+        }
         // Phase 63a Track H — DOOM SFX + music end-to-end smoke. Boots
         // with WAV AC'97 backend, launches `/bin/doom -warp 1 1` with
         // an auto-quit budget so the engine's Shutdown emits the
@@ -1112,7 +1140,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -14933,6 +14961,356 @@ fn go_runtime_smoke_steps(url: &str) -> Vec<SmokeStep> {
     steps
 }
 
+/// Phase 89 — `cargo xtask node-smoke`.
+///
+/// Builds a `M3OS_WITH_NODE` image (bundling the fully-static jitless Node.js 22
+/// + npm `.m3pkg` into the offline `/usr/pkg/` repo), boots m3OS, `pkg install
+/// node`, then over serial exercises: `node --version` (the ~100 MB static
+/// binary RUNS on target), an fs/process/event-loop/timer probe (the A.1
+/// timerfd event-loop path), a loopback `http.createServer`+`http.get`, and a
+/// plaintext HTTP GET over the in-kernel TCP stack to a host server reached via
+/// a SLIRP guestfwd rule at 10.0.2.100:80 — all always-on, no secret. The
+/// TLS/DNS/`npm install` arms are opt-in (`M3OS_NODE_NET=1`, real egress to a
+/// public host); absent it they are skip-with-reason. Absent a host C++
+/// toolchain (clang/clang++/ld.lld/python3/make) + the llvm musl sysroot the
+/// whole gate skips with reason (success exit), mirroring clang-smoke's
+/// build-precondition SKIP.
+fn cmd_node_smoke(args: &SmokeBootArgs) {
+    // SKIP-with-reason build precondition: building the Node port needs a host
+    // C++ cross-toolchain (clang/clang++/ld.lld), python3 + make (Node's
+    // configure + ninja drive), and the llvm musl sysroot's static libc++
+    // (`cargo xtask port build llvm`). Absent any of these we cannot build the
+    // `.m3pkg`, so skip cleanly rather than FAIL — mirroring clang/python smoke.
+    fn node_tool_on_path(t: &str) -> bool {
+        std::process::Command::new(t)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    let toolchain_ok = node_tool_on_path("clang")
+        && node_tool_on_path("clang++")
+        && node_tool_on_path("ld.lld")
+        && node_tool_on_path("python3")
+        && node_tool_on_path("make");
+    let sysroot_libcxx = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("target/llvm-musl-sysroot/lib/libc++.a");
+    if !toolchain_ok || !sysroot_libcxx.exists() {
+        println!(
+            "node-smoke: SKIP (reason: host C++ toolchain or llvm musl sysroot absent — \
+             needs clang/clang++/ld.lld/python3/make + `cargo xtask port build llvm`)"
+        );
+        return;
+    }
+
+    // Build the static Node.js `.m3pkg` so the data disk can bundle it. A real
+    // build failure here is a FAIL (not a skip) — the toolchain IS present.
+    if let Err(msg) = port_build::build_node_port() {
+        eprintln!("node-smoke: precondition failed (node port build): {msg}");
+        std::process::exit(SMOKE_EXIT_NODE_SMOKE_FAILED);
+    }
+
+    // Opt-in image feature: bundle the node `.m3pkg` into /usr/pkg for this build.
+    // SAFETY: xtask is single-threaded here; the child image-build steps read the
+    // env. set_var is `unsafe` in Rust edition 2024 (cross-thread UB risk).
+    unsafe {
+        std::env::set_var("M3OS_WITH_NODE", "1");
+    }
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    // Always rebuild the data disk so the freshly-bundled node `.m3pkg` + the
+    // /usr/src/node-*.js fixtures are present and the package DB starts clean.
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false, // graphical_login — autologin / serial path
+    );
+
+    // Host HTTP server on an ephemeral loopback port, exposed to the guest via a
+    // SLIRP guestfwd rule (below) at the synthetic in-subnet address
+    // 10.0.2.100:80 — the always-on plaintext egress target for node-http-egress.js.
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("node-smoke: bind host HTTP server");
+    let http_port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        const BODY: &[u8] = b"m3os-node-egress-ok\n";
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            eprintln!("node-smoke: host HTTP server accepted a guest connection");
+            let mut buf = [0u8; 2048];
+            let _ = s.read(&mut buf);
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                BODY.len()
+            );
+            let _ = s.write_all(header.as_bytes());
+            let _ = s.write_all(BODY);
+            let _ = s.flush();
+        }
+    });
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, display_mode, DeviceSet::default());
+    // Expose the host HTTP server to the guest at the synthetic in-subnet
+    // address 10.0.2.100:80, forwarded by SLIRP to 127.0.0.1:<http_port>.
+    let guestfwd = format!("user,id=net0,guestfwd=tcp:10.0.2.100:80-tcp:127.0.0.1:{http_port}");
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0") {
+            *arg = guestfwd.clone();
+        }
+    }
+
+    // Pin the guest to a single core (same rationale as the go gate): the heavy
+    // Node load + slow-VFS pipeline + libuv thread pool are still exercised, but
+    // a single core avoids cross-core SMP futex/IPC races under the heavy load.
+    for i in 0..qemu_args.len() {
+        if qemu_args[i] == "-smp" && i + 1 < qemu_args.len() {
+            qemu_args[i + 1] = "1".to_string();
+        }
+    }
+
+    // When the live network arms run (TLS handshake needs entropy), advertise
+    // RDRAND/RDSEED (TCG emulates both) so the in-OS DRBG credits entropy. The
+    // default TCG model exposes no hardware RNG.
+    let attempt_net = std::env::var("M3OS_NODE_NET").is_ok_and(|v| v == "1");
+    if attempt_net {
+        for i in 0..qemu_args.len() {
+            if qemu_args[i] == "-cpu"
+                && let Some(cpu) = qemu_args.get_mut(i + 1)
+                && !cpu.contains("rdrand")
+            {
+                cpu.push_str(",+rdrand,+rdseed");
+            }
+        }
+    }
+
+    let url = "http://10.0.2.100:80/".to_string();
+    let steps = node_smoke_steps(attempt_net, &url);
+
+    if !attempt_net {
+        println!(
+            "node-smoke: NOTE — the TLS/DNS/npm-install network arms are SKIPPED \
+             (set M3OS_NODE_NET=1 to run them)"
+        );
+    }
+
+    println!(
+        "node-smoke: launching QEMU (timeout {}s, {} steps, http server :{http_port}, net={})",
+        args.timeout_secs,
+        steps.len(),
+        attempt_net,
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!("node-smoke: PASSED ({} steps in {elapsed}s)", steps.len());
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("node-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_NODE_SMOKE_FAILED);
+        }
+    }
+}
+
+/// Serial script for `node-smoke`. The always-on core installs node, asserts the
+/// version banner, then runs the fs/event-loop/timer probe, a loopback HTTP
+/// round-trip, and a plaintext egress GET to the SLIRP host server (`egress_url`
+/// carries the synthetic 10.0.2.100:80 target). When `attempt_net` is set the
+/// live arms (HTTPS cert-validate + `npm install` over real egress) are
+/// appended. Dynamic strings that interpolate `egress_url` are leaked to
+/// `'static` — the process is short-lived and this runs once.
+fn node_smoke_steps(attempt_net: bool, egress_url: &str) -> Vec<SmokeStep> {
+    let egress_cmd: &'static str =
+        Box::leak(format!("node /usr/src/node-http-egress.js {egress_url}\n").into_boxed_str());
+
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/node-smoke: kernel first message",
+    }];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    // 1. Install the static Node.js package from the bundled offline repo.
+    steps.push(SmokeStep::Send {
+        input: "pkg install node\n",
+        label: "node-smoke: pkg install node",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "pkg install: node: OK",
+        fail_prefixes: &["pkg install: cannot"],
+        // Generous ceiling: the ~100 MB `.m3pkg` is SHA-verified + written
+        // file-by-file over the slow ring-3 VFS.
+        timeout_secs: 3600,
+        label: "node-smoke: node installed from .m3pkg",
+        exit_code_on_fail: SMOKE_EXIT_NODE_SMOKE_FAILED,
+    });
+
+    // 2. Version banner — the ~100 MB static binary cold-loads over the slow VFS
+    //    + the runtime initialises; hence the large ceiling.
+    steps.push(SmokeStep::Send {
+        input: "node --version\n",
+        label: "node-smoke: node --version",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "v22.22",
+        timeout_secs: 600,
+        label: "node-smoke: node 22.x runs on target (version banner)",
+    });
+
+    // 3. fs / process / event-loop / timer probe (A.1 timerfd event-loop path).
+    steps.push(SmokeStep::Send {
+        input: "node /usr/src/node-probe.js\n",
+        label: "node-smoke: run node-probe.js",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "NODE_HELLO_OK",
+        timeout_secs: 600,
+        label: "node-smoke: Node runtime started (NODE_HELLO_OK)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "NODE_FS_OK",
+        timeout_secs: 60,
+        label: "node-smoke: fs write/read round-trip (NODE_FS_OK)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "NODE_PROC_OK",
+        timeout_secs: 60,
+        label: "node-smoke: process introspection (NODE_PROC_OK)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "NODE_EVENTLOOP_OK",
+        timeout_secs: 60,
+        label: "node-smoke: microtask/nextTick/setImmediate ordering (NODE_EVENTLOOP_OK)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "NODE_TIMER_OK",
+        timeout_secs: 60,
+        label: "node-smoke: setInterval -> setTimeout timer path (NODE_TIMER_OK)",
+    });
+
+    // 4. Loopback HTTP server + client round-trip on 127.0.0.1.
+    steps.push(SmokeStep::Send {
+        input: "node /usr/src/node-http.js\n",
+        label: "node-smoke: run node-http.js",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "NODE_HTTP_OK",
+        timeout_secs: 120,
+        label: "node-smoke: loopback http.createServer + http.get (NODE_HTTP_OK)",
+    });
+
+    // 5. Always-on plaintext egress GET over the in-kernel TCP stack to the
+    //    SLIRP host server at 10.0.2.100:80.
+    steps.push(SmokeStep::Send {
+        input: egress_cmd,
+        label: "node-smoke: run node-http-egress.js",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "NODE_EGRESS_OK",
+        timeout_secs: 120,
+        label: "node-smoke: plaintext HTTP GET over the in-kernel TCP stack (NODE_EGRESS_OK)",
+    });
+
+    // 6. D.2 always-on: the TLS/DNS/crypto builtins load (no network), and npm
+    //    is present on disk.
+    steps.push(SmokeStep::Send {
+        input:
+            "node -e \"require('tls');require('dns');require('crypto');console.log('NODE_TLSDNS_OK')\"\n",
+        label: "node-smoke: tls/dns/crypto builtins load",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "NODE_TLSDNS_OK",
+        timeout_secs: 120,
+        label: "node-smoke: tls/dns/crypto require() OK (NODE_TLSDNS_OK)",
+    });
+    steps.push(SmokeStep::Send {
+        input: "node -e \"console.log('NPM_PRESENT_'+require('fs').existsSync('/usr/bin/npm'))\"\n",
+        label: "node-smoke: npm present on disk",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "NPM_PRESENT_true",
+        timeout_secs: 120,
+        label: "node-smoke: npm bundled at /usr/bin/npm (NPM_PRESENT_true)",
+    });
+
+    // 7. Opt-in live network arms (M3OS_NODE_NET=1): a real HTTPS cert-validate
+    //    + an `npm install` over real egress.
+    if attempt_net {
+        steps.push(SmokeStep::Send {
+            input:
+                "node -e \"require('https').get('https://example.com/', r => { if (r.statusCode === 200) console.log('NODE_HTTPS_OK'); r.resume(); }).on('error', e => console.log('NODE_HTTPS_ERR '+e.message))\"\n",
+            label: "node-smoke: live HTTPS cert-validate (M3OS_NODE_NET)",
+        });
+        steps.push(SmokeStep::Wait {
+            pattern: "NODE_HTTPS_OK",
+            timeout_secs: 120,
+            label: "node-smoke: live HTTPS GET to example.com validated (NODE_HTTPS_OK)",
+        });
+        steps.push(SmokeStep::Send {
+            input: "cd /tmp && npm install is-number --no-audit --no-fund\n",
+            label: "node-smoke: npm install is-number (M3OS_NODE_NET)",
+        });
+        steps.push(SmokeStep::WaitPassOrFail {
+            pass_pattern: "added 1 package",
+            fail_prefixes: &["npm error", "npm ERR!"],
+            timeout_secs: 600,
+            label: "node-smoke: npm install over real egress",
+            exit_code_on_fail: SMOKE_EXIT_NODE_SMOKE_FAILED,
+        });
+        steps.push(SmokeStep::Send {
+            input:
+                "node -e \"console.log('NPM_REQUIRE_'+typeof require('/tmp/node_modules/is-number'))\"\n",
+            label: "node-smoke: require the npm-installed module",
+        });
+        steps.push(SmokeStep::Wait {
+            pattern: "NPM_REQUIRE_function",
+            timeout_secs: 120,
+            label: "node-smoke: installed module loads (NPM_REQUIRE_function)",
+        });
+    }
+
+    steps
+}
+
 /// Phase 86e — `cargo xtask gh-smoke`.
 ///
 /// The CORE (build a `M3OS_WITH_GH` image → boot → `pkg install gh` →
@@ -18328,6 +18706,55 @@ fn populate_ext2_files(
         \x20   return 0;\n\
         }\n";
 
+    // Phase 89 — the `node-smoke` JS source fixtures, staged at /usr/src so a
+    // freshly-installed Node.js has real scripts to execute. Each emits
+    // distinctive NODE_* sentinels the gate waits on — the strings live in the
+    // program (so the Wait matches actual execution, not the typed echo).
+    //
+    // node-probe.js: fs round-trip + process introspection + event-loop
+    // ordering (microtask/nextTick/setImmediate) + timer (setInterval ->
+    // setTimeout) — exercises the A.1 timerfd event-loop path.
+    let node_probe_js_content = "const fs = require('fs');\n\
+        console.log('NODE_HELLO_OK');\n\
+        const p = '/tmp/node-probe.txt';\n\
+        const data = 'm3os-node-fs-' + process.pid;\n\
+        fs.writeFileSync(p, data);\n\
+        if (fs.readFileSync(p, 'utf8') === data) console.log('NODE_FS_OK');\n\
+        if (process.platform === 'linux' && Array.isArray(process.argv) && process.versions && process.versions.node) console.log('NODE_PROC_OK');\n\
+        const order = [];\n\
+        Promise.resolve().then(() => order.push('p'));\n\
+        queueMicrotask(() => order.push('m'));\n\
+        process.nextTick(() => order.push('n'));\n\
+        setImmediate(() => { if (order.length === 3) console.log('NODE_EVENTLOOP_OK'); });\n\
+        let ticks = 0;\n\
+        const iv = setInterval(() => { ticks++; if (ticks >= 2) { clearInterval(iv); setTimeout(() => console.log('NODE_TIMER_OK'), 10); } }, 20);\n";
+
+    // node-http.js: a loopback `http.createServer` + `http.get` round-trip on an
+    // ephemeral port — proves the Node HTTP server + client work over the
+    // in-kernel TCP stack on 127.0.0.1 (NODE_HTTP_OK on a 200/body match).
+    let node_http_js_content = "const http = require('http');\n\
+        const server = http.createServer((req, res) => { res.writeHead(200, {'Content-Type':'text/plain'}); res.end('ok'); });\n\
+        server.listen(0, '127.0.0.1', () => {\n\
+        \x20 const port = server.address().port;\n\
+        \x20 http.get({host:'127.0.0.1', port, path:'/'}, (res) => {\n\
+        \x20   let body = '';\n\
+        \x20   res.on('data', c => body += c);\n\
+        \x20   res.on('end', () => { if (res.statusCode === 200 && body === 'ok') console.log('NODE_HTTP_OK'); server.close(); });\n\
+        \x20 });\n\
+        });\n";
+
+    // node-http-egress.js: a plaintext HTTP GET against the URL in argv[2] (the
+    // SLIRP guestfwd host server at 10.0.2.100:80) — the always-on egress proof
+    // that Node's client reaches off-guest over the in-kernel TCP stack
+    // (NODE_EGRESS_OK on any non-empty body).
+    let node_http_egress_js_content = "const http = require('http');\n\
+        const url = process.argv[2] || 'http://10.0.2.100:80/';\n\
+        http.get(url, (res) => {\n\
+        \x20 let body = '';\n\
+        \x20 res.on('data', c => body += c);\n\
+        \x20 res.on('end', () => { if (body.length > 0) console.log('NODE_EGRESS_OK'); });\n\
+        }).on('error', (e) => { console.log('NODE_EGRESS_ERR ' + e.message); });\n";
+
     // Phase 46: service definition files.
     let sshd_conf = "name=sshd\ncommand=/bin/sshd\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=syslogd\n";
     let telnetd_conf = "name=telnetd\ncommand=/bin/telnetd\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=syslogd\n";
@@ -18777,6 +19204,9 @@ fn populate_ext2_files(
     let fibonacci_py_tmp = output_dir.join("_tmp_fibonacci_py");
     let hello_c_tmp = output_dir.join("_tmp_hello_c");
     let hello_cpp_tmp = output_dir.join("_tmp_hello_cpp");
+    let node_probe_js_tmp = output_dir.join("_tmp_node_probe_js");
+    let node_http_js_tmp = output_dir.join("_tmp_node_http_js");
+    let node_http_egress_js_tmp = output_dir.join("_tmp_node_http_egress_js");
     fs::write(&passwd_tmp, passwd_content).expect("write temp passwd");
     fs::write(&shadow_tmp, shadow_content).expect("write temp shadow");
     fs::write(&group_tmp, group_content).expect("write temp group");
@@ -18787,6 +19217,10 @@ fn populate_ext2_files(
     fs::write(&fibonacci_py_tmp, fibonacci_py_content).expect("write temp fibonacci.py");
     fs::write(&hello_c_tmp, hello_c_content).expect("write temp hello.c");
     fs::write(&hello_cpp_tmp, hello_cpp_content).expect("write temp hello.cpp");
+    fs::write(&node_probe_js_tmp, node_probe_js_content).expect("write temp node-probe.js");
+    fs::write(&node_http_js_tmp, node_http_js_content).expect("write temp node-http.js");
+    fs::write(&node_http_egress_js_tmp, node_http_egress_js_content)
+        .expect("write temp node-http-egress.js");
     fs::write(&sshd_conf_tmp, sshd_conf).expect("write temp sshd.conf");
     fs::write(&syslogd_conf_tmp, syslogd_conf).expect("write temp syslogd.conf");
     fs::write(&crond_conf_tmp, crond_conf).expect("write temp crond.conf");
@@ -19129,10 +19563,25 @@ fn populate_ext2_files(
          write \"{}\" usr/src/hello.cpp\n\
          sif usr/src/hello.cpp mode 0x81A4\n\
          sif usr/src/hello.cpp uid 0\n\
-         sif usr/src/hello.cpp gid 0\n",
+         sif usr/src/hello.cpp gid 0\n\
+         write \"{}\" usr/src/node-probe.js\n\
+         sif usr/src/node-probe.js mode 0x81A4\n\
+         sif usr/src/node-probe.js uid 0\n\
+         sif usr/src/node-probe.js gid 0\n\
+         write \"{}\" usr/src/node-http.js\n\
+         sif usr/src/node-http.js mode 0x81A4\n\
+         sif usr/src/node-http.js uid 0\n\
+         sif usr/src/node-http.js gid 0\n\
+         write \"{}\" usr/src/node-http-egress.js\n\
+         sif usr/src/node-http-egress.js mode 0x81A4\n\
+         sif usr/src/node-http-egress.js uid 0\n\
+         sif usr/src/node-http-egress.js gid 0\n",
         fibonacci_py_tmp.display(),
         hello_c_tmp.display(),
         hello_cpp_tmp.display(),
+        node_probe_js_tmp.display(),
+        node_http_js_tmp.display(),
+        node_http_egress_js_tmp.display(),
     );
 
     // Phase 73 — stage the three desktop-daemon service confs only
@@ -19699,6 +20148,9 @@ fn populate_ext2_files(
     let _ = fs::remove_file(&fibonacci_py_tmp);
     let _ = fs::remove_file(&hello_c_tmp);
     let _ = fs::remove_file(&hello_cpp_tmp);
+    let _ = fs::remove_file(&node_probe_js_tmp);
+    let _ = fs::remove_file(&node_http_js_tmp);
+    let _ = fs::remove_file(&node_http_egress_js_tmp);
     let _ = fs::remove_file(&sshd_conf_tmp);
     if enable_telnet {
         let _ = fs::remove_file(output_dir.join("_tmp_telnetd_conf"));
@@ -20480,6 +20932,39 @@ fn populate_phase_69d_ports(part_path: &Path, workspace_root: &Path) {
                  run `cargo xtask port build gh` first (or the gh-smoke gate)"
             ),
             Err(e) => eprintln!("phase-86e: gh artifact path error: {e}"),
+        }
+    }
+
+    // Phase 89 — the fully-static Node.js runtime is the heaviest artifact in the
+    // tree (≈90–110 MB), so — exactly like clang (`M3OS_WITH_CLANG`) and gh
+    // (`M3OS_WITH_GH`) — it is gated OUT of default images and bundled into
+    // `/usr/pkg/` (as `.m3pkg` + `.meta`, NOT pre-installed) only when the feature
+    // is on. The port name IS the package name (`node`); no runtime DEPS (bundled
+    // OpenSSL/zlib/ICU). The artifact only exists once `cargo xtask port build
+    // node` (or the `node-smoke` gate) has built it; absent feature OR artifact
+    // this is a no-op, so default images carry no `node.m3pkg`.
+    if std::env::var("M3OS_WITH_NODE").is_ok() {
+        match port_build::pkgcache_artifact_path("node") {
+            Ok(artifact) if artifact.is_file() => match fs::read(&artifact) {
+                Ok(bytes) if pkg_format::verify(&bytes) => {
+                    m3pkg_files.push(("usr/pkg/node.m3pkg".to_string(), artifact.clone()));
+                    let version = port_build::port_version("node").unwrap_or_default();
+                    let deps = port_build::port_deps("node").join(" ");
+                    let meta_host = preinstall_root.join("node.meta");
+                    let _ = fs::create_dir_all(&preinstall_root);
+                    if fs::write(&meta_host, format!("VERSION={version}\nDEPS={deps}\n")).is_ok() {
+                        m3pkg_files.push(("usr/pkg/node.meta".to_string(), meta_host));
+                    }
+                    println!("ports: bundled node.m3pkg (opt-in M3OS_WITH_NODE) into /usr/pkg");
+                }
+                Ok(_) => eprintln!("phase-89: node.m3pkg failed verify — skipping bundle"),
+                Err(e) => eprintln!("phase-89: read {} failed: {e}", artifact.display()),
+            },
+            Ok(_) => eprintln!(
+                "phase-89: M3OS_WITH_NODE set but the node .m3pkg is not built — \
+                 run `cargo xtask port build node` first (or the node-smoke gate)"
+            ),
+            Err(e) => eprintln!("phase-89: node artifact path error: {e}"),
         }
     }
 

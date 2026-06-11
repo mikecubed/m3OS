@@ -552,6 +552,28 @@ if [ "${M3OS_GH_REGRESSION:-0}" = "1" ]; then
     fi
 fi
 
+# Phase 89 — Node.js runtime regression gate. Gated behind M3OS_NODE_REGRESSION=1
+# because it cross-builds the fully-static jitless ~100 MB Node.js 22 + npm
+# `.m3pkg`, builds a fresh M3OS_WITH_NODE image, boots QEMU, `pkg install node`,
+# and proves `node --version` (22.x) RUNS on target plus an fs/event-loop/timer
+# probe (the A.1 timerfd path), a loopback http.createServer+http.get, and a
+# plaintext HTTP GET over the in-kernel TCP stack via SLIRP guestfwd (the
+# always-on core). The TLS/DNS/npm-install arms are opt-in (M3OS_NODE_NET=1: live
+# HTTPS cert-validate + `npm install is-number` over real egress); absent it they
+# are skip-with-reason. Absent a host C++ toolchain (clang/clang++/ld.lld/python3/
+# make) + the llvm musl sysroot the gate prints SKIP and returns success. Set this
+# on branches that touch ports/lang/node, xtask's build_node / node-smoke / the
+# M3OS_WITH_NODE bundling, or the kernel paths the heavy static Node runtime
+# exercises (timerfd/event-loop/epoll/TCP). clang-gate-class --timeout (the
+# ~100 MB install + cold static-binary load over the slow VFS take tens of minutes).
+if [ "${M3OS_NODE_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask node-smoke..."
+    if ! cargo xtask node-smoke --timeout 5400; then
+        echo "pre-push: cargo xtask node-smoke failed" >&2
+        exit 1
+    fi
+fi
+
 # Phase 86f Track C.3 — userspace SIMD + AES-NI smoke gate. Gated behind
 # M3OS_SIMD_REGRESSION=1. Runs in two phases: (1) static objdump asserts that
 # crypto-test (x86_64-m3os.json hardware-float) contains XMM-register

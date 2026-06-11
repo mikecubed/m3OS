@@ -1,0 +1,38 @@
+NAME=node
+VERSION=22.22.3
+DESCRIPTION="Static Node.js 22 LTS runtime (jitless V8, small-icu, bundled deps, +npm)"
+CATEGORY=lang
+DEPS=
+URL=https://nodejs.org/dist/v22.22.3/node-v22.22.3.tar.xz
+SHA256=f3e6a578db1ab335a4a72785c1e87ad18a2cf6d2fc25747a1d741fb34af0bd0f
+MAINTAINER=m3os
+
+# Phase 89 — Node.js is the FOURTH cross-compiled language runtime on the Phase
+# 85a `.m3pkg` substrate (after 85c Python, 85d Clang, 86d Go) and the heaviest
+# managed runtime in the tree (V8 JIT engine + libuv async I/O + bundled
+# OpenSSL/ICU/c-ares/nghttp2/llhttp/brotli). It is fully **static** — m3OS's
+# custom `ld-musl` has no real `libc.so`, so `--fully-static` (no PT_INTERP,
+# `dlopen` disabled) is the same loaderless contract as static CPython/Go/Clang.
+#
+# Toolchain note — LIKE llvm (not the musl-gcc C-port path): Node is C++17/20 and
+# `musl-tools` ships no C++ compiler, so `build_node` (xtask/src/port_build.rs)
+# drives the host **clang/clang++** as the cross-compiler
+# (`--target=x86_64-unknown-linux-musl` + the assembled musl sysroot + the
+# `build_llvm` Stage-B static `libc++.a`), with host glibc clang for the
+# `*_host` toolset (V8's `mksnapshot`/`torque` run natively on the build host —
+# same arch x86_64 — which is the one thing that makes a Node cross-build
+# tractable). DEPS is empty: every dependency is vendored into the static binary.
+#
+# V8 / W^X model — the crux of the phase. m3OS forbids `PROT_WRITE|PROT_EXEC`
+# (W^X; the green `wx-violation` gate). Modern V8 REMOVED the old `mprotect`
+# RW↔RX "write-protected code memory" JIT mechanism; it is now PKU-or-RWX,
+# neither of which m3OS allows. So this port ships **`--v8-lite-mode` (jitless)**
+# as the PRIMARY supported config: V8 allocates ZERO runtime executable memory
+# (all JS runs through the Ignition interpreter; builtins are embedded RX in the
+# binary's `.text` by the normal ELF loader), so it never requests an
+# `mprotect(W|X)` mapping. PKU-backed JIT is a tracked follow-up (needs a kernel
+# MPK/`pkey_mprotect` story). See build_node in xtask/src/port_build.rs and the
+# learning doc docs/89-nodejs.md for the full configure recipe and non-goals.
+#
+# Intl — `--with-intl=small-icu` (en-US bundled; `Intl`/`Intl.NumberFormat`
+# work, artifact stays lean). npm/npx are kept (bundled JS in lib/node_modules).

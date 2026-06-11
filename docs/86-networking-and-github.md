@@ -399,4 +399,4 @@ the *Rust* userspace target and the AES-NI backend, not basic SSE.
 - `ring`/`aws-lc-rs` crate support (blocked by asm/C build + hosted-target
   assumptions, independent of the 86f SSE flag)
 - AVX / in-kernel SIMD — requires `XSAVE_FEATURE_MASK`/`XSAVE_AREA_SIZE` bump
-- Broader runtime stacks — Node.js is Phase 87, Claude Code is Phase 88
+- Broader runtime stacks — Node.js is Phase 89, Claude Code is Phase 90

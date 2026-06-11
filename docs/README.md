@@ -70,6 +70,7 @@ and a roadmap toward stronger service isolation and broader platform support.
 | [Spectre / KPTI Mitigations](./84-spectre-mitigations.md) | 84 | Post-1.0 transient-execution hardening — KPTI (Meltdown), retpoline (Spectre-v2 BTI), IBRS/eIBRS/IBPB/STIBP, `mitigations=off\|auto\|full` boot policy, host-tested CPUID/MSR decode, and an honest accounting of the UNADDRESSED classes (Spectre-v1, MDS, L1TF, SSB, Retbleed, Downfall) |
 | [Cross-Compiled Toolchains](./85-cross-compiled-toolchains.md) | 85 (85a–d) | Build-once / install-prebuilt developer-toolchain family — the 85a content-addressed cache + relocatable `.m3pkg` + offline in-OS `pkg` installer, the relocation contract, and git (85b, local-only), Python (85c, fully-static CPython 3.12), and Clang/LLVM/LLD (85d, opt-in X86-only static) with their disk/RAM budget. Links the four 85a–d design + task docs |
 | [Networking and GitHub](./86-networking-and-github.md) | 86 (86a–f) | Authenticated outbound developer workflows — the 86a CSPRNG/wall-clock/CA trust foundation, SSH (86b) and HTTPS/TLS (86c) git transports with their contrasting trust models, the Go runtime (86d, `mmap` `MAP_FIXED` + edge-`epoll` + `SIGURG`), the GitHub CLI (86e, two coexisting TLS stacks), and the 86f userspace SIMD / AES-NI capstone (soft-float-kernel / hard-float-userspace split, signal-frame FPU, AES-NI ≈27×). Links all six 86a–f design + task docs |
+| [Node.js](./89-nodejs.md) | 89 | V8 jitless W^X model (`--v8-lite-mode`, Ignition interpreter only — modern V8 removed the `mprotect` RW↔RX JIT path), libuv `timerfd` event loop integration (Phase 89 A.1, the only new kernel primitive), the `signalfd` self-pipe fallback decision, the static-musl host-clang C++ cross build (reusing `build_llvm`'s sysroot), `small-icu`/bundled-OpenSSL/npm configuration, and the TLS/DNS/`npm install` package path the Phase 90 Claude Code milestone depends on |
 
 ### Roadmap
 
@@ -95,7 +96,7 @@ and a roadmap toward stronger service isolation and broader platform support.
 | [Clang/LLVM Roadmap](./clang-llvm-roadmap.md) | Clang/LLVM cross-compilation strategy — revived for [Phase 85d](./roadmap/85d-clang-llvm.md) |
 | [Python Roadmap](./python-roadmap.md) | Python cross-compilation strategy — revived for [Phase 85c](./roadmap/85c-python.md) |
 | [git Roadmap](./git-roadmap.md) | git cross-compilation strategy — revived for [Phase 85b](./roadmap/85b-git-local.md) |
-| [Node.js Roadmap](./archived/nodejs-roadmap.md) | Node.js cross-compilation strategy (archived; future post-85 phase) |
+| [Node.js Roadmap](./nodejs-roadmap.md) | Node.js cross-compilation strategy — revived for [Phase 89](./roadmap/89-nodejs.md) |
 | [GitHub CLI Roadmap](./archived/github-cli-roadmap.md) | gh CLI cross-compilation strategy (archived; [Phase 86](./roadmap/86-networking-and-github.md)) |
 | [Claude Code Roadmap](./archived/claude-code-roadmap.md) | Claude Code on m3OS strategy (archived; future post-85 phase) |
 | [Rust Crate Acceleration](./archived/rust-crate-acceleration.md) | Rust crate porting strategy (archived) |
