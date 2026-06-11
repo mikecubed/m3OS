@@ -599,20 +599,9 @@ impl Ext2State {
     }
 
     fn read_symlink_target(&self, inode: &Ext2Inode) -> Result<Vec<u8>, ()> {
-        if !inode.is_symlink() {
-            return Err(());
-        }
-        let target_len = inode.size as usize;
-        if inode.blocks == 0 && target_len <= 60 {
-            let mut raw = [0u8; 60];
-            for (i, &slot) in inode.block.iter().enumerate() {
-                let start = i * 4;
-                raw[start..start + 4].copy_from_slice(&slot.to_le_bytes());
-            }
-            Ok(raw[..target_len].to_vec())
-        } else {
-            self.read_file_data(inode, 0, target_len)
-        }
+        // Phase 88 Track C — delegate to the shared kernel_core reader so the
+        // vfs_server and the kernel engine resolve symlinks identically.
+        kernel_core::fs::ext2::read_symlink_target(self, inode).map_err(|_| ())
     }
 
     /// List a directory's entries as `(inode, name, dirent_type)`. Phase 88

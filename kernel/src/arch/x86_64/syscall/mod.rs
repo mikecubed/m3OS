@@ -8292,6 +8292,7 @@ fn vfs_service_open(path: &str, flags: u64) -> u64 {
             gid: st.gid,
             nlink: st.nlink as u32,
             size: st.size,
+            blksize: st.blksize,
             blocks: st.blocks,
             atime: st.atime,
             mtime: st.mtime,
@@ -8310,6 +8311,7 @@ fn vfs_service_open(path: &str, flags: u64) -> u64 {
                 gid: 0,
                 nlink: 1,
                 size: file_size as u64,
+                blksize: 4096,
                 blocks: 0,
                 atime: 0,
                 mtime: 0,
@@ -9553,32 +9555,6 @@ fn privileged_exec_credentials(path: &str, exec_is_static_ramdisk: bool) -> Opti
 ///
 /// Only `st_size` (offset 48) and `st_mode` (offset 24) are filled in;
 /// all other fields are zero.  This satisfies musl's `fstat` use in `fopen`.
-/// Get uid/gid/mode for a directory path from the appropriate filesystem.
-fn dir_metadata(path: &str) -> (u32, u32, u16) {
-    // Tmpfs directories (under /tmp or /run) — use the shared mount-relative
-    // convention (`tmpfs_relative_path`) so the lookup key matches what
-    // open/read/write/stat/chmod use. (A previous hand-rolled
-    // `strip_prefix("/tmp")` dropped the `tmp/` prefix and ignored /run.)
-    if let Some(rel) = tmpfs_relative_path(path) {
-        let tmpfs = crate::fs::tmpfs::TMPFS.lock();
-        if let Ok(s) = tmpfs.stat(rel) {
-            return (s.uid, s.gid, s.mode);
-        }
-    }
-    // ext2 root filesystem directories.
-    if crate::fs::ext2::is_mounted()
-        && let Some(rel) = ext2_root_path(path)
-    {
-        return data_file_metadata(rel).unwrap_or((0, 0, 0o755));
-    }
-    // Legacy: /data paths for FAT32 fallback.
-    if let Some(rel) = path.strip_prefix("/data/") {
-        return data_file_metadata(rel).unwrap_or((0, 0, 0o755));
-    }
-    // Default for ramdisk and other directories
-    (0, 0, 0o755)
-}
-
 /// Get uid/gid/mode for a file on the data partition (ext2 or FAT32).
 /// Returns `None` if the file is not found or the volume is not mounted.
 fn data_file_metadata(rel: &str) -> Option<(u32, u32, u16)> {
@@ -9983,12 +9959,16 @@ fn stat_dev_for_backend(backend: &FdBackend) -> u64 {
         | FdBackend::PtyMaster { .. }
         | FdBackend::PtySlave { .. } => DEV_DEVFS,
         // A directory fd's backend does not say which fs it lives on; re-derive
-        // from the path the same way the fstat `Dir` arm builds its metadata.
+        // from the path in the SAME routing order `sys_linux_fstatat` /
+        // `path_filemeta` use (procfs → tmpfs → ramdisk → ext2), so fstat and
+        // fstatat report the same `st_dev` for the same directory.
         FdBackend::Dir { path } => {
             if crate::fs::procfs::stat(path).is_some() {
                 DEV_PROCFS
             } else if tmpfs_relative_path(path).is_some() {
                 DEV_TMPFS
+            } else if crate::fs::ramdisk::ramdisk_lookup(path).is_some() {
+                DEV_RAMDISK
             } else {
                 DEV_EXT2_ROOT
             }
@@ -10010,40 +9990,14 @@ pub(super) fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
     // Build a normalized FileMeta per backend (preserving each backend's prior
     // field values), then serialize once via `fill_stat`.
     let mut meta: FileMeta = match &entry.backend {
-        FdBackend::Dir { path } => {
-            if let Some(st) = crate::fs::procfs::stat(path) {
-                let mut m = FileMeta::new();
-                m.ino = st.ino;
-                m.nlink = st.nlink;
-                m.mode = st.mode;
-                m.uid = st.uid;
-                m.gid = st.gid;
-                m.size = st.size;
-                m
-            } else if let Some(rel) = tmpfs_relative_path(path) {
-                let tmpfs = crate::fs::tmpfs::TMPFS.lock();
-                match tmpfs.stat(rel) {
-                    Ok(st) => {
-                        let mut m = FileMeta::new();
-                        m.ino = st.ino;
-                        m.nlink = st.nlink;
-                        m.mode = 0x4000 | st.mode as u32;
-                        m.uid = st.uid;
-                        m.gid = st.gid;
-                        m.size = st.size as u64;
-                        m
-                    }
-                    Err(_) => return NEG_ENOENT,
-                }
-            } else {
-                let (u, g, mode) = dir_metadata(path);
-                let mut m = FileMeta::new();
-                m.mode = 0x4000 | mode as u32;
-                m.uid = u;
-                m.gid = g;
-                m
-            }
-        }
+        // Phase 88 — a directory fd reports the SAME metadata `fstatat` reports
+        // for its path, via the shared `path_filemeta` source of truth. The
+        // previous hand-rolled arm left an ext2 directory fd's ino/nlink/size/
+        // times at 0 (an `fstat`-vs-`fstatat` identity divergence).
+        FdBackend::Dir { path } => match path_filemeta(path) {
+            Ok(m) => m,
+            Err(err) => return err,
+        },
         FdBackend::DevNull | FdBackend::DevZero | FdBackend::DevUrandom | FdBackend::DevFull => {
             let mut m = FileMeta::new();
             m.mode = 0x2000 | 0o666;
@@ -10187,6 +10141,7 @@ pub(super) fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
             m.uid = meta.uid;
             m.gid = meta.gid;
             m.size = meta.size;
+            m.blksize = meta.blksize;
             m.blocks = meta.blocks;
             m.atime = meta.atime;
             m.mtime = meta.mtime;
@@ -13876,23 +13831,15 @@ pub(super) fn sys_linux_uname(buf_ptr: u64) -> u64 {
 // T026 (via path): newfstatat(dirfd, path, stat_ptr, flags)
 // ---------------------------------------------------------------------------
 
-pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) -> u64 {
-    let mut buf = [0u8; 512];
-    let raw_name = match read_user_cstr(path_ptr, &mut buf) {
-        Some(n) => n,
-        None => return NEG_EFAULT,
-    };
-
-    let lexical = match resolve_path_from_dirfd(dirfd, raw_name) {
-        Ok(path) => path,
-        Err(err) => return err,
-    };
-    let resolved = match resolve_existing_fs_path(&lexical, flags & AT_SYMLINK_NOFOLLOW == 0) {
-        Ok(path) => path,
-        Err(err) => return err,
-    };
-    let name: &str = &resolved;
-
+/// Phase 88 — the single source of truth for *path-based* `stat` metadata.
+///
+/// Given an already-resolved absolute path, build the full [`FileMeta`] for it
+/// (with `st_dev` set per filesystem), or an errno on failure. `sys_linux_fstatat`
+/// (by path) AND `sys_linux_fstat`'s `FdBackend::Dir` arm (by fd) both call this,
+/// so the by-path and by-fd answers cannot diverge — closing the exact
+/// `(st_dev, st_ino)`/metadata inconsistency Phase 88 exists to eliminate (the
+/// `fstat`-on-a-directory-fd path previously reported `ino=nlink=size=times=0`).
+fn path_filemeta(name: &str) -> Result<FileMeta, u64> {
     if let Some(st) = crate::fs::procfs::stat(name) {
         let mut m = FileMeta::new();
         m.dev = DEV_PROCFS;
@@ -13902,7 +13849,7 @@ pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags:
         m.uid = st.uid;
         m.gid = st.gid;
         m.size = st.size;
-        return write_stat_to_user(stat_ptr, &m);
+        return Ok(m);
     }
 
     // Check tmpfs first.
@@ -13910,11 +13857,11 @@ pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags:
         let tmpfs = crate::fs::tmpfs::TMPFS.lock();
         let st = match tmpfs.stat(rel) {
             Ok(s) => s,
-            Err(crate::fs::tmpfs::TmpfsError::NotFound) => return NEG_ENOENT,
+            Err(crate::fs::tmpfs::TmpfsError::NotFound) => return Err(NEG_ENOENT),
             Err(crate::fs::tmpfs::TmpfsError::NotADirectory) => {
-                return NEG_ENOTDIR;
+                return Err(NEG_ENOTDIR);
             }
-            Err(_) => return NEG_EINVAL,
+            Err(_) => return Err(NEG_EINVAL),
         };
         // Phase 69d follow-up: if this tmpfs path is currently bound
         // to a Unix-domain socket, stat must report `S_IFSOCK`
@@ -13943,7 +13890,7 @@ pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags:
         m.gid = st.gid;
         m.size = st.size as u64;
         drop(tmpfs);
-        return write_stat_to_user(stat_ptr, &m);
+        return Ok(m);
     }
 
     // Check ramdisk tree (supports directories and hierarchical paths).
@@ -13953,13 +13900,13 @@ pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags:
             m.dev = DEV_RAMDISK;
             m.mode = 0x8000 | 0o755; // S_IFREG + executable (ramdisk binaries)
             m.size = content.len() as u64;
-            write_stat_to_user(stat_ptr, &m)
+            Ok(m)
         }
         Some(crate::fs::ramdisk::RamdiskNode::Dir { .. }) => {
             let mut m = FileMeta::new();
             m.dev = DEV_RAMDISK;
             m.mode = 0x4000 | 0o755; // S_IFDIR
-            write_stat_to_user(stat_ptr, &m)
+            Ok(m)
         }
         None => {
             // ext2 root filesystem: stat any path.
@@ -13982,7 +13929,7 @@ pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags:
                     m.atime = vfs_stat.atime;
                     m.mtime = vfs_stat.mtime;
                     m.ctime = vfs_stat.ctime;
-                    return write_stat_to_user(stat_ptr, &m);
+                    return Ok(m);
                 }
                 let vol = crate::fs::ext2::EXT2_VOLUME.lock();
                 if let Some(vol) = vol.as_ref()
@@ -14003,7 +13950,7 @@ pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags:
                     m.atime = inode.atime as i64;
                     m.mtime = inode.mtime as i64;
                     m.ctime = inode.ctime as i64;
-                    return write_stat_to_user(stat_ptr, &m);
+                    return Ok(m);
                 }
             }
             // Device special files.
@@ -14018,17 +13965,39 @@ pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags:
                 let mut m = FileMeta::new();
                 m.dev = DEV_DEVFS;
                 m.mode = 0x2000 | 0o666; // S_IFCHR | rw-rw-rw-
-                return write_stat_to_user(stat_ptr, &m);
+                return Ok(m);
             }
             // Also handle "/" specially.
             if name == "/" {
                 let mut m = FileMeta::new();
                 m.dev = DEV_EXT2_ROOT;
                 m.mode = 0x4000 | 0o755;
-                return write_stat_to_user(stat_ptr, &m);
+                return Ok(m);
             }
-            NEG_ENOENT
+            Err(NEG_ENOENT)
         }
+    }
+}
+
+pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) -> u64 {
+    let mut buf = [0u8; 512];
+    let raw_name = match read_user_cstr(path_ptr, &mut buf) {
+        Some(n) => n,
+        None => return NEG_EFAULT,
+    };
+
+    let lexical = match resolve_path_from_dirfd(dirfd, raw_name) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let resolved = match resolve_existing_fs_path(&lexical, flags & AT_SYMLINK_NOFOLLOW == 0) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+
+    match path_filemeta(&resolved) {
+        Ok(m) => write_stat_to_user(stat_ptr, &m),
+        Err(err) => err,
     }
 }
 

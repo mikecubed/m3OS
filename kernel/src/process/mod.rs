@@ -245,6 +245,9 @@ pub struct VfsFileMeta {
     pub nlink: u32,
     /// File size in bytes (`st_size`; also EOF for reads).
     pub size: u64,
+    /// Preferred I/O block size (`st_blksize`) — the live ext2 block size from
+    /// the `VFS_OPEN` stat header, so `fstat` matches `fstatat` on a non-4K disk.
+    pub blksize: u64,
     /// Count of 512-byte blocks allocated (`st_blocks`).
     pub blocks: u64,
     /// Access / modification / change times (`st_atim`/`st_mtim`/`st_ctim`).

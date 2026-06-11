@@ -23,6 +23,9 @@ const STAT_ID_FILE: &[u8] = b"/etc/passwd\0";
 const STAT_ID_DIR: &[u8] = b"/etc\0";
 const STAT_ID_ENTRY: &[u8] = b"passwd";
 const STAT_ID_TMP: &[u8] = b"/tmp/stat-id-probe\0";
+/// A real ext2-backed directory (not ramdisk- or tmpfs-shadowed, unlike `/etc`),
+/// used to prove an ext2 directory fd reports its real inode via `fstat`.
+const STAT_ID_EXT2_DIR: &[u8] = b"/root\0";
 
 // Phase 88 Track G — pwrite64 atomicity regression inputs.
 const PWRITE_TMPFS: &[u8] = b"/tmp/pwrite-atomic\0";
@@ -888,6 +891,7 @@ fn verify_stat_identity() -> Result<(), i32> {
         || by_fd.st_mtime != by_path.st_mtime
         || by_fd.st_ctime != by_path.st_ctime
         || by_fd.st_blocks != by_path.st_blocks
+        || by_fd.st_blksize != by_path.st_blksize
     {
         return Err(fail("stat-identity", "fstat != stat field mismatch", 85));
     }
@@ -912,6 +916,39 @@ fn verify_stat_identity() -> Result<(), i32> {
         return Err(fail("stat-identity", "tmpfs and ext2 share st_dev", 86));
     }
 
+    // (2a) Phase 88 — fstat on an EXT2 directory fd must equal stat on the same
+    // path field-for-field, with a REAL (nonzero) inode. `/root` is a real
+    // ext2-backed directory (not ramdisk/tmpfs-shadowed), so this exercises the
+    // consolidated `path_filemeta` source of truth: the historical fstat `Dir`
+    // arm left an ext2 directory's ino/nlink/size/times at 0 (an fstat-vs-fstatat
+    // identity divergence).
+    let rdraw = open(STAT_ID_EXT2_DIR, O_RDONLY | O_DIRECTORY, 0);
+    if rdraw < 0 {
+        return Err(fail("stat-identity", "open /root dir failed", 94));
+    }
+    let rdfd = rdraw as i32;
+    let mut rfd_st = Stat::zeroed();
+    let rrc = fstat(rdfd, &mut rfd_st);
+    close(rdfd);
+    let mut rpath_st = Stat::zeroed();
+    if rrc < 0 || stat(STAT_ID_EXT2_DIR, &mut rpath_st) < 0 {
+        return Err(fail("stat-identity", "fstat/stat(/root) failed", 95));
+    }
+    if rfd_st.st_dev != rpath_st.st_dev
+        || rfd_st.st_ino != rpath_st.st_ino
+        || rfd_st.st_ino == 0
+        || rfd_st.st_size != rpath_st.st_size
+        || rfd_st.st_mode != rpath_st.st_mode
+        || rfd_st.st_nlink != rpath_st.st_nlink
+        || rfd_st.st_mtime != rpath_st.st_mtime
+    {
+        return Err(fail(
+            "stat-identity",
+            "ext2 dir fstat != stat (or ino=0)",
+            96,
+        ));
+    }
+
     // (3) getdents64 d_ino must equal stat st_ino for the same entry. `/etc`
     // is required infrastructure (it holds passwd), so a failed open must FAIL
     // the gate rather than silently skip the Track B.3 d_ino check.
@@ -921,6 +958,37 @@ fn verify_stat_identity() -> Result<(), i32> {
     }
     {
         let dfd = draw as i32;
+
+        // (3a) Phase 88 — a directory fd reports the SAME metadata `fstatat`
+        // reports for its path. `/etc` is ramdisk-shadowed (so `st_ino` is
+        // legitimately 0), but `fstat` and `stat` must still AGREE field-for-
+        // field — in particular on `st_dev` (the historical fstat `Dir` arm
+        // reported `DEV_EXT2_ROOT` while `fstatat` reported `DEV_RAMDISK`).
+        let mut dir_by_fd = Stat::zeroed();
+        if fstat(dfd, &mut dir_by_fd) < 0 {
+            close(dfd);
+            return Err(fail("stat-identity", "fstat(/etc dir fd) failed", 97));
+        }
+        let mut dir_by_path = Stat::zeroed();
+        if stat(STAT_ID_DIR, &mut dir_by_path) < 0 {
+            close(dfd);
+            return Err(fail("stat-identity", "stat(/etc) failed", 98));
+        }
+        if dir_by_fd.st_dev != dir_by_path.st_dev
+            || dir_by_fd.st_ino != dir_by_path.st_ino
+            || dir_by_fd.st_size != dir_by_path.st_size
+            || dir_by_fd.st_mode != dir_by_path.st_mode
+            || dir_by_fd.st_nlink != dir_by_path.st_nlink
+            || dir_by_fd.st_mtime != dir_by_path.st_mtime
+        {
+            close(dfd);
+            return Err(fail(
+                "stat-identity",
+                "ramdisk dir fstat != stat field mismatch",
+                99,
+            ));
+        }
+
         let mut dbuf = [0u8; 4096];
         let mut found = false;
         loop {
@@ -1062,30 +1130,32 @@ fn verify_pwrite_atomic() -> Result<(), i32> {
         ));
     }
 
-    // --- ext2: pwrite must not move the shared fd position. Best-effort: if the
-    // create is unavailable in a minimal config, skip rather than fail. ---
+    // --- ext2: pwrite must not move the shared fd position. /root is created
+    // unconditionally by the ext2 disk populator, so a failed open must FAIL the
+    // gate rather than silently skip the ext2 arm of this Track G regression. ---
     let eraw = open(PWRITE_EXT2, O_RDWR | O_CREAT | O_TRUNC, 0o644);
-    if eraw >= 0 {
-        let efd = eraw as i32;
-        let _ = write(efd, b"AAAA"); // position 4
-        let epw = unsafe { syscall_lib::syscall4(18, efd as u64, b"BB".as_ptr() as u64, 2, 100) };
-        let epos = lseek(efd, 0, SEEK_CUR);
-        close(efd);
-        let _ = unlink(PWRITE_EXT2);
-        if (epw as i64) != 2 {
-            return Err(fail(
-                "pwrite-atomic",
-                "ext2 pwrite returned wrong count",
-                78,
-            ));
-        }
-        if epos != 4 {
-            return Err(fail(
-                "pwrite-atomic",
-                "ext2 pwrite moved the fd position",
-                79,
-            ));
-        }
+    if eraw < 0 {
+        return Err(fail("pwrite-atomic", "open ext2 /root probe failed", 93));
+    }
+    let efd = eraw as i32;
+    let _ = write(efd, b"AAAA"); // position 4
+    let epw = unsafe { syscall_lib::syscall4(18, efd as u64, b"BB".as_ptr() as u64, 2, 100) };
+    let epos = lseek(efd, 0, SEEK_CUR);
+    close(efd);
+    let _ = unlink(PWRITE_EXT2);
+    if (epw as i64) != 2 {
+        return Err(fail(
+            "pwrite-atomic",
+            "ext2 pwrite returned wrong count",
+            78,
+        ));
+    }
+    if epos != 4 {
+        return Err(fail(
+            "pwrite-atomic",
+            "ext2 pwrite moved the fd position",
+            79,
+        ));
     }
 
     Ok(())

@@ -771,6 +771,43 @@ pub fn read_file_data<R: BlockReader + ?Sized>(
     )
 }
 
+/// Maximum symlink target length stored inline ("fast symlink") in the inode's
+/// 15×4-byte block-pointer array.
+pub const SYMLINK_INLINE_MAX: usize = 60;
+
+/// Read a symbolic link's target bytes. Phase 88 Track C — the single shared
+/// implementation behind the kernel engine's `Ext2Volume::read_symlink` and the
+/// `vfs_server`'s `read_symlink_target`, so the two ext2 front-ends cannot
+/// diverge on symlink resolution.
+///
+/// A "fast symlink" (`blocks == 0`, target `<= 60` bytes) stores its target
+/// inline in the inode's block-pointer array; otherwise the target lives in the
+/// file's data blocks and is read via [`read_file_data`] (so a target spanning
+/// multiple blocks on a small-block filesystem is handled correctly).
+pub fn read_symlink_target<R: BlockReader + ?Sized>(
+    r: &R,
+    inode: &Ext2Inode,
+) -> Result<Vec<u8>, Ext2Error> {
+    if !inode.is_symlink() {
+        return Err(Ext2Error::NotSymlink);
+    }
+    let target_len = inode.size as usize;
+    if inode.blocks == 0 && target_len <= SYMLINK_INLINE_MAX {
+        // Inline: the target bytes are packed into the block-pointer array.
+        let mut raw = [0u8; SYMLINK_INLINE_MAX];
+        for (i, &slot) in inode.block.iter().enumerate() {
+            let off = i * 4;
+            raw[off..off + 4].copy_from_slice(&slot.to_le_bytes());
+        }
+        Ok(raw[..target_len].to_vec())
+    } else {
+        let mut out = alloc::vec![0u8; target_len];
+        let n = read_file_data(r, inode, 0, &mut out)?;
+        out.truncate(n);
+        Ok(out)
+    }
+}
+
 /// Read all directory entries of `inode` (a directory), including `.` and `..`,
 /// skipping deleted (inode==0) entries. Returns `(name, inode, file_type)` where
 /// `file_type` is the raw ext2 dir-entry type byte (`EXT2_FT_*`).
@@ -1818,6 +1855,71 @@ mod tests {
         fs.put_data_block(210, deep_data);
 
         fs
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 0: shared symlink-target reader (Phase 88 Track C consolidation).
+    // Guards that the single kernel_core::read_symlink_target — now the sole
+    // implementation behind BOTH the kernel engine and the vfs_server — reads
+    // inline ("fast") and block-backed ("slow") targets and rejects non-links.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn shared_read_symlink_target_inline_and_block() {
+        let mut fs = MockExt2::new();
+
+        // Inline ("fast") symlink: target packed into the block-pointer array.
+        let inline_target = b"/usr/bin/env";
+        let mut inline = Ext2Inode::new_empty();
+        inline.mode = S_IFLNK | 0o777;
+        inline.links_count = 1;
+        inline.size = inline_target.len() as u32;
+        // blocks stays 0 → inline storage.
+        let mut raw = [0u8; SYMLINK_INLINE_MAX];
+        raw[..inline_target.len()].copy_from_slice(inline_target);
+        for (i, slot) in inline.block.iter_mut().enumerate() {
+            let off = i * 4;
+            *slot = u32::from_le_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
+        }
+        fs.put_inode(20, &inline);
+
+        // Block-backed ("slow") symlink: target stored in a data block. Its
+        // length exceeds the 60-byte inline limit, so the block path is taken.
+        let long_target =
+            b"/a/very/long/symlink/target/path/that/exceeds/sixty/bytes/inline/storage";
+        assert!(long_target.len() > SYMLINK_INLINE_MAX);
+        let mut slow = Ext2Inode::new_empty();
+        slow.mode = S_IFLNK | 0o777;
+        slow.links_count = 1;
+        slow.size = long_target.len() as u32;
+        slow.blocks = 2; // non-zero → block-backed storage
+        slow.block[0] = 220;
+        fs.put_inode(21, &slow);
+        fs.put_data_block(220, long_target);
+
+        let inline_inode = read_inode(&fs, 20).unwrap();
+        assert_eq!(
+            read_symlink_target(&fs, &inline_inode).unwrap(),
+            inline_target.to_vec(),
+            "inline fast-symlink target read from the block-pointer array"
+        );
+
+        let slow_inode = read_inode(&fs, 21).unwrap();
+        assert_eq!(
+            read_symlink_target(&fs, &slow_inode).unwrap(),
+            long_target.to_vec(),
+            "block-backed slow-symlink target read via read_file_data"
+        );
+
+        // A non-symlink inode is rejected.
+        let mut reg = Ext2Inode::new_empty();
+        reg.mode = S_IFREG | 0o644;
+        reg.size = 4;
+        assert_eq!(
+            read_symlink_target(&fs, &reg).unwrap_err(),
+            Ext2Error::NotSymlink,
+            "a non-symlink inode is rejected"
+        );
     }
 
     // -----------------------------------------------------------------------

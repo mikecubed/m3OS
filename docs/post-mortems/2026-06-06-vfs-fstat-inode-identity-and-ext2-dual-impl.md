@@ -274,9 +274,12 @@ Phase 88 implemented this checklist. Boxes below are checked with the resolution
 - [x] `getdents64` `d_ino` now equals `stat` `st_ino` — the synthetic `d_ino = idx+1` was
       replaced by `path_ino()` (same routing `stat` uses); asserted in `stat-identity`
       (Track B.3).
-- [~] `st_nlink` for directories: the ext2 inode's on-disk `links_count` is reported
-      directly (correct for ext2-backed dirs); a synthetic `2 + subdir_count` for virtual
-      dirs is out of scope.
+- [x] `st_nlink` for directories: the ext2 inode's on-disk `links_count` is reported
+      directly for ext2-backed dirs by BOTH `fstatat(dir)` and `fstat(open(dir))` — the
+      `fstat` directory-fd arm and `fstatat` now build metadata through one shared
+      `path_filemeta()` source of truth, so a directory fd no longer reports
+      `nlink=ino=size=times=0` (it previously did, an `fstat`-vs-`fstatat` divergence). A
+      synthetic `2 + subdir_count` for virtual dirs is out of scope.
 
 **D. Block cache & coherency** — largely owned by Phase 87/88 throughput work, not the
    stat pass; recorded here as cross-references.

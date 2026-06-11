@@ -1,6 +1,6 @@
 # Phase 88 — VFS `stat` Conformance & ext2 Consolidation: Task List
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-88
 **Depends on:** Phase 08 (Storage & VFS) ✅, Phase 28 (ext2) ✅, Phase 54 (vfs_server) ✅, Phase 18 (Directory VFS) ✅
 **Goal:** Make file metadata correct, complete, and consistent across every access path, and reconcile the two ext2 implementations so they cannot diverge. Implements the audit checklist from the post-mortem `docs/post-mortems/2026-06-06-vfs-fstat-inode-identity-and-ext2-dual-impl.md`.
@@ -12,7 +12,7 @@
 | A | Canonical `fill_stat()` serializer + migrate all stat syscalls onto it | — | ✅ Done |
 | B | Complete VFS stat fields (dev/blocks/times) + per-mount `st_dev` + identity-consistency tests | A | ✅ Done |
 | C | Reconcile ext2: `BlockReader` trait in `kernel_core`, share resolve/read logic | — | ✅ Done |
-| D | `VFS_OPEN` returns inode; drop the 85d kernel-side open-time resolve | C | ✅ Done (impl; clang-smoke at checkpoint) |
+| D | `VFS_OPEN` returns inode; drop the 85d kernel-side open-time resolve | C | ✅ Done |
 | E | `statx` (implement onto `fill_stat`, or document the ENOSYS fallback) | A | ✅ Done (documented ENOSYS) |
 | F | Conformance + cross-impl parity test suites; promote `M3OS_CLANG_STRESS` to a CI gate | A, B, C | ✅ Done |
 | G | Atomic `pwrite64` — offset-parameterized backend writes (write-path correctness) | C | ✅ Done |
@@ -75,12 +75,12 @@
 ### C.1 — `BlockReader` trait + shared higher-level ext2 ops in `kernel_core`
 
 **File:** `kernel-core/src/fs/ext2.rs`
-**Symbol:** new `trait BlockReader`; move `resolve_path`/`read_inode`/`read_file_data`/`resolve_block`/dir-parsing onto it
+**Symbol:** new `trait BlockReader`; move `resolve_path`/`read_inode`/`read_file_data`/`resolve_block`/`read_symlink_target`/dir-parsing onto it
 **Why it matters:** Today these are implemented twice (`kernel/src/fs/ext2.rs` and `userspace/vfs_server/src/main.rs`) and diverged at the stat seam; sharing one implementation makes a fix in one a fix in both.
 
 **Acceptance:**
-- [x] `kernel_core::fs::ext2` exposes generic `resolve_path`/`read_inode`/`read_file_data`/`resolve_block`/`read_directory_entries`/`lookup_in_directory` over a `BlockReader` trait (block source + geometry; the Phase 87 run-coalescer drives `read_file_data` via the trait's `read_block_run`/`read_block_into`/`max_run_blocks` hooks).
-- [x] `kernel/src/fs/ext2.rs` (over its cache-aware `read_block` + multi-block `read_run_into_slice`) and `userspace/vfs_server` (over its cache + write-back-aware `read_block` + `read_sectors`) both `impl BlockReader` and delegate; the duplicated bodies are deleted (~335 lines removed).
+- [x] `kernel_core::fs::ext2` exposes generic `resolve_path`/`read_inode`/`read_file_data`/`resolve_block`/`read_directory_entries`/`lookup_in_directory`/`read_symlink_target` over a `BlockReader` trait (block source + geometry; the Phase 87 run-coalescer drives `read_file_data` via the trait's `read_block_run`/`read_block_into`/`max_run_blocks` hooks).
+- [x] `kernel/src/fs/ext2.rs` (over its cache-aware `read_block` + multi-block `read_run_into_slice`) and `userspace/vfs_server` (over its cache + write-back-aware `read_block` + `read_sectors`) both `impl BlockReader` and delegate; the duplicated bodies — including the symlink-target reader (`Ext2Volume::read_symlink` / `Ext2State::read_symlink_target`) — are deleted (~360 lines removed).
 
 ### C.2 — Cross-implementation parity test
 
@@ -89,7 +89,7 @@
 **Why it matters:** Proves the two readers agree (inode, size, contents, dir listing) across edge cases.
 
 **Acceptance:**
-- [x] Parity asserted (9 host tests in `kernel_core::fs::ext2::tests` over a `MockExt2` `BlockReader` fixture): regular files (direct blocks + mid-block offset + past-EOF), directories, symlinks, sparse/hole files, single- and double-indirect block boundaries, triple-indirect returns `CorruptedEntry`, and a 320-entry multi-block directory. Both impls delegate to these functions, so the tests guarantee parity.
+- [x] Parity asserted (10 host tests in `kernel_core::fs::ext2::tests` over a `MockExt2` `BlockReader` fixture): regular files (direct blocks + mid-block offset + past-EOF), directories, symlinks (inline fast-symlink + block-backed slow-symlink target reads via the shared `read_symlink_target`, plus non-symlink rejection), sparse/hole files, single- and double-indirect block boundaries, triple-indirect returns `CorruptedEntry`, and a 320-entry multi-block directory. Both impls delegate to these functions, so the tests guarantee parity.
 
 ---
 
@@ -104,7 +104,7 @@
 **Acceptance:**
 - [x] `VFS_OPEN` reply carries the inode (and the full stat header in the reply bulk) and the kernel seeds `FdBackend::VfsService.meta` (a `VfsFileMeta` snapshot) from it.
 - [x] The kernel-side `EXT2_VOLUME.resolve_path` call in `vfs_service_open` (the 85d double-resolve) is removed.
-- [ ] clang-smoke (incl. `M3OS_CLANG_STRESS`) still passes. *(pending — runs at the integration checkpoint.)*
+- [x] clang-smoke (incl. `M3OS_CLANG_STRESS`) still passes. Ran green at the integration checkpoint (commit `cd680c6f`): `CLANG_C_OK` + `CLANG_CPP_OK` + the `-fuse-ld=lld` link all pass, including the repeated multi-compile stress that drives clang's `(st_dev, st_ino)` `FileManager` dedup.
 
 ---
 
@@ -186,9 +186,9 @@
 **Why it matters:** The in-OS `clang-smoke` compile/link steps only fast-fail on `fatal error:`; a deterministic *non-fatal* clang/lld failure (`error:` / `ld.lld: error:`) burns the full multi-minute step timeout. A bare `error:` substring is unsafe because `find_terminated_fail_line` matches over the *un-drained, kernel-log-inclusive* serial buffer (the preceding `Wait` steps are non-consuming), and an inline `|| echo SENTINEL` would match the command echo — so the fix is *multiple* clang/lld-specific fail patterns. No kernel/VFS impact; bundled here as an 85d test-quality follow-up.
 
 **Acceptance:**
-- [ ] `WaitPassOrFail` accepts a list of fail patterns (e.g. `fail_prefixes: &[&str]`); existing single-pattern call sites keep working.
-- [ ] The `clang-smoke` C/C++/stress steps match clang/lld diagnostic shapes (e.g. `: error:`, `ld.lld: error:`) in addition to `fatal error:`.
-- [ ] A clean compile does **not** false-fail (no incidental serial `error:` trips the gate); a deterministic non-fatal failure fast-fails instead of timing out — validated by running the `clang-smoke` gate.
+- [x] `WaitPassOrFail` accepts a list of fail patterns (e.g. `fail_prefixes: &[&str]`); existing single-pattern call sites keep working.
+- [x] The `clang-smoke` C/C++/stress steps match clang/lld diagnostic shapes (e.g. `: error:`, `ld.lld: error:`) in addition to `fatal error:`.
+- [x] A clean compile does **not** false-fail (no incidental serial `error:` trips the gate); a deterministic non-fatal failure fast-fails instead of timing out — validated by running the `clang-smoke` gate.
 
 ---
 

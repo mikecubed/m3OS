@@ -1430,34 +1430,10 @@ impl Ext2Volume {
     /// Returns `Ext2Error::NotSymlink` if the inode is not a symlink.
     pub fn read_symlink(&self, inode_num: u32) -> Result<String, Ext2Error> {
         let inode = self.read_inode(inode_num)?;
-        if !inode.is_symlink() {
-            return Err(Ext2Error::NotSymlink);
-        }
-
-        let target_len = inode.size as usize;
-
-        if inode.blocks == 0 && target_len <= Self::SYMLINK_INLINE_MAX {
-            // Inline: target is stored in the block pointer array bytes.
-            let mut raw = [0u8; 60];
-            for (i, &slot) in inode.block.iter().enumerate() {
-                let off = i * 4;
-                raw[off..off + 4].copy_from_slice(&slot.to_le_bytes());
-            }
-            let bytes = &raw[..target_len];
-            String::from_utf8(bytes.to_vec()).map_err(|_| Ext2Error::CorruptedEntry)
-        } else {
-            // Block-backed: read from the first data block.
-            let block_num = inode.block[0];
-            if block_num == 0 {
-                return Err(Ext2Error::CorruptedEntry);
-            }
-            let block_data = self.read_block(block_num)?;
-            if target_len > block_data.len() {
-                return Err(Ext2Error::CorruptedEntry);
-            }
-            String::from_utf8(block_data[..target_len].to_vec())
-                .map_err(|_| Ext2Error::CorruptedEntry)
-        }
+        // Phase 88 Track C — delegate to the shared kernel_core reader so the
+        // kernel engine and vfs_server resolve symlinks identically.
+        let bytes = kernel_core::fs::ext2::read_symlink_target(self, &inode)?;
+        String::from_utf8(bytes).map_err(|_| Ext2Error::CorruptedEntry)
     }
 }
 
