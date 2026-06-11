@@ -16552,7 +16552,14 @@ pub(super) fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
             }
         }
         F_SETFD => {
-            // arg & 1 = FD_CLOEXEC
+            // arg & 1 = FD_CLOEXEC. Must return EBADF for a closed/out-of-range
+            // fd (like F_GETFD / F_SETFL) — NOT silent success. Otherwise a
+            // "set FD_CLOEXEC on every fd until EBADF" loop (Node 22's libuv does
+            // exactly this at startup) never terminates: m3OS reported success
+            // for fd 0,1,2,… into the millions, busy-looping the process forever.
+            if current_fd_entry(fd as usize).is_none() {
+                return NEG_EBADF;
+            }
             let cloexec = arg & 1 != 0;
             with_current_fd_mut(fd as usize, |slot| {
                 if let Some(e) = slot {

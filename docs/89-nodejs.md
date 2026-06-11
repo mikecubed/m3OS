@@ -163,7 +163,8 @@ runtime package dependencies.
 
 The resulting `node` binary is ELF `EXEC`/`DYN` fully static — no `PT_INTERP`
 segment — proven by `readelf -l` (the same check `build_python`/`build_go` use).
-Installed size is approximately 90–110 MB (measured once the port builds).
+The sealed `node.m3pkg` measures **~120 MB** (126,327,183 bytes — larger than a
+lite-mode build because WASM stays compiled in; see the jitless note above).
 
 ### npm path: TLS, DNS, and the Phase 90 dependency
 
@@ -198,15 +199,32 @@ sentinels from `node /usr/src/node-probe.js`:
 - `NODE_EVENTLOOP_OK` — `Promise`/microtask + `queueMicrotask` + `nextTick`
   ordering check.
 
-A loopback `node /usr/src/node-http.js` probe additionally asserts
-`NODE_HTTP_OK` (an in-process `http.createServer` + `http.get` over 127.0.0.1).
-The egress probe (`NODE_EGRESS_OK`) runs a plaintext HTTP GET to the SLIRP
-host at `10.0.2.100:80` — the same pattern as the Go gate (Track D.1, always-on).
+It also asserts `NODE_TLSDNS_OK` — `require('tls')`/`dns`/`crypto` load the
+static OpenSSL/c-ares/crypto stacks without throwing. **This always-on core
+PASSES** (validated under `M3OS_KVM=1`, ~30 s once booted).
+
+> **The startup-hang fix (a real kernel bug).** Getting node to even print
+> `--version` required fixing `F_SETFD` in the kernel: it wrongly returned
+> *success* for closed/out-of-range fds (unlike its sibling `F_GETFD`/`F_SETFL`,
+> which return `EBADF`). Node 22's libuv sets `FD_CLOEXEC` on every fd in a loop
+> that stops at the first `EBADF` — so on m3OS that loop busy-spun to millions of
+> fds and never returned. `F_SETFD` now returns `EBADF` for invalid fds.
+
+> **Networking is a tracked follow-up — `M3OS_NODE_NET`-gated.** node's
+> `http.get` does **not** complete on m3OS yet: the TCP connect *reaches* the
+> host (the gate's host `TcpListener` logs the guest connection, so the in-kernel
+> TCP stack + SLIRP work), but node then **deadlocks in libuv's threadpool** on
+> the DNS-resolve futex handoff — the main thread and the `clone-thread` workers
+> all go `BlockedOnFutex "no waker registered"`, a futex lost-wakeup under
+> libuv's threadpool condvar pattern. Separately, m3OS has **no 127.0.0.1
+> loopback** interface. So the egress (`NODE_EGRESS_OK`), live HTTPS, and
+> `npm install` arms are behind `M3OS_NODE_NET`, pending that futex fix — which
+> is the gating work for the Phase 90 npm dependency.
 
 The gate is wired opt-in via `M3OS_NODE_REGRESSION=1` at `--timeout 5400`
-(clang-class timeout — the ~100 MB install over the ~200 KB/s ring-3 VFS takes
-tens of minutes). When `clang`/`cmake`/`ninja` are absent on the host,
-`build_node_port()` prints `SKIP (reason: …)` and exits success.
+(much faster under `M3OS_KVM=1`, which the gate honors; `M3OS_NODE_FAST_ITER`
+reuses an installed disk). When the host C++ toolchain or the `llvm` musl
+sysroot is absent, the gate prints `SKIP (reason: …)` and exits success.
 
 ## Key Files
 
