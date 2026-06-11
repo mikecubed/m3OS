@@ -534,10 +534,10 @@ fn build_recipe_id(name: &str) -> &'static str {
         // change self-invalidates the cached `.m3pkg`; the host clang identity is
         // folded separately via `host_cxx_toolchain_id()` in `compute_port_key`.
         "node" => {
-            "node-configure:--fully-static --enable-static --cross-compiling \
-             --dest-cpu=x64 --dest-os=linux --with-intl=small-icu --v8-lite-mode \
-             --openssl-no-asm --without-corepack --without-node-snapshot \
-             --without-inspector;cxxstdlib=libc++-musl;recipe-v=1"
+            "node-configure:--fully-static --enable-static --dest-cpu=x64 \
+             --dest-os=linux --with-intl=small-icu --v8-lite-mode --openssl-no-asm \
+             --without-corepack --without-node-snapshot --without-inspector;\
+             single-toolset;make-generator;cxxstdlib=libc++-musl;recipe-v=3"
         }
         _ => "",
     }
@@ -3576,10 +3576,24 @@ fn build_node(port_src: &Path, stage: &Path, port_dir: &Path) -> Result<(), Stri
     let sysroot_s = sysroot.display().to_string();
     let tgt = format!("--target={NODE_TRIPLE} --sysroot={sysroot_s}");
     let warn = "-Wno-unused-command-line-argument";
-    let cflags = format!("{tgt} -O2 -fno-omit-frame-pointer -D_GNU_SOURCE -D__MUSL__ {warn}");
+    // clang 16+ promoted several legacy-C constructs from warnings to hard
+    // errors. The bundled OpenSSL/c-ares/etc. trip them on musl — notably
+    // OpenSSL's `o_str.c` assumes `_GNU_SOURCE` ⇒ glibc's `char*`-returning
+    // `strerror_r`, but musl always returns `int` (no GNU variant), and
+    // `_GNU_SOURCE` is still required for V8's `pthread_getattr_np`. Downgrade
+    // those clang-16 promotions back to warnings so the legacy C deps build.
+    let legacy_c = "-Wno-error=int-conversion -Wno-error=implicit-function-declaration \
+                    -Wno-error=incompatible-pointer-types -Wno-error=implicit-int";
+    let cflags =
+        format!("{tgt} -O2 -fno-omit-frame-pointer -D_GNU_SOURCE -D__MUSL__ {warn} {legacy_c}");
+    // clang does NOT auto-add `<sysroot>/include/c++/v1` to the C++ search path
+    // for this bare musl triple — its default C++ search for the sysroot is just
+    // `<sysroot>/include` + the resource dir — so the libc++ headers the `llvm`
+    // port installed there go unseen and `<cstddef>`/`<memory>` come back "file
+    // not found". Point at them explicitly with `-cxx-isystem`.
     let cxxflags = format!(
-        "{tgt} -stdlib=libc++ -rtlib=compiler-rt -O2 -fno-omit-frame-pointer \
-         -D_GNU_SOURCE -D__MUSL__ {warn}"
+        "{tgt} -stdlib=libc++ -cxx-isystem {sysroot_s}/include/c++/v1 -rtlib=compiler-rt \
+         -O2 -fno-omit-frame-pointer -D_GNU_SOURCE -D__MUSL__ {warn}"
     );
     let ldflags = format!(
         "{tgt} -static -stdlib=libc++ -L{sysroot_s}/lib -rtlib=compiler-rt \
@@ -3622,12 +3636,24 @@ fn build_node(port_src: &Path, stage: &Path, port_dir: &Path) -> Result<(), Stri
         "--prefix=/usr",
         "--dest-cpu=x64",
         "--dest-os=linux",
-        "--cross-compiling",
+        // NB: NOT `--cross-compiling`. Build host and target are both x86_64, and
+        // a fully-static musl mksnapshot/torque runs natively on the glibc host
+        // (static = no loader). `--cross-compiling` would force V8's
+        // `want_separate_host_toolset=1`, which emits BOTH host- and
+        // target-toolset `v8_inspector_headers` rules writing the same
+        // arch-independent `gen/.../js_protocol.stamp` → ninja "multiple rules
+        // generate" error. A single (native) toolset generates it once.
         "--fully-static",
         "--enable-static",
         "--with-intl=small-icu",
         "--v8-lite-mode",
-        "--ninja",
+        // NB: NOT `--ninja`. V8's gyp emits `v8_inspector_headers` for BOTH the
+        // host and target toolsets, both writing the same arch-independent
+        // `gen/.../js_protocol.stamp` (Node's `--without-inspector` disables
+        // Node's inspector but NOT V8's `v8_enable_inspector`). ninja treats
+        // "multiple rules generate X" as a FATAL error; GYP's make generator (the
+        // default, most-tested Node build backend) tolerates it as a benign
+        // "overriding recipe" warning. So we use the make backend.
         "--openssl-no-asm",
         "--without-corepack",
         "--without-node-snapshot",
@@ -3636,7 +3662,7 @@ fn build_node(port_src: &Path, stage: &Path, port_dir: &Path) -> Result<(), Stri
     apply_env(&mut cfg);
     run(&mut cfg, "node configure")?;
 
-    // ── 6. build (ninja under `--ninja`; V8 + bundled OpenSSL/ICU = LONG) ────────
+    // ── 6. build (GYP make backend; V8 + bundled OpenSSL/ICU = LONG) ─────────────
     println!("node: build ({jobs}) [LONG — V8 + bundled OpenSSL/ICU; multi-hour cold]");
     let mut mk = Command::new("make");
     mk.current_dir(src).arg(&jobs);

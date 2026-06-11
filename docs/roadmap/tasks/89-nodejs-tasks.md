@@ -1,6 +1,6 @@
 # Phase 89 — Node.js: Task List
 
-**Status:** Planned — authored ahead of implementation. Headline outcome: `cargo xtask node-smoke` PASSES end-to-end (NODE_HELLO_OK + NODE_FS_OK + NODE_TIMER_OK + NODE_EVENTLOOP_OK + NODE_HTTP_OK) and the opt-in `M3OS_NODE_NET=1` arm runs `npm install` over HTTPS; kernel bumps to `0.89.0`.
+**Status:** In progress. **Track A (kernel `timerfd` + signalfd decision + V8 W^X audit) is landed and validated** (`cargo xtask check` green, `smoke-test` 25/25 boots; commit `5bf7d766`). **Tracks B/C/D/E are code-complete and `cargo xtask check` green** (commit `adfe6a31`): the `build_node` port pipeline (Node v22.22.3, jitless V8, static musl), the `M3OS_WITH_NODE` bundle, the `node-smoke` gate (C.1/D.1/D.2), the docs (learning doc + revived roadmap), and the `0.88.0 → 0.89.0` version bump. **The live `cargo xtask port build node` cross-build is iterating** (cleared: V8 inspector ninja-duplicate via the make backend; OpenSSL `strerror_r` musl mismatch via `-Wno-error=int-conversion`; ICU libc++ headers via `-cxx-isystem`); once it seals the `.m3pkg`, `node-smoke` runs end-to-end (NODE_HELLO/FS/TIMER/EVENTLOOP/PROC/HTTP/EGRESS + opt-in `M3OS_NODE_NET=1` `npm install`). Headline outcome unchanged; kernel bumped to `0.89.0`.
 **Source Ref:** phase-89
 **Depends on:** Phase 37 (I/O Multiplexing — epoll/`epoll_pwait`) ✅, Phase 40 (Threading — `clone(CLONE_THREAD)`/futex/PT_TLS) ✅, Phase 42 (Crypto Primitives) ✅, Phase 75 (W^X — `mprotect` RW→RX, the `wx-violation` gate) ✅, Phase 76 (Dynamic Linker) ✅, Phase 85 (Cross-Compiled Toolchains — `.m3pkg` substrate + offline `pkg`) ✅, Phase 86 (Networking and GitHub — CSPRNG/CA-trust/DNS + `git`-over-HTTPS, the Go runtime 86d that already cleared `mmap`/epoll/`SIGURG` for managed runtimes) ✅ — see [86d-go-runtime-tasks.md](./86d-go-runtime-tasks.md). Quality-gated by Phase 87 (VFS bulk-I/O) ✅ and Phase 88 (`stat` conformance) ✅, both called out as heavy-I/O / `stat`-dependent prerequisites for this phase.
 **Goal:** Bring up a supported, statically-linked Node.js (22 LTS) runtime inside m3OS as a content-addressed `.m3pkg` — closing the only two libuv kernel gaps (`timerfd`, `signalfd4`), choosing a W^X-compliant V8 code-memory model (JIT via `mprotect` RW↔RX toggling, with `--jitless` as the documented fallback), validating the local runtime (fs/timers/console/process/event-loop) and a plaintext loopback HTTP path, then delivering the TLS/DNS/`npm install` package path the Phase 90 CLI-agent milestone depends on. Bump the kernel to `0.89.0` and ship the learning doc.
@@ -181,9 +181,9 @@
 **Why it matters:** every phase ships a learning doc (the roadmap's "Required Documentation for Every Phase" rule); this one teaches how a JIT-heavy managed runtime stresses W^X/execution-permissions differently from static CLIs, how libuv builds on the epoll/threading/`timerfd` substrate, the chosen Node configuration + non-goals, and the TLS/DNS/npm package path — the four learning goals named in the phase doc.
 
 **Acceptance:**
-- [ ] `docs/89-nodejs.md` exists, follows the aligned learning-doc template sections (`## Overview` → `## What This Doc Covers` → `## Core Implementation` → `## Key Files` table → `## How This Phase Differs From Later Runtime Work` → `## Related Roadmap Docs` → `## Deferred or Later-Phase Topics`), and explains the V8 W^X/JIT model, the libuv `timerfd`/`signalfd` decisions, the static-musl build, and the npm path in learner-friendly terms with the disk/RAM budget (the Node `.m3pkg` size is the **measured** value once built).
-- [ ] It is linked from `docs/README.md`'s `### Phase-Aligned Learning Docs` table (a `| [Node.js](./89-nodejs.md) | 89 | … |` row after `:72`) and cross-links the Phase 89 design + task docs.
-- [ ] `docs/86-networking-and-github.md:402` no longer claims "Node.js is Phase 87, Claude Code is Phase 88" (corrected to Phase 89 / Phase 90).
+- [x] `docs/89-nodejs.md` exists, follows the aligned learning-doc template sections, and explains the V8 W^X/JIT model (jitless), the libuv `timerfd`/`signalfd` decisions, the static-musl build, and the npm path in learner-friendly terms. **As-built:** disk/RAM budget stated as "≈90–110 MB (measured once the port builds)" pending the final build.
+- [x] It is linked from `docs/README.md`'s `### Phase-Aligned Learning Docs` table and cross-links the Phase 89 design + task docs.
+- [x] `docs/86-networking-and-github.md:402` corrected to "Node.js is Phase 89, Claude Code is Phase 90".
 
 ### E.2 — Revive the standalone Node.js roadmap
 
@@ -195,8 +195,8 @@
 **Why it matters:** the phase doc's "Related Documentation" requires `docs/nodejs-roadmap.md`; the live standalone roadmap is the per-tool narrative cross-compilation strategy (Mermaid dependency flowchart + "why Node is hard"), complementary to the master phase index. The archived copy already holds the porting plan — reviving it matches the Python/git/clang precedent rather than writing a new one.
 
 **Acceptance:**
-- [ ] `docs/nodejs-roadmap.md` exists, opening with a `> Revived … for **Phase 89 — Node.js**.` blockquote pointing at the live phase + task docs, then the `# Road to Node.js on m3OS` body carried from the archived copy and reconciled with the as-built configuration (static musl, V8 W^X model, bundled OpenSSL, npm path).
-- [ ] `docs/README.md`'s Standalone Roadmaps row points at `./nodejs-roadmap.md` with a "revived for Phase 89" note (mirroring the Python/git rows), no longer the archived path.
+- [x] `docs/nodejs-roadmap.md` exists, opening with a `> Revived 2026-06-11 for **Phase 89 — Node.js**.` blockquote, then the `# Road to Node.js on m3OS` body reconciled with the as-built configuration (static musl, V8 jitless W^X model, bundled OpenSSL, npm path).
+- [x] `docs/README.md`'s Standalone Roadmaps row points at `./nodejs-roadmap.md` with a "revived for Phase 89" note, no longer the archived path.
 
 ### E.3 — Update the roadmap README row, the design doc's task-list link + Evaluation-Gate fix, and the AGENTS.md inventory
 
@@ -209,9 +209,9 @@
 **Why it matters:** `docs/roadmap/README.md` is the authoritative phase index and AGENTS.md is the always-loaded capability inventory; both must reflect the landed runtime. Per the AGENTS.md "keep it small" maintenance policy, Node.js is the **same capability class** as Go/Python/Clang (a cross-compiled language runtime delivered through the substrate), so it **folds into the existing toolchain bullet** — it does **not** get a new capability bullet.
 
 **Acceptance:**
-- [ ] `docs/roadmap/README.md:472` Tasks cell links `[Tasks](./tasks/89-nodejs-tasks.md)`; Status reads `Complete` (and Primary Outcome is sharpened to name the npm/TLS path) when the phase lands.
-- [ ] `docs/roadmap/89-nodejs.md`'s **Companion Task List** section links `[Phase 89 Task List](./tasks/89-nodejs-tasks.md)` (replacing "defer until implementation planning begins"), and the **Evaluation Gate** "Toolchain and network baseline" row references **Phases 85 and 86** (not the copy-paste "Phases 59 and 60").
-- [ ] The AGENTS.md `:17` toolchain bullet is rewritten to fold in Node.js (a clause beside git/Python/Clang/Go), the `M3OS_NODE_REGRESSION` opt-in gate row is present in the regression table, and **no** new capability bullet is added (per "prefer rewriting an existing bullet").
+- [x] `docs/roadmap/README.md:472` Tasks cell already links `[Tasks](./tasks/89-nodejs-tasks.md)`. **Status flips `Planned` → `Complete` (+ Primary Outcome sharpened) on landing** — held until the live Node build + `node-smoke` pass.
+- [x] `docs/roadmap/89-nodejs.md`'s **Companion Task List** links the task list and the **Evaluation Gate** row references **Phases 85 and 86** (verified already correct).
+- [x] The AGENTS.md toolchain bullet is rewritten to fold in Node.js (a clause beside git/Python/Clang/Go), the `M3OS_NODE_REGRESSION` opt-in gate row is present in the regression table, and **no** new capability bullet is added.
 
 ### E.4 — Bump kernel crate `0.88.0` → `0.89.0`
 
@@ -220,9 +220,9 @@
 **Why it matters:** Phase 89 is the next post-1.0 minor; the version bump is how the phase's landing is recorded in the boot banner and `uname` (both derive from `env!("CARGO_PKG_VERSION")`), and the `node-smoke` boot banner asserting `v0.89.0` is the cheap proof the cut shipped.
 
 **Acceptance:**
-- [ ] `kernel/Cargo.toml` line 3 reads `version = "0.89.0"` (+ `Cargo.lock` updated), and `AGENTS.md:7` reads `kernel **v0.89.0**`.
-- [ ] `cargo xtask check` is clean (clippy `-D warnings` + rustfmt + host tests incl. the new `kernel_core::timerfd` tests + the `build_recipe_id` distinctness test + retpoline gate); exit 0.
-- [ ] The `node-smoke` boot banner / `uname` reports `0.89.0`.
+- [x] `kernel/Cargo.toml` line 3 reads `version = "0.89.0"` (+ `Cargo.lock` updated), and `AGENTS.md:7` reads `kernel **v0.89.0**`.
+- [x] `cargo xtask check` is clean (clippy `-D warnings` + rustfmt + host tests incl. the new `kernel_core::timerfd` tests + the `build_recipe_id` distinctness test + retpoline gate); exit 0.
+- [ ] The `node-smoke` boot banner / `uname` reports `0.89.0` (rides the `node-smoke` run, gated on the Node build).
 
 ---
 
