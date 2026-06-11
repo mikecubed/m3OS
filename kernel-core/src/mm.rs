@@ -8,6 +8,21 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
+/// For a file-backed `MAP_SHARED` **writable** mapping: the backing fd and the
+/// file offset of the mapping's first byte. `munmap`/`msync` use this to write
+/// the mapped pages back to the file (m3OS file-backed mmap is eager-loaded into
+/// anonymous frames, so without this the dirty pages would never reach the
+/// file). `None` for anonymous, private, read-only, or device (MMIO/framebuffer)
+/// mappings — those are never written back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileBacking {
+    /// The descriptor the mapping was created from (still open at unmap for the
+    /// write-back to land — the common `mmap`/write/`munmap`/`close` order).
+    pub fd: u32,
+    /// File offset of the first mapped byte.
+    pub offset: u64,
+}
+
 /// Describes a contiguous virtual memory area (VMA).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryMapping {
@@ -19,6 +34,22 @@ pub struct MemoryMapping {
     pub prot: u64,
     /// Mapping flags (`MAP_PRIVATE | MAP_ANONYMOUS`, etc.).
     pub flags: u64,
+    /// File write-back info for a file-backed `MAP_SHARED` writable mapping;
+    /// `None` otherwise. See [`FileBacking`].
+    pub file_backing: Option<FileBacking>,
+}
+
+impl MemoryMapping {
+    /// The [`FileBacking`] for a sub-mapping that starts at `new_start` (which
+    /// must lie within this mapping): the file offset advances by the distance
+    /// from this mapping's start, so a split/trimmed piece writes back to the
+    /// correct file region. `None` if this mapping is not file-backed.
+    pub fn file_backing_at(&self, new_start: u64) -> Option<FileBacking> {
+        self.file_backing.map(|fb| FileBacking {
+            fd: fb.fd,
+            offset: fb.offset + (new_start.saturating_sub(self.start)),
+        })
+    }
 }
 
 /// VMA tree for O(log n) address lookup, backed by `BTreeMap`.
@@ -98,6 +129,7 @@ impl VmaTree {
                     len: start - vma_start,
                     prot: vma.prot,
                     flags: vma.flags,
+                    file_backing: vma.file_backing_at(vma_start),
                 });
                 // Right piece: [end, vma_end)
                 to_insert.push(MemoryMapping {
@@ -105,12 +137,14 @@ impl VmaTree {
                     len: vma_end - end,
                     prot: vma.prot,
                     flags: vma.flags,
+                    file_backing: vma.file_backing_at(end),
                 });
                 removed.push(MemoryMapping {
                     start,
                     len,
                     prot: vma.prot,
                     flags: vma.flags,
+                    file_backing: vma.file_backing_at(start),
                 });
             } else if vma_start < start {
                 // VMA overlaps on the left -- trim right side.
@@ -120,12 +154,14 @@ impl VmaTree {
                     len: start - vma_start,
                     prot: vma.prot,
                     flags: vma.flags,
+                    file_backing: vma.file_backing_at(vma_start),
                 });
                 removed.push(MemoryMapping {
                     start,
                     len: vma_end - start,
                     prot: vma.prot,
                     flags: vma.flags,
+                    file_backing: vma.file_backing_at(start),
                 });
             } else {
                 // VMA overlaps on the right -- trim left side.
@@ -135,12 +171,14 @@ impl VmaTree {
                     len: vma_end - end,
                     prot: vma.prot,
                     flags: vma.flags,
+                    file_backing: vma.file_backing_at(end),
                 });
                 removed.push(MemoryMapping {
                     start: vma_start,
                     len: end - vma_start,
                     prot: vma.prot,
                     flags: vma.flags,
+                    file_backing: vma.file_backing_at(vma_start),
                 });
             }
         }
@@ -179,18 +217,21 @@ impl VmaTree {
                     len: start - vma_start,
                     prot: vma.prot,
                     flags: vma.flags,
+                    file_backing: vma.file_backing_at(vma_start),
                 });
                 to_insert.push(MemoryMapping {
                     start,
                     len: end - start,
                     prot,
                     flags: vma.flags,
+                    file_backing: vma.file_backing_at(start),
                 });
                 to_insert.push(MemoryMapping {
                     start: end,
                     len: vma_end - end,
                     prot: vma.prot,
                     flags: vma.flags,
+                    file_backing: vma.file_backing_at(end),
                 });
             } else if vma_start < start {
                 // Overlap at tail of VMA -- split into head (old) + tail (new).
@@ -200,12 +241,14 @@ impl VmaTree {
                     len: start - vma_start,
                     prot: vma.prot,
                     flags: vma.flags,
+                    file_backing: vma.file_backing_at(vma_start),
                 });
                 to_insert.push(MemoryMapping {
                     start,
                     len: vma_end - start,
                     prot,
                     flags: vma.flags,
+                    file_backing: vma.file_backing_at(start),
                 });
             } else {
                 // Overlap at head of VMA -- split into head (new) + tail (old).
@@ -215,12 +258,14 @@ impl VmaTree {
                     len: end - vma_start,
                     prot,
                     flags: vma.flags,
+                    file_backing: vma.file_backing_at(vma_start),
                 });
                 to_insert.push(MemoryMapping {
                     start: end,
                     len: vma_end - end,
                     prot: vma.prot,
                     flags: vma.flags,
+                    file_backing: vma.file_backing_at(end),
                 });
             }
         }
@@ -291,6 +336,7 @@ mod tests {
             len,
             prot: 3,
             flags: 0x22,
+            file_backing: None,
         }
     }
 
@@ -581,6 +627,7 @@ mod tests {
             len: 0x1000,
             prot: 3,
             flags: 0x100,
+            file_backing: None,
         });
         t.insert(mapping(0x2000, 0x1000));
         assert!(t.any(|m| m.flags & 0x100 != 0));
@@ -611,12 +658,14 @@ mod tests {
             len: 0x1000,
             prot: PROT_RW,
             flags: MAP_ANON_PRIV,
+            file_backing: None,
         };
         let above = MemoryMapping {
             start: ARENA + ARENA_LEN,
             len: 0x1000,
             prot: PROT_RW,
             flags: MAP_ANON_PRIV,
+            file_backing: None,
         };
         t.insert(below);
         t.insert(above);
@@ -626,6 +675,7 @@ mod tests {
             len: ARENA_LEN,
             prot: PROT_NONE,
             flags: MAP_ANON_PRIV,
+            file_backing: None,
         });
         // sysMapOS: commit PROT_RW MAP_FIXED — overwrite/split then insert.
         t.remove_range(commit_start, commit_len);
@@ -634,6 +684,7 @@ mod tests {
             len: commit_len,
             prot: PROT_RW,
             flags: MAP_ANON_PRIV,
+            file_backing: None,
         });
         t
     }

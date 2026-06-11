@@ -35,7 +35,7 @@ use crate::task::TaskId;
 use crate::task::scheduler::IrqSafeMutex;
 
 // Re-export VMA types from kernel-core for host-testability.
-pub use kernel_core::mm::{MemoryMapping, VmaTree};
+pub use kernel_core::mm::{FileBacking, MemoryMapping, VmaTree};
 
 // ---------------------------------------------------------------------------
 // Current-process tracker (per-core, Phase 35)

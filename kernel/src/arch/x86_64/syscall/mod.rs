@@ -10990,6 +10990,7 @@ pub(super) fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
                 len: total_size,
                 prot,
                 flags,
+                file_backing: None, // anonymous mapping
             });
         });
         let table = crate::process::PROCESS_TABLE.lock();
@@ -11043,6 +11044,7 @@ pub(super) fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
                 len: total_size,
                 prot,
                 flags,
+                file_backing: None, // anonymous (demand-paged) mapping
             });
         });
         // Phase 52d B.3: bump generation — the address space changed
@@ -11246,6 +11248,21 @@ fn sys_mmap_file_backed(
         return NEG_EINVAL;
     }
 
+    // Phase 88 follow-up — record file write-back info for a MAP_SHARED writable
+    // file mapping so munmap/msync flush the dirty pages back to the file. m3OS
+    // eager-loads file mmaps into anonymous frames, so without this the writes
+    // are lost (which left `lld`'s mmap'd output all-zeros → `InvalidMagic`).
+    // MAP_PRIVATE / read-only mappings are never written back.
+    const MAP_SHARED: u64 = 0x1;
+    let file_backing = if prot & PROT_WRITE != 0 && flags & MAP_SHARED != 0 {
+        Some(crate::process::FileBacking {
+            fd: fd as u32,
+            offset: file_offset as u64,
+        })
+    } else {
+        None
+    };
+
     // Record the VMA — uses the shared-mm lock, independent of the
     // page-table lock.  Order (PT mutation before VMA insert) is preserved
     // from the original code.
@@ -11255,6 +11272,7 @@ fn sys_mmap_file_backed(
             len: total_size,
             prot,
             flags,
+            file_backing,
         });
     });
     if let Some(addr_space) = addr_space.as_ref() {
@@ -11306,6 +11324,26 @@ pub(super) fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
     let mut frames_to_free: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
     let mut fb_fully_unmapped = false;
     let mut vma_changed = false;
+
+    // Phase 88 follow-up — snapshot file-backed MAP_SHARED writable VMAs that
+    // overlap the unmapped range, so each page's dirty contents can be written
+    // back to the file before its frame is freed. Empty for the common case
+    // (anonymous mappings), which keeps the unmap path unchanged.
+    let writeback_vmas: alloc::vec::Vec<(u64, u64, u32, u64)> = // (start, end, fd, file_offset)
+        crate::process::with_shared_mm_mut(pid, |_b, _m, vma_tree| {
+            vma_tree
+                .iter()
+                .filter_map(|m| {
+                    m.file_backing
+                        .filter(|_| m.start < addr + total_size && addr < m.start + m.len)
+                        .map(|fb| (m.start, m.start + m.len, fb.fd, fb.offset))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // (frame_phys, fd, file_offset) for each unmapped page of a writable file VMA.
+    let mut writeback: alloc::vec::Vec<(u64, u32, u64)> = alloc::vec::Vec::new();
+
     {
         // SAFETY: current CR3 is the calling process's page table; this is the
         // same approach used by sys_linux_mmap.
@@ -11389,10 +11427,21 @@ pub(super) fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
                     // Skip the local TLB flush here — we batch a single shootdown
                     // (which includes a local invlpg) after the loop.
                     flush.ignore();
+                    let frame_phys = frame.start_address().as_u64();
                     if !is_device_frame {
                         // Only return system-RAM frames to the allocator after the
                         // batched shootdown has invalidated every stale translation.
-                        frames_to_free.push(frame.start_address().as_u64());
+                        frames_to_free.push(frame_phys);
+                    }
+                    // Phase 88 follow-up — queue this page for write-back if it
+                    // belongs to a file-backed MAP_SHARED writable mapping.
+                    if !writeback_vmas.is_empty() {
+                        for &(vs, ve, fd, foff) in &writeback_vmas {
+                            if page_addr >= vs && page_addr < ve {
+                                writeback.push((frame_phys, fd, foff + (page_addr - vs)));
+                                break;
+                            }
+                        }
                     }
                     unmapped_addrs.push(page_addr);
                 }
@@ -11430,6 +11479,30 @@ pub(super) fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
             crate::smp::tlb::tlb_shootdown_range(addr_space, range_start, range_end);
         }
     }
+    // Phase 88 follow-up — write dirty pages of file-backed MAP_SHARED writable
+    // mappings back to the file BEFORE the frames are freed. Runs after the
+    // page-table guard is released (kernel_write_fd_at may block on disk; holding
+    // the guard across a block is the Bug #9 hazard) and reads each frame
+    // physically through the phys-offset window (the unmapped vaddr is gone, but
+    // the frame is still allocated). The fd must still be open + writable — the
+    // common mmap/write/munmap/close order — else the write-back is skipped.
+    if !writeback.is_empty() {
+        let phys_off = crate::mm::phys_offset();
+        let mut page_buf = alloc::vec![0u8; 4096];
+        for (frame_phys, fd, file_off) in writeback {
+            // SAFETY: frame_phys is an allocated user mmap frame (not yet freed);
+            // read its 4096 bytes through the kernel's phys-offset window.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    (phys_off + frame_phys) as *const u8,
+                    page_buf.as_mut_ptr(),
+                    4096,
+                );
+            }
+            let _ = kernel_write_fd_at(pid, fd as usize, file_off as usize, &page_buf);
+        }
+    }
+
     for frame_phys in frames_to_free {
         crate::mm::frame_allocator::free_frame(frame_phys);
     }
@@ -12022,6 +12095,7 @@ pub(super) fn sys_framebuffer_mmap() -> u64 {
                 len: total_size,
                 prot: 3,                    // PROT_READ | PROT_WRITE
                 flags: 1 | FB_MAPPING_FLAG, // MAP_SHARED + internal FB marker
+                file_backing: None,         // framebuffer device mapping
             });
         });
         virt_addr
@@ -12263,6 +12337,7 @@ pub(super) fn sys_shm_map(shm_id_arg: u64) -> u64 {
                 len: total_size,
                 prot: 3, // PROT_READ | PROT_WRITE
                 flags: shm_vma_flags(id),
+                file_backing: None, // shared-memory mapping
             });
         });
         virt_addr
