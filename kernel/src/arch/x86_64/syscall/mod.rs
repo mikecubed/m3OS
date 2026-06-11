@@ -8273,7 +8273,6 @@ fn vfs_service_open(path: &str, flags: u64) -> u64 {
 
     let packed = reply.data[0];
     let handle = packed & 0xFFFF_FFFF;
-    let file_size = (packed >> 32) as u32;
 
     // Phase 88 Track B.1/D — the vfs_server returns the full stat header in the
     // reply bulk; parse it into the fd's metadata snapshot. This replaces the
@@ -8281,6 +8280,18 @@ fn vfs_service_open(path: &str, flags: u64) -> u64 {
     // cross-implementation coupling it introduced: fstat now reports the
     // vfs_server's own inode/mode/uid/gid/nlink/size/blocks/times, guaranteed to
     // match what `fstatat` (also served by the vfs_server) reports for the path.
+    //
+    // A successful (label==0) VFS_OPEN reply is contractually GUARANTEED to carry
+    // the stat header: `vfs_server::handle_open` only replies label==0 after
+    // `ipc_store_reply_bulk(&stat_header)` succeeds (otherwise it replies EIO).
+    // A missing/unparseable bulk here therefore means a protocol/version mismatch
+    // or a scheduler bug, not a normal open — so return EIO rather than silently
+    // seeding inode=0 (the 85d stat-identity defect this track exists to prevent).
+    // Our sole caller treats this EIO as a fall-back trigger and re-opens via the
+    // in-kernel ext2 engine (`open_resolved_path`), which builds a complete, real
+    // metadata snapshot — so no degraded inode=0 fd is ever constructed and the
+    // open transparently recovers. The committed server-side handle is abandoned
+    // on this should-never-happen path; that is strictly preferable to a bad fd.
     let meta = match scheduler::take_bulk_data(task_id)
         .ok_or(NEG_EIO)
         .and_then(|bulk| vfs_service_parse_stat_reply(&bulk))
@@ -8299,24 +8310,8 @@ fn vfs_service_open(path: &str, flags: u64) -> u64 {
             ctime: st.ctime,
         },
         Err(_) => {
-            // Unreachable in practice (handle_open always sends a valid header
-            // for a regular file). Defensive: seed a minimal snapshot from
-            // data[0] rather than failing the open — the read path only needs
-            // the handle. fstat then degrades to the pre-85d shape.
             log::warn!("[vfs] open reply missing/invalid stat header for {path}");
-            crate::process::VfsFileMeta {
-                inode: 0,
-                mode: 0x8000 | 0o444,
-                uid: 0,
-                gid: 0,
-                nlink: 1,
-                size: file_size as u64,
-                blksize: 4096,
-                blocks: 0,
-                atime: 0,
-                mtime: 0,
-                ctime: 0,
-            }
+            return NEG_EIO;
         }
     };
     let entry = FdEntry {
@@ -11441,13 +11436,15 @@ pub(super) fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
             crate::smp::tlb::tlb_shootdown_range(addr_space, range_start, range_end);
         }
     }
-    // Phase 88 follow-up — write dirty pages of file-backed MAP_SHARED writable
-    // mappings back to the file BEFORE the frames are freed. Runs after the
-    // page-table guard is released (kernel_write_fd_at may block on disk; holding
-    // the guard across a block is the Bug #9 hazard) and reads each frame
-    // physically through the phys-offset window (the unmapped vaddr is gone, but
-    // the frame is still allocated). The fd must still be open + writable — the
-    // common mmap/write/munmap/close order — else the write-back is skipped.
+    // Phase 88 follow-up — write file-backed MAP_SHARED writable mappings back to
+    // the file BEFORE the frames are freed. There is no per-page dirty-bit
+    // tracking: EVERY unmapped page of such a mapping is written back (correct, if
+    // conservative — a never-written page just rewrites identical bytes). Runs
+    // after the page-table guard is released (kernel_write_fd_at may block on
+    // disk; holding the guard across a block is the Bug #9 hazard) and reads each
+    // frame physically through the phys-offset window (the unmapped vaddr is gone,
+    // but the frame is still allocated). The fd must still be open + writable —
+    // the common mmap/write/munmap/close order — else the write-back is skipped.
     if !writeback.is_empty() {
         let phys_off = crate::mm::phys_offset();
         let mut page_buf = alloc::vec![0u8; 4096];
