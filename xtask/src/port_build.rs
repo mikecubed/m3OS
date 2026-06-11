@@ -441,10 +441,12 @@ fn build_recipe_id(name: &str) -> &'static str {
              CLANG_ENABLE_STATIC_ANALYZER/ARCMT=OFF;static;\
              DEFAULT_LINKER=lld;DEFAULT_RTLIB=compiler-rt;DEFAULT_CXX_STDLIB=libc++;\
              DEFAULT_UNWINDLIB=libunwind;DEFAULT_SYSROOT=/usr/lib/clang-sysroot;\
-             INSTALL_TOOLCHAIN_ONLY=ON);\
+             CLANG_CONFIG_FILE_SYSTEM_DIR=.;INSTALL_TOOLCHAIN_ONLY=ON);\
              install=install-clang,install-clang-resource-headers,install-lld;\
-             stage=resource-dir-builtins+bundled-usr-sysroot(musl+libc++)+clang++-symlink;\
-             recipe-v=1"
+             stage=resource-dir-builtins+bundled-usr-sysroot(musl+libc++)+clang++-symlink\
+             +static-clang.cfg(flagless -static default);\
+             seal-strip=skip-ET_REL(crt objects keep _start);\
+             recipe-v=2"
         }
         // Phase 86b — dropbear's static client-only build. The identity is the
         // `PROGRAMS=dbclient` single-program build + the no-zlib/no-harden
@@ -926,6 +928,27 @@ fn seal_package(name: &str, stage: &Path, key: &str) -> Result<(), String> {
     // headers, data) are left untouched so dependent links still resolve.
     strip_stage(stage);
 
+    // Phase 88 follow-up — guard the crt-strip regression by construction. The
+    // clang toolchain's relocatable crt objects (crt1.o etc.) must NEVER be
+    // stripped: `strip --strip-all` deletes their symbol table, removing `_start`
+    // from crt1.o, after which every clang link fails `cannot find entry symbol
+    // _start` and produces an unrunnable binary. `strip_stage` skips ET_REL
+    // objects to prevent this; verify the bundled sysroot's crt1.o still carries
+    // its symbols after the strip so a regression fails the seal, not the
+    // multi-hour in-OS gate.
+    if name == "llvm" {
+        let crt1 = stage
+            .join(LLVM_TGT_SYSROOT.trim_start_matches('/'))
+            .join("usr/lib/crt1.o");
+        if crt1.exists() && !binary_contains(&crt1, b"_start")? {
+            return Err(format!(
+                "seal_package(llvm): {} lost its `_start` symbol after strip — a crt \
+                 object was stripped (strip_stage must skip ET_REL relocatable objects)",
+                crt1.display()
+            ));
+        }
+    }
+
     let bytes =
         pkg_format::pack(stage).map_err(|e| format!("seal_package({name}): pack failed: {e}"))?;
 
@@ -975,12 +998,28 @@ fn strip_stage(dir: &Path) {
         if !path.is_file() {
             continue;
         }
-        let mut magic = [0u8; 4];
-        let is_elf = File::open(&path)
-            .and_then(|mut f| f.read(&mut magic))
-            .map(|n| n == 4 && &magic == b"\x7fELF")
-            .unwrap_or(false);
-        if is_elf {
+        // Read enough of the ELF header to check both the magic and e_type
+        // (offset 16, u16, little-endian on x86_64). `strip` defaults to
+        // `--strip-all`, which removes the *symbol table*. That is fine for final
+        // executables / shared objects (ET_EXEC / ET_DYN) but CATASTROPHIC for
+        // relocatable objects (ET_REL = 1, e.g. the musl/compiler-rt crt objects
+        // crt1.o / crti.o / crtbegin.o): stripping them deletes the symbols the
+        // LINKER needs — most importantly `_start` from crt1.o — so every
+        // subsequent link fails with `ld.lld: cannot find entry symbol _start`
+        // and produces an unrunnable binary. (.a archives are skipped already:
+        // their `!<arch>` magic is not ELF.) Never strip ET_REL.
+        let mut hdr = [0u8; 18];
+        let n = File::open(&path)
+            .and_then(|mut f| f.read(&mut hdr))
+            .unwrap_or(0);
+        let is_elf = n >= 18 && &hdr[0..4] == b"\x7fELF";
+        const ET_REL: u16 = 1;
+        let e_type = if is_elf {
+            u16::from_le_bytes([hdr[16], hdr[17]])
+        } else {
+            0
+        };
+        if is_elf && e_type != ET_REL {
             let _ = Command::new("strip")
                 .arg(&path)
                 .stdout(Stdio::null())
@@ -3466,6 +3505,12 @@ fn build_llvm(
         .arg("-DCLANG_DEFAULT_CXX_STDLIB=libc++")
         .arg("-DCLANG_DEFAULT_UNWINDLIB=libunwind")
         .arg(format!("-DDEFAULT_SYSROOT={LLVM_TGT_SYSROOT}"))
+        // Search the clang executable's OWN directory for default config files
+        // (`clang.cfg` / `clang++.cfg`). A relative value is resolved against the
+        // binary dir, so this is relocation-safe (the resource-dir contract). The
+        // staged config files (assemble_llvm_stage) force `-static` so a bare
+        // `clang hello.c` produces a runnable static binary on m3OS.
+        .arg("-DCLANG_CONFIG_FILE_SYSTEM_DIR=.")
         .arg("-DLLVM_INSTALL_TOOLCHAIN_ONLY=ON");
     run(&mut cfg, "llvm configure")?;
 
@@ -3603,6 +3648,23 @@ fn assemble_llvm_stage(sysroot: &Path, stage: &Path) -> Result<(), String> {
         std::os::unix::fs::symlink("clang", &clangxx)
             .map_err(|e| format!("symlink clang++: {e}"))?;
     }
+
+    // Static-by-default config files. m3OS runs ONLY static binaries — its
+    // `ld-musl` is a custom loader with no real `libc.so`, so a dynamic (PIE)
+    // executable faults at startup with `DT_NEEDED not found: libc.so`. clang
+    // defaults to a dynamic/PIE link for `*-linux-musl`, so a bare `clang
+    // hello.c` would produce an unrunnable binary. These config files (loaded
+    // because the build bakes `-DCLANG_CONFIG_FILE_SYSTEM_DIR=.` → clang searches
+    // its own bin dir for `<mode>.cfg`) prepend `-static` so the FLAGLESS driver
+    // produces a runnable static ELF — the in-design "bare clang works on m3OS"
+    // contract. `-static` is a no-op for compile-only / query invocations.
+    let cfg_body = "# m3OS default: link statically. m3OS has no real libc.so /\n\
+                    # dynamic C runtime, so a dynamic executable cannot run. See\n\
+                    # ports/lang/llvm/Portfile + assemble_llvm_stage.\n\
+                    -static\n";
+    for cfg in ["clang.cfg", "clang++.cfg"] {
+        fs::write(bin.join(cfg), cfg_body).map_err(|e| format!("write {cfg}: {e}"))?;
+    }
     Ok(())
 }
 
@@ -3646,6 +3708,21 @@ fn validate_staged_clang(stage: &Path) -> Result<(), String> {
         .arg("-o")
         .arg(&c_out);
     run(&mut cc, "llvm validate: clang compile h.c")?;
+    // Phase 88 follow-up — the bare `clang` invocation above passes NO -static, so
+    // a runnable output proves the staged `clang.cfg` static default took effect.
+    // A dynamic output (PT_INTERP → /lib/ld-musl…) cannot run on m3OS (no real
+    // libc.so), so its absence is the by-construction proof — the same guard the
+    // dropbear/python ports use. This also guards the crt-strip regression: a
+    // re-stripped crt1.o makes the link fail outright (caught by the compile
+    // step), and an intact-but-dynamic default is caught here.
+    if binary_contains(&c_out, b"/lib/ld-musl-x86_64.so.1")? {
+        return Err(format!(
+            "llvm validate: {} references the dynamic loader — the static-by-default \
+             clang.cfg did not take effect (m3OS has no libc.so; a dynamic clang \
+             output cannot run on-device)",
+            c_out.display()
+        ));
+    }
     run(&mut Command::new(&c_out), "llvm validate: run C binary")?;
 
     // C++: clang++ h.cpp -o h_cpp && run (links the self-contained libc++).
@@ -3656,6 +3733,13 @@ fn validate_staged_clang(stage: &Path) -> Result<(), String> {
         .arg("-o")
         .arg(&cpp_out);
     run(&mut cxx, "llvm validate: clang++ compile h.cpp")?;
+    if binary_contains(&cpp_out, b"/lib/ld-musl-x86_64.so.1")? {
+        return Err(format!(
+            "llvm validate: {} references the dynamic loader — the static-by-default \
+             clang++.cfg did not take effect (m3OS has no libc.so)",
+            cpp_out.display()
+        ));
+    }
     run(&mut Command::new(&cpp_out), "llvm validate: run C++ binary")?;
 
     println!("llvm: staged clang validated (C + C++ compile/link/run via bundled sysroot)");
