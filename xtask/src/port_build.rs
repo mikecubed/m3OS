@@ -535,9 +535,10 @@ fn build_recipe_id(name: &str) -> &'static str {
         // folded separately via `host_cxx_toolchain_id()` in `compute_port_key`.
         "node" => {
             "node-configure:--fully-static --enable-static --dest-cpu=x64 \
-             --dest-os=linux --with-intl=small-icu --v8-lite-mode --openssl-no-asm \
-             --without-corepack --without-node-snapshot --without-inspector;\
-             single-toolset;make-generator;cxxstdlib=libc++-musl;recipe-v=3"
+             --dest-os=linux --with-intl=small-icu --v8-options=--jitless \
+             --openssl-no-asm --without-corepack --without-node-snapshot \
+             --without-inspector;single-toolset;make-generator;wasm-in-jitless;\
+             cxxstdlib=libc++-musl;recipe-v=4"
         }
         _ => "",
     }
@@ -3646,7 +3647,16 @@ fn build_node(port_src: &Path, stage: &Path, port_dir: &Path) -> Result<(), Stri
         "--fully-static",
         "--enable-static",
         "--with-intl=small-icu",
-        "--v8-lite-mode",
+        // Jitless via `--v8-options=--jitless`, NOT `--v8-lite-mode`. Both make
+        // V8 allocate zero runtime executable memory (Ignition-only, no
+        // RWX/JIT → W^X-clean), but `--v8-lite-mode` ALSO sets
+        // `v8_enable_webassembly=false`, and Node 22 unconditionally passes its
+        // default `--experimental-wasm-imported-strings`/`-memory64`/`-exnref`
+        // V8 flags at startup → a WASM-less V8 rejects them as a fatal "bad
+        // option" (exit 9) before `node --version` ever prints. Keeping WASM
+        // compiled in makes V8 recognise those flags (then `--jitless` renders
+        // them inert), so node starts cleanly while staying W^X-safe.
+        "--v8-options=--jitless",
         // NB: NOT `--ninja`. V8's gyp emits `v8_inspector_headers` for BOTH the
         // host and target toolsets, both writing the same arch-independent
         // `gen/.../js_protocol.stamp` (Node's `--without-inspector` disables

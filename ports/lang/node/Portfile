@@ -26,13 +26,17 @@ MAINTAINER=m3os
 # V8 / W^X model — the crux of the phase. m3OS forbids `PROT_WRITE|PROT_EXEC`
 # (W^X; the green `wx-violation` gate). Modern V8 REMOVED the old `mprotect`
 # RW↔RX "write-protected code memory" JIT mechanism; it is now PKU-or-RWX,
-# neither of which m3OS allows. So this port ships **`--v8-lite-mode` (jitless)**
-# as the PRIMARY supported config: V8 allocates ZERO runtime executable memory
-# (all JS runs through the Ignition interpreter; builtins are embedded RX in the
-# binary's `.text` by the normal ELF loader), so it never requests an
-# `mprotect(W|X)` mapping. PKU-backed JIT is a tracked follow-up (needs a kernel
-# MPK/`pkey_mprotect` story). See build_node in xtask/src/port_build.rs and the
-# learning doc docs/89-nodejs.md for the full configure recipe and non-goals.
+# neither of which m3OS allows. So this port ships jitless V8 via
+# **`--v8-options=--jitless`** as the PRIMARY supported config: V8 allocates ZERO
+# runtime executable memory (all JS runs through the Ignition interpreter;
+# builtins are embedded RX in the binary's `.text` by the normal ELF loader), so
+# it never requests an `mprotect(W|X)` mapping. (NOT `--v8-lite-mode`: that also
+# compiles WASM OUT, but Node 22 unconditionally passes default
+# `--experimental-wasm-*` V8 flags at startup that a WASM-less V8 rejects as a
+# fatal "bad option" before `node --version` prints; keeping WASM compiled in +
+# `--jitless` makes node start cleanly while staying W^X-safe.) PKU-backed JIT is
+# a tracked follow-up (needs a kernel MPK/`pkey_mprotect` story). See build_node
+# in xtask/src/port_build.rs and docs/89-nodejs.md for the full recipe + non-goals.
 #
 # Intl — `--with-intl=small-icu` (en-US bundled; `Intl`/`Intl.NumberFormat`
 # work, artifact stays lean). npm/npx are kept (bundled JS in lib/node_modules).

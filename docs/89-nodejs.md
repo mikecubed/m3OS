@@ -20,7 +20,7 @@ once into RX pages and stay there. Node's V8 engine historically wrote machine
 code into RW pages, flipped them executable via `mprotect`, and ran them hot.
 Modern V8 removed that flip-based model — it now wants either PKU-backed
 memory keys or RWX pages — and m3OS forbids RWX. Phase 89 resolves this by
-building V8 in **jitless mode** (`--v8-lite-mode`): all JavaScript runs through
+building V8 in **jitless mode** (`--v8-options=--jitless`): all JavaScript runs through
 the Ignition interpreter, V8 builtins are embedded RX in the binary's `.text`
 at link time, and zero executable memory is allocated at runtime. The W^X
 property is satisfied by construction.
@@ -64,15 +64,26 @@ plain `mprotect`) was **removed from V8** before Node 22 shipped. There is no
 currently-supported V8 GN flag to restore it. This means a default-configured
 Node binary on m3OS would segfault on the first JavaScript execution.
 
-The resolution is `--v8-lite-mode` (Node's `./configure` flag), which sets
-`v8_enable_lite_mode=true`. Under Lite Mode:
+The resolution is **`--v8-options=--jitless`** (Node's `./configure` flag bakes
+`--jitless` as a default V8 option). Under jitless mode:
 - V8 uses the **Ignition interpreter** exclusively for all JS execution.
-- TurboFan and Maglev (the optimizing JITs) are compiled out.
+- TurboFan and Maglev (the optimizing JITs) never allocate executable memory.
 - V8 builtins (the built-in JavaScript functions and the interpreter dispatch
   table) are embedded as **read-execute data in the binary's `.text` segment**
   during the build's `mksnapshot` step — not allocated at runtime.
-- WebAssembly is disabled (`v8_enable_webassembly=false`), since WASM requires
-  a JIT to emit machine code.
+- WebAssembly is unavailable at runtime (WASM requires a JIT), though the WASM
+  support is still *compiled into* V8 (see the as-built note below).
+
+> **As-built note — why `--v8-options=--jitless`, not `--v8-lite-mode`.** The
+> two are equivalent for W^X (both make V8 allocate zero runtime executable
+> memory), and `--v8-lite-mode` was the first choice. But `--v8-lite-mode` also
+> sets `v8_enable_webassembly=false`, compiling WASM *out* of V8 — and Node 22
+> unconditionally passes its default `--experimental-wasm-imported-strings` /
+> `-memory64` / `-exnref` V8 flags at startup. A WASM-less V8 rejects those as a
+> fatal "bad option" (exit 9) *before `node --version` prints*. Keeping WASM
+> compiled in (the default, no lite-mode) makes V8 recognise the flags, and
+> `--jitless` then renders WASM inert — so node starts cleanly **and** stays
+> W^X-safe. This was found by running the musl-static binary on the build host.
 
 The result: `node` starts, interprets JavaScript, and never calls
 `mprotect(PROT_EXEC)` on a page it controls. The W^X property holds without
@@ -138,7 +149,7 @@ Key `./configure` flags:
 | Flag | Reason |
 |---|---|
 | `--fully-static` | No `PT_INTERP`; disables `dlopen`; loaderless contract like CPython/Go/Clang |
-| `--v8-lite-mode` | Jitless V8; W^X safe; the primary W^X config (see above) |
+| `--v8-options=--jitless` | Jitless V8 (zero runtime executable memory); W^X safe; the primary W^X config (see above). NOT `--v8-lite-mode` — that removes WASM, which aborts Node 22 startup |
 | `--with-intl=small-icu` | Bundles en-US ICU data into the binary; `Intl.NumberFormat('en-US')` works |
 | `--cross-compiling` | GYP honors the `CC_host`/`CXX_host` split even on same-arch |
 | `--without-inspector` | Drops the `--inspect`/DevTools C++ surface (documented non-goal) |
@@ -223,7 +234,7 @@ tens of minutes). When `clang`/`cmake`/`ninja` are absent on the host,
   cross-core SMP races during bring-up. Multi-core `worker_threads` semantics
   are a follow-up.
 - WASM is explicitly disabled by `v8_enable_webassembly=false` (a side-effect of
-  `--v8-lite-mode`). A WASM engine for m3OS would need either a different
+  `--jitless`). A WASM engine for m3OS would need either a different
   runtime (wasmtime, wasmer) or PKU-backed JIT in V8.
 - Phase 90 (Claude Code) is the consumer of the npm path delivered in Track D.
   Phase 89 proves the path works; Phase 90 exercises it end-to-end with a real
@@ -242,8 +253,9 @@ tens of minutes). When `clang`/`cmake`/`ninja` are absent on the host,
 - **PKU-backed JIT** — V8 TurboFan with `pkey_mprotect` / Intel MPK; requires
   a kernel `pkey_alloc`/`pkey_mprotect` story. The jitless config is the shipped
   deliverable; JIT is the tracked follow-up.
-- **WebAssembly** — disabled by `--v8-lite-mode` (`v8_enable_webassembly=false`);
-  needs either a standalone WASM runtime or PKU-backed V8.
+- **WebAssembly** — compiled into V8 but inert at runtime under `--jitless`
+  (WASM needs a JIT to emit machine code); needs PKU-backed V8 or a standalone
+  WASM runtime to actually run.
 - **Native addons / `node-gyp`** — requires on-device C++ compilation and
   `dlopen`; `--fully-static` disables `dlopen` by design.
 - **`--inspect` / Chrome DevTools protocol** — dropped via `--without-inspector`;

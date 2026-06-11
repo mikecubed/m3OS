@@ -9,7 +9,7 @@
 > [Phase 89 task list](./roadmap/tasks/89-nodejs-tasks.md) are authoritative.
 >
 > **As-built decisions (Phase 89):** Node.js v22.22.3 LTS; fully-static musl
-> binary (no `PT_INTERP`, `dlopen` disabled); V8 `--v8-lite-mode` (jitless,
+> binary (no `PT_INTERP`, `dlopen` disabled); V8 `--v8-options=--jitless` (jitless,
 > Ignition interpreter only — the `mprotect` RW↔RX JIT path was removed from
 > modern V8; PKU-backed JIT is the tracked follow-up); `--with-intl=small-icu`
 > (en-US bundled); all deps bundled (OpenSSL, zlib, c-ares, nghttp2, ICU, etc.);
@@ -117,7 +117,9 @@ would be the primary shipped configuration. That model was **removed from
 V8** before Node 22. Modern V8 uses Intel PKU (`pkey_mprotect`) where
 available, or falls back to RWX pages — neither of which m3OS supports.
 
-Phase 89 resolves this by building with `--v8-lite-mode`:
+Phase 89 resolves this by building jitless via `--v8-options=--jitless` (NOT
+`--v8-lite-mode`, which removes WASM and aborts Node 22's startup on its default
+`--experimental-wasm-*` flags — keeping WASM compiled-in + `--jitless` starts clean):
 
 - V8 runs in **Ignition interpreter** mode only (no TurboFan/Maglev JIT).
 - V8 builtins are embedded RX in `.text` at build time (via `mksnapshot`).
@@ -217,7 +219,7 @@ python3 configure.py \
   --fully-static \
   --enable-static \
   --with-intl=small-icu \
-  --v8-lite-mode \
+  --v8-options=--jitless \
   --ninja \
   --openssl-no-asm \
   --without-corepack \
@@ -358,7 +360,7 @@ never be CI-bound — it is skip-with-reason when unset, mirroring
   on-device C++ toolchain contract.
 - **Inspector / `--inspect`** — dropped via `--without-inspector`; not needed
   for the Claude Code use case.
-- **WebAssembly** — disabled by `--v8-lite-mode`; needs PKU-backed V8 or a
+- **WebAssembly** — compiled in but inert under `--jitless`; needs PKU-backed V8 or a
   separate WASM runtime.
 - **RWX JIT** — forbidden by m3OS W^X policy; PKU-backed TurboFan JIT is the
   tracked follow-up.
