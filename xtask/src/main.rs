@@ -12793,11 +12793,10 @@ fn tui_smoke_steps() -> Vec<SmokeStep> {
             input,
             label: "guest/tui-smoke: send subcommand",
         });
-        // `fail` is a `&&str` (iterated from a `&'static [(..., &str)]`);
-        // deref once to get a `&'static str`, then wrap into a
-        // `&'static [&'static str]` by leaking a single-element box.
-        let fail_str: &'static str = *fail;
-        let fail_prefixes: &'static [&'static str] = Box::leak(Box::new([fail_str]));
+        // `fail` is a `&&'static str` (iterated from a `&'static [(..., &str)]`);
+        // `slice::from_ref` borrows it as a single-element `&'static [&'static str]`
+        // with no allocation — the table is `'static`, so the slice is too.
+        let fail_prefixes: &'static [&'static str] = std::slice::from_ref(fail);
         steps.push(SmokeStep::WaitPassOrFail {
             pass_pattern: pass,
             fail_prefixes,
@@ -14371,11 +14370,10 @@ fn termios_smoke_steps() -> Vec<SmokeStep> {
             input,
             label: "guest/tcsmoke: send subcommand",
         });
-        // `fail` is a `&&str` (iterated from a `&'static [(..., &str)]`);
-        // deref once to get a `&'static str`, then wrap into a
-        // `&'static [&'static str]` by leaking a single-element box.
-        let fail_str: &'static str = *fail;
-        let fail_prefixes: &'static [&'static str] = Box::leak(Box::new([fail_str]));
+        // `fail` is a `&&'static str` (iterated from a `&'static [(..., &str)]`);
+        // `slice::from_ref` borrows it as a single-element `&'static [&'static str]`
+        // with no allocation — the table is `'static`, so the slice is too.
+        let fail_prefixes: &'static [&'static str] = std::slice::from_ref(fail);
         steps.push(SmokeStep::WaitPassOrFail {
             pass_pattern: pass,
             fail_prefixes,

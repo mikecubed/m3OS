@@ -892,23 +892,34 @@ fn verify_stat_identity() -> Result<(), i32> {
         return Err(fail("stat-identity", "fstat != stat field mismatch", 85));
     }
 
-    // (2) A tmpfs file and the ext2 file must not share st_dev.
+    // (2) A tmpfs file and the ext2 file must not share st_dev. `/tmp` is a
+    // required part of the smoke flow, so a failed create/stat must FAIL the
+    // gate rather than silently skip the Track B.2 distinct-st_dev check.
     let traw = open(STAT_ID_TMP, O_CREAT | O_WRONLY | O_TRUNC, 0o644);
-    if traw >= 0 {
-        let tfd = traw as i32;
-        let _ = write(tfd, b"x");
-        close(tfd);
-        let mut tmp_stat = Stat::zeroed();
-        let rc = stat(STAT_ID_TMP, &mut tmp_stat);
-        let _ = unlink(STAT_ID_TMP);
-        if rc >= 0 && tmp_stat.st_dev == by_path.st_dev {
-            return Err(fail("stat-identity", "tmpfs and ext2 share st_dev", 86));
-        }
+    if traw < 0 {
+        return Err(fail("stat-identity", "open /tmp probe failed", 90));
+    }
+    let tfd = traw as i32;
+    let _ = write(tfd, b"x");
+    close(tfd);
+    let mut tmp_stat = Stat::zeroed();
+    let rc = stat(STAT_ID_TMP, &mut tmp_stat);
+    let _ = unlink(STAT_ID_TMP);
+    if rc < 0 {
+        return Err(fail("stat-identity", "stat /tmp probe failed", 91));
+    }
+    if tmp_stat.st_dev == by_path.st_dev {
+        return Err(fail("stat-identity", "tmpfs and ext2 share st_dev", 86));
     }
 
-    // (3) getdents64 d_ino must equal stat st_ino for the same entry.
+    // (3) getdents64 d_ino must equal stat st_ino for the same entry. `/etc`
+    // is required infrastructure (it holds passwd), so a failed open must FAIL
+    // the gate rather than silently skip the Track B.3 d_ino check.
     let draw = open(STAT_ID_DIR, O_RDONLY | O_DIRECTORY, 0);
-    if draw >= 0 {
+    if draw < 0 {
+        return Err(fail("stat-identity", "open /etc dir failed", 92));
+    }
+    {
         let dfd = draw as i32;
         let mut dbuf = [0u8; 4096];
         let mut found = false;

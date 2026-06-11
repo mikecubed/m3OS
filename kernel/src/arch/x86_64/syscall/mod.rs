@@ -11079,6 +11079,13 @@ fn sys_mmap_file_backed(
     if len == 0 || fd >= crate::process::MAX_FDS {
         return NEG_EINVAL;
     }
+    // POSIX mmap(2): the file offset must be a multiple of the page size.
+    // A misaligned offset would make both the per-page read offsets
+    // (`file_offset + i*4096`) and the `FileBacking` write-back offset
+    // ill-defined, so reject it up front like Linux/x86_64 does.
+    if file_offset & 0xFFF != 0 {
+        return NEG_EINVAL;
+    }
 
     let pages = len.div_ceil(4096);
     let total_size = match pages.checked_mul(4096) {
