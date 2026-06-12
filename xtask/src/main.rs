@@ -15300,15 +15300,16 @@ fn node_smoke_steps(attempt_net: bool, fast_iter: bool, egress_url: &str) -> Vec
     // (npm presence is asserted host-side by `assert_node_layout` — it requires
     // `usr/bin/npm` in the staged tree before sealing the `.m3pkg`.)
 
-    // Phase 89 — `#!` shebang exec proof (always-on, no network). node writes a
-    // tiny script whose interpreter is `/bin/echo`; running it forces the kernel
-    // to re-exec `/bin/echo` with argv `[/bin/echo, SHEBANG__OK, /tmp/sbt, arg]`,
-    // so the sentinel prints. This is the launch path npm's `#!/usr/bin/env node`
-    // wrapper rides. Sentinels are concat-built so the Wait keys on real output,
-    // not the command echo. (Uses node only because it's already on the disk.)
+    // Phase 89 — `#!` shebang exec proof (always-on, no network). node writes two
+    // scripts in one shot: `/tmp/sbt` (`#!/bin/echo …`, the bare-interpreter case)
+    // and `/tmp/sbe` (`#!/usr/bin/env cat …`, the `/usr/bin/env` case npm's
+    // `#!/usr/bin/env node` wrapper rides — exercising the staged /usr/bin/env +
+    // PATH lookup of `cat`). Running each forces the kernel to re-exec the
+    // interpreter with the rewritten argv so the sentinel prints. Sentinels are
+    // concat-built so the Wait keys on real output, not the command echo.
     steps.push(SmokeStep::Send {
-        input: "node -e \"require('fs').writeFileSync('/tmp/sbt','#!/bin/echo '+'SHEBANG'+'__OK\\n',{mode:0o755});console.log('SB'+'WRITTEN')\"\n",
-        label: "node-smoke: write a #! shebang script",
+        input: "node -e \"const f=require('fs');f.writeFileSync('/tmp/sbt','#!/bin/echo '+'SHEBANG'+'__OK\\n',{mode:0o755});f.writeFileSync('/tmp/sbe','#!/usr/bin/env cat\\nENVCAT'+'MARKER_OK\\n',{mode:0o755});console.log('SB'+'WRITTEN')\"\n",
+        label: "node-smoke: write #! shebang scripts (/bin/echo + /usr/bin/env)",
     });
     steps.push(SmokeStep::Wait {
         pattern: "SBWRITTEN",
@@ -15317,12 +15318,21 @@ fn node_smoke_steps(attempt_net: bool, fast_iter: bool, egress_url: &str) -> Vec
     });
     steps.push(SmokeStep::Send {
         input: "/tmp/sbt shebang-arg\n",
-        label: "node-smoke: run the #! shebang script",
+        label: "node-smoke: run the /bin/echo #! script",
     });
     steps.push(SmokeStep::Wait {
         pattern: "SHEBANG__OK",
         timeout_secs: 60,
-        label: "node-smoke: shebang interpreter re-exec works (SHEBANG__OK)",
+        label: "node-smoke: bare-interpreter shebang re-exec works (SHEBANG__OK)",
+    });
+    steps.push(SmokeStep::Send {
+        input: "/tmp/sbe\n",
+        label: "node-smoke: run the /usr/bin/env #! script",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "ENVCATMARKER_OK",
+        timeout_secs: 60,
+        label: "node-smoke: /usr/bin/env shebang resolves + finds cat (ENVCATMARKER_OK)",
     });
 
     // 7. Opt-in network arms (M3OS_NODE_NET=1): a real HTTPS cert-validate +
@@ -19134,6 +19144,24 @@ fn populate_ext2_files(
         }
     }
 
+    // Phase 89 — stage the `env` coreutil at `/usr/bin/env` so `#!/usr/bin/env
+    // <interp>` shebangs resolve (npm's `#!/usr/bin/env node`, python's
+    // `#!/usr/bin/env python3`, …). `/usr/bin` is NOT in the base image (the pkg
+    // installer creates it for node at install time, and its `mkdir` ignores
+    // EEXIST so pre-creating it here is safe), and PATH already lists `/usr/bin`,
+    // so `env` then finds the named interpreter. The builder has no symlink op, so
+    // this is a copy of the same `env` ELF the ramdisk serves at `/bin/env`.
+    let env_bin = workspace_root().join("target/generated-initrd/env");
+    let env_bin_cmds = if env_bin.exists() {
+        format!(
+            "mkdir usr/bin\nsif usr/bin mode 0x41ED\nsif usr/bin uid 0\nsif usr/bin gid 0\n\
+             write \"{src}\" usr/bin/env\nsif usr/bin/env mode 0x81ED\nsif usr/bin/env uid 0\nsif usr/bin/env gid 0\n",
+            src = env_bin.display(),
+        )
+    } else {
+        String::new()
+    };
+
     // Phase 69 Track A — compile the `m3os-term` terminfo entry so a binary
     // copy can be staged at `/usr/share/terminfo/m/m3os-term` inside the
     // data disk. Returns the path to the compiled `m3os-term` file. Treats
@@ -19916,6 +19944,7 @@ fn populate_ext2_files(
          sif usr uid 0\n\
          sif usr gid 0\n\
          {shared_libs_cmds}\
+         {env_bin_cmds}\
          mkdir usr/share\n\
          sif usr/share mode 0x41ED\n\
          sif usr/share uid 0\n\

@@ -261,13 +261,24 @@ PASSES** (validated under `M3OS_KVM=1`, ~30 s once booted).
 > JS files over the ~200 KB/s ring-3 VFS (jitless V8) is impractically slow; that
 > is a VFS-throughput limit, not a TLS gap.
 
-> **`#!` shebang exec (a fourth kernel addition).** `execve` gained Linux
-> `binfmt_script` support: a file beginning `#!interp [arg]` re-execs the
-> interpreter with argv rewritten to `[interp, arg?, script_path, original
-> argv[1..]]`, looping (bounded by `ELOOP`) so an interpreter that is itself a
-> script also resolves. Without it, running a script (e.g. npm's
-> `#!/usr/bin/env node` wrapper) returned `ENOEXEC`. Proven always-on by the
-> `node-smoke` `SHEBANG__OK` arm (a `#!/bin/echo` script re-execs `/bin/echo`).
+> **`#!` shebang exec + `/usr/bin/env` (the npm launcher chain).** Three pieces
+> make npm's `#!/usr/bin/env node` wrapper launchable:
+> 1. **Kernel `binfmt_script`.** `execve` now re-execs a `#!interp [arg]` script's
+>    interpreter with argv rewritten to `[interp, arg?, script_path, original
+>    argv[1..]]`, looping (bounded by `ELOOP`) so an interpreter that is itself a
+>    script also resolves. Without it, any script returned `ENOEXEC`.
+> 2. **`/usr/bin/env` staged.** The `env` coreutil is copied to `/usr/bin/env` in
+>    the base image (it was only at `/bin/env`; the builder has no symlink op, and
+>    the pkg installer's `mkdir` ignores `EEXIST` so pre-creating `/usr/bin` is
+>    safe). `#!/usr/bin/env <interp>` now resolves the path.
+> 3. **`env` runs the command.** m3OS's `env` previously only *printed* the
+>    environment — it ignored `env COMMAND [args]`. It now implements that form:
+>    apply leading `NAME=VALUE`, then PATH-search and exec the command with the
+>    inherited environment (the `exec_with_path_search` helper, shared with
+>    `xargs`). So `/usr/bin/env node …` actually finds + runs `node`.
+> Proven always-on by the `node-smoke` `SHEBANG__OK` (a `#!/bin/echo` script
+> re-execs `/bin/echo`) and `ENVCATMARKER_OK` (a `#!/usr/bin/env cat` script:
+> staged `/usr/bin/env` PATH-finds `cat` and runs it) arms.
 
 The gate is wired opt-in via `M3OS_NODE_REGRESSION=1` at `--timeout 5400`
 (much faster under `M3OS_KVM=1`, which the gate honors; `M3OS_NODE_FAST_ITER`
