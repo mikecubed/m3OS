@@ -247,10 +247,11 @@ pub struct TaskBlockState {
 ///
 /// Required alignment is 64 bytes (Intel SDM Vol 1 §13.4).
 ///
-/// The static size [`crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE`] (832 bytes)
-/// is checked at boot against the runtime CPUID-reported size; if a future
-/// CPUID change ever reports a larger area, the kernel panics at boot rather
-/// than silently truncating saved state.
+/// The static size [`crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE`] (832 bytes
+/// legacy x87+SSE+AVX; 2752 bytes with PKRU component 9) is checked at boot
+/// against the runtime CPUID-reported size; if the static buffer is ever too
+/// small for the enabled XCR0 mask, the kernel panics at boot rather than
+/// silently truncating saved state.
 #[derive(Clone, Copy)]
 #[repr(C, align(64))]
 pub struct XSaveArea {

@@ -12023,7 +12023,7 @@ pub(super) fn sys_meminfo(buf_addr: u64, buf_len: u64) -> u64 {
     fmt_slab(&mut writer, "endpt(128B)", &slabs.endpoint);
     fmt_slab(&mut writer, "pipe(4KiB)", &slabs.pipe);
     fmt_slab(&mut writer, "sock(256B)", &slabs.socket);
-    fmt_slab(&mut writer, "xsave(832B)", &slabs.xsave);
+    fmt_slab(&mut writer, "xsave     ", &slabs.xsave);
     if heap.size_class_active {
         let _ = writeln!(writer);
         let _ = writeln!(writer, "Size Classes (slab backing):");
