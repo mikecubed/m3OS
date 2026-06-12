@@ -314,7 +314,7 @@ Concrete LOC estimates are rough; refer to each phase doc for full scope.
 - **[Phase 85 — Cross-Compiled Toolchains](../../roadmap/85-cross-compiled-toolchains.md)** — git, Python, Clang. tcc covers 1.0.
 - **[Phase 86 — Networking and GitHub](../../roadmap/86-networking-and-github.md)**
 - **[Phase 89 — Node.js](../../roadmap/89-nodejs.md)** — depends on Phase 76 (dynamic linker).
-- **[Phase 90 — Claude Code](../../roadmap/90-claude-code.md)**
+- **[Phase 90 — Claude Code](../../roadmap/90b-claude-code.md)**
 - **[Phase 91 — IPv6 / DHCPv6](../../roadmap/91-ipv6-dhcpv6.md)**
 
 Optional pre-1.0 (defer if the rest slips):

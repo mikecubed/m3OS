@@ -6,7 +6,7 @@
 > `FUTEX_REQUEUE`/`FUTEX_CMP_REQUEUE`); its **Stage 2 (live HTTPS + `npm install`
 > over the real internet)** is the remaining opt-in part of Track D
 > (`M3OS_NODE_NET=1`, real egress only) and the
-> prerequisite for [Phase 90 — Claude Code](./roadmap/90-claude-code.md).
+> prerequisite for [Phase 90 — Claude Code](./roadmap/90b-claude-code.md).
 > Where this historical doc and the live phase docs disagree, the
 > [Phase 89 design doc](./roadmap/89-nodejs.md) and
 > [Phase 89 task list](./roadmap/tasks/89-nodejs-tasks.md) are authoritative.
