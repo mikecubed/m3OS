@@ -4,7 +4,7 @@
 //!   `#[path = "common.rs"] mod common;`
 //! and uses the helpers without any Cargo.toml changes.
 
-use syscall_lib::{STDERR_FILENO, STDOUT_FILENO, write};
+use syscall_lib::{O_RDONLY, STDERR_FILENO, STDOUT_FILENO, close, execve, open, read, write};
 
 /// Write all bytes in `data` to `fd`, retrying on short writes.
 #[allow(dead_code)]
@@ -134,6 +134,103 @@ pub fn build_nul_path(buf: &mut [u8], parts: &[&[u8]]) -> Option<usize> {
     }
     buf[pos] = 0;
     Some(pos + 1)
+}
+
+/// Try to exec `cmd` (NUL-terminated) by PATH search. If `cmd` contains '/', exec
+/// it directly. On failure (all attempts return), this returns without executing
+/// anything. The command inherits `argv`/`envp` verbatim.
+///
+/// `path` selects the search PATH:
+/// * `None` — inherit: read `PATH=` from `/proc/self/environ` (the caller's own
+///   environment). This is what `xargs` passes.
+/// * `Some(p)` with `p` non-empty — an explicit search PATH (e.g. `env`'s
+///   `PATH=…` assignment, which must override the inherited one per POSIX).
+/// * `Some(b"")` — no PATH at all (e.g. `env -i` cleared it) → use only the
+///   `/bin:/usr/bin` default fallback; do NOT consult `/proc/self/environ`.
+///
+/// Shared by `env` (passes an explicit/empty PATH for assignment / `-i`
+/// semantics) and `xargs` (passes `None`).
+#[allow(dead_code)]
+pub fn exec_with_path_search(
+    cmd: &[u8],
+    argv: &[*const u8],
+    envp: &[*const u8],
+    path: Option<&[u8]>,
+) {
+    if cmd.contains(&b'/') {
+        execve(cmd, argv, envp);
+        return;
+    }
+    let cmd_name = if cmd.last() == Some(&0) {
+        &cmd[..cmd.len().saturating_sub(1)]
+    } else {
+        cmd
+    };
+
+    // Resolve the search PATH bytes. `env_buf` backs the inherited (`None`) case.
+    let mut env_buf = [0u8; 4096];
+    let path_val: &[u8] = match path {
+        Some(p) => p,
+        None => {
+            // Read PATH from /proc/self/environ (NUL-separated KEY=VALUE entries).
+            let mut path_off = 0usize;
+            let mut path_len = 0usize;
+            let fd = open(b"/proc/self/environ\0", O_RDONLY, 0);
+            if fd >= 0 {
+                let n = read(fd as i32, &mut env_buf);
+                close(fd as i32);
+                if n > 0 {
+                    let data = &env_buf[..n as usize];
+                    let mut i = 0;
+                    while i < data.len() {
+                        let end = data[i..]
+                            .iter()
+                            .position(|&b| b == 0)
+                            .map(|p| i + p)
+                            .unwrap_or(data.len());
+                        if data[i..end].starts_with(b"PATH=") {
+                            path_off = i + 5;
+                            path_len = end.saturating_sub(i + 5);
+                            break;
+                        }
+                        i = end + 1;
+                    }
+                }
+            }
+            &env_buf[path_off..path_off + path_len]
+        }
+    };
+
+    if path_val.is_empty() {
+        let fallback: [&[u8]; 2] = [b"/bin", b"/usr/bin"];
+        for &dir in &fallback {
+            let mut path_buf = [0u8; 512];
+            if let Some(plen) = build_nul_path(&mut path_buf, &[dir, cmd_name]) {
+                execve(&path_buf[..plen], argv, envp);
+            }
+        }
+        return;
+    }
+
+    let mut seg_start = 0;
+    loop {
+        let seg_end = path_val[seg_start..]
+            .iter()
+            .position(|&b| b == b':')
+            .map(|p| seg_start + p)
+            .unwrap_or(path_val.len());
+        let dir = &path_val[seg_start..seg_end];
+        if !dir.is_empty() {
+            let mut path_buf = [0u8; 512];
+            if let Some(plen) = build_nul_path(&mut path_buf, &[dir, cmd_name]) {
+                execve(&path_buf[..plen], argv, envp);
+            }
+        }
+        if seg_end >= path_val.len() {
+            break;
+        }
+        seg_start = seg_end + 1;
+    }
 }
 
 /// Write a decimal u64 to `fd`.

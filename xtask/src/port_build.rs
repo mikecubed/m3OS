@@ -528,6 +528,18 @@ fn build_recipe_id(name: &str) -> &'static str {
              build:-trimpath -ldflags='-s -w -X github.com/cli/cli/v2/internal/build.Version=<version>';\
              toolchain=go1.24.6;stage=/usr/bin/gh;recipe-v=1"
         }
+        // Phase 89 — Node.js. The built artifact is `node`+`npm` (the tarball is
+        // the SOURCE, folded in via the Portfile SHA-256). This arm pins the V8/
+        // configure knob set (jitless for W^X, static musl, small-icu) so a flag
+        // change self-invalidates the cached `.m3pkg`; the host clang identity is
+        // folded separately via `host_cxx_toolchain_id()` in `compute_port_key`.
+        "node" => {
+            "node-configure:--fully-static --enable-static --dest-cpu=x64 \
+             --dest-os=linux --with-intl=small-icu --v8-options=--jitless \
+             --openssl-no-asm --without-corepack --without-node-snapshot \
+             --without-inspector;single-toolset;make-generator;wasm-in-jitless;\
+             cxxstdlib=libc++-musl;recipe-v=4"
+        }
         _ => "",
     }
 }
@@ -588,6 +600,16 @@ pub fn go_toolchain_id() -> String {
 /// reported version line (empty when the compiler is absent — a machine that
 /// cannot build `llvm` also cannot legitimately seal its `.m3pkg`).
 pub fn host_cxx_toolchain_id() -> String {
+    host_cxx_toolchain_id_for("M3OS_LLVM_CLANG", "M3OS_LLVM_CLANGXX")
+}
+
+/// Generalized [`host_cxx_toolchain_id`] that reads the host clang/clang++ names
+/// from the GIVEN override env vars. `node` honors `M3OS_NODE_CLANG` /
+/// `M3OS_NODE_CLANGXX` (a knob distinct from llvm's), so its content key must
+/// fold the identity of the compiler it ACTUALLY uses — otherwise a node build
+/// run with `M3OS_NODE_CLANG=clang-18` would key on the default `clang` and serve
+/// a stale cross-host pkgcache hit.
+pub fn host_cxx_toolchain_id_for(clang_var: &str, clangxx_var: &str) -> String {
     let first_version_line = |cc: &str| -> String {
         Command::new(cc)
             .arg("--version")
@@ -600,8 +622,8 @@ pub fn host_cxx_toolchain_id() -> String {
             })
             .unwrap_or_default()
     };
-    let clang = std::env::var("M3OS_LLVM_CLANG").unwrap_or_else(|_| "clang".to_string());
-    let clangxx = std::env::var("M3OS_LLVM_CLANGXX").unwrap_or_else(|_| "clang++".to_string());
+    let clang = std::env::var(clang_var).unwrap_or_else(|_| "clang".to_string());
+    let clangxx = std::env::var(clangxx_var).unwrap_or_else(|_| "clang++".to_string());
     format!(
         "{clang}|{}|{clangxx}|{}",
         first_version_line(&clang),
@@ -790,6 +812,10 @@ pub fn port_deps(name: &str) -> &'static [&'static str] {
         // linked into the toolchain + bundled in the .m3pkg's sysroot, so in-OS
         // `pkg install clang` pulls nothing else.
         "llvm" => &[],
+        // Phase 89 — Node bundles OpenSSL/zlib/c-ares/nghttp2/ICU into the static
+        // binary, so it has no runtime `.m3pkg` deps (the musl libc++ sysroot is a
+        // build-time prerequisite, not a DEP).
+        "node" => &[],
         // Phase 86a Track C.2 — the Mozilla CA bundle is a self-contained data
         // file (no libraries required at build or install time).
         "ca-certificates" => &[],
@@ -859,7 +885,17 @@ fn compute_port_key_inner(
     //   *     — all other ports are built entirely by the musl cross-compiler, so
     //           `toolchain_id()` (musl-gcc name + `--version`) is the right key.
     let tc = match name {
+        // Phase 89 — node joins llvm: both cross-build C++ with the host clang, so
+        // fold the host clang/clang++ identity so two host-clang versions don't
+        // collide on one `.m3pkg`. They read DIFFERENT override env vars
+        // (M3OS_LLVM_* vs M3OS_NODE_*), so each folds the identity of the compiler
+        // it actually invokes.
         "llvm" => format!("{}|host-cxx={}", toolchain_id(), host_cxx_toolchain_id()),
+        "node" => format!(
+            "{}|host-cxx={}",
+            toolchain_id(),
+            host_cxx_toolchain_id_for("M3OS_NODE_CLANG", "M3OS_NODE_CLANGXX")
+        ),
         // Phase 86e — go/gh cross-build with the downloaded Go toolchain, not the
         // musl cross-compiler; fold the Go toolchain identity (not musl) so a Go
         // bump auto-invalidates and a musl change does not spuriously invalidate.
@@ -1046,7 +1082,7 @@ pub fn cmd_port_build(name: &str) -> i32 {
 /// Phase-69d path or staged differently and are not driven by `port build`.
 pub const BUILDABLE_PORTS: &[&str] = &[
     "zlib", "ncurses", "libevent", "mbedtls", "dropbear", "llvm", "go", "gh", "python", "less",
-    "htop", "tmux", "curl", "git",
+    "htop", "tmux", "curl", "git", "node",
 ];
 
 /// A port's declared `DEPS=` (whitespace-separated), restricted to `within` —
@@ -1325,6 +1361,21 @@ fn port_build(name: &str) -> Result<(), String> {
     // musl_toolchain() requirement below — the port has no musl dependency.
     if name == "gh" {
         build_gh(&extracted, &stage, &port_dir)?;
+        seal_package(name, &stage, &key)?;
+        fs::write(&stamp, &fingerprint).map_err(|e| format!("write stamp: {e}"))?;
+        println!(
+            "ports: {name}-{version} build complete (staged at {})",
+            stage.display()
+        );
+        return Ok(());
+    }
+
+    // Phase 89 — `node` cross-builds C++ with the host clang/clang++ targeting
+    // musl (+ the build_llvm Stage-B libc++ sysroot), NOT the musl-gcc C path, so
+    // it branches before the musl_toolchain() requirement (it needs musl-dev
+    // headers/libs via the llvm sysroot, not a musl gcc).
+    if name == "node" {
+        build_node(&extracted, &stage, &port_dir)?;
         seal_package(name, &stage, &key)?;
         fs::write(&stamp, &fingerprint).map_err(|e| format!("write stamp: {e}"))?;
         println!(
@@ -3438,6 +3489,291 @@ const LLVM_TGT_SYSROOT: &str = "/usr/lib/clang-sysroot";
 /// target + sysroot are set, no toolchain file) so LLVM builds tblgen as a
 /// static-musl x86_64 binary that runs on the same-arch build host — sidestepping
 /// the native-tblgen sub-build.
+/// Phase 89 — cross-build a fully-static musl `node` (+ bundled `npm`) using the
+/// host clang/clang++ targeting musl (musl-tools has no C++ compiler, so this is
+/// the `build_llvm` model, NOT the musl-gcc C path) plus `build_llvm`'s static
+/// `libc++.a`. The V8 engine is built **jitless** (`--v8-options=--jitless`, NOT
+/// `--v8-lite-mode` — see the configure block) so it never requests
+/// RWX/executable memory (m3OS W^X). See `ports/lang/node/Portfile` and
+/// `docs/89-nodejs.md` for the full configuration rationale.
+fn build_node(port_src: &Path, stage: &Path, port_dir: &Path) -> Result<(), String> {
+    let root = workspace_root();
+    let jobs = format!("-j{}", num_jobs());
+    const NODE_TRIPLE: &str = "x86_64-unknown-linux-musl";
+
+    // ── 1. host toolchain preflight (host clang→musl; no musl g++ needed) ────────
+    let clang = std::env::var("M3OS_NODE_CLANG").unwrap_or_else(|_| "clang".to_string());
+    let clangxx = std::env::var("M3OS_NODE_CLANGXX").unwrap_or_else(|_| "clang++".to_string());
+    for c in [clang.as_str(), clangxx.as_str()] {
+        if !probe_tool_on_path(c) {
+            return Err(format!(
+                "node build: host C/C++ compiler '{c}' not found on PATH. Phase 89 \
+                 cross-builds Node with the host clang targeting musl (set \
+                 M3OS_NODE_CLANG / M3OS_NODE_CLANGXX to override). Install clang + lld \
+                 (Debian/Ubuntu: `apt install clang lld`)."
+            ));
+        }
+    }
+    if !probe_tool_on_path("ld.lld") {
+        return Err(
+            "node build: `ld.lld` not found on PATH (the cross-link uses \
+                    `-fuse-ld=lld`). Install LLVM's linker (`apt install lld`)."
+                .into(),
+        );
+    }
+    if !probe_tool_on_path("python3") {
+        return Err(
+            "node build: `python3` not found on PATH (Node's `configure` + V8 \
+                    GYP/torque are Python). Install python3."
+                .into(),
+        );
+    }
+    if !probe_tool_on_path("make") {
+        return Err(
+            "node build: `make` not found on PATH (Node's top-level build \
+                    driver). Install make."
+                .into(),
+        );
+    }
+
+    // ── 2. reuse the `llvm` port's static musl C++ sysroot (libc++.a + builtins) ─
+    // Node is C++ and musl-tools ships no C++ compiler, so — exactly like the
+    // clang port — the V8/Node compile needs a musl libc++. Reuse the artifact the
+    // `llvm` port already builds at target/llvm-musl-sysroot rather than rebuild it
+    // (a build-time prerequisite, NOT a runtime `.m3pkg` DEP).
+    let sysroot = root.join("target/llvm-musl-sysroot");
+    if !sysroot.join("lib/libc++.a").exists()
+        || !sysroot
+            .join("lib/linux/libclang_rt.builtins-x86_64.a")
+            .exists()
+    {
+        return Err(format!(
+            "node build: musl C++ sysroot not found at {} (need lib/libc++.a + the \
+             compiler-rt builtins). Build the `llvm` port first — it assembles the \
+             musl sysroot and the static libc++ that the Node V8 cross-compile \
+             reuses:  `cargo xtask port build llvm`  (or enable M3OS_WITH_CLANG). \
+             This is a build-time prerequisite, not a runtime DEP.",
+            sysroot.display()
+        ));
+    }
+
+    // ── 3. persistent stable source (Node builds IN-tree; never re-extract) ──────
+    // `port_build` re-extracts + re-patches `port_src` with fresh mtimes every run,
+    // which would defeat ninja incrementality and force a multi-hour V8 rebuild on
+    // every retry. Move the freshly-extracted+patched tree to a stable location
+    // once, then reuse it (the pkgcache still seals the `.m3pkg` so a clean machine
+    // pays the full build exactly once). Mirrors `build_llvm`.
+    let cross_root = root.join("target/node-cross");
+    fs::create_dir_all(&cross_root).map_err(|e| format!("mkdir node-cross: {e}"))?;
+    // A required, non-empty VERSION — never default to "" (which would name the
+    // persistent source dir `node-v`, silently mixing sources across versions and
+    // hiding a Portfile parse error).
+    let version = parse_portfile(&port_dir.join("Portfile"))
+        .map_err(|e| format!("node: re-read Portfile for src dir name: {e}"))?
+        .get("VERSION")
+        .cloned()
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| "node: Portfile is missing a non-empty VERSION".to_string())?;
+    let stable_src = cross_root.join(format!("node-v{version}"));
+    let src: PathBuf = if stable_src.join("configure").exists() {
+        println!("node: reusing persistent source {}", stable_src.display());
+        stable_src
+    } else {
+        println!(
+            "node: staging persistent source at {} (once)",
+            stable_src.display()
+        );
+        let _ = fs::remove_dir_all(&stable_src);
+        // `port_src` is the port machinery's freshly-extracted + patched tree;
+        // move it to the stable location (patches ride along). Next run re-extracts
+        // a fresh `port_src`, which we ignore once the stable tree exists.
+        fs::rename(port_src, &stable_src).map_err(|e| format!("node: stage source: {e}"))?;
+        stable_src
+    };
+    let src = src.as_path();
+
+    // ── 4. toolchain env: host clang→musl for TARGET, host glibc clang for HOST ──
+    // V8's mksnapshot/torque run on the build host (same arch x86_64 → native), so
+    // they MUST link glibc; the final node binary is musl-static. Keep the two
+    // toolsets distinct: --target/--sysroot/-static only in the TARGET vars.
+    let stub = musl_extra_ldflags_joined();
+    let sysroot_s = sysroot.display().to_string();
+    let tgt = format!("--target={NODE_TRIPLE} --sysroot={sysroot_s}");
+    let warn = "-Wno-unused-command-line-argument";
+    // clang 16+ promoted several legacy-C constructs from warnings to hard
+    // errors. The bundled OpenSSL/c-ares/etc. trip them on musl — notably
+    // OpenSSL's `o_str.c` assumes `_GNU_SOURCE` ⇒ glibc's `char*`-returning
+    // `strerror_r`, but musl always returns `int` (no GNU variant), and
+    // `_GNU_SOURCE` is still required for V8's `pthread_getattr_np`. Downgrade
+    // those clang-16 promotions back to warnings so the legacy C deps build.
+    let legacy_c = "-Wno-error=int-conversion -Wno-error=implicit-function-declaration \
+                    -Wno-error=incompatible-pointer-types -Wno-error=implicit-int";
+    let cflags =
+        format!("{tgt} -O2 -fno-omit-frame-pointer -D_GNU_SOURCE -D__MUSL__ {warn} {legacy_c}");
+    // clang does NOT auto-add `<sysroot>/include/c++/v1` to the C++ search path
+    // for this bare musl triple — its default C++ search for the sysroot is just
+    // `<sysroot>/include` + the resource dir — so the libc++ headers the `llvm`
+    // port installed there go unseen and `<cstddef>`/`<memory>` come back "file
+    // not found". Point at them explicitly with `-cxx-isystem`.
+    let cxxflags = format!(
+        "{tgt} -stdlib=libc++ -cxx-isystem {sysroot_s}/include/c++/v1 -rtlib=compiler-rt \
+         -O2 -fno-omit-frame-pointer -D_GNU_SOURCE -D__MUSL__ {warn}"
+    );
+    let ldflags = format!(
+        "{tgt} -static -stdlib=libc++ -L{sysroot_s}/lib -rtlib=compiler-rt \
+         -unwindlib=libunwind -fuse-ld=lld {warn} {stub}"
+    );
+    let ar = if probe_tool_on_path("llvm-ar") {
+        "llvm-ar"
+    } else {
+        "ar"
+    };
+    let nm = if probe_tool_on_path("llvm-nm") {
+        "llvm-nm"
+    } else {
+        "nm"
+    };
+    // The same env feeds `configure`, `make`, and `make install`.
+    let apply_env = |cmd: &mut Command| {
+        cmd.env("CC", &clang)
+            .env("CXX", &clangxx)
+            .env("CC_host", &clang)
+            .env("CXX_host", &clangxx)
+            .env("CFLAGS", &cflags)
+            .env("CXXFLAGS", &cxxflags)
+            .env("LDFLAGS", &ldflags)
+            .env("CFLAGS_host", "-O2")
+            .env("CXXFLAGS_host", "-O2")
+            .env("LDFLAGS_host", "")
+            .env("AR", ar)
+            .env("AR_host", "ar")
+            .env("NM", nm);
+    };
+
+    // ── 5. configure (static, jitless V8, small-icu, bundled deps) ───────────────
+    println!(
+        "node: configure (static musl, jitless V8, small-icu) — {}",
+        src.display()
+    );
+    let mut cfg = Command::new("python3");
+    cfg.current_dir(src).arg("configure").args([
+        "--prefix=/usr",
+        "--dest-cpu=x64",
+        "--dest-os=linux",
+        // NB: NOT `--cross-compiling`. Build host and target are both x86_64, and
+        // a fully-static musl mksnapshot/torque runs natively on the glibc host
+        // (static = no loader). `--cross-compiling` would force V8's
+        // `want_separate_host_toolset=1`, which emits BOTH host- and
+        // target-toolset `v8_inspector_headers` rules writing the same
+        // arch-independent `gen/.../js_protocol.stamp` → ninja "multiple rules
+        // generate" error. A single (native) toolset generates it once.
+        "--fully-static",
+        "--enable-static",
+        "--with-intl=small-icu",
+        // Jitless via `--v8-options=--jitless`, NOT `--v8-lite-mode`. Both make
+        // V8 allocate zero runtime executable memory (Ignition-only, no
+        // RWX/JIT → W^X-clean), but `--v8-lite-mode` ALSO sets
+        // `v8_enable_webassembly=false`, and Node 22 unconditionally passes its
+        // default `--experimental-wasm-imported-strings`/`-memory64`/`-exnref`
+        // V8 flags at startup → a WASM-less V8 rejects them as a fatal "bad
+        // option" (exit 9) before `node --version` ever prints. Keeping WASM
+        // compiled in makes V8 recognise those flags (then `--jitless` renders
+        // them inert), so node starts cleanly while staying W^X-safe.
+        "--v8-options=--jitless",
+        // NB: NOT `--ninja`. V8's gyp emits `v8_inspector_headers` for BOTH the
+        // host and target toolsets, both writing the same arch-independent
+        // `gen/.../js_protocol.stamp` (Node's `--without-inspector` disables
+        // Node's inspector but NOT V8's `v8_enable_inspector`). ninja treats
+        // "multiple rules generate X" as a FATAL error; GYP's make generator (the
+        // default, most-tested Node build backend) tolerates it as a benign
+        // "overriding recipe" warning. So we use the make backend.
+        "--openssl-no-asm",
+        "--without-corepack",
+        // The Node startup snapshot is built by running a host-glibc
+        // `node_mksnapshot` against the musl-static target build during the
+        // build; disabling it sidesteps a host/target snapshot-blob mismatch
+        // (the snapshot is regenerated at first run instead). Small startup cost,
+        // robust cross-build.
+        "--without-node-snapshot",
+        "--without-inspector",
+    ]);
+    apply_env(&mut cfg);
+    run(&mut cfg, "node configure")?;
+
+    // ── 6. build (GYP make backend; V8 + bundled OpenSSL/ICU = LONG) ─────────────
+    println!("node: build ({jobs}) [LONG — V8 + bundled OpenSSL/ICU; multi-hour cold]");
+    let mut mk = Command::new("make");
+    mk.current_dir(src).arg(&jobs);
+    apply_env(&mut mk);
+    run(&mut mk, "node build")?;
+
+    // ── 7. install into the DESTDIR stage (→ <stage>/usr/{bin,lib}) ──────────────
+    println!("node: install (DESTDIR={})", stage.display());
+    let _ = fs::remove_dir_all(stage);
+    fs::create_dir_all(stage).map_err(|e| format!("mkdir stage: {e}"))?;
+    let mut inst = Command::new("make");
+    inst.current_dir(src).arg("install").env("DESTDIR", stage);
+    apply_env(&mut inst);
+    run(&mut inst, "node install")?;
+
+    assert_node_layout(stage)?;
+    Ok(())
+}
+
+/// Assert the staged `node` is a fully-static ELF (no `PT_INTERP`) — the
+/// loaderless contract (m3OS's `ld-musl` has no real `libc.so`), and that the
+/// bundled `npm` was staged. Mirrors how `build_python`/`build_go` prove
+/// `-static`.
+fn assert_node_layout(stage: &Path) -> Result<(), String> {
+    let node_bin = stage.join("usr/bin/node");
+    if !node_bin.exists() {
+        return Err(format!(
+            "node: staged binary missing at {}",
+            node_bin.display()
+        ));
+    }
+    // Fail-closed static-link check using the same byte-scan guard the
+    // python/dropbear ports use: a fully-static binary must NOT reference the
+    // dynamic loader. `binary_contains` propagates Err on a read failure (it
+    // never silently passes), so a missing/unreadable binary fails the gate.
+    if binary_contains(&node_bin, b"/lib/ld-musl-x86_64.so.1")? {
+        return Err("node: staged `node` references the dynamic loader \
+                    `/lib/ld-musl-x86_64.so.1` — not fully static (m3OS's ld-musl \
+                    has no real `libc.so`). Check --fully-static."
+            .into());
+    }
+    // Belt-and-suspenders: when `readelf` is present, also reject a PT_INTERP
+    // segment — but only trust its output on a clean (zero) exit, otherwise a
+    // failed `readelf` would vacuously "pass" the INTERP check.
+    if probe_tool_on_path("readelf") {
+        let out = Command::new("readelf")
+            .args(["-l"])
+            .arg(&node_bin)
+            .output()
+            .map_err(|e| format!("node: readelf failed: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "node: `readelf -l {}` exited non-zero ({}) — cannot verify the \
+                 static-link contract: {}",
+                node_bin.display(),
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim(),
+            ));
+        }
+        if String::from_utf8_lossy(&out.stdout).contains("INTERP") {
+            return Err("node: staged `node` has a PT_INTERP segment — not fully \
+                        static (m3OS has no ld-musl `libc.so`). Check --fully-static."
+                .into());
+        }
+    }
+    if !stage.join("usr/bin/npm").exists() {
+        return Err("node: bundled `npm` missing under usr/bin (do not pass \
+                    --without-npm)."
+            .into());
+    }
+    Ok(())
+}
+
 fn build_llvm(
     port_src: &Path,
     stage: &Path,
@@ -4627,6 +4963,17 @@ pub fn build_llvm_port() -> Result<(), String> {
     Ok(())
 }
 
+/// Phase 89 — build the fully-static musl `node` (+ bundled `npm`) into its
+/// `.m3pkg` artifact so the image populator can bundle it into `/usr/pkg/` (gated
+/// behind `M3OS_WITH_NODE`). `build_node` reuses the `llvm` port's musl libc++
+/// sysroot and runs the V8/Node cross-build; a warm pkgcache makes a repeat build
+/// a zero-compiler hit. The `node-smoke` gate drives this (and SKIPs with reason
+/// when the host C++ toolchain or the llvm sysroot is absent).
+pub fn build_node_port() -> Result<(), String> {
+    port_build("node").map_err(|e| format!("port node: {e}"))?;
+    Ok(())
+}
+
 /// Phase 86b — build the static client-only `dropbear` (`dbclient`) into its
 /// `.m3pkg` artifact so the image populator can bundle it into `/usr/pkg/` as
 /// `ssh.m3pkg`. dropbear has no runtime deps (`--disable-zlib`), so nothing is
@@ -4940,7 +5287,7 @@ mod tests {
         // ports never collide on the recipe component of the key.
         let ports = [
             "zlib", "ncurses", "libevent", "less", "htop", "tmux", "git", "python", "llvm",
-            "dropbear", "mbedtls", "curl", "go", "gh",
+            "dropbear", "mbedtls", "curl", "go", "gh", "node",
         ];
         let ids: Vec<&str> = ports.iter().map(|p| build_recipe_id(p)).collect();
         for (p, id) in ports.iter().zip(&ids) {

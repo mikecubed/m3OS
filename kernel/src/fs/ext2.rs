@@ -1244,6 +1244,7 @@ impl Ext2Volume {
         uid: u32,
         gid: u32,
         mode: u16,
+        ctime: u32,
     ) -> Result<(), Ext2Error> {
         let ino = self.resolve_path(path)?;
         let mut inode = self.read_inode(ino)?;
@@ -1251,6 +1252,10 @@ impl Ext2Volume {
         inode.gid = gid as u16;
         // Preserve the file type bits, only update permission bits.
         inode.mode = (inode.mode & 0xF000) | (mode & 0o7777);
+        // POSIX: chmod/chown advance ctime. The routed VFS_SETATTR path
+        // (`handle_setattr`) sets ctime too; keep the direct-engine fallback
+        // (boot window) consistent so a later stat reports a coherent ctime.
+        inode.ctime = ctime;
         self.write_inode(ino, &inode)
     }
 
@@ -1467,6 +1472,12 @@ pub fn invalidate_cache() {
     if let Some(vol) = EXT2_VOLUME.lock().as_ref() {
         vol.invalidate_block_cache();
     }
+    // Phase 89: the syscall layer calls this after every ext2 mutation it routes
+    // to the `vfs_server` write authority, so it is the natural choke point to
+    // also invalidate the kernel path-metadata (stat) cache — a routed write /
+    // create / unlink / rename / truncate changes the very stat results that
+    // cache holds.
+    crate::fs::metacache::bump();
 }
 
 /// Get uid/gid/mode for an ext2 file by its root-relative path.

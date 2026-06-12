@@ -160,6 +160,32 @@ pub const VFS_RENAME: u64 = 23;
 /// Reply:   label = 0 on success (negative errno on error).
 pub const VFS_LINK: u64 = 24;
 
+/// Set inode attributes (chmod / chown / utimes) through the `vfs_server` — the
+/// single ext2 write owner — so the change is coherent with the server's own
+/// block cache and the kernel path-metadata (stat) cache it backs (Phase 89). A
+/// direct kernel-engine inode write would leave the server's cached inode block
+/// stale (the dual-engine hazard Phase 88 eliminated for data writes).
+///
+/// Only `data[0..3]` carry payload — the IPC engine reserves `data[3]` for the
+/// reply-cap handle it hands the receiver. uid/gid pack to 16 bits each (the
+/// ext2 inode width) and ctime is set to "now" by the server, so neither needs a
+/// dedicated word.
+///
+/// Request: bulk = path bytes; `data[0]` = path length;
+///          `data[1]` = `(uid << 48) | (gid << 32) | (mode << 16) | mask`
+///          (uid/gid/mode/mask each 16 bits; `mask` selects which fields to
+///          apply — see `VFS_SETATTR_*`);
+///          `data[2]` = `(atime << 32) | mtime`.
+/// Reply:   label = 0 on success (negative errno on error).
+pub const VFS_SETATTR: u64 = 25;
+
+/// `VFS_SETATTR` field-mask bits — which attributes the request applies.
+pub const VFS_SETATTR_MODE: u64 = 1 << 0;
+pub const VFS_SETATTR_UID: u64 = 1 << 1;
+pub const VFS_SETATTR_GID: u64 = 1 << 2;
+pub const VFS_SETATTR_ATIME: u64 = 1 << 3;
+pub const VFS_SETATTR_MTIME: u64 = 1 << 4;
+
 /// Node-kind selector encoded in `VFS_CREATE` `data[2]` bits 16..18.
 pub const VFS_CREATE_KIND_SHIFT: u32 = 16;
 

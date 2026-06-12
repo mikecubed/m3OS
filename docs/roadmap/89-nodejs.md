@@ -106,6 +106,7 @@ The runtime only becomes strategically useful once the package path needed for l
 - npm or the chosen equivalent package path is usable for the later CLI-agent milestone.
 - The phase docs clearly describe what Node support exists and what remains unsupported.
 - The runtime configuration and install layout are reproducible through the documented build flow.
+- The VFS metadata path serves repeated `stat`/path-walk lookups from a kernel cache (so node/npm's metadata-op storm does not serialise through a ring-3 IPC per op), exposed at `/proc/metacache`, with cross-process stat coherence preserved across create / write / chmod / chown / utimes / unlink (`ext2-coherence-smoke` sub-tests 4 & 5).
 
 ## Companion Task List
 

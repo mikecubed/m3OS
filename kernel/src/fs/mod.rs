@@ -17,6 +17,8 @@
 
 pub mod ext2;
 pub mod fat32;
+/// Phase 89: kernel-side path metadata (stat) cache — see [`metacache`].
+pub mod metacache;
 pub mod procfs;
 pub mod protocol;
 pub mod ramdisk;

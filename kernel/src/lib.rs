@@ -59,6 +59,7 @@ pub mod test_prelude;
 #[cfg(test)]
 pub mod testing;
 pub mod time;
+pub mod timerfd;
 pub mod trace;
 pub mod tty;
 
