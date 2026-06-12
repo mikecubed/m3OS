@@ -8,6 +8,7 @@ pub mod frame_allocator;
 pub mod heap;
 pub mod memory_map;
 pub mod paging;
+pub mod pkey;
 pub mod shm;
 pub mod slab;
 pub mod slab_box;
