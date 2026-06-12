@@ -146,8 +146,10 @@ const SIGMASK_SIZE: usize = 128;
 pub const SIGFRAME_SIZE: usize = 8 + 8 + 8 + 24 + SIGCONTEXT_SIZE + SIGMASK_SIZE + SIGINFO_SIZE;
 
 /// Size of the FPU save area appended above the core sigframe.
-/// Must equal `crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE` (832 bytes).
-pub const FPU_AREA_SIZE: usize = crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE; // 832
+/// Must equal [`crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE`] (832 bytes
+/// legacy x87+SSE+AVX; 2752 bytes with PKRU component 9 — see XSAVE_AREA_SIZE
+/// for the current value).
+pub const FPU_AREA_SIZE: usize = crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE;
 
 /// Total size of the extended signal frame including the FPU save area.
 pub const SIGFRAME_EXTENDED_SIZE: usize = SIGFRAME_SIZE + FPU_AREA_SIZE;

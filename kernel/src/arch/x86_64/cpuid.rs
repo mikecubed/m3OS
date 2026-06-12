@@ -222,8 +222,13 @@ pub unsafe fn enable_xsave_state() {
     }
 
     // Write XCR0 via `xsetbv` with ECX=0 — only XCR0 exists today.  When PKU is
-    // usable, fold in component 9 (PKRU) so PKRU state participates in
-    // xsave64/xrstor64 (the per-task save/restore path B.4 proves end-to-end).
+    // usable, fold in component 9 (PKRU) so the architecture *knows* PKRU is
+    // an active user-mode register and sizes the XSAVE area accordingly.
+    // NOTE: setting XCR0[9] does NOT yet save/restore PKRU across context
+    // switches — the per-task save/restore RFBM (XSAVE_FEATURE_MASK consumers
+    // in scheduler.rs save_fpu_state/restore_fpu_state/sanitize_xsave_header)
+    // is still hard-coded to 0x7 (x87+SSE+AVX).  Track B.4 must extend the
+    // RFBM to carry component 9 before PKRU isolation is complete.
     let mask = pku_features().xcr0_mask(XSAVE_FEATURE_MASK);
     unsafe {
         core::arch::asm!(
@@ -243,9 +248,10 @@ pub unsafe fn enable_xsave_state() {
 
 /// XSAVE area size (CPUID 0Dh.0.EBX) for the components currently enabled in
 /// XCR0.  Re-runs CPUID every call — must be invoked after
-/// [`enable_xsave_state`] for the value to reflect the 1.0 mask (x87+SSE+AVX
-/// = 832 B).  Used by the boot-time validation assertion to confirm
-/// [`XSAVE_AREA_SIZE`] fits the actually-enabled mask.
+/// [`enable_xsave_state`] for the value to reflect the current XCR0 mask
+/// (legacy x87+SSE+AVX = 832 B; with PKRU component 9 enabled = 2752 B per
+/// [`XSAVE_AREA_SIZE`]).  Used by the boot-time validation assertion to
+/// confirm [`XSAVE_AREA_SIZE`] fits the actually-enabled mask.
 pub fn enabled_area_size() -> usize {
     cpuid_raw(0x0D, 0).ebx as usize
 }

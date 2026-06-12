@@ -428,8 +428,26 @@ extern "C" fn ap_entry(per_core_data_ptr: *mut super::PerCoreData) -> ! {
     // carry CR4.PKE yet lack PKRU in its XSAVE area (an inconsistent per-core
     // state).  Routing both through this single call keeps every core's PKU
     // state consistent by construction.
+    //
+    // NOTE: XCR0[9] makes PKRU *architecturally enabled* on this core and
+    // sizes the XSAVE area to include the PKRU region; it does NOT yet cause
+    // PKRU to be saved/restored across context switches.  The per-task RFBM
+    // (XSAVE_FEATURE_MASK) is still 0x7 — Track B.4 extends it to component 9.
     unsafe {
         crate::arch::x86_64::cpuid::enable_xsave_state();
+    }
+
+    // Phase 90a B.1 — mirror the BSP assertion (kernel/src/lib.rs) on every
+    // AP.  A too-small XSAVE_AREA_SIZE is memory corruption; we catch it here
+    // rather than letting a later xsave64 stomp adjacent task state silently.
+    {
+        let enabled_area = crate::arch::x86_64::cpuid::enabled_area_size();
+        assert!(
+            crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE >= enabled_area,
+            "AP: XSAVE_AREA_SIZE ({}) is smaller than CPUID-required area for enabled XCR0 ({})",
+            crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE,
+            enabled_area,
+        );
     }
 
     // Phase 77 Track B — CR4.SMEP/SMAP were captured into the trampoline's
