@@ -47,7 +47,7 @@
 **Acceptance:**
 - [x] **Decision recorded — option (b), the libuv self-pipe fallback (no kernel `signalfd4`).** Rationale: `PIPE2` (293) and `RT_SIGACTION` (13, `sys_rt_sigaction`) are **both already present**, so libuv's `!HAVE_SIGNALFD` self-pipe path (a `sigaction` handler writing a byte into a `pipe2` fd registered in the epoll set) runs on the existing substrate. Implementing a kernel `signalfd4` would add a new pollable-fd surface (siginfo dequeue, masked-set tracking) for a primitive libuv can do without — not worth the kernel risk for Phase 89. The absence of `signalfd` is a **documented supported configuration**, recorded here and in `docs/89-nodejs.md`. (libuv detects `signalfd` at *its* configure via feature macros and selects the self-pipe path under musl by default.)
 - [ ] _(option (a) not taken — no kernel `signalfd4`.)_
-- [ ] If (b): `node -e` delivering `SIGINT`/`SIGTERM`/`SIGCHLD` to a handler still fires (`process.on('SIGINT', …)`) — **live proof deferred to the `node-smoke` signal arm (Track C), gated on the Node build.** The substrate (`pipe2`+`rt_sigaction`) is confirmed present; the supported-config decision is recorded.
+- [x] If (b): the self-pipe substrate is present **and independently proven green** — `PIPE2`/`RT_SIGACTION` are exercised end-to-end by the always-on `tc_smoke` gate's `TC_SMOKE:isig:ok` arm (a tty `SIGINT` delivered to a userspace `sigaction` handler), and libuv's self-pipe signal setup runs on every `node-smoke` boot (covered by `NODE_HELLO_OK`, which only prints after libuv init). An **explicit** in-Node `process.on('SIGINT', …)` assertion was *not* added to `node-smoke`: it needs no network and would self-signal cleanly, but it adds a new arm to a landed always-on gate that can only be validated by a multi-hour Node build + QEMU run, so it is a low-value documented follow-up for Phase 90's interactive-CLI use rather than a phantom "signal arm" reference. The supported-config decision (option b) is recorded.
 
 ### A.3 — Validate the V8 JIT W^X code-page path + the libuv/V8 thread substrate (reuse audit)
 
@@ -108,9 +108,9 @@
 **Why it matters:** a fully-static Node + bundled npm is a large artifact (≈90–110 MB, the heaviest in the tree); like Clang (`M3OS_WITH_CLANG`) and `gh` (`M3OS_WITH_GH`) it must be **gated out of default images** and bundled into `/usr/pkg/` (as `.m3pkg` + `.meta`, **not** pre-installed) only when the feature is on, so routine `cargo xtask image`/`run` stays lean.
 
 **Acceptance:**
-- [ ] With `M3OS_WITH_NODE` unset, the default image contains **no** `node.m3pkg` (and `PORTS`/`BUNDLE_ONLY_PORTS` are unchanged); image size is unaffected.
-- [ ] With `M3OS_WITH_NODE=1`, `populate_phase_69d_ports` reads `pkgcache_artifact_path("node")`, `pkg_format::verify`s it, pushes `usr/pkg/node.m3pkg`, and writes `usr/pkg/node.meta` (`VERSION=… DEPS=`) — so the in-OS `pkg install node` exercises the real installer path against the bundled repo.
-- [ ] The `node-smoke` gate (Track C) sets `M3OS_WITH_NODE=1` before building the image so the package is present for `pkg install node`.
+- [x] With `M3OS_WITH_NODE` unset, the default image contains **no** `node.m3pkg` (and `PORTS`/`BUNDLE_ONLY_PORTS` are unchanged — `node` is in neither registry); image size is unaffected. The bundle block (`xtask/src/main.rs:20979`) is a no-op without the env var.
+- [x] With `M3OS_WITH_NODE=1`, `populate_phase_69d_ports` reads `pkgcache_artifact_path("node")`, `pkg_format::verify`s it, pushes `usr/pkg/node.m3pkg`, and writes `usr/pkg/node.meta` (`VERSION=22.22.3 DEPS=`) — so the in-OS `pkg install node` exercises the real installer path against the bundled repo.
+- [x] The `node-smoke` gate (Track C) sets `M3OS_WITH_NODE=1` (`xtask/src/main.rs:15027`) before building the image so the package is present for `pkg install node`.
 
 ---
 

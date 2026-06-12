@@ -307,6 +307,13 @@ pub fn add_fd_refs(fd_table: &[Option<FdEntry>; MAX_FDS]) {
             // object gains a reference per copied fd. Without this the child's
             // close would free the object out from under the parent.
             FdBackend::EventFd { id } => crate::eventfd::eventfd_add_ref(*id),
+            // Phase 89 Track A.1 — timerfd is refcounted exactly like eventfd: a
+            // fork (non-CLONE_FILES) copies the fd table, so the underlying
+            // object gains a reference per copied fd. Without this the child's
+            // close would free the timer out from under the parent (and the slot
+            // could be reused by a later timerfd_create, aliasing the parent's fd
+            // onto a different timer).
+            FdBackend::TimerFd { id } => crate::timerfd::timerfd_add_ref(*id),
             _ => {}
         }
     }
@@ -322,6 +329,7 @@ pub fn close_cloexec_fds(pid: Pid) {
     let mut unix_sockets = alloc::vec::Vec::new();
     let mut epolls = alloc::vec::Vec::new();
     let mut eventfds = alloc::vec::Vec::new();
+    let mut timerfds = alloc::vec::Vec::new();
     let mut ext2_inodes = alloc::vec::Vec::new();
     let mut vfs_handles = alloc::vec::Vec::new();
     let mut ext2_last_alias = alloc::vec::Vec::new();
@@ -365,6 +373,7 @@ pub fn close_cloexec_fds(pid: Pid) {
                     }
                     FdBackend::Epoll { instance_id } => epolls.push(*instance_id),
                     FdBackend::EventFd { id } => eventfds.push(*id),
+                    FdBackend::TimerFd { id } => timerfds.push(*id),
                     FdBackend::Ext2Disk { inode_num, .. } => ext2_inodes.push(*inode_num),
                     FdBackend::VfsService { service_handle, .. } => {
                         vfs_handles.push(*service_handle)
@@ -438,6 +447,13 @@ pub fn close_cloexec_fds(pid: Pid) {
     for id in eventfds {
         crate::eventfd::eventfd_close(id);
     }
+    // Phase 89 Track A.1 — same discipline for timerfd: libuv opens its
+    // event-loop due-timer with TFD_CLOEXEC, so execve must release it or the
+    // timerfd slot (cap TIMERFD_MAX) leaks across every exec of a process that
+    // used timers.
+    for id in timerfds {
+        crate::timerfd::timerfd_close(id);
+    }
     for inode_num in ext2_last_alias {
         crate::fs::ext2::reap_unused_ext2_inode(inode_num);
     }
@@ -463,6 +479,7 @@ pub fn close_all_fds_for(pid: Pid) {
     let mut unix_sockets = alloc::vec::Vec::new();
     let mut epolls = alloc::vec::Vec::new();
     let mut eventfds = alloc::vec::Vec::new();
+    let mut timerfds = alloc::vec::Vec::new();
     let mut ext2_inodes = alloc::vec::Vec::new();
     let mut vfs_handles = alloc::vec::Vec::new();
     let mut ext2_last_alias = alloc::vec::Vec::new();
@@ -484,6 +501,7 @@ pub fn close_all_fds_for(pid: Pid) {
                     FdBackend::UnixSocket { handle } => unix_sockets.push(*handle),
                     FdBackend::Epoll { instance_id } => epolls.push(*instance_id),
                     FdBackend::EventFd { id } => eventfds.push(*id),
+                    FdBackend::TimerFd { id } => timerfds.push(*id),
                     FdBackend::Ext2Disk { inode_num, .. } => ext2_inodes.push(*inode_num),
                     FdBackend::VfsService { service_handle, .. } => {
                         vfs_handles.push(*service_handle)
@@ -538,6 +556,12 @@ pub fn close_all_fds_for(pid: Pid) {
     // eventfd slot (cap EVENTFD_MAX) for the lifetime of the kernel.
     for id in eventfds {
         crate::eventfd::eventfd_close(id);
+    }
+    // Phase 89 Track A.1 — same for timerfd on exit: without this every Node
+    // process — libuv arms one event-loop due-timer (TFD_CLOEXEC) — would leak a
+    // timerfd slot (cap TIMERFD_MAX) for the lifetime of the kernel.
+    for id in timerfds {
+        crate::timerfd::timerfd_close(id);
     }
     for inode_num in ext2_last_alias {
         crate::fs::ext2::reap_unused_ext2_inode(inode_num);

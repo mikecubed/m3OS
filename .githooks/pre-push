@@ -556,9 +556,9 @@ fi
 # because it cross-builds the fully-static jitless ~100 MB Node.js 22 + npm
 # `.m3pkg`, builds a fresh M3OS_WITH_NODE image, boots QEMU, `pkg install node`,
 # and proves `node --version` (22.x) RUNS on target plus an fs/event-loop/timer
-# probe (the A.1 timerfd path), a loopback http.createServer+http.get, and a
-# plaintext HTTP GET over the in-kernel TCP stack via SLIRP guestfwd (the
-# always-on core). The TLS/DNS/npm-install arms are opt-in (M3OS_NODE_NET=1: live
+# probe (the A.1 timerfd path) and a plaintext HTTP GET over the in-kernel TCP
+# stack via SLIRP guestfwd (NODE_EGRESS_OK — the always-on core; the
+# FUTEX_CMP_REQUEUE regression guard). The TLS/DNS/npm-install arms are opt-in (M3OS_NODE_NET=1: live
 # HTTPS cert-validate + `npm install is-number` over real egress); absent it they
 # are skip-with-reason. Absent a host C++ toolchain (clang/clang++/ld.lld/python3/
 # make) + the llvm musl sysroot the gate prints SKIP and returns success. Set this

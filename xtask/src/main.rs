@@ -18762,19 +18762,10 @@ fn populate_ext2_files(
         let ticks = 0;\n\
         const iv = setInterval(() => { ticks++; if (ticks >= 2) { clearInterval(iv); setTimeout(() => console.log('NODE_TIMER_OK'), 10); } }, 20);\n";
 
-    // node-http.js: a loopback `http.createServer` + `http.get` round-trip on an
-    // ephemeral port — proves the Node HTTP server + client work over the
-    // in-kernel TCP stack on 127.0.0.1 (NODE_HTTP_OK on a 200/body match).
-    let node_http_js_content = "const http = require('http');\n\
-        const server = http.createServer((req, res) => { res.writeHead(200, {'Content-Type':'text/plain'}); res.end('ok'); });\n\
-        server.listen(0, '127.0.0.1', () => {\n\
-        \x20 const port = server.address().port;\n\
-        \x20 http.get({host:'127.0.0.1', port, path:'/'}, (res) => {\n\
-        \x20   let body = '';\n\
-        \x20   res.on('data', c => body += c);\n\
-        \x20   res.on('end', () => { if (res.statusCode === 200 && body === 'ok') console.log('NODE_HTTP_OK'); server.close(); });\n\
-        \x20 });\n\
-        });\n";
+    // (A loopback `http.createServer` + `http.get` over 127.0.0.1 fixture was
+    // removed: m3OS has no 127.0.0.1 loopback interface, so it can never route.
+    // node-http-egress.js below is the in-kernel-TCP proof instead — a real GET
+    // to a SLIRP host server.)
 
     // node-http-egress.js: a plaintext HTTP GET against the URL in argv[2] (the
     // SLIRP guestfwd host server at 10.0.2.100:80) — the always-on egress proof
@@ -19238,7 +19229,6 @@ fn populate_ext2_files(
     let hello_c_tmp = output_dir.join("_tmp_hello_c");
     let hello_cpp_tmp = output_dir.join("_tmp_hello_cpp");
     let node_probe_js_tmp = output_dir.join("_tmp_node_probe_js");
-    let node_http_js_tmp = output_dir.join("_tmp_node_http_js");
     let node_http_egress_js_tmp = output_dir.join("_tmp_node_http_egress_js");
     fs::write(&passwd_tmp, passwd_content).expect("write temp passwd");
     fs::write(&shadow_tmp, shadow_content).expect("write temp shadow");
@@ -19251,7 +19241,6 @@ fn populate_ext2_files(
     fs::write(&hello_c_tmp, hello_c_content).expect("write temp hello.c");
     fs::write(&hello_cpp_tmp, hello_cpp_content).expect("write temp hello.cpp");
     fs::write(&node_probe_js_tmp, node_probe_js_content).expect("write temp node-probe.js");
-    fs::write(&node_http_js_tmp, node_http_js_content).expect("write temp node-http.js");
     fs::write(&node_http_egress_js_tmp, node_http_egress_js_content)
         .expect("write temp node-http-egress.js");
     fs::write(&sshd_conf_tmp, sshd_conf).expect("write temp sshd.conf");
@@ -19601,10 +19590,6 @@ fn populate_ext2_files(
          sif usr/src/node-probe.js mode 0x81A4\n\
          sif usr/src/node-probe.js uid 0\n\
          sif usr/src/node-probe.js gid 0\n\
-         write \"{}\" usr/src/node-http.js\n\
-         sif usr/src/node-http.js mode 0x81A4\n\
-         sif usr/src/node-http.js uid 0\n\
-         sif usr/src/node-http.js gid 0\n\
          write \"{}\" usr/src/node-http-egress.js\n\
          sif usr/src/node-http-egress.js mode 0x81A4\n\
          sif usr/src/node-http-egress.js uid 0\n\
@@ -19613,7 +19598,6 @@ fn populate_ext2_files(
         hello_c_tmp.display(),
         hello_cpp_tmp.display(),
         node_probe_js_tmp.display(),
-        node_http_js_tmp.display(),
         node_http_egress_js_tmp.display(),
     );
 
@@ -20182,7 +20166,6 @@ fn populate_ext2_files(
     let _ = fs::remove_file(&hello_c_tmp);
     let _ = fs::remove_file(&hello_cpp_tmp);
     let _ = fs::remove_file(&node_probe_js_tmp);
-    let _ = fs::remove_file(&node_http_js_tmp);
     let _ = fs::remove_file(&node_http_egress_js_tmp);
     let _ = fs::remove_file(&sshd_conf_tmp);
     if enable_telnet {

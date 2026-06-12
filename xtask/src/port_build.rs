@@ -3475,8 +3475,9 @@ const LLVM_TGT_SYSROOT: &str = "/usr/lib/clang-sysroot";
 /// Phase 89 — cross-build a fully-static musl `node` (+ bundled `npm`) using the
 /// host clang/clang++ targeting musl (musl-tools has no C++ compiler, so this is
 /// the `build_llvm` model, NOT the musl-gcc C path) plus `build_llvm`'s static
-/// `libc++.a`. The V8 engine is built **jitless** (`--v8-lite-mode`) so it never
-/// requests RWX/executable memory (m3OS W^X). See `ports/lang/node/Portfile` and
+/// `libc++.a`. The V8 engine is built **jitless** (`--v8-options=--jitless`, NOT
+/// `--v8-lite-mode` — see the configure block) so it never requests
+/// RWX/executable memory (m3OS W^X). See `ports/lang/node/Portfile` and
 /// `docs/89-nodejs.md` for the full configuration rationale.
 fn build_node(port_src: &Path, stage: &Path, port_dir: &Path) -> Result<(), String> {
     let root = workspace_root();
@@ -3666,6 +3667,11 @@ fn build_node(port_src: &Path, stage: &Path, port_dir: &Path) -> Result<(), Stri
         // "overriding recipe" warning. So we use the make backend.
         "--openssl-no-asm",
         "--without-corepack",
+        // The Node startup snapshot is built by running a host-glibc
+        // `node_mksnapshot` against the musl-static target build during the
+        // build; disabling it sidesteps a host/target snapshot-blob mismatch
+        // (the snapshot is regenerated at first run instead). Small startup cost,
+        // robust cross-build.
         "--without-node-snapshot",
         "--without-inspector",
     ]);

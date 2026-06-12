@@ -1,7 +1,7 @@
 # Node.js
 
 **Aligned Roadmap Phase:** Phase 89
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-89
 **Supersedes Legacy Doc:** docs/archived/nodejs-roadmap.md (revived as docs/nodejs-roadmap.md)
 
@@ -152,11 +152,20 @@ Key `./configure` flags:
 |---|---|
 | `--fully-static` | No `PT_INTERP`; disables `dlopen`; loaderless contract like CPython/Go/Clang |
 | `--v8-options=--jitless` | Jitless V8 (zero runtime executable memory); W^X safe; the primary W^X config (see above). NOT `--v8-lite-mode` — that removes WASM, which aborts Node 22 startup |
+| `--enable-static` | Builds the static `libnode.a` alongside the binary (harmless; the static-musl link consumes the objects) |
 | `--with-intl=small-icu` | Bundles en-US ICU data into the binary; `Intl.NumberFormat('en-US')` works |
-| `--cross-compiling` | GYP honors the `CC_host`/`CXX_host` split even on same-arch |
 | `--without-inspector` | Drops the `--inspect`/DevTools C++ surface (documented non-goal) |
 | `--openssl-no-asm` | Avoids perlasm paths that break under clang+lld+musl |
 | `--without-corepack` | Drops the corepack shim; npm is enough |
+| `--without-node-snapshot` | Skips the host-`node_mksnapshot`→target startup-snapshot blob (a host-glibc tool writing a musl-target blob); the snapshot is regenerated at first run — small startup cost, robust cross-build |
+
+> **NB — `--cross-compiling` is deliberately NOT passed.** Build host and target
+> are both x86_64 and a fully-static musl `mksnapshot`/`torque` runs natively on
+> the glibc host, so the `CC_host`/`CXX_host` env split is honored without it.
+> Passing `--cross-compiling` forces V8's `want_separate_host_toolset=1`, which
+> emits both host- and target-toolset `v8_inspector_headers` rules writing the
+> same arch-independent `js_protocol.stamp` → a fatal "multiple rules generate"
+> error. A single native toolset generates it once.
 
 All other major dependencies (OpenSSL, zlib, c-ares, nghttp2, llhttp, brotli,
 ngtcp2, simdjson, simdutf, ICU data) are **bundled** — `DEPS=` is empty and no

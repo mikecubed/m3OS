@@ -16531,6 +16531,11 @@ pub(super) fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
                         FdBackend::EventFd { id } => {
                             crate::eventfd::eventfd_add_ref(*id);
                         }
+                        // Phase 89 Track A.1 — same for timerfd (sys_dup/sys_dup2
+                        // already bump it; fcntl(F_DUPFD) must stay symmetric).
+                        FdBackend::TimerFd { id } => {
+                            crate::timerfd::timerfd_add_ref(*id);
+                        }
                         _ => {}
                     }
                     new_fd as u64
