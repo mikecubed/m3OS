@@ -62,9 +62,18 @@ fn main(args: &[&str], env: &[&str]) -> i32 {
 
     if idx >= rest.len() {
         // No COMMAND: print the environment (cleared by -i) plus any standalone
-        // assignments.
+        // assignments. An assignment OVERRIDES (replaces) an inherited var of the
+        // same NAME, so suppress the stale inherited line — mirroring the exec
+        // path below, and matching the documented semantics / GNU `env`.
         if !clear_env {
             for e in env {
+                let eb = e.as_bytes();
+                if assignments
+                    .iter()
+                    .any(|a| a.as_bytes().contains(&b'=') && key_of(a.as_bytes()) == key_of(eb))
+                {
+                    continue;
+                }
                 print(e);
                 print("\n");
             }
@@ -171,10 +180,16 @@ fn main(args: &[&str], env: &[&str]) -> i32 {
     };
 
     // --- COMMAND as a NUL-terminated path ---
+    // Fail fast rather than execing a silently-truncated (wrong) command name,
+    // mirroring the argv overflow handling above.
     let mut cmd_nul = [0u8; 512];
     let cb = cmd.as_bytes();
-    let clen = cb.len().min(511);
-    cmd_nul[..clen].copy_from_slice(&cb[..clen]);
+    if cb.len() >= cmd_nul.len() {
+        eprintln("env: command name too long");
+        return 127;
+    }
+    let clen = cb.len();
+    cmd_nul[..clen].copy_from_slice(cb);
     cmd_nul[clen] = 0;
 
     exec_with_path_search(
