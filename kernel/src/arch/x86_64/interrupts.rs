@@ -511,12 +511,15 @@ pub fn demand_map_vma_page_from_kernel(vaddr: u64, require_write: bool) -> bool 
 /// Pass `0x3` (`PROT_READ|PROT_WRITE`) for stack pages.
 ///
 /// `pkey` is the protection key (0..=15) to stamp into PTE bits 59..=62
-/// (Phase 90a Track B.2). This is the **one from-scratch user-PTE composition
-/// path** — every other PTE-rewrite path carries the key through from an
-/// existing flag word (see the audit in `crate::mm::pkey`). All current callers
-/// pass the default key 0, so the produced PTE is bit-for-bit identical to the
-/// pre-PKU one; Track B.3's `sys_pkey_mprotect`/VMA-pkey wiring is what will
-/// later supply a non-zero key here so a faulted-in tagged page keeps its tag.
+/// (Phase 90a Track B.2). This is the **only *demand-fault* from-scratch
+/// user-PTE composition path** — the eager paths (file-backed mmap in
+/// `sys_mmap_file_backed` and ELF segment load in `mm/elf.rs::segment_flags`)
+/// also compose PTEs from scratch but use key 0 today; they are enumerated in
+/// the audit table in `crate::mm::pkey` and flagged for B.3/C.1 revisit. All
+/// current callers pass the default key 0, so the produced PTE is bit-for-bit
+/// identical to the pre-PKU one; Track B.3's `sys_pkey_mprotect`/VMA-pkey
+/// wiring is what will later supply a non-zero key here so a faulted-in tagged
+/// page keeps its tag.
 ///
 /// Called from the page fault ISR and from kernel-context demand faulting.
 /// Returns `true` on success, `false` on OOM.

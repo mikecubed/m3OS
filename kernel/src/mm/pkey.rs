@@ -34,17 +34,19 @@
 //! preservation. The invariant: a path that starts from an existing PTE's
 //! `flags()` and toggles individual bits **preserves** the key field for free
 //! (the key bits are untouched by the toggles); a path that composes a flag word
-//! **from scratch** (from POSIX `prot` bits) must route the key through
-//! [`compose_user_pte_flags`] or it drops the tag.
+//! **from scratch** (from POSIX `prot` bits or ELF `p_flags`) must route the key
+//! through [`compose_user_pte_flags`] or it drops the tag.
 //!
 //! | Path | File:symbol | Composes from | Key handling |
 //! |---|---|---|---|
-//! | Demand fault commit | `arch/x86_64/interrupts.rs::demand_map_user_page_locked` | scratch (`prot`) | **Routed through [`compose_user_pte_flags`]** — takes a `pkey` arg (0 until a VMA carries a key in Track B.3). This is the one from-scratch user-PTE commit; without the route a faulted-in JIT page would lose its tag. |
+//! | Demand fault commit (anonymous lazy) | `arch/x86_64/interrupts.rs:523::demand_map_user_page_locked` | scratch (`prot`) | **Routed through [`compose_user_pte_flags`]** — takes a `pkey` arg (0 until a VMA carries a key in Track B.3). This is the only *demand-fault* from-scratch composition; without the route a faulted-in JIT page would lose its tag. Eager paths are enumerated below. |
+//! | File-backed mmap (eager) | `arch/x86_64/syscall/mod.rs:11277::sys_mmap_file_backed` — `pt_flags` built at line 11310, mapped via `map_user_frames` at line 11448 | scratch (`prot`) | **Key 0 today** — composes `PRESENT \| USER_ACCESSIBLE` (+ `WRITABLE` / `NO_EXECUTE` from `prot`) without a key stamp. Correct while no VMA carries a non-zero key (key 0 = no PKRU restriction). **B.3/C.1 must revisit** this row when VMAs gain keys: file-backed pages need the same `compose_user_pte_flags` route as the demand-fault path. |
+//! | ELF segment load (eager, execve) | `mm/elf.rs:311::segment_flags` — called at line 448 in `map_load_segment` (line 376), which uses `mapper.map_to` at line 462 | scratch (`p_flags`) | **Key 0 today** — composes `PRESENT \| USER_ACCESSIBLE` (+ `WRITABLE` / `NO_EXECUTE` from `p_flags`) without a key stamp. Correct for current use (no VMA pkey). **B.3/C.1 must revisit** if ELF segments ever land in a pkey-tagged range; `segment_flags` should accept a `pkey` arg and route through `compose_user_pte_flags`. |
 //! | CoW fork copy | `arch/x86_64/syscall/mod.rs::cow_clone_user_pages` | parent `pte.flags()` | **Preserved.** Child flags are `(flags & !WRITABLE) \| BIT_9` (or `flags` verbatim for non-writable / device frames) — the whole word is carried, so bits 59..=62 ride along unchanged. No change needed. |
 //! | CoW fault resolution | `arch/x86_64/interrupts.rs::resolve_cow_fault` | existing `pte.flags()` | **Preserved.** New flags are `(pte.flags() \| WRITABLE) & !BIT_9` and the same physical-or-fresh frame; only WRITABLE/BIT_9 toggle, the key field is untouched. No change needed. |
-//! | `mprotect` permission rewrite / range split | `arch/x86_64/syscall/mod.rs::sys_mprotect` | existing `old_flags` | **Preserved.** `final_flags` starts as `old_flags` and only toggles PRESENT / WRITABLE / NO_EXECUTE / USER / BIT_9 / BIT_10; the key field carries through. (`pkey_mprotect` — Track B.3 — is the path that will *set* a non-zero key here.) No change needed. |
-//! | Fresh mmap commit | demand-paged: no PTE is written at `sys_mmap` time (anonymous mmap records a VMA; pages are filled by the demand-fault path above) | — | Covered by the demand-fault row. |
-//! | `map_current_user_page_locked` / `map_user_frames*` | `mm/paging.rs`, `mm/user_space.rs` | caller-supplied `flags` | **Pass-through.** These take a full `PageTableFlags` and write it verbatim, so they carry whatever key the caller composed. The composition responsibility sits with the caller (the demand-fault path above is the one that composes from scratch). No change needed. |
+//! | `mprotect` permission rewrite / range split | `arch/x86_64/syscall/mod.rs:11754::sys_mprotect` — `new_flags` built from `prot` at line 11808, but applied as `final_flags = old_flags` + bit-toggles at line 11860 | existing `old_flags` | **Preserved.** `final_flags` starts as `old_flags` and only toggles PRESENT / WRITABLE / NO_EXECUTE / USER / BIT_9 / BIT_10; the key field carries through. (`pkey_mprotect` — Track B.3 — is the path that will *set* a non-zero key here.) No change needed. |
+//! | Anonymous mmap (demand-paged) | `arch/x86_64/syscall/mod.rs` — `sys_mmap` anon path records a VMA at line 11248; no PTE is written at `sys_mmap` time | — | Covered by the demand-fault row above. |
+//! | `map_current_user_page_locked` / `map_user_frames*` | `mm/paging.rs`, `mm/user_space.rs` | caller-supplied `flags` | **Pass-through.** These take a full `PageTableFlags` and write it verbatim, so they carry whatever key the caller composed. The composition responsibility sits with the caller. No change needed here; the eager-mmap callers noted above are the ones that need updating in B.3/C.1. |
 //!
 //! `sys_pkey_mprotect` itself (Track B.3) is the path that *sets* a non-zero key
 //! into a range's PTEs; it is out of scope here and is built against
@@ -88,7 +90,7 @@ mod tests {
     use super::*;
     use kernel_core::pkey::pkey_of;
 
-    #[test]
+    #[test_case]
     fn default_key_is_identical_to_legacy_composition() {
         // Legacy inline composition (pre-Track-B.2) for a few prot values.
         for &prot in &[0x0u64, 0x1, 0x3, 0x5, 0x7] {
@@ -107,7 +109,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[test_case]
     fn nonzero_key_is_stamped_into_the_pte() {
         let flags = compose_user_pte_flags(0x3 /* RW */, 7);
         assert_eq!(pkey_of(flags.bits()), 7);
