@@ -32,15 +32,28 @@ use x86_64::registers::model_specific::Msr;
 /// AVX (bit 2).  AVX-512 (bit 5) is intentionally deferred.
 pub const XSAVE_FEATURE_MASK: u64 = 0x7;
 
-/// Static XSAVE area size for the 1.0 mask.  Validated at boot in
-/// `kernel_main` against the post-`enable_xsave_state` size returned by
-/// [`enabled_area_size`] (CPUID 0Dh.0.EBX re-read after `xsetbv` so it
-/// reflects the actually-enabled XCR0 mask) — if a future CPUID change
-/// ever makes this too small, the kernel panics.
+/// Static XSAVE area size.  Validated at boot in `kernel_main` against the
+/// post-`enable_xsave_state` size returned by [`enabled_area_size`] (CPUID
+/// 0Dh.0.EBX re-read after `xsetbv` so it reflects the actually-enabled XCR0
+/// mask) — if a future CPUID change ever makes this too small, the kernel
+/// panics.
 ///
 /// Intel SDM Vol 1 §13.4: with x87 + SSE + AVX enabled in XCR0, the standard
-/// area is 832 bytes (legacy region 512, header 64, AVX YMM_HI region 256).
-pub const XSAVE_AREA_SIZE: usize = 832;
+/// (non-compacted) area is 832 bytes (legacy region 512, header 64, AVX YMM_HI
+/// region 256).
+///
+/// **Phase 90a B.1:** when the CPU supports PKU and the kernel enables XSAVE
+/// component 9 (PKRU) in XCR0, the standard area grows to include the PKRU
+/// component, whose architectural offset (2688 on parts that reserve the
+/// AVX-512 component region before it) + size (8 bytes) = 2696.  The static
+/// buffer is therefore sized to 2752 (the next 64-byte multiple ≥ 2696) so the
+/// per-task `XSaveArea`, the slab slot, the signal frame, and the syscall
+/// snapshot buffers all fit the PKU-grown layout.  On a no-PKU CPU component 9
+/// is never enabled, the enabled area stays 832, and the only cost is the
+/// (small, fixed) slack in the static buffer — behaviour is otherwise
+/// bit-for-bit unchanged.  `XSAVE_AREA_SIZE >= enabled_area_size()` is asserted
+/// at boot on every configuration.
+pub const XSAVE_AREA_SIZE: usize = 2752;
 
 /// CPUID-discovered XSAVE feature surface.
 ///
@@ -104,6 +117,9 @@ impl XSaveFeatures {
 
 static FEATURES: Once<XSaveFeatures> = Once::new();
 static OSXSAVE_ENABLED: AtomicBool = AtomicBool::new(false);
+/// Phase 90a B.1 — set true once `enable_xsave_state` has set `CR4.PKE` on at
+/// least one core (i.e. PKU is active this boot).  Mirrors `OSXSAVE_ENABLED`.
+static OSPKE_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Probe CPUID for XSAVE features.  Idempotent — first call wins.
 ///
@@ -154,10 +170,21 @@ pub fn features() -> &'static XSaveFeatures {
 
 /// Enable XSAVE on the current core.
 ///
-/// Sets `CR4.OSXSAVE` (bit 18) and writes `XCR0 = XSAVE_FEATURE_MASK` via
-/// `xsetbv` with `ECX=0`.  Must be called once on the BSP **before**
-/// `smp::boot::boot_aps()` (so APs inherit `CR4` via the trampoline copy)
-/// and once on each AP after its CR4 is loaded.
+/// Sets `CR4.OSXSAVE` (bit 18) and writes `XCR0` via `xsetbv` with `ECX=0`.
+/// The XCR0 mask is `XSAVE_FEATURE_MASK` (x87+SSE+AVX) plus, **when the CPU
+/// supports PKU (Phase 90a B.1)**, the PKRU component bit (9) — and on a
+/// PKU-capable CPU this also sets `CR4.PKE` (bit 22) so protection keys are
+/// active and PKRU rides the per-task XSAVE save/restore.  Must be called once
+/// on the BSP **before** `smp::boot::boot_aps()` (so APs inherit `CR4.OSXSAVE`
+/// via the trampoline copy) and once on each AP after its CR4 is loaded.
+///
+/// **Per-core coverage is the point:** `CR4.PKE` and XCR0 are per-core
+/// registers and are **not** carried by the SMP trampoline's `DATA_CR4` copy
+/// for the PKE bit on its own (the trampoline snapshots BSP CR4, but XCR0 is
+/// never inherited and this is the single per-core entry point that programs
+/// both), so an AP that skipped this call would silently ignore protection-key
+/// bits — a per-core security hole.  Routing PKE+XCR0.PKRU through the function
+/// every core already runs closes that gap by construction.
 ///
 /// # Safety
 /// CR4 / XCR0 are privileged registers; this call must run in ring 0 with
@@ -179,12 +206,25 @@ pub unsafe fn enable_xsave_state() {
         cr4.contains(Cr4Flags::OSFXSR),
         "CR4.OSFXSR must be set before enable_xsave_state"
     );
+
+    // Phase 90a B.1 — when PKU is usable, set CR4.PKE (bit 22) on *this* core
+    // so the protection-key MMU check is active and `RDPKRU`/`WRPKRU` do not
+    // `#UD`.  `Cr4Flags::PROTECTION_KEY_USER` is bit 22.  On a no-PKU CPU
+    // `pku_usable()` is false and CR4 is written exactly as before (PKE clear),
+    // keeping behaviour bit-for-bit identical.
+    let pku = pku_usable();
+    let mut new_cr4 = cr4 | Cr4Flags::OSXSAVE;
+    if pku {
+        new_cr4 |= Cr4Flags::PROTECTION_KEY_USER;
+    }
     unsafe {
-        Cr4::write(cr4 | Cr4Flags::OSXSAVE);
+        Cr4::write(new_cr4);
     }
 
-    // Write XCR0 via `xsetbv` with ECX=0 — only XCR0 exists today.
-    let mask = XSAVE_FEATURE_MASK;
+    // Write XCR0 via `xsetbv` with ECX=0 — only XCR0 exists today.  When PKU is
+    // usable, fold in component 9 (PKRU) so PKRU state participates in
+    // xsave64/xrstor64 (the per-task save/restore path B.4 proves end-to-end).
+    let mask = pku_features().xcr0_mask(XSAVE_FEATURE_MASK);
     unsafe {
         core::arch::asm!(
             "xsetbv",
@@ -195,6 +235,9 @@ pub unsafe fn enable_xsave_state() {
         );
     }
 
+    if pku {
+        OSPKE_ENABLED.store(true, Ordering::Release);
+    }
     OSXSAVE_ENABLED.store(true, Ordering::Release);
 }
 
@@ -212,6 +255,90 @@ pub fn enabled_area_size() -> usize {
 #[inline]
 pub fn osxsave_enabled() -> bool {
     OSXSAVE_ENABLED.load(Ordering::Acquire)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 90a Track B.1 — Memory Protection Keys (PKU) detection
+// ---------------------------------------------------------------------------
+//
+// PKU is per-core state: `CR4.PKE` (bit 22) must be set on the BSP **and every
+// AP** (an AP without it silently ignores key bits — a per-core security hole),
+// and PKRU only rides XSAVE when component 9 is enabled in XCR0 and fits the
+// sized XSAVE area the 57e probe validates.  This module exposes the detection;
+// `enable_xsave_state` does the per-core CR4.PKE + XCR0 programming above.  All
+// raw bit decode + the XSAVE-area accounting lives in host-tested
+// `kernel_core::xsave_model::PkuFeaturesModel`.
+
+pub use kernel_core::xsave_model::{PkuFeaturesModel, XCR0_PKRU, XSAVE_COMPONENT_PKRU};
+
+static PKU_FEATURES: Once<PkuFeaturesModel> = Once::new();
+
+/// Probe the PKU/PKRU CPUID surface.  Idempotent — first call wins.
+///
+/// Reads `CPUID.07H.0:ECX` (PKU bit 3 / OSPKE bit 4) and the `CPUID.0Dh`
+/// component-9 (PKRU) size/offset, both guarded by the max-basic-leaf check
+/// (see [`probe_smep_smap`]) so an older CPU that lacks leaf 7 / sub-leaf 9
+/// reports no PKU rather than mis-decoding a lower leaf.  Decode is the
+/// host-tested [`PkuFeaturesModel::from_raw`].
+///
+/// **Note on OSPKE:** like `OSXSAVE`, `CPUID.07H.0:ECX[4]` reflects the runtime
+/// state of `CR4.PKE` — 0 at probe time (the kernel hasn't set it yet), 1 after
+/// [`enable_xsave_state`] runs — so the usability decision ([`pku_usable`])
+/// **never** depends on it, only the architectural PKU bit (3) plus the XSAVE
+/// component-9 advertisement.
+pub fn probe_pku() -> &'static PkuFeaturesModel {
+    PKU_FEATURES.call_once(|| {
+        let max_leaf = cpuid_raw(0, 0).eax;
+        if max_leaf < 0x0D {
+            // No leaf 7 / no leaf 0Dh → no PKU surface at all.
+            return PkuFeaturesModel::from_raw(0, 0, 0, 0, 0);
+        }
+        let leaf7_0 = cpuid_raw(0x07, 0);
+        let leaf_d_0 = cpuid_raw(0x0D, 0);
+        let leaf_d_9 = cpuid_raw(0x0D, XSAVE_COMPONENT_PKRU);
+        PkuFeaturesModel::from_raw(
+            leaf7_0.ecx,
+            leaf_d_0.eax,
+            leaf_d_0.edx,
+            leaf_d_9.eax,
+            leaf_d_9.ebx,
+        )
+    })
+}
+
+/// The cached PKU features.  Must be called after [`probe_pku`] (which
+/// `enable_xsave_state` triggers via [`pku_usable`] on the first core).
+pub fn pku_features() -> &'static PkuFeaturesModel {
+    probe_pku()
+}
+
+/// True when the kernel may enable PKU on this CPU: the architectural PKU bit
+/// is set **and** the XSAVE PKRU component (9) is advertised (so PKRU can ride
+/// the per-task XSAVE save/restore).  Idempotently probes on first use.
+///
+/// This is the single `pku_supported()`-style predicate all downstream code
+/// (the `pkey_*` syscalls, the W^X v2 rule, the `pku-smoke` gate, the `m3ctl`
+/// reporter) must consult — they must never assume PKU from a bare CPUID read.
+pub fn pku_usable() -> bool {
+    probe_pku().pku_usable()
+}
+
+/// True if `CR4.PKE` (bit 22) is currently set on **this** core.  Reads the
+/// live register, so a per-core audit (e.g. the AP boot log) can confirm the
+/// bit actually landed rather than trusting the global `OSPKE_ENABLED` flag.
+pub fn cr4_pke_enabled() -> bool {
+    let cr4: u64;
+    unsafe {
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
+    }
+    cr4 & (1 << 22) != 0
+}
+
+/// True once `enable_xsave_state` has set `CR4.PKE` on at least one core this
+/// boot (PKU is active).  False on a no-PKU CPU.  Mirrors [`osxsave_enabled`].
+#[inline]
+pub fn ospke_enabled() -> bool {
+    OSPKE_ENABLED.load(Ordering::Acquire)
 }
 
 // ---------------------------------------------------------------------------

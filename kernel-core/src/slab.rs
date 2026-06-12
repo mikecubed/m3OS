@@ -1073,10 +1073,12 @@ mod tests {
 
     // Phase 60 Track B.2 — XSaveArea-cache regression.
     //
-    // `xsave_cache` is sized to `XSAVE_AREA_SIZE = 832` bytes (see
+    // `xsave_cache` is sized to `XSAVE_AREA_SIZE` (see
     // `kernel/src/mm/slab.rs::XSAVE_CACHE_SLOT_SIZE` and
     // `kernel/src/arch/x86_64/cpuid.rs::XSAVE_AREA_SIZE`).  This host-side
-    // test mirrors the Task-cache regression at the XSaveArea slot size:
+    // test mirrors the Task-cache regression at a representative XSaveArea-class
+    // slot size (832, the pre-PKU 1.0 size — the exact value is immaterial to
+    // this slab-mechanics test, only that several slots fit one page):
     // alloc/free/reuse cycles must hit the same slot addresses without
     // growing the slab page count.
     #[test]

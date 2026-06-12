@@ -415,10 +415,19 @@ extern "C" fn ap_entry(per_core_data_ptr: *mut super::PerCoreData) -> ! {
         core::arch::asm!("mov cr4, {}", in(reg) bsp_cr4, options(nostack));
     }
 
-    // Phase 57e Track J — write this AP's XCR0 to the 1.0 mask
-    // (x87 + SSE + AVX).  XCR0 is per-core: CR4.OSXSAVE was inherited from the
-    // BSP via the trampoline copy above, but XCR0 itself was not set yet on
-    // this core, so xsave64 / xrstor64 would fault until this call lands.
+    // Phase 57e Track J — write this AP's XCR0 to the enabled mask
+    // (x87 + SSE + AVX, plus PKRU component 9 on a PKU CPU).  XCR0 is per-core:
+    // CR4.OSXSAVE was inherited from the BSP via the trampoline copy above, but
+    // XCR0 itself was not set yet on this core, so xsave64 / xrstor64 would
+    // fault until this call lands.
+    //
+    // Phase 90a B.1 — `enable_xsave_state` also sets this AP's `CR4.PKE` (bit
+    // 22) when PKU is usable.  The trampoline's `DATA_CR4` snapshot of BSP CR4
+    // happens to carry the PKE bit too, but XCR0 component 9 is *not* inherited,
+    // so this per-core call is the load-bearing one — without it this AP would
+    // carry CR4.PKE yet lack PKRU in its XSAVE area (an inconsistent per-core
+    // state).  Routing both through this single call keeps every core's PKU
+    // state consistent by construction.
     unsafe {
         crate::arch::x86_64::cpuid::enable_xsave_state();
     }
@@ -438,13 +447,20 @@ extern "C" fn ap_entry(per_core_data_ptr: *mut super::PerCoreData) -> ! {
     crate::mitigations::init_ap();
 
     log::info!(
-        "[sec] AP CR4.SMEP {} CR4.SMAP {}",
+        "[sec] AP CR4.SMEP {} CR4.SMAP {} CR4.PKE {}",
         if crate::arch::x86_64::cpuid::cr4_smep_enabled() {
             "enabled"
         } else {
             "off"
         },
         if crate::arch::x86_64::cpuid::cr4_smap_enabled() {
+            "enabled"
+        } else {
+            "off"
+        },
+        // Phase 90a B.1 — read the live register so the log proves CR4.PKE
+        // actually landed on *this* AP (the per-core security-hole guard).
+        if crate::arch::x86_64::cpuid::cr4_pke_enabled() {
             "enabled"
         } else {
             "off"
