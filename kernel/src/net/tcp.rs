@@ -189,6 +189,21 @@ pub enum TcpState {
 /// Default TCP window size.
 const DEFAULT_WINDOW: u16 = 8192;
 
+/// Maximum outbound TCP segment payload for the 1500-byte link MTU
+/// (1500 − 20 IPv4 − 20 TCP). The kernel MUST NOT hand virtio-net a frame
+/// larger than the MTU: an oversized segment (e.g. a 1588-byte TLS ClientHello,
+/// which the 8 KiB send window would otherwise emit in one shot) produces a
+/// ~1642-byte Ethernet frame that the NIC silently drops (`send_frame: frame
+/// too large`), so the segment is never transmitted, retransmits are dropped
+/// the same way, and the peer eventually FINs — surfacing in userspace as
+/// "socket disconnected before secure TLS connection was established". Capping
+/// each outbound segment to one MSS keeps every frame within the MTU; the
+/// stream's remaining bytes ride the next segment(s). (Only the TX side needed
+/// this: an inbound full-MTU segment — observed up to 1440 B of payload from the
+/// peer during a real TLS handshake — is ≤1514 B on the wire, which fits the
+/// 1514+hdr RX buffer; it is only m3OS's own >MTU frames that the NIC dropped.)
+const TCP_MSS: usize = 1460;
+
 /// A single TCP connection.
 pub struct TcpConnection {
     pub state: TcpState,
@@ -411,7 +426,10 @@ impl TcpConnection {
         } else {
             window.saturating_sub(in_flight)
         };
-        let n = data.len().min(available);
+        // Cap each segment to one MSS so the built frame never exceeds the link
+        // MTU (see `TCP_MSS`). Larger writes are split across segments — the
+        // caller's partial-write handling (or a follow-up `send`) ships the rest.
+        let n = data.len().min(available).min(TCP_MSS);
         if n == 0 {
             return 0;
         }
