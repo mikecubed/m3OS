@@ -1467,6 +1467,12 @@ pub fn invalidate_cache() {
     if let Some(vol) = EXT2_VOLUME.lock().as_ref() {
         vol.invalidate_block_cache();
     }
+    // Phase 89: the syscall layer calls this after every ext2 mutation it routes
+    // to the `vfs_server` write authority, so it is the natural choke point to
+    // also invalidate the kernel path-metadata (stat) cache — a routed write /
+    // create / unlink / rename / truncate changes the very stat results that
+    // cache holds.
+    crate::fs::metacache::bump();
 }
 
 /// Get uid/gid/mode for an ext2 file by its root-relative path.

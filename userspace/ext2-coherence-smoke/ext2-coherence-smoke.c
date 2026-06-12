@@ -21,6 +21,12 @@
 //   * reader  (argv: "reader" <path> <expected-marker>): a fresh process image
 //     that opens <path> O_RDONLY and exits 0 iff its content == expected.
 //
+// Phase 89 extends this with two sub-tests for the kernel path-metadata (stat)
+// cache: sub-test 4 asserts cross-process stat coherence (a create / grow /
+// chmod / unlink from a fresh process must invalidate the kernel-global cache so
+// a re-stat sees it), and sub-test 5 asserts the cache actually serves hits via
+// /proc/metacache (so a coherent-but-useless no-op also fails the gate).
+//
 // Built as a full-musl static binary (open/read/write/fork/execve/printf), so a
 // FAIL fails the smoke gate. Exits 0 on PASS, non-zero on FAIL.
 
@@ -28,6 +34,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -342,6 +349,154 @@ static int subtest_large_write(void) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Sub-tests 4 & 5 — Phase 89 kernel path-metadata (stat) cache coherence.
+//
+// The kernel caches `vfs_service_stat_path` results (positive AND negative) per
+// absolute ext2 path, so node's repeated `stat`/path-walk storm hits RAM instead
+// of the ring-3 vfs_server IPC. Coherence is by a global epoch bumped on every
+// ext2 mutation. These sub-tests are the metacache's falsifiable contract: a
+// mutation made by a DIFFERENT process must invalidate this (kernel-global) cache
+// so a re-stat sees the new state — never a stale line.
+// ---------------------------------------------------------------------------
+#define STAT_PATH "/root/ext2-coh-stat.txt"
+
+// Stat-mutator role: a FRESH process that performs one mutation on STAT_PATH so
+// the change crosses a process boundary (the orchestrator's cached stat entry
+// must be invalidated by the mutator's epoch bump, kernel-wide).
+static int run_statmutator(const char *op) {
+    if (strcmp(op, "create") == 0) {
+        char body[1000];
+        memset(body, 'A', sizeof(body));
+        return write_file(STAT_PATH, body, sizeof(body)) == 0 ? 0 : 9;
+    }
+    if (strcmp(op, "grow") == 0) {
+        char body[4000];
+        memset(body, 'B', sizeof(body));
+        return write_file(STAT_PATH, body, sizeof(body)) == 0 ? 0 : 9;
+    }
+    if (strcmp(op, "chmod") == 0) {
+        return chmod(STAT_PATH, 0600) == 0 ? 0 : 9;
+    }
+    if (strcmp(op, "remove") == 0) {
+        return unlink(STAT_PATH) == 0 ? 0 : 9;
+    }
+    return 9;
+}
+
+// Sub-test 4 — cross-process stat-cache coherence across create / grow / chmod /
+// unlink. The orchestrator stats first (priming the kernel cache), a fresh
+// process mutates (bumping the epoch), and the orchestrator re-stats — which must
+// reflect the mutation. A stale hit at any step is the exact OS-wide bug the
+// cache could introduce, so each is a hard gate fail.
+static int subtest_stat_cache(void) {
+    struct stat st;
+    unlink(STAT_PATH); // clean slate
+
+    // (a) Negative entry: stat the absent path (the kernel caches the ENOENT),
+    // a fresh process CREATES it, then the re-stat must see the new file — the
+    // create's epoch bump must have invalidated the cached negative.
+    if (stat(STAT_PATH, &st) == 0) {
+        printf("EXT2_COHERENCE:FAIL t4a pre-existing\n");
+        return 1;
+    }
+    if (spawn_self("statmutator", "create", "") != 0) {
+        printf("EXT2_COHERENCE:FAIL t4a create spawn\n");
+        return 1;
+    }
+    if (stat(STAT_PATH, &st) != 0) {
+        printf("EXT2_COHERENCE:t4a STALE-NEG created file not visible\n");
+        return 1;
+    }
+    if (st.st_size != 1000) {
+        printf("EXT2_COHERENCE:t4a STALE size=%lld want 1000\n",
+               (long long)st.st_size);
+        return 1;
+    }
+
+    // (b) Size coherence: a fresh process rewrites the file larger; the re-stat
+    // must report the new size (the write's epoch bump invalidates the cache).
+    if (spawn_self("statmutator", "grow", "") != 0) {
+        printf("EXT2_COHERENCE:FAIL t4b grow spawn\n");
+        return 1;
+    }
+    if (stat(STAT_PATH, &st) != 0 || st.st_size != 4000) {
+        printf("EXT2_COHERENCE:t4b STALE size=%lld want 4000\n",
+               (long long)st.st_size);
+        return 1;
+    }
+
+    // (c) Mode coherence: chmod from a fresh process; the re-stat must see the
+    // new mode. chmod is direct-engine (never vfs-routed), so this exercises the
+    // explicit `data_chmod` epoch bump specifically.
+    if (spawn_self("statmutator", "chmod", "") != 0) {
+        printf("EXT2_COHERENCE:FAIL t4c chmod spawn\n");
+        return 1;
+    }
+    if (stat(STAT_PATH, &st) != 0 || (st.st_mode & 0777) != 0600) {
+        printf("EXT2_COHERENCE:t4c STALE mode=%o want 600\n",
+               (unsigned)(st.st_mode & 0777));
+        return 1;
+    }
+
+    // (d) Unlink coherence: a fresh process removes the file; the re-stat must
+    // now fail — the unlink's epoch bump invalidates the cached positive entry.
+    if (spawn_self("statmutator", "remove", "") != 0) {
+        printf("EXT2_COHERENCE:FAIL t4d remove spawn\n");
+        return 1;
+    }
+    if (stat(STAT_PATH, &st) == 0) {
+        printf("EXT2_COHERENCE:t4d STALE-POS unlinked file still statable "
+               "size=%lld\n",
+               (long long)st.st_size);
+        return 1;
+    }
+    return 0;
+}
+
+// Parse the `hits N` line from /proc/metacache. Returns the count, or -1.
+static long read_metacache_hits(void) {
+    char buf[256];
+    ssize_t n = read_file("/proc/metacache", buf, sizeof(buf));
+    if (n < 0) {
+        return -1;
+    }
+    const char *p = strstr(buf, "hits ");
+    if (!p) {
+        return -1;
+    }
+    return atol(p + 5);
+}
+
+// Sub-test 5 — the cache actually serves hits (it is not a coherent no-op).
+// Re-stat the same ext2 paths in a tight loop (node's prefix re-walk pattern)
+// and assert /proc/metacache `hits` strictly increases: repeated stats were
+// served from RAM instead of crossing the vfs_server IPC boundary. Fails the gate
+// if the cache silently stops caching.
+static int subtest_cache_hits(void) {
+    long before = read_metacache_hits();
+    if (before < 0) {
+        printf("EXT2_COHERENCE:FAIL t5 /proc/metacache unreadable\n");
+        return 1;
+    }
+    struct stat st;
+    // Two stats of the same ext2 path per iteration: with no mutation between
+    // them, the second is guaranteed a cache hit. /etc and /etc/passwd are ext2
+    // (routed to vfs_server → cached); /proc reads do not bump the epoch.
+    for (int rep = 0; rep < 40; rep++) {
+        stat("/etc/passwd", &st);
+        stat("/etc/passwd", &st);
+        stat("/etc", &st);
+        stat("/etc", &st);
+    }
+    long after = read_metacache_hits();
+    if (after <= before) {
+        printf("EXT2_COHERENCE:t5 NO-HITS before=%ld after=%ld\n", before, after);
+        return 1;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     // Reader / writer roles (fresh process images spawned by the orchestrator).
     if (argc >= 4 && strcmp(argv[1], "reader") == 0) {
@@ -352,6 +507,9 @@ int main(int argc, char **argv) {
     }
     if (argc >= 3 && strcmp(argv[1], "bigreader") == 0) {
         return run_bigreader(argv[2]);
+    }
+    if (argc >= 3 && strcmp(argv[1], "statmutator") == 0) {
+        return run_statmutator(argv[2]);
     }
 
     // Orchestrator role.
@@ -390,8 +548,20 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // Best-effort cleanup of the target.
+    // Sub-test 4 — Phase 89 kernel stat-cache coherence across create / grow /
+    // chmod / unlink made from a different process (epoch invalidation).
+    if (subtest_stat_cache() != 0) {
+        return 1;
+    }
+
+    // Sub-test 5 — Phase 89 the stat cache actually serves hits (not a no-op).
+    if (subtest_cache_hits() != 0) {
+        return 1;
+    }
+
+    // Best-effort cleanup of the targets.
     unlink(TARGET);
+    unlink(STAT_PATH);
 
     printf("EXT2_COHERENCE:PASS\n");
     return 0;

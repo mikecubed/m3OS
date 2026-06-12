@@ -8292,7 +8292,8 @@ fn ext2_root_path(path: &str) -> Option<&str> {
 // Phase 54: userspace VFS service routing
 // ---------------------------------------------------------------------------
 
-struct VfsPathStat {
+#[derive(Clone)]
+pub(crate) struct VfsPathStat {
     kind: u64,
     mode: u32,
     uid: u32,
@@ -8479,6 +8480,25 @@ fn vfs_service_open(path: &str, flags: u64) -> u64 {
 }
 
 fn vfs_service_stat_path(path: &str) -> Result<VfsPathStat, u64> {
+    // Phase 89: serve repeated stats / path-walk components from the kernel
+    // metadata cache, eliding the ring-3 `vfs_server` IPC entirely (the npm
+    // metadata-op storm). Capture the epoch BEFORE the fetch so a mutation
+    // racing the IPC can't let a stale line be installed and later served as
+    // fresh — see `metacache::store`.
+    let at_epoch = crate::fs::metacache::epoch();
+    if let Some(cached) = crate::fs::metacache::lookup(path, at_epoch) {
+        return cached;
+    }
+
+    let result = vfs_service_stat_path_uncached(path);
+    crate::fs::metacache::store(path, at_epoch, result.clone());
+    result
+}
+
+/// The uncached `VFS_STAT_PATH` IPC round-trip to `vfs_server`. Split out so the
+/// cache wrapper above stays trivial; never call this directly from the stat
+/// path — go through [`vfs_service_stat_path`] so the result is cached.
+fn vfs_service_stat_path_uncached(path: &str) -> Result<VfsPathStat, u64> {
     use crate::ipc::{endpoint, message::Message, registry};
     use crate::task::scheduler;
     use kernel_core::fs::vfs_protocol::VFS_STAT_PATH;
@@ -8797,6 +8817,50 @@ fn vfs_service_truncate(path: &str, length: u64) -> Result<(), u64> {
     let mut msg = Message::new(VFS_TRUNCATE);
     msg.data[0] = abs.len() as u64;
     msg.data[1] = length;
+    scheduler::deliver_bulk(task_id, alloc::vec::Vec::from(abs.as_bytes()));
+    let reply = endpoint::call_msg(task_id, vfs_ep, msg);
+    if reply.label != 0 {
+        return Err(reply.label);
+    }
+    crate::fs::ext2::invalidate_cache();
+    Ok(())
+}
+
+/// Set inode attributes (chmod / chown / utimes) by path through `vfs_server`,
+/// the single ext2 write owner. Routing the metadata mutation through the owner
+/// (rather than the kernel engine writing the inode directly) keeps the server's
+/// block cache — and the kernel stat cache it backs — coherent: a direct
+/// kernel-engine inode write would leave the server's cached inode block stale
+/// (the chmod-then-stat cross-engine bug). `mask` selects which fields apply.
+#[allow(clippy::too_many_arguments)]
+fn vfs_service_setattr(
+    path: &str,
+    mask: u64,
+    uid: u32,
+    gid: u32,
+    mode: u16,
+    atime: u32,
+    mtime: u32,
+) -> Result<(), u64> {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::fs::vfs_protocol::VFS_SETATTR;
+
+    let vfs_ep = registry::lookup_endpoint_id("vfs").ok_or(NEG_EIO)?;
+    let task_id = scheduler::current_task_id().ok_or(NEG_EINVAL)?;
+    let abs = vfs_abs_path(path);
+    // Only `data[0..3]` are usable payload — the IPC engine reserves `data[3]`
+    // for the reply-cap handle it hands the receiver (see `endpoint::call_msg`).
+    // uid/gid pack to 16 bits each (the ext2 inode width); ctime is set to "now"
+    // by the server, so it need not be carried.
+    let abs_len = abs.len() as u64;
+    let mut msg = Message::new(VFS_SETATTR);
+    msg.data[0] = abs_len;
+    msg.data[1] = ((uid as u64 & 0xFFFF) << 48)
+        | ((gid as u64 & 0xFFFF) << 32)
+        | ((mode as u64 & 0xFFFF) << 16)
+        | (mask & 0xFFFF);
+    msg.data[2] = ((atime as u64) << 32) | (mtime as u64 & 0xFFFF_FFFF);
     scheduler::deliver_bulk(task_id, alloc::vec::Vec::from(abs.as_bytes()));
     let reply = endpoint::call_msg(task_id, vfs_ep, msg);
     if reply.label != 0 {
@@ -9711,6 +9775,21 @@ fn data_file_metadata(rel: &str) -> Option<(u32, u32, u16)> {
 /// Returns 0 on success, NEG_ENOENT if not found, NEG_EIO on error.
 fn data_chmod(rel: &str, mode: u16) -> u64 {
     if crate::fs::ext2::is_mounted() {
+        // Phase 89: route the mode change through the vfs_server (the single ext2
+        // write owner) so its block cache — and the kernel stat cache it backs —
+        // stays coherent. A direct kernel-engine inode write would leave the
+        // server's cached inode block stale, so a later stat would report the
+        // OLD mode (the chmod-then-stat cross-engine bug).
+        if vfs_write_routable() {
+            use kernel_core::fs::vfs_protocol::VFS_SETATTR_MODE;
+            return match vfs_service_setattr(rel, VFS_SETATTR_MODE, 0, 0, mode, 0, 0) {
+                Ok(()) => 0,
+                Err(e) => e,
+            };
+        }
+        // Direct-engine fallback (boot window / vfs_server-as-writer): bump the
+        // stat cache explicitly since `vfs_service_setattr`'s `invalidate_cache`
+        // bump is not on this path.
         let mut vol = crate::fs::ext2::EXT2_VOLUME.lock();
         let vol = match vol.as_mut() {
             Some(v) => v,
@@ -9721,7 +9800,10 @@ fn data_chmod(rel: &str, mode: u16) -> u64 {
             Err(_) => return NEG_ENOENT,
         };
         match vol.set_metadata(rel, u, g, mode) {
-            Ok(()) => 0,
+            Ok(()) => {
+                crate::fs::metacache::bump();
+                0
+            }
             Err(_) => NEG_EIO,
         }
     } else {
@@ -9735,6 +9817,24 @@ fn data_chmod(rel: &str, mode: u16) -> u64 {
 /// Returns 0 on success, NEG_ENOENT if not found, NEG_EIO on error.
 fn data_chown(rel: &str, new_uid: u32, new_gid: u32) -> u64 {
     if crate::fs::ext2::is_mounted() {
+        // Phase 89: route through the vfs_server (single ext2 owner) so its block
+        // cache + the kernel stat cache stay coherent (see `data_chmod`).
+        if vfs_write_routable() {
+            use kernel_core::fs::vfs_protocol::{VFS_SETATTR_GID, VFS_SETATTR_UID};
+            return match vfs_service_setattr(
+                rel,
+                VFS_SETATTR_UID | VFS_SETATTR_GID,
+                new_uid,
+                new_gid,
+                0,
+                0,
+                0,
+            ) {
+                Ok(()) => 0,
+                Err(e) => e,
+            };
+        }
+        // Direct-engine fallback (boot window / vfs_server-as-writer).
         let mut vol = crate::fs::ext2::EXT2_VOLUME.lock();
         let vol = match vol.as_mut() {
             Some(v) => v,
@@ -9745,7 +9845,10 @@ fn data_chown(rel: &str, new_uid: u32, new_gid: u32) -> u64 {
             Err(_) => return NEG_ENOENT,
         };
         match vol.set_metadata(rel, new_uid, new_gid, mode & 0o7777) {
-            Ok(()) => 0,
+            Ok(()) => {
+                crate::fs::metacache::bump();
+                0
+            }
             Err(_) => NEG_EIO,
         }
     } else {
@@ -14516,6 +14619,23 @@ pub(super) fn sys_utimensat(_dirfd: u64, path_ptr: u64, times_ptr: u64, _flags: 
     if crate::fs::ext2::is_mounted()
         && let Some(rel) = ext2_root_path(name)
     {
+        // Phase 89: route through the vfs_server (single ext2 owner) so its block
+        // cache + the kernel stat cache stay coherent (see `data_chmod`).
+        if vfs_write_routable() {
+            use kernel_core::fs::vfs_protocol::{VFS_SETATTR_ATIME, VFS_SETATTR_MTIME};
+            let mut mask = 0u64;
+            if new_atime != u32::MAX {
+                mask |= VFS_SETATTR_ATIME;
+            }
+            if new_mtime != u32::MAX {
+                mask |= VFS_SETATTR_MTIME;
+            }
+            return match vfs_service_setattr(rel, mask, 0, 0, 0, new_atime, new_mtime) {
+                Ok(()) => 0,
+                Err(e) => e,
+            };
+        }
+        // Direct-engine fallback (boot window / vfs_server-as-writer).
         let mut vol = crate::fs::ext2::EXT2_VOLUME.lock();
         if let Some(vol) = vol.as_mut()
             && let Ok(ino) = vol.resolve_path(rel)
@@ -14533,6 +14653,7 @@ pub(super) fn sys_utimensat(_dirfd: u64, path_ptr: u64, times_ptr: u64, _flags: 
             if vol.write_inode(ino, &inode).is_err() {
                 return NEG_EIO;
             }
+            crate::fs::metacache::bump();
             return 0;
         }
         return NEG_ENOENT;

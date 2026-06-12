@@ -43,8 +43,9 @@ use kernel_core::fs::vfs_protocol::{
     VFS_ACCESS_PATH, VFS_CLOSE, VFS_CREATE, VFS_CREATE_KIND_SHIFT, VFS_LINK, VFS_LIST_DIR,
     VFS_MAX_PREAD, VFS_MAX_PWRITE, VFS_MOUNT_EXT2_ROOT, VFS_MOUNT_POLICY, VFS_MOUNT_VFAT_DATA,
     VFS_NODE_DIR, VFS_NODE_FILE, VFS_NODE_SYMLINK, VFS_OPEN, VFS_PREAD, VFS_READ, VFS_RENAME,
-    VFS_STAT_PATH, VFS_STAT_REPLY_SIZE, VFS_TRUNCATE, VFS_UMOUNT_EXT2_ROOT, VFS_UMOUNT_POLICY,
-    VFS_UMOUNT_VFAT_DATA, VFS_UNLINK, VFS_WRITE,
+    VFS_SETATTR, VFS_SETATTR_ATIME, VFS_SETATTR_GID, VFS_SETATTR_MODE, VFS_SETATTR_MTIME,
+    VFS_SETATTR_UID, VFS_STAT_PATH, VFS_STAT_REPLY_SIZE, VFS_TRUNCATE, VFS_UMOUNT_EXT2_ROOT,
+    VFS_UMOUNT_POLICY, VFS_UMOUNT_VFAT_DATA, VFS_UNLINK, VFS_WRITE,
 };
 use syscall_lib::STDOUT_FILENO;
 use syscall_lib::heap::BrkAllocator;
@@ -2048,6 +2049,7 @@ fn request_name(label: u64) -> &'static str {
         VFS_UNLINK => "UNLINK",
         VFS_RENAME => "RENAME",
         VFS_LINK => "LINK",
+        VFS_SETATTR => "SETATTR",
         _ => "UNKNOWN",
     }
 }
@@ -2095,6 +2097,9 @@ fn handle_request(
         VFS_UNLINK => handle_unlink(ext2, msg, recv_buf),
         VFS_RENAME => handle_rename(ext2, msg, recv_buf),
         VFS_LINK => handle_link(ext2, msg, recv_buf),
+        // Phase 89 — set inode attributes (chmod/chown/utimes) so they stay
+        // coherent with this server's block cache and the kernel stat cache.
+        VFS_SETATTR => handle_setattr(ext2, msg, recv_buf),
         _ => (NEG_EINVAL, 0),
     }
 }
@@ -2575,6 +2580,70 @@ fn handle_truncate(
         if ext2.write_inode(inode_num, &inode).is_err() {
             return (NEG_EIO, 0);
         }
+    }
+    (0, 0)
+}
+
+/// VFS_SETATTR — apply inode attribute changes (chmod / chown / utimes) routed
+/// from the kernel. Going through this server (the single ext2 write owner)
+/// updates the inode in its own block cache, so a subsequent stat — which this
+/// server also answers — is coherent, and the kernel stat cache it backs is
+/// correctly invalidated. A direct kernel-engine inode write would instead leave
+/// a stale cached inode block here (the chmod-then-stat cross-engine bug).
+fn handle_setattr(
+    ext2: &mut Ext2State,
+    msg: &syscall_lib::IpcMessage,
+    recv_buf: &[u8],
+) -> (u64, u64) {
+    // Only `data[0..3]` carry payload — the IPC engine reserves `data[3]` for the
+    // reply-cap handle (see the kernel `vfs_service_setattr`). uid/gid/mode/mask
+    // pack into `data[1]`, atime/mtime into `data[2]`; ctime is set to "now" here.
+    let path_len = msg.data[0] as usize;
+    let mask = msg.data[1] & 0xFFFF;
+    let mode = ((msg.data[1] >> 16) & 0xFFFF) as u16;
+    let gid = ((msg.data[1] >> 32) & 0xFFFF) as u32;
+    let uid = ((msg.data[1] >> 48) & 0xFFFF) as u32;
+    let atime = (msg.data[2] >> 32) as u32;
+    let mtime = (msg.data[2] & 0xFFFF_FFFF) as u32;
+
+    let path = match decode_str(recv_buf, 0, path_len) {
+        Ok(p) => String::from(p),
+        Err(e) => return (e, 0),
+    };
+    // Resolve first so existence/permission is checked even for a no-op request
+    // (e.g. utimes with both UTIME_OMIT must still ENOENT on a missing path).
+    let inode_num = match ext2.resolve_path(&path) {
+        Ok(n) => n,
+        Err(e) => return (e, 0),
+    };
+    // No fields selected → a valid no-op once the path is confirmed to exist.
+    if mask == 0 {
+        return (0, 0);
+    }
+    let mut inode = match ext2.read_inode(inode_num) {
+        Ok(i) => i,
+        Err(_) => return (NEG_EIO, 0),
+    };
+    if mask & VFS_SETATTR_MODE != 0 {
+        // Replace the permission/suid/sgid/sticky bits, preserve the file type.
+        inode.mode = (inode.mode & 0xF000) | (mode & 0x0FFF);
+    }
+    if mask & VFS_SETATTR_UID != 0 {
+        inode.uid = uid as u16;
+    }
+    if mask & VFS_SETATTR_GID != 0 {
+        inode.gid = gid as u16;
+    }
+    if mask & VFS_SETATTR_ATIME != 0 {
+        inode.atime = atime;
+    }
+    if mask & VFS_SETATTR_MTIME != 0 {
+        inode.mtime = mtime;
+    }
+    // ctime advances on any attribute change (matches the kernel engine).
+    inode.ctime = now_unix_secs();
+    if ext2.write_inode(inode_num, &inode).is_err() {
+        return (NEG_EIO, 0);
     }
     (0, 0)
 }

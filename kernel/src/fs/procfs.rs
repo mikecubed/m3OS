@@ -64,7 +64,7 @@ pub fn path_node(abs_path: &str) -> Option<ProcfsNode> {
     match parts.as_slice() {
         [
             "meminfo" | "kmsg" | "stat" | "uptime" | "version" | "mounts" | "cpuinfo" | "loadavg"
-            | "m3os-boot-mode" | "blkstats",
+            | "m3os-boot-mode" | "blkstats" | "metacache",
         ] => Some(ProcfsNode::File),
         ["self"] => Some(ProcfsNode::Symlink(alloc::format!(
             "/proc/{}",
@@ -211,6 +211,7 @@ pub fn read_file(abs_path: &str) -> Option<Vec<u8>> {
         ["loadavg"] => render_loadavg(),
         ["m3os-boot-mode"] => render_boot_mode(),
         ["blkstats"] => render_blkstats(),
+        ["metacache"] => render_metacache(),
         [pid, "status"] => render_status(process_snapshot(parse_pid_component(pid)?)?),
         [pid, "cmdline"] => render_cmdline(process_snapshot(parse_pid_component(pid)?)?),
         [pid, "maps"] => render_maps(process_snapshot(parse_pid_component(pid)?)?),
@@ -261,6 +262,7 @@ pub fn list_dir(abs_path: &str) -> Option<Vec<(String, bool)>> {
             (String::from("cpuinfo"), false),
             (String::from("loadavg"), false),
             (String::from("blkstats"), false),
+            (String::from("metacache"), false),
             (String::from("m3os-boot-mode"), false),
         ];
         // Phase 72b — match Linux's default `/proc` policy: every
@@ -756,6 +758,16 @@ fn render_blkstats() -> String {
     alloc::format!(
         "read_calls {read_calls}\nread_sectors {read_sectors}\nwrite_calls {write_calls}\nwrite_sectors {write_sectors}\n"
     )
+}
+
+/// Phase 89 — `/proc/metacache`: the per-boot kernel path-metadata (stat) cache
+/// counters. `hits` are repeated stats / path-walk components served from RAM
+/// (each one a `VFS_STAT_PATH` IPC to the ring-3 `vfs_server` that never
+/// happened); `bumps` count cache-wide invalidations from ext2 mutations;
+/// `entries` is the current live working-set size.
+fn render_metacache() -> String {
+    let (hits, misses, bumps, entries) = crate::fs::metacache::stats();
+    alloc::format!("hits {hits}\nmisses {misses}\nbumps {bumps}\nentries {entries}\n")
 }
 
 fn render_mounts() -> String {

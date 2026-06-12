@@ -280,6 +280,43 @@ PASSES** (validated under `M3OS_KVM=1`, ~30 s once booted).
 > re-execs `/bin/echo`) and `ENVCATMARKER_OK` (a `#!/usr/bin/env cat` script:
 > staged `/usr/bin/env` PATH-finds `cat` and runs it) arms.
 
+> **VFS throughput — the kernel path-metadata (stat) cache.** Node's
+> `require()` resolution issues tens of thousands of `stat`/path-walk operations,
+> overwhelmingly *repeated* lookups of the same prefix directories
+> (`/usr/lib/node_modules`, …) and *negative* probes for non-existent module
+> candidates. Each one otherwise crosses the ring-0↔ring-3 IPC boundary to the
+> single-threaded `vfs_server` (`VFS_STAT_PATH`), serialising the whole storm
+> through one process — the dominant cost of cold `node`/`npm` startup. The fix
+> (`kernel/src/fs/metacache.rs`) caches the `vfs_service_stat_path` result —
+> positive *and* negative (`ENOENT`) — keyed by absolute path, so a repeated stat
+> or path-walk component hits RAM and never crosses the IPC boundary. One cache
+> covers both user-visible `stat`/`getdents` and the per-component
+> `path_node_nofollow` resolution walk (the higher-leverage win, since every
+> module resolution re-walks the same prefix dirs). It sits ONLY on the
+> user-visible path; the DAC-enforcement path (`path_metadata`) stays on
+> kernel-verified ext2 metadata and is never cached (a lying `vfs_server` must not
+> spoof uid/gid/mode for an access check). Coherence is by a global epoch bumped
+> on *every* ext2 mutation — vfs-routed mutations via `ext2::invalidate_cache`,
+> direct-engine `chmod`/`chown`/`utimensat` at their syscall sites, plus a
+> `blk::write_sectors` backstop — so a cache line is valid only while its stamped
+> epoch matches; correctness needs only "every mutation bumps", not per-path
+> invalidation precision. `/proc/metacache` exposes per-boot `hits`/`misses`/
+> `bumps`/`entries`.
+>
+> **The chmod-then-stat cross-engine fix (`VFS_SETATTR`).** Surfacing the cache
+> exposed a pre-existing dual-engine hazard: `chmod`/`chown`/`utimensat` wrote the
+> inode through the *kernel* ext2 engine, but the `vfs_server` (which answers
+> `stat`) caches inode blocks and never saw the change — so a cross-process (or
+> even same-process) `chmod` then `stat` reported the OLD mode, a real npm bug
+> (executable bits). The fix completes Phase 88's single-owner design: a new
+> `VFS_SETATTR` op routes those metadata mutations through the `vfs_server` (the
+> single ext2 write owner) when `vfs_write_routable()`, so the change lands in its
+> own block cache and a later `stat` is coherent; the direct-engine path remains
+> the boot/`vfs_server`-self fallback. Proven by `ext2-coherence-smoke` sub-test 4
+> (a fresh-process create / grow / chmod / unlink each made visible to a re-stat)
+> and sub-test 5 (`/proc/metacache` `hits` strictly increase under a stat loop, so
+> a coherent-but-useless no-op also fails the gate).
+
 The gate is wired opt-in via `M3OS_NODE_REGRESSION=1` at `--timeout 5400`
 (much faster under `M3OS_KVM=1`, which the gate honors; `M3OS_NODE_FAST_ITER`
 reuses an installed disk). When the host C++ toolchain or the `llvm` musl
@@ -289,6 +326,9 @@ sysroot is absent, the gate prints `SKIP (reason: …)` and exits success.
 
 | File | Purpose |
 |---|---|
+| `kernel/src/fs/metacache.rs` | Kernel path-metadata (stat) cache: epoch-coherent positive+negative lines, `bump`/`lookup`/`store`, `/proc/metacache` counters |
+| `userspace/vfs_server/src/main.rs` | `handle_setattr` — applies chmod/chown/utimes to the server's own ext2 state (single-owner coherence) |
+| `userspace/ext2-coherence-smoke/ext2-coherence-smoke.c` | Sub-tests 4 (cross-process stat coherence) + 5 (`/proc/metacache` hits) |
 | `kernel/src/timerfd.rs` | `timerfd` backing object: expiration count, `it_interval` rearm, poll readiness, `read(2)` drain |
 | `kernel/src/arch/x86_64/syscall/mod.rs` | `sys_timerfd_create` / `sys_timerfd_settime` / `sys_timerfd_gettime` dispatch + `timerfd_readable` wired into `fd_poll_events` |
 | `kernel-core/src/timerfd.rs` | Host-testable expiration accounting and `ns_to_ticks_ceil` / `ticks_to_ns` helpers (11 unit tests) |

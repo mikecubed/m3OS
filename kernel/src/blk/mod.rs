@@ -103,6 +103,13 @@ pub fn write_sectors(start_sector: u64, count: usize, buf: &[u8]) -> Result<(), 
     // NOT device-level requests, which the VirtIO backend fans out per sector).
     BLK_WRITE_CALLS.fetch_add(1, Ordering::Relaxed);
     BLK_WRITE_SECTORS.fetch_add(count as u64, Ordering::Relaxed);
+    // Phase 89: backstop the kernel path-metadata (stat) cache. Every kernel-side
+    // ext2 mutation eventually persists through this single block-write choke
+    // point, so bumping here catches any direct-engine fallback mutation (boot
+    // window / `vfs_server`-as-writer) or future mutation path that forgets to
+    // invalidate explicitly. `bump()` is a lock-free atomic increment (no map
+    // lock), safe to call from here in any context.
+    crate::fs::metacache::bump();
     if remote::is_registered() {
         // No caller-supplied grant when writing through the legacy API — pass
         // `0` so the facade encodes "no separate grant payload" and embeds the
