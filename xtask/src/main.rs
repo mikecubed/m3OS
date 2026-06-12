@@ -251,7 +251,10 @@ const SMOKE_EXIT_GH_SMOKE_FAILED: i32 = 80;
 /// are opt-in (`M3OS_NODE_NET=1`) and skip-with-reason otherwise; absent a host
 /// C++ toolchain + the llvm musl sysroot the whole gate skips with reason
 /// (success exit).
-const SMOKE_EXIT_NODE_SMOKE_FAILED: i32 = 81;
+//
+// NB: 82, not 81 — 81 is already taken by `SMOKE_EXIT_VFS_BULKIO_FAILED` below,
+// so a shared exit code would make the two gates' failures indistinguishable.
+const SMOKE_EXIT_NODE_SMOKE_FAILED: i32 = 82;
 
 /// Phase 87 — `cargo xtask vfs-bulkio-smoke` exit code. Boots m3OS, reads
 /// `/proc/blkstats` before + after a `pkg install` of a multi-MiB package
@@ -14996,8 +14999,14 @@ fn cmd_node_smoke(args: &SmokeBootArgs) {
             .map(|s| s.success())
             .unwrap_or(false)
     }
-    let toolchain_ok = node_tool_on_path("clang")
-        && node_tool_on_path("clang++")
+    // Probe the SAME compiler names `build_node` will actually use — it honors
+    // M3OS_NODE_CLANG / M3OS_NODE_CLANGXX overrides — so a host whose C++ cross
+    // compiler is not literally `clang`/`clang++` is not falsely SKIPped (or run
+    // against a compiler different from the one the build invokes).
+    let clang = std::env::var("M3OS_NODE_CLANG").unwrap_or_else(|_| "clang".to_string());
+    let clangxx = std::env::var("M3OS_NODE_CLANGXX").unwrap_or_else(|_| "clang++".to_string());
+    let toolchain_ok = node_tool_on_path(&clang)
+        && node_tool_on_path(&clangxx)
         && node_tool_on_path("ld.lld")
         && node_tool_on_path("python3")
         && node_tool_on_path("make");

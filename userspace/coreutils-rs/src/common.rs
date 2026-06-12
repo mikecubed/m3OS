@@ -136,12 +136,27 @@ pub fn build_nul_path(buf: &mut [u8], parts: &[&[u8]]) -> Option<usize> {
     Some(pos + 1)
 }
 
-/// Try to exec `cmd` (NUL-terminated) by searching PATH from
-/// `/proc/self/environ`. If `cmd` contains '/', exec it directly. On failure
-/// (all attempts return), this returns without executing anything. The interpreter
-/// inherits `argv`/`envp` verbatim. (Shared by `xargs` and `env`.)
+/// Try to exec `cmd` (NUL-terminated) by PATH search. If `cmd` contains '/', exec
+/// it directly. On failure (all attempts return), this returns without executing
+/// anything. The command inherits `argv`/`envp` verbatim.
+///
+/// `path` selects the search PATH:
+/// * `None` — inherit: read `PATH=` from `/proc/self/environ` (the caller's own
+///   environment). This is what `xargs` passes.
+/// * `Some(p)` with `p` non-empty — an explicit search PATH (e.g. `env`'s
+///   `PATH=…` assignment, which must override the inherited one per POSIX).
+/// * `Some(b"")` — no PATH at all (e.g. `env -i` cleared it) → use only the
+///   `/bin:/usr/bin` default fallback; do NOT consult `/proc/self/environ`.
+///
+/// Shared by `env` (passes an explicit/empty PATH for assignment / `-i`
+/// semantics) and `xargs` (passes `None`).
 #[allow(dead_code)]
-pub fn exec_with_path_search(cmd: &[u8], argv: &[*const u8], envp: &[*const u8]) {
+pub fn exec_with_path_search(
+    cmd: &[u8],
+    argv: &[*const u8],
+    envp: &[*const u8],
+    path: Option<&[u8]>,
+) {
     if cmd.contains(&b'/') {
         execve(cmd, argv, envp);
         return;
@@ -152,36 +167,41 @@ pub fn exec_with_path_search(cmd: &[u8], argv: &[*const u8], envp: &[*const u8])
         cmd
     };
 
-    // Read PATH from /proc/self/environ (NUL-separated KEY=VALUE entries).
+    // Resolve the search PATH bytes. `env_buf` backs the inherited (`None`) case.
     let mut env_buf = [0u8; 4096];
-    let mut path_off = 0usize;
-    let mut path_len = 0usize;
-    let env_path = b"/proc/self/environ\0";
-    let fd = open(env_path, O_RDONLY, 0);
-    if fd >= 0 {
-        let n = read(fd as i32, &mut env_buf);
-        close(fd as i32);
-        if n > 0 {
-            let data = &env_buf[..n as usize];
-            let mut i = 0;
-            while i < data.len() {
-                let end = data[i..]
-                    .iter()
-                    .position(|&b| b == 0)
-                    .map(|p| i + p)
-                    .unwrap_or(data.len());
-                let entry = &data[i..end];
-                if entry.starts_with(b"PATH=") {
-                    path_off = i + 5;
-                    path_len = end.saturating_sub(i + 5);
-                    break;
+    let path_val: &[u8] = match path {
+        Some(p) => p,
+        None => {
+            // Read PATH from /proc/self/environ (NUL-separated KEY=VALUE entries).
+            let mut path_off = 0usize;
+            let mut path_len = 0usize;
+            let fd = open(b"/proc/self/environ\0", O_RDONLY, 0);
+            if fd >= 0 {
+                let n = read(fd as i32, &mut env_buf);
+                close(fd as i32);
+                if n > 0 {
+                    let data = &env_buf[..n as usize];
+                    let mut i = 0;
+                    while i < data.len() {
+                        let end = data[i..]
+                            .iter()
+                            .position(|&b| b == 0)
+                            .map(|p| i + p)
+                            .unwrap_or(data.len());
+                        if data[i..end].starts_with(b"PATH=") {
+                            path_off = i + 5;
+                            path_len = end.saturating_sub(i + 5);
+                            break;
+                        }
+                        i = end + 1;
+                    }
                 }
-                i = end + 1;
             }
+            &env_buf[path_off..path_off + path_len]
         }
-    }
+    };
 
-    if path_len == 0 {
+    if path_val.is_empty() {
         let fallback: [&[u8]; 2] = [b"/bin", b"/usr/bin"];
         for &dir in &fallback {
             let mut path_buf = [0u8; 512];
@@ -192,7 +212,6 @@ pub fn exec_with_path_search(cmd: &[u8], argv: &[*const u8], envp: &[*const u8])
         return;
     }
 
-    let path_val = &env_buf[path_off..path_off + path_len];
     let mut seg_start = 0;
     loop {
         let seg_end = path_val[seg_start..]

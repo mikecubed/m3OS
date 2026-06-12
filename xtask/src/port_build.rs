@@ -600,6 +600,16 @@ pub fn go_toolchain_id() -> String {
 /// reported version line (empty when the compiler is absent — a machine that
 /// cannot build `llvm` also cannot legitimately seal its `.m3pkg`).
 pub fn host_cxx_toolchain_id() -> String {
+    host_cxx_toolchain_id_for("M3OS_LLVM_CLANG", "M3OS_LLVM_CLANGXX")
+}
+
+/// Generalized [`host_cxx_toolchain_id`] that reads the host clang/clang++ names
+/// from the GIVEN override env vars. `node` honors `M3OS_NODE_CLANG` /
+/// `M3OS_NODE_CLANGXX` (a knob distinct from llvm's), so its content key must
+/// fold the identity of the compiler it ACTUALLY uses — otherwise a node build
+/// run with `M3OS_NODE_CLANG=clang-18` would key on the default `clang` and serve
+/// a stale cross-host pkgcache hit.
+pub fn host_cxx_toolchain_id_for(clang_var: &str, clangxx_var: &str) -> String {
     let first_version_line = |cc: &str| -> String {
         Command::new(cc)
             .arg("--version")
@@ -612,8 +622,8 @@ pub fn host_cxx_toolchain_id() -> String {
             })
             .unwrap_or_default()
     };
-    let clang = std::env::var("M3OS_LLVM_CLANG").unwrap_or_else(|_| "clang".to_string());
-    let clangxx = std::env::var("M3OS_LLVM_CLANGXX").unwrap_or_else(|_| "clang++".to_string());
+    let clang = std::env::var(clang_var).unwrap_or_else(|_| "clang".to_string());
+    let clangxx = std::env::var(clangxx_var).unwrap_or_else(|_| "clang++".to_string());
     format!(
         "{clang}|{}|{clangxx}|{}",
         first_version_line(&clang),
@@ -877,8 +887,15 @@ fn compute_port_key_inner(
     let tc = match name {
         // Phase 89 — node joins llvm: both cross-build C++ with the host clang, so
         // fold the host clang/clang++ identity so two host-clang versions don't
-        // collide on one `.m3pkg`.
-        "llvm" | "node" => format!("{}|host-cxx={}", toolchain_id(), host_cxx_toolchain_id()),
+        // collide on one `.m3pkg`. They read DIFFERENT override env vars
+        // (M3OS_LLVM_* vs M3OS_NODE_*), so each folds the identity of the compiler
+        // it actually invokes.
+        "llvm" => format!("{}|host-cxx={}", toolchain_id(), host_cxx_toolchain_id()),
+        "node" => format!(
+            "{}|host-cxx={}",
+            toolchain_id(),
+            host_cxx_toolchain_id_for("M3OS_NODE_CLANG", "M3OS_NODE_CLANGXX")
+        ),
         // Phase 86e — go/gh cross-build with the downloaded Go toolchain, not the
         // musl cross-compiler; fold the Go toolchain identity (not musl) so a Go
         // bump auto-invalidates and a musl change does not spuriously invalidate.
@@ -3548,10 +3565,15 @@ fn build_node(port_src: &Path, stage: &Path, port_dir: &Path) -> Result<(), Stri
     // pays the full build exactly once). Mirrors `build_llvm`.
     let cross_root = root.join("target/node-cross");
     fs::create_dir_all(&cross_root).map_err(|e| format!("mkdir node-cross: {e}"))?;
+    // A required, non-empty VERSION — never default to "" (which would name the
+    // persistent source dir `node-v`, silently mixing sources across versions and
+    // hiding a Portfile parse error).
     let version = parse_portfile(&port_dir.join("Portfile"))
-        .ok()
-        .and_then(|m| m.get("VERSION").cloned())
-        .unwrap_or_default();
+        .map_err(|e| format!("node: re-read Portfile for src dir name: {e}"))?
+        .get("VERSION")
+        .cloned()
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| "node: Portfile is missing a non-empty VERSION".to_string())?;
     let stable_src = cross_root.join(format!("node-v{version}"));
     let src: PathBuf = if stable_src.join("configure").exists() {
         println!("node: reusing persistent source {}", stable_src.display());
@@ -3710,12 +3732,34 @@ fn assert_node_layout(stage: &Path) -> Result<(), String> {
             node_bin.display()
         ));
     }
+    // Fail-closed static-link check using the same byte-scan guard the
+    // python/dropbear ports use: a fully-static binary must NOT reference the
+    // dynamic loader. `binary_contains` propagates Err on a read failure (it
+    // never silently passes), so a missing/unreadable binary fails the gate.
+    if binary_contains(&node_bin, b"/lib/ld-musl-x86_64.so.1")? {
+        return Err("node: staged `node` references the dynamic loader \
+                    `/lib/ld-musl-x86_64.so.1` — not fully static (m3OS's ld-musl \
+                    has no real `libc.so`). Check --fully-static."
+            .into());
+    }
+    // Belt-and-suspenders: when `readelf` is present, also reject a PT_INTERP
+    // segment — but only trust its output on a clean (zero) exit, otherwise a
+    // failed `readelf` would vacuously "pass" the INTERP check.
     if probe_tool_on_path("readelf") {
         let out = Command::new("readelf")
             .args(["-l"])
             .arg(&node_bin)
             .output()
             .map_err(|e| format!("node: readelf failed: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "node: `readelf -l {}` exited non-zero ({}) — cannot verify the \
+                 static-link contract: {}",
+                node_bin.display(),
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim(),
+            ));
+        }
         if String::from_utf8_lossy(&out.stdout).contains("INTERP") {
             return Err("node: staged `node` has a PT_INTERP segment — not fully \
                         static (m3OS has no ld-musl `libc.so`). Check --fully-static."

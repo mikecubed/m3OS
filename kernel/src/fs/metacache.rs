@@ -44,10 +44,10 @@
 //!   calls after every routed mutation;
 //! * direct-engine `chmod` / `chown` / `utimensat` (which never route to
 //!   `vfs_server`) bump explicitly at their syscall sites;
-//! * as a backstop, `blk::write_sectors` bumps on *any* block write, so a
-//!   direct-engine fallback mutation (boot window / `vfs_server`-as-writer) or
-//!   any future mutation path that forgets to bump is still caught when it
-//!   reaches the disk.
+//! * as a backstop, `blk::write_sectors` bumps on *any* kernel block write (the
+//!   kernel ext2 engine funnels all of its writes through it), so a direct-engine
+//!   fallback mutation (boot window) or any future kernel-side mutation path that
+//!   forgets to bump is still caught when it reaches the disk.
 //!
 //! The epoch is captured *before* the IPC fetch and re-checked implicitly on the
 //! next lookup, so a mutation racing the fetch can never install a line that is

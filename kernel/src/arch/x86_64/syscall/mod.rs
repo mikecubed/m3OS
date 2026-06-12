@@ -9799,7 +9799,7 @@ fn data_chmod(rel: &str, mode: u16) -> u64 {
             Ok(m) => m,
             Err(_) => return NEG_ENOENT,
         };
-        match vol.set_metadata(rel, u, g, mode) {
+        match vol.set_metadata(rel, u, g, mode, current_unix_time()) {
             Ok(()) => {
                 crate::fs::metacache::bump();
                 0
@@ -9844,7 +9844,7 @@ fn data_chown(rel: &str, new_uid: u32, new_gid: u32) -> u64 {
             Ok(m) => m,
             Err(_) => return NEG_ENOENT,
         };
-        match vol.set_metadata(rel, new_uid, new_gid, mode & 0o7777) {
+        match vol.set_metadata(rel, new_uid, new_gid, mode & 0o7777, current_unix_time()) {
             Ok(()) => {
                 crate::fs::metacache::bump();
                 0
@@ -17384,7 +17384,15 @@ pub(super) fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
                         table.entry(key2).or_default().extend(to_requeue);
                     }
                     if !waiters.is_empty() {
-                        table.insert(key, waiters);
+                        // `extend` into the entry, NOT `insert`: a self-requeue
+                        // (uaddr == uaddr2 ⇒ key2 == key) has just placed the
+                        // requeued waiters into `table[key]` above, so `insert`
+                        // would clobber and permanently strand them (they would
+                        // sit `BlockedOnFutex` with no waker). Appending the
+                        // leftover after the requeued ones preserves FIFO; for the
+                        // common key2 != key case `key` was `remove`d above so the
+                        // entry starts empty and this is identical to `insert`.
+                        table.entry(key).or_default().extend(waiters);
                     }
                 }
             }

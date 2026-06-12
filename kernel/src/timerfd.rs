@@ -266,34 +266,31 @@ pub fn timerfd_add_ref(id: usize) {
 
 /// Decrement the object refcount; free it (and its wait queue) at zero.
 pub fn timerfd_close(id: usize) {
-    let freed = {
-        let mut table = TIMERFD_TABLE.lock();
-        match table.get_mut(id).and_then(|s| s.as_mut()) {
-            Some(obj) => {
-                obj.refcount = obj.refcount.saturating_sub(1);
-                if obj.refcount == 0 {
-                    table[id] = None;
-                    true
-                } else {
-                    false
-                }
+    // Hold `TIMERFD_TABLE` across the wait-queue teardown. Splitting it into two
+    // lock acquisitions (free the table slot, drop the lock, re-lock the wait
+    // queues) opens a create-reuse window: between the two locks a concurrent
+    // `timerfd_create` can grab this just-freed id and install a FRESH wait queue
+    // at `wqs[id]`, which this close would then `wake_all` + null out from under
+    // the new timerfd — corrupting it and losing its wakeups. Acquiring
+    // `TIMERFD_WAITQUEUES` while still holding `TIMERFD_TABLE` keeps the id
+    // reserved through the teardown. Lock order TABLE→WAITQUEUES matches
+    // `timerfd_create` (the only other dual-lock site), so no deadlock; every
+    // WAITQUEUES-only path (`wake_timerfd`/`timerfd_register_waiter`/
+    // `timerfd_deregister_waiter` and `WaitQueue::{wake_all,register,deregister}`)
+    // never re-locks TABLE. The wake stays before the slot is nulled so a sibling
+    // blocked on the last fd is still woken on close.
+    let mut table = TIMERFD_TABLE.lock();
+    if let Some(obj) = table.get_mut(id).and_then(|s| s.as_mut()) {
+        obj.refcount = obj.refcount.saturating_sub(1);
+        if obj.refcount == 0 {
+            table[id] = None;
+            let mut wqs = TIMERFD_WAITQUEUES.lock();
+            if let Some(Some(wq)) = wqs.get(id) {
+                wq.wake_all();
             }
-            None => false,
-        }
-    };
-    if freed {
-        // Wake any task blocked on this timerfd and tear down its wait queue
-        // under a SINGLE `TIMERFD_WAITQUEUES` acquisition — the same atomic
-        // wake-then-free discipline `eventfd_close` documents, so a racing
-        // `timerfd_register_waiter` either runs before the wake (and is woken)
-        // or after the teardown (and fails to register → the read loop returns
-        // EOF / the poll scan reports a terminal event).
-        let mut wqs = TIMERFD_WAITQUEUES.lock();
-        if let Some(Some(wq)) = wqs.get(id) {
-            wq.wake_all();
-        }
-        if id < wqs.len() {
-            wqs[id] = None;
+            if id < wqs.len() {
+                wqs[id] = None;
+            }
         }
     }
 }

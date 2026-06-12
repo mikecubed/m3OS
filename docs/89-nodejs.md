@@ -173,9 +173,11 @@ ngtcp2, simdjson, simdutf, ICU data) are **bundled** — `DEPS=` is empty and no
 runtime package dependencies.
 
 The resulting `node` binary is ELF `EXEC`/`DYN` fully static — no `PT_INTERP`
-segment — proven by `readelf -l` (the same check `build_python`/`build_go` use).
-The sealed `node.m3pkg` measures **~120 MB** (126,327,183 bytes — larger than a
-lite-mode build because WASM stays compiled in; see the jitless note above).
+segment, no `/lib/ld-musl-x86_64.so.1` reference — proven fail-closed by
+`assert_node_layout` (the same `binary_contains` dynamic-loader-needle check the
+`python`/`dropbear` ports use, with a `readelf -l` PT_INTERP cross-check when
+`readelf` is present). The sealed `node.m3pkg` measures **~130 MB** — larger than
+a lite-mode build because WASM stays compiled in; see the jitless note above.
 
 ### npm path: TLS, DNS, and the Phase 90 dependency
 

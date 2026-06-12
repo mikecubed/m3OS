@@ -14,8 +14,8 @@
 #[path = "common.rs"]
 mod common;
 
-use common::{build_nul_path, eprintln};
-use syscall_lib::{O_RDONLY, STDIN_FILENO, close, execve, fork, open, read, waitpid};
+use common::{eprintln, exec_with_path_search};
+use syscall_lib::{STDIN_FILENO, fork, read, waitpid};
 
 syscall_lib::entry_point!(main);
 
@@ -78,83 +78,6 @@ fn parse_items(
         }
     }
     count
-}
-
-/// Try to exec `cmd` (NUL-terminated) by searching PATH from /proc/self/environ.
-/// If `cmd` contains '/', exec it directly. On failure (all attempts return),
-/// this function returns without executing anything.
-fn exec_with_path_search(cmd: &[u8], argv: &[*const u8], envp: &[*const u8]) {
-    if cmd.contains(&b'/') {
-        execve(cmd, argv, envp);
-        return;
-    }
-    // Strip trailing NUL to get just the command name.
-    let cmd_name = if cmd.last() == Some(&0) {
-        &cmd[..cmd.len().saturating_sub(1)]
-    } else {
-        cmd
-    };
-
-    // Read PATH from /proc/self/environ (NUL-separated KEY=VALUE entries).
-    let mut env_buf = [0u8; 4096];
-    let mut path_off = 0usize;
-    let mut path_len = 0usize;
-    let env_path = b"/proc/self/environ\0";
-    let fd = open(env_path, O_RDONLY, 0);
-    if fd >= 0 {
-        let n = read(fd as i32, &mut env_buf);
-        close(fd as i32);
-        if n > 0 {
-            let data = &env_buf[..n as usize];
-            let mut i = 0;
-            while i < data.len() {
-                let end = data[i..]
-                    .iter()
-                    .position(|&b| b == 0)
-                    .map(|p| i + p)
-                    .unwrap_or(data.len());
-                let entry = &data[i..end];
-                if entry.starts_with(b"PATH=") {
-                    path_off = i + 5;
-                    path_len = end.saturating_sub(i + 5);
-                    break;
-                }
-                i = end + 1;
-            }
-        }
-    }
-
-    if path_len == 0 {
-        let fallback: [&[u8]; 2] = [b"/bin", b"/usr/bin"];
-        for &dir in &fallback {
-            let mut path_buf = [0u8; 512];
-            if let Some(plen) = build_nul_path(&mut path_buf, &[dir, cmd_name]) {
-                execve(&path_buf[..plen], argv, envp);
-            }
-        }
-        return;
-    }
-
-    let path_val = &env_buf[path_off..path_off + path_len];
-    let mut seg_start = 0;
-    loop {
-        let seg_end = path_val[seg_start..]
-            .iter()
-            .position(|&b| b == b':')
-            .map(|p| seg_start + p)
-            .unwrap_or(path_val.len());
-        let dir = &path_val[seg_start..seg_end];
-        if !dir.is_empty() {
-            let mut path_buf = [0u8; 512];
-            if let Some(plen) = build_nul_path(&mut path_buf, &[dir, cmd_name]) {
-                execve(&path_buf[..plen], argv, envp);
-            }
-        }
-        if seg_end >= path_val.len() {
-            break;
-        }
-        seg_start = seg_end + 1;
-    }
 }
 
 /// Replace all occurrences of `replstr` in `template` with `item`, writing the
@@ -237,7 +160,9 @@ fn run_once(
 
         // argv_ptrs[argc] is the null terminator (initialized to null_ptr).
         let envp: [*const u8; 1] = [null_ptr];
-        exec_with_path_search(&cmd_nul[..clen + 1], &argv_ptrs[..argc + 1], &envp);
+        // None: inherit the search PATH from /proc/self/environ (xargs's child
+        // gets an empty envp, so the PATH for lookup comes from xargs's own env).
+        exec_with_path_search(&cmd_nul[..clen + 1], &argv_ptrs[..argc + 1], &envp, None);
         syscall_lib::exit(127);
     }
     let mut status = 0i32;
@@ -282,7 +207,7 @@ fn run_replace(cmd_bytes: &[u8], fixed_args: &[&str], item: &[u8], replstr: &[u8
         }
 
         let envp: [*const u8; 1] = [null_ptr];
-        exec_with_path_search(&cmd_nul[..clen + 1], &argv_ptrs[..argc + 1], &envp);
+        exec_with_path_search(&cmd_nul[..clen + 1], &argv_ptrs[..argc + 1], &envp, None);
         syscall_lib::exit(127);
     }
     let mut status = 0i32;

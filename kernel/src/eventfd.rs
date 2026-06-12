@@ -201,48 +201,38 @@ pub fn eventfd_add_ref(id: usize) {
 
 /// Decrement the object refcount; free it (and its wait queue) at zero.
 pub fn eventfd_close(id: usize) {
-    let freed = {
-        let mut table = EVENTFD_TABLE.lock();
-        match table.get_mut(id).and_then(|s| s.as_mut()) {
-            Some(obj) => {
-                obj.refcount = obj.refcount.saturating_sub(1);
-                if obj.refcount == 0 {
-                    table[id] = None;
-                    true
-                } else {
-                    false
-                }
+    // Hold `EVENTFD_TABLE` across the wait-queue teardown — do NOT release it
+    // before acquiring `EVENTFD_WAITQUEUES`. Two separate critical sections open
+    // TWO distinct races, and holding both locks closes both:
+    //
+    //  1. create-reuse: between freeing `table[id]` and nulling `wqs[id]`, a
+    //     concurrent `eventfd_create` could grab this id and install a FRESH wait
+    //     queue, which this close would then `wake_all` + null out from under the
+    //     new eventfd. Keeping TABLE held reserves the id through the teardown.
+    //  2. register-after-wake: a reader looping in `sys_linux_read` could
+    //     register on the still-present queue *after* `wake_all` but *before* the
+    //     slot is nulled, then block on a queue freed out from under it. (Unlike a
+    //     parked pipe reader, an eventfd has no per-waiter refcount and
+    //     `eventfd_read` can't distinguish "freed" from "empty".) Holding
+    //     WAITQUEUES across wake+free makes a racing `eventfd_register_waiter`
+    //     either run before the wake (and get woken) or after the teardown (and
+    //     fail to register → EOF in the read loop / terminal event in poll).
+    //
+    // Lock order TABLE→WAITQUEUES matches `eventfd_create` (the only other
+    // dual-lock site), so no deadlock; every WAITQUEUES-only path never re-locks
+    // TABLE. `timerfd_close` mirrors this exact discipline.
+    let mut table = EVENTFD_TABLE.lock();
+    if let Some(obj) = table.get_mut(id).and_then(|s| s.as_mut()) {
+        obj.refcount = obj.refcount.saturating_sub(1);
+        if obj.refcount == 0 {
+            table[id] = None;
+            let mut wqs = EVENTFD_WAITQUEUES.lock();
+            if let Some(Some(wq)) = wqs.get(id) {
+                wq.wake_all();
             }
-            None => false,
-        }
-    };
-    if freed {
-        // Wake any task blocked on this eventfd (a blocking `read`, or
-        // `poll`/`epoll_wait`) and tear down its wait queue under a SINGLE
-        // `EVENTFD_WAITQUEUES` acquisition. If a peer closes the last fd
-        // reference while we are blocked, dropping the wait queue without
-        // waking would strand us forever — so we must wake, like
-        // `pipe_close_reader`/`pipe_close_writer` do on close.
-        //
-        // The wake and the teardown must be atomic. Splitting them into two
-        // lock acquisitions (wake, unlock, re-lock, free) opens a
-        // register-after-wake-before-free window: a reader looping in
-        // `sys_linux_read` could register on the still-present queue *after*
-        // `wake_all` has run but *before* the slot is nulled, then block on a
-        // queue that is freed out from under it. The pipe path tolerates that
-        // gap only because a parked pipe reader keeps `reader_count > 0` (so
-        // the object can't free underneath it) and `pipe_read` returns EOF on a
-        // freed object; an eventfd has neither guarantee (no per-waiter
-        // refcount, and `eventfd_read` can't distinguish "freed" from "empty").
-        // Holding the lock across both makes a racing `eventfd_register_waiter`
-        // either run before the wake (and get woken) or after the teardown (and
-        // fail to register → EOF in the read loop / terminal event in poll).
-        let mut wqs = EVENTFD_WAITQUEUES.lock();
-        if let Some(Some(wq)) = wqs.get(id) {
-            wq.wake_all();
-        }
-        if id < wqs.len() {
-            wqs[id] = None;
+            if id < wqs.len() {
+                wqs[id] = None;
+            }
         }
     }
 }
