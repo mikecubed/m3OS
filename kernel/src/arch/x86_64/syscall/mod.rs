@@ -4877,86 +4877,163 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         }
     };
 
-    let (resolved_name, exec_owned, exec_static, exec_stream) = {
-        // MOUNT_OP_LOCK intentionally not held — `resolve_existing_fs_path`
-        // can issue blocking IPC via the VFS service (Phase 54). Per-volume
-        // locks protect read consistency.
+    // Phase 89 — `#!` shebang support (Linux binfmt_script semantics). If the
+    // resolved file begins with `#!interp [arg]`, re-exec the interpreter with
+    // argv rewritten to `[interp, arg?, script_path, original_argv[1..]]`,
+    // looping (bounded by ELOOP) so an interpreter that is itself a script also
+    // resolves. `exec_target`/`shebang_argv` carry the possibly-rewritten
+    // path/argv into the loop; a non-script file falls through to the ELF loader.
+    let mut exec_target: alloc::string::String = alloc::string::String::from(raw_name);
+    let mut shebang_argv: alloc::vec::Vec<alloc::vec::Vec<u8>> = user_argv;
+    let mut shebang_depth = 0u32;
+    let (resolved_name, exec_owned, exec_static, exec_stream) = loop {
+        let raw_name = exec_target.as_str();
+        let resolved_tuple = {
+            // MOUNT_OP_LOCK intentionally not held — `resolve_existing_fs_path`
+            // can issue blocking IPC via the VFS service (Phase 54). Per-volume
+            // locks protect read consistency.
 
-        // Follow the final symlink like Linux execve().
-        let lexical = match resolve_path_from_dirfd(AT_FDCWD, raw_name) {
-            Ok(path) => path,
-            Err(err) => {
-                #[cfg(feature = "exec-trace")]
-                log::info!(
-                    "[exec-trace] pid={} execve resolve_path_from_dirfd failed: errno={}",
-                    crate::process::current_pid(),
-                    err as i64
-                );
-                return err;
-            }
-        };
-        let resolved = match resolve_existing_fs_path(&lexical, true) {
-            Ok(path) => path,
-            Err(err) => {
-                #[cfg(feature = "exec-trace")]
-                log::info!(
-                    "[exec-trace] pid={} execve resolve_existing_fs_path failed: errno={}",
-                    crate::process::current_pid(),
-                    err as i64
-                );
-                return err;
-            }
-        };
+            // Follow the final symlink like Linux execve().
+            let lexical = match resolve_path_from_dirfd(AT_FDCWD, raw_name) {
+                Ok(path) => path,
+                Err(err) => {
+                    #[cfg(feature = "exec-trace")]
+                    log::info!(
+                        "[exec-trace] pid={} execve resolve_path_from_dirfd failed: errno={}",
+                        crate::process::current_pid(),
+                        err as i64
+                    );
+                    return err;
+                }
+            };
+            let resolved = match resolve_existing_fs_path(&lexical, true) {
+                Ok(path) => path,
+                Err(err) => {
+                    #[cfg(feature = "exec-trace")]
+                    log::info!(
+                        "[exec-trace] pid={} execve resolve_existing_fs_path failed: errno={}",
+                        crate::process::current_pid(),
+                        err as i64
+                    );
+                    return err;
+                }
+            };
 
-        // Phase 27: Execute permission check.
-        if let Some((fu, fg, fm)) = path_metadata(&resolved) {
-            let (_, _, euid, egid) = current_process_ids();
-            if !check_permission(fu, fg, fm, euid, egid, 1) {
-                #[cfg(feature = "exec-trace")]
-                log::info!(
-                    "[exec-trace] pid={} execve -> EACCES (perm check) path=\"{}\"",
-                    crate::process::current_pid(),
-                    resolved
-                );
-                return NEG_EACCES;
+            // Phase 27: Execute permission check.
+            if let Some((fu, fg, fm)) = path_metadata(&resolved) {
+                let (_, _, euid, egid) = current_process_ids();
+                if !check_permission(fu, fg, fm, euid, egid, 1) {
+                    #[cfg(feature = "exec-trace")]
+                    log::info!(
+                        "[exec-trace] pid={} execve -> EACCES (perm check) path=\"{}\"",
+                        crate::process::current_pid(),
+                        resolved
+                    );
+                    return NEG_EACCES;
+                }
             }
-        }
 
-        match crate::fs::ramdisk::get_file(&resolved) {
-            Some(data) => (resolved, None, Some(data), None),
-            None => {
-                // Phase 31: try ext2, FAT32, and tmpfs before giving up.
-                match read_file_from_disk(&resolved) {
-                    Ok(buf) => (resolved, Some(buf), None, None),
-                    // Phase 85d — a binary larger than the kernel-heap-able size
-                    // (e.g. the ~65 MiB static clang, which exceeds the entire
-                    // 64 MiB heap) cannot be buffered whole. Load it by STREAMING
-                    // its segments from disk into the mapped user pages instead.
-                    Err(errno) if errno == NEG_E2BIG => match open_exec_stream(&resolved) {
-                        Ok(src) => (resolved, None, None, Some(src)),
-                        Err(stream_errno) => {
-                            log::warn!(
-                                "[execve] large binary not streamable: {} (errno={})",
-                                resolved,
-                                stream_errno as i64
+            match crate::fs::ramdisk::get_file(&resolved) {
+                Some(data) => (resolved, None, Some(data), None),
+                None => {
+                    // Phase 31: try ext2, FAT32, and tmpfs before giving up.
+                    match read_file_from_disk(&resolved) {
+                        Ok(buf) => (resolved, Some(buf), None, None),
+                        // Phase 85d — a binary larger than the kernel-heap-able size
+                        // (e.g. the ~65 MiB static clang, which exceeds the entire
+                        // 64 MiB heap) cannot be buffered whole. Load it by STREAMING
+                        // its segments from disk into the mapped user pages instead.
+                        Err(errno) if errno == NEG_E2BIG => match open_exec_stream(&resolved) {
+                            Ok(src) => (resolved, None, None, Some(src)),
+                            Err(stream_errno) => {
+                                log::warn!(
+                                    "[execve] large binary not streamable: {} (errno={})",
+                                    resolved,
+                                    stream_errno as i64
+                                );
+                                return stream_errno;
+                            }
+                        },
+                        Err(errno) => {
+                            log::warn!("[execve] file not found or rejected: {}", resolved);
+                            #[cfg(feature = "exec-trace")]
+                            log::info!(
+                                "[exec-trace] pid={} execve read_file_from_disk failed: errno={}",
+                                crate::process::current_pid(),
+                                errno as i64
                             );
-                            return stream_errno;
+                            return errno;
                         }
-                    },
-                    Err(errno) => {
-                        log::warn!("[execve] file not found or rejected: {}", resolved);
-                        #[cfg(feature = "exec-trace")]
-                        log::info!(
-                            "[exec-trace] pid={} execve read_file_from_disk failed: errno={}",
-                            crate::process::current_pid(),
-                            errno as i64
-                        );
-                        return errno;
                     }
                 }
             }
+        };
+        // A `#!` at the head means this is a script: re-exec its interpreter.
+        // Streaming (huge) files are never scripts. `exec_static` is `'static`.
+        let is_shebang = match (resolved_tuple.1.as_deref(), resolved_tuple.2) {
+            (Some(b), _) | (_, Some(b)) => b.len() >= 2 && b[0] == b'#' && b[1] == b'!',
+            _ => false,
+        };
+        if !is_shebang {
+            break resolved_tuple;
         }
+        shebang_depth += 1;
+        if shebang_depth > 4 {
+            return NEG_ELOOP;
+        }
+        // Parse `#!interp [single-arg]` from the first line (≤256 bytes). Per
+        // Linux, everything after the interpreter token (trimmed) is ONE argument.
+        let (interp, arg_opt) = {
+            let head = resolved_tuple
+                .1
+                .as_deref()
+                .or(resolved_tuple.2)
+                .unwrap_or(&[]);
+            let limit = head.len().min(256);
+            let line_end = head[..limit]
+                .iter()
+                .position(|&b| b == b'\n')
+                .unwrap_or(limit);
+            let mut line = &head[2..line_end];
+            while let [b' ' | b'\t', rest @ ..] = line {
+                line = rest;
+            }
+            let interp_end = line
+                .iter()
+                .position(|&b| b == b' ' || b == b'\t')
+                .unwrap_or(line.len());
+            let interp = match core::str::from_utf8(&line[..interp_end]) {
+                Ok(s) if !s.is_empty() => alloc::string::String::from(s),
+                _ => return NEG_ENOEXEC,
+            };
+            let mut rest = &line[interp_end..];
+            while let [b' ' | b'\t', tail @ ..] = rest {
+                rest = tail;
+            }
+            while let [body @ .., b' ' | b'\t' | b'\r'] = rest {
+                rest = body;
+            }
+            let arg_opt = if rest.is_empty() {
+                None
+            } else {
+                Some(rest.to_vec())
+            };
+            (interp, arg_opt)
+        };
+        // Rewrite argv = [interp, arg?, resolved_script_path, original argv[1..]].
+        let mut rewritten: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+        rewritten.push(interp.clone().into_bytes());
+        if let Some(a) = arg_opt {
+            rewritten.push(a);
+        }
+        rewritten.push(resolved_tuple.0.clone().into_bytes());
+        for a in shebang_argv.iter().skip(1) {
+            rewritten.push(a.clone());
+        }
+        shebang_argv = rewritten;
+        exec_target = interp;
     };
+    let user_argv = shebang_argv;
     let name: &str = &resolved_name;
     let pid = crate::process::current_pid();
     // The Phase 56/57 graphical stack starts as a synchronous IPC chain:

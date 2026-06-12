@@ -240,6 +240,35 @@ PASSES** (validated under `M3OS_KVM=1`, ~30 s once booted).
 > Separately, m3OS still has **no 127.0.0.1 loopback** interface, but the egress
 > arm exercises the TCP path regardless.
 
+> **Real outbound HTTPS works now — the MSS fix (a third real kernel bug).**
+> Under `M3OS_NODE_NET=1`, node's `https.get('https://example.com/')` completes a
+> full TLS 1.3 handshake and validates the cert chain (`NODE_HTTPS_OK`), and a
+> direct GET to `registry.npmjs.org` reaches the npm registry over the same TLS
+> path (`NPM_REGISTRY_OK`). This required a TCP fix: `tcp_send` sized each
+> outbound segment to the 8 KiB send window with **no MSS/MTU cap**, so a
+> >1460-byte write — node/OpenSSL's 1588-byte TLS ClientHello — built a ~1642-byte
+> Ethernet frame that virtio-net (1514 MTU + 10-byte vnet hdr = 1524) **silently
+> dropped**; every retransmit dropped the same way, the handshake stalled to a
+> peer FIN, and userspace saw "socket disconnected before secure TLS connection
+> was established". Capping each outbound TCP segment to one MSS (1460) keeps every
+> frame within the MTU (the ClientHello ships as 1460+128); RX of full-MTU inbound
+> segments already fit the 1524-byte buffer. On-link egress only ever sent tiny
+> frames, so the bug surfaced solely on the first real >MTU transmit — a *general*
+> outbound-TLS fix (git/curl benefited too), not Node-specific. **Still opt-in
+> (`M3OS_NODE_NET=1`):** these need real outbound internet, which repo CI lacks
+> (mirroring `git-https-smoke`). Full `npm install` *completion* is not gate-
+> asserted — npm launches and reaches the registry, but loading its ~thousands of
+> JS files over the ~200 KB/s ring-3 VFS (jitless V8) is impractically slow; that
+> is a VFS-throughput limit, not a TLS gap.
+
+> **`#!` shebang exec (a fourth kernel addition).** `execve` gained Linux
+> `binfmt_script` support: a file beginning `#!interp [arg]` re-execs the
+> interpreter with argv rewritten to `[interp, arg?, script_path, original
+> argv[1..]]`, looping (bounded by `ELOOP`) so an interpreter that is itself a
+> script also resolves. Without it, running a script (e.g. npm's
+> `#!/usr/bin/env node` wrapper) returned `ENOEXEC`. Proven always-on by the
+> `node-smoke` `SHEBANG__OK` arm (a `#!/bin/echo` script re-execs `/bin/echo`).
+
 The gate is wired opt-in via `M3OS_NODE_REGRESSION=1` at `--timeout 5400`
 (much faster under `M3OS_KVM=1`, which the gate honors; `M3OS_NODE_FAST_ITER`
 reuses an installed disk). When the host C++ toolchain or the `llvm` musl
