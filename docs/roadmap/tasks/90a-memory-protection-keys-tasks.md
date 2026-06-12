@@ -35,10 +35,51 @@
 **Why it matters:** everything downstream hangs on two facts only an experiment settles. (1) **The kernel contract:** does V8 `mmap` code space `PROT_NONE`/RW and then `pkey_mprotect` it with W+X under a key, or request RWX up front and rely on the key to mask write? The answer decides exactly which enforcement point in `sys_mmap`/`sys_mprotect`/`sys_pkey_mprotect` carries the v2 exception. (2) **Adoption:** V8's PKU support is runtime-detected; if the detection path doesn't engage in a **static musl** build (wrapper availability, glibc-specific assumptions), V8 falls back to plain RWX requests the kernel must keep rejecting — and the phase needs a V8 build-flag or patch answer before any kernel work is worth doing.
 
 **Acceptance:**
-- [ ] A JIT-enabled static-musl node binary is built host-side and strace'd on the PKU host running (a) a JIT-hot JS loop and (b) `WebAssembly.instantiate` — the full ordered syscall sequence for code-space setup, code patching, and key usage is recorded verbatim in this doc.
-- [ ] The musl-static adoption question is answered falsifiably: either V8 demonstrably calls `pkey_alloc`/`pkey_mprotect` (adoption confirmed, flags recorded), or the exact reason it doesn't (missing wrapper, disabled feature, glibc assumption) plus the chosen remedy (V8 GN flag, small patch, or env knob) is recorded and validated host-side.
-- [ ] The **kernel contract note** is written: the precise v2 rule (which syscall, which argument combination, which key constraints) that Track C implements — concrete enough that C.1's acceptance can quote it.
-- [ ] The fallback decision is recorded: what the JIT variant does on a no-PKU machine (V8's own runtime fallback vs. refusing to start), driving D.3's skip-with-reason arms.
+- [x] A JIT-enabled static-musl node binary is built host-side and strace'd on the PKU host running (a) a JIT-hot JS loop and (b) `WebAssembly.instantiate` — the full ordered syscall sequence for code-space setup, code patching, and key usage is recorded verbatim in this doc. *(No rebuild was needed: Phase 89's `--v8-options=--jitless` is a runtime-flag default, and `node --no-jitless --turbofan --maglev --sparkplug` restores full JIT+WASM on the existing binary — verified via `%GetOptimizationStatus` = `kTurboFanned` and a working `WebAssembly.Instance`.)*
+- [x] The musl-static adoption question is answered falsifiably: V8 does **not** call `pkey_alloc`/`pkey_mprotect` (zero pkey syscalls under strace with full JIT), for the three pinned reasons in the findings below, each with a validated port-side remedy.
+- [x] The **kernel contract note** is written below — concrete enough that C.1's acceptance quotes it.
+- [x] The fallback decision is recorded: on a no-PKU machine `pkey_alloc` returns `ENOSPC` → V8's `ThreadIsolation` stays disabled → V8 falls back to plain-RWX commits, which the kernel rejects → the JIT variant **aborts at first code-space commit** (it does not degrade). The jitless artifact remains the documented default; the JIT binary can still be run manually with `--jitless`. D.3's no-PKU arm is therefore skip-with-reason.
+
+#### A.1 Findings (recorded 2026-06-12, Ryzen 5 7600 / Zen 4, `pku`+`ospke`, Linux 6.8)
+
+**Observed syscall contract** (strace `-f -e trace=mmap,mprotect,munmap,pkey_*` of the Phase 89 static-musl node v22.22.3 with `--no-jitless --turbofan --maglev --sparkplug`, JIT-hot loop + `WebAssembly.instantiate`; V8 12.4.254.21):
+
+```
+mmap(hint, size, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0)   # code-space reserve
+mprotect(page, len, PROT_READ|PROT_WRITE|PROT_EXEC)                            # code page commit (PKU-disabled fallback!)
+mprotect(range, len, PROT_NONE) / munmap(...)                                  # decommit / teardown
+```
+
+Zero `pkey_*` syscalls in the musl-static build — **and zero in a host glibc Node v24 either**. V8's PKU JIT write-protection is compiled in and on by default in this tree (`V8_HAS_PKU_JIT_WRITE_PROTECT=1`, `src/base/build_config.h:38` — Linux+x64 only, no GN arg; `V8_HEAP_USE_PKU_JIT_WRITE_PROTECT=true` since Node disables pointer compression; runtime flag `--memory-protection-keys` defaults **true**, `flag-definitions.h:759`), but is neutralized by three independent blockers:
+
+1. **musl link gap.** V8 declares `pkey_alloc/free/mprotect/get/set` as `extern __attribute__((weak))` (`src/base/platform/memory-protection-key.cc:17`, `src/libplatform/default-thread-isolated-allocator.cc:21`) and null-checks them at runtime. musl defines none of them (and not the `PKEY_DISABLE_ACCESS`/`PKEY_DISABLE_WRITE` macros — `default-thread-isolated-allocator.cc:47` compiles to a `return -1` stub without them), so every guard short-circuits. **Remedy (D.2):** a small strong-symbol shim TU (`pkey_alloc/free/mprotect` via `syscall(2)`, `pkey_get/set` via `RDPKRU`/`WRPKRU` — they are not syscalls) linked into node, plus `-DPKEY_DISABLE_ACCESS=0x1 -DPKEY_DISABLE_WRITE=0x2` at V8 compile time.
+2. **NodePlatform never provides the allocator.** `ThreadIsolation::Initialize()` requires `platform->GetThreadIsolatedAllocator()`; the `v8::Platform` default returns `nullptr` (`deps/v8/include/v8-platform.h:1068`) and Node's `NodePlatform` (`src/node_platform.{h,cc}`) never overrides it — this is why even glibc Node emits no pkey syscalls upstream. **Remedy (D.2):** port patch overriding `NodePlatform::GetThreadIsolatedAllocator()` to return V8 libplatform's `DefaultThreadIsolatedAllocator`.
+3. **Kernel-version gate.** `KernelHasPkruFix()` (`default-thread-isolated-allocator.cc:26`) parses `uname()` release and requires ≥ 5.13 (a Linux PKRU-across-fork fix); m3OS reports `0.90.0` (`sys_linux_uname`, `kernel/src/arch/x86_64/syscall/mod.rs:14070`) and would be rejected. **Remedy (D.2):** port patch accepting the m3OS release string — justified because B.4 implements (and D.1 proves) correct PKRU inherit-on-clone/reset-on-exec semantics, which is what the Linux check guards.
+
+**The PKU-engaged sequence** (source-pinned; what the kernel will see from the patched JIT variant):
+
+```
+uname(...)                                                          # KernelHasPkruFix (patched to accept m3OS)
+pkey_alloc(flags=0, init_access_rights=PKEY_DISABLE_WRITE) = 1     # default-thread-isolated-allocator.cc:53
+pkey_mprotect(trusted_data, len, PROT_READ, pkey=0)                # ThreadIsolation metadata, code-memory-access.cc:118
+mmap(hint, size, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0)    # code-space reserve (unchanged)
+pkey_mprotect(page, len, PROT_READ|PROT_WRITE|PROT_EXEC, pkey=1)   # JIT/wasm code page commit+tag
+                                                                    #   (wasm-code-manager.cc:1925, memory-allocator.cc:596→code-memory-access.cc:464)
+WRPKRU (pkey_set, no syscall) per write window                      # code-memory-access-inl.h:255
+mprotect(range, len, PROT_NONE) / munmap(...)                       # decommit / teardown (unchanged)
+```
+
+**Kernel contract note — the W^X v2 rule Track C implements verbatim:**
+
+> 1. `sys_mmap` with `PROT_WRITE|PROT_EXEC` → rejected, unchanged from Phase 75.
+> 2. `sys_mprotect` with `PROT_WRITE|PROT_EXEC` → rejected, unchanged from Phase 75.
+> 3. `sys_pkey_mprotect(addr, len, prot, pkey)`:
+>    a. with `pkey == 0` (or `pkey == -1`, the untag-Linux-alias) it behaves exactly like `sys_mprotect` — W+X rejected;
+>    b. with a non-default `pkey` that is **allocated** and whose **alloc-time `init_access_rights` include `PKEY_DISABLE_WRITE` or `PKEY_DISABLE_ACCESS`**, and PKU active (CR4.PKE set), `PROT_READ|PROT_WRITE|PROT_EXEC` is **permitted** and the range's PTEs are tagged with the key; the kernel logs one positive `[wx] v2-guarded W+X mapping (pkey=N)` line per grant;
+>    c. any other W+X request through `sys_pkey_mprotect` (unallocated key, key allocated with permissive init rights, PKU absent) → rejected with the same errno as (1)/(2).
+> 4. No other syscall or fault path may produce a W+X PTE; the C.1 enforcement-point audit enumerates them.
+
+**V8 quirk recorded for D.2/D.3:** because the Phase 89 binary bakes `--jitless` as an embedded default, V8's one-shot flag-implication pass latches `--no-opt`; plain `--no-jitless` re-enables WASM but *not* TurboFan (`%GetOptimizationStatus` = `kNeverOptimize`). The JIT variant must therefore drop `--v8-options=--jitless` at configure time (not rely on runtime `--no-jitless`); `node-jit-smoke`'s JIT-proof arm must assert actual optimization, not just WASM.
 
 ---
 
