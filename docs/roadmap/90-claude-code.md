@@ -2,7 +2,7 @@
 
 **Status:** Planned
 **Source Ref:** phase-90
-**Depends on:** Phase 85 (Cross-Compiled Toolchains), Phase 86 (Networking and GitHub), Phase 89 (Node.js)
+**Depends on:** Phase 85 (Cross-Compiled Toolchains) ✅, Phase 86 (Networking and GitHub) ✅, Phase 89 (Node.js) ✅
 **Builds on:** Uses the post-1.0 toolchain, networking, and Node runtime phases to run a modern CLI coding agent natively inside m3OS
 **Primary Components:** Node.js package installation path, CLI runtime environment, git and GitHub CLI integration, shell and terminal tooling, docs/claude-code-roadmap.md
 
@@ -109,7 +109,7 @@ Cloud-connected developer tooling raises trust, secret-handling, and support-bou
 
 ## Companion Task List
 
-- Phase 90 task list — defer until implementation planning begins.
+- [Phase 90 Task List](./tasks/90-claude-code-tasks.md)
 
 ## How Real OS Implementations Differ
 
