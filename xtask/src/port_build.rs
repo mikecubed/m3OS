@@ -4035,25 +4035,34 @@ fn patch_node_platform_allocator(src: &Path) -> Result<(), String> {
                 cc.display()
             ));
         }
-        // The method body is `return worker_thread_task_runners_.size();` followed by
-        // `}`. Inject after that closing brace by replacing the anchor's full method.
-        let full = "int NodePlatform::NumberOfWorkerThreads() {\n  \
-                    return worker_thread_task_runner_->NumberOfWorkerThreads();\n}";
+        // CRITICAL: the override definition + the factory forward-declaration MUST be
+        // appended at GLOBAL (end-of-file) scope, NOT injected in-place inside the
+        // `namespace node { ... }` body. Opening `namespace v8 { namespace platform {`
+        // anywhere inside `namespace node` creates a *nested* `node::v8::platform`,
+        // which then poisons every subsequent unqualified `v8::` lookup in the TU
+        // (`no type named 'ThreadIsolatedAllocator' in namespace 'node::v8'` — a 20-error
+        // cascade through the rest of node_platform.cc). So we append at file scope and
+        // fully qualify every V8 name as `::v8::` to be lookup-proof regardless of the
+        // enclosing-namespace context.
+        //
         // The thread-isolated allocator's concrete type
         // (`v8::platform::DefaultThreadIsolatedAllocator`) lives in the V8-internal
         // header `src/libplatform/default-thread-isolated-allocator.h`, whose own
-        // includes (`include/...`, `src/base/...`) require the V8 root on the include
-        // path. node_lib compiles node_platform.cc with only `deps/v8/include` (the
-        // `v8_libplatform` dependent-settings export), NOT the V8 root — so that header
-        // is unreachable here and #including it does not compile. Instead delegate to a
-        // free factory we inject into `default-thread-isolated-allocator.cc` (which IS
-        // compiled in `v8_libplatform` with the V8 root and the complete type) and
-        // forward-declare it here. Only the *pointer* type `v8::ThreadIsolatedAllocator`
-        // is named in node_platform.cc, and it is already visible via the existing
-        // `libplatform/libplatform.h` -> `v8-platform.h` include chain (declared at
-        // v8-platform.h:622).
-        let injected_def = format!(
-            "{full}\n\n\
+        // includes require the V8 root on the include path. node_lib compiles
+        // node_platform.cc with only `deps/v8/include` (the `v8_libplatform`
+        // dependent-settings export), NOT the V8 root — so that header is unreachable
+        // here. Instead delegate to a free factory injected into
+        // `default-thread-isolated-allocator.cc` (which IS compiled in `v8_libplatform`
+        // with the V8 root and the complete type) and forward-declare it here. Only the
+        // *pointer* type `::v8::ThreadIsolatedAllocator` is named here, already visible
+        // via the `libplatform/libplatform.h` -> `v8-platform.h` include chain
+        // (declared at v8-platform.h:622).
+        //
+        // The `anchor` presence check above already verified this is the NodePlatform
+        // TU; we append rather than splice the method body, so we no longer depend on the
+        // exact method-body text (robust across Node minor versions).
+        let patched = format!(
+            "{cc_text}\n\
              // {SENTINEL}\n\
              // A.1 finding 2: NodePlatform must provide the thread-isolated (PKU)\n\
              // allocator V8's ThreadIsolation::Initialize() requires; the v8::Platform\n\
@@ -4061,29 +4070,16 @@ fn patch_node_platform_allocator(src: &Path) -> Result<(), String> {
              // the same instance v8::platform::DefaultPlatform::GetThreadIsolatedAllocator\n\
              // returns — via a free factory injected into V8's\n\
              // default-thread-isolated-allocator.cc (which can see the concrete type).\n\
+             // Appended at file scope (NOT inside namespace node) with fully-qualified\n\
+             // ::v8:: names so no nested node::v8 namespace is ever created.\n\
              namespace v8 {{ namespace platform {{\n\
-             v8::ThreadIsolatedAllocator* M3osDefaultThreadIsolatedAllocator();\n\
-             }} }}  // namespace v8::platform\n\
-             v8::ThreadIsolatedAllocator* NodePlatform::GetThreadIsolatedAllocator() {{\n  \
-             return v8::platform::M3osDefaultThreadIsolatedAllocator();\n}}"
+             ::v8::ThreadIsolatedAllocator* M3osDefaultThreadIsolatedAllocator();\n\
+             }} }}  // namespace ::v8::platform\n\
+             namespace node {{\n\
+             ::v8::ThreadIsolatedAllocator* NodePlatform::GetThreadIsolatedAllocator() {{\n  \
+             return ::v8::platform::M3osDefaultThreadIsolatedAllocator();\n}}\n\
+             }}  // namespace node\n"
         );
-        let patched = if cc_text.contains(full) {
-            cc_text.replacen(full, &injected_def, 1)
-        } else {
-            // Fall back: the method body differs across Node minor versions. Append a
-            // standalone definition at end of file rather than guessing the body.
-            format!(
-                "{cc_text}\n\
-                 // {SENTINEL} (appended; in-place method body differed)\n\
-                 namespace v8 {{ namespace platform {{\n\
-                 v8::ThreadIsolatedAllocator* M3osDefaultThreadIsolatedAllocator();\n\
-                 }} }}  // namespace v8::platform\n\
-                 namespace node {{\n\
-                 v8::ThreadIsolatedAllocator* NodePlatform::GetThreadIsolatedAllocator() {{\n  \
-                 return v8::platform::M3osDefaultThreadIsolatedAllocator();\n}}\n\
-                 }}  // namespace node\n"
-            )
-        };
         fs::write(&cc, patched).map_err(|e| format!("node-jit: write {}: {e}", cc.display()))?;
         println!("node-jit: patched {} (allocator def)", cc.display());
     }
