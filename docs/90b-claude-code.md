@@ -29,7 +29,7 @@ phase's deliverable is packaging, environment pinning, credential handling, the
 TUI render proof, and — most importantly — an honest, falsifiable
 supported-workflow boundary. The one Phase 89 leftover it closes is the
 explicitly deferred in-Node `SIGINT` assertion (now `NODE_SIGINT_OK`, validated
-in `node-smoke`).
+in the `claude-smoke` always-on core).
 
 ## What This Doc Covers
 
@@ -64,9 +64,10 @@ Bun binary on m3OS would be a separate future port — a Bun runtime, not Node).
 
 **`2.1.112` is the last version shipping the classic model** the phase assumes:
 
-- `cli.js` — a 9.3 MB JavaScript bundle that runs on `node`.
-- `yoga.wasm` — an 88 KB WebAssembly TUI layout engine (the reason the JIT
-  variant is required; see below).
+- `cli.js` — a 9.3 MB (gzipped; ~13.7 MB unpacked) JavaScript bundle that runs
+  on `node`, with the **WebAssembly TUI layout engine (`yoga`) embedded inside it**
+  (in 2.1.112; the 1.x/2.0 bundles shipped a standalone `yoga.wasm` file). The
+  embedded WASM is the reason the JIT variant is required (see below).
 - `vendor/ripgrep/` — a vendored platform `rg` for the file-search tool.
 
 The pinned tarball (Track A host-side spike, 2026-06-13):
@@ -131,15 +132,16 @@ Claude Code's defaults assume a mainstream Linux. The launcher (`exec
 where the supported configuration is *pinned* rather than hoped for — every env
 line is a documented support-boundary decision. It relies on the Phase 89 `#!`
 shebang/exec support and the `DEPS=node` runtime at `/usr/bin/node`; the install
-layout is relocated under `/usr/lib/claude-code/`, and `cli.js` resolves
-`yoga.wasm` + `vendor/` relative to its own dir.
+layout is relocated under `/usr/lib/claude-code/`, and `cli.js` resolves the
+`vendor/` tools relative to its own dir (the WASM TUI engine is embedded in
+`cli.js`).
 
 | Launcher line | Why |
 |---|---|
 | `export NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt` | Node's bundled OpenSSL validates `api.anthropic.com` against the Phase 86a Mozilla CA bundle — m3OS has no system trust-store discovery, so the path is pinned explicitly. |
 | `export DISABLE_AUTOUPDATER=1` | The sealed `.m3pkg` is the only supported delivery; auto-update over the VFS is impractical and would version-drift the artifact away from the pinned, sealed content. |
 | `export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` | Suppresses telemetry / Statsig / Sentry egress attempts — dead weight and a confusing failure mode on a box with no default outbound egress. |
-| `exec /usr/bin/node /usr/lib/claude-code/cli.js "$@"` | Runs the bundled `cli.js` on the `DEPS=node` runtime via the Phase 89 shebang/exec chain; the relocated `/usr/lib/claude-code/` layout keeps `yoga.wasm` + `vendor/` resolvable. |
+| `exec /usr/bin/node /usr/lib/claude-code/cli.js "$@"` | Runs the bundled `cli.js` on the `DEPS=node` runtime via the Phase 89 shebang/exec chain; the relocated `/usr/lib/claude-code/` layout keeps the `vendor/` tools resolvable (the WASM TUI engine is embedded in `cli.js`). |
 
 `claude --version` on m3OS prints `2.1.112` *through this launcher*, proving the
 shebang/exec chain + relocated install layout end-to-end — asserted in the
@@ -183,7 +185,8 @@ invariant is *strengthened* to v2 (W+X is permitted only via the PKU-guarded
 `pkey_mprotect` path under a write-deny key), not relaxed — and a JIT Node
 variant on which WASM works. Phase 90b consumes that variant. The TUI path is
 already de-risked: 90a's `node-jit-smoke` proves `WebAssembly.instantiate` runs
-on the m3OS JIT node, and 2.1.112's `yoga.wasm` is the same capability class. The
+on the m3OS JIT node, and 2.1.112's embedded `yoga` WASM engine is the same
+capability class. The
 on-OS rendered-UI proof is the Track D QMP/PPM screenshot arm (a serial sentinel
 is blind to TUI rendering; only a framebuffer screenshot is falsifiable
 evidence). The jitless `claude -p` path remains the documented degraded fallback
@@ -203,12 +206,15 @@ no seccomp) are pruned or degrade gracefully. `rg --version` is asserted in the
 Track D always-on core, so a search-tool regression is a gate failure, not a
 silent degradation.
 
-### The interactive substrate (Phase 89 A.2, validated in `node-smoke`)
+### The interactive substrate (Phase 89 A.2, validated in `claude-smoke`)
 
 An interactive CLI agent lives on three primitives Phase 89 deferred to this
 phase: trapping Ctrl-C, putting the tty in raw mode, and spawning shell commands.
-Each is a one-line always-on probe arm riding the existing `node-smoke` boot
-(jitless, CI-visible, no JIT needed):
+Each is a one-line always-on probe arm riding the `claude-smoke` always-on core
+(the task list explicitly permits the A.2 arms to ride this gate; the probes
+themselves need no JIT, so they share the boot that bundles the agent — the one
+caveat is that `claude-smoke` is KVM/PKU-gated, so they run on the dev/PKU host
+rather than in CI):
 
 - `NODE_SIGINT_OK` — `process.on('SIGINT')` fires on a self-signal, proving
   libuv's self-pipe signal path (`pipe2` + `rt_sigaction`) end-to-end — the

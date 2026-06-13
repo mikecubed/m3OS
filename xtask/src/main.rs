@@ -293,12 +293,12 @@ const SMOKE_EXIT_PKU_SMOKE_FAILED: i32 = 83;
 const SMOKE_EXIT_NODE_JIT_SMOKE_FAILED: i32 = 84;
 
 /// Phase 90b — `claude-smoke` failure exit code. The gate builds a
-/// `M3OS_WITH_CLAUDE` image (bundling the claude-code `.m3pkg` + the 90a JIT node
+/// `M3OS_WITH_CLAUDE` image (bundling the claude-code `.m3pkg` + the jitless node
 /// it depends on), boots, `pkg install claude-code` (solver pulls node first),
-/// and asserts `claude --version`/`--help`/the vendored `rg` run. Like
-/// `node-jit-smoke` it requires PKU (the bundled node is the JIT variant), so it
-/// SKIPs-with-reason without `M3OS_KVM=1` on a PKU host. The opt-in live arms
-/// (authenticated `claude -p` API round-trip + file/shell/git workflow) need
+/// and asserts `claude --version`/`--help`/the vendored `rg` run. The jitless core
+/// needs no PKU, so the gate is CI-viable under TCG (KVM is a speed knob); the
+/// interactive TUI's JIT path is a deferred kernel follow-up. The opt-in live arms
+/// (authenticated `claude -p` API round-trip + file workflow) need
 /// `M3OS_CLAUDE_NET=1` + a seeded credential and skip-with-reason otherwise.
 const SMOKE_EXIT_CLAUDE_SMOKE_FAILED: i32 = 85;
 
@@ -991,12 +991,12 @@ fn main() {
             cmd_node_jit_smoke(&smoke_args);
         }
         // Phase 90b — Claude Code gate. Boots a M3OS_WITH_CLAUDE image
-        // (claude-code + the 90a JIT node it DEPS=node-depends on),
+        // (claude-code + the jitless node it DEPS=node-depends on),
         // `pkg install claude-code` (solver pulls node first), and asserts
-        // `claude --version`/`--help` + the vendored static-pie rg run. Like
-        // node-jit-smoke it requires PKU (the JIT node), so skip-with-reason
-        // without M3OS_KVM=1 on a PKU host. Opt-in live arms (M3OS_CLAUDE_NET=1
-        // + M3OS_CLAUDE_TOKEN/KEY): authenticated `claude -p` API round-trip +
+        // `claude --version`/`--help` + the vendored static-pie rg run on the
+        // jitless node (CI-viable under TCG; the TUI's JIT path is a deferred
+        // kernel follow-up). Opt-in live arms (M3OS_CLAUDE_NET=1 +
+        // M3OS_CLAUDE_TOKEN/KEY): authenticated `claude -p` API round-trip +
         // a real-FS agent workflow, skip-with-reason otherwise.
         Some("claude-smoke") => {
             let smoke_args =
@@ -15966,15 +15966,17 @@ fn node_jit_smoke_steps(fast_iter: bool) -> Vec<SmokeStep> {
 /// Phase 90b — `cargo xtask claude-smoke`.
 ///
 /// Boots a `M3OS_WITH_CLAUDE` image (bundling the pinned claude-code `.m3pkg` +
-/// the 90a JIT node it `DEPS=node`-depends on), `pkg install claude-code` (the
+/// the JITLESS node it `DEPS=node`-depends on), `pkg install claude-code` (the
 /// solver pulls node FIRST — the dependency-first proof), and asserts the launcher
 /// chain runs offline: `claude --version` → `2.1.112`, `claude --help`, the
 /// vendored static-pie `rg --version`, plus the A.2 interactive-substrate probes
 /// (SIGINT self-pipe / `child_process` spawn / raw-mode toggle) an interactive
-/// agent depends on. Like `node-jit-smoke` the bundled node is the JIT variant
-/// (the yoga.wasm TUI needs runtime WASM), which aborts on a no-PKU CPU, so the
-/// gate runs only under `M3OS_KVM=1` on a PKU host and **skip-with-reasons**
-/// otherwise (mirroring `node-jit-smoke`/`tls-smoke`/`dns-smoke`).
+/// agent depends on. The interactive TUI needs the 90a JIT node for runtime WASM,
+/// but cli.js's heavy JIT codegen currently faults the kernel under the PKU/W^X
+/// path (a kernel JIT-robustness follow-up out of this phase's scope), so the gate
+/// runs the task list's prescribed **jitless fallback** — V8's Ignition
+/// interpreter, zero runtime executable memory, no PKU needed — and so is
+/// CI-viable under plain TCG (KVM is honored only as a speed knob).
 ///
 /// The opt-in live arms (`M3OS_CLAUDE_NET=1` + a seeded credential via
 /// `M3OS_CLAUDE_TOKEN` (subscription OAuth) or `M3OS_CLAUDE_KEY` (API billing))
@@ -15987,25 +15989,21 @@ fn node_jit_smoke_steps(fast_iter: bool) -> Vec<SmokeStep> {
 /// available (the serial harness is blind to TUI rendering); it is documented in
 /// the skip-NOTE rather than gate-automated.
 fn cmd_claude_smoke(args: &SmokeBootArgs) {
-    // PKU/KVM gate (identical rationale to `cmd_node_jit_smoke`): the bundled node
-    // is the JIT variant, which cannot complete a single V8 code-space commit
-    // without PKU, and m3OS only sees PKU under KVM `-cpu host` on a PKU host.
-    // Detect the no-PKU configuration up front and SKIP-with-reason (success) —
-    // do not pay the multi-hour build + install only to abort in V8.
+    // The always-on core bundles the JITLESS node (the Phase 89 default). The
+    // interactive TUI needs the 90a JIT node for runtime WASM, BUT cli.js's heavy
+    // real-world JIT codegen (far beyond 90a's trivial node-jit-probe) faults the
+    // kernel under the PKU/W^X JIT path and the VM exits — a kernel JIT-robustness
+    // follow-up out of Phase 90b's "no kernel work" scope. So this gate exercises
+    // the task list's prescribed jitless fallback: `claude --version`/`--help`/`-p`
+    // run on the jitless node (V8's Ignition interpreter; ZERO runtime executable
+    // memory ⇒ no PKU/W^X path ⇒ no fault), which needs NO PKU and so runs under
+    // plain TCG too — the gate is CI-viable, not KVM-gated. KVM is honored only as
+    // a SPEED knob (the cold cli.js load over the slow VFS is ~10–50× faster), as
+    // in `cmd_node_smoke`.
     let kvm = std::env::var_os("M3OS_KVM").is_some_and(|v| v != "0" && !v.is_empty());
-    if !kvm {
-        println!(
-            "claude-smoke: SKIP (reason: the bundled node is the 90a JIT variant the \
-             yoga.wasm TUI requires, which REQUIRES PKU, and m3OS only sees PKU under \
-             M3OS_KVM=1 on a PKU host — the TCG model advertises none, so V8 aborts at \
-             first code-space commit. Set M3OS_KVM=1 on a PKU host (e.g. Ryzen Zen 4) to \
-             run the install + launch matrix.)"
-        );
-        return;
-    }
 
-    // SKIP-with-reason build precondition (identical to `cmd_node_jit_smoke`):
-    // building the JIT node port needs a host C++ cross-toolchain
+    // SKIP-with-reason build precondition (identical to `cmd_node_smoke`):
+    // building the node port needs a host C++ cross-toolchain
     // (clang/clang++/ld.lld), python3 + make, and the llvm musl sysroot's static
     // libc++. Absent any of these we cannot build the runtime `.m3pkg`, so skip
     // cleanly rather than FAIL.
@@ -16058,13 +16056,13 @@ fn cmd_claude_smoke(args: &SmokeBootArgs) {
         _ => None,
     };
 
-    // Select the JIT node variant for BOTH the build and the bundle (the TUI's
-    // yoga.wasm needs runtime WASM), and turn on the opt-in image bundling of the
-    // claude-code + node `.m3pkg`s. Seed the credential (if any) under a dedicated
-    // name. SAFETY: xtask is single-threaded here; the child image-build steps read
-    // the env. set_var is `unsafe` in Rust edition 2024 (cross-thread UB risk).
+    // Turn on the opt-in image bundling of the claude-code + node `.m3pkg`s. We do
+    // NOT set M3OS_NODE_JIT: the bundled runtime is the JITLESS node (the Phase 89
+    // default), on which `claude --version`/`--help`/`-p` run without the kernel
+    // JIT-fault path. Seed the credential (if any) under a dedicated name. SAFETY:
+    // xtask is single-threaded here; the child image-build steps read the env.
+    // set_var is `unsafe` in Rust edition 2024 (cross-thread UB risk).
     unsafe {
-        std::env::set_var("M3OS_NODE_JIT", "1");
         std::env::set_var("M3OS_WITH_CLAUDE", "1");
         if let Some(tok) = token.as_ref() {
             std::env::set_var("M3OS_CLAUDE_SMOKE_TOKEN", tok);
@@ -16073,7 +16071,7 @@ fn cmd_claude_smoke(args: &SmokeBootArgs) {
         }
     }
 
-    // Build the JIT node runtime FIRST (claude-code's DEPS=node), then the
+    // Build the jitless node runtime FIRST (claude-code's DEPS=node), then the
     // fetch-and-stage claude-code `.m3pkg`. A real build failure here is a FAIL
     // (not a skip) — the toolchain IS present and PKU IS available.
     if let Err(msg) = port_build::build_node_port() {
@@ -16119,11 +16117,14 @@ fn cmd_claude_smoke(args: &SmokeBootArgs) {
     } else {
         QemuDisplayMode::Headless
     };
-    // KVM is REQUIRED (gated above) — thread it into the DeviceSet EXPLICITLY (like
-    // cmd_node_jit_smoke / cmd_pku_smoke), since DeviceSet::default() never reads
-    // M3OS_KVM. `-cpu host` then surfaces the host's real PKU to the guest.
+    // KVM is OPTIONAL (a speed knob for the slow cold cli.js load, mirroring
+    // cmd_node_smoke) — the jitless core needs no PKU, so it runs under plain TCG
+    // in CI. Thread M3OS_KVM into the DeviceSet explicitly when set, since
+    // DeviceSet::default() never reads it.
     let mut devices = DeviceSet::default();
-    devices.kvm = true;
+    if kvm {
+        devices.kvm = true;
+    }
     let mut qemu_args = qemu_args_with_devices(&uefi_image, &ovmf, display_mode, devices);
     // Plain SLIRP user net (outbound TCP works by default) — drop the smoke's
     // hostfwd; the opt-in API arm needs real egress to api.anthropic.com:443.
@@ -16162,11 +16163,13 @@ fn cmd_claude_smoke(args: &SmokeBootArgs) {
             "claude-smoke: NOTE — the authenticated live arms are SKIPPED (set \
              M3OS_CLAUDE_NET=1 + M3OS_CLAUDE_TOKEN=<setup-token> (subscription) or \
              M3OS_CLAUDE_KEY=<api-key> to run them; egress to api.anthropic.com:443 + a \
-             secret, never in repo/CI). The interactive TUI render proof uses the QMP/PPM \
-             harness (the serial harness is blind to TUI rendering) and is validated \
-             manually when a credential is available. The always-on core still proves \
-             claude-code installs from the M3OS_WITH_CLAUDE bundle (solver pulls node \
-             first) and `claude --version`/`--help`/the vendored rg RUN on the JIT runtime."
+             secret, never in repo/CI). The interactive TUI render proof needs the 90a \
+             JIT node for runtime WASM, but cli.js's heavy JIT codegen currently faults \
+             the kernel under the PKU/W^X path (a kernel JIT-robustness follow-up out of \
+             this phase's scope), so it is deferred; `claude -p` headless mode is the \
+             supported workflow on the jitless node. The always-on core proves claude-code \
+             installs from the M3OS_WITH_CLAUDE bundle (solver pulls node first) and \
+             `claude --version`/`--help`/the vendored rg RUN on the jitless runtime."
         );
     }
 
@@ -16248,10 +16251,57 @@ fn claude_smoke_steps(
         });
     }
 
-    // 2. Version banner. The launcher execs cli.js (13.7 MB) under the JIT node
-    //    (~56 MB) — both cold-fault from the slow VFS as V8 initialises, so this
-    //    FIRST exec needs a cold-load ceiling (KVM makes it minutes, not the TCG
-    //    worst case). Proves the launcher → shebang → node → cli.js chain.
+    // Optional bisection diagnostics (M3OS_CLAUDE_DIAG=1): isolate where running
+    // cli.js faults the node process (node-runs vs 13 MB file-read vs cli.js exec
+    // vs a smaller V8 stack). Each Wait that PASSES (its sentinel prints) before a
+    // crash tells us the last good step. Not part of the normal gate.
+    if std::env::var("M3OS_CLAUDE_DIAG").is_ok_and(|v| v == "1") {
+        steps.push(SmokeStep::Send {
+            input: "node --version\n",
+            label: "claude-diag: node --version (baseline)",
+        });
+        steps.push(SmokeStep::Wait {
+            pattern: "v22.22",
+            timeout_secs: 1800,
+            label: "claude-diag: node binary runs (DIAG baseline)",
+        });
+        steps.push(SmokeStep::Send {
+            input: "node -e \"console.log('DIAG'+'_E_OK')\"\n",
+            label: "claude-diag: node -e",
+        });
+        steps.push(SmokeStep::Wait {
+            pattern: "DIAG_E_OK",
+            timeout_secs: 600,
+            label: "claude-diag: node -e runs (DIAG_E_OK)",
+        });
+        steps.push(SmokeStep::Send {
+            input: "node -e \"const s=require('fs').readFileSync('/usr/lib/claude-code/cli.js','utf8');console.log('DIAG'+'_READ_'+s.length)\"\n",
+            label: "claude-diag: read 13MB cli.js into memory",
+        });
+        steps.push(SmokeStep::Wait {
+            pattern: "DIAG_READ_",
+            timeout_secs: 600,
+            label: "claude-diag: read+hold the 13MB cli.js (DIAG_READ_)",
+        });
+        // Stack hypothesis: a SMALLER V8 stack makes V8 throw RangeError before
+        // recursing into the OS guard page. If this prints 2.1.112, the default
+        // crash is a stack overflow and the fix is a launcher --stack-size.
+        steps.push(SmokeStep::Send {
+            input: "node --stack-size=600 /usr/lib/claude-code/cli.js --version\n",
+            label: "claude-diag: cli.js --version with small V8 stack",
+        });
+        steps.push(SmokeStep::Wait {
+            pattern: "2.1.112",
+            timeout_secs: 1800,
+            label: "claude-diag: cli.js runs with --stack-size=600 (stack hypothesis)",
+        });
+    }
+
+    // 2. Version banner. The launcher imports cli.js (13.7 MB) in-process on the
+    //    jitless node (~56 MB) — both cold-fault from the slow VFS as V8
+    //    initialises, so this FIRST exec needs a cold-load ceiling (KVM makes it
+    //    minutes, not the TCG worst case). Proves the launcher → `#!/usr/bin/env
+    //    node` → import(cli.js) chain end-to-end.
     steps.push(SmokeStep::Send {
         input: "claude --version\n",
         label: "claude-smoke: claude --version",
@@ -16259,7 +16309,7 @@ fn claude_smoke_steps(
     steps.push(SmokeStep::Wait {
         pattern: "2.1.112",
         timeout_secs: 1800,
-        label: "claude-smoke: claude 2.1.112 runs on the JIT node (version, cold load)",
+        label: "claude-smoke: claude 2.1.112 runs on the jitless node (version, cold load)",
     });
 
     // 3. --help (subsequent execs hit the block cache, so far faster).

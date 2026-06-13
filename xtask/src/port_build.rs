@@ -575,11 +575,11 @@ fn build_recipe_id(name: &str) -> &'static str {
             "fetch-stage:npm-tarball(package/);\
              stage=/usr/lib/claude-code(cli.js[embeds-yoga.wasm]+package.json+LICENSE.md\
              +vendor/ripgrep/x64-linux/rg)+/usr/bin/claude(launcher,0755);\
-             launcher-env=NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt,\
+             launcher=node-import(#!/usr/bin/env node;NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt,\
              DISABLE_AUTOUPDATER=1,CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1;\
-             exec=/usr/bin/node /usr/lib/claude-code/cli.js;\
+             import(/usr/lib/claude-code/cli.js)single-process);\
              prune=vendor/{audio-capture,seccomp},vendor/ripgrep/{arm64-*,x64-darwin,x64-win32};\
-             recipe-v=1"
+             recipe-v=3"
         }
         _ => "",
     }
@@ -1713,21 +1713,43 @@ fn build_claude_code(extracted: &Path, stage: &Path, port_dir: &Path) -> Result<
     }
 
     // The /usr/bin/claude launcher — the pinned supported environment (Track C.1).
-    // Every env line is a documented support-boundary decision (docs/90b-claude-code.md):
-    //   NODE_EXTRA_CA_CERTS — Node's bundled OpenSSL validates api.anthropic.com
-    //     against the Phase 86a CA bundle (m3OS has no system trust-store discovery).
+    //
+    // It is a NODE script, NOT a `#!/bin/sh` script: m3OS's `/bin/sh` is `ion`,
+    // which (unlike POSIX `sh`) does not run a shebang script file with flag args
+    // — `ion /usr/bin/claude --version` is intercepted by ion's own `--version`
+    // handler (it prints the ion banner and never runs the script body), and the
+    // built-in `sh0` ignores argv entirely. The one script interpreter m3OS runs
+    // correctly with args is `node` itself (the `#!/usr/bin/env node` path npm
+    // rides). So the launcher is a tiny CJS node program that pins the supported
+    // env and runs `cli.js` IN-PROCESS via dynamic `import()` (cli.js is ESM —
+    // `package.json` has `"type":"module"`). A single node process (no node→node
+    // fork) keeps the cold start to ONE binary load over the slow VFS and avoids
+    // the heavy-workload kernel fault path the JIT node hits. Each env line is a
+    // documented support-boundary decision (docs/90b-claude-code.md):
+    //   NODE_EXTRA_CA_CERTS — Node's OpenSSL validates api.anthropic.com against the
+    //     Phase 86a CA bundle (m3OS has no system trust-store discovery). NOTE: node
+    //     reads this lazily when the root store is first built, so the in-process set
+    //     below covers the opt-in TLS arm; a user can also export it in the shell.
     //   DISABLE_AUTOUPDATER — the sealed .m3pkg is the only supported delivery.
     //   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC — no telemetry/Statsig/Sentry egress.
-    // It execs cli.js under the DEPS=node runtime at /usr/bin/node (Phase 89 `#!`).
     let bindir = stage.join("usr/bin");
     fs::create_dir_all(&bindir).map_err(|e| format!("mkdir {}: {e}", bindir.display()))?;
     let launcher = bindir.join("claude");
-    let launcher_body = "#!/bin/sh\n\
-        # Phase 90b — Claude Code launcher (pinned supported environment).\n\
-        export NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt\n\
-        export DISABLE_AUTOUPDATER=1\n\
-        export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\n\
-        exec /usr/bin/node /usr/lib/claude-code/cli.js \"$@\"\n";
+    let launcher_body = "#!/usr/bin/env node\n\
+        // Phase 90b — Claude Code launcher (pinned supported environment).\n\
+        // ion (m3OS /bin/sh) can't run shebang scripts with flag args, so this is a\n\
+        // node wrapper that imports cli.js in-process (single node, no fork).\n\
+        'use strict';\n\
+        process.env.DISABLE_AUTOUPDATER = process.env.DISABLE_AUTOUPDATER || '1';\n\
+        process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC =\n\
+        \x20 process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC || '1';\n\
+        if (!process.env.NODE_EXTRA_CA_CERTS)\n\
+        \x20 process.env.NODE_EXTRA_CA_CERTS = '/etc/ssl/certs/ca-certificates.crt';\n\
+        process.argv.splice(1, 1, '/usr/lib/claude-code/cli.js');\n\
+        import('/usr/lib/claude-code/cli.js').catch((e) => {\n\
+        \x20 console.error('claude launcher: failed to start cli.js:', e && e.message);\n\
+        \x20 process.exit(1);\n\
+        });\n";
     fs::write(&launcher, launcher_body).map_err(|e| format!("write claude launcher: {e}"))?;
     set_exec(&launcher)?;
 
