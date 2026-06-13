@@ -276,6 +276,22 @@ const SMOKE_EXIT_VFS_BULKIO_FAILED: i32 = 81;
 /// `PKU_SMOKE:<case>:FAIL` line.
 const SMOKE_EXIT_PKU_SMOKE_FAILED: i32 = 83;
 
+/// Phase 90a Track D.3 — `cargo xtask node-jit-smoke` exit code. Boots m3OS with
+/// the JIT `build_node` variant (`M3OS_NODE_JIT=1` — `--v8-options=--jitless`
+/// dropped, the A.1 V8/Node PKU patches applied) bundled behind `M3OS_WITH_NODE`,
+/// `pkg install node`, then runs `node-jit-probe.js`: it asserts V8 actually JITs
+/// a hot function to optimized/TurboFan code (`NODE_JIT_OK`, via
+/// `--allow-natives-syntax` + `%OptimizeFunctionOnNextCall` + `%GetOptimizationStatus`)
+/// AND that `WebAssembly.instantiate` of a trivial module succeeds + executes
+/// (`NODE_WASM_OK` — the exact capability the Phase 90b TUI's yoga.wasm needs).
+/// The negative arm asserts the kernel logged the positive
+/// `[wx] v2-guarded W+X mapping (pkey=N)` line (V8 took the PKU-guarded path) and
+/// fails fast on the v1 W+X rejection error line (no unguarded-RWX fallback). The
+/// JIT variant REQUIRES PKU, so the gate runs only under `M3OS_KVM=1` on a PKU
+/// host; absent that it skip-with-reasons (the JIT artifact aborts at first
+/// code-space commit on a no-PKU machine — A.1 fallback decision).
+const SMOKE_EXIT_NODE_JIT_SMOKE_FAILED: i32 = 84;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
     Headless,
@@ -949,6 +965,21 @@ fn main() {
                 });
             cmd_node_smoke(&smoke_args);
         }
+        // Phase 90a Track D.3 — Node.js JIT + WASM gate. Boots the JIT
+        // `build_node` variant (M3OS_NODE_JIT=1) under PKU (M3OS_KVM=1 on a
+        // PKU host), asserts V8 reaches optimized/TurboFan code (NODE_JIT_OK)
+        // + a WASM module executes (NODE_WASM_OK), and that the kernel logged
+        // the `[wx] v2-guarded` line (no unguarded RWX). Skip-with-reason
+        // without PKU.
+        Some("node-jit-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("node-jit-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_node_jit_smoke(&smoke_args);
+        }
         // Phase 63a Track H — DOOM SFX + music end-to-end smoke. Boots
         // with WAV AC'97 backend, launches `/bin/doom -warp 1 1` with
         // an auto-quit budget so the engine's Shutdown emits the
@@ -1169,7 +1200,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -15598,6 +15629,313 @@ fn node_smoke_steps(attempt_net: bool, fast_iter: bool, egress_url: &str) -> Vec
     steps
 }
 
+/// Phase 90a Track D.3 — `cargo xtask node-jit-smoke`.
+///
+/// The Phase 89 `cmd_node_smoke` is the template — this clones its image-build /
+/// `pkg install` / cold-exec plumbing but selects the **JIT** `build_node` variant
+/// (`M3OS_NODE_JIT=1`, set before `build_node_port()` so the JIT `.m3pkg` is the
+/// artifact built, sealed under its own content key, and bundled into `/usr/pkg`)
+/// and runs `node-jit-probe.js` instead of the local-runtime probe.
+///
+/// The JIT variant REQUIRES PKU: per the A.1 fallback decision, on a no-PKU CPU
+/// V8's `pkey_alloc` returns `ENOSPC`, `ThreadIsolation` stays disabled, V8 falls
+/// back to plain-RWX code-space commits, the kernel W^X rule rejects them, and the
+/// binary **aborts at first code-space commit** (it does not degrade to jitless).
+/// So this gate runs the matrix only under PKU and **skip-with-reasons** otherwise
+/// — mirroring `tls-smoke`/`dns-smoke`/`pku-smoke`. PKU is exposed to the guest
+/// only under `M3OS_KVM=1` on a PKU host (`-cpu host` surfaces the dev host's real
+/// `pku`+`ospke`; the TCG `qemu64` model advertises none), so KVM is the detection
+/// proxy here — and `M3OS_KVM` is threaded into the `DeviceSet` EXPLICITLY (like
+/// `cmd_pku_smoke`), since `DeviceSet::default()` never reads it.
+fn cmd_node_jit_smoke(args: &SmokeBootArgs) {
+    // PKU gate: the JIT variant cannot complete a single V8 code-space commit
+    // without PKU, and m3OS only sees PKU under KVM `-cpu host` on a PKU host.
+    // Detect the no-PKU configuration up front and SKIP-with-reason (success) —
+    // do not pay the multi-hour build + install only to abort in V8.
+    let kvm = std::env::var_os("M3OS_KVM").is_some_and(|v| v != "0" && !v.is_empty());
+    if !kvm {
+        println!(
+            "node-jit-smoke: SKIP (reason: the JIT Node variant REQUIRES PKU, and m3OS \
+             only sees PKU under M3OS_KVM=1 on a PKU host — the TCG model advertises no \
+             PKU, so V8's pkey_alloc ENOSPCs, ThreadIsolation stays disabled, and the \
+             binary aborts at first code-space commit per the A.1 fallback decision. \
+             Set M3OS_KVM=1 on a PKU host (e.g. Ryzen Zen 4) to run the full JIT+WASM matrix.)"
+        );
+        return;
+    }
+
+    // SKIP-with-reason build precondition (identical to `cmd_node_smoke`): building
+    // the Node port needs a host C++ cross-toolchain (clang/clang++/ld.lld), python3
+    // + make, and the llvm musl sysroot's static libc++. Absent any of these we
+    // cannot build the JIT `.m3pkg`, so skip cleanly rather than FAIL.
+    fn node_tool_on_path(t: &str) -> bool {
+        std::process::Command::new(t)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    let clang = std::env::var("M3OS_NODE_CLANG").unwrap_or_else(|_| "clang".to_string());
+    let clangxx = std::env::var("M3OS_NODE_CLANGXX").unwrap_or_else(|_| "clang++".to_string());
+    let toolchain_ok = node_tool_on_path(&clang)
+        && node_tool_on_path(&clangxx)
+        && node_tool_on_path("ld.lld")
+        && node_tool_on_path("python3")
+        && node_tool_on_path("make");
+    let sysroot_libcxx = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("target/llvm-musl-sysroot/lib/libc++.a");
+    if !toolchain_ok || !sysroot_libcxx.exists() {
+        println!(
+            "node-jit-smoke: SKIP (reason: host C++ toolchain or llvm musl sysroot absent — \
+             needs clang/clang++/ld.lld/python3/make + `cargo xtask port build llvm`)"
+        );
+        return;
+    }
+
+    // Select the JIT variant for BOTH the build and the bundle. `M3OS_NODE_JIT=1`
+    // makes `build_node` drop `--v8-options=--jitless` + apply the A.1 V8/Node PKU
+    // patches, and seals it under the `jit` content key (distinct from the jitless
+    // `.m3pkg`, so no cross-pkgcache contamination). `M3OS_WITH_NODE=1` bundles
+    // whichever node `.m3pkg` was built into `/usr/pkg` — with `M3OS_NODE_JIT=1`
+    // also set, the bundled + installed artifact IS the JIT one.
+    // SAFETY: xtask is single-threaded here; the child image-build steps read the
+    // env. set_var is `unsafe` in Rust edition 2024 (cross-thread UB risk).
+    unsafe {
+        std::env::set_var("M3OS_NODE_JIT", "1");
+        std::env::set_var("M3OS_WITH_NODE", "1");
+    }
+
+    // Build the static JIT Node.js `.m3pkg`. A real build failure here is a FAIL
+    // (not a skip) — the toolchain IS present and PKU IS available.
+    if let Err(msg) = port_build::build_node_port() {
+        eprintln!("node-jit-smoke: precondition failed (node JIT port build): {msg}");
+        std::process::exit(SMOKE_EXIT_NODE_JIT_SMOKE_FAILED);
+    }
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    // Always rebuild the data disk so the freshly-bundled JIT node `.m3pkg` + the
+    // /usr/src/node-jit-probe.js fixture are present and the package DB is clean.
+    // M3OS_NODE_FAST_ITER reuses an already-installed disk (mirroring node-smoke).
+    let fast_iter = std::env::var("M3OS_NODE_FAST_ITER").is_ok();
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if fast_iter && disk_img.exists() {
+        println!("node-jit-smoke: M3OS_NODE_FAST_ITER — reusing existing disk (skipping install)");
+    } else {
+        if disk_img.exists() {
+            let _ = fs::remove_file(&disk_img);
+        }
+        create_data_disk(
+            uefi_image.parent().unwrap(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false, // graphical_login — serial autologin path
+        );
+    }
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    // KVM is REQUIRED (checked above) — exposes the host's real PKU so V8's
+    // ThreadIsolation engages and the W^X v2 grant fires. Threaded explicitly
+    // into the DeviceSet (DeviceSet::default() never reads M3OS_KVM).
+    let mut qemu_args = qemu_args_with_devices(
+        &uefi_image,
+        &ovmf,
+        display_mode,
+        DeviceSet {
+            kvm: true,
+            ..DeviceSet::default()
+        },
+    );
+    // Drop the hostfwd rule (no host networking needed — the JIT + WASM proofs are
+    // entirely local; same trim `session_smoke_qemu_args`/`pku-smoke` apply).
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    // Pin to a single core (same rationale as node-smoke/pku-smoke): the heavy
+    // Node load + slow-VFS pipeline + per-thread PKRU window are exercised, but a
+    // single core avoids cross-core PKRU/futex/IPC races under the heavy load.
+    for i in 0..qemu_args.len() {
+        if qemu_args[i] == "-smp" && i + 1 < qemu_args.len() {
+            qemu_args[i + 1] = "1".to_string();
+        }
+    }
+
+    let steps = node_jit_smoke_steps(fast_iter);
+
+    println!(
+        "node-jit-smoke: launching QEMU (timeout {}s, {} steps) [KVM — real PKU, JIT variant]",
+        args.timeout_secs,
+        steps.len(),
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("node-jit-smoke: failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!(
+                "node-jit-smoke: PASSED ({} steps in {elapsed}s)",
+                steps.len()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("node-jit-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_NODE_JIT_SMOKE_FAILED);
+        }
+    }
+}
+
+/// Serial script for `node-jit-smoke`. Installs the JIT node variant, asserts the
+/// version banner (the first cold V8 init — which commits code space; on a PKU
+/// boot the W^X v2 grant fires here, on a no-PKU boot V8 would have aborted, but
+/// the gate already SKIPs that case), runs `node-jit-probe.js` under
+/// `--allow-natives-syntax`, and asserts:
+///
+///  - `NODE_JIT_OK`  — `%GetOptimizationStatus` reports the kOptimized bit (real
+///                     TurboFan/optimized machine code, not just WASM — the A.1
+///                     "must assert real optimization, not just WASM" requirement),
+///  - `NODE_WASM_OK` — a trivial `WebAssembly.Instance` executes `add(2,3) === 5`
+///                     (the capability the Phase 90b yoga.wasm TUI needs), and
+///  - `[wx] v2-guarded W+X mapping (pkey=` — the POSITIVE proof V8 took the
+///                     PKU-guarded code-commit path. The v1 W+X rejection logs
+///                     NOTHING (it just returns EINVAL), so its "absence" is proven
+///                     structurally: had V8 hit the rejected path it would have
+///                     aborted before printing NODE_JIT_OK. The non-consuming Wait
+///                     for the v2-guarded line confirms the guarded grant happened.
+///
+/// The probe arm is a `WaitPassOrFail` so a `NODE_JIT_ERR`/`NODE_WASM_ERR`
+/// diagnostic — or a V8 fatal-abort signature (the no-PKU/unguarded-RWX symptom,
+/// defence-in-depth though the gate already SKIPs no-PKU) — fails the gate fast
+/// instead of timing out.
+fn node_jit_smoke_steps(fast_iter: bool) -> Vec<SmokeStep> {
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/node-jit-smoke: kernel first message",
+    }];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    // 1. Install the JIT Node.js package from the bundled offline repo (the
+    //    bundled `.m3pkg` is the JIT variant — M3OS_NODE_JIT was set at build).
+    if !fast_iter {
+        steps.push(SmokeStep::Send {
+            input: "pkg install node\n",
+            label: "node-jit-smoke: pkg install node (JIT variant)",
+        });
+        steps.push(SmokeStep::WaitPassOrFail {
+            pass_pattern: "pkg install: node: OK",
+            fail_prefixes: &["pkg install: cannot"],
+            timeout_secs: 3600,
+            label: "node-jit-smoke: JIT node installed from .m3pkg",
+            exit_code_on_fail: SMOKE_EXIT_NODE_JIT_SMOKE_FAILED,
+        });
+    }
+
+    // 2. Version banner — the first cold V8 init. This is where V8 commits its
+    //    code space; on this PKU boot the W^X v2 grant fires (asserted below).
+    //    Cold streamed ~56 MB load over the slow VFS needs a generous ceiling
+    //    (far faster under KVM, which the gate requires).
+    steps.push(SmokeStep::Send {
+        input: "node --version\n",
+        label: "node-jit-smoke: node --version",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "v22.22",
+        timeout_secs: 1200,
+        label: "node-jit-smoke: JIT node 22.x runs on target (version banner, cold load)",
+    });
+
+    // 3. The JIT + WASM probe under --allow-natives-syntax (the `%`-intrinsics the
+    //    JIT-proof arm uses). The JIT variant has full TurboFan/Maglev + WASM ON
+    //    by default (no --jitless), so no other V8 flag is needed.
+    steps.push(SmokeStep::Send {
+        input: "node --allow-natives-syntax /usr/src/node-jit-probe.js\n",
+        label: "node-jit-smoke: run node-jit-probe.js",
+    });
+
+    // 4. Negative/security arm — asserted FIRST (before the consuming
+    //    WaitPassOrFail arms below), because `WaitPassOrFail` DRAINS the serial
+    //    buffer through its matched pass line (`drain_serial_through_match`),
+    //    which would discard this earlier-arriving kernel line.
+    //
+    //    The POSITIVE proof V8 took the PKU-guarded W+X path: the kernel logs
+    //    exactly one `[wx] v2-guarded W+X mapping (pkey=N)` per grant
+    //    (`syscall/mod.rs` `mprotect_worker`, `WxDecision::GuardedV2`). V8 emits
+    //    its W+X code-space commits as JIT/WASM codegen runs, so this kernel line
+    //    arrives during the probe — at or before NODE_JIT_OK/NODE_WASM_OK on the
+    //    wire. The v1 rejection path (an UNGUARDED RWX request — what V8 falls
+    //    back to without PKU) logs NOTHING and returns EINVAL, which aborts V8
+    //    before any sentinel prints. So this Wait matching, together with the
+    //    NODE_JIT_OK/NODE_WASM_OK arms below passing, proves the W+X grant went
+    //    through the guarded pkey path — not an unguarded-RWX policy hole. (The
+    //    Wait is non-consuming, so it leaves NODE_JIT_OK/NODE_WASM_OK in the
+    //    buffer for the following arms.)
+    steps.push(SmokeStep::Wait {
+        pattern: "[wx] v2-guarded W+X mapping (pkey=",
+        timeout_secs: 1800,
+        label: "node-jit-smoke: kernel logged the v2-guarded W+X grant (PKU path, no unguarded RWX)",
+    });
+
+    // 5. JIT proof: V8 optimized a hot function to machine code (kOptimized bit).
+    //    Fail fast on the probe's diagnostic OR a V8 fatal-abort (the
+    //    unguarded-RWX / no-PKU symptom — defence-in-depth though the gate SKIPs
+    //    no-PKU up front).
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "NODE_JIT_OK",
+        fail_prefixes: &[
+            "NODE_JIT_ERR",
+            "# Fatal error",
+            "FATAL ERROR",
+            "Check failed",
+        ],
+        timeout_secs: 1800,
+        label: "node-jit-smoke: V8 JITs a hot fn to optimized/TurboFan code (NODE_JIT_OK)",
+        exit_code_on_fail: SMOKE_EXIT_NODE_JIT_SMOKE_FAILED,
+    });
+    // 6. WASM proof: a trivial module instantiates + executes add(2,3)===5 (the
+    //    capability the 90b yoga.wasm TUI needs). WaitPassOrFail to fail fast on
+    //    its err line.
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "NODE_WASM_OK",
+        fail_prefixes: &["NODE_WASM_ERR"],
+        timeout_secs: 600,
+        label: "node-jit-smoke: WebAssembly.Instance executes add(2,3)===5 (NODE_WASM_OK)",
+        exit_code_on_fail: SMOKE_EXIT_NODE_JIT_SMOKE_FAILED,
+    });
+
+    steps
+}
+
 /// Phase 86e — `cargo xtask gh-smoke`.
 ///
 /// The CORE (build a `M3OS_WITH_GH` image → boot → `pkg install gh` →
@@ -19033,6 +19371,78 @@ fn populate_ext2_files(
         \x20 res.on('end', () => { if (body.length > 0) console.log('NODE_EGRESS_OK'); });\n\
         }).on('error', (e) => { console.log('NODE_EGRESS_ERR ' + e.message); });\n";
 
+    // Phase 90a Track D.3 — the `node-jit-smoke` JIT + WASM probe, staged at
+    // /usr/src/node-jit-probe.js. Run by the gate as
+    // `node --allow-natives-syntax /usr/src/node-jit-probe.js` (the JIT variant
+    // drops --jitless at configure time, so full TurboFan/Maglev/Sparkplug + WASM
+    // are ON by default — the only runtime flag the probe needs is
+    // --allow-natives-syntax for the `%`-intrinsics).
+    //
+    // Two falsifiable proofs:
+    //
+    //  (1) NODE_JIT_OK — V8 actually JITs. Per the A.1 findings, plain WASM
+    //      executes even on the jitless-flagged binary, so a WASM-only check does
+    //      NOT prove TurboFan ran. The probe forces real optimization with
+    //      `%OptimizeFunctionOnNextCall` after warming the function, then reads
+    //      `%GetOptimizationStatus` and asserts the kOptimized bit (1 << 4 = 16)
+    //      is set — i.e. the function is running OPTIMIZED machine code, not
+    //      interpreted/baseline. It additionally checks the kTurboFanned bit
+    //      (1 << 6 = 64) and prints `NODE_JIT_TF` when the tier is TurboFan
+    //      specifically (the A.1 note's `kTurboFanned` signal); kOptimized is the
+    //      load-bearing assertion (Maglev would also be a genuine JIT). A jitless
+    //      binary returns kNeverOptimize / no kOptimized bit, so this never falses.
+    //      (The OptimizationStatus bit values are V8's stable test enum — verified
+    //      against V8 12.4.254.21, the version this Node 22 tree embeds.)
+    //
+    //  (2) NODE_WASM_OK — `new WebAssembly.Instance(new WebAssembly.Module(bytes))`
+    //      of a trivial module exporting `add(a,b)` succeeds AND executes
+    //      (add(2,3) === 5). This is the exact capability the Phase 90b TUI's
+    //      yoga.wasm needs. The module is the canonical 41-byte hand-assembled
+    //      wasm `(module (func (export "add") (param i32 i32) (result i32)
+    //      local.get 0 local.get 1 i32.add))`.
+    //
+    // Sentinels are emitted by the program (not the typed command echo) so the
+    // gate's Wait keys on real execution. A failure of either arm prints a
+    // distinct *_ERR line the gate fails fast on, rather than a silent timeout.
+    let node_jit_probe_js_content = "'use strict';\n\
+        // --- Proof 1: real TurboFan/optimized-code JIT ---\n\
+        const V8_OPTIMIZED = 1 << 4;   // OptimizationStatus::kOptimized\n\
+        const V8_TURBOFANNED = 1 << 6; // OptimizationStatus::kTurboFanned\n\
+        function hot(x) { let s = 0; for (let i = 0; i < x; i++) s += (i * 7) ^ i; return s; }\n\
+        try {\n\
+        \x20 hot(1); hot(1);\n\
+        \x20 // eslint-disable-next-line no-undef\n\
+        \x20 %OptimizeFunctionOnNextCall(hot);\n\
+        \x20 hot(1000);\n\
+        \x20 // eslint-disable-next-line no-undef\n\
+        \x20 const st = %GetOptimizationStatus(hot);\n\
+        \x20 if ((st & V8_OPTIMIZED) !== 0) {\n\
+        \x20   if ((st & V8_TURBOFANNED) !== 0) console.log('NODE_JIT_TF status=' + st);\n\
+        \x20   console.log('NODE_JIT_OK');\n\
+        \x20 } else {\n\
+        \x20   console.log('NODE_JIT_ERR not-optimized status=' + st);\n\
+        \x20 }\n\
+        } catch (e) {\n\
+        \x20 console.log('NODE_JIT_ERR ' + (e && e.message ? e.message : e));\n\
+        }\n\
+        // --- Proof 2: WebAssembly instantiate + execute ---\n\
+        try {\n\
+        \x20 const bytes = new Uint8Array([\n\
+        \x20   0x00,0x61,0x73,0x6d, 0x01,0x00,0x00,0x00,\n\
+        \x20   0x01,0x07,0x01, 0x60,0x02,0x7f,0x7f,0x01,0x7f,\n\
+        \x20   0x03,0x02,0x01,0x00,\n\
+        \x20   0x07,0x07,0x01, 0x03,0x61,0x64,0x64, 0x00,0x00,\n\
+        \x20   0x0a,0x09,0x01, 0x07,0x00, 0x20,0x00, 0x20,0x01, 0x6a, 0x0b\n\
+        \x20 ]);\n\
+        \x20 const mod = new WebAssembly.Module(bytes);\n\
+        \x20 const inst = new WebAssembly.Instance(mod);\n\
+        \x20 const r = inst.exports.add(2, 3);\n\
+        \x20 if (r === 5) console.log('NODE_WASM_OK');\n\
+        \x20 else console.log('NODE_WASM_ERR add=' + r);\n\
+        } catch (e) {\n\
+        \x20 console.log('NODE_WASM_ERR ' + (e && e.message ? e.message : e));\n\
+        }\n";
+
     // Phase 46: service definition files.
     let sshd_conf = "name=sshd\ncommand=/bin/sshd\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=syslogd\n";
     let telnetd_conf = "name=telnetd\ncommand=/bin/telnetd\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=syslogd\n";
@@ -19502,6 +19912,7 @@ fn populate_ext2_files(
     let hello_cpp_tmp = output_dir.join("_tmp_hello_cpp");
     let node_probe_js_tmp = output_dir.join("_tmp_node_probe_js");
     let node_http_egress_js_tmp = output_dir.join("_tmp_node_http_egress_js");
+    let node_jit_probe_js_tmp = output_dir.join("_tmp_node_jit_probe_js");
     fs::write(&passwd_tmp, passwd_content).expect("write temp passwd");
     fs::write(&shadow_tmp, shadow_content).expect("write temp shadow");
     fs::write(&group_tmp, group_content).expect("write temp group");
@@ -19515,6 +19926,8 @@ fn populate_ext2_files(
     fs::write(&node_probe_js_tmp, node_probe_js_content).expect("write temp node-probe.js");
     fs::write(&node_http_egress_js_tmp, node_http_egress_js_content)
         .expect("write temp node-http-egress.js");
+    fs::write(&node_jit_probe_js_tmp, node_jit_probe_js_content)
+        .expect("write temp node-jit-probe.js");
     fs::write(&sshd_conf_tmp, sshd_conf).expect("write temp sshd.conf");
     fs::write(&syslogd_conf_tmp, syslogd_conf).expect("write temp syslogd.conf");
     fs::write(&crond_conf_tmp, crond_conf).expect("write temp crond.conf");
@@ -19865,12 +20278,17 @@ fn populate_ext2_files(
          write \"{}\" usr/src/node-http-egress.js\n\
          sif usr/src/node-http-egress.js mode 0x81A4\n\
          sif usr/src/node-http-egress.js uid 0\n\
-         sif usr/src/node-http-egress.js gid 0\n",
+         sif usr/src/node-http-egress.js gid 0\n\
+         write \"{}\" usr/src/node-jit-probe.js\n\
+         sif usr/src/node-jit-probe.js mode 0x81A4\n\
+         sif usr/src/node-jit-probe.js uid 0\n\
+         sif usr/src/node-jit-probe.js gid 0\n",
         fibonacci_py_tmp.display(),
         hello_c_tmp.display(),
         hello_cpp_tmp.display(),
         node_probe_js_tmp.display(),
         node_http_egress_js_tmp.display(),
+        node_jit_probe_js_tmp.display(),
     );
 
     // Phase 73 — stage the three desktop-daemon service confs only
@@ -20440,6 +20858,7 @@ fn populate_ext2_files(
     let _ = fs::remove_file(&hello_cpp_tmp);
     let _ = fs::remove_file(&node_probe_js_tmp);
     let _ = fs::remove_file(&node_http_egress_js_tmp);
+    let _ = fs::remove_file(&node_jit_probe_js_tmp);
     let _ = fs::remove_file(&sshd_conf_tmp);
     if enable_telnet {
         let _ = fs::remove_file(output_dir.join("_tmp_telnetd_conf"));
