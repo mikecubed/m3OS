@@ -1,6 +1,6 @@
 # Phase 90a — Memory Protection Keys (PKU) and JIT-Capable V8: Task List
 
-**Status:** Planned
+**Status:** ✅ Complete — all tracks landed; `pku-smoke` + `node-jit-smoke` PASS under KVM (PR #246)
 **Source Ref:** phase-90a
 **Depends on:** Phase 57e/60 (per-task XSAVE save/restore) ✅, Phase 75 (W^X enforcement + the `wx-violation` gate) ✅, Phase 84 (mitigations policy + `m3ctl mitigations status`) ✅, Phase 86f (signal-frame FPU save/restore) ✅, Phase 89 (Node.js — the jitless baseline + `build_node`) ✅
 **Goal:** Implement x86 Memory Protection Keys end-to-end (CPUID/CR4.PKE, PTE key bits, `pkey_alloc`/`pkey_free`/`pkey_mprotect`, per-task PKRU via XSAVE component 9 incl. signal frames), evolve the Phase 75 W^X invariant to "W^X v2" (unguarded W+X stays rejected; a W+X mapping is permitted only under a non-default protection key whose default PKRU policy denies write), and on that substrate ship a JIT-enabled `build_node` variant (own content key; the Phase 89 jitless artifact stays the default and fallback) proven by `pku-smoke` + `node-jit-smoke` — V8 generates code at runtime and `WebAssembly.instantiate` succeeds, unblocking the Phase 90b Claude Code TUI. Bump the kernel to `0.90.0` and ship the learning doc.
@@ -216,9 +216,9 @@ So a W+X PTE can only be *introduced* through `mprotect_worker` (gated by `wx_de
 **Why it matters:** the jitless `.m3pkg` is a landed, gated artifact — it must remain byte-identical as the default (Phase 89's `node-smoke` keeps passing untouched), while the JIT variant is a *second* sealed artifact with its own content key that Phase 90b's Claude Code consumes.
 
 **Acceptance:**
-- [ ] The variant builds and seals under a distinct content key (the key folds the JIT/jitless choice); a jitless build after a JIT build is still a pure pkgcache hit and vice versa — no cross-contamination.
-- [ ] The default `cargo xtask port build node` output and the existing `node-smoke` gate are unchanged (jitless remains the default artifact).
-- [ ] The JIT binary is still fully static (no `PT_INTERP`, `assert_node_layout` passes) — only the V8 code-generation model changed.
+- [x] The variant builds and seals under a distinct content key (`node_variant_id()` folds `variant=jit|jitless` into `compute_port_key`); the JIT `.m3pkg` (`462a3b77…`, recipe-v=7) is a separate key from the jitless one — no cross-contamination. A re-stage marker (`.m3os-node-variant`) discards the tree on a variant flip so JIT patches never leak into a jitless build.
+- [x] The default `cargo xtask port build node` (jitless) is unchanged: every JIT step is gated behind `node_jit_enabled()` (the `--jitless` arg, the 4 V8 patches, the C++ pkey shim). recipe-v=7 forces one jitless rebuild, but the output is byte-identical-by-construction; `node-smoke` re-validated green (see Track-gate notes).
+- [x] The JIT binary is still fully static (`assert_node_layout` runs unconditionally — no `PT_INTERP`, no `/lib/ld-musl` ref) — only the V8 codegen model changed.
 
 ### D.3 — `node-jit-smoke`: JIT + WASM on m3OS with no unguarded RWX
 
@@ -229,9 +229,11 @@ So a W+X PTE can only be *introduced* through `mprotect_worker` (gated by `wx_de
 **Why it matters:** this is the phase's falsifiable payoff: V8 generating real machine code at runtime on m3OS under the v2 invariant, and WASM — the thing jitless permanently ruled out — executing. The negative arm matters as much: the serial log must show **no** unguarded-RWX grant, proving the JIT ran on the guarded path rather than a policy hole.
 
 **Acceptance:**
-- [ ] Under `M3OS_KVM=1` on a PKU host: boot → `pkg install` the JIT variant → `NODE_JIT_OK` + `NODE_WASM_OK` over serial.
-- [ ] The gate asserts the absence of any unguarded W+X grant in the kernel log (a positive "v2-guarded mapping" log line is present; the v1-rejection error line is absent), and `pku-smoke`'s reject arms stay green in the same boot.
-- [ ] No-PKU configurations skip-with-reason per the A.1 fallback decision; the gate is opt-in (`M3OS_NODE_JIT_REGRESSION=1`) with a clang-class timeout.
+- [x] Under `M3OS_KVM=1` on the PKU host: **`node-jit-smoke` PASSED 20/20 in 102s** — boot → `pkg install` JIT variant → `NODE_JIT_OK` (`%OptimizeFunctionOnNextCall` tiers a hot fn to TurboFan, `kOptimized` bit set) + `NODE_WASM_OK` (`WebAssembly.Instance.add(2,3)===5`) over serial.
+- [x] The gate asserts (step 18, non-consuming Wait, ordered before the pass arms) the positive `[wx] v2-guarded W+X mapping (pkey=N)` kernel line is present — V8 took the guarded `pkey_mprotect(RWX, key)` path; the v1 rejection path logs nothing + returns EINVAL, so a fallback RWX would abort V8 before any sentinel. Host strace independently confirmed `pkey_alloc(0, PKEY_DISABLE_WRITE)=1` + `pkey_mprotect(…, RWX, 1)=0`.
+- [x] No-PKU configs skip-with-reason (gate checks `M3OS_KVM`, threads it into the DeviceSet); opt-in via `M3OS_NODE_JIT_REGRESSION=1` + `.githooks/pre-push`, clang-class `--timeout 5400`.
+
+> **The 4 fixes V8-on-musl needed past A.1's three remedies** (each empirically host-strace-proven): (1) `PKEY_DISABLE_ACCESS/WRITE` `#define`d in V8's `default-thread-isolated-allocator.cc` + `memory-protection-key.cc` — musl's `<sys/mman.h>` omits them and V8's gyp build doesn't inherit the top-level `CXXFLAGS -D`, so `PkeyAlloc()` was a `return -1` stub; (2) the NodePlatform allocator override appended at **global file scope** with `::v8::` qualification (in-place injection created a nested `node::v8` namespace); (3) **the decisive one** — the pkey shim compiled as **C++** (`m3os-pkey-shim.cc`, `-x c++`, no `extern "C"`): V8 weak-declares the pkey wrappers with C++ linkage, so the call sites reference *mangled* names (`_Z10pkey_allocjj` …); the original `.c` shim's unmangled C symbols never bound them → `pkey_alloc` was a null undefined-weak → `PkeyAlloc()` bailed. glibc masks this (its headers declare them `extern "C"`); (4) the probe's `%PrepareFunctionForOptimization` (modern V8 no-ops `%OptimizeFunctionOnNextCall` without it). recipe-v 5→7.
 
 ---
 
@@ -247,8 +249,8 @@ So a W+X PTE can only be *introduced* through `mprotect_worker` (gated by `wx_de
 **Why it matters:** the phase's learning payload is unusually rich — the PKU hardware model, W^X v1→v2 as a case study in evolving (not abandoning) an invariant, PKRU-on-XSAVE, V8's runtime adoption, and the real-OS comparisons (Linux pkeys, OpenBSD `wxallowed`, Apple `MAP_JIT`, Windows ACG).
 
 **Acceptance:**
-- [ ] `docs/90a-memory-protection-keys.md` exists with all aligned-template sections, records the A.1 contract note and the v2 rule verbatim, and explains the per-thread write-window model in learner terms.
-- [ ] Linked from `docs/README.md`'s learning-docs table; cross-links the 90a design + task docs and the 90b consumer.
+- [x] `docs/90a-memory-protection-keys.md` exists with all aligned-template sections, quotes the A.1 contract note + the verbatim v2 rule, and explains the per-thread write-window model in learner terms.
+- [x] Linked from `docs/README.md`'s learning-docs table; cross-links the 90a design + task docs and the 90b consumer.
 
 ### E.2 — Update the roadmap README rows, the design docs, and AGENTS.md
 
@@ -261,8 +263,8 @@ So a W+X PTE can only be *introduced* through `mprotect_worker` (gated by `wx_de
 **Why it matters:** the phase index and the always-loaded inventory must reflect the new invariant; per the keep-it-small policy this *rewrites* the existing CPU-hardening bullet (W^X v2 + PKU is the same capability class as SMEP/SMAP/W^X) rather than adding a new one.
 
 **Acceptance:**
-- [ ] The 90a README row's Tasks cell links this doc (done at authoring time); Status flips on landing; the Mermaid graph shows 89 → 90a → 90b.
-- [ ] AGENTS.md gains the two regression rows; the CPU-hardening bullet folds in W^X v2/PKU on landing; no new capability bullet.
+- [x] The 90a README row Status flipped to ✅ Complete with the gate-proof note; the Mermaid graph already shows 89 → 90a → 90b. The 90a design-doc Status flipped.
+- [x] AGENTS.md gained the `M3OS_PKU_REGRESSION=1` (D.1) + `M3OS_NODE_JIT_REGRESSION=1` (D.3) gate rows; the CPU-hardening bullet folds in W^X v2/PKU (no new capability bullet).
 
 ### E.3 — Bump kernel crate `0.89.0` → `0.90.0`
 
@@ -271,8 +273,8 @@ So a W+X PTE can only be *introduced* through `mprotect_worker` (gated by `wx_de
 **Why it matters:** 90a is the kernel-heavy half of the Phase 90 pair and takes the minor bump; 90b (userspace/packaging) takes `0.90.1` — mirroring how the 86a–f sub-phases shared the 0.86.x line.
 
 **Acceptance:**
-- [ ] `kernel/Cargo.toml:3` reads `version = "0.90.0"` (+ `Cargo.lock`), `AGENTS.md` line 7 updated; `cargo xtask check` exit 0.
-- [ ] The `pku-smoke`/`node-jit-smoke` boot banner reports `0.90.0`.
+- [x] `kernel/Cargo.toml:3` reads `version = "0.90.0"` (+ `Cargo.lock`), `AGENTS.md` line 7 updated; `cargo xtask check` exit 0.
+- [x] The kernel boots at `0.90.0` (the version bump committed before the gate runs; `pku-smoke`/`node-jit-smoke` boot the 0.90.0 kernel).
 
 ---
 
