@@ -1,0 +1,53 @@
+NAME=claude-code
+VERSION=2.1.112
+DESCRIPTION="Claude Code — Anthropic's terminal coding agent (Node cli.js bundle + yoga.wasm TUI)"
+CATEGORY=util
+DEPS=node
+URL=https://registry.npmjs.org/@anthropic-ai/claude-code/-/claude-code-2.1.112.tgz
+SHA256=84379969ea53a0e5fd231a8f77debe4c7cb17dd971f4809d10d33f9aeca5de09
+MAINTAINER=m3os
+
+# Phase 90b — Claude Code, the FIRST hosted CLI coding agent on the Phase 85a
+# `.m3pkg` substrate. It is delivered the same way every heavy port is: the
+# pinned npm registry tarball is fetched + SHA-verified host-side, the package
+# payload is staged + sealed into a content-addressed `.m3pkg`, and the offline
+# in-OS solver installs it from `/usr/pkg/`. `DEPS=node` makes the solver
+# auto-install the Phase 89/90a Node runtime first (the dependency-first proof
+# `pkg install tmux`→`libevent` established in 85a). NO live network is needed
+# inside the guest to install — see build_claude_code in xtask/src/port_build.rs.
+#
+# THE PIN — why 2.1.112 and not `latest`. This is a fetch-and-stage port (no
+# compiler): the staged payload is the npm package's `cli.js` (a ~9.3 MB minified
+# JS bundle) + `yoga.wasm` (the 88 KB WebAssembly TUI layout engine) +
+# `vendor/ripgrep/` (the search tool), run under `/usr/bin/node`. **2.1.112 is the
+# LAST claude-code version that ships this `cli.js`-under-Node model.** As of
+# 2.1.113 the npm package repackaged into a per-platform NATIVE single-file binary
+# (a Bun/JavaScriptCore executable, ~500 MB; the wrapper's `install.cjs` copies it
+# over a `bin/claude.exe` stub — there is no `cli.js`, and Node is not used at
+# all). That native model would invalidate this phase's entire `DEPS=node` +
+# Phase 89/90a JIT-Node dependency chain, so the supported pin stays on the last
+# Node-runnable release. Running the native Bun binary on m3OS is separate future
+# work (a Bun runtime port), not this phase. The Track A spike recorded the
+# transition at 2.1.112→2.1.113 and the host `cli.js --version` proof; see
+# docs/90b-claude-code.md and docs/roadmap/tasks/90b-claude-code-tasks.md.
+#
+# RUNTIME — the TUI requires the Phase 90a JIT Node variant. Claude Code's
+# terminal UI instantiates `yoga.wasm` at runtime; the Phase 89 jitless V8 forbids
+# runtime WASM codegen, so the supported runtime is the 90a JIT `build_node`
+# variant (V8 JIT + WASM under PKU-backed W^X v2). The M3OS_WITH_CLAUDE image
+# block bundles that JIT node `.m3pkg` alongside this one so the solver resolves
+# `DEPS=node` against the right runtime. The jitless `claude -p` headless mode is
+# the documented fallback if PKU/JIT is unavailable.
+#
+# LAUNCHER — `/usr/bin/claude` (staged by build_claude_code) pins the supported
+# environment: NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt (the 86a CA
+# bundle, so Node's OpenSSL validates api.anthropic.com), DISABLE_AUTOUPDATER=1
+# (the `.m3pkg` is the only supported delivery), and
+# CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 (no telemetry egress), then
+# `exec /usr/bin/node /usr/lib/claude-code/cli.js "$@"`.
+#
+# VENDORED ripgrep — `vendor/ripgrep/x64-linux/rg` is a fully-static `static-pie`
+# binary (no PT_INTERP); m3OS's ELF loader handles ET_DYN static-PIE, so it runs
+# directly and no separate ripgrep port is needed. The other-platform `rg`
+# binaries + the dynamic `audio-capture.node` addon + the `seccomp` helper (m3OS
+# has no seccomp) are pruned from the staged tree to keep the artifact lean.
