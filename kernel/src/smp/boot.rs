@@ -429,10 +429,10 @@ extern "C" fn ap_entry(per_core_data_ptr: *mut super::PerCoreData) -> ! {
     // state).  Routing both through this single call keeps every core's PKU
     // state consistent by construction.
     //
-    // NOTE: XCR0[9] makes PKRU *architecturally enabled* on this core and
-    // sizes the XSAVE area to include the PKRU region; it does NOT yet cause
-    // PKRU to be saved/restored across context switches.  The per-task RFBM
-    // (XSAVE_FEATURE_MASK) is still 0x7 — Track B.4 extends it to component 9.
+    // Phase 90a B.4 (gap closed): XCR0[9] makes PKRU *architecturally enabled*
+    // on this core and sizes the XSAVE area to include the PKRU region; the
+    // per-task RFBM is now the runtime `xsave_rfbm()` (0x207 under PKU), so PKRU
+    // is saved/restored across context switches and signal delivery on this AP.
     unsafe {
         crate::arch::x86_64::cpuid::enable_xsave_state();
     }

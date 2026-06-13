@@ -224,11 +224,13 @@ pub unsafe fn enable_xsave_state() {
     // Write XCR0 via `xsetbv` with ECX=0 — only XCR0 exists today.  When PKU is
     // usable, fold in component 9 (PKRU) so the architecture *knows* PKRU is
     // an active user-mode register and sizes the XSAVE area accordingly.
-    // NOTE: setting XCR0[9] does NOT yet save/restore PKRU across context
-    // switches — the per-task save/restore RFBM (XSAVE_FEATURE_MASK consumers
-    // in scheduler.rs save_fpu_state/restore_fpu_state/sanitize_xsave_header)
-    // is still hard-coded to 0x7 (x87+SSE+AVX).  Track B.4 must extend the
-    // RFBM to carry component 9 before PKRU isolation is complete.
+    // Phase 90a B.4 (gap closed): the per-task save/restore RFBM is now the
+    // runtime [`xsave_rfbm`] (`0x207` here, when PKU is usable; `0x7` otherwise)
+    // consumed by scheduler.rs `save_fpu_state`/`restore_fpu_state`/
+    // `sanitize_xsave_header` and the signal-frame snapshot — so once XCR0[9] is
+    // set here, PKRU is saved/restored across context switches and signal
+    // delivery, and fresh tasks seed the Linux-default PKRU rather than the
+    // all-permissive hardware init value.
     let mask = pku_features().xcr0_mask(XSAVE_FEATURE_MASK);
     unsafe {
         core::arch::asm!(
@@ -275,7 +277,37 @@ pub fn osxsave_enabled() -> bool {
 // raw bit decode + the XSAVE-area accounting lives in host-tested
 // `kernel_core::xsave_model::PkuFeaturesModel`.
 
-pub use kernel_core::xsave_model::{PkuFeaturesModel, XCR0_PKRU, XSAVE_COMPONENT_PKRU};
+pub use kernel_core::xsave_model::{
+    PKRU_INIT_DEFAULT, PkuFeaturesModel, XCR0_PKRU, XSAVE_COMPONENT_PKRU,
+};
+
+/// The per-task / signal-frame XSAVE requested-feature bitmap (RFBM) for **this
+/// boot**: `XSAVE_FEATURE_MASK` (0x7) on a no-PKU CPU, `0x207` (folding in PKRU
+/// component 9) when PKU is usable.
+///
+/// **Phase 90a B.4:** this is the single runtime source of truth that every
+/// `xsave64`/`xsaveopt64`/`xrstor64` site (`save_fpu_state` / `restore_fpu_state`
+/// in the scheduler, the signal-frame snapshot, the syscall-path snapshot) and
+/// the `sanitize_xsave_header` XSTATE_BV mask must consult — replacing the
+/// hard-coded `XSAVE_FEATURE_MASK` so PKRU rides the task boundary.  Computed by
+/// the host-tested [`kernel_core::xsave_model::xsave_rfbm`]; on a no-PKU CPU it
+/// is bit-for-bit the legacy 0x7.
+#[inline]
+pub fn xsave_rfbm() -> u64 {
+    kernel_core::xsave_model::xsave_rfbm(pku_usable())
+}
+
+/// The CPUID.0Dh.9:EBX byte offset of the PKRU state component within the
+/// standard (non-compacted) XSAVE area, or `0` when PKU is not usable (no PKRU
+/// component to seed).  Used by the new-task/fork PKRU seeding in `XSaveArea`.
+#[inline]
+pub fn pkru_component_offset() -> usize {
+    if pku_usable() {
+        pku_features().pkru_component_offset
+    } else {
+        0
+    }
+}
 
 static PKU_FEATURES: Once<PkuFeaturesModel> = Once::new();
 

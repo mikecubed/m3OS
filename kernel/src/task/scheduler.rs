@@ -1309,13 +1309,13 @@ fn alloc_task_slot(sched: &mut Scheduler, task: Task) -> usize {
         // automatically resets them — no separate reset step needed.
         *sched.tasks[idx] = task;
         if idx < sched.fpu_states.len() {
-            *sched.fpu_states[idx] = XSaveArea::new();
+            *sched.fpu_states[idx] = fresh_xsave_area();
         } else {
             sched
                 .fpu_states
                 .push(crate::mm::slab_box::SlabBox::<XSaveArea>::new_in(
                     &crate::mm::slab::caches().xsave_cache,
-                    XSaveArea::new(),
+                    fresh_xsave_area(),
                 ));
         }
         idx
@@ -1331,10 +1331,27 @@ fn alloc_task_slot(sched: &mut Scheduler, task: Task) -> usize {
             .fpu_states
             .push(crate::mm::slab_box::SlabBox::<XSaveArea>::new_in(
                 &crate::mm::slab::caches().xsave_cache,
-                XSaveArea::new(),
+                fresh_xsave_area(),
             ));
         idx
     }
+}
+
+/// Phase 90a B.4 — a fresh per-task `XSaveArea` with the architectural FPU
+/// defaults **and** the Linux-default PKRU (`PKRU_INIT_DEFAULT`: key 0
+/// unrestricted, every non-zero key access-denied) seeded into component 9 when
+/// PKU is usable.
+///
+/// `XSaveArea::new()` is `const` and leaves `XSTATE_BV[9]` clear, which would
+/// `xrstor` the all-permissive hardware init value (0) for PKRU — a security
+/// hole for a brand-new thread.  Seeding here (after CPUID is available) makes
+/// every freshly-allocated task start access-denied for allocated keys; a fork
+/// child then overrides this with the parent's PKRU in `spawn_fork_task`.  On a
+/// no-PKU CPU `seed_pkru` is a no-op and the area is the legacy default.
+fn fresh_xsave_area() -> XSaveArea {
+    let mut area = XSaveArea::new();
+    area.seed_pkru(crate::arch::x86_64::cpuid::PKRU_INIT_DEFAULT);
+    area
 }
 
 // Phase 60 — `Task` is allocated out of
@@ -1429,6 +1446,11 @@ pub fn spawn_fork_task(ctx: crate::process::ForkChildCtx, name: &'static str) ->
     let fork_pid = ctx.pid;
     let fork_rip = ctx.user_rip;
     let fork_rsp = ctx.user_rsp;
+    // Phase 90a B.4 — capture the parent's live PKRU *before* taking the
+    // scheduler lock (the capture itself acquires it), so the fork child can
+    // inherit it (Linux inherit-on-clone).  `None` on a no-PKU CPU → child
+    // keeps the seeded `PKRU_INIT_DEFAULT`.
+    let inherit_pkru = current_task_pkru();
     let mut task = Task::new(crate::process::fork_child_trampoline, name);
     let mut sched = scheduler_lock();
     let now = crate::arch::x86_64::interrupts::tick_count();
@@ -1459,6 +1481,15 @@ pub fn spawn_fork_task(ctx: crate::process::ForkChildCtx, name: &'static str) ->
         "spawn_fork_task: fork_ctx missing after set"
     );
     let idx = alloc_task_slot(&mut sched, task);
+    // Phase 90a B.4 — override the child's seeded default with the parent's
+    // PKRU so the fork child inherits the parent's key access rights (Linux
+    // semantics: PKRU is part of the FPU state copied on clone).  The lock is
+    // still held; seed directly into the just-allocated area.
+    if let Some(pkru) = inherit_pkru
+        && let Some(area) = sched.fpu_states.get_mut(idx)
+    {
+        area.seed_pkru(pkru);
+    }
     drop(sched);
 
     crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::ForkCtxPublish {
@@ -1793,8 +1824,10 @@ fn retarget_preempt_count_to_task(
 /// Phase 57e Track J — save the current task's FPU/AVX state.
 ///
 /// Uses `xsaveopt64` when CPUID 0Dh.1 advertises XSAVEOPT, otherwise the plain
-/// `xsave64`.  Both forms take the state-component mask in `EDX:EAX`; we pass
-/// the 1.0 mask (x87 + SSE + AVX = 0x7) on every call.
+/// `xsave64`.  Both forms take the state-component mask (RFBM) in `EDX:EAX`; we
+/// pass the runtime [`crate::arch::x86_64::cpuid::xsave_rfbm`] — x87 + SSE + AVX
+/// (0x7) on a no-PKU CPU, plus PKRU component 9 (0x207) when PKU is usable
+/// (Phase 90a B.4), so PKRU is saved across the task boundary.
 ///
 /// Falls back to `fxsave64` when [`crate::arch::x86_64::cpuid::osxsave_enabled`]
 /// reports false — exercised only by the very early boot window before the BSP
@@ -1804,7 +1837,7 @@ fn retarget_preempt_count_to_task(
 unsafe fn save_fpu_state(area: &mut XSaveArea) {
     unsafe {
         if crate::arch::x86_64::cpuid::osxsave_enabled() {
-            let mask = crate::arch::x86_64::cpuid::XSAVE_FEATURE_MASK;
+            let mask = crate::arch::x86_64::cpuid::xsave_rfbm();
             if crate::arch::x86_64::cpuid::features().xsaveopt {
                 core::arch::asm!(
                     "xsaveopt64 [{area}]",
@@ -1834,13 +1867,14 @@ unsafe fn save_fpu_state(area: &mut XSaveArea) {
 
 /// Phase 57e Track J — restore the current task's FPU/AVX state.
 ///
-/// Uses `xrstor64` with the 1.0 mask in `EDX:EAX`; falls back to `fxrstor64`
+/// Uses `xrstor64` with the runtime RFBM ([`crate::arch::x86_64::cpuid::xsave_rfbm`],
+/// 0x7 / 0x207 with PKU — Phase 90a B.4) in `EDX:EAX`; falls back to `fxrstor64`
 /// when XSAVE has not been enabled yet (early boot window).
 #[inline]
 unsafe fn restore_fpu_state(area: &XSaveArea) {
     unsafe {
         if crate::arch::x86_64::cpuid::osxsave_enabled() {
-            let mask = crate::arch::x86_64::cpuid::XSAVE_FEATURE_MASK;
+            let mask = crate::arch::x86_64::cpuid::xsave_rfbm();
             core::arch::asm!(
                 "xrstor64 [{area}]",
                 area = in(reg) area.as_ptr(),
@@ -2778,11 +2812,16 @@ pub fn set_current_user_return(urs: crate::task::UserReturnState) {
 }
 
 /// Reset the current task to the architectural FPU/SIMD defaults after exec.
+///
+/// Phase 90a B.4 — the new image must also start with the Linux-default PKRU
+/// (PKRU is reset, not inherited, on `execve`), so a stale write window from the
+/// pre-exec program cannot leak into the fresh image.  `fresh_xsave_area` seeds
+/// `PKRU_INIT_DEFAULT`; the `restore_fpu_state` then loads it into hardware.
 pub fn reset_current_task_fpu_state() {
     if let Some(idx) = get_current_task_idx() {
         let mut sched = scheduler_lock();
         if let Some(area) = sched.fpu_states.get_mut(idx) {
-            **area = XSaveArea::new();
+            **area = fresh_xsave_area();
             unsafe { restore_fpu_state(area.as_ref()) };
         }
     }
@@ -2803,10 +2842,12 @@ pub fn with_current_task_fpu_saved<R>(f: impl FnOnce(&[u8]) -> R) -> Option<R> {
     let mut sched = scheduler_lock();
     if let Some(area) = sched.fpu_states.get_mut(idx) {
         // Save live hardware FPU state into the task's XSaveArea so it is
-        // current for the signal-frame copy.  The xsave instruction writes the
-        // architectural state components enabled by XCR0 (x87 + SSE + AVX on
-        // m3OS today); we pass the same component mask used during context
-        // switch.  This is safe to call from the syscall-return path because:
+        // current for the signal-frame copy.  `save_fpu_state` writes the
+        // components in the runtime RFBM (x87 + SSE + AVX, plus PKRU component 9
+        // under PKU — Phase 90a B.4); we pass the same mask used during context
+        // switch, so the signal frame carries PKRU and a handler that opened a
+        // write window restores it across `sigreturn`.  This is safe to call
+        // from the syscall-return path because:
         //   a) the IRQ-safe scheduler lock is held across the xsave and the
         //      subsequent byte copy, preventing a concurrent context switch from
         //      racing with the snapshot;
@@ -2819,14 +2860,41 @@ pub fn with_current_task_fpu_saved<R>(f: impl FnOnce(&[u8]) -> R) -> Option<R> {
     }
 }
 
+/// Phase 90a B.4 — the current task's live PKRU, for `fork`/`clone` inheritance.
+///
+/// `fork`/`clone` runs on the syscall-return path while the parent is ON CPU, so
+/// its PKRU register holds the **live** value that has not yet been `xsave`d to
+/// the parent's `XSaveArea`.  We `save_fpu_state` (whose RFBM now includes
+/// component 9 under PKU — B.4) into the parent's area under the scheduler lock,
+/// then read PKRU back out — capturing the live value without executing `RDPKRU`
+/// here (B.3's `pkru.rs` owns the canonical `rdpkru`/`wrpkru` wrappers).
+///
+/// Returns `None` on a no-PKU CPU or kernel-task context — callers then leave
+/// the child at the seeded `PKRU_INIT_DEFAULT`.
+pub fn current_task_pkru() -> Option<u32> {
+    let idx = get_current_task_idx()?;
+    let mut sched = scheduler_lock();
+    let area = sched.fpu_states.get_mut(idx)?;
+    // Snapshot live hardware FPU (incl. PKRU under the B.4 RFBM) into the area,
+    // then read PKRU back from the saved bytes.
+    unsafe { save_fpu_state(area.as_mut()) };
+    area.as_ref().pkru()
+}
+
 /// Phase 86f Track B.1 — sanitize the 64-byte XSAVE header in a user-supplied
 /// buffer before passing it to `xrstor64`.
 ///
 /// A malformed XSAVE header makes `xrstor64` raise #GP in ring 0 — an
 /// unprivileged kernel DoS.  We apply three corrections:
 ///
-/// * `XSTATE_BV` (offset 512, 8 bytes): mask to `XSAVE_FEATURE_MASK` (0x7) so
-///   only x87 + SSE + AVX bits survive.
+/// * `XSTATE_BV` (offset 512, 8 bytes): mask to the runtime RFBM
+///   ([`crate::arch::x86_64::cpuid::xsave_rfbm`]) so only the components the
+///   kernel actually enabled in XCR0 survive — x87 + SSE + AVX (0x7), plus PKRU
+///   component 9 (→ 0x207) **only when PKU is usable** (Phase 90a B.4).  Bit 9 is
+///   admitted under PKU so a signal handler that opened a write window restores
+///   the pre-signal PKRU across `sigreturn`; on a no-PKU boot it is masked off
+///   exactly as Phase 86f shipped, so a forged `XSTATE_BV[9]` cannot smuggle in
+///   a component the CPU/OS never enabled (which would `#GP` `xrstor64` in ring 0).
 /// * `XCOMP_BV` (offset 520, 8 bytes): force to 0 — m3OS uses the standard
 ///   (non-compacted) `xrstor64` format; bit 63 set would trigger compacted mode
 ///   and raise #GP.
@@ -2846,7 +2914,6 @@ pub fn with_current_task_fpu_saved<R>(f: impl FnOnce(&[u8]) -> R) -> Option<R> {
 /// `restore_current_task_fpu_from_bytes` will reject it).
 pub fn sanitize_xsave_header(buf: &mut [u8]) {
     use crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE;
-    use crate::arch::x86_64::cpuid::XSAVE_FEATURE_MASK;
 
     if buf.len() != XSAVE_AREA_SIZE {
         return;
@@ -2866,9 +2933,11 @@ pub fn sanitize_xsave_header(buf: &mut [u8]) {
     // consumer of this field also sees a safe mask rather than attacker data.
     buf[28..32].copy_from_slice(&SAFE_MXCSR_MASK.to_le_bytes());
 
-    // XSTATE_BV (offset 512): keep only bits within XSAVE_FEATURE_MASK.
+    // XSTATE_BV (offset 512): keep only bits within the runtime RFBM (the
+    // components actually enabled in XCR0 this boot) — 0x7, or 0x207 under PKU.
+    let mask = crate::arch::x86_64::cpuid::xsave_rfbm();
     let xstate_bv = u64::from_le_bytes(buf[512..520].try_into().unwrap());
-    buf[512..520].copy_from_slice(&(xstate_bv & XSAVE_FEATURE_MASK).to_le_bytes());
+    buf[512..520].copy_from_slice(&(xstate_bv & mask).to_le_bytes());
 
     // XCOMP_BV (offset 520): force to 0 (standard xrstor format, not compacted).
     buf[520..528].fill(0);
