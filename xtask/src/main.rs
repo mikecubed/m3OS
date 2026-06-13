@@ -12107,6 +12107,16 @@ fn mitigations_status_smoke_steps() -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "guest/mitigations: reporter enumerates the UNADDRESSED classes",
     });
+    // Phase 90a C.2 — the reporter prints the W^X policy-version / PKU-posture
+    // line. The default TCG lane has no PKU, so the asserted form is the no-PKU
+    // `v1 (PKU absent)`. (Under `M3OS_KVM=1` on a PKU host the line reads
+    // `W^X: v2 (PKU present, active)` instead; that form is KVM-only and is
+    // covered by the host formatter unit test rather than this TCG gate.)
+    steps.push(SmokeStep::Wait {
+        pattern: "W^X: v1 (PKU absent)",
+        timeout_secs: 5,
+        label: "guest/mitigations: reporter prints the W^X v1 / PKU-absent line (no-PKU lane)",
+    });
     steps
 }
 

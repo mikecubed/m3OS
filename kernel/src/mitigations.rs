@@ -245,7 +245,23 @@ pub fn vuln_map() -> [(Vuln, Status); VULNS] {
 
 /// The wire-serializable boot report for the `m3ctl mitigations status` syscall
 /// (D.3). Reflects the actual applied state — never a re-`rdmsr`.
+///
+/// Phase 90a C.2 adds the W^X / PKU posture. The values are sourced live from
+/// the B.1 PKU probes (single source of truth — never a re-derived CPUID read):
+/// - `pku_present` = the architectural PKU bit + the XSAVE PKRU component, i.e.
+///   the static half of [`cpuid::pku_usable`].
+/// - `pku_active` = PKU was actually enabled this boot (`CR4.PKE` set on at
+///   least one core), i.e. [`cpuid::ospke_enabled`].
+/// - `wx_v2` = the W^X policy is **v2** (the pkey-guarded W+X exception is
+///   available) iff PKU is active — the same `pku_usable()` gate the C.1
+///   `wx_decision` guard consults. On the no-PKU TCG lane this is `false` (v1).
 pub fn report() -> MitigationReport {
+    // `pku_present` is the static (CPUID/XSAVE) half; `pku_active` requires the
+    // kernel to have set `CR4.PKE` this boot. `wx_v2` follows `pku_active`: the
+    // v2 pkey-guarded exception only exists when PKU is live.
+    let pku_present = cpuid::pku_usable();
+    let pku_active = pku_present && cpuid::ospke_enabled();
+    let wx_v2 = pku_active;
     match STATE.get() {
         Some(s) => MitigationReport {
             level: s.level,
@@ -255,6 +271,9 @@ pub fn report() -> MitigationReport {
             ibrs_mode: s.ibrs_mode,
             leaf7_edx: s.leaf7_edx,
             arch_caps: s.arch_caps,
+            wx_v2,
+            pku_present,
+            pku_active,
         },
         None => MitigationReport {
             level: MitigationLevel::Auto,
@@ -264,6 +283,9 @@ pub fn report() -> MitigationReport {
             ibrs_mode: IbrsMode::None,
             leaf7_edx: 0,
             arch_caps: 0,
+            wx_v2,
+            pku_present,
+            pku_active,
         },
     }
 }

@@ -140,7 +140,8 @@ mod os_binary {
     /// `m3ctl mitigations status` — call the m3OS-native `SYS_MITIGATIONS_STATUS`
     /// syscall, decode the boot `MitigationReport`, and print the per-vuln
     /// status (Meltdown reflects actual KPTI state), the compiled-in retpoline
-    /// line, the UNADDRESSED classes, and the Grimsdal caveat. Read-only.
+    /// line, the Phase 90a C.2 W^X policy-version / PKU-posture line, the
+    /// UNADDRESSED classes, and the Grimsdal caveat. Read-only.
     fn dispatch_mitigations_status() -> i32 {
         use kernel_core::spectre::{
             MITIGATION_REPORT_WIRE_LEN, MitigationReport, SYS_MITIGATIONS_STATUS,
