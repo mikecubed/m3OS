@@ -46,6 +46,7 @@
 #![no_std]
 #![no_main]
 
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use syscall_lib::{
     __syscall_lib_sigrestorer, STDOUT_FILENO, SYS_MMAP, SYS_MPROTECT, SYS_MUNMAP, SigAction, exit,
     syscall0, syscall2, syscall3, syscall4, syscall6, write,
@@ -488,24 +489,28 @@ fn case_asym() {
 // signal-frame PKRU preservation (B.4)
 // ===========================================================================
 
-static mut SIG_BASE: u64 = 0;
-static mut SIG_KEY: u8 = 0;
-static mut SIG_HANDLER_SAW_OPEN: bool = false;
-static mut SIG_HANDLER_WROTE: bool = false;
+// Shared between the SIGUSR1 handler and the main flow. The handler runs
+// asynchronously w.r.t. the main thread, so non-atomic access (even through
+// raw pointers) would be a data race / UB under Rust's memory model; atomics
+// make every access well-defined.
+static SIG_BASE: AtomicU64 = AtomicU64::new(0);
+static SIG_KEY: AtomicU8 = AtomicU8::new(0);
+static SIG_HANDLER_SAW_OPEN: AtomicBool = AtomicBool::new(false);
+static SIG_HANDLER_WROTE: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn sigusr1_handler(_sig: i32) {
     // The window opened before raising the signal must still be open inside
     // the handler - PKRU rides the signal frame (B.4). RDPKRU here reads the
     // delivered-frame PKRU.
-    let key = unsafe { core::ptr::addr_of!(SIG_KEY).read() };
+    let key = SIG_KEY.load(Ordering::SeqCst);
     let open = !pkru_write_denied(key);
-    unsafe { core::ptr::addr_of_mut!(SIG_HANDLER_SAW_OPEN).write(open) };
+    SIG_HANDLER_SAW_OPEN.store(open, Ordering::SeqCst);
     if open {
         // And a write through the tagged page succeeds inside the handler.
-        let base = unsafe { core::ptr::addr_of!(SIG_BASE).read() };
+        let base = SIG_BASE.load(Ordering::SeqCst);
         unsafe { (base as *mut u8).write_volatile(0xBB) };
         let wrote = unsafe { (base as *const u8).read_volatile() } == 0xBB;
-        unsafe { core::ptr::addr_of_mut!(SIG_HANDLER_WROTE).write(wrote) };
+        SIG_HANDLER_WROTE.store(wrote, Ordering::SeqCst);
     }
 }
 
@@ -526,12 +531,10 @@ fn case_sigframe() {
         fail(b"sigframe", b"pkey_mprotect(RW, key) failed");
     }
 
-    unsafe {
-        core::ptr::addr_of_mut!(SIG_BASE).write(base);
-        core::ptr::addr_of_mut!(SIG_KEY).write(key);
-        core::ptr::addr_of_mut!(SIG_HANDLER_SAW_OPEN).write(false);
-        core::ptr::addr_of_mut!(SIG_HANDLER_WROTE).write(false);
-    }
+    SIG_BASE.store(base, Ordering::SeqCst);
+    SIG_KEY.store(key, Ordering::SeqCst);
+    SIG_HANDLER_SAW_OPEN.store(false, Ordering::SeqCst);
+    SIG_HANDLER_WROTE.store(false, Ordering::SeqCst);
 
     // Install the SIGUSR1 handler (with the shared restorer trampoline).
     let act = SigAction {
@@ -557,8 +560,8 @@ fn case_sigframe() {
     raise(SIGUSR1);
 
     // Handler must have observed the window open and written through it.
-    let saw_open = unsafe { core::ptr::addr_of!(SIG_HANDLER_SAW_OPEN).read() };
-    let wrote = unsafe { core::ptr::addr_of!(SIG_HANDLER_WROTE).read() };
+    let saw_open = SIG_HANDLER_SAW_OPEN.load(Ordering::SeqCst);
+    let wrote = SIG_HANDLER_WROTE.load(Ordering::SeqCst);
     if !saw_open {
         fail(
             b"sigframe",
