@@ -1413,6 +1413,12 @@ mod syscall_nr {
     pub const TIMERFD_CREATE: u64 = 283;
     pub const TIMERFD_SETTIME: u64 = 286;
     pub const TIMERFD_GETTIME: u64 = 287;
+    // Phase 90a Track B.3 — x86 Memory Protection Keys. Linux numbers (the
+    // compatibility bet that lets musl wrappers + V8's runtime detection work
+    // unmodified): pkey_mprotect=329, pkey_alloc=330, pkey_free=331.
+    pub const PKEY_MPROTECT: u64 = 329;
+    pub const PKEY_ALLOC: u64 = 330;
+    pub const PKEY_FREE: u64 = 331;
 
     // -- time --
     pub const NANOSLEEP: u64 = 35;
@@ -1834,6 +1840,14 @@ pub extern "C" fn syscall_handler(
         // -- mm --
         MMAP => sys_linux_mmap(arg0, arg1, arg2),
         MPROTECT => sys_mprotect(arg0, arg1, arg2),
+        // Phase 90a B.3 — pkey_mprotect(addr, len, prot, pkey); the 4th arg
+        // (pkey) lives in r10 at syscall entry, read via the task-local snapshot.
+        PKEY_MPROTECT => {
+            let pkey = per_core_syscall_arg3();
+            sys_pkey_mprotect(arg0, arg1, arg2, pkey)
+        }
+        PKEY_ALLOC => sys_pkey_alloc(arg0, arg1),
+        PKEY_FREE => sys_pkey_free(arg0),
         MUNMAP => sys_linux_munmap(arg0, arg1),
         BRK => sys_linux_brk(arg0),
         // -- process --
@@ -4730,6 +4744,22 @@ pub(super) fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
         }
     }
 
+    // Phase 90a B.3 — pkeys are per-address-space and inherited on fork (Linux
+    // mm_pkey semantics): copy the parent's protection-key table into the child
+    // so a pre-fork `pkey_alloc` stays valid in the child's new address space.
+    {
+        let parent_pkey_table = crate::process::PROCESS_TABLE
+            .lock()
+            .find(parent_pid)
+            .map(|p| p.pkey_table);
+        if let Some(pkey_table) = parent_pkey_table {
+            let mut table = crate::process::PROCESS_TABLE.lock();
+            if let Some(child) = table.find_mut(child_pid) {
+                child.pkey_table = pkey_table;
+            }
+        }
+    }
+
     crate::task::spawn_fork_task(
         crate::process::make_fork_ctx(child_pid, user_rip, user_rsp),
         "fork-child",
@@ -5216,6 +5246,11 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
             proc.brk_current = 0;
             proc.mmap_next = 0;
             proc.vma_tree.clear(); // Phase 36: clear stale VMAs from old address space.
+            // Phase 90a B.3 — execve replaces the address space, so the
+            // protection-key table is reset to fresh (Linux: pkeys are per-mm
+            // and do not survive exec). The PKRU register itself is reset by the
+            // task's fresh XSAVE state on the new image's first run (B.4).
+            proc.pkey_table = kernel_core::pkey::PkeyTable::new();
             proc.exec_path = alloc::string::String::from(name);
             // Phase 69d follow-up: `execve` resets `comm` to the basename
             // of the binary, matching Linux behaviour for `/proc/<pid>/comm`.
@@ -11135,6 +11170,20 @@ pub(super) fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
     const PROT_MASK: u64 = 0x7; // PROT_READ | PROT_WRITE | PROT_EXEC
     let prot = prot & PROT_MASK;
 
+    // W^X enforcement (C.1 contract clause 1): `mmap` carries no pkey argument
+    // (there is no `pkey_mmap` — the JIT/V8 contract is mmap-then-pkey_mprotect,
+    // never mmap-W+X), so a plain mmap is the key-0 / non-`Tag` case of the
+    // canonical `wx_decision` rule, which rejects W+X. Reject here BEFORE any
+    // file-backed dispatch, MAP_FIXED handling, or VMA recording, so a W+X prot
+    // can never demand-fault into a live unguarded W+X PTE tagged key 0. Return
+    // the identical errno `sys_mprotect`/`mprotect_worker` returns for W+X
+    // (`NEG_EINVAL`, -22). Covers anon/file/hint/MAP_FIXED uniformly.
+    const PROT_WRITE: u64 = 0x2;
+    const PROT_EXEC: u64 = 0x4;
+    if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
+        return NEG_EINVAL;
+    }
+
     if flags & MAP_ANONYMOUS == 0 {
         // File-backed mmap — Strategy A (eager loading).
         let fd = per_core_syscall_user_r8() as usize;
@@ -11196,7 +11245,8 @@ pub(super) fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
                 len: total_size,
                 prot,
                 flags,
-                file_backing: None, // anonymous mapping
+                file_backing: None,                    // anonymous mapping
+                pkey: kernel_core::pkey::PKEY_DEFAULT, // tagged later by pkey_mprotect, if at all
             });
         });
         let table = crate::process::PROCESS_TABLE.lock();
@@ -11251,6 +11301,7 @@ pub(super) fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
                 prot,
                 flags,
                 file_backing: None, // anonymous (demand-paged) mapping
+                pkey: kernel_core::pkey::PKEY_DEFAULT, // tagged later by pkey_mprotect, if at all
             });
         });
         // Phase 52d B.3: bump generation — the address space changed
@@ -11293,6 +11344,21 @@ fn sys_mmap_file_backed(
         return NEG_EINVAL;
     }
 
+    const PROT_WRITE: u64 = 0x2;
+    const PROT_EXEC: u64 = 0x4;
+
+    // W^X enforcement (C.1 contract clause 1): a file-backed `mmap` carries no
+    // pkey argument, so it is the key-0 / non-`Tag` case of the canonical
+    // `wx_decision` rule, which rejects W+X. This path maps eagerly, so a W+X
+    // prot would compose a live unguarded W+X PTE tagged key 0 below. Reject
+    // here BEFORE any allocation or mapping, with the identical errno
+    // `sys_mprotect`/`mprotect_worker` returns for W+X (`NEG_EINVAL`, -22).
+    // (`sys_linux_mmap` also rejects this before dispatch; this is the in-function
+    // guard for the contract's named entry point.)
+    if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
+        return NEG_EINVAL;
+    }
+
     let pages = len.div_ceil(4096);
     let total_size = match pages.checked_mul(4096) {
         Some(s) => s,
@@ -11303,9 +11369,6 @@ fn sys_mmap_file_backed(
     }
 
     use x86_64::structures::paging::{PageTableFlags, PhysFrame, Size4KiB};
-
-    const PROT_WRITE: u64 = 0x2;
-    const PROT_EXEC: u64 = 0x4;
 
     let mut pt_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
     if prot & PROT_WRITE != 0 {
@@ -11486,6 +11549,7 @@ fn sys_mmap_file_backed(
             prot,
             flags,
             file_backing,
+            pkey: kernel_core::pkey::PKEY_DEFAULT, // eager file-backed; retagged by pkey_mprotect, if at all
         });
     });
     if let Some(addr_space) = addr_space.as_ref() {
@@ -11751,7 +11815,158 @@ pub(super) fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
 // regions. Updates PTEs in-place and splits VMAs at mprotect boundaries.
 // ---------------------------------------------------------------------------
 
+/// The outcome of the single W^X enforcement decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WxDecision {
+    /// Not a W+X request (or a non-W+X request that needs no W^X gating). The
+    /// request proceeds unchanged.
+    NotWx,
+    /// A W+X request that must be rejected with `EINVAL` — Phase 75 v1 behavior,
+    /// preserved exactly.
+    Rejected,
+    /// A W+X request that is the documented pkey-guarded "W^X v2" exception:
+    /// permitted under the carried non-default write-deny key. Carries the key
+    /// for the one-per-grant positive log line.
+    GuardedV2 { pkey: u8 },
+}
+
+/// The W^X enforcement decision, shared by `sys_mprotect` and
+/// `sys_pkey_mprotect`. **This is the single point at which the kernel decides
+/// whether a W+X mapping is permitted** — the invariant is enforced identically
+/// on every path that can produce a W+X PTE (the audit below enumerates them).
+///
+/// Phase 90a Track C.1 implements the A.1 W^X v2 contract VERBATIM
+/// (`docs/roadmap/tasks/90a-memory-protection-keys-tasks.md`):
+///
+/// > 1. `sys_mmap` with `PROT_WRITE|PROT_EXEC` → rejected, unchanged from Phase 75.
+/// > 2. `sys_mprotect` with `PROT_WRITE|PROT_EXEC` → rejected, unchanged from Phase 75.
+/// > 3. `sys_pkey_mprotect(addr, len, prot, pkey)`:
+/// >    a. with `pkey == 0` (or `pkey == -1`, the untag-Linux-alias) it behaves
+/// >       exactly like `sys_mprotect` — W+X rejected;
+/// >    b. with a non-default `pkey` that is **allocated** and whose **alloc-time
+/// >       `init_access_rights` include `PKEY_DISABLE_WRITE` or
+/// >       `PKEY_DISABLE_ACCESS`**, and PKU active (CR4.PKE set),
+/// >       `PROT_READ|PROT_WRITE|PROT_EXEC` is **permitted** and the range's PTEs
+/// >       are tagged with the key; the kernel logs one positive
+/// >       `[wx] v2-guarded W+X mapping (pkey=N)` line per grant;
+/// >    c. any other W+X request through `sys_pkey_mprotect` (unallocated key,
+/// >       key allocated with permissive init rights, PKU absent) → rejected with
+/// >       the same errno as (1)/(2).
+/// > 4. No other syscall or fault path may produce a W+X PTE; the C.1
+/// >    enforcement-point audit enumerates them.
+///
+/// # Enforcement-point audit (C.1) — every path that can produce a W+X PTE
+///
+/// A W+X *PTE* requires both `WRITABLE` set and `NO_EXECUTE` clear in a live
+/// user PTE. Every such composition is gated, and all but the v2 exception
+/// reject:
+///
+/// - **`sys_mprotect`** — routes through `mprotect_worker` with a `Preserve`
+///   decision → this guard returns `Rejected` for W+X (clause 2). v1 unchanged.
+/// - **`sys_pkey_mprotect`** — routes through `mprotect_worker` with the
+///   classified key decision → this guard (clauses 3.a/3.b/3.c). The *only*
+///   `GuardedV2` producer.
+/// - **`sys_mmap` (anon + file-backed)** — `mmap` carries no pkey argument
+///   (there is no `pkey_mmap`; V8's contract is mmap-then-`pkey_mprotect`,
+///   never mmap-W+X), so it can only express the unguarded (key-0) case. A W+X
+///   *prot* there would otherwise demand-fault / eager-map into a LIVE W+X PTE
+///   tagged key 0 that never touches the v2 guard, so **both `sys_linux_mmap`
+///   (anon) and `sys_mmap_file_backed` reject W+X at mmap entry** (contract
+///   clause 1) with the **same errno as `mprotect`** (`NEG_EINVAL`, -22). This
+///   is the key-0 / non-`Tag` case of the canonical `wx_decision` rule applied
+///   eagerly at the mmap entry point: a plain `mmap` is the `Preserve`/`Default`
+///   decision, which `wx_decision` classifies as `Rejected` for W+X. The VMA is
+///   still recorded with `PKEY_DEFAULT` for the accepted (non-W+X) cases, and
+///   the only route to an executable+writable page is a subsequent guarded
+///   `mprotect`/`pkey_mprotect` — back through `mprotect_worker`'s single gate.
+/// - **Demand-fault PTE composition** (`compose_user_pte_flags`) — composes from
+///   the VMA's `prot` + `pkey`. The VMA only carries a non-default `pkey` after a
+///   `pkey_mprotect(.., Tag(k))` that *this guard already permitted* (clause
+///   3.b); a `pkey_mprotect` that this guard rejected never tags the VMA, so a
+///   later fault cannot resurrect a W+X mapping the guard refused.
+/// - **ELF segment load / file-backed eager mmap** — compose key 0 only
+///   (`mm/pkey.rs` audit rows). Key 0 is never write-deny (`rights(0) == None`,
+///   `denies_write(0) == false`), so even if such a path requested W+X it would
+///   fall to `Rejected` here — they have no way to express a v2 key.
+/// - **CoW fork copy / CoW fault resolution** — carry the parent PTE's whole
+///   flag word (key field included) and only toggle `WRITABLE`/`BIT_9`; they
+///   never *introduce* a new W+X combination. A CoW page that was R-X stays
+///   non-writable; a writable page stays non-executable.
+///
+/// So a W+X PTE can only be *introduced* through `mprotect_worker` (called by
+/// both `sys_mprotect` and `sys_pkey_mprotect`), gated by `wx_decision`; the
+/// `mmap` entry points reject W+X up front with the same `wx_decision` rule and
+/// the same errno, so no `mmap` path can install an unguarded W+X PTE either.
+/// Returns the [`WxDecision`].
+fn wx_decision(
+    prot: u64,
+    key_decision: kernel_core::pkey::PkeyMprotectKey,
+    table: &kernel_core::pkey::PkeyTable,
+) -> WxDecision {
+    use kernel_core::pkey::PkeyMprotectKey;
+    const PROT_WRITE: u64 = 0x2;
+    const PROT_EXEC: u64 = 0x4;
+
+    // Only W+X requests are gated; everything else proceeds untouched.
+    if prot & PROT_WRITE == 0 || prot & PROT_EXEC == 0 {
+        return WxDecision::NotWx;
+    }
+
+    // The pkey-guarded v2 exception — the pure decision lives in host-tested
+    // `kernel_core::pkey::wx_v2_permits` so the accept/reject matrix is unit
+    // tested. PKU must be *enforcing* on this core before we grant a W+X
+    // exception. `pku_usable()` alone is insufficient: it only proves the CPU
+    // advertises PKU + the XSAVE PKRU component and *never* inspects `CR4.PKE`
+    // (see `cpuid::probe_pku`). A "present-but-inactive" posture (PKU usable yet
+    // `CR4.PKE` clear) would otherwise let the v2 grant through with the
+    // protection-key MMU check disabled — i.e. an *unguarded* W+X mapping, since
+    // a write-deny key traps nothing when PKE is off. Also require this core's
+    // live `CR4.PKE` bit, so the grant only ever rides real enforcement.
+    let pku_active =
+        crate::arch::x86_64::cpuid::pku_usable() && crate::arch::x86_64::cpuid::cr4_pke_enabled();
+    if kernel_core::pkey::wx_v2_permits(table, key_decision, pku_active) {
+        // `wx_v2_permits` only returns true for a `Tag(k)` decision, so this
+        // extraction always succeeds; default to Rejected defensively otherwise.
+        if let PkeyMprotectKey::Tag(pkey) = key_decision {
+            return WxDecision::GuardedV2 { pkey };
+        }
+    }
+    WxDecision::Rejected
+}
+
 pub(super) fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
+    // Plain `mprotect` preserves each PTE's existing protection key — Linux
+    // models `mprotect` as `pkey_mprotect(.., -1)`. The shared worker carries
+    // the `Preserve` decision (no key field is written).
+    mprotect_worker(
+        addr,
+        len,
+        prot,
+        kernel_core::pkey::PkeyMprotectKey::Preserve,
+    )
+}
+
+/// Shared `mprotect` / `pkey_mprotect` worker (Phase 90a Track B.3).
+///
+/// `key_decision` is the pre-validated outcome of classifying the requested
+/// protection key against the calling process's [`PkeyTable`]:
+/// - `Preserve` — plain `mprotect`; each PTE keeps its existing key field;
+/// - `Default` — tag the range with key 0 (clears the key field);
+/// - `Tag(k)` — tag the range with non-default key `k`, and record `k` on the
+///   covering VMAs so a **future demand-fault** in the range composes a tagged
+///   PTE.
+///
+/// (`Invalid` is rejected by the `sys_pkey_mprotect` caller before reaching
+/// here.) The VMA/permission/TLB machinery below is identical for both
+/// syscalls — only the key handling differs.
+fn mprotect_worker(
+    addr: u64,
+    len: u64,
+    prot: u64,
+    key_decision: kernel_core::pkey::PkeyMprotectKey,
+) -> u64 {
+    use kernel_core::pkey::{PkeyMprotectKey, with_pkey};
+
     // Mask prot to supported POSIX bits only.
     let prot = prot & 0x7; // PROT_READ | PROT_WRITE | PROT_EXEC
 
@@ -11759,16 +11974,44 @@ pub(super) fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
     const PROT_WRITE: u64 = 0x2;
     const PROT_EXEC: u64 = 0x4;
 
-    // Phase 75 W^X enforcement: reject any request that asks for both
-    // PROT_WRITE and PROT_EXEC on the same range. The guard runs before
-    // page-alignment validation, the VMA walk, and any PTE mutation so
-    // that no partial state is left behind on rejection. The supported
-    // JIT pattern is documented in
-    // `docs/appendix/architecture-and-syscalls.md` (allocate RW-, write
-    // machine code, then `mprotect` to R-X).
-    if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
-        return NEG_EINVAL;
+    // Phase 75 / 90a W^X enforcement — the single shared guard point (see
+    // `wx_decision`). It runs before page-alignment validation, the VMA walk,
+    // and any PTE mutation so that no partial state is left behind on rejection.
+    // The supported JIT pattern is documented in
+    // `docs/appendix/architecture-and-syscalls.md` (allocate RW-, write machine
+    // code, then `mprotect` to R-X); the pkey-guarded W+X v2 exception (Track
+    // C.1) is the only path that permits W+X, and only under a non-default
+    // write-deny key with PKU active.
+    let pid = crate::process::current_pid();
+    // The classification already consulted this process's PkeyTable; re-snapshot
+    // it for the W^X v2 rights check (`denies_write`). A snapshot is sufficient —
+    // a single-threaded syscall cannot race its own table.
+    let pkey_table = crate::process::shared_pkey_table(pid).unwrap_or_default();
+    match wx_decision(prot, key_decision, &pkey_table) {
+        WxDecision::NotWx => {}
+        WxDecision::Rejected => return NEG_EINVAL,
+        WxDecision::GuardedV2 { pkey } => {
+            // Exactly one positive line per granted W+X mapping. The D.3 gate
+            // greps for this; the v1-rejection error line must be ABSENT here.
+            log::info!("[wx] v2-guarded W+X mapping (pkey={})", pkey);
+        }
     }
+
+    // For a `Tag(k)` decision, the key field is rewritten with `k` on every PTE
+    // in the range. `Preserve` (plain `mprotect`) leaves the field untouched.
+    // `Default` (`pkey_mprotect(pkey=0)`) writes key 0 — clearing the field,
+    // which is a no-op on the common untagged PTE (already 0) but normalises any
+    // stale tag. The `set_key`/`new_key` pair below applies the tag when set.
+    let set_key: Option<u8> = match key_decision {
+        PkeyMprotectKey::Tag(k) => Some(k),
+        // `Default` (pkey==0) means "tag with key 0", i.e. clear the field;
+        // since every untagged PTE already carries 0 this is a no-op, but we
+        // still write it so an eagerly-mapped range that somehow carried a
+        // stale tag is normalised. Preserve leaves the field untouched.
+        PkeyMprotectKey::Default => Some(0),
+        PkeyMprotectKey::Preserve => None,
+        PkeyMprotectKey::Invalid => return NEG_EINVAL, // defensive; caller pre-checks
+    };
 
     // Validate: page-aligned address and non-zero length.
     if addr & 0xFFF != 0 || len == 0 {
@@ -11798,7 +12041,7 @@ pub(super) fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
 
     let (cr3_frame, _) = Cr3::read();
     let pml4_phys = cr3_frame.start_address().as_u64();
-    let pid = crate::process::current_pid();
+    // `pid` is bound above at the W^X guard.
     let addr_space = {
         let table = crate::process::PROCESS_TABLE.lock();
         table.find(pid).and_then(|p| p.addr_space.as_ref().cloned())
@@ -11881,6 +12124,17 @@ pub(super) fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
                             final_flags |= PageTableFlags::BIT_9;
                         }
                     }
+                    // Phase 90a B.3 — stamp the protection key into PTE bits
+                    // 59..=62 when this is a `pkey_mprotect` with a key to set
+                    // (`Tag(k)` or `Default`/key 0). `Preserve` (plain mprotect,
+                    // `set_key == None`) leaves the existing key field untouched
+                    // — `final_flags` already started from `old_flags`, so the
+                    // tag carries through. `with_pkey` rewrites only the 4-bit
+                    // key field; all other bits (just computed above) are intact.
+                    if let Some(key) = set_key {
+                        final_flags =
+                            PageTableFlags::from_bits_truncate(with_pkey(final_flags.bits(), key));
+                    }
                     if final_flags != old_flags {
                         pt[p1_idx].set_addr(old_addr, final_flags);
                         changed_addrs.push(page_addr);
@@ -11889,15 +12143,38 @@ pub(super) fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
             }
         }
 
-        // Update VMA protection bits and split VMAs at mprotect boundaries.
+        // Update VMA protection bits (and, for pkey_mprotect, the key) and split
+        // VMAs at the mprotect boundaries.
         if let Some(changed) =
             crate::process::with_shared_mm_mut(pid, |_brk_current, _mmap_next, vma_tree| {
-                let changed = vma_tree.any(|m| {
+                let prot_changed = vma_tree.any(|m| {
                     let m_end = m.start.saturating_add(m.len);
                     m.start < mprotect_end && m_end > addr && m.prot != prot
                 });
+                // Phase 90a B.3 — when this is a key-setting pkey_mprotect, the
+                // covering VMAs must record the key so a FUTURE demand-fault in
+                // the range composes a tagged PTE (see `demand_map_vma_page` →
+                // `shared_vma_prot_and_pkey`). Detect a key change too, so a
+                // pkey-only change (prot unchanged) still splits + retags.
+                let key_changed = if let Some(key) = set_key {
+                    vma_tree.any(|m| {
+                        let m_end = m.start.saturating_add(m.len);
+                        m.start < mprotect_end && m_end > addr && m.pkey != key
+                    })
+                } else {
+                    false
+                };
+                let changed = prot_changed || key_changed;
                 if changed {
-                    vma_tree.update_range_prot(addr, mprotect_end - addr, prot);
+                    let range_len = mprotect_end - addr;
+                    // update_range_prot splits VMAs at the boundaries and sets
+                    // the new prot; it preserves each piece's pkey. For a
+                    // key-setting request, follow with update_range_pkey on the
+                    // same (now-split) boundaries to stamp the key.
+                    vma_tree.update_range_prot(addr, range_len, prot);
+                    if let Some(key) = set_key {
+                        vma_tree.update_range_pkey(addr, range_len, key);
+                    }
                 }
                 changed
             })
@@ -11922,6 +12199,120 @@ pub(super) fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
     }
 
     0
+}
+
+// ---------------------------------------------------------------------------
+// Phase 90a Track B.3 — Memory Protection Keys syscalls (Linux 329/330/331).
+//
+// `pkey_alloc(flags, init_access_rights)` hands out a non-default protection key
+// (1..=15) from the per-address-space `PkeyTable`, records its init rights, and
+// applies them to the calling thread's live PKRU. `pkey_free(pkey)` returns a
+// key to the pool. `pkey_mprotect(addr, len, prot, pkey)` is `mprotect` that
+// also tags the range's PTEs (and VMAs) with `pkey`. The pure validation logic
+// (flags/rights, the -1 alias, key-range/allocated checks) lives in host-tested
+// `kernel_core::pkey`; these handlers wire it to PKRU, the syscall ABI, and the
+// shared `mprotect_worker`.
+// ---------------------------------------------------------------------------
+
+/// `pkey_alloc(flags, init_access_rights)` — Linux nr 330.
+///
+/// Returns the new key (1..=15) on success, or a negative errno:
+/// - `EINVAL` — `flags != 0`, or `init_access_rights` sets a bit outside
+///   `PKEY_DISABLE_ACCESS | PKEY_DISABLE_WRITE`;
+/// - `ENOSPC` — no PKU on this CPU (Linux: zero keys available), or all 15
+///   allocatable keys are in use.
+///
+/// On success the key is allocated in the per-address-space table (with its
+/// rights recorded for the W^X v2 rule) **and** the init rights are written to
+/// the calling thread's live PKRU (B.4 carries that across context switches).
+pub(super) fn sys_pkey_alloc(flags: u64, init_access_rights: u64) -> u64 {
+    use kernel_core::pkey::{AllocOutcome, PKEY_ACCESS_MASK};
+
+    // No PKU on this CPU → Linux returns ENOSPC (zero keys available). Checked
+    // first so a no-PKU machine never touches the table or PKRU.
+    if !crate::arch::x86_64::cpuid::pku_usable() {
+        return NEG_ENOSPC;
+    }
+
+    // Validate the argument bit-widths up front (the table also rejects these,
+    // but doing it here keeps the errno mapping local and explicit). `flags` and
+    // `init_access_rights` are passed as C `unsigned int`s.
+    if flags != 0 || (init_access_rights & !(PKEY_ACCESS_MASK as u64)) != 0 {
+        return NEG_EINVAL;
+    }
+
+    let pid = crate::process::current_pid();
+    let flags32 = flags as u32;
+    let rights32 = init_access_rights as u32;
+
+    let outcome =
+        crate::process::with_shared_pkey_table_mut(pid, |table| table.alloc(flags32, rights32));
+
+    match outcome {
+        Some(AllocOutcome::Ok(key)) => {
+            // Apply the new key's init rights to THIS thread's live PKRU. PKU is
+            // usable (checked above), so RDPKRU/WRPKRU do not #UD.
+            // B.4 carries this across context switches via XSAVE component 9.
+            crate::arch::x86_64::pkru::apply_init_rights(key, rights32);
+            key as u64
+        }
+        Some(AllocOutcome::NoSpace) => NEG_ENOSPC,
+        Some(AllocOutcome::Invalid) => NEG_EINVAL,
+        None => NEG_EINVAL, // no process — should not happen from a live syscall
+    }
+}
+
+/// `pkey_free(pkey)` — Linux nr 331.
+///
+/// Returns 0 on success, or `EINVAL` for key 0 (reserved), an out-of-range key,
+/// or a not-currently-allocated key. Freeing does **not** untag pages (Linux
+/// semantics — see `PkeyTable::free`); a later `pkey_alloc` may reuse the key
+/// value, after which stale-tagged pages fall under the new owner's rights.
+pub(super) fn sys_pkey_free(pkey: u64) -> u64 {
+    use kernel_core::pkey::{FreeOutcome, NUM_PKEYS};
+
+    // An out-of-range key is EINVAL without consulting the table (the table also
+    // rejects it, but the u64→u8 narrowing must be guarded first).
+    if pkey >= NUM_PKEYS as u64 {
+        return NEG_EINVAL;
+    }
+    let key = pkey as u8;
+    let pid = crate::process::current_pid();
+
+    match crate::process::with_shared_pkey_table_mut(pid, |table| table.free(key)) {
+        Some(FreeOutcome::Ok) => 0,
+        _ => NEG_EINVAL,
+    }
+}
+
+/// `pkey_mprotect(addr, len, prot, pkey)` — Linux nr 329.
+///
+/// Applies `prot` to `[addr, addr+len)` exactly like `mprotect`, and also tags
+/// the range's PTEs (and covering VMAs) with `pkey`:
+/// - `pkey == -1` (the Linux alias, [`is_preserve_key`]) → identical to plain
+///   `mprotect`; the existing key field is preserved;
+/// - `pkey == 0` → tag with the default key (clears the field);
+/// - a non-default key must be **allocated** in this process, else `EINVAL`;
+/// - W+X goes through the same single guard point as `mprotect` ([`wx_decision`]):
+///   rejected unless this is the Track C.1 pkey-guarded W^X v2 exception (a
+///   non-default, allocated, write-deny key with PKU active), in which case it
+///   is permitted and the range's PTEs are tagged with the key.
+pub(super) fn sys_pkey_mprotect(addr: u64, len: u64, prot: u64, pkey: u64) -> u64 {
+    use kernel_core::pkey::{PkeyMprotectKey, classify_pkey_mprotect};
+
+    let pid = crate::process::current_pid();
+
+    // Classify the key argument against this process's table BEFORE touching any
+    // VMA or PTE. A snapshot read is sufficient — `alloc`/`free` cannot race a
+    // single-threaded syscall on its own table, and `with_shared_pkey_table_mut`
+    // publishes atomically under the process-table lock.
+    let table = crate::process::shared_pkey_table(pid).unwrap_or_default();
+    let decision = classify_pkey_mprotect(&table, pkey);
+    if decision == PkeyMprotectKey::Invalid {
+        return NEG_EINVAL;
+    }
+
+    mprotect_worker(addr, len, prot, decision)
 }
 
 // ---------------------------------------------------------------------------
@@ -12023,7 +12414,7 @@ pub(super) fn sys_meminfo(buf_addr: u64, buf_len: u64) -> u64 {
     fmt_slab(&mut writer, "endpt(128B)", &slabs.endpoint);
     fmt_slab(&mut writer, "pipe(4KiB)", &slabs.pipe);
     fmt_slab(&mut writer, "sock(256B)", &slabs.socket);
-    fmt_slab(&mut writer, "xsave(832B)", &slabs.xsave);
+    fmt_slab(&mut writer, "xsave     ", &slabs.xsave);
     if heap.size_class_active {
         let _ = writeln!(writer);
         let _ = writeln!(writer, "Size Classes (slab backing):");
@@ -12308,9 +12699,10 @@ pub(super) fn sys_framebuffer_mmap() -> u64 {
             vma_tree.insert(crate::process::MemoryMapping {
                 start: virt_addr,
                 len: total_size,
-                prot: 3,                    // PROT_READ | PROT_WRITE
-                flags: 1 | FB_MAPPING_FLAG, // MAP_SHARED + internal FB marker
-                file_backing: None,         // framebuffer device mapping
+                prot: 3,                               // PROT_READ | PROT_WRITE
+                flags: 1 | FB_MAPPING_FLAG,            // MAP_SHARED + internal FB marker
+                file_backing: None,                    // framebuffer device mapping
+                pkey: kernel_core::pkey::PKEY_DEFAULT, // device mapping — never pkey-tagged
             });
         });
         virt_addr
@@ -12552,7 +12944,8 @@ pub(super) fn sys_shm_map(shm_id_arg: u64) -> u64 {
                 len: total_size,
                 prot: 3, // PROT_READ | PROT_WRITE
                 flags: shm_vma_flags(id),
-                file_backing: None, // shared-memory mapping
+                file_backing: None,                    // shared-memory mapping
+                pkey: kernel_core::pkey::PKEY_DEFAULT, // shm mapping — never pkey-tagged
             });
         });
         virt_addr
@@ -16619,6 +17012,18 @@ fn sys_clone_thread(
         session_id: parent_session_id,
         controlling_tty: parent_ctty,
         vma_tree: parent_mappings,
+        // Phase 90a B.3 — the protection-key table is a property of the address
+        // space. A `clone`/`fork` child inherits a copy of the parent's table
+        // here; for a `CLONE_VM` thread the shared-mm sync below keeps all
+        // threads' copies identical (the canonical table is the tgid's). Reset
+        // to a fresh table if the parent is gone.
+        pkey_table: {
+            crate::process::PROCESS_TABLE
+                .lock()
+                .find(parent_pid)
+                .map(|p| p.pkey_table)
+                .unwrap_or_default()
+        },
         exec_path: parent_exec_path,
         cmdline: parent_cmdline,
         start_ticks: crate::arch::x86_64::interrupts::tick_count(),

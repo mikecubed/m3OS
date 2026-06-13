@@ -247,10 +247,11 @@ pub struct TaskBlockState {
 ///
 /// Required alignment is 64 bytes (Intel SDM Vol 1 §13.4).
 ///
-/// The static size [`crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE`] (832 bytes)
-/// is checked at boot against the runtime CPUID-reported size; if a future
-/// CPUID change ever reports a larger area, the kernel panics at boot rather
-/// than silently truncating saved state.
+/// The static size [`crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE`] (832 bytes
+/// legacy x87+SSE+AVX; 2752 bytes with PKRU component 9) is checked at boot
+/// against the runtime CPUID-reported size; if the static buffer is ever too
+/// small for the enabled XCR0 mask, the kernel panics at boot rather than
+/// silently truncating saved state.
 #[derive(Clone, Copy)]
 #[repr(C, align(64))]
 pub struct XSaveArea {
@@ -308,6 +309,34 @@ impl XSaveArea {
     /// (caller bug — the signal frame always writes a full area).
     pub fn copy_from_bytes(&mut self, src: &[u8]) {
         self.bytes.copy_from_slice(src);
+    }
+
+    /// Phase 90a B.4 — seed the PKRU state component (9) to a specific value and
+    /// mark it present in `XSTATE_BV`, so a subsequent `xrstor64` loads `pkru`
+    /// rather than the hardware *init* value (`0` = **all keys permissive**, a
+    /// security hole for a fresh thread).
+    ///
+    /// `XSaveArea::new()` is `const` and cannot read CPUID, so it leaves the
+    /// PKRU bit clear; this non-`const` step runs after CPUID is available
+    /// (PKRU offset is `CPUID.0Dh.9:EBX`).  On a no-PKU CPU
+    /// [`crate::arch::x86_64::cpuid::pkru_component_offset`] is `0` and this is a
+    /// **no-op** — the area stays bit-for-bit the legacy default.
+    ///
+    /// Used for two cases:
+    /// * new task / `execve` reset → `pkru = PKRU_INIT_DEFAULT` (Linux
+    ///   `init_pkru_value`: key 0 unrestricted, every non-zero key
+    ///   access-denied);
+    /// * `fork`/`clone` → the parent's captured PKRU (Linux inherit-on-clone).
+    pub fn seed_pkru(&mut self, pkru: u32) {
+        let off = crate::arch::x86_64::cpuid::pkru_component_offset();
+        kernel_core::xsave_model::seed_pkru_component(&mut self.bytes, off, pkru);
+    }
+
+    /// Read back the saved PKRU register (component 9), or `None` on a no-PKU
+    /// CPU / unseeded area.  Lets `fork`/`clone` snapshot the parent's PKRU.
+    pub fn pkru(&self) -> Option<u32> {
+        let off = crate::arch::x86_64::cpuid::pkru_component_offset();
+        kernel_core::xsave_model::read_pkru_component(&self.bytes, off)
     }
 }
 

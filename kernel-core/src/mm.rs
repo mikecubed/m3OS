@@ -37,6 +37,14 @@ pub struct MemoryMapping {
     /// File write-back info for a file-backed `MAP_SHARED` writable mapping;
     /// `None` otherwise. See [`FileBacking`].
     pub file_backing: Option<FileBacking>,
+    /// Protection key (0..=15) tagging this region (Phase 90a Track B.3). The
+    /// default key 0 means "no PKU restriction" — every legacy mapping carries
+    /// it, preserving pre-PKU behaviour bit-for-bit. `pkey_mprotect` sets a
+    /// non-zero key here so that a **future demand-fault** in the range composes
+    /// a PTE tagged with the key (see `demand_map_vma_page` →
+    /// `compose_user_pte_flags`). Splits (mprotect range split, partial unmap)
+    /// carry the key through to every resulting piece, exactly as `prot` does.
+    pub pkey: u8,
 }
 
 impl MemoryMapping {
@@ -130,6 +138,7 @@ impl VmaTree {
                     prot: vma.prot,
                     flags: vma.flags,
                     file_backing: vma.file_backing_at(vma_start),
+                    pkey: vma.pkey,
                 });
                 // Right piece: [end, vma_end)
                 to_insert.push(MemoryMapping {
@@ -138,6 +147,7 @@ impl VmaTree {
                     prot: vma.prot,
                     flags: vma.flags,
                     file_backing: vma.file_backing_at(end),
+                    pkey: vma.pkey,
                 });
                 removed.push(MemoryMapping {
                     start,
@@ -145,6 +155,7 @@ impl VmaTree {
                     prot: vma.prot,
                     flags: vma.flags,
                     file_backing: vma.file_backing_at(start),
+                    pkey: vma.pkey,
                 });
             } else if vma_start < start {
                 // VMA overlaps on the left -- trim right side.
@@ -155,6 +166,7 @@ impl VmaTree {
                     prot: vma.prot,
                     flags: vma.flags,
                     file_backing: vma.file_backing_at(vma_start),
+                    pkey: vma.pkey,
                 });
                 removed.push(MemoryMapping {
                     start,
@@ -162,6 +174,7 @@ impl VmaTree {
                     prot: vma.prot,
                     flags: vma.flags,
                     file_backing: vma.file_backing_at(start),
+                    pkey: vma.pkey,
                 });
             } else {
                 // VMA overlaps on the right -- trim left side.
@@ -172,6 +185,7 @@ impl VmaTree {
                     prot: vma.prot,
                     flags: vma.flags,
                     file_backing: vma.file_backing_at(end),
+                    pkey: vma.pkey,
                 });
                 removed.push(MemoryMapping {
                     start: vma_start,
@@ -179,6 +193,7 @@ impl VmaTree {
                     prot: vma.prot,
                     flags: vma.flags,
                     file_backing: vma.file_backing_at(vma_start),
+                    pkey: vma.pkey,
                 });
             }
         }
@@ -218,6 +233,7 @@ impl VmaTree {
                     prot: vma.prot,
                     flags: vma.flags,
                     file_backing: vma.file_backing_at(vma_start),
+                    pkey: vma.pkey,
                 });
                 to_insert.push(MemoryMapping {
                     start,
@@ -225,6 +241,7 @@ impl VmaTree {
                     prot,
                     flags: vma.flags,
                     file_backing: vma.file_backing_at(start),
+                    pkey: vma.pkey,
                 });
                 to_insert.push(MemoryMapping {
                     start: end,
@@ -232,6 +249,7 @@ impl VmaTree {
                     prot: vma.prot,
                     flags: vma.flags,
                     file_backing: vma.file_backing_at(end),
+                    pkey: vma.pkey,
                 });
             } else if vma_start < start {
                 // Overlap at tail of VMA -- split into head (old) + tail (new).
@@ -242,6 +260,7 @@ impl VmaTree {
                     prot: vma.prot,
                     flags: vma.flags,
                     file_backing: vma.file_backing_at(vma_start),
+                    pkey: vma.pkey,
                 });
                 to_insert.push(MemoryMapping {
                     start,
@@ -249,6 +268,7 @@ impl VmaTree {
                     prot,
                     flags: vma.flags,
                     file_backing: vma.file_backing_at(start),
+                    pkey: vma.pkey,
                 });
             } else {
                 // Overlap at head of VMA -- split into head (new) + tail (old).
@@ -259,6 +279,7 @@ impl VmaTree {
                     prot,
                     flags: vma.flags,
                     file_backing: vma.file_backing_at(vma_start),
+                    pkey: vma.pkey,
                 });
                 to_insert.push(MemoryMapping {
                     start: end,
@@ -266,6 +287,7 @@ impl VmaTree {
                     prot: vma.prot,
                     flags: vma.flags,
                     file_backing: vma.file_backing_at(end),
+                    pkey: vma.pkey,
                 });
             }
         }
@@ -275,6 +297,96 @@ impl VmaTree {
             if just_update_prot {
                 // Re-insert with new prot.
                 self.tree.insert(key, MemoryMapping { prot, ..original });
+            }
+        }
+        for vma in to_insert {
+            self.tree.insert(vma.start, vma);
+        }
+    }
+
+    /// Set the protection key for all VMAs overlapping `[start, start+len)`
+    /// (Phase 90a Track B.3, `pkey_mprotect`).
+    ///
+    /// Mirrors [`Self::update_range_prot`]: partially overlapping VMAs are split
+    /// at the boundaries so that only the overlapping portion gets the new
+    /// `pkey`; the non-overlapping pieces keep their original key. The kernel
+    /// reads this key on a demand-fault in the range so a faulted-in page is
+    /// tagged with the right protection key.
+    pub fn update_range_pkey(&mut self, start: u64, len: u64, pkey: u8) {
+        let end = start.saturating_add(len);
+        let mut to_remove = Vec::new();
+        let mut to_insert = Vec::new();
+
+        for (&vma_start, vma) in self.tree.range(..end) {
+            let vma_end = vma_start.saturating_add(vma.len);
+            if vma_end <= start {
+                continue; // No overlap
+            }
+            if vma_start >= start && vma_end <= end {
+                // Fully contained -- update pkey in place (collected for later).
+                to_remove.push((vma_start, true, vma.clone()));
+            } else if vma_start < start && vma_end > end {
+                // Middle split: head (old key) + middle (new key) + tail (old key).
+                to_remove.push((vma_start, false, vma.clone()));
+                to_insert.push(MemoryMapping {
+                    start: vma_start,
+                    len: start - vma_start,
+                    pkey: vma.pkey,
+                    ..vma.clone()
+                });
+                to_insert.push(MemoryMapping {
+                    start,
+                    len: end - start,
+                    pkey,
+                    file_backing: vma.file_backing_at(start),
+                    ..vma.clone()
+                });
+                to_insert.push(MemoryMapping {
+                    start: end,
+                    len: vma_end - end,
+                    pkey: vma.pkey,
+                    file_backing: vma.file_backing_at(end),
+                    ..vma.clone()
+                });
+            } else if vma_start < start {
+                // Overlap at tail of VMA -- split into head (old key) + tail (new key).
+                to_remove.push((vma_start, false, vma.clone()));
+                to_insert.push(MemoryMapping {
+                    start: vma_start,
+                    len: start - vma_start,
+                    pkey: vma.pkey,
+                    ..vma.clone()
+                });
+                to_insert.push(MemoryMapping {
+                    start,
+                    len: vma_end - start,
+                    pkey,
+                    file_backing: vma.file_backing_at(start),
+                    ..vma.clone()
+                });
+            } else {
+                // Overlap at head of VMA -- split into head (new key) + tail (old key).
+                to_remove.push((vma_start, false, vma.clone()));
+                to_insert.push(MemoryMapping {
+                    start: vma_start,
+                    len: end - vma_start,
+                    pkey,
+                    ..vma.clone()
+                });
+                to_insert.push(MemoryMapping {
+                    start: end,
+                    len: vma_end - end,
+                    pkey: vma.pkey,
+                    file_backing: vma.file_backing_at(end),
+                    ..vma.clone()
+                });
+            }
+        }
+
+        for (key, just_update_pkey, original) in to_remove {
+            self.tree.remove(&key);
+            if just_update_pkey {
+                self.tree.insert(key, MemoryMapping { pkey, ..original });
             }
         }
         for vma in to_insert {
@@ -337,6 +449,7 @@ mod tests {
             prot: 3,
             flags: 0x22,
             file_backing: None,
+            pkey: 0,
         }
     }
 
@@ -578,6 +691,51 @@ mod tests {
         assert_eq!(t.find_containing(0x3000).unwrap().prot, 3);
     }
 
+    // -- update_range_pkey (Phase 90a B.3) --------------------------------
+
+    #[test]
+    fn update_range_pkey_fully_contained() {
+        let mut t = VmaTree::new();
+        t.insert(mapping(0x2000, 0x2000)); // [0x2000, 0x4000), key 0
+        t.update_range_pkey(0x2000, 0x2000, 5);
+        assert_eq!(t.len(), 1);
+        let m = t.find_containing(0x2000).unwrap();
+        assert_eq!(m.pkey, 5);
+        // prot and other fields are untouched by a key-only update.
+        assert_eq!(m.prot, 3);
+    }
+
+    #[test]
+    fn update_range_pkey_middle_split_preserves_neighbours() {
+        let mut t = VmaTree::new();
+        t.insert(mapping(0x2000, 0x4000)); // [0x2000, 0x6000)
+        t.update_range_pkey(0x3000, 0x1000, 7); // tag only [0x3000, 0x4000)
+        assert_eq!(t.len(), 3);
+        assert_eq!(t.find_containing(0x2000).unwrap().pkey, 0); // head untouched
+        assert_eq!(t.find_containing(0x3000).unwrap().pkey, 7); // middle tagged
+        assert_eq!(t.find_containing(0x4000).unwrap().pkey, 0); // tail untouched
+    }
+
+    #[test]
+    fn update_range_pkey_tail_split() {
+        let mut t = VmaTree::new();
+        t.insert(mapping(0x2000, 0x3000)); // [0x2000, 0x5000)
+        t.update_range_pkey(0x4000, 0x1000, 9); // tag [0x4000, 0x5000)
+        assert_eq!(t.len(), 2);
+        assert_eq!(t.find_containing(0x2000).unwrap().pkey, 0);
+        assert_eq!(t.find_containing(0x4000).unwrap().pkey, 9);
+    }
+
+    #[test]
+    fn update_range_pkey_head_split() {
+        let mut t = VmaTree::new();
+        t.insert(mapping(0x2000, 0x3000)); // [0x2000, 0x5000)
+        t.update_range_pkey(0x2000, 0x1000, 4); // tag [0x2000, 0x3000)
+        assert_eq!(t.len(), 2);
+        assert_eq!(t.find_containing(0x2000).unwrap().pkey, 4);
+        assert_eq!(t.find_containing(0x3000).unwrap().pkey, 0);
+    }
+
     // -- clear / len / is_empty -------------------------------------------
 
     #[test]
@@ -628,6 +786,7 @@ mod tests {
             prot: 3,
             flags: 0x100,
             file_backing: None,
+            pkey: 0,
         });
         t.insert(mapping(0x2000, 0x1000));
         assert!(t.any(|m| m.flags & 0x100 != 0));
@@ -659,6 +818,7 @@ mod tests {
             prot: PROT_RW,
             flags: MAP_ANON_PRIV,
             file_backing: None,
+            pkey: 0,
         };
         let above = MemoryMapping {
             start: ARENA + ARENA_LEN,
@@ -666,6 +826,7 @@ mod tests {
             prot: PROT_RW,
             flags: MAP_ANON_PRIV,
             file_backing: None,
+            pkey: 0,
         };
         t.insert(below);
         t.insert(above);
@@ -676,6 +837,7 @@ mod tests {
             prot: PROT_NONE,
             flags: MAP_ANON_PRIV,
             file_backing: None,
+            pkey: 0,
         });
         // sysMapOS: commit PROT_RW MAP_FIXED — overwrite/split then insert.
         t.remove_range(commit_start, commit_len);
@@ -685,6 +847,7 @@ mod tests {
             prot: PROT_RW,
             flags: MAP_ANON_PRIV,
             file_backing: None,
+            pkey: 0,
         });
         t
     }

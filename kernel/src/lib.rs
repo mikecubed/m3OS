@@ -308,16 +308,44 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
     });
     // Validate the static `XSAVE_AREA_SIZE` against the *enabled* mask size
     // (CPUID 0Dh.0.EBX re-read after `xsetbv`).  `area_size_at_mask` from the
-    // probe was captured before XCR0 = 0x7 was set, so it reflects the reset
-    // mask and is unsuitable for the size assertion.
+    // probe was captured before XCR0 was set, so it reflects the reset mask and
+    // is unsuitable for the size assertion.
+    //
+    // Phase 90a B.1: on a PKU CPU `enable_xsave_state` folded the PKRU
+    // component (9) into XCR0, so `enabled_area` now includes the PKRU region;
+    // the static `XSAVE_AREA_SIZE` (2752) was grown to fit it.  The assertion is
+    // the per-core re-validation requirement — it fires loudly if the grown
+    // layout ever exceeds the static buffer, rather than letting a later
+    // xsave64 corrupt the adjacent task's state.
     let enabled_area = arch::x86_64::cpuid::enabled_area_size();
-    log::info!("[xsave] post-enable XCR0 area={enabled_area}");
+    log::info!(
+        "[xsave] post-enable XCR0 area={enabled_area} (static={})",
+        arch::x86_64::cpuid::XSAVE_AREA_SIZE
+    );
     assert!(
         arch::x86_64::cpuid::XSAVE_AREA_SIZE >= enabled_area,
         "XSAVE_AREA_SIZE ({}) is smaller than CPUID-required area for enabled XCR0 ({})",
         arch::x86_64::cpuid::XSAVE_AREA_SIZE,
         enabled_area
     );
+
+    // Phase 90a B.1 — report the BSP's PKU state (CR4.PKE + XCR0 component 9).
+    // `pku_usable` consults the host-tested decode; `cr4_pke_enabled` reads the
+    // live register so the log confirms the bit actually landed on this core.
+    {
+        let pku_features = arch::x86_64::cpuid::pku_features();
+        log::info!(
+            "[sec] BSP PKU usable={} CR4.PKE {} (cpu_pku={}, xsave_component9={})",
+            pku_features.pku_usable(),
+            if arch::x86_64::cpuid::cr4_pke_enabled() {
+                "enabled"
+            } else {
+                "off"
+            },
+            pku_features.pku,
+            pku_features.pkru_component_supported,
+        );
+    }
 
     // Phase 77 Track B — enable CR4.SMEP (bit 20) + CR4.SMAP (bit 21) on the
     // BSP when the CPU supports them.  Ordering matters for the same reason as

@@ -593,6 +593,53 @@ if [ "${M3OS_SIMD_REGRESSION:-0}" = "1" ]; then
     fi
 fi
 
+# Phase 90a Track D.1 — PKU substrate + W^X v2 regression gate. Gated behind
+# M3OS_PKU_REGRESSION=1. Boots m3OS and runs the ramdisk pku-smoke binary,
+# which falsifiably exercises the Track B PKU substrate + the Track C.1 W^X v2
+# pkey-guarded exception independent of V8: pkey alloc/free lifecycle +
+# ENOSPC exhaustion, a denied-write fault (a forked child killed by SIGSEGV),
+# per-context PKRU register asymmetry, signal-frame PKRU preservation (B.4),
+# and the W^X v2 accept/reject matrix. On a no-PKU CPU (TCG) the binary SKIPs
+# the five hardware arms and still asserts the v1 W^X rejections; run under
+# M3OS_KVM=1 on a PKU host to exercise the real arms. Set this on branches that
+# touch kernel/src/arch/x86_64/pkru.rs, the pkey_* syscalls (329/330/331),
+# kernel_core::pkey, the wx_decision W^X v2 guard, the per-task/signal-frame
+# XSAVE component-9 RFBM, the PTE pkey composition (mm/pkey.rs), or the fork
+# PKRU/PTE-tag inherit path.
+if [ "${M3OS_PKU_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask pku-smoke..."
+    if ! cargo xtask pku-smoke --timeout 240; then
+        echo "pre-push: cargo xtask pku-smoke failed" >&2
+        exit 1
+    fi
+fi
+
+# Phase 90a Track D.3 — Node.js JIT + WASM regression gate. Gated behind
+# M3OS_NODE_JIT_REGRESSION=1. Cross-builds the JIT build_node variant
+# (M3OS_NODE_JIT=1 — --v8-options=--jitless dropped, the A.1 V8/Node PKU patches
+# applied), builds a fresh M3OS_WITH_NODE image bundling that JIT .m3pkg, boots
+# QEMU, `pkg install node`, and proves (1) NODE_JIT_OK — V8 JITs a hot function
+# to optimized/TurboFan machine code (%GetOptimizationStatus kOptimized bit, NOT
+# just WASM — the A.1 "assert real optimization" requirement); (2) NODE_WASM_OK —
+# a trivial WebAssembly.Instance executes add(2,3)===5 (the capability the Phase
+# 90b yoga.wasm TUI needs); and (3) the kernel logged `[wx] v2-guarded W+X
+# mapping (pkey=N)` (V8 took the PKU-guarded path, no unguarded RWX). The JIT
+# variant REQUIRES PKU, so the gate runs only under M3OS_KVM=1 on a PKU host
+# (Ryzen Zen 4 etc.) and skip-with-reasons otherwise (the JIT binary aborts at
+# first code-space commit on a no-PKU machine — A.1 fallback). Absent a host C++
+# toolchain + the llvm musl sysroot it also SKIPs. Set this on branches that
+# touch ports/lang/node's JIT variant, xtask's build_node JIT path /
+# node-jit-smoke, the kernel wx_decision W^X v2 guard / pkey path, or anything V8
+# JIT/WASM exercises. clang-gate-class --timeout (the ~120 MB install + cold V8
+# init — far faster under the required KVM).
+if [ "${M3OS_NODE_JIT_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask node-jit-smoke..."
+    if ! M3OS_KVM=1 cargo xtask node-jit-smoke --timeout 5400; then
+        echo "pre-push: cargo xtask node-jit-smoke failed" >&2
+        exit 1
+    fi
+fi
+
 # Phase 87 — VFS bulk-I/O throughput regression gate. Gated behind
 # M3OS_VFS_BULKIO_REGRESSION=1. Boots m3OS, `pkg install`s mbedtls, and asserts
 # BOTH the /proc/blkstats read_calls AND write_calls deltas stayed under their

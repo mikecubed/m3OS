@@ -510,14 +510,21 @@ pub fn demand_map_vma_page_from_kernel(vaddr: u64, require_write: bool) -> bool 
 /// `prot` uses POSIX constants: `PROT_READ=1`, `PROT_WRITE=2`, `PROT_EXEC=4`.
 /// Pass `0x3` (`PROT_READ|PROT_WRITE`) for stack pages.
 ///
+/// `pkey` is the protection key (0..=15) to stamp into PTE bits 59..=62
+/// (Phase 90a Track B.2). This is the **only *demand-fault* from-scratch
+/// user-PTE composition path** — the eager paths (file-backed mmap in
+/// `sys_mmap_file_backed` and ELF segment load in `mm/elf.rs::segment_flags`)
+/// also compose PTEs from scratch but use key 0 today; they are enumerated in
+/// the audit table in `crate::mm::pkey` and flagged for B.3/C.1 revisit. All
+/// current callers pass the default key 0, so the produced PTE is bit-for-bit
+/// identical to the pre-PKU one; Track B.3's `sys_pkey_mprotect`/VMA-pkey
+/// wiring is what will later supply a non-zero key here so a faulted-in tagged
+/// page keeps its tag.
+///
 /// Called from the page fault ISR and from kernel-context demand faulting.
 /// Returns `true` on success, `false` on OOM.
-fn demand_map_user_page_locked(vaddr: u64, prot: u64) -> bool {
-    use x86_64::structures::paging::PageTableFlags;
+fn demand_map_user_page_locked(vaddr: u64, prot: u64, pkey: u8) -> bool {
     use x86_64::structures::paging::Translate as _;
-
-    const PROT_WRITE: u64 = 0x2;
-    const PROT_EXEC: u64 = 0x4;
 
     let page_vaddr = VirtAddr::new(vaddr & !0xFFF);
 
@@ -534,14 +541,9 @@ fn demand_map_user_page_locked(vaddr: u64, prot: u64) -> bool {
         None => return false,
     };
 
-    // Build PTE flags from the POSIX prot bits.
-    let mut data_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
-    if prot & PROT_WRITE != 0 {
-        data_flags |= PageTableFlags::WRITABLE;
-    }
-    if prot & PROT_EXEC == 0 {
-        data_flags |= PageTableFlags::NO_EXECUTE;
-    }
+    // Build PTE flags from the POSIX prot bits, folding the protection key into
+    // bits 59..=62 (Track B.2). `pkey == 0` ⇒ no key bits set ⇒ legacy PTE.
+    let data_flags = crate::mm::pkey::compose_user_pte_flags(prot, pkey);
 
     if unsafe { crate::mm::paging::map_current_user_page_locked(page_vaddr, frame, data_flags) }
         .is_err()
@@ -558,7 +560,8 @@ fn demand_map_user_page(vaddr: u64, prot: u64) -> bool {
     let mapped = {
         let _page_table_guard =
             addr_space.map(|addr_space| unsafe { addr_space.as_ref() }.lock_page_tables());
-        demand_map_user_page_locked(vaddr, prot)
+        // Default key 0 — stack/brk/internal lazy maps are never pkey-tagged.
+        demand_map_user_page_locked(vaddr, prot, kernel_core::pkey::PKEY_DEFAULT)
     };
     if !mapped {
         return false;
@@ -592,7 +595,7 @@ fn demand_map_vma_page(vaddr: u64, require_write: bool) -> bool {
         let _page_table_guard =
             addr_space.map(|addr_space| unsafe { addr_space.as_ref() }.lock_page_tables());
 
-        let Some(prot) = crate::process::shared_vma_prot(pid, vaddr) else {
+        let Some((prot, pkey)) = crate::process::shared_vma_prot_and_pkey(pid, vaddr) else {
             return false;
         };
 
@@ -602,7 +605,11 @@ fn demand_map_vma_page(vaddr: u64, require_write: bool) -> bool {
             return false;
         }
 
-        demand_map_user_page_locked(vaddr, prot)
+        // Phase 90a B.3 — carry the VMA's protection key into the faulted-in
+        // PTE. For an untagged VMA (`pkey == 0`) this is the legacy key-0 PTE,
+        // bit-for-bit unchanged; for a `pkey_mprotect`-tagged range the faulted
+        // page keeps its key so its W^X-v2 guard survives the demand fault.
+        demand_map_user_page_locked(vaddr, prot, pkey)
     };
     if !mapped {
         return false;

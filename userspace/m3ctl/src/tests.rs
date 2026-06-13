@@ -426,6 +426,10 @@ fn mitigations_status_format_is_honest() {
         ibrs_mode: IbrsMode::None,
         leaf7_edx: 0,
         arch_caps: 0,
+        // No-PKU boot (the default lane): W^X v1, PKU absent.
+        wx_v2: false,
+        pku_present: false,
+        pku_active: false,
     };
     let r = format_mitigations(&report);
     assert!(r.contains("level=full"));
@@ -436,6 +440,8 @@ fn mitigations_status_format_is_honest() {
     // Status::Unaddressed) — the note is not an exhaustive list otherwise.
     assert!(r.contains("UNADDRESSED — Spectre-v1, MDS"));
     assert!(r.contains("Grimsdal"));
+    // Phase 90a C.2 — the no-PKU boot prints the v1 / PKU-absent W^X line.
+    assert!(r.contains("W^X: v1 (PKU absent)"));
 
     // KPTI enforcing → Meltdown reads "Mitigation: PTI".
     let report2 = MitigationReport {
@@ -451,4 +457,43 @@ fn mitigations_status_format_is_honest() {
         ..report
     };
     assert!(format_mitigations(&report3).contains("Meltdown: Not affected"));
+}
+
+/// Phase 90a C.2 — the W^X / PKU posture line renders all three boot states.
+#[test]
+fn mitigations_status_wx_pku_line() {
+    use kernel_core::spectre::{IbrsMode, MitigationLevel, MitigationReport};
+
+    let base = MitigationReport {
+        level: MitigationLevel::Auto,
+        level_recognized: true,
+        kpti_active: false,
+        ibpb_active: false,
+        ibrs_mode: IbrsMode::None,
+        leaf7_edx: 0,
+        arch_caps: 0,
+        wx_v2: false,
+        pku_present: false,
+        pku_active: false,
+    };
+
+    // No-PKU boot (the default TCG lane): v1, PKU absent.
+    assert!(format_mitigations(&base).contains("W^X: v1 (PKU absent)"));
+
+    // PKU active (e.g. under KVM on a PKU host): v2, present + active.
+    let active = MitigationReport {
+        wx_v2: true,
+        pku_present: true,
+        pku_active: true,
+        ..base
+    };
+    assert!(format_mitigations(&active).contains("W^X: v2 (PKU present, active)"));
+
+    // PKU silicon present but the kernel did not enable it: v1, present but
+    // inactive (so the v2 exception is unavailable).
+    let inactive = MitigationReport {
+        pku_present: true,
+        ..base
+    };
+    assert!(format_mitigations(&inactive).contains("W^X: v1 (PKU present, inactive)"));
 }

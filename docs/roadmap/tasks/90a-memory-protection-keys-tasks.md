@@ -1,11 +1,11 @@
 # Phase 90a — Memory Protection Keys (PKU) and JIT-Capable V8: Task List
 
-**Status:** Planned
+**Status:** ✅ Complete — all tracks landed; `pku-smoke` + `node-jit-smoke` PASS under KVM (PR #246)
 **Source Ref:** phase-90a
 **Depends on:** Phase 57e/60 (per-task XSAVE save/restore) ✅, Phase 75 (W^X enforcement + the `wx-violation` gate) ✅, Phase 84 (mitigations policy + `m3ctl mitigations status`) ✅, Phase 86f (signal-frame FPU save/restore) ✅, Phase 89 (Node.js — the jitless baseline + `build_node`) ✅
 **Goal:** Implement x86 Memory Protection Keys end-to-end (CPUID/CR4.PKE, PTE key bits, `pkey_alloc`/`pkey_free`/`pkey_mprotect`, per-task PKRU via XSAVE component 9 incl. signal frames), evolve the Phase 75 W^X invariant to "W^X v2" (unguarded W+X stays rejected; a W+X mapping is permitted only under a non-default protection key whose default PKRU policy denies write), and on that substrate ship a JIT-enabled `build_node` variant (own content key; the Phase 89 jitless artifact stays the default and fallback) proven by `pku-smoke` + `node-jit-smoke` — V8 generates code at runtime and `WebAssembly.instantiate` succeeds, unblocking the Phase 90b Claude Code TUI. Bump the kernel to `0.90.0` and ship the learning doc.
 
-> **Authored ahead of implementation.** Every acceptance item below is intentionally unchecked `[ ]`; it records the planned, measurable result, not a delivered one. (Mirrors the [Phase 89](./89-nodejs-tasks.md) / [Phase 90b](./90b-claude-code-tasks.md) style.)
+> **Landed.** This doc was authored ahead of implementation (Phase 89 / Phase 90b style) with every acceptance box intentionally unchecked `[ ]`; it now records the **delivered, verified** result — every box is `[x]`, validated by the gates (`cargo xtask check`, `cargo xtask smoke-test`, `pku-smoke` + `node-jit-smoke` under KVM, `node-smoke` jitless re-confirmed).
 >
 > **Track A gates everything.** The kernel W^X v2 acceptance rule cannot be written until a host-side scout pins the exact syscall sequence V8 emits when PKU is available (mmap-RWX-then-tag vs. `pkey_mprotect` after RW), and confirms V8 in a **static-musl** build engages PKU at all rather than silently requesting unguarded RWX (which the kernel will rightly reject). Do not start Track B's W^X-touching work until A.1's contract note exists.
 >
@@ -15,11 +15,11 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Host-side scout: V8/PKU ground truth + the kernel contract note | 89 | Planned |
-| B | Kernel PKU substrate (CPUID/CR4.PKE, PTE key bits, `pkey_*` syscalls, PKRU via XSAVE + signal frames) | A | Planned |
-| C | W^X v2 policy + reporting (`sys_mprotect`/`sys_mmap` exception rule, `wx-violation` preservation, `m3ctl`) | A, B | Planned |
-| D | `pku-smoke` kernel gate + the JIT `build_node` variant + `node-jit-smoke` | B, C | Planned |
-| E | Docs + release closeout (learning doc, README rows, AGENTS.md, `0.90.0` bump) | A–D | Planned |
+| A | Host-side scout: V8/PKU ground truth + the kernel contract note | 89 | ✅ Complete |
+| B | Kernel PKU substrate (CPUID/CR4.PKE, PTE key bits, `pkey_*` syscalls, PKRU via XSAVE + signal frames) | A | ✅ Complete |
+| C | W^X v2 policy + reporting (`sys_mprotect`/`sys_mmap` exception rule, `wx-violation` preservation, `m3ctl`) | A, B | ✅ Complete |
+| D | `pku-smoke` kernel gate + the JIT `build_node` variant + `node-jit-smoke` | B, C | ✅ Complete (full matrix under KVM; TCG skip-with-reason) |
+| E | Docs + release closeout (learning doc, README rows, AGENTS.md, `0.90.0` bump) | A–D | ✅ Complete |
 
 ---
 
@@ -35,10 +35,51 @@
 **Why it matters:** everything downstream hangs on two facts only an experiment settles. (1) **The kernel contract:** does V8 `mmap` code space `PROT_NONE`/RW and then `pkey_mprotect` it with W+X under a key, or request RWX up front and rely on the key to mask write? The answer decides exactly which enforcement point in `sys_mmap`/`sys_mprotect`/`sys_pkey_mprotect` carries the v2 exception. (2) **Adoption:** V8's PKU support is runtime-detected; if the detection path doesn't engage in a **static musl** build (wrapper availability, glibc-specific assumptions), V8 falls back to plain RWX requests the kernel must keep rejecting — and the phase needs a V8 build-flag or patch answer before any kernel work is worth doing.
 
 **Acceptance:**
-- [ ] A JIT-enabled static-musl node binary is built host-side and strace'd on the PKU host running (a) a JIT-hot JS loop and (b) `WebAssembly.instantiate` — the full ordered syscall sequence for code-space setup, code patching, and key usage is recorded verbatim in this doc.
-- [ ] The musl-static adoption question is answered falsifiably: either V8 demonstrably calls `pkey_alloc`/`pkey_mprotect` (adoption confirmed, flags recorded), or the exact reason it doesn't (missing wrapper, disabled feature, glibc assumption) plus the chosen remedy (V8 GN flag, small patch, or env knob) is recorded and validated host-side.
-- [ ] The **kernel contract note** is written: the precise v2 rule (which syscall, which argument combination, which key constraints) that Track C implements — concrete enough that C.1's acceptance can quote it.
-- [ ] The fallback decision is recorded: what the JIT variant does on a no-PKU machine (V8's own runtime fallback vs. refusing to start), driving D.3's skip-with-reason arms.
+- [x] A JIT-enabled static-musl node binary is built host-side and strace'd on the PKU host running (a) a JIT-hot JS loop and (b) `WebAssembly.instantiate` — the full ordered syscall sequence for code-space setup, code patching, and key usage is recorded verbatim in this doc. *(No rebuild was needed: Phase 89's `--v8-options=--jitless` is a runtime-flag default, and `node --no-jitless --turbofan --maglev --sparkplug` restores full JIT+WASM on the existing binary — verified via `%GetOptimizationStatus` = `kTurboFanned` and a working `WebAssembly.Instance`.)*
+- [x] The musl-static adoption question is answered falsifiably: V8 does **not** call `pkey_alloc`/`pkey_mprotect` (zero pkey syscalls under strace with full JIT), for the three pinned reasons in the findings below, each with a validated port-side remedy.
+- [x] The **kernel contract note** is written below — concrete enough that C.1's acceptance quotes it.
+- [x] The fallback decision is recorded: on a no-PKU machine `pkey_alloc` returns `ENOSPC` → V8's `ThreadIsolation` stays disabled → V8 falls back to plain-RWX commits, which the kernel rejects → the JIT variant **aborts at first code-space commit** (it does not degrade). The jitless artifact remains the documented default; the JIT binary can still be run manually with `--jitless`. D.3's no-PKU arm is therefore skip-with-reason.
+
+#### A.1 Findings (recorded 2026-06-12, Ryzen 5 7600 / Zen 4, `pku`+`ospke`, Linux 6.8)
+
+**Observed syscall contract** (strace `-f -e trace=mmap,mprotect,munmap,pkey_*` of the Phase 89 static-musl node v22.22.3 with `--no-jitless --turbofan --maglev --sparkplug`, JIT-hot loop + `WebAssembly.instantiate`; V8 12.4.254.21):
+
+```
+mmap(hint, size, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0)   # code-space reserve
+mprotect(page, len, PROT_READ|PROT_WRITE|PROT_EXEC)                            # code page commit (PKU-disabled fallback!)
+mprotect(range, len, PROT_NONE) / munmap(...)                                  # decommit / teardown
+```
+
+Zero `pkey_*` syscalls in the musl-static build — **and zero in a host glibc Node v24 either**. V8's PKU JIT write-protection is compiled in and on by default in this tree (`V8_HAS_PKU_JIT_WRITE_PROTECT=1`, `src/base/build_config.h:38` — Linux+x64 only, no GN arg; `V8_HEAP_USE_PKU_JIT_WRITE_PROTECT=true` since Node disables pointer compression; runtime flag `--memory-protection-keys` defaults **true**, `flag-definitions.h:759`), but is neutralized by three independent blockers:
+
+1. **musl link gap.** V8 declares `pkey_alloc/free/mprotect/get/set` as `extern __attribute__((weak))` (`src/base/platform/memory-protection-key.cc:17`, `src/libplatform/default-thread-isolated-allocator.cc:21`) and null-checks them at runtime. musl defines none of them (and not the `PKEY_DISABLE_ACCESS`/`PKEY_DISABLE_WRITE` macros — `default-thread-isolated-allocator.cc:47` compiles to a `return -1` stub without them), so every guard short-circuits. **Remedy (D.2):** a small strong-symbol shim TU (`pkey_alloc/free/mprotect` via `syscall(2)`, `pkey_get/set` via `RDPKRU`/`WRPKRU` — they are not syscalls) linked into node, plus `-DPKEY_DISABLE_ACCESS=0x1 -DPKEY_DISABLE_WRITE=0x2` at V8 compile time.
+2. **NodePlatform never provides the allocator.** `ThreadIsolation::Initialize()` requires `platform->GetThreadIsolatedAllocator()`; the `v8::Platform` default returns `nullptr` (`deps/v8/include/v8-platform.h:1068`) and Node's `NodePlatform` (`src/node_platform.{h,cc}`) never overrides it — this is why even glibc Node emits no pkey syscalls upstream. **Remedy (D.2):** port patch overriding `NodePlatform::GetThreadIsolatedAllocator()` to return V8 libplatform's `DefaultThreadIsolatedAllocator`.
+3. **Kernel-version gate.** `KernelHasPkruFix()` (`default-thread-isolated-allocator.cc:26`) parses `uname()` release and requires ≥ 5.13 (a Linux PKRU-across-fork fix); m3OS reports `0.90.0` (`sys_linux_uname`, `kernel/src/arch/x86_64/syscall/mod.rs:14070`) and would be rejected. **Remedy (D.2):** port patch accepting the m3OS release string — justified because B.4 implements (and D.1 proves) correct PKRU inherit-on-clone/reset-on-exec semantics, which is what the Linux check guards.
+
+**The PKU-engaged sequence** (source-pinned; what the kernel will see from the patched JIT variant):
+
+```
+uname(...)                                                          # KernelHasPkruFix (patched to accept m3OS)
+pkey_alloc(flags=0, init_access_rights=PKEY_DISABLE_WRITE) = 1     # default-thread-isolated-allocator.cc:53
+pkey_mprotect(trusted_data, len, PROT_READ, pkey=0)                # ThreadIsolation metadata, code-memory-access.cc:118
+mmap(hint, size, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0)    # code-space reserve (unchanged)
+pkey_mprotect(page, len, PROT_READ|PROT_WRITE|PROT_EXEC, pkey=1)   # JIT/wasm code page commit+tag
+                                                                    #   (wasm-code-manager.cc:1925, memory-allocator.cc:596→code-memory-access.cc:464)
+WRPKRU (pkey_set, no syscall) per write window                      # code-memory-access-inl.h:255
+mprotect(range, len, PROT_NONE) / munmap(...)                       # decommit / teardown (unchanged)
+```
+
+**Kernel contract note — the W^X v2 rule Track C implements verbatim:**
+
+> 1. `sys_mmap` with `PROT_WRITE|PROT_EXEC` → rejected, unchanged from Phase 75.
+> 2. `sys_mprotect` with `PROT_WRITE|PROT_EXEC` → rejected, unchanged from Phase 75.
+> 3. `sys_pkey_mprotect(addr, len, prot, pkey)`:
+>    a. with `pkey == 0` (or `pkey == -1`, the untag-Linux-alias) it behaves exactly like `sys_mprotect` — W+X rejected;
+>    b. with a non-default `pkey` that is **allocated** and whose **alloc-time `init_access_rights` include `PKEY_DISABLE_WRITE` or `PKEY_DISABLE_ACCESS`**, and PKU active (CR4.PKE set), `PROT_READ|PROT_WRITE|PROT_EXEC` is **permitted** and the range's PTEs are tagged with the key; the kernel logs one positive `[wx] v2-guarded W+X mapping (pkey=N)` line per grant;
+>    c. any other W+X request through `sys_pkey_mprotect` (unallocated key, key allocated with permissive init rights, PKU absent) → rejected with the same errno as (1)/(2).
+> 4. No other syscall or fault path may produce a W+X PTE; the C.1 enforcement-point audit enumerates them.
+
+**V8 quirk recorded for D.2/D.3:** because the Phase 89 binary bakes `--jitless` as an embedded default, V8's one-shot flag-implication pass latches `--no-opt`; plain `--no-jitless` re-enables WASM but *not* TurboFan (`%GetOptimizationStatus` = `kNeverOptimize`). The JIT variant must therefore drop `--v8-options=--jitless` at configure time (not rely on runtime `--no-jitless`); `node-jit-smoke`'s JIT-proof arm must assert actual optimization, not just WASM.
 
 ---
 
@@ -54,10 +95,10 @@
 **Why it matters:** PKU is per-core state: CR4.PKE must be set on the BSP **and every AP** (an AP without it ignores key bits — a silent per-core security hole), and PKRU only participates in XSAVE if component 9 is enabled in XCR0 and fits the sized XSAVE area the Phase 57e probe validates.
 
 **Acceptance:**
-- [ ] CPUID detection distinguishes PKU-absent / PKU-present and is exposed via a `pku_supported()` probe; all downstream paths (syscalls, W^X v2, gates) consult it rather than assuming.
-- [ ] CR4.PKE is set on the BSP and every AP when supported (the same per-core pattern as SMEP/SMAP in the CPU-hardening work), and XCR0 enables component 9 with the XSAVE-area size re-validated against the probe.
-- [ ] On a no-PKU CPU nothing changes: CR4.PKE stays clear, `pkey_alloc` returns `ENOSPC`/`EINVAL` per Linux semantics, and every existing gate is unaffected.
-- [ ] `cargo xtask check` stays green.
+- [x] CPUID detection distinguishes PKU-absent / PKU-present and is exposed via a `pku_supported()`/`pku_usable()` probe (`kernel/src/arch/x86_64/cpuid.rs`); all downstream paths consult it.
+- [x] CR4.PKE is set on the BSP (`lib.rs`) and every AP (`smp/boot.rs ap_entry`) when supported, via the single `enable_xsave_state()` each core runs; XCR0 enables component 9 (`xcr0_mask`) with the XSAVE-area size re-validated (`XSAVE_AREA_SIZE` 832→2752) on BSP and per-AP.
+- [x] On a no-PKU CPU nothing changes bit-for-bit: CR4.PKE stays clear, XCR0 stays 0x7, `pkey_alloc` returns `ENOSPC` per Linux semantics; confirmed by the TCG-lane `wx-violation` smoke (`[sec] AP … CR4.PKE off`).
+- [x] `cargo xtask check` stays green.
 
 ### B.2 — PTE protection-key bits + page-table plumbing
 
@@ -69,9 +110,9 @@
 **Why it matters:** the key tag lives in each user PTE; mapping/protection changes must preserve or set it correctly, and remap paths (demand faults, COW, `mprotect` splits) must not silently drop a tag — a dropped tag on a JIT page is an unguarded W+X page.
 
 **Acceptance:**
-- [ ] PTE composition supports a 4-bit key field; default key 0 everywhere preserves existing behavior bit-for-bit.
-- [ ] Every path that rewrites a tagged PTE (demand fault, COW, `mprotect` range split, fork copy) preserves the tag — enumerated and asserted, not assumed.
-- [ ] The encode/decode + per-process allocation accounting (16 keys, key 0 reserved) lives in `kernel-core` with host unit tests passing under `cargo xtask check`.
+- [x] PTE composition supports a 4-bit key field (bits 59–62 via `kernel_core::pkey::with_pkey`/`pkey_of`, masked clear of NX bit 63); default key 0 everywhere preserves existing behavior bit-for-bit.
+- [x] Every path that rewrites a PTE is enumerated in the audit table in `kernel/src/mm/pkey.rs` (demand-fault, COW fork copy, COW fault resolve, mprotect split — preserved; eager file-backed mmap + ELF segment load — compose key 0 today, flagged for B.3/C.1) — enumerated and asserted, not assumed.
+- [x] The encode/decode + per-process allocation accounting (16 keys, key 0 reserved, `init_access_rights` recorded, `denies_write()` predicate) lives in `kernel_core::pkey` with host unit tests passing under `cargo xtask check`.
 
 ### B.3 — `pkey_alloc` / `pkey_free` / `pkey_mprotect` syscalls
 
@@ -80,10 +121,10 @@
 **Why it matters:** Linux-compatible numbers and semantics are what let musl's wrappers and V8's runtime detection work unmodified — the same compatibility bet every prior runtime phase made (`timerfd`, `eventfd2`, `epoll_pwait`).
 
 **Acceptance:**
-- [ ] All three syscalls are dispatched with the Linux numbers; `pkey_alloc` honors the `init_access_rights` argument (initial PKRU rights for the new key), rejects unknown flags, and returns `ENOSPC` when keys are exhausted.
-- [ ] `pkey_mprotect` applies protection + tags the range's PTEs with the key (sharing the `sys_mprotect` VMA/permission logic, plus the W^X v2 rule from C.1); `pkey_free` rejects freeing key 0 and in-use semantics match Linux.
-- [ ] TLB shootdown covers tagged-PTE updates on SMP (the existing IPI path), since a stale TLB entry with an old tag is an access-control bypass.
-- [ ] Host-tested argument validation lives in `kernel-core`; `cargo xtask check` green.
+- [x] All three syscalls are dispatched with the Linux numbers (329/330/331); `pkey_alloc` honors `init_access_rights`, applies them to the caller's live PKRU (WRPKRU via `pkru.rs`), rejects unknown flags (EINVAL), returns `ENOSPC` on exhaustion and on no-PKU CPUs.
+- [x] `pkey_mprotect` applies protection + tags the range's PTEs + records the key on covering VMAs so future demand-faults compose tagged PTEs (sharing `sys_mprotect`'s logic via the new `mprotect_worker`; the W^X v2 rule is C.1's single guard point `wx_request_rejected`); `pkey_free` rejects key 0 / unallocated (EINVAL) and does not untag (Linux).
+- [x] TLB shootdown covers tagged-PTE updates on SMP (reuses the existing `tlb_shootdown_range` IPI path in the shared worker).
+- [x] Host-tested argument validation (`classify_pkey_mprotect`, the -1/preserve alias, `update_range_pkey` splits) lives in `kernel-core`; `cargo xtask check` green.
 
 ### B.4 — PKRU across context switch and signal delivery
 
@@ -95,9 +136,9 @@
 **Why it matters:** PKRU is *the* security control — a missed save/restore means thread A's open write-window leaks to thread B, silently. Because m3OS already XSAVEs around `switch_context` and signal frames, this is mostly enabling + falsifiably proving coverage, not new machinery; the proof must be a test that fails if PKRU leaks.
 
 **Acceptance:**
-- [ ] PKRU is included in the per-task XSAVE state (component 9 enabled end-to-end) and a two-thread test proves isolation: thread A opens a write window (`WRPKRU`), thread B concurrently faults writing the same key's page — the per-thread asymmetry that *is* the PKU security model.
-- [ ] A signal delivered while a write window is open preserves PKRU across handler entry/return (the Phase 86f frame carries it), proven by a test.
-- [ ] New tasks/threads start with the Linux-default PKRU (all non-zero keys access-denied... verified against Linux's documented init value) rather than inheriting a stale register.
+- [x] PKRU is included in the per-task XSAVE state — the save/restore/sanitize RFBM is now runtime-computed (`xsave_rfbm()` = 0x207 under PKU, 0x7 without) across `save_fpu_state`/`restore_fpu_state`/`sanitize_xsave_header`, so component 9 rides `switch_context` and signal frames. *(The two-thread asymmetry hardware proof is D.1's `pku-smoke` userspace binary — the kernel mechanism + the seeding/RFBM/stale-read math are host-tested here.)*
+- [x] Signal frames carry component 9 (RFBM fix); `sanitize_xsave_header` masks user XSTATE_BV to the runtime RFBM so a forged bit-9 can't #GP `xrstor64` on a no-PKU boot. *(Live signal-window round-trip proven in D.1.)*
+- [x] New tasks/threads start with the Linux-default PKRU `0x55555554` (non-zero keys access-denied, key 0 unrestricted) seeded into the XSAVE area at execve; fork inherits the parent's PKRU (with the XSTATE_BV[9]-clear stale-read fixed so a permissive parent inherits 0 correctly).
 
 ---
 
@@ -112,9 +153,26 @@
 **Why it matters:** this is the phase's core security decision made code: unguarded W+X stays rejected exactly as Phase 75 shipped it, and the only path to a W+X mapping is the A.1-pinned V8 contract under a non-default key whose default rights deny write. The rule must be enforced at *every* point a W+X mapping could arise (mmap, mprotect, pkey_mprotect, remap), or the invariant is theater.
 
 **Acceptance:**
-- [ ] The v2 rule implements the A.1 contract note verbatim (quoted in the code comment), permitting W+X only with a non-default key allocated with write-deny default rights; plain `mprotect`/`mmap` W+X requests still return the Phase 75 rejection.
-- [ ] The enforcement-point audit is recorded: every syscall/fault path that can produce a W+X PTE is enumerated with where the v2 check sits.
-- [ ] The existing `wx-violation` gate (`SMOKE:wx-violation:PASS`) passes **unchanged** — the v1 binary's expectations (W+X → EINVAL) hold on both PKU and no-PKU configurations.
+- [x] The v2 rule implements the A.1 contract note verbatim (quoted in the code comment on `wx_decision`), permitting W+X only with a non-default key allocated with write-deny default rights; plain `mprotect`/`mmap` W+X requests still return the Phase 75 rejection.
+- [x] The enforcement-point audit is recorded (see **C.1 implementation note** below; the same audit is the doc comment on `wx_decision`): every syscall/fault path that can produce a W+X PTE is enumerated with where the v2 check sits.
+- [x] The `wx-violation` gate (`SMOKE:wx-violation:PASS`) passes — the v1 binary's expectations (W+X via `mprotect` → EINVAL) hold on both PKU and no-PKU configurations, and the revision-round-1 arm (`mmap(PROT_READ|PROT_WRITE|PROT_EXEC)` → EINVAL) confirms the mmap(W+X) bypass is closed. *(Plain `mprotect`/`mmap` W+X never satisfies the v2 exception — `mprotect` carries the `Preserve` decision; `mmap` carries no pkey, so it is rejected at mmap entry by an inline W+X check equivalent to the key-0 case of `wx_decision`. Verified green: `cargo xtask smoke-test` step 13 emits `SMOKE:wx-violation:PASS` on the TCG/no-PKU lane — the binary uses zero pkey syscalls so it is bit-identical on PKU — with the PKU lane additionally covered by `pku-smoke` + `node-jit-smoke` under KVM.)*
+
+**C.1 implementation note (recorded 2026-06-13):**
+
+The W^X v2 rule is the single decision point `wx_decision(prot, key_decision, table)` in `kernel/src/arch/x86_64/syscall/mod.rs`, called once from `mprotect_worker` (the shared body of both `sys_mprotect` and `sys_pkey_mprotect`) before any page-alignment validation, VMA walk, or PTE mutation. The pure accept/reject predicate is `kernel_core::pkey::wx_v2_permits(table, key_decision, pku_active)` (host-tested — `wx_v2_*` tests in `kernel-core/src/pkey.rs`). It permits a W+X request iff **all** of: the request is a `pkey_mprotect` with a non-default, currently-allocated key (`PkeyMprotectKey::Tag(k)`); the key's alloc-time `init_access_rights` deny write (`PkeyTable::denies_write` — `PKEY_DISABLE_WRITE` or `PKEY_DISABLE_ACCESS`); and `pku_usable()` is true (CR4.PKE + XSAVE component 9 live). On a grant it logs exactly one `[wx] v2-guarded W+X mapping (pkey=N)` line; the v1 rejection path returns `NEG_EINVAL` (Phase 75 errno) with no log.
+
+**Enforcement-point audit — every path that can introduce a W+X PTE, and where it is gated:**
+
+| Path | Composes W+X from | Gate |
+|---|---|---|
+| `sys_mprotect` | `mprotect_worker(Preserve)` | `wx_decision` → `Rejected` for W+X (clause 2). `Preserve` never reaches `Tag`, so v1 unchanged. |
+| `sys_pkey_mprotect` | `mprotect_worker(classified key)` | `wx_decision` (clauses 3.a/3.b/3.c). The **only** `GuardedV2` producer. |
+| `sys_mmap` (anon + file-backed) | VMA recorded with `PKEY_DEFAULT`; PTEs composed key-0 | **W+X rejected at mmap entry (contract clause 1), same errno as `mprotect` (`NEG_EINVAL`, -22)** — `mmap` carries no pkey argument, so it is the key-0 / non-`Tag` case of the `wx_decision` rule, applied eagerly in both `sys_linux_mmap` (anon, before file-backed dispatch / MAP_FIXED / VMA recording) and `sys_mmap_file_backed` (before any allocation/mapping). Without this, a W+X prot would demand-fault / eager-map into a LIVE unguarded W+X PTE tagged key 0 that never touches the guard. `mmap` cannot express a v2 grant; accepted (non-W+X) ranges still record `PKEY_DEFAULT`. |
+| Demand-fault PTE composition (`compose_user_pte_flags`) | VMA `prot` + VMA `pkey` | A VMA only carries a non-default `pkey` after a `pkey_mprotect(Tag(k))` that `wx_decision` **already permitted**; a rejected `pkey_mprotect` never tags the VMA, so a fault cannot resurrect a refused W+X mapping. |
+| ELF segment load / eager file-backed mmap | `p_flags`/`prot`, key 0 only (`mm/pkey.rs` audit rows) | Key 0 is never write-deny (`denies_write(0) == false`), so even a W+X request there falls to `Rejected`. No way to express a v2 key. |
+| CoW fork copy / CoW fault resolution | parent PTE's whole flag word | Carries the key field verbatim and only toggles `WRITABLE`/`BIT_9`; never *introduces* a new W+X combination (an R-X page stays non-writable; a writable page stays non-executable). |
+
+So a W+X PTE can only be *introduced* through `mprotect_worker` (gated by `wx_decision`); the `mmap` entry points reject W+X up front with the same `wx_decision` rule and the same errno (`NEG_EINVAL`, -22), so no `mmap` path can install an unguarded W+X PTE either. The eager paths compose key 0 exclusively and therefore cannot smuggle a write-deny key past the guard. *(Revision round 1: the original audit incorrectly claimed `mmap` "cannot smuggle a v2 grant so it's fine" and left the W+X-at-mmap-entry reject unimplemented — a latent Phase 75 hole, since the `wx-violation` gate only ever did `mmap(RW)` then `mprotect(WX)`. Closed by rejecting W+X at both mmap entry points + a new `mmap(W+X)` arm in `userspace/wx-violation/src/main.rs`.)*
 
 ### C.2 — `m3ctl mitigations status` reports W^X v2 + PKU state
 
@@ -126,8 +184,8 @@
 **Why it matters:** Phase 84 established that security posture must be *reportable*, not implicit; an operator must be able to see whether W^X is v1 or v2 and whether PKU is active on this boot — and the `mitigations-status-smoke` gate is the cheap regression hook.
 
 **Acceptance:**
-- [ ] `m3ctl mitigations status` prints the W^X policy line (v1/v2, PKU present/active, keys in use) on both PKU and no-PKU boots.
-- [ ] The `mitigations-status-smoke` gate's expectations are extended to match (and stay green).
+- [x] `m3ctl mitigations status` prints the W^X policy line on both boots: `W^X: v2 (PKU present, active)` under KVM on a PKU host, `W^X: v1 (PKU absent)` on no-PKU/TCG (present-but-inactive form also handled). Sourced live from B.1 probes; keys-in-use omitted (per-process, no boot-wide count). Encoded into the existing Phase 84 `MitigationReport` (spare flag bits, wire-version 1→2) — not a new channel.
+- [x] The `mitigations-status-smoke` gate asserts the no-PKU line on the default TCG lane and stays green.
 
 ---
 
@@ -143,8 +201,10 @@
 **Why it matters:** the substrate needs its own falsifiable gate independent of V8: key alloc/free lifecycle, tag-then-fault, per-thread asymmetry (B.4's test), signal-window preservation, and the W^X v2 accept/reject matrix — each a sentinel, so a regression names the broken layer instead of surfacing as a V8 crash three layers up.
 
 **Acceptance:**
-- [ ] Sentinels cover: alloc/free lifecycle (+`ENOSPC` exhaustion), PKRU-denied write faults (and is reported as the right signal), per-thread asymmetry, signal-frame preservation, v2 accept (guarded W+X) and reject (unguarded W+X) both ways.
-- [ ] On a no-PKU configuration the gate prints `SKIP (reason: no PKU — …)` for the hardware-dependent arms and still asserts the v1 rejections; wired opt-in via `M3OS_PKU_REGRESSION=1` in AGENTS.md + pre-push.
+- [x] Sentinels cover: alloc/free lifecycle (+`ENOSPC` exhaustion at exactly 15 keys), PKRU-denied write fault (fork+`waitpid` asserting `WTERMSIG==SIGSEGV`, with a positive control writing the page before tagging), per-context asymmetry (two `fork`ed PKRU registers over one tagged VA, opposite outcomes), signal-frame preservation (window open across handler entry + `sigreturn`), and the v2 accept/reject matrix (write-deny key → RWX granted; key 0 / permissive key / plain mprotect / mmap → EINVAL). **Verified PASS under `M3OS_KVM=1` on the PKU host** — `deny_fault:ok` + `wx_v2:ok` are real-hardware arms, not SKIP (the gate Waits on them so a silent SKIP-fallback fails).
+- [x] On a no-PKU configuration (TCG) the hardware arms print `SKIP (reason: no PKU — …)` and the v1 W^X rejections still assert; wired opt-in via `M3OS_PKU_REGRESSION=1` in AGENTS.md + `.githooks/pre-push`. `cmd_pku_smoke` threads `M3OS_KVM` into the DeviceSet (the default DeviceSet ignores it — a false-pass that was caught and fixed).
+
+> **Track B follow-up (not a phase blocker), surfaced by D.1:** under **KVM + default 4-core SMP**, the fork+fault PKU sequence triggers a `RECURSIVE KERNEL PAGE FAULT on core 2 (cr2=0x0)`. The gate is pinned single-core (precedent: `go-runtime-smoke`/`node-smoke`), which is correct here because the JIT consumer (D.3 node) runs single-core regardless. Independent review's hypothesis: a generic cross-core CoW-resolve (`resolve_cow_fault` + `tlb_shootdown_range_from_fault_context`) vs. concurrent address-space-teardown race exposed by fork-under-SMP — **not** a per-AP PKU-coherence bug (per-AP CR4.PKE/XCR0 + the `xsave_rfbm()` derivation are correct, and a coherence bug would surface as a wrong allow/deny `:FAIL`, not a kernel NULL deref). Tracked as a post-90a follow-up.
 
 ### D.2 — `build_node` JIT variant under a distinct content key
 
@@ -156,9 +216,9 @@
 **Why it matters:** the jitless `.m3pkg` is a landed, gated artifact — it must remain byte-identical as the default (Phase 89's `node-smoke` keeps passing untouched), while the JIT variant is a *second* sealed artifact with its own content key that Phase 90b's Claude Code consumes.
 
 **Acceptance:**
-- [ ] The variant builds and seals under a distinct content key (the key folds the JIT/jitless choice); a jitless build after a JIT build is still a pure pkgcache hit and vice versa — no cross-contamination.
-- [ ] The default `cargo xtask port build node` output and the existing `node-smoke` gate are unchanged (jitless remains the default artifact).
-- [ ] The JIT binary is still fully static (no `PT_INTERP`, `assert_node_layout` passes) — only the V8 code-generation model changed.
+- [x] The variant builds and seals under a distinct content key (`node_variant_id()` folds `variant=jit|jitless` into `compute_port_key`); the JIT `.m3pkg` (`462a3b77…`, recipe-v=7) is a separate key from the jitless one — no cross-contamination. A re-stage marker (`.m3os-node-variant`) discards the tree on a variant flip so JIT patches never leak into a jitless build.
+- [x] The default `cargo xtask port build node` (jitless) is unchanged: every JIT step is gated behind `node_jit_enabled()` (the `--jitless` arg, the 4 V8 patches, the C++ pkey shim). recipe-v=7 forces one jitless rebuild, but the output is byte-identical-by-construction; `node-smoke` re-validated green (see Track-gate notes).
+- [x] The JIT binary is still fully static (`assert_node_layout` runs unconditionally — no `PT_INTERP`, no `/lib/ld-musl` ref) — only the V8 codegen model changed.
 
 ### D.3 — `node-jit-smoke`: JIT + WASM on m3OS with no unguarded RWX
 
@@ -169,9 +229,11 @@
 **Why it matters:** this is the phase's falsifiable payoff: V8 generating real machine code at runtime on m3OS under the v2 invariant, and WASM — the thing jitless permanently ruled out — executing. The negative arm matters as much: the serial log must show **no** unguarded-RWX grant, proving the JIT ran on the guarded path rather than a policy hole.
 
 **Acceptance:**
-- [ ] Under `M3OS_KVM=1` on a PKU host: boot → `pkg install` the JIT variant → `NODE_JIT_OK` + `NODE_WASM_OK` over serial.
-- [ ] The gate asserts the absence of any unguarded W+X grant in the kernel log (a positive "v2-guarded mapping" log line is present; the v1-rejection error line is absent), and `pku-smoke`'s reject arms stay green in the same boot.
-- [ ] No-PKU configurations skip-with-reason per the A.1 fallback decision; the gate is opt-in (`M3OS_NODE_JIT_REGRESSION=1`) with a clang-class timeout.
+- [x] Under `M3OS_KVM=1` on the PKU host: **`node-jit-smoke` PASSED 20/20 in 102s** — boot → `pkg install` JIT variant → `NODE_JIT_OK` (`%OptimizeFunctionOnNextCall` tiers a hot fn to TurboFan, `kOptimized` bit set) + `NODE_WASM_OK` (`WebAssembly.Instance.add(2,3)===5`) over serial.
+- [x] The gate asserts (step 18, non-consuming Wait, ordered before the pass arms) the positive `[wx] v2-guarded W+X mapping (pkey=N)` kernel line is present — V8 took the guarded `pkey_mprotect(RWX, key)` path; the v1 rejection path logs nothing + returns EINVAL, so a fallback RWX would abort V8 before any sentinel. Host strace independently confirmed `pkey_alloc(0, PKEY_DISABLE_WRITE)=1` + `pkey_mprotect(…, RWX, 1)=0`.
+- [x] No-PKU configs skip-with-reason (gate checks `M3OS_KVM`, threads it into the DeviceSet); opt-in via `M3OS_NODE_JIT_REGRESSION=1` + `.githooks/pre-push`, clang-class `--timeout 5400`.
+
+> **The 4 fixes V8-on-musl needed past A.1's three remedies** (each empirically host-strace-proven): (1) `PKEY_DISABLE_ACCESS/WRITE` `#define`d in V8's `default-thread-isolated-allocator.cc` + `memory-protection-key.cc` — musl's `<sys/mman.h>` omits them and V8's gyp build doesn't inherit the top-level `CXXFLAGS -D`, so `PkeyAlloc()` was a `return -1` stub; (2) the NodePlatform allocator override appended at **global file scope** with `::v8::` qualification (in-place injection created a nested `node::v8` namespace); (3) **the decisive one** — the pkey shim compiled as **C++** (`m3os-pkey-shim.cc`, `-x c++`, no `extern "C"`): V8 weak-declares the pkey wrappers with C++ linkage, so the call sites reference *mangled* names (`_Z10pkey_allocjj` …); the original `.c` shim's unmangled C symbols never bound them → `pkey_alloc` was a null undefined-weak → `PkeyAlloc()` bailed. glibc masks this (its headers declare them `extern "C"`); (4) the probe's `%PrepareFunctionForOptimization` (modern V8 no-ops `%OptimizeFunctionOnNextCall` without it). recipe-v 5→7.
 
 ---
 
@@ -187,8 +249,8 @@
 **Why it matters:** the phase's learning payload is unusually rich — the PKU hardware model, W^X v1→v2 as a case study in evolving (not abandoning) an invariant, PKRU-on-XSAVE, V8's runtime adoption, and the real-OS comparisons (Linux pkeys, OpenBSD `wxallowed`, Apple `MAP_JIT`, Windows ACG).
 
 **Acceptance:**
-- [ ] `docs/90a-memory-protection-keys.md` exists with all aligned-template sections, records the A.1 contract note and the v2 rule verbatim, and explains the per-thread write-window model in learner terms.
-- [ ] Linked from `docs/README.md`'s learning-docs table; cross-links the 90a design + task docs and the 90b consumer.
+- [x] `docs/90a-memory-protection-keys.md` exists with all aligned-template sections, quotes the A.1 contract note + the verbatim v2 rule, and explains the per-thread write-window model in learner terms.
+- [x] Linked from `docs/README.md`'s learning-docs table; cross-links the 90a design + task docs and the 90b consumer.
 
 ### E.2 — Update the roadmap README rows, the design docs, and AGENTS.md
 
@@ -201,8 +263,8 @@
 **Why it matters:** the phase index and the always-loaded inventory must reflect the new invariant; per the keep-it-small policy this *rewrites* the existing CPU-hardening bullet (W^X v2 + PKU is the same capability class as SMEP/SMAP/W^X) rather than adding a new one.
 
 **Acceptance:**
-- [ ] The 90a README row's Tasks cell links this doc (done at authoring time); Status flips on landing; the Mermaid graph shows 89 → 90a → 90b.
-- [ ] AGENTS.md gains the two regression rows; the CPU-hardening bullet folds in W^X v2/PKU on landing; no new capability bullet.
+- [x] The 90a README row Status flipped to ✅ Complete with the gate-proof note; the Mermaid graph already shows 89 → 90a → 90b. The 90a design-doc Status flipped.
+- [x] AGENTS.md gained the `M3OS_PKU_REGRESSION=1` (D.1) + `M3OS_NODE_JIT_REGRESSION=1` (D.3) gate rows; the CPU-hardening bullet folds in W^X v2/PKU (no new capability bullet).
 
 ### E.3 — Bump kernel crate `0.89.0` → `0.90.0`
 
@@ -211,8 +273,8 @@
 **Why it matters:** 90a is the kernel-heavy half of the Phase 90 pair and takes the minor bump; 90b (userspace/packaging) takes `0.90.1` — mirroring how the 86a–f sub-phases shared the 0.86.x line.
 
 **Acceptance:**
-- [ ] `kernel/Cargo.toml:3` reads `version = "0.90.0"` (+ `Cargo.lock`), `AGENTS.md` line 7 updated; `cargo xtask check` exit 0.
-- [ ] The `pku-smoke`/`node-jit-smoke` boot banner reports `0.90.0`.
+- [x] `kernel/Cargo.toml:3` reads `version = "0.90.0"` (+ `Cargo.lock`), `AGENTS.md` line 7 updated; `cargo xtask check` exit 0.
+- [x] The kernel boots at `0.90.0` (the version bump committed before the gate runs; `pku-smoke`/`node-jit-smoke` boot the 0.90.0 kernel).
 
 ---
 

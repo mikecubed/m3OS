@@ -340,6 +340,13 @@ static PAGE_GRANT_TEST_ELF: &[u8] = generated_initrd_asset!("page-grant-test");
 // no `.conf`.
 static WX_VIOLATION_ELF: &[u8] = generated_initrd_asset!("wx-violation");
 
+// Phase 90a Track D.1 — `pku-smoke` PKU substrate + W^X v2 regression:
+// pkey alloc/free lifecycle + exhaustion, a denied-write fault (forked
+// child killed by SIGSEGV), per-context PKRU asymmetry, signal-frame
+// PKRU preservation, and the W^X v2 accept/reject matrix. Not a daemon:
+// no `.conf`.
+static PKU_SMOKE_ELF: &[u8] = generated_initrd_asset!("pku-smoke");
+
 // Phase 77 Track F.1 — `epoll-smoke` epoll_* verification regression.
 static EPOLL_SMOKE_ELF: &[u8] = generated_initrd_asset!("epoll-smoke");
 
@@ -674,6 +681,13 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "wx-violation",
         RamdiskNode::File {
             content: WX_VIOLATION_ELF,
+        },
+    ),
+    // Phase 90a Track D.1: pku-smoke — PKU substrate + W^X v2 regression.
+    (
+        "pku-smoke",
+        RamdiskNode::File {
+            content: PKU_SMOKE_ELF,
         },
     ),
     // Phase 77 Track F.1: epoll-smoke — epoll_* verification regression.

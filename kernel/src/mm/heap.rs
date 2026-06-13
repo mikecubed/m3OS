@@ -308,8 +308,9 @@ fn is_slab_eligible(layout: &Layout) -> bool {
     // satisfied.
     if let Some(idx) = size_to_class(size) {
         let class_size = SIZE_CLASSES[idx];
-        // Alignment guarantee: largest power-of-two divisor of class_size.
-        let class_align = class_size & class_size.wrapping_neg();
+        // Alignment guarantee: largest power-of-two divisor of class_size
+        // (== `class_size & -class_size`, via the std bit helper).
+        let class_align = class_size.isolate_lowest_one();
         align <= class_align
     } else {
         false

@@ -896,6 +896,15 @@ pub struct Process {
     pub controlling_tty: Option<ControllingTty>,
     /// Tracked anonymous mmap regions (Phase 33). O(log n) lookup via BTreeMap.
     pub vma_tree: VmaTree,
+    /// Per-address-space x86 protection-key allocation table (Phase 90a Track
+    /// B.3). 16 keys, key 0 reserved (default). Like [`Self::vma_tree`] it is a
+    /// property of the **address space**, not the thread: all threads in a tgid
+    /// share one logical table (kept in sync by [`with_shared_mm_mut`], which
+    /// copies it across the thread group — `PkeyTable` is `Copy`). `fork`/`clone`
+    /// (new address space) inherit a copy of the parent's table; `execve` resets
+    /// it to a fresh table (Linux: pkeys are per-mm, inherited on fork, reset on
+    /// exec).
+    pub pkey_table: kernel_core::pkey::PkeyTable,
     /// Last successfully executed binary path, used for procfs.
     pub exec_path: String,
     /// Current argv vector, used for `/proc/<pid>/cmdline`.
@@ -977,6 +986,7 @@ impl Process {
             session_id: pid,
             controlling_tty: Some(ControllingTty::Console),
             vma_tree: VmaTree::new(),
+            pkey_table: kernel_core::pkey::PkeyTable::new(),
             exec_path: String::new(),
             cmdline: Vec::new(),
             start_ticks: crate::arch::x86_64::interrupts::tick_count(),
@@ -1249,6 +1259,19 @@ pub fn shared_vma_prot(pid: Pid, addr: u64) -> Option<u64> {
     table.processes[idx].find_vma(addr).map(|m| m.prot)
 }
 
+/// Like [`shared_vma_prot`] but also returns the VMA's protection key (Phase
+/// 90a B.3). The demand-fault path uses the key to compose a tagged PTE so a
+/// page faulted into a `pkey_mprotect`-tagged range keeps its tag — without
+/// this, a faulted-in JIT code page would silently lose its W^X-v2 guard.
+pub fn shared_vma_prot_and_pkey(pid: Pid, addr: u64) -> Option<(u64, u8)> {
+    let table = PROCESS_TABLE.lock();
+    let tgid = table.find(pid)?.tgid;
+    let idx = canonical_mm_index(&table.processes, tgid)?;
+    table.processes[idx]
+        .find_vma(addr)
+        .map(|m| (m.prot, m.pkey))
+}
+
 pub fn with_shared_mm_mut<R, F>(pid: Pid, f: F) -> Option<R>
 where
     F: FnOnce(&mut u64, &mut u64, &mut VmaTree) -> R,
@@ -1273,6 +1296,49 @@ where
 
 pub fn sync_shared_mm_state(pid: Pid) {
     let _ = with_shared_mm_mut(pid, |_brk_current, _mmap_next, _vma_tree| {});
+    // Phase 90a B.3 — also re-publish the canonical protection-key table to
+    // every thread in the group (a freshly-`clone`d thread shares the address
+    // space and must see the same allocated keys).
+    sync_shared_pkey_table(pid);
+}
+
+/// Snapshot the (per-address-space) protection-key table for `pid`'s thread
+/// group. Reads the canonical thread's copy (Phase 90a B.3).
+pub fn shared_pkey_table(pid: Pid) -> Option<kernel_core::pkey::PkeyTable> {
+    let table = PROCESS_TABLE.lock();
+    let tgid = table.find(pid)?.tgid;
+    let idx = canonical_mm_index(&table.processes, tgid)?;
+    Some(table.processes[idx].pkey_table)
+}
+
+/// Mutate the protection-key table for `pid`'s thread group and re-publish the
+/// result to **every** thread in the tgid (Phase 90a B.3 — pkeys are
+/// per-address-space, so all `CLONE_VM` threads must observe one logical
+/// table). Mirrors [`with_shared_mm_mut`]'s read-canonical / write-all pattern;
+/// `PkeyTable` is `Copy` so the propagation is a cheap field copy. Returns the
+/// closure's result, or `None` if the process is gone.
+pub fn with_shared_pkey_table_mut<R, F>(pid: Pid, f: F) -> Option<R>
+where
+    F: FnOnce(&mut kernel_core::pkey::PkeyTable) -> R,
+{
+    let mut table = PROCESS_TABLE.lock();
+    let tgid = table.find(pid)?.tgid;
+    let idx = canonical_mm_index(&table.processes, tgid)?;
+
+    let mut pkey_table = table.processes[idx].pkey_table;
+    let result = f(&mut pkey_table);
+
+    for proc in table.processes.iter_mut().filter(|p| p.tgid == tgid) {
+        proc.pkey_table = pkey_table;
+    }
+    Some(result)
+}
+
+/// Copy the canonical thread's protection-key table to every other thread in
+/// the tgid without otherwise mutating it. Used after a thread `clone` so the
+/// new thread inherits the group's allocated keys.
+fn sync_shared_pkey_table(pid: Pid) {
+    let _ = with_shared_pkey_table_mut(pid, |_| {});
 }
 
 // ---------------------------------------------------------------------------
@@ -1321,6 +1387,7 @@ pub fn spawn_process(ppid: Pid, entry_point: u64, user_stack_top: u64) -> Pid {
         session_id: pid,
         controlling_tty: Some(ControllingTty::Console),
         vma_tree: VmaTree::new(),
+        pkey_table: kernel_core::pkey::PkeyTable::new(),
         exec_path: String::new(),
         cmdline: Vec::new(),
         start_ticks: crate::arch::x86_64::interrupts::tick_count(),
@@ -1383,6 +1450,7 @@ pub fn spawn_process_with_cr3(
         session_id: pid,
         controlling_tty: Some(ControllingTty::Console),
         vma_tree: VmaTree::new(),
+        pkey_table: kernel_core::pkey::PkeyTable::new(),
         exec_path: String::new(),
         cmdline: Vec::new(),
         start_ticks: crate::arch::x86_64::interrupts::tick_count(),
@@ -1449,6 +1517,7 @@ pub fn spawn_process_with_cr3_and_fds(
         session_id: pid,
         controlling_tty: Some(ControllingTty::Console),
         vma_tree: VmaTree::new(),
+        pkey_table: kernel_core::pkey::PkeyTable::new(),
         exec_path: String::new(),
         cmdline: Vec::new(),
         start_ticks: crate::arch::x86_64::interrupts::tick_count(),

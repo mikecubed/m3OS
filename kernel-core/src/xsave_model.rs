@@ -11,6 +11,235 @@ pub const LEAF1_ECX_OSXSAVE: u32 = 1 << 27;
 /// 1.0 release supported state-component mask (x87 + SSE + AVX).
 pub const XSAVE_FEATURE_MASK: u64 = 0x7;
 
+// ── Phase 90a B.1: Memory Protection Keys (PKU) CPUID surface ───────────────
+
+/// `CPUID.07H.0:ECX[3]` — PKU: the CPU implements protection keys for
+/// user-mode pages (the `RDPKRU`/`WRPKRU` instructions and the PTE key field).
+pub const LEAF7_ECX_PKU: u32 = 1 << 3;
+/// `CPUID.07H.0:ECX[4]` — OSPKE: the OS has enabled protection keys via
+/// `CR4.PKE`.  Like `OSXSAVE`, this reflects *runtime* state — it reads 0
+/// before the kernel sets `CR4.PKE` and 1 after — so the support probe must
+/// **not** require it, only the architectural PKU bit.
+pub const LEAF7_ECX_OSPKE: u32 = 1 << 4;
+
+/// XSAVE state-component index for PKRU (the protection-key rights register).
+/// Bit 9 in XCR0 / the supported-component bitmap; CPUID.0Dh sub-leaf 9
+/// reports its size and offset.
+pub const XSAVE_COMPONENT_PKRU: u32 = 9;
+/// XCR0 bit mask for the PKRU component (component 9).
+pub const XCR0_PKRU: u64 = 1 << XSAVE_COMPONENT_PKRU;
+
+// ── Phase 90a B.4: PKRU register defaults + RFBM / XSAVE-area seeding ────────
+
+/// Byte offset of `XSTATE_BV` within the standard (non-compacted) XSAVE area —
+/// it sits at the start of the 64-byte XSAVE header, immediately after the
+/// 512-byte legacy FXSAVE region.
+pub const XSTATE_BV_OFFSET: usize = 512;
+
+/// The Linux-default PKRU value for a fresh address space (`init_pkru_value` in
+/// `arch/x86/mm/pkeys.c`): key 0 fully permissive (bits `00`), every non-zero
+/// key access-disabled (the access-disable bit set, the write-disable bit
+/// clear).  PKRU packs two bits per key — bit `2*k` = access-disable (AD),
+/// bit `2*k+1` = write-disable (WD).  `0x5555_5554` is therefore AD set for
+/// keys 1..=15 (the `0x4` nibble-low pattern repeated) with key 0 left at `00`.
+///
+/// A freshly-`XSAVE`d task whose `XSTATE_BV` bit 9 is **clear** would `xrstor`
+/// the hardware *init* value `0` for PKRU — which is **all keys permissive**, a
+/// security hole (a JIT page tagged with a non-default key would be writable by
+/// a brand-new thread).  Seeding this value with `XSTATE_BV[9]` set closes that
+/// gap so new tasks start access-denied for every allocated key.
+pub const PKRU_INIT_DEFAULT: u32 = 0x5555_5554;
+
+/// The requested-feature bitmap (RFBM, `EDX:EAX`) the per-task
+/// `xsave64`/`xsaveopt64`/`xrstor64` and the signal-frame snapshot pass.
+///
+/// Without PKU this is exactly the legacy `XSAVE_FEATURE_MASK` (0x7 — x87, SSE,
+/// AVX), bit-for-bit unchanged from Phase 57e.  When PKU is usable it folds in
+/// component 9 (PKRU) → `0x207`, so PKRU is saved and restored across the task
+/// boundary and rides the signal frame.  Centralising the computation here
+/// (host-tested) keeps every RFBM consumer in the kernel consistent: a site that
+/// forgot the PKU bit would leak one thread's open write window to the
+/// next-scheduled thread.
+#[inline]
+pub const fn xsave_rfbm(pku_usable: bool) -> u64 {
+    if pku_usable {
+        XSAVE_FEATURE_MASK | XCR0_PKRU
+    } else {
+        XSAVE_FEATURE_MASK
+    }
+}
+
+/// Seed the PKRU state component of a standard-format XSAVE-area byte buffer to
+/// `pkru` and mark it present in `XSTATE_BV` (bit 9).
+///
+/// `pkru_offset` is the CPUID.0Dh.9:EBX byte offset of the PKRU component within
+/// the non-compacted area (2688 on parts that reserve the AVX-512 component
+/// region before it).  The PKRU component is 8 bytes architecturally: a 4-byte
+/// PKRU register (little-endian, at the component offset) followed by 4 reserved
+/// bytes that must be zero (a non-zero reserved value would `#GP` `xrstor64`).
+///
+/// Returns `true` when the seed was applied; `false` (a no-op) when the buffer
+/// is too small to hold the component or `pkru_offset` is zero (no PKRU
+/// component on this CPU) — so a no-PKU configuration is left bit-for-bit
+/// unchanged.  Setting `XSTATE_BV[9]` is what makes a later `xrstor64` load this
+/// value rather than the all-permissive hardware init value.
+pub fn seed_pkru_component(buf: &mut [u8], pkru_offset: usize, pkru: u32) -> bool {
+    // A zero offset means CPUID never reported a PKRU component — nothing to
+    // seed (no-PKU CPU); leave the buffer untouched.
+    if pkru_offset == 0 {
+        return false;
+    }
+    // The component is 8 bytes (4-byte PKRU + 4 reserved); the header
+    // (XSTATE_BV at 512) must also be in range.
+    if buf.len() < pkru_offset + 8 || buf.len() < XSTATE_BV_OFFSET + 8 {
+        return false;
+    }
+    // PKRU register (little-endian) at the component offset.
+    buf[pkru_offset..pkru_offset + 4].copy_from_slice(&pkru.to_le_bytes());
+    // The 4 reserved bytes after the register must be zero for xrstor64.
+    buf[pkru_offset + 4..pkru_offset + 8].copy_from_slice(&0u32.to_le_bytes());
+    // Mark component 9 present in XSTATE_BV so xrstor64 loads the seeded value
+    // (a clear bit would load the hardware init value = all keys permissive).
+    let mut xstate_bv = u64::from_le_bytes(
+        buf[XSTATE_BV_OFFSET..XSTATE_BV_OFFSET + 8]
+            .try_into()
+            .unwrap(),
+    );
+    xstate_bv |= XCR0_PKRU;
+    buf[XSTATE_BV_OFFSET..XSTATE_BV_OFFSET + 8].copy_from_slice(&xstate_bv.to_le_bytes());
+    true
+}
+
+/// Read back the 4-byte PKRU register from a standard-format XSAVE-area buffer.
+///
+/// Returns `None` when `pkru_offset` is zero or the buffer is too small.  Used
+/// by host tests to prove a `seed_pkru_component` round-trip and by any caller
+/// that needs to inspect a saved PKRU value without executing `RDPKRU`.
+///
+/// # XSTATE_BV[9] / xsaveopt-skip semantics
+///
+/// `xsaveopt64` only writes a component's bytes into the area when the
+/// component's live value differs from the architectural init state.  For PKRU
+/// the init value is `0` (all keys permissive).  When a task's live PKRU is `0`
+/// after a `WRPKRU(0)` call, xsaveopt **skips** writing component 9 **and
+/// clears `XSTATE_BV[9]`**, leaving whatever bytes were previously at the PKRU
+/// offset.  If the area was earlier seeded with `PKRU_INIT_DEFAULT`
+/// (0x5555_5554), those stale bytes survive and a naive byte-read would return
+/// 0x5555_5554 instead of the true 0 — a fork child would then wrongly inherit
+/// a restrictive PKRU.
+///
+/// `xrstor64` already handles this correctly on the restore side: a component
+/// with `XSTATE_BV` bit clear is restored to its architectural init value (0
+/// for PKRU), ignoring the bytes in the area.  This function mirrors that
+/// contract on the read side: when `XSTATE_BV[9]` is clear the component is in
+/// its init state and we return `Some(0)` rather than the stale bytes.
+pub fn read_pkru_component(buf: &[u8], pkru_offset: usize) -> Option<u32> {
+    if pkru_offset == 0 || buf.len() < pkru_offset + 4 {
+        return None;
+    }
+    // Check XSTATE_BV bit 9: if clear the component is in its init state (0).
+    // Mirror xrstor64's own semantics rather than returning stale bytes that
+    // xsaveopt left behind when the live PKRU equalled the init value 0.
+    if buf.len() >= XSTATE_BV_OFFSET + 8 {
+        let xstate_bv = u64::from_le_bytes(
+            buf[XSTATE_BV_OFFSET..XSTATE_BV_OFFSET + 8]
+                .try_into()
+                .unwrap(),
+        );
+        if xstate_bv & XCR0_PKRU == 0 {
+            // Component 9 is in its init state: PKRU = 0 (all keys permissive).
+            return Some(0);
+        }
+    }
+    Some(u32::from_le_bytes(
+        buf[pkru_offset..pkru_offset + 4].try_into().unwrap(),
+    ))
+}
+
+/// Parsed Memory-Protection-Keys (PKU) CPUID surface.
+///
+/// Mirrors the runtime `CPUID.07H.0:ECX` (PKU/OSPKE) and the `CPUID.0Dh`
+/// component-9 (PKRU) parsing in `kernel/src/arch/x86_64/cpuid.rs` without
+/// executing `cpuid`.  Lets host tests pin the decode and the XSAVE-area size
+/// accounting against synthetic register values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PkuFeaturesModel {
+    /// `CPUID.07H.0:ECX[3]` — PKU implemented by the CPU.
+    pub pku: bool,
+    /// `CPUID.07H.0:ECX[4]` — OSPKE: `CR4.PKE` currently set (runtime state,
+    /// 0 before the kernel enables it).  Retained for diagnostics; the support
+    /// decision never depends on it.
+    pub ospke: bool,
+    /// Whether the PKRU component (bit 9) appears in the XSAVE supported-component
+    /// bitmap (`CPUID.0Dh.0:EDX:EAX`).  PKU without the XSAVE component is a
+    /// degenerate CPU we do not enable component 9 on.
+    pub pkru_component_supported: bool,
+    /// `CPUID.0Dh.9:EAX` — size in bytes of the PKRU state component.
+    pub pkru_component_size: usize,
+    /// `CPUID.0Dh.9:EBX` — byte offset of the PKRU component within the
+    /// (non-compacted) XSAVE area.
+    pub pkru_component_offset: usize,
+}
+
+impl PkuFeaturesModel {
+    /// Parse from raw CPUID register values.
+    ///
+    /// * `leaf7_0_ecx` — `CPUID.07H` sub-leaf 0, ECX (PKU bit 3 / OSPKE bit 4).
+    /// * `leaf_d_0_eax` / `leaf_d_0_edx` — `CPUID.0Dh` sub-leaf 0, the low/high
+    ///   halves of the supported-component bitmap (component 9 = bit 9 of EAX).
+    /// * `leaf_d_9_eax` / `leaf_d_9_ebx` — `CPUID.0Dh` sub-leaf 9, the PKRU
+    ///   component's size (EAX) and offset (EBX).
+    pub fn from_raw(
+        leaf7_0_ecx: u32,
+        leaf_d_0_eax: u32,
+        leaf_d_0_edx: u32,
+        leaf_d_9_eax: u32,
+        leaf_d_9_ebx: u32,
+    ) -> Self {
+        let supported_components = (u64::from(leaf_d_0_edx) << 32) | u64::from(leaf_d_0_eax);
+        Self {
+            pku: (leaf7_0_ecx & LEAF7_ECX_PKU) != 0,
+            ospke: (leaf7_0_ecx & LEAF7_ECX_OSPKE) != 0,
+            pkru_component_supported: (supported_components & XCR0_PKRU) != 0,
+            pkru_component_size: leaf_d_9_eax as usize,
+            pkru_component_offset: leaf_d_9_ebx as usize,
+        }
+    }
+
+    /// True when the kernel may enable PKU on this CPU: the architectural PKU
+    /// bit is set **and** the XSAVE PKRU component (9) is advertised (so PKRU
+    /// can ride the per-task XSAVE save/restore).  Independent of OSPKE — that
+    /// is runtime state the kernel itself toggles via `CR4.PKE`.
+    pub fn pku_usable(&self) -> bool {
+        self.pku && self.pkru_component_supported
+    }
+
+    /// The XCR0 mask the kernel should program: the existing base mask plus the
+    /// PKRU component bit **only** when PKU is usable.  When PKU is not usable
+    /// the mask is returned unchanged (component 9 stays clear), keeping no-PKU
+    /// behaviour bit-for-bit identical.
+    pub fn xcr0_mask(&self, base_mask: u64) -> u64 {
+        if self.pku_usable() {
+            base_mask | XCR0_PKRU
+        } else {
+            base_mask
+        }
+    }
+
+    /// Validate that a statically-sized per-task XSAVE buffer (`static_area`)
+    /// still holds the *enabled* XSAVE area once component 9 has been added.
+    ///
+    /// `enabled_area` is the size CPUID.0Dh.0:EBX reports **after** XCR0 has
+    /// been programmed with the PKU mask (it grows to include component 9).
+    /// Returns `true` when the static buffer fits.  The boot-time assertion
+    /// uses this so a future component-size change that no longer fits fails
+    /// loudly rather than corrupting the next task's state.  When PKU is not
+    /// usable the area does not grow, so this reduces to the existing 57e check.
+    pub fn static_area_fits(static_area: usize, enabled_area: usize) -> bool {
+        static_area >= enabled_area
+    }
+}
+
 /// Parsed XSAVE feature surface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct XSaveFeaturesModel {
@@ -148,5 +377,220 @@ mod tests {
         assert!(f.meets_minimum());
         assert_eq!(f.area_size_at_mask, 832);
         assert_eq!(f.max_area_size, 2688);
+    }
+
+    // ── Phase 90a B.1: PKU / PKRU decode + size accounting ──────────────────
+
+    /// Ryzen 5 7600 (Zen 4) / Skylake-X class: PKU + OSPKE not yet enabled, the
+    /// PKRU component (9) advertised at 8 bytes, offset 2688 (after the AVX-512
+    /// region in a non-compacted area).  Usable; XCR0 grows by bit 9.
+    #[test]
+    fn pku_present_component_advertised() {
+        let p = PkuFeaturesModel::from_raw(
+            LEAF7_ECX_PKU, // PKU set, OSPKE not yet (CR4.PKE unset at probe)
+            1 << 9,        // leaf D.0 EAX: component 9 bit present
+            0,             // leaf D.0 EDX: no high components
+            8,             // leaf D.9 EAX: PKRU size = 8 bytes
+            2688,          // leaf D.9 EBX: offset
+        );
+        assert!(p.pku);
+        assert!(!p.ospke);
+        assert!(p.pkru_component_supported);
+        assert_eq!(p.pkru_component_size, 8);
+        assert_eq!(p.pkru_component_offset, 2688);
+        assert!(p.pku_usable());
+        assert_eq!(
+            p.xcr0_mask(XSAVE_FEATURE_MASK),
+            XSAVE_FEATURE_MASK | XCR0_PKRU
+        );
+    }
+
+    /// OSPKE already set (CR4.PKE enabled) — reflects the post-`enable` re-read.
+    /// The usability decision is unaffected by OSPKE.
+    #[test]
+    fn ospke_set_does_not_change_usability() {
+        let p = PkuFeaturesModel::from_raw(LEAF7_ECX_PKU | LEAF7_ECX_OSPKE, 1 << 9, 0, 8, 2688);
+        assert!(p.pku);
+        assert!(p.ospke);
+        assert!(p.pku_usable());
+    }
+
+    /// No-PKU CPU (QEMU TCG without the feature): PKU bit clear → not usable,
+    /// XCR0 mask returned unchanged (component 9 stays off — bit-for-bit no-op).
+    #[test]
+    fn no_pku_cpu_unchanged() {
+        let p = PkuFeaturesModel::from_raw(0, 0, 0, 0, 0);
+        assert!(!p.pku);
+        assert!(!p.pku_usable());
+        assert_eq!(p.xcr0_mask(XSAVE_FEATURE_MASK), XSAVE_FEATURE_MASK);
+    }
+
+    /// PKU advertised but the XSAVE PKRU component absent — a degenerate CPU.
+    /// We refuse to enable component 9 (it could not be saved/restored), so
+    /// `pku_usable` is false and the XCR0 mask is unchanged.
+    #[test]
+    fn pku_without_xsave_component_not_usable() {
+        let p = PkuFeaturesModel::from_raw(LEAF7_ECX_PKU, 0x0000_0007, 0, 0, 0);
+        assert!(p.pku);
+        assert!(!p.pkru_component_supported);
+        assert!(!p.pku_usable());
+        assert_eq!(p.xcr0_mask(XSAVE_FEATURE_MASK), XSAVE_FEATURE_MASK);
+    }
+
+    // ── Phase 90a B.4: RFBM computation + PKRU-component seeding ────────────
+
+    /// The per-task / signal RFBM is exactly 0x7 on a no-PKU CPU and 0x207
+    /// (x87+SSE+AVX + PKRU component 9) when PKU is usable.
+    #[test]
+    fn rfbm_with_and_without_pku() {
+        assert_eq!(xsave_rfbm(false), 0x7);
+        assert_eq!(xsave_rfbm(true), 0x207);
+        assert_eq!(xsave_rfbm(true), XSAVE_FEATURE_MASK | XCR0_PKRU);
+    }
+
+    /// The Linux init PKRU denies access to every non-zero key and leaves key 0
+    /// fully permissive: per-key AD bit at `2*k`, WD bit at `2*k+1`.
+    #[test]
+    fn pkru_init_default_denies_nonzero_keys() {
+        let v = PKRU_INIT_DEFAULT;
+        assert_eq!(v, 0x5555_5554);
+        // Key 0: both bits clear → unrestricted.
+        assert_eq!(v & 0b11, 0, "key 0 must be unrestricted");
+        // Keys 1..=15: access-disable (AD, bit 2*k) set, write-disable clear.
+        for k in 1u32..16 {
+            let ad = 1u32 << (2 * k);
+            let wd = 1u32 << (2 * k + 1);
+            assert_ne!(v & ad, 0, "key {k} access-disable must be set");
+            assert_eq!(v & wd, 0, "key {k} write-disable must be clear");
+        }
+    }
+
+    /// Seed PKRU into a standard-format area buffer and read it back; XSTATE_BV
+    /// bit 9 is set and the reserved 4 bytes after the register are zero.
+    #[test]
+    fn seed_and_read_back_pkru() {
+        // 2752-byte buffer (matches the kernel XSAVE_AREA_SIZE), PKRU at 2688.
+        let mut buf = [0u8; 2752];
+        // Pre-set XSTATE_BV to the legacy 0x7 (as XSaveArea::new leaves it after
+        // an xsave of x87+SSE+AVX) so we prove the seed *adds* bit 9.
+        buf[XSTATE_BV_OFFSET..XSTATE_BV_OFFSET + 8].copy_from_slice(&0x7u64.to_le_bytes());
+        // Dirty the reserved bytes to prove the seed zeroes them.
+        buf[2692] = 0xAA;
+        assert!(seed_pkru_component(&mut buf, 2688, PKRU_INIT_DEFAULT));
+        assert_eq!(read_pkru_component(&buf, 2688), Some(PKRU_INIT_DEFAULT));
+        // XSTATE_BV must now have bit 9 set (and keep the prior 0x7).
+        let bv = u64::from_le_bytes(
+            buf[XSTATE_BV_OFFSET..XSTATE_BV_OFFSET + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(bv, 0x7 | XCR0_PKRU);
+        // Reserved 4 bytes after the register are zero.
+        assert_eq!(&buf[2692..2696], &[0, 0, 0, 0]);
+    }
+
+    /// A different (non-default) PKRU value also round-trips — used by the
+    /// fork-inheritance path, which seeds the parent's captured PKRU.
+    #[test]
+    fn seed_arbitrary_pkru_round_trip() {
+        let mut buf = [0u8; 2752];
+        let parent_pkru = 0x5555_5550; // parent opened a write window on key 0
+        assert!(seed_pkru_component(&mut buf, 2688, parent_pkru));
+        assert_eq!(read_pkru_component(&buf, 2688), Some(parent_pkru));
+    }
+
+    /// On a no-PKU CPU the offset is zero → seeding is a no-op and the buffer
+    /// (incl. XSTATE_BV) is left bit-for-bit unchanged.
+    #[test]
+    fn seed_no_pku_is_noop() {
+        let mut buf = [0u8; 2752];
+        buf[XSTATE_BV_OFFSET..XSTATE_BV_OFFSET + 8].copy_from_slice(&0x7u64.to_le_bytes());
+        let before = buf;
+        assert!(!seed_pkru_component(&mut buf, 0, PKRU_INIT_DEFAULT));
+        assert_eq!(&buf[..], &before[..]);
+        assert_eq!(read_pkru_component(&buf, 0), None);
+    }
+
+    /// `read_pkru_component` must return `Some(0)` — not the stale seeded bytes —
+    /// when `XSTATE_BV[9]` is clear.
+    ///
+    /// This is the xsaveopt-skip scenario: a task called `WRPKRU(0)` to open all
+    /// keys, then `xsaveopt64` ran.  Because the live PKRU equalled the hardware
+    /// init value (0), xsaveopt skipped writing component 9 and cleared
+    /// `XSTATE_BV[9]`, leaving the previously-seeded `PKRU_INIT_DEFAULT`
+    /// (0x5555_5554) in the area bytes.  A naive byte-read would return
+    /// 0x5555_5554; the correct answer is 0 (the init value), mirroring what
+    /// `xrstor64` would restore to the hardware register.
+    ///
+    /// If this returns the stale bytes instead of 0, a fork child would inherit
+    /// a restrictive PKRU (keys 1–15 access-disabled) instead of the parent's
+    /// permissive 0.
+    #[test]
+    fn read_pkru_xstate_bv_clear_returns_init_value() {
+        // 2752-byte buffer, PKRU component at offset 2688.
+        let mut buf = [0u8; 2752];
+        // Seed PKRU_INIT_DEFAULT (sets XSTATE_BV[9] | 0x7).
+        buf[XSTATE_BV_OFFSET..XSTATE_BV_OFFSET + 8].copy_from_slice(&0x7u64.to_le_bytes());
+        assert!(seed_pkru_component(&mut buf, 2688, PKRU_INIT_DEFAULT));
+        // Verify the stale bytes are present at the PKRU offset.
+        let stale_raw = u32::from_le_bytes(buf[2688..2692].try_into().unwrap());
+        assert_eq!(
+            stale_raw, PKRU_INIT_DEFAULT,
+            "stale bytes should be present"
+        );
+        // Now simulate xsaveopt clearing XSTATE_BV[9] (task did WRPKRU(0) and
+        // xsaveopt skipped writing the component because live == init).
+        let bv_before = u64::from_le_bytes(
+            buf[XSTATE_BV_OFFSET..XSTATE_BV_OFFSET + 8]
+                .try_into()
+                .unwrap(),
+        );
+        let bv_cleared = bv_before & !XCR0_PKRU; // clear bit 9
+        buf[XSTATE_BV_OFFSET..XSTATE_BV_OFFSET + 8].copy_from_slice(&bv_cleared.to_le_bytes());
+        // The raw bytes at the PKRU offset are still 0x5555_5554 (stale).
+        let still_stale = u32::from_le_bytes(buf[2688..2692].try_into().unwrap());
+        assert_eq!(
+            still_stale, PKRU_INIT_DEFAULT,
+            "stale bytes unchanged after BV clear"
+        );
+        // But read_pkru_component must return Some(0) — the init value — not the stale bytes.
+        assert_eq!(
+            read_pkru_component(&buf, 2688),
+            Some(0),
+            "XSTATE_BV[9] clear must return init value 0, not stale 0x5555_5554"
+        );
+    }
+
+    /// When `XSTATE_BV[9]` is set, `read_pkru_component` returns the actual bytes
+    /// (the complement of the xsaveopt-skip case above).
+    #[test]
+    fn read_pkru_xstate_bv_set_returns_bytes() {
+        let mut buf = [0u8; 2752];
+        buf[XSTATE_BV_OFFSET..XSTATE_BV_OFFSET + 8].copy_from_slice(&0x7u64.to_le_bytes());
+        assert!(seed_pkru_component(&mut buf, 2688, PKRU_INIT_DEFAULT));
+        // XSTATE_BV[9] is now set by seed_pkru_component.
+        assert_eq!(read_pkru_component(&buf, 2688), Some(PKRU_INIT_DEFAULT));
+    }
+
+    /// A buffer too small for the component (offset+8 out of range) is rejected
+    /// without panicking or partial writes.
+    #[test]
+    fn seed_buffer_too_small_rejected() {
+        let mut buf = [0u8; 832]; // legacy area, no room at 2688
+        assert!(!seed_pkru_component(&mut buf, 2688, PKRU_INIT_DEFAULT));
+    }
+
+    /// The static XSAVE buffer must hold the grown (component-9-inclusive) area.
+    /// 832 (x87+SSE+AVX) is too small for a PKU-grown 2696-byte area — the
+    /// boot-time assertion would fire.  The Zen-4 reality (AVX-512 + PKRU at
+    /// 2696) needs a larger static buffer; the host check pins the inequality.
+    #[test]
+    fn static_area_fit_check() {
+        // PKU off / area unchanged: 832 fits 832.
+        assert!(PkuFeaturesModel::static_area_fits(832, 832));
+        // PKU grew the area past the legacy static size → does NOT fit.
+        assert!(!PkuFeaturesModel::static_area_fits(832, 2696));
+        // A sufficiently large static buffer fits the grown area.
+        assert!(PkuFeaturesModel::static_area_fits(2696, 2696));
     }
 }

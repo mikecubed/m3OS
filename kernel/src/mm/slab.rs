@@ -310,10 +310,11 @@ pub struct KernelSlabCaches {
     /// with `Task` (see `kernel/src/task/scheduler.rs::alloc_task_slot`),
     /// so `xsave_cache`'s hit rate tracks task spawns directly.  Slot size
     /// is `XSAVE_CACHE_SLOT_SIZE`, sourced from
-    /// [`crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE`] (832 bytes — the
-    /// `XSaveArea` struct is `#[repr(C, align(64))]` over a fixed-size byte
-    /// array; the slot size is a multiple of 64 so slot addresses retain
-    /// the type's alignment).
+    /// [`crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE`] (832 bytes legacy /
+    /// 2752 bytes with PKRU component 9 — see XSAVE_AREA_SIZE for the current
+    /// value; the `XSaveArea` struct is `#[repr(C, align(64))]` over a
+    /// fixed-size byte array; the slot size is a multiple of 64 so slot
+    /// addresses retain the type's alignment).
     pub xsave_cache: IrqSafeMutex<SlabCache>,
 }
 
@@ -325,11 +326,11 @@ pub const TASK_CACHE_SLOT_SIZE: usize = 1024;
 
 /// Phase 60 — slot size for [`KernelSlabCaches::xsave_cache`].
 ///
-/// Sourced from [`crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE`] (currently
-/// 832 bytes — sufficient for x87 + SSE + AVX state on any CPU m3OS
-/// supports).  The constant is re-exported here so the slab subsystem owns
-/// the cache-sizing relationship explicitly without a cross-module import
-/// at the cache-init site.
+/// Sourced from [`crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE`] (832 bytes
+/// legacy x87+SSE+AVX; 2752 bytes with PKRU component 9 — sufficient for all
+/// XCR0 components m3OS enables today).  The constant is re-exported here so
+/// the slab subsystem owns the cache-sizing relationship explicitly without a
+/// cross-module import at the cache-init site.
 pub const XSAVE_CACHE_SLOT_SIZE: usize = crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE;
 
 static SLAB_CACHES: spin::Once<KernelSlabCaches> = spin::Once::new();

@@ -1,6 +1,6 @@
 # Phase 90a - Memory Protection Keys (PKU) and JIT-Capable V8
 
-**Status:** Planned
+**Status:** ✅ Complete — `pku-smoke` + `node-jit-smoke` PASS under KVM (PR #246); V8 JIT + WASM run under the W^X v2 invariant on the guarded PKU path
 **Source Ref:** phase-90a
 **Depends on:** Phase 57e/60 (per-task XSAVE save/restore) ✅, Phase 75 (W^X enforcement + the `wx-violation` gate) ✅, Phase 84 (mitigations policy + `m3ctl mitigations status` reporting surface) ✅, Phase 89 (Node.js — the jitless baseline this phase upgrades) ✅
 **Builds on:** Extends the Phase 75 W^X invariant to a hardware-enforced per-thread "W^X v2" using x86 Memory Protection Keys, so V8's PKU-guarded JIT can run without ever granting an unguarded writable+executable mapping
