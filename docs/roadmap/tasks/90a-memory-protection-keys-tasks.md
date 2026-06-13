@@ -184,8 +184,8 @@ So a W+X PTE can only be *introduced* through `mprotect_worker` (gated by `wx_de
 **Why it matters:** Phase 84 established that security posture must be *reportable*, not implicit; an operator must be able to see whether W^X is v1 or v2 and whether PKU is active on this boot — and the `mitigations-status-smoke` gate is the cheap regression hook.
 
 **Acceptance:**
-- [ ] `m3ctl mitigations status` prints the W^X policy line (v1/v2, PKU present/active, keys in use) on both PKU and no-PKU boots.
-- [ ] The `mitigations-status-smoke` gate's expectations are extended to match (and stay green).
+- [x] `m3ctl mitigations status` prints the W^X policy line on both boots: `W^X: v2 (PKU present, active)` under KVM on a PKU host, `W^X: v1 (PKU absent)` on no-PKU/TCG (present-but-inactive form also handled). Sourced live from B.1 probes; keys-in-use omitted (per-process, no boot-wide count). Encoded into the existing Phase 84 `MitigationReport` (spare flag bits, wire-version 1→2) — not a new channel.
+- [x] The `mitigations-status-smoke` gate asserts the no-PKU line on the default TCG lane and stays green.
 
 ---
 
@@ -201,8 +201,10 @@ So a W+X PTE can only be *introduced* through `mprotect_worker` (gated by `wx_de
 **Why it matters:** the substrate needs its own falsifiable gate independent of V8: key alloc/free lifecycle, tag-then-fault, per-thread asymmetry (B.4's test), signal-window preservation, and the W^X v2 accept/reject matrix — each a sentinel, so a regression names the broken layer instead of surfacing as a V8 crash three layers up.
 
 **Acceptance:**
-- [ ] Sentinels cover: alloc/free lifecycle (+`ENOSPC` exhaustion), PKRU-denied write faults (and is reported as the right signal), per-thread asymmetry, signal-frame preservation, v2 accept (guarded W+X) and reject (unguarded W+X) both ways.
-- [ ] On a no-PKU configuration the gate prints `SKIP (reason: no PKU — …)` for the hardware-dependent arms and still asserts the v1 rejections; wired opt-in via `M3OS_PKU_REGRESSION=1` in AGENTS.md + pre-push.
+- [x] Sentinels cover: alloc/free lifecycle (+`ENOSPC` exhaustion at exactly 15 keys), PKRU-denied write fault (fork+`waitpid` asserting `WTERMSIG==SIGSEGV`, with a positive control writing the page before tagging), per-context asymmetry (two `fork`ed PKRU registers over one tagged VA, opposite outcomes), signal-frame preservation (window open across handler entry + `sigreturn`), and the v2 accept/reject matrix (write-deny key → RWX granted; key 0 / permissive key / plain mprotect / mmap → EINVAL). **Verified PASS under `M3OS_KVM=1` on the PKU host** — `deny_fault:ok` + `wx_v2:ok` are real-hardware arms, not SKIP (the gate Waits on them so a silent SKIP-fallback fails).
+- [x] On a no-PKU configuration (TCG) the hardware arms print `SKIP (reason: no PKU — …)` and the v1 W^X rejections still assert; wired opt-in via `M3OS_PKU_REGRESSION=1` in AGENTS.md + `.githooks/pre-push`. `cmd_pku_smoke` threads `M3OS_KVM` into the DeviceSet (the default DeviceSet ignores it — a false-pass that was caught and fixed).
+
+> **Track B follow-up (not a phase blocker), surfaced by D.1:** under **KVM + default 4-core SMP**, the fork+fault PKU sequence triggers a `RECURSIVE KERNEL PAGE FAULT on core 2 (cr2=0x0)`. The gate is pinned single-core (precedent: `go-runtime-smoke`/`node-smoke`), which is correct here because the JIT consumer (D.3 node) runs single-core regardless. Independent review's hypothesis: a generic cross-core CoW-resolve (`resolve_cow_fault` + `tlb_shootdown_range_from_fault_context`) vs. concurrent address-space-teardown race exposed by fork-under-SMP — **not** a per-AP PKU-coherence bug (per-AP CR4.PKE/XCR0 + the `xsave_rfbm()` derivation are correct, and a coherence bug would surface as a wrong allow/deny `:FAIL`, not a kernel NULL deref). Tracked as a post-90a follow-up.
 
 ### D.2 — `build_node` JIT variant under a distinct content key
 
