@@ -225,8 +225,12 @@ impl PkeyTable {
         FreeOutcome::Ok
     }
 
-    /// Count of currently-allocated non-default keys (0..=15). Used by the
-    /// `m3ctl mitigations status` "keys in use" reporter (Phase 90a Track C.2).
+    /// Count of currently-allocated non-default keys (0..=15). This is a
+    /// **per-process** value and is intentionally *not* surfaced by
+    /// `m3ctl mitigations status`, whose `MitigationReport` is a boot-wide
+    /// snapshot (per-process key counts have no sensible boot-wide aggregate —
+    /// see Phase 90a Track C.2). Retained as a tested invariant helper for the
+    /// alloc/free unit tests and diagnostics.
     pub const fn keys_in_use(&self) -> u32 {
         // Subtract the always-set default-key bit 0.
         (self.allocated.count_ones()).saturating_sub(1)

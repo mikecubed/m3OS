@@ -11990,11 +11990,11 @@ fn mprotect_worker(
         }
     }
 
-    // For a `Tag(k)` decision, the key field is rewritten on every PTE in the
-    // range; otherwise it is preserved from `old_flags` (Preserve/Default both
-    // leave the existing tag — Default specifically because key 0 is the
-    // already-present field on every untagged PTE). The `set_key`/`new_key`
-    // pair below applies the tag when set.
+    // For a `Tag(k)` decision, the key field is rewritten with `k` on every PTE
+    // in the range. `Preserve` (plain `mprotect`) leaves the field untouched.
+    // `Default` (`pkey_mprotect(pkey=0)`) writes key 0 — clearing the field,
+    // which is a no-op on the common untagged PTE (already 0) but normalises any
+    // stale tag. The `set_key`/`new_key` pair below applies the tag when set.
     let set_key: Option<u8> = match key_decision {
         PkeyMprotectKey::Tag(k) => Some(k),
         // `Default` (pkey==0) means "tag with key 0", i.e. clear the field;

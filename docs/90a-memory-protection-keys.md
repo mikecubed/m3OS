@@ -1,7 +1,7 @@
 # Memory Protection Keys (PKU) and JIT-Capable V8
 
 **Aligned Roadmap Phase:** Phase 90a
-**Status:** In Progress
+**Status:** Complete
 **Source Ref:** phase-90a
 **Supersedes Legacy Doc:** (none — new capability; extends the Phase 75 W^X invariant)
 

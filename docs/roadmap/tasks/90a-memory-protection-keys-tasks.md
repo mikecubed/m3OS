@@ -5,7 +5,7 @@
 **Depends on:** Phase 57e/60 (per-task XSAVE save/restore) ✅, Phase 75 (W^X enforcement + the `wx-violation` gate) ✅, Phase 84 (mitigations policy + `m3ctl mitigations status`) ✅, Phase 86f (signal-frame FPU save/restore) ✅, Phase 89 (Node.js — the jitless baseline + `build_node`) ✅
 **Goal:** Implement x86 Memory Protection Keys end-to-end (CPUID/CR4.PKE, PTE key bits, `pkey_alloc`/`pkey_free`/`pkey_mprotect`, per-task PKRU via XSAVE component 9 incl. signal frames), evolve the Phase 75 W^X invariant to "W^X v2" (unguarded W+X stays rejected; a W+X mapping is permitted only under a non-default protection key whose default PKRU policy denies write), and on that substrate ship a JIT-enabled `build_node` variant (own content key; the Phase 89 jitless artifact stays the default and fallback) proven by `pku-smoke` + `node-jit-smoke` — V8 generates code at runtime and `WebAssembly.instantiate` succeeds, unblocking the Phase 90b Claude Code TUI. Bump the kernel to `0.90.0` and ship the learning doc.
 
-> **Authored ahead of implementation.** Every acceptance item below is intentionally unchecked `[ ]`; it records the planned, measurable result, not a delivered one. (Mirrors the [Phase 89](./89-nodejs-tasks.md) / [Phase 90b](./90b-claude-code-tasks.md) style.)
+> **Landed.** This doc was authored ahead of implementation (Phase 89 / Phase 90b style) with every acceptance box intentionally unchecked `[ ]`; it now records the **delivered, verified** result — every box is `[x]`, validated by the gates (`cargo xtask check`, `cargo xtask smoke-test`, `pku-smoke` + `node-jit-smoke` under KVM, `node-smoke` jitless re-confirmed).
 >
 > **Track A gates everything.** The kernel W^X v2 acceptance rule cannot be written until a host-side scout pins the exact syscall sequence V8 emits when PKU is available (mmap-RWX-then-tag vs. `pkey_mprotect` after RW), and confirms V8 in a **static-musl** build engages PKU at all rather than silently requesting unguarded RWX (which the kernel will rightly reject). Do not start Track B's W^X-touching work until A.1's contract note exists.
 >
@@ -15,11 +15,11 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Host-side scout: V8/PKU ground truth + the kernel contract note | 89 | Planned |
-| B | Kernel PKU substrate (CPUID/CR4.PKE, PTE key bits, `pkey_*` syscalls, PKRU via XSAVE + signal frames) | A | Planned |
-| C | W^X v2 policy + reporting (`sys_mprotect`/`sys_mmap` exception rule, `wx-violation` preservation, `m3ctl`) | A, B | Planned |
-| D | `pku-smoke` kernel gate + the JIT `build_node` variant + `node-jit-smoke` | B, C | Planned |
-| E | Docs + release closeout (learning doc, README rows, AGENTS.md, `0.90.0` bump) | A–D | Planned |
+| A | Host-side scout: V8/PKU ground truth + the kernel contract note | 89 | ✅ Complete |
+| B | Kernel PKU substrate (CPUID/CR4.PKE, PTE key bits, `pkey_*` syscalls, PKRU via XSAVE + signal frames) | A | ✅ Complete |
+| C | W^X v2 policy + reporting (`sys_mprotect`/`sys_mmap` exception rule, `wx-violation` preservation, `m3ctl`) | A, B | ✅ Complete |
+| D | `pku-smoke` kernel gate + the JIT `build_node` variant + `node-jit-smoke` | B, C | ✅ Complete (full matrix under KVM; TCG skip-with-reason) |
+| E | Docs + release closeout (learning doc, README rows, AGENTS.md, `0.90.0` bump) | A–D | ✅ Complete |
 
 ---
 
@@ -155,7 +155,7 @@ mprotect(range, len, PROT_NONE) / munmap(...)                       # decommit /
 **Acceptance:**
 - [x] The v2 rule implements the A.1 contract note verbatim (quoted in the code comment on `wx_decision`), permitting W+X only with a non-default key allocated with write-deny default rights; plain `mprotect`/`mmap` W+X requests still return the Phase 75 rejection.
 - [x] The enforcement-point audit is recorded (see **C.1 implementation note** below; the same audit is the doc comment on `wx_decision`): every syscall/fault path that can produce a W+X PTE is enumerated with where the v2 check sits.
-- [ ] The `wx-violation` gate (`SMOKE:wx-violation:PASS`) passes — the v1 binary's expectations (W+X via `mprotect` → EINVAL) hold on both PKU and no-PKU configurations, and the revision-round-1 arm (`mmap(PROT_READ|PROT_WRITE|PROT_EXEC)` → EINVAL) confirms the mmap(W+X) bypass is closed. *(Plain `mprotect`/`mmap` W+X never satisfies the v2 exception — `mprotect` carries the `Preserve` decision; `mmap` carries no pkey, so it is rejected at mmap entry by the same `wx_decision` rule; coordinator runs the QEMU gate.)*
+- [x] The `wx-violation` gate (`SMOKE:wx-violation:PASS`) passes — the v1 binary's expectations (W+X via `mprotect` → EINVAL) hold on both PKU and no-PKU configurations, and the revision-round-1 arm (`mmap(PROT_READ|PROT_WRITE|PROT_EXEC)` → EINVAL) confirms the mmap(W+X) bypass is closed. *(Plain `mprotect`/`mmap` W+X never satisfies the v2 exception — `mprotect` carries the `Preserve` decision; `mmap` carries no pkey, so it is rejected at mmap entry by an inline W+X check equivalent to the key-0 case of `wx_decision`. Verified green: `cargo xtask smoke-test` step 13 emits `SMOKE:wx-violation:PASS` on the TCG/no-PKU lane — the binary uses zero pkey syscalls so it is bit-identical on PKU — with the PKU lane additionally covered by `pku-smoke` + `node-jit-smoke` under KVM.)*
 
 **C.1 implementation note (recorded 2026-06-13):**
 
