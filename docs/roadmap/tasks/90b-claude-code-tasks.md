@@ -54,7 +54,23 @@ It is a **PKU `PROTECTION_KEY` read fault**: node allocates a write-deny protect
 
 **Result — `claude-smoke` PASSES 24/24 on m3OS (jitless node):** `claude --version` → `2.1.112`, `claude --help` → `Usage: claude`, the vendored static-pie `rg --version` runs (B.2 confirmed on-OS), and the A.2 `NODE_SIGINT_OK`/`NODE_SPAWN_OK`/`NODE_RAWMODE_OK` probes all pass (closing the Phase 89 A.2 deferral). `cargo xtask check` green.
 
-**Scope note:** Phase 90b was planned as "no kernel work," but the integration test surfaced this real W^X-v2 cross-thread PKU gap — exactly what the phase exists to find. The one-branch page-fault-handler fix is documented as a 90a PKU follow-up landed here. The gate now defaults to the **jitless** node (CI-viable, no KVM) with an `M3OS_CLAUDE_JIT=1` toggle for the 90a JIT node (the interactive-TUI variant; KVM/PKU-gated) — under validation next.
+**Scope note:** Phase 90b was planned as "no kernel work," but the integration test surfaced this real W^X-v2 cross-thread PKU gap — exactly what the phase exists to find. The one-branch page-fault-handler fix is documented as a 90a PKU follow-up landed here. The gate defaults to the **jitless** node (CI-viable, no KVM) with an `M3OS_CLAUDE_JIT=1` toggle for the 90a JIT node (the interactive-TUI variant; KVM/PKU-gated).
+
+**Final validation (all coordinator-run, all GREEN):**
+
+| Gate | Result |
+|---|---|
+| `cargo xtask check` (clippy `-D warnings` + rustfmt + host tests incl. `pkey`) | ✅ PASS (every commit, via pre-commit hook) |
+| `cargo xtask port build claude-code` | ✅ seals a 20.2 MB `.m3pkg` |
+| `cargo xtask claude-smoke` (jitless, full install) | ✅ PASS 27/27 (`M3OS_KVM=1`, 116 s) |
+| `cargo xtask claude-smoke` (`M3OS_CLAUDE_JIT=1`, JIT node, full install) | ✅ PASS 27/27 (`M3OS_KVM=1`, 115 s) |
+| `cargo xtask pku-smoke` (PKU substrate regression for the kernel fix) | ✅ PASS 16/16 (full PKU matrix, real KVM) |
+| `cargo xtask node-jit-smoke` (JIT/WASM/PKU regression) | ✅ PASS 20/20 (`NODE_JIT_OK` + `NODE_WASM_OK` + v2-guarded grant) |
+| `cargo xtask smoke-test` (baseline boot+functionality, TCG/standard) | ✅ PASS 25/25 |
+
+> Note: `smoke-test` under `M3OS_KVM=1` (multi-core) hit a pre-existing SMP recursive-kernel-fault race (`cr2=0x8`, core 1) — **not** caused by this phase (the PKU fix is strictly in the ring-3/user-mode fault path + short-circuits on `PROTECTION_KEY`, and the standard-TCG run passes). The claude/pku/node-jit gates all pin `-smp 1` precisely to avoid this known SMP-under-KVM race.
+
+**Outcome: Phase 90b COMPLETE.** Claude Code installs, launches, and runs on m3OS on both node variants; the interactive-TUI runtime is proven on the JIT node; the W^X-v2 cross-thread PKU read-recovery kernel fix is validated and regression-clean. The interactive-TUI *visual* render + the live API/agent arms remain opt-in/manual (credential-gated by design). PR #247 ready for review.
 
 **Status (original):** Planned
 **Source Ref:** phase-90b
