@@ -3906,22 +3906,18 @@ static inline void m3os_wrpkru(uint32_t pkru) {
     __asm__ volatile("wrpkru" : : "a"(pkru), "c"(0), "d"(0));
 }
 
+/* musl's syscall() already returns -1 and sets errno on error (it does NOT return
+ * -errno), so we must NOT write errno ourselves — pass the result straight through. */
 int pkey_alloc(unsigned int flags, unsigned int access_rights) {
-    long r = syscall(SYS_pkey_alloc, (long)flags, (long)access_rights);
-    if (r < 0) { errno = (int)-r; return -1; }
-    return (int)r;
+    return (int)syscall(SYS_pkey_alloc, (long)flags, (long)access_rights);
 }
 
 int pkey_free(int pkey) {
-    long r = syscall(SYS_pkey_free, (long)pkey);
-    if (r < 0) { errno = (int)-r; return -1; }
-    return (int)r;
+    return (int)syscall(SYS_pkey_free, (long)pkey);
 }
 
 int pkey_mprotect(void *addr, size_t len, int prot, int pkey) {
-    long r = syscall(SYS_pkey_mprotect, addr, (long)len, (long)prot, (long)pkey);
-    if (r < 0) { errno = (int)-r; return -1; }
-    return (int)r;
+    return (int)syscall(SYS_pkey_mprotect, addr, (long)len, (long)prot, (long)pkey);
 }
 
 /* Return the access rights (PKEY_DISABLE_ACCESS|PKEY_DISABLE_WRITE) for `pkey`
@@ -3976,8 +3972,11 @@ fn apply_node_jit_patches(src: &Path, shim_rel: &str) -> Result<(), String> {
     // nullptr (`deps/v8/include/v8-platform.h:1068`) and Node's `NodePlatform`
     // never overrides it. Override it to return V8 libplatform's
     // `DefaultThreadIsolatedAllocator` (the same one `v8::platform::
-    // NewDefaultPlatform` wires), so V8's PKU JIT path engages.
+    // NewDefaultPlatform` wires), so V8's PKU JIT path engages. The concrete type is
+    // only reachable inside the `v8_libplatform` TU, so the override delegates to a
+    // free factory injected there by `patch_node_thread_isolated_factory` (below).
     patch_node_platform_allocator(src)?;
+    patch_node_thread_isolated_factory(src)?;
 
     // ── patch 3: KernelHasPkruFix() accepts the m3OS uname release ───────────────
     // A.1 finding 3: `KernelHasPkruFix()` parses `uname()` release and requires
@@ -4013,7 +4012,7 @@ fn patch_node_platform_allocator(src: &Path) -> Result<(), String> {
         }
         let inject = format!(
             "{anchor}\n  // {SENTINEL}\n  \
-             v8::PageAllocator* GetThreadIsolatedAllocator() override;"
+             v8::ThreadIsolatedAllocator* GetThreadIsolatedAllocator() override;"
         );
         let patched = hdr_text.replacen(anchor, &inject, 1);
         fs::write(&hdr, patched).map_err(|e| format!("node-jit: write {}: {e}", hdr.display()))?;
@@ -4040,17 +4039,33 @@ fn patch_node_platform_allocator(src: &Path) -> Result<(), String> {
         // `}`. Inject after that closing brace by replacing the anchor's full method.
         let full = "int NodePlatform::NumberOfWorkerThreads() {\n  \
                     return worker_thread_task_runner_->NumberOfWorkerThreads();\n}";
+        // The thread-isolated allocator's concrete type
+        // (`v8::platform::DefaultThreadIsolatedAllocator`) lives in the V8-internal
+        // header `src/libplatform/default-thread-isolated-allocator.h`, whose own
+        // includes (`include/...`, `src/base/...`) require the V8 root on the include
+        // path. node_lib compiles node_platform.cc with only `deps/v8/include` (the
+        // `v8_libplatform` dependent-settings export), NOT the V8 root — so that header
+        // is unreachable here and #including it does not compile. Instead delegate to a
+        // free factory we inject into `default-thread-isolated-allocator.cc` (which IS
+        // compiled in `v8_libplatform` with the V8 root and the complete type) and
+        // forward-declare it here. Only the *pointer* type `v8::ThreadIsolatedAllocator`
+        // is named in node_platform.cc, and it is already visible via the existing
+        // `libplatform/libplatform.h` -> `v8-platform.h` include chain (declared at
+        // v8-platform.h:622).
         let injected_def = format!(
             "{full}\n\n\
              // {SENTINEL}\n\
              // A.1 finding 2: NodePlatform must provide the thread-isolated (PKU)\n\
              // allocator V8's ThreadIsolation::Initialize() requires; the v8::Platform\n\
-             // default returns nullptr. Return libplatform's default — the same one\n\
-             // v8::platform::NewDefaultPlatform installs.\n\
-             v8::PageAllocator* NodePlatform::GetThreadIsolatedAllocator() {{\n  \
-             static std::unique_ptr<v8::PageAllocator> allocator =\n      \
-             v8::platform::NewDefaultThreadIsolatedAllocator();\n  \
-             return allocator.get();\n}}"
+             // default returns nullptr. Delegate to libplatform's default allocator —\n\
+             // the same instance v8::platform::DefaultPlatform::GetThreadIsolatedAllocator\n\
+             // returns — via a free factory injected into V8's\n\
+             // default-thread-isolated-allocator.cc (which can see the concrete type).\n\
+             namespace v8 {{ namespace platform {{\n\
+             v8::ThreadIsolatedAllocator* M3osDefaultThreadIsolatedAllocator();\n\
+             }} }}  // namespace v8::platform\n\
+             v8::ThreadIsolatedAllocator* NodePlatform::GetThreadIsolatedAllocator() {{\n  \
+             return v8::platform::M3osDefaultThreadIsolatedAllocator();\n}}"
         );
         let patched = if cc_text.contains(full) {
             cc_text.replacen(full, &injected_def, 1)
@@ -4060,11 +4075,13 @@ fn patch_node_platform_allocator(src: &Path) -> Result<(), String> {
             format!(
                 "{cc_text}\n\
                  // {SENTINEL} (appended; in-place method body differed)\n\
+                 namespace v8 {{ namespace platform {{\n\
+                 v8::ThreadIsolatedAllocator* M3osDefaultThreadIsolatedAllocator();\n\
+                 }} }}  // namespace v8::platform\n\
                  namespace node {{\n\
-                 v8::PageAllocator* NodePlatform::GetThreadIsolatedAllocator() {{\n  \
-                 static std::unique_ptr<v8::PageAllocator> allocator =\n      \
-                 v8::platform::NewDefaultThreadIsolatedAllocator();\n  \
-                 return allocator.get();\n}}\n}}  // namespace node\n"
+                 v8::ThreadIsolatedAllocator* NodePlatform::GetThreadIsolatedAllocator() {{\n  \
+                 return v8::platform::M3osDefaultThreadIsolatedAllocator();\n}}\n\
+                 }}  // namespace node\n"
             )
         };
         fs::write(&cc, patched).map_err(|e| format!("node-jit: write {}: {e}", cc.display()))?;
@@ -4108,6 +4125,59 @@ fn patch_kernel_has_pkru_fix(src: &Path) -> Result<(), String> {
     let patched = text.replacen(anchor, &inject, 1);
     fs::write(&f, patched).map_err(|e| format!("node-jit: write {}: {e}", f.display()))?;
     println!("node-jit: patched {} (KernelHasPkruFix)", f.display());
+    Ok(())
+}
+
+/// Patch `deps/v8/src/libplatform/default-thread-isolated-allocator.cc` to add the
+/// free factory `v8::platform::M3osDefaultThreadIsolatedAllocator()` that the
+/// patched `NodePlatform::GetThreadIsolatedAllocator()` delegates to (A.1 finding
+/// 2). This TU is compiled in the `v8_libplatform` target — the one place with the
+/// V8 root on its include path AND the complete `DefaultThreadIsolatedAllocator`
+/// type — so it can construct the allocator; node_platform.cc cannot (it only sees
+/// `deps/v8/include`). The body mirrors `DefaultPlatform::GetThreadIsolatedAllocator`
+/// (default-platform.cc:285) exactly: a function-local static allocator, returned
+/// only when `Valid()`. Idempotent via a sentinel; fails if the namespace-close
+/// anchor is absent.
+fn patch_node_thread_isolated_factory(src: &Path) -> Result<(), String> {
+    const SENTINEL: &str = "m3os-pku-jit: M3osDefaultThreadIsolatedAllocator factory";
+    let f = src.join("deps/v8/src/libplatform/default-thread-isolated-allocator.cc");
+    let text =
+        fs::read_to_string(&f).map_err(|e| format!("node-jit: read {}: {e}", f.display()))?;
+    if text.contains(SENTINEL) {
+        return Ok(());
+    }
+    // Inject the factory just before the close of the `v8::platform` namespace, so it
+    // sees `DefaultThreadIsolatedAllocator` (defined just above) and is itself in
+    // `v8::platform`. Anchor on that namespace-close marker.
+    let anchor = "}  // namespace v8::platform";
+    if !text.contains(anchor) {
+        return Err(format!(
+            "node-jit: anchor `{anchor}` not found in {} — V8 layout drifted; update \
+             patch_node_thread_isolated_factory (A.1 finding 2)",
+            f.display()
+        ));
+    }
+    // Mirror DefaultPlatform::GetThreadIsolatedAllocator() (default-platform.cc:285):
+    // a function-local static avoids touching any class layout, and `.Valid()` gates
+    // the non-PKU build to nullptr (the `&alloc` is a `ThreadIsolatedAllocator*` since
+    // DefaultThreadIsolatedAllocator publicly derives ThreadIsolatedAllocator).
+    let inject = format!(
+        "// {SENTINEL}\n\
+         // A.1 finding 2: free factory the patched NodePlatform::\n\
+         // GetThreadIsolatedAllocator() delegates to. Mirrors\n\
+         // DefaultPlatform::GetThreadIsolatedAllocator (default-platform.cc:285).\n\
+         v8::ThreadIsolatedAllocator* M3osDefaultThreadIsolatedAllocator() {{\n  \
+         static DefaultThreadIsolatedAllocator alloc;\n  \
+         return alloc.Valid() ? &alloc : nullptr;\n\
+         }}\n\n\
+         {anchor}"
+    );
+    let patched = text.replacen(anchor, &inject, 1);
+    fs::write(&f, patched).map_err(|e| format!("node-jit: write {}: {e}", f.display()))?;
+    println!(
+        "node-jit: patched {} (thread-isolated allocator factory)",
+        f.display()
+    );
     Ok(())
 }
 
