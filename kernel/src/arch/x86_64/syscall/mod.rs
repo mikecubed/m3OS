@@ -11170,6 +11170,20 @@ pub(super) fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
     const PROT_MASK: u64 = 0x7; // PROT_READ | PROT_WRITE | PROT_EXEC
     let prot = prot & PROT_MASK;
 
+    // W^X enforcement (C.1 contract clause 1): `mmap` carries no pkey argument
+    // (there is no `pkey_mmap` — the JIT/V8 contract is mmap-then-pkey_mprotect,
+    // never mmap-W+X), so a plain mmap is the key-0 / non-`Tag` case of the
+    // canonical `wx_decision` rule, which rejects W+X. Reject here BEFORE any
+    // file-backed dispatch, MAP_FIXED handling, or VMA recording, so a W+X prot
+    // can never demand-fault into a live unguarded W+X PTE tagged key 0. Return
+    // the identical errno `sys_mprotect`/`mprotect_worker` returns for W+X
+    // (`NEG_EINVAL`, -22). Covers anon/file/hint/MAP_FIXED uniformly.
+    const PROT_WRITE: u64 = 0x2;
+    const PROT_EXEC: u64 = 0x4;
+    if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
+        return NEG_EINVAL;
+    }
+
     if flags & MAP_ANONYMOUS == 0 {
         // File-backed mmap — Strategy A (eager loading).
         let fd = per_core_syscall_user_r8() as usize;
@@ -11330,6 +11344,21 @@ fn sys_mmap_file_backed(
         return NEG_EINVAL;
     }
 
+    const PROT_WRITE: u64 = 0x2;
+    const PROT_EXEC: u64 = 0x4;
+
+    // W^X enforcement (C.1 contract clause 1): a file-backed `mmap` carries no
+    // pkey argument, so it is the key-0 / non-`Tag` case of the canonical
+    // `wx_decision` rule, which rejects W+X. This path maps eagerly, so a W+X
+    // prot would compose a live unguarded W+X PTE tagged key 0 below. Reject
+    // here BEFORE any allocation or mapping, with the identical errno
+    // `sys_mprotect`/`mprotect_worker` returns for W+X (`NEG_EINVAL`, -22).
+    // (`sys_linux_mmap` also rejects this before dispatch; this is the in-function
+    // guard for the contract's named entry point.)
+    if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
+        return NEG_EINVAL;
+    }
+
     let pages = len.div_ceil(4096);
     let total_size = match pages.checked_mul(4096) {
         Some(s) => s,
@@ -11340,9 +11369,6 @@ fn sys_mmap_file_backed(
     }
 
     use x86_64::structures::paging::{PageTableFlags, PhysFrame, Size4KiB};
-
-    const PROT_WRITE: u64 = 0x2;
-    const PROT_EXEC: u64 = 0x4;
 
     let mut pt_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
     if prot & PROT_WRITE != 0 {
@@ -11789,26 +11815,116 @@ pub(super) fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
 // regions. Updates PTEs in-place and splits VMAs at mprotect boundaries.
 // ---------------------------------------------------------------------------
 
+/// The outcome of the single W^X enforcement decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WxDecision {
+    /// Not a W+X request (or a non-W+X request that needs no W^X gating). The
+    /// request proceeds unchanged.
+    NotWx,
+    /// A W+X request that must be rejected with `EINVAL` — Phase 75 v1 behavior,
+    /// preserved exactly.
+    Rejected,
+    /// A W+X request that is the documented pkey-guarded "W^X v2" exception:
+    /// permitted under the carried non-default write-deny key. Carries the key
+    /// for the one-per-grant positive log line.
+    GuardedV2 { pkey: u8 },
+}
+
 /// The W^X enforcement decision, shared by `sys_mprotect` and
-/// `sys_pkey_mprotect` (Phase 90a Track B.3). **This is the single point at
-/// which the kernel decides whether a W+X mapping is permitted** — Track C.1
-/// will carve the documented pkey-guarded "W^X v2" exception *here*, in one
-/// place, so the invariant is enforced identically on every path that can
-/// produce a W+X PTE.
+/// `sys_pkey_mprotect`. **This is the single point at which the kernel decides
+/// whether a W+X mapping is permitted** — the invariant is enforced identically
+/// on every path that can produce a W+X PTE (the audit below enumerates them).
 ///
-/// Today (B.3) the rule is exactly Phase 75: any request asking for both
-/// `PROT_WRITE` and `PROT_EXEC` is rejected, regardless of the protection key.
-/// `pkey_mprotect(RWX, key)` is therefore still rejected in this build — C.1
-/// adds the exception (a non-default key whose alloc-time `init_access_rights`
-/// deny write makes a guarded W+X mapping legal). Returns `true` if the request
-/// must be rejected with `EINVAL`.
-fn wx_request_rejected(prot: u64, _pkey: kernel_core::pkey::PkeyMprotectKey) -> bool {
+/// Phase 90a Track C.1 implements the A.1 W^X v2 contract VERBATIM
+/// (`docs/roadmap/tasks/90a-memory-protection-keys-tasks.md`):
+///
+/// > 1. `sys_mmap` with `PROT_WRITE|PROT_EXEC` → rejected, unchanged from Phase 75.
+/// > 2. `sys_mprotect` with `PROT_WRITE|PROT_EXEC` → rejected, unchanged from Phase 75.
+/// > 3. `sys_pkey_mprotect(addr, len, prot, pkey)`:
+/// >    a. with `pkey == 0` (or `pkey == -1`, the untag-Linux-alias) it behaves
+/// >       exactly like `sys_mprotect` — W+X rejected;
+/// >    b. with a non-default `pkey` that is **allocated** and whose **alloc-time
+/// >       `init_access_rights` include `PKEY_DISABLE_WRITE` or
+/// >       `PKEY_DISABLE_ACCESS`**, and PKU active (CR4.PKE set),
+/// >       `PROT_READ|PROT_WRITE|PROT_EXEC` is **permitted** and the range's PTEs
+/// >       are tagged with the key; the kernel logs one positive
+/// >       `[wx] v2-guarded W+X mapping (pkey=N)` line per grant;
+/// >    c. any other W+X request through `sys_pkey_mprotect` (unallocated key,
+/// >       key allocated with permissive init rights, PKU absent) → rejected with
+/// >       the same errno as (1)/(2).
+/// > 4. No other syscall or fault path may produce a W+X PTE; the C.1
+/// >    enforcement-point audit enumerates them.
+///
+/// # Enforcement-point audit (C.1) — every path that can produce a W+X PTE
+///
+/// A W+X *PTE* requires both `WRITABLE` set and `NO_EXECUTE` clear in a live
+/// user PTE. Every such composition is gated, and all but the v2 exception
+/// reject:
+///
+/// - **`sys_mprotect`** — routes through `mprotect_worker` with a `Preserve`
+///   decision → this guard returns `Rejected` for W+X (clause 2). v1 unchanged.
+/// - **`sys_pkey_mprotect`** — routes through `mprotect_worker` with the
+///   classified key decision → this guard (clauses 3.a/3.b/3.c). The *only*
+///   `GuardedV2` producer.
+/// - **`sys_mmap` (anon + file-backed)** — `mmap` carries no pkey argument
+///   (there is no `pkey_mmap`; V8's contract is mmap-then-`pkey_mprotect`,
+///   never mmap-W+X), so it can only express the unguarded (key-0) case. A W+X
+///   *prot* there would otherwise demand-fault / eager-map into a LIVE W+X PTE
+///   tagged key 0 that never touches the v2 guard, so **both `sys_linux_mmap`
+///   (anon) and `sys_mmap_file_backed` reject W+X at mmap entry** (contract
+///   clause 1) with the **same errno as `mprotect`** (`NEG_EINVAL`, -22). This
+///   is the key-0 / non-`Tag` case of the canonical `wx_decision` rule applied
+///   eagerly at the mmap entry point: a plain `mmap` is the `Preserve`/`Default`
+///   decision, which `wx_decision` classifies as `Rejected` for W+X. The VMA is
+///   still recorded with `PKEY_DEFAULT` for the accepted (non-W+X) cases, and
+///   the only route to an executable+writable page is a subsequent guarded
+///   `mprotect`/`pkey_mprotect` — back through `mprotect_worker`'s single gate.
+/// - **Demand-fault PTE composition** (`compose_user_pte_flags`) — composes from
+///   the VMA's `prot` + `pkey`. The VMA only carries a non-default `pkey` after a
+///   `pkey_mprotect(.., Tag(k))` that *this guard already permitted* (clause
+///   3.b); a `pkey_mprotect` that this guard rejected never tags the VMA, so a
+///   later fault cannot resurrect a W+X mapping the guard refused.
+/// - **ELF segment load / file-backed eager mmap** — compose key 0 only
+///   (`mm/pkey.rs` audit rows). Key 0 is never write-deny (`rights(0) == None`,
+///   `denies_write(0) == false`), so even if such a path requested W+X it would
+///   fall to `Rejected` here — they have no way to express a v2 key.
+/// - **CoW fork copy / CoW fault resolution** — carry the parent PTE's whole
+///   flag word (key field included) and only toggle `WRITABLE`/`BIT_9`; they
+///   never *introduce* a new W+X combination. A CoW page that was R-X stays
+///   non-writable; a writable page stays non-executable.
+///
+/// So a W+X PTE can only be *introduced* through `mprotect_worker` (called by
+/// both `sys_mprotect` and `sys_pkey_mprotect`), gated by `wx_decision`; the
+/// `mmap` entry points reject W+X up front with the same `wx_decision` rule and
+/// the same errno, so no `mmap` path can install an unguarded W+X PTE either.
+/// Returns the [`WxDecision`].
+fn wx_decision(
+    prot: u64,
+    key_decision: kernel_core::pkey::PkeyMprotectKey,
+    table: &kernel_core::pkey::PkeyTable,
+) -> WxDecision {
+    use kernel_core::pkey::PkeyMprotectKey;
     const PROT_WRITE: u64 = 0x2;
     const PROT_EXEC: u64 = 0x4;
-    // C.1 amends THIS expression to permit W+X under a write-deny key. Until
-    // then the `_pkey` decision is intentionally ignored — W+X is rejected
-    // exactly as Phase 75 shipped it, including via `pkey_mprotect`.
-    prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0
+
+    // Only W+X requests are gated; everything else proceeds untouched.
+    if prot & PROT_WRITE == 0 || prot & PROT_EXEC == 0 {
+        return WxDecision::NotWx;
+    }
+
+    // The pkey-guarded v2 exception — the pure decision lives in host-tested
+    // `kernel_core::pkey::wx_v2_permits` so the accept/reject matrix is unit
+    // tested. PKU must be *active* on this CPU (CR4.PKE + the XSAVE component) —
+    // the same `pku_usable()` predicate every other PKU path consults.
+    let pku_active = crate::arch::x86_64::cpuid::pku_usable();
+    if kernel_core::pkey::wx_v2_permits(table, key_decision, pku_active) {
+        // `wx_v2_permits` only returns true for a `Tag(k)` decision, so this
+        // extraction always succeeds; default to Rejected defensively otherwise.
+        if let PkeyMprotectKey::Tag(pkey) = key_decision {
+            return WxDecision::GuardedV2 { pkey };
+        }
+    }
+    WxDecision::Rejected
 }
 
 pub(super) fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
@@ -11852,13 +11968,26 @@ fn mprotect_worker(
     const PROT_EXEC: u64 = 0x4;
 
     // Phase 75 / 90a W^X enforcement — the single shared guard point (see
-    // `wx_request_rejected`). It runs before page-alignment validation, the VMA
-    // walk, and any PTE mutation so that no partial state is left behind on
-    // rejection. The supported JIT pattern is documented in
+    // `wx_decision`). It runs before page-alignment validation, the VMA walk,
+    // and any PTE mutation so that no partial state is left behind on rejection.
+    // The supported JIT pattern is documented in
     // `docs/appendix/architecture-and-syscalls.md` (allocate RW-, write machine
-    // code, then `mprotect` to R-X); the pkey-guarded W+X exception is Track C.1.
-    if wx_request_rejected(prot, key_decision) {
-        return NEG_EINVAL;
+    // code, then `mprotect` to R-X); the pkey-guarded W+X v2 exception (Track
+    // C.1) is the only path that permits W+X, and only under a non-default
+    // write-deny key with PKU active.
+    let pid = crate::process::current_pid();
+    // The classification already consulted this process's PkeyTable; re-snapshot
+    // it for the W^X v2 rights check (`denies_write`). A snapshot is sufficient —
+    // a single-threaded syscall cannot race its own table.
+    let pkey_table = crate::process::shared_pkey_table(pid).unwrap_or_default();
+    match wx_decision(prot, key_decision, &pkey_table) {
+        WxDecision::NotWx => {}
+        WxDecision::Rejected => return NEG_EINVAL,
+        WxDecision::GuardedV2 { pkey } => {
+            // Exactly one positive line per granted W+X mapping. The D.3 gate
+            // greps for this; the v1-rejection error line must be ABSENT here.
+            log::info!("[wx] v2-guarded W+X mapping (pkey={})", pkey);
+        }
     }
 
     // For a `Tag(k)` decision, the key field is rewritten on every PTE in the
@@ -11905,7 +12034,7 @@ fn mprotect_worker(
 
     let (cr3_frame, _) = Cr3::read();
     let pml4_phys = cr3_frame.start_address().as_u64();
-    let pid = crate::process::current_pid();
+    // `pid` is bound above at the W^X guard.
     let addr_space = {
         let table = crate::process::PROCESS_TABLE.lock();
         table.find(pid).and_then(|p| p.addr_space.as_ref().cloned())
@@ -12157,8 +12286,10 @@ pub(super) fn sys_pkey_free(pkey: u64) -> u64 {
 ///   `mprotect`; the existing key field is preserved;
 /// - `pkey == 0` → tag with the default key (clears the field);
 /// - a non-default key must be **allocated** in this process, else `EINVAL`;
-/// - W+X is rejected via the same single guard point as `mprotect`
-///   (`wx_request_rejected`); the pkey-guarded W^X v2 exception is Track C.1.
+/// - W+X goes through the same single guard point as `mprotect` ([`wx_decision`]):
+///   rejected unless this is the Track C.1 pkey-guarded W^X v2 exception (a
+///   non-default, allocated, write-deny key with PKU active), in which case it
+///   is permitted and the range's PTEs are tagged with the key.
 pub(super) fn sys_pkey_mprotect(addr: u64, len: u64, prot: u64, pkey: u64) -> u64 {
     use kernel_core::pkey::{PkeyMprotectKey, classify_pkey_mprotect};
 

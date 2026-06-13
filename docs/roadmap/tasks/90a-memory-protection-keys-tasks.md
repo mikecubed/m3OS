@@ -153,9 +153,26 @@ mprotect(range, len, PROT_NONE) / munmap(...)                       # decommit /
 **Why it matters:** this is the phase's core security decision made code: unguarded W+X stays rejected exactly as Phase 75 shipped it, and the only path to a W+X mapping is the A.1-pinned V8 contract under a non-default key whose default rights deny write. The rule must be enforced at *every* point a W+X mapping could arise (mmap, mprotect, pkey_mprotect, remap), or the invariant is theater.
 
 **Acceptance:**
-- [ ] The v2 rule implements the A.1 contract note verbatim (quoted in the code comment), permitting W+X only with a non-default key allocated with write-deny default rights; plain `mprotect`/`mmap` W+X requests still return the Phase 75 rejection.
-- [ ] The enforcement-point audit is recorded: every syscall/fault path that can produce a W+X PTE is enumerated with where the v2 check sits.
-- [ ] The existing `wx-violation` gate (`SMOKE:wx-violation:PASS`) passes **unchanged** — the v1 binary's expectations (W+X → EINVAL) hold on both PKU and no-PKU configurations.
+- [x] The v2 rule implements the A.1 contract note verbatim (quoted in the code comment on `wx_decision`), permitting W+X only with a non-default key allocated with write-deny default rights; plain `mprotect`/`mmap` W+X requests still return the Phase 75 rejection.
+- [x] The enforcement-point audit is recorded (see **C.1 implementation note** below; the same audit is the doc comment on `wx_decision`): every syscall/fault path that can produce a W+X PTE is enumerated with where the v2 check sits.
+- [ ] The `wx-violation` gate (`SMOKE:wx-violation:PASS`) passes — the v1 binary's expectations (W+X via `mprotect` → EINVAL) hold on both PKU and no-PKU configurations, and the revision-round-1 arm (`mmap(PROT_READ|PROT_WRITE|PROT_EXEC)` → EINVAL) confirms the mmap(W+X) bypass is closed. *(Plain `mprotect`/`mmap` W+X never satisfies the v2 exception — `mprotect` carries the `Preserve` decision; `mmap` carries no pkey, so it is rejected at mmap entry by the same `wx_decision` rule; coordinator runs the QEMU gate.)*
+
+**C.1 implementation note (recorded 2026-06-13):**
+
+The W^X v2 rule is the single decision point `wx_decision(prot, key_decision, table)` in `kernel/src/arch/x86_64/syscall/mod.rs`, called once from `mprotect_worker` (the shared body of both `sys_mprotect` and `sys_pkey_mprotect`) before any page-alignment validation, VMA walk, or PTE mutation. The pure accept/reject predicate is `kernel_core::pkey::wx_v2_permits(table, key_decision, pku_active)` (host-tested — `wx_v2_*` tests in `kernel-core/src/pkey.rs`). It permits a W+X request iff **all** of: the request is a `pkey_mprotect` with a non-default, currently-allocated key (`PkeyMprotectKey::Tag(k)`); the key's alloc-time `init_access_rights` deny write (`PkeyTable::denies_write` — `PKEY_DISABLE_WRITE` or `PKEY_DISABLE_ACCESS`); and `pku_usable()` is true (CR4.PKE + XSAVE component 9 live). On a grant it logs exactly one `[wx] v2-guarded W+X mapping (pkey=N)` line; the v1 rejection path returns `NEG_EINVAL` (Phase 75 errno) with no log.
+
+**Enforcement-point audit — every path that can introduce a W+X PTE, and where it is gated:**
+
+| Path | Composes W+X from | Gate |
+|---|---|---|
+| `sys_mprotect` | `mprotect_worker(Preserve)` | `wx_decision` → `Rejected` for W+X (clause 2). `Preserve` never reaches `Tag`, so v1 unchanged. |
+| `sys_pkey_mprotect` | `mprotect_worker(classified key)` | `wx_decision` (clauses 3.a/3.b/3.c). The **only** `GuardedV2` producer. |
+| `sys_mmap` (anon + file-backed) | VMA recorded with `PKEY_DEFAULT`; PTEs composed key-0 | **W+X rejected at mmap entry (contract clause 1), same errno as `mprotect` (`NEG_EINVAL`, -22)** — `mmap` carries no pkey argument, so it is the key-0 / non-`Tag` case of the `wx_decision` rule, applied eagerly in both `sys_linux_mmap` (anon, before file-backed dispatch / MAP_FIXED / VMA recording) and `sys_mmap_file_backed` (before any allocation/mapping). Without this, a W+X prot would demand-fault / eager-map into a LIVE unguarded W+X PTE tagged key 0 that never touches the guard. `mmap` cannot express a v2 grant; accepted (non-W+X) ranges still record `PKEY_DEFAULT`. |
+| Demand-fault PTE composition (`compose_user_pte_flags`) | VMA `prot` + VMA `pkey` | A VMA only carries a non-default `pkey` after a `pkey_mprotect(Tag(k))` that `wx_decision` **already permitted**; a rejected `pkey_mprotect` never tags the VMA, so a fault cannot resurrect a refused W+X mapping. |
+| ELF segment load / eager file-backed mmap | `p_flags`/`prot`, key 0 only (`mm/pkey.rs` audit rows) | Key 0 is never write-deny (`denies_write(0) == false`), so even a W+X request there falls to `Rejected`. No way to express a v2 key. |
+| CoW fork copy / CoW fault resolution | parent PTE's whole flag word | Carries the key field verbatim and only toggles `WRITABLE`/`BIT_9`; never *introduces* a new W+X combination (an R-X page stays non-writable; a writable page stays non-executable). |
+
+So a W+X PTE can only be *introduced* through `mprotect_worker` (gated by `wx_decision`); the `mmap` entry points reject W+X up front with the same `wx_decision` rule and the same errno (`NEG_EINVAL`, -22), so no `mmap` path can install an unguarded W+X PTE either. The eager paths compose key 0 exclusively and therefore cannot smuggle a write-deny key past the guard. *(Revision round 1: the original audit incorrectly claimed `mmap` "cannot smuggle a v2 grant so it's fine" and left the W+X-at-mmap-entry reject unimplemented — a latent Phase 75 hole, since the `wx-violation` gate only ever did `mmap(RW)` then `mprotect(WX)`. Closed by rejecting W+X at both mmap entry points + a new `mmap(W+X)` arm in `userspace/wx-violation/src/main.rs`.)*
 
 ### C.2 — `m3ctl mitigations status` reports W^X v2 + PKU state
 

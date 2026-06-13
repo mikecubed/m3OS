@@ -310,6 +310,66 @@ pub fn classify_pkey_mprotect(table: &PkeyTable, pkey: u64) -> PkeyMprotectKey {
     }
 }
 
+// ---------------------------------------------------------------------------
+// W^X v2 decision (Phase 90a Track C.1) — host-tested pure logic.
+//
+// This is the phase's core security decision factored out of the kernel so it
+// is unit-testable on the host. The kernel's single W^X enforcement point
+// (`wx_request_rejected` → `mprotect_worker` in
+// `kernel/src/arch/x86_64/syscall/mod.rs`) calls this to decide whether a W+X
+// request is the one documented exception or must be rejected exactly as
+// Phase 75 shipped it.
+//
+// The rule it implements VERBATIM (from the Phase 90a A.1 Findings,
+// `docs/roadmap/tasks/90a-memory-protection-keys-tasks.md`):
+//
+//   1. `sys_mmap` with PROT_WRITE|PROT_EXEC          → rejected (unchanged from Phase 75).
+//   2. `sys_mprotect` with PROT_WRITE|PROT_EXEC      → rejected (unchanged from Phase 75).
+//   3. `sys_pkey_mprotect(addr, len, prot, pkey)`:
+//      a. pkey == 0 (or pkey == -1, the preserve alias) → behaves like mprotect; W+X rejected.
+//      b. a non-default pkey that is ALLOCATED and whose alloc-time
+//         init_access_rights include PKEY_DISABLE_WRITE or PKEY_DISABLE_ACCESS,
+//         AND PKU active (CR4.PKE / pku_usable())  → W+X PERMITTED; the range's
+//         PTEs are tagged with the key.
+//      c. any other W+X via pkey_mprotect (unallocated key, key allocated with
+//         permissive rights, PKU absent)             → rejected, same errno as (1)/(2).
+//   4. No other syscall or fault path may produce a W+X PTE.
+// ---------------------------------------------------------------------------
+
+/// Decide whether a **W+X** request is the documented pkey-guarded W^X v2
+/// exception (permitted) or must be rejected exactly as Phase 75 shipped it.
+///
+/// This is consulted **only** when the request actually asks for both
+/// `PROT_WRITE` and `PROT_EXEC` — for any non-W+X request the kernel never
+/// reaches here (nothing to gate). Returns `true` iff *all* of the following
+/// hold (rule clause 3.b above), and `false` (⇒ reject) otherwise:
+///
+/// - the request came through `sys_pkey_mprotect` with a **non-default**,
+///   currently-**allocated** key — i.e. a [`PkeyMprotectKey::Tag`] decision
+///   (clauses 1, 2, 3.a — `sys_mmap`/`sys_mprotect`/`pkey==0`/`pkey==-1` —
+///   never produce `Tag`, so they fall straight through to reject);
+/// - that key's **alloc-time** `init_access_rights` deny write
+///   ([`PkeyTable::denies_write`]: `PKEY_DISABLE_WRITE` or `PKEY_DISABLE_ACCESS`);
+/// - **PKU is active** on this CPU (`pku_active`, the kernel's `pku_usable()` —
+///   CR4.PKE set + the XSAVE PKRU component live). A write-deny key is meaningless
+///   without the hardware to enforce it, so absent PKU the exception is refused
+///   and the request is rejected like plain `mprotect`.
+///
+/// `key_decision` is the already-classified outcome from
+/// [`classify_pkey_mprotect`]; `table` is the calling process's [`PkeyTable`]
+/// (the same one used to classify), consulted here for the key's stored rights.
+pub fn wx_v2_permits(table: &PkeyTable, key_decision: PkeyMprotectKey, pku_active: bool) -> bool {
+    match key_decision {
+        // The only path to a guarded W+X mapping: a non-default, allocated key.
+        // Clauses 1/2/3.a (mmap, plain mprotect, pkey==0 → Default, pkey==-1 →
+        // Preserve) never reach `Tag`, so they are not permitted here.
+        PkeyMprotectKey::Tag(key) => pku_active && table.denies_write(key),
+        // Preserve (plain mprotect / pkey==-1), Default (pkey==0), and the
+        // defensive Invalid arm are all rejected — exactly Phase 75.
+        PkeyMprotectKey::Preserve | PkeyMprotectKey::Default | PkeyMprotectKey::Invalid => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,5 +669,109 @@ mod tests {
             classify_pkey_mprotect(&t, k as u64),
             PkeyMprotectKey::Invalid
         );
+    }
+
+    // -- W^X v2 accept/reject matrix (Track C.1) -----------------------------
+    //
+    // The single decision the kernel's W^X enforcement point makes for a W+X
+    // request. The full A.1 contract: permitted iff (pkey_mprotect path) ∧
+    // (non-default allocated key) ∧ (write-deny init rights) ∧ (PKU active).
+
+    /// Helper: build a table with one allocated key carrying `rights`, returning
+    /// the table and the key.
+    fn table_with_key(rights: u32) -> (PkeyTable, u8) {
+        let mut t = PkeyTable::new();
+        let AllocOutcome::Ok(k) = t.alloc(0, rights) else {
+            panic!("alloc failed")
+        };
+        (t, k)
+    }
+
+    #[test]
+    fn wx_v2_permits_write_deny_key_with_pku() {
+        // Clause 3.b — the ONE permitted W+X path: pkey_mprotect with a
+        // non-default allocated write-deny key and PKU active.
+        let (t, k) = table_with_key(PKEY_DISABLE_WRITE);
+        assert!(
+            wx_v2_permits(&t, PkeyMprotectKey::Tag(k), true),
+            "PKEY_DISABLE_WRITE key + PKU must permit the guarded W+X mapping"
+        );
+        // PKEY_DISABLE_ACCESS (deny-all) implies deny-write → also permitted.
+        let (t2, k2) = table_with_key(PKEY_DISABLE_ACCESS);
+        assert!(
+            wx_v2_permits(&t2, PkeyMprotectKey::Tag(k2), true),
+            "deny-all key implies deny-write → permitted"
+        );
+    }
+
+    #[test]
+    fn wx_v2_rejects_permissive_key() {
+        // Clause 3.c — a non-default allocated key whose init rights are
+        // permissive (do NOT deny write) must be rejected even with PKU active:
+        // an unguarded W+X page would result.
+        let (t, k) = table_with_key(0);
+        assert!(
+            !wx_v2_permits(&t, PkeyMprotectKey::Tag(k), true),
+            "a permissive (non-write-deny) key must NOT permit W+X"
+        );
+    }
+
+    #[test]
+    fn wx_v2_rejects_pku_absent() {
+        // Clause 3.c — even a write-deny key is rejected when PKU is not active
+        // on this CPU; without the hardware the key cannot be enforced.
+        let (t, k) = table_with_key(PKEY_DISABLE_WRITE);
+        assert!(
+            !wx_v2_permits(&t, PkeyMprotectKey::Tag(k), false),
+            "PKU absent → the exception is refused, W+X rejected"
+        );
+    }
+
+    #[test]
+    fn wx_v2_rejects_plain_mprotect() {
+        // Clauses 1/2/3.a — plain mprotect (Preserve) and pkey_mprotect(_, 0)
+        // (Default) never reach a Tag decision, so W+X is rejected exactly as
+        // Phase 75, regardless of PKU. (The table is irrelevant for these arms.)
+        let t = PkeyTable::new();
+        assert!(
+            !wx_v2_permits(&t, PkeyMprotectKey::Preserve, true),
+            "plain mprotect (pkey==-1) W+X must stay rejected"
+        );
+        assert!(
+            !wx_v2_permits(&t, PkeyMprotectKey::Default, true),
+            "pkey_mprotect(_, 0) W+X must stay rejected"
+        );
+        // Defensive: the Invalid arm (caller pre-rejects) is also never permitted.
+        assert!(!wx_v2_permits(&t, PkeyMprotectKey::Invalid, true));
+    }
+
+    #[test]
+    fn wx_v2_full_matrix() {
+        // Exhaustive truth table over (decision × pku) for a write-deny and a
+        // permissive key. Only (Tag(write-deny), pku=true) is permitted.
+        let (deny_t, deny_k) = table_with_key(PKEY_DISABLE_WRITE);
+        let (perm_t, perm_k) = table_with_key(0);
+        let base = PkeyTable::new();
+
+        // (decision, table, pku, expected_permit)
+        let cases: &[(PkeyMprotectKey, &PkeyTable, bool, bool)] = &[
+            (PkeyMprotectKey::Tag(deny_k), &deny_t, true, true), // the one yes
+            (PkeyMprotectKey::Tag(deny_k), &deny_t, false, false), // PKU off
+            (PkeyMprotectKey::Tag(perm_k), &perm_t, true, false), // permissive key
+            (PkeyMprotectKey::Tag(perm_k), &perm_t, false, false),
+            (PkeyMprotectKey::Preserve, &base, true, false), // plain mprotect
+            (PkeyMprotectKey::Preserve, &base, false, false),
+            (PkeyMprotectKey::Default, &base, true, false), // pkey==0
+            (PkeyMprotectKey::Default, &base, false, false),
+            (PkeyMprotectKey::Invalid, &base, true, false),
+            (PkeyMprotectKey::Invalid, &base, false, false),
+        ];
+        for &(decision, table, pku, expected) in cases {
+            assert_eq!(
+                wx_v2_permits(table, decision, pku),
+                expected,
+                "decision={decision:?} pku={pku} should permit={expected}"
+            );
+        }
     }
 }
