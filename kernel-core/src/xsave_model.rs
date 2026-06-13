@@ -110,31 +110,46 @@ pub fn seed_pkru_component(buf: &mut [u8], pkru_offset: usize, pkru: u32) -> boo
     true
 }
 
-/// The XSTATE_BV mask the kernel's `sanitize_xsave_header` applies to a
-/// user-controlled (signal-frame) XSAVE buffer before `xrstor64`.
-///
-/// Identical to [`xsave_rfbm`]: `0x7` without PKU, `0x207` with.  The sanitizer
-/// masks the frame's `XSTATE_BV` to this value so that (a) on a PKU CPU the
-/// frame's *legitimate* component-9 bit survives — PKRU is restored across a
-/// signal handler that opened a write window — while (b) **no other** component
-/// bit can be smuggled in (an attacker setting, say, AVX-512 bits would make
-/// `xrstor64` load components the kernel never enabled in XCR0 → ring-0 `#GP`).
-/// Bit 9 is admitted only when PKU is usable; on a no-PKU boot it is masked off
-/// exactly as Phase 86f shipped, so a forged `XSTATE_BV[9]` cannot enable a
-/// component the CPU/OS never turned on.
-#[inline]
-pub const fn sanitize_xstate_bv_mask(pku_usable: bool) -> u64 {
-    xsave_rfbm(pku_usable)
-}
-
 /// Read back the 4-byte PKRU register from a standard-format XSAVE-area buffer.
 ///
 /// Returns `None` when `pkru_offset` is zero or the buffer is too small.  Used
 /// by host tests to prove a `seed_pkru_component` round-trip and by any caller
 /// that needs to inspect a saved PKRU value without executing `RDPKRU`.
+///
+/// # XSTATE_BV[9] / xsaveopt-skip semantics
+///
+/// `xsaveopt64` only writes a component's bytes into the area when the
+/// component's live value differs from the architectural init state.  For PKRU
+/// the init value is `0` (all keys permissive).  When a task's live PKRU is `0`
+/// after a `WRPKRU(0)` call, xsaveopt **skips** writing component 9 **and
+/// clears `XSTATE_BV[9]`**, leaving whatever bytes were previously at the PKRU
+/// offset.  If the area was earlier seeded with `PKRU_INIT_DEFAULT`
+/// (0x5555_5554), those stale bytes survive and a naive byte-read would return
+/// 0x5555_5554 instead of the true 0 — a fork child would then wrongly inherit
+/// a restrictive PKRU.
+///
+/// `xrstor64` already handles this correctly on the restore side: a component
+/// with `XSTATE_BV` bit clear is restored to its architectural init value (0
+/// for PKRU), ignoring the bytes in the area.  This function mirrors that
+/// contract on the read side: when `XSTATE_BV[9]` is clear the component is in
+/// its init state and we return `Some(0)` rather than the stale bytes.
 pub fn read_pkru_component(buf: &[u8], pkru_offset: usize) -> Option<u32> {
     if pkru_offset == 0 || buf.len() < pkru_offset + 4 {
         return None;
+    }
+    // Check XSTATE_BV bit 9: if clear the component is in its init state (0).
+    // Mirror xrstor64's own semantics rather than returning stale bytes that
+    // xsaveopt left behind when the live PKRU equalled the init value 0.
+    if buf.len() >= XSTATE_BV_OFFSET + 8 {
+        let xstate_bv = u64::from_le_bytes(
+            buf[XSTATE_BV_OFFSET..XSTATE_BV_OFFSET + 8]
+                .try_into()
+                .unwrap(),
+        );
+        if xstate_bv & XCR0_PKRU == 0 {
+            // Component 9 is in its init state: PKRU = 0 (all keys permissive).
+            return Some(0);
+        }
     }
     Some(u32::from_le_bytes(
         buf[pkru_offset..pkru_offset + 4].try_into().unwrap(),
@@ -433,14 +448,6 @@ mod tests {
         assert_eq!(xsave_rfbm(true), XSAVE_FEATURE_MASK | XCR0_PKRU);
     }
 
-    /// The signal-frame XSTATE_BV sanitize mask matches the RFBM: it admits the
-    /// PKRU bit only under PKU, and otherwise masks exactly the Phase 86f 0x7.
-    #[test]
-    fn sanitize_mask_matches_rfbm() {
-        assert_eq!(sanitize_xstate_bv_mask(false), 0x7);
-        assert_eq!(sanitize_xstate_bv_mask(true), 0x207);
-    }
-
     /// The Linux init PKRU denies access to every non-zero key and leaves key 0
     /// fully permissive: per-key AD bit at `2*k`, WD bit at `2*k+1`.
     #[test]
@@ -502,6 +509,67 @@ mod tests {
         assert!(!seed_pkru_component(&mut buf, 0, PKRU_INIT_DEFAULT));
         assert_eq!(&buf[..], &before[..]);
         assert_eq!(read_pkru_component(&buf, 0), None);
+    }
+
+    /// `read_pkru_component` must return `Some(0)` — not the stale seeded bytes —
+    /// when `XSTATE_BV[9]` is clear.
+    ///
+    /// This is the xsaveopt-skip scenario: a task called `WRPKRU(0)` to open all
+    /// keys, then `xsaveopt64` ran.  Because the live PKRU equalled the hardware
+    /// init value (0), xsaveopt skipped writing component 9 and cleared
+    /// `XSTATE_BV[9]`, leaving the previously-seeded `PKRU_INIT_DEFAULT`
+    /// (0x5555_5554) in the area bytes.  A naive byte-read would return
+    /// 0x5555_5554; the correct answer is 0 (the init value), mirroring what
+    /// `xrstor64` would restore to the hardware register.
+    ///
+    /// If this returns the stale bytes instead of 0, a fork child would inherit
+    /// a restrictive PKRU (keys 1–15 access-disabled) instead of the parent's
+    /// permissive 0.
+    #[test]
+    fn read_pkru_xstate_bv_clear_returns_init_value() {
+        // 2752-byte buffer, PKRU component at offset 2688.
+        let mut buf = [0u8; 2752];
+        // Seed PKRU_INIT_DEFAULT (sets XSTATE_BV[9] | 0x7).
+        buf[XSTATE_BV_OFFSET..XSTATE_BV_OFFSET + 8].copy_from_slice(&0x7u64.to_le_bytes());
+        assert!(seed_pkru_component(&mut buf, 2688, PKRU_INIT_DEFAULT));
+        // Verify the stale bytes are present at the PKRU offset.
+        let stale_raw = u32::from_le_bytes(buf[2688..2692].try_into().unwrap());
+        assert_eq!(
+            stale_raw, PKRU_INIT_DEFAULT,
+            "stale bytes should be present"
+        );
+        // Now simulate xsaveopt clearing XSTATE_BV[9] (task did WRPKRU(0) and
+        // xsaveopt skipped writing the component because live == init).
+        let bv_before = u64::from_le_bytes(
+            buf[XSTATE_BV_OFFSET..XSTATE_BV_OFFSET + 8]
+                .try_into()
+                .unwrap(),
+        );
+        let bv_cleared = bv_before & !XCR0_PKRU; // clear bit 9
+        buf[XSTATE_BV_OFFSET..XSTATE_BV_OFFSET + 8].copy_from_slice(&bv_cleared.to_le_bytes());
+        // The raw bytes at the PKRU offset are still 0x5555_5554 (stale).
+        let still_stale = u32::from_le_bytes(buf[2688..2692].try_into().unwrap());
+        assert_eq!(
+            still_stale, PKRU_INIT_DEFAULT,
+            "stale bytes unchanged after BV clear"
+        );
+        // But read_pkru_component must return Some(0) — the init value — not the stale bytes.
+        assert_eq!(
+            read_pkru_component(&buf, 2688),
+            Some(0),
+            "XSTATE_BV[9] clear must return init value 0, not stale 0x5555_5554"
+        );
+    }
+
+    /// When `XSTATE_BV[9]` is set, `read_pkru_component` returns the actual bytes
+    /// (the complement of the xsaveopt-skip case above).
+    #[test]
+    fn read_pkru_xstate_bv_set_returns_bytes() {
+        let mut buf = [0u8; 2752];
+        buf[XSTATE_BV_OFFSET..XSTATE_BV_OFFSET + 8].copy_from_slice(&0x7u64.to_le_bytes());
+        assert!(seed_pkru_component(&mut buf, 2688, PKRU_INIT_DEFAULT));
+        // XSTATE_BV[9] is now set by seed_pkru_component.
+        assert_eq!(read_pkru_component(&buf, 2688), Some(PKRU_INIT_DEFAULT));
     }
 
     /// A buffer too small for the component (offset+8 out of range) is rejected

@@ -2881,18 +2881,6 @@ pub fn current_task_pkru() -> Option<u32> {
     area.as_ref().pkru()
 }
 
-/// Phase 90a B.4 — seed a freshly-spawned task's PKRU (component 9) to `pkru`.
-///
-/// Called by `spawn_fork_task` after `alloc_task_slot` (which seeds the
-/// Linux-default) to override the child with the **parent's** captured PKRU,
-/// implementing Linux's inherit-on-clone semantics.  No-op on a no-PKU CPU.
-pub fn set_task_pkru(idx: usize, pkru: u32) {
-    let mut sched = scheduler_lock();
-    if let Some(area) = sched.fpu_states.get_mut(idx) {
-        area.seed_pkru(pkru);
-    }
-}
-
 /// Phase 86f Track B.1 — sanitize the 64-byte XSAVE header in a user-supplied
 /// buffer before passing it to `xrstor64`.
 ///
