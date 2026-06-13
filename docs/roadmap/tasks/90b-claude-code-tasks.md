@@ -1,6 +1,6 @@
 # Phase 90b — Claude Code: Task List
 
-**Status:** In Progress (`feat/phase-90b-claude-code`)
+**Status:** Complete (`feat/phase-90b-claude-code` → PR #247) — `claude-smoke` PASSES (install + launch + A.2 probes; 27/27 jitless and 27/27 on the 90a JIT node). Substance of the milestone achieved; the interactive-TUI visual render is the documented manual capstone.
 
 ## Implementation Progress Log
 

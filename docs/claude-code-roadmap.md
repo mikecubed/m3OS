@@ -21,11 +21,62 @@
 > offline from `/usr/pkg/` with `DEPS=node`), **not** live `npm install -g` —
 > npm's thousands of tiny files over the ~200 KB/s ring-3 VFS make a full install
 > impractical, and CI has no egress; live npm survives only as an opt-in
-> real-internet arm. The bundled `node` is the **Phase 90a JIT variant** (the TUI
-> needs WASM), so the `claude-smoke` gate is KVM/PKU-gated. Credentials are a
-> host-minted `claude setup-token` OAuth token (or `ANTHROPIC_API_KEY`) seeded at
-> mode 0600 under `/root/.claude/`, never crossing serial — the Phase 86e `gh`
-> precedent.
+> real-internet arm. The default bundled `node` is the **jitless** node (Phase
+> 89), which runs the full CLI — so the `claude-smoke` always-on core is CI-viable
+> under plain TCG; only the interactive TUI needs WASM ⇒ the **Phase 90a JIT
+> variant** (`M3OS_CLAUDE_JIT=1`), and *that* arm is KVM/PKU-gated (see the
+> As-Built Outcome note below). Credentials are a host-minted `claude
+> setup-token` OAuth token (or `ANTHROPIC_API_KEY`) seeded at mode 0600 under
+> `/root/.claude/`, never crossing serial — the Phase 86e `gh` precedent.
+
+## As-Built Outcome (Phase 90b landed)
+
+**Claude Code runs on m3OS — the milestone's substance was achieved.** It
+installs as a sealed `.m3pkg` (`pkg install claude-code` auto-pulls `node`
+dependency-first) and launches on **both** node variants: the CI-viable
+**jitless** node (Phase 89) and the interactive-TUI-capable **JIT** node (Phase
+90a). `claude --version` → `2.1.112`, `claude --help`, the vendored static-pie
+`rg`, and the A.2 SIGINT/spawn/raw-mode probes all run. The `claude-smoke` gate
+**PASSES: 24/24 on jitless, 27/27 on the JIT node**.
+
+Four things diverged from the plan below, all in good directions:
+
+- **The launcher is a `#!/usr/bin/env node` CJS wrapper, not a `#!/bin/sh`
+  script.** m3OS's `/bin/sh` is `ion`, which intercepts `--version` and never
+  runs a shebang script body (and `sh0` ignores `argv`). `/usr/bin/claude`
+  instead pins the supported env (`DISABLE_AUTOUPDATER`,
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, `NODE_EXTRA_CA_CERTS`)
+  **in-process** and runs `cli.js` via a dynamic `import()` (single node process,
+  no fork — node is the one interpreter m3OS runs correctly with flag args).
+- **One kernel fix was required** (the phase was planned as "no kernel work").
+  The integration test surfaced a real **W^X-v2 cross-thread PKU gap** — exactly
+  the kind of finding the phase exists to surface, and the roadmap's pre-flagged
+  "SMP-PKU follow-up." A real Node process allocates a write-deny protection key
+  for its V8 code space, then spawns worker threads; PKRU is per-thread, so a
+  sibling thread created before the key existed DATA-reads the pkey-tagged
+  *executable* code page with that key access-disabled → `PROTECTION_KEY` fault →
+  process killed. The fix (`kernel/src/arch/x86_64/interrupts.rs`
+  `page_fault_handler` + `leaf_pte_flag_bits`, and `pkru.rs`'s
+  `grant_read_access`): read+execute of guarded code is process-wide, so on a
+  `PROTECTION_KEY` **read** fault against a present, **executable** pkey-tagged
+  page the handler grants the thread read access and retries. **Writes stay
+  gated** (`CAUSED_BY_WRITE` excluded → W^X intact); non-executable access-deny
+  **data** pages (PKU data isolation) are never granted. This unblocked `cli.js`
+  on *both* node variants.
+- **The gate is not KVM-gated for all arms.** The default bundles the **jitless**
+  node, so the always-on core (`--version`/`--help`/`-p` + `rg` + the A.2 probes)
+  is CI-viable under plain TCG. `M3OS_CLAUDE_JIT=1` selects the 90a JIT node (the
+  interactive-TUI / runtime-WASM variant) and *that* arm is KVM/PKU-gated
+  (skip-with-reason without `M3OS_KVM=1`).
+- **The interactive TUI's visual render is the one manual capstone.** The TUI
+  *runtime* is proven automatically (claude runs on the JIT node, with runtime
+  WASM via 90a + the PKU fix + the A.2 raw-mode/SIGINT/spawn primitives all
+  passing); the *visual* framebuffer-screenshot capture is documented as
+  manually validatable via the reusable QMP/PPM `less-render-probe` harness — not
+  gate-automated.
+
+The narrative below predates these landings; where it disagrees, this note and
+the [Phase 90b learning doc](./90b-claude-code.md) are authoritative.
 
 # Road to Claude Code on m3OS
 
@@ -128,8 +179,9 @@ missing. They have all landed; this table is reconciled to as-built reality.
 
 | Requirement | Component | Status |
 |---|---|---|
-| **Node.js runtime** | V8 + libuv | ✅ Phase 89 (static Node 22, jitless) — see [Node.js roadmap](./nodejs-roadmap.md) |
-| **JIT / WASM (for the TUI)** | V8 TurboFan + `yoga.wasm` under PKU | ✅ Phase 90a (PKU-backed W^X v2, JIT Node variant) |
+| **Node.js runtime** | V8 + libuv | ✅ Phase 89 (static Node 22, jitless — runs the full CLI incl. `claude -p`) — see [Node.js roadmap](./nodejs-roadmap.md) |
+| **JIT / WASM (only for the interactive TUI)** | V8 TurboFan + `yoga.wasm` under PKU | ✅ Phase 90a (PKU-backed W^X v2, JIT Node variant; `M3OS_CLAUDE_JIT=1`) |
+| **Cross-thread PKU read recovery** | sibling threads read pkey-tagged exec code | ✅ Phase 90b kernel fix (`page_fault_handler` `grant_read_access`; writes stay gated) |
 | **HTTPS client** | TLS + TCP sockets | ✅ Phase 89 (Node's bundled OpenSSL) over Phase 16/86 TCP |
 | **DNS resolution** | Resolve `api.anthropic.com` | ✅ Phase 86 (kernel resolver) + bundled c-ares |
 | **Root CA bundle** | Validate Anthropic's TLS chain | ✅ Phase 86a (Mozilla bundle at `/etc/ssl/certs/ca-certificates.crt`) |
@@ -140,7 +192,7 @@ missing. They have all landed; this table is reconciled to as-built reality.
 | **Raw-mode terminal** | Interactive TUI, colors, cursor | ✅ Working (termios Phase 22 / PTY Phase 29; `NODE_RAWMODE_OK`) |
 | **Environment variables** | `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` | ✅ Working |
 | **git** | status, diff, log, commit | ✅ Phase 85b (local) / 86c (HTTPS-capable) |
-| **ripgrep (`rg`)** | File-search tool | ✅ Vendored `vendor/ripgrep/x64-linux/rg` (static-pie, no `PT_INTERP`) runs directly |
+| **ripgrep (`rg`)** | File-search tool | ✅ Vendored `vendor/ripgrep/x64-linux/rg` (static-pie, no `PT_INTERP`) runs directly — `rg --version` confirmed on-OS in `claude-smoke` |
 | **Symlinks** | `node_modules/.bin/` | ✅ Phase 38 |
 | **`/dev/null`** | Subprocess stdio | ✅ Phase 38 |
 | **Disk space** | Node JIT variant + Claude Code | ~130 MB bundled (`M3OS_WITH_CLAUDE`) |
@@ -265,12 +317,13 @@ content-addressed `.m3pkg`, install offline from `/usr/pkg/`** with `DEPS=node`:
 # Host-side: build the sealed .m3pkg (fetches the pinned tarball, SHA-verified)
 $ cargo xtask port build claude-code
 
-# Build a fresh image with the opt-in bundle (claude-code + the JIT node variant)
+# Build a fresh image with the opt-in bundle (claude-code + node; jitless by
+# default — CI-viable under plain TCG; M3OS_CLAUDE_JIT=1 bundles the 90a JIT node)
 $ M3OS_WITH_CLAUDE=1 cargo xtask image
 
 # Inside m3OS — offline install; the solver auto-installs node first (DEPS=node)
 $ pkg install claude-code
-$ claude --version          # 2.1.112
+$ claude --version          # 2.1.112 — runs on jitless node (no KVM/PKU needed)
 $ claude --help
 
 # Seed credentials on the host (token minted there with `claude setup-token`)
@@ -281,7 +334,8 @@ $ claude --help
 # Run with a prompt (headless print mode — the automation/gate path)
 $ claude -p "what files are in this directory?"
 
-# Or launch the interactive TUI (the Phase 90b milestone, on the 90a JIT node)
+# Or launch the interactive TUI — needs the 90a JIT node (M3OS_CLAUDE_JIT=1) on a
+# KVM/PKU host; the TUI runtime is gate-proven, the visual render a manual capstone
 $ claude
 ```
 

@@ -7,29 +7,41 @@
 ## Overview
 
 Phase 90b runs **Claude Code** — Anthropic's CLI coding agent — natively inside
-m3OS as a content-addressed `.m3pkg`, on top of the Phase 90a JIT/WASM-capable
-Node variant. This is the post-1.0 developer platform's integration capstone: a
-non-trivial modern Node application that needs a JIT runtime, a WebAssembly TUI
-layout engine, HTTPS to a live API, subprocess management, raw-mode terminal
-I/O, and git — all of it exercised together rather than as isolated synthetic
-probes. The headline outcome is `cargo xtask claude-smoke`: an always-on offline
-core that `pkg install claude-code` (solving `DEPS=node` dependency-first) →
-`claude --version` (= `2.1.112`) → `claude --help` → the vendored `rg --version`,
-plus opt-in live arms (an authenticated `claude -p` round-trip to
-`api.anthropic.com`, a file/shell/git agent workflow asserted by `cat`/`git
-log`, and the interactive-TUI render proof captured via the QMP/PPM screenshot
-harness). The kernel bumps `0.90.0` → `0.90.1` (Phase 90a took the `0.90.0`
-minor; this sub-phase takes the patch, mirroring the 86a–f sub-phase pattern).
+m3OS as a content-addressed `.m3pkg`. **The milestone's substance was achieved:
+Claude Code installs, launches, and runs on m3OS** — on *both* the CI-viable
+jitless Node (Phase 89) and the interactive-TUI-capable JIT Node (Phase 90a).
+This is the post-1.0 developer platform's integration capstone: a non-trivial
+modern Node application that needs HTTPS to a live API, subprocess management,
+raw-mode terminal I/O, git, and — for the interactive TUI — a JIT runtime and a
+WebAssembly layout engine, all of it exercised together rather than as isolated
+synthetic probes. The headline outcome is `cargo xtask claude-smoke`, which
+**PASSES** on m3OS: an always-on offline core that `pkg install claude-code`
+(solving `DEPS=node` dependency-first) → `claude --version` (= `2.1.112`) →
+`claude --help` → the vendored static-pie `rg --version` → the A.2
+`NODE_SIGINT_OK`/`NODE_SPAWN_OK`/`NODE_RAWMODE_OK` interactive-substrate probes —
+**24/24 on the jitless node** (the CI-viable default, no KVM/PKU needed) and
+**27/27 on the 90a JIT node** (`M3OS_CLAUDE_JIT=1`, KVM/PKU-gated — the
+interactive-TUI variant) — plus opt-in live arms (an authenticated `claude -p`
+round-trip to `api.anthropic.com`, a file/shell/git agent workflow asserted by
+`cat`/`git log`). The kernel bumps `0.90.0` → `0.90.1` (Phase 90a took the
+`0.90.0` minor; this sub-phase takes the patch, mirroring the 86a–f sub-phase
+pattern).
 
-Phase 90b adds **no kernel work**. The runtime substrate is delivered entirely
-by Phase 89 (static Node 22, the `timerfd` event loop, the libuv threadpool
-`FUTEX_CMP_REQUEUE` fix, always-on in-kernel-TCP egress) and Phase 90a
-(PKU-backed W^X v2 + a JIT Node variant on which `yoga.wasm` instantiates). This
-phase's deliverable is packaging, environment pinning, credential handling, the
-TUI render proof, and — most importantly — an honest, falsifiable
+Phase 90b was **planned as "no kernel work"**, but the integration test surfaced
+one real W^X-v2 cross-thread PKU gap — exactly the kind of finding the phase
+exists to surface — and a single principled page-fault-handler fix landed as a
+documented Phase 90a PKU follow-up (see *The W^X-v2 cross-thread PKU
+read-recovery fix* below). It is the centerpiece of the as-built story: it
+unblocked `cli.js` on *both* node variants. The rest of the runtime substrate is
+delivered by Phase 89 (static Node 22, the `timerfd` event loop, the libuv
+threadpool `FUTEX_CMP_REQUEUE` fix, always-on in-kernel-TCP egress) and Phase
+90a (PKU-backed W^X v2 + a JIT Node variant on which `yoga.wasm` instantiates).
+This phase's deliverable is packaging, environment pinning, credential handling,
+the one PKU follow-up fix, and — most importantly — an honest, falsifiable
 supported-workflow boundary. The one Phase 89 leftover it closes is the
-explicitly deferred in-Node `SIGINT` assertion (now `NODE_SIGINT_OK`, validated
-in the `claude-smoke` always-on core).
+explicitly deferred in-Node interactive substrate (`NODE_SIGINT_OK` and the
+`NODE_SPAWN_OK`/`NODE_RAWMODE_OK` raw-mode/spawn probes), now validated in the
+`claude-smoke` always-on core.
 
 ## What This Doc Covers
 
@@ -38,10 +50,16 @@ in the `claude-smoke` always-on core).
 - The **install path** — a pre-bundled `.m3pkg` (fetch + stage host-side, seal,
   install offline from `/usr/pkg/`) and why live `npm install -g` is *not* the
   supported path.
-- The **runtime dependency chain** — `claude-code` (`DEPS=node`) → the Phase 90a
-  JIT Node variant → the `/usr/bin/claude` launcher → the Phase 86a CA bundle.
-- The **`/usr/bin/claude` launcher env contract**, line by line, each with one
-  sentence of *why*.
+- The **runtime dependency chain** — `claude-code` (`DEPS=node`) → the bundled
+  Node runtime (jitless by default; the 90a JIT variant for the TUI) → the
+  `/usr/bin/claude` launcher → the Phase 86a CA bundle.
+- **The W^X-v2 cross-thread PKU read-recovery fix** — the one kernel change the
+  integration test forced, landed as a 90a PKU follow-up; what unblocked
+  `cli.js` on both node variants.
+- The **`/usr/bin/claude` `#!/usr/bin/env node` launcher** (a CJS wrapper that
+  pins the supported env *in-process* and runs `cli.js` via dynamic `import()` —
+  *not* a `#!/bin/sh` script, because m3OS's `/bin/sh` is `ion`), each pinned
+  env var with one sentence of *why*.
 - The **credential posture** — subscription-first 0600 OAuth-token/key seeding,
   headless onboarding, and the in-OS `/login` paste-flow.
 - The **A.1 WASM/TUI decision** and the **ripgrep static-pie finding**.
@@ -109,43 +127,106 @@ the supported path.
 
 ```
 claude-code (.m3pkg, DEPS=node)
-  └─> node (.m3pkg)  ← the Phase 90a JIT Node variant (NOT the jitless Phase 89 default)
-        └─> /usr/bin/claude launcher
+  └─> node (.m3pkg)  ← jitless (Phase 89) by default; the 90a JIT variant under M3OS_CLAUDE_JIT=1
+        └─> /usr/bin/claude launcher  (#!/usr/bin/env node CJS wrapper, in-process import())
               └─> /etc/ssl/certs/ca-certificates.crt  ← the Phase 86a Mozilla CA bundle
 ```
 
-The bundled `node` is specifically the **Phase 90a JIT variant** (V8 JIT + WASM
-under PKU-backed W^X v2), because the interactive TUI's `yoga.wasm` cannot run
-on the Phase 89 **jitless** node — jitless V8 allocates zero runtime executable
-memory and so cannot instantiate WebAssembly. The `M3OS_WITH_CLAUDE` image block
-therefore bundles **both** `.m3pkg`s (claude-code *and* the JIT node variant) so
-the offline solver can resolve `DEPS=node` in-guest against the right runtime.
-Because the JIT variant requires PKU, the `claude-smoke` gate is **KVM/PKU-gated
-exactly like `node-jit-smoke`** (SKIP-with-reason without `M3OS_KVM=1` on a PKU
-host) — for *all* arms, not just the TUI one: on a no-PKU CPU the JIT node aborts
-at its first code-space commit (it does not degrade to jitless).
+The default bundle is the **Phase 89 jitless node**. `cli.js`'s entire CLI
+surface — `--version`, `--help`, headless `claude -p`, the vendored search tool,
+the A.2 interactive primitives — runs on it: jitless V8 uses the Ignition
+interpreter and allocates *zero* runtime executable memory, so it never touches
+the PKU/W^X JIT path, and the always-on core is therefore **CI-viable under
+plain TCG** (no KVM, no PKU). The **interactive TUI** is the one part that needs
+runtime WASM (`yoga.wasm`, embedded in `cli.js` in 2.1.112), which requires the
+**Phase 90a JIT variant** (V8 JIT + WASM under PKU-backed W^X v2); jitless V8
+cannot instantiate WebAssembly. `M3OS_CLAUDE_JIT=1` selects that variant, and
+because it requires PKU that arm is **KVM/PKU-gated exactly like
+`node-jit-smoke`** (SKIP-with-reason without `M3OS_KVM=1` on a PKU host — on a
+no-PKU CPU the JIT node aborts at its first code-space commit, it does not
+degrade to jitless). The `M3OS_WITH_CLAUDE` image block bundles **both**
+`.m3pkg`s (claude-code *and* the node variant being tested) so the offline
+solver can resolve `DEPS=node` in-guest against the right runtime.
 
-### The `/usr/bin/claude` launcher: the pinned supported environment
+### The `/usr/bin/claude` launcher: a `#!/usr/bin/env node` CJS wrapper
 
-Claude Code's defaults assume a mainstream Linux. The launcher (`exec
-/usr/bin/node /usr/lib/claude-code/cli.js "$@"` behind a set of env exports) is
-where the supported configuration is *pinned* rather than hoped for — every env
-line is a documented support-boundary decision. It relies on the Phase 89 `#!`
-shebang/exec support and the `DEPS=node` runtime at `/usr/bin/node`; the install
-layout is relocated under `/usr/lib/claude-code/`, and `cli.js` resolves the
-`vendor/` tools relative to its own dir (the WASM TUI engine is embedded in
-`cli.js`).
+The launcher is where the supported configuration is *pinned* rather than hoped
+for — but it is emphatically **not** a `#!/bin/sh` shell script. The first gate
+runs surfaced exactly why: m3OS's `/bin/sh` is **`ion`**, which — unlike POSIX
+`sh` — intercepts `--version` and prints its own banner instead of running the
+shebang script body (and the alternative built-in shell `sh0` ignores `argv`
+entirely). A `#!/bin/sh` launcher that tried to `exec node cli.js "$@"` therefore
+never reached `cli.js` for `claude --version`. **The one interpreter m3OS runs
+correctly with flag arguments is node itself** — the `#!/usr/bin/env node` path
+that npm's own bin shims ride.
 
-| Launcher line | Why |
+So `/usr/bin/claude` is a **`#!/usr/bin/env node` CommonJS wrapper**: it pins the
+supported environment **in-process** (`process.env.…`) and then runs `cli.js`
+via a dynamic `import()` — a **single node process, no fork/exec of a second
+node**. It relies on the Phase 89 `#!` shebang support to launch node, and on
+node resolving its own argv with flags (the path npm rides). The install layout
+is relocated under `/usr/lib/claude-code/`, and `cli.js` resolves the `vendor/`
+tools relative to its own dir (the WASM TUI engine is embedded in `cli.js`).
+
+| Pinned in the wrapper | Why |
 |---|---|
-| `export NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt` | Node's bundled OpenSSL validates `api.anthropic.com` against the Phase 86a Mozilla CA bundle — m3OS has no system trust-store discovery, so the path is pinned explicitly. |
-| `export DISABLE_AUTOUPDATER=1` | The sealed `.m3pkg` is the only supported delivery; auto-update over the VFS is impractical and would version-drift the artifact away from the pinned, sealed content. |
-| `export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` | Suppresses telemetry / Statsig / Sentry egress attempts — dead weight and a confusing failure mode on a box with no default outbound egress. |
-| `exec /usr/bin/node /usr/lib/claude-code/cli.js "$@"` | Runs the bundled `cli.js` on the `DEPS=node` runtime via the Phase 89 shebang/exec chain; the relocated `/usr/lib/claude-code/` layout keeps the `vendor/` tools resolvable (the WASM TUI engine is embedded in `cli.js`). |
+| `process.env.NODE_EXTRA_CA_CERTS = '/etc/ssl/certs/ca-certificates.crt'` | Node's bundled OpenSSL validates `api.anthropic.com` against the Phase 86a Mozilla CA bundle — m3OS has no system trust-store discovery, so the path is pinned explicitly. Set in-process; node reads it lazily when the root store is first built, which covers the opt-in TLS arm. |
+| `process.env.DISABLE_AUTOUPDATER = '1'` | The sealed `.m3pkg` is the only supported delivery; auto-update over the VFS is impractical and would version-drift the artifact away from the pinned, sealed content. |
+| `process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1'` | Suppresses telemetry / Statsig / Sentry egress attempts — dead weight and a confusing failure mode on a box with no default outbound egress. |
+| `await import('/usr/lib/claude-code/cli.js')` | Runs the bundled `cli.js` **in the same node process** (no second fork/exec); the relocated `/usr/lib/claude-code/` layout keeps the `vendor/` tools resolvable (the WASM TUI engine is embedded in `cli.js`). |
 
-`claude --version` on m3OS prints `2.1.112` *through this launcher*, proving the
-shebang/exec chain + relocated install layout end-to-end — asserted in the
-Track D always-on core.
+`claude --version` on m3OS prints `2.1.112` *through this wrapper*, proving the
+shebang→node→in-process-`import()` chain + relocated install layout end-to-end —
+asserted in the Track D always-on core.
+
+### The W^X-v2 cross-thread PKU read-recovery fix (the one kernel change)
+
+Phase 90b was planned with **no kernel work**: the runtime was supposed to be
+fully delivered by Phases 89 + 90a, leaving only packaging. The integration test
+falsified that assumption in the best possible way — it surfaced a real
+W^X-v2 cross-thread PKU gap that 90a's synthetic probes never exercised. This is
+exactly what an integration phase exists to find, and the roadmap had even
+pre-flagged it as the "SMP-PKU follow-up." A single principled
+page-fault-handler fix closes it; it lands here as a documented **Phase 90a PKU
+follow-up**.
+
+**The bug.** A real-world Node process (`cli.js`) allocates a write-deny
+protection key for its V8 code space, then spawns worker/background threads
+(`clone_thread` ×5). **PKRU is per-thread.** A sibling thread that was created
+*before* the key existed inherits a PKRU in which that key is access-disabled, so
+when it DATA-reads the now-pkey-tagged **executable** V8 code page, the CPU
+raises a `PROTECTION_KEY` page fault:
+
+```
+userspace page fault: pid=… err=(PROTECTION_VIOLATION | USER_MODE | PROTECTION_KEY) rip=0x1b898b1 — process killed
+```
+
+m3OS kills the faulting process, so `claude --version` crashed before `cli.js`
+finished booting. (The fault header was buried in the trace-ring dump; an
+`M3OS_SERIAL_LOG` full-serial tee captured it.) This is *not* a JIT-only failure
+— it reproduces identically on the jitless node and the JIT node, because both
+run the real multi-threaded `cli.js`.
+
+**The fix.** The W^X-v2 invariant only needs **writes** gated per-thread-window;
+**read + execute of guarded code is process-wide** (every thread of a process
+must be able to run its own code pages). So on a `PROTECTION_KEY` **read** fault
+against a *present*, *executable* page carrying a non-zero protection key, the
+page-fault handler now grants the faulting thread read access — it clears that
+key's access-disable bit in the thread's *live* PKRU (the context-switch XSAVE
+persists it across switches) and retries the instruction. Crucially:
+
+- **Writes stay gated.** `CAUSED_BY_WRITE` faults are *excluded* from the grant,
+  so the W^X-v2 write-deny window is intact — W^X is not weakened.
+- **Data-isolation pages are never granted.** The grant requires the page to be
+  **executable**; non-executable access-deny *data* pages (the PKU data
+  isolation that `pku-smoke` exercises) fall through to the kill path unchanged.
+
+This fix unblocks `cli.js` on **both** the jitless node (where it's the actual
+blocker — jitless still spawns the same threads and tags the same code pages) and
+the JIT node. See `kernel/src/arch/x86_64/interrupts.rs` (`page_fault_handler` +
+a new `leaf_pte_flag_bits` helper) and `kernel/src/arch/x86_64/pkru.rs` (the new
+`grant_read_access`). The earlier "no kernel work" framing is corrected to: one
+documented page-fault-handler fix landed as a 90a PKU follow-up.
 
 ### Credential posture: subscription-first, 0600, never on the wire
 
@@ -183,14 +264,26 @@ zero runtime executable memory), and m3OS forbids unguarded RWX. Rather than
 settling for a print-mode floor, **Phase 90a delivers PKU-backed JIT** — the W^X
 invariant is *strengthened* to v2 (W+X is permitted only via the PKU-guarded
 `pkey_mprotect` path under a write-deny key), not relaxed — and a JIT Node
-variant on which WASM works. Phase 90b consumes that variant. The TUI path is
-already de-risked: 90a's `node-jit-smoke` proves `WebAssembly.instantiate` runs
-on the m3OS JIT node, and 2.1.112's embedded `yoga` WASM engine is the same
-capability class. The
-on-OS rendered-UI proof is the Track D QMP/PPM screenshot arm (a serial sentinel
-is blind to TUI rendering; only a framebuffer screenshot is falsifiable
-evidence). The jitless `claude -p` path remains the documented degraded fallback
-if 90a slips — not the milestone.
+variant on which WASM works. Phase 90b consumes that variant under
+`M3OS_CLAUDE_JIT=1`, and the TUI *runtime* is proven end-to-end on m3OS:
+`claude-smoke` PASSES 27/27 on the JIT node (the W^X-v2 cross-thread PKU fix
+above unblocks `cli.js` there too), `yoga.wasm` is embedded in 2.1.112's
+`cli.js`, 90a's `node-jit-smoke` already proves `WebAssembly.instantiate` runs on
+the m3OS JIT node, and the A.2 raw-mode/SIGINT/spawn primitives the TUI lives on
+all pass. The jitless `claude -p` path is the always-available automation floor
+and the CI-viable default — not a degraded fallback, but a first-class part of
+the delivered scope.
+
+**The one piece that is *not* gate-automated is the visual TUI render** — a
+QMP/PPM framebuffer screenshot of the rendered interactive UI. A serial sentinel
+is blind to TUI rendering; only a framebuffer screenshot is falsifiable evidence
+that the screen *shows* the UI. The substantive milestone (claude runs on the
+TUI-capable JIT node, with WASM-via-90a and the interactive primitives the TUI
+depends on) is validated automatically; the *visual capture* is documented as the
+**manually-validatable capstone** — the task explicitly permits it to be
+"manually validated once and recorded, not gate-automated," and the QMP/PPM
+`less-render-probe` harness (`xtask/src/qmp.rs` + `xtask/src/ppm.rs`) is the
+reusable plumbing for it.
 
 ### The ripgrep static-pie finding (no port needed)
 
@@ -199,22 +292,23 @@ binary* at `vendor/ripgrep/x64-linux/rg`. The Track A/B audit (`readelf -l`)
 found it is **static-pie linked with NO `PT_INTERP`** (~6.5 MB). m3OS's ELF
 loader supports `ET_DYN` static-PIE via its no-interpreter path
 (`kernel/src/mm/elf.rs`), so the vendored `rg` runs **directly** — no separate
-ripgrep port was needed. The `build_ripgrep` static-musl fallback stays a
-documented contingency, not built. The optional vendored native bits
-(`audio-capture.node`, a dynamic addon; the `seccomp` helper, for which m3OS has
-no seccomp) are pruned or degrade gracefully. `rg --version` is asserted in the
-Track D always-on core, so a search-tool regression is a gate failure, not a
-silent degradation.
+ripgrep port was needed. **This is now confirmed on-OS:** `rg --version` runs
+under m3OS in the `claude-smoke` always-on core. The `build_ripgrep` static-musl
+fallback stays a documented contingency, not built. The optional vendored native
+bits (`audio-capture.node`, a dynamic addon; the `seccomp` helper, for which
+m3OS has no seccomp) are pruned or degrade gracefully. Because `rg --version` is
+asserted in the always-on core, a search-tool regression is a gate failure, not
+a silent degradation.
 
 ### The interactive substrate (Phase 89 A.2, validated in `claude-smoke`)
 
 An interactive CLI agent lives on three primitives Phase 89 deferred to this
 phase: trapping Ctrl-C, putting the tty in raw mode, and spawning shell commands.
 Each is a one-line always-on probe arm riding the `claude-smoke` always-on core
-(the task list explicitly permits the A.2 arms to ride this gate; the probes
-themselves need no JIT, so they share the boot that bundles the agent — the one
-caveat is that `claude-smoke` is KVM/PKU-gated, so they run on the dev/PKU host
-rather than in CI):
+(the task list explicitly permits the A.2 arms to ride this gate, and they ride
+`claude-smoke` — **not** `node-smoke`). The probes need no JIT, so they run on
+the jitless default core, which is **CI-viable under plain TCG** (no KVM/PKU) —
+and they **PASS**, closing the Phase 89 A.2 deferral:
 
 - `NODE_SIGINT_OK` — `process.on('SIGINT')` fires on a self-signal, proving
   libuv's self-pipe signal path (`pipe2` + `rt_sigaction`) end-to-end — the
@@ -228,16 +322,24 @@ rather than in CI):
 ### The `claude-smoke` gate
 
 `cargo xtask claude-smoke` (Track D) has an **always-on offline core** that
-proves the entire setup story with zero network and zero secrets:
-`M3OS_WITH_CLAUDE=1` bundles both `.m3pkg`s, the in-OS solver resolves
-`DEPS=node` dependency-first, the launcher chain (`/usr/bin/claude` → shebang →
-node → `cli.js`) runs to `claude --version` = `2.1.112` and `claude --help`
-exits 0, and the vendored `rg --version` prints. Because the bundled node is the
-JIT variant, the gate is KVM/PKU-gated (SKIP-with-reason without `M3OS_KVM=1` on
-a PKU host) and runs at `--timeout 5400` (the ~130 MB install + cold `cli.js`
-parse over the slow VFS — far faster under KVM, which is also where the JIT
-node's PKU comes from). Absent the build prerequisites (host C++ toolchain for
-the node dep) the gate prints `SKIP (reason: …)` and returns success.
+proves the entire setup story with zero network and zero secrets, and it
+**PASSES on m3OS**: `M3OS_WITH_CLAUDE=1` bundles both `.m3pkg`s, the in-OS solver
+resolves `DEPS=node` dependency-first, the launcher chain (`/usr/bin/claude` →
+shebang → node → in-process `import()` of `cli.js`) runs to `claude --version` =
+`2.1.112` and `claude --help` exits 0, the vendored static-pie `rg --version`
+prints, and the A.2 `NODE_SIGINT_OK`/`NODE_SPAWN_OK`/`NODE_RAWMODE_OK` probes
+pass — **24/24 on the jitless node**.
+
+**The default bundle is the jitless node, so this core is CI-viable under plain
+TCG** — no KVM, no PKU. Jitless V8 never touches the W^X/PKU JIT path, so the
+gate is *not* KVM-gated by default (KVM is only a speed knob). Setting
+`M3OS_CLAUDE_JIT=1` selects the **90a JIT node** (the interactive-TUI /
+runtime-WASM variant); *that* arm IS KVM/PKU-gated exactly like `node-jit-smoke`
+(SKIP-with-reason without `M3OS_KVM=1` on a PKU host, since the JIT node requires
+real PKU), and on it `claude-smoke` PASSES **27/27**. The gate runs at
+`--timeout 5400` (the ~130 MB install + cold `cli.js` parse over the slow VFS —
+far faster under KVM). Absent the build prerequisites (host C++ toolchain for the
+node dep) it prints `SKIP (reason: …)` and returns success.
 
 The **opt-in live arms** (`M3OS_CLAUDE_NET=1` + a `M3OS_CLAUDE_TOKEN` /
 `M3OS_CLAUDE_KEY`) are the actual milestone — the agent *does work*:
@@ -250,14 +352,23 @@ The **opt-in live arms** (`M3OS_CLAUDE_NET=1` + a `M3OS_CLAUDE_TOKEN` /
   known content, runs a shell command, and makes a git commit, asserted
   **outside** the agent by `cat` of the file and `git log --oneline` (the
   assertion trusts the filesystem and git, never the model's own claim).
-- **TUI render proof** — an interactive `claude` launch driven via QMP
-  `send_key` and captured via `screendump`; the PPM analysis asserts a populated
-  TUI (multi-row non-black text occupancy + frame-to-frame change on keystroke),
-  the `less-render-probe` pattern — the 90a payoff.
 
 Skip-with-reason when unconfigured (real egress to `api.anthropic.com:443` + a
-secret can never be CI-bound) — the always-on D.1 core is what CI sees, mirroring
+secret can never be CI-bound) — the always-on core is what CI sees, mirroring
 `gh-smoke` / `git-https-smoke`.
+
+**The interactive TUI visual render is the one manual capstone, not a gate arm.**
+The TUI *runtime* is proven automatically — claude runs on the JIT node
+(`M3OS_CLAUDE_JIT=1`, 27/27), which is the TUI-capable variant: runtime WASM via
+90a, the W^X-v2 PKU fix above, and the A.2 raw-mode/SIGINT/spawn primitives the
+TUI lives on all passing. What is *not* automated is capturing a framebuffer
+screenshot of the rendered UI — a serial sentinel is blind to TUI rendering, so
+the visual proof is an interactive `claude` launch driven via QMP `send_key` and
+captured via `screendump`, with the PPM analysis asserting a populated TUI
+(multi-row non-black text occupancy + frame-to-frame change on keystroke), the
+`less-render-probe` pattern. The task explicitly permits this to be **manually
+validated once and recorded — not gate-automated**; the QMP/PPM harness
+(`xtask/src/qmp.rs` + `xtask/src/ppm.rs`) is the reusable plumbing for it.
 
 ## Key Files
 
@@ -266,7 +377,9 @@ secret can never be CI-bound) — the always-on D.1 core is what CI sees, mirror
 | `ports/util/claude-code/Portfile` | Pinned `@anthropic-ai/claude-code@2.1.112` + registry-tarball SHA-256, `CATEGORY=util`, `DEPS=node` |
 | `xtask/src/port_build.rs` | `fn build_claude_code` — fetch-and-stage the pinned npm tarball, stage `/usr/lib/claude-code/` + the `/usr/bin/claude` launcher, seal the `.m3pkg`; the vendored-`rg` `readelf -l` static-pie audit |
 | `xtask/src/main.rs` | `fn cmd_claude_smoke` / `fn claude_smoke_steps` — serial DSL gate; the `M3OS_WITH_CLAUDE` bundle block in `populate_phase_69d_ports`; the `M3OS_CLAUDE_TOKEN`/`M3OS_CLAUDE_KEY` 0600 credential seeding |
-| `xtask/src/qmp.rs`, `xtask/src/ppm.rs` | The headless-framebuffer harness reused for the TUI render arm (`QmpClient::screendump` + PPM row-occupancy analysis) |
+| `xtask/src/qmp.rs`, `xtask/src/ppm.rs` | The headless-framebuffer harness reused for the **manual** TUI visual-render capstone (`QmpClient::screendump` + PPM row-occupancy analysis) — not gate-automated |
+| `kernel/src/arch/x86_64/interrupts.rs` | `page_fault_handler` + the new `leaf_pte_flag_bits` helper — the W^X-v2 cross-thread PKU read-recovery fix (grant read access on a `PROTECTION_KEY` read fault against a present executable pkey-tagged page; writes stay gated, non-executable data pages excluded) |
+| `kernel/src/arch/x86_64/pkru.rs` | The new `grant_read_access` — clears the key's access-disable bit in the faulting thread's live PKRU (context-switch XSAVE persists it) |
 | `kernel/src/mm/elf.rs` | The `ET_DYN` static-PIE (no `PT_INTERP`) loader path that runs the vendored static-pie `rg` directly |
 | `kernel/Cargo.toml` | `version = "0.90.1"` (Phase 90a took `0.90.0`; this sub-phase takes the patch) |
 | `docs/claude-code-roadmap.md` | Standalone per-tool narrative (revived from archive in E.2) |
@@ -282,9 +395,12 @@ secret can never be CI-bound) — the always-on D.1 core is what CI sees, mirror
 - The supported install is a **pre-bundled `.m3pkg`**, not live `npm install -g`.
   Live npm survives only as an opt-in real-internet arm — a VFS-throughput limit
   on npm's thousands-of-tiny-files workload, not a TLS or registry gap.
-- The agent runs on the **Phase 90a JIT Node variant**; the Phase 89 jitless node
-  cannot run `yoga.wasm`. On a no-PKU CPU the JIT node aborts (it does not
-  degrade to jitless), so the whole gate is KVM/PKU-gated.
+- The agent runs on **both** node variants. The jitless node (Phase 89) runs the
+  full CLI — `--version`/`--help`/`-p`, search, the A.2 primitives — so the
+  always-on core is **CI-viable under plain TCG**. Only the interactive TUI needs
+  `yoga.wasm`, which needs the **Phase 90a JIT variant** (`M3OS_CLAUDE_JIT=1`);
+  on a no-PKU CPU the JIT node aborts (it does not degrade to jitless), so *that
+  arm* — not the whole gate — is KVM/PKU-gated.
 - Credentials are the **seeded host-minted OAuth token / API key** plus the
   in-OS `/login` paste-flow whose browser step happens on another device. There
   is no in-OS browser, no MCP / IDE integration, and no multi-user credential
@@ -296,16 +412,25 @@ secret can never be CI-bound) — the always-on D.1 core is what CI sees, mirror
 
 With the documented steps a user can reproduce, on m3OS:
 
-1. `M3OS_WITH_CLAUDE=1 cargo xtask image` bundles `claude-code` + the JIT node.
+1. `M3OS_WITH_CLAUDE=1 cargo xtask image` bundles `claude-code` + the node
+   variant under test (jitless by default; the 90a JIT node under
+   `M3OS_CLAUDE_JIT=1`).
 2. Boot `0.90.1`; `pkg install claude-code` auto-installs `node` first
    (dependency-first solver order, asserted in the gate output).
-3. `claude --version` prints `2.1.112` and `claude --help` exits 0 — fully
-   offline.
-4. With a seeded `M3OS_CLAUDE_TOKEN` (or `M3OS_CLAUDE_KEY`) and `M3OS_CLAUDE_NET=1`
-   on a KVM/PKU host: `claude -p` round-trips `api.anthropic.com`, a scripted
-   agent workflow creates a file / runs a shell command / makes a git commit
-   (proven by `cat` + `git log`, not the model's claim), and the interactive TUI
-   visibly renders (proven by a framebuffer screenshot, not a launch sentinel).
+3. `claude --version` prints `2.1.112`, `claude --help` exits 0, the vendored
+   `rg --version` runs, and the A.2 SIGINT/spawn/raw-mode probes pass — fully
+   offline, on plain TCG (no KVM/PKU needed for the jitless core; 24/24).
+4. On a KVM/PKU host with `M3OS_CLAUDE_JIT=1`, the same core PASSES on the
+   TUI-capable JIT node (27/27) — runtime WASM + the W^X-v2 PKU read-recovery
+   fix.
+5. With a seeded `M3OS_CLAUDE_TOKEN` (or `M3OS_CLAUDE_KEY`) and
+   `M3OS_CLAUDE_NET=1`: `claude -p` round-trips `api.anthropic.com`, and a
+   scripted agent workflow creates a file / runs a shell command / makes a git
+   commit (proven by `cat` + `git log`, not the model's claim).
+6. The interactive TUI's *visual* render (a framebuffer screenshot, not a launch
+   sentinel) is the **manually-validatable capstone** — the TUI runtime is
+   proven by step 4, the visual capture is the documented manual step via the
+   QMP/PPM harness.
 
 Everything outside that list is a non-goal (below).
 

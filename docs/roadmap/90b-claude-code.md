@@ -1,6 +1,6 @@
 # Phase 90b - Claude Code
 
-**Status:** Planned
+**Status:** Complete — `claude-smoke` PASSES on m3OS (27/27 jitless + 27/27 on the 90a JIT node). Claude Code installs, launches, and runs; the interactive-TUI *runtime* is proven on the JIT node, with one W^X-v2 cross-thread PKU read-recovery kernel fix that the integration test surfaced. See [the task list's Implementation Progress Log](./tasks/90b-claude-code-tasks.md) and [the learning doc](../90b-claude-code.md).
 **Source Ref:** phase-90b
 **Depends on:** Phase 85 (Cross-Compiled Toolchains) ✅, Phase 86 (Networking and GitHub) ✅, Phase 89 (Node.js) ✅, Phase 90a (Memory Protection Keys — the JIT/WASM-capable Node variant the interactive TUI requires)
 **Builds on:** Uses the post-1.0 toolchain, networking, and Node runtime phases — plus the Phase 90a PKU JIT substrate — to run a modern CLI coding agent natively inside m3OS, interactive TUI included
