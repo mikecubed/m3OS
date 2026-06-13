@@ -42,7 +42,19 @@
 
 **Delivered + validated in-scope:** the packaging/install substrate (Portfile, `build_claude_code`, `.m3pkg` sealing, `M3OS_WITH_CLAUDE` bundling, **dependency-first `pkg install claude-code`→node — proven on m3OS 3×**), the ion-independent node launcher mechanism, credential/onboarding seeding, the gate harness, the docs, and `cargo xtask check` (clippy+fmt+host tests, incl. the new port tests). **Blocked:** `claude` actually launching (cli.js execution fault) and therefore the interactive TUI — both gated on the node-runtime follow-up above.
 
-- **Awaiting a direction decision** (see PR #247): finalize the honest in-scope delivery + document the runtime blocker, vs. authorize out-of-scope node-runtime/kernel debugging to make cli.js run.
+**BREAKTHROUGH — the blocker was a kernel W^X-v2 PKU gap; fixed; claude now LAUNCHES on m3OS.** A new `M3OS_SERIAL_LOG` full-serial tee (in `run_smoke_script`) captured the exact fault the trace-ring dump had buried:
+
+```
+userspace page fault: pid=55 … err=(PROTECTION_VIOLATION | USER_MODE | PROTECTION_KEY) rip=0x1b898b1 — process killed
+```
+
+It is a **PKU `PROTECTION_KEY` read fault**: node allocates a write-deny protection key for its V8 code space, spawns worker/background threads (`clone_thread` ×5), and a sibling thread created *before* the key existed DATA-reads the pkey-tagged **executable** code page with that key access-disabled in its **per-thread** PKRU. This is precisely the roadmap's pre-flagged "SMP-PKU follow-up" (PKRU is per-thread, so a process-allocated key's *read* access doesn't reach sibling threads).
+
+**Fix (kernel — authorized as "push toward the milestone"):** the W^X-v2 invariant only needs *writes* gated per-thread-window; read+execute of guarded code is process-wide. On a `PROTECTION_KEY` **read** fault against a present, **executable** page carrying a non-zero key, the page-fault handler now grants the thread read access (clears the key's AD bit in its live PKRU; the context-switch XSAVE persists it) and retries. **Writes stay gated** (`CAUSED_BY_WRITE` excluded → W^X intact); non-executable access-deny **data** pages (PKU data isolation, `pku-smoke`) are never granted (the executable check excludes them). See `kernel/src/arch/x86_64/interrupts.rs` (`page_fault_handler` + `leaf_pte_flag_bits`) and `pkru.rs` (`grant_read_access`).
+
+**Result — `claude-smoke` PASSES 24/24 on m3OS (jitless node):** `claude --version` → `2.1.112`, `claude --help` → `Usage: claude`, the vendored static-pie `rg --version` runs (B.2 confirmed on-OS), and the A.2 `NODE_SIGINT_OK`/`NODE_SPAWN_OK`/`NODE_RAWMODE_OK` probes all pass (closing the Phase 89 A.2 deferral). `cargo xtask check` green.
+
+**Scope note:** Phase 90b was planned as "no kernel work," but the integration test surfaced this real W^X-v2 cross-thread PKU gap — exactly what the phase exists to find. The one-branch page-fault-handler fix is documented as a 90a PKU follow-up landed here. The gate now defaults to the **jitless** node (CI-viable, no KVM) with an `M3OS_CLAUDE_JIT=1` toggle for the 90a JIT node (the interactive-TUI variant; KVM/PKU-gated) — under validation next.
 
 **Status (original):** Planned
 **Source Ref:** phase-90b

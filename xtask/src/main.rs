@@ -16069,13 +16069,32 @@ fn cmd_claude_smoke(args: &SmokeBootArgs) {
         _ => None,
     };
 
-    // Turn on the opt-in image bundling of the claude-code + node `.m3pkg`s. We do
-    // NOT set M3OS_NODE_JIT: the bundled runtime is the JITLESS node (the Phase 89
-    // default), on which `claude --version`/`--help`/`-p` run without the kernel
-    // JIT-fault path. Seed the credential (if any) under a dedicated name. SAFETY:
-    // xtask is single-threaded here; the child image-build steps read the env.
-    // set_var is `unsafe` in Rust edition 2024 (cross-thread UB risk).
+    // Runtime variant: by DEFAULT the bundled node is the JITLESS one (Phase 89),
+    // on which `claude --version`/`--help`/`-p` run — CI-viable, no PKU needed.
+    // `M3OS_CLAUDE_JIT=1` bundles the 90a JIT node instead (V8 runtime codegen +
+    // WASM — what the interactive TUI's yoga.wasm needs); that variant REQUIRES PKU
+    // (m3OS sees PKU only under KVM `-cpu host`), so it is KVM-gated like
+    // node-jit-smoke. The Phase 90b W^X-v2 cross-thread PKU read-recovery
+    // (kernel page-fault handler) is what lets cli.js's worker threads read the
+    // guarded V8 code space on BOTH variants.
+    let want_jit = std::env::var("M3OS_CLAUDE_JIT").is_ok_and(|v| v == "1");
+    if want_jit && !kvm {
+        println!(
+            "claude-smoke: SKIP (reason: M3OS_CLAUDE_JIT=1 selects the 90a JIT node for the \
+             interactive TUI, which REQUIRES PKU — and m3OS only sees PKU under M3OS_KVM=1 on a \
+             PKU host. Set M3OS_KVM=1 on a PKU host to run the JIT/TUI variant, or drop \
+             M3OS_CLAUDE_JIT to run the always-on jitless core.)"
+        );
+        return;
+    }
+    // Turn on the opt-in image bundling of the claude-code + node `.m3pkg`s. Seed
+    // the credential (if any) under a dedicated name. SAFETY: xtask is
+    // single-threaded here; the child image-build steps read the env. set_var is
+    // `unsafe` in Rust edition 2024 (cross-thread UB risk).
     unsafe {
+        if want_jit {
+            std::env::set_var("M3OS_NODE_JIT", "1");
+        }
         std::env::set_var("M3OS_WITH_CLAUDE", "1");
         if let Some(tok) = token.as_ref() {
             std::env::set_var("M3OS_CLAUDE_SMOKE_TOKEN", tok);
