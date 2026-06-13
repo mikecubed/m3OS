@@ -179,6 +179,26 @@ pub fn format_mitigations(report: &kernel_core::spectre::MitigationReport) -> St
     // the runtime-gated KPTI/IBRS lines so a reader does not expect a switch.
     out.push_str("  Spectre-v2 (retpoline): compiled-in (cannot disable at boot)\n");
 
+    // Phase 90a C.2 — W^X policy version + PKU posture. The W^X enforcement
+    // points are always active (Phase 75); the *version* reflects whether the
+    // pkey-guarded W+X exception is available, which is exactly "PKU active on
+    // this boot". On the default no-PKU lane this reads `v1 (PKU absent)`; on a
+    // PKU host (e.g. under KVM) it reads `v2 (PKU present, active)`. A
+    // present-but-inactive CPU (PKU silicon the kernel did not enable) reads
+    // `v1 (PKU present, inactive)`.
+    out.push_str("  W^X: ");
+    out.push_str(if report.wx_v2 { "v2" } else { "v1" });
+    out.push_str(" (PKU ");
+    match (report.pku_present, report.pku_active) {
+        (true, true) => out.push_str("present, active"),
+        (true, false) => out.push_str("present, inactive"),
+        // `pku_active` without `pku_present` is not a state the kernel can
+        // produce (active implies present), but render it defensively.
+        (false, true) => out.push_str("active"),
+        (false, false) => out.push_str("absent"),
+    }
+    out.push_str(")\n");
+
     // Honesty: enumerate the UNADDRESSED classes + the microkernel caveat.
     out.push_str(
         "note: UNADDRESSED — Spectre-v1, MDS, L1TF, SSB, Retbleed, Downfall/GDS are not mitigated.\n",

@@ -281,6 +281,20 @@ pub struct MitigationReport {
     pub ibrs_mode: IbrsMode,
     pub leaf7_edx: u32,
     pub arch_caps: u64,
+    /// Phase 90a Track C.2 — W^X policy is **v2** this boot (the pkey-guarded
+    /// W+X exception is available). Sourced from PKU being active: v2 iff
+    /// `pku_active`, v1 otherwise. (No separate flag — `wx_v2 == pku_active`
+    /// by construction; carried explicitly so the formatter need not re-derive
+    /// the rule.)
+    pub wx_v2: bool,
+    /// Phase 90a Track C.2 — PKU is **present** in CPUID (the architectural PKU
+    /// bit + the XSAVE PKRU component, i.e. `cpuid::pku_usable()`'s static
+    /// half). A no-PKU CPU reports `false`.
+    pub pku_present: bool,
+    /// Phase 90a Track C.2 — PKU is **active** this boot (`CR4.PKE` was set, so
+    /// `RDPKRU`/`WRPKRU` and the v2 W+X exception are live). On the default TCG
+    /// lane (no PKU) this is `false`; under a PKU host it is `true`.
+    pub pku_active: bool,
 }
 
 impl MitigationReport {
@@ -302,15 +316,25 @@ impl MitigationReport {
             MitigationLevel::Auto => 1,
             MitigationLevel::Full => 2,
         };
+        // Bits 0..=2 are the Phase 84 flags; bits 3..=5 carry the Phase 90a
+        // C.2 W^X/PKU posture in the same byte (no parallel channel, no length
+        // change). Bits 6..=7 stay free for future flags.
         b[1] = (self.level_recognized as u8)
             | ((self.kpti_active as u8) << 1)
-            | ((self.ibpb_active as u8) << 2);
+            | ((self.ibpb_active as u8) << 2)
+            | ((self.wx_v2 as u8) << 3)
+            | ((self.pku_present as u8) << 4)
+            | ((self.pku_active as u8) << 5);
         b[2] = match self.ibrs_mode {
             IbrsMode::None => 0,
             IbrsMode::Legacy => 1,
             IbrsMode::Enhanced => 2,
         };
-        b[3] = 1; // wire version
+        // Wire version 2 (Phase 90a C.2 added the W^X/PKU flag bits to `b[1]`).
+        // Bumped from 1 so a stale decoder refuses rather than reading the new
+        // bits as zero. The kernel and `m3ctl` are built together, so both
+        // sides move in lock-step.
+        b[3] = 2;
         b[4..8].copy_from_slice(&self.leaf7_edx.to_le_bytes());
         b[8..16].copy_from_slice(&self.arch_caps.to_le_bytes());
         b
@@ -323,9 +347,10 @@ impl MitigationReport {
         if buf.len() < MITIGATION_REPORT_WIRE_LEN {
             return None;
         }
-        // Wire version (written as `b[3] = 1` by `encode()`). Reject anything we
-        // do not know how to parse so a bumped format fails cleanly here.
-        if buf[3] != 1 {
+        // Wire version (written as `b[3] = 2` by `encode()`; was 1 pre-90a).
+        // Reject anything we do not know how to parse so a bumped format fails
+        // cleanly here.
+        if buf[3] != 2 {
             return None;
         }
         let level = match buf[0] {
@@ -345,12 +370,15 @@ impl MitigationReport {
         let arch_caps = u64::from_le_bytes(buf[8..16].try_into().ok()?);
         Some(Self {
             level,
-            level_recognized: flags & 0b001 != 0,
-            kpti_active: flags & 0b010 != 0,
-            ibpb_active: flags & 0b100 != 0,
+            level_recognized: flags & 0b0000_0001 != 0,
+            kpti_active: flags & 0b0000_0010 != 0,
+            ibpb_active: flags & 0b0000_0100 != 0,
             ibrs_mode,
             leaf7_edx,
             arch_caps,
+            wx_v2: flags & 0b0000_1000 != 0,
+            pku_present: flags & 0b0001_0000 != 0,
+            pku_active: flags & 0b0010_0000 != 0,
         })
     }
 }
@@ -602,6 +630,10 @@ mod tests {
             MitigationLevel::Full,
         ] {
             for ibrs_mode in [IbrsMode::None, IbrsMode::Legacy, IbrsMode::Enhanced] {
+                // Vary the C.2 W^X/PKU bits across the matrix so the flag-byte
+                // packing is exercised in every combination. `wx_v2` mirrors
+                // `pku_active` by construction, so they move together here.
+                let pku_active = matches!(ibrs_mode, IbrsMode::Legacy);
                 let r = MitigationReport {
                     level,
                     level_recognized: matches!(level, MitigationLevel::Full),
@@ -610,6 +642,9 @@ mod tests {
                     ibrs_mode,
                     leaf7_edx: (1 << 26) | (1 << 29),
                     arch_caps: 0b11,
+                    wx_v2: pku_active,
+                    pku_present: !matches!(ibrs_mode, IbrsMode::None),
+                    pku_active,
                 };
                 let bytes = r.encode();
                 assert_eq!(bytes.len(), MITIGATION_REPORT_WIRE_LEN);
@@ -635,10 +670,62 @@ mod tests {
             ibrs_mode: IbrsMode::None,
             leaf7_edx: 0,
             arch_caps: 0,
+            wx_v2: false,
+            pku_present: false,
+            pku_active: false,
         }
         .encode();
         assert!(MitigationReport::decode(&wrong_ver).is_some());
-        wrong_ver[3] = 2; // bump the version byte
+        wrong_ver[3] = 3; // bump the version byte past the current v2
         assert!(MitigationReport::decode(&wrong_ver).is_none());
+    }
+
+    /// Phase 90a C.2 — the W^X v2 / PKU posture bits survive the wire
+    /// round-trip independently of the Phase 84 flags, and are packed into the
+    /// spare bits of `b[1]` (no length change, version byte = 2).
+    #[test]
+    fn wx_pku_posture_wire_round_trip() {
+        let base = MitigationReport {
+            level: MitigationLevel::Auto,
+            level_recognized: true,
+            kpti_active: false,
+            ibpb_active: false,
+            ibrs_mode: IbrsMode::None,
+            leaf7_edx: 0,
+            arch_caps: 0,
+            wx_v2: false,
+            pku_present: false,
+            pku_active: false,
+        };
+
+        // No-PKU boot (default TCG lane): all three posture bits clear.
+        let no_pku = base.encode();
+        assert_eq!(no_pku.len(), MITIGATION_REPORT_WIRE_LEN);
+        assert_eq!(no_pku[3], 2, "wire version must be 2 after C.2");
+        let back = MitigationReport::decode(&no_pku).expect("decode no-pku");
+        assert!(!back.wx_v2 && !back.pku_present && !back.pku_active);
+
+        // PKU-active boot: v2 + present + active all set.
+        let pku = MitigationReport {
+            wx_v2: true,
+            pku_present: true,
+            pku_active: true,
+            ..base
+        }
+        .encode();
+        let back = MitigationReport::decode(&pku).expect("decode pku");
+        assert!(back.wx_v2 && back.pku_present && back.pku_active);
+
+        // The C.2 bits are independent of the Phase 84 flags: a present-but-
+        // inactive CPU (PKU silicon the kernel did not enable) decodes cleanly.
+        let present_only = MitigationReport {
+            pku_present: true,
+            ..base
+        }
+        .encode();
+        let back = MitigationReport::decode(&present_only).expect("decode present-only");
+        assert!(back.pku_present && !back.pku_active && !back.wx_v2);
+        // The Phase 84 flag bits (0..=2) are untouched by the C.2 bits.
+        assert!(back.level_recognized && !back.kpti_active && !back.ibpb_active);
     }
 }
