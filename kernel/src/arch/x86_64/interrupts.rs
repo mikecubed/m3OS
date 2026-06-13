@@ -494,6 +494,52 @@ fn dump_pte_walk_diagnostics(vaddr: u64) {
     }
 }
 
+/// Read the leaf (4 KiB) PTE's raw flag bits for `vaddr` in the **active** address
+/// space, or `None` if any paging level is not present or is a huge page. Used by
+/// the page-fault handler's W^X v2 PKU read-recovery to inspect the faulting
+/// page's NO_EXECUTE bit and protection key (PTE bits 59..=62). Read-only walk via
+/// the physical-offset map — no locks, safe from the ring-3 fault ISR (same
+/// constraints as `dump_pte_walk_diagnostics`).
+fn leaf_pte_flag_bits(vaddr: u64) -> Option<u64> {
+    use x86_64::registers::control::Cr3;
+    use x86_64::structures::paging::{PageTable, PageTableFlags};
+
+    let phys_off_va = VirtAddr::new(crate::mm::phys_offset());
+    let (cr3_frame, _) = Cr3::read_raw();
+    let pml4_phys = cr3_frame.start_address().as_u64();
+    let p4 = ((vaddr >> 39) & 0x1FF) as usize;
+    let p3 = ((vaddr >> 30) & 0x1FF) as usize;
+    let p2 = ((vaddr >> 21) & 0x1FF) as usize;
+    let p1 = ((vaddr >> 12) & 0x1FF) as usize;
+    unsafe {
+        let pml4: &PageTable = &*(phys_off_va + pml4_phys).as_ptr::<PageTable>();
+        let e4 = &pml4[p4];
+        if !e4.flags().contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+        let pdpt: &PageTable = &*(phys_off_va + e4.addr().as_u64()).as_ptr::<PageTable>();
+        let e3 = &pdpt[p3];
+        if !e3.flags().contains(PageTableFlags::PRESENT)
+            || e3.flags().contains(PageTableFlags::HUGE_PAGE)
+        {
+            return None;
+        }
+        let pd: &PageTable = &*(phys_off_va + e3.addr().as_u64()).as_ptr::<PageTable>();
+        let e2 = &pd[p2];
+        if !e2.flags().contains(PageTableFlags::PRESENT)
+            || e2.flags().contains(PageTableFlags::HUGE_PAGE)
+        {
+            return None;
+        }
+        let pt: &PageTable = &*(phys_off_va + e2.addr().as_u64()).as_ptr::<PageTable>();
+        let e1 = &pt[p1];
+        if !e1.flags().contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+        Some(e1.flags().bits())
+    }
+}
+
 /// Public entry point for kernel-context VMA demand paging.
 ///
 /// Revalidates the current VMA metadata while holding the address-space
@@ -1096,6 +1142,38 @@ extern "x86-interrupt" fn page_fault_handler(
         if !is_present && let Ok(fault_vaddr) = addr {
             let fault_addr_u64 = fault_vaddr.as_u64();
             if demand_map_vma_page(fault_addr_u64, is_write) {
+                assert_preempt_count_zero_on_return_to_user(&stack_frame);
+                return;
+            }
+        }
+
+        // Phase 90b — W^X v2 PKU cross-thread READ recovery. A real-world Node
+        // process (Claude Code's cli.js) allocates a write-deny protection key for
+        // its V8 code space, then spawns worker/background threads. PKRU is
+        // per-thread, so a sibling thread created before the key existed DATA-reads
+        // the pkey-tagged executable code page with that key access-disabled in its
+        // PKRU → PROTECTION_KEY fault (observed: `pid=N … PROTECTION_KEY … process
+        // killed` while running cli.js). The W^X v2 invariant only needs WRITE gated
+        // per-thread-window; READ+EXECUTE of guarded code is process-wide. So on a
+        // PROTECTION_KEY *read* fault (no CAUSED_BY_WRITE) against a present,
+        // EXECUTABLE page carrying a non-zero key, grant this thread read access
+        // (clear the key's AD bit in its live PKRU; the next context-switch XSAVE
+        // persists it) and retry. WRITES stay gated (CAUSED_BY_WRITE excluded → W^X
+        // write-protection intact), and non-executable access-deny DATA pages (PKU
+        // data isolation, exercised by pku-smoke) are never granted — the
+        // executable check excludes them.
+        if err.contains(PageFaultErrorCode::PROTECTION_KEY)
+            && !err.contains(PageFaultErrorCode::CAUSED_BY_WRITE)
+            && crate::arch::x86_64::cpuid::pku_usable()
+            && let Ok(fault_vaddr) = addr
+            && let Some(flag_bits) = leaf_pte_flag_bits(fault_vaddr.as_u64())
+        {
+            let is_exec =
+                flag_bits & x86_64::structures::paging::PageTableFlags::NO_EXECUTE.bits() == 0;
+            let key = kernel_core::pkey::pkey_of(flag_bits);
+            if is_exec && key != 0 {
+                crate::arch::x86_64::pkru::grant_read_access(key);
+                crate::task::scheduler::current_task_record_page_fault(false);
                 assert_preempt_count_zero_on_return_to_user(&stack_frame);
                 return;
             }

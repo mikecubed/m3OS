@@ -106,3 +106,22 @@ pub fn apply_init_rights(key: u8, init_access_rights: u32) {
     }
     wrpkru(pkru);
 }
+
+/// Phase 90b — W^X v2 cross-thread READ recovery: grant the **calling thread**
+/// READ access to protection key `key` by clearing only its access-disable (`AD`)
+/// bit in the live PKRU, leaving the write-disable (`WD`) bit untouched.
+///
+/// PKRU is per-thread hardware state. A real-world Node process allocates a
+/// write-deny key for its V8 code space, then spawns worker/background threads;
+/// a sibling thread that DATA-reads a pkey-tagged executable code page it never
+/// inherited access to traps with a `PROTECTION_KEY` page fault. The W^X v2
+/// invariant only needs *writes* gated per-thread-window — read+execute of
+/// guarded code is process-wide — so the page-fault handler calls this to grant
+/// the read and retry. Leaving `WD` set keeps writes gated (W^X intact), so this
+/// does NOT relax the W^X write-protection. Caller MUST have confirmed
+/// [`cpuid::pku_usable`]. The next context-switch XSAVE persists the new register.
+pub fn grant_read_access(key: u8) {
+    let (ad, _wd) = pkru_bits_for_key(key);
+    let pkru = rdpkru() & !ad;
+    wrpkru(pkru);
+}

@@ -6948,14 +6948,27 @@ fn idle_prompt_fallback_matches(
 /// The thread exits when the pipe closes (QEMU exits).
 fn spawn_serial_reader(stdout: std::process::ChildStdout) -> std::sync::mpsc::Receiver<Vec<u8>> {
     let (tx, rx) = std::sync::mpsc::channel();
+    // Debug: when M3OS_SERIAL_LOG=<path> is set, tee the COMPLETE raw serial
+    // stream to that file (the in-memory `serial_buf` only keeps a drained tail,
+    // so a verbose kernel fault/trace dump otherwise buries the fault header). The
+    // file is truncated at open; every chunk is appended + flushed so a VM-exit
+    // crash still leaves the full pre-crash serial on disk.
+    let mut serial_log = std::env::var("M3OS_SERIAL_LOG")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .and_then(|p| std::fs::File::create(p).ok());
     std::thread::spawn(move || {
-        use std::io::Read;
+        use std::io::{Read, Write};
         let mut reader = std::io::BufReader::new(stdout);
         let mut buf = [0u8; 4096];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    if let Some(f) = serial_log.as_mut() {
+                        let _ = f.write_all(&buf[..n]);
+                        let _ = f.flush();
+                    }
                     if tx.send(buf[..n].to_vec()).is_err() {
                         break;
                     }
