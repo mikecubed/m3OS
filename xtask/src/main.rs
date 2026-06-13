@@ -19410,6 +19410,11 @@ fn populate_ext2_files(
         const V8_TURBOFANNED = 1 << 6; // OptimizationStatus::kTurboFanned\n\
         function hot(x) { let s = 0; for (let i = 0; i < x; i++) s += (i * 7) ^ i; return s; }\n\
         try {\n\
+        \x20 // eslint-disable-next-line no-undef\n\
+        \x20 %PrepareFunctionForOptimization(hot);  // REQUIRED: modern V8 ignores\n\
+        \x20 // %OptimizeFunctionOnNextCall without a prior Prepare (the function must\n\
+        \x20 // be marked + have collected feedback) — without it the tier-up bails and\n\
+        \x20 // %GetOptimizationStatus reports kInterpreted (status&kOptimized==0).\n\
         \x20 hot(1); hot(1);\n\
         \x20 // eslint-disable-next-line no-undef\n\
         \x20 %OptimizeFunctionOnNextCall(hot);\n\

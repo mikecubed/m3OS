@@ -543,12 +543,24 @@ fn build_recipe_id(name: &str) -> &'static str {
         // links the `pkey_*` shim (all gated on `node_jit_enabled()` in build_node).
         // recipe-v bumped to 5: build_node's recipe changed (variant branching), so
         // invalidate the stale Phase 89 cached jitless `.m3pkg`.
+        // recipe-v 6: the JIT variant gained patch_pkey_disable_macros — define
+        // PKEY_DISABLE_ACCESS/WRITE in V8's allocator + memory-protection-key TUs
+        // (V8's gyp build doesn't inherit our CXXFLAGS -D, so PkeyAlloc() was a
+        // `return -1` stub and PKU never engaged). Invalidate the pre-fix `.m3pkg`.
+        // recipe-v 7: the `pkey_*` shim is now compiled as C++ (staged as
+        // `m3os-pkey-shim.cc`, built with `-x c++`, no `extern "C"`) so its strong
+        // defs mangle to V8's weak-ref names (`_Z10pkey_allocjj` …). The prior C
+        // shim defined unmangled C symbols that did NOT bind V8's mangled weak
+        // refs on musl, so `PkeyAlloc()`'s `if (!pkey_alloc) return -1;` saw a null
+        // weak symbol and PKU stayed disabled (plain mprotect(RWX)). Invalidate the
+        // pre-fix `.m3pkg`.
         "node" => {
             "node-configure:--fully-static --enable-static --dest-cpu=x64 \
              --dest-os=linux --with-intl=small-icu --v8-options=--jitless \
              --openssl-no-asm --without-corepack --without-node-snapshot \
              --without-inspector;single-toolset;make-generator;wasm-in-jitless;\
-             cxxstdlib=libc++-musl;jit-variant=M3OS_NODE_JIT(key-folded);recipe-v=5"
+             cxxstdlib=libc++-musl;jit-variant=M3OS_NODE_JIT(key-folded);\
+             pkey-disable-macros-in-v8-tu;pkey-shim-cxx-linkage;recipe-v=7"
         }
         _ => "",
     }
@@ -3674,7 +3686,23 @@ fn build_node(port_src: &Path, stage: &Path, port_dir: &Path) -> Result<(), Stri
     // stage the musl `pkey_*` shim into the source tree, idempotently (a sentinel
     // guards against double-application across the persistent-source reuse). No-op
     // for the default jitless build (so it stays byte-identical to Phase 89).
-    let pkey_shim_rel = "deps/v8/src/base/platform/m3os-pkey-shim.c";
+    // NOTE: `.cc` (C++), NOT `.c`. V8 weak-declares the `pkey_*` functions at
+    // global namespace scope in C++ TUs WITHOUT `extern "C"` (e.g.
+    // `memory-protection-key.cc:25` `int pkey_mprotect(...) V8_WEAK;`). On glibc
+    // those declarations resolve to libc's `extern "C"` symbols because glibc's
+    // `<sys/mman.h>` declares them; musl's `<sys/mman.h>` does NOT, so V8's own
+    // C++-linkage declaration wins and the call sites reference the *mangled*
+    // names (`_Z10pkey_allocjj`, `_Z9pkey_freei`, `_Z13pkey_mprotectPvmii`,
+    // `_Z8pkey_geti`, `_Z8pkey_setij`). A C shim defines the unmangled C symbols
+    // (`pkey_alloc` …), which do NOT bind those mangled weak refs — so
+    // `PkeyAlloc()`'s `if (!pkey_alloc) return -1;` sees a null weak symbol,
+    // pkey allocation is skipped, ThreadIsolation stays disabled, and V8 falls
+    // back to plain `mprotect(RWX)`. Compiling the shim as C++ (no `extern "C"`)
+    // makes its strong defs mangle to the IDENTICAL names V8 references, so they
+    // bind over the weak refs and PKU engages. (Empirically confirmed:
+    // `nm node | grep _Z10pkey_allocjj` showed an undefined weak ref distinct
+    // from the strong C `pkey_alloc` before this fix.)
+    let pkey_shim_rel = "deps/v8/src/base/platform/m3os-pkey-shim.cc";
     if node_jit_enabled() {
         apply_node_jit_patches(src, pkey_shim_rel)?;
     }
@@ -3848,10 +3876,10 @@ fn build_node(port_src: &Path, stage: &Path, port_dir: &Path) -> Result<(), Stri
     Ok(())
 }
 
-/// Phase 90a (D.2) — the musl `pkey_*` shim C source (A.1 finding 1). V8
+/// Phase 90a (D.2) — the musl `pkey_*` shim source (A.1 finding 1). V8
 /// weak-declares `pkey_alloc/free/mprotect/get/set`
-/// (`src/base/platform/memory-protection-key.cc:17`,
-/// `src/libplatform/default-thread-isolated-allocator.cc:21`) and null-checks them
+/// (`src/base/platform/memory-protection-key.cc:25`,
+/// `src/libplatform/default-thread-isolated-allocator.cc:28`) and null-checks them
 /// at runtime; musl defines none. These STRONG defs bind over the weak references
 /// at the final link. `pkey_alloc/free/mprotect` are real syscalls (nrs
 /// 330/331/329 on x86_64 — the same Linux ABI numbers the B.3 kernel handlers
@@ -3859,12 +3887,24 @@ fn build_node(port_src: &Path, stage: &Path, port_dir: &Path) -> Result<(), Stri
 /// instructions reading/writing the per-thread PKRU register (which B.4 saves/
 /// restores via XSAVE component 9). The shim mirrors glibc's libc surface so V8's
 /// runtime detection + write-window code work unmodified.
-const NODE_PKEY_SHIM_C: &str = r#"/* m3OS Phase 90a (D.2) — musl pkey_* shim for V8 PKU JIT.
+///
+/// IMPORTANT: this is compiled as **C++** (staged as `m3os-pkey-shim.cc`, built
+/// with `-x c++`) and deliberately has NO `extern "C"`, so its five `pkey_*`
+/// definitions mangle to the C++ names V8's weak refs use (`_Z10pkey_allocjj`
+/// etc.). A C-linkage shim defines unmangled symbols that do NOT bind V8's
+/// mangled weak refs on musl (where `<sys/mman.h>` omits the `extern "C"`
+/// declarations glibc provides), so PKU would silently stay disabled.
+const NODE_PKEY_SHIM_C: &str = r#"/* m3OS Phase 90a (D.2) — musl pkey_* shim for V8 PKU JIT (compiled as C++).
  *
  * V8 weak-declares pkey_alloc/free/mprotect/get/set and null-checks them; musl
  * provides none. These strong definitions bind over the weak refs at link time.
  * Linked into `node` via LDFLAGS (an object on the final link line), NOT a gyp
  * sources-list edit, so the wiring is robust across V8 version drift.
+ *
+ * Built as C++ with NO `extern "C"` so the symbols mangle to V8's weak-ref names
+ * (`_Z10pkey_allocjj`, `_Z9pkey_freei`, `_Z13pkey_mprotectPvmii`,
+ * `_Z8pkey_geti`, `_Z8pkey_setij`). On musl, V8's own un-`extern "C"`
+ * declarations give the call sites C++ linkage, so a C shim would not bind them.
  *
  * pkey_alloc/free/mprotect -> raw syscalls (x86_64 nrs 330/331/329, the Linux ABI
  *   the m3OS Phase 90a B.3 kernel handlers honor).
@@ -3984,6 +4024,84 @@ fn apply_node_jit_patches(src: &Path, shim_rel: &str) -> Result<(), String> {
     // rejected. m3OS's B.4 implements correct PKRU inherit-on-clone/reset-on-exec
     // semantics (what the Linux check guards), so accept m3OS.
     patch_kernel_has_pkru_fix(src)?;
+
+    // ── patch 4: define PKEY_DISABLE_ACCESS / PKEY_DISABLE_WRITE in the V8 TUs ────
+    // THE engagement-critical patch. V8's `PkeyAlloc()`
+    // (default-thread-isolated-allocator.cc:53) calls `pkey_alloc(0,
+    // PKEY_DISABLE_WRITE)` ONLY inside `#ifdef PKEY_DISABLE_WRITE`; without the macro
+    // it compiles to `return -1`, so V8 never gets a pkey, `ThreadIsolation` stays
+    // disabled, and V8 falls back to plain `mprotect(RWX)` (which m3OS W^X v2
+    // rejects). glibc's <sys/mman.h> defines these; musl's does NOT, and V8's gyp
+    // build bakes its own per-TU cflags at configure time and does NOT inherit our
+    // top-level `CXXFLAGS -D…` — so the `-DPKEY_DISABLE_*` we pass reaches node's own
+    // sources but NEVER V8's `v8_libplatform`/`v8_base` TUs. Define them in-source.
+    // (Verified empirically: the unpatched JIT binary emitted ZERO pkey_alloc
+    // syscalls and used mprotect(RWX); the compile line for the allocator TU carried
+    // no -DPKEY_DISABLE_WRITE.) Values match V8's `Permission` enum
+    // (kDisableAccess=1, kDisableWrite=2 — memory-protection-key.h:42-44), so the
+    // header's `static_assert(kDisableWrite == PKEY_DISABLE_WRITE)` holds.
+    patch_pkey_disable_macros(src)?;
+
+    Ok(())
+}
+
+/// Define `PKEY_DISABLE_ACCESS`/`PKEY_DISABLE_WRITE` in the two V8 TUs that need
+/// them — musl's `<sys/mman.h>` omits them and V8's gyp build does not see our
+/// `CXXFLAGS -D`. Without this, `PkeyAlloc()` is a `return -1` stub and PKU never
+/// engages. Idempotent via a sentinel; fails if an anchor is absent.
+fn patch_pkey_disable_macros(src: &Path) -> Result<(), String> {
+    const SENTINEL: &str = "m3os-pku-jit: PKEY_DISABLE_* macros";
+    let defs = format!(
+        "\n// {SENTINEL}\n\
+         #ifndef PKEY_DISABLE_ACCESS\n#define PKEY_DISABLE_ACCESS 0x1\n#endif\n\
+         #ifndef PKEY_DISABLE_WRITE\n#define PKEY_DISABLE_WRITE 0x2\n#endif\n"
+    );
+
+    // (a) default-thread-isolated-allocator.cc — inject AFTER its <sys/mman.h>
+    //     include (PkeyAlloc uses PKEY_DISABLE_WRITE further down).
+    let alloc = src.join("deps/v8/src/libplatform/default-thread-isolated-allocator.cc");
+    let alloc_text = fs::read_to_string(&alloc)
+        .map_err(|e| format!("node-jit: read {}: {e}", alloc.display()))?;
+    if !alloc_text.contains(SENTINEL) {
+        let anchor = "#include <sys/mman.h>";
+        if !alloc_text.contains(anchor) {
+            return Err(format!(
+                "node-jit: anchor `{anchor}` not found in {} — V8 layout drifted; \
+                 update patch_pkey_disable_macros (A.1 finding 1)",
+                alloc.display()
+            ));
+        }
+        let patched = alloc_text.replacen(anchor, &format!("{anchor}{defs}"), 1);
+        fs::write(&alloc, patched)
+            .map_err(|e| format!("node-jit: write {}: {e}", alloc.display()))?;
+        println!(
+            "node-jit: patched {} (PKEY_DISABLE_* macros)",
+            alloc.display()
+        );
+    }
+
+    // (b) memory-protection-key.cc — inject BEFORE the first include so the header's
+    //     `static_assert(kDisableAccess == PKEY_DISABLE_ACCESS)` (memory-protection-key.h:49)
+    //     sees the macros.
+    let mpk = src.join("deps/v8/src/base/platform/memory-protection-key.cc");
+    let mpk_text =
+        fs::read_to_string(&mpk).map_err(|e| format!("node-jit: read {}: {e}", mpk.display()))?;
+    if !mpk_text.contains(SENTINEL) {
+        let anchor = "#include \"src/base/platform/memory-protection-key.h\"";
+        if !mpk_text.contains(anchor) {
+            return Err(format!(
+                "node-jit: anchor `{anchor}` not found in {} — V8 layout drifted; \
+                 update patch_pkey_disable_macros (A.1 finding 1)",
+                mpk.display()
+            ));
+        }
+        let patched = mpk_text.replacen(anchor, &format!("{defs}{anchor}"), 1);
+        fs::write(&mpk, patched).map_err(|e| format!("node-jit: write {}: {e}", mpk.display()))?;
+        println!(
+            "node-jit: patched {} (PKEY_DISABLE_* macros)",
+            mpk.display()
+        );
+    }
 
     Ok(())
 }
@@ -4196,6 +4314,20 @@ fn compile_node_pkey_shim(
     for tok in cflags.split_whitespace() {
         cmd.arg(tok);
     }
+    // CRITICAL: compile as C++ (`-x c++`), so the shim's `pkey_*` definitions get
+    // C++ linkage and mangle to the SAME names V8's weak refs use
+    // (`_Z10pkey_allocjj`, `_Z9pkey_freei`, `_Z13pkey_mprotectPvmii`,
+    // `_Z8pkey_geti`, `_Z8pkey_setij`). V8 declares these weak functions in C++
+    // TUs without `extern "C"`, and musl's `<sys/mman.h>` does not declare them,
+    // so the call sites reference the mangled symbols — a C-linkage shim would
+    // NOT bind them (the `.cc` extension alone would suffice, but `-x c++` is
+    // explicit since `cflags` here are the C-target flags). The shim uses only C
+    // headers, which are valid in C++. `-fno-exceptions`/`-fno-rtti` keep it
+    // free of any libstdc++/libc++ dependency on the link line.
+    cmd.arg("-x")
+        .arg("c++")
+        .arg("-fno-exceptions")
+        .arg("-fno-rtti");
     cmd.arg("-c").arg(&shim_c).arg("-o").arg(&obj);
     run(&mut cmd, "node-jit pkey shim compile")?;
     println!("node-jit: compiled pkey shim object {}", obj.display());
