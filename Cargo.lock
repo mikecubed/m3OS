@@ -1526,6 +1526,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pku-smoke"
+version = "0.1.0"
+dependencies = [
+ "syscall-lib",
+]
+
+[[package]]
 name = "poly1305"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
