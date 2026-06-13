@@ -593,6 +593,27 @@ if [ "${M3OS_SIMD_REGRESSION:-0}" = "1" ]; then
     fi
 fi
 
+# Phase 90a Track D.1 — PKU substrate + W^X v2 regression gate. Gated behind
+# M3OS_PKU_REGRESSION=1. Boots m3OS and runs the ramdisk pku-smoke binary,
+# which falsifiably exercises the Track B PKU substrate + the Track C.1 W^X v2
+# pkey-guarded exception independent of V8: pkey alloc/free lifecycle +
+# ENOSPC exhaustion, a denied-write fault (a forked child killed by SIGSEGV),
+# per-context PKRU register asymmetry, signal-frame PKRU preservation (B.4),
+# and the W^X v2 accept/reject matrix. On a no-PKU CPU (TCG) the binary SKIPs
+# the five hardware arms and still asserts the v1 W^X rejections; run under
+# M3OS_KVM=1 on a PKU host to exercise the real arms. Set this on branches that
+# touch kernel/src/arch/x86_64/pkru.rs, the pkey_* syscalls (329/330/331),
+# kernel_core::pkey, the wx_decision W^X v2 guard, the per-task/signal-frame
+# XSAVE component-9 RFBM, the PTE pkey composition (mm/pkey.rs), or the fork
+# PKRU/PTE-tag inherit path.
+if [ "${M3OS_PKU_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask pku-smoke..."
+    if ! cargo xtask pku-smoke --timeout 240; then
+        echo "pre-push: cargo xtask pku-smoke failed" >&2
+        exit 1
+    fi
+fi
+
 # Phase 87 — VFS bulk-I/O throughput regression gate. Gated behind
 # M3OS_VFS_BULKIO_REGRESSION=1. Boots m3OS, `pkg install`s mbedtls, and asserts
 # BOTH the /proc/blkstats read_calls AND write_calls deltas stayed under their

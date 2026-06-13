@@ -267,6 +267,15 @@ const SMOKE_EXIT_NODE_SMOKE_FAILED: i32 = 82;
 /// zero-fill-skip write path).
 const SMOKE_EXIT_VFS_BULKIO_FAILED: i32 = 81;
 
+/// Phase 90a Track D.1 — `cargo xtask pku-smoke` exit code. Boots m3OS and runs
+/// the `pku-smoke` ramdisk binary, which emits per-case `PKU_SMOKE:<case>:ok`
+/// (or `:SKIP` on a no-PKU CPU) sentinels for the PKU substrate (Track B) + the
+/// W^X v2 pkey-guarded exception (Track C.1): pkey alloc/free lifecycle +
+/// exhaustion, a denied-write fault, per-context PKRU asymmetry, signal-frame
+/// PKRU preservation, and the W^X v2 accept/reject matrix. The gate fails on any
+/// `PKU_SMOKE:<case>:FAIL` line.
+const SMOKE_EXIT_PKU_SMOKE_FAILED: i32 = 83;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
     Headless,
@@ -1123,6 +1132,19 @@ fn main() {
                 });
             cmd_userspace_simd_smoke(&smoke_args);
         }
+        // Phase 90a Track D.1 — `pku-smoke` kernel-level PKU regression gate.
+        // Boots m3OS, runs the `pku-smoke` ramdisk binary, and asserts every
+        // PKU substrate + W^X v2 case reaches `PKU_SMOKE:done` (or SKIPs the
+        // hardware arms on a no-PKU CPU). Run under `M3OS_KVM=1` on a PKU host
+        // to exercise the real arms.
+        Some("pku-smoke") => {
+            let smoke_args = parse_smoke_boot_args("pku-smoke", &args[2..]).unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            cmd_pku_smoke(&smoke_args);
+        }
         // Phase 85a Track B.3 — zero-rebuild assertion gate.
         // Builds a port once to warm the pkgcache, removes the stage so the
         // same-machine `.stamp` fast-path cannot short-circuit, then builds
@@ -1147,7 +1169,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -1431,6 +1453,12 @@ fn build_userspace_bins() {
         // and asserts the JIT pattern (`PROT_READ | PROT_EXEC`)
         // succeeds. Pure syscall+write — no allocator.
         ("wx-violation", "wx-violation", false),
+        // Phase 90a Track D.1 — `pku-smoke` PKU substrate + W^X v2
+        // regression. Exercises pkey_alloc/free/mprotect (329/330/331),
+        // RDPKRU/WRPKRU, fork-based denied-write fault recovery, and the
+        // W^X v2 accept/reject matrix. Pure syscall + fork + write — no
+        // allocator.
+        ("pku-smoke", "pku-smoke", false),
         // Phase 77 Track F.1 — epoll_* verification smoke test.
         // Pure syscall+write against a pipe; no allocator.
         ("epoll-smoke", "epoll-smoke", false),
@@ -12430,6 +12458,176 @@ fn cmd_userspace_simd_smoke(args: &SmokeBootArgs) {
             let _ = child.kill();
             let _ = child.wait();
             eprintln!("userspace-simd-smoke: FAILED\n{msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 90a Track D.1 — `pku-smoke`: kernel-level PKU regression gate.
+// ---------------------------------------------------------------------------
+
+/// Smoke step list for `cargo xtask pku-smoke`.
+///
+/// Boots m3OS, logs into `sh0` over serial, and runs the ramdisk-embedded
+/// `pku-smoke` binary. The binary emits one `PKU_SMOKE:<case>:ok` (or
+/// `PKU_SMOKE:<case>:SKIP ...` on a no-PKU CPU) sentinel per case and a final
+/// `PKU_SMOKE:done` summary; an assertion failure prints
+/// `PKU_SMOKE:<case>:FAIL <reason>` and a panic prints `PKU_SMOKE:panic`.
+///
+/// The gate is the binary's own falsifiable proof: every internal assertion
+/// (key alloc/free + exhaustion, the denied-write fault that must kill a
+/// forked child with SIGSEGV, the per-context PKRU asymmetry, the signal-frame
+/// PKRU preservation, and the W^X v2 accept/reject matrix) runs *before*
+/// `PKU_SMOKE:done` is printed — so reaching `done` means every case passed.
+/// On a no-PKU configuration the hardware-dependent arms print `SKIP` and the
+/// v1 W^X rejections (`mprotect`/`mmap` W+X → EINVAL) are still asserted, so
+/// the gate is meaningful on both TCG (no PKU) and `M3OS_KVM=1` (real PKU)
+/// configurations. PKU presence is auto-detected inside the binary (a
+/// `pkey_alloc` ENOSPC probe), so the gate needs no host-side PKU plumbing —
+/// `M3OS_KVM=1` exposes the dev host's real PKU to the guest via the shared
+/// `qemu_args_with_devices` KVM path.
+///
+/// `WaitPassOrFail` matches `PKU_SMOKE:done` (pass) or any line containing
+/// `:FAIL` / `PKU_SMOKE:panic` (fail), aborting immediately with the captured
+/// reason on a failed case rather than timing out generically.
+fn pku_smoke_steps(kvm: bool) -> Vec<SmokeStep> {
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/pku-smoke: kernel first message",
+    }];
+    // Log into sh0 so the next Send lands at a shell prompt, not `m3OS login:`.
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "pku-smoke\n",
+        label: "guest/pku-smoke: run pku-smoke binary",
+    });
+    // Under KVM the dev host's real PKU is exposed, so the hardware-dependent
+    // arms MUST run (`:ok`), not SKIP. Assert the two load-bearing sentinels —
+    // the core denied-write fault proof and the W^X v2 accept arm — with
+    // non-consuming `Wait`s before the terminal `done`, so a silent fall-back
+    // to the no-PKU SKIP path (e.g. CR4.PKE not set, or pku_usable() false in
+    // the syscall context) fails the gate instead of passing on `done` alone.
+    // Without KVM these lines are `:SKIP`, so the asserts are KVM-only.
+    if kvm {
+        steps.push(SmokeStep::Wait {
+            pattern: "PKU_SMOKE:deny_fault:ok",
+            timeout_secs: 60,
+            label: "guest/pku-smoke: denied-write fault trapped (core PKU proof)",
+        });
+        steps.push(SmokeStep::Wait {
+            pattern: "PKU_SMOKE:wx_v2:ok",
+            timeout_secs: 60,
+            label: "guest/pku-smoke: W^X v2 accept+reject matrix",
+        });
+    }
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "PKU_SMOKE:done",
+        fail_prefixes: &[":FAIL", "PKU_SMOKE:panic"],
+        timeout_secs: 60,
+        label: "guest/pku-smoke: all PKU cases passed (or SKIPped on no-PKU)",
+        exit_code_on_fail: SMOKE_EXIT_PKU_SMOKE_FAILED,
+    });
+    steps
+}
+
+fn cmd_pku_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false, // graphical_login — serial autologin path
+    );
+
+    let ovmf = find_ovmf();
+    // Honor `M3OS_KVM=1` by threading it into the `DeviceSet` — unlike the TCG
+    // `-cpu qemu64,...` model (which advertises no PKU, so the hardware arms
+    // SKIP), KVM's `-cpu host` exposes the dev host's real `pku`+`ospke` to the
+    // guest, so `pkey_alloc` succeeds and the full matrix runs. (Threaded
+    // explicitly here because `session_smoke_qemu_args`/`DeviceSet::default()`
+    // never read `M3OS_KVM`.)
+    let kvm = std::env::var_os("M3OS_KVM").is_some_and(|v| v != "0" && !v.is_empty());
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args = qemu_args_with_devices(
+        &uefi_image,
+        &ovmf,
+        display_mode,
+        DeviceSet {
+            kvm,
+            ..DeviceSet::default()
+        },
+    );
+    // Drop the hostfwd rule (the gate needs no host networking) — same trim
+    // `session_smoke_qemu_args` applies.
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    // Pin the guest to a single core (mirroring `go-runtime-smoke`). The PKU
+    // test forks child processes that the scheduler may migrate across cores;
+    // running single-core keeps the fork's CoW page + the per-thread PKRU
+    // register asymmetry confined to one core's PKRU, sidestepping cross-core
+    // scheduler/PKRU-coherence races during the heavy fork+fault sequence. The
+    // per-CONTEXT (not per-core) asymmetry — two processes with independent
+    // PKRU values — is exercised regardless of core count.
+    for i in 0..qemu_args.len() {
+        if qemu_args[i] == "-smp" && i + 1 < qemu_args.len() {
+            qemu_args[i + 1] = "1".to_string();
+        }
+    }
+    append_ac97_audio_flags_headless(&mut qemu_args);
+    let steps = pku_smoke_steps(kvm);
+
+    println!(
+        "pku-smoke: launching QEMU (timeout {}s){}",
+        args.timeout_secs,
+        if kvm {
+            " [KVM — real PKU, full matrix]"
+        } else {
+            " [TCG — no PKU, hardware arms SKIP]"
+        }
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("pku-smoke: failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!("pku-smoke: PASS ({} steps in {elapsed}s)", steps.len());
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("pku-smoke: FAILED\n{msg}");
             std::process::exit(1);
         }
     }
