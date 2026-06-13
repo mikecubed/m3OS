@@ -9,6 +9,10 @@
 //!    `kernel/src/arch/x86_64/syscall/mod.rs`).
 //! 3. `mprotect(PROT_READ | PROT_EXEC)` succeeds — the supported JIT
 //!    pattern (allocate RW-, write code, then flip to R-X).
+//! 4. (Phase 90a C.1) `mmap(PROT_READ | PROT_WRITE | PROT_EXEC)` is
+//!    rejected with `EINVAL` at mmap entry — `mmap` carries no pkey, so a
+//!    W+X mmap must fail closed rather than demand-fault into a live
+//!    unguarded W+X PTE. Guards the C.1 mmap(W+X) bypass.
 //!
 //! On success prints `WX_VIOLATION:smoke:ok` and exits 0. An assertion
 //! failure prints `WX_VIOLATION:fail <reason>` and exits 2. A panic
@@ -120,7 +124,36 @@ fn wx_violation_main() -> ! {
         fail(b"mprotect-rx-failed");
     }
 
-    // 6. Cleanup — best effort; failure does not invalidate the test.
+    // 6. Negative case — `mmap(PROT_READ | PROT_WRITE | PROT_EXEC)` must be
+    //    rejected with EINVAL by the Phase 90a C.1 guard (contract clause 1).
+    //    `mmap` carries no pkey argument, so it can only express the unguarded
+    //    key-0 case; a W+X mmap must fail closed at entry rather than
+    //    demand-fault into a live unguarded W+X PTE. Guards the C.1 mmap(W+X)
+    //    bypass against regression.
+    let rc_mmap_wx = unsafe {
+        syscall6(
+            SYS_MMAP,
+            0,
+            PAGE,
+            PROT_READ | PROT_WRITE | PROT_EXEC,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            u64::MAX,
+            0,
+        )
+    } as i64;
+    // The kernel returns the same errno as the mprotect W+X reject (EINVAL).
+    // Accept any negative (MAP_FAILED-class) return, but require it be an
+    // error — a non-negative vaddr means the W+X mapping was honored (bypass).
+    if rc_mmap_wx >= 0 {
+        // Best-effort unmap so a failed assertion does not leak the bad page.
+        let _ = unsafe { syscall2(SYS_MUNMAP, rc_mmap_wx as u64, PAGE) };
+        fail(b"mmap-wx-not-rejected");
+    }
+    if rc_mmap_wx != EINVAL_NEG {
+        fail(b"mmap-wx-not-einval");
+    }
+
+    // 7. Cleanup — best effort; failure does not invalidate the test.
     let _ = unsafe { syscall2(SYS_MUNMAP, base, PAGE) };
 
     let _ = write(STDOUT_FILENO, b"WX_VIOLATION:smoke:ok\n");

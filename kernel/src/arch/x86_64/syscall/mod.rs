@@ -11170,6 +11170,20 @@ pub(super) fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
     const PROT_MASK: u64 = 0x7; // PROT_READ | PROT_WRITE | PROT_EXEC
     let prot = prot & PROT_MASK;
 
+    // W^X enforcement (C.1 contract clause 1): `mmap` carries no pkey argument
+    // (there is no `pkey_mmap` — the JIT/V8 contract is mmap-then-pkey_mprotect,
+    // never mmap-W+X), so a plain mmap is the key-0 / non-`Tag` case of the
+    // canonical `wx_decision` rule, which rejects W+X. Reject here BEFORE any
+    // file-backed dispatch, MAP_FIXED handling, or VMA recording, so a W+X prot
+    // can never demand-fault into a live unguarded W+X PTE tagged key 0. Return
+    // the identical errno `sys_mprotect`/`mprotect_worker` returns for W+X
+    // (`NEG_EINVAL`, -22). Covers anon/file/hint/MAP_FIXED uniformly.
+    const PROT_WRITE: u64 = 0x2;
+    const PROT_EXEC: u64 = 0x4;
+    if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
+        return NEG_EINVAL;
+    }
+
     if flags & MAP_ANONYMOUS == 0 {
         // File-backed mmap — Strategy A (eager loading).
         let fd = per_core_syscall_user_r8() as usize;
@@ -11330,6 +11344,21 @@ fn sys_mmap_file_backed(
         return NEG_EINVAL;
     }
 
+    const PROT_WRITE: u64 = 0x2;
+    const PROT_EXEC: u64 = 0x4;
+
+    // W^X enforcement (C.1 contract clause 1): a file-backed `mmap` carries no
+    // pkey argument, so it is the key-0 / non-`Tag` case of the canonical
+    // `wx_decision` rule, which rejects W+X. This path maps eagerly, so a W+X
+    // prot would compose a live unguarded W+X PTE tagged key 0 below. Reject
+    // here BEFORE any allocation or mapping, with the identical errno
+    // `sys_mprotect`/`mprotect_worker` returns for W+X (`NEG_EINVAL`, -22).
+    // (`sys_linux_mmap` also rejects this before dispatch; this is the in-function
+    // guard for the contract's named entry point.)
+    if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
+        return NEG_EINVAL;
+    }
+
     let pages = len.div_ceil(4096);
     let total_size = match pages.checked_mul(4096) {
         Some(s) => s,
@@ -11340,9 +11369,6 @@ fn sys_mmap_file_backed(
     }
 
     use x86_64::structures::paging::{PageTableFlags, PhysFrame, Size4KiB};
-
-    const PROT_WRITE: u64 = 0x2;
-    const PROT_EXEC: u64 = 0x4;
 
     let mut pt_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
     if prot & PROT_WRITE != 0 {
@@ -11840,17 +11866,19 @@ enum WxDecision {
 /// - **`sys_pkey_mprotect`** — routes through `mprotect_worker` with the
 ///   classified key decision → this guard (clauses 3.a/3.b/3.c). The *only*
 ///   `GuardedV2` producer.
-/// - **`sys_mmap` (anon + file-backed)** — never sets a non-default VMA key
-///   (the VMA is recorded with `PKEY_DEFAULT`), and its PTEs are composed via
-///   `compose_user_pte_flags`/eager paths with `pkey = 0`. A W+X *prot* there
-///   produces a `WRITABLE` + executable PTE, but only `mprotect`/`pkey_mprotect`
-///   can ever *flip a page executable while writable* through a guarded route;
-///   the JIT contract is allocate-RW then `pkey_mprotect(RWX, key)`. `mmap`
-///   itself does not carry a v2 key, so a W+X mapping there can only reach an
-///   executable page via a subsequent `mprotect`/`pkey_mprotect` — i.e. back
-///   through this single guard. (See the `mm/pkey.rs` PTE-rewrite-path audit:
-///   the eager file-backed/ELF composers stamp key 0; they cannot smuggle a
-///   write-deny key, so a v2 grant is impossible off the `mmap` path.)
+/// - **`sys_mmap` (anon + file-backed)** — `mmap` carries no pkey argument
+///   (there is no `pkey_mmap`; V8's contract is mmap-then-`pkey_mprotect`,
+///   never mmap-W+X), so it can only express the unguarded (key-0) case. A W+X
+///   *prot* there would otherwise demand-fault / eager-map into a LIVE W+X PTE
+///   tagged key 0 that never touches the v2 guard, so **both `sys_linux_mmap`
+///   (anon) and `sys_mmap_file_backed` reject W+X at mmap entry** (contract
+///   clause 1) with the **same errno as `mprotect`** (`NEG_EINVAL`, -22). This
+///   is the key-0 / non-`Tag` case of the canonical `wx_decision` rule applied
+///   eagerly at the mmap entry point: a plain `mmap` is the `Preserve`/`Default`
+///   decision, which `wx_decision` classifies as `Rejected` for W+X. The VMA is
+///   still recorded with `PKEY_DEFAULT` for the accepted (non-W+X) cases, and
+///   the only route to an executable+writable page is a subsequent guarded
+///   `mprotect`/`pkey_mprotect` — back through `mprotect_worker`'s single gate.
 /// - **Demand-fault PTE composition** (`compose_user_pte_flags`) — composes from
 ///   the VMA's `prot` + `pkey`. The VMA only carries a non-default `pkey` after a
 ///   `pkey_mprotect(.., Tag(k))` that *this guard already permitted* (clause
@@ -11865,9 +11893,11 @@ enum WxDecision {
 ///   never *introduce* a new W+X combination. A CoW page that was R-X stays
 ///   non-writable; a writable page stays non-executable.
 ///
-/// So `mprotect_worker` (called by both `sys_mprotect` and `sys_pkey_mprotect`)
-/// is the only place a W+X PTE can be *introduced*, and this function is its
-/// only gate. Returns the [`WxDecision`].
+/// So a W+X PTE can only be *introduced* through `mprotect_worker` (called by
+/// both `sys_mprotect` and `sys_pkey_mprotect`), gated by `wx_decision`; the
+/// `mmap` entry points reject W+X up front with the same `wx_decision` rule and
+/// the same errno, so no `mmap` path can install an unguarded W+X PTE either.
+/// Returns the [`WxDecision`].
 fn wx_decision(
     prot: u64,
     key_decision: kernel_core::pkey::PkeyMprotectKey,
