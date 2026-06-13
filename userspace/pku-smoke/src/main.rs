@@ -231,18 +231,27 @@ pub extern "C" fn _start() -> ! {
     );
 }
 
-/// Probe PKU presence. `pkey_alloc` returns ENOSPC on a no-PKU CPU (Linux
-/// semantics; the kernel returns it without touching the table). A success
-/// means PKU is usable; free the probe key so the exhaustion case starts from
-/// a clean table.
+/// Probe PKU presence. A success (key ≥ 1) means PKU is usable; free the probe
+/// key so the exhaustion case starts from a clean table. On a no-PKU CPU
+/// `sys_pkey_alloc` returns -ENOSPC up front (it reports zero allocatable keys
+/// without touching the table) — that is the *one* benign non-success, after
+/// which the hardware-dependent arms legitimately SKIP. Any other return (a
+/// different negative errno such as EINVAL/ENOSYS, or a spurious 0) is a
+/// regression in the `pkey_alloc` path itself; a regression gate must not let
+/// that masquerade as "no PKU" and silently SKIP every case, so we fail loud.
 fn pku_present() -> bool {
     let k = pkey_alloc(0, 0);
     if k >= 1 {
         let _ = pkey_free(k as u64);
-        true
-    } else {
-        false
+        return true;
     }
+    if k != ENOSPC_NEG {
+        fail(
+            b"probe",
+            b"pkey_alloc(0,0) returned neither a key (>=1) nor -ENOSPC; regression, not a no-PKU CPU",
+        );
+    }
+    false
 }
 
 fn pku_smoke_main() -> ! {
