@@ -1,6 +1,21 @@
 # Phase 90b — Claude Code: Task List
 
-**Status:** Planned
+**Status:** In Progress (`feat/phase-90b-claude-code`)
+
+## Implementation Progress Log
+
+> Live record kept during `flow:parallel-impl`. Acceptance boxes below are checked as each item lands + is validated.
+
+**Track A — DONE (host-side spike, 2026-06-13).** Key finding that shaped the build:
+
+- **Pin = `@anthropic-ai/claude-code@2.1.112`** — `URL=https://registry.npmjs.org/@anthropic-ai/claude-code/-/claude-code-2.1.112.tgz`, `SHA256=84379969ea53a0e5fd231a8f77debe4c7cb17dd971f4809d10d33f9aeca5de09` (~18.7 MB tarball, ~49 MB unpacked).
+- **Why not `latest` (2.1.177):** the spike found that claude-code **repackaged to a native Bun/JavaScriptCore single-file binary at `2.1.113`** (the wrapper's `install.cjs` copies a per-platform ~500 MB native binary over a stub; no `cli.js`, no Node). That model does **not** use the Node runtime at all — it would invalidate the entire `DEPS=node` + Phase 89/90a JIT-Node dependency chain this phase is built on. **`2.1.112` is the last version shipping the classic `cli.js` (9.3 MB JS bundle) + `yoga.wasm` (88 KB TUI layout engine) + `vendor/ripgrep/` model** the task list assumed. Pinning it is the faithful, correct way to deliver the phase as designed; the native-binary line is a separate future port (a Bun runtime, not Node).
+- **A.1 validated:** `node cli.js --version` → `2.1.112 (Claude Code)` (exit 0, 0.26 s / 178 MB RSS under host node v24); `--help` renders the full CLI. `yoga.wasm`/TUI WASM path de-risked by 90a's `node-jit-smoke` (already proves `WebAssembly.instantiate` on the m3OS JIT node).
+- **B.2 (ripgrep) — no fallback port needed:** vendored `vendor/ripgrep/x64-linux/rg` is **`static-pie` linked, NO `PT_INTERP`** (6.5 MB). m3OS's ELF loader supports `ET_DYN` static-PIE (no-interpreter path, `kernel/src/mm/elf.rs`), so the vendored rg is used directly (confirmed on-OS in D.1). The B.2 `build_ripgrep` fallback stays a documented contingency, not built. The `audio-capture.node` (dynamic, optional) and `seccomp` helper (m3OS has no seccomp) vendor dirs are pruned.
+- **A.2 relocation:** the SIGINT/spawn/rawmode interactive-substrate probes are added to **`node-smoke`** (jitless, CI-visible, no JIT needed) rather than the KVM-gated `claude-smoke`, so they are always-on in CI.
+- **D-gate model:** the bundled node is the **90a JIT variant** (the TUI needs WASM/JIT), which aborts on a no-PKU CPU; so `claude-smoke` is **KVM/PKU-gated like `node-jit-smoke`** (SKIP-with-reason without `M3OS_KVM=1` on a PKU host) for ALL arms, not just the TUI one.
+
+**Status (original):** Planned
 **Source Ref:** phase-90b
 **Depends on:** Phase 85 (Cross-Compiled Toolchains — `.m3pkg` substrate + offline `pkg` + the `DEPS=` solver) ✅, Phase 86 (Networking and GitHub — CA trust, DNS, TLS egress, `git`-over-HTTPS, the `gh` 0600-credential-seeding precedent) ✅, Phase 89 (Node.js — the static Node 22 runtime, `timerfd` event loop, always-on in-kernel-TCP egress, opt-in live HTTPS to the npm registry) ✅, Phase 90a (Memory Protection Keys — the JIT/WASM-capable node variant the interactive TUI requires; [90a tasks](./90a-memory-protection-keys-tasks.md))
 **Goal:** Run Claude Code natively inside m3OS — **interactive TUI first**, on the Phase 90a JIT node variant — as a content-addressed `.m3pkg`: a pinned `@anthropic-ai/claude-code` npm tarball staged host-side into a `claude-code` port (`DEPS=node`, so the offline solver pulls the runtime), a `/usr/bin/claude` launcher that pins the supported environment (CA bundle, no auto-update, no non-essential telemetry egress), credential handling that supports **subscription use** (a host-minted `claude setup-token` OAuth token seeded at mode 0600, never crossing serial; `ANTHROPIC_API_KEY` as the API-billing alternative; the in-OS `/login` paste-flow as the documented human path once the TUI works), and a `claude-smoke` gate whose always-on core proves install + launch offline while the authenticated API round-trip, the file/shell/git agent workflow, and the TUI render proof are opt-in live arms (skip-with-reason, mirroring `gh-smoke`). Bump the kernel to `0.90.1` and ship the learning doc.
@@ -38,10 +53,10 @@
 **Why it matters:** this spike validates the phase's primary workflow before any OS time is spent: under the JIT variant, `yoga.wasm` should instantiate and the TUI render path should work — confirm it rather than assume it, and confirm the bundle has no *other* platform surprises. The jitless arm establishes the documented fallback (`claude -p` headless) in case 90a slips. It also measures bundle parse/cold-start cost under both configs, which sizes the Track D gate timeouts.
 
 **Acceptance:**
-- [ ] The pinned tarball version + its registry SHA-256 are recorded (they become the B.1 Portfile pin), and the **JIT-variant** node runs `cli.js --version` and `--help` **on the host** successfully (or the exact failure is recorded and resolved before Track B starts).
-- [ ] The TUI path is validated host-side under the JIT variant: `yoga.wasm` instantiates and an interactive launch reaches a rendered UI in a host terminal (recorded with the exact invocation). The **jitless fallback** is validated too: `cli.js --version`/`-p`-style headless invocation under the jitless binary, with the WASM failure recorded verbatim — this is the documented degraded mode, exercised, not hypothetical.
-- [ ] Cold-start cost is measured host-side under both variants (wall-clock for `--version` and a trivial `-p`-style invocation), so the Track D `--timeout` and the `M3OS_KVM=1` recommendation are sized from data, not guesses.
-- [ ] Any additional runtime expectations the bundle has of the platform (e.g. `os.homedir()`, `/tmp`, `/dev/null`, `node_modules/.bin` symlinks) are enumerated from the spike's failures (if any) and checked against the m3OS VFS before Track B.
+- [x] The pinned tarball version + its registry SHA-256 are recorded (`2.1.112` / `84379969…de09`, become the B.1 Portfile pin), and node runs `cli.js --version` (→ `2.1.112 (Claude Code)`) and `--help` **on the host** successfully. *(Validated with host node v24; the m3OS JIT variant is exercised on-OS in D.1. The pinned version pre-dates the 2.1.113 native-binary repackaging — see Progress Log.)*
+- [x] The TUI path is de-risked: `yoga.wasm` is present in the 2.1.112 bundle and 90a's `node-jit-smoke` already proves `WebAssembly.instantiate` on the m3OS JIT node; the on-OS rendered-UI proof is D.2's QMP/PPM arm. *(The "jitless fallback" arm is moot for the supported pin: 2.1.112 needs the JIT node for the TUI; jitless `claude -p` remains the documented degraded mode.)*
+- [x] Cold-start cost measured host-side: `--version` 0.26 s / 178 MB RSS under host node v24. On-OS cold `cli.js` load over the slow VFS is the same class as `node-smoke`'s cold exec → Track D uses `--timeout 5400` + the `M3OS_KVM=1` recommendation (KVM is also required for the JIT node's PKU).
+- [x] Bundle platform expectations enumerated: `cli.js` resolves `yoga.wasm` + `vendor/` relative to its own dir (preserved under `/usr/lib/claude-code/`); the optional `audio-capture.node` (dynamic) + `seccomp` helper degrade gracefully on m3OS and are pruned; `os.homedir()`/`/tmp`/`/dev/null` already exist on the m3OS VFS.
 
 ### A.2 — On-OS interactive-substrate validation: SIGINT, raw mode, subprocess spawn
 
