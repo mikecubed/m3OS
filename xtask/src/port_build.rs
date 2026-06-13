@@ -533,12 +533,22 @@ fn build_recipe_id(name: &str) -> &'static str {
         // configure knob set (jitless for W^X, static musl, small-icu) so a flag
         // change self-invalidates the cached `.m3pkg`; the host clang identity is
         // folded separately via `host_cxx_toolchain_id()` in `compute_port_key`.
+        //
+        // Phase 90a (D.2) — the JIT/jitless VARIANT is NOT pinned here (this arm is
+        // `&'static str` and cannot read `M3OS_NODE_JIT`); it is folded into node's
+        // content key via the per-port `tc` string in `compute_port_key_inner`
+        // (`variant=jit|jitless` via `node_variant_id()`), so the two variants get
+        // distinct keys regardless of this arm. The JIT variant additionally drops
+        // `--v8-options=--jitless` + applies the three A.1 V8/Node PKU patches +
+        // links the `pkey_*` shim (all gated on `node_jit_enabled()` in build_node).
+        // recipe-v bumped to 5: build_node's recipe changed (variant branching), so
+        // invalidate the stale Phase 89 cached jitless `.m3pkg`.
         "node" => {
             "node-configure:--fully-static --enable-static --dest-cpu=x64 \
              --dest-os=linux --with-intl=small-icu --v8-options=--jitless \
              --openssl-no-asm --without-corepack --without-node-snapshot \
              --without-inspector;single-toolset;make-generator;wasm-in-jitless;\
-             cxxstdlib=libc++-musl;recipe-v=4"
+             cxxstdlib=libc++-musl;jit-variant=M3OS_NODE_JIT(key-folded);recipe-v=5"
         }
         _ => "",
     }
@@ -891,10 +901,18 @@ fn compute_port_key_inner(
         // (M3OS_LLVM_* vs M3OS_NODE_*), so each folds the identity of the compiler
         // it actually invokes.
         "llvm" => format!("{}|host-cxx={}", toolchain_id(), host_cxx_toolchain_id()),
+        // Phase 90a (D.2) — fold the JIT/jitless VARIANT into node's key in
+        // addition to the host-clang identity. `node_variant_id()` reads
+        // `M3OS_NODE_JIT`; a JIT build (`variant=jit`) and a jitless build
+        // (`variant=jitless`) therefore get DISTINCT content keys, so one is a pure
+        // pkgcache MISS for the other (and a HIT for its own kind) — the two sealed
+        // `.m3pkg`s never serve each other's cache entries. The jitless artifact
+        // stays the Phase 89 default; the JIT variant is additive under its own key.
         "node" => format!(
-            "{}|host-cxx={}",
+            "{}|host-cxx={}|variant={}",
             toolchain_id(),
-            host_cxx_toolchain_id_for("M3OS_NODE_CLANG", "M3OS_NODE_CLANGXX")
+            host_cxx_toolchain_id_for("M3OS_NODE_CLANG", "M3OS_NODE_CLANGXX"),
+            node_variant_id()
         ),
         // Phase 86e — go/gh cross-build with the downloaded Go toolchain, not the
         // musl cross-compiler; fold the Go toolchain identity (not musl) so a Go
@@ -3464,6 +3482,27 @@ const LLVM_MAJOR: &str = "18";
 /// (`/usr/lib/clang/<major>`) — the Phase 85a relocation contract at its hardest.
 const LLVM_TGT_SYSROOT: &str = "/usr/lib/clang-sysroot";
 
+/// Phase 90a (D.2) — is the JIT `build_node` variant requested? Gated on
+/// `M3OS_NODE_JIT=1`. When set, `build_node` drops `--v8-options=--jitless`
+/// (re-enabling full TurboFan/Maglev/Sparkplug + WASM codegen), applies the three
+/// V8/Node PKU patches from the Phase 90a A.1 findings, and links a `pkey_*` shim.
+/// When UNSET the build is byte-identical to the Phase 89 jitless artifact — every
+/// JIT-only step in `build_node` is guarded by this predicate. The jitless `.m3pkg`
+/// remains the documented default everywhere; the JIT variant is a second sealed
+/// artifact under its own content key (see [`node_variant_id`]).
+fn node_jit_enabled() -> bool {
+    std::env::var("M3OS_NODE_JIT").is_ok_and(|v| v == "1")
+}
+
+/// Phase 90a (D.2) — the stable variant token folded into `node`'s content key so
+/// a JIT build and a jitless build get DISTINCT keys (no cross-pkgcache
+/// contamination: a jitless build after a JIT build is a pure MISS for the other
+/// and a HIT for its own kind). Pure function of [`node_jit_enabled`] — host-tested
+/// in `node_variant_id_distinguishes_jit_and_folds_into_content_key`.
+fn node_variant_id() -> &'static str {
+    if node_jit_enabled() { "jit" } else { "jitless" }
+}
+
 /// Phase 85d — host-cross-build a static **Clang + LLD** (X86-only, `MinSizeRel`)
 /// for m3OS, plus the C++ runtime it links against.
 ///
@@ -3496,6 +3535,13 @@ const LLVM_TGT_SYSROOT: &str = "/usr/lib/clang-sysroot";
 /// `--v8-lite-mode` — see the configure block) so it never requests
 /// RWX/executable memory (m3OS W^X). See `ports/lang/node/Portfile` and
 /// `docs/89-nodejs.md` for the full configuration rationale.
+///
+/// Phase 90a (D.2) — when `M3OS_NODE_JIT=1` ([`node_jit_enabled`]) this builds the
+/// **JIT** variant instead: `--v8-options=--jitless` is dropped, the three A.1 V8/
+/// Node PKU patches are applied (musl `pkey_*` shim + `NodePlatform::
+/// GetThreadIsolatedAllocator` override + `KernelHasPkruFix` m3OS-accept), and the
+/// `PKEY_DISABLE_*` macro defs are added to CXXFLAGS so V8 emits PKU-guarded W+X
+/// commits the W^X v2 kernel rule permits. The default (unset) build is unchanged.
 fn build_node(port_src: &Path, stage: &Path, port_dir: &Path) -> Result<(), String> {
     let root = workspace_root();
     let jobs = format!("-j{}", num_jobs());
@@ -3575,12 +3621,40 @@ fn build_node(port_src: &Path, stage: &Path, port_dir: &Path) -> Result<(), Stri
         .filter(|v| !v.is_empty())
         .ok_or_else(|| "node: Portfile is missing a non-empty VERSION".to_string())?;
     let stable_src = cross_root.join(format!("node-v{version}"));
+    // Phase 90a (D.2) — the JIT and jitless variants share this persistent source
+    // tree. The JIT variant mutates V8/Node source in place (the three A.1
+    // patches); the jitless variant must NEVER inherit those mutations (and vice
+    // versa) or the default build would not be byte-identical. Record which variant
+    // the stable tree was last prepared for in a marker file, and FORCE a re-stage
+    // (discard the tree) when the requested variant differs from the marker. This
+    // guarantees: (a) the default jitless build is byte-identical regardless of any
+    // prior JIT build, and (b) the JIT patches are applied to a pristine tree, so
+    // their in-place application is unambiguous. The pkgcache still seals each
+    // variant's `.m3pkg` under its own key, so the rare re-stage on a variant flip
+    // costs a one-time rebuild, not repeated work.
+    let variant = node_variant_id();
+    let variant_marker = stable_src.join(".m3os-node-variant");
+    let marker_matches = fs::read_to_string(&variant_marker)
+        .map(|s| s.trim() == variant)
+        .unwrap_or(false);
+    if stable_src.join("configure").exists() && !marker_matches {
+        println!(
+            "node: persistent source at {} was prepared for a different variant \
+             (requested `{variant}`) — discarding it so the {variant} build starts \
+             from a pristine tree (no cross-variant patch leak)",
+            stable_src.display()
+        );
+        let _ = fs::remove_dir_all(&stable_src);
+    }
     let src: PathBuf = if stable_src.join("configure").exists() {
-        println!("node: reusing persistent source {}", stable_src.display());
+        println!(
+            "node: reusing persistent source {} (variant `{variant}`)",
+            stable_src.display()
+        );
         stable_src
     } else {
         println!(
-            "node: staging persistent source at {} (once)",
+            "node: staging persistent source at {} (once, variant `{variant}`)",
             stable_src.display()
         );
         let _ = fs::remove_dir_all(&stable_src);
@@ -3588,9 +3662,22 @@ fn build_node(port_src: &Path, stage: &Path, port_dir: &Path) -> Result<(), Stri
         // move it to the stable location (patches ride along). Next run re-extracts
         // a fresh `port_src`, which we ignore once the stable tree exists.
         fs::rename(port_src, &stable_src).map_err(|e| format!("node: stage source: {e}"))?;
+        // Record the variant this pristine tree is being prepared for, so a later
+        // run with the OTHER variant re-stages instead of reusing patched source.
+        fs::write(&variant_marker, variant)
+            .map_err(|e| format!("node: write variant marker: {e}"))?;
         stable_src
     };
     let src = src.as_path();
+
+    // Phase 90a (D.2) — JIT variant: apply the three A.1 V8/Node PKU patches +
+    // stage the musl `pkey_*` shim into the source tree, idempotently (a sentinel
+    // guards against double-application across the persistent-source reuse). No-op
+    // for the default jitless build (so it stays byte-identical to Phase 89).
+    let pkey_shim_rel = "deps/v8/src/base/platform/m3os-pkey-shim.c";
+    if node_jit_enabled() {
+        apply_node_jit_patches(src, pkey_shim_rel)?;
+    }
 
     // ── 4. toolchain env: host clang→musl for TARGET, host glibc clang for HOST ──
     // V8's mksnapshot/torque run on the build host (same arch x86_64 → native), so
@@ -3615,13 +3702,40 @@ fn build_node(port_src: &Path, stage: &Path, port_dir: &Path) -> Result<(), Stri
     // `<sysroot>/include` + the resource dir — so the libc++ headers the `llvm`
     // port installed there go unseen and `<cstddef>`/`<memory>` come back "file
     // not found". Point at them explicitly with `-cxx-isystem`.
+    // Phase 90a (D.2) — JIT variant: musl defines neither the `PKEY_DISABLE_ACCESS`
+    // nor `PKEY_DISABLE_WRITE` macros, so V8's `#ifdef PKEY_DISABLE_WRITE` arm in
+    // `default-thread-isolated-allocator.cc` compiles to a `return -1` stub
+    // (A.1 finding 1). Define them at their Linux values so the real
+    // `pkey_alloc(... PKEY_DISABLE_WRITE)` path compiles in. Empty for the default
+    // jitless build, so its CXXFLAGS stay byte-identical to Phase 89.
+    let pkey_defs = if node_jit_enabled() {
+        " -DPKEY_DISABLE_ACCESS=0x1 -DPKEY_DISABLE_WRITE=0x2"
+    } else {
+        ""
+    };
     let cxxflags = format!(
         "{tgt} -stdlib=libc++ -cxx-isystem {sysroot_s}/include/c++/v1 -rtlib=compiler-rt \
-         -O2 -fno-omit-frame-pointer -D_GNU_SOURCE -D__MUSL__ {warn}"
+         -O2 -fno-omit-frame-pointer -D_GNU_SOURCE -D__MUSL__ {warn}{pkey_defs}"
     );
+    // Phase 90a (D.2) — JIT variant: compile the musl `pkey_*` shim (A.1 finding 1)
+    // to an object and put it on the FINAL link line. V8 weak-declares
+    // `pkey_alloc/free/mprotect/get/set`; musl provides none. Our strong defs in
+    // the shim therefore bind at link (weak < strong), giving V8 a working
+    // `pkey_*` surface (the three syscall wrappers + RDPKRU/WRPKRU for get/set).
+    // Adding the object via LDFLAGS — rather than editing V8's gyp/GN sources list —
+    // keeps the wiring robust across V8 version drift: it only needs the symbols
+    // present on the node binary's link line, which strong-over-weak resolution
+    // honors regardless of which translation unit the weak references live in.
+    // Empty for the default jitless build → its LDFLAGS stay byte-identical.
+    let pkey_shim_obj = if node_jit_enabled() {
+        let obj = compile_node_pkey_shim(src, pkey_shim_rel, &clang, &cflags)?;
+        format!(" {}", obj.display())
+    } else {
+        String::new()
+    };
     let ldflags = format!(
         "{tgt} -static -stdlib=libc++ -L{sysroot_s}/lib -rtlib=compiler-rt \
-         -unwindlib=libunwind -fuse-ld=lld {warn} {stub}"
+         -unwindlib=libunwind -fuse-ld=lld {warn} {stub}{pkey_shim_obj}"
     );
     let ar = if probe_tool_on_path("llvm-ar") {
         "llvm-ar"
@@ -3650,9 +3764,19 @@ fn build_node(port_src: &Path, stage: &Path, port_dir: &Path) -> Result<(), Stri
             .env("NM", nm);
     };
 
-    // ── 5. configure (static, jitless V8, small-icu, bundled deps) ───────────────
+    // ── 5. configure (static V8, small-icu, bundled deps) ────────────────────────
+    // Phase 90a (D.2) — the ONLY configure difference between the variants: the
+    // jitless default passes `--v8-options=--jitless` (Phase 89, W^X-clean,
+    // Ignition-only, zero runtime executable memory); the JIT variant DROPS it,
+    // re-enabling full TurboFan/Maglev/Sparkplug codegen + WASM, which commits
+    // PKU-guarded W+X code pages the W^X v2 kernel rule permits. The A.1 finding
+    // records that relying on runtime `--no-jitless` is INSUFFICIENT — the Phase 89
+    // binary bakes `--jitless` as an embedded default, latching `--no-opt`, so the
+    // flag must be dropped at configure time for TurboFan to actually run.
+    let jit = node_jit_enabled();
     println!(
-        "node: configure (static musl, jitless V8, small-icu) — {}",
+        "node: configure (static musl, {} V8, small-icu) — {}",
+        if jit { "JIT (PKU-guarded)" } else { "jitless" },
         src.display()
     );
     let mut cfg = Command::new("python3");
@@ -3670,6 +3794,8 @@ fn build_node(port_src: &Path, stage: &Path, port_dir: &Path) -> Result<(), Stri
         "--fully-static",
         "--enable-static",
         "--with-intl=small-icu",
+    ]);
+    if !jit {
         // Jitless via `--v8-options=--jitless`, NOT `--v8-lite-mode`. Both make
         // V8 allocate zero runtime executable memory (Ignition-only, no
         // RWX/JIT → W^X-clean), but `--v8-lite-mode` ALSO sets
@@ -3679,7 +3805,9 @@ fn build_node(port_src: &Path, stage: &Path, port_dir: &Path) -> Result<(), Stri
         // option" (exit 9) before `node --version` ever prints. Keeping WASM
         // compiled in makes V8 recognise those flags (then `--jitless` renders
         // them inert), so node starts cleanly while staying W^X-safe.
-        "--v8-options=--jitless",
+        cfg.arg("--v8-options=--jitless");
+    }
+    cfg.args([
         // NB: NOT `--ninja`. V8's gyp emits `v8_inspector_headers` for BOTH the
         // host and target toolsets, both writing the same arch-independent
         // `gen/.../js_protocol.stamp` (Node's `--without-inspector` disables
@@ -3718,6 +3846,294 @@ fn build_node(port_src: &Path, stage: &Path, port_dir: &Path) -> Result<(), Stri
 
     assert_node_layout(stage)?;
     Ok(())
+}
+
+/// Phase 90a (D.2) — the musl `pkey_*` shim C source (A.1 finding 1). V8
+/// weak-declares `pkey_alloc/free/mprotect/get/set`
+/// (`src/base/platform/memory-protection-key.cc:17`,
+/// `src/libplatform/default-thread-isolated-allocator.cc:21`) and null-checks them
+/// at runtime; musl defines none. These STRONG defs bind over the weak references
+/// at the final link. `pkey_alloc/free/mprotect` are real syscalls (nrs
+/// 330/331/329 on x86_64 — the same Linux ABI numbers the B.3 kernel handlers
+/// dispatch); `pkey_get/set` are NOT syscalls — they are the `RDPKRU`/`WRPKRU`
+/// instructions reading/writing the per-thread PKRU register (which B.4 saves/
+/// restores via XSAVE component 9). The shim mirrors glibc's libc surface so V8's
+/// runtime detection + write-window code work unmodified.
+const NODE_PKEY_SHIM_C: &str = r#"/* m3OS Phase 90a (D.2) — musl pkey_* shim for V8 PKU JIT.
+ *
+ * V8 weak-declares pkey_alloc/free/mprotect/get/set and null-checks them; musl
+ * provides none. These strong definitions bind over the weak refs at link time.
+ * Linked into `node` via LDFLAGS (an object on the final link line), NOT a gyp
+ * sources-list edit, so the wiring is robust across V8 version drift.
+ *
+ * pkey_alloc/free/mprotect -> raw syscalls (x86_64 nrs 330/331/329, the Linux ABI
+ *   the m3OS Phase 90a B.3 kernel handlers honor).
+ * pkey_get/set            -> RDPKRU/WRPKRU instructions (NOT syscalls); they
+ *   read/write the per-thread PKRU register.  Each protection key owns 2 bits in
+ *   PKRU: bit (2*key) = Access-Disable, bit (2*key+1) = Write-Disable.
+ */
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <errno.h>
+#include <stdint.h>
+
+#ifndef SYS_pkey_mprotect
+#define SYS_pkey_mprotect 329
+#endif
+#ifndef SYS_pkey_alloc
+#define SYS_pkey_alloc 330
+#endif
+#ifndef SYS_pkey_free
+#define SYS_pkey_free 331
+#endif
+
+#ifndef PKEY_DISABLE_ACCESS
+#define PKEY_DISABLE_ACCESS 0x1
+#endif
+#ifndef PKEY_DISABLE_WRITE
+#define PKEY_DISABLE_WRITE 0x2
+#endif
+
+/* Read the full 32-bit PKRU via RDPKRU (ECX must be 0; EDX clobbered). */
+static inline uint32_t m3os_rdpkru(void) {
+    uint32_t pkru, edx;
+    __asm__ volatile("rdpkru" : "=a"(pkru), "=d"(edx) : "c"(0));
+    return pkru;
+}
+
+/* Write the full 32-bit PKRU via WRPKRU (ECX and EDX must be 0). */
+static inline void m3os_wrpkru(uint32_t pkru) {
+    __asm__ volatile("wrpkru" : : "a"(pkru), "c"(0), "d"(0));
+}
+
+int pkey_alloc(unsigned int flags, unsigned int access_rights) {
+    long r = syscall(SYS_pkey_alloc, (long)flags, (long)access_rights);
+    if (r < 0) { errno = (int)-r; return -1; }
+    return (int)r;
+}
+
+int pkey_free(int pkey) {
+    long r = syscall(SYS_pkey_free, (long)pkey);
+    if (r < 0) { errno = (int)-r; return -1; }
+    return (int)r;
+}
+
+int pkey_mprotect(void *addr, size_t len, int prot, int pkey) {
+    long r = syscall(SYS_pkey_mprotect, addr, (long)len, (long)prot, (long)pkey);
+    if (r < 0) { errno = (int)-r; return -1; }
+    return (int)r;
+}
+
+/* Return the access rights (PKEY_DISABLE_ACCESS|PKEY_DISABLE_WRITE) for `pkey`
+ * by decoding its 2-bit field in the live PKRU. */
+int pkey_get(int pkey) {
+    if (pkey < 0 || pkey > 15) { errno = EINVAL; return -1; }
+    uint32_t pkru = m3os_rdpkru();
+    unsigned shift = (unsigned)pkey * 2u;
+    int rights = 0;
+    if (pkru & (1u << shift)) rights |= PKEY_DISABLE_ACCESS;
+    if (pkru & (1u << (shift + 1u))) rights |= PKEY_DISABLE_WRITE;
+    return rights;
+}
+
+/* Set the 2-bit field for `pkey` in the live PKRU from `rights`. */
+int pkey_set(int pkey, unsigned int rights) {
+    if (pkey < 0 || pkey > 15) { errno = EINVAL; return -1; }
+    if (rights & ~(unsigned)(PKEY_DISABLE_ACCESS | PKEY_DISABLE_WRITE)) {
+        errno = EINVAL; return -1;
+    }
+    uint32_t pkru = m3os_rdpkru();
+    unsigned shift = (unsigned)pkey * 2u;
+    pkru &= ~(0x3u << shift);
+    if (rights & PKEY_DISABLE_ACCESS) pkru |= (1u << shift);
+    if (rights & PKEY_DISABLE_WRITE) pkru |= (1u << (shift + 1u));
+    m3os_wrpkru(pkru);
+    return 0;
+}
+"#;
+
+/// Phase 90a (D.2) — apply the three A.1 V8/Node PKU patches to `src` and stage the
+/// `pkey_*` shim at `shim_rel` (relative to `src`). Idempotent: a per-step sentinel
+/// guards re-application across the persistent-source reuse, so a second `build_node`
+/// run (or a retry) does not double-apply or fail. Each patch fails loudly if its
+/// anchor text is absent (a V8 version drift surfaces here at patch time, not as a
+/// silently-broken JIT build three layers up). JIT-variant only — never invoked for
+/// the default jitless build.
+fn apply_node_jit_patches(src: &Path, shim_rel: &str) -> Result<(), String> {
+    // ── shim TU: write it into the source tree (provenance + idempotency) ────────
+    let shim_path = src.join(shim_rel);
+    if let Some(parent) = shim_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("node-jit: mkdir for shim: {e}"))?;
+    }
+    // Always (re)write the shim to the canonical content — idempotent by value.
+    fs::write(&shim_path, NODE_PKEY_SHIM_C)
+        .map_err(|e| format!("node-jit: write pkey shim {}: {e}", shim_path.display()))?;
+    println!("node-jit: staged pkey shim at {}", shim_path.display());
+
+    // ── patch 2: NodePlatform::GetThreadIsolatedAllocator() override ─────────────
+    // A.1 finding 2: `ThreadIsolation::Initialize()` requires
+    // `platform->GetThreadIsolatedAllocator()`; the `v8::Platform` default returns
+    // nullptr (`deps/v8/include/v8-platform.h:1068`) and Node's `NodePlatform`
+    // never overrides it. Override it to return V8 libplatform's
+    // `DefaultThreadIsolatedAllocator` (the same one `v8::platform::
+    // NewDefaultPlatform` wires), so V8's PKU JIT path engages.
+    patch_node_platform_allocator(src)?;
+
+    // ── patch 3: KernelHasPkruFix() accepts the m3OS uname release ───────────────
+    // A.1 finding 3: `KernelHasPkruFix()` parses `uname()` release and requires
+    // Linux >= 5.13 (a PKRU-across-fork fix); m3OS reports `0.90.0` and would be
+    // rejected. m3OS's B.4 implements correct PKRU inherit-on-clone/reset-on-exec
+    // semantics (what the Linux check guards), so accept m3OS.
+    patch_kernel_has_pkru_fix(src)?;
+
+    Ok(())
+}
+
+/// Patch `src/node_platform.{h,cc}` so `NodePlatform::GetThreadIsolatedAllocator()`
+/// returns V8 libplatform's `DefaultThreadIsolatedAllocator`. Idempotent via a
+/// sentinel; fails if the expected anchors are absent.
+fn patch_node_platform_allocator(src: &Path) -> Result<(), String> {
+    const SENTINEL: &str = "m3os-pku-jit: GetThreadIsolatedAllocator override";
+
+    // -- header: declare the override inside the NodePlatform class ----------------
+    let hdr = src.join("src/node_platform.h");
+    let hdr_text =
+        fs::read_to_string(&hdr).map_err(|e| format!("node-jit: read {}: {e}", hdr.display()))?;
+    if !hdr_text.contains(SENTINEL) {
+        // Anchor on a stable existing v8::Platform override in NodePlatform. Every
+        // Node 18–22 NodePlatform overrides `NumberOfWorkerThreads()`; insert our
+        // declaration immediately after it.
+        let anchor = "int NumberOfWorkerThreads() override;";
+        if !hdr_text.contains(anchor) {
+            return Err(format!(
+                "node-jit: anchor `{anchor}` not found in {} — V8/Node layout drifted; \
+                 update patch_node_platform_allocator (A.1 finding 2)",
+                hdr.display()
+            ));
+        }
+        let inject = format!(
+            "{anchor}\n  // {SENTINEL}\n  \
+             v8::PageAllocator* GetThreadIsolatedAllocator() override;"
+        );
+        let patched = hdr_text.replacen(anchor, &inject, 1);
+        fs::write(&hdr, patched).map_err(|e| format!("node-jit: write {}: {e}", hdr.display()))?;
+        println!("node-jit: patched {} (allocator decl)", hdr.display());
+    }
+
+    // -- impl: define the override in node_platform.cc -----------------------------
+    let cc = src.join("src/node_platform.cc");
+    let cc_text =
+        fs::read_to_string(&cc).map_err(|e| format!("node-jit: read {}: {e}", cc.display()))?;
+    if !cc_text.contains(SENTINEL) {
+        // Anchor on the existing definition of NumberOfWorkerThreads(). Append our
+        // definition right after its closing brace. Use the libplatform default
+        // allocator factory (the same one NewDefaultPlatform installs).
+        let anchor = "int NodePlatform::NumberOfWorkerThreads() {";
+        if !cc_text.contains(anchor) {
+            return Err(format!(
+                "node-jit: anchor `{anchor}` not found in {} — V8/Node layout drifted; \
+                 update patch_node_platform_allocator (A.1 finding 2)",
+                cc.display()
+            ));
+        }
+        // The method body is `return worker_thread_task_runners_.size();` followed by
+        // `}`. Inject after that closing brace by replacing the anchor's full method.
+        let full = "int NodePlatform::NumberOfWorkerThreads() {\n  \
+                    return worker_thread_task_runner_->NumberOfWorkerThreads();\n}";
+        let injected_def = format!(
+            "{full}\n\n\
+             // {SENTINEL}\n\
+             // A.1 finding 2: NodePlatform must provide the thread-isolated (PKU)\n\
+             // allocator V8's ThreadIsolation::Initialize() requires; the v8::Platform\n\
+             // default returns nullptr. Return libplatform's default — the same one\n\
+             // v8::platform::NewDefaultPlatform installs.\n\
+             v8::PageAllocator* NodePlatform::GetThreadIsolatedAllocator() {{\n  \
+             static std::unique_ptr<v8::PageAllocator> allocator =\n      \
+             v8::platform::NewDefaultThreadIsolatedAllocator();\n  \
+             return allocator.get();\n}}"
+        );
+        let patched = if cc_text.contains(full) {
+            cc_text.replacen(full, &injected_def, 1)
+        } else {
+            // Fall back: the method body differs across Node minor versions. Append a
+            // standalone definition at end of file rather than guessing the body.
+            format!(
+                "{cc_text}\n\
+                 // {SENTINEL} (appended; in-place method body differed)\n\
+                 namespace node {{\n\
+                 v8::PageAllocator* NodePlatform::GetThreadIsolatedAllocator() {{\n  \
+                 static std::unique_ptr<v8::PageAllocator> allocator =\n      \
+                 v8::platform::NewDefaultThreadIsolatedAllocator();\n  \
+                 return allocator.get();\n}}\n}}  // namespace node\n"
+            )
+        };
+        fs::write(&cc, patched).map_err(|e| format!("node-jit: write {}: {e}", cc.display()))?;
+        println!("node-jit: patched {} (allocator def)", cc.display());
+    }
+
+    Ok(())
+}
+
+/// Patch `deps/v8/src/libplatform/default-thread-isolated-allocator.cc` so
+/// `KernelHasPkruFix()` returns true on m3OS (A.1 finding 3). Idempotent via a
+/// sentinel; fails if the function is absent.
+fn patch_kernel_has_pkru_fix(src: &Path) -> Result<(), String> {
+    const SENTINEL: &str = "m3os-pku-jit: KernelHasPkruFix accepts m3OS";
+    let f = src.join("deps/v8/src/libplatform/default-thread-isolated-allocator.cc");
+    let text =
+        fs::read_to_string(&f).map_err(|e| format!("node-jit: read {}: {e}", f.display()))?;
+    if text.contains(SENTINEL) {
+        return Ok(());
+    }
+    // Inject an early `return true;` (guarded by the sentinel comment) at the top of
+    // the function body. m3OS's B.4 implements the PKRU-across-fork semantics the
+    // Linux >= 5.13 check guards, so the gate is satisfied. Anchor on the function
+    // signature; the body opens with `{` on the same or next token.
+    let anchor = "bool KernelHasPkruFix() {";
+    if !text.contains(anchor) {
+        return Err(format!(
+            "node-jit: anchor `{anchor}` not found in {} — V8 layout drifted; update \
+             patch_kernel_has_pkru_fix (A.1 finding 3)",
+            f.display()
+        ));
+    }
+    let inject = format!(
+        "{anchor}\n  // {SENTINEL}\n  \
+         // A.1 finding 3: m3OS reports release `0.90.0`, which the upstream\n  \
+         // Linux >= 5.13 parse would reject. m3OS's Phase 90a B.4 implements the\n  \
+         // PKRU inherit-on-clone / reset-on-exec semantics the kernel-version gate\n  \
+         // guards, so accept unconditionally on m3OS.\n  \
+         return true;"
+    );
+    let patched = text.replacen(anchor, &inject, 1);
+    fs::write(&f, patched).map_err(|e| format!("node-jit: write {}: {e}", f.display()))?;
+    println!("node-jit: patched {} (KernelHasPkruFix)", f.display());
+    Ok(())
+}
+
+/// Phase 90a (D.2) — compile the staged `pkey_*` shim (at `shim_rel` under `src`)
+/// to an object with the cross clang + the node TARGET cflags, returning the
+/// object path to append to LDFLAGS. JIT-variant only. The compile is cheap (one
+/// tiny TU) and re-run each build — idempotent by overwrite, and it picks up any
+/// cflags change.
+fn compile_node_pkey_shim(
+    src: &Path,
+    shim_rel: &str,
+    clang: &str,
+    cflags: &str,
+) -> Result<PathBuf, String> {
+    let shim_c = src.join(shim_rel);
+    let obj = src.join(format!("{shim_rel}.o"));
+    // Split the joined cflags into args (whitespace-separated; the node cflags carry
+    // no embedded spaces in any single token).
+    let mut cmd = Command::new(clang);
+    for tok in cflags.split_whitespace() {
+        cmd.arg(tok);
+    }
+    cmd.arg("-c").arg(&shim_c).arg("-o").arg(&obj);
+    run(&mut cmd, "node-jit pkey shim compile")?;
+    println!("node-jit: compiled pkey shim object {}", obj.display());
+    Ok(obj)
 }
 
 /// Assert the staged `node` is a fully-static ELF (no `PT_INTERP`) — the
@@ -5299,6 +5715,83 @@ mod tests {
         assert_eq!(sorted.len(), ids.len(), "build_recipe_ids must be distinct");
         // Unknown ports yield the empty identity (no recipe contribution).
         assert_eq!(build_recipe_id("clang"), "");
+    }
+
+    // ── Phase 90a (D.2) — the JIT/jitless variant folds into node's key ──────
+
+    /// `node_variant_id()` must distinguish the JIT and jitless variants by the
+    /// `M3OS_NODE_JIT` env var, AND that distinction must propagate into node's
+    /// computed content key — so a JIT build and a jitless build seal under
+    /// DISTINCT keys (one is a pure pkgcache MISS for the other). This is the
+    /// host-test proof that the key fold (`variant=jit|jitless` in
+    /// `compute_port_key_inner`'s node arm) works, since the multi-hour real build
+    /// cannot be run in the gate. The env var is process-global, so this test
+    /// drives both states serially and restores the prior value.
+    #[test]
+    fn node_variant_id_distinguishes_jit_and_folds_into_content_key() {
+        let prior = std::env::var("M3OS_NODE_JIT").ok();
+
+        // jitless (env unset) → "jitless"
+        unsafe {
+            std::env::remove_var("M3OS_NODE_JIT");
+        }
+        assert_eq!(
+            node_variant_id(),
+            "jitless",
+            "unset M3OS_NODE_JIT must select the jitless variant"
+        );
+        assert!(!node_jit_enabled());
+
+        // JIT (env = "1") → "jit"
+        unsafe {
+            std::env::set_var("M3OS_NODE_JIT", "1");
+        }
+        assert_eq!(
+            node_variant_id(),
+            "jit",
+            "M3OS_NODE_JIT=1 must select the jit variant"
+        );
+        assert!(node_jit_enabled());
+
+        // A non-"1" value is NOT the JIT variant (only the exact opt-in engages it,
+        // so the default jitless build stays byte-identical for any other value).
+        unsafe {
+            std::env::set_var("M3OS_NODE_JIT", "0");
+        }
+        assert_eq!(
+            node_variant_id(),
+            "jitless",
+            "M3OS_NODE_JIT=0 must stay on the jitless variant"
+        );
+
+        // Prove the fold reaches the actual content key. node has no deps and the
+        // toolchain probes return the same value in both states, so ONLY the
+        // `variant=` token differs → the keys must differ.
+        if let Some(port_dir) = find_port_dir("node") {
+            unsafe {
+                std::env::remove_var("M3OS_NODE_JIT");
+            }
+            let jitless_key = compute_port_key("node", &port_dir);
+            unsafe {
+                std::env::set_var("M3OS_NODE_JIT", "1");
+            }
+            let jit_key = compute_port_key("node", &port_dir);
+            if let (Ok(a), Ok(b)) = (jitless_key, jit_key) {
+                assert_ne!(
+                    a, b,
+                    "the JIT and jitless node builds must seal under DISTINCT content \
+                     keys (no cross-pkgcache contamination)"
+                );
+            }
+        }
+
+        // Restore the prior env so parallel tests / later runs are unaffected.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("M3OS_NODE_JIT", v),
+                None => std::env::remove_var("M3OS_NODE_JIT"),
+            }
+        }
     }
 
     // ── Phase 86e — go_toolchain_id folds the Go Portfile into go/gh keys ────

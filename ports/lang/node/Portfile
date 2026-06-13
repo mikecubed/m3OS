@@ -40,3 +40,22 @@ MAINTAINER=m3os
 #
 # Intl — `--with-intl=small-icu` (en-US bundled; `Intl`/`Intl.NumberFormat`
 # work, artifact stays lean). npm/npx are kept (bundled JS in lib/node_modules).
+#
+# Phase 90a (D.2) — VARIANT: `M3OS_NODE_JIT=1`. The DEFAULT build (env unset) is
+# the jitless artifact described above and is the documented default + fallback
+# everywhere (the always-on `node-smoke` gate keeps testing it, byte-identical).
+# When `M3OS_NODE_JIT=1` is set, `build_node` (xtask/src/port_build.rs) builds the
+# JIT variant instead: it DROPS `--v8-options=--jitless` (re-enabling full
+# TurboFan/Maglev/Sparkplug codegen + WASM execution) and applies the three Phase
+# 90a A.1 V8/Node patches that make V8 engage Memory Protection Keys on
+# static-musl m3OS — (1) a strong-symbol `pkey_*` shim (musl provides none; V8
+# weak-declares them) compiled in via LDFLAGS + `-DPKEY_DISABLE_ACCESS/WRITE`
+# CXXFLAGS, (2) a `NodePlatform::GetThreadIsolatedAllocator()` override returning
+# libplatform's default (Node never provides it), (3) `KernelHasPkruFix()` patched
+# to accept the m3OS uname release. The JIT variant commits PKU-guarded W+X code
+# pages the Phase 90a W^X v2 kernel rule permits (unguarded RWX stays rejected).
+# It is sealed under a DISTINCT content key (the `variant=jit|jitless` token folds
+# into node's key in `compute_port_key_inner`), so the JIT and jitless `.m3pkg`s
+# never serve each other's pkgcache hits. The JIT binary stays fully static (no
+# PT_INTERP — only the V8 codegen model changed). See docs/roadmap/tasks/
+# 90a-memory-protection-keys-tasks.md (A.1 Findings + D.2) for the full recipe.
