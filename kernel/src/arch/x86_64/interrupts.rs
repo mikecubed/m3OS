@@ -595,7 +595,7 @@ fn demand_map_vma_page(vaddr: u64, require_write: bool) -> bool {
         let _page_table_guard =
             addr_space.map(|addr_space| unsafe { addr_space.as_ref() }.lock_page_tables());
 
-        let Some(prot) = crate::process::shared_vma_prot(pid, vaddr) else {
+        let Some((prot, pkey)) = crate::process::shared_vma_prot_and_pkey(pid, vaddr) else {
             return false;
         };
 
@@ -605,9 +605,11 @@ fn demand_map_vma_page(vaddr: u64, require_write: bool) -> bool {
             return false;
         }
 
-        // Default key 0 until the VMA carries a protection key (Track B.3); a
-        // tagged VMA will supply its key here so a faulted-in page keeps its tag.
-        demand_map_user_page_locked(vaddr, prot, kernel_core::pkey::PKEY_DEFAULT)
+        // Phase 90a B.3 — carry the VMA's protection key into the faulted-in
+        // PTE. For an untagged VMA (`pkey == 0`) this is the legacy key-0 PTE,
+        // bit-for-bit unchanged; for a `pkey_mprotect`-tagged range the faulted
+        // page keeps its key so its W^X-v2 guard survives the demand fault.
+        demand_map_user_page_locked(vaddr, prot, pkey)
     };
     if !mapped {
         return false;
