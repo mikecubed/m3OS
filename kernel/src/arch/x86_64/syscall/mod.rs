@@ -11914,9 +11914,16 @@ fn wx_decision(
 
     // The pkey-guarded v2 exception — the pure decision lives in host-tested
     // `kernel_core::pkey::wx_v2_permits` so the accept/reject matrix is unit
-    // tested. PKU must be *active* on this CPU (CR4.PKE + the XSAVE component) —
-    // the same `pku_usable()` predicate every other PKU path consults.
-    let pku_active = crate::arch::x86_64::cpuid::pku_usable();
+    // tested. PKU must be *enforcing* on this core before we grant a W+X
+    // exception. `pku_usable()` alone is insufficient: it only proves the CPU
+    // advertises PKU + the XSAVE PKRU component and *never* inspects `CR4.PKE`
+    // (see `cpuid::probe_pku`). A "present-but-inactive" posture (PKU usable yet
+    // `CR4.PKE` clear) would otherwise let the v2 grant through with the
+    // protection-key MMU check disabled — i.e. an *unguarded* W+X mapping, since
+    // a write-deny key traps nothing when PKE is off. Also require this core's
+    // live `CR4.PKE` bit, so the grant only ever rides real enforcement.
+    let pku_active =
+        crate::arch::x86_64::cpuid::pku_usable() && crate::arch::x86_64::cpuid::cr4_pke_enabled();
     if kernel_core::pkey::wx_v2_permits(table, key_decision, pku_active) {
         // `wx_v2_permits` only returns true for a `Tag(k)` decision, so this
         // extraction always succeeds; default to Rejected defensively otherwise.

@@ -123,7 +123,21 @@ fn fork() -> i64 {
 }
 fn waitpid(pid: i64) -> i32 {
     let mut status: i32 = 0;
-    let _ = unsafe { syscall3(SYS_WAITPID, pid as u64, &mut status as *mut i32 as u64, 0) };
+    // SYS_WAITPID (61) is Linux `wait4(pid, status, options, rusage)` — a
+    // 4-argument syscall. Use `syscall4` with `rusage_ptr = 0`: a `syscall3`
+    // would leave `r10` (the rusage pointer) uninitialized, and the kernel's
+    // `sys_wait4` reads `r10` and — on a successful reap with a non-zero
+    // pointer — writes a 144-byte `struct rusage` to it, a stray write to a
+    // garbage user address. Passing 0 makes the kernel skip that write.
+    let _ = unsafe {
+        syscall4(
+            SYS_WAITPID,
+            pid as u64,
+            &mut status as *mut i32 as u64,
+            0,
+            0,
+        )
+    };
     status
 }
 fn getpid() -> i64 {

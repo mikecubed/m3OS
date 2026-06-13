@@ -141,9 +141,11 @@ fn wx_violation_main() -> ! {
             0,
         )
     } as i64;
-    // The kernel returns the same errno as the mprotect W+X reject (EINVAL).
-    // Accept any negative (MAP_FAILED-class) return, but require it be an
-    // error — a non-negative vaddr means the W+X mapping was honored (bypass).
+    // Two assertions, in order:
+    //   1. the return must be an error (< 0) — a non-negative vaddr means the
+    //      W+X mapping was honored, the bypass this gate guards against;
+    //   2. and specifically `EINVAL`, the same errno the `mprotect` W+X reject
+    //      returns — the kernel's mmap(W+X) entry guard mirrors that contract.
     if rc_mmap_wx >= 0 {
         // Best-effort unmap so a failed assertion does not leak the bad page.
         let _ = unsafe { syscall2(SYS_MUNMAP, rc_mmap_wx as u64, PAGE) };

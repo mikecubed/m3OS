@@ -328,7 +328,11 @@ pub fn probe_pku() -> &'static PkuFeaturesModel {
     PKU_FEATURES.call_once(|| {
         let max_leaf = cpuid_raw(0, 0).eax;
         if max_leaf < 0x0D {
-            // No leaf 7 / no leaf 0Dh → no PKU surface at all.
+            // CPUID leaf 0x0Dh (XSAVE enumeration) is unavailable, so the PKRU
+            // state component (sub-leaf 9) cannot be advertised — PKU is not
+            // usable regardless of whether leaf 0x07 (which may still exist when
+            // 0x07 ≤ max_leaf < 0x0Dh) reports the architectural PKU bit. Report
+            // no PKU surface.
             return PkuFeaturesModel::from_raw(0, 0, 0, 0, 0);
         }
         let leaf7_0 = cpuid_raw(0x07, 0);

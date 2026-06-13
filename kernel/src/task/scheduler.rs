@@ -2089,7 +2089,12 @@ impl PreemptTraceRing {
 
 #[allow(clippy::declare_interior_mutable_const)]
 static PREEMPT_TRACE_RINGS: [PreemptTraceRing; crate::smp::MAX_CORES] = {
+    // `large_const_arrays` would have us make this a `static`, but
+    // `PreemptTraceRing` is non-`Copy` (it holds an `AtomicUsize` + an
+    // `UnsafeCell<[..]>`), so the `[RING; MAX_CORES]` array-repeat below
+    // requires a `const` operand — a `static` would not compile here.
     #[allow(clippy::declare_interior_mutable_const)]
+    #[allow(clippy::large_const_arrays)]
     const RING: PreemptTraceRing = PreemptTraceRing::new();
     [RING; crate::smp::MAX_CORES]
 };
