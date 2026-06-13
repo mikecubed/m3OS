@@ -233,6 +233,83 @@ impl PkeyTable {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `pkey_mprotect` argument validation (Track B.3) — host-tested pure logic.
+//
+// `sys_pkey_mprotect(addr, len, prot, pkey)` shares `sys_mprotect`'s VMA /
+// permission machinery; the *only* extra logic over plain mprotect is what the
+// `pkey` argument means and whether it is acceptable for *this* process. That
+// decision is pure integer logic over the process's [`PkeyTable`], so it lives
+// here and is unit-tested on the host.
+// ---------------------------------------------------------------------------
+
+/// The Linux sentinel `pkey == -1` (passed in a signed C `int`) means "do not
+/// change the key — behave exactly like `mprotect`" (glibc/musl `mprotect` is a
+/// thin wrapper that calls `pkey_mprotect` with `pkey = -1`). The syscall ABI
+/// delivers arguments as `u64`, so the sentinel arrives as `0xFFFF_FFFF_FFFF_FFFF`
+/// (and, because V8/musl may pass it as a sign-extended 32-bit `-1`, the kernel
+/// treats the low-32 `0xFFFF_FFFF` form the same — see [`is_preserve_key`]).
+pub const PKEY_PRESERVE: u64 = u64::MAX;
+
+/// True if `pkey` (as delivered to the syscall in a `u64` register) is the
+/// "preserve the existing key" alias — Linux's `pkey == -1`. Accepts both the
+/// full 64-bit `-1` and a sign-extended 32-bit `-1` (`0xFFFF_FFFF`), since the
+/// C `int` argument may be zero- or sign-extended into the 64-bit register
+/// depending on the libc wrapper. In this mode `pkey_mprotect` is byte-for-byte
+/// `mprotect` and the range's PTE key field is left untouched.
+#[inline]
+pub const fn is_preserve_key(pkey: u64) -> bool {
+    pkey == PKEY_PRESERVE || pkey == 0xFFFF_FFFF
+}
+
+/// The decision `sys_pkey_mprotect` makes about its `pkey` argument *before*
+/// touching any VMA or PTE. Mirrors `AllocOutcome`/`FreeOutcome` in shape so the
+/// kernel maps each arm to an action (and, for `Invalid`, to `EINVAL`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PkeyMprotectKey {
+    /// `pkey == -1` (the [`is_preserve_key`] alias): preserve each PTE's
+    /// existing key field — identical to plain `mprotect`.
+    Preserve,
+    /// `pkey == 0`: tag the range with the default key. Equivalent to clearing
+    /// the key field (the [`with_pkey`]`(_, 0)` identity), so also behaves like
+    /// plain `mprotect`, but the kernel still *writes* key 0 into the field.
+    Default,
+    /// A non-default key (1..=15) that is **allocated** in this process. The
+    /// range's PTEs are tagged with `.0`, and the W^X v2 rule (Track C.1) may
+    /// later consult the key's stored rights.
+    Tag(u8),
+    /// The key is out of range, or names a non-default key that is **not
+    /// currently allocated** in this process → `EINVAL` (Linux semantics).
+    Invalid,
+}
+
+/// Classify the `pkey` argument of `pkey_mprotect` against this process's key
+/// table, deciding how the range's PTEs should be (re)tagged.
+///
+/// Linux semantics (`mm/mprotect.c::do_pkey_mprotect` → `mm_pkey_is_allocated`):
+/// - `pkey == -1` → preserve (plain mprotect);
+/// - `pkey == 0` → the default key is always valid (it is reserved, not
+///   "allocated", but `pkey_mprotect(_, 0)` is accepted and tags with key 0);
+/// - a non-default key must be currently allocated, else `EINVAL`;
+/// - an out-of-range key (>= 16) → `EINVAL`.
+pub fn classify_pkey_mprotect(table: &PkeyTable, pkey: u64) -> PkeyMprotectKey {
+    if is_preserve_key(pkey) {
+        return PkeyMprotectKey::Preserve;
+    }
+    if pkey >= NUM_PKEYS as u64 {
+        return PkeyMprotectKey::Invalid;
+    }
+    let key = pkey as u8;
+    if key == PKEY_DEFAULT {
+        return PkeyMprotectKey::Default;
+    }
+    if table.is_allocated(key) {
+        PkeyMprotectKey::Tag(key)
+    } else {
+        PkeyMprotectKey::Invalid
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,5 +525,89 @@ mod tests {
     #[test]
     fn default_table_equals_new() {
         assert_eq!(PkeyTable::default(), PkeyTable::new());
+    }
+
+    // -- pkey_mprotect argument validation (Track B.3) -----------------------
+
+    #[test]
+    fn preserve_key_alias_matches_minus_one_forms() {
+        // Full 64-bit -1.
+        assert!(is_preserve_key(u64::MAX));
+        // Sign-extended 32-bit -1 (libc may zero-extend the C int).
+        assert!(is_preserve_key(0xFFFF_FFFF));
+        // Real keys and the default key are NOT the preserve alias.
+        assert!(!is_preserve_key(0));
+        assert!(!is_preserve_key(1));
+        assert!(!is_preserve_key(15));
+    }
+
+    #[test]
+    fn classify_preserve_is_plain_mprotect() {
+        let t = PkeyTable::new();
+        assert_eq!(
+            classify_pkey_mprotect(&t, u64::MAX),
+            PkeyMprotectKey::Preserve
+        );
+        assert_eq!(
+            classify_pkey_mprotect(&t, 0xFFFF_FFFF),
+            PkeyMprotectKey::Preserve
+        );
+    }
+
+    #[test]
+    fn classify_default_key_is_always_valid() {
+        // pkey == 0 is accepted even on a fresh table (key 0 is reserved, but
+        // pkey_mprotect(_, 0) tags with the default key — Linux accepts it).
+        let t = PkeyTable::new();
+        assert_eq!(classify_pkey_mprotect(&t, 0), PkeyMprotectKey::Default);
+    }
+
+    #[test]
+    fn classify_allocated_nondefault_key_tags() {
+        let mut t = PkeyTable::new();
+        let AllocOutcome::Ok(k) = t.alloc(0, PKEY_DISABLE_WRITE) else {
+            panic!()
+        };
+        assert_eq!(
+            classify_pkey_mprotect(&t, k as u64),
+            PkeyMprotectKey::Tag(k)
+        );
+    }
+
+    #[test]
+    fn classify_unallocated_nondefault_key_is_invalid() {
+        let t = PkeyTable::new();
+        // Key 7 was never allocated.
+        assert_eq!(classify_pkey_mprotect(&t, 7), PkeyMprotectKey::Invalid);
+    }
+
+    #[test]
+    fn classify_out_of_range_key_is_invalid() {
+        let t = PkeyTable::new();
+        assert_eq!(classify_pkey_mprotect(&t, 16), PkeyMprotectKey::Invalid);
+        // Note: 0xFFFF_FFFF and u64::MAX are the preserve alias, not invalid;
+        // an arbitrary large non-sentinel value is invalid.
+        assert_eq!(
+            classify_pkey_mprotect(&t, 0x1_0000_0000),
+            PkeyMprotectKey::Invalid
+        );
+    }
+
+    #[test]
+    fn classify_freed_key_becomes_invalid_again() {
+        let mut t = PkeyTable::new();
+        let AllocOutcome::Ok(k) = t.alloc(0, 0) else {
+            panic!()
+        };
+        assert_eq!(
+            classify_pkey_mprotect(&t, k as u64),
+            PkeyMprotectKey::Tag(k)
+        );
+        assert_eq!(t.free(k), FreeOutcome::Ok);
+        // After free the same key number is no longer allocated → EINVAL.
+        assert_eq!(
+            classify_pkey_mprotect(&t, k as u64),
+            PkeyMprotectKey::Invalid
+        );
     }
 }
