@@ -1073,6 +1073,23 @@ fn drain_remote_nic_ingress(
 // ---------------------------------------------------------------------------
 
 pub fn hlt_loop() -> ! {
+    // Track B (SMP TLB-shootdown survivability,
+    // docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md): every
+    // caller of `hlt_loop` is a terminal dead-end — the panic handler
+    // (`handle_panic`), the recursive-#PF cascade, the kstack-overflow / kernel
+    // page-fault arm, #GP, and #DF all funnel here and never return. Mark this
+    // core offline so the TLB-shootdown target loops (`smp::tlb`) stop counting
+    // it as a core that must acknowledge. `is_online` is otherwise write-once
+    // (→ `true` at AP bringup), so a wedged core was never excluded: a sibling
+    // issuing a routine `mprotect`/`mmap` shootdown would wait the full ack
+    // window on an ACK that can never come. A halted core never runs userspace
+    // again, so abandoning its (now stale) TLB is correct. `try_per_core()` is
+    // ISR-safe and returns `None` (no-op) if per-core data isn't up yet, so
+    // this is safe on the earliest-boot halt paths too.
+    if let Some(pc) = crate::smp::try_per_core() {
+        pc.is_online
+            .store(false, core::sync::atomic::Ordering::Release);
+    }
     loop {
         x86_64::instructions::hlt();
     }

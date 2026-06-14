@@ -1,11 +1,21 @@
 ---
-status: PARTIALLY FIXED — root-caused; Track A (NMI-on-IST) landed 2026-06-14, which
-  removes the whole-machine KERNEL PANIC (a wedged core now ACKs TLB shootdowns on a
-  clean per-core IST stack, so it no longer kills the box). Tracks B–D (mark cores
-  offline on halt, degrade the shootdown timeout, recover the wedged core / root the
-  originating overflow) remain OPEN. Validate the multi-core repro now degrades to
-  "one task wedged, machine survives" rather than panic. Workaround for full stability:
-  pin the guest to ONE core (`M3OS_SMP=1`) — what every heavy-Node gate already does.
+status: SUBSTANTIALLY FIXED — root-caused; Tracks A+B+C landed 2026-06-14. Track A
+  (NMI-on-IST) removed the whole-machine KERNEL PANIC (a wedged core now ACKs TLB
+  shootdowns on a clean per-core IST stack). Track B (mark a core offline when it
+  halts — done in `hlt_loop`, the single chokepoint all dead-end paths funnel through)
+  makes future shootdowns exclude a dead core for free. Track C (degrade the shootdown
+  ack-timeout instead of `panic!` — re-NMI the laggards, then mark-offline + continue;
+  ack tracking converted from a decrementing `SHOOTDOWN_PENDING` count to a per-round
+  idempotent `SHOOTDOWN_ACK` bitmap so the degrade path has no underflow / double-
+  decrement / cross-round-corruption hazard) makes the timeout non-fatal even for a
+  genuinely-dark core. A+C together make the `tlb.rs` timeout both effectively
+  unreachable AND non-fatal. Validated: `cargo xtask check` + `smoke-test` (boots clean
+  on the default SMP=4; all fork/exec/mmap/dynlink shootdown traffic acks correctly
+  through the new bitmap) + `regression` (11/11, incl. `fork-overlap` CoW shootdowns).
+  Only Track D (root-cause the originating kstack overflow / recover the wedged task
+  instead of halting it) remains OPEN — deeper origin work, not a machine-kill. The
+  `M3OS_SMP=1` workaround is no longer required for survivability; it remains the
+  fastest path for single-core determinism.
 branch: feat/phase-90b-claude-code
 repro-commit: bb2ee97f  # bug predates this; present since the SMP+PKU era. NOT caused by recent work.
 date: 2026-06-14
@@ -22,8 +32,8 @@ related:
   - kernel/src/arch/x86_64/interrupts.rs:699                      # NMI (TLB-shootdown delivery): NO IST (linchpin)
   - kernel/src/arch/x86_64/interrupts.rs:688-692                  # double_fault: the ONLY handler with an IST
   - kernel/src/arch/x86_64/gdt.rs:51                              # DOUBLE_FAULT_STACK is a single GLOBAL static (not per-core)
-  - kernel/src/smp/tlb.rs:176                                     # the fatal panic: shootdown ack timeout
-  - kernel/src/smp/boot.rs:545                                    # is_online: the ONLY write site (write-once → true)
+  - kernel/src/smp/tlb.rs                                         # was the fatal panic (old line 176); Track C replaced it with re-NMI + degrade on the SHOOTDOWN_ACK bitmap
+  - kernel/src/smp/boot.rs:545                                    # is_online: was the ONLY write site (→ true). Track B added `false` writes in hlt_loop (lib.rs)
 artifact: m3os.log (project root, ~172 KB; control-byte corrupted — read with `grep -a` / `sed`, plain grep treats it as binary)
 ---
 
@@ -238,22 +248,47 @@ it never re-enables NMI mid-handler and cannot nest on the shared per-core stack
 
 </details>
 
-### Track B — mark a core offline when it halts  [defense-in-depth; near-zero risk]
-- **Where:** set `is_online = false` from the dead-end paths — `hlt_loop`
-  (`lib.rs:1075`), recursive-#PF (`interrupts.rs:1300`), stack-overflow arm (`:1337`),
-  double-fault (`:1479`). The shootdown target loops already filter `is_online`, so a
-  dead core is then excluded **for free, with no protocol change**.
-- **Why:** even if Track A is somehow defeated, a future dead core can't drag the
-  machine down. A halted core never runs userspace again, so skipping its (stale) TLB
-  is correct.
+### Track B — mark a core offline when it halts  [IMPLEMENTED 2026-06-14]
+**Implemented** in `hlt_loop` (`lib.rs`). All five dead-end paths funnel through
+`hlt_loop` — the panic handler (`handle_panic`), the recursive-#PF cascade
+(`interrupts.rs`), the kstack-overflow / kernel-#PF arm, #GP, and #DF — so a single
+`if let Some(pc) = smp::try_per_core() { pc.is_online.store(false, Release) }` at the
+top of `hlt_loop` covers every one of them with no per-site edits. `try_per_core()` is
+ISR-safe and a no-op if per-core data isn't up yet (earliest boot). The shootdown
+target loops already filter `is_online` (which was otherwise write-once → `true`), so a
+halted core is now excluded **for free, with no protocol change**. A halted core never
+runs userspace again, so abandoning its stale TLB is correct.
 
-### Track C — degrade the shootdown ack-timeout instead of `panic!`  [blast-radius reduction]
-- **Where:** `tlb.rs:176`. On timeout: re-NMI the still-pending core once; if still no
-  ACK, mark it offline (Track B), drop it from the expected count, and continue.
-  Consider not holding `SHOOTDOWN_LOCK` across the full spin (`tlb.rs:210/372`).
-- **Tradeoff:** continuing past a lost shootdown risks a stale TLB on the target — only
-  safe **combined with Track B** (the core is being taken offline anyway). With A+C the
-  timeout becomes effectively unreachable *and* non-fatal.
+### Track C — degrade the shootdown ack-timeout instead of `panic!`  [IMPLEMENTED 2026-06-14]
+**Implemented** in `smp/tlb.rs`. Two parts:
+1. **Ack protocol: count → idempotent per-round bitmap.** Replaced the decrementing
+   `SHOOTDOWN_PENDING: AtomicU8` with `SHOOTDOWN_ACK: AtomicU64` (bit `i` = core `i`
+   flushed). The sender builds a `target_mask` in the same single snapshot walk it
+   already did, resets `SHOOTDOWN_ACK=0` under `SHOOTDOWN_LOCK` before sending NMIs, and
+   waits on `(SHOOTDOWN_ACK & target_mask) == target_mask`. The handler does
+   `fetch_or(1<<core_id, Release)` *after* the flush (was `fetch_sub`). This makes the
+   degrade path provably safe: a stale NMI latched from an abandoned earlier round can
+   only set a bit *outside* the current round's `target_mask` (the abandoned core was
+   marked offline, so it is excluded here) → ignored. The old count could underflow,
+   double-decrement on re-NMI, or have a late ACK corrupt a *subsequent* round's count
+   (silent stale TLB). The bitmap also subsumes the prior count-vs-send TOCTTOU
+   hardening: a core flipping online/offline post-snapshot simply never sets its bit and
+   is handled by the re-NMI + degrade path.
+2. **Timeout: panic → re-NMI → degrade.** `wait_for_shootdown_acks` now: (phase 1) spins
+   the 500 ms window; (phase 2) on timeout dumps the existing per-core
+   serviced/timer diagnostic, re-NMIs the still-outstanding cores once, and waits a
+   shorter (~100 ms) grace window; (phase 3) if any core *still* hasn't acked, marks it
+   offline (Track B) and **returns** instead of `panic!`ing. With A+C the timeout is
+   both effectively unreachable (Track A lets a wedged core ack on the IST stack) *and*
+   non-fatal if ever reached.
+- **Tradeoff (unchanged, now safe):** continuing past a lost shootdown risks a stale TLB
+  on the target — safe because the core is being taken offline anyway (it will never run
+  userspace again).
+- **Not done:** the `SHOOTDOWN_LOCK`-across-the-full-spin idea (don't stall *other*
+  cores' shootdowns during one degrade) was left out — with the degrade path now
+  bounded to ~600 ms total and effectively unreachable post-Track-A, the added lock
+  complexity wasn't worth the risk in this pass. Revisit only if the degrade path is
+  observed firing in practice.
 
 ### Track D — root-cause the originating overflow  [deeper; fixes the origin, not just the blast radius]
 - Confirm whether the cross-thread PKU read-recovery (`interrupts.rs:1174-1202`) +
@@ -270,8 +305,8 @@ it never re-enables NMI mid-handler and cannot nest on the shared per-core stack
   cut serial spam (cosmetic; spam itself slows a core and widens shootdown windows).
 
 **Suggested order:** A → B → C (A+C together make the timeout unreachable and
-non-fatal; B is the cheap safety net), then D for the origin. A is the minimal change
-that makes the current repro survivable.
+non-fatal; B is the cheap safety net), then D for the origin. **A, B, and C all landed
+2026-06-14.** Only D (root-cause the originating overflow) remains.
 
 ## Reproduction
 
