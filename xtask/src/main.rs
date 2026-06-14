@@ -16111,11 +16111,13 @@ fn cmd_claude_smoke(args: &SmokeBootArgs) {
         }
     }
 
-    // Build the jitless node runtime FIRST (claude-code's DEPS=node), then the
-    // fetch-and-stage claude-code `.m3pkg`. A real build failure here is a FAIL
-    // (not a skip) — the toolchain IS present and PKU IS available.
+    // Build the node runtime FIRST (claude-code's DEPS=node) — whichever variant
+    // is selected above: the jitless node by default, or the 90a JIT node when
+    // M3OS_CLAUDE_JIT=1 set M3OS_NODE_JIT. Then fetch-and-stage the claude-code
+    // `.m3pkg`. A real build failure here is a FAIL (not a skip) — the toolchain
+    // IS present.
     if let Err(msg) = port_build::build_node_port() {
-        eprintln!("claude-smoke: precondition failed (JIT node port build): {msg}");
+        eprintln!("claude-smoke: precondition failed (node runtime port build): {msg}");
         std::process::exit(SMOKE_EXIT_CLAUDE_SMOKE_FAILED);
     }
     if let Err(msg) = port_build::build_claude_code_port() {

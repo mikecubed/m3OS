@@ -1675,25 +1675,33 @@ fn build_claude_code(extracted: &Path, stage: &Path, port_dir: &Path) -> Result<
         ));
     }
 
+    // package.json is mandatory too: the launcher / `.meta` machinery and cli.js
+    // itself read its `version`/metadata at runtime. Require it explicitly
+    // (mirroring the cli.js check above) so a tarball-layout change can't silently
+    // produce an incomplete staged package — the prior any-of-three guard would
+    // have accepted a bundle missing package.json as long as cli.js was present.
+    let pkg_json = extracted.join("package.json");
+    if !pkg_json.is_file() {
+        return Err(format!(
+            "claude-code bundle missing package.json at {} — incomplete/changed tarball layout?",
+            pkg_json.display()
+        ));
+    }
+
     // Stage the package payload under /usr/lib/claude-code/. cli.js resolves its
     // vendored tooling relative to its own __dirname, so preserve that layout.
     let libdir = stage.join("usr/lib/claude-code");
     fs::create_dir_all(&libdir).map_err(|e| format!("mkdir {}: {e}", libdir.display()))?;
 
-    // cli.js (embeds the yoga.wasm TUI engine) + package.json are mandatory;
-    // LICENSE.md is kept for provenance. The ~134 KB `sdk-tools.d.ts` (TypeScript
-    // types, runtime-irrelevant) and `README.md` are intentionally pruned to keep
-    // the install lean over the slow ring-3 VFS.
-    let mut staged_any = false;
+    // cli.js (embeds the yoga.wasm TUI engine) + package.json are mandatory and
+    // were verified present above; LICENSE.md is optional provenance. The ~134 KB
+    // `sdk-tools.d.ts` (TypeScript types, runtime-irrelevant) and `README.md` are
+    // intentionally pruned to keep the install lean over the slow ring-3 VFS.
     for f in ["cli.js", "package.json", "LICENSE.md"] {
         let src = extracted.join(f);
         if src.is_file() {
             fs::copy(&src, libdir.join(f)).map_err(|e| format!("stage claude-code {f}: {e}"))?;
-            staged_any = true;
         }
-    }
-    if !staged_any {
-        return Err("claude-code: nothing staged (cli.js/package.json absent)".to_string());
     }
 
     // Stage ONLY the x64-linux ripgrep (Claude Code's search tool). It is a

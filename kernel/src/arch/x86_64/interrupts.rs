@@ -1149,19 +1149,28 @@ extern "x86-interrupt" fn page_fault_handler(
 
         // Phase 90b — W^X v2 PKU cross-thread READ recovery. A real-world Node
         // process (Claude Code's cli.js) allocates a write-deny protection key for
-        // its V8 code space, then spawns worker/background threads. PKRU is
-        // per-thread, so a sibling thread created before the key existed DATA-reads
-        // the pkey-tagged executable code page with that key access-disabled in its
-        // PKRU → PROTECTION_KEY fault (observed: `pid=N … PROTECTION_KEY … process
-        // killed` while running cli.js). The W^X v2 invariant only needs WRITE gated
-        // per-thread-window; READ+EXECUTE of guarded code is process-wide. So on a
-        // PROTECTION_KEY *read* fault (no CAUSED_BY_WRITE) against a present,
-        // EXECUTABLE page carrying a non-zero key, grant this thread read access
+        // its V8 code space (`pkey_alloc(0, PKEY_DISABLE_WRITE)`), then spawns
+        // worker/background threads. PKRU is per-thread, so a sibling thread created
+        // before the key existed DATA-reads the pkey-tagged executable code page with
+        // that key access-disabled in its PKRU → PROTECTION_KEY fault (observed:
+        // `pid=N … PROTECTION_KEY … process killed` while running cli.js). The W^X v2
+        // invariant only needs WRITE gated per-thread-window; READ+EXECUTE of guarded
+        // code is process-wide. So on a PROTECTION_KEY *read* fault (no
+        // CAUSED_BY_WRITE) against a present, EXECUTABLE page carrying a non-zero key
+        // the process allocated as WRITE-DENY-ONLY, grant this thread read access
         // (clear the key's AD bit in its live PKRU; the next context-switch XSAVE
         // persists it) and retry. WRITES stay gated (CAUSED_BY_WRITE excluded → W^X
-        // write-protection intact), and non-executable access-deny DATA pages (PKU
-        // data isolation, exercised by pku-smoke) are never granted — the
-        // executable check excludes them.
+        // write-protection intact). The recovery is deliberately NARROW:
+        //   - non-executable DATA pages are excluded by the `is_exec` gate (PKU data
+        //     isolation, exercised by pku-smoke, is untouched);
+        //   - a key allocated DENY-ALL-ACCESS (PKEY_DISABLE_ACCESS — which the W^X v2
+        //     grant DOES permit on an executable page) keeps its reads gated
+        //     per-thread, exactly as the process intended; auto-granting read would
+        //     defeat that isolation;
+        //   - an unallocated/permissive key is never granted (`rights()` returns None
+        //     for a key not currently allocated in this process's table → the
+        //     "currently allocated" check Linux mm_pkey_is_allocated makes).
+        // Only the write-deny-only case (V8's code space) auto-recovers.
         if err.contains(PageFaultErrorCode::PROTECTION_KEY)
             && !err.contains(PageFaultErrorCode::CAUSED_BY_WRITE)
             && crate::arch::x86_64::cpuid::pku_usable()
@@ -1172,10 +1181,23 @@ extern "x86-interrupt" fn page_fault_handler(
                 flag_bits & x86_64::structures::paging::PageTableFlags::NO_EXECUTE.bits() == 0;
             let key = kernel_core::pkey::pkey_of(flag_bits);
             if is_exec && key != 0 {
-                crate::arch::x86_64::pkru::grant_read_access(key);
-                crate::task::scheduler::current_task_record_page_fault(false);
-                assert_preempt_count_zero_on_return_to_user(&stack_frame);
-                return;
+                use kernel_core::pkey::{PKEY_DISABLE_ACCESS, PKEY_DISABLE_WRITE};
+                // The PROCESS_TABLE lock is taken only inside this branch, which is
+                // reachable only for an executable-page READ fault — i.e. only from
+                // userspace code execution, never from a kernel context that itself
+                // holds PROCESS_TABLE — so this blocking lock cannot self-deadlock.
+                let write_deny_only =
+                    crate::process::shared_pkey_table(crate::process::current_pid())
+                        .and_then(|t| t.rights(key))
+                        .is_some_and(|r| {
+                            r & PKEY_DISABLE_WRITE != 0 && r & PKEY_DISABLE_ACCESS == 0
+                        });
+                if write_deny_only {
+                    crate::arch::x86_64::pkru::grant_read_access(key);
+                    crate::task::scheduler::current_task_record_page_fault(false);
+                    assert_preempt_count_zero_on_return_to_user(&stack_frame);
+                    return;
+                }
             }
         }
 
