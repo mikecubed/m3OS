@@ -1,21 +1,27 @@
 ---
-status: SUBSTANTIALLY FIXED — root-caused; Tracks A+B+C landed 2026-06-14. Track A
-  (NMI-on-IST) removed the whole-machine KERNEL PANIC (a wedged core now ACKs TLB
-  shootdowns on a clean per-core IST stack). Track B (mark a core offline when it
-  halts — done in `hlt_loop`, the single chokepoint all dead-end paths funnel through)
-  makes future shootdowns exclude a dead core for free. Track C (degrade the shootdown
-  ack-timeout instead of `panic!` — re-NMI the laggards, then mark-offline + continue;
-  ack tracking converted from a decrementing `SHOOTDOWN_PENDING` count to a per-round
-  idempotent `SHOOTDOWN_ACK` bitmap so the degrade path has no underflow / double-
-  decrement / cross-round-corruption hazard) makes the timeout non-fatal even for a
-  genuinely-dark core. A+C together make the `tlb.rs` timeout both effectively
-  unreachable AND non-fatal. Validated: `cargo xtask check` + `smoke-test` (boots clean
-  on the default SMP=4; all fork/exec/mmap/dynlink shootdown traffic acks correctly
-  through the new bitmap) + `regression` (11/11, incl. `fork-overlap` CoW shootdowns).
-  Only Track D (root-cause the originating kstack overflow / recover the wedged task
-  instead of halting it) remains OPEN — deeper origin work, not a machine-kill. The
-  `M3OS_SMP=1` workaround is no longer required for survivability; it remains the
-  fastest path for single-core determinism.
+status: FIXED — root-caused; Tracks A+B+C+D landed 2026-06-14. Track A (NMI-on-IST)
+  removed the whole-machine KERNEL PANIC (a wedged core now ACKs TLB shootdowns on a
+  clean per-core IST stack). Track B (mark a core offline when it halts — done in
+  `hlt_loop`, the single chokepoint all dead-end paths funnel through) makes future
+  shootdowns exclude a dead core for free. Track C (degrade the shootdown ack-timeout
+  instead of `panic!` — re-NMI the laggards, then mark-offline + continue; ack tracking
+  converted from a decrementing `SHOOTDOWN_PENDING` count to a per-round idempotent
+  `SHOOTDOWN_ACK` bitmap so the degrade path has no underflow / double-decrement /
+  cross-round-corruption hazard) makes the timeout non-fatal even for a genuinely-dark
+  core; A+C together make the `tlb.rs` timeout both effectively unreachable AND
+  non-fatal. Track D (controlled-kill recovery) converts a userspace-task-attributable
+  kernel-stack overflow into a SIGSEGV of the offending process — the #PF and #DF
+  handlers redirect to `fault_kill_trampoline` (on a per-core recovery stack for #PF;
+  in-place on the DF IST stack for #DF) and the core returns to the scheduler instead
+  of wedging in `hlt_loop`; the heavy diagnostic dumps that caused the recursive-#PF
+  cascade are skipped on the overflow path. Validated: `cargo xtask check` +
+  `smoke-test` (default SMP=4) + `regression` (11/11) + a new TCG-single-core
+  `kstack-overflow-smoke` gate (`M3OS_KSTACK_OVERFLOW_REGRESSION=1`) that overflows a
+  child's kstack and asserts the child is SIGSEGV-killed while the parent survives.
+  Remaining: only the deeper Track D origin audit (pin the exact overflowing call chain;
+  the SCHEDULER/PROCESS_TABLE-across-faults audit) — not blocking, the overflow is now
+  survivable regardless of origin. The `M3OS_SMP=1` workaround is no longer required for
+  survivability; it remains the fastest path for single-core determinism.
 branch: feat/phase-90b-claude-code
 repro-commit: bb2ee97f  # bug predates this; present since the SMP+PKU era. NOT caused by recent work.
 date: 2026-06-14
@@ -290,14 +296,52 @@ runs userspace again, so abandoning its stale TLB is correct.
   complexity wasn't worth the risk in this pass. Revisit only if the degrade path is
   observed firing in practice.
 
-### Track D — root-cause the originating overflow  [deeper; fixes the origin, not just the blast radius]
-- Confirm whether the cross-thread PKU read-recovery (`interrupts.rs:1174-1202`) +
-  `demand_map_*` under multi-core contention can re-fault/loop, and audit kernel paths
-  that hold `SCHEDULER`/`PROCESS_TABLE` across fault-prone work (so a fault never wedges
-  with a lock held — cf. `docs/post-mortems/2026-04-21-scheduler-lock-isr-deadlock.md`).
-  Pairs with the pre-flagged race in `docs/roadmap/tasks/90b-claude-code-tasks.md`.
-- Consider redirecting a task-attributable kstack overflow to a controlled
-  process-kill (off the IST stack) instead of `hlt_loop` (`interrupts.rs:1337`).
+### Track D — recover the originating overflow  [IMPLEMENTED 2026-06-14]
+
+**Implemented** the controlled-kill recovery — the part the analysis flagged as the
+real payoff ("redirect a task-attributable kstack overflow to a controlled
+process-kill instead of `hlt_loop`"). A userspace-task-attributable kernel-stack
+overflow is now turned into a **SIGSEGV of the offending process**, after which the
+core returns to the scheduler and keeps running — instead of wedging in `hlt_loop`.
+
+Mechanism (`kernel/src/arch/x86_64/interrupts.rs`):
+1. **#PF path** — the ring-0 guard-page-#PF branch (the real-world cli.js
+   manifestation: a large single frame's access hit the guard while RSP was still
+   mapped) now, *before* the heavy diagnostic dumps (which themselves re-overflow →
+   the recursive-#PF cascade), prints one compact line and calls
+   `try_recover_kstack_overflow`. If a userspace task is current
+   (`current_pid() != 0`), it rewrites the interrupt return frame to IRETQ into the
+   existing `fault_kill_trampoline` running on a new **per-core fault-recovery stack**
+   (`FAULT_RECOVERY_STACKS`, a `.bss` pool), clears the per-core recursive-#PF latch
+   (we are recovering, not cascading), and returns. Non-attributable
+   (kernel/idle-context) overflows still halt — but skip the heavy dumps.
+2. **#DF path** — a gradual recursion marches RSP into the guard, so the guard-page
+   #PF can't push its frame onto the exhausted stack and escalates to a **#DF**. The
+   #DF handler (already on the clean DF IST stack) checks whether the faulting
+   context's saved RSP is in a kstack guard page and, if attributable, runs
+   `fault_kill_trampoline` directly (no stack switch needed) → kill + reschedule.
+
+**Validated** by a new `kstack-overflow-smoke` gate (`M3OS_KSTACK_OVERFLOW_REGRESSION=1`)
+on plain TCG single-core — no PKU/KVM/Node repro required, since a kstack overflow is
+just deep recursion. A feature-gated probe syscall `SYS_KSTACK_OVERFLOW_TEST` (0x1150,
+`kstack-overflow-test` cargo feature; ENOSYS in production) lets the ramdisk
+`kstack-overflow-test` binary's child overflow its kstack; the parent asserts it was
+SIGSEGV-killed (`KSTACK_OVF:killed:ok`) and that the parent kept running afterwards
+(`KSTACK_OVF:survivor:ok` — on single-core, the survival proof: a wedged core would
+never reschedule the parent, hanging `waitpid` → gate timeout). Confirmed serial:
+`[int] DOUBLE FAULT = kstack overflow (rsp=0xffff8080003fcdf0) attributable to pid 37 —
+killing process; core recovers (no halt)` → `[fault_kill] trampoline running for pid 37`
+→ child killed, parent survives, **no `RECURSIVE KERNEL PAGE FAULT`, no halt**.
+
+**Still open (deeper origin audit — not blocking):** pinning the *exact* kernel call
+chain that exhausts 64 KiB under V8's churn needs the multi-core `--kvm`/PKU node repro
+(the corrupted frame in the original log can't reveal it; see Open question 1). With the
+recovery in place that overflow is now survivable regardless of origin. The companion
+audit — confirming the cross-thread PKU read-recovery / `demand_map_*` paths can't
+re-fault/loop, and that no kernel path holds `SCHEDULER`/`PROCESS_TABLE` across
+fault-prone work (cf. `docs/post-mortems/2026-04-21-scheduler-lock-isr-deadlock.md`,
+the pre-flagged race in `docs/roadmap/tasks/90b-claude-code-tasks.md`) — remains a
+follow-up.
 
 ### Non-fixes / explicitly out of scope
 - Do **not** widen `copy_*_user` locking (Layer 0) — it would worsen Layer 2 contention.
@@ -305,8 +349,11 @@ runs userspace again, so abandoning its stale TLB is correct.
   cut serial spam (cosmetic; spam itself slows a core and widens shootdown windows).
 
 **Suggested order:** A → B → C (A+C together make the timeout unreachable and
-non-fatal; B is the cheap safety net), then D for the origin. **A, B, and C all landed
-2026-06-14.** Only D (root-cause the originating overflow) remains.
+non-fatal; B is the cheap safety net), then D for the origin. **A, B, C, and D's
+controlled-kill recovery all landed 2026-06-14.** Remaining: only the deeper Track D
+origin audit (pin the exact overflowing call chain via the multi-core repro; the
+SCHEDULER/PROCESS_TABLE-across-faults audit) — not blocking, the overflow is now
+survivable regardless of origin.
 
 ## Reproduction
 

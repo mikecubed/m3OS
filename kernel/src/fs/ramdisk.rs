@@ -347,6 +347,12 @@ static WX_VIOLATION_ELF: &[u8] = generated_initrd_asset!("wx-violation");
 // no `.conf`.
 static PKU_SMOKE_ELF: &[u8] = generated_initrd_asset!("pku-smoke");
 
+// Track D (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md) —
+// `kstack-overflow-test`: a child overflows its kernel stack via the
+// feature-gated SYS_KSTACK_OVERFLOW_TEST and the parent asserts the kernel
+// SIGSEGV-killed it (controlled-kill recovery, not a core wedge). Not a daemon.
+static KSTACK_OVERFLOW_TEST_ELF: &[u8] = generated_initrd_asset!("kstack-overflow-test");
+
 // Phase 77 Track F.1 — `epoll-smoke` epoll_* verification regression.
 static EPOLL_SMOKE_ELF: &[u8] = generated_initrd_asset!("epoll-smoke");
 
@@ -688,6 +694,14 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "pku-smoke",
         RamdiskNode::File {
             content: PKU_SMOKE_ELF,
+        },
+    ),
+    // Track D: kstack-overflow-test — kernel-stack-overflow controlled-kill
+    // recovery regression (child SIGSEGV'd, core survives).
+    (
+        "kstack-overflow-test",
+        RamdiskNode::File {
+            content: KSTACK_OVERFLOW_TEST_ELF,
         },
     ),
     // Phase 77 Track F.1: epoll-smoke — epoll_* verification regression.

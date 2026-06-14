@@ -124,6 +124,105 @@ fn assert_preempt_count_zero_on_return_to_user(stack_frame: &InterruptStackFrame
 static FAULT_KILL_PID: AtomicU32 = AtomicU32::new(0);
 
 // ---------------------------------------------------------------------------
+// Track D — kernel-stack-overflow controlled-kill recovery
+// (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md)
+// ---------------------------------------------------------------------------
+//
+// When a userspace task overflows its *per-task* kernel stack (set as TSS.RSP0
+// on dispatch), the resulting ring-0 fault cannot run the kill path on the
+// now-exhausted stack:
+//   - If RSP marched into the guard page gradually, the #PF that the guard hit
+//     would raise cannot push its frame (RSP is already unmapped) → it escalates
+//     to a **#DF**, which runs on the clean DF IST stack — so the #DF handler can
+//     run the kill directly.
+//   - If a single large frame's access hit the guard while RSP was still mapped,
+//     a deliverable **#PF** is taken (the real-world cli.js manifestation); that
+//     handler runs on a near-exhausted stack, so it must NOT do heavy work — it
+//     redirects (IRETQ) into `fault_kill_trampoline` on the per-core recovery
+//     stack below.
+// Either way the offending process is SIGSEGV-killed and the core returns to the
+// scheduler instead of cascading into a recursive #PF + `hlt_loop` (which, pre
+// Tracks A–C, escalated to a whole-machine panic).
+
+/// Size of each per-core fault-recovery stack (16 KiB — matches the syscall
+/// stack; `fault_kill_trampoline` only takes a couple of locks and a handful of
+/// calls, so this is ample).
+const FAULT_RECOVERY_STACK_SIZE: usize = 4096 * 4;
+
+/// 16-byte-aligned wrapper (x86-64 ABI requires 16-byte stack alignment before
+/// a CALL; a bare `[u8; N]` only guarantees 1-byte alignment).
+#[repr(align(16))]
+struct RecoveryStack([u8; FAULT_RECOVERY_STACK_SIZE]);
+
+/// Per-core recovery stacks, indexed by `core_id`. `.bss` (zero-initialised, no
+/// init-ordering dependency on the kstack pool). One per core suffices: a core
+/// handles one fault at a time, and the recovery runs to completion (ending in a
+/// `switch_context` to the scheduler) before the core can take another fault
+/// that would reuse it. `static mut` because the CPU/kernel writes to it as a
+/// stack when the recovery trampoline runs.
+static mut FAULT_RECOVERY_STACKS: [RecoveryStack; crate::smp::MAX_CORES] =
+    [const { RecoveryStack([0u8; FAULT_RECOVERY_STACK_SIZE]) }; crate::smp::MAX_CORES];
+
+/// 16-byte-aligned top (one past the last byte) of `core_id`'s recovery stack.
+fn fault_recovery_stack_top(core_id: usize) -> u64 {
+    let idx = core_id.min(crate::smp::MAX_CORES - 1);
+    // SAFETY: take only the address of the static (no reference formed to the
+    // `static mut`, which would be UB in edition 2024); the CPU writes to it as
+    // a stack when the recovery trampoline runs.
+    let base = unsafe { core::ptr::addr_of_mut!(FAULT_RECOVERY_STACKS[idx].0) as u64 };
+    (base + FAULT_RECOVERY_STACK_SIZE as u64) & !15
+}
+
+/// Attempt to recover from a kernel-stack overflow that is attributable to a
+/// userspace task: redirect the faulting context into `fault_kill_trampoline`
+/// (which SIGSEGVs the process and reschedules) running on this core's clean
+/// recovery stack. Returns `true` if recovery was initiated — the caller must
+/// then `return` so the rewritten interrupt frame IRETQs into the trampoline —
+/// or `false` if the overflow is not attributable to a userspace task (a
+/// genuine kernel/idle-context overflow), in which case the caller halts.
+///
+/// Mirrors the ring-3 fault-kill redirect, but points RSP at the per-core
+/// recovery stack rather than the current (exhausted) kernel stack.
+fn try_recover_kstack_overflow(stack_frame: &mut InterruptStackFrame) -> bool {
+    if !crate::smp::is_per_core_ready() {
+        return false;
+    }
+    let pid = crate::process::current_pid();
+    if pid == 0 {
+        // No userspace process on this core (idle / kernel-thread context) — the
+        // overflow is a genuine kernel bug, not a runaway user task. Halt.
+        return false;
+    }
+    let core = page_fault_core_index();
+    // We are recovering, not cascading: clear the per-core recursive-#PF latch
+    // so a future *legitimate* kernel fault on this core is still diagnosed in
+    // full rather than mistaken for a cascade and silently halted.
+    if core < IN_KERNEL_PAGE_FAULT.len() {
+        IN_KERNEL_PAGE_FAULT[core].store(false, Ordering::Release);
+    }
+    FAULT_KILL_PID.store(pid, Ordering::Relaxed);
+    _panic_print(format_args!(
+        "[int] kstack overflow attributable to pid {} — killing process; core {} recovers (no halt)\n",
+        pid, core,
+    ));
+    let recovery_top = fault_recovery_stack_top(core);
+    // SAFETY: rewrite the interrupt return frame while interrupts are disabled
+    // (exception entry cleared IF). IRETQ will load RSP = recovery stack so the
+    // kill trampoline runs on a clean stack, not the overflowed one. Same shape
+    // as the ring-3 redirect in `page_fault_handler`.
+    unsafe {
+        stack_frame.as_mut().update(|f| {
+            f.instruction_pointer = VirtAddr::new(fault_kill_trampoline as *const () as u64);
+            f.code_segment = gdt::kernel_code_selector();
+            f.cpu_flags &= !x86_64::registers::rflags::RFlags::INTERRUPT_FLAG;
+            f.stack_pointer = VirtAddr::new(recovery_top);
+            f.stack_segment = gdt::kernel_data_selector();
+        });
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
 // Page-fault re-entrance guard
 // ---------------------------------------------------------------------------
 //
@@ -1317,9 +1416,14 @@ extern "x86-interrupt" fn page_fault_handler(
         crate::hlt_loop();
     }
 
-    // Kernel-stack overflow detection: if the fault address lands inside a
-    // kstack guard page, name the slot before the regular dump path so the
-    // crash is recognised at the source rather than as a wild dereference.
+    // Kernel-stack overflow: the fault address is inside a kstack guard page.
+    // Handle this BEFORE the heavy diagnostic dumps below — those push several
+    // hundred bytes per frame and, on an already-exhausted stack, re-cross the
+    // guard and trigger a recursive #PF cascade (the failure mode in
+    // docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md). Keep
+    // this branch's own stack use to a single compact line, then either recover
+    // (Track D: kill the offending user task on a clean stack and reschedule) or
+    // halt.
     if let Ok(fault_va) = addr
         && let Some(slot) = crate::task::kstack::classify_guard_page_fault(fault_va.as_u64())
     {
@@ -1329,6 +1433,16 @@ extern "x86-interrupt" fn page_fault_handler(
             fault_va.as_u64(),
             stack_frame.instruction_pointer.as_u64(),
         ));
+        // Track D: if attributable to a userspace task, redirect to the kill
+        // trampoline on the per-core recovery stack and return (IRETQ). The core
+        // survives and keeps scheduling other tasks.
+        if try_recover_kstack_overflow(&mut stack_frame) {
+            return;
+        }
+        // Genuine kernel/idle-context overflow — a real kernel bug. Halt this
+        // core (with the SMP liveness model, Tracks A–C, the machine survives).
+        // Deliberately skip the heavy dumps below: they would re-overflow.
+        crate::hlt_loop();
     }
 
     _panic_print(format_args!(
@@ -1497,6 +1611,32 @@ extern "x86-interrupt" fn general_protection_fault_handler(
 }
 
 extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFrame, _err: u64) -> ! {
+    // Track D: a #DF whose faulting context's RSP sits in a kstack guard page is
+    // a kernel-stack overflow that *escalated* — the guard-page #PF couldn't push
+    // its frame onto the exhausted stack, so it double-faulted. We are now on the
+    // clean DF IST stack, so if the overflow is attributable to a userspace task
+    // we can run the kill path directly (no stack switch needed) and reschedule,
+    // converting a previously-fatal #DF into a SIGSEGV of the offending process.
+    // See docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md.
+    let faulting_rsp = stack_frame.stack_pointer.as_u64();
+    if crate::task::kstack::classify_guard_page_fault(faulting_rsp).is_some()
+        && crate::smp::is_per_core_ready()
+    {
+        let pid = crate::process::current_pid();
+        if pid != 0 {
+            _panic_print(format_args!(
+                "[int] DOUBLE FAULT = kstack overflow (rsp={:#x}) attributable to pid {} — \
+                 killing process; core recovers (no halt)\n",
+                faulting_rsp, pid,
+            ));
+            FAULT_KILL_PID.store(pid, Ordering::Relaxed);
+            // Already on the clean DF IST stack — run the kill directly.
+            // `fault_kill_trampoline` is `-> !` and ends in a switch to the
+            // scheduler, abandoning this IST stack (reused on the next #DF).
+            fault_kill_trampoline();
+        }
+    }
+
     _panic_print(format_args!("[int] DOUBLE FAULT: {:?}\n", stack_frame));
     _panic_print(format_args!(
         "[int] IST RSP={:#x}\n",

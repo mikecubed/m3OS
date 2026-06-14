@@ -2344,6 +2344,9 @@ pub extern "C" fn syscall_handler(
         // -- Phase 84 Spectre mitigations --
         SYS_MITIGATIONS_STATUS => sys_mitigations_status(arg0, arg1),
         SYS_SET_SPEC_CTRL => sys_set_spec_ctrl(arg0),
+        // -- Track D debug probe (feature `kstack-overflow-test`; absent → ENOSYS) --
+        #[cfg(feature = "kstack-overflow-test")]
+        SYS_KSTACK_OVERFLOW_TEST => sys_kstack_overflow_test(),
         _ => {
             log::warn!("unhandled syscall {number} (args: {arg0:#x}, {arg1:#x}, {arg2:#x})");
             NEG_ENOSYS
@@ -17388,6 +17391,50 @@ pub(super) fn sys_set_spec_ctrl(enable: u64) -> u64 {
     let pid = crate::process::current_pid();
     crate::mitigations::set_stibp_opt_in(pid, enable != 0);
     0
+}
+
+// ---------------------------------------------------------------------------
+// Track D debug probe — SYS_KSTACK_OVERFLOW_TEST (0x1150)
+// (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md)
+// ---------------------------------------------------------------------------
+//
+// Feature-gated (`kstack-overflow-test`); absent in production (the number
+// falls through to ENOSYS). Deliberately overflows the calling task's per-task
+// kernel stack so the controlled-kill recovery path can be exercised end-to-end
+// on plain TCG: the recursion marches RSP into the slot's guard page, the
+// resulting ring-0 #PF/#DF is recognised as a kstack overflow, and the offending
+// process is SIGSEGV-killed while the rest of the system keeps running.
+
+/// m3OS-native syscall number for the Track D overflow probe (0x114x block).
+#[cfg(feature = "kstack-overflow-test")]
+pub const SYS_KSTACK_OVERFLOW_TEST: u64 = 0x1150;
+
+/// Recurse with a sizable written local buffer so each frame consumes ~1 KiB
+/// and the 64 KiB kernel stack is exhausted in well under 100 frames. Not tail
+/// recursion (the result is combined *after* the recursive call), so the
+/// compiler cannot rewrite it into a loop; `black_box` + volatile keep the
+/// buffer live and un-elided.
+#[cfg(feature = "kstack-overflow-test")]
+#[inline(never)]
+#[allow(unconditional_recursion)]
+fn kstack_overflow_recurse(depth: u64) -> u64 {
+    let mut buf = [0u8; 1024];
+    for (i, b) in buf.iter_mut().enumerate() {
+        unsafe { core::ptr::write_volatile(b, (depth as u8).wrapping_add(i as u8)) };
+    }
+    let tail = unsafe { core::ptr::read_volatile(&buf[(depth as usize) & 1023]) } as u64;
+    core::hint::black_box(tail).wrapping_add(kstack_overflow_recurse(depth.wrapping_add(1)))
+}
+
+/// `SYS_KSTACK_OVERFLOW_TEST` handler — never returns normally (the recursion
+/// overflows the kstack and the fault handler kills this process first).
+#[cfg(feature = "kstack-overflow-test")]
+pub(super) fn sys_kstack_overflow_test() -> u64 {
+    log::warn!(
+        "[kstack-test] pid {} deliberately overflowing its kernel stack (Track D recovery probe)",
+        crate::process::current_pid(),
+    );
+    core::hint::black_box(kstack_overflow_recurse(core::hint::black_box(0)))
 }
 
 // ---------------------------------------------------------------------------

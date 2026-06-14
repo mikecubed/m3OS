@@ -1135,6 +1135,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kstack-overflow-test"
+version = "0.1.0"
+dependencies = [
+ "syscall-lib",
+]
+
+[[package]]
 name = "ktrace"
 version = "0.1.0"
 dependencies = [

@@ -304,6 +304,15 @@ const SMOKE_EXIT_NODE_JIT_SMOKE_FAILED: i32 = 84;
 /// `M3OS_CLAUDE_NET=1` + a seeded credential and skip-with-reason otherwise.
 const SMOKE_EXIT_CLAUDE_SMOKE_FAILED: i32 = 85;
 
+/// Track D — `cargo xtask kstack-overflow-smoke` exit code. Boots a kernel built
+/// with the `kstack-overflow-test` feature, runs the `kstack-overflow-test`
+/// ramdisk binary (a child overflows its kernel stack via
+/// `SYS_KSTACK_OVERFLOW_TEST`), and asserts the kernel SIGSEGV-killed the child
+/// and the parent survived (`KSTACK_OVF:done`) — the controlled-kill recovery,
+/// not a core wedge / machine halt. See
+/// docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md.
+const SMOKE_EXIT_KSTACK_OVERFLOW_FAILED: i32 = 86;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
     Headless,
@@ -1206,6 +1215,21 @@ fn main() {
             });
             cmd_pku_smoke(&smoke_args);
         }
+        // Track D (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md)
+        // — `kstack-overflow-smoke`: builds a kernel with the
+        // `kstack-overflow-test` feature, boots m3OS, runs the
+        // `kstack-overflow-test` ramdisk binary, and asserts a child that
+        // overflows its kernel stack is SIGSEGV-killed while the parent survives
+        // (`KSTACK_OVF:done`). Plain TCG single-core — no PKU/KVM needed.
+        Some("kstack-overflow-smoke") => {
+            let smoke_args = parse_smoke_boot_args("kstack-overflow-smoke", &args[2..])
+                .unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_kstack_overflow_smoke(&smoke_args);
+        }
         // Phase 85a Track B.3 — zero-rebuild assertion gate.
         // Builds a port once to warm the pkgcache, removes the stage so the
         // same-machine `.stamp` fast-path cannot short-circuit, then builds
@@ -1230,7 +1254,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -1520,6 +1544,12 @@ fn build_userspace_bins() {
         // W^X v2 accept/reject matrix. Pure syscall + fork + write — no
         // allocator.
         ("pku-smoke", "pku-smoke", false),
+        // Track D (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md)
+        // — `kstack-overflow-test`: a child overflows its kernel stack via the
+        // feature-gated `SYS_KSTACK_OVERFLOW_TEST` and the parent asserts the
+        // kernel SIGSEGV-killed it (recovery, not a core wedge). Pure syscall +
+        // fork + write — no allocator.
+        ("kstack-overflow-test", "kstack-overflow-test", false),
         // Phase 77 Track F.1 — epoll_* verification smoke test.
         // Pure syscall+write against a pipe; no allocator.
         ("epoll-smoke", "epoll-smoke", false),
@@ -12737,6 +12767,149 @@ fn cmd_pku_smoke(args: &SmokeBootArgs) {
             let _ = child.kill();
             let _ = child.wait();
             eprintln!("pku-smoke: FAILED\n{msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Track D — kstack-overflow-smoke: kernel-stack-overflow controlled-kill
+// recovery gate (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md)
+// ---------------------------------------------------------------------------
+
+/// Smoke steps for `cargo xtask kstack-overflow-smoke`. Logs into sh0, runs the
+/// `kstack-overflow-test` binary, and asserts the recovery sentinels. The
+/// load-bearing assertions:
+///   - `KSTACK_OVF:killed:ok` — the overflowing child was SIGSEGV-killed (the
+///     recovery fired; a wedge/halt would never print this).
+///   - `KSTACK_OVF:survivor:ok` — the parent kept running afterwards (on
+///     single-core, proof the core returned to the scheduler rather than wedging
+///     in `hlt_loop`).
+/// A non-consuming `Wait` on `:killed:ok` precedes the terminal `:done` so a
+/// `:skip` (feature absent) cannot masquerade as a pass.
+fn kstack_overflow_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/kstack-overflow: kernel first message",
+    }];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "kstack-overflow-test\n",
+        label: "guest/kstack-overflow: run kstack-overflow-test binary",
+    });
+    // The feature is built in for this gate, so the child MUST be SIGSEGV-killed
+    // (not SKIP). Assert it with a non-consuming Wait before the terminal `done`.
+    steps.push(SmokeStep::Wait {
+        pattern: "KSTACK_OVF:killed:ok",
+        timeout_secs: 60,
+        label: "guest/kstack-overflow: overflowing child SIGSEGV-killed (recovery fired)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "KSTACK_OVF:survivor:ok",
+        timeout_secs: 30,
+        label: "guest/kstack-overflow: parent survived (core recovered, no wedge)",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "KSTACK_OVF:done",
+        fail_prefixes: &["KSTACK_OVF:FAIL", "KSTACK_OVF:panic"],
+        timeout_secs: 30,
+        label: "guest/kstack-overflow: recovery probe complete",
+        exit_code_on_fail: SMOKE_EXIT_KSTACK_OVERFLOW_FAILED,
+    });
+    steps
+}
+
+fn cmd_kstack_overflow_smoke(args: &SmokeBootArgs) {
+    // Build the kernel WITH the `kstack-overflow-test` feature so the probe
+    // syscall (0x1150) is live. Merge with any pre-set M3OS_KERNEL_FEATURES.
+    // SAFETY: xtask is single-threaded here; the child build step reads the env.
+    // set_var is `unsafe` in Rust edition 2024 (cross-thread UB risk).
+    let merged = match std::env::var("M3OS_KERNEL_FEATURES") {
+        Ok(existing) if !existing.trim().is_empty() => {
+            format!("{},kstack-overflow-test", existing.trim())
+        }
+        _ => "kstack-overflow-test".to_string(),
+    };
+    unsafe {
+        std::env::set_var("M3OS_KERNEL_FEATURES", merged);
+    }
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false, // graphical_login — serial autologin path
+    );
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, display_mode, DeviceSet::default());
+    // No host networking needed.
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    // Pin to a single core: the survival proof is sharpest single-core — if the
+    // child's overflow had wedged the core in hlt_loop, the scheduler would never
+    // run the parent again and `waitpid` would hang the whole test (a clean
+    // timeout failure), rather than a sibling core masking the wedge.
+    for i in 0..qemu_args.len() {
+        if qemu_args[i] == "-smp" && i + 1 < qemu_args.len() {
+            qemu_args[i + 1] = "1".to_string();
+        }
+    }
+    append_ac97_audio_flags_headless(&mut qemu_args);
+    let steps = kstack_overflow_smoke_steps();
+
+    println!(
+        "kstack-overflow-smoke: launching QEMU (timeout {}s) [TCG single-core]",
+        args.timeout_secs,
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("kstack-overflow-smoke: failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!(
+                "kstack-overflow-smoke: PASS ({} steps in {elapsed}s)",
+                steps.len()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("kstack-overflow-smoke: FAILED\n{msg}");
             std::process::exit(1);
         }
     }

@@ -1,0 +1,11 @@
+[package]
+name = "kstack-overflow-test"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "kstack-overflow-test"
+path = "src/main.rs"
+
+[dependencies]
+syscall-lib = { path = "../syscall-lib" }
