@@ -3913,7 +3913,15 @@ fn build_node(port_src: &Path, stage: &Path, port_dir: &Path) -> Result<(), Stri
     // V8's mksnapshot/torque run on the build host (same arch x86_64 → native), so
     // they MUST link glibc; the final node binary is musl-static. Keep the two
     // toolsets distinct: --target/--sysroot/-static only in the TARGET vars.
-    let stub = musl_extra_ldflags_joined();
+    // `node.gyp` unconditionally appends `-latomic` for every Linux+clang build
+    // (PR #25852). The static musl/clang sysroot has no libatomic, and x86_64
+    // lowers all of V8/Node's atomics to inline instructions (the linked binary
+    // has zero undefined `__atomic_*` refs), so put the empty-archive stub dir
+    // (which includes `libatomic.a`) on the link path UNCONDITIONALLY — not gated
+    // on `find_musl_cc` like the autotools ports — or the final link fails with
+    // `ld.lld: error: unable to find library -latomic` on any host that lacks a
+    // system libatomic on lld's default search path.
+    let stub = crate::musl_stub_ldflags_always().join(" ");
     let sysroot_s = sysroot.display().to_string();
     let tgt = format!("--target={NODE_TRIPLE} --sysroot={sysroot_s}");
     let warn = "-Wno-unused-command-line-argument";

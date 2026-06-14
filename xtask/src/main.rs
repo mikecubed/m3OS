@@ -4549,17 +4549,42 @@ pub fn musl_cc_extra_ldflags() -> Vec<String> {
     }
 }
 
-/// Materialize empty `libdl.a`, `libpthread.a`, `librt.a` archives in
-/// `target/musl-stub-libs/`. The archives are byte-for-byte just the
-/// 8-byte ar global header `!<arch>\n` — a valid (empty) static archive
+/// Always materialize the empty musl stub archives and return the `-L<dir>`
+/// flag for them, independent of whether [`find_musl_cc`] needed them.
+///
+/// The Node cross-build uses this: `node.gyp` unconditionally appends
+/// `-latomic` for every Linux+clang build (PR #25852), so the link ALWAYS
+/// needs a `libatomic.a` on its search path. Relying on a happenstance system
+/// libatomic — present on a glibc+gcc host, absent on a clean musl box — is a
+/// latent failure (`ld.lld: error: unable to find library -latomic`). The
+/// empty stub archive resolves it with zero symbols (x86_64 inlines all of
+/// V8/Node's atomics), so the link succeeds on every host.
+pub fn musl_stub_ldflags_always() -> Vec<String> {
+    match ensure_musl_stub_libs() {
+        Ok(stub_dir) => vec![format!("-L{}", stub_dir.display())],
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Materialize empty `libdl.a`, `libpthread.a`, `librt.a`, `libatomic.a`
+/// archives in `target/musl-stub-libs/`. The archives are byte-for-byte just
+/// the 8-byte ar global header `!<arch>\n` — a valid (empty) static archive
 /// the linker accepts and traverses with no symbols. Idempotent: only
 /// writes a file if it is missing or has the wrong size.
+///
+/// `libatomic.a` is here for the Node cross-build: `node.gyp` unconditionally
+/// appends `-latomic` on every Linux+clang build (Node PR #25852), but the
+/// static musl/clang sysroot ships no libatomic and x86_64 lowers all of
+/// V8/Node's atomics to inline instructions (the linked `node` binary has zero
+/// undefined `__atomic_*` references) — so an empty archive resolves `-latomic`
+/// with no symbols. Only consulted when something passes `-latomic`, so it is
+/// harmless for the autotools ports, which never do.
 fn ensure_musl_stub_libs() -> std::io::Result<PathBuf> {
     let root = workspace_root();
     let stub_dir = root.join("target/musl-stub-libs");
     fs::create_dir_all(&stub_dir)?;
     const AR_HEADER: &[u8] = b"!<arch>\n";
-    for name in &["libdl.a", "libpthread.a", "librt.a"] {
+    for name in &["libdl.a", "libpthread.a", "librt.a", "libatomic.a"] {
         let path = stub_dir.join(name);
         let needs_write = match fs::metadata(&path) {
             Ok(m) => m.len() != AR_HEADER.len() as u64,
