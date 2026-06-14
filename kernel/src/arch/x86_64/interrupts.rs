@@ -1317,6 +1317,42 @@ extern "x86-interrupt" fn page_fault_handler(
             }
         }
 
+        // Spurious / already-resolved write-fault recovery (SMP).
+        //
+        // A userspace WRITE protection-violation whose page is, by the time we
+        // walk it here, already PRESENT|WRITABLE|USER is benign: another core
+        // concurrently made this page writable (a CoW fault that won the race —
+        // `resolve_cow_fault` returns false once WRITABLE is set, so the losing
+        // core's in-flight fault falls through here — or an `mprotect` raising
+        // permissions) and published the new PTE, but THIS core took its fault
+        // against a stale TLB entry. Killing the process is wrong: the write
+        // simply succeeds on retry. Flush the local TLB for the page and return.
+        // Single-core never hits this (no concurrent resolver); it is the
+        // multi-core CoW/mprotect race that wrongly killed Node/claude (a write
+        // to 0x… `PROTECTION_VIOLATION|CAUSED_BY_WRITE` under V8's W^X churn).
+        //
+        // This does NOT weaken W^X or PKU: a real RX/RO code-page write leaves
+        // WRITABLE clear and falls through to the kill below; a pkey-write-denied
+        // page raises PROTECTION_KEY (not plain PROTECTION_VIOLATION) and is
+        // excluded by `is_present` + the WRITABLE check. No infinite-loop risk:
+        // if the page is concurrently flipped back to RO, the re-walk on the next
+        // fault returns not-WRITABLE and we fall through to the kill.
+        if is_write
+            && is_present
+            && let Ok(fault_vaddr) = addr
+            && let Some(flags) = leaf_pte_flag_bits(fault_vaddr.as_u64())
+        {
+            use x86_64::structures::paging::PageTableFlags as Ptf;
+            let writable = flags & Ptf::WRITABLE.bits() != 0;
+            let user = flags & Ptf::USER_ACCESSIBLE.bits() != 0;
+            if writable && user {
+                x86_64::instructions::tlb::flush(VirtAddr::new(fault_vaddr.as_u64()));
+                crate::task::scheduler::current_task_record_page_fault(false);
+                assert_preempt_count_zero_on_return_to_user(&stack_frame);
+                return;
+            }
+        }
+
         let pid = crate::process::current_pid();
         _panic_print(format_args!(
             "[int] userspace page fault: pid={} addr={:?} err={:?} rip={:#x} — process killed\n",
