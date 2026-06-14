@@ -641,18 +641,20 @@ if [ "${M3OS_NODE_JIT_REGRESSION:-0}" = "1" ]; then
 fi
 
 # Phase 90b — Claude Code regression gate. Gated behind M3OS_CLAUDE_REGRESSION=1.
-# Builds a M3OS_WITH_CLAUDE image (the pinned claude-code 2.1.112 .m3pkg + the 90a
-# JIT node it DEPS=node-depends on), boots, `pkg install claude-code` (the solver
-# pulls node FIRST — the dependency-first proof), and asserts the always-on
-# offline core: `claude --version` (2.1.112), `claude --help`, the vendored
-# static-pie `rg --version`, and the A.2 SIGINT/spawn/raw-mode interactive
-# probes. Like node-jit-smoke the bundled node is the JIT variant (the yoga.wasm
-# TUI needs runtime WASM), so the gate REQUIRES PKU and runs only under M3OS_KVM=1
-# on a PKU host — skip-with-reason otherwise (V8 aborts at first code-space commit
-# on a no-PKU machine). The opt-in authenticated arms (M3OS_CLAUDE_NET=1 +
-# M3OS_CLAUDE_TOKEN=<setup-token> or M3OS_CLAUDE_KEY=<api-key>) run a `claude -p`
-# round-trip to api.anthropic.com + a real-FS agent workflow + the 0600
-# credential-hygiene check; absent a credential they skip-with-reason (a secret
+# Builds a M3OS_WITH_CLAUDE image (the pinned claude-code 2.1.112 .m3pkg + the node
+# it DEPS=node-depends on), boots, `pkg install claude-code` (the solver pulls node
+# FIRST — the dependency-first proof), and asserts the always-on offline core:
+# `claude --version` (2.1.112), `claude --help`, the vendored static-pie
+# `rg --version`, and the A.2 SIGINT/spawn/raw-mode interactive probes. By DEFAULT
+# the bundled node is the JITLESS variant, which needs NO PKU — so the offline core
+# is CI-viable under plain TCG; the M3OS_KVM=1 below is a SPEED knob (the cold
+# cli.js load over the slow VFS is ~10–50× faster under KVM), not a requirement.
+# `M3OS_CLAUDE_JIT=1` instead bundles the 90a JIT node (the interactive-TUI /
+# runtime-WASM variant), which REQUIRES PKU and so runs only under M3OS_KVM=1 on a
+# PKU host (skip-with-reason otherwise). The opt-in authenticated arms
+# (M3OS_CLAUDE_NET=1 + M3OS_CLAUDE_TOKEN=<setup-token> or M3OS_CLAUDE_KEY=<api-key>)
+# run a `claude -p` round-trip to api.anthropic.com + a real-FS agent workflow + the
+# 0600 credential-hygiene check; absent a credential they skip-with-reason (a secret
 # can never live in repo/CI). Absent a host C++ toolchain + the llvm musl sysroot
 # the gate SKIPs and returns success. Set this on branches that touch
 # ports/util/claude-code, xtask's build_claude_code / claude-smoke / the

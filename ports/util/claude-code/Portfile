@@ -31,20 +31,24 @@ MAINTAINER=m3os
 # transition at 2.1.112→2.1.113 and the host `cli.js --version` proof; see
 # docs/90b-claude-code.md and docs/roadmap/tasks/90b-claude-code-tasks.md.
 #
-# RUNTIME — the TUI requires the Phase 90a JIT Node variant. Claude Code's
-# terminal UI instantiates `yoga.wasm` at runtime; the Phase 89 jitless V8 forbids
-# runtime WASM codegen, so the supported runtime is the 90a JIT `build_node`
-# variant (V8 JIT + WASM under PKU-backed W^X v2). The M3OS_WITH_CLAUDE image
-# block bundles that JIT node `.m3pkg` alongside this one so the solver resolves
-# `DEPS=node` against the right runtime. The jitless `claude -p` headless mode is
-# the documented fallback if PKU/JIT is unavailable.
+# RUNTIME — jitless is the first-class default; the JIT node is opt-in for the TUI.
+# `claude --version`/`--help`/`-p` run on the Phase 89 JITLESS node (no PKU needed),
+# so that is the CI-viable default the M3OS_WITH_CLAUDE block bundles. Claude Code's
+# terminal UI additionally instantiates `yoga.wasm` at runtime, which needs the Phase
+# 90a JIT `build_node` variant (V8 JIT + WASM under PKU-backed W^X v2); building the
+# image with `M3OS_NODE_JIT` set (the gate's `M3OS_CLAUDE_JIT=1` path) bundles that JIT
+# node `.m3pkg` instead so the solver resolves `DEPS=node` against the TUI runtime. The
+# real-world cli.js runs on BOTH variants since the Phase 90b W^X-v2 cross-thread PKU
+# read-recovery kernel fix.
 #
 # LAUNCHER — `/usr/bin/claude` (staged by build_claude_code) pins the supported
 # environment: NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt (the 86a CA
 # bundle, so Node's OpenSSL validates api.anthropic.com), DISABLE_AUTOUPDATER=1
 # (the `.m3pkg` is the only supported delivery), and
-# CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 (no telemetry egress), then
-# `exec /usr/bin/node /usr/lib/claude-code/cli.js "$@"`.
+# CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 (no telemetry egress). It is a
+# `#!/usr/bin/env node` CJS wrapper that runs cli.js IN-PROCESS via dynamic
+# `import()` (single node, no fork) — NOT a `#!/bin/sh` script, because m3OS's
+# `/bin/sh` is `ion`, which can't run a shebang script file with flag args.
 #
 # VENDORED ripgrep — `vendor/ripgrep/x64-linux/rg` is a fully-static `static-pie`
 # binary (no PT_INTERP); m3OS's ELF loader handles ET_DYN static-PIE, so it runs

@@ -1,6 +1,6 @@
 # Phase 90b - Claude Code
 
-**Status:** Complete — `claude-smoke` PASSES on m3OS (27/27 jitless + 27/27 on the 90a JIT node). Claude Code installs, launches, and runs; the interactive-TUI *runtime* is proven on the JIT node, with one W^X-v2 cross-thread PKU read-recovery kernel fix that the integration test surfaced. See [the task list's Implementation Progress Log](./tasks/90b-claude-code-tasks.md) and [the learning doc](../90b-claude-code.md).
+**Status:** Complete (install + launch + headless `claude -p`) — `claude-smoke` PASSES on m3OS (27/27 jitless + 27/27 on the 90a JIT node): Claude Code installs, launches, and runs `--version`/`--help`/`-p`, with one W^X-v2 cross-thread PKU read-recovery kernel fix the integration test surfaced. The JIT/WASM runtime + the A.2 interactive primitives are proven; the **full interactive `claude` TUI does not yet run** — a direct QMP/PPM render test showed it crashes with a userspace null-deref tied to unhandled `mremap`/`io_uring` syscalls only the heavy interactive path exercises (Phase 93 syscall-gap territory), so the interactive-TUI *visual* render is a **tracked follow-up**, not gate-automated. See [the task list's Implementation Progress Log](./tasks/90b-claude-code-tasks.md) and [the learning doc](../90b-claude-code.md).
 **Source Ref:** phase-90b
 **Depends on:** Phase 85 (Cross-Compiled Toolchains) ✅, Phase 86 (Networking and GitHub) ✅, Phase 89 (Node.js) ✅, Phase 90a (Memory Protection Keys — the JIT/WASM-capable Node variant the interactive TUI requires)
 **Builds on:** Uses the post-1.0 toolchain, networking, and Node runtime phases — plus the Phase 90a PKU JIT substrate — to run a modern CLI coding agent natively inside m3OS, interactive TUI included
@@ -8,7 +8,7 @@
 
 ## Milestone Goal
 
-Claude Code runs natively inside m3OS — **interactive TUI first**, on the Phase 90a JIT/WASM-capable Node variant — using the supported Node, network, git, and GitHub tooling to read code, run commands, and participate in the same developer workflow the earlier post-1.0 phases made possible. Headless print mode (`claude -p`) is the automation/gate path and the documented fallback if 90a slips, not the milestone itself.
+Claude Code runs natively inside m3OS — installed via the `.m3pkg` substrate, launched through the `/usr/bin/claude` node wrapper, and exercised via headless print mode (`claude -p`) and the A.2 interactive primitives (SIGINT/raw-mode/subprocess) — using the supported Node, network, git, and GitHub tooling to read code, run commands, and participate in the same developer workflow the earlier post-1.0 phases made possible. The **interactive TUI was the original "first" target on the Phase 90a JIT/WASM-capable Node variant**; the JIT/WASM runtime + the interactive primitives are proven, but the full interactive `claude` TUI does not yet run on m3OS (it crashes on unhandled `mremap`/`io_uring` syscalls the heavy interactive path needs — see *Deferred Until Later*), so the delivered milestone is the install + launch + headless `claude -p` automation floor, with the interactive TUI a tracked follow-up.
 
 ## Why This Phase Exists
 
@@ -101,9 +101,9 @@ Cloud-connected developer tooling raises trust, secret-handling, and support-bou
 
 ## Acceptance Criteria
 
-- The supported install path for Claude Code works inside m3OS.
-- The interactive TUI renders and is usable inside the m3OS terminal on the Phase 90a JIT Node variant (verified headlessly via the QMP/PPM screenshot harness, not just a launch sentinel).
-- The tool can execute the documented file, shell, and git workflows on m3OS.
+- The supported install path for Claude Code works inside m3OS. ✅
+- ~~The interactive TUI renders and is usable inside the m3OS terminal on the Phase 90a JIT Node variant (verified headlessly via the QMP/PPM screenshot harness, not just a launch sentinel).~~ **Not met — tracked follow-up.** A direct QMP/PPM render test confirmed the full interactive `claude` TUI currently crashes (userspace null-deref) on unhandled `mremap`/`io_uring` syscalls the heavy interactive path exercises (Phase 93 syscall-gap territory). The JIT/WASM *runtime* (`node-jit-smoke`) and the A.2 interactive primitives (SIGINT/raw-mode/subprocess) are proven; the interactive-TUI visual render is deferred until those syscall gaps close. See *Deferred Until Later*.
+- The tool can execute the documented file, shell, and git workflows on m3OS via headless `claude -p` (opt-in live arm, credential-gated). ✅
 - The supported network/API path works with documented credential handling, including subscription auth via a seeded OAuth token.
 - The docs explicitly describe what Claude Code workflows are supported and what remains out of scope.
 - The milestone can be reproduced through the documented runtime and package setup.
@@ -120,6 +120,7 @@ Cloud-connected developer tooling raises trust, secret-handling, and support-bou
 
 ## Deferred Until Later
 
+- **The interactive `claude` TUI (the original "interactive TUI first" target).** Direct QMP/PPM validation (PR-audit, 2026-06-14) showed the full interactive cli.js TUI on the JIT node gets through onboarding (writes `/root/.claude.json`), JIT-compiles under the W^X-v2 guarded path, and spawns a ripgrep subprocess, then crashes with a userspace null-pointer dereference (`addr=0x0`, `rip=0x1e3464c`) after the ripgrep `SIGCHLD` — with `unhandled syscall 25` (`mremap`), `425` (`io_uring_setup`), and `125` (`capget`) in the trace immediately before. The heavy interactive path exercises syscall gaps (`mremap` is an explicit Phase 93 item) that the lighter `--version`/`--help`/`-p` paths never touch. Closing those gaps (and re-running the QMP/PPM render proof, which is then a one-line wire-up of the `htop-render-probe` harness) is the tracked follow-up. The JIT/WASM runtime and the interactive primitives that the TUI needs are already proven (`node-jit-smoke`, the A.2 probes), so this is a syscall-coverage gap, not a JIT/PKU one.
 - Extended protocol ecosystems and optional integrations
 - Broader multi-user or enterprise credential-management stories
 - Rich GUI integration for the agent

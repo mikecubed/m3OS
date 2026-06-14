@@ -1637,7 +1637,7 @@ fn build_go(extracted: &Path, stage: &Path, port_dir: &Path) -> Result<(), Strin
 /// static-pie `vendor/ripgrep/x64-linux/rg` search tool (pruning the
 /// other-platform binaries, the dynamic `audio-capture.node` addon, and the
 /// `seccomp` helper m3OS cannot use), and write the `/usr/bin/claude` launcher
-/// that pins the supported environment + execs `cli.js` under `/usr/bin/node`.
+/// that pins the supported environment + imports `cli.js` in-process under node.
 ///
 /// The pin is `2.1.112` — the last version shipping this `cli.js`-under-Node
 /// model; `2.1.113+` repackaged into a per-platform native Bun binary that does
@@ -1723,9 +1723,8 @@ fn build_claude_code(extracted: &Path, stage: &Path, port_dir: &Path) -> Result<
     // rides). So the launcher is a tiny CJS node program that pins the supported
     // env and runs `cli.js` IN-PROCESS via dynamic `import()` (cli.js is ESM —
     // `package.json` has `"type":"module"`). A single node process (no node→node
-    // fork) keeps the cold start to ONE binary load over the slow VFS and avoids
-    // the heavy-workload kernel fault path the JIT node hits. Each env line is a
-    // documented support-boundary decision (docs/90b-claude-code.md):
+    // fork) keeps the cold start to ONE binary load over the slow VFS. Each env
+    // line is a documented support-boundary decision (docs/90b-claude-code.md):
     //   NODE_EXTRA_CA_CERTS — Node's OpenSSL validates api.anthropic.com against the
     //     Phase 86a CA bundle (m3OS has no system trust-store discovery). NOTE: node
     //     reads this lazily when the root store is first built, so the in-process set

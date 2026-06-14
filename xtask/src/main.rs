@@ -296,8 +296,10 @@ const SMOKE_EXIT_NODE_JIT_SMOKE_FAILED: i32 = 84;
 /// `M3OS_WITH_CLAUDE` image (bundling the claude-code `.m3pkg` + the jitless node
 /// it depends on), boots, `pkg install claude-code` (solver pulls node first),
 /// and asserts `claude --version`/`--help`/the vendored `rg` run. The jitless core
-/// needs no PKU, so the gate is CI-viable under TCG (KVM is a speed knob); the
-/// interactive TUI's JIT path is a deferred kernel follow-up. The opt-in live arms
+/// needs no PKU, so the gate is CI-viable under TCG (KVM is a speed knob);
+/// `M3OS_CLAUDE_JIT=1` selects the 90a JIT node instead (the interactive-TUI /
+/// runtime-WASM variant, KVM/PKU-gated), on which cli.js also runs since the
+/// Phase 90b W^X-v2 cross-thread PKU read-recovery fix. The opt-in live arms
 /// (authenticated `claude -p` API round-trip + file workflow) need
 /// `M3OS_CLAUDE_NET=1` + a seeded credential and skip-with-reason otherwise.
 const SMOKE_EXIT_CLAUDE_SMOKE_FAILED: i32 = 85;
@@ -994,8 +996,9 @@ fn main() {
         // (claude-code + the jitless node it DEPS=node-depends on),
         // `pkg install claude-code` (solver pulls node first), and asserts
         // `claude --version`/`--help` + the vendored static-pie rg run on the
-        // jitless node (CI-viable under TCG; the TUI's JIT path is a deferred
-        // kernel follow-up). Opt-in live arms (M3OS_CLAUDE_NET=1 +
+        // jitless node (CI-viable under TCG, no PKU). `M3OS_CLAUDE_JIT=1`
+        // selects the 90a JIT node instead (KVM/PKU-gated, the interactive-TUI
+        // runtime variant). Opt-in live arms (M3OS_CLAUDE_NET=1 +
         // M3OS_CLAUDE_TOKEN/KEY): authenticated `claude -p` API round-trip +
         // a real-FS agent workflow, skip-with-reason otherwise.
         Some("claude-smoke") => {
@@ -15984,12 +15987,15 @@ fn node_jit_smoke_steps(fast_iter: bool) -> Vec<SmokeStep> {
 /// chain runs offline: `claude --version` → `2.1.112`, `claude --help`, the
 /// vendored static-pie `rg --version`, plus the A.2 interactive-substrate probes
 /// (SIGINT self-pipe / `child_process` spawn / raw-mode toggle) an interactive
-/// agent depends on. The interactive TUI needs the 90a JIT node for runtime WASM,
-/// but cli.js's heavy JIT codegen currently faults the kernel under the PKU/W^X
-/// path (a kernel JIT-robustness follow-up out of this phase's scope), so the gate
-/// runs the task list's prescribed **jitless fallback** — V8's Ignition
-/// interpreter, zero runtime executable memory, no PKU needed — and so is
-/// CI-viable under plain TCG (KVM is honored only as a speed knob).
+/// agent depends on. By DEFAULT the bundled node is the JITLESS variant, which
+/// needs no PKU, so the always-on core is CI-viable under plain TCG (KVM is honored
+/// only as a speed knob). `M3OS_CLAUDE_JIT=1` bundles the 90a JIT node instead (the
+/// interactive-TUI / runtime-WASM variant, KVM/PKU-gated like `node-jit-smoke`); the
+/// real-world cli.js runs on BOTH variants since the Phase 90b W^X-v2 cross-thread
+/// PKU read-recovery fix (`kernel/src/arch/x86_64/{interrupts,pkru}.rs`) — a sibling
+/// worker thread DATA-reading the per-thread-PKRU-guarded V8 code space used to fault
+/// the process; the page-fault handler now grants read on guarded executable pages
+/// (writes stay gated → W^X intact).
 ///
 /// The opt-in live arms (`M3OS_CLAUDE_NET=1` + a seeded credential via
 /// `M3OS_CLAUDE_TOKEN` (subscription OAuth) or `M3OS_CLAUDE_KEY` (API billing))
@@ -15997,22 +16003,20 @@ fn node_jit_smoke_steps(fast_iter: bool) -> Vec<SmokeStep> {
 /// (`CLAUDE_API_OK`), a real-filesystem agent workflow asserted by `cat` (not the
 /// model's own claim), and the 0600 credential-file hygiene check — all
 /// skip-with-reason when unconfigured (a secret can never live in repo/CI,
-/// mirroring `gh-smoke`/`git-https-smoke`). The interactive TUI render proof uses
-/// the QMP/PPM screenshot harness and is validated manually when a credential is
-/// available (the serial harness is blind to TUI rendering); it is documented in
-/// the skip-NOTE rather than gate-automated.
+/// mirroring `gh-smoke`/`git-https-smoke`). The interactive-TUI *runtime* (runtime
+/// WASM + the raw-mode/SIGINT/spawn primitives) is gate-proven on the JIT node; the
+/// TUI *visual* render is verified via the QMP/PPM screenshot harness (the serial
+/// harness is blind to TUI rendering).
 fn cmd_claude_smoke(args: &SmokeBootArgs) {
-    // The always-on core bundles the JITLESS node (the Phase 89 default). The
-    // interactive TUI needs the 90a JIT node for runtime WASM, BUT cli.js's heavy
-    // real-world JIT codegen (far beyond 90a's trivial node-jit-probe) faults the
-    // kernel under the PKU/W^X JIT path and the VM exits — a kernel JIT-robustness
-    // follow-up out of Phase 90b's "no kernel work" scope. So this gate exercises
-    // the task list's prescribed jitless fallback: `claude --version`/`--help`/`-p`
-    // run on the jitless node (V8's Ignition interpreter; ZERO runtime executable
-    // memory ⇒ no PKU/W^X path ⇒ no fault), which needs NO PKU and so runs under
-    // plain TCG too — the gate is CI-viable, not KVM-gated. KVM is honored only as
-    // a SPEED knob (the cold cli.js load over the slow VFS is ~10–50× faster), as
-    // in `cmd_node_smoke`.
+    // The always-on core bundles the JITLESS node (the Phase 89 default) because it
+    // needs NO PKU: `claude --version`/`--help`/`-p` run on the jitless node (V8's
+    // Ignition interpreter; ZERO runtime executable memory ⇒ no PKU/W^X path), so the
+    // gate runs under plain TCG too — CI-viable, not KVM-gated. KVM is honored only as
+    // a SPEED knob (the cold cli.js load over the slow VFS is ~10–50× faster), as in
+    // `cmd_node_smoke`. `M3OS_CLAUDE_JIT=1` selects the 90a JIT node instead (the
+    // interactive-TUI / runtime-WASM variant), which REQUIRES PKU and so is KVM-gated
+    // below. cli.js runs on BOTH variants since the Phase 90b W^X-v2 cross-thread PKU
+    // read-recovery fix (`kernel/src/arch/x86_64/{interrupts,pkru}.rs`).
     let kvm = std::env::var_os("M3OS_KVM").is_some_and(|v| v != "0" && !v.is_empty());
 
     // SKIP-with-reason build precondition (identical to `cmd_node_smoke`):
@@ -16195,15 +16199,31 @@ fn cmd_claude_smoke(args: &SmokeBootArgs) {
             "claude-smoke: NOTE — the authenticated live arms are SKIPPED (set \
              M3OS_CLAUDE_NET=1 + M3OS_CLAUDE_TOKEN=<setup-token> (subscription) or \
              M3OS_CLAUDE_KEY=<api-key> to run them; egress to api.anthropic.com:443 + a \
-             secret, never in repo/CI). The interactive TUI render proof needs the 90a \
-             JIT node for runtime WASM, but cli.js's heavy JIT codegen currently faults \
-             the kernel under the PKU/W^X path (a kernel JIT-robustness follow-up out of \
-             this phase's scope), so it is deferred; `claude -p` headless mode is the \
-             supported workflow on the jitless node. The always-on core proves claude-code \
-             installs from the M3OS_WITH_CLAUDE bundle (solver pulls node first) and \
-             `claude --version`/`--help`/the vendored rg RUN on the jitless runtime."
+             secret, never in repo/CI). The always-on core proves claude-code installs \
+             from the M3OS_WITH_CLAUDE bundle (solver pulls node first) and \
+             `claude --version`/`--help`/the vendored rg RUN, plus the A.2 \
+             SIGINT/spawn/raw-mode interactive-substrate probes."
         );
     }
+    // The interactive-TUI *visual* render is NOT gate-automated: a direct
+    // QMP/PPM attempt (Phase 90b PR-audit validation, 2026-06-14) confirmed the
+    // full interactive `claude` TUI on the JIT node currently crashes with a
+    // userspace null-pointer dereference (`addr=0x0`) AFTER the onboarding flow +
+    // a ripgrep subprocess + SIGCHLD — with `unhandled syscall 25` (mremap) /
+    // `425` (io_uring_setup) / `125` (capget) in the trace just before. The heavy
+    // interactive path exercises syscall gaps (mremap is an explicit Phase 93
+    // item) that the lighter `--version`/`--help`/`-p` paths never touch, so the
+    // visual render is a tracked follow-up, not an automatable arm. What IS proven:
+    // the JIT/WASM runtime (`node-jit-smoke`: TurboFan + `WebAssembly.Instance`),
+    // the A.2 interactive primitives (SIGINT/spawn/raw-mode), and `claude
+    // --version`/`--help` on both node variants. See docs/90b-claude-code.md.
+    println!(
+        "claude-smoke: NOTE — the interactive-TUI *visual* render is a tracked follow-up, not \
+         gate-automated: the full interactive cli.js TUI currently hits a userspace null-deref \
+         tied to unhandled `mremap`(25)/`io_uring`(425) (Phase 93 syscall-gap territory) the \
+         heavy interactive path exercises. The JIT/WASM runtime (node-jit-smoke), the A.2 \
+         SIGINT/spawn/raw-mode primitives, and `claude --version`/`--help`/`-p` are all proven."
+    );
 
     println!(
         "claude-smoke: launching QEMU (timeout {}s, {} steps; net={do_net})",
@@ -16280,52 +16300,6 @@ fn claude_smoke_steps(
             timeout_secs: 1200,
             label: "claude-smoke: claude-code installed from .m3pkg",
             exit_code_on_fail: SMOKE_EXIT_CLAUDE_SMOKE_FAILED,
-        });
-    }
-
-    // Optional bisection diagnostics (M3OS_CLAUDE_DIAG=1): isolate where running
-    // cli.js faults the node process (node-runs vs 13 MB file-read vs cli.js exec
-    // vs a smaller V8 stack). Each Wait that PASSES (its sentinel prints) before a
-    // crash tells us the last good step. Not part of the normal gate.
-    if std::env::var("M3OS_CLAUDE_DIAG").is_ok_and(|v| v == "1") {
-        steps.push(SmokeStep::Send {
-            input: "node --version\n",
-            label: "claude-diag: node --version (baseline)",
-        });
-        steps.push(SmokeStep::Wait {
-            pattern: "v22.22",
-            timeout_secs: 1800,
-            label: "claude-diag: node binary runs (DIAG baseline)",
-        });
-        steps.push(SmokeStep::Send {
-            input: "node -e \"console.log('DIAG'+'_E_OK')\"\n",
-            label: "claude-diag: node -e",
-        });
-        steps.push(SmokeStep::Wait {
-            pattern: "DIAG_E_OK",
-            timeout_secs: 600,
-            label: "claude-diag: node -e runs (DIAG_E_OK)",
-        });
-        steps.push(SmokeStep::Send {
-            input: "node -e \"const s=require('fs').readFileSync('/usr/lib/claude-code/cli.js','utf8');console.log('DIAG'+'_READ_'+s.length)\"\n",
-            label: "claude-diag: read 13MB cli.js into memory",
-        });
-        steps.push(SmokeStep::Wait {
-            pattern: "DIAG_READ_",
-            timeout_secs: 600,
-            label: "claude-diag: read+hold the 13MB cli.js (DIAG_READ_)",
-        });
-        // Stack hypothesis: a SMALLER V8 stack makes V8 throw RangeError before
-        // recursing into the OS guard page. If this prints 2.1.112, the default
-        // crash is a stack overflow and the fix is a launcher --stack-size.
-        steps.push(SmokeStep::Send {
-            input: "node --stack-size=600 /usr/lib/claude-code/cli.js --version\n",
-            label: "claude-diag: cli.js --version with small V8 stack",
-        });
-        steps.push(SmokeStep::Wait {
-            pattern: "2.1.112",
-            timeout_secs: 1800,
-            label: "claude-diag: cli.js runs with --stack-size=600 (stack hypothesis)",
         });
     }
 

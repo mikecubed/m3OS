@@ -7,8 +7,9 @@
 > — assuming V8's old `mprotect` RW↔RX JIT — is resolved by **Phase 90a**:
 > PKU-backed W^X v2 and a JIT/WASM-capable Node variant on which the agent's
 > `yoga.wasm` TUI layout engine runs. The milestone itself — the agent installed,
-> launched, authenticated, and driving file/shell/git workflows with a rendered
-> TUI — is **Phase 90b**. Where this historical doc and the live phase docs
+> launched, authenticated, and driving headless file/shell/git workflows — is
+> **Phase 90b** (the *full interactive TUI* render is a tracked follow-up; see the
+> As-Built Outcome note below). Where this historical doc and the live phase docs
 > disagree, the [Phase 90b design doc](./roadmap/90b-claude-code.md) and
 > [Phase 90b task list](./roadmap/tasks/90b-claude-code-tasks.md) are authoritative.
 >
@@ -31,13 +32,17 @@
 
 ## As-Built Outcome (Phase 90b landed)
 
-**Claude Code runs on m3OS — the milestone's substance was achieved.** It
-installs as a sealed `.m3pkg` (`pkg install claude-code` auto-pulls `node`
-dependency-first) and launches on **both** node variants: the CI-viable
-**jitless** node (Phase 89) and the interactive-TUI-capable **JIT** node (Phase
-90a). `claude --version` → `2.1.112`, `claude --help`, the vendored static-pie
-`rg`, and the A.2 SIGINT/spawn/raw-mode probes all run. The `claude-smoke` gate
-**PASSES: 24/24 on jitless, 27/27 on the JIT node**.
+**Claude Code installs, launches, and runs headless on m3OS — the delivered
+milestone is install + launch + headless `claude -p` + the interactive
+primitives.** It installs as a sealed `.m3pkg` (`pkg install claude-code`
+auto-pulls `node` dependency-first) and launches on **both** node variants: the
+CI-viable **jitless** node (Phase 89) and the **JIT** node (Phase 90a).
+`claude --version` → `2.1.112`, `claude --help`, the vendored static-pie `rg`,
+and the A.2 SIGINT/spawn/raw-mode probes all run. The `claude-smoke` gate
+**PASSES (install + launch + headless `-p` + A.2 probes): 27/27 jitless
+full-install / 27/27 JIT-node serial core** (the early 24/24 was a fast-iter
+reuse-disk run); the **full interactive `claude` TUI does not yet run** — its
+visual render is a tracked follow-up (see below).
 
 Four things diverged from the plan below, all in good directions:
 
@@ -68,12 +73,22 @@ Four things diverged from the plan below, all in good directions:
   is CI-viable under plain TCG. `M3OS_CLAUDE_JIT=1` selects the 90a JIT node (the
   interactive-TUI / runtime-WASM variant) and *that* arm is KVM/PKU-gated
   (skip-with-reason without `M3OS_KVM=1`).
-- **The interactive TUI's visual render is the one manual capstone.** The TUI
-  *runtime* is proven automatically (claude runs on the JIT node, with runtime
-  WASM via 90a + the PKU fix + the A.2 raw-mode/SIGINT/spawn primitives all
-  passing); the *visual* framebuffer-screenshot capture is documented as
-  manually validatable via the reusable QMP/PPM `less-render-probe` harness — not
-  gate-automated.
+- **The full interactive `claude` TUI does not yet run — its visual render is a
+  tracked follow-up, and it is a *syscall-coverage* gap, not a JIT/PKU gap.** The
+  JIT/WASM runtime the TUI needs *is* proven (claude runs on the JIT node, with
+  runtime WASM via 90a's `node-jit-smoke` + the PKU fix + the A.2
+  raw-mode/SIGINT/spawn primitives all passing). But a direct QMP/PPM render test
+  (PR-audit, 2026-06-14) on the JIT node showed the interactive launch gets
+  through onboarding (writes `/root/.claude.json`), JIT-compiles under the W^X-v2
+  PKU-guarded path (`[wx] v2-guarded W+X mapping`), and spawns a ripgrep
+  subprocess — then **crashes on a userspace null-deref** (`addr=0x0`,
+  `rip=0x1e3464c`) right after the ripgrep `SIGCHLD`, with `unhandled syscall 25`
+  (`mremap`), `425` (`io_uring_setup`), and `125` (`capget`) logged just before.
+  `mremap` is an explicit **Phase 93** deferred item. The JIT/PKU substrate is
+  *not* the blocker — V8 committed code under the guarded path before the crash —
+  the heavy interactive path simply exercises syscalls m3OS has not yet
+  implemented. The visual render therefore becomes a **one-line wire-up of the
+  existing `htop-render-probe` QMP/PPM harness** once those syscall gaps close.
 
 The narrative below predates these landings; where it disagrees, this note and
 the [Phase 90b learning doc](./90b-claude-code.md) are authoritative.
@@ -114,7 +129,7 @@ flowchart TD
     end
 
     subgraph GOAL ["The Goal — Phase 90b"]
-        CC(["Claude Code 2.1.112<br/><i>AI agent + TUI on m3OS</i>"])
+        CC(["Claude Code 2.1.112<br/><i>AI agent on m3OS (install + launch + headless -p; full interactive TUI is a tracked follow-up)</i>"])
     end
 
     PKU --> NODEJIT
@@ -335,7 +350,9 @@ $ claude --help
 $ claude -p "what files are in this directory?"
 
 # Or launch the interactive TUI — needs the 90a JIT node (M3OS_CLAUDE_JIT=1) on a
-# KVM/PKU host; the TUI runtime is gate-proven, the visual render a manual capstone
+# KVM/PKU host. The JIT/WASM runtime is proven, but the full interactive TUI does
+# NOT yet run: its launch crashes on unhandled mremap/io_uring syscalls (Phase 93
+# syscall-gap territory) — a tracked follow-up, not a JIT/PKU gap.
 $ claude
 ```
 
