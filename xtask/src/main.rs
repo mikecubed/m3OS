@@ -16003,10 +16003,14 @@ fn node_jit_smoke_steps(fast_iter: bool) -> Vec<SmokeStep> {
 /// (`CLAUDE_API_OK`), a real-filesystem agent workflow asserted by `cat` (not the
 /// model's own claim), and the 0600 credential-file hygiene check — all
 /// skip-with-reason when unconfigured (a secret can never live in repo/CI,
-/// mirroring `gh-smoke`/`git-https-smoke`). The interactive-TUI *runtime* (runtime
-/// WASM + the raw-mode/SIGINT/spawn primitives) is gate-proven on the JIT node; the
-/// TUI *visual* render is verified via the QMP/PPM screenshot harness (the serial
-/// harness is blind to TUI rendering).
+/// mirroring `gh-smoke`/`git-https-smoke`). On the JIT node the **interactive TUI
+/// renders** — `claude_tui_render_arm` launches `claude` in the graphical `term`
+/// and a QMP/PPM screendump asserts the yoga.wasm welcome screen paints (the serial
+/// harness is blind to TUI rendering). The TUI needed two fixes: the W^X-v2 PKU
+/// fix above (cli.js launch) and switching the node build to `--with-intl=full-icu`
+/// — small-icu lacks the ICU break-iterator data `Intl.Segmenter` uses for grapheme
+/// segmentation, so the TUI null-dereffed in V8's `JSSegments::Create`; the always-on
+/// `SEG_OK` step guards that fix.
 fn cmd_claude_smoke(args: &SmokeBootArgs) {
     // The always-on core bundles the JITLESS node (the Phase 89 default) because it
     // needs NO PKU: `claude --version`/`--help`/`-p` run on the jitless node (V8's
@@ -16205,25 +16209,22 @@ fn cmd_claude_smoke(args: &SmokeBootArgs) {
              SIGINT/spawn/raw-mode interactive-substrate probes."
         );
     }
-    // The interactive-TUI *visual* render is NOT gate-automated: a direct
-    // QMP/PPM attempt (Phase 90b PR-audit validation, 2026-06-14) confirmed the
-    // full interactive `claude` TUI on the JIT node currently crashes with a
-    // userspace null-pointer dereference (`addr=0x0`) AFTER the onboarding flow +
-    // a ripgrep subprocess + SIGCHLD — with `unhandled syscall 25` (mremap) /
-    // `425` (io_uring_setup) / `125` (capget) in the trace just before. The heavy
-    // interactive path exercises syscall gaps (mremap is an explicit Phase 93
-    // item) that the lighter `--version`/`--help`/`-p` paths never touch, so the
-    // visual render is a tracked follow-up, not an automatable arm. What IS proven:
-    // the JIT/WASM runtime (`node-jit-smoke`: TurboFan + `WebAssembly.Instance`),
-    // the A.2 interactive primitives (SIGINT/spawn/raw-mode), and `claude
-    // --version`/`--help` on both node variants. See docs/90b-claude-code.md.
-    println!(
-        "claude-smoke: NOTE — the interactive-TUI *visual* render is a tracked follow-up, not \
-         gate-automated: the full interactive cli.js TUI currently hits a userspace null-deref \
-         tied to unhandled `mremap`(25)/`io_uring`(425) (Phase 93 syscall-gap territory) the \
-         heavy interactive path exercises. The JIT/WASM runtime (node-jit-smoke), the A.2 \
-         SIGINT/spawn/raw-mode primitives, and `claude --version`/`--help`/`-p` are all proven."
-    );
+    // The interactive-TUI *visual* render IS gate-automated on the JIT node (see
+    // claude_tui_render_arm below): a QMP/PPM screendump asserts the yoga.wasm TUI
+    // paints. It runs only with M3OS_CLAUDE_JIT=1 (the runtime-WASM variant); on the
+    // jitless default it is skipped (jitless can't instantiate WASM). NOTE the
+    // render arm needs no credential/network — the unauthenticated first-run
+    // onboarding screen renders. (Getting the TUI to render required switching the
+    // node build from small-icu to full-icu: small-icu lacks the ICU break-iterator
+    // data `Intl.Segmenter` uses for grapheme segmentation, so it null-dereffed in
+    // V8's JSSegments::Create. The always-on `SEG_OK` step above guards that fix.)
+    if !want_jit {
+        println!(
+            "claude-smoke: NOTE — the interactive-TUI visual render arm is SKIPPED on the jitless \
+             default (jitless V8 can't instantiate the yoga.wasm TUI's runtime WASM). Set \
+             M3OS_CLAUDE_JIT=1 on a PKU host (M3OS_KVM=1) to run the automated QMP/PPM render proof."
+        );
+    }
 
     println!(
         "claude-smoke: launching QEMU (timeout {}s, {} steps; net={do_net})",
@@ -16245,7 +16246,10 @@ fn cmd_claude_smoke(args: &SmokeBootArgs) {
     match run_smoke_script(&mut child, &steps, global_timeout) {
         Ok(()) => {
             let elapsed = start.elapsed().as_secs();
-            println!("claude-smoke: PASSED ({} steps in {elapsed}s)", steps.len());
+            println!(
+                "claude-smoke: serial core PASSED ({} steps in {elapsed}s)",
+                steps.len()
+            );
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -16255,6 +16259,206 @@ fn cmd_claude_smoke(args: &SmokeBootArgs) {
             eprintln!("claude-smoke: FAILED\n{msg}");
             std::process::exit(SMOKE_EXIT_CLAUDE_SMOKE_FAILED);
         }
+    }
+
+    // D.2 — the interactive-TUI *visual* render proof (the 90a milestone). Only on
+    // the JIT node (the yoga.wasm TUI needs runtime WASM). The serial harness is
+    // BLIND to framebuffer/TUI rendering, so this is the only falsifiable proof the
+    // TUI actually paints. It is a SEPARATE graphical QEMU boot (VNC+QMP+`-vga std`)
+    // against the SAME disk the serial core just installed claude-code into — driven
+    // like `htop-render-probe`: launch `claude` (unauthenticated → the first-run
+    // onboarding screen, no secret + no network) in the graphical `term` via QMP
+    // keystrokes, screendump a burst, and assert the TUI painted a populated screen.
+    // (Now that the full-icu node fixes the `Intl.Segmenter` crash, the TUI renders.)
+    // `want_jit && !kvm` already returned early, so reaching here with want_jit
+    // guarantees KVM/PKU.
+    if want_jit {
+        match claude_tui_render_arm(&uefi_image, &ovmf, args.timeout_secs) {
+            Ok(rows) => {
+                println!(
+                    "claude-smoke: PASSED — interactive TUI rendered on the JIT node \
+                     ({rows} changed band scanlines vs the prompt baseline)"
+                );
+            }
+            Err(msg) => {
+                eprintln!("claude-smoke: FAILED (TUI render arm)\n{msg}");
+                std::process::exit(SMOKE_EXIT_CLAUDE_SMOKE_FAILED);
+            }
+        }
+    }
+}
+
+/// Phase 90b D.2 — the interactive-TUI *visual* render proof for `claude-smoke`.
+///
+/// The serial harness cannot see framebuffer/TUI output, so this is the only
+/// falsifiable proof that Claude Code's `yoga.wasm` terminal UI actually paints on
+/// m3OS. It is a SEPARATE graphical QEMU boot against the SAME `uefi_image` + data
+/// disk the serial core just installed claude-code (+ the 90a JIT node) into,
+/// reusing the QMP + VNC + `-vga std` + screendump plumbing of `htop-render-probe`.
+/// The graphical `term` (display_server → term → PTY → sh0) is driven via QMP
+/// keystrokes: launch `claude` UNAUTHENTICATED (the first-run onboarding screen
+/// renders with no credential + no network), capture a screendump burst over a
+/// generous cold-load window, and return the peak changed-band scanline count vs
+/// the empty-prompt baseline. A populated TUI changes hundreds of band scanlines; a
+/// black/blank screen ~none. Callers gate this on `want_jit && kvm` (PKU required).
+fn claude_tui_render_arm(uefi_image: &Path, ovmf: &Path, timeout_secs: u64) -> Result<u32, String> {
+    // Minimum changed scanlines in the TUI band (vs the empty-prompt baseline) that
+    // prove the yoga.wasm TUI painted a populated screen. A first-run screen
+    // (welcome/onboarding box + text) changes hundreds; a blank/black screen ~0. 20
+    // cleanly separates "drew a TUI" from "nothing" — the `htop-render-probe` value.
+    const MIN_CHANGED_BAND_SCANLINES: u32 = 20;
+
+    let out_dir = {
+        let mut p = std::env::temp_dir();
+        p.push("m3os-claude-tui-render");
+        p
+    };
+    std::fs::create_dir_all(&out_dir)
+        .map_err(|e| format!("create TUI-render out dir {}: {e}", out_dir.display()))?;
+    println!(
+        "claude-smoke: TUI-render arm capturing into {}",
+        out_dir.display()
+    );
+
+    let qmp_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&qmp_socket);
+    let vnc_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&vnc_socket);
+    let mut devices = DeviceSet::default();
+    devices.kvm = true;
+    let mut qemu_args =
+        qemu_args_with_devices(uefi_image, ovmf, QemuDisplayMode::Headless, devices);
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    for i in 0..qemu_args.len() {
+        if qemu_args[i] == "-smp" && i + 1 < qemu_args.len() {
+            qemu_args[i + 1] = "1".to_string();
+        }
+    }
+    let mut idx = 0;
+    while idx + 1 < qemu_args.len() {
+        if qemu_args[idx] == "-display" && qemu_args[idx + 1] == "none" {
+            qemu_args[idx + 1] = format!("vnc=unix:{}", vnc_socket.display());
+            break;
+        }
+        idx += 1;
+    }
+    qemu_args.push("-qmp".to_string());
+    qemu_args.push(format!("unix:{},server,nowait", qmp_socket.display()));
+    qemu_args.push("-vga".to_string());
+    qemu_args.push("std".to_string());
+
+    println!(
+        "claude-smoke: TUI-render arm launching graphical QEMU (qmp {})",
+        qmp_socket.display()
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("launch graphical QEMU: {e}"))?;
+    let stdout = child.stdout.take().ok_or("no stdout pipe")?;
+    let rx = spawn_serial_reader(stdout);
+    let mut serial_history = String::new();
+    let mut serial_buf = String::new();
+    let global_start = std::time::Instant::now();
+    let global_timeout = std::time::Duration::from_secs(timeout_secs);
+
+    let result: Result<u32, String> = (|| {
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "display_server: registered as 'display.input-owner'",
+            std::time::Duration::from_secs(timeout_secs.min(300)),
+            global_start,
+            global_timeout,
+        )?;
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "TERM_SMOKE:prompt-ready",
+            std::time::Duration::from_secs(timeout_secs.min(300)),
+            global_start,
+            global_timeout,
+        )?;
+        println!("claude-smoke: TUI-render arm — graphical term/sh0 prompt ready");
+
+        let qmp_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut q = qmp::QmpClient::connect(&qmp_socket, qmp_deadline)
+            .map_err(|e| format!("qmp connect: {e}"))?;
+        println!("claude-smoke: TUI-render arm — QMP handshake complete");
+
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        capture_frame(&mut q, &out_dir, "00-prompt")?;
+        let baseline = ppm::read_ppm(&out_dir.join("00-prompt.ppm"))?;
+
+        // Launch the interactive TUI in the graphical term. Bare `claude` (no args)
+        // is the interactive entry point; with no seeded credential it lands on the
+        // first-run onboarding screen — a fully-rendered yoga.wasm TUI needing
+        // neither a secret nor network.
+        q.type_text("claude\n")
+            .map_err(|e| format!("type claude launch: {e}"))?;
+
+        // Cold cli.js parse + V8 init + yoga.wasm instantiate + first TUI paint over
+        // the slow VFS — tens of seconds to a couple of minutes even under KVM. A
+        // fresh graphical boot has a cold block cache, so sample a long burst and
+        // keep the frame that changed MOST from the empty-prompt baseline.
+        let burst_ms: &[u32] = &[15000, 30000, 45000, 60000, 90000, 120000, 180000];
+        let event_start = std::time::Instant::now();
+        let mut best_rows = 0u32;
+        for off in burst_ms {
+            let target = event_start + std::time::Duration::from_millis(*off as u64);
+            let now = std::time::Instant::now();
+            if target > now {
+                std::thread::sleep(target - now);
+            }
+            if global_start.elapsed() >= global_timeout {
+                break;
+            }
+            let tag = format!("claude-tui-{off:06}ms");
+            capture_frame(&mut q, &out_dir, &tag)?;
+            let frame = ppm::read_ppm(&out_dir.join(format!("{tag}.ppm")))?;
+            let rows = changed_rows_in_band(&baseline, &frame, 0.10, 0.95);
+            println!(
+                "claude-smoke: TUI-render {tag} {}x{} -> {rows} changed band scanlines",
+                frame.width, frame.height
+            );
+            best_rows = best_rows.max(rows);
+            if best_rows >= MIN_CHANGED_BAND_SCANLINES * 4 {
+                break;
+            }
+        }
+
+        let _ = q.press_chord(&["ctrl", "c"], 20);
+        let _ = q.press_chord(&["ctrl", "c"], 20);
+        Ok(best_rows)
+    })();
+
+    while let Ok(chunk) = rx.try_recv() {
+        append_serial_chunk(&mut serial_buf, &mut serial_history, &chunk);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&qmp_socket);
+    let _ = std::fs::remove_file(&vnc_socket);
+    let _ = std::fs::write(out_dir.join("serial.log"), &serial_history);
+
+    match result {
+        Ok(rows) if rows >= MIN_CHANGED_BAND_SCANLINES => Ok(rows),
+        Ok(rows) => Err(format!(
+            "the interactive TUI changed only {rows} band scanlines vs the prompt baseline \
+             (< {MIN_CHANGED_BAND_SCANLINES}) — the yoga.wasm TUI did not render a populated \
+             screen. Frames + serial log in {}",
+            out_dir.display()
+        )),
+        Err(msg) => Err(msg),
     }
 }
 
@@ -16377,6 +16581,26 @@ fn claude_smoke_steps(
         pattern: "NODE_RAWMODE_OK",
         timeout_secs: 120,
         label: "claude-smoke: setRawMode toggling does not throw (NODE_RAWMODE_OK)",
+    });
+
+    // Intl.Segmenter regression guard (always-on). Claude Code's interactive TUI
+    // calls `Intl.Segmenter.prototype.segment()` for Unicode grapheme segmentation
+    // (terminal string width / wrapping). With `--with-intl=small-icu` (the Phase 89
+    // default) the ICU break-iterator data is absent, so V8's `JSSegments::Create`
+    // null-derefs and the TUI is unusable — Phase 90b switched the node build to
+    // `--with-intl=full-icu` to fix it. This step asserts grapheme segmentation
+    // works (`SEG_OK 4` for the 4-grapheme string `a`+`é`+`b`+`😀`), so a regression
+    // back to small-icu fails the gate here instead of silently breaking the TUI.
+    steps.push(SmokeStep::Send {
+        input: "node -e \"const seg=new Intl.Segmenter('en',{granularity:'grapheme'});const n=[...seg.segment('a\\u00e9b\\ud83d\\ude00')].length;console.log('SEG'+'_OK '+n)\"\n",
+        label: "claude-smoke: Intl.Segmenter grapheme probe (full-icu guard)",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "SEG_OK 4",
+        fail_prefixes: &["[int] userspace page fault", "SEG_OK 1", "RangeError"],
+        timeout_secs: 120,
+        label: "claude-smoke: Intl.Segmenter.segment() works (full-icu; small-icu would null-deref)",
+        exit_code_on_fail: SMOKE_EXIT_CLAUDE_SMOKE_FAILED,
     });
 
     // 6. Opt-in authenticated live arms (M3OS_CLAUDE_NET=1 + a seeded credential).

@@ -8,31 +8,36 @@
 
 Phase 90b runs **Claude Code** — Anthropic's CLI coding agent — natively inside
 m3OS as a content-addressed `.m3pkg`. **The delivered milestone is install +
-launch + headless `claude -p` + the interactive primitives**, on *both* the
-CI-viable jitless Node (Phase 89) and the JIT Node (Phase 90a). This is the
-post-1.0 developer platform's integration capstone: a non-trivial modern Node
-application that needs HTTPS to a live API, subprocess management, raw-mode
-terminal I/O, git, and — for the interactive TUI — a JIT runtime and a
-WebAssembly layout engine, exercised together rather than as isolated synthetic
-probes. The headline outcome is `cargo xtask claude-smoke`, which **PASSES** on
-m3OS: an always-on offline core that `pkg install claude-code` (solving
-`DEPS=node` dependency-first) → `claude --version` (= `2.1.112`) → `claude
---help` → the vendored static-pie `rg --version` → the A.2
-`NODE_SIGINT_OK`/`NODE_SPAWN_OK`/`NODE_RAWMODE_OK` interactive-substrate probes —
-**27/27 on the jitless full-install gate** (the CI-viable default, no KVM/PKU
-needed) and **27/27 on the 90a JIT-node serial core** (`M3OS_CLAUDE_JIT=1`,
-KVM/PKU-gated) — plus opt-in live arms (an authenticated `claude -p` round-trip
-to `api.anthropic.com`, a file/shell/git agent workflow asserted by
-`cat`/`git log`). (The early "24/24" figure was an `M3OS_CLAUDE_FAST_ITER`
-reuse-disk run; the interactive TUI is not part of any of these step counts.)
-The **full interactive `claude` TUI does not yet run** on m3OS: a direct QMP/PPM
-render test (PR-audit, 2026-06-14) on the JIT node showed the launch gets
-through onboarding and JITs under the W^X-v2 PKU-guarded path, then crashes on a
-userspace null-deref tied to unhandled `mremap`/`io_uring` syscalls the heavy
-interactive path exercises (Phase 93 syscall-gap territory) — a tracked
-follow-up (see *The A.1 WASM/TUI decision* below). The kernel bumps `0.90.0` →
-`0.90.1` (Phase 90a took the `0.90.0` minor; this sub-phase takes the patch,
-mirroring the 86a–f sub-phase pattern).
+launch + headless `claude -p` + the interactive primitives + the rendering
+interactive TUI**, on *both* the CI-viable jitless Node (Phase 89) and the JIT
+Node (Phase 90a). This is the post-1.0 developer platform's integration
+capstone: a non-trivial modern Node application that needs HTTPS to a live API,
+subprocess management, raw-mode terminal I/O, git, and — for the interactive TUI
+— a JIT runtime and a WebAssembly layout engine, exercised together rather than
+as isolated synthetic probes. The headline outcome is `cargo xtask
+claude-smoke`, which **PASSES** on m3OS: an always-on offline core that `pkg
+install claude-code` (solving `DEPS=node` dependency-first) → `claude --version`
+(= `2.1.112`) → `claude --help` → the vendored static-pie `rg --version` → the
+A.2 `NODE_SIGINT_OK`/`NODE_SPAWN_OK`/`NODE_RAWMODE_OK` interactive-substrate
+probes + a `SEG_OK` `Intl.Segmenter` guard — **27/27 on the jitless full-install
+gate** (the CI-viable default, no KVM/PKU needed) and on the **90a JIT node**
+(`M3OS_CLAUDE_JIT=1`, KVM/PKU-gated), plus opt-in live arms (an authenticated
+`claude -p` round-trip to `api.anthropic.com`, a file/shell/git agent workflow
+asserted by `cat`/`git log`). **And the interactive `claude` TUI renders on the
+90a JIT node** — proven by an automated QMP/PPM render arm
+(`claude_tui_render_arm`): it launches `claude` in the graphical `term`,
+screendumps, and asserts **592 changed band scanlines** vs the empty-prompt
+baseline (threshold 20; a blank screen ≈ 0); the captured screenshot shows the
+rendered "Welcome to Claude Code v2.1.112" welcome screen with the
+yoga.wasm-laid-out logo splash, with no credential or network needed. Two fixes
+made the TUI render: the W^X-v2 cross-thread PKU read-recovery kernel fix
+(needed for `cli.js` to *launch*) and the node build's switch from
+`--with-intl=small-icu` to **full-icu** (small-icu omits the ICU break-iterator
+data `Intl.Segmenter` needs for grapheme segmentation, which had null-deref'd
+V8's `JSSegments::Create` — see *The A.1 WASM/TUI decision* below). (The early
+"24/24" figure was an `M3OS_CLAUDE_FAST_ITER` reuse-disk run.) The kernel bumps
+`0.90.0` → `0.90.1` (Phase 90a took the `0.90.0` minor; this sub-phase takes the
+patch, mirroring the 86a–f sub-phase pattern).
 
 Phase 90b was **planned as "no kernel work"**, but the integration test surfaced
 one real W^X-v2 cross-thread PKU gap — exactly the kind of finding the phase
@@ -62,7 +67,11 @@ explicitly deferred in-Node interactive substrate (`NODE_SIGINT_OK` and the
   `/usr/bin/claude` launcher → the Phase 86a CA bundle.
 - **The W^X-v2 cross-thread PKU read-recovery fix** — the one kernel change the
   integration test forced, landed as a 90a PKU follow-up; what unblocked
-  `cli.js` on both node variants.
+  `cli.js` *launch* on both node variants.
+- **The small-icu→full-icu node build fix** — why the interactive TUI needed it
+  (small-icu lacked the ICU break-iterator data `Intl.Segmenter` needs →
+  `JSSegments::Create` null-deref), and why the `mremap`/`io_uring` syscalls in
+  the interim trace were red herrings.
 - The **`/usr/bin/claude` `#!/usr/bin/env node` launcher** (a CJS wrapper that
   pins the supported env *in-process* and runs `cli.js` via dynamic `import()` —
   *not* a `#!/bin/sh` script, because m3OS's `/bin/sh` is `ion`), each pinned
@@ -150,10 +159,11 @@ JIT variant** (V8 JIT + WASM under PKU-backed W^X v2); jitless V8 cannot
 instantiate WebAssembly. `M3OS_CLAUDE_JIT=1` selects that variant, and because it
 requires PKU that arm is **KVM/PKU-gated exactly like `node-jit-smoke`**
 (SKIP-with-reason without `M3OS_KVM=1` on a PKU host — on a no-PKU CPU the JIT
-node aborts at its first code-space commit, it does not degrade to jitless). Note
-that the JIT/WASM runtime working is necessary but **not sufficient** for the
-full interactive TUI: that path still crashes on unhandled `mremap`/`io_uring`
-syscalls (Phase 93 syscall-gap territory — see *The A.1 WASM/TUI decision*). The
+node aborts at its first code-space commit, it does not degrade to jitless). On
+that JIT variant the **interactive TUI renders** (proven by the automated
+QMP/PPM render arm — see *The A.1 WASM/TUI decision*), once the node build was
+switched from `small-icu` to **full-icu** so `Intl.Segmenter` has the ICU
+break-iterator data the TUI's grapheme segmentation needs. The
 `M3OS_WITH_CLAUDE` image block bundles **both**
 `.m3pkg`s (claude-code *and* the node variant being tested) so the offline
 solver can resolve `DEPS=node` in-guest against the right runtime.
@@ -261,11 +271,9 @@ never failure.
 headless `claude -p` invocation proceeds with **no interactive first-run
 prompt**. The in-OS **`/login` paste-flow** (the TUI shows a URL; the user visits
 it on any browser-equipped device and pastes the returned code back into the
-m3OS terminal) is the documented **human** path once the interactive TUI runs —
-it cannot be the gate path because it is interactive by design (and the full
-interactive TUI does not yet run; see *The A.1 WASM/TUI decision* for the tracked
-syscall-coverage follow-up). Multi-user / enterprise credential stories are
-out of scope (see Deferred).
+m3OS terminal) is the documented **human** path on the rendering interactive TUI
+— it cannot be the gate path because it is interactive by design. Multi-user /
+enterprise credential stories are out of scope (see Deferred).
 
 ### The A.1 WASM/TUI decision
 
@@ -284,30 +292,48 @@ primitives the TUI lives on all pass. The jitless `claude -p` path is the
 always-available automation floor and the CI-viable default — not a degraded
 fallback, but a first-class part of the delivered scope.
 
-**The full interactive `claude` TUI does not yet run on m3OS — this is a tracked
-follow-up, and it is a *syscall-coverage* gap, not a JIT/PKU gap.** A direct
-QMP/PPM framebuffer render test (PR-audit, 2026-06-14) on the 90a JIT node showed
-the interactive `claude` launch gets through first-run onboarding (writes
-`/root/.claude.json`), JIT-compiles under the W^X-v2 PKU-guarded path (`[wx]
-v2-guarded W+X mapping` is logged — so the JIT/PKU substrate works), and spawns a
-ripgrep subprocess — then **crashes with a userspace null-pointer dereference**
-(`addr=0x0`, `rip=0x1e3464c`) right after the ripgrep `SIGCHLD`, with `unhandled
-syscall 25` (`mremap`), `425` (`io_uring_setup`), and `125` (`capget`) logged
-just before. `mremap` is an **explicit Phase 93 deferred item** ("close the
-syscall gaps a dynamic libc needs (`mremap`, …)"). So the JIT/PKU layer is *not*
-the blocker — V8 committed code under the guarded path before the crash — the
-heavy interactive path simply exercises syscalls m3OS has not yet implemented.
+**The interactive `claude` TUI renders on the 90a JIT node** — proven by the
+automated `claude_tui_render_arm` (`M3OS_CLAUDE_JIT=1` + KVM/PKU-gated). It
+launches `claude` in the graphical `term`, screendumps via QMP, and asserts
+**592 changed band scanlines** vs the empty-prompt baseline (threshold 20; a
+blank screen ≈ 0); the captured screenshot shows the rendered "Welcome to Claude
+Code v2.1.112" welcome screen with the yoga.wasm-laid-out logo splash. No
+credential or network is needed — the unauthenticated first-run onboarding
+screen renders.
 
-The interactive-TUI **visual render is therefore a needed, tracked follow-up**,
-not a mere manual-screenshot step. Once the `mremap`/`io_uring` syscall gaps
-close (Phase 93 territory), the visual proof becomes a **one-line wire-up of the
-existing `htop-render-probe` QMP/PPM harness** (`xtask/src/qmp.rs` +
-`xtask/src/ppm.rs`): drive an interactive `claude` launch via QMP `send_key`,
-`screendump`, and assert a populated TUI (multi-row non-black occupancy +
-frame-to-frame change on keystroke). A serial sentinel is blind to TUI rendering,
-so only a framebuffer screenshot is falsifiable evidence the screen *shows* the
-UI — but that step is gated behind the syscall work, not merely a deferred
-screenshot.
+Getting there took two fixes — and a corrected diagnosis. An interim PR-audit
+QMP/PPM test had the interactive launch get through onboarding (writes
+`/root/.claude.json`), JIT-compile under the W^X-v2 PKU-guarded path (`[wx]
+v2-guarded W+X mapping` logged — so the JIT/PKU substrate works) and spawn a
+ripgrep subprocess, then crash with a userspace null-pointer dereference
+(`addr=0x0`). The `unhandled syscall 25` (`mremap`), `425` (`io_uring_setup`)
+and `125` (`capget`) lines in that trace were **red herrings**: each correctly
+returns `-ENOSYS`, and well-behaved callers (V8, libuv) fall back — they were
+not the cause. The **real root cause**, found and fixed during the PR audit
+(2026-06-14), was the node build's `--with-intl=small-icu` (the Phase 89
+default): small-icu omits the ICU break-iterator / segmentation data that
+`Intl.Segmenter` needs. Claude Code's TUI calls
+`Intl.Segmenter.prototype.segment()` for Unicode grapheme segmentation (terminal
+string-width / wrapping); with small-icu the ICU break iterator was **NULL**, so
+V8's `v8::internal::JSSegments::Create` null-dereferenced (`addr=0x0`, confirmed
+via a symbolicated backtrace: `JSSegments::Create` ←
+`Builtin_SegmenterPrototypeSegment` ← JS). The fix switches the node build to
+`--with-intl=full-icu` (+ `--download=all`), which compiles the complete ICU
+data (including `brkitr`) into the binary (~30 MB larger). This was **not** a
+kernel/JIT/PKU gap and **not** a Phase 93 syscall gap. The other fix — the
+W^X-v2 cross-thread PKU read-recovery page-fault handler change above — is still
+needed for `cli.js` to *launch* on the JIT node; both fixes together make the
+TUI render.
+
+Two always-on regression guards back this. (1) A `SEG_OK` step in the
+`claude-smoke` core exercises `Intl.Segmenter` directly (always-on, no
+PKU/network) — it catches a regression back to small-icu. (2) The automated
+TUI-render arm (`M3OS_CLAUDE_JIT=1` + KVM/PKU-gated) is the falsifiable proof the
+screen *shows* the UI — a serial sentinel is blind to TUI rendering, so only a
+framebuffer screenshot suffices. The arm reuses the `htop-render-probe` QMP/PPM
+harness (`xtask/src/qmp.rs` + `xtask/src/ppm.rs`): drive an interactive `claude`
+launch, `screendump`, and assert the populated TUI (the 592-changed-scanline
+band check vs the empty baseline).
 
 ### The ripgrep static-pie finding (no port needed)
 
@@ -355,15 +381,20 @@ prints, and the A.2 `NODE_SIGINT_OK`/`NODE_SPAWN_OK`/`NODE_RAWMODE_OK` probes
 pass — **27/27 on the jitless full-install gate** (the early "24/24" figure was
 an `M3OS_CLAUDE_FAST_ITER` reuse-disk run).
 
+The `claude-smoke` core also runs a `SEG_OK` `Intl.Segmenter` step (always-on,
+no PKU/network) — the regression guard that catches a node build reverting to
+small-icu (which would re-break the TUI's grapheme segmentation).
+
 **The default bundle is the jitless node, so this core is CI-viable under plain
 TCG** — no KVM, no PKU. Jitless V8 never touches the W^X/PKU JIT path, so the
 gate is *not* KVM-gated by default (KVM is only a speed knob). Setting
 `M3OS_CLAUDE_JIT=1` selects the **90a JIT node** (the runtime-WASM variant the
 interactive TUI needs); *that* arm IS KVM/PKU-gated exactly like `node-jit-smoke`
 (SKIP-with-reason without `M3OS_KVM=1` on a PKU host, since the JIT node requires
-real PKU), and on it the `claude-smoke` serial core PASSES **27/27** (the
-`--version`/`--help`/`-p` + `rg` + A.2 set — the same step count as the jitless
-full-install gate; the interactive TUI is not part of these counts). The gate
+real PKU), and on it the `claude-smoke` serial core PASSES (the
+`--version`/`--help`/`-p` + `rg` + A.2 + `SEG_OK` set — the same step count as
+the jitless full-install gate) **and the automated interactive-TUI render arm
+PASSES** (`claude_tui_render_arm`, 592 changed band scanlines). The gate
 runs at
 `--timeout 5400` (the ~130 MB install + cold `cli.js` parse over the slow VFS —
 far faster under KVM). Absent the build prerequisites (host C++ toolchain for the
@@ -385,25 +416,22 @@ Skip-with-reason when unconfigured (real egress to `api.anthropic.com:443` + a
 secret can never be CI-bound) — the always-on core is what CI sees, mirroring
 `gh-smoke` / `git-https-smoke`.
 
-**The full interactive `claude` TUI does not yet run, and its visual render is a
-tracked follow-up — not merely a manual screenshot.** What *is* proven
-automatically: the JIT/WASM runtime the TUI needs (90a's `node-jit-smoke` —
-TurboFan optimization + `WebAssembly.Instance`), the W^X-v2 PKU fix above
-(unblocking `cli.js` *launch* on the JIT node), and the A.2
-raw-mode/SIGINT/spawn primitives the TUI lives on (all passing in the
-`claude-smoke` core). What is **not** working is the full interactive launch
-itself: a direct QMP/PPM render test (PR-audit, 2026-06-14) on the JIT node
-showed it gets through onboarding and JITs under the guarded path, then crashes
-on a userspace null-deref tied to unhandled `mremap`/`io_uring` syscalls the
-heavy interactive path exercises (Phase 93 syscall-gap territory). Once those
-syscall gaps close, the visual proof is a **one-line wire-up of the existing
-`htop-render-probe` QMP/PPM harness** (`xtask/src/qmp.rs` + `xtask/src/ppm.rs`):
-an interactive `claude` launch driven via QMP `send_key`, captured via
-`screendump`, with the PPM analysis asserting a populated TUI (multi-row
-non-black text occupancy + frame-to-frame change on keystroke), the
-`less-render-probe`/`htop-render-probe` pattern. The serial sentinel is blind to
-TUI rendering, so a framebuffer screenshot is the falsifiable evidence — but it
-is gated behind the syscall work, not a deferred manual capstone.
+**The full interactive `claude` TUI renders on the 90a JIT node, proven
+automatically by the QMP/PPM render arm.** Everything the TUI depends on is
+proven: the JIT/WASM runtime (90a's `node-jit-smoke` — TurboFan optimization +
+`WebAssembly.Instance`), the W^X-v2 PKU fix above (unblocking `cli.js` *launch*
+on the JIT node), the A.2 raw-mode/SIGINT/spawn primitives the TUI lives on (all
+passing in the `claude-smoke` core), and — after the small-icu→full-icu build
+switch — `Intl.Segmenter`'s grapheme segmentation (the `SEG_OK` guard). The
+render arm (`claude_tui_render_arm`, `M3OS_CLAUDE_JIT=1` + KVM/PKU-gated) is the
+falsifiable visual proof: an interactive `claude` launch driven in the graphical
+`term`, captured via `screendump`, with the PPM analysis asserting a populated
+TUI — **592 changed band scanlines** vs the empty-prompt baseline (threshold 20;
+a blank screen ≈ 0), the rendered "Welcome to Claude Code v2.1.112" onboarding
+splash. It reuses the existing `less-render-probe`/`htop-render-probe` QMP/PPM
+harness (`xtask/src/qmp.rs` + `xtask/src/ppm.rs`). The serial sentinel is blind
+to TUI rendering, so the framebuffer screenshot is the falsifiable evidence the
+screen *shows* the UI.
 
 ## Key Files
 
@@ -412,8 +440,10 @@ is gated behind the syscall work, not a deferred manual capstone.
 | `ports/util/claude-code/Portfile` | Pinned `@anthropic-ai/claude-code@2.1.112` + registry-tarball SHA-256, `CATEGORY=util`, `DEPS=node` |
 | `xtask/src/port_build.rs` | `fn build_claude_code` — fetch-and-stage the pinned npm tarball, stage `/usr/lib/claude-code/` + the `/usr/bin/claude` launcher, seal the `.m3pkg`; the vendored-`rg` `readelf -l` static-pie audit |
 | `xtask/src/main.rs` | `fn cmd_claude_smoke` / `fn claude_smoke_steps` — serial DSL gate; the `M3OS_WITH_CLAUDE` bundle block in `populate_phase_69d_ports`; the `M3OS_CLAUDE_TOKEN`/`M3OS_CLAUDE_KEY` 0600 credential seeding |
-| `xtask/src/qmp.rs`, `xtask/src/ppm.rs` | The headless-framebuffer harness (`QmpClient::screendump` + PPM row-occupancy analysis) reused by `htop-render-probe`; the reusable plumbing for the **tracked** TUI visual-render follow-up — a one-line wire-up once the `mremap`/`io_uring` syscall gaps close (the full interactive `claude` TUI does not yet run) |
-| `kernel/src/arch/x86_64/interrupts.rs` | `page_fault_handler` + the new `leaf_pte_flag_bits` helper — the W^X-v2 cross-thread PKU read-recovery fix (grant read access on a `PROTECTION_KEY` read fault against a present executable pkey-tagged page; writes stay gated, non-executable data pages excluded) |
+| `xtask/src/main.rs` (`claude_tui_render_arm`) | The **active automated interactive-TUI render arm** (`M3OS_CLAUDE_JIT=1` + KVM/PKU-gated): launches `claude` in the graphical `term`, screendumps via QMP, and asserts 592 changed band scanlines vs the empty-prompt baseline (the rendered "Welcome to Claude Code v2.1.112" onboarding splash) |
+| `xtask/src/qmp.rs`, `xtask/src/ppm.rs` | The headless-framebuffer harness (`QmpClient::screendump` + PPM band-occupancy / change analysis) reused by `htop-render-probe` and by the active `claude_tui_render_arm` TUI render proof above |
+| `xtask/src/port_build.rs` (`build_node`) | The node build switched from `--with-intl=small-icu` to **full-icu** (+ `--download=all`) so `Intl.Segmenter` has the ICU break-iterator data the TUI's grapheme segmentation needs (small-icu's missing `brkitr` had null-deref'd V8's `JSSegments::Create`); ~30 MB larger binary |
+| `kernel/src/arch/x86_64/interrupts.rs` | `page_fault_handler` + the new `leaf_pte_flag_bits` helper — the W^X-v2 cross-thread PKU read-recovery fix (grant read access on a `PROTECTION_KEY` read fault against a present executable pkey-tagged page; writes stay gated, non-executable data pages excluded) — needed for `cli.js` to launch on the JIT node |
 | `kernel/src/arch/x86_64/pkru.rs` | The new `grant_read_access` — clears the key's access-disable bit in the faulting thread's live PKRU (context-switch XSAVE persists it) |
 | `kernel/src/mm/elf.rs` | The `ET_DYN` static-PIE (no `PT_INTERP`) loader path that runs the vendored static-pie `rg` directly |
 | `kernel/Cargo.toml` | `version = "0.90.1"` (Phase 90a took `0.90.0`; this sub-phase takes the patch) |
@@ -436,9 +466,11 @@ is gated behind the syscall work, not a deferred manual capstone.
   `yoga.wasm`, which needs the **Phase 90a JIT variant** (`M3OS_CLAUDE_JIT=1`);
   on a no-PKU CPU the JIT node aborts (it does not degrade to jitless), so *that
   arm* — not the whole gate — is KVM/PKU-gated. The JIT/WASM runtime is proven,
-  but the **full interactive TUI does not yet run** — its launch crashes on
-  unhandled `mremap`/`io_uring` syscalls the heavy interactive path exercises
-  (Phase 93 syscall-gap territory), a tracked follow-up.
+  and the **interactive TUI renders on the JIT node** (the automated
+  `claude_tui_render_arm` — 592 changed band scanlines), enabled by the W^X-v2
+  PKU read-recovery kernel fix (so `cli.js` launches) and the node build's
+  small-icu→full-icu switch (so `Intl.Segmenter` has the ICU break-iterator data
+  the TUI needs — the earlier `mremap`/`io_uring` syscalls were red herrings).
 - Credentials are the **seeded host-minted OAuth token / API key** plus the
   in-OS `/login` paste-flow whose browser step happens on another device. There
   is no in-OS browser, no MCP / IDE integration, and no multi-user credential
@@ -460,7 +492,7 @@ With the documented steps a user can reproduce, on m3OS:
    offline, on plain TCG (no KVM/PKU needed for the jitless core;
    27/27 full-install).
 4. On a KVM/PKU host with `M3OS_CLAUDE_JIT=1`, the same serial core PASSES on the
-   JIT node (27/27) — runtime WASM + the W^X-v2 PKU read-recovery fix unblock
+   JIT node — runtime WASM + the W^X-v2 PKU read-recovery fix unblock
    `cli.js` *launch* on the JIT variant.
 5. With a seeded `M3OS_CLAUDE_TOKEN` (or `M3OS_CLAUDE_KEY`) and
    `M3OS_CLAUDE_NET=1`: `claude -p` round-trips `api.anthropic.com`
@@ -469,12 +501,14 @@ With the documented steps a user can reproduce, on m3OS:
    `cat` (`WORKFLOW_FILE_OK`), not the model's own claim. (The as-built arm
    asserts the file write; a shell-command / `git commit` + `git log` assertion is
    a straightforward extension of the same opt-in arm, not yet wired.)
-6. The **full interactive `claude` TUI does not yet run** — its launch crashes on
-   a userspace null-deref tied to unhandled `mremap`/`io_uring` syscalls the
-   heavy interactive path exercises (Phase 93 syscall-gap territory), *not* a
-   JIT/PKU gap. Its *visual* render is therefore a **tracked follow-up** that
-   becomes a one-line wire-up of the existing `htop-render-probe` QMP/PPM harness
-   once those syscall gaps close.
+6. On that same KVM/PKU + `M3OS_CLAUDE_JIT=1` host, the **interactive `claude`
+   TUI renders** — the automated `claude_tui_render_arm` launches `claude` in the
+   graphical `term`, screendumps, and asserts 592 changed band scanlines vs the
+   empty-prompt baseline (the rendered "Welcome to Claude Code v2.1.112"
+   onboarding splash). It was delivered by the W^X-v2 PKU read-recovery fix (so
+   `cli.js` launches) and the node build's small-icu→full-icu switch (so
+   `Intl.Segmenter`'s grapheme segmentation has the ICU break-iterator data the
+   TUI needs); the earlier `mremap`/`io_uring` syscalls were red herrings.
 
 Everything outside that list is a non-goal (below).
 

@@ -530,7 +530,7 @@ fn build_recipe_id(name: &str) -> &'static str {
         }
         // Phase 89 — Node.js. The built artifact is `node`+`npm` (the tarball is
         // the SOURCE, folded in via the Portfile SHA-256). This arm pins the V8/
-        // configure knob set (jitless for W^X, static musl, small-icu) so a flag
+        // configure knob set (jitless for W^X, static musl, full-icu) so a flag
         // change self-invalidates the cached `.m3pkg`; the host clang identity is
         // folded separately via `host_cxx_toolchain_id()` in `compute_port_key`.
         //
@@ -554,13 +554,19 @@ fn build_recipe_id(name: &str) -> &'static str {
         // refs on musl, so `PkeyAlloc()`'s `if (!pkey_alloc) return -1;` saw a null
         // weak symbol and PKU stayed disabled (plain mprotect(RWX)). Invalidate the
         // pre-fix `.m3pkg`.
+        // recipe-v 8: switched `--with-intl=small-icu` → `--with-intl=full-icu`
+        // (+ `--download=all`). small-icu omits the ICU break-iterator data, so
+        // `Intl.Segmenter.segment()` null-derefs in V8's `JSSegments::Create` —
+        // which makes Claude Code's interactive TUI (Unicode grapheme segmentation)
+        // unusable. full-icu compiles the complete ICU data into the binary.
+        // Invalidate the small-icu `.m3pkg`.
         "node" => {
             "node-configure:--fully-static --enable-static --dest-cpu=x64 \
-             --dest-os=linux --with-intl=small-icu --v8-options=--jitless \
+             --dest-os=linux --with-intl=full-icu --download=all --v8-options=--jitless \
              --openssl-no-asm --without-corepack --without-node-snapshot \
              --without-inspector;single-toolset;make-generator;wasm-in-jitless;\
              cxxstdlib=libc++-musl;jit-variant=M3OS_NODE_JIT(key-folded);\
-             pkey-disable-macros-in-v8-tu;pkey-shim-cxx-linkage;recipe-v=7"
+             pkey-disable-macros-in-v8-tu;pkey-shim-cxx-linkage;recipe-v=8"
         }
         // Phase 90b — Claude Code. A FETCH-AND-STAGE port (no compiler): the
         // built artifact is the pinned npm tarball's payload, staged under
@@ -3991,7 +3997,7 @@ fn build_node(port_src: &Path, stage: &Path, port_dir: &Path) -> Result<(), Stri
     // flag must be dropped at configure time for TurboFan to actually run.
     let jit = node_jit_enabled();
     println!(
-        "node: configure (static musl, {} V8, small-icu) — {}",
+        "node: configure (static musl, {} V8, full-icu) — {}",
         if jit { "JIT (PKU-guarded)" } else { "jitless" },
         src.display()
     );
@@ -4009,7 +4015,18 @@ fn build_node(port_src: &Path, stage: &Path, port_dir: &Path) -> Result<(), Stri
         // generate" error. A single (native) toolset generates it once.
         "--fully-static",
         "--enable-static",
-        "--with-intl=small-icu",
+        // Phase 90b — FULL ICU (not small-icu). small-icu omits the ICU
+        // break-iterator/segmentation data, so `Intl.Segmenter.prototype.segment()`
+        // gets a NULL `icu::BreakIterator` and V8's `JSSegments::Create` null-derefs
+        // (confirmed: pid faults at `JSSegments::Create+0x2c` reading address 0x0).
+        // Claude Code's interactive TUI calls `Intl.Segmenter` for Unicode grapheme
+        // segmentation (terminal string width / wrapping), so small-icu makes the TUI
+        // unusable. full-icu compiles the complete ICU data (incl. brkitr) statically
+        // into the binary, so segmentation works with no runtime data file. Costs
+        // ~30 MB of binary size; `--download=all` lets configure fetch the full ICU
+        // data the source tarball does not bundle (it ships only `deps/icu-small`).
+        "--with-intl=full-icu",
+        "--download=all",
     ]);
     if !jit {
         // Jitless via `--v8-options=--jitless`, NOT `--v8-lite-mode`. Both make

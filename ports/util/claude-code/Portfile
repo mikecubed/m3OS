@@ -38,8 +38,17 @@ MAINTAINER=m3os
 # 90a JIT `build_node` variant (V8 JIT + WASM under PKU-backed W^X v2); building the
 # image with `M3OS_NODE_JIT` set (the gate's `M3OS_CLAUDE_JIT=1` path) bundles that JIT
 # node `.m3pkg` instead so the solver resolves `DEPS=node` against the TUI runtime. The
-# real-world cli.js runs on BOTH variants since the Phase 90b W^X-v2 cross-thread PKU
-# read-recovery kernel fix.
+# JIT node runs the real-world cli.js AND renders the interactive `claude` TUI (proven
+# by the automated QMP/PPM `claude_tui_render_arm` — the "Welcome to Claude Code
+# v2.1.112" onboarding screen paints). The real-world cli.js runs on BOTH variants since
+# the Phase 90b W^X-v2 cross-thread PKU read-recovery kernel fix (so cli.js launches).
+#
+# NOTE — the node build uses `--with-intl=full-icu`, NOT the Phase 89 `small-icu`
+# default: Claude Code's TUI calls `Intl.Segmenter.prototype.segment()` for Unicode
+# grapheme segmentation (terminal string width / wrapping), which needs ICU's
+# break-iterator (`brkitr`) data. small-icu omits that data → the ICU break iterator is
+# NULL → V8's `JSSegments::Create` null-dereferences. full-icu (+ `--download=all`)
+# compiles the complete ICU data into the binary so the TUI renders.
 #
 # LAUNCHER — `/usr/bin/claude` (staged by build_claude_code) pins the supported
 # environment: NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt (the 86a CA
