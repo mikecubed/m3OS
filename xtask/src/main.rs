@@ -16373,13 +16373,34 @@ fn cmd_claude_smoke(args: &SmokeBootArgs) {
             *arg = "user,id=net0".to_string();
         }
     }
-    // Pin the guest to a single core — same rationale as the node/gh gates: the
-    // heavy Node load + slow-VFS pipeline are still exercised, but a single core
-    // avoids cross-core SMP futex/IPC races under the heavy load.
-    for i in 0..qemu_args.len() {
-        if qemu_args[i] == "-smp" && i + 1 < qemu_args.len() {
-            qemu_args[i + 1] = "1".to_string();
+    // Pin the guest to a single core by default — same rationale as the node/gh
+    // gates: the heavy Node load + slow-VFS pipeline are still exercised, but a
+    // single core avoids cross-core SMP futex/IPC races under the heavy load.
+    //
+    // M3OS_CLAUDE_MULTICORE=1 LIFTS the pin (leaving the default qemu_smp_count(),
+    // or M3OS_SMP) so the gate validates the Track A–D SMP TLB-shootdown
+    // survivability fixes against the exact multi-core + KVM + PKU + JIT-claude
+    // workload that produced the original whole-machine panic
+    // (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md). Pair
+    // with M3OS_CLAUDE_JIT=1 + M3OS_KVM=1 to reproduce the real radio.
+    let claude_multicore = std::env::var("M3OS_CLAUDE_MULTICORE").is_ok_and(|v| v == "1");
+    if !claude_multicore {
+        for i in 0..qemu_args.len() {
+            if qemu_args[i] == "-smp" && i + 1 < qemu_args.len() {
+                qemu_args[i + 1] = "1".to_string();
+            }
         }
+    } else {
+        let cores = qemu_args
+            .iter()
+            .position(|a| a == "-smp")
+            .and_then(|i| qemu_args.get(i + 1))
+            .cloned()
+            .unwrap_or_else(|| "?".to_string());
+        println!(
+            "claude-smoke: M3OS_CLAUDE_MULTICORE=1 — running multi-core (-smp {cores}) to \
+             validate the Track A–D SMP survivability fixes against the original repro"
+        );
     }
     // The TLS handshake to api.anthropic.com needs the 86a CSPRNG at READY (Node's
     // OpenSSL seeds from getrandom, which blocks until the DRBG is READY). Advertise

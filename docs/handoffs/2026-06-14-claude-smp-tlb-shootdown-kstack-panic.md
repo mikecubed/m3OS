@@ -1,5 +1,10 @@
 ---
-status: FIXED — root-caused; Tracks A+B+C+D landed 2026-06-14. Track A (NMI-on-IST)
+status: FIXED & CONFIRMED LIVE — root-caused; Tracks A+B+C+D landed 2026-06-14 and the
+  original repro (default 4 cores + `--kvm` real PKU + JIT node + interactive `claude`)
+  was re-run end-to-end and PASSED, with the exact crash trigger (a core failing to ACK
+  a TLB shootdown within 500 ms under the V8/PKU load) firing live and Track A+C
+  recovering it via re-NMI instead of panicking — see "Empirical end-to-end
+  confirmation" below. Track A (NMI-on-IST)
   removed the whole-machine KERNEL PANIC (a wedged core now ACKs TLB shootdowns on a
   clean per-core IST stack). Track B (mark a core offline when it halts — done in
   `hlt_loop`, the single chokepoint all dead-end paths funnel through) makes future
@@ -41,6 +46,41 @@ related:
   - kernel/src/smp/tlb.rs                                         # was the fatal panic (old line 176); Track C replaced it with re-NMI + degrade on the SHOOTDOWN_ACK bitmap
   - kernel/src/smp/boot.rs:545                                    # is_online: was the ONLY write site (→ true). Track B added `false` writes in hlt_loop (lib.rs)
 artifact: m3os.log (project root, ~172 KB; control-byte corrupted — read with `grep -a` / `sed`, plain grep treats it as binary)
+---
+
+## Empirical end-to-end confirmation (2026-06-14, multi-core + KVM + PKU)
+
+The original repro was re-run **live** on the exact failing configuration — default
+**4 cores**, `--kvm` (real PKU), the **JIT node**, and interactive `claude` (the
+yoga.wasm TUI) — via a new `M3OS_CLAUDE_MULTICORE=1` escape hatch on the
+`claude-smoke` gate (which otherwise pins `-smp 1`):
+
+```
+M3OS_CLAUDE_JIT=1 M3OS_KVM=1 M3OS_CLAUDE_MULTICORE=1 cargo xtask claude-smoke
+  → claude-smoke: PASSED — interactive TUI rendered on the JIT node
+    (566 changed band scanlines vs the prompt baseline)
+```
+
+**The original crash trigger fired during the run — and the fix caught it.** Serial:
+
+```
+[tlb] tlb_shootdown_range stuck >500ms: outstanding_mask=0x2 (of target_mask=0xa),
+      my_core=0, ... — escalating to re-NMI + degrade (no panic)
+[tlb]   core 1: ipi 1848 → 1848 (Δ0)  timer 10463 → 10513 (Δ50)   ← the non-ACKing core
+[tlb] tlb_shootdown_range: recovered after re-NMI — all targets acked in the grace
+      window (machine survives)
+```
+
+Core 0 issued a shootdown to cores 1+3 under the heavy V8/PKU churn; core 1 failed to
+ACK within 500 ms (its IPI counter flat at Δ0). **This is the exact point the pre-fix
+kernel `panic!`d at `tlb.rs:176` and killed the whole machine.** Instead, Track C's
+degrade path engaged, Track A's NMI-on-IST let the re-NMI through, core 1 ACKed in the
+grace window, and the run continued to a full PASS — `claude` installed (node-first),
+`--version`/`--help`/`rg` ran, the A.2 probes passed, and the TUI rendered. No
+`KERNEL PANIC`, no `RECURSIVE KERNEL PAGE FAULT`, no machine halt. Track D's
+kstack-overflow recovery did not need to fire this run (no overflow occurred); Track
+A+C alone handled the shootdown-timeout event that was the fatal link.
+
 ---
 
 ## TL;DR
