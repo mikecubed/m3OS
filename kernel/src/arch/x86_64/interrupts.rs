@@ -696,7 +696,24 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     // IrqSafeMutex region and cannot service a Fixed-delivery IPI. See
     // `docs/handoffs/2026-05-24-4gib-pci-hole-vga-mapping.md` and the
     // sender side in `smp::ipi::send_nmi` / `smp::tlb`.
-    idt.non_maskable_interrupt.set_handler_fn(nmi_handler);
+    //
+    // Phase 90b follow-up — give the NMI its own IST stack. The fixed delivery
+    // above only guarantees the NMI *fires*; it still needs a usable stack to
+    // run on. A core whose KERNEL STACK has overflowed (or is wedged in a fault
+    // `hlt_loop` after a recursive #PF cascade) cannot push the NMI frame onto
+    // its dead stack, so it never reaches `handle_tlb_shootdown_ipi`'s ack —
+    // and a sibling core's `tlb_shootdown_range` then times out and `panic!`s
+    // the whole machine (`smp/tlb.rs:176`). An IST stack lets even a
+    // stack-overflowed core service the shootdown NMI and ack, so one wedged
+    // core no longer kills the box. The NMI handler is TLB-shootdown-only
+    // (`invlpg`/CR3-reload + atomic decrement — fault-free), so it never
+    // re-enables NMI mid-handler and cannot nest on the shared IST stack. See
+    // `docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md`.
+    unsafe {
+        idt.non_maskable_interrupt
+            .set_handler_fn(nmi_handler)
+            .set_stack_index(gdt::NMI_IST_INDEX);
+    }
 
     // Hardware IRQs — timer and reschedule IPI use raw naked-asm entry stubs
     // (Phase 57d Track B) so they are installed via `set_handler_addr`.
