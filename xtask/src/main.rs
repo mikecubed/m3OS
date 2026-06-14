@@ -21635,13 +21635,17 @@ fn populate_ext2_files(
     let debugfs_output = debugfs.wait_with_output().expect("debugfs wait");
     // SECRET SCRUB — runs on BOTH the success and the failure (`exit(1)`) paths.
     // debugfs has already read these host temp files (or failed trying), so the
-    // credential-bearing temps (the gh PAT + hosts.yml, and the dropbear private
-    // key) must be removed before the early `exit(1)` below — otherwise a debugfs
-    // failure would leave a live secret on disk in the build output dir. (Phase
-    // 86e hardening; closes the inherited dropbear-class gap for the live PAT.)
+    // credential-bearing temps (the gh PAT + hosts.yml, the dropbear private key,
+    // and the Claude OAuth token / API key + onboarding state) must be removed
+    // before the early `exit(1)` below — otherwise a debugfs failure would leave a
+    // live secret on disk in the build output dir. (Phase 86e hardening; closes the
+    // inherited dropbear-class gap for the live PAT; Phase 90b extends it to the
+    // Claude credential.)
     let _ = fs::remove_file(output_dir.join("_tmp_gh_token"));
     let _ = fs::remove_file(output_dir.join("_tmp_gh_hosts_yml"));
     let _ = fs::remove_file(output_dir.join("_tmp_id_dropbear"));
+    let _ = fs::remove_file(output_dir.join("_tmp_claude_cred"));
+    let _ = fs::remove_file(output_dir.join("_tmp_claude_json"));
     if !debugfs_output.status.success() {
         let stderr = String::from_utf8_lossy(&debugfs_output.stderr);
         eprintln!(
@@ -21660,8 +21664,9 @@ fn populate_ext2_files(
     let _ = fs::remove_file(&etc_hosts_tmp);
     let _ = fs::remove_file(&gitconfig_tmp);
     let _ = fs::remove_file(&known_hosts_tmp);
-    // (_tmp_id_dropbear, _tmp_gh_token, _tmp_gh_hosts_yml are scrubbed earlier —
-    // immediately after debugfs — so they never survive a debugfs-failure exit.)
+    // (_tmp_id_dropbear, _tmp_gh_token, _tmp_gh_hosts_yml, _tmp_claude_cred, and
+    // _tmp_claude_json are scrubbed earlier — immediately after debugfs — so they
+    // never survive a debugfs-failure exit.)
     let _ = fs::remove_file(&fibonacci_py_tmp);
     let _ = fs::remove_file(&hello_c_tmp);
     let _ = fs::remove_file(&hello_cpp_tmp);
