@@ -15600,10 +15600,22 @@ fn cmd_node_smoke(args: &SmokeBootArgs) {
     // Pin the guest to a single core (same rationale as the go gate): the heavy
     // Node load + slow-VFS pipeline + libuv thread pool are still exercised, but
     // a single core avoids cross-core SMP futex/IPC races under the heavy load.
+    //
+    // M3OS_NODE_SMP=<N> overrides the pin (diagnostic: reproduce the 4-core node
+    // hang — docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md
+    // follow-up). M3OS_NODE_HANG_PROBE=1 then runs a sustained-multithread stress
+    // and lets the step time out so the kernel stuck-task watchdog dumps.
+    let node_smp = std::env::var("M3OS_NODE_SMP").ok().and_then(|v| {
+        let n: u32 = v.parse().ok()?;
+        (n >= 1).then_some(n)
+    });
     for i in 0..qemu_args.len() {
         if qemu_args[i] == "-smp" && i + 1 < qemu_args.len() {
-            qemu_args[i + 1] = "1".to_string();
+            qemu_args[i + 1] = node_smp.unwrap_or(1).to_string();
         }
+    }
+    if let Some(n) = node_smp {
+        println!("node-smoke: M3OS_NODE_SMP={n} — running multi-core (diagnostic)");
     }
 
     // When the live network arms run (TLS handshake needs entropy), advertise
@@ -15718,6 +15730,30 @@ fn node_smoke_steps(attempt_net: bool, fast_iter: bool, egress_url: &str) -> Vec
         timeout_secs: 1200,
         label: "node-smoke: node 22.x runs on target (version banner, cold streamed load)",
     });
+
+    // DIAGNOSTIC (M3OS_NODE_HANG_PROBE=1, pair with M3OS_NODE_SMP=4): reproduce
+    // the 4-core node hang. Sustained async pbkdf2 churns the libuv threadpool
+    // (the Phase-89 futex-requeue-fragile condvar path) with 8 in-flight ops over
+    // 4 worker threads + a 'HANGPROBE_ALIVE<n>' heartbeat every 300 ms. On 4 cores
+    // this is expected to HANG; the following Wait then times out and the harness
+    // dumps the captured serial — which by then carries the kernel stuck-task
+    // watchdog verdict (the BSP `watchdog_scan` dispatch dump for a stale-ready
+    // task, or a `stuck-since=…ms (no waker registered)` BlockedOnFutex line),
+    // naming WHY it hung. Heartbeat pinpoints the exact hang tick on serial.
+    if std::env::var("M3OS_NODE_HANG_PROBE").is_ok_and(|v| v == "1") {
+        steps.push(SmokeStep::Send {
+            input: "node -e \"const c=require('crypto');let n=0;const spin=()=>c.pbkdf2('p','s',20000,64,'sha512',()=>{n++;spin()});for(let i=0;i<8;i++)spin();setInterval(()=>console.log('HANGPROBE_ALIVE'+n),300)\"\n",
+            label: "node-smoke[HANG-PROBE]: sustained multithreaded threadpool stress",
+        });
+        steps.push(SmokeStep::Wait {
+            // Impossible sentinel — the stress never prints this. The point IS to
+            // time out so the harness flushes serial with the watchdog verdict.
+            pattern: "HANGPROBE_SENTINEL_NEVER",
+            timeout_secs: 75,
+            label: "node-smoke[HANG-PROBE]: (expected timeout) capture stuck-task watchdog dump",
+        });
+        return steps;
+    }
 
     // 3. fs / process / event-loop / timer probe (A.1 timerfd event-loop path).
     steps.push(SmokeStep::Send {
@@ -16554,8 +16590,13 @@ fn claude_tui_render_arm(uefi_image: &Path, ovmf: &Path, timeout_secs: u64) -> R
             *arg = "user,id=net0".to_string();
         }
     }
+    // The TUI render arm normally pins single-core. M3OS_CLAUDE_MULTICORE=1 lifts
+    // it so the arm reproduces interactive `claude` on multiple cores (the user's
+    // exact run-gui scenario) — used to root-cause the 4-core node hang
+    // (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md follow-up).
+    let tui_multicore = std::env::var("M3OS_CLAUDE_MULTICORE").is_ok_and(|v| v == "1");
     for i in 0..qemu_args.len() {
-        if qemu_args[i] == "-smp" && i + 1 < qemu_args.len() {
+        if qemu_args[i] == "-smp" && i + 1 < qemu_args.len() && !tui_multicore {
             qemu_args[i + 1] = "1".to_string();
         }
     }
@@ -16823,6 +16864,28 @@ fn claude_smoke_steps(
         label: "claude-smoke: Intl.Segmenter.segment() works (full-icu; small-icu would null-deref)",
         exit_code_on_fail: SMOKE_EXIT_CLAUDE_SMOKE_FAILED,
     });
+
+    // DIAGNOSTIC (M3OS_CLAUDE_HANG_PROBE=1, pair with M3OS_CLAUDE_MULTICORE=1 +
+    // M3OS_CLAUDE_JIT=1): reproduce the 4-core interactive-claude hang
+    // (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md follow-up).
+    // Launch the interactive TUI (isTTY=true over the serial pty, so claude enters
+    // its yoga.wasm render path) and let it run; on 4 cores it is expected to HANG
+    // mid-render. The following Wait then times out and the harness flushes the
+    // captured serial — which by then carries the kernel stuck-task watchdog verdict
+    // (the BSP `watchdog_scan` dispatch dump for a stale-ready task, or a
+    // `stuck-since=…ms (no waker registered)` line), naming WHY it hangs.
+    if std::env::var("M3OS_CLAUDE_HANG_PROBE").is_ok_and(|v| v == "1") {
+        steps.push(SmokeStep::Send {
+            input: "claude\n",
+            label: "claude-smoke[HANG-PROBE]: launch interactive claude TUI",
+        });
+        steps.push(SmokeStep::Wait {
+            pattern: "CLAUDE_HANG_SENTINEL_NEVER",
+            timeout_secs: 90,
+            label: "claude-smoke[HANG-PROBE]: (expected timeout) capture stuck-task watchdog dump",
+        });
+        return steps;
+    }
 
     // 6. Opt-in authenticated live arms (M3OS_CLAUDE_NET=1 + a seeded credential).
     if do_net && let Some((env_var, cred_path)) = cred {

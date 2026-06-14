@@ -3632,6 +3632,31 @@ pub fn block_current_until(
                 preempt_enable();
                 return BlockOutcome::AlreadyTrue;
             }
+            // Cross-core lost-wakeup guard: re-check `woken` UNDER pi_lock before
+            // committing to the Blocked* state.
+            //
+            // The early `woken` check at the top of this fn runs with NO lock
+            // held. A waker on another core can, in the window between that check
+            // and this pi_lock acquisition, set `woken = true` and call
+            // `wake_task_v2(self)` — but because this task was still `Running`
+            // then (not yet Blocked*), `wake_task_v2`'s CAS no-ops
+            // (`wake_task_v2_with` only transitions Blocked* tasks → AlreadyAwake
+            // otherwise). If we now blindly commit to `kind`, that wake is lost
+            // and the task blocks forever (the `BlockedOnFutex "no waker
+            // registered"` deadlock that strands Node's libuv threadpool /
+            // worker-thread futexes on multi-core — single-core never hits it
+            // because the waker can't run in this window).
+            //
+            // `wake_task_v2` serializes on this same `pi_lock`, so observing
+            // `woken == true` here means the wake already fired against a
+            // not-yet-blocked task: abort the block (Acquire pairs with the
+            // waker's Release store of `woken`, ordered through the pi_lock
+            // handoff). Mirrors the `idx`-bail above exactly (same lock state +
+            // preempt_enable + return).
+            if woken.load(Ordering::Acquire) {
+                preempt_enable();
+                return BlockOutcome::AlreadyTrue;
+            }
             // Canonical (pi_lock-protected) write.
             bs.state = kind;
             if deadline_ticks.is_some() && bs.wake_deadline.is_none() {
