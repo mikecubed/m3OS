@@ -123,6 +123,10 @@ fn assert_preempt_count_zero_on_return_to_user(stack_frame: &InterruptStackFrame
 /// interrupt). Single-CPU: no concurrent writers.
 static FAULT_KILL_PID: AtomicU32 = AtomicU32::new(0);
 
+/// Count of spurious/already-resolved userspace write-faults recovered (SMP
+/// CoW/mprotect race). Diagnostic-only; rate-limits the per-recovery log.
+static SPURIOUS_WRITE_RECOVERIES: AtomicU32 = AtomicU32::new(0);
+
 // ---------------------------------------------------------------------------
 // Track D — kernel-stack-overflow controlled-kill recovery
 // (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md)
@@ -1332,13 +1336,18 @@ extern "x86-interrupt" fn page_fault_handler(
         // to 0x… `PROTECTION_VIOLATION|CAUSED_BY_WRITE` under V8's W^X churn).
         //
         // This does NOT weaken W^X or PKU: a real RX/RO code-page write leaves
-        // WRITABLE clear and falls through to the kill below; a pkey-write-denied
-        // page raises PROTECTION_KEY (not plain PROTECTION_VIOLATION) and is
-        // excluded by `is_present` + the WRITABLE check. No infinite-loop risk:
-        // if the page is concurrently flipped back to RO, the re-walk on the next
-        // fault returns not-WRITABLE and we fall through to the kill.
+        // WRITABLE clear and falls through to the kill below. A pkey-write-denied
+        // page (W^X v2: a W+X code page whose PTE *is* WRITABLE but writes are
+        // gated per-thread by the PKRU key) raises PROTECTION_KEY *in addition to*
+        // PROTECTION_VIOLATION — it must be EXCLUDED here, because `invlpg`+retry
+        // cannot clear a PKU denial (PKU keys off PKRU, not the TLB), so retrying
+        // would infinite-loop. We therefore require `!PROTECTION_KEY`. No other
+        // infinite-loop risk: if the page is concurrently flipped back to RO, the
+        // re-walk on the next fault returns not-WRITABLE and falls through to the
+        // kill.
         if is_write
             && is_present
+            && !err.contains(PageFaultErrorCode::PROTECTION_KEY)
             && let Ok(fault_vaddr) = addr
             && let Some(flags) = leaf_pte_flag_bits(fault_vaddr.as_u64())
         {
@@ -1346,6 +1355,18 @@ extern "x86-interrupt" fn page_fault_handler(
             let writable = flags & Ptf::WRITABLE.bits() != 0;
             let user = flags & Ptf::USER_ACCESSIBLE.bits() != 0;
             if writable && user {
+                // Rate-limited diagnostic: confirm this fires (and is not looping
+                // on one address). First ~24 only, to avoid serial spam.
+                let n = SPURIOUS_WRITE_RECOVERIES.fetch_add(1, Ordering::Relaxed);
+                if n < 24 {
+                    log::warn!(
+                        "[pf] spurious write-fault recovered: pid={} addr={:#x} rip={:#x} (#{}) ",
+                        crate::process::current_pid(),
+                        fault_vaddr.as_u64(),
+                        stack_frame.instruction_pointer.as_u64(),
+                        n + 1,
+                    );
+                }
                 x86_64::instructions::tlb::flush(VirtAddr::new(fault_vaddr.as_u64()));
                 crate::task::scheduler::current_task_record_page_fault(false);
                 assert_preempt_count_zero_on_return_to_user(&stack_frame);
