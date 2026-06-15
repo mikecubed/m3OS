@@ -880,7 +880,11 @@ pub fn port_deps(name: &str) -> &'static [&'static str] {
         // first (dependency-first), and node's full (JIT-variant-aware) content
         // key folds into claude-code's key via compute_port_key's recursion. The
         // bundled yoga.wasm TUI requires the Phase 90a JIT node variant.
-        "claude-code" => &["node"],
+        // `ca-certificates` lays down /etc/ssl/certs/ca-certificates.crt, the CA
+        // bundle the `/usr/bin/claude` launcher points NODE_EXTRA_CA_CERTS at so
+        // Node's OpenSSL validates api.anthropic.com — without it the launcher
+        // referenced a missing path ("Cannot open directory /etc/ssl/certs").
+        "claude-code" => &["node", "ca-certificates"],
         _ => &[],
     }
 }
@@ -6123,9 +6127,11 @@ mod tests {
         assert_eq!(port_deps("python"), &["zlib"]);
         // Phase 86a Track C.2 — the CA bundle is a self-contained data file.
         assert_eq!(port_deps("ca-certificates"), &[] as &[&str]);
-        // Phase 90b — claude-code's cli.js runs under the Node runtime, so node
-        // is its one (runtime) dependency; the in-OS solver installs node first.
-        assert_eq!(port_deps("claude-code"), &["node"]);
+        // Phase 90b — claude-code's cli.js runs under the Node runtime (node),
+        // and the launcher's NODE_EXTRA_CA_CERTS needs the ca-certificates CA
+        // bundle to validate api.anthropic.com; the in-OS solver installs both
+        // dependency-first before claude-code.
+        assert_eq!(port_deps("claude-code"), &["node", "ca-certificates"]);
         // Unknown port returns empty.
         assert_eq!(port_deps("clang"), &[] as &[&str]);
     }

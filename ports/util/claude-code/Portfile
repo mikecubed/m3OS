@@ -2,7 +2,13 @@ NAME=claude-code
 VERSION=2.1.112
 DESCRIPTION="Claude Code — Anthropic's terminal coding agent (Node cli.js bundle + yoga.wasm TUI)"
 CATEGORY=util
-DEPS=node
+# DEPS — node is the runtime; ca-certificates lays down the CA bundle at
+# /etc/ssl/certs/ca-certificates.crt that the /usr/bin/claude launcher points
+# NODE_EXTRA_CA_CERTS at (so Node's OpenSSL validates api.anthropic.com). Phase
+# 90b bring-up: with only DEPS=node, that file was never installed, so the
+# launcher referenced a missing path ("Cannot open directory /etc/ssl/certs to
+# load OpenSSL certificates") — the solver now auto-installs it dependency-first.
+DEPS=node ca-certificates
 URL=https://registry.npmjs.org/@anthropic-ai/claude-code/-/claude-code-2.1.112.tgz
 SHA256=84379969ea53a0e5fd231a8f77debe4c7cb17dd971f4809d10d33f9aeca5de09
 MAINTAINER=m3os
