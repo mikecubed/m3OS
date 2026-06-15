@@ -260,8 +260,17 @@ fn dump_ack_timeout_diagnostic(
     {
         timer_now[i] = slot.load(Ordering::Relaxed);
     }
+    // The spin budget is wall-clock ~500 ms once the TSC is calibrated, but a
+    // fixed 10G-cycle fallback before APIC/TSC calibration (`tsc_per_ms == 0`,
+    // see `ack_timeout_tsc`). Don't claim a precise ">500ms" in that window —
+    // word it per the regime so an early-boot hang dump isn't misleading.
+    let budget_desc = if tsc_per_ms > 0 {
+        "ack stuck >500ms"
+    } else {
+        "ack stuck >10G TSC cycles (pre-calibration: tsc_per_ms=0)"
+    };
     crate::serial::_panic_print(format_args!(
-        "[tlb] {site} stuck >500ms: outstanding_mask={outstanding:#018x} \
+        "[tlb] {site} {budget_desc}: outstanding_mask={outstanding:#018x} \
          (of target_mask={target_mask:#018x}), my_core={my_core}, \
          range={range_start:#x}..{range_end:#x}, \
          ICR_LOW={icr_low:#010x} (bit 12 = delivery-pending), \
