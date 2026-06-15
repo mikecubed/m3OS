@@ -88,6 +88,12 @@ const USERSPACE_LIB_HOST_TEST_PACKAGES: &[(&str, &[&str])] = &[
     // Phase 57 I.2 + Phase 81 D.2: m3ctl verb parser + `wifi status` codec.
     // Default features (NOT `os-binary`) so the host `#[cfg(test)]` path builds.
     ("m3ctl", &[]),
+    // Phase 96 spillover: xhci_driver host tests — the controller-multiplexing
+    // slot-handle codec (round-trip + fail-closed, the only coverage for the
+    // multi-controller path QEMU's single xHCI can't exercise) plus the
+    // bring-up sentinel-string assertions. No `--lib`: the bin's unittests run
+    // under `#![cfg_attr(not(test), no_main)]` so the host test harness links.
+    ("xhci_driver", &[]),
 ];
 
 /// QEMU arguments enabling an emulated Intel VT-d IOMMU on the q35 machine.
@@ -6019,7 +6025,7 @@ fn cmd_check() {
     stat_assembly_gate();
 
     println!(
-        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, ac97_driver, hda_driver, ahci_driver, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, shadow, ldso_core, wifi-core, mt792x_driver, m3ctl, pkg-format, xtask, and pkg host tests pass; doom platform-layer C tests pass; retpoline indirect-branch gate pass; stat-assembly gate pass"
+        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, ac97_driver, hda_driver, ahci_driver, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, shadow, ldso_core, wifi-core, mt792x_driver, m3ctl, xhci_driver, pkg-format, xtask, and pkg host tests pass; doom platform-layer C tests pass; retpoline indirect-branch gate pass; stat-assembly gate pass"
     );
 }
 

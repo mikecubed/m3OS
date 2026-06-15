@@ -47,6 +47,12 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+/// Pure controller-multiplexing slot handle codec. Compiled in *both* configs
+/// (no driver-runtime deps) so its round-trip + fail-closed behaviour is
+/// host-unit-testable even though `server` — its only production caller — is
+/// `#[cfg(not(test))]`.
+mod handle;
+
 /// Bring-up glue (MMIO / DMA / IRQ) around the host-tested
 /// `kernel_core::usb::xhci` pure logic. Compiled only for the OS target —
 /// it speaks the syscall ABI and has no host-test surface.

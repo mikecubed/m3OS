@@ -35,6 +35,7 @@ use syscall_lib::write_str;
 use usb_core::protocol::{AttachNotice, USB_REPLY_LABEL, UsbReply, UsbRequest};
 
 use crate::controller::Controller;
+use crate::handle::{pack_handle, unpack_handle};
 
 /// Emitted once the server has registered the `usb` service and bound its IRQ
 /// into the command endpoint — i.e. it is ready to accept requests. This does
@@ -153,30 +154,6 @@ pub fn device_info_from_ctx(ctx: &EnumContext) -> Option<AttachNotice> {
 /// A brought-up controller plus the IRQ notification and enumerated devices it
 /// owns. The server multiplexes the request loop across a `Vec` of these.
 pub type ControllerCtx = (Controller, IrqNotification, Vec<AttachNotice>);
-
-/// Pack a `(controller index, hardware slot id)` pair into the single `u8`
-/// `slot_id` field the [`AttachNotice`] protocol carries. The top two bits index
-/// the controller (up to 4) and the low six bits the slot. For controller 0 the
-/// handle equals the raw slot id, so the single-controller path (and the
-/// QEMU smoke gates) are byte-for-byte unchanged. xHCI assigns the few attached
-/// devices small slot ids (1..N), well within six bits.
-///
-/// **Fails closed**: returns `None` when the pair cannot be encoded losslessly
-/// (controller index > 3 or slot id > 63) rather than silently truncating into
-/// a colliding handle. A colliding handle would route the device's later
-/// control/bulk transfers to a *different* controller/slot — so an unencodable
-/// device is dropped (not served) at the call site instead of misrouted.
-fn pack_handle(ctrl_idx: usize, slot_id: u8) -> Option<u8> {
-    if ctrl_idx > 0b11 || slot_id > 0x3F {
-        return None;
-    }
-    Some(((ctrl_idx as u8) << 6) | (slot_id & 0x3F))
-}
-
-/// Inverse of [`pack_handle`]: recover `(controller index, hardware slot id)`.
-fn unpack_handle(handle: u8) -> (usize, u8) {
-    ((handle >> 6) as usize, handle & 0x3F)
-}
 
 /// Run the xHCI USB IPC server across every brought-up controller. Never returns.
 ///
