@@ -83,6 +83,65 @@ pub struct AttachNotice {
     /// `bInterfaceNumber` of the HID interface — the `wIndex` a class driver
     /// uses for `SET_PROTOCOL` / `SET_IDLE`.
     pub interface_num: u8,
+    /// `idVendor` from the device descriptor — lets a class driver match a
+    /// specific device (e.g. `0x0bda` for Realtek) without a `GetDescriptors`
+    /// round-trip. Phase 96.
+    pub vendor_id: u16,
+    /// `idProduct` from the device descriptor (e.g. `0x8156` for RTL8156).
+    /// Phase 96.
+    pub product_id: u16,
+    /// Device Context Index of the interface's bulk-IN endpoint, or `0` if the
+    /// interface has none. Phase 96 (USB-Ethernet / bulk-class drivers).
+    pub bulk_in_dci: u8,
+    /// `wMaxPacketSize` of that bulk-IN endpoint (0 if `bulk_in_dci == 0`).
+    pub bulk_in_mps: u16,
+    /// Device Context Index of the interface's bulk-OUT endpoint, or `0`.
+    pub bulk_out_dci: u8,
+    /// `wMaxPacketSize` of that bulk-OUT endpoint (0 if `bulk_out_dci == 0`).
+    pub bulk_out_mps: u16,
+}
+
+// ---------------------------------------------------------------------------
+// TopoPort — one root-hub port's live status, for the Topology diagnostic
+// ---------------------------------------------------------------------------
+
+/// Live status of a single root-hub port on a brought-up controller, returned
+/// by [`UsbRequest::Topology`]. Used by `ure`'s bare-metal heartbeat to surface
+/// — at the bottom of the framebuffer scroll, where no serial console exists —
+/// *which controller* a connected device sits on and *what speed* it trained
+/// to. A SuperSpeed-only device (e.g. an RTL8156 on a USB-C port's TCSS lanes)
+/// that shows `ccs` but never surfaces as an enumerated device localizes the
+/// failure to enumeration; an entirely absent controller localizes it to
+/// discovery / bring-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TopoPort {
+    /// Index of the owning brought-up controller (0 = primary).
+    pub ctrl: u8,
+    /// 1-based root-hub port number.
+    pub port: u8,
+    /// Packed status flags: bit0 = CCS (current connect status), bit1 = PED
+    /// (port enabled), bit2 = PP (port power); bits 4..8 = the `PORTSC` Port
+    /// Speed field (xHCI default PSI: 1 = Full, 2 = Low, 3 = High, 4 = Super).
+    pub flags: u8,
+}
+
+impl TopoPort {
+    /// CCS — a device is currently connected to this port.
+    pub const fn ccs(self) -> bool {
+        self.flags & 0x01 != 0
+    }
+    /// PED — the port is enabled (link trained).
+    pub const fn ped(self) -> bool {
+        self.flags & 0x02 != 0
+    }
+    /// The `PORTSC` Port Speed field (default PSI value).
+    pub const fn speed_psi(self) -> u8 {
+        (self.flags >> 4) & 0x0F
+    }
+    /// Pack `(ccs, ped, pp, speed_psi)` into the wire flag byte.
+    pub const fn pack(ccs: bool, ped: bool, pp: bool, speed_psi: u8) -> u8 {
+        (ccs as u8) | ((ped as u8) << 1) | ((pp as u8) << 2) | ((speed_psi & 0x0F) << 4)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -131,6 +190,27 @@ pub enum UsbRequest {
         setup: [u8; 8],
         /// Expected response length (0 for OUT-only control transfers).
         length: u16,
+    },
+
+    /// Issue a USB control transfer on EP0 that carries an **OUT data stage**.
+    ///
+    /// Unlike [`UsbRequest::ControlRequest`] (which only allocates a data
+    /// buffer for IN transfers), this variant ships the host-to-device payload
+    /// inline so the server can copy it into the data-stage DMA buffer. Used by
+    /// the `ure` driver's OCP register *writes* (vendor request `bRequest=0x05`,
+    /// `bmRequestType=0x40`) for chip init / RX-TX enable. Phase 96.
+    ///
+    /// `setup[6..8]` (`wLength`) MUST equal `data.len()` — the server fails the
+    /// transfer closed on a mismatch. Returns [`UsbReply::ControlData`] with an
+    /// empty `data` field (the status is carried by `completion_code`).
+    ControlWrite {
+        /// Target slot ID.
+        slot_id: u8,
+        /// Raw setup packet bytes (8 bytes, little-endian, USB 2.0 §9.3).
+        /// `bmRequestType` bit 7 (D2H) MUST be clear — this is an OUT transfer.
+        setup: [u8; 8],
+        /// Host-to-device data-stage payload (inline; `wLength` bytes).
+        data: Vec<u8>,
     },
 
     /// Submit an interrupt or bulk transfer on a non-EP0 endpoint.
@@ -183,6 +263,41 @@ pub enum UsbRequest {
         /// Maximum bytes to return (the endpoint's `wMaxPacketSize`).
         len: u16,
     },
+
+    /// Non-blocking poll of a **bulk-IN** endpoint for a received buffer (e.g. a
+    /// USB-Ethernet RX frame batch). Like [`UsbRequest::PollInterruptIn`] but
+    /// the server arms the endpoint with a frame-sized (`len`) Normal TRB; the
+    /// captured buffer is returned **inline** (frames fit within `USB_MSG_MAX`).
+    /// Returns [`UsbReply::BulkData`]. Phase 96.
+    PollBulkIn {
+        /// Target slot ID.
+        slot_id: u8,
+        /// Device Context Index of the bulk-IN endpoint to poll.
+        dci: u8,
+        /// Frame-sized buffer length to arm / cap the returned bytes at.
+        len: u16,
+    },
+
+    /// Submit a **bulk-OUT** transfer (e.g. a USB-Ethernet TX frame) and block
+    /// for completion. The payload travels inline (a frame + Realtek TX
+    /// descriptor fits within `USB_MSG_MAX`). Returns
+    /// [`UsbReply::TransferComplete`] with the byte count. Phase 96.
+    SubmitBulkOut {
+        /// Target slot ID.
+        slot_id: u8,
+        /// Device Context Index of the bulk-OUT endpoint.
+        dci: u8,
+        /// The frame bytes (Realtek TX descriptor already prepended by the driver).
+        data: Vec<u8>,
+    },
+
+    /// Diagnostic: snapshot the host's live root-hub topology across every
+    /// brought-up controller. No target — the server reads each controller's
+    /// `PORTSC` registers and returns [`UsbReply::Topology`]. Bare-metal
+    /// debugging aid (Phase 96): a class driver with no device to claim (e.g.
+    /// `ure` when the NIC didn't enumerate) polls this each heartbeat so the
+    /// controller/port/speed picture survives the framebuffer scroll.
+    Topology,
 }
 
 // ---------------------------------------------------------------------------
@@ -241,11 +356,37 @@ pub enum UsbReply {
         completion_code: u8,
     },
 
+    /// Reply to [`UsbRequest::PollBulkIn`]. `data` is the captured bulk-IN
+    /// buffer (inline, ≤ the polled `len`); an **empty** `data` with
+    /// `completion_code == 0` means "nothing captured yet". Phase 96.
+    BulkData {
+        /// The captured bulk-IN bytes (empty = nothing pending).
+        data: Vec<u8>,
+        /// xHCI completion code of the last completed transfer (`1` = success,
+        /// `0` = none captured yet).
+        completion_code: u8,
+    },
+
     /// The request failed for a reason not captured by a specific variant.
     Error {
         /// Stable numeric error code (for logging / matching). Wire-safe — a
         /// `&'static str` cannot be reconstructed on the decode side.
         code: u16,
+    },
+
+    /// Reply to [`UsbRequest::Topology`]: the live root-hub picture.
+    Topology {
+        /// Number of xHCI controllers discovered via PCI class enumeration
+        /// (may exceed `port_counts.len()` if a controller failed bring-up and
+        /// was skipped — that gap is itself the diagnostic).
+        discovered: u8,
+        /// `max_ports` (`HCSPARAMS1.MaxPorts`) for each *brought-up* controller,
+        /// in controller-index order. `len()` is the up count.
+        port_counts: Vec<u8>,
+        /// One entry per **connected** root-hub port (CCS set) across all
+        /// brought-up controllers. An empty list with `port_counts` non-empty
+        /// means the controllers came up but saw no device.
+        ports: Vec<TopoPort>,
     },
 }
 
@@ -322,6 +463,19 @@ impl UsbClient {
         }
     }
 
+    /// Build a [`UsbRequest::ControlWrite`] message (OUT control transfer with
+    /// an inline data stage).
+    ///
+    /// `setup` is the raw 8-byte SETUP packet; `data` is the host-to-device
+    /// payload whose length must equal the SETUP packet's `wLength`.
+    pub fn control_write_request(&self, setup: [u8; 8], data: Vec<u8>) -> UsbRequest {
+        UsbRequest::ControlWrite {
+            slot_id: self.slot_id,
+            setup,
+            data,
+        }
+    }
+
     /// Build a [`UsbRequest::SubmitTransfer`] message for `dci` using a
     /// page-capability grant.
     ///
@@ -353,10 +507,12 @@ pub const USB_REQ_LABEL: u64 = 1;
 /// IPC label the server replies with; the [`UsbReply`] travels as reply bulk.
 pub const USB_REPLY_LABEL: u64 = 1;
 
-/// Upper bound on an encoded request/reply that the live HID path produces
-/// (a full-config `Descriptors` reply is the largest). Clients/servers size
-/// their bulk buffers to this.
-pub const USB_MSG_MAX: usize = 1024;
+/// Upper bound on an encoded request/reply. Phase 96 raised this from 1024 to
+/// 4096 so a `BulkData`/`SubmitBulkOut` payload carrying a full Ethernet frame
+/// (≤ 1522 B) plus its Realtek descriptor and the wire-codec overhead fits
+/// inline. Clients/servers size their bulk buffers to this. Well within the
+/// kernel's `MAX_BULK_LEN` (81920).
+pub const USB_MSG_MAX: usize = 4096;
 
 // --- request tags ---
 const REQ_GET_DESCRIPTORS: u8 = 1;
@@ -365,6 +521,10 @@ const REQ_CONTROL: u8 = 3;
 const REQ_SUBMIT_TRANSFER: u8 = 4;
 const REQ_NEXT_ATTACH: u8 = 5;
 const REQ_POLL_INTERRUPT_IN: u8 = 6;
+const REQ_CONTROL_WRITE: u8 = 7;
+const REQ_POLL_BULK_IN: u8 = 8;
+const REQ_SUBMIT_BULK_OUT: u8 = 9;
+const REQ_TOPOLOGY: u8 = 10;
 
 // --- reply tags ---
 const REP_DESCRIPTORS: u8 = 1;
@@ -374,6 +534,8 @@ const REP_TRANSFER_COMPLETE: u8 = 4;
 const REP_ATTACH: u8 = 5;
 const REP_INTERRUPT_REPORT: u8 = 6;
 const REP_ERROR: u8 = 7;
+const REP_BULK_DATA: u8 = 8;
+const REP_TOPOLOGY: u8 = 9;
 
 #[inline]
 fn put_u16(v: &mut Vec<u8>, x: u16) {
@@ -438,7 +600,7 @@ impl<'a> Reader<'a> {
 
 impl AttachNotice {
     /// Fixed encoded length of an [`AttachNotice`] on the wire.
-    pub const WIRE_LEN: usize = 11;
+    pub const WIRE_LEN: usize = 21;
 
     fn encode_into(&self, out: &mut Vec<u8>) {
         out.push(self.port);
@@ -451,6 +613,12 @@ impl AttachNotice {
         put_u16(out, self.ep_in_mps);
         out.push(self.ep_in_interval);
         out.push(self.interface_num);
+        put_u16(out, self.vendor_id);
+        put_u16(out, self.product_id);
+        out.push(self.bulk_in_dci);
+        put_u16(out, self.bulk_in_mps);
+        out.push(self.bulk_out_dci);
+        put_u16(out, self.bulk_out_mps);
     }
 
     fn read(r: &mut Reader) -> Option<Self> {
@@ -465,6 +633,12 @@ impl AttachNotice {
             ep_in_mps: r.u16()?,
             ep_in_interval: r.u8()?,
             interface_num: r.u8()?,
+            vendor_id: r.u16()?,
+            product_id: r.u16()?,
+            bulk_in_dci: r.u8()?,
+            bulk_in_mps: r.u16()?,
+            bulk_out_dci: r.u8()?,
+            bulk_out_mps: r.u16()?,
         })
     }
 
@@ -508,6 +682,16 @@ impl UsbRequest {
                 v.extend_from_slice(setup);
                 put_u16(&mut v, *length);
             }
+            UsbRequest::ControlWrite {
+                slot_id,
+                setup,
+                data,
+            } => {
+                v.push(REQ_CONTROL_WRITE);
+                v.push(*slot_id);
+                v.extend_from_slice(setup);
+                put_bytes(&mut v, data);
+            }
             UsbRequest::SubmitTransfer {
                 slot_id,
                 dci,
@@ -528,6 +712,21 @@ impl UsbRequest {
                 v.push(*slot_id);
                 v.push(*dci);
                 put_u16(&mut v, *len);
+            }
+            UsbRequest::PollBulkIn { slot_id, dci, len } => {
+                v.push(REQ_POLL_BULK_IN);
+                v.push(*slot_id);
+                v.push(*dci);
+                put_u16(&mut v, *len);
+            }
+            UsbRequest::SubmitBulkOut { slot_id, dci, data } => {
+                v.push(REQ_SUBMIT_BULK_OUT);
+                v.push(*slot_id);
+                v.push(*dci);
+                put_bytes(&mut v, data);
+            }
+            UsbRequest::Topology => {
+                v.push(REQ_TOPOLOGY);
             }
         }
         v
@@ -556,6 +755,19 @@ impl UsbRequest {
                     length,
                 }
             }
+            REQ_CONTROL_WRITE => {
+                let slot_id = r.u8()?;
+                let mut setup = [0u8; 8];
+                for b in &mut setup {
+                    *b = r.u8()?;
+                }
+                let data = r.bytes()?;
+                UsbRequest::ControlWrite {
+                    slot_id,
+                    setup,
+                    data,
+                }
+            }
             REQ_SUBMIT_TRANSFER => UsbRequest::SubmitTransfer {
                 slot_id: r.u8()?,
                 dci: r.u8()?,
@@ -570,6 +782,17 @@ impl UsbRequest {
                 dci: r.u8()?,
                 len: r.u16()?,
             },
+            REQ_POLL_BULK_IN => UsbRequest::PollBulkIn {
+                slot_id: r.u8()?,
+                dci: r.u8()?,
+                len: r.u16()?,
+            },
+            REQ_SUBMIT_BULK_OUT => UsbRequest::SubmitBulkOut {
+                slot_id: r.u8()?,
+                dci: r.u8()?,
+                data: r.bytes()?,
+            },
+            REQ_TOPOLOGY => UsbRequest::Topology,
             _ => return None,
         })
     }
@@ -623,9 +846,32 @@ impl UsbReply {
                 v.push(*completion_code);
                 put_bytes(&mut v, data);
             }
+            UsbReply::BulkData {
+                data,
+                completion_code,
+            } => {
+                v.push(REP_BULK_DATA);
+                v.push(*completion_code);
+                put_bytes(&mut v, data);
+            }
             UsbReply::Error { code } => {
                 v.push(REP_ERROR);
                 put_u16(&mut v, *code);
+            }
+            UsbReply::Topology {
+                discovered,
+                port_counts,
+                ports,
+            } => {
+                v.push(REP_TOPOLOGY);
+                v.push(*discovered);
+                put_bytes(&mut v, port_counts);
+                put_u16(&mut v, ports.len() as u16);
+                for p in ports {
+                    v.push(p.ctrl);
+                    v.push(p.port);
+                    v.push(p.flags);
+                }
             }
         }
         v
@@ -670,7 +916,33 @@ impl UsbReply {
                     completion_code,
                 }
             }
+            REP_BULK_DATA => {
+                let completion_code = r.u8()?;
+                let data = r.bytes()?;
+                UsbReply::BulkData {
+                    data,
+                    completion_code,
+                }
+            }
             REP_ERROR => UsbReply::Error { code: r.u16()? },
+            REP_TOPOLOGY => {
+                let discovered = r.u8()?;
+                let port_counts = r.bytes()?;
+                let n = r.u16()? as usize;
+                let mut ports = Vec::with_capacity(n);
+                for _ in 0..n {
+                    ports.push(TopoPort {
+                        ctrl: r.u8()?,
+                        port: r.u8()?,
+                        flags: r.u8()?,
+                    });
+                }
+                UsbReply::Topology {
+                    discovered,
+                    port_counts,
+                    ports,
+                }
+            }
             _ => return None,
         })
     }
@@ -696,7 +968,48 @@ mod tests {
             ep_in_mps: 8,
             ep_in_interval: 10,
             interface_num: 0,
+            vendor_id: 0x046d,
+            product_id: 0xc31c,
+            bulk_in_dci: 0,
+            bulk_in_mps: 0,
+            bulk_out_dci: 0,
+            bulk_out_mps: 0,
         }
+    }
+
+    fn sample_ure_notice() -> AttachNotice {
+        AttachNotice {
+            port: 1,
+            slot_id: 3,
+            interface_class: 0xff,
+            interface_sub_class: 0xff,
+            interface_protocol: 0xff,
+            attached: true,
+            ep_in_dci: 0,
+            ep_in_mps: 0,
+            ep_in_interval: 0,
+            interface_num: 0,
+            vendor_id: 0x0bda,
+            product_id: 0x8156,
+            bulk_in_dci: 5,
+            bulk_in_mps: 512,
+            bulk_out_dci: 4,
+            bulk_out_mps: 512,
+        }
+    }
+
+    #[test]
+    fn attach_notice_ure_bulk_round_trip() {
+        let notice = sample_ure_notice();
+        let bytes = notice.encode();
+        assert_eq!(bytes.len(), AttachNotice::WIRE_LEN);
+        let decoded = AttachNotice::decode(&bytes).expect("decode");
+        assert_eq!(decoded, notice);
+        assert_eq!(decoded.vendor_id, 0x0bda);
+        assert_eq!(decoded.product_id, 0x8156);
+        assert_eq!(decoded.bulk_in_dci, 5);
+        assert_eq!(decoded.bulk_out_dci, 4);
+        assert_eq!(decoded.bulk_out_mps, 512);
     }
 
     #[test]
@@ -721,6 +1034,12 @@ mod tests {
             ep_in_mps: 0,
             ep_in_interval: 0,
             interface_num: 0,
+            vendor_id: 0,
+            product_id: 0,
+            bulk_in_dci: 0,
+            bulk_in_mps: 0,
+            bulk_out_dci: 0,
+            bulk_out_mps: 0,
         };
         assert!(!notice.attached);
     }
@@ -759,6 +1078,23 @@ mod tests {
                 dci: 3,
                 len: 8,
             },
+            UsbRequest::ControlWrite {
+                slot_id: 4,
+                // OCP write: bmRequestType=0x40, bRequest=0x05, wValue=0xe813,
+                // wIndex=MCU_TYPE_PLA|byte_en, wLength=2.
+                setup: [0x40, 0x05, 0x13, 0xe8, 0x00, 0x01, 0x02, 0x00],
+                data: alloc::vec![0x0c, 0x00],
+            },
+            UsbRequest::PollBulkIn {
+                slot_id: 1,
+                dci: 5,
+                len: 2048,
+            },
+            UsbRequest::SubmitBulkOut {
+                slot_id: 1,
+                dci: 4,
+                data: alloc::vec![0x00, 0x00, 0x40, 0x00, 0xde, 0xad, 0xbe, 0xef],
+            },
         ];
         for r in reqs {
             let bytes = r.encode();
@@ -767,6 +1103,29 @@ mod tests {
         }
         assert_eq!(UsbRequest::decode(&[]), None);
         assert_eq!(UsbRequest::decode(&[0xFE]), None); // unknown tag
+    }
+
+    #[test]
+    fn control_write_carries_inline_out_data() {
+        let client = UsbClient::new(2, 7);
+        let setup = [0x40u8, 0x05, 0x13, 0xe8, 0x00, 0x01, 0x02, 0x00];
+        let req = client.control_write_request(setup, alloc::vec![0xab, 0xcd]);
+        match &req {
+            UsbRequest::ControlWrite {
+                slot_id,
+                setup: s,
+                data,
+            } => {
+                assert_eq!(*slot_id, 2);
+                assert_eq!(s[0] & 0x80, 0); // OUT direction (D2H bit clear)
+                assert_eq!(s[1], 0x05); // OCP vendor request
+                assert_eq!(data, &alloc::vec![0xab, 0xcd]);
+            }
+            _ => panic!("wrong variant"),
+        }
+        // Round-trips through the wire codec with the data stage intact.
+        let back = UsbRequest::decode(&req.encode()).expect("decode");
+        assert_eq!(back, req);
     }
 
     #[test]
@@ -797,7 +1156,31 @@ mod tests {
                 data: alloc::vec![],
                 completion_code: 0,
             },
+            UsbReply::BulkData {
+                data: alloc::vec![0xaa, 0xbb, 0xcc],
+                completion_code: 1,
+            },
+            UsbReply::BulkData {
+                data: alloc::vec![],
+                completion_code: 0,
+            },
             UsbReply::Error { code: 19 },
+            UsbReply::Topology {
+                discovered: 2,
+                port_counts: alloc::vec![16, 24],
+                ports: alloc::vec![
+                    TopoPort {
+                        ctrl: 0,
+                        port: 3,
+                        flags: TopoPort::pack(true, true, true, 3),
+                    },
+                    TopoPort {
+                        ctrl: 1,
+                        port: 9,
+                        flags: TopoPort::pack(true, false, true, 4),
+                    },
+                ],
+            },
         ];
         for r in replies {
             let bytes = r.encode();
@@ -805,6 +1188,39 @@ mod tests {
             assert_eq!(back.encode(), bytes);
         }
         assert_eq!(UsbReply::decode(&[]), None);
+    }
+
+    #[test]
+    fn topology_request_and_reply_roundtrip() {
+        let req = UsbRequest::Topology;
+        assert_eq!(UsbRequest::decode(&req.encode()), Some(req));
+
+        let reply = UsbReply::Topology {
+            discovered: 2,
+            port_counts: alloc::vec![8, 22],
+            ports: alloc::vec![TopoPort {
+                ctrl: 1,
+                port: 5,
+                flags: TopoPort::pack(true, false, true, 4),
+            }],
+        };
+        match UsbReply::decode(&reply.encode()).expect("decode") {
+            UsbReply::Topology {
+                discovered,
+                port_counts,
+                ports,
+            } => {
+                assert_eq!(discovered, 2);
+                assert_eq!(port_counts, alloc::vec![8, 22]);
+                assert_eq!(ports.len(), 1);
+                assert_eq!(ports[0].ctrl, 1);
+                assert_eq!(ports[0].port, 5);
+                assert!(ports[0].ccs());
+                assert!(!ports[0].ped());
+                assert_eq!(ports[0].speed_psi(), 4); // SuperSpeed
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]

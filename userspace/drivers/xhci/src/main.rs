@@ -286,12 +286,49 @@ fn bring_up_controller(
             match final_state {
                 EnumState::Configured => {
                     syscall_lib::write_str(STDOUT_FILENO, "[xhci] enumeration complete\n");
+                    // Bare-metal diagnostic: m3OS has no hub driver, so any device
+                    // behind a hub (e.g. a keyboard with a built-in USB hub) is
+                    // invisible. Flag a hub loudly so the boot log explains a
+                    // "missing" keyboard rather than leaving it a silent mystery.
+                    let is_hub = final_ctx
+                        .device_descriptor
+                        .as_ref()
+                        .map(|d| d.b_device_class == kernel_core::usb::descriptor::CLASS_HUB)
+                        .unwrap_or(false)
+                        || final_ctx
+                            .parsed_config
+                            .as_ref()
+                            .map(|c| {
+                                c.interfaces.iter().any(|i| {
+                                    i.interface.b_interface_class
+                                        == kernel_core::usb::descriptor::CLASS_HUB
+                                })
+                            })
+                            .unwrap_or(false);
+                    if is_hub {
+                        syscall_lib::write_str(STDOUT_FILENO, "[xhci] *** USB HUB on port ");
+                        write_u8_dec(port_num);
+                        syscall_lib::write_str(
+                            STDOUT_FILENO,
+                            " — devices behind it are NOT enumerated (no hub driver yet)\n",
+                        );
+                    }
                     print_descriptor_tree(&final_ctx);
                     syscall_lib::write_str(STDOUT_FILENO, XHCI_ENUM_CONFIGURED_SENTINEL);
-                    // Phase 78c: if this is a HID device, record it so the server
-                    // can hand it to the `usb-hid` class driver.
+                    // Phase 78c/96: record any surfaceable interface (HID, or a
+                    // bulk IN+OUT pair for the NIC) so the server can hand it to a
+                    // class driver. The log line names the device so a bare-metal
+                    // boot shows exactly what was surfaced (keyboard vs NIC vs …).
                     if let Some(info) = crate::server::device_info_from_ctx(&final_ctx) {
-                        syscall_lib::write_str(STDOUT_FILENO, "[xhci] HID device registered\n");
+                        syscall_lib::write_str(STDOUT_FILENO, "[xhci] surfaced device vid=0x");
+                        write_u16_hex(info.vendor_id);
+                        syscall_lib::write_str(STDOUT_FILENO, " pid=0x");
+                        write_u16_hex(info.product_id);
+                        syscall_lib::write_str(STDOUT_FILENO, " class=");
+                        write_u8_dec(info.interface_class);
+                        syscall_lib::write_str(STDOUT_FILENO, " proto=");
+                        write_u8_dec(info.interface_protocol);
+                        syscall_lib::write_str(STDOUT_FILENO, "\n");
                         devices.push(info);
                     }
                 }
@@ -329,6 +366,10 @@ fn program_main(_args: &[&str]) -> i32 {
     // and will be returned in the list.
     let discovered = enumerate_pci_class(XHCI_CLASS, XHCI_SUBCLASS, XHCI_PROG_IF)
         .unwrap_or_else(|_| alloc::vec![]);
+    // Count of controllers discovered via PCI, reported in the `Topology`
+    // diagnostic so a bare-metal heartbeat distinguishes "controller failed
+    // bring-up and was skipped" (discovered > up) from "never discovered".
+    let discovered_count = discovered.len() as u8;
 
     // Determine the ordered list of BDFs to bring up.
     let bdf_list: alloc::vec::Vec<DeviceCapKey> = if !discovered.is_empty() {
@@ -354,38 +395,49 @@ fn program_main(_args: &[&str]) -> i32 {
         alloc::vec![SENTINEL_BDF]
     };
 
-    // Step 2: bring up each discovered controller sequentially.
-    //
-    // Phase 78b deliverable: discover + claim + enumerate each controller.
-    // Concurrent multi-controller event servicing (multiple IRQ loops) is a
-    // later refinement — for now, bring up and enumerate all controllers, then
-    // enter the event loop on the primary (first) successfully brought-up one.
-    let mut primary: Option<(
-        Controller,
-        IrqNotification,
-        alloc::vec::Vec<usb_core::protocol::AttachNotice>,
-    )> = None;
+    // Step 2: create the command endpoint and register the `usb` service
+    // *before* the slow per-port enumeration below. On a multi-controller
+    // machine (e.g. a laptop with a PCH xHCI plus a Thunderbolt/TCSS xHCI)
+    // enumerating every connected device serially can take well over ten
+    // seconds. The `usb-hid` class driver waits a bounded 10 s for the `usb`
+    // service to appear; registering the name up front lets that wait succeed
+    // immediately, after which its first `NextAttach` simply blocks on the IPC
+    // rendezvous until this driver finishes enumerating and enters `server::run`
+    // — so a slow enumeration no longer trips the timeout and silently kills the
+    // keyboard/NIC class drivers.
+    let ep = syscall_lib::create_endpoint();
+    if ep == u64::MAX {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "xhci_driver: server endpoint create failed\n",
+        );
+        return 20;
+    }
+    let ep = ep as u32;
+    if syscall_lib::ipc_register_service(ep, usb_core::protocol::USB_SERVICE_NAME) == u64::MAX {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "xhci_driver: register 'usb' service failed\n",
+        );
+        return 21;
+    }
 
+    // Step 3: bring up and enumerate every discovered controller, collecting all
+    // of them so the server can serve devices on each (the keyboard and a
+    // USB-C-attached NIC frequently land on different controllers). The kernel
+    // binds one IRQ per task, so `server::run` binds the primary controller's
+    // IRQ and drains the rest by polling on every loop wake — see its doc.
+    let mut controllers: alloc::vec::Vec<server::ControllerCtx> = alloc::vec::Vec::new();
     for key in bdf_list {
         match bring_up_controller(key) {
-            Ok(triple) => {
-                if primary.is_none() {
-                    primary = Some(triple);
-                }
-                // Additional controllers are enumerated (bring_up_controller ran
-                // the full discovery + USB enumeration path) but their event
-                // loops are not started — that is the Phase 78c multi-controller
-                // IRQ multiplexing deliverable.
-            }
+            Ok(triple) => controllers.push(triple),
             Err(0) => {
-                // Clean exit requested (no controller at BDF). For the primary
-                // slot, if no other controller succeeds we will fall through to
-                // the clean exit below.
+                // Clean exit requested (no controller at this BDF) — skip it.
             }
             Err(code) => {
                 // Hard bring-up failure on one controller. Log it but continue
                 // attempting the rest (a secondary controller failure should not
-                // prevent the primary from coming up).
+                // prevent another from coming up).
                 syscall_lib::write_str(
                     STDOUT_FILENO,
                     "xhci_driver: controller bring-up failed, continuing\n",
@@ -395,23 +447,27 @@ fn program_main(_args: &[&str]) -> i32 {
         }
     }
 
-    // Step 3: enter the USB IPC server loop on the primary controller. The
-    // server registers the `usb` service, binds the IRQ, and serves class
-    // drivers — HID Boot-Protocol setup (`SET_PROTOCOL(0)` / `SET_IDLE(0)`) is
-    // performed by the `usb-hid` class driver itself via `ControlRequest`,
-    // after the service is registered. It never returns.
-    match primary {
-        Some((controller, irq, devices)) => server::run(controller, irq, devices),
-        None => {
-            // No controller came up successfully. Exit cleanly so the service
-            // manager marks xhci_driver as permanently stopped.
-            syscall_lib::write_str(
-                STDOUT_FILENO,
-                "xhci_driver: no controller brought up — exiting cleanly\n",
-            );
-            0
-        }
+    if controllers.is_empty() {
+        // No controller came up. The `usb` service is already registered, so we
+        // must still enter the server loop (rather than exit, which would leave
+        // the registered name pointing at a dead endpoint and hang `usb-hid` on
+        // its first `NextAttach`). `server::run` with an empty controller set
+        // answers `NextAttach` with "no devices", letting `usb-hid` exit cleanly.
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "xhci_driver: no controller brought up — serving empty USB device set\n",
+        );
     }
+
+    // Step 4: enter the multi-controller USB IPC server loop. It never returns.
+    // This line is the bring-up watershed: until it prints, no client's
+    // NextAttach/Control request is answered (they block on the IPC rendezvous),
+    // so on bare metal its presence distinguishes "bring-up still grinding" from
+    // "server live, devices surfaced".
+    syscall_lib::write_str(STDOUT_FILENO, "[xhci] bring-up done: ");
+    write_u8_dec(controllers.len() as u8);
+    syscall_lib::write_str(STDOUT_FILENO, " controller(s) up — entering server loop\n");
+    server::run(ep, discovered_count, controllers)
 }
 
 /// Print the USB descriptor tree for a successfully enumerated device.

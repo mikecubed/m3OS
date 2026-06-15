@@ -38,9 +38,9 @@ use alloc::vec::Vec;
 
 use crate::usb::descriptor::{ConfigDescriptor, DeviceDescriptor, ParsedConfig, parse_config_tree};
 use crate::usb::xhci::context::{
-    EP_CERR_3, EP_TYPE_CONTROL, EP_TYPE_INTERRUPT_IN, EP_TYPE_INTERRUPT_OUT, add_flags,
-    ep_context_dword0_interval, ep_context_dword1, ep_tr_dequeue_ptr, slot_context_dword0,
-    slot_context_dword1,
+    EP_CERR_3, EP_TYPE_BULK_IN, EP_TYPE_BULK_OUT, EP_TYPE_CONTROL, EP_TYPE_INTERRUPT_IN,
+    EP_TYPE_INTERRUPT_OUT, add_flags, ep_context_dword0_interval, ep_context_dword1,
+    ep_tr_dequeue_ptr, slot_context_dword0, slot_context_dword1,
 };
 use crate::usb::xhci::port::{PortSpeed, ep0_max_packet_for_speed};
 use crate::usb::xhci::trb::{COMPLETION_SUCCESS, dci};
@@ -287,8 +287,8 @@ fn build_configure_endpoint_ctx(ctx: &EnumContext) -> InputContextSnapshot {
                 // bmAttributes bits 1:0: 0=Control, 1=Isoch, 2=Bulk, 3=Interrupt.
                 let xhci_ep_type = match (ep.transfer_type(), is_in) {
                     (0, _) => EP_TYPE_CONTROL,
-                    (2, false) => crate::usb::xhci::context::EP_TYPE_BULK_OUT,
-                    (2, true) => crate::usb::xhci::context::EP_TYPE_BULK_IN,
+                    (2, false) => EP_TYPE_BULK_OUT,
+                    (2, true) => EP_TYPE_BULK_IN,
                     (3, false) => EP_TYPE_INTERRUPT_OUT,
                     (3, true) => EP_TYPE_INTERRUPT_IN,
                     // Default to Interrupt IN for unknown types; production
@@ -555,8 +555,8 @@ pub fn run_enumeration(
 mod tests {
     use super::*;
     use crate::usb::xhci::context::{
-        EP_TYPE_CONTROL, EP_TYPE_INTERRUPT_IN, ep_interval, ep_max_packet_size, ep_type,
-        slot_context_entries,
+        EP_TYPE_BULK_IN, EP_TYPE_BULK_OUT, EP_TYPE_CONTROL, EP_TYPE_INTERRUPT_IN, ep_interval,
+        ep_max_packet_size, ep_type, slot_context_entries,
     };
     use crate::usb::xhci::trb::dci as compute_dci;
 
@@ -605,6 +605,8 @@ mod tests {
         address_device_fail_code: u8,
         /// Override the device descriptor returned (default: KEYBOARD_DEVICE_DESCRIPTOR).
         device_descriptor_override: Option<Vec<u8>>,
+        /// Override the config blob returned by get_config_short / get_config_full.
+        config_blob_override: Option<Vec<u8>>,
     }
 
     impl UsbHostOps for MockOps {
@@ -650,13 +652,21 @@ mod tests {
 
         fn get_config_short(&mut self, _slot_id: u8, _len: u16) -> Option<Vec<u8>> {
             self.call_log.push("GetConfigShort".into());
-            // Return just the first 9 bytes of the keyboard config blob.
-            Some(BOOT_KEYBOARD_CONFIG_BLOB[..9].to_vec())
+            let blob = self
+                .config_blob_override
+                .as_deref()
+                .unwrap_or(BOOT_KEYBOARD_CONFIG_BLOB);
+            // Return just the first 9 bytes of the config blob.
+            Some(blob[..9].to_vec())
         }
 
         fn get_config_full(&mut self, _slot_id: u8, _len: u16) -> Option<Vec<u8>> {
             self.call_log.push("GetConfigFull".into());
-            Some(BOOT_KEYBOARD_CONFIG_BLOB.to_vec())
+            let blob = self
+                .config_blob_override
+                .as_deref()
+                .unwrap_or(BOOT_KEYBOARD_CONFIG_BLOB);
+            Some(blob.to_vec())
         }
 
         fn set_configuration(&mut self, _slot_id: u8, _value: u8) -> u8 {
@@ -923,6 +933,125 @@ mod tests {
             ep_interval(ep_snap.ep_dword0),
             6,
             "FS interrupt bInterval=10 must encode xHCI Interval=6"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // M3b: Bulk endpoint EP types map correctly in ConfigureEndpoint
+    // -----------------------------------------------------------------------
+
+    /// Config blob for a High-Speed device with three endpoints:
+    ///   EP1 IN  Interrupt (DCI 3), MPS 8,   bInterval 1
+    ///   EP2 OUT Bulk      (DCI 4), MPS 512,  bInterval 0
+    ///   EP2 IN  Bulk      (DCI 5), MPS 512,  bInterval 0
+    ///
+    /// Layout: Config(9) + Interface(9) + EP1-IN-Interrupt(7) + EP2-OUT-Bulk(7) + EP2-IN-Bulk(7)
+    /// wTotalLength = 39 = 0x0027
+    const BULK_DEVICE_CONFIG_BLOB: &[u8] = &[
+        // Config descriptor (9 bytes)
+        0x09, 0x02, 0x27, 0x00, 0x01, 0x01, 0x00, 0xA0, 0x32,
+        // Interface descriptor (9 bytes) — class FF, 3 endpoints
+        0x09, 0x04, 0x00, 0x00, 0x03, 0xFF, 0x00, 0x00, 0x00,
+        // EP1 IN Interrupt (7 bytes): address=0x81, bmAttributes=0x03, MPS=8, bInterval=1
+        0x07, 0x05, 0x81, 0x03, 0x08, 0x00, 0x01,
+        // EP2 OUT Bulk (7 bytes): address=0x02, bmAttributes=0x02, MPS=512, bInterval=0
+        0x07, 0x05, 0x02, 0x02, 0x00, 0x02, 0x00,
+        // EP2 IN Bulk (7 bytes): address=0x82, bmAttributes=0x02, MPS=512, bInterval=0
+        0x07, 0x05, 0x82, 0x02, 0x00, 0x02, 0x00,
+    ];
+
+    /// HS device descriptor (bMaxPacketSize0=64, skips BSR two-step).
+    const BULK_DEVICE_DESCRIPTOR: &[u8] = &[
+        0x12, 0x01, 0x00, 0x02, // bLength, bDescriptorType, bcdUSB=2.00
+        0x00, 0x00, 0x00, 0x40, // bDeviceClass, SubClass, Protocol, bMaxPacketSize0=64
+        0xAB, 0xCD, 0x01, 0x00, // idVendor, idProduct
+        0x00, 0x01, 0x01, 0x02, 0x03, 0x01, // bcdDevice, iManuf, iProd, iSerial, bNumConfigs
+    ];
+
+    #[test]
+    fn configure_endpoint_maps_bulk_out_and_bulk_in_ep_types() {
+        let mut ops = MockOps {
+            device_descriptor_override: Some(BULK_DEVICE_DESCRIPTOR.to_vec()),
+            config_blob_override: Some(BULK_DEVICE_CONFIG_BLOB.to_vec()),
+            ..Default::default()
+        };
+        let ctx = EnumContext {
+            speed: Some(PortSpeed::High),
+            ep0_ring_iova: 0x0010_0000,
+            port: 1,
+            ..Default::default()
+        };
+        let (final_state, _final_ctx) = run_enumeration(EnumState::EnableSlot, ctx, &mut ops);
+        assert_eq!(final_state, EnumState::Configured);
+
+        // The last snapshot is ConfigureEndpoint.
+        // HS path: [AddressDevice(0), ConfigureEndpoint(1)]
+        let cfg_snap = ops
+            .ctx_snapshots
+            .last()
+            .expect("must have configure_endpoint snapshot");
+
+        // Three interface endpoints: DCI 3 (EP1 IN Interrupt), 4 (EP2 OUT Bulk), 5 (EP2 IN Bulk).
+        assert_eq!(
+            cfg_snap.endpoint_contexts.len(),
+            3,
+            "must have exactly 3 endpoint contexts"
+        );
+
+        // Sort by DCI to get a deterministic lookup order.
+        let ep_by_dci = |target_dci: u8| {
+            cfg_snap
+                .endpoint_contexts
+                .iter()
+                .find(|e| e.dci == target_dci)
+                .unwrap_or_else(|| panic!("no endpoint context with DCI {}", target_dci))
+        };
+
+        // --- EP1 IN Interrupt: DCI = 2*1 + 1 = 3 ---
+        let ep1_in = ep_by_dci(compute_dci(1, true)); // DCI 3
+        assert_eq!(
+            ep_type(ep1_in.ep_dword1),
+            EP_TYPE_INTERRUPT_IN,
+            "EP1 IN must be Interrupt IN"
+        );
+        assert_eq!(ep_max_packet_size(ep1_in.ep_dword1), 8);
+
+        // --- EP2 OUT Bulk: DCI = 2*2 + 0 = 4 ---
+        let ep2_out = ep_by_dci(compute_dci(2, false)); // DCI 4
+        assert_eq!(
+            ep_type(ep2_out.ep_dword1),
+            EP_TYPE_BULK_OUT,
+            "EP2 OUT must be Bulk OUT (EP_TYPE_BULK_OUT = {})",
+            EP_TYPE_BULK_OUT
+        );
+        assert_eq!(
+            ep_max_packet_size(ep2_out.ep_dword1),
+            512,
+            "EP2 OUT bulk MPS must be 512"
+        );
+
+        // --- EP2 IN Bulk: DCI = 2*2 + 1 = 5 ---
+        let ep2_in = ep_by_dci(compute_dci(2, true)); // DCI 5
+        assert_eq!(
+            ep_type(ep2_in.ep_dword1),
+            EP_TYPE_BULK_IN,
+            "EP2 IN must be Bulk IN (EP_TYPE_BULK_IN = {})",
+            EP_TYPE_BULK_IN
+        );
+        assert_eq!(
+            ep_max_packet_size(ep2_in.ep_dword1),
+            512,
+            "EP2 IN bulk MPS must be 512"
+        );
+
+        // Add Flags: A0 (Slot) + A3 (DCI 3) + A4 (DCI 4) + A5 (DCI 5), NOT A1 (EP0).
+        assert_ne!(cfg_snap.add_flags & (1 << 3), 0, "A3 (DCI 3) must be set");
+        assert_ne!(cfg_snap.add_flags & (1 << 4), 0, "A4 (DCI 4) must be set");
+        assert_ne!(cfg_snap.add_flags & (1 << 5), 0, "A5 (DCI 5) must be set");
+        assert_eq!(
+            cfg_snap.add_flags & (1 << 1),
+            0,
+            "A1 (EP0) must NOT be set in Configure Endpoint"
         );
     }
 

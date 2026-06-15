@@ -115,6 +115,38 @@ static REMOTE_NIC_REGISTERED: AtomicBool = AtomicBool::new(false);
 /// the Phase 55b D.4b / F.2b semantics for the block path.
 static RESTART_SUSPECTED: AtomicBool = AtomicBool::new(false);
 
+// ---------------------------------------------------------------------------
+// TX-drop diagnostics (bare-metal visible)
+// ---------------------------------------------------------------------------
+//
+// The kernel `log::warn!` lines on the TX-drop paths are serial-only, which is
+// invisible on a bare-metal boot (no serial cable). These lock-free counters
+// let the `[net]` framebuffer heartbeat surface *where* outbound frames are
+// being dropped, so a wedge is attributable on a physical screen instead of
+// guessed at. See `tx_drop_counts`.
+
+/// `send_frame` dropped a frame because `tx_queue` was at `TX_QUEUE_DEPTH`.
+static TX_DROP_RINGFULL: AtomicU32 = AtomicU32::new(0);
+/// `send_frame` dropped a frame because `RESTART_SUSPECTED` was latched.
+static TX_DROP_RESTARTING: AtomicU32 = AtomicU32::new(0);
+/// `drain_tx_queue` found the driver's TX endpoint backlog at capacity
+/// (`TX_QUEUE_DEPTH` queued sends) — the polled driver is behind on draining.
+/// The undelivered tail is re-queued (not dropped at the kernel; TCP/ARP
+/// retransmit anything that overflows the bounded queue), so a climbing `si`
+/// is the TX-backpressure signal on the `[net] txdrop` heartbeat.
+static TX_SEND_INTERRUPTED: AtomicU32 = AtomicU32::new(0);
+
+/// Snapshot the TX-drop diagnostic counters: `(ringfull, restarting,
+/// interrupted, restart_suspected)`. Read by the `[net]` heartbeat.
+pub fn tx_drop_counts() -> (u32, u32, u32, bool) {
+    (
+        TX_DROP_RINGFULL.load(Ordering::Relaxed),
+        TX_DROP_RESTARTING.load(Ordering::Relaxed),
+        TX_SEND_INTERRUPTED.load(Ordering::Relaxed),
+        RESTART_SUSPECTED.load(Ordering::Acquire),
+    )
+}
+
 /// Deduplicate the "driver absent" warn log on the `send_frame` hot path.
 /// Set when the first absent-driver warn is emitted; cleared on `register`.
 /// Subsequent `send_frame` calls during the same restart window skip the
@@ -335,6 +367,7 @@ impl RemoteNic {
         // If a previous IPC drain detected an endpoint closure, surface
         // DriverRestarting immediately — the TX queue is cleared on restart.
         if RESTART_SUSPECTED.load(Ordering::Acquire) {
+            TX_DROP_RESTARTING.fetch_add(1, Ordering::Relaxed);
             log::warn!(
                 "[remote_nic] send_frame: driver restart suspected, returning DriverRestarting"
             );
@@ -354,6 +387,7 @@ impl RemoteNic {
             }
         };
         if entry.tx_queue.len() >= TX_QUEUE_DEPTH {
+            TX_DROP_RINGFULL.fetch_add(1, Ordering::Relaxed);
             log::warn!(
                 "[remote_nic] send_frame: TX queue full ({} frames) — dropping",
                 TX_QUEUE_DEPTH
@@ -395,18 +429,33 @@ impl RemoteNic {
             Some(id) => id,
             None => return 0,
         };
-        let (endpoint, frames) = {
-            let mut nics = REMOTE_NIC.lock();
-            let entry = match nics.first_mut() {
-                Some(e) => e,
+
+        // Peek the driver endpoint (without draining the queue yet).
+        let endpoint = {
+            let nics = REMOTE_NIC.lock();
+            match nics.first() {
+                Some(e) => e.endpoint,
                 None => return 0,
-            };
-            let ep = entry.endpoint;
-            let frames: alloc::vec::Vec<_> = entry.tx_queue.drain(..).collect();
-            (ep, frames)
+            }
+        };
+
+        // Drain the whole TX queue. Each frame is handed to the driver endpoint
+        // via `send_tx_owned`, which carries the frame's bytes *inside* its
+        // queued `PendingSend` — so many frames can sit on the endpoint at once
+        // and the polled driver drains a batch per loop iteration. The send
+        // never blocks (no deadlock with the driver's RX publish) and never
+        // reuses a shared bulk slot mid-flight (no corruption). This replaced
+        // the single-`pending_bulk`-slot rendezvous whose one-frame-in-flight
+        // serialization first stalled, then dropped, the SSH banner on bare
+        // metal (Phase 96).
+        let frames: alloc::vec::Vec<_> = {
+            let mut nics = REMOTE_NIC.lock();
+            match nics.first_mut() {
+                Some(e) => e.tx_queue.drain(..).collect(),
+                None => return 0,
+            }
         };
         let mut forwarded = 0usize;
-        let total = frames.len();
         for (idx, frame) in frames.iter().enumerate() {
             let header = NetFrameHeader {
                 kind: NET_SEND_FRAME,
@@ -414,36 +463,58 @@ impl RemoteNic {
                 flags: 0,
             };
             let hdr_bytes = encode_net_send(header);
-            // Deliver header + frame through the IPC send_bulk path. Since
-            // this runs in the kernel net task (not an ISR), blocking briefly
-            // while the driver loop catches up is acceptable.
             let mut bulk = alloc::vec::Vec::with_capacity(hdr_bytes.len() + frame.len());
             bulk.extend_from_slice(&hdr_bytes);
             bulk.extend_from_slice(frame);
             let bulk_len = bulk.len();
-            scheduler::deliver_bulk(task_id, bulk);
             let msg = Message::with2(NET_SEND_FRAME as u64, 0, bulk_len as u64);
-            if endpoint::send(task_id, endpoint, msg) {
-                forwarded += 1;
-            } else {
-                // First IPC failure: mark restart-suspected and stop draining.
-                // Continuing would overwrite the bulk buffer on every iteration
-                // and emit one warn line per remaining frame; the driver is
-                // already presumed down, so remaining frames are dropped and
-                // future send_frame() calls will surface DriverRestarting until
-                // the driver re-registers.
-                let dropped = total.saturating_sub(idx + 1);
-                log::warn!(
-                    "[remote_nic] drain_tx_queue: IPC send failed after {} forwarded, \
-                     dropping {} remaining — marking restart-suspected",
-                    forwarded,
-                    dropped,
-                );
-                Self::on_ipc_error();
-                break;
+            match endpoint::send_tx_owned(task_id, endpoint, msg, bulk, TX_QUEUE_DEPTH) {
+                Ok(()) => forwarded += 1,
+                Err(()) => {
+                    if !endpoint::is_open(endpoint) {
+                        // Endpoint closed — the driver really went away. Latch
+                        // restart-suspected so `send_frame` fast-fails until the
+                        // driver re-registers, exactly as before.
+                        let dropped = frames.len().saturating_sub(idx);
+                        log::warn!(
+                            "[remote_nic] drain_tx_queue: endpoint closed after {} forwarded, \
+                             dropping {} remaining — marking restart-suspected",
+                            forwarded,
+                            dropped,
+                        );
+                        Self::on_ipc_error();
+                    } else {
+                        // TX backlog at capacity — the polled driver is behind.
+                        // Re-queue the undelivered tail (this frame inclusive)
+                        // and stop; TCP/ARP retransmit anything that overflows
+                        // the bounded queue. `si` surfaces this as TX backpressure
+                        // on the `[net] txdrop` heartbeat.
+                        TX_SEND_INTERRUPTED.fetch_add(1, Ordering::Relaxed);
+                        Self::requeue_front(&frames[idx..]);
+                    }
+                    break;
+                }
             }
         }
         forwarded
+    }
+
+    /// Re-queue undelivered TX frames at the FRONT of the queue, preserving
+    /// original order ahead of anything enqueued meanwhile. Bounded by
+    /// `TX_QUEUE_DEPTH`; overflow is dropped (TCP/ARP will retransmit).
+    fn requeue_front(frames: &[alloc::vec::Vec<u8>]) {
+        if frames.is_empty() {
+            return;
+        }
+        let mut nics = REMOTE_NIC.lock();
+        if let Some(entry) = nics.first_mut() {
+            for frame in frames.iter().rev() {
+                if entry.tx_queue.len() >= TX_QUEUE_DEPTH {
+                    break;
+                }
+                entry.tx_queue.push_front(frame.clone());
+            }
+        }
     }
 
     /// Mark the driver as restart-suspected after an IPC transport failure.

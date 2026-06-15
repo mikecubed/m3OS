@@ -254,6 +254,14 @@ pub(super) struct PendingSend {
     /// `true` if this is a `call` — the sender expects a reply cap to be
     /// inserted into the server's capability table.
     pub(super) wants_reply: bool,
+    /// Phase 96: fire-and-forget net-TX payload owned by *this* queued send,
+    /// rather than the sender's single shared `pending_bulk` slot. `Some` only
+    /// for [`send_tx_owned`]. Owning the bytes here lets **many** TX frames
+    /// queue on one endpoint at once without the single-slot overwrite hazard,
+    /// and signals the recv path to deliver these bytes directly and skip
+    /// `complete_send`/wake (the sender never blocked). `None` for every
+    /// rendezvous send.
+    pub(super) owned_bulk: Option<Vec<u8>>,
 }
 
 /// Sender stranded on an endpoint that closed while it was blocked.
@@ -382,35 +390,19 @@ pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
             // exists for `deliver_message`; the recipient will read its own
             // `pending_msg` via `take_message` after this match arm returns.
             scheduler::deliver_message(receiver, pending.msg);
-            let _ = transfer_bulk(pending.task, receiver);
             crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::MessageDelivered {
                 task_idx: receiver.0 as u32,
                 ep: ep_id.0 as u32,
             });
-            if !pending.wants_reply {
-                // Phase 57e Bug #12 — bracket only the load-bearing
-                // `complete_send + wake_task_v2` atomic.  `complete_send`
-                // drops `scheduler_lock`; without the bracket, that drop's
-                // `preempt_enable` can zero-cross `preempt_count` and
-                // synchronously yield under preempt-full before `wake_task_v2`
-                // runs, leaving the sender with `send_completed=true` but not
-                // enqueued (Bug #8 lost-wakeup).  Shrunk from the original
-                // Phase 57e Bug #8 bracket so non-load-bearing work
-                // (`deliver_message` to current task, `transfer_bulk`,
-                // `trace_event`) no longer blocks IRQ-driven preemption.
-                //
-                // Bug #12 part 5: `preempt_enable` itself now defers the
-                // reschedule globally (no eager-yield), so the bracket exit
-                // is safe to leave as plain `preempt_enable`.  The bracket
-                // is still load-bearing for the H7 lost-wake protection —
-                // it pins the holder above zero-cross between
-                // `complete_send` and `wake_task_v2`.
-                crate::task::scheduler::preempt_disable();
-                scheduler::complete_send(pending.task);
-                // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
-                let _ = crate::task::scheduler::wake_task_v2(pending.task);
-                crate::task::scheduler::preempt_enable();
-            }
+            // Deliver the bulk and (for a rendezvous send) complete + wake the
+            // blocked sender. See `finalize_sender_bulk` for the Bug #8/#12
+            // preempt-bracket rationale and the fire-and-forget TX case.
+            finalize_sender_bulk(
+                pending.owned_bulk.take(),
+                pending.task,
+                pending.wants_reply,
+                receiver,
+            );
         }
         None => {
             // Block; sender will call deliver_message + wake_task on us.
@@ -515,19 +507,19 @@ pub fn recv_msg_nowait(receiver: TaskId, ep_id: EndpointId) -> Option<Message> {
     // the bracket.  Only `complete_send + wake_task_v2` (the sender wake)
     // needs the Bug #8 atomic protection.  See `recv_msg` for full rationale.
     scheduler::deliver_message(receiver, pending.msg);
-    let _ = transfer_bulk(pending.task, receiver);
     crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::MessageDelivered {
         task_idx: receiver.0 as u32,
         ep: ep_id.0 as u32,
     });
-    if !pending.wants_reply {
-        crate::task::scheduler::preempt_disable();
-        scheduler::complete_send(pending.task);
-        // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
-        let _ = crate::task::scheduler::wake_task_v2(pending.task);
-        // Bug #12 part 4: defer reschedule instead of eager-yielding.
-        crate::task::scheduler::preempt_enable();
-    }
+    // Deliver the bulk and (for a rendezvous send) complete + wake the blocked
+    // sender. Fire-and-forget TX sends (`owned_bulk: Some`) deliver their bytes
+    // directly and skip the wake — this is the polled-driver TX drain path.
+    finalize_sender_bulk(
+        pending.owned_bulk.take(),
+        pending.task,
+        pending.wants_reply,
+        receiver,
+    );
 
     scheduler::take_message(receiver)
 }
@@ -634,18 +626,16 @@ pub fn recv_msg_with_notif(
                 pending.msg = pending.msg.with_reply_cap_handle(handle);
             }
 
-            // Receiver is current task — see `recv_msg` for the rationale on
-            // why only `complete_send + wake_task_v2` lives inside the bracket.
+            // Receiver is current task — see `finalize_sender_bulk` for the
+            // rationale on why only `complete_send + wake_task_v2` lives inside
+            // the preempt bracket, and the fire-and-forget TX case.
             scheduler::deliver_message(receiver, pending.msg);
-            let _ = transfer_bulk(pending.task, receiver);
-            if !pending.wants_reply {
-                crate::task::scheduler::preempt_disable();
-                scheduler::complete_send(pending.task);
-                // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
-                let _ = crate::task::scheduler::wake_task_v2(pending.task);
-                // Bug #12 part 4: defer reschedule instead of eager-yielding.
-                crate::task::scheduler::preempt_enable();
-            }
+            finalize_sender_bulk(
+                pending.owned_bulk.take(),
+                pending.task,
+                pending.wants_reply,
+                receiver,
+            );
 
             match scheduler::take_message(receiver) {
                 Some(msg) => (RECV_KIND_MESSAGE, msg),
@@ -741,6 +731,43 @@ fn transfer_bulk(src: TaskId, dst: TaskId) -> bool {
     }
 }
 
+/// Finalize a popped sender's bulk delivery and send-completion.
+///
+/// Two cases, distinguished by `owned_bulk`:
+///
+/// - **Fire-and-forget net TX** (`owned_bulk: Some`): the frame bytes ride in
+///   the `PendingSend` itself ([`send_tx_owned`]). Deliver them straight to the
+///   receiver and do **not** run `complete_send`/wake — the sender never
+///   blocked, so there is nothing to complete and no waiter to fire.
+/// - **Rendezvous send** (`owned_bulk: None`): pull the bulk from the sender's
+///   shared `pending_bulk` slot (the historical path) and, for a `!wants_reply`
+///   send, run the Bug #8/#12 atomic `complete_send + wake_task_v2` that wakes
+///   the blocked sender.
+///
+/// Taking the individual fields (rather than `&mut PendingSend`) keeps this
+/// callable after the caller has already moved `pending.msg` into
+/// `deliver_message` — a partial move that would otherwise forbid re-borrowing
+/// the whole struct.
+fn finalize_sender_bulk(
+    owned_bulk: Option<Vec<u8>>,
+    sender: TaskId,
+    wants_reply: bool,
+    receiver: TaskId,
+) {
+    if let Some(bulk) = owned_bulk {
+        scheduler::deliver_bulk(receiver, bulk);
+        return;
+    }
+    let _ = transfer_bulk(sender, receiver);
+    if !wants_reply {
+        crate::task::scheduler::preempt_disable();
+        scheduler::complete_send(sender);
+        // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
+        let _ = crate::task::scheduler::wake_task_v2(sender);
+        crate::task::scheduler::preempt_enable();
+    }
+}
+
 // Phase 57d follow-up: the previous `log_bulk_mismatch` warning was
 // over-eager. It fired when `pending.msg.data[1] != 0 && !transferred`
 // — which is correct for `ipc_send_with_bulk` (where `data[1]` is the
@@ -753,6 +780,93 @@ fn transfer_bulk(src: TaskId, dst: TaskId) -> bool {
 // receiver-side workaround in `display_server::client::decode_message`
 // now handles the original symptom (24-byte bulk with 8-byte
 // CommitSurface frame), so this site no longer needs to alarm.
+
+/// Remove the current sender's stranded `PendingSend` from an endpoint's queue.
+///
+/// Called when a blocked send is abandoned (interrupted, endpoint closed, or
+/// timed out) so the orphaned entry cannot later pair with a *different*
+/// caller's bulk payload — `PendingSend` only references the message, while the
+/// bulk rides in the sender task's single `pending_bulk` slot. Mirrors
+/// `call_msg`'s deadline cleanup and `cancel_task_wait`. No-op if a receiver
+/// already consumed it.
+pub fn remove_stranded_send(sender: TaskId, ep_id: EndpointId) {
+    let mut reg = ENDPOINTS.lock();
+    if let Some(ep) = reg.get_mut(ep_id) {
+        ep.senders.retain(|p| p.task != sender);
+    }
+}
+
+/// Fire-and-forget net-TX send whose frame bytes are **owned by the queued
+/// send** rather than the sender's single shared `pending_bulk` slot.
+///
+/// This is the Phase 96 fix for the TX serialization that first stalled, then
+/// dropped, the SSH banner on bare metal. The ring-3 NIC drivers are *polled*
+/// (`try_handle_next` / `try_recv`) and spend most of each loop iteration
+/// blocked in synchronous USB/MMIO calls, so they are almost never sitting in
+/// `recv` when the kernel net task sends. With the old single-slot rendezvous
+/// only **one** TX frame could be outstanding at a time, gated on the driver's
+/// next poll — under RX load the driver's loop period exceeds tens of ms, so a
+/// frame either blocked all other TX behind it (the 24 s banner stall) or was
+/// dropped before pickup (the banner never arriving).
+///
+/// Carrying the bytes in the `PendingSend` lets **many** frames queue on the
+/// endpoint at once; the driver drains a batch per poll. The send never blocks
+/// (so the producer↔producer deadlock with the driver's RX publish cannot
+/// occur), and the shared bulk slot is never reused mid-flight (so the frame
+/// cannot be corrupted).
+///
+/// Returns `Ok(())` when the frame was delivered to a waiting receiver or
+/// enqueued. Returns `Err(())` when the endpoint is closed, or its TX backlog
+/// already holds `max_backlog` queued sends — the caller distinguishes the two
+/// via [`is_open`]; on backlog overflow the frame is dropped and TCP/ARP
+/// retransmits.
+pub fn send_tx_owned(
+    sender: TaskId,
+    ep_id: EndpointId,
+    msg: Message,
+    bulk: Vec<u8>,
+    max_backlog: usize,
+) -> Result<(), ()> {
+    // Either hand the frame to a receiver already blocked in `recv` (the
+    // inline path below), or enqueue it owning its bytes. The backlog-full and
+    // enqueued cases return from inside the lock scope, so `bulk` / `msg` are
+    // moved on exactly one path and remain available to the inline path.
+    let receiver = {
+        let mut reg = ENDPOINTS.lock();
+        let ep = match reg.get_mut(ep_id) {
+            Some(e) if !e.closed => e,
+            _ => return Err(()),
+        };
+        if let Some(r) = ep.receivers.pop_front() {
+            r
+        } else if ep.senders.len() >= max_backlog {
+            // Backlog full — the polled driver is behind. Drop; TCP/ARP resend.
+            return Err(());
+        } else {
+            ep.senders.push_back(PendingSend {
+                task: sender,
+                msg,
+                wants_reply: false,
+                owned_bulk: Some(bulk),
+            });
+            return Ok(());
+        }
+    };
+
+    // A receiver was already blocked in `recv` — deliver the owned bulk inline
+    // and wake it. Fire-and-forget: the sender never blocks, so there is no
+    // `complete_send`. Bulk must land before the wake (see `send`).
+    scheduler::deliver_bulk(receiver, bulk);
+    crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::SendWake {
+        task_idx: receiver.0 as u32,
+        ep: ep_id.0 as u32,
+    });
+    crate::task::scheduler::preempt_disable();
+    scheduler::deliver_message(receiver, msg);
+    let _ = crate::task::scheduler::wake_task_v2(receiver);
+    crate::task::scheduler::preempt_enable();
+    Ok(())
+}
 
 /// Send a message to an endpoint.
 ///
@@ -776,6 +890,7 @@ pub fn send(sender: TaskId, ep_id: EndpointId, msg: Message) -> bool {
                 task: sender,
                 msg,
                 wants_reply: false,
+                owned_bulk: None,
             });
             (None, ep.on_pending_send)
         }
@@ -822,23 +937,40 @@ pub fn send(sender: TaskId, ep_id: EndpointId, msg: Message) -> bool {
                 task_idx: sender.0 as u32,
                 ep: ep_id.0 as u32,
             });
-            // Track F.1: migrate send block site to v2 protocol under sched-v2.
-            //
-            // Approach (c): block_current_on_send_v2 checks
-            // pending_msg.is_some() || send_completed as a fast-path before
-            // calling block_current_until, then clears send_completed on return.
-            // The v1 path remains for fallback.
+            // Block until picked up. A bare wake (no message delivered) returns
+            // here without the frame having been consumed; that is acceptable
+            // for the generic rendezvous (a request/reply caller issues one
+            // send at a time and does not reuse a shared bulk slot). The net TX
+            // drain — which DOES loop many bulk sends from one task — must use
+            // `send_tx_owned` instead, which carries each frame's bytes inside
+            // its own `PendingSend` so the shared `pending_bulk` slot is never
+            // reused mid-flight (and never blocks).
             let _ = scheduler::block_current_on_send_v2(sender);
             if let Some(msg) = scheduler::take_message(sender) {
                 debug_assert!(
                     msg.label == u64::MAX,
                     "[ipc] send: woke with unexpected pending message"
                 );
+                // Remove the stranded entry so it cannot later pair with a
+                // different caller's bulk (mirrors `call_msg`/`cancel_task_wait`).
+                remove_stranded_send(sender, ep_id);
                 return false;
             }
         }
     }
     true
+}
+
+/// Return `true` if the endpoint exists and is open (not closed).
+///
+/// Used to distinguish a *transient* `send` failure (an interrupted block on a
+/// still-live endpoint) from a *real* peer teardown (the endpoint was closed
+/// when its owning task exited). Callers that recover from transient send
+/// failures — e.g. `RemoteNic::drain_tx_queue` — must NOT treat the former as a
+/// driver restart, or a single spurious wake would permanently wedge the path.
+pub fn is_open(ep_id: EndpointId) -> bool {
+    let mut reg = ENDPOINTS.lock();
+    matches!(reg.get_mut(ep_id), Some(e) if !e.closed)
 }
 
 /// Call an endpoint: send a message and block waiting for a reply.
@@ -881,6 +1013,7 @@ pub fn call_msg(caller: TaskId, ep_id: EndpointId, msg: Message) -> Message {
                 task: caller,
                 msg,
                 wants_reply: true,
+                owned_bulk: None,
             });
             (None, ep.on_pending_send)
         }
@@ -1099,6 +1232,7 @@ pub fn call_msg_with_deadline(
                 task: caller,
                 msg,
                 wants_reply: true,
+                owned_bulk: None,
             });
             (None, ep.on_pending_send)
         }
@@ -1342,6 +1476,7 @@ pub fn send_with_cap(sender: TaskId, ep_id: EndpointId, mut msg: Message) -> boo
                 task: sender,
                 msg,
                 wants_reply: false,
+                owned_bulk: None,
             });
             (None, ep.on_pending_send)
         }
@@ -1388,16 +1523,13 @@ pub fn send_with_cap(sender: TaskId, ep_id: EndpointId, mut msg: Message) -> boo
                 task_idx: sender.0 as u32,
                 ep: ep_id.0 as u32,
             });
-            // Track F.1: migrate send_with_cap block site to v2 protocol.
-            //
-            // Approach (c): same as the send() block site above. The v1 path
-            // remains for fallback.
             let _ = scheduler::block_current_on_send_v2(sender);
             if let Some(msg) = scheduler::take_message(sender) {
                 debug_assert!(
                     msg.label == u64::MAX,
                     "[ipc] send_with_cap: woke with unexpected pending message"
                 );
+                remove_stranded_send(sender, ep_id);
                 return false;
             }
         }

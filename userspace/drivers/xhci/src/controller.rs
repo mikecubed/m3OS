@@ -82,6 +82,21 @@ const IMAN_IE: u32 = 1 << 1;
 /// ERDP bit 3 — Event Handler Busy (RW1C; write 1 to clear after draining).
 const ERDP_EHB: u64 = 1 << 3;
 
+/// Tight event-ring polls performed BEFORE falling back to 1 ms sleep-polling in
+/// the completion waits (command / control-transfer / bulk-OUT).
+///
+/// USB transfers complete in microseconds, but the kernel timer granularity is
+/// 1 ms, so `nanosleep_for(0, 1_000_000)` cannot sleep less than ~1 ms. With a
+/// pure sleep-poll EVERY transfer that isn't already complete on the first check
+/// eats a full ~1 ms — and the ring-3 NIC driver issues many USB ops per loop
+/// iteration, so that 1 ms quantum compounds into the interactive SSH lag and
+/// "freezes when typing fast" backpressure observed on bare metal. A brief
+/// busy-poll on the (cache-coherent) event ring catches the common fast
+/// completion in microseconds; genuinely slow or absent completions still fall
+/// through to the bounded 1 ms sleep phase, so the timeout behaviour is
+/// unchanged. Empty polls are cheap (event-ring memory reads, no MMIO writes).
+const COMPLETION_SPIN_POLLS: u32 = 4000;
+
 // ---------------------------------------------------------------------------
 // Extended-capability IDs (xECP walk)
 // ---------------------------------------------------------------------------
@@ -105,6 +120,16 @@ const RING_BYTES: usize = RING_TRBS * trb::TRB_SIZE;
 /// the ERST, and contexts.
 const XHCI_ALIGN: usize = 64;
 
+/// Number of Normal TRBs an **IN** endpoint keeps outstanding at once (Phase 96
+/// RX-wedge work). Each TRB points at its own buffer in the endpoint's cyclic
+/// `data_bufs` ring, so the device always has somewhere to DMA the next frame
+/// even while the host is busy draining a TX burst and slow to re-arm. A depth
+/// of 1 (the original design) let the RTL8156's RX FIFO back up under TX load —
+/// the device completed a transfer, the host could not re-arm before the next
+/// frame arrived, and the dongle's MAC stalled with no USB error. Well under
+/// the `RING_TRBS - 1` usable ring slots. OUT endpoints use a depth of 1.
+const RX_QUEUE_DEPTH: usize = 4;
+
 /// Device context size: Slot + 31 EP contexts (32 entries total).
 /// With entry_size=32: 32*32 = 1024 bytes; with entry_size=64: 2048 bytes.
 const DEVICE_CONTEXT_ENTRIES: usize = 32;
@@ -112,10 +137,36 @@ const DEVICE_CONTEXT_ENTRIES: usize = 32;
 /// device-context entries: total (DEVICE_CONTEXT_ENTRIES + 1) entries.
 const INPUT_CONTEXT_ENTRIES: usize = DEVICE_CONTEXT_ENTRIES + 1;
 
-/// Bounded spin budget for the reset / CNR / halt handshakes. QEMU clears the
-/// relevant bit within a handful of reads; a few hundred thousand iterations
-/// is a generous ceiling that still terminates if the controller wedges.
-const POLL_BUDGET: u32 = 5_000_000;
+/// Real-time poll budget for register handshakes, in 100µs iterations.
+///
+/// The old fixed-iteration busy-spin (5M tight MMIO reads, no yield) was a
+/// bare-metal trap: a controller whose status bit never flips — e.g. an empty
+/// or D3/unpowered Thunderbolt/TCSS root port returning all-ones — burned
+/// ~5 s of pure CPU per loop, and with one such loop per port across a 22-port
+/// controller that stalled the *single-threaded* driver for minutes before it
+/// reached `server::run`. Every other ring-3 task (the NIC's `ure`, the HID
+/// driver) blocks on its first `NextAttach` IPC until then, so the whole USB
+/// subsystem looks hung. `poll_yield` instead sleeps 100µs per iteration:
+/// the CPU is released to those tasks, and the worst case is a bounded
+/// wall-clock timeout rather than a multi-second spin. 1 s covers the slow
+/// CNR-clear after `HCRST` (xHCI allows the controller to stay Not-Ready for a
+/// while); 250 ms covers a USB2 port reset's PRC latch.
+const POLL_ITERS_1S: u32 = 10_000;
+const POLL_ITERS_250MS: u32 = 2_500;
+
+/// Poll `ready` every 100µs, yielding the CPU, until it returns `true` or
+/// `max_iters` elapse. Returns whether `ready` ultimately held. Unlike a tight
+/// fixed-iteration spin, each iteration sleeps so a wedged register cannot starve
+/// the other ring-3 tasks waiting on this driver's IPC server.
+fn poll_yield(max_iters: u32, mut ready: impl FnMut() -> bool) -> bool {
+    for _ in 0..max_iters {
+        if ready() {
+            return true;
+        }
+        let _ = syscall_lib::nanosleep_for(0, 100_000);
+    }
+    ready()
+}
 
 /// Outcome of the bring-up sequence: either the controller is live (with the
 /// IRQ subscription handed to the event loop) or a stage failed.
@@ -131,14 +182,28 @@ pub enum BringUpError {
 // Per-slot device context bookkeeping
 // ---------------------------------------------------------------------------
 
-/// A configured interrupt-IN/OUT endpoint on a slot. Phase 78c: owns the
-/// endpoint's transfer ring, its producer cursor, and a persistent DMA buffer
-/// the controller writes each report into. Captured reports queue here until a
-/// class driver polls them.
+/// A configured non-EP0 endpoint on a slot. Phase 78c: owns the endpoint's
+/// transfer ring, its producer cursor, and persistent DMA buffers the
+/// controller writes each report into. Captured reports queue here until a
+/// class driver polls them. Phase 96 reuses this for **bulk** endpoints too —
+/// the differences are frame-sized `data_bufs` (vs HID's `mps`) and the
+/// `armed_len` the TRBs are programmed with; direction is derived from `dci`
+/// parity (odd = IN, even = OUT, per `trb::dci`).
+///
+/// Phase 96 RX-wedge work: an IN endpoint keeps **`depth` Normal TRBs
+/// outstanding** at once, each pointing at its own buffer in the cyclic
+/// `data_bufs` ring, so the device always has somewhere to DMA the next frame.
+/// A single-TRB queue let the RTL8156's internal RX FIFO back up under TX load
+/// (the host could not re-arm fast enough between the device's back-to-back
+/// completions), stalling its MAC with no USB error. OUT endpoints use `depth`
+/// = 1 (only `data_bufs[0]`, the bulk-OUT source buffer). Completions on a
+/// single endpoint ring are delivered in enqueue order, so `arm_next` /
+/// `drain_next` track the cyclic buffer in lockstep without matching TRB
+/// pointers.
 pub struct InterruptEndpoint {
     /// Device Context Index of this endpoint.
     pub dci: u8,
-    /// `wMaxPacketSize` — the size of one report / the Normal-TRB length.
+    /// `wMaxPacketSize` — the HID report size / the interrupt Normal-TRB length.
     pub mps: u16,
     /// Transfer ring for this endpoint (kept alive for the slot's lifetime).
     ring: DmaBuffer<u8>,
@@ -146,12 +211,28 @@ pub struct InterruptEndpoint {
     ring_iova: u64,
     /// Producer cursor for `ring`.
     producer: trb::ProducerRing,
-    /// DMA buffer the controller writes each interrupt-IN report into.
-    data_buf: DmaBuffer<u8>,
-    /// FIFO of captured reports awaiting a class-driver poll (bounded).
+    /// Cyclic ring of DMA buffers, one per outstanding IN TRB (`depth` of them).
+    /// The controller writes each interrupt-IN report / bulk-IN frame into the
+    /// buffer its TRB points at. `data_bufs[0]` is also the bulk-OUT source
+    /// buffer. Grown on demand for bulk (always while a buffer is free).
+    data_bufs: alloc::vec::Vec<DmaBuffer<u8>>,
+    /// FIFO of captured reports/frames awaiting a class-driver poll (bounded).
     reports: alloc::collections::VecDeque<alloc::vec::Vec<u8>>,
-    /// `true` once a Normal TRB is pending on the ring.
-    armed: bool,
+    /// Number of Normal TRBs currently armed-but-not-yet-completed (`<= depth`).
+    in_flight: usize,
+    /// Index in `data_bufs` of the next buffer to arm a TRB into.
+    arm_next: usize,
+    /// Index in `data_bufs` of the next buffer expected to complete (drain
+    /// order matches arm order on a single ring).
+    drain_next: usize,
+    /// Target number of outstanding IN TRBs: `RX_QUEUE_DEPTH` for IN endpoints
+    /// (odd `dci`), 1 for OUT endpoints (even `dci`).
+    depth: usize,
+    /// Byte length the currently-pending Normal TRBs were programmed with.
+    /// Equals `mps` for interrupt endpoints; a frame-sized value for bulk-IN.
+    /// Capture and re-arm both use this so a bulk endpoint is not re-armed at
+    /// `mps`.
+    armed_len: u32,
 }
 
 /// Per-slot DMA context allocated during Address Device.
@@ -173,6 +254,15 @@ pub struct SlotContext {
     /// owning its transfer ring + report buffer. Populated during Configure
     /// Endpoint (Phase 78c).
     pub interrupt_eps: alloc::vec::Vec<InterruptEndpoint>,
+    /// Reusable EP0 control-transfer data-stage scratch buffer, grown on demand.
+    /// `control_transfer` reuses this across calls instead of allocating a fresh
+    /// `DmaBuffer` each time — `DmaBuffer::drop` is a no-op (the kernel reclaims
+    /// the DMA region on process exit), so a per-call allocation leaks an IOVA +
+    /// device-host DMA cap for the driver's whole lifetime. The ure NIC driver
+    /// polls registers via OCP control reads continuously, so that unbounded
+    /// growth would eventually exhaust the device-host DMA cap table. `None`
+    /// until the first data-stage transfer on this slot.
+    pub ep0_data_buf: Option<DmaBuffer<u8>>,
 }
 
 pub struct Controller {
@@ -208,7 +298,16 @@ pub struct Controller {
     /// served — every per-slot operation looks up its `SlotContext` by
     /// `slot_id`, so a second device never clobbers the first.
     slots: alloc::vec::Vec<SlotContext>,
+
+    /// Bounded counter for the transfer-error diagnostic (see
+    /// `service_interrupt_events`) so a halted endpoint logs a few times rather
+    /// than flooding the serial/framebuffer console.
+    xfer_err_logged: u32,
 }
+
+/// xHCI completion code for a short-packet transfer (xHCI §6.4.5) — a normal,
+/// non-error outcome for a bulk-IN read smaller than the armed buffer.
+const COMPLETION_SHORT_PACKET: u8 = 13;
 
 impl Controller {
     /// Read the capability registers and compute the runtime register-region
@@ -245,6 +344,7 @@ impl Controller {
             consumer: trb::EventConsumer::new(&[RING_TRBS]),
             enable_slot_emitted: false,
             slots: alloc::vec::Vec::new(),
+            xfer_err_logged: 0,
         }
     }
 
@@ -260,6 +360,19 @@ impl Controller {
 
     pub fn max_ports(&self) -> u8 {
         self.max_ports
+    }
+
+    /// Live `PORTSC` snapshot for a 1-based root-hub `port`, packed into the
+    /// `TopoPort` wire flag byte (bit0 CCS, bit1 PED, bit2 PP, bits4..8 the
+    /// Port Speed PSI). Read-only — used by the `Topology` diagnostic to
+    /// surface, on bare metal, which controller a connected device sits on and
+    /// what speed it trained to. Returns `0` for an out-of-range port.
+    pub fn port_status_flags(&self, port: u8) -> u8 {
+        if port == 0 || port > self.max_ports {
+            return 0;
+        }
+        let p = port::Portsc(self.op_u32(self.portsc(port)));
+        usb_core::protocol::TopoPort::pack(p.ccs(), p.ped(), p.pp(), p.port_speed())
     }
 
     /// Context entry size (32 or 64 bytes) selected from `HCCPARAMS1.CSZ`.
@@ -332,10 +445,9 @@ impl Controller {
             if id == XECP_ID_LEGACY {
                 if dword & USBLEGSUP_BIOS_OWNED != 0 {
                     self.bar.write_reg::<u32>(off, dword | USBLEGSUP_OS_OWNED);
-                    let mut budget = POLL_BUDGET;
-                    while self.bar.read_reg::<u32>(off) & USBLEGSUP_BIOS_OWNED != 0 && budget > 0 {
-                        budget -= 1;
-                    }
+                    poll_yield(POLL_ITERS_1S, || {
+                        self.bar.read_reg::<u32>(off) & USBLEGSUP_BIOS_OWNED == 0
+                    });
                     // If the BIOS-owned bit never cleared, the handoff failed.
                     // Treating the timeout as success would let bring-up proceed
                     // into HCRST/Run while the controller is still BIOS-owned —
@@ -375,27 +487,20 @@ impl Controller {
         if cmd & USBCMD_RS != 0 {
             self.op_write_u32(op_reg::USBCMD, cmd & !USBCMD_RS);
         }
-        let mut budget = POLL_BUDGET;
-        while self.op_u32(op_reg::USBSTS) & USBSTS_HCH == 0 {
-            if budget == 0 {
-                return Err(BringUpError::ResetTimeout);
-            }
-            budget -= 1;
+        if !poll_yield(POLL_ITERS_1S, || {
+            self.op_u32(op_reg::USBSTS) & USBSTS_HCH != 0
+        }) {
+            return Err(BringUpError::ResetTimeout);
         }
 
         // Reset: set HCRST, wait until it self-clears AND CNR clears.
         self.op_write_u32(op_reg::USBCMD, USBCMD_HCRST);
-        let mut budget = POLL_BUDGET;
-        loop {
+        if !poll_yield(POLL_ITERS_1S, || {
             let cmd = self.op_u32(op_reg::USBCMD);
             let sts = self.op_u32(op_reg::USBSTS);
-            if cmd & USBCMD_HCRST == 0 && sts & USBSTS_CNR == 0 {
-                break;
-            }
-            if budget == 0 {
-                return Err(BringUpError::ResetTimeout);
-            }
-            budget -= 1;
+            cmd & USBCMD_HCRST == 0 && sts & USBSTS_CNR == 0
+        }) {
+            return Err(BringUpError::ResetTimeout);
         }
         write_str(
             STDOUT_FILENO,
@@ -542,12 +647,10 @@ impl Controller {
             "[xhci] Bus Master Enable guaranteed by device claim (kernel B.1)\n",
         );
         self.op_write_u32(op_reg::USBCMD, USBCMD_RS | USBCMD_INTE);
-        let mut budget = POLL_BUDGET;
-        while self.op_u32(op_reg::USBSTS) & USBSTS_HCH != 0 {
-            if budget == 0 {
-                return Err(BringUpError::RunTimeout);
-            }
-            budget -= 1;
+        if !poll_yield(POLL_ITERS_1S, || {
+            self.op_u32(op_reg::USBSTS) & USBSTS_HCH == 0
+        }) {
+            return Err(BringUpError::RunTimeout);
         }
         write_str(STDOUT_FILENO, "[xhci] controller running\n");
         Ok(())
@@ -588,7 +691,7 @@ impl Controller {
     /// `producer` cursor and `ring_doorbell` primitive.
     pub fn issue_command_and_wait(
         &mut self,
-        irq: &IrqNotification,
+        _irq: &IrqNotification,
         cmd: trb::Trb,
     ) -> trb::CommandCompletionEvent {
         let ring = self.cmd_ring.as_ref().expect("command ring allocated");
@@ -606,60 +709,51 @@ impl Controller {
         }
         self.ring_doorbell(0, 0);
 
-        // Drain the event ring on each IRQ wake until we find the matching
-        // Command Completion Event. Bounded to avoid hanging if the controller
-        // wedges. A totally-silent controller (zero interrupts delivered) is
-        // still a known limitation pending a timeout-capable wait syscall.
-        const COMMAND_WAIT_WAKES: u32 = 128;
-        let mut wakes = 0u32;
-        loop {
-            let bits = irq.wait();
-            if bits == 0 {
-                wakes += 1;
-                if wakes >= COMMAND_WAIT_WAKES {
-                    write_str(
-                        STDOUT_FILENO,
-                        "[xhci] command timed out (no completion event)\n",
-                    );
-                    // Return a synthetic failure completion so enumeration can
-                    // transition to Error/Timeout rather than hanging.
-                    return trb::CommandCompletionEvent {
-                        command_trb_pointer: cmd_iova,
-                        completion_code: 0xFF, // synthetic: not COMPLETION_SUCCESS
-                        slot_id: 0,
-                        cycle: false,
-                    };
-                }
-                continue;
-            }
-            // Drain all pending events; collect our completion.
-            if let Some(ev) = self.drain_for_command_completion(cmd_iova) {
-                // Update ERDP + clear IMAN.IP.
+        // Drain the event ring on a bounded poll budget (~400 ms at 1 ms/poll)
+        // until the matching Command Completion Event appears. We poll rather
+        // than block on `irq.wait()`: on real hardware a controller may deliver
+        // **zero** MSI/MSI-X interrupts during bring-up (e.g. a Thunderbolt/TCSS
+        // xHCI whose vector isn't routed), and a blocking `irq.wait()` would then
+        // hang forever on the very first Enable Slot — wedging the whole
+        // single-threaded driver so `server::run` is never reached and every
+        // class driver (keyboard, NIC) blocks indefinitely. Polling makes a
+        // silent controller time out (synthetic failure → enumeration Error)
+        // instead, so the bring-up loop always completes. This mirrors
+        // `wait_for_transfer_event`'s bounded-poll design.
+        const MAX_POLLS: u32 = 400;
+        for poll_i in 0..(COMPLETION_SPIN_POLLS + MAX_POLLS) {
+            let before = self.consumer.index;
+            let found = self.drain_for_command_completion(cmd_iova);
+            // Only advance ERDP / clear IMAN.IP when the drain actually consumed
+            // events — an empty-poll ERDP write disturbs the controller's
+            // event-ring bookkeeping (see `wait_for_transfer_event`).
+            if self.consumer.index != before {
                 let erdp =
                     self.event_ring_iova + (self.consumer.index as u64) * trb::TRB_SIZE as u64;
                 self.rt_write_u64(rt_reg::ERDP, erdp | ERDP_EHB);
                 self.rt_write_u32(rt_reg::IMAN, IMAN_IP | IMAN_IE);
-                let _ = irq.ack(bits);
+            }
+            if let Some(ev) = found {
                 return ev;
             }
-            // Update ERDP even if we didn't find our event yet.
-            let erdp = self.event_ring_iova + (self.consumer.index as u64) * trb::TRB_SIZE as u64;
-            self.rt_write_u64(rt_reg::ERDP, erdp | ERDP_EHB);
-            self.rt_write_u32(rt_reg::IMAN, IMAN_IP | IMAN_IE);
-            let _ = irq.ack(bits);
-            wakes += 1;
-            if wakes >= COMMAND_WAIT_WAKES {
-                write_str(
-                    STDOUT_FILENO,
-                    "[xhci] command timed out (no completion event)\n",
-                );
-                return trb::CommandCompletionEvent {
-                    command_trb_pointer: cmd_iova,
-                    completion_code: 0xFF,
-                    slot_id: 0,
-                    cycle: false,
-                };
+            if poll_i < COMPLETION_SPIN_POLLS {
+                core::hint::spin_loop();
+            } else {
+                let _ = syscall_lib::nanosleep_for(0, 1_000_000);
             }
+        }
+
+        write_str(
+            STDOUT_FILENO,
+            "[xhci] command timed out (no completion event)\n",
+        );
+        // Return a synthetic failure completion so enumeration can transition to
+        // Error/Timeout rather than hanging.
+        trb::CommandCompletionEvent {
+            command_trb_pointer: cmd_iova,
+            completion_code: 0xFF, // synthetic: not COMPLETION_SUCCESS
+            slot_id: 0,
+            cycle: false,
         }
     }
 
@@ -716,19 +810,59 @@ impl Controller {
         setup: trb::SetupPacket,
         len: u16,
         dir_in: bool,
+        out_data: Option<&[u8]>,
     ) -> Option<alloc::vec::Vec<u8>> {
-        // Allocate a temporary data DMA buffer if data is expected.
-        let data_buf = if dir_in && len > 0 {
-            match DmaBuffer::<u8>::allocate(&self.handle, len as usize, XHCI_ALIGN) {
-                Ok(buf) => {
-                    zero_dma(&buf);
-                    Some(buf)
-                }
-                Err(_) => {
-                    write_str(STDOUT_FILENO, "[xhci] ctrl-xfer: data buf alloc failed\n");
+        // Stage the data-stage DMA buffer for any transfer that has one — IN
+        // reads receive into it; OUT writes copy the host payload in before the
+        // controller drains it (Phase 96 OCP register writes). Reuse the slot's
+        // persistent `ep0_data_buf` scratch (grown on demand) instead of a fresh
+        // allocation per call: `DmaBuffer::drop` is a no-op, so a per-call
+        // allocation leaks an IOVA + DMA cap every control transfer, and the ure
+        // NIC driver issues OCP control reads continuously. Returns the staged
+        // buffer's IOVA for the Data Stage TRB. `slot_id` is validated here so a
+        // bogus id from an untrusted IPC `ControlRequest` fails closed.
+        let data_iova = if len > 0 {
+            let need_grow = match self.slots.iter().find(|s| s.slot_id == slot_id) {
+                Some(sc) => sc.ep0_data_buf.as_ref().map(|b| b.len()).unwrap_or(0) < len as usize,
+                None => {
+                    write_str(
+                        STDOUT_FILENO,
+                        "[xhci] ctrl-xfer: unknown slot id — rejecting request\n",
+                    );
                     return None;
                 }
+            };
+            if need_grow {
+                let buf = match DmaBuffer::<u8>::allocate(&self.handle, len as usize, XHCI_ALIGN) {
+                    Ok(b) => b,
+                    Err(_) => {
+                        write_str(STDOUT_FILENO, "[xhci] ctrl-xfer: data buf alloc failed\n");
+                        return None;
+                    }
+                };
+                let Some(sc) = self.slots.iter_mut().find(|s| s.slot_id == slot_id) else {
+                    return None;
+                };
+                sc.ep0_data_buf = Some(buf);
             }
+            // Zero the scratch (so a stale IN read returns clean bytes) and copy
+            // the host→device payload in for an OUT transfer.
+            let Some(sc) = self.slots.iter().find(|s| s.slot_id == slot_id) else {
+                return None;
+            };
+            let buf = sc.ep0_data_buf.as_ref().expect("scratch grown above");
+            zero_dma(buf);
+            if !dir_in {
+                // `out_data.len()` is bounded to `len` (callers validate
+                // `wLength == data.len()`); clamp defensively anyway.
+                let src = out_data.unwrap_or(&[]);
+                let n = src.len().min(len as usize);
+                for (i, &b) in src.iter().take(n).enumerate() {
+                    // SAFETY: buf was grown to >= `len` bytes, i < n <= len.
+                    unsafe { core::ptr::write_volatile(buf.user_ptr().add(i), b) };
+                }
+            }
+            Some(buf.iova())
         } else {
             None
         };
@@ -772,9 +906,9 @@ impl Controller {
         }
 
         // Data Stage TRB (only for transfers with data)
-        if let Some(ref buf) = data_buf {
+        if let Some(iova) = data_iova {
             let cycle = sc.ep0_producer.cycle;
-            let data_trb = trb::Trb::data_stage(buf.iova(), len as u32, dir_in, cycle);
+            let data_trb = trb::Trb::data_stage(iova, len as u32, dir_in, cycle);
             write_trb(&sc.ep0_ring, sc.ep0_producer.enqueue, data_trb);
             let cycle_before = sc.ep0_producer.cycle;
             if sc.ep0_producer.advance() {
@@ -830,14 +964,23 @@ impl Controller {
                 // drain its event. This is fine for 78b enumeration, where every
                 // IN control read requests the descriptor's exact length; a
                 // future caller needing true short-read accounting must add ISP.
-                if let Some(buf) = data_buf {
+                // Only an IN transfer has device-to-host data to read back; an
+                // OUT transfer's scratch holds the payload we just sent, so
+                // returning it would echo the request — return an empty Vec.
+                if data_iova.is_some() && dir_in {
                     let residual = ev.residual_transfer_length.min(len as u32) as usize;
                     let actual = (len as usize).saturating_sub(residual);
                     let mut out = alloc::vec::Vec::with_capacity(actual);
-                    for i in 0..actual {
-                        // SAFETY: buf was allocated with `len` bytes, i < actual <= len.
-                        let byte = unsafe { core::ptr::read_volatile(buf.user_ptr().add(i)) };
-                        out.push(byte);
+                    // Re-borrow the slot's scratch buffer (the `wait_for_transfer_event`
+                    // above took `&mut self`, ending the earlier borrow).
+                    if let Some(sc) = self.slots.iter().find(|s| s.slot_id == slot_id)
+                        && let Some(buf) = sc.ep0_data_buf.as_ref()
+                    {
+                        for i in 0..actual {
+                            // SAFETY: buf was grown to >= `len` bytes, i < actual <= len.
+                            let byte = unsafe { core::ptr::read_volatile(buf.user_ptr().add(i)) };
+                            out.push(byte);
+                        }
                     }
                     Some(out)
                 } else {
@@ -857,46 +1000,43 @@ impl Controller {
         }
     }
 
-    /// Block for a Transfer Event targeting `slot_id` / `endpoint_id` (DCI).
-    /// Returns the first matching event or `None` after a bounded number of
-    /// IRQ wakes without a match.
+    /// Wait for a Transfer Event targeting `slot_id` / `endpoint_id` (DCI) by
+    /// **polling** the event ring (not blocking on `irq.wait()`). `notify_wait`
+    /// has no timeout, so a blocking wait deadlocks the single-threaded server
+    /// on a never-completing transfer or a coalesced/already-consumed IRQ (a
+    /// lost-wakeup race). Polling with a bounded budget (~400 ms) is race-free:
+    /// a completion already on the ring is seen on the first drain, and a stuck
+    /// transfer returns `None` instead of hanging the whole USB stack.
     fn wait_for_transfer_event(
         &mut self,
-        irq: &IrqNotification,
+        _irq: &IrqNotification,
         slot_id: u8,
         endpoint_id: u8,
     ) -> Option<trb::TransferEvent> {
-        // Bound the wait: after TRANSFER_WAIT_WAKES IRQ wakes without our
-        // event we give up and return None. This prevents infinite blocking if
-        // the controller misbehaves.
-        const TRANSFER_WAIT_WAKES: u32 = 128;
-        let mut wakes = 0u32;
-        loop {
-            let bits = irq.wait();
-            if bits == 0 {
-                wakes += 1;
-                if wakes >= TRANSFER_WAIT_WAKES {
-                    return None;
-                }
-                continue;
-            }
-            if let Some(ev) = self.drain_for_transfer_event(slot_id, endpoint_id) {
+        const MAX_POLLS: u32 = 400;
+        for poll_i in 0..(COMPLETION_SPIN_POLLS + MAX_POLLS) {
+            let before = self.consumer.index;
+            let found = self.drain_for_transfer_event(slot_id, endpoint_id);
+            // Only advance ERDP / clear IMAN.IP when the drain actually consumed
+            // events. Writing ERDP|EHB on every empty poll (e.g. during a dense
+            // run of control transfers) disturbs the controller's event-ring
+            // bookkeeping and can stall subsequent completions.
+            if self.consumer.index != before {
                 let erdp =
                     self.event_ring_iova + (self.consumer.index as u64) * trb::TRB_SIZE as u64;
                 self.rt_write_u64(rt_reg::ERDP, erdp | ERDP_EHB);
                 self.rt_write_u32(rt_reg::IMAN, IMAN_IP | IMAN_IE);
-                let _ = irq.ack(bits);
+            }
+            if let Some(ev) = found {
                 return Some(ev);
             }
-            let erdp = self.event_ring_iova + (self.consumer.index as u64) * trb::TRB_SIZE as u64;
-            self.rt_write_u64(rt_reg::ERDP, erdp | ERDP_EHB);
-            self.rt_write_u32(rt_reg::IMAN, IMAN_IP | IMAN_IE);
-            let _ = irq.ack(bits);
-            wakes += 1;
-            if wakes >= TRANSFER_WAIT_WAKES {
-                return None;
+            if poll_i < COMPLETION_SPIN_POLLS {
+                core::hint::spin_loop();
+            } else {
+                let _ = syscall_lib::nanosleep_for(0, 1_000_000);
             }
         }
+        None
     }
 
     /// Drain the event ring looking for a Transfer Event for `slot_id` /
@@ -982,6 +1122,7 @@ impl Controller {
             ep0_ring_iova,
             input_ctx,
             interrupt_eps: alloc::vec::Vec::new(),
+            ep0_data_buf: None,
         });
         Ok(())
     }
@@ -1085,12 +1226,23 @@ impl Controller {
             trb::Trb::link(iova, true, false),
         );
 
-        // Persistent buffer the controller writes reports into (at least 8
-        // bytes for a boot keyboard report).
+        // IN endpoints (odd dci) keep `RX_QUEUE_DEPTH` TRBs outstanding, each
+        // into its own buffer, so the device always has somewhere to DMA the
+        // next frame; OUT endpoints (even dci) only ever submit one transfer at
+        // a time, so a single buffer suffices.
+        let depth = if dci & 1 == 1 { RX_QUEUE_DEPTH } else { 1 };
+
+        // Persistent buffers the controller writes reports into (at least 8
+        // bytes each for a boot keyboard report). Bulk-IN grows them to a
+        // frame-sized length on the first arm.
         let data_len = (mps as usize).max(8);
-        let data_buf = DmaBuffer::<u8>::allocate(&self.handle, data_len, XHCI_ALIGN)
-            .map_err(|_| BringUpError::DmaAlloc)?;
-        zero_dma(&data_buf);
+        let mut data_bufs = alloc::vec::Vec::with_capacity(depth);
+        for _ in 0..depth {
+            let buf = DmaBuffer::<u8>::allocate(&self.handle, data_len, XHCI_ALIGN)
+                .map_err(|_| BringUpError::DmaAlloc)?;
+            zero_dma(&buf);
+            data_bufs.push(buf);
+        }
 
         let sc = self
             .slots
@@ -1103,9 +1255,13 @@ impl Controller {
             ring,
             ring_iova: iova,
             producer,
-            data_buf,
+            data_bufs,
             reports: alloc::collections::VecDeque::new(),
-            armed: false,
+            in_flight: 0,
+            arm_next: 0,
+            drain_next: 0,
+            depth,
+            armed_len: mps as u32,
         });
 
         // Return IOVA | DCS (DCS=1 means initial cycle state = true).
@@ -1119,38 +1275,105 @@ impl Controller {
     /// dropped first (a stale boot report is worthless next to a fresh one).
     const MAX_PENDING_REPORTS: usize = 16;
 
-    /// Enqueue a Normal TRB on (`slot_id`, `dci`)'s transfer ring (pointing at
-    /// its report buffer) and ring the slot doorbell so the controller delivers
-    /// the next interrupt-IN report. Returns `false` if no such endpoint exists.
-    pub fn arm_interrupt_in(&mut self, slot_id: u8, dci: u8) -> bool {
-        {
-            let Some(sc) = self.slot_mut(slot_id) else {
-                return false;
+    /// Top the (`slot_id`, `dci`) IN endpoint's queue back up to `depth`
+    /// outstanding Normal TRBs of `len` bytes each, one per free buffer in its
+    /// cyclic `data_bufs` ring, then ring the slot doorbell once so the
+    /// controller (re)starts delivering IN reports/frames. Each buffer is grown
+    /// to `len` if smaller (bulk-IN needs a frame-sized buffer, larger than a
+    /// HID `mps`) — always safe because only currently-free buffers (`arm_next`
+    /// chasing `drain_next`) are touched. Records `len` as `armed_len` so
+    /// capture and re-arm agree on the size. Idempotent: a no-op when already at
+    /// `depth`. Returns `false` if no such endpoint exists; a buffer-alloc
+    /// failure mid-fill stops early (leaving whatever was already armed) and
+    /// still rings the doorbell. This is the shared core of `arm_interrupt_in` /
+    /// `arm_bulk_in` and every re-arm site.
+    fn arm_ring_in(&mut self, slot_id: u8, dci: u8, len: u32) -> bool {
+        loop {
+            // Probe: locate the endpoint, decide whether there is a free slot to
+            // arm and whether the next buffer needs growing. Done in its own
+            // borrow scope so `&self.handle` (for allocation) and `&mut self`
+            // (for the ring write) don't overlap.
+            let (buf_idx, need_grow) = match self.slot(slot_id) {
+                Some(sc) => match sc.interrupt_eps.iter().find(|e| e.dci == dci) {
+                    Some(ep) if ep.in_flight >= ep.depth => break, // already full
+                    Some(ep) => (
+                        ep.arm_next,
+                        (len as usize) > ep.data_bufs[ep.arm_next].len(),
+                    ),
+                    None => return false,
+                },
+                None => return false,
             };
-            let Some(ep) = sc.interrupt_eps.iter_mut().find(|e| e.dci == dci) else {
-                return false;
-            };
-            zero_dma(&ep.data_buf);
-            let cycle = ep.producer.cycle;
-            write_trb(
-                &ep.ring,
-                ep.producer.enqueue,
-                trb::Trb::normal(ep.data_buf.iova(), ep.mps as u32, cycle),
-            );
-            let cycle_before = ep.producer.cycle;
-            if ep.producer.advance() {
-                let iova = ep.ring_iova;
+            if need_grow {
+                let new_buf =
+                    match DmaBuffer::<u8>::allocate(&self.handle, len as usize, XHCI_ALIGN) {
+                        Ok(buf) => buf,
+                        Err(_) => {
+                            write_str(STDOUT_FILENO, "[xhci] arm: bulk rx buf alloc failed\n");
+                            break; // keep whatever is already armed
+                        }
+                    };
+                let Some(sc) = self.slot_mut(slot_id) else {
+                    return false;
+                };
+                let Some(ep) = sc.interrupt_eps.iter_mut().find(|e| e.dci == dci) else {
+                    return false;
+                };
+                ep.data_bufs[buf_idx] = new_buf;
+            }
+            {
+                let Some(sc) = self.slot_mut(slot_id) else {
+                    return false;
+                };
+                let Some(ep) = sc.interrupt_eps.iter_mut().find(|e| e.dci == dci) else {
+                    return false;
+                };
+                zero_dma(&ep.data_bufs[buf_idx]);
+                let cycle = ep.producer.cycle;
                 write_trb(
                     &ep.ring,
-                    ep.producer.link_index(),
-                    trb::Trb::link(iova, true, cycle_before),
+                    ep.producer.enqueue,
+                    trb::Trb::normal(ep.data_bufs[buf_idx].iova(), len, cycle),
                 );
+                let cycle_before = ep.producer.cycle;
+                if ep.producer.advance() {
+                    let iova = ep.ring_iova;
+                    write_trb(
+                        &ep.ring,
+                        ep.producer.link_index(),
+                        trb::Trb::link(iova, true, cycle_before),
+                    );
+                }
+                ep.arm_next = (ep.arm_next + 1) % ep.depth;
+                ep.in_flight += 1;
+                ep.armed_len = len;
             }
-            ep.armed = true;
         }
-        // Doorbell after the mutable borrow ends (ring_doorbell takes &self).
+        // Doorbell after the mutable borrow ends (ring_doorbell takes &self). A
+        // single kick processes every TRB just queued.
         self.ring_doorbell(slot_id, dci);
         true
+    }
+
+    /// Top an interrupt-IN endpoint's queue up to `depth` Normal TRBs sized to
+    /// its `mps` (Phase 78c HID path). Returns `false` if no such endpoint
+    /// exists.
+    pub fn arm_interrupt_in(&mut self, slot_id: u8, dci: u8) -> bool {
+        let mps = match self
+            .slot(slot_id)
+            .and_then(|sc| sc.interrupt_eps.iter().find(|e| e.dci == dci))
+        {
+            Some(ep) => ep.mps as u32,
+            None => return false,
+        };
+        self.arm_ring_in(slot_id, dci, mps)
+    }
+
+    /// Top a bulk-IN endpoint's queue up to `depth` Normal TRBs sized to
+    /// `rx_len` (frame-sized), growing each free buffer if needed. Phase 96.
+    /// Returns `false` on failure.
+    pub fn arm_bulk_in(&mut self, slot_id: u8, dci: u8, rx_len: u32) -> bool {
+        self.arm_ring_in(slot_id, dci, rx_len)
     }
 
     /// Drain the event ring (non-blocking): capture interrupt-IN reports into
@@ -1170,6 +1393,25 @@ impl Controller {
             match trb::event_trb_type(&candidate) {
                 Some(trb::TrbType::TransferEvent) => {
                     let ev = trb::parse_transfer_event(&candidate);
+                    // DIAGNOSTIC: a non-success / non-short-packet completion on a
+                    // transfer endpoint means the endpoint likely HALTED (STALL=6,
+                    // transaction-error=4, babble=3, TRB-error=5). The current
+                    // re-arm path enqueues a fresh TRB on a halted endpoint, which
+                    // never runs — so RX wedges under TX load. Log the code so the
+                    // bare-metal failure is attributable; bounded to avoid flooding.
+                    if ev.completion_code != trb::COMPLETION_SUCCESS
+                        && ev.completion_code != COMPLETION_SHORT_PACKET
+                        && self.xfer_err_logged < 12
+                    {
+                        self.xfer_err_logged += 1;
+                        write_str(STDOUT_FILENO, "xhci: xfer ERR cc=");
+                        crate::write_u8_dec(ev.completion_code);
+                        write_str(STDOUT_FILENO, " slot=");
+                        crate::write_u8_dec(ev.slot_id);
+                        write_str(STDOUT_FILENO, " ep=");
+                        crate::write_u8_dec(ev.endpoint_id);
+                        write_str(STDOUT_FILENO, "\n");
+                    }
                     if self.capture_interrupt_report(ev) {
                         completed.push((ev.slot_id, ev.endpoint_id));
                     }
@@ -1190,15 +1432,27 @@ impl Controller {
         let erdp = self.event_ring_iova + (self.consumer.index as u64) * trb::TRB_SIZE as u64;
         self.rt_write_u64(rt_reg::ERDP, erdp | ERDP_EHB);
         self.rt_write_u32(rt_reg::IMAN, IMAN_IP | IMAN_IE);
-        // Re-arm every endpoint that just completed so the next report lands.
+        // Re-arm every endpoint that just completed so the next report/frame
+        // lands. Re-arm at the endpoint's last `armed_len` (preserving a bulk
+        // endpoint's frame-sized buffer) rather than at `mps`.
         for (slot_id, dci) in completed {
-            self.arm_interrupt_in(slot_id, dci);
+            let len = self
+                .slot(slot_id)
+                .and_then(|sc| sc.interrupt_eps.iter().find(|e| e.dci == dci))
+                .map(|e| e.armed_len)
+                .unwrap_or(0);
+            if len > 0 {
+                self.arm_ring_in(slot_id, dci, len);
+            }
         }
     }
 
-    /// Read the just-completed report out of `ev`'s endpoint buffer and push it
-    /// onto that endpoint's FIFO. Returns `true` if a matching endpoint was
-    /// found (so the caller re-arms it).
+    /// Read the just-completed report out of `ev`'s endpoint buffer (the one at
+    /// `drain_next` — completions arrive in arm order on a single ring) and push
+    /// it onto that endpoint's FIFO. Advances the drain cursor and decrements
+    /// `in_flight` so the caller's re-arm tops the queue back up to `depth`.
+    /// Returns `true` if a matching endpoint with an outstanding TRB was found
+    /// (so the caller re-arms it).
     fn capture_interrupt_report(&mut self, ev: trb::TransferEvent) -> bool {
         let Some(sc) = self.slot_mut(ev.slot_id) else {
             return false;
@@ -1210,10 +1464,24 @@ impl Controller {
         else {
             return false;
         };
-        ep.armed = false;
-        let mps = ep.mps as usize;
-        let residual = (ev.residual_transfer_length as usize).min(mps);
-        let len = mps.saturating_sub(residual);
+        // Defend against a spurious/duplicate completion with nothing armed —
+        // decrementing `in_flight` below 0 (or draining a stale buffer) would
+        // desync the cyclic cursors.
+        if ep.in_flight == 0 {
+            return false;
+        }
+        let buf_idx = ep.drain_next;
+        // Use the length the TRB was actually armed with (= `mps` for interrupt
+        // endpoints, a frame-sized value for bulk-IN), not `mps`, or a bulk
+        // frame would be truncated to the HID report size.
+        let cap = ep.armed_len as usize;
+        let residual = (ev.residual_transfer_length as usize).min(cap);
+        let len = cap.saturating_sub(residual);
+        // This buffer's TRB has completed — advance the drain cursor and free
+        // the slot regardless of payload length so the cyclic ring stays in
+        // lockstep with the arm cursor.
+        ep.drain_next = (ep.drain_next + 1) % ep.depth;
+        ep.in_flight -= 1;
         // A zero-length completion (no data) is still a valid wake — capture an
         // empty report only when there is data; otherwise just re-arm.
         if len == 0 {
@@ -1221,8 +1489,9 @@ impl Controller {
         }
         let mut out = alloc::vec::Vec::with_capacity(len);
         for i in 0..len {
-            // SAFETY: data_buf was allocated with at least `mps` bytes; i < len <= mps.
-            let byte = unsafe { core::ptr::read_volatile(ep.data_buf.user_ptr().add(i)) };
+            // SAFETY: data_bufs[buf_idx] was (re)allocated to at least
+            // `armed_len` bytes and `i < len <= armed_len`.
+            let byte = unsafe { core::ptr::read_volatile(ep.data_bufs[buf_idx].user_ptr().add(i)) };
             out.push(byte);
         }
         if ep.reports.len() >= Self::MAX_PENDING_REPORTS {
@@ -1232,19 +1501,193 @@ impl Controller {
         true
     }
 
-    /// Pop the oldest captured report for (`slot_id`, `dci`), arming the
-    /// endpoint if it is not currently armed (lazy arm on first poll). Returns
-    /// `None` if no report is queued.
+    /// Pop the oldest captured report for (`slot_id`, `dci`), topping the
+    /// endpoint's TRB queue back up to `depth` if it has fallen below (lazy arm
+    /// on first poll, re-fill afterwards). Returns `None` if no report is queued.
     pub fn take_interrupt_report(&mut self, slot_id: u8, dci: u8) -> Option<alloc::vec::Vec<u8>> {
         let (report, need_arm) = {
             let sc = self.slot_mut(slot_id)?;
             let ep = sc.interrupt_eps.iter_mut().find(|e| e.dci == dci)?;
-            (ep.reports.pop_front(), !ep.armed)
+            (ep.reports.pop_front(), ep.in_flight < ep.depth)
         };
         if need_arm {
             self.arm_interrupt_in(slot_id, dci);
         }
         report
+    }
+
+    /// Pop the oldest captured bulk-IN buffer for (`slot_id`, `dci`), topping
+    /// the endpoint's queue back up to `depth` `rx_len`-sized Normal TRBs if it
+    /// has fallen below (lazy arm on first poll, re-fill afterwards). Phase 96.
+    /// The returned buffer is a raw bulk-IN payload (one or more
+    /// Realtek-descriptor-prefixed frames); the class driver splits it. Returns
+    /// `None` if nothing is queued.
+    pub fn take_bulk_report(
+        &mut self,
+        slot_id: u8,
+        dci: u8,
+        rx_len: u32,
+    ) -> Option<alloc::vec::Vec<u8>> {
+        let (report, need_arm) = {
+            let sc = self.slot_mut(slot_id)?;
+            let ep = sc.interrupt_eps.iter_mut().find(|e| e.dci == dci)?;
+            (ep.reports.pop_front(), ep.in_flight < ep.depth)
+        };
+        if need_arm {
+            self.arm_bulk_in(slot_id, dci, rx_len);
+        }
+        report
+    }
+
+    /// Submit a bulk-OUT transfer of `data` on (`slot_id`, `dci`) and block for
+    /// its completion. Phase 96 — the TX half of a USB NIC. The endpoint's
+    /// `data_bufs[0]` source buffer is grown to `data.len()` if needed (an OUT
+    /// endpoint has `depth` = 1 so it only uses buffer 0), the frame is copied
+    /// in, a Normal TRB is enqueued (IOC), the doorbell rung, and the Transfer
+    /// Event awaited. Returns the number of bytes transferred, or `None` on
+    /// timeout/error. Bulk-IN completions seen while waiting are captured (not
+    /// dropped) so concurrent RX is not lost.
+    pub fn submit_bulk_out(
+        &mut self,
+        irq: &IrqNotification,
+        slot_id: u8,
+        dci: u8,
+        data: &[u8],
+    ) -> Option<usize> {
+        let len = data.len() as u32;
+        if len == 0 {
+            return Some(0);
+        }
+        // Grow the OUT data buffer if needed (disjoint borrow from self.handle).
+        let need_grow = match self.slot(slot_id) {
+            Some(sc) => match sc.interrupt_eps.iter().find(|e| e.dci == dci) {
+                Some(ep) => data.len() > ep.data_bufs[0].len(),
+                None => return None,
+            },
+            None => return None,
+        };
+        if need_grow {
+            let new_buf = DmaBuffer::<u8>::allocate(&self.handle, data.len(), XHCI_ALIGN).ok()?;
+            let sc = self.slot_mut(slot_id)?;
+            let ep = sc.interrupt_eps.iter_mut().find(|e| e.dci == dci)?;
+            ep.data_bufs[0] = new_buf;
+        }
+        {
+            let sc = self.slot_mut(slot_id)?;
+            let ep = sc.interrupt_eps.iter_mut().find(|e| e.dci == dci)?;
+            // Copy the frame into the DMA buffer.
+            for (i, &b) in data.iter().enumerate() {
+                // SAFETY: data_bufs[0] was (re)allocated to >= data.len() bytes; i < data.len().
+                unsafe { core::ptr::write_volatile(ep.data_bufs[0].user_ptr().add(i), b) };
+            }
+            let cycle = ep.producer.cycle;
+            write_trb(
+                &ep.ring,
+                ep.producer.enqueue,
+                trb::Trb::normal(ep.data_bufs[0].iova(), len, cycle),
+            );
+            let cycle_before = ep.producer.cycle;
+            if ep.producer.advance() {
+                let iova = ep.ring_iova;
+                write_trb(
+                    &ep.ring,
+                    ep.producer.link_index(),
+                    trb::Trb::link(iova, true, cycle_before),
+                );
+            }
+        }
+        self.ring_doorbell(slot_id, dci);
+        match self.wait_for_bulk_out_event(irq, slot_id, dci) {
+            Some(ev) if ev.completion_code == trb::COMPLETION_SUCCESS => {
+                let residual = ev.residual_transfer_length.min(len) as usize;
+                Some((len as usize).saturating_sub(residual))
+            }
+            _ => None,
+        }
+    }
+
+    /// Block for the bulk-OUT Transfer Event on (`slot_id`, `dci`). Unlike the
+    /// EP0 `wait_for_transfer_event`, any **IN** completion (odd DCI) seen while
+    /// draining is routed through `capture_interrupt_report` + re-armed, so a
+    /// bulk-IN frame (or HID report) completing during a TX is not lost and its
+    /// endpoint is not left stuck armed-but-completed. Bounded by IRQ wakes.
+    fn wait_for_bulk_out_event(
+        &mut self,
+        _irq: &IrqNotification,
+        slot_id: u8,
+        dci: u8,
+    ) -> Option<trb::TransferEvent> {
+        // Poll the event ring rather than block on `irq.wait()`: a bulk-OUT that
+        // never completes (or whose IRQ never fires) must NOT hang the server —
+        // `notify_wait` has no timeout, so a blocking wait here would deadlock
+        // the whole USB stack. Spin-poll first (catches the common fast
+        // completion in µs — see `COMPLETION_SPIN_POLLS`), then a bounded ~400 ms
+        // sleep-poll budget (400 × 1 ms) before giving up.
+        const MAX_POLLS: u32 = 400;
+        for poll_i in 0..(COMPLETION_SPIN_POLLS + MAX_POLLS) {
+            let before = self.consumer.index;
+            let mut found: Option<trb::TransferEvent> = None;
+            let mut completed: alloc::vec::Vec<(u8, u8)> = alloc::vec::Vec::new();
+            loop {
+                let seg = self.event_ring.as_ref().expect("event ring allocated");
+                let candidate = read_trb(seg, self.consumer.index);
+                if !self.consumer.owns(&candidate) {
+                    break;
+                }
+                match trb::event_trb_type(&candidate) {
+                    Some(trb::TrbType::TransferEvent) => {
+                        let ev = trb::parse_transfer_event(&candidate);
+                        if ev.slot_id == slot_id && ev.endpoint_id == dci {
+                            found = Some(ev);
+                        } else if ev.endpoint_id & 1 == 1 {
+                            // An IN completion on some other endpoint — capture
+                            // it rather than drop it (odd DCI = IN per trb::dci).
+                            if self.capture_interrupt_report(ev) {
+                                completed.push((ev.slot_id, ev.endpoint_id));
+                            }
+                        }
+                    }
+                    Some(trb::TrbType::CommandCompletion) => {
+                        let ev = trb::parse_command_completion(&candidate);
+                        self.on_command_completion(ev);
+                    }
+                    Some(trb::TrbType::PortStatusChange) => {
+                        let ev = trb::parse_port_status_change(&candidate);
+                        self.on_port_status_change(ev);
+                    }
+                    _ => {}
+                }
+                self.consumer.dequeue_step();
+            }
+            // Only advance ERDP / clear IMAN.IP when events were consumed (see
+            // wait_for_transfer_event — empty-poll ERDP writes stall the ring).
+            if self.consumer.index != before {
+                let erdp =
+                    self.event_ring_iova + (self.consumer.index as u64) * trb::TRB_SIZE as u64;
+                self.rt_write_u64(rt_reg::ERDP, erdp | ERDP_EHB);
+                self.rt_write_u32(rt_reg::IMAN, IMAN_IP | IMAN_IE);
+            }
+            // Re-arm any IN endpoint captured above at its frame-sized length.
+            for (s, d) in completed {
+                let len = self
+                    .slot(s)
+                    .and_then(|sc| sc.interrupt_eps.iter().find(|e| e.dci == d))
+                    .map(|e| e.armed_len)
+                    .unwrap_or(0);
+                if len > 0 {
+                    self.arm_ring_in(s, d, len);
+                }
+            }
+            if let Some(ev) = found {
+                return Some(ev);
+            }
+            if poll_i < COMPLETION_SPIN_POLLS {
+                core::hint::spin_loop();
+            } else {
+                let _ = syscall_lib::nanosleep_for(0, 1_000_000);
+            }
+        }
+        None
     }
 
     /// Issue a control transfer for a raw 8-byte SETUP packet on `slot_id`'s
@@ -1276,7 +1719,39 @@ impl Controller {
         if length != packet.w_length {
             return None;
         }
-        self.control_transfer(irq, slot_id, packet, packet.w_length, dir_in)
+        self.control_transfer(irq, slot_id, packet, packet.w_length, dir_in, None)
+    }
+
+    /// Issue a control transfer with an **OUT data stage** for a raw 8-byte
+    /// SETUP packet on `slot_id`'s EP0. Used by the server to serve a class
+    /// driver's `ControlWrite` (the `ure` driver's OCP register writes). The
+    /// SETUP packet's `wLength` is the source of truth for the data-stage size;
+    /// the IPC-supplied `data` must match it and the direction must be OUT, or
+    /// the transfer fails closed. Returns an empty Vec on success.
+    pub fn control_write(
+        &mut self,
+        irq: &IrqNotification,
+        slot_id: u8,
+        setup: [u8; 8],
+        data: &[u8],
+    ) -> Option<alloc::vec::Vec<u8>> {
+        let packet = trb::SetupPacket {
+            bm_request_type: setup[0],
+            b_request: setup[1],
+            w_value: u16::from_le_bytes([setup[2], setup[3]]),
+            w_index: u16::from_le_bytes([setup[4], setup[5]]),
+            w_length: u16::from_le_bytes([setup[6], setup[7]]),
+        };
+        // A ControlWrite must be host-to-device (D2H bit clear) and the inline
+        // payload length must agree with the SETUP packet's `wLength`. Reject a
+        // mismatched or mis-directed request rather than program an invalid TD.
+        if setup[0] & 0x80 != 0 {
+            return None;
+        }
+        if data.len() != packet.w_length as usize {
+            return None;
+        }
+        self.control_transfer(irq, slot_id, packet, packet.w_length, false, Some(data))
     }
 
     // -- A.6: single-threaded drain-on-wake event loop ---------------------
@@ -1367,12 +1842,10 @@ impl Controller {
         // USB2: issue a Port Reset, wait for PRC.
         let pr = port::portsc_write_preserving(raw, port::PORTSC_PR);
         self.op_write_u32(off, pr);
-        let mut budget = POLL_BUDGET;
-        while self.op_u32(off) & port::PORTSC_PRC == 0 {
-            if budget == 0 {
-                return None;
-            }
-            budget -= 1;
+        if !poll_yield(POLL_ITERS_250MS, || {
+            self.op_u32(off) & port::PORTSC_PRC != 0
+        }) {
+            return None;
         }
         let after = self.op_u32(off);
         let cleared = port::portsc_clear_change(after, port::PORTSC_PRC | port::PORTSC_CSC);

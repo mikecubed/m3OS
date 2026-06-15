@@ -13,6 +13,8 @@
 
 pub mod vbe;
 
+use alloc::vec::Vec;
+
 use bootloader_api::info::{FrameBuffer, FrameBufferInfo, PixelFormat};
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use kernel_core::fb::{AnsiParser, ConsoleCmd, SgrParams};
@@ -375,6 +377,15 @@ struct FbConsole {
     /// non-zero `Y_OFFSET` the page-flip syscall accepts). Zero means
     /// single-buffered.
     back_y_offset_pixels: u32,
+    /// RAM shadow of the visible framebuffer region (`stride*height*bpp`
+    /// bytes), kept byte-for-byte in sync by every pixel write. `Some` when the
+    /// allocation succeeded at init. Its purpose is to let `scroll_up` shift the
+    /// image with a cached RAM memmove and blit the result to the framebuffer
+    /// *write-only* — on real hardware the framebuffer is uncached MMIO, where a
+    /// full-screen READ (the old in-place scroll memmove) costs ~1 s. `None`
+    /// falls back to the in-place read-based scroll (correct, just slow on bare
+    /// metal; QEMU's RAM-backed framebuffer is fast either way).
+    shadow: Option<Vec<u8>>,
 }
 
 // SAFETY: FbConsole is only accessed under a spin::Mutex; the raw pointer is
@@ -399,6 +410,45 @@ impl FbConsole {
             cursor_visible: true,
             cursor_rendered: false,
             back_y_offset_pixels: 0,
+            shadow: None,
+        }
+    }
+
+    /// Encode `colour` into the framebuffer's pixel byte layout.
+    ///
+    /// Returns the byte pattern and the number of leading bytes that are
+    /// meaningful (`3` for RGB/BGR even at 4 bytes-per-pixel — the 4th byte is
+    /// padding and left untouched, matching the historical `write_pixel`
+    /// behaviour; `1` for greyscale; `0` for formats this console cannot paint).
+    fn pixel_bytes(&self, colour: Colour) -> ([u8; 4], usize) {
+        let mut b = [0u8; 4];
+        match self.pixel_format {
+            PixelFormat::Rgb if self.bytes_per_pixel >= 3 => {
+                b[0] = colour.r;
+                b[1] = colour.g;
+                b[2] = colour.b;
+                (b, 3)
+            }
+            PixelFormat::Bgr if self.bytes_per_pixel >= 3 => {
+                b[0] = colour.b;
+                b[1] = colour.g;
+                b[2] = colour.r;
+                (b, 3)
+            }
+            PixelFormat::U8 => {
+                let luma = ((colour.r as u16 * 77 + colour.g as u16 * 150 + colour.b as u16 * 29)
+                    >> 8) as u8;
+                b[0] = luma;
+                (b, 1)
+            }
+            PixelFormat::Unknown { .. } if self.bytes_per_pixel >= 3 => {
+                b[0] = colour.r;
+                b[1] = colour.g;
+                b[2] = colour.b;
+                (b, 3)
+            }
+            // bytes_per_pixel < 3 for a colour format, or an unhandled variant.
+            _ => (b, 0),
         }
     }
 
@@ -421,48 +471,23 @@ impl FbConsole {
         if offset + self.bytes_per_pixel > self.byte_len {
             return;
         }
-        // SAFETY: offset is within [0, byte_len) as checked above; buf is the
-        // static framebuffer pointer held under the mutex.
-        let pixel =
-            unsafe { core::slice::from_raw_parts_mut(self.buf.add(offset), self.bytes_per_pixel) };
-
-        match self.pixel_format {
-            PixelFormat::Rgb if self.bytes_per_pixel >= 3 => {
-                pixel[0] = colour.r;
-                pixel[1] = colour.g;
-                pixel[2] = colour.b;
-                // bytes_per_pixel may be 4; 4th byte left as-is (padding).
-            }
-            PixelFormat::Rgb => {
-                // bytes_per_pixel < 3 — nothing we can do safely.
-            }
-            PixelFormat::Bgr if self.bytes_per_pixel >= 3 => {
-                pixel[0] = colour.b;
-                pixel[1] = colour.g;
-                pixel[2] = colour.r;
-            }
-            PixelFormat::Bgr => {
-                // bytes_per_pixel < 3 — nothing we can do safely.
-            }
-            PixelFormat::U8 => {
-                // Greyscale: use luminance approximation.
-                let luma = ((colour.r as u16 * 77 + colour.g as u16 * 150 + colour.b as u16 * 29)
-                    >> 8) as u8;
-                pixel[0] = luma;
-            }
-            // Best-effort for unknown pixel formats: write RGB bytes when
-            // there are at least 3 bytes per pixel.
-            PixelFormat::Unknown { .. } if self.bytes_per_pixel >= 3 => {
-                pixel[0] = colour.r;
-                pixel[1] = colour.g;
-                pixel[2] = colour.b;
-            }
-            PixelFormat::Unknown { .. } => {
-                // bytes_per_pixel < 3 — nothing we can do safely.
-            }
-            // Non-exhaustive enum — silently ignore future variants.
-            #[allow(unreachable_patterns)]
-            _ => {}
+        let (bytes, n) = self.pixel_bytes(colour);
+        if n == 0 {
+            return;
+        }
+        let buf = self.buf;
+        // SAFETY: offset + n <= offset + bytes_per_pixel <= byte_len (checked
+        // above); buf is the static framebuffer pointer held under the mutex.
+        unsafe {
+            core::slice::from_raw_parts_mut(buf.add(offset), n).copy_from_slice(&bytes[..n]);
+        }
+        // Mirror into the RAM shadow (write-only; never read back). Keeps the
+        // shadow byte-exact so `scroll_up` can blit from it without an uncached
+        // framebuffer read.
+        if let Some(shadow) = self.shadow.as_mut()
+            && offset + n <= shadow.len()
+        {
+            shadow[offset..offset + n].copy_from_slice(&bytes[..n]);
         }
     }
 
@@ -511,19 +536,41 @@ impl FbConsole {
         let px_x = col * CHAR_W;
         let px_y = row * CHAR_H;
 
+        let buf = self.buf;
+        let bpp = self.bytes_per_pixel;
+        let byte_len = self.byte_len;
         for gy in 0..CHAR_H {
             for gx in 0..CHAR_W {
                 let x = px_x + gx;
                 let y = px_y + gy;
-                let offset = (y * self.stride + x) * self.bytes_per_pixel;
-                if offset + self.bytes_per_pixel > self.byte_len {
+                let offset = (y * self.stride + x) * bpp;
+                if offset + bpp > byte_len {
                     continue;
                 }
-                let pixel = unsafe {
-                    core::slice::from_raw_parts_mut(self.buf.add(offset), self.bytes_per_pixel)
-                };
-                for byte in pixel.iter_mut() {
-                    *byte ^= 0xFF;
+                // When a shadow exists, derive the inverted bytes from it (a
+                // cached RAM read) and write them to both — never read the
+                // uncached framebuffer. Otherwise fall back to an in-place
+                // read-modify-write on the framebuffer.
+                if let Some(shadow) = self.shadow.as_mut() {
+                    if offset + bpp > shadow.len() {
+                        continue;
+                    }
+                    let mut inv = [0u8; 4];
+                    for i in 0..bpp {
+                        inv[i] = shadow[offset + i] ^ 0xFF;
+                        shadow[offset + i] = inv[i];
+                    }
+                    // SAFETY: offset + bpp <= byte_len (checked); buf is the
+                    // framebuffer base held under the mutex.
+                    unsafe {
+                        core::slice::from_raw_parts_mut(buf.add(offset), bpp)
+                            .copy_from_slice(&inv[..bpp]);
+                    }
+                } else {
+                    let pixel = unsafe { core::slice::from_raw_parts_mut(buf.add(offset), bpp) };
+                    for byte in pixel.iter_mut() {
+                        *byte ^= 0xFF;
+                    }
                 }
             }
         }
@@ -554,17 +601,49 @@ impl FbConsole {
             self.clear_region(0, 0, self.cols(), self.rows());
             return;
         }
-        // SAFETY: `self.buf` points to the framebuffer with `total` bytes. We
-        // intentionally copy the overlapping range `[buf + row_bytes, buf + total)`
-        // down to `[buf, buf + total - row_bytes)` to scroll the contents up.
-        // `core::ptr::copy` is used because it provides memmove semantics for
-        // overlapping source and destination regions.
-        unsafe {
-            // Shift buffer up by one text row.
-            core::ptr::copy(self.buf.add(row_bytes), self.buf, total - row_bytes);
-        }
-        // Clear the last row using the current background color.
         let rows = self.rows();
+        let buf = self.buf;
+
+        // Fast path: a RAM shadow mirrors the framebuffer. Shift the image up
+        // with a cached RAM memmove, then blit the shifted region to the
+        // framebuffer WRITE-ONLY. This never READS the framebuffer — on real
+        // hardware the framebuffer is uncached MMIO, where the old in-place
+        // memmove's full-screen read costs ~1 s (the visible "scroll takes a
+        // second" stall). QEMU's RAM framebuffer is fast either way.
+        if self
+            .shadow
+            .as_ref()
+            .map(|s| s.len() >= total)
+            .unwrap_or(false)
+        {
+            {
+                let shadow = self.shadow.as_mut().unwrap();
+                // Shift the shadow contents up by one text row (cached RAM).
+                shadow.copy_within(row_bytes..total, 0);
+                // SAFETY: `buf` is the framebuffer base (>= `total` bytes mapped
+                // and bounded by `byte_len`); `shadow` holds >= `total` bytes;
+                // RAM and MMIO never overlap. Write-only blit of the shifted
+                // region (rows `[0, rows-1)`); the last row is cleared below.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(shadow.as_ptr(), buf, total - row_bytes);
+                }
+            }
+            // Clear the now-vacated last row in BOTH framebuffer and shadow
+            // (clear_region → write_pixel mirrors into the shadow).
+            if rows > 0 {
+                self.clear_region(0, rows - 1, self.cols(), rows);
+            }
+            return;
+        }
+
+        // Fallback (no shadow): in-place overlapping memmove on the framebuffer.
+        // SAFETY: `buf` points to the framebuffer with `total` bytes. We copy
+        // the overlapping range `[buf + row_bytes, buf + total)` down to
+        // `[buf, buf + total - row_bytes)`. `core::ptr::copy` provides memmove
+        // semantics for overlapping regions.
+        unsafe {
+            core::ptr::copy(buf.add(row_bytes), buf, total - row_bytes);
+        }
         if rows > 0 {
             self.clear_region(0, rows - 1, self.cols(), rows);
         }
@@ -975,6 +1054,31 @@ pub unsafe fn init_from_parts(buf_ptr: *mut u8, info: FrameBufferInfo) -> bool {
         core::ptr::write_bytes(buf_ptr, 0x00, total_bytes);
     }
 
+    // Allocate a RAM shadow of the visible region so scrolling never has to
+    // READ the framebuffer — on real hardware the framebuffer is uncached MMIO
+    // and a full-screen read costs ~1 s (the visible per-scroll stall). The
+    // framebuffer was just zeroed, so a zeroed shadow starts byte-for-byte in
+    // sync. Best-effort: on allocation failure (`try_reserve_exact`) the
+    // console keeps `shadow == None` and falls back to the in-place read-based
+    // scroll, so a memory-constrained boot still renders correctly.
+    {
+        // `try_reserve_exact` + `resize` (not `vec![0; n]`) so a failed
+        // multi-MB allocation degrades to the read-based scroll instead of
+        // aborting the kernel via `handle_alloc_error`.
+        #[allow(clippy::slow_vector_initialization)]
+        let mut shadow: Vec<u8> = Vec::new();
+        if shadow.try_reserve_exact(total_bytes).is_ok() {
+            shadow.resize(total_bytes, 0);
+            console.shadow = Some(shadow);
+        } else {
+            log::warn!(
+                "[fb] shadow buffer alloc failed ({} bytes); scroll falls back to \
+                 uncached framebuffer reads (slow on bare metal)",
+                total_bytes
+            );
+        }
+    }
+
     // Phase 73 follow-up — try to enable hardware double-buffering via
     // Bochs VBE panning. On success the LFB extends to `2 × height`
     // rows inside the same BAR, so we widen `byte_len` to expose the
@@ -1045,6 +1149,26 @@ pub fn write_str(s: &str) {
     if let Some(ref mut console) = *guard {
         console.write_str(s);
     }
+}
+
+/// Write formatted output to the framebuffer console.
+///
+/// The kernel `log::*` macros sink to **serial only** (`SerialLogger`), which is
+/// invisible on bare metal with no serial cable. This helper renders to the
+/// framebuffer text console — the same surface userspace stdout lands on — so a
+/// kernel-side diagnostic (e.g. the DHCP/network heartbeat) can be read off a
+/// physical screen. Respects [`CONSOLE_YIELDED`] (no-op when a graphical process
+/// owns the framebuffer). Pair it with a `log::*` call to also reach serial/QEMU.
+pub fn write_fmt(args: core::fmt::Arguments) {
+    use core::fmt::Write;
+    struct FbWriter;
+    impl Write for FbWriter {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            write_str(s);
+            Ok(())
+        }
+    }
+    let _ = FbWriter.write_fmt(args);
 }
 
 // ---------------------------------------------------------------------------

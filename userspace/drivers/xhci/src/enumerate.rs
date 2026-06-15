@@ -95,26 +95,26 @@ impl UsbHostOps for XhciHostOps<'_> {
     fn get_device_descriptor(&mut self, slot_id: u8, len: u16) -> Option<Vec<u8>> {
         let setup = trb::SetupPacket::get_device_descriptor(len);
         self.controller
-            .control_transfer(self.irq, slot_id, setup, len, true)
+            .control_transfer(self.irq, slot_id, setup, len, true, None)
     }
 
     fn get_config_short(&mut self, slot_id: u8, len: u16) -> Option<Vec<u8>> {
         let setup = trb::SetupPacket::get_config_descriptor(0, len);
         self.controller
-            .control_transfer(self.irq, slot_id, setup, len, true)
+            .control_transfer(self.irq, slot_id, setup, len, true, None)
     }
 
     fn get_config_full(&mut self, slot_id: u8, len: u16) -> Option<Vec<u8>> {
         let setup = trb::SetupPacket::get_config_descriptor(0, len);
         self.controller
-            .control_transfer(self.irq, slot_id, setup, len, true)
+            .control_transfer(self.irq, slot_id, setup, len, true, None)
     }
 
     fn set_configuration(&mut self, slot_id: u8, value: u8) -> u8 {
         let setup = trb::SetupPacket::set_configuration(value);
         match self
             .controller
-            .control_transfer(self.irq, slot_id, setup, 0, false)
+            .control_transfer(self.irq, slot_id, setup, 0, false, None)
         {
             Some(_) => {
                 write_str(STDOUT_FILENO, "[xhci] SET_CONFIGURATION OK\n");

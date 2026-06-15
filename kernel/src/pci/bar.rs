@@ -934,6 +934,86 @@ pub(super) fn bar_mmio_virt_offset(bars: [u32; 6], bar_index: u8, offset: u32) -
     }
 }
 
+/// Ensure the kernel physmap covers `[phys, phys + len)` so the kernel can
+/// directly read/write a device MMIO region through `phys_offset + phys`.
+///
+/// The bootloader's `Mapping::Dynamic` physical-memory map only covers the
+/// boot-visible RAM regions reported in the memory map. A PCIe device whose
+/// 64-bit BAR is placed high in the q35 PCI MMIO hole (e.g. a passed-through
+/// xHCI controller whose BAR0 lands at phys `0x70_0000_0000`) therefore has
+/// **no** physmap leaf, and a direct kernel write to `phys_offset + phys`
+/// page-faults (the symptom that crashed `allocate_msi_vectors` → MSI-X table
+/// programming under `--usb-passthrough`). Map the covering 4 KiB pages on
+/// demand with UC cache flags (`NO_CACHE | WRITE_THROUGH`), kernel-only (no
+/// `USER_ACCESSIBLE` on the leaf).
+///
+/// Idempotent: pages already present in the physmap are left untouched, so a
+/// low BAR that the bootloader already mapped is a no-op. Returns `false` if
+/// the region is implausibly large or a PTE insert fails, in which case the
+/// caller must not dereference the physmap pointer.
+///
+/// The physmap (`PML4[phys_offset >> 39]`) is shared across every address
+/// space — its PDPT frame is referenced by both the kernel PML4 and every
+/// process PML4 — so installing a leaf via the *active* mapper (which may be
+/// a ring-3 driver's page table while servicing its device-host syscall) is
+/// visible to the kernel and all processes alike.
+pub(super) fn ensure_physmap_mmio_mapped(phys: u64, len: u64) -> bool {
+    use x86_64::VirtAddr;
+    use x86_64::structures::paging::mapper::TranslateResult;
+    use x86_64::structures::paging::{Mapper, Page, PhysFrame, Size4KiB, Translate};
+
+    if len == 0 {
+        return true;
+    }
+    let phys_off = crate::mm::phys_offset();
+    let start = phys & !0xFFF;
+    let Some(end) = phys.checked_add(len).map(|v| (v + 0xFFF) & !0xFFF) else {
+        return false;
+    };
+    // Bound the loop — an MSI-X table is at most 2048 entries × 16 B = 32 KiB,
+    // i.e. 8 pages; cap generously so a corrupt size never ties up the CPU.
+    const MAX_PAGES: usize = 64;
+    let page_count = ((end - start) >> 12) as usize;
+    if page_count == 0 || page_count > MAX_PAGES {
+        return false;
+    }
+
+    let flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::NO_EXECUTE
+        | PageTableFlags::GLOBAL
+        | PageTableFlags::NO_CACHE
+        | PageTableFlags::WRITE_THROUGH;
+
+    // SAFETY: called during device init (MSI-X programming); no other
+    // `OffsetPageTable` is alive in this scope. The mapper is rooted at the
+    // active CR3, whose physmap PDPT is shared with the kernel PML4.
+    let mut mapper = unsafe { crate::mm::paging::get_mapper() };
+    let mut alloc = crate::mm::paging::GlobalFrameAlloc;
+    for i in 0..page_count {
+        let p = start + (i as u64) * 4096;
+        let v = VirtAddr::new(phys_off + p);
+        if let TranslateResult::Mapped { .. } = mapper.translate(v) {
+            continue; // already covered by the bootloader physmap
+        }
+        let page = Page::<Size4KiB>::containing_address(v);
+        let frame = match PhysFrame::<Size4KiB>::from_start_address(x86_64::PhysAddr::new(p)) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        // SAFETY: `p` is device MMIO (a PCI BAR), never in the RAM frame
+        // allocator's pool, so there is no aliasing with kernel/user memory.
+        // The PTE insert allocates intermediate tables via the global frame
+        // allocator; the leaf carries no USER_ACCESSIBLE bit so ring 3 cannot
+        // reach it even though the shared physmap PDPT is user-walkable.
+        match unsafe { mapper.map_to(page, frame, flags, &mut alloc) } {
+            Ok(flush) => flush.flush(),
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
 // Provide the phantom lifetime annotation on BarMapping so future extensions
 // can thread a device lifetime without breaking the API. PhantomData is
 // behind `#[allow(dead_code)]` since BarMapping currently does not carry it.

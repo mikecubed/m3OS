@@ -1309,7 +1309,18 @@ impl MsixCapability {
     /// valid for MSI-X per spec), uses a reserved encoding, or a 64-bit BAR
     /// claims a non-existent partner slot.
     fn table_virt_addr(&self, bars: [u32; 6]) -> Option<usize> {
-        bar::bar_mmio_virt_offset(bars, self.table_bar, self.table_offset)
+        let virt = bar::bar_mmio_virt_offset(bars, self.table_bar, self.table_offset)?;
+        // The physmap only covers boot-visible RAM, not a 64-bit BAR placed
+        // high in the q35 PCI hole (e.g. a passed-through xHCI controller).
+        // Map the table's pages on demand before returning the pointer so the
+        // direct MSI-X writes in `program_entry` cannot fault. `table_size` is
+        // the decoded entry count (1-based); each entry is 16 bytes.
+        let table_bytes = (self.table_size as u64).max(1) * 16;
+        let phys = (virt as u64).checked_sub(crate::mm::phys_offset())?;
+        if !bar::ensure_physmap_mmio_mapped(phys, table_bytes) {
+            return None;
+        }
+        Some(virt)
     }
 
     /// Program table entry `index` to deliver `vector` to `apic_lapic_id`.
