@@ -136,7 +136,21 @@ pub(crate) fn alloc_pid_pub() -> Pid {
 // ---------------------------------------------------------------------------
 
 /// Maximum number of open file descriptors per process.
-pub const MAX_FDS: usize = 32;
+///
+/// Raised 32 → 128 (Phase 90b): Node/Claude Code exhaust a 32-fd table during a
+/// single session — stdio + libuv's epoll/eventfd/timerfd/self-pipe + the custom
+/// undici agent's TLS sockets + config/`.claude.json`/temp/lock files + 3 pipe
+/// fds per spawned `ripgrep` — so the next `open`/`socket`/`pipe` returns EMFILE
+/// and the agent wedges (observed: `rg error (code=EMFILE)` immediately preceding
+/// a lock-up). 128 gives comfortable headroom over the observed ~30-fd ceiling.
+///
+/// Bounded to 128 (not 1024) because `fd_table` is an inline `[Option<FdEntry>;
+/// MAX_FDS]` and `fd_table_snapshot()` returns it BY VALUE on the 16 KiB syscall
+/// stack (`SYSCALL_STACK_SIZE`); at the 64-byte `FdEntry` class that is ≤8 KiB,
+/// which fits. Going higher (Linux's 1024) needs the fd table moved to the heap
+/// (`Vec`/`Box<[_]>`) so neither construction nor the snapshot lands on the
+/// kstack — tracked as a follow-up.
+pub const MAX_FDS: usize = 128;
 
 /// Backing store for an open file descriptor.
 #[derive(Clone)]
