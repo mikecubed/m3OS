@@ -313,6 +313,18 @@ const SMOKE_EXIT_CLAUDE_SMOKE_FAILED: i32 = 85;
 /// docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md.
 const SMOKE_EXIT_KSTACK_OVERFLOW_FAILED: i32 = 86;
 
+/// `cargo xtask smp-smoke` exit code — the permanent multi-core SMP regression
+/// gate. Boots Node on **multiple cores** (default -smp 4) and runs a
+/// futex-heavy libuv-threadpool stress (256 async pbkdf2 ops, 16 in flight) that
+/// must COMPLETE (`SMP_STRESS_OK`), proving no cross-core lost-wakeup deadlock;
+/// fail-fast on the fatal SMP signatures (`KERNEL PANIC`, the
+/// `BlockedOnFutex … no waker registered` watchdog verdict, `RECURSIVE KERNEL
+/// PAGE FAULT`, a wrongful `process killed`). The multi-command serial injection
+/// also exercises the COM1-RX-under-SMP byte-drop fix. Guards the five multi-core
+/// fixes from
+/// docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md.
+const SMOKE_EXIT_SMP_SMOKE_FAILED: i32 = 87;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
     Headless,
@@ -986,6 +998,19 @@ fn main() {
                 });
             cmd_node_smoke(&smoke_args);
         }
+        // Permanent multi-core SMP regression gate
+        // (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md):
+        // boots Node on -smp 4 and runs a futex-heavy threadpool stress that must
+        // complete, guarding the cross-core lost-wakeup / CoW-kill / TLB-panic /
+        // serial-byte-drop fixes. Honors M3OS_KVM=1 + M3OS_SMP=<N>.
+        Some("smp-smoke") => {
+            let smoke_args = parse_smoke_boot_args("smp-smoke", &args[2..]).unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            cmd_smp_smoke(&smoke_args);
+        }
         // Phase 90a Track D.3 — Node.js JIT + WASM gate. Boots the JIT
         // `build_node` variant (M3OS_NODE_JIT=1) under PKU (M3OS_KVM=1 on a
         // PKU host), asserts V8 reaches optimized/TurboFan code (NODE_JIT_OK)
@@ -1254,7 +1279,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -15674,6 +15699,219 @@ fn cmd_node_smoke(args: &SmokeBootArgs) {
             let _ = child.wait();
             eprintln!("node-smoke: FAILED\n{msg}");
             std::process::exit(SMOKE_EXIT_NODE_SMOKE_FAILED);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// smp-smoke — permanent multi-core SMP regression gate
+// (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md)
+// ---------------------------------------------------------------------------
+
+/// Serial script for `smp-smoke`. Installs node, runs it multi-core, then a
+/// futex-heavy libuv-threadpool stress that must COMPLETE — guarding the
+/// cross-core lost-wakeup fix — with fail-fast on the fatal SMP signatures. Every
+/// command we inject also exercises the COM1-RX-under-SMP byte-drop fix.
+fn smp_smoke_steps(fast_iter: bool) -> Vec<SmokeStep> {
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "smp-smoke: kernel first message",
+    }];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    if !fast_iter {
+        steps.push(SmokeStep::Send {
+            input: "pkg install node\n",
+            label: "smp-smoke: pkg install node",
+        });
+        steps.push(SmokeStep::WaitPassOrFail {
+            pass_pattern: "pkg install: node: OK",
+            fail_prefixes: &["pkg install: cannot"],
+            timeout_secs: 3600,
+            label: "smp-smoke: node installed from .m3pkg",
+            exit_code_on_fail: SMOKE_EXIT_SMP_SMOKE_FAILED,
+        });
+    }
+    // Version banner — the first multi-core serial-injected command (every
+    // command we send exercises the COM1-RX-under-SMP byte-drop fix: a regressed
+    // RX path drops a char and the command is garbled → timeout here).
+    steps.push(SmokeStep::Send {
+        input: "node --version\n",
+        label: "smp-smoke: node --version",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "v22.22",
+        timeout_secs: 1200,
+        label: "smp-smoke: node runs multi-core (version, cold streamed load)",
+    });
+    // The core test: a futex-heavy libuv-threadpool stress that must COMPLETE on
+    // multiple cores. 256 async pbkdf2 ops are queued at once; the 4-thread
+    // threadpool processes them and posts each completion back to the event loop
+    // (a futex WAKE of the main thread, which blocks on a futex WAIT between
+    // completions) — 256 cross-core WAIT/WAKE handshakes. A regression of the
+    // cross-core lost-wakeup (`block_current_until`) strands the main thread
+    // `BlockedOnFutex` → `d` never reaches 256 → `SMP_STRESS_OK` never prints, and
+    // the kernel's `no waker registered` watchdog verdict trips the fail-fast. The
+    // other fatal SMP signatures (a TLB-shootdown panic, a recursive-#PF cascade,
+    // a wrongful spurious-fault kill) fail fast too. Kept ~150 chars (the working
+    // node-smoke `node -e` length — longer command bursts can outrun the COM1 RX
+    // feeder). `'SMP'+'_STRESS_OK'` so the Wait keys on real output, not the echo.
+    steps.push(SmokeStep::Send {
+        input: "node -e \"const c=require('crypto');let d=0;for(let i=0;i!==256;i++)c.pbkdf2('p','s',2000,32,'sha256',()=>++d===256&&console.log('SMP'+'_STRESS_OK '+d))\"\n",
+        label: "smp-smoke: futex-heavy threadpool stress (256 async pbkdf2 ops)",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "SMP_STRESS_OK 256",
+        fail_prefixes: &[
+            "KERNEL PANIC",
+            "no waker registered",
+            "RECURSIVE KERNEL PAGE FAULT",
+            "process killed",
+        ],
+        timeout_secs: 900,
+        label: "smp-smoke: multithreaded stress completes (no lost-wakeup / panic / kill)",
+        exit_code_on_fail: SMOKE_EXIT_SMP_SMOKE_FAILED,
+    });
+    steps
+}
+
+/// `cargo xtask smp-smoke` — permanent multi-core SMP regression gate. Boots Node
+/// on **multiple cores** (default `-smp 4`; `M3OS_SMP=<N≥2>` overrides) and runs
+/// the futex-heavy threadpool stress above. Honors `M3OS_KVM=1` (near-native; also
+/// exposes real PKU so the JIT/W^X-v2 paths are covered) and
+/// `M3OS_NODE_FAST_ITER=1` (reuse an installed disk). SKIPs cleanly when the host
+/// C++ toolchain / llvm musl sysroot are absent (mirrors node-smoke).
+fn cmd_smp_smoke(args: &SmokeBootArgs) {
+    fn tool_ok(t: &str) -> bool {
+        std::process::Command::new(t)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    let clang = std::env::var("M3OS_NODE_CLANG").unwrap_or_else(|_| "clang".to_string());
+    let clangxx = std::env::var("M3OS_NODE_CLANGXX").unwrap_or_else(|_| "clang++".to_string());
+    let toolchain_ok = tool_ok(&clang)
+        && tool_ok(&clangxx)
+        && tool_ok("ld.lld")
+        && tool_ok("python3")
+        && tool_ok("make");
+    let sysroot_libcxx = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("target/llvm-musl-sysroot/lib/libc++.a");
+    if !toolchain_ok || !sysroot_libcxx.exists() {
+        println!(
+            "smp-smoke: SKIP (reason: host C++ toolchain or llvm musl sysroot absent — \
+             needs clang/clang++/ld.lld/python3/make + `cargo xtask port build llvm`)"
+        );
+        return;
+    }
+    if let Err(msg) = port_build::build_node_port() {
+        eprintln!("smp-smoke: precondition failed (node port build): {msg}");
+        std::process::exit(SMOKE_EXIT_SMP_SMOKE_FAILED);
+    }
+    // SAFETY: xtask is single-threaded here; the child image-build step reads the
+    // env. set_var is `unsafe` in Rust edition 2024 (cross-thread UB risk).
+    unsafe {
+        std::env::set_var("M3OS_WITH_NODE", "1");
+    }
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let fast_iter = std::env::var("M3OS_NODE_FAST_ITER").is_ok();
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if fast_iter && disk_img.exists() {
+        println!("smp-smoke: M3OS_NODE_FAST_ITER — reusing existing disk (skipping install)");
+    } else {
+        if disk_img.exists() {
+            let _ = fs::remove_file(&disk_img);
+        }
+        create_data_disk(
+            uefi_image.parent().unwrap(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false, // graphical_login — serial autologin path
+        );
+    }
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let kvm = std::env::var_os("M3OS_KVM").is_some_and(|v| v != "0" && !v.is_empty());
+    let mut qemu_args = qemu_args_with_devices(
+        &uefi_image,
+        &ovmf,
+        display_mode,
+        DeviceSet {
+            kvm,
+            ..DeviceSet::default()
+        },
+    );
+    // No host networking needed.
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    // FORCE multi-core — the whole point of the gate. Default 4; M3OS_SMP=<N≥2>
+    // overrides (a value < 2 is ignored, since a single core cannot exercise the
+    // cross-core races this gate guards).
+    let cores = std::env::var("M3OS_SMP")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|n| *n >= 2)
+        .unwrap_or(4);
+    for i in 0..qemu_args.len() {
+        if qemu_args[i] == "-smp" && i + 1 < qemu_args.len() {
+            qemu_args[i + 1] = cores.to_string();
+        }
+    }
+    append_ac97_audio_flags_headless(&mut qemu_args);
+    let steps = smp_smoke_steps(fast_iter);
+
+    println!(
+        "smp-smoke: launching QEMU (timeout {}s, -smp {cores}, {})",
+        args.timeout_secs,
+        if kvm { "KVM (real PKU)" } else { "TCG" }
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("smp-smoke: failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            println!(
+                "smp-smoke: PASSED ({} steps in {}s, -smp {cores})",
+                steps.len(),
+                start.elapsed().as_secs()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("smp-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_SMP_SMOKE_FAILED);
         }
     }
 }

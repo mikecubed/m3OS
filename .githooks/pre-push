@@ -635,6 +635,28 @@ if [ "${M3OS_KSTACK_OVERFLOW_REGRESSION:-0}" = "1" ]; then
     fi
 fi
 
+# Permanent multi-core SMP regression gate
+# (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md). Gated behind
+# M3OS_SMP_REGRESSION=1. Boots Node on MULTIPLE cores (-smp 4) and runs a
+# futex-heavy libuv-threadpool stress (256 async pbkdf2 ops, 16 in flight) that
+# must COMPLETE (SMP_STRESS_OK), guarding the five multi-core fixes: the cross-core
+# lost-wakeup (block_current_until re-check) — a regression strands a worker
+# BlockedOnFutex and the `no waker registered` watchdog trips the fail-fast; the
+# TLB-shootdown panic survival (Tracks A–D); the CoW/mprotect spurious-fault
+# wrongful-kill; and the COM1-RX-under-SMP byte-drop (every injected command would
+# garble). Runs under KVM (M3OS_KVM=1, also covers the JIT/PKU paths) or plain TCG.
+# SKIPs cleanly without the host C++ toolchain + llvm musl sysroot (mirrors
+# node-smoke). Set on branches touching the scheduler block/wake path
+# (block_current_until / wake_task_v2), the page-fault handler, smp/tlb.rs,
+# smp/boot.rs (is_online), hlt_loop, or the serial RX path.
+if [ "${M3OS_SMP_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask smp-smoke..."
+    if ! cargo xtask smp-smoke --timeout 5400; then
+        echo "pre-push: cargo xtask smp-smoke failed" >&2
+        exit 1
+    fi
+fi
+
 # Phase 90a Track D.3 — Node.js JIT + WASM regression gate. Gated behind
 # M3OS_NODE_JIT_REGRESSION=1. Cross-builds the JIT build_node variant
 # (M3OS_NODE_JIT=1 — --v8-options=--jitless dropped, the A.1 V8/Node PKU patches

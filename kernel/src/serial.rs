@@ -177,7 +177,10 @@ pub fn init_logger() {
 
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-const SERIAL_BUF_SIZE: usize = 256; // must be power of 2
+// 4 KiB (was 256): headroom so a burst of pasted/injected serial input is not
+// dropped when the feeder task is briefly descheduled under SMP load (the ring
+// fills faster than the feeder drains it). Must be a power of 2.
+const SERIAL_BUF_SIZE: usize = 4096;
 const SERIAL_BUF_MASK: usize = SERIAL_BUF_SIZE - 1;
 
 static mut SERIAL_RX_RAW: [u8; SERIAL_BUF_SIZE] = [0u8; SERIAL_BUF_SIZE];
