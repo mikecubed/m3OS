@@ -19842,6 +19842,12 @@ pub(super) fn sys_setsockopt(
     const SO_SNDBUF: u64 = 7;
     const IPPROTO_TCP: u64 = 6;
     const TCP_NODELAY: u64 = 1;
+    // TCP keepalive tuning (IPPROTO_TCP level). Accepted + stored for the
+    // future keepalive prober; the probe timer itself is deferred (see
+    // `crate::net::SocketOptions` and docs/roadmap/90b-claude-code.md).
+    const TCP_KEEPIDLE: u64 = 4;
+    const TCP_KEEPINTVL: u64 = 5;
+    const TCP_KEEPCNT: u64 = 6;
 
     match (level, optname) {
         (SOL_SOCKET, SO_REUSEADDR) => {
@@ -19859,9 +19865,44 @@ pub(super) fn sys_setsockopt(
         (IPPROTO_TCP, TCP_NODELAY) => {
             crate::net::with_socket_mut(handle, |s| s.options.tcp_nodelay = val != 0);
         }
-        _ => return NEG_ENOPROTOOPT,
+        (IPPROTO_TCP, TCP_KEEPIDLE) => {
+            crate::net::with_socket_mut(handle, |s| s.options.keep_idle_secs = val.max(0) as u32);
+        }
+        (IPPROTO_TCP, TCP_KEEPINTVL) => {
+            crate::net::with_socket_mut(handle, |s| s.options.keep_intvl_secs = val.max(0) as u32);
+        }
+        (IPPROTO_TCP, TCP_KEEPCNT) => {
+            crate::net::with_socket_mut(handle, |s| s.options.keep_cnt = val.max(0) as u32);
+        }
+        // Phase 90b: accept-and-log unimplemented best-effort options instead
+        // of returning ENOPROTOOPT. m3OS presents a Linux ABI and runs
+        // unmodified Linux binaries (libuv/undici/curl) that treat *any*
+        // setsockopt failure as fatal — a hard ENOPROTOOPT on an optional knob
+        // (e.g. SO_LINGER, SO_REUSEPORT) aborts the connection. Ignoring the
+        // hint is safe; the value is simply not honored. The first such call
+        // per boot is logged so the deferred work is visible (see
+        // docs/roadmap/90b-claude-code.md). Reads stay honest: an
+        // unimplemented `getsockopt` still returns ENOPROTOOPT rather than
+        // fabricating a value.
+        _ => log_setsockopt_noop(level, optname),
     }
     0
+}
+
+/// One-shot, per-boot log of the first `setsockopt` that hit the accept-and-log
+/// path (Phase 90b). Single line per boot to stay clear of the SMP serial-RX
+/// starvation guard — a tight retry loop would otherwise flood COM1.
+fn log_setsockopt_noop(level: u64, optname: u64) {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        log::info!(
+            "[net] setsockopt: accepting unimplemented option as no-op \
+             (first: level={level} optname={optname}); socket-option behaviors \
+             (incl. the TCP keepalive prober) are tracked as deferred — see \
+             docs/roadmap/90b-claude-code.md"
+        );
+    }
 }
 
 /// getsockopt(fd, level, optname, optval, optlen) — syscall 55
@@ -19881,6 +19922,9 @@ pub(super) fn sys_getsockopt(
     const SO_PEERCRED: u64 = 17;
     const IPPROTO_TCP: u64 = 6;
     const TCP_NODELAY: u64 = 1;
+    const TCP_KEEPIDLE: u64 = 4;
+    const TCP_KEEPINTVL: u64 = 5;
+    const TCP_KEEPCNT: u64 = 6;
 
     // Phase 69d follow-up: SO_PEERCRED on a Unix-domain socket
     // returns the connected peer's `struct ucred { pid, uid, gid }`.
@@ -19957,6 +20001,17 @@ pub(super) fn sys_getsockopt(
         }
         (IPPROTO_TCP, TCP_NODELAY) => {
             crate::net::with_socket(handle, |s| s.options.tcp_nodelay as i32).unwrap_or(0)
+        }
+        // Keepalive tuning round-trips the value stored by setsockopt (the
+        // probe timer is deferred; see SocketOptions / 90b-claude-code.md).
+        (IPPROTO_TCP, TCP_KEEPIDLE) => {
+            crate::net::with_socket(handle, |s| s.options.keep_idle_secs as i32).unwrap_or(7200)
+        }
+        (IPPROTO_TCP, TCP_KEEPINTVL) => {
+            crate::net::with_socket(handle, |s| s.options.keep_intvl_secs as i32).unwrap_or(75)
+        }
+        (IPPROTO_TCP, TCP_KEEPCNT) => {
+            crate::net::with_socket(handle, |s| s.options.keep_cnt as i32).unwrap_or(9)
         }
         (SOL_SOCKET, SO_ERROR) => {
             // Phase 86b — pending socket error, read once by clients after a
