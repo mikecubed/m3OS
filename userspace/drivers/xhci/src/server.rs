@@ -160,8 +160,17 @@ pub type ControllerCtx = (Controller, IrqNotification, Vec<AttachNotice>);
 /// handle equals the raw slot id, so the single-controller path (and the
 /// QEMU smoke gates) are byte-for-byte unchanged. xHCI assigns the few attached
 /// devices small slot ids (1..N), well within six bits.
-fn pack_handle(ctrl_idx: usize, slot_id: u8) -> u8 {
-    ((ctrl_idx as u8) << 6) | (slot_id & 0x3F)
+///
+/// **Fails closed**: returns `None` when the pair cannot be encoded losslessly
+/// (controller index > 3 or slot id > 63) rather than silently truncating into
+/// a colliding handle. A colliding handle would route the device's later
+/// control/bulk transfers to a *different* controller/slot — so an unencodable
+/// device is dropped (not served) at the call site instead of misrouted.
+fn pack_handle(ctrl_idx: usize, slot_id: u8) -> Option<u8> {
+    if ctrl_idx > 0b11 || slot_id > 0x3F {
+        return None;
+    }
+    Some(((ctrl_idx as u8) << 6) | (slot_id & 0x3F))
 }
 
 /// Inverse of [`pack_handle`]: recover `(controller index, hardware slot id)`.
@@ -192,8 +201,27 @@ pub fn run(ep: u32, discovered: u8, mut controllers: Vec<ControllerCtx>) -> ! {
     for (ctrl_idx, (_c, _irq, devices)) in controllers.iter().enumerate() {
         for d in devices {
             let mut notice = *d;
-            notice.slot_id = pack_handle(ctrl_idx, notice.slot_id);
-            served.push(notice);
+            match pack_handle(ctrl_idx, notice.slot_id) {
+                Some(handle) => {
+                    notice.slot_id = handle;
+                    served.push(notice);
+                }
+                None => {
+                    // Fail closed: a (controller, slot) pair that doesn't fit
+                    // the 1-byte handle (>=4 controllers, or slot > 63) is
+                    // dropped here rather than packed into a colliding handle
+                    // that would misroute its transfers. Surface the drop so it
+                    // is diagnosable instead of a silently-missing device.
+                    write_str(
+                        STDOUT_FILENO,
+                        "xhci_driver: WARNING dropped device — unpackable handle (ctrl=",
+                    );
+                    crate::write_u8_dec(ctrl_idx as u8);
+                    write_str(STDOUT_FILENO, " slot=");
+                    crate::write_u8_dec(notice.slot_id);
+                    write_str(STDOUT_FILENO, ")\n");
+                }
+            }
         }
     }
 

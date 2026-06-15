@@ -555,16 +555,17 @@ impl FbConsole {
                     if offset + bpp > shadow.len() {
                         continue;
                     }
-                    let mut inv = [0u8; 4];
-                    for i in 0..bpp {
-                        inv[i] = shadow[offset + i] ^ 0xFF;
-                        shadow[offset + i] = inv[i];
-                    }
+                    // Invert each byte in place, writing both the RAM shadow and
+                    // the framebuffer in one pass — no fixed-size temp, so this
+                    // is correct for any `bpp` (a `[u8; 4]` temp would panic if a
+                    // future pixel format ever reported bytes_per_pixel > 4).
                     // SAFETY: offset + bpp <= byte_len (checked); buf is the
                     // framebuffer base held under the mutex.
-                    unsafe {
-                        core::slice::from_raw_parts_mut(buf.add(offset), bpp)
-                            .copy_from_slice(&inv[..bpp]);
+                    let fb_px = unsafe { core::slice::from_raw_parts_mut(buf.add(offset), bpp) };
+                    for i in 0..bpp {
+                        let v = shadow[offset + i] ^ 0xFF;
+                        shadow[offset + i] = v;
+                        fb_px[i] = v;
                     }
                 } else {
                     let pixel = unsafe { core::slice::from_raw_parts_mut(buf.add(offset), bpp) };
