@@ -1681,6 +1681,19 @@ mod syscall_nr {
 /// crate::arch::x86_64::syscall::STRACE_PID = N`.
 pub(crate) static STRACE_PID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// One "warned" flag per syscall number (Linux range 0..512), used to rate-limit
+/// the `unhandled syscall N` WARN to once-per-number-per-boot. Without this, a
+/// userspace runtime probing unsupported syscalls in a retry loop (Node's
+/// capget=125 / io_uring_setup=425) floods the serial console, holding the
+/// IF-disabled `SERIAL1` lock long enough to starve the COM1 RX ISR → dropped
+/// serial-input bytes under SMP load. Numbers ≥ 512 (the m3OS-custom 0x114x
+/// block already has handlers) fall back to always-warn.
+#[allow(clippy::declare_interior_mutable_const)]
+static UNHANDLED_SYSCALL_WARNED: [core::sync::atomic::AtomicBool; 512] = {
+    const F: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    [F; 512]
+};
+
 #[unsafe(no_mangle)]
 pub extern "C" fn syscall_handler(
     number: u64,
@@ -2348,7 +2361,24 @@ pub extern "C" fn syscall_handler(
         #[cfg(feature = "kstack-overflow-test")]
         SYS_KSTACK_OVERFLOW_TEST => sys_kstack_overflow_test(),
         _ => {
-            log::warn!("unhandled syscall {number} (args: {arg0:#x}, {arg1:#x}, {arg2:#x})");
+            // Rate-limit to ONCE per syscall number per boot. A real userspace
+            // runtime (Node) probes unsupported syscalls (capget=125,
+            // io_uring_setup=425, …) in tight retry loops; the resulting WARN
+            // flood holds the IF-disabled `SERIAL1` lock busy-waiting on the slow
+            // UART TX, starving the COM1 RX ISR → dropped serial-input bytes under
+            // SMP load. Logging each number once preserves the "new unhandled
+            // syscall" diagnostic without the flood.
+            if number < UNHANDLED_SYSCALL_WARNED.len() as u64 {
+                if !UNHANDLED_SYSCALL_WARNED[number as usize]
+                    .swap(true, core::sync::atomic::Ordering::Relaxed)
+                {
+                    log::warn!(
+                        "unhandled syscall {number} (args: {arg0:#x}, {arg1:#x}, {arg2:#x}) [further occurrences suppressed]"
+                    );
+                }
+            } else {
+                log::warn!("unhandled syscall {number} (args: {arg0:#x}, {arg1:#x}, {arg2:#x})");
+            }
             NEG_ENOSYS
         }
     };

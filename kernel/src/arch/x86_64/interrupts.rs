@@ -1910,6 +1910,12 @@ pub unsafe extern "C" fn timer_handler_user(frame: &mut PreemptTrapFrameUser) {
     // AC so SMAP enforces while this handler runs the scheduler/IPC. See M1.
     clac_on_irq_entry();
     bump_timer_ticks_for_current_core();
+    // COM1 RX backstop on EVERY core (independent of IRQ4 routing): under heavy
+    // SMP serial-TX load the IRQ4-target core can be IF-masked busy-waiting on
+    // the slow UART TX, so this drains pending serial input from whichever core's
+    // tick fires. Cheap (one CAS, one LSR read when idle). See
+    // `serial::serial_rx_backstop`.
+    crate::serial::serial_rx_backstop();
     if !USING_APIC.load(Ordering::Relaxed) || crate::smp::is_bsp() {
         TICK_COUNT.fetch_add(1, Ordering::Relaxed);
         crate::time::on_timer_tick_isr();
@@ -1984,6 +1990,8 @@ pub unsafe extern "C" fn timer_handler_kernel(
     captured_kernel_rsp: u64,
 ) {
     bump_timer_ticks_for_current_core();
+    // COM1 RX backstop on every core — see the note in `timer_handler_user`.
+    crate::serial::serial_rx_backstop();
     if !USING_APIC.load(Ordering::Relaxed) || crate::smp::is_bsp() {
         TICK_COUNT.fetch_add(1, Ordering::Relaxed);
         crate::time::on_timer_tick_isr();

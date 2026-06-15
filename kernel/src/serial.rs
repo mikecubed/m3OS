@@ -250,10 +250,25 @@ pub fn serial_rx_pop() -> Option<u8> {
     Some(byte)
 }
 
-/// Called from the serial IRQ handler. Drains all available bytes from the
-/// UART FIFO into the lock-free ring buffer. No mutex is taken — safe to
-/// call from interrupt context.
-pub fn handle_serial_irq() {
+/// Serializes the two RX producers — the COM1 IRQ4 handler and the timer-ISR
+/// backstop ([`serial_rx_backstop`]) — so the SPSC ring keeps a single producer
+/// at a time. The drain loop reads to FIFO-empty, so a contender that loses the
+/// lock can safely skip: the winner drains everything (including bytes arriving
+/// during the contention).
+static SERIAL_RX_DRAIN_LOCK: AtomicBool = AtomicBool::new(false);
+
+/// Drain every byte currently in the UART RX FIFO into the ring buffer, under
+/// [`SERIAL_RX_DRAIN_LOCK`]. Returns `true` if ≥1 byte was drained. ISR-safe (no
+/// alloc, no blocking mutex).
+fn drain_uart_rx_locked() -> bool {
+    if SERIAL_RX_DRAIN_LOCK
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        // Another core is already draining to FIFO-empty; it will take anything
+        // pending. Skipping keeps the ring single-producer.
+        return false;
+    }
     let mut got_data = false;
     loop {
         let lsr: u8 = unsafe { x86_64::instructions::port::Port::new(0x3FDu16).read() };
@@ -264,20 +279,47 @@ pub fn handle_serial_irq() {
         let tail = SERIAL_RX_TAIL.load(Ordering::Relaxed);
         let next = (tail + 1) & SERIAL_BUF_MASK;
         if next != SERIAL_RX_HEAD.load(Ordering::Acquire) {
-            // Safety: single producer (IRQ handler); tail only advanced here.
+            // Safety: lock-serialized single producer; tail only advanced here.
             unsafe { SERIAL_RX_RAW[tail] = byte };
             SERIAL_RX_TAIL.store(next, Ordering::Release);
         }
         // else: buffer full — drop byte (prefer losing data over blocking ISR)
         got_data = true;
     }
-    if got_data {
+    SERIAL_RX_DRAIN_LOCK.store(false, Ordering::Release);
+    got_data
+}
+
+/// Called from the serial IRQ handler. Drains all available bytes from the
+/// UART FIFO into the lock-free ring buffer and wakes the feeder.
+pub fn handle_serial_irq() {
+    if drain_uart_rx_locked() {
         // Set the legacy pending flag (still read during feeder startup before
         // the task ID is registered, and harmless to keep for diagnostics).
         SERIAL_RX_PENDING.store(true, Ordering::Release);
         // H.1: wake the feeder task via the notification-based protocol.
         // This calls wake_task_v2 which issues a cross-core IPI if the feeder
         // is parked on another CPU — same mechanism as virtio-net.
+        wake_feeder_task();
+    }
+}
+
+/// Timer-ISR backstop for COM1 RX (SMP serial-input robustness).
+///
+/// Under heavy SMP serial-TX load a core busy-waiting on the slow UART TX holds
+/// the IF-disabled `SERIAL1` lock for the whole multi-byte write (≈8.7 ms for a
+/// 100-byte line at 115200 baud), masking IRQ4 on that core. If COM1 IRQ4 is
+/// routed there, incoming input overruns the 16-byte RX FIFO (or sits below the
+/// FIFO trigger un-IRQ'd) and is LOST — the dropped serial-input bytes that
+/// flaked the multi-core gates (`command not found: ode`). The timer fires on
+/// every core independently of IRQ4's routing, so polling the RX FIFO from the
+/// tick drains input even while IRQ4 is starved. Cheap: one `compare_exchange` +
+/// (when this core wins) one LSR read on an empty FIFO; only drains + wakes the
+/// feeder when bytes are actually pending. Called from both timer-handler paths
+/// on every core.
+pub fn serial_rx_backstop() {
+    if drain_uart_rx_locked() {
+        SERIAL_RX_PENDING.store(true, Ordering::Release);
         wake_feeder_task();
     }
 }
