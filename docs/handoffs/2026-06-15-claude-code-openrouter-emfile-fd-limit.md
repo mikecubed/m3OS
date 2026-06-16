@@ -1,25 +1,32 @@
 ---
-status: IN PROGRESS — ROOT-CAUSED + first fix landed, verification run in flight.
-  Claude Code locks up on m3OS. Root cause: the per-process fd table was capped at
-  MAX_FDS=32, which Node/Claude Code exhaust in a single session → the next
-  open/socket/pipe returns EMFILE and the agent wedges (observed `rg error
-  (code=EMFILE)` immediately before the lock-up, in claude's own debug log). Fix:
-  raised MAX_FDS 32→128 (commit 3d92bb40). The ENTIRE networking stack is exonerated
-  (a raw authed streaming POST to the API returns 200/DONE from m3OS) — this was
-  never a network bug. **VERIFICATION INCONCLUSIVE / NEW CONCERN:** the post-fix
-  verification runs got STUCK at `claude --version` (single-core ~22 min, multi-core
-  ~10 min, both frozen) — yet `claude --version` was FAST (~tens of seconds) in every
-  pre-fix run (MAX_FDS=32). Strongly suggests raising MAX_FDS slowed node startup, BUT
-  it is confounded (FAST_ITER reused-disk bloat after ~10 runs + long-session host
-  load + single-core VFS serialization), so a CLEAN controlled re-test is the #1 open
-  item before trusting 128. See "Verification status".
+status: IN PROGRESS — SECOND ROOT CAUSE FOUND + FIXED (uncommitted, in working tree),
+  pending a verification run. The MAX_FDS=32→128 raise (commit 3d92bb40) fixed the
+  EMFILE lock-up but introduced a SECOND bug: with `MAX_FDS=128` the per-process fd
+  table was an inline `[Option<FdEntry>; 128]` of a `VfsFileMeta`-bloated ~96-byte
+  `FdEntry` ≈ **12 KiB**, living inline in `Process` AND returned by-value from
+  `fd_table_snapshot()`. Node's `clone(CLONE_THREAD)` (libuv threadpool) / `fork`
+  path stacks THREE of them at once (parent snapshot + `child_fds_copy` + the new
+  `Process`'s inline copy) ≈ 36 KiB — which overflowed the 64 KiB per-task kernel
+  stack the instant MAX_FDS went 32→128 (at 32 the three copies were only ~9 KiB).
+  This is exactly the 06-15 "hypothesis #2 / kstack pressure" prediction, now
+  CONFIRMED by the live `[int] DOUBLE FAULT = kstack overflow … attributable to pid
+  43 [node]` (slot-math on `rsp=0xffff808000550df8` shows the FULL 64 KiB was
+  consumed). The kernel's Track-D recovery killed node and survived, but node dying
+  means claude can't run. **FIX (this session):** moved the fd table to the heap —
+  `Process.fd_table` / `shared_fd_table` / `fd_table_snapshot()` / `new_fd_table()` /
+  `spawn_process_with_cr3_and_fds()` are now `Vec<Option<FdEntry>>` (always length
+  `MAX_FDS`), so only a 24-byte `Vec` header ever lands on the kstack. `cargo xtask
+  check` passes. Networking remains fully exonerated. **OPEN:** verify node no longer
+  overflows (re-run the OpenRouter round-trip / node-smoke); commit the fix.
 branch: feat/phase-90b-claude-code
 key-commits:
   - 9e09b67c  kernel/net: accept TCP keepalive socket options (fixes setsockopt ENOPROTOOPT)
   - 28e42a55  ports/claude-code: depend on ca-certificates (CA bundle for the launcher)
   - 3d92bb40  kernel/process: raise MAX_FDS 32 → 128 (fixes Claude Code EMFILE lock-up)
   - c7e443ca  kernel/smp/tlb: word ack-timeout diagnostic per regime (PR #247 review)
-date: 2026-06-15
+  - (uncommitted) kernel/process: heap-back the fd table (Vec<Option<FdEntry>>) —
+    fixes the node clone/fork kstack overflow the MAX_FDS=128 raise introduced
+date: 2026-06-15 (updated 2026-06-16)
 component: kernel/process (fd table / MAX_FDS) + kernel/net (socket options) +
   ports/claude-code (DEPS) + xtask claude-smoke (OpenRouter/model harness plumbing,
   UNCOMMITTED in working tree)
@@ -87,41 +94,59 @@ Once the 32-slot table fills, `fd_alloc()` returns None → the syscall returns 
    it BY VALUE on the **16 KiB syscall stack** (`SYSCALL_STACK_SIZE`); at the 64-byte
    `FdEntry` class that is ≤8 KiB and fits. 128 is ~4× claude's observed ~30-fd ceiling.
 
-## Verification status (2026-06-15) — INCONCLUSIVE, must re-test cleanly
+## Verification status — hypothesis #2 CONFIRMED + FIXED (2026-06-16)
 
-After committing `3d92bb40` (MAX_FDS=128), two verification runs of `claude -p` over
-OpenRouter (Haiku 4.5) both **stalled at `claude --version`** (step 14):
-- single-core (`M3OS_SMP=1`): ~22 min, frozen at step 14 (never produced `2.1.112`).
-- multi-core (default 4): ~10 min, frozen at step 14.
+The prior stalls/lock-ups were the predicted **kstack pressure** (hypothesis #2 below),
+now confirmed by a live crash and fixed by heap-backing the fd table.
 
-This is suspicious because `claude --version` was FAST (reached step 30 within ~120 s)
-in EVERY pre-fix run (MAX_FDS=32). The only kernel delta is MAX_FDS 32→128, so the raise
-is the prime suspect for slowing/breaking node startup. **But the data is confounded** —
-both runs used `M3OS_CLAUDE_FAST_ITER=1`, reusing a data disk that ~10 prior runs bloated
-with `.claude.json` + many `backups/` (claude reads/backs-up config at startup), plus
-host load from a very long session, plus single-core's lack of node↔vfs_server I/O
-parallelism. So we cannot yet conclude 128 itself is the cause.
+**The confirming crash (2026-06-16 re-run):** node (`pid 43`) died with
+```
+[int] DOUBLE FAULT = kstack overflow (rsp=0xffff808000550df8) attributable to pid 43 — killing process; core recovers (no halt)
+[WARN] [fault_kill] trampoline running for pid 43
+```
+Slot math nails it to a per-task kstack: area start `0xFFFF_8080_0000_0000`, slot vsize
+`0x11000` (4 KiB guard + 64 KiB usable). `0x550df8 / 0x11000` = slot 80, whose guard page
+is `0x550000..0x551000`; `rsp=0x550df8` sits 520 bytes INTO that guard — i.e. the entire
+64 KiB usable stack was consumed and RSP marched past the bottom (a #DF because the
+guard-page #PF couldn't push its own frame). Track-D recovery killed node and the core
+survived, but a dead node means claude can't run.
 
-Leading hypotheses for a real MAX_FDS-driven slowdown (investigate in order):
-1. **libuv "close all fds to RLIMIT_NOFILE" startup loop.** `getrlimit(RLIMIT_NOFILE)`
-   now reports 128, so libuv iterates fd=3..128 (vs 3..32) calling close/F_SETFD on each.
-   Phase 89 already fixed an F_SETFD busy-spin here (`F_SETFD→EBADF`); confirm it still
-   holds across the larger range and isn't re-triggering a spin. If m3OS has no
-   `close_range(2)`, libuv falls back to the per-fd loop — implementing `close_range`
-   would make this O(1) regardless of MAX_FDS.
-2. **kstack pressure.** `fd_table_snapshot()`/`new_fd_table*()` materialize a
-   `[Option<FdEntry>; 128]` (~8 KiB) BY VALUE on the 16 KiB syscall stack during
-   fork/exec. Confirm this doesn't overflow/near-overflow under node's exec/clone call
-   chain (login/sh0 exec fine at 128, so simple exec is OK — but node's deeper path may
-   not be). If implicated, move the fd table to the heap (see secondary bug below).
+**Why MAX_FDS=128 caused it.** `FdEntry` is ~96 bytes (Phase 88 embedded a `VfsFileMeta`
+in `FdBackend::VfsService`), so `[Option<FdEntry>; 128]` ≈ **12 KiB**. It lived inline in
+`Process` AND was returned by-value from `fd_table_snapshot()` AND passed by-value to
+`spawn_process_with_cr3_and_fds()`. Node's `clone(CLONE_THREAD)` (libuv threadpool) and
+`fork` paths stack THREE such copies simultaneously — `sys_clone_thread`: `parent_fds`
+snapshot + `child_fds_copy = parent_fds.clone()` + the child `Process`'s inline copy ≈
+36 KiB; `sys_fork`: `parent_fds` held in a tuple + the by-value arg to `spawn_*` + the
+child `Process` ≈ 36 KiB. Plus the rest of the parent-state tuple (VmaTree clone, strings,
+`[SignalAction; 32]`) and normal frames → > 64 KiB. At MAX_FDS=32 those three copies were
+only ~9 KiB, which is why node started fine before the raise and overflowed right after.
+(The handoff's "16 KiB SYSCALL_STACK" framing was imprecise — syscalls actually run on the
+per-task **64 KiB** kstack via `set_per_core_syscall_stack_top(kstack_top)`; the overflow
+math is against 64 KiB, not 16 KiB. Either way the inline 12 KiB ×3 was the killer.)
 
-**#1 NEXT-SESSION TASK — clean controlled re-test (isolate MAX_FDS):**
-- `cargo xtask clean` (fresh data disk — removes the bloated `.claude` state), then run
-  WITHOUT `M3OS_CLAUDE_FAST_ITER`, multi-core, and **time `claude --version`** at
-  MAX_FDS=128 vs a quick build at MAX_FDS=32. If 128 is materially slower → confirmed;
-  pursue hypothesis 1/2. If comparable → 128 is fine and the stalls were disk-bloat/load.
-- A lighter isolation: boot a fresh image at 128 and run plain `node --version` (the
-  `node-smoke` path) — if node itself is slow to start at 128, it's MAX_FDS, not claude.
+**The fix (this session, in the working tree — `cargo xtask check` passes):** moved the fd
+table off the stack into the heap. `Process.fd_table` and `shared_fd_table` are now
+`Vec<Option<FdEntry>>` (`Arc<IrqSafeMutex<Vec<…>>>` for the shared case); `new_fd_table()`,
+`new_fd_table_pub()`, `fd_table_snapshot()` return `Vec`; `add_fd_refs()` takes `&[…]`;
+`spawn_process_with_cr3_and_fds()` takes a `Vec`. The Vec is ALWAYS exactly `MAX_FDS` long
+(every fd helper indexes `0..MAX_FDS`), built with `vec![None; MAX_FDS]` so even the
+constructor never materializes an `[_; N]` stack temporary. Net: only a 24-byte `Vec`
+header ever lands on the kstack; the clone/fork path's fd-table cost drops from ~36 KiB to
+~100 bytes. This also makes raising `MAX_FDS` to Linux's 1024 a one-line change (heap cost
+only, no stack budget) if claude ever needs more than 128 — kept at 128 for now (~4× the
+observed ~30-fd ceiling).
+
+Hypothesis #1 (libuv close-all-fds-to-RLIMIT loop) is NOT implicated by the crash but is
+still a latent O(MAX_FDS) startup cost; `close_range(2)` would make it O(1). Track it
+only if startup feels slow after the kstack fix lands.
+
+**#1 NEXT-SESSION TASK — verify the heap fix:**
+- Re-run the OpenRouter round-trip (command in "How to reproduce") and confirm node no
+  longer hits `DOUBLE FAULT = kstack overflow … pid <node>` and claude answers `579`.
+- Cheaper proxy: `M3OS_NODE_REGRESSION=1` `node-smoke` under `M3OS_KVM=1` — its egress arm
+  exercises the same libuv `clone(CLONE_THREAD)` threadpool path that overflowed.
+- Then commit the heap refactor (see key-commits).
 
 ## Secondary bugs (observed, NOT yet fixed — next-session candidates)
 
@@ -133,12 +158,13 @@ Leading hypotheses for a real MAX_FDS-driven slowdown (investigate in order):
   — likely a bad arg-validation / unimplemented-but-not-ENOSYS handler. Find which syscall
   Node's copyFile uses and either implement it or return `-ENOSYS` so Node's userspace
   fallback engages.
-- **MAX_FDS heap refactor (raise 128 → 1024).** To reach Linux's standard 1024 the fd
-  table must move off the kstack: change `Process.fd_table` and `shared_fd_table` from
-  inline `[Option<FdEntry>; MAX_FDS]` to a heap `Vec<Option<FdEntry>>` (or `Box<[_]>`), and
-  make `new_fd_table*()` + `fd_table_snapshot()` heap-construct/return so neither lands on
-  the 16 KiB syscall stack. Then 1024 is safe. Only needed if 128 proves tight under
-  heavier agent use.
+- **MAX_FDS heap refactor — DONE (2026-06-16, uncommitted).** `Process.fd_table`,
+  `shared_fd_table`, `fd_table_snapshot()`, `new_fd_table*()`, and
+  `spawn_process_with_cr3_and_fds()` are now heap-backed `Vec<Option<FdEntry>>` (always
+  length `MAX_FDS`), so neither construction nor the snapshot lands on the kstack. This
+  was NOT just the "raise to 1024" nicety it was filed as — it was the FIX for the node
+  clone/fork kstack overflow the MAX_FDS=128 raise introduced (see "Verification status").
+  Raising to 1024 is now a one-line `MAX_FDS` change (heap cost only); left at 128.
 - **SMP contention under heavy Node (multi-core).** The user's 4-core run showed
   `[sched] stale-ready` ×12, `spurious write-fault recovered` ×9, `vfs_server: ipc_reply
   failed` ×2, and one `virtio-blk request timeout`. The repo already pins `-smp 1` for
@@ -199,15 +225,15 @@ Verify `echo $ANTHROPIC_BASE_URL` is non-empty (ion is the login shell, not POSI
 
 ## Next steps (priority order)
 
-1. **Clean controlled re-test of MAX_FDS=128** (see "Verification status"): `cargo xtask
-   clean`, fresh non-FAST_ITER multi-core boot, time `claude --version` at 128 vs 32 to
-   isolate whether the raise slowed node startup. Then confirm the OpenRouter round-trip
-   answers `579`. If 128 slows startup → fix the fd-close scaling (close_range / verify
-   the libuv F_SETFD loop) BEFORE relying on the raise. If startup is fine → 128 stands;
-   confirm the round-trip and we're done for the lock-up.
-2. If 128 is tight under real agent use, or implicated in the kstack pressure →
-   **heap-refactor the fd table** (`Vec`/`Box<[_]>`) so neither construction nor the
-   snapshot lands on the 16 KiB syscall stack, enabling MAX_FDS=1024 safely.
+1. **Verify the heap fd-table fix** (this session's change, uncommitted): re-run the
+   OpenRouter round-trip (command below) and confirm (a) NO `DOUBLE FAULT = kstack
+   overflow … attributable to pid <node>` appears, and (b) claude answers `579`. Cheaper
+   proxy first: `M3OS_NODE_REGRESSION=1` `node-smoke` under `M3OS_KVM=1` (its egress arm
+   drives the same libuv `clone(CLONE_THREAD)` path that overflowed).
+2. **Commit the heap fd-table refactor** once verified (kernel/src/process/mod.rs +
+   kernel/src/arch/x86_64/syscall/mod.rs + the slab.rs comment). `cargo xtask check`
+   already passes. Suggested: also set `M3OS_NODE_REGRESSION=1` / `M3OS_SMP_REGRESSION=1`
+   on the PR since the change touches the fork/clone fd path.
 3. **Fix `copyfile`→EFAULT** (implement the copy syscall or return ENOSYS for fallback).
 4. **Commit the clean `M3OS_CLAUDE_BASE_URL`/`M3OS_CLAUDE_MODEL` harness support**; drop the
    throwaway probe scaffolding.

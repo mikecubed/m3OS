@@ -293,8 +293,8 @@ pub struct KernelSlabCaches {
     pub task_cache: IrqSafeMutex<SlabCache>,
     /// 64-byte objects.  Currently exercised only by the
     /// `slab_cache_alloc_free` smoke test (`kernel/src/main.rs`); the audit
-    /// records that production `FdEntry`s live inline in
-    /// `[Option<FdEntry>; MAX_FDS]` per process.
+    /// records that production `FdEntry`s live in a heap-backed
+    /// `Vec<Option<FdEntry>>` (length `MAX_FDS`) per process.
     pub fd_cache: IrqSafeMutex<SlabCache>,
     /// 128-byte objects.  Audit records that `Endpoint`s live inline in
     /// `EndpointRegistry::slots: Vec<Option<Endpoint>>`.

@@ -4692,8 +4692,11 @@ pub(super) fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
                 0,
                 0,
                 {
+                    // Heap-backed, MAX_FDS-long all-`None` table (matches the
+                    // `Some` arm's `fd_table_snapshot()` length invariant);
+                    // `vec!` fills in place so nothing lands on the kstack.
                     const NONE: Option<crate::process::FdEntry> = None;
-                    [NONE; crate::process::MAX_FDS]
+                    alloc::vec![NONE; crate::process::MAX_FDS]
                 },
                 0,
                 alloc::string::String::from("/"),
