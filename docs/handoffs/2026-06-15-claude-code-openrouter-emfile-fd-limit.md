@@ -11,12 +11,29 @@ status: THREE root causes found+fixed. (1) EMFILE — MAX_FDS 32→128 (3d92bb40
   in-kernel and, via the shared VFS, freezing the whole machine (the user's frozen
   login screen). Fix: handle `/dev/tty` as a char device (S_IFCHR 0o666) in both
   functions, matching Linux (stat never touches the FS) and the other devices.
-  VERIFIED: with the fix node sails past — stats `/dev/tty` repeatedly, reads settings/
-  `.git`/CA bundle, JITs, and **spawns ripgrep + handles SIGCHLD (agent loop runs)**,
-  no freeze. (The `claude -p` round-trip is then slow — cold agent over the ~200 KB/s
-  ring-3 VFS — but PROGRESSING, not hung; the 240s claude-smoke step window is too
-  short for it. Separate from the freeze.) The kstack-overflow backtrace diagnostic
-  (6f02d18b) was the tool that pinned #3.
+  VERIFIED: with the fix node sails PAST the freeze — claude's own `--debug` log
+  (pulled from the disk) now advances from the old hang at `[STARTUP] Loading MCP
+  configs...` through `Running setup()...` to `Loading skills from:
+  managed=/etc/claude-code/.claude/skills, user=/root/.claude/skills` — and node
+  stats `/dev/tty` repeatedly, reads settings/`.git`/CA bundle, JITs, spawns ripgrep +
+  handles SIGCHLD. The system NO LONGER freezes. The kstack-overflow backtrace
+  diagnostic (6f02d18b) + a node syscall trace (`M3OS_STRACE_COMM=node`) + an fstatat
+  path log pinned #3 (the last `[strace]` was `enter syscall=4`/stat, path `/dev/tty`).
+
+  REMAINING (separate, less-severe, NOT the reported freeze): `claude -p` does not
+  COMPLETE — it stalls in claude's `setup()`/skill-discovery phase. Characterized over
+  ~16 KVM reproduce cycles: (a) happens on BOTH `-smp 1` and `-smp 4` (not a single-
+  core lock deadlock); (b) NO `DOUBLE FAULT`/`KERNEL PANIC`/`process killed`/`vfs_server:
+  ipc_reply failed` — a CLEAN stall, and `vfs_server` keeps replying + other node
+  threads keep churning (futex/exit), so the SYSTEM STAYS RESPONSIVE (unlike the #3
+  freeze); (c) the syscall-level manifestation is non-deterministic (a `stat`, a
+  `futex`, or right after V8 `[wx] v2-guarded W+X mapping (pkey=1)` WASM codegen),
+  consistent with a node-internal threading/event-loop wait rather than a kernel wedge.
+  i.e. node is alive but a thread is waiting on something that never completes during
+  claude's heavy startup. This is a DEEPER, iterative issue (claude appears to hit a
+  sequence of m3OS gaps in its startup, each fix advancing it) and a candidate for a
+  dedicated follow-up; the cwd/`rg --files`-walks-`/` theory was tested and DISPROVED
+  (an empty cwd still stalled).
 prior-status: FIXED + PROVEN BY CONTROLLED EXPERIMENT (commit 952da571, pushed). The heap
   fd-table fix is confirmed sufficient: claude-smoke PASSES on 4-core AND 1-core (KVM),
   with and without the ANTHROPIC_* OpenRouter env vars, through the full agent flow
