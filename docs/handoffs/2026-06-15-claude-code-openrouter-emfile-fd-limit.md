@@ -1,6 +1,20 @@
 ---
-status: IN PROGRESS — SECOND ROOT CAUSE FOUND + FIXED + RUNTIME-VERIFIED (committed
-  952da571 + pushed); end-to-end OpenRouter round-trip on the laptop is the last step.
+status: FIXED + PROVEN BY CONTROLLED EXPERIMENT (commit 952da571, pushed). The heap
+  fd-table fix is confirmed sufficient: claude-smoke PASSES on 4-core AND 1-core (KVM),
+  with and without the ANTHROPIC_* OpenRouter env vars, through the full agent flow
+  (7 node launches + ripgrep child spawn), zero overflows. A controlled A/B nailed it:
+  reverting JUST the fd-table to the pre-fix inline `[Option<FdEntry>; 128]` (keeping a
+  new #DF backtrace diagnostic) reproduces the overflow single-core on the FIRST node
+  launch; the fixed (heap `Vec`) build does not. The new diagnostic confirmed the
+  MECHANISM is LARGE FRAMES, not recursion: at overflow only ~66 `.text` return
+  addresses are on the 64 KiB stack (a recursion would show hundreds/thousands), and
+  the deepest frames are `memcpy`/`memset` of ~12 KiB — the inline fd-table copied/
+  zeroed by value in the fork/clone/spawn path. ⇒ **If you still hit the overflow, your
+  kernel is a STALE build without 952da571 — `git pull` and rebuild (xtask always
+  recompiles the kernel from source, so a fresh build picks it up).** The kstack is NOT
+  too small: 64 KiB is already 4× Linux's 16 KiB `THREAD_SIZE`; the bug was the kernel
+  putting 12 KiB buffers on the stack, which the heap fix removes. Last step: the
+  end-to-end OpenRouter round-trip on the laptop (expect `579`) on a freshly-built kernel.
   The MAX_FDS=32→128 raise (commit 3d92bb40) fixed the
   EMFILE lock-up but introduced a SECOND bug: with `MAX_FDS=128` the per-process fd
   table was an inline `[Option<FdEntry>; 128]` of a `VfsFileMeta`-bloated ~96-byte

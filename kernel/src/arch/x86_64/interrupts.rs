@@ -1667,6 +1667,134 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     crate::hlt_loop();
 }
 
+/// Scan an overflowed kernel stack slot for kernel-`.text` return addresses and
+/// report the dominant recurring one — the signature of a runaway recursion.
+///
+/// Runs on the clean #DF IST stack (the faulting per-task kstack is exhausted),
+/// so it must touch only mapped memory and take no locks. The guard page the
+/// faulting RSP sits in is unmapped, so the scan starts at the slot's usable
+/// base (just above the guard) and walks up to the stack top — covering the
+/// frames the recursion pushed. `.text` candidates are identified relative to a
+/// runtime anchor (`double_fault_handler`, itself in `.text`): the kernel image
+/// is ~11 MiB, so any return address sits within ±16 MiB of the anchor, while
+/// kstack/heap data pointers are GiBs away and filtered out. Boyer–Moore
+/// majority voting finds the most-repeated address in O(1) space; the printed
+/// `delta` (addr − anchor) resolves offline via
+/// `addr2line -e kernel $((<elf vaddr of double_fault_handler> + delta))`.
+fn dump_kstack_overflow_backtrace(slot: usize, faulting_rsp: u64) {
+    let (usable_base, top) = crate::task::kstack::slot_usable_bounds(slot);
+    let anchor = double_fault_handler as *const () as u64;
+    const WINDOW: u64 = 16 * 1024 * 1024;
+    let is_text = |v: u64| -> bool {
+        let d = v.wrapping_sub(anchor) as i64;
+        d.unsigned_abs() <= WINDOW
+    };
+
+    _panic_print(format_args!(
+        "[int] kstack-bt: slot={} usable=[{:#x}..{:#x}) used={} KiB anchor(double_fault_handler)={:#x}\n",
+        slot,
+        usable_base,
+        top,
+        (top.saturating_sub(faulting_rsp)) / 1024,
+        anchor,
+    ));
+
+    // Pass 1 — Boyer–Moore majority vote over .text candidates.
+    let mut cand: u64 = 0;
+    let mut votes: i64 = 0;
+    let mut total_text: u64 = 0;
+    let mut addr = usable_base;
+    while addr < top {
+        // SAFETY: [usable_base, top) is this slot's mapped stack region (PML4[257],
+        // shared into the current CR3); 8-byte aligned reads stay in-bounds.
+        let w = unsafe { core::ptr::read_volatile(addr as *const u64) };
+        if is_text(w) {
+            total_text += 1;
+            if votes == 0 {
+                cand = w;
+                votes = 1;
+            } else if w == cand {
+                votes += 1;
+            } else {
+                votes -= 1;
+            }
+        }
+        addr += 8;
+    }
+
+    if total_text == 0 {
+        _panic_print(format_args!(
+            "[int] kstack-bt: no .text return addresses found (frame too large / non-recursive?)\n"
+        ));
+        return;
+    }
+
+    // Pass 2 — count the candidate, capture its frame stride and the deepest hits.
+    let mut count: u64 = 0;
+    let mut first_off: u64 = 0;
+    let mut stride: u64 = 0;
+    let mut prev_off: u64 = 0;
+    let mut printed_deep = 0u32;
+    addr = usable_base;
+    while addr < top {
+        let w = unsafe { core::ptr::read_volatile(addr as *const u64) };
+        if is_text(w) {
+            // Print the few deepest distinct .text addresses (nearest the fault).
+            if printed_deep < 8 {
+                _panic_print(format_args!(
+                    "[int] kstack-bt: depth#{} off={:#06x} addr={:#x} delta={}{:#x}\n",
+                    printed_deep,
+                    addr - usable_base,
+                    w,
+                    if w >= anchor { "+" } else { "-" },
+                    w.abs_diff(anchor),
+                ));
+                printed_deep += 1;
+            }
+            if w == cand {
+                if count == 0 {
+                    first_off = addr;
+                } else if stride == 0 {
+                    stride = addr - prev_off;
+                }
+                prev_off = addr;
+                count += 1;
+            }
+        }
+        addr += 8;
+    }
+
+    let _ = first_off;
+    let used = top.saturating_sub(faulting_rsp);
+    let avg_frame = used / total_text.max(1);
+    // Two distinct overflow shapes: a runaway *recursion* drives one return
+    // address to dominate the (large) `.text` population; a *large-frame*
+    // chain has only a handful of frames but each is huge (e.g. a by-value
+    // `[T; N]` buffer on the stack), so `.text` words stay few and no address
+    // repeats. Pick the verdict from the evidence rather than always blaming
+    // recursion.
+    let recursion = count >= 8 && count.saturating_mul(4) >= total_text;
+    if recursion {
+        _panic_print(format_args!(
+            "[int] kstack-bt: verdict=RECURSION site={:#x} delta={}{:#x} repeats={}x stride={} bytes ({} .text frames over {} KiB)\n",
+            cand,
+            if cand >= anchor { "+" } else { "-" },
+            cand.abs_diff(anchor),
+            count,
+            stride,
+            total_text,
+            used / 1024,
+        ));
+    } else {
+        _panic_print(format_args!(
+            "[int] kstack-bt: verdict=LARGE-FRAME chain — only {} .text frames over {} KiB (avg {} B/frame); look for a big by-value buffer (e.g. an inline [T; N]) in the deepest frames above\n",
+            total_text,
+            used / 1024,
+            avg_frame,
+        ));
+    }
+}
+
 extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFrame, _err: u64) -> ! {
     // Track D: a #DF whose faulting context's RSP sits in a kstack guard page is
     // a kernel-stack overflow that *escalated* — the guard-page #PF couldn't push
@@ -1676,7 +1804,7 @@ extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFrame,
     // converting a previously-fatal #DF into a SIGSEGV of the offending process.
     // See docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md.
     let faulting_rsp = stack_frame.stack_pointer.as_u64();
-    if crate::task::kstack::classify_guard_page_fault(faulting_rsp).is_some()
+    if let Some(slot) = crate::task::kstack::classify_guard_page_fault(faulting_rsp)
         && crate::smp::is_per_core_ready()
     {
         let pid = crate::process::current_pid();
@@ -1686,6 +1814,9 @@ extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFrame,
                  killing process; core recovers (no halt)\n",
                 faulting_rsp, pid,
             ));
+            // Pin the overflowing call chain (closes the 2026-06-14 handoff's
+            // open "origin audit"). Safe on the clean DF IST stack.
+            dump_kstack_overflow_backtrace(slot, faulting_rsp);
             FAULT_KILL_PID.store(pid, Ordering::Relaxed);
             // Already on the clean DF IST stack — run the kill directly.
             // `fault_kill_trampoline` is `-> !` and ends in a switch to the

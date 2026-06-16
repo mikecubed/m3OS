@@ -191,6 +191,15 @@ pub fn classify_guard_page_fault(vaddr: u64) -> Option<usize> {
     }
 }
 
+/// Return the (usable_base, top) virtual addresses of slot `i`'s mapped
+/// stack region — i.e. the bytes just above the guard page up to the stack
+/// top. Used by the double-fault overflow diagnostic to scan the exhausted
+/// stack for return addresses (the guard page itself is unmapped, so a scan
+/// must start at the usable base, not at the faulting RSP).
+pub fn slot_usable_bounds(i: usize) -> (u64, u64) {
+    (slot_usable_base(i) as u64, slot_top(i) as u64)
+}
+
 /// RAII handle for one kernel-stack slot.
 ///
 /// Owns exclusive access to the slot's mapped virtual range until dropped.
