@@ -1,6 +1,7 @@
 ---
-status: IN PROGRESS — SECOND ROOT CAUSE FOUND + FIXED (uncommitted, in working tree),
-  pending a verification run. The MAX_FDS=32→128 raise (commit 3d92bb40) fixed the
+status: IN PROGRESS — SECOND ROOT CAUSE FOUND + FIXED + RUNTIME-VERIFIED (committed
+  952da571 + pushed); end-to-end OpenRouter round-trip on the laptop is the last step.
+  The MAX_FDS=32→128 raise (commit 3d92bb40) fixed the
   EMFILE lock-up but introduced a SECOND bug: with `MAX_FDS=128` the per-process fd
   table was an inline `[Option<FdEntry>; 128]` of a `VfsFileMeta`-bloated ~96-byte
   `FdEntry` ≈ **12 KiB**, living inline in `Process` AND returned by-value from
@@ -16,16 +17,21 @@ status: IN PROGRESS — SECOND ROOT CAUSE FOUND + FIXED (uncommitted, in working
   `Process.fd_table` / `shared_fd_table` / `fd_table_snapshot()` / `new_fd_table()` /
   `spawn_process_with_cr3_and_fds()` are now `Vec<Option<FdEntry>>` (always length
   `MAX_FDS`), so only a 24-byte `Vec` header ever lands on the kstack. `cargo xtask
-  check` passes. Networking remains fully exonerated. **OPEN:** verify node no longer
-  overflows (re-run the OpenRouter round-trip / node-smoke); commit the fix.
+  check` passes. **RUNTIME-VERIFIED:** `M3OS_KVM=1 cargo xtask node-smoke` →
+  `node-smoke: PASSED (32 steps in 111s)` with `NODE_EGRESS_OK` (the libuv-threadpool
+  `clone(CLONE_THREAD)` path that overflowed) and 0 `kstack overflow` / 0 `DOUBLE FAULT`
+  / 0 `fault_kill` lines. Networking remains fully exonerated. **OPEN:** the end-to-end
+  OpenRouter `claude -p` round-trip on the laptop — exercises `sys_fork` via the ripgrep
+  spawn (same Vec fix) + the authed network round-trip → expect `579`.
 branch: feat/phase-90b-claude-code
 key-commits:
   - 9e09b67c  kernel/net: accept TCP keepalive socket options (fixes setsockopt ENOPROTOOPT)
   - 28e42a55  ports/claude-code: depend on ca-certificates (CA bundle for the launcher)
   - 3d92bb40  kernel/process: raise MAX_FDS 32 → 128 (fixes Claude Code EMFILE lock-up)
   - c7e443ca  kernel/smp/tlb: word ack-timeout diagnostic per regime (PR #247 review)
-  - (uncommitted) kernel/process: heap-back the fd table (Vec<Option<FdEntry>>) —
-    fixes the node clone/fork kstack overflow the MAX_FDS=128 raise introduced
+  - 952da571  kernel/process: heap-back the fd table (Vec<Option<FdEntry>>) — fixes the
+    node clone/fork kstack overflow the MAX_FDS=128 raise introduced (node-smoke verified)
+  - b567e304  xtask/claude-smoke: M3OS_CLAUDE_BASE_URL/MODEL + OpenRouter round-trip arm
 date: 2026-06-15 (updated 2026-06-16)
 component: kernel/process (fd table / MAX_FDS) + kernel/net (socket options) +
   ports/claude-code (DEPS) + xtask claude-smoke (OpenRouter/model harness plumbing,
