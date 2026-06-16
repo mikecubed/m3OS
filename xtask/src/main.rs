@@ -16691,7 +16691,23 @@ fn cmd_claude_smoke(args: &SmokeBootArgs) {
     }
 
     let do_net = attempt_net && cred.is_some();
-    let steps = claude_smoke_steps(do_net, cred, fast_iter);
+    // M3OS_CLAUDE_BASE_URL — point Claude Code at an Anthropic-protocol endpoint
+    // other than api.anthropic.com (e.g. OpenRouter's https://openrouter.ai/api or a
+    // LiteLLM/claude-code-router proxy). When set, the staged credential is exported
+    // as the bearer ANTHROPIC_AUTH_TOKEN with ANTHROPIC_API_KEY forced empty.
+    let base_url: Option<&'static str> = std::env::var("M3OS_CLAUDE_BASE_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(|s| Box::leak(s.into_boxed_str()) as &'static str);
+    // M3OS_CLAUDE_MODEL — pin both ANTHROPIC_MODEL and ANTHROPIC_SMALL_FAST_MODEL
+    // (e.g. anthropic/claude-3.5-haiku over OpenRouter) so runs are cheap.
+    let model: Option<&'static str> = std::env::var("M3OS_CLAUDE_MODEL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(|s| Box::leak(s.into_boxed_str()) as &'static str);
+    let steps = claude_smoke_steps(do_net, cred, base_url, model, fast_iter);
 
     if !attempt_net || cred.is_none() {
         println!(
@@ -16972,6 +16988,8 @@ fn claude_tui_render_arm(uefi_image: &Path, ovmf: &Path, timeout_secs: u64) -> R
 fn claude_smoke_steps(
     do_net: bool,
     cred: Option<(&'static str, &'static str)>,
+    base_url: Option<&'static str>,
+    model: Option<&'static str>,
     fast_iter: bool,
 ) -> Vec<SmokeStep> {
     let mut steps = vec![SmokeStep::Wait {
@@ -17128,17 +17146,81 @@ fn claude_smoke_steps(
     // 6. Opt-in authenticated live arms (M3OS_CLAUDE_NET=1 + a seeded credential).
     if do_net && let Some((env_var, cred_path)) = cred {
         // Export the credential from the seeded 0600 file — the VALUE never crosses
-        // serial, only `$(cat <path>)` does.
-        let export_cmd: &'static str =
-            Box::leak(format!("export {env_var}=\"$(cat {cred_path})\"\n").into_boxed_str());
+        // serial, only `$(cat <path>)` does. With M3OS_CLAUDE_BASE_URL set
+        // (OpenRouter / any Anthropic-protocol proxy) the staged key is the bearer
+        // ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY is forced empty (proxies reject a
+        // stray x-api-key), and ANTHROPIC_BASE_URL points at the endpoint — mirroring
+        // a sourced `openrouter.sh`. Otherwise it's the official-API single export.
+        let mut export_src = if let Some(url) = base_url {
+            format!(
+                "export ANTHROPIC_BASE_URL=\"{url}\"\n\
+                 export ANTHROPIC_API_KEY=\"\"\n\
+                 export ANTHROPIC_AUTH_TOKEN=\"$(cat {cred_path})\"\n"
+            )
+        } else {
+            format!("export {env_var}=\"$(cat {cred_path})\"\n")
+        };
+        // Pin the model (M3OS_CLAUDE_MODEL) — set BOTH the main model and the
+        // small/fast background model so every request is cheap (e.g. a Haiku
+        // slug like anthropic/claude-3.5-haiku over OpenRouter). Non-secret.
+        if let Some(m) = model {
+            export_src.push_str(&format!(
+                "export ANTHROPIC_MODEL=\"{m}\"\n\
+                 export ANTHROPIC_SMALL_FAST_MODEL=\"{m}\"\n"
+            ));
+        }
+        let export_cmd: &'static str = Box::leak(export_src.into_boxed_str());
         steps.push(SmokeStep::Send {
             input: export_cmd,
-            label: "claude-smoke: export credential from 0600 file",
+            label: "claude-smoke: export credential (+ base URL if set) from 0600 file",
         });
-        // API round-trip: an authenticated `claude -p` to api.anthropic.com — a full
-        // TLS 1.3 handshake + cert-chain validation against the 86a CA bundle, then a
-        // model response. The token+`claude -p` combination is itself the proof that
-        // headless subscription auth works.
+        // API round-trip. Against a custom endpoint (OpenRouter) we BACKGROUND the
+        // request with combined stdout+stderr to a file, sleep, then `cat` it — so a
+        // HANG (claude never exits) is recoverable and we SEE claude's actual output
+        // (error / partial / "579" / empty = stuck before any output). The arithmetic
+        // answer 579 is absent from the prompt, so the Wait can't false-match the
+        // echo; on timeout the harness dumps the most-recent serial, which is now the
+        // cat'd output (not the stale export echo). The official-API path keeps the
+        // established direct CLAUDE_API_OK form.
+        if base_url.is_some() {
+            // First confirm the OpenRouter env actually applied in ion (echo's
+            // OUTPUT carries the expanded URL; the command echo shows the literal
+            // "$ANTHROPIC_BASE_URL", so the Wait can't false-match). Then run the
+            // round-trip: with MAX_FDS raised (no more EMFILE), claude should now
+            // complete — "579" = the model answered (fix works); a timeout or a
+            // fail-prefix dumps the serial showing why.
+            steps.push(SmokeStep::Send {
+                input: "echo OPENROUTER_ENV_OK=$ANTHROPIC_BASE_URL\n",
+                label: "claude-smoke: verify ANTHROPIC_BASE_URL applied in ion",
+            });
+            steps.push(SmokeStep::Wait {
+                // The command echo carries the literal "$ANTHROPIC_BASE_URL"; only
+                // the expanded OUTPUT carries the URL, so this can't false-match.
+                pattern: "OPENROUTER_ENV_OK=https://openrouter",
+                timeout_secs: 20,
+                label: "claude-smoke: ANTHROPIC_BASE_URL is set (ion applied the export)",
+            });
+            steps.push(SmokeStep::Send {
+                input: "claude -p 'What is 123 plus 456? Reply with ONLY the number and nothing else.'\n",
+                label: "claude-smoke: claude -p round-trip over OpenRouter (post-MAX_FDS fix)",
+            });
+            steps.push(SmokeStep::WaitPassOrFail {
+                pass_pattern: "579",
+                fail_prefixes: &[
+                    "EMFILE",
+                    "API Error",
+                    "fetch failed",
+                    "ENOTFOUND",
+                    "ECONNREFUSED",
+                    "authentication",
+                    "Invalid",
+                ],
+                timeout_secs: 240,
+                label: "claude-smoke: OpenRouter round-trip answered 579 (MAX_FDS fix verified)",
+                exit_code_on_fail: SMOKE_EXIT_CLAUDE_SMOKE_FAILED,
+            });
+            return steps;
+        }
         steps.push(SmokeStep::Send {
             input: "claude -p 'Reply with exactly CLAUDE_API_OK and nothing else'\n",
             label: "claude-smoke: authenticated claude -p API round-trip",
