@@ -17640,21 +17640,31 @@ pub(super) fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
     let is_private = (op & FUTEX_PRIVATE_FLAG) != 0;
     let cmd = op & !(FUTEX_PRIVATE_FLAG);
 
-    // Build the futex key: (addr_space pml4_phys, uaddr).
-    // Private futexes use 0 as root; shared futexes use the real CR3.
-    let futex_root = if is_private {
-        0u64
-    } else {
-        let pid = crate::process::current_pid();
-        match crate::process::PROCESS_TABLE
-            .lock()
-            .find(pid)
-            .and_then(|p| p.addr_space.as_ref().map(|a| a.pml4_phys().as_u64()))
-        {
-            Some(root) => root,
-            None => return NEG_EINVAL, // non-private futex requires an address space
-        }
-    };
+    // Build the futex key, scoped to the owning ADDRESS SPACE.
+    //
+    // 2026-06-16 fix: private futexes were keyed `(0, uaddr)` — a single global
+    // root shared by EVERY process. That aliased every process's private futex
+    // at the same `uaddr` into one wait queue. Claude Code spawns several
+    // identical-layout `node` subprocesses whose musl/libuv pthread threadpool
+    // condvars sit at the SAME virtual address; with the fixed-0 key, one node
+    // process's `FUTEX_WAKE` woke (or absorbed the single `val=1` wake meant
+    // for) ANOTHER process's threadpool waiter — so the intended worker was
+    // never woken, the threadpool stalled (`BlockedOnFutex`, "no waker
+    // registered"), and the whole `claude -p` run hung before reaching the API.
+    // (node-smoke runs ONE node process, so it never collided — which is why it
+    // passed while claude hung.)
+    //
+    // Key both private and shared futexes by the active page-table root (CR3 ==
+    // the caller's pml4; no KPTI is active, so at syscall time CR3 is the user
+    // mm root). CLONE_THREAD siblings share CR3 (they rendezvous); distinct
+    // processes have distinct CR3 (no cross-process aliasing). `is_private` is
+    // folded into bit 0 — the pml4 root is page-aligned so bit 0 is always free —
+    // so a private and a shared futex at the same address never alias each other.
+    let pml4 = x86_64::registers::control::Cr3::read()
+        .0
+        .start_address()
+        .as_u64();
+    let futex_root = if is_private { pml4 | 1 } else { pml4 };
     let key = (futex_root, uaddr);
 
     match cmd {

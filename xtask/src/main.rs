@@ -17272,12 +17272,21 @@ fn claude_smoke_steps(
                 input: "cd /tmp/cw\n",
                 label: "claude-smoke: cd into small project cwd (avoid rg walking /)",
             });
+            // The answer is wrapped in a UNIQUE delimiter token — `<<<579>>>` —
+            // NOT the bare number. The bare `579` is a 3-digit substring that
+            // false-matches kernel log numbers (e.g. a watchdog `stuck-since=
+            // 32579ms` timestamp), which previously made a HUNG run "pass"
+            // without any request ever reaching the API. `<<<579>>>` appears only
+            // in claude's actual answer: the command echo contains the literal
+            // `<<<NUMBER>>>` (not `<<<579>>>`), and no kernel log emits it. So a
+            // match proves claude genuinely computed + returned the answer over
+            // the live API.
             steps.push(SmokeStep::Send {
-                input: "claude -p 'What is 123 plus 456? Reply with ONLY the number and nothing else.'\n",
-                label: "claude-smoke: claude -p round-trip over OpenRouter (post-MAX_FDS fix)",
+                input: "claude -p 'What is 123 plus 456? Reply with ONLY the answer wrapped in triple angle brackets, exactly like <<<NUMBER>>>, and nothing else.'\n",
+                label: "claude-smoke: claude -p round-trip over OpenRouter (futex-key fix)",
             });
             steps.push(SmokeStep::WaitPassOrFail {
-                pass_pattern: "579",
+                pass_pattern: "<<<579>>>",
                 fail_prefixes: &[
                     "EMFILE",
                     "API Error",
@@ -17285,15 +17294,14 @@ fn claude_smoke_steps(
                     "ENOTFOUND",
                     "ECONNREFUSED",
                     "authentication",
-                    "Invalid",
+                    "Invalid API key",
                 ],
                 // 600 s, not 240 s: even in a small cwd the round-trip pays a
                 // cold node-subprocess start + TLS handshake + model latency over
-                // the slow VFS. The deadline-recv IPC fix removed the kernel
-                // stall; the remaining cost is legitimate I/O latency, so give it
-                // room to COMPLETE rather than truncating a slow-but-progressing run.
+                // the slow VFS. Give it room to COMPLETE rather than truncating a
+                // slow-but-progressing run.
                 timeout_secs: 600,
-                label: "claude-smoke: OpenRouter round-trip answered 579 (MAX_FDS fix verified)",
+                label: "claude-smoke: OpenRouter round-trip answered <<<579>>> (live API verified)",
                 exit_code_on_fail: SMOKE_EXIT_CLAUDE_SMOKE_FAILED,
             });
             return steps;

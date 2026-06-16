@@ -1,32 +1,47 @@
 ---
-status: RESOLVED — `claude -p` COMPLETES end-to-end on m3OS. The four issues are all
-  fixed; #4 is FIXED this session (2026-06-16). claude-smoke PASSES the OpenRouter
-  `claude -p 'What is 123 plus 456?'` round-trip (answers **579**) twice (91 s, 54 s under
-  KVM). Root cause of #4 was NOT the IPC reply-block primitive — it was a hard
-  **single-core spin-deadlock on the kernel `EXT2_VOLUME` lock**: the kernel ext2 volume
-  (a plain `spin::Mutex`) is deliberately held across blocking virtio-blk I/O
-  (`read_inode`/`resolve_path` → `block_current_until`), and on a single core a second
-  task that acquires `EXT2_VOLUME` **busy-spins forever**, denying the only CPU to the
-  I/O-blocked holder so it can never release the lock — the whole machine wedges at 100%
-  CPU in `path_node_nofollow`'s `EXT2_VOLUME.lock()` (NO watchdog: the spin is kernel-mode,
-  IRQs fire but preemption can't unwind a spinlock). Claude Code triggers it via its
-  concurrent demand-paged `exec`(ripgrep)/`stat` storm during startup. Pinned by a
-  host-side QMP `info registers` dump showing a constant spin RIP at the `EXT2_VOLUME`
-  cmpxchg/pause loop. **Fix:** `EXT2_VOLUME` is now a `YieldingMutex` — on contention it
-  `yield_now()`s (lets the holder be rescheduled to release) instead of busy-spinning;
-  uncontended acquisition is unchanged. Also fixed (same session, real but orthogonal):
-  the deadline-bearing IPC block sites (`recv_msg_with_deadline`/`call_msg_with_deadline`)
-  reintroduced **Phase 57e Bug #8.1** (a `block_current_until` with an unregistered local
-  wake flag → a raced sender lost-woken until the 5 s flush deadline) — fixed with
-  `block_current_on_recv_v2_deadline`/`block_current_on_reply_v2_deadline`. The earlier
-  "intermittent reply-block stall" hypothesis was a red herring; the deterministic
-  `EXT2_VOLUME` wedge was the blocker.
-fix-commits (this session, to be committed):
-  - kernel/fs/ext2: EXT2_VOLUME spin::Mutex → YieldingMutex (THE #4 fix)
-  - kernel/ipc/endpoint + task/scheduler: deadline-path Bug #8.1 waker registration
-  - kernel/task + arch/syscall: last_syscall tick/nr + [replystall]/[stallcensus] diagnostics
-  - xtask/claude-smoke: claude -p in a small cwd + 600 s window + M3OS_CLAUDE_MONITOR (HMP)
-  - xtask/node-smoke: M3OS_NODE_VFS_STRESS concurrent-VFS stress arm
+status: IN PROGRESS — `claude -p` does NOT yet complete a round-trip, but it now REACHES
+  OpenRouter (establishes TCP) where it previously hung in startup. Three real fixes
+  landed/made this session (2026-06-16); a deep residual futex lost-wake remains the
+  blocker.
+  CORRECTION (2026-06-16, later): an earlier version of this handoff + commit `fcd78100`
+  claimed "claude -p COMPLETES end-to-end (answers 579)". **That was WRONG** — a false
+  positive. The claude-smoke pass pattern was the bare 3-digit string `579`, which matched
+  the substring inside a kernel watchdog line `stuck-since=32579ms`. claude `-p` had
+  actually HUNG (futex stall) and the harness matched a watchdog timestamp, not claude's
+  answer. The user's OpenRouter request logs were empty — ground-truth proof no request
+  ever completed. The `579` check is now a collision-proof `<<<579>>>` token.
+  WHAT IS REAL + FIXED:
+   1. EXT2_VOLUME single-core spin-deadlock (RIP-confirmed via host-side QMP `info
+      registers`: constant spin RIP at `path_node_nofollow`'s `EXT2_VOLUME.lock()`
+      cmpxchg/pause loop; whole machine wedged at 100% CPU, no watchdog). Fix: EXT2_VOLUME
+      `spin::Mutex` → `YieldingMutex` (yield, not busy-spin, on contention). Committed in
+      `fcd78100`. This unwedged the machine but only got claude FURTHER.
+   2. Cross-process PRIVATE-futex collision. `sys_futex` keyed private futexes as
+      `(0, uaddr)` — a single GLOBAL root. Claude spawns multiple identical-layout `node`
+      subprocesses whose musl/libuv pthread threadpool condvars sit at the same uaddr; all
+      aliased into one wait queue, so one process's `FUTEX_WAKE` woke/absorbed another
+      process's waiter → the real worker never woke. Fix: key futexes per-address-space
+      (CR3 == the caller's pml4; `is_private` folded into bit 0). MEASURED EFFECT: claude
+      went from 0 TCP connections to OpenRouter (hung in startup) to 13 (reaches the API).
+   3. The bogus `579` pass pattern → `<<<579>>>` (cannot match kernel-log numbers).
+  REMAINING BLOCKER (#4 is NOT closed): a residual futex LOST-WAKE in node's libuv
+  threadpool — now WITHIN a single process (not the cross-process collision #2 fixed).
+  Symptom: ~4800 `BlockedOnFutex "no waker registered"` watchdog lines; claude connects to
+  OpenRouter (13 TCP) but the threadpool stalls before the TLS/HTTP exchange completes, so
+  NO request reaches OpenRouter's app layer (empty logs) and claude retries. The
+  FUTEX_WAIT/WAKE `woken_flag` bridge looks correct, so the suspect is the musl
+  `pthread_cond` requeue→mutex path (FUTEX_CMP_REQUEUE then the mutex unlock skipping the
+  wake if the mutex waiter bit isn't honored across the requeue) or a value-check edge.
+  Also note: the original handoff's "reply-block IPC stall" hypothesis was wrong; the real
+  chain is EXT2 wedge (fixed) → cross-process futex collision (fixed) → residual threadpool
+  futex lost-wake (OPEN).
+fixes (this session):
+  - kernel/fs/ext2: EXT2_VOLUME spin::Mutex → YieldingMutex (committed fcd78100) — real
+  - kernel/arch/syscall sys_futex: private futex key (0,uaddr) → per-CR3 (uncommitted) — real progress
+  - kernel/ipc/endpoint + task/scheduler: deadline-path Bug #8.1 waker registration (committed) — real but orthogonal
+  - kernel/task + arch/syscall: last_syscall tick/nr + [replystall]/[stallcensus] diagnostics (committed)
+  - xtask/claude-smoke: 579 → <<<579>>> collision-proof check; small cwd; M3OS_CLAUDE_MONITOR HMP socket
+  - xtask/node-smoke: M3OS_NODE_VFS_STRESS arm
 branch: feat/phase-90b-claude-code
 key-commits:
   - 9e09b67c  kernel/net: accept TCP keepalive socket options (fixes setsockopt ENOPROTOOPT)
@@ -69,12 +84,20 @@ claude went through FOUR distinct m3OS bugs, hit one after another as each was f
 | 1 | EMFILE lock-up | per-process fd cap of 32 | `3d92bb40` MAX_FDS 32→128 | ✅ fixed+pushed |
 | 2 | Segfault (node killed) | node clone/fork stacked ~36 KiB of inline 12 KiB fd-tables → 64 KiB kstack overflow | `952da571` heap-backed fd table | ✅ fixed+pushed, proven |
 | 3 | **Frozen login screen** | `stat("/dev/tty")` hung the kernel VFS path, wedging the shared VFS system-wide | `36074826` `/dev/tty`→char device | ✅ fixed+pushed, verified |
-| 4 | `claude -p` never finishes | **NOT** the reply-block IPC primitive (red herring). A hard single-core spin-deadlock on the kernel `EXT2_VOLUME` lock: it is held across blocking virtio-blk I/O, and a second task that acquires it busy-spins forever, starving the I/O-blocked holder so it never releases. Triggered by claude's concurrent demand-paged `exec`(rg)/`stat` storm. | `EXT2_VOLUME` `spin::Mutex` → `YieldingMutex` (yield, don't spin, on contention) | ✅ FIXED + verified (2026-06-16) |
+| 4 | `claude -p` never finishes | Layered. (a) EXT2_VOLUME single-core spin-deadlock (held across virtio-blk I/O; a 2nd task busy-spins forever). (b) Cross-process PRIVATE-futex collision: private futexes keyed `(0,uaddr)` globally, so claude's multiple identical-layout node subprocesses aliased their pthread threadpool condvars and stole each other's wakes. (c) **STILL OPEN**: a residual single-process threadpool futex lost-wake. | (a) `EXT2_VOLUME`→`YieldingMutex` (committed). (b) futex key `(0,uaddr)`→per-CR3 (uncommitted). (c) — | ⚠️ PARTIAL — (a)+(b) fixed → claude now REACHES OpenRouter (0→13 TCP), but (c) still stalls it; **`claude -p` does NOT complete** |
 
-**ALL FOUR are fixed — `claude -p` completes end-to-end.** claude-smoke PASSES the OpenRouter
-`claude -p 'What is 123 plus 456?'` round-trip (answers **579**) twice (91 s, 54 s under KVM),
-and node-smoke regression is green (one pre-existing libuv-threadpool single-core futex flake
-on a re-run, unrelated to these fixes).
+**`claude -p` does NOT yet complete.** ⚠️ CORRECTION: an earlier version of this section
+claimed it did, citing a claude-smoke `579` pass. That pass was a **false positive** — the
+bare `579` matched a kernel watchdog timestamp `stuck-since=32579ms` while claude was
+actually HUNG in a futex stall. The user's empty OpenRouter request logs are ground truth:
+no request ever completed. The check is now the collision-proof `<<<579>>>`. Current real
+state: fixes (a) EXT2_VOLUME and (b) the cross-process futex key moved claude from
+"hangs in startup" to "establishes 13 TCP connections to OpenRouter", but a residual
+**single-process** libuv-threadpool futex lost-wake (~4800 `BlockedOnFutex "no waker
+registered"` lines) stalls the request before the TLS/HTTP exchange finishes, so no request
+reaches OpenRouter and claude retries. (b) and (c) are distinct: (b) was cross-process
+aliasing (fixed); (c) is a genuine within-process lost-wake (open) — suspect the musl
+`pthread_cond` FUTEX_CMP_REQUEUE→mutex-unlock wake path.
 
 ### How #4 was actually found (the reply-block hypothesis was wrong)
 
