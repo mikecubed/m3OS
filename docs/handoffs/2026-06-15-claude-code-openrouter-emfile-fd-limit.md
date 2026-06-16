@@ -1,5 +1,23 @@
 ---
-status: FIXED + PROVEN BY CONTROLLED EXPERIMENT (commit 952da571, pushed). The heap
+status: THREE root causes found+fixed. (1) EMFILE — MAX_FDS 32→128 (3d92bb40).
+  (2) kstack overflow in node clone/fork — heap-backed fd table (952da571, proven).
+  (3) **SYSTEM-WIDE FREEZE running `claude -p` — `stat("/dev/tty")` hung.** Node/Claude
+  Code `readlink` their TTY → `/dev/tty` then `stat` it at startup; `/dev/tty` was
+  MISSING from the device char-special-case lists in `path_node_nofollow` AND
+  `path_filemeta` (every other `/dev/*` device — null/zero/urandom/random/full/ptmx/
+  pts — is handled, and `path_metadata` already listed `/dev/tty`), so the stat fell
+  through to a synchronous `vfs_service_stat_path` `endpoint::call_msg` IPC to
+  `vfs_server` for a path it doesn't own — which never returned, blocking the process
+  in-kernel and, via the shared VFS, freezing the whole machine (the user's frozen
+  login screen). Fix: handle `/dev/tty` as a char device (S_IFCHR 0o666) in both
+  functions, matching Linux (stat never touches the FS) and the other devices.
+  VERIFIED: with the fix node sails past — stats `/dev/tty` repeatedly, reads settings/
+  `.git`/CA bundle, JITs, and **spawns ripgrep + handles SIGCHLD (agent loop runs)**,
+  no freeze. (The `claude -p` round-trip is then slow — cold agent over the ~200 KB/s
+  ring-3 VFS — but PROGRESSING, not hung; the 240s claude-smoke step window is too
+  short for it. Separate from the freeze.) The kstack-overflow backtrace diagnostic
+  (6f02d18b) was the tool that pinned #3.
+prior-status: FIXED + PROVEN BY CONTROLLED EXPERIMENT (commit 952da571, pushed). The heap
   fd-table fix is confirmed sufficient: claude-smoke PASSES on 4-core AND 1-core (KVM),
   with and without the ANTHROPIC_* OpenRouter env vars, through the full agent flow
   (7 node launches + ripgrep child spawn), zero overflows. A controlled A/B nailed it:

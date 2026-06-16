@@ -264,6 +264,14 @@ fn path_node_nofollow(abs_path: &str) -> Result<PathNodeKind, u64> {
         || abs_path == "/dev/random"
         || abs_path == "/dev/full"
         || abs_path == "/dev/ptmx"
+        // `/dev/tty` is the controlling-terminal char device. It MUST be
+        // recognised here (as the other char devices are) so a `stat`/path-walk
+        // resolves it without falling through to the ext2/`vfs_server` path —
+        // node/Claude Code `readlink` their TTY to `/dev/tty` and `stat` it at
+        // startup, and that synchronous `vfs_service_stat_path` IPC for a path
+        // the service does not own hangs, wedging the process (and, via the
+        // shared VFS, the whole system). `path_metadata` already lists it.
+        || abs_path == "/dev/tty"
     {
         return Ok(PathNodeKind::File);
     }
@@ -14642,6 +14650,11 @@ fn path_filemeta(name: &str) -> Result<FileMeta, u64> {
                 || name == "/dev/random"
                 || name == "/dev/full"
                 || name == "/dev/ptmx"
+                // `/dev/tty` (controlling terminal) — report a char device like
+                // the others. Without this, `stat("/dev/tty")` falls through to
+                // the ext2/`vfs_server` path and hangs on a `VFS_STAT_PATH` IPC
+                // for a node the service does not own (Claude Code startup hang).
+                || name == "/dev/tty"
                 || name.starts_with("/dev/pts/")
             {
                 let mut m = FileMeta::new();
