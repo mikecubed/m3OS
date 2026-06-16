@@ -3899,6 +3899,34 @@ pub fn block_current_on_reply_v2(caller: TaskId) -> bool {
     }
 }
 
+/// Deadline-aware variant of [`block_current_on_reply_v2`].
+///
+/// `call_msg_with_deadline` (the `sys_ipc_call_timeout` reply block) previously
+/// called [`block_current_until`] directly with an unregistered stack-local
+/// `woken` flag and no `pending_msg` recheck — the same Phase 57e Bug #8.1
+/// lost-wakeup defect [`block_current_on_recv_v2_deadline`] fixes on the recv
+/// side. A server whose `reply` races this block delivers `pending_msg` + wakes
+/// while the caller is still `Running` (CAS no-ops), and with no registered
+/// waker the block commits and sleeps to the deadline. Registering the waker
+/// before the `pending_msg` recheck closes the window; the caller's
+/// `take_message` after return remains the source of truth.
+pub fn block_current_on_reply_v2_deadline(
+    caller: TaskId,
+    deadline_ticks: Option<u64>,
+) -> BlockOutcome {
+    let woken = Arc::new(AtomicBool::new(false));
+    if !register_reply_waker(caller, woken.clone()) {
+        return BlockOutcome::AlreadyTrue;
+    }
+    if has_pending_message(caller) {
+        clear_reply_waker(caller);
+        return BlockOutcome::AlreadyTrue;
+    }
+    let outcome = block_current_until(TaskState::BlockedOnReply, &woken, deadline_ticks);
+    clear_reply_waker(caller);
+    outcome
+}
+
 /// Phase 63 audio handoff follow-up — rate-limited diagnostic for the
 /// spurious-wake race the IPC `call_msg:no_reply_message` log site
 /// (`kernel/src/ipc/mod.rs::log_ipc_umax`) flagged across audio, term,
@@ -4081,6 +4109,58 @@ pub fn block_current_on_recv_v2(receiver: TaskId) -> bool {
         BlockOutcome::Woken | BlockOutcome::AlreadyTrue => true,
         BlockOutcome::DeadlineExpired => false,
     }
+}
+
+/// Deadline-aware variant of [`block_current_on_recv_v2`].
+///
+/// `recv_msg_with_deadline` (the `vfs_server` periodic-flush recv loop, every
+/// other deadline-bearing server recv) previously called [`block_current_until`]
+/// **directly** with a stack-local `woken` flag that was never registered as the
+/// task's `reply_waker`, and with NO `pending_msg` pre-check. That reintroduced
+/// **Phase 57e Bug #8.1** on the deadline path: a sender whose `call_msg` lands
+/// in the window between the receiver enqueueing itself and `block_current_until`
+/// committing the `BlockedOnRecv` state delivers `pending_msg` + calls
+/// `wake_task_v2`, but the receiver is still `Running` so the CAS no-ops
+/// (`AlreadyAwake`) — and because no `reply_waker` was registered, the local
+/// `woken` flag stayed `false`, so `block_current_until`'s cross-core guard and
+/// post-resume recheck both missed it. The receiver then parked in
+/// `BlockedOnRecv` **with `pending_msg` already set** and slept until the
+/// deadline.
+///
+/// Unlike the no-deadline helpers (where this manifests as a permanent hang),
+/// here it is a *lost-wakeup-recovered-at-deadline*: every raced `vfs_server`
+/// recv added up to `FLUSH_INTERVAL_NS` (5 s) of latency, and a waiting client
+/// sat in `BlockedOnReply` for that whole window. Under Claude Code's
+/// startup VFS traffic these stack up into the intermittent `claude -p` stall
+/// (docs/handoffs/2026-06-15-claude-code-openrouter-emfile-fd-limit.md #4) —
+/// the system stays responsive, but one caller after another is stranded
+/// behind an asleep server.
+///
+/// This helper registers the waker BEFORE the `pending_msg` recheck (the
+/// canonical Bug #8.1 fix shared by [`block_current_on_recv_v2`] /
+/// [`block_current_on_notif_v2`] / [`block_current_on_send_v2`]) and threads the
+/// deadline through, so a raced sender now self-reverts the block immediately
+/// instead of waiting out the deadline. Returns the [`BlockOutcome`] so the
+/// caller can still distinguish a true deadline expiry (`DeadlineExpired`) from
+/// a wake; `take_message` after return remains the source of truth for whether
+/// a message actually arrived.
+pub fn block_current_on_recv_v2_deadline(
+    receiver: TaskId,
+    deadline_ticks: Option<u64>,
+) -> BlockOutcome {
+    let woken = Arc::new(core::sync::atomic::AtomicBool::new(false));
+    if !register_reply_waker(receiver, woken.clone()) {
+        // Receiver not found in the scheduler — treat as already-ready; the
+        // caller's `take_message` will surface a message if one is pending.
+        return BlockOutcome::AlreadyTrue;
+    }
+    if has_pending_message(receiver) {
+        clear_reply_waker(receiver);
+        return BlockOutcome::AlreadyTrue;
+    }
+    let outcome = block_current_until(TaskState::BlockedOnRecv, &woken, deadline_ticks);
+    clear_reply_waker(receiver);
+    outcome
 }
 
 /// v2 helper: block the current task (as `BlockedOnNotif`) until a message or
@@ -6148,6 +6228,33 @@ pub fn sys_sched_getaffinity(pid: u32) -> i64 {
 /// Tick counter gating watchdog scans (BSP-only, matches `BALANCE_COUNTER`).
 static WATCHDOG_COUNTER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// DIAGNOSTIC (claude -p stall hunt, 2026-06-16) — bounded boot budget for the
+/// reply-stall scan's per-task dumps so a persistent stall doesn't flood serial.
+static REPLY_STALL_DIAG_BUDGET: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(24);
+
+/// DIAGNOSTIC (claude -p stall hunt, 2026-06-16) — one-shot guard for the
+/// `[stallcensus]` dump of tasks wedged inside a single syscall.
+static STALL_CENSUS_FIRED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// DIAGNOSTIC (claude -p stall hunt, 2026-06-16) — a task wedged in
+/// `BlockedOnReply` for longer than this many ticks (ms) **measured from its
+/// last syscall entry** (NOT `blocked_since_tick`, which a wake/reblock loop
+/// resets every cycle) is dumped by [`reply_stall_scan`]. The Claude Code
+/// startup stall surfaces as exactly this: a node thread inside one VFS `stat`
+/// for ~90 s while the rest of the system stays responsive. A legitimate VFS op
+/// over the slow ring-3 path completes in well under this bound.
+const REPLY_STALL_SYSCALL_AGE_TICKS: u64 = 5_000;
+
+/// DIAGNOSTIC (claude -p stall hunt, 2026-06-16) — a task in ANY `Blocked*`
+/// state with `pending_msg` already set (a delivered message that did not wake
+/// it) for longer than this many ticks (ms) is a LOST WAKE. Lower than the
+/// reply-wedge threshold because a lost wake is anomalous at any duration; this
+/// catches the recv-with-deadline server-sleep (server parked in `BlockedOnRecv`
+/// with a request pending, sleeping to its 5 s flush deadline).
+const REPLY_STALL_LOSTWAKE_AGE_TICKS: u64 = 1_500;
+
 /// Phase 57e Bug #6 diagnostic — set the first time the watchdog observes a
 /// `StuckNoWaker` task or a dequeue-drop fires, gating a one-shot trace-ring
 /// dump. Stays set for the remainder of the boot so we don't flood the log on
@@ -6492,6 +6599,273 @@ pub fn watchdog_scan() {
                 );
             }
         }
+    }
+
+    // DIAGNOSTIC (claude -p stall hunt, 2026-06-16) — the reblock-loop-aware
+    // reply-stall scan runs every watchdog tick alongside the 30 s verdict above.
+    reply_stall_scan(now);
+}
+
+/// DIAGNOSTIC (claude -p stall hunt, 2026-06-16) — find tasks wedged in
+/// `BlockedOnReply` inside ONE syscall for longer than
+/// [`REPLY_STALL_SYSCALL_AGE_TICKS`] and dump the exact state that
+/// distinguishes the three live hypotheses for the Claude Code startup stall:
+///
+/// * **lost-wake** — `pending_msg=Some` (the server's reply arrived) but the
+///   task is NOT on any run queue and `on_cpu=false` → a delivered reply that
+///   never re-scheduled the caller.
+/// * **stranded request** — `pending_msg=None` for the whole window → the
+///   server never replied to THIS caller (request lost/misrouted).
+/// * **reblock livelock** — caught because `last_syscall_entry_tick` does NOT
+///   reset on a wake (unlike `blocked_since_tick`), so a task cycling
+///   block↔wake without returning to userspace still shows a large syscall age.
+///
+/// Read-only: snapshots under `SCHEDULER.lock`, then queries run-queue
+/// membership and logs after the lock is released (run-queue locks are
+/// independent of `SCHEDULER.lock`; mirrors `dump_dispatch_state`).
+fn reply_stall_scan(now: u64) {
+    use core::sync::atomic::Ordering;
+
+    // ── Stall census ─────────────────────────────────────────────────────────
+    // A task wedged inside ONE syscall for > CENSUS_THRESHOLD ms (no new syscall
+    // entry) is dumped with the syscall NUMBER it is parked in. This catches the
+    // failure modes the lost-wake detector below misses: a node event-loop
+    // thread parked in `epoll_pwait` (blocks as BlockedOnRecv with NO deadline →
+    // the 30 s watchdog exempts it) or a worker wedged in `futex`. Idle servers
+    // re-arm their recv frequently so their syscall age stays small; a genuinely
+    // wedged task's age climbs without bound. One-shot per boot.
+    const CENSUS_THRESHOLD_TICKS: u64 = 20_000;
+    {
+        struct CensusRow {
+            pid: u32,
+            name: &'static str,
+            state: super::TaskState,
+            nr: u32,
+            syscall_age: u64,
+            pending: bool,
+            wake_deadline: Option<u64>,
+        }
+        let mut crows: [Option<CensusRow>; 16] = [const { None }; 16];
+        let mut cn = 0usize;
+        {
+            let sched = scheduler_lock();
+            for task in sched.tasks.iter() {
+                let is_blocked = matches!(
+                    task.state,
+                    super::TaskState::BlockedOnRecv
+                        | super::TaskState::BlockedOnSend
+                        | super::TaskState::BlockedOnReply
+                        | super::TaskState::BlockedOnNotif
+                        | super::TaskState::BlockedOnFutex
+                        | super::TaskState::BlockedOnWait
+                        | super::TaskState::BlockedOnService
+                );
+                if !is_blocked {
+                    continue;
+                }
+                // Idle-server exemption (same as the 30 s watchdog's
+                // BlockedOnRecv-no-deadline skip): a server parked in a plain
+                // receive / notification wait with nothing pending is idle by
+                // design, not wedged — don't cry wolf on it every boot.
+                if matches!(
+                    task.state,
+                    super::TaskState::BlockedOnRecv | super::TaskState::BlockedOnNotif
+                ) && task.pending_msg.is_none()
+                    && task.wake_deadline.is_none()
+                {
+                    continue;
+                }
+                let entry = task.last_syscall_entry_tick.load(Ordering::Relaxed);
+                if entry == 0 {
+                    continue;
+                }
+                let syscall_age = now.saturating_sub(entry);
+                if syscall_age < CENSUS_THRESHOLD_TICKS {
+                    continue;
+                }
+                if cn >= crows.len() {
+                    break;
+                }
+                crows[cn] = Some(CensusRow {
+                    pid: task.pid,
+                    name: task.name,
+                    state: task.state,
+                    nr: task.last_syscall_nr.load(Ordering::Relaxed),
+                    syscall_age,
+                    pending: task.pending_msg.is_some(),
+                    wake_deadline: task.wake_deadline,
+                });
+                cn += 1;
+            }
+        }
+        if cn > 0 && !STALL_CENSUS_FIRED.swap(true, Ordering::AcqRel) {
+            log::warn!(
+                "[stallcensus] {} task(s) wedged in one syscall > {}ms:",
+                cn,
+                CENSUS_THRESHOLD_TICKS
+            );
+            for r in crows[..cn].iter().flatten() {
+                let dl = r
+                    .wake_deadline
+                    .map(|d| (d as i64) - (now as i64))
+                    .unwrap_or(0);
+                log::warn!(
+                    "[stallcensus]   pid={} name={} state={:?} last_syscall={} syscall_age={}ms pending_msg={} wake_deadline_in={}ms",
+                    r.pid,
+                    r.name,
+                    r.state,
+                    r.nr,
+                    r.syscall_age,
+                    r.pending,
+                    dl,
+                );
+            }
+        }
+    }
+
+    struct StallRow {
+        idx: usize,
+        pid: u32,
+        name: &'static str,
+        state: super::TaskState,
+        wake_deadline: Option<u64>,
+        syscall_age: u64,
+        blocked_age: u64,
+        last_ready_age: u64,
+        pending_msg: bool,
+        waker_present: bool,
+        waker_flag: bool,
+        on_cpu: bool,
+    }
+
+    let mut rows: [Option<StallRow>; 8] = [const { None }; 8];
+    let mut n = 0usize;
+    {
+        let sched = scheduler_lock();
+        for (idx, task) in sched.tasks.iter().enumerate() {
+            let is_blocked = matches!(
+                task.state,
+                super::TaskState::BlockedOnRecv
+                    | super::TaskState::BlockedOnSend
+                    | super::TaskState::BlockedOnReply
+                    | super::TaskState::BlockedOnNotif
+                    | super::TaskState::BlockedOnFutex
+                    | super::TaskState::BlockedOnWait
+                    | super::TaskState::BlockedOnService
+            );
+            if !is_blocked {
+                continue;
+            }
+            let has_pending = task.pending_msg.is_some();
+            // Two flaggable shapes:
+            //   1. ANY Blocked* task with `pending_msg` already set = a delivered
+            //      message that did not wake the task = a LOST WAKE (e.g. the
+            //      recv-with-deadline bug: server parked in BlockedOnRecv with a
+            //      message pending, sleeping to its flush deadline). This is the
+            //      precise detector independent of which Blocked* state it is.
+            //   2. A BlockedOnReply task wedged inside ONE syscall longer than
+            //      the threshold (the original reblock-loop-aware detector).
+            let entry = task.last_syscall_entry_tick.load(Ordering::Relaxed);
+            let syscall_age = now.saturating_sub(entry);
+            let lost_wake =
+                has_pending && entry != 0 && syscall_age >= REPLY_STALL_LOSTWAKE_AGE_TICKS;
+            let reply_wedged = task.state == super::TaskState::BlockedOnReply
+                && entry != 0
+                && syscall_age >= REPLY_STALL_SYSCALL_AGE_TICKS;
+            if !lost_wake && !reply_wedged {
+                continue;
+            }
+            if n >= rows.len() {
+                break;
+            }
+            rows[n] = Some(StallRow {
+                idx,
+                pid: task.pid,
+                name: task.name,
+                state: task.state,
+                wake_deadline: task.wake_deadline,
+                syscall_age,
+                blocked_age: now.saturating_sub(task.blocked_since_tick),
+                last_ready_age: now.saturating_sub(task.last_ready_tick),
+                pending_msg: task.pending_msg.is_some(),
+                waker_present: task.reply_waker.is_some(),
+                waker_flag: task
+                    .reply_waker
+                    .as_ref()
+                    .map(|w| w.load(Ordering::Acquire))
+                    .unwrap_or(false),
+                on_cpu: task.on_cpu.load(Ordering::Acquire),
+            });
+            n += 1;
+        }
+        // SCHEDULER.lock released here.
+    }
+
+    if n == 0 {
+        return;
+    }
+
+    for row in rows[..n].iter().flatten() {
+        // Charge the boot budget per dumped task.
+        if REPLY_STALL_DIAG_BUDGET
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |r| r.checked_sub(1))
+            .is_err()
+        {
+            return;
+        }
+        // Run-queue membership across all cores (run-queue locks are independent
+        // of SCHEDULER.lock — query after release, as dump_dispatch_state does).
+        let mut in_runq = false;
+        let mut runq_core: i32 = -1;
+        for core_id in 0..crate::smp::core_count() {
+            if let Some(data) = crate::smp::get_core_data(core_id) {
+                let found = data.with_run_queue(|q| q.iter().any(|&i| i == row.idx));
+                if found {
+                    in_runq = true;
+                    runq_core = core_id as i32;
+                    break;
+                }
+            }
+        }
+        // Classify for the log line so the verdict is legible without re-deriving.
+        let verdict = if row.pending_msg && !in_runq && !row.on_cpu {
+            "LOST-WAKE(msg delivered, task not enqueued)"
+        } else if row.pending_msg {
+            "LOST-WAKE?(msg delivered, but enqueued/on_cpu — racing)"
+        } else if row.state == super::TaskState::BlockedOnReply {
+            "STRANDED(BlockedOnReply, no reply delivered)"
+        } else {
+            "BLOCKED-NO-MSG(by-design wait or stranded request)"
+        };
+        let deadline_age = row
+            .wake_deadline
+            .map(|d| (d as i64) - (now as i64))
+            .unwrap_or(0);
+        log::warn!(
+            "[replystall] pid={} name={} idx={} state={:?} syscall_age={}ms blocked_age={}ms \
+             last_ready_age={}ms wake_deadline_in={}ms pending_msg={} reply_waker={} waker_flag={} \
+             on_cpu={} in_runq={} runq_core={} :: {}",
+            row.pid,
+            row.name,
+            row.idx,
+            row.state,
+            row.syscall_age,
+            row.blocked_age,
+            row.last_ready_age,
+            deadline_age,
+            row.pending_msg,
+            row.waker_present,
+            row.waker_flag,
+            row.on_cpu,
+            in_runq,
+            runq_core,
+            verdict,
+        );
+    }
+
+    // One-shot full dispatch dump for cross-core context (queues, current tasks).
+    if !DISPATCH_DUMP_FIRED.swap(true, Ordering::AcqRel) {
+        dump_dispatch_state();
     }
 }
 

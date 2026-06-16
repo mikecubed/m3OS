@@ -15993,6 +15993,53 @@ fn node_smoke_steps(attempt_net: bool, fast_iter: bool, egress_url: &str) -> Vec
         return steps;
     }
 
+    // DIAGNOSTIC (M3OS_NODE_VFS_STRESS=1): cheap reproducer for the Claude Code
+    // `claude -p` startup stall (docs/handoffs/2026-06-15-claude-code-openrouter-
+    // emfile-fd-limit.md #4) — a node thread stranded in `BlockedOnReply` under
+    // the single-threaded `vfs_server`'s concurrent multi-thread load. Fans out
+    // FAN concurrent libuv-threadpool `fs.stat` calls (UV_THREADPOOL_SIZE=16,
+    // exported just below) against the slow ring-3 VFS, completing N total. The
+    // exact concurrency surface claude hits (many callers queued in `ep.senders`
+    // while the server replies to one) WITHOUT building claude or any network.
+    // A heartbeat every 1 s prints VFS_STRESS_ALIVE (progressing) or
+    // VFS_STRESS_STALL (no progress + inflight>0 = the stall). On completion it
+    // prints VFS_STRESS_DONE; on a stall the following Wait times out and the
+    // harness flushes serial with the kernel watchdog / reply-stall verdict.
+    if std::env::var("M3OS_NODE_VFS_STRESS").is_ok_and(|v| v == "1") {
+        steps.push(SmokeStep::Send {
+            input: "export UV_THREADPOOL_SIZE=16\n",
+            label: "node-smoke[VFS-STRESS]: raise libuv threadpool to 16",
+        });
+        steps.push(SmokeStep::Sleep { millis: 300 });
+        // Mix readdir + readFile + open/close (all real vfs_server IPC round-trips
+        // that BYPASS the kernel stat metacache, unlike repeated fs.stat of the
+        // same paths) so the single-threaded server is hammered by concurrent
+        // callers — the exact surface claude's setup()/skill-discovery exercises.
+        // NOTE: the DONE/ALIVE/STALL sentinels are assembled at RUNTIME from
+        // concatenated string literals (`'VFS'+'DONE '`) so the harness Wait
+        // pattern ("VFSDONE") matches only the printed output, never the
+        // terminal's echo of this command line (which contains the literals
+        // with a `'+'` between them, so "VFSDONE" never appears verbatim there).
+        // Unbuffered heartbeat via fs.writeSync(1,...) (console.log can block-buffer
+        // to the serial console). Also spawns short-lived /bin/echo children
+        // concurrently with the VFS storm so SIGCHLD interrupts in-flight VFS
+        // `call_msg` waits — the exact signal pressure claude applies by spawning
+        // ripgrep during skill discovery, which a child-less storm never produces.
+        steps.push(SmokeStep::Send {
+            input: "node -e \"const fs=require('fs');const cp=require('child_process');function P(s){fs.writeSync(1,s+'\\n');}const D=['/usr/lib','/usr/src','/etc','/root','/bin','/usr/bin','/usr','/etc/ssl/certs','/usr/pkg','/var'];const F=['/etc/passwd','/etc/group','/etc/hostname','/usr/src/node-probe.js','/etc/ssl/certs/ca-certificates.crt','/etc/profile','/root/.profile','/etc/resolv.conf'];const PER=+(process.env.SN||20000);const ROUNDS=+(process.env.ROUNDS||8);const FAN=+(process.env.FAN||24);const KIDS=+(process.env.KIDS||4);let round=0,st=0,dn=0,inf=0;function startRound(){st=0;dn=0;pump();}function op(i,cb){const k=i%3;if(k===0){fs.readdir(D[i%D.length],()=>cb());}else if(k===1){fs.readFile(F[i%F.length],()=>cb());}else{fs.open(F[i%F.length],'r',(e,fd)=>{if(fd!=null)fs.close(fd,()=>cb());else cb();});}}function pump(){while(inf<FAN&&st<PER){const i=st;st++;inf++;op(i,()=>{inf--;dn++;if(dn===PER){round++;if(round>=ROUNDS){P('VFS'+'DONE '+(round*PER));process.exit(0);}else{P('VFS'+'ROUND '+round);startRound();}}else pump();});}}function kid(){cp.execFile('/bin/echo',['x'],()=>{setTimeout(kid,5);});}let last=-1;setInterval(()=>{P((dn===last?'VFS'+'STALL':'VFS'+'ALIVE')+' round='+round+' dn='+dn+' inf='+inf+' st='+st);last=dn;},1000);for(let i=0;i<KIDS;i++)kid();startRound();\"\n",
+            label: "node-smoke[VFS-STRESS]: concurrent readdir/readFile/open + child spawns (SIGCHLD)",
+        });
+        steps.push(SmokeStep::Wait {
+            // On a stall this never prints and the Wait times out, flushing
+            // serial with the VFSSTALL heartbeats + the kernel [replystall]
+            // / stuck-task verdict.
+            pattern: "VFSDONE",
+            timeout_secs: 420,
+            label: "node-smoke[VFS-STRESS]: all concurrent VFS storm rounds completed (no stall)",
+        });
+        return steps;
+    }
+
     // 3. fs / process / event-loop / timer probe (A.1 timerfd event-loop path).
     steps.push(SmokeStep::Send {
         input: "node /usr/src/node-probe.js\n",
@@ -16737,6 +16784,17 @@ fn cmd_claude_smoke(args: &SmokeBootArgs) {
         );
     }
 
+    // DIAGNOSTIC (claude -p wedge hunt, 2026-06-16): opt-in HMP monitor socket so
+    // the spinning guest's RIP/CR3 can be dumped host-side (the monitor stays
+    // responsive even when the guest core wedges at 100% CPU). Attach with
+    // `socat - unix:/tmp/claude-mon.sock` then `info registers` while wedged.
+    if std::env::var_os("M3OS_CLAUDE_MONITOR").is_some() {
+        let _ = std::fs::remove_file("/tmp/claude-mon.sock");
+        qemu_args.push("-monitor".to_string());
+        qemu_args.push("unix:/tmp/claude-mon.sock,server,nowait".to_string());
+        println!("claude-smoke: M3OS_CLAUDE_MONITOR — HMP monitor at /tmp/claude-mon.sock");
+    }
+
     println!(
         "claude-smoke: launching QEMU (timeout {}s, {} steps; net={do_net})",
         args.timeout_secs,
@@ -17200,6 +17258,20 @@ fn claude_smoke_steps(
                 timeout_secs: 20,
                 label: "claude-smoke: ANTHROPIC_BASE_URL is set (ion applied the export)",
             });
+            // Run from a SMALL empty cwd, not the login shell's `/`: Claude Code's
+            // startup spawns `rg` to index the working directory, and rg walking
+            // the whole root FS over the ~200 KB/s ring-3 VFS takes many minutes
+            // (a cwd artifact, not a kernel bug — see the handoff). A tiny project
+            // dir keeps the index walk instant so the round-trip measures the
+            // actual request, not the FS crawl.
+            steps.push(SmokeStep::Send {
+                input: "mkdir -p /tmp/cw\n",
+                label: "claude-smoke: create small project cwd",
+            });
+            steps.push(SmokeStep::Send {
+                input: "cd /tmp/cw\n",
+                label: "claude-smoke: cd into small project cwd (avoid rg walking /)",
+            });
             steps.push(SmokeStep::Send {
                 input: "claude -p 'What is 123 plus 456? Reply with ONLY the number and nothing else.'\n",
                 label: "claude-smoke: claude -p round-trip over OpenRouter (post-MAX_FDS fix)",
@@ -17215,7 +17287,12 @@ fn claude_smoke_steps(
                     "authentication",
                     "Invalid",
                 ],
-                timeout_secs: 240,
+                // 600 s, not 240 s: even in a small cwd the round-trip pays a
+                // cold node-subprocess start + TLS handshake + model latency over
+                // the slow VFS. The deadline-recv IPC fix removed the kernel
+                // stall; the remaining cost is legitimate I/O latency, so give it
+                // room to COMPLETE rather than truncating a slow-but-progressing run.
+                timeout_secs: 600,
                 label: "claude-smoke: OpenRouter round-trip answered 579 (MAX_FDS fix verified)",
                 exit_code_on_fail: SMOKE_EXIT_CLAUDE_SMOKE_FAILED,
             });

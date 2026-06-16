@@ -1,17 +1,32 @@
 ---
-status: IN PROGRESS — 3 of 4 issues FIXED + pushed; claude no longer crashes or freezes
-  the machine, but `claude -p` does NOT yet COMPLETE a request (a deep, intermittent
-  scheduler/IPC concurrency stall in claude's startup remains). Fixed + verified this
-  session: (1) EMFILE lock-up — MAX_FDS 32→128 (3d92bb40); (2) kstack-overflow segfault
-  in node clone/fork — heap-backed fd table (952da571, proven by controlled A/B +
-  node-smoke); (3) SYSTEM-WIDE FREEZE (frozen login screen) running claude — `stat("/dev/tty")`
-  hung the kernel VFS path → handled as a char device (36074826, verified via claude's
-  own --debug log advancing past it). REMAINING (the only blocker to end-to-end): the
-  `claude -p` round-trip stalls in claude's `setup()`/skill-discovery startup phase — a
-  clean, intermittent, SYSTEM-STAYS-RESPONSIVE wake/reblock-loop or lost-wake inside the
-  reply-block IPC primitive under claude's ~10-thread concurrent `vfs_server` load. NOT a
-  crash/freeze. Needs a dedicated instrumented pass (see "Next steps"); do NOT hot-patch
-  the scheduler/IPC primitives blind (regression risk to the 3 landed fixes).
+status: RESOLVED — `claude -p` COMPLETES end-to-end on m3OS. The four issues are all
+  fixed; #4 is FIXED this session (2026-06-16). claude-smoke PASSES the OpenRouter
+  `claude -p 'What is 123 plus 456?'` round-trip (answers **579**) twice (91 s, 54 s under
+  KVM). Root cause of #4 was NOT the IPC reply-block primitive — it was a hard
+  **single-core spin-deadlock on the kernel `EXT2_VOLUME` lock**: the kernel ext2 volume
+  (a plain `spin::Mutex`) is deliberately held across blocking virtio-blk I/O
+  (`read_inode`/`resolve_path` → `block_current_until`), and on a single core a second
+  task that acquires `EXT2_VOLUME` **busy-spins forever**, denying the only CPU to the
+  I/O-blocked holder so it can never release the lock — the whole machine wedges at 100%
+  CPU in `path_node_nofollow`'s `EXT2_VOLUME.lock()` (NO watchdog: the spin is kernel-mode,
+  IRQs fire but preemption can't unwind a spinlock). Claude Code triggers it via its
+  concurrent demand-paged `exec`(ripgrep)/`stat` storm during startup. Pinned by a
+  host-side QMP `info registers` dump showing a constant spin RIP at the `EXT2_VOLUME`
+  cmpxchg/pause loop. **Fix:** `EXT2_VOLUME` is now a `YieldingMutex` — on contention it
+  `yield_now()`s (lets the holder be rescheduled to release) instead of busy-spinning;
+  uncontended acquisition is unchanged. Also fixed (same session, real but orthogonal):
+  the deadline-bearing IPC block sites (`recv_msg_with_deadline`/`call_msg_with_deadline`)
+  reintroduced **Phase 57e Bug #8.1** (a `block_current_until` with an unregistered local
+  wake flag → a raced sender lost-woken until the 5 s flush deadline) — fixed with
+  `block_current_on_recv_v2_deadline`/`block_current_on_reply_v2_deadline`. The earlier
+  "intermittent reply-block stall" hypothesis was a red herring; the deterministic
+  `EXT2_VOLUME` wedge was the blocker.
+fix-commits (this session, to be committed):
+  - kernel/fs/ext2: EXT2_VOLUME spin::Mutex → YieldingMutex (THE #4 fix)
+  - kernel/ipc/endpoint + task/scheduler: deadline-path Bug #8.1 waker registration
+  - kernel/task + arch/syscall: last_syscall tick/nr + [replystall]/[stallcensus] diagnostics
+  - xtask/claude-smoke: claude -p in a small cwd + 600 s window + M3OS_CLAUDE_MONITOR (HMP)
+  - xtask/node-smoke: M3OS_NODE_VFS_STRESS concurrent-VFS stress arm
 branch: feat/phase-90b-claude-code
 key-commits:
   - 9e09b67c  kernel/net: accept TCP keepalive socket options (fixes setsockopt ENOPROTOOPT)
@@ -54,16 +69,39 @@ claude went through FOUR distinct m3OS bugs, hit one after another as each was f
 | 1 | EMFILE lock-up | per-process fd cap of 32 | `3d92bb40` MAX_FDS 32→128 | ✅ fixed+pushed |
 | 2 | Segfault (node killed) | node clone/fork stacked ~36 KiB of inline 12 KiB fd-tables → 64 KiB kstack overflow | `952da571` heap-backed fd table | ✅ fixed+pushed, proven |
 | 3 | **Frozen login screen** | `stat("/dev/tty")` hung the kernel VFS path, wedging the shared VFS system-wide | `36074826` `/dev/tty`→char device | ✅ fixed+pushed, verified |
-| 4 | `claude -p` never finishes | intermittent wake/reblock-loop / lost-wake in the reply-block IPC primitive under concurrent multi-thread vfs_server load | — | ❌ OPEN (the only end-to-end blocker) |
+| 4 | `claude -p` never finishes | **NOT** the reply-block IPC primitive (red herring). A hard single-core spin-deadlock on the kernel `EXT2_VOLUME` lock: it is held across blocking virtio-blk I/O, and a second task that acquires it busy-spins forever, starving the I/O-blocked holder so it never releases. Triggered by claude's concurrent demand-paged `exec`(rg)/`stat` storm. | `EXT2_VOLUME` `spin::Mutex` → `YieldingMutex` (yield, don't spin, on contention) | ✅ FIXED + verified (2026-06-16) |
 
-**The crashes and the system freeze are gone.** With #1–#3, claude boots, loads, JITs,
-spawns ripgrep, handles signals, and runs deep into its agent startup without wedging the
-machine. #4 is what stops a prompt from completing — it is NOT a crash or freeze (the system
-stays responsive); it is a deep scheduler/IPC concurrency stall.
+**ALL FOUR are fixed — `claude -p` completes end-to-end.** claude-smoke PASSES the OpenRouter
+`claude -p 'What is 123 plus 456?'` round-trip (answers **579**) twice (91 s, 54 s under KVM),
+and node-smoke regression is green (one pre-existing libuv-threadpool single-core futex flake
+on a re-run, unrelated to these fixes).
 
-Networking is fully exonerated (see "Ruled out"). The kstack is NOT undersized: m3OS already
-gives 64 KiB per task, 4× Linux's 16 KiB `THREAD_SIZE` — #2 was the kernel putting 12 KiB
-buffers on the stack, which the heap fix removed.
+### How #4 was actually found (the reply-block hypothesis was wrong)
+
+The previous handoff blamed an intermittent lost-wake in the reply-block IPC primitive. That
+was a red herring. The real failure is a **deterministic whole-machine wedge**: single-core,
+100 % CPU, **no watchdog** (the spin is kernel-mode; IRQs fire but preemption cannot unwind a
+spinlock). Method that cracked it: an opt-in QEMU HMP monitor (`M3OS_CLAUDE_MONITOR=1`) +
+a host-side `info registers` poller showed a **constant spin RIP** that `addr2line`'d to
+`path_node_nofollow`'s `EXT2_VOLUME.lock()` cmpxchg/pause loop. The kernel ext2 volume
+(`kernel/src/fs/ext2.rs`) is a plain `spin::Mutex` deliberately held across `read_inode`/
+`resolve_path` → `block_current_until` (virtio-blk I/O); on one core, when task A sleeps in
+that I/O holding the lock and task B acquires it, B busy-spins and denies A the only CPU, so A
+never releases — hard deadlock. This is the **same bug class as #3** (`/dev/tty`): a kernel FS
+lock held across a block, wedging the shared VFS. **Fix:** `EXT2_VOLUME` is now a
+`YieldingMutex` whose `lock()` `try_lock`s and, only on contention, `yield_now()`s so A is
+rescheduled to release; uncontended (boot) acquisition is unchanged.
+
+Orthogonal real bug fixed the same session: the deadline IPC block sites
+(`recv_msg_with_deadline`/`call_msg_with_deadline`) used `block_current_until` with an
+unregistered local wake flag — **Phase 57e Bug #8.1 on the deadline path** — so a sender
+racing the block was lost-woken until the 5 s flush deadline. Fixed with
+`block_current_on_recv_v2_deadline`/`block_current_on_reply_v2_deadline` (register the waker
+before the pending-message recheck). Not load-bearing for claude (the `EXT2_VOLUME` wedge was
+the blocker) but a genuine latency bug.
+
+Networking is fully exonerated (see "Ruled out") — claude never reached the API; it wedged in
+startup. The kstack is NOT undersized; #2 was the kernel putting 12 KiB buffers on the stack.
 
 ## The three fixed bugs (detail)
 

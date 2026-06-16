@@ -76,7 +76,69 @@ pub struct Ext2Volume {
 /// no ISR ever reaches it, so the preempt-disable side-effect of
 /// `IrqSafeMutex` is unnecessary defensive coverage that is now
 /// actively harmful.
-pub static EXT2_VOLUME: Mutex<Option<Ext2Volume>> = Mutex::new(None);
+///
+/// **2026-06-16 — yields on contention (`YieldingMutex`), not a bare spin.**
+/// The rationale above (the guard outlives `block_current_until` for every
+/// `read_inode`/`read_file_data` that descends into `virtio_blk`) has a
+/// corollary the original `spin::Mutex` choice missed: while task A sleeps in
+/// that I/O *holding this lock*, a task B that acquires `EXT2_VOLUME` would, on
+/// a bare `spin::Mutex`, **busy-spin** — and on a single core that spin
+/// monopolises the only CPU, so A is never rescheduled to finish its read and
+/// release the lock. Hard deadlock: the machine wedges at 100% CPU in
+/// `path_node_nofollow`'s `EXT2_VOLUME.lock()` with no watchdog (IRQs fire but
+/// the spin is kernel-mode and preemption can't unwind a spinlock). This is the
+/// `claude -p` whole-machine freeze during Claude Code's concurrent demand-paged
+/// `exec`(rg)/`stat` storm — confirmed by a host-side QMP `info registers` dump
+/// pinning the constant spin RIP to this lock
+/// (docs/handoffs/2026-06-15-claude-code-openrouter-emfile-fd-limit.md #4).
+/// `YieldingMutex::lock` `try_lock`s and, only on contention, `yield_now`s so the
+/// I/O-blocked holder is rescheduled, releases, and B re-acquires — converting
+/// the deadlock into a cooperative wait. Uncontended acquisition (boot mount,
+/// the common fast path) takes the `try_lock` with no yield, so the
+/// no-preempt-disable property above is preserved.
+pub static EXT2_VOLUME: YieldingMutex<Option<Ext2Volume>> = YieldingMutex::new(None);
+
+/// A mutex that **yields the CPU on contention** instead of busy-spinning.
+///
+/// Drop-in for `spin::Mutex` at the `EXT2_VOLUME` call sites (`lock()` returns
+/// the same `spin::MutexGuard`). The only behavioural difference is the wait
+/// strategy: a bare `spin::Mutex` `relax`es with `pause` (busy-spin), which on a
+/// single core deadlocks when the lock is held across a blocking operation (see
+/// `EXT2_VOLUME`); this instead calls `yield_now()` so the scheduler can run the
+/// lock holder. Yield only happens when `try_lock` fails, i.e. only under real
+/// contention — which can only occur once the scheduler is up and >1 task is
+/// runnable, so the boot-time uncontended acquisitions never yield.
+pub struct YieldingMutex<T> {
+    inner: Mutex<T>,
+}
+
+impl<T> YieldingMutex<T> {
+    pub const fn new(value: T) -> Self {
+        Self {
+            inner: Mutex::new(value),
+        }
+    }
+
+    /// Acquire the lock, yielding (not busy-spinning) while it is contended.
+    #[inline]
+    pub fn lock(&self) -> spin::MutexGuard<'_, T> {
+        loop {
+            if let Some(guard) = self.inner.try_lock() {
+                return guard;
+            }
+            // Contended: the holder may be asleep in virtio-blk I/O *holding this
+            // lock*. Busy-spinning here would deny it the CPU forever on a single
+            // core. Yield so it is rescheduled to release the lock.
+            crate::task::scheduler::yield_now();
+        }
+    }
+
+    /// Non-blocking acquire (no yield, no spin).
+    #[inline]
+    pub fn try_lock(&self) -> Option<spin::MutexGuard<'_, T>> {
+        self.inner.try_lock()
+    }
+}
 
 /// Phase 88 Track C — expose the kernel `Ext2Volume` as a `BlockReader` so the
 /// higher-level read logic (resolve_path / read_inode / read_file_data /

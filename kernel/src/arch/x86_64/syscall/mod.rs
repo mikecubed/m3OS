@@ -1724,6 +1724,21 @@ pub extern "C" fn syscall_handler(
     // the primary save point.
     snapshot_user_return_state();
 
+    // DIAGNOSTIC (claude -p stall hunt, 2026-06-16) — stamp the syscall-entry
+    // tick on the running task (lock-free, same discipline as IRQ CPU-time
+    // accounting). `watchdog_scan`'s reply-stall scan uses `now - this` to
+    // detect a task wedged inside ONE syscall (e.g. a `BlockedOnReply` that
+    // wake/reblock-loops, resetting `blocked_since_tick` and so evading the
+    // 30 s stuck-task watchdog). Costs one relaxed store on the hot path.
+    if let Some(task) = crate::task::scheduler::current_task_ptr() {
+        task.last_syscall_entry_tick.store(
+            crate::arch::x86_64::interrupts::tick_count(),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        task.last_syscall_nr
+            .store(number as u32, core::sync::atomic::Ordering::Relaxed);
+    }
+
     // Phase 57a follow-up DEBUG: per-pid syscall trace.
     let strace_match = {
         let trace_pid = STRACE_PID.load(core::sync::atomic::Ordering::Relaxed);

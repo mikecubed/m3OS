@@ -1013,8 +1013,6 @@ pub fn recv_msg_with_deadline(
     ep_id: EndpointId,
     deadline_ticks: Option<u64>,
 ) -> Message {
-    use core::sync::atomic::AtomicBool;
-
     const NEG_ETIMEDOUT: u64 = (-110_i64) as u64;
 
     // Fast path: sender already queued. Reuse `recv_msg`'s pop-sender
@@ -1037,12 +1035,17 @@ pub fn recv_msg_with_deadline(
     // observes our entry expired — at that point we are still queued in
     // `ep.receivers`. Race-free cleanup: remove ourselves from the queue
     // and surface ETIMEDOUT only when no message was delivered.
-    let woken = AtomicBool::new(false);
-    let outcome = scheduler::block_current_until(
-        crate::task::TaskState::BlockedOnRecv,
-        &woken,
-        deadline_ticks,
-    );
+    //
+    // MUST use the waker-registering helper (NOT a bare `block_current_until`
+    // with a stack-local flag): a sender whose `call_msg` races this block
+    // would otherwise deliver `pending_msg` + `wake_task_v2` while we are still
+    // `Running` (the CAS no-ops), and with no `reply_waker` registered the
+    // block commits anyway and sleeps until the deadline — Phase 57e Bug #8.1
+    // on the deadline path, the up-to-`FLUSH_INTERVAL`-latency root of the
+    // intermittent Claude Code `claude -p` startup stall. The helper registers
+    // the waker before its `pending_msg` recheck so a raced sender self-reverts
+    // the block immediately.
+    let outcome = scheduler::block_current_on_recv_v2_deadline(receiver, deadline_ticks);
 
     // Cleanup: remove from receivers queue if still present (the IPC
     // completion path normally pops us, but on a deadline expiry it does
@@ -1077,8 +1080,6 @@ pub fn call_msg_with_deadline(
     msg: Message,
     deadline_ticks: Option<u64>,
 ) -> Message {
-    use core::sync::atomic::AtomicBool;
-
     const NEG_ETIMEDOUT: u64 = (-110_i64) as u64;
 
     // Drain stale pending_msg so the deadline-block primitive does not
@@ -1140,13 +1141,11 @@ pub fn call_msg_with_deadline(
         crate::task::scheduler::preempt_enable();
     }
 
-    // Block waiting for the reply with the supplied deadline.
-    let woken = AtomicBool::new(false);
-    let outcome = scheduler::block_current_until(
-        crate::task::TaskState::BlockedOnReply,
-        &woken,
-        deadline_ticks,
-    );
+    // Block waiting for the reply with the supplied deadline. MUST register the
+    // waker (Phase 57e Bug #8.1 on the deadline path — see
+    // `block_current_on_recv_v2_deadline`): a server `reply` that races this
+    // block would otherwise be lost and the caller would sleep to the deadline.
+    let outcome = scheduler::block_current_on_reply_v2_deadline(caller, deadline_ticks);
 
     // Race-free cleanup: pull ourselves out of the senders queue if we
     // never matched a receiver and the deadline expired before delivery.
