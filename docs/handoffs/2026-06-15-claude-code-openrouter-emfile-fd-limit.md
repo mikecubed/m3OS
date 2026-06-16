@@ -45,10 +45,32 @@ status: THREE root causes found+fixed. (1) EMFILE — MAX_FDS 32→128 (3d92bb40
   wait (futex-WAKE-delivered-but-ineffective or a userspace deadlock; the kernel's
   `no waker` watchdog does NOT fire, so a waker IS registered); and (2) once past it,
   `rg --files` walking a large cwd (`/` → all of `/usr`, GiB) over the ~200 KB/s ring-3
-  VFS is pathologically slow (cwd-mitigable, not a bug). Next-session leads: trace
-  `FUTEX_WAIT`/`WAKE` pairing for a wake that doesn't wake its waiter; and/or audit the
-  per-task PKRU XSAVE save/restore across context switches under V8's multi-thread
-  codegen (a lost write-window would surface as a thread that can't progress).
+  VFS is pathologically slow (cwd-mitigable, not a bug).
+
+  Next-session leads (strongest first). The blocked thread is in a VFS `stat`, i.e.
+  inside `endpoint::call_msg` → `block_current_on_reply_v2` → `BlockedOnReply` with a
+  registered `reply_waker` — and NONE of the existing diagnostics fire (the `no waker`
+  watchdog only catches tasks with NO waker; the `reply_v2:*` / `call_msg:no_reply_message`
+  logs only catch spurious WAKES). A waker-registered-but-never-fired reply-wake is
+  therefore INVISIBLE today and matches the symptom exactly. ⇒ (1) Add a watchdog arm for
+  tasks stuck in `BlockedOnReply` past a deadline WITH a waker registered, dumping the
+  task + the endpoint senders/receivers + the outstanding reply-cap holder — catches the
+  exact hang next run with actionable data. (2) Audit `ipc_reply` → `deliver_message` +
+  `wake_task_v2` and the single-threaded `vfs_server` reply loop under CONCURRENT
+  multi-thread callers (claude has ~10 threads hammering `vfs_server`; node-smoke does
+  not — that concurrency is the trigger): a reply delivered to caller A while caller B is
+  mid-`call_msg` enqueue, or a reply-cap resolution race, could strand B. (3) Audit the
+  `metacache` lock in `vfs_service_stat_path` under concurrent stats. Lower priority:
+  `FUTEX_WAIT`/`WAKE` pairing; PKU XSAVE save/restore (PKU read-recovery already PROVEN
+  healthy/bounded via the new `PKU_READ_RECOVERIES` counter, so PKU is unlikely).
+  IMPORTANT CAVEAT: the existing `[sched] … no waker registered` watchdog does NOT fire
+  in any hang log, so the thread is likely NOT permanently parked — it either
+  wakes-and-reblocks or busy-spins (the node strace shows heavy `clock_gettime` polling,
+  i.e. a possible libuv event-loop spin), so blocked_since keeps resetting and the
+  watchdog never sees it "stuck". So the watchdog arm in (1) should flag high CUMULATIVE
+  blocked time / a sustained syscall-spin, not just a single long block; and the
+  libuv event-loop (timerfd/epoll_wait returning-immediately-in-a-loop) is a strong
+  alternative to the lost-wake hypothesis.
 prior-status: FIXED + PROVEN BY CONTROLLED EXPERIMENT (commit 952da571, pushed). The heap
   fd-table fix is confirmed sufficient: claude-smoke PASSES on 4-core AND 1-core (KVM),
   with and without the ANTHROPIC_* OpenRouter env vars, through the full agent flow
