@@ -1,114 +1,17 @@
 ---
-status: THREE root causes found+fixed. (1) EMFILE — MAX_FDS 32→128 (3d92bb40).
-  (2) kstack overflow in node clone/fork — heap-backed fd table (952da571, proven).
-  (3) **SYSTEM-WIDE FREEZE running `claude -p` — `stat("/dev/tty")` hung.** Node/Claude
-  Code `readlink` their TTY → `/dev/tty` then `stat` it at startup; `/dev/tty` was
-  MISSING from the device char-special-case lists in `path_node_nofollow` AND
-  `path_filemeta` (every other `/dev/*` device — null/zero/urandom/random/full/ptmx/
-  pts — is handled, and `path_metadata` already listed `/dev/tty`), so the stat fell
-  through to a synchronous `vfs_service_stat_path` `endpoint::call_msg` IPC to
-  `vfs_server` for a path it doesn't own — which never returned, blocking the process
-  in-kernel and, via the shared VFS, freezing the whole machine (the user's frozen
-  login screen). Fix: handle `/dev/tty` as a char device (S_IFCHR 0o666) in both
-  functions, matching Linux (stat never touches the FS) and the other devices.
-  VERIFIED: with the fix node sails PAST the freeze — claude's own `--debug` log
-  (pulled from the disk) now advances from the old hang at `[STARTUP] Loading MCP
-  configs...` through `Running setup()...` to `Loading skills from:
-  managed=/etc/claude-code/.claude/skills, user=/root/.claude/skills` — and node
-  stats `/dev/tty` repeatedly, reads settings/`.git`/CA bundle, JITs, spawns ripgrep +
-  handles SIGCHLD. The system NO LONGER freezes. The kstack-overflow backtrace
-  diagnostic (6f02d18b) + a node syscall trace (`M3OS_STRACE_COMM=node`) + an fstatat
-  path log pinned #3 (the last `[strace]` was `enter syscall=4`/stat, path `/dev/tty`).
-
-  REMAINING (separate, less-severe, NOT the reported freeze): `claude -p` does not
-  COMPLETE — it stalls in claude's `setup()`/skill-discovery phase. Characterized over
-  ~16 KVM reproduce cycles: (a) happens on BOTH `-smp 1` and `-smp 4` (not a single-
-  core lock deadlock); (b) NO `DOUBLE FAULT`/`KERNEL PANIC`/`process killed`/`vfs_server:
-  ipc_reply failed` — a CLEAN stall, and `vfs_server` keeps replying + other node
-  threads keep churning (futex/exit), so the SYSTEM STAYS RESPONSIVE (unlike the #3
-  freeze); (c) the syscall-level manifestation is non-deterministic (a `stat`, a
-  `futex`, or right after V8 `[wx] v2-guarded W+X mapping (pkey=1)` WASM codegen),
-  consistent with a node-internal threading/event-loop wait rather than a kernel wedge.
-  i.e. node is alive but a thread is waiting on something that never completes during
-  claude's heavy startup. This is a DEEPER, iterative issue and a candidate for a
-  dedicated follow-up. RULED OUT (do not re-chase): cwd/`rg --files`-walks-`/` (empty
-  cwd still stalled); a single-core `EXT2_VOLUME.lock` deadlock (`-smp 4` stalls too);
-  a `vfs_server` lost reply (none logged); an anonymous-`mmap` kernel hang (that path
-  is a non-blocking linear bump + VMA insert); and — via a new `PKU_READ_RECOVERIES`
-  diagnostic (`interrupts.rs`) — a PKU read-fault SPIN-LOOP: the 90b cross-thread
-  read-recovery fires a BOUNDED ~11 times across DIFFERENT worker tids at the SAME V8
-  rip (`0x3763831`) with DIFFERENT addrs, i.e. each thread reads the pkey-1 WASM code
-  space ONCE and proceeds — the recovery is healthy, not looping. NARROWED PICTURE:
-  two orthogonal things gate `claude -p` completion — (1) an INTERMITTENT hang in the
-  V8-WASM-W+X / threading startup window (some runs clear it and reach ripgrep; some
-  stall at the W+X phase), no kernel markers ⇒ a node-internal threading/event-loop
-  wait (futex-WAKE-delivered-but-ineffective or a userspace deadlock; the kernel's
-  `no waker` watchdog does NOT fire, so a waker IS registered); and (2) once past it,
-  `rg --files` walking a large cwd (`/` → all of `/usr`, GiB) over the ~200 KB/s ring-3
-  VFS is pathologically slow (cwd-mitigable, not a bug).
-
-  Next-session leads (strongest first). The blocked thread is in a VFS `stat`, i.e.
-  inside `endpoint::call_msg` → `block_current_on_reply_v2` → `BlockedOnReply` with a
-  registered `reply_waker` — and NONE of the existing diagnostics fire (the `no waker`
-  watchdog only catches tasks with NO waker; the `reply_v2:*` / `call_msg:no_reply_message`
-  logs only catch spurious WAKES). A waker-registered-but-never-fired reply-wake is
-  therefore INVISIBLE today and matches the symptom exactly. ⇒ (1) Add a watchdog arm for
-  tasks stuck in `BlockedOnReply` past a deadline WITH a waker registered, dumping the
-  task + the endpoint senders/receivers + the outstanding reply-cap holder — catches the
-  exact hang next run with actionable data. (2) Audit `ipc_reply` → `deliver_message` +
-  `wake_task_v2` and the single-threaded `vfs_server` reply loop under CONCURRENT
-  multi-thread callers (claude has ~10 threads hammering `vfs_server`; node-smoke does
-  not — that concurrency is the trigger): a reply delivered to caller A while caller B is
-  mid-`call_msg` enqueue, or a reply-cap resolution race, could strand B. (3) Audit the
-  `metacache` lock in `vfs_service_stat_path` under concurrent stats. Lower priority:
-  `FUTEX_WAIT`/`WAKE` pairing; PKU XSAVE save/restore (PKU read-recovery already PROVEN
-  healthy/bounded via the new `PKU_READ_RECOVERIES` counter, so PKU is unlikely).
-  IMPORTANT CAVEAT: the existing `[sched] … no waker registered` watchdog does NOT fire
-  in any hang log, so the thread is likely NOT permanently parked — it either
-  wakes-and-reblocks or busy-spins (the node strace shows heavy `clock_gettime` polling,
-  i.e. a possible libuv event-loop spin), so blocked_since keeps resetting and the
-  watchdog never sees it "stuck". So the watchdog arm in (1) should flag high CUMULATIVE
-  blocked time / a sustained syscall-spin, not just a single long block; and the
-  libuv event-loop (timerfd/epoll_wait returning-immediately-in-a-loop) is a strong
-  alternative to the lost-wake hypothesis.
-prior-status: FIXED + PROVEN BY CONTROLLED EXPERIMENT (commit 952da571, pushed). The heap
-  fd-table fix is confirmed sufficient: claude-smoke PASSES on 4-core AND 1-core (KVM),
-  with and without the ANTHROPIC_* OpenRouter env vars, through the full agent flow
-  (7 node launches + ripgrep child spawn), zero overflows. A controlled A/B nailed it:
-  reverting JUST the fd-table to the pre-fix inline `[Option<FdEntry>; 128]` (keeping a
-  new #DF backtrace diagnostic) reproduces the overflow single-core on the FIRST node
-  launch; the fixed (heap `Vec`) build does not. The new diagnostic confirmed the
-  MECHANISM is LARGE FRAMES, not recursion: at overflow only ~66 `.text` return
-  addresses are on the 64 KiB stack (a recursion would show hundreds/thousands), and
-  the deepest frames are `memcpy`/`memset` of ~12 KiB — the inline fd-table copied/
-  zeroed by value in the fork/clone/spawn path. ⇒ **If you still hit the overflow, your
-  kernel is a STALE build without 952da571 — `git pull` and rebuild (xtask always
-  recompiles the kernel from source, so a fresh build picks it up).** The kstack is NOT
-  too small: 64 KiB is already 4× Linux's 16 KiB `THREAD_SIZE`; the bug was the kernel
-  putting 12 KiB buffers on the stack, which the heap fix removes. Last step: the
-  end-to-end OpenRouter round-trip on the laptop (expect `579`) on a freshly-built kernel.
-  The MAX_FDS=32→128 raise (commit 3d92bb40) fixed the
-  EMFILE lock-up but introduced a SECOND bug: with `MAX_FDS=128` the per-process fd
-  table was an inline `[Option<FdEntry>; 128]` of a `VfsFileMeta`-bloated ~96-byte
-  `FdEntry` ≈ **12 KiB**, living inline in `Process` AND returned by-value from
-  `fd_table_snapshot()`. Node's `clone(CLONE_THREAD)` (libuv threadpool) / `fork`
-  path stacks THREE of them at once (parent snapshot + `child_fds_copy` + the new
-  `Process`'s inline copy) ≈ 36 KiB — which overflowed the 64 KiB per-task kernel
-  stack the instant MAX_FDS went 32→128 (at 32 the three copies were only ~9 KiB).
-  This is exactly the 06-15 "hypothesis #2 / kstack pressure" prediction, now
-  CONFIRMED by the live `[int] DOUBLE FAULT = kstack overflow … attributable to pid
-  43 [node]` (slot-math on `rsp=0xffff808000550df8` shows the FULL 64 KiB was
-  consumed). The kernel's Track-D recovery killed node and survived, but node dying
-  means claude can't run. **FIX (this session):** moved the fd table to the heap —
-  `Process.fd_table` / `shared_fd_table` / `fd_table_snapshot()` / `new_fd_table()` /
-  `spawn_process_with_cr3_and_fds()` are now `Vec<Option<FdEntry>>` (always length
-  `MAX_FDS`), so only a 24-byte `Vec` header ever lands on the kstack. `cargo xtask
-  check` passes. **RUNTIME-VERIFIED:** `M3OS_KVM=1 cargo xtask node-smoke` →
-  `node-smoke: PASSED (32 steps in 111s)` with `NODE_EGRESS_OK` (the libuv-threadpool
-  `clone(CLONE_THREAD)` path that overflowed) and 0 `kstack overflow` / 0 `DOUBLE FAULT`
-  / 0 `fault_kill` lines. Networking remains fully exonerated. **OPEN:** the end-to-end
-  OpenRouter `claude -p` round-trip on the laptop — exercises `sys_fork` via the ripgrep
-  spawn (same Vec fix) + the authed network round-trip → expect `579`.
+status: IN PROGRESS — 3 of 4 issues FIXED + pushed; claude no longer crashes or freezes
+  the machine, but `claude -p` does NOT yet COMPLETE a request (a deep, intermittent
+  scheduler/IPC concurrency stall in claude's startup remains). Fixed + verified this
+  session: (1) EMFILE lock-up — MAX_FDS 32→128 (3d92bb40); (2) kstack-overflow segfault
+  in node clone/fork — heap-backed fd table (952da571, proven by controlled A/B +
+  node-smoke); (3) SYSTEM-WIDE FREEZE (frozen login screen) running claude — `stat("/dev/tty")`
+  hung the kernel VFS path → handled as a char device (36074826, verified via claude's
+  own --debug log advancing past it). REMAINING (the only blocker to end-to-end): the
+  `claude -p` round-trip stalls in claude's `setup()`/skill-discovery startup phase — a
+  clean, intermittent, SYSTEM-STAYS-RESPONSIVE wake/reblock-loop or lost-wake inside the
+  reply-block IPC primitive under claude's ~10-thread concurrent `vfs_server` load. NOT a
+  crash/freeze. Needs a dedicated instrumented pass (see "Next steps"); do NOT hot-patch
+  the scheduler/IPC primitives blind (regression risk to the 3 landed fixes).
 branch: feat/phase-90b-claude-code
 key-commits:
   - 9e09b67c  kernel/net: accept TCP keepalive socket options (fixes setsockopt ENOPROTOOPT)
@@ -116,229 +19,251 @@ key-commits:
   - 3d92bb40  kernel/process: raise MAX_FDS 32 → 128 (fixes Claude Code EMFILE lock-up)
   - c7e443ca  kernel/smp/tlb: word ack-timeout diagnostic per regime (PR #247 review)
   - 952da571  kernel/process: heap-back the fd table (Vec<Option<FdEntry>>) — fixes the
-    node clone/fork kstack overflow the MAX_FDS=128 raise introduced (node-smoke verified)
+    node clone/fork kstack-overflow segfault the MAX_FDS=128 raise introduced (proven)
   - b567e304  xtask/claude-smoke: M3OS_CLAUDE_BASE_URL/MODEL + OpenRouter round-trip arm
-date: 2026-06-15 (updated 2026-06-16)
-component: kernel/process (fd table / MAX_FDS) + kernel/net (socket options) +
-  ports/claude-code (DEPS) + xtask claude-smoke (OpenRouter/model harness plumbing,
-  UNCOMMITTED in working tree)
-artifacts:
-  - m3os.log (project root) — the user's single-core run serial (kernel side)
-  - debug1.log / debug2.log (project root) — claude's OWN debug logs (the smoking gun)
-  - openrouter.sh (project root) — the user's OpenRouter env (key filled in locally; NOT committed)
+  - 6f02d18b  kernel/interrupts: kstack-overflow #DF backtrace diagnostic (pinned #2)
+  - 36074826  kernel/syscall: handle /dev/tty in stat path (fixes the system-wide FREEZE)
+  - ed54ce1d  kernel/interrupts: PKU read-recovery diagnostic (ruled PKU out of the stall)
+  - (docs)    0ba11f5e, 98b6d4f4, 2e449377 — running findings/analysis in this handoff
+date: 2026-06-15 (last updated 2026-06-16)
+component: kernel/process (fd table / MAX_FDS), kernel/syscall (stat /dev/tty),
+  kernel/net (socket options), kernel/interrupts (diagnostics), ports/claude-code (DEPS),
+  xtask/claude-smoke (OpenRouter harness). REMAINING work is in kernel/task/scheduler +
+  kernel/ipc (reply-block primitive) and userspace/vfs_server (reply loop).
+artifacts (project root, gitignored — do NOT commit):
+  - openrouter.sh — the user's OpenRouter env; key filled in locally. The repro command
+    reads OPENROUTER_API_KEY from it; the value never crosses serial or the repo.
+  - m3os.log — a user-supplied serial capture from a freeze repro.
+  - claude.png — original screenshot.
+  - host-side serial captures from this session live under /tmp/m3os-*.log (transient).
 ---
 
 ## Goal
 
-Get `@anthropic-ai/claude-code@2.1.112` (the pinned Node-runnable build, Phase 90b)
-to actually complete a request on m3OS — first against OpenRouter (an
-Anthropic-protocol proxy the user already runs on their laptop), as both a working
-setup and a diagnostic vs the official `api.anthropic.com`.
+Get `@anthropic-ai/claude-code@2.1.112` (the pinned Node-runnable build, Phase 90b) to
+**complete a request end-to-end on m3OS** — driven against OpenRouter (an Anthropic-protocol
+proxy the user runs on their laptop; key in `openrouter.sh`), as both a working setup and a
+diagnostic vs the official `api.anthropic.com`.
 
-## TL;DR — current status
+## Current status (TL;DR)
 
-- **ROOT CAUSE FOUND:** `MAX_FDS = 32` (kernel/src/process/mod.rs) is far too small for
-  Node/Claude Code → **EMFILE** → lock-up. Fixed to 128 (commit `3d92bb40`, pushed).
-- **Networking is NOT the problem** — proven exhaustively (see "Ruled out").
-- **Immediate open item:** verify the MAX_FDS=128 fix lets claude complete a round-trip
-  over OpenRouter (run was in flight when this doc was written — update the result).
-- **Two tracked secondary bugs** (non-fatal, not yet fixed): `copyfile`→EFAULT, and the
-  inline-fd-table design limiting MAX_FDS to 128 (heap-refactor needed for 1024).
+claude went through FOUR distinct m3OS bugs, hit one after another as each was fixed:
 
-## Root cause (the answer)
+| # | Symptom | Root cause | Fix | State |
+|---|---------|-----------|-----|-------|
+| 1 | EMFILE lock-up | per-process fd cap of 32 | `3d92bb40` MAX_FDS 32→128 | ✅ fixed+pushed |
+| 2 | Segfault (node killed) | node clone/fork stacked ~36 KiB of inline 12 KiB fd-tables → 64 KiB kstack overflow | `952da571` heap-backed fd table | ✅ fixed+pushed, proven |
+| 3 | **Frozen login screen** | `stat("/dev/tty")` hung the kernel VFS path, wedging the shared VFS system-wide | `36074826` `/dev/tty`→char device | ✅ fixed+pushed, verified |
+| 4 | `claude -p` never finishes | intermittent wake/reblock-loop / lost-wake in the reply-block IPC primitive under concurrent multi-thread vfs_server load | — | ❌ OPEN (the only end-to-end blocker) |
 
-claude's own debug log (`/root/.claude/debug/*.txt`, pulled into `debug1.log`) ended with:
+**The crashes and the system freeze are gone.** With #1–#3, claude boots, loads, JITs,
+spawns ripgrep, handles signals, and runs deep into its agent startup without wedging the
+machine. #4 is what stops a prompt from completing — it is NOT a crash or freeze (the system
+stays responsive); it is a deep scheduler/IPC concurrency stall.
 
-```
-[DEBUG] rg error (signal=undefined, code=EMFILE, stderr: ), 0 results
-```
+Networking is fully exonerated (see "Ruled out"). The kstack is NOT undersized: m3OS already
+gives 64 KiB per task, 4× Linux's 16 KiB `THREAD_SIZE` — #2 was the kernel putting 12 KiB
+buffers on the stack, which the heap fix removed.
 
-right before the agent wedged. **EMFILE = too many open files.** The kernel caps every
-process at 32 fds (`pub const MAX_FDS: usize = 32`), and Node/Claude Code blow past that
-in one session:
-- stdio (3) + libuv epoll/eventfd/timerfd/self-pipe (~6–8)
-- the **custom undici agent** with the CA certs (claude builds its own dispatcher —
-  `[DEBUG] TLS: Created undici agent with custom certificates`) → TLS sockets
-- config / `.claude.json` / temp / lock / backup files
-- **3 pipe fds per spawned `ripgrep`** (claude spawns rg repeatedly)
+## The three fixed bugs (detail)
 
-Once the 32-slot table fills, `fd_alloc()` returns None → the syscall returns `EMFILE`
-(`NEG_EMFILE`), and claude locks up.
+### #1 — EMFILE: MAX_FDS 32 → 128 (`3d92bb40`)
+claude's own debug log ended with `rg error (code=EMFILE)` before wedging. The kernel capped
+every process at 32 fds; Node + claude (stdio + libuv epoll/eventfd/timerfd/self-pipe + the
+custom undici TLS agent + config/lock/backup files + 3 pipe fds per spawned ripgrep) blow
+past 32 in one session → `fd_alloc()` → `EMFILE` → lock-up. Raised to 128 (~4× the observed
+~30-fd ceiling). `getrlimit(RLIMIT_NOFILE)` reports MAX_FDS so it stays truthful.
+(Pre-reqs that unblocked earlier symptoms: `9e09b67c` TCP keepalive setsockopt; `28e42a55`
+ca-certificates DEPS so `/etc/ssl/certs/ca-certificates.crt` is installed.)
 
-## Fixes landed (all on the branch)
+### #2 — kstack-overflow segfault: heap-backed fd table (`952da571`)
+The MAX_FDS 32→128 raise introduced this. `FdEntry` is ~96 bytes (Phase 88 embedded a
+`VfsFileMeta` in `FdBackend::VfsService`), so `[Option<FdEntry>; 128]` ≈ **12 KiB**. It lived
+inline in `Process`, was returned by-value from `fd_table_snapshot()`, and passed by-value to
+`spawn_process_with_cr3_and_fds()`. node's `clone(CLONE_THREAD)` (libuv threadpool) and `fork`
+paths stack THREE such copies at once (parent snapshot + `child_fds_copy` + the child
+`Process`'s inline copy) ≈ 36 KiB → overflowed the 64 KiB per-task kstack the instant MAX_FDS
+went to 128 (at 32 the three copies were only ~9 KiB). Surfaced as
+`#DF = kstack overflow attributable to pid <node>`; Track-D recovery killed node (the segfault).
+**Fix:** `Process.fd_table` / `shared_fd_table` / `fd_table_snapshot()` / `new_fd_table*()` /
+`spawn_process_with_cr3_and_fds()` are now heap `Vec<Option<FdEntry>>` (always length MAX_FDS,
+built `vec![None; MAX_FDS]` so no `[_; N]` stack temporary). Per-frame fd-table cost: ~12 KiB
+→ 24-byte Vec header. **Proven:** a controlled A/B revert (pre-fix inline array → overflow
+single-core on the first node launch; heap Vec → no overflow), plus `M3OS_KVM=1 cargo xtask
+node-smoke` PASSED (exercises the same `clone(CLONE_THREAD)` egress path) with 0 overflow
+lines. The `6f02d18b` #DF backtrace diagnostic pinned the mechanism (only ~66 `.text` frames
+on the stack, deepest are `memcpy`/`memset` of ~12 KiB = the inline fd-table, not recursion).
+MAX_FDS can now go to Linux's 1024 with a one-line change (heap cost only); left at 128.
 
-1. **`9e09b67c` — TCP keepalive socket options.** `setsockopt(IPPROTO_TCP,
-   TCP_KEEPIDLE/INTVL/CNT)` previously returned `ENOPROTOOPT`; libuv's
-   `uv__tcp_keepalive` treats that as a fatal connect error → claude's first symptom
-   ("Failed to connect … ENOPROTOOPT"). Now accepted+stored; the setsockopt catch-all is
-   accept-and-log for best-effort options. Guarded by `connect-smoke` assertion 5
-   (always-on, no network). The keepalive *prober* itself is deferred (see
-   90b-claude-code.md "Deferred Until Later").
-2. **`28e42a55` — ports/claude-code DEPS += ca-certificates.** The `/usr/bin/claude`
-   launcher sets `NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt`, but the package
-   only `DEPS=node`, so that file was never installed ("Cannot open directory
-   /etc/ssl/certs"). Now the solver installs the CA bundle dependency-first. (Confirmed
-   working in claude's debug log: "Appended extra certificates from NODE_EXTRA_CA_CERTS".)
-   NOTE: not the lock-up cause — Node falls back to built-in roots regardless.
-3. **`3d92bb40` — MAX_FDS 32 → 128.** The actual lock-up fix. `getrlimit(RLIMIT_NOFILE)`
-   already reports `MAX_FDS`, so it stays truthful. Bounded to 128 (not 1024) because
-   `fd_table` is an inline `[Option<FdEntry>; MAX_FDS]` and `fd_table_snapshot()` returns
-   it BY VALUE on the **16 KiB syscall stack** (`SYSCALL_STACK_SIZE`); at the 64-byte
-   `FdEntry` class that is ≤8 KiB and fits. 128 is ~4× claude's observed ~30-fd ceiling.
+### #3 — system-wide FREEZE: `/dev/tty` stat (`36074826`)
+The user's actual reported symptom: running `claude` over SSH froze the **login screen**
+(whole machine). node/claude `readlink` their TTY (→ `/dev/tty`, 8 chars) then `stat("/dev/tty")`
+at startup. `/dev/tty` was MISSING from the char-device special-case lists in BOTH
+`path_node_nofollow` and `path_filemeta` (every other `/dev/*` device — null/zero/urandom/
+random/full/ptmx/pts — was handled, and `path_metadata` already listed `/dev/tty`). So the
+stat fell through to the kernel ext2/`EXT2_VOLUME.lock` path and **hung in-kernel**; because it
+blocked holding the shared VFS, every other process blocked on file I/O → frozen login screen.
+**Fix:** report `/dev/tty` as a char device (S_IFCHR 0o666) in both functions, matching Linux
+(`stat("/dev/tty")` never touches the FS) and the other `/dev/*` devices. **Verified:** claude's
+own `--debug` log (pulled off the disk via `debugfs`) now advances from the old hang at
+`[STARTUP] Loading MCP configs...` through `Running setup()...` to skill discovery, and node
+stats `/dev/tty` repeatedly + proceeds. The system no longer freezes.
 
-## Verification status — hypothesis #2 CONFIRMED + FIXED (2026-06-16)
+## #4 — the remaining blocker: `claude -p` does not complete
 
-The prior stalls/lock-ups were the predicted **kstack pressure** (hypothesis #2 below),
-now confirmed by a live crash and fixed by heap-backing the fd table.
+**Symptom:** a `claude -p '…'` round-trip (OpenRouter) never prints the answer; the
+claude-smoke step times out. NOT a crash, NOT a freeze — the system stays responsive
+(`vfs_server` keeps replying, other node threads keep churning, no fault/panic/kill).
 
-**The confirming crash (2026-06-16 re-run):** node (`pid 43`) died with
-```
-[int] DOUBLE FAULT = kstack overflow (rsp=0xffff808000550df8) attributable to pid 43 — killing process; core recovers (no halt)
-[WARN] [fault_kill] trampoline running for pid 43
-```
-Slot math nails it to a per-task kstack: area start `0xFFFF_8080_0000_0000`, slot vsize
-`0x11000` (4 KiB guard + 64 KiB usable). `0x550df8 / 0x11000` = slot 80, whose guard page
-is `0x550000..0x551000`; `rsp=0x550df8` sits 520 bytes INTO that guard — i.e. the entire
-64 KiB usable stack was consumed and RSP marched past the bottom (a #DF because the
-guard-page #PF couldn't push its own frame). Track-D recovery killed node and the core
-survived, but a dead node means claude can't run.
+**Where it stalls (from claude's --debug log + node syscall traces):** in claude's `setup()` /
+skill-discovery startup phase (after CA-bundle load + the undici TLS agent; `Loading skills
+from: managed=/etc/claude-code/.claude/skills, user=/root/.claude/skills`). The blocked node
+thread is in a VFS `stat` (`syscall=4`), i.e. inside `endpoint::call_msg` →
+`block_current_on_reply_v2` → `BlockedOnReply`.
 
-**Why MAX_FDS=128 caused it.** `FdEntry` is ~96 bytes (Phase 88 embedded a `VfsFileMeta`
-in `FdBackend::VfsService`), so `[Option<FdEntry>; 128]` ≈ **12 KiB**. It lived inline in
-`Process` AND was returned by-value from `fd_table_snapshot()` AND passed by-value to
-`spawn_process_with_cr3_and_fds()`. Node's `clone(CLONE_THREAD)` (libuv threadpool) and
-`fork` paths stack THREE such copies simultaneously — `sys_clone_thread`: `parent_fds`
-snapshot + `child_fds_copy = parent_fds.clone()` + the child `Process`'s inline copy ≈
-36 KiB; `sys_fork`: `parent_fds` held in a tuple + the by-value arg to `spawn_*` + the
-child `Process` ≈ 36 KiB. Plus the rest of the parent-state tuple (VmaTree clone, strings,
-`[SignalAction; 32]`) and normal frames → > 64 KiB. At MAX_FDS=32 those three copies were
-only ~9 KiB, which is why node started fine before the raise and overflowed right after.
-(The handoff's "16 KiB SYSCALL_STACK" framing was imprecise — syscalls actually run on the
-per-task **64 KiB** kstack via `set_per_core_syscall_stack_top(kstack_top)`; the overflow
-math is against 64 KiB, not 16 KiB. Either way the inline 12 KiB ×3 was the killer.)
+**Why it is invisible to current diagnostics (and what that tells us):**
+- The `[sched] … no waker registered` watchdog does NOT fire — but `BlockedOnReply` ALWAYS
+  has a `reply_waker` registered, and the watchdog's `StuckNoWaker` verdict is for
+  no-deadline blocks past 30 000 ticks; a node trace showed node strace-SILENT for ~90 s
+  (no syscall boundary), yet no watchdog line. Reconciliation: the thread is most likely
+  **wake/reblock-looping INSIDE `block_current_until`** (no syscall boundary → strace-silent;
+  `blocked_since` resets each cycle → watchdog blind), OR a genuine lost-wake the watchdog
+  excludes because a waker is present.
+- The spurious-wake diagnostics (`reply_v2:*`, `call_msg:no_reply_message`) do NOT fire
+  either — so it is not a full spurious wake that returns to `call_msg` with no message.
+- **Trigger is CONCURRENCY:** claude runs ~10 threads hammering the single-threaded
+  `vfs_server`; `node-smoke` (which passes) is not concurrent. So a reply delivered to caller
+  A while caller B is mid-`call_msg` enqueue, or a reply-cap resolution race, or a
+  re-check-loop in the v2 block primitive, could strand a caller.
+- Intermittent: some runs clear the startup window and reach ripgrep; some stall earlier
+  (right after V8 `[wx] v2-guarded W+X mapping (pkey=1)` WASM codegen). Happens on BOTH
+  `-smp 1` and `-smp 4`.
 
-**The fix (this session, in the working tree — `cargo xtask check` passes):** moved the fd
-table off the stack into the heap. `Process.fd_table` and `shared_fd_table` are now
-`Vec<Option<FdEntry>>` (`Arc<IrqSafeMutex<Vec<…>>>` for the shared case); `new_fd_table()`,
-`new_fd_table_pub()`, `fd_table_snapshot()` return `Vec`; `add_fd_refs()` takes `&[…]`;
-`spawn_process_with_cr3_and_fds()` takes a `Vec`. The Vec is ALWAYS exactly `MAX_FDS` long
-(every fd helper indexes `0..MAX_FDS`), built with `vec![None; MAX_FDS]` so even the
-constructor never materializes an `[_; N]` stack temporary. Net: only a 24-byte `Vec`
-header ever lands on the kstack; the clone/fork path's fd-table cost drops from ~36 KiB to
-~100 bytes. This also makes raising `MAX_FDS` to Linux's 1024 a one-line change (heap cost
-only, no stack budget) if claude ever needs more than 128 — kept at 128 for now (~4× the
-observed ~30-fd ceiling).
+**RULED OUT (do not re-chase):**
+- cwd / `rg --files` walking `/` — disproved: an empty cwd (`/tmp/cw`) still stalled. (Note:
+  once PAST the stall, `rg --files` at a large cwd like `/` IS pathologically slow over the
+  ~200 KB/s ring-3 VFS — cwd-mitigable, not a bug. Run claude in a small project dir.)
+- single-core `EXT2_VOLUME.lock` deadlock — `-smp 4` stalls too.
+- `vfs_server` lost/failed reply — no `ipc_reply failed` / `request missing reply cap` logged.
+- anonymous-`mmap` kernel hang — that path is a non-blocking linear `mmap_next` bump + VMA
+  insert; cannot block.
+- PKU read-fault spin-loop — the new `PKU_READ_RECOVERIES` counter (`ed54ce1d`) shows the
+  Phase-90b cross-thread read-recovery fires a BOUNDED ~11 times across DIFFERENT worker tids
+  at the SAME V8 rip with DIFFERENT addrs (each thread reads the pkey-1 WASM code space ONCE
+  and proceeds) — healthy, not looping. PKU is unlikely.
 
-Hypothesis #1 (libuv close-all-fds-to-RLIMIT loop) is NOT implicated by the crash but is
-still a latent O(MAX_FDS) startup cost; `close_range(2)` would make it O(1). Track it
-only if startup feels slow after the kstack fix lands.
+## Next steps — to get claude working end-to-end (priority order)
 
-**#1 NEXT-SESSION TASK — verify the heap fix:**
-- Re-run the OpenRouter round-trip (command in "How to reproduce") and confirm node no
-  longer hits `DOUBLE FAULT = kstack overflow … pid <node>` and claude answers `579`.
-- Cheaper proxy: `M3OS_NODE_REGRESSION=1` `node-smoke` under `M3OS_KVM=1` — its egress arm
-  exercises the same libuv `clone(CLONE_THREAD)` threadpool path that overflowed.
-- Then commit the heap refactor (see key-commits).
-
-## Secondary bugs (observed, NOT yet fixed — next-session candidates)
-
-- **`copyfile` → EFAULT.** claude's config-backup (`fs.copyFile`) fails:
-  `Failed to backup config: Error: EFAULT: bad address in system call argument, copyfile
-  '/root/.claude.json' -> '/root/.claude/backups/...'`. m3OS's file-copy syscall
-  (`copy_file_range`/`sendfile`) returns EFAULT instead of working or cleanly ENOSYS-ing
-  so Node falls back. **Non-fatal** (claude proceeds via temp-write) but a real kernel bug
-  — likely a bad arg-validation / unimplemented-but-not-ENOSYS handler. Find which syscall
-  Node's copyFile uses and either implement it or return `-ENOSYS` so Node's userspace
-  fallback engages.
-- **MAX_FDS heap refactor — DONE (2026-06-16, uncommitted).** `Process.fd_table`,
-  `shared_fd_table`, `fd_table_snapshot()`, `new_fd_table*()`, and
-  `spawn_process_with_cr3_and_fds()` are now heap-backed `Vec<Option<FdEntry>>` (always
-  length `MAX_FDS`), so neither construction nor the snapshot lands on the kstack. This
-  was NOT just the "raise to 1024" nicety it was filed as — it was the FIX for the node
-  clone/fork kstack overflow the MAX_FDS=128 raise introduced (see "Verification status").
-  Raising to 1024 is now a one-line `MAX_FDS` change (heap cost only); left at 128.
-- **SMP contention under heavy Node (multi-core).** The user's 4-core run showed
-  `[sched] stale-ready` ×12, `spurious write-fault recovered` ×9, `vfs_server: ipc_reply
-  failed` ×2, and one `virtio-blk request timeout`. The repo already pins `-smp 1` for
-  heavy-Node/claude gates for this reason. EMFILE is core-independent, but for interactive
-  claude prefer **`M3OS_SMP=1`**. The `vfs_server: ipc_reply failed` + virtio-blk timeout
-  under SMP load are worth a separate look.
-- **Unhandled syscalls = RED HERRINGS** (correctly ENOSYS, Node falls back): inotify_init1
-  (294), io_uring_setup (425), mremap (25), clock_nanosleep (229), capget (125).
-
-## What was ruled out (so the next session doesn't re-chase it)
-
-The networking/HTTP stack is FULLY working on m3OS. Proven via `node -e` probes
-(M3OS_CLAUDE_BASE_URL path, see harness below) against the real OpenRouter API with the
-user's key:
-- raw Node-core `https.request` POST → **200**
-- `fetch()` (undici) non-streaming POST → **200**
-- `fetch()` streaming POST read **to completion** → **200, 13 chunks, 2218 bytes, DONE**
-- separately, `node-smoke M3OS_NODE_NET=1` (live HTTPS + `npm install`) **PASSES**
-
-OpenRouter server-side I/O logging (user) confirmed: the user's tiny 16-tok probes appear
-and succeed; claude's own request did **not** appear — because claude exhausts fds
-(EMFILE) before/while doing its work, not because of any network failure.
-
-## Uncommitted work in the tree (decide: commit cleanly or drop)
-
-`xtask/src/main.rs` has OpenRouter/model harness plumbing (NOT committed):
-- `M3OS_CLAUDE_BASE_URL` → exports `ANTHROPIC_BASE_URL` + empty `ANTHROPIC_API_KEY` +
-  bearer `ANTHROPIC_AUTH_TOKEN` (from the staged 0600 key) before launching claude.
-- `M3OS_CLAUDE_MODEL` → exports `ANTHROPIC_MODEL` + `ANTHROPIC_SMALL_FAST_MODEL`.
-- the `base_url` arm of `claude_smoke_steps` currently runs the verification round-trip
-  (echo env-check → `claude -p '…123 plus 456…'` → WaitPassOrFail on `579`).
-This `M3OS_CLAUDE_BASE_URL`/`M3OS_CLAUDE_MODEL` support is genuinely useful (run Claude
-Code against OpenRouter/any Anthropic-proxy). Worth committing a clean version once the
-fix is verified; the round-trip/probe scaffolding is throwaway.
-
-Also untracked: `openrouter.sh` (user's env, key filled in locally — do NOT commit),
-`debug1.log`, `debug2.log`, `m3os.log`, `claude.png` (the original screenshot).
+1. **INSTRUMENT first; do not patch blind.** The reply-block primitive
+   (`block_current_until` / `block_current_on_reply_v2` in `kernel/src/task/scheduler.rs`) and
+   `endpoint::call_msg` (`kernel/src/ipc/endpoint.rs`) are the kernel's most delicate
+   concurrency code (the 2026-06-14 SMP work hardened them). A speculative change risks
+   regressing fixes #2/#3 and seeding new lost-wakes. Add a SAFE, read-only diagnostic that
+   makes the exact stall state visible on the next run:
+   - A **cumulative-blocked-time / wake-reblock-cycle counter** per task (not the single-block
+     `blocked_since` the current watchdog uses, which resets each cycle). When a task exceeds
+     a cumulative threshold in `BlockedOnReply` (or churns >N reblock cycles), dump: the task
+     (pid/state), whether `pending_msg` is set (reply arrived but not consumed = lost-wake vs
+     never arrived = vfs stuck), its `reply_waker` flag, the endpoint's `senders`/`receivers`
+     queues, and the outstanding `Capability::Reply` holder.
+   - This single run distinguishes the three live hypotheses: (a) lost-wake (reply delivered,
+     waker flag set, task not rescheduled), (b) livelock in the v2 re-check loop (woken flag
+     toggling), (c) `vfs_server` never replied to THIS caller (request stranded/misrouted
+     under concurrency).
+2. **Fix per (1)'s verdict.** Likely audits: `ipc_reply` → `deliver_message` + `wake_task_v2`
+   (`scheduler.rs:4721`/`4747`) and the single-threaded `vfs_server` reply loop
+   (`userspace/vfs_server/src/main.rs:~1970-2009`) under CONCURRENT callers; the
+   `block_current_on_reply_v2` re-check (`scheduler.rs:3841`); and the `metacache` lock in
+   `vfs_service_stat_path` (`syscall/mod.rs:8553`) under concurrent stats.
+3. **Verify the fix two ways:** (a) the OpenRouter round-trip answers `579` (command below);
+   (b) a multi-thread concurrent-VFS stress (claude is the real one; a `node -e` that fans out
+   many concurrent `fs.stat` on `/usr` paths would be a cheaper regression guard — consider
+   adding it to `node-smoke` or a new gate).
+4. **Lower priority / orthogonal:** `copyfile`→EFAULT (secondary bug below); the libuv
+   event-loop angle (timerfd/epoll_wait returning-immediately-in-a-loop) as an ALTERNATIVE to
+   the lost-wake hypothesis if (1) shows the thread is spinning rather than parked.
 
 ## How to reproduce / test
 
+Pull the branch first (xtask always recompiles the kernel from source, so a fresh build picks
+up all fixes). Run from a **small cwd** to avoid the orthogonal `rg --files`-at-`/` slowness.
+
 ```
-git pull   # get 3d92bb40 (MAX_FDS=128)
+git pull
 # Single-core jitless run against OpenRouter (key read from openrouter.sh, never printed):
 M3OS_SMP=1 M3OS_CLAUDE_NET=1 \
   M3OS_CLAUDE_BASE_URL="https://openrouter.ai/api" \
   M3OS_CLAUDE_MODEL="anthropic/claude-haiku-4.5" \
   M3OS_CLAUDE_KEY="$(. ./openrouter.sh >/dev/null 2>&1; printf %s "$OPENROUTER_API_KEY")" \
   M3OS_KVM=1 M3OS_CLAUDE_FAST_ITER=1 \
+  M3OS_SERIAL_LOG=/tmp/m3os-claude.log \
   cargo xtask claude-smoke --timeout 2400
-# PASS pattern "579" = claude completed a real round-trip over OpenRouter (fix works).
+# PASS pattern "579" = claude completed the round-trip (currently STALLS — issue #4).
 ```
-Interactive (visible screen, user's path): `M3OS_SMP=1 M3OS_WITH_CLAUDE=1 cargo xtask
-run-gui`, then in the guest export the 4 ANTHROPIC_* vars + `claude --debug -p "hi"`.
-Verify `echo $ANTHROPIC_BASE_URL` is non-empty (ion is the login shell, not POSIX sh —
-`export VAR=value` should work but confirm). claude's debug logs are at
-`/root/.claude/debug/`; pull them off the ext2 disk host-side with
-`debugfs -R "rdump /root/.claude/debug /tmp/x" target/x86_64-unknown-none/release/disk.img`.
 
-## Next steps (priority order)
+- `M3OS_SERIAL_LOG=<path>` tees the COMPLETE raw guest serial to a file (the in-memory
+  harness buffer only keeps a drained tail) — essential for post-mortem; the claude-smoke
+  harness does not echo full serial otherwise.
+- `M3OS_STRACE_COMM=<comm-prefix>` is a BUILD-TIME (`option_env!`) per-comm syscall trace.
+  `M3OS_STRACE_COMM=node` traces all node threads; `=vfs_server` traces the VFS server.
+  Touch `kernel/src/arch/x86_64/syscall/mod.rs` to force the rebuild when changing it.
+  Caveat: heavy trace volume can perturb timing (heisenbug) and truncate the serial-log tail.
+- Pull claude's OWN `--debug` log off the disk (the smoking gun for the claude-level step):
+  `dd if=target/x86_64-unknown-none/release/disk.img of=/tmp/ext2.img bs=512 skip=2048` then
+  `debugfs -R "rdump /root/.claude/debug /tmp/cdebug" /tmp/ext2.img`. (The disk has an MBR
+  partition table; the ext2 root is at LBA 2048, so debugfs the partition, not the whole image.)
+  Add `--debug` to the round-trip's `claude -p` in `claude_smoke_steps` (xtask) to make claude
+  write that log; it lands at `/root/.claude/debug/<session>.txt`.
+- Interactive (visible screen): `M3OS_SMP=1 M3OS_WITH_CLAUDE=1 cargo xtask run-gui`, then in
+  the guest export the 4 ANTHROPIC_* vars and `claude --debug -p "hi"`. ion is the login
+  shell (not POSIX sh); `export VAR=value` works.
 
-1. **Verify the heap fd-table fix** (this session's change, uncommitted): re-run the
-   OpenRouter round-trip (command below) and confirm (a) NO `DOUBLE FAULT = kstack
-   overflow … attributable to pid <node>` appears, and (b) claude answers `579`. Cheaper
-   proxy first: `M3OS_NODE_REGRESSION=1` `node-smoke` under `M3OS_KVM=1` (its egress arm
-   drives the same libuv `clone(CLONE_THREAD)` path that overflowed).
-2. **Commit the heap fd-table refactor** once verified (kernel/src/process/mod.rs +
-   kernel/src/arch/x86_64/syscall/mod.rs + the slab.rs comment). `cargo xtask check`
-   already passes. Suggested: also set `M3OS_NODE_REGRESSION=1` / `M3OS_SMP_REGRESSION=1`
-   on the PR since the change touches the fork/clone fd path.
-3. **Fix `copyfile`→EFAULT** (implement the copy syscall or return ENOSYS for fallback).
-4. **Commit the clean `M3OS_CLAUDE_BASE_URL`/`M3OS_CLAUDE_MODEL` harness support**; drop the
-   throwaway probe scaffolding.
-5. Optional: revisit the SMP `vfs_server: ipc_reply failed` + virtio-blk timeout under
-   heavy multi-core Node.
+## Diagnostics available (committed, permanent)
+
+- `[int] kstack-bt: …` — on a kstack-overflow #DF, scans the exhausted stack and prints the
+  recurring return address / verdict (RECURSION vs LARGE-FRAME) + deepest frames (`6f02d18b`).
+- `[pf] pku read-recovery: …` — rate-limited per W^X-v2 cross-thread PKU read-recovery; a
+  single repeating pid/rip/addr would indicate a PKU spin-loop (`ed54ce1d`).
+- `M3OS_STRACE_COMM` per-comm syscall trace (above); the `[sched] … no waker registered`
+  watchdog (does NOT catch #4 — see "Why it is invisible").
+
+## Ruled out (network is NOT the problem)
+
+The networking/HTTP stack is fully working. Proven via `node -e` probes against the real
+OpenRouter API with the user's key: raw `https.request` POST → 200; `fetch()` non-streaming
+→ 200; `fetch()` streaming read to completion → 200/DONE; and `node-smoke M3OS_NODE_NET=1`
+(live HTTPS + `npm install`) PASSES. claude's request never reaches OpenRouter because it
+stalls in startup (#4) before issuing the API call — the debug log shows no `Request to …`
+line.
+
+## Secondary bugs (observed, not yet fixed)
+
+- **`copyfile` → EFAULT.** claude's config-backup (`fs.copyFile '/root/.claude.json' →
+  '/root/.claude/backups/…'`) fails with EFAULT. Non-fatal (claude proceeds via temp-write)
+  but a real kernel bug — m3OS's copy syscall (`copy_file_range`/`sendfile`) returns EFAULT
+  instead of working or cleanly `-ENOSYS`-ing for Node's fallback. Find which syscall Node's
+  `copyFile` uses; implement it or return `-ENOSYS`.
+- **SMP contention under heavy node (multi-core).** Earlier 4-core runs showed `[sched]
+  stale-ready`, `spurious write-fault recovered`, `vfs_server: ipc_reply failed`, and a
+  `virtio-blk request timeout`. Repo gates pin `-smp 1` for heavy-node/claude. Likely related
+  to #4's concurrency surface; worth a look alongside it.
+- **Unhandled syscalls = RED HERRINGS** (correctly `-ENOSYS`, Node falls back): inotify_init1
+  (294), io_uring_setup (425), mremap (25), clock_nanosleep (229), capget (125).
 
 ## Key environment facts
 
-- m3OS login shell is **`/bin/ion`** (root:…:/bin/ion), NOT POSIX sh; it even rejects some
-  `/bin/sh -c` forms. `export VAR=value` appears to work (gh/git gates use it) but verify.
-- `KERNEL_STACK_SIZE` = 64 KiB; **syscalls run on a 16 KiB stack** — this bounds inline
-  `[_; MAX_FDS]` by-value returns.
-- `PROCESS_TABLE` is a heap `Vec<Process>` (no fixed slot); Node threads SHARE one fd table
-  via `shared_fd_table: Arc<Mutex<…>>`, so per-process (not per-thread) fd cost is what matters.
-- Default `qemu_smp_count()` = 4; override `M3OS_SMP=1`. `M3OS_KVM=1` for near-native + real PKU.
-- `M3OS_CLAUDE_FAST_ITER=1` reuses the installed data disk (kernel still rebuilt → fix included).
+- m3OS login shell is **`/bin/ion`** (not POSIX sh); `export VAR=value` works.
+- **`KERNEL_STACK_SIZE` = 64 KiB**, and syscalls run on the per-task 64 KiB kstack (set via
+  `set_per_core_syscall_stack_top(kstack_top)` on switch) — NOT the 16 KiB static
+  `SYSCALL_STACK` (that is only the initial RSP0). The earlier "16 KiB syscall stack" framing
+  was wrong; #2's overflow math is against 64 KiB.
+- `MAX_FDS` is now 128 and the fd table is **heap-backed** (`Vec`), so raising it is a
+  one-line, heap-cost-only change.
+- `PROCESS_TABLE` is a heap `Vec<Process>`; node threads SHARE one fd table via
+  `shared_fd_table: Arc<Mutex<…>>`, so per-process (not per-thread) fd cost is what matters.
+- Default `qemu_smp_count()` = 4; override `M3OS_SMP=1`. `M3OS_KVM=1` for near-native + real
+  PKU (claude's V8 WASM codegen needs PKU for its W+X mappings; TCG has no PKU).
+- `M3OS_CLAUDE_FAST_ITER=1` reuses the installed data disk (kernel still rebuilt → fixes
+  included). The default bundled node is JITLESS-but-`wasm-in-jitless` (it DOES compile WASM
+  to native code → the `[wx] v2-guarded W+X mapping (pkey=1)` lines), so claude exercises the
+  PKU W+X path even on the "jitless" node.
