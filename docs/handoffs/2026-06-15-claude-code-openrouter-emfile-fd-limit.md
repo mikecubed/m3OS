@@ -30,10 +30,25 @@ status: THREE root causes found+fixed. (1) EMFILE — MAX_FDS 32→128 (3d92bb40
   `futex`, or right after V8 `[wx] v2-guarded W+X mapping (pkey=1)` WASM codegen),
   consistent with a node-internal threading/event-loop wait rather than a kernel wedge.
   i.e. node is alive but a thread is waiting on something that never completes during
-  claude's heavy startup. This is a DEEPER, iterative issue (claude appears to hit a
-  sequence of m3OS gaps in its startup, each fix advancing it) and a candidate for a
-  dedicated follow-up; the cwd/`rg --files`-walks-`/` theory was tested and DISPROVED
-  (an empty cwd still stalled).
+  claude's heavy startup. This is a DEEPER, iterative issue and a candidate for a
+  dedicated follow-up. RULED OUT (do not re-chase): cwd/`rg --files`-walks-`/` (empty
+  cwd still stalled); a single-core `EXT2_VOLUME.lock` deadlock (`-smp 4` stalls too);
+  a `vfs_server` lost reply (none logged); an anonymous-`mmap` kernel hang (that path
+  is a non-blocking linear bump + VMA insert); and — via a new `PKU_READ_RECOVERIES`
+  diagnostic (`interrupts.rs`) — a PKU read-fault SPIN-LOOP: the 90b cross-thread
+  read-recovery fires a BOUNDED ~11 times across DIFFERENT worker tids at the SAME V8
+  rip (`0x3763831`) with DIFFERENT addrs, i.e. each thread reads the pkey-1 WASM code
+  space ONCE and proceeds — the recovery is healthy, not looping. NARROWED PICTURE:
+  two orthogonal things gate `claude -p` completion — (1) an INTERMITTENT hang in the
+  V8-WASM-W+X / threading startup window (some runs clear it and reach ripgrep; some
+  stall at the W+X phase), no kernel markers ⇒ a node-internal threading/event-loop
+  wait (futex-WAKE-delivered-but-ineffective or a userspace deadlock; the kernel's
+  `no waker` watchdog does NOT fire, so a waker IS registered); and (2) once past it,
+  `rg --files` walking a large cwd (`/` → all of `/usr`, GiB) over the ~200 KB/s ring-3
+  VFS is pathologically slow (cwd-mitigable, not a bug). Next-session leads: trace
+  `FUTEX_WAIT`/`WAKE` pairing for a wake that doesn't wake its waiter; and/or audit the
+  per-task PKRU XSAVE save/restore across context switches under V8's multi-thread
+  codegen (a lost write-window would surface as a thread that can't progress).
 prior-status: FIXED + PROVEN BY CONTROLLED EXPERIMENT (commit 952da571, pushed). The heap
   fd-table fix is confirmed sufficient: claude-smoke PASSES on 4-core AND 1-core (KVM),
   with and without the ANTHROPIC_* OpenRouter env vars, through the full agent flow

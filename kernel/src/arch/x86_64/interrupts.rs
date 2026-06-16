@@ -127,6 +127,12 @@ static FAULT_KILL_PID: AtomicU32 = AtomicU32::new(0);
 /// CoW/mprotect race). Diagnostic-only; rate-limits the per-recovery log.
 static SPURIOUS_WRITE_RECOVERIES: AtomicU32 = AtomicU32::new(0);
 
+/// Count of W^X-v2 PKU cross-thread READ recoveries (Phase 90b). Diagnostic:
+/// if a single faulting RIP/addr keeps recovering, the grant isn't sticking and
+/// the thread is in a PKU read-fault spin-loop (a candidate for Claude Code's
+/// `claude -p` startup stall). Rate-limits the per-recovery log.
+static PKU_READ_RECOVERIES: AtomicU32 = AtomicU32::new(0);
+
 // ---------------------------------------------------------------------------
 // Track D — kernel-stack-overflow controlled-kill recovery
 // (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md)
@@ -1314,6 +1320,21 @@ extern "x86-interrupt" fn page_fault_handler(
                         });
                 if write_deny_only {
                     crate::arch::x86_64::pkru::grant_read_access(key);
+                    // Diagnostic: if this fires repeatedly for the same pid/rip,
+                    // the grant isn't sticking (the thread re-faults on the same
+                    // read) — a PKU read-fault spin-loop. Rate-limited to the
+                    // first ~40 so a genuine loop is visible without flooding.
+                    let n = PKU_READ_RECOVERIES.fetch_add(1, Ordering::Relaxed);
+                    if n < 40 {
+                        _panic_print(format_args!(
+                            "[pf] pku read-recovery: pid={} key={} addr={:#x} rip={:#x} (#{})\n",
+                            crate::process::current_pid(),
+                            key,
+                            fault_vaddr.as_u64(),
+                            stack_frame.instruction_pointer.as_u64(),
+                            n,
+                        ));
+                    }
                     crate::task::scheduler::current_task_record_page_fault(false);
                     assert_preempt_count_zero_on_return_to_user(&stack_frame);
                     return;
