@@ -16530,6 +16530,96 @@ fn node_jit_smoke_steps(fast_iter: bool) -> Vec<SmokeStep> {
 /// — small-icu lacks the ICU break-iterator data `Intl.Segmenter` uses for grapheme
 /// segmentation, so the TUI null-dereffed in V8's `JSSegments::Create`; the always-on
 /// `SEG_OK` step guards that fix.
+/// Re-stamp the seeded Claude credential into an EXISTING `disk.img`'s ext2
+/// partition, in place (Phase 90b follow-up).
+///
+/// The `M3OS_CLAUDE_FAST_ITER` escape hatch reuses a disk that already has
+/// claude-code + node installed, to skip the slow in-OS install while iterating.
+/// But the seeded 0600 credential lives ON that disk, so a credential CHANGE
+/// between fast-iter runs would silently keep using the STALE one — the exact
+/// footgun that sent the 2026-06-16 session chasing a phantom network hang: a
+/// reused disk held an old Anthropic `sk-ant-…` key while the run intended an
+/// OpenRouter `sk-or-…` key, so `claude -p` got a 401 "Missing Authentication
+/// header" despite a fully working TLS/HTTP path (the request reached OpenRouter,
+/// which rejected the wrong key).
+///
+/// This overwrites JUST `/root/.claude/<cred_name>` via `debugfs -w` against the
+/// partition opened in place with the `?offset=` device suffix (e2fsprogs ≥ 1.45),
+/// at the same LBA-2048 / 1 MiB offset `create_data_disk` lays out. The raw secret
+/// goes through a 0600 host temp that is scrubbed on both the success and failure
+/// paths (mirroring `populate_ext2_files`); it never crosses the serial console.
+/// A missing host `debugfs` is non-fatal — the caller logs the returned Err as a
+/// warning and proceeds with whatever credential the disk already holds.
+fn restamp_claude_credential(
+    disk_img: &Path,
+    output_dir: &Path,
+    cred_name: &str,
+    cred_val: &str,
+) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // Partition 1 at LBA 2048 → 1 MiB byte offset (matches create_data_disk).
+    const PARTITION_OFFSET: u64 = 2048 * 512;
+
+    // 0600 temp holding the raw secret + trailing newline (the seeding format;
+    // ion's `$(cat …)` command substitution trims the trailing newline).
+    let tmp = output_dir.join("_tmp_claude_cred_reseed");
+    let _ = fs::remove_file(&tmp);
+    {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|e| format!("create reseed temp: {e}"))?;
+        f.write_all(format!("{cred_val}\n").as_bytes())
+            .map_err(|e| format!("write reseed temp: {e}"))?;
+    }
+
+    // debugfs replaces the file in place: `rm` first (debugfs `write` refuses to
+    // overwrite an existing inode; a no-op `rm` of a missing file just warns),
+    // then `write` + restore the 0600 root-owned metadata.
+    let cmds = format!(
+        "cd /root/.claude\nrm {name}\nwrite {tmp} {name}\n\
+         sif {name} mode 0100600\nsif {name} uid 0\nsif {name} gid 0\n",
+        name = cred_name,
+        tmp = tmp.display(),
+    );
+    let dev = format!("{}?offset={PARTITION_OFFSET}", disk_img.display());
+
+    let spawn = Command::new("debugfs")
+        .arg("-w")
+        .arg(&dev)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+    let result = (|| {
+        let mut child =
+            spawn.map_err(|e| format!("spawn debugfs (is e2fsprogs installed?): {e}"))?;
+        child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "debugfs stdin".to_string())?
+            .write_all(cmds.as_bytes())
+            .map_err(|e| format!("write debugfs commands: {e}"))?;
+        let out = child
+            .wait_with_output()
+            .map_err(|e| format!("debugfs wait: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "debugfs exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        Ok(())
+    })();
+
+    // SECRET SCRUB — remove the credential-bearing temp on BOTH paths.
+    let _ = fs::remove_file(&tmp);
+    result
+}
+
 fn cmd_claude_smoke(args: &SmokeBootArgs) {
     // The always-on core bundles the JITLESS node (the Phase 89 default) because it
     // needs NO PKU: `claude --version`/`--help`/`-p` run on the jitless node (V8's
@@ -16657,6 +16747,33 @@ fn cmd_claude_smoke(args: &SmokeBootArgs) {
     let disk_img = uefi_image.parent().unwrap().join("disk.img");
     if fast_iter && disk_img.exists() {
         println!("claude-smoke: M3OS_CLAUDE_FAST_ITER — reusing existing disk (skipping install)");
+        // Re-stamp the credential so a key CHANGE between fast-iter runs takes
+        // effect — the reused disk's seeded 0600 cred would otherwise stay stale
+        // (the 2026-06-16 footgun: a reused disk's old Anthropic key 401'd against
+        // OpenRouter despite a fully working network path). Non-fatal: warn and
+        // proceed if the host has no debugfs.
+        if let Some((cred_name, cred_val)) = match (&token, &key) {
+            (Some(t), _) => Some(("oauth_token", t.as_str())),
+            (None, Some(k)) => Some(("api_key", k.as_str())),
+            _ => None,
+        } {
+            match restamp_claude_credential(
+                &disk_img,
+                uefi_image.parent().unwrap(),
+                cred_name,
+                cred_val,
+            ) {
+                Ok(()) => println!(
+                    "claude-smoke: re-stamped /root/.claude/{cred_name} into the reused disk \
+                     (fast-iter credential refresh — the current run's key wins)"
+                ),
+                Err(e) => eprintln!(
+                    "claude-smoke: WARNING — could not re-stamp the credential into the reused \
+                     disk ({e}); the run will use whatever credential the disk already holds. \
+                     Drop M3OS_CLAUDE_FAST_ITER to force a fresh disk with the current key."
+                ),
+            }
+        }
     } else {
         if disk_img.exists() {
             let _ = fs::remove_file(&disk_img);
@@ -16793,6 +16910,18 @@ fn cmd_claude_smoke(args: &SmokeBootArgs) {
         qemu_args.push("-monitor".to_string());
         qemu_args.push("unix:/tmp/claude-mon.sock,server,nowait".to_string());
         println!("claude-smoke: M3OS_CLAUDE_MONITOR — HMP monitor at /tmp/claude-mon.sock");
+    }
+
+    // DIAGNOSTIC (claude -p TLS-handshake hunt, 2026-06-16): opt-in pcap of ALL
+    // guest net traffic (the net0 SLIRP netdev) so a host-side tcpdump can tell
+    // whether the TLS ClientHello is sent and the ServerHello/response comes back
+    // — distinguishing node-not-sending vs server/SLIRP-not-responding vs
+    // kernel-not-delivering-to-node.
+    if std::env::var_os("M3OS_CLAUDE_PCAP").is_some() {
+        let _ = std::fs::remove_file("/tmp/claude-net.pcap");
+        qemu_args.push("-object".to_string());
+        qemu_args.push("filter-dump,id=dump0,netdev=net0,file=/tmp/claude-net.pcap".to_string());
+        println!("claude-smoke: M3OS_CLAUDE_PCAP — guest net capture at /tmp/claude-net.pcap");
     }
 
     println!(

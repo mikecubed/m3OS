@@ -1,47 +1,50 @@
 ---
-status: IN PROGRESS — `claude -p` does NOT yet complete a round-trip, but it now REACHES
-  OpenRouter (establishes TCP) where it previously hung in startup. Three real fixes
-  landed/made this session (2026-06-16); a deep residual futex lost-wake remains the
-  blocker.
-  CORRECTION (2026-06-16, later): an earlier version of this handoff + commit `fcd78100`
-  claimed "claude -p COMPLETES end-to-end (answers 579)". **That was WRONG** — a false
-  positive. The claude-smoke pass pattern was the bare 3-digit string `579`, which matched
-  the substring inside a kernel watchdog line `stuck-since=32579ms`. claude `-p` had
-  actually HUNG (futex stall) and the harness matched a watchdog timestamp, not claude's
-  answer. The user's OpenRouter request logs were empty — ground-truth proof no request
-  ever completed. The `579` check is now a collision-proof `<<<579>>>` token.
-  WHAT IS REAL + FIXED:
+status: RESOLVED (2026-06-16) — **`claude -p` completes a full authenticated round-trip
+  end-to-end on m3OS over OpenRouter.** VERIFIED collision-proof: claude's actual stdout
+  printed `<<<579>>>` on serial, `claude-smoke` reported `serial core PASSED (33 steps)`,
+  exit 0. The whole pipeline works: cold cli.js load → ion env export → TLS 1.3 handshake to
+  OpenRouter → full ~103 KB request (system prompt + tools) → authenticated 200 response →
+  claude prints the answer. Confirm via the user's OpenRouter request logs (the ground-truth
+  external check — this run WILL appear, unlike the earlier false-positive run).
+  THE REAL ENABLING FIXES (both committed, load-bearing):
    1. EXT2_VOLUME single-core spin-deadlock (RIP-confirmed via host-side QMP `info
       registers`: constant spin RIP at `path_node_nofollow`'s `EXT2_VOLUME.lock()`
       cmpxchg/pause loop; whole machine wedged at 100% CPU, no watchdog). Fix: EXT2_VOLUME
-      `spin::Mutex` → `YieldingMutex` (yield, not busy-spin, on contention). Committed in
-      `fcd78100`. This unwedged the machine but only got claude FURTHER.
+      `spin::Mutex` → `YieldingMutex` (yield, not busy-spin, on contention). Committed
+      `fcd78100`.
    2. Cross-process PRIVATE-futex collision. `sys_futex` keyed private futexes as
       `(0, uaddr)` — a single GLOBAL root. Claude spawns multiple identical-layout `node`
       subprocesses whose musl/libuv pthread threadpool condvars sit at the same uaddr; all
       aliased into one wait queue, so one process's `FUTEX_WAKE` woke/absorbed another
-      process's waiter → the real worker never woke. Fix: key futexes per-address-space
-      (CR3 == the caller's pml4; `is_private` folded into bit 0). MEASURED EFFECT: claude
-      went from 0 TCP connections to OpenRouter (hung in startup) to 13 (reaches the API).
-   3. The bogus `579` pass pattern → `<<<579>>>` (cannot match kernel-log numbers).
-  REMAINING BLOCKER (#4 is NOT closed): a residual futex LOST-WAKE in node's libuv
-  threadpool — now WITHIN a single process (not the cross-process collision #2 fixed).
-  Symptom: ~4800 `BlockedOnFutex "no waker registered"` watchdog lines; claude connects to
-  OpenRouter (13 TCP) but the threadpool stalls before the TLS/HTTP exchange completes, so
-  NO request reaches OpenRouter's app layer (empty logs) and claude retries. The
-  FUTEX_WAIT/WAKE `woken_flag` bridge looks correct, so the suspect is the musl
-  `pthread_cond` requeue→mutex path (FUTEX_CMP_REQUEUE then the mutex unlock skipping the
-  wake if the mutex waiter bit isn't honored across the requeue) or a value-check edge.
-  Also note: the original handoff's "reply-block IPC stall" hypothesis was wrong; the real
-  chain is EXT2 wedge (fixed) → cross-process futex collision (fixed) → residual threadpool
-  futex lost-wake (OPEN).
+      process's waiter. Fix: key futexes per-address-space (CR3 == caller's pml4; `is_private`
+      folded into bit 0). Committed `1bada591`. This is what carried claude from 0 TCP
+      connections (hung in startup) to a full request/response exchange with OpenRouter.
+  THE FINAL-STRETCH "HANG" WAS NOT A CODE BUG — it was a STALE TEST CREDENTIAL:
+   `M3OS_CLAUDE_FAST_ITER` reuses an installed disk to skip the slow in-OS install, but the
+   seeded 0600 credential lives ON that disk and was NOT refreshed between runs. A reused
+   disk held an old **Anthropic** key (`sk-ant-…`, 104 B) while the run intended the
+   **OpenRouter** key (`sk-or-…`, 74 B), so claude sent the wrong key and OpenRouter returned
+   `401 {"error":{"message":"Missing Authentication header","code":401}}` (and OpenRouter does
+   not log unauthenticated requests → the empty-logs "ground truth" that looked like "no
+   request arrived"). A host-side pcap (`M3OS_CLAUDE_PCAP=1`, new) was decisive: it showed the
+   FULL TLS handshake completing, the entire 103 KB request leaving the guest and being ACKed,
+   and OpenRouter's 1159 B response arriving and being read — i.e. the kernel network/TLS path
+   was working the whole time. THE "residual single-process futex lost-wake" (#4c in the prior
+   draft) WAS A RED HERRING: those `BlockedOnFutex "no waker registered"` lines are IDLE libuv
+   threadpool workers (normal for an idle node), not the blocker.
+  CORRECTION HISTORY (kept for the record): an earlier draft + commit `fcd78100` once claimed
+   "claude -p COMPLETES (answers 579)" — that WAS a false positive (the bare `579` matched a
+   kernel watchdog `stuck-since=32579ms` timestamp while claude was hung). The pass pattern is
+   now the collision-proof `<<<579>>>`; THIS resolution is verified against that token in
+   claude's real stdout.
 fixes (this session):
-  - kernel/fs/ext2: EXT2_VOLUME spin::Mutex → YieldingMutex (committed fcd78100) — real
-  - kernel/arch/syscall sys_futex: private futex key (0,uaddr) → per-CR3 (uncommitted) — real progress
+  - kernel/fs/ext2: EXT2_VOLUME spin::Mutex → YieldingMutex (committed fcd78100) — REAL, load-bearing
+  - kernel/arch/syscall sys_futex: private futex key (0,uaddr) → per-CR3 (committed 1bada591) — REAL, load-bearing
   - kernel/ipc/endpoint + task/scheduler: deadline-path Bug #8.1 waker registration (committed) — real but orthogonal
-  - kernel/task + arch/syscall: last_syscall tick/nr + [replystall]/[stallcensus] diagnostics (committed)
-  - xtask/claude-smoke: 579 → <<<579>>> collision-proof check; small cwd; M3OS_CLAUDE_MONITOR HMP socket
+  - xtask/claude-smoke: 579 → <<<579>>> collision-proof check; small cwd; M3OS_CLAUDE_MONITOR HMP socket;
+    M3OS_CLAUDE_PCAP guest-net capture (NEW); FAST_ITER credential re-stamp (NEW — fixes the stale-cred footgun)
   - xtask/node-smoke: M3OS_NODE_VFS_STRESS arm
+  - REVERTED (red-herring diagnostics): the [futexcensus] scheduler dump (the futex stall was idle workers)
 branch: feat/phase-90b-claude-code
 key-commits:
   - 9e09b67c  kernel/net: accept TCP keepalive socket options (fixes setsockopt ENOPROTOOPT)
@@ -84,20 +87,32 @@ claude went through FOUR distinct m3OS bugs, hit one after another as each was f
 | 1 | EMFILE lock-up | per-process fd cap of 32 | `3d92bb40` MAX_FDS 32→128 | ✅ fixed+pushed |
 | 2 | Segfault (node killed) | node clone/fork stacked ~36 KiB of inline 12 KiB fd-tables → 64 KiB kstack overflow | `952da571` heap-backed fd table | ✅ fixed+pushed, proven |
 | 3 | **Frozen login screen** | `stat("/dev/tty")` hung the kernel VFS path, wedging the shared VFS system-wide | `36074826` `/dev/tty`→char device | ✅ fixed+pushed, verified |
-| 4 | `claude -p` never finishes | Layered. (a) EXT2_VOLUME single-core spin-deadlock (held across virtio-blk I/O; a 2nd task busy-spins forever). (b) Cross-process PRIVATE-futex collision: private futexes keyed `(0,uaddr)` globally, so claude's multiple identical-layout node subprocesses aliased their pthread threadpool condvars and stole each other's wakes. (c) **STILL OPEN**: a residual single-process threadpool futex lost-wake. | (a) `EXT2_VOLUME`→`YieldingMutex` (committed). (b) futex key `(0,uaddr)`→per-CR3 (uncommitted). (c) — | ⚠️ PARTIAL — (a)+(b) fixed → claude now REACHES OpenRouter (0→13 TCP), but (c) still stalls it; **`claude -p` does NOT complete** |
+| 4 | `claude -p` never finishes | Layered. (a) EXT2_VOLUME single-core spin-deadlock (held across virtio-blk I/O; a 2nd task busy-spins forever). (b) Cross-process PRIVATE-futex collision: private futexes keyed `(0,uaddr)` globally, so claude's multiple identical-layout node subprocesses aliased their pthread threadpool condvars and stole each other's wakes. (c) **NOT A BUG** — the final "hang" was a STALE TEST CREDENTIAL (FAST_ITER reused a disk with an old Anthropic key → OpenRouter 401). | (a) `EXT2_VOLUME`→`YieldingMutex` (`fcd78100`). (b) futex key `(0,uaddr)`→per-CR3 (`1bada591`). (c) re-stamp the credential under FAST_ITER (xtask). | ✅ RESOLVED — `claude -p` answers `<<<579>>>` end-to-end over OpenRouter (smoke 33/33 PASS, exit 0) |
 
-**`claude -p` does NOT yet complete.** ⚠️ CORRECTION: an earlier version of this section
-claimed it did, citing a claude-smoke `579` pass. That pass was a **false positive** — the
-bare `579` matched a kernel watchdog timestamp `stuck-since=32579ms` while claude was
-actually HUNG in a futex stall. The user's empty OpenRouter request logs are ground truth:
-no request ever completed. The check is now the collision-proof `<<<579>>>`. Current real
-state: fixes (a) EXT2_VOLUME and (b) the cross-process futex key moved claude from
-"hangs in startup" to "establishes 13 TCP connections to OpenRouter", but a residual
-**single-process** libuv-threadpool futex lost-wake (~4800 `BlockedOnFutex "no waker
-registered"` lines) stalls the request before the TLS/HTTP exchange finishes, so no request
-reaches OpenRouter and claude retries. (b) and (c) are distinct: (b) was cross-process
-aliasing (fixed); (c) is a genuine within-process lost-wake (open) — suspect the musl
-`pthread_cond` FUTEX_CMP_REQUEUE→mutex-unlock wake path.
+**`claude -p` COMPLETES** (verified collision-proof against `<<<579>>>` in claude's real
+stdout — NOT the earlier false positive). The two load-bearing kernel fixes were (a) the
+EXT2_VOLUME yielding lock and (b) the per-address-space futex key; together they carried
+claude from "hangs in startup (0 TCP)" to a full request/response exchange with OpenRouter.
+The remaining "hang" after that was **not** a kernel bug: `M3OS_CLAUDE_FAST_ITER` reused a
+disk whose seeded credential was a STALE Anthropic `sk-ant-…` key (104 B) rather than the
+intended OpenRouter `sk-or-…` key (74 B), so OpenRouter returned `401 "Missing Authentication
+header"` and (since it does not log unauthenticated requests) the request logs stayed empty —
+which had looked like "no request ever arrived". A host-side pcap (`M3OS_CLAUDE_PCAP=1`)
+disproved that: it captured the full TLS 1.3 handshake, the entire ~103 KB request being sent
++ ACKed, and OpenRouter's response coming back and being read. The `BlockedOnFutex "no waker
+registered"` lines were IDLE libuv threadpool workers (a red herring), not a lost-wake.
+
+### What the pcap showed (the decisive evidence)
+
+`M3OS_CLAUDE_PCAP=1` adds `-object filter-dump,netdev=net0,file=/tmp/claude-net.pcap` to the
+claude-smoke QEMU launch. For each connection to `openrouter.ai:443`: SYN/SYN-ACK/ACK →
+ClientHello (1605 B, ALPN `http/1.1`, TLS 1.2+1.3 offered) → server flight 1 (3933 B, ACKed)
+→ client Finished → **full ~103 KB application request** sent and ACKed segment-by-segment →
+server's **1159 B response** arrives and is ACKed → claude reads it and prints
+`Failed to authenticate. API Error: 401 {"error":{"message":"Missing Authentication
+header","code":401}}`. That 401 (OpenRouter's error JSON shape, not Anthropic's) is proof the
+request reached OpenRouter's app and was rejected purely on auth — the network/TLS path was
+never the problem.
 
 ### How #4 was actually found (the reply-block hypothesis was wrong)
 
@@ -170,11 +185,20 @@ own `--debug` log (pulled off the disk via `debugfs`) now advances from the old 
 `[STARTUP] Loading MCP configs...` through `Running setup()...` to skill discovery, and node
 stats `/dev/tty` repeatedly + proceeds. The system no longer freezes.
 
-## #4 — the remaining blocker: `claude -p` does not complete
+## #4 — RESOLVED: `claude -p` completes (the layered chain + the credential footgun)
 
-**Symptom:** a `claude -p '…'` round-trip (OpenRouter) never prints the answer; the
-claude-smoke step times out. NOT a crash, NOT a freeze — the system stays responsive
-(`vfs_server` keeps replying, other node threads keep churning, no fault/panic/kill).
+> **RESOLUTION:** `claude -p` now completes end-to-end over OpenRouter (`<<<579>>>`, smoke
+> 33/33 PASS). The load-bearing fixes were the EXT2_VOLUME yielding lock (`fcd78100`) and the
+> per-address-space futex key (`1bada591`). The investigation notes below (written while the
+> bug was open) are kept for the record — BUT note two were superseded: (1) the "reply-block
+> IPC stall" hypothesis was wrong (it was the EXT2 wedge), and (2) the "residual single-process
+> futex lost-wake" was a RED HERRING (idle libuv threadpool workers). The actual final blocker
+> was a **stale `FAST_ITER` credential** (a reused disk's old Anthropic key → OpenRouter 401),
+> now fixed by re-stamping the credential into the reused disk (xtask `restamp_claude_credential`).
+
+**Historical symptom (while open):** a `claude -p '…'` round-trip (OpenRouter) never printed
+the answer; the claude-smoke step timed out. NOT a crash, NOT a freeze — the system stayed
+responsive (`vfs_server` kept replying, other node threads kept churning, no fault/panic/kill).
 
 **Where it stalls (from claude's --debug log + node syscall traces):** in claude's `setup()` /
 skill-discovery startup phase (after CA-bundle load + the undici TLS agent; `Loading skills
@@ -213,36 +237,23 @@ thread is in a VFS `stat` (`syscall=4`), i.e. inside `endpoint::call_msg` →
   at the SAME V8 rip with DIFFERENT addrs (each thread reads the pkey-1 WASM code space ONCE
   and proceeds) — healthy, not looping. PKU is unlikely.
 
-## Next steps — to get claude working end-to-end (priority order)
+## Remaining follow-ups (claude -p itself is DONE)
 
-1. **INSTRUMENT first; do not patch blind.** The reply-block primitive
-   (`block_current_until` / `block_current_on_reply_v2` in `kernel/src/task/scheduler.rs`) and
-   `endpoint::call_msg` (`kernel/src/ipc/endpoint.rs`) are the kernel's most delicate
-   concurrency code (the 2026-06-14 SMP work hardened them). A speculative change risks
-   regressing fixes #2/#3 and seeding new lost-wakes. Add a SAFE, read-only diagnostic that
-   makes the exact stall state visible on the next run:
-   - A **cumulative-blocked-time / wake-reblock-cycle counter** per task (not the single-block
-     `blocked_since` the current watchdog uses, which resets each cycle). When a task exceeds
-     a cumulative threshold in `BlockedOnReply` (or churns >N reblock cycles), dump: the task
-     (pid/state), whether `pending_msg` is set (reply arrived but not consumed = lost-wake vs
-     never arrived = vfs stuck), its `reply_waker` flag, the endpoint's `senders`/`receivers`
-     queues, and the outstanding `Capability::Reply` holder.
-   - This single run distinguishes the three live hypotheses: (a) lost-wake (reply delivered,
-     waker flag set, task not rescheduled), (b) livelock in the v2 re-check loop (woken flag
-     toggling), (c) `vfs_server` never replied to THIS caller (request stranded/misrouted
-     under concurrency).
-2. **Fix per (1)'s verdict.** Likely audits: `ipc_reply` → `deliver_message` + `wake_task_v2`
-   (`scheduler.rs:4721`/`4747`) and the single-threaded `vfs_server` reply loop
-   (`userspace/vfs_server/src/main.rs:~1970-2009`) under CONCURRENT callers; the
-   `block_current_on_reply_v2` re-check (`scheduler.rs:3841`); and the `metacache` lock in
-   `vfs_service_stat_path` (`syscall/mod.rs:8553`) under concurrent stats.
-3. **Verify the fix two ways:** (a) the OpenRouter round-trip answers `579` (command below);
-   (b) a multi-thread concurrent-VFS stress (claude is the real one; a `node -e` that fans out
-   many concurrent `fs.stat` on `/usr` paths would be a cheaper regression guard — consider
-   adding it to `node-smoke` or a new gate).
-4. **Lower priority / orthogonal:** `copyfile`→EFAULT (secondary bug below); the libuv
-   event-loop angle (timerfd/epoll_wait returning-immediately-in-a-loop) as an ALTERNATIVE to
-   the lost-wake hypothesis if (1) shows the thread is spinning rather than parked.
+1. **Official `api.anthropic.com` arm.** The same harness runs against the real Anthropic API
+   when `M3OS_CLAUDE_NET=1` + a credential is seeded via `M3OS_CLAUDE_TOKEN` (subscription
+   OAuth) or `M3OS_CLAUDE_KEY` (API key), WITHOUT `M3OS_CLAUDE_BASE_URL` (so it hits
+   `api.anthropic.com` and sends the native `x-api-key`/Bearer). The user plans to SSH into a
+   test machine to authenticate (`claude login`) and try it; the credential path is the same
+   0600 `/root/.claude/{oauth_token,api_key}` file, now also refreshed under FAST_ITER.
+2. **Multi-core (`M3OS_CLAUDE_MULTICORE=1`).** claude-smoke pins `-smp 1` by default. The
+   multicore arm validates the 2026-06-14 SMP TLB-shootdown survivability fixes against the
+   real claude workload; pair with `M3OS_CLAUDE_JIT=1` + `M3OS_KVM=1`. Independent of the
+   `claude -p` completion (which is done single-core).
+3. **Interactive TUI** already verified (the `claude_tui_render_arm` QMP/PPM render check —
+   the yoga.wasm "Welcome to Claude Code" splash paints under `M3OS_CLAUDE_JIT=1` + KVM).
+4. **Orthogonal cleanups (non-blocking):** `copyfile`→EFAULT (secondary bug below); the stale
+   `FAST_ITER` credential footgun is now fixed in xtask but consider extending the same
+   re-stamp to `node-smoke`/`gh-smoke` if they ever reuse disks with changing secrets.
 
 ## How to reproduce / test
 
@@ -258,8 +269,12 @@ M3OS_SMP=1 M3OS_CLAUDE_NET=1 \
   M3OS_CLAUDE_KEY="$(. ./openrouter.sh >/dev/null 2>&1; printf %s "$OPENROUTER_API_KEY")" \
   M3OS_KVM=1 M3OS_CLAUDE_FAST_ITER=1 \
   M3OS_SERIAL_LOG=/tmp/m3os-claude.log \
-  cargo xtask claude-smoke --timeout 2400
-# PASS pattern "579" = claude completed the round-trip (currently STALLS — issue #4).
+  cargo xtask claude-smoke --timeout 900
+# PASS = claude's stdout prints the collision-proof `<<<579>>>` (smoke "serial core PASSED").
+# This is the VERIFIED working command (33/33 PASS, ~69 s under KVM+FAST_ITER).
+# Add M3OS_CLAUDE_PCAP=1 to capture all guest net traffic to /tmp/claude-net.pcap (decode with
+# `tcpdump -nr /tmp/claude-net.pcap 'port 443'`) if a future network regression needs proof of
+# what actually leaves/returns at the wire.
 ```
 
 - `M3OS_SERIAL_LOG=<path>` tees the COMPLETE raw guest serial to a file (the in-memory
@@ -290,12 +305,15 @@ M3OS_SMP=1 M3OS_CLAUDE_NET=1 \
 
 ## Ruled out (network is NOT the problem)
 
-The networking/HTTP stack is fully working. Proven via `node -e` probes against the real
-OpenRouter API with the user's key: raw `https.request` POST → 200; `fetch()` non-streaming
-→ 200; `fetch()` streaming read to completion → 200/DONE; and `node-smoke M3OS_NODE_NET=1`
-(live HTTPS + `npm install`) PASSES. claude's request never reaches OpenRouter because it
-stalls in startup (#4) before issuing the API call — the debug log shows no `Request to …`
-line.
+The networking/HTTP stack is fully working — now proven THREE ways: (1) `node -e` probes
+against the real OpenRouter API (raw `https.request` POST → 200; `fetch()` non-streaming and
+streaming → 200/DONE); (2) `node-smoke M3OS_NODE_NET=1` (live HTTPS + `npm install`) PASSES;
+and (3) decisively, the `M3OS_CLAUDE_PCAP` capture of an actual `claude -p` run, which shows
+claude's full TLS 1.3 handshake + ~103 KB request + OpenRouter's response on the wire. The
+final verified run authenticates and answers `<<<579>>>`. (Historical note: while the bug was
+open it LOOKED like "the request never reaches OpenRouter" because the OpenRouter request logs
+were empty — but that was the 401-on-a-stale-key path; OpenRouter does not log unauthenticated
+requests, so empty logs meant "rejected at auth", not "never arrived".)
 
 ## Secondary bugs (observed, not yet fixed)
 
@@ -327,4 +345,10 @@ line.
 - `M3OS_CLAUDE_FAST_ITER=1` reuses the installed data disk (kernel still rebuilt → fixes
   included). The default bundled node is JITLESS-but-`wasm-in-jitless` (it DOES compile WASM
   to native code → the `[wx] v2-guarded W+X mapping (pkey=1)` lines), so claude exercises the
-  PKU W+X path even on the "jitless" node.
+  PKU W+X path even on the "jitless" node. **The seeded credential is now RE-STAMPED into the
+  reused disk on every FAST_ITER run** (`restamp_claude_credential`, via `debugfs -w
+  "disk.img?offset=1048576"`), so a key change between runs always takes effect — without this,
+  a reused disk silently kept its old credential (the 2026-06-16 footgun: an old Anthropic key
+  401'd against OpenRouter despite a fully working network path, costing a long false-trail
+  debugging detour). Requires host `debugfs` (e2fsprogs ≥ 1.45); a missing debugfs warns and
+  proceeds with the disk's existing credential.
