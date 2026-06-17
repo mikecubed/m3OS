@@ -206,6 +206,8 @@ const KNOWN_CONFIGS: &[&[u8]] = &[
     b"/etc/services.d/igc_driver.conf\0",
     b"/etc/services.d/r8169_driver.conf\0",
     b"/etc/services.d/r8125_driver.conf\0",
+    // Phase 96 Stage-1a: ring-3 USB-Ethernet driver for RTL815x.
+    b"/etc/services.d/ure_driver.conf\0",
     // Phase 81: ring-3 MediaTek mt792x Wi-Fi driver.
     b"/etc/services.d/mt792x_driver.conf\0",
     // Phase 78a B.2: ring-3 xHCI USB host-controller driver.
@@ -1302,31 +1304,48 @@ impl ServiceManager {
         }
     }
 
-    /// Fallback: register built-in service definitions for telnetd and sshd.
+    /// Fallback: register built-in service definitions when no on-disk service
+    /// configs are available.
+    ///
+    /// This fires on a **bare-metal USB boot with no ext2 data disk**: root
+    /// mount fails (m3OS has no USB mass-storage driver — Phase 90 — so the boot
+    /// USB itself can't be mounted as the rootfs), `/etc/services.d` is absent,
+    /// and without this the box would come up with only `telnetd`/`sshd` — no
+    /// keyboard, no USB, no NIC. We parse embedded copies of the essential
+    /// configs (mirrors xtask's `populate_ext2_files`) through the same
+    /// `parse_service_def` path the on-disk configs use, so the dependency graph
+    /// and restart policy behave identically. Kept minimal — no display/greeter/
+    /// audio/storage: a USB-only boot uses the kernel framebuffer console + the
+    /// ramdisk root. Order is irrelevant (deps resolve by name across the set).
     fn add_builtin_defaults(&mut self) {
-        // telnetd
-        if self.count < MAX_SERVICES {
-            let mut svc = ServiceDef::empty();
-            svc.name = FixedStr::from_bytes(b"telnetd");
-            svc.command = FixedStr::from_bytes(b"/bin/telnetd");
-            svc.service_type = ServiceType::Daemon;
-            svc.restart_policy = RestartPolicy::Always;
-            svc.max_restart = 10;
-            svc.active = true;
-            self.services[self.count] = svc;
-            self.count += 1;
-        }
-        // sshd
-        if self.count < MAX_SERVICES {
-            let mut svc = ServiceDef::empty();
-            svc.name = FixedStr::from_bytes(b"sshd");
-            svc.command = FixedStr::from_bytes(b"/bin/sshd");
-            svc.service_type = ServiceType::Daemon;
-            svc.restart_policy = RestartPolicy::Always;
-            svc.max_restart = 10;
-            svc.active = true;
-            self.services[self.count] = svc;
-            self.count += 1;
+        const BUILTIN_CONFIGS: &[&[u8]] = &[
+            // console + kbd: the PS/2 and USB keyboard input pipeline to the
+            // kernel framebuffer console / login tty.
+            b"name=console\ncommand=/bin/console_server\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=\n",
+            b"name=kbd\ncommand=/bin/kbd_server\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=console\n",
+            // xHCI host controller + USB HID class driver (USB keyboard/mouse).
+            b"name=xhci_driver\ncommand=/drivers/xhci\ntype=daemon\nrestart=on-failure\nmax_restart=5\n",
+            b"name=usb_hid\ncommand=/drivers/usb-hid\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=xhci_driver\n",
+            // RTL8156 USB-Ethernet NIC (the only networking on a Phase 96 laptop
+            // with no Ethernet port) — brings the link up for in-kernel DHCP.
+            b"name=ure_driver\ncommand=/drivers/ure\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=xhci_driver\n",
+            // Remote-login daemons (previously the only built-in defaults).
+            b"name=telnetd\ncommand=/bin/telnetd\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=\n",
+            b"name=sshd\ncommand=/bin/sshd\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=\n",
+        ];
+        let mut i = 0;
+        while i < BUILTIN_CONFIGS.len() {
+            if self.count >= MAX_SERVICES {
+                break;
+            }
+            let cfg = BUILTIN_CONFIGS[i];
+            if let Some(svc) = parse_service_def(cfg, cfg.len())
+                && !Self::is_disabled(svc.name.as_bytes())
+            {
+                self.services[self.count] = svc;
+                self.count += 1;
+            }
+            i += 1;
         }
     }
 

@@ -1109,6 +1109,16 @@ pub fn handle_tcp(ip_header: &Ipv4Header, payload: &[u8]) {
                 && let Some(conn) = conns.conns[idx].as_mut()
             {
                 conn.remote_ip = ip_header.src;
+                // The listener's `local_ip` was frozen at `create()` time to
+                // whatever our address was then — on a DHCP NIC that is the
+                // pre-lease default (10.0.2.15), since daemons like telnetd/sshd
+                // bind long before the lease lands. Refresh it to the address the
+                // client actually targeted so the SYN-ACK (and its pseudo-header
+                // checksum + passive-open ISN, both derived from `local_ip`)
+                // carry the correct source IP. Without this the client receives a
+                // SYN-ACK from a stale 10.0.2.15, rejects it, and the handshake
+                // wedges — while ICMP/ping (which stores no local address) works.
+                conn.local_ip = ip_header.dst;
                 conn.handle_segment(&tcp_hdr, tcp_data, &mut pending);
                 wake_slot = Some(idx);
                 matched = true;

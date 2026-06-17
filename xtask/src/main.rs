@@ -464,6 +464,16 @@ struct DeviceSet {
     /// server loop. `dual_xhci = false` leaves the existing `xhci0`+kbd+mouse
     /// single-controller layout byte-for-byte unchanged.
     dual_xhci: bool,
+    /// Phase 96 Track C: pass a **physical USB device** into the guest's
+    /// emulated xHCI controller. Set via `--usb-passthrough <vid:pid>` (e.g.
+    /// `0bda:8156` for the Anker RTL8156 dongle). When set, xtask appends a
+    /// dedicated `qemu-xhci,id=xhci_pt` controller and a
+    /// `usb-host,vendorid=0x<vid>,productid=0x<pid>` device so the physical
+    /// dongle is claimed from the host and handed to the m3OS guest for
+    /// bare-metal driver bring-up. The QEMU process must have access to the
+    /// raw USB device node (typically via a udev rule granting the running
+    /// user or group, or by running QEMU as root).
+    usb_passthrough: Option<(u16, u16)>,
 }
 
 /// Parse `--device <name>` and `--iommu` flags out of `args`, returning the
@@ -530,6 +540,14 @@ fn parse_device_flags(args: &[String]) -> Result<(DeviceSet, Vec<String>), Strin
             .or_else(|| arg.strip_prefix("--memory="))
         {
             devices.memory_mib = Some(parse_memory_spec(spec)?);
+        } else if arg == "--usb-passthrough" {
+            index += 1;
+            let spec = args
+                .get(index)
+                .ok_or_else(|| "missing value for `--usb-passthrough`".to_string())?;
+            devices.usb_passthrough = Some(parse_vid_pid(spec)?);
+        } else if let Some(spec) = arg.strip_prefix("--usb-passthrough=") {
+            devices.usb_passthrough = Some(parse_vid_pid(spec)?);
         } else {
             remaining.push(arg.clone());
         }
@@ -537,6 +555,40 @@ fn parse_device_flags(args: &[String]) -> Result<(DeviceSet, Vec<String>), Strin
     }
 
     Ok((devices, remaining))
+}
+
+/// Parse a `"<vid>:<pid>"` USB id spec (e.g. `"0bda:8156"`) into a `(u16, u16)` pair.
+///
+/// Both components are hex (1–4 digits, case-insensitive) separated by `:` and
+/// each must fit in a `u16`; a missing `:` or non-hex/oversized field returns a
+/// descriptive error so a typo (`"0bda"`, `"xyz"`, etc.) is caught before QEMU
+/// is launched.
+fn parse_vid_pid(spec: &str) -> Result<(u16, u16), String> {
+    let (vid_str, pid_str) = spec.split_once(':').ok_or_else(|| {
+        format!(
+            "invalid `--usb-passthrough` spec {:?}: expected `<vid>:<pid>` \
+             (four-hex-digit vendor:product, e.g. `0bda:8156`)",
+            spec
+        )
+    })?;
+    let parse_hex = |s: &str, label: &str| -> Result<u16, String> {
+        if s.is_empty() || s.len() > 4 {
+            return Err(format!(
+                "invalid `--usb-passthrough` spec {:?}: {} must be 1-4 hex digits, got {:?}",
+                spec, label, s
+            ));
+        }
+        u16::from_str_radix(s, 16).map_err(|_| {
+            format!(
+                "invalid `--usb-passthrough` spec {:?}: {} {:?} is not valid hex",
+                spec, label, s
+            )
+        })
+    };
+    Ok((
+        parse_hex(vid_str, "vendor id")?,
+        parse_hex(pid_str, "product id")?,
+    ))
 }
 
 /// Populate `devices.memory_mib` from `M3OS_MEM=` if no explicit flag set it.
@@ -901,6 +953,14 @@ fn main() {
                     std::process::exit(1);
                 });
             cmd_usb_multi_controller_smoke(&smoke_args);
+        }
+        Some("ure-smoke") => {
+            let smoke_args = parse_smoke_boot_args("ure-smoke", &args[2..]).unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            cmd_ure_smoke(&smoke_args);
         }
         Some("ssh-e1000-banner-check") => {
             let banner_args = parse_ssh_e1000_banner_check_args(&args[2..]).unwrap_or_else(|err| {
@@ -1545,9 +1605,10 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]... [--usb-passthrough <vid:pid>]|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ure-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
-     Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
+     Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm.\n\
+     USB passthrough: --usb-passthrough <vid:pid> (e.g. `--usb-passthrough 0bda:8156`) passes a physical USB device into the guest's emulated xHCI (qemu-xhci,id=xhci_pt). The QEMU process must have access to the USB device node — add a udev rule granting the user/group read-write on the device, or run with sudo. The device is claimed from the host kernel while QEMU runs and is released on exit."
 }
 
 fn workspace_root() -> PathBuf {
@@ -1696,6 +1757,8 @@ fn build_userspace_bins() {
         ("igc_driver", "igc_driver", true),
         ("r8169_driver", "r8169_driver", true),
         ("r8125_driver", "r8125_driver", true),
+        // Phase 96 Stage-1a: ring-3 USB-Ethernet driver for RTL815x.
+        ("ure_driver", "ure_driver", true),
         // Phase 81: ring-3 MediaTek mt792x Wi-Fi driver.
         ("mt792x_driver", "mt792x_driver", true),
         // Phase 78a Track B.2: ring-3 xHCI USB host-controller driver
@@ -5525,6 +5588,22 @@ fn qemu_args_with_devices_resolved(
                 "usb-mouse,bus=xhci0.0".to_string(),
             ]);
         }
+    }
+
+    // Phase 96 Track C: `--usb-passthrough <vid:pid>` passes a physical USB
+    // device into the guest's emulated xHCI. A dedicated `qemu-xhci,id=xhci_pt`
+    // controller is added so it does not conflict with the sentinel `xhci0`
+    // controller used by `--device xhci`. The `usb-host` device claims the
+    // matching physical device from the host kernel for the duration of the
+    // QEMU session. The QEMU process must have read-write access to the USB
+    // device node (typically via a udev rule or running as root).
+    if let Some((vid, pid)) = devices.usb_passthrough {
+        args.extend([
+            "-device".to_string(),
+            "qemu-xhci,id=xhci_pt".to_string(),
+            "-device".to_string(),
+            format!("usb-host,vendorid=0x{vid:04x},productid=0x{pid:04x},bus=xhci_pt.0"),
+        ]);
     }
 
     // Phase 55a Track F.1: `--iommu` enables an emulated Intel VT-d unit on
@@ -10090,6 +10169,163 @@ fn cmd_multi_nic_smoke() {
     }
 
     println!("multi-nic-smoke: ALL EMULATED ARMS PASSED");
+}
+
+/// Return `true` if a USB device with `vid:pid` is present on the host (scans
+/// sysfs, no external tools). Used by `ure-smoke` to skip-with-reason when
+/// the RTL8156 dongle is absent (e.g. in CI) rather than fail.
+fn usb_host_device_present(vid: u16, pid: u16) -> bool {
+    let want_v = format!("{vid:04x}");
+    let want_p = format!("{pid:04x}");
+    let Ok(entries) = std::fs::read_dir("/sys/bus/usb/devices") else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let v = std::fs::read_to_string(path.join("idVendor"));
+        let p = std::fs::read_to_string(path.join("idProduct"));
+        if let (Ok(v), Ok(p)) = (v, p)
+            && v.trim().eq_ignore_ascii_case(&want_v)
+            && p.trim().eq_ignore_ascii_case(&want_p)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Phase 96 Track D.1 — `ure-smoke`.
+///
+/// Boots m3OS with the physical Realtek RTL8156 (`0bda:8156`) USB-Ethernet
+/// dongle passed through to an emulated xHCI controller, then asserts the whole
+/// bring-up chain on real silicon: enumerate → `ure` claim + MAC read (control
+/// IN) → chip init (control OUT) → link up → `RemoteNic` registration (the
+/// kernel net stack binds the USB NIC). This is the USB analogue of the
+/// `multi-nic-smoke` registration+link arms, but against real hardware.
+///
+/// **Skip-with-reason** when the dongle is absent (mirrors `tls-smoke` /
+/// `wifi-smoke`): CI has no `0bda:8156`, so the always-on core is a no-op there.
+///
+/// **Opt-in live-traffic arm** (`M3OS_URE_NET=1`): an actual DHCP/ping/HTTP
+/// exchange routed *over the dongle* is inherently a real-network test — the
+/// passthrough device sits on the host's physical LAN (not a SLIRP backend), so
+/// it needs that LAN to provide DHCP + egress AND m3OS to route over `ure`
+/// rather than the default virtio/SLIRP NIC. It is therefore not CI-deterministic
+/// and is gated behind the opt-in env var (mirroring `git-https-smoke`'s
+/// `M3OS_GIT_HTTPS_NET`). Absent the opt-in, the live arm is skipped-with-reason.
+fn cmd_ure_smoke(args: &SmokeBootArgs) {
+    const VID: u16 = 0x0bda;
+    const PID: u16 = 0x8156;
+
+    if !usb_host_device_present(VID, PID) {
+        println!(
+            "ure-smoke: SKIP — no {VID:04x}:{PID:04x} RTL8156 dongle present on this host. \
+             Passthrough needs the physical 2.5GbE dongle + a readable /dev/bus/usb node \
+             (one-time `sudo chmod 666 $(lsusb -d {VID:04x}:{PID:04x} | sed -E \
+             's#Bus ([0-9]+) Device ([0-9]+).*#/dev/bus/usb/\\1/\\2#')`). \
+             Mirrors tls-smoke / wifi-smoke skip-with-reason."
+        );
+        return;
+    }
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+    let ovmf = find_ovmf();
+
+    let devices = DeviceSet {
+        usb_passthrough: Some((VID, PID)),
+        ..Default::default()
+    };
+    let qemu_args = qemu_args_with_devices(&uefi_image, &ovmf, QemuDisplayMode::Headless, devices);
+
+    // The whole bring-up chain, end to end, on the physical chip.
+    let steps = vec![
+        SmokeStep::Wait {
+            pattern: "URE_STAGE1A:OK",
+            timeout_secs: 200,
+            label: "usb-eth: enumerate → ure claim + MAC read (control IN)",
+        },
+        SmokeStep::Wait {
+            pattern: "URE_STAGE1B:OK",
+            timeout_secs: 40,
+            label: "usb-eth: chip init via control-OUT (RE|TE latched)",
+        },
+        SmokeStep::Wait {
+            pattern: "URE_STAGE2:NIC-UP",
+            timeout_secs: 40,
+            label: "usb-eth: ure registered net.nic + published link state",
+        },
+        SmokeStep::Wait {
+            pattern: "registered ring-3 NIC driver",
+            timeout_secs: 30,
+            label: "usb-eth: kernel net stack bound the USB NIC (RemoteNic)",
+        },
+    ];
+
+    // Floor the budget: a fresh-disk boot takes ~150 s+ (slow pre-Phase-87 VFS
+    // writes) before the `ure` output lands, so a too-small `--timeout` would
+    // false-fail. Honour a larger explicit value.
+    let timeout_secs = args.timeout_secs.max(360);
+    println!(
+        "ure-smoke: launching QEMU with the physical {VID:04x}:{PID:04x} passed through \
+         (timeout {timeout_secs}s)"
+    );
+    let global_timeout = std::time::Duration::from_secs(timeout_secs);
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            println!(
+                "ure-smoke: PASS — enumerate → claim → MAC → init → link → RemoteNic \
+                 registration on the physical RTL8156"
+            );
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("ure-smoke: FAIL — {msg}");
+            std::process::exit(1);
+        }
+    }
+
+    // Live-traffic arm (opt-in — see the function doc for why it cannot be
+    // CI-deterministic). Until the routing-over-ure + DHCP path is automated it
+    // is reported as skip-with-reason so the gate's semantics stay honest.
+    if std::env::var("M3OS_URE_NET").is_ok() {
+        println!(
+            "ure-smoke: M3OS_URE_NET set — the live DHCP/ping/HTTP-over-ure arm is not \
+             yet automated (needs the dongle's LAN to provide DHCP + egress and m3OS to route \
+             over `ure` rather than the default virtio/SLIRP NIC; drive it manually via the \
+             scripts/ure-vfio-validate.md runbook)."
+        );
+    } else {
+        println!(
+            "ure-smoke: live DHCP/ping/HTTP-over-ure arm SKIPPED (set M3OS_URE_NET=1 to \
+             acknowledge the real-LAN dependency; mirrors git-https-smoke's M3OS_GIT_HTTPS_NET)."
+        );
+    }
 }
 
 /// Phase 57 Track C.2 — run the kernel-core BAR-coverage smoke for the
@@ -25801,6 +26037,9 @@ fn populate_ext2_files(
         "name=igc_driver\ncommand=/drivers/igc\ntype=daemon\nrestart=on-failure\nmax_restart=5\n";
     let r8169_driver_conf = "name=r8169_driver\ncommand=/drivers/r8169\ntype=daemon\nrestart=on-failure\nmax_restart=5\n";
     let r8125_driver_conf = "name=r8125_driver\ncommand=/drivers/r8125\ntype=daemon\nrestart=on-failure\nmax_restart=5\n";
+    // Phase 96 Stage-1a: RTL815x USB-Ethernet bring-up probe. Depends on
+    // xhci_driver so the `usb` service is registered before ure starts.
+    let ure_driver_conf = "name=ure_driver\ncommand=/drivers/ure\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=xhci_driver\n";
     // Phase 81: mt792x Wi-Fi driver service definition.
     let mt792x_driver_conf = "name=mt792x_driver\ncommand=/drivers/mt792x\ntype=daemon\nrestart=on-failure\nmax_restart=5\n";
     // Phase 78a Track B.2 — ring-3 xHCI USB host-controller driver.  Same
@@ -26264,6 +26503,7 @@ fn populate_ext2_files(
     let igc_driver_conf_tmp = output_dir.join("_tmp_igc_driver_conf");
     let r8169_driver_conf_tmp = output_dir.join("_tmp_r8169_driver_conf");
     let r8125_driver_conf_tmp = output_dir.join("_tmp_r8125_driver_conf");
+    let ure_driver_conf_tmp = output_dir.join("_tmp_ure_driver_conf");
     let mt792x_driver_conf_tmp = output_dir.join("_tmp_mt792x_driver_conf");
     let xhci_driver_conf_tmp = output_dir.join("_tmp_xhci_driver_conf");
     let usbhub_conf_tmp = output_dir.join("_tmp_usbhub_conf");
@@ -26334,6 +26574,7 @@ fn populate_ext2_files(
     fs::write(&igc_driver_conf_tmp, igc_driver_conf).expect("write temp igc_driver.conf");
     fs::write(&r8169_driver_conf_tmp, r8169_driver_conf).expect("write temp r8169_driver.conf");
     fs::write(&r8125_driver_conf_tmp, r8125_driver_conf).expect("write temp r8125_driver.conf");
+    fs::write(&ure_driver_conf_tmp, ure_driver_conf).expect("write temp ure_driver.conf");
     fs::write(&mt792x_driver_conf_tmp, mt792x_driver_conf).expect("write temp mt792x_driver.conf");
     fs::write(&xhci_driver_conf_tmp, xhci_driver_conf).expect("write temp xhci_driver.conf");
     fs::write(&usbhub_conf_tmp, usbhub_conf).expect("write temp usbhub.conf");
@@ -27168,6 +27409,10 @@ fn populate_ext2_files(
          sif etc/services.d/r8125_driver.conf mode 0x81A4\n\
          sif etc/services.d/r8125_driver.conf uid 0\n\
          sif etc/services.d/r8125_driver.conf gid 0\n\
+         write \"{ure_driver_conf}\" etc/services.d/ure_driver.conf\n\
+         sif etc/services.d/ure_driver.conf mode 0x81A4\n\
+         sif etc/services.d/ure_driver.conf uid 0\n\
+         sif etc/services.d/ure_driver.conf gid 0\n\
          write \"{mt792x_driver_conf}\" etc/services.d/mt792x_driver.conf\n\
          sif etc/services.d/mt792x_driver.conf mode 0x81A4\n\
          sif etc/services.d/mt792x_driver.conf uid 0\n\
@@ -27271,6 +27516,7 @@ fn populate_ext2_files(
         igc_driver_conf = igc_driver_conf_tmp.display(),
         r8169_driver_conf = r8169_driver_conf_tmp.display(),
         r8125_driver_conf = r8125_driver_conf_tmp.display(),
+        ure_driver_conf = ure_driver_conf_tmp.display(),
         mt792x_driver_conf = mt792x_driver_conf_tmp.display(),
         xhci_driver_conf = xhci_driver_conf_tmp.display(),
         usbhub_conf = usbhub_conf_tmp.display(),
@@ -29615,6 +29861,7 @@ fn regression_tests() -> Vec<RegressionTest> {
                 xhci: false,
                 ahci: false,
                 dual_xhci: false,
+                usb_passthrough: None,
             },
             wants_debug_crash_marker: false,
             wants_readback_marker: false,
@@ -29656,6 +29903,7 @@ fn regression_tests() -> Vec<RegressionTest> {
                 xhci: false,
                 ahci: false,
                 dual_xhci: false,
+                usb_passthrough: None,
             },
             wants_debug_crash_marker: false,
             wants_readback_marker: false,
@@ -29694,6 +29942,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             xhci: false,
             ahci: false,
             dual_xhci: false,
+            usb_passthrough: None,
         },
         wants_debug_crash_marker: false,
         wants_readback_marker: false,
@@ -29729,6 +29978,7 @@ fn regression_tests() -> Vec<RegressionTest> {
                 xhci: false,
                 ahci: false,
                 dual_xhci: false,
+                usb_passthrough: None,
             },
             wants_debug_crash_marker: false,
             wants_readback_marker: false,
@@ -33120,6 +33370,133 @@ mod tests {
         assert!(err.contains("missing value for `-m`"));
     }
 
+    // ----------------------------------------------------------------
+    // Phase 96 Track C.1: `--usb-passthrough <vid:pid>` flag parsing +
+    // QEMU arg emission.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn parse_vid_pid_accepts_valid_spec() {
+        assert_eq!(parse_vid_pid("0bda:8156").unwrap(), (0x0bda, 0x8156));
+        assert_eq!(parse_vid_pid("046d:c52b").unwrap(), (0x046d, 0xc52b));
+        assert_eq!(parse_vid_pid("0001:0001").unwrap(), (0x0001, 0x0001));
+        // Short (< 4 digit) values are also valid hex.
+        assert_eq!(parse_vid_pid("f:1").unwrap(), (0x000f, 0x0001));
+    }
+
+    #[test]
+    fn parse_vid_pid_rejects_missing_colon() {
+        let err = parse_vid_pid("0bda8156").unwrap_err();
+        assert!(
+            err.contains("expected `<vid>:<pid>`"),
+            "error should explain the expected format, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_vid_pid_rejects_non_hex() {
+        let err = parse_vid_pid("xyz:8156").unwrap_err();
+        assert!(
+            err.contains("not valid hex") || err.contains("vendor id"),
+            "error should mention invalid hex, got: {err}"
+        );
+        let err2 = parse_vid_pid("0bda:zzzz").unwrap_err();
+        assert!(
+            err2.contains("not valid hex") || err2.contains("product id"),
+            "error should mention invalid hex, got: {err2}"
+        );
+    }
+
+    #[test]
+    fn extract_device_flags_parses_usb_passthrough_space_form() {
+        let input = string_args(&["--usb-passthrough", "0bda:8156", "--fresh"]);
+        let (devices, rest) = extract_device_flags(&input).unwrap();
+        assert_eq!(
+            devices.usb_passthrough,
+            Some((0x0bda, 0x8156)),
+            "--usb-passthrough space form must parse vid:pid"
+        );
+        assert_eq!(
+            rest,
+            vec!["--fresh".to_string()],
+            "--fresh must be preserved in remaining args"
+        );
+    }
+
+    #[test]
+    fn extract_device_flags_parses_usb_passthrough_equals_form() {
+        let input = string_args(&["--usb-passthrough=0bda:8156", "--fresh"]);
+        let (devices, rest) = extract_device_flags(&input).unwrap();
+        assert_eq!(
+            devices.usb_passthrough,
+            Some((0x0bda, 0x8156)),
+            "--usb-passthrough= equals form must parse vid:pid"
+        );
+        assert_eq!(
+            rest,
+            vec!["--fresh".to_string()],
+            "--fresh must be preserved in remaining args"
+        );
+    }
+
+    #[test]
+    fn extract_device_flags_usb_passthrough_missing_value_errors() {
+        let input = string_args(&["--usb-passthrough"]);
+        let err = extract_device_flags(&input).unwrap_err();
+        assert!(
+            err.contains("missing value for `--usb-passthrough`"),
+            "missing value must produce a clear error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn qemu_args_usb_passthrough_emits_xhci_pt_and_usb_host() {
+        // The passthrough controller must have id=xhci_pt (distinct from the
+        // sentinel xhci0 used by --device xhci) so both can coexist.
+        let args = qemu_args_with_devices_resolved(
+            Path::new("target/boot-uefi-m3os.img"),
+            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
+            QemuDisplayMode::Headless,
+            DeviceSet {
+                usb_passthrough: Some((0x0bda, 0x8156)),
+                ..DeviceSet::default()
+            },
+            None,
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-device", "qemu-xhci,id=xhci_pt"]),
+            "expected `-device qemu-xhci,id=xhci_pt` for passthrough controller"
+        );
+        assert!(
+            args.windows(2).any(|w| w
+                == [
+                    "-device",
+                    "usb-host,vendorid=0x0bda,productid=0x8156,bus=xhci_pt.0"
+                ]),
+            "expected `-device usb-host,vendorid=0x0bda,productid=0x8156,bus=xhci_pt.0`"
+        );
+    }
+
+    #[test]
+    fn qemu_args_no_usb_passthrough_omits_xhci_pt() {
+        let args = qemu_args_with_devices_resolved(
+            Path::new("target/boot-uefi-m3os.img"),
+            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
+            QemuDisplayMode::Headless,
+            DeviceSet::default(),
+            None,
+        );
+        assert!(
+            !args.iter().any(|a| a.contains("xhci_pt")),
+            "default DeviceSet must not add xhci_pt controller"
+        );
+        assert!(
+            !args.iter().any(|a| a.contains("usb-host")),
+            "default DeviceSet must not add a usb-host passthrough device"
+        );
+    }
+
     #[test]
     fn qemu_args_override_memory_substitutes_dash_m_value() {
         let args = qemu_args_with_devices_resolved(
@@ -33138,6 +33515,7 @@ mod tests {
                 xhci: false,
                 ahci: false,
                 dual_xhci: false,
+                usb_passthrough: None,
             },
             None,
         );
@@ -33199,6 +33577,7 @@ mod tests {
                 xhci: false,
                 ahci: false,
                 dual_xhci: false,
+                usb_passthrough: None,
             },
         );
         assert!(
@@ -33234,6 +33613,7 @@ mod tests {
                 xhci: false,
                 ahci: false,
                 dual_xhci: false,
+                usb_passthrough: None,
             },
             Some(fake_nvme),
         );
@@ -33396,6 +33776,7 @@ mod tests {
                 xhci: false,
                 ahci: false,
                 dual_xhci: false,
+                usb_passthrough: None,
             },
             Some(fake_nvme),
         );
@@ -33443,6 +33824,7 @@ mod tests {
                 xhci: false,
                 ahci: false,
                 dual_xhci: false,
+                usb_passthrough: None,
             },
             Some(Path::new("/tmp/m3os-test-nvme-rootdisk-never-created.img")),
         );
@@ -33502,6 +33884,7 @@ mod tests {
                 xhci: false,
                 ahci: false,
                 dual_xhci: false,
+                usb_passthrough: None,
             },
             None,
         );
@@ -33566,6 +33949,7 @@ mod tests {
                 xhci: false,
                 ahci: false,
                 dual_xhci: false,
+                usb_passthrough: None,
             },
             None,
         );
@@ -33603,6 +33987,7 @@ mod tests {
                 xhci: false,
                 ahci: false,
                 dual_xhci: false,
+                usb_passthrough: None,
             },
             None,
         );
@@ -33832,6 +34217,7 @@ mod tests {
             xhci: false,
             ahci: false,
             dual_xhci: false,
+            usb_passthrough: None,
         });
         let iommu = device_smoke_steps(DeviceSet {
             nvme: true,
@@ -33845,6 +34231,7 @@ mod tests {
             xhci: false,
             ahci: false,
             dual_xhci: false,
+            usb_passthrough: None,
         });
 
         assert_eq!(smoke_step_labels(&iommu), smoke_step_labels(&base));

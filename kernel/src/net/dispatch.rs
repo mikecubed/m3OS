@@ -18,9 +18,27 @@ use super::ipv4;
 use super::ipv6;
 use super::virtio_net;
 
+/// Per-boot RX-path counters surfaced by the DHCP heartbeat so a bare-metal
+/// boot (no serial console / keyboard) can localize where inbound packets stop:
+/// frames that parsed as Ethernet, of which ARP and IPv4. If `total` climbs but
+/// `arp`/`ipv4` stay 0 the Ethernet parse is failing; if `ipv4` climbs but the
+/// DHCP heartbeat's `udp68` stays 0 the OFFER is dropped above IPv4.
+static RX_TOTAL: AtomicU32 = AtomicU32::new(0);
+static RX_ARP: AtomicU32 = AtomicU32::new(0);
+static RX_IPV4: AtomicU32 = AtomicU32::new(0);
+
 /// Per-boot count of inbound IPv6 frames dispatched into the v6 stack (Phase
 /// 91). Keeps the bare-metal RX diagnostics symmetric with ARP/IPv4.
 static RX_IPV6: AtomicU32 = AtomicU32::new(0);
+
+/// Snapshot of `(total, arp, ipv4)` frames dispatched into the stack this boot.
+pub fn rx_counts() -> (u32, u32, u32) {
+    (
+        RX_TOTAL.load(Ordering::Relaxed),
+        RX_ARP.load(Ordering::Relaxed),
+        RX_IPV4.load(Ordering::Relaxed),
+    )
+}
 
 /// Snapshot of IPv6 frames dispatched this boot.
 #[allow(dead_code)]
@@ -46,13 +64,16 @@ pub fn process_rx_frames(raw: &[u8]) -> bool {
         Some(f) => f,
         None => return false,
     };
+    RX_TOTAL.fetch_add(1, Ordering::Relaxed);
     match frame.ethertype {
         ethernet::ETHERTYPE_ARP => {
+            RX_ARP.fetch_add(1, Ordering::Relaxed);
             if let Some(pkt) = arp::parse(&frame.payload) {
                 arp::handle_arp(&pkt);
             }
         }
         ethernet::ETHERTYPE_IPV4 => {
+            RX_IPV4.fetch_add(1, Ordering::Relaxed);
             if let Some((header, payload)) = ipv4::parse(&frame.payload) {
                 // Passive ARP learning: populate the cache with
                 // (sender_ip, sender_mac) before dispatching. Without this,

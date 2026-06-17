@@ -299,8 +299,14 @@ pub fn init(boot_info: &'static mut BootInfo) {
         );
     }
 
+    // BRING-UP DIAGNOSTIC: row-1 POST squares pinpoint which mm sub-step hangs
+    // on bare metal (see crate::post_marker). 16=after memory_map, 17=after
+    // frame_allocator (the per-frame free-list build — O(RAM); ~16M frames at
+    // 64 GiB), 18=after paging+heap, 19=after buddy upgrade.
     memory_map::init(static_regions);
+    crate::post_marker(16);
     frame_allocator::init(static_regions, phys_offset);
+    crate::post_marker(17);
 
     // Log reserved regions below 1 MiB to confirm allocator skips them (P2-T008)
     debug::log_reserved_below_1mib();
@@ -312,9 +318,11 @@ pub fn init(boot_info: &'static mut BootInfo) {
         let mut mapper = unsafe { paging::init(x86_64::VirtAddr::new(phys_offset)) };
         heap::init_heap(&mut mapper, &mut paging::GlobalFrameAlloc);
     }
+    crate::post_marker(18); // paging + kernel heap up
 
     // Upgrade from bootstrap free-list to buddy allocator (requires heap).
     frame_allocator::init_buddy();
+    crate::post_marker(19); // buddy allocator built (drains the free list)
 
     // P17-T010: initialize per-frame refcount table (requires heap).
     frame_allocator::init_refcounts();

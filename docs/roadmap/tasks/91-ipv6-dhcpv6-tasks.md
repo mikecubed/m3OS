@@ -272,7 +272,7 @@
 
 **File:** `xtask/src/main.rs` (the `qemu_args_with_devices` / netdev construction used by the smoke gates)
 **Symbol:** `-netdev user,…,ipv6=on` (SLIRP IPv6: default `fec0::/64` prefix, host `fec0::2`, DNS `fec0::3`, sends RAs → SLAAC works, answers stateless DHCPv6) for the always-on arms; an opt-in TAP + external `radvd`/`dhcpd`(`kea`) path for stateful DHCPv6 + the `curl http://[2606:4700::1111]/` real-egress arm
-**Why it matters:** SLIRP `ipv6=on` gives a CI-runnable IPv6 network (RAs for SLAAC, a stateless DHCPv6 DNS server) with no host configuration — so the SLAAC + ICMPv6 + NDP arms run in plain CI. Stateful DHCPv6 address leasing and real-internet AAAA/curl need more than SLIRP provides, so they follow the established opt-in skip-with-reason pattern (`git-https-smoke`'s `M3OS_GIT_HTTPS_NET`, `usb-eth-smoke`'s `M3OS_USB_ETH_NET`).
+**Why it matters:** SLIRP `ipv6=on` gives a CI-runnable IPv6 network (RAs for SLAAC, a stateless DHCPv6 DNS server) with no host configuration — so the SLAAC + ICMPv6 + NDP arms run in plain CI. Stateful DHCPv6 address leasing and real-internet AAAA/curl need more than SLIRP provides, so they follow the established opt-in skip-with-reason pattern (`git-https-smoke`'s `M3OS_GIT_HTTPS_NET`, `ure-smoke`'s `M3OS_URE_NET`).
 
 **Acceptance:**
 - [x] The `ipv6-smoke` gate launches QEMU with `ipv6=on`; the guest forms its link-local address and **answers a live Neighbor Solicitation** from SLIRP (NDP over the wire, `NDP_RESOLVE_OK`). *SLAAC global formation needs a real RA — QEMU 8.2.2 libslirp sends no Router Advertisements (packet-capture-confirmed), so SLAAC rides the opt-in `M3OS_IPV6_LIVE` arm; see the Validation Status note below.*

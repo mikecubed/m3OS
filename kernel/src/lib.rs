@@ -66,6 +66,75 @@ pub mod tty;
 use alloc::{boxed::Box, string::String, vec, vec::Vec};
 use bootloader_api::BootInfo;
 
+/// Framebuffer geometry captured at boot entry so `post_marker` can paint from
+/// anywhere (including inside `mm::init`) without threading the pointer through.
+#[derive(Clone, Copy)]
+struct PostFb {
+    base: usize,
+    width: usize,
+    height: usize,
+    stride_bytes: usize,
+    bpp: usize,
+}
+
+static POST_FB: spin::Once<PostFb> = spin::Once::new();
+
+/// Record the framebuffer for `post_marker`. Called once at boot entry.
+fn post_fb_set(ptr: *mut u8, info: &bootloader_api::info::FrameBufferInfo) {
+    let bpp = info.bytes_per_pixel.max(1);
+    POST_FB.call_once(|| PostFb {
+        base: ptr as usize,
+        width: info.width,
+        height: info.height,
+        stride_bytes: info.stride * bpp,
+        bpp,
+    });
+}
+
+/// Bring-up diagnostic — paint a small solid square at grid slot `step` as a
+/// serial-free "POST code". Slots tile left-to-right, 16 per row (`step / 16`
+/// chooses the row): row 0 (slots 0–15) holds top-level boot steps, row 1
+/// (slots 16+) a subsystem's internal steps.
+///
+/// Early boot logs go only to the COM1 UART, invisible on a machine without a
+/// serial port or AMT capture (the Phase 96 Tiger Lake laptop). These squares
+/// make a bare-metal early-boot hang *visible*: the **last square shown is the
+/// last step that completed** — the hang is in the step after it. Harmless on
+/// success (the fb console + compositor overwrite the strip immediately).
+/// Format-agnostic (same byte to every channel, shows on RGB or BGR);
+/// `write_volatile` keeps it from being elided.
+#[inline(never)]
+pub(crate) fn post_marker(step: usize) {
+    let Some(fb) = POST_FB.get() else {
+        return;
+    };
+    const SQ: usize = 28;
+    const GAP: usize = 8;
+    const PER_ROW: usize = 16;
+    let col = step % PER_ROW;
+    let row = step / PER_ROW;
+    let x0 = GAP + col * (SQ + GAP);
+    let y0 = GAP + row * (SQ + GAP);
+    if x0 + SQ > fb.width || y0 + SQ > fb.height {
+        return;
+    }
+    // Distinct brightness per column (0x48, 0x70, 0x98, …) so neighbours differ.
+    let byte: u8 = 0x48u8.wrapping_add((col as u8).wrapping_mul(0x28));
+    let base = fb.base as *mut u8;
+    for y in y0..y0 + SQ {
+        // SAFETY: the bootloader mapped + rendered to this framebuffer before
+        // jumping to the kernel, and mm::init preserves that mapping; the square
+        // is bounds-checked against width/height above.
+        let line = unsafe { base.add(y * fb.stride_bytes) };
+        for x in x0..x0 + SQ {
+            let px = unsafe { line.add(x * fb.bpp) };
+            for b in 0..fb.bpp {
+                unsafe { px.add(b).write_volatile(byte) };
+            }
+        }
+    }
+}
+
 /// Top-level kernel boot entry. Called from the binary `main.rs` which owns
 /// the `entry_point!` macro. Performs all pre-task init (serial, GDT/IDT,
 /// frame allocator, heap, framebuffer, ACPI, IOMMU, RTC, SMP, scheduler,
@@ -77,12 +146,11 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
     serial_println!("[m3os] Hello from kernel! v{}", env!("CARGO_PKG_VERSION"));
     log::info!("Kernel initialized");
 
-    // Load GDT/IDT — no IRQs yet.
-    arch::init();
-
     // P9-T001: parse framebuffer info before mm::init consumes boot_info.
     // `mm::init` takes `&'static mut BootInfo` which borrows the whole struct
-    // for 'static, so we must extract the raw pointer + layout first.
+    // for 'static, so we must extract the raw pointer + layout first.  Hoisted
+    // above arch::init so the bring-up POST markers can paint from the very
+    // first init step (see `post_marker`).
     let fb_parts: Option<(*mut u8, bootloader_api::info::FrameBufferInfo)> =
         boot_info.framebuffer.as_mut().map(|fb| {
             let info = fb.info();
@@ -94,16 +162,30 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
             (ptr, info)
         });
 
+    // BRING-UP DIAGNOSTIC (serial-free POST codes) — see `post_marker`. Record
+    // the framebuffer so any code (incl. mm::init) can paint progress squares.
+    // The last square shown on a hung bare-metal boot is the last step done.
+    if let Some((ptr, info)) = fb_parts.as_ref() {
+        post_fb_set(*ptr, info);
+    }
+    post_marker(0); // square 0 = kernel entry reached + framebuffer paintable
+
+    // Load GDT/IDT — no IRQs yet.
+    arch::init();
+    post_marker(1); // GDT/IDT loaded
+
     // P15-T001: extract RSDP address before mm::init consumes boot_info.
     let rsdp_addr: Option<u64> = boot_info.rsdp_addr.into_option();
 
     mm::init(boot_info);
+    post_marker(2); // mm::init returned (frame alloc + heap + buddy)
 
     // Map the kernel-stack pool with guard pages. Must precede any code
     // that claims a slot — Task::new, AP boot, per-process syscall-stack
     // setup, and the test harness's task spawns all go through
     // `kstack::alloc` / `alloc_leaked_top`.
     task::kstack::init();
+    post_marker(3); // kernel-stack pool mapped
 
     // Phase 86a Track A.3 — Seed the CSPRNG from hardware entropy as early as
     // possible in the boot sequence.
@@ -142,6 +224,7 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
     //       used by AT_RANDOM, the TCP ISN fallback, and /dev/urandom; boot
     //       reaches login prompt without deadlock.  Status: ACCEPTED DEGRADED.
     arch::x86_64::syscall::seed_csprng_early();
+    post_marker(4); // CSPRNG seeded (RDSEED/RDRAND)
 
     // When built with `cargo test`, run the generated test harness and exit.
     // Placed after mm::init so that tests can use heap allocations.
@@ -155,6 +238,7 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
     // Must run after heap init so tmpfs allocations succeed, before any
     // task that opens files under those paths.
     fs::tmpfs::init();
+    post_marker(5); // tmpfs up — next: framebuffer console
 
     // P9-T002: initialise framebuffer text console (fixed-font renderer).
     if let Some((buf_ptr, mut info)) = fb_parts {
@@ -996,6 +1080,11 @@ fn net_task() -> ! {
         // periodic ~200 ms deadline so it advances on an otherwise idle link.
         net::ipv6::v6_tick();
 
+        // Phase 96 R4 — drive the DHCP client one step (no-op unless a RemoteNic
+        // is registered and not yet bound). Runs after `process_rx` so an OFFER/
+        // ACK queued on UDP:68 this pass is consumed immediately.
+        net::dhcp::tick();
+
         // Park on the unified flag: the virtio-net ISR, RemoteNic, and the
         // ingress pending-send hook all set it, so a wake from any path
         // reliably unblocks the task.
@@ -1003,6 +1092,13 @@ fn net_task() -> ! {
         // F.6: under sched-v2 use block_current_until (v2 CAS primitive).
         // Phase 77 Track D.2: a ~200 ms deadline turns the park into a periodic
         // wake so the RTO scan above runs even on an otherwise idle link.
+        //
+        // Phase 96: TX is now fire-and-forget (`send_tx_owned`) — queued frames
+        // carry their own bytes and the net task never blocks waiting for the
+        // polled driver to pick one up, so there is no in-flight state to
+        // fast-poll. `send_frame` already wakes this task (`wake_net_task`) the
+        // moment TCP queues an outbound frame, so the 200 ms deadline only has
+        // to backstop the periodic RTO scan on an idle link.
         {
             const TCP_RTO_TICK_INTERVAL_MS: u64 = 200;
             let deadline = crate::arch::x86_64::interrupts::tick_count()
@@ -1117,8 +1213,22 @@ pub fn handle_panic(info: &core::panic::PanicInfo) -> ! {
                 location.file(),
                 location.line()
             ));
+            // Also surface the panic on the framebuffer console: the serial
+            // banner is invisible on bare metal (no serial cable), so a kernel
+            // panic would otherwise look like a silent freeze. This is the only
+            // way to read a crash location off a physical screen.
+            crate::fb::write_fmt(format_args!(
+                "\nKERNEL PANIC at {}:{}\n  {}\n",
+                location.file(),
+                location.line(),
+                info.message(),
+            ));
         } else {
             serial::_panic_print(format_args!("KERNEL PANIC at unknown location\n"));
+            crate::fb::write_fmt(format_args!(
+                "\nKERNEL PANIC (unknown location)\n  {}\n",
+                info.message()
+            ));
         }
         serial::_panic_print(format_args!("  {}\n", info.message()));
         panic_diag::dump_crash_context();
@@ -1146,6 +1256,13 @@ pub fn handle_alloc_error(layout: alloc::alloc::Layout) -> ! {
         layout,
         free,
         total,
+        (free * 4) / 1024,
+        (total * 4) / 1024,
+        pid,
+    ));
+    // Bare-metal-visible copy (serial is invisible without a cable).
+    crate::fb::write_fmt(format_args!(
+        "\n[alloc_error] {} MiB free / {} MiB total, pid={}\n",
         (free * 4) / 1024,
         (total * 4) / 1024,
         pid,

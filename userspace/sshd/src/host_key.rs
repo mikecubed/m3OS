@@ -2,12 +2,30 @@
 //!
 //! Generates Ed25519 host keys on first boot and persists them as raw 32-byte seeds.
 
-use syscall_lib::{O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, STDOUT_FILENO, close, open, write_str};
+use syscall_lib::{
+    O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, STDOUT_FILENO, close, open, write_str, write_u64,
+};
 
 use sunset::{KeyType, SignKey};
 
-const HOST_KEY_PATH: &[u8] = b"/etc/ssh/ssh_host_ed25519_key\0";
-const HOST_KEY_PUB_PATH: &[u8] = b"/etc/ssh/ssh_host_ed25519_key.pub\0";
+// Stored on a writable tmpfs, NOT /etc/ssh: on a bare-metal boot with no data
+// disk the root is a read-only ramdisk, so /etc/ssh cannot be created and the
+// host-key write failed — which aborted the SSH key exchange right after the
+// TCP connection established. The (cheap) Ed25519 key is regenerated each boot.
+//
+// Two candidates are tried in order. **Flat paths, no subdirectory** — creating
+// `/run/ssh/` failed on the bare-metal VFS (nested mkdir / `/run` is mode 0755
+// root-only), which is what left sshd printing "cannot write host key". `/tmp`
+// is mode 1777 (world-writable), so the fallback always succeeds; the key file
+// itself is created mode 0600 so it is never world-readable wherever it lands.
+const HOST_KEY_PATHS: [&[u8]; 2] = [
+    b"/run/ssh_host_ed25519_key\0",
+    b"/tmp/ssh_host_ed25519_key\0",
+];
+const HOST_KEY_PUB_PATHS: [&[u8]; 2] = [
+    b"/run/ssh_host_ed25519_key.pub\0",
+    b"/tmp/ssh_host_ed25519_key.pub\0",
+];
 
 /// A wrapper around sunset's SignKey for the host key.
 pub struct HostKey {
@@ -28,9 +46,12 @@ pub fn load_or_generate() -> Result<HostKey, ()> {
     }
 }
 
-/// B.3: Load existing host key from /etc/ssh/ssh_host_ed25519_key.
+/// B.3: Load an existing host key from the first candidate path that has one.
 fn load_host_key() -> Result<HostKey, ()> {
-    let seed = read_seed_file(HOST_KEY_PATH)?;
+    let seed = HOST_KEY_PATHS
+        .iter()
+        .find_map(|p| read_seed_file(p).ok())
+        .ok_or(())?;
 
     // Reconstruct the dalek SigningKey from the seed.
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
@@ -39,7 +60,10 @@ fn load_host_key() -> Result<HostKey, ()> {
     })
 }
 
-/// B.2: Generate a new Ed25519 host key and save to disk.
+/// B.2: Generate a new Ed25519 host key and save it to the first writable
+/// candidate path. Returns the key even if every write fails — an ephemeral
+/// in-memory key still lets SSH complete this boot — but logs the failing errno
+/// so a persistent write problem is attributable.
 fn generate_host_key() -> Result<HostKey, ()> {
     let key = SignKey::generate(KeyType::Ed25519, None).map_err(|_| ())?;
 
@@ -49,38 +73,64 @@ fn generate_host_key() -> Result<HostKey, ()> {
         _ => return Err(()),
     };
 
-    // Write private key seed (mode 0600).
-    let fd = open(HOST_KEY_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0o600);
-    if fd < 0 {
-        write_str(STDOUT_FILENO, "sshd: cannot write host key\n");
-        return Err(());
-    }
-    let n = syscall_lib::write(fd as i32, &seed);
-    close(fd as i32);
-    if n != 32 {
-        write_str(STDOUT_FILENO, "sshd: short write on host key\n");
-        syscall_lib::unlink(HOST_KEY_PATH);
-        return Err(());
+    // Try each candidate path until the seed is persisted. The key is usable
+    // regardless (it lives in memory); persistence only lets a reconnect reuse
+    // the same key instead of regenerating.
+    let mut written_idx: Option<usize> = None;
+    for (idx, path) in HOST_KEY_PATHS.iter().enumerate() {
+        let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o600);
+        if fd < 0 {
+            write_str(STDOUT_FILENO, "sshd: host key write failed errno=");
+            write_u64(STDOUT_FILENO, (-fd) as u64);
+            write_str(STDOUT_FILENO, " path=");
+            write_path(path);
+            write_str(STDOUT_FILENO, "\n");
+            continue;
+        }
+        let n = syscall_lib::write(fd as i32, &seed);
+        close(fd as i32);
+        if n != 32 {
+            write_str(STDOUT_FILENO, "sshd: short write on host key\n");
+            syscall_lib::unlink(path);
+            continue;
+        }
+        written_idx = Some(idx);
+        break;
     }
 
-    // Write public key (mode 0644).
+    // Write the matching public key (mode 0644) next to the private seed.
     let pubkey_bytes = match &key {
         SignKey::Ed25519(k) => k.verifying_key().to_bytes(),
         _ => return Err(()),
     };
-    let fd = open(HOST_KEY_PUB_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0o644);
-    if fd >= 0 {
-        let n = syscall_lib::write(fd as i32, &pubkey_bytes);
-        close(fd as i32);
-        if n != 32 {
-            syscall_lib::unlink(HOST_KEY_PUB_PATH);
+    if let Some(idx) = written_idx {
+        let fd = open(HOST_KEY_PUB_PATHS[idx], O_WRONLY | O_CREAT | O_TRUNC, 0o644);
+        if fd >= 0 {
+            let n = syscall_lib::write(fd as i32, &pubkey_bytes);
+            close(fd as i32);
+            if n != 32 {
+                syscall_lib::unlink(HOST_KEY_PUB_PATHS[idx]);
+            }
         }
+    } else {
+        // Every candidate failed — proceed with the in-memory key so SSH still
+        // works this boot, but make the degraded state explicit.
+        write_str(
+            STDOUT_FILENO,
+            "sshd: WARNING host key not persisted — using ephemeral in-memory key\n",
+        );
     }
 
     // Print fingerprint (SHA-256 of public key) to log.
     print_fingerprint(&pubkey_bytes);
 
     Ok(HostKey { key })
+}
+
+/// Write a NUL-terminated path literal to serial (without the trailing NUL).
+fn write_path(path: &[u8]) {
+    let end = path.iter().position(|&b| b == 0).unwrap_or(path.len());
+    syscall_lib::write(STDOUT_FILENO, &path[..end]);
 }
 
 /// Print the SHA-256 fingerprint of the public key to serial.

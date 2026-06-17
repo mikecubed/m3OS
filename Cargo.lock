@@ -2418,6 +2418,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ure_driver"
+version = "0.96.0"
+dependencies = [
+ "driver_runtime",
+ "kernel-core",
+ "syscall-lib",
+ "usb-core",
+]
+
+[[package]]
 name = "usb-core"
 version = "0.78.2"
 dependencies = [
