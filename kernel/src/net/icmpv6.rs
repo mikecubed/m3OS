@@ -35,15 +35,13 @@ pub static PING6_REPLY_TICK: AtomicU64 = AtomicU64::new(0);
 pub static PING6_EXPECTED_ID: AtomicU16 = AtomicU16::new(0);
 pub static PING6_EXPECTED_SEQ: AtomicU16 = AtomicU16::new(0);
 
-/// Synthesize a ping6 echo reply locally without touching the wire — used by the
-/// `::1` (and self-addressed) loopback short-circuit, since m3OS has no routed
-/// loopback interface (B.1). Marks the expected reply as received immediately.
-pub fn loopback_echo_reply(id: u16, seq: u16) {
+/// Arm the ping6 reply tracker for an outgoing echo request (id+seq). The reply
+/// — whether it returns over the wire or via the `ipv6::send_from` internal
+/// loopback for a self/`::1` destination — is matched in the ECHO_REPLY arm.
+pub fn arm_ping6(id: u16, seq: u16) {
+    PING6_REPLY_RECEIVED.store(false, Ordering::Release);
     PING6_EXPECTED_ID.store(id, Ordering::Release);
     PING6_EXPECTED_SEQ.store(seq, Ordering::Release);
-    let tick = crate::arch::x86_64::interrupts::tick_count();
-    PING6_REPLY_TICK.store(tick, Ordering::Release);
-    PING6_REPLY_RECEIVED.store(true, Ordering::Release);
 }
 
 /// Handle an inbound ICMPv6 message (dispatched from `ipv6::handle_ipv6`).

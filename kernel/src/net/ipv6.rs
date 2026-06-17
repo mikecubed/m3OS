@@ -47,9 +47,33 @@ pub fn send(dst: Ipv6Addr, next_header: u8, payload: &[u8]) {
     send_from(src, dst, next_header, payload);
 }
 
+/// True if `dst` is `::1` or one of the addresses this host assigned to itself.
+fn is_self_address(dst: &Ipv6Addr) -> bool {
+    kernel_core::types::ipv6_is_loopback(dst)
+        || config::our_ip_v6().as_ref() == Some(dst)
+        || config::link_local_v6().as_ref() == Some(dst)
+}
+
 /// Send an IPv6 packet from an explicit source address (e.g. an ICMPv6 echo
 /// reply sourced from the pinged address).
 pub fn send_from(src: Ipv6Addr, dst: Ipv6Addr, next_header: u8, payload: &[u8]) {
+    // Internal loopback: m3OS has no routed `lo`, so a packet addressed to `::1`
+    // or one of our own addresses is fed straight back into the RX path rather
+    // than put on the wire (B.1). This makes `ping6 ::1` and echo-to-self travel
+    // the real `handle_icmpv6` request→reply path. A small depth guard prevents
+    // any pathological self-send recursion.
+    if is_self_address(&dst) {
+        use core::sync::atomic::{AtomicU8, Ordering};
+        static LOOPBACK_DEPTH: AtomicU8 = AtomicU8::new(0);
+        if LOOPBACK_DEPTH.fetch_add(1, Ordering::Relaxed) < 4 {
+            let our_mac = super::mac_address().unwrap_or([0; 6]);
+            let ip_pkt = ipv6_core::build(src, dst, next_header, payload);
+            handle_ipv6(&ip_pkt, our_mac);
+        }
+        LOOPBACK_DEPTH.fetch_sub(1, Ordering::Relaxed);
+        return;
+    }
+
     let our_mac = match super::mac_address() {
         Some(m) => m,
         None => return,

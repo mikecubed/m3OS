@@ -17993,6 +17993,48 @@ fn sockaddr_to_user(addr_ptr: u64, ip: [u8; 4], port: u16) -> Result<(), u64> {
     Ok(())
 }
 
+/// Phase 91 — read a `sockaddr_in6` (28 bytes) from userspace → (addr, port).
+/// Family must be AF_INET6 (10). Port is network-order; `sin6_addr` is the
+/// 16 address octets at offset 8.
+fn sockaddr_from_user6(addr_ptr: u64) -> Result<([u8; 16], u16), u64> {
+    let mut buf = [0u8; 28]; // sizeof(sockaddr_in6)
+    if UserSliceRo::new(addr_ptr, buf.len())
+        .and_then(|s| s.copy_to_kernel(&mut buf))
+        .is_err()
+    {
+        return Err(NEG_EFAULT);
+    }
+    let family = u16::from_ne_bytes([buf[0], buf[1]]);
+    if family != 10 {
+        // AF_INET6
+        return Err(NEG_EINVAL);
+    }
+    let port = u16::from_be_bytes([buf[2], buf[3]]);
+    let mut addr = [0u8; 16];
+    addr.copy_from_slice(&buf[8..24]);
+    Ok((addr, port))
+}
+
+/// Phase 91 — write a `sockaddr_in6` (28 bytes) to userspace.
+fn sockaddr_to_user6(addr_ptr: u64, addr: [u8; 16], port: u16) -> Result<(), u64> {
+    if addr_ptr == 0 {
+        return Ok(());
+    }
+    let mut buf = [0u8; 28];
+    buf[0..2].copy_from_slice(&10u16.to_ne_bytes()); // AF_INET6
+    buf[2..4].copy_from_slice(&port.to_be_bytes()); // sin6_port (network order)
+    // sin6_flowinfo (4) @ offset 4 stays zero.
+    buf[8..24].copy_from_slice(&addr); // sin6_addr
+    // sin6_scope_id (4) @ offset 24 stays zero.
+    if UserSliceWo::new(addr_ptr, buf.len())
+        .and_then(|s| s.copy_from_kernel(&buf))
+        .is_err()
+    {
+        return Err(NEG_EFAULT);
+    }
+    Ok(())
+}
+
 /// Helper: look up socket handle from fd. Returns (handle, socket_kind, protocol).
 fn socket_handle_from_fd(
     fd: u64,
@@ -18722,13 +18764,16 @@ pub(super) fn sys_socket(domain: u64, socktype: u64, protocol: u64) -> u64 {
     use crate::net::{SocketKind, SocketProtocol};
     const AF_UNIX: u64 = 1;
     const AF_INET: u64 = 2;
+    // Phase 91 — AF_INET6 slots in as a third family branch beside AF_UNIX/INET.
+    const AF_INET6: u64 = 10;
 
     if domain == AF_UNIX {
         return sys_socket_unix(socktype);
     }
-    if domain != AF_INET {
+    if domain != AF_INET && domain != AF_INET6 {
         return NEG_EAFNOSUPPORT;
     }
+    let is_v6 = domain == AF_INET6;
     const SOCK_NONBLOCK: u64 = 0x800;
     const SOCK_CLOEXEC: u64 = 0x80000;
     let sock_flags = socktype & (SOCK_CLOEXEC | SOCK_NONBLOCK);
@@ -18736,9 +18781,11 @@ pub(super) fn sys_socket(domain: u64, socktype: u64, protocol: u64) -> u64 {
     let (kind, proto) = match socktype_raw {
         1 => (SocketKind::Stream, SocketProtocol::Tcp), // SOCK_STREAM
         2 => {
-            // SOCK_DGRAM — protocol determines UDP vs ICMP
-            if protocol == 1 {
-                (SocketKind::Dgram, SocketProtocol::Icmp) // IPPROTO_ICMP
+            // SOCK_DGRAM — protocol determines UDP vs ICMP. IPPROTO_ICMP (1, v4)
+            // and IPPROTO_ICMPV6 (58, v6) both map to the Icmp protocol; the
+            // socket's `family` field distinguishes the wire format.
+            if protocol == 1 || protocol == 58 {
+                (SocketKind::Dgram, SocketProtocol::Icmp)
             } else {
                 (SocketKind::Dgram, SocketProtocol::Udp) // default to UDP
             }
@@ -18749,6 +18796,9 @@ pub(super) fn sys_socket(domain: u64, socktype: u64, protocol: u64) -> u64 {
         Some(h) => h,
         None => return NEG_ENFILE,
     };
+    if is_v6 {
+        crate::net::with_socket_mut(handle, |s| s.family = 10);
+    }
     // Phase 54 Track C: notify net_udp service about new UDP socket.
     if proto == SocketProtocol::Udp && net_udp_service_available() {
         let err = net_udp_service_create(handle);
@@ -18784,6 +18834,30 @@ pub(super) fn sys_bind(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
         Ok(v) => v,
         Err(e) => return e,
     };
+    let family = crate::net::with_socket(handle, |s| s.family).unwrap_or(2);
+    if family == 10 {
+        // Phase 91 — AF_INET6 bind: 28-byte sockaddr_in6, v6 UDP port table.
+        if addr_len < 28 {
+            return NEG_EINVAL;
+        }
+        let (addr6, port) = match sockaddr_from_user6(addr_ptr) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        if matches!(proto, crate::net::SocketProtocol::Udp) && !crate::net::udp::bind_v6(port) {
+            return NEG_EADDRINUSE;
+        }
+        crate::net::with_socket_mut(handle, |s| {
+            s.local_addr6 = addr6;
+            s.local_port = port;
+            if matches!(proto, crate::net::SocketProtocol::Udp) {
+                s.udp_bound = true;
+            }
+            s.state = crate::net::SocketState::Bound;
+        });
+        let _ = kind;
+        return 0;
+    }
     if addr_len < 16 {
         return NEG_EINVAL;
     }
@@ -18849,6 +18923,27 @@ pub(super) fn sys_connect(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
         Ok(v) => v,
         Err(e) => return e,
     };
+    let family = crate::net::with_socket(handle, |s| s.family).unwrap_or(2);
+    if family == 10 {
+        // Phase 91 — AF_INET6 connect: store the peer (UDP/ICMPv6 record only;
+        // dual-stack TCP connect is the deferred opt-in arm).
+        if addr_len < 28 {
+            return NEG_EINVAL;
+        }
+        let (addr6, port) = match sockaddr_from_user6(addr_ptr) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        if matches!(proto, crate::net::SocketProtocol::Tcp) {
+            return NEG_EOPNOTSUPP;
+        }
+        crate::net::with_socket_mut(handle, |s| {
+            s.remote_addr6 = addr6;
+            s.remote_port = port;
+            s.state = crate::net::SocketState::Connected;
+        });
+        return 0;
+    }
     if addr_len < 16 {
         return NEG_EINVAL;
     }
@@ -19196,6 +19291,106 @@ pub(super) fn sys_accept4(fd: u64, addr_ptr: u64, addr_len_ptr: u64, flags: u64)
     result
 }
 
+/// Phase 91 — AF_INET6 send path (ICMPv6 echo + UDP over IPv6). TCP-over-IPv6 is
+/// the deferred opt-in arm (see `tcp::handle_tcp_v6`).
+fn sys_sendto_v6(
+    handle: crate::net::SocketHandle,
+    proto: crate::net::SocketProtocol,
+    data: &[u8],
+    addr_ptr: u64,
+    addr_len: u64,
+) -> u64 {
+    use crate::net::SocketProtocol;
+    // ENETUNREACH (101) — no usable IPv6 source address is configured yet.
+    const NEG_ENETUNREACH: u64 = (-101_i64) as u64;
+    // Destination: explicit sockaddr_in6, else the connected peer.
+    let (dst_addr, dst_port) = if addr_ptr != 0 {
+        if addr_len < 28 {
+            return NEG_EINVAL;
+        }
+        match sockaddr_from_user6(addr_ptr) {
+            Ok(v) => v,
+            Err(e) => return e,
+        }
+    } else {
+        match crate::net::with_socket(handle, |s| (s.remote_addr6, s.remote_port)) {
+            Some(v) => v,
+            None => return NEG_EBADF,
+        }
+    };
+
+    match proto {
+        SocketProtocol::Icmp => {
+            // Build an ICMPv6 Echo Request; id/seq are the first 4 payload bytes.
+            let (id, seq) = if data.len() >= 4 {
+                (
+                    u16::from_be_bytes([data[0], data[1]]),
+                    u16::from_be_bytes([data[2], data[3]]),
+                )
+            } else {
+                (1u16, 0u16)
+            };
+            let rest = [(id >> 8) as u8, id as u8, (seq >> 8) as u8, seq as u8];
+            let body: &[u8] = if data.len() > 4 {
+                &data[4..]
+            } else {
+                &[0xAB; 32]
+            };
+            crate::net::icmpv6::arm_ping6(id, seq);
+
+            // Source: for a self/`::1` destination use the destination itself so
+            // the checksum + internal loopback round-trips; otherwise our address.
+            let src = if kernel_core::types::ipv6_is_loopback(&dst_addr) {
+                dst_addr
+            } else {
+                match crate::net::config::our_ip_v6() {
+                    Some(s) => s,
+                    None => return NEG_ENETUNREACH,
+                }
+            };
+            let msg = kernel_core::net::icmpv6::build(
+                kernel_core::net::icmpv6::ICMPV6_ECHO_REQUEST,
+                0,
+                rest,
+                body,
+                src,
+                dst_addr,
+            );
+            crate::net::ipv6::send_from(src, dst_addr, kernel_core::net::ipv6::PROTO_ICMPV6, &msg);
+            data.len() as u64
+        }
+        SocketProtocol::Udp => {
+            let src = match crate::net::config::our_ip_v6() {
+                Some(s) => s,
+                None => return NEG_ENETUNREACH,
+            };
+            // Source port: the bound local port, or an ephemeral autobind.
+            let mut sport = crate::net::with_socket(handle, |s| s.local_port).unwrap_or(0);
+            if sport == 0 {
+                for _ in 0..1024u16 {
+                    let cand =
+                        0xC000u16 | (crate::arch::x86_64::interrupts::tick_count() as u16 & 0x3FFF);
+                    if crate::net::udp::bind_v6(cand) {
+                        sport = cand;
+                        break;
+                    }
+                }
+                if sport == 0 {
+                    return NEG_EAGAIN;
+                }
+                crate::net::with_socket_mut(handle, |s| {
+                    s.local_port = sport;
+                    s.udp_bound = true;
+                });
+            }
+            crate::net::udp::send_v6(src, dst_addr, dst_port, sport, data);
+            data.len() as u64
+        }
+        // Dual-stack TCP send is the deferred opt-in arm.
+        SocketProtocol::Tcp => NEG_EOPNOTSUPP,
+    }
+}
+
 /// sendto(fd, buf, len, flags, addr, addrlen) — syscall 44
 pub(super) fn sys_sendto(
     fd: u64,
@@ -19243,6 +19438,12 @@ pub(super) fn sys_sendto(
                 .is_err()
             {
                 return NEG_EFAULT;
+            }
+
+            // Phase 91 — AF_INET6 sockets take the v6 send path.
+            let family = crate::net::with_socket(handle, |s| s.family).unwrap_or(2);
+            if family == 10 {
+                return sys_sendto_v6(handle, proto, &tmp[..capped], addr_ptr, addr_len);
             }
 
             match proto {
@@ -19501,6 +19702,10 @@ pub(super) fn sys_recvfrom_socket(
             if shut_rd {
                 return 0; // EOF
             }
+            // Phase 91 — AF_INET6 sockets recv from the v6 path.
+            let family = crate::net::with_socket(handle, |s| s.family).unwrap_or(2);
+            let remote_addr6 =
+                crate::net::with_socket(handle, |s| s.remote_addr6).unwrap_or([0; 16]);
 
             // Validate addr_len if addr_ptr is provided
             if addr_ptr != 0 {
@@ -19573,6 +19778,44 @@ pub(super) fn sys_recvfrom_socket(
                         crate::task::yield_now();
                     }
                 }
+                crate::net::SocketProtocol::Udp if family == 10 => {
+                    // Phase 91 — AF_INET6 UDP recv from the v6 datagram queue.
+                    loop {
+                        if let Some(dgram) = crate::net::udp::recv_v6(local_port) {
+                            let n = dgram.data.len().min(capped);
+                            if UserSliceWo::new(buf_ptr, dgram.data[..n].len())
+                                .and_then(|s| s.copy_from_kernel(&dgram.data[..n]))
+                                .is_err()
+                            {
+                                return NEG_EFAULT;
+                            }
+                            if addr_ptr != 0 {
+                                if let Err(e) =
+                                    sockaddr_to_user6(addr_ptr, dgram.src_ip, dgram.src_port)
+                                {
+                                    return e;
+                                }
+                                if addr_len_ptr != 0 {
+                                    let len_buf = 28u32.to_ne_bytes();
+                                    if UserSliceWo::new(addr_len_ptr, len_buf.len())
+                                        .and_then(|s| s.copy_from_kernel(&len_buf))
+                                        .is_err()
+                                    {
+                                        return NEG_EFAULT;
+                                    }
+                                }
+                            }
+                            return n as u64;
+                        }
+                        if nonblock {
+                            return NEG_EAGAIN;
+                        }
+                        if has_pending_signal() {
+                            return NEG_EINTR;
+                        }
+                        crate::task::yield_now();
+                    }
+                }
                 crate::net::SocketProtocol::Udp => {
                     // Phase 54 Track C: service validates which port to recv from.
                     let recv_port = if net_udp_service_available() {
@@ -19621,13 +19864,27 @@ pub(super) fn sys_recvfrom_socket(
                     }
                 }
                 crate::net::SocketProtocol::Icmp => {
-                    // Wait for ICMP echo reply
-                    use crate::net::icmp::{PING_REPLY_RECEIVED, PING_REPLY_TICK};
+                    // Wait for an ICMP(v6) echo reply. The v6 path tracks the
+                    // reply via the PING6_* atomics (set by `icmpv6` on a wire
+                    // reply or the internal loopback for `::1`/self).
                     use core::sync::atomic::Ordering;
+                    let is_v6 = family == 10;
                     loop {
-                        if PING_REPLY_RECEIVED.load(Ordering::Acquire) {
-                            PING_REPLY_RECEIVED.store(false, Ordering::Release);
-                            let tick = PING_REPLY_TICK.load(Ordering::Acquire);
+                        let got = if is_v6 {
+                            crate::net::icmpv6::PING6_REPLY_RECEIVED.load(Ordering::Acquire)
+                        } else {
+                            crate::net::icmp::PING_REPLY_RECEIVED.load(Ordering::Acquire)
+                        };
+                        if got {
+                            let tick = if is_v6 {
+                                crate::net::icmpv6::PING6_REPLY_RECEIVED
+                                    .store(false, Ordering::Release);
+                                crate::net::icmpv6::PING6_REPLY_TICK.load(Ordering::Acquire)
+                            } else {
+                                crate::net::icmp::PING_REPLY_RECEIVED
+                                    .store(false, Ordering::Release);
+                                crate::net::icmp::PING_REPLY_TICK.load(Ordering::Acquire)
+                            };
                             // Write tick as 8-byte LE to userspace as reply data
                             let tick_bytes = tick.to_le_bytes();
                             let n = tick_bytes.len().min(capped);
@@ -19638,11 +19895,17 @@ pub(super) fn sys_recvfrom_socket(
                                 return NEG_EFAULT;
                             }
                             if addr_ptr != 0 {
-                                if let Err(e) = sockaddr_to_user(addr_ptr, remote_addr, 0) {
+                                let r = if is_v6 {
+                                    sockaddr_to_user6(addr_ptr, remote_addr6, 0)
+                                } else {
+                                    sockaddr_to_user(addr_ptr, remote_addr, 0)
+                                };
+                                if let Err(e) = r {
                                     return e;
                                 }
                                 if addr_len_ptr != 0 {
-                                    let len_buf = 16u32.to_ne_bytes();
+                                    let reported = if is_v6 { 28u32 } else { 16u32 };
+                                    let len_buf = reported.to_ne_bytes();
                                     if UserSliceWo::new(addr_len_ptr, len_buf.len())
                                         .and_then(|s| s.copy_from_kernel(&len_buf))
                                         .is_err()
