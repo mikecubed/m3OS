@@ -7,11 +7,15 @@
 
 pub mod arp;
 pub mod config;
+pub mod dhcpv6;
 #[allow(dead_code)]
 pub mod dispatch;
 pub mod ethernet;
 pub mod icmp;
+pub mod icmpv6;
 pub mod ipv4;
+pub mod ipv6;
+pub mod ndp;
 pub mod remote;
 pub mod tcp;
 pub mod udp;
@@ -192,6 +196,13 @@ pub struct SocketEntry {
     pub local_port: u16,
     pub remote_addr: [u8; 4],
     pub remote_port: u16,
+    /// Address family (Phase 91): `AF_INET` (2, default) or `AF_INET6` (10).
+    /// IPv4 sockets leave the `*_addr6` fields zeroed.
+    pub family: u8,
+    /// IPv6 local/remote addresses for `AF_INET6` sockets. The `protocol`,
+    /// `state`, port, and TCP/UDP-binding fields stay family-agnostic.
+    pub local_addr6: [u8; 16],
+    pub remote_addr6: [u8; 16],
     pub state: SocketState,
     /// Index into TCP connection table (for Stream sockets).
     pub tcp_slot: Option<usize>,
@@ -259,6 +270,9 @@ pub fn alloc_socket(kind: SocketKind, protocol: SocketProtocol) -> Option<Socket
                 local_port: 0,
                 remote_addr: [0; 4],
                 remote_port: 0,
+                family: 2, // AF_INET by default; the AF_INET6 path sets 10
+                local_addr6: [0; 16],
+                remote_addr6: [0; 16],
                 state: SocketState::Unbound,
                 tcp_slot: None,
                 udp_bound: false,

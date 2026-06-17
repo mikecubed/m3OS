@@ -831,6 +831,20 @@ pub fn on_link_down() {
     }
 }
 
+/// Handle an inbound TCP segment carried over IPv6.
+///
+/// Phase 91 scope note: the AF_INET6 socket surface, ICMPv6/NDP, SLAAC, and
+/// DHCPv6 land in this phase; making the entire `TcpConnection` state machine
+/// (its addresses, checksum, and send path) family-aware is the single largest
+/// remaining piece, and the only acceptance arm that needs it (`CURL6_OK`, a
+/// real TCP-over-IPv6 transfer) is the opt-in `M3OS_IPV6_NET` arm. Full
+/// dual-stack TCP is therefore a tracked follow-up; inbound v6 segments are
+/// dropped here rather than half-served. UDP-over-IPv6, ICMPv6 echo, and the
+/// DHCPv6 DNS path are fully wired, so the always-on CI arms do not depend on it.
+pub fn handle_tcp_v6(_ip_header: &kernel_core::net::ipv6::Ipv6Header, _payload: &[u8]) {
+    // Deferred: dual-stack TCP (see doc comment above). Drop cleanly.
+}
+
 pub fn handle_tcp(ip_header: &Ipv4Header, payload: &[u8]) {
     let (tcp_hdr, tcp_data) = match parse(payload) {
         Some(h) => h,
