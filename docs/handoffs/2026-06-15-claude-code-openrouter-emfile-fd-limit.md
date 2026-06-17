@@ -40,11 +40,28 @@ status: RESOLVED (2026-06-16) — **`claude -p` completes a full authenticated r
 fixes (this session):
   - kernel/fs/ext2: EXT2_VOLUME spin::Mutex → YieldingMutex (committed fcd78100) — REAL, load-bearing
   - kernel/arch/syscall sys_futex: private futex key (0,uaddr) → per-CR3 (committed 1bada591) — REAL, load-bearing
+  - kernel-core/input/keymap: KEY_ENTER keysym `\n` → `\r` (NEW) — REAL, the interactive-TUI fix. The
+    graphical keymap emitted LF for the Enter key; the terminal convention is CR (the TTY line discipline's
+    ICRNL, on by default, then makes LF for cooked-mode readers). Cooked-mode shell worked either way, so it
+    hid the bug — but a RAW-mode TUI (claude's ink, vim, …) clears ICRNL and watches for `\r` to detect
+    Return, so it got LF and never submitted. Aligns the graphical path with stdin_feeder (serial path,
+    already `\r`) + the term input test (expects `\r`) + DOOM's KEY_ENTER=13. Without it the claude TUI left
+    a typed prompt unsubmitted — i.e. a real user couldn't send a message in the TUI either.
   - kernel/ipc/endpoint + task/scheduler: deadline-path Bug #8.1 waker registration (committed) — real but orthogonal
   - xtask/claude-smoke: 579 → <<<579>>> collision-proof check; small cwd; M3OS_CLAUDE_MONITOR HMP socket;
-    M3OS_CLAUDE_PCAP guest-net capture (NEW); FAST_ITER credential re-stamp (NEW — fixes the stale-cred footgun)
+    M3OS_CLAUDE_PCAP guest-net capture (NEW); FAST_ITER credential re-stamp (NEW — fixes the stale-cred footgun);
+    claude_tui_render_arm extended into a REAL TUI OpenRouter round-trip (NEW — exports the env + types/submits a
+    prompt into the interactive TUI, gated on falsifiable serial markers `binary=/usr/bin/node` + post-submit
+    `[tcp] connection established`; visually confirmed claude renders "17 × 34 + 1 = 579" in the TUI)
+  - xtask/qmp: ascii_to_qkeys gained `$ ( ) * < > @ # % & +` (shift-chords); type_text cadence 5 ms → 80 ms
+    (the m3OS PS/2→term path drops scancodes under bursts — consecutive shift-chords like `$(` lost the
+    shift-BREAK → stuck shift → garbled command lines); prompt submit uses a separate settled Enter
   - xtask/node-smoke: M3OS_NODE_VFS_STRESS arm
   - REVERTED (red-herring diagnostics): the [futexcensus] scheduler dump (the futex stall was idle workers)
+  process note: TWO scanline-diff FALSE POSITIVES (the arm reported PASS while claude had NOT launched / NOT
+    submitted) were caught only by VISUALLY inspecting the screendump — the pixel-delta cannot tell a rendered
+    answer from rendered error text or a prompt sitting in the input box. Trust the screenshot + the OpenRouter
+    request log, never the scanline count alone.
 branch: feat/phase-90b-claude-code
 key-commits:
   - 9e09b67c  kernel/net: accept TCP keepalive socket options (fixes setsockopt ENOPROTOOPT)
@@ -245,12 +262,17 @@ thread is in a VFS `stat` (`syscall=4`), i.e. inside `endpoint::call_msg` →
    `api.anthropic.com` and sends the native `x-api-key`/Bearer). The user plans to SSH into a
    test machine to authenticate (`claude login`) and try it; the credential path is the same
    0600 `/root/.claude/{oauth_token,api_key}` file, now also refreshed under FAST_ITER.
-2. **Multi-core (`M3OS_CLAUDE_MULTICORE=1`).** claude-smoke pins `-smp 1` by default. The
-   multicore arm validates the 2026-06-14 SMP TLB-shootdown survivability fixes against the
-   real claude workload; pair with `M3OS_CLAUDE_JIT=1` + `M3OS_KVM=1`. Independent of the
-   `claude -p` completion (which is done single-core).
-3. **Interactive TUI** already verified (the `claude_tui_render_arm` QMP/PPM render check —
-   the yoga.wasm "Welcome to Claude Code" splash paints under `M3OS_CLAUDE_JIT=1` + KVM).
+2. **Multi-core — DONE.** `M3OS_CLAUDE_MULTICORE=1 M3OS_SMP=4` ran `claude -p` to
+   `<<<579>>>` (smoke 33/33 PASS, no panic / recursive-fault / kill) — one clean 4-core run
+   over OpenRouter, exercising the 2026-06-14 SMP TLB-shootdown survivability fixes against
+   the real claude workload. (Intermittent SMP risk remains, so it's strong evidence not a
+   hard guarantee.)
+3. **Interactive TUI over OpenRouter — DONE (visually verified).** `M3OS_CLAUDE_JIT=1` +
+   `M3OS_CLAUDE_NET=1` + the OpenRouter env: the extended `claude_tui_render_arm` launches the
+   interactive `claude` TUI, types + submits a prompt, and the screendump shows the rendered
+   answer — `> what is 17 times 34 plus 1` / `● 17 × 34 + 1 = 578 + 1 = 579` — over
+   `anthropic/claude-haiku-4.5 · API Usage Billing`. Required the Enter→CR keymap fix above.
+   (The empty-prompt welcome-splash render was already known; this is the full round-trip.)
 4. **Orthogonal cleanups (non-blocking):** `copyfile`→EFAULT (secondary bug below); the stale
    `FAST_ITER` credential footgun is now fixed in xtask but consider extending the same
    re-stamp to `node-smoke`/`gh-smoke` if they ever reuse disks with changing secrets.

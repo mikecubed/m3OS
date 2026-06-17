@@ -239,14 +239,22 @@ impl QmpClient {
                 "send-key",
                 json!({
                     "keys": key_objs,
-                    "hold-time": 20,
+                    "hold-time": 30,
                 }),
             )?;
-            // Brief gap between keys so the kbd_server's scancode
-            // queue and the input dispatcher's event queue don't
-            // saturate. 5 ms is well below human typing speed and
-            // well above QEMU's per-key dispatch latency.
-            std::thread::sleep(Duration::from_millis(5));
+            // Gap between keys. The m3OS graphical input path
+            // (PS/2 controller's 1-byte output buffer → kbd_server →
+            // display_server → term → PTY) RE-RENDERS a glyph per
+            // keystroke; at a 5 ms gap a burst of scancodes (especially
+            // the 4-scancode make/break of two CONSECUTIVE shift-chords
+            // like `$(`) overruns the controller's single-byte buffer and
+            // a shift-BREAK is lost → stuck shift → the rest of the line
+            // corrupts (observed garbling `claude` into `CLAUDE` etc.).
+            // 80 ms gives the guest time to drain each scancode before the
+            // next, which empirically types long `export FOO="$(cat …)"`
+            // command lines + a prompt into the claude TUI without drops.
+            // Cost to the short less/htop probe commands is ~1–3 s — fine.
+            std::thread::sleep(Duration::from_millis(80));
         }
         Ok(())
     }
@@ -347,6 +355,21 @@ pub fn ascii_to_qkeys(ch: char) -> Option<Vec<&'static str>> {
         '"' => Some(vec!["shift", "apostrophe"]),
         '?' => Some(vec!["shift", "slash"]),
         '!' => Some(vec!["shift", "1"]),
+        // Shell + prompt punctuation needed to type an `export FOO="$(cat …)"`
+        // command and a `<<<NUMBER>>>`-style prompt over QMP (the claude-TUI
+        // OpenRouter round-trip arm). Command substitution `$(cat …)` keeps the
+        // credential off the captured framebuffer — only `$(cat path)` is typed.
+        '$' => Some(vec!["shift", "4"]),
+        '(' => Some(vec!["shift", "9"]),
+        ')' => Some(vec!["shift", "0"]),
+        '*' => Some(vec!["shift", "8"]),
+        '<' => Some(vec!["shift", "comma"]),
+        '>' => Some(vec!["shift", "dot"]),
+        '@' => Some(vec!["shift", "2"]),
+        '#' => Some(vec!["shift", "3"]),
+        '%' => Some(vec!["shift", "5"]),
+        '&' => Some(vec!["shift", "7"]),
+        '+' => Some(vec!["shift", "equal"]),
         _ => None,
     }
 }
@@ -418,9 +441,22 @@ mod tests {
     }
 
     #[test]
+    fn shell_and_prompt_punctuation_carry_shift() {
+        // The `export FOO="$(cat path)"` + `<<<NUMBER>>>` set used by the
+        // claude-TUI OpenRouter round-trip arm.
+        assert_eq!(ascii_to_qkeys('$'), Some(vec!["shift", "4"]));
+        assert_eq!(ascii_to_qkeys('('), Some(vec!["shift", "9"]));
+        assert_eq!(ascii_to_qkeys(')'), Some(vec!["shift", "0"]));
+        assert_eq!(ascii_to_qkeys('*'), Some(vec!["shift", "8"]));
+        assert_eq!(ascii_to_qkeys('<'), Some(vec!["shift", "comma"]));
+        assert_eq!(ascii_to_qkeys('>'), Some(vec!["shift", "dot"]));
+    }
+
+    #[test]
     fn unknown_ascii_returns_none() {
-        assert_eq!(ascii_to_qkeys('@'), None);
-        assert_eq!(ascii_to_qkeys('#'), None);
+        // Backslash and backtick remain unmapped (not needed by any arm).
+        assert_eq!(ascii_to_qkeys('\\'), None);
+        assert_eq!(ascii_to_qkeys('`'), None);
     }
 
     #[test]

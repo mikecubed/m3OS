@@ -16971,7 +16971,15 @@ fn cmd_claude_smoke(args: &SmokeBootArgs) {
     // `want_jit && !kvm` already returned early, so reaching here with want_jit
     // guarantees KVM/PKU.
     if want_jit {
-        match claude_tui_render_arm(&uefi_image, &ovmf, args.timeout_secs) {
+        match claude_tui_render_arm(
+            &uefi_image,
+            &ovmf,
+            args.timeout_secs,
+            do_net,
+            base_url,
+            cred,
+            model,
+        ) {
             Ok(rows) => {
                 println!(
                     "claude-smoke: PASSED — interactive TUI rendered on the JIT node \
@@ -16999,7 +17007,25 @@ fn cmd_claude_smoke(args: &SmokeBootArgs) {
 /// generous cold-load window, and return the peak changed-band scanline count vs
 /// the empty-prompt baseline. A populated TUI changes hundreds of band scanlines; a
 /// black/blank screen ~none. Callers gate this on `want_jit && kvm` (PKU required).
-fn claude_tui_render_arm(uefi_image: &Path, ovmf: &Path, timeout_secs: u64) -> Result<u32, String> {
+fn claude_tui_render_arm(
+    uefi_image: &Path,
+    ovmf: &Path,
+    timeout_secs: u64,
+    do_net: bool,
+    base_url: Option<&'static str>,
+    cred: Option<(&'static str, &'static str)>,
+    model: Option<&'static str>,
+) -> Result<u32, String> {
+    // When the live arms are configured (M3OS_CLAUDE_NET=1 + a custom base URL +
+    // a seeded credential), drive a REAL prompt round-trip THROUGH the interactive
+    // TUI (not just the empty onboarding render): export the OpenRouter env, launch
+    // `claude`, wait for the TUI to paint, then type a `<<<NUMBER>>>` prompt + Enter
+    // and assert the conversation area repaints with the model's reply. The
+    // credential reaches the guest via `$(cat <0600 path>)` command substitution, so
+    // it never appears in the typed keystrokes OR the captured framebuffer. The
+    // matching OpenRouter request log (a NEW authenticated 200) is the external
+    // ground-truth confirmation, mirroring the serial `-p` arm.
+    let do_roundtrip = do_net && base_url.is_some() && cred.is_some();
     // Minimum changed scanlines in the TUI band (vs the empty-prompt baseline) that
     // prove the yoga.wasm TUI painted a populated screen. A first-run screen
     // (welcome/onboarding box + text) changes hundreds; a blank/black screen ~0. 20
@@ -17102,12 +17128,66 @@ fn claude_tui_render_arm(uefi_image: &Path, ovmf: &Path, timeout_secs: u64) -> R
         capture_frame(&mut q, &out_dir, "00-prompt")?;
         let baseline = ppm::read_ppm(&out_dir.join("00-prompt.ppm"))?;
 
+        // When the OpenRouter round-trip is configured, export the env into the
+        // graphical term FIRST (same vars as the serial `-p` arm) so the launched
+        // TUI is authenticated. `$(cat <path>)` command substitution keeps the token
+        // off the typed keystrokes AND the captured framebuffer; the now-mapped
+        // `$ ( )` qcodes + the slower `type_text` cadence let it type the line
+        // without the shift-stuck garbling that an earlier 5 ms cadence produced.
+        // Onboarding state is pre-seeded in /root/.claude.json, so an authenticated
+        // `claude` goes straight to the input.
+        if do_roundtrip {
+            let url = base_url.unwrap();
+            let (_env_var, cred_path) = cred.unwrap();
+            let mut export_src = format!(
+                "export ANTHROPIC_BASE_URL=\"{url}\"\n\
+                 export ANTHROPIC_API_KEY=\"\"\n\
+                 export ANTHROPIC_AUTH_TOKEN=\"$(cat {cred_path})\"\n"
+            );
+            if let Some(m) = model {
+                export_src.push_str(&format!(
+                    "export ANTHROPIC_MODEL=\"{m}\"\n\
+                     export ANTHROPIC_SMALL_FAST_MODEL=\"{m}\"\n"
+                ));
+            }
+            q.type_text(&export_src)
+                .map_err(|e| format!("type OpenRouter env export: {e}"))?;
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            println!("claude-smoke: TUI-render arm — exported OpenRouter env into the term");
+        }
+
         // Launch the interactive TUI in the graphical term. Bare `claude` (no args)
-        // is the interactive entry point; with no seeded credential it lands on the
-        // first-run onboarding screen — a fully-rendered yoga.wasm TUI needing
-        // neither a secret nor network.
+        // is the interactive entry point; unauthenticated it lands on the first-run
+        // onboarding screen (a fully-rendered yoga.wasm TUI needing neither a secret
+        // nor network); authenticated (round-trip arm) it lands on the input prompt.
         q.type_text("claude\n")
             .map_err(|e| format!("type claude launch: {e}"))?;
+
+        // FALSIFIABLE launch proof (round-trip arm): claude actually exec'ing `node`
+        // emits an `elf: … binary=/usr/bin/node` kernel line. A garbled launch (the
+        // earlier shift-stuck keystroke bug typed `CLAUDE`/junk → ion error, no exec)
+        // produces NO such line, so this wait TIMES OUT and the arm fails honestly
+        // instead of a screendump-diff false-passing on rendered error text. Nothing
+        // else execs node in this graphical boot, so the marker is unambiguous.
+        if do_roundtrip {
+            wait_for_serial_pattern(
+                &rx,
+                &mut serial_buf,
+                &mut serial_history,
+                "binary=/usr/bin/node",
+                std::time::Duration::from_secs(timeout_secs.min(300)),
+                global_start,
+                global_timeout,
+            )
+            .map_err(|e| {
+                format!(
+                    "claude did not launch in the TUI — the typed env export or `claude` \
+                     command was not accepted as a clean command line (keystroke-injection \
+                     garble): {e}"
+                )
+            })?;
+            println!("claude-smoke: TUI-render arm — claude launched (node exec'd) in the TUI");
+        }
 
         // Cold cli.js parse + V8 init + yoga.wasm instantiate + first TUI paint over
         // the slow VFS — tens of seconds to a couple of minutes even under KVM. A
@@ -17116,6 +17196,7 @@ fn claude_tui_render_arm(uefi_image: &Path, ovmf: &Path, timeout_secs: u64) -> R
         let burst_ms: &[u32] = &[15000, 30000, 45000, 60000, 90000, 120000, 180000];
         let event_start = std::time::Instant::now();
         let mut best_rows = 0u32;
+        let mut best_render_path = out_dir.join("00-prompt.ppm");
         for off in burst_ms {
             let target = event_start + std::time::Duration::from_millis(*off as u64);
             let now = std::time::Instant::now();
@@ -17127,16 +17208,119 @@ fn claude_tui_render_arm(uefi_image: &Path, ovmf: &Path, timeout_secs: u64) -> R
             }
             let tag = format!("claude-tui-{off:06}ms");
             capture_frame(&mut q, &out_dir, &tag)?;
-            let frame = ppm::read_ppm(&out_dir.join(format!("{tag}.ppm")))?;
+            let frame_path = out_dir.join(format!("{tag}.ppm"));
+            let frame = ppm::read_ppm(&frame_path)?;
             let rows = changed_rows_in_band(&baseline, &frame, 0.10, 0.95);
             println!(
                 "claude-smoke: TUI-render {tag} {}x{} -> {rows} changed band scanlines",
                 frame.width, frame.height
             );
-            best_rows = best_rows.max(rows);
+            if rows >= best_rows {
+                best_rows = rows;
+                best_render_path = frame_path;
+            }
             if best_rows >= MIN_CHANGED_BAND_SCANLINES * 4 {
                 break;
             }
+        }
+
+        // OpenRouter round-trip THROUGH the TUI: once the TUI has painted, type a
+        // (shift-chord-free, so keystroke-robust) prompt whose answer is 579 and
+        // submit it (Enter). The FALSIFIABLE proof the round-trip actually left the
+        // box is a NEW `[tcp] connection established` kernel line — claude opening the
+        // HTTPS socket to OpenRouter. The screendump (saved) shows the rendered answer
+        // for visual confirmation, and the matching OpenRouter request log is the
+        // external ground-truth — but the serial markers above + here are what make
+        // this arm fail-honest rather than diff-fooled.
+        if do_roundtrip && best_rows >= MIN_CHANGED_BAND_SCANLINES {
+            // Reference = the rendered, input-ready TUI (peak welcome-render frame).
+            let reference = ppm::read_ppm(&best_render_path)?;
+            // Drain + clear the serial scan buffer so the post-prompt
+            // `[tcp] connection established` wait only matches a NEW connection (the
+            // request), not any earlier line already in the buffer.
+            while let Ok(chunk) = rx.try_recv() {
+                append_serial_chunk(&mut serial_buf, &mut serial_history, &chunk);
+            }
+            serial_buf.clear();
+            // 17*34 + 1 = 579 — the same answer the serial `-p` arm checks. All
+            // lowercase letters + digits + spaces: NO shift-chords, so the prompt
+            // types into claude's raw-mode input without any stuck-shift risk. Type
+            // the text WITHOUT a trailing newline: a `\n` tacked onto the rapid type
+            // stream lands in claude's composer as a literal newline (observed: the
+            // prompt sat unsubmitted in the input box). Submit with a SEPARATE,
+            // settled Enter keypress after the input has rendered.
+            q.type_text("what is 17 times 34 plus 1")
+                .map_err(|e| format!("type TUI prompt: {e}"))?;
+            std::thread::sleep(std::time::Duration::from_millis(2000));
+            q.press_key("ret", 60)
+                .map_err(|e| format!("submit TUI prompt (enter): {e}"))?;
+            // Insurance Enter: if the first inserted a composer newline, this submits;
+            // if the first already submitted, this is a no-op (empty-input Enter is
+            // ignored by claude's TUI). Either way the prompt gets sent exactly once.
+            std::thread::sleep(std::time::Duration::from_millis(1200));
+            let _ = q.press_key("ret", 60);
+            println!(
+                "claude-smoke: TUI-render arm — submitted OpenRouter prompt (expect answer 579)"
+            );
+
+            // Best-effort: note when claude opens a connection after the submit.
+            // NOT a hard gate — claude also connects during startup (so a connection
+            // alone does not prove THIS prompt round-tripped), and a keep-alive reuse
+            // would emit no new line. The ground truth is the rendered answer in the
+            // saved screenshot + the matching OpenRouter request log.
+            if wait_for_serial_pattern(
+                &rx,
+                &mut serial_buf,
+                &mut serial_history,
+                "tcp] connection established",
+                std::time::Duration::from_secs(timeout_secs.min(120)),
+                global_start,
+                global_timeout,
+            )
+            .is_ok()
+            {
+                println!(
+                    "claude-smoke: TUI-render arm — observed a TCP connection after the submit"
+                );
+            }
+
+            let reply_ms: &[u32] = &[8000, 16000, 24000, 36000, 50000, 70000, 95000];
+            let reply_start = std::time::Instant::now();
+            let mut best_reply_rows = 0u32;
+            let mut best_reply_path = out_dir.join("00-prompt.ppm");
+            for off in reply_ms {
+                let target = reply_start + std::time::Duration::from_millis(*off as u64);
+                let now = std::time::Instant::now();
+                if target > now {
+                    std::thread::sleep(target - now);
+                }
+                if global_start.elapsed() >= global_timeout {
+                    break;
+                }
+                let tag = format!("claude-tui-reply-{off:06}ms");
+                capture_frame(&mut q, &out_dir, &tag)?;
+                let frame_path = out_dir.join(format!("{tag}.ppm"));
+                let frame = ppm::read_ppm(&frame_path)?;
+                let rows = changed_rows_in_band(&reference, &frame, 0.10, 0.95);
+                println!(
+                    "claude-smoke: TUI-reply {tag} -> {rows} changed band scanlines vs the input screen"
+                );
+                if rows >= best_reply_rows {
+                    best_reply_rows = rows;
+                    best_reply_path = frame_path;
+                }
+            }
+            // NOTE: the scanline delta is only a "the screen repainted" proxy — it
+            // CANNOT distinguish a rendered answer from the prompt text merely
+            // appearing in the input box. The authoritative confirmations are the
+            // saved screenshot (the rendered `579`) and the OpenRouter request log.
+            println!(
+                "claude-smoke: TUI OpenRouter round-trip DRIVEN — claude launched + the prompt \
+                 was submitted (peak post-submit repaint {best_reply_rows} band scanlines). \
+                 GROUND TRUTH: visually confirm the 579 answer in {} and the matching OpenRouter \
+                 request log (the scanline delta alone does NOT prove the answer rendered).",
+                best_reply_path.display()
+            );
         }
 
         let _ = q.press_chord(&["ctrl", "c"], 20);

@@ -803,7 +803,17 @@ impl Keymap {
             KEY_SLASH => sym(b'/', b'?', shift),
 
             KEY_SPACE => KeySym(b' ' as u32),
-            KEY_ENTER => KeySym(b'\n' as u32),
+            // The Return/Enter key produces CARRIAGE RETURN (`\r`, 0x0d), the
+            // terminal convention — NOT line-feed. The TTY line discipline's
+            // ICRNL (on by default, `tty.rs`) translates `\r`→`\n` for cooked-mode
+            // readers (the shell), so an interactive shell is unchanged; a RAW-mode
+            // TUI (which clears ICRNL via cfmakeraw) receives the raw `\r` and its
+            // "Return" key detection fires. Emitting `\n` here instead skipped CR
+            // entirely: cooked-mode worked (shell submits on `\n`) but raw-mode apps
+            // expecting CR never saw Enter — e.g. Claude Code's ink TUI left a typed
+            // prompt unsubmitted. This now matches `stdin_feeder` (serial path, which
+            // already emits `\r`) and the `term` input test (which expects `\r`).
+            KEY_ENTER => KeySym(b'\r' as u32),
             KEY_BACKSPACE => KeySym(0x08),
             KEY_TAB => KeySym(b'\t' as u32),
             KEY_ESC => KeySym(0x1B),
