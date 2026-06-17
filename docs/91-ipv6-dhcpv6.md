@@ -241,10 +241,13 @@ silently passing.
 - **This phase introduces** the dual-stack base layer: the IPv6 header, ICMPv6,
   NDP neighbor resolution, SLAAC + a DHCPv6 client, AAAA DNS, and the AF_INET6
   socket surface — enough for link-local + global addressing, neighbor
-  discovery, UDP/ICMPv6 over IPv6, and `ping6`.
-- **It deliberately stops short of full dual-stack TCP-over-IPv6.**
-  `handle_tcp_v6` drops inbound v6 TCP segments, so a `curl http://[v6-literal]/`
-  (`CURL6_OK`) round-trip is a tracked follow-up, not part of this phase.
+  discovery, UDP/ICMPv6/**TCP** over IPv6, `ping6`, and dual-stack `getaddrinfo`.
+- **Full dual-stack TCP over IPv6 is included.** `handle_tcp_v6` + a
+  family-aware `TcpConnection` (v6 addresses, IPv6 pseudo-header checksum, v6
+  send path) complete a real three-way handshake + data transfer; the always-on
+  `ipv6-smoke` `tcp` case proves it over the `::1` internal loopback. The
+  `CURL6_OK` real-internet variant stays opt-in (it needs a routable *global*
+  v6 address, which requires a real router SLIRP does not provide).
 - **Address autoconfiguration is trust-on-first-use here.** This phase forms
   addresses from EUI-64 only and trusts SLAAC's uniqueness assumption — there is
   no **DAD** (Duplicate Address Detection) and no **privacy extensions**
@@ -268,11 +271,15 @@ silently passing.
 - **IPsec** (AH / ESP) for IPv6.
 - **IPv6 mobility, NPTv6, segment routing.**
 - **DHCPv6-PD** (prefix delegation, for routers).
-- **Full RFC 6724 + RFC 8305 (Happy Eyeballs)** connection racing — this phase
-  supplies inputs to musl's sorting subset only.
-- **Full dual-stack TCP-over-IPv6** (`CURL6_OK`): `handle_tcp_v6` currently drops
-  inbound v6 TCP segments.
-- **`sys_recvmsg_inet6`** — the v6 scatter/gather receive path.
+- **RFC 8305 (Happy Eyeballs)** connection racing — this phase supplies inputs
+  to musl's RFC 6724 sorting subset (now validated by `dns6-smoke`) but does not
+  race connections.
+- **`sys_recvmsg_inet6`** — the v6 scatter/gather receive path. Only needed for
+  DNS-*over-v6-transport*; AAAA resolution rides IPv4 UDP transport, so nothing
+  in this phase depends on it.
+- **Live SLAAC / DHCPv6 over a real router** and the `CURL6_OK` real-internet
+  TCP arm — implemented + host-tested, but live-validate only behind the opt-in
+  `M3OS_IPV6_LIVE` arm (QEMU's libslirp sends no RAs / runs no DHCPv6 server).
 - **The AAAA + RFC 6724 musl `getaddrinfo` arm** end-to-end validation.
 - **Live SLAAC / DHCPv6 validation** — needs a real IPv6 router; QEMU 8.2.2's
   SLIRP sends no Router Advertisements and runs no DHCPv6 server, so these run

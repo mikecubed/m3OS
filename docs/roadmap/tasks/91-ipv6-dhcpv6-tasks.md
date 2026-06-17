@@ -1,6 +1,6 @@
 # Phase 91 — IPv6 / DHCPv6: Task List
 
-**Status:** 🟢 Landed — always-on `ipv6-smoke` gate PASSES; SLAAC/DHCPv6 live arms + dual-stack TCP are tracked follow-ups (see Validation Status)
+**Status:** 🟢 Landed — always-on `ipv6-smoke` + `dns6-smoke` gates PASS (incl. full dual-stack TCP over IPv6 + RFC 6724); only the SLAAC/DHCPv6 *live-router* arms are opt-in (no SLIRP RA — see Validation Status)
 **Source Ref:** phase-91
 **Depends on:** Phase 16 (Network) ✅, Phase 77 (Pre-1.0 Correctness — TCP retransmission + DNS stub) ✅, Phase 83 (Release 1.0 Gate) ✅
 **Goal:** Layer a dual-stack IPv6 path onto the IPv4-only 1.0 network stack: an `Ipv6Addr` type + on-wire header framing, ICMPv6 + NDP (IPv6's ARP replacement), SLAAC + a DHCPv6 client, an `AF_INET6` / `sockaddr_in6` socket surface, AAAA resolution through the Phase 77 resolver with RFC 6724 selection, and a `ping6` tool — without regressing IPv4. Closes with the kernel version bump (`0.90.1` → `0.91.0`) and the Phase 91 learning doc (`docs/91-ipv6-dhcpv6.md`).
@@ -9,7 +9,7 @@
 
 > **Scope honesty.** Privacy extensions (RFC 4941), Duplicate Address Detection (DAD), MLD/MLDv2 multicast, IPsec, mobility/segment routing, DHCPv6-PD, and Happy Eyeballs (RFC 8305) are **out of scope** and tracked in the design doc's *Deferred Until Later* section. m3OS has **no general loopback interface**, so `ping6 ::1` is served by an ICMPv6 echo short-circuit, not a routed `lo` device (see B.1).
 
-> **Validation Status (as landed).** The always-on `cargo xtask ipv6-smoke` gate PASSES and validates **live on real frames**: link-local formation (`IPV6_ADDR_OK`), bidirectional **NDP** (the guest answers SLIRP's Neighbor Solicitation with an NA — `NDP_RESOLVE_OK`), AF_INET6 socket creation, `bind6`, the `ping6 ::1` ICMPv6 loopback round-trip through the real `handle_icmpv6` request→reply path (`IPV6_LOOPBACK_OK`/`ICMPV6_ECHO_OK`), and a **full dual-stack TCP-over-IPv6** connection — a listening `AF_INET6` socket + `connect6(::1)` complete the three-way handshake through the kernel's self-address internal loopback and a payload round-trips client→server (`IPV6_SMOKE:tcp:ok`), exercising the family-aware `TcpConnection`, the IPv6 pseudo-header checksum, and `handle_tcp_v6` end-to-end. All `kernel-core` `ipv6`/`icmpv6`/`ndp`/`dhcpv6`/`tcp`-v6 parse/build is host-tested (53 tests). **SLIRP limitation found:** QEMU 8.2.2's libslirp does NDP NS/NA but sends **no Router Advertisements** and runs **no DHCPv6 server** (packet-capture-confirmed); the guest's RS, DHCPv6 Information-Request, and DAD NS all go out correctly-formatted but get no reply. So **SLAAC global-address formation, the RA-driven default route, and the stateless/stateful DHCPv6 DNS lease are implemented + host-tested but live-validated only behind the opt-in `M3OS_IPV6_LIVE` arm** (a TAP + `radvd`/`dhcpd` host setup), mirroring the established `*_NET` opt-in pattern. The `CURL6_OK` real-internet TCP arm is likewise opt-in (needs a routable global v6 address, which requires the real router). **Remaining follow-ups:** `sys_recvmsg_inet6` + the AAAA/RFC-6724 musl `getaddrinfo` arm (Track D).
+> **Validation Status (as landed).** The always-on `cargo xtask ipv6-smoke` gate PASSES and validates **live on real frames**: link-local formation (`IPV6_ADDR_OK`), bidirectional **NDP** (the guest answers SLIRP's Neighbor Solicitation with an NA — `NDP_RESOLVE_OK`), AF_INET6 socket creation, `bind6`, the `ping6 ::1` ICMPv6 loopback round-trip through the real `handle_icmpv6` request→reply path (`IPV6_LOOPBACK_OK`/`ICMPV6_ECHO_OK`), and a **full dual-stack TCP-over-IPv6** connection — a listening `AF_INET6` socket + `connect6(::1)` complete the three-way handshake through the kernel's self-address internal loopback and a payload round-trips client→server (`IPV6_SMOKE:tcp:ok`), exercising the family-aware `TcpConnection`, the IPv6 pseudo-header checksum, and `handle_tcp_v6` end-to-end. All `kernel-core` `ipv6`/`icmpv6`/`ndp`/`dhcpv6`/`tcp`-v6 parse/build is host-tested (53 tests). **SLIRP limitation found:** QEMU 8.2.2's libslirp does NDP NS/NA but sends **no Router Advertisements** and runs **no DHCPv6 server** (packet-capture-confirmed); the guest's RS, DHCPv6 Information-Request, and DAD NS all go out correctly-formatted but get no reply. So **SLAAC global-address formation, the RA-driven default route, and the stateless/stateful DHCPv6 DNS lease are implemented + host-tested but live-validated only behind the opt-in `M3OS_IPV6_LIVE` arm** (a TAP + `radvd`/`dhcpd` host setup), mirroring the established `*_NET` opt-in pattern. The `CURL6_OK` real-internet TCP arm is likewise opt-in (needs a routable global v6 address, which requires the real router). **Track D** landed too: the always-on `dns6-smoke` (in the main `smoke-test` via the smoke-runner) asserts dual-stack `getaddrinfo("localhost", AF_UNSPEC)` returns both families ordered per RFC 6724 from the staged `/etc/hosts` (`RFC6724_OK`, CI-deterministic), with a soft real-internet AAAA probe (`M3OS_IPV6_NET`-class). **Remaining follow-up:** `sys_recvmsg_inet6` — only needed for DNS-*over-v6-transport*; AAAA resolution rides IPv4 UDP transport (record *type* AAAA, transport v4), so the existing v4 `recvmsg` validates the reply and no functionality depends on it.
 
 ## Track Layout
 
@@ -18,7 +18,7 @@
 | A | IPv6 base layer (`Ipv6Addr`, header framing, extension-header walk, EtherType demux, L3 send/recv) + `AF_INET6`/`sockaddr_in6` socket family + dual-stack TCP/UDP | — | 🟢 Landed |
 | B | ICMPv6 (Echo + error), NDP (neighbor + router discovery), `ping6` userspace tool | A | 🟢 Landed (live NDP + loopback) |
 | C | SLAAC (EUI-64 + RA-driven address) + DHCPv6 client (Solicit/Advertise/Request/Reply, DNS option) | A, B | 🟢 Implemented + host-tested (live arms opt-in: no SLIRP RA) |
-| D | AAAA resolution through the Phase 77 resolver + dual-stack RFC 6724 selection + runtime DNS-server config (RDNSS source from B.3) | A, B, C | 🟡 D.1 done; AAAA/RFC6724 follow-up |
+| D | AAAA resolution through the Phase 77 resolver + dual-stack RFC 6724 selection + runtime DNS-server config (RDNSS source from B.3) | A, B, C | 🟢 Landed (`dns6-smoke`; AAAA-real-internet opt-in) |
 | E | Acceptance gates (`ipv6-smoke`, `ping6` arm, SLAAC/DHCPv6 arms) + QEMU IPv6 test harness | A, B, C, D | 🟢 Always-on gate PASSES |
 | F | Documentation + release closeout (learning doc, README/AGENTS, kernel version bump) | E | 🟢 Landed |
 
@@ -234,7 +234,7 @@
 **Acceptance:**
 - [ ] `getaddrinfo("github.com", …)` returns **both** `AF_INET` and `AF_INET6` `addrinfo` entries (the AAAA arm proven by `AAAA_RESOLVE_OK`; opt-in real-internet via `M3OS_IPV6_NET=1`, skip-with-reason otherwise — mirroring `dns-smoke`).
 - [ ] The AAAA reply's source address is validated by the resolver (so the answer is accepted, not discarded) via `sys_recvmsg_inet6`.
-- [ ] The existing IPv4-only `dns-smoke` continues to PASS (no regression to the A-record path).
+- [x] The existing IPv4-only `dns-smoke` continues to PASS (no regression to the A-record path).
 
 ### D.3 — Dual-stack address selection (RFC 6724)
 
@@ -243,9 +243,9 @@
 **Why it matters:** when a name resolves to both A and AAAA, *something* must order them. musl's `getaddrinfo` implements an RFC 3484/6724 sorting *subset* (not glibc's full per-destination source-address probe) — so the m3OS work is **providing the inputs that subset consumes** (a usable global IPv6 source address from C.1, the right scope/precedence) and gating v6-preference on whether a usable v6 source is actually configured, not re-implementing the rule set. The naive "always prefer v6" rule is what RFC 6724 + Happy Eyeballs exist to fix; we get the ordering right and leave racing to a later phase.
 
 **Acceptance:**
-- [ ] A dual-stack `getaddrinfo("localhost")` result (the staged `/etc/hosts` carries both `127.0.0.1` and `::1`) is ordered per RFC 6724 — verified by `RFC6724_OK` inspecting the returned `addrinfo` order, CI-deterministic with no network.
+- [x] A dual-stack `getaddrinfo("localhost")` result (the staged `/etc/hosts` carries both `127.0.0.1` and `::1`) is ordered per RFC 6724 — verified by `RFC6724_OK` inspecting the returned `addrinfo` order, CI-deterministic with no network.
 - [ ] With **no** usable global IPv6 source address configured, a real dual-stack name's IPv4 result is selected first (no v6-preference black-hole) — exercised on the opt-in `M3OS_IPV6_NET` arm alongside `AAAA_RESOLVE_OK`.
-- [ ] Happy Eyeballs is explicitly recorded as deferred — **NOT taken; tracked in the design doc's Deferred section.**
+- [x] Happy Eyeballs is explicitly recorded as deferred — **NOT taken; tracked in the design doc's Deferred section.**
 
 ---
 

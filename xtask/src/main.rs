@@ -3146,6 +3146,8 @@ fn build_musl_bins() {
         ("userspace/tls-smoke/tls-smoke.c", "tls-smoke"),
         // Phase 77 Track D.1: DNS resolution smoke test (musl resolver).
         ("userspace/dns-smoke/dns-smoke.c", "dns-smoke"),
+        // Phase 91 Track D: AAAA + RFC 6724 dual-stack getaddrinfo smoke test.
+        ("userspace/dns6-smoke/dns6-smoke.c", "dns6-smoke"),
         // Phase 86b: non-blocking connect() / EINPROGRESS + poll + SO_ERROR.
         ("userspace/connect-smoke/connect-smoke.c", "connect-smoke"),
         // Phase 88: ext2 cross-process read-coherence regression (Bug B).
@@ -7836,6 +7838,19 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         pattern_b: "SMOKE:dns-smoke:SKIP",
         timeout_secs: 30,
         label: "guest/dns-smoke: resolver path exercised or skipped",
+        extra_steps_a: &[],
+        extra_steps_b: &[],
+    });
+    // Phase 91 Track D — dual-stack AAAA / RFC 6724 getaddrinfo. The musl-built
+    // `/bin/dns6-smoke` asserts `getaddrinfo("localhost", AF_UNSPEC)` returns
+    // both families from the staged dual-stack `/etc/hosts` (RFC6724_OK,
+    // CI-deterministic), softly probing a real AAAA. PASS, or SKIP when the
+    // binary is absent (no musl toolchain at build).
+    steps.push(SmokeStep::WaitEither {
+        pattern_a: "SMOKE:dns6-smoke:PASS",
+        pattern_b: "SMOKE:dns6-smoke:SKIP",
+        timeout_secs: 30,
+        label: "guest/dns6-smoke: dual-stack getaddrinfo (RFC6724_OK) or skipped",
         extra_steps_a: &[],
         extra_steps_b: &[],
     });
@@ -12884,7 +12899,7 @@ fn ipv6_smoke_steps(live: bool) -> Vec<SmokeStep> {
         pass_pattern: "SMOKE:ipv6-smoke:PASS",
         fail_prefixes: &[":FAIL", "IPV6_SMOKE:panic"],
         timeout_secs: 60,
-        label: "guest/ipv6-smoke: socket + bind6 + ping6 ::1 loopback",
+        label: "guest/ipv6-smoke: socket + bind6 + ping6 ::1 loopback + TCP",
         exit_code_on_fail: SMOKE_EXIT_IPV6_SMOKE_FAILED,
     });
     steps
@@ -21608,6 +21623,7 @@ fn populate_ext2_files(
     let empty_content = "";
     let udp_smoke_bin = generated_initrd_dir(&workspace_root()).join("udp-smoke");
     let dns_smoke_bin = generated_initrd_dir(&workspace_root()).join("dns-smoke");
+    let dns6_smoke_bin = generated_initrd_dir(&workspace_root()).join("dns6-smoke");
     let connect_smoke_bin = generated_initrd_dir(&workspace_root()).join("connect-smoke");
 
     // Phase 76 — `/lib/ld-musl-x86_64.so.1` source path. Built by
@@ -22492,6 +22508,10 @@ fn populate_ext2_files(
           sif bin/dns-smoke mode 0x81ED\n\
           sif bin/dns-smoke uid 0\n\
           sif bin/dns-smoke gid 0\n\
+          write \"{dns6_smoke_bin}\" bin/dns6-smoke\n\
+          sif bin/dns6-smoke mode 0x81ED\n\
+          sif bin/dns6-smoke uid 0\n\
+          sif bin/dns6-smoke gid 0\n\
           write \"{connect_smoke_bin}\" bin/connect-smoke\n\
           sif bin/connect-smoke mode 0x81ED\n\
           sif bin/connect-smoke uid 0\n\
@@ -22784,6 +22804,7 @@ fn populate_ext2_files(
         inject_key_cmds = inject_key_cmds,
         udp_smoke_bin = udp_smoke_bin.display(),
         dns_smoke_bin = dns_smoke_bin.display(),
+        dns6_smoke_bin = dns6_smoke_bin.display(),
         connect_smoke_bin = connect_smoke_bin.display(),
         // Phase 76 — host path of the staged dynamic linker; written
         // to `/lib/ld-musl-x86_64.so.1` on the ext2 disk.

@@ -115,6 +115,15 @@ if [ "${M3OS_DNS_REGRESSION:-0}" = "1" ]; then
         echo "          cross-compiler so the Track D.1 resolver path is exercised." >&2
         exit 1
     fi
+    # Phase 91 Track D — the dual-stack AAAA / RFC 6724 getaddrinfo arm. The
+    # RFC 6724 sub-arm (dual-stack getaddrinfo("localhost") over /etc/hosts) is
+    # CI-deterministic, so a SKIP here means musl was absent; require PASS.
+    echo "pre-push: enforcing dns6-smoke PASS (M3OS_DNS_REGRESSION=1)..."
+    if grep -q 'SMOKE:dns6-smoke:SKIP' "$smoke_log" || ! grep -q 'SMOKE:dns6-smoke:PASS' "$smoke_log"; then
+        echo "pre-push: dns6-smoke did not PASS (SKIP or absent). Install a musl" >&2
+        echo "          cross-compiler so the Track D dual-stack getaddrinfo arm runs." >&2
+        exit 1
+    fi
 fi
 
 echo "pre-push: running cargo xtask test..."

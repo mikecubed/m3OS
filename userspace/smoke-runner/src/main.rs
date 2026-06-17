@@ -54,6 +54,13 @@ const TLS_SMOKE_PASS_NEEDLE: &[u8] = b"TLS_SMOKE:PASS";
 const DNS_SMOKE_PATH: &[u8] = b"/bin/dns-smoke\0";
 const DNS_SMOKE_ARGV0: &[u8] = b"dns-smoke\0";
 const DNS_SMOKE_NEEDLE: &[u8] = b"DNS_SMOKE:";
+// Phase 91 Track D — AAAA + RFC 6724 dual-stack getaddrinfo. dns6-smoke emits
+// DNS6_SMOKE:PASS once the dual-stack `getaddrinfo("localhost")` over the staged
+// `/etc/hosts` returns both families (the AAAA sub-arm is soft); the PASS needle
+// (not the bare prefix) means a FAIL/SKIP verdict fails the gate.
+const DNS6_SMOKE_PATH: &[u8] = b"/bin/dns6-smoke\0";
+const DNS6_SMOKE_ARGV0: &[u8] = b"dns6-smoke\0";
+const DNS6_SMOKE_NEEDLE: &[u8] = b"DNS6_SMOKE:PASS";
 // Phase 86b — non-blocking connect() smoke. connect-smoke asserts the new
 // EINPROGRESS / poll(POLLOUT) / getsockopt(SO_ERROR) / EALREADY semantics
 // deterministically (no network) and exits 0 with CONNECT_SMOKE:PASS, or
@@ -387,6 +394,30 @@ fn program_main(_args: &[&str]) -> i32 {
                 return code;
             }
             pass("dns-smoke");
+        }
+    }
+
+    // Phase 91 Track D — dual-stack AAAA / RFC 6724 getaddrinfo. dns6-smoke
+    // asserts `getaddrinfo("localhost", AF_UNSPEC)` returns both families from
+    // the dual-stack /etc/hosts (RFC6724_OK, CI-deterministic) and softly probes
+    // a real AAAA. SKIP when the binary is absent (musl toolchain missing).
+    {
+        let mut probe = Stat::zeroed();
+        if stat(DNS6_SMOKE_PATH, &mut probe) < 0 || probe.st_size == 0 {
+            skip("dns6-smoke");
+        } else {
+            begin("dns6-smoke");
+            let dns6_argv = [DNS6_SMOKE_ARGV0.as_ptr(), ptr::null()];
+            if let Err(code) = run_command_expect_output(
+                "dns6-smoke",
+                DNS6_SMOKE_PATH,
+                &dns6_argv,
+                DNS6_SMOKE_NEEDLE,
+                &mut command_output,
+            ) {
+                return code;
+            }
+            pass("dns6-smoke");
         }
     }
 
