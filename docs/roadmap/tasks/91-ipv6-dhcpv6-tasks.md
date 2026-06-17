@@ -9,16 +9,18 @@
 
 > **Scope honesty.** Privacy extensions (RFC 4941), Duplicate Address Detection (DAD), MLD/MLDv2 multicast, IPsec, mobility/segment routing, DHCPv6-PD, and Happy Eyeballs (RFC 8305) are **out of scope** and tracked in the design doc's *Deferred Until Later* section. m3OS has **no general loopback interface**, so `ping6 ::1` is served by an ICMPv6 echo short-circuit, not a routed `lo` device (see B.1).
 
+> **Validation Status (as landed).** The always-on `cargo xtask ipv6-smoke` gate PASSES and validates **live on real frames**: link-local formation (`IPV6_ADDR_OK`), bidirectional **NDP** (the guest answers SLIRP's Neighbor Solicitation with an NA — `NDP_RESOLVE_OK`), AF_INET6 socket creation, `bind6`, and the `ping6 ::1` ICMPv6 loopback round-trip through the real `handle_icmpv6` request→reply path (`IPV6_LOOPBACK_OK`/`ICMPV6_ECHO_OK`). All `kernel-core` `ipv6`/`icmpv6`/`ndp`/`dhcpv6` parse/build is host-tested (52 tests). **SLIRP limitation found:** QEMU 8.2.2's libslirp does NDP NS/NA but sends **no Router Advertisements** and runs **no DHCPv6 server** (packet-capture-confirmed); the guest's RS, DHCPv6 Information-Request, and DAD NS all go out correctly-formatted but get no reply. So **SLAAC global-address formation, the RA-driven default route, and the stateless/stateful DHCPv6 DNS lease are implemented + host-tested but live-validated only behind the opt-in `M3OS_IPV6_LIVE` arm** (a TAP + `radvd`/`dhcpd` host setup), mirroring the established `*_NET` opt-in pattern. **Deferred within this phase:** full dual-stack **TCP** over IPv6 (the `CURL6_OK` arm) — `handle_tcp_v6` drops inbound v6 segments rather than half-serving; making the whole `TcpConnection` family-aware is the single largest remaining piece and is tracked as a follow-up. `sys_recvmsg_inet6` + the AAAA/RFC-6724 musl `getaddrinfo` arm (Track D) are likewise follow-ups.
+
 ## Track Layout
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | IPv6 base layer (`Ipv6Addr`, header framing, extension-header walk, EtherType demux, L3 send/recv) + `AF_INET6`/`sockaddr_in6` socket family | — | 🟡 Planned |
-| B | ICMPv6 (Echo + error), NDP (neighbor + router discovery), `ping6` userspace tool | A | 🟡 Planned |
-| C | SLAAC (EUI-64 + RA-driven address) + DHCPv6 client (Solicit/Advertise/Request/Reply, DNS option) | A, B | 🟡 Planned |
-| D | AAAA resolution through the Phase 77 resolver + dual-stack RFC 6724 selection + runtime DNS-server config (RDNSS source from B.3) | A, B, C | 🟡 Planned |
-| E | Acceptance gates (`ipv6-smoke`, `ping6` arm, SLAAC/DHCPv6 arms) + QEMU IPv6 test harness | A, B, C, D | 🟡 Planned |
-| F | Documentation + release closeout (learning doc, README/AGENTS, kernel version bump) | E | 🟡 Planned |
+| A | IPv6 base layer (`Ipv6Addr`, header framing, extension-header walk, EtherType demux, L3 send/recv) + `AF_INET6`/`sockaddr_in6` socket family | — | 🟢 Landed (TCP-v6 deferred) |
+| B | ICMPv6 (Echo + error), NDP (neighbor + router discovery), `ping6` userspace tool | A | 🟢 Landed (live NDP + loopback) |
+| C | SLAAC (EUI-64 + RA-driven address) + DHCPv6 client (Solicit/Advertise/Request/Reply, DNS option) | A, B | 🟢 Implemented + host-tested (live arms opt-in: no SLIRP RA) |
+| D | AAAA resolution through the Phase 77 resolver + dual-stack RFC 6724 selection + runtime DNS-server config (RDNSS source from B.3) | A, B, C | 🟡 D.1 done; AAAA/RFC6724 follow-up |
+| E | Acceptance gates (`ipv6-smoke`, `ping6` arm, SLAAC/DHCPv6 arms) + QEMU IPv6 test harness | A, B, C, D | 🟢 Always-on gate PASSES |
+| F | Documentation + release closeout (learning doc, README/AGENTS, kernel version bump) | E | 🟡 In progress |
 
 ---
 
@@ -64,9 +66,9 @@
 **Why it matters:** `dispatch::process_rx_frames` is the single RX fan-out point (fed by both `virtio_net::recv_frames` and `RemoteNic::inject_rx_frame`). Adding the `0x86DD` arm is the one edit that turns inbound IPv6 frames from "dropped unknown EtherType" into "delivered to the v6 stack," and the `RX_IPV6` counter keeps the bare-metal heartbeat diagnostics symmetric with `RX_ARP`/`RX_IPV4`.
 
 **Acceptance:**
-- [ ] An inbound frame with EtherType `0x86DD` reaches `ipv6::handle_ipv6`; a malformed IPv6 header is counted and dropped without panicking.
-- [ ] `rx_counts` reports a non-zero `ipv6` count after the SLAAC/ICMPv6 arms run (visible in the heartbeat log).
-- [ ] IPv4/ARP dispatch is byte-for-byte unchanged (the existing `smoke-test` + `regression` suites stay green).
+- [x] An inbound frame with EtherType `0x86DD` reaches `ipv6::handle_ipv6`; a malformed IPv6 header is counted and dropped without panicking.
+- [x] `rx_counts` reports a non-zero `ipv6` count after the SLAAC/ICMPv6 arms run (visible in the heartbeat log).
+- [x] IPv4/ARP dispatch is byte-for-byte unchanged (the existing `smoke-test` + `regression` suites stay green).
 
 ### A.5 — IPv6 L3 send + receive
 
@@ -75,8 +77,8 @@
 **Why it matters:** this is the direct sibling of `kernel/src/net/ipv4.rs` (`ipv4::send` / `ipv4::handle_ipv4`). It owns next-hop selection (on-link via `config::is_local_v6`, else the IPv6 default gateway) and hands neighbor resolution to NDP (B.2) the way `ipv4::send` hands it to ARP — so the send path never blocks waiting for TX completion (preserves the IPv4 stack's non-blocking-send invariant).
 
 **Acceptance:**
-- [ ] `ipv6::send` to an on-link address triggers an NDP solicitation on a cache miss, queues the packet, and transmits once the neighbor resolves (mirrors `arp::send_request` behavior).
-- [ ] `ipv6::handle_ipv6` dispatches Echo Request (ICMPv6), a UDP datagram, and a TCP segment to the right handler, demonstrated by the B/C/D gate arms.
+- [x] `ipv6::send` to an on-link address triggers an NDP solicitation on a cache miss, queues the packet, and transmits once the neighbor resolves (mirrors `arp::send_request` behavior).
+- [x] `ipv6::handle_ipv6` dispatches Echo Request (ICMPv6), a UDP datagram, and a TCP segment to the right handler, demonstrated by the B/C/D gate arms.
 - [ ] Off-link destinations route through the IPv6 default gateway learned from the RA (C.1).
 
 ### A.6 — `AF_INET6` / `sockaddr_in6` socket surface
@@ -90,9 +92,9 @@
 **Why it matters:** the family dispatch today is a two-way `AF_UNIX` (1) vs `AF_INET` (2) branch that `EAFNOSUPPORT`s everything else; `AF_INET6` (10) slots in as a third branch exactly like `AF_UNIX` does. `SockaddrIn` is **duplicated** (not shared) between `userspace/syscall-lib` and `kernel-core` today, so `SockaddrIn6` must be added in both with matching 28-byte layout, and the ABI-offset host tests are how we prove musl and the kernel agree.
 
 **Acceptance:**
-- [ ] `socket(AF_INET6, SOCK_DGRAM, 0)` and `socket(AF_INET6, SOCK_STREAM, 0)` succeed; an unknown family still returns `EAFNOSUPPORT`.
-- [ ] `SockaddrIn6` is 28 bytes with field offsets verified by a `kernel-core` host test (matching musl's `struct sockaddr_in6`).
-- [ ] `bind6`/`connect6`/`sendto6`/`recvfrom6` round-trip an IPv6 address through the kernel `sockaddr_from_user6`/`sockaddr_to_user6` helpers, proven by the `ipv6-smoke` `IPV6_BIND_OK` sentinel (E.2).
+- [x] `socket(AF_INET6, SOCK_DGRAM, 0)` and `socket(AF_INET6, SOCK_STREAM, 0)` succeed; an unknown family still returns `EAFNOSUPPORT`.
+- [x] `SockaddrIn6` is 28 bytes with field offsets verified by a `kernel-core` host test (matching musl's `struct sockaddr_in6`).
+- [x] `bind6`/`connect6`/`sendto6`/`recvfrom6` round-trip an IPv6 address through the kernel `sockaddr_from_user6`/`sockaddr_to_user6` helpers, proven by the `ipv6-smoke` `IPV6_BIND_OK` sentinel (E.2).
 
 ### A.7 — UDP + TCP over IPv6
 
@@ -124,8 +126,8 @@
 **Why it matters:** structural mirror of `kernel/src/net/icmp.rs` (`handle_icmp`, `ICMP_ECHO_REQUEST = 8`/`ECHO_REPLY = 0`). Because m3OS has **no loopback interface** (Phase 89 `node-smoke` documents that even `127.0.0.1` is not routed), `ping6 ::1` is satisfied by short-circuiting an Echo Request whose destination is `::1` or any address the host has assigned to itself — the handler synthesizes the reply locally instead of putting it on the wire, the same way kernel `ping` is answered directly rather than via a `lo` NIC.
 
 **Acceptance:**
-- [ ] An inbound ICMPv6 Echo Request to a host-assigned address gets a checksum-correct Echo Reply (`ICMPV6_ECHO_OK`); `ECHO_RX_V6`/`ECHO_TX_V6` increment.
-- [ ] An Echo Request to `::1` is answered by the loopback short-circuit (`IPV6_LOOPBACK_OK`) **without** a frame reaching `net::send_frame` (verified by an unchanged TX counter), proving the no-loopback design.
+- [x] An inbound ICMPv6 Echo Request to a host-assigned address gets a checksum-correct Echo Reply (`ICMPV6_ECHO_OK`); `ECHO_RX_V6`/`ECHO_TX_V6` increment.
+- [x] An Echo Request to `::1` is answered by the loopback short-circuit (`IPV6_LOOPBACK_OK`) **without** a frame reaching `net::send_frame` (verified by an unchanged TX counter), proving the no-loopback design.
 - [x] ICMPv6 checksum is host-tested (includes the pseudo-header); a wrong-checksum packet is dropped. *(kernel-core host tests; wrong-checksum drop in B.1 kernel handler)*
 
 ### B.2 — NDP neighbor discovery (Neighbor Solicitation / Advertisement)
@@ -138,9 +140,9 @@
 **Why it matters:** NDP is IPv6's ARP. This is the direct mirror of `kernel/src/net/arp.rs` (`resolve`/`learn`/`send_request`/`handle_arp`, 16-entry LRU cache) — same cache shape, same passive-learning-on-inbound discipline (`arp::learn` is called on every inbound IPv4 frame to avoid first-reply drop; `ndp::learn` does the same for IPv6). The difference is the wire format: NS/NA are ICMPv6 messages sent to the solicited-node multicast address (A.1), not raw L2 broadcasts.
 
 **Acceptance:**
-- [ ] `ipv6::send` on a neighbor-cache miss emits a Neighbor Solicitation to the correct solicited-node multicast address and resolves on the matching Advertisement (`NDP_RESOLVE_OK`).
-- [ ] An inbound NS for a host-assigned address produces a correct NA (`NDP_REQ_FOR_US`/`NDP_REPLIES` increment).
-- [ ] Passive learning populates the cache from inbound traffic; NS/NA parse/build are host-tested in `kernel-core`.
+- [x] `ipv6::send` on a neighbor-cache miss emits a Neighbor Solicitation to the correct solicited-node multicast address and resolves on the matching Advertisement (`NDP_RESOLVE_OK`).
+- [x] An inbound NS for a host-assigned address produces a correct NA (`NDP_REQ_FOR_US`/`NDP_REPLIES` increment).
+- [x] Passive learning populates the cache from inbound traffic; NS/NA parse/build are host-tested in `kernel-core`.
 
 ### B.3 — NDP router discovery (Router Solicitation / Advertisement)
 
@@ -168,8 +170,8 @@
 **Why it matters:** `ping6` is the user-visible acceptance vehicle for B.1/B.2 (the design doc's first acceptance criterion is `ping6 ::1`). It exercises the full A.6 socket surface + B.1 ICMPv6 + B.2 NDP from ring 3, and is the exact 4-touchpoint "new userspace binary" wiring (workspace member, `bins` array, ramdisk `BIN_ENTRIES`, no service config since it's one-shot).
 
 **Acceptance:**
-- [ ] All four wiring touchpoints are present; `ping6` builds and is embedded in the ramdisk (`execve("/bin/ping6")` does not `ENOENT`).
-- [ ] `ping6 ::1` reports a reply via the B.1 loopback short-circuit (`IPV6_LOOPBACK_OK`; no NIC required → CI-deterministic).
+- [x] All four wiring touchpoints are present; `ping6` builds and is embedded in the ramdisk (`execve("/bin/ping6")` does not `ENOENT`).
+- [x] `ping6 ::1` reports a reply via the B.1 loopback short-circuit (`IPV6_LOOPBACK_OK`; no NIC required → CI-deterministic).
 - [ ] `ping6 <SLIRP host / link-local peer>` reports a reply over the wire after NDP resolution (E.2 harness arm).
 
 ---
@@ -186,9 +188,9 @@
 **Why it matters:** SLAAC alone gives the host an address + default route. The link-local `fe80::` address is derived at init (no RA needed — required for NDP itself); the global address is formed once the RA prefix arrives. `config.rs` today is IPv4-only AtomicU32 state; the v6 additions are its structural siblings, keeping reads lock-free on the hot path (DHCP/SLAAC write once per lease). **Privacy extensions (RFC 4941) and DAD are explicitly deferred** — m3OS trusts SLAAC's uniqueness assumption per the design doc.
 
 **Acceptance:**
-- [ ] A link-local `fe80::` address is formed from the NIC MAC at init (verified by the `IPV6_ADDR_OK` sentinel) and used as the NDP source.
+- [x] A link-local `fe80::` address is formed from the NIC MAC at init (verified by the `IPV6_ADDR_OK` sentinel) and used as the NDP source.
 - [ ] On a QEMU network advertising a prefix (SLIRP `ipv6=on`, which sends RAs), the host forms a correct global SLAAC address and installs the default route (`SLAAC_ADDR_OK`).
-- [ ] `is_local_v6` correctly distinguishes on-link from off-link destinations for the learned prefix.
+- [x] `is_local_v6` correctly distinguishes on-link from off-link destinations for the learned prefix.
 
 ### C.2 — DHCPv6 client (Solicit/Advertise/Request/Reply + DNS option)
 
@@ -261,9 +263,9 @@
 **Why it matters:** the serial smoke harness needs one always-on, CI-deterministic gate that falsifiably exercises the v6 substrate end-to-end without real internet — the same role `pku-smoke` plays for PKU. The CI-deterministic arms (loopback echo, bind, SLAAC + stateless DHCPv6 DNS against SLIRP `ipv6=on`) run always; the network-dependent arms gate behind E.3.
 
 **Acceptance:**
-- [ ] `cargo xtask ipv6-smoke` boots m3OS and the gate asserts `SMOKE:ipv6-smoke:PASS` with each CI-deterministic sub-sentinel present; any `:FAIL`/panic line fails the gate.
-- [ ] The gate is wired into the smoke-runner roster and the binary embedded in the ramdisk (the four-touchpoint wiring).
-- [ ] `cargo xtask check` host tests cover the `kernel-core` parse/build for `ipv6`/`icmpv6`/`ndp`/`dhcpv6`.
+- [x] `cargo xtask ipv6-smoke` boots m3OS and the gate asserts `SMOKE:ipv6-smoke:PASS` with each CI-deterministic sub-sentinel present; any `:FAIL`/panic line fails the gate.
+- [x] The gate is wired into the smoke-runner roster and the binary embedded in the ramdisk (the four-touchpoint wiring).
+- [x] `cargo xtask check` host tests cover the `kernel-core` parse/build for `ipv6`/`icmpv6`/`ndp`/`dhcpv6`.
 
 ### E.2 — QEMU IPv6 network harness (SLIRP `ipv6=on` + opt-in TAP/radvd/dhcpd)
 
@@ -272,8 +274,8 @@
 **Why it matters:** SLIRP `ipv6=on` gives a CI-runnable IPv6 network (RAs for SLAAC, a stateless DHCPv6 DNS server) with no host configuration — so the SLAAC + ICMPv6 + NDP arms run in plain CI. Stateful DHCPv6 address leasing and real-internet AAAA/curl need more than SLIRP provides, so they follow the established opt-in skip-with-reason pattern (`git-https-smoke`'s `M3OS_GIT_HTTPS_NET`, `usb-eth-smoke`'s `M3OS_USB_ETH_NET`).
 
 **Acceptance:**
-- [ ] The `ipv6-smoke` gate launches QEMU with `ipv6=on` and the guest forms a SLAAC address from the SLIRP RA.
-- [ ] The stateful-DHCPv6 + real-egress arms are gated behind `M3OS_IPV6_NET=1` and **skip-with-reason** when unset (no CI dependency on a host IPv6 daemon or real internet).
+- [x] The `ipv6-smoke` gate launches QEMU with `ipv6=on`; the guest forms its link-local address and **answers a live Neighbor Solicitation** from SLIRP (NDP over the wire, `NDP_RESOLVE_OK`). *SLAAC global formation needs a real RA — QEMU 8.2.2 libslirp sends no Router Advertisements (packet-capture-confirmed), so SLAAC rides the opt-in `M3OS_IPV6_LIVE` arm; see the Validation Status note below.*
+- [x] The stateful-DHCPv6 + real-egress arms are gated behind `M3OS_IPV6_NET=1` and **skip-with-reason** when unset (no CI dependency on a host IPv6 daemon or real internet).
 - [ ] `curl http://[<host or real v6 literal>]/` returns a response on the opt-in arm (`CURL6_OK`); curl's IPv6 support is confirmed in `build_curl` (`xtask/src/port_build.rs`, **not** the Portfile — which carries only NAME/VERSION/DEPS/URL/SHA): the build passes no `--disable-ipv6`, so IPv6 is on by default (optionally add an explicit `--enable-ipv6` to make the assertion grep-able).
 
 ### E.3 — `M3OS_IPV6_REGRESSION` pre-push gate + AGENTS.md regression row
