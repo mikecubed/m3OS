@@ -332,7 +332,7 @@
 **Acceptance:**
 - [x] `kernel/Cargo.toml` reads `version = "0.91.0"` (+ `Cargo.lock` updated), and `AGENTS.md:7` reads `kernel **v0.91.0**`.
 - [x] `cargo xtask check` is clean (clippy `-D warnings` + rustfmt + host tests incl. the new `kernel-core` IPv6 parse/build tests); exit 0.
-- [ ] The boot banner / `uname -a` reports `0.91.0` (rides the `ipv6-smoke` run).
+- [x] The boot banner / `uname -a` reports `0.91.0` (rides the `ipv6-smoke` run).
 
 ---
 
