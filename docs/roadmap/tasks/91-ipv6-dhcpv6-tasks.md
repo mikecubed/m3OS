@@ -1,6 +1,6 @@
 # Phase 91 — IPv6 / DHCPv6: Task List
 
-**Status:** 🟡 Planned (post-1.0) — authored ahead of implementation
+**Status:** 🟢 Landed — always-on `ipv6-smoke` gate PASSES; SLAAC/DHCPv6 live arms + dual-stack TCP are tracked follow-ups (see Validation Status)
 **Source Ref:** phase-91
 **Depends on:** Phase 16 (Network) ✅, Phase 77 (Pre-1.0 Correctness — TCP retransmission + DNS stub) ✅, Phase 83 (Release 1.0 Gate) ✅
 **Goal:** Layer a dual-stack IPv6 path onto the IPv4-only 1.0 network stack: an `Ipv6Addr` type + on-wire header framing, ICMPv6 + NDP (IPv6's ARP replacement), SLAAC + a DHCPv6 client, an `AF_INET6` / `sockaddr_in6` socket surface, AAAA resolution through the Phase 77 resolver with RFC 6724 selection, and a `ping6` tool — without regressing IPv4. Closes with the kernel version bump (`0.90.1` → `0.91.0`) and the Phase 91 learning doc (`docs/91-ipv6-dhcpv6.md`).
@@ -20,7 +20,7 @@
 | C | SLAAC (EUI-64 + RA-driven address) + DHCPv6 client (Solicit/Advertise/Request/Reply, DNS option) | A, B | 🟢 Implemented + host-tested (live arms opt-in: no SLIRP RA) |
 | D | AAAA resolution through the Phase 77 resolver + dual-stack RFC 6724 selection + runtime DNS-server config (RDNSS source from B.3) | A, B, C | 🟡 D.1 done; AAAA/RFC6724 follow-up |
 | E | Acceptance gates (`ipv6-smoke`, `ping6` arm, SLAAC/DHCPv6 arms) + QEMU IPv6 test harness | A, B, C, D | 🟢 Always-on gate PASSES |
-| F | Documentation + release closeout (learning doc, README/AGENTS, kernel version bump) | E | 🟡 In progress |
+| F | Documentation + release closeout (learning doc, README/AGENTS, kernel version bump) | E | 🟢 Landed |
 
 ---
 
@@ -219,7 +219,7 @@
 **Acceptance:**
 - [ ] `config::dns_servers()` returns the static default and is overwritten by a DHCPv6/RDNSS-learned server when one arrives.
 - [ ] A learned RDNSS/DHCPv6 server appears in the resolver's nameserver list and is the destination of the subsequent DNS query (asserted via `DHCPV6_DNS_OK` + the DNS-egress count, not a soft "is queried").
-- [ ] IPv4 DNS behavior is unchanged when no IPv6 DNS server is learned (`dns-smoke` still PASSes).
+- [x] IPv4 DNS behavior is unchanged when no IPv6 DNS server is learned (`dns-smoke` still PASSes).
 
 ### D.2 — AAAA resolution through the Phase 77 resolver path
 
@@ -285,9 +285,9 @@
 **Why it matters:** every networking subsystem in the tree has an opt-in pre-push regression gate (the `M3OS_*_REGRESSION` family); IPv6 gets the same so a future change to the v6 dispatch / NDP / SLAAC path is caught before merge. The AGENTS.md row is where the gate's contract is documented for the next contributor.
 
 **Acceptance:**
-- [ ] `M3OS_IPV6_REGRESSION=1 git push` runs `ipv6-smoke` and fails the push on a non-PASS.
-- [ ] AGENTS.md gains the `ipv6-smoke` / `M3OS_IPV6_REGRESSION=1` regression-table row (CI-deterministic arms always-on; network arms behind `M3OS_IPV6_NET=1`).
-- [ ] The row documents that IPv4 gates (`smoke-test`, `regression`, `dns-smoke`, `multi-nic-smoke`) remain unaffected.
+- [x] `M3OS_IPV6_REGRESSION=1 git push` runs `ipv6-smoke` and fails the push on a non-PASS.
+- [x] AGENTS.md gains the `ipv6-smoke` / `M3OS_IPV6_REGRESSION=1` regression-table row (CI-deterministic arms always-on; network arms behind `M3OS_IPV6_NET=1`).
+- [x] The row documents that IPv4 gates (`smoke-test`, `regression`, `dns-smoke`, `multi-nic-smoke`) remain unaffected.
 
 ---
 
@@ -304,9 +304,9 @@
 **Why it matters:** every phase ships a learning doc (the roadmap's "Required Documentation for Every Phase" rule); **Phase 91 cannot be marked Complete without this doc in tree.** This is where the phase's teaching lives: why NDP replaces ARP, how SLAAC derives an interface ID, why DHCPv6 is a four-message exchange on 546/547, the dual-stack RFC 6724 problem, and the honest non-goals (no DAD/privacy-extensions/multicast/Happy Eyeballs, no general loopback).
 
 **Acceptance:**
-- [ ] `docs/91-ipv6-dhcpv6.md` exists with all seven aligned-template sections; the Key Files table lists the exact new files (`kernel-core`/`kernel` `ipv6`/`icmpv6`/`ndp`/`dhcpv6`, `config.rs`, the socket-surface files, `userspace/ping6`).
-- [ ] It is linked from `docs/README.md`'s learning-docs table and cross-links the Phase 91 design + task docs in its Related Roadmap Docs section; `docs/appendix/codebase-map.md` gains the IPv6 Documentation-Index row.
-- [ ] The Deferred section matches the design doc's Deferred Until Later list (privacy extensions, DAD, MLD, IPsec, mobility/segment routing, DHCPv6-PD, full RFC 6724/8305).
+- [x] `docs/91-ipv6-dhcpv6.md` exists with all seven aligned-template sections; the Key Files table lists the exact new files (`kernel-core`/`kernel` `ipv6`/`icmpv6`/`ndp`/`dhcpv6`, `config.rs`, the socket-surface files, `userspace/ping6`).
+- [x] It is linked from `docs/README.md`'s learning-docs table and cross-links the Phase 91 design + task docs in its Related Roadmap Docs section; `docs/appendix/codebase-map.md` gains the IPv6 Documentation-Index row.
+- [x] The Deferred section matches the design doc's Deferred Until Later list (privacy extensions, DAD, MLD, IPsec, mobility/segment routing, DHCPv6-PD, full RFC 6724/8305).
 
 ### F.2 — Update the roadmap README row + design-doc link + AGENTS.md inventory
 
@@ -320,8 +320,8 @@
 
 **Acceptance:**
 - [x] During planning (done at authoring time): `docs/roadmap/README.md:482` Tasks cell links `[Tasks](./tasks/91-ipv6-dhcpv6-tasks.md)` and the Primary Outcome is expanded; the design doc's Companion Task List is a live link.
-- [ ] On landing: the README Status flips `Planned` → `Complete`/`🟢 Landed` with the Primary Outcome sharpened to the as-built result (SLAAC + DHCPv6 + ICMPv6/NDP + AAAA + `ping6`).
-- [ ] On landing: AGENTS.md's Networking bullet reflects dual-stack IPv6 (no separate changelog/diary entry, per the keep-it-small policy).
+- [x] On landing: the README Status flips `Planned` → `Complete`/`🟢 Landed` with the Primary Outcome sharpened to the as-built result (SLAAC + DHCPv6 + ICMPv6/NDP + AAAA + `ping6`).
+- [x] On landing: AGENTS.md's Networking bullet reflects dual-stack IPv6 (no separate changelog/diary entry, per the keep-it-small policy).
 
 ### F.3 — Bump kernel crate `0.90.1` → `0.91.0`
 
@@ -330,8 +330,8 @@
 **Why it matters:** the bump is how the landing is recorded in the boot banner, `uname`, and `/proc/version` (all derive from `env!("CARGO_PKG_VERSION")` — `kernel/src/lib.rs:146`, `kernel/src/arch/x86_64/syscall/mod.rs:14522`–`14523`, `kernel/src/fs/procfs.rs`), so no manual string edits are needed beyond `Cargo.toml` + `AGENTS.md`. The `ipv6-smoke` boot banner asserting `0.91.0` is the cheap proof the cut shipped — the exact Phase 89/90b E.4 pattern.
 
 **Acceptance:**
-- [ ] `kernel/Cargo.toml` reads `version = "0.91.0"` (+ `Cargo.lock` updated), and `AGENTS.md:7` reads `kernel **v0.91.0**`.
-- [ ] `cargo xtask check` is clean (clippy `-D warnings` + rustfmt + host tests incl. the new `kernel-core` IPv6 parse/build tests); exit 0.
+- [x] `kernel/Cargo.toml` reads `version = "0.91.0"` (+ `Cargo.lock` updated), and `AGENTS.md:7` reads `kernel **v0.91.0**`.
+- [x] `cargo xtask check` is clean (clippy `-D warnings` + rustfmt + host tests incl. the new `kernel-core` IPv6 parse/build tests); exit 0.
 - [ ] The boot banner / `uname -a` reports `0.91.0` (rides the `ipv6-smoke` run).
 
 ---

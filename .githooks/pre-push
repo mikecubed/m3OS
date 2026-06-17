@@ -614,6 +614,23 @@ if [ "${M3OS_PKU_REGRESSION:-0}" = "1" ]; then
     fi
 fi
 
+# Phase 91 — dual-stack IPv6 regression gate. Gated behind M3OS_IPV6_REGRESSION=1.
+# Boots m3OS with QEMU SLIRP `ipv6=on` and runs the ramdisk ipv6-smoke binary +
+# the kernel's live-NDP path: asserts link-local formation (IPV6_ADDR_OK), a live
+# Neighbor Solicitation answered over the wire (NDP_RESOLVE_OK), AF_INET6 socket
+# creation, bind6, and the ping6 ::1 ICMPv6 loopback round-trip
+# (SMOKE:ipv6-smoke:PASS). SLAAC + DHCPv6 DNS need a real router (no SLIRP RA) and
+# ride the opt-in M3OS_IPV6_LIVE arm. Set this on branches touching the v6 RX
+# dispatch (kernel/src/net/dispatch.rs), ipv6/icmpv6/ndp/dhcpv6 (kernel +
+# kernel-core), config.rs v6 state, or the AF_INET6 socket syscall surface.
+if [ "${M3OS_IPV6_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask ipv6-smoke..."
+    if ! cargo xtask ipv6-smoke --timeout 240; then
+        echo "pre-push: cargo xtask ipv6-smoke failed" >&2
+        exit 1
+    fi
+fi
+
 # Track D (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md) —
 # kernel-stack-overflow controlled-kill recovery gate. Gated behind
 # M3OS_KSTACK_OVERFLOW_REGRESSION=1. Builds a kernel with the
