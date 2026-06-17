@@ -898,6 +898,19 @@ pub fn peer_info(conn_idx: usize) -> Option<([u8; 4], u16, u16)> {
         .map(|c| (c.remote_ip, c.remote_port, c.local_port))
 }
 
+/// Phase 91 — the `AF_INET6` analogue of `peer_info`: the remote IPv6 address,
+/// remote port, and local port for a connection. Used by `sys_accept` to tag
+/// the accepted socket with its v6 peer so `getpeername`/`recvfrom` report a
+/// correct `sockaddr_in6`.
+pub fn peer_info6(conn_idx: usize) -> Option<(Ipv6Addr, u16, u16)> {
+    let conns = TCP_CONNS.lock();
+    conns
+        .conns
+        .get(conn_idx)?
+        .as_ref()
+        .map(|c| (c.remote_ip6, c.remote_port, c.local_port))
+}
+
 /// Check if the TCP connection's recv buffer has data.
 pub fn has_recv_data(conn_idx: usize) -> bool {
     let conns = TCP_CONNS.lock();

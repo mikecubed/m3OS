@@ -18015,8 +18015,13 @@ fn sockaddr_from_user6(addr_ptr: u64) -> Result<([u8; 16], u16), u64> {
     Ok((addr, port))
 }
 
-/// Phase 91 — write a `sockaddr_in6` (28 bytes) to userspace.
-fn sockaddr_to_user6(addr_ptr: u64, addr: [u8; 16], port: u16) -> Result<(), u64> {
+/// Phase 91 — write a `sockaddr_in6` to userspace, clamped to the caller's
+/// declared buffer length (`cap`). Linux value-result semantics: write
+/// `min(cap, 28)` bytes into the user buffer while the addrlen out-parameter
+/// (written by the caller) still reports the full 28. `cap` must be the
+/// caller's validated `addrlen` — passing a too-small `cap` truncates the
+/// address rather than overrunning the buffer past its declared size.
+fn sockaddr_to_user6(addr_ptr: u64, addr: [u8; 16], port: u16, cap: usize) -> Result<(), u64> {
     if addr_ptr == 0 {
         return Ok(());
     }
@@ -18026,8 +18031,9 @@ fn sockaddr_to_user6(addr_ptr: u64, addr: [u8; 16], port: u16) -> Result<(), u64
     // sin6_flowinfo (4) @ offset 4 stays zero.
     buf[8..24].copy_from_slice(&addr); // sin6_addr
     // sin6_scope_id (4) @ offset 24 stays zero.
-    if UserSliceWo::new(addr_ptr, buf.len())
-        .and_then(|s| s.copy_from_kernel(&buf))
+    let n = cap.min(buf.len());
+    if UserSliceWo::new(addr_ptr, n)
+        .and_then(|s| s.copy_from_kernel(&buf[..n]))
         .is_err()
     {
         return Err(NEG_EFAULT);
@@ -19248,16 +19254,37 @@ pub(super) fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
                     None => return NEG_ENFILE,
                 };
 
-                // Get peer info from the TCP connection
-                let (remote_ip, remote_port, local_port) =
-                    crate::net::tcp::peer_info(tcp_idx).unwrap_or(([0; 4], 0, 0));
+                // Phase 91 — the accepted socket inherits the listener's address
+                // family so getpeername/recvfrom report the correct sockaddr and
+                // the re-armed listen slot is the right family (a v6 listener must
+                // re-arm a v6 slot, since inbound v6 SYNs only match family==10
+                // connections in `handle_tcp_v6`).
+                let listener_family = crate::net::with_socket(handle, |s| s.family).unwrap_or(2);
+
+                // Peer info, family-tagged: the v6 4-tuple for AF_INET6, else the
+                // legacy [u8;4] path.
+                let (remote_ip, remote_port, local_port, remote_ip6) = if listener_family == 10 {
+                    let (ip6, rport, lport) =
+                        crate::net::tcp::peer_info6(tcp_idx).unwrap_or(([0; 16], 0, 0));
+                    ([0u8; 4], rport, lport, ip6)
+                } else {
+                    let (ip, rport, lport) =
+                        crate::net::tcp::peer_info(tcp_idx).unwrap_or(([0; 4], 0, 0));
+                    (ip, rport, lport, [0u8; 16])
+                };
 
                 crate::net::with_socket_mut(new_handle, |s| {
                     s.tcp_slot = Some(tcp_idx);
-                    s.remote_addr = remote_ip;
+                    s.family = listener_family;
                     s.remote_port = remote_port;
                     s.local_port = local_port;
-                    s.local_addr = crate::net::config::our_ip();
+                    if listener_family == 10 {
+                        s.remote_addr6 = remote_ip6;
+                        s.local_addr6 = crate::net::config::our_ip_v6().unwrap_or([0; 16]);
+                    } else {
+                        s.remote_addr = remote_ip;
+                        s.local_addr = crate::net::config::our_ip();
+                    }
                     s.state = crate::net::SocketState::Connected;
                 });
 
@@ -19266,9 +19293,14 @@ pub(super) fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
                     s.tcp_slot = None;
                 });
 
-                // Create a new listen slot on the original socket
+                // Create a new listen slot on the original socket — family-aware.
                 let listen_port = crate::net::with_socket(handle, |s| s.local_port).unwrap_or(0);
-                if let Some(new_tcp) = crate::net::tcp::create(listen_port) {
+                let relisten = if listener_family == 10 {
+                    crate::net::tcp::create_v6(listen_port)
+                } else {
+                    crate::net::tcp::create(listen_port)
+                };
+                if let Some(new_tcp) = relisten {
                     crate::net::tcp::listen(new_tcp);
                     crate::net::with_socket_mut(handle, |s| {
                         s.tcp_slot = Some(new_tcp);
@@ -19279,7 +19311,8 @@ pub(super) fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
                     );
                 }
 
-                // Write peer address to userspace
+                // Write peer address to userspace (family-tagged: 28-byte
+                // sockaddr_in6 for v6, 16-byte sockaddr_in for v4).
                 if addr_ptr != 0 {
                     if addr_len_ptr == 0 {
                         // Linux requires addrlen when addr is non-null
@@ -19294,18 +19327,25 @@ pub(super) fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
                         crate::net::release_socket_pub(new_handle);
                         return NEG_EFAULT;
                     }
-                    if u32::from_ne_bytes(len_buf) < 16 {
+                    let cap = u32::from_ne_bytes(len_buf) as usize;
+                    if cap < 16 {
                         crate::net::release_socket_pub(new_handle);
                         return NEG_EINVAL;
                     }
-                    if let Err(e) = sockaddr_to_user(addr_ptr, remote_ip, remote_port) {
+                    let r = if listener_family == 10 {
+                        sockaddr_to_user6(addr_ptr, remote_ip6, remote_port, cap)
+                    } else {
+                        sockaddr_to_user(addr_ptr, remote_ip, remote_port)
+                    };
+                    if let Err(e) = r {
                         crate::net::release_socket_pub(new_handle);
                         return e;
                     }
                 }
 
                 if addr_len_ptr != 0 {
-                    let len_buf = 16u32.to_ne_bytes();
+                    let reported = if listener_family == 10 { 28u32 } else { 16u32 };
+                    let len_buf = reported.to_ne_bytes();
                     if UserSliceWo::new(addr_len_ptr, len_buf.len())
                         .and_then(|s| s.copy_from_kernel(&len_buf))
                         .is_err()
@@ -19372,8 +19412,10 @@ pub(super) fn sys_accept4(fd: u64, addr_ptr: u64, addr_len_ptr: u64, flags: u64)
     result
 }
 
-/// Phase 91 — AF_INET6 send path (ICMPv6 echo + UDP over IPv6). TCP-over-IPv6 is
-/// the deferred opt-in arm (see `tcp::handle_tcp_v6`).
+/// Phase 91 — AF_INET6 datagram send path (ICMPv6 echo + UDP over IPv6).
+/// TCP-over-IPv6 is fully implemented but flows over the connected `write()`
+/// path (`tcp::send` → family-aware `build_seg` → `ipv6::send_from`), not via
+/// `sendto`; a payload `sendto` on a v6 TCP socket is therefore rejected below.
 fn sys_sendto_v6(
     handle: crate::net::SocketHandle,
     proto: crate::net::SocketProtocol,
@@ -19467,7 +19509,7 @@ fn sys_sendto_v6(
             crate::net::udp::send_v6(src, dst_addr, dst_port, sport, data);
             data.len() as u64
         }
-        // Dual-stack TCP send is the deferred opt-in arm.
+        // TCP data uses the connected write() path, not sendto-with-payload.
         SocketProtocol::Tcp => NEG_EOPNOTSUPP,
     }
 }
@@ -19790,7 +19832,12 @@ pub(super) fn sys_recvfrom_socket(
             let remote_addr6 =
                 crate::net::with_socket(handle, |s| s.remote_addr6).unwrap_or([0; 16]);
 
-            // Validate addr_len if addr_ptr is provided
+            // Validate addr_len if addr_ptr is provided, capturing the caller's
+            // declared buffer size so a v6 sockaddr write clamps to it (a v6
+            // peer is 28 bytes but the gate only requires >= 16; without the
+            // clamp a 16..27-byte buffer would be overrun — see
+            // `sockaddr_to_user6`).
+            let mut addr_cap = 0usize;
             if addr_ptr != 0 {
                 if addr_len_ptr == 0 {
                     return NEG_EINVAL;
@@ -19802,9 +19849,11 @@ pub(super) fn sys_recvfrom_socket(
                 {
                     return NEG_EFAULT;
                 }
-                if u32::from_ne_bytes(len_buf) < 16 {
+                let cap = u32::from_ne_bytes(len_buf) as usize;
+                if cap < 16 {
                     return NEG_EINVAL;
                 }
+                addr_cap = cap;
             }
 
             let capped = (count as usize).min(4096);
@@ -19828,7 +19877,7 @@ pub(super) fn sys_recvfrom_socket(
                             if addr_ptr != 0 {
                                 // Phase 91 — fill the v6 peer for AF_INET6 TCP.
                                 let r = if family == 10 {
-                                    sockaddr_to_user6(addr_ptr, remote_addr6, remote_port)
+                                    sockaddr_to_user6(addr_ptr, remote_addr6, remote_port, addr_cap)
                                 } else {
                                     sockaddr_to_user(addr_ptr, remote_addr, remote_port)
                                 };
@@ -19879,9 +19928,12 @@ pub(super) fn sys_recvfrom_socket(
                                 return NEG_EFAULT;
                             }
                             if addr_ptr != 0 {
-                                if let Err(e) =
-                                    sockaddr_to_user6(addr_ptr, dgram.src_ip, dgram.src_port)
-                                {
+                                if let Err(e) = sockaddr_to_user6(
+                                    addr_ptr,
+                                    dgram.src_ip,
+                                    dgram.src_port,
+                                    addr_cap,
+                                ) {
                                     return e;
                                 }
                                 if addr_len_ptr != 0 {
@@ -19985,7 +20037,7 @@ pub(super) fn sys_recvfrom_socket(
                             }
                             if addr_ptr != 0 {
                                 let r = if is_v6 {
-                                    sockaddr_to_user6(addr_ptr, remote_addr6, 0)
+                                    sockaddr_to_user6(addr_ptr, remote_addr6, 0, addr_cap)
                                 } else {
                                     sockaddr_to_user(addr_ptr, remote_addr, 0)
                                 };
@@ -20120,10 +20172,14 @@ pub(super) fn sys_getsockname(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 
         Ok(v) => v,
         Err(e) => return e,
     };
-    let (ip, port) = match crate::net::with_socket(handle, |s| (s.local_addr, s.local_port)) {
+    // Phase 91 — family-aware: a v6 socket reports its sockaddr_in6 (28 bytes).
+    let (family, ip, ip6, port) = match crate::net::with_socket(handle, |s| {
+        (s.family, s.local_addr, s.local_addr6, s.local_port)
+    }) {
         Some(v) => v,
         None => return NEG_EBADF,
     };
+    let mut cap = if family == 10 { 28usize } else { 16usize };
     if addr_len_ptr != 0 {
         let mut len_buf = [0u8; 4];
         if UserSliceRo::new(addr_len_ptr, len_buf.len())
@@ -20132,16 +20188,23 @@ pub(super) fn sys_getsockname(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 
         {
             return NEG_EFAULT;
         }
-        if u32::from_ne_bytes(len_buf) < 16 {
+        let provided = u32::from_ne_bytes(len_buf) as usize;
+        if provided < 16 {
             return NEG_EINVAL;
         }
+        cap = provided;
     }
-    match sockaddr_to_user(addr_ptr, ip, port) {
-        Ok(()) => {}
-        Err(e) => return e,
+    let r = if family == 10 {
+        sockaddr_to_user6(addr_ptr, ip6, port, cap)
+    } else {
+        sockaddr_to_user(addr_ptr, ip, port)
+    };
+    if let Err(e) = r {
+        return e;
     }
     if addr_len_ptr != 0 {
-        let len_buf = 16u32.to_ne_bytes();
+        let reported = if family == 10 { 28u32 } else { 16u32 };
+        let len_buf = reported.to_ne_bytes();
         if UserSliceWo::new(addr_len_ptr, len_buf.len())
             .and_then(|s| s.copy_from_kernel(&len_buf))
             .is_err()
@@ -20163,14 +20226,24 @@ pub(super) fn sys_getpeername(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 
     // poll()ing does not get a spurious ENOTCONN here. Keeps getpeername
     // consistent with the other SocketState readers (connect/getsockopt/poll).
     crate::net::reconcile_connecting(handle);
-    let info = match crate::net::with_socket(handle, |s| (s.remote_addr, s.remote_port, s.state)) {
+    // Phase 91 — family-aware: a v6 socket reports its sockaddr_in6 (28 bytes).
+    let info = match crate::net::with_socket(handle, |s| {
+        (
+            s.family,
+            s.remote_addr,
+            s.remote_addr6,
+            s.remote_port,
+            s.state,
+        )
+    }) {
         Some(v) => v,
         None => return NEG_EBADF,
     };
-    let (ip, port, state) = info;
+    let (family, ip, ip6, port, state) = info;
     if !matches!(state, crate::net::SocketState::Connected) {
         return NEG_ENOTCONN;
     }
+    let mut cap = if family == 10 { 28usize } else { 16usize };
     if addr_len_ptr != 0 {
         let mut len_buf = [0u8; 4];
         if UserSliceRo::new(addr_len_ptr, len_buf.len())
@@ -20179,16 +20252,23 @@ pub(super) fn sys_getpeername(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 
         {
             return NEG_EFAULT;
         }
-        if u32::from_ne_bytes(len_buf) < 16 {
+        let provided = u32::from_ne_bytes(len_buf) as usize;
+        if provided < 16 {
             return NEG_EINVAL;
         }
+        cap = provided;
     }
-    match sockaddr_to_user(addr_ptr, ip, port) {
-        Ok(()) => {}
-        Err(e) => return e,
+    let r = if family == 10 {
+        sockaddr_to_user6(addr_ptr, ip6, port, cap)
+    } else {
+        sockaddr_to_user(addr_ptr, ip, port)
+    };
+    if let Err(e) = r {
+        return e;
     }
     if addr_len_ptr != 0 {
-        let len_buf = 16u32.to_ne_bytes();
+        let reported = if family == 10 { 28u32 } else { 16u32 };
+        let len_buf = reported.to_ne_bytes();
         if UserSliceWo::new(addr_len_ptr, len_buf.len())
             .and_then(|s| s.copy_from_kernel(&len_buf))
             .is_err()

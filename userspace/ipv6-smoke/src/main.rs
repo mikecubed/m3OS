@@ -25,8 +25,8 @@
 #![no_main]
 
 use syscall_lib::{
-    AF_INET6, IPPROTO_ICMPV6, SOCK_DGRAM, SOCK_STREAM, SYS_RECVMSG, SockaddrIn6, accept, bind6,
-    close, connect6, exit, listen, read, sendto6, socket, write,
+    AF_INET6, IPPROTO_ICMPV6, SOCK_DGRAM, SOCK_STREAM, SYS_ACCEPT, SYS_GETPEERNAME, SYS_RECVMSG,
+    SockaddrIn6, accept, bind6, close, connect6, exit, listen, read, sendto6, socket, write,
 };
 
 const STDOUT: i32 = 1;
@@ -164,6 +164,58 @@ fn case_tcp() {
     if n < 8 || &buf[..8] != msg {
         fail("tcp", "data round-trip mismatch");
     }
+
+    // --- Phase 91 audit-fix validation, all over the `::1` internal loopback ---
+
+    // (a) Family-aware getpeername: a connected v6 client must report its peer
+    // as a 28-byte sockaddr_in6 with sin6_addr == ::1, not a zeroed
+    // sockaddr_in (the formerly v4-only getpeername/getsockname path).
+    let mut peer = SockaddrIn6::new(UNSPECIFIED, 0);
+    let mut plen: u32 = 28;
+    let r = unsafe {
+        syscall_lib::syscall3(
+            SYS_GETPEERNAME,
+            cli as u64,
+            &mut peer as *mut SockaddrIn6 as u64,
+            &mut plen as *mut u32 as u64,
+        )
+    } as isize;
+    if r < 0 {
+        fail("tcp", "getpeername");
+    }
+    if plen != 28 || peer.sin6_family != AF_INET6 as u16 || peer.sin6_addr != LOOPBACK {
+        fail("tcp", "getpeername not ::1/AF_INET6");
+    }
+
+    // (b) The v6 listener re-arms a *v6* slot after the first accept
+    // (`create_v6`, not `create`): a SECOND connect6 to the same port completes
+    // and accept fills a sockaddr_in6 peer. A v4 re-arm (the bug) never matches
+    // the inbound v6 SYN, so this connect6 would hang/fail.
+    let cli2 = socket(AF_INET6 as i32, SOCK_STREAM as i32, 0);
+    if cli2 < 0 {
+        fail("tcp", "client2 socket");
+    }
+    let cli2 = cli2 as i32;
+    if connect6(cli2, &conn_addr) < 0 {
+        fail("tcp", "connect6 ::1 (re-armed listener)");
+    }
+    let mut apeer = SockaddrIn6::new(UNSPECIFIED, 0);
+    let mut alen: u32 = 28;
+    let conn2 = unsafe {
+        syscall_lib::syscall3(
+            SYS_ACCEPT,
+            srv as u64,
+            &mut apeer as *mut SockaddrIn6 as u64,
+            &mut alen as *mut u32 as u64,
+        )
+    } as isize;
+    if conn2 < 0 {
+        fail("tcp", "accept2 (re-armed v6 listener)");
+    }
+    if alen != 28 || apeer.sin6_family != AF_INET6 as u16 {
+        fail("tcp", "accept2 peer not AF_INET6/28");
+    }
+
     // The round-trip succeeded — emit before teardown. A graceful close over the
     // synchronous `::1` loopback would half-close-deadlock (the peer's close
     // cannot run on this single thread), so let process exit reap the fds.
