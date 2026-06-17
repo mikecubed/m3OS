@@ -31,9 +31,9 @@
 **Why it matters:** every IPv6 file depends on a single shared address type, exactly as the IPv4 stack hangs off `Ipv4Addr`. The classification helpers (loopback, link-local, solicited-node multicast, EUI-64) are the primitives NDP, SLAAC, and the loopback short-circuit all consume; getting them host-tested first means the rest of the phase builds on proven address math.
 
 **Acceptance:**
-- [ ] `Ipv6Addr` is defined in `kernel-core/src/types.rs` and re-exported wherever `Ipv4Addr` is.
-- [ ] Host unit tests (`cargo test -p kernel-core --target x86_64-unknown-linux-gnu`) cover `::1`/`::`/`fe80::1`/`ff02::1` classification and the EUI-64 derivation (MAC `52:54:00:12:34:56` → IID `5054:00ff:fe12:3456` with the U/L bit flipped).
-- [ ] `solicited_node_multicast` matches RFC 4291 §2.7.1 for a known address.
+- [x] `Ipv6Addr` is defined in `kernel-core/src/types.rs` and re-exported wherever `Ipv4Addr` is.
+- [x] Host unit tests (`cargo test -p kernel-core --target x86_64-unknown-linux-gnu`) cover `::1`/`::`/`fe80::1`/`ff02::1` classification and the EUI-64 derivation (MAC `52:54:00:12:34:56` → IID `5054:00ff:fe12:3456` with the U/L bit flipped).
+- [x] `solicited_node_multicast` matches RFC 4291 §2.7.1 for a known address.
 
 ### A.2 — IPv6 header framing + pseudo-header checksum
 

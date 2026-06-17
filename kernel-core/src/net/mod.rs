@@ -20,14 +20,61 @@ pub struct SockaddrIn {
     pub sin_zero: [u8; 8],
 }
 
+// ===========================================================================
+// Phase 91: SockaddrIn6 ABI layout (mirrors musl `struct sockaddr_in6`, 28 bytes)
+// ===========================================================================
+
+/// Mirrors the Linux/musl `struct sockaddr_in6` layout for ABI compatibility.
+/// Duplicated (not shared) with `userspace/syscall-lib`'s `SockaddrIn6`, exactly
+/// as `SockaddrIn` is — these offset tests prove the two agree byte-for-byte.
+#[repr(C)]
+pub struct SockaddrIn6 {
+    pub sin6_family: u16,
+    pub sin6_port: u16,
+    pub sin6_flowinfo: u32,
+    pub sin6_addr: [u8; 16],
+    pub sin6_scope_id: u32,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::SockaddrIn;
+    use super::{SockaddrIn, SockaddrIn6};
     use core::mem;
 
     #[test]
     fn sockaddr_in_size() {
         assert_eq!(mem::size_of::<SockaddrIn>(), 16);
+    }
+
+    #[test]
+    fn sockaddr_in6_size() {
+        assert_eq!(mem::size_of::<SockaddrIn6>(), 28);
+    }
+
+    #[test]
+    fn sockaddr_in6_field_offsets() {
+        // Must match musl: family@0, port@2, flowinfo@4, addr@8, scope_id@24.
+        assert_eq!(mem::offset_of!(SockaddrIn6, sin6_family), 0);
+        assert_eq!(mem::offset_of!(SockaddrIn6, sin6_port), 2);
+        assert_eq!(mem::offset_of!(SockaddrIn6, sin6_flowinfo), 4);
+        assert_eq!(mem::offset_of!(SockaddrIn6, sin6_addr), 8);
+        assert_eq!(mem::offset_of!(SockaddrIn6, sin6_scope_id), 24);
+    }
+
+    #[test]
+    fn sockaddr_in6_network_byte_order() {
+        let addr = SockaddrIn6 {
+            sin6_family: 10, // AF_INET6
+            sin6_port: 53u16.to_be(),
+            sin6_flowinfo: 0,
+            sin6_addr: [
+                0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x50, 0x54, 0x00, 0xff, 0xfe, 0x12, 0x34, 0x56,
+            ],
+            sin6_scope_id: 0,
+        };
+        assert_eq!(addr.sin6_family, 10);
+        assert_eq!(addr.sin6_port.to_ne_bytes(), 53u16.to_be_bytes());
+        assert_eq!(addr.sin6_addr[0], 0xfe);
     }
 
     #[test]
