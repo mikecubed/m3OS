@@ -20931,12 +20931,16 @@ fn sys_recvmsg_inet(
     if UserSliceWo::new(msghdr_ptr, MSGHDR_SIZE).is_err() {
         return NEG_EFAULT;
     }
+    // Phase 91 — AF_INET6 sockets report a 28-byte `sockaddr_in6` source;
+    // AF_INET reports a 16-byte `sockaddr_in`.
+    let family = crate::net::with_socket(handle, |s| s.family).unwrap_or(2);
+    let name_cap = if family == 10 { 28usize } else { 16 };
     // Pre-validate the `msg_name` buffer up front too. The source-address
     // write happens in `finish` AFTER a datagram is dequeued, so without this
     // a faulting `msg_name` pointer would consume-and-drop the reply — the
     // same loss the iov/msghdr pre-validation above guards against.
     if header.msg_name != 0 {
-        let name_len = (header.msg_namelen as usize).min(16);
+        let name_len = (header.msg_namelen as usize).min(name_cap);
         if name_len > 0 && UserSliceWo::new(header.msg_name, name_len).is_err() {
             return NEG_EFAULT;
         }
@@ -20969,18 +20973,23 @@ fn sys_recvmsg_inet(
     // faulting copy. On return `msg_namelen` carries the real address size
     // (16) even if the caller's buffer was smaller — the recvmsg(2) contract,
     // matching `sys_recvfrom_socket`.
+    // Family-tagged datagram source for `finish`. `None` = connection-mode
+    // (TCP) / EOF (reports `msg_namelen = 0`, like Linux).
+    enum RecvSrc {
+        None,
+        V4([u8; 4], u16),
+        V6([u8; 16], u16),
+    }
     let finish = |header: &mut kernel_core::net::msghdr::MsgHdr,
-                  src: Option<([u8; 4], u16)>,
+                  src: RecvSrc,
                   truncated: bool|
      -> Result<(), u64> {
+        // recvmsg(2) is value-result: copy at most the caller's buffer size, but
+        // always report the *real* address length (16 v4 / 28 v6) on return —
+        // even when the buffer is too small or empty — so a caller probing the
+        // length or truncating sees the true size.
         match src {
-            // Datagram source address. recvmsg(2) is value-result: copy at most
-            // the caller's buffer size, but always report the *real* address
-            // length (16) on return — even when the buffer is too small or
-            // empty (`msg_namelen == 0`) — so a caller probing the length or
-            // truncating sees the true size. A zero-length buffer therefore
-            // copies nothing yet still reports 16.
-            Some((src_ip, src_port)) if header.msg_name != 0 => {
+            RecvSrc::V4(src_ip, src_port) if header.msg_name != 0 => {
                 let name_len = (header.msg_namelen as usize).min(16);
                 if name_len > 0 {
                     let mut sa = [0u8; 16];
@@ -20995,6 +21004,24 @@ fn sys_recvmsg_inet(
                     }
                 }
                 header.msg_namelen = 16;
+            }
+            RecvSrc::V6(src_ip, src_port) if header.msg_name != 0 => {
+                let name_len = (header.msg_namelen as usize).min(28);
+                if name_len > 0 {
+                    let mut sa = [0u8; 28];
+                    sa[0..2].copy_from_slice(&10u16.to_ne_bytes()); // AF_INET6
+                    sa[2..4].copy_from_slice(&src_port.to_be_bytes()); // sin6_port
+                    // sin6_flowinfo @4..8 stays zero.
+                    sa[8..24].copy_from_slice(&src_ip); // sin6_addr
+                    // sin6_scope_id @24..28 stays zero.
+                    if UserSliceWo::new(header.msg_name, name_len)
+                        .and_then(|s| s.copy_from_kernel(&sa[..name_len]))
+                        .is_err()
+                    {
+                        return Err(NEG_EFAULT);
+                    }
+                }
+                header.msg_namelen = 28;
             }
             _ => header.msg_namelen = 0,
         }
@@ -21012,7 +21039,7 @@ fn sys_recvmsg_inet(
 
     if shut_rd {
         // EOF: deliver a zero-length message with a clean header.
-        return match finish(&mut header, None, false) {
+        return match finish(&mut header, RecvSrc::None, false) {
             Ok(()) => 0,
             Err(e) => e,
         };
@@ -21020,10 +21047,12 @@ fn sys_recvmsg_inet(
 
     match proto {
         crate::net::SocketProtocol::Udp => {
-            // Resolve the recv port through the same policy authority as
-            // recvfrom so the port the service tracked matches the binding
-            // the reply was enqueued on.
-            let recv_port = if net_udp_service_available() {
+            // Resolve the recv port. AF_INET6 UDP uses the v6 datagram queue
+            // keyed by the bound local port (the v4-only net_udp service is not
+            // in that path); AF_INET keeps the existing service-resolved port.
+            let recv_port = if family == 10 {
+                local_port
+            } else if net_udp_service_available() {
                 let (err, port) = net_udp_service_recvfrom_port(handle);
                 if err != 0 {
                     return err;
@@ -21033,8 +21062,16 @@ fn sys_recvmsg_inet(
                 local_port
             };
             loop {
-                if let Some(dgram) = crate::net::udp::recv(recv_port) {
-                    let n = dgram.data.len().min(cap);
+                // Dequeue a datagram of the socket's family, tagging the source.
+                let dg: Option<(alloc::vec::Vec<u8>, RecvSrc)> = if family == 10 {
+                    crate::net::udp::recv_v6(recv_port)
+                        .map(|d| (d.data, RecvSrc::V6(d.src_ip, d.src_port)))
+                } else {
+                    crate::net::udp::recv(recv_port)
+                        .map(|d| (d.data, RecvSrc::V4(d.src_ip, d.src_port)))
+                };
+                if let Some((data, src)) = dg {
+                    let n = data.len().min(cap);
                     let mut cursor = 0usize;
                     for iov in &iovs {
                         if cursor >= n {
@@ -21045,17 +21082,15 @@ fn sys_recvmsg_inet(
                             continue;
                         }
                         if UserSliceWo::new(iov.iov_base, chunk)
-                            .and_then(|s| s.copy_from_kernel(&dgram.data[cursor..cursor + chunk]))
+                            .and_then(|s| s.copy_from_kernel(&data[cursor..cursor + chunk]))
                             .is_err()
                         {
                             return NEG_EFAULT;
                         }
                         cursor += chunk;
                     }
-                    let truncated = dgram.data.len() > n;
-                    if let Err(e) =
-                        finish(&mut header, Some((dgram.src_ip, dgram.src_port)), truncated)
-                    {
+                    let truncated = data.len() > n;
+                    if let Err(e) = finish(&mut header, src, truncated) {
                         return e;
                     }
                     return n as u64;
@@ -21078,7 +21113,7 @@ fn sys_recvmsg_inet(
             // entering the loop with cap == 0 would otherwise spin a blocking
             // socket forever, since tcp::recv always yields 0 for an empty buf.
             if cap == 0 {
-                return match finish(&mut header, None, false) {
+                return match finish(&mut header, RecvSrc::None, false) {
                     Ok(()) => 0,
                     Err(e) => e,
                 };
@@ -21105,7 +21140,7 @@ fn sys_recvmsg_inet(
                         cursor += chunk;
                     }
                     // Connection-mode socket: Linux reports msg_namelen = 0.
-                    if let Err(e) = finish(&mut header, None, false) {
+                    if let Err(e) = finish(&mut header, RecvSrc::None, false) {
                         return e;
                     }
                     return n as u64;
@@ -21117,7 +21152,7 @@ fn sys_recvmsg_inet(
                         | crate::net::tcp::TcpState::Closed
                         | crate::net::tcp::TcpState::TimeWait
                 ) {
-                    return match finish(&mut header, None, false) {
+                    return match finish(&mut header, RecvSrc::None, false) {
                         Ok(()) => 0,
                         Err(e) => e,
                     };
@@ -21179,9 +21214,11 @@ pub(super) fn sys_recvmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
         return NEG_EBADF;
     }
     let nonblock = entry.nonblock || force_nonblock;
-    // AF_INET sockets (UDP/TCP) take a dedicated path: the DNS resolver drains
-    // UDP replies with recvmsg and validates the source address from msg_name.
-    // The Unix-socket SCM_RIGHTS machinery below does not apply.
+    // AF_INET / AF_INET6 sockets (UDP/TCP) take a dedicated path: the DNS
+    // resolver drains UDP replies with recvmsg and validates the source address
+    // from msg_name. `sys_recvmsg_inet` is family-aware (Phase 91) — it fills a
+    // 16-byte sockaddr_in or a 28-byte sockaddr_in6 per the socket's family. The
+    // Unix-socket SCM_RIGHTS machinery below does not apply.
     if let FdBackend::Socket { handle } = &entry.backend {
         return sys_recvmsg_inet(*handle, header, msghdr_ptr, nonblock);
     }

@@ -274,9 +274,6 @@ silently passing.
 - **RFC 8305 (Happy Eyeballs)** connection racing — this phase supplies inputs
   to musl's RFC 6724 sorting subset (now validated by `dns6-smoke`) but does not
   race connections.
-- **`sys_recvmsg_inet6`** — the v6 scatter/gather receive path. Only needed for
-  DNS-*over-v6-transport*; AAAA resolution rides IPv4 UDP transport, so nothing
-  in this phase depends on it.
 - **Live SLAAC / DHCPv6 over a real router** and the `CURL6_OK` real-internet
   TCP arm — implemented + host-tested, but live-validate only behind the opt-in
   `M3OS_IPV6_LIVE` arm (QEMU's libslirp sends no RAs / runs no DHCPv6 server).

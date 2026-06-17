@@ -25,8 +25,8 @@
 #![no_main]
 
 use syscall_lib::{
-    AF_INET6, IPPROTO_ICMPV6, SOCK_DGRAM, SOCK_STREAM, SockaddrIn6, accept, bind6, close, connect6,
-    exit, listen, read, sendto6, socket, write,
+    AF_INET6, IPPROTO_ICMPV6, SOCK_DGRAM, SOCK_STREAM, SYS_RECVMSG, SockaddrIn6, accept, bind6,
+    close, connect6, exit, listen, read, sendto6, socket, write,
 };
 
 const STDOUT: i32 = 1;
@@ -40,6 +40,7 @@ fn main(_args: &[&str]) -> i32 {
     case_bind();
     case_loopback();
     case_tcp();
+    case_recvmsg();
     emit("SMOKE:ipv6-smoke:PASS\n");
     0
 }
@@ -147,7 +148,6 @@ fn case_tcp() {
     if connect6(cli, &conn_addr) < 0 {
         fail("tcp", "connect6 ::1");
     }
-    emit("IPV6_SMOKE:tcp:connected\n");
 
     let conn = accept(srv, None);
     if conn < 0 {
@@ -168,6 +168,66 @@ fn case_tcp() {
     // synchronous `::1` loopback would half-close-deadlock (the peer's close
     // cannot run on this single thread), so let process exit reap the fds.
     ok("tcp");
+}
+
+/// `recvmsg` over AF_INET6 UDP (Phase 91 `sys_recvmsg_inet6`): a v6 UDP datagram
+/// sent to `::1` loops back internally and is read with `recvmsg`, asserting the
+/// payload plus that `msg_name` was filled with a 28-byte `sockaddr_in6`
+/// (`sin6_family == AF_INET6`, `msg_namelen == 28`).
+fn case_recvmsg() {
+    const PORT: u16 = 0x3100;
+
+    let rfd = socket(AF_INET6 as i32, SOCK_DGRAM as i32, 0);
+    if rfd < 0 {
+        fail("recvmsg", "recv socket");
+    }
+    let rfd = rfd as i32;
+    if bind6(rfd, &SockaddrIn6::new(UNSPECIFIED, PORT)) < 0 {
+        fail("recvmsg", "bind6");
+    }
+
+    let sfd = socket(AF_INET6 as i32, SOCK_DGRAM as i32, 0);
+    if sfd < 0 {
+        fail("recvmsg", "send socket");
+    }
+    let sfd = sfd as i32;
+    let payload = b"UDP6MSG!";
+    if sendto6(sfd, payload, 0, &SockaddrIn6::new(LOOPBACK, PORT)) < 0 {
+        fail("recvmsg", "sendto6 ::1");
+    }
+
+    // Hand-build `struct msghdr` (56 bytes) + one `struct iovec` (16 bytes).
+    let mut data = [0u8; 64];
+    let mut name = [0u8; 28];
+    let mut iov = [0u8; 16];
+    iov[0..8].copy_from_slice(&(data.as_mut_ptr() as u64).to_ne_bytes()); // iov_base
+    iov[8..16].copy_from_slice(&(data.len() as u64).to_ne_bytes()); // iov_len
+    let mut mh = [0u8; 56];
+    mh[0..8].copy_from_slice(&(name.as_mut_ptr() as u64).to_ne_bytes()); // msg_name
+    mh[8..12].copy_from_slice(&28u32.to_ne_bytes()); // msg_namelen
+    mh[16..24].copy_from_slice(&(iov.as_mut_ptr() as u64).to_ne_bytes()); // msg_iov
+    mh[24..32].copy_from_slice(&1u64.to_ne_bytes()); // msg_iovlen
+
+    let n = unsafe {
+        syscall_lib::syscall3(SYS_RECVMSG, rfd as u64, mh.as_mut_ptr() as u64, 0) as isize
+    };
+    if n < 8 || &data[..8] != payload {
+        fail("recvmsg", "payload round-trip mismatch");
+    }
+    // sin6_family at offset 0 of the filled msg_name.
+    let fam = u16::from_ne_bytes([name[0], name[1]]);
+    if fam != AF_INET6 as u16 {
+        fail("recvmsg", "msg_name not AF_INET6");
+    }
+    // msghdr is value-result: msg_namelen written back at offset 8 must be 28.
+    let namelen = u32::from_ne_bytes([mh[8], mh[9], mh[10], mh[11]]);
+    if namelen != 28 {
+        fail("recvmsg", "msg_namelen != 28");
+    }
+
+    close(sfd);
+    close(rfd);
+    ok("recvmsg");
 }
 
 fn emit(s: &str) {
