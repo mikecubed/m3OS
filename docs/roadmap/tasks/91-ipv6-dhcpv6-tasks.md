@@ -126,7 +126,7 @@
 **Acceptance:**
 - [ ] An inbound ICMPv6 Echo Request to a host-assigned address gets a checksum-correct Echo Reply (`ICMPV6_ECHO_OK`); `ECHO_RX_V6`/`ECHO_TX_V6` increment.
 - [ ] An Echo Request to `::1` is answered by the loopback short-circuit (`IPV6_LOOPBACK_OK`) **without** a frame reaching `net::send_frame` (verified by an unchanged TX counter), proving the no-loopback design.
-- [ ] ICMPv6 checksum is host-tested (includes the pseudo-header); a wrong-checksum packet is dropped.
+- [x] ICMPv6 checksum is host-tested (includes the pseudo-header); a wrong-checksum packet is dropped. *(kernel-core host tests; wrong-checksum drop in B.1 kernel handler)*
 
 ### B.2 — NDP neighbor discovery (Neighbor Solicitation / Advertisement)
 
@@ -152,7 +152,7 @@
 **Why it matters:** the RA is how a host learns its prefix + default route + whether to run DHCPv6 — IPv4's DHCP bundles all of this, IPv6 splits the routing part into the RA and the optional-config part into DHCPv6. The M/O flags drive C.1 vs C.2: SLAAC alone when M=0, DHCPv6 stateful when M=1. Parsing the RDNSS option here lets SLAAC-only networks still get a DNS server without DHCPv6.
 
 **Acceptance:**
-- [ ] A received RA's Prefix Information, router lifetime, M/O flags, and RDNSS option are parsed (host-tested against a captured `radvd` RA).
+- [x] A received RA's Prefix Information, router lifetime, M/O flags, and RDNSS option are parsed (host-tested against a captured `radvd` RA).
 - [ ] The RA source is installed as the IPv6 default gateway in `config` (C.1); a zero router-lifetime RA does not install a default route.
 - [ ] The M flag is surfaced so C.2 knows whether to start the stateful DHCPv6 exchange.
 
