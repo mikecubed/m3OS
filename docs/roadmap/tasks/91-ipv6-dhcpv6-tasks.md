@@ -42,9 +42,9 @@
 **Why it matters:** this is the structural mirror of `kernel-core/src/net/ipv4.rs` (`Ipv4Header`/`parse`/`build`/`PROTO_*`). The 40-byte fixed IPv6 header is simpler than IPv4 (no checksum field, no fragmentation in the base header), but the pseudo-header checksum is mandatory for the upper layers, so it lives here next to the header so every consumer (ICMPv6, UDP, TCP) shares one implementation.
 
 **Acceptance:**
-- [ ] `ipv6::parse` round-trips with `ipv6::build` for a known 40-byte header + payload; rejects a truncated header and a non-`6` version nibble.
-- [ ] `PROTO_ICMPV6 = 58` is defined; `PROTO_TCP`/`PROTO_UDP` are reused from the shared constants (next-header values are identical across v4/v6).
-- [ ] `pseudo_header_checksum` is host-tested against a hand-computed RFC 8200 vector.
+- [x] `ipv6::parse` round-trips with `ipv6::build` for a known 40-byte header + payload; rejects a truncated header and a non-`6` version nibble.
+- [x] `PROTO_ICMPV6 = 58` is defined; `PROTO_TCP`/`PROTO_UDP` are reused from the shared constants (next-header values are identical across v4/v6).
+- [x] `pseudo_header_checksum` is host-tested against a hand-computed RFC 8200 vector.
 
 ### A.3 — Extension-header chain walk
 
@@ -53,9 +53,9 @@
 **Why it matters:** real RAs and some routers prepend extension headers; the dispatcher must locate the true upper-layer protocol (ICMPv6/TCP/UDP) without choking. Per the design doc this is deliberately a **locate-and-skip** walk, not full option processing — enough for 1.0+ workloads, with the full set deferred.
 
 **Acceptance:**
-- [ ] `walk_ext_headers` returns the correct upper-layer protocol + offset for a packet with a Hop-by-Hop header followed by ICMPv6.
-- [ ] A malformed / cyclic header chain terminates after a bounded number of steps and is dropped (no infinite loop), proven by a host test.
-- [ ] Unsupported extension headers are skipped (not fatally rejected) when their length field is well-formed.
+- [x] `walk_ext_headers` returns the correct upper-layer protocol + offset for a packet with a Hop-by-Hop header followed by ICMPv6.
+- [x] A malformed / cyclic header chain terminates after a bounded number of steps and is dropped (no infinite loop), proven by a host test.
+- [x] Unsupported extension headers are skipped (not fatally rejected) when their length field is well-formed.
 
 ### A.4 — EtherType demux hook for IPv6
 
