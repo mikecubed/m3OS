@@ -12828,11 +12828,17 @@ fn cmd_pku_smoke(args: &SmokeBootArgs) {
 // Phase 91 — ipv6-smoke: dual-stack IPv6 acceptance gate
 // ---------------------------------------------------------------------------
 
-/// Smoke steps for `cargo xtask ipv6-smoke`. Boots m3OS, asserts the kernel
-/// formed its link-local address (deterministic — needs only the NIC MAC), logs
-/// into sh0, runs the `ipv6-smoke` binary, and asserts `SMOKE:ipv6-smoke:PASS`.
-/// `live` adds best-effort assertions on the SLAAC + stateless-DHCPv6-DNS kernel
-/// log lines produced against the SLIRP `ipv6=on` router (the live wire arms).
+/// Smoke steps for `cargo xtask ipv6-smoke`. Boots m3OS with SLIRP `ipv6=on`,
+/// asserts the kernel formed its link-local address and answered a live
+/// Neighbor Solicitation (NDP works over the wire — SLIRP solicits the guest's
+/// link-local, which the guest resolves), logs into sh0, runs the `ipv6-smoke`
+/// binary, and asserts `SMOKE:ipv6-smoke:PASS`.
+///
+/// SLAAC + stateless-DHCPv6-DNS need a real IPv6 router: QEMU 8.2.2's libslirp
+/// does Neighbor Solicitation but sends NO Router Advertisements and runs no
+/// DHCPv6 server (packet-capture-confirmed), so those wire arms are gated behind
+/// `live` (`M3OS_IPV6_LIVE=1`, a TAP + radvd/dhcpd host setup) and skip by
+/// default — mirroring the established opt-in `*_NET` regression pattern.
 fn ipv6_smoke_steps(live: bool) -> Vec<SmokeStep> {
     let mut steps = vec![SmokeStep::Wait {
         pattern: "[m3os] Hello from kernel",
@@ -12846,14 +12852,21 @@ fn ipv6_smoke_steps(live: bool) -> Vec<SmokeStep> {
         timeout_secs: 30,
         label: "guest/ipv6-smoke: link-local address formed (IPV6_ADDR_OK)",
     });
-    // The live wire arms (SLAAC global from the SLIRP RA, stateless DHCPv6 DNS).
-    // Best-effort: asserted only with M3OS_IPV6_LIVE=1, since SLIRP RA timing is
-    // less deterministic than the always-on ring-3 arms.
+    // Live NDP over the wire: the guest's DHCPv6/RS traffic makes SLIRP resolve
+    // the guest's link-local; the guest answers the Neighbor Solicitation with a
+    // Neighbor Advertisement. Deterministic against SLIRP (which always does
+    // NS/NA) — proves B.2 end-to-end on real frames (NDP_RESOLVE_OK).
+    steps.push(SmokeStep::Wait {
+        pattern: "[ndp] neighbor advertisement sent",
+        timeout_secs: 40,
+        label: "guest/ipv6-smoke: answered a live Neighbor Solicitation (NDP_RESOLVE_OK)",
+    });
+    // SLAAC global + stateless DHCPv6 DNS — need a real router (see doc comment).
     if live {
         steps.push(SmokeStep::Wait {
             pattern: "[ndp] SLAAC global",
             timeout_secs: 30,
-            label: "guest/ipv6-smoke: SLAAC global address from SLIRP RA (SLAAC_ADDR_OK)",
+            label: "guest/ipv6-smoke: SLAAC global address from RA (SLAAC_ADDR_OK)",
         });
         steps.push(SmokeStep::Wait {
             pattern: "[dhcpv6] bound",

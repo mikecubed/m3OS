@@ -197,7 +197,12 @@ pub fn handle_neighbor_solicitation(src_ip: &Ipv6Addr, icmpv6_msg: &[u8]) {
     let na =
         ndp_core::build_neighbor_advertisement(ns.target, our_mac, true, true, ns.target, *src_ip);
     emit(ns.target, *src_ip, dst_mac, our_mac, &na);
-    NDP_REPLIES.fetch_add(1, Ordering::Relaxed);
+    let prev = NDP_REPLIES.fetch_add(1, Ordering::Relaxed);
+    if prev == 0 {
+        // One-time marker proving NDP neighbor discovery works bidirectionally
+        // over the wire (a peer solicited one of our addresses and we answered).
+        log::info!("[ndp] neighbor advertisement sent (NDP_RESOLVE_OK)");
+    }
 }
 
 /// Handle an inbound Neighbor Advertisement: learn `(target, target_lladdr)` so
