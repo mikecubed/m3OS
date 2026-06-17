@@ -2,9 +2,9 @@
 
 **Status:** Planned (post-1.0)
 **Source Ref:** phase-91
-**Depends on:** Phase 16 (Network) ✅, Phase 77 (Pre-1.0 Correctness — TCP retransmission + DNS stub), Phase 83 (Release 1.0 Gate)
+**Depends on:** Phase 16 (Network) ✅, Phase 77 (Pre-1.0 Correctness — TCP retransmission + DNS stub) ✅, Phase 83 (Release 1.0 Gate) ✅
 **Builds on:** Adds IPv6 + DHCPv6 + IPv6-aware DNS to the IPv4-only 1.0 network stack
-**Primary Components:** `kernel/src/net/ipv6.rs` (new), `kernel/src/net/icmpv6.rs` (new), `kernel/src/net/ndp.rs` (new — Neighbor Discovery Protocol), `kernel/src/net/dhcpv6.rs` (new), `userspace/syscall-lib/src/net/` (AF_INET6 socket surface), `userspace/syscall-lib/src/dns/` (AAAA record support)
+**Primary Components:** `kernel-core/src/net/ipv6.rs` + `kernel/src/net/ipv6.rs` (new), `kernel-core/src/net/icmpv6.rs` + `kernel/src/net/icmpv6.rs` (new), `kernel-core/src/net/ndp.rs` + `kernel/src/net/ndp.rs` (new — Neighbor Discovery Protocol), `kernel-core/src/net/dhcpv6.rs` + `kernel/src/net/dhcpv6.rs` (new), the EtherType demux in `kernel/src/net/dispatch.rs` and dual-stack config in `kernel/src/net/config.rs` (extended), the `AF_INET6` / `sockaddr_in6` socket surface in `userspace/syscall-lib/src/lib.rs` + `kernel/src/arch/x86_64/syscall/mod.rs` (extended), AAAA resolution through the Phase 77 resolver path, and a new `userspace/ping6`
 
 ## Milestone Goal
 
@@ -58,7 +58,11 @@ SLAAC alone gives the host an address and a default route. DHCPv6 (when the RA's
 
 ### RFC 6724 address selection
 
-When both endpoints support v4 and v6, the kernel must pick which family to connect over. RFC 6724 specifies a priority-based ordered rule set. The naive "always prefer v6" rule famously broke user experience in the early 2010s — Happy Eyeballs (RFC 8305) was the eventual fix, racing both connection attempts and using whichever completed first.
+When both endpoints support v4 and v6, the kernel must pick which family to connect over. RFC 6724 specifies a priority-based ordered rule set. The naive "always prefer v6" rule famously broke user experience in the early 2010s — Happy Eyeballs (RFC 8305) was the eventual fix, racing both connection attempts and using whichever completed first. m3OS's prebuilt musl already applies an RFC 3484/6724 sorting *subset* to `getaddrinfo` results (it does not do glibc's full per-destination source-address probe); the work in this phase is supplying the source-address/scope inputs that subset consumes — and gating v6-preference on whether a usable global v6 source is actually configured — not re-implementing the rule set.
+
+### Loopback and the `::1` acceptance test
+
+m3OS has **no general loopback interface** — there is no `lo` device, and even IPv4 `127.0.0.1` is not routed (Phase 89's `node-smoke` notes egress is proven over the real TCP path precisely because there is no loopback). The `kernel/src/net/dispatch.rs` RX path only sees frames that arrive from a NIC driver. So the `ping6 ::1` acceptance criterion cannot be satisfied by a routed loopback; instead the ICMPv6 echo handler short-circuits Echo Requests addressed to `::1` (and to any address the host has assigned to itself) by synthesizing the Echo Reply locally, without ever touching the wire. This mirrors how the existing userspace `ping` is served — there is no loopback NIC, the kernel answers directly.
 
 ## How This Builds on Earlier Phases
 
@@ -68,25 +72,25 @@ When both endpoints support v4 and v6, the kernel must pick which family to conn
 
 ## Implementation Outline
 
-1. Land `Ipv6Addr` + header framing + `AF_INET6` socket family.
-2. Land ICMPv6 Echo so `ping6` works against a manually configured address.
+1. Land `Ipv6Addr` + header framing + the EtherType `0x86DD` demux hook in `dispatch.rs` + the `AF_INET6` / `sockaddr_in6` socket family in the existing socket-layer code.
+2. Land ICMPv6 Echo (with an internal `::1` / own-address loopback short-circuit, since m3OS has no general loopback interface) so `ping6 ::1` works and `ping6 <peer>` works against a manually configured address.
 3. Land NDP + SLAAC; verify automatic address acquisition on a QEMU network with a Router Advertisement Daemon (`radvd`).
 4. Land DHCPv6 client; verify against a `dhcpd` IPv6 pool.
 5. Wire AAAA in the resolver; verify `getaddrinfo("github.com", ...)` returns v6 + v4 addresses.
-6. Implement the RFC 6724 selection rules.
-7. Bump kernel to the next post-1.0 minor version.
+6. Implement / validate the RFC 6724 selection rules (musl sorts; ensure correct source-address inputs).
+7. Bump kernel to the next post-1.0 minor version (`0.90.1` → `0.91.0`) and land the Phase 91 learning doc (`docs/91-ipv6-dhcpv6.md`).
 
 ## Acceptance Criteria
 
-- `ping6 ::1` works against the loopback.
-- m3OS on a QEMU dual-stack network with `radvd` running pulls a SLAAC address automatically.
-- `curl http://[2606:4700::1111]/` (or any IPv6 literal HTTP endpoint) returns a response.
-- `getaddrinfo("github.com", ...)` returns both IPv4 and IPv6 addresses; the kernel picks one per RFC 6724.
-- No regression in IPv4 — the existing TCP/IP stack continues to work, including the Phase 77 retransmission + multi-slot work.
+- `ping6 ::1` reports a reply via the ICMPv6 loopback short-circuit (m3OS has no `lo` device — verified by an unchanged TX counter proving no frame reached `net::send_frame`; the `IPV6_LOOPBACK_OK` sentinel).
+- On a QEMU dual-stack network (SLIRP `ipv6=on`, which sends Router Advertisements) m3OS forms a global SLAAC address automatically (`SLAAC_ADDR_OK`); the stateful-DHCPv6 lease arm is opt-in against an external `radvd`/`dhcpd` (`M3OS_IPV6_NET=1`).
+- `curl http://[<IPv6 literal, e.g. 2606:4700::1111>]/` returns an HTTP response over IPv6 (opt-in `M3OS_IPV6_NET=1`; `CURL6_OK`).
+- `getaddrinfo("github.com", ...)` returns both IPv4 (A) and IPv6 (AAAA) addresses (`AAAA_RESOLVE_OK`); the result is ordered per RFC 6724 (`RFC6724_OK`, inspecting the returned `addrinfo` order).
+- No regression in IPv4 — the `smoke-test`, `regression`, and `dns-smoke` gates stay green, including the Phase 77 retransmission + multi-slot work.
 
 ## Companion Task List
 
-- [Phase 91 Task List](./tasks/91-ipv6-dhcpv6-tasks.md) — to be authored when implementation planning begins.
+- [Phase 91 Task List](./tasks/91-ipv6-dhcpv6-tasks.md)
 
 ## How Real OS Implementations Differ
 
