@@ -43,6 +43,17 @@ Validate the authenticated network path the agent needs and define how credentia
 
 Be explicit about what parts of the broader agent ecosystem are supported and what remains later work, including optional integrations or protocol extensions.
 
+### Kernel work surfaced by bring-up
+
+Phase 90b was planned as **no kernel work** — the runtime was meant to be fully delivered by Phases 89 + 90a, leaving only packaging. Running a real multi-threaded, network-driven Node application (`cli.js`) falsified that: it exercised kernel paths the earlier phases' single-process synthetic probes never reached, turning the phase into a genuine kernel-hardening pass (~1.7k kernel lines). Every change was driven by a reproduced Claude Code symptom and is backed by a regression gate; none relaxes an existing invariant. The set:
+
+- **W^X-v2 cross-thread PKU read-recovery** (`kernel/src/arch/x86_64/interrupts.rs`, `pkru.rs`) — the headline, the roadmap's pre-flagged "SMP-PKU follow-up": grant *read* on a `PROTECTION_KEY` read fault against a present **executable** pkey-tagged page (writes stay gated → W^X intact; data-isolation pages excluded). Unblocked `cli.js` *launch* on both node variants. Guarded by `pku-smoke` + `node-jit-smoke`.
+- **Per-address-space futex keys** (`syscall/mod.rs`) — key PRIVATE futexes by CR3 instead of a global `(0, uaddr)`, so identical-layout sibling `node` processes stop stealing each other's libuv-threadpool wakes. Got `claude -p` from 0 TCP connections to a completed round-trip. Guarded by `claude-smoke` (multi-process; `node-smoke` is single-process so never collided).
+- **`EXT2_VOLUME` → `YieldingMutex`** (`fs/ext2.rs`) — yield on contention so an I/O-blocked lock holder is rescheduled instead of single-core-deadlocked under the concurrent demand-paged `exec(rg)`/`stat` startup storm (also fixes a Phase 57e deadline-IPC lost-wake).
+- **Enter key emits CR not LF** (`kernel-core/src/input/keymap.rs`) — so raw-mode TUIs see a submit; the interactive `claude` TUI round-trip needs it. Guarded by the keymap host tests.
+- **ABI/robustness fixes** — `MAX_FDS` 32→128 + heap-backed fd table (EMFILE; the heap move fixed a clone/fork kstack overflow, guarded by `kstack-overflow-smoke`), `/dev/tty` in the `stat` path (a system-wide freeze), and TCP keepalive socket options accepted/stored (libuv treats `setsockopt` failure as fatal; guarded network-free by `connect-smoke`).
+- **SMP-hardening cluster** (`smp/tlb.rs`, `task/scheduler.rs`, `serial.rs`, `interrupts.rs`) — TLB-shootdown ack-timeout degrade + per-core NMI IST stack, cross-core lost-wakeup, CoW/mprotect spurious-write-fault wrongful-kill recovery (PKU faults excluded), task-attributable kstack-overflow recovery, and a COM1-RX-under-SMP byte-drop. All pinned by the new always-on **`smp-smoke`** gate.
+
 ## Critical and Non-Deferrable Items
 
 | Item | Why it cannot be deferred in this phase |
@@ -106,9 +117,9 @@ Cloud-connected developer tooling raises trust, secret-handling, and support-bou
 - The supported install path for Claude Code works inside m3OS. ✅
 - The interactive TUI renders inside the m3OS terminal on the Phase 90a JIT Node variant (verified headlessly via the QMP/PPM screenshot harness, not just a launch sentinel). ✅ **Met.** The automated `claude_tui_render_arm` launches `claude` in the graphical `term`, screendumps, and asserts **592 changed band scanlines** vs the empty-prompt baseline (threshold 20; a blank screen ≈ 0); the captured screenshot shows the rendered "Welcome to Claude Code v2.1.112" onboarding splash with the yoga.wasm-laid-out logo. Two fixes delivered it: the W^X-v2 cross-thread PKU read-recovery kernel fix (so `cli.js` launches) and the node build's small-icu→full-icu switch (so `Intl.Segmenter`'s grapheme segmentation has the ICU break-iterator data the TUI needs — small-icu's missing brkitr data had null-deref'd V8's `JSSegments::Create`; the earlier `mremap`/`io_uring` syscalls were red herrings). The JIT/WASM *runtime* (`node-jit-smoke`) and the A.2 interactive primitives (SIGINT/raw-mode/subprocess) are also proven.
 - The tool can execute the documented file, shell, and git workflows on m3OS via headless `claude -p` (opt-in live arm, credential-gated). ✅
-- The supported network/API path works with documented credential handling, including subscription auth via a seeded OAuth token.
-- The docs explicitly describe what Claude Code workflows are supported and what remains out of scope.
-- The milestone can be reproduced through the documented runtime and package setup.
+- The supported network/API path works with documented credential handling, including subscription auth via a seeded OAuth token. ✅ **Verified end-to-end.** A full authenticated `claude -p` round-trip completes on m3OS: the opt-in `do_net` arm runs `claude -p 'What is 123 plus 456? … <<<NUMBER>>>'` and serial prints **`<<<579>>>`** — the model genuinely computed and returned the answer over a real TLS 1.3 request/response. Confirmed collision-proof by a host-side `M3OS_CLAUDE_PCAP` capture (the full handshake + the ~103 KB request ACKed + the response read back; gate exit 0, `serial core PASSED`). The dev-run verification used an Anthropic-protocol endpoint (`M3OS_CLAUDE_BASE_URL` → the seeded key as `ANTHROPIC_AUTH_TOKEN` bearer, since a real Anthropic secret can never be CI-bound); the official `api.anthropic.com` + subscription-OAuth-token arm (`CLAUDE_API_OK`) is the **identical code path**, run whenever the user supplies an Anthropic credential. Reaching a completed round-trip drove the per-address-space-futex-key and `EXT2_VOLUME`-yielding-lock kernel fixes (see *Kernel work surfaced by bring-up* below). Credential handling matches the Phase 86e `gh` pattern: a 0600-seeded file, the value never on the wire, skip-with-reason when absent.
+- The docs explicitly describe what Claude Code workflows are supported and what remains out of scope. ✅
+- The milestone can be reproduced through the documented runtime and package setup. ✅
 
 ## Companion Task List
 

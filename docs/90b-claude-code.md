@@ -21,9 +21,10 @@ install claude-code` (solving `DEPS=node` dependency-first) → `claude --versio
 A.2 `NODE_SIGINT_OK`/`NODE_SPAWN_OK`/`NODE_RAWMODE_OK` interactive-substrate
 probes + a `SEG_OK` `Intl.Segmenter` guard — **27/27 on the jitless full-install
 gate** (the CI-viable default, no KVM/PKU needed) and on the **90a JIT node**
-(`M3OS_CLAUDE_JIT=1`, KVM/PKU-gated), plus opt-in live arms (an authenticated
-`claude -p` round-trip to `api.anthropic.com`, a file/shell/git agent workflow
-asserted by `cat`/`git log`). **And the interactive `claude` TUI renders on the
+(`M3OS_CLAUDE_JIT=1`, KVM/PKU-gated), plus opt-in live arms — an authenticated
+`claude -p` round-trip **verified working end-to-end** (a `<<<579>>>` answer over
+a real TLS request/response, confirmed by a host-side packet capture) and a
+real-filesystem agent workflow asserted by `cat`. **And the interactive `claude` TUI renders on the
 90a JIT node** — proven by an automated QMP/PPM render arm
 (`claude_tui_render_arm`): it launches `claude` in the graphical `term`,
 screendumps, and asserts **592 changed band scanlines** vs the empty-prompt
@@ -39,18 +40,24 @@ V8's `JSSegments::Create` — see *The A.1 WASM/TUI decision* below). (The early
 `0.90.0` → `0.90.1` (Phase 90a took the `0.90.0` minor; this sub-phase takes the
 patch, mirroring the 86a–f sub-phase pattern).
 
-Phase 90b was **planned as "no kernel work"**, but the integration test surfaced
-one real W^X-v2 cross-thread PKU gap — exactly the kind of finding the phase
-exists to surface — and a single principled page-fault-handler fix landed as a
-documented Phase 90a PKU follow-up (see *The W^X-v2 cross-thread PKU
-read-recovery fix* below). It is the centerpiece of the as-built story: it
-unblocked `cli.js` on *both* node variants. The rest of the runtime substrate is
-delivered by Phase 89 (static Node 22, the `timerfd` event loop, the libuv
-threadpool `FUTEX_CMP_REQUEUE` fix, always-on in-kernel-TCP egress) and Phase
-90a (PKU-backed W^X v2 + a JIT Node variant on which `yoga.wasm` instantiates).
-This phase's deliverable is packaging, environment pinning, credential handling,
-the one PKU follow-up fix, and — most importantly — an honest, falsifiable
-supported-workflow boundary. The one Phase 89 leftover it closes is the
+Phase 90b was **planned as "no kernel work"**, but the integration test falsified
+that — running a real multi-threaded, network-driven Node application surfaced a
+cluster of kernel gaps the earlier phases' single-process synthetic probes never
+reached, turning the phase into a genuine kernel-hardening pass (~1.7k kernel
+lines, every change driven by a reproduced Claude Code symptom and regression-gated).
+The headline is a W^X-v2 cross-thread PKU read-recovery fix (the roadmap had
+pre-flagged it as the "SMP-PKU follow-up"); it unblocked `cli.js` *launch* on both
+node variants. Carrying it to a completed `claude -p` round-trip and a rendering
+TUI then took per-address-space futex keys, an `EXT2_VOLUME` yielding lock, an
+Enter-key-CR keymap fix, `MAX_FDS`/heap-fd-table/`/dev/tty`/TCP-keepalive
+ABI fixes, and an SMP-hardening cluster behind the new `smp-smoke` gate — all
+enumerated in *Kernel fixes the integration test surfaced* below. The rest of the
+runtime substrate is delivered by Phase 89 (static Node 22, the `timerfd` event
+loop, the libuv threadpool `FUTEX_CMP_REQUEUE` fix, always-on in-kernel-TCP egress)
+and Phase 90a (PKU-backed W^X v2 + a JIT Node variant on which `yoga.wasm`
+instantiates). This phase's deliverable is packaging, environment pinning,
+credential handling, the bring-up kernel fixes, and — most importantly — an honest,
+falsifiable supported-workflow boundary. The one Phase 89 leftover it closes is the
 explicitly deferred in-Node interactive substrate (`NODE_SIGINT_OK` and the
 `NODE_SPAWN_OK`/`NODE_RAWMODE_OK` raw-mode/spawn probes), now validated in the
 `claude-smoke` always-on core.
@@ -65,9 +72,11 @@ explicitly deferred in-Node interactive substrate (`NODE_SIGINT_OK` and the
 - The **runtime dependency chain** — `claude-code` (`DEPS=node`) → the bundled
   Node runtime (jitless by default; the 90a JIT variant for the TUI) → the
   `/usr/bin/claude` launcher → the Phase 86a CA bundle.
-- **The W^X-v2 cross-thread PKU read-recovery fix** — the one kernel change the
-  integration test forced, landed as a 90a PKU follow-up; what unblocked
-  `cli.js` *launch* on both node variants.
+- **The kernel fixes the integration test surfaced** — the W^X-v2 cross-thread
+  PKU read-recovery headline (what unblocked `cli.js` *launch* on both node
+  variants), plus the per-address-space futex keys, `EXT2_VOLUME` yielding lock,
+  Enter-key-CR, `MAX_FDS`/`/dev/tty`/TCP-keepalive ABI, and SMP-hardening fixes
+  that carried it to a completed `claude -p` round-trip and a rendering TUI.
 - **The small-icu→full-icu node build fix** — why the interactive TUI needed it
   (small-icu lacked the ICU break-iterator data `Intl.Segmenter` needs →
   `JSSegments::Create` null-deref), and why the `mremap`/`io_uring` syscalls in
@@ -199,16 +208,18 @@ tools relative to its own dir (the WASM TUI engine is embedded in `cli.js`).
 shebang→node→in-process-`import()` chain + relocated install layout end-to-end —
 asserted in the Track D always-on core.
 
-### The W^X-v2 cross-thread PKU read-recovery fix (the one kernel change)
+### Kernel fixes the integration test surfaced (the W^X-v2 PKU read-recovery headline + more)
 
 Phase 90b was planned with **no kernel work**: the runtime was supposed to be
 fully delivered by Phases 89 + 90a, leaving only packaging. The integration test
-falsified that assumption in the best possible way — it surfaced a real
-W^X-v2 cross-thread PKU gap that 90a's synthetic probes never exercised. This is
-exactly what an integration phase exists to find, and the roadmap had even
-pre-flagged it as the "SMP-PKU follow-up." A single principled
-page-fault-handler fix closes it; it lands here as a documented **Phase 90a PKU
-follow-up**.
+falsified that assumption in the best possible way — running a real multi-threaded,
+network-driven Node application (`cli.js`) exercised kernel paths that Phase 89/90a's
+synthetic probes never touched, and each gap it surfaced is exactly what an
+integration phase exists to find. The headline is a W^X-v2 cross-thread PKU gap
+the roadmap had even pre-flagged as the "SMP-PKU follow-up"; it is described in
+full below, and the **other bring-up fixes are enumerated after it**. None of
+these weaken an existing invariant — they are robustness/ABI-conformance fixes on
+paths the earlier phases' single-process synthetic probes did not reach.
 
 **The bug.** A real-world Node process (`cli.js`) allocates a write-deny
 protection key for its V8 code space, then spawns worker/background threads
@@ -245,8 +256,57 @@ This fix unblocks `cli.js` on **both** the jitless node (where it's the actual
 blocker — jitless still spawns the same threads and tags the same code pages) and
 the JIT node. See `kernel/src/arch/x86_64/interrupts.rs` (`page_fault_handler` +
 a new `leaf_pte_flag_bits` helper) and `kernel/src/arch/x86_64/pkru.rs` (the new
-`grant_read_access`). The earlier "no kernel work" framing is corrected to: one
-documented page-fault-handler fix landed as a 90a PKU follow-up.
+`grant_read_access`).
+
+#### The other bring-up fixes (the rest of the "no kernel work" correction)
+
+The PKU read-recovery got `cli.js` to *launch*; carrying it from launch to a
+rendering interactive TUI and a completed authenticated `claude -p` round-trip
+surfaced a further set of kernel fixes. They are robustness/ABI-conformance
+changes (no invariant relaxed), each landed with the symptom that found it:
+
+- **`EXT2_VOLUME` → `YieldingMutex`** (`kernel/src/fs/ext2.rs`). `claude -p`'s
+  concurrent demand-paged `exec(rg)`/`stat` startup storm wedged the single core:
+  a task sleeping in virtio-blk I/O *while holding* the plain-spinlock ext2 volume
+  lock could never be rescheduled to release it, because a second task busy-spun
+  the only core on `EXT2_VOLUME.lock()`. The lock now `yield_now()`s on contention
+  (uncontended boot-mount fast path unchanged). Same fix also corrects a Phase 57e
+  deadline-IPC lost-wake (`recv/call_msg_with_deadline` registered the waker after
+  the pending-message recheck).
+- **Per-address-space futex keys** (`kernel/src/arch/x86_64/syscall/mod.rs`).
+  PRIVATE futexes were keyed `(0, uaddr)` — a single global root — so two
+  identical-layout `node` subprocesses (Claude spawns several) whose libuv
+  threadpool condvars sit at the same virtual address aliased into one wait queue
+  and stole each other's wakes. Now keyed by the active page-table root (CR3);
+  `CLONE_THREAD` siblings share it, distinct processes don't. `node-smoke` runs
+  one node process so it never collided — which is why this only surfaced here.
+- **Enter key emits CR not LF** (`kernel-core/src/input/keymap.rs`). The graphical
+  keymap mapped `KEY_ENTER` to LF; a raw-mode TUI (which clears `ICRNL` and watches
+  for `\r`) never saw a submit, leaving a typed prompt stuck in the input box.
+  `KEY_ENTER => '\r'` aligns the graphical path with the serial/`term`/DOOM paths;
+  cooked-mode shell is unchanged (`ICRNL` still converts CR→LF).
+- **`MAX_FDS` 32 → 128 + heap-backed fd table** (`kernel/src/process/mod.rs`).
+  Claude Code opened enough fds to hit `EMFILE`; widening the table moved it
+  onto the heap, which in turn fixed a node `clone`/`fork` kernel-stack overflow
+  from the larger on-stack table (regression-guarded by `kstack-overflow-smoke`).
+- **`/dev/tty` in the `stat` path** (`kernel/src/arch/x86_64/syscall/mod.rs`).
+  A missing `/dev/tty` stat case froze the machine system-wide.
+- **TCP keepalive socket options accepted/stored** (`kernel/src/net/mod.rs`).
+  libuv treats *any* `setsockopt(SO_KEEPALIVE/TCP_KEEP*)` failure as fatal; the
+  kernel now accepts and round-trips them (the *prober* is a documented future
+  networking item — see Deferred). Guarded network-free by `connect-smoke`.
+- **SMP hardening** (`kernel/src/smp/tlb.rs`, `scheduler.rs`, `serial.rs`,
+  `arch/x86_64/interrupts.rs`). Running Claude on multiple cores surfaced a
+  cluster of races — a TLB-shootdown ack-timeout panic (now a degrade + per-core
+  NMI IST stack), a cross-core lost-wakeup, a CoW/mprotect spurious-write-fault
+  wrongful-kill (with PKU faults excluded from the spurious-recovery path), a
+  task-attributable kernel-stack-overflow now recovered instead of halting, and a
+  COM1-RX-under-SMP byte-drop. All five are pinned by the new always-on
+  **`smp-smoke`** regression gate.
+
+The honest correction to the "no kernel work" framing: the integration test
+turned Phase 90b into a real kernel-hardening pass (~1.7k kernel lines), every
+change driven by a reproduced Claude Code symptom and backed by a regression gate.
 
 ### Credential posture: subscription-first, 0600, never on the wire
 
@@ -401,20 +461,38 @@ far faster under KVM). Absent the build prerequisites (host C++ toolchain for th
 node dep) it prints `SKIP (reason: …)` and returns success.
 
 The **opt-in live arms** (`M3OS_CLAUDE_NET=1` + a `M3OS_CLAUDE_TOKEN` /
-`M3OS_CLAUDE_KEY`) are the actual milestone — the agent *does work*:
+`M3OS_CLAUDE_KEY`) are the actual milestone — and a full authenticated `claude -p`
+round-trip is **verified working end-to-end on m3OS**, not merely implemented:
 
-- **`CLAUDE_API_OK`** — `claude -p 'Reply with exactly CLAUDE_API_OK and nothing
-  else'` completes a full TLS 1.3 handshake + cert-chain validation against
-  `api.anthropic.com` (Node's bundled OpenSSL + the 86a CA bundle + c-ares DNS)
-  and prints the sentinel; subscription-token mode preferred.
-- **File/shell/git workflow** — a scripted `claude -p` creates a named file with
-  known content, runs a shell command, and makes a git commit, asserted
-  **outside** the agent by `cat` of the file and `git log --oneline` (the
-  assertion trusts the filesystem and git, never the model's own claim).
+- **Verified round-trip (OpenRouter / any Anthropic-protocol endpoint).** With
+  `M3OS_CLAUDE_BASE_URL` + `M3OS_CLAUDE_MODEL` set (the seeded key becomes the
+  `ANTHROPIC_AUTH_TOKEN` bearer), `claude -p 'What is 123 plus 456? … <<<NUMBER>>>'`
+  completes a full TLS 1.3 handshake + the request/response exchange and prints
+  **`<<<579>>>`** over serial — the model genuinely computed and returned the
+  answer. This was confirmed collision-proof (a host-side `M3OS_CLAUDE_PCAP` of
+  `net0` captured the entire TLS handshake + the ~103 KB request ACKed + the
+  response read back; the gate reports `serial core PASSED`, exit 0). The unique
+  `<<<579>>>` delimiter is used precisely because a bare `579` false-matched a
+  kernel watchdog timestamp — so the pass means a real API answer, never a hang.
+  Getting here is what drove the per-address-space-futex-key and
+  `EXT2_VOLUME`-yielding-lock kernel fixes above (and the Enter-key-CR fix for the
+  interactive TUI round-trip).
+- **`CLAUDE_API_OK` (official `api.anthropic.com` path).** Without a base-URL
+  override the arm runs `claude -p 'Reply with exactly CLAUDE_API_OK …'` against
+  `api.anthropic.com` (Node's bundled OpenSSL + the 86a CA bundle + c-ares DNS),
+  subscription-OAuth-token mode preferred. The code path is identical to the
+  verified OpenRouter arm; it runs whenever the user supplies an Anthropic
+  credential (a real Anthropic secret can never be CI-bound, so the dev-run
+  verification above used an Anthropic-protocol proxy instead).
+- **Real-filesystem agent workflow** — `claude -p '… Use the Write tool to create
+  /root/claude-work.txt containing WORKFLOW_FILE_OK' --allowedTools Write`, then
+  the gate asserts the content **outside** the agent via `cat` (`WORKFLOW_FILE_OK`)
+  — trusting the filesystem, never the model's own claim. (The delivered proof is
+  the agent's Write tool touching the real FS; a broader shell + `git log --oneline`
+  commit assertion is a documented future extension, not in the as-built arm.)
 
-Skip-with-reason when unconfigured (real egress to `api.anthropic.com:443` + a
-secret can never be CI-bound) — the always-on core is what CI sees, mirroring
-`gh-smoke` / `git-https-smoke`.
+Skip-with-reason when unconfigured (real egress + a secret can never be CI-bound)
+— the always-on core is what CI sees, mirroring `gh-smoke` / `git-https-smoke`.
 
 **The full interactive `claude` TUI renders on the 90a JIT node, proven
 automatically by the QMP/PPM render arm.** Everything the TUI depends on is
@@ -495,8 +573,13 @@ With the documented steps a user can reproduce, on m3OS:
    JIT node — runtime WASM + the W^X-v2 PKU read-recovery fix unblock
    `cli.js` *launch* on the JIT variant.
 5. With a seeded `M3OS_CLAUDE_TOKEN` (or `M3OS_CLAUDE_KEY`) and
-   `M3OS_CLAUDE_NET=1`: `claude -p` round-trips `api.anthropic.com`
-   (`CLAUDE_API_OK`), and a scripted agent workflow uses the Write tool to create
+   `M3OS_CLAUDE_NET=1`, `claude -p` completes a full authenticated round-trip —
+   **verified end-to-end** (a `<<<579>>>` answer over a real TLS request/response,
+   confirmed collision-proof by an `M3OS_CLAUDE_PCAP` capture). Adding
+   `M3OS_CLAUDE_BASE_URL`/`M3OS_CLAUDE_MODEL` runs it against an Anthropic-protocol
+   endpoint (the path the dev-run verification used); without them it runs against
+   `api.anthropic.com` (`CLAUDE_API_OK`) on a user-supplied Anthropic credential —
+   identical code. A scripted agent workflow then uses the Write tool to create
    `/root/claude-work.txt` with known content — proven *outside* the agent by
    `cat` (`WORKFLOW_FILE_OK`), not the model's own claim. (The as-built arm
    asserts the file write; a shell-command / `git commit` + `git log` assertion is
@@ -539,3 +622,9 @@ Everything outside that list is a non-goal (below).
 - **Live `npm install -g`** — implemented as an opt-in real-internet arm only;
   the sealed `.m3pkg` is the supported install path (a VFS-throughput limit, not
   a network gap).
+- **TCP keepalive *prober*** — bring-up made `setsockopt(SO_KEEPALIVE/TCP_KEEP*)`
+  ABI-conformant (accepted + stored + round-tripped, so libuv's `fetch` path
+  connects), but the kernel does not yet *send* keepalive probes. Not required
+  here (an active API/SSE stream keeps data flowing so the idle timer never fires;
+  a dead idle pooled socket is caught on reuse by undici's retry path); scheduled
+  for a future networking phase. See the design doc's *Deferred Until Later*.
