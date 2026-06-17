@@ -517,42 +517,29 @@ pub fn init_buddy() {
     // where the per-frame Vec hits the 8 MiB initial-heap boundary
     // mid-drain and the kernel hangs forever spinning on its own
     // mutex.
-    let (initial_free, total_pfns) = {
+    let total_pfns = {
         let alloc = FRAME_ALLOCATOR.0.lock();
-        (alloc.free_count, (alloc.max_frame_number as usize) + 1)
+        (alloc.max_frame_number as usize) + 1
     };
 
-    // Pre-allocate to exact capacity *before* re-acquiring the lock,
-    // so every push during the drain is a constant-time slot fill —
-    // no grow-doubling, no allocator re-entry.
-    let mut frames: Vec<u64> = Vec::with_capacity(initial_free);
-
-    // Build the buddy bitmaps before draining. This allocation is the
-    // other large heap consumer (a few hundred KiB of bitmap vectors)
-    // and we want it done while the free-list path is still active so
-    // any `grow_heap` calls — if they happen — succeed.
+    // Build the buddy bitmaps (sized to the PFN span) before draining, while the
+    // bootstrap free-list path is still active so any grow_heap calls succeed.
     let mut buddy = BuddyAllocator::new(total_pfns);
 
-    // Now drain the free list with the lock held. No allocation
-    // happens inside this scope: `frames` already has capacity, and
-    // `pop_frame` is allocation-free.
+    // Drain the bootstrap free list STRAIGHT into the buddy — no intermediate
+    // Vec. A `Vec<u64>` of every free frame is ~128 MiB at 64 GiB RAM, which
+    // blows the 64 MiB heap cap (HEAP_MAX_SIZE) → alloc_error → boot hang on
+    // large-RAM bare metal. (The original collect-then-sort only ever ran at
+    // ≤2 GiB in QEMU, where the Vec was ~4 MiB.) `buddy.free` only touches its
+    // pre-allocated bitmaps and never allocates, so feeding it under the
+    // FRAME_ALLOCATOR lock cannot re-enter grow_heap / self-deadlock. Buddy
+    // coalescing is order-independent, so feeding in free-list order instead of
+    // the old address sort changes construction order only, not the result.
     {
         let mut alloc = FRAME_ALLOCATOR.0.lock();
         while let Some(phys) = alloc.pop_frame() {
-            frames.push(phys);
+            buddy.free((phys / PAGE_SIZE) as usize, 0);
         }
-    }
-
-    // Sort frames so contiguous runs are added in order for better
-    // coalescing. Allocator-free.
-    frames.sort_unstable();
-
-    // Feed each frame into the buddy allocator (it will coalesce
-    // buddies). `buddy.free` reads/writes its bitmap vecs in place
-    // and never allocates.
-    for phys in &frames {
-        let pfn = (*phys / PAGE_SIZE) as usize;
-        buddy.free(pfn, 0);
     }
 
     let buddy_free = buddy.free_count();

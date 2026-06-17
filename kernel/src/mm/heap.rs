@@ -40,8 +40,15 @@ use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, S
 pub const HEAP_START: usize = 0xFFFF_8000_0000_0000;
 /// Initial heap size mapped at boot (8 MiB).
 pub const HEAP_INITIAL_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
-/// Maximum heap size the kernel may grow to (64 MiB).
-pub const HEAP_MAX_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
+/// Maximum heap size the kernel may grow to (256 MiB).
+///
+/// Sized for large-RAM bare metal: per-frame kernel metadata scales with RAM
+/// (the buddy bitmaps + the AtomicU16 refcount table — one entry per 4 KiB
+/// frame), so at 64 GiB (~16M frames) the refcount table alone is ~32 MiB. The
+/// old 64 MiB cap was set when m3OS only ran at ≤2 GiB in QEMU and OOM'd on real
+/// 64 GiB hardware. The heap is mapped lazily (grows from HEAP_INITIAL_SIZE on
+/// demand), so this larger cap costs nothing until the metadata needs it.
+pub const HEAP_MAX_SIZE: usize = 256 * 1024 * 1024; // 256 MiB
 
 /// Tracks total successful allocations (for Track F diagnostics).
 static ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);

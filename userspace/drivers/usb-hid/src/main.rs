@@ -200,6 +200,20 @@ fn poll_keyboard(usb_ep: u32, kbd_ep: u32, dev: &mut HidDevice, keymap: &Keymap)
         Some(r) if r.len() >= HID_KBD_REPORT_LEN => r,
         _ => return,
     };
+    // Bare-metal diagnostic: prove a non-empty interrupt-IN report actually
+    // arrived from the keyboard. Logged only when a key/modifier byte is set, so
+    // an idle keyboard stays quiet but a real keypress is visible even if the
+    // decode/inject/kbd_server path downstream is broken — this isolates "no
+    // report delivered" (controller/arming) from "report delivered but not
+    // injected" (decode/IPC).
+    if report.iter().take(HID_KBD_REPORT_LEN).any(|&b| b != 0) {
+        syscall_lib::write_str(STDOUT_FILENO, "usb-hid: kbd report");
+        for &b in report.iter().take(HID_KBD_REPORT_LEN) {
+            syscall_lib::write_str(STDOUT_FILENO, " ");
+            write_u8_hex(b);
+        }
+        syscall_lib::write_str(STDOUT_FILENO, "\n");
+    }
     let mut arr = [0u8; HID_KBD_REPORT_LEN];
     arr.copy_from_slice(&report[..HID_KBD_REPORT_LEN]);
     let mut edges: Vec<kernel_core::usb::hid::KeyEdge> = Vec::new();
@@ -363,6 +377,29 @@ fn program_main(_args: &[&str]) -> i32 {
         return 0;
     }
 
+    // Diagnostic: report every bound interface so a bare-metal boot log shows
+    // exactly what enumerated — in particular whether a real HID keyboard
+    // (proto=1) appeared at all, vs. only the NIC or a hub's status interface.
+    for dev in &devices {
+        let n = &dev.notice;
+        syscall_lib::write_str(STDOUT_FILENO, "usb-hid: bound vid=0x");
+        write_u16_hex(n.vendor_id);
+        syscall_lib::write_str(STDOUT_FILENO, " pid=0x");
+        write_u16_hex(n.product_id);
+        syscall_lib::write_str(STDOUT_FILENO, " class=");
+        write_u8_dec(n.interface_class);
+        syscall_lib::write_str(STDOUT_FILENO, " proto=");
+        write_u8_dec(n.interface_protocol);
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            match n.interface_protocol {
+                PROTOCOL_HID_KEYBOARD => " role=KEYBOARD\n",
+                PROTOCOL_HID_MOUSE => " role=MOUSE\n",
+                _ => " role=other\n",
+            },
+        );
+    }
+
     // 3. Resolve the input-server endpoints for the classes present.
     let want_kbd = devices
         .iter()
@@ -397,11 +434,18 @@ fn program_main(_args: &[&str]) -> i32 {
         None
     };
 
-    // 3b. Put each HID interface into Boot Protocol and suppress duplicate
-    //     reports (SET_PROTOCOL(0) / SET_IDLE(0)) via the xHCI server's
-    //     ControlRequest path. This is the class driver's responsibility.
+    // 3b. Put each HID keyboard/mouse interface into Boot Protocol and suppress
+    //     duplicate reports (SET_PROTOCOL(0) / SET_IDLE(0)) via the xHCI server's
+    //     ControlRequest path. Only HID boot devices get this — issuing a HID
+    //     class request at a non-HID interface (e.g. the surfaced NIC) just
+    //     stalls EP0 and spams the log with SET_PROTOCOL/SET_IDLE failures.
     for dev in &devices {
-        boot_protocol_init(usb_ep, &dev.notice);
+        if matches!(
+            dev.notice.interface_protocol,
+            PROTOCOL_HID_KEYBOARD | PROTOCOL_HID_MOUSE
+        ) {
+            boot_protocol_init(usb_ep, &dev.notice);
+        }
     }
 
     let keymap = Keymap::us_qwerty();
@@ -443,6 +487,24 @@ fn write_u8_dec(mut n: u8) {
     // SAFETY: `buf[i..]` contains only ASCII digits.
     let s = unsafe { core::str::from_utf8_unchecked(&buf[i..]) };
     syscall_lib::write_str(STDOUT_FILENO, s);
+}
+
+/// Write a `u8` as a fixed 2-digit lowercase-hex string to stdout.
+fn write_u8_hex(n: u8) {
+    let hi = n >> 4;
+    let lo = n & 0xF;
+    let mut buf = [0u8; 2];
+    buf[0] = if hi < 10 { b'0' + hi } else { b'a' + hi - 10 };
+    buf[1] = if lo < 10 { b'0' + lo } else { b'a' + lo - 10 };
+    // SAFETY: `buf` contains only ASCII hex digits.
+    let s = unsafe { core::str::from_utf8_unchecked(&buf) };
+    syscall_lib::write_str(STDOUT_FILENO, s);
+}
+
+/// Write a `u16` as a fixed 4-digit lowercase-hex string to stdout.
+fn write_u16_hex(n: u16) {
+    write_u8_hex((n >> 8) as u8);
+    write_u8_hex((n & 0xFF) as u8);
 }
 
 /// Write a `u32` as a fixed 8-digit lowercase-hex string to stdout.

@@ -325,6 +325,9 @@ impl EndpointDescriptor {
     }
 }
 
+/// Transfer type constant: Bulk endpoint (`bmAttributes` bits 1:0 = 2).
+pub const TRANSFER_TYPE_BULK: u8 = 2;
+
 /// Transfer type constant: Interrupt endpoint (`bmAttributes` bits 1:0 = 3).
 pub const TRANSFER_TYPE_INTERRUPT: u8 = 3;
 

@@ -539,6 +539,51 @@ mod tests {
         assert_eq!(buddy.free_count_by_order()[3], 1);
     }
 
+    /// The frame-allocator large-RAM OOM fix drains the bootstrap free list
+    /// straight into the buddy via `free(pfn, 0)` in *free-list order* instead
+    /// of the old address-sorted order (the intermediate `Vec<u64>` of every
+    /// free frame was ~128 MiB at 64 GiB and blew the heap cap). That fix relies
+    /// on coalescing being insertion-order-independent: feeding the same frame
+    /// set in any order must yield a byte-identical free pool. A non-contiguous
+    /// set (reserved "holes") keeps coalescing partial, so the invariant is
+    /// non-trivial rather than "it all merges to one block regardless".
+    #[test]
+    fn free_drain_is_insertion_order_independent() {
+        const SPAN: usize = 64;
+        const RESERVED: [usize; 4] = [7, 8, 23, 40];
+        let frames: Vec<usize> = (0..SPAN).filter(|p| !RESERVED.contains(p)).collect();
+
+        let build = |order: &[usize]| -> (usize, [usize; MAX_ORDER + 1]) {
+            let mut b = BuddyAllocator::new(SPAN);
+            for &pfn in order {
+                b.free(pfn, 0);
+            }
+            (b.free_count(), b.free_count_by_order())
+        };
+
+        let ascending = build(&frames);
+
+        let mut descending = frames.clone();
+        descending.reverse();
+        let descending = build(&descending);
+
+        // A deterministic, non-trivial reordering (no RNG in a no_std test).
+        let mut rotated = frames.clone();
+        rotated.rotate_left(13);
+        let rotated = build(&rotated);
+
+        assert_eq!(
+            ascending, descending,
+            "free pool must not depend on frame insertion order"
+        );
+        assert_eq!(
+            ascending, rotated,
+            "free pool must not depend on frame insertion order"
+        );
+        // Sanity: exactly the non-reserved frames ended up free.
+        assert_eq!(ascending.0, SPAN - RESERVED.len());
+    }
+
     /// Interleaved alloc/free across multiple orders must keep the free-state
     /// metadata consistent while `remove_free` clears merged buddies directly.
     #[test]
