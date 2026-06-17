@@ -39,6 +39,8 @@ jobs:
             cmd: "device-smoke --device nvme --iommu --timeout 180"
           - id: device-e1000-iommu
             cmd: "device-smoke --device e1000 --iommu --timeout 180"
+          - id: ipv6-smoke
+            cmd: "ipv6-smoke --timeout 300"
     name: "gate:${{ matrix.id }}"
     steps:
       - uses: actions/checkout@v5

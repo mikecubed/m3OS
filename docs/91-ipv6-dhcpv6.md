@@ -20,7 +20,9 @@ MAC, answers QEMU SLIRP's Neighbor Solicitation with a Neighbor Advertisement
 28-byte `sockaddr_in6`, and round-trips `ping6 ::1` through the ICMPv6 loopback
 short-circuit. The pieces that a SLIRP host cannot exercise — SLAAC global
 address formation and DHCPv6 DNS — are fully implemented and host-tested (the
-new kernel-core IPv6 modules carry ~52 unit tests) but live-validate only behind
+new kernel-core IPv6 modules — `ipv6`/`icmpv6`/`ndp`/`dhcpv6` — carry 46 unit
+tests, with further v6 coverage in `udp`/`tcp` `build_v6` and the address
+helpers) but live-validate only behind
 the opt-in `M3OS_IPV6_LIVE` arm against a real router, because QEMU 8.2.2's
 libslirp sends no Router Advertisements and runs no DHCPv6 server. This is the
 honest boundary of the phase: the base layer, ICMPv6/NDP, the AF_INET6 socket
@@ -205,8 +207,9 @@ The **SLIRP limitation** discovered during bring-up is the key caveat to teach:
 QEMU 8.2.2's libslirp answers NDP Neighbor Solicitations but **sends no Router
 Advertisements and runs no DHCPv6 server** (packet-capture-confirmed). Because
 SLAAC's global-address formation depends on an RA prefix and DHCPv6 depends on a
-server, those two arms are **implemented and host-tested** (the ~52 kernel-core
-unit tests across the new IPv6 modules) but can only live-validate behind the
+server, those two arms are **implemented and host-tested** (the 46 kernel-core
+unit tests across the new `ipv6`/`icmpv6`/`ndp`/`dhcpv6` modules, plus the
+`udp`/`tcp` `build_v6` + RA-decision tests) but can only live-validate behind the
 opt-in **`M3OS_IPV6_LIVE`** arm, which requires a real IPv6 router
 (a TAP + radvd/dhcpd host setup). They skip-with-reason in CI rather than
 silently passing.
