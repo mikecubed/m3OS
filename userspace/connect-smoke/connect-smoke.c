@@ -145,13 +145,20 @@ int main(void) {
         close(kfd);
         return fail("setsockopt(TCP_KEEPCNT)", e);
     }
-    // getsockopt coherence: the stored value must round-trip.
+    // getsockopt coherence: the stored value must round-trip. Split the syscall
+    // failure from the value mismatch so the FAIL detail is unambiguous — a
+    // syscall error reports errno; a mismatch reports the actual value read back
+    // (expected = kidle, stated in the message).
     int rb = 0;
     socklen_t rl = sizeof(rb);
-    if (getsockopt(kfd, IPPROTO_TCP, TCP_KEEPIDLE, &rb, &rl) != 0 || rb != kidle) {
+    if (getsockopt(kfd, IPPROTO_TCP, TCP_KEEPIDLE, &rb, &rl) != 0) {
         int e = errno;
         close(kfd);
-        return fail("getsockopt(TCP_KEEPIDLE) round-trip", (rb != kidle) ? rb : e);
+        return fail("getsockopt(TCP_KEEPIDLE)", e);
+    }
+    if (rb != kidle) {
+        close(kfd);
+        return fail("getsockopt(TCP_KEEPIDLE) round-trip mismatch (expected 60, got)", rb);
     }
     close(kfd);
 

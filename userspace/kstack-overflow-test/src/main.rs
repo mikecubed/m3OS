@@ -50,11 +50,17 @@ fn fork() -> i64 {
     unsafe { syscall0(SYS_FORK) as i64 }
 }
 
-fn waitpid(pid: i64) -> i32 {
+/// Reap `pid`. Returns `Some(status)` on success, or `None` if the `wait4`
+/// syscall itself failed (negative errno). A definitive regression test must
+/// fail fast on a `wait4` failure rather than silently proceeding with a stale
+/// `status == 0`, which would otherwise surface as a misleading "child not
+/// killed by SIGSEGV" verdict instead of the real "could not reap" cause.
+fn waitpid(pid: i64) -> Option<i32> {
     let mut status: i32 = 0;
     // wait4(pid, &status, 0, rusage=0). Pass all four args so r10 (rusage) is a
-    // defined 0 — see the identical note in pku-smoke.
-    let _ = unsafe {
+    // defined 0 — see the identical note in pku-smoke. wait4 returns the reaped
+    // pid on success, or a negative errno on failure.
+    let rc = unsafe {
         syscall4(
             SYS_WAITPID,
             pid as u64,
@@ -62,8 +68,8 @@ fn waitpid(pid: i64) -> i32 {
             0,
             0,
         )
-    };
-    status
+    } as i64;
+    if rc < 0 { None } else { Some(status) }
 }
 
 fn emit(msg: &[u8]) {
@@ -104,8 +110,13 @@ fn kstack_overflow_main() -> ! {
         exit(SKIP_EXIT_CODE);
     }
 
-    // Parent: reap the child and classify how it died.
-    let status = waitpid(child);
+    // Parent: reap the child and classify how it died. A wait4 failure is fatal
+    // to a definitive regression test — fail fast with the accurate cause rather
+    // than misclassifying a stale status as a non-SIGSEGV death below.
+    let status = match waitpid(child) {
+        Some(s) => s,
+        None => fail(b"wait4() failed to reap child"),
+    };
     let termsig = status & 0x7f;
     let exited = termsig == 0;
     let exit_code = (status >> 8) & 0xff;
