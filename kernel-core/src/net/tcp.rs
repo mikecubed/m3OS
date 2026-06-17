@@ -2,7 +2,8 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 use super::ipv4;
-use crate::types::Ipv4Addr;
+use super::ipv6;
+use crate::types::{Ipv4Addr, Ipv6Addr};
 
 /// TCP flag bits.
 pub const TCP_FIN: u8 = 0x01;
@@ -93,8 +94,19 @@ pub struct TcpBuildParams {
     pub window: u16,
 }
 
-/// Build a TCP segment with auto-computed checksum.
-pub fn build(p: &TcpBuildParams, payload: &[u8]) -> Vec<u8> {
+/// Assemble a TCP segment with a zeroed checksum field. The caller fills bytes
+/// `[16..18]` with the family-appropriate pseudo-header checksum (IPv4 via
+/// [`build`], IPv6 via [`build_v6`]). Shared so both families produce a
+/// byte-identical segment apart from the checksum.
+fn assemble_segment(
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    payload: &[u8],
+) -> Vec<u8> {
     let max_payload = MAX_TCP_SEGMENT - 20;
     let payload = if payload.len() > max_payload {
         &payload[..max_payload]
@@ -102,24 +114,60 @@ pub fn build(p: &TcpBuildParams, payload: &[u8]) -> Vec<u8> {
         payload
     };
     let data_offset: u8 = 5;
-    let total_len = 20 + payload.len();
-    let mut pkt = Vec::with_capacity(total_len);
+    let mut pkt = Vec::with_capacity(20 + payload.len());
 
-    pkt.extend_from_slice(&p.src_port.to_be_bytes());
-    pkt.extend_from_slice(&p.dst_port.to_be_bytes());
-    pkt.extend_from_slice(&p.seq.to_be_bytes());
-    pkt.extend_from_slice(&p.ack.to_be_bytes());
+    pkt.extend_from_slice(&src_port.to_be_bytes());
+    pkt.extend_from_slice(&dst_port.to_be_bytes());
+    pkt.extend_from_slice(&seq.to_be_bytes());
+    pkt.extend_from_slice(&ack.to_be_bytes());
     pkt.push(data_offset << 4);
-    pkt.push(p.flags);
-    pkt.extend_from_slice(&p.window.to_be_bytes());
+    pkt.push(flags);
+    pkt.extend_from_slice(&window.to_be_bytes());
     pkt.extend_from_slice(&0u16.to_be_bytes()); // checksum placeholder
     pkt.extend_from_slice(&0u16.to_be_bytes()); // urgent pointer
     pkt.extend_from_slice(payload);
 
+    pkt
+}
+
+/// Build a TCP segment over IPv4 with an auto-computed checksum.
+pub fn build(p: &TcpBuildParams, payload: &[u8]) -> Vec<u8> {
+    let mut pkt = assemble_segment(
+        p.src_port, p.dst_port, p.seq, p.ack, p.flags, p.window, payload,
+    );
     let cksum = tcp_checksum(p.src_ip, p.dst_ip, &pkt);
     pkt[16] = (cksum >> 8) as u8;
     pkt[17] = cksum as u8;
+    pkt
+}
 
+/// Compute the TCP checksum over the IPv6 pseudo-header (RFC 8200 §8.1, Phase
+/// 91). Mandatory for TCP over IPv6 (unlike IPv4 where it is technically
+/// optional). Shares the pseudo-header fold with `ipv6::pseudo_header_checksum`.
+pub fn tcp_checksum_v6(src: Ipv6Addr, dst: Ipv6Addr, tcp_data: &[u8]) -> u16 {
+    ipv6::pseudo_header_checksum(src, dst, ipv6::PROTO_TCP, tcp_data)
+}
+
+/// Parameters for building a TCP segment over IPv6 (Phase 91).
+pub struct TcpBuildParamsV6 {
+    pub src_ip: Ipv6Addr,
+    pub dst_ip: Ipv6Addr,
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub seq: u32,
+    pub ack: u32,
+    pub flags: u8,
+    pub window: u16,
+}
+
+/// Build a TCP segment over IPv6 with an auto-computed pseudo-header checksum.
+pub fn build_v6(p: &TcpBuildParamsV6, payload: &[u8]) -> Vec<u8> {
+    let mut pkt = assemble_segment(
+        p.src_port, p.dst_port, p.seq, p.ack, p.flags, p.window, payload,
+    );
+    let cksum = tcp_checksum_v6(p.src_ip, p.dst_ip, &pkt);
+    pkt[16] = (cksum >> 8) as u8;
+    pkt[17] = cksum as u8;
     pkt
 }
 
@@ -468,6 +516,34 @@ mod tests {
         // Verify checksum: recomputing should yield 0
         let verify = tcp_checksum(p.src_ip, p.dst_ip, &seg);
         assert_eq!(verify, 0);
+    }
+
+    #[test]
+    fn build_v6_round_trip_and_checksum() {
+        let src: Ipv6Addr = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let dst: Ipv6Addr = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let p = TcpBuildParamsV6 {
+            src_ip: src,
+            dst_ip: dst,
+            src_port: 49152,
+            dst_port: 80,
+            seq: 0x1234_5678,
+            ack: 0x9abc_def0,
+            flags: TCP_SYN,
+            window: 65535,
+        };
+        let seg = build_v6(&p, b"v6-payload");
+        let (header, data) = parse(&seg).unwrap();
+        assert_eq!(header.src_port, 49152);
+        assert_eq!(header.dst_port, 80);
+        assert_eq!(header.seq, 0x1234_5678);
+        assert_eq!(data, b"v6-payload");
+        // A correct v6 pseudo-header checksum makes the whole segment fold to 0.
+        assert_eq!(tcp_checksum_v6(src, dst, &seg), 0);
+        // A corrupted segment must NOT fold to 0 (so the kernel drops it).
+        let mut bad = seg.clone();
+        bad[25] ^= 0xff;
+        assert_ne!(tcp_checksum_v6(src, dst, &bad), 0);
     }
 
     #[test]

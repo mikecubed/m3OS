@@ -65,7 +65,10 @@ pub fn send_from(src: Ipv6Addr, dst: Ipv6Addr, next_header: u8, payload: &[u8]) 
     if is_self_address(&dst) {
         use core::sync::atomic::{AtomicU8, Ordering};
         static LOOPBACK_DEPTH: AtomicU8 = AtomicU8::new(0);
-        if LOOPBACK_DEPTH.fetch_add(1, Ordering::Relaxed) < 4 {
+        // A self-addressed TCP handshake/data exchange nests a few levels
+        // (SYN → SYN-ACK → ACK, data → ACK) synchronously through this path;
+        // 8 gives headroom while still bounding any pathological self-send loop.
+        if LOOPBACK_DEPTH.fetch_add(1, Ordering::Relaxed) < 8 {
             let our_mac = super::mac_address().unwrap_or([0; 6]);
             let ip_pkt = ipv6_core::build(src, dst, next_header, payload);
             handle_ipv6(&ip_pkt, our_mac);

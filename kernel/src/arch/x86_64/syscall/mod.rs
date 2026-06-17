@@ -18925,8 +18925,8 @@ pub(super) fn sys_connect(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
     };
     let family = crate::net::with_socket(handle, |s| s.family).unwrap_or(2);
     if family == 10 {
-        // Phase 91 — AF_INET6 connect: store the peer (UDP/ICMPv6 record only;
-        // dual-stack TCP connect is the deferred opt-in arm).
+        // Phase 91 — AF_INET6 connect: full dual-stack TCP active open, or peer
+        // record for UDP/ICMPv6.
         if addr_len < 28 {
             return NEG_EINVAL;
         }
@@ -18935,7 +18935,82 @@ pub(super) fn sys_connect(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
             Err(e) => return e,
         };
         if matches!(proto, crate::net::SocketProtocol::Tcp) {
-            return NEG_EOPNOTSUPP;
+            // Mirror of the v4 TCP connect path (non-blocking re-issue guard,
+            // slot alloc, SYN, blocking/non-blocking handshake completion).
+            crate::net::reconcile_connecting(handle);
+            match crate::net::with_socket(handle, |s| s.state) {
+                Some(crate::net::SocketState::Connected) => return NEG_EISCONN,
+                Some(crate::net::SocketState::Connecting) => return NEG_EALREADY,
+                _ => {}
+            }
+            let local_port = crate::net::with_socket(handle, |s| {
+                if s.local_port == 0 {
+                    crate::arch::x86_64::interrupts::tick_count() as u16 | 0x8000
+                } else {
+                    s.local_port
+                }
+            })
+            .unwrap_or(0x8000);
+            let tcp_idx = match crate::net::tcp::create_v6(local_port) {
+                Some(idx) => idx,
+                None => return NEG_EAGAIN, // no v6 source configured or no slots
+            };
+            crate::net::tcp::connect_v6(tcp_idx, addr6, port);
+            crate::net::with_socket_mut(handle, |s| {
+                s.tcp_slot = Some(tcp_idx);
+                s.remote_addr6 = addr6;
+                s.remote_port = port;
+                s.local_port = local_port;
+            });
+            let nonblock = current_fd_entry(fd as usize)
+                .map(|e| e.nonblock)
+                .unwrap_or(false);
+            if nonblock {
+                crate::net::with_socket_mut(handle, |s| {
+                    s.state = crate::net::SocketState::Connecting;
+                });
+                return NEG_EINPROGRESS;
+            }
+            let start_tick = crate::arch::x86_64::interrupts::tick_count();
+            loop {
+                match crate::net::tcp::state(tcp_idx) {
+                    crate::net::tcp::TcpState::Established => {
+                        crate::net::with_socket_mut(handle, |s| {
+                            s.state = crate::net::SocketState::Connected;
+                        });
+                        return 0;
+                    }
+                    crate::net::tcp::TcpState::Closed => {
+                        crate::net::tcp::destroy(tcp_idx);
+                        crate::net::with_socket_mut(handle, |s| {
+                            s.tcp_slot = None;
+                            s.state = crate::net::SocketState::Closed;
+                        });
+                        return NEG_ECONNREFUSED;
+                    }
+                    _ => {
+                        if crate::arch::x86_64::interrupts::tick_count().wrapping_sub(start_tick)
+                            > 3000
+                        {
+                            crate::net::tcp::destroy(tcp_idx);
+                            crate::net::with_socket_mut(handle, |s| {
+                                s.tcp_slot = None;
+                                s.state = crate::net::SocketState::Closed;
+                            });
+                            return NEG_ETIMEDOUT;
+                        }
+                        if has_pending_signal() {
+                            crate::net::tcp::destroy(tcp_idx);
+                            crate::net::with_socket_mut(handle, |s| {
+                                s.tcp_slot = None;
+                                s.state = crate::net::SocketState::Closed;
+                            });
+                            return NEG_EINTR;
+                        }
+                        crate::task::yield_now();
+                    }
+                }
+            }
         }
         crate::net::with_socket_mut(handle, |s| {
             s.remote_addr6 = addr6;
@@ -19125,8 +19200,14 @@ pub(super) fn sys_listen(fd: u64, backlog: u64) -> u64 {
     if local_port == 0 {
         return NEG_EINVAL; // must bind first
     }
-    // Allocate a TCP slot for listening
-    let tcp_idx = match crate::net::tcp::create(local_port) {
+    // Allocate a TCP slot for listening — a v6 slot for an AF_INET6 socket so
+    // inbound v6 SYNs (which only match family==10 connections) reach it.
+    let family = crate::net::with_socket(handle, |s| s.family).unwrap_or(2);
+    let tcp_idx = match if family == 10 {
+        crate::net::tcp::create_v6(local_port)
+    } else {
+        crate::net::tcp::create(local_port)
+    } {
         Some(idx) => idx,
         None => return NEG_EAGAIN,
     };
@@ -19440,9 +19521,11 @@ pub(super) fn sys_sendto(
                 return NEG_EFAULT;
             }
 
-            // Phase 91 — AF_INET6 sockets take the v6 send path.
+            // Phase 91 — AF_INET6 datagram sockets take the v6 send path. TCP
+            // sends are family-agnostic (they operate on the connection's
+            // tcp_slot), so a v6 TCP socket falls through to the shared TCP arm.
             let family = crate::net::with_socket(handle, |s| s.family).unwrap_or(2);
-            if family == 10 {
+            if family == 10 && !matches!(proto, crate::net::SocketProtocol::Tcp) {
                 return sys_sendto_v6(handle, proto, &tmp[..capped], addr_ptr, addr_len);
             }
 
@@ -19743,12 +19826,18 @@ pub(super) fn sys_recvfrom_socket(
                                 return NEG_EFAULT;
                             }
                             if addr_ptr != 0 {
-                                if let Err(e) = sockaddr_to_user(addr_ptr, remote_addr, remote_port)
-                                {
+                                // Phase 91 — fill the v6 peer for AF_INET6 TCP.
+                                let r = if family == 10 {
+                                    sockaddr_to_user6(addr_ptr, remote_addr6, remote_port)
+                                } else {
+                                    sockaddr_to_user(addr_ptr, remote_addr, remote_port)
+                                };
+                                if let Err(e) = r {
                                     return e;
                                 }
                                 if addr_len_ptr != 0 {
-                                    let len_buf = 16u32.to_ne_bytes();
+                                    let reported = if family == 10 { 28u32 } else { 16u32 };
+                                    let len_buf = reported.to_ne_bytes();
                                     if UserSliceWo::new(addr_len_ptr, len_buf.len())
                                         .and_then(|s| s.copy_from_kernel(&len_buf))
                                         .is_err()

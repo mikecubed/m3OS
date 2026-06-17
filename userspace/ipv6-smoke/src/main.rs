@@ -25,8 +25,8 @@
 #![no_main]
 
 use syscall_lib::{
-    AF_INET6, IPPROTO_ICMPV6, SOCK_DGRAM, SOCK_STREAM, SockaddrIn6, close, exit, read, sendto6,
-    socket, write,
+    AF_INET6, IPPROTO_ICMPV6, SOCK_DGRAM, SOCK_STREAM, SockaddrIn6, accept, bind6, close, connect6,
+    exit, listen, read, sendto6, socket, write,
 };
 
 const STDOUT: i32 = 1;
@@ -39,6 +39,7 @@ fn main(_args: &[&str]) -> i32 {
     case_socket();
     case_bind();
     case_loopback();
+    case_tcp();
     emit("SMOKE:ipv6-smoke:PASS\n");
     0
 }
@@ -111,6 +112,62 @@ fn case_loopback() {
         fail("loopback", "no echo reply from ::1");
     }
     ok("loopback");
+}
+
+/// Full dual-stack TCP over IPv6 via the `::1` internal loopback (Phase 91): a
+/// listening v6 TCP socket + a client `connect6(::1)` complete the three-way
+/// handshake through the kernel's self-address loopback (synchronously, since
+/// `ipv6::send_from` re-injects self-addressed packets), then a byte payload
+/// round-trips client → server. Exercises the family-aware `TcpConnection`,
+/// the IPv6 pseudo-header checksum, and `handle_tcp_v6` end-to-end.
+fn case_tcp() {
+    const PORT: u16 = 0x3000;
+
+    let srv = socket(AF_INET6 as i32, SOCK_STREAM as i32, 0);
+    if srv < 0 {
+        fail("tcp", "server socket");
+    }
+    let srv = srv as i32;
+    let bind_addr = SockaddrIn6::new(UNSPECIFIED, PORT);
+    if bind6(srv, &bind_addr) < 0 {
+        fail("tcp", "bind6");
+    }
+    if listen(srv, 1) < 0 {
+        fail("tcp", "listen");
+    }
+
+    let cli = socket(AF_INET6 as i32, SOCK_STREAM as i32, 0);
+    if cli < 0 {
+        fail("tcp", "client socket");
+    }
+    let cli = cli as i32;
+    let conn_addr = SockaddrIn6::new(LOOPBACK, PORT);
+    // Blocking connect — the internal loopback drives the whole handshake
+    // synchronously, so this returns once both ends are Established.
+    if connect6(cli, &conn_addr) < 0 {
+        fail("tcp", "connect6 ::1");
+    }
+    emit("IPV6_SMOKE:tcp:connected\n");
+
+    let conn = accept(srv, None);
+    if conn < 0 {
+        fail("tcp", "accept");
+    }
+    let conn = conn as i32;
+
+    let msg = b"PING6TCP";
+    if write(cli, msg) < 0 {
+        fail("tcp", "write");
+    }
+    let mut buf = [0u8; 16];
+    let n = read(conn, &mut buf);
+    if n < 8 || &buf[..8] != msg {
+        fail("tcp", "data round-trip mismatch");
+    }
+    // The round-trip succeeded — emit before teardown. A graceful close over the
+    // synchronous `::1` loopback would half-close-deadlock (the peer's close
+    // cannot run on this single thread), so let process exit reap the fds.
+    ok("tcp");
 }
 
 fn emit(s: &str) {
