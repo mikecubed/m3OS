@@ -1,9 +1,12 @@
 pub mod arp;
+pub mod dhcpv6;
 pub mod ethernet;
 pub mod icmp;
+pub mod icmpv6;
 pub mod ipv4;
 pub mod ipv6;
 pub mod msghdr;
+pub mod ndp;
 pub mod tcp;
 pub mod udp;
 pub mod udp_protocol;
