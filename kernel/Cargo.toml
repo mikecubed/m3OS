@@ -1,6 +1,6 @@
 [package]
 name = "kernel"
-version = "0.90.0"
+version = "0.90.1"
 edition = "2024"
 
 # Phase 61 Track 0a — kernel is built as both a library (so `kernel/tests/*.rs`
@@ -50,6 +50,13 @@ legacy-bootstrap-allocator = []
 # in the page-fault handler. Zero-cost/absent in production. Run with:
 #   cargo xtask run --features smep-smap-test  (or via M3OS_KERNEL_FEATURES)
 smep-smap-test = []
+# Track D (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md):
+# debug-only deliberate kernel-stack-overflow probe. Adds the `SYS_KSTACK_OVERFLOW_TEST`
+# (0x1150) syscall, which recurses until the calling task overflows its per-task
+# kernel stack — exercising the controlled-kill recovery (#PF/#DF guard-page
+# fault → SIGSEGV the offending process, core keeps running, no machine halt).
+# Absent in production (the syscall returns ENOSYS). Driven by `kstack-overflow-smoke`.
+kstack-overflow-test = []
 # When `sched-trace` is enabled, every block/wake/scan state transition
 # emits a structured SchedTrace entry into the per-core trace ring (Phase 43b).
 # Default OFF — zero runtime overhead in production builds.

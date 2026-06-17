@@ -14,6 +14,11 @@
 //   3. getsockopt(SO_ERROR) reports 0 (no pending error) while connecting.
 //   4. a second connect() on the same fd returns -1/EALREADY — the re-issue
 //      guard that stops poll-driven clients leaking TCP slots on retry.
+//   5. setsockopt(SO_KEEPALIVE) + setsockopt(TCP_KEEPIDLE/INTVL/CNT) all
+//      return 0 (Phase 90b ABI-conformance guard): libuv sets these on every
+//      client socket and a hard ENOPROTOOPT there made Node fetch/undici and
+//      Claude Code report "connect ... ENOPROTOOPT". getsockopt(TCP_KEEPIDLE)
+//      round-trips the stored value. (The keepalive PROBE timer is deferred.)
 //
 // Best-effort completion leg (reported as INFO, never changes the verdict):
 // connect non-blocking to a closed local port (10.0.2.2:9) and poll briefly;
@@ -27,6 +32,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <stdio.h>
 #include <string.h>
@@ -104,6 +110,58 @@ int main(void) {
     }
     close(fd);
 
+    // 5. setsockopt of standard TCP keepalive options must SUCCEED, not fail
+    //    with ENOPROTOOPT. Phase 90b: libuv's uv__tcp_keepalive sets
+    //    SO_KEEPALIVE then TCP_KEEPIDLE/INTVL/CNT on every client socket and
+    //    treats *any* failure there as fatal — a hard ENOPROTOOPT made Node's
+    //    fetch/undici (and thus Claude Code) report
+    //    "connect ... ENOPROTOOPT" against api.anthropic.com and abort. The
+    //    kernel now accepts + stores these; the probe TIMER is deferred (see
+    //    docs/roadmap/90b-claude-code.md). No network required — this is the
+    //    always-on regression guard for that ABI-conformance fix.
+    int kfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (kfd < 0) {
+        return fail("socket(keepalive-opts)", errno);
+    }
+    int on = 1;
+    if (setsockopt(kfd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on)) != 0) {
+        int e = errno;
+        close(kfd);
+        return fail("setsockopt(SO_KEEPALIVE)", e);
+    }
+    int kidle = 60, kintvl = 10, kcnt = 4;
+    if (setsockopt(kfd, IPPROTO_TCP, TCP_KEEPIDLE, &kidle, sizeof(kidle)) != 0) {
+        int e = errno;
+        close(kfd);
+        return fail("setsockopt(TCP_KEEPIDLE) - ABI regression", e);
+    }
+    if (setsockopt(kfd, IPPROTO_TCP, TCP_KEEPINTVL, &kintvl, sizeof(kintvl)) != 0) {
+        int e = errno;
+        close(kfd);
+        return fail("setsockopt(TCP_KEEPINTVL)", e);
+    }
+    if (setsockopt(kfd, IPPROTO_TCP, TCP_KEEPCNT, &kcnt, sizeof(kcnt)) != 0) {
+        int e = errno;
+        close(kfd);
+        return fail("setsockopt(TCP_KEEPCNT)", e);
+    }
+    // getsockopt coherence: the stored value must round-trip. Split the syscall
+    // failure from the value mismatch so the FAIL detail is unambiguous — a
+    // syscall error reports errno; a mismatch reports the actual value read back
+    // (expected = kidle, stated in the message).
+    int rb = 0;
+    socklen_t rl = sizeof(rb);
+    if (getsockopt(kfd, IPPROTO_TCP, TCP_KEEPIDLE, &rb, &rl) != 0) {
+        int e = errno;
+        close(kfd);
+        return fail("getsockopt(TCP_KEEPIDLE)", e);
+    }
+    if (rb != kidle) {
+        close(kfd);
+        return fail("getsockopt(TCP_KEEPIDLE) round-trip mismatch (expected 60, got)", rb);
+    }
+    close(kfd);
+
     // ---- Best-effort completion leg (INFO only, never fails the verdict) ----
     // If SLIRP RSTs a closed local port, prove the full
     // EINPROGRESS -> poll-wake -> getsockopt(SO_ERROR) failure round trip.
@@ -136,7 +194,8 @@ int main(void) {
     }
     fflush(stdout);
 
-    printf("CONNECT_SMOKE:PASS nonblock connect EINPROGRESS/poll/SO_ERROR/EALREADY ok\n");
+    printf("CONNECT_SMOKE:PASS nonblock connect EINPROGRESS/poll/SO_ERROR/EALREADY"
+           " + keepalive setsockopt ok\n");
     fflush(stdout);
     return 0;
 }

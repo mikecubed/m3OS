@@ -264,6 +264,14 @@ fn path_node_nofollow(abs_path: &str) -> Result<PathNodeKind, u64> {
         || abs_path == "/dev/random"
         || abs_path == "/dev/full"
         || abs_path == "/dev/ptmx"
+        // `/dev/tty` is the controlling-terminal char device. It MUST be
+        // recognised here (as the other char devices are) so a `stat`/path-walk
+        // resolves it without falling through to the ext2/`vfs_server` path —
+        // node/Claude Code `readlink` their TTY to `/dev/tty` and `stat` it at
+        // startup, and that synchronous `vfs_service_stat_path` IPC for a path
+        // the service does not own hangs, wedging the process (and, via the
+        // shared VFS, the whole system). `path_metadata` already lists it.
+        || abs_path == "/dev/tty"
     {
         return Ok(PathNodeKind::File);
     }
@@ -1681,6 +1689,19 @@ mod syscall_nr {
 /// crate::arch::x86_64::syscall::STRACE_PID = N`.
 pub(crate) static STRACE_PID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// One "warned" flag per syscall number (Linux range 0..512), used to rate-limit
+/// the `unhandled syscall N` WARN to once-per-number-per-boot. Without this, a
+/// userspace runtime probing unsupported syscalls in a retry loop (Node's
+/// capget=125 / io_uring_setup=425) floods the serial console, holding the
+/// IF-disabled `SERIAL1` lock long enough to starve the COM1 RX ISR → dropped
+/// serial-input bytes under SMP load. Numbers ≥ 512 (the m3OS-custom 0x114x
+/// block already has handlers) fall back to always-warn.
+#[allow(clippy::declare_interior_mutable_const)]
+static UNHANDLED_SYSCALL_WARNED: [core::sync::atomic::AtomicBool; 512] = {
+    const F: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    [F; 512]
+};
+
 #[unsafe(no_mangle)]
 pub extern "C" fn syscall_handler(
     number: u64,
@@ -1702,6 +1723,21 @@ pub extern "C" fn syscall_handler(
     // scheduler's restore path — block/yield sites no longer need to be
     // the primary save point.
     snapshot_user_return_state();
+
+    // DIAGNOSTIC (claude -p stall hunt, 2026-06-16) — stamp the syscall-entry
+    // tick on the running task (lock-free, same discipline as IRQ CPU-time
+    // accounting). `watchdog_scan`'s reply-stall scan uses `now - this` to
+    // detect a task wedged inside ONE syscall (e.g. a `BlockedOnReply` that
+    // wake/reblock-loops, resetting `blocked_since_tick` and so evading the
+    // 30 s stuck-task watchdog). Costs one relaxed store on the hot path.
+    if let Some(task) = crate::task::scheduler::current_task_ptr() {
+        task.last_syscall_entry_tick.store(
+            crate::arch::x86_64::interrupts::tick_count(),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        task.last_syscall_nr
+            .store(number as u32, core::sync::atomic::Ordering::Relaxed);
+    }
 
     // Phase 57a follow-up DEBUG: per-pid syscall trace.
     let strace_match = {
@@ -2344,8 +2380,28 @@ pub extern "C" fn syscall_handler(
         // -- Phase 84 Spectre mitigations --
         SYS_MITIGATIONS_STATUS => sys_mitigations_status(arg0, arg1),
         SYS_SET_SPEC_CTRL => sys_set_spec_ctrl(arg0),
+        // -- Track D debug probe (feature `kstack-overflow-test`; absent → ENOSYS) --
+        #[cfg(feature = "kstack-overflow-test")]
+        SYS_KSTACK_OVERFLOW_TEST => sys_kstack_overflow_test(),
         _ => {
-            log::warn!("unhandled syscall {number} (args: {arg0:#x}, {arg1:#x}, {arg2:#x})");
+            // Rate-limit to ONCE per syscall number per boot. A real userspace
+            // runtime (Node) probes unsupported syscalls (capget=125,
+            // io_uring_setup=425, …) in tight retry loops; the resulting WARN
+            // flood holds the IF-disabled `SERIAL1` lock busy-waiting on the slow
+            // UART TX, starving the COM1 RX ISR → dropped serial-input bytes under
+            // SMP load. Logging each number once preserves the "new unhandled
+            // syscall" diagnostic without the flood.
+            if number < UNHANDLED_SYSCALL_WARNED.len() as u64 {
+                if !UNHANDLED_SYSCALL_WARNED[number as usize]
+                    .swap(true, core::sync::atomic::Ordering::Relaxed)
+                {
+                    log::warn!(
+                        "unhandled syscall {number} (args: {arg0:#x}, {arg1:#x}, {arg2:#x}) [further occurrences suppressed]"
+                    );
+                }
+            } else {
+                log::warn!("unhandled syscall {number} (args: {arg0:#x}, {arg1:#x}, {arg2:#x})");
+            }
             NEG_ENOSYS
         }
     };
@@ -4659,8 +4715,11 @@ pub(super) fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
                 0,
                 0,
                 {
+                    // Heap-backed, MAX_FDS-long all-`None` table (matches the
+                    // `Some` arm's `fd_table_snapshot()` length invariant);
+                    // `vec!` fills in place so nothing lands on the kstack.
                     const NONE: Option<crate::process::FdEntry> = None;
-                    [NONE; crate::process::MAX_FDS]
+                    alloc::vec![NONE; crate::process::MAX_FDS]
                 },
                 0,
                 alloc::string::String::from("/"),
@@ -14606,6 +14665,11 @@ fn path_filemeta(name: &str) -> Result<FileMeta, u64> {
                 || name == "/dev/random"
                 || name == "/dev/full"
                 || name == "/dev/ptmx"
+                // `/dev/tty` (controlling terminal) — report a char device like
+                // the others. Without this, `stat("/dev/tty")` falls through to
+                // the ext2/`vfs_server` path and hangs on a `VFS_STAT_PATH` IPC
+                // for a node the service does not own (Claude Code startup hang).
+                || name == "/dev/tty"
                 || name.starts_with("/dev/pts/")
             {
                 let mut m = FileMeta::new();
@@ -17391,6 +17455,50 @@ pub(super) fn sys_set_spec_ctrl(enable: u64) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Track D debug probe — SYS_KSTACK_OVERFLOW_TEST (0x1150)
+// (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md)
+// ---------------------------------------------------------------------------
+//
+// Feature-gated (`kstack-overflow-test`); absent in production (the number
+// falls through to ENOSYS). Deliberately overflows the calling task's per-task
+// kernel stack so the controlled-kill recovery path can be exercised end-to-end
+// on plain TCG: the recursion marches RSP into the slot's guard page, the
+// resulting ring-0 #PF/#DF is recognised as a kstack overflow, and the offending
+// process is SIGSEGV-killed while the rest of the system keeps running.
+
+/// m3OS-native syscall number for the Track D overflow probe (0x114x block).
+#[cfg(feature = "kstack-overflow-test")]
+pub const SYS_KSTACK_OVERFLOW_TEST: u64 = 0x1150;
+
+/// Recurse with a sizable written local buffer so each frame consumes ~1 KiB
+/// and the 64 KiB kernel stack is exhausted in well under 100 frames. Not tail
+/// recursion (the result is combined *after* the recursive call), so the
+/// compiler cannot rewrite it into a loop; `black_box` + volatile keep the
+/// buffer live and un-elided.
+#[cfg(feature = "kstack-overflow-test")]
+#[inline(never)]
+#[allow(unconditional_recursion)]
+fn kstack_overflow_recurse(depth: u64) -> u64 {
+    let mut buf = [0u8; 1024];
+    for (i, b) in buf.iter_mut().enumerate() {
+        unsafe { core::ptr::write_volatile(b, (depth as u8).wrapping_add(i as u8)) };
+    }
+    let tail = unsafe { core::ptr::read_volatile(&buf[(depth as usize) & 1023]) } as u64;
+    core::hint::black_box(tail).wrapping_add(kstack_overflow_recurse(depth.wrapping_add(1)))
+}
+
+/// `SYS_KSTACK_OVERFLOW_TEST` handler — never returns normally (the recursion
+/// overflows the kstack and the fault handler kills this process first).
+#[cfg(feature = "kstack-overflow-test")]
+pub(super) fn sys_kstack_overflow_test() -> u64 {
+    log::warn!(
+        "[kstack-test] pid {} deliberately overflowing its kernel stack (Track D recovery probe)",
+        crate::process::current_pid(),
+    );
+    core::hint::black_box(kstack_overflow_recurse(core::hint::black_box(0)))
+}
+
+// ---------------------------------------------------------------------------
 // gettimeofday(tv) — syscall 96
 // ---------------------------------------------------------------------------
 
@@ -17532,21 +17640,31 @@ pub(super) fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
     let is_private = (op & FUTEX_PRIVATE_FLAG) != 0;
     let cmd = op & !(FUTEX_PRIVATE_FLAG);
 
-    // Build the futex key: (addr_space pml4_phys, uaddr).
-    // Private futexes use 0 as root; shared futexes use the real CR3.
-    let futex_root = if is_private {
-        0u64
-    } else {
-        let pid = crate::process::current_pid();
-        match crate::process::PROCESS_TABLE
-            .lock()
-            .find(pid)
-            .and_then(|p| p.addr_space.as_ref().map(|a| a.pml4_phys().as_u64()))
-        {
-            Some(root) => root,
-            None => return NEG_EINVAL, // non-private futex requires an address space
-        }
-    };
+    // Build the futex key, scoped to the owning ADDRESS SPACE.
+    //
+    // 2026-06-16 fix: private futexes were keyed `(0, uaddr)` — a single global
+    // root shared by EVERY process. That aliased every process's private futex
+    // at the same `uaddr` into one wait queue. Claude Code spawns several
+    // identical-layout `node` subprocesses whose musl/libuv pthread threadpool
+    // condvars sit at the SAME virtual address; with the fixed-0 key, one node
+    // process's `FUTEX_WAKE` woke (or absorbed the single `val=1` wake meant
+    // for) ANOTHER process's threadpool waiter — so the intended worker was
+    // never woken, the threadpool stalled (`BlockedOnFutex`, "no waker
+    // registered"), and the whole `claude -p` run hung before reaching the API.
+    // (node-smoke runs ONE node process, so it never collided — which is why it
+    // passed while claude hung.)
+    //
+    // Key both private and shared futexes by the active page-table root (CR3 ==
+    // the caller's pml4; no KPTI is active, so at syscall time CR3 is the user
+    // mm root). CLONE_THREAD siblings share CR3 (they rendezvous); distinct
+    // processes have distinct CR3 (no cross-process aliasing). `is_private` is
+    // folded into bit 0 — the pml4 root is page-aligned so bit 0 is always free —
+    // so a private and a shared futex at the same address never alias each other.
+    let pml4 = x86_64::registers::control::Cr3::read()
+        .0
+        .start_address()
+        .as_u64();
+    let futex_root = if is_private { pml4 | 1 } else { pml4 };
     let key = (futex_root, uaddr);
 
     match cmd {
@@ -19765,6 +19883,12 @@ pub(super) fn sys_setsockopt(
     const SO_SNDBUF: u64 = 7;
     const IPPROTO_TCP: u64 = 6;
     const TCP_NODELAY: u64 = 1;
+    // TCP keepalive tuning (IPPROTO_TCP level). Accepted + stored for the
+    // future keepalive prober; the probe timer itself is deferred (see
+    // `crate::net::SocketOptions` and docs/roadmap/90b-claude-code.md).
+    const TCP_KEEPIDLE: u64 = 4;
+    const TCP_KEEPINTVL: u64 = 5;
+    const TCP_KEEPCNT: u64 = 6;
 
     match (level, optname) {
         (SOL_SOCKET, SO_REUSEADDR) => {
@@ -19782,9 +19906,44 @@ pub(super) fn sys_setsockopt(
         (IPPROTO_TCP, TCP_NODELAY) => {
             crate::net::with_socket_mut(handle, |s| s.options.tcp_nodelay = val != 0);
         }
-        _ => return NEG_ENOPROTOOPT,
+        (IPPROTO_TCP, TCP_KEEPIDLE) => {
+            crate::net::with_socket_mut(handle, |s| s.options.keep_idle_secs = val.max(0) as u32);
+        }
+        (IPPROTO_TCP, TCP_KEEPINTVL) => {
+            crate::net::with_socket_mut(handle, |s| s.options.keep_intvl_secs = val.max(0) as u32);
+        }
+        (IPPROTO_TCP, TCP_KEEPCNT) => {
+            crate::net::with_socket_mut(handle, |s| s.options.keep_cnt = val.max(0) as u32);
+        }
+        // Phase 90b: accept-and-log unimplemented best-effort options instead
+        // of returning ENOPROTOOPT. m3OS presents a Linux ABI and runs
+        // unmodified Linux binaries (libuv/undici/curl) that treat *any*
+        // setsockopt failure as fatal — a hard ENOPROTOOPT on an optional knob
+        // (e.g. SO_LINGER, SO_REUSEPORT) aborts the connection. Ignoring the
+        // hint is safe; the value is simply not honored. The first such call
+        // per boot is logged so the deferred work is visible (see
+        // docs/roadmap/90b-claude-code.md). Reads stay honest: an
+        // unimplemented `getsockopt` still returns ENOPROTOOPT rather than
+        // fabricating a value.
+        _ => log_setsockopt_noop(level, optname),
     }
     0
+}
+
+/// One-shot, per-boot log of the first `setsockopt` that hit the accept-and-log
+/// path (Phase 90b). Single line per boot to stay clear of the SMP serial-RX
+/// starvation guard — a tight retry loop would otherwise flood COM1.
+fn log_setsockopt_noop(level: u64, optname: u64) {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        log::info!(
+            "[net] setsockopt: accepting unimplemented option as no-op \
+             (first: level={level} optname={optname}); socket-option behaviors \
+             (incl. the TCP keepalive prober) are tracked as deferred — see \
+             docs/roadmap/90b-claude-code.md"
+        );
+    }
 }
 
 /// getsockopt(fd, level, optname, optval, optlen) — syscall 55
@@ -19804,6 +19963,9 @@ pub(super) fn sys_getsockopt(
     const SO_PEERCRED: u64 = 17;
     const IPPROTO_TCP: u64 = 6;
     const TCP_NODELAY: u64 = 1;
+    const TCP_KEEPIDLE: u64 = 4;
+    const TCP_KEEPINTVL: u64 = 5;
+    const TCP_KEEPCNT: u64 = 6;
 
     // Phase 69d follow-up: SO_PEERCRED on a Unix-domain socket
     // returns the connected peer's `struct ucred { pid, uid, gid }`.
@@ -19880,6 +20042,17 @@ pub(super) fn sys_getsockopt(
         }
         (IPPROTO_TCP, TCP_NODELAY) => {
             crate::net::with_socket(handle, |s| s.options.tcp_nodelay as i32).unwrap_or(0)
+        }
+        // Keepalive tuning round-trips the value stored by setsockopt (the
+        // probe timer is deferred; see SocketOptions / 90b-claude-code.md).
+        (IPPROTO_TCP, TCP_KEEPIDLE) => {
+            crate::net::with_socket(handle, |s| s.options.keep_idle_secs as i32).unwrap_or(7200)
+        }
+        (IPPROTO_TCP, TCP_KEEPINTVL) => {
+            crate::net::with_socket(handle, |s| s.options.keep_intvl_secs as i32).unwrap_or(75)
+        }
+        (IPPROTO_TCP, TCP_KEEPCNT) => {
+            crate::net::with_socket(handle, |s| s.options.keep_cnt as i32).unwrap_or(9)
         }
         (SOL_SOCKET, SO_ERROR) => {
             // Phase 86b — pending socket error, read once by clients after a

@@ -530,7 +530,7 @@ fn build_recipe_id(name: &str) -> &'static str {
         }
         // Phase 89 — Node.js. The built artifact is `node`+`npm` (the tarball is
         // the SOURCE, folded in via the Portfile SHA-256). This arm pins the V8/
-        // configure knob set (jitless for W^X, static musl, small-icu) so a flag
+        // configure knob set (jitless for W^X, static musl, full-icu) so a flag
         // change self-invalidates the cached `.m3pkg`; the host clang identity is
         // folded separately via `host_cxx_toolchain_id()` in `compute_port_key`.
         //
@@ -554,13 +554,38 @@ fn build_recipe_id(name: &str) -> &'static str {
         // refs on musl, so `PkeyAlloc()`'s `if (!pkey_alloc) return -1;` saw a null
         // weak symbol and PKU stayed disabled (plain mprotect(RWX)). Invalidate the
         // pre-fix `.m3pkg`.
+        // recipe-v 8: switched `--with-intl=small-icu` → `--with-intl=full-icu`
+        // (+ `--download=all`). small-icu omits the ICU break-iterator data, so
+        // `Intl.Segmenter.segment()` null-derefs in V8's `JSSegments::Create` —
+        // which makes Claude Code's interactive TUI (Unicode grapheme segmentation)
+        // unusable. full-icu compiles the complete ICU data into the binary.
+        // Invalidate the small-icu `.m3pkg`.
         "node" => {
             "node-configure:--fully-static --enable-static --dest-cpu=x64 \
-             --dest-os=linux --with-intl=small-icu --v8-options=--jitless \
+             --dest-os=linux --with-intl=full-icu --download=all --v8-options=--jitless \
              --openssl-no-asm --without-corepack --without-node-snapshot \
              --without-inspector;single-toolset;make-generator;wasm-in-jitless;\
              cxxstdlib=libc++-musl;jit-variant=M3OS_NODE_JIT(key-folded);\
-             pkey-disable-macros-in-v8-tu;pkey-shim-cxx-linkage;recipe-v=7"
+             pkey-disable-macros-in-v8-tu;pkey-shim-cxx-linkage;recipe-v=8"
+        }
+        // Phase 90b — Claude Code. A FETCH-AND-STAGE port (no compiler): the
+        // built artifact is the pinned npm tarball's payload, staged under
+        // /usr/lib/claude-code/ + a /usr/bin/claude launcher. The pinned version
+        // + tarball SHA-256 are folded in via the Portfile digest, and the node
+        // runtime's full (JIT-variant-aware) key folds in via the DEPS=node
+        // recursion in compute_port_key. This arm pins the STAGING recipe (layout,
+        // prune list, launcher env contract) so a recipe change self-invalidates
+        // the cached `.m3pkg`. Bump recipe-v whenever build_claude_code's staged
+        // layout, prune set, or launcher env lines change.
+        "claude-code" => {
+            "fetch-stage:npm-tarball(package/);\
+             stage=/usr/lib/claude-code(cli.js[embeds-yoga.wasm]+package.json+LICENSE.md\
+             +vendor/ripgrep/x64-linux/rg)+/usr/bin/claude(launcher,0755);\
+             launcher=node-import(#!/usr/bin/env node;NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt,\
+             DISABLE_AUTOUPDATER=1,CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1;\
+             import(/usr/lib/claude-code/cli.js)single-process);\
+             prune=vendor/{audio-capture,seccomp},vendor/ripgrep/{arm64-*,x64-darwin,x64-win32};\
+             recipe-v=3"
         }
         _ => "",
     }
@@ -850,6 +875,16 @@ pub fn port_deps(name: &str) -> &'static [&'static str] {
         // libtommath statically, so the client has NO runtime dependency: in-OS
         // `pkg install ssh` pulls nothing else.
         "dropbear" => &[],
+        // Phase 90b — Claude Code's `cli.js` runs under the Node runtime, so
+        // `node` is a real RUNTIME dependency: the in-OS solver installs node
+        // first (dependency-first), and node's full (JIT-variant-aware) content
+        // key folds into claude-code's key via compute_port_key's recursion. The
+        // bundled yoga.wasm TUI requires the Phase 90a JIT node variant.
+        // `ca-certificates` lays down /etc/ssl/certs/ca-certificates.crt, the CA
+        // bundle the `/usr/bin/claude` launcher points NODE_EXTRA_CA_CERTS at so
+        // Node's OpenSSL validates api.anthropic.com — without it the launcher
+        // referenced a missing path ("Cannot open directory /etc/ssl/certs").
+        "claude-code" => &["node", "ca-certificates"],
         _ => &[],
     }
 }
@@ -1111,8 +1146,22 @@ pub fn cmd_port_build(name: &str) -> i32 {
 /// `mandoc`, `lua`, `minizip`, `ca-certificates`) are built via the legacy
 /// Phase-69d path or staged differently and are not driven by `port build`.
 pub const BUILDABLE_PORTS: &[&str] = &[
-    "zlib", "ncurses", "libevent", "mbedtls", "dropbear", "llvm", "go", "gh", "python", "less",
-    "htop", "tmux", "curl", "git", "node",
+    "zlib",
+    "ncurses",
+    "libevent",
+    "mbedtls",
+    "dropbear",
+    "llvm",
+    "go",
+    "gh",
+    "python",
+    "less",
+    "htop",
+    "tmux",
+    "curl",
+    "git",
+    "node",
+    "claude-code",
 ];
 
 /// A port's declared `DEPS=` (whitespace-separated), restricted to `within` —
@@ -1415,6 +1464,22 @@ fn port_build(name: &str) -> Result<(), String> {
         return Ok(());
     }
 
+    // Phase 90b — Claude Code is a FETCH-AND-STAGE port (no compiler at all): the
+    // npm tarball's `package/` payload is staged + a launcher written, so it
+    // branches before the musl_toolchain() requirement (like the go/gh/node
+    // download-based ports). `DEPS=node` is resolved at install time by the in-OS
+    // solver, not at build time.
+    if name == "claude-code" {
+        build_claude_code(&extracted, &stage, &port_dir)?;
+        seal_package(name, &stage, &key)?;
+        fs::write(&stamp, &fingerprint).map_err(|e| format!("write stamp: {e}"))?;
+        println!(
+            "ports: {name}-{version} build complete (staged at {})",
+            stage.display()
+        );
+        return Ok(());
+    }
+
     let toolchain = musl_toolchain().ok_or_else(|| {
         "no musl cross-compiler found on PATH (install musl-tools or \
                                                 musl-gcc-cross-bin)"
@@ -1569,6 +1634,147 @@ fn build_go(extracted: &Path, stage: &Path, port_dir: &Path) -> Result<(), Strin
     println!(
         "ports: go — built static probe {} ({len} bytes)",
         out_bin.display()
+    );
+    Ok(())
+}
+
+/// Phase 90b — stage the pinned Claude Code npm bundle into a `.m3pkg`.
+///
+/// `extracted` is the unpacked npm tarball's single top-level dir (`package/`),
+/// `port_dir` is `ports/util/claude-code`. There is NO compiler: Claude Code is
+/// the `cli.js` JavaScript bundle run under the Node runtime (`DEPS=node`). We
+/// stage the package payload under `/usr/lib/claude-code/`, keep only the
+/// static-pie `vendor/ripgrep/x64-linux/rg` search tool (pruning the
+/// other-platform binaries, the dynamic `audio-capture.node` addon, and the
+/// `seccomp` helper m3OS cannot use), and write the `/usr/bin/claude` launcher
+/// that pins the supported environment + imports `cli.js` in-process under node.
+///
+/// The pin is `2.1.112` — the last version shipping this `cli.js`-under-Node
+/// model; `2.1.113+` repackaged into a per-platform native Bun binary that does
+/// not use Node at all. The `yoga.wasm` TUI layout engine is embedded INSIDE
+/// `cli.js` (not a separate file as in the 1.x/2.0 bundles), so staging `cli.js`
+/// carries it; it still requires the Phase 90a JIT Node variant to instantiate.
+fn build_claude_code(extracted: &Path, stage: &Path, port_dir: &Path) -> Result<(), String> {
+    // Function-local trait import so `Permissions::from_mode` is available for
+    // chmod'ing the launcher + the vendored rg (npm tar perms / host umask vary).
+    use std::os::unix::fs::PermissionsExt;
+    let set_exec = |p: &Path| -> Result<(), String> {
+        fs::set_permissions(p, fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod 0755 {}: {e}", p.display()))
+    };
+
+    let version = parse_portfile(&port_dir.join("Portfile"))?
+        .get("VERSION")
+        .cloned()
+        .unwrap_or_default();
+
+    // The npm tarball's single top-level dir is `package/`; `extract_tarball`
+    // returns it directly as `extracted`. The entry point is `cli.js`.
+    let cli_js = extracted.join("cli.js");
+    if !cli_js.is_file() {
+        return Err(format!(
+            "claude-code bundle missing cli.js at {} — is the pinned tarball the \
+             cli.js bundle (<= 2.1.112) and not the native-binary wrapper (>= 2.1.113)?",
+            cli_js.display()
+        ));
+    }
+
+    // package.json is mandatory too: the launcher / `.meta` machinery and cli.js
+    // itself read its `version`/metadata at runtime. Require it explicitly
+    // (mirroring the cli.js check above) so a tarball-layout change can't silently
+    // produce an incomplete staged package — the prior any-of-three guard would
+    // have accepted a bundle missing package.json as long as cli.js was present.
+    let pkg_json = extracted.join("package.json");
+    if !pkg_json.is_file() {
+        return Err(format!(
+            "claude-code bundle missing package.json at {} — incomplete/changed tarball layout?",
+            pkg_json.display()
+        ));
+    }
+
+    // Stage the package payload under /usr/lib/claude-code/. cli.js resolves its
+    // vendored tooling relative to its own __dirname, so preserve that layout.
+    let libdir = stage.join("usr/lib/claude-code");
+    fs::create_dir_all(&libdir).map_err(|e| format!("mkdir {}: {e}", libdir.display()))?;
+
+    // cli.js (embeds the yoga.wasm TUI engine) + package.json are mandatory and
+    // were verified present above; LICENSE.md is optional provenance. The ~134 KB
+    // `sdk-tools.d.ts` (TypeScript types, runtime-irrelevant) and `README.md` are
+    // intentionally pruned to keep the install lean over the slow ring-3 VFS.
+    for f in ["cli.js", "package.json", "LICENSE.md"] {
+        let src = extracted.join(f);
+        if src.is_file() {
+            fs::copy(&src, libdir.join(f)).map_err(|e| format!("stage claude-code {f}: {e}"))?;
+        }
+    }
+
+    // Stage ONLY the x64-linux ripgrep (Claude Code's search tool). It is a
+    // fully-static `static-pie` binary (no PT_INTERP) — m3OS's ELF loader handles
+    // ET_DYN static-PIE, so it runs directly. Prune every other-platform `rg`, the
+    // dynamic `audio-capture.node` addon (no dlopen on m3OS), and the `seccomp`
+    // helper (m3OS has no seccomp) by simply not copying them.
+    let rg_src = extracted.join("vendor/ripgrep/x64-linux/rg");
+    if !rg_src.is_file() {
+        return Err(format!(
+            "claude-code bundle missing vendored ripgrep at {}",
+            rg_src.display()
+        ));
+    }
+    let rg_dir = libdir.join("vendor/ripgrep/x64-linux");
+    fs::create_dir_all(&rg_dir).map_err(|e| format!("mkdir {}: {e}", rg_dir.display()))?;
+    let rg_dst = rg_dir.join("rg");
+    fs::copy(&rg_src, &rg_dst).map_err(|e| format!("stage ripgrep rg: {e}"))?;
+    set_exec(&rg_dst)?;
+    let rg_copying = extracted.join("vendor/ripgrep/COPYING");
+    if rg_copying.is_file() {
+        let _ = fs::copy(&rg_copying, libdir.join("vendor/ripgrep/COPYING"));
+    }
+
+    // The /usr/bin/claude launcher — the pinned supported environment (Track C.1).
+    //
+    // It is a NODE script, NOT a `#!/bin/sh` script: m3OS's `/bin/sh` is `ion`,
+    // which (unlike POSIX `sh`) does not run a shebang script file with flag args
+    // — `ion /usr/bin/claude --version` is intercepted by ion's own `--version`
+    // handler (it prints the ion banner and never runs the script body), and the
+    // built-in `sh0` ignores argv entirely. The one script interpreter m3OS runs
+    // correctly with args is `node` itself (the `#!/usr/bin/env node` path npm
+    // rides). So the launcher is a tiny CJS node program that pins the supported
+    // env and runs `cli.js` IN-PROCESS via dynamic `import()` (cli.js is ESM —
+    // `package.json` has `"type":"module"`). A single node process (no node→node
+    // fork) keeps the cold start to ONE binary load over the slow VFS. Each env
+    // line is a documented support-boundary decision (docs/90b-claude-code.md):
+    //   NODE_EXTRA_CA_CERTS — Node's OpenSSL validates api.anthropic.com against the
+    //     Phase 86a CA bundle (m3OS has no system trust-store discovery). NOTE: node
+    //     reads this lazily when the root store is first built, so the in-process set
+    //     below covers the opt-in TLS arm; a user can also export it in the shell.
+    //   DISABLE_AUTOUPDATER — the sealed .m3pkg is the only supported delivery.
+    //   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC — no telemetry/Statsig/Sentry egress.
+    let bindir = stage.join("usr/bin");
+    fs::create_dir_all(&bindir).map_err(|e| format!("mkdir {}: {e}", bindir.display()))?;
+    let launcher = bindir.join("claude");
+    let launcher_body = "#!/usr/bin/env node\n\
+        // Phase 90b — Claude Code launcher (pinned supported environment).\n\
+        // ion (m3OS /bin/sh) can't run shebang scripts with flag args, so this is a\n\
+        // node wrapper that imports cli.js in-process (single node, no fork).\n\
+        'use strict';\n\
+        process.env.DISABLE_AUTOUPDATER = process.env.DISABLE_AUTOUPDATER || '1';\n\
+        process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC =\n\
+        \x20 process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC || '1';\n\
+        if (!process.env.NODE_EXTRA_CA_CERTS)\n\
+        \x20 process.env.NODE_EXTRA_CA_CERTS = '/etc/ssl/certs/ca-certificates.crt';\n\
+        process.argv.splice(1, 1, '/usr/lib/claude-code/cli.js');\n\
+        import('/usr/lib/claude-code/cli.js').catch((e) => {\n\
+        \x20 console.error('claude launcher: failed to start cli.js:', e && e.message);\n\
+        \x20 process.exit(1);\n\
+        });\n";
+    fs::write(&launcher, launcher_body).map_err(|e| format!("write claude launcher: {e}"))?;
+    set_exec(&launcher)?;
+
+    let cli_len = fs::metadata(&cli_js).map(|m| m.len()).unwrap_or(0);
+    let rg_len = fs::metadata(&rg_dst).map(|m| m.len()).unwrap_or(0);
+    println!(
+        "ports: claude-code — staged v{version} bundle (cli.js {cli_len} bytes, rg {rg_len} bytes) \
+         + /usr/bin/claude launcher"
     );
     Ok(())
 }
@@ -3711,7 +3917,15 @@ fn build_node(port_src: &Path, stage: &Path, port_dir: &Path) -> Result<(), Stri
     // V8's mksnapshot/torque run on the build host (same arch x86_64 → native), so
     // they MUST link glibc; the final node binary is musl-static. Keep the two
     // toolsets distinct: --target/--sysroot/-static only in the TARGET vars.
-    let stub = musl_extra_ldflags_joined();
+    // `node.gyp` unconditionally appends `-latomic` for every Linux+clang build
+    // (PR #25852). The static musl/clang sysroot has no libatomic, and x86_64
+    // lowers all of V8/Node's atomics to inline instructions (the linked binary
+    // has zero undefined `__atomic_*` refs), so put the empty-archive stub dir
+    // (which includes `libatomic.a`) on the link path UNCONDITIONALLY — not gated
+    // on `find_musl_cc` like the autotools ports — or the final link fails with
+    // `ld.lld: error: unable to find library -latomic` on any host that lacks a
+    // system libatomic on lld's default search path.
+    let stub = crate::musl_stub_ldflags_always().join(" ");
     let sysroot_s = sysroot.display().to_string();
     let tgt = format!("--target={NODE_TRIPLE} --sysroot={sysroot_s}");
     let warn = "-Wno-unused-command-line-argument";
@@ -3803,7 +4017,7 @@ fn build_node(port_src: &Path, stage: &Path, port_dir: &Path) -> Result<(), Stri
     // flag must be dropped at configure time for TurboFan to actually run.
     let jit = node_jit_enabled();
     println!(
-        "node: configure (static musl, {} V8, small-icu) — {}",
+        "node: configure (static musl, {} V8, full-icu) — {}",
         if jit { "JIT (PKU-guarded)" } else { "jitless" },
         src.display()
     );
@@ -3821,7 +4035,18 @@ fn build_node(port_src: &Path, stage: &Path, port_dir: &Path) -> Result<(), Stri
         // generate" error. A single (native) toolset generates it once.
         "--fully-static",
         "--enable-static",
-        "--with-intl=small-icu",
+        // Phase 90b — FULL ICU (not small-icu). small-icu omits the ICU
+        // break-iterator/segmentation data, so `Intl.Segmenter.prototype.segment()`
+        // gets a NULL `icu::BreakIterator` and V8's `JSSegments::Create` null-derefs
+        // (confirmed: pid faults at `JSSegments::Create+0x2c` reading address 0x0).
+        // Claude Code's interactive TUI calls `Intl.Segmenter` for Unicode grapheme
+        // segmentation (terminal string width / wrapping), so small-icu makes the TUI
+        // unusable. full-icu compiles the complete ICU data (incl. brkitr) statically
+        // into the binary, so segmentation works with no runtime data file. Costs
+        // ~30 MB of binary size; `--download=all` lets configure fetch the full ICU
+        // data the source tarball does not bundle (it ships only `deps/icu-small`).
+        "--with-intl=full-icu",
+        "--download=all",
     ]);
     if !jit {
         // Jitless via `--v8-options=--jitless`, NOT `--v8-lite-mode`. Both make
@@ -5588,6 +5813,20 @@ pub fn build_node_port() -> Result<(), String> {
     Ok(())
 }
 
+/// Phase 90b — build the `claude-code` port (the pinned Claude Code npm bundle)
+/// into its `.m3pkg`. A FETCH-AND-STAGE port: no compiler, no musl dependency —
+/// the npm registry tarball is fetched + SHA-verified + staged + sealed. The
+/// `DEPS=node` is a RUNTIME dependency resolved by the in-OS solver at
+/// `pkg install` time, so the HOST build needs only the registry fetch + the
+/// `node` Portfile (whose content key folds into claude-code's). The
+/// `claude-smoke` gate + the opt-in `M3OS_WITH_CLAUDE` image feature drive this;
+/// a warm pkgcache makes a repeat a zero-fetch hit. Callers that want the bundled
+/// runtime present (the gate, the image block) build `build_node_port()` first.
+pub fn build_claude_code_port() -> Result<(), String> {
+    port_build("claude-code").map_err(|e| format!("port claude-code: {e}"))?;
+    Ok(())
+}
+
 /// Phase 86b — build the static client-only `dropbear` (`dbclient`) into its
 /// `.m3pkg` artifact so the image populator can bundle it into `/usr/pkg/` as
 /// `ssh.m3pkg`. dropbear has no runtime deps (`--disable-zlib`), so nothing is
@@ -5888,6 +6127,11 @@ mod tests {
         assert_eq!(port_deps("python"), &["zlib"]);
         // Phase 86a Track C.2 — the CA bundle is a self-contained data file.
         assert_eq!(port_deps("ca-certificates"), &[] as &[&str]);
+        // Phase 90b — claude-code's cli.js runs under the Node runtime (node),
+        // and the launcher's NODE_EXTRA_CA_CERTS needs the ca-certificates CA
+        // bundle to validate api.anthropic.com; the in-OS solver installs both
+        // dependency-first before claude-code.
+        assert_eq!(port_deps("claude-code"), &["node", "ca-certificates"]);
         // Unknown port returns empty.
         assert_eq!(port_deps("clang"), &[] as &[&str]);
     }
@@ -5900,8 +6144,22 @@ mod tests {
         // identity so a flag change self-invalidates its cached .m3pkg and two
         // ports never collide on the recipe component of the key.
         let ports = [
-            "zlib", "ncurses", "libevent", "less", "htop", "tmux", "git", "python", "llvm",
-            "dropbear", "mbedtls", "curl", "go", "gh", "node",
+            "zlib",
+            "ncurses",
+            "libevent",
+            "less",
+            "htop",
+            "tmux",
+            "git",
+            "python",
+            "llvm",
+            "dropbear",
+            "mbedtls",
+            "curl",
+            "go",
+            "gh",
+            "node",
+            "claude-code",
         ];
         let ids: Vec<&str> = ports.iter().map(|p| build_recipe_id(p)).collect();
         for (p, id) in ports.iter().zip(&ids) {

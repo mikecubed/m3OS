@@ -614,6 +614,49 @@ if [ "${M3OS_PKU_REGRESSION:-0}" = "1" ]; then
     fi
 fi
 
+# Track D (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md) —
+# kernel-stack-overflow controlled-kill recovery gate. Gated behind
+# M3OS_KSTACK_OVERFLOW_REGRESSION=1. Builds a kernel with the
+# `kstack-overflow-test` feature, boots m3OS single-core on plain TCG (no
+# PKU/KVM), and runs the `kstack-overflow-test` ramdisk binary: a child overflows
+# its per-task kernel stack via SYS_KSTACK_OVERFLOW_TEST and the gate asserts the
+# kernel turned the resulting guard-page #PF/#DF into a SIGSEGV of the child
+# (KSTACK_OVF:killed:ok) while the parent kept running (KSTACK_OVF:survivor:ok) —
+# the recovery, NOT a core wedge / machine halt. A regression that reverts the
+# recovery (back to hlt_loop) hangs the single-core box → the gate times out. Set
+# this on branches touching the page-fault / double-fault handlers
+# (kernel/src/arch/x86_64/interrupts.rs), the fault-recovery stack / kill
+# trampoline, the kstack guard-page classifier, or hlt_loop's offline marking.
+if [ "${M3OS_KSTACK_OVERFLOW_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask kstack-overflow-smoke..."
+    if ! cargo xtask kstack-overflow-smoke --timeout 180; then
+        echo "pre-push: cargo xtask kstack-overflow-smoke failed" >&2
+        exit 1
+    fi
+fi
+
+# Permanent multi-core SMP regression gate
+# (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md). Gated behind
+# M3OS_SMP_REGRESSION=1. Boots Node on MULTIPLE cores (-smp 4) and runs a
+# futex-heavy libuv-threadpool stress (256 async pbkdf2 ops, 16 in flight) that
+# must COMPLETE (SMP_STRESS_OK), guarding the five multi-core fixes: the cross-core
+# lost-wakeup (block_current_until re-check) — a regression strands a worker
+# BlockedOnFutex and the `no waker registered` watchdog trips the fail-fast; the
+# TLB-shootdown panic survival (Tracks A–D); the CoW/mprotect spurious-fault
+# wrongful-kill; and the COM1-RX-under-SMP byte-drop (every injected command would
+# garble). Runs under KVM (M3OS_KVM=1, also covers the JIT/PKU paths) or plain TCG.
+# SKIPs cleanly without the host C++ toolchain + llvm musl sysroot (mirrors
+# node-smoke). Set on branches touching the scheduler block/wake path
+# (block_current_until / wake_task_v2), the page-fault handler, smp/tlb.rs,
+# smp/boot.rs (is_online), hlt_loop, or the serial RX path.
+if [ "${M3OS_SMP_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask smp-smoke..."
+    if ! cargo xtask smp-smoke --timeout 5400; then
+        echo "pre-push: cargo xtask smp-smoke failed" >&2
+        exit 1
+    fi
+fi
+
 # Phase 90a Track D.3 — Node.js JIT + WASM regression gate. Gated behind
 # M3OS_NODE_JIT_REGRESSION=1. Cross-builds the JIT build_node variant
 # (M3OS_NODE_JIT=1 — --v8-options=--jitless dropped, the A.1 V8/Node PKU patches
@@ -636,6 +679,34 @@ if [ "${M3OS_NODE_JIT_REGRESSION:-0}" = "1" ]; then
     echo "pre-push: running cargo xtask node-jit-smoke..."
     if ! M3OS_KVM=1 cargo xtask node-jit-smoke --timeout 5400; then
         echo "pre-push: cargo xtask node-jit-smoke failed" >&2
+        exit 1
+    fi
+fi
+
+# Phase 90b — Claude Code regression gate. Gated behind M3OS_CLAUDE_REGRESSION=1.
+# Builds a M3OS_WITH_CLAUDE image (the pinned claude-code 2.1.112 .m3pkg + the node
+# it DEPS=node-depends on), boots, `pkg install claude-code` (the solver pulls node
+# FIRST — the dependency-first proof), and asserts the always-on offline core:
+# `claude --version` (2.1.112), `claude --help`, the vendored static-pie
+# `rg --version`, and the A.2 SIGINT/spawn/raw-mode interactive probes. By DEFAULT
+# the bundled node is the JITLESS variant, which needs NO PKU — so the offline core
+# is CI-viable under plain TCG; the M3OS_KVM=1 below is a SPEED knob (the cold
+# cli.js load over the slow VFS is ~10–50× faster under KVM), not a requirement.
+# `M3OS_CLAUDE_JIT=1` instead bundles the 90a JIT node (the interactive-TUI /
+# runtime-WASM variant), which REQUIRES PKU and so runs only under M3OS_KVM=1 on a
+# PKU host (skip-with-reason otherwise). The opt-in authenticated arms
+# (M3OS_CLAUDE_NET=1 + M3OS_CLAUDE_TOKEN=<setup-token> or M3OS_CLAUDE_KEY=<api-key>)
+# run a `claude -p` round-trip to api.anthropic.com + a real-FS agent workflow + the
+# 0600 credential-hygiene check; absent a credential they skip-with-reason (a secret
+# can never live in repo/CI). Absent a host C++ toolchain + the llvm musl sysroot
+# the gate SKIPs and returns success. Set this on branches that touch
+# ports/util/claude-code, xtask's build_claude_code / claude-smoke / the
+# M3OS_WITH_CLAUDE bundle block / the credential seeding, or the launcher env
+# contract. clang-gate-class --timeout (the ~140 MB install + cold V8/cli.js init).
+if [ "${M3OS_CLAUDE_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask claude-smoke..."
+    if ! M3OS_KVM=1 cargo xtask claude-smoke --timeout 5400; then
+        echo "pre-push: cargo xtask claude-smoke failed" >&2
         exit 1
     fi
 fi

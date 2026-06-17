@@ -36,7 +36,7 @@ use x86_64::{
     },
 };
 
-use crate::arch::x86_64::gdt::DOUBLE_FAULT_IST_INDEX;
+use crate::arch::x86_64::gdt::{DOUBLE_FAULT_IST_INDEX, NMI_IST_INDEX};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -738,8 +738,8 @@ pub fn init_bsp_per_core() {
 
 /// Populate `PerCoreData` for an AP.
 ///
-/// Allocates a fresh TSS plus a per-core syscall stack and double-fault
-/// stack. The two stacks are claimed from the static `.bss` pool in
+/// Allocates a fresh TSS plus a per-core syscall stack, double-fault stack,
+/// and NMI stack. The stacks are claimed from the static `.bss` pool in
 /// [`crate::task::kstack`] rather than the kernel heap, so they cannot
 /// alias with any other heap allocation — see
 /// `docs/handoffs/ap-core-gpf-saved-rsp-stack-corruption.md` for the
@@ -755,15 +755,21 @@ pub fn init_ap_per_core(core_id: u8, apic_id: u8) -> *mut PerCoreData {
     );
     // Pool slots are 32 KiB each — larger than `SYSCALL_STACK_SIZE` (16 KiB)
     // and `DOUBLE_FAULT_STACK_SIZE` (20 KiB), so the stacks fit comfortably
-    // and the unused portion below `top` is harmless.
+    // and the unused portion below `top` is harmless. The NMI IST stack
+    // (Phase 90b follow-up) is claimed from the same pool so each AP services
+    // TLB-shootdown NMIs on a per-core stack — see the BSP equivalent in
+    // `gdt.rs` (NMI_IST_INDEX) and
+    // `docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md`.
     let kernel_stack_top = crate::task::kstack::alloc_leaked_top();
     let double_fault_stack_top = crate::task::kstack::alloc_leaked_top();
+    let nmi_stack_top = crate::task::kstack::alloc_leaked_top();
 
     // Allocate and configure TSS.
     let tss = Box::into_raw(Box::new({
         let mut tss = TaskStateSegment::new();
         tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
             VirtAddr::new(double_fault_stack_top);
+        tss.interrupt_stack_table[NMI_IST_INDEX as usize] = VirtAddr::new(nmi_stack_top);
         tss.privilege_stack_table[0] = VirtAddr::new(kernel_stack_top);
         tss
     }));

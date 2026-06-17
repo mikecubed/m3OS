@@ -319,7 +319,16 @@ fn report_generation_divergence(
     };
     let expected_after = gen_before.saturating_add(local_bumps);
     if gen_after != expected_after {
-        log::warn!(
+        // DEBUG level (was WARN): this is a benign, per-copy diagnostic (the copy
+        // already succeeded via per-page validation under `lock_page_tables`; the
+        // generation merely changed mid-copy under a concurrent mmap/mprotect).
+        // Under a multithreaded mmap-heavy workload on SMP (V8's W^X churn) it
+        // fires on nearly every copy — a serial flood that holds the IF-disabled
+        // `SERIAL1` lock long enough to starve the COM1 RX ISR → dropped input
+        // bytes. Demoted so the default `Info` console stays quiet; raise to
+        // `debug` to study address-space-mutation races. See
+        // docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md Layer 0.
+        log::debug!(
             "[user_mem] {}: address-space generation divergence (gen {} -> {}, expected {} after {} local bumps) \
              during copy at {:#x} len={:#x} — concurrent or untracked mapping mutation detected",
             caller,

@@ -12,7 +12,7 @@
 //!   [`INVLPG_THRESHOLD`] pages), uses a full CR3 reload instead of
 //!   per-page `invlpg`.
 
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::ipi;
 
@@ -23,8 +23,25 @@ use super::ipi;
 /// The virtual address to invalidate (set before sending the IPI).
 static SHOOTDOWN_ADDR: AtomicU64 = AtomicU64::new(0);
 
-/// Number of cores that still need to acknowledge the shootdown.
-static SHOOTDOWN_PENDING: AtomicU8 = AtomicU8::new(0);
+/// Per-round acknowledgement bitmap. Bit `i` is set by core `i`'s IPI handler
+/// ([`handle_tlb_shootdown_ipi`]) once it has flushed the in-flight shootdown.
+/// The sender resets this to `0` (under [`SHOOTDOWN_LOCK`]) immediately before
+/// publishing the NMIs and then waits until `(SHOOTDOWN_ACK & target_mask) ==
+/// target_mask`.
+///
+/// This replaces the pre-Phase-90b decrementing `SHOOTDOWN_PENDING` count
+/// (Track C of
+/// `docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md`). A
+/// per-round, per-core *idempotent* bitmap makes the timeout-degrade path
+/// (re-NMI the laggards, then mark them offline and continue rather than
+/// `panic!`) provably safe: a stale NMI latched from an *abandoned* earlier
+/// round can only ever set a bit *outside* the current round's `target_mask`
+/// (the abandoned core was marked offline and is excluded from this round), so
+/// it is ignored. A shared decrementing counter, by contrast, could underflow,
+/// double-decrement (re-NMI), or have a late ACK corrupt a *subsequent*
+/// round's count → a silent stale TLB. `MAX_CORES` (16) ≤ 64, so one `u64`
+/// covers every core id.
+static SHOOTDOWN_ACK: AtomicU64 = AtomicU64::new(0);
 
 /// Serializes concurrent TLB shootdown requests.
 static SHOOTDOWN_LOCK: spin::Mutex<()> = spin::Mutex::new(());
@@ -49,15 +66,14 @@ const INVLPG_THRESHOLD: u64 = 32;
 
 /// Per-core counter of `IPI_TLB_SHOOTDOWN` invocations actually serviced by
 /// [`handle_tlb_shootdown_ipi`]. Incremented from the IDT entry on each
-/// recipient; read by [`wait_for_shootdown_acks_or_panic`] before/after the
-/// spin so the timeout diagnostic can dump a per-recipient delta and tell us
-/// definitively whether each target's IPI handler fired at all during the
-/// hang.
+/// recipient; read by [`wait_for_shootdown_acks`] before/after the spin so the
+/// timeout diagnostic can dump a per-recipient delta and tell us definitively
+/// whether each target's IPI handler fired at all during the hang.
 ///
 /// Sized to [`crate::smp::MAX_CORES`] (16) to match the largest core_id the
 /// crate exposes. `Relaxed` ordering is sufficient: this counter is read only
-/// from panic / diagnostic context, never participates in correctness
-/// synchronisation (`SHOOTDOWN_PENDING` carries the ack semantics).
+/// from diagnostic context, never participates in correctness synchronisation
+/// ([`SHOOTDOWN_ACK`] carries the ack semantics).
 static TLB_IPI_SERVICED: [AtomicU64; crate::smp::MAX_CORES] =
     [const { AtomicU64::new(0) }; crate::smp::MAX_CORES];
 
@@ -70,45 +86,66 @@ static TLB_IPI_SERVICED: [AtomicU64; crate::smp::MAX_CORES] =
 // removed in session 5 (2026-05-25). See
 // `docs/handoffs/2026-05-24-4gib-pci-hole-vga-mapping.md`.
 
-/// Spin on `SHOOTDOWN_PENDING > 0` with a generous timeout. On timeout, dump
-/// the request state and which APIC IDs we sent to vs the final pending
-/// count, then panic. Designed for the 4 GiB-RAM-on-Zen 5 hang investigation
-/// (docs/handoffs/2026-05-24-4gib-pci-hole-vga-mapping.md): converts a
-/// previously-silent infinite spin into an actionable panic.
-///
-/// 500 ms is ~5 orders of magnitude over the SDM-spec ~1 µs IPI delivery
-/// latency; comfortable margin under TCG without inflating real-hang
-/// detection time. tsc_per_ms() returns 0 before APIC calibration; fall
-/// back to a ~10G-cycle absolute ceiling (~10 s at 1 GHz) in that window.
-fn wait_for_shootdown_acks_or_panic(
-    site: &'static str,
-    expected_targets: u8,
-    range_start: u64,
-    range_end: u64,
-    recipients_repr: core::fmt::Arguments<'_>,
-) {
-    let tsc_per_ms = crate::arch::x86_64::apic::tsc_per_ms();
-    let timeout_tsc: u64 = if tsc_per_ms > 0 {
+/// How long the sender spins for the initial ack window before escalating to
+/// the re-NMI + degrade path. 500 ms is ~5 orders of magnitude over the
+/// SDM-spec ~1 µs IPI delivery latency; comfortable margin under TCG without
+/// inflating real-hang detection time. `tsc_per_ms()` returns 0 before APIC
+/// calibration; fall back to a ~10G-cycle absolute ceiling (~10 s at 1 GHz).
+fn ack_timeout_tsc(tsc_per_ms: u64) -> u64 {
+    if tsc_per_ms > 0 {
         tsc_per_ms.saturating_mul(500)
     } else {
         10_000_000_000
-    };
-    // Snapshot the per-core IPI-serviced counter so a timeout panic can dump
-    // a per-recipient delta and tell us definitively whether each target's
-    // IDT handler actually fired during the spin window.
+    }
+}
+
+/// Grace window after the re-NMI before the degrade gives up on a core. Much
+/// shorter than the initial window — by this point the core has already had
+/// 500 ms + a fresh NMI, so a few hundred ms is plenty for any merely-slow
+/// core to ack, and an unresponsive one is wedged for good.
+fn ack_regrace_tsc(tsc_per_ms: u64) -> u64 {
+    if tsc_per_ms > 0 {
+        tsc_per_ms.saturating_mul(100)
+    } else {
+        2_000_000_000
+    }
+}
+
+/// Wait until every targeted core has acknowledged the in-flight shootdown by
+/// setting its bit in [`SHOOTDOWN_ACK`].
+///
+/// **Degrades instead of panicking** (Track C of
+/// `docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md`). On the
+/// happy path (the overwhelming default) it returns as soon as
+/// `(SHOOTDOWN_ACK & target_mask) == target_mask`. On the initial-window
+/// timeout it (1) dumps the per-core diagnostic, (2) re-NMIs the still-
+/// outstanding cores once and waits a short grace window, and (3) if any core
+/// *still* hasn't acked, marks that core offline (so future shootdowns exclude
+/// it for free — Track B) and **returns** rather than `panic!`ing the whole
+/// machine. With the Track A NMI-on-IST stack a wedged core services the
+/// shootdown NMI on a clean per-core stack and acks even while halted, so the
+/// degrade path should be effectively unreachable; reaching it at all means a
+/// core is genuinely dark, and abandoning its stale TLB (it will never run
+/// userspace again) is strictly better than killing the box.
+fn wait_for_shootdown_acks(site: &'static str, target_mask: u64, range_start: u64, range_end: u64) {
+    let tsc_per_ms = crate::arch::x86_64::apic::tsc_per_ms();
+    let timeout_tsc = ack_timeout_tsc(tsc_per_ms);
+
+    // Snapshot the per-core IPI-serviced + LAPIC-timer counters so a timeout
+    // dump can show a per-recipient before→after delta and tell us
+    // definitively whether each target's IDT handler fired at all during the
+    // window. The discriminator:
+    //   * timer-delta > 0, ipi-delta = 0  → core's interrupts work but it
+    //     specifically isn't taking the shootdown NMI (delivery race) —
+    //     IPI-specific.
+    //   * timer-delta = 0, ipi-delta = 0  → core had IF=0 the whole window (or
+    //     its LAPIC timer is dead) — generic interrupt-delivery wedge.
+    //   * timer-delta > 0, ipi-delta > 0  → core serviced but its ack bit
+    //     accounting is wrong somewhere.
     let mut serviced_at_start = [0u64; crate::smp::MAX_CORES];
     for (i, slot) in TLB_IPI_SERVICED.iter().enumerate() {
         serviced_at_start[i] = slot.load(Ordering::Relaxed);
     }
-    // Also snapshot per-core LAPIC timer ticks. The diagnostic discriminates:
-    //   * timer-delta > 0, ipi-delta = 0  → core's interrupts work but it
-    //     specifically isn't taking vector 0xFD (vector masking, IDT entry
-    //     missing, dispatch race) — bug is IPI-specific.
-    //   * timer-delta = 0, ipi-delta = 0  → core has IF=0 for the entire
-    //     window (or its LAPIC timer is dead) — bug is interrupt-delivery
-    //     generic, almost certainly the recursive log path holding IrqSafeMutex.
-    //   * timer-delta > 0, ipi-delta > 0  → core ack'd but the atomic
-    //     accounting is wrong somewhere.
     let mut timer_at_start = [0u64; crate::smp::MAX_CORES];
     for (i, slot) in crate::arch::x86_64::interrupts::TIMER_TICKS_PER_CORE
         .iter()
@@ -116,65 +153,150 @@ fn wait_for_shootdown_acks_or_panic(
     {
         timer_at_start[i] = slot.load(Ordering::Relaxed);
     }
+
+    // Phase 1 — initial ack window.
+    if spin_until_acked(target_mask, timeout_tsc) {
+        return;
+    }
+
+    // Timeout. Dump the per-core diagnostic before escalating.
+    let outstanding = target_mask & !SHOOTDOWN_ACK.load(Ordering::Acquire);
+    dump_ack_timeout_diagnostic(
+        site,
+        target_mask,
+        outstanding,
+        range_start,
+        range_end,
+        tsc_per_ms,
+        &serviced_at_start,
+        &timer_at_start,
+    );
+
+    // Phase 2 — Track C re-NMI: poke the still-outstanding cores once more,
+    // then wait a short grace window. `send_nmi_to_core` re-checks `is_online`,
+    // so a core already taken offline elsewhere is skipped (it can't ack and
+    // will be abandoned below). NMIs coalesce, so a laggard whose original NMI
+    // is still pending won't double-service.
+    for core_id in 0..crate::smp::MAX_CORES as u8 {
+        if outstanding & (1u64 << core_id) != 0 {
+            ipi::send_nmi_to_core(core_id);
+        }
+    }
+    if spin_until_acked(target_mask, ack_regrace_tsc(tsc_per_ms)) {
+        crate::serial::_panic_print(format_args!(
+            "[tlb] {site}: recovered after re-NMI — all targets acked in the \
+             grace window (machine survives)\n"
+        ));
+        return;
+    }
+
+    // Phase 3 — degrade. Any core still outstanding is dark. Mark it offline
+    // (Track B: future shootdowns exclude it for free) and continue. Its bit
+    // staying clear in this round's mask is harmless; a stale NMI it might
+    // service much later can only set a bit outside a future round's
+    // target_mask (it is offline now), so it cannot corrupt later rounds.
+    let still = target_mask & !SHOOTDOWN_ACK.load(Ordering::Acquire);
+    for core_id in 0..crate::smp::MAX_CORES as u8 {
+        if still & (1u64 << core_id) != 0
+            && let Some(data) = super::get_core_data(core_id)
+        {
+            data.is_online.store(false, Ordering::Release);
+        }
+    }
+    crate::serial::_panic_print(format_args!(
+        "[tlb] {site}: DEGRADED — {n} core(s) (mask={still:#018x}) failed to ack \
+         a TLB shootdown within the grace window; marked offline and \
+         continuing. The machine survives (was a whole-system panic before \
+         Track C); the abandoned cores' stale TLBs are dropped — a halted core \
+         never runs userspace again.\n",
+        n = still.count_ones(),
+    ));
+}
+
+/// Spin until `(SHOOTDOWN_ACK & target_mask) == target_mask` or `timeout_tsc`
+/// cycles elapse. Returns `true` if all targets acked, `false` on timeout.
+fn spin_until_acked(target_mask: u64, timeout_tsc: u64) -> bool {
     let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
     let mut iterations: u64 = 0;
-    while SHOOTDOWN_PENDING.load(Ordering::Acquire) > 0 {
+    loop {
+        if (SHOOTDOWN_ACK.load(Ordering::Acquire) & target_mask) == target_mask {
+            return true;
+        }
         core::hint::spin_loop();
         iterations += 1;
         if iterations.is_multiple_of(4096) {
             let now = unsafe { core::arch::x86_64::_rdtsc() };
             if now.wrapping_sub(start_tsc) > timeout_tsc {
-                let pending = SHOOTDOWN_PENDING.load(Ordering::Acquire);
-                let my_core = super::per_core().core_id;
-                let icr_low = unsafe { ipi::lapic_read(ipi::LAPIC_ICR_LOW) };
-                // Build per-core "before → after" maps for both counters.
-                let mut serviced_now = [0u64; crate::smp::MAX_CORES];
-                for (i, slot) in TLB_IPI_SERVICED.iter().enumerate() {
-                    serviced_now[i] = slot.load(Ordering::Relaxed);
-                }
-                let mut timer_now = [0u64; crate::smp::MAX_CORES];
-                for (i, slot) in crate::arch::x86_64::interrupts::TIMER_TICKS_PER_CORE
-                    .iter()
-                    .enumerate()
-                {
-                    timer_now[i] = slot.load(Ordering::Relaxed);
-                }
-                // Use _panic_print directly so the dump goes out even if the
-                // log infrastructure is wedged on the recursive DMESG_RING
-                // path.
-                crate::serial::_panic_print(format_args!(
-                    "[tlb] {site} stuck >500ms: SHOOTDOWN_PENDING={pending} \
-                     (of {expected_targets} targets), my_core={my_core}, \
-                     range={range_start:#x}..{range_end:#x}, \
-                     ICR_LOW={icr_low:#010x} (bit 12 = delivery-pending), \
-                     recipients=[{recipients_repr}], iterations={iterations}, \
-                     tsc_per_ms={tsc_per_ms}\n\
-                     [tlb] per-core diagnostics — \
-                     tlb-ipi serviced (before → after, delta), \
-                     LAPIC-timer ticks (before → after, delta):\n"
-                ));
-                for i in 0..crate::smp::MAX_CORES {
-                    let ipi_before = serviced_at_start[i];
-                    let ipi_after = serviced_now[i];
-                    let tmr_before = timer_at_start[i];
-                    let tmr_after = timer_now[i];
-                    if ipi_before != 0
-                        || ipi_after != 0
-                        || tmr_before != 0
-                        || tmr_after != 0
-                        || i == my_core as usize
-                    {
-                        let ipi_delta = ipi_after.wrapping_sub(ipi_before);
-                        let tmr_delta = tmr_after.wrapping_sub(tmr_before);
-                        crate::serial::_panic_print(format_args!(
-                            "[tlb]   core {i}: ipi {ipi_before} → {ipi_after} \
-                             (Δ{ipi_delta})  timer {tmr_before} → {tmr_after} \
-                             (Δ{tmr_delta})\n"
-                        ));
-                    }
-                }
-                panic!("[tlb] {site} ack timeout — see per-core dump above");
+                return false;
             }
+        }
+    }
+}
+
+/// Emit the per-core ack-timeout diagnostic via `_panic_print` (so it survives
+/// even if the `log`/`DMESG_RING` path is wedged). Non-fatal — the caller
+/// escalates to re-NMI + degrade after this.
+#[allow(clippy::too_many_arguments)]
+fn dump_ack_timeout_diagnostic(
+    site: &'static str,
+    target_mask: u64,
+    outstanding: u64,
+    range_start: u64,
+    range_end: u64,
+    tsc_per_ms: u64,
+    serviced_at_start: &[u64; crate::smp::MAX_CORES],
+    timer_at_start: &[u64; crate::smp::MAX_CORES],
+) {
+    let my_core = super::per_core().core_id;
+    let icr_low = unsafe { ipi::lapic_read(ipi::LAPIC_ICR_LOW) };
+    let mut serviced_now = [0u64; crate::smp::MAX_CORES];
+    for (i, slot) in TLB_IPI_SERVICED.iter().enumerate() {
+        serviced_now[i] = slot.load(Ordering::Relaxed);
+    }
+    let mut timer_now = [0u64; crate::smp::MAX_CORES];
+    for (i, slot) in crate::arch::x86_64::interrupts::TIMER_TICKS_PER_CORE
+        .iter()
+        .enumerate()
+    {
+        timer_now[i] = slot.load(Ordering::Relaxed);
+    }
+    // The spin budget is wall-clock ~500 ms once the TSC is calibrated, but a
+    // fixed 10G-cycle fallback before APIC/TSC calibration (`tsc_per_ms == 0`,
+    // see `ack_timeout_tsc`). Don't claim a precise ">500ms" in that window —
+    // word it per the regime so an early-boot hang dump isn't misleading.
+    let budget_desc = if tsc_per_ms > 0 {
+        "ack stuck >500ms"
+    } else {
+        "ack stuck >10G TSC cycles (pre-calibration: tsc_per_ms=0)"
+    };
+    crate::serial::_panic_print(format_args!(
+        "[tlb] {site} {budget_desc}: outstanding_mask={outstanding:#018x} \
+         (of target_mask={target_mask:#018x}), my_core={my_core}, \
+         range={range_start:#x}..{range_end:#x}, \
+         ICR_LOW={icr_low:#010x} (bit 12 = delivery-pending), \
+         tsc_per_ms={tsc_per_ms} — escalating to re-NMI + degrade (no panic)\n\
+         [tlb] per-core diagnostics — \
+         tlb-ipi serviced (before → after, delta), \
+         LAPIC-timer ticks (before → after, delta):\n"
+    ));
+    for i in 0..crate::smp::MAX_CORES {
+        let ipi_before = serviced_at_start[i];
+        let ipi_after = serviced_now[i];
+        let tmr_before = timer_at_start[i];
+        let tmr_after = timer_now[i];
+        if ipi_before != 0
+            || ipi_after != 0
+            || tmr_before != 0
+            || tmr_after != 0
+            || i == my_core as usize
+        {
+            let ipi_delta = ipi_after.wrapping_sub(ipi_before);
+            let tmr_delta = tmr_after.wrapping_sub(tmr_before);
+            crate::serial::_panic_print(format_args!(
+                "[tlb]   core {i}: ipi {ipi_before} → {ipi_after} \
+                 (Δ{ipi_delta})  timer {tmr_before} → {tmr_after} \
+                 (Δ{tmr_delta})\n"
+            ));
         }
     }
 }
@@ -193,7 +315,7 @@ pub fn tlb_shootdown(addr: u64) {
     // Phase 57b — `SHOOTDOWN_LOCK` migration shape: **preempt-only**.
     //
     // The lock holder broadcasts an IPI to every other online core and
-    // spins on `SHOOTDOWN_PENDING` until each acks.  IF MUST stay enabled
+    // spins on `SHOOTDOWN_ACK` until each acks.  IF MUST stay enabled
     // throughout the lock-held region: a contending core that takes the
     // lock with IF=0 (or waits on the lock with IF=0) cannot service the
     // shootdown IPI from the holder, deadlocking both cores.  The
@@ -212,16 +334,17 @@ pub fn tlb_shootdown(addr: u64) {
         // Always invalidate locally.
         x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(addr));
 
-        // Snapshot recipients in a single predicate walk. The count stored
-        // in SHOOTDOWN_PENDING and the IPIs we actually send below MUST be
-        // by construction equal — there is no second walk of get_core_data /
-        // is_online, so an AP that flips online or offline after this point
-        // cannot cause an underflow or hang. We capture apic_id directly so
-        // the send loop calls send_ipi() unconditionally rather than
-        // round-tripping through send_ipi_to_core's is_online re-check
-        // (which would re-introduce the same TOCTTOU).
+        // Snapshot recipients in a single predicate walk. We capture both the
+        // recipient `apic_id` (so the send loop calls `send_nmi()` directly,
+        // avoiding `send_nmi_to_core`'s is_online re-check) and the recipient
+        // `core_id` as a bit in `target_mask`. The mask we wait on and the
+        // NMIs we actually send are derived from this one snapshot, so an AP
+        // that flips online/offline after this point cannot desync them: a
+        // core that goes offline post-snapshot simply never sets its ack bit
+        // and is handled by the wait's re-NMI + degrade path.
         let my_core = super::per_core().core_id;
         let mut recipients = [0u8; crate::smp::MAX_CORES];
+        let mut target_mask: u64 = 0;
         let mut targets: usize = 0;
         for core_id in 0..crate::smp::MAX_CORES as u8 {
             if core_id == my_core {
@@ -232,6 +355,7 @@ pub fn tlb_shootdown(addr: u64) {
                 && targets < recipients.len()
             {
                 recipients[targets] = data.apic_id;
+                target_mask |= 1u64 << core_id;
                 targets += 1;
             }
         }
@@ -249,30 +373,26 @@ pub fn tlb_shootdown(addr: u64) {
         SHOOTDOWN_RANGE_START.store(0, Ordering::Release);
         SHOOTDOWN_RANGE_END.store(0, Ordering::Release);
 
-        // Set up the request before publishing IPIs.
+        // Set up the request and reset the ack bitmap before publishing the
+        // NMIs. Resetting under the lock (which serializes rounds) means any
+        // stale bit left by a prior abandoned round is cleared here.
         SHOOTDOWN_ADDR.store(addr, Ordering::Release);
-        SHOOTDOWN_PENDING.store(targets as u8, Ordering::Release);
+        SHOOTDOWN_ACK.store(0, Ordering::Release);
 
-        // Send to exactly the snapshot we counted — same set, by construction.
-        // NMI delivery (vs Fixed-mode IPI) so the recipient cores service the
-        // shootdown even when they are inside a CLI'd IrqSafeMutex region.
-        // See `arch::x86_64::interrupts::nmi_handler` for the receiver and
-        // `docs/handoffs/2026-05-24-4gib-pci-hole-vga-mapping.md` for the
-        // bug class this fix addresses.
+        // Send to exactly the snapshot. NMI delivery (vs Fixed-mode IPI) so the
+        // recipient cores service the shootdown even when they are inside a
+        // CLI'd IrqSafeMutex region. See `arch::x86_64::interrupts::nmi_handler`
+        // for the receiver and
+        // `docs/handoffs/2026-05-24-4gib-pci-hole-vga-mapping.md` for the bug
+        // class this addresses.
         for &apic_id in &recipients[..targets] {
             ipi::send_nmi(apic_id);
         }
 
-        // Spin-wait for all remote cores to acknowledge. With NMI delivery
-        // recipients service the shootdown regardless of their IF state, so
-        // the sender no longer needs to keep IF=1 here.
-        wait_for_shootdown_acks_or_panic(
-            "tlb_shootdown",
-            targets as u8,
-            addr,
-            addr + 4096,
-            format_args!("{:?}", &recipients[..targets]),
-        );
+        // Wait for every targeted core's ack bit. With NMI delivery recipients
+        // service the shootdown regardless of their IF state, so the sender no
+        // longer needs to keep IF=1 here.
+        wait_for_shootdown_acks("tlb_shootdown", target_mask, addr, addr + 4096);
     }
     crate::task::scheduler::preempt_enable();
 }
@@ -334,47 +454,45 @@ pub fn tlb_shootdown_range(addr_space: &crate::mm::AddressSpace, start: u64, end
         SHOOTDOWN_RANGE_END.store(aligned_end, Ordering::Release);
         SHOOTDOWN_USE_CR3_RELOAD.store(use_cr3_reload, Ordering::Release);
 
-        // Count targeted cores first so the pending count is initialized before
-        // any IPI is sent — otherwise a remote core can handle the IPI and
-        // fetch_sub(1) while SHOOTDOWN_PENDING is still 0, causing underflow.
-        //
-        // Use get_core_data + is_online per bit instead of online_core_count()
-        // as an upper bound — online_core_count() is a count, not a max core_id,
-        // and would skip higher-numbered cores if a lower-numbered core is offline.
-        let mut targets = 0u8;
-        for core_id in 0..64u8 {
+        // Build the ack target_mask from the online subset of `remote_mask` in
+        // a single walk; the NMIs we send below are derived from the same mask,
+        // so the set we wait on and the set we poke are identical by
+        // construction. `get_core_data` returns `None` for core ids ≥
+        // MAX_CORES, so the mask is naturally bounded to real cores (whose
+        // handler can actually set the bit).
+        let mut target_mask: u64 = 0;
+        for core_id in 0..crate::smp::MAX_CORES as u8 {
             if remote_mask & (1u64 << core_id) != 0
                 && let Some(data) = super::get_core_data(core_id)
                 && data.is_online.load(Ordering::Acquire)
             {
-                targets = targets.saturating_add(1);
+                target_mask |= 1u64 << core_id;
             }
         }
 
-        if targets == 0 {
+        if target_mask == 0 {
             break 'critical;
         }
 
-        SHOOTDOWN_PENDING.store(targets, Ordering::Release);
+        // Reset the ack bitmap before publishing the NMIs (under the lock, so a
+        // stale bit from a prior abandoned round is cleared here).
+        SHOOTDOWN_ACK.store(0, Ordering::Release);
 
-        // Now that the pending count is visible, send the NMIs.
-        // send_nmi_to_core already checks existence + is_online, matching
-        // the count above. NMI delivery bypasses recipient IF, so cores in
-        // CLI'd regions still service the shootdown.
-        for core_id in 0..64u8 {
-            if remote_mask & (1u64 << core_id) != 0 {
+        // Send to exactly the cores in target_mask. NMI delivery bypasses
+        // recipient IF, so cores in CLI'd regions still service the shootdown.
+        for core_id in 0..crate::smp::MAX_CORES as u8 {
+            if target_mask & (1u64 << core_id) != 0 {
                 ipi::send_nmi_to_core(core_id);
             }
         }
 
-        // Spin-wait for acknowledgment from all targeted cores. NMI
-        // delivery ensures recipients ack regardless of their IF state.
-        wait_for_shootdown_acks_or_panic(
+        // Wait for every targeted core's ack bit. NMI delivery ensures
+        // recipients ack regardless of their IF state.
+        wait_for_shootdown_acks(
             "tlb_shootdown_range",
-            targets,
+            target_mask,
             aligned_start,
             aligned_end,
-            format_args!("remote_mask={:#018x}", remote_mask),
         );
     }
     crate::task::scheduler::preempt_enable();
@@ -422,19 +540,15 @@ pub fn tlb_shootdown_range_kernel(start: u64, end: u64) {
             }
         }
 
-        // Snapshot recipients in a single predicate walk. Capturing the
-        // recipient `apic_id`s up front (rather than walking the predicate
-        // again to send) closes the count-vs-send TOCTTOU: an AP that flips
-        // `is_online` between two walks would otherwise receive an IPI but
-        // not be reflected in `SHOOTDOWN_PENDING`, underflowing the u8.
-        //
-        // The send loop calls `send_ipi(apic_id, ...)` directly rather than
-        // round-tripping through `send_ipi_to_core`, whose `is_online`
-        // re-check would reintroduce the same race in a different
-        // direction (a recipient that went *offline* between count and send
-        // would silently skip its decrement).
+        // Snapshot recipients in a single predicate walk. Capture both the
+        // recipient `apic_id` (so the send loop calls `send_nmi()` directly,
+        // avoiding `send_nmi_to_core`'s is_online re-check) and the recipient
+        // `core_id` as a bit in `target_mask`. The set we send NMIs to and the
+        // mask we wait on are derived from this one snapshot — no second
+        // predicate walk that could disagree with it.
         let my_core = super::per_core().core_id;
         let mut recipients = [0u8; crate::smp::MAX_CORES];
+        let mut target_mask: u64 = 0;
         let mut targets: usize = 0;
         for core_id in 0..crate::smp::MAX_CORES as u8 {
             if core_id == my_core {
@@ -445,6 +559,7 @@ pub fn tlb_shootdown_range_kernel(start: u64, end: u64) {
                 && targets < recipients.len()
             {
                 recipients[targets] = data.apic_id;
+                target_mask |= 1u64 << core_id;
                 targets += 1;
             }
         }
@@ -458,27 +573,24 @@ pub fn tlb_shootdown_range_kernel(start: u64, end: u64) {
         SHOOTDOWN_RANGE_START.store(aligned_start, Ordering::Release);
         SHOOTDOWN_RANGE_END.store(aligned_end, Ordering::Release);
         SHOOTDOWN_USE_CR3_RELOAD.store(use_cr3_reload, Ordering::Release);
-        SHOOTDOWN_PENDING.store(targets as u8, Ordering::Release);
+        // Reset the ack bitmap before publishing the NMIs (under the lock).
+        SHOOTDOWN_ACK.store(0, Ordering::Release);
 
-        // Send to exactly the snapshot. Recipients and pending count are
-        // by construction equal — there is no second predicate walk that
-        // could disagree with the snapshot. NMI delivery (vs Fixed) so
-        // recipients in CLI'd IrqSafeMutex regions still service the
-        // shootdown.
+        // Send to exactly the snapshot. NMI delivery (vs Fixed) so recipients
+        // in CLI'd IrqSafeMutex regions still service the shootdown.
         for &apic_id in &recipients[..targets] {
             ipi::send_nmi(apic_id);
         }
 
-        // NMI-bounded spin. With NMI delivery the recipient cores ack
-        // regardless of IF, so the prior `ShootdownIrqWindow` (forcing
-        // IF=1 during the wait) is no longer required — callers from
-        // inside any `IrqSafeMutex` region are safe.
-        wait_for_shootdown_acks_or_panic(
+        // NMI-bounded wait. With NMI delivery the recipient cores ack
+        // regardless of IF, so the prior `ShootdownIrqWindow` (forcing IF=1
+        // during the wait) is no longer required — callers from inside any
+        // `IrqSafeMutex` region are safe.
+        wait_for_shootdown_acks(
             "tlb_shootdown_range_kernel",
-            targets as u8,
+            target_mask,
             aligned_start,
             aligned_end,
-            format_args!("{:?}", &recipients[..targets]),
         );
     }
     crate::task::scheduler::preempt_enable();
@@ -487,14 +599,16 @@ pub fn tlb_shootdown_range_kernel(start: u64, end: u64) {
 /// Handle a TLB shootdown IPI on the receiving core.
 ///
 /// Called from the IDT handler. Reads the target address or range, executes
-/// the appropriate flush, and decrements the pending count.
+/// the appropriate flush, then sets this core's bit in [`SHOOTDOWN_ACK`] to
+/// acknowledge it.
 pub fn handle_tlb_shootdown_ipi() {
-    // Diagnostic counter for the 4 GiB-hang investigation: bump the
-    // per-core ack count before doing any TLB work. If a sender times out
-    // waiting for our ack, `wait_for_shootdown_acks_or_panic` reads this
-    // counter to determine whether our IDT entry fired at all.
-    if let Some(pc) = super::try_per_core()
-        && let Some(slot) = TLB_IPI_SERVICED.get(pc.core_id as usize)
+    // Resolve this core's id once: used both for the diagnostic
+    // `TLB_IPI_SERVICED` counter (bumped up front so a sender timeout dump can
+    // tell whether our IDT entry fired at all) and for the `SHOOTDOWN_ACK` bit
+    // we set after the flush.
+    let my_core = super::try_per_core().map(|pc| pc.core_id);
+    if let Some(core_id) = my_core
+        && let Some(slot) = TLB_IPI_SERVICED.get(core_id as usize)
     {
         slot.fetch_add(1, Ordering::Relaxed);
     }
@@ -524,5 +638,15 @@ pub fn handle_tlb_shootdown_ipi() {
         }
     }
 
-    SHOOTDOWN_PENDING.fetch_sub(1, Ordering::Release);
+    // Acknowledge: set this core's bit AFTER the flush is complete, with
+    // Release ordering so a sender observing the bit (Acquire) is guaranteed
+    // our TLB invalidation already happened. `fetch_or` is idempotent — a
+    // redundant re-NMI from the degrade path cannot double-count or corrupt
+    // the round. If per-core data isn't resolvable (should never happen: NMIs
+    // are only sent to online cores with per-core data up) we skip the ack;
+    // the sender's re-NMI + degrade path then handles us as a laggard rather
+    // than hanging forever.
+    if let Some(core_id) = my_core {
+        SHOOTDOWN_ACK.fetch_or(1u64 << core_id, Ordering::Release);
+    }
 }

@@ -699,6 +699,23 @@ pub struct Task {
     pub child_voluntary_ctxsw: u64,
     /// Reaped-descendants involuntary-ctxsw accumulator.
     pub child_involuntary_ctxsw: u64,
+    /// DIAGNOSTIC (claude -p stall hunt, 2026-06-16) — tick at which this task
+    /// most recently ENTERED a syscall. Stamped at `syscall_handler` entry,
+    /// lock-free from the running CPU (same discipline as [`user_ticks`]). Does
+    /// NOT reset on a wake/reblock cycle, so `now - last_syscall_entry_tick`
+    /// measures how long a task has been inside ONE syscall even if it is
+    /// wake/reblock-looping in `BlockedOnReply` (which resets `blocked_since_tick`
+    /// every cycle and so blinds the 30 s stuck-task watchdog). The reply-stall
+    /// scan in `watchdog_scan` reads this to catch the Claude Code startup stall.
+    /// Placed AFTER `preempt_frame` to preserve `EXPECTED_TASK_PREEMPT_FRAME_OFFSET`.
+    pub last_syscall_entry_tick: core::sync::atomic::AtomicU64,
+    /// DIAGNOSTIC (claude -p stall hunt, 2026-06-16) — the syscall number of the
+    /// most recent `syscall_handler` entry. Paired with `last_syscall_entry_tick`
+    /// so the stall census can name WHICH syscall a wedged task is parked in
+    /// (e.g. `epoll_pwait`=281, `futex`=202) — the parked node event-loop thread
+    /// is invisible to the 30 s watchdog (it exempts `BlockedOnRecv` with no
+    /// deadline, which is exactly how `epoll_wait` blocks).
+    pub last_syscall_nr: core::sync::atomic::AtomicU32,
 }
 
 // ---------------------------------------------------------------------------
@@ -820,6 +837,8 @@ impl Task {
             child_major_faults: 0,
             child_voluntary_ctxsw: 0,
             child_involuntary_ctxsw: 0,
+            last_syscall_entry_tick: core::sync::atomic::AtomicU64::new(0),
+            last_syscall_nr: core::sync::atomic::AtomicU32::new(u32::MAX),
         }
     }
 

@@ -152,6 +152,20 @@ pub struct SocketOptions {
     pub tcp_nodelay: bool,
     pub recv_buf_size: u32,
     pub send_buf_size: u32,
+    /// TCP keepalive tuning (TCP_KEEPIDLE/INTVL/CNT). Phase 90b: these are
+    /// *recorded* faithfully so `getsockopt` round-trips and a future
+    /// keepalive prober has the configured values, but the kernel does not
+    /// yet send keepalive probes — consistent with `keep_alive`, which is
+    /// likewise stored but not acted upon. The prober itself (idle timer →
+    /// probe segment → dead-peer teardown, hooking the existing `tcp_tick`)
+    /// is deferred; see `docs/roadmap/90b-claude-code.md` (Deferred Until
+    /// Later). Accepting these options is an ABI-conformance fix: libuv's
+    /// `uv__tcp_keepalive` sets them on every client socket and treats an
+    /// `ENOPROTOOPT` there as a fatal connect error (the Node/undici/Claude
+    /// Code `api.anthropic.com` failure).
+    pub keep_idle_secs: u32,
+    pub keep_intvl_secs: u32,
+    pub keep_cnt: u32,
 }
 
 impl SocketOptions {
@@ -162,6 +176,10 @@ impl SocketOptions {
             tcp_nodelay: false,
             recv_buf_size: 8192,
             send_buf_size: 8192,
+            // Linux defaults: net.ipv4.tcp_keepalive_{time,intvl,probes}.
+            keep_idle_secs: 7200,
+            keep_intvl_secs: 75,
+            keep_cnt: 9,
         }
     }
 }

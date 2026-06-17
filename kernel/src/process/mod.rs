@@ -136,7 +136,28 @@ pub(crate) fn alloc_pid_pub() -> Pid {
 // ---------------------------------------------------------------------------
 
 /// Maximum number of open file descriptors per process.
-pub const MAX_FDS: usize = 32;
+///
+/// Raised 32 → 128 (Phase 90b): Node/Claude Code exhaust a 32-fd table during a
+/// single session — stdio + libuv's epoll/eventfd/timerfd/self-pipe + the custom
+/// undici agent's TLS sockets + config/`.claude.json`/temp/lock files + 3 pipe
+/// fds per spawned `ripgrep` — so the next `open`/`socket`/`pipe` returns EMFILE
+/// and the agent wedges (observed: `rg error (code=EMFILE)` immediately preceding
+/// a lock-up). 128 gives comfortable headroom over the observed ~30-fd ceiling.
+///
+/// The fd table is **heap-backed** (`Vec<Option<FdEntry>>`, always sized to
+/// exactly `MAX_FDS`): `Process` holds only the 24-byte `Vec` header, and
+/// `new_fd_table()` / `fd_table_snapshot()` / `spawn_process_with_cr3_and_fds`
+/// keep the table's bulk on the heap so none of it lands on the per-task kernel
+/// stack. This was the prior cap's blocker — when `MAX_FDS` was an inline
+/// `[Option<FdEntry>; MAX_FDS]`, a `VfsFileMeta`-bloated ~96-byte `FdEntry`
+/// made each table ~12 KiB, and node's `clone(CLONE_THREAD)` / `fork` path
+/// stacked three of them (parent snapshot + `child_fds_copy` + the new
+/// `Process`'s inline copy) ≈ 36 KiB, overflowing the 64 KiB per-task kstack
+/// (#DF, pid killed) the moment the value was raised 32 → 128. With the table
+/// on the heap that pressure is gone and higher values (up to Linux's 1024)
+/// are safe to set here without touching the stack budget. 128 is ~4× Claude
+/// Code's observed ~30-fd ceiling.
+pub const MAX_FDS: usize = 128;
 
 /// Backing store for an open file descriptor.
 #[derive(Clone)]
@@ -281,7 +302,7 @@ const NONE_FD: Option<FdEntry> = None;
 
 /// Create a default FD table with stdin(0), stdout(1), stderr(2) wired up.
 /// Public accessor for use by the shell task when spawning processes.
-pub fn new_fd_table_pub() -> [Option<FdEntry>; MAX_FDS] {
+pub fn new_fd_table_pub() -> Vec<Option<FdEntry>> {
     new_fd_table()
 }
 
@@ -290,7 +311,7 @@ pub fn new_fd_table_pub() -> [Option<FdEntry>; MAX_FDS] {
 /// Must be called after cloning a process's FD table (fork/dup2) so that
 /// pipe reader/writer counts and PTY refcounts stay consistent with the
 /// number of open FDs.
-pub fn add_fd_refs(fd_table: &[Option<FdEntry>; MAX_FDS]) {
+pub fn add_fd_refs(fd_table: &[Option<FdEntry>]) {
     for entry in fd_table.iter().flatten() {
         match &entry.backend {
             FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_add_reader(*pipe_id),
@@ -651,8 +672,13 @@ pub fn vfs_handle_open_count_locked(table: &ProcessTable, service_handle: u64) -
 }
 
 /// Create a default FD table with stdin(0), stdout(1), stderr(2) wired up.
-fn new_fd_table() -> [Option<FdEntry>; MAX_FDS] {
-    let mut table = [NONE_FD; MAX_FDS];
+///
+/// Heap-backed: `vec![None; MAX_FDS]` fills the buffer in place (no `[_; N]`
+/// stack temporary), so even a large `MAX_FDS` never touches the kstack. The
+/// returned `Vec` is always exactly `MAX_FDS` long — every fd helper relies on
+/// that invariant when indexing `0..MAX_FDS`.
+fn new_fd_table() -> Vec<Option<FdEntry>> {
+    let mut table: Vec<Option<FdEntry>> = alloc::vec![NONE_FD; MAX_FDS];
     table[0] = Some(FdEntry {
         backend: FdBackend::DeviceTTY { tty_id: 0 },
         offset: 0,
@@ -861,7 +887,7 @@ pub struct Process {
     /// Per-process file descriptor table (Phase 14).
     ///
     /// FDs 0/1/2 are stdin/stdout/stderr.  `fork()` deep-clones this table.
-    pub fd_table: [Option<FdEntry>; MAX_FDS],
+    pub fd_table: Vec<Option<FdEntry>>,
     /// Bitfield of pending signals (bit N = signal N is pending).
     pub pending_signals: u64,
     /// Bitfield of blocked signals (bit N = signal N is blocked from delivery).
@@ -920,7 +946,7 @@ pub struct Process {
     /// Phase 57b G.6 — `Arc<IrqSafeMutex<...>>`.  Inherits Track F.1's
     /// preempt-discipline; clone semantics on the `Arc` are preserved
     /// (callers `.clone()` the `Arc`, child shares the same lock).
-    pub shared_fd_table: Option<Arc<IrqSafeMutex<[Option<FdEntry>; MAX_FDS]>>>,
+    pub shared_fd_table: Option<Arc<IrqSafeMutex<Vec<Option<FdEntry>>>>>,
     /// Shared signal actions for threads created with CLONE_SIGHAND (Phase 40).
     /// `None` for single-threaded processes (uses `signal_actions` directly).
     ///
@@ -1070,7 +1096,7 @@ impl Process {
     }
 
     /// Snapshot the effective fd table (shared if present, else local).
-    pub fn fd_table_snapshot(&self) -> [Option<FdEntry>; MAX_FDS] {
+    pub fn fd_table_snapshot(&self) -> Vec<Option<FdEntry>> {
         if let Some(shared) = &self.shared_fd_table {
             shared.lock().clone()
         } else {
@@ -1477,7 +1503,7 @@ pub fn spawn_process_with_cr3_and_fds(
     cr3: x86_64::PhysAddr,
     brk_current: u64,
     mmap_next: u64,
-    fd_table: [Option<FdEntry>; MAX_FDS],
+    fd_table: Vec<Option<FdEntry>>,
     inherit_pgid: Pid,
 ) -> Pid {
     let kstack_top = alloc_kernel_stack();

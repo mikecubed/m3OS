@@ -123,6 +123,115 @@ fn assert_preempt_count_zero_on_return_to_user(stack_frame: &InterruptStackFrame
 /// interrupt). Single-CPU: no concurrent writers.
 static FAULT_KILL_PID: AtomicU32 = AtomicU32::new(0);
 
+/// Count of spurious/already-resolved userspace write-faults recovered (SMP
+/// CoW/mprotect race). Diagnostic-only; rate-limits the per-recovery log.
+static SPURIOUS_WRITE_RECOVERIES: AtomicU32 = AtomicU32::new(0);
+
+/// Count of W^X-v2 PKU cross-thread READ recoveries (Phase 90b). Diagnostic:
+/// if a single faulting RIP/addr keeps recovering, the grant isn't sticking and
+/// the thread is in a PKU read-fault spin-loop (a candidate for Claude Code's
+/// `claude -p` startup stall). Rate-limits the per-recovery log.
+static PKU_READ_RECOVERIES: AtomicU32 = AtomicU32::new(0);
+
+// ---------------------------------------------------------------------------
+// Track D — kernel-stack-overflow controlled-kill recovery
+// (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md)
+// ---------------------------------------------------------------------------
+//
+// When a userspace task overflows its *per-task* kernel stack (set as TSS.RSP0
+// on dispatch), the resulting ring-0 fault cannot run the kill path on the
+// now-exhausted stack:
+//   - If RSP marched into the guard page gradually, the #PF that the guard hit
+//     would raise cannot push its frame (RSP is already unmapped) → it escalates
+//     to a **#DF**, which runs on the clean DF IST stack — so the #DF handler can
+//     run the kill directly.
+//   - If a single large frame's access hit the guard while RSP was still mapped,
+//     a deliverable **#PF** is taken (the real-world cli.js manifestation); that
+//     handler runs on a near-exhausted stack, so it must NOT do heavy work — it
+//     redirects (IRETQ) into `fault_kill_trampoline` on the per-core recovery
+//     stack below.
+// Either way the offending process is SIGSEGV-killed and the core returns to the
+// scheduler instead of cascading into a recursive #PF + `hlt_loop` (which, pre
+// Tracks A–C, escalated to a whole-machine panic).
+
+/// Size of each per-core fault-recovery stack (16 KiB — matches the syscall
+/// stack; `fault_kill_trampoline` only takes a couple of locks and a handful of
+/// calls, so this is ample).
+const FAULT_RECOVERY_STACK_SIZE: usize = 4096 * 4;
+
+/// 16-byte-aligned wrapper (x86-64 ABI requires 16-byte stack alignment before
+/// a CALL; a bare `[u8; N]` only guarantees 1-byte alignment).
+#[repr(align(16))]
+struct RecoveryStack([u8; FAULT_RECOVERY_STACK_SIZE]);
+
+/// Per-core recovery stacks, indexed by `core_id`. `.bss` (zero-initialised, no
+/// init-ordering dependency on the kstack pool). One per core suffices: a core
+/// handles one fault at a time, and the recovery runs to completion (ending in a
+/// `switch_context` to the scheduler) before the core can take another fault
+/// that would reuse it. `static mut` because the CPU/kernel writes to it as a
+/// stack when the recovery trampoline runs.
+static mut FAULT_RECOVERY_STACKS: [RecoveryStack; crate::smp::MAX_CORES] =
+    [const { RecoveryStack([0u8; FAULT_RECOVERY_STACK_SIZE]) }; crate::smp::MAX_CORES];
+
+/// 16-byte-aligned top (one past the last byte) of `core_id`'s recovery stack.
+fn fault_recovery_stack_top(core_id: usize) -> u64 {
+    let idx = core_id.min(crate::smp::MAX_CORES - 1);
+    // SAFETY: take only the address of the static (no reference formed to the
+    // `static mut`, which would be UB in edition 2024); the CPU writes to it as
+    // a stack when the recovery trampoline runs.
+    let base = unsafe { core::ptr::addr_of_mut!(FAULT_RECOVERY_STACKS[idx].0) as u64 };
+    (base + FAULT_RECOVERY_STACK_SIZE as u64) & !15
+}
+
+/// Attempt to recover from a kernel-stack overflow that is attributable to a
+/// userspace task: redirect the faulting context into `fault_kill_trampoline`
+/// (which SIGSEGVs the process and reschedules) running on this core's clean
+/// recovery stack. Returns `true` if recovery was initiated — the caller must
+/// then `return` so the rewritten interrupt frame IRETQs into the trampoline —
+/// or `false` if the overflow is not attributable to a userspace task (a
+/// genuine kernel/idle-context overflow), in which case the caller halts.
+///
+/// Mirrors the ring-3 fault-kill redirect, but points RSP at the per-core
+/// recovery stack rather than the current (exhausted) kernel stack.
+fn try_recover_kstack_overflow(stack_frame: &mut InterruptStackFrame) -> bool {
+    if !crate::smp::is_per_core_ready() {
+        return false;
+    }
+    let pid = crate::process::current_pid();
+    if pid == 0 {
+        // No userspace process on this core (idle / kernel-thread context) — the
+        // overflow is a genuine kernel bug, not a runaway user task. Halt.
+        return false;
+    }
+    let core = page_fault_core_index();
+    // We are recovering, not cascading: clear the per-core recursive-#PF latch
+    // so a future *legitimate* kernel fault on this core is still diagnosed in
+    // full rather than mistaken for a cascade and silently halted.
+    if core < IN_KERNEL_PAGE_FAULT.len() {
+        IN_KERNEL_PAGE_FAULT[core].store(false, Ordering::Release);
+    }
+    FAULT_KILL_PID.store(pid, Ordering::Relaxed);
+    _panic_print(format_args!(
+        "[int] kstack overflow attributable to pid {} — killing process; core {} recovers (no halt)\n",
+        pid, core,
+    ));
+    let recovery_top = fault_recovery_stack_top(core);
+    // SAFETY: rewrite the interrupt return frame while interrupts are disabled
+    // (exception entry cleared IF). IRETQ will load RSP = recovery stack so the
+    // kill trampoline runs on a clean stack, not the overflowed one. Same shape
+    // as the ring-3 redirect in `page_fault_handler`.
+    unsafe {
+        stack_frame.as_mut().update(|f| {
+            f.instruction_pointer = VirtAddr::new(fault_kill_trampoline as *const () as u64);
+            f.code_segment = gdt::kernel_code_selector();
+            f.cpu_flags &= !x86_64::registers::rflags::RFlags::INTERRUPT_FLAG;
+            f.stack_pointer = VirtAddr::new(recovery_top);
+            f.stack_segment = gdt::kernel_data_selector();
+        });
+    }
+    true
+}
+
 // ---------------------------------------------------------------------------
 // Page-fault re-entrance guard
 // ---------------------------------------------------------------------------
@@ -494,6 +603,52 @@ fn dump_pte_walk_diagnostics(vaddr: u64) {
     }
 }
 
+/// Read the leaf (4 KiB) PTE's raw flag bits for `vaddr` in the **active** address
+/// space, or `None` if any paging level is not present or is a huge page. Used by
+/// the page-fault handler's W^X v2 PKU read-recovery to inspect the faulting
+/// page's NO_EXECUTE bit and protection key (PTE bits 59..=62). Read-only walk via
+/// the physical-offset map — no locks, safe from the ring-3 fault ISR (same
+/// constraints as `dump_pte_walk_diagnostics`).
+fn leaf_pte_flag_bits(vaddr: u64) -> Option<u64> {
+    use x86_64::registers::control::Cr3;
+    use x86_64::structures::paging::{PageTable, PageTableFlags};
+
+    let phys_off_va = VirtAddr::new(crate::mm::phys_offset());
+    let (cr3_frame, _) = Cr3::read_raw();
+    let pml4_phys = cr3_frame.start_address().as_u64();
+    let p4 = ((vaddr >> 39) & 0x1FF) as usize;
+    let p3 = ((vaddr >> 30) & 0x1FF) as usize;
+    let p2 = ((vaddr >> 21) & 0x1FF) as usize;
+    let p1 = ((vaddr >> 12) & 0x1FF) as usize;
+    unsafe {
+        let pml4: &PageTable = &*(phys_off_va + pml4_phys).as_ptr::<PageTable>();
+        let e4 = &pml4[p4];
+        if !e4.flags().contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+        let pdpt: &PageTable = &*(phys_off_va + e4.addr().as_u64()).as_ptr::<PageTable>();
+        let e3 = &pdpt[p3];
+        if !e3.flags().contains(PageTableFlags::PRESENT)
+            || e3.flags().contains(PageTableFlags::HUGE_PAGE)
+        {
+            return None;
+        }
+        let pd: &PageTable = &*(phys_off_va + e3.addr().as_u64()).as_ptr::<PageTable>();
+        let e2 = &pd[p2];
+        if !e2.flags().contains(PageTableFlags::PRESENT)
+            || e2.flags().contains(PageTableFlags::HUGE_PAGE)
+        {
+            return None;
+        }
+        let pt: &PageTable = &*(phys_off_va + e2.addr().as_u64()).as_ptr::<PageTable>();
+        let e1 = &pt[p1];
+        if !e1.flags().contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+        Some(e1.flags().bits())
+    }
+}
+
 /// Public entry point for kernel-context VMA demand paging.
 ///
 /// Revalidates the current VMA metadata while holding the address-space
@@ -650,7 +805,24 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     // IrqSafeMutex region and cannot service a Fixed-delivery IPI. See
     // `docs/handoffs/2026-05-24-4gib-pci-hole-vga-mapping.md` and the
     // sender side in `smp::ipi::send_nmi` / `smp::tlb`.
-    idt.non_maskable_interrupt.set_handler_fn(nmi_handler);
+    //
+    // Phase 90b follow-up — give the NMI its own IST stack. The fixed delivery
+    // above only guarantees the NMI *fires*; it still needs a usable stack to
+    // run on. A core whose KERNEL STACK has overflowed (or is wedged in a fault
+    // `hlt_loop` after a recursive #PF cascade) cannot push the NMI frame onto
+    // its dead stack, so it never reaches `handle_tlb_shootdown_ipi`'s ack —
+    // and a sibling core's `tlb_shootdown_range` then times out and `panic!`s
+    // the whole machine (`smp/tlb.rs:176`). An IST stack lets even a
+    // stack-overflowed core service the shootdown NMI and ack, so one wedged
+    // core no longer kills the box. The NMI handler is TLB-shootdown-only
+    // (`invlpg`/CR3-reload + atomic decrement — fault-free), so it never
+    // re-enables NMI mid-handler and cannot nest on the shared IST stack. See
+    // `docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md`.
+    unsafe {
+        idt.non_maskable_interrupt
+            .set_handler_fn(nmi_handler)
+            .set_stack_index(gdt::NMI_IST_INDEX);
+    }
 
     // Hardware IRQs — timer and reschedule IPI use raw naked-asm entry stubs
     // (Phase 57d Track B) so they are installed via `set_handler_addr`.
@@ -1101,6 +1273,128 @@ extern "x86-interrupt" fn page_fault_handler(
             }
         }
 
+        // Phase 90b — W^X v2 PKU cross-thread READ recovery. A real-world Node
+        // process (Claude Code's cli.js) allocates a write-deny protection key for
+        // its V8 code space (`pkey_alloc(0, PKEY_DISABLE_WRITE)`), then spawns
+        // worker/background threads. PKRU is per-thread, so a sibling thread created
+        // before the key existed DATA-reads the pkey-tagged executable code page with
+        // that key access-disabled in its PKRU → PROTECTION_KEY fault (observed:
+        // `pid=N … PROTECTION_KEY … process killed` while running cli.js). The W^X v2
+        // invariant only needs WRITE gated per-thread-window; READ+EXECUTE of guarded
+        // code is process-wide. So on a PROTECTION_KEY *read* fault (no
+        // CAUSED_BY_WRITE) against a present, EXECUTABLE page carrying a non-zero key
+        // the process allocated as WRITE-DENY-ONLY, grant this thread read access
+        // (clear the key's AD bit in its live PKRU; the next context-switch XSAVE
+        // persists it) and retry. WRITES stay gated (CAUSED_BY_WRITE excluded → W^X
+        // write-protection intact). The recovery is deliberately NARROW:
+        //   - non-executable DATA pages are excluded by the `is_exec` gate (PKU data
+        //     isolation, exercised by pku-smoke, is untouched);
+        //   - a key allocated DENY-ALL-ACCESS (PKEY_DISABLE_ACCESS — which the W^X v2
+        //     grant DOES permit on an executable page) keeps its reads gated
+        //     per-thread, exactly as the process intended; auto-granting read would
+        //     defeat that isolation;
+        //   - an unallocated/permissive key is never granted (`rights()` returns None
+        //     for a key not currently allocated in this process's table → the
+        //     "currently allocated" check Linux mm_pkey_is_allocated makes).
+        // Only the write-deny-only case (V8's code space) auto-recovers.
+        if err.contains(PageFaultErrorCode::PROTECTION_KEY)
+            && !err.contains(PageFaultErrorCode::CAUSED_BY_WRITE)
+            && crate::arch::x86_64::cpuid::pku_usable()
+            && let Ok(fault_vaddr) = addr
+            && let Some(flag_bits) = leaf_pte_flag_bits(fault_vaddr.as_u64())
+        {
+            let is_exec =
+                flag_bits & x86_64::structures::paging::PageTableFlags::NO_EXECUTE.bits() == 0;
+            let key = kernel_core::pkey::pkey_of(flag_bits);
+            if is_exec && key != 0 {
+                use kernel_core::pkey::{PKEY_DISABLE_ACCESS, PKEY_DISABLE_WRITE};
+                // The PROCESS_TABLE lock is taken only inside this branch, which is
+                // reachable only for an executable-page READ fault — i.e. only from
+                // userspace code execution, never from a kernel context that itself
+                // holds PROCESS_TABLE — so this blocking lock cannot self-deadlock.
+                let write_deny_only =
+                    crate::process::shared_pkey_table(crate::process::current_pid())
+                        .and_then(|t| t.rights(key))
+                        .is_some_and(|r| {
+                            r & PKEY_DISABLE_WRITE != 0 && r & PKEY_DISABLE_ACCESS == 0
+                        });
+                if write_deny_only {
+                    crate::arch::x86_64::pkru::grant_read_access(key);
+                    // Diagnostic: if this fires repeatedly for the same pid/rip,
+                    // the grant isn't sticking (the thread re-faults on the same
+                    // read) — a PKU read-fault spin-loop. Rate-limited to the
+                    // first ~40 so a genuine loop is visible without flooding.
+                    let n = PKU_READ_RECOVERIES.fetch_add(1, Ordering::Relaxed);
+                    if n < 40 {
+                        _panic_print(format_args!(
+                            "[pf] pku read-recovery: pid={} key={} addr={:#x} rip={:#x} (#{})\n",
+                            crate::process::current_pid(),
+                            key,
+                            fault_vaddr.as_u64(),
+                            stack_frame.instruction_pointer.as_u64(),
+                            n,
+                        ));
+                    }
+                    crate::task::scheduler::current_task_record_page_fault(false);
+                    assert_preempt_count_zero_on_return_to_user(&stack_frame);
+                    return;
+                }
+            }
+        }
+
+        // Spurious / already-resolved write-fault recovery (SMP).
+        //
+        // A userspace WRITE protection-violation whose page is, by the time we
+        // walk it here, already PRESENT|WRITABLE|USER is benign: another core
+        // concurrently made this page writable (a CoW fault that won the race —
+        // `resolve_cow_fault` returns false once WRITABLE is set, so the losing
+        // core's in-flight fault falls through here — or an `mprotect` raising
+        // permissions) and published the new PTE, but THIS core took its fault
+        // against a stale TLB entry. Killing the process is wrong: the write
+        // simply succeeds on retry. Flush the local TLB for the page and return.
+        // Single-core never hits this (no concurrent resolver); it is the
+        // multi-core CoW/mprotect race that wrongly killed Node/claude (a write
+        // to 0x… `PROTECTION_VIOLATION|CAUSED_BY_WRITE` under V8's W^X churn).
+        //
+        // This does NOT weaken W^X or PKU: a real RX/RO code-page write leaves
+        // WRITABLE clear and falls through to the kill below. A pkey-write-denied
+        // page (W^X v2: a W+X code page whose PTE *is* WRITABLE but writes are
+        // gated per-thread by the PKRU key) raises PROTECTION_KEY *in addition to*
+        // PROTECTION_VIOLATION — it must be EXCLUDED here, because `invlpg`+retry
+        // cannot clear a PKU denial (PKU keys off PKRU, not the TLB), so retrying
+        // would infinite-loop. We therefore require `!PROTECTION_KEY`. No other
+        // infinite-loop risk: if the page is concurrently flipped back to RO, the
+        // re-walk on the next fault returns not-WRITABLE and falls through to the
+        // kill.
+        if is_write
+            && is_present
+            && !err.contains(PageFaultErrorCode::PROTECTION_KEY)
+            && let Ok(fault_vaddr) = addr
+            && let Some(flags) = leaf_pte_flag_bits(fault_vaddr.as_u64())
+        {
+            use x86_64::structures::paging::PageTableFlags as Ptf;
+            let writable = flags & Ptf::WRITABLE.bits() != 0;
+            let user = flags & Ptf::USER_ACCESSIBLE.bits() != 0;
+            if writable && user {
+                // Rate-limited diagnostic: confirm this fires (and is not looping
+                // on one address). First ~24 only, to avoid serial spam.
+                let n = SPURIOUS_WRITE_RECOVERIES.fetch_add(1, Ordering::Relaxed);
+                if n < 24 {
+                    log::warn!(
+                        "[pf] spurious write-fault recovered: pid={} addr={:#x} rip={:#x} (#{}) ",
+                        crate::process::current_pid(),
+                        fault_vaddr.as_u64(),
+                        stack_frame.instruction_pointer.as_u64(),
+                        n + 1,
+                    );
+                }
+                x86_64::instructions::tlb::flush(VirtAddr::new(fault_vaddr.as_u64()));
+                crate::task::scheduler::current_task_record_page_fault(false);
+                assert_preempt_count_zero_on_return_to_user(&stack_frame);
+                return;
+            }
+        }
+
         let pid = crate::process::current_pid();
         _panic_print(format_args!(
             "[int] userspace page fault: pid={} addr={:?} err={:?} rip={:#x} — process killed\n",
@@ -1200,9 +1494,14 @@ extern "x86-interrupt" fn page_fault_handler(
         crate::hlt_loop();
     }
 
-    // Kernel-stack overflow detection: if the fault address lands inside a
-    // kstack guard page, name the slot before the regular dump path so the
-    // crash is recognised at the source rather than as a wild dereference.
+    // Kernel-stack overflow: the fault address is inside a kstack guard page.
+    // Handle this BEFORE the heavy diagnostic dumps below — those push several
+    // hundred bytes per frame and, on an already-exhausted stack, re-cross the
+    // guard and trigger a recursive #PF cascade (the failure mode in
+    // docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md). Keep
+    // this branch's own stack use to a single compact line, then either recover
+    // (Track D: kill the offending user task on a clean stack and reschedule) or
+    // halt.
     if let Ok(fault_va) = addr
         && let Some(slot) = crate::task::kstack::classify_guard_page_fault(fault_va.as_u64())
     {
@@ -1212,6 +1511,16 @@ extern "x86-interrupt" fn page_fault_handler(
             fault_va.as_u64(),
             stack_frame.instruction_pointer.as_u64(),
         ));
+        // Track D: if attributable to a userspace task, redirect to the kill
+        // trampoline on the per-core recovery stack and return (IRETQ). The core
+        // survives and keeps scheduling other tasks.
+        if try_recover_kstack_overflow(&mut stack_frame) {
+            return;
+        }
+        // Genuine kernel/idle-context overflow — a real kernel bug. Halt this
+        // core (with the SMP liveness model, Tracks A–C, the machine survives).
+        // Deliberately skip the heavy dumps below: they would re-overflow.
+        crate::hlt_loop();
     }
 
     _panic_print(format_args!(
@@ -1379,7 +1688,164 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     crate::hlt_loop();
 }
 
+/// Scan an overflowed kernel stack slot for kernel-`.text` return addresses and
+/// report the dominant recurring one — the signature of a runaway recursion.
+///
+/// Runs on the clean #DF IST stack (the faulting per-task kstack is exhausted),
+/// so it must touch only mapped memory and take no locks. The guard page the
+/// faulting RSP sits in is unmapped, so the scan starts at the slot's usable
+/// base (just above the guard) and walks up to the stack top — covering the
+/// frames the recursion pushed. `.text` candidates are identified relative to a
+/// runtime anchor (`double_fault_handler`, itself in `.text`): the kernel image
+/// is ~11 MiB, so any return address sits within ±16 MiB of the anchor, while
+/// kstack/heap data pointers are GiBs away and filtered out. Boyer–Moore
+/// majority voting finds the most-repeated address in O(1) space; the printed
+/// `delta` (addr − anchor) resolves offline via
+/// `addr2line -e kernel $((<elf vaddr of double_fault_handler> + delta))`.
+fn dump_kstack_overflow_backtrace(slot: usize, faulting_rsp: u64) {
+    let (usable_base, top) = crate::task::kstack::slot_usable_bounds(slot);
+    let anchor = double_fault_handler as *const () as u64;
+    const WINDOW: u64 = 16 * 1024 * 1024;
+    let is_text = |v: u64| -> bool {
+        let d = v.wrapping_sub(anchor) as i64;
+        d.unsigned_abs() <= WINDOW
+    };
+
+    _panic_print(format_args!(
+        "[int] kstack-bt: slot={} usable=[{:#x}..{:#x}) used={} KiB anchor(double_fault_handler)={:#x}\n",
+        slot,
+        usable_base,
+        top,
+        (top.saturating_sub(faulting_rsp)) / 1024,
+        anchor,
+    ));
+
+    // Pass 1 — Boyer–Moore majority vote over .text candidates.
+    let mut cand: u64 = 0;
+    let mut votes: i64 = 0;
+    let mut total_text: u64 = 0;
+    let mut addr = usable_base;
+    while addr < top {
+        // SAFETY: [usable_base, top) is this slot's mapped stack region (PML4[257],
+        // shared into the current CR3); 8-byte aligned reads stay in-bounds.
+        let w = unsafe { core::ptr::read_volatile(addr as *const u64) };
+        if is_text(w) {
+            total_text += 1;
+            if votes == 0 {
+                cand = w;
+                votes = 1;
+            } else if w == cand {
+                votes += 1;
+            } else {
+                votes -= 1;
+            }
+        }
+        addr += 8;
+    }
+
+    if total_text == 0 {
+        _panic_print(format_args!(
+            "[int] kstack-bt: no .text return addresses found (frame too large / non-recursive?)\n"
+        ));
+        return;
+    }
+
+    // Pass 2 — count the candidate, capture its frame stride and the deepest hits.
+    let mut count: u64 = 0;
+    let mut first_off: u64 = 0;
+    let mut stride: u64 = 0;
+    let mut prev_off: u64 = 0;
+    let mut printed_deep = 0u32;
+    addr = usable_base;
+    while addr < top {
+        let w = unsafe { core::ptr::read_volatile(addr as *const u64) };
+        if is_text(w) {
+            // Print the few deepest distinct .text addresses (nearest the fault).
+            if printed_deep < 8 {
+                _panic_print(format_args!(
+                    "[int] kstack-bt: depth#{} off={:#06x} addr={:#x} delta={}{:#x}\n",
+                    printed_deep,
+                    addr - usable_base,
+                    w,
+                    if w >= anchor { "+" } else { "-" },
+                    w.abs_diff(anchor),
+                ));
+                printed_deep += 1;
+            }
+            if w == cand {
+                if count == 0 {
+                    first_off = addr;
+                } else if stride == 0 {
+                    stride = addr - prev_off;
+                }
+                prev_off = addr;
+                count += 1;
+            }
+        }
+        addr += 8;
+    }
+
+    let _ = first_off;
+    let used = top.saturating_sub(faulting_rsp);
+    let avg_frame = used / total_text.max(1);
+    // Two distinct overflow shapes: a runaway *recursion* drives one return
+    // address to dominate the (large) `.text` population; a *large-frame*
+    // chain has only a handful of frames but each is huge (e.g. a by-value
+    // `[T; N]` buffer on the stack), so `.text` words stay few and no address
+    // repeats. Pick the verdict from the evidence rather than always blaming
+    // recursion.
+    let recursion = count >= 8 && count.saturating_mul(4) >= total_text;
+    if recursion {
+        _panic_print(format_args!(
+            "[int] kstack-bt: verdict=RECURSION site={:#x} delta={}{:#x} repeats={}x stride={} bytes ({} .text frames over {} KiB)\n",
+            cand,
+            if cand >= anchor { "+" } else { "-" },
+            cand.abs_diff(anchor),
+            count,
+            stride,
+            total_text,
+            used / 1024,
+        ));
+    } else {
+        _panic_print(format_args!(
+            "[int] kstack-bt: verdict=LARGE-FRAME chain — only {} .text frames over {} KiB (avg {} B/frame); look for a big by-value buffer (e.g. an inline [T; N]) in the deepest frames above\n",
+            total_text,
+            used / 1024,
+            avg_frame,
+        ));
+    }
+}
+
 extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFrame, _err: u64) -> ! {
+    // Track D: a #DF whose faulting context's RSP sits in a kstack guard page is
+    // a kernel-stack overflow that *escalated* — the guard-page #PF couldn't push
+    // its frame onto the exhausted stack, so it double-faulted. We are now on the
+    // clean DF IST stack, so if the overflow is attributable to a userspace task
+    // we can run the kill path directly (no stack switch needed) and reschedule,
+    // converting a previously-fatal #DF into a SIGSEGV of the offending process.
+    // See docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md.
+    let faulting_rsp = stack_frame.stack_pointer.as_u64();
+    if let Some(slot) = crate::task::kstack::classify_guard_page_fault(faulting_rsp)
+        && crate::smp::is_per_core_ready()
+    {
+        let pid = crate::process::current_pid();
+        if pid != 0 {
+            _panic_print(format_args!(
+                "[int] DOUBLE FAULT = kstack overflow (rsp={:#x}) attributable to pid {} — \
+                 killing process; core recovers (no halt)\n",
+                faulting_rsp, pid,
+            ));
+            // Pin the overflowing call chain (closes the 2026-06-14 handoff's
+            // open "origin audit"). Safe on the clean DF IST stack.
+            dump_kstack_overflow_backtrace(slot, faulting_rsp);
+            FAULT_KILL_PID.store(pid, Ordering::Relaxed);
+            // Already on the clean DF IST stack — run the kill directly.
+            // `fault_kill_trampoline` is `-> !` and ends in a switch to the
+            // scheduler, abandoning this IST stack (reused on the next #DF).
+            fault_kill_trampoline();
+        }
+    }
+
     _panic_print(format_args!("[int] DOUBLE FAULT: {:?}\n", stack_frame));
     _panic_print(format_args!(
         "[int] IST RSP={:#x}\n",
@@ -1596,6 +2062,12 @@ pub unsafe extern "C" fn timer_handler_user(frame: &mut PreemptTrapFrameUser) {
     // AC so SMAP enforces while this handler runs the scheduler/IPC. See M1.
     clac_on_irq_entry();
     bump_timer_ticks_for_current_core();
+    // COM1 RX backstop on EVERY core (independent of IRQ4 routing): under heavy
+    // SMP serial-TX load the IRQ4-target core can be IF-masked busy-waiting on
+    // the slow UART TX, so this drains pending serial input from whichever core's
+    // tick fires. Cheap (one CAS, one LSR read when idle). See
+    // `serial::serial_rx_backstop`.
+    crate::serial::serial_rx_backstop();
     if !USING_APIC.load(Ordering::Relaxed) || crate::smp::is_bsp() {
         TICK_COUNT.fetch_add(1, Ordering::Relaxed);
         crate::time::on_timer_tick_isr();
@@ -1670,6 +2142,8 @@ pub unsafe extern "C" fn timer_handler_kernel(
     captured_kernel_rsp: u64,
 ) {
     bump_timer_ticks_for_current_core();
+    // COM1 RX backstop on every core — see the note in `timer_handler_user`.
+    crate::serial::serial_rx_backstop();
     if !USING_APIC.load(Ordering::Relaxed) || crate::smp::is_bsp() {
         TICK_COUNT.fetch_add(1, Ordering::Relaxed);
         crate::time::on_timer_tick_isr();

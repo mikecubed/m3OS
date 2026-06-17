@@ -1112,7 +1112,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.90.0"
+version = "0.90.1"
 dependencies = [
  "bootloader_api",
  "kernel-core",
@@ -1132,6 +1132,13 @@ dependencies = [
  "proptest",
  "spin",
  "ttf-parser",
+]
+
+[[package]]
+name = "kstack-overflow-test"
+version = "0.1.0"
+dependencies = [
+ "syscall-lib",
 ]
 
 [[package]]

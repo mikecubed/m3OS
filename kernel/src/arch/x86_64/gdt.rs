@@ -12,8 +12,24 @@ use x86_64::{
 /// IST index used for the double-fault handler stack.
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
+/// IST index used for the NMI handler stack.
+///
+/// NMIs are the cross-core TLB-shootdown delivery mechanism (`smp::ipi::send_nmi`
+/// / `smp::tlb`). Giving the NMI handler its own stack means a core whose kernel
+/// stack has overflowed — or which is wedged in a fault `hlt_loop` — can STILL
+/// service an incoming shootdown NMI on a clean stack and acknowledge it. Without
+/// it, one wedged core makes a sibling's `tlb_shootdown_range` time out and
+/// `panic!` the whole machine (`smp/tlb.rs:176`). See
+/// `docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md`.
+pub const NMI_IST_INDEX: u16 = 1;
+
 /// Size of the dedicated double-fault stack.
 const DOUBLE_FAULT_STACK_SIZE: usize = 4096 * 5;
+
+/// Size of the dedicated NMI stack. The NMI handler only services TLB
+/// shootdowns (`invlpg`/CR3-reload + an atomic decrement) so it is shallow;
+/// 20 KiB matches the double-fault stack for headroom and consistency.
+const NMI_STACK_SIZE: usize = 4096 * 5;
 
 /// Size of the dedicated syscall kernel stack (16 KiB).
 const SYSCALL_STACK_SIZE: usize = 4096 * 4;
@@ -51,6 +67,10 @@ struct AlignedStack<const N: usize>([u8; N]);
 static mut DOUBLE_FAULT_STACK: AlignedStack<DOUBLE_FAULT_STACK_SIZE> =
     AlignedStack([0; DOUBLE_FAULT_STACK_SIZE]);
 
+/// Static NMI stack (BSP). Same `static mut` rationale as `DOUBLE_FAULT_STACK`:
+/// the CPU writes to it as a stack when delivering an NMI via the IST.
+static mut NMI_STACK: AlignedStack<NMI_STACK_SIZE> = AlignedStack([0; NMI_STACK_SIZE]);
+
 /// Static kernel stack used on SYSCALL entry and stored in TSS.RSP0.
 ///
 /// `static mut` because this memory is written by the CPU (as a stack) on
@@ -68,6 +88,13 @@ static TSS: Lazy<TaskStateSegment> = Lazy::new(|| {
             unsafe { VirtAddr::from_ptr(core::ptr::addr_of!(DOUBLE_FAULT_STACK.0).cast::<u8>()) };
         // Stack grows downward, so the "top" is start + size.
         stack_start + DOUBLE_FAULT_STACK_SIZE as u64
+    };
+    tss.interrupt_stack_table[NMI_IST_INDEX as usize] = {
+        // Same safety rationale as the double-fault stack above: take only the
+        // address of the static; the CPU writes to it when delivering an NMI.
+        let stack_start =
+            unsafe { VirtAddr::from_ptr(core::ptr::addr_of!(NMI_STACK.0).cast::<u8>()) };
+        stack_start + NMI_STACK_SIZE as u64
     };
     // RSP0: kernel stack used on ring-3 → ring-0 transition via interrupt.
     // The same stack is used by the syscall entry stub (via SYSCALL_STACK_TOP).

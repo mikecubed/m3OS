@@ -292,6 +292,39 @@ const SMOKE_EXIT_PKU_SMOKE_FAILED: i32 = 83;
 /// code-space commit on a no-PKU machine — A.1 fallback decision).
 const SMOKE_EXIT_NODE_JIT_SMOKE_FAILED: i32 = 84;
 
+/// Phase 90b — `claude-smoke` failure exit code. The gate builds a
+/// `M3OS_WITH_CLAUDE` image (bundling the claude-code `.m3pkg` + the jitless node
+/// it depends on), boots, `pkg install claude-code` (solver pulls node first),
+/// and asserts `claude --version`/`--help`/the vendored `rg` run. The jitless core
+/// needs no PKU, so the gate is CI-viable under TCG (KVM is a speed knob);
+/// `M3OS_CLAUDE_JIT=1` selects the 90a JIT node instead (the interactive-TUI /
+/// runtime-WASM variant, KVM/PKU-gated), on which cli.js also runs since the
+/// Phase 90b W^X-v2 cross-thread PKU read-recovery fix. The opt-in live arms
+/// (authenticated `claude -p` API round-trip + file workflow) need
+/// `M3OS_CLAUDE_NET=1` + a seeded credential and skip-with-reason otherwise.
+const SMOKE_EXIT_CLAUDE_SMOKE_FAILED: i32 = 85;
+
+/// Track D — `cargo xtask kstack-overflow-smoke` exit code. Boots a kernel built
+/// with the `kstack-overflow-test` feature, runs the `kstack-overflow-test`
+/// ramdisk binary (a child overflows its kernel stack via
+/// `SYS_KSTACK_OVERFLOW_TEST`), and asserts the kernel SIGSEGV-killed the child
+/// and the parent survived (`KSTACK_OVF:done`) — the controlled-kill recovery,
+/// not a core wedge / machine halt. See
+/// docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md.
+const SMOKE_EXIT_KSTACK_OVERFLOW_FAILED: i32 = 86;
+
+/// `cargo xtask smp-smoke` exit code — the permanent multi-core SMP regression
+/// gate. Boots Node on **multiple cores** (default -smp 4) and runs a
+/// futex-heavy libuv-threadpool stress (256 async pbkdf2 ops, 16 in flight) that
+/// must COMPLETE (`SMP_STRESS_OK`), proving no cross-core lost-wakeup deadlock;
+/// fail-fast on the fatal SMP signatures (`KERNEL PANIC`, the
+/// `BlockedOnFutex … no waker registered` watchdog verdict, `RECURSIVE KERNEL
+/// PAGE FAULT`, a wrongful `process killed`). The multi-command serial injection
+/// also exercises the COM1-RX-under-SMP byte-drop fix. Guards the five multi-core
+/// fixes from
+/// docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md.
+const SMOKE_EXIT_SMP_SMOKE_FAILED: i32 = 87;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
     Headless,
@@ -965,6 +998,19 @@ fn main() {
                 });
             cmd_node_smoke(&smoke_args);
         }
+        // Permanent multi-core SMP regression gate
+        // (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md):
+        // boots Node on -smp 4 and runs a futex-heavy threadpool stress that must
+        // complete, guarding the cross-core lost-wakeup / CoW-kill / TLB-panic /
+        // serial-byte-drop fixes. Honors M3OS_KVM=1 + M3OS_SMP=<N>.
+        Some("smp-smoke") => {
+            let smoke_args = parse_smoke_boot_args("smp-smoke", &args[2..]).unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            cmd_smp_smoke(&smoke_args);
+        }
         // Phase 90a Track D.3 — Node.js JIT + WASM gate. Boots the JIT
         // `build_node` variant (M3OS_NODE_JIT=1) under PKU (M3OS_KVM=1 on a
         // PKU host), asserts V8 reaches optimized/TurboFan code (NODE_JIT_OK)
@@ -979,6 +1025,24 @@ fn main() {
                     std::process::exit(1);
                 });
             cmd_node_jit_smoke(&smoke_args);
+        }
+        // Phase 90b — Claude Code gate. Boots a M3OS_WITH_CLAUDE image
+        // (claude-code + the jitless node it DEPS=node-depends on),
+        // `pkg install claude-code` (solver pulls node first), and asserts
+        // `claude --version`/`--help` + the vendored static-pie rg run on the
+        // jitless node (CI-viable under TCG, no PKU). `M3OS_CLAUDE_JIT=1`
+        // selects the 90a JIT node instead (KVM/PKU-gated, the interactive-TUI
+        // runtime variant). Opt-in live arms (M3OS_CLAUDE_NET=1 +
+        // M3OS_CLAUDE_TOKEN/KEY): authenticated `claude -p` API round-trip +
+        // a real-FS agent workflow, skip-with-reason otherwise.
+        Some("claude-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("claude-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_claude_smoke(&smoke_args);
         }
         // Phase 63a Track H — DOOM SFX + music end-to-end smoke. Boots
         // with WAV AC'97 backend, launches `/bin/doom -warp 1 1` with
@@ -1176,6 +1240,21 @@ fn main() {
             });
             cmd_pku_smoke(&smoke_args);
         }
+        // Track D (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md)
+        // — `kstack-overflow-smoke`: builds a kernel with the
+        // `kstack-overflow-test` feature, boots m3OS, runs the
+        // `kstack-overflow-test` ramdisk binary, and asserts a child that
+        // overflows its kernel stack is SIGSEGV-killed while the parent survives
+        // (`KSTACK_OVF:done`). Plain TCG single-core — no PKU/KVM needed.
+        Some("kstack-overflow-smoke") => {
+            let smoke_args = parse_smoke_boot_args("kstack-overflow-smoke", &args[2..])
+                .unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_kstack_overflow_smoke(&smoke_args);
+        }
         // Phase 85a Track B.3 — zero-rebuild assertion gate.
         // Builds a port once to warm the pkgcache, removes the stage so the
         // same-machine `.stamp` fast-path cannot short-circuit, then builds
@@ -1200,7 +1279,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -1490,6 +1569,12 @@ fn build_userspace_bins() {
         // W^X v2 accept/reject matrix. Pure syscall + fork + write — no
         // allocator.
         ("pku-smoke", "pku-smoke", false),
+        // Track D (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md)
+        // — `kstack-overflow-test`: a child overflows its kernel stack via the
+        // feature-gated `SYS_KSTACK_OVERFLOW_TEST` and the parent asserts the
+        // kernel SIGSEGV-killed it (recovery, not a core wedge). Pure syscall +
+        // fork + write — no allocator.
+        ("kstack-overflow-test", "kstack-overflow-test", false),
         // Phase 77 Track F.1 — epoll_* verification smoke test.
         // Pure syscall+write against a pipe; no allocator.
         ("epoll-smoke", "epoll-smoke", false),
@@ -4519,17 +4604,42 @@ pub fn musl_cc_extra_ldflags() -> Vec<String> {
     }
 }
 
-/// Materialize empty `libdl.a`, `libpthread.a`, `librt.a` archives in
-/// `target/musl-stub-libs/`. The archives are byte-for-byte just the
-/// 8-byte ar global header `!<arch>\n` — a valid (empty) static archive
+/// Always materialize the empty musl stub archives and return the `-L<dir>`
+/// flag for them, independent of whether [`find_musl_cc`] needed them.
+///
+/// The Node cross-build uses this: `node.gyp` unconditionally appends
+/// `-latomic` for every Linux+clang build (PR #25852), so the link ALWAYS
+/// needs a `libatomic.a` on its search path. Relying on a happenstance system
+/// libatomic — present on a glibc+gcc host, absent on a clean musl box — is a
+/// latent failure (`ld.lld: error: unable to find library -latomic`). The
+/// empty stub archive resolves it with zero symbols (x86_64 inlines all of
+/// V8/Node's atomics), so the link succeeds on every host.
+pub fn musl_stub_ldflags_always() -> Vec<String> {
+    match ensure_musl_stub_libs() {
+        Ok(stub_dir) => vec![format!("-L{}", stub_dir.display())],
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Materialize empty `libdl.a`, `libpthread.a`, `librt.a`, `libatomic.a`
+/// archives in `target/musl-stub-libs/`. The archives are byte-for-byte just
+/// the 8-byte ar global header `!<arch>\n` — a valid (empty) static archive
 /// the linker accepts and traverses with no symbols. Idempotent: only
 /// writes a file if it is missing or has the wrong size.
+///
+/// `libatomic.a` is here for the Node cross-build: `node.gyp` unconditionally
+/// appends `-latomic` on every Linux+clang build (Node PR #25852), but the
+/// static musl/clang sysroot ships no libatomic and x86_64 lowers all of
+/// V8/Node's atomics to inline instructions (the linked `node` binary has zero
+/// undefined `__atomic_*` references) — so an empty archive resolves `-latomic`
+/// with no symbols. Only consulted when something passes `-latomic`, so it is
+/// harmless for the autotools ports, which never do.
 fn ensure_musl_stub_libs() -> std::io::Result<PathBuf> {
     let root = workspace_root();
     let stub_dir = root.join("target/musl-stub-libs");
     fs::create_dir_all(&stub_dir)?;
     const AR_HEADER: &[u8] = b"!<arch>\n";
-    for name in &["libdl.a", "libpthread.a", "librt.a"] {
+    for name in &["libdl.a", "libpthread.a", "librt.a", "libatomic.a"] {
         let path = stub_dir.join(name);
         let needs_write = match fs::metadata(&path) {
             Ok(m) => m.len() != AR_HEADER.len() as u64,
@@ -6921,14 +7031,27 @@ fn idle_prompt_fallback_matches(
 /// The thread exits when the pipe closes (QEMU exits).
 fn spawn_serial_reader(stdout: std::process::ChildStdout) -> std::sync::mpsc::Receiver<Vec<u8>> {
     let (tx, rx) = std::sync::mpsc::channel();
+    // Debug: when M3OS_SERIAL_LOG=<path> is set, tee the COMPLETE raw serial
+    // stream to that file (the in-memory `serial_buf` only keeps a drained tail,
+    // so a verbose kernel fault/trace dump otherwise buries the fault header). The
+    // file is truncated at open; every chunk is appended + flushed so a VM-exit
+    // crash still leaves the full pre-crash serial on disk.
+    let mut serial_log = std::env::var("M3OS_SERIAL_LOG")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .and_then(|p| std::fs::File::create(p).ok());
     std::thread::spawn(move || {
-        use std::io::Read;
+        use std::io::{Read, Write};
         let mut reader = std::io::BufReader::new(stdout);
         let mut buf = [0u8; 4096];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    if let Some(f) = serial_log.as_mut() {
+                        let _ = f.write_all(&buf[..n]);
+                        let _ = f.flush();
+                    }
                     if tx.send(buf[..n].to_vec()).is_err() {
                         break;
                     }
@@ -12675,6 +12798,149 @@ fn cmd_pku_smoke(args: &SmokeBootArgs) {
 }
 
 // ---------------------------------------------------------------------------
+// Track D — kstack-overflow-smoke: kernel-stack-overflow controlled-kill
+// recovery gate (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md)
+// ---------------------------------------------------------------------------
+
+/// Smoke steps for `cargo xtask kstack-overflow-smoke`. Logs into sh0, runs the
+/// `kstack-overflow-test` binary, and asserts the recovery sentinels. The
+/// load-bearing assertions:
+///   - `KSTACK_OVF:killed:ok` — the overflowing child was SIGSEGV-killed (the
+///     recovery fired; a wedge/halt would never print this).
+///   - `KSTACK_OVF:survivor:ok` — the parent kept running afterwards (on
+///     single-core, proof the core returned to the scheduler rather than wedging
+///     in `hlt_loop`).
+/// A non-consuming `Wait` on `:killed:ok` precedes the terminal `:done` so a
+/// `:skip` (feature absent) cannot masquerade as a pass.
+fn kstack_overflow_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/kstack-overflow: kernel first message",
+    }];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "kstack-overflow-test\n",
+        label: "guest/kstack-overflow: run kstack-overflow-test binary",
+    });
+    // The feature is built in for this gate, so the child MUST be SIGSEGV-killed
+    // (not SKIP). Assert it with a non-consuming Wait before the terminal `done`.
+    steps.push(SmokeStep::Wait {
+        pattern: "KSTACK_OVF:killed:ok",
+        timeout_secs: 60,
+        label: "guest/kstack-overflow: overflowing child SIGSEGV-killed (recovery fired)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "KSTACK_OVF:survivor:ok",
+        timeout_secs: 30,
+        label: "guest/kstack-overflow: parent survived (core recovered, no wedge)",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "KSTACK_OVF:done",
+        fail_prefixes: &["KSTACK_OVF:FAIL", "KSTACK_OVF:panic"],
+        timeout_secs: 30,
+        label: "guest/kstack-overflow: recovery probe complete",
+        exit_code_on_fail: SMOKE_EXIT_KSTACK_OVERFLOW_FAILED,
+    });
+    steps
+}
+
+fn cmd_kstack_overflow_smoke(args: &SmokeBootArgs) {
+    // Build the kernel WITH the `kstack-overflow-test` feature so the probe
+    // syscall (0x1150) is live. Merge with any pre-set M3OS_KERNEL_FEATURES.
+    // SAFETY: xtask is single-threaded here; the child build step reads the env.
+    // set_var is `unsafe` in Rust edition 2024 (cross-thread UB risk).
+    let merged = match std::env::var("M3OS_KERNEL_FEATURES") {
+        Ok(existing) if !existing.trim().is_empty() => {
+            format!("{},kstack-overflow-test", existing.trim())
+        }
+        _ => "kstack-overflow-test".to_string(),
+    };
+    unsafe {
+        std::env::set_var("M3OS_KERNEL_FEATURES", merged);
+    }
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false, // graphical_login — serial autologin path
+    );
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, display_mode, DeviceSet::default());
+    // No host networking needed.
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    // Pin to a single core: the survival proof is sharpest single-core — if the
+    // child's overflow had wedged the core in hlt_loop, the scheduler would never
+    // run the parent again and `waitpid` would hang the whole test (a clean
+    // timeout failure), rather than a sibling core masking the wedge.
+    for i in 0..qemu_args.len() {
+        if qemu_args[i] == "-smp" && i + 1 < qemu_args.len() {
+            qemu_args[i + 1] = "1".to_string();
+        }
+    }
+    append_ac97_audio_flags_headless(&mut qemu_args);
+    let steps = kstack_overflow_smoke_steps();
+
+    println!(
+        "kstack-overflow-smoke: launching QEMU (timeout {}s) [TCG single-core]",
+        args.timeout_secs,
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("kstack-overflow-smoke: failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!(
+                "kstack-overflow-smoke: PASS ({} steps in {elapsed}s)",
+                steps.len()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("kstack-overflow-smoke: FAILED\n{msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Phase 63 Track E.1 — bell-smoke step list, QEMU arg builder, and command
 // ---------------------------------------------------------------------------
 
@@ -15359,10 +15625,22 @@ fn cmd_node_smoke(args: &SmokeBootArgs) {
     // Pin the guest to a single core (same rationale as the go gate): the heavy
     // Node load + slow-VFS pipeline + libuv thread pool are still exercised, but
     // a single core avoids cross-core SMP futex/IPC races under the heavy load.
+    //
+    // M3OS_NODE_SMP=<N> overrides the pin (diagnostic: reproduce the 4-core node
+    // hang — docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md
+    // follow-up). M3OS_NODE_HANG_PROBE=1 then runs a sustained-multithread stress
+    // and lets the step time out so the kernel stuck-task watchdog dumps.
+    let node_smp = std::env::var("M3OS_NODE_SMP").ok().and_then(|v| {
+        let n: u32 = v.parse().ok()?;
+        (n >= 1).then_some(n)
+    });
     for i in 0..qemu_args.len() {
         if qemu_args[i] == "-smp" && i + 1 < qemu_args.len() {
-            qemu_args[i + 1] = "1".to_string();
+            qemu_args[i + 1] = node_smp.unwrap_or(1).to_string();
         }
+    }
+    if let Some(n) = node_smp {
+        println!("node-smoke: M3OS_NODE_SMP={n} — running multi-core (diagnostic)");
     }
 
     // When the live network arms run (TLS handshake needs entropy), advertise
@@ -15425,6 +15703,219 @@ fn cmd_node_smoke(args: &SmokeBootArgs) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// smp-smoke — permanent multi-core SMP regression gate
+// (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md)
+// ---------------------------------------------------------------------------
+
+/// Serial script for `smp-smoke`. Installs node, runs it multi-core, then a
+/// futex-heavy libuv-threadpool stress that must COMPLETE — guarding the
+/// cross-core lost-wakeup fix — with fail-fast on the fatal SMP signatures. Every
+/// command we inject also exercises the COM1-RX-under-SMP byte-drop fix.
+fn smp_smoke_steps(fast_iter: bool) -> Vec<SmokeStep> {
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "smp-smoke: kernel first message",
+    }];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    if !fast_iter {
+        steps.push(SmokeStep::Send {
+            input: "pkg install node\n",
+            label: "smp-smoke: pkg install node",
+        });
+        steps.push(SmokeStep::WaitPassOrFail {
+            pass_pattern: "pkg install: node: OK",
+            fail_prefixes: &["pkg install: cannot"],
+            timeout_secs: 3600,
+            label: "smp-smoke: node installed from .m3pkg",
+            exit_code_on_fail: SMOKE_EXIT_SMP_SMOKE_FAILED,
+        });
+    }
+    // Version banner — the first multi-core serial-injected command (every
+    // command we send exercises the COM1-RX-under-SMP byte-drop fix: a regressed
+    // RX path drops a char and the command is garbled → timeout here).
+    steps.push(SmokeStep::Send {
+        input: "node --version\n",
+        label: "smp-smoke: node --version",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "v22.22",
+        timeout_secs: 1200,
+        label: "smp-smoke: node runs multi-core (version, cold streamed load)",
+    });
+    // The core test: a futex-heavy libuv-threadpool stress that must COMPLETE on
+    // multiple cores. 256 async pbkdf2 ops are queued at once; the 4-thread
+    // threadpool processes them and posts each completion back to the event loop
+    // (a futex WAKE of the main thread, which blocks on a futex WAIT between
+    // completions) — 256 cross-core WAIT/WAKE handshakes. A regression of the
+    // cross-core lost-wakeup (`block_current_until`) strands the main thread
+    // `BlockedOnFutex` → `d` never reaches 256 → `SMP_STRESS_OK` never prints, and
+    // the kernel's `no waker registered` watchdog verdict trips the fail-fast. The
+    // other fatal SMP signatures (a TLB-shootdown panic, a recursive-#PF cascade,
+    // a wrongful spurious-fault kill) fail fast too. Kept ~150 chars (the working
+    // node-smoke `node -e` length — longer command bursts can outrun the COM1 RX
+    // feeder). `'SMP'+'_STRESS_OK'` so the Wait keys on real output, not the echo.
+    steps.push(SmokeStep::Send {
+        input: "node -e \"const c=require('crypto');let d=0;for(let i=0;i!==256;i++)c.pbkdf2('p','s',2000,32,'sha256',()=>++d===256&&console.log('SMP'+'_STRESS_OK '+d))\"\n",
+        label: "smp-smoke: futex-heavy threadpool stress (256 async pbkdf2 ops)",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "SMP_STRESS_OK 256",
+        fail_prefixes: &[
+            "KERNEL PANIC",
+            "no waker registered",
+            "RECURSIVE KERNEL PAGE FAULT",
+            "process killed",
+        ],
+        timeout_secs: 900,
+        label: "smp-smoke: multithreaded stress completes (no lost-wakeup / panic / kill)",
+        exit_code_on_fail: SMOKE_EXIT_SMP_SMOKE_FAILED,
+    });
+    steps
+}
+
+/// `cargo xtask smp-smoke` — permanent multi-core SMP regression gate. Boots Node
+/// on **multiple cores** (default `-smp 4`; `M3OS_SMP=<N≥2>` overrides) and runs
+/// the futex-heavy threadpool stress above. Honors `M3OS_KVM=1` (near-native; also
+/// exposes real PKU so the JIT/W^X-v2 paths are covered) and
+/// `M3OS_NODE_FAST_ITER=1` (reuse an installed disk). SKIPs cleanly when the host
+/// C++ toolchain / llvm musl sysroot are absent (mirrors node-smoke).
+fn cmd_smp_smoke(args: &SmokeBootArgs) {
+    fn tool_ok(t: &str) -> bool {
+        std::process::Command::new(t)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    let clang = std::env::var("M3OS_NODE_CLANG").unwrap_or_else(|_| "clang".to_string());
+    let clangxx = std::env::var("M3OS_NODE_CLANGXX").unwrap_or_else(|_| "clang++".to_string());
+    let toolchain_ok = tool_ok(&clang)
+        && tool_ok(&clangxx)
+        && tool_ok("ld.lld")
+        && tool_ok("python3")
+        && tool_ok("make");
+    let sysroot_libcxx = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("target/llvm-musl-sysroot/lib/libc++.a");
+    if !toolchain_ok || !sysroot_libcxx.exists() {
+        println!(
+            "smp-smoke: SKIP (reason: host C++ toolchain or llvm musl sysroot absent — \
+             needs clang/clang++/ld.lld/python3/make + `cargo xtask port build llvm`)"
+        );
+        return;
+    }
+    if let Err(msg) = port_build::build_node_port() {
+        eprintln!("smp-smoke: precondition failed (node port build): {msg}");
+        std::process::exit(SMOKE_EXIT_SMP_SMOKE_FAILED);
+    }
+    // SAFETY: xtask is single-threaded here; the child image-build step reads the
+    // env. set_var is `unsafe` in Rust edition 2024 (cross-thread UB risk).
+    unsafe {
+        std::env::set_var("M3OS_WITH_NODE", "1");
+    }
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let fast_iter = std::env::var("M3OS_NODE_FAST_ITER").is_ok();
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if fast_iter && disk_img.exists() {
+        println!("smp-smoke: M3OS_NODE_FAST_ITER — reusing existing disk (skipping install)");
+    } else {
+        if disk_img.exists() {
+            let _ = fs::remove_file(&disk_img);
+        }
+        create_data_disk(
+            uefi_image.parent().unwrap(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false, // graphical_login — serial autologin path
+        );
+    }
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let kvm = std::env::var_os("M3OS_KVM").is_some_and(|v| v != "0" && !v.is_empty());
+    let mut qemu_args = qemu_args_with_devices(
+        &uefi_image,
+        &ovmf,
+        display_mode,
+        DeviceSet {
+            kvm,
+            ..DeviceSet::default()
+        },
+    );
+    // No host networking needed.
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    // FORCE multi-core — the whole point of the gate. Default 4; M3OS_SMP=<N≥2>
+    // overrides (a value < 2 is ignored, since a single core cannot exercise the
+    // cross-core races this gate guards).
+    let cores = std::env::var("M3OS_SMP")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|n| *n >= 2)
+        .unwrap_or(4);
+    for i in 0..qemu_args.len() {
+        if qemu_args[i] == "-smp" && i + 1 < qemu_args.len() {
+            qemu_args[i + 1] = cores.to_string();
+        }
+    }
+    append_ac97_audio_flags_headless(&mut qemu_args);
+    let steps = smp_smoke_steps(fast_iter);
+
+    println!(
+        "smp-smoke: launching QEMU (timeout {}s, -smp {cores}, {})",
+        args.timeout_secs,
+        if kvm { "KVM (real PKU)" } else { "TCG" }
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("smp-smoke: failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            println!(
+                "smp-smoke: PASSED ({} steps in {}s, -smp {cores})",
+                steps.len(),
+                start.elapsed().as_secs()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("smp-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_SMP_SMOKE_FAILED);
+        }
+    }
+}
+
 /// Serial script for `node-smoke`. The always-on core installs node, asserts the
 /// version banner, runs the fs/event-loop/timer probe, a plaintext egress GET to
 /// the SLIRP host server (`egress_url` carries the synthetic 10.0.2.100:80
@@ -15477,6 +15968,77 @@ fn node_smoke_steps(attempt_net: bool, fast_iter: bool, egress_url: &str) -> Vec
         timeout_secs: 1200,
         label: "node-smoke: node 22.x runs on target (version banner, cold streamed load)",
     });
+
+    // DIAGNOSTIC (M3OS_NODE_HANG_PROBE=1, pair with M3OS_NODE_SMP=4): reproduce
+    // the 4-core node hang. Sustained async pbkdf2 churns the libuv threadpool
+    // (the Phase-89 futex-requeue-fragile condvar path) with 8 in-flight ops over
+    // 4 worker threads + a 'HANGPROBE_ALIVE<n>' heartbeat every 300 ms. On 4 cores
+    // this is expected to HANG; the following Wait then times out and the harness
+    // dumps the captured serial — which by then carries the kernel stuck-task
+    // watchdog verdict (the BSP `watchdog_scan` dispatch dump for a stale-ready
+    // task, or a `stuck-since=…ms (no waker registered)` BlockedOnFutex line),
+    // naming WHY it hung. Heartbeat pinpoints the exact hang tick on serial.
+    if std::env::var("M3OS_NODE_HANG_PROBE").is_ok_and(|v| v == "1") {
+        steps.push(SmokeStep::Send {
+            input: "node -e \"const c=require('crypto');let n=0;const spin=()=>c.pbkdf2('p','s',20000,64,'sha512',()=>{n++;spin()});for(let i=0;i<8;i++)spin();setInterval(()=>console.log('HANGPROBE_ALIVE'+n),300)\"\n",
+            label: "node-smoke[HANG-PROBE]: sustained multithreaded threadpool stress",
+        });
+        steps.push(SmokeStep::Wait {
+            // Impossible sentinel — the stress never prints this. The point IS to
+            // time out so the harness flushes serial with the watchdog verdict.
+            pattern: "HANGPROBE_SENTINEL_NEVER",
+            timeout_secs: 75,
+            label: "node-smoke[HANG-PROBE]: (expected timeout) capture stuck-task watchdog dump",
+        });
+        return steps;
+    }
+
+    // DIAGNOSTIC (M3OS_NODE_VFS_STRESS=1): cheap reproducer for the Claude Code
+    // `claude -p` startup stall (docs/handoffs/2026-06-15-claude-code-openrouter-
+    // emfile-fd-limit.md #4) — a node thread stranded in `BlockedOnReply` under
+    // the single-threaded `vfs_server`'s concurrent multi-thread load. Fans out
+    // FAN concurrent libuv-threadpool `fs.stat` calls (UV_THREADPOOL_SIZE=16,
+    // exported just below) against the slow ring-3 VFS, completing N total. The
+    // exact concurrency surface claude hits (many callers queued in `ep.senders`
+    // while the server replies to one) WITHOUT building claude or any network.
+    // A heartbeat every 1 s prints VFS_STRESS_ALIVE (progressing) or
+    // VFS_STRESS_STALL (no progress + inflight>0 = the stall). On completion it
+    // prints VFS_STRESS_DONE; on a stall the following Wait times out and the
+    // harness flushes serial with the kernel watchdog / reply-stall verdict.
+    if std::env::var("M3OS_NODE_VFS_STRESS").is_ok_and(|v| v == "1") {
+        steps.push(SmokeStep::Send {
+            input: "export UV_THREADPOOL_SIZE=16\n",
+            label: "node-smoke[VFS-STRESS]: raise libuv threadpool to 16",
+        });
+        steps.push(SmokeStep::Sleep { millis: 300 });
+        // Mix readdir + readFile + open/close (all real vfs_server IPC round-trips
+        // that BYPASS the kernel stat metacache, unlike repeated fs.stat of the
+        // same paths) so the single-threaded server is hammered by concurrent
+        // callers — the exact surface claude's setup()/skill-discovery exercises.
+        // NOTE: the DONE/ALIVE/STALL sentinels are assembled at RUNTIME from
+        // concatenated string literals (`'VFS'+'DONE '`) so the harness Wait
+        // pattern ("VFSDONE") matches only the printed output, never the
+        // terminal's echo of this command line (which contains the literals
+        // with a `'+'` between them, so "VFSDONE" never appears verbatim there).
+        // Unbuffered heartbeat via fs.writeSync(1,...) (console.log can block-buffer
+        // to the serial console). Also spawns short-lived /bin/echo children
+        // concurrently with the VFS storm so SIGCHLD interrupts in-flight VFS
+        // `call_msg` waits — the exact signal pressure claude applies by spawning
+        // ripgrep during skill discovery, which a child-less storm never produces.
+        steps.push(SmokeStep::Send {
+            input: "node -e \"const fs=require('fs');const cp=require('child_process');function P(s){fs.writeSync(1,s+'\\n');}const D=['/usr/lib','/usr/src','/etc','/root','/bin','/usr/bin','/usr','/etc/ssl/certs','/usr/pkg','/var'];const F=['/etc/passwd','/etc/group','/etc/hostname','/usr/src/node-probe.js','/etc/ssl/certs/ca-certificates.crt','/etc/profile','/root/.profile','/etc/resolv.conf'];const PER=+(process.env.SN||20000);const ROUNDS=+(process.env.ROUNDS||8);const FAN=+(process.env.FAN||24);const KIDS=+(process.env.KIDS||4);let round=0,st=0,dn=0,inf=0;function startRound(){st=0;dn=0;pump();}function op(i,cb){const k=i%3;if(k===0){fs.readdir(D[i%D.length],()=>cb());}else if(k===1){fs.readFile(F[i%F.length],()=>cb());}else{fs.open(F[i%F.length],'r',(e,fd)=>{if(fd!=null)fs.close(fd,()=>cb());else cb();});}}function pump(){while(inf<FAN&&st<PER){const i=st;st++;inf++;op(i,()=>{inf--;dn++;if(dn===PER){round++;if(round>=ROUNDS){P('VFS'+'DONE '+(round*PER));process.exit(0);}else{P('VFS'+'ROUND '+round);startRound();}}else pump();});}}function kid(){cp.execFile('/bin/echo',['x'],()=>{setTimeout(kid,5);});}let last=-1;setInterval(()=>{P((dn===last?'VFS'+'STALL':'VFS'+'ALIVE')+' round='+round+' dn='+dn+' inf='+inf+' st='+st);last=dn;},1000);for(let i=0;i<KIDS;i++)kid();startRound();\"\n",
+            label: "node-smoke[VFS-STRESS]: concurrent readdir/readFile/open + child spawns (SIGCHLD)",
+        });
+        steps.push(SmokeStep::Wait {
+            // On a stall this never prints and the Wait times out, flushing
+            // serial with the VFSSTALL heartbeats + the kernel [replystall]
+            // / stuck-task verdict.
+            pattern: "VFSDONE",
+            timeout_secs: 420,
+            label: "node-smoke[VFS-STRESS]: all concurrent VFS storm rounds completed (no stall)",
+        });
+        return steps;
+    }
 
     // 3. fs / process / event-loop / timer probe (A.1 timerfd event-loop path).
     steps.push(SmokeStep::Send {
@@ -15932,6 +16494,1173 @@ fn node_jit_smoke_steps(fast_iter: bool) -> Vec<SmokeStep> {
         label: "node-jit-smoke: WebAssembly.Instance executes add(2,3)===5 (NODE_WASM_OK)",
         exit_code_on_fail: SMOKE_EXIT_NODE_JIT_SMOKE_FAILED,
     });
+
+    steps
+}
+
+/// Phase 90b — `cargo xtask claude-smoke`.
+///
+/// Boots a `M3OS_WITH_CLAUDE` image (bundling the pinned claude-code `.m3pkg` +
+/// the JITLESS node it `DEPS=node`-depends on), `pkg install claude-code` (the
+/// solver pulls node FIRST — the dependency-first proof), and asserts the launcher
+/// chain runs offline: `claude --version` → `2.1.112`, `claude --help`, the
+/// vendored static-pie `rg --version`, plus the A.2 interactive-substrate probes
+/// (SIGINT self-pipe / `child_process` spawn / raw-mode toggle) an interactive
+/// agent depends on. By DEFAULT the bundled node is the JITLESS variant, which
+/// needs no PKU, so the always-on core is CI-viable under plain TCG (KVM is honored
+/// only as a speed knob). `M3OS_CLAUDE_JIT=1` bundles the 90a JIT node instead (the
+/// interactive-TUI / runtime-WASM variant, KVM/PKU-gated like `node-jit-smoke`); the
+/// real-world cli.js runs on BOTH variants since the Phase 90b W^X-v2 cross-thread
+/// PKU read-recovery fix (`kernel/src/arch/x86_64/{interrupts,pkru}.rs`) — a sibling
+/// worker thread DATA-reading the per-thread-PKRU-guarded V8 code space used to fault
+/// the process; the page-fault handler now grants read on guarded executable pages
+/// (writes stay gated → W^X intact).
+///
+/// The opt-in live arms (`M3OS_CLAUDE_NET=1` + a seeded credential via
+/// `M3OS_CLAUDE_TOKEN` (subscription OAuth) or `M3OS_CLAUDE_KEY` (API billing))
+/// run an authenticated `claude -p` round-trip to `api.anthropic.com`
+/// (`CLAUDE_API_OK`), a real-filesystem agent workflow asserted by `cat` (not the
+/// model's own claim), and the 0600 credential-file hygiene check — all
+/// skip-with-reason when unconfigured (a secret can never live in repo/CI,
+/// mirroring `gh-smoke`/`git-https-smoke`). On the JIT node the **interactive TUI
+/// renders** — `claude_tui_render_arm` launches `claude` in the graphical `term`
+/// and a QMP/PPM screendump asserts the yoga.wasm welcome screen paints (the serial
+/// harness is blind to TUI rendering). The TUI needed two fixes: the W^X-v2 PKU
+/// fix above (cli.js launch) and switching the node build to `--with-intl=full-icu`
+/// — small-icu lacks the ICU break-iterator data `Intl.Segmenter` uses for grapheme
+/// segmentation, so the TUI null-dereffed in V8's `JSSegments::Create`; the always-on
+/// `SEG_OK` step guards that fix.
+/// Re-stamp the seeded Claude credential into an EXISTING `disk.img`'s ext2
+/// partition, in place (Phase 90b follow-up).
+///
+/// The `M3OS_CLAUDE_FAST_ITER` escape hatch reuses a disk that already has
+/// claude-code + node installed, to skip the slow in-OS install while iterating.
+/// But the seeded 0600 credential lives ON that disk, so a credential CHANGE
+/// between fast-iter runs would silently keep using the STALE one — the exact
+/// footgun that sent the 2026-06-16 session chasing a phantom network hang: a
+/// reused disk held an old Anthropic `sk-ant-…` key while the run intended an
+/// OpenRouter `sk-or-…` key, so `claude -p` got a 401 "Missing Authentication
+/// header" despite a fully working TLS/HTTP path (the request reached OpenRouter,
+/// which rejected the wrong key).
+///
+/// This overwrites JUST `/root/.claude/<cred_name>` via `debugfs -w` against the
+/// partition opened in place with the `?offset=` device suffix (e2fsprogs ≥ 1.45),
+/// at the same LBA-2048 / 1 MiB offset `create_data_disk` lays out. The raw secret
+/// goes through a 0600 host temp that is scrubbed on both the success and failure
+/// paths (mirroring `populate_ext2_files`); it never crosses the serial console.
+/// A missing host `debugfs` is non-fatal — the caller logs the returned Err as a
+/// warning and proceeds with whatever credential the disk already holds.
+fn restamp_claude_credential(
+    disk_img: &Path,
+    output_dir: &Path,
+    cred_name: &str,
+    cred_val: &str,
+) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // Partition 1 at LBA 2048 → 1 MiB byte offset (matches create_data_disk).
+    const PARTITION_OFFSET: u64 = 2048 * 512;
+
+    // 0600 temp holding the raw secret + trailing newline (the seeding format;
+    // ion's `$(cat …)` command substitution trims the trailing newline).
+    let tmp = output_dir.join("_tmp_claude_cred_reseed");
+    let _ = fs::remove_file(&tmp);
+    {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|e| format!("create reseed temp: {e}"))?;
+        f.write_all(format!("{cred_val}\n").as_bytes())
+            .map_err(|e| format!("write reseed temp: {e}"))?;
+    }
+
+    // debugfs replaces the file in place: `rm` first (debugfs `write` refuses to
+    // overwrite an existing inode; a no-op `rm` of a missing file just warns),
+    // then `write` + restore the 0600 root-owned metadata.
+    let cmds = format!(
+        "cd /root/.claude\nrm {name}\nwrite {tmp} {name}\n\
+         sif {name} mode 0100600\nsif {name} uid 0\nsif {name} gid 0\n",
+        name = cred_name,
+        tmp = tmp.display(),
+    );
+    let dev = format!("{}?offset={PARTITION_OFFSET}", disk_img.display());
+
+    let spawn = Command::new("debugfs")
+        .arg("-w")
+        .arg(&dev)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+    let result = (|| {
+        let mut child =
+            spawn.map_err(|e| format!("spawn debugfs (is e2fsprogs installed?): {e}"))?;
+        child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "debugfs stdin".to_string())?
+            .write_all(cmds.as_bytes())
+            .map_err(|e| format!("write debugfs commands: {e}"))?;
+        let out = child
+            .wait_with_output()
+            .map_err(|e| format!("debugfs wait: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "debugfs exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        Ok(())
+    })();
+
+    // SECRET SCRUB — remove the credential-bearing temp on BOTH paths.
+    let _ = fs::remove_file(&tmp);
+    result
+}
+
+fn cmd_claude_smoke(args: &SmokeBootArgs) {
+    // The always-on core bundles the JITLESS node (the Phase 89 default) because it
+    // needs NO PKU: `claude --version`/`--help`/`-p` run on the jitless node (V8's
+    // Ignition interpreter; ZERO runtime executable memory ⇒ no PKU/W^X path), so the
+    // gate runs under plain TCG too — CI-viable, not KVM-gated. KVM is honored only as
+    // a SPEED knob (the cold cli.js load over the slow VFS is ~10–50× faster), as in
+    // `cmd_node_smoke`. `M3OS_CLAUDE_JIT=1` selects the 90a JIT node instead (the
+    // interactive-TUI / runtime-WASM variant), which REQUIRES PKU and so is KVM-gated
+    // below. cli.js runs on BOTH variants since the Phase 90b W^X-v2 cross-thread PKU
+    // read-recovery fix (`kernel/src/arch/x86_64/{interrupts,pkru}.rs`).
+    let kvm = std::env::var_os("M3OS_KVM").is_some_and(|v| v != "0" && !v.is_empty());
+
+    // SKIP-with-reason build precondition (identical to `cmd_node_smoke`):
+    // building the node port needs a host C++ cross-toolchain
+    // (clang/clang++/ld.lld), python3 + make, and the llvm musl sysroot's static
+    // libc++. Absent any of these we cannot build the runtime `.m3pkg`, so skip
+    // cleanly rather than FAIL.
+    fn node_tool_on_path(t: &str) -> bool {
+        std::process::Command::new(t)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    let clang = std::env::var("M3OS_NODE_CLANG").unwrap_or_else(|_| "clang".to_string());
+    let clangxx = std::env::var("M3OS_NODE_CLANGXX").unwrap_or_else(|_| "clang++".to_string());
+    let toolchain_ok = node_tool_on_path(&clang)
+        && node_tool_on_path(&clangxx)
+        && node_tool_on_path("ld.lld")
+        && node_tool_on_path("python3")
+        && node_tool_on_path("make");
+    let sysroot_libcxx = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("target/llvm-musl-sysroot/lib/libc++.a");
+    if !toolchain_ok || !sysroot_libcxx.exists() {
+        println!(
+            "claude-smoke: SKIP (reason: host C++ toolchain or llvm musl sysroot absent — \
+             the JIT node dependency needs clang/clang++/ld.lld/python3/make + \
+             `cargo xtask port build llvm`)"
+        );
+        return;
+    }
+
+    // Resolve the optional credential for the opt-in live arms. The user-facing
+    // M3OS_CLAUDE_TOKEN (subscription OAuth) is preferred over M3OS_CLAUDE_KEY
+    // (API billing). The VALUE is copied into a DEDICATED seed env var consumed by
+    // populate_ext2_files (NOT the bare CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY),
+    // so a user's ambient credential can never bake into a routine image. The value
+    // never crosses the serial console — only the 0600 file path does.
+    let token = std::env::var("M3OS_CLAUDE_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty());
+    let key = std::env::var("M3OS_CLAUDE_KEY")
+        .ok()
+        .filter(|t| !t.trim().is_empty());
+    let attempt_net = std::env::var("M3OS_CLAUDE_NET").is_ok_and(|v| v == "1");
+    // Credential mode: (in-guest env var, 0600 file path). Token wins when both set.
+    let cred: Option<(&'static str, &'static str)> = match (&token, &key) {
+        (Some(_), _) => Some(("CLAUDE_CODE_OAUTH_TOKEN", "/root/.claude/oauth_token")),
+        (None, Some(_)) => Some(("ANTHROPIC_API_KEY", "/root/.claude/api_key")),
+        _ => None,
+    };
+
+    // Runtime variant: by DEFAULT the bundled node is the JITLESS one (Phase 89),
+    // on which `claude --version`/`--help`/`-p` run — CI-viable, no PKU needed.
+    // `M3OS_CLAUDE_JIT=1` bundles the 90a JIT node instead (V8 runtime codegen +
+    // WASM — what the interactive TUI's yoga.wasm needs); that variant REQUIRES PKU
+    // (m3OS sees PKU only under KVM `-cpu host`), so it is KVM-gated like
+    // node-jit-smoke. The Phase 90b W^X-v2 cross-thread PKU read-recovery
+    // (kernel page-fault handler) is what lets cli.js's worker threads read the
+    // guarded V8 code space on BOTH variants.
+    let want_jit = std::env::var("M3OS_CLAUDE_JIT").is_ok_and(|v| v == "1");
+    if want_jit && !kvm {
+        println!(
+            "claude-smoke: SKIP (reason: M3OS_CLAUDE_JIT=1 selects the 90a JIT node for the \
+             interactive TUI, which REQUIRES PKU — and m3OS only sees PKU under M3OS_KVM=1 on a \
+             PKU host. Set M3OS_KVM=1 on a PKU host to run the JIT/TUI variant, or drop \
+             M3OS_CLAUDE_JIT to run the always-on jitless core.)"
+        );
+        return;
+    }
+    // Turn on the opt-in image bundling of the claude-code + node `.m3pkg`s. Seed
+    // the credential (if any) under a dedicated name. SAFETY: xtask is
+    // single-threaded here; the child image-build steps read the env. set_var is
+    // `unsafe` in Rust edition 2024 (cross-thread UB risk).
+    unsafe {
+        if want_jit {
+            std::env::set_var("M3OS_NODE_JIT", "1");
+        }
+        std::env::set_var("M3OS_WITH_CLAUDE", "1");
+        if let Some(tok) = token.as_ref() {
+            std::env::set_var("M3OS_CLAUDE_SMOKE_TOKEN", tok);
+        } else if let Some(k) = key.as_ref() {
+            std::env::set_var("M3OS_CLAUDE_SMOKE_KEY", k);
+        }
+    }
+
+    // Build the node runtime FIRST (claude-code's DEPS=node) — whichever variant
+    // is selected above: the jitless node by default, or the 90a JIT node when
+    // M3OS_CLAUDE_JIT=1 set M3OS_NODE_JIT. Then fetch-and-stage the claude-code
+    // `.m3pkg`. A real build failure here is a FAIL (not a skip) — the toolchain
+    // IS present.
+    if let Err(msg) = port_build::build_node_port() {
+        eprintln!("claude-smoke: precondition failed (node runtime port build): {msg}");
+        std::process::exit(SMOKE_EXIT_CLAUDE_SMOKE_FAILED);
+    }
+    if let Err(msg) = port_build::build_claude_code_port() {
+        eprintln!("claude-smoke: precondition failed (claude-code port build): {msg}");
+        std::process::exit(SMOKE_EXIT_CLAUDE_SMOKE_FAILED);
+    }
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    // Rebuild the data disk so the freshly-bundled `.m3pkg`s (+ the seeded 0600
+    // credential when present) are on it and the package DB starts clean. The
+    // M3OS_CLAUDE_FAST_ITER escape hatch (mirroring M3OS_NODE_FAST_ITER) REUSES an
+    // existing disk that already has claude-code installed, to iterate a kernel /
+    // timeout change without re-paying the slow in-OS install.
+    let fast_iter = std::env::var("M3OS_CLAUDE_FAST_ITER").is_ok();
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if fast_iter && disk_img.exists() {
+        println!("claude-smoke: M3OS_CLAUDE_FAST_ITER — reusing existing disk (skipping install)");
+        // Re-stamp the credential so a key CHANGE between fast-iter runs takes
+        // effect — the reused disk's seeded 0600 cred would otherwise stay stale
+        // (the 2026-06-16 footgun: a reused disk's old Anthropic key 401'd against
+        // OpenRouter despite a fully working network path). Non-fatal: warn and
+        // proceed if the host has no debugfs.
+        if let Some((cred_name, cred_val)) = match (&token, &key) {
+            (Some(t), _) => Some(("oauth_token", t.as_str())),
+            (None, Some(k)) => Some(("api_key", k.as_str())),
+            _ => None,
+        } {
+            match restamp_claude_credential(
+                &disk_img,
+                uefi_image.parent().unwrap(),
+                cred_name,
+                cred_val,
+            ) {
+                Ok(()) => println!(
+                    "claude-smoke: re-stamped /root/.claude/{cred_name} into the reused disk \
+                     (fast-iter credential refresh — the current run's key wins)"
+                ),
+                Err(e) => eprintln!(
+                    "claude-smoke: WARNING — could not re-stamp the credential into the reused \
+                     disk ({e}); the run will use whatever credential the disk already holds. \
+                     Drop M3OS_CLAUDE_FAST_ITER to force a fresh disk with the current key."
+                ),
+            }
+        }
+    } else {
+        if disk_img.exists() {
+            let _ = fs::remove_file(&disk_img);
+        }
+        create_data_disk(
+            uefi_image.parent().unwrap(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false, // graphical_login — autologin / serial path
+        );
+    }
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    // KVM is OPTIONAL (a speed knob for the slow cold cli.js load, mirroring
+    // cmd_node_smoke) — the jitless core needs no PKU, so it runs under plain TCG
+    // in CI. Thread M3OS_KVM into the DeviceSet explicitly when set, since
+    // DeviceSet::default() never reads it.
+    let mut devices = DeviceSet::default();
+    if kvm {
+        devices.kvm = true;
+    }
+    let mut qemu_args = qemu_args_with_devices(&uefi_image, &ovmf, display_mode, devices);
+    // Plain SLIRP user net (outbound TCP works by default) — drop the smoke's
+    // hostfwd; the opt-in API arm needs real egress to api.anthropic.com:443.
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    // Pin the guest to a single core by default — same rationale as the node/gh
+    // gates: the heavy Node load + slow-VFS pipeline are still exercised, but a
+    // single core avoids cross-core SMP futex/IPC races under the heavy load.
+    //
+    // M3OS_CLAUDE_MULTICORE=1 LIFTS the pin (leaving the default qemu_smp_count(),
+    // or M3OS_SMP) so the gate validates the Track A–D SMP TLB-shootdown
+    // survivability fixes against the exact multi-core + KVM + PKU + JIT-claude
+    // workload that produced the original whole-machine panic
+    // (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md). Pair
+    // with M3OS_CLAUDE_JIT=1 + M3OS_KVM=1 to reproduce the real radio.
+    let claude_multicore = std::env::var("M3OS_CLAUDE_MULTICORE").is_ok_and(|v| v == "1");
+    if !claude_multicore {
+        for i in 0..qemu_args.len() {
+            if qemu_args[i] == "-smp" && i + 1 < qemu_args.len() {
+                qemu_args[i + 1] = "1".to_string();
+            }
+        }
+    } else {
+        let cores = qemu_args
+            .iter()
+            .position(|a| a == "-smp")
+            .and_then(|i| qemu_args.get(i + 1))
+            .cloned()
+            .unwrap_or_else(|| "?".to_string());
+        println!(
+            "claude-smoke: M3OS_CLAUDE_MULTICORE=1 — running multi-core (-smp {cores}) to \
+             validate the Track A–D SMP survivability fixes against the original repro"
+        );
+    }
+    // The TLS handshake to api.anthropic.com needs the 86a CSPRNG at READY (Node's
+    // OpenSSL seeds from getrandom, which blocks until the DRBG is READY). Advertise
+    // RDRAND/RDSEED so the in-OS DRBG credits entropy — only when the live arm runs.
+    if attempt_net {
+        for i in 0..qemu_args.len() {
+            if qemu_args[i] == "-cpu"
+                && let Some(cpu) = qemu_args.get_mut(i + 1)
+                && !cpu.contains("rdrand")
+            {
+                cpu.push_str(",+rdrand,+rdseed");
+            }
+        }
+    }
+
+    let do_net = attempt_net && cred.is_some();
+    // M3OS_CLAUDE_BASE_URL — point Claude Code at an Anthropic-protocol endpoint
+    // other than api.anthropic.com (e.g. OpenRouter's https://openrouter.ai/api or a
+    // LiteLLM/claude-code-router proxy). When set, the staged credential is exported
+    // as the bearer ANTHROPIC_AUTH_TOKEN with ANTHROPIC_API_KEY forced empty.
+    let base_url: Option<&'static str> = std::env::var("M3OS_CLAUDE_BASE_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(|s| Box::leak(s.into_boxed_str()) as &'static str);
+    // M3OS_CLAUDE_MODEL — pin both ANTHROPIC_MODEL and ANTHROPIC_SMALL_FAST_MODEL
+    // (e.g. anthropic/claude-3.5-haiku over OpenRouter) so runs are cheap.
+    let model: Option<&'static str> = std::env::var("M3OS_CLAUDE_MODEL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(|s| Box::leak(s.into_boxed_str()) as &'static str);
+    let steps = claude_smoke_steps(do_net, cred, base_url, model, fast_iter);
+
+    if !attempt_net || cred.is_none() {
+        println!(
+            "claude-smoke: NOTE — the authenticated live arms are SKIPPED (set \
+             M3OS_CLAUDE_NET=1 + M3OS_CLAUDE_TOKEN=<setup-token> (subscription) or \
+             M3OS_CLAUDE_KEY=<api-key> to run them; egress to api.anthropic.com:443 + a \
+             secret, never in repo/CI). The always-on core proves claude-code installs \
+             from the M3OS_WITH_CLAUDE bundle (solver pulls node first) and \
+             `claude --version`/`--help`/the vendored rg RUN, plus the A.2 \
+             SIGINT/spawn/raw-mode interactive-substrate probes."
+        );
+    }
+    // The interactive-TUI *visual* render IS gate-automated on the JIT node (see
+    // claude_tui_render_arm below): a QMP/PPM screendump asserts the yoga.wasm TUI
+    // paints. It runs only with M3OS_CLAUDE_JIT=1 (the runtime-WASM variant); on the
+    // jitless default it is skipped (jitless can't instantiate WASM). NOTE the
+    // render arm needs no credential/network — the unauthenticated first-run
+    // onboarding screen renders. (Getting the TUI to render required switching the
+    // node build from small-icu to full-icu: small-icu lacks the ICU break-iterator
+    // data `Intl.Segmenter` uses for grapheme segmentation, so it null-dereffed in
+    // V8's JSSegments::Create. The always-on `SEG_OK` step above guards that fix.)
+    if !want_jit {
+        println!(
+            "claude-smoke: NOTE — the interactive-TUI visual render arm is SKIPPED on the jitless \
+             default (jitless V8 can't instantiate the yoga.wasm TUI's runtime WASM). Set \
+             M3OS_CLAUDE_JIT=1 on a PKU host (M3OS_KVM=1) to run the automated QMP/PPM render proof."
+        );
+    }
+
+    // DIAGNOSTIC (claude -p wedge hunt, 2026-06-16): opt-in HMP monitor socket so
+    // the spinning guest's RIP/CR3 can be dumped host-side (the monitor stays
+    // responsive even when the guest core wedges at 100% CPU). Attach with
+    // `socat - unix:/tmp/claude-mon.sock` then `info registers` while wedged.
+    if std::env::var_os("M3OS_CLAUDE_MONITOR").is_some() {
+        let _ = std::fs::remove_file("/tmp/claude-mon.sock");
+        qemu_args.push("-monitor".to_string());
+        qemu_args.push("unix:/tmp/claude-mon.sock,server,nowait".to_string());
+        println!("claude-smoke: M3OS_CLAUDE_MONITOR — HMP monitor at /tmp/claude-mon.sock");
+    }
+
+    // DIAGNOSTIC (claude -p TLS-handshake hunt, 2026-06-16): opt-in pcap of ALL
+    // guest net traffic (the net0 SLIRP netdev) so a host-side tcpdump can tell
+    // whether the TLS ClientHello is sent and the ServerHello/response comes back
+    // — distinguishing node-not-sending vs server/SLIRP-not-responding vs
+    // kernel-not-delivering-to-node.
+    if std::env::var_os("M3OS_CLAUDE_PCAP").is_some() {
+        let _ = std::fs::remove_file("/tmp/claude-net.pcap");
+        qemu_args.push("-object".to_string());
+        qemu_args.push("filter-dump,id=dump0,netdev=net0,file=/tmp/claude-net.pcap".to_string());
+        println!("claude-smoke: M3OS_CLAUDE_PCAP — guest net capture at /tmp/claude-net.pcap");
+    }
+
+    println!(
+        "claude-smoke: launching QEMU (timeout {}s, {} steps; net={do_net})",
+        args.timeout_secs,
+        steps.len(),
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!(
+                "claude-smoke: serial core PASSED ({} steps in {elapsed}s)",
+                steps.len()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("claude-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_CLAUDE_SMOKE_FAILED);
+        }
+    }
+
+    // D.2 — the interactive-TUI *visual* render proof (the 90a milestone). Only on
+    // the JIT node (the yoga.wasm TUI needs runtime WASM). The serial harness is
+    // BLIND to framebuffer/TUI rendering, so this is the only falsifiable proof the
+    // TUI actually paints. It is a SEPARATE graphical QEMU boot (VNC+QMP+`-vga std`)
+    // against the SAME disk the serial core just installed claude-code into — driven
+    // like `htop-render-probe`: launch `claude` (unauthenticated → the first-run
+    // onboarding screen, no secret + no network) in the graphical `term` via QMP
+    // keystrokes, screendump a burst, and assert the TUI painted a populated screen.
+    // (Now that the full-icu node fixes the `Intl.Segmenter` crash, the TUI renders.)
+    // `want_jit && !kvm` already returned early, so reaching here with want_jit
+    // guarantees KVM/PKU.
+    if want_jit {
+        match claude_tui_render_arm(
+            &uefi_image,
+            &ovmf,
+            args.timeout_secs,
+            do_net,
+            base_url,
+            cred,
+            model,
+        ) {
+            Ok(rows) => {
+                println!(
+                    "claude-smoke: PASSED — interactive TUI rendered on the JIT node \
+                     ({rows} changed band scanlines vs the prompt baseline)"
+                );
+            }
+            Err(msg) => {
+                eprintln!("claude-smoke: FAILED (TUI render arm)\n{msg}");
+                std::process::exit(SMOKE_EXIT_CLAUDE_SMOKE_FAILED);
+            }
+        }
+    }
+}
+
+/// Phase 90b D.2 — the interactive-TUI *visual* render proof for `claude-smoke`.
+///
+/// The serial harness cannot see framebuffer/TUI output, so this is the only
+/// falsifiable proof that Claude Code's `yoga.wasm` terminal UI actually paints on
+/// m3OS. It is a SEPARATE graphical QEMU boot against the SAME `uefi_image` + data
+/// disk the serial core just installed claude-code (+ the 90a JIT node) into,
+/// reusing the QMP + VNC + `-vga std` + screendump plumbing of `htop-render-probe`.
+/// The graphical `term` (display_server → term → PTY → sh0) is driven via QMP
+/// keystrokes: launch `claude` UNAUTHENTICATED (the first-run onboarding screen
+/// renders with no credential + no network), capture a screendump burst over a
+/// generous cold-load window, and return the peak changed-band scanline count vs
+/// the empty-prompt baseline. A populated TUI changes hundreds of band scanlines; a
+/// black/blank screen ~none. Callers gate this on `want_jit && kvm` (PKU required).
+fn claude_tui_render_arm(
+    uefi_image: &Path,
+    ovmf: &Path,
+    timeout_secs: u64,
+    do_net: bool,
+    base_url: Option<&'static str>,
+    cred: Option<(&'static str, &'static str)>,
+    model: Option<&'static str>,
+) -> Result<u32, String> {
+    // When the live arms are configured (M3OS_CLAUDE_NET=1 + a custom base URL +
+    // a seeded credential), drive a REAL prompt round-trip THROUGH the interactive
+    // TUI (not just the empty onboarding render): export the OpenRouter env, launch
+    // `claude`, wait for the TUI to paint, then type a `<<<NUMBER>>>` prompt + Enter
+    // and assert the conversation area repaints with the model's reply. The
+    // credential reaches the guest via `$(cat <0600 path>)` command substitution, so
+    // it never appears in the typed keystrokes OR the captured framebuffer. The
+    // matching OpenRouter request log (a NEW authenticated 200) is the external
+    // ground-truth confirmation, mirroring the serial `-p` arm.
+    let do_roundtrip = do_net && base_url.is_some() && cred.is_some();
+    // Minimum changed scanlines in the TUI band (vs the empty-prompt baseline) that
+    // prove the yoga.wasm TUI painted a populated screen. A first-run screen
+    // (welcome/onboarding box + text) changes hundreds; a blank/black screen ~0. 20
+    // cleanly separates "drew a TUI" from "nothing" — the `htop-render-probe` value.
+    const MIN_CHANGED_BAND_SCANLINES: u32 = 20;
+
+    let out_dir = {
+        let mut p = std::env::temp_dir();
+        p.push("m3os-claude-tui-render");
+        p
+    };
+    std::fs::create_dir_all(&out_dir)
+        .map_err(|e| format!("create TUI-render out dir {}: {e}", out_dir.display()))?;
+    println!(
+        "claude-smoke: TUI-render arm capturing into {}",
+        out_dir.display()
+    );
+
+    let qmp_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&qmp_socket);
+    let vnc_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&vnc_socket);
+    let mut devices = DeviceSet::default();
+    devices.kvm = true;
+    let mut qemu_args =
+        qemu_args_with_devices(uefi_image, ovmf, QemuDisplayMode::Headless, devices);
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    // The TUI render arm normally pins single-core. M3OS_CLAUDE_MULTICORE=1 lifts
+    // it so the arm reproduces interactive `claude` on multiple cores (the user's
+    // exact run-gui scenario) — used to root-cause the 4-core node hang
+    // (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md follow-up).
+    let tui_multicore = std::env::var("M3OS_CLAUDE_MULTICORE").is_ok_and(|v| v == "1");
+    for i in 0..qemu_args.len() {
+        if qemu_args[i] == "-smp" && i + 1 < qemu_args.len() && !tui_multicore {
+            qemu_args[i + 1] = "1".to_string();
+        }
+    }
+    let mut idx = 0;
+    while idx + 1 < qemu_args.len() {
+        if qemu_args[idx] == "-display" && qemu_args[idx + 1] == "none" {
+            qemu_args[idx + 1] = format!("vnc=unix:{}", vnc_socket.display());
+            break;
+        }
+        idx += 1;
+    }
+    qemu_args.push("-qmp".to_string());
+    qemu_args.push(format!("unix:{},server,nowait", qmp_socket.display()));
+    qemu_args.push("-vga".to_string());
+    qemu_args.push("std".to_string());
+
+    println!(
+        "claude-smoke: TUI-render arm launching graphical QEMU (qmp {})",
+        qmp_socket.display()
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("launch graphical QEMU: {e}"))?;
+    let stdout = child.stdout.take().ok_or("no stdout pipe")?;
+    let rx = spawn_serial_reader(stdout);
+    let mut serial_history = String::new();
+    let mut serial_buf = String::new();
+    let global_start = std::time::Instant::now();
+    let global_timeout = std::time::Duration::from_secs(timeout_secs);
+
+    let result: Result<u32, String> = (|| {
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "display_server: registered as 'display.input-owner'",
+            std::time::Duration::from_secs(timeout_secs.min(300)),
+            global_start,
+            global_timeout,
+        )?;
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "TERM_SMOKE:prompt-ready",
+            std::time::Duration::from_secs(timeout_secs.min(300)),
+            global_start,
+            global_timeout,
+        )?;
+        println!("claude-smoke: TUI-render arm — graphical term/sh0 prompt ready");
+
+        let qmp_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut q = qmp::QmpClient::connect(&qmp_socket, qmp_deadline)
+            .map_err(|e| format!("qmp connect: {e}"))?;
+        println!("claude-smoke: TUI-render arm — QMP handshake complete");
+
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        capture_frame(&mut q, &out_dir, "00-prompt")?;
+        let baseline = ppm::read_ppm(&out_dir.join("00-prompt.ppm"))?;
+
+        // When the OpenRouter round-trip is configured, export the env into the
+        // graphical term FIRST (same vars as the serial `-p` arm) so the launched
+        // TUI is authenticated. `$(cat <path>)` command substitution keeps the token
+        // off the typed keystrokes AND the captured framebuffer; the now-mapped
+        // `$ ( )` qcodes + the slower `type_text` cadence let it type the line
+        // without the shift-stuck garbling that an earlier 5 ms cadence produced.
+        // Onboarding state is pre-seeded in /root/.claude.json, so an authenticated
+        // `claude` goes straight to the input.
+        if do_roundtrip {
+            let url = base_url.unwrap();
+            let (_env_var, cred_path) = cred.unwrap();
+            let mut export_src = format!(
+                "export ANTHROPIC_BASE_URL=\"{url}\"\n\
+                 export ANTHROPIC_API_KEY=\"\"\n\
+                 export ANTHROPIC_AUTH_TOKEN=\"$(cat {cred_path})\"\n"
+            );
+            if let Some(m) = model {
+                export_src.push_str(&format!(
+                    "export ANTHROPIC_MODEL=\"{m}\"\n\
+                     export ANTHROPIC_SMALL_FAST_MODEL=\"{m}\"\n"
+                ));
+            }
+            q.type_text(&export_src)
+                .map_err(|e| format!("type OpenRouter env export: {e}"))?;
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            println!("claude-smoke: TUI-render arm — exported OpenRouter env into the term");
+        }
+
+        // Launch the interactive TUI in the graphical term. Bare `claude` (no args)
+        // is the interactive entry point; unauthenticated it lands on the first-run
+        // onboarding screen (a fully-rendered yoga.wasm TUI needing neither a secret
+        // nor network); authenticated (round-trip arm) it lands on the input prompt.
+        q.type_text("claude\n")
+            .map_err(|e| format!("type claude launch: {e}"))?;
+
+        // FALSIFIABLE launch proof (round-trip arm): claude actually exec'ing `node`
+        // emits an `elf: … binary=/usr/bin/node` kernel line. A garbled launch (the
+        // earlier shift-stuck keystroke bug typed `CLAUDE`/junk → ion error, no exec)
+        // produces NO such line, so this wait TIMES OUT and the arm fails honestly
+        // instead of a screendump-diff false-passing on rendered error text. Nothing
+        // else execs node in this graphical boot, so the marker is unambiguous.
+        if do_roundtrip {
+            wait_for_serial_pattern(
+                &rx,
+                &mut serial_buf,
+                &mut serial_history,
+                "binary=/usr/bin/node",
+                std::time::Duration::from_secs(timeout_secs.min(300)),
+                global_start,
+                global_timeout,
+            )
+            .map_err(|e| {
+                format!(
+                    "claude did not launch in the TUI — the typed env export or `claude` \
+                     command was not accepted as a clean command line (keystroke-injection \
+                     garble): {e}"
+                )
+            })?;
+            println!("claude-smoke: TUI-render arm — claude launched (node exec'd) in the TUI");
+        }
+
+        // Cold cli.js parse + V8 init + yoga.wasm instantiate + first TUI paint over
+        // the slow VFS — tens of seconds to a couple of minutes even under KVM. A
+        // fresh graphical boot has a cold block cache, so sample a long burst and
+        // keep the frame that changed MOST from the empty-prompt baseline.
+        let burst_ms: &[u32] = &[15000, 30000, 45000, 60000, 90000, 120000, 180000];
+        let event_start = std::time::Instant::now();
+        let mut best_rows = 0u32;
+        let mut best_render_path = out_dir.join("00-prompt.ppm");
+        for off in burst_ms {
+            let target = event_start + std::time::Duration::from_millis(*off as u64);
+            let now = std::time::Instant::now();
+            if target > now {
+                std::thread::sleep(target - now);
+            }
+            if global_start.elapsed() >= global_timeout {
+                break;
+            }
+            let tag = format!("claude-tui-{off:06}ms");
+            capture_frame(&mut q, &out_dir, &tag)?;
+            let frame_path = out_dir.join(format!("{tag}.ppm"));
+            let frame = ppm::read_ppm(&frame_path)?;
+            let rows = changed_rows_in_band(&baseline, &frame, 0.10, 0.95);
+            println!(
+                "claude-smoke: TUI-render {tag} {}x{} -> {rows} changed band scanlines",
+                frame.width, frame.height
+            );
+            if rows >= best_rows {
+                best_rows = rows;
+                best_render_path = frame_path;
+            }
+            if best_rows >= MIN_CHANGED_BAND_SCANLINES * 4 {
+                break;
+            }
+        }
+
+        // OpenRouter round-trip THROUGH the TUI: once the TUI has painted, type a
+        // (shift-chord-free, so keystroke-robust) prompt whose answer is 579 and
+        // submit it (Enter). The FALSIFIABLE proof the round-trip actually left the
+        // box is a NEW `[tcp] connection established` kernel line — claude opening the
+        // HTTPS socket to OpenRouter. The screendump (saved) shows the rendered answer
+        // for visual confirmation, and the matching OpenRouter request log is the
+        // external ground-truth — but the serial markers above + here are what make
+        // this arm fail-honest rather than diff-fooled.
+        if do_roundtrip && best_rows >= MIN_CHANGED_BAND_SCANLINES {
+            // Reference = the rendered, input-ready TUI (peak welcome-render frame).
+            let reference = ppm::read_ppm(&best_render_path)?;
+            // Drain + clear the serial scan buffer so the post-prompt
+            // `[tcp] connection established` wait only matches a NEW connection (the
+            // request), not any earlier line already in the buffer.
+            while let Ok(chunk) = rx.try_recv() {
+                append_serial_chunk(&mut serial_buf, &mut serial_history, &chunk);
+            }
+            serial_buf.clear();
+            // 17*34 + 1 = 579 — the same answer the serial `-p` arm checks. All
+            // lowercase letters + digits + spaces: NO shift-chords, so the prompt
+            // types into claude's raw-mode input without any stuck-shift risk. Type
+            // the text WITHOUT a trailing newline: a `\n` tacked onto the rapid type
+            // stream lands in claude's composer as a literal newline (observed: the
+            // prompt sat unsubmitted in the input box). Submit with a SEPARATE,
+            // settled Enter keypress after the input has rendered.
+            q.type_text("what is 17 times 34 plus 1")
+                .map_err(|e| format!("type TUI prompt: {e}"))?;
+            std::thread::sleep(std::time::Duration::from_millis(2000));
+            q.press_key("ret", 60)
+                .map_err(|e| format!("submit TUI prompt (enter): {e}"))?;
+            // Insurance Enter: if the first inserted a composer newline, this submits;
+            // if the first already submitted, this is a no-op (empty-input Enter is
+            // ignored by claude's TUI). Either way the prompt gets sent exactly once.
+            std::thread::sleep(std::time::Duration::from_millis(1200));
+            let _ = q.press_key("ret", 60);
+            println!(
+                "claude-smoke: TUI-render arm — submitted OpenRouter prompt (expect answer 579)"
+            );
+
+            // Best-effort: note when claude opens a connection after the submit.
+            // NOT a hard gate — claude also connects during startup (so a connection
+            // alone does not prove THIS prompt round-tripped), and a keep-alive reuse
+            // would emit no new line. The ground truth is the rendered answer in the
+            // saved screenshot + the matching OpenRouter request log.
+            if wait_for_serial_pattern(
+                &rx,
+                &mut serial_buf,
+                &mut serial_history,
+                "tcp] connection established",
+                std::time::Duration::from_secs(timeout_secs.min(120)),
+                global_start,
+                global_timeout,
+            )
+            .is_ok()
+            {
+                println!(
+                    "claude-smoke: TUI-render arm — observed a TCP connection after the submit"
+                );
+            }
+
+            let reply_ms: &[u32] = &[8000, 16000, 24000, 36000, 50000, 70000, 95000];
+            let reply_start = std::time::Instant::now();
+            let mut best_reply_rows = 0u32;
+            let mut best_reply_path = out_dir.join("00-prompt.ppm");
+            for off in reply_ms {
+                let target = reply_start + std::time::Duration::from_millis(*off as u64);
+                let now = std::time::Instant::now();
+                if target > now {
+                    std::thread::sleep(target - now);
+                }
+                if global_start.elapsed() >= global_timeout {
+                    break;
+                }
+                let tag = format!("claude-tui-reply-{off:06}ms");
+                capture_frame(&mut q, &out_dir, &tag)?;
+                let frame_path = out_dir.join(format!("{tag}.ppm"));
+                let frame = ppm::read_ppm(&frame_path)?;
+                let rows = changed_rows_in_band(&reference, &frame, 0.10, 0.95);
+                println!(
+                    "claude-smoke: TUI-reply {tag} -> {rows} changed band scanlines vs the input screen"
+                );
+                if rows >= best_reply_rows {
+                    best_reply_rows = rows;
+                    best_reply_path = frame_path;
+                }
+            }
+            // NOTE: the scanline delta is only a "the screen repainted" proxy — it
+            // CANNOT distinguish a rendered answer from the prompt text merely
+            // appearing in the input box. The authoritative confirmations are the
+            // saved screenshot (the rendered `579`) and the OpenRouter request log.
+            println!(
+                "claude-smoke: TUI OpenRouter round-trip DRIVEN — claude launched + the prompt \
+                 was submitted (peak post-submit repaint {best_reply_rows} band scanlines). \
+                 GROUND TRUTH: visually confirm the 579 answer in {} and the matching OpenRouter \
+                 request log (the scanline delta alone does NOT prove the answer rendered).",
+                best_reply_path.display()
+            );
+        }
+
+        let _ = q.press_chord(&["ctrl", "c"], 20);
+        let _ = q.press_chord(&["ctrl", "c"], 20);
+        Ok(best_rows)
+    })();
+
+    while let Ok(chunk) = rx.try_recv() {
+        append_serial_chunk(&mut serial_buf, &mut serial_history, &chunk);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&qmp_socket);
+    let _ = std::fs::remove_file(&vnc_socket);
+    let _ = std::fs::write(out_dir.join("serial.log"), &serial_history);
+
+    match result {
+        Ok(rows) if rows >= MIN_CHANGED_BAND_SCANLINES => Ok(rows),
+        Ok(rows) => Err(format!(
+            "the interactive TUI changed only {rows} band scanlines vs the prompt baseline \
+             (< {MIN_CHANGED_BAND_SCANLINES}) — the yoga.wasm TUI did not render a populated \
+             screen. Frames + serial log in {}",
+            out_dir.display()
+        )),
+        Err(msg) => Err(msg),
+    }
+}
+
+/// Serial script for `claude-smoke`. The always-on core installs claude-code
+/// (asserting the solver installs `node` first — the dependency-first proof),
+/// asserts `claude --version`/`--help` + the vendored static-pie `rg`, and runs
+/// the A.2 interactive-substrate probes. When `do_net` is set the opt-in
+/// authenticated arms (API round-trip + real-FS workflow + 0600 hygiene) are
+/// appended. `cred` is `(in-guest env var, 0600 file path)` for the seeded
+/// credential. Dynamic strings are leaked to `'static` — the process runs once.
+fn claude_smoke_steps(
+    do_net: bool,
+    cred: Option<(&'static str, &'static str)>,
+    base_url: Option<&'static str>,
+    model: Option<&'static str>,
+    fast_iter: bool,
+) -> Vec<SmokeStep> {
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/claude-smoke: kernel first message",
+    }];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    // 1. Install claude-code from the bundled offline repo. The solver resolves
+    //    DEPS=node and installs node FIRST (dependency-first) — asserted by the
+    //    node line preceding the claude-code line. Skipped under FAST_ITER.
+    if !fast_iter {
+        steps.push(SmokeStep::Send {
+            input: "pkg install claude-code\n",
+            label: "claude-smoke: pkg install claude-code",
+        });
+        // node installs first (DEPS=node) — the ~120 MB JIT node `.m3pkg` is
+        // SHA-verified + written file-by-file over the slow VFS, so a generous
+        // ceiling. This Wait is the dependency-first proof.
+        steps.push(SmokeStep::Wait {
+            pattern: "pkg install: node: OK",
+            timeout_secs: 3600,
+            label: "claude-smoke: solver installed node FIRST (DEPS=node, dependency-first)",
+        });
+        steps.push(SmokeStep::WaitPassOrFail {
+            pass_pattern: "pkg install: claude-code: OK",
+            fail_prefixes: &["pkg install: cannot"],
+            timeout_secs: 1200,
+            label: "claude-smoke: claude-code installed from .m3pkg",
+            exit_code_on_fail: SMOKE_EXIT_CLAUDE_SMOKE_FAILED,
+        });
+    }
+
+    // 2. Version banner. The launcher imports cli.js (13.7 MB) in-process on the
+    //    jitless node (~56 MB) — both cold-fault from the slow VFS as V8
+    //    initialises, so this FIRST exec needs a cold-load ceiling (KVM makes it
+    //    minutes, not the TCG worst case). Proves the launcher → `#!/usr/bin/env
+    //    node` → import(cli.js) chain end-to-end.
+    steps.push(SmokeStep::Send {
+        input: "claude --version\n",
+        label: "claude-smoke: claude --version",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "2.1.112",
+        timeout_secs: 1800,
+        label: "claude-smoke: claude 2.1.112 runs on the jitless node (version, cold load)",
+    });
+
+    // 3. --help (subsequent execs hit the block cache, so far faster).
+    steps.push(SmokeStep::Send {
+        input: "claude --help\n",
+        label: "claude-smoke: claude --help",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Usage: claude",
+        timeout_secs: 600,
+        label: "claude-smoke: claude --help renders the CLI (Usage: claude)",
+    });
+
+    // 4. The vendored static-pie ripgrep (Claude Code's search tool) runs directly
+    //    — the on-OS proof that m3OS's ELF loader handles ET_DYN static-PIE (B.2).
+    steps.push(SmokeStep::Send {
+        input: "/usr/lib/claude-code/vendor/ripgrep/x64-linux/rg --version\n",
+        label: "claude-smoke: vendored ripgrep --version",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "ripgrep",
+        timeout_secs: 300,
+        label: "claude-smoke: vendored static-pie rg runs on m3OS (ripgrep banner)",
+    });
+
+    // 5. A.2 interactive-substrate probes — the three primitives an interactive CLI
+    //    agent lives on (closes the deferred Phase 89 A.2 item). Inline `node -e`,
+    //    no network. Sentinels concat-built so the Wait keys on real output.
+    //    SIGINT: register a handler, keep the loop alive with a timer, self-signal —
+    //    proves libuv's self-pipe signal path (pipe2 + rt_sigaction) end-to-end.
+    steps.push(SmokeStep::Send {
+        input: "node -e \"process.on('SIGINT',()=>{console.log('NODE_SIGINT'+'_OK');process.exit(0)});setTimeout(()=>{console.log('NODE_SIGINT_TIMEOUT');process.exit(1)},3000);process.kill(process.pid,'SIGINT')\"\n",
+        label: "claude-smoke: SIGINT self-pipe probe",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "NODE_SIGINT_OK",
+        timeout_secs: 120,
+        label: "claude-smoke: process.on('SIGINT') handler fires (NODE_SIGINT_OK)",
+    });
+    // SPAWN: child_process spawn + stdout capture — the libuv fork/exec + pipe path
+    // Claude Code's shell tool uses.
+    steps.push(SmokeStep::Send {
+        input: "node -e \"const r=require('child_process').spawnSync('/bin/sh',['-c','echo spawned']);if(r.status===0&&/spawned/.test(String(r.stdout)))console.log('NODE_SPAWN'+'_OK');else console.log('NODE_SPAWN_ERR',r.status)\"\n",
+        label: "claude-smoke: child_process spawn probe",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "NODE_SPAWN_OK",
+        timeout_secs: 120,
+        label: "claude-smoke: child_process spawn captures stdout (NODE_SPAWN_OK)",
+    });
+    // RAWMODE: termios ICANON/ECHO toggling over the PTY stack. Defensive — prints
+    // OK whether or not stdin is a TTY (the serial shell should present one), and
+    // never throws.
+    steps.push(SmokeStep::Send {
+        input: "node -e \"const t=process.stdin.isTTY;try{if(t){process.stdin.setRawMode(true);process.stdin.setRawMode(false)}console.log('NODE_RAWMODE'+'_OK isTTY='+(!!t))}catch(e){console.log('NODE_RAWMODE_ERR',e.message)}\"\n",
+        label: "claude-smoke: setRawMode probe",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "NODE_RAWMODE_OK",
+        timeout_secs: 120,
+        label: "claude-smoke: setRawMode toggling does not throw (NODE_RAWMODE_OK)",
+    });
+
+    // Intl.Segmenter regression guard (always-on). Claude Code's interactive TUI
+    // calls `Intl.Segmenter.prototype.segment()` for Unicode grapheme segmentation
+    // (terminal string width / wrapping). With `--with-intl=small-icu` (the Phase 89
+    // default) the ICU break-iterator data is absent, so V8's `JSSegments::Create`
+    // null-derefs and the TUI is unusable — Phase 90b switched the node build to
+    // `--with-intl=full-icu` to fix it. This step asserts grapheme segmentation
+    // works (`SEG_OK 4` for the 4-grapheme string `a`+`é`+`b`+`😀`), so a regression
+    // back to small-icu fails the gate here instead of silently breaking the TUI.
+    steps.push(SmokeStep::Send {
+        input: "node -e \"const seg=new Intl.Segmenter('en',{granularity:'grapheme'});const n=[...seg.segment('a\\u00e9b\\ud83d\\ude00')].length;console.log('SEG'+'_OK '+n)\"\n",
+        label: "claude-smoke: Intl.Segmenter grapheme probe (full-icu guard)",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "SEG_OK 4",
+        fail_prefixes: &["[int] userspace page fault", "SEG_OK 1", "RangeError"],
+        timeout_secs: 120,
+        label: "claude-smoke: Intl.Segmenter.segment() works (full-icu; small-icu would null-deref)",
+        exit_code_on_fail: SMOKE_EXIT_CLAUDE_SMOKE_FAILED,
+    });
+
+    // DIAGNOSTIC (M3OS_CLAUDE_HANG_PROBE=1, pair with M3OS_CLAUDE_MULTICORE=1 +
+    // M3OS_CLAUDE_JIT=1): reproduce the 4-core interactive-claude hang
+    // (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md follow-up).
+    // Launch the interactive TUI (isTTY=true over the serial pty, so claude enters
+    // its yoga.wasm render path) and let it run; on 4 cores it is expected to HANG
+    // mid-render. The following Wait then times out and the harness flushes the
+    // captured serial — which by then carries the kernel stuck-task watchdog verdict
+    // (the BSP `watchdog_scan` dispatch dump for a stale-ready task, or a
+    // `stuck-since=…ms (no waker registered)` line), naming WHY it hangs.
+    if std::env::var("M3OS_CLAUDE_HANG_PROBE").is_ok_and(|v| v == "1") {
+        steps.push(SmokeStep::Send {
+            input: "claude\n",
+            label: "claude-smoke[HANG-PROBE]: launch interactive claude TUI",
+        });
+        steps.push(SmokeStep::Wait {
+            pattern: "CLAUDE_HANG_SENTINEL_NEVER",
+            timeout_secs: 90,
+            label: "claude-smoke[HANG-PROBE]: (expected timeout) capture stuck-task watchdog dump",
+        });
+        return steps;
+    }
+
+    // 6. Opt-in authenticated live arms (M3OS_CLAUDE_NET=1 + a seeded credential).
+    if do_net && let Some((env_var, cred_path)) = cred {
+        // Export the credential from the seeded 0600 file — the VALUE never crosses
+        // serial, only `$(cat <path>)` does. With M3OS_CLAUDE_BASE_URL set
+        // (OpenRouter / any Anthropic-protocol proxy) the staged key is the bearer
+        // ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY is forced empty (proxies reject a
+        // stray x-api-key), and ANTHROPIC_BASE_URL points at the endpoint — mirroring
+        // a sourced `openrouter.sh`. Otherwise it's the official-API single export.
+        let mut export_src = if let Some(url) = base_url {
+            format!(
+                "export ANTHROPIC_BASE_URL=\"{url}\"\n\
+                 export ANTHROPIC_API_KEY=\"\"\n\
+                 export ANTHROPIC_AUTH_TOKEN=\"$(cat {cred_path})\"\n"
+            )
+        } else {
+            format!("export {env_var}=\"$(cat {cred_path})\"\n")
+        };
+        // Pin the model (M3OS_CLAUDE_MODEL) — set BOTH the main model and the
+        // small/fast background model so every request is cheap (e.g. a Haiku
+        // slug like anthropic/claude-3.5-haiku over OpenRouter). Non-secret.
+        if let Some(m) = model {
+            export_src.push_str(&format!(
+                "export ANTHROPIC_MODEL=\"{m}\"\n\
+                 export ANTHROPIC_SMALL_FAST_MODEL=\"{m}\"\n"
+            ));
+        }
+        let export_cmd: &'static str = Box::leak(export_src.into_boxed_str());
+        steps.push(SmokeStep::Send {
+            input: export_cmd,
+            label: "claude-smoke: export credential (+ base URL if set) from 0600 file",
+        });
+        // API round-trip. Against a custom endpoint (OpenRouter) we BACKGROUND the
+        // request with combined stdout+stderr to a file, sleep, then `cat` it — so a
+        // HANG (claude never exits) is recoverable and we SEE claude's actual output
+        // (error / partial / "579" / empty = stuck before any output). The arithmetic
+        // answer 579 is absent from the prompt, so the Wait can't false-match the
+        // echo; on timeout the harness dumps the most-recent serial, which is now the
+        // cat'd output (not the stale export echo). The official-API path keeps the
+        // established direct CLAUDE_API_OK form.
+        if base_url.is_some() {
+            // First confirm the OpenRouter env actually applied in ion (echo's
+            // OUTPUT carries the expanded URL; the command echo shows the literal
+            // "$ANTHROPIC_BASE_URL", so the Wait can't false-match). Then run the
+            // round-trip: with MAX_FDS raised (no more EMFILE), claude should now
+            // complete — "579" = the model answered (fix works); a timeout or a
+            // fail-prefix dumps the serial showing why.
+            steps.push(SmokeStep::Send {
+                input: "echo OPENROUTER_ENV_OK=$ANTHROPIC_BASE_URL\n",
+                label: "claude-smoke: verify ANTHROPIC_BASE_URL applied in ion",
+            });
+            steps.push(SmokeStep::Wait {
+                // The command echo carries the literal "$ANTHROPIC_BASE_URL"; only
+                // the expanded OUTPUT carries the URL, so this can't false-match.
+                pattern: "OPENROUTER_ENV_OK=https://openrouter",
+                timeout_secs: 20,
+                label: "claude-smoke: ANTHROPIC_BASE_URL is set (ion applied the export)",
+            });
+            // Run from a SMALL empty cwd, not the login shell's `/`: Claude Code's
+            // startup spawns `rg` to index the working directory, and rg walking
+            // the whole root FS over the ~200 KB/s ring-3 VFS takes many minutes
+            // (a cwd artifact, not a kernel bug — see the handoff). A tiny project
+            // dir keeps the index walk instant so the round-trip measures the
+            // actual request, not the FS crawl.
+            steps.push(SmokeStep::Send {
+                input: "mkdir -p /tmp/cw\n",
+                label: "claude-smoke: create small project cwd",
+            });
+            steps.push(SmokeStep::Send {
+                input: "cd /tmp/cw\n",
+                label: "claude-smoke: cd into small project cwd (avoid rg walking /)",
+            });
+            // The answer is wrapped in a UNIQUE delimiter token — `<<<579>>>` —
+            // NOT the bare number. The bare `579` is a 3-digit substring that
+            // false-matches kernel log numbers (e.g. a watchdog `stuck-since=
+            // 32579ms` timestamp), which previously made a HUNG run "pass"
+            // without any request ever reaching the API. `<<<579>>>` appears only
+            // in claude's actual answer: the command echo contains the literal
+            // `<<<NUMBER>>>` (not `<<<579>>>`), and no kernel log emits it. So a
+            // match proves claude genuinely computed + returned the answer over
+            // the live API.
+            steps.push(SmokeStep::Send {
+                input: "claude -p 'What is 123 plus 456? Reply with ONLY the answer wrapped in triple angle brackets, exactly like <<<NUMBER>>>, and nothing else.'\n",
+                label: "claude-smoke: claude -p round-trip over OpenRouter (futex-key fix)",
+            });
+            steps.push(SmokeStep::WaitPassOrFail {
+                pass_pattern: "<<<579>>>",
+                fail_prefixes: &[
+                    "EMFILE",
+                    "API Error",
+                    "fetch failed",
+                    "ENOTFOUND",
+                    "ECONNREFUSED",
+                    "authentication",
+                    "Invalid API key",
+                ],
+                // 600 s, not 240 s: even in a small cwd the round-trip pays a
+                // cold node-subprocess start + TLS handshake + model latency over
+                // the slow VFS. Give it room to COMPLETE rather than truncating a
+                // slow-but-progressing run.
+                timeout_secs: 600,
+                label: "claude-smoke: OpenRouter round-trip answered <<<579>>> (live API verified)",
+                exit_code_on_fail: SMOKE_EXIT_CLAUDE_SMOKE_FAILED,
+            });
+            return steps;
+        }
+        steps.push(SmokeStep::Send {
+            input: "claude -p 'Reply with exactly CLAUDE_API_OK and nothing else'\n",
+            label: "claude-smoke: authenticated claude -p API round-trip",
+        });
+        steps.push(SmokeStep::WaitPassOrFail {
+            pass_pattern: "CLAUDE_API_OK",
+            fail_prefixes: &["Invalid API key", "Authentication", "fetch failed", "API Error"],
+            timeout_secs: 300,
+            label: "claude-smoke: authenticated API round-trip to api.anthropic.com (CLAUDE_API_OK)",
+            exit_code_on_fail: SMOKE_EXIT_CLAUDE_SMOKE_FAILED,
+        });
+        // Real-filesystem agent workflow: the agent's file tool writes a known file;
+        // the assertion trusts the FILESYSTEM (`cat`), never the model's own claim.
+        steps.push(SmokeStep::Send {
+            input: "claude -p 'Use the Write tool to create the file /root/claude-work.txt containing exactly the text WORKFLOW_FILE_OK and nothing else' --allowedTools Write\n",
+            label: "claude-smoke: agent file-write workflow",
+        });
+        steps.push(SmokeStep::Sleep { millis: 1000 });
+        steps.push(SmokeStep::Send {
+            input: "cat /root/claude-work.txt\n",
+            label: "claude-smoke: verify the agent-written file via cat",
+        });
+        steps.push(SmokeStep::WaitPassOrFail {
+            pass_pattern: "WORKFLOW_FILE_OK",
+            fail_prefixes: &["cat: "],
+            timeout_secs: 60,
+            label: "claude-smoke: agent's Write tool touched the real FS (WORKFLOW_FILE_OK)",
+            exit_code_on_fail: SMOKE_EXIT_CLAUDE_SMOKE_FAILED,
+        });
+        // Credential-file hygiene: the seeded credential is mode 0600 (the same
+        // assertion gh-smoke makes on hosts.yml).
+        let ls_cmd: &'static str = Box::leak(format!("ls -l {cred_path}\n").into_boxed_str());
+        steps.push(SmokeStep::Send {
+            input: ls_cmd,
+            label: "claude-smoke: credential file permission check",
+        });
+        steps.push(SmokeStep::Wait {
+            pattern: "-rw-------",
+            timeout_secs: 60,
+            label: "claude-smoke: credential file is -rw------- (0600 secret hygiene)",
+        });
+    }
 
     steps
 }
@@ -20089,6 +21818,80 @@ fn populate_ext2_files(
         _ => String::new(),
     };
 
+    // Phase 90b — optional Claude Code credential + onboarding state for the
+    // `claude-smoke` opt-in live arms. When `M3OS_CLAUDE_SMOKE_TOKEN=<oauth-token>`
+    // (subscription) or `M3OS_CLAUDE_SMOKE_KEY=<api-key>` (API billing) is set —
+    // cmd_claude_smoke copies the user-facing M3OS_CLAUDE_TOKEN/M3OS_CLAUDE_KEY into
+    // these DEDICATED names (NOT the bare CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY),
+    // so a user's ambient credentials can never bake into a routine image — seed it
+    // at mode 0600 under `/root/.claude/` so the guest can
+    // `export CLAUDE_CODE_OAUTH_TOKEN="$(cat …)"` (or ANTHROPIC_API_KEY) without the
+    // value ever crossing the serial console, plus a pre-completed
+    // `/root/.claude.json` onboarding/trust state so a headless `claude -p` skips the
+    // first-run prompt. Absent both env vars this is empty, so routine images carry
+    // no credential (zero common-path change), mirroring the gh seeding above.
+    let claude_cred_cmds = {
+        let token = std::env::var("M3OS_CLAUDE_SMOKE_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty());
+        let key = std::env::var("M3OS_CLAUDE_SMOKE_KEY")
+            .ok()
+            .filter(|t| !t.is_empty());
+        if token.is_none() && key.is_none() {
+            String::new()
+        } else {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Mint each temp secret fresh at 0600 (O_CREAT|O_EXCL) so it is never
+            // observable at the default 0644 and cannot follow a planted symlink.
+            let write_secret = |name: &str, content: &str| -> PathBuf {
+                let p = output_dir.join(name);
+                let _ = fs::remove_file(&p);
+                let mut f = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&p)
+                    .expect("create temp claude secret at 0600");
+                f.write_all(content.as_bytes())
+                    .expect("write temp claude secret");
+                p
+            };
+            // The credential file (subscription OAuth token preferred over API key).
+            // It holds the raw secret at mode 0600 — the file the gate's hygiene step
+            // asserts is `-rw-------`. The guest exports the matching env var from it.
+            let (cred_name, cred_val) = match (&token, &key) {
+                (Some(t), _) => ("oauth_token", t.clone()),
+                (None, Some(k)) => ("api_key", k.clone()),
+                _ => unreachable!(),
+            };
+            let cred_tmp = write_secret("_tmp_claude_cred", &format!("{cred_val}\n"));
+            // Pre-completed onboarding/trust state so a headless `claude -p` does not
+            // stop at the first-run prompt. 0600 (it is credential-adjacent state).
+            let onboarding_tmp = write_secret(
+                "_tmp_claude_json",
+                "{\"hasCompletedOnboarding\":true,\"bypassPermissionsModeAccepted\":true,\
+                 \"hasAcknowledgedCostThreshold\":true,\"theme\":\"dark\"}\n",
+            );
+            // 0x41C0 = 0o40700 (dir rwx------); 0x8180 = 0o100600 (file rw-------).
+            format!(
+                "mkdir root/.claude\n\
+                 sif root/.claude mode 0x41C0\n\
+                 sif root/.claude uid 0\n\
+                 sif root/.claude gid 0\n\
+                 write \"{}\" root/.claude/{cred_name}\n\
+                 sif root/.claude/{cred_name} mode 0x8180\n\
+                 sif root/.claude/{cred_name} uid 0\n\
+                 sif root/.claude/{cred_name} gid 0\n\
+                 write \"{}\" root/.claude.json\n\
+                 sif root/.claude.json mode 0x8180\n\
+                 sif root/.claude.json uid 0\n\
+                 sif root/.claude.json gid 0\n",
+                cred_tmp.display(),
+                onboarding_tmp.display()
+            )
+        }
+    };
+
     fs::write(
         &smoke_mode_tmp,
         if smoke_test_mode { b"1\n" } else { b"0\n" },
@@ -20489,6 +22292,7 @@ fn populate_ext2_files(
          sif root/.ssh/known_hosts gid 0\n\
          {ssh_identity_cmds}\
          {gh_token_cmds}\
+         {claude_cred_cmds}\
          write \"{empty}\" root/.local/share/ion/history\n\
          write \"{empty}\" home/user/.local/share/ion/history\n\
          sif bin mode 0x41ED\n\
@@ -20831,13 +22635,17 @@ fn populate_ext2_files(
     let debugfs_output = debugfs.wait_with_output().expect("debugfs wait");
     // SECRET SCRUB — runs on BOTH the success and the failure (`exit(1)`) paths.
     // debugfs has already read these host temp files (or failed trying), so the
-    // credential-bearing temps (the gh PAT + hosts.yml, and the dropbear private
-    // key) must be removed before the early `exit(1)` below — otherwise a debugfs
-    // failure would leave a live secret on disk in the build output dir. (Phase
-    // 86e hardening; closes the inherited dropbear-class gap for the live PAT.)
+    // credential-bearing temps (the gh PAT + hosts.yml, the dropbear private key,
+    // and the Claude OAuth token / API key + onboarding state) must be removed
+    // before the early `exit(1)` below — otherwise a debugfs failure would leave a
+    // live secret on disk in the build output dir. (Phase 86e hardening; closes the
+    // inherited dropbear-class gap for the live PAT; Phase 90b extends it to the
+    // Claude credential.)
     let _ = fs::remove_file(output_dir.join("_tmp_gh_token"));
     let _ = fs::remove_file(output_dir.join("_tmp_gh_hosts_yml"));
     let _ = fs::remove_file(output_dir.join("_tmp_id_dropbear"));
+    let _ = fs::remove_file(output_dir.join("_tmp_claude_cred"));
+    let _ = fs::remove_file(output_dir.join("_tmp_claude_json"));
     if !debugfs_output.status.success() {
         let stderr = String::from_utf8_lossy(&debugfs_output.stderr);
         eprintln!(
@@ -20856,8 +22664,9 @@ fn populate_ext2_files(
     let _ = fs::remove_file(&etc_hosts_tmp);
     let _ = fs::remove_file(&gitconfig_tmp);
     let _ = fs::remove_file(&known_hosts_tmp);
-    // (_tmp_id_dropbear, _tmp_gh_token, _tmp_gh_hosts_yml are scrubbed earlier —
-    // immediately after debugfs — so they never survive a debugfs-failure exit.)
+    // (_tmp_id_dropbear, _tmp_gh_token, _tmp_gh_hosts_yml, _tmp_claude_cred, and
+    // _tmp_claude_json are scrubbed earlier — immediately after debugfs — so they
+    // never survive a debugfs-failure exit.)
     let _ = fs::remove_file(&fibonacci_py_tmp);
     let _ = fs::remove_file(&hello_c_tmp);
     let _ = fs::remove_file(&hello_cpp_tmp);
@@ -21678,6 +23487,77 @@ fn populate_phase_69d_ports(part_path: &Path, workspace_root: &Path) {
                  run `cargo xtask port build node` first (or the node-smoke gate)"
             ),
             Err(e) => eprintln!("phase-89: node artifact path error: {e}"),
+        }
+    }
+
+    // Phase 90b — Claude Code (the hosted CLI agent). The claude-code `.m3pkg`
+    // plus its `DEPS=node` runtime together exceed ~130 MB, so — exactly like
+    // clang/gh/node — they are gated OUT of default images and bundled into
+    // `/usr/pkg/` only when the `M3OS_WITH_CLAUDE` feature is set. This block
+    // bundles BOTH the node runtime `.m3pkg`/`.meta` (so the offline solver can
+    // resolve `DEPS=node` in-guest — the **90a JIT variant** when `M3OS_NODE_JIT`
+    // is set during the build, which the yoga.wasm TUI requires) AND the
+    // claude-code `.m3pkg`/`.meta`. The node bundle is skipped here when
+    // `M3OS_WITH_NODE` is ALSO set (its own block already bundled node) to avoid a
+    // duplicate write. Absent the artifacts this is a no-op with an actionable
+    // message (mirroring the node/clang/gh blocks), so default images carry
+    // nothing.
+    if std::env::var("M3OS_WITH_CLAUDE").is_ok() {
+        // node first (DEPS=node) — unless the M3OS_WITH_NODE block already did it.
+        // `pkgcache_artifact_path("node")` resolves the JIT-or-jitless node key
+        // per `M3OS_NODE_JIT` in the current image-build env.
+        if std::env::var("M3OS_WITH_NODE").is_err() {
+            match port_build::pkgcache_artifact_path("node") {
+                Ok(artifact) if artifact.is_file() => match fs::read(&artifact) {
+                    Ok(bytes) if pkg_format::verify(&bytes) => {
+                        m3pkg_files.push(("usr/pkg/node.m3pkg".to_string(), artifact.clone()));
+                        let version = port_build::port_version("node").unwrap_or_default();
+                        let deps = port_build::port_deps("node").join(" ");
+                        let meta_host = preinstall_root.join("node.meta");
+                        let _ = fs::create_dir_all(&preinstall_root);
+                        if fs::write(&meta_host, format!("VERSION={version}\nDEPS={deps}\n"))
+                            .is_ok()
+                        {
+                            m3pkg_files.push(("usr/pkg/node.meta".to_string(), meta_host));
+                        }
+                        println!(
+                            "ports: bundled node.m3pkg (for M3OS_WITH_CLAUDE DEPS=node) into /usr/pkg"
+                        );
+                    }
+                    Ok(_) => eprintln!("phase-90b: node.m3pkg failed verify — skipping bundle"),
+                    Err(e) => eprintln!("phase-90b: read {} failed: {e}", artifact.display()),
+                },
+                Ok(_) => eprintln!(
+                    "phase-90b: M3OS_WITH_CLAUDE set but the node .m3pkg is not built — \
+                     run the claude-smoke gate (or `cargo xtask port build node`) first"
+                ),
+                Err(e) => eprintln!("phase-90b: node artifact path error: {e}"),
+            }
+        }
+        // claude-code itself.
+        match port_build::pkgcache_artifact_path("claude-code") {
+            Ok(artifact) if artifact.is_file() => match fs::read(&artifact) {
+                Ok(bytes) if pkg_format::verify(&bytes) => {
+                    m3pkg_files.push(("usr/pkg/claude-code.m3pkg".to_string(), artifact.clone()));
+                    let version = port_build::port_version("claude-code").unwrap_or_default();
+                    let deps = port_build::port_deps("claude-code").join(" ");
+                    let meta_host = preinstall_root.join("claude-code.meta");
+                    let _ = fs::create_dir_all(&preinstall_root);
+                    if fs::write(&meta_host, format!("VERSION={version}\nDEPS={deps}\n")).is_ok() {
+                        m3pkg_files.push(("usr/pkg/claude-code.meta".to_string(), meta_host));
+                    }
+                    println!(
+                        "ports: bundled claude-code.m3pkg (opt-in M3OS_WITH_CLAUDE) into /usr/pkg"
+                    );
+                }
+                Ok(_) => eprintln!("phase-90b: claude-code.m3pkg failed verify — skipping bundle"),
+                Err(e) => eprintln!("phase-90b: read {} failed: {e}", artifact.display()),
+            },
+            Ok(_) => eprintln!(
+                "phase-90b: M3OS_WITH_CLAUDE set but the claude-code .m3pkg is not built — \
+                 run `cargo xtask port build claude-code` first (or the claude-smoke gate)"
+            ),
+            Err(e) => eprintln!("phase-90b: claude-code artifact path error: {e}"),
         }
     }
 

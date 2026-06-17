@@ -52,3 +52,8 @@ doom1.wad
 # (typically several MB; produced into target/ but sometimes copied
 # into the repo root for ad-hoc analysis).
 *.wav
+
+# Session-local Claude Code / OpenRouter handoff artifacts.
+# openrouter.sh holds the user's OpenRouter API key — MUST never be committed.
+openrouter.sh
+claude.png
