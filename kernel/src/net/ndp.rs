@@ -9,7 +9,7 @@ use crate::task::scheduler::IrqSafeMutex;
 
 use kernel_core::net::ndp as ndp_core;
 use kernel_core::net::{ethernet as eth_core, icmpv6 as icmpv6_core, ipv6 as ipv6_core};
-use kernel_core::types::{Ipv6Addr, MacAddr, slaac_address, solicited_node_multicast};
+use kernel_core::types::{Ipv6Addr, MacAddr, solicited_node_multicast};
 
 use super::ethernet;
 
@@ -228,36 +228,42 @@ pub fn handle_router_advertisement(src_ip: &Ipv6Addr, src_mac: MacAddr, icmpv6_m
     // Learn the router's link-local -> MAC so we can route through it.
     learn(*src_ip, src_mac);
 
-    // The RA source is the default gateway, unless router_lifetime == 0.
-    let gateway = if ra.router_lifetime > 0 {
-        Some(*src_ip)
-    } else {
-        None
+    // Decide the config actions in host-testable pure logic (kernel-core).
+    let our_mac = super::mac_address().unwrap_or([0; 6]);
+    let current_gw = super::config::gateway_ip_v6();
+    let cfg = ndp_core::ra_to_config(&ra, *src_ip, our_mac, current_gw);
+
+    // Resolve the gateway lifecycle (RFC 4861 §6.3.4: a zero-lifetime RA from
+    // the *current* default router withdraws the route; from any other source
+    // it leaves our gateway intact).
+    let gateway = match cfg.gateway {
+        ndp_core::GatewayAction::Install(gw) => Some(gw),
+        ndp_core::GatewayAction::Clear => {
+            super::config::clear_gateway_v6();
+            None
+        }
+        ndp_core::GatewayAction::Leave => current_gw,
     };
 
-    if let Some(pi) = ra.prefix
-        && pi.on_link
-    {
-        let our_mac = super::mac_address().unwrap_or([0; 6]);
-        if pi.autonomous && !ra.managed {
-            // SLAAC: form a global address from the prefix + our EUI-64.
-            let global = slaac_address(&pi.prefix, our_mac);
-            super::config::set_config_v6(global, pi.prefix, pi.prefix_length, gateway);
+    if let Some((prefix, prefix_len)) = cfg.prefix {
+        if let Some(global) = cfg.slaac_global {
+            // SLAAC: a global address formed from the prefix + our EUI-64.
+            super::config::set_config_v6(global, prefix, prefix_len, gateway);
             log::info!(
                 "[ndp] SLAAC global {:x}:{:x}::/{} gw={}",
                 u16::from_be_bytes([global[0], global[1]]),
                 u16::from_be_bytes([global[2], global[3]]),
-                pi.prefix_length,
+                prefix_len,
                 gateway.is_some(),
             );
         } else {
             // M flag set (managed) — DHCPv6 supplies the address; keep the route.
-            super::config::set_route_v6(pi.prefix, pi.prefix_length, gateway);
+            super::config::set_route_v6(prefix, prefix_len, gateway);
         }
     }
 
     // RDNSS (RFC 8106): record any advertised DNS servers.
-    for dns in ra.rdnss {
+    for dns in cfg.dns {
         super::config::add_dns_server(super::config::DnsServer::V6(dns));
     }
 }

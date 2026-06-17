@@ -252,6 +252,76 @@ pub fn parse_router_advertisement(icmpv6_msg: &[u8]) -> Option<RouterAdvertiseme
     })
 }
 
+/// The default-gateway action an inbound Router Advertisement implies for the
+/// host's *current* default router, per RFC 4861 §6.3.4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayAction {
+    /// `router_lifetime > 0`: install the RA source as the default gateway.
+    Install(Ipv6Addr),
+    /// `router_lifetime == 0` from the *current* default router: withdraw it.
+    Clear,
+    /// `router_lifetime == 0` from any other source: leave the gateway as-is
+    /// (a deprecated/unrelated router must not evict the real one).
+    Leave,
+}
+
+/// The host configuration an inbound RA implies. Factored out of the kernel so
+/// the RA→config decision (gateway lifecycle, SLAAC-vs-managed address, RDNSS)
+/// is host-testable without a live router — QEMU's libslirp sends no RAs, so
+/// this decision path is otherwise un-exercised in CI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaConfig {
+    /// What to do with the default gateway.
+    pub gateway: GatewayAction,
+    /// On-link prefix + length, if the RA carried an on-link Prefix Info.
+    pub prefix: Option<(Ipv6Addr, u8)>,
+    /// SLAAC global address, formed when the prefix is autonomous and the RA is
+    /// not managed (M=0). `None` when M=1 — DHCPv6 supplies the address.
+    pub slaac_global: Option<Ipv6Addr>,
+    /// RDNSS (RFC 8106) recursive DNS servers to record.
+    pub dns: Vec<Ipv6Addr>,
+}
+
+/// Decide the host configuration actions for an inbound RA. `src` is the RA's
+/// IPv6 source (the candidate default gateway), `our_mac` forms the SLAAC
+/// interface identifier, and `current_gateway` is the host's installed default
+/// gateway (for the RFC 4861 §6.3.4 zero-lifetime withdrawal).
+pub fn ra_to_config(
+    ra: &RouterAdvertisement,
+    src: Ipv6Addr,
+    our_mac: MacAddr,
+    current_gateway: Option<Ipv6Addr>,
+) -> RaConfig {
+    let gateway = if ra.router_lifetime > 0 {
+        GatewayAction::Install(src)
+    } else if current_gateway == Some(src) {
+        GatewayAction::Clear
+    } else {
+        GatewayAction::Leave
+    };
+
+    let mut prefix = None;
+    let mut slaac_global = None;
+    if let Some(pi) = ra.prefix.as_ref()
+        && pi.on_link
+    {
+        prefix = Some((pi.prefix, pi.prefix_length));
+        // SLAAC forms an address only when the prefix is autonomous (A flag)
+        // and the network is not managed (M=0). Under M=1, DHCPv6 owns the
+        // address and SLAAC stands down (but the route still installs).
+        if pi.autonomous && !ra.managed {
+            slaac_global = Some(crate::types::slaac_address(&pi.prefix, our_mac));
+        }
+    }
+
+    RaConfig {
+        gateway,
+        prefix,
+        slaac_global,
+        dns: ra.rdnss.clone(),
+    }
+}
+
 /// Encode an 8-byte link-layer-address option (`type, len=1, mac[0..6]`).
 fn lladdr_option(opt_type: u8, mac: MacAddr) -> [u8; 8] {
     [opt_type, 1, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]]
@@ -435,6 +505,68 @@ mod tests {
         let msg = build_sample_ra(true, 1800);
         let ra = parse_router_advertisement(&msg).unwrap();
         assert!(ra.managed);
+    }
+
+    #[test]
+    fn ra_to_config_slaac_when_unmanaged() {
+        // M=0 + autonomous prefix → SLAAC forms the global address, the RA
+        // source installs as the gateway, and RDNSS is surfaced.
+        let msg = build_sample_ra(false, 1800);
+        let ra = parse_router_advertisement(&msg).unwrap();
+        let cfg = ra_to_config(&ra, LINK_LOCAL, MAC, None);
+        assert_eq!(cfg.gateway, GatewayAction::Install(LINK_LOCAL));
+        assert_eq!(cfg.prefix, Some((FEC0_PREFIX, 64)));
+        assert_eq!(
+            cfg.slaac_global,
+            Some(crate::types::slaac_address(&FEC0_PREFIX, MAC))
+        );
+        assert_eq!(cfg.dns, [FEC0_3]);
+    }
+
+    #[test]
+    fn ra_to_config_managed_is_route_only_no_slaac() {
+        // M=1 → DHCPv6 owns the address; SLAAC stands down but the route + DNS
+        // still install (B.3: the M flag steers the address-config decision).
+        let msg = build_sample_ra(true, 1800);
+        let ra = parse_router_advertisement(&msg).unwrap();
+        let cfg = ra_to_config(&ra, LINK_LOCAL, MAC, None);
+        assert_eq!(cfg.gateway, GatewayAction::Install(LINK_LOCAL));
+        assert_eq!(cfg.prefix, Some((FEC0_PREFIX, 64)));
+        assert_eq!(cfg.slaac_global, None);
+    }
+
+    #[test]
+    fn ra_to_config_zero_lifetime_installs_no_gateway() {
+        // router_lifetime==0 with no current gateway → no default route, but
+        // SLAAC still forms from the autonomous prefix.
+        let msg = build_sample_ra(false, 0);
+        let ra = parse_router_advertisement(&msg).unwrap();
+        let cfg = ra_to_config(&ra, LINK_LOCAL, MAC, None);
+        assert_eq!(cfg.gateway, GatewayAction::Leave);
+        assert_eq!(
+            cfg.slaac_global,
+            Some(crate::types::slaac_address(&FEC0_PREFIX, MAC))
+        );
+    }
+
+    #[test]
+    fn ra_to_config_zero_lifetime_clears_current_gateway() {
+        // RFC 4861 §6.3.4: a zero-lifetime RA from the *current* default router
+        // withdraws the route.
+        let msg = build_sample_ra(false, 0);
+        let ra = parse_router_advertisement(&msg).unwrap();
+        let cfg = ra_to_config(&ra, LINK_LOCAL, MAC, Some(LINK_LOCAL));
+        assert_eq!(cfg.gateway, GatewayAction::Clear);
+    }
+
+    #[test]
+    fn ra_to_config_zero_lifetime_other_source_leaves_gateway() {
+        // A zero-lifetime RA from a DIFFERENT source must not evict our router.
+        let msg = build_sample_ra(false, 0);
+        let ra = parse_router_advertisement(&msg).unwrap();
+        let other = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x99];
+        let cfg = ra_to_config(&ra, other, MAC, Some(LINK_LOCAL));
+        assert_eq!(cfg.gateway, GatewayAction::Leave);
     }
 
     #[test]

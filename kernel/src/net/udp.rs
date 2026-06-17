@@ -171,7 +171,8 @@ pub fn recv_v6(port: u16) -> Option<UdpV6Datagram> {
 
 /// Build a UDP datagram with a correct IPv6 pseudo-header checksum (mandatory
 /// over IPv6, unlike IPv4 where it is optional). A computed checksum of 0 is
-/// transmitted as `0xffff` per RFC 768.
+/// transmitted as `0xffff` per RFC 768. Pure logic lives in (and is host-tested
+/// by) `kernel_core::net::udp::build_v6`.
 pub fn build_v6(
     src: Ipv6Addr,
     dst: Ipv6Addr,
@@ -179,14 +180,7 @@ pub fn build_v6(
     dst_port: u16,
     data: &[u8],
 ) -> Vec<u8> {
-    use kernel_core::net::ipv6;
-    let mut pkt = build(src_port, dst_port, data);
-    let mut ck = ipv6::pseudo_header_checksum(src, dst, ipv6::PROTO_UDP, &pkt);
-    if ck == 0 {
-        ck = 0xffff;
-    }
-    pkt[6..8].copy_from_slice(&ck.to_be_bytes());
-    pkt
+    kernel_core::net::udp::build_v6(src, dst, src_port, dst_port, data)
 }
 
 /// Send a UDP datagram over IPv6 from an explicit source address.

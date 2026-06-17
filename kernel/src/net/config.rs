@@ -8,7 +8,12 @@
 //! Phase 91 adds dual-stack IPv6 state: a link-local address derived from the
 //! NIC MAC at init, plus a SLAAC/DHCPv6-learned global address, prefix, and
 //! default gateway (all runtime-mutable, written once per RA/lease), and a
-//! runtime DNS-server list (IPv4 + IPv6) the resolver path consults.
+//! runtime DNS-server list (IPv4 + IPv6) populated by DHCPv4 / DHCPv6 / the RA
+//! RDNSS option. NOTE: name resolution today is performed by the userspace
+//! musl resolver against the statically staged `/etc/resolv.conf`; plumbing
+//! this kernel `dns_servers()` store into that resolver path (so a learned
+//! v6 nameserver is actually queried) is a tracked follow-up — see the Phase 91
+//! task doc D.1 (`config::dns_servers` is currently write-only).
 
 use super::arp::Ipv4Addr;
 use crate::task::scheduler::IrqSafeMutex;
@@ -128,6 +133,13 @@ pub fn set_config_v6(
     }
 }
 
+/// Withdraw the IPv6 default gateway (RFC 4861 §6.3.4: a zero-router-lifetime RA
+/// from the *current* default router removes the default route). The on-link
+/// prefix is left intact.
+pub fn clear_gateway_v6() {
+    V6.lock().gateway = None;
+}
+
 /// Record only the on-link prefix + default gateway from an RA (used when the M
 /// flag requests DHCPv6 for the address but the route still comes from the RA).
 pub fn set_route_v6(prefix: Ipv6Addr, prefix_len: u8, gateway: Option<Ipv6Addr>) {
@@ -148,25 +160,11 @@ pub fn is_local_v6(addr: &Ipv6Addr) -> bool {
     }
     let s = V6.lock();
     match (s.prefix, s.prefix_len) {
-        (Some(prefix), len) if len > 0 => prefix_matches(&prefix, addr, len),
+        (Some(prefix), len) if len > 0 => {
+            kernel_core::types::ipv6_prefix_matches(&prefix, addr, len)
+        }
         _ => false,
     }
-}
-
-/// Compare the first `len` bits of two addresses.
-fn prefix_matches(a: &Ipv6Addr, b: &Ipv6Addr, len: u8) -> bool {
-    let full_bytes = (len / 8) as usize;
-    if a[..full_bytes] != b[..full_bytes] {
-        return false;
-    }
-    let rem = len % 8;
-    if rem != 0 {
-        let mask = 0xffu8 << (8 - rem);
-        if (a[full_bytes] & mask) != (b[full_bytes] & mask) {
-            return false;
-        }
-    }
-    true
 }
 
 /// Add/replace a learned DNS server (DHCPv4/DHCPv6/RDNSS). v6 servers are added

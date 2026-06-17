@@ -103,6 +103,25 @@ pub fn slaac_address(prefix: &Ipv6Addr, mac: MacAddr) -> Ipv6Addr {
     out
 }
 
+/// `true` if the first `len` bits of `a` and `b` are equal — the on-link test
+/// for an IPv6 prefix of arbitrary (not necessarily byte-aligned) length. A
+/// `len` of 0 matches everything; `len >= 128` compares the full address.
+pub fn ipv6_prefix_matches(a: &Ipv6Addr, b: &Ipv6Addr, len: u8) -> bool {
+    let len = len.min(128) as usize;
+    let full_bytes = len / 8;
+    if a[..full_bytes] != b[..full_bytes] {
+        return false;
+    }
+    let rem = (len % 8) as u8;
+    if rem != 0 {
+        let mask = 0xffu8 << (8 - rem);
+        if (a[full_bytes] & mask) != (b[full_bytes] & mask) {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod ipv6_tests {
     use super::*;
@@ -161,6 +180,39 @@ mod ipv6_tests {
                 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0x50, 0x54, 0x00, 0xff, 0xfe, 0x12, 0x34, 0x56
             ]
         );
+    }
+
+    #[test]
+    fn prefix_matches_on_link_and_off_link() {
+        // 2001:db8::/64 — same /64 is on-link, a differing /64 is off-link.
+        let a: Ipv6Addr = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let same64: Ipv6Addr = [
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0xaa, 0xbb, 0, 0, 0, 0, 0, 2,
+        ];
+        let diff64: Ipv6Addr = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2];
+        assert!(ipv6_prefix_matches(&a, &same64, 64));
+        assert!(!ipv6_prefix_matches(&a, &diff64, 64));
+        // /0 matches anything; the full /128 only matches itself.
+        assert!(ipv6_prefix_matches(&a, &diff64, 0));
+        assert!(ipv6_prefix_matches(&a, &a, 128));
+        assert!(!ipv6_prefix_matches(&a, &same64, 128));
+    }
+
+    #[test]
+    fn prefix_matches_non_byte_aligned() {
+        // A /60 boundary splits byte 7 (4 prefix bits + 4 host bits): equal in
+        // the high nibble matches, differing in it does not.
+        let a: Ipv6Addr = [
+            0x20, 0x01, 0x0d, 0xb8, 0xab, 0xcd, 0xef, 0x10, 0, 0, 0, 0, 0, 0, 0, 1,
+        ];
+        let hi_eq: Ipv6Addr = [
+            0x20, 0x01, 0x0d, 0xb8, 0xab, 0xcd, 0xef, 0x1f, 0, 0, 0, 0, 0, 0, 0, 2,
+        ];
+        let hi_ne: Ipv6Addr = [
+            0x20, 0x01, 0x0d, 0xb8, 0xab, 0xcd, 0xef, 0x20, 0, 0, 0, 0, 0, 0, 0, 2,
+        ];
+        assert!(ipv6_prefix_matches(&a, &hi_eq, 60));
+        assert!(!ipv6_prefix_matches(&a, &hi_ne, 60));
     }
 
     #[test]
