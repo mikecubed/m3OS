@@ -1388,6 +1388,8 @@ pub const NEG_EEXIST: isize = -17;
 
 pub const AF_UNIX: u64 = 1;
 pub const AF_INET: u64 = 2;
+/// IPv6 address family (Phase 91).
+pub const AF_INET6: u64 = 10;
 pub const SOCK_STREAM: u64 = 1;
 pub const SOCK_DGRAM: u64 = 2;
 pub const SOCK_CLOEXEC: u64 = 0x80000;
@@ -1395,6 +1397,8 @@ pub const SOCK_CLOEXEC: u64 = 0x80000;
 pub const IPPROTO_TCP: u64 = 6;
 pub const IPPROTO_UDP: u64 = 17;
 pub const IPPROTO_ICMP: u64 = 1;
+/// ICMPv6 protocol number (Phase 91).
+pub const IPPROTO_ICMPV6: u64 = 58;
 
 // Socket options
 pub const SOL_SOCKET: u64 = 1;
@@ -1512,6 +1516,44 @@ impl SockaddrIn {
     /// Return the IP address as a 4-byte array in host order.
     pub fn ip(&self) -> [u8; 4] {
         self.sin_addr.to_ne_bytes()
+    }
+}
+
+/// `struct sockaddr_in6` (Phase 91) — 28 bytes, matching musl + the kernel-side
+/// `kernel_core::net::SockaddrIn6`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SockaddrIn6 {
+    pub sin6_family: u16,
+    /// Port in **network byte order** (big-endian).
+    pub sin6_port: u16,
+    pub sin6_flowinfo: u32,
+    /// IPv6 address octets in network order.
+    pub sin6_addr: [u8; 16],
+    pub sin6_scope_id: u32,
+}
+
+impl SockaddrIn6 {
+    /// Create a `SockaddrIn6` for the given address (network-order octets) and
+    /// host-order port.
+    pub fn new(addr: [u8; 16], port: u16) -> Self {
+        Self {
+            sin6_family: AF_INET6 as u16,
+            sin6_port: port.to_be(),
+            sin6_flowinfo: 0,
+            sin6_addr: addr,
+            sin6_scope_id: 0,
+        }
+    }
+
+    /// Return the port in host byte order.
+    pub fn port(&self) -> u16 {
+        u16::from_be(self.sin6_port)
+    }
+
+    /// Return the 16 address octets.
+    pub fn addr(&self) -> [u8; 16] {
+        self.sin6_addr
     }
 }
 
@@ -2364,6 +2406,65 @@ pub fn recvfrom(fd: i32, buf: &mut [u8], flags: i32, addr: &mut SockaddrIn) -> i
             buf.len() as u64,
             flags as u64,
             addr as *mut SockaddrIn as u64,
+            &mut len as *mut u32 as u64,
+        ) as isize
+    }
+}
+
+// ===========================================================================
+// Phase 91 — AF_INET6 socket wrappers (sockaddr_in6, 28 bytes)
+// ===========================================================================
+
+/// Bind an AF_INET6 socket to a `sockaddr_in6`.
+pub fn bind6(fd: i32, addr: &SockaddrIn6) -> isize {
+    unsafe {
+        syscall3(
+            SYS_BIND,
+            fd as u64,
+            addr as *const SockaddrIn6 as u64,
+            core::mem::size_of::<SockaddrIn6>() as u64,
+        ) as isize
+    }
+}
+
+/// Connect an AF_INET6 socket to a `sockaddr_in6` peer.
+pub fn connect6(fd: i32, addr: &SockaddrIn6) -> isize {
+    unsafe {
+        syscall3(
+            SYS_CONNECT,
+            fd as u64,
+            addr as *const SockaddrIn6 as u64,
+            core::mem::size_of::<SockaddrIn6>() as u64,
+        ) as isize
+    }
+}
+
+/// Send data to a `sockaddr_in6` destination.
+pub fn sendto6(fd: i32, buf: &[u8], flags: i32, addr: &SockaddrIn6) -> isize {
+    unsafe {
+        syscall6(
+            SYS_SENDTO,
+            fd as u64,
+            buf.as_ptr() as u64,
+            buf.len() as u64,
+            flags as u64,
+            addr as *const SockaddrIn6 as u64,
+            core::mem::size_of::<SockaddrIn6>() as u64,
+        ) as isize
+    }
+}
+
+/// Receive data and an AF_INET6 sender address.
+pub fn recvfrom6(fd: i32, buf: &mut [u8], flags: i32, addr: &mut SockaddrIn6) -> isize {
+    let mut len: u32 = core::mem::size_of::<SockaddrIn6>() as u32;
+    unsafe {
+        syscall6(
+            SYS_RECVFROM,
+            fd as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            flags as u64,
+            addr as *mut SockaddrIn6 as u64,
             &mut len as *mut u32 as u64,
         ) as isize
     }

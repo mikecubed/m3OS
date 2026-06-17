@@ -16,6 +16,10 @@ members = [
     "userspace/shell",
     # Phase 23 userspace ping
     "userspace/ping",
+    # Phase 91 userspace ping6
+    "userspace/ping6",
+    # Phase 91 ipv6-smoke gate binary
+    "userspace/ipv6-smoke",
     # Phase 54 validation probe
     "userspace/udp-smoke",
     "userspace/smoke-runner",

@@ -331,6 +331,14 @@ const SMOKE_EXIT_KSTACK_OVERFLOW_FAILED: i32 = 86;
 /// docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md.
 const SMOKE_EXIT_SMP_SMOKE_FAILED: i32 = 87;
 
+/// Phase 91 — `cargo xtask ipv6-smoke` exit code. Boots m3OS with QEMU SLIRP
+/// `ipv6=on` and runs the `ipv6-smoke` ramdisk binary, which exercises the
+/// always-on, CI-deterministic dual-stack substrate from ring 3 (AF_INET6 socket
+/// creation, `bind6`, and a `ping6 ::1` loopback round-trip) and ends with
+/// `SMOKE:ipv6-smoke:PASS`. The gate additionally asserts the kernel formed its
+/// link-local address. Fails on any `:FAIL`/`IPV6_SMOKE:panic`.
+const SMOKE_EXIT_IPV6_SMOKE_FAILED: i32 = 88;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
     Headless,
@@ -1246,6 +1254,15 @@ fn main() {
             });
             cmd_pku_smoke(&smoke_args);
         }
+        Some("ipv6-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("ipv6-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_ipv6_smoke(&smoke_args);
+        }
         // Track D (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md)
         // — `kstack-overflow-smoke`: builds a kernel with the
         // `kstack-overflow-test` feature, boots m3OS, runs the
@@ -1387,6 +1404,8 @@ fn build_userspace_bins() {
         ("fork-test", "fork-test", false),
         ("echo-args", "echo-args", false),
         ("ping", "ping", false),
+        ("ping6", "ping6", false),
+        ("ipv6-smoke", "ipv6-smoke", false),
         ("udp-smoke", "udp-smoke", false),
         ("smoke-runner", "smoke-runner", false),
         // Phase 64b: init depends on kernel-core for the
@@ -5672,6 +5691,8 @@ fn cmd_check() {
         "init",
         "shell",
         "ping",
+        "ping6",
+        "ipv6-smoke",
         "edit",
         "login",
         "su",
@@ -12798,6 +12819,143 @@ fn cmd_pku_smoke(args: &SmokeBootArgs) {
             let _ = child.kill();
             let _ = child.wait();
             eprintln!("pku-smoke: FAILED\n{msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 91 — ipv6-smoke: dual-stack IPv6 acceptance gate
+// ---------------------------------------------------------------------------
+
+/// Smoke steps for `cargo xtask ipv6-smoke`. Boots m3OS, asserts the kernel
+/// formed its link-local address (deterministic — needs only the NIC MAC), logs
+/// into sh0, runs the `ipv6-smoke` binary, and asserts `SMOKE:ipv6-smoke:PASS`.
+/// `live` adds best-effort assertions on the SLAAC + stateless-DHCPv6-DNS kernel
+/// log lines produced against the SLIRP `ipv6=on` router (the live wire arms).
+fn ipv6_smoke_steps(live: bool) -> Vec<SmokeStep> {
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/ipv6-smoke: kernel first message",
+    }];
+    // The kernel forms its fe80:: link-local from the NIC MAC on the first
+    // net_task pass (no network needed) — a deterministic IPV6_ADDR_OK proof.
+    steps.push(SmokeStep::Wait {
+        pattern: "[ipv6] link-local configured",
+        timeout_secs: 30,
+        label: "guest/ipv6-smoke: link-local address formed (IPV6_ADDR_OK)",
+    });
+    // The live wire arms (SLAAC global from the SLIRP RA, stateless DHCPv6 DNS).
+    // Best-effort: asserted only with M3OS_IPV6_LIVE=1, since SLIRP RA timing is
+    // less deterministic than the always-on ring-3 arms.
+    if live {
+        steps.push(SmokeStep::Wait {
+            pattern: "[ndp] SLAAC global",
+            timeout_secs: 30,
+            label: "guest/ipv6-smoke: SLAAC global address from SLIRP RA (SLAAC_ADDR_OK)",
+        });
+        steps.push(SmokeStep::Wait {
+            pattern: "[dhcpv6] bound",
+            timeout_secs: 30,
+            label: "guest/ipv6-smoke: stateless DHCPv6 DNS (DHCPV6_DNS_OK)",
+        });
+    }
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "ipv6-smoke\n",
+        label: "guest/ipv6-smoke: run ipv6-smoke binary",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "SMOKE:ipv6-smoke:PASS",
+        fail_prefixes: &[":FAIL", "IPV6_SMOKE:panic"],
+        timeout_secs: 60,
+        label: "guest/ipv6-smoke: socket + bind6 + ping6 ::1 loopback",
+        exit_code_on_fail: SMOKE_EXIT_IPV6_SMOKE_FAILED,
+    });
+    steps
+}
+
+fn cmd_ipv6_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false, // graphical_login — serial autologin path
+    );
+
+    let ovmf = find_ovmf();
+    let kvm = std::env::var_os("M3OS_KVM").is_some_and(|v| v != "0" && !v.is_empty());
+    let live = std::env::var_os("M3OS_IPV6_LIVE").is_some_and(|v| v != "0" && !v.is_empty());
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args = qemu_args_with_devices(
+        &uefi_image,
+        &ovmf,
+        display_mode,
+        DeviceSet {
+            kvm,
+            ..DeviceSet::default()
+        },
+    );
+    // Enable IPv6 on the SLIRP user netdev (default fec0::/64 prefix, host
+    // fec0::2, DNS fec0::3 — sends RAs for SLAAC + answers stateless DHCPv6) and
+    // drop the host-forward rules (the gate needs no inbound host networking).
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") || arg.as_str() == "user,id=net0" {
+            *arg = "user,id=net0,ipv6=on".to_string();
+        }
+    }
+    append_ac97_audio_flags_headless(&mut qemu_args);
+    let steps = ipv6_smoke_steps(live);
+
+    println!(
+        "ipv6-smoke: launching QEMU (timeout {}s){}",
+        args.timeout_secs,
+        if live {
+            " [live SLIRP RA/DHCPv6 arms asserted]"
+        } else {
+            " [always-on ring-3 arms; live arms best-effort]"
+        }
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("ipv6-smoke: failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!("ipv6-smoke: PASS ({} steps in {elapsed}s)", steps.len());
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("ipv6-smoke: FAILED\n{msg}");
             std::process::exit(1);
         }
     }
