@@ -430,28 +430,29 @@ impl RemoteNic {
             None => return 0,
         };
 
-        // Peek the driver endpoint (without draining the queue yet).
-        let endpoint = {
-            let nics = REMOTE_NIC.lock();
-            match nics.first() {
-                Some(e) => e.endpoint,
-                None => return 0,
-            }
-        };
-
-        // Drain the whole TX queue. Each frame is handed to the driver endpoint
-        // via `send_tx_owned`, which carries the frame's bytes *inside* its
-        // queued `PendingSend` — so many frames can sit on the endpoint at once
-        // and the polled driver drains a batch per loop iteration. The send
-        // never blocks (no deadlock with the driver's RX publish) and never
-        // reuses a shared bulk slot mid-flight (no corruption). This replaced
-        // the single-`pending_bulk`-slot rendezvous whose one-frame-in-flight
-        // serialization first stalled, then dropped, the SSH banner on bare
-        // metal (Phase 96).
-        let frames: alloc::vec::Vec<_> = {
+        // Snapshot the driver endpoint AND drain the whole TX queue under a
+        // SINGLE `REMOTE_NIC` lock hold, so the drained frames and the endpoint
+        // they are forwarded to come from the same registry epoch. Splitting
+        // these into two lock scopes opened a TOCTOU window: a concurrent
+        // `register` / `ensure_link_event_entry` could reassign `nics[0].endpoint`
+        // between the peek and the drain, forwarding this batch to a now-stale
+        // endpoint — surfacing as a false restart-suspected + incorrect
+        // drop/requeue. The drain only moves owned `Vec<u8>` frames out of the
+        // queue (no IPC under the lock); the actual `send_tx_owned` forwarding
+        // happens below, after the lock is released.
+        //
+        // Each frame is handed to the driver endpoint via `send_tx_owned`, which
+        // carries the frame's bytes *inside* its queued `PendingSend` — so many
+        // frames can sit on the endpoint at once and the polled driver drains a
+        // batch per loop iteration. The send never blocks (no deadlock with the
+        // driver's RX publish) and never reuses a shared bulk slot mid-flight (no
+        // corruption). This replaced the single-`pending_bulk`-slot rendezvous
+        // whose one-frame-in-flight serialization first stalled, then dropped,
+        // the SSH banner on bare metal (Phase 96).
+        let (endpoint, frames): (EndpointId, alloc::vec::Vec<_>) = {
             let mut nics = REMOTE_NIC.lock();
             match nics.first_mut() {
-                Some(e) => e.tx_queue.drain(..).collect(),
+                Some(e) => (e.endpoint, e.tx_queue.drain(..).collect()),
                 None => return 0,
             }
         };

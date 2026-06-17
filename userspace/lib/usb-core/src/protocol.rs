@@ -120,8 +120,9 @@ pub struct TopoPort {
     /// 1-based root-hub port number.
     pub port: u8,
     /// Packed status flags: bit0 = CCS (current connect status), bit1 = PED
-    /// (port enabled), bit2 = PP (port power); bits 4..8 = the `PORTSC` Port
-    /// Speed field (xHCI default PSI: 1 = Full, 2 = Low, 3 = High, 4 = Super).
+    /// (port enabled), bit2 = PP (port power); bits 4–7 (the high nibble) = the
+    /// `PORTSC` Port Speed field (xHCI default PSI: 1 = Full, 2 = Low, 3 = High,
+    /// 4 = Super).
     pub flags: u8,
 }
 
