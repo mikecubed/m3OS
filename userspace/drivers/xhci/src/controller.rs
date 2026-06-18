@@ -263,6 +263,32 @@ pub struct SlotContext {
     /// growth would eventually exhaust the device-host DMA cap table. `None`
     /// until the first data-stage transfer on this slot.
     pub ep0_data_buf: Option<DmaBuffer<u8>>,
+    /// Raw 18-byte Device Descriptor captured at enumeration (Phase 92 H.1).
+    /// Returned by `GetDescriptors` so a class driver can inspect device-level
+    /// fields without a fresh control read. Empty until the enumerator caches it.
+    pub device_desc: alloc::vec::Vec<u8>,
+    /// Raw Configuration Descriptor blob (`wTotalLength` bytes — interfaces +
+    /// endpoints + class functional descriptors) captured at enumeration. A full
+    /// config exceeds the inline `ControlData` clamp, so `GetDescriptors` is the
+    /// only way a class driver reads it whole. Empty until cached.
+    pub config_desc: alloc::vec::Vec<u8>,
+}
+
+/// A root-hub port change the live event path observed and queued for the
+/// server loop to act on (Phase 92 Track C hot-plug). `on_port_status_change`
+/// records these as Port Status Change events arrive; `take_port_events` drains
+/// them so the single-threaded server can run enumeration / teardown outside the
+/// event-ring drain borrow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortChange {
+    /// A device newly connected on `port` and the port reached Enabled at
+    /// `speed` (the live path already issued the reset). The server runs
+    /// Enable Slot → Address Device → Configure Endpoint and publishes an
+    /// `AttachNotice`.
+    Connect { port: u8, speed: port::PortSpeed },
+    /// The device on `port` disconnected. The server marks its `AttachNotice`
+    /// `attached: false` and issues Disable Slot to reclaim the slot.
+    Disconnect { port: u8 },
 }
 
 pub struct Controller {
@@ -303,6 +329,10 @@ pub struct Controller {
     /// `service_interrupt_events`) so a halted endpoint logs a few times rather
     /// than flooding the serial/framebuffer console.
     xfer_err_logged: u32,
+
+    /// Root-hub port changes observed by `on_port_status_change` and awaiting
+    /// the server's attention (Phase 92 Track C). Drained by `take_port_events`.
+    port_events: alloc::vec::Vec<PortChange>,
 }
 
 /// xHCI completion code for a short-packet transfer (xHCI §6.4.5) — a normal,
@@ -345,6 +375,7 @@ impl Controller {
             enable_slot_emitted: false,
             slots: alloc::vec::Vec::new(),
             xfer_err_logged: 0,
+            port_events: alloc::vec::Vec::new(),
         }
     }
 
@@ -723,7 +754,8 @@ impl Controller {
         const MAX_POLLS: u32 = 400;
         for poll_i in 0..(COMPLETION_SPIN_POLLS + MAX_POLLS) {
             let before = self.consumer.index;
-            let found = self.drain_for_command_completion(cmd_iova);
+            let mut completed: alloc::vec::Vec<(u8, u8)> = alloc::vec::Vec::new();
+            let found = self.drain_for_command_completion(cmd_iova, &mut completed);
             // Only advance ERDP / clear IMAN.IP when the drain actually consumed
             // events — an empty-poll ERDP write disturbs the controller's
             // event-ring bookkeeping (see `wait_for_transfer_event`).
@@ -732,6 +764,17 @@ impl Controller {
                     self.event_ring_iova + (self.consumer.index as u64) * trb::TRB_SIZE as u64;
                 self.rt_write_u64(rt_reg::ERDP, erdp | ERDP_EHB);
                 self.rt_write_u32(rt_reg::IMAN, IMAN_IP | IMAN_IE);
+            }
+            // Re-arm any IN endpoint captured while the command was in flight (H.2).
+            for (s, d) in completed {
+                let len = self
+                    .slot(s)
+                    .and_then(|sc| sc.interrupt_eps.iter().find(|e| e.dci == d))
+                    .map(|e| e.armed_len)
+                    .unwrap_or(0);
+                if len > 0 {
+                    self.arm_ring_in(s, d, len);
+                }
             }
             if let Some(ev) = found {
                 return ev;
@@ -765,6 +808,7 @@ impl Controller {
     fn drain_for_command_completion(
         &mut self,
         cmd_iova: u64,
+        completed: &mut alloc::vec::Vec<(u8, u8)>,
     ) -> Option<trb::CommandCompletionEvent> {
         let mut found: Option<trb::CommandCompletionEvent> = None;
         loop {
@@ -788,7 +832,14 @@ impl Controller {
                     self.on_port_status_change(ev);
                 }
                 Some(trb::TrbType::TransferEvent) => {
-                    // Not expected during command processing; ignore.
+                    // A command (Configure Endpoint, Disable Slot, …) can run
+                    // while a HID/bulk interrupt-IN endpoint is armed. Capture a
+                    // non-matching IN completion (odd DCI) rather than drop it
+                    // (H.2); the caller re-arms it after the drain.
+                    let ev = trb::parse_transfer_event(&candidate);
+                    if ev.endpoint_id & 1 == 1 && self.capture_interrupt_report(ev) {
+                        completed.push((ev.slot_id, ev.endpoint_id));
+                    }
                 }
                 _ => {}
             }
@@ -1016,7 +1067,8 @@ impl Controller {
         const MAX_POLLS: u32 = 400;
         for poll_i in 0..(COMPLETION_SPIN_POLLS + MAX_POLLS) {
             let before = self.consumer.index;
-            let found = self.drain_for_transfer_event(slot_id, endpoint_id);
+            let mut completed: alloc::vec::Vec<(u8, u8)> = alloc::vec::Vec::new();
+            let found = self.drain_for_transfer_event(slot_id, endpoint_id, &mut completed);
             // Only advance ERDP / clear IMAN.IP when the drain actually consumed
             // events. Writing ERDP|EHB on every empty poll (e.g. during a dense
             // run of control transfers) disturbs the controller's event-ring
@@ -1026,6 +1078,18 @@ impl Controller {
                     self.event_ring_iova + (self.consumer.index as u64) * trb::TRB_SIZE as u64;
                 self.rt_write_u64(rt_reg::ERDP, erdp | ERDP_EHB);
                 self.rt_write_u32(rt_reg::IMAN, IMAN_IP | IMAN_IE);
+            }
+            // Re-arm any IN endpoint whose report we captured mid-transfer (H.2),
+            // at its frame-sized `armed_len` so a bulk frame is not truncated.
+            for (s, d) in completed {
+                let len = self
+                    .slot(s)
+                    .and_then(|sc| sc.interrupt_eps.iter().find(|e| e.dci == d))
+                    .map(|e| e.armed_len)
+                    .unwrap_or(0);
+                if len > 0 {
+                    self.arm_ring_in(s, d, len);
+                }
             }
             if let Some(ev) = found {
                 return Some(ev);
@@ -1042,10 +1106,19 @@ impl Controller {
     /// Drain the event ring looking for a Transfer Event for `slot_id` /
     /// `endpoint_id`. Returns the last matching event, consuming all
     /// produced events up to and including it.
+    ///
+    /// Phase 92 H.2: a non-matching **IN**-endpoint completion (odd DCI) seen
+    /// while waiting for an EP0 control transfer is no longer dropped — it is
+    /// routed through `capture_interrupt_report` and its `(slot, dci)` pushed
+    /// into `completed` so the caller re-arms the endpoint after the drain
+    /// (mirroring `wait_for_bulk_out_event`). Without this, a HID report or
+    /// bulk-IN frame completing mid-control-transfer was lost and its endpoint
+    /// left armed-but-completed.
     fn drain_for_transfer_event(
         &mut self,
         slot_id: u8,
         endpoint_id: u8,
+        completed: &mut alloc::vec::Vec<(u8, u8)>,
     ) -> Option<trb::TransferEvent> {
         let mut found: Option<trb::TransferEvent> = None;
         loop {
@@ -1059,6 +1132,12 @@ impl Controller {
                     let ev = trb::parse_transfer_event(&candidate);
                     if ev.slot_id == slot_id && ev.endpoint_id == endpoint_id {
                         found = Some(ev);
+                    } else if ev.endpoint_id & 1 == 1 {
+                        // A non-matching IN completion (odd DCI = IN per
+                        // trb::dci) — capture it rather than drop it (H.2).
+                        if self.capture_interrupt_report(ev) {
+                            completed.push((ev.slot_id, ev.endpoint_id));
+                        }
                     }
                 }
                 Some(trb::TrbType::CommandCompletion) => {
@@ -1123,8 +1202,74 @@ impl Controller {
             input_ctx,
             interrupt_eps: alloc::vec::Vec::new(),
             ep0_data_buf: None,
+            device_desc: alloc::vec::Vec::new(),
+            config_desc: alloc::vec::Vec::new(),
         });
         Ok(())
+    }
+
+    /// Cache the raw 18-byte Device Descriptor read during enumeration so a
+    /// later `GetDescriptors` IPC can return it without a fresh control read
+    /// (Phase 92 H.1). No-op for an unknown slot.
+    pub fn cache_device_descriptor(&mut self, slot_id: u8, bytes: &[u8]) {
+        if let Some(sc) = self.slot_mut(slot_id) {
+            sc.device_desc = bytes.to_vec();
+        }
+    }
+
+    /// Cache the raw Configuration Descriptor blob (`wTotalLength` bytes) read
+    /// during enumeration for a later `GetDescriptors` IPC (Phase 92 H.1).
+    pub fn cache_config_descriptor(&mut self, slot_id: u8, bytes: &[u8]) {
+        if let Some(sc) = self.slot_mut(slot_id) {
+            sc.config_desc = bytes.to_vec();
+        }
+    }
+
+    /// Return the cached `(device, config)` descriptor blobs for `slot_id`, or
+    /// `None` if the slot is unknown or *either* descriptor was never cached
+    /// (Phase 92 H.1 — serves `UsbRequest::GetDescriptors`). `GetDescriptors`
+    /// promises both the device **and** the full configuration blob, so an empty
+    /// `config_desc` is treated as "not cached" rather than handed to the client
+    /// as a valid-but-empty config.
+    pub fn cached_descriptors(
+        &self,
+        slot_id: u8,
+    ) -> Option<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>)> {
+        let sc = self.slot(slot_id)?;
+        if sc.device_desc.is_empty() || sc.config_desc.is_empty() {
+            return None;
+        }
+        Some((sc.device_desc.clone(), sc.config_desc.clone()))
+    }
+
+    /// Issue a **Disable Slot** command for `slot_id`, drain its completion, and
+    /// reclaim the slot's resources: clear `DCBAA[slot_id]` and drop the
+    /// `SlotContext` (freeing its EP0 ring / output context / scratch DMA on the
+    /// next process-exit reclaim). The matching teardown for Enable Slot — used
+    /// on hot-plug detach + re-enumeration so slot IDs are not leaked (Phase 92
+    /// H.3). Returns `true` on a successful Command Completion. A bogus
+    /// `slot_id` (no live `SlotContext`) is rejected without touching hardware.
+    pub fn disable_slot(&mut self, irq: &IrqNotification, slot_id: u8) -> bool {
+        if self.slot(slot_id).is_none() {
+            return false;
+        }
+        let cycle = self.producer.cycle;
+        let cmd = trb::Trb::disable_slot(slot_id, cycle);
+        let ev = self.issue_command_and_wait(irq, cmd);
+        let ok = ev.completion_code == trb::COMPLETION_SUCCESS;
+        if ok {
+            // Clear the DCBAA entry so the controller no longer references the
+            // freed Output Device Context, then drop the per-slot state.
+            if let Some(dcbaa) = self.dcbaa.as_ref() {
+                write_u64_at(dcbaa, slot_id as usize * 8, 0);
+            }
+            self.slots.retain(|s| s.slot_id != slot_id);
+        } else {
+            write_str(STDOUT_FILENO, "[xhci] Disable Slot failed: cc=");
+            crate::write_u8_dec(ev.completion_code);
+            write_str(STDOUT_FILENO, "\n");
+        }
+        ok
     }
 
     /// Write a snapshot into the Input Context DMA buffer and return the IOVA.
@@ -1606,6 +1751,97 @@ impl Controller {
         }
     }
 
+    /// Submit a **synchronous, single-TRB** bulk-IN transfer of exactly `len`
+    /// bytes on (`slot_id`, `dci`) and block for its completion, returning the
+    /// received bytes (short packets honored via the event residual). Phase 92
+    /// Track D — the Bulk-Only Transport (BOT) data + CSW phases.
+    ///
+    /// This is **distinct** from the streaming `arm_bulk_in`/`take_bulk_report`
+    /// path: BOT is a strict request/response protocol (the device sends data
+    /// only when commanded and returns to a CBW-wait state afterwards), so the
+    /// host must NOT keep surplus IN TRBs queued. The streaming path arms `depth`
+    /// (4) outstanding TRBs and auto-re-arms after every completion — perfect for
+    /// a NIC that always has another frame, but fatal for BOT: the surplus IN
+    /// tokens issued after the device's data + CSW (while it is back in CBW-wait)
+    /// make the device STALL the bulk-IN endpoint (`cc=6`), wedging it. This
+    /// method instead enqueues exactly one Normal TRB (IOC) of `len` bytes, rings
+    /// the doorbell once, waits for that single completion, and never re-arms —
+    /// the correct one-transfer-per-phase discipline. The endpoint's `in_flight`
+    /// streaming cursors are left at 0 (the BOT daemon never mixes the two paths
+    /// on the same endpoint), so the shared `ep.producer` ring stays consistent.
+    ///
+    /// `data_bufs[0]` is grown to `len` if needed (a multi-sector READ(10) can
+    /// exceed the `mps`-sized initial buffer). Returns `None` on timeout or a
+    /// non-success/short completion (e.g. a genuine STALL), so the caller can
+    /// surface a transport failure.
+    pub fn submit_bulk_in(
+        &mut self,
+        irq: &IrqNotification,
+        slot_id: u8,
+        dci: u8,
+        len: u32,
+    ) -> Option<alloc::vec::Vec<u8>> {
+        if len == 0 {
+            return Some(alloc::vec::Vec::new());
+        }
+        // Grow the IN data buffer if the requested length exceeds it (disjoint
+        // borrow from self.handle), mirroring submit_bulk_out's OUT buffer grow.
+        let need_grow = match self.slot(slot_id) {
+            Some(sc) => match sc.interrupt_eps.iter().find(|e| e.dci == dci) {
+                Some(ep) => (len as usize) > ep.data_bufs[0].len(),
+                None => return None,
+            },
+            None => return None,
+        };
+        if need_grow {
+            let new_buf = DmaBuffer::<u8>::allocate(&self.handle, len as usize, XHCI_ALIGN).ok()?;
+            let sc = self.slot_mut(slot_id)?;
+            let ep = sc.interrupt_eps.iter_mut().find(|e| e.dci == dci)?;
+            ep.data_bufs[0] = new_buf;
+        }
+        {
+            let sc = self.slot_mut(slot_id)?;
+            let ep = sc.interrupt_eps.iter_mut().find(|e| e.dci == dci)?;
+            zero_dma(&ep.data_bufs[0]);
+            let cycle = ep.producer.cycle;
+            write_trb(
+                &ep.ring,
+                ep.producer.enqueue,
+                trb::Trb::normal(ep.data_bufs[0].iova(), len, cycle),
+            );
+            let cycle_before = ep.producer.cycle;
+            if ep.producer.advance() {
+                let iova = ep.ring_iova;
+                write_trb(
+                    &ep.ring,
+                    ep.producer.link_index(),
+                    trb::Trb::link(iova, true, cycle_before),
+                );
+            }
+        }
+        self.ring_doorbell(slot_id, dci);
+        match self.wait_for_bulk_out_event(irq, slot_id, dci) {
+            Some(ev)
+                if ev.completion_code == trb::COMPLETION_SUCCESS
+                    || ev.completion_code == COMPLETION_SHORT_PACKET =>
+            {
+                let residual = (ev.residual_transfer_length.min(len)) as usize;
+                let n = (len as usize).saturating_sub(residual);
+                let sc = self.slot(slot_id)?;
+                let ep = sc.interrupt_eps.iter().find(|e| e.dci == dci)?;
+                let mut out = alloc::vec::Vec::with_capacity(n);
+                for i in 0..n {
+                    // SAFETY: data_bufs[0] is >= len bytes and i < n <= len.
+                    let byte =
+                        unsafe { core::ptr::read_volatile(ep.data_bufs[0].user_ptr().add(i)) };
+                    out.push(byte);
+                }
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
     /// Block for the bulk-OUT Transfer Event on (`slot_id`, `dci`). Unlike the
     /// EP0 `wait_for_transfer_event`, any **IN** completion (odd DCI) seen while
     /// draining is routed through `capture_interrupt_report` + re-armed, so a
@@ -1768,9 +2004,16 @@ impl Controller {
         }
     }
 
-    /// Port Status Change handler stub — A.7 reset/speed detection is wired
-    /// here; the enumeration consumer is Phase 78b.
-    fn on_port_status_change(&self, ev: trb::PortStatusChangeEvent) {
+    /// Port Status Change handler. A.7 reset/speed detection runs here; Phase 92
+    /// Track C adds the live hot-plug surface: a connect resets the port and
+    /// **queues** a `PortChange::Connect` (with the decoded speed) for the
+    /// server to enumerate; a disconnect queues `PortChange::Disconnect` for the
+    /// server to mark detached + Disable Slot. Queuing (rather than enumerating
+    /// inline) keeps the heavy work out of the event-ring drain borrow — the
+    /// single-threaded server drains the queue via `take_port_events` on each
+    /// loop wake. Called from every event-ring drain, so it runs during bring-up
+    /// too; the server guards against re-enumerating a port it already serves.
+    fn on_port_status_change(&mut self, ev: trb::PortStatusChangeEvent) {
         let portnum = ev.port_id;
         if portnum == 0 || portnum as u16 > self.max_ports as u16 {
             return;
@@ -1779,14 +2022,31 @@ impl Controller {
         let raw = self.op_u32(off);
         let p = port::Portsc(raw);
         // Acknowledge the connect-status change (RW1C) so the edge is not
-        // re-reported, then, on a real connect, drive the A.7 reset path.
+        // re-reported, then classify connect vs disconnect.
         if p.csc() {
             let cleared = port::portsc_clear_change(raw, port::PORTSC_CSC);
             self.op_write_u32(off, cleared);
             if p.ccs() {
-                self.reset_port(portnum);
+                // A real connect: drive the A.7 reset path (decoding speed) and
+                // queue the connect for the server's enumeration (Track C.1/C.3).
+                if let Some(speed) = self.reset_port_with_speed(portnum) {
+                    self.port_events.push(PortChange::Connect {
+                        port: portnum,
+                        speed,
+                    });
+                }
+            } else {
+                // A disconnect: queue it for the server to tear down (Track C.2/C.4).
+                self.port_events
+                    .push(PortChange::Disconnect { port: portnum });
             }
         }
+    }
+
+    /// Drain the queued root-hub port changes for the server to act on
+    /// (Phase 92 Track C). Returns and clears the pending list.
+    pub fn take_port_events(&mut self) -> alloc::vec::Vec<PortChange> {
+        core::mem::take(&mut self.port_events)
     }
 
     /// Scan every root-hub port and reset any that already report a connected

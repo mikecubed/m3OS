@@ -8,31 +8,28 @@
 //!
 //! # Phase status
 //!
-//! **Phase 78b Track B** implements the hub class logic in
+//! **Phase 78b Track B** implemented the hub class logic in
 //! `kernel_core::usb::hub` (descriptor parsing, `PortId` topology tree,
-//! route-string computation) and wires this daemon into the build + service
-//! machinery. The xHCI server now publishes the `usb` service (Phase 78c), but
-//! it only classifies + enumerates ROOT-hub HID devices; **live external-hub
-//! enumeration (devices behind a `usb-hub`) is deferred to Phase 90 (USB Class
-//! Expansion)**, which adds hub-class publishing + the `SET_FEATURE`
-//! PORT_POWER/PORT_RESET child-device path. Until then the daemon starts, logs
-//! its presence, exercises the hub logic at a call site so it is verified at
-//! build time, and exits cleanly — exactly as `xhci_driver` exits 0 when no
-//! controller is present, so the service manager marks the service stopped
-//! without burning its restart budget.
+//! route-string computation). **Phase 92 Track A** turns this daemon live: the
+//! xHCI server now surfaces `CLASS_HUB` interfaces (`device_info_from_ctx`), and
+//! the daemon walks the `NextAttach` cursor for a hub, reads its descriptor over
+//! EP0, and drives the per-port `SET_FEATURE(PORT_POWER)`/`PORT_RESET` bring-up
+//! (the standard hub power/reset sequence). It exits cleanly when no hub is
+//! present so the service manager marks the service stopped without burning its
+//! restart budget.
 //!
-//! # Live enumeration path (Phase 90, deferred)
+//! # Live enumeration path
 //!
-//! Once the xHCI server publishes hub-class `AttachNotice`s and serves
-//! `GetDescriptors`/`ControlRequest` for hubs:
+//! 1. Receive `AttachNotice { interface_class: CLASS_HUB, … }` via `NextAttach`.
+//! 2. Issue `GET_DESCRIPTOR(Hub)` via `UsbRequest::ControlRequest`.
+//! 3. Parse the `HubDescriptor` for `bNbrPorts` / `bPwrOn2PwrGood`.
+//! 4. For each downstream port, send `SET_FEATURE(PORT_POWER)`, settle, read
+//!    `GET_PORT_STATUS`, and on a connected port send `SET_FEATURE(PORT_RESET)`
+//!    and ack `C_PORT_RESET` once it enables.
 //!
-//! 1. Receive `AttachNotice { interface_class: CLASS_HUB, … }`.
-//! 2. Issue `GET_DESCRIPTOR(Hub)` via the `UsbClient` request channel.
-//! 3. Parse the `HubDescriptor` and call `PortTopology::add_root_port` (or
-//!    `add_child_port` for nested hubs) to register the hub in the tree.
-//! 4. For each downstream port, send `SET_FEATURE(PORT_POWER)` then wait for
-//!    `PORT_CONNECTION` status change; on connect, send `SET_FEATURE(PORT_RESET)`.
-//! 5. On `PORT_RESET` completion, report the new device to the kernel.
+//! Surfacing the downstream device as its own `AttachNotice` (tier-2 enumeration
+//! via the route string — `PortTopology` + Slot Context route string, A.4/A.5)
+//! is scheduled as **Phase 92a**.
 
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
@@ -98,25 +95,232 @@ pub fn classify_hub_interface(b_interface_class: u8) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Live hub bring-up (Phase 92 Track A) — IPC plumbing + control-transfer helpers
+// ---------------------------------------------------------------------------
+
+#[cfg(not(test))]
+use alloc::vec::Vec;
+#[cfg(not(test))]
+use kernel_core::usb::hub::{
+    HubDescriptor, PORT_POWER, PORT_RESET, clear_port_feature, get_hub_descriptor, get_port_status,
+    port_status_connected, port_status_enabled, set_port_feature,
+};
+#[cfg(not(test))]
+use kernel_core::usb::xhci::trb::SetupPacket;
+#[cfg(not(test))]
+use usb_core::protocol::{
+    AttachNotice, USB_MSG_MAX, USB_REQ_LABEL, USB_SERVICE_NAME, UsbReply, UsbRequest,
+};
+
+/// `CLEAR_FEATURE` selector for the C_PORT_RESET change bit (USB 2.0 §11.24.2).
+#[cfg(not(test))]
+const C_PORT_RESET: u16 = 20;
+/// Minimum hub-descriptor request length — covers `bNbrPorts` (byte 2) and
+/// `bPwrOn2PwrGood` (byte 5). Requesting exactly this caps the device's reply so
+/// the control-IN data stage is never short.
+#[cfg(not(test))]
+const HUB_DESC_REQ_LEN: u16 = 9;
+
+/// Pack a [`SetupPacket`] into the 8 little-endian bytes the `ControlRequest`
+/// IPC carries.
+#[cfg(not(test))]
+fn setup_to_bytes(s: SetupPacket) -> [u8; 8] {
+    [
+        s.bm_request_type,
+        s.b_request,
+        s.w_value as u8,
+        (s.w_value >> 8) as u8,
+        s.w_index as u8,
+        (s.w_index >> 8) as u8,
+        s.w_length as u8,
+        (s.w_length >> 8) as u8,
+    ]
+}
+
+/// Issue a `UsbRequest` to the xHCI server and decode the `UsbReply`.
+#[cfg(not(test))]
+fn usb_call(usb_ep: u32, req: &UsbRequest) -> Option<UsbReply> {
+    let req_bytes = req.encode();
+    let rc = syscall_lib::ipc_call_buf(usb_ep, USB_REQ_LABEL, 0, &req_bytes);
+    if rc == u64::MAX {
+        return None;
+    }
+    let mut reply_buf = [0u8; USB_MSG_MAX];
+    let n = syscall_lib::ipc_take_pending_bulk(&mut reply_buf);
+    if n == u64::MAX {
+        return None;
+    }
+    UsbReply::decode(&reply_buf[..n as usize])
+}
+
+/// Run a control transfer for `setup` on the hub's EP0, returning the data stage
+/// (empty for a no-data OUT). `length` is the IN data-stage byte count (0 for an
+/// OUT such as `SET_FEATURE`). Returns `None` on a transport failure / STALL.
+#[cfg(not(test))]
+fn control(usb_ep: u32, slot_id: u8, setup: [u8; 8], length: u16) -> Option<Vec<u8>> {
+    match usb_call(
+        usb_ep,
+        &UsbRequest::ControlRequest {
+            slot_id,
+            setup,
+            length,
+        },
+    ) {
+        Some(UsbReply::ControlData {
+            data,
+            completion_code: 1,
+        }) => Some(data),
+        _ => None,
+    }
+}
+
+#[cfg(not(test))]
+fn write_u8_dec(n: u8) {
+    let mut buf = [0u8; 3];
+    let mut i = buf.len();
+    let mut v = n;
+    if v == 0 {
+        syscall_lib::write_str(STDOUT_FILENO, "0");
+        return;
+    }
+    while v > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10);
+        v /= 10;
+    }
+    // SAFETY: buf[i..] is ASCII digits.
+    syscall_lib::write_str(STDOUT_FILENO, unsafe {
+        core::str::from_utf8_unchecked(&buf[i..])
+    });
+}
+
+/// Drive one hub: read its descriptor, power every downstream port, then probe
+/// each port's status and reset any port reporting a connected device. This is
+/// the standard hub power/reset sequence (USB 2.0 §11.5.1.5). Surfacing the
+/// downstream device as its own `AttachNotice` (tier-2 enumeration via the route
+/// string, A.4/A.5) is scheduled as Phase 92a.
+#[cfg(not(test))]
+fn enumerate_hub(usb_ep: u32, notice: &AttachNotice) {
+    let slot_id = notice.slot_id;
+
+    // GET_DESCRIPTOR(Hub) over EP0 → bNbrPorts + bPwrOn2PwrGood.
+    let setup = setup_to_bytes(get_hub_descriptor(HUB_DESC_REQ_LEN));
+    let Some(desc_bytes) = control(usb_ep, slot_id, setup, HUB_DESC_REQ_LEN) else {
+        syscall_lib::write_str(STDOUT_FILENO, "usbhub: GET_DESCRIPTOR(Hub) failed\n");
+        return;
+    };
+    let Some(desc) = HubDescriptor::parse(&desc_bytes) else {
+        syscall_lib::write_str(STDOUT_FILENO, "usbhub: hub descriptor parse failed\n");
+        return;
+    };
+    let nports = desc.b_nbr_ports;
+    syscall_lib::write_str(STDOUT_FILENO, "XHCI_HUB:enumerated ports=");
+    write_u8_dec(nports);
+    syscall_lib::write_str(STDOUT_FILENO, "\n");
+
+    // SET_FEATURE(PORT_POWER) on every downstream port.
+    for port in 1..=nports {
+        let setup = setup_to_bytes(set_port_feature(PORT_POWER, port));
+        if control(usb_ep, slot_id, setup, 0).is_none() {
+            syscall_lib::write_str(STDOUT_FILENO, "usbhub: PORT_POWER failed port=");
+            write_u8_dec(port);
+            syscall_lib::write_str(STDOUT_FILENO, "\n");
+        }
+    }
+    // Honor bPwrOn2PwrGood (units of 2 ms) before reading port status.
+    let settle_ns = (desc.b_pwr_on2_pwr_good as u32)
+        .max(1)
+        .saturating_mul(2_000_000);
+    let _ = syscall_lib::nanosleep_for(0, settle_ns.min(500_000_000));
+
+    // Probe each port; reset any that reports a connected device.
+    for port in 1..=nports {
+        let setup = setup_to_bytes(get_port_status(port));
+        let Some(st) = control(usb_ep, slot_id, setup, 4) else {
+            continue;
+        };
+        if !port_status_connected(&st) {
+            continue;
+        }
+        syscall_lib::write_str(STDOUT_FILENO, "usbhub: port ");
+        write_u8_dec(port);
+        syscall_lib::write_str(STDOUT_FILENO, " device connected\n");
+
+        // SET_FEATURE(PORT_RESET) and poll until the port enables.
+        let setup = setup_to_bytes(set_port_feature(PORT_RESET, port));
+        let _ = control(usb_ep, slot_id, setup, 0);
+        for _ in 0..50 {
+            let _ = syscall_lib::nanosleep_for(0, 4_000_000);
+            let setup = setup_to_bytes(get_port_status(port));
+            let Some(s) = control(usb_ep, slot_id, setup, 4) else {
+                continue;
+            };
+            if port_status_enabled(&s) {
+                // Ack the C_PORT_RESET change bit (RW1C via CLEAR_FEATURE).
+                let setup = setup_to_bytes(clear_port_feature(C_PORT_RESET, port));
+                let _ = control(usb_ep, slot_id, setup, 0);
+                syscall_lib::write_str(STDOUT_FILENO, "usbhub: port ");
+                write_u8_dec(port);
+                syscall_lib::write_str(STDOUT_FILENO, " reset+enabled\n");
+                break;
+            }
+        }
+    }
+    syscall_lib::write_str(STDOUT_FILENO, "USB_HUB:ready\n");
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
-/// Hub daemon main — Phase 78b.
+/// Hub daemon main — Phase 92 Track A.
 ///
-/// Logs [`BOOT_LOG_MARKER`], exercises the hub classifier (verifying the link
-/// into `kernel_core::usb::hub`) and exits 0.  Live external-hub enumeration via
-/// the `usb` service lands in Phase 90 (USB Class Expansion).
+/// Logs [`BOOT_LOG_MARKER`], waits on the `usb` service, walks the `NextAttach`
+/// cursor for a `CLASS_HUB` interface, and drives each hub through its descriptor
+/// read + per-port `PORT_POWER`/`PORT_RESET` bring-up. Exits cleanly when no hub
+/// is present (the common machine) so init's `on-failure` policy marks the
+/// service stopped rather than looping.
 #[cfg(not(test))]
 fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, BOOT_LOG_MARKER);
 
-    // Confirm the hub classifier is reachable from this daemon's build — any
-    // broken import or ABI mismatch would cause a link error here.
-    let _ = classify_hub_interface(0x09); // CLASS_HUB
+    if !syscall_lib::ipc_wait_service(USB_SERVICE_NAME, 10_000) {
+        syscall_lib::write_str(STDOUT_FILENO, "usbhub: 'usb' service absent — exiting\n");
+        return 0;
+    }
+    let usb_ep = {
+        let h = syscall_lib::ipc_lookup_service(USB_SERVICE_NAME);
+        if h == u64::MAX {
+            syscall_lib::write_str(STDOUT_FILENO, "usbhub: 'usb' lookup failed — exiting\n");
+            return 0;
+        }
+        h as u32
+    };
 
-    // Phase 90: receive hub AttachNotices, enumerate downstream ports, apply
-    // PORT_POWER / PORT_RESET, report child devices. For now, exit cleanly so
-    // init's `on-failure` policy marks the service stopped rather than looping.
+    // Walk the NextAttach cursor for hub-class interfaces (A.1).
+    let mut hubs: Vec<AttachNotice> = Vec::new();
+    let mut cursor = 0u8;
+    while let Some(UsbReply::Attach {
+        notice: Some(notice),
+    }) = usb_call(usb_ep, &UsbRequest::NextAttach { cursor })
+    {
+        cursor = cursor.saturating_add(1);
+        if notice.attached && classify_hub_interface(notice.interface_class) {
+            syscall_lib::write_str(STDOUT_FILENO, "usbhub: bound hub slot=");
+            write_u8_dec(notice.slot_id);
+            syscall_lib::write_str(STDOUT_FILENO, "\n");
+            hubs.push(notice);
+        }
+    }
+
+    if hubs.is_empty() {
+        syscall_lib::write_str(STDOUT_FILENO, "usbhub: no hub attached — exiting cleanly\n");
+        return 0;
+    }
+
+    for notice in &hubs {
+        enumerate_hub(usb_ep, notice);
+    }
     0
 }
 

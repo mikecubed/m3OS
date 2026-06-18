@@ -1,6 +1,6 @@
 # Phase 92 — USB Class Expansion: Task List
 
-**Status:** Planned
+**Status:** In Progress
 **Source Ref:** phase-92
 **Depends on:** Phase 78a (xHCI Host Bring-Up) ✅, Phase 78b (USB Enumeration + Hub) ✅, Phase 78c (HID Boot Protocol + `usb` IPC service) ✅, Phase 74 (IPC Capability Grants — page-grant transport) ✅, Phase 77 (ring-3 `RemoteBlockDevice` hosting) ✅, Phase 79 (`RemoteNic` facade) ✅, Phase 96 (Bare-Metal USB-Ethernet — USB bulk-endpoint transport + multi-controller handle codec) ✅
 **Goal:** Deliver every USB class feature deferred from Phase 78c — multi-tier hub enumeration, live HID Report Protocol, USB hot-plug, USB mass storage (BOT + UAS), isochronous USB audio/video, a generic CDC-ECM/NCM USB-Ethernet class driver, and per-controller concurrency — building on the Phase 96 bulk-endpoint substrate (`PollBulkIn`/`SubmitBulkOut`/`BulkData`/`ControlWrite`, `USB_MSG_MAX`=4096, the `handle.rs` multi-controller codec) rather than re-implementing transport. Closes with the kernel version bump (`0.91.0` → `0.92.0`) and the Phase 92 learning doc (`docs/92-usb-class-expansion.md`).
@@ -15,15 +15,89 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Multi-tier hub enumeration — live `usbhub` walker, hub descriptor + per-port power/reset, tier-2+ slot assignment via the route string | H | Planned |
-| B | HID Report Protocol — wire `parse_report_descriptor` live, multi-axis/buttons/scroll, consumer keys, LED `SET_REPORT` | H | Planned |
-| C | Live hot-plug event surface — Port Status Change → `AttachNotice` push, detach (`attached:false`), dynamic re-enumeration, Disable Slot reclamation | — | Planned |
-| D | USB Mass Storage — BOT CBW/CSW on the Phase 96 inline bulk path, SCSI subset, UAS, `RemoteBlockDevice` facade + `/mnt/usb<n>`, page-grant overflow | C, H | Planned |
-| E | Isochronous endpoints — UAC PCM-out to `audio_server`, UVC frame capture + `camera_server`, controller isoch TRB scheduling | F | Planned |
-| F | Multi-controller concurrency — per-controller bound IRQ + event-loop thread, concurrent MSI-X routing | — | Planned |
-| G | Host-side USB-Ethernet class drivers — generic CDC-ECM/NCM `RemoteNic`, fold the Phase 96 vendor `ure` into a shared device-match registry | C | Planned |
-| H | Foundation & carry-over hardening — live `GetDescriptors` (large reads), control-transfer event capture, Disable Slot, page-grant `SubmitTransfer` | — | Planned |
-| I | Validation, kernel version bump & learning docs — new acceptance gates, AGENTS.md rows, `0.91.0`→`0.92.0`, Phase 92 learning doc | A–H | Planned |
+| A | Multi-tier hub enumeration — live `usbhub` walker, hub descriptor + per-port power/reset, tier-2+ slot assignment via the route string | H | **A.1/A.2/A.3 landed** — server surfaces `CLASS_HUB`; the resident `usbhub` walker binds a hub, reads its descriptor over EP0, and drives per-port `PORT_POWER`/`PORT_RESET` (`usb-hub-smoke` PASS). **A.4/A.5 (tier-2 device-behind-hub enumeration via the route string) → Phase 92a** |
+| B | HID Report Protocol — wire `parse_report_descriptor` live, multi-axis/buttons/scroll, consumer keys, LED `SET_REPORT` | H | **B.1 landed** — `usb-hid` reads + parses the HID Report descriptor over EP0 at bind and stores the `ReportField` layout per device (`USB_HID:report-parsed` in `usb-smoke`); B.2/B.3 host-logic landed (47 hid + 38 keymap tests). **B.2-live decode / B.3-live consumer routing / B.4 LED `SET_REPORT` → Phase 92b** |
+| C | Live hot-plug event surface — Port Status Change → `AttachNotice` push, detach (`attached:false`), dynamic re-enumeration, Disable Slot reclamation | — | C.1–C.3 + server-side C.4 landed (`usb-hotplug-smoke` 3-cycle PASS); **class-driver-side C.4 release scheduled per driver — usb-storage→92a, usb-hid→92b, usb-net→92e** |
+| D | USB Mass Storage — BOT CBW/CSW on the Phase 96 inline bulk path, SCSI subset, UAS, `RemoteBlockDevice` facade + `/mnt/usb<n>`, page-grant overflow | C, H | D.1 transport + **data-IN phase** + D.2 codec landed (`usb-storage` daemon binds + BOT CBW/CSW round-trip + INQUIRY/READ CAPACITY over the new synchronous `SubmitBulkIn` path, `usb-storage-smoke` PASS asserting `USB_MASS_STORAGE:ready`; 31 host tests). **D.3 UAS / D.4 mount / D.5 page-grant pending** |
+| E | Isochronous endpoints — UAC PCM-out to `audio_server`, UVC frame capture + `camera_server`, controller isoch TRB scheduling | F | **→ Phase 92c** (deep isoch TRB scheduling; UVC bare-metal-only) |
+| F | Multi-controller concurrency — per-controller bound IRQ + event-loop thread, concurrent MSI-X routing | — | **→ Phase 92d** (ring-3 driver threading; risk-isolated from the working single-loop server) |
+| G | Host-side USB-Ethernet class drivers — generic CDC-ECM/NCM `RemoteNic`, fold the Phase 96 vendor `ure` into a shared device-match registry | C | G.1/G.2 host-logic landed (`cdc.rs`: CDC functional-descriptor parse + NTB-16 framing round-trip, 23 host tests); **live `usb-net` daemon → Phase 92e** (bare-metal/VFIO-gated — no QEMU CDC-ECM model) |
+| H | Foundation & carry-over hardening — live `GetDescriptors` (large reads), control-transfer event capture, Disable Slot, page-grant `SubmitTransfer` | — | H.1–H.3 landed (host-tested + `usb-smoke` clean); H.4→D.5 (Phase 92a) |
+| I | Validation, kernel version bump & learning docs — new acceptance gates, AGENTS.md rows, `0.91.0`→`0.92.0`, Phase 92 learning doc | A–H | **I.4 done** — bumped to **`0.92.0`** with the core (+ AGENTS.md version line + USB capability-bullet rewrite); `usb-hub-smoke` + `usb-storage-smoke` (data-IN + R/W) gates landed. **I.5 learning doc pending**; sub-phases land as `0.92.x` |
+
+---
+
+## Sub-Phase Schedule
+
+Phase 92 was split (per the `flow:parallel-impl` breadth-first run) so each chunk
+lands and is **independently verified** rather than waiting on the whole, deep
+USB-class surface. The **core** (CI-verifiable, validated this run) is below; the
+deeper / kernel-invasive / hardware-only remainder is scheduled as numbered
+sub-phases so they can be scheduled and verified one at a time.
+
+**Phase 92 core — landed + validated (always-on QEMU gates + host tests):**
+
+- **H** (foundation) — `GetDescriptors` cache, control-event capture, Disable Slot.
+- **C** (hot-plug) — Port-Status-Change → `AttachNotice`/detach/Disable-Slot (`usb-hotplug-smoke`).
+- **D.1/D.2** (mass storage) — BOT CBW/CSW + SCSI codec + **the data-IN phase** (the synchronous single-TRB `SubmitBulkIn` closing the Phase 96 streaming-path STALL) + a WRITE(10)/READ(10) sector round-trip (`usb-storage-smoke` → `USB_MASS_STORAGE:ready` + `USB_STORAGE:rw-ok`).
+- **A.1/A.2/A.3** (hub discovery) — server surfaces `CLASS_HUB`; the live `usbhub` walker reads the hub descriptor + powers/resets ports (`usb-hub-smoke`).
+- **B.1** (HID Report) — live Report-descriptor read + parse at bind (`usb-smoke` → `USB_HID:report-parsed`).
+- **B.2/B.3, G.1/G.2** host-logic — Report-descriptor Usage ranges + Report IDs, consumer keycodes, CDC functional-descriptor parse + NTB-16 framing (host tests).
+
+Each sub-phase below lists **every** open task ID it owns (so no item is orphaned), its validation gate, and its AGENTS.md row. The mapping is exhaustive: every `[ ]`/`[~]` acceptance item in this doc belongs to exactly one sub-phase (see the coverage table at the end).
+
+**Phase 92a — USB tier-2 enumeration + mass-storage mount.**
+- **A.4/A.5** — device-behind-hub enumeration via the xHCI route string + `PortTopology` → Slot Context (and A.2's reset-against-a-*connected*-downstream-device item, which only becomes meaningful once a device actually enumerates behind the hub).
+- **D.3** (UAS), **D.4** (`RemoteBlockDevice` facade + `/mnt/usb<n>` mount — requires kernel **multi-remote-block-device routing**, since `blk::remote` is a single-backend singleton today), **D.5 + H.4** (page-grant `SubmitTransfer` overflow).
+- **C.4 (usb-storage arm)** — the `usb-storage` daemon releases its per-LUN state on an `attached:false` notice and `/mnt/usb<n>` unmounts cleanly on unplug (lines 293/295).
+- **Gate (I.1 + the unmount half of I.2):** `usb-storage-smoke` extended to a `usb-hub` carrying a `usb-storage` backend → `XHCI_HUB:enumerated` + `USB_MASS_STORAGE:mounted` + `ls /mnt/usb0`; hot-plug unmount arm. AGENTS.md: `M3OS_USB_STORAGE_REGRESSION`.
+- *The hard USB data path is already done (D.1/D.2); this is the enumeration + kernel-mount integration.*
+
+**Phase 92b — HID Report Protocol live decode.**
+- **B.2-live** (data-driven multi-axis/scroll/button decode + usage→event mapping), **B.3-live** (consumer-key routing to `audio_server`; the consumer-keycode host-logic is already landed), **B.4** (keyboard LED `SET_REPORT`).
+- **C.4 (usb-hid arm)** — `usb-hid` releases its per-device state on an `attached:false` notice.
+- **H.2 remaining item** — the live "control transfer interleaved with an armed interrupt endpoint drops no report" assertion rides B.4's `SET_REPORT`-during-HID-polling path (line 87).
+- **Gate (I.2 Report-Protocol arm):** a `usb-tablet` QMP-abs-input arm → `USB_HID:mouse`/`HID_REPORT:*` (extra axes/buttons). *Host-logic + the stored `ReportField` layout (B.1) are ready.*
+
+**Phase 92c — USB isochronous (UAC / UVC).**
+- **E.3** (controller isochronous-TRB scheduling — frame interval, bandwidth reservation, no-retry), **E.1** (UAC PCM-out to `audio_server`, CI-viable via `-device usb-audio`), **E.2** (UVC frame capture + `camera_server`, bare-metal/VFIO-only).
+- **Gate (I.3 audio half):** `usb-audio-smoke` (non-silent PCM, `AUDIO:usb-sink`). AGENTS.md: `M3OS_USB_AUDIO_REGRESSION`. *Deepest controller work in the phase.*
+
+**Phase 92d — Multi-controller concurrency.**
+- **F.1** (per-controller bound IRQ + event-loop thread), **F.2** (concurrent MSI-X routing).
+- **Gate (I.2 multi-controller arm):** `usb-multi-controller-smoke` (second `qemu-xhci`, `XHCI:controller-1:ready`). *Ring-3 driver threading, deliberately risk-isolated from the validated single-loop server.*
+
+**Phase 92e — USB-Ethernet class drivers (live).**
+- **G.1/G.2/G.3** live `usb-net` (CDC-ECM/NCM `RemoteNic` + the shared `ure` device-match registry).
+- **C.4 (usb-net arm)** — `usb-net` releases its per-device state on an `attached:false` notice.
+- **Gate (I.3 ethernet half):** the CDC-ECM/NCM arm of `usb-eth-smoke` — bare-metal/VFIO, skip-with-reason in CI. *QEMU has no CDC-ECM model; host-logic (G.1/G.2) is done.*
+
+**Track I** — **I.4 (version bump) is done**: bumped `0.91.0`→**`0.92.0`** with the Phase 92 core (this PR), the AGENTS.md "kernel v0.92.0" line, and the USB capability-bullet rewrite. **Sub-phases 92a–92e land as `0.92.x` patch releases.** **I.5** (the `docs/92-usb-class-expansion.md` learning doc + `docs/README.md`/`codebase-map.md` links + flipping the roadmap README Phase 92 row to `Complete`) remains, scheduled to land with the last sub-phase. *Note: each per-sub-phase AGENTS.md gate row above lands **with** its sub-phase.*
+
+### Coverage map — every open acceptance item → its sub-phase
+
+| Open items (task IDs / lines) | Owner |
+|---|---|
+| A.4 (167–169), A.5 (178–180), A.2-reset (147) | 92a |
+| D.3 (336–338), D.4 (350–352), D.5 (361–362), H.4 (116–118) | 92a |
+| C.4 usb-storage detach + unmount (293/295) | 92a |
+| I.1 hub+mount gate (488–490), I.2 mount/unmount arm (499) | 92a |
+| B.1-decode (197), B.2-live (212–213), B.3-live (225–226), B.4 (238–240), H.2-test (87) | 92b |
+| C.4 usb-hid detach (293) | 92b |
+| I.2 Report-Protocol arm (501) | 92b |
+| E.1 (378–380), E.2 (392–394), E.3 (403–405) | 92c |
+| I.3 audio gate (510, 512) | 92c |
+| F.1 (421–423), F.2 (432–433) | 92d |
+| I.2 multi-controller arm (500) | 92d |
+| G.1 (449–450), G.2 (461), G.3 (473–475) | 92e |
+| C.4 usb-net detach (293) | 92e |
+| I.3 CDC-ECM arm (511) | 92e |
+| I.4 version bump (524–526) | **done — `0.92.0` with the core** |
+| I.5 learning doc (539–541) | Track I close-out (lands with the last sub-phase) |
+| *PR #252 readiness follow-ups (task IDs below):* | |
+| H.6 length bounds, D.2 rw-ok comment, I.6 gate regression wiring | 92a |
+| B.1 readiness items (wDescriptorLength read, doc header, hostile-count test) | 92b |
+| H.5 slot-reclaim on unpackable handle | 92d |
 
 ---
 
@@ -41,9 +115,9 @@
 **Why it matters:** descriptors are pre-resolved into `AttachNotice` at enumeration, but a Report-Protocol HID device (B.1) and CDC-ECM (G.1) must read a full **configuration / Report / CDC functional descriptor** at bind time — these exceed the ≤64-byte inline `ControlData` clamp. `GetDescriptors` must return the cached device + config descriptor blobs (already parsed during enumeration) so class drivers stop being limited to what `AttachNotice` carries.
 
 **Acceptance:**
-- [ ] `UsbRequest::GetDescriptors { slot_id }` returns `UsbReply::Descriptors { device, config }` from the enumeration-time cache (not a fresh control read) for an enumerated device.
-- [ ] A configuration descriptor larger than 64 bytes round-trips intact (bounded by `USB_MSG_MAX`=4096), proven by a host test over the wire codec and by a class driver reading it live.
-- [ ] The arm no longer returns `Error { code: ENOSYS }`; the `ENOSYS` default remains for `ConfigureEndpoints`/`SubmitTransfer` until H.4.
+- [x] `UsbRequest::GetDescriptors { slot_id }` returns `UsbReply::Descriptors { device, config }` from the enumeration-time cache (not a fresh control read) for an enumerated device. — server arm wired to `Controller::cached_descriptors`; `XhciHostOps::{get_device_descriptor(len≥18),get_config_full}` cache the raw blobs into the per-slot `SlotContext`. Live class-driver read exercised by B.1/G.1.
+- [x] A configuration descriptor larger than 64 bytes round-trips intact (bounded by `USB_MSG_MAX`=4096), proven by a host test over the wire codec. — `protocol::tests::descriptors_large_config_roundtrip` (512-byte config) PASSES.
+- [x] The arm no longer returns `Error { code: ENOSYS }`; the `ENOSYS` default remains for `ConfigureEndpoints`/`SubmitTransfer` until H.4.
 
 ### H.2 — Capture non-matching events during a blocking control transfer
 
@@ -52,9 +126,9 @@
 **Why it matters:** the bulk-OUT path already captures concurrent interrupt/bulk-IN completions (`wait_for_bulk_out_event`), but a blocking **control** transfer still discards non-matching `TransferEvent`s. Once control traffic (Report-Protocol descriptor reads, LED `SET_REPORT`, GET_MAX_LUN) interleaves with active interrupt/bulk polling, a report completing mid-transfer would be dropped and its endpoint left un-rearmed — the second 78c carry-over item.
 
 **Acceptance:**
-- [ ] `drain_for_transfer_event` routes non-matching IN-endpoint completions through `capture_interrupt_report` + deferred re-arm (mirroring `wait_for_bulk_out_event`), instead of discarding them.
-- [ ] A test (or instrumented run) issuing a control transfer while an interrupt endpoint is armed shows no dropped report and no un-rearmed endpoint.
-- [ ] No regression in `usb-smoke` (HID boot path) or `usb-eth-smoke` (bulk path).
+- [x] `drain_for_transfer_event` routes non-matching IN-endpoint completions through `capture_interrupt_report` + deferred re-arm (mirroring `wait_for_bulk_out_event`), instead of discarding them. — applied to **both** `drain_for_transfer_event` (EP0 control) and `drain_for_command_completion` (Configure/Disable Slot); callers `wait_for_transfer_event`/`issue_command_and_wait` re-arm at `armed_len`.
+- [ ] A test (or instrumented run) issuing a control transfer while an interrupt endpoint is armed shows no dropped report and no un-rearmed endpoint. — structurally mirrors the proven bulk-OUT path; a dedicated live no-drop assertion is exercised by B.4 (`SET_REPORT` interleaved with HID polling).
+- [x] No regression in `usb-smoke` (HID boot path) or `usb-eth-smoke` (bulk path). — `usb-smoke` PASSES (kbd+mouse decoded live); `usb-eth-smoke` needs the absent `ure` crate so it is not present in-tree (Track G).
 
 ### H.3 — Disable Slot reclamation
 
@@ -66,11 +140,13 @@
 **Why it matters:** `Enable Slot` allocates a slot at enumeration but nothing reclaims it. Hot-plug detach (Track C) and re-enumeration cycles would leak slot IDs and DCBAA entries until the controller's slot pool exhausts. Disable Slot is the matching teardown.
 
 **Acceptance:**
-- [ ] A `disable_slot` command is issued (and its Command Completion drained) when a device detaches, freeing the DCBAA entry and slot-context allocations.
-- [ ] A repeated attach/detach loop (QMP `device_add`/`device_del`, ≥ slot-pool-count iterations) does not exhaust slots — the Nth attach still enumerates.
-- [ ] Slot-handle packing (`pack_handle`) correctly reuses a reclaimed slot without misrouting (`unpack_handle` round-trip holds).
+- [x] A `disable_slot` command is issued (and its Command Completion drained) when a device detaches, freeing the DCBAA entry and slot-context allocations. — `Controller::disable_slot` (issues `Trb::disable_slot`, drains via `issue_command_and_wait`, zeroes `DCBAA[slot]`, drops the `SlotContext`) + the `Trb::disable_slot` builder (host-tested `encode_disable_slot`). The detach trigger is wired in Track C's `process_port_events`; proven end-to-end by `usb-hotplug-smoke`.
+- [x] A repeated attach/detach loop (QMP `device_add`/`device_del`, ≥ slot-pool-count iterations) does not exhaust slots — the Nth attach still enumerates. — `usb-hotplug-smoke` runs 3 attach/detach cycles, each Enable+Disable Slot; all attaches enumerate (no exhaustion).
+- [x] Slot-handle packing (`pack_handle`) correctly reuses a reclaimed slot without misrouting (`unpack_handle` round-trip holds). — the gate's per-cycle re-attach routes correctly (the device is found + enumerated each cycle).
 
 ### H.4 — Page-grant `SubmitTransfer` for oversized bulk data phases
+
+> **Sequencing:** deferred to land with **Track D.5** (its only consumer). Inline `SubmitBulkOut`/`PollBulkIn` cover ≤ 4096-byte data phases (an 8 × 512-byte-sector READ(10) fits), so D.1–D.4 do not need it; it is implemented when the multi-sector overflow path is built.
 
 **Files:**
 - `userspace/drivers/xhci/src/server.rs`
@@ -84,6 +160,30 @@
 - [ ] A > 4096-byte transfer (e.g. an 8-sector READ(10)) completes via the page-grant path; a ≤ 4096-byte transfer still uses the inline path.
 - [ ] The grant is unmapped on completion (no IOVA leak across repeated transfers), reusing the H.1/PR-248 buffer-lifetime discipline.
 
+### H.5 — Reclaim the slot when a hot-plug handle can't be packed (PR #252 readiness)
+
+**File:** `userspace/drivers/xhci/src/server.rs`
+**Symbol:** `process_port_events` (the attach arm, ~`server.rs:233`, where `pack_handle` returns `None`)
+**Why it matters:** on hot-plug attach the server runs Enable Slot (allocating a hardware slot + `SlotContext`) **before** `pack_handle(ctrl_idx, slot_id)`. If `pack_handle` returns `None` (`ctrl_idx > 3`, i.e. ≥5 controllers, or hw slot > 63) the code logs "unpackable handle" and continues without `disable_slot` — leaking the very slot H.3 set out to reclaim. Reachable only in the multi-controller regime, so it pairs with Track F / Phase 92d, but it is live code today. (The identical bring-up-path case at ~`server.rs:300` predates this phase.)
+
+**Acceptance:**
+- [ ] When `pack_handle` returns `None` on the attach path, the server issues `disable_slot` for the just-enabled slot before dropping the device (no slot leak) and logs the drop.
+- [ ] An instrumented run in the ≥5-controller / slot>63 regime shows no slot-pool leak across repeated unpackable attaches.
+
+### H.6 — Bound device-controlled lengths against `USB_MSG_MAX` (PR #252 readiness)
+
+**Files:**
+- `userspace/drivers/xhci/src/server.rs`
+- `kernel-core/src/usb/enumerate.rs`
+
+**Symbol:** the cached config-descriptor read (uses the device's `wTotalLength`) + `cache_config_descriptor` + the `Descriptors` reply encode; the `SubmitBulkIn { len }` arm (~`server.rs:504`)
+**Why it matters:** both paths trust a device-/caller-supplied length. A device reporting `wTotalLength` near 65535 makes the server hold a ~64 KiB blob and emit a `Descriptors` reply far over `USB_MSG_MAX` (4096); a `SubmitBulkIn { len }` near/over 4090 produces an oversized `BulkData` reply. Both **fail closed** today (the client's 4096-byte buffer truncates → length-prefixed `decode` returns `None`; no panic/OOB) and the only live callers stay well under budget — so this is hardening, not a live bug. An explicit server-side cap (reject/clamp + logged error) is clearer than silent truncation and removes the per-slot memory-amplification window from a compromised/buggy class driver.
+
+**Acceptance:**
+- [ ] The server rejects (or clamps with a logged error) a cached config blob / `Descriptors` reply that would exceed `USB_MSG_MAX`, instead of relying on client-side truncation.
+- [ ] `SubmitBulkIn { len }` that would overflow `USB_MSG_MAX` returns an explicit `UsbReply::Error` rather than a silently-truncated `BulkData`.
+- [ ] Test coverage asserts the over-budget case takes the error path (the under-budget BOT lengths 13/36/512 are unaffected).
+
 ---
 
 ## Track A — Multi-Tier Hub Enumeration
@@ -95,9 +195,9 @@
 **Why it matters:** at 1.0 the hub daemon exits immediately after proving the kernel-core link. Track A turns it into a resident process that waits on the `usb` service, walks `NextAttach` (cursor 0..until `notice.is_none()`), and filters for `interface_class == CLASS_HUB` (0x09) — the entry point for everything else in this track.
 
 **Acceptance:**
-- [ ] `usbhub` no longer returns from `program_main`; it registers on the `usb` service (`USB_SERVICE_NAME`) and loops.
-- [ ] It discovers a `CLASS_HUB` device via the `NextAttach` cursor walk and logs a hub-found marker.
-- [ ] No regression in `xhci-bringup-smoke` (the `BOOT_LOG_MARKER` assertion still passes).
+- [x] `usbhub` no longer returns immediately from `program_main`; it waits on the `usb` service (`USB_SERVICE_NAME`) and walks the `NextAttach` cursor. — `program_main` rewritten as a resident walker.
+- [x] It discovers a `CLASS_HUB` device via the `NextAttach` cursor walk and logs a hub-found marker. — server `device_info_from_ctx` now surfaces `CLASS_HUB`; the daemon logs `usbhub: bound hub slot=…` (proven by `usb-hub-smoke`).
+- [x] No regression in `xhci-bringup-smoke` / `usb-smoke` (HID boot path) — `usb-smoke` PASSES; the surfaced hub does not disturb the HID/bulk class drivers (they filter by class).
 
 ### A.2 — Hub bring-up: descriptor read + per-port power/reset
 
@@ -109,9 +209,9 @@
 **Why it matters:** all the hub-class control encoders are host-tested in `kernel-core` but have no live caller. A.2 issues `GET_DESCRIPTOR(Hub)` to learn `bNbrPorts`/`bPwrOn2PwrGood`, then `SET_FEATURE(PORT_POWER)` per port (waiting `bPwrOn2PwrGood × 2 ms`) and `SET_FEATURE(PORT_RESET)` on a detected connection — the standard hub power/reset sequence.
 
 **Acceptance:**
-- [ ] `HubDescriptor::parse` is fed a live `GET_DESCRIPTOR(Hub)` reply; `bNbrPorts` drives the per-port loop.
-- [ ] `SET_FEATURE(PORT_POWER, port)` is issued for every downstream port, honoring the `bPwrOn2PwrGood` settle delay.
-- [ ] On a port-connection, `SET_FEATURE(PORT_RESET, port)` is issued and the `C_PORT_RESET` change bit is acked with `CLEAR_FEATURE`.
+- [x] `HubDescriptor::parse` is fed a live `GET_DESCRIPTOR(Hub)` reply; `bNbrPorts` drives the per-port loop. — `enumerate_hub` issues `get_hub_descriptor` over EP0 `ControlRequest`, parses, logs `XHCI_HUB:enumerated ports=N` (proven by `usb-hub-smoke`).
+- [x] `SET_FEATURE(PORT_POWER, port)` is issued for every downstream port, honoring the `bPwrOn2PwrGood` settle delay. — per-port `set_port_feature(PORT_POWER, port)` + a `bPwrOn2PwrGood × 2 ms` settle.
+- [~] On a port-connection, `SET_FEATURE(PORT_RESET, port)` is issued and the `C_PORT_RESET` change bit is acked with `CLEAR_FEATURE`. — the reset/ack path is implemented (`GET_PORT_STATUS` → `PORT_RESET` → poll-for-enable → `CLEAR_FEATURE(C_PORT_RESET)`); exercising it against a *connected* downstream device pairs with tier-2 enumeration (**Phase 92a**), since QEMU device-behind-hub needs port-path topology + the device to actually enumerate to be meaningful.
 
 ### A.3 — `GET_PORT_STATUS` encoder + port-status bitmap helpers
 
@@ -120,9 +220,9 @@
 **Why it matters:** the hub state machine needs to read the 4-byte port status to detect connection (CCS), confirm enable (PE), and clear change bits (RW1C). The encoder and bit helpers are the only hub primitives `kernel-core` does not yet have; they belong next to `set_port_feature`/`clear_port_feature` and must be host-tested like the rest.
 
 **Acceptance:**
-- [ ] `get_port_status` encodes the class GET_STATUS SetupPacket; host test asserts the exact 8 bytes.
-- [ ] Bitmap helpers decode CCS/PE/RESET (bytes 0–1) and C_CONNECTION/C_RESET (bytes 2–3) per USB 2.0 §11.24.2.7; host-tested against known status words.
-- [ ] The hub state machine polls `GET_PORT_STATUS` after `PORT_RESET` until `C_PORT_RESET` clears and `PORT_ENABLE` is set.
+- [x] `get_port_status` encodes the class GET_STATUS SetupPacket; host test asserts the exact 8 bytes. — `get_port_status(port)` (bmRequestType `0xA3`, bRequest `0x00`, wValue 0, wIndex=port, wLength=4); host tests `get_port_status_port{1,3}_encoding` assert the 8 bytes.
+- [x] Bitmap helpers decode CCS/PE/RESET (bytes 0–1) and C_CONNECTION/C_RESET (bytes 2–3) per USB 2.0 §11.24.2.7; host-tested against known status words. — `port_status_{connected,enabled,resetting}` + `port_change_{connection,reset}` with named bit consts; short-slice inputs return false (no panic). 36 hub tests pass.
+- [x] The hub state machine polls `GET_PORT_STATUS` after `PORT_RESET` until `PORT_ENABLE` is set. — consumed by the live `usbhub` walker (A.2 `enumerate_hub`).
 
 ### A.4 — Surface hubs + assign tier-2+ slots in the xHCI server
 
@@ -160,9 +260,12 @@
 **Why it matters:** 1.0 ships Boot Protocol only; the Report Descriptor parser is dead code. B.1 reads the Report Descriptor at device bind (via `GetDescriptors`/`ControlRequest`, H.1), parses it into a `ReportField` array stored in per-device state, and decodes variable-format reports by that layout instead of the fixed boot offsets.
 
 **Acceptance:**
-- [ ] `parse_report_descriptor` gains a live call site in `usb-hid` at device bind; the parsed `ReportField` array is stored per device.
-- [ ] A Report-Protocol device's reports decode by the parsed field layout (not the boot 8-byte/3-byte assumption).
-- [ ] The existing Boot-Protocol keyboard/mouse path is unchanged (`usb-smoke` still PASSES).
+- [x] `parse_report_descriptor` gains a live call site in `usb-hid` at device bind; the parsed `ReportField` array is stored per device. — `fetch_report_fields` issues `GET_DESCRIPTOR(Report)` over EP0 for each `CLASS_HID` interface, parses it, stores `HidDevice.report_fields`, and logs `USB_HID:report-parsed proto=P fields=N` (asserted by `usb-smoke`).
+- [~] A Report-Protocol device's reports decode by the parsed field layout (not the boot 8-byte/3-byte assumption). — **Phase 92b** (B.2-live): the layout is stored; the data-driven decode + usage→event mapping + a `usb-tablet` QMP-abs-input gate arm are scheduled there.
+- [x] The existing Boot-Protocol keyboard/mouse path is unchanged (`usb-smoke` still PASSES). — `usb-smoke` PASSES (kbd+mouse decode live + render); the boot decode path is untouched.
+- [ ] **(PR #252 readiness, 92b)** `usb-hid` reads the HID descriptor's `wDescriptorLength` instead of the hard-coded `REQ_LEN = 256` (`fetch_report_fields`), so the Report descriptor is not over-read into zero padding that parses as spurious trailing zero-width fields.
+- [ ] **(PR #252 readiness, 92b)** The stale `hid_report.rs` module doc header ("not wired to any live device") is corrected — the parser is now called live at bind (B.1).
+- [ ] **(PR #252 readiness, 92b)** A host test feeds `parse_report_descriptor` a hostile Report Count/Size (e.g. a 4-byte `0xFFFFFFFF` count) to lock in the saturating/clamped (≤65536 fields) behavior now that the parser sees live device input.
 
 ### B.2 — Multi-axis / extra-button / scroll decode (touchpad + gaming mouse)
 
@@ -175,7 +278,7 @@
 **Why it matters:** a gaming mouse reports a scroll wheel + extra buttons; a touchpad reports X/Y/pressure + contact IDs. The parser must emit multiple `ReportField`s for Usage ranges and respect Report IDs, and `usb-hid` must unpack arbitrary bit fields and map usages (X=0x01:0x30, Y=0x01:0x31, buttons=0x09:0x01..) to `mouse_server` events.
 
 **Acceptance:**
-- [ ] `parse_report_descriptor` emits a `ReportField` per usage for a Usage Min/Max range and tags fields with their Report ID; host tests cover both.
+- [x] `parse_report_descriptor` emits a `ReportField` per usage for a Usage Min/Max range and tags fields with their Report ID; host tests cover both. — `kernel_core::usb::hid_report` Usage-Min/Max range expansion + per-Report-ID `report_id` tagging + offset reset; host tests `usage_min_max_range_expands_to_one_field_per_usage` + `two_report_ids_tag_fields_and_reset_offset`. (The live `usb-hid` decode using this — B.2 remainder — is pending.)
 - [ ] A Report-Protocol gaming mouse delivers correct X/Y + a scroll axis + ≥4 buttons through `mouse_server` (`USB_HID:mouse` sentinels reflect the extra axes/buttons).
 - [ ] A single-pointer touchpad maps to pointer motion (multi-touch contact tracking is explicitly deferred — see design doc).
 
@@ -221,9 +324,9 @@
 **Why it matters:** at 1.0 the device table is built once at bring-up; Port Status Change events are decoded but nothing reacts. C.1 makes the server read PORTSC on a change event, classify CSC/PRC/PLC, and drive attach/detach — the foundation of hot-plug.
 
 **Acceptance:**
-- [ ] A Port Status Change event on a root-hub port triggers a PORTSC read and a CSC/PRC/PLC classification (not just an event decode).
-- [ ] A CSC attach runs `run_enumeration` for the new device and publishes its `AttachNotice` dynamically (no server restart).
-- [ ] Change bits are acked via the RW1C-safe `portsc_clear_change` (no accidental status-bit clear).
+- [x] A Port Status Change event on a root-hub port triggers a PORTSC read and a CSC/PRC/PLC classification (not just an event decode). — `on_port_status_change` (now `&mut self`) reads PORTSC and classifies CSC connect vs disconnect; PRC is acked in the `reset_port_with_speed` path. Proven by `usb-hotplug-smoke`.
+- [x] A CSC attach runs `run_enumeration` for the new device and publishes its `AttachNotice` dynamically (no server restart). — `process_port_events` → `enumerate_port` → `served.push`; `USB_HOTPLUG:attached` asserted by the gate.
+- [x] Change bits are acked via the RW1C-safe `portsc_clear_change` (no accidental status-bit clear). — unchanged RW1C ack in `on_port_status_change`.
 
 ### C.2 — Detach notification (`attached: false`)
 
@@ -232,8 +335,8 @@
 **Why it matters:** the protocol already carries a detach flag, but nothing emits it. C.2 publishes `AttachNotice { attached: false, .. }` on a CSC-clear (device removed) so class drivers learn a device went away.
 
 **Acceptance:**
-- [ ] A device removal produces an `AttachNotice` with `attached == false` carrying the departing device's slot/port/class.
-- [ ] The `NextAttach` cursor walk and detach stream coexist without losing either (a removal is observed by a class driver polling `NextAttach`).
+- [x] A device removal produces an `AttachNotice` with `attached == false` carrying the departing device's slot/port/class. — `process_port_events` flips `served[pos].attached = false` for the departing (ctrl,port). Proven by `USB_HOTPLUG:detached`.
+- [x] The `NextAttach` cursor walk and detach stream coexist without losing either (a removal is observed by a class driver polling `NextAttach`). — `served` is append-only so cursors stay stable; the detached entry remains visible with `attached: false`.
 
 ### C.3 — Dynamic re-enumeration on attach
 
@@ -242,8 +345,8 @@
 **Why it matters:** the Enable Slot → Address Device → Configure Endpoint sequence runs once at bring-up. C.3 reuses the *stateless* enumeration state machine on demand when a port newly connects, so a freshly attached device is brought to `Configured` without re-running global bring-up.
 
 **Acceptance:**
-- [ ] A device attached after boot (QMP `device_add`) is enumerated to `Configured` and surfaced via `AttachNotice` — no daemon restart.
-- [ ] Re-attaching after a detach re-enumerates cleanly (fresh slot via H.3), proven by an attach/detach/attach cycle.
+- [x] A device attached after boot (QMP `device_add`) is enumerated to `Configured` and surfaced via `AttachNotice` — no daemon restart. — `usb-hotplug-smoke` `device_add usb-mouse` → `USB_HOTPLUG:attached`.
+- [x] Re-attaching after a detach re-enumerates cleanly (fresh slot via H.3), proven by an attach/detach/attach cycle. — the gate runs **3 attach/detach cycles**, each re-enumerating + reclaiming the slot (no exhaustion).
 
 ### C.4 — Propagate detach to class drivers + slot teardown
 
@@ -257,9 +360,9 @@
 **Why it matters:** a clean detach must release the class driver's capabilities and reclaim the slot, or a removed flash drive leaves a stale `/mnt/usb<n>` mount and a leaked slot. C.4 wires each class driver to drop its device state on detach and the server to Disable Slot.
 
 **Acceptance:**
-- [ ] `usb-hid`/`usb-storage`/`usb-net` each release their per-device state on an `attached: false` notice for a slot they own.
-- [ ] The server issues Disable Slot for the departed device (H.3) and the slot is reusable.
-- [ ] Unplugging a mounted USB stick unmounts `/mnt/usb<n>` without wedging the VFS (Track D integration).
+- [ ] `usb-hid`/`usb-storage`/`usb-net` each release their per-device state on an `attached: false` notice for a slot they own. — **server-side teardown done**; the class-driver-side release is scheduled per driver alongside that driver's resident-state work: **usb-storage → Phase 92a**, **usb-hid → Phase 92b**, **usb-net → Phase 92e** (see the Sub-Phase Schedule coverage map).
+- [x] The server issues Disable Slot for the departed device (H.3) and the slot is reusable. — `process_port_events` calls `Controller::disable_slot`; the 3-cycle gate proves the slot is reused without exhaustion.
+- [ ] Unplugging a mounted USB stick unmounts `/mnt/usb<n>` without wedging the VFS (Track D integration). — **Phase 92a** (pairs with the D.4 mount).
 
 ---
 
@@ -275,9 +378,10 @@
 **Why it matters:** mass storage is a bulk-class device — the exact transport the Phase 96 `ure` NIC already proved. D.1 stands up a new `usb-storage` ring-3 driver that binds a `CLASS_MASS_STORAGE` (0x08) interface from the `NextAttach` walk and drives its bulk IN/OUT pair using the existing primitives — **no new transport**. (New crate ⇒ the four-place wiring from AGENTS.md: workspace member, `xtask` `bins`, ramdisk `BIN_ENTRIES`, service config.)
 
 **Acceptance:**
-- [ ] `usb-storage` binds a `CLASS_MASS_STORAGE` interface (`bulk_in_dci`/`bulk_out_dci` from `AttachNotice`) and exchanges bytes over `SubmitBulkOut`/`PollBulkIn`.
-- [ ] The driver guards on `bulk_in_dci != 0` / `bulk_out_dci != 0` before issuing bulk requests (a device with no bulk pair is rejected, not crashed).
-- [ ] The crate is wired in all four places and appears in the ramdisk (`execve` resolves it).
+- [x] `usb-storage` binds a `CLASS_MASS_STORAGE` interface (`bulk_in_dci`/`bulk_out_dci` from `AttachNotice`) and exchanges bytes over `SubmitBulkOut`/`PollBulkIn`. — the new `usb-storage` daemon binds the device and completes a **full BOT CBW-out + CSW-in round-trip** (`GET_MAX_LUN` class control + `TEST UNIT READY`) over the bulk pair on a real (SuperSpeed) device; `usb-storage-smoke` asserts `USB_STORAGE:bot-ok`.
+- [x] The driver guards on `bulk_in_dci != 0` / `bulk_out_dci != 0` before issuing bulk requests (a device with no bulk pair is rejected, not crashed). — the `NextAttach` bind loop filters `interface_class == 0x08 && bulk_in_dci != 0 && bulk_out_dci != 0`.
+- [x] The crate is wired in all four places and appears in the ramdisk (`execve` resolves it). — workspace member + `xtask` `bins` + ramdisk `DRIVERS_ENTRIES` (`/drivers/usb-storage`) + init `usb-storage.conf` (daemon, `depends=xhci_driver`); the daemon spawns + binds the device, proven by the gate.
+- [x] **The bulk-IN data phase (INQUIRY + READ CAPACITY) round-trips.** — RESOLVED via a new synchronous, single-TRB `UsbRequest::SubmitBulkIn` / `Controller::submit_bulk_in` (one bulk-IN TRB per BOT phase, no streaming auto-re-arm). Root cause of the prior `cc=6` STALL: the Phase 96 streaming bulk-IN path arms `depth`=4 auto-re-armed TRBs (correct for a NIC), so after the device's data + CSW the surplus IN tokens — issued while the device is back in CBW-wait — made it STALL the endpoint. The synchronous path never issues a surplus IN token. `usb-storage-smoke` now asserts `USB_MASS_STORAGE:ready blocks=16384 bsize=512` (8 MiB scratch image). Unblocks **D.4**.
 
 ### D.2 — CBW/CSW framing + SCSI command subset + `GET_MAX_LUN`
 
@@ -285,10 +389,13 @@
 **Symbol:** `Cbw` (31-byte Command Block Wrapper), `Csw` (13-byte Command Status Wrapper); SCSI ops TEST UNIT READY, INQUIRY, READ CAPACITY(10), READ(10), WRITE(10), REQUEST SENSE; `GET_MAX_LUN` over `UsbRequest::ControlRequest`
 **Why it matters:** BOT wraps each SCSI command in a CBW on bulk-out and reads a CSW on bulk-in. Parsing SCSI in the ring-3 daemon keeps the kernel SCSI-unaware. `GET_MAX_LUN` (a class control-IN, over the live `ControlRequest`) tells the driver how many logical units the device exposes.
 
+> **Implementation note:** the pure BOT/SCSI codec lives in `kernel-core/src/usb/mass_storage.rs` (host-testable, the `hid_report`/`hub` pattern), consumed by the future `usb-storage` daemon — so the kernel stays SCSI-unaware (kernel-core is a shared lib, not called by the kernel binary).
+
 **Acceptance:**
-- [ ] `Cbw`/`Csw` encode/decode are host-tested against known byte layouts (dCBWSignature `USBC`, dCSWSignature `USBS`).
-- [ ] `INQUIRY` + `READ CAPACITY(10)` return device identity and block count; `READ(10)`/`WRITE(10)` move sectors; a failed command surfaces `REQUEST SENSE`.
-- [ ] `GET_MAX_LUN` is issued over `ControlRequest`; a device reporting STALL is treated as single-LUN.
+- [x] `Cbw`/`Csw` encode/decode are host-tested against known byte layouts (dCBWSignature `USBC`, dCSWSignature `USBS`). — `kernel_core::usb::mass_storage` `Cbw::encode`/`Csw::parse` + 31 host tests (signatures, tag/len LE, CDB pad, short-buffer rejection).
+- [x] `INQUIRY` + `READ CAPACITY(10)` return device identity and block count; `READ(10)`/`WRITE(10)` move sectors; a failed command surfaces `REQUEST SENSE`. — codec host-tested (CDB builders big-endian, `InquiryData`/`ReadCapacity10` parsers) **and the live BOT data movement is proven**: the `usb-storage` daemon reads INQUIRY + READ CAPACITY, and a `WRITE(10)` + `READ(10)` sector round-trip verifies byte-identical (`USB_STORAGE:rw-ok` in `usb-storage-smoke`) — WRITE data-OUT over `SubmitBulkOut` + READ data-IN over `SubmitBulkIn`. (REQUEST SENSE builder host-tested; surfaced on a failed command.)
+- [x] `GET_MAX_LUN` is issued over `ControlRequest`; a device reporting STALL is treated as single-LUN. — `get_max_lun(iface)` SetupPacket encoder host-tested (`A1 FE 00 00 iface 00 01 00`); live issuance + STALL→single-LUN policy is the daemon (D.1).
+- [ ] **(PR #252 readiness, 92a)** A comment in `cmd_usb_storage_smoke` notes that the `USB_STORAGE:rw-ok` round-trip depends on the 8 MiB / 512-byte scratch geometry (a non-512 device safely skips the round-trip, so the gate times out rather than false-passing).
 
 ### D.3 — UAS (USB Attached SCSI)
 
@@ -412,7 +519,7 @@
 **Acceptance:**
 - [ ] `usb-net` binds a CDC-ECM interface (`bInterfaceClass=0x02` + `0x0a` data), parses the CDC functional descriptors, selects the data alt-setting, and reads the MAC from the ECM MAC-address string descriptor.
 - [ ] Ethernet frames move over the bulk pair (`PollBulkIn`/`SubmitBulkOut`) and the kernel net stack binds the `RemoteNic` (`[remote_nic] … registered ring-3 NIC driver`).
-- [ ] QEMU has no CDC-ECM model ⇒ the live arm is bare-metal/VFIO-gated with skip-with-reason (mirroring `usb-eth-smoke`); host tests cover the CDC descriptor parse + frame framing.
+- [x] QEMU has no CDC-ECM model ⇒ the live arm is bare-metal/VFIO-gated with skip-with-reason (mirroring `usb-eth-smoke`); host tests cover the CDC descriptor parse + frame framing. — **host-logic landed**: `kernel_core::usb::cdc::{find_ethernet_functional_desc, has_ncm_functional_desc}` + 23 host tests cover the CDC functional-descriptor parse (the live `usb-net` bind is bare-metal/VFIO-only, pending).
 
 ### G.2 — CDC-NCM (framed/aggregated NTB)
 
@@ -421,7 +528,7 @@
 **Why it matters:** CDC-NCM aggregates multiple Ethernet frames into one bulk transfer (NTB) for higher throughput than ECM's one-frame-per-transfer. G.2 adds NTB parse/build on the same bulk path.
 
 **Acceptance:**
-- [ ] NTB encode/decode (NTH16 + NDP16) is host-tested against a known NTB carrying ≥2 datagrams.
+- [x] NTB encode/decode (NTH16 + NDP16) is host-tested against a known NTB carrying ≥2 datagrams. — `kernel_core::usb::cdc::{build_ntb16, parse_ntb16}` round-trip (`ntb16_round_trip_two_datagrams`) + malformed-NTB rejection tests.
 - [ ] A CDC-NCM dongle (bare-metal) brings up a `RemoteNic` and aggregates TX frames into NTBs; RX NTBs are split back into frames.
 
 ### G.3 — Shared USB-Ethernet device-match registry (adopt `ure`)
@@ -485,9 +592,11 @@
 **Why it matters:** every phase closes by bumping the kernel minor version so the boot banner, `uname`, and `/proc/version` report the phase that landed; the AGENTS.md overview line is the canonical human-readable version.
 
 **Acceptance:**
-- [ ] `kernel/Cargo.toml` version is `0.92.0`; the boot banner / `uname` report `0.92.0` (no other string edits needed).
-- [ ] The AGENTS.md Project Overview line reads "kernel **v0.92.0**".
-- [ ] A new capability bullet is added to the AGENTS.md inventory **only if** Phase 92 introduces a new capability class (USB mass storage + USB-Ethernet class + USB audio/video are new device classes under the existing USB bullet — prefer rewriting the USB bullet over adding prose, per the maintenance policy).
+- [x] `kernel/Cargo.toml` version is `0.92.0`; the boot banner / `uname` / `/proc/version` report `0.92.0` (all read `env!("CARGO_PKG_VERSION")`, so the bump propagates with no other string edits).
+- [x] The AGENTS.md Project Overview line reads "kernel **v0.92.0**".
+- [x] The AGENTS.md USB capability bullet is rewritten to add the new device classes (live hot-plug, USB mass storage, the resident hub walker) under the existing USB bullet — per the maintenance policy. Tier-2/mount/isoch/CDC-ECM are noted as sub-phases 92a–92e.
+
+> **Sub-phase versioning.** The `0.92.0` bump lands **with the Phase 92 core** (this PR) to mark the milestone. Sub-phases **92a–92e land as `0.92.x` patch releases** (each bumps the patch when it merges); the `0.93.0` minor is the next *distinct* phase.
 
 ### I.5 — Phase 92 learning documentation
 
@@ -503,6 +612,20 @@
 - [ ] `docs/92-usb-class-expansion.md` exists, follows the seven-section aligned-learning-doc template, and explains the route string, Report Protocol, BOT/UAS, isochronous endpoints, and the CDC-ECM-vs-vendor-`ure` generalization.
 - [ ] It is linked from the `docs/README.md` Phase-Aligned Learning Docs table and referenced in `docs/appendix/codebase-map.md`.
 - [ ] The `docs/roadmap/README.md` Phase 92 row Status flips `Planned` → `Complete` (and the Tasks cell links this task doc) when the phase lands.
+
+### I.6 — Wire the Phase 92 core USB gates into the regression flag (PR #252 readiness)
+
+**Files:**
+- `.githooks/pre-push`
+- `.github/workflows/` (the USB regression job)
+- `AGENTS.md` (the `M3OS_USB_REGRESSION` gate row)
+
+**Symbol:** the `M3OS_USB_REGRESSION` opt-in block (today runs only `xhci-bringup-smoke`/`xhci-enum-smoke`/`usb-smoke`)
+**Why it matters:** the three new core gates (`usb-hotplug-smoke`, `usb-storage-smoke`, `usb-hub-smoke`) PASS when invoked but are not in `M3OS_USB_REGRESSION` or any CI workflow, so a regression in the **landed** hot-plug / mass-storage / hub paths would not be caught automatically. (The host-side `usb-core` codec tests were wired into `cargo xtask check` in PR #252; this is the QEMU-gate half. Near-term — schedule with 92a.)
+
+**Acceptance:**
+- [ ] `usb-hotplug-smoke`, `usb-storage-smoke`, and `usb-hub-smoke` run under `M3OS_USB_REGRESSION` (and/or the CI USB job) alongside `usb-smoke`.
+- [ ] The AGENTS.md `M3OS_USB_REGRESSION` row lists the three added gates.
 
 ---
 

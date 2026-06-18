@@ -292,6 +292,27 @@ pub enum UsbRequest {
         data: Vec<u8>,
     },
 
+    /// Submit a **synchronous, single-TRB bulk-IN** transfer of exactly `len`
+    /// bytes and block for completion, returning the received bytes inline in
+    /// [`UsbReply::BulkData`]. Phase 92 Track D — the USB Mass Storage Bulk-Only
+    /// Transport (BOT) data + CSW phases.
+    ///
+    /// Unlike [`UsbRequest::PollBulkIn`] (the non-blocking streaming poll that
+    /// keeps `depth` IN TRBs queued and auto-re-arms — correct for a NIC that
+    /// always has another frame), this arms exactly **one** TRB of `len` bytes
+    /// and never re-arms, so the device is never issued a surplus IN token while
+    /// it is back in CBW-wait state (which would STALL the bulk-IN endpoint). BOT
+    /// is a strict request/response protocol, so this one-transfer-per-phase
+    /// discipline is required.
+    SubmitBulkIn {
+        /// Target slot ID.
+        slot_id: u8,
+        /// Device Context Index of the bulk-IN endpoint.
+        dci: u8,
+        /// Exact number of bytes to request for this transfer phase.
+        len: u16,
+    },
+
     /// Diagnostic: snapshot the host's live root-hub topology across every
     /// brought-up controller. No target — the server reads each controller's
     /// `PORTSC` registers and returns [`UsbReply::Topology`]. Bare-metal
@@ -526,6 +547,7 @@ const REQ_CONTROL_WRITE: u8 = 7;
 const REQ_POLL_BULK_IN: u8 = 8;
 const REQ_SUBMIT_BULK_OUT: u8 = 9;
 const REQ_TOPOLOGY: u8 = 10;
+const REQ_SUBMIT_BULK_IN: u8 = 11;
 
 // --- reply tags ---
 const REP_DESCRIPTORS: u8 = 1;
@@ -726,6 +748,12 @@ impl UsbRequest {
                 v.push(*dci);
                 put_bytes(&mut v, data);
             }
+            UsbRequest::SubmitBulkIn { slot_id, dci, len } => {
+                v.push(REQ_SUBMIT_BULK_IN);
+                v.push(*slot_id);
+                v.push(*dci);
+                put_u16(&mut v, *len);
+            }
             UsbRequest::Topology => {
                 v.push(REQ_TOPOLOGY);
             }
@@ -792,6 +820,11 @@ impl UsbRequest {
                 slot_id: r.u8()?,
                 dci: r.u8()?,
                 data: r.bytes()?,
+            },
+            REQ_SUBMIT_BULK_IN => UsbRequest::SubmitBulkIn {
+                slot_id: r.u8()?,
+                dci: r.u8()?,
+                len: r.u16()?,
             },
             REQ_TOPOLOGY => UsbRequest::Topology,
             _ => return None,
@@ -1096,6 +1129,11 @@ mod tests {
                 dci: 4,
                 data: alloc::vec![0x00, 0x00, 0x40, 0x00, 0xde, 0xad, 0xbe, 0xef],
             },
+            UsbRequest::SubmitBulkIn {
+                slot_id: 1,
+                dci: 5,
+                len: 36,
+            },
         ];
         for r in reqs {
             let bytes = r.encode();
@@ -1338,6 +1376,35 @@ mod tests {
             } => {
                 assert_eq!(transferred, 8);
                 assert_eq!(completion_code, 1);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// Phase 92 H.1: a full configuration descriptor (interfaces + endpoints +
+    /// class functional descriptors) exceeds the ≤64-byte inline `ControlData`
+    /// clamp, so `GetDescriptors`/`Descriptors` must carry it whole. Prove a
+    /// large blob round-trips intact through the u16-prefixed wire codec
+    /// (bounded by `USB_MSG_MAX`).
+    #[test]
+    fn descriptors_large_config_roundtrip() {
+        let device: alloc::vec::Vec<u8> = (0..18u8).collect();
+        // 512-byte config — well over the 64-byte inline cap, well under USB_MSG_MAX.
+        let config: alloc::vec::Vec<u8> = (0..512u16).map(|i| (i & 0xFF) as u8).collect();
+        assert!(config.len() > 64);
+        let reply = UsbReply::Descriptors {
+            device: device.clone(),
+            config: config.clone(),
+        };
+        let bytes = reply.encode();
+        assert!(bytes.len() <= USB_MSG_MAX, "encoded reply must fit inline");
+        match UsbReply::decode(&bytes).expect("decode") {
+            UsbReply::Descriptors {
+                device: d,
+                config: c,
+            } => {
+                assert_eq!(d, device);
+                assert_eq!(c, config);
             }
             _ => panic!("wrong variant"),
         }

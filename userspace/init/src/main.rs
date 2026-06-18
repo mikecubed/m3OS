@@ -214,6 +214,8 @@ const KNOWN_CONFIGS: &[&[u8]] = &[
     b"/etc/services.d/usbhub.conf\0",
     // Phase 78c: ring-3 USB HID Boot-Protocol class driver.
     b"/etc/services.d/usb-hid.conf\0",
+    // Phase 92 Track D: ring-3 USB Mass Storage (BOT) class driver.
+    b"/etc/services.d/usb-storage.conf\0",
     // Phase 56 Track C: display server (compositor).
     b"/etc/services.d/display_server.conf\0",
     // Phase 57 Track F.2: session_manager daemon.

@@ -27,14 +27,16 @@ use alloc::vec::Vec;
 
 use driver_runtime::IrqNotification;
 use driver_runtime::ipc::{EndpointCap, IpcBackend, RecvResult, SyscallBackend};
-use kernel_core::usb::descriptor::{CLASS_HID, TRANSFER_TYPE_BULK, TRANSFER_TYPE_INTERRUPT};
+use kernel_core::usb::descriptor::{
+    CLASS_HID, CLASS_HUB, TRANSFER_TYPE_BULK, TRANSFER_TYPE_INTERRUPT,
+};
 use kernel_core::usb::enumerate::EnumContext;
 use kernel_core::usb::xhci::trb::dci;
 use syscall_lib::STDOUT_FILENO;
 use syscall_lib::write_str;
 use usb_core::protocol::{AttachNotice, USB_REPLY_LABEL, UsbReply, UsbRequest};
 
-use crate::controller::Controller;
+use crate::controller::{Controller, PortChange};
 use crate::handle::{pack_handle, unpack_handle};
 
 /// Emitted once the server has registered the `usb` service and bound its IRQ
@@ -45,6 +47,14 @@ use crate::handle::{pack_handle, unpack_handle};
 /// keys, but it is a server-readiness marker, not a HID-setup ordering
 /// guarantee.
 pub const USB_SERVER_READY_SENTINEL: &str = "XHCI_USB:server-ready\n";
+
+/// Emitted when a hot-plugged device is enumerated and published as a new
+/// `AttachNotice` at runtime (Phase 92 Track C). The `usb-hotplug-smoke` gate
+/// waits on this after a QMP `device_add`.
+pub const USB_HOTPLUG_ATTACHED_SENTINEL: &str = "USB_HOTPLUG:attached\n";
+/// Emitted when a device disconnect is observed, its `AttachNotice` flipped to
+/// `attached: false`, and its slot reclaimed via Disable Slot (Phase 92 C.2/C.4).
+pub const USB_HOTPLUG_DETACHED_SENTINEL: &str = "USB_HOTPLUG:detached\n";
 
 // errno-style codes carried by `UsbReply::Error`.
 const EINVAL: u16 = 22;
@@ -114,11 +124,19 @@ pub fn device_info_from_ctx(ctx: &EnumContext) -> Option<AttachNotice> {
 
         let hid_surfaceable = i.b_interface_class == CLASS_HID && ep_in_dci != 0;
         let bulk_surfaceable = bulk_in_dci != 0 && bulk_out_dci != 0;
+        // Phase 92 Track A: surface CLASS_HUB interfaces so the `usbhub` daemon
+        // can bind a hub via the `NextAttach` walk and drive it (GET_DESCRIPTOR
+        // (Hub) + per-port PORT_POWER/PORT_RESET over EP0 `ControlRequest`). A hub
+        // exposes a status-change interrupt-IN endpoint but no bulk pair, so it
+        // scores below HID/NIC interfaces and is surfaced on its own low priority.
+        let hub_surfaceable = i.b_interface_class == CLASS_HUB;
         let priority = if hid_surfaceable {
             3
         } else if bulk_surfaceable && i.b_interface_class == CLASS_VENDOR_SPECIFIC {
             2
         } else if bulk_surfaceable {
+            1
+        } else if hub_surfaceable {
             1
         } else {
             continue;
@@ -154,6 +172,101 @@ pub fn device_info_from_ctx(ctx: &EnumContext) -> Option<AttachNotice> {
 /// A brought-up controller plus the IRQ notification and enumerated devices it
 /// owns. The server multiplexes the request loop across a `Vec` of these.
 pub type ControllerCtx = (Controller, IrqNotification, Vec<AttachNotice>);
+
+/// Run the Enable Slot → Address Device → Configure Endpoint sequence for a
+/// freshly connected root-hub `port` (already reset to Enabled at `speed` by
+/// the live event path) and return its `AttachNotice` if it surfaced an
+/// interface. Reuses the *stateless* `run_enumeration` state machine the
+/// bring-up path uses — no global controller re-init (Phase 92 C.3).
+fn enumerate_port(
+    controller: &mut Controller,
+    irq: &IrqNotification,
+    port: u8,
+    speed: kernel_core::usb::xhci::port::PortSpeed,
+) -> Option<AttachNotice> {
+    use kernel_core::usb::enumerate::{EnumContext, EnumState, run_enumeration};
+    let ctx = EnumContext {
+        speed: Some(speed),
+        port,
+        ep0_ring_iova: 0,
+        ..Default::default()
+    };
+    let mut ops = crate::enumerate::XhciHostOps::new(controller, irq);
+    match run_enumeration(EnumState::EnableSlot, ctx, &mut ops) {
+        (EnumState::Configured, final_ctx) => device_info_from_ctx(&final_ctx),
+        _ => None,
+    }
+}
+
+/// Drain each controller's queued root-hub port changes (Phase 92 Track C) and
+/// act on them: enumerate + publish a newly-connected device, or mark a
+/// departing device `attached: false` and reclaim its slot via Disable Slot.
+/// Called on every server loop wake after the event rings are drained. The
+/// `served` table is append-only so the `NextAttach` cursor stays stable — a
+/// detach flips the existing entry's `attached` flag in place; a re-attach
+/// pushes a fresh entry.
+fn process_port_events(controllers: &mut [ControllerCtx], served: &mut Vec<AttachNotice>) {
+    for (ctrl_idx, (c, irq, _devs)) in controllers.iter_mut().enumerate() {
+        for ev in c.take_port_events() {
+            match ev {
+                PortChange::Connect { port, speed } => {
+                    // Skip a port already served (bring-up enumerated the boot
+                    // devices; a re-reported connect must not double-enumerate).
+                    let already = served.iter().any(|n| {
+                        n.attached && n.port == port && unpack_handle(n.slot_id).0 == ctrl_idx
+                    });
+                    if already {
+                        continue;
+                    }
+                    if let Some(mut notice) = enumerate_port(c, irq, port, speed) {
+                        match pack_handle(ctrl_idx, notice.slot_id) {
+                            Some(handle) => {
+                                notice.slot_id = handle;
+                                write_str(STDOUT_FILENO, "[xhci] hot-plug attach port ");
+                                crate::write_u8_dec(port);
+                                write_str(STDOUT_FILENO, " class=");
+                                crate::write_u8_dec(notice.interface_class);
+                                write_str(STDOUT_FILENO, "\n");
+                                served.push(notice);
+                                write_str(STDOUT_FILENO, USB_HOTPLUG_ATTACHED_SENTINEL);
+                            }
+                            None => {
+                                write_str(
+                                    STDOUT_FILENO,
+                                    "xhci_driver: hot-plug device dropped — unpackable handle\n",
+                                );
+                            }
+                        }
+                    }
+                }
+                PortChange::Disconnect { port } => {
+                    if let Some(pos) = served.iter().position(|n| {
+                        n.attached && n.port == port && unpack_handle(n.slot_id).0 == ctrl_idx
+                    }) {
+                        let real_slot = unpack_handle(served[pos].slot_id).1;
+                        served[pos].attached = false;
+                        write_str(STDOUT_FILENO, "[xhci] hot-plug detach port ");
+                        crate::write_u8_dec(port);
+                        write_str(STDOUT_FILENO, "\n");
+                        // Reclaim the slot so a re-attach gets a fresh slot id (H.3).
+                        // The hot-plug gate reads USB_HOTPLUG:detached as "slot
+                        // reclaimed", so emit it only when Disable Slot actually
+                        // succeeds; otherwise log and skip the sentinel so the gate
+                        // fails instead of masking a slot-pool leak.
+                        if c.disable_slot(irq, real_slot) {
+                            write_str(STDOUT_FILENO, USB_HOTPLUG_DETACHED_SENTINEL);
+                        } else {
+                            write_str(
+                                STDOUT_FILENO,
+                                "[xhci] Disable Slot failed on detach — slot not reclaimed\n",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// Run the xHCI USB IPC server across every brought-up controller. Never returns.
 ///
@@ -222,6 +335,9 @@ pub fn run(ep: u32, discovered: u8, mut controllers: Vec<ControllerCtx>) -> ! {
                 for (c, _irq, _d) in controllers.iter_mut() {
                     c.service_interrupt_events();
                 }
+                // A bound-IRQ wake is how a hot-plug Port Status Change arrives;
+                // act on any queued connect/disconnect (Phase 92 Track C).
+                process_port_events(&mut controllers, &mut served);
                 if let Some((_c, irq, _d)) = controllers.first() {
                     let _ = irq.ack(bits);
                 }
@@ -233,6 +349,9 @@ pub fn run(ep: u32, discovered: u8, mut controllers: Vec<ControllerCtx>) -> ! {
                 for (c, _irq, _d) in controllers.iter_mut() {
                     c.service_interrupt_events();
                 }
+                // Also service any hot-plug events surfaced by the drain (a
+                // class driver's poll wakes the loop between IRQs).
+                process_port_events(&mut controllers, &mut served);
                 let reply = handle_request(&mut controllers, discovered, &served, &frame.bulk);
                 let bytes = reply.encode();
                 // Fail closed: if staging the reply bulk fails, reply with the
@@ -288,6 +407,16 @@ fn handle_request(
         UsbRequest::NextAttach { cursor } => UsbReply::Attach {
             notice: served.get(cursor as usize).copied(),
         },
+        // Phase 92 H.1: return the device + full configuration descriptor blobs
+        // cached at enumeration. A full config exceeds the inline `ControlData`
+        // clamp, so this is how a Report-Protocol HID / CDC-ECM class driver
+        // reads the descriptors `AttachNotice` does not carry.
+        UsbRequest::GetDescriptors { slot_id } => {
+            match owner!(slot_id).and_then(|(c, _irq, slot)| c.cached_descriptors(slot)) {
+                Some((device, config)) => UsbReply::Descriptors { device, config },
+                None => UsbReply::Error { code: EINVAL },
+            }
+        }
         UsbRequest::PollInterruptIn {
             slot_id,
             dci: target_dci,
@@ -367,6 +496,24 @@ fn handle_request(
             },
             None => UsbReply::TransferComplete {
                 transferred: 0,
+                completion_code: 0xFF,
+            },
+        },
+        // Phase 92 Track D — synchronous single-TRB bulk-IN for the BOT data +
+        // CSW phases (no streaming auto-re-arm; see `Controller::submit_bulk_in`).
+        UsbRequest::SubmitBulkIn {
+            slot_id,
+            dci: target_dci,
+            len,
+        } => match owner!(slot_id)
+            .and_then(|(c, irq, slot)| c.submit_bulk_in(irq, slot, target_dci, len as u32))
+        {
+            Some(data) => UsbReply::BulkData {
+                data,
+                completion_code: 1,
+            },
+            None => UsbReply::BulkData {
+                data: Vec::new(),
                 completion_code: 0xFF,
             },
         },

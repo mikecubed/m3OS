@@ -34,7 +34,9 @@ use core::alloc::Layout;
 
 use kernel_core::input::events::{KeyEvent, ModifierSide, PointerButton, PointerEvent};
 use kernel_core::input::keymap::{Keycode, Keymap};
+use kernel_core::usb::descriptor::CLASS_HID;
 use kernel_core::usb::hid::{BootKeyboardDecoder, HID_KBD_REPORT_LEN, parse_boot_mouse_report};
+use kernel_core::usb::hid_report::{ReportField, parse_report_descriptor};
 use syscall_lib::STDOUT_FILENO;
 use syscall_lib::heap::BrkAllocator;
 use usb_core::protocol::{USB_MSG_MAX, USB_REQ_LABEL, USB_SERVICE_NAME, UsbReply, UsbRequest};
@@ -78,6 +80,13 @@ struct HidDevice {
     kbd_decoder: BootKeyboardDecoder,
     /// Previous mouse button bitfield, for edge detection.
     prev_buttons: u8,
+    /// Parsed HID Report descriptor field layout (Phase 92 Track B.1). Empty for
+    /// a non-HID interface or if the Report descriptor read failed. The live
+    /// boot keyboard/mouse path still decodes via the Boot Protocol; this is the
+    /// stored layout a Report-Protocol decode (B.2-live, Phase 92b) reads — held
+    /// here now so the descriptor is read + parsed live at bind.
+    #[allow(dead_code)]
+    report_fields: Vec<ReportField>,
 }
 
 fn monotonic_ms() -> u64 {
@@ -314,6 +323,42 @@ fn poll_mouse(usb_ep: u32, mouse_ep: u32, dev: &mut HidDevice) {
     dev.prev_buttons = m.buttons;
 }
 
+/// Read a HID interface's **Report descriptor** over EP0 and parse it into a
+/// `ReportField` layout (Phase 92 Track B.1). Issues the standard
+/// `GET_DESCRIPTOR(Report)` (bmRequestType `0x81`, bRequest `0x06`, wValue
+/// `0x2200` = Report descriptor type 0x22 / index 0, wIndex = interface). A
+/// generous request length lets the control-IN short-packet return the device's
+/// actual descriptor (Report descriptors are well under `USB_MSG_MAX`). Returns
+/// an empty `Vec` if the read fails or the descriptor parses to no fields.
+fn fetch_report_fields(usb_ep: u32, notice: &usb_core::protocol::AttachNotice) -> Vec<ReportField> {
+    const REQ_LEN: u16 = 256;
+    let iface = notice.interface_num;
+    let setup = [
+        0x81,
+        0x06,
+        0x00,
+        0x22,
+        iface,
+        0x00,
+        (REQ_LEN & 0xFF) as u8,
+        (REQ_LEN >> 8) as u8,
+    ];
+    match usb_call(
+        usb_ep,
+        &UsbRequest::ControlRequest {
+            slot_id: notice.slot_id,
+            setup,
+            length: REQ_LEN,
+        },
+    ) {
+        Some(UsbReply::ControlData {
+            data,
+            completion_code: 1,
+        }) if !data.is_empty() => parse_report_descriptor(&data),
+        _ => Vec::new(),
+    }
+}
+
 /// Issue a single `PollInterruptIn` and return the captured report, if any.
 fn poll_report(usb_ep: u32, dev: &HidDevice) -> Option<Vec<u8>> {
     let req = UsbRequest::PollInterruptIn {
@@ -361,10 +406,35 @@ fn program_main(_args: &[&str]) -> i32 {
         syscall_lib::write_str(STDOUT_FILENO, "usb-hid: bound HID device (proto ");
         write_u8_dec(notice.interface_protocol);
         syscall_lib::write_str(STDOUT_FILENO, ")\n");
+        // B.1: read + parse the Report descriptor for HID-class interfaces (the
+        // surfaced device list can also include a hub/NIC the daemon ignores —
+        // issuing a HID GET_DESCRIPTOR at those would stall EP0). The boot
+        // keyboard/mouse still decode via Boot Protocol; this lights up the
+        // host-tested `parse_report_descriptor` on a live device and stores the
+        // layout a Report-Protocol decode (B.2-live, Phase 92b) will consume.
+        let report_fields = if notice.interface_class == CLASS_HID {
+            let f = fetch_report_fields(usb_ep, &notice);
+            if f.is_empty() {
+                syscall_lib::write_str(
+                    STDOUT_FILENO,
+                    "usb-hid: report descriptor unavailable/empty\n",
+                );
+            } else {
+                syscall_lib::write_str(STDOUT_FILENO, "USB_HID:report-parsed proto=");
+                write_u8_dec(notice.interface_protocol);
+                syscall_lib::write_str(STDOUT_FILENO, " fields=");
+                write_u8_dec(f.len().min(255) as u8);
+                syscall_lib::write_str(STDOUT_FILENO, "\n");
+            }
+            f
+        } else {
+            Vec::new()
+        };
         devices.push(HidDevice {
             notice,
             kbd_decoder: BootKeyboardDecoder::new(),
             prev_buttons: 0,
+            report_fields,
         });
         cursor = cursor.saturating_add(1);
     }

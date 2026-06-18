@@ -228,6 +228,8 @@ static XHCI_DRIVER_ELF: &[u8] = generated_initrd_asset!("xhci_driver");
 static USBHUB_ELF: &[u8] = generated_initrd_asset!("usbhub");
 /// Phase 78c: ring-3 USB HID Boot-Protocol class driver (keyboard + mouse).
 static USB_HID_ELF: &[u8] = generated_initrd_asset!("usb_hid");
+/// Phase 92 Track D: ring-3 USB Mass Storage (Bulk-Only Transport) class driver.
+static USB_STORAGE_ELF: &[u8] = generated_initrd_asset!("usb_storage");
 // Phase 55b Track F.3b: NVMe crash-and-restart end-to-end smoke client.
 // Exposed under /bin so the QEMU regression can launch it from the shell.
 static NVME_CRASH_SMOKE_ELF: &[u8] = generated_initrd_asset!("nvme-crash-smoke");
@@ -1341,6 +1343,14 @@ static DRIVERS_ENTRIES: &[(&str, RamdiskNode)] = &[
         "usb-hid",
         RamdiskNode::File {
             content: USB_HID_ELF,
+        },
+    ),
+    // Phase 92 Track D: ring-3 USB Mass Storage (BOT) class driver, under
+    // /drivers/ so `is_authorized_driver_process` admits it.
+    (
+        "usb-storage",
+        RamdiskNode::File {
+            content: USB_STORAGE_ELF,
         },
     ),
 ];

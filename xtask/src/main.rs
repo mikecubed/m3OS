@@ -47,6 +47,11 @@ const USERSPACE_LIB_HOST_TEST_PACKAGES: &[(&str, &[&str])] = &[
     ("audio_mixer", &[]),
     // Phase 63a Track B — C-ABI veneer over audio_client
     ("audio_client_ffi", &[]),
+    // Phase 92 — the usb-core IPC codec (UsbRequest/UsbReply round-trip) is the
+    // load-bearing contract between the xhci server and every USB class driver
+    // (usb-hid/usb-storage/usbhub); gate its protocol tests so a codec
+    // regression can't slip the merge gate.
+    ("usb-core", &[]),
     // Phase 70 Track A0 — C-ABI veneer over the Phase 56 display protocol codec
     ("display_client_ffi", &[]),
     // Phase 64 — session_manager pure-logic `table` and `lifecycle`
@@ -725,6 +730,39 @@ fn main() {
             });
             cmd_usb_smoke(&smoke_args);
         }
+        // Phase 92 Track C — USB hot-plug: device_add/device_del a usb-mouse
+        // mid-run over QMP and assert the live attach/detach + Disable Slot path.
+        Some("usb-hotplug-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("usb-hotplug-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_usb_hotplug_smoke(&smoke_args);
+        }
+        // Phase 92 Track D — USB mass storage: boots with a usb-storage device
+        // and asserts the BOT/SCSI INQUIRY + READ CAPACITY identity path.
+        Some("usb-storage-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("usb-storage-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_usb_storage_smoke(&smoke_args);
+        }
+        // Phase 92 Track A — USB hub: boots with a usb-hub (a usb-kbd behind it)
+        // and asserts the usbhub daemon enumerated the hub + powered/reset ports.
+        Some("usb-hub-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("usb-hub-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_usb_hub_smoke(&smoke_args);
+        }
         Some("ssh-e1000-banner-check") => {
             let banner_args = parse_ssh_e1000_banner_check_args(&args[2..]).unwrap_or_else(|err| {
                 eprintln!("Error: {err}");
@@ -1302,7 +1340,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -1464,6 +1502,9 @@ fn build_userspace_bins() {
         // Phase 78c: ring-3 USB HID Boot-Protocol class driver (kbd + mouse).
         // `needs_alloc = true` for kernel-core + usb-core deps.
         ("usb_hid", "usb_hid", true),
+        // Phase 92 Track D: ring-3 USB Mass Storage (BOT) class driver.
+        // `needs_alloc = true` for kernel-core (mass_storage) + usb-core deps.
+        ("usb_storage", "usb_storage", true),
         // Phase 80 Track A.5: ring-3 AC'97 out-of-process audio hardware driver.
         // `needs_alloc = true` for driver_runtime + kernel-core deps.
         ("ac97_driver", "ac97_driver", true),
@@ -6048,7 +6089,7 @@ fn cmd_check() {
     stat_assembly_gate();
 
     println!(
-        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, ac97_driver, hda_driver, ahci_driver, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, shadow, ldso_core, wifi-core, mt792x_driver, m3ctl, xhci_driver, pkg-format, xtask, and pkg host tests pass; doom platform-layer C tests pass; retpoline indirect-branch gate pass; stat-assembly gate pass"
+        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, ac97_driver, hda_driver, ahci_driver, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, shadow, ldso_core, wifi-core, mt792x_driver, m3ctl, xhci_driver, usb-core, pkg-format, xtask, and pkg host tests pass; doom platform-layer C tests pass; retpoline indirect-branch gate pass; stat-assembly gate pass"
     );
 }
 
@@ -10258,6 +10299,11 @@ fn cmd_usb_smoke(args: &SmokeBootArgs) {
         wait("XHCI_USB:server-ready")?;
         // (3) usb-hid bound the keyboard and is polling its interrupt-IN EP.
         wait("usb-hid: polling")?;
+        // (3b) Phase 92 Track B.1: usb-hid read + parsed the HID Report
+        //      descriptor live at bind (the host-tested `parse_report_descriptor`
+        //      gains a live call site on a real device — proven on the boot
+        //      keyboard/mouse, whose descriptors parse to ≥1 ReportField).
+        wait("USB_HID:report-parsed")?;
         // (4) the compositor + a focused term reached an interactive prompt, so
         //     a KBD_EVENT_PULL consumer exists to render injected USB keys.
         wait("TERM_SMOKE:prompt-ready")?;
@@ -10355,6 +10401,416 @@ fn cmd_usb_smoke(args: &SmokeBootArgs) {
         }
         Err(msg) => {
             eprintln!("usb-smoke: FAILED\n{msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Phase 92 Track C — USB hot-plug acceptance gate.
+///
+/// Boots m3OS with `-device qemu-xhci` (+ the default `usb-kbd`/`usb-mouse`),
+/// waits for the USB IPC server + `usb-hid` to finish the boot enumeration,
+/// then over QMP `device_add`s a fresh `usb-mouse` mid-run and asserts the
+/// server enumerated it dynamically (`USB_HOTPLUG:attached`), then `device_del`s
+/// it and asserts the clean detach + Disable Slot reclamation
+/// (`USB_HOTPLUG:detached`). Proves the live Port Status Change → AttachNotice
+/// pipeline (C.1/C.3) and the detach + slot-teardown path (C.2/C.4 + H.3)
+/// without restarting any daemon.
+fn cmd_usb_hotplug_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+    let ovmf = find_ovmf();
+
+    let qmp_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&qmp_socket);
+
+    let devices = DeviceSet {
+        xhci: true,
+        ..DeviceSet::default()
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, QemuDisplayMode::Headless, devices);
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    qemu_args.push("-qmp".to_string());
+    qemu_args.push(format!("unix:{},server,nowait", qmp_socket.display()));
+
+    println!(
+        "usb-hotplug-smoke: launching QEMU with -device qemu-xhci (timeout {}s, qmp {})",
+        args.timeout_secs,
+        qmp_socket.display()
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let rx = spawn_serial_reader(stdout);
+    let mut serial_history = String::new();
+    let mut serial_buf = String::new();
+    let global_start = std::time::Instant::now();
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let step = std::time::Duration::from_secs(args.timeout_secs.min(180));
+
+    // Number of attach/detach cycles. >1 proves re-enumeration after a detach
+    // (C.3) AND that Disable Slot reclamation (H.3) prevents slot-pool
+    // exhaustion — without it the Nth Enable Slot would eventually fail.
+    const CYCLES: usize = 3;
+
+    let result: Result<(), String> = (|| {
+        // (1) USB IPC server registered + IRQ bound, and (2) usb-hid finished the
+        // boot enumeration (so the static device table — kbd+mouse — is built and
+        // the next attach is genuinely a hot-plug, not a boot device).
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "XHCI_USB:server-ready",
+            step,
+            global_start,
+            global_timeout,
+        )?;
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "usb-hid: polling",
+            step,
+            global_start,
+            global_timeout,
+        )?;
+        println!("usb-hotplug-smoke: USB stack ready — driving QMP device_add/device_del");
+
+        let qmp_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut q = qmp::QmpClient::connect(&qmp_socket, qmp_deadline)
+            .map_err(|e| format!("qmp connect: {e}"))?;
+
+        for cycle in 0..CYCLES {
+            // Reset the match buffer so a stale prior-cycle sentinel can't
+            // satisfy this cycle's wait (the buffer is append-only and never
+            // drains on match). The serial *history* (for failure dumps) is
+            // preserved. Nothing relevant is pending here — the sentinel we wait
+            // for is emitted only after the device_add/device_del below.
+            serial_buf.clear();
+
+            // (3) Hot-add a usb-mouse on a free port of the live controller. The
+            // Port Status Change wakes the server's bound IRQ, which runs
+            // run_enumeration for the new device and publishes its AttachNotice.
+            q.execute(
+                "device_add",
+                serde_json::json!({"driver": "usb-mouse", "id": "hp0", "bus": "xhci0.0"}),
+            )
+            .map_err(|e| format!("cycle {cycle}: qmp device_add usb-mouse: {e}"))?;
+            wait_for_serial_pattern(
+                &rx,
+                &mut serial_buf,
+                &mut serial_history,
+                "USB_HOTPLUG:attached",
+                step,
+                global_start,
+                global_timeout,
+            )
+            .map_err(|e| format!("cycle {cycle} (attach): {e}"))?;
+
+            // (4) Hot-remove it; the disconnect must flip the AttachNotice to
+            // attached:false and reclaim the slot via Disable Slot.
+            q.execute("device_del", serde_json::json!({"id": "hp0"}))
+                .map_err(|e| format!("cycle {cycle}: qmp device_del: {e}"))?;
+            wait_for_serial_pattern(
+                &rx,
+                &mut serial_buf,
+                &mut serial_history,
+                "USB_HOTPLUG:detached",
+                step,
+                global_start,
+                global_timeout,
+            )
+            .map_err(|e| format!("cycle {cycle} (detach): {e}"))?;
+            println!("usb-hotplug-smoke: cycle {cycle} attach+detach OK (slot reclaimed)");
+
+            // Let QEMU settle the port-down before the next device_add reuses it.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+        Ok(())
+    })();
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&qmp_socket);
+    match result {
+        Ok(()) => {
+            let elapsed = global_start.elapsed().as_secs();
+            println!(
+                "usb-hotplug-smoke: PASSED ({elapsed}s) — {CYCLES} attach/detach cycles: each \
+                 device_add enumerated live + device_del detached/reclaimed (no slot exhaustion, \
+                 no daemon restart)"
+            );
+        }
+        Err(msg) => {
+            eprintln!("usb-hotplug-smoke: FAILED\n{msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Phase 92 Track D — USB mass-storage transport gate (D.1, scoped).
+///
+/// Boots m3OS with `-device qemu-xhci` plus a `-device usb-storage` backed by a
+/// raw scratch image, and asserts the ring-3 `usb-storage` daemon bound the
+/// `CLASS_MASS_STORAGE` interface (`usb-storage: bound mass-storage …`) and
+/// completed a full Bulk-Only Transport CBW-out + CSW-in round-trip over the
+/// Phase 96 bulk pair against the real (SuperSpeed) device — `GET_MAX_LUN` (a
+/// class control-IN) + `TEST UNIT READY` (a no-data BOT command) → the
+/// `USB_STORAGE:bot-ok` sentinel. This validates the BOT framing
+/// (`kernel-core::usb::mass_storage`, D.2) and the inline bulk transport on a
+/// live device. Phase 92 Track D then closes the **data-IN phase** (INQUIRY +
+/// READ CAPACITY(10)) over the new synchronous single-TRB `SubmitBulkIn` path
+/// (one bulk-IN TRB per BOT phase, no streaming auto-re-arm — the device is
+/// never issued the surplus IN token that previously STALLed the endpoint): the
+/// `USB_MASS_STORAGE:ready blocks=… bsize=…` sentinel proves the device identity
+/// + capacity read round-tripped (the 8 MiB scratch image → 16384 × 512-byte
+/// blocks). The `RemoteBlockDevice` facade + `/mnt/usb<n>` mount (D.4) build on
+/// this.
+fn cmd_usb_storage_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+    let ovmf = find_ovmf();
+
+    // 8 MiB raw scratch image for the USB stick → READ CAPACITY should report
+    // 16384 × 512-byte blocks. A sparse file is fine (INQUIRY/READ CAPACITY do
+    // not touch the medium contents).
+    let usb_img = uefi_image.parent().unwrap().join("usb-storage-scratch.img");
+    {
+        let f = std::fs::File::create(&usb_img).expect("create usb-storage scratch image");
+        f.set_len(8 * 1024 * 1024)
+            .expect("size usb-storage scratch image");
+    }
+
+    let devices = DeviceSet {
+        xhci: true,
+        ..DeviceSet::default()
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, QemuDisplayMode::Headless, devices);
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    // Attach the USB mass-storage device on the same xHCI bus the boot kbd/mouse
+    // use (`xhci0.0`).
+    qemu_args.push("-drive".to_string());
+    qemu_args.push(format!(
+        "id=usbdisk,file={},format=raw,if=none",
+        usb_img.display()
+    ));
+    qemu_args.push("-device".to_string());
+    qemu_args.push("usb-storage,drive=usbdisk,bus=xhci0.0".to_string());
+
+    println!(
+        "usb-storage-smoke: launching QEMU with -device qemu-xhci + usb-storage (timeout {}s)",
+        args.timeout_secs
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let rx = spawn_serial_reader(stdout);
+    let mut serial_history = String::new();
+    let mut serial_buf = String::new();
+    let global_start = std::time::Instant::now();
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let step = std::time::Duration::from_secs(args.timeout_secs.min(180));
+
+    let result: Result<(), String> = (|| {
+        let mut wait = |pat: &str| {
+            wait_for_serial_pattern(
+                &rx,
+                &mut serial_buf,
+                &mut serial_history,
+                pat,
+                step,
+                global_start,
+                global_timeout,
+            )
+        };
+        // The daemon bound a mass-storage interface (class 0x08 + bulk pair)…
+        wait("usb-storage: bound mass-storage")?;
+        // …a full BOT CBW-out + CSW-in round-trip completed over the bulk pair
+        // against the real (SuperSpeed) device (TEST UNIT READY) — the D.1
+        // transport milestone…
+        wait("USB_STORAGE:bot-ok")?;
+        // …the data-IN phase round-tripped: INQUIRY (device identity) + READ
+        // CAPACITY(10) over the synchronous single-TRB `SubmitBulkIn` path
+        // report the device's block count + size (8 MiB → 16384 × 512)…
+        wait("USB_MASS_STORAGE:ready")?;
+        // …and a WRITE(10) + READ(10) sector round-trip verified byte-identical:
+        // the bidirectional data path (data-OUT over SubmitBulkOut + data-IN over
+        // SubmitBulkIn) the RemoteBlockDevice facade (D.4) is built on.
+        wait("USB_STORAGE:rw-ok")?;
+        Ok(())
+    })();
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&usb_img);
+    match result {
+        Ok(()) => {
+            let elapsed = global_start.elapsed().as_secs();
+            println!(
+                "usb-storage-smoke: PASSED ({elapsed}s) — usb-storage bound the mass-storage \
+                 device, completed a BOT CBW/CSW round-trip (GET_MAX_LUN + TEST UNIT READY), read \
+                 INQUIRY + READ CAPACITY over the synchronous SubmitBulkIn data-IN path, and \
+                 verified a WRITE(10)+READ(10) sector round-trip byte-identical"
+            );
+        }
+        Err(msg) => {
+            eprintln!("usb-storage-smoke: FAILED\n{msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Boots m3OS with `-device qemu-xhci` plus a bare `-device usb-hub` (no
+/// downstream device) and asserts the ring-3 `usbhub` daemon (Phase 92 Track A)
+/// came live: it bound the `CLASS_HUB` interface surfaced by the server
+/// (`usbhub: bound hub`), read the hub descriptor over EP0 and powered every
+/// downstream port (`XHCI_HUB:enumerated ports=N`), and finished its bring-up
+/// (`USB_HUB:ready`).
+///
+/// This proves A.1 (resident hub walker over the `NextAttach` cursor) + A.2 (hub
+/// descriptor read + per-port PORT_POWER) end-to-end. The PORT_RESET-to-enabled
+/// path needs a downstream connection to report (no device is attached here, so
+/// no port reports a connection and that path does not run); it is exercised
+/// once tier-2 enumeration — surfacing the downstream device as its own
+/// `AttachNotice` via the route string (A.4/A.5) — lands in Phase 92a.
+fn cmd_usb_hub_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+    let ovmf = find_ovmf();
+
+    let devices = DeviceSet {
+        xhci: true,
+        ..DeviceSet::default()
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, QemuDisplayMode::Headless, devices);
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    // A USB 2.0 hub on the xHCI bus. (A downstream device — to exercise the
+    // PORT_RESET path — needs QEMU port-path topology and is only meaningful once
+    // tier-2 enumeration lands; that pairs with Phase 92a.)
+    qemu_args.push("-device".to_string());
+    qemu_args.push("usb-hub,id=usbhub0,bus=xhci0.0".to_string());
+
+    println!(
+        "usb-hub-smoke: launching QEMU with -device qemu-xhci + usb-hub (timeout {}s)",
+        args.timeout_secs
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let rx = spawn_serial_reader(stdout);
+    let mut serial_history = String::new();
+    let mut serial_buf = String::new();
+    let global_start = std::time::Instant::now();
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let step = std::time::Duration::from_secs(args.timeout_secs.min(180));
+
+    let result: Result<(), String> = (|| {
+        let mut wait = |pat: &str| {
+            wait_for_serial_pattern(
+                &rx,
+                &mut serial_buf,
+                &mut serial_history,
+                pat,
+                step,
+                global_start,
+                global_timeout,
+            )
+        };
+        // The daemon bound the hub-class interface the server now surfaces…
+        wait("usbhub: bound hub")?;
+        // …read its descriptor over EP0 and powered every downstream port…
+        wait("XHCI_HUB:enumerated")?;
+        // …and finished its per-port PORT_POWER/PORT_RESET bring-up.
+        wait("USB_HUB:ready")?;
+        Ok(())
+    })();
+
+    let _ = child.kill();
+    let _ = child.wait();
+    match result {
+        Ok(()) => {
+            let elapsed = global_start.elapsed().as_secs();
+            println!(
+                "usb-hub-smoke: PASSED ({elapsed}s) — usbhub bound the CLASS_HUB interface, read \
+                 the hub descriptor, and powered/reset its downstream ports (A.1/A.2 live; tier-2 \
+                 device-behind-hub enumeration is Phase 92a)"
+            );
+        }
+        Err(msg) => {
+            eprintln!("usb-hub-smoke: FAILED\n{msg}");
             std::process::exit(1);
         }
     }
@@ -21464,6 +21920,9 @@ fn populate_ext2_files(
     // Phase 78c — ring-3 USB HID class driver. Depends on xhci_driver so it
     // can look up the `usb` service the host controller registers.
     let usb_hid_conf = "name=usb_hid\ncommand=/drivers/usb-hid\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=xhci_driver\n";
+    // Phase 92 Track D — ring-3 USB Mass Storage (BOT) class driver. Depends on
+    // xhci_driver so it can look up the `usb` service the host controller registers.
+    let usb_storage_conf = "name=usb_storage\ncommand=/drivers/usb-storage\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=xhci_driver\n";
     // Phase 80 Track A.5 — ring-3 AC'97 out-of-process audio hardware driver.
     // No `depends=` (device-host substrate is kernel-internal); must start
     // before audio_server so `audio.hw` is registered when audio_server resolves it.
@@ -21855,6 +22314,7 @@ fn populate_ext2_files(
     let xhci_driver_conf_tmp = output_dir.join("_tmp_xhci_driver_conf");
     let usbhub_conf_tmp = output_dir.join("_tmp_usbhub_conf");
     let usb_hid_conf_tmp = output_dir.join("_tmp_usb_hid_conf");
+    let usb_storage_conf_tmp = output_dir.join("_tmp_usb_storage_conf");
     let ac97_driver_conf_tmp = output_dir.join("_tmp_ac97_driver_conf");
     let hda_driver_conf_tmp = output_dir.join("_tmp_hda_driver_conf");
     let ahci_driver_conf_tmp = output_dir.join("_tmp_ahci_driver_conf");
@@ -21918,6 +22378,7 @@ fn populate_ext2_files(
     fs::write(&xhci_driver_conf_tmp, xhci_driver_conf).expect("write temp xhci_driver.conf");
     fs::write(&usbhub_conf_tmp, usbhub_conf).expect("write temp usbhub.conf");
     fs::write(&usb_hid_conf_tmp, usb_hid_conf).expect("write temp usb-hid.conf");
+    fs::write(&usb_storage_conf_tmp, usb_storage_conf).expect("write temp usb-storage.conf");
     fs::write(&ac97_driver_conf_tmp, ac97_driver_conf).expect("write temp ac97.conf");
     fs::write(&hda_driver_conf_tmp, hda_driver_conf).expect("write temp hda.conf");
     fs::write(&ahci_driver_conf_tmp, ahci_driver_conf).expect("write temp ahci_driver.conf");
@@ -22753,6 +23214,10 @@ fn populate_ext2_files(
          sif etc/services.d/usb-hid.conf mode 0x81A4\n\
          sif etc/services.d/usb-hid.conf uid 0\n\
          sif etc/services.d/usb-hid.conf gid 0\n\
+         write \"{usb_storage_conf}\" etc/services.d/usb-storage.conf\n\
+         sif etc/services.d/usb-storage.conf mode 0x81A4\n\
+         sif etc/services.d/usb-storage.conf uid 0\n\
+         sif etc/services.d/usb-storage.conf gid 0\n\
          write \"{ac97_driver_conf}\" etc/services.d/ac97.conf\n\
          sif etc/services.d/ac97.conf mode 0x81A4\n\
          sif etc/services.d/ac97.conf uid 0\n\
@@ -22824,6 +23289,7 @@ fn populate_ext2_files(
         xhci_driver_conf = xhci_driver_conf_tmp.display(),
         usbhub_conf = usbhub_conf_tmp.display(),
         usb_hid_conf = usb_hid_conf_tmp.display(),
+        usb_storage_conf = usb_storage_conf_tmp.display(),
         ac97_driver_conf = ac97_driver_conf_tmp.display(),
         hda_driver_conf = hda_driver_conf_tmp.display(),
         ahci_driver_conf = ahci_driver_conf_tmp.display(),
