@@ -28,8 +28,8 @@ use alloc::vec::Vec;
 use core::alloc::Layout;
 
 use kernel_core::usb::mass_storage::{
-    CSW_LEN, Cbw, Csw, InquiryData, ReadCapacity10, cdb_inquiry, cdb_read_capacity10,
-    cdb_test_unit_ready,
+    CSW_LEN, Cbw, Csw, InquiryData, ReadCapacity10, cdb_inquiry, cdb_read_capacity10, cdb_read10,
+    cdb_test_unit_ready, cdb_write10,
 };
 use syscall_lib::STDOUT_FILENO;
 use syscall_lib::heap::BrkAllocator;
@@ -135,24 +135,11 @@ fn bot_command(
     let slot_id = notice.slot_id;
     let tag = next_tag();
     let cbw = Cbw::new(tag, data_len as u32, data_in, 0, cdb);
-    let cbw_bytes = cbw.encode();
 
     // (1) CBW on bulk-OUT (blocks for completion).
-    match usb_call(
-        usb_ep,
-        &UsbRequest::SubmitBulkOut {
-            slot_id,
-            dci: notice.bulk_out_dci,
-            data: cbw_bytes.to_vec(),
-        },
-    ) {
-        Some(UsbReply::TransferComplete {
-            completion_code: 1, ..
-        }) => {}
-        _ => {
-            write_str(STDOUT_FILENO, "usb-storage: CBW bulk-OUT failed\n");
-            return None;
-        }
+    if !bulk_out(usb_ep, slot_id, notice.bulk_out_dci, &cbw.encode()) {
+        write_str(STDOUT_FILENO, "usb-storage: CBW bulk-OUT failed\n");
+        return None;
     }
 
     // (2) Data phase (device-to-host) — request exactly the CBW data length.
@@ -166,6 +153,50 @@ fn bot_command(
     let csw_bytes = submit_bulk_in(usb_ep, slot_id, notice.bulk_in_dci, CSW_LEN as u16)?;
     let csw = Csw::parse(&csw_bytes)?;
     Some((data, csw.status))
+}
+
+/// Issue one BOT SCSI command carrying a **host-to-device data-OUT** stage
+/// (e.g. WRITE(10)): CBW on bulk-OUT, the payload on bulk-OUT, then the CSW on
+/// bulk-IN. Returns the CSW status (0 = passed), `None` on a transport failure.
+fn bot_command_write(usb_ep: u32, notice: &AttachNotice, cdb: &[u8], payload: &[u8]) -> Option<u8> {
+    let slot_id = notice.slot_id;
+    let tag = next_tag();
+    // dCBWDataTransferLength = payload len, direction OUT (data_in = false).
+    let cbw = Cbw::new(tag, payload.len() as u32, false, 0, cdb);
+
+    // (1) CBW on bulk-OUT.
+    if !bulk_out(usb_ep, slot_id, notice.bulk_out_dci, &cbw.encode()) {
+        write_str(STDOUT_FILENO, "usb-storage: WRITE CBW bulk-OUT failed\n");
+        return None;
+    }
+    // (2) Data-OUT payload on bulk-OUT.
+    if !payload.is_empty() && !bulk_out(usb_ep, slot_id, notice.bulk_out_dci, payload) {
+        write_str(STDOUT_FILENO, "usb-storage: WRITE data bulk-OUT failed\n");
+        return None;
+    }
+    // (3) CSW on bulk-IN.
+    let csw_bytes = submit_bulk_in(usb_ep, slot_id, notice.bulk_in_dci, CSW_LEN as u16)?;
+    let csw = Csw::parse(&csw_bytes)?;
+    Some(csw.status)
+}
+
+/// Submit a bulk-OUT transfer and block for completion. Returns `true` on a
+/// successful (completion_code == 1) transfer.
+fn bulk_out(usb_ep: u32, slot_id: u8, dci: u8, data: &[u8]) -> bool {
+    matches!(
+        usb_call(
+            usb_ep,
+            &UsbRequest::SubmitBulkOut {
+                slot_id,
+                dci,
+                data: data.to_vec(),
+            },
+        ),
+        Some(UsbReply::TransferComplete {
+            completion_code: 1,
+            ..
+        })
+    )
 }
 
 /// Issue `GET_MAX_LUN` (class control-IN). A STALL (or any failure) means the
@@ -335,8 +366,44 @@ fn probe_device(usb_ep: u32, notice: &AttachNotice) -> bool {
     write_str(STDOUT_FILENO, " bsize=");
     write_u32_dec(cap.block_size);
     write_str(STDOUT_FILENO, "\n");
+
+    // READ(10) / WRITE(10) sector round-trip self-test (D.2 data path). Write a
+    // known 512-byte pattern to a scratch LBA, read it back, and byte-compare —
+    // proving the bidirectional sector path end-to-end: WRITE(10) data-OUT over
+    // `submit_bulk_out` + READ(10) data-IN over the synchronous `submit_bulk_in`.
+    // A scratch LBA past any plausible filesystem metadata, bounded to the
+    // medium so a small device is not addressed out of range.
+    if cap.block_size as usize == 512 && blocks > SCRATCH_LBA {
+        let mut pattern = [0u8; 512];
+        for (i, b) in pattern.iter_mut().enumerate() {
+            *b = (i as u8) ^ 0x5A;
+        }
+        match bot_command_write(usb_ep, notice, &cdb_write10(SCRATCH_LBA, 1), &pattern) {
+            Some(0) => {}
+            _ => {
+                write_str(STDOUT_FILENO, "usb-storage: WRITE(10) self-test failed\n");
+                return false;
+            }
+        }
+        match bot_command(usb_ep, notice, &cdb_read10(SCRATCH_LBA, 1), true, 512) {
+            Some((rd, 0)) if rd.len() == 512 && rd[..] == pattern[..] => {
+                write_str(STDOUT_FILENO, "USB_STORAGE:rw-ok\n");
+            }
+            _ => {
+                write_str(
+                    STDOUT_FILENO,
+                    "usb-storage: READ(10) self-test verify mismatch\n",
+                );
+                return false;
+            }
+        }
+    }
     true
 }
+
+/// Scratch LBA used by the READ/WRITE round-trip self-test (512 KiB into the
+/// medium — past any plausible boot sector / filesystem superblock).
+const SCRATCH_LBA: u32 = 1024;
 
 // ---------------------------------------------------------------------------
 // Entry

@@ -10657,10 +10657,14 @@ fn cmd_usb_storage_smoke(args: &SmokeBootArgs) {
         // against the real (SuperSpeed) device (TEST UNIT READY) — the D.1
         // transport milestone…
         wait("USB_STORAGE:bot-ok")?;
-        // …and the data-IN phase round-tripped: INQUIRY (device identity) + READ
+        // …the data-IN phase round-tripped: INQUIRY (device identity) + READ
         // CAPACITY(10) over the synchronous single-TRB `SubmitBulkIn` path
-        // report the device's block count + size (8 MiB → 16384 × 512).
+        // report the device's block count + size (8 MiB → 16384 × 512)…
         wait("USB_MASS_STORAGE:ready")?;
+        // …and a WRITE(10) + READ(10) sector round-trip verified byte-identical:
+        // the bidirectional data path (data-OUT over SubmitBulkOut + data-IN over
+        // SubmitBulkIn) the RemoteBlockDevice facade (D.4) is built on.
+        wait("USB_STORAGE:rw-ok")?;
         Ok(())
     })();
 
@@ -10672,8 +10676,9 @@ fn cmd_usb_storage_smoke(args: &SmokeBootArgs) {
             let elapsed = global_start.elapsed().as_secs();
             println!(
                 "usb-storage-smoke: PASSED ({elapsed}s) — usb-storage bound the mass-storage \
-                 device, completed a BOT CBW/CSW round-trip (GET_MAX_LUN + TEST UNIT READY), and \
-                 read INQUIRY + READ CAPACITY over the synchronous SubmitBulkIn data-IN path"
+                 device, completed a BOT CBW/CSW round-trip (GET_MAX_LUN + TEST UNIT READY), read \
+                 INQUIRY + READ CAPACITY over the synchronous SubmitBulkIn data-IN path, and \
+                 verified a WRITE(10)+READ(10) sector round-trip byte-identical"
             );
         }
         Err(msg) => {
