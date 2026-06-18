@@ -21,6 +21,17 @@
 //!
 //! **Grant single-use (Phase 50):** `GrantIdTracker` rejects replay of any
 //! write-payload grant handle before the IPC call is attempted.
+//!
+//! **Phase 92a D.4 — multi-device registry:**
+//! The singleton `RemoteBlockInner` is lifted to a bounded array of
+//! `RemoteBlockEntry` slots (max [`MAX_REMOTE_BLOCK`] = 4). Slot 0 is the
+//! **root backend** — nvme.block/ahci.block auto-discovered on the first
+//! `is_registered()` call, exactly as before. Slots 1-3 are **additional
+//! devices** explicitly registered by name (e.g. "usb0.block") via
+//! [`register_device`] / unregistered via [`unregister_device`], enabling a
+//! USB stick to coexist with the AHCI/NVMe root without changing any root-FS
+//! paths. The root API (`is_registered`, `read_sectors`, `write_sectors`,
+//! `flush`) routes exclusively to slot 0 and is behaviorally unchanged.
 
 use kernel_core::driver_ipc::blk_dispatch::{
     BlockDispatchState, GrantIdTracker, RemoteDeviceError, WaitOutcome,
@@ -35,43 +46,96 @@ use crate::ipc::EndpointId;
 use crate::ipc::{endpoint, message::Message, registry};
 use crate::task::scheduler;
 use crate::task::scheduler::IrqSafeMutex;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use spin::Lazy;
 
-// Phase 57b G.1.b — `IrqSafeMutex` so the F.1 wiring raises
-// `preempt_count` on acquire and the matching guard `Drop` lowers it on
-// release. `REMOTE_BLOCK` is task-context-only (the ring-3 NVMe driver
-// facade has no kernel ISR), so no explicit-preempt-and-cli wrapper is
-// needed at the callsites — the auto-deref through `IrqSafeGuard`
-// preserves the existing call shapes.
-static REMOTE_BLOCK: Lazy<IrqSafeMutex<RemoteBlockInner>> =
-    Lazy::new(|| IrqSafeMutex::new(RemoteBlockInner::new()));
+// ---------------------------------------------------------------------------
+// Phase 92a D.4 — multi-device registry
+// ---------------------------------------------------------------------------
 
-/// Lock-free fast-path mirror of `REMOTE_BLOCK.lock().endpoint.is_some()`.
-/// Allows `on_endpoint_closed` (called from `cleanup_task_ipc` for every
-/// dying task's every owned endpoint) to skip the mutex acquisition when
-/// no block driver has registered, matching the analogous fast-path used
-/// by `RemoteNic::on_endpoint_closed`.
-static REMOTE_BLOCK_REGISTERED: AtomicBool = AtomicBool::new(false);
+/// Maximum number of concurrent remote block backends (root + additional).
+/// Slot 0 = root (nvme.block / ahci.block). Slots 1-3 = explicitly registered
+/// secondary devices (e.g. USB mass-storage).
+pub const MAX_REMOTE_BLOCK: usize = 4;
 
-struct RemoteBlockInner {
+/// One entry in the remote block registry.
+struct RemoteBlockEntry {
     state: BlockDispatchState,
     grants: GrantIdTracker,
     endpoint: Option<EndpointId>,
+    /// IPC-registry service name used to look up this endpoint (e.g.
+    /// "usb0.block"). Empty for the root slot's auto-discovered entries.
+    service_name: alloc::string::String,
+    /// Human-readable device name logged in diagnostics (e.g. "usb0").
+    device_name: alloc::string::String,
+    /// `TaskId` of the driver process that published this endpoint (0 =
+    /// kernel-registered, i.e. from the auto-registration path).
+    owner_task_id: u64,
+    /// Whether this slot is occupied by an explicitly registered device.
+    /// The root slot (index 0) uses auto-discovery and is never set via
+    /// `register_device`, so this flag stays `false` for slot 0.
+    explicitly_registered: bool,
 }
 
-impl RemoteBlockInner {
-    fn new() -> Self {
+impl RemoteBlockEntry {
+    fn empty() -> Self {
         Self {
             state: BlockDispatchState::new(),
             grants: GrantIdTracker::new(),
             endpoint: None,
+            service_name: alloc::string::String::new(),
+            device_name: alloc::string::String::new(),
+            owner_task_id: 0,
+            explicitly_registered: false,
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Public API
+// The registry is a fixed-size array wrapped in a single IrqSafeMutex.
+// `Lazy` defers construction until first use (avoids a `const`-fn heap issue).
+// ---------------------------------------------------------------------------
+
+struct RemoteBlockRegistry {
+    entries: [RemoteBlockEntry; MAX_REMOTE_BLOCK],
+}
+
+impl RemoteBlockRegistry {
+    fn new() -> Self {
+        // Rust does not support `[expr; N]` for non-Copy types, so each slot
+        // is explicitly constructed. All four entries start in the same
+        // unregistered state produced by `RemoteBlockEntry::empty()`.
+        Self {
+            entries: [
+                RemoteBlockEntry::empty(),
+                RemoteBlockEntry::empty(),
+                RemoteBlockEntry::empty(),
+                RemoteBlockEntry::empty(),
+            ],
+        }
+    }
+}
+
+static REMOTE_BLOCK: Lazy<IrqSafeMutex<RemoteBlockRegistry>> =
+    Lazy::new(|| IrqSafeMutex::new(RemoteBlockRegistry::new()));
+
+// ---------------------------------------------------------------------------
+// Lock-free fast-path flags
+// ---------------------------------------------------------------------------
+
+/// Lock-free bitmask: bit N is set when slot N is occupied with a registered
+/// driver. Allows hot-path callers (`is_registered`, `on_endpoint_closed`) to
+/// skip the mutex when no drivers are present.
+///
+/// Bit 0 = root slot; bits 1-3 = explicit secondary devices.
+static REMOTE_BLOCK_REGISTERED_MASK: AtomicU32 = AtomicU32::new(0);
+
+/// Convenience: `true` when the root slot (bit 0) is registered.
+/// Kept for the existing `on_endpoint_closed` fast-path (unchanged call site).
+static REMOTE_BLOCK_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+// ---------------------------------------------------------------------------
+// Root-slot public API (unchanged signatures — preserves all existing callers)
 // ---------------------------------------------------------------------------
 
 /// Register a ring-3 block driver endpoint.  Called by Track F.1 and Track
@@ -80,9 +144,15 @@ impl RemoteBlockInner {
 pub fn register(endpoint_name: &str, device_name: &str) -> Result<(), ()> {
     let ep = registry::lookup_endpoint_id(endpoint_name).ok_or(())?;
     let mut g = REMOTE_BLOCK.lock();
-    g.state.register(device_name);
-    g.endpoint = Some(ep);
+    let slot = &mut g.entries[0];
+    slot.state.register(device_name);
+    slot.endpoint = Some(ep);
+    slot.service_name = alloc::string::String::from(endpoint_name);
+    slot.device_name = alloc::string::String::from(device_name);
+    slot.owner_task_id = 0;
+    slot.explicitly_registered = false;
     REMOTE_BLOCK_REGISTERED.store(true, Ordering::Release);
+    REMOTE_BLOCK_REGISTERED_MASK.fetch_or(1, Ordering::Release);
     log::info!(
         "[blk::remote] registered '{}' on endpoint '{}'",
         device_name,
@@ -129,7 +199,7 @@ pub fn is_registered() -> bool {
     // Fast path — already cached.
     {
         let g = REMOTE_BLOCK.lock();
-        if g.state.is_registered() {
+        if g.entries[0].state.is_registered() {
             return true;
         }
     }
@@ -172,10 +242,16 @@ pub fn is_registered() -> bool {
     }
     let mut g = REMOTE_BLOCK.lock();
     // Guard against a race where two callers both hit the cold path.
-    if !g.state.is_registered() {
-        g.state.register(device_name);
-        g.endpoint = Some(ep);
+    let slot = &mut g.entries[0];
+    if !slot.state.is_registered() {
+        slot.state.register(device_name);
+        slot.endpoint = Some(ep);
+        slot.service_name = alloc::string::String::from(service_name);
+        slot.device_name = alloc::string::String::from(device_name);
+        slot.owner_task_id = owner_task_id;
+        slot.explicitly_registered = false;
         REMOTE_BLOCK_REGISTERED.store(true, Ordering::Release);
+        REMOTE_BLOCK_REGISTERED_MASK.fetch_or(1, Ordering::Release);
         log::info!(
             "[blk::remote] auto-registered ring-3 '{}' driver via service \
              registry ({} → endpoint {:?}, owner task_id={})",
@@ -214,8 +290,9 @@ fn is_trusted_driver_task(owner_task_id: u64) -> bool {
 pub fn mark_driver_ready(endpoint_name: &str, device_name: &str) -> Result<(), ()> {
     let ep = registry::lookup_endpoint_id(endpoint_name).ok_or(())?;
     let mut g = REMOTE_BLOCK.lock();
-    g.state.mark_ready();
-    g.endpoint = Some(ep);
+    let slot = &mut g.entries[0];
+    slot.state.mark_ready();
+    slot.endpoint = Some(ep);
     log::info!(
         "[blk::remote] driver '{}' recovered — cleared restart flag",
         device_name
@@ -224,7 +301,202 @@ pub fn mark_driver_ready(endpoint_name: &str, device_name: &str) -> Result<(), (
 }
 
 // ---------------------------------------------------------------------------
-// I/O forwarding
+// Phase 92a D.4 — additional-device (dev_id >= 1) public API
+// ---------------------------------------------------------------------------
+
+/// Register an additional remote block device by explicit service name.
+///
+/// Looks up `service_name` in the IPC registry (e.g. `"usb0.block"`),
+/// validates the `/drivers/` owner gate, and installs it in the first free
+/// slot with index >= 1. Returns the assigned `dev_id` on success, or `None`
+/// when the registry is full or the service name is unknown / untrusted.
+///
+/// The root slot (index 0 / nvme.block / ahci.block) is managed exclusively
+/// by `is_registered()` auto-discovery; never assign it via this function.
+#[allow(dead_code)]
+pub fn register_device(service_name: &str, device_name: &str) -> Option<u32> {
+    let (ep, owner_task_id) = registry::lookup_endpoint_with_owner(service_name)?;
+    // Owner gate: same rule as the root auto-registration.
+    if owner_task_id != 0 && !is_trusted_driver_task(owner_task_id) {
+        log::warn!(
+            "[blk::remote] register_device: ignoring '{}' from untrusted task_id={}",
+            service_name,
+            owner_task_id
+        );
+        return None;
+    }
+    let mut g = REMOTE_BLOCK.lock();
+    // Find a free slot with index >= 1.
+    let slot_idx = g
+        .entries
+        .iter()
+        .enumerate()
+        .skip(1) // never touch the root slot
+        .find(|(_, e)| e.endpoint.is_none())
+        .map(|(i, _)| i)?;
+    let slot = &mut g.entries[slot_idx];
+    slot.state.register(device_name);
+    slot.endpoint = Some(ep);
+    slot.service_name = alloc::string::String::from(service_name);
+    slot.device_name = alloc::string::String::from(device_name);
+    slot.owner_task_id = owner_task_id;
+    slot.explicitly_registered = true;
+    let dev_id = slot_idx as u32;
+    REMOTE_BLOCK_REGISTERED_MASK.fetch_or(1u32 << dev_id, Ordering::Release);
+    log::info!(
+        "[blk::remote] register_device: '{}' → dev_id={} endpoint={:?} owner={}",
+        device_name,
+        dev_id,
+        ep,
+        owner_task_id
+    );
+    Some(dev_id)
+}
+
+/// Release a secondary device slot (for hot-unplug).
+///
+/// Clears `dev_id`'s slot in the registry. The root slot (dev_id=0) may not
+/// be unregistered via this call — it is managed by the auto-registration path.
+#[allow(dead_code)]
+pub fn unregister_device(dev_id: u32) {
+    if dev_id == 0 || dev_id as usize >= MAX_REMOTE_BLOCK {
+        log::warn!("[blk::remote] unregister_device: invalid dev_id={}", dev_id);
+        return;
+    }
+    let mut g = REMOTE_BLOCK.lock();
+    let slot = &mut g.entries[dev_id as usize];
+    if slot.endpoint.is_none() {
+        return;
+    }
+    log::info!(
+        "[blk::remote] unregister_device: releasing dev_id={} ('{}')",
+        dev_id,
+        slot.device_name
+    );
+    *slot = RemoteBlockEntry::empty();
+    REMOTE_BLOCK_REGISTERED_MASK.fetch_and(!(1u32 << dev_id), Ordering::Release);
+}
+
+/// `true` when `dev_id` is in-range and its slot is occupied.
+#[allow(dead_code)]
+pub fn is_registered_dev(dev_id: u32) -> bool {
+    if dev_id as usize >= MAX_REMOTE_BLOCK {
+        return false;
+    }
+    // Fast lock-free check first.
+    if REMOTE_BLOCK_REGISTERED_MASK.load(Ordering::Acquire) & (1u32 << dev_id) == 0 {
+        return false;
+    }
+    // Confirm under the lock (the mask is set before endpoint is `Some`, so
+    // this is technically redundant, but keeps the semantics tight).
+    REMOTE_BLOCK.lock().entries[dev_id as usize]
+        .endpoint
+        .is_some()
+}
+
+/// Read sectors from an additional device (dev_id >= 1).
+#[allow(dead_code)]
+pub fn read_sectors_dev(
+    dev_id: u32,
+    start_sector: u64,
+    count: usize,
+    buf: &mut [u8],
+) -> Result<(), u8> {
+    if dev_id as usize >= MAX_REMOTE_BLOCK {
+        return Err(0xFF);
+    }
+    if count > MAX_SECTORS_PER_REQUEST as usize {
+        return Err(0xFF);
+    }
+    if REMOTE_BLOCK.lock().entries[dev_id as usize]
+        .state
+        .is_restarting()
+        && !wait_for_driver_restart_dev(dev_id)
+    {
+        return Err(BlockDriverError::DriverRestarting.to_byte());
+    }
+    match do_read_ipc_dev(dev_id, start_sector, count, buf) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            on_ipc_error_dev(dev_id);
+            if wait_for_driver_restart_dev(dev_id) {
+                do_read_ipc_dev(dev_id, start_sector, count, buf)
+            } else {
+                Err(BlockDriverError::DriverRestarting.to_byte())
+            }
+        }
+    }
+}
+
+/// Write sectors to an additional device (dev_id >= 1).
+#[allow(dead_code)]
+pub fn write_sectors_dev(
+    dev_id: u32,
+    start_sector: u64,
+    count: usize,
+    buf: &[u8],
+) -> Result<(), u8> {
+    if dev_id as usize >= MAX_REMOTE_BLOCK {
+        return Err(0xFF);
+    }
+    if count > MAX_SECTORS_PER_REQUEST as usize {
+        return Err(0xFF);
+    }
+    if REMOTE_BLOCK.lock().entries[dev_id as usize]
+        .state
+        .is_restarting()
+        && !wait_for_driver_restart_dev(dev_id)
+    {
+        return Err(BlockDriverError::DriverRestarting.to_byte());
+    }
+    // Pass payload_grant=0 (inline-bulk path) for dev writes.
+    match do_write_ipc_dev(dev_id, start_sector, count, buf, 0, true) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            on_ipc_error_dev(dev_id);
+            if wait_for_driver_restart_dev(dev_id) {
+                do_write_ipc_dev(dev_id, start_sector, count, buf, 0, false)
+            } else {
+                Err(BlockDriverError::DriverRestarting.to_byte())
+            }
+        }
+    }
+}
+
+/// Flush an additional device's write-back cache.
+#[allow(dead_code)]
+pub fn flush_dev(dev_id: u32) -> Result<(), u8> {
+    if dev_id as usize >= MAX_REMOTE_BLOCK {
+        return Err(0xFF);
+    }
+    let (ep, task) = endpoint_and_task_dev(dev_id)?;
+    let hdr = BlkRequestHeader {
+        kind: BLK_FLUSH,
+        cmd_id: 0,
+        lba: 0,
+        sector_count: 0,
+        flags: 0,
+    };
+    let encoded = encode_blk_request(hdr, 0u32);
+    scheduler::deliver_bulk(task, alloc::vec::Vec::from(encoded.as_slice()));
+    let mut msg = Message::new(BLK_FLUSH as u64);
+    msg.data[0] = 0;
+    msg.data[1] = BLK_REQUEST_HEADER_SIZE as u64;
+    let reply = endpoint::call_msg(task, ep, msg);
+    if reply.label == u64::MAX {
+        return Err(BlockDriverError::DriverRestarting.to_byte());
+    }
+    let bulk = scheduler::take_bulk_data(task).ok_or(0xFFu8)?;
+    let (reply_hdr, _) =
+        decode_blk_reply(bulk.get(..BLK_REPLY_HEADER_SIZE).ok_or(0xFFu8)?).map_err(|_| 0xFFu8)?;
+    if reply_hdr.status != BlockDriverError::Ok {
+        return Err(reply_hdr.status.to_byte());
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Root-slot I/O forwarding (unchanged from the singleton era)
 // ---------------------------------------------------------------------------
 
 /// Forward a read to the ring-3 NVMe driver via IPC.
@@ -241,7 +513,7 @@ pub fn read_sectors(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(
     // If the driver is already mid-restart on entry, wait for it first.
     // On timeout, surface DriverRestarting so the caller can distinguish
     // "driver still down" from a generic I/O error (Phase 55b Track F.2b).
-    if REMOTE_BLOCK.lock().state.is_restarting() && !wait_for_driver_restart() {
+    if REMOTE_BLOCK.lock().entries[0].state.is_restarting() && !wait_for_driver_restart() {
         return Err(BlockDriverError::DriverRestarting.to_byte());
     }
     // Attempt the IPC call; on failure wait + retry once.
@@ -333,7 +605,7 @@ pub fn write_sectors(
     // The grant is consumed in `do_write_ipc` immediately before the
     // IPC call so the single-use contract is still enforced against
     // concurrent writers racing on the same grant id.
-    if REMOTE_BLOCK.lock().state.is_restarting() && !wait_for_driver_restart() {
+    if REMOTE_BLOCK.lock().entries[0].state.is_restarting() && !wait_for_driver_restart() {
         return Err(BlockDriverError::DriverRestarting.to_byte());
     }
     // Attempt the IPC call with the grant consumed as part of the first
@@ -371,7 +643,7 @@ fn do_write_ipc(
 ) -> Result<(), u8> {
     if consume_grant {
         let mut g = REMOTE_BLOCK.lock();
-        match g.grants.consume(payload_grant) {
+        match g.entries[0].grants.consume(payload_grant) {
             Ok(()) => {}
             Err(RemoteDeviceError::GrantReplayed) => {
                 log::error!(
@@ -465,25 +737,26 @@ pub fn flush() -> Result<(), u8> {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Helpers — root slot (slot 0)
 // ---------------------------------------------------------------------------
 
-/// Snapshot the current endpoint + task ID, or return `Err(0xFF)`.
+/// Snapshot the current endpoint + task ID for slot 0, or return `Err(0xFF)`.
 fn endpoint_and_task() -> Result<(EndpointId, crate::task::TaskId), u8> {
     let g = REMOTE_BLOCK.lock();
-    let ep = g.endpoint.ok_or(0xFFu8)?;
+    let ep = g.entries[0].endpoint.ok_or(0xFFu8)?;
     let task = scheduler::current_task_id().ok_or(0xFFu8)?;
     Ok((ep, task))
 }
 
-/// Mark the driver mid-restart and emit one `driver.absent` warn.
+/// Mark the root driver mid-restart and emit one `driver.absent` warn.
 fn on_ipc_error() {
     let mut g = REMOTE_BLOCK.lock();
-    if !g.state.is_restarting() {
-        g.state.mark_restarting();
+    let slot = &mut g.entries[0];
+    if !slot.state.is_restarting() {
+        slot.state.mark_restarting();
         log::warn!(
             "[blk::remote] driver '{}' unreachable — marking mid-restart",
-            g.state.device_name().unwrap_or("<unknown>")
+            slot.state.device_name().unwrap_or("<unknown>")
         );
     }
 }
@@ -495,26 +768,63 @@ fn on_ipc_error() {
 /// driver process exit so consumers see the restart window immediately
 /// instead of waiting for the next IPC call to fail. No-op when no driver
 /// is registered or the closed endpoint is not the registered one.
+///
+/// Phase 92a: scans all occupied slots (not just slot 0) so a secondary USB
+/// device endpoint closing is also caught.
 pub fn on_endpoint_closed(ep_id: EndpointId) {
     // Fast-path: skip the mutex acquisition entirely when no driver is
     // registered. Mirrors `RemoteNic::on_endpoint_closed` so cleanup
     // overhead during boot and stop_service stays lock-free in the
     // no-driver configuration exercised by `serverization-fallback`.
-    if !REMOTE_BLOCK_REGISTERED.load(Ordering::Acquire) {
+    if REMOTE_BLOCK_REGISTERED_MASK.load(Ordering::Acquire) == 0 {
         return;
     }
-    let registered = REMOTE_BLOCK.lock().endpoint;
-    if registered == Some(ep_id) {
-        log::warn!(
-            "[blk::remote] driver endpoint {:?} closed by owner exit — \
-             marking mid-restart",
-            ep_id,
-        );
-        on_ipc_error();
+    // Keep backward-compatible fast check for slot 0.
+    if !REMOTE_BLOCK_REGISTERED.load(Ordering::Acquire) {
+        // No root driver; only check secondary slots.
+        let mut g = REMOTE_BLOCK.lock();
+        for idx in 1..MAX_REMOTE_BLOCK {
+            let slot = &mut g.entries[idx];
+            if slot.endpoint == Some(ep_id) {
+                log::warn!(
+                    "[blk::remote] dev_id={} endpoint {:?} closed — marking mid-restart",
+                    idx,
+                    ep_id,
+                );
+                on_ipc_error_dev_inner(slot);
+            }
+        }
+        return;
+    }
+    // Check root slot first (common case).
+    {
+        let root_ep = REMOTE_BLOCK.lock().entries[0].endpoint;
+        if root_ep == Some(ep_id) {
+            log::warn!(
+                "[blk::remote] driver endpoint {:?} closed by owner exit — \
+                 marking mid-restart",
+                ep_id,
+            );
+            on_ipc_error();
+            return;
+        }
+    }
+    // Check secondary slots.
+    let mut g = REMOTE_BLOCK.lock();
+    for idx in 1..MAX_REMOTE_BLOCK {
+        let slot = &mut g.entries[idx];
+        if slot.endpoint == Some(ep_id) {
+            log::warn!(
+                "[blk::remote] dev_id={} endpoint {:?} closed — marking mid-restart",
+                idx,
+                ep_id,
+            );
+            on_ipc_error_dev_inner(slot);
+        }
     }
 }
 
-/// Block up to `DRIVER_RESTART_TIMEOUT_MS` for the driver to re-register.
+/// Block up to `DRIVER_RESTART_TIMEOUT_MS` for the root driver to re-register.
 ///
 /// Called when the driver is found mid-restart (either because `is_registered()`
 /// was false, or because an IPC call returned a failure sentinel). The function
@@ -541,7 +851,7 @@ fn wait_for_driver_restart() -> bool {
     // Snapshot the restart budget without holding the lock across yields.
     let budget_ms = {
         let g = REMOTE_BLOCK.lock();
-        g.state.restart_deadline_ms as u64
+        g.entries[0].state.restart_deadline_ms as u64
     };
     let start_tick = crate::arch::x86_64::interrupts::tick_count();
     let deadline_tick = start_tick.saturating_add(budget_ms);
@@ -550,7 +860,7 @@ fn wait_for_driver_restart() -> bool {
         let now_tick = crate::arch::x86_64::interrupts::tick_count();
         let is_ready = {
             let g = REMOTE_BLOCK.lock();
-            !g.state.is_restarting()
+            !g.entries[0].state.is_restarting()
         };
         match BlockDispatchState::check_restart_wait(now_tick, deadline_tick, is_ready) {
             WaitOutcome::Ready => return true,
@@ -561,4 +871,147 @@ fn wait_for_driver_restart() -> bool {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers — secondary device slots (dev_id >= 1)
+// ---------------------------------------------------------------------------
+
+fn endpoint_and_task_dev(dev_id: u32) -> Result<(EndpointId, crate::task::TaskId), u8> {
+    let g = REMOTE_BLOCK.lock();
+    let ep = g.entries[dev_id as usize].endpoint.ok_or(0xFFu8)?;
+    let task = scheduler::current_task_id().ok_or(0xFFu8)?;
+    Ok((ep, task))
+}
+
+fn on_ipc_error_dev(dev_id: u32) {
+    let mut g = REMOTE_BLOCK.lock();
+    let slot = &mut g.entries[dev_id as usize];
+    on_ipc_error_dev_inner(slot);
+}
+
+fn on_ipc_error_dev_inner(slot: &mut RemoteBlockEntry) {
+    if !slot.state.is_restarting() {
+        slot.state.mark_restarting();
+        log::warn!(
+            "[blk::remote] device '{}' unreachable — marking mid-restart",
+            slot.state.device_name().unwrap_or("<unknown>")
+        );
+    }
+}
+
+fn wait_for_driver_restart_dev(dev_id: u32) -> bool {
+    let budget_ms = {
+        let g = REMOTE_BLOCK.lock();
+        g.entries[dev_id as usize].state.restart_deadline_ms as u64
+    };
+    let start_tick = crate::arch::x86_64::interrupts::tick_count();
+    let deadline_tick = start_tick.saturating_add(budget_ms);
+
+    loop {
+        let now_tick = crate::arch::x86_64::interrupts::tick_count();
+        let is_ready = {
+            let g = REMOTE_BLOCK.lock();
+            !g.entries[dev_id as usize].state.is_restarting()
+        };
+        match BlockDispatchState::check_restart_wait(now_tick, deadline_tick, is_ready) {
+            WaitOutcome::Ready => return true,
+            WaitOutcome::TimedOut => return false,
+            WaitOutcome::Waiting => {
+                scheduler::yield_now();
+            }
+        }
+    }
+}
+
+fn do_read_ipc_dev(dev_id: u32, start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(), u8> {
+    let (ep, task) = endpoint_and_task_dev(dev_id)?;
+    let hdr = BlkRequestHeader {
+        kind: BLK_READ,
+        cmd_id: start_sector,
+        lba: start_sector,
+        sector_count: count as u32,
+        flags: 0,
+    };
+    let encoded = encode_blk_request(hdr, 0u32);
+    scheduler::deliver_bulk(task, alloc::vec::Vec::from(encoded.as_slice()));
+    let mut msg = Message::new(BLK_READ as u64);
+    msg.data[0] = start_sector;
+    msg.data[1] = BLK_REQUEST_HEADER_SIZE as u64;
+    let reply = endpoint::call_msg(task, ep, msg);
+    if reply.label == u64::MAX {
+        on_ipc_error_dev(dev_id);
+        return Err(BlockDriverError::DriverRestarting.to_byte());
+    }
+    let bulk = scheduler::take_bulk_data(task).ok_or(0xFFu8)?;
+    let (reply_hdr, _) =
+        decode_blk_reply(bulk.get(..BLK_REPLY_HEADER_SIZE).ok_or(0xFFu8)?).map_err(|_| 0xFFu8)?;
+    if reply_hdr.status != BlockDriverError::Ok {
+        return Err(reply_hdr.status.to_byte());
+    }
+    const SECTOR_SIZE: usize = 512;
+    let expected_len = count.checked_mul(SECTOR_SIZE).ok_or(0xFFu8)?;
+    if buf.len() < expected_len {
+        return Err(0xFFu8);
+    }
+    let payload = &bulk[BLK_REPLY_HEADER_SIZE..];
+    if payload.len() < expected_len {
+        return Err(0xFFu8);
+    }
+    buf[..expected_len].copy_from_slice(&payload[..expected_len]);
+    Ok(())
+}
+
+fn do_write_ipc_dev(
+    dev_id: u32,
+    start_sector: u64,
+    count: usize,
+    buf: &[u8],
+    payload_grant: u32,
+    consume_grant: bool,
+) -> Result<(), u8> {
+    if consume_grant {
+        let mut g = REMOTE_BLOCK.lock();
+        match g.entries[dev_id as usize].grants.consume(payload_grant) {
+            Ok(()) => {}
+            Err(RemoteDeviceError::GrantReplayed) => {
+                log::error!(
+                    "[blk::remote] dev_id={} grant 0x{:08x} replayed — Phase 50 violation",
+                    dev_id,
+                    payload_grant
+                );
+                return Err(0xFF);
+            }
+            Err(_) => return Err(0xFF),
+        }
+    }
+    let (ep, task) = endpoint_and_task_dev(dev_id)?;
+    let hdr = BlkRequestHeader {
+        kind: BLK_WRITE,
+        cmd_id: start_sector,
+        lba: start_sector,
+        sector_count: count as u32,
+        flags: 0,
+    };
+    let encoded = encode_blk_request(hdr, payload_grant);
+    let mut bulk = alloc::vec![0u8; BLK_REQUEST_HEADER_SIZE + buf.len()];
+    bulk[..BLK_REQUEST_HEADER_SIZE].copy_from_slice(&encoded);
+    bulk[BLK_REQUEST_HEADER_SIZE..].copy_from_slice(buf);
+    let bulk_len = bulk.len();
+    scheduler::deliver_bulk(task, bulk);
+    let mut msg = Message::new(BLK_WRITE as u64);
+    msg.data[0] = start_sector;
+    msg.data[1] = bulk_len as u64;
+    let reply = endpoint::call_msg(task, ep, msg);
+    if reply.label == u64::MAX {
+        on_ipc_error_dev(dev_id);
+        return Err(BlockDriverError::DriverRestarting.to_byte());
+    }
+    let bulk_r = scheduler::take_bulk_data(task).ok_or(0xFFu8)?;
+    let (reply_hdr, _) =
+        decode_blk_reply(bulk_r.get(..BLK_REPLY_HEADER_SIZE).ok_or(0xFFu8)?).map_err(|_| 0xFFu8)?;
+    if reply_hdr.status != BlockDriverError::Ok {
+        return Err(reply_hdr.status.to_byte());
+    }
+    Ok(())
 }
