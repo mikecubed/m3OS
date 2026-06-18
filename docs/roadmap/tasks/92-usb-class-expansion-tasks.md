@@ -16,7 +16,7 @@
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
 | A | Multi-tier hub enumeration — live `usbhub` walker, hub descriptor + per-port power/reset, tier-2+ slot assignment via the route string | H | **A.1/A.2/A.3 landed** — server surfaces `CLASS_HUB`; the resident `usbhub` walker binds a hub, reads its descriptor over EP0, and drives per-port `PORT_POWER`/`PORT_RESET` (`usb-hub-smoke` PASS). **A.4/A.5 (tier-2 device-behind-hub enumeration via the route string) → Phase 92a** |
-| B | HID Report Protocol — wire `parse_report_descriptor` live, multi-axis/buttons/scroll, consumer keys, LED `SET_REPORT` | H | B.2/B.3 host-logic landed (Usage ranges + Report IDs + consumer keycodes; 47 hid + 38 keymap tests); live `usb-hid` wiring (B.1/B.4) pending |
+| B | HID Report Protocol — wire `parse_report_descriptor` live, multi-axis/buttons/scroll, consumer keys, LED `SET_REPORT` | H | **B.1 landed** — `usb-hid` reads + parses the HID Report descriptor over EP0 at bind and stores the `ReportField` layout per device (`USB_HID:report-parsed` in `usb-smoke`); B.2/B.3 host-logic landed (47 hid + 38 keymap tests). **B.2-live decode / B.3-live consumer routing / B.4 LED `SET_REPORT` → Phase 92b** |
 | C | Live hot-plug event surface — Port Status Change → `AttachNotice` push, detach (`attached:false`), dynamic re-enumeration, Disable Slot reclamation | — | C.1–C.3 + server-side C.4 landed (`usb-hotplug-smoke` 3-cycle PASS); class-driver-side release pends per-driver |
 | D | USB Mass Storage — BOT CBW/CSW on the Phase 96 inline bulk path, SCSI subset, UAS, `RemoteBlockDevice` facade + `/mnt/usb<n>`, page-grant overflow | C, H | D.1 transport + **data-IN phase** + D.2 codec landed (`usb-storage` daemon binds + BOT CBW/CSW round-trip + INQUIRY/READ CAPACITY over the new synchronous `SubmitBulkIn` path, `usb-storage-smoke` PASS asserting `USB_MASS_STORAGE:ready`; 31 host tests). **D.3 UAS / D.4 mount / D.5 page-grant pending** |
 | E | Isochronous endpoints — UAC PCM-out to `audio_server`, UVC frame capture + `camera_server`, controller isoch TRB scheduling | F | Planned |
@@ -162,9 +162,9 @@
 **Why it matters:** 1.0 ships Boot Protocol only; the Report Descriptor parser is dead code. B.1 reads the Report Descriptor at device bind (via `GetDescriptors`/`ControlRequest`, H.1), parses it into a `ReportField` array stored in per-device state, and decodes variable-format reports by that layout instead of the fixed boot offsets.
 
 **Acceptance:**
-- [ ] `parse_report_descriptor` gains a live call site in `usb-hid` at device bind; the parsed `ReportField` array is stored per device.
-- [ ] A Report-Protocol device's reports decode by the parsed field layout (not the boot 8-byte/3-byte assumption).
-- [ ] The existing Boot-Protocol keyboard/mouse path is unchanged (`usb-smoke` still PASSES).
+- [x] `parse_report_descriptor` gains a live call site in `usb-hid` at device bind; the parsed `ReportField` array is stored per device. — `fetch_report_fields` issues `GET_DESCRIPTOR(Report)` over EP0 for each `CLASS_HID` interface, parses it, stores `HidDevice.report_fields`, and logs `USB_HID:report-parsed proto=P fields=N` (asserted by `usb-smoke`).
+- [~] A Report-Protocol device's reports decode by the parsed field layout (not the boot 8-byte/3-byte assumption). — **Phase 92b** (B.2-live): the layout is stored; the data-driven decode + usage→event mapping + a `usb-tablet` QMP-abs-input gate arm are scheduled there.
+- [x] The existing Boot-Protocol keyboard/mouse path is unchanged (`usb-smoke` still PASSES). — `usb-smoke` PASSES (kbd+mouse decode live + render); the boot decode path is untouched.
 
 ### B.2 — Multi-axis / extra-button / scroll decode (touchpad + gaming mouse)
 

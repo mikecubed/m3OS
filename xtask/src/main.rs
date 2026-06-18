@@ -10294,6 +10294,11 @@ fn cmd_usb_smoke(args: &SmokeBootArgs) {
         wait("XHCI_USB:server-ready")?;
         // (3) usb-hid bound the keyboard and is polling its interrupt-IN EP.
         wait("usb-hid: polling")?;
+        // (3b) Phase 92 Track B.1: usb-hid read + parsed the HID Report
+        //      descriptor live at bind (the host-tested `parse_report_descriptor`
+        //      gains a live call site on a real device — proven on the boot
+        //      keyboard/mouse, whose descriptors parse to ≥1 ReportField).
+        wait("USB_HID:report-parsed")?;
         // (4) the compositor + a focused term reached an interactive prompt, so
         //     a KBD_EVENT_PULL consumer exists to render injected USB keys.
         wait("TERM_SMOKE:prompt-ready")?;
