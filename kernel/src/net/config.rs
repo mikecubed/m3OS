@@ -116,8 +116,10 @@ pub fn gateway_ip_v6() -> Option<Ipv6Addr> {
 }
 
 /// Install a SLAAC/DHCPv6 global address + on-link prefix + default gateway.
-/// A `gateway` of `None` (e.g. a zero-router-lifetime RA) installs no default
-/// route. Phase 91 C.1.
+/// A `gateway` of `Some(_)` (re)installs the default route; `None` leaves any
+/// existing default route **unchanged** — this call never withdraws a route.
+/// Use [`clear_gateway_v6`] to withdraw one (e.g. on a zero-router-lifetime RA).
+/// Phase 91 C.1.
 pub fn set_config_v6(
     global: Ipv6Addr,
     prefix: Ipv6Addr,

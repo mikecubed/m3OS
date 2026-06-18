@@ -14,10 +14,13 @@
 //   outbound DNS it reports `aaaa:skip` rather than failing (mirroring
 //   `dns-smoke`'s SKIP discipline). -> DNS6_SMOKE:aaaa:ok | :skip
 //
-// Verdicts (gate accepts the `DNS6_SMOKE:` prefix; exit 0 except on FAIL):
+// Verdicts (the smoke-runner requires the `DNS6_SMOKE:PASS` marker — a missing
+// marker is a hard failure — so exit 0 on PASS, non-zero on FAIL):
 //   - localhost dual-stack resolves -> `DNS6_SMOKE:PASS` (exit 0)
 //   - localhost not dual-stack       -> `DNS6_SMOKE:FAIL` (exit 1)
-//   - localhost cannot resolve       -> `DNS6_SMOKE:SKIP` (exit 0)
+//   - localhost cannot resolve       -> `DNS6_SMOKE:FAIL` (exit 1)
+// (The CI gate stages a dual-stack `/etc/hosts`, so a localhost resolve failure
+// is a genuine fault, not a skip.)
 
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -34,10 +37,10 @@ int main(void) {
     struct addrinfo *res = NULL;
     int rc = getaddrinfo("localhost", "80", &hints, &res);
     if (rc != 0 || res == NULL) {
-        printf("DNS6_SMOKE:SKIP localhost getaddrinfo rc=%d (%s)\n", rc,
+        printf("DNS6_SMOKE:FAIL localhost getaddrinfo rc=%d (%s)\n", rc,
                gai_strerror(rc));
         fflush(stdout);
-        return 0;
+        return 1;
     }
     int have4 = 0, have6 = 0, first_family = 0;
     for (struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next) {

@@ -116,14 +116,27 @@ pub fn pseudo_header_checksum(
     next_header: u8,
     upper_data: &[u8],
 ) -> u16 {
-    let mut buf = Vec::with_capacity(40 + upper_data.len());
-    buf.extend_from_slice(&src);
-    buf.extend_from_slice(&dst);
-    buf.extend_from_slice(&(upper_data.len() as u32).to_be_bytes());
-    buf.extend_from_slice(&[0, 0, 0]);
-    buf.push(next_header);
-    buf.extend_from_slice(upper_data);
-    super::ipv4::checksum(&buf)
+    // Accumulate the ones-complement sum in place — no temporary buffer. The
+    // pseudo-header is exactly 40 bytes (16 src + 16 dst + 4 length + 3 zero +
+    // 1 next-header), an even length, so the seam into `upper_data` stays
+    // 16-bit aligned and the running sum equals the concatenated form.
+    let len_be = (upper_data.len() as u32).to_be_bytes();
+    let tail = [
+        len_be[0],
+        len_be[1],
+        len_be[2],
+        len_be[3],
+        0,
+        0,
+        0,
+        next_header,
+    ];
+    let mut sum: u32 = 0;
+    super::ipv4::checksum_accumulate(&mut sum, &src);
+    super::ipv4::checksum_accumulate(&mut sum, &dst);
+    super::ipv4::checksum_accumulate(&mut sum, &tail);
+    super::ipv4::checksum_accumulate(&mut sum, upper_data);
+    super::ipv4::checksum_fold(sum)
 }
 
 /// Walk the IPv6 extension-header chain (RFC 8200 §4).

@@ -144,9 +144,11 @@ no general loopback interface, and even IPv4 `127.0.0.1` is not routed; the RX
 path only sees frames that arrive from a NIC. So `ping6 ::1` cannot work by
 routing. Instead, `ipv6::send_from` detects a self-addressed packet (one
 destined for `::1` or any address the host has assigned itself) and **feeds it
-back into the RX path** without touching the wire. The smoke gate proves this is
-genuinely loopback-only by asserting the TX counter does not advance — no frame
-reached `net::send_frame`.
+back into the RX path** without touching the wire. The smoke gate proves this
+works by sending an ICMPv6 echo to `::1` and asserting the reply round-trips
+through the real `handle_icmpv6` request→reply path (`IPV6_LOOPBACK_OK`) — with
+no `lo` device and no NIC frame involved, the only way the echo can return is the
+internal loopback.
 
 ### Track C — SLAAC and DHCPv6 (why IPv6 splits config across RA and DHCPv6)
 

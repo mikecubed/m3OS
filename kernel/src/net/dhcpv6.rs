@@ -42,10 +42,12 @@ static DRIVER: IrqSafeMutex<Dhcpv6Driver> = IrqSafeMutex::new(Dhcpv6Driver {
     ticks: 0,
 });
 
-/// Derive a 3-byte transaction id from the NIC MAC (no RNG here; it only needs
-/// to be stable within a transaction).
-fn derive_xid(mac: MacAddr, salt: u8) -> [u8; 3] {
-    [mac[3] ^ salt, mac[4], mac[5]]
+/// Derive a 3-byte DHCPv6 transaction id from the NIC MAC. `variant` perturbs
+/// the id between the initial Information-Request and its retransmit. This is a
+/// transaction identifier (RFC 8415 §8), not a cryptographic value — no RNG is
+/// needed; it only has to be stable within a single transaction.
+fn derive_xid(mac: MacAddr, variant: u8) -> [u8; 3] {
+    [mac[3] ^ variant, mac[4], mac[5]]
 }
 
 /// Send a DHCPv6 client message to `[ff02::1:2]:547` (UDP 546 → 547).
