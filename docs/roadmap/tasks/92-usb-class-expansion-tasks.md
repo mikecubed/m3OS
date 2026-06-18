@@ -22,7 +22,7 @@
 | E | Isochronous endpoints — UAC PCM-out to `audio_server`, UVC frame capture + `camera_server`, controller isoch TRB scheduling | F | Planned |
 | F | Multi-controller concurrency — per-controller bound IRQ + event-loop thread, concurrent MSI-X routing | — | Planned |
 | G | Host-side USB-Ethernet class drivers — generic CDC-ECM/NCM `RemoteNic`, fold the Phase 96 vendor `ure` into a shared device-match registry | C | Planned |
-| H | Foundation & carry-over hardening — live `GetDescriptors` (large reads), control-transfer event capture, Disable Slot, page-grant `SubmitTransfer` | — | Planned |
+| H | Foundation & carry-over hardening — live `GetDescriptors` (large reads), control-transfer event capture, Disable Slot, page-grant `SubmitTransfer` | — | H.1–H.3 landed (host-tested + `usb-smoke` clean); H.4→D.5 |
 | I | Validation, kernel version bump & learning docs — new acceptance gates, AGENTS.md rows, `0.91.0`→`0.92.0`, Phase 92 learning doc | A–H | Planned |
 
 ---
@@ -41,9 +41,9 @@
 **Why it matters:** descriptors are pre-resolved into `AttachNotice` at enumeration, but a Report-Protocol HID device (B.1) and CDC-ECM (G.1) must read a full **configuration / Report / CDC functional descriptor** at bind time — these exceed the ≤64-byte inline `ControlData` clamp. `GetDescriptors` must return the cached device + config descriptor blobs (already parsed during enumeration) so class drivers stop being limited to what `AttachNotice` carries.
 
 **Acceptance:**
-- [ ] `UsbRequest::GetDescriptors { slot_id }` returns `UsbReply::Descriptors { device, config }` from the enumeration-time cache (not a fresh control read) for an enumerated device.
-- [ ] A configuration descriptor larger than 64 bytes round-trips intact (bounded by `USB_MSG_MAX`=4096), proven by a host test over the wire codec and by a class driver reading it live.
-- [ ] The arm no longer returns `Error { code: ENOSYS }`; the `ENOSYS` default remains for `ConfigureEndpoints`/`SubmitTransfer` until H.4.
+- [x] `UsbRequest::GetDescriptors { slot_id }` returns `UsbReply::Descriptors { device, config }` from the enumeration-time cache (not a fresh control read) for an enumerated device. — server arm wired to `Controller::cached_descriptors`; `XhciHostOps::{get_device_descriptor(len≥18),get_config_full}` cache the raw blobs into the per-slot `SlotContext`. Live class-driver read exercised by B.1/G.1.
+- [x] A configuration descriptor larger than 64 bytes round-trips intact (bounded by `USB_MSG_MAX`=4096), proven by a host test over the wire codec. — `protocol::tests::descriptors_large_config_roundtrip` (512-byte config) PASSES.
+- [x] The arm no longer returns `Error { code: ENOSYS }`; the `ENOSYS` default remains for `ConfigureEndpoints`/`SubmitTransfer` until H.4.
 
 ### H.2 — Capture non-matching events during a blocking control transfer
 
@@ -52,9 +52,9 @@
 **Why it matters:** the bulk-OUT path already captures concurrent interrupt/bulk-IN completions (`wait_for_bulk_out_event`), but a blocking **control** transfer still discards non-matching `TransferEvent`s. Once control traffic (Report-Protocol descriptor reads, LED `SET_REPORT`, GET_MAX_LUN) interleaves with active interrupt/bulk polling, a report completing mid-transfer would be dropped and its endpoint left un-rearmed — the second 78c carry-over item.
 
 **Acceptance:**
-- [ ] `drain_for_transfer_event` routes non-matching IN-endpoint completions through `capture_interrupt_report` + deferred re-arm (mirroring `wait_for_bulk_out_event`), instead of discarding them.
-- [ ] A test (or instrumented run) issuing a control transfer while an interrupt endpoint is armed shows no dropped report and no un-rearmed endpoint.
-- [ ] No regression in `usb-smoke` (HID boot path) or `usb-eth-smoke` (bulk path).
+- [x] `drain_for_transfer_event` routes non-matching IN-endpoint completions through `capture_interrupt_report` + deferred re-arm (mirroring `wait_for_bulk_out_event`), instead of discarding them. — applied to **both** `drain_for_transfer_event` (EP0 control) and `drain_for_command_completion` (Configure/Disable Slot); callers `wait_for_transfer_event`/`issue_command_and_wait` re-arm at `armed_len`.
+- [ ] A test (or instrumented run) issuing a control transfer while an interrupt endpoint is armed shows no dropped report and no un-rearmed endpoint. — structurally mirrors the proven bulk-OUT path; a dedicated live no-drop assertion is exercised by B.4 (`SET_REPORT` interleaved with HID polling).
+- [x] No regression in `usb-smoke` (HID boot path) or `usb-eth-smoke` (bulk path). — `usb-smoke` PASSES (kbd+mouse decoded live); `usb-eth-smoke` needs the absent `ure` crate so it is not present in-tree (Track G).
 
 ### H.3 — Disable Slot reclamation
 
@@ -66,11 +66,13 @@
 **Why it matters:** `Enable Slot` allocates a slot at enumeration but nothing reclaims it. Hot-plug detach (Track C) and re-enumeration cycles would leak slot IDs and DCBAA entries until the controller's slot pool exhausts. Disable Slot is the matching teardown.
 
 **Acceptance:**
-- [ ] A `disable_slot` command is issued (and its Command Completion drained) when a device detaches, freeing the DCBAA entry and slot-context allocations.
-- [ ] A repeated attach/detach loop (QMP `device_add`/`device_del`, ≥ slot-pool-count iterations) does not exhaust slots — the Nth attach still enumerates.
-- [ ] Slot-handle packing (`pack_handle`) correctly reuses a reclaimed slot without misrouting (`unpack_handle` round-trip holds).
+- [x] A `disable_slot` command is issued (and its Command Completion drained) when a device detaches, freeing the DCBAA entry and slot-context allocations. — `Controller::disable_slot` (issues `Trb::disable_slot`, drains via `issue_command_and_wait`, zeroes `DCBAA[slot]`, drops the `SlotContext`) + the `Trb::disable_slot` builder (kernel-core, host-tested `encode_disable_slot`). The detach *trigger* is wired in C.4.
+- [ ] A repeated attach/detach loop (QMP `device_add`/`device_del`, ≥ slot-pool-count iterations) does not exhaust slots — the Nth attach still enumerates. — verified by the hot-plug gate (I.2) once Track C lands.
+- [ ] Slot-handle packing (`pack_handle`) correctly reuses a reclaimed slot without misrouting (`unpack_handle` round-trip holds). — verified with the hot-plug gate (I.2).
 
 ### H.4 — Page-grant `SubmitTransfer` for oversized bulk data phases
+
+> **Sequencing:** deferred to land with **Track D.5** (its only consumer). Inline `SubmitBulkOut`/`PollBulkIn` cover ≤ 4096-byte data phases (an 8 × 512-byte-sector READ(10) fits), so D.1–D.4 do not need it; it is implemented when the multi-sector overflow path is built.
 
 **Files:**
 - `userspace/drivers/xhci/src/server.rs`

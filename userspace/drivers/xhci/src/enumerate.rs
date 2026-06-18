@@ -94,8 +94,15 @@ impl UsbHostOps for XhciHostOps<'_> {
 
     fn get_device_descriptor(&mut self, slot_id: u8, len: u16) -> Option<Vec<u8>> {
         let setup = trb::SetupPacket::get_device_descriptor(len);
-        self.controller
-            .control_transfer(self.irq, slot_id, setup, len, true, None)
+        let bytes = self
+            .controller
+            .control_transfer(self.irq, slot_id, setup, len, true, None)?;
+        // Cache the full 18-byte device descriptor for a later GetDescriptors
+        // IPC (Phase 92 H.1). The 8-byte MaxPacketSize-probe read is skipped.
+        if len >= 18 {
+            self.controller.cache_device_descriptor(slot_id, &bytes);
+        }
+        Some(bytes)
     }
 
     fn get_config_short(&mut self, slot_id: u8, len: u16) -> Option<Vec<u8>> {
@@ -106,8 +113,14 @@ impl UsbHostOps for XhciHostOps<'_> {
 
     fn get_config_full(&mut self, slot_id: u8, len: u16) -> Option<Vec<u8>> {
         let setup = trb::SetupPacket::get_config_descriptor(0, len);
-        self.controller
-            .control_transfer(self.irq, slot_id, setup, len, true, None)
+        let bytes = self
+            .controller
+            .control_transfer(self.irq, slot_id, setup, len, true, None)?;
+        // Cache the full configuration blob (wTotalLength bytes) for a later
+        // GetDescriptors IPC (Phase 92 H.1) — class drivers read the interface /
+        // endpoint / functional descriptors a full config carries.
+        self.controller.cache_config_descriptor(slot_id, &bytes);
+        Some(bytes)
     }
 
     fn set_configuration(&mut self, slot_id: u8, value: u8) -> u8 {

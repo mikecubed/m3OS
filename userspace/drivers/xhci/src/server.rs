@@ -288,6 +288,16 @@ fn handle_request(
         UsbRequest::NextAttach { cursor } => UsbReply::Attach {
             notice: served.get(cursor as usize).copied(),
         },
+        // Phase 92 H.1: return the device + full configuration descriptor blobs
+        // cached at enumeration. A full config exceeds the inline `ControlData`
+        // clamp, so this is how a Report-Protocol HID / CDC-ECM class driver
+        // reads the descriptors `AttachNotice` does not carry.
+        UsbRequest::GetDescriptors { slot_id } => {
+            match owner!(slot_id).and_then(|(c, _irq, slot)| c.cached_descriptors(slot)) {
+                Some((device, config)) => UsbReply::Descriptors { device, config },
+                None => UsbReply::Error { code: EINVAL },
+            }
+        }
         UsbRequest::PollInterruptIn {
             slot_id,
             dci: target_dci,

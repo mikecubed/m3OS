@@ -253,6 +253,22 @@ impl Trb {
         }
     }
 
+    /// Build a **Disable Slot Command TRB** (xHCI §6.4.3.6).
+    ///
+    /// Frees the device slot `slot_id` that Enable Slot allocated: the
+    /// controller releases the slot's Device Context and returns the slot to
+    /// the available pool. The matching teardown for [`Trb::enable_slot`] — used
+    /// on hot-plug detach and re-enumeration so slot IDs / DCBAA entries are not
+    /// leaked (Phase 92 Track H.3). `cycle` is the producer cycle bit.
+    pub const fn disable_slot(slot_id: u8, cycle: bool) -> Trb {
+        Trb {
+            parameter: 0,
+            status: 0,
+            control: control_type_cycle(TRB_TYPE_DISABLE_SLOT, cycle)
+                | ((slot_id as u32) << CMD_SLOT_ID_SHIFT),
+        }
+    }
+
     /// Build a **No Op Command TRB** (xHCI §6.4.3.10) — used during bring-up to
     /// confirm the command ring and event ring are wired up correctly.
     pub const fn no_op_command(cycle: bool) -> Trb {
@@ -947,6 +963,23 @@ mod tests {
             5
         );
         assert!(!trb_cycle(&trb2));
+    }
+
+    #[test]
+    fn encode_disable_slot() {
+        // Slot ID rides bits 31:24, the same field Address Device / Configure
+        // Endpoint use; type is Disable Slot (10); cycle propagates.
+        let trb = Trb::disable_slot(7, true);
+        assert_eq!(trb.parameter, 0);
+        assert_eq!(trb.status, 0);
+        assert_eq!(trb_type_raw(&trb), TRB_TYPE_DISABLE_SLOT);
+        assert!(trb_cycle(&trb));
+        assert_eq!((trb.control >> 24) & 0xFF, 7);
+
+        let trb2 = Trb::disable_slot(31, false);
+        assert_eq!(trb_type_raw(&trb2), TRB_TYPE_DISABLE_SLOT);
+        assert!(!trb_cycle(&trb2));
+        assert_eq!((trb2.control >> 24) & 0xFF, 31);
     }
 
     #[test]

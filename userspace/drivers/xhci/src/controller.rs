@@ -263,6 +263,15 @@ pub struct SlotContext {
     /// growth would eventually exhaust the device-host DMA cap table. `None`
     /// until the first data-stage transfer on this slot.
     pub ep0_data_buf: Option<DmaBuffer<u8>>,
+    /// Raw 18-byte Device Descriptor captured at enumeration (Phase 92 H.1).
+    /// Returned by `GetDescriptors` so a class driver can inspect device-level
+    /// fields without a fresh control read. Empty until the enumerator caches it.
+    pub device_desc: alloc::vec::Vec<u8>,
+    /// Raw Configuration Descriptor blob (`wTotalLength` bytes — interfaces +
+    /// endpoints + class functional descriptors) captured at enumeration. A full
+    /// config exceeds the inline `ControlData` clamp, so `GetDescriptors` is the
+    /// only way a class driver reads it whole. Empty until cached.
+    pub config_desc: alloc::vec::Vec<u8>,
 }
 
 pub struct Controller {
@@ -723,7 +732,8 @@ impl Controller {
         const MAX_POLLS: u32 = 400;
         for poll_i in 0..(COMPLETION_SPIN_POLLS + MAX_POLLS) {
             let before = self.consumer.index;
-            let found = self.drain_for_command_completion(cmd_iova);
+            let mut completed: alloc::vec::Vec<(u8, u8)> = alloc::vec::Vec::new();
+            let found = self.drain_for_command_completion(cmd_iova, &mut completed);
             // Only advance ERDP / clear IMAN.IP when the drain actually consumed
             // events — an empty-poll ERDP write disturbs the controller's
             // event-ring bookkeeping (see `wait_for_transfer_event`).
@@ -732,6 +742,17 @@ impl Controller {
                     self.event_ring_iova + (self.consumer.index as u64) * trb::TRB_SIZE as u64;
                 self.rt_write_u64(rt_reg::ERDP, erdp | ERDP_EHB);
                 self.rt_write_u32(rt_reg::IMAN, IMAN_IP | IMAN_IE);
+            }
+            // Re-arm any IN endpoint captured while the command was in flight (H.2).
+            for (s, d) in completed {
+                let len = self
+                    .slot(s)
+                    .and_then(|sc| sc.interrupt_eps.iter().find(|e| e.dci == d))
+                    .map(|e| e.armed_len)
+                    .unwrap_or(0);
+                if len > 0 {
+                    self.arm_ring_in(s, d, len);
+                }
             }
             if let Some(ev) = found {
                 return ev;
@@ -765,6 +786,7 @@ impl Controller {
     fn drain_for_command_completion(
         &mut self,
         cmd_iova: u64,
+        completed: &mut alloc::vec::Vec<(u8, u8)>,
     ) -> Option<trb::CommandCompletionEvent> {
         let mut found: Option<trb::CommandCompletionEvent> = None;
         loop {
@@ -788,7 +810,14 @@ impl Controller {
                     self.on_port_status_change(ev);
                 }
                 Some(trb::TrbType::TransferEvent) => {
-                    // Not expected during command processing; ignore.
+                    // A command (Configure Endpoint, Disable Slot, …) can run
+                    // while a HID/bulk interrupt-IN endpoint is armed. Capture a
+                    // non-matching IN completion (odd DCI) rather than drop it
+                    // (H.2); the caller re-arms it after the drain.
+                    let ev = trb::parse_transfer_event(&candidate);
+                    if ev.endpoint_id & 1 == 1 && self.capture_interrupt_report(ev) {
+                        completed.push((ev.slot_id, ev.endpoint_id));
+                    }
                 }
                 _ => {}
             }
@@ -1016,7 +1045,8 @@ impl Controller {
         const MAX_POLLS: u32 = 400;
         for poll_i in 0..(COMPLETION_SPIN_POLLS + MAX_POLLS) {
             let before = self.consumer.index;
-            let found = self.drain_for_transfer_event(slot_id, endpoint_id);
+            let mut completed: alloc::vec::Vec<(u8, u8)> = alloc::vec::Vec::new();
+            let found = self.drain_for_transfer_event(slot_id, endpoint_id, &mut completed);
             // Only advance ERDP / clear IMAN.IP when the drain actually consumed
             // events. Writing ERDP|EHB on every empty poll (e.g. during a dense
             // run of control transfers) disturbs the controller's event-ring
@@ -1026,6 +1056,18 @@ impl Controller {
                     self.event_ring_iova + (self.consumer.index as u64) * trb::TRB_SIZE as u64;
                 self.rt_write_u64(rt_reg::ERDP, erdp | ERDP_EHB);
                 self.rt_write_u32(rt_reg::IMAN, IMAN_IP | IMAN_IE);
+            }
+            // Re-arm any IN endpoint whose report we captured mid-transfer (H.2),
+            // at its frame-sized `armed_len` so a bulk frame is not truncated.
+            for (s, d) in completed {
+                let len = self
+                    .slot(s)
+                    .and_then(|sc| sc.interrupt_eps.iter().find(|e| e.dci == d))
+                    .map(|e| e.armed_len)
+                    .unwrap_or(0);
+                if len > 0 {
+                    self.arm_ring_in(s, d, len);
+                }
             }
             if let Some(ev) = found {
                 return Some(ev);
@@ -1042,10 +1084,19 @@ impl Controller {
     /// Drain the event ring looking for a Transfer Event for `slot_id` /
     /// `endpoint_id`. Returns the last matching event, consuming all
     /// produced events up to and including it.
+    ///
+    /// Phase 92 H.2: a non-matching **IN**-endpoint completion (odd DCI) seen
+    /// while waiting for an EP0 control transfer is no longer dropped — it is
+    /// routed through `capture_interrupt_report` and its `(slot, dci)` pushed
+    /// into `completed` so the caller re-arms the endpoint after the drain
+    /// (mirroring `wait_for_bulk_out_event`). Without this, a HID report or
+    /// bulk-IN frame completing mid-control-transfer was lost and its endpoint
+    /// left armed-but-completed.
     fn drain_for_transfer_event(
         &mut self,
         slot_id: u8,
         endpoint_id: u8,
+        completed: &mut alloc::vec::Vec<(u8, u8)>,
     ) -> Option<trb::TransferEvent> {
         let mut found: Option<trb::TransferEvent> = None;
         loop {
@@ -1059,6 +1110,12 @@ impl Controller {
                     let ev = trb::parse_transfer_event(&candidate);
                     if ev.slot_id == slot_id && ev.endpoint_id == endpoint_id {
                         found = Some(ev);
+                    } else if ev.endpoint_id & 1 == 1 {
+                        // A non-matching IN completion (odd DCI = IN per
+                        // trb::dci) — capture it rather than drop it (H.2).
+                        if self.capture_interrupt_report(ev) {
+                            completed.push((ev.slot_id, ev.endpoint_id));
+                        }
                     }
                 }
                 Some(trb::TrbType::CommandCompletion) => {
@@ -1123,8 +1180,71 @@ impl Controller {
             input_ctx,
             interrupt_eps: alloc::vec::Vec::new(),
             ep0_data_buf: None,
+            device_desc: alloc::vec::Vec::new(),
+            config_desc: alloc::vec::Vec::new(),
         });
         Ok(())
+    }
+
+    /// Cache the raw 18-byte Device Descriptor read during enumeration so a
+    /// later `GetDescriptors` IPC can return it without a fresh control read
+    /// (Phase 92 H.1). No-op for an unknown slot.
+    pub fn cache_device_descriptor(&mut self, slot_id: u8, bytes: &[u8]) {
+        if let Some(sc) = self.slot_mut(slot_id) {
+            sc.device_desc = bytes.to_vec();
+        }
+    }
+
+    /// Cache the raw Configuration Descriptor blob (`wTotalLength` bytes) read
+    /// during enumeration for a later `GetDescriptors` IPC (Phase 92 H.1).
+    pub fn cache_config_descriptor(&mut self, slot_id: u8, bytes: &[u8]) {
+        if let Some(sc) = self.slot_mut(slot_id) {
+            sc.config_desc = bytes.to_vec();
+        }
+    }
+
+    /// Return the cached `(device, config)` descriptor blobs for `slot_id`, or
+    /// `None` if the slot is unknown or its descriptors were never cached
+    /// (Phase 92 H.1 — serves `UsbRequest::GetDescriptors`).
+    pub fn cached_descriptors(
+        &self,
+        slot_id: u8,
+    ) -> Option<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>)> {
+        let sc = self.slot(slot_id)?;
+        if sc.device_desc.is_empty() {
+            return None;
+        }
+        Some((sc.device_desc.clone(), sc.config_desc.clone()))
+    }
+
+    /// Issue a **Disable Slot** command for `slot_id`, drain its completion, and
+    /// reclaim the slot's resources: clear `DCBAA[slot_id]` and drop the
+    /// `SlotContext` (freeing its EP0 ring / output context / scratch DMA on the
+    /// next process-exit reclaim). The matching teardown for Enable Slot — used
+    /// on hot-plug detach + re-enumeration so slot IDs are not leaked (Phase 92
+    /// H.3). Returns `true` on a successful Command Completion. A bogus
+    /// `slot_id` (no live `SlotContext`) is rejected without touching hardware.
+    pub fn disable_slot(&mut self, irq: &IrqNotification, slot_id: u8) -> bool {
+        if self.slot(slot_id).is_none() {
+            return false;
+        }
+        let cycle = self.producer.cycle;
+        let cmd = trb::Trb::disable_slot(slot_id, cycle);
+        let ev = self.issue_command_and_wait(irq, cmd);
+        let ok = ev.completion_code == trb::COMPLETION_SUCCESS;
+        if ok {
+            // Clear the DCBAA entry so the controller no longer references the
+            // freed Output Device Context, then drop the per-slot state.
+            if let Some(dcbaa) = self.dcbaa.as_ref() {
+                write_u64_at(dcbaa, slot_id as usize * 8, 0);
+            }
+            self.slots.retain(|s| s.slot_id != slot_id);
+        } else {
+            write_str(STDOUT_FILENO, "[xhci] Disable Slot failed: cc=");
+            crate::write_u8_dec(ev.completion_code);
+            write_str(STDOUT_FILENO, "\n");
+        }
+        ok
     }
 
     /// Write a snapshot into the Input Context DMA buffer and return the IOVA.

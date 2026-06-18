@@ -1342,4 +1342,33 @@ mod tests {
             _ => panic!("wrong variant"),
         }
     }
+
+    /// Phase 92 H.1: a full configuration descriptor (interfaces + endpoints +
+    /// class functional descriptors) exceeds the ≤64-byte inline `ControlData`
+    /// clamp, so `GetDescriptors`/`Descriptors` must carry it whole. Prove a
+    /// large blob round-trips intact through the u16-prefixed wire codec
+    /// (bounded by `USB_MSG_MAX`).
+    #[test]
+    fn descriptors_large_config_roundtrip() {
+        let device: alloc::vec::Vec<u8> = (0..18u8).collect();
+        // 512-byte config — well over the 64-byte inline cap, well under USB_MSG_MAX.
+        let config: alloc::vec::Vec<u8> = (0..512u16).map(|i| (i & 0xFF) as u8).collect();
+        assert!(config.len() > 64);
+        let reply = UsbReply::Descriptors {
+            device: device.clone(),
+            config: config.clone(),
+        };
+        let bytes = reply.encode();
+        assert!(bytes.len() <= USB_MSG_MAX, "encoded reply must fit inline");
+        match UsbReply::decode(&bytes).expect("decode") {
+            UsbReply::Descriptors {
+                device: d,
+                config: c,
+            } => {
+                assert_eq!(d, device);
+                assert_eq!(c, config);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
 }
