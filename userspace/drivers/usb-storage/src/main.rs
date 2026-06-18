@@ -104,30 +104,22 @@ fn next_tag() -> u32 {
 // BOT command execution
 // ---------------------------------------------------------------------------
 
-/// Poll a bulk-IN endpoint for exactly `len` bytes until it returns a non-empty
-/// buffer or the bounded budget is exhausted. The first poll lazily arms the
-/// endpoint at `len`; the device's IN response is captured by a subsequent poll.
-/// `len` MUST equal the transfer the device will send for that phase — BOT
-/// requires the host's bulk-IN length to match the CBW data length / CSW length
-/// exactly (a too-large arm trips the spec's Hi>Di STALL). The bulk-IN endpoint
-/// is configured at depth 1 (see `alloc_interrupt_ep_ring`), so each poll arms
-/// one TRB at exactly `len` with no stale-length TRB left from the prior phase.
-/// Returns `None` on timeout.
-fn poll_bulk_in(usb_ep: u32, slot_id: u8, dci: u8, len: u16) -> Option<Vec<u8>> {
-    // ~400 ms budget at 2 ms/poll — generous for an emulated device.
-    for _ in 0..200 {
-        if let Some(UsbReply::BulkData {
+/// Issue a **synchronous, single-TRB** bulk-IN transfer of exactly `len` bytes
+/// for one BOT phase (the data stage or the 13-byte CSW). `len` MUST equal the
+/// transfer the device will send for that phase — BOT requires the host's
+/// bulk-IN length to match the CBW data length / CSW length exactly. The server
+/// arms exactly one TRB and blocks for its completion (no streaming auto-re-arm,
+/// so the device is never issued a surplus IN token while it is back in CBW-wait
+/// state — which would STALL the endpoint, the Phase 96 streaming-path gap this
+/// closes). Returns `None` on a transport failure / STALL.
+fn submit_bulk_in(usb_ep: u32, slot_id: u8, dci: u8, len: u16) -> Option<Vec<u8>> {
+    match usb_call(usb_ep, &UsbRequest::SubmitBulkIn { slot_id, dci, len }) {
+        Some(UsbReply::BulkData {
             data,
-            completion_code,
-        }) = usb_call(usb_ep, &UsbRequest::PollBulkIn { slot_id, dci, len })
-            && completion_code == 1
-            && !data.is_empty()
-        {
-            return Some(data);
-        }
-        let _ = syscall_lib::nanosleep_for(0, 2_000_000);
+            completion_code: 1,
+        }) => Some(data),
+        _ => None,
     }
-    None
 }
 
 /// Run one BOT SCSI command: CBW on bulk-OUT, optional data phase on bulk-IN,
@@ -163,15 +155,15 @@ fn bot_command(
         }
     }
 
-    // (2) Data phase (device-to-host) — arm at exactly the CBW data length.
+    // (2) Data phase (device-to-host) — request exactly the CBW data length.
     let data = if data_in && data_len > 0 {
-        poll_bulk_in(usb_ep, slot_id, notice.bulk_in_dci, data_len)?
+        submit_bulk_in(usb_ep, slot_id, notice.bulk_in_dci, data_len)?
     } else {
         Vec::new()
     };
 
-    // (3) CSW on bulk-IN — arm at exactly 13 bytes.
-    let csw_bytes = poll_bulk_in(usb_ep, slot_id, notice.bulk_in_dci, CSW_LEN as u16)?;
+    // (3) CSW on bulk-IN — request exactly 13 bytes.
+    let csw_bytes = submit_bulk_in(usb_ep, slot_id, notice.bulk_in_dci, CSW_LEN as u16)?;
     let csw = Csw::parse(&csw_bytes)?;
     Some((data, csw.status))
 }
@@ -265,12 +257,11 @@ fn probe_device(usb_ep: u32, notice: &AttachNotice) -> bool {
         return false;
     }
 
-    // INQUIRY — device identity. NOTE: the data-IN phase against a SuperSpeed
-    // device currently stalls on a Phase 96 bulk-IN-data substrate gap (the
-    // bulk-IN data path was never validated by a real device — see the Phase 92
-    // task doc, D.1). The attempt is left in place (best-effort, non-fatal) so
-    // it lights up automatically once that gap is closed; until then it logs the
-    // failure and the daemon exits cleanly without the capacity/mount steps.
+    // INQUIRY — device identity. The data-IN phase rides the synchronous
+    // single-TRB `SubmitBulkIn` path (Phase 92 Track D), which arms exactly one
+    // bulk-IN TRB per phase and never leaves a surplus TRB queued — closing the
+    // Phase 96 streaming-path gap where the device STALLed the bulk-IN endpoint
+    // on the surplus IN tokens issued after its data + CSW.
     let (inq_data, inq_status) = match bot_command(
         usb_ep,
         notice,

@@ -479,6 +479,24 @@ fn handle_request(
                 completion_code: 0xFF,
             },
         },
+        // Phase 92 Track D — synchronous single-TRB bulk-IN for the BOT data +
+        // CSW phases (no streaming auto-re-arm; see `Controller::submit_bulk_in`).
+        UsbRequest::SubmitBulkIn {
+            slot_id,
+            dci: target_dci,
+            len,
+        } => match owner!(slot_id)
+            .and_then(|(c, irq, slot)| c.submit_bulk_in(irq, slot, target_dci, len as u32))
+        {
+            Some(data) => UsbReply::BulkData {
+                data,
+                completion_code: 1,
+            },
+            None => UsbReply::BulkData {
+                data: Vec::new(),
+                completion_code: 0xFF,
+            },
+        },
         UsbRequest::Topology => {
             // Snapshot every brought-up controller's root-hub ports live. The
             // per-controller port count records the bring-up set; each connected

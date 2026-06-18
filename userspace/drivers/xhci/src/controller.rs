@@ -1748,6 +1748,97 @@ impl Controller {
         }
     }
 
+    /// Submit a **synchronous, single-TRB** bulk-IN transfer of exactly `len`
+    /// bytes on (`slot_id`, `dci`) and block for its completion, returning the
+    /// received bytes (short packets honored via the event residual). Phase 92
+    /// Track D — the Bulk-Only Transport (BOT) data + CSW phases.
+    ///
+    /// This is **distinct** from the streaming `arm_bulk_in`/`take_bulk_report`
+    /// path: BOT is a strict request/response protocol (the device sends data
+    /// only when commanded and returns to a CBW-wait state afterwards), so the
+    /// host must NOT keep surplus IN TRBs queued. The streaming path arms `depth`
+    /// (4) outstanding TRBs and auto-re-arms after every completion — perfect for
+    /// a NIC that always has another frame, but fatal for BOT: the surplus IN
+    /// tokens issued after the device's data + CSW (while it is back in CBW-wait)
+    /// make the device STALL the bulk-IN endpoint (`cc=6`), wedging it. This
+    /// method instead enqueues exactly one Normal TRB (IOC) of `len` bytes, rings
+    /// the doorbell once, waits for that single completion, and never re-arms —
+    /// the correct one-transfer-per-phase discipline. The endpoint's `in_flight`
+    /// streaming cursors are left at 0 (the BOT daemon never mixes the two paths
+    /// on the same endpoint), so the shared `ep.producer` ring stays consistent.
+    ///
+    /// `data_bufs[0]` is grown to `len` if needed (a multi-sector READ(10) can
+    /// exceed the `mps`-sized initial buffer). Returns `None` on timeout or a
+    /// non-success/short completion (e.g. a genuine STALL), so the caller can
+    /// surface a transport failure.
+    pub fn submit_bulk_in(
+        &mut self,
+        irq: &IrqNotification,
+        slot_id: u8,
+        dci: u8,
+        len: u32,
+    ) -> Option<alloc::vec::Vec<u8>> {
+        if len == 0 {
+            return Some(alloc::vec::Vec::new());
+        }
+        // Grow the IN data buffer if the requested length exceeds it (disjoint
+        // borrow from self.handle), mirroring submit_bulk_out's OUT buffer grow.
+        let need_grow = match self.slot(slot_id) {
+            Some(sc) => match sc.interrupt_eps.iter().find(|e| e.dci == dci) {
+                Some(ep) => (len as usize) > ep.data_bufs[0].len(),
+                None => return None,
+            },
+            None => return None,
+        };
+        if need_grow {
+            let new_buf = DmaBuffer::<u8>::allocate(&self.handle, len as usize, XHCI_ALIGN).ok()?;
+            let sc = self.slot_mut(slot_id)?;
+            let ep = sc.interrupt_eps.iter_mut().find(|e| e.dci == dci)?;
+            ep.data_bufs[0] = new_buf;
+        }
+        {
+            let sc = self.slot_mut(slot_id)?;
+            let ep = sc.interrupt_eps.iter_mut().find(|e| e.dci == dci)?;
+            zero_dma(&ep.data_bufs[0]);
+            let cycle = ep.producer.cycle;
+            write_trb(
+                &ep.ring,
+                ep.producer.enqueue,
+                trb::Trb::normal(ep.data_bufs[0].iova(), len, cycle),
+            );
+            let cycle_before = ep.producer.cycle;
+            if ep.producer.advance() {
+                let iova = ep.ring_iova;
+                write_trb(
+                    &ep.ring,
+                    ep.producer.link_index(),
+                    trb::Trb::link(iova, true, cycle_before),
+                );
+            }
+        }
+        self.ring_doorbell(slot_id, dci);
+        match self.wait_for_bulk_out_event(irq, slot_id, dci) {
+            Some(ev)
+                if ev.completion_code == trb::COMPLETION_SUCCESS
+                    || ev.completion_code == COMPLETION_SHORT_PACKET =>
+            {
+                let residual = (ev.residual_transfer_length.min(len)) as usize;
+                let n = (len as usize).saturating_sub(residual);
+                let sc = self.slot(slot_id)?;
+                let ep = sc.interrupt_eps.iter().find(|e| e.dci == dci)?;
+                let mut out = alloc::vec::Vec::with_capacity(n);
+                for i in 0..n {
+                    // SAFETY: data_bufs[0] is >= len bytes and i < n <= len.
+                    let byte =
+                        unsafe { core::ptr::read_volatile(ep.data_bufs[0].user_ptr().add(i)) };
+                    out.push(byte);
+                }
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
     /// Block for the bulk-OUT Transfer Event on (`slot_id`, `dci`). Unlike the
     /// EP0 `wait_for_transfer_event`, any **IN** completion (odd DCI) seen while
     /// draining is routed through `capture_interrupt_report` + re-armed, so a

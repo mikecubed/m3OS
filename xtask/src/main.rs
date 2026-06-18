@@ -10562,11 +10562,14 @@ fn cmd_usb_hotplug_smoke(args: &SmokeBootArgs) {
 /// class control-IN) + `TEST UNIT READY` (a no-data BOT command) → the
 /// `USB_STORAGE:bot-ok` sentinel. This validates the BOT framing
 /// (`kernel-core::usb::mass_storage`, D.2) and the inline bulk transport on a
-/// live device. The **data-IN phase** (INQUIRY / READ CAPACITY → `RemoteBlockDevice`
-/// + mount, D.1 remainder + D.4) currently stalls on a SuperSpeed bulk-IN-data
-/// substrate gap (the Phase 96 bulk-IN data path was never exercised by a real
-/// device — the `ure` NIC that defined it was not merged); it is a tracked
-/// follow-up. Not in the always-on suite for that reason.
+/// live device. Phase 92 Track D then closes the **data-IN phase** (INQUIRY +
+/// READ CAPACITY(10)) over the new synchronous single-TRB `SubmitBulkIn` path
+/// (one bulk-IN TRB per BOT phase, no streaming auto-re-arm — the device is
+/// never issued the surplus IN token that previously STALLed the endpoint): the
+/// `USB_MASS_STORAGE:ready blocks=… bsize=…` sentinel proves the device identity
+/// + capacity read round-tripped (the 8 MiB scratch image → 16384 × 512-byte
+/// blocks). The `RemoteBlockDevice` facade + `/mnt/usb<n>` mount (D.4) build on
+/// this.
 fn cmd_usb_storage_smoke(args: &SmokeBootArgs) {
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
@@ -10650,12 +10653,14 @@ fn cmd_usb_storage_smoke(args: &SmokeBootArgs) {
         };
         // The daemon bound a mass-storage interface (class 0x08 + bulk pair)…
         wait("usb-storage: bound mass-storage")?;
-        // …and a full BOT CBW-out + CSW-in round-trip completed over the bulk
-        // pair against the real (SuperSpeed) device (TEST UNIT READY). This is
-        // the validated D.1 transport milestone; the data-IN phase (INQUIRY /
-        // READ CAPACITY → mount) is a tracked follow-up blocked on a SuperSpeed
-        // bulk-IN-data substrate gap (see the Phase 92 task doc, D.1).
+        // …a full BOT CBW-out + CSW-in round-trip completed over the bulk pair
+        // against the real (SuperSpeed) device (TEST UNIT READY) — the D.1
+        // transport milestone…
         wait("USB_STORAGE:bot-ok")?;
+        // …and the data-IN phase round-tripped: INQUIRY (device identity) + READ
+        // CAPACITY(10) over the synchronous single-TRB `SubmitBulkIn` path
+        // report the device's block count + size (8 MiB → 16384 × 512).
+        wait("USB_MASS_STORAGE:ready")?;
         Ok(())
     })();
 
@@ -10667,7 +10672,8 @@ fn cmd_usb_storage_smoke(args: &SmokeBootArgs) {
             let elapsed = global_start.elapsed().as_secs();
             println!(
                 "usb-storage-smoke: PASSED ({elapsed}s) — usb-storage bound the mass-storage \
-                 device + completed a BOT CBW/CSW round-trip (GET_MAX_LUN + TEST UNIT READY)"
+                 device, completed a BOT CBW/CSW round-trip (GET_MAX_LUN + TEST UNIT READY), and \
+                 read INQUIRY + READ CAPACITY over the synchronous SubmitBulkIn data-IN path"
             );
         }
         Err(msg) => {
