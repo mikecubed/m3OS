@@ -10774,9 +10774,12 @@ fn cmd_usb_mount_smoke(args: &SmokeBootArgs) {
             *arg = "user,id=net0".to_string();
         }
     }
-    // Attach the USB mass-storage device on the xHCI bus (direct-attach, like
-    // usb-storage-smoke). Tier-2-behind-hub enumeration is exercised by
-    // usb-hub-smoke; this gate isolates the mount + block-backend path.
+    // Attach the USB mass-storage device directly on the xHCI bus. (QEMU's
+    // `usb-hub` is a full-speed USB 1.1 hub and cannot enumerate a high-speed
+    // mass-storage device behind it, so the headline "stick behind a hub"
+    // topology is bare-metal-only; tier-2 enumeration is validated live with a
+    // full-speed HID device behind the hub in `usb-hub-smoke`.) This gate
+    // isolates the D.4 mount + block-backend path.
     qemu_args.push("-drive".to_string());
     qemu_args.push(format!(
         "id=usbdisk,file={},format=raw,if=none",
@@ -10983,11 +10986,18 @@ fn cmd_usb_hub_smoke(args: &SmokeBootArgs) {
             *arg = "user,id=net0".to_string();
         }
     }
-    // A USB 2.0 hub on the xHCI bus. (A downstream device — to exercise the
-    // PORT_RESET path — needs QEMU port-path topology and is only meaningful once
-    // tier-2 enumeration lands; that pairs with Phase 92a.)
+    // A USB hub on xHCI root-hub port 3, with a full-speed usb-mouse behind it
+    // on hub port 1 (QEMU port-path "3.1"). QEMU's usb-hub is full-speed (USB
+    // 1.1), so a full-speed HID device enumerates behind it — exercising the
+    // Phase 92a tier-2 path (A.4/A.5): the usbhub walker resets the downstream
+    // port, computes the route string, and asks the server to EnumerateChild,
+    // which surfaces the device as its own AttachNotice (XHCI_HUB:child-
+    // enumerated). (A high-speed usb-storage cannot sit behind the 1.1 hub, so
+    // the behind-hub mass-storage topology is bare-metal-only.)
     qemu_args.push("-device".to_string());
-    qemu_args.push("usb-hub,id=usbhub0,bus=xhci0.0".to_string());
+    qemu_args.push("usb-hub,id=usbhub0,bus=xhci0.0,port=3".to_string());
+    qemu_args.push("-device".to_string());
+    qemu_args.push("usb-mouse,id=hubmouse,bus=xhci0.0,port=3.1".to_string());
 
     println!(
         "usb-hub-smoke: launching QEMU with -device qemu-xhci + usb-hub (timeout {}s)",
@@ -11024,6 +11034,12 @@ fn cmd_usb_hub_smoke(args: &SmokeBootArgs) {
         wait("usbhub: bound hub")?;
         // …read its descriptor over EP0 and powered every downstream port…
         wait("XHCI_HUB:enumerated")?;
+        // …reset the downstream port carrying the full-speed usb-mouse and, via
+        // the Phase 92a tier-2 path (A.4/A.5), asked the server to EnumerateChild
+        // — which addressed the device through the route string, ran Enable Slot
+        // / Address Device / Configure Endpoint, and surfaced it as its own
+        // AttachNotice (class 3 = HID)…
+        wait("XHCI_HUB:child-enumerated class=3")?;
         // …and finished its per-port PORT_POWER/PORT_RESET bring-up.
         wait("USB_HUB:ready")?;
         Ok(())
@@ -11036,8 +11052,9 @@ fn cmd_usb_hub_smoke(args: &SmokeBootArgs) {
             let elapsed = global_start.elapsed().as_secs();
             println!(
                 "usb-hub-smoke: PASSED ({elapsed}s) — usbhub bound the CLASS_HUB interface, read \
-                 the hub descriptor, and powered/reset its downstream ports (A.1/A.2 live; tier-2 \
-                 device-behind-hub enumeration is Phase 92a)"
+                 the hub descriptor, powered/reset its downstream ports, and tier-2-enumerated a \
+                 full-speed HID device behind the hub via the route string (A.1/A.2/A.4/A.5 live: \
+                 XHCI_HUB:child-enumerated)"
             );
         }
         Err(msg) => {
