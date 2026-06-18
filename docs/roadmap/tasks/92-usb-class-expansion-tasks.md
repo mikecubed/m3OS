@@ -17,7 +17,7 @@
 |---|---|---|---|
 | A | Multi-tier hub enumeration — live `usbhub` walker, hub descriptor + per-port power/reset, tier-2+ slot assignment via the route string | H | **A.1/A.2/A.3 landed** — server surfaces `CLASS_HUB`; the resident `usbhub` walker binds a hub, reads its descriptor over EP0, and drives per-port `PORT_POWER`/`PORT_RESET` (`usb-hub-smoke` PASS). **A.4/A.5 (tier-2 device-behind-hub enumeration via the route string) → Phase 92a** |
 | B | HID Report Protocol — wire `parse_report_descriptor` live, multi-axis/buttons/scroll, consumer keys, LED `SET_REPORT` | H | **B.1 landed** — `usb-hid` reads + parses the HID Report descriptor over EP0 at bind and stores the `ReportField` layout per device (`USB_HID:report-parsed` in `usb-smoke`); B.2/B.3 host-logic landed (47 hid + 38 keymap tests). **B.2-live decode / B.3-live consumer routing / B.4 LED `SET_REPORT` → Phase 92b** |
-| C | Live hot-plug event surface — Port Status Change → `AttachNotice` push, detach (`attached:false`), dynamic re-enumeration, Disable Slot reclamation | — | C.1–C.3 + server-side C.4 landed (`usb-hotplug-smoke` 3-cycle PASS); class-driver-side release pends per-driver |
+| C | Live hot-plug event surface — Port Status Change → `AttachNotice` push, detach (`attached:false`), dynamic re-enumeration, Disable Slot reclamation | — | C.1–C.3 + server-side C.4 landed (`usb-hotplug-smoke` 3-cycle PASS); **class-driver-side C.4 release scheduled per driver — usb-storage→92a, usb-hid→92b, usb-net→92e** |
 | D | USB Mass Storage — BOT CBW/CSW on the Phase 96 inline bulk path, SCSI subset, UAS, `RemoteBlockDevice` facade + `/mnt/usb<n>`, page-grant overflow | C, H | D.1 transport + **data-IN phase** + D.2 codec landed (`usb-storage` daemon binds + BOT CBW/CSW round-trip + INQUIRY/READ CAPACITY over the new synchronous `SubmitBulkIn` path, `usb-storage-smoke` PASS asserting `USB_MASS_STORAGE:ready`; 31 host tests). **D.3 UAS / D.4 mount / D.5 page-grant pending** |
 | E | Isochronous endpoints — UAC PCM-out to `audio_server`, UVC frame capture + `camera_server`, controller isoch TRB scheduling | F | **→ Phase 92c** (deep isoch TRB scheduling; UVC bare-metal-only) |
 | F | Multi-controller concurrency — per-controller bound IRQ + event-loop thread, concurrent MSI-X routing | — | **→ Phase 92d** (ring-3 driver threading; risk-isolated from the working single-loop server) |
@@ -44,17 +44,55 @@ sub-phases so they can be scheduled and verified one at a time.
 - **B.1** (HID Report) — live Report-descriptor read + parse at bind (`usb-smoke` → `USB_HID:report-parsed`).
 - **B.2/B.3, G.1/G.2** host-logic — Report-descriptor Usage ranges + Report IDs, consumer keycodes, CDC functional-descriptor parse + NTB-16 framing (host tests).
 
-**Phase 92a — USB tier-2 enumeration + mass-storage mount.** A.4/A.5 (device-behind-hub enumeration via the xHCI route string + `PortTopology` → Slot Context), D.3 (UAS), D.4 (`RemoteBlockDevice` facade + `/mnt/usb<n>` mount — requires kernel multi-remote-block-device routing, since `blk::remote` is currently a single-backend singleton), D.5 + H.4 (page-grant `SubmitTransfer` overflow). *The hard USB data path is already done (D.1/D.2); this is the enumeration + kernel-mount integration.*
+Each sub-phase below lists **every** open task ID it owns (so no item is orphaned), its validation gate, and its AGENTS.md row. The mapping is exhaustive: every `[ ]`/`[~]` acceptance item in this doc belongs to exactly one sub-phase (see the coverage table at the end).
 
-**Phase 92b — HID Report Protocol live decode.** B.2-live (data-driven multi-axis/scroll/button decode + usage→event mapping + a `usb-tablet` QMP-abs-input gate arm), B.3-live (consumer-key routing to `audio_server`), B.4 (keyboard LED `SET_REPORT`). *Host-logic + the stored `ReportField` layout (B.1) are ready.*
+**Phase 92a — USB tier-2 enumeration + mass-storage mount.**
+- **A.4/A.5** — device-behind-hub enumeration via the xHCI route string + `PortTopology` → Slot Context (and A.2's reset-against-a-*connected*-downstream-device item, which only becomes meaningful once a device actually enumerates behind the hub).
+- **D.3** (UAS), **D.4** (`RemoteBlockDevice` facade + `/mnt/usb<n>` mount — requires kernel **multi-remote-block-device routing**, since `blk::remote` is a single-backend singleton today), **D.5 + H.4** (page-grant `SubmitTransfer` overflow).
+- **C.4 (usb-storage arm)** — the `usb-storage` daemon releases its per-LUN state on an `attached:false` notice and `/mnt/usb<n>` unmounts cleanly on unplug (lines 293/295).
+- **Gate (I.1 + the unmount half of I.2):** `usb-storage-smoke` extended to a `usb-hub` carrying a `usb-storage` backend → `XHCI_HUB:enumerated` + `USB_MASS_STORAGE:mounted` + `ls /mnt/usb0`; hot-plug unmount arm. AGENTS.md: `M3OS_USB_STORAGE_REGRESSION`.
+- *The hard USB data path is already done (D.1/D.2); this is the enumeration + kernel-mount integration.*
 
-**Phase 92c — USB isochronous (UAC / UVC).** E.3 (controller isochronous-TRB scheduling — frame interval, bandwidth reservation, no-retry), E.1 (UAC PCM-out to `audio_server`, CI-viable via `-device usb-audio`), E.2 (UVC frame capture + `camera_server`, bare-metal/VFIO-only). *Deepest controller work in the phase.*
+**Phase 92b — HID Report Protocol live decode.**
+- **B.2-live** (data-driven multi-axis/scroll/button decode + usage→event mapping), **B.3-live** (consumer-key routing to `audio_server`; the consumer-keycode host-logic is already landed), **B.4** (keyboard LED `SET_REPORT`).
+- **C.4 (usb-hid arm)** — `usb-hid` releases its per-device state on an `attached:false` notice.
+- **H.2 remaining item** — the live "control transfer interleaved with an armed interrupt endpoint drops no report" assertion rides B.4's `SET_REPORT`-during-HID-polling path (line 87).
+- **Gate (I.2 Report-Protocol arm):** a `usb-tablet` QMP-abs-input arm → `USB_HID:mouse`/`HID_REPORT:*` (extra axes/buttons). *Host-logic + the stored `ReportField` layout (B.1) are ready.*
 
-**Phase 92d — Multi-controller concurrency.** F.1 (per-controller bound IRQ + event-loop thread), F.2 (concurrent MSI-X routing). *Ring-3 driver threading, deliberately risk-isolated from the validated single-loop server; CI-viable via a second `qemu-xhci`.*
+**Phase 92c — USB isochronous (UAC / UVC).**
+- **E.3** (controller isochronous-TRB scheduling — frame interval, bandwidth reservation, no-retry), **E.1** (UAC PCM-out to `audio_server`, CI-viable via `-device usb-audio`), **E.2** (UVC frame capture + `camera_server`, bare-metal/VFIO-only).
+- **Gate (I.3 audio half):** `usb-audio-smoke` (non-silent PCM, `AUDIO:usb-sink`). AGENTS.md: `M3OS_USB_AUDIO_REGRESSION`. *Deepest controller work in the phase.*
 
-**Phase 92e — USB-Ethernet class drivers (live).** G.1/G.2/G.3 live `usb-net` (CDC-ECM/NCM `RemoteNic` + the shared `ure` device-match registry). *Bare-metal/VFIO-gated — QEMU has no CDC-ECM model — so it follows the `usb-eth-smoke`/`wifi-smoke` opt-in + skip-with-reason pattern; the host-logic (G.1/G.2) is done.*
+**Phase 92d — Multi-controller concurrency.**
+- **F.1** (per-controller bound IRQ + event-loop thread), **F.2** (concurrent MSI-X routing).
+- **Gate (I.2 multi-controller arm):** `usb-multi-controller-smoke` (second `qemu-xhci`, `XHCI:controller-1:ready`). *Ring-3 driver threading, deliberately risk-isolated from the validated single-loop server.*
 
-**Track I** (version bump `0.91.0`→`0.92.0` + the `docs/92-usb-class-expansion.md` learning doc) closes when the user signs off the 92 core as sealed — held now because the phase is intentionally mid-flight across the sub-phases above.
+**Phase 92e — USB-Ethernet class drivers (live).**
+- **G.1/G.2/G.3** live `usb-net` (CDC-ECM/NCM `RemoteNic` + the shared `ure` device-match registry).
+- **C.4 (usb-net arm)** — `usb-net` releases its per-device state on an `attached:false` notice.
+- **Gate (I.3 ethernet half):** the CDC-ECM/NCM arm of `usb-eth-smoke` — bare-metal/VFIO, skip-with-reason in CI. *QEMU has no CDC-ECM model; host-logic (G.1/G.2) is done.*
+
+**Track I close-out** (when the user signs off the 92 line as sealed): **I.4** version bump `0.91.0`→`0.92.0` + the AGENTS.md "kernel v0.92.0" line + USB capability-bullet rewrite; **I.5** the `docs/92-usb-class-expansion.md` learning doc + `docs/README.md`/`codebase-map.md` links + flipping the roadmap README Phase 92 row to `Complete`. Held now because the phase is intentionally mid-flight across the sub-phases above. *Note: the per-sub-phase AGENTS.md gate rows above land **with** their sub-phase; I.4/I.5 are the final version-bump + learning-doc only.*
+
+### Coverage map — every open acceptance item → its sub-phase
+
+| Open items (task IDs / lines) | Owner |
+|---|---|
+| A.4 (167–169), A.5 (178–180), A.2-reset (147) | 92a |
+| D.3 (336–338), D.4 (350–352), D.5 (361–362), H.4 (116–118) | 92a |
+| C.4 usb-storage detach + unmount (293/295) | 92a |
+| I.1 hub+mount gate (488–490), I.2 mount/unmount arm (499) | 92a |
+| B.1-decode (197), B.2-live (212–213), B.3-live (225–226), B.4 (238–240), H.2-test (87) | 92b |
+| C.4 usb-hid detach (293) | 92b |
+| I.2 Report-Protocol arm (501) | 92b |
+| E.1 (378–380), E.2 (392–394), E.3 (403–405) | 92c |
+| I.3 audio gate (510, 512) | 92c |
+| F.1 (421–423), F.2 (432–433) | 92d |
+| I.2 multi-controller arm (500) | 92d |
+| G.1 (449–450), G.2 (461), G.3 (473–475) | 92e |
+| C.4 usb-net detach (293) | 92e |
+| I.3 CDC-ECM arm (511) | 92e |
+| I.4 version bump (524–526), I.5 learning doc (539–541) | Track I close-out |
 
 ---
 
@@ -290,9 +328,9 @@ sub-phases so they can be scheduled and verified one at a time.
 **Why it matters:** a clean detach must release the class driver's capabilities and reclaim the slot, or a removed flash drive leaves a stale `/mnt/usb<n>` mount and a leaked slot. C.4 wires each class driver to drop its device state on detach and the server to Disable Slot.
 
 **Acceptance:**
-- [ ] `usb-hid`/`usb-storage`/`usb-net` each release their per-device state on an `attached: false` notice for a slot they own. — **server-side teardown done**; class-driver-side release is a follow-up wired per-driver as each lands (`usb-storage`/`usb-net` don't exist yet — Tracks D/G).
+- [ ] `usb-hid`/`usb-storage`/`usb-net` each release their per-device state on an `attached: false` notice for a slot they own. — **server-side teardown done**; the class-driver-side release is scheduled per driver alongside that driver's resident-state work: **usb-storage → Phase 92a**, **usb-hid → Phase 92b**, **usb-net → Phase 92e** (see the Sub-Phase Schedule coverage map).
 - [x] The server issues Disable Slot for the departed device (H.3) and the slot is reusable. — `process_port_events` calls `Controller::disable_slot`; the 3-cycle gate proves the slot is reused without exhaustion.
-- [ ] Unplugging a mounted USB stick unmounts `/mnt/usb<n>` without wedging the VFS (Track D integration). — deferred to Track D.
+- [ ] Unplugging a mounted USB stick unmounts `/mnt/usb<n>` without wedging the VFS (Track D integration). — **Phase 92a** (pairs with the D.4 mount).
 
 ---
 
