@@ -122,11 +122,19 @@ const SERVICE_NAME: &str = "usb0.block";
 #[cfg(not(test))]
 const MAX_CONSECUTIVE_ERRORS: u32 = 8;
 
-/// Maximum number of sectors per BOT READ/WRITE(10) sub-request. The
-/// synchronous `SubmitBulkIn` path caps the data stage at 4096 bytes =
-/// 8 × 512-byte sectors.
+/// Maximum number of sectors per BOT READ/WRITE(10) sub-request.
+///
+/// The inline `SubmitBulkIn`/`SubmitBulkOut` data stage must fit `USB_MSG_MAX`
+/// (4096) **including the wire-codec overhead**: a `BulkData` reply is
+/// `data + 3` bytes and a `SubmitBulkOut` request is `data + 7` bytes. So the
+/// largest sector-aligned data stage that fits is 7 × 512 = 3584 bytes (8 ×
+/// 512 = 4096 overflows the reply and is rejected by the server's H.6 bound).
+/// A larger `BLK_READ`/`BLK_WRITE` (e.g. a 4096-byte ext2 block = 8 sectors) is
+/// split across multiple BOT sub-requests by `handle_read`/`handle_write` and
+/// reassembled in the block-protocol reply (which has the larger MAX_BULK_LEN
+/// budget). Oversized transfers (D.5) use the page-grant path instead.
 #[cfg(not(test))]
-const MAX_BOT_SECTORS: u16 = 8;
+const MAX_BOT_SECTORS: u16 = 7;
 
 // ---------------------------------------------------------------------------
 // IPC plumbing (mirrors usb-hid's usb_call)

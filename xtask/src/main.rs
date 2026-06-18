@@ -10616,14 +10616,32 @@ const USB_MOUNT_SEED_CONTENT: &[u8] = b"m3os-usb-mount-ok\n";
 fn create_usb_mount_ext2_image(path: &Path) {
     {
         let f = std::fs::File::create(path).expect("create usb-mount ext2 image");
-        // 16 MiB → comfortable for 4K-block ext2 (READ CAPACITY reports 32768 ×
-        // 512). Bare ext2 starts at byte 0; superblock at byte 1024 = LBA 2.
+        // 16 MiB bare ext2 (no partition table); superblock at byte 1024 = LBA 2.
         f.set_len(16 * 1024 * 1024)
             .expect("size usb-mount ext2 image");
     }
-    // Format with the same mkfs.ext2 argument fallback the data partition uses
-    // (rev 0, minimal features — what the in-kernel parser expects).
-    format_ext2_partition(path);
+    // Format with **1024-byte blocks** (rev 0, minimal features). A 1024-byte
+    // ext2 block is exactly 2 × 512 sectors, so every block read/write the
+    // kernel issues is a single ≤7-sector BOT transfer through the inline
+    // SubmitBulkIn/SubmitBulkOut path — within the USB_MSG_MAX budget. (A larger
+    // block size's 8-sector I/O needs the multi-sector / page-grant overflow
+    // path — D.5 — which the inline transport cannot carry in one reply.)
+    let mkfs_variants: [&[&str]; 2] = [
+        &["-F", "-q", "-b", "1024", "-O", "^resize_inode", "-r", "0"],
+        &["-F", "-q", "-b", "1024"],
+    ];
+    let mut mkfs_ok = false;
+    for v in mkfs_variants {
+        let st = Command::new("mkfs.ext2").args(v).arg(path).status();
+        if matches!(st, Ok(s) if s.success()) {
+            mkfs_ok = true;
+            break;
+        }
+    }
+    if !mkfs_ok {
+        eprintln!("usb-mount-smoke: mkfs.ext2 -b 1024 failed (is e2fsprogs installed?)");
+        std::process::exit(1);
+    }
 
     // Seed `hello.txt` via debugfs (bare image → no `?offset=`).
     let tmp = path.parent().unwrap().join("usb-mount-hello-seed.txt");
