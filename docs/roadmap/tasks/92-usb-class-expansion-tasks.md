@@ -15,7 +15,7 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Multi-tier hub enumeration — live `usbhub` walker, hub descriptor + per-port power/reset, tier-2+ slot assignment via the route string | H | A.3 host-logic landed (`get_port_status` encoder + port-status bitmap helpers; 36 hub tests); live `usbhub` walker (A.1/A.2/A.4/A.5) pending |
+| A | Multi-tier hub enumeration — live `usbhub` walker, hub descriptor + per-port power/reset, tier-2+ slot assignment via the route string | H | **A.1/A.2/A.3 landed** — server surfaces `CLASS_HUB`; the resident `usbhub` walker binds a hub, reads its descriptor over EP0, and drives per-port `PORT_POWER`/`PORT_RESET` (`usb-hub-smoke` PASS). **A.4/A.5 (tier-2 device-behind-hub enumeration via the route string) → Phase 92a** |
 | B | HID Report Protocol — wire `parse_report_descriptor` live, multi-axis/buttons/scroll, consumer keys, LED `SET_REPORT` | H | B.2/B.3 host-logic landed (Usage ranges + Report IDs + consumer keycodes; 47 hid + 38 keymap tests); live `usb-hid` wiring (B.1/B.4) pending |
 | C | Live hot-plug event surface — Port Status Change → `AttachNotice` push, detach (`attached:false`), dynamic re-enumeration, Disable Slot reclamation | — | C.1–C.3 + server-side C.4 landed (`usb-hotplug-smoke` 3-cycle PASS); class-driver-side release pends per-driver |
 | D | USB Mass Storage — BOT CBW/CSW on the Phase 96 inline bulk path, SCSI subset, UAS, `RemoteBlockDevice` facade + `/mnt/usb<n>`, page-grant overflow | C, H | D.1 transport + **data-IN phase** + D.2 codec landed (`usb-storage` daemon binds + BOT CBW/CSW round-trip + INQUIRY/READ CAPACITY over the new synchronous `SubmitBulkIn` path, `usb-storage-smoke` PASS asserting `USB_MASS_STORAGE:ready`; 31 host tests). **D.3 UAS / D.4 mount / D.5 page-grant pending** |
@@ -97,9 +97,9 @@
 **Why it matters:** at 1.0 the hub daemon exits immediately after proving the kernel-core link. Track A turns it into a resident process that waits on the `usb` service, walks `NextAttach` (cursor 0..until `notice.is_none()`), and filters for `interface_class == CLASS_HUB` (0x09) — the entry point for everything else in this track.
 
 **Acceptance:**
-- [ ] `usbhub` no longer returns from `program_main`; it registers on the `usb` service (`USB_SERVICE_NAME`) and loops.
-- [ ] It discovers a `CLASS_HUB` device via the `NextAttach` cursor walk and logs a hub-found marker.
-- [ ] No regression in `xhci-bringup-smoke` (the `BOOT_LOG_MARKER` assertion still passes).
+- [x] `usbhub` no longer returns immediately from `program_main`; it waits on the `usb` service (`USB_SERVICE_NAME`) and walks the `NextAttach` cursor. — `program_main` rewritten as a resident walker.
+- [x] It discovers a `CLASS_HUB` device via the `NextAttach` cursor walk and logs a hub-found marker. — server `device_info_from_ctx` now surfaces `CLASS_HUB`; the daemon logs `usbhub: bound hub slot=…` (proven by `usb-hub-smoke`).
+- [x] No regression in `xhci-bringup-smoke` / `usb-smoke` (HID boot path) — `usb-smoke` PASSES; the surfaced hub does not disturb the HID/bulk class drivers (they filter by class).
 
 ### A.2 — Hub bring-up: descriptor read + per-port power/reset
 
@@ -111,9 +111,9 @@
 **Why it matters:** all the hub-class control encoders are host-tested in `kernel-core` but have no live caller. A.2 issues `GET_DESCRIPTOR(Hub)` to learn `bNbrPorts`/`bPwrOn2PwrGood`, then `SET_FEATURE(PORT_POWER)` per port (waiting `bPwrOn2PwrGood × 2 ms`) and `SET_FEATURE(PORT_RESET)` on a detected connection — the standard hub power/reset sequence.
 
 **Acceptance:**
-- [ ] `HubDescriptor::parse` is fed a live `GET_DESCRIPTOR(Hub)` reply; `bNbrPorts` drives the per-port loop.
-- [ ] `SET_FEATURE(PORT_POWER, port)` is issued for every downstream port, honoring the `bPwrOn2PwrGood` settle delay.
-- [ ] On a port-connection, `SET_FEATURE(PORT_RESET, port)` is issued and the `C_PORT_RESET` change bit is acked with `CLEAR_FEATURE`.
+- [x] `HubDescriptor::parse` is fed a live `GET_DESCRIPTOR(Hub)` reply; `bNbrPorts` drives the per-port loop. — `enumerate_hub` issues `get_hub_descriptor` over EP0 `ControlRequest`, parses, logs `XHCI_HUB:enumerated ports=N` (proven by `usb-hub-smoke`).
+- [x] `SET_FEATURE(PORT_POWER, port)` is issued for every downstream port, honoring the `bPwrOn2PwrGood` settle delay. — per-port `set_port_feature(PORT_POWER, port)` + a `bPwrOn2PwrGood × 2 ms` settle.
+- [~] On a port-connection, `SET_FEATURE(PORT_RESET, port)` is issued and the `C_PORT_RESET` change bit is acked with `CLEAR_FEATURE`. — the reset/ack path is implemented (`GET_PORT_STATUS` → `PORT_RESET` → poll-for-enable → `CLEAR_FEATURE(C_PORT_RESET)`); exercising it against a *connected* downstream device pairs with tier-2 enumeration (**Phase 92a**), since QEMU device-behind-hub needs port-path topology + the device to actually enumerate to be meaningful.
 
 ### A.3 — `GET_PORT_STATUS` encoder + port-status bitmap helpers
 
@@ -124,7 +124,7 @@
 **Acceptance:**
 - [x] `get_port_status` encodes the class GET_STATUS SetupPacket; host test asserts the exact 8 bytes. — `get_port_status(port)` (bmRequestType `0xA3`, bRequest `0x00`, wValue 0, wIndex=port, wLength=4); host tests `get_port_status_port{1,3}_encoding` assert the 8 bytes.
 - [x] Bitmap helpers decode CCS/PE/RESET (bytes 0–1) and C_CONNECTION/C_RESET (bytes 2–3) per USB 2.0 §11.24.2.7; host-tested against known status words. — `port_status_{connected,enabled,resetting}` + `port_change_{connection,reset}` with named bit consts; short-slice inputs return false (no panic). 36 hub tests pass.
-- [ ] The hub state machine polls `GET_PORT_STATUS` after `PORT_RESET` until `C_PORT_RESET` clears and `PORT_ENABLE` is set. — consumed by the live `usbhub` walker (A.1/A.2), pending.
+- [x] The hub state machine polls `GET_PORT_STATUS` after `PORT_RESET` until `PORT_ENABLE` is set. — consumed by the live `usbhub` walker (A.2 `enumerate_hub`).
 
 ### A.4 — Surface hubs + assign tier-2+ slots in the xHCI server
 

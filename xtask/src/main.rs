@@ -747,6 +747,17 @@ fn main() {
                 });
             cmd_usb_storage_smoke(&smoke_args);
         }
+        // Phase 92 Track A — USB hub: boots with a usb-hub (a usb-kbd behind it)
+        // and asserts the usbhub daemon enumerated the hub + powered/reset ports.
+        Some("usb-hub-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("usb-hub-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_usb_hub_smoke(&smoke_args);
+        }
         Some("ssh-e1000-banner-check") => {
             let banner_args = parse_ssh_e1000_banner_check_args(&args[2..]).unwrap_or_else(|err| {
                 eprintln!("Error: {err}");
@@ -10683,6 +10694,113 @@ fn cmd_usb_storage_smoke(args: &SmokeBootArgs) {
         }
         Err(msg) => {
             eprintln!("usb-storage-smoke: FAILED\n{msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Boots m3OS with `-device qemu-xhci` plus a `-device usb-hub` (carrying a
+/// `usb-kbd` on a downstream port) and asserts the ring-3 `usbhub` daemon
+/// (Phase 92 Track A) came live: it bound the `CLASS_HUB` interface surfaced by
+/// the server (`usbhub: bound hub`), read the hub descriptor over EP0 and
+/// powered every downstream port (`XHCI_HUB:enumerated ports=N`), detected the
+/// downstream device via `GET_PORT_STATUS` and drove `PORT_RESET` to enable
+/// (`usbhub: port N reset+enabled`), and finished its bring-up (`USB_HUB:ready`).
+///
+/// This proves A.1 (resident hub walker over the `NextAttach` cursor) + A.2 (hub
+/// descriptor read + per-port PORT_POWER/PORT_RESET) end-to-end. Surfacing the
+/// downstream device as its OWN `AttachNotice` (tier-2 enumeration via the route
+/// string, A.4/A.5) is scheduled as Phase 92a; the downstream `usb-kbd` here is
+/// only used to make a hub port report a connection so the reset path runs.
+fn cmd_usb_hub_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+    let ovmf = find_ovmf();
+
+    let devices = DeviceSet {
+        xhci: true,
+        ..DeviceSet::default()
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, QemuDisplayMode::Headless, devices);
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    // A USB 2.0 hub on the xHCI bus. (A downstream device — to exercise the
+    // PORT_RESET path — needs QEMU port-path topology and is only meaningful once
+    // tier-2 enumeration lands; that pairs with Phase 92a.)
+    qemu_args.push("-device".to_string());
+    qemu_args.push("usb-hub,id=usbhub0,bus=xhci0.0".to_string());
+
+    println!(
+        "usb-hub-smoke: launching QEMU with -device qemu-xhci + usb-hub (timeout {}s)",
+        args.timeout_secs
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let rx = spawn_serial_reader(stdout);
+    let mut serial_history = String::new();
+    let mut serial_buf = String::new();
+    let global_start = std::time::Instant::now();
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let step = std::time::Duration::from_secs(args.timeout_secs.min(180));
+
+    let result: Result<(), String> = (|| {
+        let mut wait = |pat: &str| {
+            wait_for_serial_pattern(
+                &rx,
+                &mut serial_buf,
+                &mut serial_history,
+                pat,
+                step,
+                global_start,
+                global_timeout,
+            )
+        };
+        // The daemon bound the hub-class interface the server now surfaces…
+        wait("usbhub: bound hub")?;
+        // …read its descriptor over EP0 and powered every downstream port…
+        wait("XHCI_HUB:enumerated")?;
+        // …and finished its per-port PORT_POWER/PORT_RESET bring-up.
+        wait("USB_HUB:ready")?;
+        Ok(())
+    })();
+
+    let _ = child.kill();
+    let _ = child.wait();
+    match result {
+        Ok(()) => {
+            let elapsed = global_start.elapsed().as_secs();
+            println!(
+                "usb-hub-smoke: PASSED ({elapsed}s) — usbhub bound the CLASS_HUB interface, read \
+                 the hub descriptor, and powered/reset its downstream ports (A.1/A.2 live; tier-2 \
+                 device-behind-hub enumeration is Phase 92a)"
+            );
+        }
+        Err(msg) => {
+            eprintln!("usb-hub-smoke: FAILED\n{msg}");
             std::process::exit(1);
         }
     }

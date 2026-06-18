@@ -27,7 +27,9 @@ use alloc::vec::Vec;
 
 use driver_runtime::IrqNotification;
 use driver_runtime::ipc::{EndpointCap, IpcBackend, RecvResult, SyscallBackend};
-use kernel_core::usb::descriptor::{CLASS_HID, TRANSFER_TYPE_BULK, TRANSFER_TYPE_INTERRUPT};
+use kernel_core::usb::descriptor::{
+    CLASS_HID, CLASS_HUB, TRANSFER_TYPE_BULK, TRANSFER_TYPE_INTERRUPT,
+};
 use kernel_core::usb::enumerate::EnumContext;
 use kernel_core::usb::xhci::trb::dci;
 use syscall_lib::STDOUT_FILENO;
@@ -122,11 +124,19 @@ pub fn device_info_from_ctx(ctx: &EnumContext) -> Option<AttachNotice> {
 
         let hid_surfaceable = i.b_interface_class == CLASS_HID && ep_in_dci != 0;
         let bulk_surfaceable = bulk_in_dci != 0 && bulk_out_dci != 0;
+        // Phase 92 Track A: surface CLASS_HUB interfaces so the `usbhub` daemon
+        // can bind a hub via the `NextAttach` walk and drive it (GET_DESCRIPTOR
+        // (Hub) + per-port PORT_POWER/PORT_RESET over EP0 `ControlRequest`). A hub
+        // exposes a status-change interrupt-IN endpoint but no bulk pair, so it
+        // scores below HID/NIC interfaces and is surfaced on its own low priority.
+        let hub_surfaceable = i.b_interface_class == CLASS_HUB;
         let priority = if hid_surfaceable {
             3
         } else if bulk_surfaceable && i.b_interface_class == CLASS_VENDOR_SPECIFIC {
             2
         } else if bulk_surfaceable {
+            1
+        } else if hub_surfaceable {
             1
         } else {
             continue;
