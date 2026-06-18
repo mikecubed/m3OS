@@ -11,4 +11,5 @@ pub mod enumerate;
 pub mod hid;
 pub mod hid_report;
 pub mod hub;
+pub mod mass_storage;
 pub mod xhci;
