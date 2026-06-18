@@ -94,6 +94,10 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 | I.3 CDC-ECM arm (511) | 92e |
 | I.4 version bump (524–526) | **done — `0.92.0` with the core** |
 | I.5 learning doc (539–541) | Track I close-out (lands with the last sub-phase) |
+| *PR #252 readiness follow-ups (task IDs below):* | |
+| H.6 length bounds, D.2 rw-ok comment, I.6 gate regression wiring | 92a |
+| B.1 readiness items (wDescriptorLength read, doc header, hostile-count test) | 92b |
+| H.5 slot-reclaim on unpackable handle | 92d |
 
 ---
 
@@ -155,6 +159,30 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 - [ ] `SubmitTransfer` maps the `PageGrant`, programs Normal TRBs (IOC on the last), rings the doorbell, and completes off the Transfer Event — returning `UsbReply::TransferComplete { transferred, completion_code }`.
 - [ ] A > 4096-byte transfer (e.g. an 8-sector READ(10)) completes via the page-grant path; a ≤ 4096-byte transfer still uses the inline path.
 - [ ] The grant is unmapped on completion (no IOVA leak across repeated transfers), reusing the H.1/PR-248 buffer-lifetime discipline.
+
+### H.5 — Reclaim the slot when a hot-plug handle can't be packed (PR #252 readiness)
+
+**File:** `userspace/drivers/xhci/src/server.rs`
+**Symbol:** `process_port_events` (the attach arm, ~`server.rs:233`, where `pack_handle` returns `None`)
+**Why it matters:** on hot-plug attach the server runs Enable Slot (allocating a hardware slot + `SlotContext`) **before** `pack_handle(ctrl_idx, slot_id)`. If `pack_handle` returns `None` (`ctrl_idx > 3`, i.e. ≥5 controllers, or hw slot > 63) the code logs "unpackable handle" and continues without `disable_slot` — leaking the very slot H.3 set out to reclaim. Reachable only in the multi-controller regime, so it pairs with Track F / Phase 92d, but it is live code today. (The identical bring-up-path case at ~`server.rs:300` predates this phase.)
+
+**Acceptance:**
+- [ ] When `pack_handle` returns `None` on the attach path, the server issues `disable_slot` for the just-enabled slot before dropping the device (no slot leak) and logs the drop.
+- [ ] An instrumented run in the ≥5-controller / slot>63 regime shows no slot-pool leak across repeated unpackable attaches.
+
+### H.6 — Bound device-controlled lengths against `USB_MSG_MAX` (PR #252 readiness)
+
+**Files:**
+- `userspace/drivers/xhci/src/server.rs`
+- `kernel-core/src/usb/enumerate.rs`
+
+**Symbol:** the cached config-descriptor read (uses the device's `wTotalLength`) + `cache_config_descriptor` + the `Descriptors` reply encode; the `SubmitBulkIn { len }` arm (~`server.rs:504`)
+**Why it matters:** both paths trust a device-/caller-supplied length. A device reporting `wTotalLength` near 65535 makes the server hold a ~64 KiB blob and emit a `Descriptors` reply far over `USB_MSG_MAX` (4096); a `SubmitBulkIn { len }` near/over 4090 produces an oversized `BulkData` reply. Both **fail closed** today (the client's 4096-byte buffer truncates → length-prefixed `decode` returns `None`; no panic/OOB) and the only live callers stay well under budget — so this is hardening, not a live bug. An explicit server-side cap (reject/clamp + logged error) is clearer than silent truncation and removes the per-slot memory-amplification window from a compromised/buggy class driver.
+
+**Acceptance:**
+- [ ] The server rejects (or clamps with a logged error) a cached config blob / `Descriptors` reply that would exceed `USB_MSG_MAX`, instead of relying on client-side truncation.
+- [ ] `SubmitBulkIn { len }` that would overflow `USB_MSG_MAX` returns an explicit `UsbReply::Error` rather than a silently-truncated `BulkData`.
+- [ ] Test coverage asserts the over-budget case takes the error path (the under-budget BOT lengths 13/36/512 are unaffected).
 
 ---
 
@@ -235,6 +263,9 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 - [x] `parse_report_descriptor` gains a live call site in `usb-hid` at device bind; the parsed `ReportField` array is stored per device. — `fetch_report_fields` issues `GET_DESCRIPTOR(Report)` over EP0 for each `CLASS_HID` interface, parses it, stores `HidDevice.report_fields`, and logs `USB_HID:report-parsed proto=P fields=N` (asserted by `usb-smoke`).
 - [~] A Report-Protocol device's reports decode by the parsed field layout (not the boot 8-byte/3-byte assumption). — **Phase 92b** (B.2-live): the layout is stored; the data-driven decode + usage→event mapping + a `usb-tablet` QMP-abs-input gate arm are scheduled there.
 - [x] The existing Boot-Protocol keyboard/mouse path is unchanged (`usb-smoke` still PASSES). — `usb-smoke` PASSES (kbd+mouse decode live + render); the boot decode path is untouched.
+- [ ] **(PR #252 readiness, 92b)** `usb-hid` reads the HID descriptor's `wDescriptorLength` instead of the hard-coded `REQ_LEN = 256` (`fetch_report_fields`), so the Report descriptor is not over-read into zero padding that parses as spurious trailing zero-width fields.
+- [ ] **(PR #252 readiness, 92b)** The stale `hid_report.rs` module doc header ("not wired to any live device") is corrected — the parser is now called live at bind (B.1).
+- [ ] **(PR #252 readiness, 92b)** A host test feeds `parse_report_descriptor` a hostile Report Count/Size (e.g. a 4-byte `0xFFFFFFFF` count) to lock in the saturating/clamped (≤65536 fields) behavior now that the parser sees live device input.
 
 ### B.2 — Multi-axis / extra-button / scroll decode (touchpad + gaming mouse)
 
@@ -364,6 +395,7 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 - [x] `Cbw`/`Csw` encode/decode are host-tested against known byte layouts (dCBWSignature `USBC`, dCSWSignature `USBS`). — `kernel_core::usb::mass_storage` `Cbw::encode`/`Csw::parse` + 31 host tests (signatures, tag/len LE, CDB pad, short-buffer rejection).
 - [x] `INQUIRY` + `READ CAPACITY(10)` return device identity and block count; `READ(10)`/`WRITE(10)` move sectors; a failed command surfaces `REQUEST SENSE`. — codec host-tested (CDB builders big-endian, `InquiryData`/`ReadCapacity10` parsers) **and the live BOT data movement is proven**: the `usb-storage` daemon reads INQUIRY + READ CAPACITY, and a `WRITE(10)` + `READ(10)` sector round-trip verifies byte-identical (`USB_STORAGE:rw-ok` in `usb-storage-smoke`) — WRITE data-OUT over `SubmitBulkOut` + READ data-IN over `SubmitBulkIn`. (REQUEST SENSE builder host-tested; surfaced on a failed command.)
 - [x] `GET_MAX_LUN` is issued over `ControlRequest`; a device reporting STALL is treated as single-LUN. — `get_max_lun(iface)` SetupPacket encoder host-tested (`A1 FE 00 00 iface 00 01 00`); live issuance + STALL→single-LUN policy is the daemon (D.1).
+- [ ] **(PR #252 readiness, 92a)** A comment in `cmd_usb_storage_smoke` notes that the `USB_STORAGE:rw-ok` round-trip depends on the 8 MiB / 512-byte scratch geometry (a non-512 device safely skips the round-trip, so the gate times out rather than false-passing).
 
 ### D.3 — UAS (USB Attached SCSI)
 
@@ -580,6 +612,20 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 - [ ] `docs/92-usb-class-expansion.md` exists, follows the seven-section aligned-learning-doc template, and explains the route string, Report Protocol, BOT/UAS, isochronous endpoints, and the CDC-ECM-vs-vendor-`ure` generalization.
 - [ ] It is linked from the `docs/README.md` Phase-Aligned Learning Docs table and referenced in `docs/appendix/codebase-map.md`.
 - [ ] The `docs/roadmap/README.md` Phase 92 row Status flips `Planned` → `Complete` (and the Tasks cell links this task doc) when the phase lands.
+
+### I.6 — Wire the Phase 92 core USB gates into the regression flag (PR #252 readiness)
+
+**Files:**
+- `.githooks/pre-push`
+- `.github/workflows/` (the USB regression job)
+- `AGENTS.md` (the `M3OS_USB_REGRESSION` gate row)
+
+**Symbol:** the `M3OS_USB_REGRESSION` opt-in block (today runs only `xhci-bringup-smoke`/`xhci-enum-smoke`/`usb-smoke`)
+**Why it matters:** the three new core gates (`usb-hotplug-smoke`, `usb-storage-smoke`, `usb-hub-smoke`) PASS when invoked but are not in `M3OS_USB_REGRESSION` or any CI workflow, so a regression in the **landed** hot-plug / mass-storage / hub paths would not be caught automatically. (The host-side `usb-core` codec tests were wired into `cargo xtask check` in PR #252; this is the QEMU-gate half. Near-term — schedule with 92a.)
+
+**Acceptance:**
+- [ ] `usb-hotplug-smoke`, `usb-storage-smoke`, and `usb-hub-smoke` run under `M3OS_USB_REGRESSION` (and/or the CI USB job) alongside `usb-smoke`.
+- [ ] The AGENTS.md `M3OS_USB_REGRESSION` row lists the three added gates.
 
 ---
 
