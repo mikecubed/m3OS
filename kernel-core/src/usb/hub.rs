@@ -394,6 +394,40 @@ pub fn port_change_reset(status4: &[u8]) -> bool {
     le16_at(status4, 2) & (1 << PORT_CHANGE_RESET_BIT) != 0
 }
 
+/// Bit position of "Low-Speed Device Attached" in `wPortStatus` (USB 2.0
+/// §11.24.2.7.1, Table 11-21).
+pub const PORT_STATUS_LOW_SPEED_BIT: u8 = 9;
+/// Bit position of "High-Speed Device Attached" in `wPortStatus`.
+pub const PORT_STATUS_HIGH_SPEED_BIT: u8 = 10;
+
+/// Speed code for a device attached downstream of a hub, matching the xHCI
+/// server's `EnumerateChild` wire encoding and the kernel's `PortSpeed`:
+/// `0` = Low, `1` = Full, `2` = High. A USB 2.0 hub never reports SuperSpeed
+/// downstream, so this never returns the SuperSpeed code (`3`).
+pub const DOWNSTREAM_SPEED_LOW: u8 = 0;
+/// Full-speed device-attached code (the default when neither LS nor HS is set).
+pub const DOWNSTREAM_SPEED_FULL: u8 = 1;
+/// High-speed device-attached code.
+pub const DOWNSTREAM_SPEED_HIGH: u8 = 2;
+
+/// Decode the downstream device speed from a hub's 4-byte `GET_PORT_STATUS`
+/// reply (USB 2.0 §11.24.2.7.1). The Low/High-Speed-Device-Attached bits are
+/// mutually exclusive; absent both, the device is Full speed.
+///
+/// Returns one of [`DOWNSTREAM_SPEED_LOW`] / [`DOWNSTREAM_SPEED_FULL`] /
+/// [`DOWNSTREAM_SPEED_HIGH`]. Defensively returns Full speed if `status4` is
+/// shorter than 2 bytes.
+pub fn port_status_speed_code(status4: &[u8]) -> u8 {
+    let w = le16_at(status4, 0);
+    if w & (1 << PORT_STATUS_LOW_SPEED_BIT) != 0 {
+        DOWNSTREAM_SPEED_LOW
+    } else if w & (1 << PORT_STATUS_HIGH_SPEED_BIT) != 0 {
+        DOWNSTREAM_SPEED_HIGH
+    } else {
+        DOWNSTREAM_SPEED_FULL
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PortId — USB topology tree (flat arena)
 // ---------------------------------------------------------------------------
@@ -1079,5 +1113,31 @@ mod tests {
         assert!(!port_status_resetting(s));
         assert!(!port_change_connection(s));
         assert!(!port_change_reset(s));
+    }
+
+    #[test]
+    fn port_status_speed_code_decodes_each_speed() {
+        // Neither LS nor HS bit → Full speed.
+        assert_eq!(
+            port_status_speed_code(&[0x01, 0x00, 0x00, 0x00]),
+            DOWNSTREAM_SPEED_FULL
+        );
+        // Bit 9 (Low-Speed Device Attached) set.
+        assert_eq!(
+            port_status_speed_code(&[0x00, 0x02, 0x00, 0x00]),
+            DOWNSTREAM_SPEED_LOW
+        );
+        // Bit 10 (High-Speed Device Attached) set.
+        assert_eq!(
+            port_status_speed_code(&[0x00, 0x04, 0x00, 0x00]),
+            DOWNSTREAM_SPEED_HIGH
+        );
+        // Low takes precedence if both somehow set (LS is checked first).
+        assert_eq!(
+            port_status_speed_code(&[0x00, 0x06, 0x00, 0x00]),
+            DOWNSTREAM_SPEED_LOW
+        );
+        // Short slice → defensively Full.
+        assert_eq!(port_status_speed_code(&[0x00]), DOWNSTREAM_SPEED_FULL);
     }
 }
