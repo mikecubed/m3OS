@@ -19,11 +19,42 @@
 | B | HID Report Protocol — wire `parse_report_descriptor` live, multi-axis/buttons/scroll, consumer keys, LED `SET_REPORT` | H | **B.1 landed** — `usb-hid` reads + parses the HID Report descriptor over EP0 at bind and stores the `ReportField` layout per device (`USB_HID:report-parsed` in `usb-smoke`); B.2/B.3 host-logic landed (47 hid + 38 keymap tests). **B.2-live decode / B.3-live consumer routing / B.4 LED `SET_REPORT` → Phase 92b** |
 | C | Live hot-plug event surface — Port Status Change → `AttachNotice` push, detach (`attached:false`), dynamic re-enumeration, Disable Slot reclamation | — | C.1–C.3 + server-side C.4 landed (`usb-hotplug-smoke` 3-cycle PASS); class-driver-side release pends per-driver |
 | D | USB Mass Storage — BOT CBW/CSW on the Phase 96 inline bulk path, SCSI subset, UAS, `RemoteBlockDevice` facade + `/mnt/usb<n>`, page-grant overflow | C, H | D.1 transport + **data-IN phase** + D.2 codec landed (`usb-storage` daemon binds + BOT CBW/CSW round-trip + INQUIRY/READ CAPACITY over the new synchronous `SubmitBulkIn` path, `usb-storage-smoke` PASS asserting `USB_MASS_STORAGE:ready`; 31 host tests). **D.3 UAS / D.4 mount / D.5 page-grant pending** |
-| E | Isochronous endpoints — UAC PCM-out to `audio_server`, UVC frame capture + `camera_server`, controller isoch TRB scheduling | F | Planned |
-| F | Multi-controller concurrency — per-controller bound IRQ + event-loop thread, concurrent MSI-X routing | — | Planned |
-| G | Host-side USB-Ethernet class drivers — generic CDC-ECM/NCM `RemoteNic`, fold the Phase 96 vendor `ure` into a shared device-match registry | C | G.1/G.2 host-logic landed (`cdc.rs`: CDC functional-descriptor parse + NTB-16 framing round-trip, 23 host tests); live `usb-net` daemon pending (bare-metal/VFIO-gated — no QEMU CDC-ECM model) |
-| H | Foundation & carry-over hardening — live `GetDescriptors` (large reads), control-transfer event capture, Disable Slot, page-grant `SubmitTransfer` | — | H.1–H.3 landed (host-tested + `usb-smoke` clean); H.4→D.5 |
-| I | Validation, kernel version bump & learning docs — new acceptance gates, AGENTS.md rows, `0.91.0`→`0.92.0`, Phase 92 learning doc | A–H | Planned |
+| E | Isochronous endpoints — UAC PCM-out to `audio_server`, UVC frame capture + `camera_server`, controller isoch TRB scheduling | F | **→ Phase 92c** (deep isoch TRB scheduling; UVC bare-metal-only) |
+| F | Multi-controller concurrency — per-controller bound IRQ + event-loop thread, concurrent MSI-X routing | — | **→ Phase 92d** (ring-3 driver threading; risk-isolated from the working single-loop server) |
+| G | Host-side USB-Ethernet class drivers — generic CDC-ECM/NCM `RemoteNic`, fold the Phase 96 vendor `ure` into a shared device-match registry | C | G.1/G.2 host-logic landed (`cdc.rs`: CDC functional-descriptor parse + NTB-16 framing round-trip, 23 host tests); **live `usb-net` daemon → Phase 92e** (bare-metal/VFIO-gated — no QEMU CDC-ECM model) |
+| H | Foundation & carry-over hardening — live `GetDescriptors` (large reads), control-transfer event capture, Disable Slot, page-grant `SubmitTransfer` | — | H.1–H.3 landed (host-tested + `usb-smoke` clean); H.4→D.5 (Phase 92a) |
+| I | Validation, kernel version bump & learning docs — new acceptance gates, AGENTS.md rows, `0.91.0`→`0.92.0`, Phase 92 learning doc | A–H | In progress — `usb-hub-smoke` + `usb-storage-smoke` (data-IN + R/W) gates landed; version bump + learning doc sealed once the 92 core is signed off |
+
+---
+
+## Sub-Phase Schedule
+
+Phase 92 was split (per the `flow:parallel-impl` breadth-first run) so each chunk
+lands and is **independently verified** rather than waiting on the whole, deep
+USB-class surface. The **core** (CI-verifiable, validated this run) is below; the
+deeper / kernel-invasive / hardware-only remainder is scheduled as numbered
+sub-phases so they can be scheduled and verified one at a time.
+
+**Phase 92 core — landed + validated (always-on QEMU gates + host tests):**
+
+- **H** (foundation) — `GetDescriptors` cache, control-event capture, Disable Slot.
+- **C** (hot-plug) — Port-Status-Change → `AttachNotice`/detach/Disable-Slot (`usb-hotplug-smoke`).
+- **D.1/D.2** (mass storage) — BOT CBW/CSW + SCSI codec + **the data-IN phase** (the synchronous single-TRB `SubmitBulkIn` closing the Phase 96 streaming-path STALL) + a WRITE(10)/READ(10) sector round-trip (`usb-storage-smoke` → `USB_MASS_STORAGE:ready` + `USB_STORAGE:rw-ok`).
+- **A.1/A.2/A.3** (hub discovery) — server surfaces `CLASS_HUB`; the live `usbhub` walker reads the hub descriptor + powers/resets ports (`usb-hub-smoke`).
+- **B.1** (HID Report) — live Report-descriptor read + parse at bind (`usb-smoke` → `USB_HID:report-parsed`).
+- **B.2/B.3, G.1/G.2** host-logic — Report-descriptor Usage ranges + Report IDs, consumer keycodes, CDC functional-descriptor parse + NTB-16 framing (host tests).
+
+**Phase 92a — USB tier-2 enumeration + mass-storage mount.** A.4/A.5 (device-behind-hub enumeration via the xHCI route string + `PortTopology` → Slot Context), D.3 (UAS), D.4 (`RemoteBlockDevice` facade + `/mnt/usb<n>` mount — requires kernel multi-remote-block-device routing, since `blk::remote` is currently a single-backend singleton), D.5 + H.4 (page-grant `SubmitTransfer` overflow). *The hard USB data path is already done (D.1/D.2); this is the enumeration + kernel-mount integration.*
+
+**Phase 92b — HID Report Protocol live decode.** B.2-live (data-driven multi-axis/scroll/button decode + usage→event mapping + a `usb-tablet` QMP-abs-input gate arm), B.3-live (consumer-key routing to `audio_server`), B.4 (keyboard LED `SET_REPORT`). *Host-logic + the stored `ReportField` layout (B.1) are ready.*
+
+**Phase 92c — USB isochronous (UAC / UVC).** E.3 (controller isochronous-TRB scheduling — frame interval, bandwidth reservation, no-retry), E.1 (UAC PCM-out to `audio_server`, CI-viable via `-device usb-audio`), E.2 (UVC frame capture + `camera_server`, bare-metal/VFIO-only). *Deepest controller work in the phase.*
+
+**Phase 92d — Multi-controller concurrency.** F.1 (per-controller bound IRQ + event-loop thread), F.2 (concurrent MSI-X routing). *Ring-3 driver threading, deliberately risk-isolated from the validated single-loop server; CI-viable via a second `qemu-xhci`.*
+
+**Phase 92e — USB-Ethernet class drivers (live).** G.1/G.2/G.3 live `usb-net` (CDC-ECM/NCM `RemoteNic` + the shared `ure` device-match registry). *Bare-metal/VFIO-gated — QEMU has no CDC-ECM model — so it follows the `usb-eth-smoke`/`wifi-smoke` opt-in + skip-with-reason pattern; the host-logic (G.1/G.2) is done.*
+
+**Track I** (version bump `0.91.0`→`0.92.0` + the `docs/92-usb-class-expansion.md` learning doc) closes when the user signs off the 92 core as sealed — held now because the phase is intentionally mid-flight across the sub-phases above.
 
 ---
 
