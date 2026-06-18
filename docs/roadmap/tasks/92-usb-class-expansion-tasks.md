@@ -23,7 +23,7 @@
 | F | Multi-controller concurrency — per-controller bound IRQ + event-loop thread, concurrent MSI-X routing | — | **→ Phase 92d** (ring-3 driver threading; risk-isolated from the working single-loop server) |
 | G | Host-side USB-Ethernet class drivers — generic CDC-ECM/NCM `RemoteNic`, fold the Phase 96 vendor `ure` into a shared device-match registry | C | G.1/G.2 host-logic landed (`cdc.rs`: CDC functional-descriptor parse + NTB-16 framing round-trip, 23 host tests); **live `usb-net` daemon → Phase 92e** (bare-metal/VFIO-gated — no QEMU CDC-ECM model) |
 | H | Foundation & carry-over hardening — live `GetDescriptors` (large reads), control-transfer event capture, Disable Slot, page-grant `SubmitTransfer` | — | H.1–H.3 landed (host-tested + `usb-smoke` clean); H.4→D.5 (Phase 92a) |
-| I | Validation, kernel version bump & learning docs — new acceptance gates, AGENTS.md rows, `0.91.0`→`0.92.0`, Phase 92 learning doc | A–H | In progress — `usb-hub-smoke` + `usb-storage-smoke` (data-IN + R/W) gates landed; version bump + learning doc sealed once the 92 core is signed off |
+| I | Validation, kernel version bump & learning docs — new acceptance gates, AGENTS.md rows, `0.91.0`→`0.92.0`, Phase 92 learning doc | A–H | **I.4 done** — bumped to **`0.92.0`** with the core (+ AGENTS.md version line + USB capability-bullet rewrite); `usb-hub-smoke` + `usb-storage-smoke` (data-IN + R/W) gates landed. **I.5 learning doc pending**; sub-phases land as `0.92.x` |
 
 ---
 
@@ -72,7 +72,7 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 - **C.4 (usb-net arm)** — `usb-net` releases its per-device state on an `attached:false` notice.
 - **Gate (I.3 ethernet half):** the CDC-ECM/NCM arm of `usb-eth-smoke` — bare-metal/VFIO, skip-with-reason in CI. *QEMU has no CDC-ECM model; host-logic (G.1/G.2) is done.*
 
-**Track I close-out** (when the user signs off the 92 line as sealed): **I.4** version bump `0.91.0`→`0.92.0` + the AGENTS.md "kernel v0.92.0" line + USB capability-bullet rewrite; **I.5** the `docs/92-usb-class-expansion.md` learning doc + `docs/README.md`/`codebase-map.md` links + flipping the roadmap README Phase 92 row to `Complete`. Held now because the phase is intentionally mid-flight across the sub-phases above. *Note: the per-sub-phase AGENTS.md gate rows above land **with** their sub-phase; I.4/I.5 are the final version-bump + learning-doc only.*
+**Track I** — **I.4 (version bump) is done**: bumped `0.91.0`→**`0.92.0`** with the Phase 92 core (this PR), the AGENTS.md "kernel v0.92.0" line, and the USB capability-bullet rewrite. **Sub-phases 92a–92e land as `0.92.x` patch releases.** **I.5** (the `docs/92-usb-class-expansion.md` learning doc + `docs/README.md`/`codebase-map.md` links + flipping the roadmap README Phase 92 row to `Complete`) remains, scheduled to land with the last sub-phase. *Note: each per-sub-phase AGENTS.md gate row above lands **with** its sub-phase.*
 
 ### Coverage map — every open acceptance item → its sub-phase
 
@@ -92,7 +92,8 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 | G.1 (449–450), G.2 (461), G.3 (473–475) | 92e |
 | C.4 usb-net detach (293) | 92e |
 | I.3 CDC-ECM arm (511) | 92e |
-| I.4 version bump (524–526), I.5 learning doc (539–541) | Track I close-out |
+| I.4 version bump (524–526) | **done — `0.92.0` with the core** |
+| I.5 learning doc (539–541) | Track I close-out (lands with the last sub-phase) |
 
 ---
 
@@ -559,9 +560,11 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 **Why it matters:** every phase closes by bumping the kernel minor version so the boot banner, `uname`, and `/proc/version` report the phase that landed; the AGENTS.md overview line is the canonical human-readable version.
 
 **Acceptance:**
-- [ ] `kernel/Cargo.toml` version is `0.92.0`; the boot banner / `uname` report `0.92.0` (no other string edits needed).
-- [ ] The AGENTS.md Project Overview line reads "kernel **v0.92.0**".
-- [ ] A new capability bullet is added to the AGENTS.md inventory **only if** Phase 92 introduces a new capability class (USB mass storage + USB-Ethernet class + USB audio/video are new device classes under the existing USB bullet — prefer rewriting the USB bullet over adding prose, per the maintenance policy).
+- [x] `kernel/Cargo.toml` version is `0.92.0`; the boot banner / `uname` / `/proc/version` report `0.92.0` (all read `env!("CARGO_PKG_VERSION")`, so the bump propagates with no other string edits).
+- [x] The AGENTS.md Project Overview line reads "kernel **v0.92.0**".
+- [x] The AGENTS.md USB capability bullet is rewritten to add the new device classes (live hot-plug, USB mass storage, the resident hub walker) under the existing USB bullet — per the maintenance policy. Tier-2/mount/isoch/CDC-ECM are noted as sub-phases 92a–92e.
+
+> **Sub-phase versioning.** The `0.92.0` bump lands **with the Phase 92 core** (this PR) to mark the milestone. Sub-phases **92a–92e land as `0.92.x` patch releases** (each bumps the patch when it merges); the `0.93.0` minor is the next *distinct* phase.
 
 ### I.5 — Phase 92 learning documentation
 
