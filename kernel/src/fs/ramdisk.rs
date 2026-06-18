@@ -1397,6 +1397,21 @@ static ROOT_ENTRIES: &[(&str, RamdiskNode)] = &[
             children: USR_ENTRIES,
         },
     ),
+    // Phase 92a D.4 — USB mass-storage mount points. These are empty
+    // directories until a `mount /dev/usbN /mnt/usbN ext2` shadows them with a
+    // secondary ext2 volume (see `kernel::fs::ext2::USB_MOUNTS`).
+    (
+        "mnt",
+        RamdiskNode::Dir {
+            children: MNT_ENTRIES,
+        },
+    ),
+];
+
+/// `/mnt` children: the USB mass-storage mount points (Phase 92a D.4).
+static MNT_ENTRIES: &[(&str, RamdiskNode)] = &[
+    ("usb0", RamdiskNode::Dir { children: &[] }),
+    ("usb1", RamdiskNode::Dir { children: &[] }),
 ];
 
 /// The root of the ramdisk directory tree.

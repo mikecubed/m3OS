@@ -301,6 +301,29 @@ fn path_node_nofollow(abs_path: &str) -> Result<PathNodeKind, u64> {
         };
     }
 
+    // Phase 92a D.4: a path under a /mnt/usbN secondary mount resolves in that
+    // mount's own ext2 volume (and shadows the empty ramdisk mount-point dir).
+    // `with_usb_mount` returns None when no secondary mount serves the path, so
+    // an unmounted /mnt/usbN falls through to the ramdisk empty-dir below.
+    if let Some(res) =
+        crate::fs::ext2::with_usb_mount(abs_path, |vol, rel| match vol.resolve_path(rel) {
+            Ok(ino) => match vol.read_inode(ino) {
+                Ok(inode) if inode.is_symlink() => vol
+                    .read_symlink(ino)
+                    .map(PathNodeKind::Symlink)
+                    .map_err(|_| NEG_EIO),
+                Ok(inode) if inode.is_dir() => Ok(PathNodeKind::Dir),
+                Ok(_) => Ok(PathNodeKind::File),
+                Err(_) => Err(NEG_EIO),
+            },
+            Err(kernel_core::fs::ext2::Ext2Error::NotFound) => Err(NEG_ENOENT),
+            Err(kernel_core::fs::ext2::Ext2Error::NotDirectory) => Err(NEG_ENOTDIR),
+            Err(_) => Err(NEG_EIO),
+        })
+    {
+        return res;
+    }
+
     if let Some(node) = crate::fs::ramdisk::ramdisk_lookup(abs_path) {
         return if node.is_dir() {
             Ok(PathNodeKind::Dir)
@@ -6750,6 +6773,49 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             let offset = entry.offset;
             let path = path.clone();
 
+            // Phase 92a D.4: a file under a /mnt/usbN secondary mount reads from
+            // that mount's own ext2 volume. The vfs_server authority owns only
+            // the root device, so it is bypassed here (the volume-local inode
+            // number was resolved against this same volume at open time).
+            if let Some(read_res) = crate::fs::ext2::with_usb_mount(
+                &path,
+                |vol, _rel| -> Result<alloc::vec::Vec<u8>, u64> {
+                    let inode = vol.read_inode(inode_num).map_err(|_| NEG_EIO)?;
+                    let actual_size = inode.size as usize;
+                    if offset >= actual_size {
+                        return Ok(alloc::vec::Vec::new());
+                    }
+                    let mut read_buf = alloc::vec![0u8; capped_count];
+                    let n = vol
+                        .read_file_data(&inode, offset as u64, &mut read_buf)
+                        .map_err(|_| NEG_EIO)?;
+                    read_buf.truncate(n);
+                    Ok(read_buf)
+                },
+            ) {
+                return match read_res {
+                    Ok(data) => {
+                        if data.is_empty() {
+                            return 0;
+                        }
+                        let n = data.len();
+                        if UserSliceWo::new(buf_ptr, n)
+                            .and_then(|s| s.copy_from_kernel(&data))
+                            .is_err()
+                        {
+                            return NEG_EFAULT;
+                        }
+                        with_current_fd_mut(fd, |slot| {
+                            if let Some(e) = slot {
+                                e.offset += n;
+                            }
+                        });
+                        n as u64
+                    }
+                    Err(e) => e,
+                };
+            }
+
             // Phase 88: when the vfs_server ext2 authority is registered, read
             // through it (VFS_PREAD by path) so a writer reading back its own
             // writable fd — or any reader after an out-of-band write — sees the
@@ -7488,6 +7554,44 @@ pub(super) fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                 copied += chunk;
             }
             let data = &data[..copied];
+
+            // Phase 92a D.4: a file under a /mnt/usbN secondary mount writes to
+            // that mount's own ext2 volume directly. The vfs_server authority
+            // owns only the root device, so it is bypassed; same-volume reads
+            // stay coherent through the volume's write-through block cache.
+            if let Some(write_res) = crate::fs::ext2::with_usb_mount_mut(
+                &path,
+                |vol, _rel| -> Result<(usize, u32), u64> {
+                    let mut inode = vol.read_inode(inode_num).map_err(|_| NEG_EIO)?;
+                    let now = current_unix_time();
+                    inode.mtime = now;
+                    inode.ctime = now;
+                    let n = vol
+                        .write_file_data(inode_num, &mut inode, offset as u64, data)
+                        .map_err(|_| NEG_EIO)?;
+                    Ok((n, inode.size))
+                },
+            ) {
+                return match write_res {
+                    Ok((n, new_size)) => {
+                        let new_offset = offset + n;
+                        with_current_fd_mut(fd_idx, |slot| {
+                            if let Some(e) = slot {
+                                e.offset = new_offset;
+                                if let FdBackend::Ext2Disk {
+                                    file_size: ref mut fs,
+                                    ..
+                                } = e.backend
+                                {
+                                    *fs = new_size;
+                                }
+                            }
+                        });
+                        n as u64
+                    }
+                    Err(e) => e,
+                };
+            }
 
             // Phase 88: route the write to the vfs_server ext2 authority when
             // it is registered, so a later read (this fd or any other process)
@@ -9558,6 +9662,15 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
         }
     }
 
+    // Phase 92a D.4: a path under a /mnt/usbN secondary mount opens from that
+    // mount's own ext2 volume (checked before the root ext2 branch so it is not
+    // resolved against the root device).
+    if crate::fs::ext2::is_usb_mount_path(name) {
+        return open_usb_file(
+            name, readable, writable, create, append, truncate, mode_arg, cloexec, nonblock,
+        );
+    }
+
     // Phase 28: ext2 root filesystem — try before ramdisk for non-/bin, non-/sbin.
     if crate::fs::ext2::is_mounted()
         && let Some(rel) = ext2_root_path(name)
@@ -10160,6 +10273,118 @@ fn open_ext2_file(
             }
         }
         Err(_) => NEG_ENOENT,
+    }
+}
+
+/// Open a file under a `/mnt/usbN` secondary mount (Phase 92a D.4).
+///
+/// Resolves (or, with `create`, creates) the file in the mount's own ext2
+/// volume and installs an `Ext2Disk` fd whose `path` is the **absolute** mount
+/// path — so the read/write syscalls route back to the secondary volume via
+/// `with_usb_mount`. The volume work runs inside the `USB_MOUNTS` lock and
+/// returns the fd-construction data; the fd-table mutation happens outside the
+/// lock.
+#[allow(clippy::too_many_arguments)]
+fn open_usb_file(
+    name: &str,
+    readable: bool,
+    writable: bool,
+    create: bool,
+    append: bool,
+    truncate: bool,
+    mode_arg: u64,
+    cloexec: bool,
+    nonblock: bool,
+) -> u64 {
+    const NEG_EISDIR: u64 = (-21_i64) as u64;
+    const NEG_ENOENT: u64 = (-2_i64) as u64;
+    const NEG_EMFILE: u64 = (-24_i64) as u64;
+    const NEG_EIO: u64 = (-5_i64) as u64;
+
+    let create_mode = ((mode_arg as u16) & 0o7777) & !current_umask();
+    let (_, _, caller_euid, caller_egid) = current_process_ids();
+
+    // (inode_num, file_size, parent_inode, is_dir)
+    let outcome = crate::fs::ext2::with_usb_mount_mut(
+        name,
+        |vol, rel| -> Result<(u32, u32, u32, bool), u64> {
+            if rel.is_empty() || rel == "/" {
+                // The mount-point directory itself (e.g. `ls /mnt/usb0` opens it
+                // before getdents). Not writable/creatable/truncatable.
+                if writable || create || truncate {
+                    return Err(NEG_EISDIR);
+                }
+                let root = kernel_core::fs::ext2::EXT2_ROOT_INO;
+                return Ok((root, 0, root, true));
+            }
+            let parts: alloc::vec::Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+            let parent_ino = if parts.len() <= 1 {
+                kernel_core::fs::ext2::EXT2_ROOT_INO
+            } else {
+                let parent_path = parts[..parts.len() - 1].join("/");
+                vol.resolve_path(&parent_path).map_err(|_| NEG_ENOENT)?
+            };
+            match vol.resolve_path(rel) {
+                Ok(ino) => {
+                    let mut inode = vol.read_inode(ino).map_err(|_| NEG_EIO)?;
+                    if inode.is_dir() {
+                        if writable || create || truncate {
+                            return Err(NEG_EISDIR);
+                        }
+                        return Ok((ino, inode.size, parent_ino, true));
+                    }
+                    if truncate && writable {
+                        vol.truncate_file(ino, &mut inode).map_err(|_| NEG_EIO)?;
+                    }
+                    Ok((ino, inode.size, parent_ino, false))
+                }
+                Err(kernel_core::fs::ext2::Ext2Error::NotFound) if create => {
+                    let file_name = parts[parts.len() - 1];
+                    let new_ino = vol
+                        .create_file(parent_ino, file_name, create_mode, caller_euid, caller_egid)
+                        .map_err(|_| NEG_EIO)?;
+                    Ok((new_ino, 0, parent_ino, false))
+                }
+                Err(_) => Err(NEG_ENOENT),
+            }
+        },
+    );
+
+    let (ino, file_size, parent_ino, is_dir) = match outcome {
+        Some(Ok(t)) => t,
+        Some(Err(e)) => return e,
+        None => return NEG_ENOENT,
+    };
+
+    let backend = if is_dir {
+        FdBackend::Dir {
+            path: alloc::string::String::from(name),
+        }
+    } else {
+        FdBackend::Ext2Disk {
+            // Absolute path so the read/write syscalls route to the USB volume.
+            path: alloc::string::String::from(name),
+            inode_num: ino,
+            file_size,
+            parent_inode: parent_ino,
+        }
+    };
+    let initial_offset = if append && !is_dir {
+        file_size as usize
+    } else {
+        0
+    };
+    let fd_entry = FdEntry {
+        backend,
+        offset: initial_offset,
+        readable: if is_dir { true } else { readable },
+        writable: if is_dir { false } else { writable },
+        cloexec,
+        nonblock,
+    };
+    match alloc_fd(3, fd_entry) {
+        Some(i) => i as u64,
+        None => NEG_EMFILE,
     }
 }
 
@@ -15694,7 +15919,7 @@ pub(super) fn sys_linux_rename(old_ptr: u64, new_ptr: u64) -> u64 {
 // Phase 24: mount(source, target, fstype) — syscall 165
 // ---------------------------------------------------------------------------
 
-pub(super) fn sys_linux_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64) -> u64 {
+pub(super) fn sys_linux_mount(source_ptr: u64, target_ptr: u64, fstype_ptr: u64) -> u64 {
     let (_, _, euid, _) = current_process_ids();
     if euid != 0 {
         return NEG_EPERM;
@@ -15722,6 +15947,48 @@ pub(super) fn sys_linux_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64
     };
     if !matches!(path_node_nofollow(&resolved_target), Ok(PathNodeKind::Dir)) {
         return NEG_ENOTDIR;
+    }
+
+    // Phase 92a D.4: a USB mass-storage mount — source `/dev/usbN`, fstype ext2.
+    // Unlike the root mount (whose device is ignored / MBR-probed on virtio-blk),
+    // this resolves the source to a `usbN.block` ring-3 backend in the multi-
+    // device registry and mounts a *second* ext2 volume at the target prefix.
+    {
+        let mut buf_source = [0u8; 512];
+        let source = read_user_cstr(source_ptr, &mut buf_source).unwrap_or("");
+        if let Some(idx) = source
+            .strip_prefix("/dev/usb")
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            if fstype != "ext2" {
+                return NEG_EINVAL;
+            }
+            let _mount_guard = MOUNT_OP_LOCK.lock();
+            let svc = alloc::format!("usb{idx}.block");
+            let dev_name = alloc::format!("usb{idx}");
+            let dev_id = match crate::blk::register_remote_device(&svc, &dev_name) {
+                Some(id) => id,
+                None => {
+                    log::error!("[mount] no '{svc}' block backend registered");
+                    return NEG_ENODEV;
+                }
+            };
+            // The USB image is a bare ext2 (no partition table), so the
+            // superblock is at LBA 2 from device start (base_lba = 0).
+            match crate::fs::ext2::mount_usb(&resolved_target, 0, dev_id) {
+                Ok(()) => {
+                    log::info!(
+                        "[mount] usb{idx} (dev_id={dev_id}) mounted at {resolved_target} (ext2)"
+                    );
+                    return 0;
+                }
+                Err(e) => {
+                    log::error!("[mount] usb{idx} ext2 mount failed: {e:?}");
+                    crate::blk::unregister_remote_device(dev_id);
+                    return NEG_EIO;
+                }
+            }
+        }
     }
 
     let action = match vfs_service_mount_action(&resolved_target, fstype) {
@@ -16164,6 +16431,17 @@ pub(super) fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                 alloc::format!("{dir_path}/{name}")
             };
             entries.push((name, dirent_type_for_path(&child_path, is_dir)));
+        }
+    } else if crate::fs::ext2::is_usb_mount_path(&dir_path) {
+        // Phase 92a D.4: list a /mnt/usbN secondary mount from its own ext2
+        // volume (caught before the root ext2 branch so it is not resolved
+        // against the root device).
+        if let Some(Some(children)) =
+            crate::fs::ext2::with_usb_mount(&dir_path, |vol, rel| vol.list_dir(rel).ok())
+        {
+            for (name, is_dir) in children {
+                entries.push((name, if is_dir { DT_DIR } else { DT_REG }));
+            }
         }
     } else if dir_path == "/" {
         // Root directory: merge ext2 root + ramdisk overlays + virtual mounts.
