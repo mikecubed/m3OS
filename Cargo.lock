@@ -2425,6 +2425,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "usb_storage"
+version = "0.92.0"
+dependencies = [
+ "kernel-core",
+ "syscall-lib",
+ "usb-core",
+]
+
+[[package]]
 name = "usbhub"
 version = "0.78.2"
 dependencies = [

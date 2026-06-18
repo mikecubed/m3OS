@@ -83,6 +83,8 @@ members = [
     "userspace/drivers/usbhub",
     # Phase 78c — ring-3 USB HID Boot-Protocol class driver (keyboard + mouse)
     "userspace/drivers/usb-hid",
+    # Phase 92 Track D — ring-3 USB Mass Storage (Bulk-Only Transport) class driver
+    "userspace/drivers/usb-storage",
     # Phase 80 Track A.5 — ring-3 AC'97 out-of-process audio hardware driver
     "userspace/drivers/ac97",
     # Phase 80b — ring-3 Intel HDA out-of-process audio hardware driver

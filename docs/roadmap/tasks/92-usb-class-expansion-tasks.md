@@ -18,10 +18,10 @@
 | A | Multi-tier hub enumeration — live `usbhub` walker, hub descriptor + per-port power/reset, tier-2+ slot assignment via the route string | H | A.3 host-logic landed (`get_port_status` encoder + port-status bitmap helpers; 36 hub tests); live `usbhub` walker (A.1/A.2/A.4/A.5) pending |
 | B | HID Report Protocol — wire `parse_report_descriptor` live, multi-axis/buttons/scroll, consumer keys, LED `SET_REPORT` | H | B.2/B.3 host-logic landed (Usage ranges + Report IDs + consumer keycodes; 47 hid + 38 keymap tests); live `usb-hid` wiring (B.1/B.4) pending |
 | C | Live hot-plug event surface — Port Status Change → `AttachNotice` push, detach (`attached:false`), dynamic re-enumeration, Disable Slot reclamation | — | C.1–C.3 + server-side C.4 landed (`usb-hotplug-smoke` 3-cycle PASS); class-driver-side release pends per-driver |
-| D | USB Mass Storage — BOT CBW/CSW on the Phase 96 inline bulk path, SCSI subset, UAS, `RemoteBlockDevice` facade + `/mnt/usb<n>`, page-grant overflow | C, H | Planned |
+| D | USB Mass Storage — BOT CBW/CSW on the Phase 96 inline bulk path, SCSI subset, UAS, `RemoteBlockDevice` facade + `/mnt/usb<n>`, page-grant overflow | C, H | D.1 transport + D.2 codec landed (`usb-storage` daemon binds + BOT CBW/CSW round-trip on a real SuperSpeed device, `usb-storage-smoke` PASS; 31 host tests). **Data-IN phase + D.3/D.4/D.5 pending** on a tracked SuperSpeed bulk-IN substrate gap |
 | E | Isochronous endpoints — UAC PCM-out to `audio_server`, UVC frame capture + `camera_server`, controller isoch TRB scheduling | F | Planned |
 | F | Multi-controller concurrency — per-controller bound IRQ + event-loop thread, concurrent MSI-X routing | — | Planned |
-| G | Host-side USB-Ethernet class drivers — generic CDC-ECM/NCM `RemoteNic`, fold the Phase 96 vendor `ure` into a shared device-match registry | C | Planned |
+| G | Host-side USB-Ethernet class drivers — generic CDC-ECM/NCM `RemoteNic`, fold the Phase 96 vendor `ure` into a shared device-match registry | C | G.1/G.2 host-logic landed (`cdc.rs`: CDC functional-descriptor parse + NTB-16 framing round-trip, 23 host tests); live `usb-net` daemon pending (bare-metal/VFIO-gated — no QEMU CDC-ECM model) |
 | H | Foundation & carry-over hardening — live `GetDescriptors` (large reads), control-transfer event capture, Disable Slot, page-grant `SubmitTransfer` | — | H.1–H.3 landed (host-tested + `usb-smoke` clean); H.4→D.5 |
 | I | Validation, kernel version bump & learning docs — new acceptance gates, AGENTS.md rows, `0.91.0`→`0.92.0`, Phase 92 learning doc | A–H | Planned |
 
@@ -177,7 +177,7 @@
 **Why it matters:** a gaming mouse reports a scroll wheel + extra buttons; a touchpad reports X/Y/pressure + contact IDs. The parser must emit multiple `ReportField`s for Usage ranges and respect Report IDs, and `usb-hid` must unpack arbitrary bit fields and map usages (X=0x01:0x30, Y=0x01:0x31, buttons=0x09:0x01..) to `mouse_server` events.
 
 **Acceptance:**
-- [ ] `parse_report_descriptor` emits a `ReportField` per usage for a Usage Min/Max range and tags fields with their Report ID; host tests cover both.
+- [x] `parse_report_descriptor` emits a `ReportField` per usage for a Usage Min/Max range and tags fields with their Report ID; host tests cover both. — `kernel_core::usb::hid_report` Usage-Min/Max range expansion + per-Report-ID `report_id` tagging + offset reset; host tests `usage_min_max_range_expands_to_one_field_per_usage` + `two_report_ids_tag_fields_and_reset_offset`. (The live `usb-hid` decode using this — B.2 remainder — is pending.)
 - [ ] A Report-Protocol gaming mouse delivers correct X/Y + a scroll axis + ≥4 buttons through `mouse_server` (`USB_HID:mouse` sentinels reflect the extra axes/buttons).
 - [ ] A single-pointer touchpad maps to pointer motion (multi-touch contact tracking is explicitly deferred — see design doc).
 
@@ -277,9 +277,11 @@
 **Why it matters:** mass storage is a bulk-class device — the exact transport the Phase 96 `ure` NIC already proved. D.1 stands up a new `usb-storage` ring-3 driver that binds a `CLASS_MASS_STORAGE` (0x08) interface from the `NextAttach` walk and drives its bulk IN/OUT pair using the existing primitives — **no new transport**. (New crate ⇒ the four-place wiring from AGENTS.md: workspace member, `xtask` `bins`, ramdisk `BIN_ENTRIES`, service config.)
 
 **Acceptance:**
-- [ ] `usb-storage` binds a `CLASS_MASS_STORAGE` interface (`bulk_in_dci`/`bulk_out_dci` from `AttachNotice`) and exchanges bytes over `SubmitBulkOut`/`PollBulkIn`.
-- [ ] The driver guards on `bulk_in_dci != 0` / `bulk_out_dci != 0` before issuing bulk requests (a device with no bulk pair is rejected, not crashed).
-- [ ] The crate is wired in all four places and appears in the ramdisk (`execve` resolves it).
+- [x] `usb-storage` binds a `CLASS_MASS_STORAGE` interface (`bulk_in_dci`/`bulk_out_dci` from `AttachNotice`) and exchanges bytes over `SubmitBulkOut`/`PollBulkIn`. — the new `usb-storage` daemon binds the device and completes a **full BOT CBW-out + CSW-in round-trip** (`GET_MAX_LUN` class control + `TEST UNIT READY`) over the bulk pair on a real (SuperSpeed) device; `usb-storage-smoke` asserts `USB_STORAGE:bot-ok`.
+- [x] The driver guards on `bulk_in_dci != 0` / `bulk_out_dci != 0` before issuing bulk requests (a device with no bulk pair is rejected, not crashed). — the `NextAttach` bind loop filters `interface_class == 0x08 && bulk_in_dci != 0 && bulk_out_dci != 0`.
+- [x] The crate is wired in all four places and appears in the ramdisk (`execve` resolves it). — workspace member + `xtask` `bins` + ramdisk `DRIVERS_ENTRIES` (`/drivers/usb-storage`) + init `usb-storage.conf` (daemon, `depends=xhci_driver`); the daemon spawns + binds the device, proven by the gate.
+
+> **D.1 data-IN follow-up (tracked).** The **bulk-IN data phase** (INQUIRY / READ CAPACITY → identity/capacity) stalls against the qemu SuperSpeed device with `xfer ERR cc=6` (STALL on the bulk-IN), even though the CBW is byte-exact-valid (verified on the wire: `55 53 42 43 … 24 00 00 00 80 00 06 12 …`) and the no-data BOT round-trip works. Root cause: the **Phase 96 bulk-IN *data* path was never exercised by a real device** (the `ure` NIC that defined it was not merged), so a SuperSpeed (`bulk_in_mps=1024`) data-IN transfer is unhandled. Closing this (likely SS Endpoint-Companion / Max-Burst handling, or a USB2 high-speed path) unblocks the rest of D.1 (multi-byte data phase), **D.4** (`RemoteBlockDevice` + `/mnt/usb<n>` mount), and the always-on promotion of `usb-storage-smoke`. The daemon's INQUIRY/READ-CAPACITY code is left in place (best-effort, non-fatal) so it lights up automatically once the gap is closed.
 
 ### D.2 — CBW/CSW framing + SCSI command subset + `GET_MAX_LUN`
 
@@ -287,10 +289,12 @@
 **Symbol:** `Cbw` (31-byte Command Block Wrapper), `Csw` (13-byte Command Status Wrapper); SCSI ops TEST UNIT READY, INQUIRY, READ CAPACITY(10), READ(10), WRITE(10), REQUEST SENSE; `GET_MAX_LUN` over `UsbRequest::ControlRequest`
 **Why it matters:** BOT wraps each SCSI command in a CBW on bulk-out and reads a CSW on bulk-in. Parsing SCSI in the ring-3 daemon keeps the kernel SCSI-unaware. `GET_MAX_LUN` (a class control-IN, over the live `ControlRequest`) tells the driver how many logical units the device exposes.
 
+> **Implementation note:** the pure BOT/SCSI codec lives in `kernel-core/src/usb/mass_storage.rs` (host-testable, the `hid_report`/`hub` pattern), consumed by the future `usb-storage` daemon — so the kernel stays SCSI-unaware (kernel-core is a shared lib, not called by the kernel binary).
+
 **Acceptance:**
-- [ ] `Cbw`/`Csw` encode/decode are host-tested against known byte layouts (dCBWSignature `USBC`, dCSWSignature `USBS`).
-- [ ] `INQUIRY` + `READ CAPACITY(10)` return device identity and block count; `READ(10)`/`WRITE(10)` move sectors; a failed command surfaces `REQUEST SENSE`.
-- [ ] `GET_MAX_LUN` is issued over `ControlRequest`; a device reporting STALL is treated as single-LUN.
+- [x] `Cbw`/`Csw` encode/decode are host-tested against known byte layouts (dCBWSignature `USBC`, dCSWSignature `USBS`). — `kernel_core::usb::mass_storage` `Cbw::encode`/`Csw::parse` + 31 host tests (signatures, tag/len LE, CDB pad, short-buffer rejection).
+- [~] `INQUIRY` + `READ CAPACITY(10)` return device identity and block count; `READ(10)`/`WRITE(10)` move sectors; a failed command surfaces `REQUEST SENSE`. — **codec done + host-tested** (CDB builders big-endian, `InquiryData`/`ReadCapacity10` parsers); the live BOT data movement is the `usb-storage` daemon (D.1), pending.
+- [x] `GET_MAX_LUN` is issued over `ControlRequest`; a device reporting STALL is treated as single-LUN. — `get_max_lun(iface)` SetupPacket encoder host-tested (`A1 FE 00 00 iface 00 01 00`); live issuance + STALL→single-LUN policy is the daemon (D.1).
 
 ### D.3 — UAS (USB Attached SCSI)
 
@@ -414,7 +418,7 @@
 **Acceptance:**
 - [ ] `usb-net` binds a CDC-ECM interface (`bInterfaceClass=0x02` + `0x0a` data), parses the CDC functional descriptors, selects the data alt-setting, and reads the MAC from the ECM MAC-address string descriptor.
 - [ ] Ethernet frames move over the bulk pair (`PollBulkIn`/`SubmitBulkOut`) and the kernel net stack binds the `RemoteNic` (`[remote_nic] … registered ring-3 NIC driver`).
-- [ ] QEMU has no CDC-ECM model ⇒ the live arm is bare-metal/VFIO-gated with skip-with-reason (mirroring `usb-eth-smoke`); host tests cover the CDC descriptor parse + frame framing.
+- [x] QEMU has no CDC-ECM model ⇒ the live arm is bare-metal/VFIO-gated with skip-with-reason (mirroring `usb-eth-smoke`); host tests cover the CDC descriptor parse + frame framing. — **host-logic landed**: `kernel_core::usb::cdc::{find_ethernet_functional_desc, has_ncm_functional_desc}` + 23 host tests cover the CDC functional-descriptor parse (the live `usb-net` bind is bare-metal/VFIO-only, pending).
 
 ### G.2 — CDC-NCM (framed/aggregated NTB)
 
@@ -423,7 +427,7 @@
 **Why it matters:** CDC-NCM aggregates multiple Ethernet frames into one bulk transfer (NTB) for higher throughput than ECM's one-frame-per-transfer. G.2 adds NTB parse/build on the same bulk path.
 
 **Acceptance:**
-- [ ] NTB encode/decode (NTH16 + NDP16) is host-tested against a known NTB carrying ≥2 datagrams.
+- [x] NTB encode/decode (NTH16 + NDP16) is host-tested against a known NTB carrying ≥2 datagrams. — `kernel_core::usb::cdc::{build_ntb16, parse_ntb16}` round-trip (`ntb16_round_trip_two_datagrams`) + malformed-NTB rejection tests.
 - [ ] A CDC-NCM dongle (bare-metal) brings up a `RemoteNic` and aggregates TX frames into NTBs; RX NTBs are split back into frames.
 
 ### G.3 — Shared USB-Ethernet device-match registry (adopt `ure`)

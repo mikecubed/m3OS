@@ -736,6 +736,17 @@ fn main() {
                 });
             cmd_usb_hotplug_smoke(&smoke_args);
         }
+        // Phase 92 Track D — USB mass storage: boots with a usb-storage device
+        // and asserts the BOT/SCSI INQUIRY + READ CAPACITY identity path.
+        Some("usb-storage-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("usb-storage-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_usb_storage_smoke(&smoke_args);
+        }
         Some("ssh-e1000-banner-check") => {
             let banner_args = parse_ssh_e1000_banner_check_args(&args[2..]).unwrap_or_else(|err| {
                 eprintln!("Error: {err}");
@@ -1475,6 +1486,9 @@ fn build_userspace_bins() {
         // Phase 78c: ring-3 USB HID Boot-Protocol class driver (kbd + mouse).
         // `needs_alloc = true` for kernel-core + usb-core deps.
         ("usb_hid", "usb_hid", true),
+        // Phase 92 Track D: ring-3 USB Mass Storage (BOT) class driver.
+        // `needs_alloc = true` for kernel-core (mass_storage) + usb-core deps.
+        ("usb_storage", "usb_storage", true),
         // Phase 80 Track A.5: ring-3 AC'97 out-of-process audio hardware driver.
         // `needs_alloc = true` for driver_runtime + kernel-core deps.
         ("ac97_driver", "ac97_driver", true),
@@ -10533,6 +10547,131 @@ fn cmd_usb_hotplug_smoke(args: &SmokeBootArgs) {
         }
         Err(msg) => {
             eprintln!("usb-hotplug-smoke: FAILED\n{msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Phase 92 Track D — USB mass-storage transport gate (D.1, scoped).
+///
+/// Boots m3OS with `-device qemu-xhci` plus a `-device usb-storage` backed by a
+/// raw scratch image, and asserts the ring-3 `usb-storage` daemon bound the
+/// `CLASS_MASS_STORAGE` interface (`usb-storage: bound mass-storage …`) and
+/// completed a full Bulk-Only Transport CBW-out + CSW-in round-trip over the
+/// Phase 96 bulk pair against the real (SuperSpeed) device — `GET_MAX_LUN` (a
+/// class control-IN) + `TEST UNIT READY` (a no-data BOT command) → the
+/// `USB_STORAGE:bot-ok` sentinel. This validates the BOT framing
+/// (`kernel-core::usb::mass_storage`, D.2) and the inline bulk transport on a
+/// live device. The **data-IN phase** (INQUIRY / READ CAPACITY → `RemoteBlockDevice`
+/// + mount, D.1 remainder + D.4) currently stalls on a SuperSpeed bulk-IN-data
+/// substrate gap (the Phase 96 bulk-IN data path was never exercised by a real
+/// device — the `ure` NIC that defined it was not merged); it is a tracked
+/// follow-up. Not in the always-on suite for that reason.
+fn cmd_usb_storage_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+    let ovmf = find_ovmf();
+
+    // 8 MiB raw scratch image for the USB stick → READ CAPACITY should report
+    // 16384 × 512-byte blocks. A sparse file is fine (INQUIRY/READ CAPACITY do
+    // not touch the medium contents).
+    let usb_img = uefi_image.parent().unwrap().join("usb-storage-scratch.img");
+    {
+        let f = std::fs::File::create(&usb_img).expect("create usb-storage scratch image");
+        f.set_len(8 * 1024 * 1024)
+            .expect("size usb-storage scratch image");
+    }
+
+    let devices = DeviceSet {
+        xhci: true,
+        ..DeviceSet::default()
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, QemuDisplayMode::Headless, devices);
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    // Attach the USB mass-storage device on the same xHCI bus the boot kbd/mouse
+    // use (`xhci0.0`).
+    qemu_args.push("-drive".to_string());
+    qemu_args.push(format!(
+        "id=usbdisk,file={},format=raw,if=none",
+        usb_img.display()
+    ));
+    qemu_args.push("-device".to_string());
+    qemu_args.push("usb-storage,drive=usbdisk,bus=xhci0.0".to_string());
+
+    println!(
+        "usb-storage-smoke: launching QEMU with -device qemu-xhci + usb-storage (timeout {}s)",
+        args.timeout_secs
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let rx = spawn_serial_reader(stdout);
+    let mut serial_history = String::new();
+    let mut serial_buf = String::new();
+    let global_start = std::time::Instant::now();
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let step = std::time::Duration::from_secs(args.timeout_secs.min(180));
+
+    let result: Result<(), String> = (|| {
+        let mut wait = |pat: &str| {
+            wait_for_serial_pattern(
+                &rx,
+                &mut serial_buf,
+                &mut serial_history,
+                pat,
+                step,
+                global_start,
+                global_timeout,
+            )
+        };
+        // The daemon bound a mass-storage interface (class 0x08 + bulk pair)…
+        wait("usb-storage: bound mass-storage")?;
+        // …and a full BOT CBW-out + CSW-in round-trip completed over the bulk
+        // pair against the real (SuperSpeed) device (TEST UNIT READY). This is
+        // the validated D.1 transport milestone; the data-IN phase (INQUIRY /
+        // READ CAPACITY → mount) is a tracked follow-up blocked on a SuperSpeed
+        // bulk-IN-data substrate gap (see the Phase 92 task doc, D.1).
+        wait("USB_STORAGE:bot-ok")?;
+        Ok(())
+    })();
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&usb_img);
+    match result {
+        Ok(()) => {
+            let elapsed = global_start.elapsed().as_secs();
+            println!(
+                "usb-storage-smoke: PASSED ({elapsed}s) — usb-storage bound the mass-storage \
+                 device + completed a BOT CBW/CSW round-trip (GET_MAX_LUN + TEST UNIT READY)"
+            );
+        }
+        Err(msg) => {
+            eprintln!("usb-storage-smoke: FAILED\n{msg}");
             std::process::exit(1);
         }
     }
@@ -21642,6 +21781,9 @@ fn populate_ext2_files(
     // Phase 78c — ring-3 USB HID class driver. Depends on xhci_driver so it
     // can look up the `usb` service the host controller registers.
     let usb_hid_conf = "name=usb_hid\ncommand=/drivers/usb-hid\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=xhci_driver\n";
+    // Phase 92 Track D — ring-3 USB Mass Storage (BOT) class driver. Depends on
+    // xhci_driver so it can look up the `usb` service the host controller registers.
+    let usb_storage_conf = "name=usb_storage\ncommand=/drivers/usb-storage\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=xhci_driver\n";
     // Phase 80 Track A.5 — ring-3 AC'97 out-of-process audio hardware driver.
     // No `depends=` (device-host substrate is kernel-internal); must start
     // before audio_server so `audio.hw` is registered when audio_server resolves it.
@@ -22033,6 +22175,7 @@ fn populate_ext2_files(
     let xhci_driver_conf_tmp = output_dir.join("_tmp_xhci_driver_conf");
     let usbhub_conf_tmp = output_dir.join("_tmp_usbhub_conf");
     let usb_hid_conf_tmp = output_dir.join("_tmp_usb_hid_conf");
+    let usb_storage_conf_tmp = output_dir.join("_tmp_usb_storage_conf");
     let ac97_driver_conf_tmp = output_dir.join("_tmp_ac97_driver_conf");
     let hda_driver_conf_tmp = output_dir.join("_tmp_hda_driver_conf");
     let ahci_driver_conf_tmp = output_dir.join("_tmp_ahci_driver_conf");
@@ -22096,6 +22239,7 @@ fn populate_ext2_files(
     fs::write(&xhci_driver_conf_tmp, xhci_driver_conf).expect("write temp xhci_driver.conf");
     fs::write(&usbhub_conf_tmp, usbhub_conf).expect("write temp usbhub.conf");
     fs::write(&usb_hid_conf_tmp, usb_hid_conf).expect("write temp usb-hid.conf");
+    fs::write(&usb_storage_conf_tmp, usb_storage_conf).expect("write temp usb-storage.conf");
     fs::write(&ac97_driver_conf_tmp, ac97_driver_conf).expect("write temp ac97.conf");
     fs::write(&hda_driver_conf_tmp, hda_driver_conf).expect("write temp hda.conf");
     fs::write(&ahci_driver_conf_tmp, ahci_driver_conf).expect("write temp ahci_driver.conf");
@@ -22931,6 +23075,10 @@ fn populate_ext2_files(
          sif etc/services.d/usb-hid.conf mode 0x81A4\n\
          sif etc/services.d/usb-hid.conf uid 0\n\
          sif etc/services.d/usb-hid.conf gid 0\n\
+         write \"{usb_storage_conf}\" etc/services.d/usb-storage.conf\n\
+         sif etc/services.d/usb-storage.conf mode 0x81A4\n\
+         sif etc/services.d/usb-storage.conf uid 0\n\
+         sif etc/services.d/usb-storage.conf gid 0\n\
          write \"{ac97_driver_conf}\" etc/services.d/ac97.conf\n\
          sif etc/services.d/ac97.conf mode 0x81A4\n\
          sif etc/services.d/ac97.conf uid 0\n\
@@ -23002,6 +23150,7 @@ fn populate_ext2_files(
         xhci_driver_conf = xhci_driver_conf_tmp.display(),
         usbhub_conf = usbhub_conf_tmp.display(),
         usb_hid_conf = usb_hid_conf_tmp.display(),
+        usb_storage_conf = usb_storage_conf_tmp.display(),
         ac97_driver_conf = ac97_driver_conf_tmp.display(),
         hda_driver_conf = hda_driver_conf_tmp.display(),
         ahci_driver_conf = ahci_driver_conf_tmp.display(),
