@@ -1,6 +1,6 @@
 # Phase 92 — USB Class Expansion: Task List
 
-**Status:** Planned
+**Status:** In Progress
 **Source Ref:** phase-92
 **Depends on:** Phase 78a (xHCI Host Bring-Up) ✅, Phase 78b (USB Enumeration + Hub) ✅, Phase 78c (HID Boot Protocol + `usb` IPC service) ✅, Phase 74 (IPC Capability Grants — page-grant transport) ✅, Phase 77 (ring-3 `RemoteBlockDevice` hosting) ✅, Phase 79 (`RemoteNic` facade) ✅, Phase 96 (Bare-Metal USB-Ethernet — USB bulk-endpoint transport + multi-controller handle codec) ✅
 **Goal:** Deliver every USB class feature deferred from Phase 78c — multi-tier hub enumeration, live HID Report Protocol, USB hot-plug, USB mass storage (BOT + UAS), isochronous USB audio/video, a generic CDC-ECM/NCM USB-Ethernet class driver, and per-controller concurrency — building on the Phase 96 bulk-endpoint substrate (`PollBulkIn`/`SubmitBulkOut`/`BulkData`/`ControlWrite`, `USB_MSG_MAX`=4096, the `handle.rs` multi-controller codec) rather than re-implementing transport. Closes with the kernel version bump (`0.91.0` → `0.92.0`) and the Phase 92 learning doc (`docs/92-usb-class-expansion.md`).
