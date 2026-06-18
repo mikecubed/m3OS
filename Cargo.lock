@@ -2416,6 +2416,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "usb-mount-smoke"
+version = "0.1.0"
+dependencies = [
+ "syscall-lib",
+]
+
+[[package]]
 name = "usb_hid"
 version = "0.78.2"
 dependencies = [

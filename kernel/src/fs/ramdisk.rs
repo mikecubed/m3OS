@@ -353,6 +353,11 @@ static WX_VIOLATION_ELF: &[u8] = generated_initrd_asset!("wx-violation");
 // no `.conf`.
 static PKU_SMOKE_ELF: &[u8] = generated_initrd_asset!("pku-smoke");
 
+// Phase 92a D.4 / I.1 — `usb-mount-smoke`: mount /dev/usb0 at /mnt/usb0, then
+// ls + read + overwrite-readback over the secondary-mount routing + the ring-3
+// usb-storage block backend. Not a daemon: no `.conf`.
+static USB_MOUNT_SMOKE_ELF: &[u8] = generated_initrd_asset!("usb-mount-smoke");
+
 // Track D (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md) —
 // `kstack-overflow-test`: a child overflows its kernel stack via the
 // feature-gated SYS_KSTACK_OVERFLOW_TEST and the parent asserts the kernel
@@ -700,6 +705,13 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "pku-smoke",
         RamdiskNode::File {
             content: PKU_SMOKE_ELF,
+        },
+    ),
+    // Phase 92a D.4 / I.1: usb-mount-smoke — USB mass-storage mount gate.
+    (
+        "usb-mount-smoke",
+        RamdiskNode::File {
+            content: USB_MOUNT_SMOKE_ELF,
         },
     ),
     // Track D: kstack-overflow-test — kernel-stack-overflow controlled-kill

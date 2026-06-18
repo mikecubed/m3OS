@@ -752,6 +752,18 @@ fn main() {
                 });
             cmd_usb_storage_smoke(&smoke_args);
         }
+        // Phase 92a D.4 / I.1 — USB mass-storage mount: boots with a usb-storage
+        // device, mounts /dev/usb0 at /mnt/usb0, and asserts ls + read +
+        // overwrite-readback through the secondary-mount routing.
+        Some("usb-mount-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("usb-mount-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_usb_mount_smoke(&smoke_args);
+        }
         // Phase 92 Track A — USB hub: boots with a usb-hub (a usb-kbd behind it)
         // and asserts the usbhub daemon enumerated the hub + powered/reset ports.
         Some("usb-hub-smoke") => {
@@ -1340,7 +1352,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -1635,6 +1647,9 @@ fn build_userspace_bins() {
         // W^X v2 accept/reject matrix. Pure syscall + fork + write — no
         // allocator.
         ("pku-smoke", "pku-smoke", false),
+        // Phase 92a D.4 / I.1 — USB mass-storage mount end-to-end gate. Pure
+        // syscall (mount/getdents/open/read/write) — no allocator.
+        ("usb-mount-smoke", "usb-mount-smoke", false),
         // Track D (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md)
         // — `kstack-overflow-test`: a child overflows its kernel stack via the
         // feature-gated `SYS_KSTACK_OVERFLOW_TEST` and the parent asserts the
@@ -10591,6 +10606,204 @@ fn cmd_usb_hotplug_smoke(args: &SmokeBootArgs) {
 /// + capacity read round-tripped (the 8 MiB scratch image → 16384 × 512-byte
 /// blocks). The `RemoteBlockDevice` facade + `/mnt/usb<n>` mount (D.4) build on
 /// this.
+/// Seed content the host writes into `hello.txt` of the bare-ext2 USB image —
+/// MUST match `SEED_CONTENT` in `userspace/usb-mount-smoke/src/main.rs`.
+const USB_MOUNT_SEED_CONTENT: &[u8] = b"m3os-usb-mount-ok\n";
+
+/// Build a bare (partition-table-free) ext2 image with a seeded `hello.txt`,
+/// for the USB mass-storage mount gate. `Ext2Volume::mount_dev(base_lba=0, ..)`
+/// reads the superblock at LBA 2, so a bare ext2 (no MBR) is correct.
+fn create_usb_mount_ext2_image(path: &Path) {
+    {
+        let f = std::fs::File::create(path).expect("create usb-mount ext2 image");
+        // 16 MiB → comfortable for 4K-block ext2 (READ CAPACITY reports 32768 ×
+        // 512). Bare ext2 starts at byte 0; superblock at byte 1024 = LBA 2.
+        f.set_len(16 * 1024 * 1024)
+            .expect("size usb-mount ext2 image");
+    }
+    // Format with the same mkfs.ext2 argument fallback the data partition uses
+    // (rev 0, minimal features — what the in-kernel parser expects).
+    format_ext2_partition(path);
+
+    // Seed `hello.txt` via debugfs (bare image → no `?offset=`).
+    let tmp = path.parent().unwrap().join("usb-mount-hello-seed.txt");
+    std::fs::write(&tmp, USB_MOUNT_SEED_CONTENT).expect("write usb-mount seed temp");
+    let cmds = format!("write {} hello.txt\n", tmp.display());
+    let spawn = Command::new("debugfs")
+        .arg("-w")
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+    let result = (|| -> Result<(), String> {
+        let mut child = spawn.map_err(|e| format!("spawn debugfs (e2fsprogs?): {e}"))?;
+        child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "debugfs stdin".to_string())?
+            .write_all(cmds.as_bytes())
+            .map_err(|e| format!("write debugfs cmds: {e}"))?;
+        let out = child
+            .wait_with_output()
+            .map_err(|e| format!("debugfs wait: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "debugfs exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = result {
+        eprintln!("usb-mount-smoke: failed to seed hello.txt into the ext2 image: {e}");
+        std::process::exit(1);
+    }
+}
+
+/// Steps for `usb-mount-smoke`: boot + login, then run the `usb-mount-smoke`
+/// binary which mounts `/dev/usb0` at `/mnt/usb0` and exercises ls + read +
+/// overwrite-readback over the secondary-mount routing + the ring-3 usb-storage
+/// block backend.
+fn usb_mount_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/usb-mount-smoke: kernel first message",
+    }];
+    // The usb-storage daemon binds the mass-storage device and registers its
+    // usb0.block backend before we mount.
+    steps.push(SmokeStep::Wait {
+        pattern: "usb-storage: registered usb0.block",
+        timeout_secs: 120,
+        label: "guest/usb-mount-smoke: usb-storage registered usb0.block backend",
+    });
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "usb-mount-smoke\n",
+        label: "guest/usb-mount-smoke: run usb-mount-smoke binary",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "USB_MASS_STORAGE:mounted",
+        timeout_secs: 60,
+        label: "guest/usb-mount-smoke: /mnt/usb0 mounted",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "USB_MOUNT:ls-ok",
+        timeout_secs: 30,
+        label: "guest/usb-mount-smoke: ls /mnt/usb0 lists seeded file",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "USB_MOUNT:read-ok",
+        timeout_secs: 30,
+        label: "guest/usb-mount-smoke: read /mnt/usb0/hello.txt matches seed",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "USB_MOUNT:rw-ok",
+        fail_prefixes: &[":FAIL", "USB_MOUNT:panic"],
+        timeout_secs: 60,
+        label: "guest/usb-mount-smoke: overwrite + read-back byte-identical",
+        exit_code_on_fail: 1,
+    });
+    steps
+}
+
+/// Phase 92a D.4 / I.1 — boots m3OS with a `usb-storage` device on the xHCI bus,
+/// then runs the `usb-mount-smoke` binary which mounts `/dev/usb0` at
+/// `/mnt/usb0` (a bare ext2 image) and verifies ls + read + overwrite-readback
+/// through the secondary-mount routing + the ring-3 usb-storage block backend.
+fn cmd_usb_mount_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+    let ovmf = find_ovmf();
+
+    let usb_img = uefi_image.parent().unwrap().join("usb-mount-ext2.img");
+    create_usb_mount_ext2_image(&usb_img);
+
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args = qemu_args_with_devices(
+        &uefi_image,
+        &ovmf,
+        display_mode,
+        DeviceSet {
+            xhci: true,
+            ..DeviceSet::default()
+        },
+    );
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    // Attach the USB mass-storage device on the xHCI bus (direct-attach, like
+    // usb-storage-smoke). Tier-2-behind-hub enumeration is exercised by
+    // usb-hub-smoke; this gate isolates the mount + block-backend path.
+    qemu_args.push("-drive".to_string());
+    qemu_args.push(format!(
+        "id=usbdisk,file={},format=raw,if=none",
+        usb_img.display()
+    ));
+    qemu_args.push("-device".to_string());
+    qemu_args.push("usb-storage,drive=usbdisk,bus=xhci0.0".to_string());
+
+    let steps = usb_mount_smoke_steps();
+
+    println!(
+        "usb-mount-smoke: launching QEMU with -device qemu-xhci + usb-storage (timeout {}s)",
+        args.timeout_secs
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("usb-mount-smoke: failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+    let result = run_smoke_script(&mut child, &steps, global_timeout);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&usb_img);
+    match result {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!(
+                "usb-mount-smoke: PASS ({} steps in {elapsed}s) — /dev/usb0 mounted at \
+                 /mnt/usb0, ls + read + overwrite-readback verified over the secondary-mount \
+                 routing and the ring-3 usb-storage block backend",
+                steps.len()
+            );
+        }
+        Err(msg) => {
+            eprintln!("usb-mount-smoke: FAILED\n{msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn cmd_usb_storage_smoke(args: &SmokeBootArgs) {
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);

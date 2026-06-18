@@ -175,6 +175,10 @@ members = [
     # asymmetry, signal-frame preservation, and the W^X v2 accept/reject
     # matrix. Raw syscalls + RDPKRU/WRPKRU; no allocator.
     "userspace/pku-smoke",
+    # Phase 92a D.4 / I.1 — USB mass-storage mount end-to-end gate: mount
+    # /dev/usb0 at /mnt/usb0, ls + read + overwrite-readback over the
+    # secondary-mount routing + the ring-3 usb-storage block backend.
+    "userspace/usb-mount-smoke",
     # Track D (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md)
     # — kernel-stack-overflow controlled-kill recovery regression. A child
     # overflows its kstack via the feature-gated SYS_KSTACK_OVERFLOW_TEST and the
