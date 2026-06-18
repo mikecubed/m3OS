@@ -10620,15 +10620,15 @@ fn create_usb_mount_ext2_image(path: &Path) {
         f.set_len(16 * 1024 * 1024)
             .expect("size usb-mount ext2 image");
     }
-    // Format with **1024-byte blocks** (rev 0, minimal features). A 1024-byte
-    // ext2 block is exactly 2 × 512 sectors, so every block read/write the
-    // kernel issues is a single ≤7-sector BOT transfer through the inline
-    // SubmitBulkIn/SubmitBulkOut path — within the USB_MSG_MAX budget. (A larger
-    // block size's 8-sector I/O needs the multi-sector / page-grant overflow
-    // path — D.5 — which the inline transport cannot carry in one reply.)
+    // Format with **4096-byte blocks** (rev 0, minimal features) — the common
+    // real-world ext2 block size. A 4096-byte block is 8 × 512 sectors, which
+    // the daemon splits into a 7-sector + 1-sector pair of inline BOT transfers
+    // (each ≤ 3584 B, within USB_MSG_MAX). The multi-sector (3584 B) bulk-OUT
+    // path is exercised here — it requires the `submit_bulk_out` SHORT_PACKET
+    // completion fix.
     let mkfs_variants: [&[&str]; 2] = [
-        &["-F", "-q", "-b", "1024", "-O", "^resize_inode", "-r", "0"],
-        &["-F", "-q", "-b", "1024"],
+        &["-F", "-q", "-b", "4096", "-O", "^resize_inode", "-r", "0"],
+        &["-F", "-q", "-b", "4096"],
     ];
     let mut mkfs_ok = false;
     for v in mkfs_variants {

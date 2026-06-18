@@ -372,7 +372,14 @@ pub fn run(ep: u32, discovered: u8, mut controllers: Vec<ControllerCtx>) -> ! {
 
     let mut backend = SyscallBackend::new();
     loop {
-        match backend.recv(ep_cap) {
+        // Receive with a USB_MSG_MAX-sized bulk buffer, NOT the default
+        // `recv`'s MAX_BULK_RECV (1522 B, the Ethernet MTU). A `SubmitBulkOut`
+        // request carrying a multi-sector BOT WRITE(10) data-OUT (up to ~4089 B
+        // of payload + 7 B header) would otherwise be truncated to 1522 B — the
+        // server would then program a short bulk-OUT TRB while the CBW told the
+        // device to expect the full length, so the device waits forever and the
+        // transfer times out. This is what wedged the >1522-byte write path.
+        match backend.recv_with_capacity(ep_cap, USB_MSG_MAX) {
             Ok(RecvResult::Notification(bits)) => {
                 for (c, _irq, _d) in controllers.iter_mut() {
                     c.service_interrupt_events();

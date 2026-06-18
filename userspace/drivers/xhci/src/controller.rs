@@ -1743,11 +1743,30 @@ impl Controller {
         }
         self.ring_doorbell(slot_id, dci);
         match self.wait_for_bulk_out_event(irq, slot_id, dci) {
-            Some(ev) if ev.completion_code == trb::COMPLETION_SUCCESS => {
+            // Accept SHORT_PACKET as well as SUCCESS, mirroring `submit_bulk_in`.
+            // The xHC reports a multi-packet bulk-OUT TD whose last packet is
+            // short — or whose data buffer was consumed exactly — with a Short
+            // Packet completion (cc=13) and a residual, NOT a hard error. The
+            // earlier SUCCESS-only filter rejected a perfectly good multi-sector
+            // BOT WRITE(10) data-OUT (e.g. 7 × 512 = 3584 B), wedging the write
+            // path; the transferred count is `len - residual` either way.
+            Some(ev)
+                if ev.completion_code == trb::COMPLETION_SUCCESS
+                    || ev.completion_code == COMPLETION_SHORT_PACKET =>
+            {
                 let residual = ev.residual_transfer_length.min(len) as usize;
                 Some((len as usize).saturating_sub(residual))
             }
-            _ => None,
+            Some(ev) => {
+                // A genuine transport failure (STALL, Babble, transaction error,
+                // data-buffer error) — surface the completion code so it is
+                // diagnosable rather than an opaque `None`.
+                write_str(STDOUT_FILENO, "[xhci] bulk-OUT non-success cc=");
+                crate::write_u8_dec(ev.completion_code);
+                write_str(STDOUT_FILENO, "\n");
+                None
+            }
+            None => None,
         }
     }
 
