@@ -34,7 +34,7 @@ use syscall_lib::STDOUT_FILENO;
 use syscall_lib::write_str;
 use usb_core::protocol::{AttachNotice, USB_REPLY_LABEL, UsbReply, UsbRequest};
 
-use crate::controller::Controller;
+use crate::controller::{Controller, PortChange};
 use crate::handle::{pack_handle, unpack_handle};
 
 /// Emitted once the server has registered the `usb` service and bound its IRQ
@@ -45,6 +45,14 @@ use crate::handle::{pack_handle, unpack_handle};
 /// keys, but it is a server-readiness marker, not a HID-setup ordering
 /// guarantee.
 pub const USB_SERVER_READY_SENTINEL: &str = "XHCI_USB:server-ready\n";
+
+/// Emitted when a hot-plugged device is enumerated and published as a new
+/// `AttachNotice` at runtime (Phase 92 Track C). The `usb-hotplug-smoke` gate
+/// waits on this after a QMP `device_add`.
+pub const USB_HOTPLUG_ATTACHED_SENTINEL: &str = "USB_HOTPLUG:attached\n";
+/// Emitted when a device disconnect is observed, its `AttachNotice` flipped to
+/// `attached: false`, and its slot reclaimed via Disable Slot (Phase 92 C.2/C.4).
+pub const USB_HOTPLUG_DETACHED_SENTINEL: &str = "USB_HOTPLUG:detached\n";
 
 // errno-style codes carried by `UsbReply::Error`.
 const EINVAL: u16 = 22;
@@ -155,6 +163,91 @@ pub fn device_info_from_ctx(ctx: &EnumContext) -> Option<AttachNotice> {
 /// owns. The server multiplexes the request loop across a `Vec` of these.
 pub type ControllerCtx = (Controller, IrqNotification, Vec<AttachNotice>);
 
+/// Run the Enable Slot → Address Device → Configure Endpoint sequence for a
+/// freshly connected root-hub `port` (already reset to Enabled at `speed` by
+/// the live event path) and return its `AttachNotice` if it surfaced an
+/// interface. Reuses the *stateless* `run_enumeration` state machine the
+/// bring-up path uses — no global controller re-init (Phase 92 C.3).
+fn enumerate_port(
+    controller: &mut Controller,
+    irq: &IrqNotification,
+    port: u8,
+    speed: kernel_core::usb::xhci::port::PortSpeed,
+) -> Option<AttachNotice> {
+    use kernel_core::usb::enumerate::{EnumContext, EnumState, run_enumeration};
+    let ctx = EnumContext {
+        speed: Some(speed),
+        port,
+        ep0_ring_iova: 0,
+        ..Default::default()
+    };
+    let mut ops = crate::enumerate::XhciHostOps::new(controller, irq);
+    match run_enumeration(EnumState::EnableSlot, ctx, &mut ops) {
+        (EnumState::Configured, final_ctx) => device_info_from_ctx(&final_ctx),
+        _ => None,
+    }
+}
+
+/// Drain each controller's queued root-hub port changes (Phase 92 Track C) and
+/// act on them: enumerate + publish a newly-connected device, or mark a
+/// departing device `attached: false` and reclaim its slot via Disable Slot.
+/// Called on every server loop wake after the event rings are drained. The
+/// `served` table is append-only so the `NextAttach` cursor stays stable — a
+/// detach flips the existing entry's `attached` flag in place; a re-attach
+/// pushes a fresh entry.
+fn process_port_events(controllers: &mut [ControllerCtx], served: &mut Vec<AttachNotice>) {
+    for (ctrl_idx, (c, irq, _devs)) in controllers.iter_mut().enumerate() {
+        for ev in c.take_port_events() {
+            match ev {
+                PortChange::Connect { port, speed } => {
+                    // Skip a port already served (bring-up enumerated the boot
+                    // devices; a re-reported connect must not double-enumerate).
+                    let already = served.iter().any(|n| {
+                        n.attached && n.port == port && unpack_handle(n.slot_id).0 == ctrl_idx
+                    });
+                    if already {
+                        continue;
+                    }
+                    if let Some(mut notice) = enumerate_port(c, irq, port, speed) {
+                        match pack_handle(ctrl_idx, notice.slot_id) {
+                            Some(handle) => {
+                                notice.slot_id = handle;
+                                write_str(STDOUT_FILENO, "[xhci] hot-plug attach port ");
+                                crate::write_u8_dec(port);
+                                write_str(STDOUT_FILENO, " class=");
+                                crate::write_u8_dec(notice.interface_class);
+                                write_str(STDOUT_FILENO, "\n");
+                                served.push(notice);
+                                write_str(STDOUT_FILENO, USB_HOTPLUG_ATTACHED_SENTINEL);
+                            }
+                            None => {
+                                write_str(
+                                    STDOUT_FILENO,
+                                    "xhci_driver: hot-plug device dropped — unpackable handle\n",
+                                );
+                            }
+                        }
+                    }
+                }
+                PortChange::Disconnect { port } => {
+                    if let Some(pos) = served.iter().position(|n| {
+                        n.attached && n.port == port && unpack_handle(n.slot_id).0 == ctrl_idx
+                    }) {
+                        let real_slot = unpack_handle(served[pos].slot_id).1;
+                        served[pos].attached = false;
+                        // Reclaim the slot so a re-attach gets a fresh slot id (H.3).
+                        c.disable_slot(irq, real_slot);
+                        write_str(STDOUT_FILENO, "[xhci] hot-plug detach port ");
+                        crate::write_u8_dec(port);
+                        write_str(STDOUT_FILENO, "\n");
+                        write_str(STDOUT_FILENO, USB_HOTPLUG_DETACHED_SENTINEL);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Run the xHCI USB IPC server across every brought-up controller. Never returns.
 ///
 /// `ep` is the command endpoint, already registered under [`USB_SERVICE_NAME`]
@@ -222,6 +315,9 @@ pub fn run(ep: u32, discovered: u8, mut controllers: Vec<ControllerCtx>) -> ! {
                 for (c, _irq, _d) in controllers.iter_mut() {
                     c.service_interrupt_events();
                 }
+                // A bound-IRQ wake is how a hot-plug Port Status Change arrives;
+                // act on any queued connect/disconnect (Phase 92 Track C).
+                process_port_events(&mut controllers, &mut served);
                 if let Some((_c, irq, _d)) = controllers.first() {
                     let _ = irq.ack(bits);
                 }
@@ -233,6 +329,9 @@ pub fn run(ep: u32, discovered: u8, mut controllers: Vec<ControllerCtx>) -> ! {
                 for (c, _irq, _d) in controllers.iter_mut() {
                     c.service_interrupt_events();
                 }
+                // Also service any hot-plug events surfaced by the drain (a
+                // class driver's poll wakes the loop between IRQs).
+                process_port_events(&mut controllers, &mut served);
                 let reply = handle_request(&mut controllers, discovered, &served, &frame.bulk);
                 let bytes = reply.encode();
                 // Fail closed: if staging the reply bulk fails, reply with the

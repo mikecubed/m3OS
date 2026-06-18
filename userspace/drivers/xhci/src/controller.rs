@@ -274,6 +274,23 @@ pub struct SlotContext {
     pub config_desc: alloc::vec::Vec<u8>,
 }
 
+/// A root-hub port change the live event path observed and queued for the
+/// server loop to act on (Phase 92 Track C hot-plug). `on_port_status_change`
+/// records these as Port Status Change events arrive; `take_port_events` drains
+/// them so the single-threaded server can run enumeration / teardown outside the
+/// event-ring drain borrow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortChange {
+    /// A device newly connected on `port` and the port reached Enabled at
+    /// `speed` (the live path already issued the reset). The server runs
+    /// Enable Slot → Address Device → Configure Endpoint and publishes an
+    /// `AttachNotice`.
+    Connect { port: u8, speed: port::PortSpeed },
+    /// The device on `port` disconnected. The server marks its `AttachNotice`
+    /// `attached: false` and issues Disable Slot to reclaim the slot.
+    Disconnect { port: u8 },
+}
+
 pub struct Controller {
     handle: DeviceHandle,
     bar: Mmio<XhciBar0>,
@@ -312,6 +329,10 @@ pub struct Controller {
     /// `service_interrupt_events`) so a halted endpoint logs a few times rather
     /// than flooding the serial/framebuffer console.
     xfer_err_logged: u32,
+
+    /// Root-hub port changes observed by `on_port_status_change` and awaiting
+    /// the server's attention (Phase 92 Track C). Drained by `take_port_events`.
+    port_events: alloc::vec::Vec<PortChange>,
 }
 
 /// xHCI completion code for a short-packet transfer (xHCI §6.4.5) — a normal,
@@ -354,6 +375,7 @@ impl Controller {
             enable_slot_emitted: false,
             slots: alloc::vec::Vec::new(),
             xfer_err_logged: 0,
+            port_events: alloc::vec::Vec::new(),
         }
     }
 
@@ -1888,9 +1910,16 @@ impl Controller {
         }
     }
 
-    /// Port Status Change handler stub — A.7 reset/speed detection is wired
-    /// here; the enumeration consumer is Phase 78b.
-    fn on_port_status_change(&self, ev: trb::PortStatusChangeEvent) {
+    /// Port Status Change handler. A.7 reset/speed detection runs here; Phase 92
+    /// Track C adds the live hot-plug surface: a connect resets the port and
+    /// **queues** a `PortChange::Connect` (with the decoded speed) for the
+    /// server to enumerate; a disconnect queues `PortChange::Disconnect` for the
+    /// server to mark detached + Disable Slot. Queuing (rather than enumerating
+    /// inline) keeps the heavy work out of the event-ring drain borrow — the
+    /// single-threaded server drains the queue via `take_port_events` on each
+    /// loop wake. Called from every event-ring drain, so it runs during bring-up
+    /// too; the server guards against re-enumerating a port it already serves.
+    fn on_port_status_change(&mut self, ev: trb::PortStatusChangeEvent) {
         let portnum = ev.port_id;
         if portnum == 0 || portnum as u16 > self.max_ports as u16 {
             return;
@@ -1899,14 +1928,31 @@ impl Controller {
         let raw = self.op_u32(off);
         let p = port::Portsc(raw);
         // Acknowledge the connect-status change (RW1C) so the edge is not
-        // re-reported, then, on a real connect, drive the A.7 reset path.
+        // re-reported, then classify connect vs disconnect.
         if p.csc() {
             let cleared = port::portsc_clear_change(raw, port::PORTSC_CSC);
             self.op_write_u32(off, cleared);
             if p.ccs() {
-                self.reset_port(portnum);
+                // A real connect: drive the A.7 reset path (decoding speed) and
+                // queue the connect for the server's enumeration (Track C.1/C.3).
+                if let Some(speed) = self.reset_port_with_speed(portnum) {
+                    self.port_events.push(PortChange::Connect {
+                        port: portnum,
+                        speed,
+                    });
+                }
+            } else {
+                // A disconnect: queue it for the server to tear down (Track C.2/C.4).
+                self.port_events
+                    .push(PortChange::Disconnect { port: portnum });
             }
         }
+    }
+
+    /// Drain the queued root-hub port changes for the server to act on
+    /// (Phase 92 Track C). Returns and clears the pending list.
+    pub fn take_port_events(&mut self) -> alloc::vec::Vec<PortChange> {
+        core::mem::take(&mut self.port_events)
     }
 
     /// Scan every root-hub port and reset any that already report a connected
