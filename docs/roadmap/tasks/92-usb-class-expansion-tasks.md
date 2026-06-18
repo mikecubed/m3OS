@@ -122,9 +122,9 @@
 **Why it matters:** the hub state machine needs to read the 4-byte port status to detect connection (CCS), confirm enable (PE), and clear change bits (RW1C). The encoder and bit helpers are the only hub primitives `kernel-core` does not yet have; they belong next to `set_port_feature`/`clear_port_feature` and must be host-tested like the rest.
 
 **Acceptance:**
-- [ ] `get_port_status` encodes the class GET_STATUS SetupPacket; host test asserts the exact 8 bytes.
-- [ ] Bitmap helpers decode CCS/PE/RESET (bytes 0–1) and C_CONNECTION/C_RESET (bytes 2–3) per USB 2.0 §11.24.2.7; host-tested against known status words.
-- [ ] The hub state machine polls `GET_PORT_STATUS` after `PORT_RESET` until `C_PORT_RESET` clears and `PORT_ENABLE` is set.
+- [x] `get_port_status` encodes the class GET_STATUS SetupPacket; host test asserts the exact 8 bytes. — `get_port_status(port)` (bmRequestType `0xA3`, bRequest `0x00`, wValue 0, wIndex=port, wLength=4); host tests `get_port_status_port{1,3}_encoding` assert the 8 bytes.
+- [x] Bitmap helpers decode CCS/PE/RESET (bytes 0–1) and C_CONNECTION/C_RESET (bytes 2–3) per USB 2.0 §11.24.2.7; host-tested against known status words. — `port_status_{connected,enabled,resetting}` + `port_change_{connection,reset}` with named bit consts; short-slice inputs return false (no panic). 36 hub tests pass.
+- [ ] The hub state machine polls `GET_PORT_STATUS` after `PORT_RESET` until `C_PORT_RESET` clears and `PORT_ENABLE` is set. — consumed by the live `usbhub` walker (A.1/A.2), pending.
 
 ### A.4 — Surface hubs + assign tier-2+ slots in the xHCI server
 
