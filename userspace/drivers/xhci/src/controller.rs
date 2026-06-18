@@ -1226,14 +1226,17 @@ impl Controller {
     }
 
     /// Return the cached `(device, config)` descriptor blobs for `slot_id`, or
-    /// `None` if the slot is unknown or its descriptors were never cached
-    /// (Phase 92 H.1 — serves `UsbRequest::GetDescriptors`).
+    /// `None` if the slot is unknown or *either* descriptor was never cached
+    /// (Phase 92 H.1 — serves `UsbRequest::GetDescriptors`). `GetDescriptors`
+    /// promises both the device **and** the full configuration blob, so an empty
+    /// `config_desc` is treated as "not cached" rather than handed to the client
+    /// as a valid-but-empty config.
     pub fn cached_descriptors(
         &self,
         slot_id: u8,
     ) -> Option<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>)> {
         let sc = self.slot(slot_id)?;
-        if sc.device_desc.is_empty() {
+        if sc.device_desc.is_empty() || sc.config_desc.is_empty() {
             return None;
         }
         Some((sc.device_desc.clone(), sc.config_desc.clone()))

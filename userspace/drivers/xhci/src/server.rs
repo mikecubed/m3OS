@@ -245,12 +245,22 @@ fn process_port_events(controllers: &mut [ControllerCtx], served: &mut Vec<Attac
                     }) {
                         let real_slot = unpack_handle(served[pos].slot_id).1;
                         served[pos].attached = false;
-                        // Reclaim the slot so a re-attach gets a fresh slot id (H.3).
-                        c.disable_slot(irq, real_slot);
                         write_str(STDOUT_FILENO, "[xhci] hot-plug detach port ");
                         crate::write_u8_dec(port);
                         write_str(STDOUT_FILENO, "\n");
-                        write_str(STDOUT_FILENO, USB_HOTPLUG_DETACHED_SENTINEL);
+                        // Reclaim the slot so a re-attach gets a fresh slot id (H.3).
+                        // The hot-plug gate reads USB_HOTPLUG:detached as "slot
+                        // reclaimed", so emit it only when Disable Slot actually
+                        // succeeds; otherwise log and skip the sentinel so the gate
+                        // fails instead of masking a slot-pool leak.
+                        if c.disable_slot(irq, real_slot) {
+                            write_str(STDOUT_FILENO, USB_HOTPLUG_DETACHED_SENTINEL);
+                        } else {
+                            write_str(
+                                STDOUT_FILENO,
+                                "[xhci] Disable Slot failed on detach — slot not reclaimed\n",
+                            );
+                        }
                     }
                 }
             }

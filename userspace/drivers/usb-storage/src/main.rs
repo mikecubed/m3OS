@@ -149,9 +149,16 @@ fn bot_command(
         Vec::new()
     };
 
-    // (3) CSW on bulk-IN — request exactly 13 bytes.
+    // (3) CSW on bulk-IN — request exactly 13 bytes. The CSW `dCSWTag` MUST echo
+    // this command's CBW `dCBWTag` (BOT §6.3); a mismatch means transport
+    // desynchronization, so reject it rather than attribute a stale CSW status to
+    // the wrong command.
     let csw_bytes = submit_bulk_in(usb_ep, slot_id, notice.bulk_in_dci, CSW_LEN as u16)?;
     let csw = Csw::parse(&csw_bytes)?;
+    if csw.tag != tag {
+        write_str(STDOUT_FILENO, "usb-storage: CSW tag mismatch\n");
+        return None;
+    }
     Some((data, csw.status))
 }
 
@@ -174,9 +181,15 @@ fn bot_command_write(usb_ep: u32, notice: &AttachNotice, cdb: &[u8], payload: &[
         write_str(STDOUT_FILENO, "usb-storage: WRITE data bulk-OUT failed\n");
         return None;
     }
-    // (3) CSW on bulk-IN.
+    // (3) CSW on bulk-IN. The `dCSWTag` MUST echo this command's `dCBWTag`
+    // (BOT §6.3); reject a mismatch so a stale CSW is not misattributed to this
+    // WRITE(10), masking a real transport error.
     let csw_bytes = submit_bulk_in(usb_ep, slot_id, notice.bulk_in_dci, CSW_LEN as u16)?;
     let csw = Csw::parse(&csw_bytes)?;
+    if csw.tag != tag {
+        write_str(STDOUT_FILENO, "usb-storage: WRITE CSW tag mismatch\n");
+        return None;
+    }
     Some(csw.status)
 }
 

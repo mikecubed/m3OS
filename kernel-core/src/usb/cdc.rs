@@ -255,6 +255,11 @@ pub struct NDP16 {
 
 /// Serialise an NTB-16 carrying the given datagrams into a `Vec<u8>`.
 ///
+/// Returns `None` if the resulting NTB would not fit the 16-bit NTB-16 framing —
+/// i.e. its total `wBlockLength` (and therefore any datagram index/length or
+/// `wNdpIndex`) would exceed [`u16::MAX`]. Without this guard the `usize → u16`
+/// casts below would silently wrap and emit a malformed NTB.
+///
 /// # Layout produced
 ///
 /// ```text
@@ -274,7 +279,7 @@ pub struct NDP16 {
 /// * `seq` — the `wSequence` value to embed in the NTH16 header.
 /// * `datagrams` — the Ethernet frames to aggregate. An empty slice produces
 ///   an NTB with a single NDP16 containing only the `(0,0)` terminator.
-pub fn build_ntb16(seq: u16, datagrams: &[&[u8]]) -> Vec<u8> {
+pub fn build_ntb16(seq: u16, datagrams: &[&[u8]]) -> Option<Vec<u8>> {
     // --- Compute layout offsets ----------------------------------------
     //
     // NTH16 occupies bytes 0..12.
@@ -299,6 +304,14 @@ pub fn build_ntb16(seq: u16, datagrams: &[&[u8]]) -> Vec<u8> {
 
     // Total NTB size.
     let block_length: usize = ndp_offset + ndp_total_len;
+
+    // NTB-16 encodes wBlockLength, wNdpIndex, every datagram (index, length)
+    // pair, and the NDP16 wLength as u16. `block_length` is the largest of these
+    // quantities, so once it fits in a u16 every `as u16` cast below is exact;
+    // otherwise the frame would silently wrap into a malformed NTB — refuse it.
+    if block_length > u16::MAX as usize {
+        return None;
+    }
 
     // --- Serialise ------------------------------------------------------
     let mut out = Vec::with_capacity(block_length);
@@ -332,7 +345,7 @@ pub fn build_ntb16(seq: u16, datagrams: &[&[u8]]) -> Vec<u8> {
     out.extend_from_slice(&0u16.to_le_bytes());
 
     debug_assert_eq!(out.len(), block_length, "NTB-16 output length mismatch");
-    out
+    Some(out)
 }
 
 /// Parse an NTB-16 and return the contained Ethernet datagrams.
@@ -626,7 +639,7 @@ mod tests {
 
     #[test]
     fn ntb16_round_trip_two_datagrams() {
-        let ntb = build_ntb16(7, &[DGRAM_A, DGRAM_B]);
+        let ntb = build_ntb16(7, &[DGRAM_A, DGRAM_B]).expect("test NTB fits u16");
         let result = parse_ntb16(&ntb).expect("parse_ntb16 must succeed on a well-formed NTB");
         assert_eq!(result.len(), 2, "must recover exactly 2 datagrams");
         assert_eq!(result[0], DGRAM_A, "first datagram must match DGRAM_A");
@@ -635,7 +648,7 @@ mod tests {
 
     #[test]
     fn ntb16_nth16_signature_present_in_built_bytes() {
-        let ntb = build_ntb16(7, &[DGRAM_A, DGRAM_B]);
+        let ntb = build_ntb16(7, &[DGRAM_A, DGRAM_B]).expect("test NTB fits u16");
         // NTH16 dwSignature at bytes 0..4.
         let sig = u32::from_le_bytes([ntb[0], ntb[1], ntb[2], ntb[3]]);
         assert_eq!(sig, NTH16_SIGNATURE, "NTH16 dwSignature must be 0x484D434E");
@@ -645,7 +658,7 @@ mod tests {
 
     #[test]
     fn ntb16_ndp16_signature_present_in_built_bytes() {
-        let ntb = build_ntb16(7, &[DGRAM_A, DGRAM_B]);
+        let ntb = build_ntb16(7, &[DGRAM_A, DGRAM_B]).expect("test NTB fits u16");
         // wNdpIndex at bytes 10..12.
         let ndp_offset = u16::from_le_bytes([ntb[10], ntb[11]]) as usize;
         let sig = u32::from_le_bytes([
@@ -664,7 +677,7 @@ mod tests {
 
     #[test]
     fn ntb16_sequence_number_encoded_correctly() {
-        let ntb = build_ntb16(42, &[DGRAM_A]);
+        let ntb = build_ntb16(42, &[DGRAM_A]).expect("test NTB fits u16");
         let wseq = u16::from_le_bytes([ntb[6], ntb[7]]);
         assert_eq!(
             wseq, 42,
@@ -674,7 +687,7 @@ mod tests {
 
     #[test]
     fn ntb16_block_length_matches_buffer_length() {
-        let ntb = build_ntb16(7, &[DGRAM_A, DGRAM_B]);
+        let ntb = build_ntb16(7, &[DGRAM_A, DGRAM_B]).expect("test NTB fits u16");
         let w_block_length = u16::from_le_bytes([ntb[8], ntb[9]]) as usize;
         assert_eq!(
             w_block_length,
@@ -685,7 +698,7 @@ mod tests {
 
     #[test]
     fn ntb16_header_length_is_twelve() {
-        let ntb = build_ntb16(0, &[DGRAM_A]);
+        let ntb = build_ntb16(0, &[DGRAM_A]).expect("test NTB fits u16");
         let w_header_length = u16::from_le_bytes([ntb[4], ntb[5]]);
         assert_eq!(w_header_length, 12, "wHeaderLength must be 12");
     }
@@ -693,7 +706,7 @@ mod tests {
     #[test]
     fn ntb16_round_trip_single_datagram() {
         let dgram: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
-        let ntb = build_ntb16(0, &[dgram]);
+        let ntb = build_ntb16(0, &[dgram]).expect("test NTB fits u16");
         let result = parse_ntb16(&ntb).expect("must parse");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], dgram);
@@ -701,9 +714,38 @@ mod tests {
 
     #[test]
     fn ntb16_round_trip_empty_datagram_list() {
-        let ntb = build_ntb16(0, &[]);
+        let ntb = build_ntb16(0, &[]).expect("test NTB fits u16");
         let result = parse_ntb16(&ntb).expect("empty NTB must parse without error");
         assert!(result.is_empty(), "no datagrams in an empty NTB");
+    }
+
+    #[test]
+    fn ntb16_oversized_block_returns_none() {
+        // A datagram large enough that the total wBlockLength would exceed
+        // u16::MAX must be refused, not silently truncated into a malformed NTB.
+        let big = alloc::vec![0u8; 70_000];
+        assert!(
+            build_ntb16(0, &[big.as_slice()]).is_none(),
+            "an NTB whose wBlockLength exceeds u16::MAX must yield None"
+        );
+    }
+
+    #[test]
+    fn ntb16_maximal_block_builds_and_round_trips() {
+        // The largest NTB that still fits 16-bit framing must build and parse:
+        // wBlockLength = 12 (NTH16) + payload + 8 (NDP16 hdr) + 4 (one pair)
+        //              + 4 (terminator) == u16::MAX.
+        let payload = u16::MAX as usize - 12 - 8 - 4 - 4;
+        let big = alloc::vec![0xABu8; payload];
+        let ntb = build_ntb16(0, &[big.as_slice()]).expect("a u16::MAX-sized NTB must build");
+        assert_eq!(
+            ntb.len(),
+            u16::MAX as usize,
+            "the maximal NTB must fill exactly wBlockLength"
+        );
+        let result = parse_ntb16(&ntb).expect("the maximal NTB must round-trip");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), payload);
     }
 
     // -----------------------------------------------------------------------
@@ -712,7 +754,7 @@ mod tests {
 
     #[test]
     fn parse_ntb16_bad_signature_returns_none() {
-        let mut ntb = build_ntb16(1, &[DGRAM_A]);
+        let mut ntb = build_ntb16(1, &[DGRAM_A]).expect("test NTB fits u16");
         // Corrupt the NTH16 signature.
         ntb[0] = 0xFF;
         assert!(
@@ -733,7 +775,7 @@ mod tests {
 
     #[test]
     fn parse_ntb16_ndp_out_of_range_returns_none() {
-        let mut ntb = build_ntb16(1, &[DGRAM_A]);
+        let mut ntb = build_ntb16(1, &[DGRAM_A]).expect("test NTB fits u16");
         // Set wNdpIndex to a value beyond the buffer.
         let bad_offset = (ntb.len() as u16 + 100).to_le_bytes();
         ntb[10] = bad_offset[0];
@@ -746,7 +788,7 @@ mod tests {
 
     #[test]
     fn parse_ntb16_bad_ndp_signature_returns_none() {
-        let mut ntb = build_ntb16(1, &[DGRAM_A]);
+        let mut ntb = build_ntb16(1, &[DGRAM_A]).expect("test NTB fits u16");
         // Locate and corrupt the NDP16 signature.
         let ndp_offset = u16::from_le_bytes([ntb[10], ntb[11]]) as usize;
         ntb[ndp_offset] = 0xFF;
@@ -758,7 +800,7 @@ mod tests {
 
     #[test]
     fn parse_ntb16_datagram_index_out_of_range_returns_none() {
-        let mut ntb = build_ntb16(1, &[DGRAM_A]);
+        let mut ntb = build_ntb16(1, &[DGRAM_A]).expect("test NTB fits u16");
         // Locate the first datagram pointer pair in the NDP16.
         // NDP16 starts at ntb[wNdpIndex]; pointer pairs start 8 bytes in.
         let ndp_offset = u16::from_le_bytes([ntb[10], ntb[11]]) as usize;
@@ -775,7 +817,7 @@ mod tests {
 
     #[test]
     fn parse_ntb16_datagram_length_overrun_returns_none() {
-        let mut ntb = build_ntb16(1, &[DGRAM_A]);
+        let mut ntb = build_ntb16(1, &[DGRAM_A]).expect("test NTB fits u16");
         // Locate the first datagram pointer pair in the NDP16.
         let ndp_offset = u16::from_le_bytes([ntb[10], ntb[11]]) as usize;
         let pair_offset = ndp_offset + 8;
