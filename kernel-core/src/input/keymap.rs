@@ -243,6 +243,15 @@ pub const KEY_PAUSE: Keycode = Keycode(0x00E0);
 /// Print Screen keycode (decoded from `E0 2A E0 37`; release: `E0 B7 E0 AA`).
 pub const KEY_PRINTSCREEN: Keycode = Keycode(0x00E1);
 
+/// Mute keycode (Linux `input-event-codes.h` KEY_MUTE = 113).
+pub const KEY_MUTE: Keycode = Keycode(0x00F0);
+/// Volume Down keycode (Linux `input-event-codes.h` KEY_VOLUMEDOWN = 114).
+pub const KEY_VOLUMEDOWN: Keycode = Keycode(0x00F1);
+/// Volume Up keycode (Linux `input-event-codes.h` KEY_VOLUMEUP = 115).
+pub const KEY_VOLUMEUP: Keycode = Keycode(0x00F2);
+/// Play/Pause keycode (Linux `input-event-codes.h` KEY_PLAYPAUSE = 164).
+pub const KEY_PLAYPAUSE: Keycode = Keycode(0x00F3);
+
 // ---- KeySym constants for non-printable keys -----------------------------
 
 const KEYSYM_PRIVATE_BASE: u32 = 0xE000;

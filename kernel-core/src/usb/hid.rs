@@ -44,11 +44,11 @@ use crate::input::keymap::{
     KEY_DOT, KEY_DOWN, KEY_E, KEY_END, KEY_ENTER, KEY_EQUALS, KEY_ESC, KEY_F, KEY_F1, KEY_F2,
     KEY_F3, KEY_F4, KEY_F5, KEY_F6, KEY_F7, KEY_F8, KEY_F9, KEY_F10, KEY_F11, KEY_F12, KEY_G,
     KEY_GRAVE, KEY_H, KEY_HOME, KEY_I, KEY_INSERT, KEY_J, KEY_K, KEY_L, KEY_LALT, KEY_LBRACKET,
-    KEY_LCTRL, KEY_LEFT, KEY_LSHIFT, KEY_LSUPER, KEY_M, KEY_MINUS, KEY_N, KEY_NUMLOCK, KEY_O,
-    KEY_P, KEY_PAGEDOWN, KEY_PAGEUP, KEY_PAUSE, KEY_PRINTSCREEN, KEY_Q, KEY_R, KEY_RALT,
-    KEY_RBRACKET, KEY_RCTRL, KEY_RIGHT, KEY_RSHIFT, KEY_RSUPER, KEY_S, KEY_SCROLLLOCK,
-    KEY_SEMICOLON, KEY_SLASH, KEY_SPACE, KEY_T, KEY_TAB, KEY_U, KEY_UP, KEY_V, KEY_W, KEY_X, KEY_Y,
-    KEY_Z,
+    KEY_LCTRL, KEY_LEFT, KEY_LSHIFT, KEY_LSUPER, KEY_M, KEY_MINUS, KEY_MUTE, KEY_N, KEY_NUMLOCK,
+    KEY_O, KEY_P, KEY_PAGEDOWN, KEY_PAGEUP, KEY_PAUSE, KEY_PLAYPAUSE, KEY_PRINTSCREEN, KEY_Q,
+    KEY_R, KEY_RALT, KEY_RBRACKET, KEY_RCTRL, KEY_RIGHT, KEY_RSHIFT, KEY_RSUPER, KEY_S,
+    KEY_SCROLLLOCK, KEY_SEMICOLON, KEY_SLASH, KEY_SPACE, KEY_T, KEY_TAB, KEY_U, KEY_UP, KEY_V,
+    KEY_VOLUMEDOWN, KEY_VOLUMEUP, KEY_W, KEY_X, KEY_Y, KEY_Z,
 };
 
 // ---------------------------------------------------------------------------
@@ -206,6 +206,37 @@ pub fn hid_usage_to_keycode(usage: u8) -> Option<u32> {
         0x53 => KEY_NUMLOCK.0,
 
         // Everything else is unmapped in this table.
+        _ => return None,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// hid_consumer_usage_to_keycode
+// ---------------------------------------------------------------------------
+
+/// Map a HID Usage ID from Usage Page 0x0C (Consumer) to a kernel-core
+/// hardware-neutral keycode value.
+///
+/// This covers the most common media-control usages found on keyboards with
+/// dedicated volume/playback keys. Returns `None` for any usage not listed
+/// in this table.
+///
+/// | HID Consumer Usage | Keycode constant  |
+/// |--------------------|-------------------|
+/// | 0x00E2 — Mute      | [`KEY_MUTE`]      |
+/// | 0x00E9 — Volume Increment | [`KEY_VOLUMEUP`] |
+/// | 0x00EA — Volume Decrement | [`KEY_VOLUMEDOWN`] |
+/// | 0x00CD — Play/Pause | [`KEY_PLAYPAUSE`] |
+///
+/// The returned `u32` is the `.0` field of the [`crate::input::keymap::Keycode`]
+/// type; the consumer can store it directly in
+/// [`crate::input::events::KeyEvent::keycode`].
+pub fn hid_consumer_usage_to_keycode(usage: u16) -> Option<u32> {
+    Some(match usage {
+        0x00CD => KEY_PLAYPAUSE.0,  // Play/Pause
+        0x00E2 => KEY_MUTE.0,       // Mute
+        0x00E9 => KEY_VOLUMEUP.0,   // Volume Increment
+        0x00EA => KEY_VOLUMEDOWN.0, // Volume Decrement
         _ => return None,
     })
 }
@@ -871,5 +902,51 @@ mod tests {
     fn mouse_report_right_button() {
         let r = parse_boot_mouse_report(&[0x02, 0x00, 0x00]).unwrap();
         assert_eq!(r.buttons, 0x02);
+    }
+
+    // ---- hid_consumer_usage_to_keycode ------------------------------------
+
+    /// Volume Increment (0xE9) maps to KEY_VOLUMEUP.
+    #[test]
+    fn consumer_volume_increment_maps_to_volumeup() {
+        assert_eq!(hid_consumer_usage_to_keycode(0x00E9), Some(KEY_VOLUMEUP.0));
+    }
+
+    /// Volume Decrement (0xEA) maps to KEY_VOLUMEDOWN.
+    #[test]
+    fn consumer_volume_decrement_maps_to_volumedown() {
+        assert_eq!(
+            hid_consumer_usage_to_keycode(0x00EA),
+            Some(KEY_VOLUMEDOWN.0)
+        );
+    }
+
+    /// Mute (0xE2) maps to KEY_MUTE.
+    #[test]
+    fn consumer_mute_maps_to_key_mute() {
+        assert_eq!(hid_consumer_usage_to_keycode(0x00E2), Some(KEY_MUTE.0));
+    }
+
+    /// Play/Pause (0xCD) maps to KEY_PLAYPAUSE.
+    #[test]
+    fn consumer_play_pause_maps_to_key_playpause() {
+        assert_eq!(hid_consumer_usage_to_keycode(0x00CD), Some(KEY_PLAYPAUSE.0));
+    }
+
+    /// The three volume keycodes are all distinct from each other.
+    #[test]
+    fn consumer_volume_keycodes_are_distinct() {
+        let mute = hid_consumer_usage_to_keycode(0x00E2).unwrap();
+        let vol_up = hid_consumer_usage_to_keycode(0x00E9).unwrap();
+        let vol_dn = hid_consumer_usage_to_keycode(0x00EA).unwrap();
+        assert_ne!(mute, vol_up, "MUTE and VOLUMEUP must be distinct");
+        assert_ne!(mute, vol_dn, "MUTE and VOLUMEDOWN must be distinct");
+        assert_ne!(vol_up, vol_dn, "VOLUMEUP and VOLUMEDOWN must be distinct");
+    }
+
+    /// An unmapped Consumer usage (0x0001 — Consumer Control) returns None.
+    #[test]
+    fn consumer_unmapped_usage_returns_none() {
+        assert_eq!(hid_consumer_usage_to_keycode(0x0001), None);
     }
 }
