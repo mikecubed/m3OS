@@ -129,7 +129,7 @@ fn handle_udp_v6(header: &Ipv6Header, payload: &[u8]) {
         None => return,
     };
     if udp_hdr.dst_port == kernel_core::net::dhcpv6::DHCPV6_CLIENT_PORT {
-        super::dhcpv6::on_udp(header.src, udp_data);
+        super::dhcpv6::on_udp(udp_data);
         return;
     }
     super::udp::handle_udp_v6(header.src, udp_hdr.src_port, udp_hdr.dst_port, udp_data);

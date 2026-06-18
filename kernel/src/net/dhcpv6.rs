@@ -4,15 +4,22 @@
 //!
 //! Unlike DHCPv4 (which is RemoteNic-gated because SLIRP serves IPv4 statically),
 //! DHCPv6 runs on the ordinary virtio/SLIRP path: IPv6 has no static-address
-//! fallback, and the CI-deterministic gate boots QEMU with `ipv6=on`, which
-//! answers a **stateless** Information-Request with a DNS server option. The
-//! driver issues that Information-Request once a link-local address exists and
-//! installs the learned DNS server via [`config::add_dns_server`].
+//! fallback. Once a link-local address exists, the driver issues a **stateless**
+//! Information-Request and installs any learned DNS server via
+//! [`config::add_dns_server`].
+//!
+//! **Not CI-deterministic under SLIRP.** Packet capture showed QEMU 8.2.2's
+//! libslirp (`ipv6=on`) answers NDP NS/NA but runs **no DHCPv6 server** — the
+//! Information-Request goes out correctly formed but gets no reply. So the
+//! DHCPv6 DNS path is validated by the host-tested `kernel_core::net::dhcpv6`
+//! state machine and live-validated only behind the opt-in `M3OS_IPV6_LIVE` arm
+//! (a TAP bridged to a real router; `M3OS_IPV6_DHCPV6=1` additionally requires
+//! the router to run a DHCPv6 server).
 //!
 //! The full **stateful** four-message Solicit/Advertise/Request/Reply address
-//! lease lives in the host-tested `kernel_core::net::dhcpv6` state machine and
-//! is exercised by the opt-in `M3OS_IPV6_NET` arm; auto-driving it from a
-//! managed (M-flag) RA is a tracked follow-up.
+//! lease also lives in that host-tested state machine and is exercised by the
+//! same opt-in `M3OS_IPV6_LIVE` arm; auto-driving it from a managed (M-flag) RA
+//! is a tracked follow-up.
 
 use kernel_core::net::dhcpv6::{
     self, ALL_DHCP_SERVERS, DHCPV6_SERVER_PORT, Dhcpv6Action, Dhcpv6Client,
@@ -42,12 +49,15 @@ static DRIVER: IrqSafeMutex<Dhcpv6Driver> = IrqSafeMutex::new(Dhcpv6Driver {
     ticks: 0,
 });
 
-/// Derive a 3-byte DHCPv6 transaction id from the NIC MAC. `variant` perturbs
-/// the id between the initial Information-Request and its retransmit. This is a
-/// transaction identifier (RFC 8415 §8), not a cryptographic value — no RNG is
-/// needed; it only has to be stable within a single transaction.
-fn derive_xid(mac: MacAddr, variant: u8) -> [u8; 3] {
-    [mac[3] ^ variant, mac[4], mac[5]]
+/// Derive a 3-byte DHCPv6 transaction id from the NIC MAC. Per RFC 8415 §15 the
+/// transaction id MUST stay unchanged across retransmissions of the same
+/// message, so the initial Information-Request and every retransmit reuse this
+/// single value (matching `Dhcpv6Client`'s "replayed in all subsequent
+/// messages" contract). This is a transaction identifier (RFC 8415 §8), not a
+/// cryptographic value — no RNG is needed; it only has to be stable within a
+/// single transaction.
+fn derive_xid(mac: MacAddr) -> [u8; 3] {
+    [mac[3], mac[4], mac[5]]
 }
 
 /// Send a DHCPv6 client message to `[ff02::1:2]:547` (UDP 546 → 547).
@@ -79,7 +89,7 @@ pub fn tick() {
         return;
     }
     if !d.started {
-        let msg = d.client.start_information_request(mac, derive_xid(mac, 0));
+        let msg = d.client.start_information_request(mac, derive_xid(mac));
         d.started = true;
         d.ticks = 0;
         drop(d);
@@ -90,7 +100,9 @@ pub fn tick() {
     d.ticks = d.ticks.wrapping_add(1);
     if d.ticks >= RETRANSMIT_TICKS {
         d.ticks = 0;
-        let msg = d.client.start_information_request(mac, derive_xid(mac, 1));
+        // RFC 8415 §15: a retransmission keeps the SAME transaction id as the
+        // initial Information-Request — `derive_xid` is deterministic per MAC.
+        let msg = d.client.start_information_request(mac, derive_xid(mac));
         drop(d);
         send_to_servers(src, &msg);
         log::info!("[dhcpv6] retransmit Information-Request");
@@ -98,8 +110,10 @@ pub fn tick() {
 }
 
 /// Feed an inbound UDP datagram received on the client port (546) to the state
-/// machine. Routed here from `ipv6::handle_ipv6`.
-pub fn on_udp(src: Ipv6Addr, data: &[u8]) {
+/// machine. Routed here from `ipv6::handle_ipv6`. The datagram's source address
+/// is the server's; the client's own outgoing messages are sourced from our
+/// link-local (see [`config::link_local_v6`]), never from the inbound source.
+pub fn on_udp(data: &[u8]) {
     let reply = match dhcpv6::parse_reply(data) {
         Some(r) => r,
         None => return,
@@ -108,8 +122,18 @@ pub fn on_udp(src: Ipv6Addr, data: &[u8]) {
     match d.client.on_reply(reply) {
         Dhcpv6Action::SendRequest(bytes) => {
             drop(d);
-            send_to_servers(src, &bytes);
-            log::info!("[dhcpv6] Advertise received; Request sent");
+            // Source the REQUEST from our own link-local address, not the
+            // server's (the inbound datagram source). The DHCPv6 flow only
+            // starts once a link-local exists, so this is normally present.
+            match config::link_local_v6() {
+                Some(local) => {
+                    send_to_servers(local, &bytes);
+                    log::info!("[dhcpv6] Advertise received; Request sent");
+                }
+                None => {
+                    log::warn!("[dhcpv6] Advertise received but no link-local; Request not sent");
+                }
+            }
         }
         Dhcpv6Action::Bound(cfg) => {
             d.bound = true;

@@ -83,8 +83,8 @@ m3OS has **no general loopback interface** — there is no `lo` device, and even
 ## Acceptance Criteria
 
 - `ping6 ::1` reports a reply via the ICMPv6 loopback short-circuit (m3OS has no `lo` device — verified by an unchanged TX counter proving no frame reached `net::send_frame`; the `IPV6_LOOPBACK_OK` sentinel).
-- On a QEMU dual-stack network (SLIRP `ipv6=on`, which sends Router Advertisements) m3OS forms a global SLAAC address automatically (`SLAAC_ADDR_OK`); the stateful-DHCPv6 lease arm is opt-in against an external `radvd`/`dhcpd` (`M3OS_IPV6_NET=1`).
-- `curl http://[<IPv6 literal, e.g. 2606:4700::1111>]/` returns an HTTP response over IPv6 (opt-in `M3OS_IPV6_NET=1`; `CURL6_OK`).
+- On a real dual-stack LAN (a TAP bridged to an IPv6 router; opt-in `M3OS_IPV6_LIVE=1`) m3OS forms a global SLAAC address from the router's RA (`SLAAC_ADDR_OK`); the stateful-DHCPv6 lease arm rides the same opt-in (`M3OS_IPV6_DHCPV6=1` for a router running a DHCPv6 server). QEMU SLIRP `ipv6=on` does NDP NS/NA only — no Router Advertisements, no DHCPv6 server (packet-capture-confirmed) — so SLAAC/DHCPv6 are not CI-deterministic.
+- `curl http://[<IPv6 literal, e.g. 2606:4700::1111>]/` returns an HTTP response over IPv6 (opt-in `M3OS_IPV6_LIVE=1`; `CURL6_OK`).
 - `getaddrinfo("github.com", ...)` returns both IPv4 (A) and IPv6 (AAAA) addresses (`AAAA_RESOLVE_OK`); the result is ordered per RFC 6724 (`RFC6724_OK`, inspecting the returned `addrinfo` order).
 - No regression in IPv4 — the `smoke-test`, `regression`, and `dns-smoke` gates stay green, including the Phase 77 retransmission + multi-slot work.
 

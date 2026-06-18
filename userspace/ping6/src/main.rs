@@ -67,8 +67,10 @@ fn main(args: &[&str]) -> i32 {
         let mut reply_buf = [0u8; 8];
         let n = read(fd, &mut reply_buf);
         if n == 8 {
+            // Both ticks are boot-relative milliseconds (kernel `tick_count()`
+            // and our `get_tick()` below), so the delta is already the RTT in ms.
             let reply_tick = u64::from_le_bytes(reply_buf);
-            let rtt_ms = reply_tick.wrapping_sub(send_tick) * 10;
+            let rtt_ms = reply_tick.wrapping_sub(send_tick);
             write_str(STDOUT_FILENO, "Reply from ");
             print_ipv6(&target);
             write_str(STDOUT_FILENO, ": seq=");
@@ -217,7 +219,15 @@ fn get_tick() -> u64 {
             ts.as_mut_ptr() as u64,
         )
     };
-    if ret as i64 >= 0 { ts[0] * 100 } else { 0 }
+    // Boot-relative milliseconds, matching the kernel reply tick (`tick_count()`,
+    // TICKS_PER_SEC = 1000) so a plain subtraction at the call site yields the
+    // RTT in ms. CLOCK_MONOTONIC is also boot-relative. Folding in tv_nsec gives
+    // 1 ms resolution; without it the RTT would collapse to whole seconds.
+    if ret as i64 >= 0 {
+        ts[0] * 1000 + ts[1] / 1_000_000
+    } else {
+        0
+    }
 }
 
 #[panic_handler]

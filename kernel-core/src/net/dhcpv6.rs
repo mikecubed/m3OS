@@ -36,7 +36,10 @@
 //! ```
 //!
 //! No address is leased; the client just asks for configuration (DNS servers).
-//! This is the CI-deterministic path against SLIRP.
+//! This is the path the kernel driver drives by default. It is **not**
+//! CI-deterministic under QEMU SLIRP (`ipv6=on`), which runs no DHCPv6 server,
+//! so it is host-tested here and live-validated only behind the opt-in
+//! `M3OS_IPV6_LIVE` arm against a real router.
 //!
 //! # Usage
 //!
@@ -213,8 +216,10 @@ impl Dhcpv6Client {
     /// Begin the **stateless** DNS-only exchange.
     ///
     /// Transitions to [`Dhcpv6State::InfoRequesting`] and returns the
-    /// INFORMATION-REQUEST bytes. This is the CI-deterministic path against
-    /// SLIRP — it leases no address, only configuration (DNS servers).
+    /// INFORMATION-REQUEST bytes. This is the path the kernel driver drives by
+    /// default — it leases no address, only configuration (DNS servers). It is
+    /// **not** CI-deterministic under QEMU SLIRP (no DHCPv6 server); see the
+    /// module docs.
     pub fn start_information_request(&mut self, mac: MacAddr, xid: [u8; 3]) -> Vec<u8> {
         self.mac = mac;
         self.xid = xid;
