@@ -325,6 +325,18 @@ if [ "${M3OS_USB_REGRESSION:-0}" = "1" ]; then
     # the kbd_server/mouse_server inject path, or kernel-core/src/usb/hid.
     echo "pre-push: running cargo xtask usb-smoke..."
     cargo xtask usb-smoke --timeout 160
+    # Phase 92 core — hot-plug, mass-storage transport, and hub bring-up gates.
+    echo "pre-push: running cargo xtask usb-hotplug-smoke..."
+    cargo xtask usb-hotplug-smoke --timeout 220
+    echo "pre-push: running cargo xtask usb-storage-smoke..."
+    cargo xtask usb-storage-smoke --timeout 360
+    # Phase 92a — usb-hub-smoke also asserts tier-2 enumeration (a full-speed HID
+    # device behind the hub → XHCI_HUB:child-enumerated), and usb-mount-smoke
+    # mounts /dev/usb0 at /mnt/usb0 and verifies ls + read + overwrite-readback.
+    echo "pre-push: running cargo xtask usb-hub-smoke..."
+    cargo xtask usb-hub-smoke --timeout 200
+    echo "pre-push: running cargo xtask usb-mount-smoke..."
+    cargo xtask usb-mount-smoke --timeout 420
 fi
 
 # Phase 79 — opt-in modern-NIC regression gate. `multi-nic-smoke` boots QEMU
