@@ -144,3 +144,71 @@ pub fn flush() {
         log::warn!("[blk] virtio-blk flush failed (status {status}) — buffered writes may be lost");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Phase 92a D.4 — secondary device (dev_id >= 1) forwarding surface
+// ---------------------------------------------------------------------------
+
+/// Register an additional remote block device by service name (e.g.
+/// `"usb0.block"`). Returns the assigned `dev_id` (1-based), or `None` if
+/// the registry is full or the service is unknown / untrusted.
+///
+/// This is the coordinator entry point — the USB mass-storage daemon
+/// publishes its endpoint then calls this (or the coordinator calls it)
+/// after confirming the device is ready.
+#[allow(dead_code)]
+pub fn register_remote_device(service_name: &str, device_name: &str) -> Option<u32> {
+    remote::register_device(service_name, device_name)
+}
+
+/// Release a secondary device slot on hot-unplug.
+///
+/// `dev_id` must be >= 1 (the root slot is never released via this path).
+#[allow(dead_code)]
+pub fn unregister_remote_device(dev_id: u32) {
+    remote::unregister_device(dev_id);
+}
+
+/// `true` when `dev_id` is in-range and its slot holds a live driver.
+#[allow(dead_code)]
+pub fn is_remote_device_registered(dev_id: u32) -> bool {
+    remote::is_registered_dev(dev_id)
+}
+
+/// Read `count` sectors from the device identified by `dev_id`.
+///
+/// `dev_id` must be the value returned by [`register_remote_device`]. Passing
+/// `dev_id=0` here is intentionally unsupported — callers that need the root
+/// device use [`read_sectors`] directly. Returns `Err(0xFF)` for an
+/// out-of-range or unregistered `dev_id`.
+#[allow(dead_code)]
+pub fn read_sectors_dev(
+    dev_id: u32,
+    start_sector: u64,
+    count: usize,
+    buf: &mut [u8],
+) -> Result<(), u8> {
+    remote::read_sectors_dev(dev_id, start_sector, count, buf)
+}
+
+/// Write `count` sectors to the device identified by `dev_id`.
+///
+/// Same preconditions as [`read_sectors_dev`].
+#[allow(dead_code)]
+pub fn write_sectors_dev(
+    dev_id: u32,
+    start_sector: u64,
+    count: usize,
+    buf: &[u8],
+) -> Result<(), u8> {
+    remote::write_sectors_dev(dev_id, start_sector, count, buf)
+}
+
+/// Flush the write-back cache of the device identified by `dev_id`.
+///
+/// Same preconditions as [`read_sectors_dev`]. Best-effort: a failure is
+/// returned as `Err(u8)` so the caller can decide whether to log or ignore.
+#[allow(dead_code)]
+pub fn flush_dev(dev_id: u32) -> Result<(), u8> {
+    remote::flush_dev(dev_id)
+}
