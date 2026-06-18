@@ -141,6 +141,18 @@ jobs:
         # + the BLK_FLUSH IPC path. echo/cat only — no musl dependency.
         run: cargo xtask ahci-persist-smoke --timeout 300
 
+      - name: "IPv6 dual-stack (ipv6-smoke: NDP/loopback/AF_INET6/TCP-over-IPv6 + recvmsg)"
+        # Phase 91: the always-on dual-stack IPv6 gate. Boots with SLIRP
+        # ipv6=on (which cmd_ipv6_smoke sets itself) and asserts the
+        # CI-deterministic arms — link-local formation, a live NDP NS->NA over
+        # the wire, AF_INET6 socket/bind6, the ping6 ::1 ICMPv6 loopback, full
+        # dual-stack TCP over IPv6 (incl. family-aware accept/getpeername re-arm),
+        # and recvmsg sockaddr_in6 — all over the ::1 internal loopback, no real
+        # router/internet. The SLAAC/DHCPv6 live-router arms stay opt-in behind
+        # M3OS_IPV6_LIVE (libslirp sends no RA). Mirrors the M3OS_IPV6_REGRESSION
+        # pre-push gate.
+        run: cargo xtask ipv6-smoke --timeout 300
+
       - name: "Regression suite (with flake-isolation retry)"
         # `cargo xtask regression` is not test-isolated; suite-level QEMU
         # contention occasionally yields spurious per-test timeouts under TCG.

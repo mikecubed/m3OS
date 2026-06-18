@@ -1,7 +1,7 @@
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
-use crate::types::Ipv4Addr;
+use crate::types::{Ipv4Addr, Ipv6Addr};
 
 /// Parsed UDP header.
 #[derive(Debug, Clone, Copy)]
@@ -46,6 +46,30 @@ pub fn build(src_port: u16, dst_port: u16, payload: &[u8]) -> Vec<u8> {
     pkt.extend_from_slice(&length.to_be_bytes());
     pkt.extend_from_slice(&0u16.to_be_bytes()); // checksum = 0
     pkt.extend_from_slice(effective);
+    pkt
+}
+
+/// Build a UDP datagram with a correct IPv6 pseudo-header checksum. Unlike UDP
+/// over IPv4 — where the checksum is optional and m3OS leaves it 0 — the
+/// checksum is **mandatory** over IPv6 (RFC 8200 §8.1), computed over the IPv6
+/// pseudo-header. A computed checksum of 0 is transmitted as `0xffff` per
+/// RFC 768 so the receiver never mistakes a real checksum for the
+/// "checksum-disabled" sentinel. This is the host-testable pure-logic core of
+/// the kernel's `udp::build_v6`.
+pub fn build_v6(
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    use crate::net::ipv6;
+    let mut pkt = build(src_port, dst_port, payload);
+    let mut ck = ipv6::pseudo_header_checksum(src, dst, ipv6::PROTO_UDP, &pkt);
+    if ck == 0 {
+        ck = 0xffff;
+    }
+    pkt[6..8].copy_from_slice(&ck.to_be_bytes());
     pkt
 }
 
@@ -154,6 +178,72 @@ impl Default for UdpBindings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::ipv6;
+
+    #[test]
+    fn build_v6_checksum_folds_to_zero() {
+        // A correct IPv6 pseudo-header checksum makes the whole datagram fold
+        // back to 0 when recomputed by the receiver (the v6 checksum-verify
+        // invariant, mandatory unlike IPv4 UDP). Mirrors tcp::build_v6.
+        let src: Ipv6Addr = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let dst: Ipv6Addr = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let pkt = build_v6(src, dst, 546, 547, b"dhcpv6-payload");
+        assert_eq!(
+            ipv6::pseudo_header_checksum(src, dst, ipv6::PROTO_UDP, &pkt),
+            0
+        );
+        let (h, data) = parse(&pkt).unwrap();
+        assert_eq!(h.src_port, 546);
+        assert_eq!(h.dst_port, 547);
+        assert_eq!(data, b"dhcpv6-payload");
+        // The checksum field is non-zero (it was actually computed).
+        assert_ne!(&pkt[6..8], &[0u8, 0u8]);
+    }
+
+    #[test]
+    fn build_v6_corrupt_does_not_fold_to_zero() {
+        // A single corrupted payload byte must break the fold-to-zero invariant
+        // so the receiver drops the datagram.
+        let src: Ipv6Addr = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let dst: Ipv6Addr = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let mut pkt = build_v6(src, dst, 1000, 2000, b"payload");
+        pkt[9] ^= 0xff;
+        assert_ne!(
+            ipv6::pseudo_header_checksum(src, dst, ipv6::PROTO_UDP, &pkt),
+            0
+        );
+    }
+
+    #[test]
+    fn build_v6_zero_checksum_transmitted_as_0xffff() {
+        // RFC 768: a computed checksum of 0 must be sent as 0xffff so the
+        // receiver never reads the "checksum disabled" sentinel (0x0000). This
+        // is the one branch the kernel-only `build_v6` never naturally hit.
+        let src: Ipv6Addr = [0; 16];
+        let dst: Ipv6Addr = [0; 16];
+        // Find a src_port whose raw checksum computes to 0 (it exists in the
+        // 16-bit space for an empty payload + zero addresses).
+        let mut found = None;
+        for sp in 0u16..=u16::MAX {
+            let raw = build(sp, 0, &[]);
+            if ipv6::pseudo_header_checksum(src, dst, ipv6::PROTO_UDP, &raw) == 0 {
+                found = Some(sp);
+                break;
+            }
+        }
+        let sp = found.expect("a zero-checksum UDP/IPv6 input must exist in the 16-bit space");
+        let pkt = build_v6(src, dst, sp, 0, &[]);
+        assert_eq!(
+            &pkt[6..8],
+            &[0xff, 0xff],
+            "a zero checksum must transmit as 0xffff, never 0x0000"
+        );
+        // The 0xffff datagram still folds to 0 on verify.
+        assert_eq!(
+            ipv6::pseudo_header_checksum(src, dst, ipv6::PROTO_UDP, &pkt),
+            0
+        );
+    }
 
     #[test]
     fn parse_valid() {

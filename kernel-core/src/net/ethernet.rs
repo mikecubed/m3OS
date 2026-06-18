@@ -4,6 +4,8 @@ use crate::types::MacAddr;
 
 pub const ETHERTYPE_ARP: u16 = 0x0806;
 pub const ETHERTYPE_IPV4: u16 = 0x0800;
+/// IPv6 EtherType (RFC 7042). Phase 91.
+pub const ETHERTYPE_IPV6: u16 = 0x86DD;
 
 /// Broadcast MAC address.
 pub const MAC_BROADCAST: MacAddr = [0xFF; 6];

@@ -990,6 +990,11 @@ fn net_task() -> ! {
         // fires even when no NIC event wakes the task.
         net::tcp::tcp_tick();
 
+        // Phase 91 — step the IPv6 maintenance state machine (link-local
+        // formation on first run, router solicitation, DHCPv6). Rides the same
+        // periodic ~200 ms deadline so it advances on an otherwise idle link.
+        net::ipv6::v6_tick();
+
         // Park on the unified flag: the virtio-net ISR, RemoteNic, and the
         // ingress pending-send hook all set it, so a wake from any path
         // reliably unblocks the task.

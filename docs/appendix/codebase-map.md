@@ -172,6 +172,7 @@ Read the relevant doc before making significant changes to that subsystem.
 | `docs/11-elf-loader-and-process-model.md` | Before touching ELF loading or process lifecycle |
 | `docs/12-posix-compatibility-layer.md` | Before adding syscalls or POSIX behavior |
 | `docs/16-network.md` | Before touching `kernel/src/net/` |
+| `docs/91-ipv6-dhcpv6.md` | Before touching `kernel/src/net/ipv6.rs`/`icmpv6.rs`/`ndp.rs`/`dhcpv6.rs` (and their `kernel-core` siblings) |
 | `docs/19-signal-handlers.md` | Before touching signal delivery |
 | `docs/22-tty-terminal.md` | Before touching TTY/terminal subsystem |
 | `docs/25-smp.md` | Before touching SMP or multi-core code |

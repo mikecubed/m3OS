@@ -10,10 +10,23 @@
 //! out-of-band through the IPC endpoint and are already dispatched before
 //! `process_rx` is called.
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use super::arp;
 use super::ethernet;
 use super::ipv4;
+use super::ipv6;
 use super::virtio_net;
+
+/// Per-boot count of inbound IPv6 frames dispatched into the v6 stack (Phase
+/// 91). Keeps the bare-metal RX diagnostics symmetric with ARP/IPv4.
+static RX_IPV6: AtomicU32 = AtomicU32::new(0);
+
+/// Snapshot of IPv6 frames dispatched this boot.
+#[allow(dead_code)]
+pub fn rx_ipv6_count() -> u32 {
+    RX_IPV6.load(Ordering::Relaxed)
+}
 
 /// Dispatch a single raw Ethernet frame into the protocol stack.
 ///
@@ -49,6 +62,15 @@ pub fn process_rx_frames(raw: &[u8]) -> bool {
                 arp::learn(header.src, frame.src);
                 ipv4::handle_ipv4(&header, payload);
             }
+        }
+        ethernet::ETHERTYPE_IPV6 => {
+            // Phase 91: deliver to the v6 stack. `handle_ipv6` parses the header
+            // (a malformed header is dropped without panicking), learns the
+            // neighbor passively (mirror of ARP learning), walks extension
+            // headers, and dispatches ICMPv6/UDP/TCP. The Ethernet source MAC is
+            // threaded through for NDP passive learning.
+            RX_IPV6.fetch_add(1, Ordering::Relaxed);
+            ipv6::handle_ipv6(&frame.payload, frame.src);
         }
         _ => {
             // Unknown EtherType — drop silently.

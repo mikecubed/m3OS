@@ -331,6 +331,14 @@ const SMOKE_EXIT_KSTACK_OVERFLOW_FAILED: i32 = 86;
 /// docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md.
 const SMOKE_EXIT_SMP_SMOKE_FAILED: i32 = 87;
 
+/// Phase 91 — `cargo xtask ipv6-smoke` exit code. Boots m3OS with QEMU SLIRP
+/// `ipv6=on` and runs the `ipv6-smoke` ramdisk binary, which exercises the
+/// always-on, CI-deterministic dual-stack substrate from ring 3 (AF_INET6 socket
+/// creation, `bind6`, and a `ping6 ::1` loopback round-trip) and ends with
+/// `SMOKE:ipv6-smoke:PASS`. The gate additionally asserts the kernel formed its
+/// link-local address. Fails on any `:FAIL`/`IPV6_SMOKE:panic`.
+const SMOKE_EXIT_IPV6_SMOKE_FAILED: i32 = 88;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
     Headless,
@@ -1246,6 +1254,15 @@ fn main() {
             });
             cmd_pku_smoke(&smoke_args);
         }
+        Some("ipv6-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("ipv6-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_ipv6_smoke(&smoke_args);
+        }
         // Track D (docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md)
         // — `kstack-overflow-smoke`: builds a kernel with the
         // `kstack-overflow-test` feature, boots m3OS, runs the
@@ -1387,6 +1404,8 @@ fn build_userspace_bins() {
         ("fork-test", "fork-test", false),
         ("echo-args", "echo-args", false),
         ("ping", "ping", false),
+        ("ping6", "ping6", false),
+        ("ipv6-smoke", "ipv6-smoke", false),
         ("udp-smoke", "udp-smoke", false),
         ("smoke-runner", "smoke-runner", false),
         // Phase 64b: init depends on kernel-core for the
@@ -3127,6 +3146,8 @@ fn build_musl_bins() {
         ("userspace/tls-smoke/tls-smoke.c", "tls-smoke"),
         // Phase 77 Track D.1: DNS resolution smoke test (musl resolver).
         ("userspace/dns-smoke/dns-smoke.c", "dns-smoke"),
+        // Phase 91 Track D: AAAA + RFC 6724 dual-stack getaddrinfo smoke test.
+        ("userspace/dns6-smoke/dns6-smoke.c", "dns6-smoke"),
         // Phase 86b: non-blocking connect() / EINPROGRESS + poll + SO_ERROR.
         ("userspace/connect-smoke/connect-smoke.c", "connect-smoke"),
         // Phase 88: ext2 cross-process read-coherence regression (Bug B).
@@ -5672,6 +5693,8 @@ fn cmd_check() {
         "init",
         "shell",
         "ping",
+        "ping6",
+        "ipv6-smoke",
         "edit",
         "login",
         "su",
@@ -7815,6 +7838,19 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         pattern_b: "SMOKE:dns-smoke:SKIP",
         timeout_secs: 30,
         label: "guest/dns-smoke: resolver path exercised or skipped",
+        extra_steps_a: &[],
+        extra_steps_b: &[],
+    });
+    // Phase 91 Track D — dual-stack AAAA / RFC 6724 getaddrinfo. The musl-built
+    // `/bin/dns6-smoke` asserts `getaddrinfo("localhost", AF_UNSPEC)` returns
+    // both families from the staged dual-stack `/etc/hosts` (RFC6724_OK,
+    // CI-deterministic), softly probing a real AAAA. PASS, or SKIP when the
+    // binary is absent (no musl toolchain at build).
+    steps.push(SmokeStep::WaitEither {
+        pattern_a: "SMOKE:dns6-smoke:PASS",
+        pattern_b: "SMOKE:dns6-smoke:SKIP",
+        timeout_secs: 30,
+        label: "guest/dns6-smoke: dual-stack getaddrinfo (RFC6724_OK) or skipped",
         extra_steps_a: &[],
         extra_steps_b: &[],
     });
@@ -12798,6 +12834,198 @@ fn cmd_pku_smoke(args: &SmokeBootArgs) {
             let _ = child.kill();
             let _ = child.wait();
             eprintln!("pku-smoke: FAILED\n{msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 91 — ipv6-smoke: dual-stack IPv6 acceptance gate
+// ---------------------------------------------------------------------------
+
+/// Smoke steps for `cargo xtask ipv6-smoke`. Boots m3OS with SLIRP `ipv6=on`,
+/// asserts the kernel formed its link-local address and answered a live
+/// Neighbor Solicitation (NDP works over the wire — SLIRP solicits the guest's
+/// link-local, which the guest resolves), logs into sh0, runs the `ipv6-smoke`
+/// binary, and asserts `SMOKE:ipv6-smoke:PASS`.
+///
+/// SLAAC + stateless-DHCPv6-DNS need a real IPv6 router: QEMU 8.2.2's libslirp
+/// does Neighbor Solicitation but sends NO Router Advertisements and runs no
+/// DHCPv6 server (packet-capture-confirmed), so those wire arms are gated behind
+/// `live` (`M3OS_IPV6_LIVE=1`) and skip by default — mirroring the established
+/// opt-in `*_NET` regression pattern. The `live` arms only pass when the guest
+/// is on a network that actually emits RAs/DHCPv6: set `M3OS_IPV6_TAP=<ifname>`
+/// to attach a pre-created TAP bridged either to a LAN with a real IPv6 router
+/// or to a host-run `radvd`/`dnsmasq` (SLIRP alone cannot satisfy them).
+fn ipv6_smoke_steps(live: bool, dhcpv6: bool) -> Vec<SmokeStep> {
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/ipv6-smoke: kernel first message",
+    }];
+    // The kernel forms its fe80:: link-local from the NIC MAC on the first
+    // net_task pass (no network needed) — a deterministic IPV6_ADDR_OK proof.
+    steps.push(SmokeStep::Wait {
+        pattern: "[ipv6] link-local configured",
+        timeout_secs: 30,
+        label: "guest/ipv6-smoke: link-local address formed (IPV6_ADDR_OK)",
+    });
+    // Live NDP over the wire: the guest's DHCPv6/RS traffic makes SLIRP resolve
+    // the guest's link-local; the guest answers the Neighbor Solicitation with a
+    // Neighbor Advertisement. Deterministic against SLIRP (which always does
+    // NS/NA) — proves B.2 end-to-end on real frames (NDP_RESOLVE_OK).
+    steps.push(SmokeStep::Wait {
+        pattern: "[ndp] neighbor advertisement sent",
+        timeout_secs: 40,
+        label: "guest/ipv6-smoke: answered a live Neighbor Solicitation (NDP_RESOLVE_OK)",
+    });
+    // SLAAC global address — the primary live proof: it is RA-driven, so any
+    // router that hands out IPv6 via SLAAC (the common case, incl. most home
+    // routers) satisfies it. Needs a real router on the wire (M3OS_IPV6_TAP).
+    if live {
+        steps.push(SmokeStep::Wait {
+            pattern: "[ndp] SLAAC global",
+            timeout_secs: 60,
+            label: "guest/ipv6-smoke: SLAAC global address from RA (SLAAC_ADDR_OK)",
+        });
+        // The DHCPv6 lease is asserted only when the operator knows the router
+        // runs a DHCPv6 server (M3OS_IPV6_DHCPV6=1). A SLAAC-only router (no
+        // DHCPv6) leaves the guest's Information-Requests unanswered — so making
+        // this a hard step by default would wrongly fail on the common case.
+        if dhcpv6 {
+            steps.push(SmokeStep::Wait {
+                pattern: "[dhcpv6] bound",
+                timeout_secs: 30,
+                label: "guest/ipv6-smoke: DHCPv6 DNS lease (DHCPV6_DNS_OK)",
+            });
+        }
+    }
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "ipv6-smoke\n",
+        label: "guest/ipv6-smoke: run ipv6-smoke binary",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "SMOKE:ipv6-smoke:PASS",
+        fail_prefixes: &[":FAIL", "IPV6_SMOKE:panic"],
+        timeout_secs: 60,
+        label: "guest/ipv6-smoke: socket + bind6 + ping6 ::1 loopback + TCP",
+        exit_code_on_fail: SMOKE_EXIT_IPV6_SMOKE_FAILED,
+    });
+    steps
+}
+
+fn cmd_ipv6_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false, // graphical_login — serial autologin path
+    );
+
+    let ovmf = find_ovmf();
+    let kvm = std::env::var_os("M3OS_KVM").is_some_and(|v| v != "0" && !v.is_empty());
+    let live = std::env::var_os("M3OS_IPV6_LIVE").is_some_and(|v| v != "0" && !v.is_empty());
+    // M3OS_IPV6_TAP=<ifname> attaches the guest to a pre-created TAP device
+    // instead of SLIRP. Bridge that TAP to a LAN segment that has a real IPv6
+    // router and the router's Router Advertisements + DHCPv6 reach the guest, so
+    // SLAAC global-address formation and the DHCPv6 DNS lease actually run — the
+    // path QEMU's user-mode (SLIRP) backend cannot exercise (it sends no RAs).
+    let tap_ifname = std::env::var("M3OS_IPV6_TAP")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args = qemu_args_with_devices(
+        &uefi_image,
+        &ovmf,
+        display_mode,
+        DeviceSet {
+            kvm,
+            ..DeviceSet::default()
+        },
+    );
+    // Network backend. With a TAP device the guest is on a real L2 segment (the
+    // operator bridges `ifname` to a LAN with an IPv6 router). Otherwise SLIRP
+    // user-mode with ipv6=on (default fec0::/64 prefix, host fec0::2, DNS
+    // fec0::3): NDP NS/NA work over the wire, but libslirp sends NO Router
+    // Advertisements and runs no DHCPv6 server, so SLAAC/DHCPv6 cannot run
+    // (see `ipv6_smoke_steps`). Either way the host-forward rules are dropped.
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") || arg.as_str() == "user,id=net0" {
+            *arg = match &tap_ifname {
+                Some(ifname) => {
+                    format!("tap,id=net0,ifname={ifname},script=no,downscript=no")
+                }
+                None => "user,id=net0,ipv6=on".to_string(),
+            };
+        }
+    }
+    if live && tap_ifname.is_none() {
+        eprintln!(
+            "ipv6-smoke: WARNING — M3OS_IPV6_LIVE=1 asserts SLAAC + DHCPv6 \
+             ([ndp] SLAAC global / [dhcpv6] bound), which require a real IPv6 \
+             router. QEMU SLIRP sends no Router Advertisements, so without \
+             M3OS_IPV6_TAP=<tap-ifname> (a TAP bridged to a LAN that has an IPv6 \
+             router) these arms will time out."
+        );
+    }
+    append_ac97_audio_flags_headless(&mut qemu_args);
+    // The DHCPv6-lease arm is asserted only when the operator confirms the
+    // network runs a DHCPv6 server (a SLAAC-only router never answers).
+    let dhcpv6 = std::env::var_os("M3OS_IPV6_DHCPV6").is_some_and(|v| v != "0" && !v.is_empty());
+    let steps = ipv6_smoke_steps(live, dhcpv6);
+
+    println!(
+        "ipv6-smoke: launching QEMU (timeout {}s){}",
+        args.timeout_secs,
+        match (live, tap_ifname.as_deref()) {
+            (true, Some(ifname)) => {
+                format!(" [live SLAAC/DHCPv6 arms asserted; TAP {ifname}]")
+            }
+            (true, None) => " [live arms asserted — needs M3OS_IPV6_TAP!]".to_string(),
+            (false, Some(ifname)) => format!(" [TAP {ifname}; ring-3 arms]"),
+            (false, None) => " [always-on ring-3 arms; live arms best-effort]".to_string(),
+        }
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("ipv6-smoke: failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!("ipv6-smoke: PASS ({} steps in {elapsed}s)", steps.len());
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("ipv6-smoke: FAILED\n{msg}");
             std::process::exit(1);
         }
     }
@@ -21437,6 +21665,7 @@ fn populate_ext2_files(
     let empty_content = "";
     let udp_smoke_bin = generated_initrd_dir(&workspace_root()).join("udp-smoke");
     let dns_smoke_bin = generated_initrd_dir(&workspace_root()).join("dns-smoke");
+    let dns6_smoke_bin = generated_initrd_dir(&workspace_root()).join("dns6-smoke");
     let connect_smoke_bin = generated_initrd_dir(&workspace_root()).join("connect-smoke");
 
     // Phase 76 — `/lib/ld-musl-x86_64.so.1` source path. Built by
@@ -22321,6 +22550,10 @@ fn populate_ext2_files(
           sif bin/dns-smoke mode 0x81ED\n\
           sif bin/dns-smoke uid 0\n\
           sif bin/dns-smoke gid 0\n\
+          write \"{dns6_smoke_bin}\" bin/dns6-smoke\n\
+          sif bin/dns6-smoke mode 0x81ED\n\
+          sif bin/dns6-smoke uid 0\n\
+          sif bin/dns6-smoke gid 0\n\
           write \"{connect_smoke_bin}\" bin/connect-smoke\n\
           sif bin/connect-smoke mode 0x81ED\n\
           sif bin/connect-smoke uid 0\n\
@@ -22613,6 +22846,7 @@ fn populate_ext2_files(
         inject_key_cmds = inject_key_cmds,
         udp_smoke_bin = udp_smoke_bin.display(),
         dns_smoke_bin = dns_smoke_bin.display(),
+        dns6_smoke_bin = dns6_smoke_bin.display(),
         connect_smoke_bin = connect_smoke_bin.display(),
         // Phase 76 — host path of the staged dynamic linker; written
         // to `/lib/ld-musl-x86_64.so.1` on the ext2 disk.

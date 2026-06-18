@@ -75,21 +75,35 @@ pub fn parse(data: &[u8]) -> Option<(Ipv4Header, &[u8])> {
     ))
 }
 
-/// Compute the IPv4 header checksum (RFC 1071).
-pub fn checksum(data: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
+/// Accumulate the big-endian 16-bit ones-complement sum of `data` into `sum`
+/// (RFC 1071). An odd trailing byte is padded into the high half, matching a
+/// final block. To checksum a concatenation incrementally, every part except the
+/// last MUST have an even length so each part starts on a 16-bit boundary.
+pub(crate) fn checksum_accumulate(sum: &mut u32, data: &[u8]) {
     let mut i = 0;
     while i + 1 < data.len() {
-        sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+        *sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
         i += 2;
     }
     if i < data.len() {
-        sum += (data[i] as u32) << 8;
+        *sum += (data[i] as u32) << 8;
     }
+}
+
+/// Fold the carries out of an accumulated ones-complement `sum` and return its
+/// complement — the final RFC 1071 checksum.
+pub(crate) fn checksum_fold(mut sum: u32) -> u16 {
     while sum > 0xFFFF {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
     !(sum as u16)
+}
+
+/// Compute the IPv4 header checksum (RFC 1071).
+pub fn checksum(data: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    checksum_accumulate(&mut sum, data);
+    checksum_fold(sum)
 }
 
 /// Build a raw IPv4 packet with the given protocol and payload.

@@ -75,6 +75,13 @@ jobs:
           cargo xtask device-smoke --device nvme --timeout 180
           cargo xtask device-smoke --device e1000 --iommu --timeout 180
 
+      - name: "IPv6 dual-stack (ipv6-smoke: NDP/loopback/AF_INET6/TCP-over-IPv6 + recvmsg)"
+        # Phase 91: always-on dual-stack IPv6 gate. SLIRP ipv6=on + the ::1
+        # internal loopback exercise link-local/NDP/AF_INET6/TCP-over-IPv6/recvmsg
+        # with no real router/internet; SLAAC/DHCPv6 live arms stay opt-in behind
+        # M3OS_IPV6_LIVE (libslirp sends no RA).
+        run: cargo xtask ipv6-smoke --timeout 300
+
       - name: Regression suite (SMP races + headless operator workflows)
         # Flake-isolation retry mirrors .githooks/pre-push and pr.yml: re-run any
         # failing test on a fresh QEMU and only fail on persistent failures, so

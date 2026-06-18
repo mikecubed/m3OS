@@ -1066,6 +1066,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ipv6-smoke"
+version = "0.1.0"
+dependencies = [
+ "syscall-lib",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1112,7 +1119,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.90.1"
+version = "0.91.0"
 dependencies = [
  "bootloader_api",
  "kernel-core",
@@ -1491,6 +1498,13 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "ping"
+version = "0.1.0"
+dependencies = [
+ "syscall-lib",
+]
+
+[[package]]
+name = "ping6"
 version = "0.1.0"
 dependencies = [
  "syscall-lib",

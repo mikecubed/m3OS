@@ -154,6 +154,10 @@ static PATCH_ELF: &[u8] = generated_initrd_asset!("patch");
 static LESS_ELF: &[u8] = generated_initrd_asset!("less");
 // Phase 23: ping
 static PING_ELF: &[u8] = generated_initrd_asset!("ping");
+// Phase 91: ping6
+static PING6_ELF: &[u8] = generated_initrd_asset!("ping6");
+// Phase 91: ipv6-smoke gate binary
+static IPV6_SMOKE_ELF: &[u8] = generated_initrd_asset!("ipv6-smoke");
 static SMOKE_RUNNER_ELF: &[u8] = generated_initrd_asset!("smoke-runner");
 // Phase 29: PTY test
 static PTY_TEST_ELF: &[u8] = generated_initrd_asset!("pty-test");
@@ -852,6 +856,13 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
     ("less", RamdiskNode::File { content: LESS_ELF }),
     ("make", RamdiskNode::File { content: MAKE_ELF }),
     ("ping", RamdiskNode::File { content: PING_ELF }),
+    ("ping6", RamdiskNode::File { content: PING6_ELF }),
+    (
+        "ipv6-smoke",
+        RamdiskNode::File {
+            content: IPV6_SMOKE_ELF,
+        },
+    ),
     (
         "pty-test",
         RamdiskNode::File {
