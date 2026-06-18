@@ -260,8 +260,16 @@ pub const fn clear_port_feature(feature: u16, port: u8) -> SetupPacket {
 /// (bits 4:0 = 00000) → 0xA0.
 pub const BM_REQUEST_TYPE_CLASS_DEVICE_D2H: u8 = 0xA0;
 
+/// `bmRequestType` for a hub-class GET_STATUS targeting a **port**
+/// (recipient = Other): Device-to-Host (bit 7 = 1), Class type
+/// (bits 6:5 = 01), Other recipient (bits 4:0 = 00011) → 0xA3.
+pub const BM_REQUEST_TYPE_CLASS_OTHER_D2H: u8 = 0xA3;
+
 /// `bRequest` for GET_DESCRIPTOR (USB 2.0 §9.4.3).
 pub const B_REQUEST_GET_DESCRIPTOR: u8 = 0x06;
+
+/// `bRequest` for GET_STATUS (USB 2.0 §9.4 Table 9-4).
+pub const B_REQUEST_GET_STATUS: u8 = 0x00;
 
 /// Encode a `GET_DESCRIPTOR(Hub)` request to fetch the hub's class descriptor.
 ///
@@ -275,6 +283,115 @@ pub const fn get_hub_descriptor(length: u16) -> SetupPacket {
         w_index: 0,
         w_length: length,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Hub-class GET_PORT_STATUS request encoder (USB 2.0 §11.24.2.7)
+// ---------------------------------------------------------------------------
+
+/// Encode a hub-class `GET_STATUS(port)` [`SetupPacket`] (USB 2.0 §11.24.2.7).
+///
+/// The host sends this to read a port's 4-byte status word
+/// `[wPortStatus(2 LE), wPortChange(2 LE)]`.
+///
+/// Per USB 2.0 §11.24.2.7:
+/// * `bmRequestType` = 0xA3 (class, other recipient, device-to-host)
+/// * `bRequest` = 0 (GET_STATUS)
+/// * `wValue` = 0
+/// * `wIndex` = `port` (1-based port number)
+/// * `wLength` = 4 (the 4-byte port status response)
+pub const fn get_port_status(port: u8) -> SetupPacket {
+    SetupPacket {
+        bm_request_type: BM_REQUEST_TYPE_CLASS_OTHER_D2H,
+        b_request: B_REQUEST_GET_STATUS,
+        w_value: 0,
+        w_index: port as u16,
+        w_length: 4,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Port-status bitmap decode helpers (USB 2.0 §11.24.2.7 Tables 11-21/11-22)
+// ---------------------------------------------------------------------------
+//
+// The 4-byte GET_PORT_STATUS response is:
+//   bytes 0..2  wPortStatus  — current port state
+//   bytes 2..4  wPortChange  — change bits (set by hardware, cleared by
+//                              CLEAR_FEATURE(C_PORT_*))
+//
+// wPortStatus bit positions (Table 11-21):
+//   bit 0  PORT_CONNECTION (CCS)
+//   bit 1  PORT_ENABLE     (PE)
+//   bit 4  PORT_RESET
+//
+// wPortChange bit positions (Table 11-22):
+//   bit 0  C_PORT_CONNECTION
+//   bit 4  C_PORT_RESET
+
+/// Bit position of PORT_CONNECTION (CCS) in `wPortStatus`.
+pub const PORT_STATUS_CCS_BIT: u8 = 0;
+/// Bit position of PORT_ENABLE (PE) in `wPortStatus`.
+pub const PORT_STATUS_PE_BIT: u8 = 1;
+/// Bit position of PORT_RESET in `wPortStatus`.
+pub const PORT_STATUS_RESET_BIT: u8 = 4;
+/// Bit position of C_PORT_CONNECTION in `wPortChange`.
+pub const PORT_CHANGE_CONNECTION_BIT: u8 = 0;
+/// Bit position of C_PORT_RESET in `wPortChange`.
+pub const PORT_CHANGE_RESET_BIT: u8 = 4;
+
+/// Returns the little-endian `u16` encoded in bytes `[lo, hi]` of a slice,
+/// or `0` if the slice is too short. Purely internal helper.
+#[inline]
+fn le16_at(status4: &[u8], offset: usize) -> u16 {
+    if status4.len() < offset + 2 {
+        return 0;
+    }
+    u16::from_le_bytes([status4[offset], status4[offset + 1]])
+}
+
+/// Returns `true` if the PORT_CONNECTION (CCS) bit is set in `wPortStatus`.
+///
+/// A device is currently connected to the port when this is `true`.
+///
+/// Defensively returns `false` if `status4` is shorter than 4 bytes.
+pub fn port_status_connected(status4: &[u8]) -> bool {
+    le16_at(status4, 0) & (1 << PORT_STATUS_CCS_BIT) != 0
+}
+
+/// Returns `true` if the PORT_ENABLE (PE) bit is set in `wPortStatus`.
+///
+/// The port is enabled (data transfers are possible) when this is `true`.
+///
+/// Defensively returns `false` if `status4` is shorter than 4 bytes.
+pub fn port_status_enabled(status4: &[u8]) -> bool {
+    le16_at(status4, 0) & (1 << PORT_STATUS_PE_BIT) != 0
+}
+
+/// Returns `true` if the PORT_RESET bit is set in `wPortStatus`.
+///
+/// A USB reset is currently in progress on this port when this is `true`.
+///
+/// Defensively returns `false` if `status4` is shorter than 4 bytes.
+pub fn port_status_resetting(status4: &[u8]) -> bool {
+    le16_at(status4, 0) & (1 << PORT_STATUS_RESET_BIT) != 0
+}
+
+/// Returns `true` if the C_PORT_CONNECTION bit is set in `wPortChange`.
+///
+/// The connection status has changed since the host last cleared this bit.
+///
+/// Defensively returns `false` if `status4` is shorter than 4 bytes.
+pub fn port_change_connection(status4: &[u8]) -> bool {
+    le16_at(status4, 2) & (1 << PORT_CHANGE_CONNECTION_BIT) != 0
+}
+
+/// Returns `true` if the C_PORT_RESET bit is set in `wPortChange`.
+///
+/// A reset sequence has completed since the host last cleared this bit.
+///
+/// Defensively returns `false` if `status4` is shorter than 4 bytes.
+pub fn port_change_reset(status4: &[u8]) -> bool {
+    le16_at(status4, 2) & (1 << PORT_CHANGE_RESET_BIT) != 0
 }
 
 // ---------------------------------------------------------------------------
@@ -804,5 +921,163 @@ mod tests {
         assert!(is_hub_interface(CLASS_HUB));
         assert!(!is_hub_interface(CLASS_HID));
         assert!(!is_hub_interface(0x00));
+    }
+
+    // -----------------------------------------------------------------------
+    // get_port_status encoding tests (A.3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn get_port_status_port1_encoding() {
+        let pkt = get_port_status(1);
+        // bmRequestType: class | other | device-to-host = 0xA3.
+        assert_eq!(pkt.bm_request_type, 0xA3);
+        assert_eq!(pkt.bm_request_type, BM_REQUEST_TYPE_CLASS_OTHER_D2H);
+        // bRequest: GET_STATUS = 0x00.
+        assert_eq!(pkt.b_request, 0x00);
+        assert_eq!(pkt.b_request, B_REQUEST_GET_STATUS);
+        // wValue: 0 (unused for GET_STATUS).
+        assert_eq!(pkt.w_value, 0);
+        // wIndex: port number (1-based).
+        assert_eq!(pkt.w_index, 1);
+        // wLength: 4 (the 4-byte wPortStatus + wPortChange response).
+        assert_eq!(pkt.w_length, 4);
+    }
+
+    #[test]
+    fn get_port_status_port3_encoding() {
+        let pkt = get_port_status(3);
+        assert_eq!(pkt.bm_request_type, BM_REQUEST_TYPE_CLASS_OTHER_D2H);
+        assert_eq!(pkt.b_request, B_REQUEST_GET_STATUS);
+        assert_eq!(pkt.w_value, 0);
+        assert_eq!(pkt.w_index, 3);
+        assert_eq!(pkt.w_length, 4);
+    }
+
+    #[test]
+    fn get_port_status_all_ports_windex() {
+        // Verify each of the 4-port hub's ports produces the correct wIndex.
+        for port in 1u8..=4 {
+            let pkt = get_port_status(port);
+            assert_eq!(pkt.w_index, port as u16, "port {port}: wIndex mismatch");
+            assert_eq!(pkt.w_length, 4, "port {port}: wLength must be 4");
+        }
+    }
+
+    // Verify the exact 8 SETUP bytes via as_u64 for port 2:
+    // A3 00 00 00 02 00 04 00
+    // byte 0: bmRequestType = 0xA3
+    // byte 1: bRequest      = 0x00
+    // bytes 2-3: wValue     = 0x0000 LE
+    // bytes 4-5: wIndex     = 0x0002 LE (port 2)
+    // bytes 6-7: wLength    = 0x0004 LE
+    #[test]
+    fn get_port_status_port2_as_u64_bytes() {
+        let pkt = get_port_status(2);
+        let raw = pkt.as_u64();
+        let bytes = raw.to_le_bytes();
+        assert_eq!(bytes[0], 0xA3, "byte 0: bmRequestType");
+        assert_eq!(bytes[1], 0x00, "byte 1: bRequest GET_STATUS");
+        assert_eq!(bytes[2], 0x00, "byte 2: wValue low");
+        assert_eq!(bytes[3], 0x00, "byte 3: wValue high");
+        assert_eq!(bytes[4], 0x02, "byte 4: wIndex low (port 2)");
+        assert_eq!(bytes[5], 0x00, "byte 5: wIndex high");
+        assert_eq!(bytes[6], 0x04, "byte 6: wLength low (4)");
+        assert_eq!(bytes[7], 0x00, "byte 7: wLength high");
+    }
+
+    // -----------------------------------------------------------------------
+    // Port-status bitmap decode helper tests (A.3)
+    // -----------------------------------------------------------------------
+
+    // [0x01, 0x00, 0x00, 0x00]: wPortStatus=0x0001 (CCS set), wPortChange=0.
+    // → connected, not enabled, not resetting, no change bits.
+    #[test]
+    fn port_status_connected_only() {
+        let s: &[u8] = &[0x01, 0x00, 0x00, 0x00];
+        assert!(port_status_connected(s), "CCS must be set");
+        assert!(!port_status_enabled(s), "PE must be clear");
+        assert!(!port_status_resetting(s), "RESET must be clear");
+        assert!(!port_change_connection(s), "C_CONNECTION must be clear");
+        assert!(!port_change_reset(s), "C_RESET must be clear");
+    }
+
+    // [0x03, 0x00, 0x00, 0x00]: wPortStatus=0x0003 (CCS+PE), wPortChange=0.
+    // → connected, enabled, not resetting.
+    #[test]
+    fn port_status_connected_and_enabled() {
+        let s: &[u8] = &[0x03, 0x00, 0x00, 0x00];
+        assert!(port_status_connected(s));
+        assert!(port_status_enabled(s));
+        assert!(!port_status_resetting(s));
+        assert!(!port_change_connection(s));
+        assert!(!port_change_reset(s));
+    }
+
+    // [0x13, 0x00, 0x01, 0x00]:
+    //   wPortStatus = 0x0013 = bits 0,1,4 = CCS + PE + RESET
+    //   wPortChange = 0x0001 = bit 0 = C_CONNECTION
+    #[test]
+    fn port_status_connected_enabled_resetting_c_connection() {
+        let s: &[u8] = &[0x13, 0x00, 0x01, 0x00];
+        assert!(port_status_connected(s), "CCS");
+        assert!(port_status_enabled(s), "PE");
+        assert!(port_status_resetting(s), "RESET (bit 4)");
+        assert!(
+            port_change_connection(s),
+            "C_CONNECTION (bit 0 of wPortChange)"
+        );
+        assert!(!port_change_reset(s), "C_RESET must be clear");
+    }
+
+    // [0x00, 0x00, 0x10, 0x00]:
+    //   wPortStatus = 0x0000 (nothing)
+    //   wPortChange = 0x0010 = bit 4 = C_RESET
+    #[test]
+    fn port_change_reset_set_only() {
+        let s: &[u8] = &[0x00, 0x00, 0x10, 0x00];
+        assert!(!port_status_connected(s));
+        assert!(!port_status_enabled(s));
+        assert!(!port_status_resetting(s));
+        assert!(!port_change_connection(s));
+        assert!(port_change_reset(s), "C_RESET (bit 4 of wPortChange)");
+    }
+
+    // All-zero status: everything false.
+    #[test]
+    fn port_status_all_zero() {
+        let s: &[u8] = &[0x00, 0x00, 0x00, 0x00];
+        assert!(!port_status_connected(s));
+        assert!(!port_status_enabled(s));
+        assert!(!port_status_resetting(s));
+        assert!(!port_change_connection(s));
+        assert!(!port_change_reset(s));
+    }
+
+    // Short-slice (2 bytes): all helpers must return false without panicking.
+    #[test]
+    fn port_status_short_slice_no_panic() {
+        let s: &[u8] = &[0xFF, 0xFF]; // only 2 bytes instead of 4
+        // wPortStatus: both bytes present → can read LE u16 = 0xFFFF
+        assert!(port_status_connected(s)); // CCS bit set in 0xFFFF
+        assert!(port_status_enabled(s)); // PE bit set
+        assert!(port_status_resetting(s)); // RESET bit set
+        // wPortChange: at offset 2, need 2 bytes but only 0 remain → 0 → false
+        assert!(
+            !port_change_connection(s),
+            "must return false for short slice"
+        );
+        assert!(!port_change_reset(s), "must return false for short slice");
+    }
+
+    // Empty slice: all helpers must return false without panicking.
+    #[test]
+    fn port_status_empty_slice_no_panic() {
+        let s: &[u8] = &[];
+        assert!(!port_status_connected(s));
+        assert!(!port_status_enabled(s));
+        assert!(!port_status_resetting(s));
+        assert!(!port_change_connection(s));
+        assert!(!port_change_reset(s));
     }
 }
