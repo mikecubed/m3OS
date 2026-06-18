@@ -725,6 +725,17 @@ fn main() {
             });
             cmd_usb_smoke(&smoke_args);
         }
+        // Phase 92 Track C — USB hot-plug: device_add/device_del a usb-mouse
+        // mid-run over QMP and assert the live attach/detach + Disable Slot path.
+        Some("usb-hotplug-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("usb-hotplug-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_usb_hotplug_smoke(&smoke_args);
+        }
         Some("ssh-e1000-banner-check") => {
             let banner_args = parse_ssh_e1000_banner_check_args(&args[2..]).unwrap_or_else(|err| {
                 eprintln!("Error: {err}");
@@ -10355,6 +10366,173 @@ fn cmd_usb_smoke(args: &SmokeBootArgs) {
         }
         Err(msg) => {
             eprintln!("usb-smoke: FAILED\n{msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Phase 92 Track C — USB hot-plug acceptance gate.
+///
+/// Boots m3OS with `-device qemu-xhci` (+ the default `usb-kbd`/`usb-mouse`),
+/// waits for the USB IPC server + `usb-hid` to finish the boot enumeration,
+/// then over QMP `device_add`s a fresh `usb-mouse` mid-run and asserts the
+/// server enumerated it dynamically (`USB_HOTPLUG:attached`), then `device_del`s
+/// it and asserts the clean detach + Disable Slot reclamation
+/// (`USB_HOTPLUG:detached`). Proves the live Port Status Change → AttachNotice
+/// pipeline (C.1/C.3) and the detach + slot-teardown path (C.2/C.4 + H.3)
+/// without restarting any daemon.
+fn cmd_usb_hotplug_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+    let ovmf = find_ovmf();
+
+    let qmp_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&qmp_socket);
+
+    let devices = DeviceSet {
+        xhci: true,
+        ..DeviceSet::default()
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, QemuDisplayMode::Headless, devices);
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    qemu_args.push("-qmp".to_string());
+    qemu_args.push(format!("unix:{},server,nowait", qmp_socket.display()));
+
+    println!(
+        "usb-hotplug-smoke: launching QEMU with -device qemu-xhci (timeout {}s, qmp {})",
+        args.timeout_secs,
+        qmp_socket.display()
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let rx = spawn_serial_reader(stdout);
+    let mut serial_history = String::new();
+    let mut serial_buf = String::new();
+    let global_start = std::time::Instant::now();
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let step = std::time::Duration::from_secs(args.timeout_secs.min(180));
+
+    // Number of attach/detach cycles. >1 proves re-enumeration after a detach
+    // (C.3) AND that Disable Slot reclamation (H.3) prevents slot-pool
+    // exhaustion — without it the Nth Enable Slot would eventually fail.
+    const CYCLES: usize = 3;
+
+    let result: Result<(), String> = (|| {
+        // (1) USB IPC server registered + IRQ bound, and (2) usb-hid finished the
+        // boot enumeration (so the static device table — kbd+mouse — is built and
+        // the next attach is genuinely a hot-plug, not a boot device).
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "XHCI_USB:server-ready",
+            step,
+            global_start,
+            global_timeout,
+        )?;
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "usb-hid: polling",
+            step,
+            global_start,
+            global_timeout,
+        )?;
+        println!("usb-hotplug-smoke: USB stack ready — driving QMP device_add/device_del");
+
+        let qmp_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut q = qmp::QmpClient::connect(&qmp_socket, qmp_deadline)
+            .map_err(|e| format!("qmp connect: {e}"))?;
+
+        for cycle in 0..CYCLES {
+            // Reset the match buffer so a stale prior-cycle sentinel can't
+            // satisfy this cycle's wait (the buffer is append-only and never
+            // drains on match). The serial *history* (for failure dumps) is
+            // preserved. Nothing relevant is pending here — the sentinel we wait
+            // for is emitted only after the device_add/device_del below.
+            serial_buf.clear();
+
+            // (3) Hot-add a usb-mouse on a free port of the live controller. The
+            // Port Status Change wakes the server's bound IRQ, which runs
+            // run_enumeration for the new device and publishes its AttachNotice.
+            q.execute(
+                "device_add",
+                serde_json::json!({"driver": "usb-mouse", "id": "hp0", "bus": "xhci0.0"}),
+            )
+            .map_err(|e| format!("cycle {cycle}: qmp device_add usb-mouse: {e}"))?;
+            wait_for_serial_pattern(
+                &rx,
+                &mut serial_buf,
+                &mut serial_history,
+                "USB_HOTPLUG:attached",
+                step,
+                global_start,
+                global_timeout,
+            )
+            .map_err(|e| format!("cycle {cycle} (attach): {e}"))?;
+
+            // (4) Hot-remove it; the disconnect must flip the AttachNotice to
+            // attached:false and reclaim the slot via Disable Slot.
+            q.execute("device_del", serde_json::json!({"id": "hp0"}))
+                .map_err(|e| format!("cycle {cycle}: qmp device_del: {e}"))?;
+            wait_for_serial_pattern(
+                &rx,
+                &mut serial_buf,
+                &mut serial_history,
+                "USB_HOTPLUG:detached",
+                step,
+                global_start,
+                global_timeout,
+            )
+            .map_err(|e| format!("cycle {cycle} (detach): {e}"))?;
+            println!("usb-hotplug-smoke: cycle {cycle} attach+detach OK (slot reclaimed)");
+
+            // Let QEMU settle the port-down before the next device_add reuses it.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+        Ok(())
+    })();
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&qmp_socket);
+    match result {
+        Ok(()) => {
+            let elapsed = global_start.elapsed().as_secs();
+            println!(
+                "usb-hotplug-smoke: PASSED ({elapsed}s) — {CYCLES} attach/detach cycles: each \
+                 device_add enumerated live + device_del detached/reclaimed (no slot exhaustion, \
+                 no daemon restart)"
+            );
+        }
+        Err(msg) => {
+            eprintln!("usb-hotplug-smoke: FAILED\n{msg}");
             std::process::exit(1);
         }
     }

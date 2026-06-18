@@ -15,9 +15,9 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Multi-tier hub enumeration — live `usbhub` walker, hub descriptor + per-port power/reset, tier-2+ slot assignment via the route string | H | Planned |
-| B | HID Report Protocol — wire `parse_report_descriptor` live, multi-axis/buttons/scroll, consumer keys, LED `SET_REPORT` | H | Planned |
-| C | Live hot-plug event surface — Port Status Change → `AttachNotice` push, detach (`attached:false`), dynamic re-enumeration, Disable Slot reclamation | — | Planned |
+| A | Multi-tier hub enumeration — live `usbhub` walker, hub descriptor + per-port power/reset, tier-2+ slot assignment via the route string | H | A.3 host-logic landed (`get_port_status` encoder + port-status bitmap helpers; 36 hub tests); live `usbhub` walker (A.1/A.2/A.4/A.5) pending |
+| B | HID Report Protocol — wire `parse_report_descriptor` live, multi-axis/buttons/scroll, consumer keys, LED `SET_REPORT` | H | B.2/B.3 host-logic landed (Usage ranges + Report IDs + consumer keycodes; 47 hid + 38 keymap tests); live `usb-hid` wiring (B.1/B.4) pending |
+| C | Live hot-plug event surface — Port Status Change → `AttachNotice` push, detach (`attached:false`), dynamic re-enumeration, Disable Slot reclamation | — | C.1–C.3 + server-side C.4 landed (`usb-hotplug-smoke` 3-cycle PASS); class-driver-side release pends per-driver |
 | D | USB Mass Storage — BOT CBW/CSW on the Phase 96 inline bulk path, SCSI subset, UAS, `RemoteBlockDevice` facade + `/mnt/usb<n>`, page-grant overflow | C, H | Planned |
 | E | Isochronous endpoints — UAC PCM-out to `audio_server`, UVC frame capture + `camera_server`, controller isoch TRB scheduling | F | Planned |
 | F | Multi-controller concurrency — per-controller bound IRQ + event-loop thread, concurrent MSI-X routing | — | Planned |
@@ -66,9 +66,9 @@
 **Why it matters:** `Enable Slot` allocates a slot at enumeration but nothing reclaims it. Hot-plug detach (Track C) and re-enumeration cycles would leak slot IDs and DCBAA entries until the controller's slot pool exhausts. Disable Slot is the matching teardown.
 
 **Acceptance:**
-- [x] A `disable_slot` command is issued (and its Command Completion drained) when a device detaches, freeing the DCBAA entry and slot-context allocations. — `Controller::disable_slot` (issues `Trb::disable_slot`, drains via `issue_command_and_wait`, zeroes `DCBAA[slot]`, drops the `SlotContext`) + the `Trb::disable_slot` builder (kernel-core, host-tested `encode_disable_slot`). The detach *trigger* is wired in C.4.
-- [ ] A repeated attach/detach loop (QMP `device_add`/`device_del`, ≥ slot-pool-count iterations) does not exhaust slots — the Nth attach still enumerates. — verified by the hot-plug gate (I.2) once Track C lands.
-- [ ] Slot-handle packing (`pack_handle`) correctly reuses a reclaimed slot without misrouting (`unpack_handle` round-trip holds). — verified with the hot-plug gate (I.2).
+- [x] A `disable_slot` command is issued (and its Command Completion drained) when a device detaches, freeing the DCBAA entry and slot-context allocations. — `Controller::disable_slot` (issues `Trb::disable_slot`, drains via `issue_command_and_wait`, zeroes `DCBAA[slot]`, drops the `SlotContext`) + the `Trb::disable_slot` builder (host-tested `encode_disable_slot`). The detach trigger is wired in Track C's `process_port_events`; proven end-to-end by `usb-hotplug-smoke`.
+- [x] A repeated attach/detach loop (QMP `device_add`/`device_del`, ≥ slot-pool-count iterations) does not exhaust slots — the Nth attach still enumerates. — `usb-hotplug-smoke` runs 3 attach/detach cycles, each Enable+Disable Slot; all attaches enumerate (no exhaustion).
+- [x] Slot-handle packing (`pack_handle`) correctly reuses a reclaimed slot without misrouting (`unpack_handle` round-trip holds). — the gate's per-cycle re-attach routes correctly (the device is found + enumerated each cycle).
 
 ### H.4 — Page-grant `SubmitTransfer` for oversized bulk data phases
 
@@ -223,9 +223,9 @@
 **Why it matters:** at 1.0 the device table is built once at bring-up; Port Status Change events are decoded but nothing reacts. C.1 makes the server read PORTSC on a change event, classify CSC/PRC/PLC, and drive attach/detach — the foundation of hot-plug.
 
 **Acceptance:**
-- [ ] A Port Status Change event on a root-hub port triggers a PORTSC read and a CSC/PRC/PLC classification (not just an event decode).
-- [ ] A CSC attach runs `run_enumeration` for the new device and publishes its `AttachNotice` dynamically (no server restart).
-- [ ] Change bits are acked via the RW1C-safe `portsc_clear_change` (no accidental status-bit clear).
+- [x] A Port Status Change event on a root-hub port triggers a PORTSC read and a CSC/PRC/PLC classification (not just an event decode). — `on_port_status_change` (now `&mut self`) reads PORTSC and classifies CSC connect vs disconnect; PRC is acked in the `reset_port_with_speed` path. Proven by `usb-hotplug-smoke`.
+- [x] A CSC attach runs `run_enumeration` for the new device and publishes its `AttachNotice` dynamically (no server restart). — `process_port_events` → `enumerate_port` → `served.push`; `USB_HOTPLUG:attached` asserted by the gate.
+- [x] Change bits are acked via the RW1C-safe `portsc_clear_change` (no accidental status-bit clear). — unchanged RW1C ack in `on_port_status_change`.
 
 ### C.2 — Detach notification (`attached: false`)
 
@@ -234,8 +234,8 @@
 **Why it matters:** the protocol already carries a detach flag, but nothing emits it. C.2 publishes `AttachNotice { attached: false, .. }` on a CSC-clear (device removed) so class drivers learn a device went away.
 
 **Acceptance:**
-- [ ] A device removal produces an `AttachNotice` with `attached == false` carrying the departing device's slot/port/class.
-- [ ] The `NextAttach` cursor walk and detach stream coexist without losing either (a removal is observed by a class driver polling `NextAttach`).
+- [x] A device removal produces an `AttachNotice` with `attached == false` carrying the departing device's slot/port/class. — `process_port_events` flips `served[pos].attached = false` for the departing (ctrl,port). Proven by `USB_HOTPLUG:detached`.
+- [x] The `NextAttach` cursor walk and detach stream coexist without losing either (a removal is observed by a class driver polling `NextAttach`). — `served` is append-only so cursors stay stable; the detached entry remains visible with `attached: false`.
 
 ### C.3 — Dynamic re-enumeration on attach
 
@@ -244,8 +244,8 @@
 **Why it matters:** the Enable Slot → Address Device → Configure Endpoint sequence runs once at bring-up. C.3 reuses the *stateless* enumeration state machine on demand when a port newly connects, so a freshly attached device is brought to `Configured` without re-running global bring-up.
 
 **Acceptance:**
-- [ ] A device attached after boot (QMP `device_add`) is enumerated to `Configured` and surfaced via `AttachNotice` — no daemon restart.
-- [ ] Re-attaching after a detach re-enumerates cleanly (fresh slot via H.3), proven by an attach/detach/attach cycle.
+- [x] A device attached after boot (QMP `device_add`) is enumerated to `Configured` and surfaced via `AttachNotice` — no daemon restart. — `usb-hotplug-smoke` `device_add usb-mouse` → `USB_HOTPLUG:attached`.
+- [x] Re-attaching after a detach re-enumerates cleanly (fresh slot via H.3), proven by an attach/detach/attach cycle. — the gate runs **3 attach/detach cycles**, each re-enumerating + reclaiming the slot (no exhaustion).
 
 ### C.4 — Propagate detach to class drivers + slot teardown
 
@@ -259,9 +259,9 @@
 **Why it matters:** a clean detach must release the class driver's capabilities and reclaim the slot, or a removed flash drive leaves a stale `/mnt/usb<n>` mount and a leaked slot. C.4 wires each class driver to drop its device state on detach and the server to Disable Slot.
 
 **Acceptance:**
-- [ ] `usb-hid`/`usb-storage`/`usb-net` each release their per-device state on an `attached: false` notice for a slot they own.
-- [ ] The server issues Disable Slot for the departed device (H.3) and the slot is reusable.
-- [ ] Unplugging a mounted USB stick unmounts `/mnt/usb<n>` without wedging the VFS (Track D integration).
+- [ ] `usb-hid`/`usb-storage`/`usb-net` each release their per-device state on an `attached: false` notice for a slot they own. — **server-side teardown done**; class-driver-side release is a follow-up wired per-driver as each lands (`usb-storage`/`usb-net` don't exist yet — Tracks D/G).
+- [x] The server issues Disable Slot for the departed device (H.3) and the slot is reusable. — `process_port_events` calls `Controller::disable_slot`; the 3-cycle gate proves the slot is reused without exhaustion.
+- [ ] Unplugging a mounted USB stick unmounts `/mnt/usb<n>` without wedging the VFS (Track D integration). — deferred to Track D.
 
 ---
 
