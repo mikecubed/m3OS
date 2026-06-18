@@ -223,8 +223,25 @@ pub fn handle_neighbor_advertisement(icmpv6_msg: &[u8]) {
 pub fn handle_router_advertisement(src_ip: &Ipv6Addr, src_mac: MacAddr, icmpv6_msg: &[u8]) {
     let ra = match ndp_core::parse_router_advertisement(icmpv6_msg) {
         Some(r) => r,
-        None => return,
+        None => {
+            // Diagnostic: a real router's RA reached us but the parser bailed
+            // (an option/length the synthetic tests never exercised).
+            log::warn!("[ndp] RA parse FAILED ({} bytes)", icmpv6_msg.len());
+            return;
+        }
     };
+    // Diagnostic: surface what we actually parsed from a real RA so a
+    // SLAAC-no-show (managed flag, missing/non-autonomous prefix, zero lifetime)
+    // is visible.
+    log::info!(
+        "[ndp] RA rx: managed={} other={} lifetime={} prefix={} autonomous={} rdnss={}",
+        ra.managed,
+        ra.other,
+        ra.router_lifetime,
+        ra.prefix.is_some(),
+        ra.prefix.as_ref().map(|p| p.autonomous).unwrap_or(false),
+        ra.rdnss.len(),
+    );
     // Learn the router's link-local -> MAC so we can route through it.
     learn(*src_ip, src_mac);
 

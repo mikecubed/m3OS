@@ -48,8 +48,17 @@ pub fn arm_ping6(id: u16, seq: u16) {
 /// `src_mac` is the Ethernet source, used by NDP for passive learning.
 pub fn handle_icmpv6(ip_header: &Ipv6Header, payload: &[u8], src_mac: MacAddr) {
     // Verify the pseudo-header checksum; a wrong-checksum packet is dropped.
-    if ipv6::pseudo_header_checksum(ip_header.src, ip_header.dst, ipv6::PROTO_ICMPV6, payload) != 0
-    {
+    let cksum =
+        ipv6::pseudo_header_checksum(ip_header.src, ip_header.dst, ipv6::PROTO_ICMPV6, payload);
+    if cksum != 0 {
+        // Diagnostic: surface a dropped Router Advertisement (real routers, not
+        // SLIRP) so a checksum/offset regression is visible on the wire.
+        if payload.first() == Some(&ICMPV6_ROUTER_ADVERTISEMENT) {
+            log::warn!(
+                "[ndp] RA dropped: ICMPv6 checksum {cksum:#06x} != 0 ({} bytes)",
+                payload.len()
+            );
+        }
         return;
     }
 

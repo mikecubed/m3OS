@@ -139,8 +139,16 @@ fn handle_udp_v6(header: &Ipv6Header, payload: &[u8]) {
 /// `tcp_tick`). Forms the link-local address on first run, solicits a router,
 /// and steps the DHCPv6 client.
 pub fn v6_tick() {
-    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
     static INITED: AtomicBool = AtomicBool::new(false);
+    static RS_SENT: AtomicU8 = AtomicU8::new(0);
+    static TICKS_SINCE_RS: AtomicU32 = AtomicU32::new(0);
+
+    // RFC 4861: send up to MAX_RTR_SOLICITATIONS (3) Router Solicitations, one
+    // RTR_SOLICITATION_INTERVAL (~4 s) apart. v6_tick rides the ~200 ms net
+    // deadline, so ~20 ticks ≈ 4 s.
+    const MAX_RTR_SOLICITATIONS: u8 = 3;
+    const TICKS_PER_RS: u32 = 20;
 
     // Form the link-local address + kick off discovery once the MAC is known.
     if !INITED.load(Ordering::Relaxed)
@@ -148,7 +156,23 @@ pub fn v6_tick() {
     {
         INITED.store(true, Ordering::Relaxed);
         ndp::send_router_solicitation();
+        RS_SENT.store(1, Ordering::Relaxed);
+        TICKS_SINCE_RS.store(0, Ordering::Relaxed);
         log::info!("[ipv6] link-local configured; router solicitation sent");
+    }
+
+    // Retransmit the Router Solicitation until a global address is configured,
+    // so a single missed/dropped RA does not leave the host without SLAAC (a
+    // real router replies to an RS, but the first reply can be lost). Periodic
+    // multicast RAs cover the tail once we stop soliciting.
+    if INITED.load(Ordering::Relaxed)
+        && super::config::global_ip_v6().is_none()
+        && RS_SENT.load(Ordering::Relaxed) < MAX_RTR_SOLICITATIONS
+        && TICKS_SINCE_RS.fetch_add(1, Ordering::Relaxed) + 1 >= TICKS_PER_RS
+    {
+        ndp::send_router_solicitation();
+        RS_SENT.fetch_add(1, Ordering::Relaxed);
+        TICKS_SINCE_RS.store(0, Ordering::Relaxed);
     }
 
     super::dhcpv6::tick();

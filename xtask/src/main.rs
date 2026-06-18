@@ -12852,9 +12852,12 @@ fn cmd_pku_smoke(args: &SmokeBootArgs) {
 /// SLAAC + stateless-DHCPv6-DNS need a real IPv6 router: QEMU 8.2.2's libslirp
 /// does Neighbor Solicitation but sends NO Router Advertisements and runs no
 /// DHCPv6 server (packet-capture-confirmed), so those wire arms are gated behind
-/// `live` (`M3OS_IPV6_LIVE=1`, a TAP + radvd/dhcpd host setup) and skip by
-/// default — mirroring the established opt-in `*_NET` regression pattern.
-fn ipv6_smoke_steps(live: bool) -> Vec<SmokeStep> {
+/// `live` (`M3OS_IPV6_LIVE=1`) and skip by default — mirroring the established
+/// opt-in `*_NET` regression pattern. The `live` arms only pass when the guest
+/// is on a network that actually emits RAs/DHCPv6: set `M3OS_IPV6_TAP=<ifname>`
+/// to attach a pre-created TAP bridged either to a LAN with a real IPv6 router
+/// or to a host-run `radvd`/`dnsmasq` (SLIRP alone cannot satisfy them).
+fn ipv6_smoke_steps(live: bool, dhcpv6: bool) -> Vec<SmokeStep> {
     let mut steps = vec![SmokeStep::Wait {
         pattern: "[m3os] Hello from kernel",
         timeout_secs: 30,
@@ -12876,18 +12879,26 @@ fn ipv6_smoke_steps(live: bool) -> Vec<SmokeStep> {
         timeout_secs: 40,
         label: "guest/ipv6-smoke: answered a live Neighbor Solicitation (NDP_RESOLVE_OK)",
     });
-    // SLAAC global + stateless DHCPv6 DNS — need a real router (see doc comment).
+    // SLAAC global address — the primary live proof: it is RA-driven, so any
+    // router that hands out IPv6 via SLAAC (the common case, incl. most home
+    // routers) satisfies it. Needs a real router on the wire (M3OS_IPV6_TAP).
     if live {
         steps.push(SmokeStep::Wait {
             pattern: "[ndp] SLAAC global",
-            timeout_secs: 30,
+            timeout_secs: 60,
             label: "guest/ipv6-smoke: SLAAC global address from RA (SLAAC_ADDR_OK)",
         });
-        steps.push(SmokeStep::Wait {
-            pattern: "[dhcpv6] bound",
-            timeout_secs: 30,
-            label: "guest/ipv6-smoke: stateless DHCPv6 DNS (DHCPV6_DNS_OK)",
-        });
+        // The DHCPv6 lease is asserted only when the operator knows the router
+        // runs a DHCPv6 server (M3OS_IPV6_DHCPV6=1). A SLAAC-only router (no
+        // DHCPv6) leaves the guest's Information-Requests unanswered — so making
+        // this a hard step by default would wrongly fail on the common case.
+        if dhcpv6 {
+            steps.push(SmokeStep::Wait {
+                pattern: "[dhcpv6] bound",
+                timeout_secs: 30,
+                label: "guest/ipv6-smoke: DHCPv6 DNS lease (DHCPV6_DNS_OK)",
+            });
+        }
     }
     steps.extend(boot_and_login_steps());
     steps.push(SmokeStep::Sleep { millis: 500 });
@@ -12927,6 +12938,14 @@ fn cmd_ipv6_smoke(args: &SmokeBootArgs) {
     let ovmf = find_ovmf();
     let kvm = std::env::var_os("M3OS_KVM").is_some_and(|v| v != "0" && !v.is_empty());
     let live = std::env::var_os("M3OS_IPV6_LIVE").is_some_and(|v| v != "0" && !v.is_empty());
+    // M3OS_IPV6_TAP=<ifname> attaches the guest to a pre-created TAP device
+    // instead of SLIRP. Bridge that TAP to a LAN segment that has a real IPv6
+    // router and the router's Router Advertisements + DHCPv6 reach the guest, so
+    // SLAAC global-address formation and the DHCPv6 DNS lease actually run — the
+    // path QEMU's user-mode (SLIRP) backend cannot exercise (it sends no RAs).
+    let tap_ifname = std::env::var("M3OS_IPV6_TAP")
+        .ok()
+        .filter(|s| !s.is_empty());
     let display_mode = if args.display {
         QemuDisplayMode::Gui
     } else {
@@ -12941,24 +12960,47 @@ fn cmd_ipv6_smoke(args: &SmokeBootArgs) {
             ..DeviceSet::default()
         },
     );
-    // Enable IPv6 on the SLIRP user netdev (default fec0::/64 prefix, host
-    // fec0::2, DNS fec0::3 — sends RAs for SLAAC + answers stateless DHCPv6) and
-    // drop the host-forward rules (the gate needs no inbound host networking).
+    // Network backend. With a TAP device the guest is on a real L2 segment (the
+    // operator bridges `ifname` to a LAN with an IPv6 router). Otherwise SLIRP
+    // user-mode with ipv6=on (default fec0::/64 prefix, host fec0::2, DNS
+    // fec0::3): NDP NS/NA work over the wire, but libslirp sends NO Router
+    // Advertisements and runs no DHCPv6 server, so SLAAC/DHCPv6 cannot run
+    // (see `ipv6_smoke_steps`). Either way the host-forward rules are dropped.
     for arg in qemu_args.iter_mut() {
         if arg.starts_with("user,id=net0,hostfwd=") || arg.as_str() == "user,id=net0" {
-            *arg = "user,id=net0,ipv6=on".to_string();
+            *arg = match &tap_ifname {
+                Some(ifname) => {
+                    format!("tap,id=net0,ifname={ifname},script=no,downscript=no")
+                }
+                None => "user,id=net0,ipv6=on".to_string(),
+            };
         }
     }
+    if live && tap_ifname.is_none() {
+        eprintln!(
+            "ipv6-smoke: WARNING — M3OS_IPV6_LIVE=1 asserts SLAAC + DHCPv6 \
+             ([ndp] SLAAC global / [dhcpv6] bound), which require a real IPv6 \
+             router. QEMU SLIRP sends no Router Advertisements, so without \
+             M3OS_IPV6_TAP=<tap-ifname> (a TAP bridged to a LAN that has an IPv6 \
+             router) these arms will time out."
+        );
+    }
     append_ac97_audio_flags_headless(&mut qemu_args);
-    let steps = ipv6_smoke_steps(live);
+    // The DHCPv6-lease arm is asserted only when the operator confirms the
+    // network runs a DHCPv6 server (a SLAAC-only router never answers).
+    let dhcpv6 = std::env::var_os("M3OS_IPV6_DHCPV6").is_some_and(|v| v != "0" && !v.is_empty());
+    let steps = ipv6_smoke_steps(live, dhcpv6);
 
     println!(
         "ipv6-smoke: launching QEMU (timeout {}s){}",
         args.timeout_secs,
-        if live {
-            " [live SLIRP RA/DHCPv6 arms asserted]"
-        } else {
-            " [always-on ring-3 arms; live arms best-effort]"
+        match (live, tap_ifname.as_deref()) {
+            (true, Some(ifname)) => {
+                format!(" [live SLAAC/DHCPv6 arms asserted; TAP {ifname}]")
+            }
+            (true, None) => " [live arms asserted — needs M3OS_IPV6_TAP!]".to_string(),
+            (false, Some(ifname)) => format!(" [TAP {ifname}; ring-3 arms]"),
+            (false, None) => " [always-on ring-3 arms; live arms best-effort]".to_string(),
         }
     );
 

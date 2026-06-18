@@ -210,8 +210,19 @@ SLAAC's global-address formation depends on an RA prefix and DHCPv6 depends on a
 server, those two arms are **implemented and host-tested** (the 46 kernel-core
 unit tests across the new `ipv6`/`icmpv6`/`ndp`/`dhcpv6` modules, plus the
 `udp`/`tcp` `build_v6` + RA-decision tests) but can only live-validate behind the
-opt-in **`M3OS_IPV6_LIVE`** arm, which requires a real IPv6 router
-(a TAP + radvd/dhcpd host setup). They skip-with-reason in CI rather than
+opt-in **`M3OS_IPV6_LIVE`** arm, which requires a real IPv6 router. That arm
+attaches the guest to a real LAN via `M3OS_IPV6_TAP=<ifname>` — a TAP bridged to
+a segment that has a router — instead of SLIRP. **SLAAC was demonstrated
+end-to-end against a real home router** this way: the guest received the
+router's Router Advertisement, formed a real `/64` global address, and the full
+`ipv6-smoke` gate PASSed. The real-router run also surfaced two robustness
+items, now landed: an **RFC 4861 Router-Solicitation retransmit** (up to three,
+~4 s apart, until a global address is configured, so a single dropped RA does
+not strand the host) and concise **RA-reception diagnostics**. Per-run
+acquisition is nonetheless best-effort — bounded by the router's RA cadence and
+the deferred **MLD** (without MLD the guest never formally joins the all-nodes
+group `ff02::1`, so multicast RA delivery across a bridge is not guaranteed) —
+which is why these arms stay opt-in and skip-with-reason in CI rather than
 silently passing.
 
 ## Key Files
