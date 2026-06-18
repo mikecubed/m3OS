@@ -1,6 +1,6 @@
 # Phase 92 - USB Class Expansion
 
-**Status:** Planned
+**Status:** In Progress — core landed + validated (kernel `0.92.0`); sub-phases 92a–92e scheduled
 **Source Ref:** phase-92
 **Depends on:** Phase 78a (xHCI Host Bring-Up) ✅, Phase 78b (USB Enumeration + Hub) ✅, Phase 78c (HID Boot Protocol + `usb` IPC service) ✅, Phase 74 (IPC Capability Grants — the page-grant transport) ✅, Phase 83 (Release 1.0 Gate) ✅, Phase 96 (Bare-Metal USB-Ethernet) ✅ — the USB **bulk-endpoint transport** + **multi-controller handle codec** this phase's bulk-class drivers build on landed ahead of Phase 92 via PR 248 (host-stack robustness) and PR 237 (the `ure` driver)
 **Builds on:** Extends the Phase 78 USB foundation — xHCI host driver, root-hub enumeration, HID Boot-Protocol keyboard + mouse, and the `usb` IPC service — with the USB class features explicitly deferred from 78c. It builds **directly on the Phase 96 bulk-endpoint substrate** (landed ahead of this phase): the `PollBulkIn` / `SubmitBulkOut` / `BulkData` inline bulk transport, the `ControlWrite` OUT-with-data control path, `USB_MSG_MAX` raised 1024 → 4096, the multi-controller `handle.rs` slot codec, and the three Phase 78c carry-over hardening fixes (see *Carry-over hardening*). Phase 92 adds the class drivers on top rather than re-implementing transport.

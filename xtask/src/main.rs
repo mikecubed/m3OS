@@ -47,6 +47,11 @@ const USERSPACE_LIB_HOST_TEST_PACKAGES: &[(&str, &[&str])] = &[
     ("audio_mixer", &[]),
     // Phase 63a Track B — C-ABI veneer over audio_client
     ("audio_client_ffi", &[]),
+    // Phase 92 — the usb-core IPC codec (UsbRequest/UsbReply round-trip) is the
+    // load-bearing contract between the xhci server and every USB class driver
+    // (usb-hid/usb-storage/usbhub); gate its protocol tests so a codec
+    // regression can't slip the merge gate.
+    ("usb-core", &[]),
     // Phase 70 Track A0 — C-ABI veneer over the Phase 56 display protocol codec
     ("display_client_ffi", &[]),
     // Phase 64 — session_manager pure-logic `table` and `lifecycle`
@@ -6084,7 +6089,7 @@ fn cmd_check() {
     stat_assembly_gate();
 
     println!(
-        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, ac97_driver, hda_driver, ahci_driver, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, shadow, ldso_core, wifi-core, mt792x_driver, m3ctl, xhci_driver, pkg-format, xtask, and pkg host tests pass; doom platform-layer C tests pass; retpoline indirect-branch gate pass; stat-assembly gate pass"
+        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, ac97_driver, hda_driver, ahci_driver, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, shadow, ldso_core, wifi-core, mt792x_driver, m3ctl, xhci_driver, usb-core, pkg-format, xtask, and pkg host tests pass; doom platform-layer C tests pass; retpoline indirect-branch gate pass; stat-assembly gate pass"
     );
 }
 
@@ -10704,19 +10709,19 @@ fn cmd_usb_storage_smoke(args: &SmokeBootArgs) {
     }
 }
 
-/// Boots m3OS with `-device qemu-xhci` plus a `-device usb-hub` (carrying a
-/// `usb-kbd` on a downstream port) and asserts the ring-3 `usbhub` daemon
-/// (Phase 92 Track A) came live: it bound the `CLASS_HUB` interface surfaced by
-/// the server (`usbhub: bound hub`), read the hub descriptor over EP0 and
-/// powered every downstream port (`XHCI_HUB:enumerated ports=N`), detected the
-/// downstream device via `GET_PORT_STATUS` and drove `PORT_RESET` to enable
-/// (`usbhub: port N reset+enabled`), and finished its bring-up (`USB_HUB:ready`).
+/// Boots m3OS with `-device qemu-xhci` plus a bare `-device usb-hub` (no
+/// downstream device) and asserts the ring-3 `usbhub` daemon (Phase 92 Track A)
+/// came live: it bound the `CLASS_HUB` interface surfaced by the server
+/// (`usbhub: bound hub`), read the hub descriptor over EP0 and powered every
+/// downstream port (`XHCI_HUB:enumerated ports=N`), and finished its bring-up
+/// (`USB_HUB:ready`).
 ///
 /// This proves A.1 (resident hub walker over the `NextAttach` cursor) + A.2 (hub
-/// descriptor read + per-port PORT_POWER/PORT_RESET) end-to-end. Surfacing the
-/// downstream device as its OWN `AttachNotice` (tier-2 enumeration via the route
-/// string, A.4/A.5) is scheduled as Phase 92a; the downstream `usb-kbd` here is
-/// only used to make a hub port report a connection so the reset path runs.
+/// descriptor read + per-port PORT_POWER) end-to-end. The PORT_RESET-to-enabled
+/// path needs a downstream connection to report (no device is attached here, so
+/// no port reports a connection and that path does not run); it is exercised
+/// once tier-2 enumeration — surfacing the downstream device as its own
+/// `AttachNotice` via the route string (A.4/A.5) — lands in Phase 92a.
 fn cmd_usb_hub_smoke(args: &SmokeBootArgs) {
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
