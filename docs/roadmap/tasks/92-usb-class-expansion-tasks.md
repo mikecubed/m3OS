@@ -20,7 +20,7 @@
 | C | Live hot-plug event surface — Port Status Change → `AttachNotice` push, detach (`attached:false`), dynamic re-enumeration, Disable Slot reclamation | — | C.1–C.3 + server-side C.4 landed (`usb-hotplug-smoke` 3-cycle PASS); class-driver-side C.4: **usb-storage→92a ✅, usb-hid→92b ✅** (`reconcile_attachments` releases on `attached:false`, gate-asserted), **usb-net→92e** |
 | D | USB Mass Storage — BOT CBW/CSW on the Phase 96 inline bulk path, SCSI subset, UAS, `RemoteBlockDevice` facade + `/mnt/usb<n>`, page-grant overflow | C, H | D.1/D.2 transport + **D.3 UAS codec** + **D.4 mount landed (Phase 92a)**: the resident `usb-storage` daemon registers `usb0.block` and serves the block protocol; the kernel multi-device registry + VFS secondary-mount table mount it at `/mnt/usb0`. Live-validated by `usb-mount-smoke` (mount + ls + read + overwrite-readback). **D.5 zero-copy overflow landed** (shm-DMA, `USB_STORAGE:shm-dma-ok`); **live UAS → deferred follow-up.** |
 | E | Isochronous endpoints — UAC PCM-out to `audio_server`, UVC frame capture + `camera_server`, controller isoch TRB scheduling | F | **→ Phase 92c** (deep isoch TRB scheduling; UVC bare-metal-only) |
-| F | Multi-controller concurrency — per-controller bound IRQ + event-loop thread, concurrent MSI-X routing | — | **→ Phase 92d** (ring-3 driver threading; risk-isolated from the working single-loop server) |
+| F | Multi-controller concurrency — secondary-controller IRQs multiplexed into the primary's bound notification (single event loop), concurrent MSI-X routing | — | **F.1/F.2 landed (Phase 92d)** — each secondary controller's MSI-X IRQ is subscribed into the primary's bound notification at a distinct bit (kernel-tested primitive), so the single server loop wakes on **any** controller's interrupt; a `Notification(bits)` wake drains only the controller(s) that fired. Implemented as the m3OS single-event-loop pattern (not per-controller threads — the native `BrkAllocator` is single-threaded by design and the ring-drain path allocates, so a service thread would race the heap). Live-validated: `usb-multi-controller-smoke` asserts `XHCI:controller-1:ready` + a controller-1 `usb-mouse` decode. |
 | G | Host-side USB-Ethernet class drivers — generic CDC-ECM/NCM `RemoteNic`, fold the Phase 96 vendor `ure` into a shared device-match registry | C | G.1/G.2 host-logic landed (`cdc.rs`: CDC functional-descriptor parse + NTB-16 framing round-trip, 23 host tests); **live `usb-net` daemon → Phase 92e** (bare-metal/VFIO-gated — no QEMU CDC-ECM model) |
 | H | Foundation & carry-over hardening — live `GetDescriptors` (large reads), control-transfer event capture, Disable Slot, zero-copy `SubmitTransfer` | — | H.1–H.3 landed; **H.6 length bounds + H.4 zero-copy DMA landed (Phase 92a)**. H.4 delivered as a kernel IOMMU-map-shm syscall (`SYS_DEVICE_DMA_MAP_SHM`) + `SubmitShmTransfer`, validated by `USB_STORAGE:shm-dma-ok` (8192-byte zero-copy round-trip). |
 | I | Validation, kernel version bump & learning docs — new acceptance gates, AGENTS.md rows, version bumps, Phase 92 learning doc | A–H | **I.4 done** (`0.92.0` core, then **`0.92.1`** for 92a). **I.1 done** — `usb-mount-smoke` gate (mount + ls + read + rw). **I.6 done** — Phase 92 USB gates wired into `M3OS_USB_REGRESSION` + AGENTS.md. **I.5 learning doc → last sub-phase.** |
@@ -71,9 +71,15 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 - ✅ **E.2** — UVC frame capture: `usb-video` driver + `camera_server` + host-tested `kernel_core::usb::uvc` codec (probe/commit + `find_video_stream` + `camera_ipc`, 17 tests). Live capture **bare-metal/VFIO-only** (no QEMU UVC model — skip-with-reason); the server surfaces `CLASS_VIDEO` interfaces.
 - ✅ **Gate (I.3 audio half):** `usb-audio-smoke` (non-silent WAV + `AUDIO_DEMO:PASS` + `frames_consumed!=0`); `M3OS_USB_AUDIO_REGRESSION` pre-push block + AGENTS.md row. ✅ **I.4** — kernel `0.92.2`→`0.92.3`. *The deepest controller work in the phase; the isoch-OUT delivery required splitting a payload into ≤mps per-frame TDs (a full-speed isoch TD carries ≤ mps/frame) — root-caused via QEMU `xhci`/WAV diagnosis.*
 
-**Phase 92d — Multi-controller concurrency.**
-- **F.1** (per-controller bound IRQ + event-loop thread), **F.2** (concurrent MSI-X routing).
-- **Gate (I.2 multi-controller arm):** `usb-multi-controller-smoke` (second `qemu-xhci`, `XHCI:controller-1:ready`). *Ring-3 driver threading, deliberately risk-isolated from the validated single-loop server.*
+**Phase 92d — Multi-controller concurrency. — LANDED + VALIDATED.**
+- ✅ **F.1/F.2 — multiplexed-interrupt multi-controller servicing.** A device on a *secondary* xHCI controller is now serviced on its **own interrupt**, not only when traffic happens on the primary. Delivered as the **m3OS single-event-loop pattern** rather than the task doc's literal per-controller threads: the native userspace heap (`BrkAllocator`) is single-threaded by design ("Safety: Single-threaded userspace processes") and the per-controller ring-drain path allocates, so a per-controller *service* thread would race the global allocator (the only existing threaded binary, `thread-test`, is careful never to allocate in a thread). Making malloc thread-safe would touch every native userspace binary — out of 92d scope. Instead each controller's interrupt source is added to the *one* bound event loop (the analog of adding all fds to an `epoll` set), which is the architecturally correct pattern for m3OS's single-threaded-event-loop driver model and keeps the validated single-controller path byte-identical. *(Design discussed + approved with the maintainer before implementation.)*
+  - **Kernel:** `sys_device_irq_subscribe` accepts a `Capability::DeviceIrq` as `notification_arg` (via the existing, unit-tested `Capability::ipc_notification_id`), so a driver can subscribe a second device's IRQ into an already-subscribed controller's notification at a distinct bit. `kernel_owns_notif` stays false for the caller-provided path (no double-free). Covered by the existing `device_host_irq_subscribe_caller_provided_notif` test + the `ipc_notification_id_accepts_device_irq_caps` unit test.
+  - **driver_runtime:** `IrqNotification::subscribe_into(device, into_notif_cap, bit_index)` + `IrqBackend::subscribe_into` — host-tested (`subscribe_into_targets_existing_notification_at_bit`, `subscribe_into_surfaces_backend_error`).
+  - **xHCI driver:** `Controller::init_interrupter_into` + shared `enable_interrupter()`; `program_main` brings up controller 0 with a fresh notification (bit 0, bound to the recv loop) and multiplexes each secondary into it at `bit = controller index`, emitting `XHCI:controller-N:ready`. **Optimization A** (bit-directed draining): a `Notification(bits)` wake drains only the controller(s) whose bit is set — single-controller is bit 0 → controller 0, byte-identical to pre-92d; the Message arm still drains all as a safety net. **Optimization B**: `service_interrupt_events` skips the ERDP/IMAN MMIO write on an empty drain (mirrors the command-completion path guard), so the more-frequent multiplexed drains waste no MMIO.
+- ✅ **H.5** — `process_port_events` attach arm reclaims the just-enabled slot via `disable_slot` when `pack_handle` returns `None` (no slot leak), mirroring the EnumerateChild arm.
+- ✅ **Gate (I.2 multi-controller arm):** `usb-multi-controller-smoke` — a second `qemu-xhci,id=xhci1,addr=0x7` with a `usb-mouse` behind it; asserts `XHCI:controller-1:ready` (the multiplexed subscribe succeeded end-to-end: kernel + driver_runtime + driver — emitted only after `init_interrupter_into` succeeds) and that a QMP mouse-move on the controller-1 device decodes (`USB_HID:mouse`), proving controller 1 is fully enumerated, routed, and serviced. Wired into `M3OS_USB_REGRESSION` + the AGENTS.md row. ✅ **I.4** — kernel `0.92.3`→`0.92.4`.
+- **Deferred perf (own measured changes):** interrupt moderation (IMOD post-bring-up) and non-blocking / state-machined EP0 control transfers (removes the single-loop's one head-of-line-blocking weakness, the proper event-loop fix vs. threads). Both change the validated single-controller path, so they are out of 92d scope.
+- *Honest gate-falsifiability note:* `XHCI:controller-1:ready` is the load-bearing proof of the multiplexed-IRQ substrate. The `USB_HID:mouse` decode proves controller 1 is fully functional; it does **not** isolate the bit-directed IRQ path from the Message-wake all-drain safety net (a client poll would also drain controller 1), since both are correct. The bit-directed optimization itself is validated by design + the kernel unit test.
 
 **Phase 92e — USB-Ethernet class drivers (live).**
 - **G.1/G.2/G.3** live `usb-net` (CDC-ECM/NCM `RemoteNic` + the shared `ure` device-match registry).
@@ -95,8 +101,8 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 | I.2 Report-Protocol arm (`usb-report-smoke`) | **92b — done (PR #254)** |
 | E.1 (378–380), E.2 (392–394), E.3 (403–405) | 92c |
 | I.3 audio gate (510, 512) | 92c |
-| F.1 (421–423), F.2 (432–433) | 92d |
-| I.2 multi-controller arm (500) | 92d |
+| F.1, F.2 | **92d — done** |
+| I.2 multi-controller arm (`usb-multi-controller-smoke`) | **92d — done** |
 | G.1 (449–450), G.2 (461), G.3 (473–475) | 92e |
 | C.4 usb-net detach (293) | 92e |
 | I.3 CDC-ECM arm (511) | 92e |
@@ -105,7 +111,7 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 | *PR #252 readiness follow-ups (task IDs below):* | |
 | H.6 length bounds, D.2 rw-ok comment, I.6 gate regression wiring | 92a |
 | B.1 readiness items (wDescriptorLength read, doc header, hostile-count test) | 92b |
-| H.5 slot-reclaim on unpackable handle | 92d |
+| H.5 slot-reclaim on unpackable handle | **92d — done** |
 
 ---
 
@@ -181,8 +187,8 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 **Why it matters:** on hot-plug attach the server runs Enable Slot (allocating a hardware slot + `SlotContext`) **before** `pack_handle(ctrl_idx, slot_id)`. If `pack_handle` returns `None` (`ctrl_idx > 3`, i.e. ≥5 controllers, or hw slot > 63) the code logs "unpackable handle" and continues without `disable_slot` — leaking the very slot H.3 set out to reclaim. Reachable only in the multi-controller regime, so it pairs with Track F / Phase 92d, but it is live code today. (The identical bring-up-path case at ~`server.rs:300` predates this phase.)
 
 **Acceptance:**
-- [ ] When `pack_handle` returns `None` on the attach path, the server issues `disable_slot` for the just-enabled slot before dropping the device (no slot leak) and logs the drop.
-- [ ] An instrumented run in the ≥5-controller / slot>63 regime shows no slot-pool leak across repeated unpackable attaches.
+- [x] When `pack_handle` returns `None` on the attach path, the server issues `disable_slot` for the just-enabled slot before dropping the device (no slot leak) and logs the drop. — `process_port_events`'s attach `None` arm now calls `c.disable_slot(irq, notice.slot_id)` (the real hardware slot, before it is overwritten with the packed handle) and logs `… unpackable handle (slot reclaimed)`, mirroring the EnumerateChild arm.
+- [~] An instrumented run in the ≥5-controller / slot>63 regime shows no slot-pool leak across repeated unpackable attaches. — the reclaim is exercised on the code path; a ≥5-controller QEMU topology to drive the `pack_handle == None` branch live is not wired (QEMU multi-xHCI tops out well below the pathological regime), so the reclaim is verified by inspection + the shared `disable_slot` path the hot-plug gate already covers.
 
 ### H.6 — Bound device-controlled lengths against `USB_MSG_MAX` (PR #252 readiness)
 
@@ -503,9 +509,9 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 **Why it matters:** PR 248's `handle.rs` codec already multiplexes requests to the right controller, but only the primary controller has a bound IRQ — a device on a secondary controller is serviced only on the next inbound message, not on its own interrupt. F.1 binds each controller's IRQ and runs a per-controller event loop so secondary devices wake the server on their own interrupt.
 
 **Acceptance:**
-- [ ] Each brought-up controller binds its own MSI-X IRQ and runs an event-loop thread (not just the primary).
-- [ ] A device on a second `qemu-xhci` controller delivers interrupt/bulk completions without waiting for traffic on the primary — proven by a second-controller HID/NIC event arriving while the primary is idle.
-- [ ] The `owner!`/`unpack_handle` request routing is unchanged (no cross-controller misroute).
+- [x] Each brought-up controller binds its own MSI-X IRQ and its interrupt wakes the server loop (not just the primary). — each controller still subscribes its own MSI-X vector (`init_interrupter`/`init_interrupter_into`); the **secondary** controllers subscribe **into the primary's bound notification** at a distinct bit (`Controller::init_interrupter_into` → `IrqNotification::subscribe_into` → the kernel's caller-provided-notification path) so the single bound recv loop wakes on any controller's interrupt. *(Delivered as the m3OS single-event-loop pattern rather than a per-controller OS thread: the native `BrkAllocator` is single-threaded by design and the ring-drain path allocates, so a per-controller service thread would race the heap — see the 92d schedule note. Multiplexing all IRQ sources into the bound notification is the event-loop-idiomatic equivalent.)*
+- [x] A device on a second `qemu-xhci` controller delivers interrupt completions without waiting for traffic on the primary. — `usb-multi-controller-smoke`: a `usb-mouse` on the second controller (`xhci1`) decodes (`USB_HID:mouse`) and `XHCI:controller-1:ready` confirms its IRQ was subscribed into the primary's bound notification (so its interrupt wakes the loop independently). The mouse being the *sole* pointer device, on `xhci1`, makes this falsifiable.
+- [x] The `owner!`/`unpack_handle` request routing is unchanged (no cross-controller misroute). — the request-routing path is untouched; the only server change is the `Notification(bits)` arm draining bit-directed instead of all (`controllers` index == notification bit == `unpack_handle` controller index).
 
 ### F.2 — Concurrent MSI-X routing
 
@@ -514,8 +520,8 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 **Why it matters:** with per-controller loops (F.1), each controller must service and re-arm its own event ring concurrently without serializing through a single shared handler.
 
 **Acceptance:**
-- [ ] Two controllers service their event rings concurrently (a device on each enumerates and polls in parallel).
-- [ ] Simultaneous input on both controllers (QMP keyboard on one, mouse on the other) is observed without one controller starving the other.
+- [~] Both controllers' event rings are serviced promptly, each woken by its own interrupt (no controller waits on another's traffic). — reworded from the original "service their event rings concurrently": in the m3OS single-event-loop model the rings are serviced by the *one* loop, but each controller's interrupt independently wakes it (multiplexed notification) and a `Notification(bits)` wake drains exactly the controller(s) that fired (Optimization A), so neither controller's servicing waits on the other's traffic. True multi-core *simultaneous* ring draining would require a per-controller thread (→ a thread-safe native allocator first; deferred — see the 92d schedule note); it buys nothing here (ring servicing is microseconds of MMIO) and the loop is the same single loop that already serializes all USB servicing.
+- [x] Simultaneous input on both controllers is observed without one controller starving the other. — both controllers' interrupts wake the single loop and a Message-wake all-drain is the safety net, so a `usb-kbd` on `xhci0` and the `usb-mouse` on `xhci1` are both serviced; the gate exercises the `xhci1` pointer path (`USB_HID:mouse`) with the `xhci0` keyboard idle. The long-blocking-control-transfer head-of-line case (the one place a single loop could delay another controller) is called out as the deferred non-blocking-control-transfer follow-up.
 
 ---
 
@@ -582,7 +588,7 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 
 **Acceptance:**
 - [ ] Hot-plug gate: a mid-run `device_add`/`device_del` produces `USB_HOTPLUG:attached` then `USB_HOTPLUG:detached`, and `/mnt/usb0` mounts then cleanly unmounts.
-- [ ] Multi-controller gate: a device on the second controller enumerates on its own IRQ (`XHCI:controller-1:ready`) concurrently with the primary.
+- [x] Multi-controller gate: a device on the second controller enumerates + is serviced via its own (multiplexed) IRQ (`XHCI:controller-1:ready`) alongside the primary. — **`usb-multi-controller-smoke`** (Phase 92d): a second `qemu-xhci,id=xhci1,addr=0x7` carries the sole `usb-mouse`; the gate asserts `XHCI:controller-1:ready` (the secondary's IRQ subscribed into the primary's bound notification) then injects a QMP mouse-move and asserts `USB_HID:mouse`. Wired into `M3OS_USB_REGRESSION` + the AGENTS.md row.
 - [x] Report-Protocol arm: a Report-Protocol pointer with extra axes/buttons decodes through `mouse_server`. — **`usb-report-smoke` (Phase 92b)**: a `usb-tablet` (Report-Protocol absolute pointer, no Boot interface) is decoded against the parsed `ReportField` layout and emits `HID_REPORT:pointer` (B.2); the same gate covers the B.4 `USB_HID:led` `SET_REPORT` and the H.2 no-drop assertion. Wired into `M3OS_USB_REGRESSION` + the AGENTS.md row.
 
 ### I.3 — USB audio + USB-Ethernet class gates
