@@ -498,18 +498,36 @@ fn handle_request(
             slot_id,
             setup,
             length,
-        } => match owner!(slot_id)
-            .and_then(|(c, irq, slot)| c.control_request(irq, slot, setup, length))
-        {
-            Some(data) => UsbReply::ControlData {
-                data,
-                completion_code: 1,
-            },
-            None => UsbReply::ControlData {
-                data: Vec::new(),
-                completion_code: 0xFF,
-            },
-        },
+        } => {
+            // H.6: a `length` that would overflow the inline ControlData reply
+            // (tag(1) + completion_code(1) + u16 len-prefix(2) = 4 bytes of
+            // overhead) is rejected with an explicit error instead of a
+            // silently-truncated reply or an oversized EP0 scratch allocation.
+            // The usb-hid Report-descriptor fetch already clamps its (untrusted,
+            // device-declared) length; this fail-closed guard mirrors the
+            // SubmitBulkIn/GetDescriptors checks so no future ControlRequest
+            // caller can forward an out-of-bounds length across the boundary.
+            if length as usize + 4 > USB_MSG_MAX {
+                write_str(
+                    STDOUT_FILENO,
+                    "[xhci] ControlRequest length over USB_MSG_MAX — rejected\n",
+                );
+                UsbReply::Error { code: EINVAL }
+            } else {
+                match owner!(slot_id)
+                    .and_then(|(c, irq, slot)| c.control_request(irq, slot, setup, length))
+                {
+                    Some(data) => UsbReply::ControlData {
+                        data,
+                        completion_code: 1,
+                    },
+                    None => UsbReply::ControlData {
+                        data: Vec::new(),
+                        completion_code: 0xFF,
+                    },
+                }
+            }
+        }
         UsbRequest::ControlWrite {
             slot_id,
             setup,

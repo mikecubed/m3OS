@@ -654,7 +654,16 @@ fn poll_mouse(usb_ep: u32, mouse_ep: u32, dev: &mut HidDevice) {
 /// length, so the parser sees only the real bytes. Returns an empty `Vec` if the
 /// read fails or the descriptor parses to no fields.
 fn fetch_report_fields(usb_ep: u32, notice: &usb_core::protocol::AttachNotice) -> Vec<ReportField> {
-    let req_len = report_descriptor_len(usb_ep, notice).unwrap_or(256);
+    // Clamp the requested length so a device's declared `wDescriptorLength`
+    // (untrusted) can't force an oversized EP0 scratch allocation or a
+    // `ControlData` reply that overruns `USB_MSG_MAX` — the `ControlRequest`
+    // path carries no H.6-style server clamp, so the bound is enforced here.
+    // The inline `ControlData` encode overhead is tag(1) + completion(1) +
+    // len-prefix(2) = 4 bytes, so the data body must fit in `USB_MSG_MAX - 4`.
+    const MAX_REPORT_DESC_LEN: u16 = (USB_MSG_MAX - 4) as u16;
+    let req_len = report_descriptor_len(usb_ep, notice)
+        .unwrap_or(256)
+        .min(MAX_REPORT_DESC_LEN);
     let iface = notice.interface_num;
     let setup = [
         0x81,
@@ -724,11 +733,22 @@ fn hid_report_descriptor_len(config: &[u8], iface: u8) -> Option<u16> {
             // HID descriptor under the target interface.
             0x21 if cur_iface == Some(iface) => {
                 let num = *config.get(i + 5)? as usize;
+                // Class-descriptor entries live *within* this HID descriptor's
+                // own `bLength` (`[i, i+blen)`). Bound the walk to it so a
+                // malformed `bNumDescriptors` (or a truncated descriptor) fails
+                // closed (→ `None`) instead of reading `wDescriptorLength` out of
+                // the next TLV descriptor and returning a bogus length.
+                let end = i + blen;
                 let mut e = i + 6;
                 for _ in 0..num {
-                    let dtype = *config.get(e)?;
-                    let lo = *config.get(e + 1)? as u16;
-                    let hi = *config.get(e + 2)? as u16;
+                    // Each entry is `[bDescriptorType, wDescriptorLength[2]]`; it
+                    // must fit entirely within this descriptor.
+                    if e + 3 > end {
+                        return None;
+                    }
+                    let dtype = config[e];
+                    let lo = config[e + 1] as u16;
+                    let hi = config[e + 2] as u16;
                     if dtype == 0x22 {
                         return Some((hi << 8) | lo);
                     }

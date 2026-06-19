@@ -386,6 +386,7 @@ pub fn parse_report_descriptor(raw: &[u8]) -> Vec<ReportField> {
                                 .saturating_sub(usage_min as usize)
                                 .saturating_add(1);
                             let slots = rc.min(range_len);
+                            let mut emitted = 0usize;
                             for i in 0..slots {
                                 if fields.len() >= MAX_REPORT_FIELDS {
                                     break;
@@ -410,14 +411,18 @@ pub fn parse_report_descriptor(raw: &[u8]) -> Vec<ReportField> {
                                     &mut id_offsets_id,
                                     &mut id_offsets_bits,
                                 );
+                                emitted += 1;
                             }
-                            // Consume any remaining padding slots (report count
-                            // exceeds the range length — uncommon but spec-legal).
-                            let padding = rc.saturating_sub(range_len);
-                            if padding > 0 {
+                            // Advance the running offset over every slot not
+                            // individually emitted — both the spec-legal padding
+                            // when report count exceeds the usage range, and any
+                            // slots dropped by the `MAX_REPORT_FIELDS` cap — so
+                            // the item spans its full `rs * rc` bits and a
+                            // following Main item's offsets stay aligned.
+                            if emitted < rc {
                                 advance_offset(
                                     report_id,
-                                    rs.saturating_mul(padding),
+                                    rs.saturating_mul(rc - emitted),
                                     &mut id_offsets_id,
                                     &mut id_offsets_bits,
                                 );
@@ -427,6 +432,7 @@ pub fn parse_report_descriptor(raw: &[u8]) -> Vec<ReportField> {
                             // slot, each `report_size` bits. Field `i` gets the
                             // i-th declared usage (last usage repeated when the
                             // count exceeds the usage list; usage 0 when empty).
+                            let mut emitted = 0usize;
                             for i in 0..rc {
                                 if fields.len() >= MAX_REPORT_FIELDS {
                                     break;
@@ -452,6 +458,19 @@ pub fn parse_report_descriptor(raw: &[u8]) -> Vec<ReportField> {
                                 advance_offset(
                                     report_id,
                                     rs,
+                                    &mut id_offsets_id,
+                                    &mut id_offsets_bits,
+                                );
+                                emitted += 1;
+                            }
+                            // Advance the running offset over any slots dropped by
+                            // the `MAX_REPORT_FIELDS` cap so the item spans its
+                            // full `rs * rc` bits and a following Main item's
+                            // offsets stay aligned to the report layout.
+                            if emitted < rc {
+                                advance_offset(
+                                    report_id,
+                                    rs.saturating_mul(rc - emitted),
                                     &mut id_offsets_id,
                                     &mut id_offsets_bits,
                                 );
@@ -984,6 +1003,40 @@ mod tests {
             fields.len(),
             MAX_REPORT_FIELDS
         );
+    }
+
+    /// A Usage Min/Max range whose Report Count exceeds the range length leaves
+    /// padding slots; the running bit offset must still advance over the *full*
+    /// `report_size * report_count` span so a following Main item is aligned.
+    /// Guards the offset-advance fix for the variable/usage-range branches.
+    #[test]
+    fn usage_range_padding_advances_full_span() {
+        let raw: &[u8] = &[
+            0x05, 0x09, // Usage Page = Button
+            0x19, 0x01, // Usage Minimum = 1
+            0x29, 0x03, // Usage Maximum = 3   (range length = 3)
+            0x75, 0x01, // Report Size = 1
+            0x95, 0x08, // Report Count = 8    (5 padding slots beyond the range)
+            0x81, 0x02, // Input (Data, Variable, Absolute) → 3 buttons @ 0,1,2
+            0x05, 0x01, // Usage Page = Generic Desktop
+            0x09, 0x30, // Usage = X
+            0x75, 0x08, // Report Size = 8
+            0x95, 0x01, // Report Count = 1
+            0x81, 0x02, // Input → X must sit at bit 8 (after the full 8-bit block)
+        ];
+        let fields = parse_report_descriptor(raw);
+        assert_eq!(fields.len(), 4, "3 buttons + 1 axis");
+        assert_eq!(fields[0].bit_offset, 0);
+        assert_eq!(fields[1].bit_offset, 1);
+        assert_eq!(fields[2].bit_offset, 2);
+        // The X axis must start at bit 8: the button item spans report_size(1) *
+        // report_count(8) = 8 bits, not just the 3 emitted usage slots.
+        assert_eq!(fields[3].usage, 0x0030, "Generic Desktop X");
+        assert_eq!(
+            fields[3].bit_offset, 8,
+            "axis must follow the full 8-bit span"
+        );
+        assert_eq!(fields[3].bit_size, 8);
     }
 
     // -----------------------------------------------------------------------
