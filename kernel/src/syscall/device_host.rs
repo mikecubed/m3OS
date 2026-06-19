@@ -1565,7 +1565,18 @@ pub fn sys_device_dma_map_shm(dev_cap: u32, shm_id: u32) -> isize {
             len,
             MapFlags::READ | MapFlags::WRITE,
         ) {
-            Ok(()) | Err(DomainError::AlreadyMapped) => {}
+            Ok(()) => {}
+            // A genuine double-map (same region mapped twice with no
+            // intervening unmap) or an overlap with a pre-mapped reserved
+            // region — a fresh shm map returns `Ok(())`, so this never fires on
+            // the happy path. Recording a second mapping over the shared PTE
+            // would make a later unmap/exit-cleanup tear down a PTE another live
+            // user (or the firmware-reserved identity mapping) still needs, so
+            // reject instead of silently aliasing it.
+            Err(DomainError::AlreadyMapped) => {
+                let _ = crate::mm::shm::decref(crate::mm::shm::ShmId(shm_id));
+                return NEG_EBUSY;
+            }
             Err(_) => {
                 let _ = crate::mm::shm::decref(crate::mm::shm::ShmId(shm_id));
                 return NEG_EIO;

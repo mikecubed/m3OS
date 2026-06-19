@@ -263,17 +263,25 @@ fn match_mount_prefix(abs_path: &str, prefix: &str) -> Option<String> {
 }
 
 /// Mount an ext2 volume on registry device `dev_id` at `prefix` (e.g.
-/// `"/mnt/usb0"`). Replaces any existing mount at the same prefix.
-pub fn mount_usb(prefix: &str, base_lba: u64, dev_id: u32) -> Result<(), Ext2Error> {
+/// `"/mnt/usb0"`). If a mount already exists at the same prefix it is replaced,
+/// and that displaced mount's `dev_id` is returned as `Some(old_dev_id)` so the
+/// caller can unregister its now-orphaned `blk::remote` slot. Without that,
+/// repeated remounts to the same prefix leak registry slots until
+/// `MAX_REMOTE_BLOCK` is exhausted.
+pub fn mount_usb(prefix: &str, base_lba: u64, dev_id: u32) -> Result<Option<u32>, Ext2Error> {
     let vol = Ext2Volume::mount_dev(base_lba, dev_id)?;
     let mut mounts = USB_MOUNTS.lock();
+    let displaced = mounts
+        .iter()
+        .find(|m| m.prefix == prefix)
+        .map(|m| m.volume.dev_id);
     mounts.retain(|m| m.prefix != prefix);
     mounts.push(UsbMount {
         prefix: String::from(prefix),
         volume: vol,
     });
     USB_MOUNTS_ACTIVE.store(!mounts.is_empty(), core::sync::atomic::Ordering::Release);
-    Ok(())
+    Ok(displaced)
 }
 
 /// Remove the secondary mount at `prefix`. Returns `true` if one was removed.

@@ -1514,9 +1514,10 @@ mod tests {
     /// H.6 (PR #252 readiness): the xHCI server bounds device-/caller-supplied
     /// lengths against `USB_MSG_MAX`. This locks in the encode-size arithmetic
     /// the server's reject thresholds rely on: a `BulkData` reply is tag(1) +
-    /// u16 len-prefix(2) + data, and a `Descriptors` reply is tag(1) + two u16
-    /// len-prefixes(4) + blobs. The server rejects (returns `Error`) anything
-    /// that would push the encoded reply over `USB_MSG_MAX`.
+    /// completion_code(1) + u16 len-prefix(2) + data, and a `Descriptors`
+    /// reply is tag(1) + two u16 len-prefixes(4) + blobs. The server rejects
+    /// (returns `Error`) anything that would push the encoded reply over
+    /// `USB_MSG_MAX`.
     #[test]
     fn bulk_in_len_budget_matches_encoded_size() {
         // At the server's accept threshold (len + 4 <= USB_MSG_MAX) the encoded

@@ -15998,7 +15998,13 @@ pub(super) fn sys_linux_mount(source_ptr: u64, target_ptr: u64, fstype_ptr: u64)
             // The USB image is a bare ext2 (no partition table), so the
             // superblock is at LBA 2 from device start (base_lba = 0).
             match crate::fs::ext2::mount_usb(&resolved_target, 0, dev_id) {
-                Ok(()) => {
+                Ok(displaced) => {
+                    // Replacing a mount at the same prefix orphans the old
+                    // backend's registry slot — free it so repeated remounts
+                    // don't leak blk::remote slots (MAX_REMOTE_BLOCK).
+                    if let Some(old_dev_id) = displaced {
+                        crate::blk::unregister_remote_device(old_dev_id);
+                    }
                     log::info!(
                         "[mount] usb{idx} (dev_id={dev_id}) mounted at {resolved_target} (ext2)"
                     );

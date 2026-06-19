@@ -10639,7 +10639,7 @@ fn create_usb_mount_ext2_image(path: &Path) {
         }
     }
     if !mkfs_ok {
-        eprintln!("usb-mount-smoke: mkfs.ext2 -b 1024 failed (is e2fsprogs installed?)");
+        eprintln!("usb-mount-smoke: mkfs.ext2 -b 4096 failed (is e2fsprogs installed?)");
         std::process::exit(1);
     }
 

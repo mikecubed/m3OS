@@ -568,8 +568,9 @@ fn handle_request(
             len,
         } => {
             // H.6: a `len` that would overflow the inline BulkData reply
-            // (tag(1) + u16 len-prefix(2) = 3 bytes of overhead) is rejected
-            // with an explicit error instead of a silently-truncated BulkData.
+            // (tag(1) + completion_code(1) + u16 len-prefix(2) = 4 bytes of
+            // overhead) is rejected with an explicit error instead of a
+            // silently-truncated BulkData.
             if len as usize + 4 > USB_MSG_MAX {
                 write_str(
                     STDOUT_FILENO,
