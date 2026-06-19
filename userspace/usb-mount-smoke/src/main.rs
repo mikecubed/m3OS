@@ -60,6 +60,13 @@ fn fail(case: &str) -> ! {
 /// `usb0.block` backend and enters its block-server loop (the kernel mount
 /// reads the superblock over IPC, which needs the daemon already serving).
 fn mount_with_retry() {
+    // Only ENODEV (backend not yet registered) and EIO (daemon not serving the
+    // superblock read yet) are transient races against the usb-storage daemon
+    // coming up. Any OTHER error (EINVAL, EPERM, ENOTDIR, …) is a real,
+    // non-transient failure — fail fast so it surfaces immediately instead of
+    // being hidden behind the 30 s retry budget.
+    const ENODEV: isize = -19;
+    const EIO: isize = -5;
     let src = b"/dev/usb0\0";
     let target = b"/mnt/usb0\0";
     let fstype = b"ext2\0";
@@ -69,8 +76,10 @@ fn mount_with_retry() {
             write_str(STDOUT_FILENO, "USB_MASS_STORAGE:mounted\n");
             return;
         }
-        // ENODEV (backend not yet registered) / EIO (daemon not serving yet) —
-        // wait and retry. ~250 ms × 120 = 30 s budget.
+        if rc != ENODEV && rc != EIO {
+            fail("mount");
+        }
+        // ~250 ms × 120 = 30 s budget for the daemon to register + serve.
         let _ = nanosleep_for(0, 250_000_000);
     }
     fail("mount");

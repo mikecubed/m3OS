@@ -249,14 +249,16 @@ fn usb_mounts_active() -> bool {
 /// Match `abs_path` against `prefix`, returning the in-volume path (always
 /// starting with `/`) if `abs_path` is the mount point itself or a child of it.
 /// `"/mnt/usb0"` → `"/"`; `"/mnt/usb0/dir/f"` → `"/dir/f"`; `"/mnt/usb01"` → None
-/// (boundary-safe, no false prefix match).
-fn match_mount_prefix(abs_path: &str, prefix: &str) -> Option<String> {
+/// (boundary-safe, no false prefix match). Returns a borrow of `abs_path` (or
+/// the static `"/"`), so it never allocates — `is_usb_mount_path`'s `.is_some()`
+/// probe stays allocation-free on every `/mnt/usbN` open/stat hot path.
+fn match_mount_prefix<'a>(abs_path: &'a str, prefix: &str) -> Option<&'a str> {
     if abs_path == prefix {
-        return Some(String::from("/"));
+        return Some("/");
     }
     let rest = abs_path.strip_prefix(prefix)?;
     if rest.starts_with('/') {
-        Some(String::from(rest))
+        Some(rest)
     } else {
         None
     }
@@ -314,7 +316,7 @@ pub fn with_usb_mount<R>(abs_path: &str, f: impl FnOnce(&Ext2Volume, &str) -> R)
     let mounts = USB_MOUNTS.lock();
     for m in mounts.iter() {
         if let Some(rel) = match_mount_prefix(abs_path, &m.prefix) {
-            return Some(f(&m.volume, &rel));
+            return Some(f(&m.volume, rel));
         }
     }
     None
@@ -332,7 +334,7 @@ pub fn with_usb_mount_mut<R>(
     let mut mounts = USB_MOUNTS.lock();
     for m in mounts.iter_mut() {
         if let Some(rel) = match_mount_prefix(abs_path, &m.prefix) {
-            return Some(f(&mut m.volume, &rel));
+            return Some(f(&mut m.volume, rel));
         }
     }
     None

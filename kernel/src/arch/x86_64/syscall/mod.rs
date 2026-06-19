@@ -15977,7 +15977,16 @@ pub(super) fn sys_linux_mount(source_ptr: u64, target_ptr: u64, fstype_ptr: u64)
     // device registry and mounts a *second* ext2 volume at the target prefix.
     {
         let mut buf_source = [0u8; 512];
-        let source = read_user_cstr(source_ptr, &mut buf_source).unwrap_or("");
+        let source = match read_user_cstr(source_ptr, &mut buf_source) {
+            Some(s) => s,
+            // A NULL source (ptr == 0) is the legitimate "device ignored" idiom
+            // the root/vfs mount path below relies on, so treat it as empty and
+            // fall through. A non-null but unreadable pointer is a genuine fault
+            // — return EFAULT rather than silently falling through to a root
+            // mount now that the source is semantically meaningful (/dev/usbN).
+            None if source_ptr == 0 => "",
+            None => return NEG_EFAULT,
+        };
         if let Some(idx) = source
             .strip_prefix("/dev/usb")
             .and_then(|s| s.parse::<u32>().ok())
