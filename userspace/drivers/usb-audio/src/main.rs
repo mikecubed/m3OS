@@ -127,12 +127,20 @@ impl UsbSink {
     /// chunk is dropped (not retried) and submission continues.
     fn submit_pcm(&mut self, pcm: &[u8]) -> usize {
         let mut sent = 0usize;
+        // Build the request once and reuse its `data` Vec across chunks: each
+        // iteration clears and re-fills it (reusing the capacity after the first
+        // chunk grows it to ISOCH_CHUNK) instead of allocating a fresh
+        // `chunk.to_vec()` per interval on this continuous-stream hot path.
+        let mut req = UsbRequest::SubmitIsochOut {
+            slot_id: self.slot_id,
+            dci: self.stream.ep_dci,
+            data: alloc::vec::Vec::with_capacity(ISOCH_CHUNK),
+        };
         for chunk in pcm.chunks(ISOCH_CHUNK) {
-            let req = UsbRequest::SubmitIsochOut {
-                slot_id: self.slot_id,
-                dci: self.stream.ep_dci,
-                data: chunk.to_vec(),
-            };
+            if let UsbRequest::SubmitIsochOut { data, .. } = &mut req {
+                data.clear();
+                data.extend_from_slice(chunk);
+            }
             match usb_call(self.usb_ep, &req) {
                 Some(UsbReply::TransferComplete { transferred, .. }) => {
                     sent += transferred;

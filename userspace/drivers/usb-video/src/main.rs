@@ -18,7 +18,7 @@
 //! 4. Run the UVC probe/commit negotiation:
 //!    `GET_MAX(VS_PROBE_CONTROL)` → `SET_CUR(VS_PROBE_CONTROL)` →
 //!    `GET_CUR(VS_PROBE_CONTROL)` → `SET_CUR(VS_COMMIT_CONTROL)`.
-//! 5. Capture frames via `SubmitBulkIn` / `PollBulkIn` on the IN endpoint DCI,
+//! 5. Capture frames via synchronous `SubmitBulkIn` on the IN endpoint DCI,
 //!    and forward each frame to `camera_server` via IPC.
 //!    Each frame emits `CAMERA:frame` on serial for observability.
 
@@ -328,7 +328,7 @@ fn program_main(_args: &[&str]) -> i32 {
     // `usb_video` reaches this point.
     let mut camera_ep: Option<u32> = lookup(CAMERA_SERVICE_NAME);
 
-    // 7. Capture loop: SubmitBulkIn / PollBulkIn per frame.
+    // 7. Capture loop: one synchronous SubmitBulkIn per frame.
     let mut frame_seq: u64 = 0;
     loop {
         // Submit an IN request for up to FRAME_BUF_LEN bytes.

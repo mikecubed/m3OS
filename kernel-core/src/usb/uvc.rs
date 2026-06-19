@@ -10,10 +10,10 @@
 //!   alt-setting.
 //! * [`set_interface_setup`] builds the standard `SET_INTERFACE` SETUP packet
 //!   that activates an alt-setting (mirrors the UAC helper of the same name).
-//! * [`probe_control_setup`] / [`commit_control_setup`] build the UVC
-//!   class-specific `VS_PROBE_CONTROL` and `VS_COMMIT_CONTROL` SETUP packets
-//!   (UVC 1.1 §4.3.1.1) for the `SET_CUR` and `GET_CUR` requests that
-//!   negotiate the capture format and frame size.
+//! * [`probe_control_setup`] builds the UVC class-specific SETUP packet for
+//!   both the `VS_PROBE_CONTROL` and `VS_COMMIT_CONTROL` selectors (the
+//!   selector is a parameter) (UVC 1.1 §4.3.1.1), used by the `SET_CUR` /
+//!   `GET_CUR` requests that negotiate the capture format and frame size.
 //! * [`UvcStreamingControl`] is the 26-byte UVC 1.0/1.1 Probe/Commit control
 //!   block with [`UvcStreamingControl::encode`] / [`UvcStreamingControl::parse`]
 //!   round-trip helpers.
