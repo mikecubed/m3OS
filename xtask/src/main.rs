@@ -787,6 +787,15 @@ fn main() {
                 });
             cmd_usb_hub_smoke(&smoke_args);
         }
+        Some("usb-audio-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("usb-audio-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_usb_audio_smoke(&smoke_args);
+        }
         Some("ssh-e1000-banner-check") => {
             let banner_args = parse_ssh_e1000_banner_check_args(&args[2..]).unwrap_or_else(|err| {
                 eprintln!("Error: {err}");
@@ -1364,7 +1373,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -1529,6 +1538,12 @@ fn build_userspace_bins() {
         // Phase 92 Track D: ring-3 USB Mass Storage (BOT) class driver.
         // `needs_alloc = true` for kernel-core (mass_storage) + usb-core deps.
         ("usb_storage", "usb_storage", true),
+        // Phase 92c Track E: ring-3 USB Audio Class (UAC) isochronous PCM-out
+        // driver. `needs_alloc = true` for driver_runtime + kernel-core + usb-core.
+        ("usb_audio", "usb_audio", true),
+        // Phase 92c Track E.2: ring-3 USB Video Class (UVC) frame-capture
+        // driver. `needs_alloc = true` for kernel-core + usb-core deps.
+        ("usb_video", "usb_video", true),
         // Phase 80 Track A.5: ring-3 AC'97 out-of-process audio hardware driver.
         // `needs_alloc = true` for driver_runtime + kernel-core deps.
         ("ac97_driver", "ac97_driver", true),
@@ -1589,6 +1604,11 @@ fn build_userspace_bins() {
         // on `kernel-core` (audio types + protocol codec) and
         // `driver_runtime` (DmaBuffer<T>, IrqNotification).
         ("audio_server", "audio_server", true),
+        // Phase 92c Track E.2 — camera_server daemon (UVC frame
+        // aggregator IPC server).  `needs_alloc = true` because the
+        // binary depends on `kernel-core` (camera_ipc codec) and
+        // `driver_runtime` (SyscallBackend / IpcBackend).
+        ("camera_server", "camera_server", true),
         // Phase 57 Track E.2 — audio reference demo.  `needs_alloc =
         // true` because the binary depends on `audio_client`, which
         // pulls in `kernel-core` (audio protocol codec) at the alloc
@@ -6116,7 +6136,7 @@ fn cmd_check() {
     stat_assembly_gate();
 
     println!(
-        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, ac97_driver, hda_driver, ahci_driver, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, shadow, ldso_core, wifi-core, mt792x_driver, m3ctl, xhci_driver, usb-core, pkg-format, xtask, and pkg host tests pass; doom platform-layer C tests pass; retpoline indirect-branch gate pass; stat-assembly gate pass"
+        "check passed: clippy clean, formatting correct, kernel-core (incl. usb::uvc + camera_ipc), passwd, driver_runtime, audio_client, audio_server, ac97_driver, hda_driver, ahci_driver, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, shadow, ldso_core, wifi-core, mt792x_driver, m3ctl, xhci_driver, usb-core, pkg-format, xtask, and pkg host tests pass; doom platform-layer C tests pass; retpoline indirect-branch gate pass; stat-assembly gate pass"
     );
 }
 
@@ -11691,6 +11711,161 @@ fn cmd_hda_smoke(args: &SmokeBootArgs) {
         Ok(()) => println!("hda-smoke: WAV non-silent check PASSED"),
         Err(msg) => {
             eprintln!("hda-smoke: WAV non-silent check FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_WAV_SILENT);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 92c — usb-audio-smoke: UAC isochronous PCM-out end-to-end gate.
+// ---------------------------------------------------------------------------
+
+/// Serial steps the `usb-audio-smoke` gate asserts: kernel boot, the `usb-audio`
+/// daemon binding the QEMU `usb-audio` device + registering as the `audio.hw`
+/// sink (`AUDIO:usb-sink`), then — after login — `audio-demo` mixing a tone
+/// through `audio_server` → the USB sink → the device's isochronous OUT
+/// endpoint, asserting `AUDIO_DEMO:PASS` and a non-zero consumed-frame count.
+/// The host-side WAV-capture check (in `cmd_usb_audio_smoke`) is the real proof
+/// the PCM actually reached the device.
+fn usb_audio_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/usb-audio: kernel first message",
+    }];
+    // Log in first: the `net_udp` boot marker `boot_and_login_steps` waits on
+    // appears early in boot, and must be matched before the continuous
+    // usb-storage/dhcpv6 boot logs evict it from the 64 KB serial window. The
+    // USB-audio sink's own `AUDIO:usb-sink` sentinel appears later (after USB
+    // enumeration); rather than racing it against the boot marker, the gate
+    // proves the sink is live the strong way — `audio-demo` producing a
+    // non-silent captured WAV through it (the host-side check below).
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "audio-demo\n",
+        label: "guest/usb-audio: launch audio-demo (mixes through usb-audio)",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "AUDIO_DEMO:PASS",
+        fail_prefixes: &["AUDIO_DEMO:FAIL stage="],
+        timeout_secs: 60,
+        label: "guest/usb-audio: audio-demo PASS sentinel",
+        exit_code_on_fail: SMOKE_EXIT_AUDIO_DEMO_FAILED,
+    });
+    // A zero consumed count means audio_server fell back to the silent stub (the
+    // USB sink never bound) — the regression guard for the audio.hw race.
+    steps.push(SmokeStep::WaitLineNotMatching {
+        pattern: "AUDIO_DEMO:stats consumed=",
+        bad_substring: "consumed=0 ",
+        timeout_secs: 5,
+        label: "guest/usb-audio: frames_consumed non-zero",
+    });
+    steps
+}
+
+/// QEMU args for the usb-audio smoke: an xHCI controller with a `usb-audio`
+/// device wired to a WAV audiodev. No AC'97/HDA device, so `usb-audio` wins the
+/// `audio.hw` registration and is the sole sink.
+fn usb_audio_smoke_qemu_args(
+    smoke_dir: &Path,
+    uefi_image: &Path,
+    ovmf: &Path,
+    display: bool,
+) -> Vec<String> {
+    let display_mode = if display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let devices = DeviceSet {
+        xhci: true,
+        ..DeviceSet::default()
+    };
+    let mut qemu_args = qemu_args_with_devices(uefi_image, ovmf, display_mode, devices);
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    let wav_path = smoke_dir.join("audio.wav");
+    qemu_args.extend([
+        "-audiodev".to_string(),
+        format!("wav,id=snd0,path={}", wav_path.display()),
+        "-device".to_string(),
+        "usb-audio,audiodev=snd0,bus=xhci0.0".to_string(),
+    ]);
+    qemu_args
+}
+
+/// Run the usb-audio smoke (model on `cmd_hda_smoke`).
+fn cmd_usb_audio_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+
+    let smoke_dir = prepare_audio_smoke_dir();
+    let ovmf = find_ovmf();
+    let qemu_args = usb_audio_smoke_qemu_args(&smoke_dir, &uefi_image, &ovmf, args.display);
+    let steps = usb_audio_smoke_steps();
+
+    println!(
+        "usb-audio-smoke: launching QEMU with qemu-xhci + usb-audio (timeout {}s)",
+        args.timeout_secs
+    );
+    println!(
+        "usb-audio-smoke: WAV output → {}",
+        smoke_dir.join("audio.wav").display()
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!(
+                "usb-audio-smoke: serial script PASSED ({} steps in {elapsed}s)",
+                steps.len()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("usb-audio-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_AUDIO_DEMO_FAILED);
+        }
+    }
+
+    let wav_path = smoke_dir.join("audio.wav");
+    match assert_wav_non_silent(&wav_path) {
+        Ok(()) => println!("usb-audio-smoke: WAV non-silent check PASSED"),
+        Err(msg) => {
+            eprintln!("usb-audio-smoke: WAV non-silent check FAILED\n{msg}");
             std::process::exit(SMOKE_EXIT_WAV_SILENT);
         }
     }
@@ -22408,6 +22583,18 @@ fn populate_ext2_files(
     // Phase 92 Track D — ring-3 USB Mass Storage (BOT) class driver. Depends on
     // xhci_driver so it can look up the `usb` service the host controller registers.
     let usb_storage_conf = "name=usb_storage\ncommand=/drivers/usb-storage\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=xhci_driver\n";
+    // Phase 92c Track E — ring-3 USB Audio Class (UAC) isochronous PCM-out
+    // driver. Depends on xhci_driver (for the `usb` service); registers
+    // `audio.hw` so audio_server binds it as the PCM sink on a USB-audio machine.
+    let usb_audio_conf = "name=usb_audio\ncommand=/drivers/usb-audio\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=xhci_driver\n";
+    // Phase 92c Track E.2 — ring-3 USB Video Class (UVC) frame-capture driver.
+    // Depends on xhci_driver (for the `usb` service); exits cleanly (rc 0) when
+    // no CLASS_VIDEO device is present (QEMU has no UVC model).
+    let usb_video_conf = "name=usb_video\ncommand=/drivers/usb-video\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=xhci_driver\n";
+    // Phase 92c Track E.2 — ring-3 camera IPC server (UVC frame aggregator).
+    // Registers the "camera" service; no xhci_driver dependency since it can
+    // start independently and waits for usb-video to push frames.
+    let camera_server_conf = "name=camera_server\ncommand=/drivers/camera_server\ntype=daemon\nrestart=on-failure\nmax_restart=5\n";
     // Phase 80 Track A.5 — ring-3 AC'97 out-of-process audio hardware driver.
     // No `depends=` (device-host substrate is kernel-internal); must start
     // before audio_server so `audio.hw` is registered when audio_server resolves it.
@@ -22800,6 +22987,9 @@ fn populate_ext2_files(
     let usbhub_conf_tmp = output_dir.join("_tmp_usbhub_conf");
     let usb_hid_conf_tmp = output_dir.join("_tmp_usb_hid_conf");
     let usb_storage_conf_tmp = output_dir.join("_tmp_usb_storage_conf");
+    let usb_audio_conf_tmp = output_dir.join("_tmp_usb_audio_conf");
+    let usb_video_conf_tmp = output_dir.join("_tmp_usb_video_conf");
+    let camera_server_conf_tmp = output_dir.join("_tmp_camera_server_conf");
     let ac97_driver_conf_tmp = output_dir.join("_tmp_ac97_driver_conf");
     let hda_driver_conf_tmp = output_dir.join("_tmp_hda_driver_conf");
     let ahci_driver_conf_tmp = output_dir.join("_tmp_ahci_driver_conf");
@@ -22864,6 +23054,9 @@ fn populate_ext2_files(
     fs::write(&usbhub_conf_tmp, usbhub_conf).expect("write temp usbhub.conf");
     fs::write(&usb_hid_conf_tmp, usb_hid_conf).expect("write temp usb-hid.conf");
     fs::write(&usb_storage_conf_tmp, usb_storage_conf).expect("write temp usb-storage.conf");
+    fs::write(&usb_audio_conf_tmp, usb_audio_conf).expect("write temp usb-audio.conf");
+    fs::write(&usb_video_conf_tmp, usb_video_conf).expect("write temp usb-video.conf");
+    fs::write(&camera_server_conf_tmp, camera_server_conf).expect("write temp camera_server.conf");
     fs::write(&ac97_driver_conf_tmp, ac97_driver_conf).expect("write temp ac97.conf");
     fs::write(&hda_driver_conf_tmp, hda_driver_conf).expect("write temp hda.conf");
     fs::write(&ahci_driver_conf_tmp, ahci_driver_conf).expect("write temp ahci_driver.conf");
@@ -23703,6 +23896,18 @@ fn populate_ext2_files(
          sif etc/services.d/usb-storage.conf mode 0x81A4\n\
          sif etc/services.d/usb-storage.conf uid 0\n\
          sif etc/services.d/usb-storage.conf gid 0\n\
+         write \"{usb_audio_conf}\" etc/services.d/usb-audio.conf\n\
+         sif etc/services.d/usb-audio.conf mode 0x81A4\n\
+         sif etc/services.d/usb-audio.conf uid 0\n\
+         sif etc/services.d/usb-audio.conf gid 0\n\
+         write \"{usb_video_conf}\" etc/services.d/usb-video.conf\n\
+         sif etc/services.d/usb-video.conf mode 0x81A4\n\
+         sif etc/services.d/usb-video.conf uid 0\n\
+         sif etc/services.d/usb-video.conf gid 0\n\
+         write \"{camera_server_conf}\" etc/services.d/camera_server.conf\n\
+         sif etc/services.d/camera_server.conf mode 0x81A4\n\
+         sif etc/services.d/camera_server.conf uid 0\n\
+         sif etc/services.d/camera_server.conf gid 0\n\
          write \"{ac97_driver_conf}\" etc/services.d/ac97.conf\n\
          sif etc/services.d/ac97.conf mode 0x81A4\n\
          sif etc/services.d/ac97.conf uid 0\n\
@@ -23775,6 +23980,9 @@ fn populate_ext2_files(
         usbhub_conf = usbhub_conf_tmp.display(),
         usb_hid_conf = usb_hid_conf_tmp.display(),
         usb_storage_conf = usb_storage_conf_tmp.display(),
+        usb_audio_conf = usb_audio_conf_tmp.display(),
+        usb_video_conf = usb_video_conf_tmp.display(),
+        camera_server_conf = camera_server_conf_tmp.display(),
         ac97_driver_conf = ac97_driver_conf_tmp.display(),
         hda_driver_conf = hda_driver_conf_tmp.display(),
         ahci_driver_conf = ahci_driver_conf_tmp.display(),

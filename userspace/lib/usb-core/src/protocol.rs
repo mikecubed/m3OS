@@ -367,6 +367,24 @@ pub enum UsbRequest {
         /// `true` for a bulk-IN (device → shm), `false` for bulk-OUT (shm → device).
         dir_in: bool,
     },
+
+    /// Submit an **isochronous-OUT** transfer (a service interval of USB-audio
+    /// PCM) and block for completion. The payload travels inline (a UAC period
+    /// fits within `USB_MSG_MAX`; the `usb-audio` driver chunks a larger
+    /// `audio_server` submission across several of these). Returns
+    /// [`UsbReply::TransferComplete`] with the byte count. Isochronous transfers
+    /// have no retry, so a ring-underrun / missed-service-interval completion is
+    /// non-fatal and the submitted bytes are still counted as delivered (the
+    /// full byte count is returned); only a genuine transaction error / STALL
+    /// fails the transfer. Phase 92c (Track E).
+    SubmitIsochOut {
+        /// Target slot ID.
+        slot_id: u8,
+        /// Device Context Index of the isochronous-OUT endpoint.
+        dci: u8,
+        /// The PCM bytes for this service interval.
+        data: Vec<u8>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -597,6 +615,7 @@ const REQ_TOPOLOGY: u8 = 10;
 const REQ_SUBMIT_BULK_IN: u8 = 11;
 const REQ_ENUMERATE_CHILD: u8 = 12;
 const REQ_SUBMIT_SHM_TRANSFER: u8 = 13;
+const REQ_SUBMIT_ISOCH_OUT: u8 = 14;
 
 // --- reply tags ---
 const REP_DESCRIPTORS: u8 = 1;
@@ -832,6 +851,12 @@ impl UsbRequest {
                 put_u32(&mut v, *len);
                 v.push(*dir_in as u8);
             }
+            UsbRequest::SubmitIsochOut { slot_id, dci, data } => {
+                v.push(REQ_SUBMIT_ISOCH_OUT);
+                v.push(*slot_id);
+                v.push(*dci);
+                put_bytes(&mut v, data);
+            }
         }
         v
     }
@@ -914,6 +939,11 @@ impl UsbRequest {
                 shm_id: r.u32()?,
                 len: r.u32()?,
                 dir_in: r.u8()? != 0,
+            },
+            REQ_SUBMIT_ISOCH_OUT => UsbRequest::SubmitIsochOut {
+                slot_id: r.u8()?,
+                dci: r.u8()?,
+                data: r.bytes()?,
             },
             _ => return None,
         })
@@ -1234,6 +1264,11 @@ mod tests {
                 shm_id: 0x00AB_CDEF,
                 len: 8192,
                 dir_in: true,
+            },
+            UsbRequest::SubmitIsochOut {
+                slot_id: 2,
+                dci: 2,
+                data: alloc::vec![0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
             },
         ];
         for r in reqs {

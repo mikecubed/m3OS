@@ -374,6 +374,24 @@ if [ "${M3OS_HDA_REGRESSION:-0}" = "1" ]; then
     fi
 fi
 
+# Phase 92c — opt-in USB audio regression gate. `usb-audio-smoke` boots QEMU
+# with `-device qemu-xhci` + `-device usb-audio` (wired to a WAV audiodev),
+# brings up the ring-3 `usb-audio` driver (binds the UAC AudioStreaming
+# interface, SET_INTERFACE the isoch alt-setting, registers `audio.hw`), runs
+# `audio-demo` through `audio_server -> usb-audio -> isochronous OUT`, and
+# asserts a non-silent captured WAV. Gated behind M3OS_USB_AUDIO_REGRESSION=1
+# because it boots a full QEMU + audio-demo run; set it on branches touching the
+# usb-audio driver, the isochronous TRB path (controller `submit_isoch_out`,
+# `kernel_core::usb::{uac,xhci}` isoch primitives, the `SubmitIsochOut`
+# protocol), the xHCI server's audio-interface surfacing, or `audio_server`.
+if [ "${M3OS_USB_AUDIO_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask usb-audio-smoke..."
+    if ! cargo xtask usb-audio-smoke --timeout 300; then
+        echo "pre-push: cargo xtask usb-audio-smoke failed" >&2
+        exit 1
+    fi
+fi
+
 # Phase 81 — opt-in Wi-Fi regression gate. There is NO QEMU mt76 device model,
 # so `wifi-smoke` is a skip-with-reason diagnostic (always exits 0); the radio
 # path is validated on real hardware via VFIO passthrough

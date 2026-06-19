@@ -339,6 +339,34 @@ pub struct Controller {
 /// non-error outcome for a bulk-IN read smaller than the armed buffer.
 const COMPLETION_SHORT_PACKET: u8 = 13;
 
+/// xHCI Missed Service Error completion code (xHCI §6.4.5) — an isochronous
+/// service interval elapsed before the controller serviced the endpoint.
+/// Isoch has no retry, so the interval's data is dropped and the host resyncs
+/// on the next interval; this is **not** a transport failure.
+const COMPLETION_MISSED_SERVICE_ERROR: u8 = 26;
+
+/// xHCI Ring Underrun completion code (xHCI §6.4.5) — posted on an isochronous
+/// OUT endpoint when the controller's periodic scheduler finds the transfer
+/// ring empty (the producer hasn't queued the next interval yet). For a
+/// fire-and-forget audio-OUT stream this is the expected steady-state event
+/// between interval submissions, **not** a transport failure.
+const COMPLETION_RING_UNDERRUN: u8 = 14;
+
+/// Outcome of draining one isochronous-OUT batch in [`Controller::submit_isoch_out`].
+enum IsochBatchDrain {
+    /// Either all requested intervals were serviced, or a Ring-Underrun /
+    /// Missed-Service event showed the controller drained the transfer ring (so
+    /// in-flight TRBs are zero and the next batch is safe to enqueue). Both are
+    /// non-fatal for isochronous transfers, which have no retry.
+    Drained,
+    /// The bounded poll budget expired before the batch completed and without an
+    /// underrun — the device is servicing too slowly. The caller abandons the
+    /// rest of the submission, matching the pre-existing "no event" behaviour.
+    Timeout,
+    /// A genuine transaction error / STALL completion code on this endpoint.
+    Error(u8),
+}
+
 impl Controller {
     /// Read the capability registers and compute the runtime register-region
     /// bases. No MMIO writes happen here.
@@ -1929,6 +1957,136 @@ impl Controller {
         }
     }
 
+    /// Phase 92c (E.1/E.3) — submit an **isochronous OUT** transfer of `data` on
+    /// (`slot_id`, `dci`) and block for completion. This is the USB-audio (UAC)
+    /// PCM-out path: a class driver dribbles a service-interval's worth of mixed
+    /// PCM out to the device.
+    ///
+    /// `data` is copied into the endpoint's `data_bufs[0]` source buffer (grown
+    /// on demand) and split into **one Isoch TRB per `wMaxPacketSize`-sized
+    /// frame** — a full-speed isochronous TD carries at most `mps` bytes per
+    /// (micro)frame, so a single oversized TD is rejected (STALL/NAK) by the
+    /// device. Each TRB is enqueued with **SIA = 1** (Start Isoch ASAP — the
+    /// controller schedules it on the next available frame, so the host needs no
+    /// Frame-ID bookkeeping). Frames are queued in bounded batches (≤
+    /// `ISOCH_BATCH_FRAMES`, well within the transfer + event rings); the
+    /// doorbell is rung once per batch and the batch's completions drained.
+    ///
+    /// Isochronous transfers have **no retry**: a `Ring Underrun` (the periodic
+    /// scheduler found the ring empty between batches) or `Missed Service`
+    /// completion is the expected steady-state event, not a transport failure —
+    /// the audio backend's clock, not a per-frame handshake, governs flow. Such
+    /// frames are counted as delivered. Returns the byte count submitted, or
+    /// `None` on a genuine transport STALL / timeout.
+    pub fn submit_isoch_out(
+        &mut self,
+        irq: &IrqNotification,
+        slot_id: u8,
+        dci: u8,
+        data: &[u8],
+    ) -> Option<usize> {
+        /// Frames queued per doorbell — bounded so a batch never laps the 64-TRB
+        /// transfer ring nor floods the 64-entry event ring before it is drained.
+        const ISOCH_BATCH_FRAMES: usize = 16;
+
+        if data.is_empty() {
+            return Some(0);
+        }
+        // Resolve the endpoint's max-packet size and grow the source buffer to
+        // hold the whole payload (disjoint borrow from self.handle).
+        let (mps, need_grow) = match self.slot(slot_id) {
+            Some(sc) => match sc.interrupt_eps.iter().find(|e| e.dci == dci) {
+                Some(ep) => ((ep.mps as usize).max(1), data.len() > ep.data_bufs[0].len()),
+                None => return None,
+            },
+            None => return None,
+        };
+        if need_grow {
+            let new_buf = DmaBuffer::<u8>::allocate(&self.handle, data.len(), XHCI_ALIGN).ok()?;
+            let sc = self.slot_mut(slot_id)?;
+            let ep = sc.interrupt_eps.iter_mut().find(|e| e.dci == dci)?;
+            ep.data_bufs[0] = new_buf;
+        }
+        // Copy the whole payload into the DMA buffer once; TRBs point into it at
+        // mps-sized offsets. A single `copy_nonoverlapping` is used rather than a
+        // per-byte volatile loop on this periodic audio hot path; the subsequent
+        // doorbell MMIO write (a volatile store) orders these buffer stores ahead
+        // of the controller being told to read the ring.
+        let base_iova = {
+            let sc = self.slot_mut(slot_id)?;
+            let ep = sc.interrupt_eps.iter_mut().find(|e| e.dci == dci)?;
+            // SAFETY: data_bufs[0] was (re)allocated to >= data.len() above, the
+            // source and destination regions are distinct, and u8 has no
+            // alignment requirement.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    ep.data_bufs[0].user_ptr(),
+                    data.len(),
+                );
+            }
+            ep.data_bufs[0].iova()
+        };
+
+        let len = data.len();
+        let mut offset = 0usize;
+        while offset < len {
+            // Queue a batch of mps-sized isoch TRBs.
+            let mut batch = 0usize;
+            {
+                let sc = self.slot_mut(slot_id)?;
+                let ep = sc.interrupt_eps.iter_mut().find(|e| e.dci == dci)?;
+                while offset < len && batch < ISOCH_BATCH_FRAMES {
+                    let chunk = (len - offset).min(mps) as u32;
+                    let cycle = ep.producer.cycle;
+                    write_trb(
+                        &ep.ring,
+                        ep.producer.enqueue,
+                        trb::Trb::isoch(base_iova + offset as u64, chunk, 0, true, cycle),
+                    );
+                    let cycle_before = ep.producer.cycle;
+                    if ep.producer.advance() {
+                        let ring_iova = ep.ring_iova;
+                        write_trb(
+                            &ep.ring,
+                            ep.producer.link_index(),
+                            trb::Trb::link(ring_iova, true, cycle_before),
+                        );
+                    }
+                    offset += chunk as usize;
+                    batch += 1;
+                }
+            }
+            if batch == 0 {
+                break;
+            }
+            self.ring_doorbell(slot_id, dci);
+            // Drain THIS batch fully before enqueueing the next one. Each isoch
+            // TRB carries IOC, so the controller posts one Transfer Event per
+            // serviced interval; waiting for the whole batch caps in-flight TRBs
+            // at `ISOCH_BATCH_FRAMES` (< `RING_TRBS`), so the producer can never
+            // lap the transfer ring. The old code returned after the *first*
+            // event, which let back-to-back chunks (usb-audio dribbles a frame
+            // window out as adjacent `submit_isoch_out` calls sharing this
+            // persistent producer) enqueue far faster than a real controller —
+            // pacing one interval per microframe — drains, eventually
+            // overwriting still-owned TRBs. QEMU completes isoch near-instantly,
+            // which masked the overrun. Ring-Underrun / Missed-Service means the
+            // ring drained (non-fatal); a genuine error aborts the stream.
+            match self.drain_isoch_batch(irq, slot_id, dci, batch) {
+                IsochBatchDrain::Drained => {}
+                IsochBatchDrain::Timeout => return None,
+                IsochBatchDrain::Error(cc) => {
+                    write_str(STDOUT_FILENO, "[xhci] isoch-OUT non-success cc=");
+                    crate::write_u8_dec(cc);
+                    write_str(STDOUT_FILENO, "\n");
+                    return None;
+                }
+            }
+        }
+        Some(len)
+    }
+
     /// Block for the bulk-OUT Transfer Event on (`slot_id`, `dci`). Unlike the
     /// EP0 `wait_for_transfer_event`, any **IN** completion (odd DCI) seen while
     /// draining is routed through `capture_interrupt_report` + re-armed, so a
@@ -2011,6 +2169,106 @@ impl Controller {
             }
         }
         None
+    }
+
+    /// Drain `want` isochronous-OUT Transfer Events for (`slot_id`, `dci`) before
+    /// the next batch is enqueued — the ring-overrun guard for `submit_isoch_out`
+    /// (see its in-loop comment). Mirrors `wait_for_bulk_out_event`'s poll
+    /// skeleton — same ERDP/IMAN advance and IN-completion capture/re-arm so a
+    /// concurrent interrupt-IN report is not dropped — but counts matching
+    /// completions instead of returning the first. Each isoch TRB carries IOC, so
+    /// a fully-serviced batch posts exactly `want` Transfer Events; a Ring-Underrun
+    /// / Missed-Service shows the ring drained (in-flight == 0) and ends the wait
+    /// early as non-fatal. Bounded by the same spin-then-sleep poll budget.
+    fn drain_isoch_batch(
+        &mut self,
+        _irq: &IrqNotification,
+        slot_id: u8,
+        dci: u8,
+        want: usize,
+    ) -> IsochBatchDrain {
+        const MAX_POLLS: u32 = 400;
+        let mut drained = 0usize;
+        for poll_i in 0..(COMPLETION_SPIN_POLLS + MAX_POLLS) {
+            let before = self.consumer.index;
+            let mut fatal: Option<u8> = None;
+            let mut underrun = false;
+            let mut completed: alloc::vec::Vec<(u8, u8)> = alloc::vec::Vec::new();
+            loop {
+                let seg = self.event_ring.as_ref().expect("event ring allocated");
+                let candidate = read_trb(seg, self.consumer.index);
+                if !self.consumer.owns(&candidate) {
+                    break;
+                }
+                match trb::event_trb_type(&candidate) {
+                    Some(trb::TrbType::TransferEvent) => {
+                        let ev = trb::parse_transfer_event(&candidate);
+                        if ev.slot_id == slot_id && ev.endpoint_id == dci {
+                            match ev.completion_code {
+                                c if c == trb::COMPLETION_SUCCESS
+                                    || c == COMPLETION_SHORT_PACKET =>
+                                {
+                                    drained += 1;
+                                }
+                                COMPLETION_RING_UNDERRUN | COMPLETION_MISSED_SERVICE_ERROR => {
+                                    underrun = true;
+                                }
+                                cc => {
+                                    fatal = Some(cc);
+                                }
+                            }
+                        } else if ev.endpoint_id & 1 == 1 {
+                            // An IN completion on some other endpoint — capture
+                            // it rather than drop it (odd DCI = IN per trb::dci).
+                            if self.capture_interrupt_report(ev) {
+                                completed.push((ev.slot_id, ev.endpoint_id));
+                            }
+                        }
+                    }
+                    Some(trb::TrbType::CommandCompletion) => {
+                        let ev = trb::parse_command_completion(&candidate);
+                        self.on_command_completion(ev);
+                    }
+                    Some(trb::TrbType::PortStatusChange) => {
+                        let ev = trb::parse_port_status_change(&candidate);
+                        self.on_port_status_change(ev);
+                    }
+                    _ => {}
+                }
+                self.consumer.dequeue_step();
+            }
+            // Only advance ERDP / clear IMAN.IP when events were consumed (an
+            // empty-poll ERDP write stalls the ring — see wait_for_bulk_out_event).
+            if self.consumer.index != before {
+                let erdp =
+                    self.event_ring_iova + (self.consumer.index as u64) * trb::TRB_SIZE as u64;
+                self.rt_write_u64(rt_reg::ERDP, erdp | ERDP_EHB);
+                self.rt_write_u32(rt_reg::IMAN, IMAN_IP | IMAN_IE);
+            }
+            // Re-arm any IN endpoint captured above at its frame-sized length.
+            for (s, d) in completed {
+                let len = self
+                    .slot(s)
+                    .and_then(|sc| sc.interrupt_eps.iter().find(|e| e.dci == d))
+                    .map(|e| e.armed_len)
+                    .unwrap_or(0);
+                if len > 0 {
+                    self.arm_ring_in(s, d, len);
+                }
+            }
+            if let Some(cc) = fatal {
+                return IsochBatchDrain::Error(cc);
+            }
+            if underrun || drained >= want {
+                return IsochBatchDrain::Drained;
+            }
+            if poll_i < COMPLETION_SPIN_POLLS {
+                core::hint::spin_loop();
+            } else {
+                let _ = syscall_lib::nanosleep_for(0, 1_000_000);
+            }
+        }
+        IsochBatchDrain::Timeout
     }
 
     /// Issue a control transfer for a raw 8-byte SETUP packet on `slot_id`'s

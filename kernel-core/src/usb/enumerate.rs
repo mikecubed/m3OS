@@ -38,9 +38,10 @@ use alloc::vec::Vec;
 
 use crate::usb::descriptor::{ConfigDescriptor, DeviceDescriptor, ParsedConfig, parse_config_tree};
 use crate::usb::xhci::context::{
-    EP_CERR_3, EP_TYPE_BULK_IN, EP_TYPE_BULK_OUT, EP_TYPE_CONTROL, EP_TYPE_INTERRUPT_IN,
-    EP_TYPE_INTERRUPT_OUT, add_flags, ep_context_dword0_interval, ep_context_dword1,
-    ep_tr_dequeue_ptr, slot_context_dword0, slot_context_dword1,
+    EP_CERR_0, EP_CERR_3, EP_TYPE_BULK_IN, EP_TYPE_BULK_OUT, EP_TYPE_CONTROL, EP_TYPE_INTERRUPT_IN,
+    EP_TYPE_INTERRUPT_OUT, EP_TYPE_ISOCH_IN, EP_TYPE_ISOCH_OUT, add_flags,
+    ep_context_dword0_interval, ep_context_dword1, ep_tr_dequeue_ptr, slot_context_dword0,
+    slot_context_dword1,
 };
 use crate::usb::xhci::port::{PortSpeed, ep0_max_packet_for_speed};
 use crate::usb::xhci::trb::{COMPLETION_SUCCESS, dci};
@@ -295,6 +296,8 @@ fn build_configure_endpoint_ctx(ctx: &EnumContext) -> InputContextSnapshot {
                 // bmAttributes bits 1:0: 0=Control, 1=Isoch, 2=Bulk, 3=Interrupt.
                 let xhci_ep_type = match (ep.transfer_type(), is_in) {
                     (0, _) => EP_TYPE_CONTROL,
+                    (1, false) => EP_TYPE_ISOCH_OUT,
+                    (1, true) => EP_TYPE_ISOCH_IN,
                     (2, false) => EP_TYPE_BULK_OUT,
                     (2, true) => EP_TYPE_BULK_IN,
                     (3, false) => EP_TYPE_INTERRUPT_OUT,
@@ -302,6 +305,16 @@ fn build_configure_endpoint_ctx(ctx: &EnumContext) -> InputContextSnapshot {
                     // Default to Interrupt IN for unknown types; production
                     // code should log and skip.
                     _ => EP_TYPE_INTERRUPT_IN,
+                };
+
+                // Isochronous endpoints have no retry, so their Endpoint Context
+                // CErr field must be 0 (xHCI §6.2.3); every other type uses the
+                // standard 3-retry count.
+                let cerr = if xhci_ep_type == EP_TYPE_ISOCH_OUT || xhci_ep_type == EP_TYPE_ISOCH_IN
+                {
+                    EP_CERR_0
+                } else {
+                    EP_CERR_3
                 };
 
                 // Convert bInterval to the xHCI Endpoint-Context Interval field
@@ -335,7 +348,7 @@ fn build_configure_endpoint_ctx(ctx: &EnumContext) -> InputContextSnapshot {
                 ep_snapshots.push(EndpointContextSnapshot {
                     dci: ep_dci,
                     ep_dword0: ep_context_dword0_interval(xhci_interval),
-                    ep_dword1: ep_context_dword1(xhci_ep_type, EP_CERR_3, ep.w_max_packet_size),
+                    ep_dword1: ep_context_dword1(xhci_ep_type, cerr, ep.w_max_packet_size),
                     ep_dequeue_ptr: ep_ptr,
                 });
             }
@@ -564,8 +577,8 @@ pub fn run_enumeration(
 mod tests {
     use super::*;
     use crate::usb::xhci::context::{
-        EP_TYPE_BULK_IN, EP_TYPE_BULK_OUT, EP_TYPE_CONTROL, EP_TYPE_INTERRUPT_IN, ep_interval,
-        ep_max_packet_size, ep_type, slot_context_entries,
+        EP_TYPE_BULK_IN, EP_TYPE_BULK_OUT, EP_TYPE_CONTROL, EP_TYPE_INTERRUPT_IN,
+        EP_TYPE_ISOCH_OUT, ep_cerr, ep_interval, ep_max_packet_size, ep_type, slot_context_entries,
     };
     use crate::usb::xhci::trb::dci as compute_dci;
 
@@ -1062,6 +1075,67 @@ mod tests {
             0,
             "A1 (EP0) must NOT be set in Configure Endpoint"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 92c (E.3): isochronous endpoints map to the isoch EP type with
+    // CErr=0 — previously they fell through to the Interrupt-IN default.
+    // -----------------------------------------------------------------------
+
+    /// Config blob for a High-Speed UAC-style device with a single
+    /// isochronous OUT endpoint (the USB-audio PCM-out path):
+    ///   Config(9) + AudioStreaming interface(9) + EP1-OUT-Isoch(7) = 25 = 0x0019
+    const ISOCH_AUDIO_CONFIG_BLOB: &[u8] = &[
+        // Config descriptor (9 bytes), wTotalLength = 25 = 0x0019, 1 interface
+        0x09, 0x02, 0x19, 0x00, 0x01, 0x01, 0x00, 0x80, 0x32,
+        // AudioStreaming interface (9 bytes): class 0x01 (Audio),
+        // subclass 0x02 (AudioStreaming), 1 endpoint, alt setting 1
+        0x09, 0x04, 0x01, 0x01, 0x01, 0x01, 0x02, 0x00, 0x00,
+        // EP1 OUT Isochronous (7 bytes): address=0x01 (OUT), bmAttributes=0x09
+        // (isochronous / adaptive), MPS=192 (0x00C0), bInterval=1
+        0x07, 0x05, 0x01, 0x09, 0xC0, 0x00, 0x01,
+    ];
+
+    #[test]
+    fn configure_endpoint_maps_isoch_out_ep_type_with_zero_cerr() {
+        let mut ops = MockOps {
+            device_descriptor_override: Some(BULK_DEVICE_DESCRIPTOR.to_vec()),
+            config_blob_override: Some(ISOCH_AUDIO_CONFIG_BLOB.to_vec()),
+            ..Default::default()
+        };
+        let ctx = EnumContext {
+            speed: Some(PortSpeed::High),
+            ep0_ring_iova: 0x0010_0000,
+            port: 1,
+            ..Default::default()
+        };
+        let (final_state, _ctx) = run_enumeration(EnumState::EnableSlot, ctx, &mut ops);
+        assert_eq!(final_state, EnumState::Configured);
+
+        let cfg_snap = ops
+            .ctx_snapshots
+            .last()
+            .expect("must have configure_endpoint snapshot");
+        assert_eq!(
+            cfg_snap.endpoint_contexts.len(),
+            1,
+            "must have exactly one (isoch OUT) endpoint context"
+        );
+
+        let ep = &cfg_snap.endpoint_contexts[0];
+        // EP1 OUT → DCI = 2*1 + 0 = 2.
+        assert_eq!(ep.dci, compute_dci(1, false));
+        assert_eq!(
+            ep_type(ep.ep_dword1),
+            EP_TYPE_ISOCH_OUT,
+            "isoch OUT endpoint must be typed EP_TYPE_ISOCH_OUT, not the old Interrupt-IN default"
+        );
+        assert_eq!(
+            ep_cerr(ep.ep_dword1),
+            0,
+            "isochronous endpoint CErr field must be 0 (no retry)"
+        );
+        assert_eq!(ep_max_packet_size(ep.ep_dword1), 192);
     }
 
     #[test]

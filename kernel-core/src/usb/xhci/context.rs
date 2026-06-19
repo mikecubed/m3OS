@@ -183,6 +183,12 @@ pub const EP_TYPE_BULK_IN: u8 = 6;
 pub const EP_TYPE_INTERRUPT_OUT: u8 = 3;
 /// EP Type value for an Interrupt IN endpoint.
 pub const EP_TYPE_INTERRUPT_IN: u8 = 7;
+/// EP Type value for an Isochronous OUT endpoint (xHCI §6.2.3 Table 6-9) — the
+/// USB-audio (UAC) PCM-out direction.
+pub const EP_TYPE_ISOCH_OUT: u8 = 1;
+/// EP Type value for an Isochronous IN endpoint — the USB-video (UVC) frame-in
+/// direction.
+pub const EP_TYPE_ISOCH_IN: u8 = 5;
 
 /// Shift of the Endpoint Type field in Endpoint Context dword 1 (bits 5:3).
 pub const EP_TYPE_SHIFT: u32 = 3;
@@ -193,6 +199,12 @@ pub const EP_TYPE_MASK: u32 = 0x7;
 pub const EP_CERR_SHIFT: u32 = 1;
 /// Mask of the CErr field after shifting (2 bits).
 pub const EP_CERR_MASK: u32 = 0x3;
+/// Shift of the Max Burst Size field in Endpoint Context dword 1 (bits 15:8).
+/// Zero for full-speed endpoints; for HS/SS isochronous endpoints it carries
+/// `bMaxBurst` (the additional transactions per service interval).
+pub const EP_MAX_BURST_SHIFT: u32 = 8;
+/// Mask of the Max Burst Size field after shifting (8 bits).
+pub const EP_MAX_BURST_MASK: u32 = 0xFF;
 /// Shift of Max Packet Size in Endpoint Context dword 1 (bits 31:16).
 pub const EP_MAX_PACKET_SIZE_SHIFT: u32 = 16;
 /// Mask of Max Packet Size after shifting (16 bits).
@@ -216,6 +228,11 @@ pub const EP_DCS_BIT: u64 = 1;
 /// maximum and the standard choice for control/bulk/interrupt endpoints.
 pub const EP_CERR_3: u8 = 3;
 
+/// Error Count (CErr = 0) for isochronous endpoints (xHCI §6.2.3). Isoch has no
+/// retry — a failed/missed transaction's data is dropped, not resent — so the
+/// CErr field **must** be 0 for an isochronous endpoint context.
+pub const EP_CERR_0: u8 = 0;
+
 /// Encode **Endpoint Context dword 0** for an interrupt endpoint (xHCI §6.2.3).
 ///
 /// Sets the Interval field (bits 23:16); all other bits in dword 0 are left
@@ -236,11 +253,32 @@ pub const fn ep_context_dword0_interval(interval: u8) -> u32 {
 /// * `cerr`    (bits 2:1) — error count, use [`EP_CERR_3`] for non-isoch.
 /// * `max_packet_size` (bits 31:16) — the endpoint's `wMaxPacketSize`.
 ///
-/// Bits 15:8 (Max Burst Size) and bits 7:6 (reserved) are left zero.
+/// Bits 15:8 (Max Burst Size) and bits 7:6 (reserved) are left zero. Equivalent
+/// to [`ep_context_dword1_burst`] with `max_burst = 0` — the correct choice for
+/// control/bulk/interrupt and full-speed isochronous endpoints.
 pub const fn ep_context_dword1(ep_type: u8, cerr: u8, max_packet_size: u16) -> u32 {
+    ep_context_dword1_burst(ep_type, cerr, 0, max_packet_size)
+}
+
+/// Encode **Endpoint Context dword 1** including the **Max Burst Size** field
+/// (bits 15:8, xHCI §6.2.3). For a high-speed/SuperSpeed isochronous endpoint
+/// `max_burst` is `bMaxBurst` (the additional opportunities per service
+/// interval); full-speed endpoints pass 0.
+pub const fn ep_context_dword1_burst(
+    ep_type: u8,
+    cerr: u8,
+    max_burst: u8,
+    max_packet_size: u16,
+) -> u32 {
     (((ep_type as u32) & EP_TYPE_MASK) << EP_TYPE_SHIFT)
         | (((cerr as u32) & EP_CERR_MASK) << EP_CERR_SHIFT)
+        | (((max_burst as u32) & EP_MAX_BURST_MASK) << EP_MAX_BURST_SHIFT)
         | (((max_packet_size as u32) & EP_MAX_PACKET_SIZE_MASK) << EP_MAX_PACKET_SIZE_SHIFT)
+}
+
+/// Decode the Max Burst Size from Endpoint Context dword 1 (bits 15:8).
+pub const fn ep_max_burst(dword1: u32) -> u8 {
+    ((dword1 >> EP_MAX_BURST_SHIFT) & EP_MAX_BURST_MASK) as u8
 }
 
 /// Encode the **TR Dequeue Pointer** value stored in Endpoint Context dwords
@@ -398,6 +436,29 @@ mod tests {
     }
 
     #[test]
+    fn ep_context_dword1_isoch_out_zero_cerr() {
+        // Isochronous OUT endpoint (UAC PCM-out), MPS = 192, CErr MUST be 0.
+        let d1 = ep_context_dword1(EP_TYPE_ISOCH_OUT, EP_CERR_0, 192);
+        assert_eq!(ep_type(d1), EP_TYPE_ISOCH_OUT);
+        assert_eq!(ep_cerr(d1), 0, "isochronous endpoints must have CErr = 0");
+        assert_eq!(ep_max_packet_size(d1), 192);
+        // Full-speed isoch carries no burst.
+        assert_eq!(ep_max_burst(d1), 0);
+    }
+
+    #[test]
+    fn ep_context_dword1_burst_roundtrip() {
+        // High-speed isoch IN (UVC) with bMaxBurst = 2 and MPS = 1024.
+        let d1 = ep_context_dword1_burst(EP_TYPE_ISOCH_IN, EP_CERR_0, 2, 1024);
+        assert_eq!(ep_type(d1), EP_TYPE_ISOCH_IN);
+        assert_eq!(ep_cerr(d1), 0);
+        assert_eq!(ep_max_burst(d1), 2, "Max Burst Size occupies bits 15:8");
+        assert_eq!(ep_max_packet_size(d1), 1024);
+        // The burst field must not bleed into MPS or EP-type neighbours.
+        assert_eq!((d1 >> EP_MAX_BURST_SHIFT) & EP_MAX_BURST_MASK, 2);
+    }
+
+    #[test]
     fn ep_context_dword0_interval_roundtrip() {
         // Interval = 10 (for a HS interrupt endpoint with bInterval = 11).
         let d0 = ep_context_dword0_interval(10);
@@ -429,6 +490,8 @@ mod tests {
         assert_eq!(EP_TYPE_BULK_IN, 6);
         assert_eq!(EP_TYPE_INTERRUPT_OUT, 3);
         assert_eq!(EP_TYPE_INTERRUPT_IN, 7);
+        assert_eq!(EP_TYPE_ISOCH_OUT, 1);
+        assert_eq!(EP_TYPE_ISOCH_IN, 5);
         // EP0 control endpoint type encodes as 4.
         let d1 = ep_context_dword1(EP_TYPE_CONTROL, 0, 0);
         assert_eq!((d1 >> EP_TYPE_SHIFT) & EP_TYPE_MASK, 4);

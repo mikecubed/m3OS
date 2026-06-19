@@ -71,10 +71,24 @@ pub const HID_DESCRIPTOR_MIN_LEN: u8 = 9;
 // USB device class codes (USB-IF assigned, USB 2.0 §9.6.1 Table 9-8)
 // ---------------------------------------------------------------------------
 
+/// Audio class code (`bInterfaceClass`) — UAC AudioControl / AudioStreaming.
+pub const CLASS_AUDIO: u8 = 0x01;
 /// HID class code (`bDeviceClass` / `bInterfaceClass`).
 pub const CLASS_HID: u8 = 0x03;
 /// Hub class code.
 pub const CLASS_HUB: u8 = 0x09;
+/// Video class code (`bInterfaceClass`) — UVC VideoControl / VideoStreaming.
+pub const CLASS_VIDEO: u8 = 0x0E;
+
+/// Audio Streaming subclass (`bInterfaceSubClass`) — the UAC interface that
+/// carries the isochronous PCM endpoint.
+pub const SUBCLASS_AUDIO_STREAMING: u8 = 0x02;
+/// Video Control subclass (`bInterfaceSubClass`) — the UVC interface that
+/// carries the control pipe.
+pub const SUBCLASS_VIDEO_CONTROL: u8 = 0x01;
+/// Video Streaming subclass (`bInterfaceSubClass`) — the UVC interface that
+/// carries the capture endpoint.
+pub const SUBCLASS_VIDEO_STREAMING: u8 = 0x02;
 
 /// HID boot subclass (`bInterfaceSubClass`).
 pub const SUBCLASS_HID_BOOT: u8 = 0x01;
@@ -324,6 +338,9 @@ impl EndpointDescriptor {
         self.bm_attributes & 0x03
     }
 }
+
+/// Transfer type constant: Isochronous endpoint (`bmAttributes` bits 1:0 = 1).
+pub const TRANSFER_TYPE_ISOCH: u8 = 1;
 
 /// Transfer type constant: Bulk endpoint (`bmAttributes` bits 1:0 = 2).
 pub const TRANSFER_TYPE_BULK: u8 = 2;

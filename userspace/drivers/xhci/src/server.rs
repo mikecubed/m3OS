@@ -28,7 +28,8 @@ use alloc::vec::Vec;
 use driver_runtime::IrqNotification;
 use driver_runtime::ipc::{EndpointCap, IpcBackend, RecvResult, SyscallBackend};
 use kernel_core::usb::descriptor::{
-    CLASS_HID, CLASS_HUB, TRANSFER_TYPE_BULK, TRANSFER_TYPE_INTERRUPT,
+    CLASS_AUDIO, CLASS_HID, CLASS_HUB, CLASS_VIDEO, TRANSFER_TYPE_BULK, TRANSFER_TYPE_INTERRUPT,
+    TRANSFER_TYPE_ISOCH,
 };
 use kernel_core::usb::enumerate::EnumContext;
 use kernel_core::usb::xhci::trb::dci;
@@ -100,6 +101,11 @@ pub fn device_info_from_ctx(ctx: &EnumContext) -> Option<AttachNotice> {
         let mut bulk_in_mps = 0u16;
         let mut bulk_out_dci = 0u8;
         let mut bulk_out_mps = 0u16;
+        // Phase 92c Track E: track whether this interface carries an
+        // isochronous OUT endpoint (the UAC PCM-out streaming endpoint) or an
+        // isochronous IN endpoint (the UVC frame-capture endpoint).
+        let mut isoch_out_present = false;
+        let mut isoch_in_present = false;
 
         for ep in &iface.endpoints {
             let is_in = ep.b_endpoint_address & 0x80 != 0;
@@ -118,12 +124,34 @@ pub fn device_info_from_ctx(ctx: &EnumContext) -> Option<AttachNotice> {
                     bulk_out_dci = dci(ep_num, false);
                     bulk_out_mps = ep.w_max_packet_size;
                 }
+                (TRANSFER_TYPE_ISOCH, false) => {
+                    isoch_out_present = true;
+                }
+                (TRANSFER_TYPE_ISOCH, true) => {
+                    isoch_in_present = true;
+                }
                 _ => {}
             }
         }
 
         let hid_surfaceable = i.b_interface_class == CLASS_HID && ep_in_dci != 0;
         let bulk_surfaceable = bulk_in_dci != 0 && bulk_out_dci != 0;
+        // Phase 92c Track E: surface the UAC AudioStreaming interface (the alt
+        // setting that carries an isochronous OUT endpoint) so the `usb-audio`
+        // daemon can bind it via the `NextAttach` walk. The isoch endpoint has
+        // neither an interrupt-IN nor a bulk pair, so without this branch the
+        // device produces no `AttachNotice` at all. The notice carries the slot
+        // + class; `usb-audio` resolves the isoch OUT DCI itself via a
+        // `GetDescriptors` round-trip (the isoch endpoint fields are not on the
+        // fixed-width AttachNotice wire format).
+        let audio_surfaceable = i.b_interface_class == CLASS_AUDIO && isoch_out_present;
+        // Phase 92c Track E.2: surface the UVC VideoStreaming interface (the alt
+        // setting carrying a capture IN endpoint — isochronous, or bulk-IN with
+        // no OUT pair) so the `usb-video` daemon can bind it via `NextAttach`.
+        // Like the audio case, `usb-video` resolves the IN endpoint DCI itself
+        // via `GetDescriptors`. (Bare-metal/VFIO-only — QEMU has no UVC model.)
+        let video_surfaceable =
+            i.b_interface_class == CLASS_VIDEO && (isoch_in_present || bulk_in_dci != 0);
         // Phase 92 Track A: surface CLASS_HUB interfaces so the `usbhub` daemon
         // can bind a hub via the `NextAttach` walk and drive it (GET_DESCRIPTOR
         // (Hub) + per-port PORT_POWER/PORT_RESET over EP0 `ControlRequest`). A hub
@@ -137,6 +165,10 @@ pub fn device_info_from_ctx(ctx: &EnumContext) -> Option<AttachNotice> {
         } else if bulk_surfaceable {
             1
         } else if hub_surfaceable {
+            1
+        } else if audio_surfaceable {
+            1
+        } else if video_surfaceable {
             1
         } else {
             continue;
@@ -568,6 +600,26 @@ fn handle_request(
             data,
         } => match owner!(slot_id)
             .and_then(|(c, irq, slot)| c.submit_bulk_out(irq, slot, target_dci, &data))
+        {
+            Some(transferred) => UsbReply::TransferComplete {
+                transferred,
+                completion_code: 1,
+            },
+            None => UsbReply::TransferComplete {
+                transferred: 0,
+                completion_code: 0xFF,
+            },
+        },
+        // Phase 92c Track E — isochronous-OUT for USB audio (UAC PCM-out). One
+        // service interval of PCM, scheduled SIA (Start Isoch ASAP); a ring-
+        // underrun / missed interval is non-fatal (no retry) and the submitted
+        // bytes are still counted as delivered, rather than failing.
+        UsbRequest::SubmitIsochOut {
+            slot_id,
+            dci: target_dci,
+            data,
+        } => match owner!(slot_id)
+            .and_then(|(c, irq, slot)| c.submit_isoch_out(irq, slot, target_dci, &data))
         {
             Some(transferred) => UsbReply::TransferComplete {
                 transferred,

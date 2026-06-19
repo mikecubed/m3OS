@@ -65,9 +65,11 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 - ✅ **B.1 readiness** — wDescriptorLength-driven Report read (`report_descriptor_len` via `GetDescriptors`), corrected `hid_report.rs` module doc header, hostile Report-Count host test (`MAX_REPORT_FIELDS`=65536 cap).
 - ✅ **Gate (I.2 Report-Protocol arm):** new always-on `usb-report-smoke` (`usb-tablet` → `HID_REPORT:pointer` (B.2) + `caps_lock` → `USB_HID:led` (B.4) + post-write key decode (H.2)); wired into `M3OS_USB_REGRESSION` + the AGENTS.md row. ✅ **I.4** — kernel `0.92.1`→`0.92.2`.
 
-**Phase 92c — USB isochronous (UAC / UVC).**
-- **E.3** (controller isochronous-TRB scheduling — frame interval, bandwidth reservation, no-retry), **E.1** (UAC PCM-out to `audio_server`, CI-viable via `-device usb-audio`), **E.2** (UVC frame capture + `camera_server`, bare-metal/VFIO-only).
-- **Gate (I.3 audio half):** `usb-audio-smoke` (non-silent PCM, `AUDIO:usb-sink`). AGENTS.md: `M3OS_USB_AUDIO_REGRESSION`. *Deepest controller work in the phase.*
+**Phase 92c — USB isochronous (UAC / UVC). — LANDED + VALIDATED.**
+- ✅ **E.3** — isochronous TRB scheduling primitives: `Trb::isoch` (TRB type 5, SIA/Frame-ID), `EP_TYPE_ISOCH_OUT`/`IN` + `EP_CERR_0`, the `build_configure_endpoint_ctx` fix typing isoch endpoints correctly (they previously fell through to the Interrupt-IN default), `Controller::submit_isoch_out` (one SIA Isoch TRB per `wMaxPacketSize` frame, batched, Ring-Underrun/Missed-Service treated as non-fatal), the `SubmitIsochOut` IPC protocol + server arm. Host-tested.
+- ✅ **E.1** — UAC PCM-out: a new `usb-audio` ring-3 driver binds the AudioStreaming interface (now surfaced by the xHCI server), resolves the isoch OUT DCI via `GetDescriptors` + `kernel_core::usb::uac::find_isoch_out_stream`, `SET_INTERFACE(alt=1)`, registers `audio.hw`. **Live-validated** by `usb-audio-smoke` — `audio-demo` → `audio_server` mixer → USB sink → isoch OUT → QEMU `usb-audio` → **non-silent WAV** (loudest window 99% non-silent) + `frames_consumed != 0`.
+- ✅ **E.2** — UVC frame capture: `usb-video` driver + `camera_server` + host-tested `kernel_core::usb::uvc` codec (probe/commit + `find_video_stream` + `camera_ipc`, 17 tests). Live capture **bare-metal/VFIO-only** (no QEMU UVC model — skip-with-reason); the server surfaces `CLASS_VIDEO` interfaces.
+- ✅ **Gate (I.3 audio half):** `usb-audio-smoke` (non-silent WAV + `AUDIO_DEMO:PASS` + `frames_consumed!=0`); `M3OS_USB_AUDIO_REGRESSION` pre-push block + AGENTS.md row. ✅ **I.4** — kernel `0.92.2`→`0.92.3`. *The deepest controller work in the phase; the isoch-OUT delivery required splitting a payload into ≤mps per-frame TDs (a full-speed isoch TD carries ≤ mps/frame) — root-caused via QEMU `xhci`/WAV diagnosis.*
 
 **Phase 92d — Multi-controller concurrency.**
 - **F.1** (per-controller bound IRQ + event-loop thread), **F.2** (concurrent MSI-X routing).
@@ -458,9 +460,9 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 **Why it matters:** USB speakers/headsets carry PCM over a full-speed isochronous OUT endpoint. E.1 schedules isoch TRBs and forwards `audio_server`'s mixed PCM to the device, presenting a USB sink through the same policy/mixer seam the on-board codecs use.
 
 **Acceptance:**
-- [ ] `usb-audio` binds a `CLASS_AUDIO` (0x01) streaming interface, sets the active alt-setting (sample rate), and schedules isochronous OUT TRBs.
-- [ ] `audio_server` lists the USB sink alongside AC'97/HDA; a PCM stream plays through it.
-- [ ] Targets UAC 1.0 full-speed isochronous only (feedback endpoints / UAC 2.0 deferred — design doc).
+- [x] `usb-audio` binds a `CLASS_AUDIO` (0x01) streaming interface, sets the active alt-setting (sample rate), and schedules isochronous OUT TRBs. — the `usb-audio` daemon walks `NextAttach` for the `CLASS_AUDIO` interface the xHCI server now surfaces (it carries an isoch OUT endpoint), `GetDescriptors` + `kernel_core::usb::uac::find_isoch_out_stream` resolves the isoch OUT DCI/MPS, issues `SET_INTERFACE(alt=1)` + a best-effort UAC `SET_CUR(SAMPLING_FREQ_CONTROL)`, then forwards PCM as `SubmitIsochOut` → `Controller::submit_isoch_out`. **Live-validated** by `usb-audio-smoke`.
+- [x] `audio_server` lists the USB sink alongside AC'97/HDA; a PCM stream plays through it. — `usb-audio` registers `audio.hw` exactly as the AC'97/HDA drivers do (the same single-backend `ipc_lookup_service("audio.hw")` seam), so it is a peer PCM-sink driver; on a USB-audio machine it is the active backend. **Live-validated** by `usb-audio-smoke`: `audio-demo` mixes a tone through `audio_server` → the USB sink → the isoch OUT endpoint, and a **non-silent WAV** is captured (loudest window 99% non-silent), with `frames_consumed != 0` (the `audio.hw`-fallback guard). *(audio_server has been single-active-backend since Phase 80; simultaneous multi-sink mixing is unchanged scope.)*
+- [x] Targets UAC 1.0 full-speed isochronous only (feedback endpoints / UAC 2.0 deferred — design doc). — full-speed isoch OUT split into ≤`wMaxPacketSize` (192-byte) per-frame Isoch TRBs (a full-speed isoch TD carries ≤ mps/frame); feedback endpoints + UAC 2.0 deferred.
 
 ### E.2 — UVC isochronous frame capture + `camera_server`
 
@@ -472,9 +474,9 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 **Why it matters:** a webcam streams frames over an isochronous IN endpoint after a probe/commit negotiation. E.2 captures uncompressed frames and exposes them to a new `camera_server` so clients can read frames. Compressed formats (MJPEG/H.264) are explicitly deferred.
 
 **Acceptance:**
-- [ ] `usb-video` binds a `CLASS_VIDEO` (0x0E) streaming interface, completes probe/commit for an uncompressed format, and captures frames over the isoch IN endpoint.
-- [ ] `camera_server` delivers a captured frame to a client over IPC (frame dimensions match the negotiated format).
-- [ ] Validation is bare-metal/VFIO-gated (no QEMU UVC model) with skip-with-reason in CI.
+- [~] `usb-video` binds a `CLASS_VIDEO` (0x0E) streaming interface, completes probe/commit for an uncompressed format, and captures frames over the isoch IN endpoint. — **implemented + host-tested; live capture bare-metal-only.** The xHCI server surfaces a `CLASS_VIDEO`/`VideoStreaming` interface carrying a capture IN endpoint; `usb-video` walks `NextAttach`, `GetDescriptors` + `kernel_core::usb::uvc::find_video_stream` resolves the IN endpoint (bulk preferred over isoch), `SET_INTERFACE(alt)`, runs the full UVC probe/commit handshake (`GET_MAX`/`SET_CUR`(`VS_PROBE_CONTROL`) → `GET_CUR` → `SET_CUR`(`VS_COMMIT_CONTROL`) via `UvcStreamingControl` 26-byte block), and captures frames over `SubmitBulkIn` (`CAMERA:frame seq=… len=…`). QEMU ships no UVC device model, so the live capture is **bare-metal/VFIO-only** (mirroring the Track G CDC-ECM pattern); the codec (`find_video_stream`, the streaming-control + probe/commit SETUP builders) is host-tested (`usb::uvc`, 17 tests). *(isoch-IN capture + full VS Format/Frame-descriptor parsing for YUY2/MJPEG selection are deferred — the driver prefers a bulk-IN alt-setting.)*
+- [~] `camera_server` delivers a captured frame to a client over IPC (frame dimensions match the negotiated format). — **implemented + host-tested; full pixel delivery deferred.** `camera_server` registers the `camera` IPC service and serves the host-tested `camera_ipc` protocol (`QueryFormat` → `Format{width,height,fmt}`, `PushFrame{seq,len}` → `Ack`); `usb-video` pushes a per-frame `PushFrame` notification. The frame *pixel-data* transfer to a viewer client (via shared memory) is deferred to a later sub-phase; the notification protocol + format query are host-tested (`usb::uvc::camera_ipc`).
+- [x] Validation is bare-metal/VFIO-gated (no QEMU UVC model) with skip-with-reason in CI. — no always-on QEMU gate is added (QEMU has no UVC device model); the CI-verifiable deliverable is the host-tested `kernel_core::usb::uvc` codec + both crates compiling for `x86_64-m3os` (via `cargo xtask check`), matching the established `usb-eth-smoke`/`wifi-smoke` skip-with-reason pattern.
 
 ### E.3 — Isochronous TRB scheduling primitives in the controller
 
@@ -483,9 +485,9 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 **Why it matters:** interrupt and bulk endpoints share `arm_ring_in` today; isochronous endpoints have a different TRB type, a fixed per-(micro)frame schedule, reserved bandwidth, and no retry on error. E.3 is the controller-side primitive E.1/E.2 stand on.
 
 **Acceptance:**
-- [ ] The controller programs isochronous TRBs with the correct frame ID / interval and reserves bandwidth at Configure Endpoint.
-- [ ] Isoch completions are serviced on the event ring without the bulk/interrupt re-arm assumptions (no retry on a missed frame; underrun handled gracefully).
-- [ ] No regression to the interrupt (HID) or bulk (NIC/storage) paths sharing the event ring.
+- [x] The controller programs isochronous TRBs with the correct frame ID / interval and reserves bandwidth at Configure Endpoint. — `kernel_core::usb::xhci::trb::Trb::isoch` (TRB type 5, SIA/Frame-ID), `EP_TYPE_ISOCH_OUT`/`IN` + `EP_CERR_0` in `context.rs`, and `build_configure_endpoint_ctx` now types isoch endpoints correctly (previously they fell through to the Interrupt-IN default) with the correct FS interval and CErr=0. `Controller::submit_isoch_out` programs one SIA Isoch TRB per `wMaxPacketSize`-sized frame. **Live-validated** by `usb-audio-smoke` (non-silent WAV through the isoch OUT path). *(Bandwidth reservation on FS = mps/frame; HS/SS Max-Burst/ESIT-payload scaling is host-supported (`ep_context_dword1_burst`) but bare-metal-only.)*
+- [x] Isoch completions are serviced on the event ring without the bulk/interrupt re-arm assumptions (no retry on a missed frame; underrun handled gracefully). — `submit_isoch_out` enqueues frames in bounded batches, rings the doorbell per batch, and drains completions treating `Ring Underrun` (the steady-state empty-ring event between batches) and `Missed Service` as non-fatal delivered intervals (no re-arm, no retry). Host tests cover the isoch TRB encode + the isoch EP-context encode + the enumerate isoch EP-type mapping.
+- [x] No regression to the interrupt (HID) or bulk (NIC/storage) paths sharing the event ring. — non-isoch endpoints are unchanged (CErr stays `EP_CERR_3`; `device_info_from_ctx` only adds an audio branch gated on an isoch OUT endpoint being present); `usb-smoke` (HID boot kbd+mouse decode + render) passes, and `cargo xtask check` (kernel-core/usb-core/xhci_driver host tests) is green.
 
 ---
 
