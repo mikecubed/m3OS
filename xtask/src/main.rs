@@ -410,6 +410,14 @@ struct DeviceSet {
     /// (instead of virtio-blk) via an `ide-hd`. Set via `--device ahci`. Phase
     /// 82: drives the ring-3 `ahci_driver` bring-up + `RemoteBlockDevice` mount.
     ahci: bool,
+    /// Phase 92d — attach a SECOND `qemu-xhci` controller at PCI slot 0:7.0
+    /// (`addr=0x7`) with only a `usb-mouse` on it. Effective only when `xhci`
+    /// is also true; that first controller carries only a `usb-kbd`. The mouse
+    /// being the sole pointer device and living on controller 1 makes the gate
+    /// falsifiable: a decoded mouse-move proves controller 1's IRQ reached the
+    /// server loop. `dual_xhci = false` leaves the existing `xhci0`+kbd+mouse
+    /// single-controller layout byte-for-byte unchanged.
+    dual_xhci: bool,
 }
 
 /// Parse `--device <name>` and `--iommu` flags out of `args`, returning the
@@ -795,6 +803,17 @@ fn main() {
                     std::process::exit(1);
                 });
             cmd_usb_audio_smoke(&smoke_args);
+        }
+        // Phase 92d — two qemu-xhci controllers (xhci0+kbd, xhci1+mouse); asserts
+        // XHCI:controller-1:ready and that a QMP mouse-move on xhci1 decodes.
+        Some("usb-multi-controller-smoke") => {
+            let smoke_args = parse_smoke_boot_args("usb-multi-controller-smoke", &args[2..])
+                .unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_usb_multi_controller_smoke(&smoke_args);
         }
         Some("ssh-e1000-banner-check") => {
             let banner_args = parse_ssh_e1000_banner_check_args(&args[2..]).unwrap_or_else(|err| {
@@ -1373,7 +1392,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -5313,15 +5332,40 @@ fn qemu_args_with_devices_resolved(
     // Phase 78c: attach BOTH a usb-kbd and a usb-mouse so the multi-slot
     // enumeration path (keyboard AND mouse) is exercised, matching the
     // design-doc acceptance `-device qemu-xhci -device usb-kbd -device usb-mouse`.
+    //
+    // Phase 92d (`dual_xhci`): when a second controller is requested the
+    // topology splits across two buses — xhci0 (slot 0x6) carries only the
+    // keyboard, xhci1 (slot 0x7) carries only the mouse. addr=0x7 is the next
+    // free PCI slot after xhci0 (0x6); the AHCI controller only occupies 0x7
+    // when `devices.iommu` is true, and `dual_xhci` never combines with
+    // `iommu` in the gate, so there is no slot conflict. The split topology is
+    // what makes the gate falsifiable: a decoded mouse report proves xhci1's
+    // MSI-X IRQ was subscribed into the shared Notification and reached the
+    // server loop independently of xhci0.
     if devices.xhci {
-        args.extend([
-            "-device".to_string(),
-            "qemu-xhci,id=xhci0,addr=0x6".to_string(),
-            "-device".to_string(),
-            "usb-kbd,bus=xhci0.0".to_string(),
-            "-device".to_string(),
-            "usb-mouse,bus=xhci0.0".to_string(),
-        ]);
+        if devices.dual_xhci {
+            // Second-controller topology: kbd on xhci0, mouse on xhci1.
+            args.extend([
+                "-device".to_string(),
+                "qemu-xhci,id=xhci0,addr=0x6".to_string(),
+                "-device".to_string(),
+                "usb-kbd,bus=xhci0.0".to_string(),
+                "-device".to_string(),
+                "qemu-xhci,id=xhci1,addr=0x7".to_string(),
+                "-device".to_string(),
+                "usb-mouse,bus=xhci1.0".to_string(),
+            ]);
+        } else {
+            // Default single-controller layout (unchanged — kbd + mouse on xhci0).
+            args.extend([
+                "-device".to_string(),
+                "qemu-xhci,id=xhci0,addr=0x6".to_string(),
+                "-device".to_string(),
+                "usb-kbd,bus=xhci0.0".to_string(),
+                "-device".to_string(),
+                "usb-mouse,bus=xhci0.0".to_string(),
+            ]);
+        }
     }
 
     // Phase 55a Track F.1: `--iommu` enables an emulated Intel VT-d unit on
@@ -10448,6 +10492,199 @@ fn cmd_usb_smoke(args: &SmokeBootArgs) {
         }
         Err(msg) => {
             eprintln!("usb-smoke: FAILED\n{msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Phase 92d — multi-controller USB concurrency acceptance gate.
+///
+/// Boots m3OS with TWO `qemu-xhci` controllers:
+///   - xhci0 (PCI slot 0x6): `usb-kbd` only
+///   - xhci1 (PCI slot 0x7): `usb-mouse` only
+///
+/// The split topology makes the gate falsifiable: the mouse is the sole
+/// pointer device and it lives exclusively on controller 1. A decoded
+/// mouse-move proves that controller 1's MSI-X IRQ was subscribed into
+/// the primary driver's bound `Notification` object and that the single
+/// server loop services events from either controller. Asserts, in order:
+///
+/// 1. `XHCI:controller-1:ready` — the second controller's ring is up and
+///    its IRQ is bound into the shared notification (the key new assertion).
+/// 2. `XHCI_BRINGUP:enable-slot:OK` — at least one Enable Slot Completion
+///    event (causal anchor, same as `usb-smoke`).
+/// 3. `XHCI_USB:server-ready` — the USB IPC server is registered + bound.
+/// 4. `usb-hid: polling` — HID class driver bound the keyboard on xhci0.
+/// 5. `USB_HID:report-parsed` — Report descriptor parsed live (Phase 92b).
+/// 6. `TERM_SMOKE:prompt-ready` — focused term at an interactive prompt.
+/// 7. A QMP relative-motion event into the `usb-mouse` (which is on
+///    xhci1) produces `USB_HID:mouse` — a live interrupt-IN decode proving
+///    xhci1's interrupt was serviced through the shared notification path.
+///
+/// Opt-in pre-push gate via `M3OS_USB_REGRESSION=1`.
+fn cmd_usb_multi_controller_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false, // graphical_login — autologin / serial path
+    );
+    let ovmf = find_ovmf();
+
+    let qmp_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&qmp_socket);
+    let vnc_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&vnc_socket);
+
+    // Dual-controller topology: xhci0 (0x6) + kbd, xhci1 (0x7) + mouse only.
+    let devices = DeviceSet {
+        xhci: true,
+        dual_xhci: true,
+        ahci: false,
+        ..DeviceSet::default()
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, QemuDisplayMode::Headless, devices);
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    // Swap `-display none` for a VNC unix socket so the framebuffer surface
+    // stays live for QMP, and wire the QMP control socket.
+    let mut idx = 0;
+    while idx + 1 < qemu_args.len() {
+        if qemu_args[idx] == "-display" && qemu_args[idx + 1] == "none" {
+            qemu_args[idx + 1] = format!("vnc=unix:{}", vnc_socket.display());
+            break;
+        }
+        idx += 1;
+    }
+    qemu_args.push("-qmp".to_string());
+    qemu_args.push(format!("unix:{},server,nowait", qmp_socket.display()));
+    qemu_args.push("-vga".to_string());
+    qemu_args.push("std".to_string());
+
+    let out_dir = std::env::temp_dir().join("m3os-usb-multi-controller-smoke");
+    let _ = std::fs::create_dir_all(&out_dir);
+
+    println!(
+        "usb-multi-controller-smoke: launching QEMU with xhci0+usb-kbd (0x6) \
+         and xhci1+usb-mouse (0x7) (timeout {}s, qmp {})",
+        args.timeout_secs,
+        qmp_socket.display()
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let rx = spawn_serial_reader(stdout);
+    let mut serial_history = String::new();
+    let mut serial_buf = String::new();
+    let global_start = std::time::Instant::now();
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let step = std::time::Duration::from_secs(args.timeout_secs.min(180));
+
+    let result: Result<(), String> = (|| {
+        let mut wait = |pat: &str| {
+            wait_for_serial_pattern(
+                &rx,
+                &mut serial_buf,
+                &mut serial_history,
+                pat,
+                step,
+                global_start,
+                global_timeout,
+            )
+        };
+        // (1) The driver track emits this sentinel when xhci1's ring is up
+        //     and its IRQ is subscribed into the primary Notification.
+        wait("XHCI:controller-1:ready")?;
+        println!(
+            "usb-multi-controller-smoke: secondary controller (xhci1) IRQ bound — \
+             shared notification ready"
+        );
+        // (2) Enable Slot Command Completion (causal anchor, same as usb-smoke).
+        wait("XHCI_BRINGUP:enable-slot:OK")?;
+        // (3) The USB IPC server is registered + the IRQ is bound.
+        wait("XHCI_USB:server-ready")?;
+        // (4) usb-hid bound the keyboard (on xhci0) and is polling.
+        wait("usb-hid: polling")?;
+        // (5) Phase 92 Track B.1: Report descriptor parsed live.
+        wait("USB_HID:report-parsed")?;
+        // (6) Compositor + focused term at interactive prompt — consumer ready.
+        wait("TERM_SMOKE:prompt-ready")?;
+        println!(
+            "usb-multi-controller-smoke: USB stack + focused term ready — \
+             injecting mouse event via QMP"
+        );
+
+        let qmp_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut q = qmp::QmpClient::connect(&qmp_socket, qmp_deadline)
+            .map_err(|e| format!("qmp connect: {e}"))?;
+
+        // (7) Mouse: inject relative motion into the usb-mouse (which is on
+        // xhci1, not xhci0). QMP routes the event to the only pointer device,
+        // which produces an interrupt-IN report on xhci1's ring. usb-hid must
+        // decode it — proving xhci1's interrupt was wired into the shared
+        // Notification and the server loop services it.
+        let mut mouse_ok = false;
+        for attempt in 0..5 {
+            q.send_pointer_rel(24, 18)
+                .map_err(|e| format!("qmp input-send-event: {e}"))?;
+            if wait("USB_HID:mouse").is_ok() {
+                mouse_ok = true;
+                break;
+            }
+            println!(
+                "usb-multi-controller-smoke: mouse report not yet observed \
+                 (attempt {attempt})"
+            );
+        }
+        if !mouse_ok {
+            return Err(
+                "injected mouse motion (on xhci1) never decoded by usb-hid — \
+                 controller-1 interrupt was not serviced"
+                    .to_string(),
+            );
+        }
+        println!(
+            "usb-multi-controller-smoke: mouse report decoded via xhci1 — \
+             USB_HID:mouse received (controller-1 interrupt serviced)"
+        );
+        Ok(())
+    })();
+
+    let _ = child.kill();
+    let _ = child.wait();
+    // Unlink the QMP/VNC unix sockets so repeated runs/CI jobs don't accumulate
+    // stale `.sock` files in `$TMPDIR` (mirrors `cmd_less_render_probe`).
+    let _ = std::fs::remove_file(&qmp_socket);
+    let _ = std::fs::remove_file(&vnc_socket);
+    match result {
+        Ok(()) => {
+            let elapsed = global_start.elapsed().as_secs();
+            println!(
+                "usb-multi-controller-smoke: PASSED ({elapsed}s) — second xHCI controller \
+                 IRQ bound into shared notification and mouse-move decoded from xhci1"
+            );
+        }
+        Err(msg) => {
+            eprintln!("usb-multi-controller-smoke: FAILED\n{msg}");
             std::process::exit(1);
         }
     }
@@ -26224,6 +26461,7 @@ fn regression_tests() -> Vec<RegressionTest> {
                 memory_mib: None,
                 xhci: false,
                 ahci: false,
+                dual_xhci: false,
             },
             wants_debug_crash_marker: false,
             wants_readback_marker: false,
@@ -26264,6 +26502,7 @@ fn regression_tests() -> Vec<RegressionTest> {
                 memory_mib: None,
                 xhci: false,
                 ahci: false,
+                dual_xhci: false,
             },
             wants_debug_crash_marker: false,
             wants_readback_marker: false,
@@ -26301,6 +26540,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             memory_mib: None,
             xhci: false,
             ahci: false,
+            dual_xhci: false,
         },
         wants_debug_crash_marker: false,
         wants_readback_marker: false,
@@ -26335,6 +26575,7 @@ fn regression_tests() -> Vec<RegressionTest> {
                 memory_mib: None,
                 xhci: false,
                 ahci: false,
+                dual_xhci: false,
             },
             wants_debug_crash_marker: false,
             wants_readback_marker: false,
@@ -29741,6 +29982,7 @@ mod tests {
                 memory_mib: Some(4096),
                 xhci: false,
                 ahci: false,
+                dual_xhci: false,
             },
             None,
         );
@@ -29801,6 +30043,7 @@ mod tests {
                 memory_mib: None,
                 xhci: false,
                 ahci: false,
+                dual_xhci: false,
             },
         );
         assert!(
@@ -29835,6 +30078,7 @@ mod tests {
                 memory_mib: None,
                 xhci: false,
                 ahci: false,
+                dual_xhci: false,
             },
             Some(fake_nvme),
         );
@@ -29996,6 +30240,7 @@ mod tests {
                 memory_mib: None,
                 xhci: false,
                 ahci: false,
+                dual_xhci: false,
             },
             Some(fake_nvme),
         );
@@ -30042,6 +30287,7 @@ mod tests {
                 memory_mib: None,
                 xhci: false,
                 ahci: false,
+                dual_xhci: false,
             },
             Some(Path::new("/tmp/m3os-test-nvme-rootdisk-never-created.img")),
         );
@@ -30100,6 +30346,7 @@ mod tests {
                 memory_mib: None,
                 xhci: false,
                 ahci: false,
+                dual_xhci: false,
             },
             None,
         );
@@ -30163,6 +30410,7 @@ mod tests {
                 memory_mib: None,
                 xhci: false,
                 ahci: false,
+                dual_xhci: false,
             },
             None,
         );
@@ -30199,6 +30447,7 @@ mod tests {
                 memory_mib: None,
                 xhci: false,
                 ahci: false,
+                dual_xhci: false,
             },
             None,
         );
@@ -30427,6 +30676,7 @@ mod tests {
             memory_mib: None,
             xhci: false,
             ahci: false,
+            dual_xhci: false,
         });
         let iommu = device_smoke_steps(DeviceSet {
             nvme: true,
@@ -30439,6 +30689,7 @@ mod tests {
             memory_mib: None,
             xhci: false,
             ahci: false,
+            dual_xhci: false,
         });
 
         assert_eq!(smoke_step_labels(&iommu), smoke_step_labels(&base));
