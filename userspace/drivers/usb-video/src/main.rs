@@ -320,8 +320,13 @@ fn program_main(_args: &[&str]) -> i32 {
 
     // 6. Look up camera_server (best-effort; if absent the driver still captures
     // and logs frames — useful for initial bare-metal bringup without
-    // camera_server running).
-    let camera_ep: Option<u32> = lookup(CAMERA_SERVICE_NAME);
+    // camera_server running). The lookup is retried lazily in the capture loop
+    // below while still unresolved, so frame forwarding begins whenever
+    // camera_server registers — `usb_video` and `camera_server` have no start
+    // ordering between them (camera_server declares no `depends=`), and a
+    // one-shot lookup here would miss a camera_server that registers after
+    // `usb_video` reaches this point.
+    let mut camera_ep: Option<u32> = lookup(CAMERA_SERVICE_NAME);
 
     // 7. Capture loop: SubmitBulkIn / PollBulkIn per frame.
     let mut frame_seq: u64 = 0;
@@ -342,6 +347,11 @@ fn program_main(_args: &[&str]) -> i32 {
                 syscall_lib::write_u64(STDOUT_FILENO, frame_len as u64);
                 syscall_lib::write_str(STDOUT_FILENO, "\n");
 
+                // Resolve camera_server lazily: if it was not up when we bound,
+                // retry the lookup until it registers (cheap; stops once found).
+                if camera_ep.is_none() {
+                    camera_ep = lookup(CAMERA_SERVICE_NAME);
+                }
                 // Forward to camera_server if available.
                 if let Some(cam_ep) = camera_ep {
                     forward_frame_to_camera(cam_ep, frame_seq, &data);

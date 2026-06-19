@@ -352,6 +352,21 @@ const COMPLETION_MISSED_SERVICE_ERROR: u8 = 26;
 /// between interval submissions, **not** a transport failure.
 const COMPLETION_RING_UNDERRUN: u8 = 14;
 
+/// Outcome of draining one isochronous-OUT batch in [`Controller::submit_isoch_out`].
+enum IsochBatchDrain {
+    /// Either all requested intervals were serviced, or a Ring-Underrun /
+    /// Missed-Service event showed the controller drained the transfer ring (so
+    /// in-flight TRBs are zero and the next batch is safe to enqueue). Both are
+    /// non-fatal for isochronous transfers, which have no retry.
+    Drained,
+    /// The bounded poll budget expired before the batch completed and without an
+    /// underrun — the device is servicing too slowly. The caller abandons the
+    /// rest of the submission, matching the pre-existing "no event" behaviour.
+    Timeout,
+    /// A genuine transaction error / STALL completion code on this endpoint.
+    Error(u8),
+}
+
 impl Controller {
     /// Read the capability registers and compute the runtime register-region
     /// bases. No MMIO writes happen here.
@@ -2046,23 +2061,27 @@ impl Controller {
                 break;
             }
             self.ring_doorbell(slot_id, dci);
-            // Drain this batch's completions. One `wait_for_bulk_out_event` pass
-            // drains all currently-owned events; isoch completion codes
-            // (Success/Short/Ring-Underrun/Missed-Service) are all non-fatal. A
-            // genuine STALL/transaction error aborts the stream.
-            match self.wait_for_bulk_out_event(irq, slot_id, dci) {
-                Some(ev)
-                    if ev.completion_code == trb::COMPLETION_SUCCESS
-                        || ev.completion_code == COMPLETION_SHORT_PACKET
-                        || ev.completion_code == COMPLETION_RING_UNDERRUN
-                        || ev.completion_code == COMPLETION_MISSED_SERVICE_ERROR => {}
-                Some(ev) => {
+            // Drain THIS batch fully before enqueueing the next one. Each isoch
+            // TRB carries IOC, so the controller posts one Transfer Event per
+            // serviced interval; waiting for the whole batch caps in-flight TRBs
+            // at `ISOCH_BATCH_FRAMES` (< `RING_TRBS`), so the producer can never
+            // lap the transfer ring. The old code returned after the *first*
+            // event, which let back-to-back chunks (usb-audio dribbles a frame
+            // window out as adjacent `submit_isoch_out` calls sharing this
+            // persistent producer) enqueue far faster than a real controller —
+            // pacing one interval per microframe — drains, eventually
+            // overwriting still-owned TRBs. QEMU completes isoch near-instantly,
+            // which masked the overrun. Ring-Underrun / Missed-Service means the
+            // ring drained (non-fatal); a genuine error aborts the stream.
+            match self.drain_isoch_batch(irq, slot_id, dci, batch) {
+                IsochBatchDrain::Drained => {}
+                IsochBatchDrain::Timeout => return None,
+                IsochBatchDrain::Error(cc) => {
                     write_str(STDOUT_FILENO, "[xhci] isoch-OUT non-success cc=");
-                    crate::write_u8_dec(ev.completion_code);
+                    crate::write_u8_dec(cc);
                     write_str(STDOUT_FILENO, "\n");
                     return None;
                 }
-                None => return None,
             }
         }
         Some(len)
@@ -2150,6 +2169,106 @@ impl Controller {
             }
         }
         None
+    }
+
+    /// Drain `want` isochronous-OUT Transfer Events for (`slot_id`, `dci`) before
+    /// the next batch is enqueued — the ring-overrun guard for `submit_isoch_out`
+    /// (see its in-loop comment). Mirrors `wait_for_bulk_out_event`'s poll
+    /// skeleton — same ERDP/IMAN advance and IN-completion capture/re-arm so a
+    /// concurrent interrupt-IN report is not dropped — but counts matching
+    /// completions instead of returning the first. Each isoch TRB carries IOC, so
+    /// a fully-serviced batch posts exactly `want` Transfer Events; a Ring-Underrun
+    /// / Missed-Service shows the ring drained (in-flight == 0) and ends the wait
+    /// early as non-fatal. Bounded by the same spin-then-sleep poll budget.
+    fn drain_isoch_batch(
+        &mut self,
+        _irq: &IrqNotification,
+        slot_id: u8,
+        dci: u8,
+        want: usize,
+    ) -> IsochBatchDrain {
+        const MAX_POLLS: u32 = 400;
+        let mut drained = 0usize;
+        for poll_i in 0..(COMPLETION_SPIN_POLLS + MAX_POLLS) {
+            let before = self.consumer.index;
+            let mut fatal: Option<u8> = None;
+            let mut underrun = false;
+            let mut completed: alloc::vec::Vec<(u8, u8)> = alloc::vec::Vec::new();
+            loop {
+                let seg = self.event_ring.as_ref().expect("event ring allocated");
+                let candidate = read_trb(seg, self.consumer.index);
+                if !self.consumer.owns(&candidate) {
+                    break;
+                }
+                match trb::event_trb_type(&candidate) {
+                    Some(trb::TrbType::TransferEvent) => {
+                        let ev = trb::parse_transfer_event(&candidate);
+                        if ev.slot_id == slot_id && ev.endpoint_id == dci {
+                            match ev.completion_code {
+                                c if c == trb::COMPLETION_SUCCESS
+                                    || c == COMPLETION_SHORT_PACKET =>
+                                {
+                                    drained += 1;
+                                }
+                                COMPLETION_RING_UNDERRUN | COMPLETION_MISSED_SERVICE_ERROR => {
+                                    underrun = true;
+                                }
+                                cc => {
+                                    fatal = Some(cc);
+                                }
+                            }
+                        } else if ev.endpoint_id & 1 == 1 {
+                            // An IN completion on some other endpoint — capture
+                            // it rather than drop it (odd DCI = IN per trb::dci).
+                            if self.capture_interrupt_report(ev) {
+                                completed.push((ev.slot_id, ev.endpoint_id));
+                            }
+                        }
+                    }
+                    Some(trb::TrbType::CommandCompletion) => {
+                        let ev = trb::parse_command_completion(&candidate);
+                        self.on_command_completion(ev);
+                    }
+                    Some(trb::TrbType::PortStatusChange) => {
+                        let ev = trb::parse_port_status_change(&candidate);
+                        self.on_port_status_change(ev);
+                    }
+                    _ => {}
+                }
+                self.consumer.dequeue_step();
+            }
+            // Only advance ERDP / clear IMAN.IP when events were consumed (an
+            // empty-poll ERDP write stalls the ring — see wait_for_bulk_out_event).
+            if self.consumer.index != before {
+                let erdp =
+                    self.event_ring_iova + (self.consumer.index as u64) * trb::TRB_SIZE as u64;
+                self.rt_write_u64(rt_reg::ERDP, erdp | ERDP_EHB);
+                self.rt_write_u32(rt_reg::IMAN, IMAN_IP | IMAN_IE);
+            }
+            // Re-arm any IN endpoint captured above at its frame-sized length.
+            for (s, d) in completed {
+                let len = self
+                    .slot(s)
+                    .and_then(|sc| sc.interrupt_eps.iter().find(|e| e.dci == d))
+                    .map(|e| e.armed_len)
+                    .unwrap_or(0);
+                if len > 0 {
+                    self.arm_ring_in(s, d, len);
+                }
+            }
+            if let Some(cc) = fatal {
+                return IsochBatchDrain::Error(cc);
+            }
+            if underrun || drained >= want {
+                return IsochBatchDrain::Drained;
+            }
+            if poll_i < COMPLETION_SPIN_POLLS {
+                core::hint::spin_loop();
+            } else {
+                let _ = syscall_lib::nanosleep_for(0, 1_000_000);
+            }
+        }
+        IsochBatchDrain::Timeout
     }
 
     /// Issue a control transfer for a raw 8-byte SETUP packet on `slot_id`'s
