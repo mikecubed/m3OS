@@ -41,6 +41,12 @@ const BLOCK_CACHE_MAX: usize = 4096;
 pub struct Ext2Volume {
     /// Absolute LBA of the partition start on the block device.
     base_lba: u64,
+    /// Remote block-device id this volume reads/writes through. `0` = the root
+    /// backend via the global `blk::read_sectors`/`write_sectors` (the original
+    /// singleton behaviour, byte-identical). `>= 1` = a secondary device in the
+    /// `blk::remote` registry (Phase 92a D.4 — e.g. a `/mnt/usbN` mount), routed
+    /// via `blk::read_sectors_dev`/`write_sectors_dev`.
+    dev_id: u32,
     /// Parsed and cached superblock.
     pub superblock: Ext2Superblock,
     /// Cached block group descriptor table.
@@ -185,13 +191,170 @@ impl kernel_core::fs::ext2::BlockReader for Ext2Volume {
     }
 }
 
+/// Read sectors from device `dev_id` — the root backend (`dev_id == 0`) via the
+/// global `blk::read_sectors` (byte-identical to the pre-Phase-92a singleton),
+/// or a secondary registry device (`dev_id >= 1`, e.g. a USB stick) via
+/// `blk::read_sectors_dev`.
+fn read_sectors_for(dev_id: u32, lba: u64, count: usize, buf: &mut [u8]) -> Result<(), u8> {
+    if dev_id == 0 {
+        crate::blk::read_sectors(lba, count, buf)
+    } else {
+        crate::blk::read_sectors_dev(dev_id, lba, count, buf)
+    }
+}
+
+/// Write sectors to device `dev_id`. `dev_id == 0` uses the global
+/// `blk::write_sectors` (root, grant-backed inline path); `dev_id >= 1` uses
+/// the secondary-device `blk::write_sectors_dev` inline path.
+fn write_sectors_for(dev_id: u32, lba: u64, count: usize, buf: &[u8]) -> Result<(), u8> {
+    if dev_id == 0 {
+        crate::blk::write_sectors(lba, count, buf)
+    } else {
+        crate::blk::write_sectors_dev(dev_id, lba, count, buf)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 92a D.4 — secondary ext2 mount table (e.g. /mnt/usb0)
+// ---------------------------------------------------------------------------
+
+/// One secondary ext2 mount: a path prefix bound to an [`Ext2Volume`] on a
+/// `blk::remote` registry device (`dev_id >= 1`). The root `/` mount stays in
+/// [`EXT2_VOLUME`]; this table holds only the additional mounts so the root
+/// path is completely untouched (Phase 92a D.4).
+pub struct UsbMount {
+    /// Absolute mount-point prefix, e.g. `"/mnt/usb0"` (no trailing slash).
+    pub prefix: String,
+    /// The ext2 volume backing this mount, reading via its `dev_id`.
+    pub volume: Ext2Volume,
+}
+
+/// Active secondary mounts. Empty on a machine with no USB storage mounted, so
+/// the lookup helpers short-circuit and the root FS path is unaffected.
+pub static USB_MOUNTS: YieldingMutex<Vec<UsbMount>> = YieldingMutex::new(Vec::new());
+
+/// Lock-free fast-path: `true` only while [`USB_MOUNTS`] is non-empty. Every
+/// path-resolving syscall checks this *before* acquiring the `USB_MOUNTS` lock,
+/// so on the overwhelmingly common no-USB-mounted machine the secondary-mount
+/// routing adds a single relaxed atomic load to the root FS hot path and never
+/// touches the lock.
+static USB_MOUNTS_ACTIVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+fn usb_mounts_active() -> bool {
+    USB_MOUNTS_ACTIVE.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Match `abs_path` against `prefix`, returning the in-volume path (always
+/// starting with `/`) if `abs_path` is the mount point itself or a child of it.
+/// `"/mnt/usb0"` → `"/"`; `"/mnt/usb0/dir/f"` → `"/dir/f"`; `"/mnt/usb01"` → None
+/// (boundary-safe, no false prefix match). Returns a borrow of `abs_path` (or
+/// the static `"/"`), so it never allocates — `is_usb_mount_path`'s `.is_some()`
+/// probe stays allocation-free on every `/mnt/usbN` open/stat hot path.
+fn match_mount_prefix<'a>(abs_path: &'a str, prefix: &str) -> Option<&'a str> {
+    if abs_path == prefix {
+        return Some("/");
+    }
+    let rest = abs_path.strip_prefix(prefix)?;
+    if rest.starts_with('/') {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
+/// Mount an ext2 volume on registry device `dev_id` at `prefix` (e.g.
+/// `"/mnt/usb0"`). If a mount already exists at the same prefix it is replaced,
+/// and that displaced mount's `dev_id` is returned as `Some(old_dev_id)` so the
+/// caller can unregister its now-orphaned `blk::remote` slot. Without that,
+/// repeated remounts to the same prefix leak registry slots until
+/// `MAX_REMOTE_BLOCK` is exhausted.
+pub fn mount_usb(prefix: &str, base_lba: u64, dev_id: u32) -> Result<Option<u32>, Ext2Error> {
+    let vol = Ext2Volume::mount_dev(base_lba, dev_id)?;
+    let mut mounts = USB_MOUNTS.lock();
+    let displaced = mounts
+        .iter()
+        .find(|m| m.prefix == prefix)
+        .map(|m| m.volume.dev_id);
+    mounts.retain(|m| m.prefix != prefix);
+    mounts.push(UsbMount {
+        prefix: String::from(prefix),
+        volume: vol,
+    });
+    USB_MOUNTS_ACTIVE.store(!mounts.is_empty(), core::sync::atomic::Ordering::Release);
+    Ok(displaced)
+}
+
+/// Remove the secondary mount at `prefix`. Returns `true` if one was removed.
+pub fn unmount_usb(prefix: &str) -> bool {
+    let mut mounts = USB_MOUNTS.lock();
+    let before = mounts.len();
+    mounts.retain(|m| m.prefix != prefix);
+    USB_MOUNTS_ACTIVE.store(!mounts.is_empty(), core::sync::atomic::Ordering::Release);
+    mounts.len() != before
+}
+
+/// `true` if `abs_path` falls under any secondary mount prefix.
+pub fn is_usb_mount_path(abs_path: &str) -> bool {
+    if !usb_mounts_active() {
+        return false;
+    }
+    let mounts = USB_MOUNTS.lock();
+    mounts
+        .iter()
+        .any(|m| match_mount_prefix(abs_path, &m.prefix).is_some())
+}
+
+/// Run `f` against the secondary-mount volume serving `abs_path` (read-only),
+/// passing the in-volume relative path. Returns `None` if `abs_path` is not
+/// under any secondary mount (the caller then takes the existing root path).
+pub fn with_usb_mount<R>(abs_path: &str, f: impl FnOnce(&Ext2Volume, &str) -> R) -> Option<R> {
+    if !usb_mounts_active() {
+        return None;
+    }
+    let mounts = USB_MOUNTS.lock();
+    for m in mounts.iter() {
+        if let Some(rel) = match_mount_prefix(abs_path, &m.prefix) {
+            return Some(f(&m.volume, rel));
+        }
+    }
+    None
+}
+
+/// Mutable counterpart of [`with_usb_mount`] for the write path
+/// (`write_file_data`/`truncate_file` take `&mut Ext2Volume`).
+pub fn with_usb_mount_mut<R>(
+    abs_path: &str,
+    f: impl FnOnce(&mut Ext2Volume, &str) -> R,
+) -> Option<R> {
+    if !usb_mounts_active() {
+        return None;
+    }
+    let mut mounts = USB_MOUNTS.lock();
+    for m in mounts.iter_mut() {
+        if let Some(rel) = match_mount_prefix(abs_path, &m.prefix) {
+            return Some(f(&mut m.volume, rel));
+        }
+    }
+    None
+}
+
 impl Ext2Volume {
-    /// Mount an ext2 partition at the given base LBA (P28-T019).
+    /// Mount an ext2 partition at the given base LBA on the root device (P28-T019).
     pub fn mount(base_lba: u64) -> Result<Self, Ext2Error> {
+        Self::mount_dev(base_lba, 0)
+    }
+
+    /// Mount an ext2 partition at `base_lba` on remote block device `dev_id`
+    /// (Phase 92a D.4). `dev_id == 0` is the root backend (identical to
+    /// [`Ext2Volume::mount`]); `dev_id >= 1` reads/writes through the
+    /// secondary-device `blk::*_dev` routing (e.g. a `/mnt/usbN` USB stick).
+    pub fn mount_dev(base_lba: u64, dev_id: u32) -> Result<Self, Ext2Error> {
         // Superblock is at byte offset 1024 from partition start = LBA + 2 sectors.
         let sb_lba = base_lba + 2; // 1024 bytes / 512 bytes per sector
         let mut sb_raw = vec![0u8; 1024];
-        crate::blk::read_sectors(sb_lba, 2, &mut sb_raw).map_err(|_| Ext2Error::IoError)?;
+        read_sectors_for(dev_id, sb_lba, 2, &mut sb_raw).map_err(|_| Ext2Error::IoError)?;
 
         let superblock = Ext2Superblock::parse(&sb_raw)?;
         let block_size = superblock.block_size();
@@ -207,7 +370,7 @@ impl Ext2Volume {
         let bgd_size = (bg_count as usize) * 32;
         let bgd_sectors = bgd_size.div_ceil(512);
         let mut bgd_raw = vec![0u8; bgd_sectors * 512];
-        crate::blk::read_sectors(bgd_lba, bgd_sectors, &mut bgd_raw)
+        read_sectors_for(dev_id, bgd_lba, bgd_sectors, &mut bgd_raw)
             .map_err(|_| Ext2Error::IoError)?;
 
         let bgd_table = Ext2BlockGroupDescriptor::parse_table(&bgd_raw, bg_count)?;
@@ -223,6 +386,7 @@ impl Ext2Volume {
 
         Ok(Ext2Volume {
             base_lba,
+            dev_id,
             superblock,
             bgd_table,
             block_size,
@@ -266,8 +430,9 @@ impl Ext2Volume {
             }
         }
 
-        // Cache miss: read from VirtIO-blk.
-        crate::blk::read_sectors(
+        // Cache miss: read from the backing block device.
+        read_sectors_for(
+            self.dev_id,
             self.block_to_lba(block_num),
             self.sectors_per_block as usize,
             &mut buf,
@@ -311,10 +476,11 @@ impl Ext2Volume {
             }
         }
 
-        // Cache miss: read the full block from VirtIO-blk, cache it, then copy
-        // the requested slice into dst.
+        // Cache miss: read the full block from the backing device, cache it,
+        // then copy the requested slice into dst.
         let mut block_buf = vec![0u8; self.block_size as usize];
-        crate::blk::read_sectors(
+        read_sectors_for(
+            self.dev_id,
             self.block_to_lba(block_num),
             self.sectors_per_block as usize,
             &mut block_buf,
@@ -337,7 +503,7 @@ impl Ext2Volume {
         // Invalidate before write so stale data is never served.
         self.block_cache.lock().remove(&block_num);
         let lba = self.block_to_lba(block_num);
-        crate::blk::write_sectors(lba, self.sectors_per_block as usize, data)
+        write_sectors_for(self.dev_id, lba, self.sectors_per_block as usize, data)
             .map_err(|_| Ext2Error::IoError)
     }
 
@@ -362,7 +528,8 @@ impl Ext2Volume {
         count: u32,
         dst: &mut [u8],
     ) -> Result<(), Ext2Error> {
-        crate::blk::read_sectors(
+        read_sectors_for(
+            self.dev_id,
             self.block_to_lba(start_block),
             count as usize * self.sectors_per_block as usize,
             dst,
@@ -646,7 +813,7 @@ impl Ext2Volume {
         let mut sb_buf = self.superblock_raw.clone();
         self.superblock.write_into(&mut sb_buf);
         let sb_lba = self.base_lba + 2;
-        crate::blk::write_sectors(sb_lba, 2, &sb_buf).map_err(|_| Ext2Error::IoError)?;
+        write_sectors_for(self.dev_id, sb_lba, 2, &sb_buf).map_err(|_| Ext2Error::IoError)?;
 
         // Write BGD table.
         let bgd_block = if self.block_size == 1024 { 2 } else { 1 };
@@ -657,7 +824,8 @@ impl Ext2Volume {
         for (i, bgd) in self.bgd_table.iter().enumerate() {
             bgd.write_into(&mut bgd_buf[i * 32..(i + 1) * 32]);
         }
-        crate::blk::write_sectors(bgd_lba, bgd_sectors, &bgd_buf).map_err(|_| Ext2Error::IoError)
+        write_sectors_for(self.dev_id, bgd_lba, bgd_sectors, &bgd_buf)
+            .map_err(|_| Ext2Error::IoError)
     }
 
     // -----------------------------------------------------------------------

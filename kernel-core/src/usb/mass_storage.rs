@@ -450,6 +450,421 @@ pub const fn get_max_lun(interface: u8) -> SetupPacket {
 }
 
 // ---------------------------------------------------------------------------
+// UAS — USB Attached SCSI Protocol (UAS r01)
+// ---------------------------------------------------------------------------
+//
+// # UAS Overview (USB Attached SCSI Protocol r01)
+//
+// UAS replaces BOT's serial CBW/CSW with typed **Information Units (IUs)**
+// carried over **four dedicated pipes**:
+//
+// | Pipe          | Direction | Purpose                          |
+// |---------------|-----------|----------------------------------|
+// | Command       | OUT       | Host sends Command IUs            |
+// | Status        | IN        | Device sends Sense / Response IUs |
+// | Data-In       | IN        | Device sends read data            |
+// | Data-Out      | OUT       | Host sends write data             |
+//
+// Each pipe uses xHCI **streams** (one stream per in-flight tag).
+//
+// ## Tag ↔ Stream ID
+//
+// UAS uses the 16-bit Tag value directly as the xHCI Stream ID for the
+// Command, Status, Data-In, and Data-Out pipes. Tag 0 is reserved; tags
+// begin at 1. The daemon opens a stream with `stream_id = tag` on all four
+// pipes before submitting a Command IU and closes them after receiving the
+// matching Sense/Response IU.
+//
+// ## Codec scope
+//
+// This module is the **wire codec only** (pure host logic, no hardware
+// dependencies). The live pipe and stream plumbing belongs in the ring-3
+// `usb-storage` daemon.
+
+// ---------------------------------------------------------------------------
+// IU ID constants (UAS r01 §7)
+// ---------------------------------------------------------------------------
+
+/// IU ID for a **Command IU** — carries a SCSI CDB from host to device.
+pub const UAS_IU_COMMAND: u8 = 0x01;
+
+/// IU ID for a **Sense IU** — device reports SCSI status and sense data.
+pub const UAS_IU_SENSE: u8 = 0x03;
+
+/// IU ID for a **Response IU** — device reports task-management status.
+pub const UAS_IU_RESPONSE: u8 = 0x04;
+
+/// IU ID for a **Task Management IU** — host issues an abort/reset request.
+pub const UAS_IU_TASK_MGMT: u8 = 0x05;
+
+/// IU ID for a **Read Ready IU** — device signals it is ready to receive data
+/// on the Data-In stream for the given tag.
+pub const UAS_IU_READ_READY: u8 = 0x06;
+
+/// IU ID for a **Write Ready IU** — device signals it is ready to accept data
+/// on the Data-Out stream for the given tag.
+pub const UAS_IU_WRITE_READY: u8 = 0x07;
+
+// ---------------------------------------------------------------------------
+// Response IU response-code constants (UAS r01 §7.5)
+// ---------------------------------------------------------------------------
+
+/// Task Management Function completed successfully.
+pub const UAS_RESPONSE_TASK_MGMT_FUNCTION_COMPLETE: u8 = 0x00;
+/// The received IU was invalid.
+pub const UAS_RESPONSE_INVALID_IU: u8 = 0x02;
+/// The requested Task Management Function is not supported.
+pub const UAS_RESPONSE_TMF_NOT_SUPPORTED: u8 = 0x04;
+/// The Task Management Function failed.
+pub const UAS_RESPONSE_TMF_FAILED: u8 = 0x05;
+/// The Task Management Function succeeded.
+pub const UAS_RESPONSE_TMF_SUCCEEDED: u8 = 0x08;
+/// A command with an overlapping tag was received.
+pub const UAS_RESPONSE_OVERLAPPED_TAG: u8 = 0x09;
+
+// ---------------------------------------------------------------------------
+// Task Management Function constants (UAS r01 §7.6)
+// ---------------------------------------------------------------------------
+
+/// Abort the task identified by the Task Tag field.
+pub const UAS_TMF_ABORT_TASK: u8 = 0x01;
+/// Perform a Logical Unit Reset.
+pub const UAS_TMF_LOGICAL_UNIT_RESET: u8 = 0x08;
+
+// ---------------------------------------------------------------------------
+// Wire sizes
+// ---------------------------------------------------------------------------
+
+/// Wire size of a UAS Command IU in bytes (UAS r01 §7.2).
+///
+/// Fixed at 32 bytes for a 16-byte CDB (no Additional CDB bytes).
+pub const UAS_COMMAND_IU_LEN: usize = 32;
+
+/// Wire size of the minimum UAS Sense IU header (IU ID through status byte,
+/// UAS r01 §7.3).
+///
+/// Full Sense IU = 16 header bytes + up to 252 bytes of sense data.
+pub const UAS_SENSE_IU_MIN_LEN: usize = 16;
+
+/// Wire size of a UAS Response IU in bytes (UAS r01 §7.5).
+pub const UAS_RESPONSE_IU_LEN: usize = 8;
+
+/// Wire size of a UAS Read/Write Ready IU in bytes (UAS r01 §7.7/7.8).
+pub const UAS_READY_IU_LEN: usize = 4;
+
+/// Wire size of a UAS Task Management IU in bytes (UAS r01 §7.6).
+pub const UAS_TASK_MGMT_IU_LEN: usize = 16;
+
+// ---------------------------------------------------------------------------
+// Command IU (UAS r01 §7.2)
+// ---------------------------------------------------------------------------
+
+/// UAS **Command IU** — carries a SCSI CDB from the host to the device.
+///
+/// Wire layout (32 bytes, 16-byte CDB, no additional CDB bytes):
+///
+/// | Offset | Field | Notes |
+/// |--------|-------|-------|
+/// | 0      | IU ID | `0x01` |
+/// | 1      | Reserved | |
+/// | 2–3    | Tag   | BE u16; also the xHCI Stream ID |
+/// | 4      | Command Priority \| Task Attribute | bits 6:4 priority, bits 2:0 attr |
+/// | 5      | Reserved | |
+/// | 6      | Reserved | |
+/// | 7      | Additional CDB Length | 0 for a standard 16-byte CDB |
+/// | 8–15   | Logical Unit Number   | 8 bytes (SCSI ADDRESS METHOD) |
+/// | 16–31  | CDB (Command Descriptor Block) | 16 bytes, zero-padded |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandIu {
+    /// 16-bit command tag; also the xHCI Stream ID for all four UAS pipes.
+    pub tag: u16,
+    /// `COMMAND PRIORITY` (bits 6:4) and `TASK ATTRIBUTE` (bits 2:0) packed
+    /// into a single byte (UAS r01 §7.2).
+    pub command_priority_task_attr: u8,
+    /// 8-byte Logical Unit Number (SCSI LUN address format).
+    pub lun: [u8; 8],
+    /// 16-byte Command Descriptor Block (zero-padded for shorter CDBs).
+    pub cdb: [u8; 16],
+}
+
+impl CommandIu {
+    /// Construct a Command IU from a SCSI CDB slice.
+    ///
+    /// `cdb_bytes` is copied into the low `cdb_bytes.len()` bytes of the
+    /// 16-byte CDB field; remaining bytes are zero-padded.  Panics if
+    /// `cdb_bytes.len() > 16`.
+    ///
+    /// `task_attr` is placed in bits 2:0; command priority is set to 0.
+    pub fn new(tag: u16, lun: [u8; 8], cdb_bytes: &[u8], task_attr: u8) -> Self {
+        assert!(cdb_bytes.len() <= 16, "CDB must not exceed 16 bytes");
+        let mut cdb = [0u8; 16];
+        cdb[..cdb_bytes.len()].copy_from_slice(cdb_bytes);
+        CommandIu {
+            tag,
+            command_priority_task_attr: task_attr & 0x07,
+            lun,
+            cdb,
+        }
+    }
+
+    /// Encode this Command IU into its 32-byte on-wire representation
+    /// (UAS r01 §7.2).
+    pub fn encode(&self) -> [u8; UAS_COMMAND_IU_LEN] {
+        let mut buf = [0u8; UAS_COMMAND_IU_LEN];
+
+        // byte 0: IU ID
+        buf[0] = UAS_IU_COMMAND;
+        // byte 1: Reserved
+        buf[1] = 0x00;
+        // bytes 2–3: Tag (BE u16)
+        let tag_be = self.tag.to_be_bytes();
+        buf[2] = tag_be[0];
+        buf[3] = tag_be[1];
+        // byte 4: Command Priority | Task Attribute
+        buf[4] = self.command_priority_task_attr;
+        // byte 5: Reserved
+        buf[5] = 0x00;
+        // byte 6: Reserved
+        buf[6] = 0x00;
+        // byte 7: Additional CDB Length (0 for standard 16-byte CDB)
+        buf[7] = 0x00;
+        // bytes 8–15: Logical Unit Number (8 bytes)
+        buf[8..16].copy_from_slice(&self.lun);
+        // bytes 16–31: CDB (16 bytes)
+        buf[16..32].copy_from_slice(&self.cdb);
+
+        buf
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sense IU (UAS r01 §7.3)
+// ---------------------------------------------------------------------------
+
+/// Minimum wire size of sense data that `SenseIu::parse` will capture.
+///
+/// Up to [`UAS_SENSE_MAX_DATA`] bytes of sense data are stored inline.
+pub const UAS_SENSE_MAX_DATA: usize = 252;
+
+/// UAS **Sense IU** — device reports SCSI command status and sense data.
+///
+/// Wire layout (16 header bytes + up to 252 bytes of sense data):
+///
+/// | Offset | Field | Notes |
+/// |--------|-------|-------|
+/// | 0      | IU ID | `0x03` |
+/// | 1      | Reserved | |
+/// | 2–3    | Tag   | BE u16 |
+/// | 4–5    | Status Qualifier | BE u16 |
+/// | 6      | Status  | SCSI status byte (0x00 = GOOD) |
+/// | 7–13   | Reserved (7 bytes) | |
+/// | 14–15  | Sense Data Length | BE u16 |
+/// | 16…    | Sense Data | `sense_data_length` bytes |
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SenseIu {
+    /// 16-bit command tag matching the originating Command IU.
+    pub tag: u16,
+    /// SCSI Status Qualifier (big-endian u16 at bytes 4–5).
+    pub status_qualifier: u16,
+    /// SCSI Status byte (byte 6): `0x00` = GOOD, `0x02` = CHECK CONDITION, etc.
+    pub status: u8,
+    /// Number of valid bytes in `sense_data`.
+    pub sense_data_length: u16,
+    /// Raw sense data bytes (up to [`UAS_SENSE_MAX_DATA`] bytes, zero-padded).
+    pub sense_data: [u8; UAS_SENSE_MAX_DATA],
+}
+
+impl SenseIu {
+    /// Parse a Sense IU from a raw byte buffer.
+    ///
+    /// Returns `None` if:
+    /// * `buf.len() < 16` (minimum header), or
+    /// * `buf[0]` ≠ [`UAS_IU_SENSE`].
+    ///
+    /// Sense data is capped at [`UAS_SENSE_MAX_DATA`] bytes even if the wire
+    /// value of `Sense Data Length` exceeds that.
+    pub fn parse(buf: &[u8]) -> Option<Self> {
+        if buf.len() < UAS_SENSE_IU_MIN_LEN {
+            return None;
+        }
+        if buf[0] != UAS_IU_SENSE {
+            return None;
+        }
+        let tag = u16::from_be_bytes([buf[2], buf[3]]);
+        let status_qualifier = u16::from_be_bytes([buf[4], buf[5]]);
+        let status = buf[6];
+        let sense_data_length = u16::from_be_bytes([buf[14], buf[15]]);
+
+        let mut sense_data = [0u8; UAS_SENSE_MAX_DATA];
+        let available = buf.len().saturating_sub(UAS_SENSE_IU_MIN_LEN);
+        let copy_len = (sense_data_length as usize)
+            .min(available)
+            .min(UAS_SENSE_MAX_DATA);
+        sense_data[..copy_len].copy_from_slice(&buf[16..16 + copy_len]);
+
+        Some(SenseIu {
+            tag,
+            status_qualifier,
+            status,
+            sense_data_length,
+            sense_data,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Response IU (UAS r01 §7.5)
+// ---------------------------------------------------------------------------
+
+/// UAS **Response IU** — device reports task management function status.
+///
+/// Wire layout (8 bytes):
+///
+/// | Offset | Field | Notes |
+/// |--------|-------|-------|
+/// | 0      | IU ID | `0x04` |
+/// | 1      | Reserved | |
+/// | 2–3    | Tag   | BE u16 |
+/// | 4–6    | Additional Response Info | 3 bytes (implementation-specific) |
+/// | 7      | Response Code | `UAS_RESPONSE_*` constant |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResponseIu {
+    /// 16-bit task management tag matching the originating Task Management IU.
+    pub tag: u16,
+    /// Three bytes of implementation-specific additional response info.
+    pub additional_response_info: [u8; 3],
+    /// Response code — see `UAS_RESPONSE_*` constants.
+    pub response_code: u8,
+}
+
+impl ResponseIu {
+    /// Parse a Response IU from a raw byte buffer.
+    ///
+    /// Returns `None` if:
+    /// * `buf.len() < 8`, or
+    /// * `buf[0]` ≠ [`UAS_IU_RESPONSE`].
+    pub fn parse(buf: &[u8]) -> Option<Self> {
+        if buf.len() < UAS_RESPONSE_IU_LEN {
+            return None;
+        }
+        if buf[0] != UAS_IU_RESPONSE {
+            return None;
+        }
+        let tag = u16::from_be_bytes([buf[2], buf[3]]);
+        let additional_response_info = [buf[4], buf[5], buf[6]];
+        let response_code = buf[7];
+        Some(ResponseIu {
+            tag,
+            additional_response_info,
+            response_code,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Read Ready / Write Ready IUs (UAS r01 §7.7 / §7.8)
+// ---------------------------------------------------------------------------
+
+/// Parse a **Read Ready IU** or **Write Ready IU** and return its tag.
+///
+/// Both IUs share the same 4-byte layout:
+///
+/// | Offset | Field | Notes |
+/// |--------|-------|-------|
+/// | 0      | IU ID | `0x06` (Read Ready) or `0x07` (Write Ready) |
+/// | 1      | Reserved | |
+/// | 2–3    | Tag   | BE u16 |
+///
+/// Returns `None` if `buf.len() < 4` or the IU ID is not `expected_iu_id`.
+fn parse_ready_iu(buf: &[u8], expected_iu_id: u8) -> Option<u16> {
+    if buf.len() < UAS_READY_IU_LEN {
+        return None;
+    }
+    if buf[0] != expected_iu_id {
+        return None;
+    }
+    Some(u16::from_be_bytes([buf[2], buf[3]]))
+}
+
+/// Parse a **Read Ready IU** (`bIUID = 0x06`) and return its tag.
+///
+/// The device sends this IU on the Status pipe to signal that it is ready to
+/// send data on the Data-In stream identified by the returned tag.
+///
+/// Returns `None` if `buf.len() < 4` or the IU ID byte is not `0x06`.
+pub fn parse_read_ready_iu(buf: &[u8]) -> Option<u16> {
+    parse_ready_iu(buf, UAS_IU_READ_READY)
+}
+
+/// Parse a **Write Ready IU** (`bIUID = 0x07`) and return its tag.
+///
+/// The device sends this IU on the Status pipe to signal that it is ready to
+/// accept data on the Data-Out stream identified by the returned tag.
+///
+/// Returns `None` if `buf.len() < 4` or the IU ID byte is not `0x07`.
+pub fn parse_write_ready_iu(buf: &[u8]) -> Option<u16> {
+    parse_ready_iu(buf, UAS_IU_WRITE_READY)
+}
+
+// ---------------------------------------------------------------------------
+// Task Management IU (UAS r01 §7.6)
+// ---------------------------------------------------------------------------
+
+/// UAS **Task Management IU** — host issues an abort or reset request.
+///
+/// Wire layout (16 bytes):
+///
+/// | Offset | Field | Notes |
+/// |--------|-------|-------|
+/// | 0      | IU ID | `0x05` |
+/// | 1      | Reserved | |
+/// | 2–3    | Tag   | BE u16 — tag for *this* TM IU |
+/// | 4      | TM Function | `UAS_TMF_*` constant |
+/// | 5      | Reserved | |
+/// | 6–7    | Task Tag | BE u16 — tag of the command to abort/reset |
+/// | 8–15   | Logical Unit Number | 8 bytes |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskMgmtIu {
+    /// Tag for this Task Management IU itself (also the xHCI Stream ID).
+    pub tag: u16,
+    /// Task Management Function — see `UAS_TMF_*` constants.
+    pub tm_function: u8,
+    /// Tag of the command being targeted (e.g., the tag to abort).
+    pub task_tag: u16,
+    /// 8-byte Logical Unit Number.
+    pub lun: [u8; 8],
+}
+
+impl TaskMgmtIu {
+    /// Encode this Task Management IU into its 16-byte on-wire representation
+    /// (UAS r01 §7.6).
+    pub fn encode(&self) -> [u8; UAS_TASK_MGMT_IU_LEN] {
+        let mut buf = [0u8; UAS_TASK_MGMT_IU_LEN];
+
+        // byte 0: IU ID
+        buf[0] = UAS_IU_TASK_MGMT;
+        // byte 1: Reserved
+        buf[1] = 0x00;
+        // bytes 2–3: Tag (BE u16)
+        let tag_be = self.tag.to_be_bytes();
+        buf[2] = tag_be[0];
+        buf[3] = tag_be[1];
+        // byte 4: TM Function
+        buf[4] = self.tm_function;
+        // byte 5: Reserved
+        buf[5] = 0x00;
+        // bytes 6–7: Task Tag (BE u16)
+        let task_tag_be = self.task_tag.to_be_bytes();
+        buf[6] = task_tag_be[0];
+        buf[7] = task_tag_be[1];
+        // bytes 8–15: Logical Unit Number (8 bytes)
+        buf[8..16].copy_from_slice(&self.lun);
+
+        buf
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -818,5 +1233,367 @@ mod tests {
     fn get_max_lun_nonzero_interface() {
         let pkt = get_max_lun(2);
         assert_eq!(pkt.w_index, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // UAS Command IU encoding tests
+    // -----------------------------------------------------------------------
+
+    /// Command IU encodes to exactly 32 bytes with the correct IU ID.
+    #[test]
+    fn uas_command_iu_encode_length_and_iuid() {
+        let cdb = cdb_read10(0x0000_1234, 1);
+        let iu = CommandIu::new(1, [0u8; 8], &cdb, 0);
+        let wire = iu.encode();
+        assert_eq!(wire.len(), UAS_COMMAND_IU_LEN);
+        assert_eq!(wire[0], UAS_IU_COMMAND, "byte 0 must be IU ID 0x01");
+    }
+
+    /// Tag is encoded big-endian at bytes 2–3.
+    #[test]
+    fn uas_command_iu_encode_tag_big_endian() {
+        let cdb = cdb_read10(0, 1);
+        let iu = CommandIu::new(0x1234, [0u8; 8], &cdb, 0);
+        let wire = iu.encode();
+        assert_eq!(wire[2], 0x12, "tag MSB at byte 2");
+        assert_eq!(wire[3], 0x34, "tag LSB at byte 3");
+    }
+
+    /// Reserved bytes 1, 5, 6 are zero; Additional CDB Length (byte 7) is 0.
+    #[test]
+    fn uas_command_iu_encode_reserved_and_additional_cdb_len() {
+        let cdb = cdb_read10(0, 1);
+        let iu = CommandIu::new(1, [0u8; 8], &cdb, 0);
+        let wire = iu.encode();
+        assert_eq!(wire[1], 0x00, "byte 1 reserved");
+        assert_eq!(wire[5], 0x00, "byte 5 reserved");
+        assert_eq!(wire[6], 0x00, "byte 6 reserved");
+        assert_eq!(wire[7], 0x00, "byte 7 Additional CDB Length = 0");
+    }
+
+    /// LUN bytes appear at offsets 8–15.
+    #[test]
+    fn uas_command_iu_encode_lun_placement() {
+        let cdb = cdb_read10(0, 1);
+        let lun: [u8; 8] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        let iu = CommandIu::new(1, lun, &cdb, 0);
+        let wire = iu.encode();
+        assert_eq!(&wire[8..16], &lun, "LUN must be at bytes 8–15");
+    }
+
+    /// CDB is placed at bytes 16–31 (zero-padded for shorter CDBs).
+    #[test]
+    fn uas_command_iu_encode_cdb_at_offset_16() {
+        let cdb = cdb_read10(0xABCD_EF01, 0x0008);
+        let iu = CommandIu::new(5, [0u8; 8], &cdb, 0);
+        let wire = iu.encode();
+        assert_eq!(&wire[16..26], &cdb, "10-byte CDB must be at bytes 16–25");
+        assert_eq!(&wire[26..32], &[0u8; 6], "bytes 26–31 must be zero-padded");
+    }
+
+    /// Full byte-exact check for a READ(10) Command IU.
+    #[test]
+    fn uas_command_iu_encode_read10_exact() {
+        // READ(10) LBA=0x00000000, blocks=1
+        let cdb = cdb_read10(0x0000_0000, 1);
+        // tag=0x0001, LUN=all zeros, task_attr=0 (simple)
+        let iu = CommandIu::new(0x0001, [0u8; 8], &cdb, 0x00);
+        let wire = iu.encode();
+
+        // byte 0: IU ID = 0x01
+        assert_eq!(wire[0], 0x01);
+        // byte 1: reserved = 0x00
+        assert_eq!(wire[1], 0x00);
+        // bytes 2–3: tag = 0x0001 (BE)
+        assert_eq!(&wire[2..4], &[0x00, 0x01]);
+        // byte 4: priority|attr = 0x00
+        assert_eq!(wire[4], 0x00);
+        // bytes 5–7: reserved + additional CDB len = 0x00
+        assert_eq!(&wire[5..8], &[0x00, 0x00, 0x00]);
+        // bytes 8–15: LUN = all zeros
+        assert_eq!(&wire[8..16], &[0u8; 8]);
+        // bytes 16–25: READ(10) CDB (opcode 0x28, LBA 0, blocks 1)
+        assert_eq!(wire[16], 0x28); // READ(10) opcode
+        assert_eq!(&wire[17..22], &[0x00, 0x00, 0x00, 0x00, 0x00]); // flags+LBA
+        assert_eq!(wire[22], 0x00); // group
+        assert_eq!(&wire[23..25], &[0x00, 0x01]); // transfer length = 1 block
+        assert_eq!(wire[25], 0x00); // control
+        // bytes 26–31: zero padding
+        assert_eq!(&wire[26..32], &[0u8; 6]);
+    }
+
+    // -----------------------------------------------------------------------
+    // UAS Sense IU parsing tests
+    // -----------------------------------------------------------------------
+
+    fn make_sense_iu_buf(tag: u16, status: u8, sense_data: &[u8]) -> alloc::vec::Vec<u8> {
+        let sense_len = sense_data.len() as u16;
+        let mut buf = alloc::vec![0u8; 16 + sense_data.len()];
+        buf[0] = UAS_IU_SENSE;
+        buf[1] = 0x00; // reserved
+        buf[2] = (tag >> 8) as u8;
+        buf[3] = (tag & 0xFF) as u8;
+        // status qualifier = 0 (bytes 4–5)
+        buf[4] = 0x00;
+        buf[5] = 0x00;
+        buf[6] = status;
+        // bytes 7–13: reserved
+        buf[14] = (sense_len >> 8) as u8;
+        buf[15] = (sense_len & 0xFF) as u8;
+        buf[16..].copy_from_slice(sense_data);
+        buf
+    }
+
+    /// A valid Sense IU with known sense data parses correctly.
+    #[test]
+    fn uas_sense_iu_parse_valid() {
+        let sense = [
+            0x70, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x3A, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ];
+        let buf = make_sense_iu_buf(0x0042, 0x02, &sense);
+        let iu = SenseIu::parse(&buf).expect("valid Sense IU must parse");
+        assert_eq!(iu.tag, 0x0042);
+        assert_eq!(iu.status, 0x02); // CHECK CONDITION
+        assert_eq!(iu.sense_data_length, sense.len() as u16);
+        assert_eq!(&iu.sense_data[..sense.len()], &sense);
+    }
+
+    /// Tag round-trips big-endian correctly.
+    #[test]
+    fn uas_sense_iu_parse_tag_big_endian() {
+        let buf = make_sense_iu_buf(0xBEEF, 0x00, &[]);
+        let iu = SenseIu::parse(&buf).unwrap();
+        assert_eq!(iu.tag, 0xBEEF);
+    }
+
+    /// GOOD status (0x00) parses without error.
+    #[test]
+    fn uas_sense_iu_parse_good_status() {
+        let buf = make_sense_iu_buf(1, 0x00, &[]);
+        let iu = SenseIu::parse(&buf).unwrap();
+        assert_eq!(iu.status, 0x00);
+        assert_eq!(iu.sense_data_length, 0);
+    }
+
+    /// A buffer shorter than 16 bytes returns None.
+    #[test]
+    fn uas_sense_iu_parse_short_returns_none() {
+        let buf = [UAS_IU_SENSE; 15]; // one byte short
+        assert!(SenseIu::parse(&buf).is_none());
+    }
+
+    /// An empty buffer returns None without panicking.
+    #[test]
+    fn uas_sense_iu_parse_empty_returns_none() {
+        assert!(SenseIu::parse(&[]).is_none());
+    }
+
+    /// Wrong IU ID returns None.
+    #[test]
+    fn uas_sense_iu_parse_wrong_iuid_returns_none() {
+        let mut buf = make_sense_iu_buf(1, 0x00, &[]);
+        buf[0] = 0xFF; // wrong IU ID
+        assert!(SenseIu::parse(&buf).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // UAS Response IU parsing tests
+    // -----------------------------------------------------------------------
+
+    fn make_response_iu_buf(tag: u16, response_code: u8) -> [u8; 8] {
+        let mut buf = [0u8; 8];
+        buf[0] = UAS_IU_RESPONSE;
+        buf[1] = 0x00;
+        buf[2] = (tag >> 8) as u8;
+        buf[3] = (tag & 0xFF) as u8;
+        // additional response info bytes 4–6 = 0
+        buf[7] = response_code;
+        buf
+    }
+
+    /// A valid Response IU parses tag and response code correctly.
+    #[test]
+    fn uas_response_iu_parse_valid() {
+        let buf = make_response_iu_buf(0x0007, UAS_RESPONSE_TASK_MGMT_FUNCTION_COMPLETE);
+        let iu = ResponseIu::parse(&buf).expect("valid Response IU must parse");
+        assert_eq!(iu.tag, 0x0007);
+        assert_eq!(iu.response_code, UAS_RESPONSE_TASK_MGMT_FUNCTION_COMPLETE);
+    }
+
+    /// Tag is decoded big-endian.
+    #[test]
+    fn uas_response_iu_parse_tag_big_endian() {
+        let buf = make_response_iu_buf(0xABCD, UAS_RESPONSE_TMF_SUCCEEDED);
+        let iu = ResponseIu::parse(&buf).unwrap();
+        assert_eq!(iu.tag, 0xABCD);
+        assert_eq!(iu.response_code, UAS_RESPONSE_TMF_SUCCEEDED);
+    }
+
+    /// All `UAS_RESPONSE_*` constants decode without aliasing.
+    #[test]
+    fn uas_response_iu_response_code_constants() {
+        let codes = [
+            UAS_RESPONSE_TASK_MGMT_FUNCTION_COMPLETE,
+            UAS_RESPONSE_INVALID_IU,
+            UAS_RESPONSE_TMF_NOT_SUPPORTED,
+            UAS_RESPONSE_TMF_FAILED,
+            UAS_RESPONSE_TMF_SUCCEEDED,
+            UAS_RESPONSE_OVERLAPPED_TAG,
+        ];
+        // Verify all constants are distinct.
+        for i in 0..codes.len() {
+            for j in (i + 1)..codes.len() {
+                assert_ne!(
+                    codes[i], codes[j],
+                    "response code constants must be distinct"
+                );
+            }
+        }
+    }
+
+    /// Truncated buffer (< 8 bytes) returns None.
+    #[test]
+    fn uas_response_iu_parse_short_returns_none() {
+        let buf = [UAS_IU_RESPONSE; 7]; // one byte short
+        assert!(ResponseIu::parse(&buf).is_none());
+    }
+
+    /// Wrong IU ID returns None.
+    #[test]
+    fn uas_response_iu_parse_wrong_iuid_returns_none() {
+        let mut buf = make_response_iu_buf(1, 0x00);
+        buf[0] = 0xFF;
+        assert!(ResponseIu::parse(&buf).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // UAS Read Ready / Write Ready IU tests
+    // -----------------------------------------------------------------------
+
+    fn make_ready_iu(iu_id: u8, tag: u16) -> [u8; 4] {
+        [iu_id, 0x00, (tag >> 8) as u8, (tag & 0xFF) as u8]
+    }
+
+    /// Read Ready IU extracts the tag correctly.
+    #[test]
+    fn uas_read_ready_iu_parse_tag() {
+        let buf = make_ready_iu(UAS_IU_READ_READY, 0x0003);
+        let tag = parse_read_ready_iu(&buf).expect("Read Ready IU must parse");
+        assert_eq!(tag, 0x0003);
+    }
+
+    /// Write Ready IU extracts the tag correctly.
+    #[test]
+    fn uas_write_ready_iu_parse_tag() {
+        let buf = make_ready_iu(UAS_IU_WRITE_READY, 0xF00D);
+        let tag = parse_write_ready_iu(&buf).expect("Write Ready IU must parse");
+        assert_eq!(tag, 0xF00D);
+    }
+
+    /// Read Ready IU with wrong IU ID returns None.
+    #[test]
+    fn uas_read_ready_iu_wrong_iuid_returns_none() {
+        let buf = make_ready_iu(UAS_IU_WRITE_READY, 1); // wrong: write, not read
+        assert!(parse_read_ready_iu(&buf).is_none());
+    }
+
+    /// Write Ready IU with wrong IU ID returns None.
+    #[test]
+    fn uas_write_ready_iu_wrong_iuid_returns_none() {
+        let buf = make_ready_iu(UAS_IU_READ_READY, 1); // wrong: read, not write
+        assert!(parse_write_ready_iu(&buf).is_none());
+    }
+
+    /// Short buffer (< 4 bytes) returns None for both ready IU helpers.
+    #[test]
+    fn uas_ready_iu_short_buffer_returns_none() {
+        let buf = [UAS_IU_READ_READY; 3];
+        assert!(parse_read_ready_iu(&buf).is_none());
+        let buf2 = [UAS_IU_WRITE_READY; 3];
+        assert!(parse_write_ready_iu(&buf2).is_none());
+    }
+
+    /// Tag is decoded big-endian in both ready IU helpers.
+    #[test]
+    fn uas_ready_iu_tag_big_endian() {
+        let buf = make_ready_iu(UAS_IU_READ_READY, 0x1234);
+        let tag = parse_read_ready_iu(&buf).unwrap();
+        assert_eq!(tag, 0x1234);
+    }
+
+    // -----------------------------------------------------------------------
+    // UAS Task Management IU encoding tests
+    // -----------------------------------------------------------------------
+
+    /// Task Management IU encodes to exactly 16 bytes with the correct IU ID.
+    #[test]
+    fn uas_task_mgmt_iu_encode_length_and_iuid() {
+        let iu = TaskMgmtIu {
+            tag: 1,
+            tm_function: UAS_TMF_ABORT_TASK,
+            task_tag: 99,
+            lun: [0u8; 8],
+        };
+        let wire = iu.encode();
+        assert_eq!(wire.len(), UAS_TASK_MGMT_IU_LEN);
+        assert_eq!(wire[0], UAS_IU_TASK_MGMT, "byte 0 must be IU ID 0x05");
+    }
+
+    /// Byte-exact encoding for an ABORT_TASK Task Management IU.
+    #[test]
+    fn uas_task_mgmt_iu_encode_abort_task_exact() {
+        // TM tag=0x0002, ABORT_TASK targeting task_tag=0x0001, LUN=0
+        let iu = TaskMgmtIu {
+            tag: 0x0002,
+            tm_function: UAS_TMF_ABORT_TASK,
+            task_tag: 0x0001,
+            lun: [0u8; 8],
+        };
+        let wire = iu.encode();
+
+        // byte 0: IU ID = 0x05
+        assert_eq!(wire[0], 0x05);
+        // byte 1: reserved = 0x00
+        assert_eq!(wire[1], 0x00);
+        // bytes 2–3: tag = 0x0002 (BE)
+        assert_eq!(&wire[2..4], &[0x00, 0x02]);
+        // byte 4: TM Function = ABORT_TASK = 0x01
+        assert_eq!(wire[4], UAS_TMF_ABORT_TASK);
+        // byte 5: reserved = 0x00
+        assert_eq!(wire[5], 0x00);
+        // bytes 6–7: task tag = 0x0001 (BE)
+        assert_eq!(&wire[6..8], &[0x00, 0x01]);
+        // bytes 8–15: LUN = all zeros
+        assert_eq!(&wire[8..16], &[0u8; 8]);
+    }
+
+    /// LOGICAL_UNIT_RESET encodes the TM Function byte correctly.
+    #[test]
+    fn uas_task_mgmt_iu_encode_logical_unit_reset() {
+        let lun: [u8; 8] = [0xC1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let iu = TaskMgmtIu {
+            tag: 0x0010,
+            tm_function: UAS_TMF_LOGICAL_UNIT_RESET,
+            task_tag: 0x0000,
+            lun,
+        };
+        let wire = iu.encode();
+        assert_eq!(wire[4], UAS_TMF_LOGICAL_UNIT_RESET);
+        assert_eq!(&wire[8..16], &lun);
+    }
+
+    /// Tags and task_tags encode big-endian correctly.
+    #[test]
+    fn uas_task_mgmt_iu_encode_tags_big_endian() {
+        let iu = TaskMgmtIu {
+            tag: 0xABCD,
+            tm_function: UAS_TMF_ABORT_TASK,
+            task_tag: 0xEF01,
+            lun: [0u8; 8],
+        };
+        let wire = iu.encode();
+        assert_eq!(&wire[2..4], &[0xAB, 0xCD], "tag must be big-endian");
+        assert_eq!(&wire[6..8], &[0xEF, 0x01], "task_tag must be big-endian");
     }
 }

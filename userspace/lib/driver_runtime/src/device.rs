@@ -98,6 +98,28 @@ impl DeviceHandle {
         self.key
     }
 
+    /// IOMMU-map a shared-memory region (created via `sys_shm_create` by another
+    /// process and shared by integer id) into this device's IOMMU domain, so the
+    /// device can DMA into/out of it **zero-copy** (Phase 92a H.4). Returns the
+    /// device IOVA to program into a transfer descriptor, or `None` on failure.
+    /// Pair every success with [`DeviceHandle::unmap_shm_dma`].
+    #[inline]
+    pub fn map_shm_dma(&self, shm_id: u32) -> Option<u64> {
+        // SAFETY: `self.cap` is a live `Capability::Device` handle.
+        let r = unsafe { crate::syscall_backend::raw_sys_device_dma_map_shm(self.cap, shm_id) };
+        if r < 0 { None } else { Some(r as u64) }
+    }
+
+    /// Tear down a mapping installed by [`DeviceHandle::map_shm_dma`], identified
+    /// by its device `iova`.
+    #[inline]
+    pub fn unmap_shm_dma(&self, iova: u64) {
+        // SAFETY: `self.cap` is a live `Capability::Device` handle.
+        unsafe {
+            crate::syscall_backend::raw_sys_device_dma_unmap_shm(self.cap, iova);
+        }
+    }
+
     /// Explicitly release the claim. Consumes `self`. Because there is
     /// no dedicated `sys_device_release` syscall today, this is a no-op
     /// — the kernel releases the claim when the driver process exits.

@@ -102,8 +102,9 @@ pub fn classify_hub_interface(b_interface_class: u8) -> bool {
 use alloc::vec::Vec;
 #[cfg(not(test))]
 use kernel_core::usb::hub::{
-    HubDescriptor, PORT_POWER, PORT_RESET, clear_port_feature, get_hub_descriptor, get_port_status,
-    port_status_connected, port_status_enabled, set_port_feature,
+    HubDescriptor, PORT_POWER, PORT_RESET, PortTopology, clear_port_feature, get_hub_descriptor,
+    get_port_status, port_status_connected, port_status_enabled, port_status_speed_code,
+    set_port_feature,
 };
 #[cfg(not(test))]
 use kernel_core::usb::xhci::trb::SetupPacket;
@@ -262,6 +263,59 @@ fn enumerate_hub(usb_ep: u32, notice: &AttachNotice) {
                 syscall_lib::write_str(STDOUT_FILENO, "usbhub: port ");
                 write_u8_dec(port);
                 syscall_lib::write_str(STDOUT_FILENO, " reset+enabled\n");
+
+                // Tier-2 enumeration (A.4/A.5): compute the route string for a
+                // device on this downstream port (the hub sits directly on the
+                // root-hub port `notice.port`, so the device is tier-2) and ask
+                // the server to enumerate it through that route.
+                let mut topo = PortTopology::new();
+                let hub_idx = topo.add_root_port(notice.port);
+                match topo.add_child_port(hub_idx, port) {
+                    Some(dev_idx) => {
+                        let route = topo.route_string(dev_idx);
+                        let root = topo.root_hub_port(dev_idx).unwrap_or(notice.port);
+                        let speed = port_status_speed_code(&s);
+                        match usb_call(
+                            usb_ep,
+                            &UsbRequest::EnumerateChild {
+                                parent_slot_id: slot_id,
+                                route_string: route,
+                                root_hub_port: root,
+                                speed,
+                            },
+                        ) {
+                            Some(UsbReply::Attach {
+                                notice: Some(child),
+                            }) => {
+                                syscall_lib::write_str(
+                                    STDOUT_FILENO,
+                                    "usbhub: child enumerated slot=",
+                                );
+                                write_u8_dec(child.slot_id);
+                                syscall_lib::write_str(STDOUT_FILENO, " class=");
+                                write_u8_dec(child.interface_class);
+                                syscall_lib::write_str(STDOUT_FILENO, "\n");
+                            }
+                            _ => {
+                                syscall_lib::write_str(
+                                    STDOUT_FILENO,
+                                    "usbhub: child enumerate failed port=",
+                                );
+                                write_u8_dec(port);
+                                syscall_lib::write_str(STDOUT_FILENO, "\n");
+                            }
+                        }
+                    }
+                    None => {
+                        // Nesting beyond MAX_HUB_DEPTH — skip gracefully (A.5).
+                        syscall_lib::write_str(
+                            STDOUT_FILENO,
+                            "usbhub: nesting beyond MAX_HUB_DEPTH — skipping port ",
+                        );
+                        write_u8_dec(port);
+                        syscall_lib::write_str(STDOUT_FILENO, "\n");
+                    }
+                }
                 break;
             }
         }

@@ -1743,11 +1743,30 @@ impl Controller {
         }
         self.ring_doorbell(slot_id, dci);
         match self.wait_for_bulk_out_event(irq, slot_id, dci) {
-            Some(ev) if ev.completion_code == trb::COMPLETION_SUCCESS => {
+            // Accept SHORT_PACKET as well as SUCCESS, mirroring `submit_bulk_in`.
+            // The xHC reports a multi-packet bulk-OUT TD whose last packet is
+            // short — or whose data buffer was consumed exactly — with a Short
+            // Packet completion (cc=13) and a residual, NOT a hard error. The
+            // earlier SUCCESS-only filter rejected a perfectly good multi-sector
+            // BOT WRITE(10) data-OUT (e.g. 7 × 512 = 3584 B), wedging the write
+            // path; the transferred count is `len - residual` either way.
+            Some(ev)
+                if ev.completion_code == trb::COMPLETION_SUCCESS
+                    || ev.completion_code == COMPLETION_SHORT_PACKET =>
+            {
                 let residual = ev.residual_transfer_length.min(len) as usize;
                 Some((len as usize).saturating_sub(residual))
             }
-            _ => None,
+            Some(ev) => {
+                // A genuine transport failure (STALL, Babble, transaction error,
+                // data-buffer error) — surface the completion code so it is
+                // diagnosable rather than an opaque `None`.
+                write_str(STDOUT_FILENO, "[xhci] bulk-OUT non-success cc=");
+                crate::write_u8_dec(ev.completion_code);
+                write_str(STDOUT_FILENO, "\n");
+                None
+            }
+            None => None,
         }
     }
 
@@ -1839,6 +1858,74 @@ impl Controller {
                 Some(out)
             }
             _ => None,
+        }
+    }
+
+    /// Phase 92a H.4 — IOMMU-map a shared-memory region into the xHCI device's
+    /// domain (zero-copy DMA substrate) and return its device IOVA, or `None`.
+    pub fn map_shm(&self, shm_id: u32) -> Option<u64> {
+        self.handle.map_shm_dma(shm_id)
+    }
+
+    /// Tear down a mapping installed by [`Controller::map_shm`].
+    pub fn unmap_shm(&self, iova: u64) {
+        self.handle.unmap_shm_dma(iova);
+    }
+
+    /// Phase 92a H.4 — submit a **single-TRB, zero-copy** bulk transfer of `len`
+    /// bytes whose buffer already lives at device IOVA `iova` (a shared-memory
+    /// region mapped via [`Controller::map_shm`]) and block for completion.
+    /// Direction (IN vs OUT) is the endpoint's, selected by `dci`; the TRB shape
+    /// is identical either way. Unlike `submit_bulk_out`/`submit_bulk_in` there
+    /// is **no host-side copy** — the device DMAs straight into/out of the shared
+    /// buffer the class driver also maps. Returns the transferred byte count
+    /// (`len - residual`), or `None` on timeout / a non-success completion.
+    pub fn submit_bulk_iova(
+        &mut self,
+        irq: &IrqNotification,
+        slot_id: u8,
+        dci: u8,
+        iova: u64,
+        len: u32,
+    ) -> Option<usize> {
+        if len == 0 {
+            return Some(0);
+        }
+        {
+            let sc = self.slot_mut(slot_id)?;
+            let ep = sc.interrupt_eps.iter_mut().find(|e| e.dci == dci)?;
+            let cycle = ep.producer.cycle;
+            write_trb(
+                &ep.ring,
+                ep.producer.enqueue,
+                trb::Trb::normal(iova, len, cycle),
+            );
+            let cycle_before = ep.producer.cycle;
+            if ep.producer.advance() {
+                let ring_iova = ep.ring_iova;
+                write_trb(
+                    &ep.ring,
+                    ep.producer.link_index(),
+                    trb::Trb::link(ring_iova, true, cycle_before),
+                );
+            }
+        }
+        self.ring_doorbell(slot_id, dci);
+        match self.wait_for_bulk_out_event(irq, slot_id, dci) {
+            Some(ev)
+                if ev.completion_code == trb::COMPLETION_SUCCESS
+                    || ev.completion_code == COMPLETION_SHORT_PACKET =>
+            {
+                let residual = ev.residual_transfer_length.min(len) as usize;
+                Some((len as usize).saturating_sub(residual))
+            }
+            Some(ev) => {
+                write_str(STDOUT_FILENO, "[xhci] shm bulk non-success cc=");
+                crate::write_u8_dec(ev.completion_code);
+                write_str(STDOUT_FILENO, "\n");
+                None
+            }
+            None => None,
         }
     }
 

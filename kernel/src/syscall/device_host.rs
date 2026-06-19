@@ -1492,6 +1492,208 @@ pub fn sys_device_dma_handle_info(dma_cap: u32, out_user_ptr: usize) -> isize {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 92a H.4 — shared-memory zero-copy DMA mapping
+// ---------------------------------------------------------------------------
+
+/// One live `sys_device_dma_map_shm` mapping: the (pid, device) that installed
+/// it, the shm id it pinned, and the device-domain IOVA + length it mapped.
+/// Tracked so `sys_device_dma_unmap_shm` and process-exit cleanup can tear down
+/// the IOMMU entry + drop the shm ref.
+struct ShmDmaMapping {
+    pid: Pid,
+    key: DeviceCapKey,
+    shm_id: u32,
+    iova: u64,
+    len: usize,
+}
+
+static SHM_DMA_MAP_REGISTRY: IrqSafeMutex<alloc::vec::Vec<ShmDmaMapping>> =
+    IrqSafeMutex::new(alloc::vec::Vec::new());
+
+/// Phase 92a H.4 — `sys_device_dma_map_shm(dev_cap, shm_id) -> isize`.
+///
+/// IOMMU-map a shared-memory region's contiguous frame run into the caller's
+/// claimed device IOMMU domain so the device can DMA into/out of it zero-copy.
+/// Returns the device IOVA (>= 0) on success or a negated errno.
+pub fn sys_device_dma_map_shm(dev_cap: u32, shm_id: u32) -> isize {
+    let pid = crate::process::current_pid();
+    if pid == 0 {
+        return NEG_ESRCH;
+    }
+    let task_id = match scheduler::current_task_id() {
+        Some(id) => id,
+        None => return NEG_ESRCH,
+    };
+    let key = match scheduler::task_cap(task_id, dev_cap) {
+        Ok(Capability::Device { key }) => key,
+        Ok(_) => return NEG_EBADF,
+        Err(_) => return NEG_EBADF,
+    };
+
+    // Resolve the device's IOMMU domain, then RELEASE the device-host lock
+    // before touching the IOMMU registry (lock order: device-host → iommu;
+    // never a page-table op under the device-host lock).
+    let snap = {
+        let reg = DEVICE_HOST_REGISTRY.lock();
+        match reg.slot_for(pid, key) {
+            Some(slot) => slot.handle.domain_snapshot(),
+            None => return NEG_EPERM,
+        }
+    };
+
+    // Pin the shm region + read its physically-contiguous frame run. `incref`
+    // holds the region alive while it is mapped; the matching unmap `decref`s.
+    let (start_phys, page_count) = match crate::mm::shm::incref(crate::mm::shm::ShmId(shm_id)) {
+        Ok(run) => run,
+        Err(_) => return NEG_ENODEV,
+    };
+    let len = (page_count as usize) * 4096;
+
+    // Install the device-domain IOMMU mapping (identity: IOVA = phys). When the
+    // IOMMU is not translating (identity fallback — the typical no-`--iommu`
+    // QEMU boot), the device already reaches the frame at its physical address,
+    // so the map is a no-op; the IOVA the device programs is still `start_phys`.
+    if let Some(snap) = snap
+        && crate::iommu::registry::translating()
+    {
+        use kernel_core::iommu::contract::{DomainError, Iova, MapFlags, PhysAddr};
+        match crate::iommu::registry::map(
+            snap.unit_index,
+            snap.domain,
+            Iova(start_phys),
+            PhysAddr(start_phys),
+            len,
+            MapFlags::READ | MapFlags::WRITE,
+        ) {
+            Ok(()) => {}
+            // A genuine double-map (same region mapped twice with no
+            // intervening unmap) or an overlap with a pre-mapped reserved
+            // region — a fresh shm map returns `Ok(())`, so this never fires on
+            // the happy path. Recording a second mapping over the shared PTE
+            // would make a later unmap/exit-cleanup tear down a PTE another live
+            // user (or the firmware-reserved identity mapping) still needs, so
+            // reject instead of silently aliasing it.
+            Err(DomainError::AlreadyMapped) => {
+                let _ = crate::mm::shm::decref(crate::mm::shm::ShmId(shm_id));
+                return NEG_EBUSY;
+            }
+            Err(_) => {
+                let _ = crate::mm::shm::decref(crate::mm::shm::ShmId(shm_id));
+                return NEG_EIO;
+            }
+        }
+    }
+
+    SHM_DMA_MAP_REGISTRY.lock().push(ShmDmaMapping {
+        pid,
+        key,
+        shm_id,
+        iova: start_phys,
+        len,
+    });
+
+    log::info!(
+        "device_host.dma_map_shm pid={} bdf={:04x}:{:02x}:{:02x}.{} shm_id={} iova={:#x} len={}",
+        pid,
+        key.segment,
+        key.bus,
+        key.dev,
+        key.func,
+        shm_id,
+        start_phys,
+        len,
+    );
+    isize::try_from(start_phys).unwrap_or(isize::MAX)
+}
+
+/// Phase 92a H.4 — `sys_device_dma_unmap_shm(dev_cap, iova) -> isize`.
+///
+/// Tear down a mapping installed by [`sys_device_dma_map_shm`] (identified by
+/// its device IOVA): remove the device-domain IOMMU entry and drop the shm ref.
+/// Returns 0 or a negated errno.
+pub fn sys_device_dma_unmap_shm(dev_cap: u32, iova: u64) -> isize {
+    let pid = crate::process::current_pid();
+    if pid == 0 {
+        return NEG_ESRCH;
+    }
+    let task_id = match scheduler::current_task_id() {
+        Some(id) => id,
+        None => return NEG_ESRCH,
+    };
+    let key = match scheduler::task_cap(task_id, dev_cap) {
+        Ok(Capability::Device { key }) => key,
+        Ok(_) => return NEG_EBADF,
+        Err(_) => return NEG_EBADF,
+    };
+
+    // Find + remove the record (the IOVA uniquely identifies the mapping; this
+    // also validates the caller owns it). The recorded `len` drives the unmap.
+    let mapping = {
+        let mut reg = SHM_DMA_MAP_REGISTRY.lock();
+        match reg
+            .iter()
+            .position(|m| m.pid == pid && m.key == key && m.iova == iova)
+        {
+            Some(pos) => reg.swap_remove(pos),
+            None => return NEG_EINVAL,
+        }
+    };
+
+    let snap = {
+        let reg = DEVICE_HOST_REGISTRY.lock();
+        reg.slot_for(pid, key)
+            .and_then(|s| s.handle.domain_snapshot())
+    };
+    if let Some(snap) = snap
+        && crate::iommu::registry::translating()
+    {
+        use kernel_core::iommu::contract::Iova;
+        let _ = crate::iommu::registry::unmap(
+            snap.unit_index,
+            snap.domain,
+            Iova(mapping.iova),
+            mapping.len,
+        );
+    }
+    let _ = crate::mm::shm::decref(crate::mm::shm::ShmId(mapping.shm_id));
+    0
+}
+
+/// Release every `sys_device_dma_map_shm` mapping owned by `pid` (process-exit
+/// cleanup): tear down each IOMMU entry and drop each shm ref so a driver that
+/// exits mid-transfer leaks neither an IOMMU mapping nor an shm pin.
+pub fn release_shm_dma_maps_for_pid(pid: Pid) {
+    let mappings: alloc::vec::Vec<ShmDmaMapping> = {
+        let mut reg = SHM_DMA_MAP_REGISTRY.lock();
+        let mut drained = alloc::vec::Vec::new();
+        let mut i = 0;
+        while i < reg.len() {
+            if reg[i].pid == pid {
+                drained.push(reg.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        drained
+    };
+    for m in mappings {
+        let snap = {
+            let reg = DEVICE_HOST_REGISTRY.lock();
+            reg.slot_for(pid, m.key)
+                .and_then(|s| s.handle.domain_snapshot())
+        };
+        if let Some(snap) = snap
+            && crate::iommu::registry::translating()
+        {
+            use kernel_core::iommu::contract::Iova;
+            let _ =
+                crate::iommu::registry::unmap(snap.unit_index, snap.domain, Iova(m.iova), m.len);
+        }
+        let _ = crate::mm::shm::decref(crate::mm::shm::ShmId(m.shm_id));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Phase 55b Track B.4 — `sys_device_irq_subscribe`
 // ---------------------------------------------------------------------------
 //

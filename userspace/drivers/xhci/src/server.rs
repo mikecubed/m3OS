@@ -34,7 +34,7 @@ use kernel_core::usb::enumerate::EnumContext;
 use kernel_core::usb::xhci::trb::dci;
 use syscall_lib::STDOUT_FILENO;
 use syscall_lib::write_str;
-use usb_core::protocol::{AttachNotice, USB_REPLY_LABEL, UsbReply, UsbRequest};
+use usb_core::protocol::{AttachNotice, USB_MSG_MAX, USB_REPLY_LABEL, UsbReply, UsbRequest};
 
 use crate::controller::{Controller, PortChange};
 use crate::handle::{pack_handle, unpack_handle};
@@ -198,6 +198,48 @@ fn enumerate_port(
     }
 }
 
+/// Map an `EnumerateChild` wire speed code (matching
+/// `kernel_core::usb::hub::DOWNSTREAM_SPEED_*`) to a [`PortSpeed`]. Unknown
+/// codes default to Full speed — the safe lowest-common-denominator that drives
+/// the BSR two-step MaxPacketSize negotiation.
+fn port_speed_from_code(code: u8) -> kernel_core::usb::xhci::port::PortSpeed {
+    use kernel_core::usb::xhci::port::PortSpeed;
+    match code {
+        0 => PortSpeed::Low,
+        2 => PortSpeed::High,
+        3 => PortSpeed::Super,
+        _ => PortSpeed::Full,
+    }
+}
+
+/// Enumerate a device attached **behind a hub** (Phase 92a A.4/A.5).
+///
+/// Identical to [`enumerate_port`] except the device is addressed by the xHCI
+/// **route string** (xHCI §8.9) threaded into the Slot Context dword0, with the
+/// `root_hub_port` going into dword1 — the addressing a tier-2+ device requires.
+/// The route string is computed by the `usbhub` walker from the topology tree.
+fn enumerate_child(
+    controller: &mut Controller,
+    irq: &IrqNotification,
+    route_string: u32,
+    root_hub_port: u8,
+    speed: kernel_core::usb::xhci::port::PortSpeed,
+) -> Option<AttachNotice> {
+    use kernel_core::usb::enumerate::{EnumContext, EnumState, run_enumeration};
+    let ctx = EnumContext {
+        speed: Some(speed),
+        port: root_hub_port,
+        route_string,
+        ep0_ring_iova: 0,
+        ..Default::default()
+    };
+    let mut ops = crate::enumerate::XhciHostOps::new(controller, irq);
+    match run_enumeration(EnumState::EnableSlot, ctx, &mut ops) {
+        (EnumState::Configured, final_ctx) => device_info_from_ctx(&final_ctx),
+        _ => None,
+    }
+}
+
 /// Drain each controller's queued root-hub port changes (Phase 92 Track C) and
 /// act on them: enumerate + publish a newly-connected device, or mark a
 /// departing device `attached: false` and reclaim its slot via Disable Slot.
@@ -330,7 +372,14 @@ pub fn run(ep: u32, discovered: u8, mut controllers: Vec<ControllerCtx>) -> ! {
 
     let mut backend = SyscallBackend::new();
     loop {
-        match backend.recv(ep_cap) {
+        // Receive with a USB_MSG_MAX-sized bulk buffer, NOT the default
+        // `recv`'s MAX_BULK_RECV (1522 B, the Ethernet MTU). A `SubmitBulkOut`
+        // request carrying a multi-sector BOT WRITE(10) data-OUT (up to ~4089 B
+        // of payload + 7 B header) would otherwise be truncated to 1522 B — the
+        // server would then program a short bulk-OUT TRB while the CBW told the
+        // device to expect the full length, so the device waits forever and the
+        // transfer times out. This is what wedged the >1522-byte write path.
+        match backend.recv_with_capacity(ep_cap, USB_MSG_MAX) {
             Ok(RecvResult::Notification(bits)) => {
                 for (c, _irq, _d) in controllers.iter_mut() {
                     c.service_interrupt_events();
@@ -352,7 +401,7 @@ pub fn run(ep: u32, discovered: u8, mut controllers: Vec<ControllerCtx>) -> ! {
                 // Also service any hot-plug events surfaced by the drain (a
                 // class driver's poll wakes the loop between IRQs).
                 process_port_events(&mut controllers, &mut served);
-                let reply = handle_request(&mut controllers, discovered, &served, &frame.bulk);
+                let reply = handle_request(&mut controllers, discovered, &mut served, &frame.bulk);
                 let bytes = reply.encode();
                 // Fail closed: if staging the reply bulk fails, reply with the
                 // `u64::MAX` sentinel label so the client's `usb_call` returns
@@ -386,7 +435,7 @@ pub fn run(ep: u32, discovered: u8, mut controllers: Vec<ControllerCtx>) -> ! {
 fn handle_request(
     controllers: &mut [ControllerCtx],
     discovered: u8,
-    served: &[AttachNotice],
+    served: &mut Vec<AttachNotice>,
     bulk: &[u8],
 ) -> UsbReply {
     let Some(req) = UsbRequest::decode(bulk) else {
@@ -413,6 +462,18 @@ fn handle_request(
         // reads the descriptors `AttachNotice` does not carry.
         UsbRequest::GetDescriptors { slot_id } => {
             match owner!(slot_id).and_then(|(c, _irq, slot)| c.cached_descriptors(slot)) {
+                // H.6: reject a Descriptors reply that would exceed USB_MSG_MAX
+                // (a device reporting a hostile `wTotalLength` could otherwise
+                // amplify into a ~64 KiB blob). Encode overhead is tag(1) +
+                // device len-prefix(2) + config len-prefix(2) = 5 bytes. Fails
+                // closed with an explicit error rather than client-side truncation.
+                Some((device, config)) if device.len() + config.len() + 5 > USB_MSG_MAX => {
+                    write_str(
+                        STDOUT_FILENO,
+                        "[xhci] GetDescriptors over USB_MSG_MAX — rejected\n",
+                    );
+                    UsbReply::Error { code: EINVAL }
+                }
                 Some((device, config)) => UsbReply::Descriptors { device, config },
                 None => UsbReply::Error { code: EINVAL },
             }
@@ -505,18 +566,32 @@ fn handle_request(
             slot_id,
             dci: target_dci,
             len,
-        } => match owner!(slot_id)
-            .and_then(|(c, irq, slot)| c.submit_bulk_in(irq, slot, target_dci, len as u32))
-        {
-            Some(data) => UsbReply::BulkData {
-                data,
-                completion_code: 1,
-            },
-            None => UsbReply::BulkData {
-                data: Vec::new(),
-                completion_code: 0xFF,
-            },
-        },
+        } => {
+            // H.6: a `len` that would overflow the inline BulkData reply
+            // (tag(1) + completion_code(1) + u16 len-prefix(2) = 4 bytes of
+            // overhead) is rejected with an explicit error instead of a
+            // silently-truncated BulkData.
+            if len as usize + 4 > USB_MSG_MAX {
+                write_str(
+                    STDOUT_FILENO,
+                    "[xhci] SubmitBulkIn len over USB_MSG_MAX — rejected\n",
+                );
+                UsbReply::Error { code: EINVAL }
+            } else {
+                match owner!(slot_id)
+                    .and_then(|(c, irq, slot)| c.submit_bulk_in(irq, slot, target_dci, len as u32))
+                {
+                    Some(data) => UsbReply::BulkData {
+                        data,
+                        completion_code: 1,
+                    },
+                    None => UsbReply::BulkData {
+                        data: Vec::new(),
+                        completion_code: 0xFF,
+                    },
+                }
+            }
+        }
         UsbRequest::Topology => {
             // Snapshot every brought-up controller's root-hub ports live. The
             // per-controller port count records the bring-up set; each connected
@@ -546,10 +621,107 @@ fn handle_request(
                 ports,
             }
         }
-        // GetDescriptors / ConfigureEndpoints / SubmitTransfer are not needed by
-        // the live HID-boot path (descriptors are pre-resolved into AttachNotice
-        // during enumeration; endpoints are configured at bring-up). The
-        // page-grant `SubmitTransfer` path remains for Phase 90 (mass storage).
+        // Phase 92a A.4/A.5: enumerate a device behind a hub. The `usbhub`
+        // walker supplies the route string + root-hub port; we run the standard
+        // enumeration against the route-addressed slot and publish the child so
+        // a class driver's `NextAttach` walk discovers it.
+        UsbRequest::EnumerateChild {
+            parent_slot_id,
+            route_string,
+            root_hub_port,
+            speed,
+        } => {
+            let (ctrl_idx, _parent_real) = unpack_handle(parent_slot_id);
+            match controllers.get_mut(ctrl_idx) {
+                Some((c, irq, _d)) => {
+                    let ps = port_speed_from_code(speed);
+                    match enumerate_child(c, &*irq, route_string, root_hub_port, ps) {
+                        Some(mut notice) => match pack_handle(ctrl_idx, notice.slot_id) {
+                            Some(handle) => {
+                                let real_slot = notice.slot_id;
+                                notice.slot_id = handle;
+                                // Dedup: a repeated EnumerateChild for the same
+                                // route must not push a second cursor entry.
+                                if served.iter().any(|n| n.attached && n.slot_id == handle) {
+                                    // Already published — reclaim the duplicate
+                                    // slot we just enabled so it is not leaked.
+                                    c.disable_slot(&*irq, real_slot);
+                                } else {
+                                    write_str(STDOUT_FILENO, "XHCI_HUB:child-enumerated class=");
+                                    crate::write_u8_dec(notice.interface_class);
+                                    write_str(STDOUT_FILENO, " port=");
+                                    crate::write_u8_dec(root_hub_port);
+                                    write_str(STDOUT_FILENO, "\n");
+                                    served.push(notice);
+                                }
+                                UsbReply::Attach {
+                                    notice: Some(notice),
+                                }
+                            }
+                            None => {
+                                // Reclaim the just-enabled slot so an unpackable
+                                // handle does not leak it (H.3/H.5 discipline).
+                                c.disable_slot(&*irq, notice.slot_id);
+                                write_str(
+                                    STDOUT_FILENO,
+                                    "[xhci] tier-2 child dropped — unpackable handle\n",
+                                );
+                                UsbReply::Error { code: EINVAL }
+                            }
+                        },
+                        None => UsbReply::Error { code: EINVAL },
+                    }
+                }
+                None => UsbReply::Error { code: EINVAL },
+            }
+        }
+        // Phase 92a H.4 — zero-copy bulk transfer over a shared-memory region.
+        // The server IOMMU-maps the shm into the xHCI device domain and programs
+        // a single bulk TRB straight at it (no inline USB_MSG_MAX copy), so a
+        // transfer larger than the 4096-byte inline budget completes in one
+        // descriptor. `dir_in` is informational — the endpoint's DCI selects the
+        // direction.
+        UsbRequest::SubmitShmTransfer {
+            slot_id,
+            dci: target_dci,
+            shm_id,
+            len,
+            dir_in: _,
+        } => {
+            // Defense-in-depth: reject a caller-supplied `len` that exceeds the
+            // shm region's actual size BEFORE any TRB is programmed at it.
+            // Otherwise `len > shm_size(shm_id)` makes the controller DMA past
+            // the end of the mapped region — and with `--iommu` off / identity
+            // fallback there is no hardware backstop to contain the overrun. An
+            // unknown/invalid shm_id (`shm_size` → None) is rejected too.
+            if !matches!(syscall_lib::shm_size(shm_id), Some(sz) if (len as usize) <= sz) {
+                UsbReply::Error { code: EINVAL }
+            } else {
+                match owner!(slot_id) {
+                    Some((c, irq, slot)) => match c.map_shm(shm_id) {
+                        Some(iova) => {
+                            let res = c.submit_bulk_iova(irq, slot, target_dci, iova, len);
+                            c.unmap_shm(iova);
+                            match res {
+                                Some(transferred) => UsbReply::TransferComplete {
+                                    transferred,
+                                    completion_code: 1,
+                                },
+                                None => UsbReply::TransferComplete {
+                                    transferred: 0,
+                                    completion_code: 0xFF,
+                                },
+                            }
+                        }
+                        None => UsbReply::Error { code: EINVAL },
+                    },
+                    None => UsbReply::Error { code: EINVAL },
+                }
+            }
+        }
+        // GetDescriptors / ConfigureEndpoints / SubmitTransfer (page-grant) are
+        // not needed by the live paths — descriptors are pre-resolved into
+        // AttachNotice during enumeration; endpoints are configured at bring-up.
         _ => UsbReply::Error { code: ENOSYS },
     }
 }

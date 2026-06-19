@@ -320,6 +320,53 @@ pub enum UsbRequest {
     /// `ure` when the NIC didn't enumerate) polls this each heartbeat so the
     /// controller/port/speed picture survives the framebuffer scroll.
     Topology,
+
+    /// Enumerate a device attached **behind a hub** (Phase 92a Track A.4/A.5).
+    ///
+    /// The resident `usbhub` walker, having reset a downstream hub port and
+    /// confirmed a device is connected + enabled, asks the server to run the
+    /// Enable Slot → Address Device → Configure Endpoint sequence for that
+    /// tier-2+ device. The server addresses it via the xHCI **route string**
+    /// (xHCI §8.9) rather than a root-hub port: `route_string` encodes the
+    /// downstream-port path through the intervening hub(s), while
+    /// `root_hub_port` is the root-hub port the whole chain hangs off (Slot
+    /// Context dword1). On success the new device is published into the server's
+    /// `NextAttach` table and returned as a fresh [`UsbReply::Attach`].
+    EnumerateChild {
+        /// Packed handle of the parent hub (identifies the owning controller so
+        /// the child is enumerated on the same xHCI controller).
+        parent_slot_id: u8,
+        /// 20-bit xHCI route string addressing the child through the hub(s).
+        route_string: u32,
+        /// Root-hub port number (1-based) the hub chain is attached to.
+        root_hub_port: u8,
+        /// Downstream device speed code: 0 = Low, 1 = Full, 2 = High, 3 = Super
+        /// (matches `kernel_core::usb::hub::DOWNSTREAM_SPEED_*`).
+        speed: u8,
+    },
+
+    /// **Zero-copy** bulk transfer over a shared-memory region (Phase 92a H.4).
+    ///
+    /// The class driver creates an shm region (`sys_shm_create`), fills it (for
+    /// an OUT) or leaves it for the device to fill (for an IN), and sends its
+    /// `shm_id`. The server IOMMU-maps the region into the xHCI device domain
+    /// (`sys_device_dma_map_shm`) and programs a single bulk TRB straight at it
+    /// — no inline `USB_MSG_MAX` copy, so a transfer larger than the 4096-byte
+    /// inline budget completes in one descriptor. The class driver reads the
+    /// result (for an IN) directly from its own mapping of the same region.
+    SubmitShmTransfer {
+        /// Target slot ID.
+        slot_id: u8,
+        /// Device Context Index of the bulk endpoint (its direction selects
+        /// IN vs OUT).
+        dci: u8,
+        /// Shared-memory region id (from the class driver's `sys_shm_create`).
+        shm_id: u32,
+        /// Number of bytes to transfer (≤ the region length).
+        len: u32,
+        /// `true` for a bulk-IN (device → shm), `false` for bulk-OUT (shm → device).
+        dir_in: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -548,6 +595,8 @@ const REQ_POLL_BULK_IN: u8 = 8;
 const REQ_SUBMIT_BULK_OUT: u8 = 9;
 const REQ_TOPOLOGY: u8 = 10;
 const REQ_SUBMIT_BULK_IN: u8 = 11;
+const REQ_ENUMERATE_CHILD: u8 = 12;
+const REQ_SUBMIT_SHM_TRANSFER: u8 = 13;
 
 // --- reply tags ---
 const REP_DESCRIPTORS: u8 = 1;
@@ -757,6 +806,32 @@ impl UsbRequest {
             UsbRequest::Topology => {
                 v.push(REQ_TOPOLOGY);
             }
+            UsbRequest::EnumerateChild {
+                parent_slot_id,
+                route_string,
+                root_hub_port,
+                speed,
+            } => {
+                v.push(REQ_ENUMERATE_CHILD);
+                v.push(*parent_slot_id);
+                put_u32(&mut v, *route_string);
+                v.push(*root_hub_port);
+                v.push(*speed);
+            }
+            UsbRequest::SubmitShmTransfer {
+                slot_id,
+                dci,
+                shm_id,
+                len,
+                dir_in,
+            } => {
+                v.push(REQ_SUBMIT_SHM_TRANSFER);
+                v.push(*slot_id);
+                v.push(*dci);
+                put_u32(&mut v, *shm_id);
+                put_u32(&mut v, *len);
+                v.push(*dir_in as u8);
+            }
         }
         v
     }
@@ -827,6 +902,19 @@ impl UsbRequest {
                 len: r.u16()?,
             },
             REQ_TOPOLOGY => UsbRequest::Topology,
+            REQ_ENUMERATE_CHILD => UsbRequest::EnumerateChild {
+                parent_slot_id: r.u8()?,
+                route_string: r.u32()?,
+                root_hub_port: r.u8()?,
+                speed: r.u8()?,
+            },
+            REQ_SUBMIT_SHM_TRANSFER => UsbRequest::SubmitShmTransfer {
+                slot_id: r.u8()?,
+                dci: r.u8()?,
+                shm_id: r.u32()?,
+                len: r.u32()?,
+                dir_in: r.u8()? != 0,
+            },
             _ => return None,
         })
     }
@@ -1134,6 +1222,19 @@ mod tests {
                 dci: 5,
                 len: 36,
             },
+            UsbRequest::EnumerateChild {
+                parent_slot_id: 0x42,
+                route_string: 0x0001_2345,
+                root_hub_port: 7,
+                speed: 2,
+            },
+            UsbRequest::SubmitShmTransfer {
+                slot_id: 3,
+                dci: 4,
+                shm_id: 0x00AB_CDEF,
+                len: 8192,
+                dir_in: true,
+            },
         ];
         for r in reqs {
             let bytes = r.encode();
@@ -1408,5 +1509,55 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    /// H.6 (PR #252 readiness): the xHCI server bounds device-/caller-supplied
+    /// lengths against `USB_MSG_MAX`. This locks in the encode-size arithmetic
+    /// the server's reject thresholds rely on: a `BulkData` reply is tag(1) +
+    /// completion_code(1) + u16 len-prefix(2) + data, and a `Descriptors`
+    /// reply is tag(1) + two u16 len-prefixes(4) + blobs. The server rejects
+    /// (returns `Error`) anything that would push the encoded reply over
+    /// `USB_MSG_MAX`.
+    #[test]
+    fn bulk_in_len_budget_matches_encoded_size() {
+        // At the server's accept threshold (len + 4 <= USB_MSG_MAX) the encoded
+        // BulkData reply fits; one byte past it overflows.
+        let max_ok = USB_MSG_MAX - 4;
+        let ok = UsbReply::BulkData {
+            data: alloc::vec![0xAB; max_ok],
+            completion_code: 1,
+        };
+        assert!(
+            ok.encode().len() <= USB_MSG_MAX,
+            "len+4==MAX must fit inline"
+        );
+
+        let over = UsbReply::BulkData {
+            data: alloc::vec![0xAB; max_ok + 1],
+            completion_code: 1,
+        };
+        assert!(
+            over.encode().len() > USB_MSG_MAX,
+            "one byte over the threshold must exceed USB_MSG_MAX (server rejects it)"
+        );
+    }
+
+    #[test]
+    fn descriptors_over_budget_exceeds_usb_msg_max() {
+        // device(18) + config + tag(1) + two len-prefixes(4). A config sized so
+        // 18 + config + 5 == USB_MSG_MAX fits; one byte more overflows — the
+        // server's GetDescriptors reject boundary.
+        let device: alloc::vec::Vec<u8> = (0..18u8).collect();
+        let fit = USB_MSG_MAX - 18 - 5;
+        let ok = UsbReply::Descriptors {
+            device: device.clone(),
+            config: alloc::vec![0u8; fit],
+        };
+        assert!(ok.encode().len() <= USB_MSG_MAX);
+        let over = UsbReply::Descriptors {
+            device,
+            config: alloc::vec![0u8; fit + 1],
+        };
+        assert!(over.encode().len() > USB_MSG_MAX);
     }
 }

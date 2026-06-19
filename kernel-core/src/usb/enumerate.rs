@@ -219,6 +219,12 @@ pub struct EnumContext {
     pub ep0_ring_iova: u64,
     /// The root-hub port number (1-based).
     pub port: u8,
+    /// The xHCI route string (xHCI §8.9) addressing this device through any
+    /// intermediate hubs. Zero for a device directly on a root-hub port;
+    /// non-zero for a tier-2+ device behind one or more hubs (Phase 92a). It is
+    /// written into Slot Context dword0 bits 19:0; the root-hub port (`port`)
+    /// is written into dword1 separately.
+    pub route_string: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -235,7 +241,9 @@ fn build_address_device_ctx(ctx: &EnumContext) -> InputContextSnapshot {
         Some(PortSpeed::Super) => crate::usb::xhci::port::PSI_SUPER_SPEED,
         None => crate::usb::xhci::port::PSI_FULL_SPEED,
     };
-    let slot_dw0 = slot_context_dword0(0, speed_psi, 1); // context_entries = 1 (EP0 only)
+    // context_entries = 1 (EP0 only); route_string addresses a tier-2+ device
+    // through intermediate hubs (0 for a root-hub-port device).
+    let slot_dw0 = slot_context_dword0(ctx.route_string, speed_psi, 1);
     let slot_dw1 = slot_context_dword1(ctx.port);
     let ep0_dw1 = ep_context_dword1(EP_TYPE_CONTROL, EP_CERR_3, ctx.ep0_mps);
     let ep0_ptr = ep_tr_dequeue_ptr(ctx.ep0_ring_iova);
@@ -345,8 +353,9 @@ fn build_configure_endpoint_ctx(ctx: &EnumContext) -> InputContextSnapshot {
     }
     let af = add_flags(&dci_list);
 
-    // Slot Context dword 0: context_entries = max_dci.
-    let slot_dw0 = slot_context_dword0(0, speed_psi, max_dci);
+    // Slot Context dword 0: context_entries = max_dci; route_string preserved
+    // from the Address Device step so a tier-2+ device stays addressable.
+    let slot_dw0 = slot_context_dword0(ctx.route_string, speed_psi, max_dci);
     let slot_dw1 = slot_context_dword1(ctx.port);
     let ep0_dw1 = ep_context_dword1(EP_TYPE_CONTROL, EP_CERR_3, ctx.ep0_mps);
     let ep0_ptr = ep_tr_dequeue_ptr(ctx.ep0_ring_iova);
@@ -1260,5 +1269,38 @@ mod tests {
         let snap = &ops.ctx_snapshots[0];
         // Root Hub Port Number at bits 23:16 of slot_dword1.
         assert_eq!((snap.slot_dword1 >> 16) & 0xFF, 3);
+    }
+
+    #[test]
+    fn slot_context_route_string_encoded_for_tier2_device() {
+        // A device behind a hub carries a non-zero route string (xHCI §8.9) in
+        // Slot Context dword0 bits 19:0, while the root-hub port it ultimately
+        // hangs off goes in dword1 bits 23:16. High speed skips the BSR
+        // two-step, so ctx_snapshots[0] is the Address Device snapshot and the
+        // last snapshot is Configure Endpoint (Phase 92a A.5).
+        let mut ops = MockOps::default();
+        let ctx = EnumContext {
+            speed: Some(PortSpeed::High),
+            ep0_ring_iova: 0x0010_0000,
+            port: 5,
+            route_string: 0x21, // tier-2 port 1 behind a hub on tier-1 port 2
+            ..Default::default()
+        };
+        let (state, _final_ctx) = run_enumeration(EnumState::EnableSlot, ctx, &mut ops);
+        assert_eq!(state, EnumState::Configured);
+
+        // Address Device snapshot: route string in dword0, root port in dword1.
+        let addr = &ops.ctx_snapshots[0];
+        assert_eq!(addr.slot_dword0 & 0x000F_FFFF, 0x21);
+        assert_eq!((addr.slot_dword1 >> 16) & 0xFF, 5);
+
+        // Configure Endpoint snapshot must preserve the route string so the
+        // tier-2 device stays addressable after its endpoints are added.
+        let cfg = ops
+            .ctx_snapshots
+            .last()
+            .expect("configure endpoint snapshot");
+        assert_eq!(cfg.slot_dword0 & 0x000F_FFFF, 0x21);
+        assert_eq!((cfg.slot_dword1 >> 16) & 0xFF, 5);
     }
 }
