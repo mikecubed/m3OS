@@ -56,7 +56,7 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 - ✅ **D.5 + H.4 — zero-copy DMA (delivered).** New capability-gated kernel syscalls `SYS_DEVICE_DMA_MAP_SHM`/`UNMAP_SHM` IOMMU-map a **shared-memory** region (`sys_shm` — contiguous, shared by id, the right substrate vs the move-based page-grant) into a claimed device's domain; `UsbRequest::SubmitShmTransfer` programs one bulk TRB straight at it (no inline copy), freed on unmap + process exit. **Validated:** `usb-storage-smoke` `USB_STORAGE:shm-dma-ok` — a 16-sector (8192-byte, >`USB_MSG_MAX`) zero-copy WRITE+READ in single descriptors, byte-identical.
 - *The hard USB data path was already done (D.1/D.2); this delivered the tier-2 enumeration + the kernel multi-mount integration.*
 
-**Phase 92b — HID Report Protocol live decode.**
+**Phase 92b — HID Report Protocol live decode. — IN PROGRESS (this PR).**
 - **B.2-live** (data-driven multi-axis/scroll/button decode + usage→event mapping), **B.3-live** (consumer-key routing to `audio_server`; the consumer-keycode host-logic is already landed), **B.4** (keyboard LED `SET_REPORT`).
 - **C.4 (usb-hid arm)** — `usb-hid` releases its per-device state on an `attached:false` notice.
 - **H.2 remaining item** — the live "control transfer interleaved with an armed interrupt endpoint drops no report" assertion rides B.4's `SET_REPORT`-during-HID-polling path (line 87).
