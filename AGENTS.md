@@ -102,7 +102,7 @@ This sets `core.hooksPath` to `.githooks/`. **pre-commit** runs `cargo xtask che
 | `doom-concurrent-smoke` | `M3OS_DOOM_CONCURRENT_REGRESSION=1` |
 | `tiling-smoke` | `M3OS_TILING_REGRESSION=1` |
 | `htop-render-probe` | `M3OS_HTOP_REGRESSION=1` |
-| `xhci-bringup-smoke` + `xhci-enum-smoke` + `usb-smoke` + `usb-hotplug-smoke` + `usb-storage-smoke` + `usb-hub-smoke` (Phase 92a: also asserts **tier-2** `XHCI_HUB:child-enumerated` for a full-speed HID device behind the hub) + `usb-mount-smoke` (Phase 92a: `mount /dev/usb0 /mnt/usb0` + `ls`/read/overwrite-readback over the secondary-mount routing) | `M3OS_USB_REGRESSION=1` |
+| `xhci-bringup-smoke` + `xhci-enum-smoke` + `usb-smoke` + `usb-hotplug-smoke` + `usb-storage-smoke` (Phase 92a H.4: also asserts `USB_STORAGE:shm-dma-ok` — an 8192-byte zero-copy WRITE+READ over an IOMMU-mapped shared-memory region via `SYS_DEVICE_DMA_MAP_SHM` + `SubmitShmTransfer`) + `usb-hub-smoke` (Phase 92a: also asserts **tier-2** `XHCI_HUB:child-enumerated` for a full-speed HID device behind the hub) + `usb-mount-smoke` (Phase 92a: `mount /dev/usb0 /mnt/usb0` + `ls`/read/overwrite-readback over the secondary-mount routing) | `M3OS_USB_REGRESSION=1` |
 | `tls-smoke` PASS (not SKIP) | `M3OS_TLS_REGRESSION=1` |
 | `dns-smoke` PASS (not SKIP) | `M3OS_DNS_REGRESSION=1` |
 | `multi-nic-smoke` (e1000 + e1000e + igb arms) | `M3OS_MULTI_NIC_REGRESSION=1` |
