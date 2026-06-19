@@ -22,6 +22,19 @@
 //!
 //! The xHCI server captures reports on its IRQ and buffers them, so a poll is a
 //! cheap non-blocking read — between keystrokes it simply returns "no report".
+//!
+//! # Report Protocol (Phase 92 Track B)
+//!
+//! Beyond the two Boot-Protocol classes, this driver also binds **Report
+//! Protocol** HID pointers — touchpads, tablets, gaming mice — whose report
+//! layout is not the fixed boot 8/3-byte shape. At bind it reads + parses the
+//! device's HID Report descriptor (`fetch_report_fields`, B.1) into a
+//! `ReportField` layout, and decodes each interrupt-IN report against that
+//! layout with `kernel_core::usb::hid_report::decode_pointer_report` (B.2) —
+//! emitting multi-axis motion, a scroll wheel, and arbitrary buttons into
+//! `mouse_server`. Report-Protocol keyboards additionally drive their Caps /
+//! Num / Scroll Lock LEDs via `SET_REPORT` (B.4), and the resident walk
+//! re-checks `NextAttach` so a hot-unplugged device's state is released (C.4).
 
 #![no_std]
 #![no_main]
@@ -32,11 +45,18 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::alloc::Layout;
 
-use kernel_core::input::events::{KeyEvent, ModifierSide, PointerButton, PointerEvent};
-use kernel_core::input::keymap::{Keycode, Keymap};
-use kernel_core::usb::descriptor::CLASS_HID;
-use kernel_core::usb::hid::{BootKeyboardDecoder, HID_KBD_REPORT_LEN, parse_boot_mouse_report};
-use kernel_core::usb::hid_report::{ReportField, parse_report_descriptor};
+use kernel_core::input::events::{
+    KeyEvent, KeyEventKind, ModifierSide, ModifierState, PointerButton, PointerEvent,
+};
+use kernel_core::input::keymap::{KEY_CAPSLOCK, KEY_NUMLOCK, KEY_SCROLLLOCK, Keycode, Keymap};
+use kernel_core::usb::descriptor::{CLASS_HID, SUBCLASS_HID_BOOT};
+use kernel_core::usb::hid::{
+    BootKeyboardDecoder, HID_KBD_REPORT_LEN, hid_consumer_usage_to_keycode, parse_boot_mouse_report,
+};
+use kernel_core::usb::hid_report::{
+    DecodedPointer, ReportField, decode_consumer_usages, decode_pointer_report,
+    parse_report_descriptor,
+};
 use syscall_lib::STDOUT_FILENO;
 use syscall_lib::heap::BrkAllocator;
 use usb_core::protocol::{USB_MSG_MAX, USB_REQ_LABEL, USB_SERVICE_NAME, UsbReply, UsbRequest};
@@ -74,18 +94,100 @@ const MOUSE_EVENT_INJECT: u64 = 3;
 /// 5 ms poll keeps input latency below one report period.
 const POLL_INTERVAL_NS: u32 = 5_000_000;
 
+/// How this driver decodes a bound HID interface.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeviceRole {
+    /// Boot-Protocol keyboard (subclass 1, protocol 1) — 8-byte boot report.
+    BootKeyboard,
+    /// Boot-Protocol mouse (subclass 1, protocol 2) — 3-byte boot report.
+    BootMouse,
+    /// Report-Protocol pointer (tablet / touchpad / gaming mouse) — variable
+    /// layout decoded against the parsed `ReportField` array (Phase 92 B.2).
+    ReportPointer,
+    /// Report-Protocol consumer-control interface (media / volume keys, Usage
+    /// Page 0x0C) decoded against the parsed layout (Phase 92 B.3).
+    ReportConsumer,
+    /// A HID interface this driver does not drive (no usable layout).
+    Ignore,
+}
+
+/// Decide how to decode a freshly-bound interface from its boot protocol and
+/// parsed Report-descriptor layout. Boot keyboard/mouse keep the fixed-format
+/// boot decode; a Report-Protocol interface is classified by the usages its
+/// `ReportField` layout actually carries (pointer axes/buttons vs consumer
+/// controls), so a tablet drives `mouse_server` and a media-key strip routes
+/// consumer keys — without either being mistaken for the other.
+fn classify_role(notice: &usb_core::protocol::AttachNotice, fields: &[ReportField]) -> DeviceRole {
+    // Per USB HID §4.2/§4.3 the boot protocol field (1 = keyboard, 2 = mouse) is
+    // only meaningful when the interface declares the Boot subclass. A
+    // Report-Protocol interface (subclass 0) that happens to advertise protocol
+    // 1/2 must NOT be driven as a boot device — that would issue boot-only
+    // SET_PROTOCOL/SET_IDLE and pick the fixed-format boot decoder over the
+    // parsed `ReportField` layout. Honor the boot protocol only under the Boot
+    // subclass; otherwise classify by the layout the descriptor actually carries.
+    let is_boot = notice.interface_sub_class == SUBCLASS_HID_BOOT;
+    match notice.interface_protocol {
+        PROTOCOL_HID_KEYBOARD if is_boot => DeviceRole::BootKeyboard,
+        PROTOCOL_HID_MOUSE if is_boot => DeviceRole::BootMouse,
+        _ => {
+            if notice.interface_class != CLASS_HID || fields.is_empty() {
+                return DeviceRole::Ignore;
+            }
+            if fields_have_pointer(fields) {
+                DeviceRole::ReportPointer
+            } else if fields.iter().any(|f| f.usage_page == USAGE_PAGE_CONSUMER) {
+                DeviceRole::ReportConsumer
+            } else {
+                DeviceRole::Ignore
+            }
+        }
+    }
+}
+
+/// HID Usage Page 0x01 — Generic Desktop (pointer axes live here).
+const USAGE_PAGE_GENERIC_DESKTOP: u16 = 0x01;
+/// HID Usage Page 0x09 — Button.
+const USAGE_PAGE_BUTTON: u16 = 0x09;
+/// HID Usage Page 0x0C — Consumer (media/volume/brightness controls).
+const USAGE_PAGE_CONSUMER: u16 = 0x0C;
+
+/// True if the parsed layout carries pointer input — a Generic-Desktop X/Y
+/// axis or any Button-page field — i.e. this interface should drive
+/// `mouse_server`.
+fn fields_have_pointer(fields: &[ReportField]) -> bool {
+    fields.iter().any(|f| {
+        f.usage_page == USAGE_PAGE_BUTTON
+            || (f.usage_page == USAGE_PAGE_GENERIC_DESKTOP && matches!(f.usage, 0x30 | 0x31))
+    })
+}
+
 /// One bound HID device the daemon polls.
 struct HidDevice {
     notice: usb_core::protocol::AttachNotice,
+    /// How this device's reports are decoded (Phase 92 Track B).
+    role: DeviceRole,
+    /// The `NextAttach` table index this device was bound from — a stable,
+    /// unique handle to this enumeration event (the table is append-only),
+    /// used by the C.4 reconcile instead of the reusable packed `slot_id`.
+    source_cursor: u8,
     kbd_decoder: BootKeyboardDecoder,
-    /// Previous mouse button bitfield, for edge detection.
+    /// Previous mouse button bitfield, for boot-mouse edge detection.
     prev_buttons: u8,
+    /// Previous Report-Protocol pointer button bitmap, for edge detection
+    /// across the (up to 32) buttons a `decode_pointer_report` surfaces.
+    prev_pointer_buttons: u32,
+    /// Previous Consumer-control pressed-usage bitmap snapshot, for edge
+    /// detection on a Report-Protocol media-key interface (B.3).
+    prev_consumer: u64,
+    /// Caps/Num/Scroll Lock LED bitfield last pushed to the device via
+    /// `SET_REPORT` (Phase 92 B.4). Boot keyboard output report: bit0 Num,
+    /// bit1 Caps, bit2 Scroll Lock.
+    led_state: u8,
     /// Parsed HID Report descriptor field layout (Phase 92 Track B.1). Empty for
-    /// a non-HID interface or if the Report descriptor read failed. The live
-    /// boot keyboard/mouse path still decodes via the Boot Protocol; this is the
-    /// stored layout a Report-Protocol decode (B.2-live, Phase 92b) reads — held
-    /// here now so the descriptor is read + parsed live at bind.
-    #[allow(dead_code)]
+    /// a non-HID interface or if the Report descriptor read failed. The boot
+    /// keyboard/mouse path decodes via the Boot Protocol; a `ReportPointer` /
+    /// `ReportConsumer` device decodes its interrupt-IN reports against this
+    /// layout (B.2/B.3).
     report_fields: Vec<ReportField>,
 }
 
@@ -237,6 +339,229 @@ fn poll_keyboard(usb_ep: u32, kbd_ep: u32, dev: &mut HidDevice, keymap: &Keymap)
         // the Down edge of the injected key. The exact spelling is asserted.
         emit_key_sentinel(&ev);
     }
+    // Phase 92 B.4 — a lock-key press toggles the matching LED and pushes the new
+    // bitfield to the keyboard via SET_REPORT (a write-back to the device over
+    // the H.2-hardened EP0 control path, interleaved with the armed interrupt-IN
+    // poll above).
+    maybe_update_leds(usb_ep, dev, &edges);
+}
+
+/// Boot-keyboard LED output-report bit positions (USB HID §B.1 / boot output
+/// report): bit0 Num Lock, bit1 Caps Lock, bit2 Scroll Lock.
+const LED_NUM_LOCK: u8 = 0x01;
+const LED_CAPS_LOCK: u8 = 0x02;
+const LED_SCROLL_LOCK: u8 = 0x04;
+
+/// Phase 92 B.4 — fold any newly-pressed lock key into the device's LED state
+/// and, when it changed, push the new bitfield to the keyboard. Each lock key is
+/// a toggle: its Down edge flips the corresponding LED bit. Boot keyboards
+/// expose a 1-byte LED output report, so this drives the physical Caps / Num /
+/// Scroll Lock LEDs.
+fn maybe_update_leds(usb_ep: u32, dev: &mut HidDevice, edges: &[kernel_core::usb::hid::KeyEdge]) {
+    let mut changed = false;
+    for edge in edges {
+        if edge.kind != KeyEventKind::Down {
+            continue;
+        }
+        let bit = if edge.keycode == KEY_CAPSLOCK.0 {
+            LED_CAPS_LOCK
+        } else if edge.keycode == KEY_NUMLOCK.0 {
+            LED_NUM_LOCK
+        } else if edge.keycode == KEY_SCROLLLOCK.0 {
+            LED_SCROLL_LOCK
+        } else {
+            continue;
+        };
+        dev.led_state ^= bit;
+        changed = true;
+    }
+    if changed {
+        set_keyboard_leds(usb_ep, dev);
+    }
+}
+
+/// Issue `SET_REPORT(Output)` carrying the device's current LED bitfield over
+/// the live `ControlWrite` EP0 path (bmRequestType `0x21` = H2D|Class|Interface,
+/// bRequest `0x09` = SET_REPORT, wValue `0x0200` = Output report / report id 0,
+/// wIndex = interface, wLength = 1). Emits a `USB_HID:led` sentinel on a
+/// successful write so the gate can assert the round-trip.
+fn set_keyboard_leds(usb_ep: u32, dev: &HidDevice) {
+    let iface = dev.notice.interface_num as u16;
+    let setup = [
+        0x21,
+        0x09,
+        0x00,
+        0x02,
+        (iface & 0xFF) as u8,
+        (iface >> 8) as u8,
+        0x01,
+        0x00,
+    ];
+    let ok = matches!(
+        usb_call(
+            usb_ep,
+            &UsbRequest::ControlWrite {
+                slot_id: dev.notice.slot_id,
+                setup,
+                data: alloc::vec![dev.led_state],
+            },
+        ),
+        Some(UsbReply::ControlData {
+            completion_code: 1,
+            ..
+        })
+    );
+    if ok {
+        syscall_lib::write_str(STDOUT_FILENO, "USB_HID:led state=0x");
+        write_u8_hex(dev.led_state);
+        syscall_lib::write_str(STDOUT_FILENO, "\n");
+    } else {
+        syscall_lib::write_str(STDOUT_FILENO, "usb-hid: warn: SET_REPORT(LED) failed\n");
+    }
+}
+
+/// Poll a Report-Protocol pointer (tablet / touchpad / gaming mouse): read its
+/// interrupt-IN report, decode it against the parsed `ReportField` layout
+/// (`decode_pointer_report`, B.2), and inject motion + wheel + button edges into
+/// `mouse_server`. A tablet reports an absolute position; a gaming mouse reports
+/// relative deltas + a scroll wheel + extra buttons.
+fn poll_report_pointer(usb_ep: u32, mouse_ep: u32, dev: &mut HidDevice) {
+    let report = match poll_report(usb_ep, dev) {
+        Some(r) => r,
+        None => return,
+    };
+    let p: DecodedPointer = decode_pointer_report(&dev.report_fields, &report);
+    // Nothing moved and no button changed — stay quiet (an idle tablet still
+    // reports its position every frame, but `any_input` gates the sentinel).
+    if !p.any_input && p.buttons == dev.prev_pointer_buttons {
+        return;
+    }
+    let now = monotonic_ms();
+    // Load-bearing sentinel for the I.2 Report-Protocol gate arm: a live
+    // Report-Protocol pointer report decoded against the parsed layout.
+    emit_report_pointer_sentinel(&p);
+
+    let abs_position = match (p.abs_x, p.abs_y) {
+        (Some(x), Some(y)) => Some((x as i32, y as i32)),
+        _ => None,
+    };
+    if abs_position.is_some() || p.rel_x != 0 || p.rel_y != 0 || p.wheel != 0 {
+        inject_pointer(
+            mouse_ep,
+            &PointerEvent {
+                timestamp_ms: now,
+                dx: p.rel_x,
+                dy: p.rel_y,
+                abs_position,
+                button: PointerButton::None,
+                wheel_dx: 0,
+                wheel_dy: p.wheel,
+                modifiers: Default::default(),
+            },
+        );
+    }
+
+    // Button edges across up to 32 buttons (a gaming mouse exposes ≥4).
+    let changed = p.buttons ^ dev.prev_pointer_buttons;
+    for bit in 0..32u8 {
+        if changed & (1u32 << bit) != 0 {
+            let down = p.buttons & (1u32 << bit) != 0;
+            let button = if down {
+                PointerButton::Down(bit)
+            } else {
+                PointerButton::Up(bit)
+            };
+            inject_pointer(
+                mouse_ep,
+                &PointerEvent {
+                    timestamp_ms: now,
+                    dx: 0,
+                    dy: 0,
+                    abs_position: None,
+                    button,
+                    wheel_dx: 0,
+                    wheel_dy: 0,
+                    modifiers: Default::default(),
+                },
+            );
+        }
+    }
+    dev.prev_pointer_buttons = p.buttons;
+}
+
+/// `HID_REPORT:pointer btn=0x<hex> abs=<0|1> moved=<0|1>` — proves a live
+/// Report-Protocol pointer report was decoded against the parsed field layout
+/// (B.2). The exact prefix is asserted by the Report-Protocol gate arm.
+fn emit_report_pointer_sentinel(p: &DecodedPointer) {
+    syscall_lib::write_str(STDOUT_FILENO, "HID_REPORT:pointer btn=0x");
+    write_u32_hex(p.buttons);
+    syscall_lib::write_str(STDOUT_FILENO, " abs=");
+    write_u8_dec(u8::from(p.abs_x.is_some()));
+    let moved = p.abs_x.is_some() || p.rel_x != 0 || p.rel_y != 0 || p.wheel != 0;
+    syscall_lib::write_str(STDOUT_FILENO, " moved=");
+    write_u8_dec(u8::from(moved));
+    syscall_lib::write_str(STDOUT_FILENO, "\n");
+}
+
+/// Poll a Report-Protocol consumer-control interface (media / volume keys): read
+/// its report, decode the asserted Consumer usages against the parsed layout
+/// (`decode_consumer_usages`, B.3), map each via `hid_consumer_usage_to_keycode`,
+/// and inject a Down+Up `KeyEvent` into kbd_server — which routes media/volume
+/// keys onward (`display_server` → `audio_server`). Press-edge-detected so a held
+/// key fires once. (No QEMU device emits consumer reports, so this path is
+/// bare-metal/VFIO-validated; the decode is host-tested in `kernel-core`.)
+fn poll_report_consumer(usb_ep: u32, kbd_ep: u32, dev: &mut HidDevice, keymap: &Keymap) {
+    let report = match poll_report(usb_ep, dev) {
+        Some(r) => r,
+        None => return,
+    };
+    let active = decode_consumer_usages(&dev.report_fields, &report);
+    let now = monotonic_ms();
+    let mut snapshot: u64 = 0;
+    for (idx, f) in dev
+        .report_fields
+        .iter()
+        .filter(|f| f.usage_page == USAGE_PAGE_CONSUMER)
+        .enumerate()
+        .take(64)
+    {
+        if !active.contains(&f.usage) {
+            continue;
+        }
+        snapshot |= 1u64 << idx;
+        // Fire only on the press transition (this field was not set last poll).
+        if dev.prev_consumer & (1u64 << idx) == 0
+            && let Some(kc) = hid_consumer_usage_to_keycode(f.usage)
+        {
+            inject_consumer_key(kbd_ep, kc, keymap, now);
+        }
+    }
+    dev.prev_consumer = snapshot;
+}
+
+/// Inject a consumer/media keycode as a Down then Up `KeyEvent` into kbd_server
+/// and log a `USB_HID:consumer` sentinel.
+fn inject_consumer_key(kbd_ep: u32, keycode: u32, keymap: &Keymap, now: u64) {
+    let symbol = keymap
+        .lookup(Keycode(keycode), ModifierState::empty())
+        .map(|s| s.0)
+        .unwrap_or(0);
+    for kind in [KeyEventKind::Down, KeyEventKind::Up] {
+        inject_key(
+            kbd_ep,
+            &KeyEvent {
+                timestamp_ms: now,
+                keycode,
+                symbol,
+                modifiers: ModifierState::empty(),
+                kind,
+                modifier_side: ModifierSide::for_keycode(keycode),
+            },
+        );
+    }
+    syscall_lib::write_str(STDOUT_FILENO, "USB_HID:consumer kc=0x");
+    write_u32_hex(keycode);
+    syscall_lib::write_str(STDOUT_FILENO, "\n");
 }
 
 /// `USB_HID:key kind=<k> sym=0x<hex> kc=0x<hex>` — proves the full USB input
@@ -326,12 +651,30 @@ fn poll_mouse(usb_ep: u32, mouse_ep: u32, dev: &mut HidDevice) {
 /// Read a HID interface's **Report descriptor** over EP0 and parse it into a
 /// `ReportField` layout (Phase 92 Track B.1). Issues the standard
 /// `GET_DESCRIPTOR(Report)` (bmRequestType `0x81`, bRequest `0x06`, wValue
-/// `0x2200` = Report descriptor type 0x22 / index 0, wIndex = interface). A
-/// generous request length lets the control-IN short-packet return the device's
-/// actual descriptor (Report descriptors are well under `USB_MSG_MAX`). Returns
-/// an empty `Vec` if the read fails or the descriptor parses to no fields.
+/// `0x2200` = Report descriptor type 0x22 / index 0, wIndex = interface).
+///
+/// The request length is the HID descriptor's `wDescriptorLength` (read via
+/// `GetDescriptors`, H.1) so the Report descriptor is read at exactly its
+/// declared size (B.1 readiness — over-reading a hard-coded 256 risks pulling
+/// trailing zero padding the parser would have to ignore). Falls back to a
+/// generous 256 when the HID descriptor's length is unavailable — the control-IN
+/// short-packet still terminates the transfer at the device's real descriptor
+/// length, so the parser sees only the real bytes. Returns an empty `Vec` if the
+/// read fails or the descriptor parses to no fields.
 fn fetch_report_fields(usb_ep: u32, notice: &usb_core::protocol::AttachNotice) -> Vec<ReportField> {
-    const REQ_LEN: u16 = 256;
+    // Clamp the requested length so a device's declared `wDescriptorLength`
+    // (untrusted) can't force an oversized EP0 scratch allocation or a
+    // `ControlData` reply that overruns `USB_MSG_MAX`. The xHCI server now also
+    // rejects an over-budget `ControlRequest` length (`> USB_MSG_MAX - 4` →
+    // EINVAL) as defense-in-depth; clamping here keeps the request at the
+    // device's real descriptor size so the read succeeds instead of bouncing
+    // off that server-side guard. The inline `ControlData` encode overhead is
+    // tag(1) + completion(1) + len-prefix(2) = 4 bytes, so the data body must
+    // fit in `USB_MSG_MAX - 4`.
+    const MAX_REPORT_DESC_LEN: u16 = (USB_MSG_MAX - 4) as u16;
+    let req_len = report_descriptor_len(usb_ep, notice)
+        .unwrap_or(256)
+        .min(MAX_REPORT_DESC_LEN);
     let iface = notice.interface_num;
     let setup = [
         0x81,
@@ -340,15 +683,15 @@ fn fetch_report_fields(usb_ep: u32, notice: &usb_core::protocol::AttachNotice) -
         0x22,
         iface,
         0x00,
-        (REQ_LEN & 0xFF) as u8,
-        (REQ_LEN >> 8) as u8,
+        (req_len & 0xFF) as u8,
+        (req_len >> 8) as u8,
     ];
     match usb_call(
         usb_ep,
         &UsbRequest::ControlRequest {
             slot_id: notice.slot_id,
             setup,
-            length: REQ_LEN,
+            length: req_len,
         },
     ) {
         Some(UsbReply::ControlData {
@@ -357,6 +700,77 @@ fn fetch_report_fields(usb_ep: u32, notice: &usb_core::protocol::AttachNotice) -
         }) if !data.is_empty() => parse_report_descriptor(&data),
         _ => Vec::new(),
     }
+}
+
+/// Resolve the Report descriptor's declared length for `notice.interface_num`
+/// by reading the device's Configuration descriptor (`GetDescriptors`, H.1) and
+/// scanning it for the interface's HID descriptor (Phase 92 B.1 readiness).
+/// `None` if the descriptor set is unavailable or carries no HID descriptor for
+/// the interface — the caller then falls back to a generous request length.
+fn report_descriptor_len(usb_ep: u32, notice: &usb_core::protocol::AttachNotice) -> Option<u16> {
+    let config = match usb_call(
+        usb_ep,
+        &UsbRequest::GetDescriptors {
+            slot_id: notice.slot_id,
+        },
+    ) {
+        Some(UsbReply::Descriptors { config, .. }) => config,
+        _ => return None,
+    };
+    hid_report_descriptor_len(&config, notice.interface_num)
+}
+
+/// Pure scan of a raw Configuration descriptor blob for the Report-descriptor
+/// `wDescriptorLength` declared in the HID descriptor (bDescriptorType 0x21)
+/// belonging to interface `iface`. Standard TLV walk: each descriptor is
+/// `[bLength, bDescriptorType, …]`; track the current Interface (0x04) and, at
+/// the HID descriptor (0x21) under it, read the `wDescriptorLength` of its first
+/// Report (0x22) class-descriptor entry (USB HID §6.2.1: the HID descriptor is
+/// `bLength, 0x21, bcdHID[2], bCountryCode, bNumDescriptors`, then
+/// `bNumDescriptors × [bDescriptorType, wDescriptorLength[2]]`). All indexing is
+/// bounds-checked (`?`) so a malformed/truncated blob yields `None`, never a
+/// panic.
+fn hid_report_descriptor_len(config: &[u8], iface: u8) -> Option<u16> {
+    let mut i = 0usize;
+    let mut cur_iface: Option<u8> = None;
+    while i + 2 <= config.len() {
+        let blen = config[i] as usize;
+        if blen < 2 || i + blen > config.len() {
+            break;
+        }
+        match config[i + 1] {
+            // Interface descriptor — bInterfaceNumber is at offset 2.
+            0x04 => cur_iface = config.get(i + 2).copied(),
+            // HID descriptor under the target interface.
+            0x21 if cur_iface == Some(iface) => {
+                let num = *config.get(i + 5)? as usize;
+                // Class-descriptor entries live *within* this HID descriptor's
+                // own `bLength` (`[i, i+blen)`). Bound the walk to it so a
+                // malformed `bNumDescriptors` (or a truncated descriptor) fails
+                // closed (→ `None`) instead of reading `wDescriptorLength` out of
+                // the next TLV descriptor and returning a bogus length.
+                let end = i + blen;
+                let mut e = i + 6;
+                for _ in 0..num {
+                    // Each entry is `[bDescriptorType, wDescriptorLength[2]]`; it
+                    // must fit entirely within this descriptor.
+                    if e + 3 > end {
+                        return None;
+                    }
+                    let dtype = config[e];
+                    let lo = config[e + 1] as u16;
+                    let hi = config[e + 2] as u16;
+                    if dtype == 0x22 {
+                        return Some((hi << 8) | lo);
+                    }
+                    e += 3;
+                }
+            }
+            _ => {}
+        }
+        i += blen;
+    }
+    None
 }
 
 /// Issue a single `PollInterruptIn` and return the captured report, if any.
@@ -378,6 +792,128 @@ fn lookup(name: &str) -> Option<u32> {
     if h == u64::MAX { None } else { Some(h as u32) }
 }
 
+/// Bind one attached interface: read + parse its Report descriptor (for a
+/// HID-class interface), classify its decode role, and assemble the polled
+/// device state. Shared by the boot-time enumeration walk and the C.4 hot-plug
+/// reconcile so a device attached after boot is brought up identically.
+///
+/// `source_cursor` is the `NextAttach` table index this device was bound from.
+/// The server's table is append-only, so that index is a stable, unique handle
+/// to *this* enumeration event — unlike the packed `slot_id`, which the server
+/// reuses for a reclaimed slot (H.3). Keying the C.4 reconcile on it avoids
+/// confusing a re-attached device with the stale detached entry it reused.
+fn build_device(
+    usb_ep: u32,
+    notice: usb_core::protocol::AttachNotice,
+    source_cursor: u8,
+) -> HidDevice {
+    // Read + parse the Report descriptor for HID-class interfaces (the surfaced
+    // device list can also include a hub/NIC this daemon ignores — issuing a HID
+    // GET_DESCRIPTOR at those would stall EP0). Boot keyboard/mouse still decode
+    // via Boot Protocol; the parsed layout drives the Report-Protocol decode.
+    let report_fields = if notice.interface_class == CLASS_HID {
+        let f = fetch_report_fields(usb_ep, &notice);
+        if f.is_empty() {
+            syscall_lib::write_str(
+                STDOUT_FILENO,
+                "usb-hid: report descriptor unavailable/empty\n",
+            );
+        } else {
+            syscall_lib::write_str(STDOUT_FILENO, "USB_HID:report-parsed proto=");
+            write_u8_dec(notice.interface_protocol);
+            syscall_lib::write_str(STDOUT_FILENO, " fields=");
+            write_u8_dec(f.len().min(255) as u8);
+            syscall_lib::write_str(STDOUT_FILENO, "\n");
+        }
+        f
+    } else {
+        Vec::new()
+    };
+    let role = classify_role(&notice, &report_fields);
+    HidDevice {
+        notice,
+        role,
+        source_cursor,
+        kbd_decoder: BootKeyboardDecoder::new(),
+        prev_buttons: 0,
+        prev_pointer_buttons: 0,
+        prev_consumer: 0,
+        led_state: 0,
+        report_fields,
+    }
+}
+
+/// Phase 92 Track C.4 — reconcile the bound-device set against the server's live
+/// attach table. A hot-removed device flips its `AttachNotice` to
+/// `attached: false` (C.2); a hot-added one appends a fresh attached entry
+/// (C.1/C.3). Re-walk the whole `NextAttach` cursor and: **release** any device
+/// we hold whose source entry is now detached (the usb-hid arm of C.4 — drops
+/// its per-device state so a removed device stops being polled), and **bind**
+/// any newly-attached HID interface we do not yet hold.
+///
+/// Identity is keyed on the **table index** (`source_cursor`), not the packed
+/// `slot_id`: the server reuses a reclaimed slot's handle (H.3), so a detach +
+/// re-attach of the same physical port appends a new entry that carries the same
+/// `slot_id`. Keying on the (stable, append-only) index lets a single reconcile
+/// pass that observes both entries correctly release the old device (its source
+/// entry went `attached:false`) *and* bind the new one (a fresh index) without
+/// the two aliasing.
+fn reconcile_attachments(usb_ep: u32, devices: &mut Vec<HidDevice>) {
+    // 1. Snapshot the full attach table (append-only; index == NextAttach cursor).
+    let mut table: Vec<usb_core::protocol::AttachNotice> = Vec::new();
+    let mut cursor = 0u8;
+    while let Some(UsbReply::Attach {
+        notice: Some(notice),
+    }) = usb_call(usb_ep, &UsbRequest::NextAttach { cursor })
+    {
+        table.push(notice);
+        cursor = match cursor.checked_add(1) {
+            Some(c) => c,
+            None => break,
+        };
+    }
+
+    // 2. Release held devices whose source entry is gone or now detached.
+    let mut i = 0;
+    while i < devices.len() {
+        let alive = table
+            .get(devices[i].source_cursor as usize)
+            .is_some_and(|n| n.attached);
+        if alive {
+            i += 1;
+        } else {
+            syscall_lib::write_str(STDOUT_FILENO, "usb-hid: released slot=");
+            write_u8_dec(devices[i].notice.slot_id);
+            syscall_lib::write_str(STDOUT_FILENO, "\n");
+            devices.remove(i);
+        }
+    }
+
+    // 3. Bind newly-attached HID interfaces we do not already hold (an entry whose
+    //    index backs no held device). A still-present device keeps its index held,
+    //    so it is skipped; a stale detached entry is `attached:false`, so skipped.
+    for (idx, n) in table.iter().enumerate() {
+        if !n.attached {
+            continue;
+        }
+        let idx = idx as u8;
+        if devices.iter().any(|d| d.source_cursor == idx) {
+            continue;
+        }
+        let dev = build_device(usb_ep, *n, idx);
+        if dev.role == DeviceRole::Ignore {
+            continue;
+        }
+        if matches!(dev.role, DeviceRole::BootKeyboard | DeviceRole::BootMouse) {
+            boot_protocol_init(usb_ep, &dev.notice);
+        }
+        syscall_lib::write_str(STDOUT_FILENO, "usb-hid: hot-attached slot=");
+        write_u8_dec(n.slot_id);
+        syscall_lib::write_str(STDOUT_FILENO, "\n");
+        devices.push(dev);
+    }
+}
+
 fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, BOOT_LOG_MARKER);
 
@@ -396,47 +932,29 @@ fn program_main(_args: &[&str]) -> i32 {
         return 0;
     };
 
-    // 2. Enumerate attached HID devices via the NextAttach cursor.
+    // 2. Enumerate attached HID devices via the NextAttach cursor. `idx` is the
+    //    table index this device is bound from — passed to `build_device` as its
+    //    stable `source_cursor` for the C.4 reconcile.
     let mut devices: Vec<HidDevice> = Vec::new();
     let mut cursor = 0u8;
     while let Some(UsbReply::Attach {
         notice: Some(notice),
     }) = usb_call(usb_ep, &UsbRequest::NextAttach { cursor })
     {
+        let idx = cursor;
+        cursor = match cursor.checked_add(1) {
+            Some(c) => c,
+            None => break,
+        };
+        // A boot enumeration only surfaces attached devices, but guard the flag
+        // so the same walk is correct if it ever sees a stale detached entry.
+        if !notice.attached {
+            continue;
+        }
         syscall_lib::write_str(STDOUT_FILENO, "usb-hid: bound HID device (proto ");
         write_u8_dec(notice.interface_protocol);
         syscall_lib::write_str(STDOUT_FILENO, ")\n");
-        // B.1: read + parse the Report descriptor for HID-class interfaces (the
-        // surfaced device list can also include a hub/NIC the daemon ignores —
-        // issuing a HID GET_DESCRIPTOR at those would stall EP0). The boot
-        // keyboard/mouse still decode via Boot Protocol; this lights up the
-        // host-tested `parse_report_descriptor` on a live device and stores the
-        // layout a Report-Protocol decode (B.2-live, Phase 92b) will consume.
-        let report_fields = if notice.interface_class == CLASS_HID {
-            let f = fetch_report_fields(usb_ep, &notice);
-            if f.is_empty() {
-                syscall_lib::write_str(
-                    STDOUT_FILENO,
-                    "usb-hid: report descriptor unavailable/empty\n",
-                );
-            } else {
-                syscall_lib::write_str(STDOUT_FILENO, "USB_HID:report-parsed proto=");
-                write_u8_dec(notice.interface_protocol);
-                syscall_lib::write_str(STDOUT_FILENO, " fields=");
-                write_u8_dec(f.len().min(255) as u8);
-                syscall_lib::write_str(STDOUT_FILENO, "\n");
-            }
-            f
-        } else {
-            Vec::new()
-        };
-        devices.push(HidDevice {
-            notice,
-            kbd_decoder: BootKeyboardDecoder::new(),
-            prev_buttons: 0,
-            report_fields,
-        });
-        cursor = cursor.saturating_add(1);
+        devices.push(build_device(usb_ep, notice, idx));
     }
 
     if devices.is_empty() {
@@ -462,21 +980,28 @@ fn program_main(_args: &[&str]) -> i32 {
         write_u8_dec(n.interface_protocol);
         syscall_lib::write_str(
             STDOUT_FILENO,
-            match n.interface_protocol {
-                PROTOCOL_HID_KEYBOARD => " role=KEYBOARD\n",
-                PROTOCOL_HID_MOUSE => " role=MOUSE\n",
-                _ => " role=other\n",
+            match dev.role {
+                DeviceRole::BootKeyboard => " role=KEYBOARD\n",
+                DeviceRole::BootMouse => " role=MOUSE\n",
+                DeviceRole::ReportPointer => " role=REPORT_POINTER\n",
+                DeviceRole::ReportConsumer => " role=REPORT_CONSUMER\n",
+                DeviceRole::Ignore => " role=other\n",
             },
         );
     }
 
-    // 3. Resolve the input-server endpoints for the classes present.
-    let want_kbd = devices
-        .iter()
-        .any(|d| d.notice.interface_protocol == PROTOCOL_HID_KEYBOARD);
+    // 3. Resolve the input-server endpoints for the classes present. A
+    //    Report-Protocol pointer (tablet/touchpad) drives `mouse_server`; a
+    //    consumer-control interface drives `kbd_server` (→ audio_server).
+    let want_kbd = devices.iter().any(|d| {
+        matches!(
+            d.role,
+            DeviceRole::BootKeyboard | DeviceRole::ReportConsumer
+        )
+    });
     let want_mouse = devices
         .iter()
-        .any(|d| d.notice.interface_protocol == PROTOCOL_HID_MOUSE);
+        .any(|d| matches!(d.role, DeviceRole::BootMouse | DeviceRole::ReportPointer));
     // Wait (bounded) for the input servers to register before looking them up:
     // `usb_hid` only `depends=xhci_driver`, so on a cold boot it can win the
     // race against `kbd_server` / `mouse_server`. A plain `lookup` that loses
@@ -504,16 +1029,13 @@ fn program_main(_args: &[&str]) -> i32 {
         None
     };
 
-    // 3b. Put each HID keyboard/mouse interface into Boot Protocol and suppress
-    //     duplicate reports (SET_PROTOCOL(0) / SET_IDLE(0)) via the xHCI server's
-    //     ControlRequest path. Only HID boot devices get this — issuing a HID
-    //     class request at a non-HID interface (e.g. the surfaced NIC) just
-    //     stalls EP0 and spams the log with SET_PROTOCOL/SET_IDLE failures.
+    // 3b. Put each Boot-Protocol keyboard/mouse interface into Boot Protocol and
+    //     suppress duplicate reports (SET_PROTOCOL(0) / SET_IDLE(0)) via the xHCI
+    //     server's ControlRequest path. Only boot devices get this — a
+    //     Report-Protocol device (tablet/consumer) has no boot interface, and a
+    //     non-HID interface (e.g. a surfaced NIC) would just stall EP0.
     for dev in &devices {
-        if matches!(
-            dev.notice.interface_protocol,
-            PROTOCOL_HID_KEYBOARD | PROTOCOL_HID_MOUSE
-        ) {
+        if matches!(dev.role, DeviceRole::BootKeyboard | DeviceRole::BootMouse) {
             boot_protocol_init(usb_ep, &dev.notice);
         }
     }
@@ -521,21 +1043,42 @@ fn program_main(_args: &[&str]) -> i32 {
     let keymap = Keymap::us_qwerty();
     syscall_lib::write_str(STDOUT_FILENO, READY_SENTINEL);
 
-    // 4. Poll loop: each device's interrupt-IN endpoint, decode, inject.
+    // 4. Poll loop: each device's interrupt-IN endpoint, decode by role, inject.
+    //    Every `RECONCILE_EVERY` ticks, reconcile against the live attach table
+    //    so a hot-plugged device is bound and a hot-unplugged one is released
+    //    (C.4) without restarting the daemon. ~200 ms cadence at the 5 ms poll
+    //    period — fast enough to observe an attach/detach pair, cheap enough not
+    //    to flood the server with `NextAttach` walks.
+    const RECONCILE_EVERY: u32 = 40;
+    let mut tick: u32 = 0;
     loop {
+        if tick.is_multiple_of(RECONCILE_EVERY) {
+            reconcile_attachments(usb_ep, &mut devices);
+        }
+        tick = tick.wrapping_add(1);
         for dev in devices.iter_mut() {
-            match dev.notice.interface_protocol {
-                PROTOCOL_HID_KEYBOARD => {
+            match dev.role {
+                DeviceRole::BootKeyboard => {
                     if let Some(kbd_ep) = kbd_ep {
                         poll_keyboard(usb_ep, kbd_ep, dev, &keymap);
                     }
                 }
-                PROTOCOL_HID_MOUSE => {
+                DeviceRole::BootMouse => {
                     if let Some(mouse_ep) = mouse_ep {
                         poll_mouse(usb_ep, mouse_ep, dev);
                     }
                 }
-                _ => {}
+                DeviceRole::ReportPointer => {
+                    if let Some(mouse_ep) = mouse_ep {
+                        poll_report_pointer(usb_ep, mouse_ep, dev);
+                    }
+                }
+                DeviceRole::ReportConsumer => {
+                    if let Some(kbd_ep) = kbd_ep {
+                        poll_report_consumer(usb_ep, kbd_ep, dev, &keymap);
+                    }
+                }
+                DeviceRole::Ignore => {}
             }
         }
         let _ = syscall_lib::nanosleep_for(0, POLL_INTERVAL_NS);

@@ -215,6 +215,24 @@ impl QmpClient {
         Ok(())
     }
 
+    /// Inject an **absolute** pointer position into the guest via QMP
+    /// `input-send-event`. QEMU routes `abs` events to a device that registered
+    /// absolute axes — the emulated `usb-tablet` — so this drives the
+    /// Report-Protocol pointer path (Phase 92b B.2) distinct from the relative
+    /// `usb-mouse`. Values are in QEMU's normalized 0..0x7FFF absolute range.
+    pub fn send_pointer_abs(&mut self, x: i32, y: i32) -> Result<(), QmpError> {
+        let _ = self.execute(
+            "input-send-event",
+            json!({
+                "events": [
+                    {"type": "abs", "data": {"axis": "x", "value": x}},
+                    {"type": "abs", "data": {"axis": "y", "value": y}},
+                ]
+            }),
+        )?;
+        Ok(())
+    }
+
     /// Type a literal ASCII string, one PS/2 keypress per character.
     /// Whitespace, punctuation, and shift-modified letters are mapped
     /// through [`ascii_to_qkeys`]. Characters outside the supported

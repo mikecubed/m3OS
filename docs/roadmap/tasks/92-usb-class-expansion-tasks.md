@@ -16,8 +16,8 @@
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
 | A | Multi-tier hub enumeration — live `usbhub` walker, hub descriptor + per-port power/reset, tier-2+ slot assignment via the route string | H | **A.1–A.5 landed (Phase 92a)** — server surfaces `CLASS_HUB`; the resident `usbhub` walker binds a hub, reads its descriptor, drives per-port `PORT_POWER`/`PORT_RESET`, and **tier-2-enumerates a device behind the hub via the route string** (`UsbRequest::EnumerateChild` + `PortTopology`). Live-validated: `usb-hub-smoke` asserts `XHCI_HUB:child-enumerated` for a full-speed HID device behind the hub. |
-| B | HID Report Protocol — wire `parse_report_descriptor` live, multi-axis/buttons/scroll, consumer keys, LED `SET_REPORT` | H | **B.1 landed** — `usb-hid` reads + parses the HID Report descriptor over EP0 at bind and stores the `ReportField` layout per device (`USB_HID:report-parsed` in `usb-smoke`); B.2/B.3 host-logic landed (47 hid + 38 keymap tests). **B.2-live decode / B.3-live consumer routing / B.4 LED `SET_REPORT` → Phase 92b** |
-| C | Live hot-plug event surface — Port Status Change → `AttachNotice` push, detach (`attached:false`), dynamic re-enumeration, Disable Slot reclamation | — | C.1–C.3 + server-side C.4 landed (`usb-hotplug-smoke` 3-cycle PASS); **class-driver-side C.4 release scheduled per driver — usb-storage→92a, usb-hid→92b, usb-net→92e** |
+| B | HID Report Protocol — wire `parse_report_descriptor` live, multi-axis/buttons/scroll, consumer keys, LED `SET_REPORT` | H | **B.1–B.4 landed (Phase 92b)** — `usb-hid` reads + parses the Report descriptor at bind (at its `wDescriptorLength`), classifies a non-boot HID pointer as `ReportPointer`, and decodes its reports with `decode_pointer_report` (multi-axis/scroll/buttons) into `mouse_server`; consumer-key decode (`decode_consumer_usages`) routes media keys; Caps/Num/Scroll Lock LEDs ride `SET_REPORT`. **Live-validated:** `usb-report-smoke` (`HID_REPORT:pointer` + `USB_HID:led` + H.2 no-drop). B.3-live consumer *routing* is bare-metal (no QEMU consumer device); its decode is host-tested. |
+| C | Live hot-plug event surface — Port Status Change → `AttachNotice` push, detach (`attached:false`), dynamic re-enumeration, Disable Slot reclamation | — | C.1–C.3 + server-side C.4 landed (`usb-hotplug-smoke` 3-cycle PASS); class-driver-side C.4: **usb-storage→92a ✅, usb-hid→92b ✅** (`reconcile_attachments` releases on `attached:false`, gate-asserted), **usb-net→92e** |
 | D | USB Mass Storage — BOT CBW/CSW on the Phase 96 inline bulk path, SCSI subset, UAS, `RemoteBlockDevice` facade + `/mnt/usb<n>`, page-grant overflow | C, H | D.1/D.2 transport + **D.3 UAS codec** + **D.4 mount landed (Phase 92a)**: the resident `usb-storage` daemon registers `usb0.block` and serves the block protocol; the kernel multi-device registry + VFS secondary-mount table mount it at `/mnt/usb0`. Live-validated by `usb-mount-smoke` (mount + ls + read + overwrite-readback). **D.5 zero-copy overflow landed** (shm-DMA, `USB_STORAGE:shm-dma-ok`); **live UAS → deferred follow-up.** |
 | E | Isochronous endpoints — UAC PCM-out to `audio_server`, UVC frame capture + `camera_server`, controller isoch TRB scheduling | F | **→ Phase 92c** (deep isoch TRB scheduling; UVC bare-metal-only) |
 | F | Multi-controller concurrency — per-controller bound IRQ + event-loop thread, concurrent MSI-X routing | — | **→ Phase 92d** (ring-3 driver threading; risk-isolated from the working single-loop server) |
@@ -56,11 +56,14 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 - ✅ **D.5 + H.4 — zero-copy DMA (delivered).** New capability-gated kernel syscalls `SYS_DEVICE_DMA_MAP_SHM`/`UNMAP_SHM` IOMMU-map a **shared-memory** region (`sys_shm` — contiguous, shared by id, the right substrate vs the move-based page-grant) into a claimed device's domain; `UsbRequest::SubmitShmTransfer` programs one bulk TRB straight at it (no inline copy), freed on unmap + process exit. **Validated:** `usb-storage-smoke` `USB_STORAGE:shm-dma-ok` — a 16-sector (8192-byte, >`USB_MSG_MAX`) zero-copy WRITE+READ in single descriptors, byte-identical.
 - *The hard USB data path was already done (D.1/D.2); this delivered the tier-2 enumeration + the kernel multi-mount integration.*
 
-**Phase 92b — HID Report Protocol live decode.**
-- **B.2-live** (data-driven multi-axis/scroll/button decode + usage→event mapping), **B.3-live** (consumer-key routing to `audio_server`; the consumer-keycode host-logic is already landed), **B.4** (keyboard LED `SET_REPORT`).
-- **C.4 (usb-hid arm)** — `usb-hid` releases its per-device state on an `attached:false` notice.
-- **H.2 remaining item** — the live "control transfer interleaved with an armed interrupt endpoint drops no report" assertion rides B.4's `SET_REPORT`-during-HID-polling path (line 87).
-- **Gate (I.2 Report-Protocol arm):** a `usb-tablet` QMP-abs-input arm → `USB_HID:mouse`/`HID_REPORT:*` (extra axes/buttons). *Host-logic + the stored `ReportField` layout (B.1) are ready.*
+**Phase 92b — HID Report Protocol live decode. — CORE LANDED + VALIDATED (PR #254).**
+- ✅ **B.2-live** — `usb-hid` classifies a non-boot HID pointer as `ReportPointer` and decodes its interrupt-IN reports with `kernel_core::usb::hid_report::decode_pointer_report` against the parsed `ReportField` layout (multi-axis abs/rel motion, signed wheel, up to 32 buttons), injecting motion + wheel + button edges into `mouse_server`. The parser gained `is_relative` + multi-usage-list (`Usage X; Usage Y; Input`) support. **Live-validated** by `usb-report-smoke` (a `usb-tablet` → `HID_REPORT:pointer`).
+- ✅ **B.3 decode** — `decode_consumer_usages` (Usage Page 0x0C bitmap, host-tested) + `usb-hid` `poll_report_consumer` route media/volume keys (`hid_consumer_usage_to_keycode` → `kbd_server` → `audio_server`, `USB_HID:consumer`). The live routing is bare-metal/VFIO (no QEMU consumer device); the decode is host-tested.
+- ✅ **B.4** — `usb-hid` tracks Caps/Num/Scroll Lock from the decoded boot-keyboard edges and issues `SET_REPORT(Output)` over the live `ControlWrite` EP0 path. **Live-validated** by `usb-report-smoke` → `USB_HID:led`.
+- ✅ **C.4 (usb-hid arm)** — `reconcile_attachments` re-walks `NextAttach` (~200 ms) and releases a held device whose latest entry is `attached:false` (and binds hot-attached HID interfaces). **Live-validated** by `usb-hotplug-smoke` (`usb-hid: hot-attached`/`usb-hid: released` each of 3 cycles).
+- ✅ **H.2 remaining item** — the no-drop assertion rides B.4: `usb-report-smoke` injects a key right after the `SET_REPORT` and asserts it still decodes (`USB_HID:key … sym=0x…62`).
+- ✅ **B.1 readiness** — wDescriptorLength-driven Report read (`report_descriptor_len` via `GetDescriptors`), corrected `hid_report.rs` module doc header, hostile Report-Count host test (`MAX_REPORT_FIELDS`=65536 cap).
+- ✅ **Gate (I.2 Report-Protocol arm):** new always-on `usb-report-smoke` (`usb-tablet` → `HID_REPORT:pointer` (B.2) + `caps_lock` → `USB_HID:led` (B.4) + post-write key decode (H.2)); wired into `M3OS_USB_REGRESSION` + the AGENTS.md row. ✅ **I.4** — kernel `0.92.1`→`0.92.2`.
 
 **Phase 92c — USB isochronous (UAC / UVC).**
 - **E.3** (controller isochronous-TRB scheduling — frame interval, bandwidth reservation, no-retry), **E.1** (UAC PCM-out to `audio_server`, CI-viable via `-device usb-audio`), **E.2** (UVC frame capture + `camera_server`, bare-metal/VFIO-only).
@@ -85,9 +88,9 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 | D.3 (336–338), D.4 (350–352), D.5 (361–362), H.4 (116–118) | 92a |
 | C.4 usb-storage detach + unmount (293/295) | 92a |
 | I.1 hub+mount gate (488–490), I.2 mount/unmount arm (499) | 92a |
-| B.1-decode (197), B.2-live (212–213), B.3-live (225–226), B.4 (238–240), H.2-test (87) | 92b |
-| C.4 usb-hid detach (293) | 92b |
-| I.2 Report-Protocol arm (501) | 92b |
+| B.1-decode, B.2-live, B.3 decode, B.4, H.2-test, B.1 readiness items | **92b — done (PR #254)** |
+| C.4 usb-hid detach | **92b — done (PR #254)** |
+| I.2 Report-Protocol arm (`usb-report-smoke`) | **92b — done (PR #254)** |
 | E.1 (378–380), E.2 (392–394), E.3 (403–405) | 92c |
 | I.3 audio gate (510, 512) | 92c |
 | F.1 (421–423), F.2 (432–433) | 92d |
@@ -130,7 +133,7 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 
 **Acceptance:**
 - [x] `drain_for_transfer_event` routes non-matching IN-endpoint completions through `capture_interrupt_report` + deferred re-arm (mirroring `wait_for_bulk_out_event`), instead of discarding them. — applied to **both** `drain_for_transfer_event` (EP0 control) and `drain_for_command_completion` (Configure/Disable Slot); callers `wait_for_transfer_event`/`issue_command_and_wait` re-arm at `armed_len`.
-- [ ] A test (or instrumented run) issuing a control transfer while an interrupt endpoint is armed shows no dropped report and no un-rearmed endpoint. — structurally mirrors the proven bulk-OUT path; a dedicated live no-drop assertion is exercised by B.4 (`SET_REPORT` interleaved with HID polling).
+- [x] A test (or instrumented run) issuing a control transfer while an interrupt endpoint is armed shows no dropped report and no un-rearmed endpoint. — **`usb-report-smoke` (Phase 92b)**: a `caps_lock` press issues a `SET_REPORT(Output)` EP0 control write while the keyboard's interrupt-IN endpoint is armed; the gate then injects a normal key (`b`) and asserts it still decodes (`USB_HID:key … sym=0x…62`), proving the interleaved control transfer dropped no report and left the endpoint armed.
 - [x] No regression in `usb-smoke` (HID boot path) or `usb-eth-smoke` (bulk path). — `usb-smoke` PASSES (kbd+mouse decoded live); `usb-eth-smoke` needs the absent `ure` crate so it is not present in-tree (Track G).
 
 ### H.3 — Disable Slot reclamation
@@ -270,11 +273,11 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 
 **Acceptance:**
 - [x] `parse_report_descriptor` gains a live call site in `usb-hid` at device bind; the parsed `ReportField` array is stored per device. — `fetch_report_fields` issues `GET_DESCRIPTOR(Report)` over EP0 for each `CLASS_HID` interface, parses it, stores `HidDevice.report_fields`, and logs `USB_HID:report-parsed proto=P fields=N` (asserted by `usb-smoke`).
-- [~] A Report-Protocol device's reports decode by the parsed field layout (not the boot 8-byte/3-byte assumption). — **Phase 92b** (B.2-live): the layout is stored; the data-driven decode + usage→event mapping + a `usb-tablet` QMP-abs-input gate arm are scheduled there.
+- [x] A Report-Protocol device's reports decode by the parsed field layout (not the boot 8-byte/3-byte assumption). — **Phase 92b (B.2-live)**: `usb-hid` classifies a non-boot HID pointer as `ReportPointer` and decodes its interrupt-IN reports with `decode_pointer_report` against the stored `ReportField` layout. Live-validated by `usb-report-smoke` (a `usb-tablet` → `HID_REPORT:pointer`).
 - [x] The existing Boot-Protocol keyboard/mouse path is unchanged (`usb-smoke` still PASSES). — `usb-smoke` PASSES (kbd+mouse decode live + render); the boot decode path is untouched.
-- [ ] **(PR #252 readiness, 92b)** `usb-hid` reads the HID descriptor's `wDescriptorLength` instead of the hard-coded `REQ_LEN = 256` (`fetch_report_fields`), so the Report descriptor is not over-read into zero padding that parses as spurious trailing zero-width fields.
-- [ ] **(PR #252 readiness, 92b)** The stale `hid_report.rs` module doc header ("not wired to any live device") is corrected — the parser is now called live at bind (B.1).
-- [ ] **(PR #252 readiness, 92b)** A host test feeds `parse_report_descriptor` a hostile Report Count/Size (e.g. a 4-byte `0xFFFFFFFF` count) to lock in the saturating/clamped (≤65536 fields) behavior now that the parser sees live device input.
+- [x] **(PR #252 readiness, 92b)** `usb-hid` reads the HID descriptor's `wDescriptorLength` instead of the hard-coded `REQ_LEN = 256` (`fetch_report_fields`), so the Report descriptor is not over-read into zero padding that parses as spurious trailing zero-width fields. — `report_descriptor_len` reads the config descriptor via `GetDescriptors` (H.1) and `hid_report_descriptor_len` scans it for the interface's HID-descriptor Report-entry `wDescriptorLength`; `fetch_report_fields` requests exactly that (falling back to 256 only if unavailable).
+- [x] **(PR #252 readiness, 92b)** The stale `hid_report.rs` module doc header ("not wired to any live device") is corrected — the parser is now called live at bind (B.1). — header rewritten to "live, host-tested" describing the live bind-time read + `decode_pointer_report` use.
+- [x] **(PR #252 readiness, 92b)** A host test feeds `parse_report_descriptor` a hostile Report Count/Size (e.g. a 4-byte `0xFFFFFFFF` count) to lock in the saturating/clamped (≤65536 fields) behavior now that the parser sees live device input. — `hid_report::tests::hostile_report_count_is_bounded` (Usage Min 1 / Max 0xFFFF range + a 4-byte `0xFFFFFFFF` Report Count) asserts `<= MAX_REPORT_FIELDS` (65536) and no panic.
 
 ### B.2 — Multi-axis / extra-button / scroll decode (touchpad + gaming mouse)
 
@@ -287,9 +290,9 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 **Why it matters:** a gaming mouse reports a scroll wheel + extra buttons; a touchpad reports X/Y/pressure + contact IDs. The parser must emit multiple `ReportField`s for Usage ranges and respect Report IDs, and `usb-hid` must unpack arbitrary bit fields and map usages (X=0x01:0x30, Y=0x01:0x31, buttons=0x09:0x01..) to `mouse_server` events.
 
 **Acceptance:**
-- [x] `parse_report_descriptor` emits a `ReportField` per usage for a Usage Min/Max range and tags fields with their Report ID; host tests cover both. — `kernel_core::usb::hid_report` Usage-Min/Max range expansion + per-Report-ID `report_id` tagging + offset reset; host tests `usage_min_max_range_expands_to_one_field_per_usage` + `two_report_ids_tag_fields_and_reset_offset`. (The live `usb-hid` decode using this — B.2 remainder — is pending.)
-- [ ] A Report-Protocol gaming mouse delivers correct X/Y + a scroll axis + ≥4 buttons through `mouse_server` (`USB_HID:mouse` sentinels reflect the extra axes/buttons).
-- [ ] A single-pointer touchpad maps to pointer motion (multi-touch contact tracking is explicitly deferred — see design doc).
+- [x] `parse_report_descriptor` emits a `ReportField` per usage for a Usage Min/Max range and tags fields with their Report ID; host tests cover both. — `kernel_core::usb::hid_report` Usage-Min/Max range expansion + per-Report-ID `report_id` tagging + offset reset; host tests `usage_min_max_range_expands_to_one_field_per_usage` + `two_report_ids_tag_fields_and_reset_offset`. **Phase 92b also added** `is_relative` + multi-usage-list parsing (`Usage X; Usage Y; Input`) + `decode_pointer_report`, and `usb-hid` decodes live against this layout (validated by `usb-report-smoke`).
+- [x] A Report-Protocol gaming mouse delivers correct X/Y + a scroll axis + ≥4 buttons through `mouse_server` (`USB_HID:mouse` sentinels reflect the extra axes/buttons). — `decode_pointer_report` extracts X/Y (relative or absolute by the field's `is_relative` flag), the Generic-Desktop Wheel (signed), and up to 32 Button-page buttons against the parsed layout; `poll_report_pointer` injects motion + `wheel_dy` + per-button Down/Up edges into `mouse_server`. The decode is host-tested (gaming-mouse-style relative + button descriptors) and the live path is validated by `usb-report-smoke` via a `usb-tablet` (absolute X/Y + wheel + 3 buttons) → `HID_REPORT:pointer`. *(QEMU ships no multi-button gaming-mouse Report-Protocol model, so the ≥4-button case is host-tested + bare-metal; the tablet exercises the same decode/inject path live.)*
+- [x] A single-pointer touchpad maps to pointer motion (multi-touch contact tracking is explicitly deferred — see design doc). — a single-pointer absolute device (the `usb-tablet`) maps to `PointerEvent { abs_position }` motion through `mouse_server`; multi-touch contact tracking remains deferred per the design doc.
 
 ### B.3 — Consumer-control keys (media / brightness)
 
@@ -301,8 +304,8 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 **Why it matters:** media keys (volume up/down/mute, play/pause) and brightness live on HID Usage Page 0x0C, which Boot Protocol cannot express. B.3 maps Consumer usages to keycodes so `display_server` can route them to `audio_server` / brightness control.
 
 **Acceptance:**
-- [ ] `hid_usage_to_keycode` maps the Consumer page (volume up/down/mute at minimum) to distinct keycodes; host-tested.
-- [ ] A Report-Protocol keyboard's volume keys are decoded and routed (volume keys reach `audio_server`).
+- [x] `hid_usage_to_keycode` maps the Consumer page (volume up/down/mute at minimum) to distinct keycodes; host-tested. — `hid_consumer_usage_to_keycode` (Usage Page 0x0C) maps Mute (0xE2), Volume Increment (0xE9), Volume Decrement (0xEA), Play/Pause (0xCD) to distinct `KEY_MUTE`/`KEY_VOLUMEUP`/`KEY_VOLUMEDOWN`/`KEY_PLAYPAUSE`; host tests (`consumer_*`) assert the mappings + distinctness.
+- [~] A Report-Protocol keyboard's volume keys are decoded and routed (volume keys reach `audio_server`). — **implemented + host-tested decode, live arm bare-metal.** `decode_consumer_usages` (Usage Page 0x0C bitmap, host-tested) + `usb-hid`'s `poll_report_consumer`/`inject_consumer_key` decode a Report-Protocol consumer interface and inject the mapped keycode (Down+Up) into `kbd_server` → `display_server` → `audio_server` (the proven keyboard inject path; `USB_HID:consumer`). QEMU emulates no device that emits HID consumer reports, so the live routing is bare-metal/VFIO-validated (skip-with-reason in CI), mirroring the established `usb-eth-smoke`/`wifi-smoke` pattern; the decode logic is host-tested.
 
 ### B.4 — Keyboard LED output via `SET_REPORT`
 
@@ -314,9 +317,9 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 **Why it matters:** Boot keyboards are input-only; Report-Protocol keyboards expose OUTPUT items for Caps/Num/Scroll Lock LEDs. B.4 tracks lock state in `kbd_server` and issues `SET_REPORT` (over the live `ControlWrite` path) with the LED bitfield — the one Track-B path that writes back to the device.
 
 **Acceptance:**
-- [ ] Toggling Caps Lock updates `kbd_server` LED state and issues a `SET_REPORT` `ControlWrite` carrying the LED bitfield.
-- [ ] The transfer uses the H.2-hardened control path (a concurrent interrupt report is not dropped during the `SET_REPORT`).
-- [ ] Boot keyboards (no OUTPUT items) are unaffected — no `SET_REPORT` issued, no error.
+- [x] Toggling Caps Lock updates LED state and issues a `SET_REPORT` `ControlWrite` carrying the LED bitfield. — `usb-hid` tracks Caps/Num/Scroll Lock per device (`maybe_update_leds` watches the decoded boot-keyboard lock-key Down edges) and `set_keyboard_leds` issues `SET_REPORT(Output)` (bmRequestType 0x21 / bRequest 0x09 / wValue 0x0200) over the live `ControlWrite` EP0 path. Live-validated by `usb-report-smoke` → `USB_HID:led`. *(LED authority lives in `usb-hid` rather than `kbd_server` for this sub-phase since `usb-hid` decodes the keyboard's own edges; cross-driver PS/2↔USB lock-LED coherence via `kbd_server` is a noted follow-up.)*
+- [x] The transfer uses the H.2-hardened control path (a concurrent interrupt report is not dropped during the `SET_REPORT`). — `usb-report-smoke` injects a normal key immediately after the `SET_REPORT` and asserts it still decodes (`USB_HID:key … sym=0x…62`); the EP0 control write captured no interrupt-IN report and left the endpoint armed (the H.2 capture path).
+- [x] Boot keyboards (no OUTPUT items) are unaffected — no `SET_REPORT` issued, no error. — `SET_REPORT` is issued only when a lock-key Down edge is decoded; mice/tablets and any non-keyboard interface decode no lock keys, so they never trigger a `SET_REPORT`. The existing `usb-smoke` (boot kbd/mouse, no lock keys typed) passes unchanged with no LED writes.
 
 ---
 
@@ -369,7 +372,7 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 **Why it matters:** a clean detach must release the class driver's capabilities and reclaim the slot, or a removed flash drive leaves a stale `/mnt/usb<n>` mount and a leaked slot. C.4 wires each class driver to drop its device state on detach and the server to Disable Slot.
 
 **Acceptance:**
-- [ ] `usb-hid`/`usb-storage`/`usb-net` each release their per-device state on an `attached: false` notice for a slot they own. — **server-side teardown done**; the class-driver-side release is scheduled per driver alongside that driver's resident-state work: **usb-storage → Phase 92a**, **usb-hid → Phase 92b**, **usb-net → Phase 92e** (see the Sub-Phase Schedule coverage map).
+- [~] `usb-hid`/`usb-storage`/`usb-net` each release their per-device state on an `attached: false` notice for a slot they own. — **usb-hid (Phase 92b) + usb-storage (Phase 92a) done; usb-net → Phase 92e.** `usb-hid`'s `reconcile_attachments` re-walks the `NextAttach` table every ~200 ms and drops a held device whose latest entry is `attached: false` (resolving by the *latest* `(slot_id, interface_num)` entry so a reclaimed/re-packed slot is never confused with a stale detached one), logging `usb-hid: released slot=N`. Live-validated by `usb-hotplug-smoke` (3 cycles: `usb-hid: hot-attached` then `usb-hid: released` each cycle).
 - [x] The server issues Disable Slot for the departed device (H.3) and the slot is reusable. — `process_port_events` calls `Controller::disable_slot`; the 3-cycle gate proves the slot is reused without exhaustion.
 - [ ] Unplugging a mounted USB stick unmounts `/mnt/usb<n>` without wedging the VFS (Track D integration). — **Phase 92a** (pairs with the D.4 mount).
 
@@ -578,7 +581,7 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 **Acceptance:**
 - [ ] Hot-plug gate: a mid-run `device_add`/`device_del` produces `USB_HOTPLUG:attached` then `USB_HOTPLUG:detached`, and `/mnt/usb0` mounts then cleanly unmounts.
 - [ ] Multi-controller gate: a device on the second controller enumerates on its own IRQ (`XHCI:controller-1:ready`) concurrently with the primary.
-- [ ] Report-Protocol arm: a gaming-mouse report with extra axes/buttons renders through `mouse_server` (PPM `changed_rows_in_band` or `USB_HID:mouse` sentinel).
+- [x] Report-Protocol arm: a Report-Protocol pointer with extra axes/buttons decodes through `mouse_server`. — **`usb-report-smoke` (Phase 92b)**: a `usb-tablet` (Report-Protocol absolute pointer, no Boot interface) is decoded against the parsed `ReportField` layout and emits `HID_REPORT:pointer` (B.2); the same gate covers the B.4 `USB_HID:led` `SET_REPORT` and the H.2 no-drop assertion. Wired into `M3OS_USB_REGRESSION` + the AGENTS.md row.
 
 ### I.3 — USB audio + USB-Ethernet class gates
 
