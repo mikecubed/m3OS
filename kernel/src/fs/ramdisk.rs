@@ -232,6 +232,10 @@ static USB_HID_ELF: &[u8] = generated_initrd_asset!("usb_hid");
 static USB_STORAGE_ELF: &[u8] = generated_initrd_asset!("usb_storage");
 /// Phase 92c Track E: ring-3 USB Audio Class (UAC) isochronous PCM-out driver.
 static USB_AUDIO_ELF: &[u8] = generated_initrd_asset!("usb_audio");
+/// Phase 92c Track E.2: ring-3 USB Video Class (UVC) frame-capture driver.
+static USB_VIDEO_ELF: &[u8] = generated_initrd_asset!("usb_video");
+/// Phase 92c Track E.2: ring-3 camera IPC server (UVC frame aggregator).
+static CAMERA_SERVER_ELF: &[u8] = generated_initrd_asset!("camera_server");
 // Phase 55b Track F.3b: NVMe crash-and-restart end-to-end smoke client.
 // Exposed under /bin so the QEMU regression can launch it from the shell.
 static NVME_CRASH_SMOKE_ELF: &[u8] = generated_initrd_asset!("nvme-crash-smoke");
@@ -1372,6 +1376,21 @@ static DRIVERS_ENTRIES: &[(&str, RamdiskNode)] = &[
         "usb-audio",
         RamdiskNode::File {
             content: USB_AUDIO_ELF,
+        },
+    ),
+    // Phase 92c Track E.2: ring-3 USB Video Class (UVC) frame-capture driver.
+    (
+        "usb-video",
+        RamdiskNode::File {
+            content: USB_VIDEO_ELF,
+        },
+    ),
+    // Phase 92c Track E.2: ring-3 camera IPC server (UVC frame aggregator).
+    // Lives under /drivers/ so `is_authorized_driver_process` admits it.
+    (
+        "camera_server",
+        RamdiskNode::File {
+            content: CAMERA_SERVER_ELF,
         },
     ),
 ];

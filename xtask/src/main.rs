@@ -1541,6 +1541,9 @@ fn build_userspace_bins() {
         // Phase 92c Track E: ring-3 USB Audio Class (UAC) isochronous PCM-out
         // driver. `needs_alloc = true` for driver_runtime + kernel-core + usb-core.
         ("usb_audio", "usb_audio", true),
+        // Phase 92c Track E.2: ring-3 USB Video Class (UVC) frame-capture
+        // driver. `needs_alloc = true` for kernel-core + usb-core deps.
+        ("usb_video", "usb_video", true),
         // Phase 80 Track A.5: ring-3 AC'97 out-of-process audio hardware driver.
         // `needs_alloc = true` for driver_runtime + kernel-core deps.
         ("ac97_driver", "ac97_driver", true),
@@ -1601,6 +1604,11 @@ fn build_userspace_bins() {
         // on `kernel-core` (audio types + protocol codec) and
         // `driver_runtime` (DmaBuffer<T>, IrqNotification).
         ("audio_server", "audio_server", true),
+        // Phase 92c Track E.2 — camera_server daemon (UVC frame
+        // aggregator IPC server).  `needs_alloc = true` because the
+        // binary depends on `kernel-core` (camera_ipc codec) and
+        // `driver_runtime` (SyscallBackend / IpcBackend).
+        ("camera_server", "camera_server", true),
         // Phase 57 Track E.2 — audio reference demo.  `needs_alloc =
         // true` because the binary depends on `audio_client`, which
         // pulls in `kernel-core` (audio protocol codec) at the alloc
@@ -6128,7 +6136,7 @@ fn cmd_check() {
     stat_assembly_gate();
 
     println!(
-        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, ac97_driver, hda_driver, ahci_driver, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, shadow, ldso_core, wifi-core, mt792x_driver, m3ctl, xhci_driver, usb-core, pkg-format, xtask, and pkg host tests pass; doom platform-layer C tests pass; retpoline indirect-branch gate pass; stat-assembly gate pass"
+        "check passed: clippy clean, formatting correct, kernel-core (incl. usb::uvc + camera_ipc), passwd, driver_runtime, audio_client, audio_server, ac97_driver, hda_driver, ahci_driver, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, shadow, ldso_core, wifi-core, mt792x_driver, m3ctl, xhci_driver, usb-core, pkg-format, xtask, and pkg host tests pass; doom platform-layer C tests pass; retpoline indirect-branch gate pass; stat-assembly gate pass"
     );
 }
 
@@ -22579,6 +22587,14 @@ fn populate_ext2_files(
     // driver. Depends on xhci_driver (for the `usb` service); registers
     // `audio.hw` so audio_server binds it as the PCM sink on a USB-audio machine.
     let usb_audio_conf = "name=usb_audio\ncommand=/drivers/usb-audio\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=xhci_driver\n";
+    // Phase 92c Track E.2 — ring-3 USB Video Class (UVC) frame-capture driver.
+    // Depends on xhci_driver (for the `usb` service); exits cleanly (rc 0) when
+    // no CLASS_VIDEO device is present (QEMU has no UVC model).
+    let usb_video_conf = "name=usb_video\ncommand=/drivers/usb-video\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=xhci_driver\n";
+    // Phase 92c Track E.2 — ring-3 camera IPC server (UVC frame aggregator).
+    // Registers the "camera" service; no xhci_driver dependency since it can
+    // start independently and waits for usb-video to push frames.
+    let camera_server_conf = "name=camera_server\ncommand=/drivers/camera_server\ntype=daemon\nrestart=on-failure\nmax_restart=5\n";
     // Phase 80 Track A.5 — ring-3 AC'97 out-of-process audio hardware driver.
     // No `depends=` (device-host substrate is kernel-internal); must start
     // before audio_server so `audio.hw` is registered when audio_server resolves it.
@@ -22972,6 +22988,8 @@ fn populate_ext2_files(
     let usb_hid_conf_tmp = output_dir.join("_tmp_usb_hid_conf");
     let usb_storage_conf_tmp = output_dir.join("_tmp_usb_storage_conf");
     let usb_audio_conf_tmp = output_dir.join("_tmp_usb_audio_conf");
+    let usb_video_conf_tmp = output_dir.join("_tmp_usb_video_conf");
+    let camera_server_conf_tmp = output_dir.join("_tmp_camera_server_conf");
     let ac97_driver_conf_tmp = output_dir.join("_tmp_ac97_driver_conf");
     let hda_driver_conf_tmp = output_dir.join("_tmp_hda_driver_conf");
     let ahci_driver_conf_tmp = output_dir.join("_tmp_ahci_driver_conf");
@@ -23037,6 +23055,8 @@ fn populate_ext2_files(
     fs::write(&usb_hid_conf_tmp, usb_hid_conf).expect("write temp usb-hid.conf");
     fs::write(&usb_storage_conf_tmp, usb_storage_conf).expect("write temp usb-storage.conf");
     fs::write(&usb_audio_conf_tmp, usb_audio_conf).expect("write temp usb-audio.conf");
+    fs::write(&usb_video_conf_tmp, usb_video_conf).expect("write temp usb-video.conf");
+    fs::write(&camera_server_conf_tmp, camera_server_conf).expect("write temp camera_server.conf");
     fs::write(&ac97_driver_conf_tmp, ac97_driver_conf).expect("write temp ac97.conf");
     fs::write(&hda_driver_conf_tmp, hda_driver_conf).expect("write temp hda.conf");
     fs::write(&ahci_driver_conf_tmp, ahci_driver_conf).expect("write temp ahci_driver.conf");
@@ -23880,6 +23900,14 @@ fn populate_ext2_files(
          sif etc/services.d/usb-audio.conf mode 0x81A4\n\
          sif etc/services.d/usb-audio.conf uid 0\n\
          sif etc/services.d/usb-audio.conf gid 0\n\
+         write \"{usb_video_conf}\" etc/services.d/usb-video.conf\n\
+         sif etc/services.d/usb-video.conf mode 0x81A4\n\
+         sif etc/services.d/usb-video.conf uid 0\n\
+         sif etc/services.d/usb-video.conf gid 0\n\
+         write \"{camera_server_conf}\" etc/services.d/camera_server.conf\n\
+         sif etc/services.d/camera_server.conf mode 0x81A4\n\
+         sif etc/services.d/camera_server.conf uid 0\n\
+         sif etc/services.d/camera_server.conf gid 0\n\
          write \"{ac97_driver_conf}\" etc/services.d/ac97.conf\n\
          sif etc/services.d/ac97.conf mode 0x81A4\n\
          sif etc/services.d/ac97.conf uid 0\n\
@@ -23953,6 +23981,8 @@ fn populate_ext2_files(
         usb_hid_conf = usb_hid_conf_tmp.display(),
         usb_storage_conf = usb_storage_conf_tmp.display(),
         usb_audio_conf = usb_audio_conf_tmp.display(),
+        usb_video_conf = usb_video_conf_tmp.display(),
+        camera_server_conf = camera_server_conf_tmp.display(),
         ac97_driver_conf = ac97_driver_conf_tmp.display(),
         hda_driver_conf = hda_driver_conf_tmp.display(),
         ahci_driver_conf = ahci_driver_conf_tmp.display(),

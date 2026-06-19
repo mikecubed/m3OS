@@ -14,4 +14,5 @@ pub mod hid_report;
 pub mod hub;
 pub mod mass_storage;
 pub mod uac;
+pub mod uvc;
 pub mod xhci;

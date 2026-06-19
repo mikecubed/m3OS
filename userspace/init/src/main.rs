@@ -218,6 +218,10 @@ const KNOWN_CONFIGS: &[&[u8]] = &[
     b"/etc/services.d/usb-storage.conf\0",
     // Phase 92c Track E: ring-3 USB Audio Class (UAC) isochronous PCM-out driver.
     b"/etc/services.d/usb-audio.conf\0",
+    // Phase 92c Track E.2: ring-3 USB Video Class (UVC) frame-capture driver.
+    b"/etc/services.d/usb-video.conf\0",
+    // Phase 92c Track E.2: ring-3 camera IPC server (UVC frame aggregator).
+    b"/etc/services.d/camera_server.conf\0",
     // Phase 56 Track C: display server (compositor).
     b"/etc/services.d/display_server.conf\0",
     // Phase 57 Track F.2: session_manager daemon.

@@ -28,7 +28,7 @@ use alloc::vec::Vec;
 use driver_runtime::IrqNotification;
 use driver_runtime::ipc::{EndpointCap, IpcBackend, RecvResult, SyscallBackend};
 use kernel_core::usb::descriptor::{
-    CLASS_AUDIO, CLASS_HID, CLASS_HUB, TRANSFER_TYPE_BULK, TRANSFER_TYPE_INTERRUPT,
+    CLASS_AUDIO, CLASS_HID, CLASS_HUB, CLASS_VIDEO, TRANSFER_TYPE_BULK, TRANSFER_TYPE_INTERRUPT,
     TRANSFER_TYPE_ISOCH,
 };
 use kernel_core::usb::enumerate::EnumContext;
@@ -102,8 +102,10 @@ pub fn device_info_from_ctx(ctx: &EnumContext) -> Option<AttachNotice> {
         let mut bulk_out_dci = 0u8;
         let mut bulk_out_mps = 0u16;
         // Phase 92c Track E: track whether this interface carries an
-        // isochronous OUT endpoint (the UAC PCM-out streaming endpoint).
+        // isochronous OUT endpoint (the UAC PCM-out streaming endpoint) or an
+        // isochronous IN endpoint (the UVC frame-capture endpoint).
         let mut isoch_out_present = false;
+        let mut isoch_in_present = false;
 
         for ep in &iface.endpoints {
             let is_in = ep.b_endpoint_address & 0x80 != 0;
@@ -125,6 +127,9 @@ pub fn device_info_from_ctx(ctx: &EnumContext) -> Option<AttachNotice> {
                 (TRANSFER_TYPE_ISOCH, false) => {
                     isoch_out_present = true;
                 }
+                (TRANSFER_TYPE_ISOCH, true) => {
+                    isoch_in_present = true;
+                }
                 _ => {}
             }
         }
@@ -140,6 +145,13 @@ pub fn device_info_from_ctx(ctx: &EnumContext) -> Option<AttachNotice> {
         // `GetDescriptors` round-trip (the isoch endpoint fields are not on the
         // fixed-width AttachNotice wire format).
         let audio_surfaceable = i.b_interface_class == CLASS_AUDIO && isoch_out_present;
+        // Phase 92c Track E.2: surface the UVC VideoStreaming interface (the alt
+        // setting carrying a capture IN endpoint — isochronous, or bulk-IN with
+        // no OUT pair) so the `usb-video` daemon can bind it via `NextAttach`.
+        // Like the audio case, `usb-video` resolves the IN endpoint DCI itself
+        // via `GetDescriptors`. (Bare-metal/VFIO-only — QEMU has no UVC model.)
+        let video_surfaceable =
+            i.b_interface_class == CLASS_VIDEO && (isoch_in_present || bulk_in_dci != 0);
         // Phase 92 Track A: surface CLASS_HUB interfaces so the `usbhub` daemon
         // can bind a hub via the `NextAttach` walk and drive it (GET_DESCRIPTOR
         // (Hub) + per-port PORT_POWER/PORT_RESET over EP0 `ControlRequest`). A hub
@@ -155,6 +167,8 @@ pub fn device_info_from_ctx(ctx: &EnumContext) -> Option<AttachNotice> {
         } else if hub_surfaceable {
             1
         } else if audio_surfaceable {
+            1
+        } else if video_surfaceable {
             1
         } else {
             continue;
