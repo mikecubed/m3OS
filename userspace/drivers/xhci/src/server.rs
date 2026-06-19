@@ -687,26 +687,38 @@ fn handle_request(
             shm_id,
             len,
             dir_in: _,
-        } => match owner!(slot_id) {
-            Some((c, irq, slot)) => match c.map_shm(shm_id) {
-                Some(iova) => {
-                    let res = c.submit_bulk_iova(irq, slot, target_dci, iova, len);
-                    c.unmap_shm(iova);
-                    match res {
-                        Some(transferred) => UsbReply::TransferComplete {
-                            transferred,
-                            completion_code: 1,
-                        },
-                        None => UsbReply::TransferComplete {
-                            transferred: 0,
-                            completion_code: 0xFF,
-                        },
-                    }
+        } => {
+            // Defense-in-depth: reject a caller-supplied `len` that exceeds the
+            // shm region's actual size BEFORE any TRB is programmed at it.
+            // Otherwise `len > shm_size(shm_id)` makes the controller DMA past
+            // the end of the mapped region — and with `--iommu` off / identity
+            // fallback there is no hardware backstop to contain the overrun. An
+            // unknown/invalid shm_id (`shm_size` → None) is rejected too.
+            if !matches!(syscall_lib::shm_size(shm_id), Some(sz) if (len as usize) <= sz) {
+                UsbReply::Error { code: EINVAL }
+            } else {
+                match owner!(slot_id) {
+                    Some((c, irq, slot)) => match c.map_shm(shm_id) {
+                        Some(iova) => {
+                            let res = c.submit_bulk_iova(irq, slot, target_dci, iova, len);
+                            c.unmap_shm(iova);
+                            match res {
+                                Some(transferred) => UsbReply::TransferComplete {
+                                    transferred,
+                                    completion_code: 1,
+                                },
+                                None => UsbReply::TransferComplete {
+                                    transferred: 0,
+                                    completion_code: 0xFF,
+                                },
+                            }
+                        }
+                        None => UsbReply::Error { code: EINVAL },
+                    },
+                    None => UsbReply::Error { code: EINVAL },
                 }
-                None => UsbReply::Error { code: EINVAL },
-            },
-            None => UsbReply::Error { code: EINVAL },
-        },
+            }
+        }
         // GetDescriptors / ConfigureEndpoints / SubmitTransfer (page-grant) are
         // not needed by the live paths — descriptors are pre-resolved into
         // AttachNotice during enumeration; endpoints are configured at bring-up.
