@@ -10920,6 +10920,12 @@ fn cmd_usb_storage_smoke(args: &SmokeBootArgs) {
         // the bidirectional data path (data-OUT over SubmitBulkOut + data-IN over
         // SubmitBulkIn) the RemoteBlockDevice facade (D.4) is built on.
         wait("USB_STORAGE:rw-ok")?;
+        // Phase 92a H.4 / D.5 — a 16-sector (8192-byte) WRITE(10)+READ(10), larger
+        // than the ~4092-byte inline budget, completes in a SINGLE descriptor over
+        // a shared-memory region the xHCI device DMAs directly (zero-copy
+        // SubmitShmTransfer → sys_device_dma_map_shm → IOMMU-mapped shm), verified
+        // byte-identical. Proves the kernel IOMMU-map-shm syscall end-to-end.
+        wait("USB_STORAGE:shm-dma-ok")?;
         Ok(())
     })();
 
@@ -10932,8 +10938,10 @@ fn cmd_usb_storage_smoke(args: &SmokeBootArgs) {
             println!(
                 "usb-storage-smoke: PASSED ({elapsed}s) — usb-storage bound the mass-storage \
                  device, completed a BOT CBW/CSW round-trip (GET_MAX_LUN + TEST UNIT READY), read \
-                 INQUIRY + READ CAPACITY over the synchronous SubmitBulkIn data-IN path, and \
-                 verified a WRITE(10)+READ(10) sector round-trip byte-identical"
+                 INQUIRY + READ CAPACITY over the synchronous SubmitBulkIn data-IN path, verified a \
+                 WRITE(10)+READ(10) sector round-trip byte-identical, and (H.4) ran a 16-sector \
+                 (8192-byte, > USB_MSG_MAX) zero-copy WRITE+READ over an IOMMU-mapped shared-memory \
+                 region (SubmitShmTransfer → sys_device_dma_map_shm) verified byte-identical"
             );
         }
         Err(msg) => {

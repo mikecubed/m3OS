@@ -674,10 +674,41 @@ fn handle_request(
                 None => UsbReply::Error { code: EINVAL },
             }
         }
-        // GetDescriptors / ConfigureEndpoints / SubmitTransfer are not needed by
-        // the live HID-boot path (descriptors are pre-resolved into AttachNotice
-        // during enumeration; endpoints are configured at bring-up). The
-        // page-grant `SubmitTransfer` path remains for Phase 90 (mass storage).
+        // Phase 92a H.4 — zero-copy bulk transfer over a shared-memory region.
+        // The server IOMMU-maps the shm into the xHCI device domain and programs
+        // a single bulk TRB straight at it (no inline USB_MSG_MAX copy), so a
+        // transfer larger than the 4096-byte inline budget completes in one
+        // descriptor. `dir_in` is informational — the endpoint's DCI selects the
+        // direction.
+        UsbRequest::SubmitShmTransfer {
+            slot_id,
+            dci: target_dci,
+            shm_id,
+            len,
+            dir_in: _,
+        } => match owner!(slot_id) {
+            Some((c, irq, slot)) => match c.map_shm(shm_id) {
+                Some(iova) => {
+                    let res = c.submit_bulk_iova(irq, slot, target_dci, iova, len);
+                    c.unmap_shm(iova);
+                    match res {
+                        Some(transferred) => UsbReply::TransferComplete {
+                            transferred,
+                            completion_code: 1,
+                        },
+                        None => UsbReply::TransferComplete {
+                            transferred: 0,
+                            completion_code: 0xFF,
+                        },
+                    }
+                }
+                None => UsbReply::Error { code: EINVAL },
+            },
+            None => UsbReply::Error { code: EINVAL },
+        },
+        // GetDescriptors / ConfigureEndpoints / SubmitTransfer (page-grant) are
+        // not needed by the live paths — descriptors are pre-resolved into
+        // AttachNotice during enumeration; endpoints are configured at bring-up.
         _ => UsbReply::Error { code: ENOSYS },
     }
 }

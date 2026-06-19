@@ -1650,8 +1650,8 @@ mod syscall_nr {
     pub use kernel_core::device_host::syscalls::{
         DEVICE_HOST_BASE, DEVICE_HOST_LAST, SYS_DEVICE_CLAIM, SYS_DEVICE_CONFIG_READ,
         SYS_DEVICE_CONFIG_WRITE, SYS_DEVICE_DMA_ALLOC, SYS_DEVICE_DMA_HANDLE_INFO,
-        SYS_DEVICE_IRQ_SUBSCRIBE, SYS_DEVICE_MMIO_MAP, SYS_DEVICE_PCI_ENUMERATE,
-        SYS_DEVICE_PIO_READ, SYS_DEVICE_PIO_WRITE,
+        SYS_DEVICE_DMA_MAP_SHM, SYS_DEVICE_DMA_UNMAP_SHM, SYS_DEVICE_IRQ_SUBSCRIBE,
+        SYS_DEVICE_MMIO_MAP, SYS_DEVICE_PCI_ENUMERATE, SYS_DEVICE_PIO_READ, SYS_DEVICE_PIO_WRITE,
     };
 
     // -- Phase 84 Spectre mitigations (Track D.3 reporter / C.4 STIBP opt-in) --
@@ -2400,6 +2400,22 @@ pub extern "C" fn syscall_handler(
                 ) as u64
             }
         }
+        SYS_DEVICE_DMA_MAP_SHM => {
+            // Signature (Phase 92a H.4): sys_device_dma_map_shm(dev_cap: CapHandle, shm_id: u32) -> isize.
+            if arg0 > u64::from(u32::MAX) || arg1 > u64::from(u32::MAX) {
+                NEG_EINVAL
+            } else {
+                crate::syscall::device_host::sys_device_dma_map_shm(arg0 as u32, arg1 as u32) as u64
+            }
+        }
+        SYS_DEVICE_DMA_UNMAP_SHM => {
+            // Signature (Phase 92a H.4): sys_device_dma_unmap_shm(dev_cap: CapHandle, iova: u64) -> isize.
+            if arg0 > u64::from(u32::MAX) {
+                NEG_EINVAL
+            } else {
+                crate::syscall::device_host::sys_device_dma_unmap_shm(arg0 as u32, arg1) as u64
+            }
+        }
         // -- Phase 84 Spectre mitigations --
         SYS_MITIGATIONS_STATUS => sys_mitigations_status(arg0, arg1),
         SYS_SET_SPEC_CTRL => sys_set_spec_ctrl(arg0),
@@ -2930,6 +2946,12 @@ fn do_full_process_exit(pid: crate::process::Pid, code: i32) -> ! {
     // destroyed by `PciDeviceHandle::drop` and the IOVA unmap would be a
     // no-op against a freed domain.
     let _ = crate::syscall::device_host::release_dma_for_pid(pid);
+
+    // Phase 92a H.4: tear down any zero-copy shm→device IOMMU mappings this
+    // process installed (sys_device_dma_map_shm), BEFORE the device claims are
+    // released — same ordering rationale as release_dma_for_pid: the IOVA unmap
+    // must run against a still-live IOMMU domain.
+    crate::syscall::device_host::release_shm_dma_maps_for_pid(pid);
 
     // Phase 55b Track B.1: release every `Capability::Device` held by this
     // process so the supervisor (Phase 46 / Phase 51) can restart a fresh

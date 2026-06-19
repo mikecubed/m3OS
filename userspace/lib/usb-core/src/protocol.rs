@@ -344,6 +344,29 @@ pub enum UsbRequest {
         /// (matches `kernel_core::usb::hub::DOWNSTREAM_SPEED_*`).
         speed: u8,
     },
+
+    /// **Zero-copy** bulk transfer over a shared-memory region (Phase 92a H.4).
+    ///
+    /// The class driver creates an shm region (`sys_shm_create`), fills it (for
+    /// an OUT) or leaves it for the device to fill (for an IN), and sends its
+    /// `shm_id`. The server IOMMU-maps the region into the xHCI device domain
+    /// (`sys_device_dma_map_shm`) and programs a single bulk TRB straight at it
+    /// — no inline `USB_MSG_MAX` copy, so a transfer larger than the 4096-byte
+    /// inline budget completes in one descriptor. The class driver reads the
+    /// result (for an IN) directly from its own mapping of the same region.
+    SubmitShmTransfer {
+        /// Target slot ID.
+        slot_id: u8,
+        /// Device Context Index of the bulk endpoint (its direction selects
+        /// IN vs OUT).
+        dci: u8,
+        /// Shared-memory region id (from the class driver's `sys_shm_create`).
+        shm_id: u32,
+        /// Number of bytes to transfer (≤ the region length).
+        len: u32,
+        /// `true` for a bulk-IN (device → shm), `false` for bulk-OUT (shm → device).
+        dir_in: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -573,6 +596,7 @@ const REQ_SUBMIT_BULK_OUT: u8 = 9;
 const REQ_TOPOLOGY: u8 = 10;
 const REQ_SUBMIT_BULK_IN: u8 = 11;
 const REQ_ENUMERATE_CHILD: u8 = 12;
+const REQ_SUBMIT_SHM_TRANSFER: u8 = 13;
 
 // --- reply tags ---
 const REP_DESCRIPTORS: u8 = 1;
@@ -794,6 +818,20 @@ impl UsbRequest {
                 v.push(*root_hub_port);
                 v.push(*speed);
             }
+            UsbRequest::SubmitShmTransfer {
+                slot_id,
+                dci,
+                shm_id,
+                len,
+                dir_in,
+            } => {
+                v.push(REQ_SUBMIT_SHM_TRANSFER);
+                v.push(*slot_id);
+                v.push(*dci);
+                put_u32(&mut v, *shm_id);
+                put_u32(&mut v, *len);
+                v.push(*dir_in as u8);
+            }
         }
         v
     }
@@ -869,6 +907,13 @@ impl UsbRequest {
                 route_string: r.u32()?,
                 root_hub_port: r.u8()?,
                 speed: r.u8()?,
+            },
+            REQ_SUBMIT_SHM_TRANSFER => UsbRequest::SubmitShmTransfer {
+                slot_id: r.u8()?,
+                dci: r.u8()?,
+                shm_id: r.u32()?,
+                len: r.u32()?,
+                dir_in: r.u8()? != 0,
             },
             _ => return None,
         })
@@ -1182,6 +1227,13 @@ mod tests {
                 route_string: 0x0001_2345,
                 root_hub_port: 7,
                 speed: 2,
+            },
+            UsbRequest::SubmitShmTransfer {
+                slot_id: 3,
+                dci: 4,
+                shm_id: 0x00AB_CDEF,
+                len: 8192,
+                dir_in: true,
             },
         ];
         for r in reqs {

@@ -212,6 +212,28 @@ pub const SYS_DEVICE_CONFIG_READ: u64 = 0x1128;
 /// - `-ESRCH` (`-3`): kernel context (PID 0).
 pub const SYS_DEVICE_CONFIG_WRITE: u64 = 0x1129;
 
+/// IOMMU-map a **shared-memory region** (created via `sys_shm_create`) into a
+/// claimed device's IOMMU domain so the device can DMA into/out of it
+/// zero-copy. Phase 92a H.4 —
+/// `sys_device_dma_map_shm(dev_cap, shm_id) -> isize`.
+///
+/// The shm region is a physically-contiguous frame run shared by integer id, so
+/// both the owning class driver (which fills/reads it) and the host driver's
+/// device (which DMAs it) see the same memory — the zero-copy substrate the USB
+/// `SubmitTransfer` path needs without a per-transfer inline copy. The caller
+/// must own `dev_cap` (a `Capability::Device` claim). On success the region is
+/// ref-pinned and the **device IOVA** (>= 0) the caller programs into a transfer
+/// descriptor is returned; the caller already knows the region length. Errors:
+/// `-EBADF` (bad cap), `-EPERM` (caller does not own the claim), `-ENODEV` (no
+/// such shm id), `-EIO` (IOMMU map failed).
+pub const SYS_DEVICE_DMA_MAP_SHM: u64 = 0x112A;
+
+/// Tear down a mapping installed by [`SYS_DEVICE_DMA_MAP_SHM`], removing the
+/// device-domain IOMMU entry and dropping the shm ref. Phase 92a H.4 —
+/// `sys_device_dma_unmap_shm(dev_cap, iova) -> isize`. The IOVA identifies the
+/// mapping. Returns 0 or a negated errno (`-EBADF`/`-EINVAL`).
+pub const SYS_DEVICE_DMA_UNMAP_SHM: u64 = 0x112B;
+
 /// Sentinel passed as `notification_arg` (arg3) of [`SYS_DEVICE_IRQ_SUBSCRIBE`]
 /// to request that the kernel allocate a fresh `Notification` object on the
 /// caller's behalf, rather than binding the IRQ to an existing notification
@@ -245,7 +267,7 @@ pub const DEVICE_HOST_BASE: u64 = SYS_DEVICE_CLAIM;
 ///
 /// Adjust upward when adding new device-host syscalls; the Track B acceptance
 /// items pin this constant as the authoritative upper bound.
-pub const DEVICE_HOST_LAST: u64 = SYS_DEVICE_CONFIG_WRITE;
+pub const DEVICE_HOST_LAST: u64 = SYS_DEVICE_DMA_UNMAP_SHM;
 
 #[cfg(test)]
 mod tests {
@@ -269,6 +291,10 @@ mod tests {
         assert_eq!(SYS_DEVICE_CONFIG_READ, 0x1128);
         // Phase 80c Track F.1 — claim-gated PCI config-space write.
         assert_eq!(SYS_DEVICE_CONFIG_WRITE, 0x1129);
+        // Phase 92a H.4 — IOMMU-map / unmap a shared-memory region for device DMA.
+        assert_eq!(SYS_DEVICE_DMA_MAP_SHM, 0x112A);
+        assert_eq!(SYS_DEVICE_DMA_UNMAP_SHM, 0x112B);
+        assert_eq!(DEVICE_HOST_LAST, SYS_DEVICE_DMA_UNMAP_SHM);
     }
 
     #[test]
@@ -284,6 +310,8 @@ mod tests {
             SYS_DEVICE_PCI_ENUMERATE,
             SYS_DEVICE_CONFIG_READ,
             SYS_DEVICE_CONFIG_WRITE,
+            SYS_DEVICE_DMA_MAP_SHM,
+            SYS_DEVICE_DMA_UNMAP_SHM,
         ];
         for (i, a) in all.iter().enumerate() {
             for (j, b) in all.iter().enumerate() {
@@ -307,6 +335,8 @@ mod tests {
             SYS_DEVICE_PCI_ENUMERATE,
             SYS_DEVICE_CONFIG_READ,
             SYS_DEVICE_CONFIG_WRITE,
+            SYS_DEVICE_DMA_MAP_SHM,
+            SYS_DEVICE_DMA_UNMAP_SHM,
         ];
         for n in all {
             assert!(
@@ -329,7 +359,10 @@ mod tests {
         assert_eq!(SYS_DEVICE_CONFIG_READ, SYS_DEVICE_PCI_ENUMERATE + 1);
         // Phase 80c Track F.1 pin: CONFIG_WRITE follows CONFIG_READ without gap.
         assert_eq!(SYS_DEVICE_CONFIG_WRITE, SYS_DEVICE_CONFIG_READ + 1);
-        assert_eq!(DEVICE_HOST_LAST, SYS_DEVICE_CONFIG_WRITE);
+        // Phase 92a H.4 pin: the shm-DMA map/unmap pair closes the block.
+        assert_eq!(SYS_DEVICE_DMA_MAP_SHM, SYS_DEVICE_CONFIG_WRITE + 1);
+        assert_eq!(SYS_DEVICE_DMA_UNMAP_SHM, SYS_DEVICE_DMA_MAP_SHM + 1);
+        assert_eq!(DEVICE_HOST_LAST, SYS_DEVICE_DMA_UNMAP_SHM);
     }
 
     #[test]

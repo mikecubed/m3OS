@@ -25,7 +25,8 @@ use core::mem::size_of;
 
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 use kernel_core::device_host::syscalls::{
-    SYS_DEVICE_CLAIM, SYS_DEVICE_DMA_ALLOC, SYS_DEVICE_DMA_HANDLE_INFO, SYS_DEVICE_MMIO_MAP,
+    SYS_DEVICE_CLAIM, SYS_DEVICE_DMA_ALLOC, SYS_DEVICE_DMA_HANDLE_INFO, SYS_DEVICE_DMA_MAP_SHM,
+    SYS_DEVICE_DMA_UNMAP_SHM, SYS_DEVICE_MMIO_MAP,
 };
 use kernel_core::device_host::{DeviceCapKey, DeviceHostError, DmaHandle};
 use kernel_core::driver_runtime::contract::DriverRuntimeError;
@@ -137,6 +138,52 @@ pub(crate) unsafe fn raw_sys_device_dma_alloc(
     #[cfg(not(all(target_arch = "x86_64", target_os = "none")))]
     {
         let _ = (dev_cap, size, align);
+        -38
+    }
+}
+
+/// `sys_device_dma_map_shm(dev_cap, shm_id) -> isize` (Phase 92a H.4).
+///
+/// IOMMU-maps a shared-memory region into the claimed device's domain and
+/// returns its device IOVA (>= 0), or a negated errno.
+///
+/// # Safety
+///
+/// Caller must pass a valid `Capability::Device` handle.
+#[inline]
+pub(crate) unsafe fn raw_sys_device_dma_map_shm(dev_cap: CapHandle, shm_id: u32) -> isize {
+    #[cfg(all(target_arch = "x86_64", target_os = "none"))]
+    // SAFETY: plain-integer args; validated kernel-side.
+    unsafe {
+        syscall_lib::syscall2(
+            SYS_DEVICE_DMA_MAP_SHM,
+            u64::from(dev_cap),
+            u64::from(shm_id),
+        ) as isize
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_os = "none")))]
+    {
+        let _ = (dev_cap, shm_id);
+        -38
+    }
+}
+
+/// `sys_device_dma_unmap_shm(dev_cap, iova) -> isize` (Phase 92a H.4).
+///
+/// # Safety
+///
+/// Caller must pass a valid `Capability::Device` handle and an `iova` previously
+/// returned by [`raw_sys_device_dma_map_shm`].
+#[inline]
+pub(crate) unsafe fn raw_sys_device_dma_unmap_shm(dev_cap: CapHandle, iova: u64) -> isize {
+    #[cfg(all(target_arch = "x86_64", target_os = "none"))]
+    // SAFETY: plain-integer args; validated kernel-side.
+    unsafe {
+        syscall_lib::syscall2(SYS_DEVICE_DMA_UNMAP_SHM, u64::from(dev_cap), iova) as isize
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_os = "none")))]
+    {
+        let _ = (dev_cap, iova);
         -38
     }
 }

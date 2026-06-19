@@ -595,8 +595,166 @@ fn run_scratch_self_test(usb_ep: u32, notice: &AttachNotice, cap: &ReadCapacity1
                 STDOUT_FILENO,
                 "usb-storage: READ(10) self-test verify mismatch\n",
             );
+            return;
         }
     }
+    // Phase 92a H.4 / D.5 — zero-copy DMA over a shared-memory region.
+    if blocks > SCRATCH_LBA + 24 {
+        shm_dma_self_test(usb_ep, notice);
+    }
+}
+
+/// Submit a **zero-copy** bulk data stage over a shared-memory region and block
+/// for completion (Phase 92a H.4 `SubmitShmTransfer`). The xHCI server maps the
+/// region into the device's IOMMU domain and programs one TRB straight at it —
+/// no inline `USB_MSG_MAX` copy. Returns the transferred byte count.
+#[cfg(not(test))]
+fn submit_shm(
+    usb_ep: u32,
+    slot_id: u8,
+    dci: u8,
+    shm_id: u32,
+    len: u32,
+    dir_in: bool,
+) -> Option<usize> {
+    match usb_call(
+        usb_ep,
+        &UsbRequest::SubmitShmTransfer {
+            slot_id,
+            dci,
+            shm_id,
+            len,
+            dir_in,
+        },
+    ) {
+        Some(UsbReply::TransferComplete {
+            transferred,
+            completion_code: 1,
+        }) => Some(transferred),
+        _ => None,
+    }
+}
+
+/// BOT WRITE(10) whose data-OUT stage is a single zero-copy shm transfer.
+#[cfg(not(test))]
+fn bot_write_shm(
+    usb_ep: u32,
+    notice: &AttachNotice,
+    cdb: &[u8],
+    shm_id: u32,
+    len: u32,
+) -> Option<u8> {
+    let slot_id = notice.slot_id;
+    let tag = next_tag();
+    let cbw = Cbw::new(tag, len, false, 0, cdb);
+    if !bulk_out(usb_ep, slot_id, notice.bulk_out_dci, &cbw.encode()) {
+        return None;
+    }
+    submit_shm(usb_ep, slot_id, notice.bulk_out_dci, shm_id, len, false)?;
+    let csw = Csw::parse(&submit_bulk_in(
+        usb_ep,
+        slot_id,
+        notice.bulk_in_dci,
+        CSW_LEN as u16,
+    )?)?;
+    if csw.tag != tag {
+        return None;
+    }
+    Some(csw.status)
+}
+
+/// BOT READ(10) whose data-IN stage is a single zero-copy shm transfer.
+#[cfg(not(test))]
+fn bot_read_shm(
+    usb_ep: u32,
+    notice: &AttachNotice,
+    cdb: &[u8],
+    shm_id: u32,
+    len: u32,
+) -> Option<u8> {
+    let slot_id = notice.slot_id;
+    let tag = next_tag();
+    let cbw = Cbw::new(tag, len, true, 0, cdb);
+    if !bulk_out(usb_ep, slot_id, notice.bulk_out_dci, &cbw.encode()) {
+        return None;
+    }
+    submit_shm(usb_ep, slot_id, notice.bulk_in_dci, shm_id, len, true)?;
+    let csw = Csw::parse(&submit_bulk_in(
+        usb_ep,
+        slot_id,
+        notice.bulk_in_dci,
+        CSW_LEN as u16,
+    )?)?;
+    if csw.tag != tag {
+        return None;
+    }
+    Some(csw.status)
+}
+
+/// Zero-copy DMA self-test (Phase 92a H.4 / D.5): WRITE(10) then READ(10) a
+/// **16-sector (8192-byte)** payload — larger than the ~4092-byte inline budget
+/// — through a single shared-memory region the xHCI device DMAs into/out of
+/// directly, and verify the round-trip byte-identical. Proves the zero-copy
+/// `SubmitShmTransfer` path moves a >`USB_MSG_MAX` transfer in one descriptor.
+/// Emits `USB_STORAGE:shm-dma-ok`.
+#[cfg(not(test))]
+fn shm_dma_self_test(usb_ep: u32, notice: &AttachNotice) {
+    const SECTORS: u16 = 16;
+    const NBYTES: usize = SECTORS as usize * 512;
+    const TEST_LBA: u32 = SCRATCH_LBA + 8;
+    let shm_id = syscall_lib::shm_create(NBYTES);
+    if shm_id == 0 {
+        write_str(STDOUT_FILENO, "usb-storage: shm_create failed\n");
+        return;
+    }
+    let va = syscall_lib::shm_map(shm_id);
+    if va == u64::MAX || va == 0 {
+        write_str(STDOUT_FILENO, "usb-storage: shm_map failed\n");
+        return;
+    }
+    let buf = va as *mut u8;
+    // Fill the shared buffer with a recognizable pattern.
+    for i in 0..NBYTES {
+        // SAFETY: the shm region is NBYTES bytes mapped writable at `va`.
+        unsafe { buf.add(i).write_volatile((i as u8) ^ 0x3C) };
+    }
+    // WRITE(10) the shm to the device (zero-copy data-OUT — device reads the shm).
+    if bot_write_shm(
+        usb_ep,
+        notice,
+        &cdb_write10(TEST_LBA, SECTORS),
+        shm_id,
+        NBYTES as u32,
+    ) != Some(0)
+    {
+        write_str(STDOUT_FILENO, "usb-storage: shm WRITE failed\n");
+        return;
+    }
+    // Clear the buffer, then READ(10) back into it (zero-copy data-IN).
+    for i in 0..NBYTES {
+        // SAFETY: as above.
+        unsafe { buf.add(i).write_volatile(0) };
+    }
+    if bot_read_shm(
+        usb_ep,
+        notice,
+        &cdb_read10(TEST_LBA, SECTORS),
+        shm_id,
+        NBYTES as u32,
+    ) != Some(0)
+    {
+        write_str(STDOUT_FILENO, "usb-storage: shm READ failed\n");
+        return;
+    }
+    // Verify the device DMA'd the original pattern back into the shared buffer.
+    for i in 0..NBYTES {
+        // SAFETY: as above.
+        if unsafe { buf.add(i).read_volatile() } != ((i as u8) ^ 0x3C) {
+            write_str(STDOUT_FILENO, "usb-storage: shm DMA verify mismatch\n");
+            return;
+        }
+    }
+    write_str(STDOUT_FILENO, "USB_STORAGE:shm-dma-ok\n");
 }
 
 // ---------------------------------------------------------------------------
