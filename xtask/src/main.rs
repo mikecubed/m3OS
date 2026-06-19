@@ -730,6 +730,18 @@ fn main() {
             });
             cmd_usb_smoke(&smoke_args);
         }
+        // Phase 92b Track B — HID Report Protocol: a usb-tablet (no Boot
+        // interface) decodes via the parsed ReportField layout (B.2), Caps Lock
+        // drives a SET_REPORT LED write (B.4), no interrupt-IN drop (H.2).
+        Some("usb-report-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("usb-report-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_usb_report_smoke(&smoke_args);
+        }
         // Phase 92 Track C — USB hot-plug: device_add/device_del a usb-mouse
         // mid-run over QMP and assert the live attach/detach + Disable Slot path.
         Some("usb-hotplug-smoke") => {
@@ -10421,6 +10433,185 @@ fn cmd_usb_smoke(args: &SmokeBootArgs) {
     }
 }
 
+/// Phase 92b Track B — HID **Report Protocol** acceptance gate (I.2 arm).
+///
+/// Boots m3OS with `-device qemu-xhci` (+ the default `usb-kbd`/`usb-mouse`) plus
+/// an extra `-device usb-tablet` — a Report-Protocol absolute-pointer device with
+/// no Boot interface, so `usb-hid` must decode it against the parsed
+/// `ReportField` layout (`decode_pointer_report`, B.2) rather than the fixed
+/// boot offsets. Asserts, in causal order:
+///
+/// 1. `XHCI_USB:server-ready` — the USB IPC server is up.
+/// 2. `usb-hid: polling` — the class driver finished boot enumeration.
+/// 3. **B.2:** a QMP `abs` pointer event drives the `usb-tablet`; `usb-hid`
+///    decodes the variable-format report and emits `HID_REPORT:pointer` — a live
+///    Report-Protocol pointer decode (the tablet's X/Y are absolute and its
+///    report carries buttons + a wheel the parser laid out).
+/// 4. **B.4:** a QMP `caps_lock` press toggles the keyboard LED state and
+///    `usb-hid` issues a `SET_REPORT` (Output) control-write the device ACKs →
+///    `USB_HID:led`.
+/// 5. **H.2:** a normal key (`b`) injected right after the `SET_REPORT` still
+///    decodes (`USB_HID:key … sym=0x00000062`), proving the interleaved control
+///    transfer did not drop the armed interrupt-IN report / leave it un-rearmed.
+///
+/// Opt-in pre-push gate via `M3OS_USB_REGRESSION=1`.
+fn cmd_usb_report_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+    let ovmf = find_ovmf();
+
+    let qmp_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&qmp_socket);
+
+    let devices = DeviceSet {
+        xhci: true,
+        ..DeviceSet::default()
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, QemuDisplayMode::Headless, devices);
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    // Add a Report-Protocol absolute pointer (no Boot interface) alongside the
+    // boot kbd/mouse the xhci device set already attached.
+    qemu_args.push("-device".to_string());
+    qemu_args.push("usb-tablet,bus=xhci0.0".to_string());
+    qemu_args.push("-qmp".to_string());
+    qemu_args.push(format!("unix:{},server,nowait", qmp_socket.display()));
+
+    println!(
+        "usb-report-smoke: launching QEMU with -device qemu-xhci + usb-kbd + usb-mouse + \
+         usb-tablet (timeout {}s, qmp {})",
+        args.timeout_secs,
+        qmp_socket.display()
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let rx = spawn_serial_reader(stdout);
+    let mut serial_history = String::new();
+    let mut serial_buf = String::new();
+    let global_start = std::time::Instant::now();
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let step = std::time::Duration::from_secs(args.timeout_secs.min(180));
+
+    let result: Result<(), String> = (|| {
+        let mut wait = |pat: &str| {
+            wait_for_serial_pattern(
+                &rx,
+                &mut serial_buf,
+                &mut serial_history,
+                pat,
+                step,
+                global_start,
+                global_timeout,
+            )
+        };
+        wait("XHCI_USB:server-ready")?;
+        wait("usb-hid: polling")?;
+        println!("usb-report-smoke: USB stack ready — driving QMP abs pointer + caps lock");
+
+        let qmp_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut q = qmp::QmpClient::connect(&qmp_socket, qmp_deadline)
+            .map_err(|e| format!("qmp connect: {e}"))?;
+
+        // (B.2) Drive the tablet with absolute positions and assert usb-hid
+        // decoded a Report-Protocol pointer report against the parsed layout.
+        // The tablet only emits a report in response to an injected event, so
+        // injection strictly precedes the observation; nudge the position each
+        // attempt so a repeated identical abs value cannot be coalesced away.
+        let mut decoded = false;
+        for attempt in 0..6 {
+            let x = 8_000 + attempt * 2_000;
+            let y = 6_000 + attempt * 1_500;
+            q.send_pointer_abs(x, y)
+                .map_err(|e| format!("qmp abs pointer: {e}"))?;
+            if wait("HID_REPORT:pointer").is_ok() {
+                decoded = true;
+                break;
+            }
+            println!("usb-report-smoke: tablet report not yet observed (attempt {attempt})");
+        }
+        if !decoded {
+            return Err("usb-tablet Report-Protocol pointer never decoded by usb-hid".to_string());
+        }
+        println!("usb-report-smoke: B.2 — Report-Protocol pointer decoded (usb-tablet)");
+
+        // (B.4) Toggle Caps Lock and assert usb-hid wrote the LED state back via
+        // SET_REPORT (the device ACKed completion_code 1).
+        let mut led_ok = false;
+        for attempt in 0..5 {
+            q.press_key("caps_lock", 40)
+                .map_err(|e| format!("qmp caps_lock: {e}"))?;
+            if wait("USB_HID:led").is_ok() {
+                led_ok = true;
+                break;
+            }
+            println!("usb-report-smoke: LED SET_REPORT not yet observed (attempt {attempt})");
+        }
+        if !led_ok {
+            return Err("Caps Lock did not drive a SET_REPORT LED write".to_string());
+        }
+        println!("usb-report-smoke: B.4 — Caps Lock LED SET_REPORT issued + ACKed");
+
+        // (H.2) A normal key right after the interleaved SET_REPORT must still
+        // decode — the control write did not drop the armed interrupt-IN report.
+        let mut nodrop = false;
+        for attempt in 0..5 {
+            q.press_key("b", 40)
+                .map_err(|e| format!("qmp key b: {e}"))?;
+            if wait("USB_HID:key kind=0 sym=0x00000062").is_ok() {
+                nodrop = true;
+                break;
+            }
+            println!("usb-report-smoke: post-SET_REPORT key not yet observed (attempt {attempt})");
+        }
+        if !nodrop {
+            return Err("key after SET_REPORT was dropped (H.2 interleave regression)".to_string());
+        }
+        println!("usb-report-smoke: H.2 — interrupt-IN not dropped across the SET_REPORT");
+        Ok(())
+    })();
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&qmp_socket);
+    match result {
+        Ok(()) => {
+            let elapsed = global_start.elapsed().as_secs();
+            println!(
+                "usb-report-smoke: PASSED ({elapsed}s) — Report-Protocol pointer decoded (B.2), \
+                 Caps Lock LED SET_REPORT (B.4), no interrupt-IN drop across the control write (H.2)"
+            );
+        }
+        Err(msg) => {
+            eprintln!("usb-report-smoke: FAILED\n{msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Phase 92 Track C — USB hot-plug acceptance gate.
 ///
 /// Boots m3OS with `-device qemu-xhci` (+ the default `usb-kbd`/`usb-mouse`),
@@ -10546,6 +10737,20 @@ fn cmd_usb_hotplug_smoke(args: &SmokeBootArgs) {
                 global_timeout,
             )
             .map_err(|e| format!("cycle {cycle} (attach): {e}"))?;
+            // Phase 92b C.4 (usb-hid arm): the class driver re-walks NextAttach
+            // and binds the hot-added device. Waiting on its pickup before the
+            // device_del also makes the detach-release deterministic (usb-hid
+            // must hold the device to release it).
+            wait_for_serial_pattern(
+                &rx,
+                &mut serial_buf,
+                &mut serial_history,
+                "usb-hid: hot-attached",
+                step,
+                global_start,
+                global_timeout,
+            )
+            .map_err(|e| format!("cycle {cycle} (usb-hid attach): {e}"))?;
 
             // (4) Hot-remove it; the disconnect must flip the AttachNotice to
             // attached:false and reclaim the slot via Disable Slot.
@@ -10561,7 +10766,21 @@ fn cmd_usb_hotplug_smoke(args: &SmokeBootArgs) {
                 global_timeout,
             )
             .map_err(|e| format!("cycle {cycle} (detach): {e}"))?;
-            println!("usb-hotplug-smoke: cycle {cycle} attach+detach OK (slot reclaimed)");
+            // Phase 92b C.4: usb-hid observes the attached:false notice and
+            // releases the departed device's per-device state.
+            wait_for_serial_pattern(
+                &rx,
+                &mut serial_buf,
+                &mut serial_history,
+                "usb-hid: released",
+                step,
+                global_start,
+                global_timeout,
+            )
+            .map_err(|e| format!("cycle {cycle} (usb-hid release): {e}"))?;
+            println!(
+                "usb-hotplug-smoke: cycle {cycle} attach+detach OK (slot reclaimed, usb-hid released)"
+            );
 
             // Let QEMU settle the port-down before the next device_add reuses it.
             std::thread::sleep(std::time::Duration::from_millis(300));

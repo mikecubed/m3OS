@@ -325,6 +325,13 @@ if [ "${M3OS_USB_REGRESSION:-0}" = "1" ]; then
     # the kbd_server/mouse_server inject path, or kernel-core/src/usb/hid.
     echo "pre-push: running cargo xtask usb-smoke..."
     cargo xtask usb-smoke --timeout 160
+    # Phase 92b — HID Report Protocol: a usb-tablet decodes via the parsed
+    # ReportField layout (B.2 → HID_REPORT:pointer), Caps Lock drives a
+    # SET_REPORT LED write (B.4 → USB_HID:led), and a key after the control write
+    # still decodes (H.2 no-drop). usb-hotplug-smoke also asserts the usb-hid C.4
+    # detach release. Set additionally for branches touching kernel-core/usb/hid_report.
+    echo "pre-push: running cargo xtask usb-report-smoke..."
+    cargo xtask usb-report-smoke --timeout 180
     # Phase 92 core — hot-plug, mass-storage transport, and hub bring-up gates.
     echo "pre-push: running cargo xtask usb-hotplug-smoke..."
     cargo xtask usb-hotplug-smoke --timeout 220
