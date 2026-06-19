@@ -372,9 +372,11 @@ pub enum UsbRequest {
     /// PCM) and block for completion. The payload travels inline (a UAC period
     /// fits within `USB_MSG_MAX`; the `usb-audio` driver chunks a larger
     /// `audio_server` submission across several of these). Returns
-    /// [`UsbReply::TransferComplete`] with the byte count; an underrun / missed
-    /// service interval reports a transferred count of 0 rather than an error,
-    /// since isochronous transfers have no retry. Phase 92c (Track E).
+    /// [`UsbReply::TransferComplete`] with the byte count. Isochronous transfers
+    /// have no retry, so a ring-underrun / missed-service-interval completion is
+    /// non-fatal and the submitted bytes are still counted as delivered (the
+    /// full byte count is returned); only a genuine transaction error / STALL
+    /// fails the transfer. Phase 92c (Track E).
     SubmitIsochOut {
         /// Target slot ID.
         slot_id: u8,

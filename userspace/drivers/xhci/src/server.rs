@@ -611,8 +611,9 @@ fn handle_request(
             },
         },
         // Phase 92c Track E — isochronous-OUT for USB audio (UAC PCM-out). One
-        // service interval of PCM, scheduled SIA (Start Isoch ASAP); an underrun
-        // / missed interval reports transferred=0 (no retry) rather than failing.
+        // service interval of PCM, scheduled SIA (Start Isoch ASAP); a ring-
+        // underrun / missed interval is non-fatal (no retry) and the submitted
+        // bytes are still counted as delivered, rather than failing.
         UsbRequest::SubmitIsochOut {
             slot_id,
             dci: target_dci,

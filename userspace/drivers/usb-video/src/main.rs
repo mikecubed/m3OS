@@ -206,6 +206,22 @@ fn program_main(_args: &[&str]) -> i32 {
         },
     );
 
+    // `find_video_stream` prefers a bulk alt-setting but falls back to an
+    // isochronous one (`bulk_candidate.or(isoch_candidate)`). The capture loop
+    // below only drives bulk endpoints (`SubmitBulkIn` queues Normal TRBs);
+    // xHCI requires Isoch TRBs for an isochronous endpoint, so submitting on an
+    // isoch endpoint never completes and the loop would spin forever. Isoch-IN
+    // capture is a documented bare-metal/VFIO deferral (no QEMU UVC model), so
+    // exit cleanly here rather than busy-loop — matching the "no device found —
+    // exiting cleanly" rc-0 pattern used above.
+    if stream.is_isoch {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "usb-video: isochronous-IN capture not yet implemented — exiting cleanly\n",
+        );
+        return 0;
+    }
+
     // 4. SET_INTERFACE if alt > 0 (isochronous camera: zero-bandwidth idle on
     // alt 0; bulk camera: endpoint is already on alt 0, skip).
     if stream.alt_setting > 0 {
@@ -342,34 +358,28 @@ fn program_main(_args: &[&str]) -> i32 {
 
 /// Forward a captured frame to `camera_server` via IPC.
 ///
-/// This is a best-effort fire-and-forget: if camera_server is not ready the
-/// frame is dropped and capture continues.  A failure here must never stall
-/// the capture loop.
+/// Best-effort fire-and-forget: this uses send-shaped IPC (`ipc_send_buf`, no
+/// reply cap) so a slow or busy `camera_server` can never stall the capture
+/// loop. If camera_server is not ready the frame is dropped and capture
+/// continues. `camera_server` correspondingly skips its reply for send-shaped
+/// pushes (it only replies when a reply cap is present).
 #[cfg(not(test))]
 fn forward_frame_to_camera(cam_ep: u32, seq: u64, data: &[u8]) {
-    use kernel_core::usb::uvc::camera_ipc::{CameraReply, CameraRequest};
+    use kernel_core::usb::uvc::camera_ipc::CameraRequest;
 
     let req = CameraRequest::PushFrame {
         seq,
         len: data.len() as u32,
     };
     let req_bytes = req.encode();
-    let rc = syscall_lib::ipc_call_buf(
+    // Send, not call: do not wait for an ack. A dropped frame on a transient
+    // send failure is acceptable for live video, so the result is ignored.
+    let _ = syscall_lib::ipc_send_buf(
         cam_ep,
         kernel_core::usb::uvc::camera_ipc::CAMERA_REQ_LABEL,
         0,
         &req_bytes,
     );
-    if rc == u64::MAX {
-        return;
-    }
-    let mut reply_buf = [0u8; 64];
-    let n = syscall_lib::ipc_take_pending_bulk(&mut reply_buf);
-    if n == u64::MAX {
-        return;
-    }
-    // The response is just an acknowledgment; we don't block on it.
-    let _ = CameraReply::decode(&reply_buf[..n as usize]);
 }
 
 // ---------------------------------------------------------------------------

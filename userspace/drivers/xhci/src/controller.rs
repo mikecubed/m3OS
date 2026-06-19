@@ -1993,13 +1993,22 @@ impl Controller {
             ep.data_bufs[0] = new_buf;
         }
         // Copy the whole payload into the DMA buffer once; TRBs point into it at
-        // mps-sized offsets.
+        // mps-sized offsets. A single `copy_nonoverlapping` is used rather than a
+        // per-byte volatile loop on this periodic audio hot path; the subsequent
+        // doorbell MMIO write (a volatile store) orders these buffer stores ahead
+        // of the controller being told to read the ring.
         let base_iova = {
             let sc = self.slot_mut(slot_id)?;
             let ep = sc.interrupt_eps.iter_mut().find(|e| e.dci == dci)?;
-            for (i, &b) in data.iter().enumerate() {
-                // SAFETY: data_bufs[0] was (re)allocated to >= data.len(); i < data.len().
-                unsafe { core::ptr::write_volatile(ep.data_bufs[0].user_ptr().add(i), b) };
+            // SAFETY: data_bufs[0] was (re)allocated to >= data.len() above, the
+            // source and destination regions are distinct, and u8 has no
+            // alignment requirement.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    ep.data_bufs[0].user_ptr(),
+                    data.len(),
+                );
             }
             ep.data_bufs[0].iova()
         };

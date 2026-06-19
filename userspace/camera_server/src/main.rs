@@ -154,11 +154,18 @@ fn program_main(_args: &[&str]) -> i32 {
                     Some(req) => state.handle(req),
                     None => CameraReply::NoFrame,
                 };
-                let reply_bytes = reply.encode();
-                // Stage bulk payload then reply (mirrors audio_server / blk
-                // drivers: store_reply_bulk → reply).
-                let _ = backend.store_reply_bulk(&reply_bytes);
-                let _ = backend.reply(CAMERA_REQ_LABEL, 0);
+                // Only reply when the client used call-shaped IPC (a reply cap
+                // is present). `usb-video` pushes frames with send-shaped IPC
+                // (no reply cap), for which `SyscallBackend::reply` would error
+                // on a zero handle — so staging + replying would be wasted work
+                // every frame. Gate on the frame's reply cap.
+                if frame.reply_cap_handle != 0 {
+                    let reply_bytes = reply.encode();
+                    // Stage bulk payload then reply (mirrors audio_server / blk
+                    // drivers: store_reply_bulk → reply).
+                    let _ = backend.store_reply_bulk(&reply_bytes);
+                    let _ = backend.reply(CAMERA_REQ_LABEL, 0);
+                }
             }
             Ok(RecvResult::Notification(_)) => {
                 // No notifications bound; nothing to service.
