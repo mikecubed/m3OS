@@ -345,6 +345,13 @@ const COMPLETION_SHORT_PACKET: u8 = 13;
 /// on the next interval; this is **not** a transport failure.
 const COMPLETION_MISSED_SERVICE_ERROR: u8 = 26;
 
+/// xHCI Ring Underrun completion code (xHCI §6.4.5) — posted on an isochronous
+/// OUT endpoint when the controller's periodic scheduler finds the transfer
+/// ring empty (the producer hasn't queued the next interval yet). For a
+/// fire-and-forget audio-OUT stream this is the expected steady-state event
+/// between interval submissions, **not** a transport failure.
+const COMPLETION_RING_UNDERRUN: u8 = 14;
+
 impl Controller {
     /// Read the capability registers and compute the runtime register-region
     /// bases. No MMIO writes happen here.
@@ -1941,19 +1948,21 @@ impl Controller {
     /// PCM out to the device.
     ///
     /// `data` is copied into the endpoint's `data_bufs[0]` source buffer (grown
-    /// on demand — an OUT endpoint has `depth` = 1 so it only uses buffer 0), a
-    /// single **Isoch TRB** is enqueued with **SIA = 1** (Start Isoch ASAP — the
-    /// controller schedules the TD on the next available (micro)frame, so the
-    /// host needs no Frame-ID bookkeeping), the doorbell is rung, and the
-    /// Transfer Event awaited (reusing the bulk-OUT drain so a concurrent IN
-    /// completion is captured, not dropped).
+    /// on demand) and split into **one Isoch TRB per `wMaxPacketSize`-sized
+    /// frame** — a full-speed isochronous TD carries at most `mps` bytes per
+    /// (micro)frame, so a single oversized TD is rejected (STALL/NAK) by the
+    /// device. Each TRB is enqueued with **SIA = 1** (Start Isoch ASAP — the
+    /// controller schedules it on the next available frame, so the host needs no
+    /// Frame-ID bookkeeping). Frames are queued in bounded batches (≤
+    /// `ISOCH_BATCH_FRAMES`, well within the transfer + event rings); the
+    /// doorbell is rung once per batch and the batch's completions drained.
     ///
-    /// Isochronous transfers have **no retry**: a `Missed Service Error` /
-    /// `Ring Underrun` completion means the service interval elapsed before the
-    /// controller could service the endpoint, so that interval's data is simply
-    /// dropped. That is reported as `Some(0)` (the caller resynchronises on the
-    /// next interval), **not** a hard error. `None` is returned only on timeout
-    /// or a genuine transport STALL.
+    /// Isochronous transfers have **no retry**: a `Ring Underrun` (the periodic
+    /// scheduler found the ring empty between batches) or `Missed Service`
+    /// completion is the expected steady-state event, not a transport failure —
+    /// the audio backend's clock, not a per-frame handshake, governs flow. Such
+    /// frames are counted as delivered. Returns the byte count submitted, or
+    /// `None` on a genuine transport STALL / timeout.
     pub fn submit_isoch_out(
         &mut self,
         irq: &IrqNotification,
@@ -1961,14 +1970,18 @@ impl Controller {
         dci: u8,
         data: &[u8],
     ) -> Option<usize> {
-        let len = data.len() as u32;
-        if len == 0 {
+        /// Frames queued per doorbell — bounded so a batch never laps the 64-TRB
+        /// transfer ring nor floods the 64-entry event ring before it is drained.
+        const ISOCH_BATCH_FRAMES: usize = 16;
+
+        if data.is_empty() {
             return Some(0);
         }
-        // Grow the OUT data buffer if needed (disjoint borrow from self.handle).
-        let need_grow = match self.slot(slot_id) {
+        // Resolve the endpoint's max-packet size and grow the source buffer to
+        // hold the whole payload (disjoint borrow from self.handle).
+        let (mps, need_grow) = match self.slot(slot_id) {
             Some(sc) => match sc.interrupt_eps.iter().find(|e| e.dci == dci) {
-                Some(ep) => data.len() > ep.data_bufs[0].len(),
+                Some(ep) => ((ep.mps as usize).max(1), data.len() > ep.data_bufs[0].len()),
                 None => return None,
             },
             None => return None,
@@ -1979,51 +1992,71 @@ impl Controller {
             let ep = sc.interrupt_eps.iter_mut().find(|e| e.dci == dci)?;
             ep.data_bufs[0] = new_buf;
         }
-        {
+        // Copy the whole payload into the DMA buffer once; TRBs point into it at
+        // mps-sized offsets.
+        let base_iova = {
             let sc = self.slot_mut(slot_id)?;
             let ep = sc.interrupt_eps.iter_mut().find(|e| e.dci == dci)?;
-            // Copy the PCM interval into the DMA buffer.
             for (i, &b) in data.iter().enumerate() {
                 // SAFETY: data_bufs[0] was (re)allocated to >= data.len(); i < data.len().
                 unsafe { core::ptr::write_volatile(ep.data_bufs[0].user_ptr().add(i), b) };
             }
-            let cycle = ep.producer.cycle;
-            write_trb(
-                &ep.ring,
-                ep.producer.enqueue,
-                trb::Trb::isoch(ep.data_bufs[0].iova(), len, 0, true, cycle),
-            );
-            let cycle_before = ep.producer.cycle;
-            if ep.producer.advance() {
-                let iova = ep.ring_iova;
-                write_trb(
-                    &ep.ring,
-                    ep.producer.link_index(),
-                    trb::Trb::link(iova, true, cycle_before),
-                );
-            }
-        }
-        self.ring_doorbell(slot_id, dci);
-        match self.wait_for_bulk_out_event(irq, slot_id, dci) {
-            Some(ev)
-                if ev.completion_code == trb::COMPLETION_SUCCESS
-                    || ev.completion_code == COMPLETION_SHORT_PACKET =>
+            ep.data_bufs[0].iova()
+        };
+
+        let len = data.len();
+        let mut offset = 0usize;
+        while offset < len {
+            // Queue a batch of mps-sized isoch TRBs.
+            let mut batch = 0usize;
             {
-                let residual = ev.residual_transfer_length.min(len) as usize;
-                Some((len as usize).saturating_sub(residual))
+                let sc = self.slot_mut(slot_id)?;
+                let ep = sc.interrupt_eps.iter_mut().find(|e| e.dci == dci)?;
+                while offset < len && batch < ISOCH_BATCH_FRAMES {
+                    let chunk = (len - offset).min(mps) as u32;
+                    let cycle = ep.producer.cycle;
+                    write_trb(
+                        &ep.ring,
+                        ep.producer.enqueue,
+                        trb::Trb::isoch(base_iova + offset as u64, chunk, 0, true, cycle),
+                    );
+                    let cycle_before = ep.producer.cycle;
+                    if ep.producer.advance() {
+                        let ring_iova = ep.ring_iova;
+                        write_trb(
+                            &ep.ring,
+                            ep.producer.link_index(),
+                            trb::Trb::link(ring_iova, true, cycle_before),
+                        );
+                    }
+                    offset += chunk as usize;
+                    batch += 1;
+                }
             }
-            // Isoch has no retry: a missed service interval / ring underrun is a
-            // dropped interval, not a failure — report 0 transferred so the
-            // caller resyncs on the next interval rather than tearing down.
-            Some(ev) if ev.completion_code == COMPLETION_MISSED_SERVICE_ERROR => Some(0),
-            Some(ev) => {
-                write_str(STDOUT_FILENO, "[xhci] isoch-OUT non-success cc=");
-                crate::write_u8_dec(ev.completion_code);
-                write_str(STDOUT_FILENO, "\n");
-                None
+            if batch == 0 {
+                break;
             }
-            None => None,
+            self.ring_doorbell(slot_id, dci);
+            // Drain this batch's completions. One `wait_for_bulk_out_event` pass
+            // drains all currently-owned events; isoch completion codes
+            // (Success/Short/Ring-Underrun/Missed-Service) are all non-fatal. A
+            // genuine STALL/transaction error aborts the stream.
+            match self.wait_for_bulk_out_event(irq, slot_id, dci) {
+                Some(ev)
+                    if ev.completion_code == trb::COMPLETION_SUCCESS
+                        || ev.completion_code == COMPLETION_SHORT_PACKET
+                        || ev.completion_code == COMPLETION_RING_UNDERRUN
+                        || ev.completion_code == COMPLETION_MISSED_SERVICE_ERROR => {}
+                Some(ev) => {
+                    write_str(STDOUT_FILENO, "[xhci] isoch-OUT non-success cc=");
+                    crate::write_u8_dec(ev.completion_code);
+                    write_str(STDOUT_FILENO, "\n");
+                    return None;
+                }
+                None => return None,
+            }
         }
+        Some(len)
     }
 
     /// Block for the bulk-OUT Transfer Event on (`slot_id`, `dci`). Unlike the

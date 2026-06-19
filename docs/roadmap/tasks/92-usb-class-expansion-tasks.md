@@ -458,9 +458,9 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 **Why it matters:** USB speakers/headsets carry PCM over a full-speed isochronous OUT endpoint. E.1 schedules isoch TRBs and forwards `audio_server`'s mixed PCM to the device, presenting a USB sink through the same policy/mixer seam the on-board codecs use.
 
 **Acceptance:**
-- [ ] `usb-audio` binds a `CLASS_AUDIO` (0x01) streaming interface, sets the active alt-setting (sample rate), and schedules isochronous OUT TRBs.
-- [ ] `audio_server` lists the USB sink alongside AC'97/HDA; a PCM stream plays through it.
-- [ ] Targets UAC 1.0 full-speed isochronous only (feedback endpoints / UAC 2.0 deferred — design doc).
+- [x] `usb-audio` binds a `CLASS_AUDIO` (0x01) streaming interface, sets the active alt-setting (sample rate), and schedules isochronous OUT TRBs. — the `usb-audio` daemon walks `NextAttach` for the `CLASS_AUDIO` interface the xHCI server now surfaces (it carries an isoch OUT endpoint), `GetDescriptors` + `kernel_core::usb::uac::find_isoch_out_stream` resolves the isoch OUT DCI/MPS, issues `SET_INTERFACE(alt=1)` + a best-effort UAC `SET_CUR(SAMPLING_FREQ_CONTROL)`, then forwards PCM as `SubmitIsochOut` → `Controller::submit_isoch_out`. **Live-validated** by `usb-audio-smoke`.
+- [x] `audio_server` lists the USB sink alongside AC'97/HDA; a PCM stream plays through it. — `usb-audio` registers `audio.hw` exactly as the AC'97/HDA drivers do (the same single-backend `ipc_lookup_service("audio.hw")` seam), so it is a peer PCM-sink driver; on a USB-audio machine it is the active backend. **Live-validated** by `usb-audio-smoke`: `audio-demo` mixes a tone through `audio_server` → the USB sink → the isoch OUT endpoint, and a **non-silent WAV** is captured (loudest window 99% non-silent), with `frames_consumed != 0` (the `audio.hw`-fallback guard). *(audio_server has been single-active-backend since Phase 80; simultaneous multi-sink mixing is unchanged scope.)*
+- [x] Targets UAC 1.0 full-speed isochronous only (feedback endpoints / UAC 2.0 deferred — design doc). — full-speed isoch OUT split into ≤`wMaxPacketSize` (192-byte) per-frame Isoch TRBs (a full-speed isoch TD carries ≤ mps/frame); feedback endpoints + UAC 2.0 deferred.
 
 ### E.2 — UVC isochronous frame capture + `camera_server`
 
@@ -483,9 +483,9 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 **Why it matters:** interrupt and bulk endpoints share `arm_ring_in` today; isochronous endpoints have a different TRB type, a fixed per-(micro)frame schedule, reserved bandwidth, and no retry on error. E.3 is the controller-side primitive E.1/E.2 stand on.
 
 **Acceptance:**
-- [ ] The controller programs isochronous TRBs with the correct frame ID / interval and reserves bandwidth at Configure Endpoint.
-- [ ] Isoch completions are serviced on the event ring without the bulk/interrupt re-arm assumptions (no retry on a missed frame; underrun handled gracefully).
-- [ ] No regression to the interrupt (HID) or bulk (NIC/storage) paths sharing the event ring.
+- [x] The controller programs isochronous TRBs with the correct frame ID / interval and reserves bandwidth at Configure Endpoint. — `kernel_core::usb::xhci::trb::Trb::isoch` (TRB type 5, SIA/Frame-ID), `EP_TYPE_ISOCH_OUT`/`IN` + `EP_CERR_0` in `context.rs`, and `build_configure_endpoint_ctx` now types isoch endpoints correctly (previously they fell through to the Interrupt-IN default) with the correct FS interval and CErr=0. `Controller::submit_isoch_out` programs one SIA Isoch TRB per `wMaxPacketSize`-sized frame. **Live-validated** by `usb-audio-smoke` (non-silent WAV through the isoch OUT path). *(Bandwidth reservation on FS = mps/frame; HS/SS Max-Burst/ESIT-payload scaling is host-supported (`ep_context_dword1_burst`) but bare-metal-only.)*
+- [x] Isoch completions are serviced on the event ring without the bulk/interrupt re-arm assumptions (no retry on a missed frame; underrun handled gracefully). — `submit_isoch_out` enqueues frames in bounded batches, rings the doorbell per batch, and drains completions treating `Ring Underrun` (the steady-state empty-ring event between batches) and `Missed Service` as non-fatal delivered intervals (no re-arm, no retry). Host tests cover the isoch TRB encode + the isoch EP-context encode + the enumerate isoch EP-type mapping.
+- [x] No regression to the interrupt (HID) or bulk (NIC/storage) paths sharing the event ring. — non-isoch endpoints are unchanged (CErr stays `EP_CERR_3`; `device_info_from_ctx` only adds an audio branch gated on an isoch OUT endpoint being present); `usb-smoke` (HID boot kbd+mouse decode + render) passes, and `cargo xtask check` (kernel-core/usb-core/xhci_driver host tests) is green.
 
 ---
 

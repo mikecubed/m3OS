@@ -28,7 +28,8 @@ use alloc::vec::Vec;
 use driver_runtime::IrqNotification;
 use driver_runtime::ipc::{EndpointCap, IpcBackend, RecvResult, SyscallBackend};
 use kernel_core::usb::descriptor::{
-    CLASS_HID, CLASS_HUB, TRANSFER_TYPE_BULK, TRANSFER_TYPE_INTERRUPT,
+    CLASS_AUDIO, CLASS_HID, CLASS_HUB, TRANSFER_TYPE_BULK, TRANSFER_TYPE_INTERRUPT,
+    TRANSFER_TYPE_ISOCH,
 };
 use kernel_core::usb::enumerate::EnumContext;
 use kernel_core::usb::xhci::trb::dci;
@@ -100,6 +101,9 @@ pub fn device_info_from_ctx(ctx: &EnumContext) -> Option<AttachNotice> {
         let mut bulk_in_mps = 0u16;
         let mut bulk_out_dci = 0u8;
         let mut bulk_out_mps = 0u16;
+        // Phase 92c Track E: track whether this interface carries an
+        // isochronous OUT endpoint (the UAC PCM-out streaming endpoint).
+        let mut isoch_out_present = false;
 
         for ep in &iface.endpoints {
             let is_in = ep.b_endpoint_address & 0x80 != 0;
@@ -118,12 +122,24 @@ pub fn device_info_from_ctx(ctx: &EnumContext) -> Option<AttachNotice> {
                     bulk_out_dci = dci(ep_num, false);
                     bulk_out_mps = ep.w_max_packet_size;
                 }
+                (TRANSFER_TYPE_ISOCH, false) => {
+                    isoch_out_present = true;
+                }
                 _ => {}
             }
         }
 
         let hid_surfaceable = i.b_interface_class == CLASS_HID && ep_in_dci != 0;
         let bulk_surfaceable = bulk_in_dci != 0 && bulk_out_dci != 0;
+        // Phase 92c Track E: surface the UAC AudioStreaming interface (the alt
+        // setting that carries an isochronous OUT endpoint) so the `usb-audio`
+        // daemon can bind it via the `NextAttach` walk. The isoch endpoint has
+        // neither an interrupt-IN nor a bulk pair, so without this branch the
+        // device produces no `AttachNotice` at all. The notice carries the slot
+        // + class; `usb-audio` resolves the isoch OUT DCI itself via a
+        // `GetDescriptors` round-trip (the isoch endpoint fields are not on the
+        // fixed-width AttachNotice wire format).
+        let audio_surfaceable = i.b_interface_class == CLASS_AUDIO && isoch_out_present;
         // Phase 92 Track A: surface CLASS_HUB interfaces so the `usbhub` daemon
         // can bind a hub via the `NextAttach` walk and drive it (GET_DESCRIPTOR
         // (Hub) + per-port PORT_POWER/PORT_RESET over EP0 `ControlRequest`). A hub
@@ -137,6 +153,8 @@ pub fn device_info_from_ctx(ctx: &EnumContext) -> Option<AttachNotice> {
         } else if bulk_surfaceable {
             1
         } else if hub_surfaceable {
+            1
+        } else if audio_surfaceable {
             1
         } else {
             continue;

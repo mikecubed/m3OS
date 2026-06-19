@@ -124,12 +124,17 @@ fn program_main(_args: &[&str]) -> i32 {
 
 /// Discover the `audio.hw` driver service and build an [`AudioProxyBackend`].
 ///
-/// Retries with a bounded back-off (≈5 s total) so the driver's start
+/// Retries with a bounded back-off (≈15 s total) so the driver's start
 /// ordering relative to `audio_server` does not force the silent stub path.
+/// The window is generous because the `usb-audio` backend (Phase 92c) must
+/// first enumerate its USB device + run SET_INTERFACE over the `usb` service
+/// before it registers `audio.hw` — slower to appear than the kernel-internal
+/// AC'97/HDA device claim. Whichever driver registers first wins; a longer
+/// window only delays the stub fallback on a genuinely audio-less machine.
 /// Returns `None` only if no driver answered within the window.
 #[cfg(not(test))]
 fn connect_driver_backend() -> Option<AudioProxyBackend<SyscallProxyTransport>> {
-    const ATTEMPTS: u32 = 50;
+    const ATTEMPTS: u32 = 150;
     const RETRY_NS: u32 = 100_000_000; // 100 ms
     for _ in 0..ATTEMPTS {
         if let Ok(transport) = SyscallProxyTransport::connect() {

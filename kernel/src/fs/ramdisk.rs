@@ -230,6 +230,8 @@ static USBHUB_ELF: &[u8] = generated_initrd_asset!("usbhub");
 static USB_HID_ELF: &[u8] = generated_initrd_asset!("usb_hid");
 /// Phase 92 Track D: ring-3 USB Mass Storage (Bulk-Only Transport) class driver.
 static USB_STORAGE_ELF: &[u8] = generated_initrd_asset!("usb_storage");
+/// Phase 92c Track E: ring-3 USB Audio Class (UAC) isochronous PCM-out driver.
+static USB_AUDIO_ELF: &[u8] = generated_initrd_asset!("usb_audio");
 // Phase 55b Track F.3b: NVMe crash-and-restart end-to-end smoke client.
 // Exposed under /bin so the QEMU regression can launch it from the shell.
 static NVME_CRASH_SMOKE_ELF: &[u8] = generated_initrd_asset!("nvme-crash-smoke");
@@ -1363,6 +1365,13 @@ static DRIVERS_ENTRIES: &[(&str, RamdiskNode)] = &[
         "usb-storage",
         RamdiskNode::File {
             content: USB_STORAGE_ELF,
+        },
+    ),
+    // Phase 92c Track E: ring-3 USB Audio Class (UAC) isochronous PCM-out driver.
+    (
+        "usb-audio",
+        RamdiskNode::File {
+            content: USB_AUDIO_ELF,
         },
     ),
 ];

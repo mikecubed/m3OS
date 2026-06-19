@@ -2423,6 +2423,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "usb_audio"
+version = "0.92.0"
+dependencies = [
+ "driver_runtime",
+ "kernel-core",
+ "syscall-lib",
+ "usb-core",
+]
+
+[[package]]
 name = "usb_hid"
 version = "0.78.2"
 dependencies = [

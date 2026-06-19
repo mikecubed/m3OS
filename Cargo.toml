@@ -85,6 +85,8 @@ members = [
     "userspace/drivers/usb-hid",
     # Phase 92 Track D — ring-3 USB Mass Storage (Bulk-Only Transport) class driver
     "userspace/drivers/usb-storage",
+    # Phase 92c Track E — ring-3 USB Audio Class (UAC) isochronous PCM-out driver
+    "userspace/drivers/usb-audio",
     # Phase 80 Track A.5 — ring-3 AC'97 out-of-process audio hardware driver
     "userspace/drivers/ac97",
     # Phase 80b — ring-3 Intel HDA out-of-process audio hardware driver
