@@ -96,7 +96,14 @@ fn ls_contains_hello() -> bool {
     let mut found = false;
     loop {
         let n = getdents64(fd, &mut buf);
-        if n <= 0 {
+        if n < 0 {
+            // A directory-read error must not be mistaken for end-of-directory:
+            // otherwise a failure that occurs after hello.txt was already seen
+            // would still let the gate pass despite a broken listing.
+            let _ = close(fd);
+            return false;
+        }
+        if n == 0 {
             break;
         }
         let n = n as usize;
@@ -159,18 +166,26 @@ fn read_hello(out: &mut [u8]) -> Option<usize> {
 /// returns ENODEV. Remount 6× (2× the usable budget) and confirm the final
 /// volume still reads back the last-written bytes.
 fn remount_leak_check() {
+    // The daemon is already serving (mounted + read + wrote above), so a remount
+    // succeeds promptly; only a transient EIO is worth waiting out. ENODEV is the
+    // leak signal itself (registry exhausted — does NOT clear by waiting, that IS
+    // the regression under test), and any other code (EINVAL/EPERM/…) is
+    // unexpected — fail fast on both so the regression surfaces immediately
+    // instead of being delayed/hidden behind the retry budget.
+    const EIO: isize = -5;
     let src = b"/dev/usb0\0";
     let target = b"/mnt/usb0\0";
     let fstype = b"ext2\0";
     for _ in 0..6 {
-        // The daemon is already serving (mounted + read + wrote above), so a
-        // remount succeeds promptly; a few retries absorb a transient EIO.
-        // ENODEV does NOT clear by waiting (that IS the leak under test).
         let mut ok = false;
         for _ in 0..20 {
-            if mount(src.as_ptr(), target.as_ptr(), fstype.as_ptr()) == 0 {
+            let rc = mount(src.as_ptr(), target.as_ptr(), fstype.as_ptr());
+            if rc == 0 {
                 ok = true;
                 break;
+            }
+            if rc != EIO {
+                fail("remount");
             }
             let _ = nanosleep_for(0, 100_000_000);
         }

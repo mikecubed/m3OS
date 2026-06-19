@@ -14845,6 +14845,38 @@ fn path_filemeta(name: &str) -> Result<FileMeta, u64> {
         return Ok(m);
     }
 
+    // Phase 92a D.4: a /mnt/usbN path stats against the secondary mount's own
+    // ext2 volume (checked before ramdisk/root-ext2, matching the open/getdents
+    // routing precedence). Without this, stat falls through to the root device
+    // and returns ENOENT for a file that exists on the USB volume — and its
+    // `st_ino` would not match the getdents64 `d_ino` from the same volume.
+    // `with_usb_mount` short-circuits to None when no secondary mount is active.
+    if let Some(res) = crate::fs::ext2::with_usb_mount(name, |vol, rel| {
+        let ino = match vol.resolve_path(rel) {
+            Ok(ino) => ino,
+            Err(kernel_core::fs::ext2::Ext2Error::NotFound) => return Err(NEG_ENOENT),
+            Err(kernel_core::fs::ext2::Ext2Error::NotDirectory) => return Err(NEG_ENOTDIR),
+            Err(_) => return Err(NEG_EIO),
+        };
+        let inode = vol.read_inode(ino).map_err(|_| NEG_EIO)?;
+        let mut m = FileMeta::new();
+        m.dev = DEV_EXT2_ROOT;
+        m.ino = ino as u64;
+        m.nlink = inode.links_count as u64;
+        m.mode = inode.mode as u32;
+        m.uid = inode.uid as u32;
+        m.gid = inode.gid as u32;
+        m.size = inode.size as u64;
+        m.blksize = vol.block_size as u64;
+        m.blocks = inode.blocks as u64;
+        m.atime = inode.atime as i64;
+        m.mtime = inode.mtime as i64;
+        m.ctime = inode.ctime as i64;
+        Ok(m)
+    }) {
+        return res;
+    }
+
     // Check ramdisk tree (supports directories and hierarchical paths).
     match crate::fs::ramdisk::ramdisk_lookup(name) {
         Some(crate::fs::ramdisk::RamdiskNode::File { content }) => {
@@ -16375,6 +16407,15 @@ fn path_ino(abs_path: &str) -> u64 {
         let tmpfs = crate::fs::tmpfs::TMPFS.lock();
         return tmpfs.stat(rel).map(|s| s.ino).unwrap_or(0);
     }
+    // Phase 92a D.4: a /mnt/usbN path resolves its inode in the secondary
+    // mount's own ext2 volume, so getdents64 `d_ino` and `stat` `st_ino` carry
+    // the real inode (not 0) and agree — the Phase 88 Track B.3 invariant.
+    // `with_usb_mount` short-circuits to None when no secondary mount is active.
+    if let Some(Some(ino)) =
+        crate::fs::ext2::with_usb_mount(abs_path, |vol, rel| vol.resolve_path(rel).ok())
+    {
+        return ino as u64;
+    }
     if crate::fs::ext2::is_mounted()
         && let Some(rel) = ext2_root_path(abs_path)
     {
@@ -16472,13 +16513,21 @@ pub(super) fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     } else if crate::fs::ext2::is_usb_mount_path(&dir_path) {
         // Phase 92a D.4: list a /mnt/usbN secondary mount from its own ext2
         // volume (caught before the root ext2 branch so it is not resolved
-        // against the root device).
-        if let Some(Some(children)) =
-            crate::fs::ext2::with_usb_mount(&dir_path, |vol, rel| vol.list_dir(rel).ok())
-        {
-            for (name, is_dir) in children {
-                entries.push((name, if is_dir { DT_DIR } else { DT_REG }));
-            }
+        // against the root device). A volume read/parse error must surface as
+        // an errno (like the procfs/tmpfs branches above) rather than being
+        // swallowed into a silently-empty directory.
+        let children =
+            match crate::fs::ext2::with_usb_mount(&dir_path, |vol, rel| vol.list_dir(rel)) {
+                Some(Ok(children)) => children,
+                Some(Err(kernel_core::fs::ext2::Ext2Error::NotFound)) => return NEG_ENOENT,
+                Some(Err(kernel_core::fs::ext2::Ext2Error::NotDirectory)) => return NEG_ENOTDIR,
+                Some(Err(_)) => return NEG_EIO,
+                // The mount was removed between the lock-free active check and
+                // re-acquiring the USB_MOUNTS lock (raced unmount).
+                None => return NEG_ENOENT,
+            };
+        for (name, is_dir) in children {
+            entries.push((name, if is_dir { DT_DIR } else { DT_REG }));
         }
     } else if dir_path == "/" {
         // Root directory: merge ext2 root + ramdisk overlays + virtual mounts.
