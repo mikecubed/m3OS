@@ -49,7 +49,7 @@ use kernel_core::input::events::{
     KeyEvent, KeyEventKind, ModifierSide, ModifierState, PointerButton, PointerEvent,
 };
 use kernel_core::input::keymap::{KEY_CAPSLOCK, KEY_NUMLOCK, KEY_SCROLLLOCK, Keycode, Keymap};
-use kernel_core::usb::descriptor::CLASS_HID;
+use kernel_core::usb::descriptor::{CLASS_HID, SUBCLASS_HID_BOOT};
 use kernel_core::usb::hid::{
     BootKeyboardDecoder, HID_KBD_REPORT_LEN, hid_consumer_usage_to_keycode, parse_boot_mouse_report,
 };
@@ -118,9 +118,17 @@ enum DeviceRole {
 /// controls), so a tablet drives `mouse_server` and a media-key strip routes
 /// consumer keys — without either being mistaken for the other.
 fn classify_role(notice: &usb_core::protocol::AttachNotice, fields: &[ReportField]) -> DeviceRole {
+    // Per USB HID §4.2/§4.3 the boot protocol field (1 = keyboard, 2 = mouse) is
+    // only meaningful when the interface declares the Boot subclass. A
+    // Report-Protocol interface (subclass 0) that happens to advertise protocol
+    // 1/2 must NOT be driven as a boot device — that would issue boot-only
+    // SET_PROTOCOL/SET_IDLE and pick the fixed-format boot decoder over the
+    // parsed `ReportField` layout. Honor the boot protocol only under the Boot
+    // subclass; otherwise classify by the layout the descriptor actually carries.
+    let is_boot = notice.interface_sub_class == SUBCLASS_HID_BOOT;
     match notice.interface_protocol {
-        PROTOCOL_HID_KEYBOARD => DeviceRole::BootKeyboard,
-        PROTOCOL_HID_MOUSE => DeviceRole::BootMouse,
+        PROTOCOL_HID_KEYBOARD if is_boot => DeviceRole::BootKeyboard,
+        PROTOCOL_HID_MOUSE if is_boot => DeviceRole::BootMouse,
         _ => {
             if notice.interface_class != CLASS_HID || fields.is_empty() {
                 return DeviceRole::Ignore;
@@ -656,10 +664,13 @@ fn poll_mouse(usb_ep: u32, mouse_ep: u32, dev: &mut HidDevice) {
 fn fetch_report_fields(usb_ep: u32, notice: &usb_core::protocol::AttachNotice) -> Vec<ReportField> {
     // Clamp the requested length so a device's declared `wDescriptorLength`
     // (untrusted) can't force an oversized EP0 scratch allocation or a
-    // `ControlData` reply that overruns `USB_MSG_MAX` — the `ControlRequest`
-    // path carries no H.6-style server clamp, so the bound is enforced here.
-    // The inline `ControlData` encode overhead is tag(1) + completion(1) +
-    // len-prefix(2) = 4 bytes, so the data body must fit in `USB_MSG_MAX - 4`.
+    // `ControlData` reply that overruns `USB_MSG_MAX`. The xHCI server now also
+    // rejects an over-budget `ControlRequest` length (`> USB_MSG_MAX - 4` →
+    // EINVAL) as defense-in-depth; clamping here keeps the request at the
+    // device's real descriptor size so the read succeeds instead of bouncing
+    // off that server-side guard. The inline `ControlData` encode overhead is
+    // tag(1) + completion(1) + len-prefix(2) = 4 bytes, so the data body must
+    // fit in `USB_MSG_MAX - 4`.
     const MAX_REPORT_DESC_LEN: u16 = (USB_MSG_MAX - 4) as u16;
     let req_len = report_descriptor_len(usb_ep, notice)
         .unwrap_or(256)
