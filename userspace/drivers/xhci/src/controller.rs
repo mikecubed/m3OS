@@ -695,9 +695,31 @@ impl Controller {
     /// ([`init_interrupter`]) and multiplexed ([`init_interrupter_into`])
     /// subscribe paths. `IMOD = 0` (no moderation) keeps the first event prompt
     /// during bring-up; `IMAN` sets IE and clears any latched IP (write-1-clear).
+    /// Steady-state moderation is applied later by [`set_interrupt_moderation`]
+    /// once the server loop is reached, so bring-up (which polls, but whose
+    /// no-device Enable Slot completion is interrupt-delivered) is unaffected.
     fn enable_interrupter(&self) {
         self.rt_write_u32(rt_reg::IMOD, 0);
         self.rt_write_u32(rt_reg::IMAN, IMAN_IP | IMAN_IE);
+    }
+
+    /// Set interrupter 0's moderation interval (the `IMODI` field, the low 16
+    /// bits of `IMOD`, in 250 ns increments) — Phase 92d steady-state perf.
+    ///
+    /// `IMOD = 0` (bring-up) interrupts on *every* event; under sustained bulk
+    /// load (a USB NIC / mass-storage stream) that is an interrupt storm. A
+    /// non-zero `IMODI` makes the interrupter wait at least `IMODI × 250 ns`
+    /// between interrupts, coalescing a burst of completions into one wake.
+    ///
+    /// This adds at most `IMODI × 250 ns` of *interrupt* latency, but it does
+    /// **not** delay delivery to class drivers: they poll their endpoints
+    /// (`PollInterruptIn`/`PollBulkIn`), and each poll is an IPC message that
+    /// wakes the loop and drains the ring regardless of the interrupt. So
+    /// moderation only thins out redundant interrupt wakes (which, with
+    /// Optimization B, already do no MMIO when they find an empty ring).
+    /// Applied per controller once, when entering the server loop.
+    pub fn set_interrupt_moderation(&self, imodi: u16) {
+        self.rt_write_u32(rt_reg::IMOD, imodi as u32);
     }
 
     /// Subscribe the controller IRQ **into an existing notification**
@@ -919,6 +941,7 @@ impl Controller {
         len: u16,
         dir_in: bool,
         out_data: Option<&[u8]>,
+        drain_others: &mut dyn FnMut(),
     ) -> Option<alloc::vec::Vec<u8>> {
         // Stage the data-stage DMA buffer for any transfer that has one — IN
         // reads receive into it; OUT writes copy the host payload in before the
@@ -1055,8 +1078,9 @@ impl Controller {
         // Ring EP0 doorbell (DCI = 1).
         self.ring_doorbell(slot_id, 1);
 
-        // Block for Transfer Event(s) — wait for the status stage to complete.
-        let result = self.wait_for_transfer_event(irq, slot_id, 1);
+        // Block for Transfer Event(s) — wait for the status stage to complete,
+        // interleaving other-controller servicing so they don't starve (92d).
+        let result = self.wait_for_transfer_event(irq, slot_id, 1, drain_others);
 
         match result {
             Some(ev) if ev.completion_code == trb::COMPLETION_SUCCESS => {
@@ -1120,8 +1144,13 @@ impl Controller {
         _irq: &IrqNotification,
         slot_id: u8,
         endpoint_id: u8,
+        drain_others: &mut dyn FnMut(),
     ) -> Option<trb::TransferEvent> {
-        const MAX_POLLS: u32 = 400;
+        // Phase 92d: bound the dead-device stall. A healthy control transfer
+        // completes in microseconds (well within the spin phase); 200 ms is the
+        // dead/stuck-device ceiling (was 400 ms). The interleaved `drain_others`
+        // below keeps co-resident controllers alive even across this window.
+        const MAX_POLLS: u32 = 200;
         for poll_i in 0..(COMPLETION_SPIN_POLLS + MAX_POLLS) {
             let before = self.consumer.index;
             let mut completed: alloc::vec::Vec<(u8, u8)> = alloc::vec::Vec::new();
@@ -1154,6 +1183,13 @@ impl Controller {
             if poll_i < COMPLETION_SPIN_POLLS {
                 core::hint::spin_loop();
             } else {
+                // Phase 92d interleaved drain: this control transfer is blocking
+                // the single server loop. Before sleeping, service the OTHER
+                // controllers' event rings so a co-resident controller (e.g. a
+                // busy NIC) does not overflow its finite event ring / lose
+                // completions while we wait here. No-op closure for the
+                // single-controller and enumeration paths (no other controllers).
+                drain_others();
                 let _ = syscall_lib::nanosleep_for(0, 1_000_000);
             }
         }
@@ -2324,6 +2360,7 @@ impl Controller {
         slot_id: u8,
         setup: [u8; 8],
         length: u16,
+        drain_others: &mut dyn FnMut(),
     ) -> Option<alloc::vec::Vec<u8>> {
         let packet = trb::SetupPacket {
             bm_request_type: setup[0],
@@ -2342,7 +2379,15 @@ impl Controller {
         if length != packet.w_length {
             return None;
         }
-        self.control_transfer(irq, slot_id, packet, packet.w_length, dir_in, None)
+        self.control_transfer(
+            irq,
+            slot_id,
+            packet,
+            packet.w_length,
+            dir_in,
+            None,
+            drain_others,
+        )
     }
 
     /// Issue a control transfer with an **OUT data stage** for a raw 8-byte
@@ -2357,6 +2402,7 @@ impl Controller {
         slot_id: u8,
         setup: [u8; 8],
         data: &[u8],
+        drain_others: &mut dyn FnMut(),
     ) -> Option<alloc::vec::Vec<u8>> {
         let packet = trb::SetupPacket {
             bm_request_type: setup[0],
@@ -2374,7 +2420,15 @@ impl Controller {
         if data.len() != packet.w_length as usize {
             return None;
         }
-        self.control_transfer(irq, slot_id, packet, packet.w_length, false, Some(data))
+        self.control_transfer(
+            irq,
+            slot_id,
+            packet,
+            packet.w_length,
+            false,
+            Some(data),
+            drain_others,
+        )
     }
 
     // -- A.6: single-threaded drain-on-wake event loop ---------------------

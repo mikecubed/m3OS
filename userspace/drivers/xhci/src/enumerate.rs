@@ -96,7 +96,9 @@ impl UsbHostOps for XhciHostOps<'_> {
         let setup = trb::SetupPacket::get_device_descriptor(len);
         let bytes = self
             .controller
-            .control_transfer(self.irq, slot_id, setup, len, true, None)?;
+            // Enumeration runs serially during bring-up, before any other
+            // controller is up — no co-resident controllers to interleave (92d).
+            .control_transfer(self.irq, slot_id, setup, len, true, None, &mut || {})?;
         // Cache the full 18-byte device descriptor for a later GetDescriptors
         // IPC (Phase 92 H.1). The 8-byte MaxPacketSize-probe read is skipped.
         if len >= 18 {
@@ -108,14 +110,18 @@ impl UsbHostOps for XhciHostOps<'_> {
     fn get_config_short(&mut self, slot_id: u8, len: u16) -> Option<Vec<u8>> {
         let setup = trb::SetupPacket::get_config_descriptor(0, len);
         self.controller
-            .control_transfer(self.irq, slot_id, setup, len, true, None)
+            // Enumeration runs serially during bring-up, before any other
+            // controller is up — no co-resident controllers to interleave (92d).
+            .control_transfer(self.irq, slot_id, setup, len, true, None, &mut || {})
     }
 
     fn get_config_full(&mut self, slot_id: u8, len: u16) -> Option<Vec<u8>> {
         let setup = trb::SetupPacket::get_config_descriptor(0, len);
         let bytes = self
             .controller
-            .control_transfer(self.irq, slot_id, setup, len, true, None)?;
+            // Enumeration runs serially during bring-up, before any other
+            // controller is up — no co-resident controllers to interleave (92d).
+            .control_transfer(self.irq, slot_id, setup, len, true, None, &mut || {})?;
         // Cache the full configuration blob (wTotalLength bytes) for a later
         // GetDescriptors IPC (Phase 92 H.1) — class drivers read the interface /
         // endpoint / functional descriptors a full config carries.
@@ -127,7 +133,7 @@ impl UsbHostOps for XhciHostOps<'_> {
         let setup = trb::SetupPacket::set_configuration(value);
         match self
             .controller
-            .control_transfer(self.irq, slot_id, setup, 0, false, None)
+            .control_transfer(self.irq, slot_id, setup, 0, false, None, &mut || {})
         {
             Some(_) => {
                 write_str(STDOUT_FILENO, "[xhci] SET_CONFIGURATION OK\n");
