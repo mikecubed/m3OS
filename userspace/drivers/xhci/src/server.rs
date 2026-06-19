@@ -578,6 +578,25 @@ fn handle_request(
                 completion_code: 0xFF,
             },
         },
+        // Phase 92c Track E — isochronous-OUT for USB audio (UAC PCM-out). One
+        // service interval of PCM, scheduled SIA (Start Isoch ASAP); an underrun
+        // / missed interval reports transferred=0 (no retry) rather than failing.
+        UsbRequest::SubmitIsochOut {
+            slot_id,
+            dci: target_dci,
+            data,
+        } => match owner!(slot_id)
+            .and_then(|(c, irq, slot)| c.submit_isoch_out(irq, slot, target_dci, &data))
+        {
+            Some(transferred) => UsbReply::TransferComplete {
+                transferred,
+                completion_code: 1,
+            },
+            None => UsbReply::TransferComplete {
+                transferred: 0,
+                completion_code: 0xFF,
+            },
+        },
         // Phase 92 Track D — synchronous single-TRB bulk-IN for the BOT data +
         // CSW phases (no streaming auto-re-arm; see `Controller::submit_bulk_in`).
         UsbRequest::SubmitBulkIn {

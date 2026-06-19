@@ -339,6 +339,12 @@ pub struct Controller {
 /// non-error outcome for a bulk-IN read smaller than the armed buffer.
 const COMPLETION_SHORT_PACKET: u8 = 13;
 
+/// xHCI Missed Service Error completion code (xHCI §6.4.5) — an isochronous
+/// service interval elapsed before the controller serviced the endpoint.
+/// Isoch has no retry, so the interval's data is dropped and the host resyncs
+/// on the next interval; this is **not** a transport failure.
+const COMPLETION_MISSED_SERVICE_ERROR: u8 = 26;
+
 impl Controller {
     /// Read the capability registers and compute the runtime register-region
     /// bases. No MMIO writes happen here.
@@ -1921,6 +1927,97 @@ impl Controller {
             }
             Some(ev) => {
                 write_str(STDOUT_FILENO, "[xhci] shm bulk non-success cc=");
+                crate::write_u8_dec(ev.completion_code);
+                write_str(STDOUT_FILENO, "\n");
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Phase 92c (E.1/E.3) — submit an **isochronous OUT** transfer of `data` on
+    /// (`slot_id`, `dci`) and block for completion. This is the USB-audio (UAC)
+    /// PCM-out path: a class driver dribbles a service-interval's worth of mixed
+    /// PCM out to the device.
+    ///
+    /// `data` is copied into the endpoint's `data_bufs[0]` source buffer (grown
+    /// on demand — an OUT endpoint has `depth` = 1 so it only uses buffer 0), a
+    /// single **Isoch TRB** is enqueued with **SIA = 1** (Start Isoch ASAP — the
+    /// controller schedules the TD on the next available (micro)frame, so the
+    /// host needs no Frame-ID bookkeeping), the doorbell is rung, and the
+    /// Transfer Event awaited (reusing the bulk-OUT drain so a concurrent IN
+    /// completion is captured, not dropped).
+    ///
+    /// Isochronous transfers have **no retry**: a `Missed Service Error` /
+    /// `Ring Underrun` completion means the service interval elapsed before the
+    /// controller could service the endpoint, so that interval's data is simply
+    /// dropped. That is reported as `Some(0)` (the caller resynchronises on the
+    /// next interval), **not** a hard error. `None` is returned only on timeout
+    /// or a genuine transport STALL.
+    pub fn submit_isoch_out(
+        &mut self,
+        irq: &IrqNotification,
+        slot_id: u8,
+        dci: u8,
+        data: &[u8],
+    ) -> Option<usize> {
+        let len = data.len() as u32;
+        if len == 0 {
+            return Some(0);
+        }
+        // Grow the OUT data buffer if needed (disjoint borrow from self.handle).
+        let need_grow = match self.slot(slot_id) {
+            Some(sc) => match sc.interrupt_eps.iter().find(|e| e.dci == dci) {
+                Some(ep) => data.len() > ep.data_bufs[0].len(),
+                None => return None,
+            },
+            None => return None,
+        };
+        if need_grow {
+            let new_buf = DmaBuffer::<u8>::allocate(&self.handle, data.len(), XHCI_ALIGN).ok()?;
+            let sc = self.slot_mut(slot_id)?;
+            let ep = sc.interrupt_eps.iter_mut().find(|e| e.dci == dci)?;
+            ep.data_bufs[0] = new_buf;
+        }
+        {
+            let sc = self.slot_mut(slot_id)?;
+            let ep = sc.interrupt_eps.iter_mut().find(|e| e.dci == dci)?;
+            // Copy the PCM interval into the DMA buffer.
+            for (i, &b) in data.iter().enumerate() {
+                // SAFETY: data_bufs[0] was (re)allocated to >= data.len(); i < data.len().
+                unsafe { core::ptr::write_volatile(ep.data_bufs[0].user_ptr().add(i), b) };
+            }
+            let cycle = ep.producer.cycle;
+            write_trb(
+                &ep.ring,
+                ep.producer.enqueue,
+                trb::Trb::isoch(ep.data_bufs[0].iova(), len, 0, true, cycle),
+            );
+            let cycle_before = ep.producer.cycle;
+            if ep.producer.advance() {
+                let iova = ep.ring_iova;
+                write_trb(
+                    &ep.ring,
+                    ep.producer.link_index(),
+                    trb::Trb::link(iova, true, cycle_before),
+                );
+            }
+        }
+        self.ring_doorbell(slot_id, dci);
+        match self.wait_for_bulk_out_event(irq, slot_id, dci) {
+            Some(ev)
+                if ev.completion_code == trb::COMPLETION_SUCCESS
+                    || ev.completion_code == COMPLETION_SHORT_PACKET =>
+            {
+                let residual = ev.residual_transfer_length.min(len) as usize;
+                Some((len as usize).saturating_sub(residual))
+            }
+            // Isoch has no retry: a missed service interval / ring underrun is a
+            // dropped interval, not a failure — report 0 transferred so the
+            // caller resyncs on the next interval rather than tearing down.
+            Some(ev) if ev.completion_code == COMPLETION_MISSED_SERVICE_ERROR => Some(0),
+            Some(ev) => {
+                write_str(STDOUT_FILENO, "[xhci] isoch-OUT non-success cc=");
                 crate::write_u8_dec(ev.completion_code);
                 write_str(STDOUT_FILENO, "\n");
                 None

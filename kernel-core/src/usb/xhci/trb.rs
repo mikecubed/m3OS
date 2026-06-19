@@ -88,6 +88,9 @@ pub const TRB_TYPE_SETUP_STAGE: u8 = 2;
 pub const TRB_TYPE_DATA_STAGE: u8 = 3;
 /// Status Stage — control-transfer status phase.
 pub const TRB_TYPE_STATUS_STAGE: u8 = 4;
+/// Isoch — isochronous transfer-ring data TRB (xHCI §6.4.1.3). Carries the
+/// SIA / Frame ID / TBC / TLBPC fields a periodic isochronous endpoint needs.
+pub const TRB_TYPE_ISOCH: u8 = 5;
 /// Link — chains ring segments / wraps the ring.
 pub const TRB_TYPE_LINK: u8 = 6;
 /// No Op (transfer ring).
@@ -128,6 +131,8 @@ pub enum TrbType {
     DataStage = TRB_TYPE_DATA_STAGE,
     /// Status Stage TRB.
     StatusStage = TRB_TYPE_STATUS_STAGE,
+    /// Isochronous transfer TRB.
+    Isoch = TRB_TYPE_ISOCH,
     /// Link TRB.
     Link = TRB_TYPE_LINK,
     /// No Op (transfer ring) TRB.
@@ -163,6 +168,7 @@ impl TrbType {
             TRB_TYPE_SETUP_STAGE => Some(TrbType::SetupStage),
             TRB_TYPE_DATA_STAGE => Some(TrbType::DataStage),
             TRB_TYPE_STATUS_STAGE => Some(TrbType::StatusStage),
+            TRB_TYPE_ISOCH => Some(TrbType::Isoch),
             TRB_TYPE_LINK => Some(TrbType::Link),
             TRB_TYPE_NO_OP_TRANSFER => Some(TrbType::NoOpTransfer),
             TRB_TYPE_ENABLE_SLOT => Some(TrbType::EnableSlot),
@@ -191,6 +197,16 @@ impl TrbType {
 
 /// Success completion code.
 pub const COMPLETION_SUCCESS: u8 = 1;
+
+/// Short Packet completion code (xHCI §6.4.5) — the device transferred fewer
+/// bytes than the TRB length; the residual reports how many were missing.
+pub const COMPLETION_SHORT_PACKET: u8 = 13;
+
+/// Missed Service Error completion code (xHCI §6.4.5) — an isochronous service
+/// interval elapsed before the controller could service the endpoint. Isoch
+/// has no retry, so the affected interval's data is simply dropped; the driver
+/// resynchronises on the next interval rather than treating it as fatal.
+pub const COMPLETION_MISSED_SERVICE_ERROR: u8 = 26;
 
 // ---------------------------------------------------------------------------
 // Generic field accessors
@@ -501,6 +517,38 @@ impl Trb {
             parameter: buf_iova,
             status: len & DATA_TRB_TRANSFER_LENGTH_MASK,
             control: control_type_cycle(TRB_TYPE_NORMAL, cycle) | IOC_BIT | ISP_BIT,
+        }
+    }
+
+    /// Build an **Isochronous TRB** (xHCI §6.4.1.3) for an isochronous transfer
+    /// ring (USB audio / video).
+    ///
+    /// `buf_iova` is the device-visible address of the PCM / frame buffer and
+    /// `len` the byte count for this service interval. When `sia` is `true` the
+    /// **SIA** (Start Isoch ASAP, control bit 31) flag is set and the controller
+    /// schedules the TD on the next available (micro)frame — `frame_id` is
+    /// ignored. When `sia` is `false` the 11-bit **Frame ID** (control bits
+    /// 30:20) selects the target (micro)frame for precise scheduling. **IOC** is
+    /// set so each interval posts a Transfer Event; **ISP** is set so a short IN
+    /// transfer (UVC frame end) still reports its residual. TBC (bits 8:7) and
+    /// TLBPC (bits 19:16) are left zero — correct for full-speed single-packet
+    /// service (no bursts); a high-speed/SuperSpeed bursting endpoint would set
+    /// them from `bMaxBurst`/`Mult`.
+    pub const fn isoch(buf_iova: u64, len: u32, frame_id: u16, sia: bool, cycle: bool) -> Trb {
+        const IOC_BIT: u32 = 1 << 5;
+        const ISP_BIT: u32 = 1 << 2;
+        const SIA_BIT: u32 = 1 << 31;
+        const FRAME_ID_SHIFT: u32 = 20;
+        const FRAME_ID_MASK: u32 = 0x7FF; // 11-bit field
+        let sched = if sia {
+            SIA_BIT
+        } else {
+            ((frame_id as u32) & FRAME_ID_MASK) << FRAME_ID_SHIFT
+        };
+        Trb {
+            parameter: buf_iova,
+            status: len & DATA_TRB_TRANSFER_LENGTH_MASK,
+            control: control_type_cycle(TRB_TYPE_ISOCH, cycle) | IOC_BIT | ISP_BIT | sched,
         }
     }
 
@@ -1252,6 +1300,43 @@ mod tests {
         const ISP_BIT: u32 = 1 << 2;
         assert_ne!(trb.control & IOC_BIT, 0, "Normal TRB must set IOC");
         assert_ne!(trb.control & ISP_BIT, 0, "Normal TRB must set ISP");
+    }
+
+    #[test]
+    fn isoch_trb_sia_start_asap() {
+        // Isoch TRB scheduled Start-Isoch-ASAP (the fire-and-forget UAC audio
+        // OUT path): SIA (bit 31) set, Frame ID field zero, IOC set so each
+        // service interval posts a Transfer Event.
+        let buf = 0x0040_0000u64;
+        let trb = Trb::isoch(buf, 192, 0, true, true);
+        assert_eq!(trb_type_raw(&trb), TRB_TYPE_ISOCH);
+        assert_eq!(event_trb_type(&trb), Some(TrbType::Isoch));
+        assert!(trb_cycle(&trb));
+        assert_eq!(trb.parameter, buf);
+        assert_eq!(trb.status & 0x1_FFFF, 192);
+        const IOC_BIT: u32 = 1 << 5;
+        const SIA_BIT: u32 = 1 << 31;
+        const FRAME_ID_MASK: u32 = 0x7FF << 20;
+        assert_ne!(trb.control & IOC_BIT, 0, "Isoch TRB must set IOC");
+        assert_ne!(trb.control & SIA_BIT, 0, "SIA must be set when sia=true");
+        assert_eq!(
+            trb.control & FRAME_ID_MASK,
+            0,
+            "Frame ID must be ignored (zero) when SIA is set"
+        );
+    }
+
+    #[test]
+    fn isoch_trb_explicit_frame_id() {
+        // With sia=false the 11-bit Frame ID selects the target (micro)frame and
+        // SIA must be clear.
+        let trb = Trb::isoch(0x0050_0000, 64, 0x2AB, false, false);
+        assert_eq!(trb_type_raw(&trb), TRB_TYPE_ISOCH);
+        assert!(!trb_cycle(&trb));
+        const SIA_BIT: u32 = 1 << 31;
+        assert_eq!(trb.control & SIA_BIT, 0, "SIA must be clear when sia=false");
+        // Frame ID occupies control bits 30:20.
+        assert_eq!((trb.control >> 20) & 0x7FF, 0x2AB);
     }
 
     #[test]
