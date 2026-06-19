@@ -687,11 +687,40 @@ impl Controller {
     pub fn init_interrupter(&self) -> Result<IrqNotification, BringUpError> {
         let irq = IrqNotification::subscribe(&DeviceCap(&self.handle), None)
             .map_err(|_| BringUpError::IrqSubscribe)?;
-        // IMOD = 0: no moderation delay, so the first event interrupts
-        // promptly during bring-up.
+        self.enable_interrupter();
+        Ok(irq)
+    }
+
+    /// Program interrupter 0's moderation + enable bits. Shared by the fresh
+    /// ([`init_interrupter`]) and multiplexed ([`init_interrupter_into`])
+    /// subscribe paths. `IMOD = 0` (no moderation) keeps the first event prompt
+    /// during bring-up; `IMAN` sets IE and clears any latched IP (write-1-clear).
+    fn enable_interrupter(&self) {
         self.rt_write_u32(rt_reg::IMOD, 0);
-        // Enable interrupts and clear any latched IP (write-1-clear).
         self.rt_write_u32(rt_reg::IMAN, IMAN_IP | IMAN_IE);
+    }
+
+    /// Subscribe the controller IRQ **into an existing notification**
+    /// (`notif_cap`) at `bit_index`, then enable interrupter 0 — the Phase 92d
+    /// multiplexed-interrupt path for a *secondary* controller.
+    ///
+    /// `notif_cap` is the primary controller's `IrqNotification` cap handle
+    /// (already bound to the server recv loop). This controller's interrupt then
+    /// sets `1 << bit_index` in that shared notification word, so the single
+    /// recv loop wakes on this controller's interrupt without waiting for
+    /// primary traffic. `bit_index` equals the controller's index in the
+    /// server's controller table, so a `Notification(bits)` wake names exactly
+    /// which controller(s) fired and the loop drains only those (bit-directed
+    /// draining). The kernel binds each device its own MSI-X vector; only the
+    /// destination notification + bit are shared.
+    pub fn init_interrupter_into(
+        &self,
+        notif_cap: u32,
+        bit_index: u8,
+    ) -> Result<IrqNotification, BringUpError> {
+        let irq = IrqNotification::subscribe_into(&DeviceCap(&self.handle), notif_cap, bit_index)
+            .map_err(|_| BringUpError::IrqSubscribe)?;
+        self.enable_interrupter();
         Ok(irq)
     }
 
@@ -1557,6 +1586,14 @@ impl Controller {
         // Collect (dci, report) pairs first so re-arming (which needs &mut
         // self via ring_doorbell) happens after the drain borrow ends.
         let mut completed: alloc::vec::Vec<(u8, u8)> = alloc::vec::Vec::new();
+        // Optimization B (Phase 92d): record the dequeue cursor so an *empty*
+        // drain skips the ERDP/IMAN write below. With multiplexed interrupts the
+        // server drains controllers far more often (every IRQ + every client
+        // poll re-drains), and an empty-poll ERDP write both wastes an MMIO and,
+        // per the command-completion path's own guard, "disturbs the
+        // controller's event-ring bookkeeping". Only touch ERDP/IMAN when at
+        // least one event was actually consumed.
+        let before = self.consumer.index;
         loop {
             let seg = self.event_ring.as_ref().expect("event ring allocated");
             let candidate = read_trb(seg, self.consumer.index);
@@ -1601,10 +1638,15 @@ impl Controller {
             }
             self.consumer.dequeue_step();
         }
-        // Advance the controller's dequeue pointer and clear the pending bit.
-        let erdp = self.event_ring_iova + (self.consumer.index as u64) * trb::TRB_SIZE as u64;
-        self.rt_write_u64(rt_reg::ERDP, erdp | ERDP_EHB);
-        self.rt_write_u32(rt_reg::IMAN, IMAN_IP | IMAN_IE);
+        // Advance the controller's dequeue pointer and clear the pending bit —
+        // but only when the drain actually consumed events (Optimization B): an
+        // empty-poll ERDP write is wasted MMIO and disturbs the ring bookkeeping
+        // (the command-completion path guards the same way).
+        if self.consumer.index != before {
+            let erdp = self.event_ring_iova + (self.consumer.index as u64) * trb::TRB_SIZE as u64;
+            self.rt_write_u64(rt_reg::ERDP, erdp | ERDP_EHB);
+            self.rt_write_u32(rt_reg::IMAN, IMAN_IP | IMAN_IE);
+        }
         // Re-arm every endpoint that just completed so the next report/frame
         // lands. Re-arm at the endpoint's last `armed_len` (preserving a bulk
         // endpoint's frame-sized buffer) rather than at `mps`.

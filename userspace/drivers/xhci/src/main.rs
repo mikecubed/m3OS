@@ -169,6 +169,7 @@ const BAR0_EXPECTED_BYTES: usize = 0x1_0000;
 #[cfg(not(test))]
 fn bring_up_controller(
     key: DeviceCapKey,
+    shared: Option<(u32, u8)>,
 ) -> Result<
     (
         Controller,
@@ -242,7 +243,16 @@ fn bring_up_controller(
     if let Err(e) = controller.init_event_ring() {
         return Err(bringup_failed(e));
     }
-    let irq = match controller.init_interrupter() {
+    // Subscribe the controller IRQ. The primary controller (`shared == None`)
+    // allocates a fresh notification (bit 0) that the server binds to its recv
+    // loop; a secondary controller subscribes its IRQ INTO the primary's
+    // notification at `bit` (= its controller index), so the single recv loop
+    // wakes on this controller's interrupt too (Phase 92d multiplexed path).
+    let irq = match shared {
+        None => controller.init_interrupter(),
+        Some((notif_cap, bit)) => controller.init_interrupter_into(notif_cap, bit),
+    };
+    let irq = match irq {
         Ok(irq) => irq,
         Err(e) => return Err(bringup_failed(e)),
     };
@@ -434,9 +444,34 @@ fn program_main(_args: &[&str]) -> i32 {
     // binds one IRQ per task, so `server::run` binds the primary controller's
     // IRQ and drains the rest by polling on every loop wake — see its doc.
     let mut controllers: alloc::vec::Vec<server::ControllerCtx> = alloc::vec::Vec::new();
+    // Phase 92d multiplexed interrupts: the first controller brought up (index 0,
+    // the "primary") subscribes a fresh notification (bit 0) that `server::run`
+    // binds to its recv loop; every later controller subscribes its IRQ INTO
+    // that same notification at bit = its controller index, so the single recv
+    // loop wakes on any controller's interrupt. We capture the primary's
+    // notification as a plain cap handle so we don't borrow into `controllers`
+    // while pushing. `bit == controller index` (the 1-byte slot-handle codec
+    // caps at 4 controllers / 2-bit index, well within the 64-bit word), so a
+    // `Notification(bits)` wake names exactly which controller(s) fired.
+    let mut primary_notif_cap: Option<u32> = None;
     for key in bdf_list {
-        match bring_up_controller(key) {
-            Ok(triple) => controllers.push(triple),
+        let this_idx = controllers.len();
+        let shared = primary_notif_cap.map(|cap| (cap, this_idx as u8));
+        match bring_up_controller(key, shared) {
+            Ok((c, irq, devs)) => {
+                if primary_notif_cap.is_none() {
+                    primary_notif_cap = Some(irq.cap_handle());
+                } else {
+                    // A secondary controller is up and multiplexed into the
+                    // primary's bound notification — announce it. The
+                    // `usb-multi-controller-smoke` gate waits on
+                    // `XHCI:controller-1:ready`.
+                    syscall_lib::write_str(STDOUT_FILENO, "XHCI:controller-");
+                    write_u8_dec(this_idx as u8);
+                    syscall_lib::write_str(STDOUT_FILENO, ":ready\n");
+                }
+                controllers.push((c, irq, devs));
+            }
             Err(0) => {
                 // Clean exit requested (no controller at this BDF) — skip it.
             }

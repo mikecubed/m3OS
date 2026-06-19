@@ -305,9 +305,21 @@ fn process_port_events(controllers: &mut [ControllerCtx], served: &mut Vec<Attac
                                 write_str(STDOUT_FILENO, USB_HOTPLUG_ATTACHED_SENTINEL);
                             }
                             None => {
+                                // H.5: Enable Slot already allocated a hardware
+                                // slot + SlotContext for this device during
+                                // `enumerate_port`. If the (controller, slot)
+                                // pair can't be packed into the 1-byte handle
+                                // (≥5 controllers, or slot > 63), reclaim that
+                                // slot via Disable Slot before dropping the
+                                // device — otherwise it leaks the very slot H.3
+                                // set out to reclaim. `notice.slot_id` still
+                                // holds the real hardware slot here (it is only
+                                // overwritten with the packed handle in the
+                                // `Some` arm). Mirrors the EnumerateChild arm.
+                                c.disable_slot(irq, notice.slot_id);
                                 write_str(
                                     STDOUT_FILENO,
-                                    "xhci_driver: hot-plug device dropped — unpackable handle\n",
+                                    "xhci_driver: hot-plug device dropped — unpackable handle (slot reclaimed)\n",
                                 );
                             }
                         }
@@ -413,8 +425,19 @@ pub fn run(ep: u32, discovered: u8, mut controllers: Vec<ControllerCtx>) -> ! {
         // transfer times out. This is what wedged the >1522-byte write path.
         match backend.recv_with_capacity(ep_cap, USB_MSG_MAX) {
             Ok(RecvResult::Notification(bits)) => {
-                for (c, _irq, _d) in controllers.iter_mut() {
-                    c.service_interrupt_events();
+                // Bit-directed draining (Phase 92d Optimization A): controller
+                // `i`'s interrupt sets bit `i` in this shared notification (see
+                // `Controller::init_interrupter_into`), so drain only the
+                // controller(s) that actually fired rather than every controller.
+                // For a single controller this is bit 0 → controller 0, so the
+                // validated single-controller path is byte-identical. The
+                // Message arm below still drains all controllers as a safety net,
+                // so an event whose bit is not yet reflected is never lost — it
+                // is picked up on the next client poll.
+                for (idx, (c, _irq, _d)) in controllers.iter_mut().enumerate() {
+                    if bits & (1u64 << idx) != 0 {
+                        c.service_interrupt_events();
+                    }
                 }
                 // A bound-IRQ wake is how a hot-plug Port Status Change arrives;
                 // act on any queued connect/disconnect (Phase 92 Track C).
