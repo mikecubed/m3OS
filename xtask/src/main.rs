@@ -10726,6 +10726,16 @@ fn usb_mount_smoke_steps() -> Vec<SmokeStep> {
         label: "guest/usb-mount-smoke: overwrite + read-back byte-identical",
         exit_code_on_fail: 1,
     });
+    // PR #253 regression: remount the same prefix past MAX_REMOTE_BLOCK — the
+    // `mount_usb` displaced-dev_id unregister must free each slot, else the 3rd
+    // remount fails ENODEV and the guest emits `USB_MOUNT:remount:FAIL`.
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "USB_MOUNT:remount-ok",
+        fail_prefixes: &[":FAIL", "USB_MOUNT:panic"],
+        timeout_secs: 60,
+        label: "guest/usb-mount-smoke: remount same prefix past registry budget (dev_id-leak regression)",
+        exit_code_on_fail: 1,
+    });
     steps
 }
 

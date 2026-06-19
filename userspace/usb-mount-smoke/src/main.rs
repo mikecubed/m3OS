@@ -16,6 +16,11 @@
 //! - `USB_MOUNT:rw-ok` — overwriting `/mnt/usb0/hello.txt` and reading it back
 //!   in a fresh open returns the new bytes byte-identical (BOT WRITE(10) +
 //!   READ(10) round-trip through the daemon).
+//! - `USB_MOUNT:remount-ok` — remounting the SAME prefix past the
+//!   `MAX_REMOTE_BLOCK` registry budget (PR #253 `mount_usb` dev_id-leak
+//!   regression) keeps succeeding and the volume still reads back the
+//!   last-written bytes; without the displaced-dev_id unregister the 3rd
+//!   remount exhausts the `blk::remote` registry and `mount` returns ENODEV.
 //! - `USB_MOUNT:done` — clean run.
 //!
 //! A failure prints `USB_MOUNT:<case>:FAIL` and exits non-zero; a panic prints
@@ -137,6 +142,44 @@ fn read_hello(out: &mut [u8]) -> Option<usize> {
     Some(total)
 }
 
+/// Phase 92a — PR #253 regression guard for the `mount_usb` `blk::remote`
+/// dev_id leak. Remounting the SAME prefix registers a fresh registry slot each
+/// time and must free the displaced one. `MAX_REMOTE_BLOCK` is 4 (slot 0
+/// reserved → 3 usable) and the initial mount already holds one, so WITHOUT the
+/// displaced-id unregister the 3rd remount exhausts the registry and `mount`
+/// returns ENODEV. Remount 6× (2× the usable budget) and confirm the final
+/// volume still reads back the last-written bytes.
+fn remount_leak_check() {
+    let src = b"/dev/usb0\0";
+    let target = b"/mnt/usb0\0";
+    let fstype = b"ext2\0";
+    for _ in 0..6 {
+        // The daemon is already serving (mounted + read + wrote above), so a
+        // remount succeeds promptly; a few retries absorb a transient EIO.
+        // ENODEV does NOT clear by waiting (that IS the leak under test).
+        let mut ok = false;
+        for _ in 0..20 {
+            if mount(src.as_ptr(), target.as_ptr(), fstype.as_ptr()) == 0 {
+                ok = true;
+                break;
+            }
+            let _ = nanosleep_for(0, 100_000_000);
+        }
+        if !ok {
+            fail("remount");
+        }
+    }
+    // The volume from the final remount must still serve the step-4 overwrite,
+    // proving each replace produced a working volume (not just a 0 return).
+    let mut buf = [0u8; 64];
+    match read_hello(&mut buf) {
+        Some(n) if &buf[..n] == RW_CONTENT => {
+            write_str(STDOUT_FILENO, "USB_MOUNT:remount-ok\n");
+        }
+        _ => fail("remount-verify"),
+    }
+}
+
 #[cfg(not(test))]
 fn usb_mount_smoke_main() -> ! {
     write_str(STDOUT_FILENO, "usb-mount-smoke: start\n");
@@ -181,6 +224,10 @@ fn usb_mount_smoke_main() -> ! {
         }
         _ => fail("rw-verify"),
     }
+
+    // 5. Remount the same prefix past the registry budget — the PR #253
+    //    dev_id-leak regression guard (must free each displaced slot).
+    remount_leak_check();
 
     write_str(STDOUT_FILENO, "USB_MOUNT:done\n");
     syscall_lib::exit(0)
