@@ -35,7 +35,13 @@
 //! * Logical Min/Max sign-extension is applied at *decode* time
 //!   ([`decode_pointer_report`] sign-extends relative axes / wheel by
 //!   `bit_size`), not stored per-field at parse time.
-//! * Long items (prefix byte 0xFE) are skipped.
+//! * Input / Output / Feature items share one running bit offset per Report ID.
+//!   In the HID spec these are independent bit-spaces; a descriptor that
+//!   *interleaves* an Output/Feature item between Input items under the same
+//!   Report ID would push subsequent Input offsets past the Output bits. The
+//!   common "all Inputs, then Outputs" ordering (boot keyboards, the QEMU
+//!   tablet) is unaffected; per-report-type offset accumulators are a deferred
+//!   refinement.
 //! * Collection / End Collection nesting is not modelled (these Main items
 //!   carry no report bits and are ignored without disturbing offsets).
 
@@ -627,10 +633,10 @@ pub fn decode_pointer_report(fields: &[ReportField], report: &[u8]) -> DecodedPo
             (USAGE_PAGE_GENERIC_DESKTOP, USAGE_WHEEL) => {
                 out.wheel = out.wheel.saturating_add(sign_extend(raw, f.bit_size));
             }
-            // A Button-page (0x09) 1-bit variable field with usage `n` (1..=31)
-            // sets bit `n - 1` when asserted.
+            // A Button-page (0x09) 1-bit variable field with usage `n` (1..=32)
+            // sets bit `n - 1` when asserted (32 buttons fit the u32 bitmap).
             (USAGE_PAGE_BUTTON, n)
-                if f.bit_size == 1 && (1..=31).contains(&n) && raw & 0x01 != 0 =>
+                if f.bit_size == 1 && (1..=32).contains(&n) && raw & 0x01 != 0 =>
             {
                 out.buttons |= 1u32 << (n - 1);
             }
@@ -1246,6 +1252,30 @@ mod tests {
         assert_eq!(sign_extend(0x7F, 8), 127);
         assert_eq!(sign_extend(0x80, 8), -128);
         assert_eq!(sign_extend(0x01, 1), -1); // 1-bit signed: top bit set
+    }
+
+    /// A 32-button device: Button usage 32 maps to bit 31 of the u32 bitmap
+    /// (regression guard for the button-range cap — must be 1..=32, not 1..=31).
+    #[test]
+    fn decode_thirty_two_buttons() {
+        let raw: &[u8] = &[
+            0x05, 0x09, // Usage Page = Button
+            0x19, 0x01, // Usage Minimum = 1
+            0x29, 0x20, // Usage Maximum = 32
+            0x15, 0x00, // Logical Minimum = 0
+            0x25, 0x01, // Logical Maximum = 1
+            0x75, 0x01, // Report Size = 1
+            0x95, 0x20, // Report Count = 32
+            0x81, 0x02, // Input (Data, Variable, Absolute)
+        ];
+        let fields = parse_report_descriptor(raw);
+        assert_eq!(fields.len(), 32);
+        // Only button 32 pressed → report bit 31 set (byte 3 == 0x80).
+        let p = decode_pointer_report(&fields, &[0x00, 0x00, 0x00, 0x80]);
+        assert_eq!(p.buttons, 1u32 << 31, "button 32 must set bit 31");
+        // Button 1 pressed → bit 0.
+        let p1 = decode_pointer_report(&fields, &[0x01, 0x00, 0x00, 0x00]);
+        assert_eq!(p1.buttons, 0b1);
     }
 
     // -----------------------------------------------------------------------

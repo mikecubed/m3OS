@@ -158,6 +158,10 @@ struct HidDevice {
     notice: usb_core::protocol::AttachNotice,
     /// How this device's reports are decoded (Phase 92 Track B).
     role: DeviceRole,
+    /// The `NextAttach` table index this device was bound from — a stable,
+    /// unique handle to this enumeration event (the table is append-only),
+    /// used by the C.4 reconcile instead of the reusable packed `slot_id`.
+    source_cursor: u8,
     kbd_decoder: BootKeyboardDecoder,
     /// Previous mouse button bitfield, for boot-mouse edge detection.
     prev_buttons: u8,
@@ -761,7 +765,17 @@ fn lookup(name: &str) -> Option<u32> {
 /// HID-class interface), classify its decode role, and assemble the polled
 /// device state. Shared by the boot-time enumeration walk and the C.4 hot-plug
 /// reconcile so a device attached after boot is brought up identically.
-fn build_device(usb_ep: u32, notice: usb_core::protocol::AttachNotice) -> HidDevice {
+///
+/// `source_cursor` is the `NextAttach` table index this device was bound from.
+/// The server's table is append-only, so that index is a stable, unique handle
+/// to *this* enumeration event — unlike the packed `slot_id`, which the server
+/// reuses for a reclaimed slot (H.3). Keying the C.4 reconcile on it avoids
+/// confusing a re-attached device with the stale detached entry it reused.
+fn build_device(
+    usb_ep: u32,
+    notice: usb_core::protocol::AttachNotice,
+    source_cursor: u8,
+) -> HidDevice {
     // Read + parse the Report descriptor for HID-class interfaces (the surfaced
     // device list can also include a hub/NIC this daemon ignores — issuing a HID
     // GET_DESCRIPTOR at those would stall EP0). Boot keyboard/mouse still decode
@@ -788,6 +802,7 @@ fn build_device(usb_ep: u32, notice: usb_core::protocol::AttachNotice) -> HidDev
     HidDevice {
         notice,
         role,
+        source_cursor,
         kbd_decoder: BootKeyboardDecoder::new(),
         prev_buttons: 0,
         prev_pointer_buttons: 0,
@@ -801,13 +816,19 @@ fn build_device(usb_ep: u32, notice: usb_core::protocol::AttachNotice) -> HidDev
 /// attach table. A hot-removed device flips its `AttachNotice` to
 /// `attached: false` (C.2); a hot-added one appends a fresh attached entry
 /// (C.1/C.3). Re-walk the whole `NextAttach` cursor and: **release** any device
-/// we hold whose slot is now reported detached (the usb-hid arm of C.4 — drops
+/// we hold whose source entry is now detached (the usb-hid arm of C.4 — drops
 /// its per-device state so a removed device stops being polled), and **bind**
-/// any newly-attached HID interface we do not yet hold. Resolution is by the
-/// *latest* table entry for a `(slot_id, interface_num)` pair, so a reclaimed +
-/// re-packed slot id (H.3) is never confused with a stale detached entry.
+/// any newly-attached HID interface we do not yet hold.
+///
+/// Identity is keyed on the **table index** (`source_cursor`), not the packed
+/// `slot_id`: the server reuses a reclaimed slot's handle (H.3), so a detach +
+/// re-attach of the same physical port appends a new entry that carries the same
+/// `slot_id`. Keying on the (stable, append-only) index lets a single reconcile
+/// pass that observes both entries correctly release the old device (its source
+/// entry went `attached:false`) *and* bind the new one (a fresh index) without
+/// the two aliasing.
 fn reconcile_attachments(usb_ep: u32, devices: &mut Vec<HidDevice>) {
-    // 1. Snapshot the full attach table (append-only; ≤ 255 entries).
+    // 1. Snapshot the full attach table (append-only; index == NextAttach cursor).
     let mut table: Vec<usb_core::protocol::AttachNotice> = Vec::new();
     let mut cursor = 0u8;
     while let Some(UsbReply::Attach {
@@ -821,45 +842,34 @@ fn reconcile_attachments(usb_ep: u32, devices: &mut Vec<HidDevice>) {
         };
     }
 
-    // 2. Release held devices whose latest table state is detached (or gone).
+    // 2. Release held devices whose source entry is gone or now detached.
     let mut i = 0;
     while i < devices.len() {
-        let (sid, ifn) = (devices[i].notice.slot_id, devices[i].notice.interface_num);
         let alive = table
-            .iter()
-            .rev()
-            .find(|n| n.slot_id == sid && n.interface_num == ifn)
+            .get(devices[i].source_cursor as usize)
             .is_some_and(|n| n.attached);
         if alive {
             i += 1;
         } else {
             syscall_lib::write_str(STDOUT_FILENO, "usb-hid: released slot=");
-            write_u8_dec(sid);
+            write_u8_dec(devices[i].notice.slot_id);
             syscall_lib::write_str(STDOUT_FILENO, "\n");
             devices.remove(i);
         }
     }
 
-    // 3. Bind newly-attached HID interfaces we do not already hold.
+    // 3. Bind newly-attached HID interfaces we do not already hold (an entry whose
+    //    index backs no held device). A still-present device keeps its index held,
+    //    so it is skipped; a stale detached entry is `attached:false`, so skipped.
     for (idx, n) in table.iter().enumerate() {
         if !n.attached {
             continue;
         }
-        // Act only on the latest entry for this (slot, iface) — a later attached
-        // entry supersedes this one.
-        let superseded = table[idx + 1..]
-            .iter()
-            .any(|m| m.slot_id == n.slot_id && m.interface_num == n.interface_num);
-        if superseded {
+        let idx = idx as u8;
+        if devices.iter().any(|d| d.source_cursor == idx) {
             continue;
         }
-        let held = devices
-            .iter()
-            .any(|d| d.notice.slot_id == n.slot_id && d.notice.interface_num == n.interface_num);
-        if held {
-            continue;
-        }
-        let dev = build_device(usb_ep, *n);
+        let dev = build_device(usb_ep, *n, idx);
         if dev.role == DeviceRole::Ignore {
             continue;
         }
@@ -891,14 +901,20 @@ fn program_main(_args: &[&str]) -> i32 {
         return 0;
     };
 
-    // 2. Enumerate attached HID devices via the NextAttach cursor.
+    // 2. Enumerate attached HID devices via the NextAttach cursor. `idx` is the
+    //    table index this device is bound from — passed to `build_device` as its
+    //    stable `source_cursor` for the C.4 reconcile.
     let mut devices: Vec<HidDevice> = Vec::new();
     let mut cursor = 0u8;
     while let Some(UsbReply::Attach {
         notice: Some(notice),
     }) = usb_call(usb_ep, &UsbRequest::NextAttach { cursor })
     {
-        cursor = cursor.saturating_add(1);
+        let idx = cursor;
+        cursor = match cursor.checked_add(1) {
+            Some(c) => c,
+            None => break,
+        };
         // A boot enumeration only surfaces attached devices, but guard the flag
         // so the same walk is correct if it ever sees a stale detached entry.
         if !notice.attached {
@@ -907,7 +923,7 @@ fn program_main(_args: &[&str]) -> i32 {
         syscall_lib::write_str(STDOUT_FILENO, "usb-hid: bound HID device (proto ");
         write_u8_dec(notice.interface_protocol);
         syscall_lib::write_str(STDOUT_FILENO, ")\n");
-        devices.push(build_device(usb_ep, notice));
+        devices.push(build_device(usb_ep, notice, idx));
     }
 
     if devices.is_empty() {
