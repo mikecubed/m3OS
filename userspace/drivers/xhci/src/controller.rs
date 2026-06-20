@@ -1622,14 +1622,19 @@ impl Controller {
         // Collect (dci, report) pairs first so re-arming (which needs &mut
         // self via ring_doorbell) happens after the drain borrow ends.
         let mut completed: alloc::vec::Vec<(u8, u8)> = alloc::vec::Vec::new();
-        // Optimization B (Phase 92d): record the dequeue cursor so an *empty*
-        // drain skips the ERDP/IMAN write below. With multiplexed interrupts the
-        // server drains controllers far more often (every IRQ + every client
+        // Optimization B (Phase 92d): count consumed events so an *empty* drain
+        // skips the ERDP/IMAN write below. Comparing the dequeue index alone is
+        // unsound — a drain that consumes exactly one full ring (RING_TRBS = 64
+        // events) wraps `consumer.index` back to its starting value (and toggles
+        // CCS), so `index == before` despite real consumption, which would
+        // wrongly skip the ERDP write and leave IMAN.IP set (a stuck pending
+        // interrupt). A direct count is wrap-proof. With multiplexed interrupts
+        // the server drains controllers far more often (every IRQ + every client
         // poll re-drains), and an empty-poll ERDP write both wastes an MMIO and,
         // per the command-completion path's own guard, "disturbs the
         // controller's event-ring bookkeeping". Only touch ERDP/IMAN when at
         // least one event was actually consumed.
-        let before = self.consumer.index;
+        let mut drained = 0usize;
         loop {
             let seg = self.event_ring.as_ref().expect("event ring allocated");
             let candidate = read_trb(seg, self.consumer.index);
@@ -1673,12 +1678,13 @@ impl Controller {
                 _ => {}
             }
             self.consumer.dequeue_step();
+            drained += 1;
         }
         // Advance the controller's dequeue pointer and clear the pending bit —
         // but only when the drain actually consumed events (Optimization B): an
         // empty-poll ERDP write is wasted MMIO and disturbs the ring bookkeeping
         // (the command-completion path guards the same way).
-        if self.consumer.index != before {
+        if drained > 0 {
             let erdp = self.event_ring_iova + (self.consumer.index as u64) * trb::TRB_SIZE as u64;
             self.rt_write_u64(rt_reg::ERDP, erdp | ERDP_EHB);
             self.rt_write_u32(rt_reg::IMAN, IMAN_IP | IMAN_IE);

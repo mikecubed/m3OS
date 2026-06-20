@@ -10575,9 +10575,6 @@ fn cmd_usb_multi_controller_smoke(args: &SmokeBootArgs) {
     qemu_args.push("-vga".to_string());
     qemu_args.push("std".to_string());
 
-    let out_dir = std::env::temp_dir().join("m3os-usb-multi-controller-smoke");
-    let _ = std::fs::create_dir_all(&out_dir);
-
     println!(
         "usb-multi-controller-smoke: launching QEMU with xhci0+usb-kbd (0x6) \
          and xhci1+usb-mouse (0x7) (timeout {}s, qmp {})",

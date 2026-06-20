@@ -608,6 +608,13 @@ impl<B: IrqBackend> IrqNotification<B> {
         into_notif_cap: u32,
         bit_index: u8,
     ) -> Result<Self, DriverRuntimeError> {
+        // `bit_index` names a bit in the shared notification's 64-bit word, so a
+        // value ≥ 64 is a caller contract violation (`1u64 << bit_index` would
+        // shift-overflow — panic in debug, wrong mask in release). Fail fast
+        // before touching the backend rather than corrupting the subscription.
+        if bit_index >= 64 {
+            return Err(DriverRuntimeError::from(DeviceHostError::Internal));
+        }
         let cap = backend.subscribe_into(device.cap_handle(), bit_index as u32, into_notif_cap)?;
         Ok(Self {
             cap_handle: cap,
@@ -1145,6 +1152,27 @@ mod tests {
             err,
             DriverRuntimeError::from(DeviceHostError::IrqUnavailable)
         );
+    }
+
+    #[test]
+    fn subscribe_into_rejects_out_of_range_bit_index_before_backend() {
+        // A `bit_index` ≥ 64 cannot name a bit in the 64-bit notification word —
+        // `1u64 << bit_index` would shift-overflow. The wrapper must fail fast
+        // with an Internal (caller-bug) error and must NOT touch the backend.
+        let backend = MockBackend::new();
+        let device = MockDevice { cap_handle: 7 };
+        let err = IrqNotification::subscribe_into_with_backend(backend.clone(), &device, 1, 64)
+            .expect_err("bit_index == 64 must be rejected");
+        assert_eq!(err, DriverRuntimeError::from(DeviceHostError::Internal));
+        assert!(
+            backend.subscribe_into_records().is_empty(),
+            "rejection must happen before any backend call"
+        );
+
+        // The largest valid bit index (63) must still succeed.
+        let ok = IrqNotification::subscribe_into_with_backend(backend.clone(), &device, 1, 63)
+            .expect("bit_index == 63 is valid");
+        assert_eq!(ok.bit_mask(), 1u64 << 63);
     }
 
     #[test]

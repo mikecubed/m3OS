@@ -325,12 +325,21 @@ fn process_port_events(controllers: &mut [ControllerCtx], served: &mut Vec<Attac
                                 // set out to reclaim. `notice.slot_id` still
                                 // holds the real hardware slot here (it is only
                                 // overwritten with the packed handle in the
-                                // `Some` arm). Mirrors the EnumerateChild arm.
-                                c.disable_slot(irq, notice.slot_id);
-                                write_str(
-                                    STDOUT_FILENO,
-                                    "xhci_driver: hot-plug device dropped — unpackable handle (slot reclaimed)\n",
-                                );
+                                // `Some` arm). Like the Disconnect path, only
+                                // claim "slot reclaimed" when Disable Slot
+                                // actually succeeds; otherwise log the failure
+                                // honestly so a real slot leak isn't masked.
+                                if c.disable_slot(irq, notice.slot_id) {
+                                    write_str(
+                                        STDOUT_FILENO,
+                                        "xhci_driver: hot-plug device dropped — unpackable handle (slot reclaimed)\n",
+                                    );
+                                } else {
+                                    write_str(
+                                        STDOUT_FILENO,
+                                        "xhci_driver: hot-plug device dropped — unpackable handle; Disable Slot failed, slot not reclaimed\n",
+                                    );
+                                }
                             }
                         }
                     }
@@ -454,7 +463,13 @@ pub fn run(ep: u32, discovered: u8, mut controllers: Vec<ControllerCtx>) -> ! {
                 // so an event whose bit is not yet reflected is never lost — it
                 // is picked up on the next client poll.
                 for (idx, (c, _irq, _d)) in controllers.iter_mut().enumerate() {
-                    if bits & (1u64 << idx) != 0 {
+                    // Guard the shift: only controllers 0..63 can own a bit in
+                    // the 64-bit notification word. A controller at index ≥ 64
+                    // (which the 2-bit slot-handle codec already can't address)
+                    // is left to the Message-arm safety net below, which drains
+                    // every controller — so its events are never lost, and
+                    // `1u64 << idx` can never shift-overflow.
+                    if idx < 64 && bits & (1u64 << idx) != 0 {
                         c.service_interrupt_events();
                     }
                 }
