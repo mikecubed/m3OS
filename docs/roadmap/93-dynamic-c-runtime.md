@@ -1,6 +1,6 @@
 # Phase 93 - Dynamic C Runtime (`libc.so` + shared objects)
 
-**Status:** In Progress
+**Status:** Complete
 **Source Ref:** phase-93
 **Depends on:** Phase 76 (Dynamic Linker) ✅, Phase 36 (Expanded Memory) ✅, Phase 85c (Python — surfaced the gap), the kernel syscall layer
 **Builds on:** Completes the dynamic-linking story begun in Phase 76: the linker *machinery* exists, but m3OS ships no dynamic C library for it to load, so real dynamic C programs (and runtime-`dlopen` users) cannot run. This phase provides the missing `libc.so` and the syscall coverage a dynamic libc needs.

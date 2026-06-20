@@ -1,7 +1,7 @@
 # Dynamic C Runtime (`libc.so` + shared objects)
 
 **Aligned Roadmap Phase:** Phase 93
-**Status:** In Progress
+**Status:** Complete
 **Source Ref:** phase-93
 **Supersedes Legacy Doc:** N/A (new capability)
 

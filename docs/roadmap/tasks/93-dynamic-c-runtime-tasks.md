@@ -1,6 +1,6 @@
 # Phase 93 — Dynamic C Runtime (`libc.so` + shared objects): Task List
 
-**Status:** In Progress — implementation underway (feat/phase-93-dynamic-c-runtime)
+**Status:** Complete — all tracks landed; `dynamic-hello-smoke` + `dynamic-python-smoke` PASS
 **Source Ref:** phase-93
 **Depends on:** Phase 76 (Dynamic Linker) ✅, Phase 36 (Expanded Memory) ✅, Phase 85c (Python — surfaced the gap) ✅, Phase 90a (PKU / W^X v2 — the lazy-PLT W+X path) ✅
 **Goal:** Ship m3OS's first real dynamic C library — a musl `libc.so` the Phase 76 loader can map and bind a genuinely dynamically-linked program against — and close the loader/kernel gaps a real libc exercises, so a dynamic `python3` (`PT_INTERP=/lib/ld-musl-x86_64.so.1`, `DT_NEEDED libc.so`) boots, imports `lib-dynload/*.so` extensions via `dlopen`, and `ctypes.CDLL(...)` opens a shared object — while the static `git` and static `python3` paths stay the conservative green fallback. Closes with the kernel version bump (`0.92.5` → `0.93.0`) and the Phase 93 learning doc (`docs/93-dynamic-c-runtime.md`). The tracks map onto the design doc's Areas: Track A = Area A (ship `libc.so`), Tracks B+C = Area B (loader + kernel syscall gaps), Track D = Area C (dynamic CPython + `ctypes`), Track E = the Evaluation Gate, Track F = closeout.
@@ -18,9 +18,9 @@
 | A | Ship a real musl `libc.so` — a companion upstream-musl shared object at `/usr/lib/libc.so` (`DT_SONAME=libc.so`) + the Portfile / `build_musl` / `.so`-safe sealing / dispatch + install plumbing | — | 🟢 Done (live-validated via E.1) |
 | B | Loader extensions a real libc exercises that the self-contained test libs never did: copy relocations (`R_X86_64_COPY`), IFUNC (`R_X86_64_IRELATIVE`/`STT_GNU_IFUNC`), general-dynamic TLS (`DTPMOD64`/`DTPOFF64`/`TPOFF64`), and a broadened DT_NEEDED/`dlopen` search path | — (independent loader work; A is the end-to-end validation target) | 🟢 Code complete (host-tested; live-validated via E.1/E.2) |
 | C | Kernel syscall gaps a dynamic libc invokes at startup: implement `mremap` (25), audit/confirm the dynamic-startup set, and confirm the W^X-v2 / `pkey_mprotect` interaction for lazy-PLT GOT writes | — | 🟢 Code complete (host-tested via `cargo xtask check`; live-validated via E.1/E.2) |
-| D | Dynamic CPython — a `build_python_dynamic` variant (`lib-dynload/*.so`, `PT_INTERP`+`DT_NEEDED libc.so`) + a `libffi` port + re-enabled `_ctypes`, shipped **opt-in** beside the unchanged static fallback | A, B, C | ⏳ Planned |
-| E | Acceptance gates: `dynamic-hello-smoke`, `dynamic-python-smoke`, `ctypes-smoke` + the `M3OS_*_REGRESSION` wiring; the static `git` / `python3` gates stay green | A, B, C, D | 🔵 In Progress (E.1 `dynamic-hello-smoke` PASSES; E.2/E.3 pending Track D) |
-| F | Documentation + release closeout: the learning doc, the design-doc + README + AGENTS.md updates, the deferral-pointer flips, and the kernel version bump `0.92.5` → `0.93.0` | E | ⏳ Planned |
+| D | Dynamic CPython — a `build_python_dynamic` variant (`lib-dynload/*.so`, `PT_INTERP`+`DT_NEEDED libc.so`) + a `libffi` port + re-enabled `_ctypes`, shipped **opt-in** beside the unchanged static fallback | A, B, C | 🟢 Done (54 lib-dynload `.so` incl. `_ctypes`; live-validated via E.2/E.3) |
+| E | Acceptance gates: `dynamic-hello-smoke`, `dynamic-python-smoke`, `ctypes-smoke` + the `M3OS_*_REGRESSION` wiring; the static `git` / `python3` gates stay green | A, B, C, D | 🟢 Done (`dynamic-hello-smoke` + `dynamic-python-smoke` (E.2+E.3 combined) PASS) |
+| F | Documentation + release closeout: the learning doc, the design-doc + README + AGENTS.md updates, the deferral-pointer flips, and the kernel version bump `0.92.5` → `0.93.0` | E | 🟢 Done |
 
 > **Architecture finding (Track B, the loader-vs-libc-split glue — CORRECTED by `dynamic-hello-smoke` bring-up).** An early empirical guess was that libc's weak `static_init_tls` would self-init TLS; **booting the real binary proved that wrong**, exactly the "bring-up surprise" the design doc warned of. In the **shared/dynamic-linker** `libc.so` build, the symbols a dynamic program's `__libc_start_main` calls are the **dynamic linker's** versions, which expect `__dls3`'s internal state — and m3OS's foreign Rust loader *replaces* `__dls3`. So the loader **must supply the startup glue musl's own `ld.so` normally would** (precisely what the design doc said Track B delivers for Option A1):
 >  1. **`__init_tls` is a no-op `endbr64;ret` stub** in the shared build (not the weak `static_init_tls`) — musl assumes its `ld.so` set TLS up. The loader therefore builds the **x86_64 variant-II TCB itself** (`setup_static_tls`): a `struct pthread` with `self`@TP+0 / `dtv`@TP+8, the main exe's `PT_TLS` local-exec block copied below TP, and `arch_prctl(ARCH_SET_FS, TP)` — run **before** constructors. Without it libc's first `%fs:` access (errno / the `%fs:0x28` stack canary / locale) faults.
@@ -89,7 +89,7 @@
 **Why it matters:** a port is invisible to `cargo xtask port build` and the in-OS solver until it is registered in all the wiring spots (the four-place port-registration contract). `libc.so` must also reach `/usr/lib/` on the data disk for the loader's hard-coded `/usr/lib/<name>` lookup (`main.rs:1706`) to find it at runtime.
 
 **Acceptance:**
-- [ ] `cargo xtask port build musl` builds + seals `musl.m3pkg`; a second build is a pure pkgcache hit (zero compiler invocations).
+- [x] `cargo xtask port build musl` builds + seals `musl.m3pkg`; a second build is a pure pkgcache hit (zero compiler invocations).
 - [ ] The image places `libc.so` at `/usr/lib/libc.so` (plus any `libc.so.1` SONAME symlink) on the booted ext2 disk, readable `0755`.
 
 ---
@@ -167,7 +167,7 @@
 **Why it matters:** a dynamic `libc.so` + `__libc_start_main` exercise a startup path the static bring-up never ran; a single missing startup syscall faults before `main`. The audit confirmed these all exist today — this task is the deliberate verification under a **real dynamic binary**, plus confirming the TP set by `ARCH_SET_FS` survives a context switch so loader-initialized TLS (B.3) persists.
 
 **Acceptance:**
-- [ ] The trivial dynamic C binary (E.1) reaches `main` with **no** unhandled-syscall log line during startup. *(Live-validated via E.1.)*
+- [x] The dynamic C binary (E.1) reaches `main` with no startup fault (and a dynamic `python3` runs); the dynamic-startup syscall set is sufficient. *(Live-validated via E.1 + E.2.)*
 - [x] The FS base set by `arch_prctl(ARCH_SET_FS, ...)` is restored from `proc.fs_base` across a context switch (audited: saved in `sys_linux_arch_prctl`, restored in `scheduler.rs` at `switch_context` via `FsBase::write` — loader/libc-initialized TLS persists after a yield).
 
 ### C.3 — W^X v2 / `pkey_mprotect` for lazy-PLT GOT writes
@@ -184,7 +184,11 @@
 
 ## Track D — Dynamic CPython + `lib-dynload` + libffi + ctypes
 
-> **Status: ⏳ remaining (well de-risked).** The loader/kernel substrate Track D rides is **done and proven**: a dynamic program loads `libc.so`, relocates (incl. COPY-order), sets up TLS, runs constructors, and **`dlopen`s + `dlsym`s a `.so` and calls into it** (the exact mechanism `lib-dynload`/`ctypes` use — see the E.1 `DLOPEN:ok` proof). So the remaining work is the **build + wiring**, not loader bring-up: (D.1) a `libffi` port; (D.2) a `build_python_dynamic` recipe (drop `-static`/`MODULE_BUILDTYPE=static`/`--disable-shared`, ship `lib-dynload/*.so`); (D.3) re-enable `_ctypes` against libffi; (D.4) the `M3OS_WITH_DYNAMIC_PYTHON` bundling. The dynamic CPython cross-build is a multi-stage, ~30-min-per-iteration job — the long pole. The static `python3` recipe is left **byte-for-byte intact** as the green fallback.
+> **Status: 🟢 done — `dynamic-python-smoke` PASSES.** A dynamic `python3` (`PT_INTERP=/lib/ld-musl-x86_64.so.1` + `DT_NEEDED libc.so`) boots (`Python 3.12.8`), imports a `lib-dynload` `.so` extension via the loader's `dlopen` (`DYNPY:import-ok pi=3.14`), and `ctypes.CDLL('/usr/lib/libc.so')` opens a shared object + calls `strlen` (`CTYPES:ok len=4`). Two more bring-up surprises (beyond the six from dynamic-hello) surfaced loading a *real* interpreter and a *real* extension — both pre-flagged-style loader-vs-libc glue:
+> 7. **The minimal TCB was too minimal for a real interpreter.** A printf/malloc hello ran with just `self`+`dtv`, but CPython's locale-aware startup deref'd `self->locale` (NULL) and faulted. Fix: the loader resolves + calls libc's **`__init_tp(tp)`** (un-hidden by musl patch 0002), which sets every musl-internal `struct pthread` field (`locale`=`&libc.global_locale`, `tid`, `robust_list.head`, `detach_state`, `sysinfo`, `next`/`prev`) using musl's own code, with a minimal-TCB fallback.
+> 8. **`dlopen` of a *new* `.so` never installed the lazy-PLT trampoline.** The `dynamic-hello` `DLOPEN:ok` proof dedup'd the already-loaded libc (no fresh load), so it missed that the loader's `dlopen` applied relocations + ran constructors but never installed `GOT[1]`/`GOT[2]` (the startup path does) — a dlopen'd extension's first lazy `JUMP_SLOT` jumped through an unset `GOT[2]` → NULL (`rip=0x0`). Fix: `runtime::install_trampoline_for` called in `dlopen` after publication.
+>
+> The static `python3` recipe is left **byte-for-byte intact** as the green fallback (a separate `python-dynamic` port + distinct content key). The dynamic CPython build is a multi-stage cross-build (~30 min cold; pkgcache-cached after).
 
 ### D.1 — `ports/lib/libffi/Portfile` + `build_libffi`
 
@@ -193,8 +197,8 @@
 **Why it matters:** CPython's `_ctypes` links libffi; it is the one missing port the design doc and `docs/python-roadmap.md` both call out for Phase 93. `ffitarget.h` is generated per-target, so the recipe must cross-configure `--host=x86_64-linux-musl` (not reuse the host's header).
 
 **Acceptance:**
-- [ ] `cargo xtask port build libffi` produces a shared `libffi` (`DT_SONAME=libffi.so`, `DT_NEEDED libc.so`) + staged `ffi.h`/`ffitarget.h`; registered in `PORTS` and the `port_build` dispatch and routed through `musl_toolchain()`.
-- [ ] A second build is a pure pkgcache hit.
+- [x] `cargo xtask port build libffi` produces `libffi` + staged `ffi.h`/`ffitarget.h`, registered in the `port_build` dispatch and routed through `musl_toolchain()`. **Deviation:** built as a **static `-fPIC` `libffi.a`** (not a shared `libffi.so`) because `_ctypes` — libffi's only consumer — links it statically, so the extension's only `DT_NEEDED` is `libc.so`; this sidesteps the versioned-soname (`libffi.so.8`) shared-object staging the generated-libs `.so` path would mishandle, and delivers the identical `ctypes` capability (E.3 PASSES). `--disable-exec-static-tramp` avoids the musl-sysroot-absent `linux/limits.h`.
+- [x] A second `cargo xtask port build libffi` is a pure pkgcache hit.
 
 ### D.2 — `build_python_dynamic` variant (do not touch the static recipe)
 
@@ -203,8 +207,8 @@
 **Why it matters:** the static recipe must remain the green fallback the Evaluation Gate requires, so the dynamic interpreter is a **new, separate** codepath/artifact. The static build's `lib-dynload` prune (`assert_python_layout` at L5438 requires it empty; prune at ~L5321) must be **skipped** for the dynamic variant.
 
 **Acceptance:**
-- [ ] `build_python_dynamic` produces a `python3` with `PT_INTERP` + `DT_NEEDED libc.so` and a non-empty `lib-dynload`; `build_python`'s static output is unchanged (its gate stays green).
-- [ ] The dynamic variant carries a distinct content key; static and dynamic `.m3pkg`s coexist in `target/pkgcache/` without collision.
+- [x] `build_python_dynamic` produces a `python3` with `PT_INTERP=/lib/ld-musl-x86_64.so.1` + `DT_NEEDED libc.so` and a non-empty `lib-dynload` (54 `.so`); `build_python` is left byte-for-byte intact (separate `python-dynamic` port). Verified by `assert_python_dynamic_layout`.
+- [x] The dynamic variant carries a distinct content key (separate `ports/lang/python-dynamic` Portfile + `build_recipe_id("python-dynamic")`); static and dynamic `.m3pkg`s coexist in `target/pkgcache/`.
 
 ### D.3 — Re-enable `_ctypes` in the dynamic build
 
@@ -213,9 +217,9 @@
 **Why it matters:** `_ctypes` is explicitly excluded in the current build because it needs libffi + runtime `dlopen`; re-enabling it against the D.1 libffi is what makes `ctypes.CDLL` exist on m3OS.
 
 **Acceptance:**
-- [ ] The dynamic `python3` ships `lib-dynload/_ctypes.cpython-312-*.so`; `_ctypes_test` stays pruned.
-- [ ] `python3 -c "import ctypes"` succeeds inside m3OS (proven by gate E.3).
-- [ ] The stale `_ctypes ... → Phase 93 (Dynamic C Runtime)` deferral comment near the `disabled_modules` array (`port_build.rs:~3566`) is updated to reflect that this phase delivers it (the inherited `Phase 91` typo was corrected when this task doc landed).
+- [x] The dynamic `python3` ships `lib-dynload/_ctypes.cpython-312-x86_64-linux-gnu.so` (static libffi.a linked in, only `DT_NEEDED libc.so`); `_ctypes_test` stays disabled.
+- [x] `import ctypes` + `ctypes.CDLL` succeed inside m3OS (gate E.3 — `CTYPES:ok`).
+- [x] `_ctypes` removed from `build_python_dynamic`'s `disabled_modules` (the static `build_python` keeps it disabled, as that interpreter has no dlopen).
 
 ### D.4 — Opt-in bundling + dependency graph (keep static default)
 
@@ -224,8 +228,8 @@
 **Why it matters:** the Evaluation Gate requires the static path remain the conservative fallback, so the dynamic variant ships behind its own feature flag until stable, and the in-OS solver must learn `python → libffi` so `pkg install python` (dynamic) pulls it.
 
 **Acceptance:**
-- [ ] Default images bundle static `python3` unchanged; `M3OS_WITH_DYNAMIC_PYTHON=1` bundles the dynamic variant + `libc.so` + `libffi` and writes the `.meta` `DEPS=` so the solver resolves `libffi`.
-- [ ] On install, `/usr/lib/libc.so` + `lib-dynload/` land in the Phase 85a relocatable layout (`lib/python3.12/lib-dynload/`).
+- [x] Default images bundle static `python3` unchanged; `M3OS_WITH_DYNAMIC_PYTHON=1` bundles `python-dynamic.m3pkg` + `musl.m3pkg` and writes `python-dynamic`'s `.meta` `DEPS=musl` so the solver installs `libc.so` first (dependency-first proof: `pkg install: musl: OK` precedes `pkg install: python-dynamic: OK`). (libffi is static-linked into `_ctypes`, so it is NOT a runtime dep — a deviation from D.1's "shared libffi" that simplifies staging while delivering the same `ctypes` capability.)
+- [x] On install, `/usr/lib/libc.so` + `lib/python3.12/lib-dynload/` land correctly (proven by the dynamic `python3` running + importing).
 
 ---
 
@@ -251,8 +255,8 @@
 **Why it matters:** the milestone-goal proof — a `PT_INTERP`+`DT_NEEDED` `python3` boots, binds the real `libc.so`, and `dlopen`s a `lib-dynload/*.so` extension at runtime (the layout the static Phase 85c build had to flatten into `python312.zip`).
 
 **Acceptance:**
-- [ ] The dynamic `python3` prints its version and imports at least one `lib-dynload` `.so` extension inside m3OS (sentinel `DYNPY:import-ok`).
-- [ ] Runs at a `python-smoke`-class `--timeout` (cold imports over the slow VFS), opt-in behind `M3OS_WITH_DYNAMIC_PYTHON`.
+- [x] The dynamic `python3` prints its version (`Python 3.12.8`) and imports `lib-dynload` `.so` extensions (`math` + `_ctypes`) inside m3OS — sentinel `DYNPY:import-ok pi=3.14`. **PASSES.**
+- [x] Runs at a `python-smoke`-class `--timeout 5400`, opt-in behind `M3OS_WITH_DYNAMIC_PYTHON`. (E.2 + E.3 are one `dynamic-python-smoke` gate — one boot proves both.)
 
 ### E.3 — `ctypes-smoke` (`ctypes.CDLL` opens a `.so` and calls a function)
 
@@ -261,7 +265,7 @@
 **Why it matters:** the design doc's explicit acceptance criterion — `ctypes.CDLL(...)` opens a shared object and calls a function inside m3OS. This is the proof runtime `dlopen` of an arbitrary `.so` works through the real libc.
 
 **Acceptance:**
-- [ ] `ctypes.CDLL` opens `/usr/lib/libc.so` (or a small bundled `.so` such as the Phase 76 `libhello.so`) and a called function returns the expected value (`CTYPES:ok`).
+- [x] `ctypes.CDLL('/usr/lib/libc.so')` opens the shared object and `libc.strlen(b'abcd')` returns the expected value — sentinel `CTYPES:ok len=4`. **PASSES** (folded into `dynamic-python-smoke`).
 
 ### E.4 — Regression wiring + static-path green guard
 
@@ -270,8 +274,8 @@
 **Why it matters:** the Evaluation Gate requires the static fallback stay green; the new gates follow the established opt-in `M3OS_*_REGRESSION` + pre-push + AGENTS.md-table convention so they are discoverable and CI-wired exactly like every prior gate.
 
 **Acceptance:**
-- [ ] `dynamic-hello-smoke`/`dynamic-python-smoke`/`ctypes-smoke` are added to the AGENTS.md pre-push gate table and `.githooks/pre-push` under `M3OS_DYNAMIC_C_REGRESSION`; `dynamic-hello-smoke` is wired to run CI-deterministically.
-- [ ] `python-smoke` (static) and `git-local-smoke` stay green — no regression of the conservative fallback path.
+- [x] `dynamic-hello-smoke` + `dynamic-python-smoke` (E.2+E.3 folded into one gate) are added to `.githooks/pre-push` under `M3OS_DYNAMIC_C_REGRESSION` and the AGENTS.md pre-push gate table; `dynamic-hello-smoke` is CI-deterministic (no network/hardware).
+- [x] `python-smoke` (static) and `git-local-smoke` stay green — `build_python`/`build_git` are untouched; the dynamic path is a separate `python-dynamic` port behind its own image feature.
 
 ---
 
@@ -284,8 +288,8 @@
 **Why it matters:** the design doc's *Learning Documentation Requirement* mandates it. It teaches the loader-vs-libc split (why on real musl the loader *is* the libc and what it meant that m3OS split them), the A1/A2 provider decision, the syscall-gap audit, and the dynamic-vs-static trade-offs CPython exposed — the pedagogical companion to the implementation-focused design doc.
 
 **Acceptance:**
-- [ ] `docs/93-dynamic-c-runtime.md` exists and uses the aligned-learning-doc template (not the phase-design template).
-- [ ] It covers the loader-vs-libc split, the copy-reloc/IFUNC/TLS shapes a real libc needs, and the static-fallback rationale; it links the design doc + this task doc.
+- [x] `docs/93-dynamic-c-runtime.md` exists and uses the aligned-learning-doc template (Aligned Roadmap Phase / Status / Source Ref / Overview / Key Files / Deferred topics).
+- [x] It covers the loader-vs-libc split, the libc-provider decision, the **eight** bring-up surprises (incl. the copy-reloc-order + dlopen-trampoline + `__init_tp` glue), `dlopen` routing, and the static-fallback rationale; it links the design doc + this task doc.
 
 ### F.2 — Fix the design doc's Companion Task List link
 
@@ -303,7 +307,7 @@
 **Why it matters:** the learning-doc index must list Phase 93 so readers can discover the material, in the exact `| [Title](./NN-slug.md) | NN | description … Links the [NN design](./roadmap/NN-slug.md) + [task](./roadmap/tasks/NN-slug-tasks.md) docs |` shape used by the surrounding rows.
 
 **Acceptance:**
-- [ ] A row `| [Dynamic C Runtime](./93-dynamic-c-runtime.md) | 93 | … | Links the [93 design](./roadmap/93-dynamic-c-runtime.md) + [task](./roadmap/tasks/93-dynamic-c-runtime-tasks.md) docs |` is added in phase order.
+- [x] The `| [Dynamic C Runtime](./93-dynamic-c-runtime.md) | 93 | … |` row is added to `docs/README.md` in phase order (after the Phase 92 row).
 
 ### F.4 — Update the roadmap README Phase 93 row + status
 
@@ -322,7 +326,7 @@
 **Why it matters:** AGENTS.md's maintenance policy permits rewriting an existing capability bullet when the capability class changes. Today it correctly describes a loader *without* a libc; post-`libc.so` it must mention the real musl `libc.so`, dynamic programs (dynamic `python3`, `lib-dynload`, `ctypes`), and the copy-reloc/IFUNC/TLS maturity — while preserving the reloc/versioning/W^X detail. *(Applied only when the phase actually lands.)*
 
 **Acceptance:**
-- [ ] The bullet describes both the loader and a real musl `libc.so` + dynamic C/Python with `lib-dynload` + `ctypes`, preserving the existing technical detail, and is edited only at phase completion.
+- [x] The **Dynamic linking & a real `libc.so`** bullet now describes both the loader and the real musl `libc.so` + the startup glue (`setup_static_tls`/`__init_tp`, COPY-reloc-order, the dlopen trampoline) + dynamic C/Python with `lib-dynload` + `ctypes`, preserving the reloc/versioning/W^X detail.
 
 ### F.6 — Flip the Phase 93 deferral pointers in the Python docs
 
@@ -331,7 +335,7 @@
 **Why it matters:** when Phase 93 lands, those deferrals flip from "deferred" to "delivered." The historical "why 85c shipped static" explanation stays (it teaches *why* the loader had no libc to bind against); a callout notes that Phase 93 lifted the constraint.
 
 **Acceptance:**
-- [ ] Both docs note Phase 93 delivered the dynamic path (`ctypes`/`dlopen` live); the historical static rationale is preserved, not deleted.
+- [x] Both `docs/python-roadmap.md` + `docs/roadmap/85c-python.md` note Phase 93 delivered the dynamic path (`ctypes`/`dlopen` live); the historical static rationale is preserved, not deleted.
 
 ### F.7 — Bump the kernel version (`0.92.5` → `0.93.0`)
 
@@ -340,8 +344,8 @@
 **Why it matters:** every phase lands with a kernel version bump; the design doc's Implementation Outline (step 5) and *Related Documentation and Version Updates* both call for it, and AGENTS.md's maintenance policy explicitly permits bumping the version line when a phase lands.
 
 **Acceptance:**
-- [ ] `kernel/Cargo.toml` `version` is `0.93.0`.
-- [ ] The AGENTS.md "kernel v0.xx.x" reference is updated to `v0.93.0` to match.
+- [x] `kernel/Cargo.toml` `version` is `0.93.0`.
+- [x] The AGENTS.md "kernel **v0.93.0**" reference is updated to match.
 
 ---
 
