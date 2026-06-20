@@ -345,6 +345,14 @@ const SMOKE_EXIT_SMP_SMOKE_FAILED: i32 = 87;
 /// startup-syscall set (Track C) compose.
 const SMOKE_EXIT_DYNAMIC_HELLO_FAILED: i32 = 88;
 
+/// Phase 93 E.2/E.3 — `cargo xtask dynamic-python-smoke` exit code. Builds the
+/// DYNAMIC CPython chain (musl libc.so + libffi + the `python-dynamic` variant),
+/// builds an `M3OS_WITH_DYNAMIC_PYTHON` image, boots, `pkg install
+/// python-dynamic` (the solver installs musl/libc.so first via `DEPS=musl`),
+/// then asserts `python3 --version`, a `lib-dynload` `.so` import (`DYNPY:import-ok`),
+/// and `ctypes.CDLL('/usr/lib/libc.so')` calling `strlen` (`CTYPES:ok`).
+const SMOKE_EXIT_DYNAMIC_PYTHON_FAILED: i32 = 89;
+
 /// Phase 91 — `cargo xtask ipv6-smoke` exit code. Boots m3OS with QEMU SLIRP
 /// `ipv6=on` and runs the `ipv6-smoke` ramdisk binary, which exercises the
 /// always-on, CI-deterministic dual-stack substrate from ring 3 (AF_INET6 socket
@@ -1065,6 +1073,16 @@ fn main() {
                 });
             cmd_dynamic_hello_smoke(&smoke_args);
         }
+        // Phase 93 E.2/E.3 — dynamic CPython: imports a lib-dynload .so + ctypes.
+        Some("dynamic-python-smoke") => {
+            let smoke_args = parse_smoke_boot_args("dynamic-python-smoke", &args[2..])
+                .unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_dynamic_python_smoke(&smoke_args);
+        }
         // Phase 86d — `cargo xtask go-runtime-smoke` boots m3OS, installs the
         // bundled static-Go `.m3pkg` (`pkg install go`), and runs the runtime
         // probe over serial: GO_HELLO_OK (runtime up), GO_GOROUTINE_OK (a
@@ -1439,7 +1457,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -21611,6 +21629,171 @@ fn dynamic_hello_smoke_steps() -> Vec<SmokeStep> {
     steps
 }
 
+/// Phase 93 E.2 + E.3 — `dynamic-python-smoke`. Builds the DYNAMIC CPython chain
+/// (musl `libc.so` + libffi + the `python-dynamic` variant), builds an
+/// `M3OS_WITH_DYNAMIC_PYTHON` image, boots, `pkg install python-dynamic` (the
+/// solver installs musl/libc.so first via `DEPS=musl`), then proves a dynamic
+/// `python3` boots, imports a `lib-dynload` `.so` extension via `dlopen`
+/// (`DYNPY:import-ok`), and `ctypes.CDLL('/usr/lib/libc.so')` opens a shared
+/// object and calls `strlen` (`CTYPES:ok`). The static `python3` path is unaffected.
+fn cmd_dynamic_python_smoke(args: &SmokeBootArgs) {
+    if let Err(msg) = port_build::build_python_dynamic_port() {
+        eprintln!("dynamic-python-smoke: precondition failed (dynamic python build): {msg}");
+        std::process::exit(SMOKE_EXIT_DYNAMIC_PYTHON_FAILED);
+    }
+
+    // Bundle the dynamic python + musl libc.so into /usr/pkg.
+    unsafe {
+        std::env::set_var("M3OS_WITH_DYNAMIC_PYTHON", "1");
+    }
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, display_mode, DeviceSet::default());
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    let steps = dynamic_python_smoke_steps();
+    println!(
+        "dynamic-python-smoke: launching QEMU (timeout {}s, {} steps)",
+        args.timeout_secs,
+        steps.len()
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            println!(
+                "dynamic-python-smoke: PASSED ({} steps in {}s)",
+                steps.len(),
+                start.elapsed().as_secs()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("dynamic-python-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_DYNAMIC_PYTHON_FAILED);
+        }
+    }
+}
+
+/// Serial script for `dynamic-python-smoke`. Sentinels are runtime-constructed
+/// (e.g. `'CTYPES:ok len='+str(...)`) so a `Wait` never matches the echoed
+/// command line. Generous timeouts: cold stdlib imports over the slow ring-3 VFS
+/// take minutes.
+fn dynamic_python_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/dynamic-python-smoke: kernel first message",
+    }];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    // Install the dynamic python; the solver installs musl (libc.so) first.
+    steps.push(SmokeStep::Send {
+        input: "pkg install python-dynamic\n",
+        label: "dynamic-python-smoke: pkg install python-dynamic",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "pkg install: resolving python-dynamic + dependencies",
+        timeout_secs: 30,
+        label: "dynamic-python-smoke: dependency solver engaged",
+    });
+    // Dependency-first proof: musl (libc.so) installs before python-dynamic.
+    steps.push(SmokeStep::Wait {
+        pattern: "pkg install: musl: OK",
+        timeout_secs: 120,
+        label: "dynamic-python-smoke: musl (libc.so) installed first",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "pkg install: python-dynamic: OK",
+        fail_prefixes: &["pkg install: cannot"],
+        timeout_secs: 900,
+        label: "dynamic-python-smoke: python-dynamic installed",
+        exit_code_on_fail: SMOKE_EXIT_DYNAMIC_PYTHON_FAILED,
+    });
+
+    // Version — proves the dynamic interpreter boots (loads libc.so, relocates,
+    // TLS, runs to the version print).
+    steps.push(SmokeStep::Send {
+        input: "python3 --version\n",
+        label: "dynamic-python-smoke: python3 --version",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Python 3.12.8",
+        timeout_secs: 240,
+        label: "dynamic-python-smoke: version",
+    });
+
+    // E.2 — import a lib-dynload `.so` extension (math + _ctypes are dlopen'd
+    // shared modules in the dynamic build). The sentinel is runtime-built.
+    steps.push(SmokeStep::Send {
+        input: "python3 -c \"import math, _ctypes; print('DYNPY:'+'import-ok pi='+format(math.pi,'.2f'))\"\n",
+        label: "dynamic-python-smoke: import lib-dynload .so",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "DYNPY:import-ok pi=3.14",
+        fail_prefixes: &[
+            "Traceback (most recent call last)",
+            "ended by signal SIGSEGV",
+        ],
+        timeout_secs: 360,
+        label: "dynamic-python-smoke: DYNPY:import-ok (lib-dynload dlopen)",
+        exit_code_on_fail: SMOKE_EXIT_DYNAMIC_PYTHON_FAILED,
+    });
+
+    // E.3 — ctypes.CDLL opens a shared object and calls a function.
+    steps.push(SmokeStep::Send {
+        input: "python3 -c \"import ctypes; libc=ctypes.CDLL('/usr/lib/libc.so'); libc.strlen.restype=ctypes.c_size_t; libc.strlen.argtypes=[ctypes.c_char_p]; print('CTYPES:'+'ok len='+str(libc.strlen(b'abcd')))\"\n",
+        label: "dynamic-python-smoke: ctypes.CDLL + call",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "CTYPES:ok len=4",
+        fail_prefixes: &[
+            "Traceback (most recent call last)",
+            "ended by signal SIGSEGV",
+        ],
+        timeout_secs: 240,
+        label: "dynamic-python-smoke: CTYPES:ok (ctypes.CDLL opens + calls)",
+        exit_code_on_fail: SMOKE_EXIT_DYNAMIC_PYTHON_FAILED,
+    });
+    steps
+}
+
 fn cmd_python_smoke(args: &SmokeBootArgs) {
     // Build python (+ zlib) so the `.m3pkg` artifacts exist for the data disk to
     // bundle into `/usr/pkg/`. The first build two-stage cross-compiles CPython
@@ -25951,6 +26134,43 @@ fn populate_phase_69d_ports(part_path: &Path, workspace_root: &Path) {
                  run `cargo xtask port build node` first (or the node-smoke gate)"
             ),
             Err(e) => eprintln!("phase-89: node artifact path error: {e}"),
+        }
+    }
+
+    // Phase 93 Track D.4 — the DYNAMIC CPython variant + the musl `libc.so` it
+    // binds against, bundled into `/usr/pkg/` only behind `M3OS_WITH_DYNAMIC_PYTHON`
+    // (default images keep the static `python3`). `pkg install python-dynamic`
+    // then resolves `DEPS=musl`, installing `/usr/lib/libc.so` first, then the
+    // dynamic interpreter + its `lib-dynload/*.so`. Both `.m3pkg`s must be present
+    // (built by `dynamic-python-smoke` or `cargo xtask port build python-dynamic`).
+    if std::env::var("M3OS_WITH_DYNAMIC_PYTHON").is_ok() {
+        for port in ["musl", "python-dynamic"] {
+            match port_build::pkgcache_artifact_path(port) {
+                Ok(artifact) if artifact.is_file() => match fs::read(&artifact) {
+                    Ok(bytes) if pkg_format::verify(&bytes) => {
+                        m3pkg_files.push((format!("usr/pkg/{port}.m3pkg"), artifact.clone()));
+                        let version = port_build::port_version(port).unwrap_or_default();
+                        let deps = port_build::port_deps(port).join(" ");
+                        let meta_host = preinstall_root.join(format!("{port}.meta"));
+                        let _ = fs::create_dir_all(&preinstall_root);
+                        if fs::write(&meta_host, format!("VERSION={version}\nDEPS={deps}\n"))
+                            .is_ok()
+                        {
+                            m3pkg_files.push((format!("usr/pkg/{port}.meta"), meta_host));
+                        }
+                        println!(
+                            "ports: bundled {port}.m3pkg (opt-in M3OS_WITH_DYNAMIC_PYTHON) into /usr/pkg"
+                        );
+                    }
+                    Ok(_) => eprintln!("phase-93: {port}.m3pkg failed verify — skipping bundle"),
+                    Err(e) => eprintln!("phase-93: read {} failed: {e}", artifact.display()),
+                },
+                Ok(_) => eprintln!(
+                    "phase-93: M3OS_WITH_DYNAMIC_PYTHON set but {port}.m3pkg is not built — \
+                     run `cargo xtask port build python-dynamic` first (or dynamic-python-smoke)"
+                ),
+                Err(e) => eprintln!("phase-93: {port} artifact path error: {e}"),
+            }
         }
     }
 

@@ -587,6 +587,35 @@ fn build_recipe_id(name: &str) -> &'static str {
              prune=vendor/{audio-capture,seccomp},vendor/ripgrep/{arm64-*,x64-darwin,x64-win32};\
              recipe-v=3"
         }
+        // Phase 93 Track A — musl libc.so shared object (Rust recipe lives in
+        // build_musl, not captured by recipe_digest, so pin it here).
+        "musl" => {
+            "configure:--prefix=/usr --disable-static --enable-shared \
+             --host=x86_64-linux-musl;cflags:-O2 -fPIC;ldflags:-Wl,-soname,libc.so;\
+             stage:usr/lib/libc.so-only(no ld.so symlink);verify:SONAME+malloc+no-NEEDED;recipe-v=1"
+        }
+        // Phase 93 Track D.1 — static -fPIC libffi.a for _ctypes.
+        "libffi" => {
+            "configure:--prefix=/usr/local --enable-static --disable-shared \
+             --disable-multi-os-directory --disable-docs --disable-exec-static-tramp \
+             --host=x86_64-linux-musl;cflags:-O2 -fPIC;recipe-v=1"
+        }
+        // Phase 93 Track D.2/D.3 — DYNAMIC CPython (mirrors `python` minus -static
+        // / MODULE_BUILDTYPE=static, plus _ctypes re-enabled against libffi).
+        "python-dynamic" => {
+            "two-stage-DYNAMIC:host(--disable-test-modules --without-ensurepip)+\
+             cross(MODULE_BUILDTYPE=shared LDFLAGS=no-static --host=x86_64-linux-musl \
+             --build=$(cc -dumpmachine) --with-build-python=<host> --disable-shared \
+             --disable-ipv6 --without-ensurepip --without-pymalloc --disable-test-modules \
+             --prefix=/usr);ac_cv:_dev_ptmx=no,_dev_ptc=no,buggy_getaddrinfo=no;\
+             pkgconfig=isolated;zlib:ZLIB_*=<staged libz.a>;\
+             curses(build-only,ncurses-6.5):CURSES_*/PANEL_*=<staged wide ncurses>;\
+             libffi:LIBFFI_CFLAGS/LIBFFI_LIBS=<staged static libffi.a>;_ctypes=ENABLED;\
+             na=_ctypes_test,_ssl,_hashlib,readline,_sqlite3,_dbm,_gdbm,_tkinter,nis,\
+             _uuid,_bz2,_lzma,ossaudiodev,_crypt,xxlimited,xxlimited_35;\
+             neuter=checksharedmods;prune=test,config-3.12,include,libpython.a,__pycache__;\
+             keep=lib-dynload+loose-stdlib(no-freeze);recipe-v=1"
+        }
         _ => "",
     }
 }
@@ -822,6 +851,16 @@ pub fn port_deps(name: &str) -> &'static [&'static str] {
     match name {
         "less" => &["ncurses"],
         "htop" => &["ncurses"],
+        // Phase 93: musl (libc.so) is self-contained (no deps).
+        "musl" => &[],
+        // Phase 93 Track D — the DYNAMIC python's only RUNTIME dep is musl
+        // (the `/usr/lib/libc.so` its `DT_NEEDED` binds against + every
+        // lib-dynload `.so` loads). zlib/ncurses/libffi are BUILD-only — their
+        // archives are static-linked into the extensions, so they are NOT
+        // installed at runtime (their build recipes are pinned in
+        // `build_recipe_id("python-dynamic")`, mirroring how the static `python`
+        // keeps the heavy ncurses terminfo DB out of its runtime deps).
+        "python-dynamic" => &["musl"],
         // Order is irrelevant to the content key (deps are sorted in
         // `compute_package_key`); it only sets the install sequence the in-OS
         // solver follows — libevent (a small static lib) before the heavyweight
@@ -1491,12 +1530,14 @@ fn port_build(name: &str) -> Result<(), String> {
     let zlib_stage = stage_root.join("zlib");
     let mbedtls_stage = stage_root.join("mbedtls");
     let curl_stage = stage_root.join("curl");
+    let libffi_stage = stage_root.join("libffi");
 
     match name {
         "ncurses" => build_ncurses(&extracted, &stage, &toolchain)?,
         "libevent" => build_libevent(&extracted, &stage, &toolchain)?,
         "zlib" => build_zlib(&extracted, &stage, &toolchain)?,
         "musl" => build_musl(&extracted, &stage, &toolchain)?,
+        "libffi" => build_libffi(&extracted, &stage, &toolchain)?,
         "less" => build_less(&extracted, &stage, &toolchain, &ncurses_stage)?,
         "htop" => build_htop(&extracted, &stage, &toolchain, &ncurses_stage)?,
         "tmux" => build_tmux(
@@ -1515,6 +1556,14 @@ fn port_build(name: &str) -> Result<(), String> {
             &mbedtls_stage,
         )?,
         "python" => build_python(&extracted, &stage, &toolchain, &zlib_stage, &ncurses_stage)?,
+        "python-dynamic" => build_python_dynamic(
+            &extracted,
+            &stage,
+            &toolchain,
+            &zlib_stage,
+            &ncurses_stage,
+            &libffi_stage,
+        )?,
         "llvm" => build_llvm(&extracted, &stage, &toolchain)?,
         "dropbear" => build_dropbear(&extracted, &stage, &toolchain)?,
         "mbedtls" => build_mbedtls(&extracted, &stage, &toolchain)?,
@@ -2308,6 +2357,81 @@ fn which_readelf() -> String {
         }
     }
     "readelf".to_string()
+}
+
+/// Phase 93 Track D.1 — build libffi as a static `-fPIC` archive (`libffi.a`)
+/// + its target-generated headers (`ffi.h`, `ffitarget.h`). CPython's `_ctypes`
+/// is libffi's only consumer here and links it **statically** into
+/// `_ctypes.cpython-*.so`, so the extension's only `DT_NEEDED` is `libc.so` —
+/// avoiding the versioned-soname (`libffi.so.8`) shared-object staging the
+/// generated-libs `.so` path would mishandle. `ffitarget.h` is generated per
+/// target, so we cross-configure `--host=x86_64-linux-musl` (never reuse the
+/// host header). Routes the toolchain through the shared musl plumbing.
+fn build_libffi(
+    src: &Path,
+    stage: &Path,
+    (cc, ar, ranlib): &(&'static str, String, String),
+) -> Result<(), String> {
+    let stage_prefix = stage.join("usr/local");
+    fs::create_dir_all(&stage_prefix).map_err(|e| format!("mkdir: {e}"))?;
+
+    let extra_ld = musl_extra_ldflags_joined();
+    let ldflags = if extra_ld.is_empty() {
+        String::new()
+    } else {
+        extra_ld
+    };
+
+    let mut configure_cmd = Command::new("sh");
+    configure_cmd
+        .current_dir(src)
+        .arg("./configure")
+        .arg("--prefix=/usr/local")
+        .arg("--enable-static")
+        .arg("--disable-shared")
+        .arg("--disable-multi-os-directory") // headers in include/, not lib/../include
+        .arg("--disable-docs")
+        // The static-exec closure trampoline pulls in `linux/limits.h`, which the
+        // musl cross sysroot does not ship; disable it (libffi falls back to the
+        // legacy trampoline — _ctypes works the same).
+        .arg("--disable-exec-static-tramp")
+        .arg("--host=x86_64-linux-musl")
+        .env("CC", cc)
+        .env("AR", ar)
+        .env("RANLIB", ranlib)
+        .env("CFLAGS", "-O2 -fPIC")
+        .env("LDFLAGS", &ldflags);
+    run(&mut configure_cmd, "libffi configure")?;
+
+    let mut make_cmd = Command::new("make");
+    make_cmd.current_dir(src).arg(format!("-j{}", num_jobs()));
+    run(&mut make_cmd, "libffi make")?;
+
+    let mut install_cmd = Command::new("make");
+    install_cmd
+        .current_dir(src)
+        .arg("install")
+        .arg(format!("DESTDIR={}", stage.display()));
+    run(&mut install_cmd, "libffi install")?;
+
+    let lib = stage_prefix.join("lib/libffi.a");
+    if !lib.exists() {
+        return Err(format!("libffi build missing {}", lib.display()));
+    }
+    let hdr = stage_prefix.join("include/ffi.h");
+    let tgt = stage_prefix.join("include/ffitarget.h");
+    if !hdr.exists() || !tgt.exists() {
+        return Err(format!(
+            "libffi build missing headers ({} / {})",
+            hdr.display(),
+            tgt.display()
+        ));
+    }
+    println!(
+        "libffi: produced /usr/local/lib/libffi.a ({} bytes) + ffi.h/ffitarget.h",
+        file_size(&lib)
+    );
+    Ok(())
 }
 
 fn build_less(
@@ -3832,6 +3956,288 @@ fn build_python(
     prune_python_stage(stage)?;
     freeze_stdlib_zip(stage, &host_py)?;
     assert_python_layout(stage)?;
+    Ok(())
+}
+
+/// Phase 93 Track D.2/D.3 — the DYNAMIC CPython variant. Mirrors `build_python`
+/// (kept byte-for-byte intact as the green static fallback) with exactly three
+/// deltas: (1) LDFLAGS drops `-static` → a dynamic `python3` (`PT_INTERP` +
+/// `DT_NEEDED libc.so`); (2) `MODULE_BUILDTYPE=static` is dropped → C extensions
+/// build as `lib-dynload/*.cpython-312-*.so` loaded via the loader's `dlopen`;
+/// (3) `_ctypes` is re-enabled, linking the static libffi.a from Track D.1.
+#[allow(clippy::too_many_arguments)]
+fn build_python_dynamic(
+    src: &Path,
+    stage: &Path,
+    (cc, ar, ranlib): &(&'static str, String, String),
+    zlib_stage: &Path,
+    ncurses_stage: &Path,
+    libffi_stage: &Path,
+) -> Result<(), String> {
+    let zlib_prefix = zlib_stage.join("usr/local");
+    if !zlib_prefix.join("lib/libz.a").exists() {
+        return Err(format!(
+            "python-dynamic build: staged zlib not found at {} (build the zlib port first)",
+            zlib_prefix.join("lib/libz.a").display()
+        ));
+    }
+    let ncurses_prefix = ncurses_stage.join("usr/local");
+    if !ncurses_prefix.join("lib/libncursesw.a").exists() {
+        return Err(format!(
+            "python-dynamic build: staged ncurses not found at {} (build ncurses first)",
+            ncurses_prefix.join("lib/libncursesw.a").display()
+        ));
+    }
+    let have_panel = ncurses_prefix.join("lib/libpanelw.a").exists();
+    let libffi_prefix = libffi_stage.join("usr/local");
+    if !libffi_prefix.join("lib/libffi.a").exists() {
+        return Err(format!(
+            "python-dynamic build: staged libffi not found at {} (build the libffi port first)",
+            libffi_prefix.join("lib/libffi.a").display()
+        ));
+    }
+
+    let work = src
+        .parent()
+        .ok_or_else(|| "python-dynamic build: source dir has no parent".to_string())?;
+    let build_host = work.join("build-host-dyn");
+    let build_cross = work.join("build-cross-dyn");
+    let _ = fs::remove_dir_all(&build_host);
+    let _ = fs::remove_dir_all(&build_cross);
+    fs::create_dir_all(&build_host).map_err(|e| format!("mkdir build-host-dyn: {e}"))?;
+    fs::create_dir_all(&build_cross).map_err(|e| format!("mkdir build-cross-dyn: {e}"))?;
+
+    let pkgconfig_empty = work.join("pkgconfig-empty-dyn");
+    fs::create_dir_all(&pkgconfig_empty).map_err(|e| format!("mkdir pkgconfig-empty-dyn: {e}"))?;
+
+    let configure = src.join("configure");
+    let jobs = format!("-j{}", num_jobs());
+
+    // ── Stage 1: host interpreter (identical to the static recipe) ────────────
+    println!("python-dynamic: stage 1 — host interpreter configure");
+    let mut host_cfg = Command::new("sh");
+    host_cfg
+        .current_dir(&build_host)
+        .arg(&configure)
+        .arg("--disable-test-modules")
+        .arg("--without-ensurepip");
+    run(&mut host_cfg, "python-dynamic host configure")?;
+    let mut host_make = Command::new("make");
+    host_make.current_dir(&build_host).arg(&jobs);
+    run(&mut host_make, "python-dynamic host make")?;
+    let host_py = build_host.join("python");
+    if !host_py.exists() {
+        return Err(format!(
+            "python-dynamic host build produced no interpreter at {}",
+            host_py.display()
+        ));
+    }
+
+    // ── Stage 2: cross interpreter (DYNAMIC) ──────────────────────────────────
+    let build_triple = build_machine_triple();
+    println!(
+        "python-dynamic: stage 2 — cross configure (build={build_triple} host=x86_64-linux-musl)"
+    );
+    let extra_ld = musl_extra_ldflags_joined();
+    let cppflags = format!(
+        "-I{0}/include -I{1}/include -I{1}/include/ncursesw",
+        zlib_prefix.display(),
+        ncurses_prefix.display()
+    );
+    let lib_search = format!(
+        "-L{}/lib -L{}/lib",
+        zlib_prefix.display(),
+        ncurses_prefix.display()
+    );
+    // KEY DELTA vs build_python: NO `-static`. The interpreter links dynamically
+    // (PT_INTERP=/lib/ld-musl-x86_64.so.1, DT_NEEDED libc.so).
+    let ldflags = if extra_ld.is_empty() {
+        lib_search.clone()
+    } else {
+        format!("{lib_search} {extra_ld}")
+    };
+    let zlib_cflags = format!("-I{}/include", zlib_prefix.display());
+    let zlib_libs = format!("-L{}/lib -lz", zlib_prefix.display());
+    let curses_cflags = format!(
+        "-I{0}/include -I{0}/include/ncursesw",
+        ncurses_prefix.display()
+    );
+    let curses_libs = format!("-L{}/lib -lncursesw -ltinfow", ncurses_prefix.display());
+    let panel_libs = format!(
+        "-L{}/lib -lpanelw -lncursesw -ltinfow",
+        ncurses_prefix.display()
+    );
+    // _ctypes against the static libffi.a (Track D.1). LIBFFI_CFLAGS/LIBFFI_LIBS
+    // override CPython 3.12's PKG_CHECK_MODULES([LIBFFI]) — exactly like ZLIB_*.
+    let libffi_cflags = format!("-I{}/include", libffi_prefix.display());
+    let libffi_libs = format!("-L{}/lib -lffi", libffi_prefix.display());
+
+    // KEY DELTA: `_ctypes` is NOT in this list (re-enabled); `_ctypes_test` stays
+    // disabled. The rest mirror the static recipe's genuine dependency-absent
+    // deferrals.
+    let disabled_modules = [
+        "_ctypes_test",
+        "_ssl",
+        "_hashlib",
+        "readline",
+        "_sqlite3",
+        "_dbm",
+        "_gdbm",
+        "_tkinter",
+        "nis",
+        "_uuid",
+        "_bz2",
+        "_lzma",
+        "ossaudiodev",
+        "_crypt",
+        "xxlimited",
+        "xxlimited_35",
+    ];
+
+    let mut cross_cfg = Command::new("sh");
+    cross_cfg
+        .current_dir(&build_cross)
+        .arg(&configure)
+        .arg("--host=x86_64-linux-musl")
+        .arg(format!("--build={build_triple}"))
+        .arg(format!("--with-build-python={}", host_py.display()))
+        // --disable-shared: libpython is static-linked INTO python3 (no
+        // libpython3.12.so to stage); python3 itself stays dynamic (no -static).
+        .arg("--disable-shared")
+        .arg("--disable-ipv6")
+        .arg("--without-ensurepip")
+        .arg("--without-pymalloc")
+        .arg("--disable-test-modules")
+        .arg("--prefix=/usr")
+        .env("CC", cc)
+        .env("AR", ar)
+        .env("RANLIB", ranlib)
+        .env("PKG_CONFIG_LIBDIR", &pkgconfig_empty)
+        .env("PKG_CONFIG_PATH", "")
+        // MODULE_BUILDTYPE intentionally UNSET → defaults to "shared" → C
+        // extensions build as lib-dynload/*.so.
+        .env("CPPFLAGS", &cppflags)
+        .env("LDFLAGS", &ldflags)
+        .env("ZLIB_CFLAGS", &zlib_cflags)
+        .env("ZLIB_LIBS", &zlib_libs)
+        .env("CURSES_CFLAGS", &curses_cflags)
+        .env("CURSES_LIBS", &curses_libs)
+        .env("PANEL_CFLAGS", &curses_cflags)
+        .env("PANEL_LIBS", &panel_libs)
+        .env("LIBFFI_CFLAGS", &libffi_cflags)
+        .env("LIBFFI_LIBS", &libffi_libs)
+        .env("ac_cv_file__dev_ptmx", "no")
+        .env("ac_cv_file__dev_ptc", "no")
+        .env("ac_cv_buggy_getaddrinfo", "no");
+    for m in disabled_modules {
+        cross_cfg.env(format!("py_cv_module_{m}"), "n/a");
+    }
+    run(&mut cross_cfg, "python-dynamic cross configure")?;
+
+    neuter_checksharedmods(&build_cross.join("Makefile"))?;
+
+    println!("python-dynamic: stage 2 — cross make ({jobs})");
+    let mut cross_make = Command::new("make");
+    cross_make.current_dir(&build_cross).arg(&jobs);
+    run(&mut cross_make, "python-dynamic cross make")?;
+    let _ = have_panel;
+
+    println!(
+        "python-dynamic: stage 2 — cross install (DESTDIR={})",
+        stage.display()
+    );
+    let mut cross_install = Command::new("make");
+    cross_install
+        .current_dir(&build_cross)
+        .arg(format!("DESTDIR={}", stage.display()))
+        .arg("install");
+    run(&mut cross_install, "python-dynamic cross install")?;
+
+    prune_python_dynamic_stage(stage)?;
+    assert_python_dynamic_layout(stage)?;
+    Ok(())
+}
+
+/// Phase 93 D.2 — trim the dynamic CPython install: drop headers, the static
+/// `libpython3.12.a`, the `test` package, `config-3.12*`, and `__pycache__`, but
+/// KEEP `lib/python3.12/*.py` (the loose stdlib) and `lib/python3.12/lib-dynload`
+/// (the `.so` extensions — the whole point of the dynamic variant). No frozen
+/// `python312.zip` (the static recipe's optimization); standard CPython layout.
+fn prune_python_dynamic_stage(stage: &Path) -> Result<(), String> {
+    let pylib = stage.join("usr/lib/python3.12");
+    // Heavy / unneeded-at-runtime trees.
+    let _ = fs::remove_dir_all(pylib.join("test"));
+    let _ = fs::remove_dir_all(pylib.join("config-3.12-x86_64-linux-musl"));
+    let _ = fs::remove_dir_all(stage.join("usr/include"));
+    let _ = fs::remove_file(stage.join("usr/lib/libpython3.12.a"));
+    // Recursively drop __pycache__ to shrink the (slow-VFS) install.
+    fn drop_pycache(dir: &Path) {
+        let Ok(rd) = fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if p.file_name().and_then(|n| n.to_str()) == Some("__pycache__") {
+                    let _ = fs::remove_dir_all(&p);
+                } else {
+                    drop_pycache(&p);
+                }
+            }
+        }
+    }
+    drop_pycache(&pylib);
+    Ok(())
+}
+
+/// Phase 93 D.2 — verify the dynamic layout: a DYNAMIC `python3` (carries the
+/// `/lib/ld-musl-x86_64.so.1` interp string — the proof it is NOT `-static`), a
+/// NON-empty `lib-dynload`, and the `_ctypes` extension present.
+fn assert_python_dynamic_layout(stage: &Path) -> Result<(), String> {
+    let py = stage.join("usr/bin/python3.12");
+    if !py.exists() {
+        return Err(format!("python-dynamic: missing {}", py.display()));
+    }
+    // Dynamic proof: the interpreter must reference the loader (PT_INTERP).
+    let bytes = fs::read(&py).map_err(|e| format!("read python3.12: {e}"))?;
+    let needle = b"/lib/ld-musl-x86_64.so.1";
+    let has_interp = bytes.windows(needle.len()).any(|w| w == needle);
+    if !has_interp {
+        return Err(
+            "python-dynamic: python3.12 has no /lib/ld-musl-x86_64.so.1 interp (built static?)"
+                .to_string(),
+        );
+    }
+    let dynload = stage.join("usr/lib/python3.12/lib-dynload");
+    if !dynload.is_dir() {
+        return Err(format!(
+            "python-dynamic: missing lib-dynload {}",
+            dynload.display()
+        ));
+    }
+    let mut so_count = 0usize;
+    let mut has_ctypes = false;
+    if let Ok(rd) = fs::read_dir(&dynload) {
+        for e in rd.flatten() {
+            let n = e.file_name();
+            let n = n.to_string_lossy();
+            if n.ends_with(".so") {
+                so_count += 1;
+                if n.starts_with("_ctypes.") {
+                    has_ctypes = true;
+                }
+            }
+        }
+    }
+    if so_count == 0 {
+        return Err(
+            "python-dynamic: lib-dynload is empty (extensions not built shared?)".to_string(),
+        );
+    }
+    if !has_ctypes {
+        return Err("python-dynamic: _ctypes extension missing from lib-dynload".to_string());
+    }
+    println!(
+        "python-dynamic: layout OK — dynamic python3, {so_count} lib-dynload .so (incl. _ctypes)"
+    );
     Ok(())
 }
 
@@ -5914,6 +6320,24 @@ pub fn build_python_port() -> Result<(), String> {
     port_build("zlib").map_err(|e| format!("port zlib: {e}"))?;
     port_build("ncurses").map_err(|e| format!("port ncurses: {e}"))?;
     port_build("python").map_err(|e| format!("port python: {e}"))?;
+    Ok(())
+}
+
+/// Phase 93 Track D — build the DYNAMIC CPython chain into `.m3pkg`s:
+/// zlib + ncurses (shared with the static recipe), musl (the `libc.so` the
+/// dynamic interpreter binds against), libffi (the `_ctypes` backend), then the
+/// dynamic `python-dynamic` variant. The static `python` recipe is untouched.
+pub fn build_python_dynamic_port() -> Result<(), String> {
+    if musl_cc().is_none() {
+        return Err(
+            "no musl cross-compiler on PATH (install musl-tools or musl-gcc-cross-bin)".to_string(),
+        );
+    }
+    port_build("zlib").map_err(|e| format!("port zlib: {e}"))?;
+    port_build("ncurses").map_err(|e| format!("port ncurses: {e}"))?;
+    port_build("musl").map_err(|e| format!("port musl: {e}"))?;
+    port_build("libffi").map_err(|e| format!("port libffi: {e}"))?;
+    port_build("python-dynamic").map_err(|e| format!("port python-dynamic: {e}"))?;
     Ok(())
 }
 
