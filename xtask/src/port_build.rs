@@ -3563,7 +3563,7 @@ fn build_python(
     // only `n/a` (not `disabled`) survives the per-module detection overwrite.
     // `zlib` and `_curses`/`_curses_panel` are intentionally absent — their deps
     // (zlib, ncurses) are ported and staged above, so they ARE built. The split:
-    //   • `_ctypes` (libffi + dlopen) → Phase 91 (Dynamic C Runtime).
+    //   • `_ctypes` (libffi + dlopen) → Phase 93 (Dynamic C Runtime).
     //   • `_ssl`/`_hashlib`-OpenSSL → Phase 86 (TLS/networking).
     //   • everything else here depends on a library m3OS has not ported yet
     //     (GNU readline, sqlite3, gdbm, tk, libffi, libbz2, liblzma, libuuid,
