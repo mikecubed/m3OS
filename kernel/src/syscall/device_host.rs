@@ -1830,10 +1830,24 @@ pub fn sys_device_irq_subscribe(dev_cap: u32, bit_index_arg: u32, notification_a
         (id, true)
     } else {
         // Caller-provided path: resolve the CapHandle and extract the NotifId.
+        //
+        // Accept EITHER a standalone `Capability::Notification` OR a
+        // `Capability::DeviceIrq` (which aliases the same NotifId the ISR shim
+        // signals — see `Capability::ipc_notification_id`). The DeviceIrq case
+        // is the Phase 92d multiplexed-interrupt path: a multi-controller xHCI
+        // driver subscribes controller 0's IRQ with `SENTINEL_NEW` (fresh
+        // notification, bit 0), binds that to its recv loop, then subscribes
+        // each *secondary* controller's IRQ into the SAME notification at a
+        // distinct bit by passing controller 0's `DeviceIrq` cap handle here.
+        // One bound recv loop then wakes on any controller's interrupt. We
+        // never own a caller-provided notification, so `kernel_owns_notif`
+        // stays false and process-exit teardown only unbinds the vector.
         let cap_handle = notification_arg;
         match scheduler::task_cap(task_id, cap_handle) {
-            Ok(Capability::Notification(notif_id)) => (notif_id, false),
-            Ok(_) => return NEG_EBADF,  // wrong cap type
+            Ok(cap) => match cap.ipc_notification_id() {
+                Some(notif_id) => (notif_id, false),
+                None => return NEG_EBADF, // wrong cap type
+            },
             Err(_) => return NEG_EBADF, // invalid handle
         }
     };

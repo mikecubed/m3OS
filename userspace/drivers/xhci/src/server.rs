@@ -61,6 +61,16 @@ pub const USB_HOTPLUG_DETACHED_SENTINEL: &str = "USB_HOTPLUG:detached\n";
 const EINVAL: u16 = 22;
 const ENOSYS: u16 = 38;
 
+/// Steady-state interrupter-moderation interval applied to every controller
+/// once the server loop is reached (Phase 92d). In `IMODI` units of 250 ns,
+/// so `4000 × 250 ns = 1 ms` — at most one interrupt per millisecond per
+/// controller, coalescing bulk-completion storms. Delivery to class drivers is
+/// poll-driven and unaffected; this only thins redundant interrupt wakes (see
+/// `Controller::set_interrupt_moderation`). 1 ms also matches the USB HID
+/// reporting interval, so a mouse/keyboard is never interrupted faster than it
+/// reports. Bring-up keeps `IMOD = 0` (prompt) — this is applied afterwards.
+const IMOD_STEADY_STATE_INTERVAL: u16 = 4000;
+
 /// Build an [`AttachNotice`] from a Configured enumeration result if the device
 /// exposes a surfaceable interface: a HID interface with an interrupt-IN
 /// endpoint (Phase 78c), or — Phase 96 — any interface exposing a bulk IN+OUT
@@ -305,10 +315,31 @@ fn process_port_events(controllers: &mut [ControllerCtx], served: &mut Vec<Attac
                                 write_str(STDOUT_FILENO, USB_HOTPLUG_ATTACHED_SENTINEL);
                             }
                             None => {
-                                write_str(
-                                    STDOUT_FILENO,
-                                    "xhci_driver: hot-plug device dropped — unpackable handle\n",
-                                );
+                                // H.5: Enable Slot already allocated a hardware
+                                // slot + SlotContext for this device during
+                                // `enumerate_port`. If the (controller, slot)
+                                // pair can't be packed into the 1-byte handle
+                                // (≥5 controllers, or slot > 63), reclaim that
+                                // slot via Disable Slot before dropping the
+                                // device — otherwise it leaks the very slot H.3
+                                // set out to reclaim. `notice.slot_id` still
+                                // holds the real hardware slot here (it is only
+                                // overwritten with the packed handle in the
+                                // `Some` arm). Like the Disconnect path, only
+                                // claim "slot reclaimed" when Disable Slot
+                                // actually succeeds; otherwise log the failure
+                                // honestly so a real slot leak isn't masked.
+                                if c.disable_slot(irq, notice.slot_id) {
+                                    write_str(
+                                        STDOUT_FILENO,
+                                        "xhci_driver: hot-plug device dropped — unpackable handle (slot reclaimed)\n",
+                                    );
+                                } else {
+                                    write_str(
+                                        STDOUT_FILENO,
+                                        "xhci_driver: hot-plug device dropped — unpackable handle; Disable Slot failed, slot not reclaimed\n",
+                                    );
+                                }
                             }
                         }
                     }
@@ -400,6 +431,15 @@ pub fn run(ep: u32, discovered: u8, mut controllers: Vec<ControllerCtx>) -> ! {
         syscall_lib::exit(22);
     }
 
+    // Phase 92d: now that bring-up (which wants IMOD=0 for a prompt first
+    // interrupt) is done, apply steady-state interrupt moderation to every
+    // controller so a sustained bulk stream coalesces its completions into
+    // ~1 interrupt/ms instead of one wake per packet. Class-driver delivery is
+    // poll-driven, so this only thins redundant interrupt wakes.
+    for (c, _irq, _d) in controllers.iter() {
+        c.set_interrupt_moderation(IMOD_STEADY_STATE_INTERVAL);
+    }
+
     write_str(STDOUT_FILENO, USB_SERVER_READY_SENTINEL);
 
     let mut backend = SyscallBackend::new();
@@ -413,8 +453,25 @@ pub fn run(ep: u32, discovered: u8, mut controllers: Vec<ControllerCtx>) -> ! {
         // transfer times out. This is what wedged the >1522-byte write path.
         match backend.recv_with_capacity(ep_cap, USB_MSG_MAX) {
             Ok(RecvResult::Notification(bits)) => {
-                for (c, _irq, _d) in controllers.iter_mut() {
-                    c.service_interrupt_events();
+                // Bit-directed draining (Phase 92d Optimization A): controller
+                // `i`'s interrupt sets bit `i` in this shared notification (see
+                // `Controller::init_interrupter_into`), so drain only the
+                // controller(s) that actually fired rather than every controller.
+                // For a single controller this is bit 0 → controller 0, so the
+                // validated single-controller path is byte-identical. The
+                // Message arm below still drains all controllers as a safety net,
+                // so an event whose bit is not yet reflected is never lost — it
+                // is picked up on the next client poll.
+                for (idx, (c, _irq, _d)) in controllers.iter_mut().enumerate() {
+                    // Guard the shift: only controllers 0..63 can own a bit in
+                    // the 64-bit notification word. A controller at index ≥ 64
+                    // (which the 2-bit slot-handle codec already can't address)
+                    // is left to the Message-arm safety net below, which drains
+                    // every controller — so its events are never lost, and
+                    // `1u64 << idx` can never shift-overflow.
+                    if idx < 64 && bits & (1u64 << idx) != 0 {
+                        c.service_interrupt_events();
+                    }
                 }
                 // A bound-IRQ wake is how a hot-plug Port Status Change arrives;
                 // act on any queued connect/disconnect (Phase 92 Track C).
@@ -455,6 +512,39 @@ pub fn run(ep: u32, discovered: u8, mut controllers: Vec<ControllerCtx>) -> ! {
             }
         }
     }
+}
+
+/// Serve a control transfer on the controller owning `handle`, interleaving
+/// servicing of the OTHER controllers during the transfer's bounded poll
+/// (Phase 92d). A control transfer blocks the single server loop; without this,
+/// a slow/dead-device control transfer on one controller would let a co-resident
+/// controller (e.g. a busy NIC) overflow its finite event ring while we wait.
+///
+/// Splits `controllers` into the target (passed to `op`) and the rest (drained
+/// by the `drain_others` callback `op` forwards into `control_request`/
+/// `control_write` → `wait_for_transfer_event`). The split borrows are disjoint,
+/// so the target's transfer and the others' ring drains never alias. Returns
+/// `None` for an out-of-range controller index (a stale/forged handle).
+fn serve_control<F>(controllers: &mut [ControllerCtx], handle: u8, op: F) -> Option<Vec<u8>>
+where
+    F: FnOnce(&mut Controller, &IrqNotification, u8, &mut dyn FnMut()) -> Option<Vec<u8>>,
+{
+    let (ctrl_idx, real_slot) = unpack_handle(handle);
+    if ctrl_idx >= controllers.len() {
+        return None;
+    }
+    let (before, rest) = controllers.split_at_mut(ctrl_idx);
+    let (target, after) = rest.split_at_mut(1);
+    let (c, irq, _d) = &mut target[0];
+    let mut drain_others = || {
+        for (oc, _oirq, _od) in before.iter_mut() {
+            oc.service_interrupt_events();
+        }
+        for (oc, _oirq, _od) in after.iter_mut() {
+            oc.service_interrupt_events();
+        }
+    };
+    op(c, &*irq, real_slot, &mut drain_others)
 }
 
 /// Decode and serve one request, producing the reply.
@@ -546,9 +636,9 @@ fn handle_request(
                 );
                 UsbReply::Error { code: EINVAL }
             } else {
-                match owner!(slot_id)
-                    .and_then(|(c, irq, slot)| c.control_request(irq, slot, setup, length))
-                {
+                match serve_control(controllers, slot_id, |c, irq, slot, drain| {
+                    c.control_request(irq, slot, setup, length, drain)
+                }) {
                     Some(data) => UsbReply::ControlData {
                         data,
                         completion_code: 1,
@@ -564,9 +654,9 @@ fn handle_request(
             slot_id,
             setup,
             data,
-        } => match owner!(slot_id)
-            .and_then(|(c, irq, slot)| c.control_write(irq, slot, setup, &data))
-        {
+        } => match serve_control(controllers, slot_id, |c, irq, slot, drain| {
+            c.control_write(irq, slot, setup, &data, drain)
+        }) {
             // OUT control transfers carry no device-to-host data; the status is
             // the completion code. An empty `ControlData` mirrors the IN path.
             Some(_) => UsbReply::ControlData {

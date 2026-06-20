@@ -166,6 +166,31 @@ pub trait IrqBackend {
         let _ = (notif_cap, ep_cap);
         Ok(())
     }
+
+    /// Subscribe `dev_cap`'s IRQ into an **existing** notification (named by
+    /// `notif_arg`, a cap handle to a `Notification` *or* `DeviceIrq`) at
+    /// `bit_index`, instead of allocating a fresh notification.
+    ///
+    /// This is the Phase 92d multiplexed-interrupt path: a multi-controller
+    /// driver subscribes its primary device with [`subscribe`](Self::subscribe)
+    /// (fresh notification, bit 0) and binds that one notification to its recv
+    /// loop, then subscribes each *secondary* device's IRQ into that same
+    /// notification at a distinct bit. The single bound recv loop then wakes on
+    /// any device's interrupt, with the pending-bit word naming which device(s)
+    /// fired.
+    ///
+    /// The default implementation errors so a mock backend that does not model
+    /// multiplexing fails loudly rather than silently allocating a fresh
+    /// notification; [`SyscallBackend`] and the contract-test mock override it.
+    fn subscribe_into(
+        &self,
+        dev_cap: u32,
+        bit_index: u32,
+        notif_arg: u32,
+    ) -> Result<u32, DriverRuntimeError> {
+        let _ = (dev_cap, bit_index, notif_arg);
+        Err(DriverRuntimeError::from(DeviceHostError::Internal))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -268,6 +293,39 @@ impl IrqBackend for SyscallBackend {
         // are errno returns sign-extended into the u64 result register.
         let rc = syscall_lib::sys_notif_bind(notif_cap, ep_cap);
         decode_notif_bind_result(rc)
+    }
+
+    fn subscribe_into(
+        &self,
+        dev_cap: u32,
+        bit_index: u32,
+        notif_arg: u32,
+    ) -> Result<u32, DriverRuntimeError> {
+        // Same B.4b ABI as `subscribe`, but `notif_arg` (arg3) carries the
+        // caller's existing notification cap handle instead of the
+        // `NOTIFICATION_SENTINEL_NEW` sentinel — the kernel resolves it to the
+        // referenced notification's `NotifId` (a `Notification` or `DeviceIrq`
+        // cap; see `Capability::ipc_notification_id`) and wires this device's
+        // ISR to set `1 << bit_index` in that shared word.
+        if bit_index >= 64 {
+            return Err(errno_to_driver_runtime_error(-22));
+        }
+        // SAFETY: identical contract to `subscribe` above — the syscall number
+        // is the reserved device-host constant, three u64 args, no pointers.
+        let rax = unsafe {
+            syscall_lib::syscall3(
+                SYS_DEVICE_IRQ_SUBSCRIBE,
+                dev_cap as u64,
+                bit_index as u64,
+                notif_arg as u64,
+            )
+        };
+        let signed = rax as i64;
+        if signed < 0 {
+            Err(errno_to_driver_runtime_error(signed))
+        } else {
+            Ok((signed as u64 & u32::MAX as u64) as u32)
+        }
     }
 }
 
@@ -499,6 +557,26 @@ impl IrqNotification<SyscallBackend> {
     ) -> Result<Self, DriverRuntimeError> {
         Self::subscribe_with_backend(SyscallBackend, device, vector_hint)
     }
+
+    /// Subscribe `device`'s IRQ into the **existing** notification named by
+    /// `into_notif_cap` (a cap handle to a `Notification` or `DeviceIrq` — e.g.
+    /// the [`cap_handle`](Self::cap_handle) of a primary controller's
+    /// [`IrqNotification`]), delivering on `bit_index` rather than allocating a
+    /// fresh notification. The Phase 92d multiplexed-interrupt path — see
+    /// [`IrqBackend::subscribe_into`].
+    ///
+    /// The returned wrapper owns `device`'s new `DeviceIrq` cap; its
+    /// [`bit_mask`](Self::bit_mask) is `1 << bit_index`. It is **not** itself
+    /// bound or waited on — the shared notification (already bound to the recv
+    /// loop) carries this device's bit, so the caller keeps this wrapper only to
+    /// hold the cap alive for the process lifetime.
+    pub fn subscribe_into<D: DeviceCapHandle>(
+        device: &D,
+        into_notif_cap: u32,
+        bit_index: u8,
+    ) -> Result<Self, DriverRuntimeError> {
+        Self::subscribe_into_with_backend(SyscallBackend, device, into_notif_cap, bit_index)
+    }
 }
 
 impl<B: IrqBackend> IrqNotification<B> {
@@ -517,6 +595,33 @@ impl<B: IrqBackend> IrqNotification<B> {
         Ok(Self {
             cap_handle: cap,
             bit_mask: 1u64 << notification_index,
+            last_observed: Cell::new(0),
+            backend,
+        })
+    }
+
+    /// Backend-generic variant of [`IrqNotification::subscribe_into`] so the
+    /// contract tests can drive the multiplexed-subscribe path through a mock.
+    pub fn subscribe_into_with_backend<D: DeviceCapHandle>(
+        backend: B,
+        device: &D,
+        into_notif_cap: u32,
+        bit_index: u8,
+    ) -> Result<Self, DriverRuntimeError> {
+        // `bit_index` names a bit in the shared notification's 64-bit word, so a
+        // value ≥ 64 is out of range (`1u64 << bit_index` would shift-overflow —
+        // panic in debug, wrong mask in release). Fail fast before touching the
+        // backend, using the SAME -EINVAL mapping the backend guards apply
+        // (`SyscallBackend::{subscribe, subscribe_into}` both
+        // `errno_to_driver_runtime_error(-22)` for an out-of-range bit index), so
+        // the wrapper is consistent regardless of which layer catches it.
+        if bit_index >= 64 {
+            return Err(errno_to_driver_runtime_error(-22));
+        }
+        let cap = backend.subscribe_into(device.cap_handle(), bit_index as u32, into_notif_cap)?;
+        Ok(Self {
+            cap_handle: cap,
+            bit_mask: 1u64 << bit_index,
             last_observed: Cell::new(0),
             backend,
         })
@@ -611,6 +716,8 @@ mod tests {
         inject_subscribe_error: Option<DriverRuntimeError>,
         /// Records (notif_cap, ep_cap) pairs for bind_to_endpoint assertions.
         bind_records: Vec<(u32, u32)>,
+        /// Records (dev_cap, bit_index, notif_arg) for subscribe_into assertions.
+        subscribe_into_records: Vec<(u32, u32, u32)>,
     }
 
     #[derive(Debug)]
@@ -726,11 +833,42 @@ mod tests {
                 .push((notif_cap, ep_cap));
             Ok(())
         }
+
+        fn subscribe_into(
+            &self,
+            dev_cap: u32,
+            bit_index: u32,
+            notif_arg: u32,
+        ) -> Result<u32, DriverRuntimeError> {
+            let mut st = self.state.borrow_mut();
+            if let Some(err) = st.inject_subscribe_error.take() {
+                return Err(err);
+            }
+            st.subscribe_into_records
+                .push((dev_cap, bit_index, notif_arg));
+            // Allocate a fresh DeviceIrq cap for the secondary device, mirroring
+            // `subscribe`. The notification it delivers to is the caller-named
+            // `notif_arg`, recorded above for the test to assert.
+            let cap_handle = st.next_cap;
+            st.next_cap = st.next_cap.wrapping_add(1);
+            st.subs.push(SubRecord {
+                cap_handle,
+                dev_cap,
+                vector_hint: None,
+                pending: Vec::new(),
+                released: false,
+            });
+            Ok(cap_handle)
+        }
     }
 
     impl MockBackend {
         fn bind_records(&self) -> alloc::vec::Vec<(u32, u32)> {
             self.state.borrow().bind_records.clone()
+        }
+
+        fn subscribe_into_records(&self) -> alloc::vec::Vec<(u32, u32, u32)> {
+            self.state.borrow().subscribe_into_records.clone()
         }
     }
 
@@ -959,6 +1097,86 @@ mod tests {
         let (n_cap, e_cap) = records[0];
         assert_eq!(n_cap, notif.cap_handle(), "notif cap forwarded correctly");
         assert_eq!(e_cap, ep.raw(), "endpoint cap forwarded correctly");
+    }
+
+    // -- Phase 92d test — subscribe_into (multiplexed interrupt) ----------
+
+    #[test]
+    fn subscribe_into_targets_existing_notification_at_bit() {
+        // A secondary controller subscribes its IRQ INTO the primary's
+        // notification at a distinct bit. The backend must forward
+        // (dev_cap, bit_index, into_notif_cap) verbatim, and the returned
+        // wrapper's bit_mask must be `1 << bit_index` (not the bit-0 default).
+        let backend = MockBackend::new();
+        let primary = MockDevice { cap_handle: 10 };
+        let primary_irq = IrqNotification::subscribe_with_backend(backend.clone(), &primary, None)
+            .expect("primary subscribe");
+
+        let secondary = MockDevice { cap_handle: 20 };
+        let secondary_irq = IrqNotification::subscribe_into_with_backend(
+            backend.clone(),
+            &secondary,
+            primary_irq.cap_handle(),
+            1,
+        )
+        .expect("secondary subscribe_into");
+
+        let records = backend.subscribe_into_records();
+        assert_eq!(records.len(), 1, "exactly one subscribe_into recorded");
+        let (dev_cap, bit_index, notif_arg) = records[0];
+        assert_eq!(dev_cap, 20, "secondary device cap forwarded");
+        assert_eq!(bit_index, 1, "bit index forwarded");
+        assert_eq!(
+            notif_arg,
+            primary_irq.cap_handle(),
+            "subscribe_into targets the primary's notification cap"
+        );
+        assert_eq!(
+            secondary_irq.bit_mask(),
+            1u64 << 1,
+            "secondary wrapper observes its own bit, not the bit-0 default"
+        );
+        assert_ne!(
+            secondary_irq.cap_handle(),
+            primary_irq.cap_handle(),
+            "secondary owns a distinct DeviceIrq cap"
+        );
+    }
+
+    #[test]
+    fn subscribe_into_surfaces_backend_error() {
+        let backend = MockBackend::new();
+        backend.state.borrow_mut().inject_subscribe_error =
+            Some(DriverRuntimeError::from(DeviceHostError::IrqUnavailable));
+        let device = MockDevice { cap_handle: 2 };
+        let err = IrqNotification::subscribe_into_with_backend(backend, &device, 99, 1)
+            .expect_err("subscribe_into must surface the backend error");
+        assert_eq!(
+            err,
+            DriverRuntimeError::from(DeviceHostError::IrqUnavailable)
+        );
+    }
+
+    #[test]
+    fn subscribe_into_rejects_out_of_range_bit_index_before_backend() {
+        // A `bit_index` ≥ 64 cannot name a bit in the 64-bit notification word —
+        // `1u64 << bit_index` would shift-overflow. The wrapper must fail fast
+        // with the SAME -EINVAL mapping the backend guards use (so the error is
+        // consistent across call sites) and must NOT touch the backend.
+        let backend = MockBackend::new();
+        let device = MockDevice { cap_handle: 7 };
+        let err = IrqNotification::subscribe_into_with_backend(backend.clone(), &device, 1, 64)
+            .expect_err("bit_index == 64 must be rejected");
+        assert_eq!(err, errno_to_driver_runtime_error(-22));
+        assert!(
+            backend.subscribe_into_records().is_empty(),
+            "rejection must happen before any backend call"
+        );
+
+        // The largest valid bit index (63) must still succeed.
+        let ok = IrqNotification::subscribe_into_with_backend(backend.clone(), &device, 1, 63)
+            .expect("bit_index == 63 is valid");
+        assert_eq!(ok.bit_mask(), 1u64 << 63);
     }
 
     #[test]

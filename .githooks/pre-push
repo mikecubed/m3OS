@@ -344,6 +344,11 @@ if [ "${M3OS_USB_REGRESSION:-0}" = "1" ]; then
     cargo xtask usb-hub-smoke --timeout 200
     echo "pre-push: running cargo xtask usb-mount-smoke..."
     cargo xtask usb-mount-smoke --timeout 420
+    # Phase 92d — dual-controller concurrency: a second qemu-xhci (xhci1, addr=0x7)
+    # with only a usb-mouse; asserts XHCI:controller-1:ready (xhci1's IRQ subscribed
+    # into the shared Notification) and that a QMP mouse-move on xhci1 decodes.
+    echo "pre-push: running cargo xtask usb-multi-controller-smoke..."
+    cargo xtask usb-multi-controller-smoke --timeout 200
 fi
 
 # Phase 79 — opt-in modern-NIC regression gate. `multi-nic-smoke` boots QEMU
