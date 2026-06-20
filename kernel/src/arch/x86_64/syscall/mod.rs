@@ -16149,6 +16149,26 @@ pub(super) fn sys_linux_umount2(target_ptr: u64, flags: u64) -> u64 {
     if !matches!(path_node_nofollow(&resolved_target), Ok(PathNodeKind::Dir)) {
         return NEG_ENOTDIR;
     }
+
+    // Phase 92 C.4: a USB mass-storage unmount — target `/mnt/usbN`. Mirrors the
+    // `/dev/usbN` branch in `sys_linux_mount`: tear down the secondary ext2
+    // volume and free its `blk::remote` registry slot. Reached both by a
+    // voluntary `umount /mnt/usbN` and by the `usb-storage` daemon when it
+    // observes its device hot-unplugged. Removable-media semantics: the device
+    // is (or may be) physically gone, so this path forces the teardown without a
+    // busy check — leaving the mount stale is the exact bug C.4 closes; a
+    // process still holding the mount gets IO errors on its next access (the
+    // backing block device is unregistered). `unmount_usb` returns `None` for a
+    // non-USB target, so `/` and `/data` fall through to the action path below.
+    {
+        let _mount_guard = MOUNT_OP_LOCK.lock();
+        if let Some(dev_id) = crate::fs::ext2::unmount_usb(&resolved_target) {
+            crate::blk::unregister_remote_device(dev_id);
+            log::info!("[mount] unmounted USB {resolved_target} (dev_id={dev_id})");
+            return 0;
+        }
+    }
+
     let action = match vfs_service_umount_action(&resolved_target) {
         Ok(action) => action,
         Err(err) => return err,

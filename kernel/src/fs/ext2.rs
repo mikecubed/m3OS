@@ -286,13 +286,21 @@ pub fn mount_usb(prefix: &str, base_lba: u64, dev_id: u32) -> Result<Option<u32>
     Ok(displaced)
 }
 
-/// Remove the secondary mount at `prefix`. Returns `true` if one was removed.
-pub fn unmount_usb(prefix: &str) -> bool {
+/// Remove the secondary mount at `prefix`. Returns the freed `dev_id` of the
+/// removed mount's backing volume (so the caller can `unregister_remote_device`
+/// it), or `None` if no mount matched `prefix`.
+///
+/// Phase 92 C.4: wired from `sys_linux_umount2` for both a voluntary
+/// `umount /mnt/usbN` and the `usb-storage` daemon's hot-unplug detach path.
+pub fn unmount_usb(prefix: &str) -> Option<u32> {
     let mut mounts = USB_MOUNTS.lock();
-    let before = mounts.len();
+    let dev_id = mounts
+        .iter()
+        .find(|m| m.prefix == prefix)
+        .map(|m| m.volume.dev_id);
     mounts.retain(|m| m.prefix != prefix);
     USB_MOUNTS_ACTIVE.store(!mounts.is_empty(), core::sync::atomic::Ordering::Release);
-    mounts.len() != before
+    dev_id
 }
 
 /// `true` if `abs_path` falls under any secondary mount prefix.

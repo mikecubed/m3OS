@@ -22,10 +22,11 @@
 //! 5. Registers the device as `usb0.block` via `ipc_register_service` and
 //!    enters a `BlockServer`-style loop dispatching `BLK_READ`, `BLK_WRITE`,
 //!    `BLK_FLUSH`, and `BLK_STATUS` requests over BOT.
-//! 6. **Detach cleanup (C.4)**: `release_device()` logs that the slot has been
-//!    released; called on the discovery path if the device detaches before
-//!    serving starts. The resident loop leaves a `TODO(92a C.4)` marker for
-//!    the non-blocking recv path needed for detach-during-serve.
+//! 6. **Detach cleanup (C.4)**: the resident block-server loop bounds its recv
+//!    with `ipc_recv_msg_timeout`; on an idle window it re-queries `NextAttach`
+//!    and, when the bound device is gone, calls `umount("/mnt/usb0")` (which
+//!    tears down the secondary ext2 volume + frees the kernel `blk::remote`
+//!    slot) so a hot-unplugged stick leaves no stale mount, then exits.
 //!
 //! # Existing sentinels kept
 //!
@@ -113,9 +114,23 @@ const READ_CAPACITY10_LEN: u16 = 8;
 #[cfg(not(test))]
 const SCRATCH_LBA: u32 = 1024;
 
-/// Block service endpoint name for `usb0`.
+/// Conventional VFS mount prefix this daemon's device mounts under
+/// (`/dev/usb0` → `/mnt/usb0`), used by the C.4 detach path to unmount on a
+/// hot-unplug. NUL-terminated for the `umount` syscall.
 #[cfg(not(test))]
-const SERVICE_NAME: &str = "usb0.block";
+const MOUNT_PREFIX_CSTR: &[u8] = b"/mnt/usb0\0";
+
+/// Block-server idle window for the C.4 detach reconcile: when no block request
+/// arrives within this many ms, re-check whether the bound device was
+/// hot-unplugged (its `NextAttach` entry flipped to `attached:false`).
+#[cfg(not(test))]
+const DETACH_POLL_INTERVAL_MS: u64 = 1000;
+
+/// `ipc_recv_msg_timeout` returns this sentinel (`-110` cast to `u64`,
+/// `-ETIMEDOUT`) on a deadline expiry — distinct from a real message label or
+/// the `u64::MAX` error return.
+#[cfg(not(test))]
+const NEG_ETIMEDOUT: u64 = (-110i64) as u64;
 
 /// Maximum consecutive `handle_next`-style errors before the daemon exits
 /// for restart (mirrors nvme driver).
@@ -761,21 +776,41 @@ fn shm_dma_self_test(usb_ep: u32, notice: &AttachNotice) {
 // Detach cleanup (C.4)
 // ---------------------------------------------------------------------------
 
-/// Release a bound device slot. Called when a detach is observed on the
-/// discovery / rebind path. Logs the event and returns so the caller can
-/// attempt re-discovery.
-///
-/// TODO(92a C.4): detach-during-serve requires a non-blocking recv variant
-/// (e.g. `ipc_try_recv_msg`) interleaved with the block-server loop so a
-/// hot-unplug mid-serve is noticed without hanging on the next `ipc_recv_msg`.
+/// Release a bound device slot. Called when a detach is observed (on the
+/// discovery/rebind path or mid-serve). Logs the event so the caller can exit
+/// or attempt re-discovery.
 #[cfg(not(test))]
 fn release_device(notice: &AttachNotice) {
     write_str(STDOUT_FILENO, "usb-storage: device detached slot=");
     write_u8_dec(notice.slot_id);
     write_str(STDOUT_FILENO, " — released\n");
-    // C.4: detach observed → release
-    // In a full implementation this would deregister the service endpoint
-    // and free any associated resources so a re-attach can bind a fresh slot.
+}
+
+/// Absolute CLOCK_MONOTONIC nanoseconds — the deadline base for
+/// `ipc_recv_msg_timeout` (C.4 detach reconcile). Returns 0 if the clock read
+/// fails (yielding an immediate timeout, which is self-correcting).
+#[cfg(not(test))]
+fn monotonic_ns() -> u64 {
+    let (sec, nsec) = syscall_lib::clock_gettime(syscall_lib::CLOCK_MONOTONIC);
+    if sec < 0 {
+        return 0;
+    }
+    (sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(nsec as u64)
+}
+
+/// C.4: re-read the device's discovery-time `NextAttach` `cursor` and report
+/// whether the device is gone. A `attached:false` entry, a missing entry, or a
+/// transport error all count as detached (mirrors `usb-net`'s `device_detached`).
+#[cfg(not(test))]
+fn device_detached(usb_ep: u32, cursor: u8) -> bool {
+    match usb_call(usb_ep, &UsbRequest::NextAttach { cursor }) {
+        Some(UsbReply::Attach {
+            notice: Some(notice),
+        }) => !notice.attached,
+        _ => true,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -857,7 +892,7 @@ fn handle_bot_read(
 
     while remaining > 0 {
         let chunk = remaining.min(MAX_BOT_SECTORS as u32) as u16;
-        let byte_count = chunk as u16 * 512;
+        let byte_count = chunk * 512;
         let lba32 = current_lba as u32; // BOT READ(10) uses 32-bit LBA.
         match bot_command(usb_ep, notice, &cdb_read10(lba32, chunk), true, byte_count) {
             Some((data, 0)) if data.len() == byte_count as usize => {
@@ -987,17 +1022,218 @@ fn program_main(_args: &[&str]) -> i32 {
         return 0;
     };
 
-    // Polling discovery: walk NextAttach cursor 0 every ~200 ms for up to
-    // ~30 s waiting for a mass-storage device (tier-2 hub-enumerated devices
-    // arrive late; we must not miss them by giving up after one walk).
-    //
-    // Fast path: if a device is already present on the first walk, we bind it
-    // immediately without sleeping.
-    let mut bound: Option<AttachNotice> = None;
+    // D.4: discover up to MAX_STICKS mass-storage devices (NextAttach walk;
+    // tier-2 hub-enumerated devices arrive late, so it re-walks for ~30 s).
+    let devices = discover_storage_devices(usb_ep);
+    if devices.is_empty() {
+        write_str(
+            STDOUT_FILENO,
+            "usb-storage: no mass-storage device attached — exiting cleanly\n",
+        );
+        return 0;
+    }
+
+    if devices.len() == 1 {
+        // Single-device path: the efficient blocking-with-timeout loop
+        // (usb0.block; C.4-validated by usb-unmount-smoke). No
+        // multi-device idle-poll latency on the common single-stick case.
+        let (notice, cursor) = devices[0];
+        let (blk_ep, uas) = match prepare_and_register(usb_ep, &notice, 0) {
+            Some(v) => v,
+            None => return 1,
+        };
+        // `cursor` lets the loop re-query NextAttach for a C.4 hot-unplug.
+        run_block_server_loop(usb_ep, blk_ep, &notice, uas, cursor);
+        return 0;
+    }
+
+    // D.4 multi-device path: prepare + register each stick (usb0.block,
+    // usb1.block, …) and serve them all from one event loop.
+    write_str(STDOUT_FILENO, "usb-storage: ");
+    write_u8_dec(devices.len() as u8);
+    write_str(STDOUT_FILENO, " mass-storage devices — multi-device mode\n");
+    let mut active: Vec<StorageDevice> = Vec::new();
+    for (k, (notice, cursor)) in devices.into_iter().enumerate() {
+        match prepare_and_register(usb_ep, &notice, k as u32) {
+            Some((blk_ep, uas)) => active.push(StorageDevice {
+                notice,
+                cursor,
+                index: k as u32,
+                blk_ep,
+                uas,
+            }),
+            None => {
+                write_str(
+                    STDOUT_FILENO,
+                    "usb-storage: skipping a device (prepare failed)\n",
+                );
+            }
+        }
+    }
+    if active.is_empty() {
+        return 1;
+    }
+    run_multi_block_server_loop(usb_ep, active);
+
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Multi-device support (D.4)
+// ---------------------------------------------------------------------------
+
+/// Maximum concurrent USB sticks the daemon serves. The kernel `blk::remote`
+/// registry holds `MAX_REMOTE_BLOCK`=4 devices; slot 0 is the root disk, so
+/// slots 1..=3 (→ `usb0`/`usb1`/`usb2`, mounted `/mnt/usb0`..`/mnt/usb2`) are
+/// available for USB mass storage.
+#[cfg(not(test))]
+const MAX_STICKS: usize = 3;
+
+/// One bound mass-storage device served by the multi-device loop.
+#[cfg(not(test))]
+struct StorageDevice {
+    /// The device's `AttachNotice` (bulk DCIs + slot for BOT transfers).
+    notice: AttachNotice,
+    /// `NextAttach` cursor where it was discovered (for the C.4 detach probe).
+    cursor: u8,
+    /// 0-based stick index → `usb{index}.block` / `/mnt/usb{index}`.
+    index: u32,
+    /// The registered block-service endpoint.
+    blk_ep: u32,
+    /// UAS vs BOT transport selection (BOT is the live path; D.3).
+    uas: bool,
+}
+
+/// `usb{index}.block` service name for a stick index.
+#[cfg(not(test))]
+fn service_name_for(index: u32) -> alloc::string::String {
+    alloc::format!("usb{index}.block")
+}
+
+/// NUL-terminated `/mnt/usb{index}` mount prefix for the `umount` syscall.
+/// `index < MAX_STICKS` (single digit), so a one-byte append suffices.
+#[cfg(not(test))]
+fn mount_prefix_cstr(index: u32) -> Vec<u8> {
+    let mut v = Vec::with_capacity(11);
+    v.extend_from_slice(b"/mnt/usb");
+    v.push(b'0' + (index as u8));
+    v.push(0);
+    v
+}
+
+/// Serve one decoded block request (shared by the single- and multi-device
+/// loops). Decodes the request, dispatches to the BOT handlers, and stages +
+/// sends the reply. For `BLK_READ` the combined (header+bulk) buffer is staged
+/// inside `handle_bot_read` and signalled via the `bytes == u32::MAX` sentinel
+/// so the second store call is skipped.
+#[cfg(not(test))]
+fn serve_block_request(
+    usb_ep: u32,
+    notice: &AttachNotice,
+    uas: bool,
+    msg: &IpcMessage,
+    recv_buf: &[u8],
+) {
+    use kernel_core::driver_ipc::block::BLK_REQUEST_HEADER_SIZE;
+
+    let reply_cap = msg.data[3] as u32;
+    if reply_cap == 0 {
+        // Notification or fire-and-forget — no reply expected.
+        return;
+    }
+    let real_len = (msg.data[1] as usize).min(recv_buf.len());
+
+    let (reply_header, already_staged) = match decode_blk_request(&recv_buf[..real_len]) {
+        Ok((req_hdr, _payload_grant)) => {
+            let write_payload = if real_len > BLK_REQUEST_HEADER_SIZE {
+                &recv_buf[BLK_REQUEST_HEADER_SIZE..real_len]
+            } else {
+                &[][..]
+            };
+
+            // TODO(92a D.3): UAS transport — when `uas` is true and the live UAS
+            // IU datapath lands, route SCSI over CommandIu/SenseIu/ResponseIu
+            // instead of the BOT helpers below. BOT is the live transport today.
+            let _ = uas;
+
+            match req_hdr.kind {
+                BLK_READ => {
+                    let hdr = handle_bot_read(
+                        usb_ep,
+                        notice,
+                        req_hdr.cmd_id,
+                        req_hdr.lba,
+                        req_hdr.sector_count,
+                    );
+                    let already = hdr.bytes == u32::MAX;
+                    (hdr, already)
+                }
+                BLK_WRITE => {
+                    let hdr = handle_bot_write(
+                        usb_ep,
+                        notice,
+                        req_hdr.cmd_id,
+                        req_hdr.lba,
+                        req_hdr.sector_count,
+                        write_payload,
+                    );
+                    (hdr, false)
+                }
+                BLK_FLUSH => {
+                    let hdr = handle_bot_flush(usb_ep, notice, req_hdr.cmd_id);
+                    (hdr, false)
+                }
+                BLK_STATUS => (ok_empty_reply(req_hdr.cmd_id), false),
+                _ => (
+                    BlkReplyHeader {
+                        cmd_id: req_hdr.cmd_id,
+                        status: BlockDriverError::InvalidRequest,
+                        bytes: 0,
+                    },
+                    false,
+                ),
+            }
+        }
+        Err(_) => (
+            BlkReplyHeader {
+                cmd_id: 0,
+                status: BlockDriverError::InvalidRequest,
+                bytes: 0,
+            },
+            false,
+        ),
+    };
+
+    if !already_staged {
+        let reply_bytes = encode_blk_reply(reply_header, 0);
+        let rc_bulk = syscall_lib::ipc_store_reply_bulk(&reply_bytes);
+        if rc_bulk == u64::MAX {
+            write_str(STDOUT_FILENO, "usb-storage: ipc_store_reply_bulk failed\n");
+        }
+    }
+
+    let rc_reply = syscall_lib::ipc_reply(reply_cap, 0, 0);
+    if rc_reply == u64::MAX {
+        write_str(STDOUT_FILENO, "usb-storage: ipc_reply failed\n");
+    }
+}
+
+/// Walk `NextAttach` and collect up to [`MAX_STICKS`] attached mass-storage
+/// devices (each with a bulk IN+OUT pair) plus the cursor each was found at.
+/// Re-walks every ~200 ms for up to ~30 s; once a non-empty set is stable for a
+/// few walks it returns, so co-present sticks that enumerate slightly apart are
+/// all caught while a lone stick is not delayed by waiting for a phantom second.
+#[cfg(not(test))]
+fn discover_storage_devices(usb_ep: u32) -> Vec<(AttachNotice, u8)> {
     const POLL_INTERVAL_MS: u32 = 200;
     const MAX_POLLS: u32 = 150; // 150 × 200 ms = 30 s
+    const STABLE_WALKS: u32 = 3; // ~600 ms with no growth ⇒ set is complete
 
-    'outer: for attempt in 0..MAX_POLLS {
+    let mut best: Vec<(AttachNotice, u8)> = Vec::new();
+    let mut stable = 0u32;
+
+    for attempt in 0..MAX_POLLS {
+        let mut current: Vec<(AttachNotice, u8)> = Vec::new();
         let mut cursor = 0u8;
         loop {
             match usb_call(usb_ep, &UsbRequest::NextAttach { cursor }) {
@@ -1009,40 +1245,26 @@ fn program_main(_args: &[&str]) -> i32 {
                         && notice.bulk_in_dci != 0
                         && notice.bulk_out_dci != 0
                     {
-                        write_str(STDOUT_FILENO, "usb-storage: bound mass-storage slot=");
-                        write_u8_dec(notice.slot_id);
-                        write_str(STDOUT_FILENO, " in_dci=");
-                        write_u8_dec(notice.bulk_in_dci);
-                        write_str(STDOUT_FILENO, " out_dci=");
-                        write_u8_dec(notice.bulk_out_dci);
-                        write_str(STDOUT_FILENO, "\n");
-
-                        // C.4: check for a device that was detached between
-                        // enumeration and our bind attempt.
-                        if !notice.attached {
-                            release_device(&notice);
-                            cursor = cursor.saturating_add(1);
-                            continue;
+                        current.push((notice, cursor));
+                        if current.len() >= MAX_STICKS {
+                            break;
                         }
-
-                        bound = Some(notice);
-                        break 'outer;
                     }
                     cursor = cursor.saturating_add(1);
                 }
-                Some(UsbReply::Attach { notice: None }) | None => {
-                    // Cursor exhausted for this walk.
-                    break;
-                }
-                _ => {
-                    cursor = cursor.saturating_add(1);
-                }
+                Some(UsbReply::Attach { notice: None }) | None => break,
+                _ => cursor = cursor.saturating_add(1),
             }
         }
 
-        if attempt == 0 {
-            // No log spam on the first immediate attempt; only start logging
-            // on the first retry.
+        if current.len() > best.len() {
+            best = current;
+            stable = 0;
+        } else if !best.is_empty() {
+            stable += 1;
+            if stable >= STABLE_WALKS {
+                break;
+            }
         } else if attempt % 5 == 1 {
             write_str(STDOUT_FILENO, "usb-storage: waiting for device\n");
         }
@@ -1050,32 +1272,36 @@ fn program_main(_args: &[&str]) -> i32 {
         let _ = syscall_lib::nanosleep_for(0, POLL_INTERVAL_MS * 1_000_000);
     }
 
-    let notice = match bound {
-        Some(n) => n,
-        None => {
-            write_str(
-                STDOUT_FILENO,
-                "usb-storage: no mass-storage device attached — exiting cleanly\n",
-            );
-            return 0;
-        }
-    };
+    for (notice, _) in &best {
+        write_str(STDOUT_FILENO, "usb-storage: bound mass-storage slot=");
+        write_u8_dec(notice.slot_id);
+        write_str(STDOUT_FILENO, " in_dci=");
+        write_u8_dec(notice.bulk_in_dci);
+        write_str(STDOUT_FILENO, " out_dci=");
+        write_u8_dec(notice.bulk_out_dci);
+        write_str(STDOUT_FILENO, "\n");
+    }
+    best
+}
 
+/// Probe a discovered device, run the scratch self-test only on blank media, and
+/// register its `usb{index}.block` backend. Returns `(blk_ep, uas)` on success.
+#[cfg(not(test))]
+fn prepare_and_register(usb_ep: u32, notice: &AttachNotice, index: u32) -> Option<(u32, bool)> {
     // (D.3) Transport selection: fetch config descriptor, scan for UAS.
-    let uas = select_transport(usb_ep, &notice);
+    let uas = select_transport(usb_ep, notice);
 
     // Probe: GET_MAX_LUN → TEST UNIT READY (bot-ok) → INQUIRY → READ CAPACITY.
-    let cap = match probe_device(usb_ep, &notice) {
+    let cap = match probe_device(usb_ep, notice) {
         Some(c) => c,
         None => {
-            write_str(STDOUT_FILENO, "usb-storage: probe failed — exiting\n");
-            return 1;
+            write_str(STDOUT_FILENO, "usb-storage: probe failed\n");
+            return None;
         }
     };
 
-    // (D.4 safety gate) Detect real filesystem before any write.
-    let real_fs = detect_real_fs(usb_ep, &notice);
-    if real_fs {
+    // (D.4 safety gate) Detect a real filesystem before any destructive write.
+    if detect_real_fs(usb_ep, notice) {
         write_str(
             STDOUT_FILENO,
             "usb-storage: real-fs detected — skipping destructive self-test\n",
@@ -1085,41 +1311,123 @@ fn program_main(_args: &[&str]) -> i32 {
             STDOUT_FILENO,
             "usb-storage: scratch device — running rw self-test\n",
         );
-        run_scratch_self_test(usb_ep, &notice, &cap);
+        run_scratch_self_test(usb_ep, notice, &cap);
     }
 
-    // Register as a block backend.
-    let blk_ep = match create_service_endpoint(SERVICE_NAME) {
+    // Register the block backend as usb{index}.block.
+    let svc = service_name_for(index);
+    let blk_ep = match create_service_endpoint(&svc) {
         Some(ep) => ep,
         None => {
-            write_str(
-                STDOUT_FILENO,
-                "usb-storage: failed to register usb0.block — exiting\n",
-            );
-            return 1;
+            write_str(STDOUT_FILENO, "usb-storage: failed to register ");
+            write_str(STDOUT_FILENO, &svc);
+            write_str(STDOUT_FILENO, "\n");
+            return None;
         }
     };
-    write_str(STDOUT_FILENO, "usb-storage: registered usb0.block\n");
-
-    // Enter the resident block-server loop.
-    // The loop calls ipc_store_reply_bulk + ipc_reply for each request.
-    // For reads the combined (header+bulk) buffer is staged inside
-    // handle_bot_read and signalled via the bytes==u32::MAX sentinel.
-    run_block_server_loop(usb_ep, blk_ep, &notice, uas);
-
-    0
+    write_str(STDOUT_FILENO, "usb-storage: registered ");
+    write_str(STDOUT_FILENO, &svc);
+    write_str(STDOUT_FILENO, "\n");
+    Some((blk_ep, uas))
 }
 
-/// Block-server dispatch loop.
+/// Multi-device block-server loop (D.4): serves N≥2 sticks from one process.
 ///
-/// Uses `ipc_recv_msg` directly (driver_runtime is not a dependency of this
-/// crate) and mirrors the `BlockServer::handle_next` contract: recv →
-/// decode_blk_request → dispatch → encode_blk_reply → ipc_store_reply_bulk
-/// → ipc_reply. For `BLK_READ` the combined (header+bulk) buffer is staged
-/// inside `handle_bot_read` and signalled to the loop via the
-/// `bytes == u32::MAX` sentinel so the loop skips the second store call.
+/// m3OS's single-threaded userspace (the native `BrkAllocator` is not
+/// thread-safe) means N devices cannot each block on their own endpoint in a
+/// thread; instead this is the single-event-loop pattern (the analog of Track F
+/// multi-controller servicing): round-robin `ipc_try_recv_msg` across every
+/// device's block endpoint, serving any pending request immediately, and when a
+/// full round is idle, run the C.4 detach reconcile across all devices and sleep
+/// briefly. The single-device case keeps the efficient blocking
+/// `run_block_server_loop` (no poll latency); this path trades a small idle-poll
+/// latency for serving multiple sticks without threads.
 #[cfg(not(test))]
-fn run_block_server_loop(usb_ep: u32, blk_ep: u32, notice: &AttachNotice, uas: bool) {
+fn run_multi_block_server_loop(usb_ep: u32, mut devices: Vec<StorageDevice>) {
+    use kernel_core::driver_ipc::block::BLK_REQUEST_HEADER_SIZE;
+    use kernel_core::driver_ipc::block::MAX_SECTORS_PER_REQUEST;
+
+    let recv_cap = BLK_REQUEST_HEADER_SIZE + (MAX_SECTORS_PER_REQUEST as usize) * 512;
+    let mut recv_buf = alloc::vec![0u8; recv_cap];
+    let mut last_detach_ns = monotonic_ns();
+
+    loop {
+        // Drain any pending request on each device's endpoint (non-blocking).
+        let mut served_any = false;
+        let mut i = 0;
+        while i < devices.len() {
+            let ep = devices[i].blk_ep;
+            let mut msg = IpcMessage::new(0);
+            let rc = syscall_lib::ipc_try_recv_msg(ep, &mut msg, &mut recv_buf);
+            if rc != u64::MAX {
+                serve_block_request(usb_ep, &devices[i].notice, devices[i].uas, &msg, &recv_buf);
+                served_any = true;
+            }
+            i += 1;
+        }
+        if served_any {
+            // Stay in the fast path while any device is busy.
+            continue;
+        }
+
+        // Idle round: C.4 detach reconcile across all devices (rate-limited).
+        let now = monotonic_ns();
+        if now.saturating_sub(last_detach_ns) >= DETACH_POLL_INTERVAL_MS * 1_000_000 {
+            last_detach_ns = now;
+            let mut j = 0;
+            while j < devices.len() {
+                if device_detached(usb_ep, devices[j].cursor) {
+                    let index = devices[j].index;
+                    let prefix = mount_prefix_cstr(index);
+                    let rc_um = syscall_lib::umount(&prefix);
+                    write_str(
+                        STDOUT_FILENO,
+                        if rc_um == 0 {
+                            "USB_STORAGE:detached-unmounted /mnt/usb"
+                        } else {
+                            "USB_STORAGE:detached (no live mount) /mnt/usb"
+                        },
+                    );
+                    write_u8_dec(index as u8);
+                    write_str(STDOUT_FILENO, "\n");
+                    release_device(&devices[j].notice);
+                    devices.remove(j);
+                    // Do not advance `j`: the next device shifted into this slot.
+                    continue;
+                }
+                j += 1;
+            }
+            if devices.is_empty() {
+                write_str(
+                    STDOUT_FILENO,
+                    "usb-storage: all devices detached — exiting\n",
+                );
+                return;
+            }
+        }
+
+        // Brief idle sleep to avoid a busy-spin while no device has traffic.
+        let _ = syscall_lib::nanosleep_for(0, 1_000_000);
+    }
+}
+
+/// Block-server dispatch loop (single device).
+///
+/// Mirrors the `BlockServer::handle_next` contract via [`serve_block_request`]:
+/// recv → decode_blk_request → dispatch → encode_blk_reply → ipc_store_reply_bulk
+/// → ipc_reply. For `BLK_READ` the combined (header+bulk) buffer is staged inside
+/// `handle_bot_read` and signalled via the `bytes == u32::MAX` sentinel so the
+/// loop skips the second store call.
+///
+/// C.4: the recv is bounded by `ipc_recv_msg_timeout` (≈`DETACH_POLL_INTERVAL`).
+/// On a deadline expiry (no block request in the window) the loop re-queries
+/// `NextAttach` at the device's discovery `cursor`; if the device was
+/// hot-unplugged it unmounts `/mnt/usb0` (freeing the kernel `blk::remote`
+/// slot) and returns, so a removed stick no longer leaves a stale mount. An
+/// active filesystem keeps the timeout from firing, so steady-state I/O is
+/// unaffected.
+#[cfg(not(test))]
+fn run_block_server_loop(usb_ep: u32, blk_ep: u32, notice: &AttachNotice, uas: bool, cursor: u8) {
     use kernel_core::driver_ipc::block::BLK_REQUEST_HEADER_SIZE;
     use kernel_core::driver_ipc::block::MAX_SECTORS_PER_REQUEST;
 
@@ -1129,7 +1437,28 @@ fn run_block_server_loop(usb_ep: u32, blk_ep: u32, notice: &AttachNotice, uas: b
 
     loop {
         let mut msg = IpcMessage::new(0);
-        let rc = syscall_lib::ipc_recv_msg(blk_ep, &mut msg, &mut recv_buf);
+        let deadline = monotonic_ns().saturating_add(DETACH_POLL_INTERVAL_MS * 1_000_000);
+        let rc = syscall_lib::ipc_recv_msg_timeout(blk_ep, &mut msg, &mut recv_buf, deadline);
+
+        if rc == NEG_ETIMEDOUT {
+            // C.4: idle window elapsed — has the device been hot-unplugged?
+            if device_detached(usb_ep, cursor) {
+                let rc_um = syscall_lib::umount(MOUNT_PREFIX_CSTR);
+                if rc_um == 0 {
+                    write_str(STDOUT_FILENO, "USB_STORAGE:detached-unmounted /mnt/usb0\n");
+                } else {
+                    // The device was registered but never mounted (or already
+                    // unmounted) — benign; still tear down and exit.
+                    write_str(
+                        STDOUT_FILENO,
+                        "USB_STORAGE:detached (no live mount) /mnt/usb0\n",
+                    );
+                }
+                release_device(notice);
+                return;
+            }
+            continue;
+        }
         if rc == u64::MAX {
             consecutive_errors += 1;
             write_str(
@@ -1146,100 +1475,7 @@ fn run_block_server_loop(usb_ep: u32, blk_ep: u32, notice: &AttachNotice, uas: b
             continue;
         }
         consecutive_errors = 0;
-
-        let reply_cap = msg.data[3] as u32;
-        if reply_cap == 0 {
-            // Notification or fire-and-forget — no reply expected.
-            // TODO(92a C.4): detach-during-serve — check for a detach
-            // notification here and call release_device if the bound slot
-            // has been removed. Needs a non-blocking poll of the USB server
-            // to distinguish "detach notification" from "block request".
-            continue;
-        }
-
-        let real_len = (msg.data[1] as usize).min(recv_buf.len());
-
-        // Decode the block request.
-        let (reply_header, already_staged) = match decode_blk_request(&recv_buf[..real_len]) {
-            Ok((req_hdr, _payload_grant)) => {
-                let write_payload = if real_len > BLK_REQUEST_HEADER_SIZE {
-                    &recv_buf[BLK_REQUEST_HEADER_SIZE..real_len]
-                } else {
-                    &[][..]
-                };
-
-                // TODO(92a D.3): UAS transport — when `uas` is true and UAS
-                // IU types are available in kernel_core::usb::mass_storage,
-                // route SCSI commands over CommandIu/SenseIu/ResponseIu
-                // instead of the BOT helpers below.
-                let _ = uas;
-
-                match req_hdr.kind {
-                    BLK_READ => {
-                        // handle_bot_read stages (header+bulk) and signals via
-                        // bytes == u32::MAX.
-                        let hdr = handle_bot_read(
-                            usb_ep,
-                            notice,
-                            req_hdr.cmd_id,
-                            req_hdr.lba,
-                            req_hdr.sector_count,
-                        );
-                        let already = hdr.bytes == u32::MAX;
-                        (hdr, already)
-                    }
-                    BLK_WRITE => {
-                        let hdr = handle_bot_write(
-                            usb_ep,
-                            notice,
-                            req_hdr.cmd_id,
-                            req_hdr.lba,
-                            req_hdr.sector_count,
-                            write_payload,
-                        );
-                        (hdr, false)
-                    }
-                    BLK_FLUSH => {
-                        let hdr = handle_bot_flush(usb_ep, notice, req_hdr.cmd_id);
-                        (hdr, false)
-                    }
-                    BLK_STATUS => (ok_empty_reply(req_hdr.cmd_id), false),
-                    _ => (
-                        BlkReplyHeader {
-                            cmd_id: req_hdr.cmd_id,
-                            status: BlockDriverError::InvalidRequest,
-                            bytes: 0,
-                        },
-                        false,
-                    ),
-                }
-            }
-            Err(_) => (
-                BlkReplyHeader {
-                    cmd_id: 0,
-                    status: BlockDriverError::InvalidRequest,
-                    bytes: 0,
-                },
-                false,
-            ),
-        };
-
-        // Stage the encoded reply header (and any bulk data for non-reads),
-        // then send the reply. For reads the combined (header+bulk) buffer was
-        // already staged inside handle_bot_read (signalled by bytes==u32::MAX);
-        // calling store_reply_bulk again would overwrite the sector payload.
-        if !already_staged {
-            let reply_bytes = encode_blk_reply(reply_header, 0);
-            let rc_bulk = syscall_lib::ipc_store_reply_bulk(&reply_bytes);
-            if rc_bulk == u64::MAX {
-                write_str(STDOUT_FILENO, "usb-storage: ipc_store_reply_bulk failed\n");
-            }
-        }
-
-        let rc_reply = syscall_lib::ipc_reply(reply_cap, 0, 0);
-        if rc_reply == u64::MAX {
-            write_str(STDOUT_FILENO, "usb-storage: ipc_reply failed\n");
-        }
+        serve_block_request(usb_ep, notice, uas, &msg, &recv_buf);
     }
 }
 
