@@ -115,12 +115,15 @@ const MAX_SCAN_PASSES: u32 = 50;
 #[cfg(not(test))]
 const POLL_INTERVAL_MS: u64 = 200;
 
-/// Length used to arm each bulk-IN RX poll. Sized to hold a full Ethernet frame
-/// (1514) plus NCM NTB framing overhead, bounded well under the H.6
-/// `USB_MSG_MAX`-minus-overhead cap so the inline `BulkData` reply never
-/// overflows.
+/// Length used to arm each bulk-IN RX poll. A CDC-NCM RX unit is a whole NTB
+/// (`parse_ntb16`), which legitimately aggregates several Ethernet frames and
+/// can exceed a single 1514-byte frame, so this is sized to the largest inline
+/// transfer the protocol allows: `USB_MSG_MAX - 4` is the maximum `len` whose
+/// `BulkData` reply (data + a 4-byte wire header) still fits `USB_MSG_MAX`, the
+/// xHCI server's H.6 accept threshold. A smaller cap would truncate large NTBs
+/// and make `parse_ntb16` drop the aggregated frames.
 #[cfg(not(test))]
-const RX_POLL_LEN: u16 = 2048;
+const RX_POLL_LEN: u16 = (USB_MSG_MAX - 4) as u16;
 
 /// Re-walk the `NextAttach` table for a detach check every N io-loop passes
 /// (C.4). At `POLL_INTERVAL_MS` that is roughly one detach probe per second.
@@ -276,7 +279,29 @@ fn try_bind(usb_ep: u32, notice: &AttachNotice, cursor: u8) -> Option<CdcDevice>
     // Read the full config blob to refine ECM-vs-NCM and locate the MAC.
     let config = get_config(usb_ep, notice.slot_id)?;
     let variant = refine_cdc_variant(&config);
-    let mac = read_ecm_mac(usb_ep, notice.slot_id, &config).unwrap_or([0x02, 0, 0, 0, 0, 0x01]);
+    let mac = match read_ecm_mac(usb_ep, notice.slot_id, &config) {
+        Some(mac) => mac,
+        None => {
+            // The `iMACAddress` lookup failed. Do NOT fall back to a fixed
+            // constant — two devices that both fail the read would then present
+            // the same L2 address and break ARP/NDP. Derive a *unique*
+            // locally-administered MAC (first octet 0x02: LAA bit set, multicast
+            // bit clear) from stable device identifiers (VID/PID/xHCI slot).
+            let mac = [
+                0x02,
+                (notice.vendor_id >> 8) as u8,
+                notice.vendor_id as u8,
+                (notice.product_id >> 8) as u8,
+                notice.product_id as u8,
+                notice.slot_id,
+            ];
+            write_str(
+                STDOUT_FILENO,
+                "usb-net: iMACAddress read failed — using derived locally-administered MAC\n",
+            );
+            mac
+        }
+    };
 
     // Activate the data-interface bulk pair (alt 0 is the zero-bandwidth idle
     // setting for ECM/NCM; the bulk endpoints live on alt 1). Best-effort: a
@@ -367,9 +392,10 @@ fn tx_frame(usb_ep: u32, dev: &CdcDevice, frame: &[u8]) -> bool {
             }
         }
     };
-    // A `SubmitBulkOut` request is `data + 7` bytes on the wire; standard-MTU
-    // frames are far under `USB_MSG_MAX`, but guard the bound explicitly.
-    if payload.len() + 7 > USB_MSG_MAX {
+    // A `SubmitBulkOut` request encodes as `data + 5` bytes on the wire
+    // (tag + slot_id + dci + a u16 length prefix); standard-MTU frames are far
+    // under `USB_MSG_MAX`, but guard the bound explicitly.
+    if payload.len() + 5 > USB_MSG_MAX {
         return false;
     }
     matches!(
