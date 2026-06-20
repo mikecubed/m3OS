@@ -1,6 +1,6 @@
 # Phase 92 - USB Class Expansion
 
-**Status:** In Progress — core landed + validated (kernel `0.92.0`); sub-phases 92a–92e scheduled
+**Status:** Complete (92a–92e landed + the C.4 unmount-on-detach / D.4 multi-stick follow-ups; kernel `0.92.5`) — fully validated except **live UAS command/data driving** (the UAS codec + UAS-vs-BOT detection ship; the live IU datapath is a hardware-only deferral, see *Deferred Until Later*). C.4 (`usb-unmount-smoke`) and D.4 (`usb-storage-dual-smoke`) are gated.
 **Source Ref:** phase-92
 **Depends on:** Phase 78a (xHCI Host Bring-Up) ✅, Phase 78b (USB Enumeration + Hub) ✅, Phase 78c (HID Boot Protocol + `usb` IPC service) ✅, Phase 74 (IPC Capability Grants — the page-grant transport) ✅, Phase 83 (Release 1.0 Gate) ✅, Phase 96 (Bare-Metal USB-Ethernet) ✅ — the USB **bulk-endpoint transport** + **multi-controller handle codec** this phase's bulk-class drivers build on landed ahead of Phase 92 via PR 248 (host-stack robustness) and PR 237 (the `ure` driver)
 **Builds on:** Extends the Phase 78 USB foundation — xHCI host driver, root-hub enumeration, HID Boot-Protocol keyboard + mouse, and the `usb` IPC service — with the USB class features explicitly deferred from 78c. It builds **directly on the Phase 96 bulk-endpoint substrate** (landed ahead of this phase): the `PollBulkIn` / `SubmitBulkOut` / `BulkData` inline bulk transport, the `ControlWrite` OUT-with-data control path, `USB_MSG_MAX` raised 1024 → 4096, the multi-controller `handle.rs` slot codec, and the three Phase 78c carry-over hardening fixes (see *Carry-over hardening*). Phase 92 adds the class drivers on top rather than re-implementing transport.
@@ -8,7 +8,7 @@
 
 ## Milestone Goal
 
-m3OS supports the full USB class ecosystem deferred from the 1.0 release: multi-tier hubs enumerate devices behind them, HID Report Protocol enables touchpads and gaming mice, hot-plug attach/detach events reach userspace dynamically, USB flash drives mount as block devices, isochronous endpoints carry USB audio and video class streams, and a generic CDC-ECM/NCM driver brings up arbitrary USB-Ethernet dongles (generalizing the Phase 96 vendor `ure` proof). Multiple xHCI controllers are serviced concurrently, each on its own interrupt. The phase closes by bumping the kernel to `0.92.0` and shipping the Phase 92 learning doc.
+m3OS supports the full USB class ecosystem deferred from the 1.0 release: multi-tier hubs enumerate devices behind them, HID Report Protocol enables touchpads and gaming mice, hot-plug attach/detach events reach userspace dynamically, USB flash drives mount as block devices, isochronous endpoints carry USB audio and video class streams, and a generic CDC-ECM/NCM driver brings up arbitrary USB-Ethernet dongles (generalizing the Phase 96 vendor `ure` proof). Multiple xHCI controllers are serviced concurrently, each on its own interrupt. The phase closes by bumping the kernel to `0.92.5` (the `0.92.0` core milestone plus the `0.92.1`–`0.92.5` sub-phase patch releases) and shipping the Phase 92 learning doc.
 
 ## Why This Phase Exists
 
@@ -111,18 +111,18 @@ Phase 96 proved the host-side USB-Ethernet path with a *vendor-specific* driver:
 6. Implement per-controller event-loop threads + concurrent MSI-X routing for multi-controller concurrency (Track F).
 7. Implement the generic CDC-ECM/NCM class driver and fold the Phase 96 `ure` driver into the shared device-match registry (Track G).
 8. Implement UAC isochronous PCM-out; validate audio playback from a USB speaker (Track E.1) and UVC frame capture + `camera_server` (Track E.2/E.3).
-9. Add the Phase 92 acceptance gates, bump the kernel to `0.92.0`, and ship the Phase 92 learning doc (Track I).
+9. Add the Phase 92 acceptance gates, bump the kernel (`0.92.0` at the core milestone, then `0.92.1`–`0.92.5` across sub-phases 92a–92e), and ship the Phase 92 learning doc (Track I).
 
 ## Acceptance Criteria
 
-- A USB flash drive attached behind a 4-port USB hub enumerates and mounts; `ls /mnt/usb0` lists its files.
+- A USB flash drive enumerates and mounts; `ls /mnt/usb0` lists its files. (Direct-attach in QEMU — `usb-mount-smoke`. Tier-2 hub enumeration is CI-validated separately with a full-speed HID device behind the hub — `usb-hub-smoke` → `XHCI_HUB:child-enumerated`; a *high-speed mass-storage* device behind an external hub is bare-metal-only because QEMU's `usb-hub` is full-speed USB 1.1 and cannot carry it.)
 - Disconnecting and reconnecting the flash drive triggers a clean detach (`AttachNotice { attached: false }` + Disable Slot) and re-enumeration without restarting any daemon.
 - A HID Report Protocol gaming mouse reports correct X/Y axes and additional buttons through `mouse_server`; Caps Lock toggles the keyboard LED via `SET_REPORT`.
 - A second xHCI controller (a second QEMU `-device qemu-xhci`) enumerates its devices on **its own bound IRQ / event loop**, concurrently with the primary controller (not merely polled on the next message).
 - A generic CDC-ECM USB-Ethernet dongle brings up an L2 `RemoteNic` through the new `usb-net` class driver, and the Phase 96 vendor `ure` driver continues to bind the RTL8156 through the shared registry.
 - USB audio (UAC) plays a PCM stream; `audio_server` lists the USB sink alongside AC'97 / HDA.
 - No regression in the Phase 78c Boot-Protocol keyboard or mouse, the Phase 96 `usb-eth-smoke`, or any other smoke / regression gate.
-- The kernel reports `0.92.0` (boot banner / `uname`), and the Phase 92 learning doc (`docs/92-usb-class-expansion.md`) ships, linked from `docs/README.md` and `docs/appendix/codebase-map.md`.
+- The kernel reports `0.92.5` (boot banner / `uname` — `0.92.0` at the core milestone, bumped to `0.92.5` across sub-phases 92a–92e), and the Phase 92 learning doc (`docs/92-usb-class-expansion.md`) ships, linked from `docs/README.md` and `docs/appendix/codebase-map.md`.
 
 ## Companion Task List
 
@@ -133,7 +133,7 @@ Phase 96 proved the host-side USB-Ethernet path with a *vendor-specific* driver:
 - Linux's `usbcore` + `hub.c` handle arbitrary hub depth natively; the driver framework makes multi-tier enumeration transparent. m3OS at Phase 92 wires this explicitly through the `usb` IPC service boundary.
 - Linux's HID subsystem uses Report Descriptors universally — Boot Protocol is only a BIOS fallback. m3OS ships Boot Protocol at 1.0 because it covers the 99% case with zero descriptor-parsing risk at bring-up.
 - Real OS hot-plug is interrupt-driven and fully asynchronous at every layer. m3OS at Phase 92 adds the Port Status Change → event surface path but may still serialize some re-enumeration steps through the xHCI server's IPC loop.
-- BOT is considered legacy in the USB 3.x era; UAS is the preferred SCSI transport for USB 3.0 drives. m3OS ships both and selects UAS when the device advertises it.
+- BOT is considered legacy in the USB 3.x era; UAS is the preferred SCSI transport for USB 3.0 drives. m3OS at Phase 92 ships **BOT** as the live transport plus the host-tested UAS Information-Unit codec and the UAS-vs-BOT device-detection/selection (`find_uas_interface` → `transport=uas|bot`); the **live UAS command/data driving path** (stream IDs, queued IUs) is deferred — see *Deferred Until Later*.
 - Production OSes drive USB-Ethernet through a stack of class + vendor drivers (`cdc_ether`, `cdc_ncm`, `r8152`, `ax88179_178a`, …). m3OS at Phase 92 ships the generic CDC-ECM/NCM class driver plus the Phase 96 vendor `ure` driver behind one registry, leaving RNDIS and the long vendor tail deferred.
 - Production OSes support UAC 2.0 and UAC 3.0 (high-speed isochronous, multiple sampling rates, feedback endpoints). m3OS at this phase targets UAC 1.0 full-speed isochronous only.
 - UVC device profiles, format negotiation, and compressed streams (H.264, MJPEG) — deferred.
@@ -151,6 +151,9 @@ Phase 96 proved the host-side USB-Ethernet path with a *vendor-specific* driver:
 - USB OTG / dual-role
 - HID multi-touch contact tracking beyond single-pointer touchpad mapping
 - Per-tier hub TT (Transaction Translator) bandwidth accounting for full/low-speed devices behind USB 2.0 hubs
+- **Live UAS command/data driving** (Track D.3) — the UAS Information-Unit codec (`kernel_core::usb::mass_storage`) and UAS-vs-BOT device detection/selection (`find_uas_interface`, logging `transport=uas|bot`) are shipped + host-tested, but the live command/status/data path over stream IDs is deferred (BOT is the validated transport; QEMU's `usb-uas` chain is bare-metal-only here).
+
+> **Closed as follow-ups (formerly deferred here):** **Mount-teardown-on-detach** (Track C.4) — the resident `usb-storage` loop now uses the Phase 87 `ipc_recv_msg_timeout` (no new IPC primitive was needed) to notice a hot-unplug and `umount("/mnt/usb<n>")`, the kernel `sys_linux_umount2` gaining a `/mnt/usb*` branch that frees the ext2 volume + `blk::remote` slot (gated by `usb-unmount-smoke`). **Multi-stick concurrent mounts** (Track D.4) — the daemon is now multi-device (`discover_storage_devices` + `run_multi_block_server_loop`, the single-event-loop pattern), serving `usb0.block`/`usb1.block`/… concurrently (gated by `usb-storage-dual-smoke`).
 
 ### Carry-over hardening from the Phase 78c review
 

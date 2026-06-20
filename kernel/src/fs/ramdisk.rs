@@ -230,6 +230,8 @@ static USBHUB_ELF: &[u8] = generated_initrd_asset!("usbhub");
 static USB_HID_ELF: &[u8] = generated_initrd_asset!("usb_hid");
 /// Phase 92 Track D: ring-3 USB Mass Storage (Bulk-Only Transport) class driver.
 static USB_STORAGE_ELF: &[u8] = generated_initrd_asset!("usb_storage");
+/// Phase 92e Track G: ring-3 USB-Ethernet (CDC-ECM/NCM) RemoteNic class driver.
+static USB_NET_ELF: &[u8] = generated_initrd_asset!("usb_net");
 /// Phase 92c Track E: ring-3 USB Audio Class (UAC) isochronous PCM-out driver.
 static USB_AUDIO_ELF: &[u8] = generated_initrd_asset!("usb_audio");
 /// Phase 92c Track E.2: ring-3 USB Video Class (UVC) frame-capture driver.
@@ -1369,6 +1371,14 @@ static DRIVERS_ENTRIES: &[(&str, RamdiskNode)] = &[
         "usb-storage",
         RamdiskNode::File {
             content: USB_STORAGE_ELF,
+        },
+    ),
+    // Phase 92e Track G: ring-3 USB-Ethernet (CDC-ECM/NCM) RemoteNic class
+    // driver, under /drivers/ so `is_authorized_driver_process` admits it.
+    (
+        "usb-net",
+        RamdiskNode::File {
+            content: USB_NET_ELF,
         },
     ),
     // Phase 92c Track E: ring-3 USB Audio Class (UAC) isochronous PCM-out driver.

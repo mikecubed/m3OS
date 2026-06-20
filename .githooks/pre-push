@@ -344,11 +344,27 @@ if [ "${M3OS_USB_REGRESSION:-0}" = "1" ]; then
     cargo xtask usb-hub-smoke --timeout 200
     echo "pre-push: running cargo xtask usb-mount-smoke..."
     cargo xtask usb-mount-smoke --timeout 420
+    # Phase 92 C.4 — unmount-on-detach: mounts /mnt/usb0, QMP device_del the stick,
+    # and asserts the usb-storage daemon unmounts it (USB_STORAGE:detached-unmounted)
+    # without wedging the VFS.
+    echo "pre-push: running cargo xtask usb-unmount-smoke..."
+    cargo xtask usb-unmount-smoke --timeout 420
+    # Phase 92 D.4 — concurrent multi-stick: two usb-storage devices; the daemon
+    # enters multi-device mode + registers usb0.block + usb1.block, both mount and
+    # read their own distinct content (independent concurrent sticks).
+    echo "pre-push: running cargo xtask usb-storage-dual-smoke..."
+    cargo xtask usb-storage-dual-smoke --timeout 420
     # Phase 92d — dual-controller concurrency: a second qemu-xhci (xhci1, addr=0x7)
     # with only a usb-mouse; asserts XHCI:controller-1:ready (xhci1's IRQ subscribed
     # into the shared Notification) and that a QMP mouse-move on xhci1 decodes.
     echo "pre-push: running cargo xtask usb-multi-controller-smoke..."
     cargo xtask usb-multi-controller-smoke --timeout 200
+    # Phase 92e — CDC-ECM/NCM USB-Ethernet. Skip-with-reason (QEMU has no CDC-ECM
+    # model); CI coverage is the kernel_core::usb::cdc host tests + the usb-net
+    # crate compiling. Set M3OS_USB_ETH_REGRESSION=1 to acknowledge hardware-only
+    # validation via VFIO passthrough with a CDC dongle.
+    echo "pre-push: running cargo xtask usb-eth-smoke..."
+    cargo xtask usb-eth-smoke
 fi
 
 # Phase 79 — opt-in modern-NIC regression gate. `multi-nic-smoke` boots QEMU

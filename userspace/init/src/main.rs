@@ -216,6 +216,8 @@ const KNOWN_CONFIGS: &[&[u8]] = &[
     b"/etc/services.d/usb-hid.conf\0",
     // Phase 92 Track D: ring-3 USB Mass Storage (BOT) class driver.
     b"/etc/services.d/usb-storage.conf\0",
+    // Phase 92e Track G: ring-3 USB-Ethernet (CDC-ECM/NCM) RemoteNic class driver.
+    b"/etc/services.d/usb-net.conf\0",
     // Phase 92c Track E: ring-3 USB Audio Class (UAC) isochronous PCM-out driver.
     b"/etc/services.d/usb-audio.conf\0",
     // Phase 92c Track E.2: ring-3 USB Video Class (UVC) frame-capture driver.
