@@ -609,11 +609,14 @@ impl<B: IrqBackend> IrqNotification<B> {
         bit_index: u8,
     ) -> Result<Self, DriverRuntimeError> {
         // `bit_index` names a bit in the shared notification's 64-bit word, so a
-        // value ≥ 64 is a caller contract violation (`1u64 << bit_index` would
-        // shift-overflow — panic in debug, wrong mask in release). Fail fast
-        // before touching the backend rather than corrupting the subscription.
+        // value ≥ 64 is out of range (`1u64 << bit_index` would shift-overflow —
+        // panic in debug, wrong mask in release). Fail fast before touching the
+        // backend, using the SAME -EINVAL mapping the backend guards apply
+        // (`SyscallBackend::{subscribe, subscribe_into}` both
+        // `errno_to_driver_runtime_error(-22)` for an out-of-range bit index), so
+        // the wrapper is consistent regardless of which layer catches it.
         if bit_index >= 64 {
-            return Err(DriverRuntimeError::from(DeviceHostError::Internal));
+            return Err(errno_to_driver_runtime_error(-22));
         }
         let cap = backend.subscribe_into(device.cap_handle(), bit_index as u32, into_notif_cap)?;
         Ok(Self {
@@ -1158,12 +1161,13 @@ mod tests {
     fn subscribe_into_rejects_out_of_range_bit_index_before_backend() {
         // A `bit_index` ≥ 64 cannot name a bit in the 64-bit notification word —
         // `1u64 << bit_index` would shift-overflow. The wrapper must fail fast
-        // with an Internal (caller-bug) error and must NOT touch the backend.
+        // with the SAME -EINVAL mapping the backend guards use (so the error is
+        // consistent across call sites) and must NOT touch the backend.
         let backend = MockBackend::new();
         let device = MockDevice { cap_handle: 7 };
         let err = IrqNotification::subscribe_into_with_backend(backend.clone(), &device, 1, 64)
             .expect_err("bit_index == 64 must be rejected");
-        assert_eq!(err, DriverRuntimeError::from(DeviceHostError::Internal));
+        assert_eq!(err, errno_to_driver_runtime_error(-22));
         assert!(
             backend.subscribe_into_records().is_empty(),
             "rejection must happen before any backend call"
