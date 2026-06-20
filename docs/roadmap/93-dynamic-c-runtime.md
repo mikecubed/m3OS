@@ -123,7 +123,7 @@ A static interpreter embeds libc and never performs a `libc.so` lookup, so it ru
 
 ## Companion Task List
 
-- Phase 93 task list — defer until implementation planning begins.
+- [Phase 93 Task List](./tasks/93-dynamic-c-runtime-tasks.md)
 
 ## How Real OS Implementations Differ
 
