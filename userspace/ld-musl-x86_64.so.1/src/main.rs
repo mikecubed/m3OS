@@ -1671,6 +1671,22 @@ pub(crate) unsafe fn apply_relocations_for(
     Ok(())
 }
 
+/// Phase 93 — install the lazy-PLT trampoline (`GOT[1]` = link-map, `GOT[2]` =
+/// `&_dl_runtime_resolve`) into a `dlopen`'d DSO's GOT, mirroring what the
+/// startup path does for the bring-up DSOs. Without it a `dlopen`'d DSO's first
+/// lazy `JUMP_SLOT` call jumps through an unset `GOT[2]` → a NULL/garbage target
+/// (the exact fault a CPython `lib-dynload` extension hit at `import`). The
+/// link-map must be the stable `DL_STATE.dsos[id]` address.
+///
+/// # Safety
+/// `id` must index a published, relocated DSO in `state`; `DT_PLTGOT` was
+/// bounds-checked at load time.
+pub(crate) unsafe fn install_trampoline_for(id: DsoId, state: &dl::DlState) {
+    let idx = id.0 as usize;
+    let link_map = &state.dsos[idx] as *const LoadedDso;
+    unsafe { plt::install_trampoline(&state.dsos[idx], link_map) };
+}
+
 // ---------------------------------------------------------------------------
 // Main bring-up driver.
 // ---------------------------------------------------------------------------

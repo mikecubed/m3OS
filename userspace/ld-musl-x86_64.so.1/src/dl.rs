@@ -505,6 +505,12 @@ pub unsafe extern "C" fn dlopen(path: *const c_char, flags: c_int) -> *mut c_voi
         return core::ptr::null_mut();
     }
 
+    // Phase 93 — install the lazy-PLT trampoline into the freshly-loaded DSO's
+    // GOT (the startup path does this for the bring-up DSOs; dlopen must too, or
+    // a lazy JUMP_SLOT call jumps through an unset GOT[2] → NULL). Must run AFTER
+    // publication into DL_STATE (the link-map points at DL_STATE.dsos[id]).
+    unsafe { runtime::install_trampoline_for(id, state) };
+
     // Reserve a handle BEFORE running constructors. Two reasons:
     //
     // 1. A handle-table-full failure that happens AFTER constructors
