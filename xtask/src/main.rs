@@ -336,6 +336,15 @@ const SMOKE_EXIT_KSTACK_OVERFLOW_FAILED: i32 = 86;
 /// docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md.
 const SMOKE_EXIT_SMP_SMOKE_FAILED: i32 = 87;
 
+/// Phase 93 E.1 — `cargo xtask dynamic-hello-smoke` exit code. Boots m3OS,
+/// logs in, and runs a genuinely dynamically-linked C binary
+/// (`PT_INTERP=/lib/ld-musl-x86_64.so.1` + `DT_NEEDED libc.so`, calling
+/// `printf`/`malloc`) from `/usr/bin/dynamic-hello`, asserting `DYNAMIC_HELLO:ok`
+/// — the falsifiable end-to-end proof that the musl `libc.so` (Track A), the
+/// loader reloc/TLS/search extensions (Track B), and the kernel `mremap` +
+/// startup-syscall set (Track C) compose.
+const SMOKE_EXIT_DYNAMIC_HELLO_FAILED: i32 = 88;
+
 /// Phase 91 — `cargo xtask ipv6-smoke` exit code. Boots m3OS with QEMU SLIRP
 /// `ipv6=on` and runs the `ipv6-smoke` ramdisk binary, which exercises the
 /// always-on, CI-deterministic dual-stack substrate from ring 3 (AF_INET6 socket
@@ -1045,6 +1054,17 @@ fn main() {
                 });
             cmd_python_smoke(&smoke_args);
         }
+        // Phase 93 E.1 — `cargo xtask dynamic-hello-smoke` boots m3OS and runs a
+        // genuinely dynamically-linked C binary (PT_INTERP + DT_NEEDED libc.so).
+        Some("dynamic-hello-smoke") => {
+            let smoke_args = parse_smoke_boot_args("dynamic-hello-smoke", &args[2..])
+                .unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_dynamic_hello_smoke(&smoke_args);
+        }
         // Phase 86d — `cargo xtask go-runtime-smoke` boots m3OS, installs the
         // bundled static-Go `.m3pkg` (`pkg install go`), and runs the runtime
         // probe over serial: GO_HELLO_OK (runtime up), GO_GOROUTINE_OK (a
@@ -1419,7 +1439,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -7735,7 +7755,7 @@ fn run_smoke_script(
                         let _ = child.wait();
                         dump_serial(&serial_history);
                         let msg = format!(
-                            "audio-demo failed at stage: {captured}\n\
+                            "smoke step failed (fail-prefix matched): {captured}\n\
                              (step {} — {label})",
                             step_num
                         );
@@ -21361,6 +21381,213 @@ fn git_https_smoke_steps(
 /// `/usr/pkg/` repo (exercising the `DEPS=zlib` solver), then drives REPL /
 /// import / script / file-IO assertions over serial — proof the cross-built
 /// interpreter + stdlib actually run inside m3OS.
+/// Phase 93 E.1 — cross-build the dynamic-hello smoke fixture: a genuinely
+/// dynamically-linked C program (PIE → `PT_INTERP=/lib/ld-musl-x86_64.so.1` +
+/// `DT_NEEDED libc.so`) that calls `printf` + `malloc`, staged at
+/// `target/generated-libs/dynamic-hello` (which `populate_ext2_files` writes to
+/// `/usr/bin/dynamic-hello`). `printf`/`malloc` exercise stdio/locale/errno —
+/// all TLS-backed in musl — so a clean `DYNAMIC_HELLO:ok` proves the TCB the
+/// libc set up via `static_init_tls` (over the kernel/loader-supplied auxv) is
+/// live. Returns `Ok(true)` when built, `Ok(false)` when no musl cross-compiler
+/// is present (the gate then SKIPs), `Err` on a build failure.
+fn build_dynamic_hello_fixture() -> Result<bool, String> {
+    let cc = match find_musl_cc() {
+        Some(cc) => cc,
+        None => return Ok(false),
+    };
+    let root = workspace_root();
+    let libs = ensure_generated_libs_dir(&root);
+    let src = libs.join("dynamic-hello.c");
+    let out = libs.join("dynamic-hello");
+    let _ = fs::remove_file(&out);
+    let c_src = r#"#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int main(void) {
+    char *p = malloc(64);
+    if (!p) { printf("DYNAMIC_HELLO:malloc-fail\n"); fflush(stdout); return 1; }
+    strcpy(p, "world");
+    printf("DYNAMIC_HELLO:ok msg=%s len=%zu\n", p, strlen(p));
+    fflush(stdout);
+    free(p);
+    return 0;
+}
+"#;
+    fs::write(&src, c_src).map_err(|e| format!("write dynamic-hello.c: {e}"))?;
+    // -fPIE -pie makes the binary a dynamic ET_DYN with PT_INTERP + DT_NEEDED
+    // libc.so (musl-gcc's default dynamic link). No -static.
+    let status = Command::new(cc)
+        .args(["-O2", "-fPIE", "-pie", "-o"])
+        .arg(&out)
+        .arg(&src)
+        .status()
+        .map_err(|e| format!("invoke musl cc {cc}: {e}"))?;
+    if !status.success() {
+        return Err("dynamic-hello.c failed to compile".to_string());
+    }
+    if !out.exists() {
+        return Err("dynamic-hello binary missing after compile".to_string());
+    }
+    let sz = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+    println!(
+        "dynamic-hello-smoke: built fixture {} ({sz} bytes)",
+        out.display()
+    );
+    Ok(true)
+}
+
+/// Phase 93 E.1 — `dynamic-hello-smoke`. Builds the musl `libc.so` port,
+/// stages it at `/usr/lib/libc.so` (via the generated-libs mechanism),
+/// cross-builds the dynamic-hello fixture, boots m3OS, logs in, runs
+/// `/usr/bin/dynamic-hello`, and asserts `DYNAMIC_HELLO:ok` — the falsifiable
+/// end-to-end proof that Track A (libc.so) + Track B (loader) + Track C
+/// (kernel) compose to run a genuinely dynamically-linked C program.
+fn cmd_dynamic_hello_smoke(args: &SmokeBootArgs) {
+    // 1. Build the musl libc.so port (the artifact the dynamic binary binds
+    //    against). Warm pkgcache makes this a zero-compiler hit.
+    if port_build::cmd_port_build("musl") != 0 {
+        eprintln!("dynamic-hello-smoke: musl port build failed");
+        std::process::exit(SMOKE_EXIT_DYNAMIC_HELLO_FAILED);
+    }
+
+    // 2. Stage libc.so into generated-libs (populate_ext2_files writes every
+    //    generated-libs/*.so to /usr/lib/<name>, so this lands at
+    //    /usr/lib/libc.so) and cross-build the dynamic-hello fixture.
+    let root = workspace_root();
+    let libs = ensure_generated_libs_dir(&root);
+    let libc_src = root.join("target/port-stage/musl/usr/lib/libc.so");
+    if !libc_src.exists() {
+        eprintln!(
+            "dynamic-hello-smoke: built libc.so not found at {}",
+            libc_src.display()
+        );
+        std::process::exit(SMOKE_EXIT_DYNAMIC_HELLO_FAILED);
+    }
+    if let Err(e) = fs::copy(&libc_src, libs.join("libc.so")) {
+        eprintln!("dynamic-hello-smoke: failed to stage libc.so: {e}");
+        std::process::exit(SMOKE_EXIT_DYNAMIC_HELLO_FAILED);
+    }
+    match build_dynamic_hello_fixture() {
+        Ok(true) => {}
+        Ok(false) => {
+            println!(
+                "dynamic-hello-smoke: SKIP (reason: no musl cross-compiler on PATH — \
+                 install musl-tools / a musl-cross toolchain)"
+            );
+            return;
+        }
+        Err(e) => {
+            eprintln!("dynamic-hello-smoke: fixture build failed: {e}");
+            std::process::exit(SMOKE_EXIT_DYNAMIC_HELLO_FAILED);
+        }
+    }
+
+    // 3. Build the kernel (also builds the ld.so into generated-libs), image,
+    //    and a fresh data disk (which stages libc.so + ld.so + dynamic-hello).
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, display_mode, DeviceSet::default());
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    let steps = dynamic_hello_smoke_steps();
+    println!(
+        "dynamic-hello-smoke: launching QEMU (timeout {}s, {} steps)",
+        args.timeout_secs,
+        steps.len()
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            println!(
+                "dynamic-hello-smoke: PASSED ({} steps in {}s)",
+                steps.len(),
+                start.elapsed().as_secs()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("dynamic-hello-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_DYNAMIC_HELLO_FAILED);
+        }
+    }
+}
+
+/// Serial script for `dynamic-hello-smoke`: boot, log in, run the dynamic
+/// binary, assert the sentinel. Fails fast on the loader/runtime failure
+/// signatures (`ldso:` errors, undefined-symbol/DT_NEEDED aborts, a fault).
+fn dynamic_hello_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/dynamic-hello-smoke: kernel first message",
+    }];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    // Run the dynamic binary. printf/malloc touch stdio/locale/errno (all
+    // TLS-backed), so a clean sentinel proves the full A+B+C chain.
+    steps.push(SmokeStep::Send {
+        input: "/usr/bin/dynamic-hello\n",
+        label: "dynamic-hello-smoke: run dynamic binary",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "DYNAMIC_HELLO:ok",
+        // Loader/runtime failures the chain could surface: a missing or
+        // oversized libc.so, an undefined symbol, an unsupported reloc, a TLS
+        // setup failure, or a fault.
+        fail_prefixes: &[
+            "ldso: DT_NEEDED not found",
+            "ldso: undefined symbol",
+            "ldso: unsupported reloc",
+            "ldso: failed to load",
+            "ldso: TLS region mmap failed",
+            "ldso: arch_prctl",
+            "DYNAMIC_HELLO:malloc-fail",
+            "Segmentation fault",
+            "ended by signal SIGSEGV",
+        ],
+        timeout_secs: 45,
+        label: "dynamic-hello-smoke: DYNAMIC_HELLO:ok",
+        exit_code_on_fail: SMOKE_EXIT_DYNAMIC_HELLO_FAILED,
+    });
+    steps
+}
+
 fn cmd_python_smoke(args: &SmokeBootArgs) {
     // Build python (+ zlib) so the `.m3pkg` artifacts exist for the data disk to
     // bundle into `/usr/pkg/`. The first build two-stage cross-compiles CPython
@@ -23679,6 +23906,23 @@ fn populate_ext2_files(
         String::new()
     };
 
+    // Phase 93 E.1 — stage the dynamic-hello smoke fixture (a genuinely
+    // dynamically-linked C binary: PT_INTERP=/lib/ld-musl-x86_64.so.1 +
+    // DT_NEEDED libc.so, calling printf/malloc) at /usr/bin/dynamic-hello when
+    // the `dynamic-hello-smoke` gate cross-built it into generated-libs/.
+    // Present only for that gate; absent (no-op) otherwise. `/usr/bin` is
+    // created idempotently (debugfs mkdir ignores EEXIST).
+    let dynamic_hello_bin = workspace_root().join("target/generated-libs/dynamic-hello");
+    let dynamic_hello_cmds = if dynamic_hello_bin.exists() {
+        format!(
+            "mkdir usr/bin\nsif usr/bin mode 0x41ED\nsif usr/bin uid 0\nsif usr/bin gid 0\n\
+             write \"{src}\" usr/bin/dynamic-hello\nsif usr/bin/dynamic-hello mode 0x81ED\nsif usr/bin/dynamic-hello uid 0\nsif usr/bin/dynamic-hello gid 0\n",
+            src = dynamic_hello_bin.display(),
+        )
+    } else {
+        String::new()
+    };
+
     // Phase 69 Track A — compile the `m3os-term` terminfo entry so a binary
     // copy can be staged at `/usr/share/terminfo/m/m3os-term` inside the
     // data disk. Returns the path to the compiled `m3os-term` file. Treats
@@ -24559,6 +24803,7 @@ fn populate_ext2_files(
          sif usr gid 0\n\
          {shared_libs_cmds}\
          {env_bin_cmds}\
+         {dynamic_hello_cmds}\
          mkdir usr/share\n\
          sif usr/share mode 0x41ED\n\
          sif usr/share uid 0\n\
@@ -29045,7 +29290,7 @@ fn run_smoke_steps_with_capture(
                         let _ = child.kill();
                         let _ = child.wait();
                         let msg = format!(
-                            "audio-demo failed at stage: {captured}\n\
+                            "smoke step failed (fail-prefix matched): {captured}\n\
                              (step {} — {label})",
                             step_num
                         );

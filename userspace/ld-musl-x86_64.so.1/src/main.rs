@@ -64,9 +64,10 @@ use ldso_core::dynlink::{
     DsoId, DynamicSection, LoadedDso, MAX_DSOS, MAX_NEEDED, TopoError, topo_sort,
 };
 use ldso_core::elf64::{
-    DT_NULL, Dyn, PT_DYNAMIC, PT_LOAD, Phdr, R_X86_64_64, R_X86_64_COPY, R_X86_64_DTPMOD64,
-    R_X86_64_DTPOFF64, R_X86_64_GLOB_DAT, R_X86_64_IRELATIVE, R_X86_64_JUMP_SLOT,
-    R_X86_64_RELATIVE, R_X86_64_TPOFF64, Rela, STT_GNU_IFUNC, Sym, r_sym, r_type, st_type,
+    DT_NULL, Dyn, PT_DYNAMIC, PT_LOAD, PT_PHDR, PT_TLS, Phdr, R_X86_64_64, R_X86_64_COPY,
+    R_X86_64_DTPMOD64, R_X86_64_DTPOFF64, R_X86_64_GLOB_DAT, R_X86_64_IRELATIVE,
+    R_X86_64_JUMP_SLOT, R_X86_64_RELATIVE, R_X86_64_TPOFF64, Rela, STB_WEAK, STT_GNU_IFUNC, Sym,
+    r_sym, r_type, st_bind, st_type,
 };
 use ldso_core::reloc::{
     apply_abs64, apply_copy, apply_glob_dat, apply_irelative, apply_relative, apply_tls_word,
@@ -94,10 +95,15 @@ const SYS_READ: u64 = 0;
 const SYS_WRITE: u64 = 1;
 const SYS_OPEN: u64 = 2;
 const SYS_CLOSE: u64 = 3;
+const SYS_LSEEK: u64 = 8;
 const SYS_MMAP: u64 = 9;
 const SYS_MPROTECT: u64 = 10;
 const SYS_MUNMAP: u64 = 11;
+const SYS_ARCH_PRCTL: u64 = 158;
 const SYS_EXIT: u64 = 60;
+
+/// `arch_prctl(ARCH_SET_FS = 0x1002)` — set the thread pointer (FS base).
+const ARCH_SET_FS: u64 = 0x1002;
 
 /// `errno` codes the bring-up linker uses as `exit(2)` codes when a
 /// DT_NEEDED dependency fails to load. The negative gates (Track
@@ -199,6 +205,20 @@ fn sys_read(fd: i64, buf: &mut [u8]) -> i64 {
             buf.len() as u64,
         )
     }
+}
+
+/// `lseek(fd, offset, whence)`. Phase 93 — used by `load_dso` to size the
+/// scratch buffer to the DSO file (a real `libc.so` is ~700 KiB, far past the
+/// old fixed 64 KiB scratch). `whence`: 0=SET, 1=CUR, 2=END.
+fn sys_lseek(fd: i64, offset: i64, whence: u64) -> i64 {
+    unsafe { syscall3(SYS_LSEEK, fd as u64, offset as u64, whence) }
+}
+
+/// `arch_prctl(code, addr)`. Phase 93 B.3 — sets the thread pointer
+/// (`ARCH_SET_FS`) so libc's `%fs:0` self / `%fs:0x28` stack-canary / errno
+/// accesses resolve. The unused 3rd syscall register is ignored by the kernel.
+fn sys_arch_prctl(code: u64, addr: u64) -> i64 {
+    unsafe { syscall3(SYS_ARCH_PRCTL, code, addr, 0) }
 }
 
 fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: i64, offset: u64) -> i64 {
@@ -746,6 +766,10 @@ enum LoadError {
 /// predictably. Returns the first successful load; if every directory
 /// reports `NotFound`, returns `NotFound`; a non-NotFound error from any
 /// attempt (malformed image) is returned immediately.
+///
+/// # Safety
+/// Same contract as [`load_dso`]: `name` is a soname (no NUL needed; this
+/// builds the NUL-terminated path) and the call maps + parses an on-disk DSO.
 unsafe fn load_dso_search(name: &[u8]) -> Result<LoadedDso, LoadError> {
     const PREFIXES: [&[u8]; 2] = [b"/usr/lib/", b"/lib/"];
     for prefix in PREFIXES {
@@ -779,7 +803,39 @@ unsafe fn load_dso(path_bytes: &[u8]) -> Result<LoadedDso, LoadError> {
         }
         return Err(LoadError::Other("open failed"));
     }
-    let scratch_len: u64 = 64 * 1024;
+    // Phase 93 — size the scratch buffer to the DSO file. A real `libc.so` is
+    // ~700 KiB and a dynamic interpreter is several MiB, far past the old fixed
+    // 64 KiB scratch (which errored "DSO larger than 64 KiB scratch" on any
+    // real libc). `lseek` to END gives the size; we mmap a page-rounded scratch
+    // with one page of headroom (so the read loop hits EOF cleanly) and rewind.
+    const SCRATCH_FLOOR: u64 = 64 * 1024;
+    // Guard a corrupt/hostile size from driving an enormous mmap. Generous
+    // enough for any real interpreter (a dynamic CPython is tens of MiB).
+    const SCRATCH_CAP: u64 = 256 * 1024 * 1024;
+    let file_size = sys_lseek(fd, 0, 2 /* SEEK_END */);
+    let scratch_len = if file_size <= 0 {
+        // lseek unsupported on this fd or empty/odd size — fall back to the
+        // legacy fixed scratch (small self-contained test libs still load).
+        SCRATCH_FLOOR
+    } else {
+        let sz = file_size as u64;
+        if sz > SCRATCH_CAP {
+            sys_close(fd);
+            return Err(LoadError::Other("DSO exceeds loader scratch cap"));
+        }
+        let rounded = (sz + 4095) & !4095u64;
+        let with_headroom = rounded.saturating_add(4096);
+        if with_headroom > SCRATCH_FLOOR {
+            with_headroom
+        } else {
+            SCRATCH_FLOOR
+        }
+    };
+    // Rewind to offset 0 so `load_dso_impl`'s sequential read starts at the
+    // ELF header.
+    if file_size > 0 {
+        let _ = sys_lseek(fd, 0, 0 /* SEEK_SET */);
+    }
     let scratch = sys_mmap(
         0,
         scratch_len,
@@ -832,7 +888,10 @@ unsafe fn load_dso_impl(fd: i64, scratch: u64, scratch_len: u64) -> Result<Loade
     }
     sys_close(fd);
     if truncated {
-        return Err(LoadError::Other("DSO larger than 64 KiB scratch"));
+        // The scratch buffer is sized to the file (lseek SEEK_END) plus a page
+        // of headroom, so this only fires if the file grew between the size
+        // probe and the read (a race) — refuse to parse a truncated image.
+        return Err(LoadError::Other("DSO grew during load (read truncated)"));
     }
     if total < core::mem::size_of::<Ehdr>() {
         return Err(LoadError::Other("file too small"));
@@ -1095,6 +1154,11 @@ fn warn_tls_reloc_once() {
 /// in-DSO IFUNC reference reached via `GLOB_DAT`/`JUMP_SLOT`; cross-DSO
 /// `STT_GNU_IFUNC` (where the consumer's symbol is `UND`) is the rare
 /// case the `R_X86_64_IRELATIVE` path covers directly.
+///
+/// # Safety
+/// When `sym` is a resolved in-scope `STT_GNU_IFUNC` definition, `value` must
+/// be the address of its zero-argument resolver (`extern "C" fn() -> u64`),
+/// which is then called.
 unsafe fn maybe_ifunc_resolve(sym: &Sym, value: u64) -> u64 {
     if st_type(sym.st_info) == STT_GNU_IFUNC && sym.st_shndx != 0 && value != 0 {
         // SAFETY: an STT_GNU_IFUNC definition's address is an
@@ -1211,12 +1275,16 @@ unsafe fn apply_rela(
                     &ver_table,
                 );
                 let value = unsafe { sym::lookup(dsos, name, version).unwrap_or(0) };
-                if value == 0 {
+                if value == 0 && st_bind(sym.st_info) != STB_WEAK {
                     serial(b"ldso: undefined symbol ");
                     serial(name);
                     serial(b"\n");
                     return Err("undefined symbol");
                 }
+                // Phase 93 — a WEAK undefined reference (crt's
+                // `_ITM_registerTMCloneTable`/`__gmon_start__`, etc.) that
+                // resolves nowhere is legitimately 0; the consumer guards
+                // `if (sym) sym();`. Fall through and store 0.
                 // Phase 93 B.2 — route an in-DSO STT_GNU_IFUNC reference
                 // through its resolver before storing.
                 let value = unsafe { maybe_ifunc_resolve(&sym, value) };
@@ -1271,12 +1339,13 @@ unsafe fn apply_rela(
                         &ver_table,
                     );
                     let value = unsafe { sym::lookup(dsos, name, version).unwrap_or(0) };
-                    if value == 0 {
+                    if value == 0 && st_bind(sym.st_info) != STB_WEAK {
                         serial(b"ldso: undefined symbol ");
                         serial(name);
                         serial(b"\n");
                         return Err("undefined symbol");
                     }
+                    // Phase 93 — WEAK undefined → store 0 (see GLOB_DAT).
                     // Phase 93 B.2 — resolve an in-DSO STT_GNU_IFUNC.
                     let value = unsafe { maybe_ifunc_resolve(&sym, value) };
                     let image: &mut [u8] = unsafe {
@@ -1313,9 +1382,11 @@ unsafe fn apply_rela(
                     &ver_table,
                 );
                 let value = unsafe { sym::lookup(dsos, name, version).unwrap_or(0) };
-                if value == 0 {
+                if value == 0 && st_bind(sym.st_info) != STB_WEAK {
                     return Err("undefined symbol (R_X86_64_64)");
                 }
+                // Phase 93 — WEAK undefined → value 0, so apply_abs64 writes
+                // `0 + addend` (the correct weak-absolute result).
                 // Route through `apply_abs64` against the FULL image
                 // slice (matching the RELATIVE / GLOB_DAT arms) so the
                 // helper bounds-checks `r.r_offset` against the image
@@ -1699,6 +1770,147 @@ unsafe fn read_ld_bind_now(stack: *const u64) -> bool {
 /// for the asm caller to `jmp` to. Returns 0 on any unrecoverable
 /// error (the asm caller will then `jmp 0` and the kernel reports a
 /// page-fault on user code — visible failure mode).
+/// Phase 93 B.3 — establish the thread-control block + thread pointer the way
+/// musl's own dynamic linker (`__dls3`) does. In the SHARED `libc.so` the weak
+/// `static_init_tls` is overridden by a **no-op** `__init_tls` stub (musl
+/// assumes its own `ld.so` already set TLS up). m3OS's foreign Rust loader
+/// replaces `__dls3`, so it must build the TCB itself — otherwise libc's first
+/// `%fs:` access (errno, the `%fs:0x28` stack canary, locale) faults.
+///
+/// x86_64 is TLS variant II: static TLS blocks sit BELOW the thread pointer;
+/// the musl `struct pthread` TCB sits AT the thread pointer with `self` at
+/// TP+0 and `dtv` at TP+8. The main executable's `PT_TLS` (local-exec — the
+/// only TLS module this loader sets up; `DT_NEEDED` `.so` TLS is deferred) is
+/// copied into the block at `TP - tls_offset`, matching the `%fs:-N` offsets
+/// the static linker baked in. A program with no `PT_TLS` gets a bare TCB.
+///
+/// # Safety
+/// `at_phdr` must point to the main executable's program-header table (the
+/// `AT_PHDR` auxv value) with `at_phnum` valid entries. For a `PT_TLS` segment
+/// the `p_filesz` bytes of the template at the computed runtime address are
+/// read; both must reference the mapped main-executable image.
+unsafe fn setup_static_tls(at_phdr: *const Phdr, at_phnum: usize) {
+    // sizeof(struct pthread) on x86_64 musl 1.2.5 is ~0xc0; reserve generously
+    // so every field musl reads (self@0, dtv@8, canary@0x28, errno, locale)
+    // lands in the zeroed TCB region.
+    const TCB_RESERVE: u64 = 0x400;
+    const MIN_TLS_ALIGN: u64 = 16;
+
+    // Find the main exe's PT_TLS (template) + PT_PHDR (to recover a PIE base).
+    let mut tls: Option<Phdr> = None;
+    let mut phdr_vaddr: u64 = 0;
+    let mut have_phdr_vaddr = false;
+    for i in 0..at_phnum {
+        let ph = unsafe { *at_phdr.add(i) };
+        if ph.p_type == PT_TLS {
+            tls = Some(ph);
+        } else if ph.p_type == PT_PHDR {
+            phdr_vaddr = ph.p_vaddr;
+            have_phdr_vaddr = true;
+        }
+    }
+    // base = runtime AT_PHDR address - link-time PT_PHDR vaddr.
+    let exe_base = if have_phdr_vaddr {
+        (at_phdr as u64).wrapping_sub(phdr_vaddr)
+    } else {
+        0
+    };
+
+    let (tls_memsz, tls_filesz, tls_align, tls_image) = match tls {
+        Some(t) => {
+            let align = if t.p_align < MIN_TLS_ALIGN {
+                MIN_TLS_ALIGN
+            } else {
+                t.p_align
+            };
+            (
+                t.p_memsz,
+                t.p_filesz,
+                align,
+                exe_base.wrapping_add(t.p_vaddr),
+            )
+        }
+        None => (0, 0, MIN_TLS_ALIGN, 0),
+    };
+    // Variant II: the module's TP-relative offset is round_up(memsz, align).
+    let tls_offset = (tls_memsz + tls_align - 1) & !(tls_align - 1);
+
+    // Reserve [tls block (tls_offset)][TCB (TCB_RESERVE)] + alignment slack.
+    let region_len = (tls_offset + TCB_RESERVE + tls_align + 4095) & !4095u64;
+    let region = sys_mmap(
+        0,
+        region_len,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+    if region < 0 {
+        serial(b"ldso: TLS region mmap failed\n");
+        return;
+    }
+    let region = region as u64;
+    // TP sits above the TLS block; align it so (TP - tls_offset) honors
+    // tls_align (the exe's local-exec %fs:-N offsets assume that).
+    let tp = {
+        let raw = region + tls_offset;
+        (raw + tls_align - 1) & !(tls_align - 1)
+    };
+
+    // Copy the main exe's .tdata into the block at TP - tls_offset; .tbss is
+    // already zero (anonymous mmap).
+    if tls_memsz > 0 {
+        let block = tp - tls_offset;
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                tls_image as *const u8,
+                block as *mut u8,
+                tls_filesz as usize,
+            );
+        }
+    }
+
+    // Build a minimal DTV (separate page): dtv[0]=module count, dtv[1]=block
+    // address (DTP_OFFSET is 0 on x86_64). `__tls_get_addr` is not exercised by
+    // a main-exe-only local-exec program but a valid DTV keeps the TCB sane.
+    let dtv = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+    if dtv < 0 {
+        serial(b"ldso: TLS dtv mmap failed\n");
+        return;
+    }
+    let dtv = dtv as u64;
+    let dtv_arr = dtv as *mut u64;
+    if tls_memsz > 0 {
+        unsafe {
+            *dtv_arr.add(0) = 1;
+            *dtv_arr.add(1) = tp - tls_offset;
+        }
+    } else {
+        unsafe {
+            *dtv_arr.add(0) = 0;
+        }
+    }
+
+    // Initialize the musl `struct pthread` TCB: self at TP+0, dtv at TP+8.
+    let tcb = tp as *mut u64;
+    unsafe {
+        *tcb.add(0) = tp; // self
+        *tcb.add(1) = dtv; // dtv
+    }
+
+    // Install the thread pointer.
+    if sys_arch_prctl(ARCH_SET_FS, tp) < 0 {
+        serial(b"ldso: arch_prctl(ARCH_SET_FS) failed\n");
+    }
+}
+
 /// Bring-up driver invoked from the naked-asm `_start`.
 ///
 /// # Safety
@@ -2155,6 +2367,12 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
             unsafe { plt::install_trampoline(&state.dsos[i], link_map) };
         }
     }
+
+    // -- Phase 93 B.3 — establish the TCB + thread pointer BEFORE constructors
+    // (which may touch errno / the stack canary). In the shared libc.so the
+    // weak `static_init_tls` is a no-op stub, so this foreign loader must do
+    // the `__dls3` TLS work itself.
+    unsafe { setup_static_tls(at_phdr, at_phnum) };
 
     // -- Run constructors deepest-first -------------------------------------
     unsafe { run_constructors(&dsos) };

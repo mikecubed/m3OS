@@ -105,6 +105,10 @@ pub const PT_LOAD: u32 = 1;
 pub const PT_DYNAMIC: u32 = 2;
 pub const PT_INTERP: u32 = 3;
 pub const PT_PHDR: u32 = 6;
+/// `PT_TLS` — the thread-local-storage template segment. Phase 93 B.3 reads
+/// the main executable's `PT_TLS` to lay out the static TLS block beneath the
+/// thread pointer (x86_64 variant II).
+pub const PT_TLS: u32 = 7;
 
 // ---------------------------------------------------------------------------
 // x86_64 relocation types (subset Phase 76b applies).
@@ -139,10 +143,24 @@ pub const R_X86_64_IRELATIVE: u32 = 37;
 /// real implementation address) rather than using its `st_value`.
 pub const STT_GNU_IFUNC: u8 = 10;
 
+/// Symbol binding `STB_WEAK` — stored in the high nibble of `st_info`.
+/// A relocation against a **weak** undefined symbol that resolves nowhere
+/// is satisfied by writing 0 (the consumer guards `if (sym) sym();`), not
+/// a hard undefined-symbol error. GCC's crt objects emit weak refs like
+/// `_ITM_registerTMCloneTable` / `__gmon_start__` that real libc never
+/// provides.
+pub const STB_WEAK: u8 = 2;
+
 /// Extract the symbol *type* (low nibble) from an `Elf64_Sym::st_info`.
 #[inline]
 pub const fn st_type(st_info: u8) -> u8 {
     st_info & 0x0F
+}
+
+/// Extract the symbol *binding* (high nibble) from an `Elf64_Sym::st_info`.
+#[inline]
+pub const fn st_bind(st_info: u8) -> u8 {
+    st_info >> 4
 }
 
 /// Extract the relocation type from `r_info`. The lower 32 bits of
