@@ -11436,10 +11436,15 @@ fn cmd_usb_unmount_smoke(args: &SmokeBootArgs) {
     let qmp_socket = qmp::fresh_socket_path();
     let _ = std::fs::remove_file(&qmp_socket);
 
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
     let mut qemu_args = qemu_args_with_devices(
         &uefi_image,
         &ovmf,
-        QemuDisplayMode::Headless,
+        display_mode,
         DeviceSet {
             xhci: true,
             ..DeviceSet::default()
@@ -11647,10 +11652,15 @@ fn cmd_usb_storage_dual_smoke(args: &SmokeBootArgs) {
     create_usb_mount_ext2_image_seeded(&usb_img0, b"m3os-usb0-stick\n");
     create_usb_mount_ext2_image_seeded(&usb_img1, b"m3os-usb1-stick\n");
 
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
     let mut qemu_args = qemu_args_with_devices(
         &uefi_image,
         &ovmf,
-        QemuDisplayMode::Headless,
+        display_mode,
         DeviceSet {
             xhci: true,
             ..DeviceSet::default()
