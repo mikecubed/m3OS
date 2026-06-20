@@ -1,6 +1,6 @@
 # Phase 93 — Dynamic C Runtime (`libc.so` + shared objects): Task List
 
-**Status:** Planned — authored ahead of implementation
+**Status:** In Progress — implementation underway (feat/phase-93-dynamic-c-runtime)
 **Source Ref:** phase-93
 **Depends on:** Phase 76 (Dynamic Linker) ✅, Phase 36 (Expanded Memory) ✅, Phase 85c (Python — surfaced the gap) ✅, Phase 90a (PKU / W^X v2 — the lazy-PLT W+X path) ✅
 **Goal:** Ship m3OS's first real dynamic C library — a musl `libc.so` the Phase 76 loader can map and bind a genuinely dynamically-linked program against — and close the loader/kernel gaps a real libc exercises, so a dynamic `python3` (`PT_INTERP=/lib/ld-musl-x86_64.so.1`, `DT_NEEDED libc.so`) boots, imports `lib-dynload/*.so` extensions via `dlopen`, and `ctypes.CDLL(...)` opens a shared object — while the static `git` and static `python3` paths stay the conservative green fallback. Closes with the kernel version bump (`0.92.5` → `0.93.0`) and the Phase 93 learning doc (`docs/93-dynamic-c-runtime.md`). The tracks map onto the design doc's Areas: Track A = Area A (ship `libc.so`), Tracks B+C = Area B (loader + kernel syscall gaps), Track D = Area C (dynamic CPython + `ctypes`), Track E = the Evaluation Gate, Track F = closeout.
