@@ -1,13 +1,16 @@
 NAME=libffi
 VERSION=3.4.6
-DESCRIPTION="Foreign Function Interface library — CPython _ctypes backend (shared object)"
+DESCRIPTION="Foreign Function Interface library — CPython _ctypes backend (static -fPIC archive)"
 CATEGORY=lib
 DEPS=
 URL=https://github.com/libffi/libffi/releases/download/v3.4.6/libffi-3.4.6.tar.gz
 SHA256=b0dea9df23c863a7a50e825440f3ebffabd65df1497108e5d437747843895a4e
 MAINTAINER=m3os
 # Phase 93 (Dynamic C Runtime), Track D.1. libffi is the one missing port
-# CPython's `_ctypes` links against. Built `--disable-static --enable-shared`
-# (DT_SONAME=libffi.so, DT_NEEDED libc.so) so the dynamic `python3` loads it via
-# the m3OS loader's dlopen. `ffitarget.h` is generated per-target, so the recipe
-# cross-configures `--host=x86_64-linux-musl` (it must NOT reuse the host header).
+# CPython's `_ctypes` links against. Built `--enable-static --disable-shared`
+# as a `-fPIC` `libffi.a` that `_ctypes` links STATICALLY (so the extension's
+# only `DT_NEEDED` is `libc.so`), sidestepping the versioned-soname (`libffi.so.8`)
+# shared-object staging the generated-libs `.so` path would mishandle — it
+# delivers the identical `ctypes` capability. `ffitarget.h` is generated
+# per-target, so the recipe cross-configures `--host=x86_64-linux-musl` (it must
+# NOT reuse the host header).

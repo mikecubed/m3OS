@@ -25,4 +25,5 @@ pub mod elf64;
 pub mod gnu_hash;
 pub mod handle;
 pub mod reloc;
+pub mod tls;
 pub mod ver;

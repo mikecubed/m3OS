@@ -12174,9 +12174,19 @@ pub(super) fn sys_mremap(old_addr: u64, old_size: u64, new_size: u64, flags: u64
         return NEG_EINVAL;
     }
 
-    // Page-align new_size upward (mirrors Linux behaviour and sys_linux_mmap).
-    let new_size = new_size.div_ceil(4096) * 4096;
-    let old_size_aligned = old_size.div_ceil(4096) * 4096;
+    // Page-align both sizes upward (mirrors Linux behaviour and sys_linux_mmap).
+    // Use checked arithmetic — matching sys_linux_mmap/sys_linux_munmap — so a
+    // pathological near-`u64::MAX` size returns a clean EINVAL instead of
+    // wrapping the rounded product to 0 (which would otherwise survive the
+    // `new_size == 0` reject above and silently full-unmap the mapping).
+    let new_size = match new_size.div_ceil(4096).checked_mul(4096) {
+        Some(s) => s,
+        None => return NEG_EINVAL,
+    };
+    let old_size_aligned = match old_size.div_ceil(4096).checked_mul(4096) {
+        Some(s) => s,
+        None => return NEG_EINVAL,
+    };
 
     const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
     const MMAP_MIN_ADDR: u64 = 0x1_0000;
@@ -12303,7 +12313,7 @@ pub(super) fn sys_mremap(old_addr: u64, old_size: u64, new_size: u64, flags: u64
         // full new_size.  Anonymous pages are demand-faulted, so no frames need
         // to be allocated for the extension — the page fault handler will do it
         // on first access, just as for a fresh mmap.
-        let _ = crate::process::with_shared_mm_mut(pid, |_b, _m, vma_tree| {
+        let _ = crate::process::with_shared_mm_mut(pid, |_b, mmap_next, vma_tree| {
             // Remove the old entry (keyed by old_addr) and insert the grown one.
             vma_tree.remove(old_addr);
             vma_tree.insert(crate::process::MemoryMapping {
@@ -12314,6 +12324,18 @@ pub(super) fn sys_mremap(old_addr: u64, old_size: u64, new_size: u64, flags: u64
                 file_backing: None,
                 pkey: vma_pkey,
             });
+            // Advance the bump pointer past the grown top. The non-fixed mmap
+            // allocator is a pure bump over `mmap_next` and never consults the
+            // VMA tree for conflicts; if we grew the topmost region (the only
+            // case where [old_end, new_end) is actually free) without bumping,
+            // `mmap_next` would still point inside the now-larger VMA and the
+            // next mmap would be handed an overlapping address. Keep this
+            // symmetric with the MAYMOVE path and sys_linux_mmap. `new_size`
+            // already fits in user space (checked above), so no overflow.
+            let grown_end = old_addr + new_size;
+            if *mmap_next < grown_end {
+                *mmap_next = grown_end;
+            }
         });
         // Bump the address-space generation (new VMA range).
         let table = crate::process::PROCESS_TABLE.lock();
@@ -12547,7 +12569,38 @@ pub(super) fn sys_mremap(old_addr: u64, old_size: u64, new_size: u64, flags: u64
             failed
         };
         if map_result {
-            // Mapping failed — free copied frames, roll back reservation.
+            // Mapping failed partway. Before freeing the copied frames, unmap
+            // any leaf PTEs we already installed in the new range — otherwise we
+            // would leave dangling *present* PTEs pointing at frames returned to
+            // the allocator (a use-after-free within the process's own address
+            // space, reachable via a stale TLB entry since no VMA is recorded to
+            // demand-fault them). Empty intermediate page-table levels are left
+            // unreclaimed, matching sys_linux_munmap's convention (OOM-only path).
+            {
+                let _page_table_guard = addr_space
+                    .as_ref()
+                    .map(|addr_space| addr_space.lock_page_tables());
+                let mut mapper = unsafe { crate::mm::mapper_for_frame(cr3_frame) };
+                use x86_64::structures::paging::Mapper as _;
+                for (i, _) in &copied_frames {
+                    let vaddr = new_base + (*i as u64 * 4096);
+                    if let Ok(page) =
+                        x86_64::structures::paging::Page::<Size4KiB>::from_start_address(
+                            x86_64::VirtAddr::new(vaddr),
+                        )
+                        && let Ok((_f, flush)) = mapper.unmap(page)
+                    {
+                        // Local invlpg is batched into the shootdown below.
+                        flush.ignore();
+                    }
+                }
+            }
+            // Shoot down the new range on all cores (outside the page-table lock
+            // to avoid the IF-masking deadlock the fork CoW path documents) so no
+            // stale TLB entry can alias a frame we are about to free.
+            if let Some(ref a) = addr_space {
+                crate::smp::tlb::tlb_shootdown_range(a, new_base, new_base + new_size);
+            }
             for (_, f) in &copied_frames {
                 crate::mm::frame_allocator::free_frame(f.start_address().as_u64());
             }

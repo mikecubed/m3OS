@@ -27,8 +27,9 @@ normally does.
   m3OS to split them (a Rust loader with no libc counterpart).
 - The libc-provider decision (Option A1: ship upstream musl as a companion
   `libc.so`, keep the Rust loader as the interp).
-- The **six bring-up surprises** booting a real dynamic binary surfaced — each
-  a piece of the startup glue the foreign loader must supply.
+- The **eight bring-up surprises** booting real dynamic binaries surfaced (six
+  from the dynamic-hello C program, two more from a real interpreter/extension) —
+  each a piece of the startup glue the foreign loader must supply.
 - How `dlopen` routes to the loader (not libc), enabling `lib-dynload`/`ctypes`.
 
 ## Core Implementation
@@ -62,12 +63,14 @@ surface than reusing upstream musl, sacrificing the loader's bounds-checked,
 W^X, GNU-hash assets. Non-goals: no glibc; musl's own `ld.so` is *not*
 installed.
 
-### The six bring-up surprises (the startup glue)
+### The eight bring-up surprises (the startup glue)
 
-Booting a real dynamic binary surfaced six issues — exactly the "loader
+Booting real dynamic binaries surfaced eight issues — exactly the "loader
 provides the TLS/startup musl's own ld normally does" work the design doc
-predicted for A1. The first is a plain capacity bug; the rest are the
-loader-vs-libc split made concrete:
+predicted for A1. Surprises 1–6 surfaced running the trivial dynamic-hello C
+program; 7–8 surfaced loading a *real* interpreter (CPython) and a *real*
+extension. The first is a plain capacity bug; the rest are the loader-vs-libc
+split made concrete:
 
 1. **64 KiB scratch.** `load_dso` read the whole DSO into a fixed 64 KiB buffer;
    `libc.so` is 711 KiB. Now `lseek(SEEK_END)`-sizes the scratch to the file.
@@ -95,6 +98,21 @@ loader-vs-libc split made concrete:
    standard "copy relocations apply last" rule.
 6. (harness) The shared `WaitPassOrFail` failure message was hardcoded
    "audio-demo failed at stage" for *every* gate — made generic.
+7. **The minimal TCB was too minimal for a real interpreter.** A printf/malloc
+   hello ran with a TCB carrying just `self`+`dtv`, but CPython's locale-aware
+   startup dereferences `self->locale` (NULL) and faults. Fix: after building the
+   TLS block the loader resolves + calls libc's **`__init_tp(tp)`** — un-hidden
+   by `ports/lib/musl/patches/0002-export-init-tp.patch` — which sets every
+   musl-internal `struct pthread` field (`locale` = `&libc.global_locale`, `tid`,
+   `robust_list.head`, `detach_state`, `sysinfo`, `next`/`prev`) using musl's own
+   code, with a minimal-TCB fallback if `__init_tp` is absent.
+8. **`dlopen` of a *new* `.so` never installed the lazy-PLT trampoline.** The
+   dynamic-hello `DLOPEN:ok` proof dedup'd the already-loaded `libc.so` (no fresh
+   load), so it missed that the loader's `dlopen` applied relocations + ran
+   constructors but never installed `GOT[1]`/`GOT[2]` (only the *startup* path
+   did). A freshly `dlopen`'d extension's first lazy `JUMP_SLOT` then jumped
+   through an unset `GOT[2]` → NULL (`rip=0x0`). Fix: call
+   `runtime::install_trampoline_for` in `dlopen` after the DSO is published.
 
 ### `dlopen` routes to the loader, not libc
 
@@ -119,7 +137,8 @@ recipe is untouched, so its green fallback never regresses.
 
 | File | Purpose |
 |---|---|
-| `ports/lib/musl/Portfile` + `patches/0001-…` | musl 1.2.5 pin + the foreign-loader NULL-ctor-queue patch |
+| `ports/lib/musl/Portfile` + `patches/0001-…`/`0002-…` | musl 1.2.5 pin + the foreign-loader NULL-ctor-queue patch (`0001`) + the `__init_tp` un-hide patch (`0002`) |
+| `userspace/ld-musl-x86_64.so.1/src/{dl,plt}.rs` | `dlopen` lazy-PLT trampoline install for freshly-loaded DSOs |
 | `xtask/src/port_build.rs` (`build_musl`/`build_libffi`/`build_python_dynamic`) | the shared `libc.so`, static `libffi.a`, and dynamic CPython recipes |
 | `userspace/ld-musl-x86_64.so.1/src/main.rs` (`setup_static_tls`, COPY-order, weak-symbol, scratch sizing) | the loader startup glue + the relocation-order fix |
 | `userspace/ld-musl-x86_64.so.1/src/{elf64,reloc}.rs` | COPY/IFUNC/TLS reloc types + `STB_WEAK`/`st_bind` |

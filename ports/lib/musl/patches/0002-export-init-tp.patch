@@ -21,7 +21,7 @@ every libc-internal pthread field is populated by musl's own code.
 
 --- a/src/internal/pthread_impl.h
 +++ b/src/internal/pthread_impl.h
-@@ -140,7 +140,7 @@
+@@ -141,4 +141,4 @@
  void *__tls_get_addr(tls_mod_off_t *);
 -hidden int __init_tp(void *);
 +int __init_tp(void *);

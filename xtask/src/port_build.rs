@@ -1201,6 +1201,15 @@ pub const BUILDABLE_PORTS: &[&str] = &[
     "git",
     "node",
     "claude-code",
+    // Phase 93 (Dynamic C Runtime). `musl` (the dynamic `libc.so`) and `libffi`
+    // have host build recipes, so `port list` must report RECIPE=yes and
+    // `port build all` must build them (in DEPS order). `python-dynamic` is
+    // deliberately NOT listed: it is a heavy (~30-min) opt-in variant gated by
+    // `M3OS_WITH_DYNAMIC_PYTHON`, built on demand by `dynamic-python-smoke` (via
+    // `port_build` directly), mirroring how no acceptance item runs it under
+    // `build all`.
+    "musl",
+    "libffi",
 ];
 
 /// A port's declared `DEPS=` (whitespace-separated), restricted to `within` —
@@ -2295,9 +2304,12 @@ fn build_musl(
 /// Phase 93 Track A.3/A.4 — assert a staged `libc.so` is a usable dynamic
 /// libc: `ET_DYN`, `DT_SONAME=libc.so`, zero `DT_NEEDED`, and exporting the
 /// `malloc` sentinel in its `.dynsym`. Uses `readelf` (always present where a
-/// cross-toolchain is). This is the falsifiable guard that the build (and
-/// later `strip_stage`/`seal_package`) did not damage the dynamic symbol
-/// table the loader resolves against.
+/// cross-toolchain is). This validates the freshly-built artifact PRE-seal
+/// (it runs inside `build_musl`, before `seal_package`'s `strip_stage`). The
+/// post-seal guarantee is not this function: GNU `strip` cannot remove an
+/// `ET_DYN`'s allocable `.dynsym`/`.dynstr`/`.gnu.hash`/SONAME, and the live
+/// E.1 `dynamic-hello-smoke` gate is the falsifiable post-seal regression guard
+/// (a damaged dynamic symbol table surfaces as an undefined-symbol abort there).
 fn verify_libc_so(path: &Path) -> Result<(), String> {
     let readelf = which_readelf();
     // SONAME + NEEDED via `readelf -dW`.
@@ -3988,7 +4000,11 @@ fn build_python_dynamic(
             ncurses_prefix.join("lib/libncursesw.a").display()
         ));
     }
-    let have_panel = ncurses_prefix.join("lib/libpanelw.a").exists();
+    // NOTE: unlike the static build_python (which asserts `_curses`/`_curses_panel`
+    // are builtin via assert_curses_builtin), the dynamic variant leaves
+    // MODULE_BUILDTYPE unset, so extensions build as soft-failing
+    // `lib-dynload/*.so` modules rather than Modules/config.c entries — there is
+    // no builtin to assert, so no have_panel gate applies here.
     let libffi_prefix = libffi_stage.join("usr/local");
     if !libffi_prefix.join("lib/libffi.a").exists() {
         return Err(format!(
@@ -4140,7 +4156,6 @@ fn build_python_dynamic(
     let mut cross_make = Command::new("make");
     cross_make.current_dir(&build_cross).arg(&jobs);
     run(&mut cross_make, "python-dynamic cross make")?;
-    let _ = have_panel;
 
     println!(
         "python-dynamic: stage 2 — cross install (DESTDIR={})",

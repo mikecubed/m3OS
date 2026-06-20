@@ -90,7 +90,7 @@
 
 **Acceptance:**
 - [x] `cargo xtask port build musl` builds + seals `musl.m3pkg`; a second build is a pure pkgcache hit (zero compiler invocations).
-- [ ] The image places `libc.so` at `/usr/lib/libc.so` (plus any `libc.so.1` SONAME symlink) on the booted ext2 disk, readable `0755`.
+- [x] The image places `libc.so` at `/usr/lib/libc.so` on the booted ext2 disk, readable `0755` (verified: `populate_ext2_files` stages `target/generated-libs/libc.so` at mode `0x81ED` = `0o100755` for `dynamic-hello-smoke`; for the `M3OS_WITH_DYNAMIC_PYTHON` image it arrives via `pkg install python-dynamic` → `DEPS=musl` → `musl.m3pkg`). No `libc.so.1` SONAME symlink is needed — the SONAME is `libc.so` (`-Wl,-soname,libc.so`) and nothing `DT_NEEDED`s `libc.so.1`; the loader resolves the bare soname `libc.so` via `load_dso_search`'s `/usr/lib`→`/lib` search.
 
 ---
 
@@ -317,7 +317,7 @@
 
 **Acceptance:**
 - [x] The Tasks column reads `[Tasks](./tasks/93-dynamic-c-runtime-tasks.md)`.
-- [ ] Status reflects reality (`Planned` → `In Progress` → `Complete`) as the phase advances.
+- [x] Status reflects reality — the roadmap README Phase 93 row (`docs/roadmap/README.md`) Status column reads `Complete`.
 
 ### F.5 — Update the AGENTS.md "Dynamic linking" capability bullet
 

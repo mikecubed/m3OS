@@ -1147,6 +1147,19 @@ fn warn_tls_reloc_once() {
     }
 }
 
+/// Phase 93 — return `true` when the byte range `[start, start + len)` lies
+/// fully inside *some* loaded DSO's mapped image. Used to validate an address
+/// the loader is about to dereference or transfer control to (a copy-reloc
+/// source, an IFUNC resolver) before touching it, mirroring the per-arm bounds
+/// discipline `apply_glob_dat`/`apply_abs64`/`apply_copy` already apply to their
+/// write targets. `range_in_image` is overflow-safe, so this also rejects a
+/// `len` so large that `start + len` would wrap (the `from_raw_parts` UB edge).
+fn range_in_any_image(dsos: &[LoadedDso], start: u64, len: u64) -> bool {
+    dsos.iter().any(|d| {
+        d.image_len != 0 && ldso_core::bounds::range_in_image(start, len, d.load_bias, d.image_len)
+    })
+}
+
 /// Phase 93 B.2 — if `sym` is an `STT_GNU_IFUNC` *definition* (resolved
 /// within scope, so its `st_shndx` is non-zero), the resolved `value` is
 /// a resolver function whose return value is the real implementation;
@@ -1155,14 +1168,26 @@ fn warn_tls_reloc_once() {
 /// `STT_GNU_IFUNC` (where the consumer's symbol is `UND`) is the rare
 /// case the `R_X86_64_IRELATIVE` path covers directly.
 ///
+/// The resolver address is bounds-checked against the loaded images before
+/// it is transmuted + called: an out-of-image `value` (a malformed/hostile
+/// DSO) would otherwise transfer control to an arbitrary address. On a
+/// bounds violation we serial-warn and return `value` *without* calling it
+/// (no arbitrary control transfer); a well-formed in-scope IFUNC always
+/// resolves inside a mapped image.
+///
 /// # Safety
-/// When `sym` is a resolved in-scope `STT_GNU_IFUNC` definition, `value` must
-/// be the address of its zero-argument resolver (`extern "C" fn() -> u64`),
-/// which is then called.
-unsafe fn maybe_ifunc_resolve(sym: &Sym, value: u64) -> u64 {
+/// When `sym` is a resolved in-scope `STT_GNU_IFUNC` definition whose `value`
+/// passes the image-bounds check, `value` is the address of its zero-argument
+/// resolver (`extern "C" fn() -> u64`), which is then called.
+unsafe fn maybe_ifunc_resolve(dsos: &[LoadedDso], sym: &Sym, value: u64) -> u64 {
     if st_type(sym.st_info) == STT_GNU_IFUNC && sym.st_shndx != 0 && value != 0 {
+        if !range_in_any_image(dsos, value, 1) {
+            serial(b"ldso: IFUNC resolver out of image\n");
+            return value;
+        }
         // SAFETY: an STT_GNU_IFUNC definition's address is an
-        // executable resolver `extern "C" fn() -> u64`.
+        // executable resolver `extern "C" fn() -> u64`, and the address
+        // was just confirmed to lie inside a mapped DSO image.
         let resolver: extern "C" fn() -> u64 =
             unsafe { core::mem::transmute::<u64, extern "C" fn() -> u64>(value) };
         resolver()
@@ -1287,7 +1312,7 @@ unsafe fn apply_rela(
                 // `if (sym) sym();`. Fall through and store 0.
                 // Phase 93 B.2 — route an in-DSO STT_GNU_IFUNC reference
                 // through its resolver before storing.
-                let value = unsafe { maybe_ifunc_resolve(&sym, value) };
+                let value = unsafe { maybe_ifunc_resolve(dsos, &sym, value) };
                 // Phase 76d.S1.3: route through `apply_glob_dat` slice
                 // helper. The helper writes 8 bytes at `r.r_offset`
                 // and bounds-checks the range internally.
@@ -1347,7 +1372,7 @@ unsafe fn apply_rela(
                     }
                     // Phase 93 — WEAK undefined → store 0 (see GLOB_DAT).
                     // Phase 93 B.2 — resolve an in-DSO STT_GNU_IFUNC.
-                    let value = unsafe { maybe_ifunc_resolve(&sym, value) };
+                    let value = unsafe { maybe_ifunc_resolve(dsos, &sym, value) };
                     let image: &mut [u8] = unsafe {
                         core::slice::from_raw_parts_mut(
                             dso.load_bias as *mut u8,
@@ -1439,10 +1464,20 @@ unsafe fn apply_rela(
                         }
                     };
                 let size = sym.st_size as usize;
-                // SAFETY: `src_addr` is the resolved provider symbol's
-                // address inside a mapped DSO; `size` is the symbol's
-                // own `st_size`. `apply_copy` bounds-checks the write
-                // target against the consumer image.
+                // Bounds-check the *read* (provider) side too: `size` is the
+                // consumer-supplied `st_size`, and `apply_copy` only validates
+                // the write target. Confirm `[src_addr, src_addr + size)` lies
+                // inside some loaded image before forming the slice — a corrupt
+                // `st_size` would otherwise over-read the provider (and a `size`
+                // past `isize::MAX` would be `from_raw_parts` UB; `range_in_image`
+                // is overflow-safe and rejects both).
+                if size > 0 && !range_in_any_image(dsos, src_addr, size as u64) {
+                    serial(b"ldso: copy-reloc source out of image\n");
+                    return Err("copy-reloc source out of image");
+                }
+                // SAFETY: `[src_addr, src_addr + size)` was just confirmed to lie
+                // inside a mapped DSO image; `size` is the symbol's own `st_size`.
+                // `apply_copy` bounds-checks the write target against the consumer.
                 let src: &[u8] =
                     unsafe { core::slice::from_raw_parts(src_addr as *const u8, size) };
                 let image: &mut [u8] = unsafe {
@@ -1464,9 +1499,21 @@ unsafe fn apply_rela(
                 // libc / a lib-dynload `.so` may, and aborting the load
                 // on an unrecognized type would break the interpreter.)
                 let resolver_addr = dso.load_bias.wrapping_add(r.r_addend as u64);
-                // SAFETY: `resolver_addr` is load_bias + an in-image
-                // addend, i.e. an executable address inside the DSO; an
-                // IFUNC resolver is `extern "C" fn() -> u64`.
+                // Bounds-check the resolver against this DSO's image before
+                // transmuting + calling it. Every other reloc arm bounds-checks
+                // its target; an out-of-image addend would transfer control to
+                // an arbitrary address. (`range_in_image` is overflow-safe.)
+                if !ldso_core::bounds::range_in_image(
+                    resolver_addr,
+                    1,
+                    dso.load_bias,
+                    dso.image_len,
+                ) {
+                    serial(b"ldso: IRELATIVE resolver out of image\n");
+                    return Err("IRELATIVE resolver out of image");
+                }
+                // SAFETY: `resolver_addr` was just confirmed to lie inside the
+                // DSO's mapped image; an IFUNC resolver is `extern "C" fn() -> u64`.
                 let resolver: extern "C" fn() -> u64 =
                     unsafe { core::mem::transmute::<u64, extern "C" fn() -> u64>(resolver_addr) };
                 let resolved = resolver();
@@ -1811,7 +1858,6 @@ unsafe fn setup_static_tls(at_phdr: *const Phdr, at_phnum: usize, dsos: &[Loaded
     // so every field musl reads (self@0, dtv@8, canary@0x28, errno, locale)
     // lands in the zeroed TCB region.
     const TCB_RESERVE: u64 = 0x400;
-    const MIN_TLS_ALIGN: u64 = 16;
 
     // Find the main exe's PT_TLS (template) + PT_PHDR (to recover a PIE base).
     let mut tls: Option<Phdr> = None;
@@ -1826,34 +1872,37 @@ unsafe fn setup_static_tls(at_phdr: *const Phdr, at_phnum: usize, dsos: &[Loaded
             have_phdr_vaddr = true;
         }
     }
-    // base = runtime AT_PHDR address - link-time PT_PHDR vaddr.
+    // base = runtime AT_PHDR address - link-time PT_PHDR vaddr. For a non-PIE
+    // executable PT_PHDR's p_vaddr equals the runtime AT_PHDR, so exe_base is 0
+    // and `exe_base + p_vaddr` is the correct absolute address; the else-0
+    // fallback only mis-locates a PIE that omits PT_PHDR, which real toolchains
+    // never emit (a PIE always carries PT_PHDR).
     let exe_base = if have_phdr_vaddr {
         (at_phdr as u64).wrapping_sub(phdr_vaddr)
     } else {
         0
     };
 
-    let (tls_memsz, tls_filesz, tls_align, tls_image) = match tls {
-        Some(t) => {
-            let align = if t.p_align < MIN_TLS_ALIGN {
-                MIN_TLS_ALIGN
-            } else {
-                t.p_align
-            };
-            (
-                t.p_memsz,
-                t.p_filesz,
-                align,
-                exe_base.wrapping_add(t.p_vaddr),
-            )
-        }
-        None => (0, 0, MIN_TLS_ALIGN, 0),
+    // Keep the segment's OWN p_align for the TP-relative module offset; the
+    // 16-byte floor ([`MIN_TLS_ALIGN`]) applies only to region/TP *placement*.
+    let (tls_memsz, tls_filesz, seg_align, tls_image) = match tls {
+        Some(t) => (
+            t.p_memsz,
+            t.p_filesz,
+            t.p_align.max(1),
+            exe_base.wrapping_add(t.p_vaddr),
+        ),
+        None => (0, 0, 1, 0),
     };
-    // Variant II: the module's TP-relative offset is round_up(memsz, align).
-    let tls_offset = (tls_memsz + tls_align - 1) & !(tls_align - 1);
+    let place_align = ldso_core::tls::tls_place_align(seg_align);
+    // Variant-II module offset = round_up(memsz, seg_align) — the exact value
+    // the static linker baked into the exe's local-exec %fs:-N references (NOT
+    // the 16-floored placement align, which would mis-place thread-locals for a
+    // segment whose p_align < 16 and memsz is not a multiple of 16).
+    let tls_offset = ldso_core::tls::main_tls_offset(tls_memsz, seg_align);
 
     // Reserve [tls block (tls_offset)][TCB (TCB_RESERVE)] + alignment slack.
-    let region_len = (tls_offset + TCB_RESERVE + tls_align + 4095) & !4095u64;
+    let region_len = (tls_offset + TCB_RESERVE + place_align + 4095) & !4095u64;
     let region = sys_mmap(
         0,
         region_len,
@@ -1867,11 +1916,13 @@ unsafe fn setup_static_tls(at_phdr: *const Phdr, at_phnum: usize, dsos: &[Loaded
         return;
     }
     let region = region as u64;
-    // TP sits above the TLS block; align it so (TP - tls_offset) honors
-    // tls_align (the exe's local-exec %fs:-N offsets assume that).
+    // TP sits above the TLS block; align it to place_align. Because place_align
+    // is a multiple of seg_align and tls_offset is a multiple of seg_align,
+    // (TP - tls_offset) — the block start — is also seg_align-aligned, which the
+    // exe's local-exec %fs:-N offsets assume.
     let tp = {
         let raw = region + tls_offset;
-        (raw + tls_align - 1) & !(tls_align - 1)
+        (raw + place_align - 1) & !(place_align - 1)
     };
 
     // Copy the main exe's .tdata into the block at TP - tls_offset; .tbss is
@@ -2426,6 +2477,13 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
     unsafe { setup_static_tls(at_phdr, at_phnum, dsos.as_slice()) };
 
     // -- Run constructors deepest-first -------------------------------------
+    // NOTE: these run with a *zero* stack canary. musl randomizes the canary
+    // (`%fs:0x28`) in `__init_ssp`, which runs from the program's
+    // `__libc_start_main` at entry — i.e. AFTER this loader returns. So any
+    // DT_INIT_ARRAY constructor compiled with `-fstack-protector` reads/writes
+    // the same zero canary in its prologue/epilogue: internally consistent and
+    // safe, just a deviation from musl's order (which runs ctors after
+    // `__init_ssp`). errno/locale/tid ARE valid here (set by `__init_tp`).
     unsafe { run_constructors(&dsos) };
 
     serial(b"ldso(76c): handoff to main entry=");
