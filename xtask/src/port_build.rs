@@ -1496,6 +1496,7 @@ fn port_build(name: &str) -> Result<(), String> {
         "ncurses" => build_ncurses(&extracted, &stage, &toolchain)?,
         "libevent" => build_libevent(&extracted, &stage, &toolchain)?,
         "zlib" => build_zlib(&extracted, &stage, &toolchain)?,
+        "musl" => build_musl(&extracted, &stage, &toolchain)?,
         "less" => build_less(&extracted, &stage, &toolchain, &ncurses_stage)?,
         "htop" => build_htop(&extracted, &stage, &toolchain, &ncurses_stage)?,
         "tmux" => build_tmux(
@@ -2158,6 +2159,155 @@ fn build_zlib(
         file_size(&lib)
     );
     Ok(())
+}
+
+/// Phase 93 Track A.3 — build the musl C library as a shared object
+/// (`/usr/lib/libc.so`) the m3OS Rust loader can map and bind a dynamic
+/// program against.
+///
+/// Configures musl `--disable-static --enable-shared`, links with
+/// `-Wl,-soname,libc.so` so the artifact self-identifies for the loader's
+/// SONAME dedup, and stages **only** `libc.so` at `/usr/lib/libc.so`
+/// (musl's own `ld-musl-x86_64.so.1` symlink is deliberately NOT installed
+/// — m3OS keeps its from-scratch Rust loader as the PT_INTERP, Option A1).
+///
+/// Routes CC/AR/RANLIB + LDFLAGS through the shared musl-toolchain plumbing
+/// (the "Adding a New Cross-Compiled Port" contract) so it builds on
+/// toolchains lacking the historical static-compat archives.
+fn build_musl(
+    src: &Path,
+    stage: &Path,
+    (cc, ar, ranlib): &(&'static str, String, String),
+) -> Result<(), String> {
+    // musl's build is config-cache sensitive; configure into the source
+    // tree (its build system writes `config.mak` there).
+    let mut configure_cmd = Command::new("sh");
+    configure_cmd
+        .current_dir(src)
+        .arg("./configure")
+        .arg("--prefix=/usr")
+        .arg("--disable-static")
+        .arg("--enable-shared")
+        .arg("--host=x86_64-linux-musl")
+        .env("CC", cc)
+        .env("AR", ar)
+        .env("RANLIB", ranlib)
+        .env("CFLAGS", "-O2 -fPIC");
+    // -Wl,-soname,libc.so makes the .so self-identify (musl's default link
+    // sets no SONAME). The shared stub-libs `-L` (when the host toolchain
+    // lacks libdl.a/libpthread.a/librt.a) rides the same LDFLAGS.
+    let extra_ld = musl_extra_ldflags_joined();
+    let ldflags = if extra_ld.is_empty() {
+        "-Wl,-soname,libc.so".to_string()
+    } else {
+        format!("-Wl,-soname,libc.so {extra_ld}")
+    };
+    configure_cmd.env("LDFLAGS", &ldflags);
+    run(&mut configure_cmd, "musl configure")?;
+
+    // Build only the shared library target (we do not want the headers,
+    // static archives, or the ld.so symlink musl's `install` would emit).
+    let built_so = src.join("lib/libc.so");
+    let _ = fs::remove_file(&built_so); // force a fresh link so -soname applies
+    let mut make_cmd = Command::new("make");
+    make_cmd
+        .current_dir(src)
+        .env("LDFLAGS", &ldflags)
+        .arg(format!("-j{}", num_jobs()))
+        .arg("lib/libc.so");
+    run(&mut make_cmd, "musl make lib/libc.so")?;
+
+    if !built_so.exists() {
+        return Err(format!(
+            "musl build missing {} after make",
+            built_so.display()
+        ));
+    }
+
+    // Stage exactly libc.so at /usr/lib/libc.so.
+    let stage_lib = stage.join("usr/lib");
+    fs::create_dir_all(&stage_lib).map_err(|e| format!("mkdir: {e}"))?;
+    let dst = stage_lib.join("libc.so");
+    fs::copy(&built_so, &dst).map_err(|e| format!("copy libc.so: {e}"))?;
+
+    // Track A.3/A.4 acceptance — verify the staged artifact's shape: it must
+    // carry DT_SONAME=libc.so, export a sentinel symbol (malloc), and have
+    // zero DT_NEEDED (musl is self-contained). A symbol-presence check, not
+    // an assumption.
+    verify_libc_so(&dst)?;
+
+    println!(
+        "musl: produced /usr/lib/libc.so ({} bytes, SONAME=libc.so)",
+        file_size(&dst)
+    );
+    Ok(())
+}
+
+/// Phase 93 Track A.3/A.4 — assert a staged `libc.so` is a usable dynamic
+/// libc: `ET_DYN`, `DT_SONAME=libc.so`, zero `DT_NEEDED`, and exporting the
+/// `malloc` sentinel in its `.dynsym`. Uses `readelf` (always present where a
+/// cross-toolchain is). This is the falsifiable guard that the build (and
+/// later `strip_stage`/`seal_package`) did not damage the dynamic symbol
+/// table the loader resolves against.
+fn verify_libc_so(path: &Path) -> Result<(), String> {
+    let readelf = which_readelf();
+    // SONAME + NEEDED via `readelf -dW`.
+    let dyn_out = Command::new(&readelf)
+        .args(["-dW"])
+        .arg(path)
+        .output()
+        .map_err(|e| format!("readelf -d {}: {e}", path.display()))?;
+    let dyn_text = String::from_utf8_lossy(&dyn_out.stdout);
+    if !dyn_text.contains("SONAME") || !dyn_text.contains("libc.so") {
+        return Err(format!(
+            "libc.so at {} is missing DT_SONAME=libc.so",
+            path.display()
+        ));
+    }
+    if dyn_text.contains("(NEEDED)") {
+        return Err(format!(
+            "libc.so at {} unexpectedly has DT_NEEDED entries (musl must be self-contained)",
+            path.display()
+        ));
+    }
+    // malloc export via `readelf --dyn-syms`.
+    let sym_out = Command::new(&readelf)
+        .args(["--dyn-syms", "-W"])
+        .arg(path)
+        .output()
+        .map_err(|e| format!("readelf --dyn-syms {}: {e}", path.display()))?;
+    let sym_text = String::from_utf8_lossy(&sym_out.stdout);
+    let exports_malloc = sym_text
+        .lines()
+        .any(|l| l.split_whitespace().last() == Some("malloc"));
+    if !exports_malloc {
+        return Err(format!(
+            "libc.so at {} does not export the `malloc` sentinel in .dynsym",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve a `readelf` binary, preferring a musl-cross one if present.
+fn which_readelf() -> String {
+    for cand in [
+        "x86_64-linux-musl-readelf",
+        "x86_64-linux-gnu-readelf",
+        "readelf",
+    ] {
+        if Command::new(cand)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return cand.to_string();
+        }
+    }
+    "readelf".to_string()
 }
 
 fn build_less(

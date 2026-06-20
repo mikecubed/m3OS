@@ -1,0 +1,17 @@
+NAME=musl
+VERSION=1.2.5
+DESCRIPTION="musl C library, built as a shared object (libc.so) for the m3OS dynamic loader"
+CATEGORY=lib
+DEPS=
+URL=https://musl.libc.org/releases/musl-1.2.5.tar.gz
+SHA256=a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4
+MAINTAINER=m3os
+# Phase 93 (Dynamic C Runtime). musl 1.2.5 is the latest stable release; it is
+# pinned here so the shared `libc.so` the m3OS Rust loader binds against is
+# reproducible. The relocation/TLS shapes this pin requires of the loader were
+# audited empirically (Track A.1): libc.so emits only RELATIVE/GLOB_DAT/
+# JUMP_SLOT relocations (all already supported), carries NO PT_TLS, and is
+# self-contained (zero DT_NEEDED). The build is `--disable-static
+# --enable-shared` with `-Wl,-soname,libc.so` so the artifact self-identifies
+# for the loader's SONAME dedup. The m3OS Rust loader stays the PT_INTERP at
+# /lib/ld-musl-x86_64.so.1 (Option A1); musl's own ld.so is NOT installed.
