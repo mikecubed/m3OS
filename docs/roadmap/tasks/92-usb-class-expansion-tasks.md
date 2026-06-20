@@ -1,6 +1,6 @@
 # Phase 92 — USB Class Expansion: Task List
 
-**Status:** Complete (92a–92e landed; kernel `0.92.5`)
+**Status:** Complete (92a–92e landed; kernel `0.92.5`) — two sub-items explicitly deferred with stated blockers and noted inline + in the design-doc *Deferred Until Later* list: **live UAS command/data driving** (D.3 — codec + detection shipped) and **mount-teardown-on-detach** (C.4 `/mnt/usb<n>` half — needs a non-blocking IPC recv). Every other open `[~]` item is a hardware-only (no QEMU device model) or architectural deferral; no unneeded deferrals remain.
 **Source Ref:** phase-92
 **Depends on:** Phase 78a (xHCI Host Bring-Up) ✅, Phase 78b (USB Enumeration + Hub) ✅, Phase 78c (HID Boot Protocol + `usb` IPC service) ✅, Phase 74 (IPC Capability Grants — page-grant transport) ✅, Phase 77 (ring-3 `RemoteBlockDevice` hosting) ✅, Phase 79 (`RemoteNic` facade) ✅, Phase 96 (Bare-Metal USB-Ethernet — USB bulk-endpoint transport + multi-controller handle codec) ✅
 **Goal:** Deliver every USB class feature deferred from Phase 78c — multi-tier hub enumeration, live HID Report Protocol, USB hot-plug, USB mass storage (BOT + UAS), isochronous USB audio/video, a generic CDC-ECM/NCM USB-Ethernet class driver, and per-controller concurrency — building on the Phase 96 bulk-endpoint substrate (`PollBulkIn`/`SubmitBulkOut`/`BulkData`/`ControlWrite`, `USB_MSG_MAX`=4096, the `handle.rs` multi-controller codec) rather than re-implementing transport. Closes with the kernel version bump (`0.91.0` → `0.92.0`) and the Phase 92 learning doc (`docs/92-usb-class-expansion.md`).
@@ -389,7 +389,7 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 **Acceptance:**
 - [x] `usb-hid`/`usb-storage`/`usb-net` each release their per-device state on an `attached: false` notice for a slot they own. — **usb-hid (Phase 92b) + usb-storage (Phase 92a) + usb-net (Phase 92e) done.** `usb-hid`'s `reconcile_attachments` re-walks the `NextAttach` table every ~200 ms and drops a held device whose latest entry is `attached: false` (resolving by the *latest* `(slot_id, interface_num)` entry so a reclaimed/re-packed slot is never confused with a stale detached one), logging `usb-hid: released slot=N`. Live-validated by `usb-hotplug-smoke` (3 cycles: `usb-hid: hot-attached` then `usb-hid: released` each cycle). `usb-net`'s io loop calls `device_detached` (re-reads the bound slot's `NextAttach` entry) every ~1 s and, on `attached: false`, releases its `CdcDevice` state + publishes link-down + exits (`usb-net: released slot=N`); the release path is host-logic / bare-metal (no QEMU CDC-ECM model).
 - [x] The server issues Disable Slot for the departed device (H.3) and the slot is reusable. — `process_port_events` calls `Controller::disable_slot`; the 3-cycle gate proves the slot is reused without exhaustion.
-- [ ] Unplugging a mounted USB stick unmounts `/mnt/usb<n>` without wedging the VFS (Track D integration). — **Phase 92a** (pairs with the D.4 mount).
+- [~] Unplugging a mounted USB stick unmounts `/mnt/usb<n>` without wedging the VFS (Track D integration). — **DEFERRED (needed — new IPC primitive required).** Server-side detach + Disable-Slot reclamation (C.1–C.3 / H.3) and the per-driver `release_device` hook are live + gated, and the kernel `unmount_usb(prefix)` teardown (`kernel/src/fs/ext2.rs`) is implemented + ready to call. The remaining blocker is purely the resident `usb-storage` block-server loop: it cannot interleave a detach notification with a block request without a **non-blocking IPC recv** (`ipc_try_recv_msg`, which does not exist in `syscall-lib` — the in-code `TODO(92a C.4)` at `usb-storage/src/main.rs`). Unplugging a *mounted* stick leaves the mount stale but does **not** wedge the VFS; detach of an *unmounted* stick is fully handled. Tracked in the design-doc *Deferred Until Later* list.
 
 ---
 
@@ -422,7 +422,7 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 - [x] `Cbw`/`Csw` encode/decode are host-tested against known byte layouts (dCBWSignature `USBC`, dCSWSignature `USBS`). — `kernel_core::usb::mass_storage` `Cbw::encode`/`Csw::parse` + 31 host tests (signatures, tag/len LE, CDB pad, short-buffer rejection).
 - [x] `INQUIRY` + `READ CAPACITY(10)` return device identity and block count; `READ(10)`/`WRITE(10)` move sectors; a failed command surfaces `REQUEST SENSE`. — codec host-tested (CDB builders big-endian, `InquiryData`/`ReadCapacity10` parsers) **and the live BOT data movement is proven**: the `usb-storage` daemon reads INQUIRY + READ CAPACITY, and a `WRITE(10)` + `READ(10)` sector round-trip verifies byte-identical (`USB_STORAGE:rw-ok` in `usb-storage-smoke`) — WRITE data-OUT over `SubmitBulkOut` + READ data-IN over `SubmitBulkIn`. (REQUEST SENSE builder host-tested; surfaced on a failed command.)
 - [x] `GET_MAX_LUN` is issued over `ControlRequest`; a device reporting STALL is treated as single-LUN. — `get_max_lun(iface)` SetupPacket encoder host-tested (`A1 FE 00 00 iface 00 01 00`); live issuance + STALL→single-LUN policy is the daemon (D.1).
-- [ ] **(PR #252 readiness, 92a)** A comment in `cmd_usb_storage_smoke` notes that the `USB_STORAGE:rw-ok` round-trip depends on the 8 MiB / 512-byte scratch geometry (a non-512 device safely skips the round-trip, so the gate times out rather than false-passing).
+- [x] **(PR #252 readiness, 92a)** A comment in `cmd_usb_storage_smoke` notes that the `USB_STORAGE:rw-ok` round-trip depends on the 8 MiB / 512-byte scratch geometry (a non-512 device safely skips the round-trip, so the gate times out rather than false-passing). — the `NOTE (D.2):` comment block at the `wait("USB_STORAGE:rw-ok")` site (`xtask/src/main.rs`) documents the 512-byte-sector dependency + the skip→timeout (not false-pass) behavior.
 
 ### D.3 — UAS (USB Attached SCSI)
 
@@ -431,9 +431,9 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 **Why it matters:** BOT is a single-command-in-flight legacy protocol; USB 3.0 drives advertise UAS for queued, higher-throughput SCSI over streams. D.3 selects UAS when present and falls back to BOT otherwise.
 
 **Acceptance:**
-- [ ] A device advertising the UAS alt-setting is driven over the UAS pipes with stream IDs; a BOT-only device falls back to D.2.
-- [ ] Command queuing (≥2 in flight) is exercised on a UAS device; a task-management abort is issued and acknowledged.
-- [ ] Selection is logged (`usb-storage: transport=uas|bot`).
+- [ ] **DEFERRED (needed — bare-metal/VFIO-only; no validated QEMU `usb-uas` chain here).** A device advertising the UAS alt-setting is driven over the UAS pipes with stream IDs; a BOT-only device falls back to D.2. — the UAS Information-Unit codec (`CommandIu`/`SenseIu`/`ResponseIu`/`TaskMgmtIu`, `kernel_core::usb::mass_storage`) is shipped + host-tested and `find_uas_interface` detects the UAS protocol, but the live IU command/data driving path is deferred (see the design-doc *Deferred Until Later* list). BOT is the live transport.
+- [ ] **DEFERRED (needed — pairs with the live UAS path above).** Command queuing (≥2 in flight) is exercised on a UAS device; a task-management abort is issued and acknowledged.
+- [x] Selection is logged (`usb-storage: transport=uas|bot`). — the daemon's `select_transport` logs `usb-storage: transport=uas` / `transport=bot` (`usb-storage/src/main.rs`); a UAS device logs `transport=uas` then falls back to BOT for the block-server loop (the live UAS driving path being the deferral above).
 
 ### D.4 — `RemoteBlockDevice` facade + `/mnt/usb<n>` mount
 
@@ -447,7 +447,7 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 **Acceptance:**
 - [x] Each mass-storage LUN registers as a block device over the shared block protocol (`READ(10)`/`WRITE(10)` back the block read/write IPC). — the resident `usb-storage` daemon registers `usb0.block` and serves `BLK_READ`/`BLK_WRITE`/`BLK_FLUSH`/`BLK_STATUS`, chunking each into ≤7-sector BOT READ(10)/WRITE(10) transfers. The kernel `blk::remote` multi-device registry routes `dev_id>=1` to it.
 - [x] An ext2 USB stick mounts under `/mnt/usb0`; `ls /mnt/usb0` lists its files and a written file reads back byte-identical. — **`usb-mount-smoke` validates this end-to-end with a real-world 4096-byte-block ext2**: `mount("/dev/usb0","/mnt/usb0","ext2")` → `USB_MASS_STORAGE:mounted`, `getdents64` lists the seeded `hello.txt` (`USB_MOUNT:ls-ok`), read matches the seed (`USB_MOUNT:read-ok`), and an overwrite reads back byte-identical (`USB_MOUNT:rw-ok`) — through the kernel VFS secondary-mount routing (`USB_MOUNTS` table + `dev_id`-aware `Ext2Volume`, root path byte-identical). Each 4096-byte (8-sector) block I/O is split into a 7-sector + 1-sector pair of inline BOT transfers. *(Fixing this required root-causing a **bulk-OUT recv-truncation bug**: the xHCI server `recv`d requests with the 1522-byte Ethernet-MTU buffer, truncating a >1522-byte `SubmitBulkOut` and wedging the multi-sector write — fixed to `recv_with_capacity(USB_MSG_MAX)`.)* FAT-on-USB is not wired (ext2 only).
-- [~] A second LUN / second stick mounts at `/mnt/usb1` independently. — the registry supports up to 4 devices and `/mnt/usb1` is pre-created + routable (`mount /dev/usb1 /mnt/usb1`), but a two-stick gate is not yet wired (single-stick validated).
+- [~] A second LUN / second stick mounts at `/mnt/usb1` independently. — the kernel `blk::remote` registry holds up to `MAX_REMOTE_BLOCK`=4 devices, `/mnt/usb1` is pre-created + routable (`mount /dev/usb1 /mnt/usb1`), and the multi-device routing is exercised by `usb-mount-smoke`'s remount arm (`USB_MOUNT:remount-ok`, 6× the same prefix). The remaining gap is **not** gate-only: the `usb-storage` daemon is single-device per process (hardcoded `usb0.block`), so a *concurrent* two-stick gate first needs the daemon's service name + target device parameterized (a second instance). Tracked in the design-doc *Deferred Until Later* list (multi-stick concurrent mounts).
 
 ### D.5 — Page-grant overflow path
 
@@ -594,7 +594,7 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 **Why it matters:** Tracks B/C/F each need a falsifiable QEMU gate; the QMP `device_add`/`device_del` path and a second `qemu-xhci` instance are emulator-supported, so these can be CI-viable.
 
 **Acceptance:**
-- [ ] Hot-plug gate: a mid-run `device_add`/`device_del` produces `USB_HOTPLUG:attached` then `USB_HOTPLUG:detached`, and `/mnt/usb0` mounts then cleanly unmounts.
+- [~] Hot-plug gate: a mid-run `device_add`/`device_del` produces `USB_HOTPLUG:attached` then `USB_HOTPLUG:detached`, and `/mnt/usb0` mounts then cleanly unmounts. — **the attach/detach half is done + gated**: `usb-hotplug-smoke` runs 3 mid-run `device_add`/`device_del` cycles asserting `USB_HOTPLUG:attached`/`USB_HOTPLUG:detached` (+ the `usb-hid` detach release). The **`/mnt/usb0` mounts-then-unmounts-on-detach** half is the deferred C.4 line-392 item (needs the non-blocking IPC recv); mount/read/overwrite is validated statically by `usb-mount-smoke`.
 - [x] Multi-controller gate: a device on the second controller enumerates + is serviced via its own (multiplexed) IRQ (`XHCI:controller-1:ready`) alongside the primary. — **`usb-multi-controller-smoke`** (Phase 92d): a second `qemu-xhci,id=xhci1,addr=0x7` carries the sole `usb-mouse`; the gate asserts `XHCI:controller-1:ready` (the secondary's IRQ subscribed into the primary's bound notification) then injects a QMP mouse-move and asserts `USB_HID:mouse`. Wired into `M3OS_USB_REGRESSION` + the AGENTS.md row.
 - [x] Report-Protocol arm: a Report-Protocol pointer with extra axes/buttons decodes through `mouse_server`. — **`usb-report-smoke` (Phase 92b)**: a `usb-tablet` (Report-Protocol absolute pointer, no Boot interface) is decoded against the parsed `ReportField` layout and emits `HID_REPORT:pointer` (B.2); the same gate covers the B.4 `USB_HID:led` `SET_REPORT` and the H.2 no-drop assertion. Wired into `M3OS_USB_REGRESSION` + the AGENTS.md row.
 
@@ -651,8 +651,8 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 **Why it matters:** the three new core gates (`usb-hotplug-smoke`, `usb-storage-smoke`, `usb-hub-smoke`) PASS when invoked but are not in `M3OS_USB_REGRESSION` or any CI workflow, so a regression in the **landed** hot-plug / mass-storage / hub paths would not be caught automatically. (The host-side `usb-core` codec tests were wired into `cargo xtask check` in PR #252; this is the QEMU-gate half. Near-term — schedule with 92a.)
 
 **Acceptance:**
-- [ ] `usb-hotplug-smoke`, `usb-storage-smoke`, and `usb-hub-smoke` run under `M3OS_USB_REGRESSION` (and/or the CI USB job) alongside `usb-smoke`.
-- [ ] The AGENTS.md `M3OS_USB_REGRESSION` row lists the three added gates.
+- [x] `usb-hotplug-smoke`, `usb-storage-smoke`, and `usb-hub-smoke` run under `M3OS_USB_REGRESSION` (and/or the CI USB job) alongside `usb-smoke`. — wired in `.githooks/pre-push` under the `M3OS_USB_REGRESSION` guard (also runs `usb-report-smoke`/`usb-mount-smoke`/`usb-multi-controller-smoke`/`usb-eth-smoke`).
+- [x] The AGENTS.md `M3OS_USB_REGRESSION` row lists the three added gates. — the row enumerates `xhci-bringup-smoke` + `xhci-enum-smoke` + `usb-smoke` + `usb-report-smoke` + `usb-hotplug-smoke` + `usb-storage-smoke` + `usb-hub-smoke` + `usb-mount-smoke` + `usb-multi-controller-smoke` + `usb-eth-smoke`.
 
 ---
 

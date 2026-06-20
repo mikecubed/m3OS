@@ -11446,6 +11446,11 @@ fn cmd_usb_storage_smoke(args: &SmokeBootArgs) {
         // …and a WRITE(10) + READ(10) sector round-trip verified byte-identical:
         // the bidirectional data path (data-OUT over SubmitBulkOut + data-IN over
         // SubmitBulkIn) the RemoteBlockDevice facade (D.4) is built on.
+        // NOTE (D.2): `USB_STORAGE:rw-ok` depends on the 8 MiB / 512-byte scratch
+        // geometry created above — the daemon only issues the WRITE(10)+READ(10)
+        // round-trip on a 512-byte-sector device. A non-512 device safely *skips*
+        // the round-trip (it never emits `rw-ok`), so this `wait` would time out
+        // rather than false-pass; keep the scratch image 512-byte-sector.
         wait("USB_STORAGE:rw-ok")?;
         // Phase 92a H.4 / D.5 — a 16-sector (8192-byte) WRITE(10)+READ(10), larger
         // than the ~4092-byte inline budget, completes in a SINGLE descriptor over
