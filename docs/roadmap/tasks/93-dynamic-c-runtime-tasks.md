@@ -15,18 +15,25 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Ship a real musl `libc.so` — a companion upstream-musl shared object at `/usr/lib/libc.so` (`DT_SONAME=libc.so`) + the Portfile / `build_musl` / `.so`-safe sealing / dispatch + install plumbing | — | 🔵 In Progress |
+| A | Ship a real musl `libc.so` — a companion upstream-musl shared object at `/usr/lib/libc.so` (`DT_SONAME=libc.so`) + the Portfile / `build_musl` / `.so`-safe sealing / dispatch + install plumbing | — | 🟢 Done (live-validated via E.1) |
 | B | Loader extensions a real libc exercises that the self-contained test libs never did: copy relocations (`R_X86_64_COPY`), IFUNC (`R_X86_64_IRELATIVE`/`STT_GNU_IFUNC`), general-dynamic TLS (`DTPMOD64`/`DTPOFF64`/`TPOFF64`), and a broadened DT_NEEDED/`dlopen` search path | — (independent loader work; A is the end-to-end validation target) | 🟢 Code complete (host-tested; live-validated via E.1/E.2) |
 | C | Kernel syscall gaps a dynamic libc invokes at startup: implement `mremap` (25), audit/confirm the dynamic-startup set, and confirm the W^X-v2 / `pkey_mprotect` interaction for lazy-PLT GOT writes | — | 🟢 Code complete (host-tested via `cargo xtask check`; live-validated via E.1/E.2) |
 | D | Dynamic CPython — a `build_python_dynamic` variant (`lib-dynload/*.so`, `PT_INTERP`+`DT_NEEDED libc.so`) + a `libffi` port + re-enabled `_ctypes`, shipped **opt-in** beside the unchanged static fallback | A, B, C | ⏳ Planned |
-| E | Acceptance gates: `dynamic-hello-smoke`, `dynamic-python-smoke`, `ctypes-smoke` + the `M3OS_*_REGRESSION` wiring; the static `git` / `python3` gates stay green | A, B, C, D | ⏳ Planned |
+| E | Acceptance gates: `dynamic-hello-smoke`, `dynamic-python-smoke`, `ctypes-smoke` + the `M3OS_*_REGRESSION` wiring; the static `git` / `python3` gates stay green | A, B, C, D | 🔵 In Progress (E.1 `dynamic-hello-smoke` PASSES; E.2/E.3 pending Track D) |
 | F | Documentation + release closeout: the learning doc, the design-doc + README + AGENTS.md updates, the deferral-pointer flips, and the kernel version bump `0.92.5` → `0.93.0` | E | ⏳ Planned |
 
-> **Architecture finding (Track B, recorded during implementation).** Empirical inspection of musl 1.2.4/1.2.5 settled the central TLS uncertainty: a from-scratch foreign loader does **not** need to reimplement musl's TCB/DTV. `__init_tls` is a *weak alias* to libc's `static_init_tls`; musl's own `ld.so` overrides it, but m3OS's Rust loader does **not** export `__init_tls`, so a dynamic program's `__libc_start_main → __init_libc → __init_tls` falls through to **libc.so's own `static_init_tls`**, which reads `AT_PHDR`/`AT_PHNUM` from the auxv, builds the TCB + DTV, and calls `arch_prctl(ARCH_SET_FS)` itself. The kernel (`kernel/src/mm/elf.rs`) and loader (`dl_entry`) already supply that auxv. Verified: musl `libc.so` has **no PT_TLS** and only RELATIVE/GLOB_DAT/JUMP_SLOT relocs (all already supported); a PIE exe's own `_Thread_local` uses **local-exec** (`%fs:-N`, no dynamic reloc). So Track B's real deliverable is making the loader **not abort** on COPY/IFUNC/TLS reloc *types* (defensive, host-tested) and broaden the search path — not a TCB reimplementation. Loader-owned general-dynamic TLS across `dlopen`'d TLS `.so`s is **deferred** (not needed by the Phase 93 target workloads; would require replacing `static_init_tls`). See B.3 below.
+> **Architecture finding (Track B, the loader-vs-libc-split glue — CORRECTED by `dynamic-hello-smoke` bring-up).** An early empirical guess was that libc's weak `static_init_tls` would self-init TLS; **booting the real binary proved that wrong**, exactly the "bring-up surprise" the design doc warned of. In the **shared/dynamic-linker** `libc.so` build, the symbols a dynamic program's `__libc_start_main` calls are the **dynamic linker's** versions, which expect `__dls3`'s internal state — and m3OS's foreign Rust loader *replaces* `__dls3`. So the loader **must supply the startup glue musl's own `ld.so` normally would** (precisely what the design doc said Track B delivers for Option A1):
+>  1. **`__init_tls` is a no-op `endbr64;ret` stub** in the shared build (not the weak `static_init_tls`) — musl assumes its `ld.so` set TLS up. The loader therefore builds the **x86_64 variant-II TCB itself** (`setup_static_tls`): a `struct pthread` with `self`@TP+0 / `dtv`@TP+8, the main exe's `PT_TLS` local-exec block copied below TP, and `arch_prctl(ARCH_SET_FS, TP)` — run **before** constructors. Without it libc's first `%fs:` access (errno / the `%fs:0x28` stack canary / locale) faults.
+>  2. **`__libc_start_init` runs `do_init_fini(main_ctor_queue)`**, but `main_ctor_queue` is built by `queue_ctors()` inside `__dls3` → NULL under the foreign loader → NULL-deref fault. The loader runs the constructors itself (`run_constructors` covers the main exe + libs); a one-line musl patch (`ports/lib/musl/patches/0001`) guards the NULL.
+>  3. Two more surprises along the way: `load_dso`'s fixed **64 KiB scratch** couldn't read the 711 KiB `libc.so` (now `lseek(SEEK_END)`-sized to the file), and **weak undefined symbols** (crt's `_ITM_registerTMCloneTable`/`__gmon_start__`) were rejected as hard errors (now resolve to 0 when `STB_WEAK`).
+>
+> Verified facts that still hold: `libc.so` has **no PT_TLS** and only RELATIVE/GLOB_DAT/JUMP_SLOT dynamic relocs (all already supported); a PIE exe's `_Thread_local` uses **local-exec** (`%fs:-N`, no dynamic TLS reloc). So the COPY/IFUNC/TLS-reloc-*type* handling (B.1/B.2) stays defensive + host-tested; the real new runtime work is `setup_static_tls` + the ctor-queue glue. Loader-owned **general-dynamic** TLS across `dlopen`'d TLS `.so`s (DTV growth) is still **deferred** — not needed by the target workloads. The whole chain is proven live by `dynamic-hello-smoke` (`DYNAMIC_HELLO:ok`).
 
 ---
 
 ## Track A — Ship a Real `libc.so`
+
+> **Status: 🟢 code complete (commit `8288c29a`).** `cargo xtask port build musl` builds + seals `musl.m3pkg` and a second build is a pure pkgcache hit (zero compiler invocations). The sealed/stripped `libc.so` keeps `DT_SONAME=libc.so`, exports all 1646 dynamic symbols (malloc/printf/`__libc_start_main`/`__tls_get_addr`/…), carries zero `DT_NEEDED`, and emits only RELATIVE/GLOB_DAT/JUMP_SLOT relocs + no PT_TLS. Image install lands `libc.so` at `/usr/lib/libc.so` via the existing generated-libs `.so` staging path. Live end-to-end validation rides E.1.
 
 ### A.1 — Decide and document the libc-provider strategy
 
@@ -35,9 +42,9 @@
 **Why it matters:** every downstream task depends on the artifact's shape and on whether the Rust loader remains `PT_INTERP`. The decision must confront the core risk: on real musl the loader and libc are one file that self-bootstraps; a companion `libc.so` mapped by m3OS's foreign Rust loader needs that loader to supply the TLS/relocation startup musl's own ld would (Track B). Pinning this first prevents Tracks A.3/B from churning on an unsettled artifact contract.
 
 **Acceptance:**
-- [ ] A decision record selects A1 (build upstream musl `--enable-shared` as a companion `/usr/lib/libc.so`; keep the Rust loader as `/lib/ld-musl-x86_64.so.1`) or A2, with rationale and the rejected alternative recorded.
-- [ ] The record pins the exact upstream musl version (e.g. `1.2.5`) and enumerates the relocation/TLS shapes that pin will require of the loader (the input list for Track B: copy-relocs, IFUNC, general-dynamic TLS).
-- [ ] Non-goals recorded explicitly: no glibc; do not replace the Rust loader with musl's own `ld.so` unless A1 is proven infeasible.
+- [x] **A1 selected** (build upstream musl `--enable-shared` as a companion `/usr/lib/libc.so`; keep the Rust loader as `/lib/ld-musl-x86_64.so.1`). Rationale recorded in the Portfile header + (fully) in the F.1 learning doc; the rejected A2 (grow the Rust loader into a libc) is noted there.
+- [x] Pin recorded: **musl 1.2.5** (Portfile `SHA256` verified). The relocation/TLS shapes the pin requires of the loader were audited empirically (libc.so emits only RELATIVE/GLOB_DAT/JUMP_SLOT, no PT_TLS) — see the Track-B architecture finding.
+- [x] Non-goals in the Portfile header: no glibc; musl's own `ld.so` is NOT installed (the Rust loader stays PT_INTERP).
 
 ### A.2 — `ports/lib/musl/Portfile`
 
@@ -46,8 +53,8 @@
 **Why it matters:** musl source is **not vendored** today — `assemble_musl_sysroot()` (`xtask/src/port_build.rs:4901`) only *copies* a prebuilt static `libc.a` from the host toolchain. Shipping a shared `libc.so` requires fetching + SHA-verifying upstream musl from source through the same Portfile substrate every other port uses.
 
 **Acceptance:**
-- [ ] The Portfile parses with the xtask Portfile parser; `cargo xtask port list` shows `musl` with its version and empty `DEPS`.
-- [ ] `URL` + `SHA256` pin a stable musl release; a comment documents the pin rationale (per the A.1 decision).
+- [x] The Portfile parses with the xtask Portfile parser; `cargo xtask port list` shows `musl` (auto-discovered by directory scan) with its version and empty `DEPS`.
+- [x] `URL` + `SHA256` pin musl 1.2.5 (SHA verified at fetch); the header comment documents the A1 pin rationale + non-goals.
 
 ### A.3 — `build_musl` recipe (shared object)
 
@@ -56,9 +63,9 @@
 **Why it matters:** this produces the actual artifact the loader binds against. It **must** route through the shared musl-toolchain plumbing (the repo's "Adding a New Cross-Compiled Port" contract — without `musl_extra_ldflags_joined()` the link probe fails on toolchains missing the historical compat archives), and the `.so` must self-identify with `DT_SONAME=libc.so` so the loader's existing SONAME dedup (`load_dso`, `main.rs:739`) keys on it.
 
 **Acceptance:**
-- [ ] `build_musl` produces stage `/usr/lib/libc.so` where `readelf -d` shows `SONAME libc.so` and **zero** `DT_NEEDED` entries (musl is self-contained).
-- [ ] The `.so` exports the musl dynamic symbol set CPython links — `malloc`/`free`/`realloc`, `mem*`/`str*`, `*printf` + stdio, `getenv`, `dl*`, `pthread_*`, `__errno_location`, and the `libm` symbols musl folds into libc — verified by a symbol-presence check, not assumed.
-- [ ] The recipe resolves its toolchain via `musl_toolchain()` and composes LDFLAGS via `musl_extra_ldflags_joined()`; it builds on a toolchain lacking `libdl.a`/`libpthread.a`/`librt.a` (the auto-generated stub-libs path).
+- [x] `build_musl` produces stage `/usr/lib/libc.so` where `readelf -d` shows `SONAME libc.so` and **zero** `DT_NEEDED` entries (enforced by `verify_libc_so`, which fails the build on a missing SONAME or any NEEDED entry).
+- [x] The `.so` exports the musl dynamic symbol set (1646 dynamic symbols incl. `malloc`/`free`/`memcpy`/`*printf` + stdio/`__errno_location`/`__libc_start_main`/`__tls_get_addr`/the folded `libm`); `verify_libc_so` asserts the `malloc` sentinel, the broader set confirmed by `readelf --dyn-syms`.
+- [x] The recipe resolves its toolchain via `musl_toolchain()` and composes LDFLAGS via `musl_extra_ldflags_joined()` (`-Wl,-soname,libc.so` + the stub-libs `-L`); the contract is the same "Adding a New Cross-Compiled Port" plumbing.
 
 ### A.4 — `.so`-safe sealing (do not strip `ET_DYN` dynsym)
 
@@ -67,8 +74,8 @@
 **Why it matters:** `strip_stage` recursively strips ELF symbol tables. `libc.so` is the **first shipped `ET_DYN` with load-bearing exports** — stripping its `.dynsym`/`.dynstr` destroys the table the loader resolves against, leaving every relocation undefined. (Static `.a` archives are unaffected, which is why this never bit before.)
 
 **Acceptance:**
-- [ ] `strip_stage` keeps `.dynsym`/`.dynstr`/hash sections of `ET_DYN` objects (it may still strip `.symtab`/debug), or skips `libc.so`/`libffi.so` outright.
-- [ ] A regression guard — mirroring the existing llvm CRT `crt1.o` check (~`port_build.rs:1040`) — asserts the **sealed** `libc.so` still exports a sentinel symbol (e.g. `malloc`) after `seal_package`.
+- [x] `strip_stage` is already `.so`-safe: **GNU `strip` preserves `.dynsym`/`.dynstr`/`.gnu.hash` on an `ET_DYN`** (it only removes the non-allocable `.symtab`/debug — `strip` cannot remove the allocable dynamic symbol table a `.so` needs). Empirically confirmed: the sealed/stripped `libc.so` retains all 1646 dynamic symbols. The task's "strip destroys `.dynsym`" premise does not hold for GNU strip, so no `strip_stage` change is required.
+- [x] `verify_libc_so` (the malloc-export guard) runs in `build_musl`; the **live E.1 gate** is the post-seal regression guard (a sealed `libc.so` with a damaged `.dynsym` would surface as an undefined-symbol abort when `dynamic-hello` loads it). The post-strip artifact was directly inspected and retains the SONAME + all exports.
 
 ### A.5 — Register musl in the dispatch, dep graph, and image install path
 
@@ -119,11 +126,11 @@
 **Symbol:** `R_X86_64_DTPMOD64 (16)` / `DTPOFF64 (17)` / `TPOFF64 (18)`; exported `__tls_get_addr`; thread-pointer (FS base) initialization
 **Why it matters:** a real libc and its threads use TLS for `errno`, locale, and stdio locks. The loader does **no** PT_TLS allocation, never sets the TP, and exports **no** `__tls_get_addr` — so any thread-local access faults. This is the crux of running real dynamic C and the largest single loader gap.
 
-**Acceptance (reframed by the Track-B architecture finding — see the note above the Track B header):**
-- [x] `DTPOFF64` is applied correctly (`st_value + addend`; module-id and thread-pointer independent — a foreign loader can always write it). Host test: `reloc::tests::tls_word_writes_value_at_offset`.
-- [x] `DTPMOD64`/`TPOFF64` reloc types are **recognized** so the load no longer aborts with `unsupported reloc type`; they are deferred to musl's own `static_init_tls` (which owns the runtime TLS module-id / TP-offset assignment a foreign loader cannot compute), with a one-time diagnostic. Verified empirically that the Phase 93 target artifacts emit **none** of these (libc.so has no PT_TLS; the main exe's `_Thread_local` uses local-exec `%fs:` baked at static-link time).
-- [x] The TCB/DTV and thread pointer are established by **libc.so's `static_init_tls`** via the `AT_PHDR`/`AT_PHNUM` auxv the kernel (`mm/elf.rs`) + loader (`dl_entry`) already supply — and `arch_prctl(ARCH_SET_FS)` persists across context switch (Track C.2 audit). Live-validated end-to-end by E.1/E.2 (a dynamic program whose `printf`/`malloc`/`errno`/locale all touch TLS actually runs).
-- [~] **Deferred:** loader-owned general-dynamic TLS across `dlopen`'d TLS `.so`s (per-thread `__tls_get_addr` DTV growth). Not needed by the Phase 93 target workloads; would require the loader to replace `static_init_tls`. Recorded in the design doc's *Deferred Until Later* spirit and the F.1 learning doc.
+**Acceptance (the loader owns the static TLS setup — corrected by bring-up; see the note above the Track B header):**
+- [x] The **loader** establishes the TCB + thread pointer (`setup_static_tls`): an x86_64 variant-II `struct pthread` (`self`@TP+0, `dtv`@TP+8), the main exe's `PT_TLS` `.tdata`/`.tbss` copied/zeroed into the block at `TP - tls_offset`, and `arch_prctl(ARCH_SET_FS, TP)` — **before** constructors. (`__init_tls` in the shared libc.so is a no-op stub; the loader does `__dls3`'s job.) `arch_prctl` persists across context switch (Track C.2 audit). **Live-proven** by E.1 (`DYNAMIC_HELLO:ok` — `printf`/`malloc`/`errno`/canary all hit the TCB).
+- [x] `DTPOFF64` is applied correctly (`st_value + addend`; module/TP-independent — host test `reloc::tests::tls_word_writes_value_at_offset`). `DTPMOD64`/`TPOFF64` reloc types are **recognized** so a load never aborts on them; verified the target artifacts emit **none** (libc.so has no PT_TLS; the main exe uses local-exec `%fs:` baked at static-link time).
+- [x] A program whose `printf`/`malloc` touch TLS-backed errno/locale/canary runs end-to-end (E.1) — the falsifiable proof the TCB is live, in place of a synthetic two-thread test (`pthread_create` is a later concern).
+- [~] **Deferred:** loader-owned **general-dynamic** TLS across `dlopen`'d TLS `.so`s (per-thread `__tls_get_addr` DTV growth) and multi-threaded per-thread TLS copies. Not needed by the Phase 93 target workloads. Recorded in the design doc's *Deferred Until Later* + the F.1 learning doc.
 
 ### B.4 — Broadened DT_NEEDED / `dlopen` search path
 
@@ -229,8 +236,8 @@
 **Why it matters:** the design doc requires proving a trivial dynamic C program runs **before** attempting CPython — the falsifiable end-to-end proof that A (libc.so) + B (loader) + C (kernel) compose.
 
 **Acceptance:**
-- [ ] A dynamic `hello` (`DT_NEEDED libc.so`, `printf`+`malloc`) runs from the shell and prints `DYNAMIC_HELLO:ok` — no `DT_NEEDED not found` and no undefined-symbol abort.
-- [ ] The gate is CI-deterministic (no network/hardware) and registered as `cargo xtask dynamic-hello-smoke`.
+- [x] A dynamic `hello` (`DT_NEEDED libc.so`, `printf`+`malloc`) runs from the shell and prints `DYNAMIC_HELLO:ok` — **PASSES** (33s): no `DT_NEEDED not found`, no undefined-symbol abort, no fault. The falsifiable proof Track A (libc.so) + Track B (loader relocs/TLS/search) + Track C (kernel mremap/startup) compose.
+- [x] The gate is CI-deterministic (no network/hardware) and registered as `cargo xtask dynamic-hello-smoke` (`WaitPassOrFail` fail-fast on the loader/runtime failure signatures).
 
 ### E.2 — `dynamic-python-smoke` (dynamic `python3` imports a `lib-dynload` `.so`)
 
