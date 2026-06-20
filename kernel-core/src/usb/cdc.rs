@@ -54,6 +54,139 @@ pub const CDC_SUBTYPE_ETHERNET: u8 = 0x0F;
 pub const CDC_SUBTYPE_NCM: u8 = 0x1A;
 
 // ---------------------------------------------------------------------------
+// USB-Ethernet device-match registry (Phase 92e Track G.3)
+//
+// A USB-Ethernet `AttachNotice` is routed to exactly one driver: the
+// vendor-native `ure` (Realtek RTL815x register map) when the VID:PID matches a
+// known vendor part, or the class-compliant CDC driver (this crate) for a
+// standard CDC-ECM/NCM interface. Folding the two behind one registry is the
+// Phase 92e G.3 deliverable — a USB-Ethernet device selects its driver from one
+// table instead of two unrelated binaries racing to claim it.
+// ---------------------------------------------------------------------------
+
+/// USB vendor ID for Realtek USB peripherals (`0x0BDA`).
+///
+/// Distinct from the *PCI* Realtek vendor ID (`0x10EC`, see
+/// [`crate::nic_ids::VENDOR_REALTEK`]) — the USB-Ethernet dongles enumerate
+/// under the USB-IF vendor ID.
+pub const USB_VENDOR_REALTEK: u16 = 0x0BDA;
+
+/// Realtek USB-Ethernet product IDs served by the vendor-native `ure` driver
+/// (the RTL815x USB family). The `ure` binary itself is not yet on `main` (it
+/// lives on the Phase 96 `docs/96-bare-metal-usb-ethernet` branch); this table
+/// is the routing verdict the shared registry returns for it.
+pub const URE_PRODUCT_IDS: &[u16] = &[
+    0x8156, // RTL8156  — 2.5GbE
+    0x8157, // RTL8156B — 2.5GbE
+    0x8152, // RTL8152  — USB 2.0 10/100
+    0x8153, // RTL8153  — USB 3.0 1GbE
+];
+
+/// `bInterfaceClass` for the CDC Communications interface — the control
+/// interface that carries the CDC functional descriptors and the notification
+/// interrupt-IN endpoint (USB CDC spec Table 15).
+pub const CDC_COMM_CLASS: u8 = 0x02;
+
+/// `bInterfaceClass` for the CDC Data interface — carries the bulk IN/OUT pair
+/// over which Ethernet frames (ECM) or NTBs (NCM) move (USB CDC spec Table 18).
+pub const CDC_DATA_CLASS: u8 = 0x0A;
+
+/// `bInterfaceSubClass` of the CDC Communications interface for the Ethernet
+/// Networking Control Model (ECM, CDC spec Table 16).
+pub const CDC_SUBCLASS_ECM: u8 = 0x06;
+
+/// `bInterfaceSubClass` of the CDC Communications interface for the Network
+/// Control Model (NCM, NCM spec §3.1).
+pub const CDC_SUBCLASS_NCM: u8 = 0x0D;
+
+/// Vendor-native USB-Ethernet driver families — drivers with a device-specific
+/// register map rather than the class-compliant CDC datapath.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsbNetVendor {
+    /// Realtek RTL815x USB-Ethernet (the Phase 96 `ure` driver). The binary is
+    /// not on `main` yet, so this verdict is *routed-to* (logged by the
+    /// `usb-net` daemon) but the actual hand-off lands with the Phase 96 merge.
+    Realtek,
+}
+
+/// Which USB-Ethernet driver the shared registry selects for a device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsbNetDriver {
+    /// A vendor-native driver, matched by VID:PID (the native datapath; the
+    /// class-compliant interface on the same composite device is ignored).
+    Vendor(UsbNetVendor),
+    /// The class-compliant CDC driver. The ECM-vs-NCM variant is refined from
+    /// the configuration blob with [`refine_cdc_variant`].
+    Cdc,
+}
+
+/// The CDC data-model variant, refined from the configuration blob once a
+/// device has been classified as [`UsbNetDriver::Cdc`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CdcVariant {
+    /// Ethernet Control Model — one Ethernet frame per bulk transfer.
+    Ecm,
+    /// Network Control Model — multiple frames aggregated per NTB
+    /// ([`build_ntb16`] / [`parse_ntb16`]).
+    Ncm,
+}
+
+/// Select the driver for a USB-Ethernet device from the identifying fields a
+/// class driver already has on its `AttachNotice` — no `GetDescriptors`
+/// round-trip required.
+///
+/// Resolution order (vendor-native beats class-compliant: a composite RTL8156
+/// exposes BOTH a vendor-specific interface and a CDC/RNDIS one, but only the
+/// vendor datapath actually carries traffic, so the vendor match wins):
+///
+/// 1. **VID:PID** — a Realtek (`0x0BDA`) device whose product ID is in
+///    [`URE_PRODUCT_IDS`] routes to [`UsbNetVendor::Realtek`] (`ure`).
+/// 2. **Interface class** — a CDC Communications interface (`0x02`, subclass
+///    ECM `0x06` or NCM `0x0D`) or a CDC Data interface (`0x0A`) routes to
+///    [`UsbNetDriver::Cdc`].
+///
+/// Returns `None` for a device that is neither — the `usb-net` daemon ignores
+/// it (it is not a USB-Ethernet device, or uses an unsupported model such as
+/// RNDIS, which is deferred).
+pub fn match_usb_net_driver(
+    vendor_id: u16,
+    product_id: u16,
+    interface_class: u8,
+    interface_sub_class: u8,
+) -> Option<UsbNetDriver> {
+    // 1. Vendor-native match takes priority over the class match so a known
+    //    composite dongle is driven by its native datapath.
+    if vendor_id == USB_VENDOR_REALTEK && URE_PRODUCT_IDS.contains(&product_id) {
+        return Some(UsbNetDriver::Vendor(UsbNetVendor::Realtek));
+    }
+
+    // 2. Class-compliant CDC. A CDC Communications interface is only a
+    //    USB-Ethernet device for the ECM/NCM subclasses (ACM `0x02` is a serial
+    //    modem, not Ethernet); a CDC Data interface (`0x0A`) is unambiguous.
+    match interface_class {
+        CDC_COMM_CLASS
+            if interface_sub_class == CDC_SUBCLASS_ECM
+                || interface_sub_class == CDC_SUBCLASS_NCM =>
+        {
+            Some(UsbNetDriver::Cdc)
+        }
+        CDC_DATA_CLASS => Some(UsbNetDriver::Cdc),
+        _ => None,
+    }
+}
+
+/// Refine a [`UsbNetDriver::Cdc`] device into its [`CdcVariant`] from the full
+/// configuration blob: [`CdcVariant::Ncm`] if it advertises an NCM functional
+/// descriptor, otherwise [`CdcVariant::Ecm`].
+pub fn refine_cdc_variant(config: &[u8]) -> CdcVariant {
+    if has_ncm_functional_desc(config) {
+        CdcVariant::Ncm
+    } else {
+        CdcVariant::Ecm
+    }
+}
+
+// ---------------------------------------------------------------------------
 // NCM NTB-16 header signatures (NCM spec §3.2)
 // ---------------------------------------------------------------------------
 
@@ -835,5 +968,112 @@ mod tests {
     #[test]
     fn parse_ntb16_empty_slice_returns_none() {
         assert!(parse_ntb16(&[]).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // USB-Ethernet device-match registry tests (Phase 92e Track G.3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn match_realtek_rtl8156_routes_to_ure() {
+        // The headline G.3 case: a Realtek 0x0bda:0x8156 routes to the vendor
+        // `ure` driver even though its surfaced interface is vendor-specific.
+        assert_eq!(
+            match_usb_net_driver(USB_VENDOR_REALTEK, 0x8156, 0xFF, 0xFF),
+            Some(UsbNetDriver::Vendor(UsbNetVendor::Realtek)),
+            "RTL8156 must route to the vendor (ure) driver"
+        );
+    }
+
+    #[test]
+    fn match_realtek_family_pids_all_route_to_ure() {
+        for &pid in URE_PRODUCT_IDS {
+            assert_eq!(
+                match_usb_net_driver(USB_VENDOR_REALTEK, pid, 0xFF, 0x00),
+                Some(UsbNetDriver::Vendor(UsbNetVendor::Realtek)),
+                "Realtek PID {pid:#06x} must route to ure"
+            );
+        }
+    }
+
+    #[test]
+    fn match_realtek_vendor_wins_over_cdc_interface() {
+        // A composite RTL8156 exposing a CDC interface (class 0x0a) must still
+        // route to the vendor driver — the VID:PID match takes priority.
+        assert_eq!(
+            match_usb_net_driver(USB_VENDOR_REALTEK, 0x8156, CDC_DATA_CLASS, 0x00),
+            Some(UsbNetDriver::Vendor(UsbNetVendor::Realtek)),
+            "a known vendor device routes to ure regardless of interface class"
+        );
+    }
+
+    #[test]
+    fn match_cdc_ecm_comm_interface_routes_to_cdc() {
+        // A non-vendor CDC Communications interface, ECM subclass, routes to CDC.
+        assert_eq!(
+            match_usb_net_driver(0x1234, 0x5678, CDC_COMM_CLASS, CDC_SUBCLASS_ECM),
+            Some(UsbNetDriver::Cdc),
+            "CDC comms / ECM subclass must route to the CDC driver"
+        );
+    }
+
+    #[test]
+    fn match_cdc_ncm_comm_interface_routes_to_cdc() {
+        assert_eq!(
+            match_usb_net_driver(0x1234, 0x5678, CDC_COMM_CLASS, CDC_SUBCLASS_NCM),
+            Some(UsbNetDriver::Cdc),
+            "CDC comms / NCM subclass must route to the CDC driver"
+        );
+    }
+
+    #[test]
+    fn match_cdc_data_interface_routes_to_cdc() {
+        // The data interface (0x0a) is unambiguously a CDC data path.
+        assert_eq!(
+            match_usb_net_driver(0x1234, 0x5678, CDC_DATA_CLASS, 0x00),
+            Some(UsbNetDriver::Cdc),
+            "CDC data interface must route to the CDC driver"
+        );
+    }
+
+    #[test]
+    fn match_realtek_unknown_pid_falls_through_to_class() {
+        // A Realtek VID but a PID outside the ure family, presenting a CDC ECM
+        // interface, must fall through to the class match (not vendor).
+        assert_eq!(
+            match_usb_net_driver(USB_VENDOR_REALTEK, 0x9999, CDC_COMM_CLASS, CDC_SUBCLASS_ECM),
+            Some(UsbNetDriver::Cdc),
+            "an unknown Realtek PID with a CDC interface routes to CDC, not ure"
+        );
+    }
+
+    #[test]
+    fn match_non_ethernet_interfaces_return_none() {
+        // CDC ACM (serial modem, subclass 0x02) is not Ethernet.
+        assert_eq!(
+            match_usb_net_driver(0x1234, 0x5678, CDC_COMM_CLASS, 0x02),
+            None,
+            "CDC ACM (serial) is not a USB-Ethernet device"
+        );
+        // HID, mass storage, audio — none are USB-Ethernet.
+        assert_eq!(match_usb_net_driver(0x1234, 0x5678, 0x03, 0x01), None);
+        assert_eq!(match_usb_net_driver(0x1234, 0x5678, 0x08, 0x06), None);
+        assert_eq!(match_usb_net_driver(0x1234, 0x5678, 0x01, 0x01), None);
+    }
+
+    #[test]
+    fn refine_cdc_variant_picks_ncm_then_ecm() {
+        assert_eq!(
+            refine_cdc_variant(CDC_NCM_CONFIG_BLOB),
+            CdcVariant::Ncm,
+            "a blob with an NCM functional descriptor refines to NCM"
+        );
+        assert_eq!(
+            refine_cdc_variant(CDC_ECM_CONFIG_BLOB),
+            CdcVariant::Ecm,
+            "an ECM-only blob refines to ECM"
+        );
+        // An empty / non-CDC blob defaults to ECM (the simpler datapath).
+        assert_eq!(refine_cdc_variant(&[]), CdcVariant::Ecm);
     }
 }
