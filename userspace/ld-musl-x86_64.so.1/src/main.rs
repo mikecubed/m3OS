@@ -1788,8 +1788,9 @@ unsafe fn read_ld_bind_now(stack: *const u64) -> bool {
 /// `at_phdr` must point to the main executable's program-header table (the
 /// `AT_PHDR` auxv value) with `at_phnum` valid entries. For a `PT_TLS` segment
 /// the `p_filesz` bytes of the template at the computed runtime address are
-/// read; both must reference the mapped main-executable image.
-unsafe fn setup_static_tls(at_phdr: *const Phdr, at_phnum: usize) {
+/// read; both must reference the mapped main-executable image. `dsos` is the
+/// loaded-DSO scope used to resolve libc's `__init_tp`.
+unsafe fn setup_static_tls(at_phdr: *const Phdr, at_phnum: usize, dsos: &[LoadedDso]) {
     // sizeof(struct pthread) on x86_64 musl 1.2.5 is ~0xc0; reserve generously
     // so every field musl reads (self@0, dtv@8, canary@0x28, errno, locale)
     // lands in the zeroed TCB region.
@@ -1898,16 +1899,42 @@ unsafe fn setup_static_tls(at_phdr: *const Phdr, at_phnum: usize) {
         }
     }
 
-    // Initialize the musl `struct pthread` TCB: self at TP+0, dtv at TP+8.
+    // Set the DTV (TP+8) — the one field `__init_tp` does not touch (musl's
+    // `__copy_tls` sets it). `__init_tp` sets `self` (TP+0) itself.
     let tcb = tp as *mut u64;
     unsafe {
-        *tcb.add(0) = tp; // self
-        *tcb.add(1) = dtv; // dtv
+        *tcb.add(1) = dtv;
     }
 
-    // Install the thread pointer.
-    if sys_arch_prctl(ARCH_SET_FS, tp) < 0 {
-        serial(b"ldso: arch_prctl(ARCH_SET_FS) failed\n");
+    // Phase 93 — finish the TCB the way musl's `__dls3` does: call libc's
+    // `__init_tp(tp)`, which sets `self`, installs the thread pointer
+    // (`arch_prctl(ARCH_SET_FS)`), and populates the musl-internal `struct
+    // pthread` fields a real interpreter reads at startup (`locale` =
+    // `&libc.global_locale`, `tid`, `robust_list.head`, `detach_state`,
+    // `sysinfo`, `next`/`prev`). Resolving it needs the un-hidden `__init_tp`
+    // (musl patch 0002); libc is already relocated at this point so its globals
+    // are valid. Fall back to a minimal `self`+`arch_prctl` (enough for trivial
+    // programs) if `__init_tp` is not exported (an un-patched libc).
+    let init_tp = unsafe { sym::lookup(dsos, b"__init_tp", None) };
+    match init_tp {
+        Some(addr) if addr != 0 => {
+            // SAFETY: `__init_tp` is `int __init_tp(void *tcb)`; `tp` is the
+            // TCB we just laid out.
+            let f: extern "C" fn(u64) -> i32 =
+                unsafe { core::mem::transmute::<u64, extern "C" fn(u64) -> i32>(addr) };
+            if f(tp) < 0 {
+                serial(b"ldso: __init_tp failed\n");
+            }
+        }
+        _ => {
+            // Minimal fallback: self + thread pointer only.
+            unsafe {
+                *tcb.add(0) = tp;
+            }
+            if sys_arch_prctl(ARCH_SET_FS, tp) < 0 {
+                serial(b"ldso: arch_prctl(ARCH_SET_FS) failed\n");
+            }
+        }
     }
 }
 
@@ -2380,7 +2407,7 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
     // (which may touch errno / the stack canary). In the shared libc.so the
     // weak `static_init_tls` is a no-op stub, so this foreign loader must do
     // the `__dls3` TLS work itself.
-    unsafe { setup_static_tls(at_phdr, at_phnum) };
+    unsafe { setup_static_tls(at_phdr, at_phnum, dsos.as_slice()) };
 
     // -- Run constructors deepest-first -------------------------------------
     unsafe { run_constructors(&dsos) };
