@@ -431,6 +431,32 @@ pub unsafe extern "C" fn dlopen(path: *const c_char, flags: c_int) -> *mut c_voi
     // buffer.
     let loaded = match unsafe { runtime::load_dso_for_dl(&path_buf[..path_len]) } {
         Ok(d) => d,
+        Err(DlLoadError::NotFound) if name_bytes.first() != Some(&b'/') => {
+            // Phase 93 B.4 — a bare soname not found under `/usr/lib`;
+            // retry `/lib` (matching the DT_NEEDED search order) before
+            // giving up.
+            const ALT: &[u8] = b"/lib/";
+            let mut alt_buf = [0u8; 320];
+            if ALT.len() + name_bytes.len() + 1 > alt_buf.len() {
+                state.set_error(ERR_BAD_PATH);
+                return core::ptr::null_mut();
+            }
+            alt_buf[..ALT.len()].copy_from_slice(ALT);
+            alt_buf[ALT.len()..ALT.len() + name_bytes.len()].copy_from_slice(name_bytes);
+            alt_buf[ALT.len() + name_bytes.len()] = 0;
+            let alt_len = ALT.len() + name_bytes.len() + 1;
+            match unsafe { runtime::load_dso_for_dl(&alt_buf[..alt_len]) } {
+                Ok(d) => d,
+                Err(DlLoadError::NotFound) => {
+                    state.set_error(ERR_LIBRARY_NOT_FOUND);
+                    return core::ptr::null_mut();
+                }
+                Err(_) => {
+                    state.set_error(ERR_LOAD_FAILED);
+                    return core::ptr::null_mut();
+                }
+            }
+        }
         Err(DlLoadError::NotFound) => {
             state.set_error(ERR_LIBRARY_NOT_FOUND);
             return core::ptr::null_mut();

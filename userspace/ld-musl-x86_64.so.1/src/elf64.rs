@@ -112,9 +112,38 @@ pub const PT_PHDR: u32 = 6;
 
 pub const R_X86_64_NONE: u32 = 0;
 pub const R_X86_64_64: u32 = 1;
+/// `R_X86_64_COPY` (Phase 93 B.1) — copy `st_size` bytes of a data
+/// symbol from its defining DSO into the relocated image's BSS. Used
+/// when an executable copy-relocates a libc data object for legacy
+/// interposition.
+pub const R_X86_64_COPY: u32 = 5;
 pub const R_X86_64_GLOB_DAT: u32 = 6;
 pub const R_X86_64_JUMP_SLOT: u32 = 7;
 pub const R_X86_64_RELATIVE: u32 = 8;
+/// `R_X86_64_DTPMOD64` (Phase 93 B.3) — general-dynamic TLS module id.
+pub const R_X86_64_DTPMOD64: u32 = 16;
+/// `R_X86_64_DTPOFF64` (Phase 93 B.3) — general-dynamic TLS offset
+/// within the module's TLS block (`st_value + addend`; module-id and
+/// thread-pointer independent, so a foreign loader can always write it).
+pub const R_X86_64_DTPOFF64: u32 = 17;
+/// `R_X86_64_TPOFF64` (Phase 93 B.3) — initial-exec TLS offset relative
+/// to the thread pointer.
+pub const R_X86_64_TPOFF64: u32 = 18;
+/// `R_X86_64_IRELATIVE` (Phase 93 B.2) — IFUNC: the value at
+/// `load_bias + r_addend` is a resolver function; its return value is
+/// written into the relocated slot.
+pub const R_X86_64_IRELATIVE: u32 = 37;
+
+/// Symbol type `STT_GNU_IFUNC` — stored in the low nibble of `st_info`.
+/// A symbol of this type is resolved by *calling* it (it returns the
+/// real implementation address) rather than using its `st_value`.
+pub const STT_GNU_IFUNC: u8 = 10;
+
+/// Extract the symbol *type* (low nibble) from an `Elf64_Sym::st_info`.
+#[inline]
+pub const fn st_type(st_info: u8) -> u8 {
+    st_info & 0x0F
+}
 
 /// Extract the relocation type from `r_info`. The lower 32 bits of
 /// `r_info` are the type; the upper 32 are the symbol-table index.
