@@ -620,7 +620,7 @@ Each sub-phase below lists **every** open task ID it owns (so no item is orphane
 
 **Acceptance:**
 - [x] `kernel/Cargo.toml` version is `0.92.0`; the boot banner / `uname` / `/proc/version` report `0.92.0` (all read `env!("CARGO_PKG_VERSION")`, so the bump propagates with no other string edits).
-- [x] The AGENTS.md Project Overview line reads "kernel **v0.92.0**".
+- [x] The AGENTS.md Project Overview line reads the current kernel version (`v0.92.0` at the Phase 92 core; bumped to **`v0.92.5`** at the 92e close).
 - [x] The AGENTS.md USB capability bullet is rewritten to add the new device classes (live hot-plug, USB mass storage, the resident hub walker) under the existing USB bullet — per the maintenance policy. Tier-2/mount/isoch/CDC-ECM are noted as sub-phases 92a–92e.
 
 > **Sub-phase versioning.** The `0.92.0` bump lands **with the Phase 92 core** (this PR) to mark the milestone. Sub-phases **92a–92e land as `0.92.x` patch releases** (each bumps the patch when it merges); the `0.93.0` minor is the next *distinct* phase.
