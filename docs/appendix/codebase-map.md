@@ -173,6 +173,7 @@ Read the relevant doc before making significant changes to that subsystem.
 | `docs/12-posix-compatibility-layer.md` | Before adding syscalls or POSIX behavior |
 | `docs/16-network.md` | Before touching `kernel/src/net/` |
 | `docs/91-ipv6-dhcpv6.md` | Before touching `kernel/src/net/ipv6.rs`/`icmpv6.rs`/`ndp.rs`/`dhcpv6.rs` (and their `kernel-core` siblings) |
+| `docs/92-usb-class-expansion.md` | Before touching the USB class drivers (`userspace/drivers/usb-{storage,audio,video,net,hid}/`, `usbhub`), the xHCI host stack (`userspace/drivers/xhci/`), or their `kernel-core/src/usb/{cdc,hub,hid_report,mass_storage,uac,uvc}.rs` siblings |
 | `docs/19-signal-handlers.md` | Before touching signal delivery |
 | `docs/22-tty-terminal.md` | Before touching TTY/terminal subsystem |
 | `docs/25-smp.md` | Before touching SMP or multi-core code |

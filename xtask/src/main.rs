@@ -695,6 +695,9 @@ fn main() {
         Some("wifi-smoke") => {
             cmd_wifi_smoke();
         }
+        Some("usb-eth-smoke") => {
+            cmd_usb_eth_smoke();
+        }
         Some("device-smoke") => {
             let device_smoke_args = parse_device_smoke_args(&args[2..]).unwrap_or_else(|err| {
                 eprintln!("Error: {err}");
@@ -1557,6 +1560,9 @@ fn build_userspace_bins() {
         // Phase 92 Track D: ring-3 USB Mass Storage (BOT) class driver.
         // `needs_alloc = true` for kernel-core (mass_storage) + usb-core deps.
         ("usb_storage", "usb_storage", true),
+        // Phase 92e Track G: ring-3 USB-Ethernet (CDC-ECM/NCM) RemoteNic driver.
+        // `needs_alloc = true` for driver_runtime + kernel-core + usb-core deps.
+        ("usb_net", "usb_net", true),
         // Phase 92c Track E: ring-3 USB Audio Class (UAC) isochronous PCM-out
         // driver. `needs_alloc = true` for driver_runtime + kernel-core + usb-core.
         ("usb_audio", "usb_audio", true),
@@ -9711,6 +9717,44 @@ fn cmd_wifi_smoke() {
              math, 802.11 mgmt + RSN IE, association FSM, WPA2 PMK/PTK/MIC/GTK). \
              Set M3OS_WIFI_REGRESSION=1 to acknowledge hardware-only validation \
              via scripts/mt792x-vfio-validate.md."
+        );
+    }
+    // Skip-with-reason gates always exit success — the assertion is "the host
+    // tests passed", which `cargo xtask check` enforces separately.
+}
+
+/// Phase 92e Track G / I.3 — CDC-ECM/NCM USB-Ethernet acceptance gate.
+///
+/// QEMU ships **no** CDC-ECM/NCM device model (it emulates `usb-net` only as
+/// RNDIS, which this phase defers), so the live `usb-net` CDC datapath is
+/// bare-metal/VFIO-only. This is the established skip-with-reason pattern shared
+/// with `wifi-smoke` (no QEMU mt76 model). CI coverage is the host-tested
+/// `kernel_core::usb::cdc` logic — the device-match registry
+/// (`match_usb_net_driver` / `refine_cdc_variant`), the CDC functional-descriptor
+/// parse (`find_ethernet_functional_desc` / `has_ncm_functional_desc`), the
+/// NTB-16 framing round-trip (`build_ntb16` / `parse_ntb16`), and the ECM MAC
+/// string parse (`parse_ecm_mac`) — 38 tests, enforced by `cargo xtask check`,
+/// plus the `usb-net` crate compiling for `x86_64-m3os`.
+fn cmd_usb_eth_smoke() {
+    let opted_in = std::env::var("M3OS_USB_ETH_REGRESSION").is_ok();
+    if opted_in {
+        println!(
+            "usb-eth-smoke: CDC-ECM/NCM opted in via M3OS_USB_ETH_REGRESSION, but \
+             QEMU has no CDC-ECM/NCM device model — run on real hardware via VFIO \
+             passthrough with a CDC dongle. On the target expect: `usb-net: spawned`, \
+             `usb-net: bound CDC ECM|NCM slot=N`, `USB_NET:registered`, then \
+             `[remote_nic] … registered ring-3 NIC driver` as the kernel net stack \
+             binds the RemoteNic. The kernel_core::usb::cdc host tests are the CI \
+             coverage."
+        );
+    } else {
+        println!(
+            "usb-eth-smoke: SKIP — no QEMU CDC-ECM/NCM model exists; the live \
+             usb-net datapath is hardware-only. Coverage is the kernel_core::usb::cdc \
+             host tests (device-match registry, CDC functional-descriptor parse, \
+             NTB-16 framing, ECM MAC parse) + the usb-net crate compiling for \
+             x86_64-m3os. Set M3OS_USB_ETH_REGRESSION=1 to acknowledge hardware-only \
+             validation via VFIO passthrough with a CDC-ECM/NCM dongle."
         );
     }
     // Skip-with-reason gates always exit success — the assertion is "the host
@@ -22817,6 +22861,10 @@ fn populate_ext2_files(
     // Phase 92 Track D — ring-3 USB Mass Storage (BOT) class driver. Depends on
     // xhci_driver so it can look up the `usb` service the host controller registers.
     let usb_storage_conf = "name=usb_storage\ncommand=/drivers/usb-storage\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=xhci_driver\n";
+    // Phase 92e Track G — ring-3 USB-Ethernet (CDC-ECM/NCM) class driver. Depends
+    // on xhci_driver (for the `usb` service); registers `net.nic` only once it
+    // binds a CDC dongle, so it is inert (exits cleanly) on a machine with none.
+    let usb_net_conf = "name=usb_net\ncommand=/drivers/usb-net\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=xhci_driver\n";
     // Phase 92c Track E — ring-3 USB Audio Class (UAC) isochronous PCM-out
     // driver. Depends on xhci_driver (for the `usb` service); registers
     // `audio.hw` so audio_server binds it as the PCM sink on a USB-audio machine.
@@ -23221,6 +23269,7 @@ fn populate_ext2_files(
     let usbhub_conf_tmp = output_dir.join("_tmp_usbhub_conf");
     let usb_hid_conf_tmp = output_dir.join("_tmp_usb_hid_conf");
     let usb_storage_conf_tmp = output_dir.join("_tmp_usb_storage_conf");
+    let usb_net_conf_tmp = output_dir.join("_tmp_usb_net_conf");
     let usb_audio_conf_tmp = output_dir.join("_tmp_usb_audio_conf");
     let usb_video_conf_tmp = output_dir.join("_tmp_usb_video_conf");
     let camera_server_conf_tmp = output_dir.join("_tmp_camera_server_conf");
@@ -23288,6 +23337,7 @@ fn populate_ext2_files(
     fs::write(&usbhub_conf_tmp, usbhub_conf).expect("write temp usbhub.conf");
     fs::write(&usb_hid_conf_tmp, usb_hid_conf).expect("write temp usb-hid.conf");
     fs::write(&usb_storage_conf_tmp, usb_storage_conf).expect("write temp usb-storage.conf");
+    fs::write(&usb_net_conf_tmp, usb_net_conf).expect("write temp usb-net.conf");
     fs::write(&usb_audio_conf_tmp, usb_audio_conf).expect("write temp usb-audio.conf");
     fs::write(&usb_video_conf_tmp, usb_video_conf).expect("write temp usb-video.conf");
     fs::write(&camera_server_conf_tmp, camera_server_conf).expect("write temp camera_server.conf");
@@ -24130,6 +24180,10 @@ fn populate_ext2_files(
          sif etc/services.d/usb-storage.conf mode 0x81A4\n\
          sif etc/services.d/usb-storage.conf uid 0\n\
          sif etc/services.d/usb-storage.conf gid 0\n\
+         write \"{usb_net_conf}\" etc/services.d/usb-net.conf\n\
+         sif etc/services.d/usb-net.conf mode 0x81A4\n\
+         sif etc/services.d/usb-net.conf uid 0\n\
+         sif etc/services.d/usb-net.conf gid 0\n\
          write \"{usb_audio_conf}\" etc/services.d/usb-audio.conf\n\
          sif etc/services.d/usb-audio.conf mode 0x81A4\n\
          sif etc/services.d/usb-audio.conf uid 0\n\
@@ -24214,6 +24268,7 @@ fn populate_ext2_files(
         usbhub_conf = usbhub_conf_tmp.display(),
         usb_hid_conf = usb_hid_conf_tmp.display(),
         usb_storage_conf = usb_storage_conf_tmp.display(),
+        usb_net_conf = usb_net_conf_tmp.display(),
         usb_audio_conf = usb_audio_conf_tmp.display(),
         usb_video_conf = usb_video_conf_tmp.display(),
         camera_server_conf = camera_server_conf_tmp.display(),

@@ -85,6 +85,8 @@ members = [
     "userspace/drivers/usb-hid",
     # Phase 92 Track D — ring-3 USB Mass Storage (Bulk-Only Transport) class driver
     "userspace/drivers/usb-storage",
+    # Phase 92e Track G — ring-3 USB-Ethernet (CDC-ECM/NCM) RemoteNic class driver
+    "userspace/drivers/usb-net",
     # Phase 92c Track E — ring-3 USB Audio Class (UAC) isochronous PCM-out driver
     "userspace/drivers/usb-audio",
     # Phase 92c Track E.2 — ring-3 USB Video Class (UVC) frame-capture driver

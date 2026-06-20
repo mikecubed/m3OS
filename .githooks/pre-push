@@ -349,6 +349,12 @@ if [ "${M3OS_USB_REGRESSION:-0}" = "1" ]; then
     # into the shared Notification) and that a QMP mouse-move on xhci1 decodes.
     echo "pre-push: running cargo xtask usb-multi-controller-smoke..."
     cargo xtask usb-multi-controller-smoke --timeout 200
+    # Phase 92e — CDC-ECM/NCM USB-Ethernet. Skip-with-reason (QEMU has no CDC-ECM
+    # model); CI coverage is the kernel_core::usb::cdc host tests + the usb-net
+    # crate compiling. Set M3OS_USB_ETH_REGRESSION=1 to acknowledge hardware-only
+    # validation via VFIO passthrough with a CDC dongle.
+    echo "pre-push: running cargo xtask usb-eth-smoke..."
+    cargo xtask usb-eth-smoke
 fi
 
 # Phase 79 — opt-in modern-NIC regression gate. `multi-nic-smoke` boots QEMU

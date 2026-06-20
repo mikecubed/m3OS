@@ -186,6 +186,70 @@ pub fn refine_cdc_variant(config: &[u8]) -> CdcVariant {
     }
 }
 
+/// Build the `GET_DESCRIPTOR(String)` SETUP packet that reads the MAC-address
+/// string descriptor a CDC-ECM device points to via its
+/// [`EthernetFunctionalDesc::mac_string_index`].
+///
+/// The reply is a UTF-16LE string descriptor carrying the MAC as 12 ASCII hex
+/// characters; pass it to [`parse_ecm_mac`].
+///
+/// Wire layout (8 bytes, USB 2.0 §9.4.3):
+///
+/// | Offset | Value | Field |
+/// |--------|-------|-------|
+/// | 0 | `0x80` | bmRequestType: IN \| Standard \| Device |
+/// | 1 | `0x06` | bRequest: GET_DESCRIPTOR |
+/// | 2 | `index` | wValue lo: string descriptor index |
+/// | 3 | `0x03` | wValue hi: STRING descriptor type |
+/// | 4–5 | `0x0409` | wIndex: English (US) language ID |
+/// | 6–7 | `0x00FF` | wLength: 255 (max string descriptor) |
+pub const fn get_string_descriptor_setup(index: u8) -> [u8; 8] {
+    [
+        0x80,  // bmRequestType: device-to-host, standard, device
+        0x06,  // bRequest: GET_DESCRIPTOR
+        index, // wValue lo: string index
+        0x03,  // wValue hi: STRING descriptor type
+        0x09, 0x04, // wIndex: langid 0x0409 (English-US)
+        0xFF, 0x00, // wLength: 255
+    ]
+}
+
+/// Parse a 6-byte MAC address out of a USB String descriptor whose payload is
+/// the 12 ASCII hex characters CDC-ECM uses for `iMACAddress` (ECM spec §5.4).
+///
+/// The descriptor is `[bLength, bDescriptorType=0x03, <UTF-16LE chars…>]`; each
+/// of the 12 hex characters is one UTF-16 code unit (ASCII byte + `0x00`).
+///
+/// Returns `None` if the descriptor is too short, is not a String descriptor,
+/// contains a non-ASCII code unit, or contains a non-hex character.
+pub fn parse_ecm_mac(string_desc: &[u8]) -> Option<[u8; 6]> {
+    // 2-byte header + 12 UTF-16LE code units (24 bytes) for the hex MAC.
+    const STRING_DESC_TYPE: u8 = 0x03;
+    if string_desc.len() < 2 + 24 || string_desc[1] != STRING_DESC_TYPE {
+        return None;
+    }
+    let mut nibbles = [0u8; 12];
+    for (i, nib) in nibbles.iter_mut().enumerate() {
+        let lo = string_desc[2 + i * 2];
+        let hi = string_desc[2 + i * 2 + 1];
+        // The MAC string is pure ASCII hex, so the UTF-16 high byte is always 0.
+        if hi != 0 {
+            return None;
+        }
+        *nib = match lo {
+            b'0'..=b'9' => lo - b'0',
+            b'a'..=b'f' => lo - b'a' + 10,
+            b'A'..=b'F' => lo - b'A' + 10,
+            _ => return None,
+        };
+    }
+    let mut mac = [0u8; 6];
+    for (i, octet) in mac.iter_mut().enumerate() {
+        *octet = (nibbles[i * 2] << 4) | nibbles[i * 2 + 1];
+    }
+    Some(mac)
+}
+
 // ---------------------------------------------------------------------------
 // NCM NTB-16 header signatures (NCM spec §3.2)
 // ---------------------------------------------------------------------------
@@ -1059,6 +1123,71 @@ mod tests {
         assert_eq!(match_usb_net_driver(0x1234, 0x5678, 0x03, 0x01), None);
         assert_eq!(match_usb_net_driver(0x1234, 0x5678, 0x08, 0x06), None);
         assert_eq!(match_usb_net_driver(0x1234, 0x5678, 0x01, 0x01), None);
+    }
+
+    #[test]
+    fn get_string_descriptor_setup_encodes_index() {
+        let s = get_string_descriptor_setup(5);
+        assert_eq!(s, [0x80, 0x06, 0x05, 0x03, 0x09, 0x04, 0xFF, 0x00]);
+        // wValue hi must be the STRING descriptor type.
+        assert_eq!(s[3], 0x03);
+        // wLength = 255.
+        assert_eq!(u16::from_le_bytes([s[6], s[7]]), 255);
+    }
+
+    #[test]
+    fn parse_ecm_mac_decodes_hex_string_descriptor() {
+        // String descriptor: bLength=26, bType=0x03, then "001A2B3C4D5E" UTF-16LE.
+        let mut desc = alloc::vec![26u8, 0x03];
+        for ch in b"001A2B3C4D5E" {
+            desc.push(*ch);
+            desc.push(0x00);
+        }
+        assert_eq!(
+            parse_ecm_mac(&desc),
+            Some([0x00, 0x1A, 0x2B, 0x3C, 0x4D, 0x5E]),
+            "must decode the 12-hex-char MAC string into 6 octets"
+        );
+    }
+
+    #[test]
+    fn parse_ecm_mac_accepts_lowercase_hex() {
+        let mut desc = alloc::vec![26u8, 0x03];
+        for ch in b"aabbccddeeff" {
+            desc.push(*ch);
+            desc.push(0x00);
+        }
+        assert_eq!(
+            parse_ecm_mac(&desc),
+            Some([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF])
+        );
+    }
+
+    #[test]
+    fn parse_ecm_mac_rejects_malformed() {
+        // Too short.
+        assert!(parse_ecm_mac(&[26u8, 0x03, b'0', 0x00]).is_none());
+        // Wrong descriptor type.
+        let mut wrong_type = alloc::vec![26u8, 0x02];
+        for ch in b"001A2B3C4D5E" {
+            wrong_type.push(*ch);
+            wrong_type.push(0x00);
+        }
+        assert!(parse_ecm_mac(&wrong_type).is_none());
+        // Non-hex character.
+        let mut non_hex = alloc::vec![26u8, 0x03];
+        for ch in b"00ZZ2B3C4D5E" {
+            non_hex.push(*ch);
+            non_hex.push(0x00);
+        }
+        assert!(parse_ecm_mac(&non_hex).is_none());
+        // Non-ASCII UTF-16 code unit (high byte set).
+        let mut wide = alloc::vec![26u8, 0x03];
+        for ch in b"001A2B3C4D5E" {
+            wide.push(*ch);
+            wide.push(0x01);
+        }
+        assert!(parse_ecm_mac(&wide).is_none());
     }
 
     #[test]
