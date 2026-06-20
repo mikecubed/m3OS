@@ -21403,6 +21403,7 @@ fn build_dynamic_hello_fixture() -> Result<bool, String> {
     let c_src = r#"#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dlfcn.h>
 int main(void) {
     char *p = malloc(64);
     if (!p) { printf("DYNAMIC_HELLO:malloc-fail\n"); fflush(stdout); return 1; }
@@ -21410,6 +21411,16 @@ int main(void) {
     printf("DYNAMIC_HELLO:ok msg=%s len=%zu\n", p, strlen(p));
     fflush(stdout);
     free(p);
+    /* Phase 93 — dlopen/dlsym/call: the runtime mechanism ctypes + CPython's
+       lib-dynload use. The program's dlopen resolves to the m3OS loader's
+       dlopen (exported GLOBAL, ahead of libc in scope order); it dedups the
+       already-loaded libc.so and dlsym resolves a real libc function. */
+    void *h = dlopen("/usr/lib/libc.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!h) { printf("DLOPEN:fail-open\n"); fflush(stdout); return 1; }
+    size_t (*fn)(const char *) = (size_t (*)(const char *))dlsym(h, "strlen");
+    if (!fn) { printf("DLOPEN:fail-sym\n"); fflush(stdout); return 1; }
+    printf("DLOPEN:ok strlen=%zu\n", fn("abcd"));
+    fflush(stdout);
     return 0;
 }
 "#;
@@ -21565,11 +21576,21 @@ fn dynamic_hello_smoke_steps() -> Vec<SmokeStep> {
         input: "/usr/bin/dynamic-hello\n",
         label: "dynamic-hello-smoke: run dynamic binary",
     });
+    // First the basic dynamic-C proof (printf+malloc), which prints before the
+    // dlopen sequence — a clean intermediate checkpoint.
+    steps.push(SmokeStep::Wait {
+        pattern: "DYNAMIC_HELLO:ok",
+        timeout_secs: 45,
+        label: "dynamic-hello-smoke: DYNAMIC_HELLO:ok (printf+malloc)",
+    });
+    // Then the dlopen/dlsym/call proof — the runtime mechanism ctypes and
+    // CPython's lib-dynload depend on. `DLOPEN:ok` is the final sentinel, so it
+    // also proves the whole chain (TLS, COPY relocs, dlopen routing) completed.
     steps.push(SmokeStep::WaitPassOrFail {
-        pass_pattern: "DYNAMIC_HELLO:ok",
-        // Loader/runtime failures the chain could surface: a missing or
-        // oversized libc.so, an undefined symbol, an unsupported reloc, a TLS
-        // setup failure, or a fault.
+        pass_pattern: "DLOPEN:ok",
+        // Loader/runtime failures the chain could surface: a missing/oversized
+        // libc.so, an undefined symbol, an unsupported reloc, a TLS-setup
+        // failure, a dlopen/dlsym miss, or a fault.
         fail_prefixes: &[
             "ldso: DT_NEEDED not found",
             "ldso: undefined symbol",
@@ -21578,11 +21599,13 @@ fn dynamic_hello_smoke_steps() -> Vec<SmokeStep> {
             "ldso: TLS region mmap failed",
             "ldso: arch_prctl",
             "DYNAMIC_HELLO:malloc-fail",
+            "DLOPEN:fail-open",
+            "DLOPEN:fail-sym",
             "Segmentation fault",
             "ended by signal SIGSEGV",
         ],
         timeout_secs: 45,
-        label: "dynamic-hello-smoke: DYNAMIC_HELLO:ok",
+        label: "dynamic-hello-smoke: DLOPEN:ok (dlopen+dlsym+call)",
         exit_code_on_fail: SMOKE_EXIT_DYNAMIC_HELLO_FAILED,
     });
     steps

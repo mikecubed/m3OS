@@ -2234,7 +2234,48 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
         }
     }
 
-    // -- Apply relocations against the main binary --------------------------
+    // -- Apply relocations against each loaded DSO FIRST --------------------
+    // Phase 93: the DSO (libc) relocations must run BEFORE the main binary's,
+    // because the main binary's `R_X86_64_COPY` relocations copy *data* out of
+    // a provider DSO (e.g. libc's `stdout` FILE* pointer) into the executable's
+    // BSS — and the provider's RELATIVE relocs must already have rebased that
+    // data, or the copy captures an un-rebased low address that faults on first
+    // use (the standard ld.so "copy relocations apply last" rule).
+    // Slot 1 (when present) is the self-injected linker; its image
+    // was already self-relocated by `dl_relocate_self` and applying
+    // another reloc pass would double-process every entry. Skip it.
+    let n_dsos = dsos.len();
+    let linker_slot: Option<usize> = if at_base != 0 { Some(1) } else { None };
+    for i in 1..n_dsos {
+        if linker_slot == Some(i) {
+            continue;
+        }
+        let dso = dsos[i];
+        if let Some(rela) = dso.dyn_.rela {
+            let n = (dso.dyn_.relasz / 24) as usize;
+            let dsos_slice = dsos.as_slice();
+            if let Err(_e) =
+                unsafe { apply_rela(&dso, rela.as_ptr() as *const Rela, n, dsos_slice) }
+            {
+                serial(b"ldso: apply_rela on DSO failed\n");
+                return 0;
+            }
+        }
+        if let Some(jmprel) = dso.dyn_.jmprel {
+            let n = (dso.dyn_.pltrelsz / 24) as usize;
+            let dsos_slice = dsos.as_slice();
+            if let Err(_e) =
+                unsafe { apply_rela(&dso, jmprel.as_ptr() as *const Rela, n, dsos_slice) }
+            {
+                serial(b"ldso: apply_rela jmprel on DSO failed\n");
+                return 0;
+            }
+        }
+    }
+
+    // -- Apply relocations against the main binary LAST --------------------
+    // Now every DSO (libc) is fully relocated, so the main binary's
+    // `R_X86_64_COPY` relocations copy correctly-rebased provider data.
     if let Some(rela) = main_dyn_section.rela {
         let n = (main_dyn_section.relasz / 24) as usize;
         let dsos_slice = dsos.as_slice();
@@ -2267,39 +2308,6 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
             serial(e.as_bytes());
             serial(b"\n");
             return 0;
-        }
-    }
-
-    // -- Apply relocations against each loaded DSO --------------------------
-    // Slot 1 (when present) is the self-injected linker; its image
-    // was already self-relocated by `dl_relocate_self` and applying
-    // another reloc pass would double-process every entry. Skip it.
-    let n_dsos = dsos.len();
-    let linker_slot: Option<usize> = if at_base != 0 { Some(1) } else { None };
-    for i in 1..n_dsos {
-        if linker_slot == Some(i) {
-            continue;
-        }
-        let dso = dsos[i];
-        if let Some(rela) = dso.dyn_.rela {
-            let n = (dso.dyn_.relasz / 24) as usize;
-            let dsos_slice = dsos.as_slice();
-            if let Err(_e) =
-                unsafe { apply_rela(&dso, rela.as_ptr() as *const Rela, n, dsos_slice) }
-            {
-                serial(b"ldso: apply_rela on DSO failed\n");
-                return 0;
-            }
-        }
-        if let Some(jmprel) = dso.dyn_.jmprel {
-            let n = (dso.dyn_.pltrelsz / 24) as usize;
-            let dsos_slice = dsos.as_slice();
-            if let Err(_e) =
-                unsafe { apply_rela(&dso, jmprel.as_ptr() as *const Rela, n, dsos_slice) }
-            {
-                serial(b"ldso: apply_rela jmprel on DSO failed\n");
-                return 0;
-            }
         }
     }
 
