@@ -361,6 +361,14 @@ const SMOKE_EXIT_DYNAMIC_PYTHON_FAILED: i32 = 89;
 /// link-local address. Fails on any `:FAIL`/`IPV6_SMOKE:panic`.
 const SMOKE_EXIT_IPV6_SMOKE_FAILED: i32 = 88;
 
+/// Phase 94 — `cargo xtask coreutils-smoke` exit code. Builds the uutils
+/// `coreutils.m3pkg`, boots m3OS, `pkg install coreutils` (DEPS= empty), then
+/// runs a GNU-compatibility battery (ls/cp/mv/rm/wc/cat/sort/env/sha256sum),
+/// asserts `/usr/local/bin/ls` is a symlink (round-trip) shadowing the ramdisk
+/// floor by PATH precedence, and that `pkg remove coreutils` falls back cleanly.
+/// Skip-with-reason when the prebuilt-std musl Rust target is absent.
+const SMOKE_EXIT_COREUTILS_SMOKE_FAILED: i32 = 90;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
     Headless,
@@ -1062,6 +1070,21 @@ fn main() {
                 });
             cmd_python_smoke(&smoke_args);
         }
+        // Phase 94 — `cargo xtask coreutils-smoke` boots m3OS, installs the uutils
+        // `coreutils.m3pkg` from the bundled offline repo, and runs a
+        // GNU-compatibility battery proving the first Rust-cargo musl port runs +
+        // shadows the ramdisk floor by PATH precedence. Opt-in via
+        // `M3OS_COREUTILS_REGRESSION=1`; skip-with-reason when the musl target is
+        // absent.
+        Some("coreutils-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("coreutils-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_coreutils_smoke(&smoke_args);
+        }
         // Phase 93 E.1 — `cargo xtask dynamic-hello-smoke` boots m3OS and runs a
         // genuinely dynamically-linked C binary (PT_INTERP + DT_NEEDED libc.so).
         Some("dynamic-hello-smoke") => {
@@ -1457,7 +1480,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -22053,6 +22076,464 @@ fn python_smoke_steps() -> Vec<SmokeStep> {
     steps
 }
 
+/// Phase 94 Track D.1 — `cargo xtask coreutils-smoke`.
+///
+/// Builds the uutils `coreutils.m3pkg`, boots m3OS, `pkg install coreutils` from
+/// the bundled offline repo (DEPS= empty → no dependency chain), then runs a
+/// GNU-compatibility battery and the PATH-shadow / ramdisk-floor coexistence
+/// proof. Mirrors `cmd_python_smoke`; skips-with-reason when the prebuilt-std
+/// `x86_64-unknown-linux-musl` Rust target is absent (so the Track A/B/C/D fixes
+/// don't ride unverified on a toolchain-less CI, mirroring git-https/python).
+fn cmd_coreutils_smoke(args: &SmokeBootArgs) {
+    // Build the coreutils port so the `.m3pkg` exists for the data disk to bundle
+    // into `/usr/pkg/`. A warm pkgcache makes this a zero-compiler hit.
+    if let Err(msg) = port_build::build_coreutils_port() {
+        // SKIP (not FAIL) when the musl Rust target is unavailable — the build
+        // cannot even start without it. Mirrors git-https-smoke's
+        // "no musl cross-compiler" skip.
+        if msg.contains("target not installed") {
+            println!("coreutils-smoke: SKIP (reason: {msg})");
+            return;
+        }
+        eprintln!("coreutils-smoke: precondition failed (coreutils port build): {msg}");
+        std::process::exit(SMOKE_EXIT_COREUTILS_SMOKE_FAILED);
+    }
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    // Always rebuild the data disk so the freshly-bundled coreutils `.m3pkg` is
+    // present and the installed-package DB / /tmp working area start clean.
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false, // graphical_login — autologin / serial path
+    );
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, display_mode, DeviceSet::default());
+    // coreutils needs no network; drop the host-forward rule to avoid port
+    // conflicts when gates run back-to-back.
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    let steps = coreutils_smoke_steps();
+
+    println!(
+        "coreutils-smoke: launching QEMU (timeout {}s, {} steps)",
+        args.timeout_secs,
+        steps.len()
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!(
+                "coreutils-smoke: PASSED ({} steps in {elapsed}s)",
+                steps.len()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("coreutils-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_COREUTILS_SMOKE_FAILED);
+        }
+    }
+}
+
+fn coreutils_smoke_steps() -> Vec<SmokeStep> {
+    // SHA-256 of the exact bytes `/bin/echo coreutils-phase94` writes
+    // ("coreutils-phase94\n", 18 bytes). Both the installed uutils `sha256sum`
+    // and the ramdisk crypto-lib `/bin/sha256sum` must reproduce this 64-hex
+    // digest on the same file — the falsifiable proof their digests MATCH (D.1
+    // acceptance: compare the digest token, computed against a known constant
+    // rather than captured, since the serial DSL cannot capture-and-compare).
+    const SHA: &str = "5b21435f2a09bd58f8c6feda41d7d4886d897703c80e592dc73bcba73658e6bd";
+
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/coreutils-smoke: kernel first message",
+    }];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    // 1. Install coreutils from the bundled offline repo. DEPS= empty, so the
+    //    solver installs exactly one package (no "resolving … + dependencies"
+    //    line — that proof of an empty dep set is implicit). The ~13 MB `.m3pkg`
+    //    (one multicall binary + 106 symlinks) is read + SHA-verified + laid down
+    //    over the slow ring-3 VFS, hence the generous ceiling.
+    steps.push(SmokeStep::Send {
+        input: "pkg install coreutils\n",
+        label: "coreutils-smoke: pkg install coreutils",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "pkg install: coreutils: OK",
+        fail_prefixes: &["pkg install: cannot"],
+        timeout_secs: 600,
+        label: "coreutils-smoke: coreutils installed from .m3pkg (DEPS= empty)",
+        exit_code_on_fail: SMOKE_EXIT_COREUTILS_SMOKE_FAILED,
+    });
+
+    // 2. Runtime proof (explicit path): the static Rust musl multicall binary
+    //    runs via the Linux-compat layer. This is the cold first exec — the 13 MB
+    //    binary streams off the slow VFS — so the ceiling is the largest here.
+    steps.push(SmokeStep::Send {
+        input: "/usr/local/bin/coreutils --version\n",
+        label: "coreutils-smoke: coreutils --version (cold exec, runtime proof)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "coreutils 0.9.0 (multi-call binary)",
+        timeout_secs: 240,
+        label: "coreutils-smoke: uutils 0.9.0 multicall runs",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 30,
+        label: "coreutils-smoke: prompt after --version",
+    });
+
+    // 3. PATH-shadow proof: a BARE `ls` resolves to /usr/local/bin/ls (login sets
+    //    PATH=/usr/local/bin:… first), so it is the uutils applet, NOT the ramdisk
+    //    /bin/ls. m3OS has no `command -v`/`which`, so shadowing is proven by which
+    //    implementation's OUTPUT you get (`ls (uutils coreutils) …`).
+    steps.push(SmokeStep::Send {
+        input: "ls --version\n",
+        label: "coreutils-smoke: bare `ls --version` (PATH shadow)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "uutils coreutils",
+        timeout_secs: 120,
+        label: "coreutils-smoke: bare ls is uutils (shadows ramdisk /bin/ls)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 30,
+        label: "coreutils-smoke: prompt after bare ls --version",
+    });
+
+    // 4. Symlink round-trip proof: /usr/local/bin/ls is a SYMLINK to coreutils
+    //    (not a copy) — survived `pkg-format` pack→unpack at install.
+    steps.push(SmokeStep::Send {
+        input: "/usr/local/bin/ls -l /usr/local/bin/ls\n",
+        label: "coreutils-smoke: inspect /usr/local/bin/ls symlink",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "-> coreutils",
+        timeout_secs: 120,
+        label: "coreutils-smoke: ls is a symlink -> coreutils (round-trip)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 30,
+        label: "coreutils-smoke: prompt after symlink inspect",
+    });
+
+    // 5. `ls -la /` — directory listing battery item.
+    steps.push(SmokeStep::Send {
+        input: "ls -la /\n",
+        label: "coreutils-smoke: ls -la /",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "usr",
+        timeout_secs: 120,
+        label: "coreutils-smoke: ls -la / lists root entries",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 30,
+        label: "coreutils-smoke: prompt after ls -la",
+    });
+
+    // 6. cp / mv / rm a TREE (recursive), round-tripped through cat. `/bin/echo`
+    //    seeds the input (ramdisk); every cp/mkdir/mv/rm/cat below is a BARE
+    //    command → the installed uutils applet.
+    steps.extend(cmd_then_prompt(
+        "/bin/echo treedata > /tmp/cu_seed\n",
+        "coreutils-smoke: seed tree file",
+        "coreutils-smoke: prompt after seed",
+        30,
+    ));
+    steps.extend(cmd_then_prompt(
+        "mkdir -p /tmp/cutree/sub\n",
+        "coreutils-smoke: mkdir -p tree",
+        "coreutils-smoke: prompt after mkdir",
+        120,
+    ));
+    steps.extend(cmd_then_prompt(
+        "cp /tmp/cu_seed /tmp/cutree/sub/f\n",
+        "coreutils-smoke: cp file into tree",
+        "coreutils-smoke: prompt after cp",
+        120,
+    ));
+    steps.extend(cmd_then_prompt(
+        "cp -r /tmp/cutree /tmp/cutree2\n",
+        "coreutils-smoke: cp -r tree",
+        "coreutils-smoke: prompt after cp -r",
+        120,
+    ));
+    steps.push(SmokeStep::Send {
+        input: "cat /tmp/cutree2/sub/f\n",
+        label: "coreutils-smoke: cat recursively-copied file",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "treedata",
+        timeout_secs: 120,
+        label: "coreutils-smoke: cp -r round-trip (content intact)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 30,
+        label: "coreutils-smoke: prompt after cat copied",
+    });
+    steps.extend(cmd_then_prompt(
+        "mv /tmp/cutree2/sub/f /tmp/cutree2/sub/g\n",
+        "coreutils-smoke: mv within tree",
+        "coreutils-smoke: prompt after mv",
+        120,
+    ));
+    steps.push(SmokeStep::Send {
+        input: "cat /tmp/cutree2/sub/g\n",
+        label: "coreutils-smoke: cat moved file",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "treedata",
+        timeout_secs: 120,
+        label: "coreutils-smoke: mv round-trip (content intact)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 30,
+        label: "coreutils-smoke: prompt after cat moved",
+    });
+    steps.extend(cmd_then_prompt(
+        "rm -r /tmp/cutree /tmp/cutree2\n",
+        "coreutils-smoke: rm -r both trees",
+        "coreutils-smoke: prompt after rm -r",
+        120,
+    ));
+    steps.push(SmokeStep::Send {
+        input: "cat /tmp/cutree2/sub/g\n",
+        label: "coreutils-smoke: cat removed file (must fail)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "No such file",
+        timeout_secs: 120,
+        label: "coreutils-smoke: rm -r removed the tree",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 30,
+        label: "coreutils-smoke: prompt after cat removed",
+    });
+
+    // 7. wc -l on a known 3-line file.
+    steps.extend(cmd_then_prompt(
+        "/bin/echo l1 > /tmp/cu_wc\n",
+        "coreutils-smoke: wc fixture line 1",
+        "coreutils-smoke: prompt after wc line 1",
+        30,
+    ));
+    steps.extend(cmd_then_prompt(
+        "/bin/echo l2 >> /tmp/cu_wc\n",
+        "coreutils-smoke: wc fixture line 2",
+        "coreutils-smoke: prompt after wc line 2",
+        30,
+    ));
+    steps.extend(cmd_then_prompt(
+        "/bin/echo l3 >> /tmp/cu_wc\n",
+        "coreutils-smoke: wc fixture line 3",
+        "coreutils-smoke: prompt after wc line 3",
+        30,
+    ));
+    steps.push(SmokeStep::Send {
+        input: "wc -l /tmp/cu_wc\n",
+        label: "coreutils-smoke: wc -l",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "3 /tmp/cu_wc",
+        timeout_secs: 120,
+        label: "coreutils-smoke: wc -l counts 3 lines",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 30,
+        label: "coreutils-smoke: prompt after wc -l",
+    });
+
+    // 8. sort on a large input (50000 lines) to exercise the threaded/parallel
+    //    sort path — the de-risk for std-thread support (clone/futex/TLS). `seq`
+    //    (uutils) generates the input; `sort -rn | head -n 1` (both uutils) yields
+    //    the max, 50000.
+    steps.extend(cmd_then_prompt(
+        "seq 1 50000 > /tmp/cu_seq\n",
+        "coreutils-smoke: seq 1..50000 (large sort input)",
+        "coreutils-smoke: prompt after seq",
+        240,
+    ));
+    steps.push(SmokeStep::Send {
+        input: "sort -rn /tmp/cu_seq | head -n 1\n",
+        label: "coreutils-smoke: sort -rn (parallel path) | head",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "50000",
+        timeout_secs: 240,
+        label: "coreutils-smoke: sort largest line is 50000",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 30,
+        label: "coreutils-smoke: prompt after sort",
+    });
+
+    // 9. env — prints the environment; the login PATH leads with /usr/local/bin.
+    steps.push(SmokeStep::Send {
+        input: "env\n",
+        label: "coreutils-smoke: env",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "PATH=/usr/local/bin",
+        timeout_secs: 120,
+        label: "coreutils-smoke: env prints PATH (usr/local/bin first)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 30,
+        label: "coreutils-smoke: prompt after env",
+    });
+
+    // 10. sha256sum digest must MATCH the ramdisk crypto-lib /bin/sha256sum on the
+    //     same file. Each command is its own Send (which resets the serial buffer),
+    //     so the second wait genuinely checks the ramdisk output, not the cached
+    //     uutils one.
+    steps.extend(cmd_then_prompt(
+        "/bin/echo coreutils-phase94 > /tmp/cu_sha\n",
+        "coreutils-smoke: sha256 fixture",
+        "coreutils-smoke: prompt after sha fixture",
+        30,
+    ));
+    steps.push(SmokeStep::Send {
+        input: "/usr/local/bin/sha256sum /tmp/cu_sha\n",
+        label: "coreutils-smoke: uutils sha256sum",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: SHA,
+        timeout_secs: 120,
+        label: "coreutils-smoke: uutils sha256sum digest",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 30,
+        label: "coreutils-smoke: prompt after uutils sha256sum",
+    });
+    steps.push(SmokeStep::Send {
+        input: "/bin/sha256sum /tmp/cu_sha\n",
+        label: "coreutils-smoke: ramdisk crypto-lib sha256sum",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: SHA,
+        timeout_secs: 60,
+        label: "coreutils-smoke: ramdisk sha256sum digest MATCHES uutils",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 30,
+        label: "coreutils-smoke: prompt after ramdisk sha256sum",
+    });
+
+    // 11. Uninstall + ramdisk-floor fallback (C.3). `pkg remove` unlinks the
+    //     binary + all 106 applet symlinks, so /usr/local/bin/ls is gone — a BARE
+    //     `ls` necessarily falls back to the ramdisk /bin/ls, which still lists the
+    //     root and the shell still reaches a working prompt.
+    steps.push(SmokeStep::Send {
+        input: "pkg remove coreutils\n",
+        label: "coreutils-smoke: pkg remove coreutils",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "pkg remove: coreutils: removed",
+        timeout_secs: 120,
+        label: "coreutils-smoke: coreutils removed",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 30,
+        label: "coreutils-smoke: prompt after remove",
+    });
+    // The uutils binary is gone — proves the install was fully removed.
+    steps.push(SmokeStep::Send {
+        input: "/bin/cat /usr/local/bin/coreutils\n",
+        label: "coreutils-smoke: removed binary is gone",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "No such file",
+        timeout_secs: 60,
+        label: "coreutils-smoke: /usr/local/bin/coreutils no longer exists",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 30,
+        label: "coreutils-smoke: prompt after gone check",
+    });
+    // Bare `ls` still works → fell back to the ramdisk floor.
+    steps.push(SmokeStep::Send {
+        input: "ls /\n",
+        label: "coreutils-smoke: ramdisk ls fallback",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "usr",
+        timeout_secs: 60,
+        label: "coreutils-smoke: ramdisk /bin/ls still lists root (floor intact)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 30,
+        label: "coreutils-smoke: prompt after fallback ls",
+    });
+    // Final deterministic end marker.
+    steps.push(SmokeStep::Send {
+        input: "/bin/echo COREUTILS_SMOKE_DONE\n",
+        label: "coreutils-smoke: end marker",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "COREUTILS_SMOKE_DONE",
+        timeout_secs: 30,
+        label: "coreutils-smoke: done",
+    });
+
+    steps
+}
+
 /// Phase 85d — `cargo xtask clang-smoke`: cross-build the opt-in Clang/LLVM/LLD
 /// toolchain into its `.m3pkg`, build a fresh image with `M3OS_WITH_CLANG` (so it
 /// is bundled into the offline `/usr/pkg/` repo), boot m3OS, `pkg install clang`,
@@ -26009,8 +26490,23 @@ fn populate_phase_69d_ports(part_path: &Path, workspace_root: &Path) {
     // solver to resolve. The artifacts exist once build_git_port has built the chain (the
     // git-https-smoke gate does so first); on a routine image build where they
     // are absent this is a no-op, so nothing regresses.
-    const BUNDLE_ONLY_PORTS: &[&str] =
-        &["git", "python", "ca-certificates", "mbedtls", "curl", "go"];
+    // Phase 94 — coreutils (uutils) ships bundle-only like git/python: its
+    // `.m3pkg` + `.meta` land in the offline `/usr/pkg/` repo but it is NOT
+    // pre-installed at boot, so `coreutils-smoke` exercises the real
+    // `pkg install coreutils` path from a clean tree (and the ramdisk floor stays
+    // the only coreutils until then). DEPS= empty, so the solver pulls nothing
+    // else. The artifact only exists once the coreutils port has been built (the
+    // gate does so first); on a routine image build where it is absent this is a
+    // no-op, so nothing regresses.
+    const BUNDLE_ONLY_PORTS: &[&str] = &[
+        "git",
+        "python",
+        "ca-certificates",
+        "mbedtls",
+        "curl",
+        "go",
+        "coreutils",
+    ];
     for port in BUNDLE_ONLY_PORTS {
         let Ok(artifact) = port_build::pkgcache_artifact_path(port) else {
             continue;

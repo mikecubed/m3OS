@@ -772,6 +772,76 @@ mod tests {
         assert_eq!(m.entries.len(), 1);
         assert_eq!(m.entries[0].path, "file");
     }
+
+    /// Guards the Phase 94 uutils multicall symlink shape: a single `coreutils`
+    /// binary with multiple applet symlinks (e.g. `ls -> coreutils`,
+    /// `cat -> coreutils`) must round-trip through `pack` → `unpack` as genuine
+    /// symlinks, not file copies. Without this invariant, ~100 uutils applets
+    /// would be silently duplicated as independent file copies on install,
+    /// multiplying disk usage and breaking the multicall dispatch.
+    #[test]
+    fn usr_local_bin_applet_symlink_round_trips() {
+        let src = tempfile::tempdir().unwrap();
+        let bin = src.path().join("usr/local/bin");
+        fs::create_dir_all(&bin).unwrap();
+
+        // Stage the real binary (the multicall dispatcher).
+        let coreutils_content = b"#!/usr/local/bin/coreutils\n# multicall binary stub\n";
+        fs::write(bin.join("coreutils"), coreutils_content).unwrap();
+        fs::set_permissions(bin.join("coreutils"), fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Stage two applet symlinks pointing at the binary (relative targets).
+        std::os::unix::fs::symlink("coreutils", bin.join("ls")).unwrap();
+        std::os::unix::fs::symlink("coreutils", bin.join("cat")).unwrap();
+
+        // Pack and verify the artifact.
+        let bytes = pack(src.path()).unwrap();
+        assert!(verify(&bytes), "freshly packed multicall tree must verify");
+
+        // Unpack into a fresh destination.
+        let dst = tempfile::tempdir().unwrap();
+        let n = unpack(&bytes, dst.path()).unwrap();
+        assert_eq!(n, 3, "one binary + two applet symlinks");
+
+        let dst_bin = dst.path().join("usr/local/bin");
+
+        // The binary must be a regular file with identical content and mode 0o755.
+        let coreutils_out = fs::read(dst_bin.join("coreutils")).unwrap();
+        assert_eq!(
+            &coreutils_out, coreutils_content,
+            "binary content must be byte-identical"
+        );
+        let coreutils_mode = fs::metadata(dst_bin.join("coreutils"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(coreutils_mode, 0o755, "binary must retain mode 0o755");
+
+        // `ls` must be a symlink pointing at "coreutils", not a file copy.
+        let ls_meta = fs::symlink_metadata(dst_bin.join("ls")).unwrap();
+        assert!(
+            ls_meta.file_type().is_symlink(),
+            "ls must be a symlink after unpack, not a file copy"
+        );
+        assert_eq!(
+            fs::read_link(dst_bin.join("ls")).unwrap(),
+            std::path::PathBuf::from("coreutils"),
+            "ls symlink target must be 'coreutils'"
+        );
+
+        // `cat` must also be a symlink pointing at "coreutils".
+        let cat_meta = fs::symlink_metadata(dst_bin.join("cat")).unwrap();
+        assert!(
+            cat_meta.file_type().is_symlink(),
+            "cat must be a symlink after unpack, not a file copy"
+        );
+        assert_eq!(
+            fs::read_link(dst_bin.join("cat")).unwrap(),
+            std::path::PathBuf::from("coreutils"),
+            "cat symlink target must be 'coreutils'"
+        );
+    }
 }
 
 #[cfg(test)]
