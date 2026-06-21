@@ -558,6 +558,25 @@ if [ "${M3OS_PYTHON_REGRESSION:-0}" = "1" ]; then
     fi
 fi
 
+# Phase 94 — uutils coreutils regression gate. Gated behind
+# M3OS_COREUTILS_REGRESSION=1 because it cross-compiles uutils/coreutils (the
+# first Rust-cargo musl port) before booting QEMU and driving `pkg install
+# coreutils` + a GNU-compatibility battery (ls/cp/mv/rm/wc/cat/sort/env/
+# sha256sum), the symlink round-trip + PATH-shadow proof, and the
+# ramdisk-floor fallback after `pkg remove`. Far lighter than the git-https /
+# clang gates (one multicall binary + symlinks), hence --timeout 1800. The
+# gate skips-with-reason when the prebuilt-std x86_64-unknown-linux-musl Rust
+# target is absent. Set this on branches touching ports/util/coreutils,
+# xtask's build_uutils / coreutils bundling, rust-toolchain.toml, the `pkg`
+# installer, or the static-ELF/Linux-compat paths a Rust musl binary exercises.
+if [ "${M3OS_COREUTILS_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask coreutils-smoke..."
+    if ! cargo xtask coreutils-smoke --timeout 1800; then
+        echo "pre-push: cargo xtask coreutils-smoke failed" >&2
+        exit 1
+    fi
+fi
+
 # Phase 93 — Dynamic C Runtime regression gate. Gated behind
 # M3OS_DYNAMIC_C_REGRESSION=1. dynamic-hello-smoke is CI-deterministic (no
 # network/hardware): it builds the musl libc.so + a dynamic hello fixture and

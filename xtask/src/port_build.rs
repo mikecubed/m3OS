@@ -616,6 +616,23 @@ fn build_recipe_id(name: &str) -> &'static str {
              neuter=checksharedmods;prune=test,config-3.12,include,libpython.a,__pycache__;\
              keep=lib-dynload+loose-stdlib(no-freeze);recipe-v=1"
         }
+        // Phase 94 — uutils/coreutils, the first Rust-cargo port. The built
+        // artifact is the single `coreutils` multicall binary + per-applet
+        // symlinks (the tarball is the SOURCE, folded in via the Portfile
+        // SHA-256). This arm pins the cargo cross-build knob set + the curated
+        // feature umbrella + the staging shape so a recipe change self-invalidates
+        // the cached `.m3pkg`. The Rust toolchain identity folds in separately via
+        // `rust_toolchain_id()` in `compute_port_key_inner` (so a rustc bump
+        // auto-invalidates without a recipe-v bump). Bump recipe-v whenever
+        // `build_uutils`'s flags/features/staging change.
+        "coreutils" => {
+            "cargo-build:--release --target x86_64-unknown-linux-musl \
+             --no-default-features --features feat_os_unix_musl --locked;\
+             rustflags:-C relocation-model=static -C target-feature=+crt-static;\
+             features=feat_os_unix_musl(Tier1+require_unix_musl+hostid+utmpx;\
+             excludes selinux-chcon/runcon+external-libstdbuf);\
+             stage=/usr/local/bin/coreutils+per-applet-symlinks(from `coreutils --list`);recipe-v=1"
+        }
         _ => "",
     }
 }
@@ -663,6 +680,25 @@ pub fn go_toolchain_id() -> String {
         return "go-toolchain|unknown".to_string();
     }
     format!("go-toolchain|{version}|{sha}")
+}
+
+/// Phase 94 — identity of the Rust toolchain used to cross-build the `coreutils`
+/// port (the project's first Rust-cargo port). Folded into coreutils' content key
+/// (see `compute_port_key_inner`) so a `rustc` bump auto-invalidates the cached
+/// `.m3pkg`, and a musl-gcc change does NOT spuriously invalidate it: the
+/// self-contained Rust musl target (prebuilt std + bundled musl + `rust-lld`) is
+/// built entirely by `rustc`/`cargo`, never by the musl cross-gcc. Analogous to
+/// `go_toolchain_id()` (go/gh) and `host_cxx_toolchain_id()` (llvm/node).
+pub fn rust_toolchain_id() -> String {
+    let version = Command::new("rustc")
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("rust-toolchain|{version}|target=x86_64-unknown-linux-musl")
 }
 
 /// Identity of the HOST clang/clang++ used to cross-build the `llvm` port
@@ -1004,6 +1040,11 @@ fn compute_port_key_inner(
         // musl cross-compiler; fold the Go toolchain identity (not musl) so a Go
         // bump auto-invalidates and a musl change does not spuriously invalidate.
         "go" | "gh" => go_toolchain_id(),
+        // Phase 94 — coreutils is the first Rust-cargo port: built by rustc/cargo
+        // for the self-contained `x86_64-unknown-linux-musl` target, NOT the musl
+        // cross-gcc. Fold the rustc identity so a toolchain bump invalidates the
+        // cache and a musl-gcc change does not spuriously invalidate it.
+        "coreutils" => rust_toolchain_id(),
         _ => toolchain_id(),
     };
     let dep_keys: Vec<String> = port_deps(name)
@@ -1210,6 +1251,11 @@ pub const BUILDABLE_PORTS: &[&str] = &[
     // `build all`.
     "musl",
     "libffi",
+    // Phase 94 — uutils/coreutils, the first Rust-cargo port. Has a host build
+    // recipe (`build_uutils`), so `port list` reports RECIPE=yes and
+    // `port build all` builds it. DEPS= empty (pure Rust), so it has no ordering
+    // constraint.
+    "coreutils",
 ];
 
 /// A port's declared `DEPS=` (whitespace-separated), restricted to `within` —
@@ -1528,6 +1574,24 @@ fn port_build(name: &str) -> Result<(), String> {
         return Ok(());
     }
 
+    // Phase 94 — coreutils is the first Rust-cargo port: a pure-Rust crate
+    // cross-built for the SELF-CONTAINED `x86_64-unknown-linux-musl` Rust target
+    // (prebuilt std + bundled musl + rust-lld). It needs NO external
+    // x86_64-linux-musl-gcc, so it branches before the musl_toolchain()
+    // requirement below (like the go/gh/node/claude-code download-based ports).
+    // (The `build_musl_rust_bins` precedent, Phase 44, already proves a std Rust
+    // musl binary runs on m3OS.)
+    if name == "coreutils" {
+        build_uutils(&extracted, &stage, &port_dir)?;
+        seal_package(name, &stage, &key)?;
+        fs::write(&stamp, &fingerprint).map_err(|e| format!("write stamp: {e}"))?;
+        println!(
+            "ports: {name}-{version} build complete (staged at {})",
+            stage.display()
+        );
+        return Ok(());
+    }
+
     let toolchain = musl_toolchain().ok_or_else(|| {
         "no musl cross-compiler found on PATH (install musl-tools or \
                                                 musl-gcc-cross-bin)"
@@ -1713,6 +1777,170 @@ fn build_go(extracted: &Path, stage: &Path, port_dir: &Path) -> Result<(), Strin
 /// not use Node at all. The `yoga.wasm` TUI layout engine is embedded INSIDE
 /// `cli.js` (not a separate file as in the 1.x/2.0 bundles), so staging `cli.js`
 /// carries it; it still requires the Phase 90a JIT Node variant to instantiate.
+/// Phase 94 — cross-compile uutils/coreutils into a single static musl multicall
+/// binary plus per-applet symlinks. The project's FIRST Rust-cargo port.
+///
+/// `extracted` is the unpacked uutils source tree (carries `Cargo.lock` for the
+/// `--locked` build); `_port_dir` is `ports/util/coreutils` (no in-repo source —
+/// the artifact is built from the downloaded crate). Unlike every C port this
+/// uses NO musl cross-gcc: the `x86_64-unknown-linux-musl` Rust target is
+/// self-contained (prebuilt std + bundled musl + `rust-lld`), so a pure-Rust crate
+/// links fully static with `cargo` alone — the `build_musl_rust_bins` (Phase 44)
+/// precedent that de-risks this. Stages `/usr/local/bin/coreutils` + one relative
+/// symlink per enabled applet (derived from the binary's own `--list`, so the
+/// symlink set can never drift from the compiled feature set).
+fn build_uutils(extracted: &Path, stage: &Path, _port_dir: &Path) -> Result<(), String> {
+    const TARGET: &str = "x86_64-unknown-linux-musl";
+    // The curated applet feature set (task B.3). `feat_os_unix_musl` is uutils'
+    // musl unix umbrella:
+    //   feat_os_unix_musl = feat_Tier1 (feat_common_core + arch/hostname/nproc/
+    //       sync/uname/whoami) + feat_require_unix_musl (= feat_require_unix_core:
+    //       chgrp/chmod/chown/chroot/groups/id/install/kill/logname/mkfifo/mknod/
+    //       nice/nohup/stat/stty/timeout) + feat_require_unix_hostid (hostid)
+    //       + feat_require_unix_utmpx (pinky/uptime/users/who).
+    // It is the deterministic derivation task B.3 calls for: a comprehensive
+    // GNU-compatible set that ALREADY EXCLUDES, by construction, the two applet
+    // classes m3OS lacks the facilities for —
+    //   * SELinux chcon/runcon — only in feat_require_selinux, NOT pulled here;
+    //   * stdbuf — feat_require_unix_musl drops it (it needs an external
+    //     libstdbuf.so, impossible in a fully-static binary).
+    // It is a superset of every uutils-PROVIDED applet among the 63 hand-built
+    // `coreutils-rs` `[[bin]]`s (ls/cat/cp/mv/rm/mkdir/rmdir/wc/sort/env/
+    // sha256sum/touch/stat/ln/readlink/chmod/chown/tee/head/uniq/df/tr/tail/du/
+    // cut/echo/pwd/sleep/true/false/date/uptime/kill/hostname/who/install); the
+    // remaining hand-built names (grep/sed/find/diff/xargs/less/patch/file/
+    // strings/ps/...) are not GNU coreutils and are out of uutils' scope.
+    const FEATURES: &str = "feat_os_unix_musl";
+
+    // A.1 — probe the prebuilt-std musl target. Unlike the bare-metal
+    // `x86_64-unknown-none` target (built via `-Zbuild-std`), this one ships
+    // PREBUILT std (+ bundled musl + rust-lld), so `rustup target add` (or the
+    // `rust-toolchain.toml` `targets=` entry) materializes it. Abort with an
+    // actionable message if absent so `coreutils-smoke` SKIPs with reason —
+    // mirroring the `build_musl_rust_bins` check (xtask/src/main.rs:3435).
+    let target_installed = Command::new("rustup")
+        .args(["target", "list", "--installed"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(TARGET))
+        .unwrap_or(false);
+    if !target_installed {
+        return Err(format!(
+            "{TARGET} target not installed — run `rustup target add {TARGET}` \
+             (the Rust musl target ships prebuilt std + bundled musl + rust-lld, so a \
+             pure-Rust crate needs no external x86_64-linux-musl-gcc)"
+        ));
+    }
+
+    // Stable cargo target dir OUTSIDE `extracted`: extract_tarball() wipes the
+    // source tree on every run, so an in-tree `target/` would force a full
+    // recompile each time. A sibling scratch dir keeps re-runs incremental
+    // (mirrors the go/gh GOCACHE-outside-source pattern).
+    let root = workspace_root();
+    let cargo_target = root.join("target/port-build/coreutils-cargo-target");
+    fs::create_dir_all(&cargo_target).map_err(|e| format!("mkdir cargo target: {e}"))?;
+
+    println!(
+        "ports: coreutils — cross-building uutils for {TARGET} (release, static, \
+         --no-default-features --features {FEATURES} --locked)"
+    );
+    let mut cargo = Command::new(env!("CARGO"));
+    cargo
+        .current_dir(extracted)
+        .env("CARGO_TARGET_DIR", &cargo_target)
+        // Match the Phase 44 `build_musl_rust_bins` recipe exactly:
+        //   -C relocation-model=static  → a non-PIE **ET_EXEC** static binary
+        //     (NOT static-pie/ET_DYN), so the kernel's ELF loader does not
+        //     conflict with musl's self-relocating CRT startup — the proven path
+        //     for std-Rust-musl binaries on m3OS.
+        //   -C target-feature=+crt-static → fully static (musl embedded); pinned
+        //     explicitly so a toolchain default flip can't yield a dynamic binary
+        //     m3OS's loader (no real libc.so) can't run.
+        .env(
+            "RUSTFLAGS",
+            "-C relocation-model=static -C target-feature=+crt-static",
+        )
+        .args([
+            "build",
+            "--release",
+            "--target",
+            TARGET,
+            "--no-default-features",
+            "--features",
+            FEATURES,
+            "--locked",
+        ]);
+    // Defensive: if a transitive dependency compiles C via cc-rs, point it at the
+    // musl cross-gcc (harmless for a pure-Rust build). `feat_os_unix_musl` is pure
+    // Rust (selinux's cc/bindgen + stdbuf's cc are both excluded), so this is a
+    // belt-and-suspenders guard, not a requirement.
+    if let Some(cc) = crate::find_musl_cc() {
+        cargo.env("CC_x86_64_unknown_linux_musl", cc);
+    }
+    run(&mut cargo, "cargo build uutils coreutils")?;
+
+    let built = cargo_target.join(TARGET).join("release/coreutils");
+    if !built.is_file() {
+        return Err(format!(
+            "cargo build produced no coreutils binary at {}",
+            built.display()
+        ));
+    }
+    let unstripped = fs::metadata(&built).map(|m| m.len()).unwrap_or(0);
+
+    // Stage `/usr/local/bin/coreutils`.
+    let bindir = stage.join("usr/local/bin");
+    fs::create_dir_all(&bindir).map_err(|e| format!("mkdir {}: {e}", bindir.display()))?;
+    let dst_bin = bindir.join("coreutils");
+    fs::copy(&built, &dst_bin).map_err(|e| format!("copy coreutils: {e}"))?;
+
+    // Derive the enabled applet list FROM THE BINARY ITSELF (`coreutils --list`,
+    // one applet per row) so the symlink set is exactly what was compiled — it can
+    // never drift from `FEATURES`. The freshly cross-built artifact is a static
+    // musl x86_64 ELF, which runs on the x86_64-Linux host directly.
+    let list_out = Command::new(&dst_bin)
+        .arg("--list")
+        .output()
+        .map_err(|e| format!("run `coreutils --list`: {e}"))?;
+    if !list_out.status.success() {
+        return Err(format!(
+            "`coreutils --list` exited {} (stderr: {})",
+            list_out.status,
+            String::from_utf8_lossy(&list_out.stderr).trim()
+        ));
+    }
+    let applets: Vec<String> = String::from_utf8_lossy(&list_out.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty() && l != "coreutils")
+        .collect();
+    if applets.is_empty() {
+        return Err("`coreutils --list` produced no applets (empty feature set?)".to_string());
+    }
+
+    // One RELATIVE symlink per applet: `usr/local/bin/<applet> -> coreutils`.
+    // pkg-format round-trips these as symlinks (not copies), so ~100 applets cost
+    // one binary + tiny links, not ~100 copies (see pkg-format symlink test, A.3).
+    for applet in &applets {
+        let link = bindir.join(applet);
+        let _ = fs::remove_file(&link);
+        std::os::unix::fs::symlink("coreutils", &link)
+            .map_err(|e| format!("symlink {applet} -> coreutils: {e}"))?;
+    }
+
+    println!(
+        "ports: coreutils — staged /usr/local/bin/coreutils ({unstripped} bytes pre-strip) \
+         + {} applet symlinks: {}",
+        applets.len(),
+        {
+            let mut preview = applets.clone();
+            preview.sort();
+            preview.truncate(12);
+            format!("{}, …", preview.join(", "))
+        }
+    );
+    Ok(())
+}
+
 fn build_claude_code(extracted: &Path, stage: &Path, port_dir: &Path) -> Result<(), String> {
     // Function-local trait import so `Permissions::from_mode` is available for
     // chmod'ing the launcher + the vendored rg (npm tar perms / host umask vary).
@@ -2778,7 +3006,10 @@ fn build_tmux(
 /// install ~100 dashed `libexec/git-core/git-<builtin>` **hardlinks** to the
 /// main binary, and the `.m3pkg` packer ([`pkg_format::pack`]) stores file
 /// *content* per path with no inode/hardlink dedup — so those hardlinks would
-/// balloon the artifact by hundreds of MB. With this knob the dashed builtins
+/// balloon the artifact by hundreds of MB. (This concerns HARDLINK/inode dedup
+/// specifically; *symlinks* round-trip fine through `.m3pkg` — Phase 94's
+/// coreutils port stages ~100 applet symlinks to one binary for exactly this
+/// reason.) With this knob the dashed builtins
 /// are not installed at all; every smoke subcommand (`init`/`add`/`commit`/
 /// `log`/`diff`/`status`/`branch`/`merge`/`checkout`) is dispatched in-process
 /// by the single `git` binary, so nothing is lost. The curl-backed remote
@@ -3078,10 +3309,15 @@ fn build_machine_triple() -> String {
 /// Post-install the manpage is pruned and a second copy of `dbclient` is laid
 /// down as `/usr/bin/ssh`, so both the dropbear name (`dbclient -y/-i/-p`, used
 /// by the smoke) and the OpenSSH name (`ssh -T git@github.com`) resolve on PATH.
-/// A copy, not a symlink: the `.m3pkg` packer stores file *content* per path with
-/// no symlink/hardlink dedup, so a symlink would not round-trip. dbclient is a
-/// single-program build whose behaviour does not switch on argv[0], so the copy
-/// IS a working ssh client.
+/// A copy, not a symlink — but NOT because symlinks fail to round-trip: they do
+/// (the `.m3pkg` packer preserves `S_IFLNK` via `pkg_format::pack`/`unpack`, and
+/// Phase 94's coreutils port relies on exactly this for its ~100 applet symlinks,
+/// proven by the `pkg-format` symlink round-trip test). The real `.m3pkg`
+/// limitation is no *content* dedup: the packer stores file content per path, so a
+/// symlink to a multi-MB binary still costs only a tiny link, but two regular-file
+/// copies of a binary cost two full copies. dbclient is a single-program build
+/// whose behaviour does not switch on argv[0], so a plain copy is the simplest
+/// working ssh client; a symlink would also work and round-trip fine.
 fn build_dropbear(
     src: &Path,
     stage: &Path,
@@ -6424,6 +6660,19 @@ pub fn build_gh_port() -> Result<(), String> {
     port_build("gh").map_err(|e| format!("port gh: {e}"))
 }
 
+/// Phase 94 — build the uutils `coreutils` port (the first Rust-cargo port) into
+/// its `.m3pkg` artifact so the image populator can bundle it into `/usr/pkg/`
+/// (`coreutils` is in `BUNDLE_ONLY_PORTS`). Pure-Rust: cross-built with the
+/// self-contained `x86_64-unknown-linux-musl` Rust target, so it needs NO musl
+/// cross-gcc (it branches before the `musl_toolchain()` requirement in
+/// `port_build`). DEPS= empty. The `coreutils-smoke` gate drives this; a warm
+/// pkgcache makes a repeat build a zero-compiler hit. If the prebuilt-std musl
+/// target is absent, `build_uutils` returns an actionable "target not installed"
+/// error so the gate SKIPs.
+pub fn build_coreutils_port() -> Result<(), String> {
+    port_build("coreutils").map_err(|e| format!("port coreutils: {e}"))
+}
+
 /// Phase 85d — build the Clang/LLVM/LLD toolchain into its `.m3pkg`. Separate
 /// from the routine ports (it is the heaviest artifact, multi-GB-RAM / multi-hour
 /// on a cold cache) so only the opt-in image feature + the `clang-smoke` gate +
@@ -6795,6 +7044,7 @@ mod tests {
             "gh",
             "node",
             "claude-code",
+            "coreutils",
         ];
         let ids: Vec<&str> = ports.iter().map(|p| build_recipe_id(p)).collect();
         for (p, id) in ports.iter().zip(&ids) {

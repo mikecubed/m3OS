@@ -1,6 +1,6 @@
 # Phase 94 - Rust-Cargo Ports & uutils Coreutils
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-94
 **Depends on:** Phase 12 ✅ (Linux-syscall compat), Phase 40 ✅ (threading/futex/TLS), Phase 44 ✅ (Rust cross-compilation lineage), Phase 85a ✅ (`.m3pkg` package & build-cache substrate)
 **Builds on:** Establishes the project's **first Rust-cargo cross-compiled port class** on top of the Phase 85a `.m3pkg` substrate and the Phase 12 Linux-syscall compatibility layer. Reuses the Phase 44 "Rust runs in the OS" lineage but targets `x86_64-unknown-linux-musl` (std) rather than the bare-metal `x86_64-unknown-none` target the kernel and the hand-built userspace use. Does **not** replace the hand-built `coreutils-rs`; it shadows it via PATH precedence.
@@ -56,7 +56,7 @@ The curated feature set is **derived deterministically**, not guessed: start fro
 
 ### Linux-syscall compat layer + static-ELF loader (existing, relied upon)
 
-uutils runs through the same path as `git`/`python`: musl libc issues Linux syscalls, `syscall_entry` marshals them to `syscall_handler`, and the static-ELF loader maps the binary. The syscalls uutils exercises are already implemented: `openat`/`read`/`write`/`getdents64`/`newfstatat`/`statfs`/`readlinkat`/`symlinkat`/`fchmodat`/`utimensat`/`getrandom`, plus `clone`/`futex`/`set_tid_address` for any threaded applet (Phase 40 + the Phase 77 futex `CHILD_CLEARTID` lost-wakeup fix; Python's threads already exercise this).
+uutils runs through the same path as `git`/`python`: musl libc issues Linux syscalls, `syscall_entry` marshals them to `syscall_handler`, and the static-ELF loader maps the binary. Most syscalls uutils exercises were already implemented: `openat`/`read`/`write`/`getdents64`/`newfstatat`/`statfs`/`readlinkat`/`symlinkat`/`utimensat`/`getrandom`, plus `clone`/`futex`/`set_tid_address` for any threaded applet (Phase 40 + the Phase 77 futex `CHILD_CLEARTID` lost-wakeup fix; Python's threads already exercise this). The exception is the fd-relative metadata `*at` family that uutils' `uucore::safe_traversal` issues for recursive ops (`unlinkat`/`fchmodat`/`fchmodat2`/`fchownat`/`mkdirat`) — these were *not* present (m3OS had `openat`/`newfstatat` dirfds but not the metadata `*at` set) and are the phase's one kernel change (see *Acceptance Criteria* + the learning doc's syscall table; patch bump `0.94.1`).
 
 ### PATH precedence (existing, relied upon)
 
@@ -99,7 +99,7 @@ The shell searches `/usr/local/bin` first. No shell change is needed; installing
 - A behavior battery passes with GNU-compatible output: `ls -la /`, `cp`/`mv`/`rm` a file tree, `wc -l`, `cat`, `sort` (including an input large enough to trigger any parallel path), `env`, and `sha256sum` whose 64-hex-digit **digest field** matches the existing `crypto-lib`-based `/bin/sha256sum` on the same input (compare the digest token, not the whole line, since GNU- vs hand-built output framing may differ).
 - `coreutils-smoke` PASSES end-to-end in CI under `M3OS_COREUTILS_REGRESSION=1` (skip-with-reason when the musl/cargo toolchain is absent, mirroring `git-https-smoke`).
 - The ramdisk `coreutils-rs` set is unchanged and the OS still boots and reaches a login prompt with `coreutils` **not** installed.
-- The kernel reports `0.94.0` (`kernel/Cargo.toml` `version` + the `AGENTS.md` line), and the Phase 94 learning doc (`docs/94-rust-cargo-uutils.md`) ships, linked from `docs/README.md` and `docs/appendix/codebase-map.md`.
+- The kernel reports `0.94.1` (`kernel/Cargo.toml` `version` + the `AGENTS.md` line) — the standard minor bump `0.93.0`→`0.94.0` plus a patch bump to `0.94.1` for the fd-relative `*at` syscall gaps surfaced during bring-up (the anticipated patch-bump case from the Implementation Outline), and the Phase 94 learning doc (`docs/94-rust-cargo-uutils.md`) ships, linked from `docs/README.md` and `docs/appendix/codebase-map.md`.
 
 ## Companion Task List
 
@@ -118,3 +118,4 @@ The shell searches `/usr/local/bin` first. No shell change is needed; installing
 - **SELinux / locale-heavy applets.** `chcon`/`runcon` and any applet depending on facilities m3OS lacks are excluded from the feature set, not stubbed.
 - **`stat`/inode-identity rigor.** uutils is stricter about `(st_dev, st_ino)` than the hand-built tools (e.g. `ls -i`, hardlink detection in `du`/`cp`), so it may surface the VFS `st_ino` inconsistency that **Phase 88** addresses; full correctness there rides on Phase 88.
 - **`findutils`/`diffutils`/other uutils projects.** Only `uutils/coreutils` is in scope; the Rust-cargo port class this phase establishes makes them straightforward follow-ons.
+- **Rust-cargo ports with C FFI.** A future Rust crate that pulls a `cc`-built C dependency re-enters the `find_musl_cc()`/stub-archive plumbing — out of scope here (uutils' `feat_os_unix_musl` set is pure Rust).

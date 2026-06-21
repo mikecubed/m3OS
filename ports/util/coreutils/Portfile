@@ -1,0 +1,38 @@
+NAME=coreutils
+VERSION=0.9.0
+DESCRIPTION="uutils coreutils — GNU-compatible coreutils in Rust (static musl multicall binary + applet symlinks)"
+CATEGORY=util
+DEPS=
+URL=https://github.com/uutils/coreutils/archive/refs/tags/0.9.0.tar.gz
+SHA256=dafe0126ee4ed55c7cd60c6b559f43724a74751deed3c1b078f4f510311acab2
+MAINTAINER=m3os
+
+# Phase 94 — the project's FIRST Rust-cargo cross-compiled port. Unlike every
+# other port (autotools/cmake/make C/C++ via the musl cross-gcc), coreutils is a
+# pure-Rust crate built by `build_uutils` (xtask/src/port_build.rs) with:
+#
+#   cargo build --release --target x86_64-unknown-linux-musl \
+#       --no-default-features --features feat_os_unix_musl --locked
+#
+# The Rust musl target is SELF-CONTAINED (bundles its own musl + uses rust-lld),
+# so a pure-Rust crate needs NO external x86_64-linux-musl-gcc — it sidesteps the
+# find_musl_cc/musl_extra_ldflags plumbing the C ports require (precedent:
+# build_musl_rust_bins, Phase 44). `build_uutils` therefore dispatches through the
+# go/gh-style early-return branch in `fn port_build`, before the musl_toolchain()
+# requirement.
+#
+# DEPS= is empty: the curated feature set (`feat_os_unix_musl`) is pure Rust, so
+# the in-OS solver pulls nothing else — the simplest possible package, contrasting
+# with the zlib -> mbedtls -> ... -> git chain.
+#
+# The single static `coreutils` multicall binary installs to /usr/local/bin with
+# one per-applet symlink (`ls -> coreutils`, ...), where it SHADOWS the hand-built
+# ramdisk `coreutils-rs` set by PATH precedence (/usr/local/bin is first in the
+# shell PATH). The ramdisk floor is NOT removed — it is the only coreutils before
+# the data disk mounts and the fallback after `pkg remove coreutils`.
+#
+# URL note: uutils' GitHub releases ship only PREBUILT per-target binaries (a
+# `coreutils-0.9.0-x86_64-unknown-linux-musl.tar.gz`), no source asset — using
+# that would defeat the entire point of establishing the cargo build path, so the
+# pinned URL is the GitHub auto-generated SOURCE tarball (it carries Cargo.lock for
+# the `--locked` build; SHA-256 verified deterministic across re-downloads).

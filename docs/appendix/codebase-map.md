@@ -174,6 +174,8 @@ Read the relevant doc before making significant changes to that subsystem.
 | `docs/16-network.md` | Before touching `kernel/src/net/` |
 | `docs/91-ipv6-dhcpv6.md` | Before touching `kernel/src/net/ipv6.rs`/`icmpv6.rs`/`ndp.rs`/`dhcpv6.rs` (and their `kernel-core` siblings) |
 | `docs/92-usb-class-expansion.md` | Before touching the USB class drivers (`userspace/drivers/usb-{storage,audio,video,net,hid}/`, `usbhub`), the xHCI host stack (`userspace/drivers/xhci/`), or their `kernel-core/src/usb/{cdc,hub,hid_report,mass_storage,uac,uvc}.rs` siblings |
+| `docs/93-dynamic-c-runtime.md` | Before touching `userspace/ld-musl-x86_64.so.1/` (the Rust loader), `ports/lib/musl/` (the companion `libc.so`), `ports/lib/libffi/`, `ports/lang/python-dynamic/`, or the kernel `mremap`/`arch_prctl` paths a dynamic libc exercises |
+| `docs/94-rust-cargo-uutils.md` | Before touching `build_uutils` in `xtask/src/port_build.rs`, the `ports/util/coreutils/Portfile`, the `x86_64-unknown-linux-musl` Rust musl port class, or the `pkg-format` symlink round-trip |
 | `docs/19-signal-handlers.md` | Before touching signal delivery |
 | `docs/22-tty-terminal.md` | Before touching TTY/terminal subsystem |
 | `docs/25-smp.md` | Before touching SMP or multi-core code |

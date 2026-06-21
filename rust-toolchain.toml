@@ -1,3 +1,11 @@
 [toolchain]
 channel = "nightly"
 components = ["rustfmt", "clippy", "rust-src"]
+# Phase 94 — the Rust-cargo musl port class (`build_uutils`) cross-compiles std
+# Rust for `x86_64-unknown-linux-musl`. Unlike the bare-metal `x86_64-unknown-none`
+# default target (built via `-Zbuild-std` against `rust-src`), the musl target ships
+# PREBUILT std, so it is installed declaratively here — `rustup` materializes it for
+# the pinned nightly. This is the same self-contained target `build_musl_rust_bins`
+# (Phase 44) already uses; pinning it makes the port build reproducible without a
+# manual `rustup target add`.
+targets = ["x86_64-unknown-linux-musl"]
