@@ -2312,12 +2312,50 @@ fn build_musl(
 /// (a damaged dynamic symbol table surfaces as an undefined-symbol abort there).
 fn verify_libc_so(path: &Path) -> Result<(), String> {
     let readelf = which_readelf();
+
+    // ELF type must be DYN (shared object) via `readelf -hW`. A build gate must
+    // fail closed: a non-zero readelf exit (missing tool, corrupted ELF) is a
+    // hard error, not a silently-empty parse.
+    let hdr_out = Command::new(&readelf)
+        .args(["-hW"])
+        .arg(path)
+        .output()
+        .map_err(|e| format!("readelf -h {}: {e}", path.display()))?;
+    if !hdr_out.status.success() {
+        return Err(format!(
+            "readelf -h {} failed ({}): {}",
+            path.display(),
+            hdr_out.status,
+            String::from_utf8_lossy(&hdr_out.stderr).trim(),
+        ));
+    }
+    let hdr_text = String::from_utf8_lossy(&hdr_out.stdout);
+    // The `Type:` line reads e.g. "Type:  DYN (Shared object file)".
+    let is_dyn = hdr_text
+        .lines()
+        .find(|l| l.trim_start().starts_with("Type:"))
+        .is_some_and(|l| l.contains("DYN"));
+    if !is_dyn {
+        return Err(format!(
+            "libc.so at {} is not ET_DYN (a shared object); readelf -h Type line did not report DYN",
+            path.display()
+        ));
+    }
+
     // SONAME + NEEDED via `readelf -dW`.
     let dyn_out = Command::new(&readelf)
         .args(["-dW"])
         .arg(path)
         .output()
         .map_err(|e| format!("readelf -d {}: {e}", path.display()))?;
+    if !dyn_out.status.success() {
+        return Err(format!(
+            "readelf -d {} failed ({}): {}",
+            path.display(),
+            dyn_out.status,
+            String::from_utf8_lossy(&dyn_out.stderr).trim(),
+        ));
+    }
     let dyn_text = String::from_utf8_lossy(&dyn_out.stdout);
     if !dyn_text.contains("SONAME") || !dyn_text.contains("libc.so") {
         return Err(format!(
@@ -2337,6 +2375,14 @@ fn verify_libc_so(path: &Path) -> Result<(), String> {
         .arg(path)
         .output()
         .map_err(|e| format!("readelf --dyn-syms {}: {e}", path.display()))?;
+    if !sym_out.status.success() {
+        return Err(format!(
+            "readelf --dyn-syms {} failed ({}): {}",
+            path.display(),
+            sym_out.status,
+            String::from_utf8_lossy(&sym_out.stderr).trim(),
+        ));
+    }
     let sym_text = String::from_utf8_lossy(&sym_out.stdout);
     let exports_malloc = sym_text
         .lines()

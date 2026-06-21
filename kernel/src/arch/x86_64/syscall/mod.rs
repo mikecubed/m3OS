@@ -12208,7 +12208,7 @@ pub(super) fn sys_mremap(old_addr: u64, old_size: u64, new_size: u64, flags: u64
     // --- C.1 step 2: locate the covering VMA ---
     //
     // We need:
-    //  (a) old_addr is inside a VMA.
+    //  (a) old_addr is the START of an existing VMA.
     //  (b) The VMA fully covers [old_addr, old_addr + old_size_aligned).
     //  (c) The VMA is anonymous (file_backing.is_none()) — file-backed mremap
     //      would need write-back coherence beyond Phase 93 scope; reject it.
@@ -12216,6 +12216,15 @@ pub(super) fn sys_mremap(old_addr: u64, old_size: u64, new_size: u64, flags: u64
     // Capture VMA metadata before the mutable borrow below.
     let vma_info = crate::process::with_shared_mm_mut(pid, |_b, _m, vma_tree| {
         vma_tree.find_containing(old_addr).and_then(|vma| {
+            // Linux mremap requires old_addr be the start of an existing
+            // mapping. Our grow-in-place path keys on `vma_tree.remove(old_addr)`
+            // and the MAYMOVE/shrink paths assume the located VMA begins at
+            // old_addr; if old_addr pointed into the middle of a mapping,
+            // `remove(old_addr)` would be a no-op and we could insert an
+            // overlapping VMA, corrupting the VMA tree. Reject EINVAL.
+            if vma.start != old_addr {
+                return None;
+            }
             // The VMA must fully cover the old range.
             let vma_end = vma.start.saturating_add(vma.len);
             if vma_end < old_addr.saturating_add(old_size_aligned) {
@@ -12626,7 +12635,25 @@ pub(super) fn sys_mremap(old_addr: u64, old_size: u64, new_size: u64, flags: u64
     });
 
     // Unmap the old range (frees old frames, removes old VMA, TLB shootdown).
-    let _ = sys_linux_munmap(old_addr, old_size_aligned);
+    //
+    // This munmap cannot legitimately fail here: old_addr/old_size_aligned were
+    // already validated as page-aligned, non-zero, in-range, and non-overflowing
+    // at the top of this function — the only conditions under which
+    // sys_linux_munmap returns an error. The new region lives at a fresh
+    // bump-allocated `new_base` that is disjoint from old_addr, so a failure
+    // could never produce an *overlap* — only a leak of the old mapping. We
+    // still surface a non-zero return rather than silently dropping it: a leak
+    // here would be a kernel-invariant violation worth logging.
+    let unmap_ret = sys_linux_munmap(old_addr, old_size_aligned);
+    if unmap_ret != 0 {
+        log::error!(
+            "[mremap] pid={} MAYMOVE: unexpected munmap failure (ret={:#x}) freeing old range {:#x}+{:#x}; old mapping leaked",
+            pid,
+            unmap_ret,
+            old_addr,
+            old_size_aligned,
+        );
+    }
 
     // Bump address-space generation for new VMA.
     let table = crate::process::PROCESS_TABLE.lock();
