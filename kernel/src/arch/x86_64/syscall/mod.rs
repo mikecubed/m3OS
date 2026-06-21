@@ -12225,9 +12225,24 @@ pub(super) fn sys_mremap(old_addr: u64, old_size: u64, new_size: u64, flags: u64
             if vma.start != old_addr {
                 return None;
             }
-            // The VMA must fully cover the old range.
-            let vma_end = vma.start.saturating_add(vma.len);
-            if vma_end < old_addr.saturating_add(old_size_aligned) {
+            // Linux mremap's `old_size` must describe the WHOLE mapping, not a
+            // sub-range. Require an exact length match (`vma.start == old_addr`
+            // is already enforced above, and both lengths are page-aligned):
+            //
+            //  * The MAYMOVE path copies/unmaps only `old_size_aligned` bytes, so
+            //    a VMA longer than old_size would leak its tail — [old_addr +
+            //    old_size_aligned, vma_end) stays mapped while the caller is
+            //    handed a new base as if the whole region had moved.
+            //  * The in-place-grow free-space probe keys on `grow_start =
+            //    old_addr + old_size_aligned`; if the VMA extended past that it
+            //    would overlap its OWN grow window, so the probe would always
+            //    (wrongly) report "not free" and force a needless move.
+            //
+            // The only Phase 93 caller (musl's realloc) always passes the full
+            // mapping length, so rejecting the sub-range case with EINVAL — like
+            // the mid-VMA old_addr, file-backed, and MREMAP_FIXED rejects — is the
+            // correct fail-closed behaviour.
+            if vma.len != old_size_aligned {
                 return None;
             }
             // File-backed mremap is not implemented in Phase 93.
