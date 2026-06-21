@@ -1,6 +1,6 @@
 # Phase 94 - Rust-Cargo Ports & uutils Coreutils
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-94
 **Depends on:** Phase 12 ✅ (Linux-syscall compat), Phase 40 ✅ (threading/futex/TLS), Phase 44 ✅ (Rust cross-compilation lineage), Phase 85a ✅ (`.m3pkg` package & build-cache substrate)
 **Builds on:** Establishes the project's **first Rust-cargo cross-compiled port class** on top of the Phase 85a `.m3pkg` substrate and the Phase 12 Linux-syscall compatibility layer. Reuses the Phase 44 "Rust runs in the OS" lineage but targets `x86_64-unknown-linux-musl` (std) rather than the bare-metal `x86_64-unknown-none` target the kernel and the hand-built userspace use. Does **not** replace the hand-built `coreutils-rs`; it shadows it via PATH precedence.

@@ -22490,13 +22490,17 @@ fn coreutils_smoke_steps() -> Vec<SmokeStep> {
         timeout_secs: 30,
         label: "coreutils-smoke: prompt after remove",
     });
-    // The uutils binary is gone — proves the install was fully removed.
+    // The uutils binary is gone — proves the install was fully removed. Uses the
+    // ramdisk `/bin/cat` (the uutils cat was just removed); its hand-built error
+    // for a missing file is "cat: cannot open file" (distinct from uutils' "No
+    // such file or directory") — so this also incidentally confirms we are now on
+    // the ramdisk floor, not uutils.
     steps.push(SmokeStep::Send {
         input: "/bin/cat /usr/local/bin/coreutils\n",
         label: "coreutils-smoke: removed binary is gone",
     });
     steps.push(SmokeStep::Wait {
-        pattern: "No such file",
+        pattern: "cannot open",
         timeout_secs: 60,
         label: "coreutils-smoke: /usr/local/bin/coreutils no longer exists",
     });

@@ -1353,6 +1353,7 @@ mod syscall_nr {
     pub const GETDENTS64: u64 = 217;
     pub const OPENAT: u64 = 257;
     pub const NEWFSTATAT: u64 = 262;
+    pub const UNLINKAT: u64 = 263;
     pub const STATX: u64 = 332;
     pub const LINKAT: u64 = 265;
     pub const SYMLINKAT: u64 = 266;
@@ -1872,6 +1873,7 @@ pub extern "C" fn syscall_handler(
         RMDIR => sys_linux_rmdir(arg0),
         LINK => sys_link(arg0, arg1),
         UNLINK => sys_linux_unlink(arg0),
+        UNLINKAT => sys_linux_unlinkat(arg0, arg1, arg2),
         SYMLINK => sys_symlink(arg0, arg1),
         READLINK => sys_readlink(arg0, arg1, arg2),
         CHMOD => sys_linux_chmod(arg0, arg1),
@@ -16170,14 +16172,38 @@ pub(super) fn sys_linux_mkdir(path_ptr: u64, mode: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 pub(super) fn sys_linux_rmdir(path_ptr: u64) -> u64 {
+    sys_linux_rmdir_at(AT_FDCWD, path_ptr)
+}
+
+/// Phase 94 — `unlinkat(dirfd, pathname, flags)` (syscall 263). Routes to the
+/// rmdir core when `AT_REMOVEDIR` is set, else the unlink core. Both cores are
+/// dirfd-aware (via `resolve_path_from_dirfd`), so uutils rm's `safe-traversal`
+/// (`openat` the parent dir, then `unlinkat(dirfd, name, …)` / `fstatat`) removes
+/// files and directories correctly. m3OS already supports `openat`/`newfstatat`
+/// real dirfds; `unlinkat` was the one missing piece — surfaced by
+/// `coreutils-smoke` (uutils `rm -r` removed nothing without it).
+pub(super) fn sys_linux_unlinkat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
+    const AT_REMOVEDIR: u64 = 0x200;
+    if flags & AT_REMOVEDIR != 0 {
+        sys_linux_rmdir_at(dirfd, path_ptr)
+    } else {
+        sys_linux_unlink_at(dirfd, path_ptr)
+    }
+}
+
+/// `rmdir` core, dirfd-aware (the `AT_FDCWD` path is byte-equivalent to the prior
+/// `resolve_path(&cwd, …)` behaviour for both relative and absolute paths).
+pub(super) fn sys_linux_rmdir_at(dirfd: u64, path_ptr: u64) -> u64 {
     let mut buf = [0u8; 512];
     let raw_name = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
         None => return NEG_EFAULT,
     };
 
-    let cwd = current_cwd();
-    let resolved = resolve_path(&cwd, raw_name);
+    let resolved = match resolve_path_from_dirfd(dirfd, raw_name) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     let name: &str = &resolved;
 
     // Phase 27: Write+execute permission on parent directory.
@@ -16239,6 +16265,12 @@ pub(super) fn sys_linux_rmdir(path_ptr: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 pub(super) fn sys_linux_unlink(path_ptr: u64) -> u64 {
+    sys_linux_unlink_at(AT_FDCWD, path_ptr)
+}
+
+/// `unlink` core, dirfd-aware (see `sys_linux_unlinkat`). The `AT_FDCWD` path is
+/// byte-equivalent to the prior behaviour.
+pub(super) fn sys_linux_unlink_at(dirfd: u64, path_ptr: u64) -> u64 {
     let mut buf = [0u8; 512];
     let raw_name = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
@@ -16246,7 +16278,7 @@ pub(super) fn sys_linux_unlink(path_ptr: u64) -> u64 {
     };
 
     // unlink() should resolve parent symlinks but unlink the lexical final component.
-    let lexical = match resolve_path_from_dirfd(AT_FDCWD, raw_name) {
+    let lexical = match resolve_path_from_dirfd(dirfd, raw_name) {
         Ok(path) => path,
         Err(err) => return err,
     };

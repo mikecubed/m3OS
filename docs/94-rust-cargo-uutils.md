@@ -147,6 +147,19 @@ threading path (`clone`/`futex`/`set_tid_address`). The static-ELF loader (`kern
 maps the binary. The runtime substrate is already proven; Phase 94 adds only the build
 plumbing.
 
+**One syscall gap surfaced (the anticipated patch-bump case).** uutils `rm`'s `uucore`
+`safe-traversal` feature removes files/dirs via the TOCTOU-safe fd-relative path —
+`openat()` the parent directory, then `fstatat(dirfd, name)` / `unlinkat(dirfd, name, flags)`
+— rather than plain `unlink`/`rmdir`. m3OS already resolved real dirfds for `openat` and
+`newfstatat` (via `resolve_path_from_dirfd`), but had **no `unlinkat` (263)**, so `rm -r`
+removed *nothing* (it returned, but every removal `-ENOSYS`'d). The fix is contained:
+`sys_linux_unlinkat` routes by `AT_REMOVEDIR` to dirfd-aware `sys_linux_unlink_at` /
+`sys_linux_rmdir_at` (the existing `unlink`/`rmdir` cores, with `AT_FDCWD` resolution
+generalized to any dirfd via `resolve_path_from_dirfd`). This is the **only** kernel change in
+the phase and carried a **patch** bump (`0.94.0` → `0.94.1`). Lesson: a std/musl binary that
+"just issues Linux syscalls" can still exercise a corner (fd-relative removal) the existing C
+ports never hit — `coreutils-smoke` is what caught it.
+
 ## Key Files
 
 | File | Purpose |
