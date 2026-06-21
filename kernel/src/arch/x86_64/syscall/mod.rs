@@ -1365,6 +1365,10 @@ mod syscall_nr {
     pub const MPROTECT: u64 = 10;
     pub const MUNMAP: u64 = 11;
     pub const BRK: u64 = 12;
+    // Phase 93 Track C — Dynamic C Runtime: mremap is the missing syscall
+    // that musl's realloc calls for large in-place grow/shrink of heap chunks
+    // mapped directly via mmap. Linux ABI slot 25 (after sched_yield=24).
+    pub const MREMAP: u64 = 25;
 
     // -- process --
     pub const GETPID: u64 = 39;
@@ -1909,6 +1913,15 @@ pub extern "C" fn syscall_handler(
         PKEY_FREE => sys_pkey_free(arg0),
         MUNMAP => sys_linux_munmap(arg0, arg1),
         BRK => sys_linux_brk(arg0),
+        // Phase 93 Track C.1 — mremap(old_addr, old_size, new_size, flags).
+        // The 4th argument (flags) lives in r10 at syscall entry, same as the
+        // other 4-argument mm syscalls (pkey_mprotect, mmap's MAP_FIXED flags,
+        // wait4's rusage_ptr, etc.).  The optional 5th arg (new_address for
+        // MREMAP_FIXED) is in r8; we reject MREMAP_FIXED so it is not read.
+        MREMAP => {
+            let flags = per_core_syscall_arg3();
+            sys_mremap(arg0, arg1, arg2, flags)
+        }
         // -- process --
         GETPID => sys_getpid(),
         CLONE => {
@@ -12114,6 +12127,567 @@ pub(super) fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
     }
 
     0
+}
+
+// ---------------------------------------------------------------------------
+// Phase 93 Track C.1 — mremap(old_addr, old_size, new_size, flags[, new_addr])
+//
+// Implements the Linux mremap(2) ABI (syscall 25) for the Dynamic C Runtime
+// phase. musl's realloc uses mremap to resize large anonymous allocations
+// (those originally obtained via mmap) in place or, when the region cannot
+// grow in place, by moving the mapping.
+//
+// Supported flag combinations:
+//   0                 — shrink or grow in place only; ENOMEM if blocked.
+//   MREMAP_MAYMOVE    — as above, but also permit relocation on grow failure.
+//   MREMAP_FIXED      — REJECTED (EINVAL): musl's realloc never uses it;
+//                       implementing it would require a 5th syscall argument
+//                       and an atomic swap that is not needed for Phase 93.
+// ---------------------------------------------------------------------------
+
+/// `mremap(old_addr, old_size, new_size, flags)` — Phase 93 Track C.1.
+///
+/// Resizes an anonymous anonymous VMA.  For the Dynamic C Runtime the only
+/// caller that matters is musl's `__expand_heap` → `mremap` path, which is
+/// always an anonymous in-place grow or move; file-backed regions and
+/// MREMAP_FIXED are rejected.
+pub(super) fn sys_mremap(old_addr: u64, old_size: u64, new_size: u64, flags: u64) -> u64 {
+    // Linux flag constants (mremap(2)).
+    const MREMAP_MAYMOVE: u64 = 1;
+    const MREMAP_FIXED: u64 = 2;
+
+    // --- C.1 step 1: validate arguments ---
+
+    // MREMAP_FIXED is not supported: we do not consume the 5th syscall arg
+    // (new_address, in r8) and musl's realloc never sets this flag.
+    if flags & MREMAP_FIXED != 0 {
+        return NEG_EINVAL;
+    }
+
+    // old_addr must be page-aligned.
+    if old_addr & 0xFFF != 0 {
+        return NEG_EINVAL;
+    }
+
+    // Both sizes must be non-zero (Linux mremap rejects them too).
+    if old_size == 0 || new_size == 0 {
+        return NEG_EINVAL;
+    }
+
+    // Page-align both sizes upward (mirrors Linux behaviour and sys_linux_mmap).
+    // Use checked arithmetic — matching sys_linux_mmap/sys_linux_munmap — so a
+    // pathological near-`u64::MAX` size returns a clean EINVAL instead of
+    // wrapping the rounded product to 0 (which would otherwise survive the
+    // `new_size == 0` reject above and silently full-unmap the mapping).
+    let new_size = match new_size.div_ceil(4096).checked_mul(4096) {
+        Some(s) => s,
+        None => return NEG_EINVAL,
+    };
+    let old_size_aligned = match old_size.div_ceil(4096).checked_mul(4096) {
+        Some(s) => s,
+        None => return NEG_EINVAL,
+    };
+
+    const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
+    const MMAP_MIN_ADDR: u64 = 0x1_0000;
+
+    if !(MMAP_MIN_ADDR..USER_SPACE_END).contains(&old_addr) {
+        return NEG_EINVAL;
+    }
+    // The old range must fit in canonical user space.
+    if old_addr
+        .checked_add(old_size_aligned)
+        .filter(|e| *e <= USER_SPACE_END)
+        .is_none()
+    {
+        return NEG_EINVAL;
+    }
+
+    let pid = crate::process::current_pid();
+
+    // --- C.1 step 2: locate the covering VMA ---
+    //
+    // We need:
+    //  (a) old_addr is the START of an existing VMA.
+    //  (b) The VMA fully covers [old_addr, old_addr + old_size_aligned).
+    //  (c) The VMA is anonymous (file_backing.is_none()) — file-backed mremap
+    //      would need write-back coherence beyond Phase 93 scope; reject it.
+    //
+    // Capture VMA metadata before the mutable borrow below.
+    let vma_info = crate::process::with_shared_mm_mut(pid, |_b, _m, vma_tree| {
+        vma_tree.find_containing(old_addr).and_then(|vma| {
+            // Linux mremap requires old_addr be the start of an existing
+            // mapping. Our grow-in-place path keys on `vma_tree.remove(old_addr)`
+            // and the MAYMOVE/shrink paths assume the located VMA begins at
+            // old_addr; if old_addr pointed into the middle of a mapping,
+            // `remove(old_addr)` would be a no-op and we could insert an
+            // overlapping VMA, corrupting the VMA tree. Reject EINVAL.
+            if vma.start != old_addr {
+                return None;
+            }
+            // Linux mremap's `old_size` must describe the WHOLE mapping, not a
+            // sub-range. Require an exact length match (`vma.start == old_addr`
+            // is already enforced above, and both lengths are page-aligned):
+            //
+            //  * The MAYMOVE path copies/unmaps only `old_size_aligned` bytes, so
+            //    a VMA longer than old_size would leak its tail — [old_addr +
+            //    old_size_aligned, vma_end) stays mapped while the caller is
+            //    handed a new base as if the whole region had moved.
+            //  * The in-place-grow free-space probe keys on `grow_start =
+            //    old_addr + old_size_aligned`; if the VMA extended past that it
+            //    would overlap its OWN grow window, so the probe would always
+            //    (wrongly) report "not free" and force a needless move.
+            //
+            // The only Phase 93 caller (musl's realloc) always passes the full
+            // mapping length, so rejecting the sub-range case with EINVAL — like
+            // the mid-VMA old_addr, file-backed, and MREMAP_FIXED rejects — is the
+            // correct fail-closed behaviour.
+            if vma.len != old_size_aligned {
+                return None;
+            }
+            // File-backed mremap is not implemented in Phase 93.
+            if vma.file_backing.is_some() {
+                return None;
+            }
+            Some((vma.prot, vma.flags, vma.pkey))
+        })
+    });
+
+    let (vma_prot, vma_flags, vma_pkey) = match vma_info {
+        Some(Some(info)) => info,
+        Some(None) => return NEG_EINVAL,
+        None => return NEG_EINVAL, // process gone
+    };
+
+    // --- C.1 step 3: no-op case ---
+    if new_size == old_size_aligned {
+        return old_addr;
+    }
+
+    // --- C.1 step 4: shrink (new_size < old_size_aligned) ---
+    //
+    // Unmap the tail [old_addr+new_size, old_addr+old_size_aligned).
+    // sys_linux_munmap handles the PTE clear, frame free, VMA split, and TLB
+    // shootdown, so we reuse it directly — no duplication.
+    if new_size < old_size_aligned {
+        let tail_start = old_addr + new_size;
+        let tail_len = old_size_aligned - new_size;
+        let ret = sys_linux_munmap(tail_start, tail_len);
+        if ret != 0 {
+            // munmap failed — propagate errno.
+            return ret;
+        }
+        // Update the VMA to reflect the shrunk length (remove_range inside
+        // munmap already split or removed the tail, but the head VMA entry
+        // that covers [old_addr, old_addr+new_size) was left with its original
+        // length if the tail was a suffix split.  Re-insert with correct len.
+        let _ = crate::process::with_shared_mm_mut(pid, |_b, _m, vma_tree| {
+            // After munmap the VMA starting at old_addr should already be
+            // trimmed by remove_range (partial right-overlap path), but if
+            // old_addr was exactly the VMA start we may need to re-normalise.
+            // find_containing returns it; if its len already matches new_size
+            // no update is needed.
+            if let Some(vma) = vma_tree.find_containing(old_addr)
+                && vma.start == old_addr
+                && vma.len != new_size
+            {
+                let mut updated = vma.clone();
+                updated.len = new_size;
+                vma_tree.insert(updated);
+            }
+        });
+        return old_addr;
+    }
+
+    // --- C.1 step 5 & 6: grow (new_size > old_size_aligned) ---
+    //
+    // First try in-place extension: check that [old_addr+old_size_aligned,
+    // old_addr+new_size) is free (no overlapping VMA).
+    let grow_start = old_addr + old_size_aligned;
+    let grow_len = new_size - old_size_aligned;
+
+    // Validate the grown range fits in user space.
+    if old_addr
+        .checked_add(new_size)
+        .filter(|e| *e <= USER_SPACE_END)
+        .is_none()
+    {
+        return NEG_ENOMEM;
+    }
+
+    let range_is_free = crate::process::with_shared_mm_mut(pid, |_b, _m, vma_tree| {
+        // The growth window must not overlap any existing VMA.  A single
+        // find_containing check covers point-in-range; for a full range we
+        // check the start AND any VMA whose start falls inside the window.
+        if vma_tree.find_containing(grow_start).is_some() {
+            return false;
+        }
+        // Also check whether any VMA starts inside (grow_start, grow_start+grow_len).
+        vma_tree.iter().all(|m| {
+            // VMA overlaps [grow_start, grow_start+grow_len) iff:
+            //   m.start < grow_start+grow_len  AND  m.start+m.len > grow_start
+            let m_end = m.start.saturating_add(m.len);
+            !(m.start < grow_start.saturating_add(grow_len) && m_end > grow_start)
+        })
+    })
+    .unwrap_or(false);
+
+    if range_is_free {
+        // Grow in place: remove the old VMA and insert a new one covering the
+        // full new_size.  Anonymous pages are demand-faulted, so no frames need
+        // to be allocated for the extension — the page fault handler will do it
+        // on first access, just as for a fresh mmap.
+        let _ = crate::process::with_shared_mm_mut(pid, |_b, mmap_next, vma_tree| {
+            // Remove the old entry (keyed by old_addr) and insert the grown one.
+            vma_tree.remove(old_addr);
+            vma_tree.insert(crate::process::MemoryMapping {
+                start: old_addr,
+                len: new_size,
+                prot: vma_prot,
+                flags: vma_flags,
+                file_backing: None,
+                pkey: vma_pkey,
+            });
+            // Advance the bump pointer past the grown top. The non-fixed mmap
+            // allocator is a pure bump over `mmap_next` and never consults the
+            // VMA tree for conflicts; if we grew the topmost region (the only
+            // case where [old_end, new_end) is actually free) without bumping,
+            // `mmap_next` would still point inside the now-larger VMA and the
+            // next mmap would be handed an overlapping address. Keep this
+            // symmetric with the MAYMOVE path and sys_linux_mmap. `new_size`
+            // already fits in user space (checked above), so no overflow.
+            let grown_end = old_addr + new_size;
+            if *mmap_next < grown_end {
+                *mmap_next = grown_end;
+            }
+        });
+        // Bump the address-space generation (new VMA range).
+        let table = crate::process::PROCESS_TABLE.lock();
+        if let Some(proc) = table.find(pid)
+            && let Some(ref addr_space) = proc.addr_space
+        {
+            addr_space.bump_generation();
+        }
+        return old_addr;
+    }
+
+    // Cannot grow in place.
+    if flags & MREMAP_MAYMOVE == 0 {
+        // Without MREMAP_MAYMOVE the kernel must return ENOMEM.  musl's
+        // realloc falls back to malloc(new_size)+memcpy+free(old_ptr) on
+        // ENOMEM — correct-but-slower, never a fault.
+        return NEG_ENOMEM;
+    }
+
+    // MREMAP_MAYMOVE: allocate a fresh anonymous region of new_size, copy all
+    // committed (present) pages from the old range into it, then unmap the old
+    // range.  The new region is demand-paged: only pages that were already
+    // committed in the old range are eagerly copied; the extension pages are
+    // left demand-paged (no frames allocated yet).
+
+    // Allocate a new virtual range via the same bump allocator sys_linux_mmap
+    // uses.  We record the VMA entry here and let demand faults fill frames for
+    // the extension pages.
+    let new_base = match crate::process::with_shared_mm_mut(pid, |_b, mmap_next, _vma_tree| {
+        let current = if *mmap_next == 0 {
+            ANON_MMAP_BASE
+        } else {
+            *mmap_next
+        };
+        let next = current
+            .checked_add(new_size)
+            .filter(|v| *v <= USER_SPACE_END)?;
+        *mmap_next = next;
+        Some(current)
+    }) {
+        Some(Some(base)) => base,
+        _ => return NEG_ENOMEM,
+    };
+
+    // Copy committed (present) pages from old range → new range.
+    //
+    // Strategy: walk the old range page by page.  For each present PTE, allocate
+    // a new frame, copy the page content through the kernel phys-offset window,
+    // and map the new frame at the corresponding offset in the new base.  Absent
+    // (demand-paged-but-not-yet-faulted) pages are skipped — they will be faulted
+    // in on demand at the new address, exactly as a fresh mmap would be.
+    //
+    // We use the same phys-offset read/write technique as sys_mmap_file_backed
+    // (copy_nonoverlapping through phys_off + frame_phys) and the same
+    // map_user_frames helper for installing the copied frame.
+    //
+    // SMAP note: we never read/write user virtual addresses directly; all
+    // accesses go through the phys-offset kernel window, so SMAP (which only
+    // guards ring-0 accesses to *user-mapped* virtual addresses) is not an issue.
+    use x86_64::structures::paging::{PageTableFlags, PhysFrame, Size4KiB};
+
+    let phys_off = crate::mm::phys_offset();
+    let addr_space = {
+        let table = crate::process::PROCESS_TABLE.lock();
+        table.find(pid).and_then(|p| p.addr_space.as_ref().cloned())
+    };
+
+    let old_pages = (old_size_aligned / 4096) as usize;
+
+    // Build PTE flags matching the VMA's protection bits and pkey, using the
+    // same compose_user_pte_flags helper as the demand-fault path in
+    // interrupts.rs.  This correctly encodes the protection key into bits 59-62
+    // of the PTE and handles PROT_WRITE / PROT_EXEC / PROT_READ.
+    let pt_flags = crate::mm::pkey::compose_user_pte_flags(vma_prot, vma_pkey);
+
+    let cr3_phys = match addr_space.as_ref().map(|a| a.pml4_phys()) {
+        Some(phys) => phys,
+        None => {
+            // Roll back mmap_next reservation.
+            let _ = crate::process::with_shared_mm_mut(pid, |_b, mmap_next, _vma_tree| {
+                if *mmap_next == new_base + new_size {
+                    *mmap_next = new_base;
+                }
+            });
+            return NEG_ENOMEM;
+        }
+    };
+    let cr3_frame = match PhysFrame::<Size4KiB>::from_start_address(cr3_phys) {
+        Ok(f) => f,
+        Err(_) => {
+            let _ = crate::process::with_shared_mm_mut(pid, |_b, mmap_next, _vma_tree| {
+                if *mmap_next == new_base + new_size {
+                    *mmap_next = new_base;
+                }
+            });
+            return NEG_ENOMEM;
+        }
+    };
+
+    // Collect (page_index, new_frame) pairs for pages that are present in the old
+    // range and need to be copied.
+    let mut copied_frames: alloc::vec::Vec<(usize, PhysFrame<Size4KiB>)> = alloc::vec::Vec::new();
+
+    {
+        // Walk old range PTEs with the page-table guard held (same lock discipline
+        // as sys_linux_munmap's PTE walk).
+        let _page_table_guard = addr_space
+            .as_ref()
+            .map(|addr_space| addr_space.lock_page_tables());
+
+        use x86_64::{VirtAddr, registers::control::Cr3, structures::paging::PageTable};
+
+        let (cr3_f, _) = Cr3::read();
+        let phys_offset_va = VirtAddr::new(phys_off);
+
+        for i in 0..old_pages {
+            let page_vaddr = old_addr + (i as u64 * 4096);
+            let p4_idx = ((page_vaddr >> 39) & 0x1FF) as usize;
+            let p3_idx = ((page_vaddr >> 30) & 0x1FF) as usize;
+            let p2_idx = ((page_vaddr >> 21) & 0x1FF) as usize;
+            let p1_idx = ((page_vaddr >> 12) & 0x1FF) as usize;
+
+            let src_phys: Option<u64> = unsafe {
+                let pml4: &PageTable =
+                    &*(phys_offset_va + cr3_f.start_address().as_u64()).as_ptr::<PageTable>();
+                if !pml4[p4_idx].flags().contains(PageTableFlags::PRESENT) {
+                    None
+                } else {
+                    let pdpt: &PageTable =
+                        &*(phys_offset_va + pml4[p4_idx].addr().as_u64()).as_ptr::<PageTable>();
+                    if !pdpt[p3_idx].flags().contains(PageTableFlags::PRESENT) {
+                        None
+                    } else {
+                        let pd: &PageTable =
+                            &*(phys_offset_va + pdpt[p3_idx].addr().as_u64()).as_ptr::<PageTable>();
+                        if !pd[p2_idx].flags().contains(PageTableFlags::PRESENT) {
+                            None
+                        } else {
+                            let pt: &PageTable = &*(phys_offset_va + pd[p2_idx].addr().as_u64())
+                                .as_ptr::<PageTable>();
+                            let pte = &pt[p1_idx];
+                            // Only copy present non-guard pages.
+                            if pte.flags().contains(PageTableFlags::PRESENT)
+                                && !pte.flags().contains(PageTableFlags::BIT_10)
+                            {
+                                Some(pte.addr().as_u64())
+                            } else {
+                                None
+                            }
+                        }
+                    }
+                }
+            };
+
+            if let Some(src_frame_phys) = src_phys {
+                // Allocate a new frame for the copy destination.
+                let dst_frame = match crate::mm::frame_allocator::allocate_frame_zeroed() {
+                    Some(f) => f,
+                    None => {
+                        // OOM — free already-allocated frames and give up.
+                        for (_, f) in &copied_frames {
+                            crate::mm::frame_allocator::free_frame(f.start_address().as_u64());
+                        }
+                        let _ =
+                            crate::process::with_shared_mm_mut(pid, |_b, mmap_next, _vma_tree| {
+                                if *mmap_next == new_base + new_size {
+                                    *mmap_next = new_base;
+                                }
+                            });
+                        return NEG_ENOMEM;
+                    }
+                };
+                // Copy page content through the kernel phys-offset window.
+                // SAFETY: both src_frame_phys and dst_frame are valid allocated
+                // frames; phys_off is the kernel's direct physmap offset.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        (phys_off + src_frame_phys) as *const u8,
+                        (phys_off + dst_frame.start_address().as_u64()) as *mut u8,
+                        4096,
+                    );
+                }
+                copied_frames.push((i, dst_frame));
+            }
+            // Absent (demand-paged) pages: skip — they will fault in at the new VA.
+        }
+    }
+
+    // Map the copied frames into the new virtual range.
+    if !copied_frames.is_empty() {
+        let map_result = {
+            let _page_table_guard = addr_space
+                .as_ref()
+                .map(|addr_space| addr_space.lock_page_tables());
+            let mut mapper = unsafe { crate::mm::mapper_for_frame(cr3_frame) };
+            let mut failed = false;
+            for (i, frame) in &copied_frames {
+                let vaddr = new_base + (*i as u64 * 4096);
+                let page = match x86_64::structures::paging::Page::<Size4KiB>::from_start_address(
+                    x86_64::VirtAddr::new(vaddr),
+                ) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        failed = true;
+                        break;
+                    }
+                };
+                use x86_64::structures::paging::Mapper as _;
+                let mut frame_alloc = crate::mm::paging::GlobalFrameAlloc;
+                let table_flags = PageTableFlags::PRESENT
+                    | PageTableFlags::WRITABLE
+                    | PageTableFlags::USER_ACCESSIBLE;
+                // Defer local TLB flush — the TLB shootdown after munmap covers it.
+                let map_ok = unsafe {
+                    mapper
+                        .map_to_with_table_flags(
+                            page,
+                            *frame,
+                            pt_flags,
+                            table_flags,
+                            &mut frame_alloc,
+                        )
+                        .map(|f| f.ignore())
+                        .is_ok()
+                };
+                if !map_ok {
+                    failed = true;
+                    break;
+                }
+            }
+            failed
+        };
+        if map_result {
+            // Mapping failed partway. Before freeing the copied frames, unmap
+            // any leaf PTEs we already installed in the new range — otherwise we
+            // would leave dangling *present* PTEs pointing at frames returned to
+            // the allocator (a use-after-free within the process's own address
+            // space, reachable via a stale TLB entry since no VMA is recorded to
+            // demand-fault them). Empty intermediate page-table levels are left
+            // unreclaimed, matching sys_linux_munmap's convention (OOM-only path).
+            {
+                let _page_table_guard = addr_space
+                    .as_ref()
+                    .map(|addr_space| addr_space.lock_page_tables());
+                let mut mapper = unsafe { crate::mm::mapper_for_frame(cr3_frame) };
+                use x86_64::structures::paging::Mapper as _;
+                for (i, _) in &copied_frames {
+                    let vaddr = new_base + (*i as u64 * 4096);
+                    if let Ok(page) =
+                        x86_64::structures::paging::Page::<Size4KiB>::from_start_address(
+                            x86_64::VirtAddr::new(vaddr),
+                        )
+                        && let Ok((_f, flush)) = mapper.unmap(page)
+                    {
+                        // Local invlpg is batched into the shootdown below.
+                        flush.ignore();
+                    }
+                }
+            }
+            // Shoot down the new range on all cores (outside the page-table lock
+            // to avoid the IF-masking deadlock the fork CoW path documents) so no
+            // stale TLB entry can alias a frame we are about to free.
+            if let Some(ref a) = addr_space {
+                crate::smp::tlb::tlb_shootdown_range(a, new_base, new_base + new_size);
+            }
+            for (_, f) in &copied_frames {
+                crate::mm::frame_allocator::free_frame(f.start_address().as_u64());
+            }
+            let _ = crate::process::with_shared_mm_mut(pid, |_b, mmap_next, _vma_tree| {
+                if *mmap_next == new_base + new_size {
+                    *mmap_next = new_base;
+                }
+            });
+            return NEG_ENOMEM;
+        }
+    }
+
+    // Record the new VMA.
+    let _ = crate::process::with_shared_mm_mut(pid, |_b, _m, vma_tree| {
+        vma_tree.insert(crate::process::MemoryMapping {
+            start: new_base,
+            len: new_size,
+            prot: vma_prot,
+            flags: vma_flags,
+            file_backing: None,
+            pkey: vma_pkey,
+        });
+    });
+
+    // Unmap the old range (frees old frames, removes old VMA, TLB shootdown).
+    //
+    // This munmap cannot legitimately fail here: old_addr/old_size_aligned were
+    // already validated as page-aligned, non-zero, in-range, and non-overflowing
+    // at the top of this function — the only conditions under which
+    // sys_linux_munmap returns an error. The new region lives at a fresh
+    // bump-allocated `new_base` that is disjoint from old_addr, so a failure
+    // could never produce an *overlap* — only a leak of the old mapping. We
+    // still surface a non-zero return rather than silently dropping it: a leak
+    // here would be a kernel-invariant violation worth logging.
+    let unmap_ret = sys_linux_munmap(old_addr, old_size_aligned);
+    if unmap_ret != 0 {
+        log::error!(
+            "[mremap] pid={} MAYMOVE: unexpected munmap failure (ret={:#x}) freeing old range {:#x}+{:#x}; old mapping leaked",
+            pid,
+            unmap_ret,
+            old_addr,
+            old_size_aligned,
+        );
+    }
+
+    // Bump address-space generation for new VMA.
+    let table = crate::process::PROCESS_TABLE.lock();
+    if let Some(proc) = table.find(pid)
+        && let Some(ref addr_space) = proc.addr_space
+    {
+        addr_space.bump_generation();
+    }
+
+    log::debug!(
+        "[mremap] pid={} old={:#x}+{:#x} → new={:#x}+{:#x} (MAYMOVE)",
+        pid,
+        old_addr,
+        old_size_aligned,
+        new_base,
+        new_size,
+    );
+
+    new_base
 }
 
 // ---------------------------------------------------------------------------

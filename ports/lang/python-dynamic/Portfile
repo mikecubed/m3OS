@@ -1,0 +1,23 @@
+NAME=python-dynamic
+VERSION=3.12.8
+DESCRIPTION="CPython interpreter — DYNAMIC variant (PT_INTERP + DT_NEEDED libc.so, lib-dynload/*.so, _ctypes)"
+CATEGORY=lang
+DEPS=musl
+URL=https://www.python.org/ftp/python/3.12.8/Python-3.12.8.tar.xz
+SHA256=c909157bb25ec114e5869124cc2a9c4a4d4c1e957ca4ff553f1edc692101154e
+MAINTAINER=m3os
+
+# Phase 93 (Dynamic C Runtime), Track D.2/D.3 — the DYNAMIC CPython variant,
+# shipped beside (never replacing) the byte-for-byte-intact static `python`
+# port. The same 3.12.8 tarball; a separate port name gives a DISTINCT pkgcache
+# content key (recipe-v in build_recipe_id("python-dynamic")) so the static and
+# dynamic `.m3pkg`s coexist without collision.
+#
+# Differs from the static `python` recipe only by:
+#   • drop `-static` from LDFLAGS  → a DYNAMIC python3 (PT_INTERP=
+#     /lib/ld-musl-x86_64.so.1 + DT_NEEDED libc.so), bound at runtime against the
+#     real /usr/lib/libc.so (Phase 93 Track A) by the m3OS loader (Track B).
+#   • drop `MODULE_BUILDTYPE=static` → C extensions build as dlopen-able
+#     lib-dynload/*.cpython-312-*.so, loaded at import via the loader's dlopen.
+#   • re-enable `_ctypes` (static libffi.a linked in) → `ctypes.CDLL(...)` works.
+# Bundled opt-in behind the `M3OS_WITH_DYNAMIC_PYTHON` image feature.

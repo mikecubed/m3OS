@@ -558,6 +558,29 @@ if [ "${M3OS_PYTHON_REGRESSION:-0}" = "1" ]; then
     fi
 fi
 
+# Phase 93 — Dynamic C Runtime regression gate. Gated behind
+# M3OS_DYNAMIC_C_REGRESSION=1. dynamic-hello-smoke is CI-deterministic (no
+# network/hardware): it builds the musl libc.so + a dynamic hello fixture and
+# asserts DYNAMIC_HELLO:ok + DLOPEN:ok. dynamic-python-smoke is the heavy
+# opt-in arm (builds the dynamic CPython + libffi, ~tens of minutes, then
+# pkg-installs + imports a lib-dynload .so + runs ctypes.CDLL). Set on branches
+# touching userspace/ld-musl-x86_64.so.1, ports/lib/musl|libffi,
+# ports/lang/python-dynamic, xtask's build_musl/build_libffi/build_python_dynamic
+# or the dynamic-* gates, or the kernel mremap / arch_prctl / startup paths a
+# dynamic libc exercises.
+if [ "${M3OS_DYNAMIC_C_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask dynamic-hello-smoke..."
+    if ! cargo xtask dynamic-hello-smoke --timeout 600; then
+        echo "pre-push: cargo xtask dynamic-hello-smoke failed" >&2
+        exit 1
+    fi
+    echo "pre-push: running cargo xtask dynamic-python-smoke..."
+    if ! cargo xtask dynamic-python-smoke --timeout 5400; then
+        echo "pre-push: cargo xtask dynamic-python-smoke failed" >&2
+        exit 1
+    fi
+fi
+
 # Phase 85d — Clang/LLVM/LLD regression gate. Gated behind M3OS_CLANG_REGRESSION=1
 # because it host-cross-builds clang + lld + a self-contained libc++ — a
 # multi-GB-RAM, multi-hour cold build — before building an opt-in M3OS_WITH_CLANG

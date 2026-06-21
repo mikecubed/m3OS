@@ -1,0 +1,29 @@
+Phase 93 (Dynamic C Runtime) — make musl's dynamic libc.so tolerate m3OS's
+foreign Rust loader.
+
+In the shared/dynamic-linker musl build, `__libc_start_init` runs all DSO
+constructors via `do_init_fini(main_ctor_queue)`, where `main_ctor_queue` is
+built by `queue_ctors()` inside `__dls3` (musl's own dynamic linker). m3OS's
+loader is a from-scratch Rust loader that REPLACES `__dls3` and runs the
+constructors itself (`run_constructors` in
+userspace/ld-musl-x86_64.so.1/src/main.rs), so `main_ctor_queue` is never set
+and stays NULL. The unconditional `do_init_fini(main_ctor_queue)` then
+dereferences a NULL queue pointer and faults before `main`.
+
+Guard the call on a non-NULL queue: when the foreign loader has already run the
+constructors (NULL queue) this is a clean no-op; on a real musl ld.so the queue
+is populated and the call runs exactly as before. This mirrors the no-op
+`__init_tls` stub the same dynamic build already ships (TLS setup is likewise
+delegated to the loader, which m3OS handles in `setup_static_tls`).
+
+--- a/ldso/dynlink.c
++++ b/ldso/dynlink.c
+@@ -1618,7 +1618,7 @@ static void do_init_fini(struct dso **queue)
+
+ void __libc_start_init(void)
+ {
+-	do_init_fini(main_ctor_queue);
++	if (main_ctor_queue) do_init_fini(main_ctor_queue);
+ 	if (!__malloc_replaced && main_ctor_queue != builtin_ctor_queue)
+ 		free(main_ctor_queue);
+ 	main_ctor_queue = 0;

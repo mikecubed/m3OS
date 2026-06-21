@@ -105,6 +105,10 @@ pub const PT_LOAD: u32 = 1;
 pub const PT_DYNAMIC: u32 = 2;
 pub const PT_INTERP: u32 = 3;
 pub const PT_PHDR: u32 = 6;
+/// `PT_TLS` — the thread-local-storage template segment. Phase 93 B.3 reads
+/// the main executable's `PT_TLS` to lay out the static TLS block beneath the
+/// thread pointer (x86_64 variant II).
+pub const PT_TLS: u32 = 7;
 
 // ---------------------------------------------------------------------------
 // x86_64 relocation types (subset Phase 76b applies).
@@ -112,9 +116,52 @@ pub const PT_PHDR: u32 = 6;
 
 pub const R_X86_64_NONE: u32 = 0;
 pub const R_X86_64_64: u32 = 1;
+/// `R_X86_64_COPY` (Phase 93 B.1) — copy `st_size` bytes of a data
+/// symbol from its defining DSO into the relocated image's BSS. Used
+/// when an executable copy-relocates a libc data object for legacy
+/// interposition.
+pub const R_X86_64_COPY: u32 = 5;
 pub const R_X86_64_GLOB_DAT: u32 = 6;
 pub const R_X86_64_JUMP_SLOT: u32 = 7;
 pub const R_X86_64_RELATIVE: u32 = 8;
+/// `R_X86_64_DTPMOD64` (Phase 93 B.3) — general-dynamic TLS module id.
+pub const R_X86_64_DTPMOD64: u32 = 16;
+/// `R_X86_64_DTPOFF64` (Phase 93 B.3) — general-dynamic TLS offset
+/// within the module's TLS block (`st_value + addend`; module-id and
+/// thread-pointer independent, so a foreign loader can always write it).
+pub const R_X86_64_DTPOFF64: u32 = 17;
+/// `R_X86_64_TPOFF64` (Phase 93 B.3) — initial-exec TLS offset relative
+/// to the thread pointer.
+pub const R_X86_64_TPOFF64: u32 = 18;
+/// `R_X86_64_IRELATIVE` (Phase 93 B.2) — IFUNC: the value at
+/// `load_bias + r_addend` is a resolver function; its return value is
+/// written into the relocated slot.
+pub const R_X86_64_IRELATIVE: u32 = 37;
+
+/// Symbol type `STT_GNU_IFUNC` — stored in the low nibble of `st_info`.
+/// A symbol of this type is resolved by *calling* it (it returns the
+/// real implementation address) rather than using its `st_value`.
+pub const STT_GNU_IFUNC: u8 = 10;
+
+/// Symbol binding `STB_WEAK` — stored in the high nibble of `st_info`.
+/// A relocation against a **weak** undefined symbol that resolves nowhere
+/// is satisfied by writing 0 (the consumer guards `if (sym) sym();`), not
+/// a hard undefined-symbol error. GCC's crt objects emit weak refs like
+/// `_ITM_registerTMCloneTable` / `__gmon_start__` that real libc never
+/// provides.
+pub const STB_WEAK: u8 = 2;
+
+/// Extract the symbol *type* (low nibble) from an `Elf64_Sym::st_info`.
+#[inline]
+pub const fn st_type(st_info: u8) -> u8 {
+    st_info & 0x0F
+}
+
+/// Extract the symbol *binding* (high nibble) from an `Elf64_Sym::st_info`.
+#[inline]
+pub const fn st_bind(st_info: u8) -> u8 {
+    st_info >> 4
+}
 
 /// Extract the relocation type from `r_info`. The lower 32 bits of
 /// `r_info` are the type; the upper 32 are the symbol-table index.

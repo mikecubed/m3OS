@@ -495,6 +495,6 @@ Clang roadmap (Phase 33 + Expanded Memory + disk expansion).
 - **IDLE** -- no GUI IDE needed
 - **readline** -- nice to have for REPL but Python works without it
 - **curses** -- would need terminfo database; deferred
-- **ctypes/cffi** -- needs `dlopen()`; deferred until dynamic linking
+- **ctypes/cffi** -- needs `dlopen()`; **delivered in [Phase 93 (Dynamic C Runtime)](./93-dynamic-c-runtime.md)** — the dynamic `python3` variant ships `_ctypes` and `ctypes.CDLL(...)` opens a shared object + calls a function inside m3OS (was: deferred until dynamic linking)
 - **distutils/setuptools** -- deprecated; pip handles this
 - **NumPy/SciPy** -- C/Fortran extensions; requires a full compiler toolchain
