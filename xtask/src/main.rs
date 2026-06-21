@@ -22200,7 +22200,19 @@ fn coreutils_smoke_steps() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: "pkg install: coreutils: OK",
-        fail_prefixes: &["pkg install: cannot"],
+        // Cover the reachable terminal-failure modes of the installer's
+        // `install_one` (userspace/pkg/src/main.rs) so an uncovered failure fails
+        // fast with a precise captured line instead of burning the full timeout. A
+        // bare `pkg install:` prefix is deliberately avoided — it would over-match
+        // the benign `reading`/`verifying`/`installing N files` progress lines.
+        fail_prefixes: &[
+            "pkg install: cannot",
+            "pkg install: integrity check FAILED",
+            "pkg install: parse error",
+            "pkg install: entry content error",
+            "pkg install: write error",
+            "pkg install: DB update error",
+        ],
         timeout_secs: 600,
         label: "coreutils-smoke: coreutils installed from .m3pkg (DEPS= empty)",
         exit_code_on_fail: SMOKE_EXIT_COREUTILS_SMOKE_FAILED,
@@ -22356,6 +22368,105 @@ fn coreutils_smoke_steps() -> Vec<SmokeStep> {
         pattern: "# ",
         timeout_secs: 30,
         label: "coreutils-smoke: prompt after cat removed",
+    });
+
+    // 6b. Recursive attribute ops + `install -D` — the regression guard for the
+    //     fd-relative `*at` syscalls uutils' `uucore::safe_traversal` issues (the
+    //     same TOCTOU-safe family that forced `unlinkat`): `chmod -R` →
+    //     `fchmodat2`(452)/`fchmodat`(268), `chown -R` → `fchownat`(260),
+    //     `install -D` → `mkdirat`(258). m3OS routes plain chmod/chown/mkdir to the
+    //     legacy syscalls (90/92/83) so the non-recursive applets already worked,
+    //     but the recursive/`-D` walk hard-routes to the `*at` form with NO musl
+    //     legacy fallback — without the kernel handlers each ENOSYS-fails and the
+    //     applet errors (chmod -R's NoFollow path would fall into musl's
+    //     `/proc/self/fd` emulation, which m3OS lacks). Each op is proven by reading
+    //     the result back (`stat`/`cat`), so a silent ENOSYS regression fails the
+    //     gate rather than passing on an unchecked exit.
+    steps.extend(cmd_then_prompt(
+        "/bin/echo amode > /tmp/cu_at\n",
+        "coreutils-smoke: *at fixture file",
+        "coreutils-smoke: prompt after *at fixture",
+        30,
+    ));
+    steps.extend(cmd_then_prompt(
+        "mkdir -p /tmp/cuat/sub\n",
+        "coreutils-smoke: mkdir -p *at tree",
+        "coreutils-smoke: prompt after *at mkdir",
+        120,
+    ));
+    steps.extend(cmd_then_prompt(
+        "cp /tmp/cu_at /tmp/cuat/sub/f\n",
+        "coreutils-smoke: seed *at tree file",
+        "coreutils-smoke: prompt after *at seed cp",
+        120,
+    ));
+    // chmod -R 750 (NoFollow → raw fchmodat2(452)); read the mode back. A
+    // distinctive 750 proves the recursive chmod actually applied (the freshly
+    // created file's default mode is not 750), so the fd-relative chmod worked.
+    steps.extend(cmd_then_prompt(
+        "chmod -R 750 /tmp/cuat\n",
+        "coreutils-smoke: chmod -R (fchmodat2/fchmodat)",
+        "coreutils-smoke: prompt after chmod -R",
+        120,
+    ));
+    steps.push(SmokeStep::Send {
+        input: "stat -c %a /tmp/cuat/sub/f\n",
+        label: "coreutils-smoke: stat mode after chmod -R",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "750",
+        timeout_secs: 120,
+        label: "coreutils-smoke: chmod -R applied 750 recursively (fchmodat2/268 works)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 30,
+        label: "coreutils-smoke: prompt after stat mode",
+    });
+    // chown -R 321:321 (fchownat(260)); read the uid back — 321 proves it applied.
+    steps.extend(cmd_then_prompt(
+        "chown -R 321:321 /tmp/cuat\n",
+        "coreutils-smoke: chown -R (fchownat)",
+        "coreutils-smoke: prompt after chown -R",
+        120,
+    ));
+    steps.push(SmokeStep::Send {
+        input: "stat -c %u /tmp/cuat/sub/f\n",
+        label: "coreutils-smoke: stat uid after chown -R",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "321",
+        timeout_secs: 120,
+        label: "coreutils-smoke: chown -R applied uid 321 recursively (fchownat works)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 30,
+        label: "coreutils-smoke: prompt after stat uid",
+    });
+    // install -D creates the dest's leading dirs via mkdirat(258) then copies.
+    steps.push(SmokeStep::Send {
+        input: "install -D /tmp/cu_at /tmp/cuinst/a/b/dst\n",
+        label: "coreutils-smoke: install -D (mkdirat)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 120,
+        label: "coreutils-smoke: prompt after install -D",
+    });
+    steps.push(SmokeStep::Send {
+        input: "cat /tmp/cuinst/a/b/dst\n",
+        label: "coreutils-smoke: cat install -D dest",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "amode",
+        timeout_secs: 120,
+        label: "coreutils-smoke: install -D created leading dirs + copied (mkdirat works)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 30,
+        label: "coreutils-smoke: prompt after cat install dest",
     });
 
     // 7. wc -l on a known 3-line file.

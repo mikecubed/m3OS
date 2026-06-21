@@ -1352,8 +1352,18 @@ mod syscall_nr {
     pub const UMOUNT2: u64 = 166;
     pub const GETDENTS64: u64 = 217;
     pub const OPENAT: u64 = 257;
+    pub const MKDIRAT: u64 = 258;
+    pub const FCHOWNAT: u64 = 260;
     pub const NEWFSTATAT: u64 = 262;
     pub const UNLINKAT: u64 = 263;
+    pub const FCHMODAT: u64 = 268;
+    // Phase 94 — uutils `chmod -R` walks with `SymlinkBehavior::NoFollow`, which
+    // issues raw `fchmodat2(452, dirfd, name, mode, AT_SYMLINK_NOFOLLOW)` FIRST and
+    // only falls back to the legacy `fchmodat(268)` on `ENOSYS`. That musl fallback
+    // emulates `AT_SYMLINK_NOFOLLOW` via `O_PATH` + `/proc/self/fd`, neither of
+    // which m3OS implements — so `fchmodat2` must be handled directly, not left to
+    // ENOSYS-fall-through, or `chmod -R` fails on every regular file.
+    pub const FCHMODAT2: u64 = 452;
     pub const STATX: u64 = 332;
     pub const LINKAT: u64 = 265;
     pub const SYMLINKAT: u64 = 266;
@@ -1870,6 +1880,7 @@ pub extern "C" fn syscall_handler(
         CHDIR => sys_linux_chdir(arg0),
         RENAME => sys_linux_rename(arg0, arg1),
         MKDIR => sys_linux_mkdir(arg0, arg1),
+        MKDIRAT => sys_linux_mkdirat(arg0, arg1, arg2),
         RMDIR => sys_linux_rmdir(arg0),
         LINK => sys_link(arg0, arg1),
         UNLINK => sys_linux_unlink(arg0),
@@ -1878,8 +1889,21 @@ pub extern "C" fn syscall_handler(
         READLINK => sys_readlink(arg0, arg1, arg2),
         CHMOD => sys_linux_chmod(arg0, arg1),
         FCHMOD => sys_linux_fchmod(arg0, arg1),
+        FCHMODAT => sys_linux_fchmodat(arg0, arg1, arg2, per_core_syscall_arg3()),
+        // fchmodat2(dirfd, path, mode, flags): identical to fchmodat on m3OS (the
+        // chmod core follows symlinks; the recursive walk pre-filters them), but
+        // handled directly so uutils' NoFollow chmod -R does not fall back to the
+        // unsupported musl `/proc/self/fd` emulation. See FCHMODAT2 in syscall_nr.
+        FCHMODAT2 => sys_linux_fchmodat(arg0, arg1, arg2, per_core_syscall_arg3()),
         CHOWN => sys_linux_chown(arg0, arg1, arg2),
         FCHOWN => sys_linux_fchown(arg0, arg1, arg2),
+        FCHOWNAT => sys_linux_fchownat(
+            arg0,
+            arg1,
+            arg2,
+            per_core_syscall_arg3(),
+            crate::task::current_task_syscall_snapshot().user_r8,
+        ),
         STATFS => sys_statfs(arg0, arg1),
         FSTATFS => sys_fstatfs(arg0, arg1),
         MOUNT => sys_linux_mount(arg0, arg1, arg2),
@@ -10994,12 +11018,38 @@ fn create_parent_is_read_only(abs_path: &str) -> bool {
 
 /// `chmod(path, mode)` — change file mode bits (syscall 90).
 pub(super) fn sys_linux_chmod(path_ptr: u64, mode_arg: u64) -> u64 {
+    sys_linux_chmod_at(AT_FDCWD, path_ptr, mode_arg)
+}
+
+/// Phase 94 — `fchmodat(dirfd, pathname, mode, flags)` (syscall 268), also the
+/// handler for `fchmodat2`(452). uutils `chmod -R` walks a directory tree via
+/// `uucore::safe_traversal` (the TOCTOU-safe fd-relative family that also forced
+/// `unlinkat`) and applies modes with `fchmodat2`/`fchmodat(dirfd, name, mode, …)`.
+/// musl's `chmod()` is the legacy `SYS_chmod`(90) on x86_64, so non-recursive chmod
+/// already worked; only the fd-relative `*at` form was missing. Routes to the
+/// dirfd-aware chmod core. The `flags` arg (`AT_SYMLINK_NOFOLLOW`=0x100) is accepted
+/// but not specially honored: m3OS chmod always follows symlinks (no `lchmod`),
+/// Linux itself returns `EOPNOTSUPP` for it on most filesystems, and the recursive
+/// walk has already confirmed each target is not a symlink (so follow == nofollow).
+pub(super) fn sys_linux_fchmodat(dirfd: u64, path_ptr: u64, mode_arg: u64, _flags: u64) -> u64 {
+    sys_linux_chmod_at(dirfd, path_ptr, mode_arg)
+}
+
+/// `chmod` core, dirfd-aware. The `AT_FDCWD` path is byte-equivalent to the prior
+/// `resolve_path(&cwd, …)` behaviour for relative and absolute paths; the only
+/// difference is an empty path, which now returns `ENOENT` (matching Linux
+/// `chmod("")==ENOENT`) instead of degenerately targeting the cwd.
+pub(super) fn sys_linux_chmod_at(dirfd: u64, path_ptr: u64, mode_arg: u64) -> u64 {
     let mut buf = [0u8; 512];
     let raw = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
         None => return NEG_EFAULT,
     };
-    let abs = match resolve_existing_fs_path(&resolve_path(&current_cwd(), raw), true) {
+    let lexical = match resolve_path_from_dirfd(dirfd, raw) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let abs = match resolve_existing_fs_path(&lexical, true) {
         Ok(path) => path,
         Err(err) => return err,
     };
@@ -11087,12 +11137,41 @@ pub(super) fn sys_linux_fchmod(fd: u64, mode_arg: u64) -> u64 {
 /// `chown(path, uid, gid)` — change file owner (syscall 92).
 /// Only root can change file ownership.
 pub(super) fn sys_linux_chown(path_ptr: u64, uid_arg: u64, gid_arg: u64) -> u64 {
+    sys_linux_chown_at(AT_FDCWD, path_ptr, uid_arg, gid_arg)
+}
+
+/// Phase 94 — `fchownat(dirfd, pathname, owner, group, flags)` (syscall 260).
+/// uutils `chown -R` walks the tree via `uucore::safe_traversal` and applies
+/// ownership with `fchownat(dirfd, name, …)` (the fd-relative sibling of the
+/// `unlinkat`/`fchmodat` family). musl's `chown()` is the legacy `SYS_chown`(92)
+/// on x86_64 so non-recursive chown already worked; this adds the `*at` form.
+/// `flags` (`AT_SYMLINK_NOFOLLOW`=0x100) is accepted but not specially honored —
+/// m3OS chown always follows symlinks; the recursive walk targets regular tree
+/// entries, where follow-vs-nofollow does not differ.
+pub(super) fn sys_linux_fchownat(
+    dirfd: u64,
+    path_ptr: u64,
+    uid_arg: u64,
+    gid_arg: u64,
+    _flags: u64,
+) -> u64 {
+    sys_linux_chown_at(dirfd, path_ptr, uid_arg, gid_arg)
+}
+
+/// `chown` core, dirfd-aware. The `AT_FDCWD` path is byte-equivalent to the prior
+/// `resolve_path(&cwd, …)` behaviour for relative and absolute paths (empty path
+/// now returns `ENOENT`, matching Linux).
+pub(super) fn sys_linux_chown_at(dirfd: u64, path_ptr: u64, uid_arg: u64, gid_arg: u64) -> u64 {
     let mut buf = [0u8; 512];
     let raw = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
         None => return NEG_EFAULT,
     };
-    let abs = match resolve_existing_fs_path(&resolve_path(&current_cwd(), raw), true) {
+    let lexical = match resolve_path_from_dirfd(dirfd, raw) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let abs = match resolve_existing_fs_path(&lexical, true) {
         Ok(path) => path,
         Err(err) => return err,
     };
@@ -15985,6 +16064,18 @@ pub(super) fn sys_utimensat(_dirfd: u64, path_ptr: u64, times_ptr: u64, _flags: 
 // ---------------------------------------------------------------------------
 
 pub(super) fn sys_linux_mkdir(path_ptr: u64, mode: u64) -> u64 {
+    sys_linux_mkdirat(AT_FDCWD, path_ptr, mode)
+}
+
+/// Phase 94 — `mkdirat(dirfd, pathname, mode)` (syscall 258). uutils `install -D`
+/// creates the destination's parent dirs via `uucore::safe_traversal`'s
+/// `create_dir_all_safe`, which issues `mkdirat(dirfd, name, mode)` (the
+/// fd-relative sibling of `unlinkat`/`fchmodat`/`fchownat`). musl's `mkdir()` is
+/// the legacy `SYS_mkdir`(83) on x86_64 so `mkdir`/`mkdir -p`/`cp -r` dir creation
+/// already worked; this adds the `*at` form. The `AT_FDCWD` path is byte-equivalent
+/// to the prior `sys_linux_mkdir` behaviour (which already routed through
+/// `resolve_path_from_dirfd(AT_FDCWD, …)`).
+pub(super) fn sys_linux_mkdirat(dirfd: u64, path_ptr: u64, mode: u64) -> u64 {
     let mut buf = [0u8; 512];
     let raw_name = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
@@ -15992,7 +16083,7 @@ pub(super) fn sys_linux_mkdir(path_ptr: u64, mode: u64) -> u64 {
     };
 
     // mkdir() should resolve parent symlinks but operate on the lexical basename.
-    let lexical = match resolve_path_from_dirfd(AT_FDCWD, raw_name) {
+    let lexical = match resolve_path_from_dirfd(dirfd, raw_name) {
         Ok(path) => path,
         Err(err) => return err,
     };
@@ -16191,8 +16282,10 @@ pub(super) fn sys_linux_unlinkat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
     }
 }
 
-/// `rmdir` core, dirfd-aware (the `AT_FDCWD` path is byte-equivalent to the prior
-/// `resolve_path(&cwd, …)` behaviour for both relative and absolute paths).
+/// `rmdir` core, dirfd-aware. The `AT_FDCWD` path is byte-equivalent to the prior
+/// `resolve_path(&cwd, …)` behaviour for relative and absolute paths; the only
+/// difference is an empty path, which now returns `ENOENT` (matching Linux
+/// `rmdir("")==ENOENT`) instead of the prior cwd-dependent `EROFS`/`EINVAL`.
 pub(super) fn sys_linux_rmdir_at(dirfd: u64, path_ptr: u64) -> u64 {
     let mut buf = [0u8; 512];
     let raw_name = match read_user_cstr(path_ptr, &mut buf) {

@@ -142,23 +142,39 @@ A std Rust binary built for `x86_64-unknown-linux-musl` static-links musl libc a
 the same Linux syscalls as the C ports (`git`, `Python`). m3OS's Phase 12 Linux-syscall
 compatibility layer (`kernel/src/arch/x86_64/syscall/mod.rs`) already handles the ~121
 Linux syscalls those ports exercise: `openat`, `read`, `write`, `getdents64`, `newfstatat`,
-`statfs`, `readlinkat`, `symlinkat`, `fchmodat`, `utimensat`, `getrandom`, and the
+`statfs`, `readlinkat`, `symlinkat`, `utimensat`, `getrandom`, and the
 threading path (`clone`/`futex`/`set_tid_address`). The static-ELF loader (`kernel/src/mm/elf.rs`)
 maps the binary. The runtime substrate is already proven; Phase 94 adds only the build
-plumbing.
+plumbing — plus one small, contained family of kernel syscalls described next.
 
-**One syscall gap surfaced (the anticipated patch-bump case).** uutils `rm`'s `uucore`
-`safe-traversal` feature removes files/dirs via the TOCTOU-safe fd-relative path —
-`openat()` the parent directory, then `fstatat(dirfd, name)` / `unlinkat(dirfd, name, flags)`
-— rather than plain `unlink`/`rmdir`. m3OS already resolved real dirfds for `openat` and
-`newfstatat` (via `resolve_path_from_dirfd`), but had **no `unlinkat` (263)**, so `rm -r`
-removed *nothing* (it returned, but every removal `-ENOSYS`'d). The fix is contained:
-`sys_linux_unlinkat` routes by `AT_REMOVEDIR` to dirfd-aware `sys_linux_unlink_at` /
-`sys_linux_rmdir_at` (the existing `unlink`/`rmdir` cores, with `AT_FDCWD` resolution
-generalized to any dirfd via `resolve_path_from_dirfd`). This is the **only** kernel change in
-the phase and carried a **patch** bump (`0.94.0` → `0.94.1`). Lesson: a std/musl binary that
-"just issues Linux syscalls" can still exercise a corner (fd-relative removal) the existing C
-ports never hit — `coreutils-smoke` is what caught it.
+**A family of fd-relative `*at` syscall gaps surfaced (the anticipated patch-bump case).**
+uutils' `uucore::safe_traversal` performs recursive metadata ops via the TOCTOU-safe
+fd-relative path — `openat()` the parent directory, then operate by `(dirfd, name)` — rather
+than the legacy path syscalls. Crucially, **musl on x86_64 keeps the legacy syscalls for the
+non-`at` wrappers** (`chmod`→`SYS_chmod`(90), `chown`→`SYS_chown`(92), `mkdir`→`SYS_mkdir`(83),
+`unlink`→`SYS_unlink`(87)), but the `*at` forms are bare `syscall(SYS_…at)` with **no legacy
+fallback**. So plain `chmod`/`chown`/`mkdir -p`/`cp -p`/`cp -r` worked from day one, while the
+recursive / fd-relative applets hit syscalls m3OS had never implemented:
+
+| uutils applet (path) | fd-relative syscall | was missing |
+|---|---|---|
+| `rm -r` (`uucore` safe removal) | `unlinkat`(263) | yes → `rm -r` removed *nothing* |
+| `chmod -R` (NoFollow walk) | `fchmodat2`(452) then `fchmodat`(268) | yes |
+| `chown -R` | `fchownat`(260) | yes |
+| `install -D` (parent-dir create) | `mkdirat`(258) | yes |
+
+Each was added as a thin dirfd-aware wrapper over the **existing** `unlink`/`rmdir`/`chmod`/
+`chown`/`mkdir` core, routing through the `resolve_path_from_dirfd` helper m3OS already used
+for `openat`/`newfstatat`; the `AT_FDCWD` path stays byte-equivalent to the prior behaviour.
+`fchmodat2`(452) is handled directly (not left to ENOSYS): `chmod -R`'s NoFollow path tries
+raw 452 first and the musl `fchmodat`(268) fallback emulates `AT_SYMLINK_NOFOLLOW` via
+`O_PATH` + `/proc/self/fd`, which m3OS does not implement — so 452 must succeed in-kernel.
+These syscalls (`unlinkat`/`fchmodat`/`fchmodat2`/`fchownat`/`mkdirat`) are the **only** kernel
+change in the phase and carried a single **patch** bump (`0.94.0` → `0.94.1`). Lesson: a
+std/musl binary that "just issues Linux syscalls" can still exercise a whole corner of the
+ABI (fd-relative metadata ops) the existing C ports never hit — `coreutils-smoke`, which now
+exercises `rm -r`, `chmod -R`, `chown -R`, and `install -D` and reads each result back, is
+what caught it.
 
 ## Key Files
 
@@ -190,7 +206,7 @@ ports never hit — `coreutils-smoke` is what caught it.
 
 - [Phase 94 design doc](./roadmap/94-rust-cargo-uutils.md)
 - [Phase 94 task doc](./roadmap/tasks/94-rust-cargo-uutils-tasks.md)
-- [Phase 85a — Package substrate](./roadmap/85a-pkg-format.md) (the `.m3pkg`/pkgcache/`pkg` installer this phase extends)
+- [Phase 85a — Package substrate](./roadmap/85a-package-infrastructure.md) (the `.m3pkg`/pkgcache/`pkg` installer this phase extends)
 - [Phase 44 — Rust cross-compilation](./roadmap/44-rust-cross-compilation.md) (the `build_musl_rust_bins`/`build_ion` precedent)
 - [Phase 12 — POSIX compatibility layer](./12-posix-compatibility-layer.md) (the Linux-syscall compat layer uutils rides)
 
