@@ -2397,7 +2397,7 @@ fn verify_libc_so(path: &Path) -> Result<(), String> {
 }
 
 /// Resolve a `readelf` binary, preferring a musl-cross one if present.
-fn which_readelf() -> String {
+pub(crate) fn which_readelf() -> String {
     for cand in [
         "x86_64-linux-musl-readelf",
         "x86_64-linux-gnu-readelf",

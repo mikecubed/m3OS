@@ -1464,13 +1464,22 @@ unsafe fn apply_rela(
                         }
                     };
                 let size = sym.st_size as usize;
+                // `from_raw_parts` is UB when `len > isize::MAX`. The
+                // `range_in_any_image` check below already precludes that
+                // transitively — no mapped image on x86_64 approaches 2^63, so a
+                // `size` that large can never fit — but make the invariant local
+                // and explicit so the `unsafe` slice is self-evidently sound on a
+                // corrupt `st_size` rather than relying on that argument.
+                if size > isize::MAX as usize {
+                    serial(b"ldso: copy-reloc size exceeds isize::MAX\n");
+                    return Err("copy-reloc size exceeds isize::MAX");
+                }
                 // Bounds-check the *read* (provider) side too: `size` is the
                 // consumer-supplied `st_size`, and `apply_copy` only validates
                 // the write target. Confirm `[src_addr, src_addr + size)` lies
                 // inside some loaded image before forming the slice — a corrupt
-                // `st_size` would otherwise over-read the provider (and a `size`
-                // past `isize::MAX` would be `from_raw_parts` UB; `range_in_image`
-                // is overflow-safe and rejects both).
+                // `st_size` would otherwise over-read the provider. `range_in_image`
+                // is overflow-safe (`checked_add`).
                 if size > 0 && !range_in_any_image(dsos, src_addr, size as u64) {
                     serial(b"ldso: copy-reloc source out of image\n");
                     return Err("copy-reloc source out of image");
@@ -1928,6 +1937,17 @@ unsafe fn setup_static_tls(at_phdr: *const Phdr, at_phnum: usize, dsos: &[Loaded
     // Copy the main exe's .tdata into the block at TP - tls_offset; .tbss is
     // already zero (anonymous mmap).
     if tls_memsz > 0 {
+        // Fail closed on a malformed PT_TLS: .tdata (`p_filesz`) must fit within
+        // the TLS image (`p_memsz`) — the block below is sized for `tls_offset`
+        // = round_up(memsz, align) >= memsz, so a hostile/corrupt exe with
+        // `p_filesz > p_memsz` would otherwise over-read the template and
+        // overflow the block into the TCB. Real toolchains always emit
+        // `p_filesz <= p_memsz`; leaving TLS unset (the existing mmap-fail path's
+        // behaviour) is the correct fail-closed outcome for a bad binary.
+        if tls_filesz > tls_memsz {
+            serial(b"ldso: PT_TLS p_filesz > p_memsz (malformed); TLS not set\n");
+            return;
+        }
         let block = tp - tls_offset;
         unsafe {
             core::ptr::copy_nonoverlapping(

@@ -21457,9 +21457,43 @@ int main(void) {
     if !out.exists() {
         return Err("dynamic-hello binary missing after compile".to_string());
     }
+    // Fail closed on a non-dynamic fixture. The whole point of this gate is to
+    // exercise the m3OS dynamic loader, so the fixture MUST request it as its
+    // PT_INTERP. A musl toolchain that links static-by-default or lacks shared
+    // musl in its sysroot would silently produce a static / static-PIE binary
+    // here, turning the gate into a false positive (it would no longer touch the
+    // loader at all). Assert PT_INTERP=/lib/ld-musl-x86_64.so.1 via readelf,
+    // mirroring the hardened `verify_libc_so` fail-closed readelf pattern.
+    const INTERP: &str = "/lib/ld-musl-x86_64.so.1";
+    let readelf = port_build::which_readelf();
+    let ph_out = Command::new(&readelf)
+        .args(["-lW"])
+        .arg(&out)
+        .output()
+        .map_err(|e| format!("readelf -l {}: {e}", out.display()))?;
+    if !ph_out.status.success() {
+        return Err(format!(
+            "readelf -l {} failed ({}): {}",
+            out.display(),
+            ph_out.status,
+            String::from_utf8_lossy(&ph_out.stderr).trim(),
+        ));
+    }
+    let ph_text = String::from_utf8_lossy(&ph_out.stdout);
+    // readelf prints e.g. "[Requesting program interpreter: /lib/ld-musl-x86_64.so.1]".
+    if !ph_text.contains(&format!("[Requesting program interpreter: {INTERP}]")) {
+        return Err(format!(
+            "dynamic-hello fixture {} is not a dynamic ELF requesting {INTERP} as PT_INTERP \
+             (the musl toolchain linked it static / static-PIE — the gate would no longer \
+             exercise the m3OS loader); readelf -l program headers:\n{}",
+            out.display(),
+            ph_text.trim(),
+        ));
+    }
+
     let sz = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
     println!(
-        "dynamic-hello-smoke: built fixture {} ({sz} bytes)",
+        "dynamic-hello-smoke: built fixture {} ({sz} bytes, PT_INTERP={INTERP})",
         out.display()
     );
     Ok(true)
