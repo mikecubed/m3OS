@@ -196,8 +196,10 @@ what caught it.
 - The uutils build **fetches crates from crates.io** during the host build (`--locked`).
   A fully-offline vendored-source tarball (hermetic, network-free) is the reproducibility
   upgrade deferred to a follow-on.
-- `stat`/inode-identity rigor (uutils `ls -i`, hardlink detection in `du`/`cp`) may expose
-  VFS `st_ino` inconsistencies; full correctness there depends on **Phase 88**.
+- `stat`/inode-identity rigor (uutils `ls -i`, hardlink detection in `du`/`cp`) depends on the
+  VFS returning consistent, non-zero `(st_dev, st_ino)` — delivered by **Phase 88** (PR #240,
+  before this phase), so `coreutils-smoke` exercises it directly on the ext2 root (hardlink
+  nlink + shared-vs-distinct inode assertions) rather than deferring it.
 - **Phase 95** (Native Rust Toolchain) will reuse the prebuilt-std musl path to cross-compile
   a proc-macro `.so` — a more complex Rust-cargo port because proc-macros are `dlopen`'d at
   compile time and need the Phase 93 dynamic loader.
@@ -220,8 +222,12 @@ what caught it.
 - **SELinux / locale-heavy applets.** `chcon`/`runcon` and any applet depending on facilities
   m3OS lacks are excluded from the feature set, not stubbed.
 - **`stat`/inode-identity rigor.** uutils is stricter about `(st_dev, st_ino)` than the
-  hand-built tools (`ls -i`, hardlink detection in `du`/`cp`), so it may surface the VFS
-  `st_ino` inconsistency that **Phase 88** addresses; full correctness there rides on Phase 88.
+  hand-built tools (`ls -i`, hardlink detection in `du`/`cp`). The enabling fix — a canonical
+  `fill_stat()` yielding consistent, non-zero `(st_dev, st_ino)` — landed in **Phase 88**
+  (PR #240, before this phase), so this is no longer deferred: `coreutils-smoke` asserts it on
+  the ext2 root (hardlink `nlink` 2→1 across an unlink; shared inode for hardlinked names,
+  distinct non-zero inodes for distinct files). Deeper locale/`-i`-format edge cases stay
+  best-effort.
 - **`findutils`/`diffutils`/other uutils projects.** Only `uutils/coreutils` is in scope;
   the Rust-cargo port class this phase establishes makes them straightforward follow-ons.
 - **Rust-cargo ports with C FFI.** A future Rust crate that pulls a `cc`-built C dependency

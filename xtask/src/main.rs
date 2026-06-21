@@ -22583,6 +22583,174 @@ fn coreutils_smoke_steps() -> Vec<SmokeStep> {
         label: "coreutils-smoke: prompt after ramdisk sha256sum",
     });
 
+    // 10b. Inode identity & hardlinks — the Phase 88 VFS `st_ino` rigor, now
+    //      exercised on the uutils path. The Phase 94 design doc deferred this to
+    //      Phase 88 (consistent, non-zero `(st_dev, st_ino)` from a canonical
+    //      `fill_stat()`), which has since landed (PR #240); uutils' inode-sensitive
+    //      applets (`ls -i`, hardlink detection in `du`/`cp`) all read the same
+    //      `st_ino`/`st_nlink` this battery asserts directly, so `stat -c %i`/`%h`
+    //      are the deterministic proxies. Runs on the EXT2/`vfs_server` root
+    //      (`/root`, the login home — `# ` is the root prompt), NOT `/tmp`: `/tmp`
+    //      is tmpfs with a separate stat path and would bypass the Phase 88 fix and
+    //      the `vfs_service_link` ext2 hardlink route. Every assertion is against a
+    //      known constant (no capture-compare): `stat -c nlink=%h` → 2 then 1, the
+    //      distinct-inode cardinality (`stat -c %i … | sort -u > f; wc -l f`) → 1
+    //      for the two hardlinked names (shared inode) vs 2 for two distinct files,
+    //      and the hardlink content surviving `rm` of the original name.
+    //      `ln`/`stat`/`sort`/`wc`/`cat` are all bare → the installed uutils
+    //      applets. A regression of Phase 88's `fill_stat` to `st_ino=0` (the 85d
+    //      clang bug) collapses distinct files onto one identity → the distinctness
+    //      step reads `1 …` instead of `2 …` and the gate fails.
+    steps.extend(cmd_then_prompt(
+        "mkdir -p /root/cuino\n",
+        "coreutils-smoke: mkdir inode-test dir (ext2)",
+        "coreutils-smoke: prompt after inode mkdir",
+        120,
+    ));
+    steps.extend(cmd_then_prompt(
+        "/bin/echo culinkpayload > /root/cuino/a\n",
+        "coreutils-smoke: seed inode file a",
+        "coreutils-smoke: prompt after seed a",
+        30,
+    ));
+    steps.extend(cmd_then_prompt(
+        "/bin/echo otherpayload > /root/cuino/x\n",
+        "coreutils-smoke: seed distinct inode file x",
+        "coreutils-smoke: prompt after seed x",
+        30,
+    ));
+    // `ln a b` (no -s) — a real ext2 hardlink; Phase 88 routes link() through
+    // `vfs_service_link` to the vfs_server authority.
+    steps.extend(cmd_then_prompt(
+        "ln /root/cuino/a /root/cuino/b\n",
+        "coreutils-smoke: ln hardlink a -> b",
+        "coreutils-smoke: prompt after ln",
+        120,
+    ));
+    // nlink == 2 on BOTH names — link() bumped i_links_count and uutils stat reads
+    // it back through fill_stat's st_nlink. The literal `nlink=%h` format means the
+    // echoed command can never spuriously satisfy the `nlink=2` wait.
+    steps.push(SmokeStep::Send {
+        input: "stat -c nlink=%h /root/cuino/a\n",
+        label: "coreutils-smoke: stat nlink of original",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "nlink=2",
+        timeout_secs: 120,
+        label: "coreutils-smoke: original reports nlink=2 (hardlink created)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 30,
+        label: "coreutils-smoke: prompt after stat nlink a",
+    });
+    steps.push(SmokeStep::Send {
+        input: "stat -c nlink=%h /root/cuino/b\n",
+        label: "coreutils-smoke: stat nlink of link",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "nlink=2",
+        timeout_secs: 120,
+        label: "coreutils-smoke: link side also reports nlink=2",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 30,
+        label: "coreutils-smoke: prompt after stat nlink b",
+    });
+    // Inode IDENTITY: a and b share one st_ino, so the two printed inode numbers
+    // dedup to a single line — `wc -l` of the deduped file reports `1 …`. (One pipe
+    // into `sort -u`, proven by the §8 sort step; the file-based `wc -l FILE`
+    // mirrors the §7 `wc -l` form, so the distinctive `1 /root/cuino/ids_ab` can't
+    // be satisfied by a stray digit.)
+    steps.extend(cmd_then_prompt(
+        "stat -c %i /root/cuino/a /root/cuino/b | sort -u > /root/cuino/ids_ab\n",
+        "coreutils-smoke: collect deduped inodes for a,b",
+        "coreutils-smoke: prompt after collect ids_ab",
+        120,
+    ));
+    steps.push(SmokeStep::Send {
+        input: "wc -l /root/cuino/ids_ab\n",
+        label: "coreutils-smoke: count distinct inodes for a,b (hardlinks)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "1 /root/cuino/ids_ab",
+        timeout_secs: 120,
+        label: "coreutils-smoke: a and b share one st_ino (cardinality 1)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 30,
+        label: "coreutils-smoke: prompt after ids_ab count",
+    });
+    // Inode DISTINCTNESS: two genuinely different files (a, x) have two different
+    // non-zero st_ino → cardinality 2. This is the exact Phase 88 regression guard —
+    // a revert to st_ino=0 collapses them onto one identity and this reads `1 …`.
+    steps.extend(cmd_then_prompt(
+        "stat -c %i /root/cuino/a /root/cuino/x | sort -u > /root/cuino/ids_ax\n",
+        "coreutils-smoke: collect deduped inodes for a,x",
+        "coreutils-smoke: prompt after collect ids_ax",
+        120,
+    ));
+    steps.push(SmokeStep::Send {
+        input: "wc -l /root/cuino/ids_ax\n",
+        label: "coreutils-smoke: count distinct inodes for a,x (distinct files)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "2 /root/cuino/ids_ax",
+        timeout_secs: 120,
+        label: "coreutils-smoke: distinct files have distinct st_ino (no st_ino=0 collapse)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 30,
+        label: "coreutils-smoke: prompt after ids_ax count",
+    });
+    // Behavioral hardlink semantics: removing the ORIGINAL name leaves the data
+    // reachable via the link (shared inode, refcounted) — `cat b` still prints the
+    // payload after `rm a`.
+    steps.extend(cmd_then_prompt(
+        "rm /root/cuino/a\n",
+        "coreutils-smoke: rm original hardlink name",
+        "coreutils-smoke: prompt after rm original",
+        120,
+    ));
+    steps.push(SmokeStep::Send {
+        input: "cat /root/cuino/b\n",
+        label: "coreutils-smoke: cat surviving hardlink",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "culinkpayload",
+        timeout_secs: 120,
+        label: "coreutils-smoke: data survives unlink of original (shared inode)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 30,
+        label: "coreutils-smoke: prompt after cat survivor",
+    });
+    // nlink decremented 2 -> 1 after one name was removed (unlink kept the inode).
+    steps.push(SmokeStep::Send {
+        input: "stat -c nlink=%h /root/cuino/b\n",
+        label: "coreutils-smoke: stat nlink after rm original",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "nlink=1",
+        timeout_secs: 120,
+        label: "coreutils-smoke: nlink dropped to 1 after unlink (refcount)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 30,
+        label: "coreutils-smoke: prompt after stat nlink survivor",
+    });
+    steps.extend(cmd_then_prompt(
+        "rm -r /root/cuino\n",
+        "coreutils-smoke: clean up inode-test dir",
+        "coreutils-smoke: prompt after inode cleanup",
+        120,
+    ));
+
     // 11. Uninstall + ramdisk-floor fallback (C.3). `pkg remove` unlinks the
     //     binary + all 106 applet symlinks, so /usr/local/bin/ls is gone — a BARE
     //     `ls` necessarily falls back to the ramdisk /bin/ls, which still lists the
