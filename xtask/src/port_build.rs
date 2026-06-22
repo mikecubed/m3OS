@@ -2030,12 +2030,23 @@ fn build_rust(extracted: &Path, stage: &Path, _port_dir: &Path) -> Result<(), St
         }
     }
 
-    // Persistent cross-build workspace OUTSIDE the port work dir that `port_build`
-    // wipes + re-extracts every run (which would force a multi-hour rebuild on each
-    // retry). A stable source tree + persistent x.py `build/` keep staging-bug
-    // iterations cheap; the Phase 85a pkgcache still caches the sealed `.m3pkg` so a
-    // clean machine pays the full build exactly once.
-    let cross_root = root.join("target/rust-cross");
+    // Persistent cross-build workspace OUTSIDE the m3OS Cargo workspace tree (not
+    // under `target/`). x.py drives `cargo` over the extracted rustc source, and
+    // cargo walks UP the directory tree for both `Cargo.toml` and
+    // `.cargo/config.toml`: under `target/` it binds rust's `src/bootstrap` to the
+    // m3OS workspace AND inherits m3OS's `build.target = x86_64-unknown-none`,
+    // breaking the host bootstrap ("can't find crate for core/std"). Building under
+    // `$HOME/.cache` (like the bring-up scratch) has no such ancestor config. A
+    // stable source tree + persistent x.py `build/` also keep staging-bug iterations
+    // cheap (the Phase 85a pkgcache still seals the `.m3pkg`, so a clean machine pays
+    // the full build once). Overridable via `M3OS_RUST_CROSS_DIR`.
+    let cross_root = match std::env::var("M3OS_RUST_CROSS_DIR") {
+        Ok(d) if !d.trim().is_empty() => PathBuf::from(d),
+        _ => {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+            PathBuf::from(home).join(".cache/m3os-rust-cross")
+        }
+    };
     fs::create_dir_all(&cross_root).map_err(|e| format!("mkdir rust-cross: {e}"))?;
     // A DEDICATED `-fPIC` musl C++ sysroot for the rust build. x.py builds LLVM
     // `-fPIC` (LLVM_LINK_LLVM_DYLIB), so linking the LLVM tools against the clang
