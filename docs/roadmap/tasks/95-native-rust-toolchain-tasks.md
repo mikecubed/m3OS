@@ -3,7 +3,7 @@
 **Status:** Planned
 **Source Ref:** phase-95
 **Depends on:** Phase 12 ✅ (Linux-syscall compat), Phase 44 ✅ (Rust cross-compilation lineage), Phase 76 ✅ (dynamic loader machinery), Phase 85a ✅ (`.m3pkg` substrate), Phase 85d ✅ (on-device LLVM-class delivery + streaming exec / `pread64` / `fstat`-identity kernel work + LLD), Phase 87 ✅ (VFS bulk-I/O), Phase 88 ✅ (VFS `stat` conformance), Phase 93 ✅ (`libc.so` + loader TLS — the proc-macro `dlopen` prerequisite), Phase 94 ✅ (Rust-cargo musl port class)
-**Goal:** Ship a fully-static `x86_64-unknown-linux-musl` `rustc` (host-cross-built) packaged behind an `M3OS_WITH_RUST` image feature so that, on m3OS, `rustc /usr/src/hello.rs -o /tmp/hello && /tmp/hello` compiles a Rust source file to a native ELF, links it via the bundled `rust-lld`, and runs it (`RUSTC_OK`) against a prebuilt `std` sysroot resolved relative to the `rustc` binary — the Rust analog of Phase 85d's on-device Clang. The `cargo` + proc-macro half (Track D) is a stretch, now unblocked by Phase 93's `libc.so` + loader TLS, and may split into a `95b`.
+**Goal:** Ship a **dynamic** `x86_64-unknown-linux-musl` `rustc` (host-cross-built, `DEPS=musl` — a fully-static rustc is infeasible: rustc's own proc-macro deps can't build on a `crt-static` musl host) packaged behind an `M3OS_WITH_RUST` image feature so that, on m3OS, `rustc /usr/src/hello.rs -o /tmp/hello && /tmp/hello` compiles a Rust source file to a native ELF, links it via the bundled `rust-lld`, and runs it (`RUSTC_OK`) against a prebuilt `std` sysroot resolved relative to the `rustc` binary — the Rust analog of Phase 85d's on-device Clang. (Landed: the host toolchain + on-device `pkg install rust`; the on-device `RUSTC_OK` milestone is blocked on a streaming-loader perf wall, deferred to `95b`.) The `cargo` + proc-macro half (Track D) is a stretch, now unblocked by Phase 93's `libc.so` + loader TLS, and may split into a `95b`.
 
 > **Planning task list authored ahead of implementation.** Phase 95 is `Planned`; acceptance items below are forward-looking (`[ ]`). The Area A–C core is the milestone; Track D (cargo + proc-macros) is a stretch. The bundle/install path, kernel runtime substrate, and LLD linker are all reused from Phase 85d — this phase adds the host-side `build_rust` recipe, a userspace Rust sysroot/target, and two gates, not new kernel work for the core.
 
@@ -11,7 +11,7 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Bootstrap a fully-static musl `rustc` (host-cross-built) + prove it loads on m3OS | 85d, 94 | In progress — `build_rust` recipe landed; host build running |
+| A | Bootstrap a dynamic musl `rustc` (host-cross-built, `DEPS=musl`) + prove it loads on m3OS | 85d, 94 | Host build COMPLETE + sealed; on-device `rustc` load BLOCKED (streaming loader → `95b`) |
 | B | Userspace target spec + prebuilt `std` sysroot + bundled `rust-lld` (relocation contract) | A | In progress — stock `x86_64-unknown-linux-musl` target + bundled `rust-lld`; on-device check pending |
 | C | On-device `rustc hello.rs` milestone (`RUSTC_OK`) — no proc-macros | A, B | In progress — fixture + gate landed; QEMU validation pending |
 | D | (Stretch) `cargo` + proc-macros via on-device `dlopen` of the proc-macro `.so` | C, 93 | Deferred (stretch / `95b`) |
@@ -56,24 +56,34 @@
 > like the Phase 90b Claude-Code bring-up that surfaced kernel hardening).
 > **Thoroughly diagnosed** (the on-device load of `rustc --version` was driven to
 > failure under both multi-core and single-core, KVM and TCG):
->   1. **CPU-bound super-linear load of a ~736 MB dynamic image — the real
+>   1. **CPU-bound super-linear load of the ~162 MB `librustc_driver.so` — the real
 >      blocker.** `rustc --version` never completes: **single-core under KVM it runs
 >      at a steady 100 % CPU and times out at 25 min** (multi-core 25 min too) — so
 >      it is CPU-bound, NOT a deadlock (qemu busy, not idle), NOT a VFS-latency
 >      stall, NOT the symbol resolver (gnu-hash O(1)) nor the VMA lookup (`find_vma`
 >      = O(log n) BTreeMap) nor the vfs block cache (bounded BTreeMap). The crux is
->      SIZE: `rustc` is an **11 KB launcher** that `DT_NEEDED`s **`librustc_driver.so`
->      = 576 MB** + **`libLLVM.so` = 160 MB** — ~**736 MB of shared libraries loaded
->      per invocation**. The Phase 76/93 `ld-musl` loader's per-DSO strategy is
->      "mmap a file-sized scratch → `sys_read` the whole file (64 KiB chunks) → mmap
->      a file-sized anonymous image → copy segments → relocate", i.e. for
->      librustc_driver alone **> 1.1 GB of anonymous mmap (scratch + image) + 576 MB
->      read + 576 MB copy + reloc**, on the 2 GiB guest — ~1000+ CPU-seconds. The
->      fundamental fix is a **streaming / file-backed-mmap loader** (demand-page the
->      segments, drop the whole-file scratch+copy) plus faster kernel demand-paging;
->      this is the dominant cost regardless of the smaller items below. (Reused as-is,
->      the dynamic-`python3` Phase 93 path works because those `.so`s are tens of MB,
->      not 576 MB.)
+>      SIZE: `rustc` is a **~5 KB launcher** that `DT_NEEDED`s **`librustc_driver.so`
+>      = ~162 MB** (the *stripped musl* `.so`, with LLVM **statically linked in** —
+>      so there is no separate `libLLVM.so` for `rustc --version`; the 576 MB figure
+>      a prior draft cited was the *unstripped GNU stage0* artifact, and a 576 MB DSO
+>      would in fact have tripped the loader's 256 MiB `SCRATCH_CAP` and failed
+>      outright) + `libc.so`. The Phase 76/93 `ld-musl` loader's per-DSO strategy is
+>      "mmap a file-sized anon scratch → `sys_read` the whole file (64 KiB VFS-capped
+>      chunks) → mmap a file-sized anonymous image → copy each `PT_LOAD` → relocate",
+>      i.e. for librustc_driver alone **~324 MB anonymous mmap (scratch + image) +
+>      ~162 MB read + ~162 MB RAM copy + reloc**, on the 2 GiB guest — hundreds of
+>      CPU-seconds. The fundamental fix is a **streaming / file-backed-mmap loader**
+>      (demand-page the segments, drop the whole-file scratch+copy) plus kernel
+>      demand-fault-from-file VMA backing (today `sys_mmap_file_backed` is **eager**).
+>      A **loader-only partial win** is available even without kernel work — read
+>      each `PT_LOAD` directly into the final image via `lseek`+`read`, dropping the
+>      scratch buffer + the full-image RAM copy (~halving anon footprint + copy
+>      traffic) — but it does not by itself unblock the milestone. This is the
+>      dominant cost regardless of the smaller items below. (Reused as-is, the
+>      dynamic-`python3` Phase 93 path works because those `.so`s are tens of MB.
+>      Separately, the bundled **`rust-lld`** *does* dynamically link `libLLVM.so`
+>      = ~160 MB, paid at the `rustc hello.rs` **link** step — `build_rust` now stages
+>      that dylib into the sysroot so rust-lld is loadable.)
 >   2. **Multi-core TLB-shootdown storm.** With the default `-smp 4`, the same load
 >      pegs **~380 % CPU** (3 extra cores spinning) — the loader's ~tens-of-thousands
 >      of `map`/`mprotect`/CoW page operations each broadcast a TLB-shootdown IPI to
@@ -106,7 +116,7 @@
 - `docs/roadmap/95-native-rust-toolchain.md` (the *Alternative bootstrap: `mrustc`* note)
 
 **Symbol:** `build_rust` (bootstrap-strategy comment block); `build_recipe_id("rust")`
-**Why it matters:** Upstream ships a **dynamically-linked** toolchain, so producing a fully-static musl `rustc` is a deliberate multi-stage host build (the same discipline Phase 85d applied to clang). The method must be chosen and recorded before the heavy build: either rustc's `x.py`/`config.toml` bootstrap configured for an `x86_64-unknown-linux-musl` host with `crt-static`, or the smaller LLVM-free `mrustc` first cut (no proc-macro `dlopen`, reduced language coverage). Picking the wrong one wastes a multi-hour build.
+**Why it matters:** Upstream ships a glibc toolchain, so producing a musl `rustc` is a deliberate multi-stage host build (the same discipline Phase 85d applied to clang). The method must be chosen and recorded before the heavy build: rustc's `x.py`/`config.toml` bootstrap configured for an `x86_64-unknown-linux-musl` host, or the smaller LLVM-free `mrustc` first cut (no proc-macro `dlopen`, reduced language coverage). Picking the wrong one wastes a multi-hour build. **Outcome:** the `x.py` path was taken, and the bring-up established that `crt-static` is infeasible (proc-macro deps) — so the toolchain is **dynamic** musl (`DEPS=musl`), not static.
 
 **Acceptance:**
 - [ ] A bootstrap-method decision is recorded as a comment in `build_rust` and reflected in the design doc: the full LLVM-based `x.py` static-musl `rustc` is the recommended path; `mrustc` is recorded as the smaller Phase-93-independent alternative (and explicitly **not** chosen for a general toolchain).
@@ -123,7 +133,7 @@
 **Why it matters:** This is the first *toolchain*-producing Rust port (Phase 94's `build_uutils` builds a Rust *program*; this builds the Rust *compiler*). Like `build_go` / `build_llvm`, it branches **before** the shared musl-gcc plumbing (`find_musl_cc` / `musl_extra_ldflags_joined`) because the Rust toolchain bootstraps with its own compiler, not `x86_64-linux-musl-gcc`. It stages a DESTDIR-style `usr/` tree that `seal_package` strips and packs.
 
 **Acceptance:**
-- [ ] `build_rust` produces a **fully-static** `x86_64-unknown-linux-musl` `rustc` binary; `file` reports `ELF 64-bit LSB executable, x86-64, ... statically linked`.
+- [x] `build_rust` produces a **dynamic** `x86_64-unknown-linux-musl` `rustc` binary (`crt-static=false`; a fully-static rustc proved infeasible — rustc's own proc-macro deps can't build on a `crt-static` musl host — so `rust.m3pkg` `DEPS=musl`); `file` reports `ELF 64-bit LSB pie executable, x86-64, ... dynamically linked, interpreter /lib/ld-musl-x86_64.so.1` and `readelf -d` shows `NEEDED librustc_driver-*.so` + `NEEDED libc.so`. *(Verified on the staged artifact.)*
 - [ ] `build_rust` is reachable from `fn port_build` via a `go`/`llvm`-style early-return branch (before the `musl_toolchain()` requirement — the toolchain self-bootstraps, no external musl-gcc), and `rust` is added to `PORTS` so `cargo xtask port list` shows it with `RECIPE=yes`.
 - [ ] `build_rust` stages a DESTDIR `usr/` tree (the static `rustc` binary + the Track B sysroot + Track B linker) and routes it through `seal_package` → `strip_stage` → `pkg_format::pack`; the second build logs `PKGCACHE: hit … zero compiler invocations` (the 85a payoff on a heavy artifact).
 
@@ -306,7 +316,7 @@
 **Why it matters:** The maintenance policy permits a capability-inventory edit only for a **new capability class**. On-device `rustc` is a new class — the project's first native Rust *code generator* (distinct from the Phase 85d on-device C/C++ generator) — so a minimal one-line edit is warranted; per "keep it small", rewrite an existing bullet rather than adding a new one.
 
 **Acceptance:**
-- [ ] A **one-line** addition/rewrite of the existing developer-toolchain capability bullet names on-device `rustc` (fully-static musl, `M3OS_WITH_RUST`, `pkg install rust`, `rustc hello.rs` → native ELF via bundled `rust-lld`, proc-macro half gated on Phase 93). No new bullet, no reflow.
+- [x] A **one-line** addition/rewrite of the existing developer-toolchain capability bullet names on-device `rustc` (dynamic musl `DEPS=musl`, `M3OS_WITH_RUST`, `pkg install rust` works on-device, the `rustc hello.rs` → `RUSTC_OK` code-gen milestone blocked → `95b`, proc-macro half gated on Phase 93). No new bullet, no reflow.
 
 ### F.3 — Create the Phase 95 learning doc + register it
 
@@ -333,9 +343,19 @@
 **Symbol:** `version = "0.94.1"`
 **Why it matters:** Every phase lands with an **unconditional** kernel version bump — the design doc's Implementation Outline (step 7) + *Related Documentation and Version Updates* call for it, and the `AGENTS.md` maintenance policy explicitly permits bumping the version line when a phase lands (mirrors Phase 94 task E.4). No kernel *code* change is expected for Area C — the banner (`kernel/src/lib.rs`), `/proc/version` (`kernel/src/fs/procfs.rs`), and `uname` utsname (`kernel/src/arch/x86_64/syscall/mod.rs`) all derive from `env!("CARGO_PKG_VERSION")`, so the single `Cargo.toml` edit propagates everywhere.
 
+> **DECISION — the bump is HELD until `95b`, deliberately (not an oversight).** The
+> bump signals "the phase capability landed", and Phase 95's headline capability —
+> on-device `rustc` code generation (`RUSTC_OK`) — is **blocked and deferred to
+> `95b`**. The kernel itself gained no functional capability this phase (the only
+> kernel edit is a `#PF`-path diagnostic, not a feature). Bumping to `0.95.0` now
+> would pair a "Phase 95 done" version with a capability that does not yet run, so
+> the version stays `0.94.1` and the bump lands **with the `95b` on-device
+> milestone** (a `0.95.0` minor at that point). This is the honest state for an
+> in-progress phase; revisit when `95b` lands `RUSTC_OK`.
+
 **Acceptance:**
-- [ ] `kernel/Cargo.toml` `version` is `0.95.0` (the standard minor bump `0.94.1` → `0.95.0`; a further **patch** bump applies only if a syscall gap surfaces during bring-up — the Phase 94 precedent) and `Cargo.lock` matches; `cargo xtask check` is clean.
-- [ ] The `AGENTS.md` "kernel **v0.94.1**" reference (`AGENTS.md:7`) is updated to `v0.95.0`.
+- [ ] *(Held for `95b`.)* `kernel/Cargo.toml` `version` → `0.95.0` and `Cargo.lock` matches; `cargo xtask check` clean — applied **when the on-device milestone lands**, not in this host-toolchain-only phase (see the DECISION above).
+- [ ] *(Held for `95b`.)* The `AGENTS.md` "kernel **v0.94.1**" reference (`AGENTS.md:7`) → `v0.95.0`, paired with the version bump above.
 - [ ] No other source edit is needed for the version string (the three derived sites pick it up from `CARGO_PKG_VERSION`); prior-phase `0.94.x` mentions in `docs/roadmap/` are historical and left unchanged.
 
 ---
@@ -344,7 +364,7 @@
 
 - **Precedent is Phase 85d, not Phase 86d.** Phase 86d *runs a pre-built Go binary* — its compiler never runs on-device. This phase runs the `rustc` *compiler* and generates machine code on m3OS, which is the Phase 85d (on-device Clang) problem class. m3OS userspace has run native Rust *binaries* since Phase 5; the new thing is the *toolchain*.
 - **No new kernel work is expected for the Area C core.** The streaming ELF exec loader (`DiskElfSource`, >heap binaries), positional `pread64`/`pwrite64`, generous `rlimit`s, and the Phase 88 `fill_stat` inode identity all landed for clang (85d) and are reused unchanged. Any syscall gap that surfaces during bring-up is enumerated here and carried as a patch bump (the Phase 94 `unlinkat`/`fchmodat`/`fchownat`/`mkdirat` precedent), never a silent kernel change.
-- **The bootstrap is a deliberate static build.** Upstream ships a *dynamic* toolchain; m3OS builds `rustc`/`cargo` fully static (the same discipline as clang/python/go), even though Phase 93's `libc.so` now exists — the toolchain *binary* stays static while proc-macro `.so`s loaded *by* `rustc` bind against `libc.so`.
+- **The bootstrap is a dynamic musl build (a static one is infeasible).** Unlike clang/python/go, `rustc` *cannot* be built fully static: rustc's own source depends on proc-macro crates, and a `crt-static` musl host cannot build dylibs/proc-macros. So the `rustc` *binary itself* is dynamic (`PT_INTERP=/lib/ld-musl` + `DT_NEEDED libc.so`, `DEPS=musl`) and binds `/usr/lib/libc.so` via the Phase 93 loader — which is exactly why Phase 93 is a hard dependency (and why the dynamic-`python3`/`ctypes` Phase 93 proof is the relevant precedent). Proc-macro `.so`s loaded *by* `rustc` (Track D) bind against the same `libc.so`.
 - **The userspace target/sysroot is new.** `x86_64-m3os.json` is the existing userspace target (hardware-float `+sse,+sse2,+aes`) but carries `code-model: kernel` and is tailored to the hand-built `no_std` ring-3 binaries, so it is unsuitable as-is as a Rust std toolchain target; a dedicated userspace Rust target spec + a prebuilt `std`/`core`/`alloc` rlib sysroot resolved relative to the `rustc` binary has no precedent in the tree (Go shipped no toolchain; clang ships a C/C++ sysroot, not a Rust one).
 - **The linker is reused.** Phase 85d already proved LLD links on m3OS; this phase bundles `rust-lld` or `DEPS=clang`s the 85d `ld.lld` — the "no system linker" problem is solved upstream of this phase.
 - **Proc-macros are the wall — now cleared by Phase 93.** A proc-macro `.so` is `dlopen`'d at compile time and references libc + Rust-runtime symbols (incl. TLS). The dynamic-linker machinery has existed since Phase 76; the missing `libc.so` + loader TLS landed in Phase 93 (proven by dynamic `python3` + `ctypes.CDLL`). Track D validates that path against a *Rust* proc-macro `.so`; the Area C milestone stays proc-macro-free by construction (precompiled `std` rlibs).

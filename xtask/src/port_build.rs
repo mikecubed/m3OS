@@ -645,13 +645,14 @@ fn build_recipe_id(name: &str) -> &'static str {
             "x.py-cross:build=x86_64-unknown-linux-gnu host=target=x86_64-unknown-linux-musl \
              profile=compiler docs=false extended=false tools=[] crt-static=FALSE(dynamic;\
              proc-macros block static musl host)→DEPS=musl(libc.so) \
-             download-ci-llvm=true lld=true llvm-tools=false;\
+             download-ci-llvm=false targets=X86(in-tree LLVM) lld=true llvm-tools=false;\
              stageB=-fPIC-musl-libc++/libc++abi/libunwind+compiler-rt(from llvm-port \
              llvm-project/runtimes,MinSizeRel)→target/rust-musl-sysroot;\
              cc/cxx=host-clang(--target=musl --sysroot=rust-musl-sysroot -L.../lib \
              -rtlib=compiler-rt -unwindlib=libunwind -fuse-ld=lld);\
-             install=DESTDIR(prefix=/usr:rustc+rust-std-musl+rust-lld);\
-             prune=doc/man/manifest/build-host-rustlib;recipe-v=3"
+             install=DESTDIR(prefix=/usr:rustc+rust-std-musl+rust-lld)\
+             +stage-libLLVM.so→rustlib/lib(rust-lld DT_NEEDED);\
+             prune=doc/man/manifest/build-host-rustlib;recipe-v=4"
         }
         _ => "",
     }
@@ -980,6 +981,17 @@ pub fn port_deps(name: &str) -> &'static [&'static str] {
         // Node's OpenSSL validates api.anthropic.com — without it the launcher
         // referenced a missing path ("Cannot open directory /etc/ssl/certs").
         "claude-code" => &["node", "ca-certificates"],
+        // Phase 95 — the on-device rustc is a DYNAMIC musl binary (a fully-static
+        // rustc is infeasible: rustc's own proc-macro deps cannot build on a
+        // `crt-static` musl host). Its `DT_NEEDED libc.so` binds against the
+        // Phase 93 `/usr/lib/libc.so`, shipped only by the `musl` package, so
+        // `musl` is a real RUNTIME dep and the in-OS solver must install it
+        // first. This MUST match `ports/lang/rust/Portfile`'s `DEPS=musl` — the
+        // M3OS_WITH_RUST bundling writes the staged `rust.meta` `DEPS=` from this
+        // table, so an empty arm here would orphan the bundled `musl.m3pkg` and
+        // `pkg install rust` would never pull `libc.so` (rustc then can't load).
+        // Locked by the `port_deps_rust_depends_on_musl` regression test.
+        "rust" => &["musl"],
         _ => &[],
     }
 }
@@ -1986,17 +1998,19 @@ fn build_uutils(extracted: &Path, stage: &Path, _port_dir: &Path) -> Result<(), 
 
 /// Phase 95 — the project's FIRST on-device Rust *compiler* (`rustc`), distinct
 /// from Phase 94's coreutils which runs a host-cross-compiled Rust *program*.
-/// The Rust analog of `build_llvm` (Phase 85d): cross-build a **fully-static**
+/// The Rust analog of `build_llvm` (Phase 85d): cross-build a **dynamic**
 /// `x86_64-unknown-linux-musl` `rustc` (+ a prebuilt `std`/`core`/`alloc` sysroot
 /// + the bundled `rust-lld` linker) via the upstream `x.py` bootstrap. The host
 /// clang is the musl cross-compiler (musl-tools ships no C++ compiler), and the
-/// heavy LLVM-for-musl is cross-built by x.py from the in-tree `src/llvm-project`,
-/// driven by the gnu CI LLVM tools that `download-ci-llvm` fetches. crt-static
-/// embeds musl into the rustc binary (m3OS's custom `ld-musl` has no real
-/// `libc.so`, so a dynamic toolchain can't run — same discipline as
-/// clang/python/go). Branches BEFORE the `musl_toolchain()` requirement in
-/// `port_build` (Rust self-bootstraps with its own stage0 compiler; no external
-/// `x86_64-linux-musl-gcc`).
+/// heavy LLVM-for-musl is cross-built by x.py from the in-tree `src/llvm-project`
+/// (`download-ci-llvm = false`, `targets = "X86"` — no prebuilt CI LLVM fetch).
+/// The toolchain is **dynamic, not static** (`crt-static = false`): a fully-static
+/// rustc proved infeasible because rustc's OWN source depends on proc-macro crates
+/// that a `crt-static` musl host cannot build. So the rustc binary is
+/// `PT_INTERP=/lib/ld-musl` + `DT_NEEDED libc.so`, running on m3OS via the Phase
+/// 93 `/usr/lib/libc.so` + Rust loader — hence `rust.m3pkg` `DEPS=musl`. Branches
+/// BEFORE the `musl_toolchain()` requirement in `port_build` (Rust self-bootstraps
+/// with its own stage0 compiler; no external `x86_64-linux-musl-gcc`).
 ///
 /// `extracted` is the port machinery's freshly-re-extracted source (ignored for
 /// the heavy build — we keep a stable copy under `target/rust-cross` so re-runs
@@ -2267,10 +2281,13 @@ fn build_rust(extracted: &Path, stage: &Path, _port_dir: &Path) -> Result<(), St
             .map_err(|e| format!("chmod wrapper {}: {e}", w.display()))?;
     }
 
-    // 5. x.py config (config.toml in the source root). download-ci-llvm=true fetches
-    //    the gnu CI LLVM tools (tblgen/nm/config) that DRIVE the musl-LLVM
-    //    cross-build (x.py builds musl LLVM from src/llvm-project with our cc/cxx).
-    //    No `targets=` (incompatible with download-ci-llvm).
+    // 5. x.py config (config.toml in the source root). download-ci-llvm=false:
+    //    x.py builds LLVM-for-musl from the in-tree src/llvm-project with our
+    //    cc/cxx wrappers (the prebuilt *musl* CI `llvm-config` is itself a dynamic
+    //    musl binary that won't run on the glibc host, and ci-llvm mis-pointed the
+    //    musl `rustc_llvm` shim's includes). With download-ci-llvm=false, targets
+    //    = "X86" is honored (it's incompatible with download-ci-llvm) — X86-only
+    //    LLVM is faster to build and a smaller librustc_driver to load on-device.
     //
     //    crt-static = FALSE (not the musl default): rustc's OWN source depends on
     //    proc-macro crates (darling_macro, serde_derive, …), and a `crt-static` musl
@@ -2320,8 +2337,8 @@ fn build_rust(extracted: &Path, stage: &Path, _port_dir: &Path) -> Result<(), St
 
     // 6. The heavy build: rustc (stage 2) + std. x.py self-downloads its stage0
     //    bootstrap compiler. This cross-builds LLVM-for-musl then rustc — the
-    //    multi-tens-of-MB static toolchain. (download-ci-llvm needs no .git, but
-    //    x.py warns harmlessly about `not a git repository`.)
+    //    multi-tens-of-MB dynamic toolchain. (x.py warns harmlessly about `not a
+    //    git repository` building from the unpacked source tarball.)
     println!(
         "rust: building dynamic musl rustc + std (x.py, {} jobs) — the heavy cross-build",
         jobs
@@ -2393,6 +2410,51 @@ fn build_rust(extracted: &Path, stage: &Path, _port_dir: &Path) -> Result<(), St
             std_dir.display()
         ));
     }
+    // Stage the shared LLVM the bundled `rust-lld` dynamically links against.
+    // x.py builds LLVM with a shared `libLLVM.so` and links the LLVM tools
+    // (incl. `lld` -> `rust-lld`) against it, but `x.py install` does NOT copy
+    // `libLLVM.so` into the rust-std component (it is an LLVM build artifact, not
+    // a rustc/std install component). `rust-lld`'s RUNPATH is `$ORIGIN/../lib`
+    // (= `rustlib/<target>/lib/`), so without this copy the shipped `rust-lld`
+    // would `DT_NEEDED libLLVM.so.* not found` and be unloadable on-device — the
+    // `rustc hello.rs` LINK step would then fail even after the loader-perf
+    // bring-up. (librustc_driver statically links LLVM and needs only libc.so, so
+    // `rustc --version` itself does not require this — only the linker does.)
+    let llvm_build_lib = src.join(format!("build/{TARGET}/llvm/lib"));
+    let mut staged_libllvm = 0usize;
+    if let Ok(entries) = fs::read_dir(&llvm_build_lib) {
+        for entry in entries.flatten() {
+            let fname = entry.file_name();
+            let name = fname.to_string_lossy();
+            // The versioned soname (e.g. `libLLVM.so.22.1-rust-1.96.0-stable`) is
+            // the real file rust-lld DT_NEEDEDs; skip the bare `libLLVM.so` dev
+            // symlink (rust-lld does not reference it, and copying it would
+            // duplicate ~160 MB of identical content under the wrong name).
+            if name.starts_with("libLLVM.so.") && entry.path().is_file() {
+                let dest = std_dir.join(name.as_ref());
+                fs::copy(entry.path(), &dest).map_err(|e| {
+                    format!(
+                        "rust build: staging {} -> {}: {e}",
+                        entry.path().display(),
+                        dest.display()
+                    )
+                })?;
+                staged_libllvm += 1;
+            }
+        }
+    }
+    if staged_libllvm == 0 {
+        return Err(format!(
+            "rust build: no `libLLVM.so.*` found in {} to stage for rust-lld — the \
+             bundled rust-lld DT_NEEDEDs the shared libLLVM and would be unloadable \
+             on-device. (Did the LLVM build stop emitting a shared libLLVM.so, or did \
+             the bootstrap build dir layout change?)",
+            llvm_build_lib.display()
+        ));
+    }
+    println!(
+        "rust: staged {staged_libllvm} libLLVM.so dylib(s) into the sysroot (rust-lld DT_NEEDED)"
+    );
     // Best-effort self-check: a dynamic musl rustc runs on the host only if it has
     // /lib/ld-musl-x86_64.so.1 + a musl libc.so; log the outcome, don't fail on it.
     match Command::new(&rustc_bin).arg("--version").output() {
@@ -7561,6 +7623,7 @@ mod tests {
             "node",
             "claude-code",
             "coreutils",
+            "rust",
         ];
         let ids: Vec<&str> = ports.iter().map(|p| build_recipe_id(p)).collect();
         for (p, id) in ports.iter().zip(&ids) {
@@ -7572,6 +7635,24 @@ mod tests {
         assert_eq!(sorted.len(), ids.len(), "build_recipe_ids must be distinct");
         // Unknown ports yield the empty identity (no recipe contribution).
         assert_eq!(build_recipe_id("clang"), "");
+    }
+
+    /// Phase 95 — the on-device `rustc` is a DYNAMIC musl binary whose
+    /// `DT_NEEDED libc.so` is shipped only by the `musl` package, so `musl` MUST
+    /// be a runtime dep: the `M3OS_WITH_RUST` bundling writes the staged
+    /// `rust.meta` `DEPS=` from `port_deps("rust")`, and the in-OS solver installs
+    /// `musl` first from it. This locks the table against the Portfile's
+    /// `DEPS=musl`; an empty arm would orphan the bundled `musl.m3pkg` and
+    /// `pkg install rust` would never lay down `/usr/lib/libc.so` (rustc then
+    /// fails to load on-device). Regression guard for the missing-`rust`-arm bug.
+    #[test]
+    fn port_deps_rust_depends_on_musl() {
+        assert_eq!(
+            port_deps("rust"),
+            &["musl"],
+            "rust must runtime-depend on musl (the dynamic rustc binds /usr/lib/libc.so); \
+             keep this in sync with ports/lang/rust/Portfile DEPS=musl"
+        );
     }
 
     // ── Phase 90a (D.2) — the JIT/jitless variant folds into node's key ──────

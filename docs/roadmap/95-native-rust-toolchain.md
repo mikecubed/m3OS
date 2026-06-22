@@ -1,10 +1,22 @@
 # Phase 95 - Native Rust Toolchain (on-device `rustc` + `cargo`)
 
-**Status:** Planned
+**Status:** In progress — host toolchain built + sealed and `pkg install rust` works on m3OS; the on-device `RUSTC_OK` code-generation milestone is diagnosed but blocked on a streaming-loader perf wall and deferred to a Phase-95 follow-up (`95b`)
 **Source Ref:** phase-95
 **Depends on:** Phase 93 ✅ (Dynamic C Runtime — `libc.so` + loader TLS for proc-macro `dlopen`), Phase 94 ✅ (Rust-cargo musl port class), Phase 85d ✅ (Clang/LLVM/LLD on-device precedent + large-exec / `pread64` kernel fixes), Phase 87 ✅ (VFS bulk-I/O — the large install), Phase 88 ✅ (VFS `stat` conformance), Phase 44 ✅ (Rust cross-compilation lineage)
 **Builds on:** Extends the Phase 44 → 94 "Rust runs in the OS" lineage from *running* host-cross-compiled Rust to *running the Rust toolchain itself* on-device. Reuses the Phase 85d Clang/LLVM/LLD delivery pattern (the project's only existing on-device native code generator) and the Phase 85a `.m3pkg` substrate. It is the Rust analog of Phase 85d, not of Phase 86d.
 **Primary Components:** `ports/lang/rust/Portfile`, `xtask/src/port_build.rs` (`build_rust`), the bundled `rust-lld` linker (or a `DEPS=clang` dependency on the Phase 85d LLD), a userspace Rust target spec + a prebuilt `std`/`core` sysroot, the `M3OS_WITH_RUST` image feature, the `rustc-smoke` / `cargo-smoke` gates
+
+> **Implementation-status callout (read first).** Two findings correct the design
+> below. (1) The toolchain is **dynamic**, not fully static: a `crt-static` musl
+> host cannot build rustc's own proc-macro deps, so the shipped `rustc` is a
+> dynamic musl binary (`PT_INTERP=/lib/ld-musl` + `DT_NEEDED libc.so`, `DEPS=musl`,
+> running via the Phase 93 `libc.so` + loader). Wherever this doc says "fully
+> static", read "dynamic musl, `DEPS=musl`". (2) The host build is **complete** and
+> `pkg install rust` works on m3OS, but the on-device milestone (`rustc hello.rs` →
+> `RUSTC_OK`) is **blocked** on a streaming/file-backed-mmap loader for the ~162 MB
+> `librustc_driver.so` (the kernel's file-backed `mmap` is eager today) plus SMP
+> TLB-shootdown batching + a kstack strategy — deferred to a follow-up (`95b`). See
+> the [task doc](./tasks/95-native-rust-toolchain-tasks.md) implementation-status note.
 
 ## Milestone Goal
 
@@ -76,21 +88,25 @@ code on the device. They share the `.m3pkg` substrate and nothing else.
 - How a Rust **sysroot** (prebuilt `libstd`/`libcore` rlibs + a target spec) is
   resolved relative to the compiler binary, mirroring the Phase 85d clang
   resource-dir relocation contract.
-- The **bootstrap problem**: upstream ships a dynamic toolchain, so producing a
-  fully-static musl `rustc`/`cargo` for m3OS is a multi-stage host build, the
-  same discipline Phase 85d applied to clang.
+- The **bootstrap problem**: upstream ships a glibc toolchain, so producing a
+  musl `rustc`/`cargo` for m3OS is a multi-stage host build (the same discipline
+  Phase 85d applied to clang) — landing on a *dynamic* musl `rustc` (`DEPS=musl`),
+  since a `crt-static` musl host can't build rustc's own proc-macro deps.
 
 ## Feature Scope
 
-### Area A — A static `rustc` (host-cross-built)
+### Area A — A dynamic musl `rustc` (host-cross-built)
 
 A new `build_rust()` dispatch in `xtask/src/port_build.rs`, paralleling
-`build_llvm()` (85d) and `build_go()` (86d), produces a **fully static**
-`x86_64-unknown-linux-musl` `rustc` (and, for Area D, `cargo`). Upstream Rust
-ships a dynamically-linked toolchain, so this is a deliberate static build —
-the same constraint that forced static clang/python/go, because m3OS's
-`ld-musl` has no real `libc.so` until Phase 93. The host's own Rust toolchain
-is the build compiler (the analog of "host clang cross-compiles LLVM" in 85d).
+`build_llvm()` (85d) and `build_go()` (86d), produces a **dynamic**
+`x86_64-unknown-linux-musl` `rustc` (and, for Area D, `cargo`). A fully-static
+rustc was the original plan (the clang/python/go discipline) but proved
+**infeasible** — rustc's own source uses proc-macro crates, and a `crt-static`
+musl host cannot build dylibs/proc-macros — so the shipped `rustc` is a dynamic
+musl binary (`PT_INTERP=/lib/ld-musl` + `DT_NEEDED libc.so`) that runs on m3OS via
+the **Phase 93** `/usr/lib/libc.so` + loader (hence `DEPS=musl`). The host's own
+Rust toolchain is the build compiler (the analog of "host clang cross-compiles
+LLVM" in 85d).
 
 ### Area B — Bundled linker + sysroot relocation contract
 
@@ -294,8 +310,9 @@ recommended path for a *general* Rust toolchain.
 
 ## Acceptance Criteria
 
-- `cargo xtask port build rust` produces a fully-static `x86_64-unknown-linux-musl`
-  `rustc` and seals a valid `rust.m3pkg` (`pkg_format::verify` passes).
+- `cargo xtask port build rust` produces a dynamic `x86_64-unknown-linux-musl`
+  `rustc` (`DEPS=musl`) and seals a valid `rust.m3pkg` (`pkg_format::verify` passes). ✅
+  (host build complete)
 - On m3OS, behind `M3OS_WITH_RUST`: `pkg install rust` succeeds and
   `rustc --version` reports the pinned toolchain version (proving the static
   rustc *runs* via the Phase 12 compat layer + Phase 85d streaming loader).

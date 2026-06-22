@@ -1,6 +1,6 @@
 NAME=rust
 VERSION=1.96.0
-DESCRIPTION="On-device Rust toolchain — fully-static x86_64-unknown-linux-musl rustc + prebuilt std sysroot + bundled rust-lld (the project's first native Rust code generator)"
+DESCRIPTION="On-device Rust toolchain — dynamic x86_64-unknown-linux-musl rustc 1.96.0 (DEPS=musl/libc.so) + prebuilt std sysroot + bundled rust-lld (the project's first native Rust code generator)"
 CATEGORY=lang
 DEPS=musl
 URL=https://static.rust-lang.org/dist/rustc-1.96.0-src.tar.xz
@@ -9,20 +9,22 @@ MAINTAINER=m3os
 
 # Phase 95 — the project's FIRST on-device Rust *compiler* (distinct from Phase
 # 94's coreutils, which runs a host-cross-compiled Rust *program*). The Rust
-# analog of Phase 85d (on-device Clang/LLVM/LLD): a fully-static
-# `x86_64-unknown-linux-musl` `rustc` that compiles + links + runs Rust on m3OS.
+# analog of Phase 85d (on-device Clang/LLVM/LLD): a dynamic
+# `x86_64-unknown-linux-musl` `rustc` whose goal is to compile + link + run Rust
+# on m3OS (the on-device code-gen milestone is a Phase-95 follow-up, `95b`; the
+# host toolchain + `pkg install rust` land in this phase).
 #
 # Built by `build_rust` (xtask/src/port_build.rs) via the upstream `x.py`
-# bootstrap configured for a cross-host static build:
+# bootstrap configured for a cross-host build:
 #   build  = x86_64-unknown-linux-gnu   (the stage0 bootstrap runs on the host)
-#   host   = x86_64-unknown-linux-musl  (the rustc BINARY is static musl — m3OS's
-#                                        custom ld-musl has no real libc.so, so a
-#                                        dynamic toolchain can't run; same static
-#                                        discipline as clang/python/go)
+#   host   = x86_64-unknown-linux-musl  (the rustc BINARY is dynamic musl — see
+#                                        the crt-static note + DEPS=musl below)
 #   target = x86_64-unknown-linux-musl  (it also generates musl code on-device)
-# LLVM is built X86-only (we only target x86_64) with the host clang as the
-# musl cross-compiler (the Phase 85d "host clang cross-compiles LLVM" pattern),
-# linking a musl libc++. crt-static=true embeds musl into the rustc binary.
+# LLVM is built X86-only (we only target x86_64) from the in-tree src/llvm-project
+# (download-ci-llvm=false) with the host clang as the musl cross-compiler (the
+# Phase 85d "host clang cross-compiles LLVM" pattern), linking a musl libc++.
+# crt-static=false — see the DEPS=musl note below for why a static rustc is
+# infeasible.
 #
 # The bundled `rust-lld` (rustc's default linker, vendored LLD) is staged INSIDE
 # the .m3pkg, so on-device linking needs no external cc/ld and no dependency on
