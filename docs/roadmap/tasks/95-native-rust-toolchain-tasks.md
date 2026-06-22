@@ -11,12 +11,12 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Bootstrap a dynamic musl `rustc` (host-cross-built, `DEPS=musl`) + prove it loads on m3OS | 85d, 94 | Host build COMPLETE + sealed; on-device `rustc` load BLOCKED (streaming loader → `95b`) |
-| B | Userspace target spec + prebuilt `std` sysroot + bundled `rust-lld` (relocation contract) | A | In progress — stock `x86_64-unknown-linux-musl` target + bundled `rust-lld`; on-device check pending |
-| C | On-device `rustc hello.rs` milestone (`RUSTC_OK`) — no proc-macros | A, B | In progress — fixture + gate landed; QEMU validation pending |
-| D | (Stretch) `cargo` + proc-macros via on-device `dlopen` of the proc-macro `.so` | C, 93 | Deferred (stretch / `95b`) |
-| E | Packaging (`M3OS_WITH_RUST`) + `rustc-smoke` / `cargo-smoke` gates | A–D | In progress — `M3OS_WITH_RUST` + `rustc-smoke` landed; `cargo-smoke` deferred |
-| F | Documentation, learning doc, capability bullet, kernel version bump | A–E | In progress — docs + version bump underway |
+| A | Bootstrap a dynamic musl `rustc` (host-cross-built, `DEPS=musl`) + prove it loads on m3OS | 85d, 94 | ✅ Host build COMPLETE + sealed; the on-device `rustc` *load* moves to [Phase 95b](./95b-on-device-rustc-tasks.md) (streaming loader) |
+| B | Userspace target spec + prebuilt `std` sysroot + bundled `rust-lld` (relocation contract) | A | ✅ Done (host) — stock `x86_64-unknown-linux-musl` + bundled `rust-lld` + staged `libLLVM.so`; host-validated |
+| C | On-device `rustc hello.rs` milestone (`RUSTC_OK`) — no proc-macros | A, B | → [Phase 95b](./95b-on-device-rustc-tasks.md) (blocked on the streaming loader) |
+| D | (Stretch) `cargo` + proc-macros via on-device `dlopen` of the proc-macro `.so` | C, 93 | → [Phase 95b Track E](./95b-on-device-rustc-tasks.md) |
+| E | Packaging (`M3OS_WITH_RUST`) + `rustc-smoke` gate | A–D | ✅ Done — `M3OS_WITH_RUST` + `rustc-smoke` landed; `cargo-smoke` → [Phase 95b](./95b-on-device-rustc-tasks.md) |
+| F | Documentation, learning doc, capability bullet, kernel version bump (`0.95.0`) | A–E | ✅ Done — docs + the `0.94.1` → `0.95.0` bump landed |
 
 > **Implementation status (live).** Host-side scaffolding for Tracks A/B/C/E is
 > landed and `cargo xtask check`-green (PR #264): `ports/lang/rust/Portfile` (Rust
@@ -96,14 +96,16 @@
 >      backtrace on the #PF recovery path — not just the #DF path — is landed to
 >      help pin it next time.)
 >
-> **Deferred to a Phase 95 follow-up / `95b`:** the kernel mm/page-fault perf fix
-> (item 1, the real blocker), the SMP TLB-shootdown batching (item 2), and the
-> kstack strategy (item 3) — together needed to land on-device `RUSTC_OK`. The
-> `rustc-smoke` gate is wired (KVM-honoring, `--timeout 5400`) and bundles
-> `musl.m3pkg` + `rust.m3pkg`; it passes through `pkg install rust` on m3OS and
-> fails at the `rustc --version` load. Phase 95 thus delivers the complete HOST
-> toolchain + on-device install + a precise on-device diagnosis; the on-device
-> code-generation milestone is blocked on the deep kernel work above.
+> **Split out to [Phase 95b](../95b-on-device-rustc.md) ([tasks](./95b-on-device-rustc-tasks.md)):**
+> the streaming / file-backed-mmap loader (item 1, the real blocker), the SMP
+> TLB-shootdown batching (item 2), and the kstack strategy (item 3) — together
+> needed to land on-device `RUSTC_OK` — plus the `cargo` + proc-macro stretch (the
+> old Track D) and the `cargo-smoke` gate. The `rustc-smoke` gate is wired
+> (KVM-honoring, `--timeout 5400`) and bundles `musl.m3pkg` + `rust.m3pkg`; it
+> passes through `pkg install rust` on m3OS and fails at the `rustc --version` load.
+> Phase 95 thus delivers the complete HOST toolchain + on-device install + a precise
+> on-device diagnosis (and lands the `0.95.0` version bump); the on-device
+> code-generation milestone is carried by Phase 95b.
 
 ---
 
@@ -343,20 +345,20 @@
 **Symbol:** `version = "0.94.1"`
 **Why it matters:** Every phase lands with an **unconditional** kernel version bump — the design doc's Implementation Outline (step 7) + *Related Documentation and Version Updates* call for it, and the `AGENTS.md` maintenance policy explicitly permits bumping the version line when a phase lands (mirrors Phase 94 task E.4). No kernel *code* change is expected for Area C — the banner (`kernel/src/lib.rs`), `/proc/version` (`kernel/src/fs/procfs.rs`), and `uname` utsname (`kernel/src/arch/x86_64/syscall/mod.rs`) all derive from `env!("CARGO_PKG_VERSION")`, so the single `Cargo.toml` edit propagates everywhere.
 
-> **DECISION — the bump is HELD until `95b`, deliberately (not an oversight).** The
-> bump signals "the phase capability landed", and Phase 95's headline capability —
-> on-device `rustc` code generation (`RUSTC_OK`) — is **blocked and deferred to
-> `95b`**. The kernel itself gained no functional capability this phase (the only
-> kernel edit is a `#PF`-path diagnostic, not a feature). Bumping to `0.95.0` now
-> would pair a "Phase 95 done" version with a capability that does not yet run, so
-> the version stays `0.94.1` and the bump lands **with the `95b` on-device
-> milestone** (a `0.95.0` minor at that point). This is the honest state for an
-> in-progress phase; revisit when `95b` lands `RUSTC_OK`.
+> **DECISION — Phase 95 lands the host toolchain at `0.95.0`; the on-device
+> milestone moves to [Phase 95b](./95b-on-device-rustc-tasks.md).** Phase 95 is
+> being merged as a complete sub-deliverable — the host-cross-built dynamic musl
+> `rustc`/`std`/`rust-lld`, the `M3OS_WITH_RUST` packaging, and a working on-device
+> `pkg install rust` — so the standard per-phase minor bump `0.94.1` → `0.95.0`
+> applies and is taken in this PR. The on-device `RUSTC_OK` code-generation
+> milestone (blocked on the streaming-loader perf wall) and the `cargo`/proc-macro
+> stretch are split out to **Phase 95b**, which takes its own bump (`0.95.0` →
+> `0.95.1`) when it lands `RUSTC_OK`.
 
 **Acceptance:**
-- [ ] *(Held for `95b`.)* `kernel/Cargo.toml` `version` → `0.95.0` and `Cargo.lock` matches; `cargo xtask check` clean — applied **when the on-device milestone lands**, not in this host-toolchain-only phase (see the DECISION above).
-- [ ] *(Held for `95b`.)* The `AGENTS.md` "kernel **v0.94.1**" reference (`AGENTS.md:7`) → `v0.95.0`, paired with the version bump above.
-- [ ] No other source edit is needed for the version string (the three derived sites pick it up from `CARGO_PKG_VERSION`); prior-phase `0.94.x` mentions in `docs/roadmap/` are historical and left unchanged.
+- [x] `kernel/Cargo.toml` `version` is `0.95.0` and `Cargo.lock` matches (the standard minor bump `0.94.1` → `0.95.0`).
+- [x] The `AGENTS.md` "kernel **v0.94.1**" reference (`AGENTS.md:7`) is updated to `v0.95.0`.
+- [x] No other source edit is needed for the version string (the three derived sites — boot banner, `/proc/version`, `uname` — pick it up from `CARGO_PKG_VERSION`); prior-phase `0.94.x` mentions in `docs/roadmap/` are historical and left unchanged.
 
 ---
 

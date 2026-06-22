@@ -228,9 +228,10 @@ edit expected for the Area C core.
   exists (read each `PT_LOAD` directly into the final image via `lseek`+`read`,
   dropping the scratch buffer + the full-image RAM copy — ~halving anon footprint
   and copy traffic with no kernel change) but does not by itself unblock the
-  milestone. Tracked for `95b`, alongside SMP TLB-shootdown batching and a
-  targeted/lazy kernel-stack strategy.
-- **Mainstream `cargo` + proc-macros** (Track D, may split into `95b`): a
+  milestone. Tracked in **[Phase 95b](./roadmap/95b-on-device-rustc.md)**, alongside
+  SMP TLB-shootdown batching and a targeted/lazy kernel-stack strategy.
+- **Mainstream `cargo` + proc-macros** (the old Track D, now
+  **[Phase 95b Track E](./roadmap/tasks/95b-on-device-rustc-tasks.md)**): a
   proc-macro-free `cargo build` (`CARGO_OK`), then a derive-macro crate via
   on-device `dlopen` of the proc-macro `.so` against the Phase 93 `libc.so`
   (`CARGO_PROCMACRO_OK`).

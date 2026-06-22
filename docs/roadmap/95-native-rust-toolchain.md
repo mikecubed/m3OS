@@ -15,8 +15,9 @@
 > `pkg install rust` works on m3OS, but the on-device milestone (`rustc hello.rs` →
 > `RUSTC_OK`) is **blocked** on a streaming/file-backed-mmap loader for the ~162 MB
 > `librustc_driver.so` (the kernel's file-backed `mmap` is eager today) plus SMP
-> TLB-shootdown batching + a kstack strategy — deferred to a follow-up (`95b`). See
-> the [task doc](./tasks/95-native-rust-toolchain-tasks.md) implementation-status note.
+> TLB-shootdown batching + a kstack strategy — split out to
+> **[Phase 95b](./95b-on-device-rustc.md)** ([tasks](./tasks/95b-on-device-rustc-tasks.md)).
+> See the [task doc](./tasks/95-native-rust-toolchain-tasks.md) implementation-status note.
 
 ## Milestone Goal
 
@@ -248,9 +249,11 @@ recommended path for a *general* Rust toolchain.
 
 ## Implementation Outline
 
-1. **De-risk the bootstrap (Track A).** Cross-build a minimal fully-static musl
-   `rustc` on the host; confirm it loads and runs on m3OS through the Phase 85d
-   streaming exec path (`rustc --version`, `rustc --print sysroot`).
+1. **De-risk the bootstrap (Track A).** Cross-build a dynamic musl `rustc`
+   (`DEPS=musl` — a `crt-static` host can't build rustc's proc-macro deps) on the
+   host; confirm it loads and runs on m3OS through the Phase 85d streaming exec
+   path (`rustc --version`, `rustc --print sysroot`). *(On-device load blocked on
+   the streaming-loader wall → Phase 95b.)*
 2. **Sysroot + target (Track B).** Define the userspace target spec, bundle the
    prebuilt `std`/`core` rlibs, and prove `rustc --print sysroot` resolves under
    `/usr` (the relocation contract).
@@ -338,10 +341,11 @@ recommended path for a *general* Rust toolchain.
 
 - A real distro ships a **dynamic** `rustc`/`cargo` linked against the system
   `libc.so` and `librustc_driver.so`, installed via `rustup`/the package manager
-  onto a writable root, with full crates.io registry access over TLS. m3OS
-  builds the toolchain **fully static** (the same static-toolchain discipline as
-  clang/python/go — even though Phase 93's `libc.so` now exists, the `rustc`
-  binary stays static) and installs it offline from a bundled `.m3pkg`.
+  onto a writable root, with full crates.io registry access over TLS. m3OS's
+  `rustc` is **also dynamic** (`librustc_driver.so` + `libc.so`, via the Phase 93
+  loader) — unlike static clang/python/go, because rustc's own proc-macro deps
+  can't build on a `crt-static` musl host — but it is installed **offline** from a
+  bundled `.m3pkg` (`DEPS=musl`), not from a network registry.
 - Real toolchains support proc-macros out of the box because the host always has
   a dynamic libc to `dlopen` a `.so` against; on m3OS that capability was a
   distinct, sequenced prerequisite — supplied by Phase 93 (`libc.so` + loader
@@ -355,9 +359,13 @@ recommended path for a *general* Rust toolchain.
 
 ## Deferred Until Later
 
+- **The on-device `RUSTC_OK` code-generation milestone itself** — split out to
+  **[Phase 95b](./95b-on-device-rustc.md)** ([tasks](./tasks/95b-on-device-rustc-tasks.md)):
+  the streaming / file-backed-mmap loader for the ~162 MB `librustc_driver.so`, SMP
+  TLB-shootdown batching, and the kstack strategy.
 - **Mainstream `cargo` + proc-macros** ride the **Phase 93** `libc.so` + loader
-  TLS (now landed — the hard gate is cleared; the Area D stretch may still be
-  split into a `95b`).
+  TLS (now landed — the hard gate is cleared); split out to
+  **[Phase 95b Track E](./tasks/95b-on-device-rustc-tasks.md)**.
 - **crates.io registry access** (cargo HTTPS fetch wired to the Phase 86c TLS
   stack) and **`build.rs` with `cc`-crates** (on-device clang invocation).
 - **A self-hosting rustc bootstrap on-device** (building rustc *on* m3OS) — the
