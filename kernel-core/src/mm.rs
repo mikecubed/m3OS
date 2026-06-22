@@ -8,12 +8,25 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
+/// Kernel-internal `mmap` flag (bit 32, above every POSIX 32-bit `MAP_*` flag):
+/// request a **lazy, demand-paged file-backed** `MAP_PRIVATE` mapping (Phase
+/// 95b). Only the `ld-musl` loader sets it, on each `PT_LOAD` it maps, and it
+/// keeps the backing fd open for the mapping's lifetime so the page-fault
+/// handler can read a faulting page straight from the file. A plain (flag-absent)
+/// `MAP_PRIVATE` file mmap stays **eager** — preserving POSIX mmap-then-close for
+/// callers like `lld` that map an input file and immediately close the fd. The
+/// flag is stored in the VMA's `flags`, so it propagates through every
+/// split/trim, and the demand-fault path keys off it to read-from-file vs
+/// zero-fill.
+pub const MAP_LAZY_FILE: u64 = 1 << 32;
+
 /// For a file-backed `MAP_SHARED` **writable** mapping: the backing fd and the
 /// file offset of the mapping's first byte. `munmap`/`msync` use this to write
 /// the mapped pages back to the file (m3OS file-backed mmap is eager-loaded into
 /// anonymous frames, so without this the dirty pages would never reach the
-/// file). `None` for anonymous, private, read-only, or device (MMIO/framebuffer)
-/// mappings — those are never written back.
+/// file). For a Phase 95b lazy `MAP_LAZY_FILE` mapping it instead records the
+/// read source for demand paging (`fd` + the file offset of the first mapped
+/// byte). `None` for anonymous, private-eager, read-only, or device mappings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileBacking {
     /// The descriptor the mapping was created from (still open at unmap for the

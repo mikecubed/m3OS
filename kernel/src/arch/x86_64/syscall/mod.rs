@@ -8928,6 +8928,51 @@ fn vfs_service_read(handle: u64, offset: usize, user_buf_ptr: u64, count: usize)
     bytes_read as u64
 }
 
+/// Phase 95b (Area A.2) — kernel-buffer variant of [`vfs_service_read`]: read up
+/// to `buf.len()` bytes at `offset` from a `VfsService` handle into a kernel
+/// buffer (instead of a user pointer), blocking on the `vfs_server` IPC reply.
+///
+/// This is the read used by the demand-fault file-backed page filler, so it must
+/// be callable from the page-fault handler. That is sound: a ring-3 fault is
+/// entered with no kernel locks held (the faulting task was running userspace),
+/// so blocking on the synchronous `call_msg` here only switches the faulting task
+/// out until `vfs_server` replies — exactly as a syscall-context vfs read does.
+/// Returns bytes read (0 at EOF) or a negative errno.
+fn vfs_service_read_kernel(handle: u64, offset: usize, buf: &mut [u8]) -> Result<usize, i64> {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::fs::vfs_protocol::{VFS_MAX_PREAD, VFS_READ};
+
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    let vfs_ep = registry::lookup_endpoint_id("vfs").ok_or(NEG_EIO as i64)?;
+    let task_id = scheduler::current_task_id().ok_or(NEG_EINVAL as i64)?;
+    let capped = buf.len().min(VFS_MAX_PREAD);
+
+    let mut msg = Message::new(VFS_READ);
+    msg.data[0] = handle;
+    msg.data[1] = offset as u64;
+    msg.data[2] = capped as u64;
+    let reply = endpoint::call_msg(task_id, vfs_ep, msg);
+    if reply.label != 0 {
+        return Err(reply.label as i64);
+    }
+    let bytes_read = reply.data[0] as usize;
+    if bytes_read == 0 {
+        return Ok(0);
+    }
+    if bytes_read > capped {
+        return Err(NEG_EIO as i64);
+    }
+    let bulk = scheduler::take_bulk_data(task_id).ok_or(NEG_EIO as i64)?;
+    if bulk.len() < bytes_read {
+        return Err(NEG_EIO as i64);
+    }
+    buf[..bytes_read].copy_from_slice(&bulk[..bytes_read]);
+    Ok(bytes_read)
+}
+
 fn vfs_service_close(handle: u64) {
     use crate::ipc::{endpoint, message::Message, registry};
     use crate::task::scheduler;
@@ -11321,6 +11366,20 @@ pub(super) fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
 /// Read `buf.len()` bytes from process `pid`'s fd `fd` at file byte `offset`
 /// into the kernel buffer `buf`.  Does **not** advance the fd's offset.
 /// Returns the number of bytes actually read, or a negative errno on error.
+/// Phase 95b (Area A.2) — demand-fault entry point: read one page of file data
+/// for a lazy (`MAP_LAZY_FILE`) file-backed mapping into `buf`, by `(pid, fd,
+/// file_offset)`. Thin `pub(crate)` wrapper over [`kernel_read_fd_at`] (which
+/// handles `VfsService`/ext2/ramdisk/tmpfs/fat32), called from the page-fault
+/// handler. Returns bytes read (0 at EOF / past file end) or a negative errno.
+pub(crate) fn demand_read_file_page(
+    pid: u32,
+    fd: usize,
+    file_offset: usize,
+    buf: &mut [u8],
+) -> Result<usize, i64> {
+    kernel_read_fd_at(pid, fd, file_offset, buf)
+}
+
 fn kernel_read_fd_at(pid: u32, fd: usize, offset: usize, buf: &mut [u8]) -> Result<usize, i64> {
     if buf.is_empty() {
         return Ok(0);
@@ -11396,6 +11455,13 @@ fn kernel_read_fd_at(pid: u32, fd: usize, offset: usize, buf: &mut [u8]) -> Resu
                 },
                 None => Err(NEG_EIO as i64),
             }
+        }
+        // Phase 95b (Area A.2) — a `/usr` file on the default boot is served by
+        // the ring-3 `vfs_server`. Reading it here (pread-style, by `offset`)
+        // blocks on the vfs IPC reply; the demand-fault filler relies on this arm
+        // to demand-page a file-backed mapping whose backing fd is `VfsService`.
+        FdBackend::VfsService { service_handle, .. } => {
+            vfs_service_read_kernel(*service_handle, offset, buf)
         }
         _ => Err(NEG_EINVAL as i64),
     }
@@ -11726,7 +11792,7 @@ pub(super) fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 fn sys_mmap_file_backed(
-    _addr_hint: u64,
+    addr_hint: u64,
     len: u64,
     prot: u64,
     flags: u64,
@@ -11766,6 +11832,82 @@ fn sys_mmap_file_backed(
     };
     if total_size > 0x0000_8000_0000_0000 {
         return NEG_EINVAL;
+    }
+
+    // Phase 95b (Area A.2) — lazy, demand-paged file-backed mapping. The ld-musl
+    // loader sets `MAP_LAZY_FILE` on each `PT_LOAD` and keeps the fd open;
+    // install a VMA recording `(fd, file_offset)` and allocate NO frames. The
+    // page-fault handler then reads a faulting page straight from the file
+    // (`kernel_read_fd_at`, which now handles `VfsService`/ext2/ramdisk) on first
+    // touch — turning a 162 MB eager load into the small working set actually
+    // executed. A plain `MAP_PRIVATE` file mmap (no `MAP_LAZY_FILE`) keeps the
+    // eager path below, preserving POSIX mmap-then-close for callers like `lld`.
+    {
+        const MAP_PRIVATE: u64 = 0x02;
+        const MAP_FIXED: u64 = 0x10;
+        const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
+        if flags & kernel_core::mm::MAP_LAZY_FILE != 0 {
+            let pid = crate::process::current_pid();
+            // Stored VMA flags: MAP_PRIVATE + the lazy marker (MAP_FIXED is a
+            // placement directive, not a property of the resulting mapping).
+            let vma_flags = (flags & MAP_PRIVATE) | kernel_core::mm::MAP_LAZY_FILE;
+            let file_backing = Some(crate::process::FileBacking {
+                fd: fd as u32,
+                offset: file_offset as u64,
+            });
+
+            let base = if flags & MAP_FIXED != 0 {
+                const MMAP_MIN_ADDR: u64 = 0x1_0000;
+                if addr_hint < MMAP_MIN_ADDR
+                    || addr_hint & 0xFFF != 0
+                    || addr_hint
+                        .checked_add(total_size)
+                        .filter(|e| *e <= USER_SPACE_END)
+                        .is_none()
+                {
+                    return NEG_EINVAL;
+                }
+                // Replace whatever occupies [addr_hint, addr_hint+total_size) —
+                // the loader's PROT_NONE span reservation, split by remove_range
+                // — then record the lazy VMA at the exact requested address.
+                let _ = sys_linux_munmap(addr_hint, total_size);
+                addr_hint
+            } else {
+                match crate::process::with_shared_mm_mut(pid, |_b, mmap_next, _v| {
+                    let current = if *mmap_next == 0 {
+                        ANON_MMAP_BASE
+                    } else {
+                        *mmap_next
+                    };
+                    let end = current
+                        .checked_add(total_size)
+                        .filter(|v| *v <= USER_SPACE_END)?;
+                    *mmap_next = end;
+                    Some(current)
+                }) {
+                    Some(Some(b)) => b,
+                    _ => return NEG_EINVAL,
+                }
+            };
+
+            let _ = crate::process::with_shared_mm_mut(pid, |_b, _m, vma_tree| {
+                vma_tree.insert(crate::process::MemoryMapping {
+                    start: base,
+                    len: total_size,
+                    prot,
+                    flags: vma_flags,
+                    file_backing,
+                    pkey: kernel_core::pkey::PKEY_DEFAULT,
+                });
+            });
+            if let Some(addr_space) = {
+                let table = crate::process::PROCESS_TABLE.lock();
+                table.find(pid).and_then(|p| p.addr_space.as_ref().cloned())
+            } {
+                addr_space.bump_generation();
+            }
+            return base;
+        }
     }
 
     use x86_64::structures::paging::{PageTableFlags, PhysFrame, Size4KiB};

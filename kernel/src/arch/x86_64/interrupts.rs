@@ -724,6 +724,47 @@ fn demand_map_user_page_locked(vaddr: u64, prot: u64, pkey: u8) -> bool {
     true
 }
 
+/// Phase 95b (Area A.2) — like [`demand_map_user_page_locked`] but fills the
+/// fresh frame from `buf` (the file bytes for this page, read OUTSIDE the
+/// page-table lock) before mapping. Any tail past `buf.len()` stays zero (the
+/// BSS / past-EOF remainder). Must be called with the page-table lock held.
+fn demand_map_user_page_from_buf_locked(vaddr: u64, prot: u64, pkey: u8, buf: &[u8]) -> bool {
+    use x86_64::structures::paging::Translate as _;
+
+    let page_vaddr = VirtAddr::new(vaddr & !0xFFF);
+    {
+        let mapper = unsafe { crate::mm::paging::get_mapper() };
+        if mapper.translate_addr(page_vaddr).is_some() {
+            // Raced with another fault/thread that already filled this page
+            // while we were doing the (blocking) file read — leave it.
+            return true;
+        }
+    }
+
+    let frame = match crate::mm::frame_allocator::allocate_frame_zeroed() {
+        Some(f) => f,
+        None => return false,
+    };
+
+    // Copy the file bytes into the freshly-zeroed frame via the phys-offset map.
+    let n = buf.len().min(4096);
+    if n > 0 {
+        let dst = (crate::mm::phys_offset() + frame.start_address().as_u64()) as *mut u8;
+        // SAFETY: `dst` is the kernel's linear-map alias of the just-allocated
+        // frame (exclusively owned here); `n <= 4096` stays within the frame.
+        unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, n) };
+    }
+
+    let data_flags = crate::mm::pkey::compose_user_pte_flags(prot, pkey);
+    if unsafe { crate::mm::paging::map_current_user_page_locked(page_vaddr, frame, data_flags) }
+        .is_err()
+    {
+        crate::mm::frame_allocator::free_frame(frame.start_address().as_u64());
+        return false;
+    }
+    true
+}
+
 fn demand_map_user_page(vaddr: u64, prot: u64) -> bool {
     let addr_space = crate::process::current_addr_space();
     let page_base = vaddr & !0xFFF;
@@ -757,6 +798,48 @@ fn demand_map_vma_page(vaddr: u64, require_write: bool) -> bool {
     let pid = crate::process::current_pid();
     if pid == 0 {
         return false;
+    }
+
+    // Phase 95b (Area A.2) — lazy file-backed demand paging. If the faulting page
+    // lies in a `MAP_LAZY_FILE` VMA, read it straight from the backing file and
+    // fill the frame; otherwise fall through to the zero-fill anonymous path.
+    // The file read BLOCKS (virtio / vfs_server IPC) and must run with NO
+    // page-table lock held — a ring-3 fault holds no kernel locks, so blocking
+    // here only switches the faulting task out until the read completes.
+    if let Some((prot, pkey, fd, file_off)) = crate::process::shared_vma_demand_file(pid, vaddr) {
+        let any_access = prot & (PROT_READ | PROT_WRITE | PROT_EXEC) != 0;
+        let write_ok = !require_write || prot & PROT_WRITE != 0;
+        if !any_access || !write_ok {
+            return false;
+        }
+        // Heap (not stack) buffer: the file read path is already deep on the
+        // per-task kernel stack (Area C), so keep this frame's footprint small.
+        let mut buf = alloc::vec![0u8; 4096];
+        let n = match crate::arch::x86_64::syscall::demand_read_file_page(
+            pid,
+            fd as usize,
+            file_off as usize,
+            &mut buf,
+        ) {
+            Ok(n) => n.min(4096),
+            Err(_) => return false,
+        };
+        let addr_space = crate::process::current_addr_space();
+        let mapped = {
+            let _page_table_guard =
+                addr_space.map(|addr_space| unsafe { addr_space.as_ref() }.lock_page_tables());
+            demand_map_user_page_from_buf_locked(vaddr, prot, pkey, &buf[..n])
+        };
+        if !mapped {
+            return false;
+        }
+        // Track B: a not-present -> present transition needs NO cross-core TLB
+        // shootdown on x86 (no core can hold a stale translation for a page that
+        // was never present), so the per-page demand-fault shootdown is skipped.
+        // This is what bounds the IPI storm a 162 MB page-by-page DSO load would
+        // otherwise drive across the idle cores.
+        bump_current_addr_space_generation();
+        return true;
     }
 
     let addr_space = crate::process::current_addr_space();

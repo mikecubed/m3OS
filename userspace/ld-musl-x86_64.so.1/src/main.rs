@@ -207,9 +207,10 @@ fn sys_read(fd: i64, buf: &mut [u8]) -> i64 {
     }
 }
 
-/// `lseek(fd, offset, whence)`. Phase 93 — used by `load_dso` to size the
-/// scratch buffer to the DSO file (a real `libc.so` is ~700 KiB, far past the
-/// old fixed 64 KiB scratch). `whence`: 0=SET, 1=CUR, 2=END.
+/// `lseek(fd, offset, whence)`. `whence`: 0=SET, 1=CUR, 2=END. Retained as a
+/// general syscall wrapper; Phase 95b's loader maps each `PT_LOAD` file-backed
+/// (`mmap`) rather than `lseek`+`read`, so it currently has no caller.
+#[allow(dead_code)]
 fn sys_lseek(fd: i64, offset: i64, whence: u64) -> i64 {
     unsafe { syscall3(SYS_LSEEK, fd as u64, offset as u64, whence) }
 }
@@ -924,8 +925,12 @@ unsafe fn load_dso_impl(fd: i64, scratch: u64, scratch_len: u64) -> Result<Loade
     }
     let image_len = (image_end + 4095) & !4095;
 
-    // One anonymous mmap for the whole image. The kernel picks the
-    // address; the returned value IS our load bias.
+    // Reserve the whole image span as one anonymous mapping. The kernel picks
+    // the address; the returned value IS our load bias. Phase 95b (Area A.2)
+    // then MAP_FIXED-overlays each PT_LOAD as a *lazy file-backed* mapping over
+    // this reservation, so segment content demand-faults from the file instead
+    // of being read+copied in full. Gaps between segments stay anon demand-zero,
+    // matching the prior whole-image-anon behaviour.
     let image_base = sys_mmap(
         0,
         image_len,
@@ -939,44 +944,93 @@ unsafe fn load_dso_impl(fd: i64, scratch: u64, scratch_len: u64) -> Result<Loade
     }
     let load_bias = image_base as u64;
 
-    // Pass 2: stream each PT_LOAD straight from the file into the image, then
-    // mprotect text pages to R-X (W^X requires separate W and X mappings). The
-    // image mmap is anonymous-zeroed, so reading only `p_filesz` bytes leaves the
-    // BSS tail (`p_memsz - p_filesz`) zero — no explicit zeroing needed.
+    // Pass 2: map each PT_LOAD over the reservation — the file part as a lazy
+    // file-backed mapping (`MAP_LAZY_FILE`: the kernel demand-pages it from `fd`
+    // on first touch, which is why the fd is kept open below), the BSS tail as
+    // anonymous zero. Segments are mapped writable so the relocation engine (run
+    // by the caller) can patch the GOT/data; text is dropped to R-X afterwards.
+    const MAP_FIXED: u64 = 0x10;
+    // Kernel-internal flag requesting a lazy demand-paged file-backed mapping;
+    // must match `kernel_core::mm::MAP_LAZY_FILE`.
+    const MAP_LAZY_FILE: u64 = 1 << 32;
     for i in 0..phnum {
         let ph = unsafe { *phdr_base.add(i) };
         if ph.p_type != PT_LOAD {
             continue;
         }
-        let filesz = ph.p_filesz as usize;
-        if filesz == 0 {
-            continue;
-        }
-        // Sanity-bound the segment to the image span just mapped so a malformed
-        // PT_LOAD cannot drive an out-of-bounds write into unrelated memory.
-        let seg_hi = ph
+        // Bound the segment to the reserved image span (defence against a
+        // malformed PT_LOAD driving a MAP_FIXED outside our reservation).
+        let mem_hi = ph
             .p_vaddr
-            .checked_add(ph.p_filesz)
-            .ok_or(LoadError::Other("p_vaddr+p_filesz overflow"))?;
-        if seg_hi > image_len {
-            return Err(LoadError::Other("PT_LOAD file range outside image"));
+            .checked_add(ph.p_memsz)
+            .ok_or(LoadError::Other("p_vaddr+p_memsz overflow"))?;
+        if mem_hi > image_len {
+            return Err(LoadError::Other("PT_LOAD range outside image"));
         }
-        if sys_lseek(fd, ph.p_offset as i64, 0 /* SEEK_SET */) < 0 {
-            return Err(LoadError::Other("lseek PT_LOAD failed"));
+        let seg_vaddr = load_bias + ph.p_vaddr;
+        let vaddr_pa = seg_vaddr & !4095u64;
+        let file_off_pa = ph.p_offset & !4095u64;
+        let file_end = seg_vaddr + ph.p_filesz;
+        let file_map_end = (file_end + 4095) & !4095u64;
+        let mem_end = seg_vaddr + ph.p_memsz;
+        let mem_map_end = (mem_end + 4095) & !4095u64;
+
+        // 1. Lazy file-backed part. p_vaddr ≡ p_offset (mod page), so the
+        //    page-aligned file offset lines up with the page-aligned vaddr.
+        if ph.p_filesz > 0 {
+            let r = sys_mmap(
+                vaddr_pa,
+                file_map_end - vaddr_pa,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_FIXED | MAP_LAZY_FILE,
+                fd,
+                file_off_pa,
+            );
+            if r < 0 || (r as u64) != vaddr_pa {
+                return Err(LoadError::Other("PT_LOAD file-backed mmap failed"));
+            }
         }
-        let dst =
-            unsafe { core::slice::from_raw_parts_mut((load_bias + ph.p_vaddr) as *mut u8, filesz) };
-        let mut off = 0usize;
-        while off < filesz {
-            let n = sys_read(fd, &mut dst[off..]);
-            if n < 0 {
-                return Err(LoadError::Other("PT_LOAD read failed"));
+
+        // 2. BSS pages beyond the file part (anonymous zero). For a pure-bss
+        //    segment (filesz == 0) this maps the whole segment.
+        let bss_start = if ph.p_filesz > 0 {
+            file_map_end
+        } else {
+            vaddr_pa
+        };
+        if mem_map_end > bss_start {
+            let r = sys_mmap(
+                bss_start,
+                mem_map_end - bss_start,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                -1,
+                0,
+            );
+            if r < 0 || (r as u64) != bss_start {
+                return Err(LoadError::Other("PT_LOAD bss mmap failed"));
             }
-            if n == 0 {
-                // EOF before p_filesz — the remainder stays zero (anon image).
-                break;
+        }
+
+        // 3. Zero the BSS bytes that share the last file page with file content.
+        //    The write faults the (lazy) boundary page in from the file, then
+        //    zeroes the `[filesz, page_end)` tail — so a demand-read that pulled
+        //    in trailing next-segment file bytes is corrected before first use.
+        if ph.p_filesz > 0 && ph.p_memsz > ph.p_filesz && file_end < file_map_end {
+            let zero_end = if mem_end < file_map_end {
+                mem_end
+            } else {
+                file_map_end
+            };
+            if zero_end > file_end {
+                let tail = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        file_end as *mut u8,
+                        (zero_end - file_end) as usize,
+                    )
+                };
+                tail.fill(0);
             }
-            off += n as usize;
         }
     }
     for i in 0..phnum {
@@ -1044,6 +1098,11 @@ unsafe fn load_dso_impl(fd: i64, scratch: u64, scratch_len: u64) -> Result<Loade
         serial(b"\n");
         return Err(LoadError::Other("dynamic pointer outside image"));
     }
+    // Success: the lazy file-backed PT_LOAD mappings demand-page from `fd` for
+    // the lifetime of the process, so the fd must stay open. Leak it (forget the
+    // guard) — a few open fds per loaded DSO. Every *error* return above still
+    // drops the guard and closes the fd (the failed DSO's mappings go unused).
+    core::mem::forget(fd_guard);
     Ok(LoadedDso {
         load_bias,
         image_len,
