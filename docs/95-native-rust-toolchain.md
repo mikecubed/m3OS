@@ -130,9 +130,12 @@ Phase 85d already proved **LLD** links real programs on m3OS, so Phase 95 simply
 bundles Rust's vendored `rust-lld` in the `.m3pkg` (its default linker) rather than
 re-solving "no system linker" or depending on the heavy clang port. Because m3OS
 has no system `cc`, the on-device compile passes
-`-C linker-flavor=ld.lld -C link-self-contained=+linker`, so `rustc` invokes its
+`-C linker-flavor=ld.lld -C link-self-contained=yes`, so `rustc` invokes its
 bundled `rust-lld` directly (self-contained crt + linker) instead of shelling out
-to an absent `cc`.
+to an absent `cc` — and the resulting program is static-pie (no runtime deps).
+Note `rust-lld` is itself dynamically linked against the bundled `libLLVM.so`
+(LLVM built as a dylib), found via RPATH in the sysroot, so the `.m3pkg` ships
+`libLLVM.so` and rust-lld loads through the Phase 93 loader on-device.
 
 ### Reused kernel substrate (no new always-on kernel work for the core)
 

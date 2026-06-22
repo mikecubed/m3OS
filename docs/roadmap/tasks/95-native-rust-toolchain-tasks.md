@@ -20,15 +20,32 @@
 
 > **Implementation status (live).** Host-side scaffolding for Tracks A/B/C/E is
 > landed and `cargo xtask check`-green (PR #264): `ports/lang/rust/Portfile` (Rust
-> 1.96.0), `build_rust` (x.py cross-build → static musl rustc + std sysroot +
-> bundled `rust-lld`, reusing the Phase 85d musl libc++ sysroot), the dispatch /
-> `build_recipe_id` / `BUILDABLE_PORTS` wiring, the `M3OS_WITH_RUST` image-feature
-> gate, the `/usr/src/hello.rs` fixture, and `cmd_rustc_smoke` + `rustc_smoke_steps`
-> + CLI dispatch + `usage()`. The heavy host build (static musl `rustc` over the
-> reused LLVM-22 musl libc++ sysroot) is running; on-device `RUSTC_OK` validation
-> via the `rustc-smoke` gate follows once it lands. Bootstrap decisions made:
-> stock `x86_64-unknown-linux-musl` target (not a new spec); bundled `rust-lld`
-> (no `DEPS=clang`); full `x.py` static-musl build (not `mrustc`).
+> 1.96.0), `build_rust` (x.py cross-build → musl rustc + std sysroot + bundled
+> `rust-lld`), the dispatch / `build_recipe_id` / `BUILDABLE_PORTS` wiring, the
+> `M3OS_WITH_RUST` image-feature gate, the `/usr/src/hello.rs` fixture, and
+> `cmd_rustc_smoke` + `rustc_smoke_steps` + CLI dispatch + `usage()`.
+>
+> **Key architectural finding (build bring-up).** A *fully-static* musl-host `rustc`
+> proved **infeasible**: rustc's own source depends on proc-macro crates, and a
+> `crt-static` musl host cannot build dylibs/proc-macros (`error: cannot produce
+> proc-macro … target does not support these crate types`). So Phase 95 ships a
+> **dynamic** musl `rustc` (`crt-static=false`, `PT_INTERP=/lib/ld-musl` +
+> `DT_NEEDED libc.so`) that runs on m3OS via the **Phase 93** `/usr/lib/libc.so` +
+> Rust loader — which is exactly why Phase 93 is a listed dependency. `rust.m3pkg`
+> carries `DEPS=musl`; the gate bundles `musl.m3pkg` + `rust.m3pkg`. (The design
+> doc's "static rustc" assumption is corrected by this finding.) The build also
+> required: a dedicated **`-fPIC` musl libc++** (built from the llvm port's
+> llvm-project source — the rustc-src tarball omits libcxx; x.py's LLVM is `-fPIC`);
+> building the rustc source **outside the m3OS Cargo workspace** (under `$HOME/.cache`,
+> so cargo doesn't inherit `build.target=x86_64-unknown-none` / bind `src/bootstrap`);
+> `llvm-libunwind="in-tree"` (std's dynamic link else pulls absent `-lgcc_s`); and
+> `download-ci-llvm=false` + `targets="X86"` (ci-llvm mis-pointed the musl rustc_llvm
+> shim's includes; X86-only is faster + a smaller rustc to load on-device).
+>
+> The heavy host build is iterating through these (each fix cleared the next
+> blocker); on-device `RUSTC_OK` validation via `rustc-smoke` follows once a `rustc`
+> lands. Bootstrap decisions: stock `x86_64-unknown-linux-musl` target; bundled
+> `rust-lld` (no `DEPS=clang`); full `x.py` build (not `mrustc`).
 
 ---
 

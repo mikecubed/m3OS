@@ -2203,6 +2203,9 @@ fn build_rust(extracted: &Path, stage: &Path, _port_dir: &Path) -> Result<(), St
             ));
         }
     }
+    // (The musl stage2 rustc_llvm links our self-contained `libc++.a` — libc++abi +
+    // libunwind merged in via the Stage-B flags — as `-lc++`; see the per-target
+    // `CXXFLAGS_<triple>=-stdlib=libc++` at the x.py build step below.)
 
     // 3. musl-root prefix: Rust's std build wants `<musl-root>/lib/libc.a`. Build a
     //    symlink prefix over the distro musl (Debian: /usr/lib/x86_64-linux-musl;
@@ -2323,9 +2326,21 @@ fn build_rust(extracted: &Path, stage: &Path, _port_dir: &Path) -> Result<(), St
         "rust: building dynamic musl rustc + std (x.py, {} jobs) — the heavy cross-build",
         jobs
     );
+    // PER-TARGET C++ stdlib selection (the crux of the cross build): the C++ LLVM
+    // code is compiled against libc++ (`std::__1`), but `rustc_llvm`'s build.rs picks
+    // the stdlib to link from `llvm-config --cxxflags` — it links `-lc++` iff that
+    // contains `-stdlib=libc++`, else the absent `-lstdc++`. cc-rs reads
+    // `CXXFLAGS_<triple>` into bootstrap's per-target LLVM cmake flags, so setting it
+    // ONLY for the musl triple bakes `-stdlib=libc++` into the MUSL llvm-config (→
+    // the musl stage2 rustc_llvm links `-lc++`, which resolves to our static
+    // `libc++.a` in the sysroot — no .so shipped) while the gnu stage1 keeps the
+    // host's gcc/libstdc++ (a GLOBAL `[llvm] cxxflags` would break the gnu LLVM build,
+    // which gcc compiles). A single `--stage 2` builds the whole stage0→stage1(gnu)→
+    // stage2(musl) chain.
     run(
         Command::new("python3")
             .current_dir(src)
+            .env("CXXFLAGS_x86_64_unknown_linux_musl", "-stdlib=libc++")
             .arg("./x.py")
             .arg("build")
             .arg("--stage")
@@ -2344,6 +2359,7 @@ fn build_rust(extracted: &Path, stage: &Path, _port_dir: &Path) -> Result<(), St
         Command::new("python3")
             .current_dir(src)
             .env("DESTDIR", stage)
+            .env("CXXFLAGS_x86_64_unknown_linux_musl", "-stdlib=libc++")
             .arg("./x.py")
             .arg("install")
             .arg("--stage")
