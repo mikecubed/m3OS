@@ -622,6 +622,24 @@ if [ "${M3OS_CLANG_REGRESSION:-0}" = "1" ]; then
     fi
 fi
 
+# Phase 95 — Native Rust toolchain regression gate. Gated behind
+# M3OS_RUST_REGRESSION=1 because it host-cross-builds a fully-static
+# x86_64-unknown-linux-musl rustc (the upstream x.py bootstrap: musl LLVM-22 +
+# rustc + std, reusing the llvm port's musl libc++ sysroot) — a multi-hour cold
+# build — before building an opt-in M3OS_WITH_RUST image, booting QEMU,
+# `pkg install rust`, and compiling + linking (bundled rust-lld) + running a Rust
+# program INSIDE m3OS (RUSTC_OK). Set this on branches that touch ports/lang/rust,
+# xtask's build_rust / rust bundling / cmd_rustc_smoke, or the kernel exec / ext2 /
+# VFS paths the big static toolchain exercises. Requires host clang + cmake + ninja
+# + python3 + musl-dev; SKIPs with reason otherwise.
+if [ "${M3OS_RUST_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask rustc-smoke..."
+    if ! cargo xtask rustc-smoke --timeout 5400; then
+        echo "pre-push: cargo xtask rustc-smoke failed" >&2
+        exit 1
+    fi
+fi
+
 # Phase 86d — Go-runtime regression gate. Gated behind M3OS_GO_REGRESSION=1
 # because it cross-builds a fully static (CGO_ENABLED=0) Go 1.24 program with the
 # downloaded official toolchain, bundles it, boots QEMU, `pkg install go`, and

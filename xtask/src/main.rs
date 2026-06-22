@@ -1,3 +1,10 @@
+// `doc_lazy_continuation` / `doc_overindented_list_items` are doc-comment
+// markdown-rendering style lints (newly default in recent clippy). xtask is the
+// build tool, full of long internal build-recipe doc comments where these flag
+// prose layout, not correctness or public API. Opt out crate-wide rather than
+// reformat ~dozens of internal comments; all other clippy lints stay `-D warnings`.
+#![allow(clippy::doc_lazy_continuation, clippy::doc_overindented_list_items)]
+
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, Seek, Write as _};
@@ -368,6 +375,14 @@ const SMOKE_EXIT_IPV6_SMOKE_FAILED: i32 = 88;
 /// floor by PATH precedence, and that `pkg remove coreutils` falls back cleanly.
 /// Skip-with-reason when the prebuilt-std musl Rust target is absent.
 const SMOKE_EXIT_COREUTILS_SMOKE_FAILED: i32 = 90;
+
+/// Phase 95 — `cargo xtask rustc-smoke` exit code. Builds the static musl
+/// `rust.m3pkg`, builds the `M3OS_WITH_RUST` image, boots m3OS, `pkg install
+/// rust`, asserts `rustc --version` + `rustc --print sysroot` under `/usr`
+/// (relocation contract), then compiles + links (bundled rust-lld) + runs
+/// `/usr/src/hello.rs` and asserts `RUSTC_OK`. Skip-with-reason when the host
+/// Rust/clang toolchain or musl headers are absent.
+const SMOKE_EXIT_RUSTC_SMOKE_FAILED: i32 = 91;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
@@ -1154,6 +1169,22 @@ fn main() {
                 });
             cmd_clang_smoke(&smoke_args);
         }
+        // Phase 95 — on-device Rust toolchain smoke. Builds the image with the
+        // opt-in `M3OS_WITH_RUST` feature (bundling the static musl `rustc` +
+        // sysroot + rust-lld `.m3pkg` into the offline `/usr/pkg/` repo), boots
+        // m3OS, `pkg install rust`, then compiles + links (bundled rust-lld) +
+        // RUNS a Rust program inside m3OS (`RUSTC_OK`) — the proof the cross-built
+        // toolchain generates native code on target. SKIP-with-reason when the
+        // host build toolchain (clang/cmake/ninja/ld.lld/python3/musl-dev) is absent.
+        Some("rustc-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("rustc-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_rustc_smoke(&smoke_args);
+        }
         // Phase 86e — GitHub CLI (`gh`) smoke. Builds the image with the opt-in
         // `M3OS_WITH_GH` feature (bundling the ~55 MB static-Go `gh` `.m3pkg`
         // into the offline `/usr/pkg/` repo), boots m3OS, `pkg install gh`, and
@@ -1480,7 +1511,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -1916,7 +1947,7 @@ fn build_userspace_bins() {
         }
 
         let src = root.join(format!("target/x86_64-m3os/release/{bin}"));
-        let dst = initrd.join(format!("{bin}"));
+        let dst = initrd.join(bin);
         fs::copy(&src, &dst).unwrap_or_else(|e| {
             panic!("failed to copy {bin} to initrd: {e}");
         });
@@ -2021,7 +2052,7 @@ fn build_userspace_bins() {
 
     for bin in coreutils_bins {
         let src = root.join(format!("target/x86_64-m3os/release/{bin}"));
-        let dst = initrd.join(format!("{bin}"));
+        let dst = initrd.join(bin);
         fs::copy(&src, &dst).unwrap_or_else(|e| {
             panic!("failed to copy {bin} to initrd: {e}");
         });
@@ -3364,7 +3395,7 @@ fn build_musl_bins() {
             );
             // Create empty placeholders so include_bytes! doesn't fail.
             for (_, name) in bins {
-                let dst = initrd.join(format!("{name}"));
+                let dst = initrd.join(name);
                 if !dst.exists() {
                     fs::write(&dst, b"").unwrap_or_else(|e| {
                         eprintln!(
@@ -3381,7 +3412,7 @@ fn build_musl_bins() {
     let extra_ldflags = musl_cc_extra_ldflags();
     for (src_rel, name) in bins {
         let src = root.join(src_rel);
-        let dst = initrd.join(format!("{name}"));
+        let dst = initrd.join(name);
         let mut cmd = Command::new(cc);
         cmd.args([
             "-static",
@@ -3399,7 +3430,7 @@ fn build_musl_bins() {
                 eprintln!(
                     "warning: {cc} disappeared between probe and execution — skipping {name}"
                 );
-                let dst = initrd.join(format!("{name}"));
+                let dst = initrd.join(name);
                 if !dst.exists() {
                     fs::write(&dst, b"").unwrap_or_else(|e| {
                         eprintln!(
@@ -3911,24 +3942,24 @@ fn build_doom() {
     // the doomgeneric source tree, overwriting the upstreamed originals.
     // This runs after git checkout so our patches survive the forced reset.
     let patches_dir = root.join("userspace/doom/patches");
-    if patches_dir.is_dir() {
-        if let Ok(entries) = fs::read_dir(&patches_dir) {
-            for entry in entries.flatten() {
-                let src = entry.path();
-                if src.extension().is_some_and(|e| e == "c" || e == "h") {
-                    let dst = dg_game_src.join(src.file_name().unwrap());
-                    fs::copy(&src, &dst).unwrap_or_else(|e| {
-                        eprintln!(
-                            "doom: failed to apply patch {:?}: {e}",
-                            src.file_name().unwrap()
-                        );
-                        0
-                    });
-                    println!(
-                        "doom: applied patch {}",
-                        src.file_name().unwrap().to_str().unwrap_or("?")
+    if patches_dir.is_dir()
+        && let Ok(entries) = fs::read_dir(&patches_dir)
+    {
+        for entry in entries.flatten() {
+            let src = entry.path();
+            if src.extension().is_some_and(|e| e == "c" || e == "h") {
+                let dst = dg_game_src.join(src.file_name().unwrap());
+                fs::copy(&src, &dst).unwrap_or_else(|e| {
+                    eprintln!(
+                        "doom: failed to apply patch {:?}: {e}",
+                        src.file_name().unwrap()
                     );
-                }
+                    0
+                });
+                println!(
+                    "doom: applied patch {}",
+                    src.file_name().unwrap().to_str().unwrap_or("?")
+                );
             }
         }
     }
@@ -6108,6 +6139,30 @@ fn cmd_check() {
         std::process::exit(1);
     }
 
+    // Clippy for `xtask` itself (host target). Without this, the build tool —
+    // including `port_build.rs`'s port recipes — was compiled (via the host
+    // tests below) but never linted, so clippy regressions in xtask slipped the
+    // gate. Linted here with the same `-D warnings` bar as every other crate.
+    let status = Command::new(env!("CARGO"))
+        .current_dir(&root)
+        .args([
+            "clippy",
+            "--package",
+            "xtask",
+            "--target",
+            KERNEL_CORE_HOST_TARGET,
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .status()
+        .expect("failed to run xtask clippy");
+
+    if !status.success() {
+        eprintln!("xtask clippy reported errors");
+        std::process::exit(1);
+    }
+
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
         .args([
@@ -6411,8 +6466,8 @@ fn retpoline_objdump_gate() {
             let after_tab = line.split('\t').nth(2).unwrap_or("");
             let mnemonic = after_tab.split_whitespace().next().unwrap_or("");
             let operand = after_tab
-                .splitn(2, char::is_whitespace)
-                .nth(1)
+                .split_once(char::is_whitespace)
+                .map(|x| x.1)
                 .unwrap_or("")
                 .trim_start();
             matches!(mnemonic, "call" | "callq" | "jmp" | "jmpq") && operand.starts_with('*')
@@ -6674,19 +6729,18 @@ fn build_test_binaries(test_name: Option<&str>, features: &[String]) -> Vec<Path
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut binaries = Vec::new();
     for line in stdout.lines() {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
-            if json.get("reason").and_then(|v| v.as_str()) == Some("compiler-artifact") {
-                if let Some(executable) = json.get("executable").and_then(|v| v.as_str()) {
-                    // Only include test binaries (those with test = true in profile).
-                    if json
-                        .get("profile")
-                        .and_then(|p| p.get("test"))
-                        .and_then(|t| t.as_bool())
-                        == Some(true)
-                    {
-                        binaries.push(PathBuf::from(executable));
-                    }
-                }
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(line)
+            && json.get("reason").and_then(|v| v.as_str()) == Some("compiler-artifact")
+            && let Some(executable) = json.get("executable").and_then(|v| v.as_str())
+        {
+            // Only include test binaries (those with test = true in profile).
+            if json
+                .get("profile")
+                .and_then(|p| p.get("test"))
+                .and_then(|t| t.as_bool())
+                == Some(true)
+            {
+                binaries.push(PathBuf::from(executable));
             }
         }
     }
@@ -7048,10 +7102,12 @@ fn strip_ansi(input: &str) -> String {
                     }
                 }
                 // consume final byte (letter @ through ~)
-                if let Some(&c) = chars.peek() {
-                    if c.is_ascii() && (c as u8) >= b'@' && (c as u8) <= b'~' {
-                        chars.next();
-                    }
+                if let Some(&c) = chars.peek()
+                    && c.is_ascii()
+                    && (c as u8) >= b'@'
+                    && (c as u8) <= b'~'
+                {
+                    chars.next();
                 }
             } else {
                 // ESC + single character (e.g., ESC c)
@@ -9441,9 +9497,11 @@ fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
     } else {
         QemuDisplayMode::Headless
     };
-    let mut devices = DeviceSet::default();
-    devices.kvm = smoke_args.kvm;
-    devices.memory_mib = smoke_args.memory_mib;
+    let devices = DeviceSet {
+        kvm: smoke_args.kvm,
+        memory_mib: smoke_args.memory_mib,
+        ..Default::default()
+    };
     let mut args = qemu_args_with_devices(&uefi_image, &ovmf, display_mode, devices);
     // Strip hostfwd to avoid port conflicts in CI (same as qemu_test_args).
     for arg in args.iter_mut() {
@@ -13850,14 +13908,14 @@ fn prepare_audio_smoke_dir() -> PathBuf {
 
     // Remove any WAV from a prior run so the smoke gate always reads a fresh file.
     let wav_path = smoke_dir.join("audio.wav");
-    if wav_path.exists() {
-        if let Err(e) = fs::remove_file(&wav_path) {
-            eprintln!(
-                "audio-smoke: cannot remove prior audio.wav {}: {e}",
-                wav_path.display()
-            );
-            std::process::exit(1);
-        }
+    if wav_path.exists()
+        && let Err(e) = fs::remove_file(&wav_path)
+    {
+        eprintln!(
+            "audio-smoke: cannot remove prior audio.wav {}: {e}",
+            wav_path.display()
+        );
+        std::process::exit(1);
     }
 
     // Verify writability with a probe file before launching QEMU.
@@ -16136,6 +16194,10 @@ fn capture_burst(
     Ok(())
 }
 
+// The QEMU child is killed + waited on the normal path (and on every early
+// return below); clippy cannot prove reaping across the panic/`expect` paths in
+// this harness, so the lint is a false positive here.
+#[allow(clippy::zombie_processes)]
 fn cmd_less_render_probe(args: &LessRenderProbeArgs) {
     // 1. Build everything the boot needs. Mirrors `cmd_tui_app_smoke`
     //    so the on-disk layout (less binary, terminfo, /etc/passwd)
@@ -16381,6 +16443,9 @@ fn cmd_less_render_probe(args: &LessRenderProbeArgs) {
 /// Exit code 0 = process rows rendered; non-zero = blank table (the
 /// 2026-05-20 regression) or a probe error. Run via `cargo xtask
 /// htop-render-probe`.
+// The QEMU child is killed + waited on the normal path; clippy cannot prove
+// reaping across the panic/`expect` paths in this harness (false positive).
+#[allow(clippy::zombie_processes)]
 fn cmd_htop_render_probe(args: &LessRenderProbeArgs) {
     /// Minimum changed scanlines in htop's process-table band (vs the empty
     /// prompt baseline) that indicate htop rendered a populated table. A full
@@ -16724,8 +16789,10 @@ fn cmd_compositor_stress(args: &CompositorStressArgs) {
     let vnc_socket = qmp::fresh_socket_path();
     let _ = std::fs::remove_file(&vnc_socket);
 
-    let mut devices = DeviceSet::default();
-    devices.kvm = args.kvm;
+    let devices = DeviceSet {
+        kvm: args.kvm,
+        ..Default::default()
+    };
     let mut qemu_args =
         qemu_args_with_devices(&uefi_image, &ovmf, QemuDisplayMode::Headless, devices);
     for arg in qemu_args.iter_mut() {
@@ -19245,8 +19312,10 @@ fn claude_tui_render_arm(
     let _ = std::fs::remove_file(&qmp_socket);
     let vnc_socket = qmp::fresh_socket_path();
     let _ = std::fs::remove_file(&vnc_socket);
-    let mut devices = DeviceSet::default();
-    devices.kvm = true;
+    let devices = DeviceSet {
+        kvm: true,
+        ..Default::default()
+    };
     let mut qemu_args =
         qemu_args_with_devices(uefi_image, ovmf, QemuDisplayMode::Headless, devices);
     for arg in qemu_args.iter_mut() {
@@ -23076,6 +23145,228 @@ fn clang_smoke_steps() -> Vec<SmokeStep> {
     steps
 }
 
+/// Phase 95 — `cargo xtask rustc-smoke`. Builds the static musl `rust.m3pkg`,
+/// builds the `M3OS_WITH_RUST` image (bundling it into the offline `/usr/pkg/`
+/// repo), boots m3OS, `pkg install rust`, asserts `rustc --version` + `rustc
+/// --print sysroot` under `/usr` (the relocation contract), then compiles + links
+/// (the bundled `rust-lld`) + RUNS `/usr/src/hello.rs` and asserts `RUSTC_OK` —
+/// the Area C milestone proof the cross-built toolchain generates native code
+/// on-device. SKIP-with-reason when the host toolchain (clang/cmake/ninja/ld.lld/
+/// python3/musl-dev) needed to build the static rustc is absent (mirroring
+/// `clang-smoke` / `coreutils-smoke`).
+fn cmd_rustc_smoke(args: &SmokeBootArgs) {
+    // Precondition: build the rust port so `rust.m3pkg` exists for the image to
+    // bundle. `build_rust` reuses the `llvm` port's static musl C++ sysroot
+    // (libc++/builtins) for its rustc_llvm shim + x.py's musl-LLVM cross-build, so
+    // build the llvm port FIRST (like `node-smoke`); a warm pkgcache makes it a
+    // zero-compiler hit. `build_llvm`/`build_rust` probe their host prerequisites
+    // first, so a missing toolchain surfaces as a clear "not found"/"musl headers
+    // not found" error — treat those as SKIP (a prereq-absent environment), and any
+    // other error (a real build failure) as a hard FAIL.
+    let skip_if_prereq = |label: &str, msg: String| {
+        let m = msg.to_lowercase();
+        if m.contains("not found") || m.contains("not installed") || m.contains("musl headers") {
+            println!("rustc-smoke: SKIP (reason: {label}: {msg})");
+            std::process::exit(0);
+        }
+        eprintln!("rustc-smoke: precondition failed ({label}): {msg}");
+        std::process::exit(SMOKE_EXIT_RUSTC_SMOKE_FAILED);
+    };
+    if let Err(msg) = port_build::build_llvm_port() {
+        skip_if_prereq("llvm port build (musl C++ sysroot)", msg);
+    }
+    // rustc is a DYNAMIC musl binary (`DEPS=musl`), so the solver needs the Phase 93
+    // `libc.so` (`musl.m3pkg`) bundled too — build it so the image gate can bundle it.
+    if let Err(msg) = port_build::build_musl_port() {
+        skip_if_prereq("musl port build (libc.so for DEPS=musl)", msg);
+    }
+    if let Err(msg) = port_build::build_rust_port() {
+        skip_if_prereq("rust port build", msg);
+    }
+
+    // Opt-in image feature: bundle the rust `.m3pkg` into /usr/pkg for this build.
+    // SAFETY: xtask is single-threaded here; the child image-build steps read the
+    // env. set_var is `unsafe` in Rust edition 2024.
+    unsafe {
+        std::env::set_var("M3OS_WITH_RUST", "1");
+    }
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    // Recreate the data disk so the freshly-bundled rust `.m3pkg` + the
+    // /usr/src/hello.rs fixture are present and the package DB starts clean.
+    // M3OS_RUST_FAST_ITER=1 reuses an existing disk with rust already installed
+    // (paired with rustc_smoke_steps() skipping the install) for kernel-fix iteration.
+    let fast_iter = std::env::var("M3OS_RUST_FAST_ITER").is_ok();
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if fast_iter && disk_img.exists() {
+        println!("rustc-smoke: M3OS_RUST_FAST_ITER — reusing existing disk (skipping install)");
+    } else {
+        if disk_img.exists() {
+            let _ = fs::remove_file(&disk_img);
+        }
+        create_data_disk(
+            uefi_image.parent().unwrap(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false, // graphical_login — autologin / serial path
+        );
+    }
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    // KVM (`M3OS_KVM=1`) runs the guest near-native instead of TCG. rustc-smoke's
+    // cold path is dominated by the ~368 MB toolchain install + the dynamic rustc /
+    // librustc_driver.so / libLLVM.so load streaming page-by-page over the ring-3
+    // VFS, so KVM is ~10–50x faster — strongly recommended for this gate locally.
+    // CI (no nested-virt guarantee) stays TCG with the generous timeouts in
+    // rustc_smoke_steps.
+    let mut devices = DeviceSet::default();
+    if std::env::var_os("M3OS_KVM").is_some_and(|v| v != "0" && !v.is_empty()) {
+        devices.kvm = true;
+    }
+    let mut qemu_args = qemu_args_with_devices(&uefi_image, &ovmf, display_mode, devices);
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    let steps = rustc_smoke_steps();
+
+    println!(
+        "rustc-smoke: launching QEMU (timeout {}s, {} steps)",
+        args.timeout_secs,
+        steps.len()
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!("rustc-smoke: PASSED ({} steps in {elapsed}s)", steps.len());
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("rustc-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_RUSTC_SMOKE_FAILED);
+        }
+    }
+}
+
+/// The serial script for `rustc-smoke`. The run-output sentinel (`RUSTC_OK`) comes
+/// from the bundled `/usr/src/hello.rs` fixture, NOT the typed command, so the Wait
+/// matches the program's actual output rather than the echoed command. Timeouts are
+/// generous: the multi-hundred-MB `pkg install` and each cold rustc invocation
+/// (loading the multi-tens-of-MB static binary + reading the sysroot rlibs) run for
+/// minutes over m3OS's slow ring-3 VFS.
+fn rustc_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/rustc-smoke: kernel first message",
+    }];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    // 1. Install rust from the bundled offline repo (no runtime DEPS). The package
+    //    is large (the static rustc + std sysroot + rust-lld); `pkg install` first
+    //    READS the whole `.m3pkg` to verify its SHA-256, then writes every file over
+    //    the slow ring-3 VFS, so the ceiling is very large (clang-gate class).
+    if std::env::var("M3OS_RUST_FAST_ITER").is_err() {
+        steps.push(SmokeStep::Send {
+            input: "pkg install rust\n",
+            label: "rustc-smoke: pkg install rust",
+        });
+        steps.push(SmokeStep::WaitPassOrFail {
+            pass_pattern: "pkg install: rust: OK",
+            fail_prefixes: &["pkg install: cannot"],
+            timeout_secs: 3000,
+            label: "rustc-smoke: rust installed from .m3pkg",
+            exit_code_on_fail: SMOKE_EXIT_RUSTC_SMOKE_FAILED,
+        });
+    }
+
+    // 2. rustc resolves on PATH and reports the pinned version (the static musl
+    //    rustc ET_EXEC RUNS via the Phase 12 compat layer + Phase 85d streaming
+    //    loader). First invocation cold-loads the big static binary over the slow
+    //    VFS — generous ceiling.
+    steps.push(SmokeStep::Send {
+        input: "rustc --version\n",
+        label: "rustc-smoke: rustc --version",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "rustc 1.96.0",
+        // The first rustc invocation cold-loads the dynamic rustc + librustc_driver.so
+        // + libLLVM.so (~150 MB) page-by-page over the slow ring-3 VFS — minutes under
+        // TCG (near-instant under M3OS_KVM=1). Generous ceiling; the global --timeout
+        // caps the total.
+        timeout_secs: 1500,
+        label: "rustc-smoke: version 1.96.0",
+    });
+
+    // 3. Relocation contract: the sysroot resolves RELATIVE to the binary, under
+    //    /usr. The printed path is NOT in the typed command, so the Wait can't
+    //    false-match the echo.
+    steps.push(SmokeStep::Send {
+        input: "rustc --print sysroot\n",
+        label: "rustc-smoke: rustc --print sysroot",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "/usr",
+        timeout_secs: 600,
+        label: "rustc-smoke: sysroot under /usr (relocation contract)",
+    });
+
+    // 4. Compile + link (bundled rust-lld) + RUN inside m3OS. m3OS has no system
+    //    `cc`/`ld`, so rustc is told to link directly with its bundled rust-lld
+    //    (self-contained linker + crt). The `RUSTC_OK` sentinel is printed by the
+    //    running program (from the fixture), proving the toolchain produced a
+    //    working native binary — not merely cross-built. No proc-macros in the
+    //    dependency graph (the milestone is proc-macro-free by construction).
+    steps.push(SmokeStep::Send {
+        input: "rustc -C linker-flavor=ld.lld -C link-self-contained=yes /usr/src/hello.rs -o /tmp/hello && /tmp/hello\n",
+        label: "rustc-smoke: rustc hello.rs (rust-lld) + run",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "RUSTC_OK hello from rustc",
+        // rustc emits `error[E...]`/`error:` on a failed compile; rust-lld emits
+        // `rust-lld: error:` / `error: linking with` on a failed link.
+        fail_prefixes: &[
+            "error:",
+            "error[",
+            "rust-lld: error:",
+            "error: linking with",
+        ],
+        timeout_secs: 1800,
+        label: "rustc-smoke: Rust program compiled, linked (rust-lld) + ran",
+        exit_code_on_fail: SMOKE_EXIT_RUSTC_SMOKE_FAILED,
+    });
+
+    steps
+}
+
 /// Phase 63a Track H — `cargo xtask doom-audio-smoke` exit codes.
 /// Originally 65 (collided with `SMOKE_EXIT_SESSION_RESTART_FAILED`); bumped
 /// to 67 in PR 168 round-3 review so each smoke-mode failure exits with a
@@ -24055,14 +24346,14 @@ fn create_data_disk(
     // honest states: marker-present-and-matching (good) or
     // marker-absent (the verify aborts with the expected error).
     let marker_path = output_dir.join(FONT_MARKER_FILENAME);
-    if marker_path.exists() {
-        if let Err(e) = fs::remove_file(&marker_path) {
-            eprintln!(
-                "Error: failed to remove stale font marker {}: {e}",
-                marker_path.display()
-            );
-            std::process::exit(1);
-        }
+    if marker_path.exists()
+        && let Err(e) = fs::remove_file(&marker_path)
+    {
+        eprintln!(
+            "Error: failed to remove stale font marker {}: {e}",
+            marker_path.display()
+        );
+        std::process::exit(1);
     }
 
     const SECTOR_SIZE: u64 = 512;
@@ -24301,6 +24592,10 @@ fn compile_m3os_terminfo(output_dir: &Path) -> PathBuf {
     compiled
 }
 
+// Eight discrete data-disk build inputs (paths + per-service enable flags);
+// grouping them into a config struct would not improve this single internal
+// call site, so the arg-count heuristic is allowed here.
+#[allow(clippy::too_many_arguments)]
 fn populate_ext2_files(
     part_path: &Path,
     output_dir: &Path,
@@ -24425,6 +24720,18 @@ fn populate_ext2_files(
         int main() {\n\
         \x20   std::cout << \"CLANG_CPP_OK hello from libc++\" << std::endl;\n\
         \x20   return 0;\n\
+        }\n";
+
+    // Phase 95 — the `rustc-smoke` Rust source fixture. Staged at /usr/src so a
+    // freshly-installed rustc has a real program to compile + link (via the
+    // bundled rust-lld) + run inside m3OS. Prints the `RUSTC_OK` run-output
+    // sentinel — the string lives in the program, not the typed compile command,
+    // so the Wait matches actual execution, not the echo. No proc-macros / no
+    // non-std deps: it links only the precompiled distribution sysroot rlibs, so
+    // rustc never has to `dlopen` anything (the Area C milestone is
+    // proc-macro-free by construction).
+    let hello_rs_content = "fn main() {\n\
+        \x20   println!(\"RUSTC_OK hello from rustc\");\n\
         }\n";
 
     // Phase 89 — the `node-smoke` JS source fixtures, staged at /usr/src so a
@@ -25053,6 +25360,7 @@ fn populate_ext2_files(
     let fibonacci_py_tmp = output_dir.join("_tmp_fibonacci_py");
     let hello_c_tmp = output_dir.join("_tmp_hello_c");
     let hello_cpp_tmp = output_dir.join("_tmp_hello_cpp");
+    let hello_rs_tmp = output_dir.join("_tmp_hello_rs");
     let node_probe_js_tmp = output_dir.join("_tmp_node_probe_js");
     let node_http_egress_js_tmp = output_dir.join("_tmp_node_http_egress_js");
     let node_jit_probe_js_tmp = output_dir.join("_tmp_node_jit_probe_js");
@@ -25066,6 +25374,7 @@ fn populate_ext2_files(
     fs::write(&fibonacci_py_tmp, fibonacci_py_content).expect("write temp fibonacci.py");
     fs::write(&hello_c_tmp, hello_c_content).expect("write temp hello.c");
     fs::write(&hello_cpp_tmp, hello_cpp_content).expect("write temp hello.cpp");
+    fs::write(&hello_rs_tmp, hello_rs_content).expect("write temp hello.rs");
     fs::write(&node_probe_js_tmp, node_probe_js_content).expect("write temp node-probe.js");
     fs::write(&node_http_egress_js_tmp, node_http_egress_js_content)
         .expect("write temp node-http-egress.js");
@@ -25493,6 +25802,10 @@ fn populate_ext2_files(
          sif usr/src/hello.cpp mode 0x81A4\n\
          sif usr/src/hello.cpp uid 0\n\
          sif usr/src/hello.cpp gid 0\n\
+         write \"{}\" usr/src/hello.rs\n\
+         sif usr/src/hello.rs mode 0x81A4\n\
+         sif usr/src/hello.rs uid 0\n\
+         sif usr/src/hello.rs gid 0\n\
          write \"{}\" usr/src/node-probe.js\n\
          sif usr/src/node-probe.js mode 0x81A4\n\
          sif usr/src/node-probe.js uid 0\n\
@@ -25508,6 +25821,7 @@ fn populate_ext2_files(
         fibonacci_py_tmp.display(),
         hello_c_tmp.display(),
         hello_cpp_tmp.display(),
+        hello_rs_tmp.display(),
         node_probe_js_tmp.display(),
         node_http_egress_js_tmp.display(),
         node_jit_probe_js_tmp.display(),
@@ -26677,57 +26991,55 @@ fn populate_phase_69d_ports(part_path: &Path, workspace_root: &Path) {
         // Prefer the sealed .m3pkg artifact: bundle it into /usr/pkg/ and
         // pre-install by unpacking it (proves the artifact round-trips).
         let mut staged_from_artifact = false;
-        if let Ok(artifact) = port_build::pkgcache_artifact_path(port) {
-            if artifact.is_file() {
-                match fs::read(&artifact) {
-                    Ok(bytes) if pkg_format::verify(&bytes) => {
-                        m3pkg_files.push((format!("usr/pkg/{port}.m3pkg"), artifact.clone()));
-                        // Write the `.meta` sidecar (VERSION + DEPS) the in-OS
-                        // dependency solver reads — e.g. `pkg install tmux`
-                        // auto-installs ncurses + libevent first.
-                        let version = port_build::port_version(port).unwrap_or_default();
-                        let deps = port_build::port_deps(port).join(" ");
-                        let meta_host = preinstall_root.join(format!("{port}.meta"));
-                        let _ = fs::create_dir_all(&preinstall_root);
-                        if fs::write(&meta_host, format!("VERSION={version}\nDEPS={deps}\n"))
-                            .is_ok()
-                        {
-                            m3pkg_files.push((format!("usr/pkg/{port}.meta"), meta_host));
+        if let Ok(artifact) = port_build::pkgcache_artifact_path(port)
+            && artifact.is_file()
+        {
+            match fs::read(&artifact) {
+                Ok(bytes) if pkg_format::verify(&bytes) => {
+                    m3pkg_files.push((format!("usr/pkg/{port}.m3pkg"), artifact.clone()));
+                    // Write the `.meta` sidecar (VERSION + DEPS) the in-OS
+                    // dependency solver reads — e.g. `pkg install tmux`
+                    // auto-installs ncurses + libevent first.
+                    let version = port_build::port_version(port).unwrap_or_default();
+                    let deps = port_build::port_deps(port).join(" ");
+                    let meta_host = preinstall_root.join(format!("{port}.meta"));
+                    let _ = fs::create_dir_all(&preinstall_root);
+                    if fs::write(&meta_host, format!("VERSION={version}\nDEPS={deps}\n")).is_ok() {
+                        m3pkg_files.push((format!("usr/pkg/{port}.meta"), meta_host));
+                    }
+                    let dest = preinstall_root.join(port);
+                    let _ = fs::create_dir_all(&dest);
+                    match pkg_format::unpack(&bytes, &dest) {
+                        Ok(_) => {
+                            let local = dest.join("usr/local");
+                            if local.is_dir() {
+                                collect_phase_69d_entries(
+                                    &local,
+                                    "usr/local",
+                                    &mut dirs,
+                                    &mut files,
+                                    &mut execs,
+                                );
+                            }
+                            let share = dest.join("usr/share");
+                            if share.is_dir() {
+                                collect_phase_69d_entries(
+                                    &share,
+                                    "usr/share",
+                                    &mut dirs,
+                                    &mut files,
+                                    &mut execs,
+                                );
+                            }
+                            staged_from_artifact = true;
                         }
-                        let dest = preinstall_root.join(port);
-                        let _ = fs::create_dir_all(&dest);
-                        match pkg_format::unpack(&bytes, &dest) {
-                            Ok(_) => {
-                                let local = dest.join("usr/local");
-                                if local.is_dir() {
-                                    collect_phase_69d_entries(
-                                        &local,
-                                        "usr/local",
-                                        &mut dirs,
-                                        &mut files,
-                                        &mut execs,
-                                    );
-                                }
-                                let share = dest.join("usr/share");
-                                if share.is_dir() {
-                                    collect_phase_69d_entries(
-                                        &share,
-                                        "usr/share",
-                                        &mut dirs,
-                                        &mut files,
-                                        &mut execs,
-                                    );
-                                }
-                                staged_from_artifact = true;
-                            }
-                            Err(e) => {
-                                eprintln!("phase-85a: unpack {port}.m3pkg failed: {e}");
-                            }
+                        Err(e) => {
+                            eprintln!("phase-85a: unpack {port}.m3pkg failed: {e}");
                         }
                     }
-                    Ok(_) => eprintln!("phase-85a: {port}.m3pkg failed verify — skipping bundle"),
-                    Err(e) => eprintln!("phase-85a: read {} failed: {e}", artifact.display()),
                 }
+                Ok(_) => eprintln!("phase-85a: {port}.m3pkg failed verify — skipping bundle"),
+                Err(e) => eprintln!("phase-85a: read {} failed: {e}", artifact.display()),
             }
         }
 
@@ -26880,6 +27192,49 @@ fn populate_phase_69d_ports(part_path: &Path, workspace_root: &Path) {
                  run `cargo xtask port build llvm` first (or the clang-smoke gate)"
             ),
             Err(e) => eprintln!("phase-85d: clang artifact path error: {e}"),
+        }
+    }
+
+    // Phase 95 — the opt-in on-device Rust toolchain (`rustc` + std sysroot +
+    // bundled `rust-lld`). The 200–500 MB artifact is bundled into the offline
+    // `/usr/pkg/` repo ONLY when the `M3OS_WITH_RUST` image feature is set, so
+    // default images stay small (mirroring `M3OS_WITH_CLANG`). The port name IS the
+    // package name (`rust` → `pkg install rust`). rustc is a DYNAMIC musl binary
+    // (a fully-static musl host can't build the proc-macros rustc's own source
+    // needs), so `rust.m3pkg` carries `DEPS=musl` — the Phase 93 `/usr/lib/libc.so`
+    // it binds against — and BOTH `.m3pkg`s are bundled (like the dynamic-python
+    // path) so the solver installs musl first, then rustc. The artifacts only exist
+    // once `cargo xtask port build rust` (or the `rustc-smoke` gate) has built them;
+    // on a routine image build where the feature is unset OR an artifact is absent
+    // this is a no-op, so nothing regresses and default images carry no `rust.m3pkg`.
+    if std::env::var("M3OS_WITH_RUST").is_ok() {
+        for port in ["musl", "rust"] {
+            match port_build::pkgcache_artifact_path(port) {
+                Ok(artifact) if artifact.is_file() => match fs::read(&artifact) {
+                    Ok(bytes) if pkg_format::verify(&bytes) => {
+                        m3pkg_files.push((format!("usr/pkg/{port}.m3pkg"), artifact.clone()));
+                        let version = port_build::port_version(port).unwrap_or_default();
+                        let deps = port_build::port_deps(port).join(" ");
+                        let meta_host = preinstall_root.join(format!("{port}.meta"));
+                        let _ = fs::create_dir_all(&preinstall_root);
+                        if fs::write(&meta_host, format!("VERSION={version}\nDEPS={deps}\n"))
+                            .is_ok()
+                        {
+                            m3pkg_files.push((format!("usr/pkg/{port}.meta"), meta_host));
+                        }
+                        println!(
+                            "ports: bundled {port}.m3pkg (opt-in M3OS_WITH_RUST) into /usr/pkg"
+                        );
+                    }
+                    Ok(_) => eprintln!("phase-95: {port}.m3pkg failed verify — skipping bundle"),
+                    Err(e) => eprintln!("phase-95: read {} failed: {e}", artifact.display()),
+                },
+                Ok(_) => eprintln!(
+                    "phase-95: M3OS_WITH_RUST set but {port}.m3pkg is not built — \
+                     run `cargo xtask port build rust` first (or the rustc-smoke gate)"
+                ),
+                Err(e) => eprintln!("phase-95: {port} artifact path error: {e}"),
+            }
         }
     }
 
@@ -27755,16 +28110,16 @@ fn create_fat_filesystem(
         .context("failed to size FAT image file")?;
 
     let mut label = *b"MY_RUST_OS!";
-    if let Some(FileDataSource::File(path)) = files.get(KERNEL_FILE_NAME) {
-        if let Some(name) = path.file_stem() {
-            let converted = name.to_string_lossy();
-            let name = converted.as_bytes();
-            let mut new_label = [0u8; 11];
-            let name = &name[..usize::min(new_label.len(), name.len())];
-            let slice = &mut new_label[..name.len()];
-            slice.copy_from_slice(name);
-            label = new_label;
-        }
+    if let Some(FileDataSource::File(path)) = files.get(KERNEL_FILE_NAME)
+        && let Some(name) = path.file_stem()
+    {
+        let converted = name.to_string_lossy();
+        let name = converted.as_bytes();
+        let mut new_label = [0u8; 11];
+        let name = &name[..usize::min(new_label.len(), name.len())];
+        let slice = &mut new_label[..name.len()];
+        slice.copy_from_slice(name);
+        label = new_label;
     }
 
     let format_options = fatfs::FormatVolumeOptions::new().volume_label(label);
@@ -29809,18 +30164,18 @@ fn cmd_regression(args: &RegressionArgs) {
     // Checked first so `--test driver-restart` returns immediately without
     // building the kernel or pulling OVMF.
     let all_host_tests = host_regression_tests();
-    if let Some(name) = &args.test_name {
-        if let Some(t) = all_host_tests.iter().find(|t| t.name == *name) {
-            println!("regression: running host-only test '{}'", t.name);
-            match run_host_regression_test(t) {
-                Ok(()) => {
-                    println!("\nregression: 1 passed, 0 failed");
-                    return;
-                }
-                Err(code) => {
-                    eprintln!("\nregression: 0 passed, 1 failed (exit code {code})");
-                    std::process::exit(1);
-                }
+    if let Some(name) = &args.test_name
+        && let Some(t) = all_host_tests.iter().find(|t| t.name == *name)
+    {
+        println!("regression: running host-only test '{}'", t.name);
+        match run_host_regression_test(t) {
+            Ok(()) => {
+                println!("\nregression: 1 passed, 0 failed");
+                return;
+            }
+            Err(code) => {
+                eprintln!("\nregression: 0 passed, 1 failed (exit code {code})");
+                std::process::exit(1);
             }
         }
     }
