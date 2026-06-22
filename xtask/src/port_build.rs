@@ -645,11 +645,12 @@ fn build_recipe_id(name: &str) -> &'static str {
             "x.py-cross:build=x86_64-unknown-linux-gnu host=target=x86_64-unknown-linux-musl \
              profile=compiler docs=false extended=false tools=[] crt-static=true \
              download-ci-llvm=true lld=true llvm-tools=false;\
-             cxx-sysroot=REUSE(target/llvm-musl-sysroot:libc++/libc++abi/libunwind+compiler-rt);\
-             cc/cxx=host-clang(--target=musl --sysroot=llvm-musl-sysroot -L.../lib \
+             stageB=-fPIC-musl-libc++/libc++abi/libunwind+compiler-rt(from llvm-port \
+             llvm-project/runtimes,MinSizeRel)→target/rust-musl-sysroot;\
+             cc/cxx=host-clang(--target=musl --sysroot=rust-musl-sysroot -L.../lib \
              -rtlib=compiler-rt -unwindlib=libunwind -fuse-ld=lld);\
              install=DESTDIR(prefix=/usr:rustc+rust-std-musl+rust-lld);\
-             prune=doc/man/manifest/build-host-rustlib;recipe-v=1"
+             prune=doc/man/manifest/build-host-rustlib;recipe-v=2"
         }
         _ => "",
     }
@@ -2036,12 +2037,14 @@ fn build_rust(extracted: &Path, stage: &Path, _port_dir: &Path) -> Result<(), St
     // clean machine pays the full build exactly once.
     let cross_root = root.join("target/rust-cross");
     fs::create_dir_all(&cross_root).map_err(|e| format!("mkdir rust-cross: {e}"))?;
-    // Reuse the Phase 85d musl C++ sysroot the `llvm` port assembles (the same one
-    // `build_node` reuses): the rustc_llvm C++ shim + x.py's musl-LLVM cross-build
-    // need a static musl libc++, but the rustc-src tarball's vendored `llvm-project`
-    // ships `compiler-rt` + `libunwind` yet NOT `libcxx`/`libcxxabi`, so we cannot
-    // build libc++ from it. The clang port already produces the full runtime.
-    let sysroot = root.join("target/llvm-musl-sysroot");
+    // A DEDICATED `-fPIC` musl C++ sysroot for the rust build. x.py builds LLVM
+    // `-fPIC` (LLVM_LINK_LLVM_DYLIB), so linking the LLVM tools against the clang
+    // port's static libc++ (which is built WITHOUT -fPIC, for static ET_EXEC
+    // linking) fails `ld.lld: R_X86_64_PC32 against 'vtable for …' recompile with
+    // -fPIC`. We therefore build our own libc++/libc++abi/libunwind WITH -fPIC from
+    // the clang port's llvm-project source (the rustc-src tarball ships compiler-rt
+    // + libunwind but NOT libcxx/libcxxabi, so it can't supply libc++ itself).
+    let sysroot = root.join("target/rust-musl-sysroot");
     let wrap_bin = cross_root.join("bin");
     fs::create_dir_all(&wrap_bin).map_err(|e| format!("mkdir rust-cross/bin: {e}"))?;
 
@@ -2072,40 +2075,122 @@ fn build_rust(extracted: &Path, stage: &Path, _port_dir: &Path) -> Result<(), St
     };
     let src = src.as_path();
 
-    // 2. Reuse the `llvm` port's static musl C++ sysroot (the same artifact
-    //    `build_node` reuses). The rustc_llvm C++ shim AND x.py's from-source
-    //    musl-LLVM cross-build both compile C++ with the host clang targeting musl,
-    //    which needs a static musl libc++ + compiler-rt builtins. The clang port
-    //    assembles them at target/llvm-musl-sysroot; the rustc-src tarball cannot
-    //    supply them (its vendored llvm-project ships compiler-rt + libunwind but
-    //    not libcxx/libcxxabi). Error with an actionable message if absent so
-    //    `rustc-smoke` builds the llvm port first.
-    if !sysroot.join("lib/libc++.a").exists()
-        || !sysroot
-            .join("lib/linux/libclang_rt.builtins-x86_64.a")
-            .exists()
+    // 2. Build a `-fPIC` musl C++ runtime (libc++/libc++abi/libunwind + compiler-rt
+    //    builtins) into `sysroot`, if not already present. The libcxx/libcxxabi
+    //    SOURCE comes from the `llvm` port's llvm-project tree (the rustc-src tarball
+    //    omits them); the clang port must therefore have been built first (the
+    //    `rustc-smoke` gate does so). Mirrors `build_llvm` Stage B but adds -fPIC.
+    if !sysroot.join("lib/libc++.a").exists() || std::env::var("M3OS_RUST_REBUILD_RUNTIMES").is_ok()
     {
-        return Err(format!(
-            "rust build: musl C++ sysroot not found at {} (need lib/libc++.a + the \
-             compiler-rt builtins). Build the `llvm` port first — it assembles the \
-             musl sysroot + the static libc++ that the rustc cross-build (and x.py's \
-             from-source musl-LLVM build) require. Run `cargo xtask port build llvm` \
-             (or the clang-smoke gate) first.",
+        // Locate the clang port's llvm-project source (has libcxx/libcxxabi, unlike
+        // the rustc-src tree): the extracted tree first, else extract its tarball.
+        let llvm_extracted =
+            root.join(format!("target/llvm-cross/llvm-project-{LLVM_VERSION}.src"));
+        let llvm_src = if llvm_extracted.join("runtimes/CMakeLists.txt").exists() {
+            llvm_extracted
+        } else {
+            let tarball = root.join(format!(
+                "target/port-src/llvm-project-{LLVM_VERSION}.src.tar.xz"
+            ));
+            if !tarball.exists() {
+                return Err(format!(
+                    "rust build: llvm-project source for the musl libc++ not found \
+                     (looked for {} and {}). Build the `llvm` port first — it provides \
+                     the libcxx/libcxxabi source the rustc-src tarball omits. Run \
+                     `cargo xtask port build llvm` (or the clang-smoke gate) first.",
+                    llvm_extracted.display(),
+                    tarball.display()
+                ));
+            }
+            println!("rust: extracting llvm-project source for the -fPIC libc++ build (once)");
+            extract_tarball(&tarball, &cross_root.join("llvm-src-extract"))?
+        };
+        let rt_src = llvm_src.join("runtimes");
+
+        assemble_musl_sysroot(&sysroot)?;
+        let build_rt = cross_root.join("build-runtimes");
+        let _ = fs::remove_dir_all(&build_rt);
+        // -fPIC is the only addition vs build_llvm Stage B: x.py's LLVM is -fPIC, so
+        // the libc++ it links must be too. -unwindlib=none because libunwind is what
+        // THIS stage builds.
+        let ldx = "-rtlib=compiler-rt -unwindlib=none -fuse-ld=lld";
+        let cfx = format!("-Wno-unused-command-line-argument -fPIC {ldx}");
+        println!("rust: stage B — -fPIC musl libc++/libc++abi/libunwind + compiler-rt builtins");
+        let mut cfg = Command::new("cmake");
+        cfg.args(["-G", "Ninja", "-S"])
+            .arg(&rt_src)
+            .arg("-B")
+            .arg(&build_rt)
+            .arg("-DCMAKE_BUILD_TYPE=MinSizeRel")
+            .arg(format!("-DCMAKE_INSTALL_PREFIX={}", sysroot.display()))
+            .arg(format!("-DCMAKE_C_COMPILER={clang}"))
+            .arg(format!("-DCMAKE_CXX_COMPILER={clangxx}"))
+            .arg(format!("-DCMAKE_C_COMPILER_TARGET={TARGET}"))
+            .arg(format!("-DCMAKE_CXX_COMPILER_TARGET={TARGET}"))
+            .arg(format!("-DCMAKE_SYSROOT={}", sysroot.display()))
+            .arg(format!("-DCMAKE_C_FLAGS={cfx}"))
+            .arg(format!("-DCMAKE_CXX_FLAGS={cfx}"))
+            .arg(format!("-DCMAKE_EXE_LINKER_FLAGS={ldx}"))
+            .arg(format!("-DCMAKE_SHARED_LINKER_FLAGS={ldx}"))
+            .arg("-DCMAKE_POSITION_INDEPENDENT_CODE=ON")
+            .arg("-DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY")
+            .arg("-DLLVM_ENABLE_RUNTIMES=libcxx;libcxxabi;libunwind;compiler-rt")
+            .arg("-DLIBCXX_ENABLE_SHARED=OFF")
+            .arg("-DLIBCXXABI_ENABLE_SHARED=OFF")
+            .arg("-DLIBUNWIND_ENABLE_SHARED=OFF")
+            .arg("-DLIBCXX_ENABLE_STATIC=ON")
+            .arg("-DLIBCXXABI_ENABLE_STATIC=ON")
+            .arg("-DLIBUNWIND_ENABLE_STATIC=ON")
+            .arg("-DLIBCXX_HAS_MUSL_LIBC=ON")
+            .arg("-DLIBCXXABI_HAS_CXA_THREAD_ATEXIT_IMPL=OFF")
+            .arg("-DLIBCXX_CXX_ABI=libcxxabi")
+            .arg("-DLIBCXXABI_USE_LLVM_UNWINDER=ON")
+            .arg("-DLIBCXXABI_ENABLE_STATIC_UNWINDER=ON")
+            .arg("-DLIBCXXABI_STATICALLY_LINK_UNWINDER_IN_STATIC_LIBRARY=ON")
+            .arg("-DLIBCXX_ENABLE_STATIC_ABI_LIBRARY=ON")
+            .arg("-DLIBCXX_STATICALLY_LINK_ABI_IN_STATIC_LIBRARY=ON")
+            .arg("-DLIBCXX_USE_COMPILER_RT=ON")
+            .arg("-DLIBCXXABI_USE_COMPILER_RT=ON")
+            .arg("-DLIBUNWIND_USE_COMPILER_RT=ON")
+            .arg("-DLIBCXX_INCLUDE_BENCHMARKS=OFF")
+            .arg("-DLIBCXX_INCLUDE_TESTS=OFF")
+            .arg("-DLIBCXXABI_INCLUDE_TESTS=OFF")
+            .arg("-DLIBUNWIND_INCLUDE_TESTS=OFF")
+            .arg("-DLLVM_INCLUDE_TESTS=OFF")
+            .arg("-DCOMPILER_RT_DEFAULT_TARGET_ONLY=ON")
+            .arg("-DCOMPILER_RT_BUILD_BUILTINS=ON")
+            .arg("-DCOMPILER_RT_BUILD_SANITIZERS=OFF")
+            .arg("-DCOMPILER_RT_BUILD_XRAY=OFF")
+            .arg("-DCOMPILER_RT_BUILD_LIBFUZZER=OFF")
+            .arg("-DCOMPILER_RT_BUILD_PROFILE=OFF")
+            .arg("-DCOMPILER_RT_BUILD_MEMPROF=OFF")
+            .arg("-DCOMPILER_RT_BUILD_ORC=OFF");
+        run(&mut cfg, "rust runtimes configure (-fPIC)")?;
+        run(
+            Command::new("ninja")
+                .current_dir(&build_rt)
+                .arg(format!("-j{jobs}")),
+            "rust runtimes build (-fPIC)",
+        )?;
+        run(
+            Command::new("ninja").current_dir(&build_rt).arg("install"),
+            "rust runtimes install (-fPIC)",
+        )?;
+    } else {
+        println!(
+            "rust: stage B — reusing existing -fPIC musl C++ runtime in {} (set \
+             M3OS_RUST_REBUILD_RUNTIMES=1 to force)",
             sysroot.display()
-        ));
+        );
     }
     for need in ["lib/libc++.a", "lib/libc++abi.a", "lib/libunwind.a"] {
         if !sysroot.join(need).exists() {
             return Err(format!(
-                "rust build: reused musl C++ sysroot missing {} — rebuild the llvm port",
+                "rust build: stage B did not produce {} — -fPIC musl C++ runtime incomplete",
                 sysroot.join(need).display()
             ));
         }
     }
-    println!(
-        "rust: reusing the llvm port's static musl C++ sysroot at {}",
-        sysroot.display()
-    );
 
     // 3. musl-root prefix: Rust's std build wants `<musl-root>/lib/libc.a`. Build a
     //    symlink prefix over the distro musl (Debian: /usr/lib/x86_64-linux-musl;
