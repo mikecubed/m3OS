@@ -633,6 +633,24 @@ fn build_recipe_id(name: &str) -> &'static str {
              excludes selinux-chcon/runcon+external-libstdbuf);\
              stage=/usr/local/bin/coreutils+per-applet-symlinks(from `coreutils --list`);recipe-v=1"
         }
+        // Phase 95 — the on-device Rust toolchain. The built artifact is the static
+        // musl `rustc` + std sysroot + `rust-lld` (the tarball is the rustc SOURCE,
+        // folded in via the Portfile SHA-256). This arm pins the x.py cross-build
+        // knob set (static musl host, crt-static, download-ci-llvm-driven musl LLVM,
+        // bundled lld, the Stage-B musl libc++ runtimes recipe) so a flag change
+        // self-invalidates the cached `.m3pkg`. The host clang identity folds in
+        // separately via `host_cxx_toolchain_id()` in `compute_port_key`. Bump
+        // recipe-v whenever build_rust's config/flags/staging change.
+        "rust" => {
+            "x.py-cross:build=x86_64-unknown-linux-gnu host=target=x86_64-unknown-linux-musl \
+             profile=compiler docs=false extended=false tools=[] crt-static=true \
+             download-ci-llvm=true lld=true llvm-tools=false;\
+             cxx-sysroot=REUSE(target/llvm-musl-sysroot:libc++/libc++abi/libunwind+compiler-rt);\
+             cc/cxx=host-clang(--target=musl --sysroot=llvm-musl-sysroot -L.../lib \
+             -rtlib=compiler-rt -unwindlib=libunwind -fuse-ld=lld);\
+             install=DESTDIR(prefix=/usr:rustc+rust-std-musl+rust-lld);\
+             prune=doc/man/manifest/build-host-rustlib;recipe-v=1"
+        }
         _ => "",
     }
 }
@@ -1256,6 +1274,12 @@ pub const BUILDABLE_PORTS: &[&str] = &[
     // `port build all` builds it. DEPS= empty (pure Rust), so it has no ordering
     // constraint.
     "coreutils",
+    // Phase 95 — the on-device Rust TOOLCHAIN (`build_rust`): a fully-static musl
+    // `rustc` + std sysroot + bundled `rust-lld`. RECIPE=yes; DEPS= empty (it
+    // self-bootstraps via x.py + the host clang). NOT in `port build all`'s default
+    // expectations for CI lightness — it is a multi-hundred-MB opt-in toolchain
+    // (M3OS_WITH_RUST), like `llvm`, built on demand by the `rustc-smoke` gate.
+    "rust",
 ];
 
 /// A port's declared `DEPS=` (whitespace-separated), restricted to `within` —
@@ -1583,6 +1607,23 @@ fn port_build(name: &str) -> Result<(), String> {
     // musl binary runs on m3OS.)
     if name == "coreutils" {
         build_uutils(&extracted, &stage, &port_dir)?;
+        seal_package(name, &stage, &key)?;
+        fs::write(&stamp, &fingerprint).map_err(|e| format!("write stamp: {e}"))?;
+        println!(
+            "ports: {name}-{version} build complete (staged at {})",
+            stage.display()
+        );
+        return Ok(());
+    }
+
+    // Phase 95 — rust is the first on-device Rust TOOLCHAIN. It cross-builds rustc
+    // with its own x.py bootstrap (stage0 self-download) + the host clang as the
+    // musl cross-compiler, NOT the musl cross-gcc, so it branches before the
+    // musl_toolchain() requirement (like the go/coreutils/node download-based
+    // ports). The heavy LLVM-for-musl is cross-built by x.py from the in-tree
+    // src/llvm-project (driven by the gnu CI LLVM `download-ci-llvm` fetches).
+    if name == "rust" {
+        build_rust(&extracted, &stage, &port_dir)?;
         seal_package(name, &stage, &key)?;
         fs::write(&stamp, &fingerprint).map_err(|e| format!("write stamp: {e}"))?;
         println!(
@@ -1937,6 +1978,328 @@ fn build_uutils(extracted: &Path, stage: &Path, _port_dir: &Path) -> Result<(), 
             preview.truncate(12);
             format!("{}, …", preview.join(", "))
         }
+    );
+    Ok(())
+}
+
+/// Phase 95 — the project's FIRST on-device Rust *compiler* (`rustc`), distinct
+/// from Phase 94's coreutils which runs a host-cross-compiled Rust *program*.
+/// The Rust analog of `build_llvm` (Phase 85d): cross-build a **fully-static**
+/// `x86_64-unknown-linux-musl` `rustc` (+ a prebuilt `std`/`core`/`alloc` sysroot
+/// + the bundled `rust-lld` linker) via the upstream `x.py` bootstrap. The host
+/// clang is the musl cross-compiler (musl-tools ships no C++ compiler), and the
+/// heavy LLVM-for-musl is cross-built by x.py from the in-tree `src/llvm-project`,
+/// driven by the gnu CI LLVM tools that `download-ci-llvm` fetches. crt-static
+/// embeds musl into the rustc binary (m3OS's custom `ld-musl` has no real
+/// `libc.so`, so a dynamic toolchain can't run — same discipline as
+/// clang/python/go). Branches BEFORE the `musl_toolchain()` requirement in
+/// `port_build` (Rust self-bootstraps with its own stage0 compiler; no external
+/// `x86_64-linux-musl-gcc`).
+///
+/// `extracted` is the port machinery's freshly-re-extracted source (ignored for
+/// the heavy build — we keep a stable copy under `target/rust-cross` so re-runs
+/// stay incremental, mirroring `build_llvm`). Stages a DESTDIR `usr/` tree
+/// (rustc + the sysroot + rust-lld) that `seal_package` strips and packs.
+fn build_rust(extracted: &Path, stage: &Path, _port_dir: &Path) -> Result<(), String> {
+    const RUST_VERSION: &str = "1.96.0";
+    const TARGET: &str = "x86_64-unknown-linux-musl";
+    let root = workspace_root();
+    let jobs = num_jobs();
+
+    // 0. Host toolchain probes. Host clang is the musl cross (Phase 85d pattern);
+    //    x.py needs python3; the cross-build links with `-fuse-ld=lld`.
+    let clang = std::env::var("M3OS_RUST_CLANG").unwrap_or_else(|_| "clang".to_string());
+    let clangxx = std::env::var("M3OS_RUST_CLANGXX").unwrap_or_else(|_| "clang++".to_string());
+    for c in [
+        clang.as_str(),
+        clangxx.as_str(),
+        "cmake",
+        "ninja",
+        "ld.lld",
+        "python3",
+    ] {
+        if !probe_tool_on_path(c) {
+            return Err(format!(
+                "rust build: required host tool '{c}' not found on PATH. Phase 95 \
+                 cross-builds rustc with the host clang as the musl cross-compiler \
+                 (set M3OS_RUST_CLANG / M3OS_RUST_CLANGXX to override) + cmake/ninja/\
+                 ld.lld + python3 (for x.py). Debian/Ubuntu: \
+                 `apt install clang lld cmake ninja-build python3 musl-dev`."
+            ));
+        }
+    }
+
+    // Persistent cross-build workspace OUTSIDE the port work dir that `port_build`
+    // wipes + re-extracts every run (which would force a multi-hour rebuild on each
+    // retry). A stable source tree + persistent x.py `build/` keep staging-bug
+    // iterations cheap; the Phase 85a pkgcache still caches the sealed `.m3pkg` so a
+    // clean machine pays the full build exactly once.
+    let cross_root = root.join("target/rust-cross");
+    fs::create_dir_all(&cross_root).map_err(|e| format!("mkdir rust-cross: {e}"))?;
+    // Reuse the Phase 85d musl C++ sysroot the `llvm` port assembles (the same one
+    // `build_node` reuses): the rustc_llvm C++ shim + x.py's musl-LLVM cross-build
+    // need a static musl libc++, but the rustc-src tarball's vendored `llvm-project`
+    // ships `compiler-rt` + `libunwind` yet NOT `libcxx`/`libcxxabi`, so we cannot
+    // build libc++ from it. The clang port already produces the full runtime.
+    let sysroot = root.join("target/llvm-musl-sysroot");
+    let wrap_bin = cross_root.join("bin");
+    fs::create_dir_all(&wrap_bin).map_err(|e| format!("mkdir rust-cross/bin: {e}"))?;
+
+    // 1. Stable source: extract the pinned tarball once into `cross_root` and reuse
+    //    (the port machinery's `extracted` is re-extracted with fresh mtimes every
+    //    run, which would defeat x.py/ninja incrementality).
+    let stable_src = cross_root.join(format!("rustc-{RUST_VERSION}-src"));
+    let src: PathBuf = if stable_src.join("x.py").exists() {
+        stable_src.clone()
+    } else {
+        let tarball = root.join(format!("target/port-src/rustc-{RUST_VERSION}-src.tar.xz"));
+        if tarball.exists() {
+            println!(
+                "rust: extracting source to persistent {} (once)",
+                stable_src.display()
+            );
+            let ex = extract_tarball(&tarball, &cross_root.join("src-extract"))?;
+            let _ = fs::remove_dir_all(&stable_src);
+            fs::rename(&ex, &stable_src).map_err(|e| format!("rust: stage stable source: {e}"))?;
+            stable_src.clone()
+        } else {
+            println!(
+                "rust: cached tarball absent; using port-extracted source {}",
+                extracted.display()
+            );
+            extracted.to_path_buf()
+        }
+    };
+    let src = src.as_path();
+
+    // 2. Reuse the `llvm` port's static musl C++ sysroot (the same artifact
+    //    `build_node` reuses). The rustc_llvm C++ shim AND x.py's from-source
+    //    musl-LLVM cross-build both compile C++ with the host clang targeting musl,
+    //    which needs a static musl libc++ + compiler-rt builtins. The clang port
+    //    assembles them at target/llvm-musl-sysroot; the rustc-src tarball cannot
+    //    supply them (its vendored llvm-project ships compiler-rt + libunwind but
+    //    not libcxx/libcxxabi). Error with an actionable message if absent so
+    //    `rustc-smoke` builds the llvm port first.
+    if !sysroot.join("lib/libc++.a").exists()
+        || !sysroot
+            .join("lib/linux/libclang_rt.builtins-x86_64.a")
+            .exists()
+    {
+        return Err(format!(
+            "rust build: musl C++ sysroot not found at {} (need lib/libc++.a + the \
+             compiler-rt builtins). Build the `llvm` port first — it assembles the \
+             musl sysroot + the static libc++ that the rustc cross-build (and x.py's \
+             from-source musl-LLVM build) require. Run `cargo xtask port build llvm` \
+             (or the clang-smoke gate) first.",
+            sysroot.display()
+        ));
+    }
+    for need in ["lib/libc++.a", "lib/libc++abi.a", "lib/libunwind.a"] {
+        if !sysroot.join(need).exists() {
+            return Err(format!(
+                "rust build: reused musl C++ sysroot missing {} — rebuild the llvm port",
+                sysroot.join(need).display()
+            ));
+        }
+    }
+    println!(
+        "rust: reusing the llvm port's static musl C++ sysroot at {}",
+        sysroot.display()
+    );
+
+    // 3. musl-root prefix: Rust's std build wants `<musl-root>/lib/libc.a`. Build a
+    //    symlink prefix over the distro musl (Debian: /usr/lib/x86_64-linux-musl;
+    //    Arch: /usr/lib/musl/lib).
+    let (musl_inc, musl_lib) = [
+        (
+            "/usr/include/x86_64-linux-musl",
+            "/usr/lib/x86_64-linux-musl",
+        ),
+        ("/usr/lib/musl/include", "/usr/lib/musl/lib"),
+    ]
+    .into_iter()
+    .find(|(inc, lib)| {
+        Path::new(inc).join("stdio.h").exists() && Path::new(lib).join("libc.a").exists()
+    })
+    .ok_or_else(|| {
+        "rust build: musl headers/libs not found (Debian/Ubuntu: `apt install musl-dev`; \
+         Arch: `pacman -S musl`)."
+            .to_string()
+    })?;
+    let musl_root = cross_root.join("musl-root");
+    fs::create_dir_all(&musl_root).map_err(|e| format!("mkdir musl-root: {e}"))?;
+    for (target_path, name) in [(musl_lib, "lib"), (musl_inc, "include")] {
+        let link = musl_root.join(name);
+        let _ = fs::remove_file(&link);
+        let _ = fs::remove_dir_all(&link);
+        std::os::unix::fs::symlink(target_path, &link)
+            .map_err(|e| format!("symlink musl-root/{name}: {e}"))?;
+    }
+
+    // 4. cc/cxx wrapper scripts: host clang/clang++ targeting musl against the
+    //    Stage-B sysroot, with lld + compiler-rt + libunwind (no GNU ld / libgcc_s,
+    //    which a musl sysroot has none of).
+    use std::os::unix::fs::PermissionsExt;
+    let sysroot_s = sysroot.display().to_string();
+    let cc_wrap = wrap_bin.join("m3os-musl-clang");
+    let cxx_wrap = wrap_bin.join("m3os-musl-clang++");
+    fs::write(
+        &cc_wrap,
+        format!(
+            "#!/bin/sh\nexec {clang} --target={TARGET} --sysroot={sysroot_s} \
+             -L{sysroot_s}/lib -rtlib=compiler-rt -unwindlib=libunwind -fuse-ld=lld \
+             -Wno-unused-command-line-argument \"$@\"\n"
+        ),
+    )
+    .map_err(|e| format!("write cc wrapper: {e}"))?;
+    fs::write(
+        &cxx_wrap,
+        format!(
+            "#!/bin/sh\nexec {clangxx} --target={TARGET} --sysroot={sysroot_s} \
+             -L{sysroot_s}/lib -stdlib=libc++ -cxx-isystem {sysroot_s}/include/c++/v1 \
+             -rtlib=compiler-rt -unwindlib=libunwind -fuse-ld=lld \
+             -Wno-unused-command-line-argument \"$@\"\n"
+        ),
+    )
+    .map_err(|e| format!("write cxx wrapper: {e}"))?;
+    for w in [&cc_wrap, &cxx_wrap] {
+        fs::set_permissions(w, fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod wrapper {}: {e}", w.display()))?;
+    }
+
+    // 5. x.py config (config.toml in the source root). download-ci-llvm=true fetches
+    //    the gnu CI LLVM tools (tblgen/nm/config) that DRIVE the musl-LLVM
+    //    cross-build (x.py builds musl LLVM from src/llvm-project with our cc/cxx).
+    //    crt-static => the rustc binary embeds musl. No `targets=` (incompatible
+    //    with download-ci-llvm).
+    let config = format!(
+        "profile = \"compiler\"\n\
+         change-id = \"ignore\"\n\
+         \n[build]\n\
+         build = \"x86_64-unknown-linux-gnu\"\n\
+         host = [\"{TARGET}\"]\n\
+         target = [\"{TARGET}\"]\n\
+         docs = false\n\
+         extended = false\n\
+         tools = []\n\
+         locked-deps = true\n\
+         vendor = true\n\
+         sanitizers = false\n\
+         profiler = false\n\
+         \n[install]\n\
+         prefix = \"/usr\"\n\
+         sysconfdir = \"etc\"\n\
+         \n[rust]\n\
+         channel = \"stable\"\n\
+         lld = true\n\
+         llvm-tools = false\n\
+         debug = false\n\
+         \n[llvm]\n\
+         download-ci-llvm = true\n\
+         ninja = true\n\
+         \n[target.{TARGET}]\n\
+         crt-static = true\n\
+         musl-root = \"{}\"\n\
+         cc = \"{}\"\n\
+         cxx = \"{}\"\n",
+        musl_root.display(),
+        cc_wrap.display(),
+        cxx_wrap.display(),
+    );
+    fs::write(src.join("config.toml"), &config).map_err(|e| format!("write config.toml: {e}"))?;
+
+    // 6. The heavy build: rustc (stage 2) + std. x.py self-downloads its stage0
+    //    bootstrap compiler. This cross-builds LLVM-for-musl then rustc — the
+    //    multi-tens-of-MB static toolchain. (download-ci-llvm needs no .git, but
+    //    x.py warns harmlessly about `not a git repository`.)
+    println!(
+        "rust: building static musl rustc + std (x.py, {} jobs) — the heavy cross-build",
+        jobs
+    );
+    run(
+        Command::new("python3")
+            .current_dir(src)
+            .arg("./x.py")
+            .arg("build")
+            .arg("--stage")
+            .arg("2")
+            .arg(format!("-j{jobs}"))
+            .arg("compiler/rustc")
+            .arg("library/std"),
+        "x.py build rustc + std",
+    )?;
+
+    // 7. Install into the DESTDIR stage at prefix=/usr → stage/usr/bin/rustc +
+    //    stage/usr/lib/rustlib/<target>/{lib,bin/rust-lld}. The sysroot resolves
+    //    relative to the binary (the Phase 85d relocation contract).
+    println!("rust: installing toolchain into DESTDIR stage (prefix=/usr)");
+    run(
+        Command::new("python3")
+            .current_dir(src)
+            .env("DESTDIR", stage)
+            .arg("./x.py")
+            .arg("install")
+            .arg("--stage")
+            .arg("2"),
+        "x.py install rustc + std",
+    )?;
+
+    // 8. Validate the staged toolchain (the relocation contract + rust-lld). The
+    //    freshly cross-built rustc is a static musl x86_64 ELF that runs on the
+    //    x86_64-Linux host directly, so we can self-check `--version`.
+    let rustc_bin = stage.join("usr/bin/rustc");
+    if !rustc_bin.is_file() {
+        return Err(format!(
+            "rust build: x.py install produced no rustc at {}",
+            rustc_bin.display()
+        ));
+    }
+    let rust_lld = stage.join(format!("usr/lib/rustlib/{TARGET}/bin/rust-lld"));
+    if !rust_lld.is_file() {
+        return Err(format!(
+            "rust build: bundled rust-lld missing at {} (rustc cannot link on-device \
+             without it)",
+            rust_lld.display()
+        ));
+    }
+    let std_dir = stage.join(format!("usr/lib/rustlib/{TARGET}/lib"));
+    if !std_dir.is_dir() {
+        return Err(format!(
+            "rust build: prebuilt std sysroot missing at {}",
+            std_dir.display()
+        ));
+    }
+    let ver = Command::new(&rustc_bin)
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("run staged rustc --version: {e}"))?;
+    let ver_s = String::from_utf8_lossy(&ver.stdout);
+    if !ver_s.contains(RUST_VERSION) {
+        return Err(format!(
+            "rust build: staged rustc --version did not report {RUST_VERSION} (got: {})",
+            ver_s.trim()
+        ));
+    }
+    // Prune install cruft that bloats the (already 200-500 MB) artifact: docs,
+    // man pages, the install manifest/uninstall scripts, and the build-host (gnu)
+    // rustlib tree (only the musl target sysroot is needed on-device).
+    for prune in [
+        "usr/share/doc",
+        "usr/share/man",
+        "usr/lib/rustlib/uninstall.sh",
+        "usr/lib/rustlib/install.log",
+        "usr/lib/rustlib/components",
+        "usr/lib/rustlib/manifest-rustc",
+        "usr/lib/rustlib/manifest-rust-std-x86_64-unknown-linux-musl",
+        "usr/lib/rustlib/rust-installer-version",
+    ] {
+        let p = stage.join(prune);
+        let _ = fs::remove_file(&p);
+        let _ = fs::remove_dir_all(&p);
+    }
+    println!(
+        "rust: staged static musl rustc ({}) + std sysroot + rust-lld at /usr",
+        ver_s.trim()
     );
     Ok(())
 }
@@ -6683,6 +7046,18 @@ pub fn build_coreutils_port() -> Result<(), String> {
 /// heaviest artifact).
 pub fn build_llvm_port() -> Result<(), String> {
     port_build("llvm").map_err(|e| format!("port llvm: {e}"))?;
+    Ok(())
+}
+
+/// Phase 95 — build the fully-static musl `rust` toolchain (rustc + std sysroot +
+/// bundled `rust-lld`) into its `.m3pkg` artifact so the image populator can
+/// bundle it into `/usr/pkg/` (gated behind `M3OS_WITH_RUST`). `build_rust`
+/// self-bootstraps via x.py + the host clang as the musl cross-compiler; a warm
+/// pkgcache makes a repeat build a zero-compiler hit. The `rustc-smoke` gate
+/// drives this (and SKIPs with reason when the host Rust toolchain / clang / musl
+/// headers are absent).
+pub fn build_rust_port() -> Result<(), String> {
+    port_build("rust").map_err(|e| format!("port rust: {e}"))?;
     Ok(())
 }
 

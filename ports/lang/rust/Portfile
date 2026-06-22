@@ -1,0 +1,40 @@
+NAME=rust
+VERSION=1.96.0
+DESCRIPTION="On-device Rust toolchain — fully-static x86_64-unknown-linux-musl rustc + prebuilt std sysroot + bundled rust-lld (the project's first native Rust code generator)"
+CATEGORY=lang
+DEPS=
+URL=https://static.rust-lang.org/dist/rustc-1.96.0-src.tar.xz
+SHA256=b99ce16cdf0ecfc761b585ac84d131b46733465a02f8ecd0ff2de9713c62ee09
+MAINTAINER=m3os
+
+# Phase 95 — the project's FIRST on-device Rust *compiler* (distinct from Phase
+# 94's coreutils, which runs a host-cross-compiled Rust *program*). The Rust
+# analog of Phase 85d (on-device Clang/LLVM/LLD): a fully-static
+# `x86_64-unknown-linux-musl` `rustc` that compiles + links + runs Rust on m3OS.
+#
+# Built by `build_rust` (xtask/src/port_build.rs) via the upstream `x.py`
+# bootstrap configured for a cross-host static build:
+#   build  = x86_64-unknown-linux-gnu   (the stage0 bootstrap runs on the host)
+#   host   = x86_64-unknown-linux-musl  (the rustc BINARY is static musl — m3OS's
+#                                        custom ld-musl has no real libc.so, so a
+#                                        dynamic toolchain can't run; same static
+#                                        discipline as clang/python/go)
+#   target = x86_64-unknown-linux-musl  (it also generates musl code on-device)
+# LLVM is built X86-only (we only target x86_64) with the host clang as the
+# musl cross-compiler (the Phase 85d "host clang cross-compiles LLVM" pattern),
+# linking a musl libc++. crt-static=true embeds musl into the rustc binary.
+#
+# DEPS= is empty: the bundled `rust-lld` (rustc's default linker, vendored LLD)
+# is staged INSIDE the .m3pkg, so on-device linking needs no external cc/ld and
+# no dependency on the (huge, opt-in) clang port. The prebuilt std/core/alloc
+# rlib sysroot is laid out relative to the rustc binary (the Phase 85d
+# relocation contract — `rustc --print sysroot` resolves under /usr).
+#
+# The toolchain is a 200–500 MB artifact, so it is OPT-IN behind the
+# `M3OS_WITH_RUST` image feature (mirroring `M3OS_WITH_CLANG`); default images
+# omit it. `pkg install rust` materializes rustc + the sysroot + rust-lld.
+#
+# URL note: the pinned `rustc-<ver>-src.tar.xz` from static.rust-lang.org is the
+# fully-vendored Rust source (carries Cargo.lock for the `--locked`/vendored
+# bootstrap; SHA-256 is the canonical upstream digest), so the heavy host build
+# needs no network beyond the stage0 bootstrap compiler x.py auto-downloads.
