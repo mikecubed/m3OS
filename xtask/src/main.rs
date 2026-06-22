@@ -23130,6 +23130,11 @@ fn cmd_rustc_smoke(args: &SmokeBootArgs) {
     if let Err(msg) = port_build::build_llvm_port() {
         skip_if_prereq("llvm port build (musl C++ sysroot)", msg);
     }
+    // rustc is a DYNAMIC musl binary (`DEPS=musl`), so the solver needs the Phase 93
+    // `libc.so` (`musl.m3pkg`) bundled too — build it so the image gate can bundle it.
+    if let Err(msg) = port_build::build_musl_port() {
+        skip_if_prereq("musl port build (libc.so for DEPS=musl)", msg);
+    }
     if let Err(msg) = port_build::build_rust_port() {
         skip_if_prereq("rust port build", msg);
     }
@@ -27134,34 +27139,42 @@ fn populate_phase_69d_ports(part_path: &Path, workspace_root: &Path) {
     // bundled `rust-lld`). The 200–500 MB artifact is bundled into the offline
     // `/usr/pkg/` repo ONLY when the `M3OS_WITH_RUST` image feature is set, so
     // default images stay small (mirroring `M3OS_WITH_CLANG`). The port name IS the
-    // package name (`rust` → `pkg install rust`); rust has no runtime DEPS (the
-    // sysroot + rust-lld are bundled in the `.m3pkg`, rustc links static musl). The
-    // artifact only exists once `cargo xtask port build rust` (or the `rustc-smoke`
-    // gate) has built it; on a routine image build where the feature is unset OR the
-    // artifact is absent this is a no-op, so nothing regresses and default images
-    // carry no `rust.m3pkg`.
+    // package name (`rust` → `pkg install rust`). rustc is a DYNAMIC musl binary
+    // (a fully-static musl host can't build the proc-macros rustc's own source
+    // needs), so `rust.m3pkg` carries `DEPS=musl` — the Phase 93 `/usr/lib/libc.so`
+    // it binds against — and BOTH `.m3pkg`s are bundled (like the dynamic-python
+    // path) so the solver installs musl first, then rustc. The artifacts only exist
+    // once `cargo xtask port build rust` (or the `rustc-smoke` gate) has built them;
+    // on a routine image build where the feature is unset OR an artifact is absent
+    // this is a no-op, so nothing regresses and default images carry no `rust.m3pkg`.
     if std::env::var("M3OS_WITH_RUST").is_ok() {
-        match port_build::pkgcache_artifact_path("rust") {
-            Ok(artifact) if artifact.is_file() => match fs::read(&artifact) {
-                Ok(bytes) if pkg_format::verify(&bytes) => {
-                    m3pkg_files.push(("usr/pkg/rust.m3pkg".to_string(), artifact.clone()));
-                    let version = port_build::port_version("rust").unwrap_or_default();
-                    let deps = port_build::port_deps("rust").join(" ");
-                    let meta_host = preinstall_root.join("rust.meta");
-                    let _ = fs::create_dir_all(&preinstall_root);
-                    if fs::write(&meta_host, format!("VERSION={version}\nDEPS={deps}\n")).is_ok() {
-                        m3pkg_files.push(("usr/pkg/rust.meta".to_string(), meta_host));
+        for port in ["musl", "rust"] {
+            match port_build::pkgcache_artifact_path(port) {
+                Ok(artifact) if artifact.is_file() => match fs::read(&artifact) {
+                    Ok(bytes) if pkg_format::verify(&bytes) => {
+                        m3pkg_files.push((format!("usr/pkg/{port}.m3pkg"), artifact.clone()));
+                        let version = port_build::port_version(port).unwrap_or_default();
+                        let deps = port_build::port_deps(port).join(" ");
+                        let meta_host = preinstall_root.join(format!("{port}.meta"));
+                        let _ = fs::create_dir_all(&preinstall_root);
+                        if fs::write(&meta_host, format!("VERSION={version}\nDEPS={deps}\n"))
+                            .is_ok()
+                        {
+                            m3pkg_files.push((format!("usr/pkg/{port}.meta"), meta_host));
+                        }
+                        println!(
+                            "ports: bundled {port}.m3pkg (opt-in M3OS_WITH_RUST) into /usr/pkg"
+                        );
                     }
-                    println!("ports: bundled rust.m3pkg (opt-in M3OS_WITH_RUST) into /usr/pkg");
-                }
-                Ok(_) => eprintln!("phase-95: rust.m3pkg failed verify — skipping bundle"),
-                Err(e) => eprintln!("phase-95: read {} failed: {e}", artifact.display()),
-            },
-            Ok(_) => eprintln!(
-                "phase-95: M3OS_WITH_RUST set but the rust .m3pkg is not built — \
-                 run `cargo xtask port build rust` first (or the rustc-smoke gate)"
-            ),
-            Err(e) => eprintln!("phase-95: rust artifact path error: {e}"),
+                    Ok(_) => eprintln!("phase-95: {port}.m3pkg failed verify — skipping bundle"),
+                    Err(e) => eprintln!("phase-95: read {} failed: {e}", artifact.display()),
+                },
+                Ok(_) => eprintln!(
+                    "phase-95: M3OS_WITH_RUST set but {port}.m3pkg is not built — \
+                     run `cargo xtask port build rust` first (or the rustc-smoke gate)"
+                ),
+                Err(e) => eprintln!("phase-95: {port} artifact path error: {e}"),
+            }
         }
     }
 

@@ -643,14 +643,15 @@ fn build_recipe_id(name: &str) -> &'static str {
         // recipe-v whenever build_rust's config/flags/staging change.
         "rust" => {
             "x.py-cross:build=x86_64-unknown-linux-gnu host=target=x86_64-unknown-linux-musl \
-             profile=compiler docs=false extended=false tools=[] crt-static=true \
+             profile=compiler docs=false extended=false tools=[] crt-static=FALSE(dynamic;\
+             proc-macros block static musl host)→DEPS=musl(libc.so) \
              download-ci-llvm=true lld=true llvm-tools=false;\
              stageB=-fPIC-musl-libc++/libc++abi/libunwind+compiler-rt(from llvm-port \
              llvm-project/runtimes,MinSizeRel)→target/rust-musl-sysroot;\
              cc/cxx=host-clang(--target=musl --sysroot=rust-musl-sysroot -L.../lib \
              -rtlib=compiler-rt -unwindlib=libunwind -fuse-ld=lld);\
              install=DESTDIR(prefix=/usr:rustc+rust-std-musl+rust-lld);\
-             prune=doc/man/manifest/build-host-rustlib;recipe-v=2"
+             prune=doc/man/manifest/build-host-rustlib;recipe-v=3"
         }
         _ => "",
     }
@@ -2266,8 +2267,16 @@ fn build_rust(extracted: &Path, stage: &Path, _port_dir: &Path) -> Result<(), St
     // 5. x.py config (config.toml in the source root). download-ci-llvm=true fetches
     //    the gnu CI LLVM tools (tblgen/nm/config) that DRIVE the musl-LLVM
     //    cross-build (x.py builds musl LLVM from src/llvm-project with our cc/cxx).
-    //    crt-static => the rustc binary embeds musl. No `targets=` (incompatible
-    //    with download-ci-llvm).
+    //    No `targets=` (incompatible with download-ci-llvm).
+    //
+    //    crt-static = FALSE (not the musl default): rustc's OWN source depends on
+    //    proc-macro crates (darling_macro, serde_derive, …), and a `crt-static` musl
+    //    host CANNOT build dylibs/proc-macros ("target does not support these crate
+    //    types"). A fully-static musl-host rustc is therefore infeasible. So rustc is
+    //    a DYNAMIC musl binary (PT_INTERP=/lib/ld-musl-x86_64.so.1 + DT_NEEDED
+    //    libc.so) that runs on m3OS via the Phase 93 `libc.so` + Rust loader — which
+    //    is exactly why Phase 93 is a Phase 95 dependency. `rust.m3pkg` carries
+    //    `DEPS=musl` so the solver installs `/usr/lib/libc.so` first.
     let config = format!(
         "profile = \"compiler\"\n\
          change-id = \"ignore\"\n\
@@ -2291,10 +2300,12 @@ fn build_rust(extracted: &Path, stage: &Path, _port_dir: &Path) -> Result<(), St
          llvm-tools = false\n\
          debug = false\n\
          \n[llvm]\n\
-         download-ci-llvm = true\n\
+         download-ci-llvm = false\n\
+         targets = \"X86\"\n\
          ninja = true\n\
          \n[target.{TARGET}]\n\
-         crt-static = true\n\
+         crt-static = false\n\
+         llvm-libunwind = \"in-tree\"\n\
          musl-root = \"{}\"\n\
          cc = \"{}\"\n\
          cxx = \"{}\"\n",
@@ -2309,7 +2320,7 @@ fn build_rust(extracted: &Path, stage: &Path, _port_dir: &Path) -> Result<(), St
     //    multi-tens-of-MB static toolchain. (download-ci-llvm needs no .git, but
     //    x.py warns harmlessly about `not a git repository`.)
     println!(
-        "rust: building static musl rustc + std (x.py, {} jobs) — the heavy cross-build",
+        "rust: building dynamic musl rustc + std (x.py, {} jobs) — the heavy cross-build",
         jobs
     );
     run(
@@ -2341,8 +2352,9 @@ fn build_rust(extracted: &Path, stage: &Path, _port_dir: &Path) -> Result<(), St
     )?;
 
     // 8. Validate the staged toolchain (the relocation contract + rust-lld). The
-    //    freshly cross-built rustc is a static musl x86_64 ELF that runs on the
-    //    x86_64-Linux host directly, so we can self-check `--version`.
+    //    cross-built rustc is a DYNAMIC musl ELF, so it may not run on the glibc
+    //    build host (it needs /lib/ld-musl + libc.so) — the `--version` self-check is
+    //    therefore best-effort (the rustc-smoke gate validates it for real on m3OS).
     let rustc_bin = stage.join("usr/bin/rustc");
     if !rustc_bin.is_file() {
         return Err(format!(
@@ -2365,16 +2377,25 @@ fn build_rust(extracted: &Path, stage: &Path, _port_dir: &Path) -> Result<(), St
             std_dir.display()
         ));
     }
-    let ver = Command::new(&rustc_bin)
-        .arg("--version")
-        .output()
-        .map_err(|e| format!("run staged rustc --version: {e}"))?;
-    let ver_s = String::from_utf8_lossy(&ver.stdout);
-    if !ver_s.contains(RUST_VERSION) {
-        return Err(format!(
-            "rust build: staged rustc --version did not report {RUST_VERSION} (got: {})",
-            ver_s.trim()
-        ));
+    // Best-effort self-check: a dynamic musl rustc runs on the host only if it has
+    // /lib/ld-musl-x86_64.so.1 + a musl libc.so; log the outcome, don't fail on it.
+    match Command::new(&rustc_bin).arg("--version").output() {
+        Ok(out) => {
+            let ver_s = String::from_utf8_lossy(&out.stdout);
+            if ver_s.contains(RUST_VERSION) {
+                println!("rust: staged rustc self-check OK ({})", ver_s.trim());
+            } else {
+                println!(
+                    "rust: staged rustc --version did not print {RUST_VERSION} on the host \
+                     (dynamic musl binary; validated on m3OS by rustc-smoke). stdout: {}",
+                    ver_s.trim()
+                );
+            }
+        }
+        Err(e) => println!(
+            "rust: staged rustc not runnable on the glibc host ({e}) — expected for a \
+             dynamic musl binary; the rustc-smoke gate validates it on m3OS"
+        ),
     }
     // Prune install cruft that bloats the (already 200-500 MB) artifact: docs,
     // man pages, the install manifest/uninstall scripts, and the build-host (gnu)
@@ -2394,8 +2415,7 @@ fn build_rust(extracted: &Path, stage: &Path, _port_dir: &Path) -> Result<(), St
         let _ = fs::remove_dir_all(&p);
     }
     println!(
-        "rust: staged static musl rustc ({}) + std sysroot + rust-lld at /usr",
-        ver_s.trim()
+        "rust: staged dynamic musl rustc + std sysroot + rust-lld at /usr (DEPS=musl libc.so)"
     );
     Ok(())
 }
@@ -7154,6 +7174,15 @@ pub fn build_llvm_port() -> Result<(), String> {
 /// headers are absent).
 pub fn build_rust_port() -> Result<(), String> {
     port_build("rust").map_err(|e| format!("port rust: {e}"))?;
+    Ok(())
+}
+
+/// Phase 93/95 — build the dynamic musl `libc.so` port into its `.m3pkg` so the
+/// solver can resolve `DEPS=musl` (the dynamic `rustc`/`python3` bind against it).
+/// `build_musl` uses the musl cross-toolchain, so a missing musl-gcc surfaces as a
+/// clear "no musl cross-compiler" error the `rustc-smoke` gate treats as SKIP.
+pub fn build_musl_port() -> Result<(), String> {
+    port_build("musl").map_err(|e| format!("port musl: {e}"))?;
     Ok(())
 }
 

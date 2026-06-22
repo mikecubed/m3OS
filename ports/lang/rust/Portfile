@@ -2,7 +2,7 @@ NAME=rust
 VERSION=1.96.0
 DESCRIPTION="On-device Rust toolchain — fully-static x86_64-unknown-linux-musl rustc + prebuilt std sysroot + bundled rust-lld (the project's first native Rust code generator)"
 CATEGORY=lang
-DEPS=
+DEPS=musl
 URL=https://static.rust-lang.org/dist/rustc-1.96.0-src.tar.xz
 SHA256=b99ce16cdf0ecfc761b585ac84d131b46733465a02f8ecd0ff2de9713c62ee09
 MAINTAINER=m3os
@@ -24,11 +24,18 @@ MAINTAINER=m3os
 # musl cross-compiler (the Phase 85d "host clang cross-compiles LLVM" pattern),
 # linking a musl libc++. crt-static=true embeds musl into the rustc binary.
 #
-# DEPS= is empty: the bundled `rust-lld` (rustc's default linker, vendored LLD)
-# is staged INSIDE the .m3pkg, so on-device linking needs no external cc/ld and
-# no dependency on the (huge, opt-in) clang port. The prebuilt std/core/alloc
-# rlib sysroot is laid out relative to the rustc binary (the Phase 85d
-# relocation contract — `rustc --print sysroot` resolves under /usr).
+# The bundled `rust-lld` (rustc's default linker, vendored LLD) is staged INSIDE
+# the .m3pkg, so on-device linking needs no external cc/ld and no dependency on
+# the (huge, opt-in) clang port. The prebuilt std/core/alloc rlib sysroot is laid
+# out relative to the rustc binary (the Phase 85d relocation contract —
+# `rustc --print sysroot` resolves under /usr).
+#
+# DEPS=musl: rustc's OWN source uses proc-macro crates, and a `crt-static` musl
+# host cannot build dylibs/proc-macros, so a fully-static rustc is INFEASIBLE.
+# rustc is therefore a DYNAMIC musl binary (PT_INTERP=/lib/ld-musl-x86_64.so.1 +
+# DT_NEEDED libc.so) that runs on m3OS via the Phase 93 `libc.so` + Rust loader
+# (`ports/lib/musl`) — which is exactly why Phase 93 is a Phase 95 dependency. The
+# solver installs `/usr/lib/libc.so` first.
 #
 # The toolchain is a 200–500 MB artifact, so it is OPT-IN behind the
 # `M3OS_WITH_RUST` image feature (mirroring `M3OS_WITH_CLANG`); default images
