@@ -123,6 +123,14 @@ fn assert_preempt_count_zero_on_return_to_user(stack_frame: &InterruptStackFrame
 /// interrupt). Single-CPU: no concurrent writers.
 static FAULT_KILL_PID: AtomicU32 = AtomicU32::new(0);
 
+/// Phase 95 diag: slot + faulting kernel RSP of a kstack overflow recovered via
+/// the #PF path, handed to `fault_kill_trampoline` so it can print the recursion
+/// backtrace on the clean recovery stack — the #PF handler's own (faulting) kstack
+/// is exhausted, so dumping there would re-cross the guard and cascade-halt.
+/// `usize::MAX` = no pending kstack-overflow backtrace.
+static KSTACK_OVF_SLOT: AtomicUsize = AtomicUsize::new(usize::MAX);
+static KSTACK_OVF_RSP: AtomicU64 = AtomicU64::new(0);
+
 /// Count of spurious/already-resolved userspace write-faults recovered (SMP
 /// CoW/mprotect race). Diagnostic-only; rate-limits the per-recovery log.
 static SPURIOUS_WRITE_RECOVERIES: AtomicU32 = AtomicU32::new(0);
@@ -287,6 +295,13 @@ fn fault_kill_trampoline() -> ! {
     // have IF set, and we must not take interrupts before acquiring locks.
     x86_64::instructions::interrupts::disable();
     let pid = FAULT_KILL_PID.load(Ordering::Relaxed);
+    // Phase 95 diag: if this kill is a recovered kstack overflow, print the
+    // recursion backtrace NOW — we are on the clean per-core recovery stack, while
+    // the overflowed task kstack is still intact (the task is not yet rescheduled).
+    let ovf_slot = KSTACK_OVF_SLOT.swap(usize::MAX, Ordering::Relaxed);
+    if ovf_slot != usize::MAX {
+        dump_kstack_overflow_backtrace(ovf_slot, KSTACK_OVF_RSP.load(Ordering::Relaxed));
+    }
     log::warn!("[fault_kill] trampoline running for pid {}", pid);
     // Close all open FDs so pipe ref-counts reach 0 and EOF propagates.
     crate::process::close_all_fds_for(pid);
@@ -1511,6 +1526,11 @@ extern "x86-interrupt" fn page_fault_handler(
             fault_va.as_u64(),
             stack_frame.instruction_pointer.as_u64(),
         ));
+        // Phase 95 diag: stash slot + faulting RSP so the recovery trampoline can
+        // print the recursion backtrace on its CLEAN stack (dumping here would
+        // re-overflow). One compact store each — no risk of re-crossing the guard.
+        KSTACK_OVF_SLOT.store(slot, Ordering::Relaxed);
+        KSTACK_OVF_RSP.store(stack_frame.stack_pointer.as_u64(), Ordering::Relaxed);
         // Track D: if attributable to a userspace task, redirect to the kill
         // trampoline on the per-core recovery stack and return (IRETQ). The core
         // survives and keeps scheduling other tasks.

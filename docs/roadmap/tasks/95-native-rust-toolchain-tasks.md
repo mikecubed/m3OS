@@ -50,30 +50,42 @@
 > decisions: stock `x86_64-unknown-linux-musl` target; bundled `rust-lld`; full
 > `x.py`; per-target `CXXFLAGS=-stdlib=libc++`.
 >
-> **On-device status (`rustc-smoke`): install works; `rustc` RUN is BLOCKED by two
-> cascading kernel/loader bring-up issues** (the heaviest on-device program class,
-> no upstream precedent — like the Phase 90b Claude-Code bring-up that surfaced
-> kernel hardening). Diagnosed, not yet fixed:
->   1. **64 KiB per-task kernel-stack overflow** while servicing rustc. The kernel
->      RECOVERS (kills the task: `[int] KERNEL STACK OVERFLOW … killing process;
->      core recovers (no halt)`), so rustc never runs at 64 KiB. Bumping
->      `KERNEL_STACK_SIZE` 64→256 KiB ELIMINATES the overflow (proven) — but that
->      eager pool is +104 MiB on every boot, so the right fix is targeted (a leaner
->      bump or lazy/demand-paged kstacks), deferred. After 256 KiB:
->   2. **Dynamic-loader hang** — `rustc --version` produces zero output for 25 min
->      even under KVM (no overflow, no VFS activity, no error). Under KVM (near-native
->      CPU) a CPU-bound loader would finish fast, so this is a deadlock/pathological
->      stall in the Phase 93 `ld-musl` loader resolving the ~150 MB dynamic rustc
->      (`librustc_driver.so` + `libLLVM.so`, huge relocation tables) — far larger
->      than the Phase 93-validated dynamic `python3`. Needs `ldso_core` investigation
->      (likely relocation/symbol-resolution scaling).
+> **On-device status (`rustc-smoke`): install works; `rustc` RUN is BLOCKED by
+> deep kernel/SMP/perf bring-up issues** (the heaviest, and first *dynamic +
+> multi-threaded*, on-device program; no upstream precedent for a musl-host rustc —
+> like the Phase 90b Claude-Code bring-up that surfaced kernel hardening).
+> **Thoroughly diagnosed** (the on-device load of `rustc --version` was driven to
+> failure under both multi-core and single-core, KVM and TCG):
+>   1. **CPU-bound super-linear load.** `rustc --version` never completes:
+>      **single-core under KVM it runs at a steady 100 % CPU and times out at 25 min
+>      with no progress** — so it is CPU-bound, NOT a deadlock (qemu is busy, not
+>      idle), NOT a VFS-latency stall, and NOT the symbol resolver (gnu-hash is
+>      O(1)/lookup) nor the VMA lookup (`find_vma` is an O(log n) BTreeMap). ~1000+
+>      CPU-seconds to load the ~150 MB dynamic rustc (`librustc_driver.so` +
+>      `libLLVM.so`) implies a **super-linear factor in the kernel page-fault /
+>      mm / demand-paging path** hit ~tens-of-thousands of times as the binary's
+>      pages fault in (the loader's own reloc/symbol work is O(relocs × dsos) =
+>      linear). Pinpointing it needs kernel fault-path profiling/bisection.
+>   2. **Multi-core TLB-shootdown storm.** With the default `-smp 4`, the same load
+>      pegs **~380 % CPU** (3 extra cores spinning) — the loader's ~tens-of-thousands
+>      of `map`/`mprotect`/CoW page operations each broadcast a TLB-shootdown IPI to
+>      the other cores (cf. `docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md`).
+>   3. **64 KiB per-task kernel-stack overflow** (intermittent, multi-core) while
+>      servicing rustc; the kernel RECOVERS (kills the task: `[int] KERNEL STACK
+>      OVERFLOW … killing process; core recovers (no halt)`). `KERNEL_STACK_SIZE`
+>      64→256 KiB removes the overflow (proven) but at +104 MiB eager/boot, so the
+>      right fix is targeted/lazy kstacks. (A diagnostic that prints the recursion
+>      backtrace on the #PF recovery path — not just the #DF path — is landed to
+>      help pin it next time.)
 >
-> **Deferred to a Phase 95 follow-up / `95b`:** the kstack fix + the loader
-> scaling fix to land on-device `RUSTC_OK`. The `rustc-smoke` gate is wired (KVM-
-> honoring, `--timeout 5400`) and bundles `musl.m3pkg` + `rust.m3pkg`; it passes
-> through `pkg install rust` on m3OS and fails at the `rustc --version` load. Phase
-> 95 thus delivers the complete HOST toolchain + on-device install; the on-device
-> code-generation milestone is blocked on the two kernel/loader items above.
+> **Deferred to a Phase 95 follow-up / `95b`:** the kernel mm/page-fault perf fix
+> (item 1, the real blocker), the SMP TLB-shootdown batching (item 2), and the
+> kstack strategy (item 3) — together needed to land on-device `RUSTC_OK`. The
+> `rustc-smoke` gate is wired (KVM-honoring, `--timeout 5400`) and bundles
+> `musl.m3pkg` + `rust.m3pkg`; it passes through `pkg install rust` on m3OS and
+> fails at the `rustc --version` load. Phase 95 thus delivers the complete HOST
+> toolchain + on-device install + a precise on-device diagnosis; the on-device
+> code-generation milestone is blocked on the deep kernel work above.
 
 ---
 
