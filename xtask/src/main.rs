@@ -23179,8 +23179,17 @@ fn cmd_rustc_smoke(args: &SmokeBootArgs) {
     } else {
         QemuDisplayMode::Headless
     };
-    let mut qemu_args =
-        qemu_args_with_devices(&uefi_image, &ovmf, display_mode, DeviceSet::default());
+    // KVM (`M3OS_KVM=1`) runs the guest near-native instead of TCG. rustc-smoke's
+    // cold path is dominated by the ~368 MB toolchain install + the dynamic rustc /
+    // librustc_driver.so / libLLVM.so load streaming page-by-page over the ring-3
+    // VFS, so KVM is ~10–50x faster — strongly recommended for this gate locally.
+    // CI (no nested-virt guarantee) stays TCG with the generous timeouts in
+    // rustc_smoke_steps.
+    let mut devices = DeviceSet::default();
+    if std::env::var_os("M3OS_KVM").is_some_and(|v| v != "0" && !v.is_empty()) {
+        devices.kvm = true;
+    }
+    let mut qemu_args = qemu_args_with_devices(&uefi_image, &ovmf, display_mode, devices);
     for arg in qemu_args.iter_mut() {
         if arg.starts_with("user,id=net0,hostfwd=") {
             *arg = "user,id=net0".to_string();
@@ -23264,7 +23273,11 @@ fn rustc_smoke_steps() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::Wait {
         pattern: "rustc 1.96.0",
-        timeout_secs: 900,
+        // The first rustc invocation cold-loads the dynamic rustc + librustc_driver.so
+        // + libLLVM.so (~150 MB) page-by-page over the slow ring-3 VFS — minutes under
+        // TCG (near-instant under M3OS_KVM=1). Generous ceiling; the global --timeout
+        // caps the total.
+        timeout_secs: 1500,
         label: "rustc-smoke: version 1.96.0",
     });
 

@@ -42,10 +42,38 @@
 > `download-ci-llvm=false` + `targets="X86"` (ci-llvm mis-pointed the musl rustc_llvm
 > shim's includes; X86-only is faster + a smaller rustc to load on-device).
 >
-> The heavy host build is iterating through these (each fix cleared the next
-> blocker); on-device `RUSTC_OK` validation via `rustc-smoke` follows once a `rustc`
-> lands. Bootstrap decisions: stock `x86_64-unknown-linux-musl` target; bundled
-> `rust-lld` (no `DEPS=clang`); full `x.py` build (not `mrustc`).
+> **HOST BUILD COMPLETE.** `cargo xtask port build rust` seals a working dynamic
+> musl `rustc 1.96.0` + std sysroot + `rust-lld` (368 MB `.m3pkg`). Host-validated:
+> `rustc --version`, `--print sysroot` (relocation contract), and
+> `rustc -C linker-flavor=ld.lld -C link-self-contained=yes hello.rs` → a static-pie
+> binary that runs (`RUSTC_OK`) via bundled `rust-lld` (no `cc`). Bootstrap
+> decisions: stock `x86_64-unknown-linux-musl` target; bundled `rust-lld`; full
+> `x.py`; per-target `CXXFLAGS=-stdlib=libc++`.
+>
+> **On-device status (`rustc-smoke`): install works; `rustc` RUN is BLOCKED by two
+> cascading kernel/loader bring-up issues** (the heaviest on-device program class,
+> no upstream precedent — like the Phase 90b Claude-Code bring-up that surfaced
+> kernel hardening). Diagnosed, not yet fixed:
+>   1. **64 KiB per-task kernel-stack overflow** while servicing rustc. The kernel
+>      RECOVERS (kills the task: `[int] KERNEL STACK OVERFLOW … killing process;
+>      core recovers (no halt)`), so rustc never runs at 64 KiB. Bumping
+>      `KERNEL_STACK_SIZE` 64→256 KiB ELIMINATES the overflow (proven) — but that
+>      eager pool is +104 MiB on every boot, so the right fix is targeted (a leaner
+>      bump or lazy/demand-paged kstacks), deferred. After 256 KiB:
+>   2. **Dynamic-loader hang** — `rustc --version` produces zero output for 25 min
+>      even under KVM (no overflow, no VFS activity, no error). Under KVM (near-native
+>      CPU) a CPU-bound loader would finish fast, so this is a deadlock/pathological
+>      stall in the Phase 93 `ld-musl` loader resolving the ~150 MB dynamic rustc
+>      (`librustc_driver.so` + `libLLVM.so`, huge relocation tables) — far larger
+>      than the Phase 93-validated dynamic `python3`. Needs `ldso_core` investigation
+>      (likely relocation/symbol-resolution scaling).
+>
+> **Deferred to a Phase 95 follow-up / `95b`:** the kstack fix + the loader
+> scaling fix to land on-device `RUSTC_OK`. The `rustc-smoke` gate is wired (KVM-
+> honoring, `--timeout 5400`) and bundles `musl.m3pkg` + `rust.m3pkg`; it passes
+> through `pkg install rust` on m3OS and fails at the `rustc --version` load. Phase
+> 95 thus delivers the complete HOST toolchain + on-device install; the on-device
+> code-generation milestone is blocked on the two kernel/loader items above.
 
 ---
 

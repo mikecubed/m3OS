@@ -7,13 +7,23 @@
 
 ## Overview
 
+> **Status (in progress):** the complete **host-side** toolchain is built + sealed
+> and `pkg install rust` works on m3OS, but the on-device **code-generation
+> milestone** (`rustc hello.rs` → `RUSTC_OK` on m3OS) is **blocked** on two
+> diagnosed kernel/loader bring-up issues — a per-task kernel-stack overflow and a
+> dynamic-loader stall on the ~150 MB rustc — deferred to a Phase 95 follow-up
+> (`95b`); see the task doc's implementation-status note. NOTE: rustc is **dynamic**
+> musl, not fully static (a `crt-static` musl host can't build rustc's own
+> proc-macro deps), so it `DEPS=musl` (the Phase 93 `libc.so`). The sections below
+> describe the design as built.
+
 Phase 95 makes m3OS **self-hosting for Rust**: a native `rustc` runs *on the
 device* and compiles a Rust source file to a working native ELF that also runs on
 m3OS — `rustc /usr/src/hello.rs -o /tmp/hello && /tmp/hello` prints `RUSTC_OK`.
-The toolchain is a fully-static `x86_64-unknown-linux-musl` `rustc` (+ a prebuilt
+The toolchain is a dynamic `x86_64-unknown-linux-musl` `rustc` (+ a prebuilt
 `std`/`core`/`alloc` sysroot + the bundled `rust-lld` linker), host-cross-built
 from pinned Rust 1.96.0 source and packaged behind an `M3OS_WITH_RUST` image
-feature, installed offline with `pkg install rust`.
+feature, installed offline with `pkg install rust` (which pulls `DEPS=musl`).
 
 This is the **Rust analog of Phase 85d** (on-device Clang/LLVM/LLD), *not* of
 Phase 86d. The single most important framing is the difference between running a
