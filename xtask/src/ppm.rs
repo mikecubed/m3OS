@@ -23,7 +23,7 @@
 //! slightly (a cursor blink)", and "screen went black".
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek};
 use std::path::Path;
 
 /// In-memory PPM frame: dimensions plus the raw RGB pixel bytes the
@@ -274,7 +274,7 @@ fn read_token(file: &mut File) -> Result<String, String> {
     // to make the byte position observable in tests if a regression
     // ever splits a token. `file.stream_position()` is the
     // human-readable form of that.
-    let _ = file.seek(SeekFrom::Current(0));
+    let _ = file.stream_position();
     Ok(token)
 }
 

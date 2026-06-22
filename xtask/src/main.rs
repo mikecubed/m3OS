@@ -1,3 +1,10 @@
+// `doc_lazy_continuation` / `doc_overindented_list_items` are doc-comment
+// markdown-rendering style lints (newly default in recent clippy). xtask is the
+// build tool, full of long internal build-recipe doc comments where these flag
+// prose layout, not correctness or public API. Opt out crate-wide rather than
+// reformat ~dozens of internal comments; all other clippy lints stay `-D warnings`.
+#![allow(clippy::doc_lazy_continuation, clippy::doc_overindented_list_items)]
+
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, Seek, Write as _};
@@ -1940,7 +1947,7 @@ fn build_userspace_bins() {
         }
 
         let src = root.join(format!("target/x86_64-m3os/release/{bin}"));
-        let dst = initrd.join(format!("{bin}"));
+        let dst = initrd.join(bin);
         fs::copy(&src, &dst).unwrap_or_else(|e| {
             panic!("failed to copy {bin} to initrd: {e}");
         });
@@ -2045,7 +2052,7 @@ fn build_userspace_bins() {
 
     for bin in coreutils_bins {
         let src = root.join(format!("target/x86_64-m3os/release/{bin}"));
-        let dst = initrd.join(format!("{bin}"));
+        let dst = initrd.join(bin);
         fs::copy(&src, &dst).unwrap_or_else(|e| {
             panic!("failed to copy {bin} to initrd: {e}");
         });
@@ -3388,7 +3395,7 @@ fn build_musl_bins() {
             );
             // Create empty placeholders so include_bytes! doesn't fail.
             for (_, name) in bins {
-                let dst = initrd.join(format!("{name}"));
+                let dst = initrd.join(name);
                 if !dst.exists() {
                     fs::write(&dst, b"").unwrap_or_else(|e| {
                         eprintln!(
@@ -3405,7 +3412,7 @@ fn build_musl_bins() {
     let extra_ldflags = musl_cc_extra_ldflags();
     for (src_rel, name) in bins {
         let src = root.join(src_rel);
-        let dst = initrd.join(format!("{name}"));
+        let dst = initrd.join(name);
         let mut cmd = Command::new(cc);
         cmd.args([
             "-static",
@@ -3423,7 +3430,7 @@ fn build_musl_bins() {
                 eprintln!(
                     "warning: {cc} disappeared between probe and execution — skipping {name}"
                 );
-                let dst = initrd.join(format!("{name}"));
+                let dst = initrd.join(name);
                 if !dst.exists() {
                     fs::write(&dst, b"").unwrap_or_else(|e| {
                         eprintln!(
@@ -3935,24 +3942,24 @@ fn build_doom() {
     // the doomgeneric source tree, overwriting the upstreamed originals.
     // This runs after git checkout so our patches survive the forced reset.
     let patches_dir = root.join("userspace/doom/patches");
-    if patches_dir.is_dir() {
-        if let Ok(entries) = fs::read_dir(&patches_dir) {
-            for entry in entries.flatten() {
-                let src = entry.path();
-                if src.extension().is_some_and(|e| e == "c" || e == "h") {
-                    let dst = dg_game_src.join(src.file_name().unwrap());
-                    fs::copy(&src, &dst).unwrap_or_else(|e| {
-                        eprintln!(
-                            "doom: failed to apply patch {:?}: {e}",
-                            src.file_name().unwrap()
-                        );
-                        0
-                    });
-                    println!(
-                        "doom: applied patch {}",
-                        src.file_name().unwrap().to_str().unwrap_or("?")
+    if patches_dir.is_dir()
+        && let Ok(entries) = fs::read_dir(&patches_dir)
+    {
+        for entry in entries.flatten() {
+            let src = entry.path();
+            if src.extension().is_some_and(|e| e == "c" || e == "h") {
+                let dst = dg_game_src.join(src.file_name().unwrap());
+                fs::copy(&src, &dst).unwrap_or_else(|e| {
+                    eprintln!(
+                        "doom: failed to apply patch {:?}: {e}",
+                        src.file_name().unwrap()
                     );
-                }
+                    0
+                });
+                println!(
+                    "doom: applied patch {}",
+                    src.file_name().unwrap().to_str().unwrap_or("?")
+                );
             }
         }
     }
@@ -6132,6 +6139,30 @@ fn cmd_check() {
         std::process::exit(1);
     }
 
+    // Clippy for `xtask` itself (host target). Without this, the build tool —
+    // including `port_build.rs`'s port recipes — was compiled (via the host
+    // tests below) but never linted, so clippy regressions in xtask slipped the
+    // gate. Linted here with the same `-D warnings` bar as every other crate.
+    let status = Command::new(env!("CARGO"))
+        .current_dir(&root)
+        .args([
+            "clippy",
+            "--package",
+            "xtask",
+            "--target",
+            KERNEL_CORE_HOST_TARGET,
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .status()
+        .expect("failed to run xtask clippy");
+
+    if !status.success() {
+        eprintln!("xtask clippy reported errors");
+        std::process::exit(1);
+    }
+
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
         .args([
@@ -6435,8 +6466,8 @@ fn retpoline_objdump_gate() {
             let after_tab = line.split('\t').nth(2).unwrap_or("");
             let mnemonic = after_tab.split_whitespace().next().unwrap_or("");
             let operand = after_tab
-                .splitn(2, char::is_whitespace)
-                .nth(1)
+                .split_once(char::is_whitespace)
+                .map(|x| x.1)
                 .unwrap_or("")
                 .trim_start();
             matches!(mnemonic, "call" | "callq" | "jmp" | "jmpq") && operand.starts_with('*')
@@ -6698,19 +6729,18 @@ fn build_test_binaries(test_name: Option<&str>, features: &[String]) -> Vec<Path
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut binaries = Vec::new();
     for line in stdout.lines() {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
-            if json.get("reason").and_then(|v| v.as_str()) == Some("compiler-artifact") {
-                if let Some(executable) = json.get("executable").and_then(|v| v.as_str()) {
-                    // Only include test binaries (those with test = true in profile).
-                    if json
-                        .get("profile")
-                        .and_then(|p| p.get("test"))
-                        .and_then(|t| t.as_bool())
-                        == Some(true)
-                    {
-                        binaries.push(PathBuf::from(executable));
-                    }
-                }
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(line)
+            && json.get("reason").and_then(|v| v.as_str()) == Some("compiler-artifact")
+            && let Some(executable) = json.get("executable").and_then(|v| v.as_str())
+        {
+            // Only include test binaries (those with test = true in profile).
+            if json
+                .get("profile")
+                .and_then(|p| p.get("test"))
+                .and_then(|t| t.as_bool())
+                == Some(true)
+            {
+                binaries.push(PathBuf::from(executable));
             }
         }
     }
@@ -7072,10 +7102,12 @@ fn strip_ansi(input: &str) -> String {
                     }
                 }
                 // consume final byte (letter @ through ~)
-                if let Some(&c) = chars.peek() {
-                    if c.is_ascii() && (c as u8) >= b'@' && (c as u8) <= b'~' {
-                        chars.next();
-                    }
+                if let Some(&c) = chars.peek()
+                    && c.is_ascii()
+                    && (c as u8) >= b'@'
+                    && (c as u8) <= b'~'
+                {
+                    chars.next();
                 }
             } else {
                 // ESC + single character (e.g., ESC c)
@@ -9465,9 +9497,11 @@ fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
     } else {
         QemuDisplayMode::Headless
     };
-    let mut devices = DeviceSet::default();
-    devices.kvm = smoke_args.kvm;
-    devices.memory_mib = smoke_args.memory_mib;
+    let devices = DeviceSet {
+        kvm: smoke_args.kvm,
+        memory_mib: smoke_args.memory_mib,
+        ..Default::default()
+    };
     let mut args = qemu_args_with_devices(&uefi_image, &ovmf, display_mode, devices);
     // Strip hostfwd to avoid port conflicts in CI (same as qemu_test_args).
     for arg in args.iter_mut() {
@@ -13874,14 +13908,14 @@ fn prepare_audio_smoke_dir() -> PathBuf {
 
     // Remove any WAV from a prior run so the smoke gate always reads a fresh file.
     let wav_path = smoke_dir.join("audio.wav");
-    if wav_path.exists() {
-        if let Err(e) = fs::remove_file(&wav_path) {
-            eprintln!(
-                "audio-smoke: cannot remove prior audio.wav {}: {e}",
-                wav_path.display()
-            );
-            std::process::exit(1);
-        }
+    if wav_path.exists()
+        && let Err(e) = fs::remove_file(&wav_path)
+    {
+        eprintln!(
+            "audio-smoke: cannot remove prior audio.wav {}: {e}",
+            wav_path.display()
+        );
+        std::process::exit(1);
     }
 
     // Verify writability with a probe file before launching QEMU.
@@ -16160,6 +16194,10 @@ fn capture_burst(
     Ok(())
 }
 
+// The QEMU child is killed + waited on the normal path (and on every early
+// return below); clippy cannot prove reaping across the panic/`expect` paths in
+// this harness, so the lint is a false positive here.
+#[allow(clippy::zombie_processes)]
 fn cmd_less_render_probe(args: &LessRenderProbeArgs) {
     // 1. Build everything the boot needs. Mirrors `cmd_tui_app_smoke`
     //    so the on-disk layout (less binary, terminfo, /etc/passwd)
@@ -16405,6 +16443,9 @@ fn cmd_less_render_probe(args: &LessRenderProbeArgs) {
 /// Exit code 0 = process rows rendered; non-zero = blank table (the
 /// 2026-05-20 regression) or a probe error. Run via `cargo xtask
 /// htop-render-probe`.
+// The QEMU child is killed + waited on the normal path; clippy cannot prove
+// reaping across the panic/`expect` paths in this harness (false positive).
+#[allow(clippy::zombie_processes)]
 fn cmd_htop_render_probe(args: &LessRenderProbeArgs) {
     /// Minimum changed scanlines in htop's process-table band (vs the empty
     /// prompt baseline) that indicate htop rendered a populated table. A full
@@ -16748,8 +16789,10 @@ fn cmd_compositor_stress(args: &CompositorStressArgs) {
     let vnc_socket = qmp::fresh_socket_path();
     let _ = std::fs::remove_file(&vnc_socket);
 
-    let mut devices = DeviceSet::default();
-    devices.kvm = args.kvm;
+    let devices = DeviceSet {
+        kvm: args.kvm,
+        ..Default::default()
+    };
     let mut qemu_args =
         qemu_args_with_devices(&uefi_image, &ovmf, QemuDisplayMode::Headless, devices);
     for arg in qemu_args.iter_mut() {
@@ -19269,8 +19312,10 @@ fn claude_tui_render_arm(
     let _ = std::fs::remove_file(&qmp_socket);
     let vnc_socket = qmp::fresh_socket_path();
     let _ = std::fs::remove_file(&vnc_socket);
-    let mut devices = DeviceSet::default();
-    devices.kvm = true;
+    let devices = DeviceSet {
+        kvm: true,
+        ..Default::default()
+    };
     let mut qemu_args =
         qemu_args_with_devices(uefi_image, ovmf, QemuDisplayMode::Headless, devices);
     for arg in qemu_args.iter_mut() {
@@ -24301,14 +24346,14 @@ fn create_data_disk(
     // honest states: marker-present-and-matching (good) or
     // marker-absent (the verify aborts with the expected error).
     let marker_path = output_dir.join(FONT_MARKER_FILENAME);
-    if marker_path.exists() {
-        if let Err(e) = fs::remove_file(&marker_path) {
-            eprintln!(
-                "Error: failed to remove stale font marker {}: {e}",
-                marker_path.display()
-            );
-            std::process::exit(1);
-        }
+    if marker_path.exists()
+        && let Err(e) = fs::remove_file(&marker_path)
+    {
+        eprintln!(
+            "Error: failed to remove stale font marker {}: {e}",
+            marker_path.display()
+        );
+        std::process::exit(1);
     }
 
     const SECTOR_SIZE: u64 = 512;
@@ -24547,6 +24592,10 @@ fn compile_m3os_terminfo(output_dir: &Path) -> PathBuf {
     compiled
 }
 
+// Eight discrete data-disk build inputs (paths + per-service enable flags);
+// grouping them into a config struct would not improve this single internal
+// call site, so the arg-count heuristic is allowed here.
+#[allow(clippy::too_many_arguments)]
 fn populate_ext2_files(
     part_path: &Path,
     output_dir: &Path,
@@ -26942,57 +26991,55 @@ fn populate_phase_69d_ports(part_path: &Path, workspace_root: &Path) {
         // Prefer the sealed .m3pkg artifact: bundle it into /usr/pkg/ and
         // pre-install by unpacking it (proves the artifact round-trips).
         let mut staged_from_artifact = false;
-        if let Ok(artifact) = port_build::pkgcache_artifact_path(port) {
-            if artifact.is_file() {
-                match fs::read(&artifact) {
-                    Ok(bytes) if pkg_format::verify(&bytes) => {
-                        m3pkg_files.push((format!("usr/pkg/{port}.m3pkg"), artifact.clone()));
-                        // Write the `.meta` sidecar (VERSION + DEPS) the in-OS
-                        // dependency solver reads — e.g. `pkg install tmux`
-                        // auto-installs ncurses + libevent first.
-                        let version = port_build::port_version(port).unwrap_or_default();
-                        let deps = port_build::port_deps(port).join(" ");
-                        let meta_host = preinstall_root.join(format!("{port}.meta"));
-                        let _ = fs::create_dir_all(&preinstall_root);
-                        if fs::write(&meta_host, format!("VERSION={version}\nDEPS={deps}\n"))
-                            .is_ok()
-                        {
-                            m3pkg_files.push((format!("usr/pkg/{port}.meta"), meta_host));
+        if let Ok(artifact) = port_build::pkgcache_artifact_path(port)
+            && artifact.is_file()
+        {
+            match fs::read(&artifact) {
+                Ok(bytes) if pkg_format::verify(&bytes) => {
+                    m3pkg_files.push((format!("usr/pkg/{port}.m3pkg"), artifact.clone()));
+                    // Write the `.meta` sidecar (VERSION + DEPS) the in-OS
+                    // dependency solver reads — e.g. `pkg install tmux`
+                    // auto-installs ncurses + libevent first.
+                    let version = port_build::port_version(port).unwrap_or_default();
+                    let deps = port_build::port_deps(port).join(" ");
+                    let meta_host = preinstall_root.join(format!("{port}.meta"));
+                    let _ = fs::create_dir_all(&preinstall_root);
+                    if fs::write(&meta_host, format!("VERSION={version}\nDEPS={deps}\n")).is_ok() {
+                        m3pkg_files.push((format!("usr/pkg/{port}.meta"), meta_host));
+                    }
+                    let dest = preinstall_root.join(port);
+                    let _ = fs::create_dir_all(&dest);
+                    match pkg_format::unpack(&bytes, &dest) {
+                        Ok(_) => {
+                            let local = dest.join("usr/local");
+                            if local.is_dir() {
+                                collect_phase_69d_entries(
+                                    &local,
+                                    "usr/local",
+                                    &mut dirs,
+                                    &mut files,
+                                    &mut execs,
+                                );
+                            }
+                            let share = dest.join("usr/share");
+                            if share.is_dir() {
+                                collect_phase_69d_entries(
+                                    &share,
+                                    "usr/share",
+                                    &mut dirs,
+                                    &mut files,
+                                    &mut execs,
+                                );
+                            }
+                            staged_from_artifact = true;
                         }
-                        let dest = preinstall_root.join(port);
-                        let _ = fs::create_dir_all(&dest);
-                        match pkg_format::unpack(&bytes, &dest) {
-                            Ok(_) => {
-                                let local = dest.join("usr/local");
-                                if local.is_dir() {
-                                    collect_phase_69d_entries(
-                                        &local,
-                                        "usr/local",
-                                        &mut dirs,
-                                        &mut files,
-                                        &mut execs,
-                                    );
-                                }
-                                let share = dest.join("usr/share");
-                                if share.is_dir() {
-                                    collect_phase_69d_entries(
-                                        &share,
-                                        "usr/share",
-                                        &mut dirs,
-                                        &mut files,
-                                        &mut execs,
-                                    );
-                                }
-                                staged_from_artifact = true;
-                            }
-                            Err(e) => {
-                                eprintln!("phase-85a: unpack {port}.m3pkg failed: {e}");
-                            }
+                        Err(e) => {
+                            eprintln!("phase-85a: unpack {port}.m3pkg failed: {e}");
                         }
                     }
-                    Ok(_) => eprintln!("phase-85a: {port}.m3pkg failed verify — skipping bundle"),
-                    Err(e) => eprintln!("phase-85a: read {} failed: {e}", artifact.display()),
                 }
+                Ok(_) => eprintln!("phase-85a: {port}.m3pkg failed verify — skipping bundle"),
+                Err(e) => eprintln!("phase-85a: read {} failed: {e}", artifact.display()),
             }
         }
 
@@ -28063,16 +28110,16 @@ fn create_fat_filesystem(
         .context("failed to size FAT image file")?;
 
     let mut label = *b"MY_RUST_OS!";
-    if let Some(FileDataSource::File(path)) = files.get(KERNEL_FILE_NAME) {
-        if let Some(name) = path.file_stem() {
-            let converted = name.to_string_lossy();
-            let name = converted.as_bytes();
-            let mut new_label = [0u8; 11];
-            let name = &name[..usize::min(new_label.len(), name.len())];
-            let slice = &mut new_label[..name.len()];
-            slice.copy_from_slice(name);
-            label = new_label;
-        }
+    if let Some(FileDataSource::File(path)) = files.get(KERNEL_FILE_NAME)
+        && let Some(name) = path.file_stem()
+    {
+        let converted = name.to_string_lossy();
+        let name = converted.as_bytes();
+        let mut new_label = [0u8; 11];
+        let name = &name[..usize::min(new_label.len(), name.len())];
+        let slice = &mut new_label[..name.len()];
+        slice.copy_from_slice(name);
+        label = new_label;
     }
 
     let format_options = fatfs::FormatVolumeOptions::new().volume_label(label);
@@ -30117,18 +30164,18 @@ fn cmd_regression(args: &RegressionArgs) {
     // Checked first so `--test driver-restart` returns immediately without
     // building the kernel or pulling OVMF.
     let all_host_tests = host_regression_tests();
-    if let Some(name) = &args.test_name {
-        if let Some(t) = all_host_tests.iter().find(|t| t.name == *name) {
-            println!("regression: running host-only test '{}'", t.name);
-            match run_host_regression_test(t) {
-                Ok(()) => {
-                    println!("\nregression: 1 passed, 0 failed");
-                    return;
-                }
-                Err(code) => {
-                    eprintln!("\nregression: 0 passed, 1 failed (exit code {code})");
-                    std::process::exit(1);
-                }
+    if let Some(name) = &args.test_name
+        && let Some(t) = all_host_tests.iter().find(|t| t.name == *name)
+    {
+        println!("regression: running host-only test '{}'", t.name);
+        match run_host_regression_test(t) {
+            Ok(()) => {
+                println!("\nregression: 1 passed, 0 failed");
+                return;
+            }
+            Err(code) => {
+                eprintln!("\nregression: 0 passed, 1 failed (exit code {code})");
+                std::process::exit(1);
             }
         }
     }

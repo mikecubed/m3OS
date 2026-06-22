@@ -774,20 +774,20 @@ fn fetch_tarball(url: &str, sha: &str, cache_dir: &Path) -> Result<PathBuf, Stri
         .ok_or_else(|| format!("malformed URL: {url}"))?;
     let dest = cache_dir.join(basename);
     let sha_prefix = sha_log_prefix(sha);
-    if dest.exists() {
-        if let Ok(actual) = sha256_file(&dest) {
-            if actual == sha {
-                println!("ports: cache hit {} (sha {})", dest.display(), sha_prefix);
-                return Ok(dest);
-            }
-            println!(
-                "ports: cached {} has stale SHA {} (expected {}) — re-fetching",
-                dest.display(),
-                sha_log_prefix(&actual),
-                sha_prefix
-            );
-            let _ = fs::remove_file(&dest);
+    if dest.exists()
+        && let Ok(actual) = sha256_file(&dest)
+    {
+        if actual == sha {
+            println!("ports: cache hit {} (sha {})", dest.display(), sha_prefix);
+            return Ok(dest);
         }
+        println!(
+            "ports: cached {} has stale SHA {} (expected {}) — re-fetching",
+            dest.display(),
+            sha_log_prefix(&actual),
+            sha_prefix
+        );
+        let _ = fs::remove_file(&dest);
     }
     println!("ports: downloading {url}");
     let status = Command::new("curl")
@@ -1481,30 +1481,26 @@ fn port_build(name: &str) -> Result<(), String> {
     let key = compute_port_key(name, &port_dir)?;
     let stamp = stage_root.join(format!("{name}.stamp"));
     let pkgcache_artifact = root.join("target/pkgcache").join(format!("{key}.m3pkg"));
-    if pkgcache_artifact.exists() {
-        if let Ok(bytes) = fs::read(&pkgcache_artifact) {
-            if pkg_format::verify(&bytes) {
-                // Cache hit — materialize the stage from the artifact.
-                let short_key = key.get(..16).unwrap_or(&key);
-                println!("PKGCACHE: hit {key}");
-                println!(
-                    "ports: {name} pkgcache hit (key {short_key}…), zero compiler invocations"
-                );
+    if pkgcache_artifact.exists()
+        && let Ok(bytes) = fs::read(&pkgcache_artifact)
+        && pkg_format::verify(&bytes)
+    {
+        // Cache hit — materialize the stage from the artifact.
+        let short_key = key.get(..16).unwrap_or(&key);
+        println!("PKGCACHE: hit {key}");
+        println!("ports: {name} pkgcache hit (key {short_key}…), zero compiler invocations");
 
-                // Reset the stage dir and unpack.
-                let _ = fs::remove_dir_all(&stage);
-                fs::create_dir_all(&stage).map_err(|e| format!("mkdir stage (cache hit): {e}"))?;
-                pkg_format::unpack(&bytes, &stage)
-                    .map_err(|e| format!("unpack pkgcache({name}): {e}"))?;
+        // Reset the stage dir and unpack.
+        let _ = fs::remove_dir_all(&stage);
+        fs::create_dir_all(&stage).map_err(|e| format!("mkdir stage (cache hit): {e}"))?;
+        pkg_format::unpack(&bytes, &stage).map_err(|e| format!("unpack pkgcache({name}): {e}"))?;
 
-                // Prime the same-machine `.stamp` fast-path so subsequent calls
-                // skip even the key computation on the same machine.
-                let fingerprint = port_fingerprint(&port_dir);
-                let _ = fs::write(&stamp, &fingerprint);
+        // Prime the same-machine `.stamp` fast-path so subsequent calls
+        // skip even the key computation on the same machine.
+        let fingerprint = port_fingerprint(&port_dir);
+        let _ = fs::write(&stamp, &fingerprint);
 
-                return Ok(());
-            }
-        }
+        return Ok(());
     }
     // Cache miss — log it, then fall through to the same-machine stamp check
     // and the real build.
