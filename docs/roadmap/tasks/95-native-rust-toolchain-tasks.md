@@ -56,16 +56,24 @@
 > like the Phase 90b Claude-Code bring-up that surfaced kernel hardening).
 > **Thoroughly diagnosed** (the on-device load of `rustc --version` was driven to
 > failure under both multi-core and single-core, KVM and TCG):
->   1. **CPU-bound super-linear load.** `rustc --version` never completes:
->      **single-core under KVM it runs at a steady 100 % CPU and times out at 25 min
->      with no progress** — so it is CPU-bound, NOT a deadlock (qemu is busy, not
->      idle), NOT a VFS-latency stall, and NOT the symbol resolver (gnu-hash is
->      O(1)/lookup) nor the VMA lookup (`find_vma` is an O(log n) BTreeMap). ~1000+
->      CPU-seconds to load the ~150 MB dynamic rustc (`librustc_driver.so` +
->      `libLLVM.so`) implies a **super-linear factor in the kernel page-fault /
->      mm / demand-paging path** hit ~tens-of-thousands of times as the binary's
->      pages fault in (the loader's own reloc/symbol work is O(relocs × dsos) =
->      linear). Pinpointing it needs kernel fault-path profiling/bisection.
+>   1. **CPU-bound super-linear load of a ~736 MB dynamic image — the real
+>      blocker.** `rustc --version` never completes: **single-core under KVM it runs
+>      at a steady 100 % CPU and times out at 25 min** (multi-core 25 min too) — so
+>      it is CPU-bound, NOT a deadlock (qemu busy, not idle), NOT a VFS-latency
+>      stall, NOT the symbol resolver (gnu-hash O(1)) nor the VMA lookup (`find_vma`
+>      = O(log n) BTreeMap) nor the vfs block cache (bounded BTreeMap). The crux is
+>      SIZE: `rustc` is an **11 KB launcher** that `DT_NEEDED`s **`librustc_driver.so`
+>      = 576 MB** + **`libLLVM.so` = 160 MB** — ~**736 MB of shared libraries loaded
+>      per invocation**. The Phase 76/93 `ld-musl` loader's per-DSO strategy is
+>      "mmap a file-sized scratch → `sys_read` the whole file (64 KiB chunks) → mmap
+>      a file-sized anonymous image → copy segments → relocate", i.e. for
+>      librustc_driver alone **> 1.1 GB of anonymous mmap (scratch + image) + 576 MB
+>      read + 576 MB copy + reloc**, on the 2 GiB guest — ~1000+ CPU-seconds. The
+>      fundamental fix is a **streaming / file-backed-mmap loader** (demand-page the
+>      segments, drop the whole-file scratch+copy) plus faster kernel demand-paging;
+>      this is the dominant cost regardless of the smaller items below. (Reused as-is,
+>      the dynamic-`python3` Phase 93 path works because those `.so`s are tens of MB,
+>      not 576 MB.)
 >   2. **Multi-core TLB-shootdown storm.** With the default `-smp 4`, the same load
 >      pegs **~380 % CPU** (3 extra cores spinning) — the loader's ~tens-of-thousands
 >      of `map`/`mprotect`/CoW page operations each broadcast a TLB-shootdown IPI to
