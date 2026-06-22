@@ -633,14 +633,17 @@ fn build_recipe_id(name: &str) -> &'static str {
              excludes selinux-chcon/runcon+external-libstdbuf);\
              stage=/usr/local/bin/coreutils+per-applet-symlinks(from `coreutils --list`);recipe-v=1"
         }
-        // Phase 95 — the on-device Rust toolchain. The built artifact is the static
+        // Phase 95 — the on-device Rust toolchain. The built artifact is the dynamic
         // musl `rustc` + std sysroot + `rust-lld` (the tarball is the rustc SOURCE,
         // folded in via the Portfile SHA-256). This arm pins the x.py cross-build
-        // knob set (static musl host, crt-static, download-ci-llvm-driven musl LLVM,
-        // bundled lld, the Stage-B musl libc++ runtimes recipe) so a flag change
-        // self-invalidates the cached `.m3pkg`. The host clang identity folds in
-        // separately via `host_cxx_toolchain_id()` in `compute_port_key`. Bump
-        // recipe-v whenever build_rust's config/flags/staging change.
+        // knob set (crt-static=false → a dynamic musl host with a runtime DEPS=musl,
+        // because a crt-static musl host can't build rustc's own proc-macro deps;
+        // in-tree X86 LLVM, bundled lld, the Stage-B musl libc++ runtimes recipe) so
+        // a flag change self-invalidates the cached `.m3pkg`. The host clang identity
+        // folds in separately via `host_cxx_toolchain_id()` in `compute_port_key`.
+        // Bump recipe-v whenever the recipe-id STRING below (build_rust's
+        // config/flags/staging) changes — editing only this comment does not affect
+        // the computed port key.
         "rust" => {
             "x.py-cross:build=x86_64-unknown-linux-gnu host=target=x86_64-unknown-linux-musl \
              profile=compiler docs=false extended=false tools=[] crt-static=FALSE(dynamic;\
@@ -1288,11 +1291,14 @@ pub const BUILDABLE_PORTS: &[&str] = &[
     // `port build all` builds it. DEPS= empty (pure Rust), so it has no ordering
     // constraint.
     "coreutils",
-    // Phase 95 — the on-device Rust TOOLCHAIN (`build_rust`): a fully-static musl
-    // `rustc` + std sysroot + bundled `rust-lld`. RECIPE=yes; DEPS= empty (it
-    // self-bootstraps via x.py + the host clang). NOT in `port build all`'s default
-    // expectations for CI lightness — it is a multi-hundred-MB opt-in toolchain
-    // (M3OS_WITH_RUST), like `llvm`, built on demand by the `rustc-smoke` gate.
+    // Phase 95 — the on-device Rust TOOLCHAIN (`build_rust`): a dynamic musl
+    // `rustc` + std sysroot + bundled `rust-lld`. RECIPE=yes; DEPS=musl — the rustc
+    // binary is dynamic (a crt-static musl host can't build rustc's own proc-macro
+    // deps), so it needs the Phase 93 `/usr/lib/libc.so` at runtime. It still
+    // self-bootstraps the build via x.py + the host clang. NOT in `port build all`'s
+    // default expectations for CI lightness — it is a multi-hundred-MB opt-in
+    // toolchain (M3OS_WITH_RUST), like `llvm`, built on demand by the `rustc-smoke`
+    // gate.
     "rust",
 ];
 
