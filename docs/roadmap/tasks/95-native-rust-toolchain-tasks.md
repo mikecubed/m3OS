@@ -11,12 +11,24 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Bootstrap a fully-static musl `rustc` (host-cross-built) + prove it loads on m3OS | 85d, 94 | Planned |
-| B | Userspace target spec + prebuilt `std` sysroot + bundled `rust-lld` (relocation contract) | A | Planned |
-| C | On-device `rustc hello.rs` milestone (`RUSTC_OK`) — no proc-macros | A, B | Planned |
-| D | (Stretch) `cargo` + proc-macros via on-device `dlopen` of the proc-macro `.so` | C, 93 | Planned |
-| E | Packaging (`M3OS_WITH_RUST`) + `rustc-smoke` / `cargo-smoke` gates | A–D | Planned |
-| F | Documentation, learning doc, capability bullet, kernel version bump | A–E | Planned |
+| A | Bootstrap a fully-static musl `rustc` (host-cross-built) + prove it loads on m3OS | 85d, 94 | In progress — `build_rust` recipe landed; host build running |
+| B | Userspace target spec + prebuilt `std` sysroot + bundled `rust-lld` (relocation contract) | A | In progress — stock `x86_64-unknown-linux-musl` target + bundled `rust-lld`; on-device check pending |
+| C | On-device `rustc hello.rs` milestone (`RUSTC_OK`) — no proc-macros | A, B | In progress — fixture + gate landed; QEMU validation pending |
+| D | (Stretch) `cargo` + proc-macros via on-device `dlopen` of the proc-macro `.so` | C, 93 | Deferred (stretch / `95b`) |
+| E | Packaging (`M3OS_WITH_RUST`) + `rustc-smoke` / `cargo-smoke` gates | A–D | In progress — `M3OS_WITH_RUST` + `rustc-smoke` landed; `cargo-smoke` deferred |
+| F | Documentation, learning doc, capability bullet, kernel version bump | A–E | In progress — docs + version bump underway |
+
+> **Implementation status (live).** Host-side scaffolding for Tracks A/B/C/E is
+> landed and `cargo xtask check`-green (PR #264): `ports/lang/rust/Portfile` (Rust
+> 1.96.0), `build_rust` (x.py cross-build → static musl rustc + std sysroot +
+> bundled `rust-lld`, reusing the Phase 85d musl libc++ sysroot), the dispatch /
+> `build_recipe_id` / `BUILDABLE_PORTS` wiring, the `M3OS_WITH_RUST` image-feature
+> gate, the `/usr/src/hello.rs` fixture, and `cmd_rustc_smoke` + `rustc_smoke_steps`
+> + CLI dispatch + `usage()`. The heavy host build (static musl `rustc` over the
+> reused LLVM-22 musl libc++ sysroot) is running; on-device `RUSTC_OK` validation
+> via the `rustc-smoke` gate follows once it lands. Bootstrap decisions made:
+> stock `x86_64-unknown-linux-musl` target (not a new spec); bundled `rust-lld`
+> (no `DEPS=clang`); full `x.py` static-musl build (not `mrustc`).
 
 ---
 
