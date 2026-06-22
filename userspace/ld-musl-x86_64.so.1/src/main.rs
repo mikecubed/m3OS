@@ -803,42 +803,21 @@ unsafe fn load_dso(path_bytes: &[u8]) -> Result<LoadedDso, LoadError> {
         }
         return Err(LoadError::Other("open failed"));
     }
-    // Phase 93 — size the scratch buffer to the DSO file. A real `libc.so` is
-    // ~700 KiB and a dynamic interpreter is several MiB, far past the old fixed
-    // 64 KiB scratch (which errored "DSO larger than 64 KiB scratch" on any
-    // real libc). `lseek` to END gives the size; we mmap a page-rounded scratch
-    // with one page of headroom (so the read loop hits EOF cleanly) and rewind.
-    const SCRATCH_FLOOR: u64 = 64 * 1024;
-    // Guard a corrupt/hostile size from driving an enormous mmap. Generous
-    // enough for any real interpreter (a dynamic CPython is tens of MiB).
-    const SCRATCH_CAP: u64 = 256 * 1024 * 1024;
-    let file_size = sys_lseek(fd, 0, 2 /* SEEK_END */);
-    let scratch_len = if file_size <= 0 {
-        // lseek unsupported on this fd or empty/odd size — fall back to the
-        // legacy fixed scratch (small self-contained test libs still load).
-        SCRATCH_FLOOR
-    } else {
-        let sz = file_size as u64;
-        if sz > SCRATCH_CAP {
-            sys_close(fd);
-            return Err(LoadError::Other("DSO exceeds loader scratch cap"));
-        }
-        let rounded = (sz + 4095) & !4095u64;
-        let with_headroom = rounded.saturating_add(4096);
-        if with_headroom > SCRATCH_FLOOR {
-            with_headroom
-        } else {
-            SCRATCH_FLOOR
-        }
-    };
-    // Rewind to offset 0 so `load_dso_impl`'s sequential read starts at the
-    // ELF header.
-    if file_size > 0 {
-        let _ = sys_lseek(fd, 0, 0 /* SEEK_SET */);
-    }
+    // Phase 95b (Area A.1) — stream each PT_LOAD straight from the file into the
+    // image instead of buffering the whole DSO. The old strategy mmap'd a
+    // file-sized anonymous *scratch*, `read` the entire file into it, mmap'd a
+    // second file-sized image, then `copy_nonoverlapping`d each PT_LOAD between
+    // them — ~2× the file size in anonymous RAM plus a file-sized intra-RAM copy,
+    // *per DSO*. That is fatal for a 162 MB `librustc_driver.so` (hundreds of
+    // CPU-seconds, the Phase 95 load wall). The ELF header + program-header table
+    // both live at the start of the file, so a small fixed scratch is enough to
+    // parse them; `load_dso_impl` then `lseek`+`read`s each PT_LOAD directly into
+    // `load_bias + p_vaddr` (no scratch copy), and the BSS tail stays zero
+    // because the image mmap is anonymous-zeroed.
+    const HEADER_SCRATCH: u64 = 64 * 1024;
     let scratch = sys_mmap(
         0,
-        scratch_len,
+        HEADER_SCRATCH,
         PROT_READ | PROT_WRITE,
         MAP_PRIVATE | MAP_ANONYMOUS,
         -1,
@@ -848,26 +827,40 @@ unsafe fn load_dso(path_bytes: &[u8]) -> Result<LoadedDso, LoadError> {
         sys_close(fd);
         return Err(LoadError::Other("scratch mmap failed"));
     }
-    // The scratch buffer is only needed for header parsing + PT_LOAD
-    // copy.  Once `dyn_` is built, every pointer it carries lives in
-    // the freshly-mmap'd image, not in scratch.  Delegating to an
-    // inner helper lets us munmap the scratch buffer on EVERY return
-    // path (success + every early-error path) without scattering the
-    // teardown across half a dozen `return Err(…)` sites.
-    let result = unsafe { load_dso_impl(fd, scratch as u64, scratch_len) };
-    let _ = sys_munmap(scratch as u64, scratch_len);
+    // `load_dso_impl` keeps `fd` open to stream the segments and closes it on
+    // every return path. Delegating to the inner helper lets us munmap the
+    // header scratch on EVERY return (success + every early-error path) without
+    // scattering the teardown across half a dozen `return Err(…)` sites.
+    let result = unsafe { load_dso_impl(fd, scratch as u64, HEADER_SCRATCH) };
+    let _ = sys_munmap(scratch as u64, HEADER_SCRATCH);
     result
 }
 
 unsafe fn load_dso_impl(fd: i64, scratch: u64, scratch_len: u64) -> Result<LoadedDso, LoadError> {
+    // RAII guard so `fd` is closed on EVERY return path (the header parse has
+    // half a dozen early `Err` returns, and Pass 2 streams from the fd). Phase
+    // 95b keeps the fd open past the header read — the old code closed it
+    // immediately after slurping the whole file into scratch.
+    struct FdGuard(i64);
+    impl Drop for FdGuard {
+        fn drop(&mut self) {
+            if self.0 >= 0 {
+                sys_close(self.0);
+            }
+        }
+    }
+    let fd_guard = FdGuard(fd);
+    let fd = fd_guard.0;
+
     let scratch_buf =
         unsafe { core::slice::from_raw_parts_mut(scratch as *mut u8, scratch_len as usize) };
+    // Read only the header window (ELF header + program-header table, both at the
+    // start of the file) into the small scratch — never the whole file. Pass 2
+    // streams each PT_LOAD straight into the image via `lseek`+`read`.
     let mut total = 0usize;
-    let mut truncated = false;
     loop {
         let n = sys_read(fd, &mut scratch_buf[total..]);
         if n < 0 {
-            sys_close(fd);
             return Err(LoadError::Other("read failed"));
         }
         if n == 0 {
@@ -875,23 +868,10 @@ unsafe fn load_dso_impl(fd: i64, scratch: u64, scratch_len: u64) -> Result<Loade
         }
         total += n as usize;
         if total >= scratch_buf.len() {
-            // Buffer is full. Probe for one more byte to distinguish
-            // "file is exactly scratch_len" from "file is larger and
-            // would be silently truncated". A non-zero return from
-            // this read means the file kept going past our buffer —
-            // refuse to parse a truncated image.
-            let mut probe = [0u8; 1];
-            let extra = sys_read(fd, &mut probe);
-            truncated = extra > 0;
+            // Header window full — ample to parse Ehdr + PHDRs for any real DSO
+            // (the program-header table lives within the first few hundred bytes).
             break;
         }
-    }
-    sys_close(fd);
-    if truncated {
-        // The scratch buffer is sized to the file (lseek SEEK_END) plus a page
-        // of headroom, so this only fires if the file grew between the size
-        // probe and the read (a race) — refuse to parse a truncated image.
-        return Err(LoadError::Other("DSO grew during load (read truncated)"));
     }
     if total < core::mem::size_of::<Ehdr>() {
         return Err(LoadError::Other("file too small"));
@@ -959,26 +939,45 @@ unsafe fn load_dso_impl(fd: i64, scratch: u64, scratch_len: u64) -> Result<Loade
     }
     let load_bias = image_base as u64;
 
-    // Pass 2: copy each PT_LOAD into the image, then mprotect text
-    // pages to R-X (W^X requires separate W and X mappings).
+    // Pass 2: stream each PT_LOAD straight from the file into the image, then
+    // mprotect text pages to R-X (W^X requires separate W and X mappings). The
+    // image mmap is anonymous-zeroed, so reading only `p_filesz` bytes leaves the
+    // BSS tail (`p_memsz - p_filesz`) zero — no explicit zeroing needed.
     for i in 0..phnum {
         let ph = unsafe { *phdr_base.add(i) };
         if ph.p_type != PT_LOAD {
             continue;
         }
-        // Bounds-check the file range against the bytes we actually
-        // read. A malformed ELF whose PT_LOAD references data past
-        // the scratch buffer would otherwise cause an out-of-bounds
-        // read during copy_nonoverlapping.
-        let seg_end = (ph.p_offset as usize)
-            .checked_add(ph.p_filesz as usize)
-            .ok_or(LoadError::Other("p_offset+p_filesz overflow"))?;
-        if seg_end > total {
-            return Err(LoadError::Other("PT_LOAD file range outside scratch"));
+        let filesz = ph.p_filesz as usize;
+        if filesz == 0 {
+            continue;
         }
-        let src = (scratch + ph.p_offset) as *const u8;
-        let dst = (load_bias + ph.p_vaddr) as *mut u8;
-        unsafe { core::ptr::copy_nonoverlapping(src, dst, ph.p_filesz as usize) };
+        // Sanity-bound the segment to the image span just mapped so a malformed
+        // PT_LOAD cannot drive an out-of-bounds write into unrelated memory.
+        let seg_hi = ph
+            .p_vaddr
+            .checked_add(ph.p_filesz)
+            .ok_or(LoadError::Other("p_vaddr+p_filesz overflow"))?;
+        if seg_hi > image_len {
+            return Err(LoadError::Other("PT_LOAD file range outside image"));
+        }
+        if sys_lseek(fd, ph.p_offset as i64, 0 /* SEEK_SET */) < 0 {
+            return Err(LoadError::Other("lseek PT_LOAD failed"));
+        }
+        let dst =
+            unsafe { core::slice::from_raw_parts_mut((load_bias + ph.p_vaddr) as *mut u8, filesz) };
+        let mut off = 0usize;
+        while off < filesz {
+            let n = sys_read(fd, &mut dst[off..]);
+            if n < 0 {
+                return Err(LoadError::Other("PT_LOAD read failed"));
+            }
+            if n == 0 {
+                // EOF before p_filesz — the remainder stays zero (anon image).
+                break;
+            }
+            off += n as usize;
+        }
     }
     for i in 0..phnum {
         let ph = unsafe { *phdr_base.add(i) };
