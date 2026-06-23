@@ -179,17 +179,40 @@ app's `__init_libc → __init_tls` does nothing. The m3OS loader REPLACED the ld
 `__init_tls` actually reaches `__copy_tls` (it has static TLS the trivial test
 programs lack — hence `dynamic-hello`/`dynamic-python` don't hit it).
 
-**FIX (mirror musl's `dynlink.c` for the shared `libc.so` — which serves ONLY
-loader-driven dynamic programs; the static git/python use a separate musl toolchain
-so this is isolated):**
-1. **No-op `__init_tls`** in the musl port (patch `0004`): the loader already builds
-   the TCB/DTV (`setup_static_tls` + `__init_tp`), so the app's `__init_tls` must do
-   nothing. Smallest fix; fixes the MAIN thread. May suffice for `rustc --version`
-   (likely single-threaded).
-2. **(If rustc spawns threads)** ALSO populate `libc.tls_head/tls_size/tls_align/
-   tls_cnt` from the loader (it computed the TLS layout in `setup_static_tls`;
-   `total_off` etc.) so `pthread_create`'s own `__copy_tls` has valid globals — else
-   new threads crash the same way. This is the complete `dynlink.c` mirror.
+**FIX — VALIDATED REQUIREMENTS (a `0004`-no-op experiment was run + reverted):**
+The COMPLETE fix mirrors musl's `dynlink.c` and needs BOTH parts; the no-op ALONE is
+insufficient AND regressing:
+- **A no-op `static_init_tls` ALONE is INSUFFICIENT.** A patch making
+  `static_init_tls` (the weak alias `__init_tls`) a no-op was built + run: the crash
+  is UNCHANGED (`addr=0x8`, same `rip` in `__copy_tls`, same `demand_pages≈9051`),
+  because rustc spawns its worker thread immediately and **`pthread_create →
+  __copy_tls`** hits the SAME zero `libc.tls_*` globals. `__copy_tls` (used by
+  pthread_create) was correctly left intact, so the fault site is identical.
+- **A no-op `static_init_tls` ALONE also REGRESSES `dynamic-python`.** `static_init_tls`
+  is what POPULATES `libc.tls_head/tls_size/tls_align/tls_cnt`. It mis-derives the
+  main-exe TLS base for dynamic programs (per patch `0002`) — it found nothing for
+  rustc (→ zero globals → crash) but worked by luck for python's simpler TLS. No-op'ing
+  it removes python's (lucky-correct) globals → python's threads would then crash in
+  `pthread_create` too.
+
+**So the complete fix is BOTH, together (mirror `dynlink.c`):**
+1. **Loader POPULATES `libc.tls_head/tls_size/tls_align/tls_cnt`** (the `__libc` fields
+   at `0xaf8d0/d8/e0/e8`) with the CORRECT TLS layout it already computed in
+   `setup_static_tls` (it derives the base properly from `AT_PHDR`, which
+   `static_init_tls` botches). Add an exported musl setter (like `__m3os_set_auxv`) —
+   e.g. `__m3os_set_tls(head, size, align, cnt)` — and call it from the loader.
+   Caveat: `tls_head` is musl's `struct tls_module *` linked list, which differs from
+   the loader's `DsoTls`; either build a compatible `tls_module` list, OR (simpler,
+   verify it suffices) set `size`/`align`/`cnt` non-zero with `tls_head=NULL` so
+   `__copy_tls` computes a valid `td` and skips the per-module copy loop — new threads
+   then get a correctly-sized but zero-initialized TLS block (fine unless a
+   thread-local has a non-zero initial image; verify against rustc's worker thread).
+2. **No-op `static_init_tls`** (the reverted `0004`) so the app's mis-deriving
+   `__init_tls` does NOT overwrite the loader's correct globals.
+
+**Validate against BOTH** `rustc-smoke` AND `dynamic-python-smoke` (the python-thread
+regression is the trap). Loader TLS internals: `userspace/ld-musl-x86_64.so.1/src/
+{main.rs::setup_static_tls, tls.rs}`.
 
 ---
 
