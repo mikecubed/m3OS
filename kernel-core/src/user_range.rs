@@ -5,16 +5,22 @@
 
 /// Maximum bytes accepted in a single user-copy operation.
 ///
-/// Sized to comfortably hold the largest bulk-IPC payload we accept
-/// (see `MAX_BULK_LEN` in `kernel/src/ipc/mod.rs`, currently 80 KiB)
-/// plus headroom for the IPC frame header and minor wire overhead.
-/// The previous 64 KiB cap matched the old `MAX_BULK_LEN` exactly,
-/// which broke the audio path: `audio_client::SyscallSocket::call`
-/// concatenates a 16 B request frame and a 64 KiB PCM payload into
-/// one `ipc_call_buf`, hitting 65552 B > 65536 B and surfacing as a
-/// silent `copy_to_kernel` failure (the Phase 63 audio-smoke `submit`
-/// stage).
-pub const MAX_COPY_LEN: usize = 96 * 1024; // 96 KiB
+/// **Must track `MAX_BULK_LEN`** (in `kernel/src/ipc/mod.rs`) plus headroom for
+/// the IPC frame header and minor wire overhead: a bulk-IPC payload is copied
+/// to/from a user buffer in one `UserSliceWo`/`UserSliceRo`, so a copy limit
+/// below the bulk ceiling silently fails the largest transfers. History: the
+/// original 64 KiB cap matched the old `MAX_BULK_LEN` exactly and broke the
+/// audio path (`audio_client` packs a 16 B frame + 64 KiB PCM into one
+/// `ipc_call_buf`, hitting 65552 B > 65536 B); it was bumped to 96 KiB for the
+/// 80 KiB ceiling.
+///
+/// Phase 95c (Area A.2) — `MAX_BULK_LEN` rose to 512 KiB to admit 256 KiB VFS
+/// read/write clusters, so this rose in lockstep to 576 KiB (512 KiB + 64 KiB
+/// headroom). Without this bump a 256 KiB `read()` of a `/usr` file failed the
+/// `UserSliceWo` validation (256 KiB > 96 KiB → `EFAULT`), surfacing as the
+/// installer's `read … : read failed`. The copy is chunked per page internally,
+/// so a larger cap costs no fixed buffer — it only raises the accepted total.
+pub const MAX_COPY_LEN: usize = 576 * 1024; // 576 KiB (>= MAX_BULK_LEN + headroom)
 
 /// Lowest valid user address (below this is the null-guard region).
 pub const USER_ADDR_MIN: u64 = 0x1000;
