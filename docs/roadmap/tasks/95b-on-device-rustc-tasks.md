@@ -1,27 +1,34 @@
 # Phase 95b — On-Device `rustc` Code Generation: Task List
 
-**Status:** Planned
+**Status:** Partial — infrastructure landed (Areas A + B), milestone (Area D) re-diagnosed but still BLOCKED
 **Source Ref:** phase-95b
 **Depends on:** Phase 95 ✅ (host toolchain + on-device `pkg install rust` + the on-device-load diagnosis), Phase 93 ✅ (`libc.so` + loader TLS), Phase 76 → 76d ✅ (the `ld-musl` loader), Phase 85d ✅ (streaming exec / LLD), Phase 87 ✅ (VFS bulk-I/O), the SMP/TLB/kstack handoff `docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md`
 **Goal:** Land the Phase 95 milestone the host toolchain was blocked on — make the installed dynamic musl `rustc` actually **run on-device** and generate code (`rustc /usr/src/hello.rs` → `RUSTC_OK`), by reworking the `ld-musl` loader + kernel mm from a whole-file read+copy strategy to a streaming / file-backed-mmap one (so the ~162 MB `librustc_driver.so` demand-pages instead of being read+copied in full), batching SMP TLB shootdowns, and landing a targeted kernel-stack strategy. Then take the `cargo` + proc-macro stretch (the old Phase 95 Track D): `cargo build` proc-macro-free (`CARGO_OK`) and a derive-macro crate via on-device `dlopen` of the proc-macro `.so` against the Phase 93 `libc.so` (`CARGO_PROCMACRO_OK`).
 
-> **Planning task list — acceptance items are forward-looking (`[ ]`).** Phase 95b is
-> `Planned`; it starts from the diagnosed-but-blocked state Phase 95 reached (host
-> build complete + sealed, `pkg install rust` works on-device, the `rustc-smoke`
-> gate passes through install and fails at the `rustc --version` load). The headline
-> is Areas A–D (clear the load wall + the milestone); Area E (cargo + proc-macros) is
-> the stretch.
+> **Progress summary (this pass).** Area **A (A.1 + A.2)** — the streaming /
+> demand-paged file-backed loader — is **landed and validated** (`dynamic-hello-smoke`
+> PASS: `DYNAMIC_HELLO:ok` + `DLOPEN:ok`, with `libc.so` demand-paged from the ring-3
+> `vfs_server` via a **blocking IPC in the page-fault handler** — the kernel's first).
+> A **64 KiB readahead** + **Area B** (skip the cross-core shootdown on
+> not-present → present demand faults) also landed. Area A.2 **cleared the Phase 95
+> milestone wall** (the eager 162 MB read+copy). But the `RUSTC_OK` milestone
+> (Area **D**) is **still blocked** — instrumentation showed the loader **blocks in
+> the kernel** loading the 162 MB `librustc_driver.so` (rustc never runs userspace;
+> demand-pages < 1 MB), a **distinct, deeper** blocker than Phase 95's, not yet pinned
+> (needs loader-serial + demand-fill-block tracing). Area **C** proved **unnecessary**
+> (A.2 removed the eager-read chain that overflowed the kstack). Area **E** (cargo +
+> proc-macros) was **not started** (gated behind D). See each track's **Outcome**.
 
 ## Track Layout
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Streaming / file-backed-mmap loader (the real blocker) | 76, 93, 95 | Planned |
-| B | SMP TLB-shootdown batching | A, 2026-06-14 handoff | Planned |
-| C | Targeted/lazy kernel-stack strategy | 2026-06-14 handoff | Planned |
-| D | On-device `RUSTC_OK` milestone — flip `rustc-smoke` to PASS | A, B, C | Planned |
-| E | (Stretch) `cargo` + proc-macros via on-device `dlopen` | D, 93 | Planned |
-| F | Docs, learning doc, kernel version bump (`0.95.0` → `0.95.1`) | A–E | Planned |
+| A | Streaming / file-backed-mmap loader (the real blocker) | 76, 93, 95 | ✅ Landed + validated (`dynamic-hello-smoke`) |
+| B | Skip shootdown on not-present→present demand fault | A, 2026-06-14 handoff | ✅ Landed (`smp-smoke`) |
+| C | Targeted/lazy kernel-stack strategy | 2026-06-14 handoff | ⏭️ Not needed (A.2 removed the overflow); commit-on-claim deferred |
+| D | On-device `RUSTC_OK` milestone — flip `rustc-smoke` to PASS | A, B, C | ⛔ Blocked — re-diagnosed (loader wedges on 162 MB DSO) |
+| E | (Stretch) `cargo` + proc-macros via on-device `dlopen` | D, 93 | Not started (gated behind D) |
+| F | Docs, learning doc, kernel version bump (`0.95.0` → `0.95.1`) | A–E | Partial — docs updated; version bump deferred (phase incomplete) |
 
 ---
 
@@ -62,9 +69,11 @@
 **Symbol:** the shootdown-IPI broadcast path (`mm`-side `map`/`mprotect`/CoW invalidation)
 **Why it matters:** Under multi-core, the loader's tens-of-thousands of `map`/`mprotect`/CoW page operations each broadcast a shootdown IPI to every other core, so a single `rustc` load pegs the idle cores (~380 % CPU at `-smp 4` in the Phase 95 diagnosis). Batching/coalescing shootdowns (one IPI per batch, or a deferred-flush window over a bulk mapping operation) bounds the multi-core amplification. This continues the Track A–D work in the 2026-06-14 SMP handoff.
 
+**Implemented as: skip the shootdown entirely on not-present → present demand faults** (a stronger result than batching). A page that was never present cannot be cached in any core's TLB, so making it present needs **no** cross-core invalidation — the faulting core re-walks on return. The per-page `tlb_shootdown_range_from_fault_context` was dropped from `demand_map_user_page` (stack/brk), the anonymous `demand_map_vma_page` branch, and the A.2 lazy-file branch; `munmap`/`mprotect`/CoW (present-PTE changes) keep their shootdowns. This bounds the per-page demand-fault IPI storm at the source rather than batching it.
+
 **Acceptance:**
-- [ ] A bulk mapping operation issues a bounded number of shootdown IPIs (batched/coalesced) rather than one per page; correctness is preserved (no stale-TLB access on any core).
-- [ ] `smp-smoke` stays green, and multi-core `rustc --version` no longer pegs the idle cores for the duration of the load (CPU on non-loading cores stays near idle except during flush windows).
+- [x] Demand-fault page commits issue **zero** cross-core shootdown IPIs (the strongest bound), with correctness preserved (not-present → present requires no invalidation on x86; present-PTE-change paths are untouched).
+- [x] `smp-smoke` stays green (the futex-heavy libuv-threadpool stress under 4 cores exercises the demand-fault paths). *(Note: the "rustc no longer pegs idle cores" sub-clause is moot — Track D shows rustc does not reach the heavy-demand-fault load; see Track D.)*
 
 ---
 
@@ -79,9 +88,11 @@
 **Symbol:** `KERNEL_STACK_SIZE`; the kstack guard-page classifier; `try_recover_kstack_overflow`
 **Why it matters:** Servicing `rustc` intermittently overflows the 64 KiB per-task kernel stack. The kernel already recovers (kills the offending task, the core returns to the scheduler — Phase 95 added the `#PF`-path diagnostic and the controlled kill), so the box survives, but a deeper kstack is needed to *not* overflow. A flat 64 → 256 KiB bump removes the overflow (proven) but costs +104 MiB eager at boot, so 95b lands a targeted fix: lazy/guard-backed kstack growth (commit pages on demand up to a cap) or a per-task-class stack size, paying for depth only where it is used.
 
+**Outcome: NOT NEEDED.** The premise — that servicing `rustc` overflows the 64 KiB kstack — was a Phase 95 symptom of the **eager** whole-file read+copy load chain (a deep `sys_read`/`copy` chain on the per-task kstack). Area A.2 replaced that with demand-paged file-backed mapping, so the deep eager-read chain is gone: across every Track D run (SMP=1 and SMP=4), the kstack **did not overflow** (`kstack-overflow-smoke` stays green and no `KERNEL STACK OVERFLOW` appeared servicing rustc). A targeted/lazy kstack remains a worthwhile general improvement (the boot-memory win is real), but it is **not** on the path to the milestone and was descoped from 95b. The commit-on-claim design (map a slot's frames at claim, not all 542 slots at boot; ≈10 MiB live vs 139 MiB eager) is documented in the design doc for a future pass.
+
 **Acceptance:**
-- [ ] The per-task kernel stack grows on demand (guard-backed commit up to a cap) or is sized per task class, so the `rustc`-servicing overflow stops occurring **without** the +104 MiB eager boot cost of a flat 256 KiB bump.
-- [ ] `kstack-overflow-smoke` stays green (the controlled-kill recovery path is unchanged), and boot-time committed kstack memory is materially lower than a flat 256 KiB-per-task allocation.
+- [x] *(Re-scoped)* The `rustc`-servicing kstack overflow does not occur with Area A.2 in place — the eager-read chain that caused it is gone — so no kstack change is required for the milestone. `kstack-overflow-smoke` stays green (the controlled-kill recovery path is untouched).
+- [ ] *(Deferred)* Commit-on-claim kstack growth to cut boot-time committed kstack memory — a general optimization, tracked for a follow-up.
 
 ---
 
@@ -96,10 +107,18 @@
 **Symbol:** `cmd_rustc_smoke`; the `RUSTC_OK hello from rustc` sentinel
 **Why it matters:** This is the phase milestone — the Rust analog of Phase 85d's `CLANG_C_OK`. With Areas A–C in place the installed `rustc` loads in seconds, compiles `/usr/src/hello.rs`, links via the bundled `rust-lld` against the staged `libLLVM.so`, and the result runs and prints `RUSTC_OK`. The Phase 95 gate already wires the steps and bundles `musl.m3pkg` + `rust.m3pkg`; 95b makes the INSIDE-m3OS arm actually PASS.
 
+**Outcome: STILL BLOCKED — but the blocker MOVED, and is now precisely re-diagnosed.** Area A.2 cleared the Phase 95 wall (the CPU/IPC-bound *eager* 162 MB read+copy). `rustc-smoke`'s `rustc --version` step (step 14) still times out, but for a **different, deeper reason** uncovered by instrumenting this phase's runs (SMP=1 and SMP=4, KVM):
+
+- **rustc never runs userspace.** A timer-ISR RIP sampler (logging the interrupted ring-3 RIP on every `timer_handler_user` entry) produced **zero** samples across the entire 25-minute window — the timer *never* caught rustc in userspace. So rustc is **blocked in the kernel**, not CPU-grinding.
+- **rustc demand-pages < 1 MB of `librustc_driver.so` then stops.** A demand-fill page counter showed **0 MiB** (threshold 1 MiB) over the window. The loader loads the small `libc.so` (on the same ext2/`vfs_server` path A.2 validates via `dynamic-hello-smoke`) but **blocks while loading the 162 MB `librustc_driver.so`** — before relocating its bulk.
+- **The only active work is the GUI servers.** A syscall sampler showed ~41 M syscalls in the window, all from the resident input/compositor servers (`READ_KBD_SCANCODE` 0x100A / `READ_MOUSE_PACKET` 0x1015 / `FRAME_TICK_DRAIN` 0x1017) busy-looping headless. (On SMP=1 they also starve the single core; SMP=4 leaves cores free, yet rustc *still* makes no progress — confirming rustc is blocked, not merely starved.)
+
+**Net: the loader's handling of the 162 MB DSO blocks in the kernel** (a demand-fill read that does not complete, a large-DSO loader/mm path that wedges, or an early silent loader exit — not yet pinned, because the loader's `serial()` diagnostics are release-suppressed). This is **distinct** from the Phase 95 eager-load cost A.2 fixed. The required next step is a run with loader-serial enabled + a demand-fill enter/block trace to localize the exact wedge (a tracked Phase-95b follow-up).
+
 **Acceptance:**
-- [ ] On m3OS, `rustc --version` reports 1.96.0 and `rustc --print sysroot` resolves under `/usr` (both complete, no timeout).
-- [ ] `rustc /usr/src/hello.rs -o /tmp/hello` compiles + links via the bundled `rust-lld` (no absent-`cc`/`ld` error), `/tmp/hello` prints `RUSTC_OK`, no proc-macros in the dependency graph.
-- [ ] `rustc-smoke` PASSES end-to-end under `M3OS_RUST_REGRESSION=1` (skip-with-reason still applies when the host toolchain is absent).
+- [ ] **BLOCKED** — On m3OS, `rustc --version` does not complete (rustc blocks in the kernel loading the 162 MB `librustc_driver.so`). `rustc --print sysroot` / `rustc hello.rs` → `RUSTC_OK` are gated behind it.
+- [ ] **BLOCKED** — `rustc /usr/src/hello.rs` → `RUSTC_OK`.
+- [ ] **BLOCKED** — `rustc-smoke` PASSES end-to-end. *(The gate scaffold + the rust/musl `.m3pkg` bundling from Phase 95 are reused unchanged; `pkg install rust` succeeds on-device.)*
 
 ---
 

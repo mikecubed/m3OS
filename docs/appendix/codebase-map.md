@@ -177,6 +177,7 @@ Read the relevant doc before making significant changes to that subsystem.
 | `docs/93-dynamic-c-runtime.md` | Before touching `userspace/ld-musl-x86_64.so.1/` (the Rust loader), `ports/lib/musl/` (the companion `libc.so`), `ports/lib/libffi/`, `ports/lang/python-dynamic/`, or the kernel `mremap`/`arch_prctl` paths a dynamic libc exercises |
 | `docs/94-rust-cargo-uutils.md` | Before touching `build_uutils` in `xtask/src/port_build.rs`, the `ports/util/coreutils/Portfile`, the `x86_64-unknown-linux-musl` Rust musl port class, or the `pkg-format` symlink round-trip |
 | `docs/95-native-rust-toolchain.md` | Before touching `build_rust` in `xtask/src/port_build.rs`, the `ports/lang/rust/Portfile`, the userspace Rust sysroot/target + bundled `rust-lld`, the `M3OS_WITH_RUST` bundling, or `cmd_rustc_smoke` |
+| `docs/95b-on-device-rustc.md` | Before touching the `ld-musl` loader's per-DSO load path (`userspace/ld-musl-x86_64.so.1/src/main.rs` `load_dso`/`load_dso_impl`), the kernel lazy file-backed mmap (`MAP_LAZY_FILE`, `sys_mmap_file_backed`), the page-fault demand-fill (`demand_map_vma_page` / `demand_map_user_page_from_buf_locked` / `shared_vma_demand_file` / `demand_read_file_page`), or the demand-fault TLB-shootdown skip |
 | `docs/19-signal-handlers.md` | Before touching signal delivery |
 | `docs/22-tty-terminal.md` | Before touching TTY/terminal subsystem |
 | `docs/25-smp.md` | Before touching SMP or multi-core code |
