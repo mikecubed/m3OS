@@ -90,13 +90,44 @@ existing C/musl DSO keeps working — `dynamic-hello-smoke` is the regression gu
 
 **Confidence + caveat.** This is a textbook glibc-vs-musl loader divergence and the
 symptom (raw null deref, no panic, fixed offset in a Rust shared object, early
-startup) fits. BUT it is **NOT confirmed** — no `rustc-smoke` was run this session
-(the install + cold-load is ~90 min under KVM, outside the session's validation
-envelope). **Next step: run `rustc-smoke` and check whether `rustc --version` now
-gets past the CR2=0.** If it does → milestone candidate. If it still CR2=0s at the
-same offset, fall back to the offline-disassembly path below; an `fs:`-prefixed
-faulting instruction means it's TLS (hypothesis 2/3), a plain `mov reg,[reg]` means a
-different non-arg null.
+startup) fits.
+
+## UPDATE 2026-06-23 (later): rustc-smoke RAN — the CR2=0 crash is CLEARED; new wall is cold-load PERF
+
+A full `M3OS_KVM=1 cargo xtask rustc-smoke --timeout 5400` was run on this branch
+(`97ea3e89`). Result: **`pkg install rust` PASSED** (~8 min — the 95c VFS work +
+KVM; far under the old ~40-min estimate), and **`rustc --version` no longer
+crashes**: across the full 1500s step-16 window the guest emitted **zero** crash
+markers (no `page fault`, no `addr=0x0`, no `process killed`, no `CR2`, no `PANIC`)
+and QEMU stayed **CPU-bound at ~110%** the entire time. Pre-fix, rustc died in
+*seconds* (early-startup null deref) and the box idled; post-fix it executes for
+25 min straight. **The init-array `(argc,argv,envp)` fix (cdb48a11) cleared the
+CR2=0** — strong evidence (sustained execution past the early-crash point + no
+fault markers), though not a positive `version 1.96.0` print.
+
+`rustc-smoke` still FAILS — but the failure mode changed from a **crash** to a
+**timeout**: `rustc --version` did not finish printing `rustc 1.96.0` within the
+1500s budget. The binding constraint is now the **cold-load / relocation /
+LLVM-static-init cost of the 162 MB `librustc_driver.so`** (CPU- + page-fault-bound),
+not a correctness bug. The wall moved from a hard blocker to a performance problem.
+
+**Next steps (perf, not correctness):**
+1. **Confirm slow-but-correct vs. pathology**: re-run with a much larger step-16
+   timeout (e.g. 3600s) — does `rustc --version` EVER complete? If yes → purely
+   perf; if no even at 60 min → a load-time pathology (O(n²) reloc loop, demand-page
+   thrash, or a livelock) to localize.
+2. **Localize the cost**: the `ldso` `serial()` is release-suppressed — build the
+   loader with logging (or a debug profile) to time relocation vs. demand-paging vs.
+   LLVM init; or re-enable the timer-ISR RIP sampler the prior session used.
+3. **Levers** (see `docs/roadmap/tasks/95c-vfs-block-io-perf-tasks.md`): **Track B
+   kernel file-backed page cache** (zero-IPC re-fault / second-invocation / shared
+   `rust`+`rust-lld` pages — the milestone's biggest lever), loader relocation
+   throughput (`R_X86_64_RELATIVE` batching / `DT_RELR`), and a larger demand-fault
+   readahead cluster for the linear reloc sweep.
+
+(If a future run DOES regress to a hard crash, the original CR2=0 caveat applies —
+fall back to the offline-disasm path below; `fs:` prefix ⇒ TLS, plain `mov` ⇒ a
+different non-arg null.)
 
 ## Hypotheses for the remaining `CR2=0` (ranked)
 
