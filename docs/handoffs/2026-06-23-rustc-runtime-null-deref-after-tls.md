@@ -160,6 +160,39 @@ LLVM executes (rip `0x40002xxx`), THEN the libc.so null-deref. So rustc reaches 
 execution — this is a real null-deref ~16 MiB in, **not** a slow-load/throughput
 problem (only ~16 MiB paged before the crash).
 
+## NEXT BLOCKER (root-caused, disassembled): `__copy_tls` `td=0` — zero `libc.tls_*` globals
+
+After the `__libc.auxv` fix, rustc runs ~2× further and hits a **WRITE to `addr=0x8`** at
+`libc.so+0x1df09` = `mov %r13,0x8(%r12)` = `td->dtv = dtv` in musl's **`__copy_tls`**
+(`src/env/__init_tls.c`), with `td == 0`. `__copy_tls` computes
+`td = (mem + libc.tls_size − 0xc8) & −libc.tls_align`; with `libc.tls_size`,
+`tls_align`, `tls_head`, `tls_cnt` (globals at `0xaf8d0/d8/e0/e8`) all **ZERO**,
+`td = 0` → the `->dtv` store faults at `0x8`.
+
+**Why:** the app's `crt1 _start → __libc_start_main → __init_libc → __init_tls →
+static_init_tls → __copy_tls` runs musl's own static TLS setup. In real musl-dynamic
+the linker (`dynlink.c`, part of the ld.so) BOTH (a) populates `libc.tls_*` and
+(b) provides a strong **no-op `__init_tls`** that overrides the static one — so the
+app's `__init_libc → __init_tls` does nothing. The m3OS loader REPLACED the ld.so
+(no `dynlink.c` compiled into the shared `libc.so`), so `libc.so` keeps the **static**
+`__init_tls` AND the `libc.tls_*` globals stay zero. rustc is the first program whose
+`__init_tls` actually reaches `__copy_tls` (it has static TLS the trivial test
+programs lack — hence `dynamic-hello`/`dynamic-python` don't hit it).
+
+**FIX (mirror musl's `dynlink.c` for the shared `libc.so` — which serves ONLY
+loader-driven dynamic programs; the static git/python use a separate musl toolchain
+so this is isolated):**
+1. **No-op `__init_tls`** in the musl port (patch `0004`): the loader already builds
+   the TCB/DTV (`setup_static_tls` + `__init_tp`), so the app's `__init_tls` must do
+   nothing. Smallest fix; fixes the MAIN thread. May suffice for `rustc --version`
+   (likely single-threaded).
+2. **(If rustc spawns threads)** ALSO populate `libc.tls_head/tls_size/tls_align/
+   tls_cnt` from the loader (it computed the TLS layout in `setup_static_tls`;
+   `total_off` etc.) so `pthread_create`'s own `__copy_tls` has valid globals — else
+   new threads crash the same way. This is the complete `dynlink.c` mirror.
+
+---
+
 ## ROOT CAUSE (disassembled + verified): `__libc.auxv` is NULL → mallocng first-malloc crash
 
 Disassembly of `libc.so` (musl 1.2.5, `target/port-stage/musl/usr/lib/libc.so`) at
