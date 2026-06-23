@@ -1,4 +1,16 @@
 ---
+status: OPEN — FIRST null-deref FIXED + validated; rustc now 2× further, hits the
+  NEXT one. The `__libc.auxv` NULL-deref at `libc.so+0x28188` is FIXED (loader calls
+  the new exported `__m3os_set_auxv(envp)` before constructors; musl patch `0003`).
+  VALIDATED: on `rustc-smoke` rustc went from the old crash at ~16 MiB
+  (`demand_pages≈4115`) to **~36 MiB (`demand_pages≈9126`)** and the `addr=0x0` READ
+  crash is GONE. It now hits a DIFFERENT crash — a **WRITE to `addr=0x8`**
+  (`CAUSED_BY_WRITE|USER_MODE`) at `rip=0x200a1f9f09` = **`libc.so+0x1df09`** (right by
+  `__init_libc`) — almost certainly the next uninitialized runtime global / the app's
+  `__libc_start_main → __init_libc → __init_tls` path (which rustc now reaches) writing
+  through a null at +8. Disassembly of `0x1df09` in progress; iterative dynamic-runtime
+  bring-up (each fixed global reveals the next, as with `0001`/`0002`/`0003`).
+  ---PRE-FIX-STATUS-BELOW (historical)---
 status: OPEN — crash LOCALIZED to `libc.so + 0x28188`; the original `CR2=0` is NOT
   fixed (CORRECTION below). `rustc` loads + runs LLVM (paged ~16 MiB) then NULL-derefs
   (`addr=0x0`, USER_MODE) at userspace rip `0x200a204188` = **`libc.so` vaddr

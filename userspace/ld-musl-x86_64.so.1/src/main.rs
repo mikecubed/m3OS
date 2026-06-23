@@ -2894,6 +2894,32 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
         store_startup_args(argc, argv, envp);
     }
 
+    // -- Phase 95b: populate `__libc.auxv` BEFORE constructors run -----------
+    // In a dynamic process musl's own ld.so (`__dls3`) calls `__init_libc` to set
+    // `__libc.auxv` (+ `page_size`) from the startup auxv. THIS loader replaces
+    // the ld.so AND runs DSO constructors (`run_constructors`) before the app's
+    // `crt1 _start → __libc_start_main → __init_libc`. So the FIRST `malloc` from
+    // a constructor (e.g. `librustc_driver`'s LLVM static ctors) reaches mallocng's
+    // secret-init, which walks `__libc.auxv` for `AT_RANDOM` — and with `auxv`
+    // still NULL it faults at `libc.so+0x28188` (the on-device `rustc` crash;
+    // `dynamic-hello` is unaffected because ITS malloc is in `main`, after
+    // `__init_libc`). `__m3os_set_auxv(envp)` (musl patch 0003) sets `auxv` +
+    // `page_size` only — no TLS / no SSP — so it is idempotent and safe to precede
+    // the app's own `__init_libc`. Skip gracefully if the symbol is absent
+    // (un-patched libc): trivial dynamic programs keep working exactly as before.
+    {
+        let (_argc, _argv, envp) = startup_args();
+        if let Some(addr) = unsafe { sym::lookup(dsos.as_slice(), b"__m3os_set_auxv", None) }
+            && addr != 0
+        {
+            // SAFETY: `void __m3os_set_auxv(char **envp)`; `envp` points into the
+            // kernel-built initial stack, valid for the process lifetime.
+            let f: extern "C" fn(*const *const u8) =
+                unsafe { core::mem::transmute::<u64, extern "C" fn(*const *const u8)>(addr) };
+            f(envp);
+        }
+    }
+
     // -- Run constructors deepest-first -------------------------------------
     // NOTE: these run with a *zero* stack canary. musl randomizes the canary
     // (`%fs:0x28`) in `__init_ssp`, which runs from the program's
