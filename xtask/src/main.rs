@@ -23201,6 +23201,17 @@ fn cmd_rustc_smoke(args: &SmokeBootArgs) {
     // (paired with rustc_smoke_steps() skipping the install) for kernel-fix iteration.
     let fast_iter = std::env::var("M3OS_RUST_FAST_ITER").is_ok();
     let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    // The rust toolchain is a ~484 MiB `.m3pkg` that installs ~484 MiB of files —
+    // both live on the data disk simultaneously (the `.m3pkg` in `/usr/pkg`, the
+    // install under `/usr`), on top of the bundled base packages. A 1 GiB disk
+    // ENOSPCs mid-install (~330 MiB written), so size it to ~3 GiB unless the
+    // caller already pinned `M3OS_DATA_DISK_GB`. SAFETY: xtask is single-threaded
+    // here; `set_var` is `unsafe` in edition 2024.
+    if std::env::var("M3OS_DATA_DISK_GB").is_err() {
+        unsafe {
+            std::env::set_var("M3OS_DATA_DISK_GB", "3");
+        }
+    }
     if fast_iter && disk_img.exists() {
         println!("rustc-smoke: M3OS_RUST_FAST_ITER — reusing existing disk (skipping install)");
     } else {
@@ -24308,16 +24319,30 @@ fn create_data_disk(
     let disk_path = output_dir.join("disk.img");
     // Phase 36: increased from 128 MB to 1 GB to support the expanded persistent
     // storage requirements for filesystem stress testing and larger workloads.
-    const DISK_SIZE: u64 = 1024 * 1024 * 1024; // 1 GB
+    //
+    // Phase 95c: `M3OS_DATA_DISK_GB` overrides the default 1 GiB. A multi-hundred-MB
+    // package install needs the `.m3pkg` on disk (in `/usr/pkg`) AND the extracted
+    // files AND the base system simultaneously — e.g. the rust toolchain is a
+    // ~484 MiB `.m3pkg` that installs ~484 MiB of files, so `rustc-smoke` requests
+    // ~3 GiB (a 1 GiB disk ENOSPCs mid-install after ~330 MiB written). Clamped to
+    // [1, 64] GiB (well within the u32 sector count below).
+    let disk_size: u64 = {
+        let gb = std::env::var("M3OS_DATA_DISK_GB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1)
+            .clamp(1, 64);
+        gb * 1024 * 1024 * 1024
+    };
     if disk_path.exists() {
         let meta = std::fs::metadata(&disk_path).ok();
         let size = meta.map(|m| m.len()).unwrap_or(0);
-        if size < DISK_SIZE {
+        if size < disk_size {
             println!(
                 "WARNING: existing data disk is {} MB but {} MB is expected. \
                  Delete {} to recreate at the correct size.",
                 size / (1024 * 1024),
-                DISK_SIZE / (1024 * 1024),
+                disk_size / (1024 * 1024),
                 disk_path.display()
             );
         }
@@ -24358,7 +24383,7 @@ fn create_data_disk(
 
     const SECTOR_SIZE: u64 = 512;
     const PARTITION_START_LBA: u32 = 2048; // 1 MB offset
-    let total_sectors = (DISK_SIZE / SECTOR_SIZE) as u32;
+    let total_sectors = (disk_size / SECTOR_SIZE) as u32;
     let partition_sectors = total_sectors - PARTITION_START_LBA;
     let partition_offset = PARTITION_START_LBA as u64 * SECTOR_SIZE;
     let partition_size = partition_sectors as u64 * SECTOR_SIZE;
@@ -24374,7 +24399,7 @@ fn create_data_disk(
             eprintln!("Error: failed to create disk.img: {e}");
             std::process::exit(1);
         });
-    disk_file.set_len(DISK_SIZE).unwrap_or_else(|e| {
+    disk_file.set_len(disk_size).unwrap_or_else(|e| {
         eprintln!("Error: failed to set disk.img size: {e}");
         std::process::exit(1);
     });
