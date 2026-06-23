@@ -82,6 +82,14 @@ fn program_main(_args: &[&str]) -> i32 {
     let n_bytes = PAYLOAD_BYTES as u64;
     print_kv("VFS_THRPUT:bytes=", n_bytes);
 
+    // Ensure the parent dir exists on a FRESH data disk (the gate recreates the
+    // disk for reproducible deltas, and `/usr/local` is only staged when ports
+    // are installed). Mirrors the `pkg` installer's mkdir-each-component pattern;
+    // `open(O_CREAT)` cannot create a missing parent, so a bare open would ENOENT
+    // on a clean disk. Errors (incl. EEXIST) are ignored — the open is the gate.
+    let _ = syscall_lib::mkdir(b"/usr\0", 0o755);
+    let _ = syscall_lib::mkdir(b"/usr/local\0", 0o755);
+
     let flags = syscall_lib::O_WRONLY | syscall_lib::O_CREAT | syscall_lib::O_TRUNC;
     let fd = syscall_lib::open(PROBE_PATH, flags, 0o644);
     if (fd as i64) < 0 {

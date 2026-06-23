@@ -20557,59 +20557,81 @@ fn vfs_bulkio_smoke_steps(pkg: &'static str) -> Vec<SmokeStep> {
 // Phase 95c Track E.1 — `cargo xtask vfs-throughput-smoke`
 // ---------------------------------------------------------------------------
 
-/// Generous ceiling for `write_calls_delta` / `read_calls_delta` from a
-/// `PAYLOAD_BYTES`-sized sequential write + read through the ring-3 VFS.
+/// Device-block-op count if the VFS regressed to per-4 KiB-block round-trips for
+/// `n_bytes` (the failure mode these ceilings guard against): `n_bytes / 4096`.
+fn vfs_thrput_per_block(n_bytes: u64) -> u64 {
+    n_bytes / 4096
+}
+
+/// Ceilings for `write_calls_delta` / `read_calls_delta` from a `PAYLOAD_BYTES`-sized
+/// sequential write + read-back through the ring-3 VFS, as counted by `/proc/blkstats`
+/// (DEVICE block ops: `vfs_server` → virtio, NOT the kernel↔server IPC count).
 ///
-/// The probe writes and reads in 256 KiB chunks; at 4 KiB blocks that is 64
-/// blocks per chunk.  The VFS coalesces those into one `write_sectors` /
-/// `read_sectors` call per contiguous run, so the tight lower bound is
-/// `n_bytes / (256*1024)`.  We add a generous slack (`+64`) to absorb
-/// metadata writes (allocation bitmap, inode) without making the test
-/// brittle.  This ceiling is deliberately loose — it catches regressions
-/// back to per-block round-trips (which would produce `n_bytes / 4096`
-/// calls, roughly 64× more) while staying stable across minor VFS changes.
+/// MEASURED BASELINE (fresh data disk, 8 MiB payload, plain TCG): `write_calls_delta`
+/// ≈ 649, `read_calls_delta` ≈ 134. The write count is dominated by ext2 metadata —
+/// the inode, the block/inode-allocation bitmaps, and the single/double-indirect
+/// blocks for a ~2048-block file — written alongside the data runs; the read-back
+/// touches far less metadata, hence the large write/read asymmetry.
 ///
-/// # Example
-/// 8 MiB payload → 32 data chunks + 64 slack = 96 max calls.
-/// Per-block regression would produce 8*1024*1024/4096 = 2048 calls, which
-/// is far above 96 and would trip the gate.
-pub fn vfs_thrput_ceiling(n_bytes: u64) -> u64 {
-    n_bytes / (256 * 1024) + 64
+/// The regression these guard against is a collapse to PER-BLOCK round-trips
+/// (`vfs_thrput_per_block` ≈ 2048 for 8 MiB, plus metadata). The ceilings sit with
+/// comfortable headroom over the measured baseline — so a noisy boot's background
+/// block ops between the probe's `/proc/blkstats` snapshots do not flake this opt-in
+/// gate — yet well under the per-block regression, and scale with payload size:
+///   - write: 3/4 of the per-block count (8 MiB → 1536; baseline 649 ⇒ ~2.4× headroom)
+///   - read:  1/2 of the per-block count (8 MiB → 1024; baseline 134 ⇒ ~7.6× headroom)
+/// A per-block regression (≥ 2048) trips both. The earlier `n/(256*1024)+64` = 96
+/// ceiling was a mis-model (it counted 256 KiB IPC chunks, not device block ops) and
+/// is replaced here by the empirically-anchored values.
+pub fn vfs_thrput_write_ceiling(n_bytes: u64) -> u64 {
+    vfs_thrput_per_block(n_bytes) * 3 / 4
+}
+
+/// Read-side ceiling — see [`vfs_thrput_write_ceiling`]. Half the per-block count.
+pub fn vfs_thrput_read_ceiling(n_bytes: u64) -> u64 {
+    vfs_thrput_per_block(n_bytes) / 2
 }
 
 #[cfg(test)]
 mod vfs_thrput_tests {
-    use super::vfs_thrput_ceiling;
+    use super::{vfs_thrput_per_block, vfs_thrput_read_ceiling, vfs_thrput_write_ceiling};
+
+    const MIB8: u64 = 8 * 1024 * 1024;
 
     #[test]
-    fn ceiling_8mib() {
-        // 8 MiB → 32 chunks + 64 slack = 96.
-        assert_eq!(vfs_thrput_ceiling(8 * 1024 * 1024), 96);
+    fn ceilings_8mib() {
+        // 8 MiB → per-block = 2048; write ceiling = 3/4 = 1536, read ceiling = 1/2 = 1024.
+        assert_eq!(vfs_thrput_per_block(MIB8), 2048);
+        assert_eq!(vfs_thrput_write_ceiling(MIB8), 1536);
+        assert_eq!(vfs_thrput_read_ceiling(MIB8), 1024);
     }
 
     #[test]
-    fn ceiling_zero() {
-        // 0 bytes → only the slack term.
-        assert_eq!(vfs_thrput_ceiling(0), 64);
-    }
-
-    #[test]
-    fn ceiling_1mib() {
-        // 1 MiB → 4 chunks + 64 slack = 68.
-        assert_eq!(vfs_thrput_ceiling(1024 * 1024), 68);
-    }
-
-    #[test]
-    fn per_block_regression_fails() {
-        // A per-block regression would produce n_bytes/4096 calls.
-        // Verify that per-block call count exceeds the ceiling, i.e. the
-        // gate would catch the regression.
-        let n: u64 = 8 * 1024 * 1024;
-        let per_block_calls = n / 4096; // 2048
-        let ceiling = vfs_thrput_ceiling(n); // 96
+    fn ceilings_clear_measured_baseline() {
+        // Measured baseline (fresh disk, 8 MiB): write ≈ 649, read ≈ 134. Both must
+        // pass with headroom so a noisy boot does not flake the opt-in gate.
         assert!(
-            per_block_calls > ceiling,
-            "per-block call count {per_block_calls} should exceed ceiling {ceiling}"
+            vfs_thrput_write_ceiling(MIB8) > 649,
+            "write ceiling must clear the ~649 measured baseline"
+        );
+        assert!(
+            vfs_thrput_read_ceiling(MIB8) > 134,
+            "read ceiling must clear the ~134 measured baseline"
+        );
+    }
+
+    #[test]
+    fn per_block_regression_trips_both() {
+        // A collapse to per-block round-trips (~2048 for 8 MiB) exceeds both ceilings,
+        // i.e. the gate would catch the regression it is designed for.
+        let per_block = vfs_thrput_per_block(MIB8); // 2048
+        assert!(
+            per_block > vfs_thrput_write_ceiling(MIB8),
+            "per-block {per_block} should exceed the write ceiling"
+        );
+        assert!(
+            per_block > vfs_thrput_read_ceiling(MIB8),
+            "per-block {per_block} should exceed the read ceiling"
         );
     }
 }
@@ -20627,15 +20649,16 @@ mod vfs_thrput_tests {
 ///
 /// Parses the sentinels from the serial transcript and asserts:
 ///   - `verify=ok` (content round-tripped correctly),
-///   - `write_calls_delta ≤ vfs_thrput_ceiling(PAYLOAD_BYTES)`,
-///   - `read_calls_delta ≤ vfs_thrput_ceiling(PAYLOAD_BYTES)`.
+///   - `write_calls_delta ≤ vfs_thrput_write_ceiling(PAYLOAD_BYTES)`,
+///   - `read_calls_delta ≤ vfs_thrput_read_ceiling(PAYLOAD_BYTES)`.
 ///
 /// Opt-in: gated by `M3OS_VFS_THROUGHPUT_REGRESSION=1` in `.githooks/pre-push`.
 fn cmd_vfs_throughput_smoke(args: &SmokeBootArgs) {
     /// Payload the probe writes/reads (must match `PAYLOAD_BYTES` in the binary).
     const PAYLOAD_BYTES: u64 = 8 * 1024 * 1024;
 
-    let ceiling = vfs_thrput_ceiling(PAYLOAD_BYTES);
+    let write_ceiling = vfs_thrput_write_ceiling(PAYLOAD_BYTES);
+    let read_ceiling = vfs_thrput_read_ceiling(PAYLOAD_BYTES);
 
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
@@ -20679,11 +20702,12 @@ fn cmd_vfs_throughput_smoke(args: &SmokeBootArgs) {
     let steps = vfs_throughput_smoke_steps();
     println!(
         "vfs-throughput-smoke: launching QEMU (timeout {}s, {} steps; \
-         payload={} MiB, ceiling={} calls)",
+         payload={} MiB, write_ceiling={} read_ceiling={} calls)",
         args.timeout_secs,
         steps.len(),
         PAYLOAD_BYTES / (1024 * 1024),
-        ceiling,
+        write_ceiling,
+        read_ceiling,
     );
 
     let mut child = Command::new("qemu-system-x86_64")
@@ -20755,24 +20779,25 @@ fn cmd_vfs_throughput_smoke(args: &SmokeBootArgs) {
 
     println!(
         "vfs-throughput-smoke: probe completed — \
-         write_calls_delta={wd} read_calls_delta={rd} (ceiling={ceiling})"
+         write_calls_delta={wd} (ceiling {write_ceiling}) \
+         read_calls_delta={rd} (ceiling {read_ceiling})"
     );
 
-    if wd > ceiling {
+    if wd > write_ceiling {
         eprintln!(
-            "vfs-throughput-smoke: FAILED — write_calls_delta {wd} exceeds ceiling {ceiling}; \
-             a regression to per-block VFS round-trips would produce ~{} calls for an 8 MiB \
-             payload.  Check vfs_server write coalescing / 64 KiB write cap / \
+            "vfs-throughput-smoke: FAILED — write_calls_delta {wd} exceeds write ceiling \
+             {write_ceiling}; a regression to per-block VFS round-trips would produce ~{} calls \
+             for an 8 MiB payload.  Check vfs_server write coalescing / write cap / \
              multi-block allocation.",
             PAYLOAD_BYTES / 4096,
         );
         std::process::exit(SMOKE_EXIT_VFS_THROUGHPUT_FAILED);
     }
-    if rd > ceiling {
+    if rd > read_ceiling {
         eprintln!(
-            "vfs-throughput-smoke: FAILED — read_calls_delta {rd} exceeds ceiling {ceiling}; \
-             a regression to per-block VFS round-trips would produce ~{} calls for an 8 MiB \
-             payload.  Check vfs_server read coalescing / 64 KiB read cap / \
+            "vfs-throughput-smoke: FAILED — read_calls_delta {rd} exceeds read ceiling \
+             {read_ceiling}; a regression to per-block VFS round-trips would produce ~{} calls \
+             for an 8 MiB payload.  Check vfs_server read coalescing / read cap / \
              contiguous-run batching.",
             PAYLOAD_BYTES / 4096,
         );
@@ -20781,7 +20806,8 @@ fn cmd_vfs_throughput_smoke(args: &SmokeBootArgs) {
 
     println!(
         "vfs-throughput-smoke: PASSED — verify=ok, \
-         write_calls_delta={wd} read_calls_delta={rd} ≤ ceiling={ceiling} in {elapsed}s"
+         write_calls_delta={wd} ≤ {write_ceiling}, read_calls_delta={rd} ≤ {read_ceiling} \
+         in {elapsed}s"
     );
 }
 
