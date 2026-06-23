@@ -868,10 +868,17 @@ fn create_irq_notification(task_id: crate::task::TaskId, irq: u64) -> u64 {
 /// Raising it further is safe in principle but consumers'
 /// `bulk_buf: Vec<u8>` reservations need to track in lockstep
 /// (`display_server::client::MAX_BULK_BYTES`,
-/// `kernel_core::display::protocol::MAX_FRAME_BODY_LEN`). 81920 leaves
-/// 16 KiB headroom over the 64 KiB PCM submit payload so future
-/// driver protocols can grow without re-bumping this constant.
-const MAX_BULK_LEN: usize = 81920;
+/// `kernel_core::display::protocol::MAX_FRAME_BODY_LEN`) — though only a
+/// receiver that *expects* to read up to this ceiling needs to; each receiver
+/// caps at its own buffer regardless. Per-call allocs are sized to the actual
+/// payload, so this only changes the ceiling.
+///
+/// Phase 95c (Area A.2) — raised 80 KiB → 512 KiB so the 256 KiB
+/// `VFS_MAX_PREAD`/`VFS_MAX_PWRITE` clusters (path + data) fit: ~4x fewer IPC
+/// round-trips on the install + cold-load VFS paths. `vfs_server`'s `recv_buf`
+/// (`MAX_BULK_BUF = VFS_MAX_PWRITE = 256 KiB`) tracks it; display/audio keep
+/// their own smaller caps and are unaffected.
+const MAX_BULK_LEN: usize = 512 * 1024;
 
 /// Send (or call) with an attached bulk-data buffer.
 ///

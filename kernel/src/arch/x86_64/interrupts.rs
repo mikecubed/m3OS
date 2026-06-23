@@ -814,11 +814,14 @@ fn demand_map_vma_page(vaddr: u64, require_write: bool) -> bool {
         }
         // Readahead: fill a cluster of up to 64 KiB forward from the faulting
         // page in ONE backing-file read, then map every page in the cluster.
-        // A bare per-page fill costs one blocking vfs IPC per 4 KiB; loading a
-        // 162 MB DSO whose relocation/startup touches a large, mostly-sequential
-        // working set then becomes thousands of round-trips. A 64 KiB cluster
-        // (= `VFS_MAX_PREAD`, one IPC) amortises that ~16x — the same bulk-read
-        // efficiency the eager path had, but only for pages actually touched.
+        // A bare per-page fill costs one blocking vfs IPC per 4 KiB; a 64 KiB
+        // cluster (16 pages) amortises that ~16x. Kept MODERATE on purpose: the
+        // demand-fault access pattern of a loader (relocation, symbol resolution)
+        // is partly *sparse*, so a much larger cluster over-reads — dragging in
+        // dozens of untouched pages per scattered touch and making a small DSO
+        // *slower*, not faster (measured: a 256 KiB cluster regressed
+        // dynamic-hello). The 256 KiB `VFS_MAX_PREAD` cap (Phase 95c Area A.2) is
+        // for the *sequential* install reads, where over-read is a non-issue.
         const CLUSTER: u64 = 64 * 1024;
         let page_base = vaddr & !0xFFF;
         let cluster_end = (page_base + CLUSTER).min(vma_end);
