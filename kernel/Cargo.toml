@@ -57,6 +57,15 @@ smep-smap-test = []
 # fault → SIGSEGV the offending process, core keeps running, no machine halt).
 # Absent in production (the syscall returns ENOSYS). Driven by `kstack-overflow-smoke`.
 kstack-overflow-test = []
+# Cold-load profiling diagnostic (docs/handoffs/2026-06-23-rustc-runtime-null-deref-after-tls.md).
+# Localizes where a large dynamic binary's cold-load time goes (e.g. the on-device
+# `rustc` loading the 162 MB librustc_driver.so): a per-file-backed-page DEMAND_PAGES
+# counter + a timer-ISR user-RIP sampler, emitting a rate-limited `[prof]` line via
+# the deadlock-safe try-lock serial path. DEMAND_PAGES climbing the whole run ⇒
+# paging/throughput-bound; plateau + advancing ticks ⇒ execution-bound (LLVM
+# static-init / relocation CPU). Default OFF (zero residue in production). Run with:
+#   M3OS_KERNEL_FEATURES=rustc-profile cargo xtask rustc-smoke
+rustc-profile = []
 # When `sched-trace` is enabled, every block/wake/scan state transition
 # emits a structured SchedTrace entry into the per-core trace ring (Phase 43b).
 # Default OFF — zero runtime overhead in production builds.

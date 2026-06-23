@@ -1,4 +1,18 @@
 ---
+status: OPEN — crash LOCALIZED to `libc.so + 0x28188`; the original `CR2=0` is NOT
+  fixed (CORRECTION below). `rustc` loads + runs LLVM (paged ~16 MiB) then NULL-derefs
+  (`addr=0x0`, USER_MODE) at userspace rip `0x200a204188` = **`libc.so` vaddr
+  `0x28188`** — the SAME rip the original diagnosis recorded (mis-attributed then to
+  `librustc_driver.so`; with runtime bases `libc.so=0x200a1dc000` /
+  `librustc_driver=0x2000010000`, the rip is in `libc.so`). CORRECTION: the loader
+  init-array `(argc,argv,envp)` fix (`cdb48a11`, glibc-ABI) did NOT clear this crash;
+  the earlier "cleared" claim was a MEASUREMENT ERROR — the rustc-smoke cargo log
+  carries NO guest serial unless `M3OS_SMOKE_SERIAL_DUMP` is set, so the
+  `process killed` line was invisible and the ~25-min CPU-bound time was the headless
+  GUI servers busy-looping AFTER rustc died, not rustc running. The init-array fix is
+  still a correct glibc-ABI improvement (keep it; rustc now reaches LLVM before
+  crashing) but is necessary-not-sufficient. NEXT: disassemble `libc.so+0x28188`
+  (`fs:` TLS access vs plain null) — in progress. ---OLD-STATUS-BELOW---
 status: OPEN — root cause NOT yet confirmed, but a NEW high-confidence CANDIDATE FIX
   has landed and needs a `rustc-smoke` run to confirm. The on-device `rustc`
   (Phase 95b RUSTC_OK milestone) cold-loads + relocates + executes
@@ -92,42 +106,101 @@ existing C/musl DSO keeps working — `dynamic-hello-smoke` is the regression gu
 symptom (raw null deref, no panic, fixed offset in a Rust shared object, early
 startup) fits.
 
-## UPDATE 2026-06-23 (later): rustc-smoke RAN — the CR2=0 crash is CLEARED; new wall is cold-load PERF
+## UPDATE 2026-06-23 (latest): crash LOCALIZED to `libc.so+0x28188` — and the "CLEARED" claim was WRONG
 
-A full `M3OS_KVM=1 cargo xtask rustc-smoke --timeout 5400` was run on this branch
-(`97ea3e89`). Result: **`pkg install rust` PASSED** (~8 min — the 95c VFS work +
-KVM; far under the old ~40-min estimate), and **`rustc --version` no longer
-crashes**: across the full 1500s step-16 window the guest emitted **zero** crash
-markers (no `page fault`, no `addr=0x0`, no `process killed`, no `CR2`, no `PANIC`)
-and QEMU stayed **CPU-bound at ~110%** the entire time. Pre-fix, rustc died in
-*seconds* (early-startup null deref) and the box idled; post-fix it executes for
-25 min straight. **The init-array `(argc,argv,envp)` fix (cdb48a11) cleared the
-CR2=0** — strong evidence (sustained execution past the early-crash point + no
-fault markers), though not a positive `version 1.96.0` print.
+**RETRACTION.** An interim update here claimed the init-array fix "cleared the
+CR2=0". That was a **measurement error**, now corrected. The `rustc-smoke` cargo log
+carries only the harness `[step N]` markers — it does **NOT** echo guest serial
+unless `M3OS_SMOKE_SERIAL_DUMP=<path>` is set (see `run_smoke_script` in
+`xtask/src/main.rs`; `dump_serial` writes the full history only at a terminal
+point — timeout/error/end). So grepping the cargo log for `process killed` found
+nothing because the guest serial was never there. And the "~25-min CPU-bound at
+110–366%" was the **headless GUI servers busy-looping AFTER rustc died** (the prior
+session's `READ_KBD_SCANCODE`/`FRAME_TICK_DRAIN` spin), not rustc running.
 
-`rustc-smoke` still FAILS — but the failure mode changed from a **crash** to a
-**timeout**: `rustc --version` did not finish printing `rustc 1.96.0` within the
-1500s budget. The binding constraint is now the **cold-load / relocation /
-LLVM-static-init cost of the 162 MB `librustc_driver.so`** (CPU- + page-fault-bound),
-not a correctness bug. The wall moved from a hard blocker to a performance problem.
+**How to actually see it.** Run with the serial dump and grep with `-a` (the dump
+has control bytes):
+```
+cargo xtask clean
+M3OS_SMOKE_SERIAL_DUMP=/tmp/s.txt M3OS_KERNEL_FEATURES=rustc-profile \
+  M3OS_KVM=1 cargo xtask rustc-smoke --timeout 5400 &
+# after install + a few min of rustc load, `pkill -TERM -x qemu-system-x86` to
+# force dump_serial, then:
+grep -a 'process killed\|\[pf\]\|loaded .* base=' /tmp/s.txt
+```
 
-**Next steps (perf, not correctness):**
-1. **Confirm slow-but-correct vs. pathology**: re-run with a much larger step-16
-   timeout (e.g. 3600s) — does `rustc --version` EVER complete? If yes → purely
-   perf; if no even at 60 min → a load-time pathology (O(n²) reloc loop, demand-page
-   thrash, or a livelock) to localize.
-2. **Localize the cost**: the `ldso` `serial()` is release-suppressed — build the
-   loader with logging (or a debug profile) to time relocation vs. demand-paging vs.
-   LLVM init; or re-enable the timer-ISR RIP sampler the prior session used.
-3. **Levers** (see `docs/roadmap/tasks/95c-vfs-block-io-perf-tasks.md`): **Track B
-   kernel file-backed page cache** (zero-IPC re-fault / second-invocation / shared
-   `rust`+`rust-lld` pages — the milestone's biggest lever), loader relocation
-   throughput (`R_X86_64_RELATIVE` batching / `DT_RELR`), and a larger demand-fault
-   readahead cluster for the linear reloc sweep.
+**What the dump shows (clean disk, KVM):**
+- `[int] userspace page fault: pid=43 addr=Ok(VirtAddr(0x0)) err=USER_MODE`
+  `rip=0x200a204188 — process killed`.
+- Loader bases (the loader DOES log them; they're just invisible without the dump):
+  `librustc_driver-….so base=0x2000010000 len=0xa1bc000`, `libc.so base=0x200a1dc000
+  len=0xb3000`. So **`rip 0x200a204188 = libc.so + 0x28188`** (NOT librustc_driver —
+  the original diagnosis mis-attributed it; `0x200a204188 > driver_end 0x20081cc000`).
+- The crash rip `0x200a204188` is **identical** to one the original diagnosis
+  recorded → same crash, **unchanged by the init-array fix**.
 
-(If a future run DOES regress to a hard crash, the original CR2=0 caveat applies —
-fall back to the offline-disasm path below; `fs:` prefix ⇒ TLS, plain `mov` ⇒ a
-different non-arg null.)
+**The `rustc-profile` kernel feature (added this pass; off by default, zero prod
+residue)** confirms rustc *does* run before crashing — a `[pf]` heartbeat at the #PF
+handler top (`kernel/src/arch/x86_64/interrupts.rs::rustc_prof`, every 32 faults)
+shows: ~2300 anonymous faults at loader rip `0x244cc3` (the streaming PT_LOAD
+read into anon, ~7 MiB), then `demand_pages` climbs 0→~4115 (~16 MiB file-backed) as
+LLVM executes (rip `0x40002xxx`), THEN the libc.so null-deref. So rustc reaches LLVM
+execution — this is a real null-deref ~16 MiB in, **not** a slow-load/throughput
+problem (only ~16 MiB paged before the crash).
+
+## ROOT CAUSE (disassembled + verified): `__libc.auxv` is NULL → mallocng first-malloc crash
+
+Disassembly of `libc.so` (musl 1.2.5, `target/port-stage/musl/usr/lib/libc.so`) at
+vaddr `0x28188`:
+```
+28175:  mov    0xaf8c8(%rip),%rdx     ; rdx = __libc.auxv   (the global; it is NULL)
+28188:  mov    (%rdx),%rax            ; FAULT: deref __libc.auxv == NULL  (addr 0x0)
+...     (loop scanning auxv for a_type==0x19 AT_RANDOM, 16-byte stride → memcpy 16 bytes)
+```
+- **NOT TLS** — no `fs:` prefix; a plain dereference of the global `__libc.auxv`
+  (at libc.so vaddr `0xaf8c8`; neighbour `0xaf8c3` = `__libc.secure`).
+- The faulting function is musl **mallocng's secret-init** (`get_random_secret` /
+  `alloc_meta` path, `src/malloc/mallocng/{meta.c,glue.h}`), which runs on the
+  **first `malloc`** and seeds the allocator from `AT_RANDOM`.
+- `__libc.auxv`'s ONLY writer is `__init_libc` (`0x1df89: mov %rax,0xaf8c8(%rip)`),
+  called ONLY from `__libc_start_main` (`0x1e1bc`).
+
+**Why NULL on m3OS:** for a dynamic program, `__init_libc` is the **ld.so's**
+responsibility (musl's own `__dls2`/`__dls3`), and even via `__libc_start_main` it
+runs only at app entry — but the m3OS Rust loader **replaces the ld.so and never
+calls `__init_libc`**, and it runs the DSO constructors (`run_constructors`) BEFORE
+the app's `__libc_start_main`. librustc_driver's LLVM static ctors `malloc` during
+`run_constructors` → mallocng secret-init → walk NULL `__libc.auxv` → fault.
+**Same foreign-loader-NULL-global class already patched twice** (`main_ctor_queue`
+patch `0001`, `__init_tp` un-hide patch `0002`); `__libc.auxv` is the third.
+
+**THE FIX (loader must do the ld.so's `__init_libc` job before constructors):**
+The loader already has `argc/argv/envp` (the init-array fix stashed them in
+`STARTUP_ARGV`/`STARTUP_ENVP`). Two options, ranked:
+1. **Un-hide + call `__init_libc(envp, argv[0])`** (preferred — it's the canonical
+   function; sets `auxv` + `page_size` + `secure` + `environ` + `hwcap`). Add
+   `ports/lib/musl/patches/0003-export-init-libc.patch` mirroring `0002` (drop
+   `hidden` from `__init_libc`'s decl in `src/internal/libc.h`), then in
+   `userspace/ld-musl-x86_64.so.1/src/main.rs` `sym::lookup(b"__init_libc")` and call
+   it **after `__init_tp` / `setup_static_tls`, BEFORE `run_constructors`**. RISK:
+   `__init_libc` calls `__init_tls(aux)` — verify that resolves to the **no-op weak
+   stub** in this shared libc.so (the handoff already relies on `static_init_tls`
+   being a no-op stub, so this is expected safe); if it instead redoes TLS and
+   conflicts with the loader's multi-module `setup_static_tls`, fall back to option 2.
+2. **Minimal exported setter** (lower risk): patch musl to add an exported
+   `void __m3os_set_auxv(size_t *auxv)` that sets `libc.auxv = auxv` + derives
+   `libc.page_size` from `AT_PAGESZ` (mallocng needs both), `__attribute__((visibility
+   ("default")))` so it survives `-fvisibility=hidden`; loader calls it with the auxv
+   pointer (`= envp` walked to NULL, +1). No TLS interaction.
+
+**Validation:** musl rebuild → `M3OS_WITH_RUST` image → `M3OS_SMOKE_SERIAL_DUMP=… …
+rustc-smoke` and grep `-a` for `process killed` (should be gone) + a higher
+`demand_pages` / `rustc 1.96.0`. The 95c throughput levers are NOT on the
+`RUSTC_OK` critical path — this correctness crash is the blocker.
+
+(A kernel-mode fault was also seen once — `InterruptStackFrame ip=0x10000b53f61
+rpl:Ring0` reading `0x0` — likely a secondary effect of the user crash or a
+`rustc-profile` interaction; revisit only if it recurs after the `__libc.auxv` fix.)
 
 ## Hypotheses for the remaining `CR2=0` (ranked)
 

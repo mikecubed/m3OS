@@ -762,6 +762,8 @@ fn demand_map_user_page_from_buf_locked(vaddr: u64, prot: u64, pkey: u8, buf: &[
         crate::mm::frame_allocator::free_frame(frame.start_address().as_u64());
         return false;
     }
+    #[cfg(feature = "rustc-profile")]
+    rustc_prof::note_demand_page();
     true
 }
 
@@ -1407,6 +1409,17 @@ extern "x86-interrupt" fn page_fault_handler(
 ) {
     clac_on_irq_entry();
     let addr = x86_64::registers::control::Cr2::read();
+
+    // `rustc-profile`: heartbeat at the lock-free top of the #PF handler — counts
+    // every fault + logs the running totals and faulting addr/rip every 64 faults.
+    #[cfg(feature = "rustc-profile")]
+    rustc_prof::note_fault(
+        match &addr {
+            Ok(a) => a.as_u64(),
+            Err(_) => 0,
+        },
+        stack_frame.instruction_pointer.as_u64(),
+    );
 
     // Check if the fault came from ring 3 (user mode).
     if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
@@ -2252,6 +2265,66 @@ unsafe fn check_and_preempt_user(frame: &mut PreemptTrapFrameUser, trigger: Pree
 // and `reschedule_ipi_handler_kernel` under preempt-full.  Both call
 // sites are now early-return for the kernel-mode path; see the
 // post-mortem at `docs/post-mortems/2026-05-07-57e-preempt-full-deferred.md`.
+
+// ---------------------------------------------------------------------------
+// `rustc-profile` — opt-in cold-load diagnostic (feature-gated; off by default).
+//
+// Localizes where a large dynamic binary spends its cold-load time (the on-device
+// `rustc` loading the 162 MB `librustc_driver.so`): is it demand-paging-bound
+// (`DEMAND_PAGES` climbs the whole run ⇒ VFS throughput is the wall) or
+// execution-bound (`DEMAND_PAGES` plateaus while ticks keep advancing ⇒ LLVM
+// static-init / relocation CPU is the wall)? The loader's own `fd 2` serial is
+// invisible in the smoke harness, so this logs via the visible kernel serial.
+// The periodic line is emitted from the timer ISR through the deadlock-safe
+// try-lock `_panic_print` (a normal `log::info!` could re-enter `SERIAL1` on the
+// same core and spin), and fires regardless of paging so the execution-bound
+// phase is observable too. See
+// docs/handoffs/2026-06-23-rustc-runtime-null-deref-after-tls.md.
+// ---------------------------------------------------------------------------
+#[cfg(feature = "rustc-profile")]
+pub mod rustc_prof {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    /// Cumulative file-backed user pages demand-filled since boot (load progress).
+    pub static DEMAND_PAGES: AtomicU64 = AtomicU64::new(0);
+    /// Cumulative page faults seen at the top of the #PF handler (ALL kinds).
+    static FAULT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+    /// `[pf]` heartbeat cadence — one line per this many faults (low so even a
+    /// sub-2-MiB load is visible; the prior session saw rustc page < 1 MiB).
+    const LOG_EVERY_FAULTS: u64 = 32;
+
+    /// Bump the file-backed demand-page counter (called from the page-table-
+    /// LOCKED fill path — atomic increment ONLY; logging under that lock from
+    /// #PF context risks a recursive fault, so the log lives in [`note_fault`]).
+    #[inline(always)]
+    pub fn note_demand_page() {
+        DEMAND_PAGES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Heartbeat from the TOP of the page-fault handler — BEFORE any branch and
+    /// BEFORE any kernel lock is taken (the same lock-free, ring-3-fault context
+    /// CoW resolution + `log::info!` already use safely). Counts EVERY fault
+    /// regardless of which branch resolves it, and every 64 faults logs the
+    /// running fault + demand-page totals and the faulting user `addr`/`rip`.
+    /// Read the trend during `rustc --version`:
+    ///   - `[pf]` lines streaming with `demand_pages`/`addr` climbing ⇒
+    ///     **paging-bound** (per-line wall-clock × 64 ≈ the fault rate → load MB/s);
+    ///   - `[pf]` goes SILENT while rustc keeps burning CPU ⇒ **execution-bound**
+    ///     (spinning on an already-resident working set — the last `rip` is where).
+    pub fn note_fault(addr: u64, rip: u64) {
+        let n = FAULT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % LOG_EVERY_FAULTS == 0 {
+            log::info!(
+                "[pf] faults={} demand_pages={} addr={:#x} rip={:#x}",
+                n,
+                DEMAND_PAGES.load(Ordering::Relaxed),
+                addr,
+                rip,
+            );
+        }
+    }
+}
 
 /// Phase 57d Track B — timer handler, user (ring 3) path.
 ///
