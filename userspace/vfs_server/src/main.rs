@@ -32,7 +32,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::cell::{Cell, RefCell};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kernel_core::fs::ext2::{
     EXT2_DIND_BLOCK, EXT2_FT_DIR, EXT2_FT_REG_FILE, EXT2_FT_SYMLINK, EXT2_IND_BLOCK,
     EXT2_NDIR_BLOCKS, EXT2_ROOT_INO, Ext2BlockGroupDescriptor, Ext2Error, Ext2Inode,
@@ -42,10 +42,10 @@ use kernel_core::fs::mbr;
 use kernel_core::fs::vfs_protocol::{
     VFS_ACCESS_PATH, VFS_CLOSE, VFS_CREATE, VFS_CREATE_KIND_SHIFT, VFS_LINK, VFS_LIST_DIR,
     VFS_MAX_PREAD, VFS_MAX_PWRITE, VFS_MOUNT_EXT2_ROOT, VFS_MOUNT_POLICY, VFS_MOUNT_VFAT_DATA,
-    VFS_NODE_DIR, VFS_NODE_FILE, VFS_NODE_SYMLINK, VFS_OPEN, VFS_PREAD, VFS_READ, VFS_RENAME,
-    VFS_SETATTR, VFS_SETATTR_ATIME, VFS_SETATTR_GID, VFS_SETATTR_MODE, VFS_SETATTR_MTIME,
-    VFS_SETATTR_UID, VFS_STAT_PATH, VFS_STAT_REPLY_SIZE, VFS_TRUNCATE, VFS_UMOUNT_EXT2_ROOT,
-    VFS_UMOUNT_POLICY, VFS_UMOUNT_VFAT_DATA, VFS_UNLINK, VFS_WRITE,
+    VFS_NODE_DIR, VFS_NODE_FILE, VFS_NODE_SYMLINK, VFS_OPEN, VFS_PREAD, VFS_READ, VFS_READ_WINDOW,
+    VFS_RENAME, VFS_SETATTR, VFS_SETATTR_ATIME, VFS_SETATTR_GID, VFS_SETATTR_MODE,
+    VFS_SETATTR_MTIME, VFS_SETATTR_UID, VFS_STAT_PATH, VFS_STAT_REPLY_SIZE, VFS_TRUNCATE,
+    VFS_UMOUNT_EXT2_ROOT, VFS_UMOUNT_POLICY, VFS_UMOUNT_VFAT_DATA, VFS_UNLINK, VFS_WRITE,
 };
 use syscall_lib::STDOUT_FILENO;
 use syscall_lib::heap::BrkAllocator;
@@ -1852,6 +1852,29 @@ fn program_main(_args: &[&str]) -> i32 {
         return 1;
     }
 
+    // Phase 95c (Area A.1) — create + map a shared SHM "read window" and register
+    // it with the kernel as the zero-copy demand-fault read destination. On a
+    // `MAP_LAZY_FILE` fault the kernel asks us (`VFS_READ_WINDOW`) to read file
+    // bytes straight into this window, then fills the faulting frame from the
+    // window's frames via its physical map — no IPC bulk payload, no double copy.
+    // Best-effort: if any step fails the kernel never uses the window (its
+    // demand-fill falls back to the legacy IPC-bulk path), so we log and continue.
+    {
+        let shm_id = syscall_lib::shm_create(VFS_MAX_PREAD);
+        if shm_id != 0 {
+            let va = syscall_lib::shm_map(shm_id);
+            if va != 0 && syscall_lib::vfs_register_read_window(shm_id) == 0 {
+                READ_WINDOW_VA.store(va, Ordering::Release);
+                READ_WINDOW_LEN.store(VFS_MAX_PREAD as u64, Ordering::Release);
+                syscall_lib::serial_print("vfs_server: zero-copy read window registered\n");
+            } else {
+                syscall_lib::serial_print(
+                    "vfs_server: read-window setup failed (using IPC-bulk fallback)\n",
+                );
+            }
+        }
+    }
+
     // Drain deferred metadata on orderly shutdown: install a SIGTERM handler so
     // init's stop sequence flushes the superblock/BGD free-count summaries (see
     // server_loop / shutdown_flush_and_exit) before exiting. Without it, the
@@ -1875,6 +1898,11 @@ fn program_main(_args: &[&str]) -> i32 {
 /// before exiting (see `server_loop`). Async-signal-safe: the handler performs
 /// only an atomic store and never touches the block cache's `RefCell`.
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Phase 95c (Area A.1) — user VA and byte length of the mapped SHM read window
+/// (0 until registered). `handle_read_window` reads file data straight into it.
+static READ_WINDOW_VA: AtomicU64 = AtomicU64::new(0);
+static READ_WINDOW_LEN: AtomicU64 = AtomicU64::new(0);
 
 extern "C" fn sigterm_handler(_sig: i32) {
     SHUTDOWN_REQUESTED.store(true, Ordering::Release);
@@ -2036,6 +2064,7 @@ fn request_name(label: u64) -> &'static str {
     match label {
         VFS_OPEN => "OPEN",
         VFS_READ => "READ",
+        VFS_READ_WINDOW => "READ_WINDOW",
         VFS_CLOSE => "CLOSE",
         VFS_STAT_PATH => "STAT_PATH",
         VFS_LIST_DIR => "LIST_DIR",
@@ -2083,6 +2112,7 @@ fn handle_request(
     match msg.label {
         VFS_OPEN => handle_open(ext2, handles, msg, recv_buf),
         VFS_READ => handle_read(ext2, handles, msg),
+        VFS_READ_WINDOW => handle_read_window(ext2, handles, msg),
         VFS_CLOSE => handle_close(handles, msg),
         VFS_STAT_PATH => handle_stat_path(ext2, msg, recv_buf),
         VFS_LIST_DIR => handle_list_dir(ext2, msg, recv_buf),
@@ -2301,6 +2331,72 @@ fn handle_read(
     }
 
     (0, bytes_read as u64)
+}
+
+/// VFS_READ_WINDOW (Phase 95c Area A.1) — zero-copy demand-fault read. Read file
+/// data DIRECTLY into the shared SHM read window (registered at startup) instead
+/// of staging it as an IPC reply bulk; the kernel reads the window's frames via
+/// its physical map and fills the faulting frame from there, so neither the IPC
+/// bulk `Vec` nor the kernel's `take_bulk_data` copy exists on this path. The
+/// only copy is block-cache → window (the unavoidable fill), done here by the
+/// shared `kernel_core` reader writing straight into the window slice.
+///
+/// `data[0]` = handle id, `data[1]` = offset, `data[2]` = byte count. Reply
+/// `data[0]` = bytes written into the window (0 = EOF). No reply bulk.
+fn handle_read_window(
+    ext2: &Ext2State,
+    handles: &HandleTable,
+    msg: &syscall_lib::IpcMessage,
+) -> (u64, u64) {
+    let va = READ_WINDOW_VA.load(Ordering::Acquire);
+    let win_len = READ_WINDOW_LEN.load(Ordering::Acquire) as usize;
+    if va == 0 || win_len == 0 {
+        // Window not set up — the kernel should not have sent this, but fail
+        // cleanly so it can fall back rather than wedge.
+        return (NEG_EIO, 0);
+    }
+
+    let handle_id = msg.data[0];
+    let offset = msg.data[1] as usize;
+    let max_bytes = (msg.data[2] as usize).min(win_len).min(VFS_MAX_PREAD);
+
+    let handle = match handles.get(handle_id) {
+        Some(h) => h,
+        None => return (NEG_EBADF, 0),
+    };
+    let inode = match ext2.read_inode(handle.inode_num) {
+        Ok(i) => i,
+        Err(_) => return (NEG_EIO, 0),
+    };
+
+    let file_size = inode.size as u64;
+    if offset as u64 >= file_size {
+        return (0, 0); // EOF — kernel zero-fills the cluster past the extent.
+    }
+    let to_read = ((file_size - offset as u64) as usize).min(max_bytes);
+    if to_read == 0 {
+        return (0, 0);
+    }
+
+    // The window is our own mapped SHM region; read straight into it. The kernel
+    // holds the window borrow for the duration of this request (its single-window
+    // `in_use` flag), so no other reader observes a torn fill.
+    //
+    // SAFETY: `va`/`win_len` describe the SHM region we created + mapped at
+    // startup; `to_read <= win_len`, so the slice is in-bounds and exclusively
+    // ours for this request.
+    let window: &mut [u8] = unsafe { core::slice::from_raw_parts_mut(va as *mut u8, win_len) };
+    let n = match kernel_core::fs::ext2::read_file_data(
+        ext2,
+        &inode,
+        offset as u64,
+        &mut window[..to_read],
+    ) {
+        Ok(n) => n,
+        Err(_) => return (NEG_EIO, 0),
+    };
+
+    (0, n as u64)
 }
 
 // ---------------------------------------------------------------------------

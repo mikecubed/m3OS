@@ -186,6 +186,25 @@ pub const VFS_SETATTR_GID: u64 = 1 << 2;
 pub const VFS_SETATTR_ATIME: u64 = 1 << 3;
 pub const VFS_SETATTR_MTIME: u64 = 1 << 4;
 
+/// `VFS_READ_WINDOW` (Phase 95c Area A.1) — **zero-copy** demand-fault read.
+///
+/// The 95b demand-fill path staged the read reply as an IPC bulk payload
+/// (`ipc_store_reply_bulk` → a kernel `Vec` → `take_bulk_data` → a copy into the
+/// faulting frame), violating m3OS's "bulk data = page grants, never IPC
+/// payloads" rule and paying a double copy per fault. `VFS_READ_WINDOW` instead
+/// has the server read file data **directly into a shared SHM "read window"** the
+/// server creates and maps once at startup and registers with the kernel via
+/// `SYS_VFS_REGISTER_READ_WINDOW`. The kernel reads the window's frames through
+/// its physical-memory map (no IPC bulk, no `take_bulk_data`) and fills the
+/// faulting pages from there. The data crosses kernel↔server through the shared
+/// region — the idiomatic external-pager transfer — not through an IPC payload.
+///
+/// Request: `data[0]` = open-handle id; `data[1]` = file offset;
+///          `data[2]` = byte count (clamped to the window size).
+/// Reply:   `label` = 0 on success with `data[0]` = bytes written into the
+///          window (0 = EOF); negative errno in `label` on error. No reply bulk.
+pub const VFS_READ_WINDOW: u64 = 26;
+
 /// Node-kind selector encoded in `VFS_CREATE` `data[2]` bits 16..18.
 pub const VFS_CREATE_KIND_SHIFT: u32 = 16;
 

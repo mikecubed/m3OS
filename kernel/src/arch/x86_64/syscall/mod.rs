@@ -1639,6 +1639,10 @@ mod syscall_nr {
     /// `sys_shm_size(shm_id) -> bytes | u64::MAX`.
     pub const SHM_SIZE: u64 = 0x1022;
 
+    /// Phase 95c (Area A.1): `vfs_server` registers its mapped SHM "read window"
+    /// (the zero-copy demand-fault read destination). `vfs_register_read_window(shm_id)`.
+    pub const VFS_REGISTER_READ_WINDOW: u64 = 0x1024;
+
     // -- ipc --
     pub const IPC_BASE: u64 = 0x1100;
     // Phase 74 extension: cap-bearing IPC (0x1117/0x1118) and per-call
@@ -2177,6 +2181,7 @@ pub extern "C" fn syscall_handler(
         FRAME_TICK_HZ => sys_frame_tick_hz(),
         FRAME_TICK_DRAIN => sys_frame_tick_drain(),
         SHM_CREATE => sys_shm_create(arg0),
+        VFS_REGISTER_READ_WINDOW => sys_vfs_register_read_window(arg0),
         SHM_MAP => sys_shm_map(arg0),
         SHM_UNMAP => sys_shm_unmap(arg0),
         SHM_DESTROY => sys_shm_destroy(arg0),
@@ -8926,6 +8931,213 @@ fn vfs_service_read(handle: u64, offset: usize, user_buf_ptr: u64, count: usize)
         return NEG_EFAULT;
     }
     bytes_read as u64
+}
+
+// ---------------------------------------------------------------------------
+// Phase 95c (Area A.1) — zero-copy demand-fault SHM "read window".
+//
+// The 95b demand-fill staged each read as an IPC bulk payload: `vfs_server`
+// `ipc_store_reply_bulk`s the data into a kernel `Vec`, the kernel
+// `take_bulk_data`s it, copies it into a cluster buffer, then copies THAT into
+// the faulting frame — a double copy that violates m3OS's "bulk data = page
+// grants, never IPC payloads" rule. The read window replaces that transport
+// with a shared SHM region (the idiomatic external-pager move): `vfs_server`
+// creates + maps a window once at startup and registers it here; on a fault the
+// kernel issues `VFS_READ_WINDOW`, `vfs_server` reads file bytes straight into
+// the shared window, and the kernel fills the faulting frame from the window's
+// frames through its physical map — no IPC bulk, no `take_bulk_data`.
+//
+// A single window is shared by all faulting tasks, guarded by a non-blocking
+// `in_use` flag held across the borrow (issue → reply → frame-fill): a second
+// concurrent fault that can't claim it falls back to the legacy bulk path, so
+// the optimization never blocks and never serializes correctness. `vfs_server`
+// is single-threaded, so file reads already serialize there; the window only
+// extends that to the kernel's brief frame-fill memcpy.
+// ---------------------------------------------------------------------------
+
+struct VfsReadWindow {
+    /// Physical base of the registered SHM window (0 = unregistered).
+    phys_base: core::sync::atomic::AtomicU64,
+    /// Window size in bytes (a contiguous SHM run from `phys_base`).
+    bytes: core::sync::atomic::AtomicU64,
+    /// Held across a faulting task's `VFS_READ_WINDOW` borrow so no other writer
+    /// (another fault, or `vfs_server` serving another window request) can
+    /// overwrite the region before the kernel has copied it into the frame.
+    in_use: core::sync::atomic::AtomicBool,
+    /// PID of the current borrower — used to reclaim the window if the borrower
+    /// is killed mid-fault (otherwise a single such death would wedge the single
+    /// window in `in_use` and permanently force the legacy fallback).
+    holder_pid: core::sync::atomic::AtomicU32,
+}
+
+static VFS_READ_WINDOW: VfsReadWindow = VfsReadWindow {
+    phys_base: core::sync::atomic::AtomicU64::new(0),
+    bytes: core::sync::atomic::AtomicU64::new(0),
+    in_use: core::sync::atomic::AtomicBool::new(false),
+    holder_pid: core::sync::atomic::AtomicU32::new(0),
+};
+
+/// `SYS_VFS_REGISTER_READ_WINDOW` (0x1024) — `vfs_server` registers its mapped
+/// SHM read window. Only the registered `vfs` service owner may register (the
+/// window's frames are read by the kernel from its physical map, so a bogus
+/// region would let any process feed the demand-fill arbitrary memory). Returns
+/// 0 on success, `u64::MAX` on error. Idempotent.
+pub(super) fn sys_vfs_register_read_window(shm_id_arg: u64) -> u64 {
+    use core::sync::atomic::Ordering;
+    // Gate: only the live `vfs_server` process may register the window.
+    if !is_current_exec_path("/bin/vfs_server") {
+        return u64::MAX;
+    }
+    if shm_id_arg == 0 || shm_id_arg > u64::from(u32::MAX) {
+        return u64::MAX;
+    }
+    let id = crate::mm::shm::ShmId(shm_id_arg as u32);
+    let (start_phys, page_count) = match crate::mm::shm::frames(id) {
+        Ok(v) => v,
+        Err(_) => return u64::MAX,
+    };
+    let bytes = (page_count as u64) * 4096;
+    // The window must hold at least one demand cluster; reject an undersized
+    // region so the fault path can assume `bytes >= VFS_MAX_PREAD` never under-
+    // serves a cluster (it clamps the request to `bytes` regardless).
+    if bytes < 4096 {
+        return u64::MAX;
+    }
+    VFS_READ_WINDOW.bytes.store(bytes, Ordering::Relaxed);
+    VFS_READ_WINDOW
+        .phys_base
+        .store(start_phys, Ordering::Release);
+    log::info!(
+        "[vfs] read-window registered: shm_id={} phys={:#x} bytes={}",
+        shm_id_arg,
+        start_phys,
+        bytes
+    );
+    0
+}
+
+/// True once `vfs_server` has registered a read window.
+fn vfs_read_window_registered() -> bool {
+    use core::sync::atomic::Ordering;
+    VFS_READ_WINDOW.phys_base.load(Ordering::Acquire) != 0
+}
+
+/// Try to borrow the read window for `pid`. Returns `false` (fall back to the
+/// legacy bulk path) if it is unregistered or already in use by a *live* task;
+/// if the recorded borrower is dead (killed mid-fault) the window is reclaimed.
+pub(crate) fn claim_vfs_read_window(pid: u32) -> bool {
+    use core::sync::atomic::Ordering;
+    if !vfs_read_window_registered() {
+        return false;
+    }
+    if VFS_READ_WINDOW
+        .in_use
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        VFS_READ_WINDOW.holder_pid.store(pid, Ordering::Relaxed);
+        return true;
+    }
+    // Busy — reclaim only if the recorded holder is gone (a fault path that was
+    // killed while blocked in its `VFS_READ_WINDOW` round-trip, before it could
+    // release). This is the single-window liveness guard; without it one such
+    // death would wedge the window in `in_use` and force the legacy fallback
+    // forever. The reclaim is a single-winner CAS on `holder_pid` so two tasks
+    // that simultaneously observe the same dead holder cannot BOTH steal the
+    // (still-`in_use`) window and race on its bytes — only the CAS winner
+    // proceeds; the loser falls back. (A pid reused by a live process before we
+    // look is a false-negative: we simply don't reclaim and fall back — safe.)
+    let holder = VFS_READ_WINDOW.holder_pid.load(Ordering::Acquire);
+    if holder != 0 && crate::process::PROCESS_TABLE.lock().find(holder).is_none() {
+        return VFS_READ_WINDOW
+            .holder_pid
+            .compare_exchange(holder, pid, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok();
+    }
+    false
+}
+
+/// Release the read window after the borrow completes.
+pub(crate) fn release_vfs_read_window() {
+    use core::sync::atomic::Ordering;
+    VFS_READ_WINDOW.in_use.store(false, Ordering::Release);
+}
+
+/// Kernel-side view of the registered window's frames, via the physical-memory
+/// map. The caller must hold the borrow (`claim_vfs_read_window`) so the bytes
+/// are stable. Returns `None` if unregistered.
+///
+/// # Safety
+/// The returned slice aliases `vfs_server`'s SHM frames; it is only valid while
+/// the borrow is held (no concurrent writer) and the window stays registered.
+pub(crate) unsafe fn vfs_read_window_slice() -> Option<&'static [u8]> {
+    use core::sync::atomic::Ordering;
+    let phys = VFS_READ_WINDOW.phys_base.load(Ordering::Acquire);
+    if phys == 0 {
+        return None;
+    }
+    let bytes = VFS_READ_WINDOW.bytes.load(Ordering::Relaxed) as usize;
+    let virt = crate::mm::phys_offset() + phys;
+    Some(unsafe { core::slice::from_raw_parts(virt as *const u8, bytes) })
+}
+
+/// Maximum bytes the window can hold (for clamping a cluster request).
+fn vfs_read_window_bytes() -> usize {
+    use core::sync::atomic::Ordering;
+    VFS_READ_WINDOW.bytes.load(Ordering::Relaxed) as usize
+}
+
+/// Issue one `VFS_READ_WINDOW` round-trip: `vfs_server` reads up to `len` bytes
+/// at file `offset` from open `handle` directly into the shared window's first
+/// `len` bytes. Returns the bytes written into the window (0 at EOF) or a
+/// negative errno. The caller must hold the window borrow and read the bytes
+/// from [`vfs_read_window_slice`] before releasing it. Mirrors
+/// [`vfs_service_read_kernel`]'s `call_msg` blocking contract.
+pub(crate) fn vfs_read_into_window(handle: u64, offset: usize, len: usize) -> Result<usize, i64> {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::fs::vfs_protocol::VFS_READ_WINDOW;
+
+    let capped = len.min(vfs_read_window_bytes());
+    if capped == 0 {
+        return Ok(0);
+    }
+    let vfs_ep = registry::lookup_endpoint_id("vfs").ok_or(NEG_EIO as i64)?;
+    let task_id = scheduler::current_task_id().ok_or(NEG_EINVAL as i64)?;
+
+    let mut msg = Message::new(VFS_READ_WINDOW);
+    msg.data[0] = handle;
+    msg.data[1] = offset as u64;
+    msg.data[2] = capped as u64;
+    let reply = endpoint::call_msg(task_id, vfs_ep, msg);
+    if reply.label != 0 {
+        return Err(reply.label as i64);
+    }
+    let bytes_read = reply.data[0] as usize;
+    if bytes_read > capped {
+        return Err(NEG_EIO as i64);
+    }
+    Ok(bytes_read)
+}
+
+/// Resolve the `vfs_server` service handle for a process `fd`, **only** if that
+/// fd is backed by `vfs_server` (the one backend the zero-copy read window can
+/// fill — `vfs_server` owns those files and is the IPC peer that reads into the
+/// window). Returns `None` for every other backend (ramdisk / in-kernel ext2 /
+/// tmpfs / fat32), whose pages the window cannot serve, so the demand-fault
+/// caller knows to use the legacy per-backend read routing instead.
+///
+/// Phase 95c (Area A.1). Critically, the value stored in a file-backed VMA is
+/// the *process* fd number, NOT the `vfs_server` handle — the handle lives
+/// inside `FdBackend::VfsService`. Sending the raw fd number to `vfs_server`
+/// (the original A.1 bug) made it `EBADF` every demand read.
+pub(crate) fn vfs_service_handle_for_fd(pid: u32, fd: usize) -> Option<u64> {
+    let table = crate::process::PROCESS_TABLE.lock();
+    let entry = table.find(pid)?.fd_get(fd)?;
+    match &entry.backend {
+        FdBackend::VfsService { service_handle, .. } => Some(*service_handle),
+        _ => None,
+    }
 }
 
 /// Phase 95b (Area A.2) — kernel-buffer variant of [`vfs_service_read`]: read up

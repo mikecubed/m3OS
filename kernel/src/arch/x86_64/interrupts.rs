@@ -826,6 +826,74 @@ fn demand_map_vma_page(vaddr: u64, require_write: bool) -> bool {
         let page_base = vaddr & !0xFFF;
         let cluster_end = (page_base + CLUSTER).min(vma_end);
         let cluster_len = (cluster_end - page_base) as usize;
+
+        // Phase 95c (Area A.1) — zero-copy path. ONLY a `vfs_server`-backed
+        // mapping can be served by the window: `vfs_server` owns those files and
+        // is the IPC peer that reads into the shared region. So resolve the
+        // server handle for this fd first (the value stored in the VMA is the
+        // *process* fd number, NOT the server handle — the handle lives in
+        // `FdBackend::VfsService`), and for every other backend (ramdisk /
+        // in-kernel ext2 / tmpfs / fat32) skip straight to the legacy per-backend
+        // read routing below. If the window IS eligible but can't serve the fault
+        // for any reason, we ALSO fall through to legacy — the window is a pure
+        // best-effort optimization that never changes correctness. One round-trip
+        // suffices: `read_file_data` returns the full available range, so a short
+        // read means EOF and the trailing cluster pages are legitimately zero.
+        if let Some(svc_handle) =
+            crate::arch::x86_64::syscall::vfs_service_handle_for_fd(pid, fd as usize)
+            && crate::arch::x86_64::syscall::claim_vfs_read_window(pid)
+        {
+            let filled = (|| -> Option<bool> {
+                let n = crate::arch::x86_64::syscall::vfs_read_into_window(
+                    svc_handle,
+                    file_off as usize,
+                    cluster_len,
+                )
+                .ok()?;
+                // SAFETY: we hold the window borrow, so the bytes are stable until
+                // we release it below; the slice aliases the registered SHM frames.
+                let window = unsafe { crate::arch::x86_64::syscall::vfs_read_window_slice() }?;
+                let addr_space = crate::process::current_addr_space();
+                let _page_table_guard =
+                    addr_space.map(|addr_space| unsafe { addr_space.as_ref() }.lock_page_tables());
+                let mut faulting_ok = false;
+                let mut off = 0usize;
+                while off < cluster_len {
+                    let page_va = page_base + off as u64;
+                    let avail_end = (off + 4096).min(n);
+                    let slice: &[u8] = if off < n {
+                        &window[off..avail_end]
+                    } else {
+                        &[]
+                    };
+                    let ok = demand_map_user_page_from_buf_locked(page_va, prot, pkey, slice);
+                    if page_va == page_base {
+                        faulting_ok = ok;
+                    }
+                    off += 4096;
+                }
+                Some(faulting_ok)
+            })();
+            crate::arch::x86_64::syscall::release_vfs_read_window();
+            if filled == Some(true) {
+                // One-shot proof the zero-copy window path actually served a
+                // demand fault (vs. falling back) — the Area A.1 "counter".
+                static WINDOW_FILL_LOGGED: core::sync::atomic::AtomicBool =
+                    core::sync::atomic::AtomicBool::new(false);
+                if !WINDOW_FILL_LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                    log::info!(
+                        "[vfs] read-window: first zero-copy demand-fill served (no IPC bulk)"
+                    );
+                }
+                // Track B: not-present -> present needs no cross-core shootdown.
+                bump_current_addr_space_generation();
+                return true;
+            }
+            // Window couldn't serve it — fall through to the legacy read path,
+            // which re-reads the cluster (skipping any pages the window already
+            // mapped) via the correct per-backend routing.
+        }
+
         // Heap (not stack) buffer: the file read path is already deep on the
         // per-task kernel stack (Area C), so keep this frame's footprint small.
         let mut buf = alloc::vec![0u8; cluster_len];
