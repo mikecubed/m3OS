@@ -29,11 +29,15 @@
   instrumentation (a timer-ISR userspace-RIP sampler + a demand-fill page counter +
   a syscall sampler, on SMP=1 and SMP=4 under KVM) showed **rustc never runs userspace**
   (zero RIP samples), **demand-pages < 1 MB** of `librustc_driver.so`, and is **blocked
-  in the kernel** — the loader loads the small `libc.so` fine but **wedges loading the
-  162 MB `librustc_driver.so`**. The exact wedge (a demand-fill read that never
-  completes, a large-DSO loader/mm path, or a silent loader exit) is not yet pinned
-  because the loader's `serial()` diagnostics are release-suppressed; the next step is a
-  loader-serial + demand-fill-block trace. This is a **tracked Phase-95b follow-up**.
+  in the kernel** — the loader loads the small `libc.so` fine but **wedges/never loads
+  the 162 MB `librustc_driver.so`**. Further tracing pointed *upstream* of A.2: the
+  dominant cost is the ~368 MB `pkg install rust` over the **~100–200 KB/s ring-3 VFS**
+  (≈40 min of I/O, at/over the 50-min install-step timeout — so the on-device rustc is
+  likely never properly installed). The binding constraint is **VFS / block-I/O
+  throughput**, which A.2's demand-side laziness cannot fix. **The `RUSTC_OK` milestone
+  is carried into [Phase 95c](./95c-vfs-block-io-perf.md)** — the supply-side
+  VFS/block-I/O performance subphase whose explicit goal is to flip this `rustc-smoke`
+  arm to PASS and close the 95-series.
 - **Area E (cargo + proc-macros) was not started** (gated behind D).
 
 The remainder of this doc describes the originally-planned design; the
