@@ -1,4 +1,27 @@
 ---
+status: MILESTONE+ — `rustc` EXECUTES AND COMPILES on m3OS; all libc/loader
+  correctness blockers FIXED; the remaining `RUSTC_OK` gate is now a KERNEL mm
+  fault-LOOP (perf/correctness, not a libc global). After the TLS fix, `rustc hello.rs`
+  panicked `Failed finding sysroot: "dladdr failed"` (filesearch.rs:255) — m3OS's
+  `dladdr` returned 0 (musl's real one is in the replaced `dynlink.c`; libc.so ships a
+  return-0 stub). FIXED: implemented `dladdr` in the loader (`dl.rs` — iterates the
+  published DSO list, returns `dli_fname=/usr/lib/<soname>` + `dli_fbase=load_bias`;
+  exported, resolves before libc.so's stub). VALIDATED: the sysroot panic is GONE and
+  rustc compiles MUCH further — `demand_pages≈35631` (~140 MiB, vs 19153 at the panic),
+  no crash, runs codegen + spawns rust-lld. `rustc-smoke` step 20 still times out, but
+  for a NEW reason: a **kernel fault LOOP** — the `[pf]` trace shows the SAME
+  `addr=0x200c79f000 rip=0x200a204838` (`libc.so+0x28838`, mallocng) faulting **43
+  MILLION** times with `demand_pages` FROZEN at 35631. The kernel #PF handler "returns"
+  without actually resolving that page, so mallocng's access re-faults forever. Likely
+  a perm/mapping bug on a mallocng anon/`mprotect`/W^X/guard page (the fault is NOT
+  counted as a file-backed demand page → it's an anon/CoW/perm fault the handler mis-
+  handles). NEXT: log the fault ERR code (write/present/protection) for `0x200c79f000`
+  + trace the kernel #PF path for that addr (anon VMA? wrong perms? W^X/PKU? a
+  not-present→present that doesn't stick?). Also: the `rustc-profile` `[pf]` logging
+  (LOG_EVERY_FAULTS=32 → 360K serial writes here) is itself a big overhead at this fault
+  volume — raise it / disable the feature for timing runs. Once the fault loop is fixed,
+  the 95c VFS page-cache/throughput levers become relevant for cold-load speed.
+  ---PRIOR MILESTONE (rustc executes) BELOW---
 status: MILESTONE — **`rustc` EXECUTES ON m3OS.** `rustc --version` (`rustc 1.96.0`)
   and `rustc --print sysroot` both COMPLETE with NO crash, and `rustc hello.rs` runs
   codegen on its worker thread (paged ~75 MiB) before a downstream panic. The
