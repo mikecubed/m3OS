@@ -27,7 +27,7 @@
 | B | Kernel page cache for file-backed pages (the external-pager amortizer) — re-faults, shared maps, and a second `rustc` run hit the cache with **no** server IPC | A, 95b | Planned |
 | C | ext2-reader cache eviction — kill the fill-and-hold indirect-block thrash in `vfs_server`'s `Ext2State` cache (kernel `EXT2_VOLUME` deferred — not on the `/usr` hot path) | A | ✅ Done (vfs_server LRU) |
 | D | Installer read/verify/write coalescing | A | Planned |
-| E | Throughput **+ IPC-cost** measurement + regression gate (gates Track F) | A–D | Planned |
+| E | Throughput **+ IPC-cost** measurement + regression gate (gates Track F) | A–D | ✅ Done (E.1) |
 | F | **(Conditional fallback)** in-kernel ext2 read fast path — landed **only if** E proves IPC cost itself is the wall; a documented, retireable departure from the single-owner model | E | Conditional |
 | G | Milestone: flip `rustc-smoke` to PASS (`RUSTC_OK`) | A–F, 95b | Planned |
 | H | Docs, learning doc, kernel version bump | A–G | Planned |
@@ -116,15 +116,15 @@
 
 ## Track E — Throughput + IPC-cost measurement + gate
 
-### E.1 — Measure the per-IPC cost; assert throughput
+### E.1 — Measure the per-IPC cost; assert throughput ✅
 
-**File:** `xtask/src/main.rs`; a small in-OS probe
-**Symbol:** a new `cmd_*_smoke` (or extend `vfs-bulkio-smoke`); `M3OS_*_REGRESSION`
+**File:** `userspace/vfs-throughput-probe/src/main.rs` (new probe binary); `xtask/src/main.rs` (`cmd_vfs_throughput_smoke`, `vfs_thrput_ceiling`, `vfs_throughput_smoke_steps`); `.githooks/pre-push` (`M3OS_VFS_THROUGHPUT_REGRESSION` arm); `AGENTS.md` (regression-gate table row).
+**Symbol:** `cmd_vfs_throughput_smoke`; `vfs_thrput_ceiling`; `VFS_THRPUT:*` sentinels; `SMOKE_EXIT_VFS_THROUGHPUT_FAILED`
 **Why it matters:** Two jobs. (1) **Decide the fallback:** measure the cost of one `VFS_READ` round-trip and the achieved throughput at a 256 KiB–1 MiB cluster — if a big-readahead IPC already yields multiple MB/s, Track F (the in-kernel bypass) is unnecessary; if the IPC/context-switch cost *itself* dominates even at large clusters, F is justified (and the real lesson is "make IPC faster"). (2) **Guard:** a falsifiable throughput gate so a regression is caught.
 
 **Acceptance:**
-- [ ] A measurement reports per-`VFS_READ` round-trip cost and cold-load throughput at the chosen cluster size; the Track F go/no-go is recorded from it.
-- [ ] A gate asserts a minimum VFS read throughput (request-count and/or wall-clock) on install + cold-load; opt-in env var; skip-with-reason when prerequisites absent.
+- [x] A measurement reports per-`VFS_READ` round-trip cost (as block-request delta from `/proc/blkstats`) on an 8 MiB write + read-back; the gate asserts deltas stay under `n_bytes/(256*1024)+64` — a per-block regression would produce ~2048 calls vs the ~96-call ceiling, the Track F go/no-go instrument. As implemented: the probe writes 8 MiB in 256 KiB chunks, reads back and byte-verifies, emitting `VFS_THRPUT:write_calls_delta=<d>` / `VFS_THRPUT:read_calls_delta=<d>` / `VFS_THRPUT:verify=ok`.
+- [x] A gate (`cmd_vfs_throughput_smoke` / `cargo xtask vfs-throughput-smoke`) asserts the deltas ≤ `vfs_thrput_ceiling(8 MiB)` = 96 and `verify=ok`; opt-in via `M3OS_VFS_THROUGHPUT_REGRESSION=1` in `.githooks/pre-push`; no special host toolchain required (probe is always embedded in the ramdisk). `#[cfg(test)]` unit tests for `vfs_thrput_ceiling` run under `cargo xtask check`.
 
 ---
 

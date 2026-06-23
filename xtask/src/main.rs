@@ -384,6 +384,12 @@ const SMOKE_EXIT_COREUTILS_SMOKE_FAILED: i32 = 90;
 /// Rust/clang toolchain or musl headers are absent.
 const SMOKE_EXIT_RUSTC_SMOKE_FAILED: i32 = 91;
 
+/// Phase 95c Track E.1 — `cargo xtask vfs-throughput-smoke` exit code.
+/// Boots m3OS, runs `vfs-throughput-probe`, and asserts the
+/// `write_calls_delta` and `read_calls_delta` from `/proc/blkstats` stay
+/// under size-derived ceilings — the regression guard for VFS IPC-call count.
+const SMOKE_EXIT_VFS_THROUGHPUT_FAILED: i32 = 92;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
     Headless,
@@ -1155,6 +1161,20 @@ fn main() {
                 });
             cmd_vfs_bulkio_smoke(&smoke_args);
         }
+        // Phase 95c Track E.1 — VFS throughput + IPC-cost measurement gate.
+        // Boots m3OS, runs the ramdisk `vfs-throughput-probe` binary (write 8 MiB
+        // + read back + verify, bracketed by /proc/blkstats snapshots), and asserts
+        // the write_calls_delta and read_calls_delta stay under size-derived
+        // ceilings — the regression guard for VFS IPC-call count.
+        Some("vfs-throughput-smoke") => {
+            let smoke_args = parse_smoke_boot_args("vfs-throughput-smoke", &args[2..])
+                .unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_vfs_throughput_smoke(&smoke_args);
+        }
         // Phase 85d — Clang/LLVM/LLD toolchain smoke. Builds the image with the
         // opt-in `M3OS_WITH_CLANG` feature (bundling the heavyweight clang
         // `.m3pkg` into the offline `/usr/pkg/` repo), boots m3OS, `pkg install
@@ -1511,7 +1531,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -1859,6 +1879,9 @@ fn build_userspace_bins() {
         ("lockscreen", "lockscreen", true),
         // Phase 85a Track C — offline package installer (alloc for Vec/String + pkg-format).
         ("pkg", "pkg", true),
+        // Phase 95c Track E.1 — VFS throughput measurement probe.
+        // Uses Vec for I/O buffers + the blkstats text, so `needs_alloc = true`.
+        ("vfs-throughput-probe", "vfs-throughput-probe", true),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -20525,6 +20548,265 @@ fn vfs_bulkio_smoke_steps(pkg: &'static str) -> Vec<SmokeStep> {
         timeout_secs: 600,
         label: "vfs-bulkio-smoke: installed files verify clean",
         exit_code_on_fail: SMOKE_EXIT_VFS_BULKIO_FAILED,
+    });
+
+    steps
+}
+
+// ---------------------------------------------------------------------------
+// Phase 95c Track E.1 — `cargo xtask vfs-throughput-smoke`
+// ---------------------------------------------------------------------------
+
+/// Generous ceiling for `write_calls_delta` / `read_calls_delta` from a
+/// `PAYLOAD_BYTES`-sized sequential write + read through the ring-3 VFS.
+///
+/// The probe writes and reads in 256 KiB chunks; at 4 KiB blocks that is 64
+/// blocks per chunk.  The VFS coalesces those into one `write_sectors` /
+/// `read_sectors` call per contiguous run, so the tight lower bound is
+/// `n_bytes / (256*1024)`.  We add a generous slack (`+64`) to absorb
+/// metadata writes (allocation bitmap, inode) without making the test
+/// brittle.  This ceiling is deliberately loose — it catches regressions
+/// back to per-block round-trips (which would produce `n_bytes / 4096`
+/// calls, roughly 64× more) while staying stable across minor VFS changes.
+///
+/// # Example
+/// 8 MiB payload → 32 data chunks + 64 slack = 96 max calls.
+/// Per-block regression would produce 8*1024*1024/4096 = 2048 calls, which
+/// is far above 96 and would trip the gate.
+pub fn vfs_thrput_ceiling(n_bytes: u64) -> u64 {
+    n_bytes / (256 * 1024) + 64
+}
+
+#[cfg(test)]
+mod vfs_thrput_tests {
+    use super::vfs_thrput_ceiling;
+
+    #[test]
+    fn ceiling_8mib() {
+        // 8 MiB → 32 chunks + 64 slack = 96.
+        assert_eq!(vfs_thrput_ceiling(8 * 1024 * 1024), 96);
+    }
+
+    #[test]
+    fn ceiling_zero() {
+        // 0 bytes → only the slack term.
+        assert_eq!(vfs_thrput_ceiling(0), 64);
+    }
+
+    #[test]
+    fn ceiling_1mib() {
+        // 1 MiB → 4 chunks + 64 slack = 68.
+        assert_eq!(vfs_thrput_ceiling(1024 * 1024), 68);
+    }
+
+    #[test]
+    fn per_block_regression_fails() {
+        // A per-block regression would produce n_bytes/4096 calls.
+        // Verify that per-block call count exceeds the ceiling, i.e. the
+        // gate would catch the regression.
+        let n: u64 = 8 * 1024 * 1024;
+        let per_block_calls = n / 4096; // 2048
+        let ceiling = vfs_thrput_ceiling(n); // 96
+        assert!(
+            per_block_calls > ceiling,
+            "per-block call count {per_block_calls} should exceed ceiling {ceiling}"
+        );
+    }
+}
+
+/// Phase 95c Track E.1 — `cargo xtask vfs-throughput-smoke`.
+///
+/// Boots m3OS (plain default image — no special ports or packages required),
+/// runs the ramdisk-embedded `vfs-throughput-probe` binary which:
+///   1. snapshots `/proc/blkstats`,
+///   2. writes an 8 MiB deterministic payload to `/usr/local/vfsthr-probe.bin`,
+///   3. snapshots `/proc/blkstats` (write delta),
+///   4. reads the file back and verifies the byte pattern,
+///   5. snapshots `/proc/blkstats` (read delta),
+///   6. emits `VFS_THRPUT:*` sentinels.
+///
+/// Parses the sentinels from the serial transcript and asserts:
+///   - `verify=ok` (content round-tripped correctly),
+///   - `write_calls_delta ≤ vfs_thrput_ceiling(PAYLOAD_BYTES)`,
+///   - `read_calls_delta ≤ vfs_thrput_ceiling(PAYLOAD_BYTES)`.
+///
+/// Opt-in: gated by `M3OS_VFS_THROUGHPUT_REGRESSION=1` in `.githooks/pre-push`.
+fn cmd_vfs_throughput_smoke(args: &SmokeBootArgs) {
+    /// Payload the probe writes/reads (must match `PAYLOAD_BYTES` in the binary).
+    const PAYLOAD_BYTES: u64 = 8 * 1024 * 1024;
+
+    let ceiling = vfs_thrput_ceiling(PAYLOAD_BYTES);
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    // Fresh data disk so the block cache and ext2 state start clean, giving
+    // reproducible blkstats deltas (a warm cache would suppress device reads).
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let qemu_args = qemu_args_with_devices(&uefi_image, &ovmf, display_mode, DeviceSet::default());
+
+    // Capture full serial transcript for host-side sentinel parsing.
+    let dump_path = uefi_image
+        .parent()
+        .unwrap()
+        .join("vfs-throughput-serial.txt");
+    let _ = fs::remove_file(&dump_path);
+    // SAFETY: xtask is single-threaded here.
+    unsafe {
+        std::env::set_var("M3OS_SMOKE_SERIAL_DUMP", &dump_path);
+    }
+
+    let steps = vfs_throughput_smoke_steps();
+    println!(
+        "vfs-throughput-smoke: launching QEMU (timeout {}s, {} steps; \
+         payload={} MiB, ceiling={} calls)",
+        args.timeout_secs,
+        steps.len(),
+        PAYLOAD_BYTES / (1024 * 1024),
+        ceiling,
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    let run_result = run_smoke_script(&mut child, &steps, global_timeout);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    if let Err(msg) = run_result {
+        eprintln!("vfs-throughput-smoke: FAILED\n{msg}");
+        std::process::exit(SMOKE_EXIT_VFS_THROUGHPUT_FAILED);
+    }
+
+    // Parse sentinels from the serial transcript.
+    let transcript = fs::read_to_string(&dump_path).unwrap_or_default();
+
+    let parse_sentinel = |key: &str| -> Option<u64> {
+        transcript.lines().find_map(|l| {
+            l.trim()
+                .strip_prefix(key)
+                .and_then(|v| v.trim().parse::<u64>().ok())
+        })
+    };
+
+    let verify_ok = transcript
+        .lines()
+        .any(|l| l.trim() == "VFS_THRPUT:verify=ok");
+
+    let write_delta = parse_sentinel("VFS_THRPUT:write_calls_delta=");
+    let read_delta = parse_sentinel("VFS_THRPUT:read_calls_delta=");
+
+    let elapsed = start.elapsed().as_secs();
+
+    if !verify_ok {
+        eprintln!(
+            "vfs-throughput-smoke: FAILED — byte-pattern verify did not pass \
+             (VFS_THRPUT:verify=ok not found in transcript). \
+             Serial dump: {}",
+            dump_path.display()
+        );
+        std::process::exit(SMOKE_EXIT_VFS_THROUGHPUT_FAILED);
+    }
+
+    let Some(wd) = write_delta else {
+        eprintln!(
+            "vfs-throughput-smoke: FAILED — VFS_THRPUT:write_calls_delta sentinel not found. \
+             Serial dump: {}",
+            dump_path.display()
+        );
+        std::process::exit(SMOKE_EXIT_VFS_THROUGHPUT_FAILED);
+    };
+    let Some(rd) = read_delta else {
+        eprintln!(
+            "vfs-throughput-smoke: FAILED — VFS_THRPUT:read_calls_delta sentinel not found. \
+             Serial dump: {}",
+            dump_path.display()
+        );
+        std::process::exit(SMOKE_EXIT_VFS_THROUGHPUT_FAILED);
+    };
+
+    println!(
+        "vfs-throughput-smoke: probe completed — \
+         write_calls_delta={wd} read_calls_delta={rd} (ceiling={ceiling})"
+    );
+
+    if wd > ceiling {
+        eprintln!(
+            "vfs-throughput-smoke: FAILED — write_calls_delta {wd} exceeds ceiling {ceiling}; \
+             a regression to per-block VFS round-trips would produce ~{} calls for an 8 MiB \
+             payload.  Check vfs_server write coalescing / 64 KiB write cap / \
+             multi-block allocation.",
+            PAYLOAD_BYTES / 4096,
+        );
+        std::process::exit(SMOKE_EXIT_VFS_THROUGHPUT_FAILED);
+    }
+    if rd > ceiling {
+        eprintln!(
+            "vfs-throughput-smoke: FAILED — read_calls_delta {rd} exceeds ceiling {ceiling}; \
+             a regression to per-block VFS round-trips would produce ~{} calls for an 8 MiB \
+             payload.  Check vfs_server read coalescing / 64 KiB read cap / \
+             contiguous-run batching.",
+            PAYLOAD_BYTES / 4096,
+        );
+        std::process::exit(SMOKE_EXIT_VFS_THROUGHPUT_FAILED);
+    }
+
+    println!(
+        "vfs-throughput-smoke: PASSED — verify=ok, \
+         write_calls_delta={wd} read_calls_delta={rd} ≤ ceiling={ceiling} in {elapsed}s"
+    );
+}
+
+/// Serial script for `vfs-throughput-smoke`: boot + login, run the probe,
+/// wait for `VFS_THRPUT:done`.
+fn vfs_throughput_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/vfs-throughput-smoke: kernel first message",
+    }];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    // Run the probe.  The binary is in the ramdisk at /bin/vfs-throughput-probe.
+    steps.push(SmokeStep::Send {
+        input: "vfs-throughput-probe\n",
+        label: "vfs-throughput-smoke: launch probe",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "VFS_THRPUT:done",
+        fail_prefixes: &["VFS_THRPUT:error=", "VFS_THRPUT:verify=FAIL"],
+        timeout_secs: 240,
+        label: "vfs-throughput-smoke: probe done",
+        exit_code_on_fail: SMOKE_EXIT_VFS_THROUGHPUT_FAILED,
     });
 
     steps

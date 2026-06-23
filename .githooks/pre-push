@@ -871,3 +871,22 @@ if [ "${M3OS_VFS_BULKIO_REGRESSION:-0}" = "1" ]; then
         exit 1
     fi
 fi
+
+# Phase 95c Track E.1 — VFS throughput + IPC-cost measurement gate. Gated behind
+# M3OS_VFS_THROUGHPUT_REGRESSION=1. Boots m3OS, runs the ramdisk
+# `vfs-throughput-probe` binary (write 8 MiB + read back + verify, bracketed
+# by /proc/blkstats snapshots), and asserts the write_calls_delta and
+# read_calls_delta stay under size-derived ceilings — the regression guard for
+# VFS IPC-call count. A regression to per-block round-trips would produce ~2048
+# calls for an 8 MiB payload vs the ~96-call ceiling. Requires no special ports
+# or host toolchain (the probe binary is always embedded in the ramdisk).
+# Set this on branches touching vfs_server's ext2 read/write path, the VFS IPC
+# caps (VFS_MAX_PREAD/PWRITE), the block-request coalescing, or the
+# /proc/blkstats counters.
+if [ "${M3OS_VFS_THROUGHPUT_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask vfs-throughput-smoke..."
+    if ! cargo xtask vfs-throughput-smoke --timeout 300; then
+        echo "pre-push: cargo xtask vfs-throughput-smoke failed" >&2
+        exit 1
+    fi
+fi

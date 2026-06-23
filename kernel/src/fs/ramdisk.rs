@@ -372,6 +372,11 @@ static USB_MOUNT_SMOKE_ELF: &[u8] = generated_initrd_asset!("usb-mount-smoke");
 // SIGSEGV-killed it (controlled-kill recovery, not a core wedge). Not a daemon.
 static KSTACK_OVERFLOW_TEST_ELF: &[u8] = generated_initrd_asset!("kstack-overflow-test");
 
+// Phase 95c Track E.1 — `vfs-throughput-probe`: write + read-back + verify
+// a fixed payload on the writable ext2 data disk, bracketing each with
+// `/proc/blkstats` snapshots, and emit `VFS_THRPUT:*` sentinels.
+static VFS_THROUGHPUT_PROBE_ELF: &[u8] = generated_initrd_asset!("vfs-throughput-probe");
+
 // Phase 77 Track F.1 — `epoll-smoke` epoll_* verification regression.
 static EPOLL_SMOKE_ELF: &[u8] = generated_initrd_asset!("epoll-smoke");
 
@@ -728,6 +733,14 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "kstack-overflow-test",
         RamdiskNode::File {
             content: KSTACK_OVERFLOW_TEST_ELF,
+        },
+    ),
+    // Phase 95c Track E.1: vfs-throughput-probe — write+read-back+verify on
+    // the writable ext2 disk, emitting VFS_THRPUT:* sentinels.
+    (
+        "vfs-throughput-probe",
+        RamdiskNode::File {
+            content: VFS_THROUGHPUT_PROBE_ELF,
         },
     ),
     // Phase 77 Track F.1: epoll-smoke — epoll_* verification regression.
