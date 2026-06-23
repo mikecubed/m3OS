@@ -193,9 +193,31 @@ The loader already has `argc/argv/envp` (the init-array fix stashed them in
    ("default")))` so it survives `-fvisibility=hidden`; loader calls it with the auxv
    pointer (`= envp` walked to NULL, +1). No TLS interaction.
 
-**Validation:** musl rebuild → `M3OS_WITH_RUST` image → `M3OS_SMOKE_SERIAL_DUMP=… …
-rustc-smoke` and grep `-a` for `process killed` (should be gone) + a higher
-`demand_pages` / `rustc 1.96.0`. The 95c throughput levers are NOT on the
+**Confirming insight — why `dynamic-hello-smoke` passes despite `malloc`ing:** its
+malloc is in `main`, which runs AFTER the app's `crt1 _start → __libc_start_main →
+__init_libc` (auxv set). rustc crashes because its **first** malloc is in an LLVM
+**static constructor**, which the loader runs (`run_constructors`) BEFORE the app's
+`__libc_start_main`. So the fix MUST set `__libc.auxv` before `run_constructors`.
+This also means option 1 would run `__init_libc` **twice** (loader + the app's
+`__libc_start_main`); the auxv/environ/page_size sets are idempotent, but the
+`__init_tls(aux)` inside `__init_libc` is NOT obviously safe to run twice (verify it
+resolves to the no-op weak TLS stub this libc.so uses; if not, **prefer option 2**,
+the auxv+page_size-only setter, which is idempotent and TLS-free).
+
+**Loader insertion point:** `userspace/ld-musl-x86_64.so.1/src/main.rs`, in
+`dl_entry` between the `store_startup_args(...)` block (~line 2894) and
+`run_constructors(&dsos)` (~line 2905). Use `sym::lookup(dsos.as_slice(), b"__init_libc"
+/* or the setter */, None)` (mirrors the `__init_tp` lookup at ~line 2356), transmute
+to `extern "C" fn(*const *const u8, *const u8)` (envp, argv[0]) / the setter's sig,
+and call it; skip gracefully if the symbol is absent (un-patched libc — no regression).
+
+**Validation:** musl rebuild (`cargo xtask port build musl`) → `M3OS_WITH_RUST` image
+→ `cargo xtask clean` → `M3OS_SMOKE_SERIAL_DUMP=/tmp/s.txt M3OS_KERNEL_FEATURES=rustc-profile
+M3OS_KVM=1 cargo xtask rustc-smoke --timeout 5400`; after the install + a few min of
+rustc load, `pkill -TERM -x qemu-system-x86` to force the dump, then `grep -a` for
+`process killed` (should be GONE), a higher `[pf] demand_pages` (rustc gets further),
+and ideally `rustc 1.96.0`. Use a CLEAN disk (NOT `M3OS_RUST_FAST_ITER`, which
+recursive-faults on a reused disk). The 95c throughput levers are NOT on the
 `RUSTC_OK` critical path — this correctness crash is the blocker.
 
 (A kernel-mode fault was also seen once — `InterruptStackFrame ip=0x10000b53f61
