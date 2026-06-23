@@ -1761,13 +1761,87 @@ unsafe fn apply_rela(
 // Constructors (Track B5.1).
 // ---------------------------------------------------------------------------
 
+/// glibc-compatible constructor ABI: every `DT_INIT` / `DT_INIT_ARRAY` entry
+/// is called as `void ctor(int argc, char **argv, char **envp)`.
+///
+/// glibc's `dl-init.c::call_init` has always passed `(argc, argv, envp)` to
+/// BOTH executable and shared-library constructors (see `_dl_init`).  musl's
+/// `do_init_fini` passes no arguments; this loader previously matched musl.
+///
+/// The divergence matters for Rust's `std` — it registers an `.init_array`
+/// entry (`ARGV_INIT_ARRAY` / `init_wrapper(argc, argv, envp)` in
+/// `std::sys::pal::unix::args`) that captures `argv`/`envp` into module-level
+/// statics.  A static Rust binary is fine because its init_array runs from
+/// libc's `__libc_start_main` with the three args. A **dynamic** Rust binary
+/// (e.g. the Phase 95b on-device `rustc` with `libstd-*.so`) has `std` in a
+/// shared library whose init_array is run by THIS loader — with no args the
+/// captured pointers are null/garbage → `std::env::args()` later derefs null →
+/// `CR2=0` page fault (see `docs/handoffs/2026-06-23-rustc-runtime-null-deref-after-tls.md`).
+///
+/// Passing extra register args to a C constructor compiled as `void(void)` is
+/// harmless on the x86-64 SysV ABI — the callee simply ignores `rdi`/`rsi`/`rdx`.
+/// So existing C/musl constructors (e.g. `libc.so`'s) keep working unchanged.
+type InitFn = extern "C" fn(i32, *const *const u8, *const *const u8);
+
+// ---------------------------------------------------------------------------
+// Startup-args stash — set once by `dl_entry`, read by constructor runs
+// (including dlopen-time ctors, mirroring glibc which always passes the
+// real argc/argv/envp even to dlopen'd library constructors).
+// ---------------------------------------------------------------------------
+
+use core::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
+
+static STARTUP_ARGC: AtomicI32 = AtomicI32::new(0);
+static STARTUP_ARGV: AtomicPtr<*const u8> = AtomicPtr::new(core::ptr::null_mut());
+static STARTUP_ENVP: AtomicPtr<*const u8> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Derive `(argc, argv, envp)` from the raw kernel-built initial stack.
+///
+/// The SysV x86-64 process-startup stack layout is:
+/// `[argc][argv[0]..argv[argc-1]][NULL][envp[0]..envp[n]][NULL][auxv...]`
+///
+/// This mirrors the pointer arithmetic in `parse_auxv` (above) and
+/// `read_ld_bind_now`.
+///
+/// # Safety
+/// `stack` must be the genuine kernel-built SysV process-startup stack pointer
+/// (`rsp` at process entry, as passed by `_start`'s naked asm to `dl_entry`).
+unsafe fn startup_args_from_stack(stack: *const u64) -> (i32, *const *const u8, *const *const u8) {
+    let argc = unsafe { *stack } as i32;
+    let argv = unsafe { stack.add(1) } as *const *const u8;
+    // envp starts right after the NULL terminator that follows argv[argc].
+    let envp = unsafe { stack.add(1 + argc as usize + 1) } as *const *const u8;
+    (argc, argv, envp)
+}
+
+/// Store the startup `(argc, argv, envp)` into the process-lifetime stash.
+/// Must be called exactly once from `dl_entry` before any `run_constructors`
+/// call. `argv` and `envp` point into the kernel-built initial stack which
+/// lives for the lifetime of the process, so storing the raw pointers is sound.
+fn store_startup_args(argc: i32, argv: *const *const u8, envp: *const *const u8) {
+    STARTUP_ARGC.store(argc, Ordering::Release);
+    STARTUP_ARGV.store(argv as *mut *const u8, Ordering::Release);
+    STARTUP_ENVP.store(envp as *mut *const u8, Ordering::Release);
+}
+
+/// Return the stashed `(argc, argv, envp)`. Returns `(0, null, null)` before
+/// `store_startup_args` is called (should not happen in practice — constructors
+/// run after the store).
+fn startup_args() -> (i32, *const *const u8, *const *const u8) {
+    let argc = STARTUP_ARGC.load(Ordering::Acquire);
+    let argv = STARTUP_ARGV.load(Ordering::Acquire) as *const *const u8;
+    let envp = STARTUP_ENVP.load(Ordering::Acquire) as *const *const u8;
+    (argc, argv, envp)
+}
+
 unsafe fn run_constructors(dsos: &[LoadedDso]) {
     // dsos[0] is the main binary. Deepest-first ⇒ reverse iteration
     // (so deps run before the main binary).
     for dso in dsos.iter().rev() {
         // SAFETY: each DSO's `dyn_` came from a `validate_dyn_pointers`
         // pass at load time, so the function pointers lie inside the
-        // mapped image. The destructor convention is `extern "C" fn()`.
+        // mapped image. Constructors are invoked glibc-style with
+        // `(argc, argv, envp)`; see `InitFn` above.
         unsafe { run_constructors_for(dso) };
     }
 }
@@ -1782,11 +1856,17 @@ unsafe fn run_constructors(dsos: &[LoadedDso]) {
 /// # Safety
 /// `dso` must have been produced by `load_dso` or the bring-up
 /// linker — i.e. its `init` / `init_array` pointers lie inside the
-/// mapped image. Constructors are called as `extern "C" fn()`.
+/// mapped image. Constructors are called as `InitFn` — i.e. with
+/// `(argc, argv, envp)` per the glibc `dl-init.c::call_init` ABI
+/// (see `docs/handoffs/2026-06-23-rustc-runtime-null-deref-after-tls.md`).
+/// Passing the three args to a C constructor compiled as `void(void)`
+/// is harmless on the x86-64 SysV ABI — the callee ignores unused
+/// registers — so all existing C/musl constructors keep working.
 pub(crate) unsafe fn run_constructors_for(dso: &LoadedDso) {
+    let (argc, argv, envp) = startup_args();
     if let Some(init) = dso.dyn_.init {
-        let f: extern "C" fn() = unsafe { core::mem::transmute(init.as_ptr()) };
-        f();
+        let f: InitFn = unsafe { core::mem::transmute(init.as_ptr()) };
+        f(argc, argv, envp);
     }
     if let Some(arr) = dso.dyn_.init_array
         && dso.dyn_.init_arraysz >= 8
@@ -1796,10 +1876,56 @@ pub(crate) unsafe fn run_constructors_for(dso: &LoadedDso) {
         for i in 0..n {
             let fnptr = unsafe { *base.add(i) };
             if fnptr != 0 {
-                let f: extern "C" fn() = unsafe { core::mem::transmute(fnptr) };
-                f();
+                let f: InitFn = unsafe { core::mem::transmute(fnptr) };
+                f(argc, argv, envp);
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host-only unit tests for startup_args_from_stack.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod ctor_args_tests {
+    use super::startup_args_from_stack;
+
+    /// Build a synthetic SysV initial stack and verify that
+    /// `startup_args_from_stack` returns the correct `(argc, argv, envp)`.
+    #[test]
+    fn startup_args_from_stack_basic() {
+        // Layout: [argc=2][argv0][argv1][NULL][env0][NULL][AT_NULL=0][0]
+        let argv0: *const u8 = b"prog\0".as_ptr();
+        let argv1: *const u8 = b"arg1\0".as_ptr();
+        let env0: *const u8 = b"HOME=/root\0".as_ptr();
+
+        let stack: [u64; 8] = [
+            2,            // argc
+            argv0 as u64, // argv[0]
+            argv1 as u64, // argv[1]
+            0,            // NULL (argv terminator)
+            env0 as u64,  // envp[0]
+            0,            // NULL (envp terminator)
+            0,            // AT_NULL tag
+            0,            // AT_NULL val
+        ];
+
+        let (argc, argv, envp) = unsafe { startup_args_from_stack(stack.as_ptr() as *const u64) };
+
+        assert_eq!(argc, 2);
+        // argv must point at the second element of the stack array (stack[1])
+        assert_eq!(argv as *const u64, unsafe {
+            (stack.as_ptr() as *const u64).add(1)
+        });
+        // envp must point at stack[4] (= stack.add(1 + 2 + 1))
+        assert_eq!(envp as *const u64, unsafe {
+            (stack.as_ptr() as *const u64).add(4)
+        });
+        // Verify the values are reachable through the returned pointers
+        assert_eq!(unsafe { *argv }, argv0);
+        assert_eq!(unsafe { *argv.add(1) }, argv1);
+        assert_eq!(unsafe { *envp }, env0);
     }
 }
 
@@ -2755,6 +2881,18 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
     // weak `static_init_tls` is a no-op stub, so this foreign loader must do
     // the `__dls3` TLS work itself.
     unsafe { setup_static_tls(dsos.as_slice()) };
+
+    // -- Stash startup args for constructor calls (glibc ABI) -----------------
+    // glibc's `dl-init.c::call_init` passes `(argc, argv, envp)` to every
+    // DT_INIT / DT_INIT_ARRAY entry, including shared-library constructors.
+    // Rust's `std` relies on this: its `.init_array` entry `ARGV_INIT_ARRAY`
+    // captures argv/envp into statics for `std::env::args()`. With a dynamic
+    // libstd (e.g. Phase 95b rustc), the ctor runs here — not from
+    // `__libc_start_main` — so we must pass the real args; see `InitFn` above.
+    {
+        let (argc, argv, envp) = unsafe { startup_args_from_stack(stack) };
+        store_startup_args(argc, argv, envp);
+    }
 
     // -- Run constructors deepest-first -------------------------------------
     // NOTE: these run with a *zero* stack canary. musl randomizes the canary
