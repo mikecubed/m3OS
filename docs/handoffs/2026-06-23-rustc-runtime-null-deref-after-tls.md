@@ -1,12 +1,24 @@
 ---
-status: OPEN — diagnosis narrowed, root cause NOT yet found. The on-device `rustc`
+status: OPEN — root cause NOT yet confirmed, but a NEW high-confidence CANDIDATE FIX
+  has landed and needs a `rustc-smoke` run to confirm. The on-device `rustc`
   (Phase 95b RUSTC_OK milestone) cold-loads + relocates + executes
   `librustc_driver.so` but NULL-derefs (`CR2=0`) early in startup. The multi-module
-  static-TLS loader gap that was the leading hypothesis is now CLOSED (commit
-  `59cd0c00`) and ruled OUT — rustc crashes identically with the TLS gap fixed. The
-  remaining blocker is a separate, non-TLS crash in rustc's runtime init. A safe,
-  offline next-diagnostic is wired up (a loader load-base log + disassembly); no
-  more risky in-kernel probes.
+  static-TLS loader gap (commit `59cd0c00`) was ruled OUT — rustc crashed identically
+  with it fixed. A **separate loader ABI gap** was then found by static analysis: the
+  from-scratch ld-musl ran shared-object `DT_INIT`/`DT_INIT_ARRAY` constructors with
+  NO arguments (matching musl's `do_init_fini`), but **glibc's loader passes
+  `(argc, argv, envp)` to every init_array entry including shared libraries**, and
+  Rust's `std` captures `argv`/`envp` via exactly such an `.init_array` entry. A
+  dynamic (`prefer-dynamic`) rustc keeps `std` in a shared `libstd-*.so`, so its
+  argv-capture ctor was run with no args → null/garbage argv → `std::env::args()`
+  derefs null → `CR2=0`. **Fix landed (commit `cdb48a11`): the loader now passes
+  `(argc, argv, envp)` to all constructors, glibc-style.** Regression-guarded by
+  `dynamic-hello-smoke` (existing C ctors ignore the extra register args — harmless
+  on the SysV ABI). **NOT yet confirmed against rustc** — a full `rustc-smoke`
+  (~90 min, KVM) is required. If rustc still `CR2=0`s, the remaining candidate is a
+  TLS-residual / different null deref — use the offline disassembly path below
+  (`rip - base = offset`, check for an `fs:` prefix to distinguish TLS from a plain
+  null).
 owner: unassigned (follow-up to the Phase 95c VFS-perf + loader-TLS work)
 ---
 
@@ -41,9 +53,50 @@ spot.** So the crash is **NOT** the DSO-TLS gap.
 | `38a92459` | Phase 95c C — `kernel_core::fs::lru_cache::LruBlockCache`, vfs_server ext2 block cache → LRU (kills fill-and-hold thrash) |
 | `f1f731ee` | `M3OS_DATA_DISK_GB` (clamped 1..=64); rustc-smoke uses **3 GiB** (1 GiB ENOSPC'd mid-install after ~330 MiB) |
 | `59cd0c00` | **Multi-module static TLS** in ld-musl (DT_NEEDED DSO TLS: `DsoTls`, `assign_tls_modules`, multi-module block + DTV, `TPOFF64`/`DTPMOD64`/`DTPOFF64` resolution). Regression-clean. Does NOT fix rustc. |
+| `cdb48a11` | **Loader init-array ABI fix (CANDIDATE FIX for this CR2=0).** ld-musl now passes `(argc, argv, envp)` to every `DT_INIT`/`DT_INIT_ARRAY` constructor (`run_constructors_for`), matching glibc's `dl-init.c::call_init`. Adds `InitFn`, `startup_args_from_stack`, a process-lifetime arg stash (for dlopen-time ctors), + a host unit test. `cargo xtask check` clean, independently reviewed (APPROVE on all ABI/safety axes). NOT yet confirmed against rustc — needs a `rustc-smoke` run. |
 
 Net effect proven on-device: install completes, the 162 MiB DSO demand-pages in and
-executes. Only the runtime NULL-deref remains between here and `RUSTC_OK`.
+executes. The runtime NULL-deref is the last thing between here and `RUSTC_OK`;
+`cdb48a11` is the leading candidate fix for it.
+
+## The new leading candidate: the init-array ABI gap (commit `cdb48a11`)
+
+**The mechanism.** Rust's `std` registers an `.init_array` entry — `ARGV_INIT_ARRAY`
+/ `init_wrapper(argc, argv, envp)` in `std::sys::pal::unix::args` — that captures
+`argv`/`envp` into module-level statics so `std::env::args()` works. On the
+`x86_64-*-linux-*` targets (musl included, since `target_os = "linux"`) this is the
+**only** argv source for a shared `std`. The capture **requires the loader to invoke
+init_array entries with `(argc, argv, envp)`**:
+
+- **glibc** does this — `dl-init.c::call_init` calls every init_array entry
+  (executable AND shared library) as `void (*)(int, char**, char**)`.
+- **musl** does NOT — `do_init_fini` calls library ctors as `void (*)(void)`. A
+  static musl Rust binary is unaffected because the *main executable's* init_array
+  is run by `__libc_start_main`/`__libc_start_init` with the three args; only the
+  exe's std matters there.
+- m3OS's from-scratch ld-musl matched **musl** (no args). For a **dynamic
+  `prefer-dynamic` rustc**, `std` lives in a shared `libstd-*.so` whose argv-capture
+  init_array is run by **the loader**, not `__libc_start_main` — so it got no args →
+  the captured `argv`/`envp` statics are null/garbage → the first `std::env::args()`
+  (rustc reads its args immediately) derefs null → `CR2=0`, a raw page fault (NOT a
+  Rust panic), early in `librustc_driver.so` startup — exactly the observed symptom.
+
+**The fix.** `run_constructors_for` now calls each `DT_INIT`/`DT_INIT_ARRAY` entry as
+`InitFn = extern "C" fn(i32, *const *const u8, *const *const u8)` with the real
+`(argc, argv, envp)` (derived from the kernel-built SysV startup stack in `dl_entry`,
+stashed for dlopen-time ctors). Passing three register args to a `void(void)` C ctor
+is harmless on the x86-64 SysV ABI (the callee ignores `rdi`/`rsi`/`rdx`), so every
+existing C/musl DSO keeps working — `dynamic-hello-smoke` is the regression guard.
+
+**Confidence + caveat.** This is a textbook glibc-vs-musl loader divergence and the
+symptom (raw null deref, no panic, fixed offset in a Rust shared object, early
+startup) fits. BUT it is **NOT confirmed** — no `rustc-smoke` was run this session
+(the install + cold-load is ~90 min under KVM, outside the session's validation
+envelope). **Next step: run `rustc-smoke` and check whether `rustc --version` now
+gets past the CR2=0.** If it does → milestone candidate. If it still CR2=0s at the
+same offset, fall back to the offline-disassembly path below; an `fs:`-prefixed
+faulting instruction means it's TLS (hypothesis 2/3), a plain `mov reg,[reg]` means a
+different non-arg null.
 
 ## Hypotheses for the remaining `CR2=0` (ranked)
 
