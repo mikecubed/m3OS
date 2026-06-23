@@ -2509,6 +2509,19 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
         } else {
             name
         };
+        // Diagnostic aid — log each loaded DSO's soname, load base, and image
+        // length. A userspace fault's `rip` (e.g. rustc's CR2=0 NULL-deref) can
+        // then be mapped to its DSO + offset (`rip - base`) for OFFLINE
+        // disassembly of the faulting instruction — no risky in-kernel
+        // instruction read needed. Low-volume: one line per DT_NEEDED dependency
+        // at process startup.
+        serial(b"ldso: loaded ");
+        serial(display_name);
+        serial(b" base=");
+        serial_hex(loaded.load_bias);
+        serial(b" len=");
+        serial_hex(loaded.image_len);
+        serial(b"\n");
         let new_idx = dsos.len();
         if dsos.push(loaded).is_err() || loaded_names.push(display_name).is_err() {
             serial(b"ldso: too many DSOs\n");
