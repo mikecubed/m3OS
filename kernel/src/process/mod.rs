@@ -1299,12 +1299,13 @@ pub fn shared_vma_prot_and_pkey(pid: Pid, addr: u64) -> Option<(u64, u8)> {
 }
 
 /// Phase 95b (Area A.2) — demand-fill info for a **lazy file-backed** VMA
-/// (`MAP_LAZY_FILE`). Returns `(prot, pkey, fd, file_offset_of_this_page)` so the
-/// page-fault handler can read the faulting page straight from the backing file,
-/// or `None` when `addr` is not inside a lazy file-backed VMA (the caller then
-/// falls back to zero-fill demand paging). All fields are copied out so the
-/// `PROCESS_TABLE` lock is released before the (blocking) file read.
-pub fn shared_vma_demand_file(pid: Pid, addr: u64) -> Option<(u64, u8, u32, u64)> {
+/// (`MAP_LAZY_FILE`). Returns `(prot, pkey, fd, file_offset_of_this_page,
+/// vma_end)` so the page-fault handler can read the faulting page (and a
+/// readahead cluster up to `vma_end`) straight from the backing file, or `None`
+/// when `addr` is not inside a lazy file-backed VMA (the caller then falls back
+/// to zero-fill demand paging). All fields are copied out so the `PROCESS_TABLE`
+/// lock is released before the (blocking) file read.
+pub fn shared_vma_demand_file(pid: Pid, addr: u64) -> Option<(u64, u8, u32, u64, u64)> {
     let table = PROCESS_TABLE.lock();
     let tgid = table.find(pid)?.tgid;
     let idx = canonical_mm_index(&table.processes, tgid)?;
@@ -1316,7 +1317,8 @@ pub fn shared_vma_demand_file(pid: Pid, addr: u64) -> Option<(u64, u8, u32, u64)
     let page_base = addr & !0xFFF;
     // file offset of this page = first-byte offset + distance from vma.start.
     let page_file_off = fb.offset.wrapping_add(page_base.saturating_sub(vma.start));
-    Some((vma.prot, vma.pkey, fb.fd, page_file_off))
+    let vma_end = vma.start.saturating_add(vma.len);
+    Some((vma.prot, vma.pkey, fb.fd, page_file_off, vma_end))
 }
 
 pub fn with_shared_mm_mut<R, F>(pid: Pid, f: F) -> Option<R>

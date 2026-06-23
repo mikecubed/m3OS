@@ -767,7 +767,6 @@ fn demand_map_user_page_from_buf_locked(vaddr: u64, prot: u64, pkey: u8, buf: &[
 
 fn demand_map_user_page(vaddr: u64, prot: u64) -> bool {
     let addr_space = crate::process::current_addr_space();
-    let page_base = vaddr & !0xFFF;
     let mapped = {
         let _page_table_guard =
             addr_space.map(|addr_space| unsafe { addr_space.as_ref() }.lock_page_tables());
@@ -777,15 +776,14 @@ fn demand_map_user_page(vaddr: u64, prot: u64) -> bool {
     if !mapped {
         return false;
     }
-    if crate::smp::is_per_core_ready()
-        && let Some(addr_space) = addr_space
-    {
-        tlb_shootdown_range_from_fault_context(
-            unsafe { addr_space.as_ref() },
-            page_base,
-            page_base + 4096,
-        );
-    }
+    // Track B (Phase 95b): a not-present -> present demand fill needs NO
+    // cross-core TLB shootdown. No core can hold a stale translation for a page
+    // that was never present (x86 never caches a not-present PTE that requires
+    // invalidation on the present transition), and the faulting core re-walks on
+    // return. Skipping the per-page shootdown IPI here is the SMP amplification
+    // fix — under multi-core, stack/anon demand paging during a heavy load (the
+    // loader, V8, rustc) no longer broadcasts one IPI per faulted page to every
+    // idle core. munmap/mprotect/CoW (present-PTE changes) keep their shootdowns.
     bump_current_addr_space_generation();
     true
 }
@@ -806,29 +804,64 @@ fn demand_map_vma_page(vaddr: u64, require_write: bool) -> bool {
     // The file read BLOCKS (virtio / vfs_server IPC) and must run with NO
     // page-table lock held — a ring-3 fault holds no kernel locks, so blocking
     // here only switches the faulting task out until the read completes.
-    if let Some((prot, pkey, fd, file_off)) = crate::process::shared_vma_demand_file(pid, vaddr) {
+    if let Some((prot, pkey, fd, file_off, vma_end)) =
+        crate::process::shared_vma_demand_file(pid, vaddr)
+    {
         let any_access = prot & (PROT_READ | PROT_WRITE | PROT_EXEC) != 0;
         let write_ok = !require_write || prot & PROT_WRITE != 0;
         if !any_access || !write_ok {
             return false;
         }
+        // Readahead: fill a cluster of up to 64 KiB forward from the faulting
+        // page in ONE backing-file read, then map every page in the cluster.
+        // A bare per-page fill costs one blocking vfs IPC per 4 KiB; loading a
+        // 162 MB DSO whose relocation/startup touches a large, mostly-sequential
+        // working set then becomes thousands of round-trips. A 64 KiB cluster
+        // (= `VFS_MAX_PREAD`, one IPC) amortises that ~16x — the same bulk-read
+        // efficiency the eager path had, but only for pages actually touched.
+        const CLUSTER: u64 = 64 * 1024;
+        let page_base = vaddr & !0xFFF;
+        let cluster_end = (page_base + CLUSTER).min(vma_end);
+        let cluster_len = (cluster_end - page_base) as usize;
         // Heap (not stack) buffer: the file read path is already deep on the
         // per-task kernel stack (Area C), so keep this frame's footprint small.
-        let mut buf = alloc::vec![0u8; 4096];
-        let n = match crate::arch::x86_64::syscall::demand_read_file_page(
-            pid,
-            fd as usize,
-            file_off as usize,
-            &mut buf,
-        ) {
-            Ok(n) => n.min(4096),
-            Err(_) => return false,
-        };
+        let mut buf = alloc::vec![0u8; cluster_len];
+        // Loop the read so a short read (a backend returning fewer bytes than
+        // requested mid-file) fully fills the cluster; `Ok(0)` is true EOF, and
+        // pages past `n` are then legitimately zero (past the file extent).
+        let mut n = 0usize;
+        while n < cluster_len {
+            match crate::arch::x86_64::syscall::demand_read_file_page(
+                pid,
+                fd as usize,
+                (file_off as usize) + n,
+                &mut buf[n..],
+            ) {
+                Ok(0) => break,
+                Ok(r) => n += r.min(cluster_len - n),
+                Err(_) => return false,
+            }
+        }
         let addr_space = crate::process::current_addr_space();
         let mapped = {
             let _page_table_guard =
                 addr_space.map(|addr_space| unsafe { addr_space.as_ref() }.lock_page_tables());
-            demand_map_user_page_from_buf_locked(vaddr, prot, pkey, &buf[..n])
+            // Map the faulting page first (so a partial cluster still satisfies
+            // the fault), then the rest of the cluster as readahead. Pages
+            // already present (raced) are skipped inside the fill.
+            let mut faulting_ok = false;
+            let mut off = 0usize;
+            while off < cluster_len {
+                let page_va = page_base + off as u64;
+                let hi = (off + 4096).min(buf.len());
+                let slice: &[u8] = if off < n { &buf[off..hi.min(n)] } else { &[] };
+                let ok = demand_map_user_page_from_buf_locked(page_va, prot, pkey, slice);
+                if page_va == page_base {
+                    faulting_ok = ok;
+                }
+                off += 4096;
+            }
+            faulting_ok
         };
         if !mapped {
             return false;
@@ -843,7 +876,6 @@ fn demand_map_vma_page(vaddr: u64, require_write: bool) -> bool {
     }
 
     let addr_space = crate::process::current_addr_space();
-    let page_base = vaddr & !0xFFF;
     let mapped = {
         let _page_table_guard =
             addr_space.map(|addr_space| unsafe { addr_space.as_ref() }.lock_page_tables());
@@ -867,15 +899,10 @@ fn demand_map_vma_page(vaddr: u64, require_write: bool) -> bool {
     if !mapped {
         return false;
     }
-    if crate::smp::is_per_core_ready()
-        && let Some(addr_space) = addr_space
-    {
-        tlb_shootdown_range_from_fault_context(
-            unsafe { addr_space.as_ref() },
-            page_base,
-            page_base + 4096,
-        );
-    }
+    // Track B (Phase 95b): not-present -> present anonymous demand fill — no
+    // cross-core shootdown required (see `demand_map_user_page`). The lazy
+    // file-backed branch above already skips it; this brings the anonymous
+    // mmap demand path to parity.
     bump_current_addr_space_generation();
     true
 }
