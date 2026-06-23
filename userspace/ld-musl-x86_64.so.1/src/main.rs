@@ -2374,6 +2374,72 @@ unsafe fn setup_static_tls(dsos: &[LoadedDso]) {
             }
         }
     }
+
+    // Phase 95b follow-up — give musl the TLS descriptors a dynamic process's
+    // `__dls3` would, so the application's later `pthread_create → __copy_tls`
+    // (which reads `libc.tls_size/align/head/cnt` to SIZE, PLACE and per-module
+    // COPY a new thread's TLS) sets the thread up correctly. Without this,
+    // `__copy_tls` computed `td=0` (the WRITE-to-0x8 crash at `libc.so+0x1df09`)
+    // and — with only the scalars set but `tls_head=NULL` — a spawned thread's
+    // per-module `.tdata` was never copied / its `dtv[i]` never set, so the thread
+    // faulted on its first thread-local access. The m3OS loader REPLACED musl's
+    // `__dls3` and musl's `static_init_tls` mis-derives these for a dynamic main exe
+    // (musl patch 0004 no-ops it), so the loader — which holds the correct layout —
+    // builds the `struct tls_module` list itself and publishes it via the exported
+    // `__m3os_set_tls(head, size, align, cnt)` (musl patch 0004). Skips gracefully
+    // if the symbol is absent (un-patched libc → no regression).
+    if module_count > 0 && module_count < 512 {
+        // musl 1.2.5 `struct tls_module { struct tls_module *next; void *image;
+        //   size_t len, size, align, offset; }` — 48 bytes, fields at 0/8/16/24/32/40.
+        const TLS_MOD_SZ: u64 = 48;
+        let list_len = (module_count * TLS_MOD_SZ + 4095) & !4095u64;
+        let list = sys_mmap(
+            0,
+            list_len,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        if list >= 0 {
+            let list = list as u64;
+            // Populate one entry per module, indexed by `tls_id - 1`, and chain
+            // `next` in tls_id order so `__copy_tls` assigns `dtv[i]` to tls_id `i`.
+            for dso in dsos {
+                if let Some(t) = dso.tls {
+                    if t.tls_id == 0 || (t.tls_id as u64) > module_count {
+                        continue;
+                    }
+                    let m = list + (t.tls_id as u64 - 1) * TLS_MOD_SZ;
+                    let next = if (t.tls_id as u64) < module_count {
+                        list + (t.tls_id as u64) * TLS_MOD_SZ
+                    } else {
+                        0
+                    };
+                    // SAFETY: `m` is within the freshly-mmap'd `module_count`-entry
+                    // list; the offsets match musl 1.2.5's `struct tls_module`.
+                    unsafe {
+                        *(m as *mut u64) = next; // next
+                        *((m + 8) as *mut u64) = t.image_vaddr; // image (.tdata)
+                        *((m + 16) as *mut u64) = t.filesz; // len (bytes to copy)
+                        *((m + 24) as *mut u64) = t.memsz; // size
+                        *((m + 32) as *mut u64) = t.align; // align
+                        *((m + 40) as *mut u64) = t.tls_offset; // offset (TP-relative)
+                    }
+                }
+            }
+            if let Some(addr) = unsafe { sym::lookup(dsos, b"__m3os_set_tls", None) }
+                && addr != 0
+            {
+                let tls_size = total_off + TCB_RESERVE + place_align;
+                // SAFETY: `void __m3os_set_tls(void *head, size_t size, size_t align,
+                // size_t cnt)` (musl patch 0004); `list` is the chained module list.
+                let f: extern "C" fn(u64, u64, u64, u64) =
+                    unsafe { core::mem::transmute::<u64, extern "C" fn(u64, u64, u64, u64)>(addr) };
+                f(list, tls_size, place_align, module_count);
+            }
+        }
+    }
 }
 
 /// Bring-up driver invoked from the naked-asm `_start`.

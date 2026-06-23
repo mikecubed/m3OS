@@ -1,15 +1,33 @@
 ---
+status: MILESTONE — **`rustc` EXECUTES ON m3OS.** `rustc --version` (`rustc 1.96.0`)
+  and `rustc --print sysroot` both COMPLETE with NO crash, and `rustc hello.rs` runs
+  codegen on its worker thread (paged ~75 MiB) before a downstream panic. The
+  multi-week `CR2=0` blocker is BROKEN. It took THREE foreign-loader/libc fixes this
+  session (each a global rustc was the first program to exercise):
+  (1) **`__libc.auxv`** — musl patch `0003` exports `__m3os_set_auxv`, loader calls it
+  before constructors (mallocng first-malloc crash at `libc.so+0x28188`);
+  (2) **`libc.tls_*` + no-op `static_init_tls`** — musl patch `0004` exports
+  `__m3os_set_tls(head,size,align,cnt)` and no-ops `static_init_tls`;
+  (3) **the `tls_module` list** — the loader builds musl's `struct tls_module` list in
+  `setup_static_tls` and publishes it via `__m3os_set_tls`, so `pthread_create →
+  __copy_tls` sets up the worker thread's per-module TLS correctly (the `__copy_tls`
+  `td=0` WRITE-to-0x8 crash + the follow-on worker-thread TLS-read fault are GONE).
+  VALIDATED: `process killed = 0`; rustc runs its codegen thread.
+  NEXT BLOCKER (different class — a rustc/std issue, NOT a loader/libc global):
+  `rustc hello.rs` panics `thread 'main' panicked at
+  compiler/rustc_session/src/filesearch.rs:255:60` → SIGABRT. rustc's library/path
+  search hits a `std`-on-m3OS filesystem/path difference (likely `canonicalize` /
+  `current_exe` (`/proc/self/exe`) / `read_dir`). `--print sysroot` works, so it's a
+  DIFFERENT search than the sysroot root. This is the `RUSTC_OK` gate now — investigate
+  `filesearch.rs:255` (what path op fails) + the relevant m3OS VFS/`/proc` syscall.
+  rust-lld (another big dynamic binary) hasn't been reached yet (the panic precedes it).
+  ---PRE-MILESTONE-STATUS-BELOW (historical)---
 status: OPEN — FIRST null-deref FIXED + validated; rustc now 2× further, hits the
   NEXT one. The `__libc.auxv` NULL-deref at `libc.so+0x28188` is FIXED (loader calls
   the new exported `__m3os_set_auxv(envp)` before constructors; musl patch `0003`).
   VALIDATED: on `rustc-smoke` rustc went from the old crash at ~16 MiB
   (`demand_pages≈4115`) to **~36 MiB (`demand_pages≈9126`)** and the `addr=0x0` READ
-  crash is GONE. It now hits a DIFFERENT crash — a **WRITE to `addr=0x8`**
-  (`CAUSED_BY_WRITE|USER_MODE`) at `rip=0x200a1f9f09` = **`libc.so+0x1df09`** (right by
-  `__init_libc`) — almost certainly the next uninitialized runtime global / the app's
-  `__libc_start_main → __init_libc → __init_tls` path (which rustc now reaches) writing
-  through a null at +8. Disassembly of `0x1df09` in progress; iterative dynamic-runtime
-  bring-up (each fixed global reveals the next, as with `0001`/`0002`/`0003`).
+  crash is GONE. (Superseded by the MILESTONE above.)
   ---PRE-FIX-STATUS-BELOW (historical)---
 status: OPEN — crash LOCALIZED to `libc.so + 0x28188`; the original `CR2=0` is NOT
   fixed (CORRECTION below). `rustc` loads + runs LLVM (paged ~16 MiB) then NULL-derefs
