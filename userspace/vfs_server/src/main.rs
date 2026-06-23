@@ -93,14 +93,19 @@ struct Ext2State {
     /// uncached, so every path-resolution re-read its directory / inode / bitmap
     /// / indirect blocks from disk (a `pkg install` issued tens of thousands of
     /// per-block `block_read` round-trips). This caches ext2 blocks by block
-    /// number; insertion is fill-only — once `BLOCK_CACHE_MAX` blocks are held it
-    /// stops admitting new blocks (no eviction), so it retains the first N distinct
-    /// blocks seen rather than an LRU working set. `BLOCK_CACHE_MAX` is sized
-    /// (16 MiB) to hold a whole package's metadata working set across an install,
-    /// so the cap is not reached for the target workload. `write_sectors`
-    /// invalidates any overlapping block so the write authority never serves stale
-    /// data (mirrors the kernel engine's `block_cache` + invalidate-on-write).
-    block_cache: RefCell<BTreeMap<u32, Vec<u8>>>,
+    /// number; the data-block run reader (`read_block_run`) bypasses it, so what
+    /// it holds is the re-read **metadata** (inode-table / directory / bitmap /
+    /// indirect-pointer blocks). `write_sectors` invalidates any overlapping block
+    /// so the write authority never serves stale data.
+    ///
+    /// Phase 95c (Track C) — **LRU eviction** (was fill-and-hold, which stopped
+    /// admitting once full and kept the first `cap` distinct blocks ever seen). A
+    /// large operation overflows the cap, and fill-and-hold then misses every
+    /// later metadata read to the device — notably the hot indirect blocks a
+    /// 162 MB DSO cold-load re-touches, *especially* when a preceding install
+    /// already filled the cache (fill-and-hold refused to admit the cold-load's
+    /// indirect blocks at all). LRU keeps the genuinely-hot blocks resident.
+    block_cache: RefCell<kernel_core::fs::lru_cache::LruBlockCache>,
     /// Phase 87 follow-up — write-back buffer for indirect/double-indirect
     /// **pointer** blocks. Mapping each data block of a large file wires one
     /// pointer into its indirect block; writing that whole 4 KiB block through to
@@ -143,8 +148,10 @@ struct Ext2State {
 }
 
 /// Max ext2 blocks held in the vfs_server read-through cache (4 KiB blocks →
-/// ~16 MiB ceiling). Large enough to hold a package's metadata working set
-/// (dir/inode/bitmap/indirect blocks) across an install without unbounded growth.
+/// ~16 MiB ceiling). Phase 95c (Track C): with LRU eviction this is now a true
+/// working-set bound — when full, the least-recently-used metadata block is
+/// evicted to admit a new one, so a workload whose hot metadata exceeds the cap
+/// keeps its *hot* blocks resident instead of thrashing every later read.
 const BLOCK_CACHE_MAX: usize = 4096;
 
 /// Phase 87 — flush the superblock + BGD free-count summaries to disk after at
@@ -247,19 +254,15 @@ impl Ext2State {
         if let Some(dirty) = self.dirty_blocks.borrow().get(&block_num) {
             return Ok(dirty.clone());
         }
-        if let Some(cached) = self.block_cache.borrow().get(&block_num) {
-            return Ok(cached.clone());
+        if let Some(cached) = self.block_cache.borrow_mut().get(block_num) {
+            return Ok(cached.to_vec());
         }
         let lba = self.block_to_lba(block_num);
         let mut buf = vec![0u8; self.block_size as usize];
         let sector_count = self.sectors_per_block as usize;
         self.read_sectors(lba, sector_count, &mut buf)?;
-        {
-            let mut cache = self.block_cache.borrow_mut();
-            if cache.len() < BLOCK_CACHE_MAX {
-                cache.insert(block_num, buf.clone());
-            }
-        }
+        // LRU admit (evicts the least-recently-used block if full).
+        self.block_cache.borrow_mut().insert(block_num, buf.clone());
         Ok(buf)
     }
 
@@ -281,7 +284,7 @@ impl Ext2State {
         let last = (end_lba - self.base_lba).div_ceil(spb);
         let mut cache = self.block_cache.borrow_mut();
         for b in first..last {
-            cache.remove(&(b as u32));
+            cache.remove(b as u32);
         }
     }
 
@@ -330,20 +333,19 @@ impl Ext2State {
             // Write failed — drop any cached copy so a later read re-reads the
             // actual (possibly partially-written) on-disk state, never a value
             // we cannot prove landed.
-            self.block_cache.borrow_mut().remove(&block_num);
+            self.block_cache.borrow_mut().remove(block_num);
             return Err(());
         }
         self.writes_since_flush.set(true);
         let mut cache = self.block_cache.borrow_mut();
         if data.len() == self.block_size as usize {
-            // Update if present (the hot path); otherwise insert while bounded.
-            if cache.contains_key(&block_num) || cache.len() < BLOCK_CACHE_MAX {
-                cache.insert(block_num, data.to_vec());
-            }
+            // Write-through refresh (LRU admits/refreshes + marks most-recent;
+            // this block is hot metadata that read-modify-write re-reads).
+            cache.insert(block_num, data.to_vec());
         } else {
             // Defensive: a short/odd write can't refresh a full cached block, so
             // drop it rather than cache a malformed entry (no caller does this).
-            cache.remove(&block_num);
+            cache.remove(block_num);
         }
         Ok(())
     }
@@ -367,7 +369,7 @@ impl Ext2State {
             dirty.insert(block_num, data.to_vec());
             // A dirty entry shadows any clean cache copy; drop the cache copy so
             // the two can't disagree (read_block checks dirty first anyway).
-            self.block_cache.borrow_mut().remove(&block_num);
+            self.block_cache.borrow_mut().remove(block_num);
             if dirty.len() < DIRTY_FLUSH_THRESHOLD {
                 return Ok(());
             }
@@ -408,17 +410,14 @@ impl Ext2State {
                 // Could not persist — drop any clean cache copy so a later read
                 // re-reads the actual on-disk state, leave the block in
                 // `dirty_blocks` for a later retry, and surface the error.
-                self.block_cache.borrow_mut().remove(&block_num);
+                self.block_cache.borrow_mut().remove(block_num);
                 return Err(());
             }
             self.writes_since_flush.set(true);
             // Persisted — now clean on disk: drop it from the dirty set and
-            // refresh the read cache (bounded insert).
+            // refresh the read cache (LRU admit/refresh).
             self.dirty_blocks.borrow_mut().remove(&block_num);
-            let mut cache = self.block_cache.borrow_mut();
-            if cache.contains_key(&block_num) || cache.len() < BLOCK_CACHE_MAX {
-                cache.insert(block_num, data);
-            }
+            self.block_cache.borrow_mut().insert(block_num, data);
         }
         Ok(())
     }
@@ -463,7 +462,7 @@ impl Ext2State {
         // never serve a value we cannot prove landed).
         let mut cache = self.block_cache.borrow_mut();
         for i in 0..count as u32 {
-            cache.remove(&(start_block + i));
+            cache.remove(start_block + i);
         }
         if ret < 0 {
             Err(())
@@ -804,7 +803,7 @@ impl Ext2State {
         // here, but that flush result is best-effort (discarded on I/O error),
         // so make the freed-block invariant explicit rather than implicit.
         self.dirty_blocks.borrow_mut().remove(&block_num);
-        self.block_cache.borrow_mut().remove(&block_num);
+        self.block_cache.borrow_mut().remove(block_num);
 
         self.bgd_table[group].free_blocks_count += 1;
         self.superblock.free_blocks_count += 1;
@@ -1829,7 +1828,9 @@ fn program_main(_args: &[&str]) -> i32 {
         bgd_table,
         block_size,
         sectors_per_block,
-        block_cache: RefCell::new(BTreeMap::new()),
+        block_cache: RefCell::new(kernel_core::fs::lru_cache::LruBlockCache::new(
+            BLOCK_CACHE_MAX,
+        )),
         dirty_blocks: RefCell::new(BTreeMap::new()),
         meta_dirty_ops: 0,
         block_reservation: None,
