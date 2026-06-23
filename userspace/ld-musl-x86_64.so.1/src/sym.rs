@@ -157,6 +157,30 @@ pub unsafe fn lookup(scope: &[LoadedDso], name: &[u8], version: Option<&[u8]>) -
     None
 }
 
+/// Phase 95c follow-up — resolve a TLS symbol `name` across `scope` to its
+/// *defining* DSO index and the symbol's `st_value` (the offset within that
+/// DSO's TLS block, NOT a load address). Used by the TLS relocation arms to map
+/// a cross-DSO thread-local reference to the module (`tls_id`/`tls_offset`) that
+/// defines it. Returns `None` when no DSO in scope defines the name.
+///
+/// Note: the per-DSO walk shares the `st_value != 0` filter the regular lookup
+/// uses, so a TLS symbol defined at module offset 0 is not found cross-DSO
+/// (rare — same-DSO references resolve directly from `st_shndx`).
+///
+/// # Safety
+/// Same contract as [`lookup`] — every `LoadedDso` in `scope` whose hash /
+/// symtab / strtab pointers are populated must reference its mapped image.
+pub unsafe fn lookup_tls(scope: &[LoadedDso], name: &[u8]) -> Option<(usize, u64)> {
+    for (idx, dso) in scope.iter().enumerate() {
+        if let Some(hit) = unsafe { lookup_in_dso(dso, name) } {
+            // `DsoHit.addr == load_bias + st_value`, so recover the raw
+            // module-relative `st_value` the TLS layout/DTV index against.
+            return Some((idx, hit.addr.wrapping_sub(dso.load_bias)));
+        }
+    }
+    None
+}
+
 /// Pick the GNU or SysV backend for `dso` based on which hash table
 /// it carries and run it. Returns the resolved address + sym_idx if
 /// the DSO defines `name`, or `None` if it doesn't.

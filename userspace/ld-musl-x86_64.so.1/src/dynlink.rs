@@ -317,6 +317,29 @@ pub fn lookup_in_hash_table(
 // drive without invoking real syscalls.
 // ---------------------------------------------------------------------------
 
+/// Per-DSO thread-local-storage descriptor (Phase 95c follow-up — multi-module
+/// static TLS). Captured from a DSO's `PT_TLS` program header at load time; the
+/// runtime-assigned `tls_id` / `tls_offset` are filled in by the loader's TLS
+/// module-assignment pass (run **before** relocations) so the `DTPMOD64` /
+/// `TPOFF64` relocation arms and the static TLS block + DTV can reference this
+/// module. A DSO with no `PT_TLS` carries `None`.
+#[derive(Debug, Clone, Copy)]
+pub struct DsoTls {
+    /// Runtime address of the `.tdata` template (`load_bias + p_vaddr`).
+    pub image_vaddr: u64,
+    /// `p_memsz` — total TLS size (`.tdata` initialized image + `.tbss`).
+    pub memsz: u64,
+    /// `p_filesz` — initialized (`.tdata`) bytes to copy; the rest is zeroed.
+    pub filesz: u64,
+    /// `p_align` (forced to `>= 1`).
+    pub align: u64,
+    /// 1-based module id (`0` = unassigned). Indexes the thread's DTV.
+    pub tls_id: u32,
+    /// Variant-II distance below the thread pointer: the module's block starts
+    /// at `TP - tls_offset` (`0` = unassigned).
+    pub tls_offset: u64,
+}
+
 /// One mapped DSO. `load_bias` + `image_len` are the byte range the
 /// runtime `mmap`ed for the whole image; `dyn_` is the parsed
 /// `PT_DYNAMIC` view rebased against `load_bias`.
@@ -334,6 +357,10 @@ pub struct LoadedDso {
     /// Parsed `PT_DYNAMIC` view, pointers rebased against
     /// `load_bias`.
     pub dyn_: DynamicSection,
+    /// The DSO's `PT_TLS` module (Phase 95c follow-up), or `None` if it carries
+    /// no thread-local storage. `tls_id` / `tls_offset` are assigned by the
+    /// loader before the relocation pass.
+    pub tls: Option<DsoTls>,
 }
 
 impl LoadedDso {
@@ -345,6 +372,7 @@ impl LoadedDso {
             load_bias: 0,
             image_len: 0,
             dyn_: DynamicSection::empty(),
+            tls: None,
         }
     }
 }
@@ -776,6 +804,7 @@ mod tests {
             load_bias: 0x4000_0000,
             image_len: 0x3000, // page-aligned, 12 KiB
             dyn_: DynamicSection::empty(),
+            tls: None,
         };
         let mut observed: Option<(u64, u64)> = None;
         let r = unmap_dso(&d, |addr, len| {
@@ -792,6 +821,7 @@ mod tests {
             load_bias: 0x4000_0000,
             image_len: 0x3000,
             dyn_: DynamicSection::empty(),
+            tls: None,
         };
         let r = unmap_dso(&d, |_addr, _len| -22); // -EINVAL
         assert_eq!(r, Err(UnmapError::MunmapFailed(-22)));

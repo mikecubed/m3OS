@@ -413,6 +413,8 @@ unsafe fn parse_linker_dso(phdr_base: *const Phdr, phnum: usize, load_bias: u64)
             load_bias,
             image_len,
             dyn_: DynamicSection::empty(),
+            // The linker's own image carries no PT_TLS.
+            tls: None,
         };
     }
     let mut entries: heapless::Vec<Dyn, 64> = heapless::Vec::new();
@@ -438,6 +440,8 @@ unsafe fn parse_linker_dso(phdr_base: *const Phdr, phnum: usize, load_bias: u64)
         load_bias,
         image_len,
         dyn_,
+        // The linker's own image carries no PT_TLS.
+        tls: None,
     }
 }
 
@@ -1103,10 +1107,32 @@ unsafe fn load_dso_impl(fd: i64, scratch: u64, scratch_len: u64) -> Result<Loade
     // guard) — a few open fds per loaded DSO. Every *error* return above still
     // drops the guard and closes the fd (the failed DSO's mappings go unused).
     core::mem::forget(fd_guard);
+
+    // Phase 95c follow-up — capture this DSO's PT_TLS template (if any) so the
+    // loader's TLS module-assignment pass can give it a slot in the static TLS
+    // block + DTV and resolve its DTPMOD64/TPOFF64 relocs. `tls_id`/`tls_offset`
+    // stay 0 here (assigned later, before the reloc pass).
+    let mut tls: Option<ldso_core::dynlink::DsoTls> = None;
+    for i in 0..phnum {
+        let ph = unsafe { *phdr_base.add(i) };
+        if ph.p_type == PT_TLS {
+            tls = Some(ldso_core::dynlink::DsoTls {
+                image_vaddr: load_bias.wrapping_add(ph.p_vaddr),
+                memsz: ph.p_memsz,
+                filesz: ph.p_filesz,
+                align: ph.p_align.max(1),
+                tls_id: 0,
+                tls_offset: 0,
+            });
+            break;
+        }
+    }
+
     Ok(LoadedDso {
         load_bias,
         image_len,
         dyn_,
+        tls,
     })
 }
 
@@ -1252,6 +1278,50 @@ unsafe fn maybe_ifunc_resolve(dsos: &[LoadedDso], sym: &Sym, value: u64) -> u64 
     } else {
         value
     }
+}
+
+/// Phase 95c follow-up — resolve the TLS module (and the referenced symbol's
+/// offset within that module's block) a TLS relocation in `dso` targets.
+///
+/// Returns `(module, st_value)`, or `None` when no TLS module can be found (a
+/// malformed/unsupported case the caller treats as a deferred 0).
+///
+/// * `sym_idx == 0` — no symbol: the module is the one being relocated, offset 0
+///   (the relocation's addend carries any in-module offset).
+/// * symbol defined in `dso` (`st_shndx != SHN_UNDEF`): module is `dso`, offset
+///   is the symbol's `st_value`.
+/// * undefined symbol: the defining DSO is found by name across `dsos` and its
+///   module + the symbol's `st_value` are returned (cross-DSO general-dynamic).
+///
+/// # Safety
+/// `symtab` / `strtab` must reference `dso`'s mapped image (the caller derives
+/// them from `dso.dyn_`); every `LoadedDso` in `dsos` must satisfy the
+/// `sym::lookup` safety contract. TLS `tls_id`/`tls_offset` must already have
+/// been assigned by `assign_tls_modules`.
+unsafe fn tls_module_for_reloc(
+    dso: &LoadedDso,
+    dsos: &[LoadedDso],
+    symtab: *const Sym,
+    strtab: *const u8,
+    strsz: u64,
+    sym_idx: u32,
+) -> Option<(ldso_core::dynlink::DsoTls, u64)> {
+    if sym_idx == 0 || symtab.is_null() {
+        return dso.tls.map(|t| (t, 0u64));
+    }
+    let sym = unsafe { sym_entry(symtab, sym_idx, dso.load_bias, dso.image_len) }?;
+    // SHN_UNDEF == 0: a non-zero st_shndx means the symbol is defined in THIS
+    // DSO (its own __thread variable), so its module is `dso`.
+    if sym.st_shndx != 0 {
+        return dso.tls.map(|t| (t, sym.st_value));
+    }
+    // Undefined here — a cross-DSO reference. Find the defining DSO by name.
+    if strtab.is_null() {
+        return None;
+    }
+    let name = unsafe { strtab_get(strtab, sym.st_name as u64, strsz) };
+    let (idx, st_value) = unsafe { sym::lookup_tls(dsos, name) }?;
+    dsos.get(idx).and_then(|d| d.tls).map(|t| (t, st_value))
 }
 
 /// Walk a `Rela` table at `table` of `count` entries and apply each
@@ -1596,19 +1666,17 @@ unsafe fn apply_rela(
                 }
             }
             R_X86_64_DTPOFF64 => {
-                // Phase 93 B.3 — general-dynamic TLS offset within the
-                // module's block. This is `st_value + addend`, which is
-                // independent of the runtime module id and thread
-                // pointer, so a foreign loader can always write it.
+                // Phase 93 B.3 / Phase 95c follow-up — general-dynamic TLS offset
+                // within the *defining* module's block (`st_value + addend`),
+                // consumed by `__tls_get_addr` as `dtv[module] + offset`. For a
+                // local/same-DSO symbol this is the symbol's own `st_value`; for
+                // a cross-DSO reference it is the defining module's `st_value`.
                 let sym_idx = r_sym(r.r_info);
-                let st_value = if sym_idx == 0 || symtab.is_null() {
-                    0
-                } else {
-                    match unsafe { sym_entry(symtab, sym_idx, dso.load_bias, dso.image_len) } {
-                        Some(s) => s.st_value,
-                        None => 0,
-                    }
-                };
+                let st_value = unsafe {
+                    tls_module_for_reloc(dso, dsos, symtab, strtab, dso.dyn_.strsz, sym_idx)
+                }
+                .map(|(_m, off)| off)
+                .unwrap_or(0);
                 let value = st_value.wrapping_add(r.r_addend as u64);
                 let image: &mut [u8] = unsafe {
                     core::slice::from_raw_parts_mut(
@@ -1621,22 +1689,62 @@ unsafe fn apply_rela(
                     return Err("apply_tls_word failed");
                 }
             }
-            R_X86_64_DTPMOD64 | R_X86_64_TPOFF64 => {
-                // Phase 93 B.3 — these need musl's *runtime* TLS module-id
-                // / static-TLS-offset assignment, which musl's own
-                // libc.so owns via `static_init_tls` (the kernel + loader
-                // hand it the auxv; it builds the TCB+DTV and sets the
-                // thread pointer itself — the weak `__init_tls` is NOT
-                // overridden by m3OS's foreign loader). A foreign loader
-                // cannot compute these values, and they do NOT appear in
-                // the Phase 93 target artifacts (libc.so has no PT_TLS;
-                // the main executable uses local-exec `%fs:` offsets
-                // baked at static-link time — verified empirically).
-                // Recognize the type so the load does not abort, leaving
-                // the slot at its load-time content. Loader-owned
-                // general-dynamic TLS across dlopen'd TLS libraries is
-                // deferred (would require replacing static_init_tls).
-                warn_tls_reloc_once();
+            R_X86_64_DTPMOD64 => {
+                // Phase 95c follow-up — general-dynamic TLS module id. The
+                // multi-module static-TLS assignment (run before this pass) gave
+                // every PT_TLS module (the main exe + each DT_NEEDED DSO, e.g.
+                // rustc's librustc_driver.so) a 1-based id; `__tls_get_addr`
+                // indexes the thread's DTV by it. An unresolved module (no TLS
+                // assignment found) leaves 0 + warns, matching the prior deferral.
+                let sym_idx = r_sym(r.r_info);
+                let value = match unsafe {
+                    tls_module_for_reloc(dso, dsos, symtab, strtab, dso.dyn_.strsz, sym_idx)
+                } {
+                    Some((m, _off)) => m.tls_id as u64,
+                    None => {
+                        warn_tls_reloc_once();
+                        0
+                    }
+                };
+                let image: &mut [u8] = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        dso.load_bias as *mut u8,
+                        dso.image_len as usize,
+                    )
+                };
+                if let Err(_e) = apply_tls_word(&r, value, image) {
+                    serial(b"ldso: apply_tls_word (DTPMOD64) failed\n");
+                    return Err("apply_tls_word failed");
+                }
+            }
+            R_X86_64_TPOFF64 => {
+                // Phase 95c follow-up — initial-exec TLS offset relative to the
+                // thread pointer. Variant II (x86_64): the module's block sits at
+                // `TP - tls_offset`, so the variable at module-offset `st_value`
+                // is reached via `%fs:(st_value - tls_offset)`. An unresolved
+                // module leaves 0 + warns (prior deferral behaviour).
+                let sym_idx = r_sym(r.r_info);
+                let value = match unsafe {
+                    tls_module_for_reloc(dso, dsos, symtab, strtab, dso.dyn_.strsz, sym_idx)
+                } {
+                    Some((m, off)) => off
+                        .wrapping_add(r.r_addend as u64)
+                        .wrapping_sub(m.tls_offset),
+                    None => {
+                        warn_tls_reloc_once();
+                        0
+                    }
+                };
+                let image: &mut [u8] = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        dso.load_bias as *mut u8,
+                        dso.image_len as usize,
+                    )
+                };
+                if let Err(_e) = apply_tls_word(&r, value, image) {
+                    serial(b"ldso: apply_tls_word (TPOFF64) failed\n");
+                    return Err("apply_tls_word failed");
+                }
             }
             _ => {
                 serial(b"ldso: unsupported reloc type ");
@@ -1900,33 +2008,20 @@ unsafe fn read_ld_bind_now(stack: *const u64) -> bool {
 /// for the asm caller to `jmp` to. Returns 0 on any unrecoverable
 /// error (the asm caller will then `jmp 0` and the kernel reports a
 /// page-fault on user code — visible failure mode).
-/// Phase 93 B.3 — establish the thread-control block + thread pointer the way
-/// musl's own dynamic linker (`__dls3`) does. In the SHARED `libc.so` the weak
-/// `static_init_tls` is overridden by a **no-op** `__init_tls` stub (musl
-/// assumes its own `ld.so` already set TLS up). m3OS's foreign Rust loader
-/// replaces `__dls3`, so it must build the TCB itself — otherwise libc's first
-/// `%fs:` access (errno, the `%fs:0x28` stack canary, locale) faults.
-///
-/// x86_64 is TLS variant II: static TLS blocks sit BELOW the thread pointer;
-/// the musl `struct pthread` TCB sits AT the thread pointer with `self` at
-/// TP+0 and `dtv` at TP+8. The main executable's `PT_TLS` (local-exec — the
-/// only TLS module this loader sets up; `DT_NEEDED` `.so` TLS is deferred) is
-/// copied into the block at `TP - tls_offset`, matching the `%fs:-N` offsets
-/// the static linker baked in. A program with no `PT_TLS` gets a bare TCB.
+/// Phase 95c follow-up — locate the main executable's `PT_TLS` template (TLS
+/// module one) from its program headers, returning a [`DsoTls`] with
+/// `tls_id`/`tls_offset` unset (assigned later by [`assign_tls_modules`]). Uses
+/// the same `exe_base`-from-`PT_PHDR` method [`setup_static_tls`] historically
+/// used, so the main's `.tdata` template is located identically (no regression).
 ///
 /// # Safety
-/// `at_phdr` must point to the main executable's program-header table (the
-/// `AT_PHDR` auxv value) with `at_phnum` valid entries. For a `PT_TLS` segment
-/// the `p_filesz` bytes of the template at the computed runtime address are
-/// read; both must reference the mapped main-executable image. `dsos` is the
-/// loaded-DSO scope used to resolve libc's `__init_tp`.
-unsafe fn setup_static_tls(at_phdr: *const Phdr, at_phnum: usize, dsos: &[LoadedDso]) {
-    // sizeof(struct pthread) on x86_64 musl 1.2.5 is ~0xc0; reserve generously
-    // so every field musl reads (self@0, dtv@8, canary@0x28, errno, locale)
-    // lands in the zeroed TCB region.
-    const TCB_RESERVE: u64 = 0x400;
-
-    // Find the main exe's PT_TLS (template) + PT_PHDR (to recover a PIE base).
+/// `at_phdr` must be the main exe's program-header table (`AT_PHDR`) with
+/// `at_phnum` valid entries; the `PT_TLS` template bytes are read later from the
+/// returned `image_vaddr`, which must reference the mapped main image.
+unsafe fn capture_main_tls(
+    at_phdr: *const Phdr,
+    at_phnum: usize,
+) -> Option<ldso_core::dynlink::DsoTls> {
     let mut tls: Option<Phdr> = None;
     let mut phdr_vaddr: u64 = 0;
     let mut have_phdr_vaddr = false;
@@ -1939,37 +2034,112 @@ unsafe fn setup_static_tls(at_phdr: *const Phdr, at_phnum: usize, dsos: &[Loaded
             have_phdr_vaddr = true;
         }
     }
-    // base = runtime AT_PHDR address - link-time PT_PHDR vaddr. For a non-PIE
-    // executable PT_PHDR's p_vaddr equals the runtime AT_PHDR, so exe_base is 0
-    // and `exe_base + p_vaddr` is the correct absolute address; the else-0
-    // fallback only mis-locates a PIE that omits PT_PHDR, which real toolchains
-    // never emit (a PIE always carries PT_PHDR).
+    let t = tls?;
+    // base = runtime AT_PHDR address - link-time PT_PHDR vaddr (0 for non-PIE).
     let exe_base = if have_phdr_vaddr {
         (at_phdr as u64).wrapping_sub(phdr_vaddr)
     } else {
         0
     };
+    Some(ldso_core::dynlink::DsoTls {
+        image_vaddr: exe_base.wrapping_add(t.p_vaddr),
+        memsz: t.p_memsz,
+        filesz: t.p_filesz,
+        align: t.p_align.max(1),
+        tls_id: 0,
+        tls_offset: 0,
+    })
+}
 
-    // Keep the segment's OWN p_align for the TP-relative module offset; the
-    // 16-byte floor ([`MIN_TLS_ALIGN`]) applies only to region/TP *placement*.
-    let (tls_memsz, tls_filesz, seg_align, tls_image) = match tls {
-        Some(t) => (
-            t.p_memsz,
-            t.p_filesz,
-            t.p_align.max(1),
-            exe_base.wrapping_add(t.p_vaddr),
-        ),
-        None => (0, 0, 1, 0),
-    };
-    let place_align = ldso_core::tls::tls_place_align(seg_align);
-    // Variant-II module offset = round_up(memsz, seg_align) — the exact value
-    // the static linker baked into the exe's local-exec %fs:-N references (NOT
-    // the 16-floored placement align, which would mis-place thread-locals for a
-    // segment whose p_align < 16 and memsz is not a multiple of 16).
-    let tls_offset = ldso_core::tls::main_tls_offset(tls_memsz, seg_align);
+/// Phase 95c follow-up — assign each TLS module (the main exe + every DT_NEEDED
+/// DSO carrying `PT_TLS`) a 1-based `tls_id` and a cumulative variant-II
+/// `tls_offset`, in load order so the main executable is module 1. MUST run
+/// before the relocation pass so the `TPOFF64`/`DTPMOD64`/`DTPOFF64` arms (and
+/// the static TLS block + DTV built by `setup_static_tls`) can reference these
+/// modules. Returns the number of TLS modules assigned.
+fn assign_tls_modules(dsos: &mut [LoadedDso]) -> u32 {
+    let mut next_id: u32 = 1;
+    let mut running_off: u64 = 0;
+    for dso in dsos.iter_mut() {
+        if let Some(t) = dso.tls.as_mut() {
+            running_off = ldso_core::tls::next_tls_offset(running_off, t.memsz, t.align);
+            t.tls_id = next_id;
+            t.tls_offset = running_off;
+            next_id += 1;
+        }
+    }
+    next_id - 1
+}
 
-    // Reserve [tls block (tls_offset)][TCB (TCB_RESERVE)] + alignment slack.
-    let region_len = (tls_offset + TCB_RESERVE + place_align + 4095) & !4095u64;
+/// Phase 93 B.3 / Phase 95c follow-up — establish the thread-control block +
+/// thread pointer the way musl's own dynamic linker (`__dls3`) does, laying out
+/// a **multi-module** static TLS block. In the SHARED `libc.so` the weak
+/// `static_init_tls` is overridden by a **no-op** `__init_tls` stub (musl assumes
+/// its own `ld.so` set TLS up). m3OS's foreign Rust loader replaces `__dls3`, so
+/// it builds the TCB + TLS image itself — otherwise libc's first `%fs:` access
+/// (errno, the `%fs:0x28` canary, locale) or a DSO's thread-local faults.
+///
+/// x86_64 is TLS variant II: every module's static block sits BELOW the thread
+/// pointer at `TP - module.tls_offset`; the musl `struct pthread` TCB sits AT the
+/// thread pointer with `self` at TP+0 and `dtv` at TP+8. Each PT_TLS module
+/// (assigned a `tls_id`/`tls_offset` by [`assign_tls_modules`]) — the main exe
+/// (module 1, local-exec `%fs:-N`) AND each DT_NEEDED DSO with TLS (e.g. rustc's
+/// `librustc_driver.so`, general-dynamic via `__tls_get_addr` over the DTV) — has
+/// its `.tdata` copied in and a DTV slot installed. A process with no `PT_TLS`
+/// module gets a bare TCB.
+///
+/// # Safety
+/// Every module's `image_vaddr` must reference its mapped image, and the
+/// `tls_id`/`tls_offset` must already be assigned. `dsos` is also the scope used
+/// to resolve libc's `__init_tp`.
+unsafe fn setup_static_tls(dsos: &[LoadedDso]) {
+    // sizeof(struct pthread) on x86_64 musl 1.2.5 is ~0xc0; reserve generously
+    // so every field musl reads (self@0, dtv@8, canary@0x28, errno, locale)
+    // lands in the zeroed TCB region.
+    const TCB_RESERVE: u64 = 0x400;
+
+    // The whole TLS block spans [TP - total_off, TP). Offsets are assigned
+    // cumulatively (so the last module is deepest); the total is their max.
+    // Placement align = the max module align, floored to MIN_TLS_ALIGN — a
+    // multiple of every module's own align, so each `TP - tls_offset` lands
+    // aligned (each tls_offset is already a multiple of its module's align).
+    let mut total_off: u64 = 0;
+    let mut max_align: u64 = ldso_core::tls::MIN_TLS_ALIGN;
+    let mut module_count: u64 = 0;
+    for dso in dsos {
+        if let Some(t) = dso.tls {
+            if t.tls_id == 0 {
+                continue;
+            }
+            if t.tls_offset > total_off {
+                total_off = t.tls_offset;
+            }
+            let pa = ldso_core::tls::tls_place_align(t.align);
+            if pa > max_align {
+                max_align = pa;
+            }
+            if t.tls_id as u64 > module_count {
+                module_count = t.tls_id as u64;
+            }
+            // Fail closed on a malformed PT_TLS, matching the prior guard.
+            if t.filesz > t.memsz {
+                serial(b"ldso: PT_TLS p_filesz > p_memsz (malformed); TLS not set\n");
+                return;
+            }
+        }
+    }
+    let place_align = max_align;
+
+    // Diagnostic: report the assembled TLS module count + total span so a load
+    // failure can be triaged from the serial log (Phase 95c follow-up).
+    serial(b"ldso: tls modules=");
+    serial_hex(module_count);
+    serial(b" total_off=");
+    serial_hex(total_off);
+    serial(b"\n");
+
+    // Reserve [tls block (total_off)][TCB (TCB_RESERVE)] + alignment slack.
+    let region_len = (total_off + TCB_RESERVE + place_align + 4095) & !4095u64;
     let region = sys_mmap(
         0,
         region_len,
@@ -1983,42 +2153,33 @@ unsafe fn setup_static_tls(at_phdr: *const Phdr, at_phnum: usize, dsos: &[Loaded
         return;
     }
     let region = region as u64;
-    // TP sits above the TLS block; align it to place_align. Because place_align
-    // is a multiple of seg_align and tls_offset is a multiple of seg_align,
-    // (TP - tls_offset) — the block start — is also seg_align-aligned, which the
-    // exe's local-exec %fs:-N offsets assume.
     let tp = {
-        let raw = region + tls_offset;
+        let raw = region + total_off;
         (raw + place_align - 1) & !(place_align - 1)
     };
 
-    // Copy the main exe's .tdata into the block at TP - tls_offset; .tbss is
-    // already zero (anonymous mmap).
-    if tls_memsz > 0 {
-        // Fail closed on a malformed PT_TLS: .tdata (`p_filesz`) must fit within
-        // the TLS image (`p_memsz`) — the block below is sized for `tls_offset`
-        // = round_up(memsz, align) >= memsz, so a hostile/corrupt exe with
-        // `p_filesz > p_memsz` would otherwise over-read the template and
-        // overflow the block into the TCB. Real toolchains always emit
-        // `p_filesz <= p_memsz`; leaving TLS unset (the existing mmap-fail path's
-        // behaviour) is the correct fail-closed outcome for a bad binary.
-        if tls_filesz > tls_memsz {
-            serial(b"ldso: PT_TLS p_filesz > p_memsz (malformed); TLS not set\n");
-            return;
-        }
-        let block = tp - tls_offset;
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                tls_image as *const u8,
-                block as *mut u8,
-                tls_filesz as usize,
-            );
+    // Copy each module's .tdata into its block at TP - tls_offset; the .tbss tail
+    // is already zero (anonymous mmap). The DTV (built below) then lets
+    // `__tls_get_addr` reach general-dynamic modules as `dtv[id] + offset`.
+    for dso in dsos {
+        if let Some(t) = dso.tls {
+            if t.tls_id == 0 || t.filesz == 0 {
+                continue;
+            }
+            let block = tp - t.tls_offset;
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    t.image_vaddr as *const u8,
+                    block as *mut u8,
+                    t.filesz as usize,
+                );
+            }
         }
     }
 
-    // Build a minimal DTV (separate page): dtv[0]=module count, dtv[1]=block
-    // address (DTP_OFFSET is 0 on x86_64). `__tls_get_addr` is not exercised by
-    // a main-exe-only local-exec program but a valid DTV keeps the TCB sane.
+    // Build the DTV (separate page): dtv[0] = module count, dtv[id] = that
+    // module's block start (DTP_OFFSET is 0 on x86_64). One page (512 entries)
+    // far exceeds any realistic startup module count.
     let dtv = sys_mmap(
         0,
         4096,
@@ -2033,14 +2194,20 @@ unsafe fn setup_static_tls(at_phdr: *const Phdr, at_phnum: usize, dsos: &[Loaded
     }
     let dtv = dtv as u64;
     let dtv_arr = dtv as *mut u64;
-    if tls_memsz > 0 {
-        unsafe {
-            *dtv_arr.add(0) = 1;
-            *dtv_arr.add(1) = tp - tls_offset;
-        }
-    } else {
-        unsafe {
-            *dtv_arr.add(0) = 0;
+    unsafe {
+        *dtv_arr.add(0) = module_count;
+    }
+    for dso in dsos {
+        if let Some(t) = dso.tls {
+            if t.tls_id == 0 {
+                continue;
+            }
+            // Guard the one-page DTV against an implausibly large module count.
+            if (t.tls_id as usize) < 512 {
+                unsafe {
+                    *dtv_arr.add(t.tls_id as usize) = tp - t.tls_offset;
+                }
+            }
         }
     }
 
@@ -2220,6 +2387,13 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
         sys_exit(ELIBBAD_CODE);
     }
 
+    // Phase 95c follow-up — capture the main exe's PT_TLS (module 1) so the
+    // multi-module TLS path (assignment → reloc resolution → block layout)
+    // treats it uniformly with DT_NEEDED DSO TLS modules. Located exactly the
+    // way `setup_static_tls` does (exe_base from PT_PHDR), so the two never
+    // diverge on where the main's `.tdata` template lives.
+    let main_tls = unsafe { capture_main_tls(at_phdr, at_phnum) };
+
     // -- Load DT_NEEDED dependencies ----------------------------------------
     let mut dsos: heapless::Vec<LoadedDso, MAX_DSOS> = heapless::Vec::new();
     // Main binary first (index 0) so lookup_symbol resolves to it
@@ -2229,6 +2403,7 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
             load_bias: main_load_bias,
             image_len: main_image_len,
             dyn_: main_dyn_section,
+            tls: main_tls,
         })
         .is_err()
     {
@@ -2406,6 +2581,12 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
         }
     }
 
+    // -- Phase 95c follow-up — assign TLS module ids + variant-II offsets to the
+    // main exe + every DT_NEEDED DSO carrying PT_TLS, BEFORE the reloc pass so the
+    // TPOFF64/DTPMOD64/DTPOFF64 arms resolve against them. `dsos[0]` is the main
+    // (module 1 if it has TLS); the per-DSO `tls` was captured at load time.
+    let _n_tls_modules = assign_tls_modules(dsos.as_mut_slice());
+
     // -- Apply relocations against each loaded DSO FIRST --------------------
     // Phase 93: the DSO (libc) relocations must run BEFORE the main binary's,
     // because the main binary's `R_X86_64_COPY` relocations copy *data* out of
@@ -2455,6 +2636,10 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
             load_bias: main_load_bias,
             image_len: main_image_len,
             dyn_: main_dyn_section,
+            // Phase 95c follow-up — the main is relocated via this standalone
+            // record (not `dsos[0]`), so carry the assigned module-1 TLS so its
+            // own TPOFF64/DTPMOD64 relocs resolve.
+            tls: dsos_slice.first().and_then(|d| d.tls),
         };
         if let Err(e) =
             unsafe { apply_rela(&dso_main, rela.as_ptr() as *const Rela, n, dsos_slice) }
@@ -2472,6 +2657,10 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
             load_bias: main_load_bias,
             image_len: main_image_len,
             dyn_: main_dyn_section,
+            // Phase 95c follow-up — the main is relocated via this standalone
+            // record (not `dsos[0]`), so carry the assigned module-1 TLS so its
+            // own TPOFF64/DTPMOD64 relocs resolve.
+            tls: dsos_slice.first().and_then(|d| d.tls),
         };
         if let Err(e) =
             unsafe { apply_rela(&dso_main, jmprel.as_ptr() as *const Rela, n, dsos_slice) }
@@ -2552,7 +2741,7 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
     // (which may touch errno / the stack canary). In the shared libc.so the
     // weak `static_init_tls` is a no-op stub, so this foreign loader must do
     // the `__dls3` TLS work itself.
-    unsafe { setup_static_tls(at_phdr, at_phnum, dsos.as_slice()) };
+    unsafe { setup_static_tls(dsos.as_slice()) };
 
     // -- Run constructors deepest-first -------------------------------------
     // NOTE: these run with a *zero* stack canary. musl randomizes the canary
