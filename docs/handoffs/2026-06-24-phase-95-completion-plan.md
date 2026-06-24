@@ -147,7 +147,17 @@ thread is left `BlockedOnFutex` after the lock fixes.
   wedge (rustc has thread-locals so it gets past this). Next on the repro: either add a
   `_Thread_local` to `dynamic-mt` to push past TLS and reach the lock wedge, OR fix the
   `__copy_tls td=0` no-TLS-main case first (it is deterministic + fundamental, a good
-  starting target).
+  starting target). **[FIXED 2026-06-24]** — the loader (`setup_static_tls`) now ALWAYS calls
+  `__m3os_set_tls` (head=NULL when zero TLS modules) so `libc.tls_align` ≥ 16; `dynamic-mt`
+  no longer crashes (`ldso: tls modules=0` → handoff to main, no `addr=0x8`). **It now
+  DETERMINISTICALLY reproduces the wedge** — it hangs *before* `pthread_create`'s
+  `clone_thread` log (a lazy-file fault during the new thread's stack/TLS setup, under a
+  lock). The deadlock-guard did NOT fire, so the wedge is BEFORE the guard spot (the
+  lazy-file blocking read) — likely the `PROCESS_TABLE` re-lock self-deadlock in
+  `shared_vma_demand_file`, or a fault on an anon/stack page rather than a lazy-file one.
+  **NEXT: move the guard to `demand_map_vma_page` ENTRY** (before `shared_vma_demand_file`)
+  and re-run the **2-min `/usr/bin/dynamic-mt` repro** to name the culprit — no more 15-min
+  rust-gate cycles.
 - The futex pre-fault did **NOT** clear the `rust-lld` link wedge.
 - **NEW — the link failure is NON-DETERMINISTIC.** It alternates between (a) the **silent
   lock-wedge** and (b) an **`ENOTTY` panic** at `std/src/process.rs:2385`

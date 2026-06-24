@@ -2388,12 +2388,16 @@ unsafe fn setup_static_tls(dsos: &[LoadedDso]) {
     // builds the `struct tls_module` list itself and publishes it via the exported
     // `__m3os_set_tls(head, size, align, cnt)` (musl patch 0004). Skips gracefully
     // if the symbol is absent (un-patched libc → no regression).
+    // Build the per-module `struct tls_module` list when there ARE TLS modules;
+    // `list` stays NULL (0) when there are none — but we STILL publish the layout
+    // below so a pthread program with no thread-locals gets a valid TLS block.
+    let mut list: u64 = 0;
     if module_count > 0 && module_count < 512 {
         // musl 1.2.5 `struct tls_module { struct tls_module *next; void *image;
         //   size_t len, size, align, offset; }` — 48 bytes, fields at 0/8/16/24/32/40.
         const TLS_MOD_SZ: u64 = 48;
         let list_len = (module_count * TLS_MOD_SZ + 4095) & !4095u64;
-        let list = sys_mmap(
+        let map = sys_mmap(
             0,
             list_len,
             PROT_READ | PROT_WRITE,
@@ -2401,8 +2405,8 @@ unsafe fn setup_static_tls(dsos: &[LoadedDso]) {
             -1,
             0,
         );
-        if list >= 0 {
-            let list = list as u64;
+        if map >= 0 {
+            list = map as u64;
             // Populate one entry per module, indexed by `tls_id - 1`, and chain
             // `next` in tls_id order so `__copy_tls` assigns `dtv[i]` to tls_id `i`.
             for dso in dsos {
@@ -2428,17 +2432,27 @@ unsafe fn setup_static_tls(dsos: &[LoadedDso]) {
                     }
                 }
             }
-            if let Some(addr) = unsafe { sym::lookup(dsos, b"__m3os_set_tls", None) }
-                && addr != 0
-            {
-                let tls_size = total_off + TCB_RESERVE + place_align;
-                // SAFETY: `void __m3os_set_tls(void *head, size_t size, size_t align,
-                // size_t cnt)` (musl patch 0004); `list` is the chained module list.
-                let f: extern "C" fn(u64, u64, u64, u64) =
-                    unsafe { core::mem::transmute::<u64, extern "C" fn(u64, u64, u64, u64)>(addr) };
-                f(list, tls_size, place_align, module_count);
-            }
         }
+    }
+    // ALWAYS publish the TLS layout to musl — even with ZERO TLS modules a pthread
+    // program needs a valid `libc.tls_align`/`tls_size` so `__copy_tls` computes a
+    // non-zero `td` (the TCB). With `tls_align==0`, musl's
+    // `td = (mem + tls_size - sizeof(pthread)) & -tls_align` becomes `& -0 == 0` →
+    // the WRITE-to-0x8 crash on the first `pthread_create` (`dynamic-mt`: a
+    // no-thread-local-main dynamic pthread program; rustc escaped only because it
+    // HAS thread-locals → module_count>0). `place_align` is floored to
+    // MIN_TLS_ALIGN (≥16) and `tls_size = total_off(=0) + TCB_RESERVE + place_align`
+    // is the minimal TCB block; `head=NULL`/`cnt=0` make the per-module copy loop a
+    // no-op. Skips gracefully if `__m3os_set_tls` is absent (un-patched libc).
+    if let Some(addr) = unsafe { sym::lookup(dsos, b"__m3os_set_tls", None) }
+        && addr != 0
+    {
+        let tls_size = total_off + TCB_RESERVE + place_align;
+        // SAFETY: `void __m3os_set_tls(void *head, size_t size, size_t align,
+        // size_t cnt)` (musl patch 0004); `list` is the chained module list or NULL.
+        let f: extern "C" fn(u64, u64, u64, u64) =
+            unsafe { core::mem::transmute::<u64, extern "C" fn(u64, u64, u64, u64)>(addr) };
+        f(list, tls_size, place_align, module_count);
     }
 }
 

@@ -22260,13 +22260,14 @@ fn dynamic_hello_smoke_steps() -> Vec<SmokeStep> {
         label: "dynamic-hello-smoke: DLOPEN:ok (dlopen+dlsym+call)",
         exit_code_on_fail: SMOKE_EXIT_DYNAMIC_HELLO_FAILED,
     });
-    // Phase 95b — the multithreaded `dynamic-mt` repro is staged at
-    // /usr/bin/dynamic-mt but NOT auto-run here yet: it currently reproduces a
-    // SEPARATE, DETERMINISTIC bug — a no-thread-local-main dynamic pthread
-    // program crashes in musl `__copy_tls` (WRITE to 0x8 = `td=0`) on
-    // pthread_create — not the rust-lld lock wedge (rustc has thread-locals, so
-    // it gets past this). Run `/usr/bin/dynamic-mt` manually for the TLS repro;
-    // see the completion-plan Step 1. Make it an assertion once that's fixed.
+    // Phase 95b — `dynamic-mt` (the multithreaded dynamic repro) is staged at
+    // /usr/bin/dynamic-mt but NOT auto-run yet. The `__copy_tls td=0` crash is
+    // FIXED (the loader now always publishes `libc.tls_align`≥MIN_TLS_ALIGN even
+    // with zero TLS modules), so it loads + reaches `main`; it now HANGS before
+    // `pthread_create` completes — the lazy-file-fault-under-lock wedge hit during
+    // the thread's stack/TLS setup (the next bug). It is now a DETERMINISTIC fast
+    // repro of that wedge; run `/usr/bin/dynamic-mt` manually. Make it an assertion
+    // (`DYNAMIC_MT:ok`) once the wedge is fixed. See completion-plan Step 1.
     steps
 }
 
