@@ -18,7 +18,26 @@ use kernel_core::fs::ext2::{
     S_IFLNK, S_IFREG,
 };
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
+
+/// Engine-unification Phase C1 — count of LOGICAL block reads the **in-kernel**
+/// root ext2 engine served (the root volume, `dev_id == 0`), incremented on
+/// every `read_block`/`read_block_into_slice`/`read_run_into_slice` whether the
+/// block came from the in-kernel cache or the device. After Phases A+B routed
+/// every root read + exec to `vfs_server`, this should stop climbing once
+/// `vfs_server` is registered: a non-zero post-registration delta means a root
+/// read still reaches the second engine (a degraded vfs-IPC fallback, or a
+/// missed routing — the regression this guard exists to catch). Exposed via
+/// `/proc/blkstats` as `inkernel_root_reads`; the `vfs-throughput-probe` asserts
+/// its steady-state delta is ~0. NOT incremented for secondary `/mnt/usbN`
+/// mounts (`dev_id >= 1`), which are a separate engine by design.
+pub static IN_KERNEL_ROOT_READS: AtomicU64 = AtomicU64::new(0);
+
+/// Current value of the in-kernel root-read counter (see [`IN_KERNEL_ROOT_READS`]).
+pub fn in_kernel_root_reads() -> u64 {
+    IN_KERNEL_ROOT_READS.load(Ordering::Relaxed)
+}
 
 // ---------------------------------------------------------------------------
 // Ext2Volume (P28-T019)
@@ -425,6 +444,10 @@ impl Ext2Volume {
     /// being invoked while holding a spinlock, avoiding potential contention
     /// between the allocator lock and the cache lock.
     fn read_block(&self, block_num: u32) -> Result<Vec<u8>, Ext2Error> {
+        // Phase C1: count this in-kernel root read (see `IN_KERNEL_ROOT_READS`).
+        if self.dev_id == 0 {
+            IN_KERNEL_ROOT_READS.fetch_add(1, Ordering::Relaxed);
+        }
         // Pre-allocate the result buffer outside any lock so the heap
         // allocator is never called while a spinlock is held.
         let mut buf = vec![0u8; self.block_size as usize];
@@ -475,6 +498,10 @@ impl Ext2Volume {
         block_offset: usize,
         dst: &mut [u8],
     ) -> Result<(), Ext2Error> {
+        // Phase C1: count this in-kernel root read (see `IN_KERNEL_ROOT_READS`).
+        if self.dev_id == 0 {
+            IN_KERNEL_ROOT_READS.fetch_add(1, Ordering::Relaxed);
+        }
         // Cache hit: copy directly under the spinlock — no heap allocation.
         {
             let cache = self.block_cache.lock();
@@ -536,6 +563,10 @@ impl Ext2Volume {
         count: u32,
         dst: &mut [u8],
     ) -> Result<(), Ext2Error> {
+        // Phase C1: count these in-kernel root reads (see `IN_KERNEL_ROOT_READS`).
+        if self.dev_id == 0 {
+            IN_KERNEL_ROOT_READS.fetch_add(count as u64, Ordering::Relaxed);
+        }
         read_sectors_for(
             self.dev_id,
             self.block_to_lba(start_block),

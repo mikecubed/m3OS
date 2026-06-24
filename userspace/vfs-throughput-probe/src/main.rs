@@ -11,6 +11,7 @@
 //! VFS_THRPUT:bytes=<N>
 //! VFS_THRPUT:write_calls_delta=<d>
 //! VFS_THRPUT:read_calls_delta=<d>
+//! VFS_THRPUT:inkernel_root_reads_delta=<d>   (Phase C1 — must be ~0)
 //! VFS_THRPUT:verify=ok        (or :verify=FAIL)
 //! VFS_THRPUT:done
 //! ```
@@ -101,7 +102,7 @@ fn program_main(_args: &[&str]) -> i32 {
     measure_ipc_rtt();
 
     // ---- 1. Snapshot blkstats BEFORE the bulk write. ----
-    let (_rc_before, wc_before) = match read_blkstats() {
+    let (_rc_before, wc_before, ik_before) = match read_blkstats() {
         Ok(v) => v,
         Err(e) => {
             error(e);
@@ -144,7 +145,7 @@ fn program_main(_args: &[&str]) -> i32 {
     let write_ns = now_ns().saturating_sub(write_t0);
 
     // ---- 3. Snapshot blkstats AFTER the write. ----
-    let (rc_after_write, wc_after_write) = match read_blkstats() {
+    let (rc_after_write, wc_after_write, _ik_after_write) = match read_blkstats() {
         Ok(v) => v,
         Err(e) => {
             error(e);
@@ -196,7 +197,7 @@ fn program_main(_args: &[&str]) -> i32 {
     }
 
     // ---- 5. Snapshot blkstats AFTER the read. ----
-    let (rc_after_read, _wc_after_read) = match read_blkstats() {
+    let (rc_after_read, _wc_after_read, ik_after_read) = match read_blkstats() {
         Ok(v) => v,
         Err(e) => {
             error(e);
@@ -207,6 +208,13 @@ fn program_main(_args: &[&str]) -> i32 {
     let read_delta = rc_after_read.saturating_sub(rc_after_write);
     print_kv("VFS_THRPUT:read_calls_delta=", read_delta);
     report_phase("read", PAYLOAD_BYTES as u64, read_ns, read_delta);
+
+    // Engine-unification Phase C1: the in-kernel root ext2 engine must have
+    // served ~0 reads across the whole write+read+verify — every root read now
+    // routes to vfs_server (Phases A+B). A non-zero delta means a root read
+    // reached the second engine, the exact regression this guard catches.
+    let inkernel_delta = ik_after_read.saturating_sub(ik_before);
+    print_kv("VFS_THRPUT:inkernel_root_reads_delta=", inkernel_delta);
 
     // ---- 5b. Many-files-into-one-directory phase (Phase 95c latency probe). ----
     // Runs AFTER the bulk read snapshot so it cannot perturb the gate's asserted
@@ -231,15 +239,20 @@ fn program_main(_args: &[&str]) -> i32 {
 // /proc/blkstats parser — returns (read_calls, write_calls)
 // ---------------------------------------------------------------------------
 
-/// Read `/proc/blkstats` and return `(read_calls, write_calls)`.
+/// Read `/proc/blkstats` and return `(read_calls, write_calls,
+/// inkernel_root_reads)`.
 ///
 /// The file contains lines like:
 /// ```text
 /// read_calls 12345
 /// write_calls 678
+/// inkernel_root_reads 0
 /// ```
-/// We scan for the exact key prefix used by `cmd_vfs_bulkio_smoke`.
-fn read_blkstats() -> Result<(u64, u64), &'static str> {
+/// We scan for the exact key prefix used by `cmd_vfs_bulkio_smoke`. The third
+/// counter (engine-unification Phase C1) is the blocks the in-kernel root ext2
+/// engine served; its steady-state delta across the probe must be ~0 (every
+/// root read routes to `vfs_server`).
+fn read_blkstats() -> Result<(u64, u64, u64), &'static str> {
     let fd = syscall_lib::open(BLKSTATS_PATH, syscall_lib::O_RDONLY, 0);
     if (fd as i64) < 0 {
         return Err("open /proc/blkstats failed");
@@ -265,6 +278,10 @@ fn read_blkstats() -> Result<(u64, u64), &'static str> {
 
     let mut read_calls: Option<u64> = None;
     let mut write_calls: Option<u64> = None;
+    // Default to 0 so an older kernel without the line still parses (the delta
+    // is then trivially 0 — the assertion degrades to a no-op, never a spurious
+    // failure).
+    let mut inkernel_root_reads: u64 = 0;
 
     for line in text.lines() {
         let line = line.trim();
@@ -276,11 +293,15 @@ fn read_blkstats() -> Result<(u64, u64), &'static str> {
             if let Ok(v) = rest.trim().parse::<u64>() {
                 write_calls = Some(v);
             }
+        } else if let Some(rest) = line.strip_prefix("inkernel_root_reads ") {
+            if let Ok(v) = rest.trim().parse::<u64>() {
+                inkernel_root_reads = v;
+            }
         }
     }
 
     match (read_calls, write_calls) {
-        (Some(r), Some(w)) => Ok((r, w)),
+        (Some(r), Some(w)) => Ok((r, w, inkernel_root_reads)),
         _ => Err("/proc/blkstats missing read_calls or write_calls"),
     }
 }
@@ -375,7 +396,7 @@ fn measure_manyfiles() {
     let mut created = 0u64;
 
     for batch in 0..MF_BATCHES {
-        let (rc0, wc0) = read_blkstats().unwrap_or((0, 0));
+        let (rc0, wc0, _) = read_blkstats().unwrap_or((0, 0, 0));
         let b0 = now_ns();
         for i in 0..MF_PER_BATCH {
             let n = batch * MF_PER_BATCH + i;
@@ -410,7 +431,7 @@ fn measure_manyfiles() {
             created += 1;
         }
         let batch_ms = now_ns().saturating_sub(b0) / 1_000_000;
-        let (rc1, wc1) = read_blkstats().unwrap_or((rc0, wc0));
+        let (rc1, wc1, _) = read_blkstats().unwrap_or((rc0, wc0, 0));
         if batch == 0 {
             first_batch_ms = batch_ms;
             first_batch_rd = rc1.saturating_sub(rc0);

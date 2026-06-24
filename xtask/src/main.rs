@@ -20771,6 +20771,11 @@ fn cmd_vfs_throughput_smoke(args: &SmokeBootArgs) {
 
     let write_delta = parse_sentinel("VFS_THRPUT:write_calls_delta=");
     let read_delta = parse_sentinel("VFS_THRPUT:read_calls_delta=");
+    // Engine-unification Phase C1: the in-kernel root ext2 engine must serve ~0
+    // reads while the probe writes+reads 8 MiB (all routed to vfs_server). An
+    // older kernel without the counter emits no sentinel → treated as 0 (the
+    // assertion degrades to a no-op rather than a spurious failure).
+    let inkernel_delta = parse_sentinel("VFS_THRPUT:inkernel_root_reads_delta=").unwrap_or(0);
 
     let elapsed = start.elapsed().as_secs();
 
@@ -20890,9 +20895,37 @@ fn cmd_vfs_throughput_smoke(args: &SmokeBootArgs) {
         std::process::exit(SMOKE_EXIT_VFS_THROUGHPUT_FAILED);
     }
 
+    // Engine-unification Phase C1 — the single-post-boot-root-engine invariant.
+    // After Phases A+B route every root read to vfs_server, the in-kernel ext2
+    // engine serves only a small, known residual during the 8 MiB write+read:
+    // ~68 blocks (measured) from `open_ext2_file` building the writable
+    // `Ext2Disk` fd via in-kernel `resolve_path`/`read_inode` — the file-open
+    // metadata still resolved in-kernel. Routing that is the remaining work to
+    // make write-back (C2) safe, since those reads would observe a write-back-
+    // deferred create stale. The ceiling sits above the residual but well below
+    // a real read-un-routing regression (~`PAYLOAD_BYTES/4096` ≈ 2048 in-kernel
+    // blocks), so it still trips on one.
+    const INKERNEL_ROOT_READS_CEILING: u64 = 160;
+    println!(
+        "vfs-throughput-smoke:   inkernel_root_reads_delta = {inkernel_delta} (ceiling {INKERNEL_ROOT_READS_CEILING})"
+    );
+    if inkernel_delta > INKERNEL_ROOT_READS_CEILING {
+        eprintln!(
+            "vfs-throughput-smoke: FAILED — inkernel_root_reads_delta {inkernel_delta} exceeds \
+             ceiling {INKERNEL_ROOT_READS_CEILING}. The in-kernel root ext2 engine served a root \
+             read post-boot — Phases A+B should route every root read to vfs_server. A regression \
+             that un-routes a reader (getdents/stat/exec/path_ino) would produce ~{} in-kernel \
+             reads for an 8 MiB payload.  This is also the safety precondition for retiring the \
+             dual-engine cache invalidation (Phase C3).",
+            PAYLOAD_BYTES / 4096,
+        );
+        std::process::exit(SMOKE_EXIT_VFS_THROUGHPUT_FAILED);
+    }
+
     println!(
         "vfs-throughput-smoke: PASSED — verify=ok, \
-         write_calls_delta={wd} ≤ {write_ceiling}, read_calls_delta={rd} ≤ {read_ceiling} \
+         write_calls_delta={wd} ≤ {write_ceiling}, read_calls_delta={rd} ≤ {read_ceiling}, \
+         inkernel_root_reads_delta={inkernel_delta} ≤ {INKERNEL_ROOT_READS_CEILING} \
          in {elapsed}s"
     );
 }

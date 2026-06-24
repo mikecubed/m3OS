@@ -755,8 +755,12 @@ fn render_version() -> String {
 /// should issue far fewer requests once contiguous runs are coalesced).
 fn render_blkstats() -> String {
     let (read_calls, read_sectors, write_calls, write_sectors) = crate::blk::blkstats_snapshot();
+    // Engine-unification Phase C1: blocks the in-kernel root ext2 engine served.
+    // After Phases A+B routed all root reads to vfs_server this should be flat
+    // post-boot; the `vfs-throughput-probe` asserts its steady-state delta ~0.
+    let inkernel_root_reads = crate::fs::ext2::in_kernel_root_reads();
     alloc::format!(
-        "read_calls {read_calls}\nread_sectors {read_sectors}\nwrite_calls {write_calls}\nwrite_sectors {write_sectors}\n"
+        "read_calls {read_calls}\nread_sectors {read_sectors}\nwrite_calls {write_calls}\nwrite_sectors {write_sectors}\ninkernel_root_reads {inkernel_root_reads}\n"
     )
 }
 
