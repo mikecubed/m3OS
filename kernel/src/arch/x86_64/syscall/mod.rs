@@ -3813,18 +3813,58 @@ const SA_RESETHAND: u64 = 0x8000_0000;
 pub(super) fn sys_rt_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64) -> u64 {
     let pid = crate::process::current_pid();
 
-    let mut table = crate::process::PROCESS_TABLE.lock();
-    let proc = match table.find_mut(pid) {
-        Some(p) => p,
-        None => return NEG_EINVAL,
+    // Read the new mask from userspace BEFORE taking PROCESS_TABLE. The user
+    // pointer can be a cold MAP_LAZY_FILE page whose demand-fault blocks on a
+    // vfs_server IPC; faulting it while holding PROCESS_TABLE (an IrqSafeMutex
+    // held across the resulting context switch) strands the lock and wedges every
+    // core — the Phase-95b lazy-file-fault-under-lock class. The deadlock-guard
+    // caught this exact syscall (14) wedging dynamic-mt's pthread_create
+    // signal-block. Validate `how` here too so the EINVAL path never touches the
+    // lock. Userspace (musl) uses 0-indexed bits (bit N = signal N+1); convert to
+    // the kernel's signal-number-indexed bits by <<1.
+    let new_mask = if set_ptr != 0 {
+        match how {
+            SIG_BLOCK | SIG_UNBLOCK | SIG_SETMASK => {}
+            _ => return NEG_EINVAL,
+        }
+        let mut set_bytes = [0u8; 8];
+        if UserSliceRo::new(set_ptr, set_bytes.len())
+            .and_then(|s| s.copy_to_kernel(&mut set_bytes))
+            .is_err()
+        {
+            return NEG_EFAULT;
+        }
+        Some(u64::from_ne_bytes(set_bytes) << 1)
+    } else {
+        None
     };
 
-    // Write old mask to userspace if requested.
-    // Userspace (musl) uses 0-indexed bits: bit N represents signal N+1.
-    // Kernel uses signal-number-indexed bits: bit N represents signal N.
-    // Convert kernel→userspace by shifting right 1.
+    // Snapshot + modify the mask under the lock, capturing the OLD mask (before
+    // applying the new one) to write back AFTER the lock is dropped — the oldset
+    // write is also a user access that must not fault under the lock.
+    let old_user;
+    {
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        let proc = match table.find_mut(pid) {
+            Some(p) => p,
+            None => return NEG_EINVAL,
+        };
+        old_user = proc.blocked_signals >> 1;
+        if let Some(set) = new_mask {
+            match how {
+                SIG_BLOCK => proc.blocked_signals |= set,
+                SIG_UNBLOCK => proc.blocked_signals &= !set,
+                SIG_SETMASK => proc.blocked_signals = set,
+                _ => unreachable!("how validated above the lock"),
+            }
+            // SIGKILL and SIGSTOP can never be blocked.
+            proc.blocked_signals &= !UNBLOCKABLE_MASK;
+        }
+    }
+
+    // Write the old mask to userspace AFTER dropping the lock (convert
+    // kernel->user by >>1; same lazy-file hazard as the read above).
     if oldset_ptr != 0 {
-        let old_user = proc.blocked_signals >> 1;
         let old_bytes = old_user.to_ne_bytes();
         if UserSliceWo::new(oldset_ptr, old_bytes.len())
             .and_then(|s| s.copy_from_kernel(&old_bytes))
@@ -3834,36 +3874,8 @@ pub(super) fn sys_rt_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64) -> u64
         }
     }
 
-    // Apply new mask if set_ptr is non-null.
-    if set_ptr != 0 {
-        let mut set_bytes = [0u8; 8];
-        if UserSliceRo::new(set_ptr, set_bytes.len())
-            .and_then(|s| s.copy_to_kernel(&mut set_bytes))
-            .is_err()
-        {
-            return NEG_EFAULT;
-        }
-        // Convert userspace→kernel by shifting left 1.
-        let set = u64::from_ne_bytes(set_bytes) << 1;
-
-        match how {
-            SIG_BLOCK => proc.blocked_signals |= set,
-            SIG_UNBLOCK => proc.blocked_signals &= !set,
-            SIG_SETMASK => proc.blocked_signals = set,
-            _ => return NEG_EINVAL,
-        }
-
-        // SIGKILL and SIGSTOP can never be blocked.
-        proc.blocked_signals &= !UNBLOCKABLE_MASK;
-    }
-
-    // Drop the lock before checking pending signals so we don't deadlock.
-    // Check pending signals after any operation that could unblock signals.
+    // After SIG_UNBLOCK / SIG_SETMASK, deliver any newly-unblocked pending signals.
     let needs_check = set_ptr != 0 && (how == SIG_UNBLOCK || how == SIG_SETMASK);
-    drop(table);
-
-    // After SIG_UNBLOCK, deliver any newly-unblocked pending signals immediately.
-    // Pass 0 as the syscall result since rt_sigprocmask succeeds.
     if needs_check {
         check_pending_signals(0);
     }

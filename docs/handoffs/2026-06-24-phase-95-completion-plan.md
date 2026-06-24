@@ -157,7 +157,15 @@ thread is left `BlockedOnFutex` after the lock fixes.
   `shared_vma_demand_file`, or a fault on an anon/stack page rather than a lazy-file one.
   **NEXT: move the guard to `demand_map_vma_page` ENTRY** (before `shared_vma_demand_file`)
   and re-run the **2-min `/usr/bin/dynamic-mt` repro** to name the culprit — no more 15-min
-  rust-gate cycles.
+  rust-gate cycles. **[DONE 2026-06-24]** — the entry guard named the culprit:
+  **`rt_sigprocmask` (syscall 14)** reads the user `sigset_t` (and writes the old set) under
+  `PROCESS_TABLE` during `pthread_create`'s signal-block; a cold lazy-file sigset page wedged.
+  **FIXED** (both user accesses moved out of the lock, Linux-style; `how` validated before the
+  lock). **`dynamic-mt` now PASSES** (`DYNAMIC_MT:ok`, no guard hit) — multithreaded dynamic
+  binaries work, and it is now a GREEN permanent regression gate in `dynamic-hello-smoke`.
+  Bug **A is very likely fixed**: rust-lld is multithreaded+dynamic and `pthread_create →
+  rt_sigprocmask`, so the same wedge. **NEXT: re-run `rustc-smoke`** to confirm `RUSTC_OK`
+  (bug **B**, the `ENOTTY` at `std/process.rs:2385`, may still need a separate fix).
 - The futex pre-fault did **NOT** clear the `rust-lld` link wedge.
 - **NEW — the link failure is NON-DETERMINISTIC.** It alternates between (a) the **silent
   lock-wedge** and (b) an **`ENOTTY` panic** at `std/src/process.rs:2385`

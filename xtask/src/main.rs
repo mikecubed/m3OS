@@ -22260,14 +22260,27 @@ fn dynamic_hello_smoke_steps() -> Vec<SmokeStep> {
         label: "dynamic-hello-smoke: DLOPEN:ok (dlopen+dlsym+call)",
         exit_code_on_fail: SMOKE_EXIT_DYNAMIC_HELLO_FAILED,
     });
-    // Phase 95b — `dynamic-mt` (the multithreaded dynamic repro) is staged at
-    // /usr/bin/dynamic-mt but NOT auto-run yet. The `__copy_tls td=0` crash is
-    // FIXED (the loader now always publishes `libc.tls_align`≥MIN_TLS_ALIGN even
-    // with zero TLS modules), so it loads + reaches `main`; it now HANGS before
-    // `pthread_create` completes — the lazy-file-fault-under-lock wedge hit during
-    // the thread's stack/TLS setup (the next bug). It is now a DETERMINISTIC fast
-    // repro of that wedge; run `/usr/bin/dynamic-mt` manually. Make it an assertion
-    // (`DYNAMIC_MT:ok`) once the wedge is fixed. See completion-plan Step 1.
+    // Phase 95b — run the multithreaded `dynamic-mt` repro (4 pthreads + a global
+    // mutex/cond). The `__copy_tls td=0` crash is fixed; this now exercises the
+    // lazy-file-fault-under-lock wedge during thread setup. `DYNAMIC_MT:ok` proves
+    // no wedge; a regression hangs (timeout) or crashes (fail-prefix). The kernel
+    // deadlock-guard names the culprit syscall in the serial on a wedge.
+    steps.push(SmokeStep::Send {
+        input: "/usr/bin/dynamic-mt\n",
+        label: "dynamic-hello-smoke: run multithreaded dynamic repro",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "DYNAMIC_MT:ok",
+        fail_prefixes: &[
+            "DYNAMIC_MT:create-fail",
+            "Segmentation fault",
+            "ended by signal SIGSEGV",
+            "process killed",
+        ],
+        timeout_secs: 60,
+        label: "dynamic-hello-smoke: DYNAMIC_MT:ok (multithreaded)",
+        exit_code_on_fail: SMOKE_EXIT_DYNAMIC_HELLO_FAILED,
+    });
     steps
 }
 

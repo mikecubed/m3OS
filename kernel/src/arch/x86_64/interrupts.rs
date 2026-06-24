@@ -861,6 +861,37 @@ fn demand_map_vma_page(vaddr: u64, require_write: bool) -> bool {
         return false;
     }
 
+    // Deadlock-guard (Phase 95b lazy-file-fault-under-lock hunt) — placed at
+    // ENTRY, before `shared_vma_demand_file` (which re-takes PROCESS_TABLE) and
+    // before the blocking lazy-file read below. A legitimate ring-3 fault holds no
+    // kernel lock (preempt==0); preempt>0 means a SYSCALL holds an IrqSafeMutex
+    // across this demand-fault and is about to either self-deadlock on the
+    // PROCESS_TABLE re-lock or strand the lock across the blocking IPC — wedging
+    // every core. Log the culprit syscall (the last line before the silence).
+    {
+        static DEADLOCK_GUARD_BUDGET: core::sync::atomic::AtomicI32 =
+            core::sync::atomic::AtomicI32::new(64);
+        let depth = crate::task::scheduler::current_preempt_count();
+        if depth > 0
+            && DEADLOCK_GUARD_BUDGET.fetch_sub(1, core::sync::atomic::Ordering::Relaxed) > 0
+        {
+            let nr = crate::task::scheduler::current_task_ptr()
+                .map(|t| {
+                    t.last_syscall_nr
+                        .load(core::sync::atomic::Ordering::Relaxed)
+                })
+                .unwrap_or(u32::MAX);
+            log::error!(
+                "[deadlock-guard] demand-fault under lock: preempt={} syscall_nr={} pid={} vaddr={:#x} require_write={}",
+                depth,
+                nr,
+                pid,
+                vaddr,
+                require_write,
+            );
+        }
+    }
+
     // Phase 95b (Area A.2) — lazy file-backed demand paging. If the faulting page
     // lies in a `MAP_LAZY_FILE` VMA, read it straight from the backing file and
     // fill the frame; otherwise fall through to the zero-fill anonymous path.
@@ -885,37 +916,6 @@ fn demand_map_vma_page(vaddr: u64, require_write: bool) -> bool {
         // *slower*, not faster (measured: a 256 KiB cluster regressed
         // dynamic-hello). The 256 KiB `VFS_MAX_PREAD` cap (Phase 95c Area A.2) is
         // for the *sequential* install reads, where over-read is a non-issue.
-        // Deadlock-guard (Phase 95b lazy-file-fault-under-lock hunt): we are about
-        // to do a BLOCKING vfs_server read to fill this lazy-file page. The
-        // page-table lock + PROCESS_TABLE are already released here, and a
-        // legitimate ring-3 fault holds no kernel lock (preempt==0), so preempt>0
-        // means a SYSCALL holds an IrqSafeMutex across this fault — the lock is
-        // stranded across the IPC's context switch and wedges every core. Log the
-        // culprit syscall (the last line before the wedge) instead of hanging.
-        {
-            static DEADLOCK_GUARD_BUDGET: core::sync::atomic::AtomicI32 =
-                core::sync::atomic::AtomicI32::new(32);
-            let depth = crate::task::scheduler::current_preempt_count();
-            if depth > 0
-                && DEADLOCK_GUARD_BUDGET.fetch_sub(1, core::sync::atomic::Ordering::Relaxed) > 0
-            {
-                let nr = crate::task::scheduler::current_task_ptr()
-                    .map(|t| {
-                        t.last_syscall_nr
-                            .load(core::sync::atomic::Ordering::Relaxed)
-                    })
-                    .unwrap_or(u32::MAX);
-                log::error!(
-                    "[deadlock-guard] blocking lazy-file fault under lock: preempt={} syscall_nr={} pid={} vaddr={:#x} fd={}",
-                    depth,
-                    nr,
-                    pid,
-                    vaddr,
-                    fd,
-                );
-            }
-        }
-
         const CLUSTER: u64 = 64 * 1024;
         let page_base = vaddr & !0xFFF;
         let cluster_end = (page_base + CLUSTER).min(vma_end);
