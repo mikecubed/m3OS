@@ -5,6 +5,16 @@
 **Depends on:** Phase 95b (demand-side loader) ✅ (A+B), Phase 95 ✅ (rust toolchain + `pkg install rust`), Phase 88 ✅ (vfs_server ext2 ownership), Phase 87 ✅ (VFS bulk-I/O + `/proc/blkstats`)
 **Goal:** Make the ring-3 VFS read/write path fast enough that `pkg install rust` completes inside the install-step timeout and `rustc --version` cold-loads in reasonable time — flipping the Phase 95b `rustc-smoke` INSIDE-m3OS arm to PASS (`RUSTC_OK`) — **using the microkernel-idiomatic techniques** (zero-copy page-grant transfer, server-side readahead, a kernel page cache acting as the external-pager amortizer) **rather than moving the filesystem into the kernel.** `vfs_server` stays the sole ext2 authority for reads and writes.
 
+> **➜ CANONICAL PLAN + reframe.** Forward planning for the whole 95-series lives in
+> [`docs/handoffs/2026-06-24-phase-95-completion-plan.md`](../../handoffs/2026-06-24-phase-95-completion-plan.md).
+> Two corrections to this doc's premise: (1) measured under **KVM**, the FS is fast
+> (`pkg install rust` ~25 s, cold-load ~9.6 s) — the "~100–200 KB/s / 40-min install" figures
+> are a **TCG artifact**, so 95c is the path to a **TCG-runnable** gate, NOT the `RUSTC_OK`
+> correctness blocker (that is the `rustc hello.rs` compile stall — plan Step 1); and (2)
+> **Track F (the in-kernel ext2 bypass) is REJECTED** by an architecture decision — fix perf
+> in the ring-3 driver; F is reconsidered only if A+B+D + a recorded measurement prove IPC
+> itself is the wall.
+>
 > **Design stance.** The 95b prototype that read `/usr` pages straight from the in-kernel
 > `EXT2_VOLUME` (bypassing `vfs_server`) is fast but **not microkernel-pure** — it widens
 > ring-0's filesystem role and creates a two-readers-of-one-disk coherence hazard. Real
@@ -28,7 +38,7 @@
 | C | ext2-reader cache eviction — kill the fill-and-hold indirect-block thrash in `vfs_server`'s `Ext2State` cache (kernel `EXT2_VOLUME` deferred — not on the `/usr` hot path) | A | ✅ Done (vfs_server LRU) |
 | D | Installer read/verify/write coalescing | A | Planned |
 | E | Throughput **+ IPC-cost** measurement + regression gate (gates Track F) | A–D | ✅ Done (E.1) |
-| F | **(Conditional fallback)** in-kernel ext2 read fast path — landed **only if** E proves IPC cost itself is the wall; a documented, retireable departure from the single-owner model | E | Conditional |
+| F | **⛔ REJECTED (arch decision 2026-06-24)** in-kernel ext2 read fast path — violates the microkernel boundary + conflicts with the ext2-engine-unification (vfs_server = sole reader); reconsidered ONLY if A+B+D + a recorded measurement prove IPC itself is the wall | E | ⛔ Rejected |
 | G | Milestone: flip `rustc-smoke` to PASS (`RUSTC_OK`) | A–F, 95b | Planned |
 | H | Docs, learning doc, kernel version bump | A–G | Planned |
 
@@ -137,7 +147,7 @@
 **Why it matters:** If — and only if — Track E shows m3OS's raw IPC cost is the wall (a large-readahead IPC still can't reach acceptable throughput), fall back to reading read-only `/usr` demand pages straight from the in-kernel ext2 engine by inode (no IPC). This is the 95b prototype, landed **with** its coherence + concurrency proof and an **explicit "model departure"** note + a retirement condition (retire once IPC is fast enough). It is a last resort, not the design.
 
 **Acceptance:**
-- [ ] **Gated on E:** landed only if the measurement records IPC cost as the binding constraint at large clusters; otherwise this track is **not implemented** and is documented as intentionally-skipped.
+- [x] **REJECTED (arch decision 2026-06-24) — intentionally not implemented.** Performance is fixed in the ring-3 driver (Tracks A/B), not by moving ext2 into the kernel; this departure conflicts with the ext2-engine-unification (vfs_server = sole reader). Reconsidered ONLY if A+B+D + a recorded Track-E measurement prove IPC itself is the wall — and even then the fix is faster IPC. See the [completion plan](../../handoffs/2026-06-24-phase-95-completion-plan.md).
 - [ ] If landed: coherence proof (write-via-vfs then read-back-via-fast-path returns new bytes; `MAP_PRIVATE` writes never reach the file) + concurrency-safe with `vfs_server` (`smp-smoke` + `dynamic-hello-smoke` green); a docstring marks it a deliberate departure with a retirement condition.
 
 ---
@@ -148,6 +158,9 @@
 
 **File:** `xtask/src/main.rs` (`cmd_rustc_smoke` — reused from 95/95b, unchanged)
 **Symbol:** the `RUSTC_OK` sentinel
+**Note (2026-06-24):** the milestone is **also** gated on the `rustc hello.rs` compile-thread
+stall (completion-plan Step 1, a scheduler/futex fix), independent of 95c FS perf; if
+`rustc-smoke` is KVM-gated (plan Step 2) these FS tracks become optional for it.
 **Acceptance:**
 - [ ] `pkg install rust` completes well within the install-step timeout (fresh, non-`FAST_ITER`).
 - [ ] `rustc --version` → `--print sysroot` → `rustc hello.rs` → `RUSTC_OK`; `rustc-smoke` PASSES under `M3OS_RUST_REGRESSION=1`.

@@ -6,6 +6,20 @@
 **Builds on:** Phase 87 made the ext2 read/write path *coalesce contiguous runs* and added `/proc/blkstats`; Phase 95b made large-DSO loading *demand-paged* so only the touched working set is read. 95c is the **supply-side** complement: make the ring-3 VFS path itself fast enough that the heavy-toolchain install + cold-load story stops being I/O-bound — finishing the `RUSTC_OK` milestone Phase 95b is gated on.
 **Primary Components:** `userspace/vfs_server/` (the ring-3 ext2 read/write service), `kernel/src/arch/x86_64/syscall/mod.rs` (`kernel_read_fd_at` / `vfs_service_read` / `demand_read_file_page`), `kernel/src/fs/ext2.rs` (the in-kernel ext2 engine + block cache), `kernel-core/src/fs/ext2.rs` (the coalescing reader), `userspace/pkg/` (the installer's read/verify/write loop), `kernel/src/blk/` (`/proc/blkstats`)
 
+> **➜ Reframe (2026-06-24) — read with the [completion plan](../handoffs/2026-06-24-phase-95-completion-plan.md).**
+> Two corrections to this doc's premise, learned after it was written:
+> 1. **The FS is not the `RUSTC_OK` wall.** Measured under **KVM**, `pkg install rust` is
+>    ~25 s and the cold-load ~9.6 s; the "~100–200 KB/s / ~40-min install" numbers below are
+>    a **TCG artifact**. 95c is therefore the path to a **TCG-runnable** `rustc-smoke` gate
+>    (and to faster repeat/shared loads via the page cache), **not** the milestone's
+>    correctness blocker — that is the `rustc hello.rs` multithreaded-compile stall (a
+>    scheduler/futex fix; completion-plan Step 1).
+> 2. **Area F (in-kernel ext2 read fast path) is REJECTED** by an architecture decision
+>    (owner, 2026-06-24): it violates the microkernel boundary and conflicts with the
+>    ext2-engine-unification (vfs_server = sole post-boot reader). Fix perf in the ring-3
+>    driver (Areas A/B); F is reconsidered only if A+B+D + a recorded measurement prove IPC
+>    itself is the wall. The "Area F" text below stands as the (now last-resort) description.
+
 ## Milestone Goal
 
 `pkg install rust` (the ~368 MB toolchain) **completes well within** the install-step timeout, and `rustc --version` cold-loads in a reasonable time — so the **Phase 95b `rustc-smoke` INSIDE-m3OS arm reaches PASS** (`RUSTC_OK`). The same throughput win materially shortens the clang / node / python / claude installs and cold loads, letting their gates relax the 90-minute timeouts. This is the subphase that *finishes* the 95-series goal: a native rust toolchain that actually runs and generates code on m3OS.
@@ -91,7 +105,12 @@ is justified (and the lesson is "make IPC faster"). **(2) Guard** with a `/proc/
 throughput gate (request-count + wall-clock), reusing the Phase 87 `vfs-bulkio-smoke` plumbing.
 
 ### Area F — (Conditional fallback) in-kernel ext2 read fast path
-Landed **only if** Area E proves IPC cost itself is the wall. A `/usr` file's `VfsService` fd
+**⛔ REJECTED (arch decision, owner, 2026-06-24) — NOT implemented.** This microkernel-boundary
+departure is off the table (it also conflicts with the ext2-engine-unification that made
+`vfs_server` the sole reader). Reconsidered **only if** Areas A+B+D are landed AND a recorded
+Area-E measurement proves the VFS path categorically cannot reach acceptable throughput — and
+even then the fix is faster IPC, not ext2-in-ring-0. The original (now last-resort)
+description follows. Landed **only if** Area E proves IPC cost itself is the wall. A `/usr` file's `VfsService` fd
 carries its ext2 inode (`VfsFileMeta::inode`), so a read-only `MAP_LAZY_FILE` demand fault could
 read straight from `EXT2_VOLUME` (no IPC). This is the 95b prototype, landed **with** its coherence
 proof (`MAP_PRIVATE` → writes never reach the file; `/usr` read-only at runtime; kernel ext2 read

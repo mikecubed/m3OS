@@ -1,4 +1,10 @@
 ---
+forward-plan: ➜ The remaining work to finish Phase 95 is tracked in
+  `docs/handoffs/2026-06-24-phase-95-completion-plan.md` (the canonical plan). The CRASH
+  CHAIN this doc is named for is DONE — `rustc --version` (1.96.0) and `rustc --print sysroot`
+  (/usr) run on-device. The only remaining `RUSTC_OK` blocker is the `rustc hello.rs`
+  multithreaded-compile stall (plan Step 1). This doc remains the technical record + the
+  repro gotchas.
 status: VALIDATED (page-table fix works) + PERF REFRAMED. The intermediate-writable
   page-table fix is CONFIRMED on-device: with it, `rustc --version` → `rustc 1.96.0`
   and `rustc --print sysroot` → `/usr` both RUN (serial-captured) — the 165 M-iteration

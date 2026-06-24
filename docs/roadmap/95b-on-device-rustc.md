@@ -1,12 +1,20 @@
 # Phase 95b - On-Device `rustc` Code Generation (Native Rust toolchain, part B)
 
-**Status:** Partial — Areas A + B landed & validated; milestone (Area D) re-diagnosed but still BLOCKED (see "Outcome" below)
+**Status:** Partial — crash chain FIXED, **rustc EXECUTES on-device** (`--version`→1.96.0, `--print sysroot`→/usr); the `RUSTC_OK` milestone now gates on the `rustc hello.rs` multithreaded-compile stall (scheduler/futex), NOT VFS throughput. ➜ Plan: [`docs/handoffs/2026-06-24-phase-95-completion-plan.md`](../handoffs/2026-06-24-phase-95-completion-plan.md). (The "Outcome" below is the pre-page-table-fix record.)
 **Source Ref:** phase-95b
 **Depends on:** Phase 95 ✅ (host toolchain + on-device `pkg install rust` + the precise on-device-load diagnosis), Phase 93 ✅ (`libc.so` + loader TLS — the dynamic `rustc` interpreter and the proc-macro `dlopen` target), Phase 76 → 76d ✅ (the from-scratch `ld-musl` dynamic loader 95b reworks), Phase 85d ✅ (streaming ELF exec / `pread64` / LLD), Phase 87 ✅ (VFS bulk-I/O), the SMP/TLB/kstack handoff [`docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md`](../handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md)
 **Builds on:** Phase 95 cross-built a **dynamic** musl `rustc` 1.96.0 (+ prebuilt `std` sysroot + bundled `rust-lld`), packaged it behind `M3OS_WITH_RUST`, and proved `pkg install rust` works on-device — but the on-device **code-generation milestone** (`rustc hello.rs` → `RUSTC_OK`) hit a wall: loading the ~162 MB dynamic `librustc_driver.so` through the loader's whole-file read+copy strategy is CPU-bound and times out. Phase 95b clears that wall and lands the milestone, then takes the `cargo` + proc-macro stretch (Phase 95's old Track D).
 **Primary Components:** `userspace/ld-musl-x86_64.so.1/src/main.rs` (the per-DSO load path), `kernel/src/arch/x86_64/syscall/mod.rs` (`sys_mmap_file_backed`), `kernel/src/mm/` (file-backed demand-fault VMA backing), `kernel/src/smp/tlb.rs` (shootdown batching), the kernel-stack allocator + the `#PF`/`#DF` recovery path, `xtask/src/main.rs` (`cmd_rustc_smoke` `RUSTC_OK` arm, `cmd_cargo_smoke`), `xtask/src/port_build.rs` (`build_rust` — stage `cargo`)
 
 ## Outcome (this pass)
+
+> **➜ SUPERSEDED IN PART (2026-06-24).** This Outcome predates the page-table fix
+> (`841fd53f`) and the KVM measurements. Corrections: rustc **does** now run userspace
+> (`--version`/`--print sysroot` pass); the "rustc never runs userspace / VFS throughput is
+> the binding constraint / ~40-min install" diagnosis below was a **pre-fix, TCG** picture
+> (under KVM the install is ~25 s). The real `RUSTC_OK` blocker is the `rustc hello.rs`
+> compile-thread stall. See the
+> [completion plan](../handoffs/2026-06-24-phase-95-completion-plan.md).
 
 **The infrastructure landed; the milestone moved but is still blocked.**
 

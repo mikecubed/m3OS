@@ -1,10 +1,16 @@
 # Phase 95b — On-Device `rustc` Code Generation: Task List
 
-**Status:** Partial — infrastructure landed (Areas A + B), milestone (Area D) re-diagnosed but still BLOCKED
+**Status:** Partial — crash chain FIXED — **rustc EXECUTES** (`--version`→1.96.0, `--print sysroot`→/usr); the `RUSTC_OK` milestone now gates on the `rustc hello.rs` multithreaded-compile stall (scheduler/futex), NOT VFS throughput. ➜ Canonical plan: `docs/handoffs/2026-06-24-phase-95-completion-plan.md`. (Tracks below are the per-pass record.)
 **Source Ref:** phase-95b
 **Depends on:** Phase 95 ✅ (host toolchain + on-device `pkg install rust` + the on-device-load diagnosis), Phase 93 ✅ (`libc.so` + loader TLS), Phase 76 → 76d ✅ (the `ld-musl` loader), Phase 85d ✅ (streaming exec / LLD), Phase 87 ✅ (VFS bulk-I/O), the SMP/TLB/kstack handoff `docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md`
 **Goal:** Land the Phase 95 milestone the host toolchain was blocked on — make the installed dynamic musl `rustc` actually **run on-device** and generate code (`rustc /usr/src/hello.rs` → `RUSTC_OK`), by reworking the `ld-musl` loader + kernel mm from a whole-file read+copy strategy to a streaming / file-backed-mmap one (so the ~162 MB `librustc_driver.so` demand-pages instead of being read+copied in full), batching SMP TLB shootdowns, and landing a targeted kernel-stack strategy. Then take the `cargo` + proc-macro stretch (the old Phase 95 Track D): `cargo build` proc-macro-free (`CARGO_OK`) and a derive-macro crate via on-device `dlopen` of the proc-macro `.so` against the Phase 93 `libc.so` (`CARGO_PROCMACRO_OK`).
 
+> **➜ CANONICAL PLAN.** Forward planning to finish Phase 95 — and the corrected
+> understanding (rustc now executes; the FS-throughput framing below was a **TCG artifact**;
+> the real `RUSTC_OK` blocker is the `rustc hello.rs` compile stall) — lives in
+> [`docs/handoffs/2026-06-24-phase-95-completion-plan.md`](../../handoffs/2026-06-24-phase-95-completion-plan.md).
+> The summary below is this pass's historical record.
+>
 > **Progress summary (this pass).** Area **A (A.1 + A.2)** — the streaming /
 > demand-paged file-backed loader — is **landed and validated** (`dynamic-hello-smoke`
 > PASS: `DYNAMIC_HELLO:ok` + `DLOPEN:ok`, with `libc.so` demand-paged from the ring-3
@@ -114,6 +120,15 @@
 - **The only active work is the GUI servers.** A syscall sampler showed ~41 M syscalls in the window, all from the resident input/compositor servers (`READ_KBD_SCANCODE` 0x100A / `READ_MOUSE_PACKET` 0x1015 / `FRAME_TICK_DRAIN` 0x1017) busy-looping headless. (On SMP=1 they also starve the single core; SMP=4 leaves cores free, yet rustc *still* makes no progress — confirming rustc is blocked, not merely starved.)
 
 **Net: the milestone is gated on VFS / block-I/O throughput, not on 95b's loader work.** Further localization (loader-serial + execve/demand-fill tracing) pointed *upstream* of A.2's code: the loader never loads a single DSO, and the dominant cost in the window is the ~368 MB `pkg install rust` over the **~100–200 KB/s ring-3 VFS** (≈40 min of I/O, at/over the 50-min install-step timeout — so the on-device rustc is likely never properly installed/loaded). This is the binding constraint A.2's demand-side laziness cannot fix (the bytes that *are* read still crawl). **The `RUSTC_OK` milestone is therefore carried into [Phase 95c](../95c-vfs-block-io-perf.md)** — the supply-side VFS/block-I/O performance subphase, done the **microkernel-idiomatic** way (zero-copy page-grant demand-fill + server-side readahead + a kernel page cache as the external-pager amortizer, keeping `vfs_server` the sole ext2 authority; the in-kernel ext2 bypass demoted to a measurement-gated fallback) — whose explicit goal is to flip this `rustc-smoke` arm to PASS and close the 95-series.
+
+**UPDATE (2026-06-24) — the above was superseded.** The page-table fix (`841fd53f`) cleared
+the kernel fault loop and **rustc now EXECUTES**: `rustc --version`→1.96.0 and `rustc --print
+sysroot`→/usr both run on-device. Measured under **KVM**, the FS is fast (`pkg install rust`
+~25 s, cold-load ~9.6 s) — the "~100–200 KB/s / 40-min install" wall was a **TCG artifact**,
+not the milestone blocker. The remaining `RUSTC_OK` gap is the `rustc hello.rs`
+**multithreaded-compile stall** (a scheduler/futex issue), tracked as **Step 1** of the
+[completion plan](../../handoffs/2026-06-24-phase-95-completion-plan.md). 95c's VFS perf is
+needed only to run `rustc-smoke` under TCG (no KVM); see the plan's Step 2 decision.
 
 **Acceptance:**
 - [ ] **BLOCKED** — On m3OS, `rustc --version` does not complete (rustc blocks in the kernel loading the 162 MB `librustc_driver.so`). `rustc --print sysroot` / `rustc hello.rs` → `RUSTC_OK` are gated behind it.
