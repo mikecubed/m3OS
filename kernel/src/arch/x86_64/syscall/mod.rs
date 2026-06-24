@@ -790,11 +790,19 @@ fn statfs_for_path(abs_path: &str) -> Statfs {
     if crate::fs::ext2::is_mounted()
         && let Some(rel) = ext2_root_path(abs_path)
     {
-        let vol = crate::fs::ext2::EXT2_VOLUME.lock();
-        if let Some(vol) = vol.as_ref()
-            && vol.exists(rel)
-        {
-            return ext2_statfs();
+        // Engine-unification Phase A: route the existence probe to `vfs_server`
+        // when registered (the in-kernel engine is the boot-window fallback).
+        if vfs_service_can_handle_path(abs_path) {
+            if vfs_service_stat_path(abs_path).is_ok() {
+                return ext2_statfs();
+            }
+        } else {
+            let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+            if let Some(vol) = vol.as_ref()
+                && vol.exists(rel)
+            {
+                return ext2_statfs();
+            }
         }
     }
     if let Some(rel) = fat32_relative_path(abs_path) {
@@ -855,6 +863,12 @@ fn statfs_path_exists(abs_path: &str) -> bool {
     if crate::fs::ext2::is_mounted()
         && let Some(rel) = ext2_root_path(abs_path)
     {
+        // Engine-unification Phase A: a root existence check routes to the
+        // `vfs_server` authority when registered so a write-back-deferred create
+        // is visible and the in-kernel ext2 engine isn't consulted post-boot.
+        if vfs_service_can_handle_path(abs_path) {
+            return vfs_service_stat_path(abs_path).is_ok();
+        }
         let vol = crate::fs::ext2::EXT2_VOLUME.lock();
         if let Some(vol) = vol.as_ref() {
             return vol.exists(rel);
@@ -8598,6 +8612,27 @@ fn vfs_service_can_list_dir(path: &str) -> bool {
         && crate::fs::ramdisk::ramdisk_list_dir(path).is_none()
 }
 
+/// Whether the ext2 *contents* of `path` can be enumerated through `vfs_server`
+/// (engine-unification Phase A). Listing is a MERGE — the ramdisk overlays the
+/// ext2 dir rather than shadowing it — so, unlike `vfs_service_can_handle_path`
+/// (single-file shadow semantics), a ramdisk-present directory such as `/`,
+/// `/bin`, or `/etc` still routes its ext2 portion to the server; the caller
+/// merges the ramdisk/virtual overlays on top. Excludes `vfs_server` itself,
+/// the kernel-owned virtual filesystems, and `/data` (fat32).
+fn vfs_can_list_ext2_dir(path: &str) -> bool {
+    if is_current_exec_path("/bin/vfs_server") {
+        return false;
+    }
+    if path == "/proc" || path.starts_with("/proc/") || path == "/dev" || path.starts_with("/dev/")
+    {
+        return false;
+    }
+    if path == "/data" || path.starts_with("/data/") {
+        return false;
+    }
+    crate::ipc::registry::is_registered("vfs") && ext2_root_path(path).is_some()
+}
+
 fn vfs_bootstrap_mount_action(target: &str, fstype: &str) -> Result<u64, u64> {
     use kernel_core::fs::vfs_protocol::{VFS_MOUNT_EXT2_ROOT, VFS_MOUNT_VFAT_DATA};
 
@@ -8822,6 +8857,94 @@ fn vfs_service_list_dir(
         return Err(NEG_EFAULT);
     }
     Ok((bytes, next_offset))
+}
+
+/// One child entry of an ext2 directory as enumerated by the `vfs_server`:
+/// `(name, d_type, d_ino)` where `d_ino` is the REAL on-disk inode the server
+/// emits (so a caller needs no second `stat`).
+type VfsDirChild = (alloc::string::String, u8, u64);
+
+/// Enumerate ALL children of an ext2 directory through the ring-3 `vfs_server`
+/// (engine-unification Phase A), draining the paginated `VFS_LIST_DIR` stream
+/// into a kernel `Vec` and parsing the `dirent64` records it returns. `.` and
+/// `..` are skipped — the getdents root/overlay merge synthesizes those itself.
+///
+/// This is the listing analog of `vfs_service_stat_path`: it lets the kernel's
+/// directory-merge paths (root `/` and ramdisk-overlaid subdirs) source their
+/// ext2 entries — names AND real inodes — from the single post-boot engine
+/// instead of `EXT2_VOLUME`, so a write-back-deferred create is visible and the
+/// in-kernel engine is not consulted for a root listing post-boot. Callers keep
+/// the in-kernel `list_dir` as the boot-window / degraded fallback.
+fn vfs_service_list_dir_entries(path: &str) -> Result<alloc::vec::Vec<VfsDirChild>, u64> {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::fs::vfs_protocol::VFS_LIST_DIR;
+
+    // One reply page. 64 KiB matches the cap `sys_linux_getdents64` already
+    // passes to `vfs_service_list_dir`; it is well within both `vfs_server`'s
+    // `recv_buf` and the IPC bulk ceiling.
+    const LIST_CHUNK: usize = 64 * 1024;
+
+    let vfs_ep = registry::lookup_endpoint_id("vfs").ok_or(NEG_ENOENT)?;
+    let task_id = scheduler::current_task_id().ok_or(NEG_EINVAL)?;
+
+    let mut children: alloc::vec::Vec<VfsDirChild> = alloc::vec::Vec::new();
+    let mut offset: usize = 0;
+    // Bound the page count so a corrupt/garbage `next_offset` can never spin
+    // forever (a directory can hold at most a few hundred thousand entries; the
+    // server advances the offset by at least one record per non-empty reply).
+    for _ in 0..1_000_000 {
+        let mut msg = Message::new(VFS_LIST_DIR);
+        msg.data[0] = path.len() as u64;
+        msg.data[1] = offset as u64;
+        msg.data[2] = LIST_CHUNK as u64;
+        scheduler::deliver_bulk(task_id, alloc::vec::Vec::from(path.as_bytes()));
+        let reply = endpoint::call_msg(task_id, vfs_ep, msg);
+        if reply.label != 0 {
+            return Err(reply.label);
+        }
+        let packed = reply.data[0];
+        let bytes = (packed & 0xFFFF_FFFF) as usize;
+        let next_offset = (packed >> 32) as usize;
+        if bytes == 0 {
+            break; // end of directory
+        }
+        if bytes > LIST_CHUNK {
+            return Err(NEG_EIO);
+        }
+        let bulk = scheduler::take_bulk_data(task_id).ok_or(NEG_EIO)?;
+        if bulk.len() < bytes {
+            return Err(NEG_EIO);
+        }
+        // Parse the packed dirent64 records: d_ino(8) d_off(8) reclen(2)
+        // d_type(1) name(NUL-terminated, padded to reclen).
+        let mut pos = 0usize;
+        while pos + 19 <= bytes {
+            let d_ino = u64::from_ne_bytes(bulk[pos..pos + 8].try_into().unwrap());
+            let reclen = u16::from_ne_bytes(bulk[pos + 16..pos + 18].try_into().unwrap()) as usize;
+            if reclen < 20 || pos + reclen > bytes {
+                return Err(NEG_EIO); // malformed record
+            }
+            let d_type = bulk[pos + 18];
+            let name_bytes = &bulk[pos + 19..pos + reclen];
+            let name_end = name_bytes
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(name_bytes.len());
+            if let Ok(name) = core::str::from_utf8(&name_bytes[..name_end])
+                && name != "."
+                && name != ".."
+            {
+                children.push((alloc::string::String::from(name), d_type, d_ino));
+            }
+            pos += reclen;
+        }
+        if next_offset <= offset {
+            break; // no forward progress — done (or degenerate)
+        }
+        offset = next_offset;
+    }
+    Ok(children)
 }
 
 fn vfs_service_mount_action(target: &str, fstype: &str) -> Result<u64, u64> {
@@ -17499,6 +17622,18 @@ fn path_ino(abs_path: &str) -> u64 {
     if crate::fs::ext2::is_mounted()
         && let Some(rel) = ext2_root_path(abs_path)
     {
+        // Engine-unification Phase A: resolve the inode through the `vfs_server`
+        // authority whenever it is registered, so getdents64 `d_ino` reflects a
+        // routed (possibly write-back-deferred) create/rename and the in-kernel
+        // ext2 engine is not consulted for a root read post-boot. The cached
+        // `vfs_service_stat_path` is the SAME source `stat`/`path_filemeta` use,
+        // so `d_ino` always matches `st_ino` for the entry. The in-kernel
+        // `EXT2_VOLUME` resolve stays as the boot-window / degraded fallback.
+        if vfs_service_can_handle_path(abs_path)
+            && let Ok(st) = vfs_service_stat_path(abs_path)
+        {
+            return st.ino;
+        }
         let vol = crate::fs::ext2::EXT2_VOLUME.lock();
         if let Some(vol) = vol.as_ref()
             && let Ok(ino) = vol.resolve_path(rel)
@@ -17560,6 +17695,15 @@ pub(super) fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     entries.push((alloc::string::String::from("."), DT_DIR));
     entries.push((alloc::string::String::from(".."), DT_DIR));
 
+    // Engine-unification Phase A: when a root/overlaid directory's ext2 entries
+    // are sourced from `vfs_server`, the server already returns each child's
+    // REAL d_ino — stash it by name so the serialization loop emits it directly
+    // instead of a second per-entry `path_ino` resolve. A name absent from this
+    // map (`.`/`..`, ramdisk overlays, virtual mounts, tmpfs/procfs/fat32) falls
+    // back to `path_ino` as before.
+    let mut vfs_inos: alloc::collections::BTreeMap<alloc::string::String, u64> =
+        alloc::collections::BTreeMap::new();
+
     if crate::fs::procfs::is_dir(&dir_path) {
         match crate::fs::procfs::list_dir(&dir_path) {
             Some(children) => {
@@ -17614,15 +17758,31 @@ pub(super) fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         // Start with ext2 root entries if mounted.
         let mut seen = alloc::collections::BTreeSet::new();
         if crate::fs::ext2::is_mounted() {
-            let children = {
-                let vol = crate::fs::ext2::EXT2_VOLUME.lock();
-                vol.as_ref().and_then(|vol| vol.list_dir("/").ok())
+            // Engine-unification Phase A: source the ext2 root's entries from the
+            // `vfs_server` authority when registered (real d_ino, write-back-
+            // visible). The in-kernel `list_dir` is the boot-window fallback.
+            let routed = if vfs_can_list_ext2_dir("/") {
+                vfs_service_list_dir_entries("/").ok()
+            } else {
+                None
             };
-            if let Some(children) = children {
-                for (name, is_dir) in children {
+            if let Some(routed) = routed {
+                for (name, d_type, d_ino) in routed {
                     seen.insert(name.clone());
-                    let child_path = alloc::format!("/{name}");
-                    entries.push((name, dirent_type_for_path(&child_path, is_dir)));
+                    vfs_inos.insert(name.clone(), d_ino);
+                    entries.push((name, d_type));
+                }
+            } else {
+                let children = {
+                    let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+                    vol.as_ref().and_then(|vol| vol.list_dir("/").ok())
+                };
+                if let Some(children) = children {
+                    for (name, is_dir) in children {
+                        seen.insert(name.clone());
+                        let child_path = alloc::format!("/{name}");
+                        entries.push((name, dirent_type_for_path(&child_path, is_dir)));
+                    }
                 }
             }
         }
@@ -17678,19 +17838,36 @@ pub(super) fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                     entries.push((name, if is_dir { DT_DIR } else { DT_REG }));
                 }
             }
-            let children = {
-                let vol = crate::fs::ext2::EXT2_VOLUME.lock();
-                vol.as_ref().and_then(|vol| vol.list_dir(rel).ok())
+            // Engine-unification Phase A: source the ext2 portion of an overlaid
+            // dir from the `vfs_server` authority when registered (real d_ino,
+            // write-back-visible); the in-kernel `list_dir` is the fallback.
+            let routed = if vfs_can_list_ext2_dir(&dir_path) {
+                vfs_service_list_dir_entries(&dir_path).ok()
+            } else {
+                None
             };
-            if let Some(children) = children {
-                for (name, is_dir) in children {
+            if let Some(routed) = routed {
+                for (name, d_type, d_ino) in routed {
                     if !seen.contains(&name) {
-                        let child_path = if dir_path == "/" {
-                            alloc::format!("/{name}")
-                        } else {
-                            alloc::format!("{dir_path}/{name}")
-                        };
-                        entries.push((name, dirent_type_for_path(&child_path, is_dir)));
+                        vfs_inos.insert(name.clone(), d_ino);
+                        entries.push((name, d_type));
+                    }
+                }
+            } else {
+                let children = {
+                    let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+                    vol.as_ref().and_then(|vol| vol.list_dir(rel).ok())
+                };
+                if let Some(children) = children {
+                    for (name, is_dir) in children {
+                        if !seen.contains(&name) {
+                            let child_path = if dir_path == "/" {
+                                alloc::format!("/{name}")
+                            } else {
+                                alloc::format!("{dir_path}/{name}")
+                            };
+                            entries.push((name, dirent_type_for_path(&child_path, is_dir)));
+                        }
                     }
                 }
             }
@@ -17764,7 +17941,14 @@ pub(super) fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         } else {
             alloc::format!("{dir_path}/{name}")
         };
-        let d_ino: u64 = path_ino(&child_abs);
+        // Engine-unification Phase A: prefer the real d_ino the `vfs_server`
+        // already returned for a routed ext2 child; only resolve via `path_ino`
+        // for entries with no stashed inode (`.`/`..`, ramdisk, virtual mounts,
+        // tmpfs/procfs/fat32).
+        let d_ino: u64 = match vfs_inos.get(name) {
+            Some(&ino) => ino,
+            None => path_ino(&child_abs),
+        };
         let d_off: i64 = (idx + 1) as i64;
         out[start..start + 8].copy_from_slice(&d_ino.to_ne_bytes());
         out[start + 8..start + 16].copy_from_slice(&d_off.to_ne_bytes());
