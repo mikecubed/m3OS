@@ -1815,6 +1815,22 @@ extern "x86-interrupt" fn page_fault_handler(
         crate::hlt_loop();
     }
 
+    // Phase 95b — emit a COMPACT one-line rip/cr2/err/rsp record FIRST, using only
+    // raw u64 hex (NO `VirtAddr`/`InterruptStackFrame` Debug formatters). Those
+    // formatters recurse deeply and can overflow an already-stressed kstack inside
+    // the heavy dumps below before the rip is ever printed — exactly what hid the
+    // RIP of the rust-lld-triggered `addr=0x8` kernel NULL-deref (the recursive
+    // fault's bogus RIP landed mid-instruction in `VirtAddr::fmt`, the dump's own
+    // formatter). This single line is stack-cheap and survives even if the heavy
+    // dumps below cascade. (`#PF` so it greps distinctly from the verbose line.)
+    _panic_print(format_args!(
+        "[int] KERNEL #PF rip={:#x} cr2={:#x} err={:#x} rsp={:#x}\n",
+        stack_frame.instruction_pointer.as_u64(),
+        addr.as_ref().map_or(u64::MAX, |v| v.as_u64()),
+        err.bits(),
+        stack_frame.stack_pointer.as_u64(),
+    ));
+
     // Kernel-stack overflow: the fault address is inside a kstack guard page.
     // Handle this BEFORE the heavy diagnostic dumps below — those push several
     // hundred bytes per frame and, on an already-exhausted stack, re-cross the

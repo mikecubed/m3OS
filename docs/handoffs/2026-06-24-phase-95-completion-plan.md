@@ -16,18 +16,20 @@ updated: 2026-06-24
 - **`rustc` runs on m3OS.** After the loader/libc/page-table crash chain was fully fixed
   (see "What is done"), `rustc --version` → `rustc 1.96.0` and `rustc --print sysroot` →
   `/usr` both **execute on-device, serial-captured**. The multi-week `CR2=0` blocker is gone.
-- **The remaining blocker to `RUSTC_OK` is now precisely diagnosed (2026-06-24): a KERNEL
-  PAGE-FAULT CASCADE during rust-lld's multithreaded link, NOT a lock-wedge.** The ENOTTY +
+- **The remaining blocker to `RUSTC_OK` is now precisely root-caused (2026-06-24).** The ENOTTY +
   `libLLVM.so`-load blockers were fixed this pass (FIONBIO ioctl; kernel `AT_EXECFN` + loader
-  `DT_RUNPATH`/`$ORIGIN`), so `rustc hello.rs` now compiles and rust-lld **loads + runs**.
-  It then crashes the kernel: a rust-lld worker thread faults in userspace (killed normally),
-  followed by a kernel NULL-deref (`addr=0x8`) and a **recursive kernel #PF on a kstack guard
-  page** (`cr2` inside `0xffff8080…` — kernel-stack overflow) that the kstack-overflow recovery
-  fails to contain → cascade-halt. The `block_current_until` guard fired ONLY on the benign
-  boot `virtio_blk.rs:968` mount and NEVER in the rustc phase, proving it is NOT a
-  block-while-atomic deadlock. Next is a **kernel-robustness investigation** (decode the
-  `addr=0x8` fault, bound the kstack-overflowing recursion so recovery fires, characterize the
-  pid-57 userspace fault) — see Step 1's dated update for specifics.
+  `DT_RUNPATH`/`$ORIGIN`), so `rustc hello.rs` now compiles and rust-lld **loads + runs**. The
+  chain: (1) a rust-lld **worker thread deterministically faults in userspace** (`rip=0x50755c`,
+  same 4-core and single-core) and is killed; (2) `fault_kill_trampoline` kills only that **one
+  TID**, not the **thread group**, so the siblings strand `BlockedOnFutex` forever (single-core:
+  a deterministic hang); (3) on **SMP** a sibling on another core races the partial teardown →
+  the kernel **`addr=0x8` NULL+8 deref**, then the `VirtAddr::fmt` heavy dump overflows the
+  kstack → recursive #PF cascade-halt. So **`addr=0x8` is the SMP-race manifestation of a
+  missing thread-group fatal-kill** (m3OS already has `sys_exit_group` group-kill machinery; the
+  fatal-fault path just doesn't use it). The fix = terminate the whole thread group on a fatal
+  fault + make the fault dump stack-safe (kernel-robustness) — but the **`RUSTC_OK`-critical
+  blocker is the rust-lld worker fault itself (`rip=0x50755c`)**, which the group-kill does not
+  resolve. See Step 1's dated updates for the full evidence + fix design.
 - **The "slow VFS install is the wall" story was a TCG artifact.** Measured under KVM, the
   FS is fast (136 MB/s write, 422 MB/s read, 217 µs IPC RTT): `pkg install rust` is **~25 s**
   and the 169 MB `librustc_driver.so` cold-load is **~9.6 s**. So **95c's VFS perf work is
@@ -271,6 +273,48 @@ thread is left `BlockedOnFutex` after the lock fixes.
     moved the failure from "rust-lld can't load" to "rust-lld runs, then a kernel fault cascade").
     The diagnostic `block_current_until` guard was reverted (uncommitted; it served its purpose:
     proving the hang is a fault cascade, not a block-while-atomic).
+  - **UPDATE (2026-06-24, addr=0x8 ROOT-CAUSED) — it is the SMP-race manifestation of a missing
+    thread-group fatal-kill; single-core it is a deterministic sibling futex-deadlock.** Added a
+    compact `[int] KERNEL #PF rip=…` line (raw u64 hex, no `VirtAddr`/`InterruptStackFrame`
+    Debug — those recurse and overflow the kstack inside the dump, which is what hid the rip)
+    at the top of the ring-0 fault arm (`interrupts.rs`, committed). Then ran the gate at
+    **`M3OS_SMP=1`** (single core) — the decisive experiment:
+      - The **userspace** fault is DETERMINISTIC and SMP-independent: `pid=57 rip=0x50755c
+        addr≈0x20ac1bX998` (a rust-lld **worker thread**) faults and is killed on EVERY run
+        (4-core and 1-core; the addr varies by ~1 page).
+      - Single-core there is **NO kernel `addr=0x8` fault**. Instead `[fault_kill] trampoline
+        running for pid 57` runs and then the **sibling threads deadlock forever**: `pid 56`
+        (the rust-lld thread-group leader), `pid 52`, `pid 49` are all `BlockedOnFutex "no
+        waker registered"` → the link hangs → timeout.
+    **Root cause:** `fault_kill_trampoline` (interrupts.rs:303) kills only the faulting **TID**,
+    not the **thread group**. m3OS already has the group-kill machinery — `sys_exit_group`
+    (syscall/mod.rs:3236) claims `tg.exit_owner`, `request_group_exit_by_pid` each sibling
+    (sets `group_exit_pending` → `forced_group_exit_trampoline`), quiesces them, then
+    `do_full_process_exit` frees the SHARED resources once — but the **fatal-fault path does not
+    use it**. So killing one thread (a) strands the siblings (single-core deadlock) and (b) on
+    SMP, a sibling running on another core races the trampoline's single-process teardown
+    (`close_all_fds_for` / `AddressSpace::deactivate_on_core` + nulling `pc.current_addrspace` /
+    `free_process_page_table`) and derefs a now-NULL shared struct at offset 8 → the kernel
+    `addr=0x8` NULL+8 read (err=0x0). The subsequent `VirtAddr::fmt` in the heavy dump overflows
+    the kstack → recursive #PF cascade-halt (a SECOND, dump-path bug). The recovered
+    `rip=0x10000b60331` was that recursive fault's bogus frame (mid-instruction in
+    `VirtAddr::fmt`), not the `addr=0x8` site.
+    **FIX (the real `addr=0x8` + sibling-deadlock fix):** make the fatal-fault path
+    (`fault_kill_trampoline`, and the analogous GPF/other unhandled-user-fault kills) terminate
+    the whole **thread group** when the process is multithreaded — reuse `sys_exit_group`'s
+    teardown (request group exit on all siblings + quiesce + free shared resources once) with a
+    SIGSEGV-encoded status, instead of the single-process teardown. This is substantial (the
+    quiesce loop runs in the post-IRETQ trampoline context; mind the waitpid status encoding —
+    killed-by-SIGSEGV vs exit-code; and the shared page-table must be freed only on the last
+    thread). Secondary hardening: make the kernel-fault heavy dump stack-safe (use compact u64
+    hex, not `VirtAddr`/`InterruptStackFrame` Debug) so a non-guard-page kernel fault can't
+    cascade into a kstack-overflow recursive #PF. **NOTE — even with a perfect group-kill,
+    `RUSTC_OK` is NOT reached:** the rust-lld worker still faults (rip=0x50755c) → rust-lld dies
+    (cleanly now) → the link fails. The group-kill is a kernel-robustness fix (no hang/crash);
+    the RUSTC_OK-critical blocker is the **rust-lld worker userspace fault itself** — next,
+    disassemble rust-lld at `0x50755c` (in the installed `.m3pkg`) + decode `addr≈0x20ac1bX998`
+    to determine whether it is an m3OS thread stack/TLS/mmap setup bug or a rust-lld behaviour
+    m3OS mishandles.
 
 ### Step 2 (DECISION — RESOLVED 2026-06-24) — `rustc-smoke` is KVM-gated; CI uses KVM
 
