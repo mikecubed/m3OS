@@ -98,7 +98,27 @@ unsafe fn map_current_user_page_inner(
         let user_flags =
             PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
 
+        // Upgrade an existing intermediate (PDPT/PD) entry to the full
+        // user_flags if it is missing WRITABLE or USER. A RO/supervisor
+        // intermediate left behind by an earlier mapping in the same 1 GiB /
+        // 2 MiB region (e.g. a PROT_READ file mmap, whose default `map_to`
+        // parent flags omit WRITABLE) would otherwise AND away the leaf's
+        // WRITABLE bit and make every writable anon page under it fault
+        // `present+write` forever. The leaf is the sole permission arbiter, so
+        // forcing intermediates permissive is always safe (see
+        // `user_space::USER_PARENT_TABLE_FLAGS`). Done before the PRESENT check
+        // below — OR-ing flags preserves PRESENT, so the "reuse vs allocate"
+        // decision is unchanged.
+        let upgrade_existing = |e: &mut x86_64::structures::paging::page_table::PageTableEntry| {
+            let f = e.flags();
+            if f.contains(PageTableFlags::PRESENT) && !f.contains(user_flags) {
+                let addr = e.addr();
+                e.set_addr(addr, f | user_flags);
+            }
+        };
+
         let pml4 = table_mut(phys_offset, pml4_phys);
+        upgrade_existing(&mut pml4[p4_idx]);
 
         let new_pdpt = if pml4[p4_idx].flags().contains(PageTableFlags::PRESENT) {
             None
@@ -115,6 +135,7 @@ unsafe fn map_current_user_page_inner(
             .map(|frame| frame.start_address().as_u64())
             .unwrap_or_else(|| pml4[p4_idx].addr().as_u64());
         let pdpt = table_mut(phys_offset, pdpt_phys);
+        upgrade_existing(&mut pdpt[p3_idx]);
 
         let new_pd = if pdpt[p3_idx].flags().contains(PageTableFlags::PRESENT) {
             None
@@ -134,6 +155,7 @@ unsafe fn map_current_user_page_inner(
             .map(|frame| frame.start_address().as_u64())
             .unwrap_or_else(|| pdpt[p3_idx].addr().as_u64());
         let pd = table_mut(phys_offset, pd_phys);
+        upgrade_existing(&mut pd[p2_idx]);
 
         let new_pt = if pd[p2_idx].flags().contains(PageTableFlags::PRESENT) {
             None

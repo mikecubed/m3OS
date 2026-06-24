@@ -458,8 +458,19 @@ unsafe fn map_load_segment(
             let frame = frame_allocator::allocate_frame_zeroed().ok_or(ElfError::OutOfFrames)?;
 
             // Map the page; use ignore() since mapper may not be the current CR3.
+            // Force PRESENT|WRITABLE|USER on the intermediate tables: a RO
+            // PT_LOAD segment (.text/.rodata) has `flags` without WRITABLE, and
+            // the default `map_to` would derive non-writable intermediates from
+            // it — a later writable anon mmap reusing that 1 GiB/2 MiB region
+            // would then fault forever (see `user_space::USER_PARENT_TABLE_FLAGS`).
             mapper
-                .map_to(page, frame, flags, &mut frame_alloc)
+                .map_to_with_table_flags(
+                    page,
+                    frame,
+                    flags,
+                    super::user_space::USER_PARENT_TABLE_FLAGS,
+                    &mut frame_alloc,
+                )
                 .map_err(|_| ElfError::MappingFailed("map_to failed for PT_LOAD segment"))?
                 .ignore();
 
@@ -554,7 +565,13 @@ unsafe fn map_user_stack(mapper: &mut OffsetPageTable<'_>) -> Result<u64, ElfErr
             let frame = frame_allocator::allocate_frame_zeroed().ok_or(ElfError::OutOfFrames)?;
 
             mapper
-                .map_to(page, frame, flags, &mut frame_alloc)
+                .map_to_with_table_flags(
+                    page,
+                    frame,
+                    flags,
+                    super::user_space::USER_PARENT_TABLE_FLAGS,
+                    &mut frame_alloc,
+                )
                 .map_err(|_| ElfError::MappingFailed("map_to failed for stack page"))?
                 .ignore();
         }

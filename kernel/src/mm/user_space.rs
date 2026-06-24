@@ -15,6 +15,27 @@ use x86_64::{
 
 use super::{frame_allocator, paging::GlobalFrameAlloc};
 
+/// Intermediate (PDPT / PD / PT) page-table entries for **user** mappings must
+/// always be `PRESENT | WRITABLE | USER_ACCESSIBLE`, regardless of the leaf
+/// PTE's permissions.
+///
+/// On x86-64 the effective permission of a 4 KiB page is the AND of the
+/// WRITABLE/USER bits across every paging level, but m3OS uses the **leaf** PTE
+/// as the sole permission arbiter — W^X, the CoW marker (BIT_9), and PKU keys
+/// all live on the leaf. The `x86_64` crate's default [`Mapper::map_to`] derives
+/// its parent-table flags from the *leaf* flags (`flags & (PRESENT | WRITABLE |
+/// USER_ACCESSIBLE)`), so an eager `PROT_READ` file mmap (leaf = `PRESENT|USER`,
+/// no WRITABLE) would create **non-writable** intermediate tables. A later
+/// writable anonymous mmap that reuses that same 1 GiB/2 MiB region then faults
+/// `present+write` *forever*: the intermediate ANDs away WRITABLE while the leaf
+/// reads as writable, so the page-fault handler's spurious-write recovery (which
+/// only inspects the leaf) loops. (Observed: rustc's mallocng `alloc_group`
+/// write spinning 165 M times on one address — Phase 95b.) Always pass these
+/// explicit parent flags via [`Mapper::map_to_with_table_flags`].
+pub(crate) const USER_PARENT_TABLE_FLAGS: PageTableFlags = PageTableFlags::PRESENT
+    .union(PageTableFlags::WRITABLE)
+    .union(PageTableFlags::USER_ACCESSIBLE);
+
 /// Virtual base address where userspace code is loaded.
 pub const USER_CODE_BASE: u64 = 0x0000_0000_0040_0000; // 4 MiB
 
@@ -58,8 +79,11 @@ pub unsafe fn map_user_pages(
             // Zero-before-exposure: user-visible frame must be zeroed.
             let frame = frame_allocator::allocate_frame_zeroed().ok_or("out of physical frames")?;
             // Safety: frame is freshly allocated and zeroed, vaddr is within user range.
+            // Force PRESENT|WRITABLE|USER on the intermediate tables (see
+            // `USER_PARENT_TABLE_FLAGS`) so the leaf — not a RO/supervisor parent
+            // inherited from the default `map_to` — governs the page permission.
             mapper
-                .map_to(page, frame, flags, &mut alloc)
+                .map_to_with_table_flags(page, frame, flags, USER_PARENT_TABLE_FLAGS, &mut alloc)
                 .map_err(|_| "map_to failed")?
                 .flush();
         }
@@ -91,7 +115,17 @@ pub unsafe fn map_user_frames(
         for (i, &frame) in frames.iter().enumerate() {
             let vaddr = VirtAddr::new(virt_base + i as u64 * 4096);
             let page: Page<Size4KiB> = Page::containing_address(vaddr);
-            match mapper.map_to(page, frame, flags, &mut alloc) {
+            // `map_to_with_table_flags` + `USER_PARENT_TABLE_FLAGS`: the eager
+            // file-backed mmap path is the *primary* source of RO intermediate
+            // tables (a PROT_READ DSO segment), so this is the root-cause fix for
+            // the Phase 95b rustc anon-write fault loop.
+            match mapper.map_to_with_table_flags(
+                page,
+                frame,
+                flags,
+                USER_PARENT_TABLE_FLAGS,
+                &mut alloc,
+            ) {
                 Ok(flush) => {
                     flush.flush();
                     mapped += 1;
@@ -153,7 +187,14 @@ pub unsafe fn map_user_frames_contiguous(
             };
             let vaddr = VirtAddr::new(virt_base + i * 4096);
             let page: Page<Size4KiB> = Page::containing_address(vaddr);
-            match mapper.map_to(page, frame, flags, &mut alloc) {
+            // See `USER_PARENT_TABLE_FLAGS`: intermediates stay writable+user.
+            match mapper.map_to_with_table_flags(
+                page,
+                frame,
+                flags,
+                USER_PARENT_TABLE_FLAGS,
+                &mut alloc,
+            ) {
                 Ok(flush) => flush.flush(),
                 Err(_) => {
                     rollback_user_mapping(mapper, virt_base, i);

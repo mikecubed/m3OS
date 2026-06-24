@@ -135,6 +135,16 @@ static KSTACK_OVF_RSP: AtomicU64 = AtomicU64::new(0);
 /// CoW/mprotect race). Diagnostic-only; rate-limits the per-recovery log.
 static SPURIOUS_WRITE_RECOVERIES: AtomicU32 = AtomicU32::new(0);
 
+/// Count of write-faults whose leaf PTE grants write+user but an *intermediate*
+/// (PDPT/PD) table does not (effective permission ANDs every level). This is the
+/// Phase 95b RO/supervisor-intermediate bug — left unguarded the spurious-write
+/// recovery would loop forever (observed: rustc's mallocng spinning 165 M times
+/// on one address). The map paths now keep intermediates `PRESENT|WRITABLE|USER`
+/// (`user_space::USER_PARENT_TABLE_FLAGS` + the `map_current_user_page_inner`
+/// upgrade), so this should stay 0; if it fires we log the per-level flags and
+/// fall through to a visible kill rather than hang. Rate-limits the log.
+static INTERMEDIATE_PERM_FAULTS: AtomicU32 = AtomicU32::new(0);
+
 /// Count of W^X-v2 PKU cross-thread READ recoveries (Phase 90b). Diagnostic:
 /// if a single faulting RIP/addr keeps recovering, the grant isn't sticking and
 /// the thread is in a PKU read-fault spin-loop (a candidate for Claude Code's
@@ -664,6 +674,59 @@ fn leaf_pte_flag_bits(vaddr: u64) -> Option<u64> {
     }
 }
 
+/// Walk all four paging levels for `vaddr` and return each level's flag bits as
+/// `[p4, p3, p2, p1]`, or `None` if any level is absent or a huge page.
+///
+/// The effective permission of a 4 KiB page is the AND of WRITABLE/USER across
+/// every level, so the spurious-write recovery must inspect the whole walk —
+/// not just the leaf ([`leaf_pte_flag_bits`]) — to tell a genuine SMP race
+/// (every level writable+user) from a RO/supervisor *intermediate* that would
+/// otherwise loop the fault forever (Phase 95b).
+fn user_walk_level_flags(vaddr: u64) -> Option<[u64; 4]> {
+    use x86_64::registers::control::Cr3;
+    use x86_64::structures::paging::{PageTable, PageTableFlags};
+
+    let phys_off_va = VirtAddr::new(crate::mm::phys_offset());
+    let (cr3_frame, _) = Cr3::read_raw();
+    let pml4_phys = cr3_frame.start_address().as_u64();
+    let p4 = ((vaddr >> 39) & 0x1FF) as usize;
+    let p3 = ((vaddr >> 30) & 0x1FF) as usize;
+    let p2 = ((vaddr >> 21) & 0x1FF) as usize;
+    let p1 = ((vaddr >> 12) & 0x1FF) as usize;
+    unsafe {
+        let pml4: &PageTable = &*(phys_off_va + pml4_phys).as_ptr::<PageTable>();
+        let e4 = &pml4[p4];
+        if !e4.flags().contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+        let pdpt: &PageTable = &*(phys_off_va + e4.addr().as_u64()).as_ptr::<PageTable>();
+        let e3 = &pdpt[p3];
+        if !e3.flags().contains(PageTableFlags::PRESENT)
+            || e3.flags().contains(PageTableFlags::HUGE_PAGE)
+        {
+            return None;
+        }
+        let pd: &PageTable = &*(phys_off_va + e3.addr().as_u64()).as_ptr::<PageTable>();
+        let e2 = &pd[p2];
+        if !e2.flags().contains(PageTableFlags::PRESENT)
+            || e2.flags().contains(PageTableFlags::HUGE_PAGE)
+        {
+            return None;
+        }
+        let pt: &PageTable = &*(phys_off_va + e2.addr().as_u64()).as_ptr::<PageTable>();
+        let e1 = &pt[p1];
+        if !e1.flags().contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+        Some([
+            e4.flags().bits(),
+            e3.flags().bits(),
+            e2.flags().bits(),
+            e1.flags().bits(),
+        ])
+    }
+}
+
 /// Public entry point for kernel-context VMA demand paging.
 ///
 /// Revalidates the current VMA metadata while holding the address-space
@@ -762,8 +825,6 @@ fn demand_map_user_page_from_buf_locked(vaddr: u64, prot: u64, pkey: u8, buf: &[
         crate::mm::frame_allocator::free_frame(frame.start_address().as_u64());
         return false;
     }
-    #[cfg(feature = "rustc-profile")]
-    rustc_prof::note_demand_page();
     true
 }
 
@@ -1410,17 +1471,6 @@ extern "x86-interrupt" fn page_fault_handler(
     clac_on_irq_entry();
     let addr = x86_64::registers::control::Cr2::read();
 
-    // `rustc-profile`: heartbeat at the lock-free top of the #PF handler — counts
-    // every fault + logs the running totals and faulting addr/rip every 64 faults.
-    #[cfg(feature = "rustc-profile")]
-    rustc_prof::note_fault(
-        match &addr {
-            Ok(a) => a.as_u64(),
-            Err(_) => 0,
-        },
-        stack_frame.instruction_pointer.as_u64(),
-    );
-
     // Check if the fault came from ring 3 (user mode).
     if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
         // P17-T031: detect CoW faults — a write to a present, non-writable
@@ -1575,16 +1625,28 @@ extern "x86-interrupt" fn page_fault_handler(
         // infinite-loop risk: if the page is concurrently flipped back to RO, the
         // re-walk on the next fault returns not-WRITABLE and falls through to the
         // kill.
+        // The genuine SMP race requires *every* level to be writable+user — the
+        // effective permission ANDs all four levels. A leaf-only check (the
+        // historical bug) would also fire when the leaf grants write+user but an
+        // INTERMEDIATE table does not, and since `invlpg`+retry cannot change a
+        // RO/supervisor intermediate, that retry loops forever (Phase 95b: rustc
+        // mallocng spun 165 M times on one addr under a non-writable PD created
+        // by an eager PROT_READ file mmap). So we walk the whole translation and
+        // recover only when all levels agree; a deficient intermediate logs the
+        // per-level flags once and falls through to a visible kill.
         if is_write
             && is_present
             && !err.contains(PageFaultErrorCode::PROTECTION_KEY)
             && let Ok(fault_vaddr) = addr
-            && let Some(flags) = leaf_pte_flag_bits(fault_vaddr.as_u64())
+            && let Some(levels) = user_walk_level_flags(fault_vaddr.as_u64())
         {
             use x86_64::structures::paging::PageTableFlags as Ptf;
-            let writable = flags & Ptf::WRITABLE.bits() != 0;
-            let user = flags & Ptf::USER_ACCESSIBLE.bits() != 0;
-            if writable && user {
+            let all_writable = levels.iter().all(|f| f & Ptf::WRITABLE.bits() != 0);
+            let all_user = levels.iter().all(|f| f & Ptf::USER_ACCESSIBLE.bits() != 0);
+            let leaf = levels[3];
+            let leaf_writable = leaf & Ptf::WRITABLE.bits() != 0;
+            let leaf_user = leaf & Ptf::USER_ACCESSIBLE.bits() != 0;
+            if all_writable && all_user {
                 // Rate-limited diagnostic: confirm this fires (and is not looping
                 // on one address). First ~24 only, to avoid serial spam.
                 let n = SPURIOUS_WRITE_RECOVERIES.fetch_add(1, Ordering::Relaxed);
@@ -1601,6 +1663,25 @@ extern "x86-interrupt" fn page_fault_handler(
                 crate::task::scheduler::current_task_record_page_fault(false);
                 assert_preempt_count_zero_on_return_to_user(&stack_frame);
                 return;
+            } else if leaf_writable && leaf_user {
+                // Leaf grants write+user but an intermediate does not — the
+                // Phase 95b RO/supervisor-intermediate bug. The map paths now
+                // keep intermediates permissive, so this should never fire; if
+                // it does, surface which level is deficient and kill (NOT loop).
+                let n = INTERMEDIATE_PERM_FAULTS.fetch_add(1, Ordering::Relaxed);
+                if n < 8 {
+                    _panic_print(format_args!(
+                        "[pf] non-writable intermediate (would loop): pid={} addr={:#x} rip={:#x} p4={:#x} p3={:#x} p2={:#x} p1={:#x}\n",
+                        crate::process::current_pid(),
+                        fault_vaddr.as_u64(),
+                        stack_frame.instruction_pointer.as_u64(),
+                        levels[0],
+                        levels[1],
+                        levels[2],
+                        levels[3],
+                    ));
+                }
+                // fall through to the kill below
             }
         }
 
@@ -2265,66 +2346,6 @@ unsafe fn check_and_preempt_user(frame: &mut PreemptTrapFrameUser, trigger: Pree
 // and `reschedule_ipi_handler_kernel` under preempt-full.  Both call
 // sites are now early-return for the kernel-mode path; see the
 // post-mortem at `docs/post-mortems/2026-05-07-57e-preempt-full-deferred.md`.
-
-// ---------------------------------------------------------------------------
-// `rustc-profile` — opt-in cold-load diagnostic (feature-gated; off by default).
-//
-// Localizes where a large dynamic binary spends its cold-load time (the on-device
-// `rustc` loading the 162 MB `librustc_driver.so`): is it demand-paging-bound
-// (`DEMAND_PAGES` climbs the whole run ⇒ VFS throughput is the wall) or
-// execution-bound (`DEMAND_PAGES` plateaus while ticks keep advancing ⇒ LLVM
-// static-init / relocation CPU is the wall)? The loader's own `fd 2` serial is
-// invisible in the smoke harness, so this logs via the visible kernel serial.
-// The periodic line is emitted from the timer ISR through the deadlock-safe
-// try-lock `_panic_print` (a normal `log::info!` could re-enter `SERIAL1` on the
-// same core and spin), and fires regardless of paging so the execution-bound
-// phase is observable too. See
-// docs/handoffs/2026-06-23-rustc-runtime-null-deref-after-tls.md.
-// ---------------------------------------------------------------------------
-#[cfg(feature = "rustc-profile")]
-pub mod rustc_prof {
-    use core::sync::atomic::{AtomicU64, Ordering};
-
-    /// Cumulative file-backed user pages demand-filled since boot (load progress).
-    pub static DEMAND_PAGES: AtomicU64 = AtomicU64::new(0);
-    /// Cumulative page faults seen at the top of the #PF handler (ALL kinds).
-    static FAULT_COUNT: AtomicU64 = AtomicU64::new(0);
-
-    /// `[pf]` heartbeat cadence — one line per this many faults (low so even a
-    /// sub-2-MiB load is visible; the prior session saw rustc page < 1 MiB).
-    const LOG_EVERY_FAULTS: u64 = 32;
-
-    /// Bump the file-backed demand-page counter (called from the page-table-
-    /// LOCKED fill path — atomic increment ONLY; logging under that lock from
-    /// #PF context risks a recursive fault, so the log lives in [`note_fault`]).
-    #[inline(always)]
-    pub fn note_demand_page() {
-        DEMAND_PAGES.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Heartbeat from the TOP of the page-fault handler — BEFORE any branch and
-    /// BEFORE any kernel lock is taken (the same lock-free, ring-3-fault context
-    /// CoW resolution + `log::info!` already use safely). Counts EVERY fault
-    /// regardless of which branch resolves it, and every 64 faults logs the
-    /// running fault + demand-page totals and the faulting user `addr`/`rip`.
-    /// Read the trend during `rustc --version`:
-    ///   - `[pf]` lines streaming with `demand_pages`/`addr` climbing ⇒
-    ///     **paging-bound** (per-line wall-clock × 64 ≈ the fault rate → load MB/s);
-    ///   - `[pf]` goes SILENT while rustc keeps burning CPU ⇒ **execution-bound**
-    ///     (spinning on an already-resident working set — the last `rip` is where).
-    pub fn note_fault(addr: u64, rip: u64) {
-        let n = FAULT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        if n % LOG_EVERY_FAULTS == 0 {
-            log::info!(
-                "[pf] faults={} demand_pages={} addr={:#x} rip={:#x}",
-                n,
-                DEMAND_PAGES.load(Ordering::Relaxed),
-                addr,
-                rip,
-            );
-        }
-    }
-}
 
 /// Phase 57d Track B — timer handler, user (ring 3) path.
 ///
