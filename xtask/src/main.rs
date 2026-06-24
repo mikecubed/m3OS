@@ -20896,16 +20896,19 @@ fn cmd_vfs_throughput_smoke(args: &SmokeBootArgs) {
     }
 
     // Engine-unification Phase C1 — the single-post-boot-root-engine invariant.
-    // After Phases A+B route every root read to vfs_server, the in-kernel ext2
-    // engine serves only a small, known residual during the 8 MiB write+read:
-    // ~68 blocks (measured) from `open_ext2_file` building the writable
-    // `Ext2Disk` fd via in-kernel `resolve_path`/`read_inode` — the file-open
-    // metadata still resolved in-kernel. Routing that is the remaining work to
-    // make write-back (C2) safe, since those reads would observe a write-back-
-    // deferred create stale. The ceiling sits above the residual but well below
-    // a real read-un-routing regression (~`PAYLOAD_BYTES/4096` ≈ 2048 in-kernel
-    // blocks), so it still trips on one.
-    const INKERNEL_ROOT_READS_CEILING: u64 = 160;
+    // After Phases A+B routed all root reads and the open path now builds the
+    // `Ext2Disk` fd through vfs_server too, the in-kernel ext2 engine serves a
+    // small DELIBERATE residual during the 8 MiB write+read (~51 blocks
+    // measured): the DAC enforcement path. `require_search_permission` /
+    // `path_metadata` read each path component's uid/gid/mode from the in-kernel
+    // engine ON PURPOSE — DAC decisions must NOT trust a ring-3 `vfs_server`
+    // (which could spoof permissions via VFS_STAT_PATH). Those reads cannot be
+    // routed, and `invalidate_cache` keeps them coherent. This is why metadata
+    // write-back (C2) and retiring the invalidation (C3) are blocked: deferring
+    // inode/dir blocks would make the trusted DAC reads observe stale on-disk
+    // permissions. The ceiling sits above the DAC residual but well below a real
+    // read-un-routing regression (~`PAYLOAD_BYTES/4096` ≈ 2048 in-kernel blocks).
+    const INKERNEL_ROOT_READS_CEILING: u64 = 96;
     println!(
         "vfs-throughput-smoke:   inkernel_root_reads_delta = {inkernel_delta} (ceiling {INKERNEL_ROOT_READS_CEILING})"
     );

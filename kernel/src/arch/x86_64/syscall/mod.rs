@@ -10685,6 +10685,138 @@ fn data_chown(rel: &str, new_uid: u32, new_gid: u32) -> u64 {
     }
 }
 
+/// Engine-unification Phase C2-prep: open an ext2-root file/dir **entirely
+/// through `vfs_server`** — resolve existence + kind, route the `O_CREAT`/
+/// `O_TRUNC` mutation, and build the fd's metadata (inode/size/parent) from the
+/// server's stat — so the open never consults the in-kernel `EXT2_VOLUME`. This
+/// is the precondition for safe metadata write-back: the prior in-kernel
+/// `resolve_path`/`read_inode` here would observe a write-back-DEFERRED create
+/// stale (the C1-measured residual), failing an `open` right after its `create`.
+///
+/// Returns `Some(fd_or_errno)` when the server handled the open (success or a
+/// definitive errno), or `None` to fall through to the in-kernel path — used
+/// only when the server stat IPC itself fails (degraded vfs), never in steady
+/// state. The caller gates this on `vfs_write_routable()`, so the boot window
+/// (vfs not yet registered) always takes the in-kernel path below.
+#[allow(clippy::too_many_arguments)]
+fn open_ext2_file_routed(
+    name: &str,
+    rel: &str,
+    readable: bool,
+    writable: bool,
+    create: bool,
+    append: bool,
+    truncate: bool,
+    mode_arg: u64,
+    cloexec: bool,
+    nonblock: bool,
+) -> Option<u64> {
+    use kernel_core::fs::vfs_protocol::{VFS_NODE_DIR, VFS_NODE_FILE};
+    const NEG_EISDIR: u64 = (-21_i64) as u64;
+    const NEG_ENOENT: u64 = (-2_i64) as u64;
+    const NEG_EMFILE: u64 = (-24_i64) as u64;
+
+    // Existence + kind from the authority.
+    let existed = match vfs_service_stat_path(name) {
+        Ok(_) => true,
+        Err(e) if e == NEG_ENOENT => false,
+        // Any other error (IPC/degraded) → let the in-kernel path try.
+        Err(_) => return None,
+    };
+
+    if existed {
+        if truncate
+            && writable
+            && let Err(e) = vfs_service_truncate(name, 0)
+        {
+            return Some(e);
+        }
+    } else if create {
+        let parts: alloc::vec::Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+        let (parent_abs, file_name) = if parts.len() <= 1 {
+            ("/", parts.first().copied().unwrap_or(rel))
+        } else {
+            let name_start = name.len() - parts[parts.len() - 1].len();
+            (&name[..name_start], parts[parts.len() - 1])
+        };
+        let create_mode = ((mode_arg as u16) & 0o7777) & !current_umask();
+        let (_, _, caller_euid, caller_egid) = current_process_ids();
+        if let Err(e) = vfs_service_create(
+            parent_abs,
+            file_name,
+            VFS_NODE_FILE,
+            create_mode,
+            caller_euid,
+            caller_egid,
+            None,
+        ) {
+            return Some(e);
+        }
+    } else {
+        return Some(NEG_ENOENT);
+    }
+
+    // Re-stat for the post-mutation metadata. The create/truncate bumped the
+    // kernel stat cache (their `invalidate_cache`), so this resolves fresh.
+    let st = match vfs_service_stat_path(name) {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+
+    if st.kind == VFS_NODE_DIR {
+        if writable || create || truncate {
+            return Some(NEG_EISDIR);
+        }
+        let fd_entry = FdEntry {
+            backend: FdBackend::Dir {
+                path: alloc::string::String::from(name),
+            },
+            offset: 0,
+            readable: true,
+            writable: false,
+            cloexec,
+            nonblock,
+        };
+        return Some(match alloc_fd(3, fd_entry) {
+            Some(i) => i as u64,
+            None => NEG_EMFILE,
+        });
+    }
+
+    // Regular file (a symlink target was already followed by path resolution):
+    // an `Ext2Disk` fd whose reads/writes route BY PATH to vfs_server. The
+    // inode_num/parent_inode come from the server and are consulted only by the
+    // in-kernel fallback (never reached post-boot).
+    let parent_ino = {
+        let parent = parent_dir(name);
+        if parent == "/" {
+            kernel_core::fs::ext2::EXT2_ROOT_INO
+        } else {
+            vfs_service_stat_path(parent)
+                .map(|s| s.ino as u32)
+                .unwrap_or(kernel_core::fs::ext2::EXT2_ROOT_INO)
+        }
+    };
+    let initial_offset = if append { st.size as usize } else { 0 };
+    let fd_entry = FdEntry {
+        backend: FdBackend::Ext2Disk {
+            path: alloc::string::String::from(rel),
+            inode_num: st.ino as u32,
+            file_size: st.size as u32,
+            parent_inode: parent_ino,
+        },
+        offset: initial_offset,
+        readable,
+        writable,
+        cloexec,
+        nonblock,
+    };
+    Some(match alloc_fd(3, fd_entry) {
+        Some(i) => i as u64,
+        None => NEG_EMFILE,
+    })
+}
+
 /// Open a file on the ext2 partition.
 #[allow(clippy::too_many_arguments)]
 fn open_ext2_file(
@@ -10706,6 +10838,19 @@ fn open_ext2_file(
 
     if rel.is_empty() {
         return NEG_EISDIR;
+    }
+
+    // Engine-unification Phase C2-prep: post-boot, serve the whole open from the
+    // vfs_server authority so it never reads the in-kernel engine (which would
+    // see a write-back-deferred create stale). `None` (degraded vfs stat) falls
+    // through to the in-kernel path; the boot window (vfs unregistered) skips
+    // this entirely.
+    if vfs_write_routable()
+        && let Some(result) = open_ext2_file_routed(
+            name, rel, readable, writable, create, append, truncate, mode_arg, cloexec, nonblock,
+        )
+    {
+        return result;
     }
 
     // Phase 88: when the vfs_server ext2 authority is registered, route the
