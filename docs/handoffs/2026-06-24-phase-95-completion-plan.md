@@ -75,44 +75,65 @@ fully reconciled (this plan does that):
 
 ## The plan — ordered work to close the 95-series
 
-### Step 1 (PRIMARY, the real milestone blocker) — fix the `rustc hello.rs` compile-thread stall
+### Step 1 (PRIMARY) — the `rust-lld` link wedge: a Phase-95b "lock held across a blocking lazy-file fault" CLASS
 
-This is the only thing between here and `RUSTC_OK`. It is **new** work, not in either task
-list. Treat it as its own track.
+**DIAGNOSIS SOLVED (2026-06-24). It was never a codegen hang.** Empirical KVM runs peeled it:
+1. rustc **compiles fine** — the handoff's "compile-thread hang" was the slow TCG compile.
+2. The smoke harness's linker invocation was **mis-wired** — `-C linker-flavor=ld.lld` alone
+   execs a binary named `lld`; the bundled one is `rust-lld`. **FIXED** by adding
+   `-C linker=rust-lld` (xtask/src/main.rs ~23791; kept). With that, rustc invokes `rust-lld`.
+3. **The real blocker:** once `rust-lld` (a *dynamic*, multithreaded LLVM linker) runs, the
+   **whole system wedges — the stall-census watchdog stops too**. That "watchdog stops"
+   ⇒ a kernel deadlock (a global lock stranded across a context switch), not a userspace
+   futex block.
 
-**Files:** the scheduler block/wake path (`kernel/src/sched/` / `block_current_until` /
-`wake_task_v2`), the futex syscall path (`kernel/src/arch/x86_64/syscall/` futex ops), the
-`[sched] dequeue-drop … state-not-ready` emitter, the `clone(CLONE_THREAD)` / pthread path,
-and `fork`/`exec`/`waitpid` (rustc spawns `rust-lld` as a subprocess).
+**Root cause (high confidence, agent-verified).** Phase 95b (commit `bc732cb8`) made dynamic
+PT_LOAD pages `MAP_LAZY_FILE`, so a demand-fault now issues a **blocking vfs_server IPC**.
+Any syscall that does `copy_from_user`/`copy_to_user` (which pre-faults via `try_demand_fault`)
+**while holding an `IrqSafeMutex`** can now block → `block_current_until` → `switch_context`
+**with the lock still held, IF masked, preempt raised**. The lock is never released; every
+other core spinning on it wedges; the watchdog (needs scheduler progress) goes silent. This
+is exactly why a **static** binary (node) passes `smp-smoke` but a **dynamic** one (rust-lld)
+wedges — only dynamic binaries have lazy-file PT_LOAD pages.
 
-**Investigation outline:**
-1. **Reproduce in isolation, KVM, clean disk, serial dump.** Confirm `--version` /
-   `--print sysroot` pass and only `rustc /usr/src/hello.rs` stalls:
-   ```
-   cargo xtask clean
-   M3OS_SMOKE_SERIAL_DUMP=/tmp/s.txt M3OS_KVM=1 cargo xtask rustc-smoke --timeout 5400 &
-   # after install + a few min in the compile, `pkill -TERM -x qemu-system-x86`, then:
-   grep -a 'dequeue-drop\|BlockedOnFutex\|no waker\|process killed\|rust-lld\|panic' /tmp/s.txt
-   ```
-2. **Disambiguate hang vs. slow.** Re-use the 95b timer-ISR userspace-RIP sampler + the
-   syscall sampler: zero forward progress over minutes ⇒ a **deadlock** (lost wakeup /
-   futex / waitpid); slow-but-advancing ⇒ a throughput/contention problem.
-3. **Trace the `dequeue-drop state-not-ready` path** — find where a task is dequeued while
-   not runnable. This smells like a **wake/block race** (a worker signaled ready but
-   dropped, or a futex wake delivered to the wrong key / lost). Cross-check against the
-   2026-06-14 SMP lost-wakeup re-check (`block_current_until` re-validation) and the
-   per-address-space futex keys (Phase 90b).
-4. **Bisect rustc's own parallelism** to localize: `rustc -C codegen-units=1 -Z threads=1
-   /usr/src/hello.rs` (serial codegen) vs. the default parallel path. If serial passes and
-   parallel hangs, the bug is in the threadpool's futex/condvar handshake; if both hang,
-   suspect the `rust-lld` subprocess spawn/`waitpid`.
-5. **Check the link step is reached.** Does `rust-lld` ever spawn (grep the dump)? A hang
-   *before* lld is codegen-threadpool; a hang *at* lld is the fork/exec/wait path on a large
-   dynamic binary.
+**FIXED so far (this is a CLASS — more sites remain):**
+- `sys_futex` `FUTEX_WAIT` + `FUTEX_CMP_REQUEUE` read the futex word under `FUTEX_TABLE`
+  (`syscall/mod.rs` ~19677 / ~19833). **Fixed** by pre-faulting the word with no lock held
+  before locking (Linux-style). Note: this did NOT clear the `rust-lld` link wedge — it's a
+  *different* site (the link path completes `--version`/`--print sysroot`, which always
+  worked, then wedges only in the actual link).
 
-**Acceptance:** `rustc /usr/src/hello.rs` completes and the binary runs → `RUSTC_OK`
-(serial), under `M3OS_KVM=1`, clean disk; the scheduler warning is gone; `smp-smoke` stays
-green (the fix must not regress the existing futex/threadpool guard).
+**REMAINING: find the other lock-held-across-lazy-file-fault site(s) in the `rust-lld` link
+path** (the agent flagged `PROCESS_TABLE`, `ENDPOINTS`, and the scheduler locks as candidates;
+the `PROCESS_TABLE`-held-across-`copy_from_user` case is also a non-reentrant self-deadlock —
+`process/mod.rs:1293,1309` re-take `PROCESS_TABLE` from the demand path).
+
+**NEXT STEP — the deadlock-guard (stop guessing which lock).** Add a one-shot diagnostic at
+the blocking demand-fault chokepoint (`block_current_until`, scheduler.rs:3544, or
+`demand_map_vma_page`, interrupts.rs ~908): when about to block **with a lock held / preempt
+raised**, `log::error!` the offending **syscall number + user RIP + pid** (per-task
+`syscall_snapshot` in task/mod.rs ~636; the IrqSafeMutex/preempt held-state is the trigger).
+The **last line before the silence** names the culprit syscall → pre-fault its user copy
+before the lock (same fix shape). Repeat until the wedge clears. Consider a **systemic** fix
+too: pre-fault user-pointer args at syscall entry before locks, or a drop-lock-fault-retry on
+`copy_*_user`, since the agent warns this hazard exists anywhere a held lock spans a user copy.
+
+**FAST REPRO (build this first — ~2 min vs the 15-min rust gate).** A minimal **dynamic**
+(`PT_INTERP` + lazy-file PT_LOAD) C program, **4 pthreads**, with the contended
+`pthread_mutex_t`/`pthread_cond_t` in a **global `static` (.bss/.data)** — so its page is
+lazy-file-cold on first touch — doing tight lock/cond contention. A stack-local lock faults
+into the *non-blocking anonymous* path and misses the bug, so it MUST be a global. Build via
+the `build_dynamic_hello_fixture` template (`-O2 -fPIE -pie`, `xtask/src/main.rs:21933`); wire
+it as a `dynamic-mt-smoke` gate (the permanent regression guard for this Phase-95b class).
+
+**Acceptance:** `rustc /usr/src/hello.rs` links via multithreaded `rust-lld` and the binary
+runs → `RUSTC_OK` (serial, `M3OS_KVM=1`, clean disk); `dynamic-mt-smoke` passes; `smp-smoke`
+stays green. Also handle the `--threads=1` path's `std::process` `ENOTTY` panic (a separate,
+smaller bug) only if it resurfaces once the multithreaded path works.
+
+**Other notes:** `unhandled syscall 324` = `membarrier(PRIVATE_EXPEDITED)` — appears benign
+(a whole-system wedge is a lock deadlock, not a missing barrier); revisit only if a *single*
+thread is left `BlockedOnFutex` after the lock fixes.
 
 ### Step 2 (DECISION — RESOLVED 2026-06-24) — `rustc-smoke` is KVM-gated; CI uses KVM
 

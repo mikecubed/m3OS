@@ -19667,6 +19667,24 @@ pub(super) fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
                 return 0;
             }
 
+            // Pre-fault the futex word with NO lock held. For a dynamic binary
+            // the word can live in a cold MAP_LAZY_FILE page whose demand-fault
+            // blocks on a vfs_server IPC; faulting it under FUTEX_TABLE (an
+            // IrqSafeMutex held across the resulting context switch) strands the
+            // lock and wedges every core that touches a futex — the Phase 95b
+            // lazy-file-mmap regression that hung multithreaded dynamic rust-lld.
+            // Touching it here makes the page present so the compare-read under
+            // the lock below cannot block.
+            {
+                let mut probe = [0u8; 4];
+                if UserSliceRo::new(uaddr, probe.len())
+                    .and_then(|s| s.copy_to_kernel(&mut probe))
+                    .is_err()
+                {
+                    return NEG_EFAULT;
+                }
+            }
+
             let woken_flag = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
 
             {
@@ -19823,6 +19841,20 @@ pub(super) fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
 
             let mut woken_tids = alloc::vec::Vec::new();
             let mut requeued = 0usize;
+            // Pre-fault uaddr with NO lock held before the CMP_REQUEUE compare
+            // (see FUTEX_WAIT): the under-lock read below would otherwise
+            // demand-fault a cold lazy-file page and wedge all cores. musl's
+            // pthread_cond_signal/broadcast requeues onto a global mutex word,
+            // which is exactly such a page for a dynamic binary.
+            if cmd == FUTEX_CMP_REQUEUE {
+                let mut probe = [0u8; 4];
+                if UserSliceRo::new(uaddr, probe.len())
+                    .and_then(|s| s.copy_to_kernel(&mut probe))
+                    .is_err()
+                {
+                    return NEG_EFAULT;
+                }
+            }
             {
                 let mut table = FUTEX_TABLE.lock();
                 // CMP_REQUEUE re-checks `*uaddr == val3` under the table lock (so a

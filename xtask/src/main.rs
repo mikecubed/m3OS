@@ -23781,13 +23781,16 @@ fn rustc_smoke_steps() -> Vec<SmokeStep> {
     });
 
     // 4. Compile + link (bundled rust-lld) + RUN inside m3OS. m3OS has no system
-    //    `cc`/`ld`, so rustc is told to link directly with its bundled rust-lld
-    //    (self-contained linker + crt). The `RUSTC_OK` sentinel is printed by the
+    //    `cc`/`ld`, so rustc is told to link directly with its bundled rust-lld:
+    //    `-C linker=rust-lld` NAMES that vendored lld (the `ld.lld` flavor alone
+    //    defaults the linker binary to `lld`, which m3OS lacks → "linker `lld` not
+    //    found"), and `link-self-contained=yes` supplies the musl crt + libs. The
+    //    `RUSTC_OK` sentinel is printed by the
     //    running program (from the fixture), proving the toolchain produced a
     //    working native binary — not merely cross-built. No proc-macros in the
     //    dependency graph (the milestone is proc-macro-free by construction).
     steps.push(SmokeStep::Send {
-        input: "rustc -C linker-flavor=ld.lld -C link-self-contained=yes /usr/src/hello.rs -o /tmp/hello && /tmp/hello\n",
+        input: "rustc -C linker=rust-lld -C linker-flavor=ld.lld -C link-self-contained=yes /usr/src/hello.rs -o /tmp/hello && /tmp/hello\n",
         label: "rustc-smoke: rustc hello.rs (rust-lld) + run",
     });
     steps.push(SmokeStep::WaitPassOrFail {
