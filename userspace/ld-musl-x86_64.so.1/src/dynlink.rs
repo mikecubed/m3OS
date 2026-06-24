@@ -12,8 +12,8 @@
 use crate::elf64::{
     DT_FINI, DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_GNU_HASH, DT_HASH, DT_INIT, DT_INIT_ARRAY,
     DT_INIT_ARRAYSZ, DT_JMPREL, DT_NEEDED, DT_NULL, DT_PLTGOT, DT_PLTREL, DT_PLTRELSZ, DT_RELA,
-    DT_RELAENT, DT_RELASZ, DT_SONAME, DT_STRSZ, DT_STRTAB, DT_SYMENT, DT_SYMTAB, DT_VERDEF,
-    DT_VERDEFNUM, DT_VERNEED, DT_VERNEEDNUM, DT_VERSYM, Dyn, Sym,
+    DT_RELAENT, DT_RELASZ, DT_RPATH, DT_RUNPATH, DT_SONAME, DT_STRSZ, DT_STRTAB, DT_SYMENT,
+    DT_SYMTAB, DT_VERDEF, DT_VERDEFNUM, DT_VERNEED, DT_VERNEEDNUM, DT_VERSYM, Dyn, Sym,
 };
 use core::ptr::NonNull;
 
@@ -94,6 +94,12 @@ pub struct DynamicSection {
     /// or `u64::MAX` if absent (no `NonNull` here because zero is a
     /// legal offset).
     pub soname: u64,
+    /// `DT_RUNPATH` (or legacy `DT_RPATH`) — offset into `strtab` of a
+    /// colon-separated library search-path list, or `u64::MAX` if absent.
+    /// Supports `$ORIGIN` expansion. Phase 95b: rust-lld carries
+    /// `RUNPATH=$ORIGIN/../lib` to locate its bundled `libLLVM.so`.
+    /// `DT_RUNPATH` takes precedence over `DT_RPATH` when both are present.
+    pub runpath: u64,
     /// `DT_NEEDED` entries — each value is the offset into `strtab`
     /// of one needed library name. Up to `MAX_NEEDED` entries.
     pub needed: [u64; MAX_NEEDED],
@@ -131,6 +137,7 @@ impl DynamicSection {
             verneed: None,
             verneednum: 0,
             soname: u64::MAX,
+            runpath: u64::MAX,
             needed: [0; MAX_NEEDED],
             n_needed: 0,
         }
@@ -180,6 +187,12 @@ impl DynamicSection {
                     out.init = NonNull::new((entry.d_val.wrapping_add(load_bias)) as *mut u8);
                 }
                 DT_SONAME => out.soname = entry.d_val,
+                // Phase 95b — DT_RUNPATH (preferred) / DT_RPATH (legacy). When
+                // both appear, RUNPATH wins per the ELF spec; since RUNPATH (29)
+                // and RPATH (15) can appear in either tag order, only let RPATH
+                // set the field when RUNPATH has not already (sentinel u64::MAX).
+                DT_RUNPATH => out.runpath = entry.d_val,
+                DT_RPATH if out.runpath == u64::MAX => out.runpath = entry.d_val,
                 DT_PLTREL => out.pltrel = entry.d_val as i64,
                 DT_JMPREL => {
                     out.jmprel = NonNull::new((entry.d_val.wrapping_add(load_bias)) as *mut u8);

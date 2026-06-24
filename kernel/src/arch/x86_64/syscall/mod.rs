@@ -5379,6 +5379,10 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
                 &argv_refs,
                 &envp_refs,
                 loaded.aux_info(),
+                // Phase 95b — the resolved execve path for AT_EXECFN, so the
+                // loader can expand `$ORIGIN` in DT_RUNPATH (rust-lld →
+                // libLLVM.so under `$ORIGIN/../lib`).
+                Some(name.as_bytes()),
             )
         } {
             Ok(rsp) => rsp,
@@ -15898,6 +15902,37 @@ pub(super) fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
     } else {
         None
     };
+
+    // FIONBIO toggles O_NONBLOCK on ANY fd (pipe / socket / file), like Linux —
+    // NOT just TTYs, so it must be handled BEFORE the `is_tty` ENOTTY gate below.
+    // Rust std's `FileDesc::set_nonblocking` (Linux target) issues
+    // `ioctl(fd, FIONBIO, &c_int)`; `std::process::read_output` uses it to drain a
+    // child's stdout+stderr pipes via `poll` (see library/std/src/process.rs:2385,
+    // `wait_with_output`). Returning ENOTTY for the pipe fd made rustc panic while
+    // reading `rust-lld`'s output, blocking on-device codegen (Phase 95b). Mirror
+    // the `fcntl(F_SETFL, O_NONBLOCK)` path: set the `FdEntry.nonblock` flag the
+    // read paths already honor (EAGAIN when set + no data).
+    const FIONBIO: u64 = 0x5421;
+    if req == FIONBIO {
+        if backend.is_none() {
+            return NEG_EBADF;
+        }
+        let mut val = [0u8; 4];
+        if UserSliceRo::new(arg, val.len())
+            .and_then(|s| s.copy_to_kernel(&mut val))
+            .is_err()
+        {
+            return NEG_EFAULT;
+        }
+        let nonblock = i32::from_ne_bytes(val) != 0;
+        with_current_fd_mut(fd_idx, |slot| {
+            if let Some(e) = slot {
+                e.nonblock = nonblock;
+            }
+        });
+        return 0;
+    }
+
     let is_tty = matches!(
         &backend,
         Some(FdBackend::DeviceTTY { .. })

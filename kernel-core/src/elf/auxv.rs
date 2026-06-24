@@ -39,6 +39,13 @@ pub const AT_ENTRY: u64 = 9;
 /// Pointer to a 16-byte random seed in the string region. musl seeds
 /// its stack canary from this.
 pub const AT_RANDOM: u64 = 25;
+/// Pointer to the NUL-terminated pathname the program was executed with
+/// (the resolved `execve` path). The dynamic linker needs this to expand
+/// `$ORIGIN` in `DT_RUNPATH`/`DT_RPATH` (e.g. rust-lld's
+/// `RUNPATH=$ORIGIN/../lib` for its bundled `libLLVM.so`). Emitted only
+/// when the caller supplies the path; absent → the loader falls back to
+/// the default `/usr/lib`+`/lib` search (pre-existing behaviour).
+pub const AT_EXECFN: u64 = 31;
 
 /// Hard upper bound on entries this module can emit. Eight slots cover
 /// every entry Phase 76 produces (PHDR, PHENT, PHNUM, PAGESZ, BASE,
@@ -93,10 +100,17 @@ pub struct AuxExtras {
 /// When `extras` is `None`, neither is emitted — keeping the
 /// pre-Phase-76 static-binary auxv shape bit-identical so existing
 /// binaries are unaffected.
+///
+/// `at_execfn_ptr` is the user-space virtual address of the NUL-terminated
+/// program pathname in the string region (for `AT_EXECFN`), or `0` to omit
+/// the entry. The caller writes those bytes; this function just references
+/// them. Omitting it keeps the auxv shape bit-identical to the pre-`AT_EXECFN`
+/// layout (the pinned-sequence tests pass `0`).
 pub fn build_layout(
     phdr: PhdrInfo,
     extras: Option<AuxExtras>,
     at_random_ptr: u64,
+    at_execfn_ptr: u64,
 ) -> HeaplessVec<AuxEntry, MAX_AUX_ENTRIES> {
     let mut out = HeaplessVec::new();
 
@@ -142,6 +156,16 @@ pub fn build_layout(
         a_val: at_random_ptr,
     })
     .unwrap();
+    // AT_EXECFN (when supplied) — emitted just before AT_NULL. Position is
+    // immaterial to consumers (auxv is scanned by a_type), only AT_NULL must
+    // be last.
+    if at_execfn_ptr != 0 {
+        out.push(AuxEntry {
+            a_type: AT_EXECFN,
+            a_val: at_execfn_ptr,
+        })
+        .unwrap();
+    }
     out.push(AuxEntry {
         a_type: AT_NULL,
         a_val: 0,
@@ -174,7 +198,7 @@ mod tests {
 
     #[test]
     fn static_binary_layout_matches_phase_11_shape() {
-        let v = build_layout(phdr(), None, 0xDEAD_BEEF);
+        let v = build_layout(phdr(), None, 0xDEAD_BEEF, 0);
         // 6 entries: PHDR, PHENT, PHNUM, PAGESZ, RANDOM, NULL — same
         // as before Phase 76 so existing static binaries are unaffected.
         assert_eq!(v.len(), 6);
@@ -193,7 +217,7 @@ mod tests {
             at_base: 0x4000_0000,
             at_entry: 0x40_1000,
         };
-        let v = build_layout(phdr(), Some(extras), 0xCAFE);
+        let v = build_layout(phdr(), Some(extras), 0xCAFE, 0);
         // 8 entries — PAGESZ before BASE; BASE before ENTRY; ENTRY before
         // RANDOM; NULL last. This is the exact order musl _dlstart's
         // walker consumes.
@@ -213,7 +237,7 @@ mod tests {
 
     #[test]
     fn at_null_is_always_last() {
-        let v_static = build_layout(phdr(), None, 0);
+        let v_static = build_layout(phdr(), None, 0, 0);
         assert_eq!(v_static.last().map(|e| e.a_type), Some(AT_NULL));
 
         let v_dyn = build_layout(
@@ -223,8 +247,26 @@ mod tests {
                 at_entry: 0x2000,
             }),
             0,
+            0,
         );
         assert_eq!(v_dyn.last().map(|e| e.a_type), Some(AT_NULL));
+    }
+
+    #[test]
+    fn execfn_emitted_before_null_when_supplied() {
+        // With a non-zero execfn pointer, AT_EXECFN appears just before
+        // AT_NULL (and only AT_NULL is last). With 0 it is omitted entirely.
+        const EXECFN_PTR: u64 = 0x7fff_0000_1234;
+        let with = build_layout(phdr(), None, 0xAA, EXECFN_PTR);
+        assert_eq!(with.len(), 7); // PHDR,PHENT,PHNUM,PAGESZ,RANDOM,EXECFN,NULL
+        assert_eq!(with[5].a_type, AT_EXECFN);
+        assert_eq!(with[5].a_val, EXECFN_PTR);
+        assert_eq!(with[6].a_type, AT_NULL);
+
+        let without = build_layout(phdr(), None, 0xAA, 0);
+        assert_eq!(without.len(), 6);
+        assert!(without.iter().all(|e| e.a_type != AT_EXECFN));
+        assert_eq!(without.last().map(|e| e.a_type), Some(AT_NULL));
     }
 
     #[test]
@@ -247,6 +289,7 @@ mod tests {
             },
             None,
             0x20,
+            0,
         );
         let kinds: heapless::Vec<u64, MAX_AUX_ENTRIES> = v.iter().map(|e| e.a_type).collect();
         let expect = [AT_PHDR, AT_PHENT, AT_PHNUM, AT_PAGESZ, AT_RANDOM, AT_NULL];
@@ -287,6 +330,7 @@ mod tests {
                     },
                     extras,
                     0xdead_beef,
+                    0,
                 );
                 let nenv: usize = 2;
                 let narg: usize = 1;
@@ -333,6 +377,7 @@ mod tests {
                 at_entry: 0x40_1000,
             }),
             0x20,
+            0,
         );
         let kinds: heapless::Vec<u64, MAX_AUX_ENTRIES> = v.iter().map(|e| e.a_type).collect();
         let expect = [

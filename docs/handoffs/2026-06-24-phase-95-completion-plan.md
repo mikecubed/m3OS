@@ -195,6 +195,44 @@ thread is left `BlockedOnFutex` after the lock fixes.
   std `unwrap()`s; fix m3OS to return success for it (or confirm it's one std should tolerate).
   Fixing ENOTTY may let the multithreaded link complete, leaving the wedge a rarer race to
   finish off with the guard.
+- **UPDATE (2026-06-24, this pass) — ENOTTY FIXED + libLLVM.so RUNPATH-load FIXED; the
+  remaining blocker is the compile/link wedge (a RACE).** Three fixes landed this pass:
+  1. **ENOTTY (bug B) — FIXED.** The `std/process.rs:2385` `ENOTTY` is `read_output`'s
+     `set_nonblocking(true)` → `ioctl(pipe_fd, FIONBIO, &int)` (musl/linux `FileDesc`), which
+     m3OS's `sys_linux_ioctl` rejected with `ENOTTY` for any non-TTY fd. Fix: handle `FIONBIO`
+     (0x5421) BEFORE the TTY gate, toggling the `FdEntry.nonblock` flag the pipe read path
+     already honors (`syscall/mod.rs`). Confirmed: rustc now drains rust-lld's stdout/stderr
+     and prints the real linker error instead of panicking.
+  2. **rust-lld `DT_NEEDED not found: libLLVM.so.22.1-rust-1.96.0-stable` — FIXED.** With
+     ENOTTY gone, the captured error was that the loader could not find rust-lld's
+     `DT_NEEDED libLLVM.so`. rust-lld carries `RUNPATH=$ORIGIN/../lib` (`= /usr/lib/rustlib/
+     <target>/lib`, where `build_rust` already stages libLLVM.so), but the loader's
+     `load_dso_search` only searched `/usr/lib` + `/lib` and ignored `DT_RUNPATH`. Fix: the
+     kernel now emits **`AT_EXECFN`** (the resolved execve path — `auxv.rs` `build_layout` +
+     `mm/elf.rs` writes the string; `setup_abi_stack_with_envp` gained an `exec_path` arg), and
+     the loader parses **`DT_RUNPATH`/`DT_RPATH`** (`dynlink.rs`/`elf64.rs`) and, on a default-
+     search miss for the **main exe's** DT_NEEDEDs, falls back to the RUNPATH list with
+     `$ORIGIN` expanded from `AT_EXECFN`'s dir (`main.rs` `load_dso_runpath`). Additive auxv +
+     fallback-after-default = zero-regression for existing binaries (their libs are in /usr/lib,
+     found first). **Proven:** the run changed from the deterministic `DT_NEEDED not found`/
+     `exit status: 2` to rust-lld actually loading + running — the libLLVM.so load blocker is
+     cleared. No rust re-seal needed (the lib was already packaged).
+  3. The diagnostic `block_current_until` "block-while-atomic" guard was added then **removed**
+     before commit: it has a legitimate boot-time hit (`virtio_blk.rs:968`, pid 1 syscall 165
+     `mount` blocks with a lock held during the root mount — self-healing via the deadline+poll
+     fallback), so it is unsuitable as an always-on guard.
+  - **REMAINING (the next blocker): the rustc-compile / rust-lld-link whole-system wedge.**
+    With (1)+(2) landed, `rustc-smoke` under `M3OS_KVM=1`+`M3OS_RUST_FAST_ITER=1` now reaches
+    `rustc --version` 1.96.0 + `--print sysroot` `/usr`, then **hangs at `rustc hello.rs`**:
+    the serial dump ends right after `/usr` with **no hello.rs compile output and no dhcpv6
+    spam** → a whole-system lock-held deadlock, the SAME non-deterministic
+    lazy-file-fault-under-lock class (`rt_sigprocmask` cleared one site + `dynamic-mt`; the
+    rustc-compile/rust-lld path hits another). It is a RACE (earlier passes hit the ENOTTY arm
+    instead). **NEXT: re-add the general `block_current_until` "scheduling-while-atomic" guard
+    (preempt>0 at block entry → log syscall_nr + block_caller + pid), tolerating the known
+    `virtio_blk.rs:968` boot hit, and re-run the KVM rust gate to NAME the culprit syscall, then
+    fix it like `rt_sigprocmask` (move the user copy / drop the lock before the block).** Lower
+    the gate `--timeout` (e.g. 300) so the wedge dumps fast instead of waiting out 700s.
 
 ### Step 2 (DECISION — RESOLVED 2026-06-24) — `rustc-smoke` is KVM-gated; CI uses KVM
 

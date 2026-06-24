@@ -83,6 +83,9 @@ const AT_PHENT: u64 = 4;
 const AT_PHNUM: u64 = 5;
 const AT_BASE: u64 = 7;
 const AT_ENTRY: u64 = 9;
+/// Phase 95b — pointer to the NUL-terminated `execve` pathname, used to
+/// expand `$ORIGIN` in `DT_RUNPATH` (rust-lld → `$ORIGIN/../lib/libLLVM.so`).
+const AT_EXECFN: u64 = 31;
 
 // ---------------------------------------------------------------------------
 // Raw syscalls — Phase 76b's linker cannot link `syscall_lib` because
@@ -789,6 +792,96 @@ unsafe fn load_dso_search(name: &[u8]) -> Result<LoadedDso, LoadError> {
             Err(LoadError::NotFound) => continue,
             Err(e) => return Err(e),
         }
+    }
+    Err(LoadError::NotFound)
+}
+
+/// The directory portion of a path (everything before the final `/`), or an
+/// empty slice when the path has no `/`. Phase 95b — used to derive `$ORIGIN`
+/// (the directory of the executed program) from `AT_EXECFN`.
+fn dir_of(path: &[u8]) -> &[u8] {
+    match path.iter().rposition(|&b| b == b'/') {
+        Some(i) => &path[..i],
+        None => &[],
+    }
+}
+
+/// Borrow a NUL-terminated C string (e.g. the `AT_EXECFN` pathname) as a byte
+/// slice, capped at `cap` bytes so a missing terminator can't run away.
+///
+/// # Safety
+/// `p` must be null or point to a readable region with a NUL within `cap`.
+unsafe fn cstr_bytes<'a>(p: *const u8, cap: usize) -> &'a [u8] {
+    if p.is_null() {
+        return &[];
+    }
+    let mut n = 0usize;
+    while n < cap && unsafe { *p.add(n) } != 0 {
+        n += 1;
+    }
+    unsafe { core::slice::from_raw_parts(p, n) }
+}
+
+/// Phase 95b — resolve a `DT_NEEDED` soname through a colon-separated
+/// `DT_RUNPATH`/`DT_RPATH` list, expanding a leading `$ORIGIN` token to
+/// `origin` (the directory of the requesting object). Tries each entry as
+/// `<expanded-dir>/<name>`.
+///
+/// This runs ONLY as a FALLBACK after the default `/usr/lib`+`/lib` search
+/// misses, so the common case (libc.so etc. resolved from `/usr/lib`) is
+/// unaffected — the search exists purely to locate libraries a binary ships in
+/// a private directory, e.g. rust-lld's `libLLVM.so` under `$ORIGIN/../lib`
+/// (`/usr/lib/rustlib/<target>/lib`). Returns the loaded DSO on the first hit,
+/// or `NotFound` if no entry resolves.
+///
+/// # Safety
+/// Same contract as [`load_dso`]; `name`/`runpath`/`origin` must be valid for
+/// the call.
+unsafe fn load_dso_runpath(
+    name: &[u8],
+    runpath: &[u8],
+    origin: &[u8],
+) -> Result<LoadedDso, LoadError> {
+    const ORIGIN_TOK: &[u8] = b"$ORIGIN";
+    let mut start = 0usize;
+    let n = runpath.len();
+    let mut i = 0usize;
+    while i <= n {
+        if i == n || runpath[i] == b':' {
+            let entry = &runpath[start..i];
+            start = i + 1;
+            if !entry.is_empty() {
+                // Build `<dir>/<name>` into a zero-padded buffer (NUL-terminated
+                // for sys_open, like load_dso_search). Expand a leading $ORIGIN.
+                let mut path_buf = [0u8; 512];
+                let mut pos = 0usize;
+                let mut push = |bytes: &[u8], pos: &mut usize| -> bool {
+                    if *pos + bytes.len() >= path_buf.len() {
+                        return false;
+                    }
+                    path_buf[*pos..*pos + bytes.len()].copy_from_slice(bytes);
+                    *pos += bytes.len();
+                    true
+                };
+                let ok = if entry.len() >= ORIGIN_TOK.len()
+                    && &entry[..ORIGIN_TOK.len()] == ORIGIN_TOK
+                {
+                    push(origin, &mut pos) && push(&entry[ORIGIN_TOK.len()..], &mut pos)
+                } else {
+                    push(entry, &mut pos)
+                } && push(b"/", &mut pos)
+                    && push(name, &mut pos);
+                // Reserve one byte for the NUL terminator (buffer is pre-zeroed).
+                if ok && pos < path_buf.len() {
+                    match unsafe { load_dso(&path_buf) } {
+                        Ok(d) => return Ok(d),
+                        Err(LoadError::NotFound) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+        }
+        i += 1;
     }
     Err(LoadError::NotFound)
 }
@@ -2040,11 +2133,13 @@ pub(crate) unsafe fn install_trampoline_for(id: DsoId, state: &dl::DlState) {
 // ---------------------------------------------------------------------------
 
 /// Walk argc / argv / envp / auxv to extract `AT_BASE`, `AT_PHDR`,
-/// `AT_PHNUM`, `AT_ENTRY`. Returns the four values in order.
+/// `AT_PHNUM`, `AT_ENTRY`, and `AT_EXECFN`. Returns the five values in order
+/// (the last is the NUL-terminated execve pathname pointer, or null when the
+/// kernel did not supply `AT_EXECFN`).
 ///
 /// # Safety
 /// `stack` must be the genuine kernel-built SysV stack.
-unsafe fn parse_auxv(stack: *const u64) -> (u64, *const Phdr, usize, u64) {
+unsafe fn parse_auxv(stack: *const u64) -> (u64, *const Phdr, usize, u64, *const u8) {
     let argc = unsafe { *stack } as usize;
     let mut p = unsafe { stack.add(1).add(argc).add(1) };
     while unsafe { *p } != 0 {
@@ -2055,6 +2150,7 @@ unsafe fn parse_auxv(stack: *const u64) -> (u64, *const Phdr, usize, u64) {
     let mut at_phdr: *const Phdr = core::ptr::null();
     let mut at_phnum = 0usize;
     let mut at_entry = 0u64;
+    let mut at_execfn: *const u8 = core::ptr::null();
     loop {
         let a_type = unsafe { *p };
         let a_val = unsafe { *p.add(1) };
@@ -2066,12 +2162,13 @@ unsafe fn parse_auxv(stack: *const u64) -> (u64, *const Phdr, usize, u64) {
             AT_PHDR => at_phdr = a_val as *const Phdr,
             AT_PHNUM => at_phnum = a_val as usize,
             AT_ENTRY => at_entry = a_val,
+            AT_EXECFN => at_execfn = a_val as *const u8,
             _ => {}
         }
         p = unsafe { p.add(2) };
     }
     let _ = AT_PHENT; // accepted in input, not yet acted on
-    (at_base, at_phdr, at_phnum, at_entry)
+    (at_base, at_phdr, at_phnum, at_entry, at_execfn)
 }
 
 /// Phase 76d.E4.1 — Walk `envp` for `LD_BIND_NOW`. Returns `true` when
@@ -2465,7 +2562,7 @@ unsafe fn setup_static_tls(dsos: &[LoadedDso]) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
     serial(b"ldso(76d): _dlstart\n");
-    let (at_base, at_phdr, at_phnum, at_entry) = unsafe { parse_auxv(stack) };
+    let (at_base, at_phdr, at_phnum, at_entry, at_execfn) = unsafe { parse_auxv(stack) };
     if at_phdr.is_null() || at_phnum == 0 || at_entry == 0 {
         serial(b"ldso: missing AT_PHDR/AT_PHNUM/AT_ENTRY\n");
         return 0;
@@ -2620,6 +2717,13 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
         Some(p) => p.as_ptr(),
         None => core::ptr::null(),
     };
+    // Phase 95b — `$ORIGIN` for the main executable's DT_RUNPATH, derived from
+    // the AT_EXECFN pathname's directory (e.g. rust-lld at
+    // `/usr/lib/rustlib/<target>/bin/rust-lld` → origin
+    // `/usr/lib/rustlib/<target>/bin`, so `$ORIGIN/../lib` resolves its bundled
+    // libLLVM.so). Empty when the kernel supplied no AT_EXECFN.
+    let exec_path_bytes = unsafe { cstr_bytes(at_execfn, 512) };
+    let exec_origin = dir_of(exec_path_bytes);
     // SONAME (or DT_NEEDED name when DT_SONAME is absent) of every
     // loaded DSO, parallel to `dsos`. The main binary's slot is
     // empty (it has no SONAME).
@@ -2681,7 +2785,31 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
             continue;
         }
         // Phase 93 B.4 — search `/usr/lib` then `/lib` for the soname.
-        let loaded = match unsafe { load_dso_search(name) } {
+        // Phase 95b — on a miss, FALL BACK to the main executable's
+        // DT_RUNPATH ($ORIGIN-expanded) before giving up. This locates a
+        // private library a binary ships outside the standard dirs, e.g.
+        // rust-lld's `libLLVM.so` under `$ORIGIN/../lib`. Only the main exe's
+        // RUNPATH is honored (child DSOs' own $ORIGIN is not tracked); the
+        // common case (libc.so from /usr/lib) never reaches this fallback.
+        let resolved = match unsafe { load_dso_search(name) } {
+            Err(LoadError::NotFound)
+                if parent_idx == 0
+                    && main_dyn_section.runpath != u64::MAX
+                    && !strtab_main.is_null()
+                    && !exec_origin.is_empty() =>
+            {
+                let rp = unsafe {
+                    strtab_get(
+                        strtab_main,
+                        main_dyn_section.runpath,
+                        main_dyn_section.strsz,
+                    )
+                };
+                unsafe { load_dso_runpath(name, rp, exec_origin) }
+            }
+            other => other,
+        };
+        let loaded = match resolved {
             Ok(d) => d,
             Err(LoadError::NotFound) => {
                 serial(b"ldso: DT_NEEDED not found: ");

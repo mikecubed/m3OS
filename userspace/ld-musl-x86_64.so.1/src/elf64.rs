@@ -76,6 +76,12 @@ pub const DT_SYMENT: i64 = 11;
 pub const DT_INIT: i64 = 12;
 pub const DT_FINI: i64 = 13;
 pub const DT_SONAME: i64 = 14;
+/// `DT_RPATH` (legacy) / `DT_RUNPATH` — colon-separated library search paths
+/// (offsets into `DT_STRTAB`), supporting `$ORIGIN` expansion. Phase 95b reads
+/// these so a binary like rust-lld (`RUNPATH=$ORIGIN/../lib`) can locate its
+/// bundled `libLLVM.so` outside the default `/usr/lib`+`/lib` search.
+pub const DT_RPATH: i64 = 15;
+pub const DT_RUNPATH: i64 = 29;
 pub const DT_PLTREL: i64 = 20;
 pub const DT_JMPREL: i64 = 23;
 pub const DT_INIT_ARRAY: i64 = 25;
