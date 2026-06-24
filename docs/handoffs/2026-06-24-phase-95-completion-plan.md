@@ -114,24 +114,42 @@ and `fork`/`exec`/`waitpid` (rustc spawns `rust-lld` as a subprocess).
 (serial), under `M3OS_KVM=1`, clean disk; the scheduler warning is gone; `smp-smoke` stays
 green (the fix must not regress the existing futex/threadpool guard).
 
-### Step 2 (DECISION, do this before sinking more into 95c) — gate `rustc-smoke` on KVM?
+### Step 2 (DECISION — RESOLVED 2026-06-24) — `rustc-smoke` is KVM-gated; CI uses KVM
 
-Because the FS is only slow under TCG, the cheapest path to a green gate is to **require KVM
-for `rustc-smoke`** (skip-with-reason without `M3OS_KVM=1`), exactly like `node-jit-smoke`
-and the `claude` TUI arm already do. If we take that, **95c Steps 3a/3b below become optional
-for the milestone** and the 95-series closes on Step 1 alone.
+**Decision: KVM-gate `rustc-smoke`** (skip-with-reason without `M3OS_KVM=1`, like
+`node-jit-smoke`). **Verified empirically** — a throwaway `ci/kvm-probe` workflow on
+`ubuntu-latest` showed GitHub-hosted runners **DO expose `/dev/kvm`** and `kvm-ok` reports
+"KVM acceleration can be used". The "GitHub runners have no KVM" assumption still written in
+`build.yml`/`pr.yml` comments is **stale**. Findings:
 
-- **Recommended:** KVM-gate `rustc-smoke`. Rationale: the install/cold-load are already fast
-  under KVM; CI runners that lack nested virt skip cleanly (established precedent); we avoid
-  spending a whole subphase to make a heavyweight gate fit a TCG timeout.
-- **Alternative:** keep `rustc-smoke` TCG-runnable → then Step 3 (95c B+D) is required so the
-  ~368 MB install fits the timeout under TCG.
+- Host: Azure VM, **AMD EPYC 7763** (Zen 3), 4 vCPU, SVM exposed on all cores → nested KVM
+  works; `pkg install rust` ~25 s and cold-load ~9.6 s apply in CI, not the ~40-min TCG wall.
+- `/dev/kvm` is `root:kvm 0660`, so the non-root `runner` user needs the standard one-line
+  udev enable step before QEMU can use it:
+  ```yaml
+  - name: Enable KVM
+    run: |
+      echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+        | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+      sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+  ```
+- **Caveat — PKU is NOT exposed** (`pku=no`/`ospke=no`; Azure masks it even on Zen 3). KVM
+  buys `rustc-smoke` **speed**, which is all rustc needs (it does not JIT). It does **not**
+  give the PKU-dependent JIT gates (`node-jit-smoke`, the `claude` JIT arm) what they need —
+  those stay dev-machine / self-hosted-runner only.
 
-This is the pivotal sequencing call and should be made explicitly (owner input).
+**Consequences:** **Step 3 (95c B/D) is OPTIONAL for the milestone** — under KVM the FS is
+already fast, so the 95-series closes on **Step 1** alone. `rustc-smoke` runs KVM-accelerated
+in a dedicated heavy/nightly CI lane (the udev step + `M3OS_KVM=1`), matching how the other
+heavy toolchain gates are opt-in rather than per-PR. **Do not** spend 95c making TCG fast for
+a per-PR rustc gate. Follow-ups when we reach the milestone: (a) wire the KVM lane + udev step
+for `rustc-smoke`; (b) refresh the stale "no KVM" comments in `build.yml`/`pr.yml`.
 
-### Step 3 (95c, CONDITIONAL on Step 2 = "keep TCG-runnable") — finish VFS perf, in the driver
+### Step 3 (95c — now OPTIONAL per the Step 2 decision) — finish VFS perf, in the driver
 
-Only needed if `rustc-smoke` must run without KVM. All **in the ring-3 `vfs_server` path** —
+Step 2 resolved to KVM-gating `rustc-smoke`, so this is **not** on the milestone path; pursue
+it only for a TCG-runnable gate or for the standalone wins (Track B helps KVM too — repeat /
+shared loads). All **in the ring-3 `vfs_server` path** —
 **not** in the kernel (Track F is rejected, see below):
 - **3a. Track B — kernel page cache for file-backed pages** (`(file-id, offset)` keyed;
   re-faults / second run / shared DSO maps served with zero server IPC). This is the
