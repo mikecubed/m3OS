@@ -5378,6 +5378,14 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         (loaded, user_rsp)
     };
 
+    // Engine-unification Phase B: the streamed binary is fully loaded, so close
+    // the `vfs_server` exec handle now. `execve` ends by diverging into
+    // userspace (`enter_userspace` is `-> !`), so `exec_stream`'s `Drop` would
+    // never run; drop it explicitly here while still on the old task context
+    // (before the CR3 switch) so the `VFS_CLOSE` IPC lands and no handle leaks.
+    // For the in-kernel (boot-window) source this is a cheap no-op drop.
+    drop(exec_stream);
+
     // Close file descriptors with FD_CLOEXEC set.
     crate::process::close_cloexec_fds(pid);
 
@@ -8269,10 +8277,100 @@ fn is_directory(path: &str) -> bool {
 /// failure (e.g. `NEG_ENOENT` if not found, `NEG_E2BIG` if too large).
 const NEG_E2BIG: u64 = (-7_i64) as u64;
 
+/// Engine-unification Phase B: whether an `execve` binary read for `path` should
+/// be served by the ring-3 `vfs_server` rather than the in-kernel ext2 loader.
+///
+/// The early-boot window — `vfs_server` not yet registered, or the `vfs_server`
+/// binary loading *itself* — returns `false` so `init` and `vfs_server` are
+/// brought up from the FS by the in-kernel loader (`vfs_write_routable` already
+/// folds in the `is_current_exec_path("/bin/vfs_server")` guard). Only ext2-root
+/// binaries route; ramdisk (`/bin/sh`, …) and `/data` (fat32) keep their own
+/// loaders. Once routed, the read holds no `EXT2_VOLUME` lock and observes any
+/// write-back-deferred bytes — the Phase C precondition for the exec path.
+fn exec_should_route(path: &str) -> bool {
+    vfs_write_routable()
+        && !path.starts_with("/data/")
+        && crate::fs::ramdisk::ramdisk_lookup(path).is_none()
+        && ext2_root_path(path).is_some()
+}
+
+/// Open `path` read-only through `vfs_server` for a kernel-side exec read,
+/// returning the raw service handle (no fd allocation). The `VFS_OPEN` reply
+/// carries a stat-header bulk the exec loader does not need; it is drained so it
+/// cannot bleed into the first `VFS_READ`. Close with [`vfs_service_close`].
+fn vfs_exec_open(path: &str) -> Result<u64, u64> {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::fs::vfs_protocol::VFS_OPEN;
+
+    let vfs_ep = registry::lookup_endpoint_id("vfs").ok_or(NEG_ENOENT)?;
+    let task_id = scheduler::current_task_id().ok_or(NEG_EINVAL)?;
+    let mut msg = Message::new(VFS_OPEN);
+    msg.data[0] = 0; // O_RDONLY — the server rejects anything else
+    msg.data[1] = path.len() as u64;
+    scheduler::deliver_bulk(task_id, alloc::vec::Vec::from(path.as_bytes()));
+    let reply = endpoint::call_msg(task_id, vfs_ep, msg);
+    if reply.label != 0 {
+        return Err(reply.label);
+    }
+    // Drain the (unused) stat-header bulk the open reply delivers.
+    let _ = scheduler::take_bulk_data(task_id);
+    Ok(reply.data[0] & 0xFFFF_FFFF)
+}
+
+/// Read the whole of an already-stat'd ext2 binary (`size` bytes) through
+/// `vfs_server` into a fresh kernel buffer (engine-unification Phase B, static
+/// exec path). Opens a read-only handle, drains it with the kernel `VFS_READ`
+/// client (which caps each round-trip at `VFS_MAX_PREAD`), and always closes the
+/// handle. No `EXT2_VOLUME` lock is held across the transfer.
+fn vfs_exec_read_bytes(path: &str, size: usize) -> Result<alloc::vec::Vec<u8>, u64> {
+    let handle = vfs_exec_open(path)?;
+    let mut buf = alloc::vec![0u8; size];
+    let mut read = 0usize;
+    let result = loop {
+        if read >= size {
+            break Ok(());
+        }
+        match vfs_service_read_kernel(handle, read, &mut buf[read..]) {
+            Ok(0) => break Ok(()), // short file / EOF
+            Ok(n) => read += n,
+            Err(e) => break Err(e as u64),
+        }
+    };
+    vfs_service_close(handle);
+    result?;
+    buf.truncate(read);
+    Ok(buf)
+}
+
 pub(crate) fn read_file_from_disk(path: &str) -> Result<alloc::vec::Vec<u8>, u64> {
     /// Maximum executable size we can safely materialize in one reclaimable
     /// kernel heap allocation with the current page-backed large-allocation path.
     const MAX_EXEC_SIZE: usize = crate::mm::heap::max_page_backed_allocation_bytes();
+
+    // Engine-unification Phase B: post-boot, read an ext2-resident binary through
+    // the `vfs_server` authority — no `EXT2_VOLUME` lock held across the read,
+    // and a write-back-deferred binary is visible. The `vfs_service_stat_path`
+    // (cached) gives the size up front so a too-large binary returns E2BIG to the
+    // streaming path exactly as the in-kernel branch does. Any vfs miss (stat
+    // fails, not a regular file, read error) falls through to the in-kernel ext2
+    // path below — which also covers the boot window, where `exec_should_route`
+    // is false and `init`/`vfs_server` load via the in-kernel loader.
+    if exec_should_route(path)
+        && let Ok(st) = vfs_service_stat_path(path)
+        && st.kind == kernel_core::fs::vfs_protocol::VFS_NODE_FILE
+    {
+        let size = st.size as usize;
+        if size > MAX_EXEC_SIZE {
+            log::warn!("[exec] file too large ({size} bytes > {MAX_EXEC_SIZE} limit): {path}");
+            return Err(NEG_E2BIG);
+        }
+        if size > 0
+            && let Ok(buf) = vfs_exec_read_bytes(path, size)
+        {
+            return Ok(buf);
+        }
+    }
 
     // Try ext2 root filesystem first (most likely location for compiled binaries).
     // Skip /data/ paths — those are routed to FAT32 by other syscalls.
@@ -8384,35 +8482,77 @@ struct ExecWindow {
     data: alloc::vec::Vec<u8>,
 }
 
+/// Backing store for a [`DiskElfSource`] window refill.
+enum ExecStreamSource {
+    /// In-kernel ext2 by inode (early-boot window / `vfs_server` degraded).
+    Kernel(kernel_core::fs::ext2::Ext2Inode),
+    /// Engine-unification Phase B: an open `vfs_server` read handle — the routed
+    /// post-boot path, read with the kernel `VFS_READ` client (no `EXT2_VOLUME`
+    /// lock, write-back-visible). Closed when the `DiskElfSource` is dropped.
+    Vfs(u64),
+}
+
 /// Phase 85d — a disk-backed, windowed [`crate::mm::elf::ElfBytes`] source for
 /// ext2-resident binaries too large to materialize in one kernel-heap buffer (the
-/// ~65 MiB static `clang` exceeds the entire 64 MiB heap). Reads ranges from the
-/// ext2 root on demand through a 1 MiB sliding window, so
-/// `mm::elf::load_elf_streaming` never needs a giant allocation. Only ext2 is
-/// supported — `clang` installs to `/usr` on the ext2 root; a large binary on
-/// another filesystem falls back to E2BIG (no such case exists in practice).
+/// ~65 MiB static `clang` exceeds the entire 64 MiB heap). Reads ranges on demand
+/// through a 1 MiB sliding window, so `mm::elf::load_elf_streaming` never needs a
+/// giant allocation. The bytes come either from the in-kernel ext2 engine (boot
+/// window) or — once `vfs_server` is registered — from it over IPC
+/// (engine-unification Phase B). Only ext2-root binaries stream; a large binary
+/// elsewhere falls back to E2BIG (no such case exists in practice).
 struct DiskElfSource {
-    inode: kernel_core::fs::ext2::Ext2Inode,
+    source: ExecStreamSource,
     size: usize,
     window: spin::Mutex<ExecWindow>,
 }
 
+impl Drop for DiskElfSource {
+    fn drop(&mut self) {
+        if let ExecStreamSource::Vfs(handle) = self.source {
+            vfs_service_close(handle);
+        }
+    }
+}
+
 impl DiskElfSource {
-    /// Refill the window from the ext2 root so it starts at `offset`. Reads up to
-    /// `EXEC_STREAM_WINDOW` bytes (clamped to EOF).
+    /// Refill the window so it starts at `offset`. Reads up to
+    /// `EXEC_STREAM_WINDOW` bytes (clamped to EOF) from the backing source.
     fn refill(&self, win: &mut ExecWindow, offset: usize) -> Result<(), crate::mm::elf::ElfError> {
         use crate::mm::elf::ElfError;
         let to_read = EXEC_STREAM_WINDOW.min(self.size.saturating_sub(offset));
         if win.data.len() < EXEC_STREAM_WINDOW {
             win.data.resize(EXEC_STREAM_WINDOW, 0);
         }
-        let vol = crate::fs::ext2::EXT2_VOLUME.lock();
-        let vol = vol
-            .as_ref()
-            .ok_or(ElfError::MappingFailed("ext2 not mounted (streamed exec)"))?;
-        let n = vol
-            .read_file_data(&self.inode, offset as u64, &mut win.data[..to_read])
-            .map_err(|_| ElfError::MappingFailed("ext2 read failed (streamed exec)"))?;
+        let n = match &self.source {
+            ExecStreamSource::Kernel(inode) => {
+                let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+                let vol = vol
+                    .as_ref()
+                    .ok_or(ElfError::MappingFailed("ext2 not mounted (streamed exec)"))?;
+                vol.read_file_data(inode, offset as u64, &mut win.data[..to_read])
+                    .map_err(|_| ElfError::MappingFailed("ext2 read failed (streamed exec)"))?
+            }
+            ExecStreamSource::Vfs(handle) => {
+                // The kernel `VFS_READ` client caps each round-trip at
+                // `VFS_MAX_PREAD` (< `EXEC_STREAM_WINDOW`), so loop to fill the
+                // window. A short read before EOF leaves `len` at what landed.
+                let mut filled = 0usize;
+                while filled < to_read {
+                    match vfs_service_read_kernel(
+                        *handle,
+                        offset + filled,
+                        &mut win.data[filled..to_read],
+                    ) {
+                        Ok(0) => break,
+                        Ok(got) => filled += got,
+                        Err(_) => {
+                            return Err(ElfError::MappingFailed("vfs read failed (streamed exec)"));
+                        }
+                    }
+                }
+                filled
+            }
+        };
         win.offset = offset;
         win.len = n;
         Ok(())
@@ -8457,6 +8597,40 @@ impl crate::mm::elf::ElfBytes for DiskElfSource {
 /// [`DiskElfSource`]. Only the ext2 root (where `/usr/bin/clang-18` lives) is
 /// supported; the caller falls back to E2BIG for large binaries elsewhere.
 fn open_exec_stream(path: &str) -> Result<DiskElfSource, u64> {
+    let empty_window = || {
+        spin::Mutex::new(ExecWindow {
+            offset: 0,
+            len: 0,
+            data: alloc::vec::Vec::new(),
+        })
+    };
+
+    // Engine-unification Phase B: post-boot, stream the large binary through the
+    // `vfs_server` authority (no `EXT2_VOLUME` lock per refill, write-back-
+    // visible). `vfs_service_stat_path` (cached) gives the size; a routed
+    // `LARGE_EXEC_MAX` overflow returns E2BIG exactly as the in-kernel branch
+    // does. Any vfs miss falls through to the in-kernel path below, which also
+    // serves the boot window (`exec_should_route` false → in-kernel loader).
+    if exec_should_route(path)
+        && let Ok(st) = vfs_service_stat_path(path)
+        && st.kind == kernel_core::fs::vfs_protocol::VFS_NODE_FILE
+    {
+        let size = st.size as usize;
+        if size > LARGE_EXEC_MAX {
+            log::warn!(
+                "[execve] file too large for streaming ({size} bytes > {LARGE_EXEC_MAX} limit): {path}"
+            );
+            return Err(NEG_E2BIG);
+        }
+        if let Ok(handle) = vfs_exec_open(path) {
+            return Ok(DiskElfSource {
+                source: ExecStreamSource::Vfs(handle),
+                size,
+                window: empty_window(),
+            });
+        }
+    }
+
     if crate::fs::ext2::is_mounted() && !path.starts_with("/data/") {
         let vol = crate::fs::ext2::EXT2_VOLUME.lock();
         if let Some(vol) = vol.as_ref() {
@@ -8475,13 +8649,9 @@ fn open_exec_stream(path: &str) -> Result<DiskElfSource, u64> {
                     return Err(NEG_E2BIG);
                 }
                 return Ok(DiskElfSource {
-                    inode,
+                    source: ExecStreamSource::Kernel(inode),
                     size,
-                    window: spin::Mutex::new(ExecWindow {
-                        offset: 0,
-                        len: 0,
-                        data: alloc::vec::Vec::new(),
-                    }),
+                    window: empty_window(),
                 });
             }
         }
