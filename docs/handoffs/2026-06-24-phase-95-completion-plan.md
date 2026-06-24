@@ -16,12 +16,18 @@ updated: 2026-06-24
 - **`rustc` runs on m3OS.** After the loader/libc/page-table crash chain was fully fixed
   (see "What is done"), `rustc --version` → `rustc 1.96.0` and `rustc --print sysroot` →
   `/usr` both **execute on-device, serial-captured**. The multi-week `CR2=0` blocker is gone.
-- **The ONE remaining blocker to `RUSTC_OK` is the `rustc hello.rs` compile.** It loads,
-  spawns its codegen threads, then **goes silent** — a **multithreaded-compile hang or
-  extreme slowness**, *not* a page-table, loader, or filesystem problem. The lead is a
-  kernel `[sched] dequeue-drop … state-not-ready` warning on a rustc worker thread. This is
-  a **scheduler / futex / threading** investigation — a *new* track, owned by neither task
-  list as written.
+- **The remaining blocker to `RUSTC_OK` is now precisely diagnosed (2026-06-24): a KERNEL
+  PAGE-FAULT CASCADE during rust-lld's multithreaded link, NOT a lock-wedge.** The ENOTTY +
+  `libLLVM.so`-load blockers were fixed this pass (FIONBIO ioctl; kernel `AT_EXECFN` + loader
+  `DT_RUNPATH`/`$ORIGIN`), so `rustc hello.rs` now compiles and rust-lld **loads + runs**.
+  It then crashes the kernel: a rust-lld worker thread faults in userspace (killed normally),
+  followed by a kernel NULL-deref (`addr=0x8`) and a **recursive kernel #PF on a kstack guard
+  page** (`cr2` inside `0xffff8080…` — kernel-stack overflow) that the kstack-overflow recovery
+  fails to contain → cascade-halt. The `block_current_until` guard fired ONLY on the benign
+  boot `virtio_blk.rs:968` mount and NEVER in the rustc phase, proving it is NOT a
+  block-while-atomic deadlock. Next is a **kernel-robustness investigation** (decode the
+  `addr=0x8` fault, bound the kstack-overflowing recursion so recovery fires, characterize the
+  pid-57 userspace fault) — see Step 1's dated update for specifics.
 - **The "slow VFS install is the wall" story was a TCG artifact.** Measured under KVM, the
   FS is fast (136 MB/s write, 422 MB/s read, 217 µs IPC RTT): `pkg install rust` is **~25 s**
   and the 169 MB `librustc_driver.so` cold-load is **~9.6 s**. So **95c's VFS perf work is
@@ -228,11 +234,43 @@ thread is left `BlockedOnFutex` after the lock fixes.
     spam** → a whole-system lock-held deadlock, the SAME non-deterministic
     lazy-file-fault-under-lock class (`rt_sigprocmask` cleared one site + `dynamic-mt`; the
     rustc-compile/rust-lld path hits another). It is a RACE (earlier passes hit the ENOTTY arm
-    instead). **NEXT: re-add the general `block_current_until` "scheduling-while-atomic" guard
-    (preempt>0 at block entry → log syscall_nr + block_caller + pid), tolerating the known
-    `virtio_blk.rs:968` boot hit, and re-run the KVM rust gate to NAME the culprit syscall, then
-    fix it like `rt_sigprocmask` (move the user copy / drop the lock before the block).** Lower
-    the gate `--timeout` (e.g. 300) so the wedge dumps fast instead of waiting out 700s.
+    instead).
+  - **UPDATE (2026-06-24, later this pass) — the "wedge" is NOT a lock-held block; it is a
+    KERNEL PAGE-FAULT CASCADE (kstack overflow) during rust-lld's multithreaded run.** The
+    `block_current_until` "scheduling-while-atomic" guard was re-added and run: it fired ONLY
+    on the known self-healing boot case (`virtio_blk.rs:968`, pid 1 `mount`) and **never during
+    the rustc/rust-lld phase** — so the hang does NOT go through `block_current_until` with a
+    lock held. A run that progressed further (rust-lld is non-deterministic) captured the real
+    failure in the serial dump: rust-lld **loaded** (pid 56 mapped — RUNPATH fix confirmed) and
+    spawned worker threads, then:
+      1. `[int] userspace page fault: pid=57 addr=0x20ac1bb998 err=USER_MODE rip=0x50755c —
+         process killed` (a rust-lld worker thread faults in userspace, killed normally);
+      2. `[int] KERNEL page fault … addr=0x8` (a kernel NULL+8 deref) on one core;
+      3. `[int] RECURSIVE KERNEL PAGE FAULT on core 3 … cr2=0xffff8080000dd000 rip=0x10000b60331
+         — cascade halted`. **`cr2=0xffff8080000dd000` is inside the kstack pool guard region**
+         (`[kstack] pool … 0xffff808000000000..0xffff8080023fe000`) ⇒ a **kernel stack overflow**
+         whose guard-page #PF recurses (the bogus >4 GB rip = a corrupted return frame). The
+         existing kstack-overflow recovery (turn the guard #PF into a SIGSEGV of the offending
+         task; `kstack-overflow-smoke`/Track D) did NOT contain this — it cascaded to a recursive
+         fault that halts the core.
+    **So RUSTC_OK's remaining blocker is a kernel-robustness bug, NOT a lock wedge:** rust-lld's
+    multithreaded execution drives (a) a userspace fault in a worker thread, (b) a kernel NULL
+    deref at `0x8`, and (c) a kernel-stack-overflow recursive #PF cascade. **NEXT (a focused
+    kernel-fault investigation, the real `RUSTC_OK` gate):** (i) decode the kernel `addr=0x8`
+    fault — which handler NULL-derefs (likely the fault/kill/reap path under SMP, or the trace
+    dump path) — and harden it; (ii) find the deep kernel recursion overflowing the per-task
+    kstack (a fault handler re-faulting on a lazy-file/CoW page during the kill of pid 57, or the
+    trace-ring dump recursing) and bound it so the kstack-overflow recovery actually fires
+    instead of cascading; (iii) separately, characterize the pid-57 userspace fault
+    (rip=0x50755c, addr=0x20ac1bb998) — map it into rust-lld to see whether a worker thread's
+    stack/TLS/mmap setup is wrong (a loader/thread bug) vs. a legitimate access into memory the
+    kernel failed to map. Run the KVM rust gate at a short `--timeout` (300) so the cascade dumps
+    fast; `M3OS_SMOKE_SERIAL_DUMP` captures the full fault chain past the dhcpv6 spam.
+  - **Status of this pass's commits:** the FIONBIO + AT_EXECFN/DT_RUNPATH fixes are committed +
+    pushed (they cleared the ENOTTY + libLLVM-load blockers and are independently correct — they
+    moved the failure from "rust-lld can't load" to "rust-lld runs, then a kernel fault cascade").
+    The diagnostic `block_current_until` guard was reverted (uncommitted; it served its purpose:
+    proving the hang is a fault cascade, not a block-while-atomic).
 
 ### Step 2 (DECISION — RESOLVED 2026-06-24) — `rustc-smoke` is KVM-gated; CI uses KVM
 
