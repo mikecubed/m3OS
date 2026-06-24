@@ -18,11 +18,17 @@ status: VALIDATED (page-table fix works) + PERF REFRAMED. The intermediate-writa
   **entry-name→inode index** (`DirIndex`) keyed by inode number, making `resolve_path`'s
   per-component lookup + `create_file`'s EEXIST check + `add_directory_entry`'s free-slot
   search all O(1) amortised; coherence funnels through `add_directory_entry` (insert),
-  `remove_directory_entry` (clear), `update_dotdot` (clear). Measured: many-files
-  5083→3001 ms (−41%), last-batch 935→400 ms, super-linear growth 4.8×→2.1×, `verify=ok`.
-  Residual growth (2.1×) is the block/inode-bitmap free-search scanning from bit 0
-  (`claim_block_run`/`allocate_inode`) — a documented follow-up (per-group free cursor);
-  the per-create device-op floor (~24 ops/create) is the other lever. ALSO landed:
+  `remove_directory_entry` (clear), `update_dotdot` (clear). Measured (1000-file bench):
+  many-files 5083→3001 ms (−41%), last-batch 935→400 ms, super-linear growth 4.8×→2.1×,
+  `verify=ok`. SECOND FIX — the residual 2.1× growth was the block/inode-bitmap free-search
+  scanning from bit 0 (`claim_block_run`/`allocate_inode`, O(fill) per alloc); added a
+  **per-group free-search cursor** (`block_search_cursor`/`inode_search_cursor`) that
+  resumes where the last alloc in that group left off and wraps to 0 (correctness is
+  cursor-independent — every bit is still visited), with a free rewinding the cursor so the
+  slot is reused. Combined result (300-file bench): per-create 5.08→3.00→**2.11 ms/file**,
+  growth 4.8×→2.1×→**1.30× (flat)**, device reads flat across batches (1042→1084),
+  `write_calls_delta=649` unchanged, gate PASSES. Remaining lever: the per-create device-op
+  floor (~24 ops/create — metadata write batching). ALSO landed:
   `vfs-throughput-smoke` honors `M3OS_KVM`; the probe gained `ipc_rtt`/per-phase
   throughput + per-batch block-op sentinels; `run_smoke_script` prints per-step `[timing]`.
   ---PRIOR STATUS (page-table root-cause) BELOW---

@@ -173,6 +173,18 @@ struct Ext2State {
     /// write (the dominant remaining write cost + WRITE-request latency driver)
     /// into one write per run.
     block_reservation: Option<(u32, u32)>,
+    /// Phase 95c — per-group free-search cursors (one entry per block group). The
+    /// block/inode bitmap free-search previously scanned each group from bit 0 on
+    /// every allocation, so as a group filled the scan skipped an ever-longer
+    /// run of set bits — O(fill) per alloc, O(N²) over a create burst (the
+    /// residual super-linear cost after the directory index). Each cursor records
+    /// where the last allocation in its group left off; the search resumes there
+    /// and wraps to 0, making sequential fill O(1) amortised. A free in the group
+    /// rewinds the cursor to the freed bit so the slot is promptly reused. The
+    /// wrap-around guarantees every bit is still visited, so correctness is
+    /// independent of the cursor value — it is a pure start-position hint.
+    block_search_cursor: Vec<u32>,
+    inode_search_cursor: Vec<u32>,
     /// Phase 87 durability — set by every device write (`write_block`,
     /// `write_block_run`, `write_sectors`, `flush_dirty_blocks`), cleared after a
     /// device `block_flush`. The periodic write-back flush gates its device FLUSH
@@ -741,9 +753,18 @@ impl Ext2State {
                 self.superblock.blocks_per_group
             };
 
-            // Find the first free bit in this group.
+            // Find the first free bit, resuming at this group's cursor and
+            // wrapping to 0 (so the whole group is still searched — correctness
+            // is independent of the cursor — but a sequential fill skips the
+            // populated prefix).
+            let cursor = self
+                .block_search_cursor
+                .get(group)
+                .copied()
+                .unwrap_or(0)
+                .min(blocks_in_group.saturating_sub(1));
             let mut start_bit = None;
-            for bit in 0..blocks_in_group {
+            for bit in (cursor..blocks_in_group).chain(0..cursor) {
                 let byte_idx = (bit / 8) as usize;
                 let bit_idx = bit % 8;
                 if bitmap[byte_idx] & (1 << bit_idx) == 0 {
@@ -785,6 +806,12 @@ impl Ext2State {
                 self.superblock.free_blocks_count.saturating_sub(run_len);
             self.mark_meta_dirty().map_err(|_| NEG_EIO)?;
 
+            // Advance this group's cursor past the claimed run so the next claim
+            // resumes here instead of rescanning the populated prefix.
+            if let Some(c) = self.block_search_cursor.get_mut(group) {
+                *c = start_bit + run_len;
+            }
+
             let first_abs = (group as u32) * self.superblock.blocks_per_group
                 + start_bit
                 + self.superblock.first_data_block;
@@ -822,6 +849,12 @@ impl Ext2State {
             .map_err(|_| NEG_EIO)?;
         self.bgd_table[group].free_blocks_count += remaining as u16;
         self.superblock.free_blocks_count += remaining;
+        // Rewind the cursor to the first freed bit so the reservation tail is
+        // reused before scanning further.
+        let first_freed_bit = next - self.superblock.first_data_block - group_base;
+        if let Some(c) = self.block_search_cursor.get_mut(group) {
+            *c = (*c).min(first_freed_bit);
+        }
         self.mark_meta_dirty().map_err(|_| NEG_EIO)?;
         Ok(())
     }
@@ -862,6 +895,10 @@ impl Ext2State {
 
         self.bgd_table[group].free_blocks_count += 1;
         self.superblock.free_blocks_count += 1;
+        // Rewind the cursor so the just-freed block is reused promptly.
+        if let Some(c) = self.block_search_cursor.get_mut(group) {
+            *c = (*c).min(bit);
+        }
         self.mark_meta_dirty().map_err(|_| NEG_EIO)
     }
 
@@ -877,7 +914,17 @@ impl Ext2State {
             let mut bitmap = self.read_block(bitmap_block).map_err(|_| NEG_EIO)?;
             let inodes_in_group = self.superblock.inodes_per_group;
 
-            for bit in 0..inodes_in_group {
+            // Resume at this group's inode cursor and wrap to 0 (whole group is
+            // still searched — correctness is cursor-independent — but a
+            // sequential fill skips the populated prefix, incl. the reserved
+            // low inodes already consumed in this group).
+            let cursor = self
+                .inode_search_cursor
+                .get(group)
+                .copied()
+                .unwrap_or(0)
+                .min(inodes_in_group.saturating_sub(1));
+            for bit in (cursor..inodes_in_group).chain(0..cursor) {
                 let abs_inode = (group as u32) * self.superblock.inodes_per_group + bit + 1;
                 if abs_inode > self.superblock.inodes_count {
                     continue;
@@ -891,6 +938,10 @@ impl Ext2State {
 
                     self.bgd_table[group].free_inodes_count -= 1;
                     self.superblock.free_inodes_count -= 1;
+                    // Advance the cursor past the inode just claimed.
+                    if let Some(c) = self.inode_search_cursor.get_mut(group) {
+                        *c = bit + 1;
+                    }
                     self.mark_meta_dirty().map_err(|_| NEG_EIO)?;
                     return Ok(abs_inode);
                 }
@@ -922,6 +973,10 @@ impl Ext2State {
 
         self.bgd_table[group].free_inodes_count += 1;
         self.superblock.free_inodes_count += 1;
+        // Rewind the cursor so the just-freed inode is reused promptly.
+        if let Some(c) = self.inode_search_cursor.get_mut(group) {
+            *c = (*c).min(index);
+        }
         self.mark_meta_dirty().map_err(|_| NEG_EIO)
     }
 
@@ -2006,6 +2061,7 @@ fn program_main(_args: &[&str]) -> i32 {
         }
     };
 
+    let bg_count = bgd_table.len();
     let ext2 = Ext2State {
         base_lba,
         superblock,
@@ -2019,6 +2075,8 @@ fn program_main(_args: &[&str]) -> i32 {
         dirty_blocks: RefCell::new(BTreeMap::new()),
         meta_dirty_ops: 0,
         block_reservation: None,
+        block_search_cursor: alloc::vec![0u32; bg_count],
+        inode_search_cursor: alloc::vec![0u32; bg_count],
         writes_since_flush: Cell::new(false),
     };
 
