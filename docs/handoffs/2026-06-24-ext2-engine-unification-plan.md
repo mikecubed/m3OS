@@ -1,13 +1,17 @@
 ---
-status: PARTIAL — Phases A+B+C1 DONE (single post-boot root engine for all reads
-  + exec + file-open, each boot-validated and committed on
-  `feat/phase-95b-on-device-rustc`). Phase C2/C3 (metadata write-back + retiring
-  the invalidation) are **architecturally BLOCKED**: the C1 counter proved the
-  in-kernel engine is still the *trusted DAC authority* (uid/gid/mode for every
-  path-component permission check, deliberately NOT trusting `vfs_server`), so
-  deferring inode/dir metadata would make those security reads stale. The
-  write-back perf win is gated on a separate DAC-architecture decision. See
-  Progress + the C2/C3 block note below. Boot-critical; executed as per-step
+status: COMPLETE / CLOSED (2026-06-24) — Phases A+B+C1 DONE and shipped (single
+  post-boot root engine for all reads + exec + file-open, each boot-validated and
+  committed on `feat/phase-95b-on-device-rustc`). Phase C2/C3 (metadata write-back
+  + retiring the invalidation) are **CLOSED as won't-do-here**, not deferred:
+  independently re-verified against the code (2026-06-24) that the in-kernel engine
+  is the kernel's *trusted DAC authority* (uid/gid/mode for every path-component
+  permission check, deliberately NOT trusting `vfs_server`). The inode-table/dir
+  blocks C2 would defer are *exactly* the security-read blocks and MUST stay
+  write-through; the blocks the DAC path never reads (data, indirect) are ALREADY
+  deferred — so write-back offers **no additional safe deferral** and the
+  ~7→~2-3 writes/create payoff is unachievable without a security-model change.
+  Unblocking would be a separate DAC-security design phase (out of scope). See
+  Progress + the closure note below. Boot-critical; executed as per-step
   boot-validated increments, NOT a marathon-tail change.
 ---
 
@@ -214,6 +218,37 @@ fallbacks skip `invalidate_cache` (benign — only the single-engine boot window
     couples the engines again). Both are a **separate security-design phase**,
     out of scope here. The write-back perf win (~7→~2-3 writes/create) is real
     but gated on that decision; it must not be taken by silently weakening DAC.
+
+## Decision (2026-06-24) — CLOSED: structural unification shipped, C2/C3 not pursued
+
+The owner reviewed the blocker and chose to **close this work as complete** rather
+than open a marginal-payoff security phase. Before closing, the blocker was
+**independently re-verified against the code** (not just taken from the Progress
+notes above):
+
+- DAC chain confirmed: `require_search_permission` →
+  `path_metadata` (syscall/mod.rs:11608, with the explicit security comment at
+  :11641 — vfs_server is trusted for `stat`/`getdents` *display*, never for
+  enforcement) → `data_file_metadata` → `get_ext2_meta` (fs/ext2.rs:1832) →
+  `vol.metadata` → `resolve_path` + `read_inode`, which read **inode-table blocks**
+  (kernel-core/fs/ext2.rs:707) and **directory blocks** (:829) — exactly the blocks
+  C2 would defer.
+- `invalidate_cache` (fs/ext2.rs:1803, called from `vfs_service_setattr/create/
+  unlink` at syscall/mod.rs:9687/9726/9753) confirmed **load-bearing for DAC
+  coherence** after a routed mutation — not retire-able dual-engine legacy, so C3
+  is unsafe too.
+- **Key refinement that decided it:** the only blocks safe to defer (data,
+  indirect/pointer — the ones the DAC path never reads) are **already** deferred /
+  coalesced. C2 therefore yields **no additional safe deferral**; the headline
+  ~7→~2-3 writes/create win is not real without weakening DAC. Closing here is the
+  honest call.
+
+If ever revisited, it is a **dedicated DAC-architecture phase** (e.g. a
+kernel-trusted metadata channel from `vfs_server`, or a relocated trust boundary),
+NOT a continuation of this FS-perf work. The structural deliverable — a single
+post-boot root ext2 engine for all reads + exec + open, guarded by the
+`IN_KERNEL_ROOT_READS` regression counter in `vfs-throughput-smoke` — is **shipped
+and final**.
 
 ## Companion
 
