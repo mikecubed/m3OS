@@ -166,6 +166,19 @@ thread is left `BlockedOnFutex` after the lock fixes.
   Bug **A is very likely fixed**: rust-lld is multithreaded+dynamic and `pthread_create →
   rt_sigprocmask`, so the same wedge. **NEXT: re-run `rustc-smoke`** to confirm `RUSTC_OK`
   (bug **B**, the `ENOTTY` at `std/process.rs:2385`, may still need a separate fix).
+- **`rustc-smoke` re-run (2026-06-24): still wedges — `rt_sigprocmask` was NOT the last
+  wedge.** `rustc --version`/`--print sysroot` pass; `rustc hello.rs` times out with **NO
+  `RUSTC_OK`, NO `ENOTTY`, and ZERO deadlock-guard hits**, and the stall-census stops (only
+  the unrelated `fork-child` appears) → a **whole-system lock-held deadlock that does NOT go
+  through `demand_map_vma_page`** (so not a `copy_from_user`-under-lock demand-fault).
+  `dynamic-mt` PASSES, so this wedge is **rust-lld-specific** (a syscall rust-lld makes that
+  the simple repro doesn't) — the 2-min repro can't reproduce it; back to the 15-min rust gate.
+  **NEXT DIAGNOSTIC: a more general "scheduling-while-atomic" guard at `block_current_until`**
+  (scheduler.rs:3544) — log `current_preempt_count()>0` at the block entry with the
+  syscall_nr + `block_caller`. That catches ANY block taken while a lock is held (not just
+  demand-faults), so it will name this culprit too. Then fix it like `rt_sigprocmask`
+  (move the user access / drop the lock before the block). Bug B (`ENOTTY`) is racy and may
+  surface once the wedge is gone — fetch rust 1.96 `process.rs:2385` for the op when it does.
 - The futex pre-fault did **NOT** clear the `rust-lld` link wedge.
 - **NEW — the link failure is NON-DETERMINISTIC.** It alternates between (a) the **silent
   lock-wedge** and (b) an **`ENOTTY` panic** at `std/src/process.rs:2385`
