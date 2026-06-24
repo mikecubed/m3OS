@@ -1,9 +1,14 @@
 ---
-status: PLAN (not started) — scoping + phased roadmap for unifying the root ext2
-  onto the ring-3 `vfs_server`, so metadata can be safely written back and the
-  dual-engine cache-invalidation machinery retired. Grounded in a full inventory
-  of in-kernel `EXT2_VOLUME` root usage (2026-06-24). Boot-critical; execute as a
-  focused phase with per-step boot validation, NOT as a marathon-tail change.
+status: PARTIAL — Phases A+B+C1 DONE (single post-boot root engine for all reads
+  + exec + file-open, each boot-validated and committed on
+  `feat/phase-95b-on-device-rustc`). Phase C2/C3 (metadata write-back + retiring
+  the invalidation) are **architecturally BLOCKED**: the C1 counter proved the
+  in-kernel engine is still the *trusted DAC authority* (uid/gid/mode for every
+  path-component permission check, deliberately NOT trusting `vfs_server`), so
+  deferring inode/dir metadata would make those security reads stale. The
+  write-back perf win is gated on a separate DAC-architecture decision. See
+  Progress + the C2/C3 block note below. Boot-critical; executed as per-step
+  boot-validated increments, NOT a marathon-tail change.
 ---
 
 # ext2 engine unification — make `vfs_server` the sole post-boot root engine
@@ -172,32 +177,43 @@ fallbacks skip `invalidate_cache` (benign — only the single-engine boot window
   separate engine, by design) and `ext2_statfs`'s superblock free-counts
   (benign/approximate). The structural unification (single post-boot root engine
   for all reads + exec) is therefore complete.
-- **Phase C — DEFERRED follow-up** (write-back + retire the invalidation).
-  Rationale: C2/C3 are the *risky, hard-to-validate* parts and must not be
-  rushed on a journal-less FS:
-  - **C1 (empirical assert)** is a genuine prerequisite, not ceremony: the
-    existing coherence gates (`ext2-coherence-smoke`, `vfs-bulkio-smoke`)
-    **cannot** prove C3 safe, because after A+B their read paths route to
-    `vfs_server` regardless of the in-kernel cache — so a hidden post-boot
-    in-kernel reader would pass them silently. C1 must add an in-kernel-ext2
-    read counter (or reuse the cache probe) and demonstrate ~0 root reads after
-    `vfs_server` registers under a real workload, turning the manual audit above
-    into a measured invariant.
-  - **C2 (write-back)** = defer inode-table + directory blocks through
-    `write_block_deferred` (today only indirect/pointer blocks defer), with an
-    **ordered drain** — inodes+bitmaps+data flushed before dir-entry blocks, so a
-    crash leaves at most fsck-reconcilable orphans, never a dirent pointing at an
-    un-written inode. `flush_dirty_blocks` currently drains in block-number
-    order; ordered drain needs the deferred set categorized by block type. Bitmaps
-    stay write-through (allocation crash-consistency). Validate with
-    `ahci-persist-smoke` (reboot persistence) — and reason about the ordering,
-    since a process-restart gate cannot prove power-loss durability (its own
-    caveat).
-  - **C3 (delete `record_dirty_root_write` + the block-cache half of
-    `invalidate_cache`)** — KEEP `metacache::bump()` (that is the kernel↔server
-    stat-cache coherence, always needed; only the in-kernel *block*-cache
-    invalidation is the now-redundant dual-engine machinery). Safe only once C1
-    proves no post-boot in-kernel root reads.
+- **Phase C1 — DONE** (commit `Phase C1 — in-kernel root-read counter`) +
+  **file-OPEN routing** (commit `route the file-OPEN path through vfs_server`).
+  C1 added `IN_KERNEL_ROOT_READS` (a count of LOGICAL root-volume reads the
+  in-kernel engine serves, cache hits included), exposed via `/proc/blkstats` and
+  asserted by `vfs-throughput-smoke`. It is BOTH the empirical proof of the A+B
+  audit AND a permanent regression guard. The OPEN routing then moved
+  `open_ext2_file`'s fd-construction off the in-kernel engine onto vfs_server.
+  Measured residual dropped 68 → 51 root reads per probe.
+- **Phase C2 / C3 — ARCHITECTURALLY BLOCKED (not merely deferred).** C1 +
+  tracing the residual surfaced the blocker the plan's premise missed: **the
+  in-kernel engine is the kernel's TRUSTED DAC authority, not a removable legacy
+  second engine.** `require_search_permission` → `path_metadata` →
+  `data_file_metadata` → in-kernel `EXT2_VOLUME.metadata` reads every path
+  component's uid/gid/mode **on purpose** (syscall/mod.rs ~11642): "DAC decisions
+  must stay on kernel-verified metadata — a compromised ring-3 `vfs_server` could
+  spoof uid/gid/mode via `VFS_STAT_PATH` and defeat the access checks." Those
+  reads (the measured ~51 residual) **cannot** be routed to vfs without making
+  the security boundary trust the very thing it distrusts. Consequences:
+  - **C2 (write-back) is unsafe.** `vol.metadata` does `resolve_path` (dir
+    blocks) + `read_inode` (inode-table block) — *exactly* the blocks C2 would
+    defer. Deferring them makes the trusted DAC read observe **stale on-disk
+    uid/gid/mode** (the disk lacks the deferred change) → wrong, security-relevant
+    access decisions on a freshly-`chmod`'d/created file. The only blocks the DAC
+    path never reads (indirect/pointer, data) are *already* deferred / coalesced,
+    so C2 offers **no additional safe deferral**.
+  - **C3 (retire the block-cache `invalidate_cache`) is unsafe.** That
+    invalidation is what keeps the DAC reads coherent after a routed mutation
+    (e.g. `data_chmod` routes the chmod to vfs, then the next in-kernel DAC read
+    must see the new mode — `invalidate_cache` drops the stale cached block so it
+    re-reads fresh). It is the DAC coherence mechanism, not dual-engine legacy.
+    (`metacache::bump()` stays regardless.)
+  - **To unblock C2/C3 you must first resolve the DAC architecture** — e.g. move
+    DAC enforcement into `vfs_server` (and trust it, a security-model change), or
+    give the in-kernel DAC path a coherent view of vfs's deferred state (which
+    couples the engines again). Both are a **separate security-design phase**,
+    out of scope here. The write-back perf win (~7→~2-3 writes/create) is real
+    but gated on that decision; it must not be taken by silently weakening DAC.
 
 ## Companion
 
