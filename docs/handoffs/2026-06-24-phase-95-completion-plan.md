@@ -13,6 +13,16 @@ updated: 2026-06-24
 
 ## TL;DR — where we actually are
 
+- **✅ `RUSTC_OK` ACHIEVED (2026-06-24) — on-device Rust code generation works on m3OS.**
+  `rustc-smoke` PASSES end-to-end under `M3OS_KVM=1`: `rustc hello.rs` compiles, rust-lld links
+  it, and the native binary runs (`RUSTC_OK hello from rustc`), 0 kernel faults, ~41 s. The
+  Phase-95b milestone (the Rust analog of Phase 85d clang) is reached with a **single-threaded
+  linker** constraint — `-C link-arg=--threads=1` (now baked into the gate; analogous to Go's
+  single-core constraint). This required, in order: FIONBIO ioctl (ENOTTY fix); kernel
+  `AT_EXECFN` + loader `DT_RUNPATH`/`$ORIGIN` (so rust-lld finds `libLLVM.so`); and `--threads=1`
+  (so rust-lld avoids the multithreaded `relocsVec[threadIndex]` OOB fault + the worker-kill
+  `addr=0x8`/deadlock). See Step 1's dated updates. Deferred (non-blocking): the multithreaded
+  rust-lld `threadIndex`/pool-size bug; the thread-group fatal-kill kernel-robustness fix.
 - **`rustc` runs on m3OS.** After the loader/libc/page-table crash chain was fully fixed
   (see "What is done"), `rustc --version` → `rustc 1.96.0` and `rustc --print sysroot` →
   `/usr` both **execute on-device, serial-captured**. The multi-week `CR2=0` blocker is gone.
@@ -315,6 +325,33 @@ thread is left `BlockedOnFutex` after the lock fixes.
     disassemble rust-lld at `0x50755c` (in the installed `.m3pkg`) + decode `addr≈0x20ac1bX998`
     to determine whether it is an m3OS thread stack/TLS/mmap setup bug or a rust-lld behaviour
     m3OS mishandles.
+  - **RESOLVED (2026-06-24) — `RUSTC_OK` ACHIEVED via `--threads=1`. On-device Rust codegen
+    works on m3OS.** Disassembled rust-lld at the worker-fault `rip=0x50755c`: it is bias
+    `0x200000` (PIE) → file-vaddr `0x30755c`, in
+    **`lld::elf::RelocationBaseSection::addReloc<true>` (Relocations.cpp)**, instruction
+    `mov 0x8(%rsi,%rcx,1),%edx` where the lead-up is `rax=%fs:0`; `rax += &llvm::parallel::
+    threadIndex`; `ecx = threadIndex`; `rsi = relocsVec.data()`; `rcx = threadIndex<<4`. So the
+    fault is `relocsVec[threadIndex].size` — LLD's **lock-free parallel relocation scan**, where
+    each worker writes its own per-thread `SmallVector` slot indexed by the `%fs`-relative
+    `thread_local` `threadIndex`. The faulting **slot array element** (`relocsVec.data() +
+    threadIndex*16`) is unmapped ⇒ the worker's `threadIndex` is out of bounds for the vector
+    LLD sized for the pool — a parallel-LLD thread-index/TLS-vs-pool-size mismatch on m3OS.
+    **Fix that reached the milestone:** pass **`-C link-arg=--threads=1`** to rustc so rust-lld
+    links single-threaded — only the main thread (threadIndex 0) scans relocations
+    (`relocsVec[0]` always valid) AND **no worker threads spawn** (so the thread-group-kill
+    `addr=0x8`/sibling-deadlock path is never entered either). With it, `rustc-smoke` **PASSES
+    end-to-end under `M3OS_KVM=1`+`M3OS_RUST_FAST_ITER=1`: `rustc --version` 1.96.0 → `--print
+    sysroot` `/usr` → `rustc -C linker=rust-lld -C linker-flavor=ld.lld -C link-self-contained=yes
+    -C link-arg=--threads=1 hello.rs` compiles + links + RUNS → `RUSTC_OK hello from rustc`, 0
+    kernel faults, 18 steps in ~41 s.** This is the Phase-95b on-device code-generation milestone
+    — the Rust analog of Phase 85d clang — reached with a single-threaded-linker constraint
+    (analogous to Go's single-core constraint). The gate now bakes in `--threads=1`.
+    **Deferred follow-ups (NOT milestone blockers):** (a) the **multithreaded rust-lld**
+    `threadIndex`-vs-`relocsVec`-size bug (so `--threads=1` can be dropped) — investigate how
+    LLD sizes `relocsVec` (`parallel::getThreadCount()`) vs how each worker's `threadIndex`
+    `thread_local` is set under m3OS's clone_thread TLS; (b) the **thread-group fatal-kill**
+    kernel-robustness fix (so a faulting thread in ANY multithreaded process doesn't
+    hang/`addr=0x8` the kernel) per the addr=0x8 update above; (c) the fault-dump stack-safety.
 
 ### Step 2 (DECISION — RESOLVED 2026-06-24) — `rustc-smoke` is KVM-gated; CI uses KVM
 

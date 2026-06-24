@@ -23889,8 +23889,8 @@ fn rustc_smoke_steps() -> Vec<SmokeStep> {
     //    working native binary — not merely cross-built. No proc-macros in the
     //    dependency graph (the milestone is proc-macro-free by construction).
     steps.push(SmokeStep::Send {
-        input: "rustc -C linker=rust-lld -C linker-flavor=ld.lld -C link-self-contained=yes /usr/src/hello.rs -o /tmp/hello && /tmp/hello\n",
-        label: "rustc-smoke: rustc hello.rs (rust-lld) + run",
+        input: "rustc -C linker=rust-lld -C linker-flavor=ld.lld -C link-self-contained=yes -C link-arg=--threads=1 /usr/src/hello.rs -o /tmp/hello && /tmp/hello\n",
+        label: "rustc-smoke: rustc hello.rs (rust-lld, --threads=1) + run",
     });
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: "RUSTC_OK hello from rustc",
