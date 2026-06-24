@@ -135,6 +135,36 @@ smaller bug) only if it resurfaces once the multithreaded path works.
 (a whole-system wedge is a lock deadlock, not a missing barrier); revisit only if a *single*
 thread is left `BlockedOnFutex` after the lock fixes.
 
+**UPDATE (2026-06-24, this pass) — guard + repro LANDED; the failure is a RACE (TWO bugs).**
+- The **deadlock-guard** is committed: an always-on "scheduling-while-atomic" check at the
+  blocking lazy-file demand-fill (`interrupts.rs` `demand_map_vma_page`, using new
+  `current_preempt_count()` in `scheduler.rs`) — logs `[deadlock-guard] … syscall_nr=…` when
+  about to block with `preempt>0`. A **`dynamic-mt` repro** (4 pthreads + a **global**
+  mutex/cond) is built + staged at `/usr/bin/dynamic-mt` (not auto-run yet — built by
+  `build_dynamic_mt_fixture`, run it manually). **It surfaced a THIRD distinct bug:** a
+  no-thread-local-main dynamic pthread program **crashes in musl `__copy_tls`** (`addr=0x8`
+  WRITE in `libc.so` = `td=0`) on `pthread_create` — deterministic, and distinct from the
+  wedge (rustc has thread-locals so it gets past this). Next on the repro: either add a
+  `_Thread_local` to `dynamic-mt` to push past TLS and reach the lock wedge, OR fix the
+  `__copy_tls td=0` no-TLS-main case first (it is deterministic + fundamental, a good
+  starting target).
+- The futex pre-fault did **NOT** clear the `rust-lld` link wedge.
+- **NEW — the link failure is NON-DETERMINISTIC.** It alternates between (a) the **silent
+  lock-wedge** and (b) an **`ENOTTY` panic** at `std/src/process.rs:2385`
+  (`Result::unwrap()` on `Os { code: 25, "Not a tty" }`) while rustc spawns `rust-lld`. So
+  there are **two** bugs: the lock-held-across-fault wedge AND a std-process spawn op that
+  hits `ENOTTY`.
+- The guard did **not** fire on the ENOTTY run (no wedge that run). To catch the wedge:
+  (a) re-run until it wedges rather than ENOTTYs, or (b) move the guard to
+  `demand_map_vma_page` **entry** so it also catches the `PROCESS_TABLE`-re-lock self-deadlock
+  (`shared_vma_demand_file`, which runs BEFORE the current guard spot).
+- **ENOTTY (likely the more tractable / possibly primary blocker):** fetch rust 1.96.0
+  `library/std/src/process.rs:2385` (host is 1.97 — line numbers differ) to see which op
+  returns `ENOTTY` in the spawn/wait path. Likely a tty/`ioctl` m3OS returns `ENOTTY` for that
+  std `unwrap()`s; fix m3OS to return success for it (or confirm it's one std should tolerate).
+  Fixing ENOTTY may let the multithreaded link complete, leaving the wedge a rarer race to
+  finish off with the guard.
+
 ### Step 2 (DECISION — RESOLVED 2026-06-24) — `rustc-smoke` is KVM-gated; CI uses KVM
 
 **Decision: KVM-gate `rustc-smoke`** (skip-with-reason without `M3OS_KVM=1`, like

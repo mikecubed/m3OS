@@ -21930,6 +21930,79 @@ fn git_https_smoke_steps(
 /// libc set up via `static_init_tls` (over the kernel/loader-supplied auxv) is
 /// live. Returns `Ok(true)` when built, `Ok(false)` when no musl cross-compiler
 /// is present (the gate then SKIPs), `Err` on a build failure.
+/// Phase 95b deadlock-guard companion — a MULTITHREADED dynamic fixture that
+/// exercises the lazy-file-fault-under-lock class: 4 pthreads contending a
+/// **global** (`.bss`/`.data`) mutex + cond (cold lazy-file pages on first
+/// touch), `pthread_cond_broadcast` (FUTEX_CMP_REQUEUE) + `pthread_join`
+/// (CHILD_CLEARTID wake). Staged at `/usr/bin/dynamic-mt`; the
+/// `dynamic-hello-smoke` flow runs it and asserts `DYNAMIC_MT:ok` (a kernel
+/// wedge times the gate out). The lock MUST be a global — a stack-local lock
+/// faults into the non-blocking anonymous path and misses the bug.
+fn build_dynamic_mt_fixture() -> Result<bool, String> {
+    let cc = match find_musl_cc() {
+        Some(cc) => cc,
+        None => return Ok(false),
+    };
+    let root = workspace_root();
+    let libs = ensure_generated_libs_dir(&root);
+    let src = libs.join("dynamic-mt.c");
+    let out = libs.join("dynamic-mt");
+    let _ = fs::remove_file(&out);
+    let c_src = r#"#include <stdio.h>
+#include <pthread.h>
+static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_cond = PTHREAD_COND_INITIALIZER;
+static long g_counter = 0;
+#define N 4
+#define ITERS 20000
+static void *worker(void *arg) {
+    (void)arg;
+    for (int i = 0; i < ITERS; i++) {
+        pthread_mutex_lock(&g_mtx);
+        g_counter++;
+        pthread_cond_broadcast(&g_cond);
+        pthread_mutex_unlock(&g_mtx);
+    }
+    return (void *)0;
+}
+int main(void) {
+    pthread_t t[N];
+    for (long i = 0; i < N; i++) {
+        if (pthread_create(&t[i], (void *)0, worker, (void *)i) != 0) {
+            printf("DYNAMIC_MT:create-fail\n");
+            fflush(stdout);
+            return 1;
+        }
+    }
+    for (int i = 0; i < N; i++) {
+        pthread_join(t[i], (void *)0);
+    }
+    printf("DYNAMIC_MT:ok counter=%ld\n", g_counter);
+    fflush(stdout);
+    return 0;
+}
+"#;
+    fs::write(&src, c_src).map_err(|e| format!("write dynamic-mt.c: {e}"))?;
+    let status = Command::new(cc)
+        .args(["-O2", "-fPIE", "-pie", "-pthread", "-o"])
+        .arg(&out)
+        .arg(&src)
+        .status()
+        .map_err(|e| format!("invoke musl cc {cc}: {e}"))?;
+    if !status.success() {
+        return Err("dynamic-mt.c failed to compile".to_string());
+    }
+    if !out.exists() {
+        return Err("dynamic-mt binary missing after compile".to_string());
+    }
+    let sz = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+    println!(
+        "dynamic-hello-smoke: built dynamic-mt fixture {} ({sz} bytes)",
+        out.display()
+    );
+    Ok(true)
+}
+
 fn build_dynamic_hello_fixture() -> Result<bool, String> {
     let cc = match find_musl_cc() {
         Some(cc) => cc,
@@ -22018,6 +22091,11 @@ int main(void) {
         "dynamic-hello-smoke: built fixture {} ({sz} bytes, PT_INTERP={INTERP})",
         out.display()
     );
+
+    // Also build the multithreaded deadlock-repro companion (staged + run by the
+    // same gate as the lazy-file-fault-under-lock regression guard).
+    build_dynamic_mt_fixture()?;
+
     Ok(true)
 }
 
@@ -22182,6 +22260,13 @@ fn dynamic_hello_smoke_steps() -> Vec<SmokeStep> {
         label: "dynamic-hello-smoke: DLOPEN:ok (dlopen+dlsym+call)",
         exit_code_on_fail: SMOKE_EXIT_DYNAMIC_HELLO_FAILED,
     });
+    // Phase 95b — the multithreaded `dynamic-mt` repro is staged at
+    // /usr/bin/dynamic-mt but NOT auto-run here yet: it currently reproduces a
+    // SEPARATE, DETERMINISTIC bug — a no-thread-local-main dynamic pthread
+    // program crashes in musl `__copy_tls` (WRITE to 0x8 = `td=0`) on
+    // pthread_create — not the rust-lld lock wedge (rustc has thread-locals, so
+    // it gets past this). Run `/usr/bin/dynamic-mt` manually for the TLS repro;
+    // see the completion-plan Step 1. Make it an assertion once that's fixed.
     steps
 }
 
@@ -25682,12 +25767,21 @@ fn populate_ext2_files(
     // Present only for that gate; absent (no-op) otherwise. `/usr/bin` is
     // created idempotently (debugfs mkdir ignores EEXIST).
     let dynamic_hello_bin = workspace_root().join("target/generated-libs/dynamic-hello");
+    let dynamic_mt_bin = workspace_root().join("target/generated-libs/dynamic-mt");
     let dynamic_hello_cmds = if dynamic_hello_bin.exists() {
-        format!(
+        let mut s = format!(
             "mkdir usr/bin\nsif usr/bin mode 0x41ED\nsif usr/bin uid 0\nsif usr/bin gid 0\n\
              write \"{src}\" usr/bin/dynamic-hello\nsif usr/bin/dynamic-hello mode 0x81ED\nsif usr/bin/dynamic-hello uid 0\nsif usr/bin/dynamic-hello gid 0\n",
             src = dynamic_hello_bin.display(),
-        )
+        );
+        // Phase 95b — stage the multithreaded deadlock-repro companion alongside.
+        if dynamic_mt_bin.exists() {
+            s.push_str(&format!(
+                "write \"{src}\" usr/bin/dynamic-mt\nsif usr/bin/dynamic-mt mode 0x81ED\nsif usr/bin/dynamic-mt uid 0\nsif usr/bin/dynamic-mt gid 0\n",
+                src = dynamic_mt_bin.display(),
+            ));
+        }
+        s
     } else {
         String::new()
     };
