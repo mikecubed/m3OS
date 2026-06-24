@@ -27,8 +27,21 @@ status: VALIDATED (page-table fix works) + PERF REFRAMED. The intermediate-writa
   cursor-independent — every bit is still visited), with a free rewinding the cursor so the
   slot is reused. Combined result (300-file bench): per-create 5.08→3.00→**2.11 ms/file**,
   growth 4.8×→2.1×→**1.30× (flat)**, device reads flat across batches (1042→1084),
-  `write_calls_delta=649` unchanged, gate PASSES. Remaining lever: the per-create device-op
-  floor (~24 ops/create — metadata write batching). ALSO landed:
+  `write_calls_delta=649` unchanged, gate PASSES. THIRD FIX — the device-op floor: profiling
+  showed vfs_server's own block cache is 99.9% effective (9 misses / 300 creates), so the
+  ~17 device reads/create are KERNEL-side: `open(O_CREAT|O_WRONLY|O_TRUNC)`+writes aren't
+  routed to vfs_server (`vfs_service_should_route` only routes read-only opens), so the
+  create/write runs partly through the in-kernel ext2 engine, which the kernel WHOLE-cleared
+  (`invalidate_cache`) after every routed mutation — evicting the hot inode-table/dir/bitmap
+  blocks the read-heavy path re-reads. Fix (kernel-only): `sys_block_write` (the choke point
+  for every vfs_server root mutation) records the written sector ranges
+  (`record_dirty_root_write` → a `PENDING_DIRTY` buffer); `invalidate_cache` invalidates ONLY
+  those (`Ext2Volume::invalidate_lba_range`), keeping unchanged metadata warm; overflow →
+  whole-clear (cannot under-invalidate — ring-3 vfs_server can only touch the device via
+  `sys_block_write`, so the recorded set is complete). Measured: device reads 1042→186/batch
+  (−82%, ~17→~3 reads/create), per-create 2.11→**1.61 ms**, 621 files/s, `verify=ok`
+  (write-then-read-back coherence holds). Remaining lever: the ~7 metadata write-throughs
+  per create (a durability-vs-speed tradeoff). ALSO landed:
   `vfs-throughput-smoke` honors `M3OS_KVM`; the probe gained `ipc_rtt`/per-phase
   throughput + per-batch block-op sentinels; `run_smoke_script` prints per-step `[timing]`.
   ---PRIOR STATUS (page-table root-cause) BELOW---

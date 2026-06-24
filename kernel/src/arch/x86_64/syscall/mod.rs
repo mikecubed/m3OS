@@ -15088,7 +15088,14 @@ fn sys_block_write(start_sector: u64, count: u64, buf_ptr: u64, buf_len: u64) ->
     }
 
     match crate::blk::write_sectors(start_sector, count, &kernel_buf) {
-        Ok(()) => 0,
+        Ok(()) => {
+            // Phase 95c — record the written range so the next `invalidate_cache`
+            // (after this routed mutation) drops ONLY these blocks from the
+            // in-kernel ext2 cache, not the whole thing. This is the choke point
+            // for every `vfs_server` root mutation, so the record is complete.
+            crate::fs::ext2::record_dirty_root_write(start_sector, count);
+            0
+        }
         // Propagate the driver error byte through the documented errno mapping.
         // DriverRestarting (5) and Busy (4) → EAGAIN (-11); all others → EIO (-5).
         // Single source of truth: kernel_core::driver_ipc::block::block_error_to_neg_errno.
