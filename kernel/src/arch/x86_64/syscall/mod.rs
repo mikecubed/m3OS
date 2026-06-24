@@ -9173,11 +9173,20 @@ fn vfs_service_should_route(path: &str, flags: u64) -> bool {
     if !vfs_service_can_handle_path(path) {
         return false;
     }
-    if let Some(rel) = ext2_root_path(path) {
-        crate::fs::ext2::is_ext2_regular_file(rel)
-    } else {
-        false
+    if ext2_root_path(path).is_none() {
+        return false;
     }
+    // Engine-unification Phase A (audit completion): determine regular-file-ness
+    // through the cached `vfs_service_stat_path` — the SAME authority that will
+    // serve the open — instead of the in-kernel `is_ext2_regular_file`
+    // (`EXT2_VOLUME.metadata`). This removes the last hot-path in-kernel root
+    // read from the open-routing decision (so it can't disagree with the server,
+    // and a write-back-deferred new file routes correctly), and is the
+    // precondition for retiring the dual-engine block-cache invalidation.
+    matches!(
+        vfs_service_stat_path(path),
+        Ok(st) if st.kind == kernel_core::fs::vfs_protocol::VFS_NODE_FILE
+    )
 }
 
 fn vfs_service_read(handle: u64, offset: usize, user_buf_ptr: u64, count: usize) -> u64 {
