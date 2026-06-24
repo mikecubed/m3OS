@@ -1,4 +1,64 @@
 ---
+status: VALIDATED (page-table fix works) + PERF REFRAMED. The intermediate-writable
+  page-table fix is CONFIRMED on-device: with it, `rustc --version` → `rustc 1.96.0`
+  and `rustc --print sysroot` → `/usr` both RUN (serial-captured) — the 165 M-iteration
+  fault loop is GONE. The remaining `RUSTC_OK` gap is **`rustc hello.rs`** (the real
+  compile + `rust-lld` link): it loads, spawns its codegen threads, then goes silent —
+  a multithreaded-compile hang/very-slow, NOT a page-table or filesystem issue (a
+  `[sched] dequeue-drop … state-not-ready` warning on a rustc worker is a lead).
+  PERF FINDINGS (measured under KVM via the enhanced `vfs-throughput-probe`): the
+  long-assumed "40-min install / slow filesystem" was a **TCG artifact** — under KVM the
+  filesystem is FAST (136 MB/s write, 422 MB/s read, 217 µs IPC round-trip), `pkg install
+  rust` is **25 s**, and the 169 MB `librustc_driver.so` cold-load is **9.6 s** (not 8 min;
+  302 K relocs, 94% cheap RELATIVE, GNU-hash O(1) — reloc CPU was never the wall). The one
+  real FS pathology found: **O(N²) metadata-create** — every `open(O_CREAT)` resolves the
+  full path, scanning the (growing) target directory for a name that isn't there
+  (`resolve_path` → per-component block scan), so a burst of N creates was O(N²) (measured
+  196→935 ms per 100 files, growing). FIX (vfs_server, Phase 95c): a per-directory
+  **entry-name→inode index** (`DirIndex`) keyed by inode number, making `resolve_path`'s
+  per-component lookup + `create_file`'s EEXIST check + `add_directory_entry`'s free-slot
+  search all O(1) amortised; coherence funnels through `add_directory_entry` (insert),
+  `remove_directory_entry` (clear), `update_dotdot` (clear). Measured: many-files
+  5083→3001 ms (−41%), last-batch 935→400 ms, super-linear growth 4.8×→2.1×, `verify=ok`.
+  Residual growth (2.1×) is the block/inode-bitmap free-search scanning from bit 0
+  (`claim_block_run`/`allocate_inode`) — a documented follow-up (per-group free cursor);
+  the per-create device-op floor (~24 ops/create) is the other lever. ALSO landed:
+  `vfs-throughput-smoke` honors `M3OS_KVM`; the probe gained `ipc_rtt`/per-phase
+  throughput + per-batch block-op sentinels; `run_smoke_script` prints per-step `[timing]`.
+  ---PRIOR STATUS (page-table root-cause) BELOW---
+status: ROOT-CAUSED + FIXED (verification run pending) — the KERNEL mm fault-LOOP
+  is a **non-writable intermediate page-table entry**. Definitive err code captured:
+  `addr=0x200c79f000 rip=0x200a204838 err=0x7` = PRESENT|WRITE|USER (NO protection-key
+  bit) — i.e. the page is mapped but the WRITE is denied, repeating forever. The page is
+  mallocng's freshly-mmap'd anon RW group (`alloc_group`'s `mov %rbp,(%rsi)` storing
+  `g->meta`). Mechanism: on x86-64 the effective writability of a 4 KiB page is the AND
+  of WRITABLE across **all four** paging levels, but the kernel's spurious-write-fault
+  recovery (`interrupts.rs`) and `leaf_pte_flag_bits` only inspected the **leaf** PTE.
+  The leaf was WRITABLE|USER, so the handler treated each fault as a benign SMP race
+  (`invlpg`+retry) and returned — but an **intermediate** (PDPT/PD) entry had WRITABLE
+  clear, so the retry re-faulted → 165 M-iteration loop, `demand_pages` frozen at 35631.
+  WHY the intermediate was RO: the `x86_64` crate's default `Mapper::map_to` derives its
+  parent-table flags from the *leaf* flags (`flags & (PRESENT|WRITABLE|USER)`). m3OS's
+  eager file-backed mmap (`map_user_frames`), the kernel ELF loader (`mm/elf.rs`), and
+  `map_user_pages`/`_contiguous` all used plain `map_to` — so a **PROT_READ** segment
+  (a DSO `.text`/`.rodata`, the loader maps these for rustc's DSOs) created **non-writable
+  intermediate tables**; a later writable anon mmap landing in the same 1 GiB/2 MiB
+  region reused that RO intermediate (`map_current_user_page_inner` reused existing
+  intermediates without upgrading them) → effective-RO leaf-writable page. FIX (4 parts,
+  all in-kernel, `cargo xtask check` green): (1) `user_space::USER_PARENT_TABLE_FLAGS`
+  const = PRESENT|WRITABLE|USER, and `map_user_frames`/`_contiguous`/`map_user_pages`
+  switched from `map_to` → `map_to_with_table_flags` with it; (2) `mm/elf.rs` PT_LOAD +
+  stack maps likewise; (3) `map_current_user_page_inner` now OR-upgrades any pre-existing
+  intermediate to PRESENT|WRITABLE|USER (defense-in-depth + directly heals the anon
+  demand-fault that was reusing a RO intermediate); (4) the spurious-write recovery now
+  walks ALL FOUR levels (`user_walk_level_flags`) and recovers only when every level is
+  writable+user — a deficient intermediate logs per-level flags ONCE
+  (`INTERMEDIATE_PERM_FAULTS`) and falls through to a visible KILL instead of an infinite
+  loop, so any future variant fails fast/diagnosable rather than hanging a 60-min run.
+  NEXT: rustc-smoke verification run — expect `demand_pages` to keep climbing past 35631,
+  no `[pf-loop]`, rustc reaches rust-lld → `RUSTC_OK`. (The `rustc-profile` `[pf]`
+  instrumentation should be removed before the final commit.)
+  ---PRIOR STATUS (fault-loop OPEN, pre-root-cause) BELOW---
 status: MILESTONE+ — `rustc` EXECUTES AND COMPILES on m3OS; all libc/loader
   correctness blockers FIXED; the remaining `RUSTC_OK` gate is now a KERNEL mm
   fault-LOOP (perf/correctness, not a libc global). After the TLS fix, `rustc hello.rs`

@@ -7463,6 +7463,11 @@ fn run_smoke_script(
     // Use a queue so WaitEither can inject extra steps at the front.
     let mut queue: VecDeque<&SmokeStep> = steps.iter().collect();
     let mut step_num = 0usize;
+    // Per-step wall-clock timing (Phase 95c perf investigation): prints when
+    // each step starts and how long the PREVIOUS step took, so a single run
+    // reveals where the wall-clock goes (e.g. `pkg install` vs each `rustc`
+    // invocation's cold-load vs compile). Host-side only; no guest overhead.
+    let mut last_step_at = std::time::Instant::now();
 
     // Phase 57e Bug #6 diagnostic: when M3OS_SMOKE_SERIAL_DUMP=<path> is set,
     // every error return below writes the full serial_history to that file
@@ -7485,6 +7490,16 @@ fn run_smoke_script(
 
     while let Some(step) = queue.pop_front() {
         step_num += 1;
+        {
+            let now = std::time::Instant::now();
+            println!(
+                "[timing] step {} starts at +{:.1}s (prev step took {:.1}s)",
+                step_num,
+                global_start.elapsed().as_secs_f64(),
+                now.duration_since(last_step_at).as_secs_f64(),
+            );
+            last_step_at = now;
+        }
         // Global timeout check.
         if global_start.elapsed() > global_timeout {
             let _ = child.kill();
@@ -20686,7 +20701,16 @@ fn cmd_vfs_throughput_smoke(args: &SmokeBootArgs) {
     } else {
         QemuDisplayMode::Headless
     };
-    let qemu_args = qemu_args_with_devices(&uefi_image, &ovmf, display_mode, DeviceSet::default());
+    // Honor `M3OS_KVM=1` so the latency-probe sentinels (ipc_rtt_us_per_op,
+    // *_us_per_blockop) reflect near-native wall-clock timing — the per-op
+    // tick-latency wakes that dominate `pkg install` are a real 1 ms (BSP) /
+    // 10 ms (AP) under KVM, but are masked by TCG's emulated clock. The block-op
+    // COUNT assertions are unaffected by the backend.
+    let mut devices = DeviceSet::default();
+    if std::env::var_os("M3OS_KVM").is_some_and(|v| v != "0" && !v.is_empty()) {
+        devices.kvm = true;
+    }
+    let qemu_args = qemu_args_with_devices(&uefi_image, &ovmf, display_mode, devices);
 
     // Capture full serial transcript for host-side sentinel parsing.
     let dump_path = uefi_image
@@ -20781,6 +20805,68 @@ fn cmd_vfs_throughput_smoke(args: &SmokeBootArgs) {
         "vfs-throughput-smoke: probe completed — \
          write_calls_delta={wd} (ceiling {write_ceiling}) \
          read_calls_delta={rd} (ceiling {read_ceiling})"
+    );
+
+    // Surface the Phase 95c latency-probe sentinels (additive; not asserted) so
+    // the per-op timing is visible in the gate's stdout, not just the transcript.
+    let kvm = std::env::var_os("M3OS_KVM").is_some_and(|v| v != "0" && !v.is_empty());
+    let show = |label: &str, key: &str, unit: &str| {
+        if let Some(v) = parse_sentinel(key) {
+            println!("vfs-throughput-smoke:   {label} = {v} {unit}");
+        }
+    };
+    println!(
+        "vfs-throughput-smoke: LATENCY PROBE ({}):",
+        if kvm {
+            "KVM / near-native"
+        } else {
+            "TCG / emulated"
+        }
+    );
+    show(
+        "ipc_rtt per small write (app↔vfs round-trip + 1 cached block)",
+        "VFS_THRPUT:ipc_rtt_us_per_op=",
+        "µs",
+    );
+    show("write throughput", "VFS_THRPUT:write_kbps=", "KB/s");
+    show("write wall", "VFS_THRPUT:write_ms=", "ms");
+    show(
+        "write per-block-op",
+        "VFS_THRPUT:write_us_per_blockop=",
+        "µs",
+    );
+    show("read throughput", "VFS_THRPUT:read_kbps=", "KB/s");
+    show("read wall", "VFS_THRPUT:read_ms=", "ms");
+    show("read per-block-op", "VFS_THRPUT:read_us_per_blockop=", "µs");
+    show(
+        "many-files count (16 KiB each, one dir)",
+        "VFS_THRPUT:manyfiles_count=",
+        "files",
+    );
+    show(
+        "many-files total wall",
+        "VFS_THRPUT:manyfiles_total_ms=",
+        "ms",
+    );
+    show(
+        "many-files FIRST batch (100 files)",
+        "VFS_THRPUT:manyfiles_first_batch_ms=",
+        "ms",
+    );
+    show(
+        "many-files LAST batch (100 files)",
+        "VFS_THRPUT:manyfiles_last_batch_ms=",
+        "ms",
+    );
+    show(
+        "many-files rate",
+        "VFS_THRPUT:manyfiles_per_sec=",
+        "files/s",
+    );
+    show(
+        "many-files per-file",
+        "VFS_THRPUT:manyfiles_us_per_file=",
+        "µs",
     );
 
     if wd > write_ceiling {

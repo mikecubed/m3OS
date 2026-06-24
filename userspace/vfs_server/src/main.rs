@@ -26,6 +26,7 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec;
@@ -82,6 +83,39 @@ const NEG_ENOTEMPTY: u64 = (-39i64) as u64;
 // Ext2 volume state (server-local)
 // ---------------------------------------------------------------------------
 
+/// Phase 95c — per-directory entry-name index. The `create_file` EEXIST check
+/// (`lookup_in_directory`) and the `add_directory_entry` free-slot search were
+/// each a full O(N) scan of the directory, so a burst of N creates into one
+/// directory was O(N²) — measured at 196→935 ms per 100 files as the directory
+/// grew (the slow `pkg install` / tarball-extract metadata cost). This caches a
+/// touched directory's entry-name set plus an append-block hint so a create is
+/// O(1) amortised. Coherence funnels through exactly two sites:
+/// `add_directory_entry` inserts the new name (and advances the hint), and
+/// `remove_directory_entry` invalidates the whole index (removals are rare and
+/// never on the create hot path, so a full drop + lazy rebuild is the simplest
+/// always-correct rule). An un-indexed directory is simply scanned from disk on
+/// next access — the index is a pure accelerator, never the source of truth.
+struct DirIndex {
+    /// Every entry name in the directory mapped to its child inode number
+    /// (includes "." / ".."). The name→inode map serves both the `create_file`
+    /// EEXIST check AND the per-component lookup in `resolve_path`, so a path
+    /// resolution into a fully-indexed directory does ZERO block reads. Because
+    /// resolution now trusts this map, it is kept authoritative: every entry
+    /// insert updates it, and every entry removal or `..`-repoint clears the
+    /// whole index (rebuilt lazily from disk on next access).
+    names: BTreeMap<Box<[u8]>, u32>,
+    /// Logical block index to start the free-slot search from. For sequential
+    /// appends this is the last block, where the free slack lives, so the scan
+    /// skips the full populated prefix.
+    append_block: u32,
+}
+
+/// Max directories held in the entry-name index at once. Bounds memory; on
+/// overflow an arbitrary entry is dropped (rebuilt lazily on next access). A
+/// deep source tree touches many directories during an install, but only the
+/// directory currently being filled is hot, so a modest cap suffices.
+const DIR_INDEX_MAX: usize = 64;
+
 /// In-process ext2 volume state — replaces `Ext2Volume` from the kernel.
 struct Ext2State {
     base_lba: u64,
@@ -106,6 +140,10 @@ struct Ext2State {
     /// already filled the cache (fill-and-hold refused to admit the cold-load's
     /// indirect blocks at all). LRU keeps the genuinely-hot blocks resident.
     block_cache: RefCell<kernel_core::fs::lru_cache::LruBlockCache>,
+    /// Phase 95c — per-directory entry-name index (see [`DirIndex`]). Makes the
+    /// `create_file` EEXIST check + `add_directory_entry` free-slot search O(1)
+    /// amortised instead of an O(N)-per-create directory scan.
+    dir_index: RefCell<BTreeMap<u32, DirIndex>>,
     /// Phase 87 follow-up — write-back buffer for indirect/double-indirect
     /// **pointer** blocks. Mapping each data block of a large file wires one
     /// pointer into its indirect block; writing that whole 4 KiB block through to
@@ -566,11 +604,28 @@ impl Ext2State {
         if !path.starts_with('/') {
             return Err(NEG_EINVAL);
         }
-        kernel_core::fs::ext2::resolve_path(self, path).map_err(|e| match e {
-            Ext2Error::NotFound => NEG_ENOENT,
-            Ext2Error::NotDirectory => NEG_ENOTDIR,
-            _ => NEG_EIO,
-        })
+        // Phase 95c — index-aware path resolution. This mirrors
+        // `kernel_core::fs::ext2::resolve_path` exactly (a plain component walk
+        // that does NOT follow symlinks for intermediate components — same
+        // behaviour, same limitations) but resolves each component through the
+        // O(1) entry-name index (`lookup_indexed`) instead of a per-component
+        // full-block scan. This is the dominant `open(O_CREAT)` cost: the
+        // kernel's existence check resolves the whole path, scanning the
+        // (growing) target directory for a name that isn't there — O(N) per
+        // create, O(N²) for a burst of creates into one directory. With the
+        // index each component lookup (present OR absent) reads zero blocks.
+        let mut current = EXT2_ROOT_INO;
+        for component in path.split('/').filter(|s| !s.is_empty()) {
+            if component == "." {
+                continue;
+            }
+            let inode = self.read_inode(current).map_err(|_| NEG_EIO)?;
+            if !inode.is_dir() {
+                return Err(NEG_ENOTDIR);
+            }
+            current = self.lookup_indexed(current, &inode, component)?;
+        }
+        Ok(current)
     }
 
     /// Read file data from an inode at a given byte offset. Phase 88 Track C —
@@ -1086,6 +1141,106 @@ impl Ext2State {
     }
 
     /// Add a directory entry to a directory inode.
+    /// Build the entry-name index for `dir_ino` if not already cached. The index
+    /// is a pure accelerator; on any I/O error it is left absent and callers
+    /// fall back to a disk scan. Bounded by [`DIR_INDEX_MAX`].
+    fn ensure_dir_index(&self, dir_ino: u32, dir_inode: &Ext2Inode) -> Result<(), u64> {
+        if self.dir_index.borrow().contains_key(&dir_ino) {
+            return Ok(());
+        }
+        let bs = self.block_size as u64;
+        let num_blocks = (dir_inode.size as u64).div_ceil(bs) as u32;
+        let mut names: BTreeMap<Box<[u8]>, u32> = BTreeMap::new();
+        for logical_block in 0..num_blocks {
+            let phys = self
+                .resolve_block(dir_inode, logical_block)
+                .map_err(|_| NEG_EIO)?;
+            if phys == 0 {
+                continue;
+            }
+            let block = self.read_block(phys).map_err(|_| NEG_EIO)?;
+            let mut off = 0;
+            while off + 8 <= block.len() {
+                let rec_len = u16::from_le_bytes([block[off + 4], block[off + 5]]) as usize;
+                if rec_len == 0 {
+                    break;
+                }
+                let inode = u32::from_le_bytes([
+                    block[off],
+                    block[off + 1],
+                    block[off + 2],
+                    block[off + 3],
+                ]);
+                let name_len = block[off + 6] as usize;
+                if inode != 0 && name_len > 0 && off + 8 + name_len <= block.len() {
+                    names.insert(block[off + 8..off + 8 + name_len].into(), inode);
+                }
+                off = off.checked_add(rec_len).unwrap_or(block.len());
+            }
+        }
+        let append_block = num_blocks.saturating_sub(1);
+        let mut idx = self.dir_index.borrow_mut();
+        if idx.len() >= DIR_INDEX_MAX
+            && !idx.contains_key(&dir_ino)
+            && let Some(&victim) = idx.keys().next()
+        {
+            idx.remove(&victim);
+        }
+        idx.insert(
+            dir_ino,
+            DirIndex {
+                names,
+                append_block,
+            },
+        );
+        Ok(())
+    }
+
+    /// True iff `name` already exists in directory `dir_ino` — the O(1) EEXIST
+    /// check (builds the index on first use). Replaces a full `lookup_in_directory`
+    /// scan per create.
+    fn dir_has_entry(&self, dir_ino: u32, dir_inode: &Ext2Inode, name: &str) -> Result<bool, u64> {
+        self.ensure_dir_index(dir_ino, dir_inode)?;
+        Ok(self
+            .dir_index
+            .borrow()
+            .get(&dir_ino)
+            .map(|d| d.names.contains_key(name.as_bytes()))
+            .unwrap_or(false))
+    }
+
+    /// Index-aware single-component lookup — the O(1) replacement for
+    /// `kernel_core::fs::ext2::lookup_in_directory`'s full-block scan on the hot
+    /// `resolve_path` walk. Builds the directory's index on first use (one scan),
+    /// then resolves the name (present or ABSENT — the common `open(O_CREAT)`
+    /// existence-check case) with no further block reads.
+    fn lookup_indexed(&self, dir_ino: u32, dir_inode: &Ext2Inode, name: &str) -> Result<u32, u64> {
+        self.ensure_dir_index(dir_ino, dir_inode)?;
+        self.dir_index
+            .borrow()
+            .get(&dir_ino)
+            .and_then(|d| d.names.get(name.as_bytes()).copied())
+            .ok_or(NEG_ENOENT)
+    }
+
+    /// Record a freshly-inserted entry in the index (no-op if `dir_ino` is not
+    /// currently indexed). `new_append_block`, when `Some`, advances the append
+    /// hint because a new directory block was allocated.
+    fn dir_index_record_insert(
+        &self,
+        dir_ino: u32,
+        name: &[u8],
+        child_inode: u32,
+        new_append_block: Option<u32>,
+    ) {
+        if let Some(d) = self.dir_index.borrow_mut().get_mut(&dir_ino) {
+            d.names.insert(name.into(), child_inode);
+            if let Some(b) = new_append_block {
+                d.append_block = b;
+            }
+        }
+    }
+
     fn add_directory_entry(
         &mut self,
         dir_inode_num: u32,
@@ -1105,7 +1260,20 @@ impl Ext2State {
         let bs = self.block_size as u64;
         let num_blocks = dir_size.div_ceil(bs) as u32;
 
-        for logical_block in 0..num_blocks {
+        // Phase 95c — start the free-slot search at the directory's append-block
+        // hint (the last block, where sequential appends leave slack), then fall
+        // back to earlier blocks so a freed slot is still reused. This visits the
+        // same blocks as the old `0..num_blocks` scan but tries the likely one
+        // first, so a burst of appends is O(1) per create instead of O(N).
+        let hint = self
+            .dir_index
+            .borrow()
+            .get(&dir_inode_num)
+            .map(|d| d.append_block)
+            .unwrap_or(0)
+            .min(num_blocks.saturating_sub(1));
+        let scan_order = (hint..num_blocks).chain(0..hint);
+        for logical_block in scan_order {
             let phys_block = self
                 .resolve_block(dir_inode, logical_block)
                 .map_err(|_| NEG_EIO)?;
@@ -1141,6 +1309,7 @@ impl Ext2State {
                         .copy_from_slice(name_bytes);
                     self.write_block(phys_block, &block_data)
                         .map_err(|_| NEG_EIO)?;
+                    self.dir_index_record_insert(dir_inode_num, name_bytes, child_inode, None);
                     return Ok(());
                 }
                 off += rec_len;
@@ -1161,6 +1330,9 @@ impl Ext2State {
         dir_inode.size += bs as u32;
         self.write_inode(dir_inode_num, dir_inode)
             .map_err(|_| NEG_EIO)?;
+        // The freshly-appended block (logical index `num_blocks`) is now the
+        // directory's last block — advance the append hint to it.
+        self.dir_index_record_insert(dir_inode_num, name_bytes, child_inode, Some(num_blocks));
         Ok(())
     }
 
@@ -1168,6 +1340,11 @@ impl Ext2State {
     /// is moved across parents so `<new_parent>/<dir>/..` resolves correctly
     /// (`resolve_path` treats ".." as a normal directory entry).
     fn update_dotdot(&mut self, dir_inode: &Ext2Inode, new_parent: u32) -> Result<(), u64> {
+        // Repointing ".." changes an indexed entry's target inode; since the
+        // entry-name index is now authoritative for `resolve_path`, drop it so a
+        // stale ".." → old-parent mapping can't survive (rebuilt lazily). Rare
+        // (cross-parent directory rename only).
+        self.dir_index.borrow_mut().clear();
         let bs = self.block_size as u64;
         let num_blocks = (dir_inode.size as u64).div_ceil(bs) as u32;
 
@@ -1204,6 +1381,13 @@ impl Ext2State {
 
     /// Remove a directory entry by name (merging the slot into its predecessor).
     fn remove_directory_entry(&mut self, dir_inode: &Ext2Inode, name: &str) -> Result<(), u64> {
+        // Phase 95c — this is the single choke point for every directory-entry
+        // removal (delete_file, delete_directory, rename's old-name unlink), and
+        // it only has the directory's `Ext2Inode` (not its inode number), so the
+        // simplest always-correct coherence rule is to drop the whole entry-name
+        // index here and let it rebuild lazily. Removals are rare and never on
+        // the create hot path, so the rebuild cost is immaterial.
+        self.dir_index.borrow_mut().clear();
         let name_bytes = name.as_bytes();
         let bs = self.block_size as u64;
         let num_blocks = (dir_inode.size as u64).div_ceil(bs) as u32;
@@ -1338,7 +1522,7 @@ impl Ext2State {
         if !parent_inode.is_dir() {
             return Err(NEG_ENOTDIR);
         }
-        if self.lookup_in_directory(&parent_inode, name).is_ok() {
+        if self.dir_has_entry(parent_inode_num, &parent_inode, name)? {
             return Err(NEG_EEXIST);
         }
 
@@ -1376,7 +1560,7 @@ impl Ext2State {
         if !parent_inode.is_dir() {
             return Err(NEG_ENOTDIR);
         }
-        if self.lookup_in_directory(&parent_inode, name).is_ok() {
+        if self.dir_has_entry(parent_inode_num, &parent_inode, name)? {
             return Err(NEG_EEXIST);
         }
 
@@ -1449,7 +1633,7 @@ impl Ext2State {
         if !parent_inode.is_dir() {
             return Err(NEG_ENOTDIR);
         }
-        if self.lookup_in_directory(&parent_inode, name).is_ok() {
+        if self.dir_has_entry(parent_inode_num, &parent_inode, name)? {
             return Err(NEG_EEXIST);
         }
 
@@ -1526,7 +1710,7 @@ impl Ext2State {
         if !parent_inode.is_dir() {
             return Err(NEG_ENOTDIR);
         }
-        if self.lookup_in_directory(&parent_inode, name).is_ok() {
+        if self.dir_has_entry(parent_inode_num, &parent_inode, name)? {
             return Err(NEG_EEXIST);
         }
 
@@ -1831,6 +2015,7 @@ fn program_main(_args: &[&str]) -> i32 {
         block_cache: RefCell::new(kernel_core::fs::lru_cache::LruBlockCache::new(
             BLOCK_CACHE_MAX,
         )),
+        dir_index: RefCell::new(BTreeMap::new()),
         dirty_blocks: RefCell::new(BTreeMap::new()),
         meta_dirty_ops: 0,
         block_reservation: None,
