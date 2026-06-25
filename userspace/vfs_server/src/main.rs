@@ -26,13 +26,14 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::cell::{Cell, RefCell};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kernel_core::fs::ext2::{
     EXT2_DIND_BLOCK, EXT2_FT_DIR, EXT2_FT_REG_FILE, EXT2_FT_SYMLINK, EXT2_IND_BLOCK,
     EXT2_NDIR_BLOCKS, EXT2_ROOT_INO, Ext2BlockGroupDescriptor, Ext2Error, Ext2Inode,
@@ -42,10 +43,10 @@ use kernel_core::fs::mbr;
 use kernel_core::fs::vfs_protocol::{
     VFS_ACCESS_PATH, VFS_CLOSE, VFS_CREATE, VFS_CREATE_KIND_SHIFT, VFS_LINK, VFS_LIST_DIR,
     VFS_MAX_PREAD, VFS_MAX_PWRITE, VFS_MOUNT_EXT2_ROOT, VFS_MOUNT_POLICY, VFS_MOUNT_VFAT_DATA,
-    VFS_NODE_DIR, VFS_NODE_FILE, VFS_NODE_SYMLINK, VFS_OPEN, VFS_PREAD, VFS_READ, VFS_RENAME,
-    VFS_SETATTR, VFS_SETATTR_ATIME, VFS_SETATTR_GID, VFS_SETATTR_MODE, VFS_SETATTR_MTIME,
-    VFS_SETATTR_UID, VFS_STAT_PATH, VFS_STAT_REPLY_SIZE, VFS_TRUNCATE, VFS_UMOUNT_EXT2_ROOT,
-    VFS_UMOUNT_POLICY, VFS_UMOUNT_VFAT_DATA, VFS_UNLINK, VFS_WRITE,
+    VFS_NODE_DIR, VFS_NODE_FILE, VFS_NODE_SYMLINK, VFS_OPEN, VFS_PREAD, VFS_READ, VFS_READ_WINDOW,
+    VFS_RENAME, VFS_SETATTR, VFS_SETATTR_ATIME, VFS_SETATTR_GID, VFS_SETATTR_MODE,
+    VFS_SETATTR_MTIME, VFS_SETATTR_UID, VFS_STAT_PATH, VFS_STAT_REPLY_SIZE, VFS_TRUNCATE,
+    VFS_UMOUNT_EXT2_ROOT, VFS_UMOUNT_POLICY, VFS_UMOUNT_VFAT_DATA, VFS_UNLINK, VFS_WRITE,
 };
 use syscall_lib::STDOUT_FILENO;
 use syscall_lib::heap::BrkAllocator;
@@ -82,6 +83,39 @@ const NEG_ENOTEMPTY: u64 = (-39i64) as u64;
 // Ext2 volume state (server-local)
 // ---------------------------------------------------------------------------
 
+/// Phase 95c — per-directory entry-name index. The `create_file` EEXIST check
+/// (`lookup_in_directory`) and the `add_directory_entry` free-slot search were
+/// each a full O(N) scan of the directory, so a burst of N creates into one
+/// directory was O(N²) — measured at 196→935 ms per 100 files as the directory
+/// grew (the slow `pkg install` / tarball-extract metadata cost). This caches a
+/// touched directory's entry-name set plus an append-block hint so a create is
+/// O(1) amortised. Coherence funnels through exactly two sites:
+/// `add_directory_entry` inserts the new name (and advances the hint), and
+/// `remove_directory_entry` invalidates the whole index (removals are rare and
+/// never on the create hot path, so a full drop + lazy rebuild is the simplest
+/// always-correct rule). An un-indexed directory is simply scanned from disk on
+/// next access — the index is a pure accelerator, never the source of truth.
+struct DirIndex {
+    /// Every entry name in the directory mapped to its child inode number
+    /// (includes "." / ".."). The name→inode map serves both the `create_file`
+    /// EEXIST check AND the per-component lookup in `resolve_path`, so a path
+    /// resolution into a fully-indexed directory does ZERO block reads. Because
+    /// resolution now trusts this map, it is kept authoritative: every entry
+    /// insert updates it, and every entry removal or `..`-repoint clears the
+    /// whole index (rebuilt lazily from disk on next access).
+    names: BTreeMap<Box<[u8]>, u32>,
+    /// Logical block index to start the free-slot search from. For sequential
+    /// appends this is the last block, where the free slack lives, so the scan
+    /// skips the full populated prefix.
+    append_block: u32,
+}
+
+/// Max directories held in the entry-name index at once. Bounds memory; on
+/// overflow an arbitrary entry is dropped (rebuilt lazily on next access). A
+/// deep source tree touches many directories during an install, but only the
+/// directory currently being filled is hot, so a modest cap suffices.
+const DIR_INDEX_MAX: usize = 64;
+
 /// In-process ext2 volume state — replaces `Ext2Volume` from the kernel.
 struct Ext2State {
     base_lba: u64,
@@ -93,14 +127,23 @@ struct Ext2State {
     /// uncached, so every path-resolution re-read its directory / inode / bitmap
     /// / indirect blocks from disk (a `pkg install` issued tens of thousands of
     /// per-block `block_read` round-trips). This caches ext2 blocks by block
-    /// number; insertion is fill-only — once `BLOCK_CACHE_MAX` blocks are held it
-    /// stops admitting new blocks (no eviction), so it retains the first N distinct
-    /// blocks seen rather than an LRU working set. `BLOCK_CACHE_MAX` is sized
-    /// (16 MiB) to hold a whole package's metadata working set across an install,
-    /// so the cap is not reached for the target workload. `write_sectors`
-    /// invalidates any overlapping block so the write authority never serves stale
-    /// data (mirrors the kernel engine's `block_cache` + invalidate-on-write).
-    block_cache: RefCell<BTreeMap<u32, Vec<u8>>>,
+    /// number; the data-block run reader (`read_block_run`) bypasses it, so what
+    /// it holds is the re-read **metadata** (inode-table / directory / bitmap /
+    /// indirect-pointer blocks). `write_sectors` invalidates any overlapping block
+    /// so the write authority never serves stale data.
+    ///
+    /// Phase 95c (Track C) — **LRU eviction** (was fill-and-hold, which stopped
+    /// admitting once full and kept the first `cap` distinct blocks ever seen). A
+    /// large operation overflows the cap, and fill-and-hold then misses every
+    /// later metadata read to the device — notably the hot indirect blocks a
+    /// 162 MB DSO cold-load re-touches, *especially* when a preceding install
+    /// already filled the cache (fill-and-hold refused to admit the cold-load's
+    /// indirect blocks at all). LRU keeps the genuinely-hot blocks resident.
+    block_cache: RefCell<kernel_core::fs::lru_cache::LruBlockCache>,
+    /// Phase 95c — per-directory entry-name index (see [`DirIndex`]). Makes the
+    /// `create_file` EEXIST check + `add_directory_entry` free-slot search O(1)
+    /// amortised instead of an O(N)-per-create directory scan.
+    dir_index: RefCell<BTreeMap<u32, DirIndex>>,
     /// Phase 87 follow-up — write-back buffer for indirect/double-indirect
     /// **pointer** blocks. Mapping each data block of a large file wires one
     /// pointer into its indirect block; writing that whole 4 KiB block through to
@@ -130,6 +173,18 @@ struct Ext2State {
     /// write (the dominant remaining write cost + WRITE-request latency driver)
     /// into one write per run.
     block_reservation: Option<(u32, u32)>,
+    /// Phase 95c — per-group free-search cursors (one entry per block group). The
+    /// block/inode bitmap free-search previously scanned each group from bit 0 on
+    /// every allocation, so as a group filled the scan skipped an ever-longer
+    /// run of set bits — O(fill) per alloc, O(N²) over a create burst (the
+    /// residual super-linear cost after the directory index). Each cursor records
+    /// where the last allocation in its group left off; the search resumes there
+    /// and wraps to 0, making sequential fill O(1) amortised. A free in the group
+    /// rewinds the cursor to the freed bit so the slot is promptly reused. The
+    /// wrap-around guarantees every bit is still visited, so correctness is
+    /// independent of the cursor value — it is a pure start-position hint.
+    block_search_cursor: Vec<u32>,
+    inode_search_cursor: Vec<u32>,
     /// Phase 87 durability — set by every device write (`write_block`,
     /// `write_block_run`, `write_sectors`, `flush_dirty_blocks`), cleared after a
     /// device `block_flush`. The periodic write-back flush gates its device FLUSH
@@ -143,8 +198,10 @@ struct Ext2State {
 }
 
 /// Max ext2 blocks held in the vfs_server read-through cache (4 KiB blocks →
-/// ~16 MiB ceiling). Large enough to hold a package's metadata working set
-/// (dir/inode/bitmap/indirect blocks) across an install without unbounded growth.
+/// ~16 MiB ceiling). Phase 95c (Track C): with LRU eviction this is now a true
+/// working-set bound — when full, the least-recently-used metadata block is
+/// evicted to admit a new one, so a workload whose hot metadata exceeds the cap
+/// keeps its *hot* blocks resident instead of thrashing every later read.
 const BLOCK_CACHE_MAX: usize = 4096;
 
 /// Phase 87 — flush the superblock + BGD free-count summaries to disk after at
@@ -247,19 +304,15 @@ impl Ext2State {
         if let Some(dirty) = self.dirty_blocks.borrow().get(&block_num) {
             return Ok(dirty.clone());
         }
-        if let Some(cached) = self.block_cache.borrow().get(&block_num) {
-            return Ok(cached.clone());
+        if let Some(cached) = self.block_cache.borrow_mut().get(block_num) {
+            return Ok(cached.to_vec());
         }
         let lba = self.block_to_lba(block_num);
         let mut buf = vec![0u8; self.block_size as usize];
         let sector_count = self.sectors_per_block as usize;
         self.read_sectors(lba, sector_count, &mut buf)?;
-        {
-            let mut cache = self.block_cache.borrow_mut();
-            if cache.len() < BLOCK_CACHE_MAX {
-                cache.insert(block_num, buf.clone());
-            }
-        }
+        // LRU admit (evicts the least-recently-used block if full).
+        self.block_cache.borrow_mut().insert(block_num, buf.clone());
         Ok(buf)
     }
 
@@ -281,7 +334,7 @@ impl Ext2State {
         let last = (end_lba - self.base_lba).div_ceil(spb);
         let mut cache = self.block_cache.borrow_mut();
         for b in first..last {
-            cache.remove(&(b as u32));
+            cache.remove(b as u32);
         }
     }
 
@@ -330,20 +383,19 @@ impl Ext2State {
             // Write failed — drop any cached copy so a later read re-reads the
             // actual (possibly partially-written) on-disk state, never a value
             // we cannot prove landed.
-            self.block_cache.borrow_mut().remove(&block_num);
+            self.block_cache.borrow_mut().remove(block_num);
             return Err(());
         }
         self.writes_since_flush.set(true);
         let mut cache = self.block_cache.borrow_mut();
         if data.len() == self.block_size as usize {
-            // Update if present (the hot path); otherwise insert while bounded.
-            if cache.contains_key(&block_num) || cache.len() < BLOCK_CACHE_MAX {
-                cache.insert(block_num, data.to_vec());
-            }
+            // Write-through refresh (LRU admits/refreshes + marks most-recent;
+            // this block is hot metadata that read-modify-write re-reads).
+            cache.insert(block_num, data.to_vec());
         } else {
             // Defensive: a short/odd write can't refresh a full cached block, so
             // drop it rather than cache a malformed entry (no caller does this).
-            cache.remove(&block_num);
+            cache.remove(block_num);
         }
         Ok(())
     }
@@ -367,7 +419,7 @@ impl Ext2State {
             dirty.insert(block_num, data.to_vec());
             // A dirty entry shadows any clean cache copy; drop the cache copy so
             // the two can't disagree (read_block checks dirty first anyway).
-            self.block_cache.borrow_mut().remove(&block_num);
+            self.block_cache.borrow_mut().remove(block_num);
             if dirty.len() < DIRTY_FLUSH_THRESHOLD {
                 return Ok(());
             }
@@ -408,17 +460,14 @@ impl Ext2State {
                 // Could not persist — drop any clean cache copy so a later read
                 // re-reads the actual on-disk state, leave the block in
                 // `dirty_blocks` for a later retry, and surface the error.
-                self.block_cache.borrow_mut().remove(&block_num);
+                self.block_cache.borrow_mut().remove(block_num);
                 return Err(());
             }
             self.writes_since_flush.set(true);
             // Persisted — now clean on disk: drop it from the dirty set and
-            // refresh the read cache (bounded insert).
+            // refresh the read cache (LRU admit/refresh).
             self.dirty_blocks.borrow_mut().remove(&block_num);
-            let mut cache = self.block_cache.borrow_mut();
-            if cache.contains_key(&block_num) || cache.len() < BLOCK_CACHE_MAX {
-                cache.insert(block_num, data);
-            }
+            self.block_cache.borrow_mut().insert(block_num, data);
         }
         Ok(())
     }
@@ -463,7 +512,7 @@ impl Ext2State {
         // never serve a value we cannot prove landed).
         let mut cache = self.block_cache.borrow_mut();
         for i in 0..count as u32 {
-            cache.remove(&(start_block + i));
+            cache.remove(start_block + i);
         }
         if ret < 0 {
             Err(())
@@ -567,11 +616,28 @@ impl Ext2State {
         if !path.starts_with('/') {
             return Err(NEG_EINVAL);
         }
-        kernel_core::fs::ext2::resolve_path(self, path).map_err(|e| match e {
-            Ext2Error::NotFound => NEG_ENOENT,
-            Ext2Error::NotDirectory => NEG_ENOTDIR,
-            _ => NEG_EIO,
-        })
+        // Phase 95c — index-aware path resolution. This mirrors
+        // `kernel_core::fs::ext2::resolve_path` exactly (a plain component walk
+        // that does NOT follow symlinks for intermediate components — same
+        // behaviour, same limitations) but resolves each component through the
+        // O(1) entry-name index (`lookup_indexed`) instead of a per-component
+        // full-block scan. This is the dominant `open(O_CREAT)` cost: the
+        // kernel's existence check resolves the whole path, scanning the
+        // (growing) target directory for a name that isn't there — O(N) per
+        // create, O(N²) for a burst of creates into one directory. With the
+        // index each component lookup (present OR absent) reads zero blocks.
+        let mut current = EXT2_ROOT_INO;
+        for component in path.split('/').filter(|s| !s.is_empty()) {
+            if component == "." {
+                continue;
+            }
+            let inode = self.read_inode(current).map_err(|_| NEG_EIO)?;
+            if !inode.is_dir() {
+                return Err(NEG_ENOTDIR);
+            }
+            current = self.lookup_indexed(current, &inode, component)?;
+        }
+        Ok(current)
     }
 
     /// Read file data from an inode at a given byte offset. Phase 88 Track C —
@@ -687,9 +753,18 @@ impl Ext2State {
                 self.superblock.blocks_per_group
             };
 
-            // Find the first free bit in this group.
+            // Find the first free bit, resuming at this group's cursor and
+            // wrapping to 0 (so the whole group is still searched — correctness
+            // is independent of the cursor — but a sequential fill skips the
+            // populated prefix).
+            let cursor = self
+                .block_search_cursor
+                .get(group)
+                .copied()
+                .unwrap_or(0)
+                .min(blocks_in_group.saturating_sub(1));
             let mut start_bit = None;
-            for bit in 0..blocks_in_group {
+            for bit in (cursor..blocks_in_group).chain(0..cursor) {
                 let byte_idx = (bit / 8) as usize;
                 let bit_idx = bit % 8;
                 if bitmap[byte_idx] & (1 << bit_idx) == 0 {
@@ -731,6 +806,12 @@ impl Ext2State {
                 self.superblock.free_blocks_count.saturating_sub(run_len);
             self.mark_meta_dirty().map_err(|_| NEG_EIO)?;
 
+            // Advance this group's cursor past the claimed run so the next claim
+            // resumes here instead of rescanning the populated prefix.
+            if let Some(c) = self.block_search_cursor.get_mut(group) {
+                *c = start_bit + run_len;
+            }
+
             let first_abs = (group as u32) * self.superblock.blocks_per_group
                 + start_bit
                 + self.superblock.first_data_block;
@@ -768,6 +849,12 @@ impl Ext2State {
             .map_err(|_| NEG_EIO)?;
         self.bgd_table[group].free_blocks_count += remaining as u16;
         self.superblock.free_blocks_count += remaining;
+        // Rewind the cursor to the first freed bit so the reservation tail is
+        // reused before scanning further.
+        let first_freed_bit = next - self.superblock.first_data_block - group_base;
+        if let Some(c) = self.block_search_cursor.get_mut(group) {
+            *c = (*c).min(first_freed_bit);
+        }
         self.mark_meta_dirty().map_err(|_| NEG_EIO)?;
         Ok(())
     }
@@ -804,10 +891,14 @@ impl Ext2State {
         // here, but that flush result is best-effort (discarded on I/O error),
         // so make the freed-block invariant explicit rather than implicit.
         self.dirty_blocks.borrow_mut().remove(&block_num);
-        self.block_cache.borrow_mut().remove(&block_num);
+        self.block_cache.borrow_mut().remove(block_num);
 
         self.bgd_table[group].free_blocks_count += 1;
         self.superblock.free_blocks_count += 1;
+        // Rewind the cursor so the just-freed block is reused promptly.
+        if let Some(c) = self.block_search_cursor.get_mut(group) {
+            *c = (*c).min(bit);
+        }
         self.mark_meta_dirty().map_err(|_| NEG_EIO)
     }
 
@@ -823,7 +914,17 @@ impl Ext2State {
             let mut bitmap = self.read_block(bitmap_block).map_err(|_| NEG_EIO)?;
             let inodes_in_group = self.superblock.inodes_per_group;
 
-            for bit in 0..inodes_in_group {
+            // Resume at this group's inode cursor and wrap to 0 (whole group is
+            // still searched — correctness is cursor-independent — but a
+            // sequential fill skips the populated prefix, incl. the reserved
+            // low inodes already consumed in this group).
+            let cursor = self
+                .inode_search_cursor
+                .get(group)
+                .copied()
+                .unwrap_or(0)
+                .min(inodes_in_group.saturating_sub(1));
+            for bit in (cursor..inodes_in_group).chain(0..cursor) {
                 let abs_inode = (group as u32) * self.superblock.inodes_per_group + bit + 1;
                 if abs_inode > self.superblock.inodes_count {
                     continue;
@@ -837,6 +938,10 @@ impl Ext2State {
 
                     self.bgd_table[group].free_inodes_count -= 1;
                     self.superblock.free_inodes_count -= 1;
+                    // Advance the cursor past the inode just claimed.
+                    if let Some(c) = self.inode_search_cursor.get_mut(group) {
+                        *c = bit + 1;
+                    }
                     self.mark_meta_dirty().map_err(|_| NEG_EIO)?;
                     return Ok(abs_inode);
                 }
@@ -868,6 +973,10 @@ impl Ext2State {
 
         self.bgd_table[group].free_inodes_count += 1;
         self.superblock.free_inodes_count += 1;
+        // Rewind the cursor so the just-freed inode is reused promptly.
+        if let Some(c) = self.inode_search_cursor.get_mut(group) {
+            *c = (*c).min(index);
+        }
         self.mark_meta_dirty().map_err(|_| NEG_EIO)
     }
 
@@ -1087,6 +1196,106 @@ impl Ext2State {
     }
 
     /// Add a directory entry to a directory inode.
+    /// Build the entry-name index for `dir_ino` if not already cached. The index
+    /// is a pure accelerator; on any I/O error it is left absent and callers
+    /// fall back to a disk scan. Bounded by [`DIR_INDEX_MAX`].
+    fn ensure_dir_index(&self, dir_ino: u32, dir_inode: &Ext2Inode) -> Result<(), u64> {
+        if self.dir_index.borrow().contains_key(&dir_ino) {
+            return Ok(());
+        }
+        let bs = self.block_size as u64;
+        let num_blocks = (dir_inode.size as u64).div_ceil(bs) as u32;
+        let mut names: BTreeMap<Box<[u8]>, u32> = BTreeMap::new();
+        for logical_block in 0..num_blocks {
+            let phys = self
+                .resolve_block(dir_inode, logical_block)
+                .map_err(|_| NEG_EIO)?;
+            if phys == 0 {
+                continue;
+            }
+            let block = self.read_block(phys).map_err(|_| NEG_EIO)?;
+            let mut off = 0;
+            while off + 8 <= block.len() {
+                let rec_len = u16::from_le_bytes([block[off + 4], block[off + 5]]) as usize;
+                if rec_len == 0 {
+                    break;
+                }
+                let inode = u32::from_le_bytes([
+                    block[off],
+                    block[off + 1],
+                    block[off + 2],
+                    block[off + 3],
+                ]);
+                let name_len = block[off + 6] as usize;
+                if inode != 0 && name_len > 0 && off + 8 + name_len <= block.len() {
+                    names.insert(block[off + 8..off + 8 + name_len].into(), inode);
+                }
+                off = off.checked_add(rec_len).unwrap_or(block.len());
+            }
+        }
+        let append_block = num_blocks.saturating_sub(1);
+        let mut idx = self.dir_index.borrow_mut();
+        if idx.len() >= DIR_INDEX_MAX
+            && !idx.contains_key(&dir_ino)
+            && let Some(&victim) = idx.keys().next()
+        {
+            idx.remove(&victim);
+        }
+        idx.insert(
+            dir_ino,
+            DirIndex {
+                names,
+                append_block,
+            },
+        );
+        Ok(())
+    }
+
+    /// True iff `name` already exists in directory `dir_ino` — the O(1) EEXIST
+    /// check (builds the index on first use). Replaces a full `lookup_in_directory`
+    /// scan per create.
+    fn dir_has_entry(&self, dir_ino: u32, dir_inode: &Ext2Inode, name: &str) -> Result<bool, u64> {
+        self.ensure_dir_index(dir_ino, dir_inode)?;
+        Ok(self
+            .dir_index
+            .borrow()
+            .get(&dir_ino)
+            .map(|d| d.names.contains_key(name.as_bytes()))
+            .unwrap_or(false))
+    }
+
+    /// Index-aware single-component lookup — the O(1) replacement for
+    /// `kernel_core::fs::ext2::lookup_in_directory`'s full-block scan on the hot
+    /// `resolve_path` walk. Builds the directory's index on first use (one scan),
+    /// then resolves the name (present or ABSENT — the common `open(O_CREAT)`
+    /// existence-check case) with no further block reads.
+    fn lookup_indexed(&self, dir_ino: u32, dir_inode: &Ext2Inode, name: &str) -> Result<u32, u64> {
+        self.ensure_dir_index(dir_ino, dir_inode)?;
+        self.dir_index
+            .borrow()
+            .get(&dir_ino)
+            .and_then(|d| d.names.get(name.as_bytes()).copied())
+            .ok_or(NEG_ENOENT)
+    }
+
+    /// Record a freshly-inserted entry in the index (no-op if `dir_ino` is not
+    /// currently indexed). `new_append_block`, when `Some`, advances the append
+    /// hint because a new directory block was allocated.
+    fn dir_index_record_insert(
+        &self,
+        dir_ino: u32,
+        name: &[u8],
+        child_inode: u32,
+        new_append_block: Option<u32>,
+    ) {
+        if let Some(d) = self.dir_index.borrow_mut().get_mut(&dir_ino) {
+            d.names.insert(name.into(), child_inode);
+            if let Some(b) = new_append_block {
+                d.append_block = b;
+            }
+        }
+    }
+
     fn add_directory_entry(
         &mut self,
         dir_inode_num: u32,
@@ -1106,7 +1315,20 @@ impl Ext2State {
         let bs = self.block_size as u64;
         let num_blocks = dir_size.div_ceil(bs) as u32;
 
-        for logical_block in 0..num_blocks {
+        // Phase 95c — start the free-slot search at the directory's append-block
+        // hint (the last block, where sequential appends leave slack), then fall
+        // back to earlier blocks so a freed slot is still reused. This visits the
+        // same blocks as the old `0..num_blocks` scan but tries the likely one
+        // first, so a burst of appends is O(1) per create instead of O(N).
+        let hint = self
+            .dir_index
+            .borrow()
+            .get(&dir_inode_num)
+            .map(|d| d.append_block)
+            .unwrap_or(0)
+            .min(num_blocks.saturating_sub(1));
+        let scan_order = (hint..num_blocks).chain(0..hint);
+        for logical_block in scan_order {
             let phys_block = self
                 .resolve_block(dir_inode, logical_block)
                 .map_err(|_| NEG_EIO)?;
@@ -1142,6 +1364,7 @@ impl Ext2State {
                         .copy_from_slice(name_bytes);
                     self.write_block(phys_block, &block_data)
                         .map_err(|_| NEG_EIO)?;
+                    self.dir_index_record_insert(dir_inode_num, name_bytes, child_inode, None);
                     return Ok(());
                 }
                 off += rec_len;
@@ -1162,6 +1385,9 @@ impl Ext2State {
         dir_inode.size += bs as u32;
         self.write_inode(dir_inode_num, dir_inode)
             .map_err(|_| NEG_EIO)?;
+        // The freshly-appended block (logical index `num_blocks`) is now the
+        // directory's last block — advance the append hint to it.
+        self.dir_index_record_insert(dir_inode_num, name_bytes, child_inode, Some(num_blocks));
         Ok(())
     }
 
@@ -1169,6 +1395,11 @@ impl Ext2State {
     /// is moved across parents so `<new_parent>/<dir>/..` resolves correctly
     /// (`resolve_path` treats ".." as a normal directory entry).
     fn update_dotdot(&mut self, dir_inode: &Ext2Inode, new_parent: u32) -> Result<(), u64> {
+        // Repointing ".." changes an indexed entry's target inode; since the
+        // entry-name index is now authoritative for `resolve_path`, drop it so a
+        // stale ".." → old-parent mapping can't survive (rebuilt lazily). Rare
+        // (cross-parent directory rename only).
+        self.dir_index.borrow_mut().clear();
         let bs = self.block_size as u64;
         let num_blocks = (dir_inode.size as u64).div_ceil(bs) as u32;
 
@@ -1205,6 +1436,13 @@ impl Ext2State {
 
     /// Remove a directory entry by name (merging the slot into its predecessor).
     fn remove_directory_entry(&mut self, dir_inode: &Ext2Inode, name: &str) -> Result<(), u64> {
+        // Phase 95c — this is the single choke point for every directory-entry
+        // removal (delete_file, delete_directory, rename's old-name unlink), and
+        // it only has the directory's `Ext2Inode` (not its inode number), so the
+        // simplest always-correct coherence rule is to drop the whole entry-name
+        // index here and let it rebuild lazily. Removals are rare and never on
+        // the create hot path, so the rebuild cost is immaterial.
+        self.dir_index.borrow_mut().clear();
         let name_bytes = name.as_bytes();
         let bs = self.block_size as u64;
         let num_blocks = (dir_inode.size as u64).div_ceil(bs) as u32;
@@ -1339,7 +1577,7 @@ impl Ext2State {
         if !parent_inode.is_dir() {
             return Err(NEG_ENOTDIR);
         }
-        if self.lookup_in_directory(&parent_inode, name).is_ok() {
+        if self.dir_has_entry(parent_inode_num, &parent_inode, name)? {
             return Err(NEG_EEXIST);
         }
 
@@ -1377,7 +1615,7 @@ impl Ext2State {
         if !parent_inode.is_dir() {
             return Err(NEG_ENOTDIR);
         }
-        if self.lookup_in_directory(&parent_inode, name).is_ok() {
+        if self.dir_has_entry(parent_inode_num, &parent_inode, name)? {
             return Err(NEG_EEXIST);
         }
 
@@ -1450,7 +1688,7 @@ impl Ext2State {
         if !parent_inode.is_dir() {
             return Err(NEG_ENOTDIR);
         }
-        if self.lookup_in_directory(&parent_inode, name).is_ok() {
+        if self.dir_has_entry(parent_inode_num, &parent_inode, name)? {
             return Err(NEG_EEXIST);
         }
 
@@ -1527,7 +1765,7 @@ impl Ext2State {
         if !parent_inode.is_dir() {
             return Err(NEG_ENOTDIR);
         }
-        if self.lookup_in_directory(&parent_inode, name).is_ok() {
+        if self.dir_has_entry(parent_inode_num, &parent_inode, name)? {
             return Err(NEG_EEXIST);
         }
 
@@ -1823,16 +2061,22 @@ fn program_main(_args: &[&str]) -> i32 {
         }
     };
 
+    let bg_count = bgd_table.len();
     let ext2 = Ext2State {
         base_lba,
         superblock,
         bgd_table,
         block_size,
         sectors_per_block,
-        block_cache: RefCell::new(BTreeMap::new()),
+        block_cache: RefCell::new(kernel_core::fs::lru_cache::LruBlockCache::new(
+            BLOCK_CACHE_MAX,
+        )),
+        dir_index: RefCell::new(BTreeMap::new()),
         dirty_blocks: RefCell::new(BTreeMap::new()),
         meta_dirty_ops: 0,
         block_reservation: None,
+        block_search_cursor: alloc::vec![0u32; bg_count],
+        inode_search_cursor: alloc::vec![0u32; bg_count],
         writes_since_flush: Cell::new(false),
     };
 
@@ -1850,6 +2094,29 @@ fn program_main(_args: &[&str]) -> i32 {
     if ret == u64::MAX {
         syscall_lib::write_str(STDOUT_FILENO, "vfs_server: register_service failed\n");
         return 1;
+    }
+
+    // Phase 95c (Area A.1) — create + map a shared SHM "read window" and register
+    // it with the kernel as the zero-copy demand-fault read destination. On a
+    // `MAP_LAZY_FILE` fault the kernel asks us (`VFS_READ_WINDOW`) to read file
+    // bytes straight into this window, then fills the faulting frame from the
+    // window's frames via its physical map — no IPC bulk payload, no double copy.
+    // Best-effort: if any step fails the kernel never uses the window (its
+    // demand-fill falls back to the legacy IPC-bulk path), so we log and continue.
+    {
+        let shm_id = syscall_lib::shm_create(VFS_MAX_PREAD);
+        if shm_id != 0 {
+            let va = syscall_lib::shm_map(shm_id);
+            if va != 0 && syscall_lib::vfs_register_read_window(shm_id) == 0 {
+                READ_WINDOW_VA.store(va, Ordering::Release);
+                READ_WINDOW_LEN.store(VFS_MAX_PREAD as u64, Ordering::Release);
+                syscall_lib::serial_print("vfs_server: zero-copy read window registered\n");
+            } else {
+                syscall_lib::serial_print(
+                    "vfs_server: read-window setup failed (using IPC-bulk fallback)\n",
+                );
+            }
+        }
     }
 
     // Drain deferred metadata on orderly shutdown: install a SIGTERM handler so
@@ -1875,6 +2142,11 @@ fn program_main(_args: &[&str]) -> i32 {
 /// before exiting (see `server_loop`). Async-signal-safe: the handler performs
 /// only an atomic store and never touches the block cache's `RefCell`.
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Phase 95c (Area A.1) — user VA and byte length of the mapped SHM read window
+/// (0 until registered). `handle_read_window` reads file data straight into it.
+static READ_WINDOW_VA: AtomicU64 = AtomicU64::new(0);
+static READ_WINDOW_LEN: AtomicU64 = AtomicU64::new(0);
 
 extern "C" fn sigterm_handler(_sig: i32) {
     SHUTDOWN_REQUESTED.store(true, Ordering::Release);
@@ -2036,6 +2308,7 @@ fn request_name(label: u64) -> &'static str {
     match label {
         VFS_OPEN => "OPEN",
         VFS_READ => "READ",
+        VFS_READ_WINDOW => "READ_WINDOW",
         VFS_CLOSE => "CLOSE",
         VFS_STAT_PATH => "STAT_PATH",
         VFS_LIST_DIR => "LIST_DIR",
@@ -2083,6 +2356,7 @@ fn handle_request(
     match msg.label {
         VFS_OPEN => handle_open(ext2, handles, msg, recv_buf),
         VFS_READ => handle_read(ext2, handles, msg),
+        VFS_READ_WINDOW => handle_read_window(ext2, handles, msg),
         VFS_CLOSE => handle_close(handles, msg),
         VFS_STAT_PATH => handle_stat_path(ext2, msg, recv_buf),
         VFS_LIST_DIR => handle_list_dir(ext2, msg, recv_buf),
@@ -2301,6 +2575,72 @@ fn handle_read(
     }
 
     (0, bytes_read as u64)
+}
+
+/// VFS_READ_WINDOW (Phase 95c Area A.1) — zero-copy demand-fault read. Read file
+/// data DIRECTLY into the shared SHM read window (registered at startup) instead
+/// of staging it as an IPC reply bulk; the kernel reads the window's frames via
+/// its physical map and fills the faulting frame from there, so neither the IPC
+/// bulk `Vec` nor the kernel's `take_bulk_data` copy exists on this path. The
+/// only copy is block-cache → window (the unavoidable fill), done here by the
+/// shared `kernel_core` reader writing straight into the window slice.
+///
+/// `data[0]` = handle id, `data[1]` = offset, `data[2]` = byte count. Reply
+/// `data[0]` = bytes written into the window (0 = EOF). No reply bulk.
+fn handle_read_window(
+    ext2: &Ext2State,
+    handles: &HandleTable,
+    msg: &syscall_lib::IpcMessage,
+) -> (u64, u64) {
+    let va = READ_WINDOW_VA.load(Ordering::Acquire);
+    let win_len = READ_WINDOW_LEN.load(Ordering::Acquire) as usize;
+    if va == 0 || win_len == 0 {
+        // Window not set up — the kernel should not have sent this, but fail
+        // cleanly so it can fall back rather than wedge.
+        return (NEG_EIO, 0);
+    }
+
+    let handle_id = msg.data[0];
+    let offset = msg.data[1] as usize;
+    let max_bytes = (msg.data[2] as usize).min(win_len).min(VFS_MAX_PREAD);
+
+    let handle = match handles.get(handle_id) {
+        Some(h) => h,
+        None => return (NEG_EBADF, 0),
+    };
+    let inode = match ext2.read_inode(handle.inode_num) {
+        Ok(i) => i,
+        Err(_) => return (NEG_EIO, 0),
+    };
+
+    let file_size = inode.size as u64;
+    if offset as u64 >= file_size {
+        return (0, 0); // EOF — kernel zero-fills the cluster past the extent.
+    }
+    let to_read = ((file_size - offset as u64) as usize).min(max_bytes);
+    if to_read == 0 {
+        return (0, 0);
+    }
+
+    // The window is our own mapped SHM region; read straight into it. The kernel
+    // holds the window borrow for the duration of this request (its single-window
+    // `in_use` flag), so no other reader observes a torn fill.
+    //
+    // SAFETY: `va`/`win_len` describe the SHM region we created + mapped at
+    // startup; `to_read <= win_len`, so the slice is in-bounds and exclusively
+    // ours for this request.
+    let window: &mut [u8] = unsafe { core::slice::from_raw_parts_mut(va as *mut u8, win_len) };
+    let n = match kernel_core::fs::ext2::read_file_data(
+        ext2,
+        &inode,
+        offset as u64,
+        &mut window[..to_read],
+    ) {
+        Ok(n) => n,
+        Err(_) => return (NEG_EIO, 0),
+    };
+
+    (0, n as u64)
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,14 @@
+[package]
+name = "vfs-throughput-probe"
+version = "0.1.0"
+edition = "2024"
+description = "Phase 95c Track E.1 — VFS throughput measurement probe for m3OS"
+
+[[bin]]
+name = "vfs-throughput-probe"
+path = "src/main.rs"
+
+[dependencies]
+# syscall-lib: fs syscalls (open/read/write/close/unlink/fstat) + heap
+# allocator + entry_point! macro.  `alloc` feature brings Vec/String into scope.
+syscall-lib = { path = "../syscall-lib", features = ["alloc"] }

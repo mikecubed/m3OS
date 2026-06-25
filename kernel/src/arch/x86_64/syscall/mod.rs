@@ -790,11 +790,19 @@ fn statfs_for_path(abs_path: &str) -> Statfs {
     if crate::fs::ext2::is_mounted()
         && let Some(rel) = ext2_root_path(abs_path)
     {
-        let vol = crate::fs::ext2::EXT2_VOLUME.lock();
-        if let Some(vol) = vol.as_ref()
-            && vol.exists(rel)
-        {
-            return ext2_statfs();
+        // Engine-unification Phase A: route the existence probe to `vfs_server`
+        // when registered (the in-kernel engine is the boot-window fallback).
+        if vfs_service_can_handle_path(abs_path) {
+            if vfs_service_stat_path(abs_path).is_ok() {
+                return ext2_statfs();
+            }
+        } else {
+            let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+            if let Some(vol) = vol.as_ref()
+                && vol.exists(rel)
+            {
+                return ext2_statfs();
+            }
         }
     }
     if let Some(rel) = fat32_relative_path(abs_path) {
@@ -855,6 +863,12 @@ fn statfs_path_exists(abs_path: &str) -> bool {
     if crate::fs::ext2::is_mounted()
         && let Some(rel) = ext2_root_path(abs_path)
     {
+        // Engine-unification Phase A: a root existence check routes to the
+        // `vfs_server` authority when registered so a write-back-deferred create
+        // is visible and the in-kernel ext2 engine isn't consulted post-boot.
+        if vfs_service_can_handle_path(abs_path) {
+            return vfs_service_stat_path(abs_path).is_ok();
+        }
         let vol = crate::fs::ext2::EXT2_VOLUME.lock();
         if let Some(vol) = vol.as_ref() {
             return vol.exists(rel);
@@ -1639,6 +1653,10 @@ mod syscall_nr {
     /// `sys_shm_size(shm_id) -> bytes | u64::MAX`.
     pub const SHM_SIZE: u64 = 0x1022;
 
+    /// Phase 95c (Area A.1): `vfs_server` registers its mapped SHM "read window"
+    /// (the zero-copy demand-fault read destination). `vfs_register_read_window(shm_id)`.
+    pub const VFS_REGISTER_READ_WINDOW: u64 = 0x1024;
+
     // -- ipc --
     pub const IPC_BASE: u64 = 0x1100;
     // Phase 74 extension: cap-bearing IPC (0x1117/0x1118) and per-call
@@ -2177,6 +2195,7 @@ pub extern "C" fn syscall_handler(
         FRAME_TICK_HZ => sys_frame_tick_hz(),
         FRAME_TICK_DRAIN => sys_frame_tick_drain(),
         SHM_CREATE => sys_shm_create(arg0),
+        VFS_REGISTER_READ_WINDOW => sys_vfs_register_read_window(arg0),
         SHM_MAP => sys_shm_map(arg0),
         SHM_UNMAP => sys_shm_unmap(arg0),
         SHM_DESTROY => sys_shm_destroy(arg0),
@@ -3217,7 +3236,31 @@ pub(super) fn sys_exit(code: i32) -> ! {
 pub(super) fn sys_exit_group(code: i32) -> ! {
     let pid = crate::process::current_pid();
     log::debug!("[p{}] exit_group({})", pid, code);
+    terminate_thread_group_and_exit(pid, code);
+}
 
+/// Terminate the whole thread group of `pid` and exit with `code`, then mark the
+/// caller's scheduler task dead (never returns). Quiesces any still-running
+/// siblings first (an off-core sibling — including one parked `BlockedOnFutex` —
+/// is marked Dead in place by `quiesce_task_for_remote_reap_by_pid`; a running
+/// one is requested to group-exit and IPI'd until it quiesces), reaps them, then
+/// performs the caller's final `do_full_process_exit` once it is the last thread
+/// standing. Single-threaded callers (`thread_group == None`) skip straight to the
+/// full exit.
+///
+/// Used by `exit_group(2)` (normal exit code) AND by the fatal-fault kill path
+/// (`fault_kill_trampoline`, SIGSEGV-encoded `code = -11`): an unhandled fatal
+/// fault in one thread of a multithreaded process must terminate the ENTIRE
+/// group (Linux semantics). Without this the fault path killed only the faulting
+/// TID, stranding siblings `BlockedOnFutex` forever (single-core hang) and — on
+/// SMP — racing a sibling against the shared-address-space teardown into a kernel
+/// `addr=0x8` NULL deref. Reusing this path also gives the crash the same
+/// cap/SHM/flock/IOMMU cleanup a clean exit gets.
+///
+/// MUST be called from a normal ring-0 task continuation with interrupts enabled
+/// (the quiesce loop yields / sends reschedule IPIs), exactly like the
+/// `exit_group` syscall context.
+pub(crate) fn terminate_thread_group_and_exit(pid: crate::process::Pid, code: i32) -> ! {
     if pid != 0 {
         // Check if we are in a thread group.
         let thread_group = {
@@ -3794,18 +3837,58 @@ const SA_RESETHAND: u64 = 0x8000_0000;
 pub(super) fn sys_rt_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64) -> u64 {
     let pid = crate::process::current_pid();
 
-    let mut table = crate::process::PROCESS_TABLE.lock();
-    let proc = match table.find_mut(pid) {
-        Some(p) => p,
-        None => return NEG_EINVAL,
+    // Read the new mask from userspace BEFORE taking PROCESS_TABLE. The user
+    // pointer can be a cold MAP_LAZY_FILE page whose demand-fault blocks on a
+    // vfs_server IPC; faulting it while holding PROCESS_TABLE (an IrqSafeMutex
+    // held across the resulting context switch) strands the lock and wedges every
+    // core — the Phase-95b lazy-file-fault-under-lock class. The deadlock-guard
+    // caught this exact syscall (14) wedging dynamic-mt's pthread_create
+    // signal-block. Validate `how` here too so the EINVAL path never touches the
+    // lock. Userspace (musl) uses 0-indexed bits (bit N = signal N+1); convert to
+    // the kernel's signal-number-indexed bits by <<1.
+    let new_mask = if set_ptr != 0 {
+        match how {
+            SIG_BLOCK | SIG_UNBLOCK | SIG_SETMASK => {}
+            _ => return NEG_EINVAL,
+        }
+        let mut set_bytes = [0u8; 8];
+        if UserSliceRo::new(set_ptr, set_bytes.len())
+            .and_then(|s| s.copy_to_kernel(&mut set_bytes))
+            .is_err()
+        {
+            return NEG_EFAULT;
+        }
+        Some(u64::from_ne_bytes(set_bytes) << 1)
+    } else {
+        None
     };
 
-    // Write old mask to userspace if requested.
-    // Userspace (musl) uses 0-indexed bits: bit N represents signal N+1.
-    // Kernel uses signal-number-indexed bits: bit N represents signal N.
-    // Convert kernel→userspace by shifting right 1.
+    // Snapshot + modify the mask under the lock, capturing the OLD mask (before
+    // applying the new one) to write back AFTER the lock is dropped — the oldset
+    // write is also a user access that must not fault under the lock.
+    let old_user;
+    {
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        let proc = match table.find_mut(pid) {
+            Some(p) => p,
+            None => return NEG_EINVAL,
+        };
+        old_user = proc.blocked_signals >> 1;
+        if let Some(set) = new_mask {
+            match how {
+                SIG_BLOCK => proc.blocked_signals |= set,
+                SIG_UNBLOCK => proc.blocked_signals &= !set,
+                SIG_SETMASK => proc.blocked_signals = set,
+                _ => unreachable!("how validated above the lock"),
+            }
+            // SIGKILL and SIGSTOP can never be blocked.
+            proc.blocked_signals &= !UNBLOCKABLE_MASK;
+        }
+    }
+
+    // Write the old mask to userspace AFTER dropping the lock (convert
+    // kernel->user by >>1; same lazy-file hazard as the read above).
     if oldset_ptr != 0 {
-        let old_user = proc.blocked_signals >> 1;
         let old_bytes = old_user.to_ne_bytes();
         if UserSliceWo::new(oldset_ptr, old_bytes.len())
             .and_then(|s| s.copy_from_kernel(&old_bytes))
@@ -3815,36 +3898,8 @@ pub(super) fn sys_rt_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64) -> u64
         }
     }
 
-    // Apply new mask if set_ptr is non-null.
-    if set_ptr != 0 {
-        let mut set_bytes = [0u8; 8];
-        if UserSliceRo::new(set_ptr, set_bytes.len())
-            .and_then(|s| s.copy_to_kernel(&mut set_bytes))
-            .is_err()
-        {
-            return NEG_EFAULT;
-        }
-        // Convert userspace→kernel by shifting left 1.
-        let set = u64::from_ne_bytes(set_bytes) << 1;
-
-        match how {
-            SIG_BLOCK => proc.blocked_signals |= set,
-            SIG_UNBLOCK => proc.blocked_signals &= !set,
-            SIG_SETMASK => proc.blocked_signals = set,
-            _ => return NEG_EINVAL,
-        }
-
-        // SIGKILL and SIGSTOP can never be blocked.
-        proc.blocked_signals &= !UNBLOCKABLE_MASK;
-    }
-
-    // Drop the lock before checking pending signals so we don't deadlock.
-    // Check pending signals after any operation that could unblock signals.
+    // After SIG_UNBLOCK / SIG_SETMASK, deliver any newly-unblocked pending signals.
     let needs_check = set_ptr != 0 && (how == SIG_UNBLOCK || how == SIG_SETMASK);
-    drop(table);
-
-    // After SIG_UNBLOCK, deliver any newly-unblocked pending signals immediately.
-    // Pass 0 as the syscall result since rt_sigprocmask succeeds.
     if needs_check {
         check_pending_signals(0);
     }
@@ -5348,6 +5403,10 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
                 &argv_refs,
                 &envp_refs,
                 loaded.aux_info(),
+                // Phase 95b — the resolved execve path for AT_EXECFN, so the
+                // loader can expand `$ORIGIN` in DT_RUNPATH (rust-lld →
+                // libLLVM.so under `$ORIGIN/../lib`).
+                Some(name.as_bytes()),
             )
         } {
             Ok(rsp) => rsp,
@@ -5358,6 +5417,14 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         };
         (loaded, user_rsp)
     };
+
+    // Engine-unification Phase B: the streamed binary is fully loaded, so close
+    // the `vfs_server` exec handle now. `execve` ends by diverging into
+    // userspace (`enter_userspace` is `-> !`), so `exec_stream`'s `Drop` would
+    // never run; drop it explicitly here while still on the old task context
+    // (before the CR3 switch) so the `VFS_CLOSE` IPC lands and no handle leaks.
+    // For the in-kernel (boot-window) source this is a cheap no-op drop.
+    drop(exec_stream);
 
     // Close file descriptors with FD_CLOEXEC set.
     crate::process::close_cloexec_fds(pid);
@@ -8250,10 +8317,100 @@ fn is_directory(path: &str) -> bool {
 /// failure (e.g. `NEG_ENOENT` if not found, `NEG_E2BIG` if too large).
 const NEG_E2BIG: u64 = (-7_i64) as u64;
 
+/// Engine-unification Phase B: whether an `execve` binary read for `path` should
+/// be served by the ring-3 `vfs_server` rather than the in-kernel ext2 loader.
+///
+/// The early-boot window — `vfs_server` not yet registered, or the `vfs_server`
+/// binary loading *itself* — returns `false` so `init` and `vfs_server` are
+/// brought up from the FS by the in-kernel loader (`vfs_write_routable` already
+/// folds in the `is_current_exec_path("/bin/vfs_server")` guard). Only ext2-root
+/// binaries route; ramdisk (`/bin/sh`, …) and `/data` (fat32) keep their own
+/// loaders. Once routed, the read holds no `EXT2_VOLUME` lock and observes any
+/// write-back-deferred bytes — the Phase C precondition for the exec path.
+fn exec_should_route(path: &str) -> bool {
+    vfs_write_routable()
+        && !path.starts_with("/data/")
+        && crate::fs::ramdisk::ramdisk_lookup(path).is_none()
+        && ext2_root_path(path).is_some()
+}
+
+/// Open `path` read-only through `vfs_server` for a kernel-side exec read,
+/// returning the raw service handle (no fd allocation). The `VFS_OPEN` reply
+/// carries a stat-header bulk the exec loader does not need; it is drained so it
+/// cannot bleed into the first `VFS_READ`. Close with [`vfs_service_close`].
+fn vfs_exec_open(path: &str) -> Result<u64, u64> {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::fs::vfs_protocol::VFS_OPEN;
+
+    let vfs_ep = registry::lookup_endpoint_id("vfs").ok_or(NEG_ENOENT)?;
+    let task_id = scheduler::current_task_id().ok_or(NEG_EINVAL)?;
+    let mut msg = Message::new(VFS_OPEN);
+    msg.data[0] = 0; // O_RDONLY — the server rejects anything else
+    msg.data[1] = path.len() as u64;
+    scheduler::deliver_bulk(task_id, alloc::vec::Vec::from(path.as_bytes()));
+    let reply = endpoint::call_msg(task_id, vfs_ep, msg);
+    if reply.label != 0 {
+        return Err(reply.label);
+    }
+    // Drain the (unused) stat-header bulk the open reply delivers.
+    let _ = scheduler::take_bulk_data(task_id);
+    Ok(reply.data[0] & 0xFFFF_FFFF)
+}
+
+/// Read the whole of an already-stat'd ext2 binary (`size` bytes) through
+/// `vfs_server` into a fresh kernel buffer (engine-unification Phase B, static
+/// exec path). Opens a read-only handle, drains it with the kernel `VFS_READ`
+/// client (which caps each round-trip at `VFS_MAX_PREAD`), and always closes the
+/// handle. No `EXT2_VOLUME` lock is held across the transfer.
+fn vfs_exec_read_bytes(path: &str, size: usize) -> Result<alloc::vec::Vec<u8>, u64> {
+    let handle = vfs_exec_open(path)?;
+    let mut buf = alloc::vec![0u8; size];
+    let mut read = 0usize;
+    let result = loop {
+        if read >= size {
+            break Ok(());
+        }
+        match vfs_service_read_kernel(handle, read, &mut buf[read..]) {
+            Ok(0) => break Ok(()), // short file / EOF
+            Ok(n) => read += n,
+            Err(e) => break Err(e as u64),
+        }
+    };
+    vfs_service_close(handle);
+    result?;
+    buf.truncate(read);
+    Ok(buf)
+}
+
 pub(crate) fn read_file_from_disk(path: &str) -> Result<alloc::vec::Vec<u8>, u64> {
     /// Maximum executable size we can safely materialize in one reclaimable
     /// kernel heap allocation with the current page-backed large-allocation path.
     const MAX_EXEC_SIZE: usize = crate::mm::heap::max_page_backed_allocation_bytes();
+
+    // Engine-unification Phase B: post-boot, read an ext2-resident binary through
+    // the `vfs_server` authority — no `EXT2_VOLUME` lock held across the read,
+    // and a write-back-deferred binary is visible. The `vfs_service_stat_path`
+    // (cached) gives the size up front so a too-large binary returns E2BIG to the
+    // streaming path exactly as the in-kernel branch does. Any vfs miss (stat
+    // fails, not a regular file, read error) falls through to the in-kernel ext2
+    // path below — which also covers the boot window, where `exec_should_route`
+    // is false and `init`/`vfs_server` load via the in-kernel loader.
+    if exec_should_route(path)
+        && let Ok(st) = vfs_service_stat_path(path)
+        && st.kind == kernel_core::fs::vfs_protocol::VFS_NODE_FILE
+    {
+        let size = st.size as usize;
+        if size > MAX_EXEC_SIZE {
+            log::warn!("[exec] file too large ({size} bytes > {MAX_EXEC_SIZE} limit): {path}");
+            return Err(NEG_E2BIG);
+        }
+        if size > 0
+            && let Ok(buf) = vfs_exec_read_bytes(path, size)
+        {
+            return Ok(buf);
+        }
+    }
 
     // Try ext2 root filesystem first (most likely location for compiled binaries).
     // Skip /data/ paths — those are routed to FAT32 by other syscalls.
@@ -8365,35 +8522,77 @@ struct ExecWindow {
     data: alloc::vec::Vec<u8>,
 }
 
+/// Backing store for a [`DiskElfSource`] window refill.
+enum ExecStreamSource {
+    /// In-kernel ext2 by inode (early-boot window / `vfs_server` degraded).
+    Kernel(kernel_core::fs::ext2::Ext2Inode),
+    /// Engine-unification Phase B: an open `vfs_server` read handle — the routed
+    /// post-boot path, read with the kernel `VFS_READ` client (no `EXT2_VOLUME`
+    /// lock, write-back-visible). Closed when the `DiskElfSource` is dropped.
+    Vfs(u64),
+}
+
 /// Phase 85d — a disk-backed, windowed [`crate::mm::elf::ElfBytes`] source for
 /// ext2-resident binaries too large to materialize in one kernel-heap buffer (the
-/// ~65 MiB static `clang` exceeds the entire 64 MiB heap). Reads ranges from the
-/// ext2 root on demand through a 1 MiB sliding window, so
-/// `mm::elf::load_elf_streaming` never needs a giant allocation. Only ext2 is
-/// supported — `clang` installs to `/usr` on the ext2 root; a large binary on
-/// another filesystem falls back to E2BIG (no such case exists in practice).
+/// ~65 MiB static `clang` exceeds the entire 64 MiB heap). Reads ranges on demand
+/// through a 1 MiB sliding window, so `mm::elf::load_elf_streaming` never needs a
+/// giant allocation. The bytes come either from the in-kernel ext2 engine (boot
+/// window) or — once `vfs_server` is registered — from it over IPC
+/// (engine-unification Phase B). Only ext2-root binaries stream; a large binary
+/// elsewhere falls back to E2BIG (no such case exists in practice).
 struct DiskElfSource {
-    inode: kernel_core::fs::ext2::Ext2Inode,
+    source: ExecStreamSource,
     size: usize,
     window: spin::Mutex<ExecWindow>,
 }
 
+impl Drop for DiskElfSource {
+    fn drop(&mut self) {
+        if let ExecStreamSource::Vfs(handle) = self.source {
+            vfs_service_close(handle);
+        }
+    }
+}
+
 impl DiskElfSource {
-    /// Refill the window from the ext2 root so it starts at `offset`. Reads up to
-    /// `EXEC_STREAM_WINDOW` bytes (clamped to EOF).
+    /// Refill the window so it starts at `offset`. Reads up to
+    /// `EXEC_STREAM_WINDOW` bytes (clamped to EOF) from the backing source.
     fn refill(&self, win: &mut ExecWindow, offset: usize) -> Result<(), crate::mm::elf::ElfError> {
         use crate::mm::elf::ElfError;
         let to_read = EXEC_STREAM_WINDOW.min(self.size.saturating_sub(offset));
         if win.data.len() < EXEC_STREAM_WINDOW {
             win.data.resize(EXEC_STREAM_WINDOW, 0);
         }
-        let vol = crate::fs::ext2::EXT2_VOLUME.lock();
-        let vol = vol
-            .as_ref()
-            .ok_or(ElfError::MappingFailed("ext2 not mounted (streamed exec)"))?;
-        let n = vol
-            .read_file_data(&self.inode, offset as u64, &mut win.data[..to_read])
-            .map_err(|_| ElfError::MappingFailed("ext2 read failed (streamed exec)"))?;
+        let n = match &self.source {
+            ExecStreamSource::Kernel(inode) => {
+                let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+                let vol = vol
+                    .as_ref()
+                    .ok_or(ElfError::MappingFailed("ext2 not mounted (streamed exec)"))?;
+                vol.read_file_data(inode, offset as u64, &mut win.data[..to_read])
+                    .map_err(|_| ElfError::MappingFailed("ext2 read failed (streamed exec)"))?
+            }
+            ExecStreamSource::Vfs(handle) => {
+                // The kernel `VFS_READ` client caps each round-trip at
+                // `VFS_MAX_PREAD` (< `EXEC_STREAM_WINDOW`), so loop to fill the
+                // window. A short read before EOF leaves `len` at what landed.
+                let mut filled = 0usize;
+                while filled < to_read {
+                    match vfs_service_read_kernel(
+                        *handle,
+                        offset + filled,
+                        &mut win.data[filled..to_read],
+                    ) {
+                        Ok(0) => break,
+                        Ok(got) => filled += got,
+                        Err(_) => {
+                            return Err(ElfError::MappingFailed("vfs read failed (streamed exec)"));
+                        }
+                    }
+                }
+                filled
+            }
+        };
         win.offset = offset;
         win.len = n;
         Ok(())
@@ -8438,6 +8637,40 @@ impl crate::mm::elf::ElfBytes for DiskElfSource {
 /// [`DiskElfSource`]. Only the ext2 root (where `/usr/bin/clang-18` lives) is
 /// supported; the caller falls back to E2BIG for large binaries elsewhere.
 fn open_exec_stream(path: &str) -> Result<DiskElfSource, u64> {
+    let empty_window = || {
+        spin::Mutex::new(ExecWindow {
+            offset: 0,
+            len: 0,
+            data: alloc::vec::Vec::new(),
+        })
+    };
+
+    // Engine-unification Phase B: post-boot, stream the large binary through the
+    // `vfs_server` authority (no `EXT2_VOLUME` lock per refill, write-back-
+    // visible). `vfs_service_stat_path` (cached) gives the size; a routed
+    // `LARGE_EXEC_MAX` overflow returns E2BIG exactly as the in-kernel branch
+    // does. Any vfs miss falls through to the in-kernel path below, which also
+    // serves the boot window (`exec_should_route` false → in-kernel loader).
+    if exec_should_route(path)
+        && let Ok(st) = vfs_service_stat_path(path)
+        && st.kind == kernel_core::fs::vfs_protocol::VFS_NODE_FILE
+    {
+        let size = st.size as usize;
+        if size > LARGE_EXEC_MAX {
+            log::warn!(
+                "[execve] file too large for streaming ({size} bytes > {LARGE_EXEC_MAX} limit): {path}"
+            );
+            return Err(NEG_E2BIG);
+        }
+        if let Ok(handle) = vfs_exec_open(path) {
+            return Ok(DiskElfSource {
+                source: ExecStreamSource::Vfs(handle),
+                size,
+                window: empty_window(),
+            });
+        }
+    }
+
     if crate::fs::ext2::is_mounted() && !path.starts_with("/data/") {
         let vol = crate::fs::ext2::EXT2_VOLUME.lock();
         if let Some(vol) = vol.as_ref() {
@@ -8456,13 +8689,9 @@ fn open_exec_stream(path: &str) -> Result<DiskElfSource, u64> {
                     return Err(NEG_E2BIG);
                 }
                 return Ok(DiskElfSource {
-                    inode,
+                    source: ExecStreamSource::Kernel(inode),
                     size,
-                    window: spin::Mutex::new(ExecWindow {
-                        offset: 0,
-                        len: 0,
-                        data: alloc::vec::Vec::new(),
-                    }),
+                    window: empty_window(),
                 });
             }
         }
@@ -8591,6 +8820,27 @@ fn vfs_service_can_list_dir(path: &str) -> bool {
     path != "/"
         && vfs_service_can_handle_path(path)
         && crate::fs::ramdisk::ramdisk_list_dir(path).is_none()
+}
+
+/// Whether the ext2 *contents* of `path` can be enumerated through `vfs_server`
+/// (engine-unification Phase A). Listing is a MERGE — the ramdisk overlays the
+/// ext2 dir rather than shadowing it — so, unlike `vfs_service_can_handle_path`
+/// (single-file shadow semantics), a ramdisk-present directory such as `/`,
+/// `/bin`, or `/etc` still routes its ext2 portion to the server; the caller
+/// merges the ramdisk/virtual overlays on top. Excludes `vfs_server` itself,
+/// the kernel-owned virtual filesystems, and `/data` (fat32).
+fn vfs_can_list_ext2_dir(path: &str) -> bool {
+    if is_current_exec_path("/bin/vfs_server") {
+        return false;
+    }
+    if path == "/proc" || path.starts_with("/proc/") || path == "/dev" || path.starts_with("/dev/")
+    {
+        return false;
+    }
+    if path == "/data" || path.starts_with("/data/") {
+        return false;
+    }
+    crate::ipc::registry::is_registered("vfs") && ext2_root_path(path).is_some()
 }
 
 fn vfs_bootstrap_mount_action(target: &str, fstype: &str) -> Result<u64, u64> {
@@ -8819,6 +9069,94 @@ fn vfs_service_list_dir(
     Ok((bytes, next_offset))
 }
 
+/// One child entry of an ext2 directory as enumerated by the `vfs_server`:
+/// `(name, d_type, d_ino)` where `d_ino` is the REAL on-disk inode the server
+/// emits (so a caller needs no second `stat`).
+type VfsDirChild = (alloc::string::String, u8, u64);
+
+/// Enumerate ALL children of an ext2 directory through the ring-3 `vfs_server`
+/// (engine-unification Phase A), draining the paginated `VFS_LIST_DIR` stream
+/// into a kernel `Vec` and parsing the `dirent64` records it returns. `.` and
+/// `..` are skipped — the getdents root/overlay merge synthesizes those itself.
+///
+/// This is the listing analog of `vfs_service_stat_path`: it lets the kernel's
+/// directory-merge paths (root `/` and ramdisk-overlaid subdirs) source their
+/// ext2 entries — names AND real inodes — from the single post-boot engine
+/// instead of `EXT2_VOLUME`, so a write-back-deferred create is visible and the
+/// in-kernel engine is not consulted for a root listing post-boot. Callers keep
+/// the in-kernel `list_dir` as the boot-window / degraded fallback.
+fn vfs_service_list_dir_entries(path: &str) -> Result<alloc::vec::Vec<VfsDirChild>, u64> {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::fs::vfs_protocol::VFS_LIST_DIR;
+
+    // One reply page. 64 KiB matches the cap `sys_linux_getdents64` already
+    // passes to `vfs_service_list_dir`; it is well within both `vfs_server`'s
+    // `recv_buf` and the IPC bulk ceiling.
+    const LIST_CHUNK: usize = 64 * 1024;
+
+    let vfs_ep = registry::lookup_endpoint_id("vfs").ok_or(NEG_ENOENT)?;
+    let task_id = scheduler::current_task_id().ok_or(NEG_EINVAL)?;
+
+    let mut children: alloc::vec::Vec<VfsDirChild> = alloc::vec::Vec::new();
+    let mut offset: usize = 0;
+    // Bound the page count so a corrupt/garbage `next_offset` can never spin
+    // forever (a directory can hold at most a few hundred thousand entries; the
+    // server advances the offset by at least one record per non-empty reply).
+    for _ in 0..1_000_000 {
+        let mut msg = Message::new(VFS_LIST_DIR);
+        msg.data[0] = path.len() as u64;
+        msg.data[1] = offset as u64;
+        msg.data[2] = LIST_CHUNK as u64;
+        scheduler::deliver_bulk(task_id, alloc::vec::Vec::from(path.as_bytes()));
+        let reply = endpoint::call_msg(task_id, vfs_ep, msg);
+        if reply.label != 0 {
+            return Err(reply.label);
+        }
+        let packed = reply.data[0];
+        let bytes = (packed & 0xFFFF_FFFF) as usize;
+        let next_offset = (packed >> 32) as usize;
+        if bytes == 0 {
+            break; // end of directory
+        }
+        if bytes > LIST_CHUNK {
+            return Err(NEG_EIO);
+        }
+        let bulk = scheduler::take_bulk_data(task_id).ok_or(NEG_EIO)?;
+        if bulk.len() < bytes {
+            return Err(NEG_EIO);
+        }
+        // Parse the packed dirent64 records: d_ino(8) d_off(8) reclen(2)
+        // d_type(1) name(NUL-terminated, padded to reclen).
+        let mut pos = 0usize;
+        while pos + 19 <= bytes {
+            let d_ino = u64::from_ne_bytes(bulk[pos..pos + 8].try_into().unwrap());
+            let reclen = u16::from_ne_bytes(bulk[pos + 16..pos + 18].try_into().unwrap()) as usize;
+            if reclen < 20 || pos + reclen > bytes {
+                return Err(NEG_EIO); // malformed record
+            }
+            let d_type = bulk[pos + 18];
+            let name_bytes = &bulk[pos + 19..pos + reclen];
+            let name_end = name_bytes
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(name_bytes.len());
+            if let Ok(name) = core::str::from_utf8(&name_bytes[..name_end])
+                && name != "."
+                && name != ".."
+            {
+                children.push((alloc::string::String::from(name), d_type, d_ino));
+            }
+            pos += reclen;
+        }
+        if next_offset <= offset {
+            break; // no forward progress — done (or degenerate)
+        }
+        offset = next_offset;
+    }
+    Ok(children)
+}
+
 fn vfs_service_mount_action(target: &str, fstype: &str) -> Result<u64, u64> {
     use crate::ipc::{endpoint, message::Message, registry};
     use crate::task::scheduler;
@@ -8875,11 +9213,20 @@ fn vfs_service_should_route(path: &str, flags: u64) -> bool {
     if !vfs_service_can_handle_path(path) {
         return false;
     }
-    if let Some(rel) = ext2_root_path(path) {
-        crate::fs::ext2::is_ext2_regular_file(rel)
-    } else {
-        false
+    if ext2_root_path(path).is_none() {
+        return false;
     }
+    // Engine-unification Phase A (audit completion): determine regular-file-ness
+    // through the cached `vfs_service_stat_path` — the SAME authority that will
+    // serve the open — instead of the in-kernel `is_ext2_regular_file`
+    // (`EXT2_VOLUME.metadata`). This removes the last hot-path in-kernel root
+    // read from the open-routing decision (so it can't disagree with the server,
+    // and a write-back-deferred new file routes correctly), and is the
+    // precondition for retiring the dual-engine block-cache invalidation.
+    matches!(
+        vfs_service_stat_path(path),
+        Ok(st) if st.kind == kernel_core::fs::vfs_protocol::VFS_NODE_FILE
+    )
 }
 
 fn vfs_service_read(handle: u64, offset: usize, user_buf_ptr: u64, count: usize) -> u64 {
@@ -8926,6 +9273,258 @@ fn vfs_service_read(handle: u64, offset: usize, user_buf_ptr: u64, count: usize)
         return NEG_EFAULT;
     }
     bytes_read as u64
+}
+
+// ---------------------------------------------------------------------------
+// Phase 95c (Area A.1) — zero-copy demand-fault SHM "read window".
+//
+// The 95b demand-fill staged each read as an IPC bulk payload: `vfs_server`
+// `ipc_store_reply_bulk`s the data into a kernel `Vec`, the kernel
+// `take_bulk_data`s it, copies it into a cluster buffer, then copies THAT into
+// the faulting frame — a double copy that violates m3OS's "bulk data = page
+// grants, never IPC payloads" rule. The read window replaces that transport
+// with a shared SHM region (the idiomatic external-pager move): `vfs_server`
+// creates + maps a window once at startup and registers it here; on a fault the
+// kernel issues `VFS_READ_WINDOW`, `vfs_server` reads file bytes straight into
+// the shared window, and the kernel fills the faulting frame from the window's
+// frames through its physical map — no IPC bulk, no `take_bulk_data`.
+//
+// A single window is shared by all faulting tasks, guarded by a non-blocking
+// `in_use` flag held across the borrow (issue → reply → frame-fill): a second
+// concurrent fault that can't claim it falls back to the legacy bulk path, so
+// the optimization never blocks and never serializes correctness. `vfs_server`
+// is single-threaded, so file reads already serialize there; the window only
+// extends that to the kernel's brief frame-fill memcpy.
+// ---------------------------------------------------------------------------
+
+struct VfsReadWindow {
+    /// Physical base of the registered SHM window (0 = unregistered).
+    phys_base: core::sync::atomic::AtomicU64,
+    /// Window size in bytes (a contiguous SHM run from `phys_base`).
+    bytes: core::sync::atomic::AtomicU64,
+    /// Held across a faulting task's `VFS_READ_WINDOW` borrow so no other writer
+    /// (another fault, or `vfs_server` serving another window request) can
+    /// overwrite the region before the kernel has copied it into the frame.
+    in_use: core::sync::atomic::AtomicBool,
+    /// PID of the current borrower — used to reclaim the window if the borrower
+    /// is killed mid-fault (otherwise a single such death would wedge the single
+    /// window in `in_use` and permanently force the legacy fallback).
+    holder_pid: core::sync::atomic::AtomicU32,
+}
+
+static VFS_READ_WINDOW: VfsReadWindow = VfsReadWindow {
+    phys_base: core::sync::atomic::AtomicU64::new(0),
+    bytes: core::sync::atomic::AtomicU64::new(0),
+    in_use: core::sync::atomic::AtomicBool::new(false),
+    holder_pid: core::sync::atomic::AtomicU32::new(0),
+};
+
+/// `SYS_VFS_REGISTER_READ_WINDOW` (0x1024) — `vfs_server` registers its mapped
+/// SHM read window. Only the registered `vfs` service owner may register (the
+/// window's frames are read by the kernel from its physical map, so a bogus
+/// region would let any process feed the demand-fill arbitrary memory). Returns
+/// 0 on success, `u64::MAX` on error. Idempotent.
+pub(super) fn sys_vfs_register_read_window(shm_id_arg: u64) -> u64 {
+    use core::sync::atomic::Ordering;
+    // Gate: only the live `vfs_server` process may register the window.
+    if !is_current_exec_path("/bin/vfs_server") {
+        return u64::MAX;
+    }
+    if shm_id_arg == 0 || shm_id_arg > u64::from(u32::MAX) {
+        return u64::MAX;
+    }
+    let id = crate::mm::shm::ShmId(shm_id_arg as u32);
+    let (start_phys, page_count) = match crate::mm::shm::frames(id) {
+        Ok(v) => v,
+        Err(_) => return u64::MAX,
+    };
+    let bytes = (page_count as u64) * 4096;
+    // The window must hold at least one demand cluster; reject an undersized
+    // region so the fault path can assume `bytes >= VFS_MAX_PREAD` never under-
+    // serves a cluster (it clamps the request to `bytes` regardless).
+    if bytes < 4096 {
+        return u64::MAX;
+    }
+    VFS_READ_WINDOW.bytes.store(bytes, Ordering::Relaxed);
+    VFS_READ_WINDOW
+        .phys_base
+        .store(start_phys, Ordering::Release);
+    log::info!(
+        "[vfs] read-window registered: shm_id={} phys={:#x} bytes={}",
+        shm_id_arg,
+        start_phys,
+        bytes
+    );
+    0
+}
+
+/// True once `vfs_server` has registered a read window.
+fn vfs_read_window_registered() -> bool {
+    use core::sync::atomic::Ordering;
+    VFS_READ_WINDOW.phys_base.load(Ordering::Acquire) != 0
+}
+
+/// Try to borrow the read window for `pid`. Returns `false` (fall back to the
+/// legacy bulk path) if it is unregistered or already in use by a *live* task;
+/// if the recorded borrower is dead (killed mid-fault) the window is reclaimed.
+pub(crate) fn claim_vfs_read_window(pid: u32) -> bool {
+    use core::sync::atomic::Ordering;
+    if !vfs_read_window_registered() {
+        return false;
+    }
+    if VFS_READ_WINDOW
+        .in_use
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        VFS_READ_WINDOW.holder_pid.store(pid, Ordering::Relaxed);
+        return true;
+    }
+    // Busy — reclaim only if the recorded holder is gone (a fault path that was
+    // killed while blocked in its `VFS_READ_WINDOW` round-trip, before it could
+    // release). This is the single-window liveness guard; without it one such
+    // death would wedge the window in `in_use` and force the legacy fallback
+    // forever. The reclaim is a single-winner CAS on `holder_pid` so two tasks
+    // that simultaneously observe the same dead holder cannot BOTH steal the
+    // (still-`in_use`) window and race on its bytes — only the CAS winner
+    // proceeds; the loser falls back. (A pid reused by a live process before we
+    // look is a false-negative: we simply don't reclaim and fall back — safe.)
+    let holder = VFS_READ_WINDOW.holder_pid.load(Ordering::Acquire);
+    if holder != 0 && crate::process::PROCESS_TABLE.lock().find(holder).is_none() {
+        return VFS_READ_WINDOW
+            .holder_pid
+            .compare_exchange(holder, pid, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok();
+    }
+    false
+}
+
+/// Release the read window after the borrow completes.
+pub(crate) fn release_vfs_read_window() {
+    use core::sync::atomic::Ordering;
+    VFS_READ_WINDOW.in_use.store(false, Ordering::Release);
+}
+
+/// Kernel-side view of the registered window's frames, via the physical-memory
+/// map. The caller must hold the borrow (`claim_vfs_read_window`) so the bytes
+/// are stable. Returns `None` if unregistered.
+///
+/// # Safety
+/// The returned slice aliases `vfs_server`'s SHM frames; it is only valid while
+/// the borrow is held (no concurrent writer) and the window stays registered.
+pub(crate) unsafe fn vfs_read_window_slice() -> Option<&'static [u8]> {
+    use core::sync::atomic::Ordering;
+    let phys = VFS_READ_WINDOW.phys_base.load(Ordering::Acquire);
+    if phys == 0 {
+        return None;
+    }
+    let bytes = VFS_READ_WINDOW.bytes.load(Ordering::Relaxed) as usize;
+    let virt = crate::mm::phys_offset() + phys;
+    Some(unsafe { core::slice::from_raw_parts(virt as *const u8, bytes) })
+}
+
+/// Maximum bytes the window can hold (for clamping a cluster request).
+fn vfs_read_window_bytes() -> usize {
+    use core::sync::atomic::Ordering;
+    VFS_READ_WINDOW.bytes.load(Ordering::Relaxed) as usize
+}
+
+/// Issue one `VFS_READ_WINDOW` round-trip: `vfs_server` reads up to `len` bytes
+/// at file `offset` from open `handle` directly into the shared window's first
+/// `len` bytes. Returns the bytes written into the window (0 at EOF) or a
+/// negative errno. The caller must hold the window borrow and read the bytes
+/// from [`vfs_read_window_slice`] before releasing it. Mirrors
+/// [`vfs_service_read_kernel`]'s `call_msg` blocking contract.
+pub(crate) fn vfs_read_into_window(handle: u64, offset: usize, len: usize) -> Result<usize, i64> {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::fs::vfs_protocol::VFS_READ_WINDOW;
+
+    let capped = len.min(vfs_read_window_bytes());
+    if capped == 0 {
+        return Ok(0);
+    }
+    let vfs_ep = registry::lookup_endpoint_id("vfs").ok_or(NEG_EIO as i64)?;
+    let task_id = scheduler::current_task_id().ok_or(NEG_EINVAL as i64)?;
+
+    let mut msg = Message::new(VFS_READ_WINDOW);
+    msg.data[0] = handle;
+    msg.data[1] = offset as u64;
+    msg.data[2] = capped as u64;
+    let reply = endpoint::call_msg(task_id, vfs_ep, msg);
+    if reply.label != 0 {
+        return Err(reply.label as i64);
+    }
+    let bytes_read = reply.data[0] as usize;
+    if bytes_read > capped {
+        return Err(NEG_EIO as i64);
+    }
+    Ok(bytes_read)
+}
+
+/// Resolve the `vfs_server` service handle for a process `fd`, **only** if that
+/// fd is backed by `vfs_server` (the one backend the zero-copy read window can
+/// fill — `vfs_server` owns those files and is the IPC peer that reads into the
+/// window). Returns `None` for every other backend (ramdisk / in-kernel ext2 /
+/// tmpfs / fat32), whose pages the window cannot serve, so the demand-fault
+/// caller knows to use the legacy per-backend read routing instead.
+///
+/// Phase 95c (Area A.1). Critically, the value stored in a file-backed VMA is
+/// the *process* fd number, NOT the `vfs_server` handle — the handle lives
+/// inside `FdBackend::VfsService`. Sending the raw fd number to `vfs_server`
+/// (the original A.1 bug) made it `EBADF` every demand read.
+pub(crate) fn vfs_service_handle_for_fd(pid: u32, fd: usize) -> Option<u64> {
+    let table = crate::process::PROCESS_TABLE.lock();
+    let entry = table.find(pid)?.fd_get(fd)?;
+    match &entry.backend {
+        FdBackend::VfsService { service_handle, .. } => Some(*service_handle),
+        _ => None,
+    }
+}
+
+/// Phase 95b (Area A.2) — kernel-buffer variant of [`vfs_service_read`]: read up
+/// to `buf.len()` bytes at `offset` from a `VfsService` handle into a kernel
+/// buffer (instead of a user pointer), blocking on the `vfs_server` IPC reply.
+///
+/// This is the read used by the demand-fault file-backed page filler, so it must
+/// be callable from the page-fault handler. That is sound: a ring-3 fault is
+/// entered with no kernel locks held (the faulting task was running userspace),
+/// so blocking on the synchronous `call_msg` here only switches the faulting task
+/// out until `vfs_server` replies — exactly as a syscall-context vfs read does.
+/// Returns bytes read (0 at EOF) or a negative errno.
+fn vfs_service_read_kernel(handle: u64, offset: usize, buf: &mut [u8]) -> Result<usize, i64> {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::fs::vfs_protocol::{VFS_MAX_PREAD, VFS_READ};
+
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    let vfs_ep = registry::lookup_endpoint_id("vfs").ok_or(NEG_EIO as i64)?;
+    let task_id = scheduler::current_task_id().ok_or(NEG_EINVAL as i64)?;
+    let capped = buf.len().min(VFS_MAX_PREAD);
+
+    let mut msg = Message::new(VFS_READ);
+    msg.data[0] = handle;
+    msg.data[1] = offset as u64;
+    msg.data[2] = capped as u64;
+    let reply = endpoint::call_msg(task_id, vfs_ep, msg);
+    if reply.label != 0 {
+        return Err(reply.label as i64);
+    }
+    let bytes_read = reply.data[0] as usize;
+    if bytes_read == 0 {
+        return Ok(0);
+    }
+    if bytes_read > capped {
+        return Err(NEG_EIO as i64);
+    }
+    let bulk = scheduler::take_bulk_data(task_id).ok_or(NEG_EIO as i64)?;
+    if bulk.len() < bytes_read {
+        return Err(NEG_EIO as i64);
+    }
+    buf[..bytes_read].copy_from_slice(&bulk[..bytes_read]);
+    Ok(bytes_read)
 }
 
 fn vfs_service_close(handle: u64) {
@@ -10126,6 +10725,138 @@ fn data_chown(rel: &str, new_uid: u32, new_gid: u32) -> u64 {
     }
 }
 
+/// Engine-unification Phase C2-prep: open an ext2-root file/dir **entirely
+/// through `vfs_server`** — resolve existence + kind, route the `O_CREAT`/
+/// `O_TRUNC` mutation, and build the fd's metadata (inode/size/parent) from the
+/// server's stat — so the open never consults the in-kernel `EXT2_VOLUME`. This
+/// is the precondition for safe metadata write-back: the prior in-kernel
+/// `resolve_path`/`read_inode` here would observe a write-back-DEFERRED create
+/// stale (the C1-measured residual), failing an `open` right after its `create`.
+///
+/// Returns `Some(fd_or_errno)` when the server handled the open (success or a
+/// definitive errno), or `None` to fall through to the in-kernel path — used
+/// only when the server stat IPC itself fails (degraded vfs), never in steady
+/// state. The caller gates this on `vfs_write_routable()`, so the boot window
+/// (vfs not yet registered) always takes the in-kernel path below.
+#[allow(clippy::too_many_arguments)]
+fn open_ext2_file_routed(
+    name: &str,
+    rel: &str,
+    readable: bool,
+    writable: bool,
+    create: bool,
+    append: bool,
+    truncate: bool,
+    mode_arg: u64,
+    cloexec: bool,
+    nonblock: bool,
+) -> Option<u64> {
+    use kernel_core::fs::vfs_protocol::{VFS_NODE_DIR, VFS_NODE_FILE};
+    const NEG_EISDIR: u64 = (-21_i64) as u64;
+    const NEG_ENOENT: u64 = (-2_i64) as u64;
+    const NEG_EMFILE: u64 = (-24_i64) as u64;
+
+    // Existence + kind from the authority.
+    let existed = match vfs_service_stat_path(name) {
+        Ok(_) => true,
+        Err(e) if e == NEG_ENOENT => false,
+        // Any other error (IPC/degraded) → let the in-kernel path try.
+        Err(_) => return None,
+    };
+
+    if existed {
+        if truncate
+            && writable
+            && let Err(e) = vfs_service_truncate(name, 0)
+        {
+            return Some(e);
+        }
+    } else if create {
+        let parts: alloc::vec::Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+        let (parent_abs, file_name) = if parts.len() <= 1 {
+            ("/", parts.first().copied().unwrap_or(rel))
+        } else {
+            let name_start = name.len() - parts[parts.len() - 1].len();
+            (&name[..name_start], parts[parts.len() - 1])
+        };
+        let create_mode = ((mode_arg as u16) & 0o7777) & !current_umask();
+        let (_, _, caller_euid, caller_egid) = current_process_ids();
+        if let Err(e) = vfs_service_create(
+            parent_abs,
+            file_name,
+            VFS_NODE_FILE,
+            create_mode,
+            caller_euid,
+            caller_egid,
+            None,
+        ) {
+            return Some(e);
+        }
+    } else {
+        return Some(NEG_ENOENT);
+    }
+
+    // Re-stat for the post-mutation metadata. The create/truncate bumped the
+    // kernel stat cache (their `invalidate_cache`), so this resolves fresh.
+    let st = match vfs_service_stat_path(name) {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+
+    if st.kind == VFS_NODE_DIR {
+        if writable || create || truncate {
+            return Some(NEG_EISDIR);
+        }
+        let fd_entry = FdEntry {
+            backend: FdBackend::Dir {
+                path: alloc::string::String::from(name),
+            },
+            offset: 0,
+            readable: true,
+            writable: false,
+            cloexec,
+            nonblock,
+        };
+        return Some(match alloc_fd(3, fd_entry) {
+            Some(i) => i as u64,
+            None => NEG_EMFILE,
+        });
+    }
+
+    // Regular file (a symlink target was already followed by path resolution):
+    // an `Ext2Disk` fd whose reads/writes route BY PATH to vfs_server. The
+    // inode_num/parent_inode come from the server and are consulted only by the
+    // in-kernel fallback (never reached post-boot).
+    let parent_ino = {
+        let parent = parent_dir(name);
+        if parent == "/" {
+            kernel_core::fs::ext2::EXT2_ROOT_INO
+        } else {
+            vfs_service_stat_path(parent)
+                .map(|s| s.ino as u32)
+                .unwrap_or(kernel_core::fs::ext2::EXT2_ROOT_INO)
+        }
+    };
+    let initial_offset = if append { st.size as usize } else { 0 };
+    let fd_entry = FdEntry {
+        backend: FdBackend::Ext2Disk {
+            path: alloc::string::String::from(rel),
+            inode_num: st.ino as u32,
+            file_size: st.size as u32,
+            parent_inode: parent_ino,
+        },
+        offset: initial_offset,
+        readable,
+        writable,
+        cloexec,
+        nonblock,
+    };
+    Some(match alloc_fd(3, fd_entry) {
+        Some(i) => i as u64,
+        None => NEG_EMFILE,
+    })
+}
+
 /// Open a file on the ext2 partition.
 #[allow(clippy::too_many_arguments)]
 fn open_ext2_file(
@@ -10147,6 +10878,19 @@ fn open_ext2_file(
 
     if rel.is_empty() {
         return NEG_EISDIR;
+    }
+
+    // Engine-unification Phase C2-prep: post-boot, serve the whole open from the
+    // vfs_server authority so it never reads the in-kernel engine (which would
+    // see a write-back-deferred create stale). `None` (degraded vfs stat) falls
+    // through to the in-kernel path; the boot window (vfs unregistered) skips
+    // this entirely.
+    if vfs_write_routable()
+        && let Some(result) = open_ext2_file_routed(
+            name, rel, readable, writable, create, append, truncate, mode_arg, cloexec, nonblock,
+        )
+    {
+        return result;
     }
 
     // Phase 88: when the vfs_server ext2 authority is registered, route the
@@ -11321,6 +12065,20 @@ pub(super) fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
 /// Read `buf.len()` bytes from process `pid`'s fd `fd` at file byte `offset`
 /// into the kernel buffer `buf`.  Does **not** advance the fd's offset.
 /// Returns the number of bytes actually read, or a negative errno on error.
+/// Phase 95b (Area A.2) — demand-fault entry point: read one page of file data
+/// for a lazy (`MAP_LAZY_FILE`) file-backed mapping into `buf`, by `(pid, fd,
+/// file_offset)`. Thin `pub(crate)` wrapper over [`kernel_read_fd_at`] (which
+/// handles `VfsService`/ext2/ramdisk/tmpfs/fat32), called from the page-fault
+/// handler. Returns bytes read (0 at EOF / past file end) or a negative errno.
+pub(crate) fn demand_read_file_page(
+    pid: u32,
+    fd: usize,
+    file_offset: usize,
+    buf: &mut [u8],
+) -> Result<usize, i64> {
+    kernel_read_fd_at(pid, fd, file_offset, buf)
+}
+
 fn kernel_read_fd_at(pid: u32, fd: usize, offset: usize, buf: &mut [u8]) -> Result<usize, i64> {
     if buf.is_empty() {
         return Ok(0);
@@ -11396,6 +12154,13 @@ fn kernel_read_fd_at(pid: u32, fd: usize, offset: usize, buf: &mut [u8]) -> Resu
                 },
                 None => Err(NEG_EIO as i64),
             }
+        }
+        // Phase 95b (Area A.2) — a `/usr` file on the default boot is served by
+        // the ring-3 `vfs_server`. Reading it here (pread-style, by `offset`)
+        // blocks on the vfs IPC reply; the demand-fault filler relies on this arm
+        // to demand-page a file-backed mapping whose backing fd is `VfsService`.
+        FdBackend::VfsService { service_handle, .. } => {
+            vfs_service_read_kernel(*service_handle, offset, buf)
         }
         _ => Err(NEG_EINVAL as i64),
     }
@@ -11726,7 +12491,7 @@ pub(super) fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 fn sys_mmap_file_backed(
-    _addr_hint: u64,
+    addr_hint: u64,
     len: u64,
     prot: u64,
     flags: u64,
@@ -11766,6 +12531,82 @@ fn sys_mmap_file_backed(
     };
     if total_size > 0x0000_8000_0000_0000 {
         return NEG_EINVAL;
+    }
+
+    // Phase 95b (Area A.2) — lazy, demand-paged file-backed mapping. The ld-musl
+    // loader sets `MAP_LAZY_FILE` on each `PT_LOAD` and keeps the fd open;
+    // install a VMA recording `(fd, file_offset)` and allocate NO frames. The
+    // page-fault handler then reads a faulting page straight from the file
+    // (`kernel_read_fd_at`, which now handles `VfsService`/ext2/ramdisk) on first
+    // touch — turning a 162 MB eager load into the small working set actually
+    // executed. A plain `MAP_PRIVATE` file mmap (no `MAP_LAZY_FILE`) keeps the
+    // eager path below, preserving POSIX mmap-then-close for callers like `lld`.
+    {
+        const MAP_PRIVATE: u64 = 0x02;
+        const MAP_FIXED: u64 = 0x10;
+        const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
+        if flags & kernel_core::mm::MAP_LAZY_FILE != 0 {
+            let pid = crate::process::current_pid();
+            // Stored VMA flags: MAP_PRIVATE + the lazy marker (MAP_FIXED is a
+            // placement directive, not a property of the resulting mapping).
+            let vma_flags = (flags & MAP_PRIVATE) | kernel_core::mm::MAP_LAZY_FILE;
+            let file_backing = Some(crate::process::FileBacking {
+                fd: fd as u32,
+                offset: file_offset as u64,
+            });
+
+            let base = if flags & MAP_FIXED != 0 {
+                const MMAP_MIN_ADDR: u64 = 0x1_0000;
+                if addr_hint < MMAP_MIN_ADDR
+                    || addr_hint & 0xFFF != 0
+                    || addr_hint
+                        .checked_add(total_size)
+                        .filter(|e| *e <= USER_SPACE_END)
+                        .is_none()
+                {
+                    return NEG_EINVAL;
+                }
+                // Replace whatever occupies [addr_hint, addr_hint+total_size) —
+                // the loader's PROT_NONE span reservation, split by remove_range
+                // — then record the lazy VMA at the exact requested address.
+                let _ = sys_linux_munmap(addr_hint, total_size);
+                addr_hint
+            } else {
+                match crate::process::with_shared_mm_mut(pid, |_b, mmap_next, _v| {
+                    let current = if *mmap_next == 0 {
+                        ANON_MMAP_BASE
+                    } else {
+                        *mmap_next
+                    };
+                    let end = current
+                        .checked_add(total_size)
+                        .filter(|v| *v <= USER_SPACE_END)?;
+                    *mmap_next = end;
+                    Some(current)
+                }) {
+                    Some(Some(b)) => b,
+                    _ => return NEG_EINVAL,
+                }
+            };
+
+            let _ = crate::process::with_shared_mm_mut(pid, |_b, _m, vma_tree| {
+                vma_tree.insert(crate::process::MemoryMapping {
+                    start: base,
+                    len: total_size,
+                    prot,
+                    flags: vma_flags,
+                    file_backing,
+                    pkey: kernel_core::pkey::PKEY_DEFAULT,
+                });
+            });
+            if let Some(addr_space) = {
+                let table = crate::process::PROCESS_TABLE.lock();
+                table.find(pid).and_then(|p| p.addr_space.as_ref().cloned())
+            } {
+                addr_space.bump_generation();
+            }
+            return base;
+        }
     }
 
     use x86_64::structures::paging::{PageTableFlags, PhysFrame, Size4KiB};
@@ -11873,7 +12714,16 @@ fn sys_mmap_file_backed(
         // Frame is pre-zeroed by allocate_frame_zeroed (D.4); fill from file.
         let frame_ptr = (phys_off + frame.start_address().as_u64()) as *mut u8;
 
-        let read_offset = file_offset + (i as usize) * 4096;
+        // Same unbounded-user-`file_offset` overflow guard as the lazy
+        // demand-fault path (`shared_vma_demand_file`): a near-`usize::MAX`
+        // page-aligned mmap offset would wrap `file_offset + i*4096` (release
+        // build, no panic). Treat overflow as a past-EOF page and leave the
+        // already-zeroed frame — never read a wrapped/aliased file region.
+        // (`i*4096 < total_size <= 2^47`, so only the outer add can overflow.)
+        let Some(read_offset) = file_offset.checked_add((i as usize) * 4096) else {
+            mapped_frames.push(frame);
+            continue;
+        };
         match kernel_read_fd_at(pid, fd, read_offset, &mut page_buf) {
             Ok(n) if n > 0 => unsafe {
                 core::ptr::copy_nonoverlapping(page_buf.as_ptr(), frame_ptr, n);
@@ -14734,7 +15584,14 @@ fn sys_block_write(start_sector: u64, count: u64, buf_ptr: u64, buf_len: u64) ->
     }
 
     match crate::blk::write_sectors(start_sector, count, &kernel_buf) {
-        Ok(()) => 0,
+        Ok(()) => {
+            // Phase 95c — record the written range so the next `invalidate_cache`
+            // (after this routed mutation) drops ONLY these blocks from the
+            // in-kernel ext2 cache, not the whole thing. This is the choke point
+            // for every `vfs_server` root mutation, so the record is complete.
+            crate::fs::ext2::record_dirty_root_write(start_sector, count);
+            0
+        }
         // Propagate the driver error byte through the documented errno mapping.
         // DriverRestarting (5) and Busy (4) → EAGAIN (-11); all others → EIO (-5).
         // Single source of truth: kernel_core::driver_ipc::block::block_error_to_neg_errno.
@@ -15078,6 +15935,37 @@ pub(super) fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
     } else {
         None
     };
+
+    // FIONBIO toggles O_NONBLOCK on ANY fd (pipe / socket / file), like Linux —
+    // NOT just TTYs, so it must be handled BEFORE the `is_tty` ENOTTY gate below.
+    // Rust std's `FileDesc::set_nonblocking` (Linux target) issues
+    // `ioctl(fd, FIONBIO, &c_int)`; `std::process::read_output` uses it to drain a
+    // child's stdout+stderr pipes via `poll` (see library/std/src/process.rs:2385,
+    // `wait_with_output`). Returning ENOTTY for the pipe fd made rustc panic while
+    // reading `rust-lld`'s output, blocking on-device codegen (Phase 95b). Mirror
+    // the `fcntl(F_SETFL, O_NONBLOCK)` path: set the `FdEntry.nonblock` flag the
+    // read paths already honor (EAGAIN when set + no data).
+    const FIONBIO: u64 = 0x5421;
+    if req == FIONBIO {
+        if backend.is_none() {
+            return NEG_EBADF;
+        }
+        let mut val = [0u8; 4];
+        if UserSliceRo::new(arg, val.len())
+            .and_then(|s| s.copy_to_kernel(&mut val))
+            .is_err()
+        {
+            return NEG_EFAULT;
+        }
+        let nonblock = i32::from_ne_bytes(val) != 0;
+        with_current_fd_mut(fd_idx, |slot| {
+            if let Some(e) = slot {
+                e.nonblock = nonblock;
+            }
+        });
+        return 0;
+    }
+
     let is_tty = matches!(
         &backend,
         Some(FdBackend::DeviceTTY { .. })
@@ -17138,6 +18026,18 @@ fn path_ino(abs_path: &str) -> u64 {
     if crate::fs::ext2::is_mounted()
         && let Some(rel) = ext2_root_path(abs_path)
     {
+        // Engine-unification Phase A: resolve the inode through the `vfs_server`
+        // authority whenever it is registered, so getdents64 `d_ino` reflects a
+        // routed (possibly write-back-deferred) create/rename and the in-kernel
+        // ext2 engine is not consulted for a root read post-boot. The cached
+        // `vfs_service_stat_path` is the SAME source `stat`/`path_filemeta` use,
+        // so `d_ino` always matches `st_ino` for the entry. The in-kernel
+        // `EXT2_VOLUME` resolve stays as the boot-window / degraded fallback.
+        if vfs_service_can_handle_path(abs_path)
+            && let Ok(st) = vfs_service_stat_path(abs_path)
+        {
+            return st.ino;
+        }
         let vol = crate::fs::ext2::EXT2_VOLUME.lock();
         if let Some(vol) = vol.as_ref()
             && let Ok(ino) = vol.resolve_path(rel)
@@ -17199,6 +18099,15 @@ pub(super) fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     entries.push((alloc::string::String::from("."), DT_DIR));
     entries.push((alloc::string::String::from(".."), DT_DIR));
 
+    // Engine-unification Phase A: when a root/overlaid directory's ext2 entries
+    // are sourced from `vfs_server`, the server already returns each child's
+    // REAL d_ino — stash it by name so the serialization loop emits it directly
+    // instead of a second per-entry `path_ino` resolve. A name absent from this
+    // map (`.`/`..`, ramdisk overlays, virtual mounts, tmpfs/procfs/fat32) falls
+    // back to `path_ino` as before.
+    let mut vfs_inos: alloc::collections::BTreeMap<alloc::string::String, u64> =
+        alloc::collections::BTreeMap::new();
+
     if crate::fs::procfs::is_dir(&dir_path) {
         match crate::fs::procfs::list_dir(&dir_path) {
             Some(children) => {
@@ -17253,15 +18162,31 @@ pub(super) fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         // Start with ext2 root entries if mounted.
         let mut seen = alloc::collections::BTreeSet::new();
         if crate::fs::ext2::is_mounted() {
-            let children = {
-                let vol = crate::fs::ext2::EXT2_VOLUME.lock();
-                vol.as_ref().and_then(|vol| vol.list_dir("/").ok())
+            // Engine-unification Phase A: source the ext2 root's entries from the
+            // `vfs_server` authority when registered (real d_ino, write-back-
+            // visible). The in-kernel `list_dir` is the boot-window fallback.
+            let routed = if vfs_can_list_ext2_dir("/") {
+                vfs_service_list_dir_entries("/").ok()
+            } else {
+                None
             };
-            if let Some(children) = children {
-                for (name, is_dir) in children {
+            if let Some(routed) = routed {
+                for (name, d_type, d_ino) in routed {
                     seen.insert(name.clone());
-                    let child_path = alloc::format!("/{name}");
-                    entries.push((name, dirent_type_for_path(&child_path, is_dir)));
+                    vfs_inos.insert(name.clone(), d_ino);
+                    entries.push((name, d_type));
+                }
+            } else {
+                let children = {
+                    let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+                    vol.as_ref().and_then(|vol| vol.list_dir("/").ok())
+                };
+                if let Some(children) = children {
+                    for (name, is_dir) in children {
+                        seen.insert(name.clone());
+                        let child_path = alloc::format!("/{name}");
+                        entries.push((name, dirent_type_for_path(&child_path, is_dir)));
+                    }
                 }
             }
         }
@@ -17317,19 +18242,36 @@ pub(super) fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                     entries.push((name, if is_dir { DT_DIR } else { DT_REG }));
                 }
             }
-            let children = {
-                let vol = crate::fs::ext2::EXT2_VOLUME.lock();
-                vol.as_ref().and_then(|vol| vol.list_dir(rel).ok())
+            // Engine-unification Phase A: source the ext2 portion of an overlaid
+            // dir from the `vfs_server` authority when registered (real d_ino,
+            // write-back-visible); the in-kernel `list_dir` is the fallback.
+            let routed = if vfs_can_list_ext2_dir(&dir_path) {
+                vfs_service_list_dir_entries(&dir_path).ok()
+            } else {
+                None
             };
-            if let Some(children) = children {
-                for (name, is_dir) in children {
+            if let Some(routed) = routed {
+                for (name, d_type, d_ino) in routed {
                     if !seen.contains(&name) {
-                        let child_path = if dir_path == "/" {
-                            alloc::format!("/{name}")
-                        } else {
-                            alloc::format!("{dir_path}/{name}")
-                        };
-                        entries.push((name, dirent_type_for_path(&child_path, is_dir)));
+                        vfs_inos.insert(name.clone(), d_ino);
+                        entries.push((name, d_type));
+                    }
+                }
+            } else {
+                let children = {
+                    let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+                    vol.as_ref().and_then(|vol| vol.list_dir(rel).ok())
+                };
+                if let Some(children) = children {
+                    for (name, is_dir) in children {
+                        if !seen.contains(&name) {
+                            let child_path = if dir_path == "/" {
+                                alloc::format!("/{name}")
+                            } else {
+                                alloc::format!("{dir_path}/{name}")
+                            };
+                            entries.push((name, dirent_type_for_path(&child_path, is_dir)));
+                        }
                     }
                 }
             }
@@ -17403,7 +18345,14 @@ pub(super) fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         } else {
             alloc::format!("{dir_path}/{name}")
         };
-        let d_ino: u64 = path_ino(&child_abs);
+        // Engine-unification Phase A: prefer the real d_ino the `vfs_server`
+        // already returned for a routed ext2 child; only resolve via `path_ino`
+        // for entries with no stashed inode (`.`/`..`, ramdisk, virtual mounts,
+        // tmpfs/procfs/fat32).
+        let d_ino: u64 = match vfs_inos.get(name) {
+            Some(&ino) => ino,
+            None => path_ino(&child_abs),
+        };
         let d_off: i64 = (idx + 1) as i64;
         out[start..start + 8].copy_from_slice(&d_ino.to_ne_bytes());
         out[start + 8..start + 16].copy_from_slice(&d_off.to_ne_bytes());
@@ -18798,6 +19747,24 @@ pub(super) fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
                 return 0;
             }
 
+            // Pre-fault the futex word with NO lock held. For a dynamic binary
+            // the word can live in a cold MAP_LAZY_FILE page whose demand-fault
+            // blocks on a vfs_server IPC; faulting it under FUTEX_TABLE (an
+            // IrqSafeMutex held across the resulting context switch) strands the
+            // lock and wedges every core that touches a futex — the Phase 95b
+            // lazy-file-mmap regression that hung multithreaded dynamic rust-lld.
+            // Touching it here makes the page present so the compare-read under
+            // the lock below cannot block.
+            {
+                let mut probe = [0u8; 4];
+                if UserSliceRo::new(uaddr, probe.len())
+                    .and_then(|s| s.copy_to_kernel(&mut probe))
+                    .is_err()
+                {
+                    return NEG_EFAULT;
+                }
+            }
+
             let woken_flag = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
 
             {
@@ -18954,6 +19921,20 @@ pub(super) fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
 
             let mut woken_tids = alloc::vec::Vec::new();
             let mut requeued = 0usize;
+            // Pre-fault uaddr with NO lock held before the CMP_REQUEUE compare
+            // (see FUTEX_WAIT): the under-lock read below would otherwise
+            // demand-fault a cold lazy-file page and wedge all cores. musl's
+            // pthread_cond_signal/broadcast requeues onto a global mutex word,
+            // which is exactly such a page for a dynamic binary.
+            if cmd == FUTEX_CMP_REQUEUE {
+                let mut probe = [0u8; 4];
+                if UserSliceRo::new(uaddr, probe.len())
+                    .and_then(|s| s.copy_to_kernel(&mut probe))
+                    .is_err()
+                {
+                    return NEG_EFAULT;
+                }
+            }
             {
                 let mut table = FUTEX_TABLE.lock();
                 // CMP_REQUEUE re-checks `*uaddr == val3` under the table lock (so a

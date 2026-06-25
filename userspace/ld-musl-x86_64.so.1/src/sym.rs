@@ -11,7 +11,9 @@
 //! first DSO that defines `name`. Behavior matches the Phase 76b
 //! free-function `lookup_symbol` byte-for-byte when `version` is
 //! `None`: SysV global scope, `STN_UNDEF == 0` terminator,
-//! `st_value != 0` filter, `nchain` hops bound.
+//! `st_value != 0` filter, `nchain` hops bound. (The TLS path —
+//! [`lookup_tls`] — instead tests `st_shndx != SHN_UNDEF` so a defined
+//! thread-local at module offset 0 resolves; see `lookup_in_dso`.)
 //!
 //! ## Backend dispatch
 //!
@@ -47,6 +49,14 @@ use ldso_core::ver::{
 };
 
 use crate::plt;
+
+/// `SHN_UNDEF` — the ELF "undefined section" index. A symbol with
+/// `st_shndx == SHN_UNDEF` is a *reference* (undefined here); any other index
+/// means the symbol is *defined* in this object. This is the correct
+/// definedness test for symbol lookup — unlike `st_value != 0`, it accepts a
+/// DEFINED symbol whose `st_value` is legitimately 0 (e.g. a TLS symbol at
+/// module offset 0).
+const SHN_UNDEF: u16 = 0;
 
 /// Backend chosen for one DSO's symbol-table walk.
 ///
@@ -90,7 +100,7 @@ pub unsafe fn lookup(scope: &[LoadedDso], name: &[u8], version: Option<&[u8]>) -
     // check the DSO's version constraint matches.
     let mut name_matched_somewhere = false;
     for dso in scope {
-        let hit = match unsafe { lookup_in_dso(dso, name) } {
+        let hit = match unsafe { lookup_in_dso(dso, name, false) } {
             Some(h) => h,
             None => continue,
         };
@@ -145,7 +155,7 @@ pub unsafe fn lookup(scope: &[LoadedDso], name: &[u8], version: Option<&[u8]>) -
         // pass-1 unversioned path: non-default hidden exports must not
         // surface during fallback either.
         for dso in scope {
-            if let Some(hit) = unsafe { lookup_in_dso(dso, name) } {
+            if let Some(hit) = unsafe { lookup_in_dso(dso, name, false) } {
                 if unsafe { dso_symbol_is_hidden(dso, hit.sym_idx) } {
                     continue;
                 }
@@ -157,10 +167,43 @@ pub unsafe fn lookup(scope: &[LoadedDso], name: &[u8], version: Option<&[u8]>) -
     None
 }
 
+/// Phase 95c follow-up — resolve a TLS symbol `name` across `scope` to its
+/// *defining* DSO index and the symbol's `st_value` (the offset within that
+/// DSO's TLS block, NOT a load address). Used by the TLS relocation arms to map
+/// a cross-DSO thread-local reference to the module (`tls_id`/`tls_offset`) that
+/// defines it. Returns `None` when no DSO in scope defines the name.
+///
+/// The per-DSO walk shares `lookup_in_dso`, whose definedness test is
+/// `st_shndx != SHN_UNDEF` — so a TLS symbol defined at module offset 0
+/// (`st_value == 0`, e.g. libLLVM's `llvm::parallel::threadIndex`) IS found
+/// cross-DSO. (A prior `st_value != 0` filter wrongly rejected it, which broke
+/// initial-exec resolution of such thread-locals — the rust-lld worker bug.)
+///
+/// # Safety
+/// Same contract as [`lookup`] — every `LoadedDso` in `scope` whose hash /
+/// symtab / strtab pointers are populated must reference its mapped image.
+pub unsafe fn lookup_tls(scope: &[LoadedDso], name: &[u8]) -> Option<(usize, u64)> {
+    for (idx, dso) in scope.iter().enumerate() {
+        if let Some(hit) = unsafe { lookup_in_dso(dso, name, true) } {
+            // `DsoHit.addr == load_bias + st_value`, so recover the raw
+            // module-relative `st_value` the TLS layout/DTV index against.
+            return Some((idx, hit.addr.wrapping_sub(dso.load_bias)));
+        }
+    }
+    None
+}
+
 /// Pick the GNU or SysV backend for `dso` based on which hash table
 /// it carries and run it. Returns the resolved address + sym_idx if
 /// the DSO defines `name`, or `None` if it doesn't.
-unsafe fn lookup_in_dso(dso: &LoadedDso, name: &[u8]) -> Option<DsoHit> {
+///
+/// `accept_tls_zero` selects the definedness test. The regular symbol path
+/// (`lookup`) passes `false` and keeps the historical `st_value != 0` filter
+/// byte-for-byte (changing it broke rustc startup — a non-TLS symbol legitimately
+/// at value 0 in `librustc_driver.so` mis-resolved). The TLS path (`lookup_tls`)
+/// passes `true` and instead tests `st_shndx != SHN_UNDEF`, so a DEFINED TLS
+/// symbol at module offset 0 (e.g. libLLVM's `threadIndex`) is found cross-DSO.
+unsafe fn lookup_in_dso(dso: &LoadedDso, name: &[u8], accept_tls_zero: bool) -> Option<DsoHit> {
     let backend = if dso.dyn_.gnu_hash.is_some() {
         Backend::Gnu
     } else if dso.dyn_.hash.is_some() {
@@ -169,8 +212,8 @@ unsafe fn lookup_in_dso(dso: &LoadedDso, name: &[u8]) -> Option<DsoHit> {
         return None;
     };
     match backend {
-        Backend::SysV => unsafe { lookup_sysv(dso, name) },
-        Backend::Gnu => unsafe { lookup_gnu(dso, name) },
+        Backend::SysV => unsafe { lookup_sysv(dso, name, accept_tls_zero) },
+        Backend::Gnu => unsafe { lookup_gnu(dso, name, accept_tls_zero) },
     }
 }
 
@@ -292,7 +335,7 @@ unsafe fn max_verdef_bytes(dso: &LoadedDso) -> usize {
 /// elements are read. Chain hops are capped via the GNU end-marker
 /// bit, a hard `MAX_HOPS` ceiling, and the per-element hash-array
 /// bound (whichever comes first).
-unsafe fn lookup_gnu(dso: &LoadedDso, name: &[u8]) -> Option<DsoHit> {
+unsafe fn lookup_gnu(dso: &LoadedDso, name: &[u8], accept_tls_zero: bool) -> Option<DsoHit> {
     let header = dso.dyn_.gnu_hash?.as_ptr();
     let symtab = dso.dyn_.symtab?.as_ptr();
     let strtab = dso.dyn_.strtab?.as_ptr();
@@ -385,7 +428,16 @@ unsafe fn lookup_gnu(dso: &LoadedDso, name: &[u8]) -> Option<DsoHit> {
         if (h | 1) == (h2 | 1) {
             let sym = unsafe { crate::sym_entry(symtab, sym_idx, dso.load_bias, dso.image_len) }?;
             let nm = unsafe { crate::strtab_get(strtab, sym.st_name as u64, dso.dyn_.strsz) };
-            if nm == name && sym.st_value != 0 {
+            // Definedness test (see `lookup_in_dso`): the TLS path accepts a
+            // DEFINED symbol at module offset 0 (`st_value == 0`, e.g. libLLVM's
+            // `threadIndex`) via `st_shndx != SHN_UNDEF`; the regular path keeps
+            // the historical `st_value != 0` filter unchanged.
+            let defined = if accept_tls_zero {
+                sym.st_shndx != SHN_UNDEF
+            } else {
+                sym.st_value != 0
+            };
+            if nm == name && defined {
                 return Some(DsoHit {
                     addr: dso.load_bias.wrapping_add(sym.st_value),
                     sym_idx,
@@ -437,7 +489,7 @@ fn _gnu_hash_lookup_keepalive() -> GnuLookupOutcome {
 /// out-of-image read. The symtab read routes through the bounded
 /// `crate::sym_entry`. (`image_len == 0` is the placeholder shape — the
 /// span is unknown and the legacy `nchain`-relative guards apply.)
-unsafe fn lookup_sysv(dso: &LoadedDso, name: &[u8]) -> Option<DsoHit> {
+unsafe fn lookup_sysv(dso: &LoadedDso, name: &[u8], accept_tls_zero: bool) -> Option<DsoHit> {
     let hash_ptr = dso.dyn_.hash?.as_ptr();
     let symtab = dso.dyn_.symtab?.as_ptr();
     let strtab = dso.dyn_.strtab?.as_ptr();
@@ -486,7 +538,16 @@ unsafe fn lookup_sysv(dso: &LoadedDso, name: &[u8]) -> Option<DsoHit> {
         }
         let sym = unsafe { crate::sym_entry(symtab, idx, dso.load_bias, dso.image_len) }?;
         let nm = unsafe { crate::strtab_get(strtab, sym.st_name as u64, dso.dyn_.strsz) };
-        if nm == name && sym.st_value != 0 {
+        // Definedness test (see `lookup_in_dso`). DT_HASH (unlike DT_GNU_HASH)
+        // includes undefined entries, so the TLS path's `st_shndx != SHN_UNDEF`
+        // is what rejects references while still accepting a DEFINED TLS symbol
+        // at module offset 0; the regular path keeps `st_value != 0` unchanged.
+        let defined = if accept_tls_zero {
+            sym.st_shndx != SHN_UNDEF
+        } else {
+            sym.st_value != 0
+        };
+        if nm == name && defined {
             return Some(DsoHit {
                 addr: dso.load_bias.wrapping_add(sym.st_value),
                 sym_idx: idx,

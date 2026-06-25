@@ -12,8 +12,8 @@
 use crate::elf64::{
     DT_FINI, DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_GNU_HASH, DT_HASH, DT_INIT, DT_INIT_ARRAY,
     DT_INIT_ARRAYSZ, DT_JMPREL, DT_NEEDED, DT_NULL, DT_PLTGOT, DT_PLTREL, DT_PLTRELSZ, DT_RELA,
-    DT_RELAENT, DT_RELASZ, DT_SONAME, DT_STRSZ, DT_STRTAB, DT_SYMENT, DT_SYMTAB, DT_VERDEF,
-    DT_VERDEFNUM, DT_VERNEED, DT_VERNEEDNUM, DT_VERSYM, Dyn, Sym,
+    DT_RELAENT, DT_RELASZ, DT_RPATH, DT_RUNPATH, DT_SONAME, DT_STRSZ, DT_STRTAB, DT_SYMENT,
+    DT_SYMTAB, DT_VERDEF, DT_VERDEFNUM, DT_VERNEED, DT_VERNEEDNUM, DT_VERSYM, Dyn, Sym,
 };
 use core::ptr::NonNull;
 
@@ -94,6 +94,12 @@ pub struct DynamicSection {
     /// or `u64::MAX` if absent (no `NonNull` here because zero is a
     /// legal offset).
     pub soname: u64,
+    /// `DT_RUNPATH` (or legacy `DT_RPATH`) — offset into `strtab` of a
+    /// colon-separated library search-path list, or `u64::MAX` if absent.
+    /// Supports `$ORIGIN` expansion. Phase 95b: rust-lld carries
+    /// `RUNPATH=$ORIGIN/../lib` to locate its bundled `libLLVM.so`.
+    /// `DT_RUNPATH` takes precedence over `DT_RPATH` when both are present.
+    pub runpath: u64,
     /// `DT_NEEDED` entries — each value is the offset into `strtab`
     /// of one needed library name. Up to `MAX_NEEDED` entries.
     pub needed: [u64; MAX_NEEDED],
@@ -131,6 +137,7 @@ impl DynamicSection {
             verneed: None,
             verneednum: 0,
             soname: u64::MAX,
+            runpath: u64::MAX,
             needed: [0; MAX_NEEDED],
             n_needed: 0,
         }
@@ -180,6 +187,12 @@ impl DynamicSection {
                     out.init = NonNull::new((entry.d_val.wrapping_add(load_bias)) as *mut u8);
                 }
                 DT_SONAME => out.soname = entry.d_val,
+                // Phase 95b — DT_RUNPATH (preferred) / DT_RPATH (legacy). When
+                // both appear, RUNPATH wins per the ELF spec; since RUNPATH (29)
+                // and RPATH (15) can appear in either tag order, only let RPATH
+                // set the field when RUNPATH has not already (sentinel u64::MAX).
+                DT_RUNPATH => out.runpath = entry.d_val,
+                DT_RPATH if out.runpath == u64::MAX => out.runpath = entry.d_val,
                 DT_PLTREL => out.pltrel = entry.d_val as i64,
                 DT_JMPREL => {
                     out.jmprel = NonNull::new((entry.d_val.wrapping_add(load_bias)) as *mut u8);
@@ -317,6 +330,29 @@ pub fn lookup_in_hash_table(
 // drive without invoking real syscalls.
 // ---------------------------------------------------------------------------
 
+/// Per-DSO thread-local-storage descriptor (Phase 95c follow-up — multi-module
+/// static TLS). Captured from a DSO's `PT_TLS` program header at load time; the
+/// runtime-assigned `tls_id` / `tls_offset` are filled in by the loader's TLS
+/// module-assignment pass (run **before** relocations) so the `DTPMOD64` /
+/// `TPOFF64` relocation arms and the static TLS block + DTV can reference this
+/// module. A DSO with no `PT_TLS` carries `None`.
+#[derive(Debug, Clone, Copy)]
+pub struct DsoTls {
+    /// Runtime address of the `.tdata` template (`load_bias + p_vaddr`).
+    pub image_vaddr: u64,
+    /// `p_memsz` — total TLS size (`.tdata` initialized image + `.tbss`).
+    pub memsz: u64,
+    /// `p_filesz` — initialized (`.tdata`) bytes to copy; the rest is zeroed.
+    pub filesz: u64,
+    /// `p_align` (forced to `>= 1`).
+    pub align: u64,
+    /// 1-based module id (`0` = unassigned). Indexes the thread's DTV.
+    pub tls_id: u32,
+    /// Variant-II distance below the thread pointer: the module's block starts
+    /// at `TP - tls_offset` (`0` = unassigned).
+    pub tls_offset: u64,
+}
+
 /// One mapped DSO. `load_bias` + `image_len` are the byte range the
 /// runtime `mmap`ed for the whole image; `dyn_` is the parsed
 /// `PT_DYNAMIC` view rebased against `load_bias`.
@@ -334,6 +370,10 @@ pub struct LoadedDso {
     /// Parsed `PT_DYNAMIC` view, pointers rebased against
     /// `load_bias`.
     pub dyn_: DynamicSection,
+    /// The DSO's `PT_TLS` module (Phase 95c follow-up), or `None` if it carries
+    /// no thread-local storage. `tls_id` / `tls_offset` are assigned by the
+    /// loader before the relocation pass.
+    pub tls: Option<DsoTls>,
 }
 
 impl LoadedDso {
@@ -345,6 +385,7 @@ impl LoadedDso {
             load_bias: 0,
             image_len: 0,
             dyn_: DynamicSection::empty(),
+            tls: None,
         }
     }
 }
@@ -776,6 +817,7 @@ mod tests {
             load_bias: 0x4000_0000,
             image_len: 0x3000, // page-aligned, 12 KiB
             dyn_: DynamicSection::empty(),
+            tls: None,
         };
         let mut observed: Option<(u64, u64)> = None;
         let r = unmap_dso(&d, |addr, len| {
@@ -792,6 +834,7 @@ mod tests {
             load_bias: 0x4000_0000,
             image_len: 0x3000,
             dyn_: DynamicSection::empty(),
+            tls: None,
         };
         let r = unmap_dso(&d, |_addr, _len| -22); // -EINVAL
         assert_eq!(r, Err(UnmapError::MunmapFailed(-22)));

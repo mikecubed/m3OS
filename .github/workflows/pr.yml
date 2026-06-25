@@ -53,13 +53,14 @@ jobs:
       - name: Allocator loom concurrency tests
         run: RUSTFLAGS='--cfg loom' cargo test -p kernel-core --target x86_64-unknown-linux-gnu --test allocator_loom
 
-  # Headless QEMU gates on the PR. Runs in parallel with `check`. Timeouts are
-  # deliberately generous (vs. build.yml's tighter post-merge lanes) because
-  # GitHub runners have no KVM — QEMU executes under TCG, which is markedly
-  # slower than developer hardware. The device-smoke NVMe lane was unreliable
-  # under TCG until the ring-3 NVMe driver was fixed to enable MSI-X *before*
-  # creating its I/O completion queue (PR re-enabling this gate); it is now
-  # verified 10/10 under TCG, so both NVMe (± IOMMU) lanes are gated here.
+  # Headless QEMU gates on the PR. Runs in parallel with `check`. The job enables
+  # KVM best-effort (the "Enable KVM" step below — GitHub-hosted runners expose
+  # /dev/kvm per the Phase 95 completion plan) and gracefully falls back to TCG if
+  # it is ever unavailable, so the deliberately generous timeouts (vs. build.yml's
+  # tighter post-merge lanes) still cover the TCG-fallback case. The device-smoke
+  # NVMe lane was unreliable under TCG until the ring-3 NVMe driver was fixed to
+  # enable MSI-X *before* creating its I/O completion queue; it is now verified
+  # 10/10, so both NVMe (± IOMMU) lanes are gated here.
   qemu-gates:
     name: QEMU smoke + device + regression gates
     runs-on: ubuntu-latest
@@ -77,6 +78,26 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 ovmf musl-tools qemu-utils e2fsprogs
+
+      - name: Enable KVM (best-effort; falls back to TCG)
+        # Phase 95 completion plan verified GitHub-hosted runners expose /dev/kvm
+        # (Azure EPYC, nested KVM). The udev rule + chmod make the kvm node usable
+        # by the non-root runner user; we set M3OS_KVM=1 ONLY when /dev/kvm is
+        # actually writable, so the gates run KVM-accelerated where available and
+        # gracefully fall back to TCG otherwise — this never breaks CI if a future
+        # runner image drops KVM. (Azure masks PKU, so PKU-dependent JIT gates are
+        # unaffected; KVM here buys speed, not PKU.)
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm || true
+          [ -e /dev/kvm ] && sudo chmod 666 /dev/kvm || true
+          if [ -w /dev/kvm ]; then
+            echo "M3OS_KVM=1" >> "$GITHUB_ENV"
+            echo "KVM available — gates run KVM-accelerated (M3OS_KVM=1)."
+          else
+            echo "KVM unavailable — gates run under TCG."
+          fi
 
       - name: Cargo cache
         uses: actions/cache@v5
@@ -108,7 +129,13 @@ jobs:
           # Regenerate the data disk so a stale cached image cannot mask a
           # build/boot regression (mirrors build.yml's smoke-test recipe).
           rm -f target/x86_64-unknown-none/release/disk.img
-          cargo xtask smoke-test --timeout 400
+          # Tee the full serial output (incl. any "=== CRASH DIAGNOSTICS ==="
+          # register dump + trace ring) to a file so the failure-artifact upload
+          # below captures the COMPLETE backtrace for offline addr2line against
+          # the uploaded kernel ELF. The GH default shell is `bash -eo pipefail`,
+          # so a smoke-test failure still fails the step despite the tee.
+          mkdir -p target/ci-crash
+          cargo xtask smoke-test --timeout 400 2>&1 | tee target/ci-crash/smoke-test.log
 
       - name: "Device-smoke (NVMe ± IOMMU + e1000 IOMMU)"
         run: |
@@ -193,5 +220,13 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: pr-regression-artifacts
-          path: target/regression/
+          # Includes the exact CI-built kernel ELF + teed smoke-test serial log
+          # so a CI-only crash (e.g. a layout-exposed kernel fault that does not
+          # reproduce locally) can be symbolized offline: addr2line the crash rip
+          # (rip − PIE load base = ELF file vaddr) against this kernel binary.
+          path: |
+            target/regression/
+            target/ci-crash/
+            target/x86_64-unknown-none/release/kernel
           retention-days: 14
+          if-no-files-found: ignore

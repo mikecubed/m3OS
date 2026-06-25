@@ -1,10 +1,59 @@
 # Phase 95b - On-Device `rustc` Code Generation (Native Rust toolchain, part B)
 
-**Status:** Planned
+**Status:** ✅ Complete (milestone) — **`RUSTC_OK` ACHIEVED + MULTITHREADED (2026-06-25).** `rustc hello.rs` compiles, **multithreaded `rust-lld`** links it, and the native binary runs on-device (`RUSTC_OK`); `rustc-smoke`'s codegen arm PASSES under `M3OS_KVM=1` (0 kernel faults, ~53 s fresh-install). The `--threads=1` constraint is DROPPED — the cross-DSO TLS-at-offset-0 loader bug (rust-lld's worker `threadIndex`) and the thread-group fatal-kill (`addr=0x8`) robustness hole are both fixed. Areas A+B (streaming demand-paged file-backed loader) landed earlier and cleared Phase 95's eager-load wall. **Deferred follow-up:** running the arm under plain TCG (Phase 95c VFS throughput) and the cargo/proc-macro stretch (Track E — a separate `cargo-smoke` gate). ➜ Record: [`docs/handoffs/2026-06-24-phase-95-completion-plan.md`](../handoffs/2026-06-24-phase-95-completion-plan.md). (The "Outcome" below is the pre-page-table-fix record, superseded by the completion plan.)
 **Source Ref:** phase-95b
 **Depends on:** Phase 95 ✅ (host toolchain + on-device `pkg install rust` + the precise on-device-load diagnosis), Phase 93 ✅ (`libc.so` + loader TLS — the dynamic `rustc` interpreter and the proc-macro `dlopen` target), Phase 76 → 76d ✅ (the from-scratch `ld-musl` dynamic loader 95b reworks), Phase 85d ✅ (streaming ELF exec / `pread64` / LLD), Phase 87 ✅ (VFS bulk-I/O), the SMP/TLB/kstack handoff [`docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md`](../handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md)
 **Builds on:** Phase 95 cross-built a **dynamic** musl `rustc` 1.96.0 (+ prebuilt `std` sysroot + bundled `rust-lld`), packaged it behind `M3OS_WITH_RUST`, and proved `pkg install rust` works on-device — but the on-device **code-generation milestone** (`rustc hello.rs` → `RUSTC_OK`) hit a wall: loading the ~162 MB dynamic `librustc_driver.so` through the loader's whole-file read+copy strategy is CPU-bound and times out. Phase 95b clears that wall and lands the milestone, then takes the `cargo` + proc-macro stretch (Phase 95's old Track D).
 **Primary Components:** `userspace/ld-musl-x86_64.so.1/src/main.rs` (the per-DSO load path), `kernel/src/arch/x86_64/syscall/mod.rs` (`sys_mmap_file_backed`), `kernel/src/mm/` (file-backed demand-fault VMA backing), `kernel/src/smp/tlb.rs` (shootdown batching), the kernel-stack allocator + the `#PF`/`#DF` recovery path, `xtask/src/main.rs` (`cmd_rustc_smoke` `RUSTC_OK` arm, `cmd_cargo_smoke`), `xtask/src/port_build.rs` (`build_rust` — stage `cargo`)
+
+## Outcome (this pass)
+
+> **➜ SUPERSEDED IN PART (2026-06-24).** This Outcome predates the page-table fix
+> (`841fd53f`) and the KVM measurements. Corrections: rustc **does** now run userspace
+> (`--version`/`--print sysroot` pass); the "rustc never runs userspace / VFS throughput is
+> the binding constraint / ~40-min install" diagnosis below was a **pre-fix, TCG** picture
+> (under KVM the install is ~25 s). The real `RUSTC_OK` blocker is the `rustc hello.rs`
+> compile-thread stall. See the
+> [completion plan](../handoffs/2026-06-24-phase-95-completion-plan.md).
+
+**[Superseded pre-fix picture — the milestone has since LANDED; see the header + the
+[completion plan](../handoffs/2026-06-24-phase-95-completion-plan.md). Kept as the forensic
+record of the bring-up.]**
+
+- **Area A landed & validated.** The `ld-musl` loader + kernel mm were reworked from
+  whole-file read+copy to **streaming / demand-paged file-backed** loading: a new
+  opt-in `MAP_LAZY_FILE` flag installs a frameless file-backed VMA, and the page-fault
+  handler demand-fills a faulting page straight from the backing file — including the
+  ring-3 `vfs_server` case via a **blocking IPC issued from the page-fault handler**
+  (the kernel's first). `dynamic-hello-smoke` PASSES (`DYNAMIC_HELLO:ok` + `DLOPEN:ok`),
+  proving the loader + the novel fault-context read end-to-end. A 64 KiB **readahead**
+  cluster amortises the per-page reads. **This cleared the Phase 95 wall** (the eager
+  162 MB read+copy that was CPU/IPC-bound).
+- **Area B landed.** Demand-fault page commits (lazy-file, anon, stack/brk) now issue
+  **zero** cross-core TLB-shootdown IPIs — a not-present → present transition needs no
+  invalidation. `smp-smoke` is the guard.
+- **Area C is unnecessary.** The kstack overflow was a symptom of the eager-read chain;
+  A.2 removed it, and rustc no longer overflows the 64 KiB kstack.
+- **Area D (the `RUSTC_OK` milestone) — [SUPERSEDED pre-fix re-diagnosis; the milestone
+  LANDED 2026-06-25, see the header].** At the time, with the eager
+  load gone, `rustc --version` appeared to block for a **different, deeper** reason:
+  instrumentation (a timer-ISR userspace-RIP sampler + a demand-fill page counter +
+  a syscall sampler, on SMP=1 and SMP=4 under KVM) showed **rustc never runs userspace**
+  (zero RIP samples), **demand-pages < 1 MB** of `librustc_driver.so`, and is **blocked
+  in the kernel** — the loader loads the small `libc.so` fine but **wedges/never loads
+  the 162 MB `librustc_driver.so`**. Further tracing pointed *upstream* of A.2: the
+  dominant cost is the ~368 MB `pkg install rust` over the **~100–200 KB/s ring-3 VFS**
+  (≈40 min of I/O, at/over the 50-min install-step timeout — so the on-device rustc is
+  likely never properly installed). The binding constraint is **VFS / block-I/O
+  throughput**, which A.2's demand-side laziness cannot fix. *(This conclusion was a
+  pre-page-table-fix, TCG-only artifact. Under KVM the FS is fast and the milestone in
+  fact landed via the multithreaded-TLS loader fix — see the header. [Phase 95c](./95c-vfs-block-io-perf.md)
+  remains the supply-side follow-up for a **TCG-runnable** `rustc-smoke` gate, not the
+  `RUSTC_OK` blocker.)*
+- **Area E (cargo + proc-macros) was not started** (gated behind D).
+
+The remainder of this doc describes the originally-planned design; the
+[task list](./tasks/95b-on-device-rustc-tasks.md) has the per-track outcomes.
 
 ## Milestone Goal
 

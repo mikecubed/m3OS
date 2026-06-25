@@ -458,8 +458,19 @@ unsafe fn map_load_segment(
             let frame = frame_allocator::allocate_frame_zeroed().ok_or(ElfError::OutOfFrames)?;
 
             // Map the page; use ignore() since mapper may not be the current CR3.
+            // Force PRESENT|WRITABLE|USER on the intermediate tables: a RO
+            // PT_LOAD segment (.text/.rodata) has `flags` without WRITABLE, and
+            // the default `map_to` would derive non-writable intermediates from
+            // it — a later writable anon mmap reusing that 1 GiB/2 MiB region
+            // would then fault forever (see `user_space::USER_PARENT_TABLE_FLAGS`).
             mapper
-                .map_to(page, frame, flags, &mut frame_alloc)
+                .map_to_with_table_flags(
+                    page,
+                    frame,
+                    flags,
+                    super::user_space::USER_PARENT_TABLE_FLAGS,
+                    &mut frame_alloc,
+                )
                 .map_err(|_| ElfError::MappingFailed("map_to failed for PT_LOAD segment"))?
                 .ignore();
 
@@ -554,7 +565,13 @@ unsafe fn map_user_stack(mapper: &mut OffsetPageTable<'_>) -> Result<u64, ElfErr
             let frame = frame_allocator::allocate_frame_zeroed().ok_or(ElfError::OutOfFrames)?;
 
             mapper
-                .map_to(page, frame, flags, &mut frame_alloc)
+                .map_to_with_table_flags(
+                    page,
+                    frame,
+                    flags,
+                    super::user_space::USER_PARENT_TABLE_FLAGS,
+                    &mut frame_alloc,
+                )
                 .map_err(|_| ElfError::MappingFailed("map_to failed for stack page"))?
                 .ignore();
         }
@@ -600,13 +617,19 @@ pub unsafe fn setup_abi_stack(
     argv: &[&[u8]],
     aux: ElfAuxInfo,
 ) -> Result<u64, ElfError> {
-    unsafe { setup_abi_stack_with_envp(stack_top, mapper, phys_off, argv, &[], aux) }
+    unsafe { setup_abi_stack_with_envp(stack_top, mapper, phys_off, argv, &[], aux, None) }
 }
 
 /// Build the SysV AMD64 ABI initial stack with argv and envp.
 ///
 /// Phase 14 extension: supports passing environment variables to the
 /// new process via the envp array.
+///
+/// `exec_path` (Phase 95b) is the resolved `execve` pathname. When `Some`,
+/// it is written into the string region and referenced by `AT_EXECFN` so the
+/// dynamic linker can expand `$ORIGIN` in `DT_RUNPATH` (e.g. rust-lld's
+/// `$ORIGIN/../lib` for its bundled `libLLVM.so`). `None` omits `AT_EXECFN`,
+/// keeping the auxv shape unchanged for callers that have no path.
 pub unsafe fn setup_abi_stack_with_envp(
     stack_top: u64,
     mapper: &OffsetPageTable<'_>,
@@ -614,6 +637,7 @@ pub unsafe fn setup_abi_stack_with_envp(
     argv: &[&[u8]],
     envp: &[&[u8]],
     aux: ElfAuxInfo,
+    exec_path: Option<&[u8]>,
 ) -> Result<u64, ElfError> {
     unsafe {
         // Helper: translate a virtual address in the target page table to a kernel
@@ -694,6 +718,20 @@ pub unsafe fn setup_abi_stack_with_envp(
         }
         cursor &= !7; // realign to 8 bytes
 
+        // Phase 95b — write the resolved execve pathname into the string region
+        // for AT_EXECFN (the dynamic linker expands `$ORIGIN` in DT_RUNPATH from
+        // it). 0 ⇒ omit the entry. Written here (alongside AT_RANDOM) so it lives
+        // in the same string area below the auxv table; `write_string` packs
+        // downward and NUL-terminates.
+        let at_execfn_ptr = match exec_path {
+            Some(p) if !p.is_empty() => {
+                let ptr = write_string(&mut cursor, p)?;
+                cursor &= !7; // realign to 8 bytes after the variable-length string
+                ptr
+            }
+            _ => 0,
+        };
+
         // Build the auxv layout via the pure-logic kernel-core helper
         // so the byte-exact ordering is host-testable (see
         // `kernel-core/src/elf/auxv.rs`).  The helper returns entries
@@ -707,6 +745,7 @@ pub unsafe fn setup_abi_stack_with_envp(
             },
             aux.aux_extras,
             at_random_ptr,
+            at_execfn_ptr,
         );
 
         // SysV AMD64 ABI: RSP at `_start` must be 0 mod 16.

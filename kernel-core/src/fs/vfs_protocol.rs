@@ -186,6 +186,25 @@ pub const VFS_SETATTR_GID: u64 = 1 << 2;
 pub const VFS_SETATTR_ATIME: u64 = 1 << 3;
 pub const VFS_SETATTR_MTIME: u64 = 1 << 4;
 
+/// `VFS_READ_WINDOW` (Phase 95c Area A.1) — **zero-copy** demand-fault read.
+///
+/// The 95b demand-fill path staged the read reply as an IPC bulk payload
+/// (`ipc_store_reply_bulk` → a kernel `Vec` → `take_bulk_data` → a copy into the
+/// faulting frame), violating m3OS's "bulk data = page grants, never IPC
+/// payloads" rule and paying a double copy per fault. `VFS_READ_WINDOW` instead
+/// has the server read file data **directly into a shared SHM "read window"** the
+/// server creates and maps once at startup and registers with the kernel via
+/// `SYS_VFS_REGISTER_READ_WINDOW`. The kernel reads the window's frames through
+/// its physical-memory map (no IPC bulk, no `take_bulk_data`) and fills the
+/// faulting pages from there. The data crosses kernel↔server through the shared
+/// region — the idiomatic external-pager transfer — not through an IPC payload.
+///
+/// Request: `data[0]` = open-handle id; `data[1]` = file offset;
+///          `data[2]` = byte count (clamped to the window size).
+/// Reply:   `label` = 0 on success with `data[0]` = bytes written into the
+///          window (0 = EOF); negative errno in `label` on error. No reply bulk.
+pub const VFS_READ_WINDOW: u64 = 26;
+
 /// Node-kind selector encoded in `VFS_CREATE` `data[2]` bits 16..18.
 pub const VFS_CREATE_KIND_SHIFT: u32 = 16;
 
@@ -204,7 +223,12 @@ pub const VFS_MAX_READ: usize = 4096;
 /// instead of one 4 KiB block per round-trip. With vfs_server's contiguous-run
 /// coalescing this collapses a multi-MiB read into a few multi-block requests.
 /// Must stay `<= MAX_BULK_LEN` and 512-aligned.
-pub const VFS_MAX_PREAD: usize = 64 * 1024;
+///
+/// Phase 95c (Area A.2) — raised 64 KiB → 256 KiB: one `VFS_READ` round-trip now
+/// serves up to 256 KiB (64 pages), so a sequential cold load (a demand-paged DSO
+/// over the ring-3 VFS) issues ~4x fewer IPC round-trips — the in-model way to
+/// amortise the per-round-trip cost without bypassing `vfs_server`.
+pub const VFS_MAX_PREAD: usize = 256 * 1024;
 
 /// Phase 87 — maximum bytes per single `VFS_WRITE` request (path + data),
 /// raised from `VFS_MAX_READ` (4 KiB). The write request packs the path AND the
@@ -212,9 +236,14 @@ pub const VFS_MAX_PREAD: usize = 64 * 1024;
 /// sizes that buffer (now heap-allocated, not a stack array). A 64 KiB write
 /// chunk lets vfs_server write up to ~16 blocks per request — 16x fewer IPC
 /// round-trips, and the per-`write_file_data` inode flush is amortized over the
-/// whole chunk instead of per 4 KiB block. Must stay `<= MAX_BULK_LEN` (80 KiB)
+/// whole chunk instead of per 4 KiB block. Must stay `<= MAX_BULK_LEN`
 /// and 512-aligned.
-pub const VFS_MAX_PWRITE: usize = 64 * 1024;
+///
+/// Phase 95c (Area A.2) — raised 64 KiB → 256 KiB: a write chunk now carries up
+/// to ~64 blocks per request, ~4x fewer IPC round-trips on the install write
+/// path (and the per-`write_file_data` inode flush amortises over the larger
+/// chunk). Sizes `vfs_server`'s heap `recv_buf` (`MAX_BULK_BUF`).
+pub const VFS_MAX_PWRITE: usize = 256 * 1024;
 
 /// Reply-bulk size for `VFS_STAT_PATH` (and the `VFS_OPEN` reply bulk — Phase 88
 /// Track B.1/D: the same header is returned on open so the kernel can seed a
@@ -299,10 +328,11 @@ mod tests {
     #[test]
     fn max_pread_is_valid() {
         // 512-aligned, larger than a single 4 KiB block, and within the IPC
-        // bulk-reply ceiling (MAX_BULK_LEN = 80 KiB in kernel/src/ipc/mod.rs).
+        // bulk-reply ceiling (MAX_BULK_LEN in kernel/src/ipc/mod.rs, raised to
+        // 512 KiB in Phase 95c to admit the 256 KiB PREAD/PWRITE clusters).
         assert_eq!(VFS_MAX_PREAD % 512, 0);
         assert!(VFS_MAX_PREAD >= VFS_MAX_READ);
-        assert!(VFS_MAX_PREAD <= 81920);
+        assert!(VFS_MAX_PREAD <= 512 * 1024);
     }
 
     #[test]
@@ -310,11 +340,11 @@ mod tests {
         // The write-side analog of `max_pread_is_valid`. VFS_MAX_PWRITE sizes
         // vfs_server's heap `recv_buf` (MAX_BULK_BUF) and bounds the write chunk
         // (`data.len().min(VFS_MAX_PWRITE - path_len)`); it must stay 512-aligned
-        // and within the IPC bulk ceiling (MAX_BULK_LEN = 80 KiB) so a path+data
-        // request can never overflow the receive buffer.
+        // and within the IPC bulk ceiling (MAX_BULK_LEN, 512 KiB as of Phase 95c)
+        // so a path+data request can never overflow the receive buffer.
         assert_eq!(VFS_MAX_PWRITE % 512, 0);
         assert!(VFS_MAX_PWRITE >= VFS_MAX_READ);
-        assert!(VFS_MAX_PWRITE <= 81920);
+        assert!(VFS_MAX_PWRITE <= 512 * 1024);
     }
 
     #[test]

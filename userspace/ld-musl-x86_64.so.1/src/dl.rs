@@ -711,6 +711,92 @@ pub unsafe extern "C" fn dlerror() -> *const c_char {
     }
 }
 
+/// `Dl_info` (musl layout): four pointers describing the DSO an address falls in.
+#[repr(C)]
+pub struct DlInfo {
+    pub dli_fname: *const c_char,
+    pub dli_fbase: *mut c_void,
+    pub dli_sname: *const c_char,
+    pub dli_saddr: *mut c_void,
+}
+
+/// Backing store for the `dli_fname` path returned by [`dladdr`]. `dladdr` is
+/// used for single-threaded, startup sysroot detection (rustc's
+/// `current_dll_path`), so one reused buffer suffices; the returned pointer is
+/// valid until the next `dladdr` call.
+///
+/// This shares the loader-wide single-threaded `DlState` invariant
+/// (see [`DlStateCell`]'s `unsafe impl Sync`, documented in
+/// `docs/76-dynamic-linker.md`): `dladdr`'s own slot scan reads
+/// `refcounts[]`/`dsos[]`/`name()` from that same unsynchronized state, so this
+/// buffer is no less safe than the surrounding libdl entry points. Making
+/// concurrent `dladdr` safe is the whole-`DlState`-locking follow-up, not a
+/// per-buffer change.
+static mut DLADDR_PATH: [u8; 320] = [0; 320];
+
+/// `int dladdr(void *addr, Dl_info *info)` — given an address, fill `info` with
+/// the loaded DSO that contains it. Returns nonzero on success (musl semantics),
+/// 0 when `addr` is in no loaded DSO.
+///
+/// musl's real `dladdr` lives in the dynamic linker (`dynlink.c`), which the m3OS
+/// loader replaces — so `libc.so` ships only a return-0 stub and this is the
+/// working implementation (resolved before the stub: the linker is DSO slot 1).
+/// rustc's `current_dll_path()` calls it on one of its own functions to locate
+/// `librustc_driver.so` and derive the sysroot (`/usr`).
+///
+/// Only `dli_fname` + `dli_fbase` are filled (the nearest-symbol fields are left
+/// NULL — rustc does not need them). `dli_fname` is reconstructed as
+/// `/usr/lib/<soname>`: the loader searches `/usr/lib` first and libc.so + the
+/// rust libs all live there, so this is the real path for them. A DSO loaded
+/// from `/lib` would report the wrong directory — acceptable until the loader
+/// records per-DSO load paths (a tracked follow-up).
+///
+/// # Safety
+/// `info` (when non-NULL) must point at a valid `Dl_info`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dladdr(addr: *mut c_void, info: *mut DlInfo) -> c_int {
+    if info.is_null() {
+        return 0;
+    }
+    let a = addr as u64;
+    let state = dl_state();
+    if !state.initialized {
+        return 0;
+    }
+    for i in 0..state.n_slots_used {
+        if state.refcounts[i] == 0 {
+            continue;
+        }
+        let dso = &state.dsos[i];
+        if dso.image_len == 0 || a < dso.load_bias || a >= dso.load_bias + dso.image_len {
+            continue;
+        }
+        // Build `/usr/lib/<name>` (NUL-terminated) into the reusable buffer. Use
+        // a raw pointer to the `static mut` (no `&mut` reference — edition-2024 /
+        // `static_mut_refs` clean).
+        let name = state.name(i);
+        let prefix: &[u8] = b"/usr/lib/";
+        let buf = core::ptr::addr_of_mut!(DLADDR_PATH) as *mut u8;
+        const CAP: usize = 320;
+        let mut n = 0usize;
+        for &b in prefix.iter().chain(name.iter()) {
+            if n + 1 < CAP {
+                unsafe { *buf.add(n) = b };
+                n += 1;
+            }
+        }
+        unsafe { *buf.add(n) = 0 };
+        unsafe {
+            (*info).dli_fname = buf as *const c_char;
+            (*info).dli_fbase = dso.load_bias as *mut c_void;
+            (*info).dli_sname = core::ptr::null();
+            (*info).dli_saddr = core::ptr::null_mut();
+        }
+        return 1;
+    }
+    0
+}
+
 // ---------------------------------------------------------------------------
 // Helpers shared between the entry points.
 // ---------------------------------------------------------------------------

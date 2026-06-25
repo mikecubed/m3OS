@@ -1,5 +1,6 @@
 pub mod ext2;
 pub mod fat32;
+pub mod lru_cache;
 pub mod mbr;
 pub mod mode;
 pub mod tmpfs;

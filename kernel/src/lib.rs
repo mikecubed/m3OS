@@ -606,6 +606,7 @@ fn spawn_userspace_init() {
                 argv,
                 envp,
                 loaded.aux_info(),
+                Some(b"/sbin/init"),
             )
         }
         .expect("[init] ABI stack setup failed for /sbin/init");

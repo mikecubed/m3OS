@@ -135,6 +135,16 @@ static KSTACK_OVF_RSP: AtomicU64 = AtomicU64::new(0);
 /// CoW/mprotect race). Diagnostic-only; rate-limits the per-recovery log.
 static SPURIOUS_WRITE_RECOVERIES: AtomicU32 = AtomicU32::new(0);
 
+/// Count of write-faults whose leaf PTE grants write+user but an *intermediate*
+/// (PDPT/PD) table does not (effective permission ANDs every level). This is the
+/// Phase 95b RO/supervisor-intermediate bug — left unguarded the spurious-write
+/// recovery would loop forever (observed: rustc's mallocng spinning 165 M times
+/// on one address). The map paths now keep intermediates `PRESENT|WRITABLE|USER`
+/// (`user_space::USER_PARENT_TABLE_FLAGS` + the `map_current_user_page_inner`
+/// upgrade), so this should stay 0; if it fires we log the per-level flags and
+/// fall through to a visible kill rather than hang. Rate-limits the log.
+static INTERMEDIATE_PERM_FAULTS: AtomicU32 = AtomicU32::new(0);
+
 /// Count of W^X-v2 PKU cross-thread READ recoveries (Phase 90b). Diagnostic:
 /// if a single faulting RIP/addr keeps recovering, the grant isn't sticking and
 /// the thread is in a PKU read-fault spin-loop (a candidate for Claude Code's
@@ -292,7 +302,8 @@ fn bump_current_addr_space_generation() {
 /// context-switching (which are forbidden inside an ISR) can happen safely.
 fn fault_kill_trampoline() -> ! {
     // Disable interrupts immediately — IRET restored user RFLAGS which may
-    // have IF set, and we must not take interrupts before acquiring locks.
+    // have IF set, and we must not take interrupts before reading the latched
+    // fault state / printing the kstack-overflow diagnostic.
     x86_64::instructions::interrupts::disable();
     let pid = FAULT_KILL_PID.load(Ordering::Relaxed);
     // Phase 95 diag: if this kill is a recovered kstack overflow, print the
@@ -301,8 +312,48 @@ fn fault_kill_trampoline() -> ! {
     let ovf_slot = KSTACK_OVF_SLOT.swap(usize::MAX, Ordering::Relaxed);
     if ovf_slot != usize::MAX {
         dump_kstack_overflow_backtrace(ovf_slot, KSTACK_OVF_RSP.load(Ordering::Relaxed));
+        log::warn!(
+            "[fault_kill] trampoline running for pid {} (kstack overflow)",
+            pid
+        );
+        // KSTACK-OVERFLOW RECOVERY PATH — runs on the small (16 KiB) per-core
+        // recovery stack, which has a single-use invariant (the recovery must run
+        // to completion before the core takes another fault). Keep this teardown
+        // MINIMAL and never-yielding: the heavier, possibly-yielding group-aware
+        // exit could overflow the recovery stack or re-enter it. A multithreaded
+        // process that kstack-overflows therefore still strands its siblings (a
+        // rare double-corner); the priority here is killing the offender and
+        // keeping the core alive. (The common fatal-fault paths take the
+        // group-aware branch below.)
+        kstack_overflow_minimal_kill(pid);
     }
     log::warn!("[fault_kill] trampoline running for pid {}", pid);
+    // NORMAL fatal-fault kill (page fault / GPF) — runs on the faulting task's
+    // FULL kernel stack. Phase 95b: an unhandled fatal fault in ONE thread must
+    // terminate the WHOLE thread group (Linux semantics), reusing the exit_group
+    // teardown with SIGSEGV-encoded status (-11). The previous code here killed
+    // only the faulting TID and freed the SHARED address space, which (a)
+    // stranded sibling threads `BlockedOnFutex` forever on single-core and (b) on
+    // SMP raced a sibling against the page-table free into a kernel `addr=0x8`
+    // NULL deref. `terminate_thread_group_and_exit` quiesces every sibling (an
+    // off-core one — including a blocked one — is marked Dead in place) BEFORE the
+    // final `do_full_process_exit` frees the shared resources, and gives the crash
+    // the same cap/SHM/flock/IOMMU cleanup a clean exit gets. It runs the quiesce
+    // loop (yield / reschedule IPIs) exactly like the exit_group syscall context,
+    // so re-enable interrupts: this trampoline is a normal ring-0 task
+    // continuation (entered via IRETQ onto the kernel stack), not interrupt
+    // context. Single-threaded processes take the same path (thread_group == None
+    // → straight to do_full_process_exit), a superset of the old teardown.
+    x86_64::instructions::interrupts::enable();
+    crate::arch::x86_64::syscall::terminate_thread_group_and_exit(pid, -11);
+}
+
+/// Minimal, never-yielding single-process SIGSEGV teardown for the
+/// kstack-overflow recovery path (see `fault_kill_trampoline`). This is the
+/// pre-Phase-95b fault-kill body, kept verbatim because it must fit the small
+/// per-core recovery stack and run to completion without rescheduling. Interrupts
+/// stay disabled (the caller already cleared IF). Never returns.
+fn kstack_overflow_minimal_kill(pid: crate::process::Pid) -> ! {
     // Close all open FDs so pipe ref-counts reach 0 and EOF propagates.
     crate::process::close_all_fds_for(pid);
     // Deactivate this core's tracked AddressSpace *before* marking Zombie.
@@ -664,6 +715,59 @@ fn leaf_pte_flag_bits(vaddr: u64) -> Option<u64> {
     }
 }
 
+/// Walk all four paging levels for `vaddr` and return each level's flag bits as
+/// `[p4, p3, p2, p1]`, or `None` if any level is absent or a huge page.
+///
+/// The effective permission of a 4 KiB page is the AND of WRITABLE/USER across
+/// every level, so the spurious-write recovery must inspect the whole walk —
+/// not just the leaf ([`leaf_pte_flag_bits`]) — to tell a genuine SMP race
+/// (every level writable+user) from a RO/supervisor *intermediate* that would
+/// otherwise loop the fault forever (Phase 95b).
+fn user_walk_level_flags(vaddr: u64) -> Option<[u64; 4]> {
+    use x86_64::registers::control::Cr3;
+    use x86_64::structures::paging::{PageTable, PageTableFlags};
+
+    let phys_off_va = VirtAddr::new(crate::mm::phys_offset());
+    let (cr3_frame, _) = Cr3::read_raw();
+    let pml4_phys = cr3_frame.start_address().as_u64();
+    let p4 = ((vaddr >> 39) & 0x1FF) as usize;
+    let p3 = ((vaddr >> 30) & 0x1FF) as usize;
+    let p2 = ((vaddr >> 21) & 0x1FF) as usize;
+    let p1 = ((vaddr >> 12) & 0x1FF) as usize;
+    unsafe {
+        let pml4: &PageTable = &*(phys_off_va + pml4_phys).as_ptr::<PageTable>();
+        let e4 = &pml4[p4];
+        if !e4.flags().contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+        let pdpt: &PageTable = &*(phys_off_va + e4.addr().as_u64()).as_ptr::<PageTable>();
+        let e3 = &pdpt[p3];
+        if !e3.flags().contains(PageTableFlags::PRESENT)
+            || e3.flags().contains(PageTableFlags::HUGE_PAGE)
+        {
+            return None;
+        }
+        let pd: &PageTable = &*(phys_off_va + e3.addr().as_u64()).as_ptr::<PageTable>();
+        let e2 = &pd[p2];
+        if !e2.flags().contains(PageTableFlags::PRESENT)
+            || e2.flags().contains(PageTableFlags::HUGE_PAGE)
+        {
+            return None;
+        }
+        let pt: &PageTable = &*(phys_off_va + e2.addr().as_u64()).as_ptr::<PageTable>();
+        let e1 = &pt[p1];
+        if !e1.flags().contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+        Some([
+            e4.flags().bits(),
+            e3.flags().bits(),
+            e2.flags().bits(),
+            e1.flags().bits(),
+        ])
+    }
+}
+
 /// Public entry point for kernel-context VMA demand paging.
 ///
 /// Revalidates the current VMA metadata while holding the address-space
@@ -724,9 +828,49 @@ fn demand_map_user_page_locked(vaddr: u64, prot: u64, pkey: u8) -> bool {
     true
 }
 
+/// Phase 95b (Area A.2) — like [`demand_map_user_page_locked`] but fills the
+/// fresh frame from `buf` (the file bytes for this page, read OUTSIDE the
+/// page-table lock) before mapping. Any tail past `buf.len()` stays zero (the
+/// BSS / past-EOF remainder). Must be called with the page-table lock held.
+fn demand_map_user_page_from_buf_locked(vaddr: u64, prot: u64, pkey: u8, buf: &[u8]) -> bool {
+    use x86_64::structures::paging::Translate as _;
+
+    let page_vaddr = VirtAddr::new(vaddr & !0xFFF);
+    {
+        let mapper = unsafe { crate::mm::paging::get_mapper() };
+        if mapper.translate_addr(page_vaddr).is_some() {
+            // Raced with another fault/thread that already filled this page
+            // while we were doing the (blocking) file read — leave it.
+            return true;
+        }
+    }
+
+    let frame = match crate::mm::frame_allocator::allocate_frame_zeroed() {
+        Some(f) => f,
+        None => return false,
+    };
+
+    // Copy the file bytes into the freshly-zeroed frame via the phys-offset map.
+    let n = buf.len().min(4096);
+    if n > 0 {
+        let dst = (crate::mm::phys_offset() + frame.start_address().as_u64()) as *mut u8;
+        // SAFETY: `dst` is the kernel's linear-map alias of the just-allocated
+        // frame (exclusively owned here); `n <= 4096` stays within the frame.
+        unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, n) };
+    }
+
+    let data_flags = crate::mm::pkey::compose_user_pte_flags(prot, pkey);
+    if unsafe { crate::mm::paging::map_current_user_page_locked(page_vaddr, frame, data_flags) }
+        .is_err()
+    {
+        crate::mm::frame_allocator::free_frame(frame.start_address().as_u64());
+        return false;
+    }
+    true
+}
+
 fn demand_map_user_page(vaddr: u64, prot: u64) -> bool {
     let addr_space = crate::process::current_addr_space();
-    let page_base = vaddr & !0xFFF;
     let mapped = {
         let _page_table_guard =
             addr_space.map(|addr_space| unsafe { addr_space.as_ref() }.lock_page_tables());
@@ -736,15 +880,14 @@ fn demand_map_user_page(vaddr: u64, prot: u64) -> bool {
     if !mapped {
         return false;
     }
-    if crate::smp::is_per_core_ready()
-        && let Some(addr_space) = addr_space
-    {
-        tlb_shootdown_range_from_fault_context(
-            unsafe { addr_space.as_ref() },
-            page_base,
-            page_base + 4096,
-        );
-    }
+    // Track B (Phase 95b): a not-present -> present demand fill needs NO
+    // cross-core TLB shootdown. No core can hold a stale translation for a page
+    // that was never present (x86 never caches a not-present PTE that requires
+    // invalidation on the present transition), and the faulting core re-walks on
+    // return. Skipping the per-page shootdown IPI here is the SMP amplification
+    // fix — under multi-core, stack/anon demand paging during a heavy load (the
+    // loader, V8, rustc) no longer broadcasts one IPI per faulted page to every
+    // idle core. munmap/mprotect/CoW (present-PTE changes) keep their shootdowns.
     bump_current_addr_space_generation();
     true
 }
@@ -759,8 +902,186 @@ fn demand_map_vma_page(vaddr: u64, require_write: bool) -> bool {
         return false;
     }
 
+    // Deadlock-guard (Phase 95b lazy-file-fault-under-lock hunt) — placed at
+    // ENTRY, before `shared_vma_demand_file` (which re-takes PROCESS_TABLE) and
+    // before the blocking lazy-file read below. A legitimate ring-3 fault holds no
+    // kernel lock (preempt==0); preempt>0 means a SYSCALL holds an IrqSafeMutex
+    // across this demand-fault and is about to either self-deadlock on the
+    // PROCESS_TABLE re-lock or strand the lock across the blocking IPC — wedging
+    // every core. Log the culprit syscall (the last line before the silence).
+    {
+        static DEADLOCK_GUARD_BUDGET: core::sync::atomic::AtomicI32 =
+            core::sync::atomic::AtomicI32::new(64);
+        let depth = crate::task::scheduler::current_preempt_count();
+        if depth > 0
+            && DEADLOCK_GUARD_BUDGET.fetch_sub(1, core::sync::atomic::Ordering::Relaxed) > 0
+        {
+            let nr = crate::task::scheduler::current_task_ptr()
+                .map(|t| {
+                    t.last_syscall_nr
+                        .load(core::sync::atomic::Ordering::Relaxed)
+                })
+                .unwrap_or(u32::MAX);
+            log::error!(
+                "[deadlock-guard] demand-fault under lock: preempt={} syscall_nr={} pid={} vaddr={:#x} require_write={}",
+                depth,
+                nr,
+                pid,
+                vaddr,
+                require_write,
+            );
+        }
+    }
+
+    // Phase 95b (Area A.2) — lazy file-backed demand paging. If the faulting page
+    // lies in a `MAP_LAZY_FILE` VMA, read it straight from the backing file and
+    // fill the frame; otherwise fall through to the zero-fill anonymous path.
+    // The file read BLOCKS (virtio / vfs_server IPC) and must run with NO
+    // page-table lock held — a ring-3 fault holds no kernel locks, so blocking
+    // here only switches the faulting task out until the read completes.
+    if let Some((prot, pkey, fd, file_off, vma_end)) =
+        crate::process::shared_vma_demand_file(pid, vaddr)
+    {
+        let any_access = prot & (PROT_READ | PROT_WRITE | PROT_EXEC) != 0;
+        let write_ok = !require_write || prot & PROT_WRITE != 0;
+        if !any_access || !write_ok {
+            return false;
+        }
+        // Readahead: fill a cluster of up to 64 KiB forward from the faulting
+        // page in ONE backing-file read, then map every page in the cluster.
+        // A bare per-page fill costs one blocking vfs IPC per 4 KiB; a 64 KiB
+        // cluster (16 pages) amortises that ~16x. Kept MODERATE on purpose: the
+        // demand-fault access pattern of a loader (relocation, symbol resolution)
+        // is partly *sparse*, so a much larger cluster over-reads — dragging in
+        // dozens of untouched pages per scattered touch and making a small DSO
+        // *slower*, not faster (measured: a 256 KiB cluster regressed
+        // dynamic-hello). The 256 KiB `VFS_MAX_PREAD` cap (Phase 95c Area A.2) is
+        // for the *sequential* install reads, where over-read is a non-issue.
+        const CLUSTER: u64 = 64 * 1024;
+        let page_base = vaddr & !0xFFF;
+        let cluster_end = (page_base + CLUSTER).min(vma_end);
+        let cluster_len = (cluster_end - page_base) as usize;
+
+        // Phase 95c (Area A.1) — zero-copy path. ONLY a `vfs_server`-backed
+        // mapping can be served by the window: `vfs_server` owns those files and
+        // is the IPC peer that reads into the shared region. So resolve the
+        // server handle for this fd first (the value stored in the VMA is the
+        // *process* fd number, NOT the server handle — the handle lives in
+        // `FdBackend::VfsService`), and for every other backend (ramdisk /
+        // in-kernel ext2 / tmpfs / fat32) skip straight to the legacy per-backend
+        // read routing below. If the window IS eligible but can't serve the fault
+        // for any reason, we ALSO fall through to legacy — the window is a pure
+        // best-effort optimization that never changes correctness. One round-trip
+        // suffices: `read_file_data` returns the full available range, so a short
+        // read means EOF and the trailing cluster pages are legitimately zero.
+        if let Some(svc_handle) =
+            crate::arch::x86_64::syscall::vfs_service_handle_for_fd(pid, fd as usize)
+            && crate::arch::x86_64::syscall::claim_vfs_read_window(pid)
+        {
+            let filled = (|| -> Option<bool> {
+                let n = crate::arch::x86_64::syscall::vfs_read_into_window(
+                    svc_handle,
+                    file_off as usize,
+                    cluster_len,
+                )
+                .ok()?;
+                // SAFETY: we hold the window borrow, so the bytes are stable until
+                // we release it below; the slice aliases the registered SHM frames.
+                let window = unsafe { crate::arch::x86_64::syscall::vfs_read_window_slice() }?;
+                let addr_space = crate::process::current_addr_space();
+                let _page_table_guard =
+                    addr_space.map(|addr_space| unsafe { addr_space.as_ref() }.lock_page_tables());
+                let mut faulting_ok = false;
+                let mut off = 0usize;
+                while off < cluster_len {
+                    let page_va = page_base + off as u64;
+                    let avail_end = (off + 4096).min(n);
+                    let slice: &[u8] = if off < n {
+                        &window[off..avail_end]
+                    } else {
+                        &[]
+                    };
+                    let ok = demand_map_user_page_from_buf_locked(page_va, prot, pkey, slice);
+                    if page_va == page_base {
+                        faulting_ok = ok;
+                    }
+                    off += 4096;
+                }
+                Some(faulting_ok)
+            })();
+            crate::arch::x86_64::syscall::release_vfs_read_window();
+            if filled == Some(true) {
+                // One-shot proof the zero-copy window path actually served a
+                // demand fault (vs. falling back) — the Area A.1 "counter".
+                static WINDOW_FILL_LOGGED: core::sync::atomic::AtomicBool =
+                    core::sync::atomic::AtomicBool::new(false);
+                if !WINDOW_FILL_LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                    log::info!(
+                        "[vfs] read-window: first zero-copy demand-fill served (no IPC bulk)"
+                    );
+                }
+                // Track B: not-present -> present needs no cross-core shootdown.
+                bump_current_addr_space_generation();
+                return true;
+            }
+            // Window couldn't serve it — fall through to the legacy read path,
+            // which re-reads the cluster (skipping any pages the window already
+            // mapped) via the correct per-backend routing.
+        }
+
+        // Heap (not stack) buffer: the file read path is already deep on the
+        // per-task kernel stack (Area C), so keep this frame's footprint small.
+        let mut buf = alloc::vec![0u8; cluster_len];
+        // Loop the read so a short read (a backend returning fewer bytes than
+        // requested mid-file) fully fills the cluster; `Ok(0)` is true EOF, and
+        // pages past `n` are then legitimately zero (past the file extent).
+        let mut n = 0usize;
+        while n < cluster_len {
+            match crate::arch::x86_64::syscall::demand_read_file_page(
+                pid,
+                fd as usize,
+                (file_off as usize) + n,
+                &mut buf[n..],
+            ) {
+                Ok(0) => break,
+                Ok(r) => n += r.min(cluster_len - n),
+                Err(_) => return false,
+            }
+        }
+        let addr_space = crate::process::current_addr_space();
+        let mapped = {
+            let _page_table_guard =
+                addr_space.map(|addr_space| unsafe { addr_space.as_ref() }.lock_page_tables());
+            // Map the faulting page first (so a partial cluster still satisfies
+            // the fault), then the rest of the cluster as readahead. Pages
+            // already present (raced) are skipped inside the fill.
+            let mut faulting_ok = false;
+            let mut off = 0usize;
+            while off < cluster_len {
+                let page_va = page_base + off as u64;
+                let hi = (off + 4096).min(buf.len());
+                let slice: &[u8] = if off < n { &buf[off..hi.min(n)] } else { &[] };
+                let ok = demand_map_user_page_from_buf_locked(page_va, prot, pkey, slice);
+                if page_va == page_base {
+                    faulting_ok = ok;
+                }
+                off += 4096;
+            }
+            faulting_ok
+        };
+        if !mapped {
+            return false;
+        }
+        // Track B: a not-present -> present transition needs NO cross-core TLB
+        // shootdown on x86 (no core can hold a stale translation for a page that
+        // was never present), so the per-page demand-fault shootdown is skipped.
+        // This is what bounds the IPI storm a 162 MB page-by-page DSO load would
+        // otherwise drive across the idle cores.
+        bump_current_addr_space_generation();
+        return true;
+    }
+
     let addr_space = crate::process::current_addr_space();
-    let page_base = vaddr & !0xFFF;
     let mapped = {
         let _page_table_guard =
             addr_space.map(|addr_space| unsafe { addr_space.as_ref() }.lock_page_tables());
@@ -784,15 +1105,10 @@ fn demand_map_vma_page(vaddr: u64, require_write: bool) -> bool {
     if !mapped {
         return false;
     }
-    if crate::smp::is_per_core_ready()
-        && let Some(addr_space) = addr_space
-    {
-        tlb_shootdown_range_from_fault_context(
-            unsafe { addr_space.as_ref() },
-            page_base,
-            page_base + 4096,
-        );
-    }
+    // Track B (Phase 95b): not-present -> present anonymous demand fill — no
+    // cross-core shootdown required (see `demand_map_user_page`). The lazy
+    // file-backed branch above already skips it; this brings the anonymous
+    // mmap demand path to parity.
     bump_current_addr_space_generation();
     true
 }
@@ -1381,16 +1697,28 @@ extern "x86-interrupt" fn page_fault_handler(
         // infinite-loop risk: if the page is concurrently flipped back to RO, the
         // re-walk on the next fault returns not-WRITABLE and falls through to the
         // kill.
+        // The genuine SMP race requires *every* level to be writable+user — the
+        // effective permission ANDs all four levels. A leaf-only check (the
+        // historical bug) would also fire when the leaf grants write+user but an
+        // INTERMEDIATE table does not, and since `invlpg`+retry cannot change a
+        // RO/supervisor intermediate, that retry loops forever (Phase 95b: rustc
+        // mallocng spun 165 M times on one addr under a non-writable PD created
+        // by an eager PROT_READ file mmap). So we walk the whole translation and
+        // recover only when all levels agree; a deficient intermediate logs the
+        // per-level flags once and falls through to a visible kill.
         if is_write
             && is_present
             && !err.contains(PageFaultErrorCode::PROTECTION_KEY)
             && let Ok(fault_vaddr) = addr
-            && let Some(flags) = leaf_pte_flag_bits(fault_vaddr.as_u64())
+            && let Some(levels) = user_walk_level_flags(fault_vaddr.as_u64())
         {
             use x86_64::structures::paging::PageTableFlags as Ptf;
-            let writable = flags & Ptf::WRITABLE.bits() != 0;
-            let user = flags & Ptf::USER_ACCESSIBLE.bits() != 0;
-            if writable && user {
+            let all_writable = levels.iter().all(|f| f & Ptf::WRITABLE.bits() != 0);
+            let all_user = levels.iter().all(|f| f & Ptf::USER_ACCESSIBLE.bits() != 0);
+            let leaf = levels[3];
+            let leaf_writable = leaf & Ptf::WRITABLE.bits() != 0;
+            let leaf_user = leaf & Ptf::USER_ACCESSIBLE.bits() != 0;
+            if all_writable && all_user {
                 // Rate-limited diagnostic: confirm this fires (and is not looping
                 // on one address). First ~24 only, to avoid serial spam.
                 let n = SPURIOUS_WRITE_RECOVERIES.fetch_add(1, Ordering::Relaxed);
@@ -1407,6 +1735,25 @@ extern "x86-interrupt" fn page_fault_handler(
                 crate::task::scheduler::current_task_record_page_fault(false);
                 assert_preempt_count_zero_on_return_to_user(&stack_frame);
                 return;
+            } else if leaf_writable && leaf_user {
+                // Leaf grants write+user but an intermediate does not — the
+                // Phase 95b RO/supervisor-intermediate bug. The map paths now
+                // keep intermediates permissive, so this should never fire; if
+                // it does, surface which level is deficient and kill (NOT loop).
+                let n = INTERMEDIATE_PERM_FAULTS.fetch_add(1, Ordering::Relaxed);
+                if n < 8 {
+                    _panic_print(format_args!(
+                        "[pf] non-writable intermediate (would loop): pid={} addr={:#x} rip={:#x} p4={:#x} p3={:#x} p2={:#x} p1={:#x}\n",
+                        crate::process::current_pid(),
+                        fault_vaddr.as_u64(),
+                        stack_frame.instruction_pointer.as_u64(),
+                        levels[0],
+                        levels[1],
+                        levels[2],
+                        levels[3],
+                    ));
+                }
+                // fall through to the kill below
             }
         }
 
@@ -1508,6 +1855,22 @@ extern "x86-interrupt" fn page_fault_handler(
         ));
         crate::hlt_loop();
     }
+
+    // Phase 95b — emit a COMPACT one-line rip/cr2/err/rsp record FIRST, using only
+    // raw u64 hex (NO `VirtAddr`/`InterruptStackFrame` Debug formatters). Those
+    // formatters recurse deeply and can overflow an already-stressed kstack inside
+    // the heavy dumps below before the rip is ever printed — exactly what hid the
+    // RIP of the rust-lld-triggered `addr=0x8` kernel NULL-deref (the recursive
+    // fault's bogus RIP landed mid-instruction in `VirtAddr::fmt`, the dump's own
+    // formatter). This single line is stack-cheap and survives even if the heavy
+    // dumps below cascade. (`#PF` so it greps distinctly from the verbose line.)
+    _panic_print(format_args!(
+        "[int] KERNEL #PF rip={:#x} cr2={:#x} err={:#x} rsp={:#x}\n",
+        stack_frame.instruction_pointer.as_u64(),
+        addr.as_ref().map_or(u64::MAX, |v| v.as_u64()),
+        err.bits(),
+        stack_frame.stack_pointer.as_u64(),
+    ));
 
     // Kernel-stack overflow: the fault address is inside a kstack guard page.
     // Handle this BEFORE the heavy diagnostic dumps below — those push several

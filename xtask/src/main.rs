@@ -384,6 +384,12 @@ const SMOKE_EXIT_COREUTILS_SMOKE_FAILED: i32 = 90;
 /// Rust/clang toolchain or musl headers are absent.
 const SMOKE_EXIT_RUSTC_SMOKE_FAILED: i32 = 91;
 
+/// Phase 95c Track E.1 — `cargo xtask vfs-throughput-smoke` exit code.
+/// Boots m3OS, runs `vfs-throughput-probe`, and asserts the
+/// `write_calls_delta` and `read_calls_delta` from `/proc/blkstats` stay
+/// under size-derived ceilings — the regression guard for VFS IPC-call count.
+const SMOKE_EXIT_VFS_THROUGHPUT_FAILED: i32 = 92;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
     Headless,
@@ -1155,6 +1161,20 @@ fn main() {
                 });
             cmd_vfs_bulkio_smoke(&smoke_args);
         }
+        // Phase 95c Track E.1 — VFS throughput + IPC-cost measurement gate.
+        // Boots m3OS, runs the ramdisk `vfs-throughput-probe` binary (write 8 MiB
+        // + read back + verify, bracketed by /proc/blkstats snapshots), and asserts
+        // the write_calls_delta and read_calls_delta stay under size-derived
+        // ceilings — the regression guard for VFS IPC-call count.
+        Some("vfs-throughput-smoke") => {
+            let smoke_args = parse_smoke_boot_args("vfs-throughput-smoke", &args[2..])
+                .unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_vfs_throughput_smoke(&smoke_args);
+        }
         // Phase 85d — Clang/LLVM/LLD toolchain smoke. Builds the image with the
         // opt-in `M3OS_WITH_CLANG` feature (bundling the heavyweight clang
         // `.m3pkg` into the offline `/usr/pkg/` repo), boots m3OS, `pkg install
@@ -1511,7 +1531,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|e1000e|igb|audio|xhci|ahci]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|xhci-bringup-smoke [--timeout <secs>] [--display]|xhci-enum-smoke [--timeout <secs>] [--display]|usb-smoke [--timeout <secs>] [--display]|usb-hotplug-smoke [--timeout <secs>] [--display]|usb-storage-smoke [--timeout <secs>] [--display]|usb-mount-smoke [--timeout <secs>] [--display]|usb-unmount-smoke [--timeout <secs>] [--display]|usb-storage-dual-smoke [--timeout <secs>] [--display]|usb-hub-smoke [--timeout <secs>] [--display]|usb-audio-smoke [--timeout <secs>] [--display]|usb-multi-controller-smoke [--timeout <secs>] [--display]|usb-eth-smoke [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|hda-smoke [--timeout <secs>] [--display]|ahci-smoke [--timeout <secs>] [--display]|ahci-root-smoke [--timeout <secs>] [--display]|ahci-rw-smoke [--timeout <secs>] [--display]|ahci-persist-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|mitigations-status-smoke [--timeout <secs>] [--display]|userspace-simd-smoke [--timeout <secs>] [--display]|pku-smoke [--timeout <secs>] [--display]|kstack-overflow-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|htop-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|pkg-smoke [--timeout <secs>] [--display]|git-local-smoke [--timeout <secs>] [--display]|git-ssh-smoke [--timeout <secs>] [--display]|git-https-smoke [--timeout <secs>] [--display]|python-smoke [--timeout <secs>] [--display]|coreutils-smoke [--timeout <secs>] [--display]|dynamic-hello-smoke [--timeout <secs>] [--display]|dynamic-python-smoke [--timeout <secs>] [--display]|go-runtime-smoke [--timeout <secs>] [--display]|clang-smoke [--timeout <secs>] [--display]|rustc-smoke [--timeout <secs>] [--display]|gh-smoke [--timeout <secs>] [--display]|node-smoke [--timeout <secs>] [--display]|smp-smoke [--timeout <secs>] [--display]|node-jit-smoke [--timeout <secs>] [--display]|claude-smoke [--timeout <secs>] [--display]|vfs-bulkio-smoke [--timeout <secs>] [--display]|vfs-throughput-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name|all>|port list|pkgcache-hit-check [<port-name>]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -1859,6 +1879,9 @@ fn build_userspace_bins() {
         ("lockscreen", "lockscreen", true),
         // Phase 85a Track C — offline package installer (alloc for Vec/String + pkg-format).
         ("pkg", "pkg", true),
+        // Phase 95c Track E.1 — VFS throughput measurement probe.
+        // Uses Vec for I/O buffers + the blkstats text, so `needs_alloc = true`.
+        ("vfs-throughput-probe", "vfs-throughput-probe", true),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -7440,6 +7463,11 @@ fn run_smoke_script(
     // Use a queue so WaitEither can inject extra steps at the front.
     let mut queue: VecDeque<&SmokeStep> = steps.iter().collect();
     let mut step_num = 0usize;
+    // Per-step wall-clock timing (Phase 95c perf investigation): prints when
+    // each step starts and how long the PREVIOUS step took, so a single run
+    // reveals where the wall-clock goes (e.g. `pkg install` vs each `rustc`
+    // invocation's cold-load vs compile). Host-side only; no guest overhead.
+    let mut last_step_at = std::time::Instant::now();
 
     // Phase 57e Bug #6 diagnostic: when M3OS_SMOKE_SERIAL_DUMP=<path> is set,
     // every error return below writes the full serial_history to that file
@@ -7462,6 +7490,16 @@ fn run_smoke_script(
 
     while let Some(step) = queue.pop_front() {
         step_num += 1;
+        {
+            let now = std::time::Instant::now();
+            println!(
+                "[timing] step {} starts at +{:.1}s (prev step took {:.1}s)",
+                step_num,
+                global_start.elapsed().as_secs_f64(),
+                now.duration_since(last_step_at).as_secs_f64(),
+            );
+            last_step_at = now;
+        }
         // Global timeout check.
         if global_start.elapsed() > global_timeout {
             let _ = child.kill();
@@ -20530,6 +20568,398 @@ fn vfs_bulkio_smoke_steps(pkg: &'static str) -> Vec<SmokeStep> {
     steps
 }
 
+// ---------------------------------------------------------------------------
+// Phase 95c Track E.1 — `cargo xtask vfs-throughput-smoke`
+// ---------------------------------------------------------------------------
+
+/// Device-block-op count if the VFS regressed to per-4 KiB-block round-trips for
+/// `n_bytes` (the failure mode these ceilings guard against): `n_bytes / 4096`.
+fn vfs_thrput_per_block(n_bytes: u64) -> u64 {
+    n_bytes / 4096
+}
+
+/// Ceilings for `write_calls_delta` / `read_calls_delta` from a `PAYLOAD_BYTES`-sized
+/// sequential write + read-back through the ring-3 VFS, as counted by `/proc/blkstats`
+/// (DEVICE block ops: `vfs_server` → virtio, NOT the kernel↔server IPC count).
+///
+/// MEASURED BASELINE (fresh data disk, 8 MiB payload, plain TCG): `write_calls_delta`
+/// ≈ 649, `read_calls_delta` ≈ 134. The write count is dominated by ext2 metadata —
+/// the inode, the block/inode-allocation bitmaps, and the single/double-indirect
+/// blocks for a ~2048-block file — written alongside the data runs; the read-back
+/// touches far less metadata, hence the large write/read asymmetry.
+///
+/// The regression these guard against is a collapse to PER-BLOCK round-trips
+/// (`vfs_thrput_per_block` ≈ 2048 for 8 MiB, plus metadata). The ceilings sit with
+/// comfortable headroom over the measured baseline — so a noisy boot's background
+/// block ops between the probe's `/proc/blkstats` snapshots do not flake this opt-in
+/// gate — yet well under the per-block regression, and scale with payload size:
+///   - write: 3/4 of the per-block count (8 MiB → 1536; baseline 649 ⇒ ~2.4× headroom)
+///   - read:  1/2 of the per-block count (8 MiB → 1024; baseline 134 ⇒ ~7.6× headroom)
+/// A per-block regression (≥ 2048) trips both. The earlier `n/(256*1024)+64` = 96
+/// ceiling was a mis-model (it counted 256 KiB IPC chunks, not device block ops) and
+/// is replaced here by the empirically-anchored values.
+pub fn vfs_thrput_write_ceiling(n_bytes: u64) -> u64 {
+    vfs_thrput_per_block(n_bytes) * 3 / 4
+}
+
+/// Read-side ceiling — see [`vfs_thrput_write_ceiling`]. Half the per-block count.
+pub fn vfs_thrput_read_ceiling(n_bytes: u64) -> u64 {
+    vfs_thrput_per_block(n_bytes) / 2
+}
+
+#[cfg(test)]
+mod vfs_thrput_tests {
+    use super::{vfs_thrput_per_block, vfs_thrput_read_ceiling, vfs_thrput_write_ceiling};
+
+    const MIB8: u64 = 8 * 1024 * 1024;
+
+    #[test]
+    fn ceilings_8mib() {
+        // 8 MiB → per-block = 2048; write ceiling = 3/4 = 1536, read ceiling = 1/2 = 1024.
+        assert_eq!(vfs_thrput_per_block(MIB8), 2048);
+        assert_eq!(vfs_thrput_write_ceiling(MIB8), 1536);
+        assert_eq!(vfs_thrput_read_ceiling(MIB8), 1024);
+    }
+
+    #[test]
+    fn ceilings_clear_measured_baseline() {
+        // Measured baseline (fresh disk, 8 MiB): write ≈ 649, read ≈ 134. Both must
+        // pass with headroom so a noisy boot does not flake the opt-in gate.
+        assert!(
+            vfs_thrput_write_ceiling(MIB8) > 649,
+            "write ceiling must clear the ~649 measured baseline"
+        );
+        assert!(
+            vfs_thrput_read_ceiling(MIB8) > 134,
+            "read ceiling must clear the ~134 measured baseline"
+        );
+    }
+
+    #[test]
+    fn per_block_regression_trips_both() {
+        // A collapse to per-block round-trips (~2048 for 8 MiB) exceeds both ceilings,
+        // i.e. the gate would catch the regression it is designed for.
+        let per_block = vfs_thrput_per_block(MIB8); // 2048
+        assert!(
+            per_block > vfs_thrput_write_ceiling(MIB8),
+            "per-block {per_block} should exceed the write ceiling"
+        );
+        assert!(
+            per_block > vfs_thrput_read_ceiling(MIB8),
+            "per-block {per_block} should exceed the read ceiling"
+        );
+    }
+}
+
+/// Phase 95c Track E.1 — `cargo xtask vfs-throughput-smoke`.
+///
+/// Boots m3OS (plain default image — no special ports or packages required),
+/// runs the ramdisk-embedded `vfs-throughput-probe` binary which:
+///   1. snapshots `/proc/blkstats`,
+///   2. writes an 8 MiB deterministic payload to `/usr/local/vfsthr-probe.bin`,
+///   3. snapshots `/proc/blkstats` (write delta),
+///   4. reads the file back and verifies the byte pattern,
+///   5. snapshots `/proc/blkstats` (read delta),
+///   6. emits `VFS_THRPUT:*` sentinels.
+///
+/// Parses the sentinels from the serial transcript and asserts:
+///   - `verify=ok` (content round-tripped correctly),
+///   - `write_calls_delta ≤ vfs_thrput_write_ceiling(PAYLOAD_BYTES)`,
+///   - `read_calls_delta ≤ vfs_thrput_read_ceiling(PAYLOAD_BYTES)`.
+///
+/// Opt-in: gated by `M3OS_VFS_THROUGHPUT_REGRESSION=1` in `.githooks/pre-push`.
+fn cmd_vfs_throughput_smoke(args: &SmokeBootArgs) {
+    /// Payload the probe writes/reads (must match `PAYLOAD_BYTES` in the binary).
+    const PAYLOAD_BYTES: u64 = 8 * 1024 * 1024;
+
+    let write_ceiling = vfs_thrput_write_ceiling(PAYLOAD_BYTES);
+    let read_ceiling = vfs_thrput_read_ceiling(PAYLOAD_BYTES);
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    // Fresh data disk so the block cache and ext2 state start clean, giving
+    // reproducible blkstats deltas (a warm cache would suppress device reads).
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    // Honor `M3OS_KVM=1` so the latency-probe sentinels (ipc_rtt_us_per_op,
+    // *_us_per_blockop) reflect near-native wall-clock timing — the per-op
+    // tick-latency wakes that dominate `pkg install` are a real 1 ms (BSP) /
+    // 10 ms (AP) under KVM, but are masked by TCG's emulated clock. The block-op
+    // COUNT assertions are unaffected by the backend.
+    let mut devices = DeviceSet::default();
+    if std::env::var_os("M3OS_KVM").is_some_and(|v| v != "0" && !v.is_empty()) {
+        devices.kvm = true;
+    }
+    let qemu_args = qemu_args_with_devices(&uefi_image, &ovmf, display_mode, devices);
+
+    // Capture full serial transcript for host-side sentinel parsing.
+    let dump_path = uefi_image
+        .parent()
+        .unwrap()
+        .join("vfs-throughput-serial.txt");
+    let _ = fs::remove_file(&dump_path);
+    // SAFETY: xtask is single-threaded here.
+    unsafe {
+        std::env::set_var("M3OS_SMOKE_SERIAL_DUMP", &dump_path);
+    }
+
+    let steps = vfs_throughput_smoke_steps();
+    println!(
+        "vfs-throughput-smoke: launching QEMU (timeout {}s, {} steps; \
+         payload={} MiB, write_ceiling={} read_ceiling={} calls)",
+        args.timeout_secs,
+        steps.len(),
+        PAYLOAD_BYTES / (1024 * 1024),
+        write_ceiling,
+        read_ceiling,
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    let run_result = run_smoke_script(&mut child, &steps, global_timeout);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    if let Err(msg) = run_result {
+        eprintln!("vfs-throughput-smoke: FAILED\n{msg}");
+        std::process::exit(SMOKE_EXIT_VFS_THROUGHPUT_FAILED);
+    }
+
+    // Parse sentinels from the serial transcript.
+    let transcript = fs::read_to_string(&dump_path).unwrap_or_default();
+
+    let parse_sentinel = |key: &str| -> Option<u64> {
+        transcript.lines().find_map(|l| {
+            l.trim()
+                .strip_prefix(key)
+                .and_then(|v| v.trim().parse::<u64>().ok())
+        })
+    };
+
+    let verify_ok = transcript
+        .lines()
+        .any(|l| l.trim() == "VFS_THRPUT:verify=ok");
+
+    let write_delta = parse_sentinel("VFS_THRPUT:write_calls_delta=");
+    let read_delta = parse_sentinel("VFS_THRPUT:read_calls_delta=");
+    // Engine-unification Phase C1: the in-kernel root ext2 engine must serve ~0
+    // reads while the probe writes+reads 8 MiB (all routed to vfs_server). An
+    // older kernel without the counter emits no sentinel → treated as 0 (the
+    // assertion degrades to a no-op rather than a spurious failure).
+    let inkernel_delta = parse_sentinel("VFS_THRPUT:inkernel_root_reads_delta=").unwrap_or(0);
+
+    let elapsed = start.elapsed().as_secs();
+
+    if !verify_ok {
+        eprintln!(
+            "vfs-throughput-smoke: FAILED — byte-pattern verify did not pass \
+             (VFS_THRPUT:verify=ok not found in transcript). \
+             Serial dump: {}",
+            dump_path.display()
+        );
+        std::process::exit(SMOKE_EXIT_VFS_THROUGHPUT_FAILED);
+    }
+
+    let Some(wd) = write_delta else {
+        eprintln!(
+            "vfs-throughput-smoke: FAILED — VFS_THRPUT:write_calls_delta sentinel not found. \
+             Serial dump: {}",
+            dump_path.display()
+        );
+        std::process::exit(SMOKE_EXIT_VFS_THROUGHPUT_FAILED);
+    };
+    let Some(rd) = read_delta else {
+        eprintln!(
+            "vfs-throughput-smoke: FAILED — VFS_THRPUT:read_calls_delta sentinel not found. \
+             Serial dump: {}",
+            dump_path.display()
+        );
+        std::process::exit(SMOKE_EXIT_VFS_THROUGHPUT_FAILED);
+    };
+
+    println!(
+        "vfs-throughput-smoke: probe completed — \
+         write_calls_delta={wd} (ceiling {write_ceiling}) \
+         read_calls_delta={rd} (ceiling {read_ceiling})"
+    );
+
+    // Surface the Phase 95c latency-probe sentinels (additive; not asserted) so
+    // the per-op timing is visible in the gate's stdout, not just the transcript.
+    let kvm = std::env::var_os("M3OS_KVM").is_some_and(|v| v != "0" && !v.is_empty());
+    let show = |label: &str, key: &str, unit: &str| {
+        if let Some(v) = parse_sentinel(key) {
+            println!("vfs-throughput-smoke:   {label} = {v} {unit}");
+        }
+    };
+    println!(
+        "vfs-throughput-smoke: LATENCY PROBE ({}):",
+        if kvm {
+            "KVM / near-native"
+        } else {
+            "TCG / emulated"
+        }
+    );
+    show(
+        "ipc_rtt per small write (app↔vfs round-trip + 1 cached block)",
+        "VFS_THRPUT:ipc_rtt_us_per_op=",
+        "µs",
+    );
+    show("write throughput", "VFS_THRPUT:write_kbps=", "KB/s");
+    show("write wall", "VFS_THRPUT:write_ms=", "ms");
+    show(
+        "write per-block-op",
+        "VFS_THRPUT:write_us_per_blockop=",
+        "µs",
+    );
+    show("read throughput", "VFS_THRPUT:read_kbps=", "KB/s");
+    show("read wall", "VFS_THRPUT:read_ms=", "ms");
+    show("read per-block-op", "VFS_THRPUT:read_us_per_blockop=", "µs");
+    show(
+        "many-files count (16 KiB each, one dir)",
+        "VFS_THRPUT:manyfiles_count=",
+        "files",
+    );
+    show(
+        "many-files total wall",
+        "VFS_THRPUT:manyfiles_total_ms=",
+        "ms",
+    );
+    show(
+        "many-files FIRST batch (100 files)",
+        "VFS_THRPUT:manyfiles_first_batch_ms=",
+        "ms",
+    );
+    show(
+        "many-files LAST batch (100 files)",
+        "VFS_THRPUT:manyfiles_last_batch_ms=",
+        "ms",
+    );
+    show(
+        "many-files rate",
+        "VFS_THRPUT:manyfiles_per_sec=",
+        "files/s",
+    );
+    show(
+        "many-files per-file",
+        "VFS_THRPUT:manyfiles_us_per_file=",
+        "µs",
+    );
+
+    if wd > write_ceiling {
+        eprintln!(
+            "vfs-throughput-smoke: FAILED — write_calls_delta {wd} exceeds write ceiling \
+             {write_ceiling}; a regression to per-block VFS round-trips would produce ~{} calls \
+             for an 8 MiB payload.  Check vfs_server write coalescing / write cap / \
+             multi-block allocation.",
+            PAYLOAD_BYTES / 4096,
+        );
+        std::process::exit(SMOKE_EXIT_VFS_THROUGHPUT_FAILED);
+    }
+    if rd > read_ceiling {
+        eprintln!(
+            "vfs-throughput-smoke: FAILED — read_calls_delta {rd} exceeds read ceiling \
+             {read_ceiling}; a regression to per-block VFS round-trips would produce ~{} calls \
+             for an 8 MiB payload.  Check vfs_server read coalescing / read cap / \
+             contiguous-run batching.",
+            PAYLOAD_BYTES / 4096,
+        );
+        std::process::exit(SMOKE_EXIT_VFS_THROUGHPUT_FAILED);
+    }
+
+    // Engine-unification Phase C1 — the single-post-boot-root-engine invariant.
+    // After Phases A+B routed all root reads and the open path now builds the
+    // `Ext2Disk` fd through vfs_server too, the in-kernel ext2 engine serves a
+    // small DELIBERATE residual during the 8 MiB write+read (~51 blocks
+    // measured): the DAC enforcement path. `require_search_permission` /
+    // `path_metadata` read each path component's uid/gid/mode from the in-kernel
+    // engine ON PURPOSE — DAC decisions must NOT trust a ring-3 `vfs_server`
+    // (which could spoof permissions via VFS_STAT_PATH). Those reads cannot be
+    // routed, and `invalidate_cache` keeps them coherent. This is why metadata
+    // write-back (C2) and retiring the invalidation (C3) are blocked: deferring
+    // inode/dir blocks would make the trusted DAC reads observe stale on-disk
+    // permissions. The ceiling sits above the DAC residual but well below a real
+    // read-un-routing regression (~`PAYLOAD_BYTES/4096` ≈ 2048 in-kernel blocks).
+    const INKERNEL_ROOT_READS_CEILING: u64 = 96;
+    println!(
+        "vfs-throughput-smoke:   inkernel_root_reads_delta = {inkernel_delta} (ceiling {INKERNEL_ROOT_READS_CEILING})"
+    );
+    if inkernel_delta > INKERNEL_ROOT_READS_CEILING {
+        eprintln!(
+            "vfs-throughput-smoke: FAILED — inkernel_root_reads_delta {inkernel_delta} exceeds \
+             ceiling {INKERNEL_ROOT_READS_CEILING}. The in-kernel root ext2 engine served a root \
+             read post-boot — Phases A+B should route every root read to vfs_server. A regression \
+             that un-routes a reader (getdents/stat/exec/path_ino) would produce ~{} in-kernel \
+             reads for an 8 MiB payload.  This is also the safety precondition for retiring the \
+             dual-engine cache invalidation (Phase C3).",
+            PAYLOAD_BYTES / 4096,
+        );
+        std::process::exit(SMOKE_EXIT_VFS_THROUGHPUT_FAILED);
+    }
+
+    println!(
+        "vfs-throughput-smoke: PASSED — verify=ok, \
+         write_calls_delta={wd} ≤ {write_ceiling}, read_calls_delta={rd} ≤ {read_ceiling}, \
+         inkernel_root_reads_delta={inkernel_delta} ≤ {INKERNEL_ROOT_READS_CEILING} \
+         in {elapsed}s"
+    );
+}
+
+/// Serial script for `vfs-throughput-smoke`: boot + login, run the probe,
+/// wait for `VFS_THRPUT:done`.
+fn vfs_throughput_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/vfs-throughput-smoke: kernel first message",
+    }];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    // Run the probe.  The binary is in the ramdisk at /bin/vfs-throughput-probe.
+    steps.push(SmokeStep::Send {
+        input: "vfs-throughput-probe\n",
+        label: "vfs-throughput-smoke: launch probe",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "VFS_THRPUT:done",
+        fail_prefixes: &["VFS_THRPUT:error=", "VFS_THRPUT:verify=FAIL"],
+        timeout_secs: 240,
+        label: "vfs-throughput-smoke: probe done",
+        exit_code_on_fail: SMOKE_EXIT_VFS_THROUGHPUT_FAILED,
+    });
+
+    steps
+}
+
 /// The serial script for `git-local-smoke`. Wait-patterns are git's own output
 /// (never a substring of the command that triggers them) because the serial
 /// console echoes typed input; `Send` clears the scrollback so each assertion
@@ -21500,6 +21930,362 @@ fn git_https_smoke_steps(
 /// libc set up via `static_init_tls` (over the kernel/loader-supplied auxv) is
 /// live. Returns `Ok(true)` when built, `Ok(false)` when no musl cross-compiler
 /// is present (the gate then SKIPs), `Err` on a build failure.
+/// Phase 95b deadlock-guard companion — a MULTITHREADED dynamic fixture that
+/// exercises the lazy-file-fault-under-lock class: 4 pthreads contending a
+/// **global** (`.bss`/`.data`) mutex + cond (cold lazy-file pages on first
+/// touch), `pthread_cond_broadcast` (FUTEX_CMP_REQUEUE) + `pthread_join`
+/// (CHILD_CLEARTID wake). Staged at `/usr/bin/dynamic-mt`; the
+/// `dynamic-hello-smoke` flow runs it and asserts `DYNAMIC_MT:ok` (a kernel
+/// wedge times the gate out). The lock MUST be a global — a stack-local lock
+/// faults into the non-blocking anonymous path and misses the bug.
+fn build_dynamic_mt_fixture() -> Result<bool, String> {
+    let cc = match find_musl_cc() {
+        Some(cc) => cc,
+        None => return Ok(false),
+    };
+    let root = workspace_root();
+    let libs = ensure_generated_libs_dir(&root);
+    let src = libs.join("dynamic-mt.c");
+    let out = libs.join("dynamic-mt");
+    let _ = fs::remove_file(&out);
+    let c_src = r#"#include <stdio.h>
+#include <pthread.h>
+static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_cond = PTHREAD_COND_INITIALIZER;
+static long g_counter = 0;
+#define N 4
+#define ITERS 20000
+static void *worker(void *arg) {
+    (void)arg;
+    for (int i = 0; i < ITERS; i++) {
+        pthread_mutex_lock(&g_mtx);
+        g_counter++;
+        pthread_cond_broadcast(&g_cond);
+        pthread_mutex_unlock(&g_mtx);
+    }
+    return (void *)0;
+}
+int main(void) {
+    pthread_t t[N];
+    for (long i = 0; i < N; i++) {
+        if (pthread_create(&t[i], (void *)0, worker, (void *)i) != 0) {
+            printf("DYNAMIC_MT:create-fail\n");
+            fflush(stdout);
+            return 1;
+        }
+    }
+    for (int i = 0; i < N; i++) {
+        pthread_join(t[i], (void *)0);
+    }
+    printf("DYNAMIC_MT:ok counter=%ld\n", g_counter);
+    fflush(stdout);
+    return 0;
+}
+"#;
+    fs::write(&src, c_src).map_err(|e| format!("write dynamic-mt.c: {e}"))?;
+    let status = Command::new(cc)
+        .args(["-O2", "-fPIE", "-pie", "-pthread", "-o"])
+        .arg(&out)
+        .arg(&src)
+        .status()
+        .map_err(|e| format!("invoke musl cc {cc}: {e}"))?;
+    if !status.success() {
+        return Err("dynamic-mt.c failed to compile".to_string());
+    }
+    if !out.exists() {
+        return Err("dynamic-mt binary missing after compile".to_string());
+    }
+    let sz = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+    println!(
+        "dynamic-hello-smoke: built dynamic-mt fixture {} ({sz} bytes)",
+        out.display()
+    );
+    Ok(true)
+}
+
+/// Phase 95b follow-up — the thread-group fatal-fault reproducer (the `addr=0x8`
+/// kernel bug). When ONE thread of a multithreaded process takes an unhandled
+/// fatal fault (NULL deref → SIGSEGV), the WHOLE thread group must die (Linux
+/// semantics). The pre-fix kernel killed only the FAULTING TID and freed the
+/// SHARED address space, so sibling threads parked `BlockedOnFutex` were either
+/// stranded forever (single-core hang) or — on SMP — raced against the
+/// page-table free into a kernel NULL+8 deref. This was hit by rust-lld's pool
+/// workers (a fault induced by the separately-fixed cross-DSO TLS bug). The fix
+/// routes the fatal-fault kill through the same group-quiesce + full-process-exit
+/// path as `exit_group(2)` (with SIGSEGV-encoded status -11).
+///
+/// Two falsifiable arms, both with N sibling threads blocked in
+/// `pthread_cond_wait` (i.e. `BlockedOnFutex`) at the instant of the fault:
+/// * `THREAD_FAULT:leader-ok` — the GROUP LEADER thread faults (caller == leader,
+///   the normal exit_group shape); the parent `waitpid(leader)` observes
+///   `WIFSIGNALED && SIGSEGV`.
+/// * `THREAD_FAULT:worker-ok` — a NON-leader worker faults while the leader +
+///   sleepers are all blocked (the exact rust-lld shape); the faulting tid
+///   becomes the group zombie, so the parent `waitpid(-1)` observes
+///   `WIFSIGNALED && SIGSEGV`.
+/// A regression hangs (siblings stranded → `waitpid` never returns → gate
+/// timeout) or panics the kernel (`process killed` / `KERNEL PANIC` /
+/// `RECURSIVE KERNEL PAGE FAULT` / `addr=0x8`). Staged at `/usr/bin/thread-fault`,
+/// run by `dynamic-hello-smoke` (`-smp` default exercises the SMP race arm).
+fn build_thread_fault_fixture() -> Result<bool, String> {
+    let cc = match find_musl_cc() {
+        Some(cc) => cc,
+        None => return Ok(false),
+    };
+    let root = workspace_root();
+    let libs = ensure_generated_libs_dir(&root);
+    let src = libs.join("thread-fault.c");
+    let out = libs.join("thread-fault");
+    let _ = fs::remove_file(&out);
+    let c_src = r#"#include <stdio.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <sched.h>
+#include <time.h>
+#include <signal.h>
+#include <sys/wait.h>
+/* N sibling threads parked in pthread_cond_wait (BlockedOnFutex) when the fault
+   fires — the threads the pre-fix kernel stranded after freeing the shared
+   address space out from under them. */
+#define NSLEEP 3
+static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_cond = PTHREAD_COND_INITIALIZER;
+static volatile int g_parked = 0;
+static void *sleeper(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&g_mtx);
+    g_parked++;
+    while (1) pthread_cond_wait(&g_cond, &g_mtx);   /* never signaled */
+    pthread_mutex_unlock(&g_mtx);
+    return (void *)0;
+}
+/* Spin until at least `want` threads have parked, then settle so they are truly
+   inside the futex wait (past `g_parked++`, in pthread_cond_wait). */
+static void wait_until_parked(int want) {
+    for (;;) {
+        pthread_mutex_lock(&g_mtx);
+        int p = g_parked;
+        pthread_mutex_unlock(&g_mtx);
+        if (p >= want) break;
+        sched_yield();
+    }
+    struct timespec ts = { 0, 150 * 1000 * 1000 };  /* 150 ms */
+    nanosleep(&ts, (void *)0);
+}
+static void crash_null(void) { *(volatile int *)0 = 0xdead; }  /* SIGSEGV */
+static void *crasher(void *arg) {
+    int want = (int)(long)arg;
+    wait_until_parked(want);
+    crash_null();
+    return (void *)0;   /* unreachable */
+}
+/* Child mode 0 (leader faults): spawn NSLEEP sleepers, then THIS (leader) thread
+   faults once they are all parked. Child mode 1 (worker faults): spawn NSLEEP
+   sleepers + 1 crasher worker, then the leader parks in cond_wait too; the
+   crasher faults once leader+sleepers are all parked. */
+static void child_body(int worker_mode) {
+    pthread_t t[NSLEEP];
+    for (int i = 0; i < NSLEEP; i++)
+        pthread_create(&t[i], (void *)0, sleeper, (void *)0);
+    if (!worker_mode) {
+        wait_until_parked(NSLEEP);
+        crash_null();           /* leader thread takes the fatal fault */
+        _exit(99);              /* unreachable if the kill works */
+    }
+    /* worker_mode: a non-leader worker faults; the leader blocks too (NSLEEP+1
+       parked) so every other thread is BlockedOnFutex at the fault instant. */
+    pthread_t cr;
+    pthread_create(&cr, (void *)0, crasher, (void *)(long)(NSLEEP + 1));
+    pthread_mutex_lock(&g_mtx);
+    g_parked++;
+    while (1) pthread_cond_wait(&g_cond, &g_mtx);   /* leader blocks forever */
+    _exit(98);                  /* unreachable */
+}
+int main(void) {
+    /* Arm 1 — leader faults; parent waits for the specific child pid. */
+    fflush(stdout);
+    pid_t k1 = fork();
+    if (k1 < 0) { printf("THREAD_FAULT:FAIL fork1\n"); fflush(stdout); return 1; }
+    if (k1 == 0) { child_body(0); _exit(97); }
+    int st = 0;
+    pid_t w = waitpid(k1, &st, 0);
+    if (w != k1) { printf("THREAD_FAULT:FAIL wait1=%d\n", (int)w); fflush(stdout); return 1; }
+    if (!(WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV)) {
+        printf("THREAD_FAULT:FAIL leader status=0x%x exited=%d\n",
+               st, WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+        fflush(stdout); return 1;
+    }
+    printf("THREAD_FAULT:leader-ok sig=%d\n", WTERMSIG(st));
+    fflush(stdout);
+    /* Arm 2 — a non-leader worker faults; the leader is reaped as a sibling, so
+       the faulting tid is the group zombie -> reap via waitpid(-1). */
+    g_parked = 0;
+    pid_t k2 = fork();
+    if (k2 < 0) { printf("THREAD_FAULT:FAIL fork2\n"); fflush(stdout); return 1; }
+    if (k2 == 0) { child_body(1); _exit(96); }
+    st = 0;
+    w = waitpid(-1, &st, 0);
+    if (w <= 0) { printf("THREAD_FAULT:FAIL wait2=%d\n", (int)w); fflush(stdout); return 1; }
+    if (!(WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV)) {
+        printf("THREAD_FAULT:FAIL worker status=0x%x exited=%d\n",
+               st, WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+        fflush(stdout); return 1;
+    }
+    printf("THREAD_FAULT:worker-ok sig=%d\n", WTERMSIG(st));
+    printf("THREAD_FAULT:ok\n");
+    fflush(stdout);
+    return 0;
+}
+"#;
+    fs::write(&src, c_src).map_err(|e| format!("write thread-fault.c: {e}"))?;
+    let status = Command::new(cc)
+        .args(["-O2", "-fPIE", "-pie", "-pthread", "-o"])
+        .arg(&out)
+        .arg(&src)
+        .status()
+        .map_err(|e| format!("invoke musl cc {cc}: {e}"))?;
+    if !status.success() {
+        return Err("thread-fault.c failed to compile".to_string());
+    }
+    if !out.exists() {
+        return Err("thread-fault binary missing after compile".to_string());
+    }
+    let sz = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+    println!(
+        "dynamic-hello-smoke: built thread-fault fixture {} ({sz} bytes)",
+        out.display()
+    );
+    Ok(true)
+}
+
+/// Phase 95b — the multi-module-TLS reproducer for the rust-lld worker-thread
+/// `threadIndex` bug that previously forced `--threads=1` (now dropped, commit
+/// 653391d7); kept as the permanent regression guard. It recreates rust-lld's
+/// EXACT failing pattern in a ~2-min fixture instead of the 15-min rust gate:
+///
+/// * `libfoo.so` — a `DT_NEEDED` DSO with an EXPORTED `__thread int foo_tls`,
+///   written via a general-dynamic accessor `foo_set()` (mirrors libLLVM's
+///   `work(): threadIndex = ThreadID`, an exported `extern thread_local` written
+///   inside the DSO ⇒ `R_X86_64_DTPMOD64`/`DTPOFF64`).
+/// * `dynamic-tls` — a `-pie` main exe with its OWN `__thread` (TLS module 1,
+///   like rust-lld's PT_TLS) that READS libfoo's `foo_tls` (TLS module 2) via
+///   INITIAL-EXEC (`__attribute__((tls_model("initial-exec")))` ⇒
+///   `R_X86_64_TPOFF64`, mirroring rust-lld's `addReloc`), across N pthreads.
+///
+/// Two TLS modules + a general-dynamic-write/initial-exec-read MIX on a worker
+/// thread — the exact case neither rustc (1 TLS module) nor `dynamic-mt` (0 DSO
+/// thread-locals) exercises. Each worker asserts the GD write is visible through
+/// the IE read; a divergence prints `DYNAMIC_TLS:FAIL …` (the bug, with the
+/// observed values), success prints `DYNAMIC_TLS:ok`. Staged at
+/// `/usr/bin/dynamic-tls` (+ `/usr/lib/libfoo.so` via the generated-libs `.so`
+/// auto-stage) and run by `dynamic-hello-smoke`.
+fn build_dynamic_tls_fixture() -> Result<bool, String> {
+    let cc = match find_musl_cc() {
+        Some(cc) => cc,
+        None => return Ok(false),
+    };
+    let root = workspace_root();
+    let libs = ensure_generated_libs_dir(&root);
+
+    // 1. libfoo.so — exported __thread var + general-dynamic accessors.
+    let foo_src = libs.join("libfoo.c");
+    let foo_so = libs.join("libfoo.so");
+    let _ = fs::remove_file(&foo_so);
+    let foo_c = r#"/* m3OS Phase 95b TLS repro DSO. An exported thread_local written
+   via a general-dynamic accessor — mirrors libLLVM's work(): threadIndex=ThreadID
+   (an exported `extern thread_local` written INSIDE the DSO -> DTPMOD64/DTPOFF64). */
+__thread int foo_tls = -1;
+void foo_set(int v) { foo_tls = v; }
+int  foo_get(void)  { return foo_tls; }
+"#;
+    fs::write(&foo_src, foo_c).map_err(|e| format!("write libfoo.c: {e}"))?;
+    let status = Command::new(cc)
+        .args(["-shared", "-fPIC", "-O2", "-Wl,-soname,libfoo.so", "-o"])
+        .arg(&foo_so)
+        .arg(&foo_src)
+        .status()
+        .map_err(|e| format!("invoke musl cc {cc}: {e}"))?;
+    if !status.success() {
+        return Err("libfoo.so failed to compile".to_string());
+    }
+
+    // 2. dynamic-tls — -pie main exe: own __thread (module 1) + INITIAL-EXEC read
+    //    of libfoo's __thread (module 2) + general-dynamic write via foo_set, from
+    //    N pthreads with a sched_yield between write and read to force a context
+    //    switch (exercises any FS_BASE/DTV save-restore subtlety too).
+    let src = libs.join("dynamic-tls.c");
+    let out = libs.join("dynamic-tls");
+    let _ = fs::remove_file(&out);
+    let c_src = r#"#include <stdio.h>
+#include <pthread.h>
+#include <sched.h>
+/* main-exe thread_local — TLS module 1 (mirrors rust-lld's own PT_TLS). */
+static __thread int main_tls = 222;
+/* libfoo's thread_local — TLS module 2 — read via INITIAL-EXEC. The attribute
+   forces the IE model so this matches rust-lld's addReloc (R_X86_64_TPOFF64)
+   rather than defaulting to general-dynamic for a PIE-referenced DSO var. */
+extern __thread int foo_tls __attribute__((tls_model("initial-exec")));
+extern void foo_set(int v);   /* general-dynamic write inside libfoo (like work()) */
+extern int  foo_get(void);    /* general-dynamic read inside libfoo */
+#define N 4
+#define ITERS 2000
+static volatile int g_fail = 0;
+static volatile int g_id = 0, g_ie = 0, g_gd = 0, g_main = 0;
+static void *worker(void *arg) {
+    int id = (int)(long)arg + 1;   /* 1-based, like an LLVM worker ThreadID */
+    for (int i = 0; i < ITERS && !g_fail; i++) {
+        foo_set(id);               /* general-dynamic WRITE of the DSO thread_local */
+        main_tls = id;             /* write the main-exe thread_local */
+        sched_yield();             /* force a context switch between write and read */
+        int ie = foo_tls;          /* INITIAL-EXEC READ (the rust-lld addReloc pattern) */
+        int gd = foo_get();        /* general-dynamic read (same var) */
+        if (ie != id || gd != id || main_tls != id) {
+            g_id = id; g_ie = ie; g_gd = gd; g_main = main_tls;
+            g_fail = 1;
+            return (void *)0;
+        }
+    }
+    return (void *)0;
+}
+int main(void) {
+    pthread_t t[N];
+    for (long i = 0; i < N; i++) {
+        if (pthread_create(&t[i], (void *)0, worker, (void *)i) != 0) {
+            printf("DYNAMIC_TLS:create-fail\n"); fflush(stdout); return 1;
+        }
+    }
+    for (int i = 0; i < N; i++) pthread_join(t[i], (void *)0);
+    if (g_fail)
+        printf("DYNAMIC_TLS:FAIL id=%d ie=%d gd=%d main=%d\n", g_id, g_ie, g_gd, g_main);
+    else
+        printf("DYNAMIC_TLS:ok\n");
+    fflush(stdout);
+    return 0;
+}
+"#;
+    fs::write(&src, c_src).map_err(|e| format!("write dynamic-tls.c: {e}"))?;
+    let status = Command::new(cc)
+        .args(["-O2", "-fPIE", "-pie", "-pthread", "-o"])
+        .arg(&out)
+        .arg(&src)
+        .arg(format!("-L{}", libs.display()))
+        .arg("-lfoo")
+        .status()
+        .map_err(|e| format!("invoke musl cc {cc}: {e}"))?;
+    if !status.success() {
+        return Err("dynamic-tls.c failed to compile/link".to_string());
+    }
+    if !out.exists() {
+        return Err("dynamic-tls binary missing after compile".to_string());
+    }
+    let sz = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+    println!(
+        "dynamic-hello-smoke: built dynamic-tls fixture {} + libfoo.so ({sz} bytes)",
+        out.display()
+    );
+    Ok(true)
+}
+
 fn build_dynamic_hello_fixture() -> Result<bool, String> {
     let cc = match find_musl_cc() {
         Some(cc) => cc,
@@ -21588,6 +22374,17 @@ int main(void) {
         "dynamic-hello-smoke: built fixture {} ({sz} bytes, PT_INTERP={INTERP})",
         out.display()
     );
+
+    // Also build the multithreaded deadlock-repro companion (staged + run by the
+    // same gate as the lazy-file-fault-under-lock regression guard).
+    build_dynamic_mt_fixture()?;
+    // Phase 95b follow-up — the multi-module-TLS reproducer (libfoo.so + a -pie
+    // main exe) for the rust-lld worker-thread `threadIndex` bug.
+    build_dynamic_tls_fixture()?;
+    // Phase 95b follow-up — the thread-group fatal-fault reproducer (the addr=0x8
+    // bug): a fault in one thread must kill the whole group, not strand siblings.
+    build_thread_fault_fixture()?;
+
     Ok(true)
 }
 
@@ -21750,6 +22547,77 @@ fn dynamic_hello_smoke_steps() -> Vec<SmokeStep> {
         ],
         timeout_secs: 45,
         label: "dynamic-hello-smoke: DLOPEN:ok (dlopen+dlsym+call)",
+        exit_code_on_fail: SMOKE_EXIT_DYNAMIC_HELLO_FAILED,
+    });
+    // Phase 95b — run the multithreaded `dynamic-mt` repro (4 pthreads + a global
+    // mutex/cond). The `__copy_tls td=0` crash is fixed; this now exercises the
+    // lazy-file-fault-under-lock wedge during thread setup. `DYNAMIC_MT:ok` proves
+    // no wedge; a regression hangs (timeout) or crashes (fail-prefix). The kernel
+    // deadlock-guard names the culprit syscall in the serial on a wedge.
+    steps.push(SmokeStep::Send {
+        input: "/usr/bin/dynamic-mt\n",
+        label: "dynamic-hello-smoke: run multithreaded dynamic repro",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "DYNAMIC_MT:ok",
+        fail_prefixes: &[
+            "DYNAMIC_MT:create-fail",
+            "Segmentation fault",
+            "ended by signal SIGSEGV",
+            "process killed",
+        ],
+        timeout_secs: 60,
+        label: "dynamic-hello-smoke: DYNAMIC_MT:ok (multithreaded)",
+        exit_code_on_fail: SMOKE_EXIT_DYNAMIC_HELLO_FAILED,
+    });
+    // Phase 95b follow-up — the multi-module-TLS reproducer for the rust-lld
+    // worker `threadIndex` bug: a general-dynamic write of a DT_NEEDED DSO's
+    // thread_local + an initial-exec read of it on each pthread. `DYNAMIC_TLS:ok`
+    // means the GD write is visible through the IE read on workers (the fix);
+    // `DYNAMIC_TLS:FAIL id=N ie=-1 …` is the rust-lld bug reproduced.
+    steps.push(SmokeStep::Send {
+        input: "/usr/bin/dynamic-tls\n",
+        label: "dynamic-hello-smoke: run multi-module TLS repro",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "DYNAMIC_TLS:ok",
+        fail_prefixes: &[
+            "DYNAMIC_TLS:FAIL",
+            "DYNAMIC_TLS:create-fail",
+            "Segmentation fault",
+            "ended by signal SIGSEGV",
+            "process killed",
+        ],
+        timeout_secs: 60,
+        label: "dynamic-hello-smoke: DYNAMIC_TLS:ok (DSO thread_local on workers)",
+        exit_code_on_fail: SMOKE_EXIT_DYNAMIC_HELLO_FAILED,
+    });
+    // Phase 95b follow-up — the thread-group fatal-fault reproducer (the addr=0x8
+    // bug). A fatal fault in ONE thread of a multithreaded process must terminate
+    // the WHOLE group; the pre-fix kernel killed only the faulting TID and freed
+    // the shared address space, stranding siblings BlockedOnFutex (single-core
+    // hang) or racing the page-table free into a kernel NULL+8 deref (SMP). The
+    // binary forks two multithreaded children (leader-faults + worker-faults) and
+    // asserts each is reaped with WIFSIGNALED && SIGSEGV. A regression HANGS (the
+    // stranded-sibling deadlock → waitpid never returns → this step times out) or
+    // PANICS the kernel (the fail-prefixes below). The `process killed` / panic /
+    // recursive-#PF / `addr=0x8` prefixes catch the SMP race; note `THREAD_FAULT`
+    // itself prints no such line on success — the children die *cleanly* via the
+    // group teardown, no `process killed` log.
+    steps.push(SmokeStep::Send {
+        input: "/usr/bin/thread-fault\n",
+        label: "dynamic-hello-smoke: run thread-group fatal-fault repro",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "THREAD_FAULT:ok",
+        fail_prefixes: &[
+            "THREAD_FAULT:FAIL",
+            "KERNEL PANIC",
+            "RECURSIVE KERNEL PAGE FAULT",
+            "addr=0x8",
+        ],
+        timeout_secs: 90,
+        label: "dynamic-hello-smoke: THREAD_FAULT:ok (group dies on one-thread fault)",
         exit_code_on_fail: SMOKE_EXIT_DYNAMIC_HELLO_FAILED,
     });
     steps
@@ -23201,6 +24069,17 @@ fn cmd_rustc_smoke(args: &SmokeBootArgs) {
     // (paired with rustc_smoke_steps() skipping the install) for kernel-fix iteration.
     let fast_iter = std::env::var("M3OS_RUST_FAST_ITER").is_ok();
     let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    // The rust toolchain is a ~484 MiB `.m3pkg` that installs ~484 MiB of files —
+    // both live on the data disk simultaneously (the `.m3pkg` in `/usr/pkg`, the
+    // install under `/usr`), on top of the bundled base packages. A 1 GiB disk
+    // ENOSPCs mid-install (~330 MiB written), so size it to ~3 GiB unless the
+    // caller already pinned `M3OS_DATA_DISK_GB`. SAFETY: xtask is single-threaded
+    // here; `set_var` is `unsafe` in edition 2024.
+    if std::env::var("M3OS_DATA_DISK_GB").is_err() {
+        unsafe {
+            std::env::set_var("M3OS_DATA_DISK_GB", "3");
+        }
+    }
     if fast_iter && disk_img.exists() {
         println!("rustc-smoke: M3OS_RUST_FAST_ITER — reusing existing disk (skipping install)");
     } else {
@@ -23340,14 +24219,17 @@ fn rustc_smoke_steps() -> Vec<SmokeStep> {
     });
 
     // 4. Compile + link (bundled rust-lld) + RUN inside m3OS. m3OS has no system
-    //    `cc`/`ld`, so rustc is told to link directly with its bundled rust-lld
-    //    (self-contained linker + crt). The `RUSTC_OK` sentinel is printed by the
+    //    `cc`/`ld`, so rustc is told to link directly with its bundled rust-lld:
+    //    `-C linker=rust-lld` NAMES that vendored lld (the `ld.lld` flavor alone
+    //    defaults the linker binary to `lld`, which m3OS lacks → "linker `lld` not
+    //    found"), and `link-self-contained=yes` supplies the musl crt + libs. The
+    //    `RUSTC_OK` sentinel is printed by the
     //    running program (from the fixture), proving the toolchain produced a
     //    working native binary — not merely cross-built. No proc-macros in the
     //    dependency graph (the milestone is proc-macro-free by construction).
     steps.push(SmokeStep::Send {
-        input: "rustc -C linker-flavor=ld.lld -C link-self-contained=yes /usr/src/hello.rs -o /tmp/hello && /tmp/hello\n",
-        label: "rustc-smoke: rustc hello.rs (rust-lld) + run",
+        input: "rustc -C linker=rust-lld -C linker-flavor=ld.lld -C link-self-contained=yes /usr/src/hello.rs -o /tmp/hello && /tmp/hello\n",
+        label: "rustc-smoke: rustc hello.rs (rust-lld, multithreaded) + run",
     });
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: "RUSTC_OK hello from rustc",
@@ -24308,16 +25190,30 @@ fn create_data_disk(
     let disk_path = output_dir.join("disk.img");
     // Phase 36: increased from 128 MB to 1 GB to support the expanded persistent
     // storage requirements for filesystem stress testing and larger workloads.
-    const DISK_SIZE: u64 = 1024 * 1024 * 1024; // 1 GB
+    //
+    // Phase 95c: `M3OS_DATA_DISK_GB` overrides the default 1 GiB. A multi-hundred-MB
+    // package install needs the `.m3pkg` on disk (in `/usr/pkg`) AND the extracted
+    // files AND the base system simultaneously — e.g. the rust toolchain is a
+    // ~484 MiB `.m3pkg` that installs ~484 MiB of files, so `rustc-smoke` requests
+    // ~3 GiB (a 1 GiB disk ENOSPCs mid-install after ~330 MiB written). Clamped to
+    // [1, 64] GiB (well within the u32 sector count below).
+    let disk_size: u64 = {
+        let gb = std::env::var("M3OS_DATA_DISK_GB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1)
+            .clamp(1, 64);
+        gb * 1024 * 1024 * 1024
+    };
     if disk_path.exists() {
         let meta = std::fs::metadata(&disk_path).ok();
         let size = meta.map(|m| m.len()).unwrap_or(0);
-        if size < DISK_SIZE {
+        if size < disk_size {
             println!(
                 "WARNING: existing data disk is {} MB but {} MB is expected. \
                  Delete {} to recreate at the correct size.",
                 size / (1024 * 1024),
-                DISK_SIZE / (1024 * 1024),
+                disk_size / (1024 * 1024),
                 disk_path.display()
             );
         }
@@ -24358,7 +25254,7 @@ fn create_data_disk(
 
     const SECTOR_SIZE: u64 = 512;
     const PARTITION_START_LBA: u32 = 2048; // 1 MB offset
-    let total_sectors = (DISK_SIZE / SECTOR_SIZE) as u32;
+    let total_sectors = (disk_size / SECTOR_SIZE) as u32;
     let partition_sectors = total_sectors - PARTITION_START_LBA;
     let partition_offset = PARTITION_START_LBA as u64 * SECTOR_SIZE;
     let partition_size = partition_sectors as u64 * SECTOR_SIZE;
@@ -24374,7 +25270,7 @@ fn create_data_disk(
             eprintln!("Error: failed to create disk.img: {e}");
             std::process::exit(1);
         });
-    disk_file.set_len(DISK_SIZE).unwrap_or_else(|e| {
+    disk_file.set_len(disk_size).unwrap_or_else(|e| {
         eprintln!("Error: failed to set disk.img size: {e}");
         std::process::exit(1);
     });
@@ -25224,12 +26120,39 @@ fn populate_ext2_files(
     // Present only for that gate; absent (no-op) otherwise. `/usr/bin` is
     // created idempotently (debugfs mkdir ignores EEXIST).
     let dynamic_hello_bin = workspace_root().join("target/generated-libs/dynamic-hello");
+    let dynamic_mt_bin = workspace_root().join("target/generated-libs/dynamic-mt");
     let dynamic_hello_cmds = if dynamic_hello_bin.exists() {
-        format!(
+        let mut s = format!(
             "mkdir usr/bin\nsif usr/bin mode 0x41ED\nsif usr/bin uid 0\nsif usr/bin gid 0\n\
              write \"{src}\" usr/bin/dynamic-hello\nsif usr/bin/dynamic-hello mode 0x81ED\nsif usr/bin/dynamic-hello uid 0\nsif usr/bin/dynamic-hello gid 0\n",
             src = dynamic_hello_bin.display(),
-        )
+        );
+        // Phase 95b — stage the multithreaded deadlock-repro companion alongside.
+        if dynamic_mt_bin.exists() {
+            s.push_str(&format!(
+                "write \"{src}\" usr/bin/dynamic-mt\nsif usr/bin/dynamic-mt mode 0x81ED\nsif usr/bin/dynamic-mt uid 0\nsif usr/bin/dynamic-mt gid 0\n",
+                src = dynamic_mt_bin.display(),
+            ));
+        }
+        // Phase 95b follow-up — stage the multi-module-TLS reproducer (its
+        // libfoo.so auto-stages to /usr/lib via the generated-libs `.so` loop).
+        let dynamic_tls_bin = workspace_root().join("target/generated-libs/dynamic-tls");
+        if dynamic_tls_bin.exists() {
+            s.push_str(&format!(
+                "write \"{src}\" usr/bin/dynamic-tls\nsif usr/bin/dynamic-tls mode 0x81ED\nsif usr/bin/dynamic-tls uid 0\nsif usr/bin/dynamic-tls gid 0\n",
+                src = dynamic_tls_bin.display(),
+            ));
+        }
+        // Phase 95b follow-up — stage the thread-group fatal-fault reproducer
+        // (the addr=0x8 bug guard).
+        let thread_fault_bin = workspace_root().join("target/generated-libs/thread-fault");
+        if thread_fault_bin.exists() {
+            s.push_str(&format!(
+                "write \"{src}\" usr/bin/thread-fault\nsif usr/bin/thread-fault mode 0x81ED\nsif usr/bin/thread-fault uid 0\nsif usr/bin/thread-fault gid 0\n",
+                src = thread_fault_bin.display(),
+            ));
+        }
+        s
     } else {
         String::new()
     };

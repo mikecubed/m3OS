@@ -1298,6 +1298,35 @@ pub fn shared_vma_prot_and_pkey(pid: Pid, addr: u64) -> Option<(u64, u8)> {
         .map(|m| (m.prot, m.pkey))
 }
 
+/// Phase 95b (Area A.2) — demand-fill info for a **lazy file-backed** VMA
+/// (`MAP_LAZY_FILE`). Returns `(prot, pkey, fd, file_offset_of_this_page,
+/// vma_end)` so the page-fault handler can read the faulting page (and a
+/// readahead cluster up to `vma_end`) straight from the backing file, or `None`
+/// when `addr` is not inside a lazy file-backed VMA (the caller then falls back
+/// to zero-fill demand paging). All fields are copied out so the `PROCESS_TABLE`
+/// lock is released before the (blocking) file read.
+pub fn shared_vma_demand_file(pid: Pid, addr: u64) -> Option<(u64, u8, u32, u64, u64)> {
+    let table = PROCESS_TABLE.lock();
+    let tgid = table.find(pid)?.tgid;
+    let idx = canonical_mm_index(&table.processes, tgid)?;
+    let vma = table.processes[idx].find_vma(addr)?;
+    if vma.flags & kernel_core::mm::MAP_LAZY_FILE == 0 {
+        return None;
+    }
+    let fb = vma.file_backing?;
+    let page_base = addr & !0xFFF;
+    // file offset of this page = first-byte offset + distance from vma.start.
+    // `MAP_LAZY_FILE` and `file_offset` are both userspace-controlled via `mmap`
+    // (the offset is only page-alignment-checked, not bounded against u64::MAX),
+    // so a bogus near-`u64::MAX` offset could overflow here. Treat overflow as an
+    // invalid lazy mapping and return `None` — the caller then falls back to
+    // zero-fill demand paging (this function's documented `None` contract)
+    // instead of `wrapping_add` silently aliasing the wrong file region.
+    let page_file_off = fb.offset.checked_add(page_base.saturating_sub(vma.start))?;
+    let vma_end = vma.start.saturating_add(vma.len);
+    Some((vma.prot, vma.pkey, fb.fd, page_file_off, vma_end))
+}
+
 pub fn with_shared_mm_mut<R, F>(pid: Pid, f: F) -> Option<R>
 where
     F: FnOnce(&mut u64, &mut u64, &mut VmaTree) -> R,

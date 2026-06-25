@@ -18,7 +18,26 @@ use kernel_core::fs::ext2::{
     S_IFLNK, S_IFREG,
 };
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
+
+/// Engine-unification Phase C1 — count of LOGICAL block reads the **in-kernel**
+/// root ext2 engine served (the root volume, `dev_id == 0`), incremented on
+/// every `read_block`/`read_block_into_slice`/`read_run_into_slice` whether the
+/// block came from the in-kernel cache or the device. After Phases A+B routed
+/// every root read + exec to `vfs_server`, this should stop climbing once
+/// `vfs_server` is registered: a non-zero post-registration delta means a root
+/// read still reaches the second engine (a degraded vfs-IPC fallback, or a
+/// missed routing — the regression this guard exists to catch). Exposed via
+/// `/proc/blkstats` as `inkernel_root_reads`; the `vfs-throughput-probe` asserts
+/// its steady-state delta is ~0. NOT incremented for secondary `/mnt/usbN`
+/// mounts (`dev_id >= 1`), which are a separate engine by design.
+pub static IN_KERNEL_ROOT_READS: AtomicU64 = AtomicU64::new(0);
+
+/// Current value of the in-kernel root-read counter (see [`IN_KERNEL_ROOT_READS`]).
+pub fn in_kernel_root_reads() -> u64 {
+    IN_KERNEL_ROOT_READS.load(Ordering::Relaxed)
+}
 
 // ---------------------------------------------------------------------------
 // Ext2Volume (P28-T019)
@@ -425,6 +444,10 @@ impl Ext2Volume {
     /// being invoked while holding a spinlock, avoiding potential contention
     /// between the allocator lock and the cache lock.
     fn read_block(&self, block_num: u32) -> Result<Vec<u8>, Ext2Error> {
+        // Phase C1: count this in-kernel root read (see `IN_KERNEL_ROOT_READS`).
+        if self.dev_id == 0 {
+            IN_KERNEL_ROOT_READS.fetch_add(1, Ordering::Relaxed);
+        }
         // Pre-allocate the result buffer outside any lock so the heap
         // allocator is never called while a spinlock is held.
         let mut buf = vec![0u8; self.block_size as usize];
@@ -475,6 +498,10 @@ impl Ext2Volume {
         block_offset: usize,
         dst: &mut [u8],
     ) -> Result<(), Ext2Error> {
+        // Phase C1: count this in-kernel root read (see `IN_KERNEL_ROOT_READS`).
+        if self.dev_id == 0 {
+            IN_KERNEL_ROOT_READS.fetch_add(1, Ordering::Relaxed);
+        }
         // Cache hit: copy directly under the spinlock — no heap allocation.
         {
             let cache = self.block_cache.lock();
@@ -536,6 +563,10 @@ impl Ext2Volume {
         count: u32,
         dst: &mut [u8],
     ) -> Result<(), Ext2Error> {
+        // Phase C1: count these in-kernel root reads (see `IN_KERNEL_ROOT_READS`).
+        if self.dev_id == 0 {
+            IN_KERNEL_ROOT_READS.fetch_add(count as u64, Ordering::Relaxed);
+        }
         read_sectors_for(
             self.dev_id,
             self.block_to_lba(start_block),
@@ -555,6 +586,31 @@ impl Ext2Volume {
     /// next read repopulates from disk.
     pub fn invalidate_block_cache(&self) {
         self.block_cache.lock().clear();
+    }
+
+    /// Granular counterpart of [`invalidate_block_cache`]: drop ONLY the cached
+    /// blocks overlapping the raw sector range `[start_lba, start_lba + count)`.
+    ///
+    /// Phase 95c — after a routed `vfs_server` mutation the kernel used to clear
+    /// its ENTIRE ext2 cache (the write authority is out-of-band), which evicts
+    /// the hot inode-table / directory / bitmap blocks the read-heavy
+    /// create/write path immediately re-reads — ~17 device reads per create.
+    /// `sys_block_write` is the choke point for every root mutation, so the
+    /// kernel records the written ranges and invalidates only those here,
+    /// keeping the unchanged metadata warm. Out-of-range / pre-data writes fall
+    /// back to a full clear (cannot under-invalidate).
+    pub fn invalidate_lba_range(&self, start_lba: u64, count: usize) {
+        let spb = self.sectors_per_block as u64;
+        if spb == 0 || count == 0 || start_lba < self.base_lba {
+            self.block_cache.lock().clear();
+            return;
+        }
+        let first = (start_lba - self.base_lba) / spb;
+        let last = (start_lba + count as u64 - 1 - self.base_lba) / spb;
+        let mut cache = self.block_cache.lock();
+        for block_num in first..=last {
+            cache.remove(&(block_num as u32));
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1701,20 +1757,73 @@ pub fn unmount_ext2() {
     *EXT2_VOLUME.lock() = None;
 }
 
-/// Flush the kernel ext2 read cache (Phase 88).
+/// Phase 95c — pending root-device dirty-write ranges, recorded by
+/// `sys_block_write` (the choke point for every `vfs_server` root mutation) and
+/// drained by `invalidate_cache` so the in-kernel ext2 cache invalidates ONLY
+/// the blocks vfs_server actually changed instead of clearing wholesale. On
+/// overflow (more ranges than the buffer holds before the next drain) it falls
+/// back to a whole clear — under-invalidation is impossible by construction.
+const PENDING_DIRTY_CAP: usize = 64;
+struct PendingDirty {
+    ranges: [(u64, u32); PENDING_DIRTY_CAP],
+    len: usize,
+    overflow: bool,
+}
+static PENDING_DIRTY: Mutex<PendingDirty> = Mutex::new(PendingDirty {
+    ranges: [(0, 0); PENDING_DIRTY_CAP],
+    len: 0,
+    overflow: false,
+});
+
+/// Record a raw root-device sector write so the next `invalidate_cache` can drop
+/// exactly those blocks. Called from `sys_block_write`. Cheap (one push under a
+/// short spinlock); overflows degrade to a whole-cache clear.
+pub fn record_dirty_root_write(start_lba: u64, count: usize) {
+    let mut pd = PENDING_DIRTY.lock();
+    if pd.overflow {
+        return;
+    }
+    if pd.len >= PENDING_DIRTY_CAP {
+        pd.overflow = true;
+        return;
+    }
+    let idx = pd.len;
+    pd.ranges[idx] = (start_lba, count as u32);
+    pd.len += 1;
+}
+
+/// Flush the kernel ext2 read cache after a routed mutation (Phase 88/95c).
 ///
 /// Called by the syscall layer after it routes a mutating ext2 op to the
 /// `vfs_server` write authority, so the kernel's own metadata reads
-/// (`resolve_path`, exec loader) don't serve a stale cached block.
+/// (`resolve_path`, exec loader) don't serve a stale cached block. Phase 95c:
+/// invalidate ONLY the blocks vfs_server wrote (recorded via
+/// `record_dirty_root_write`), keeping the unchanged metadata warm; a whole
+/// clear only on overflow.
 pub fn invalidate_cache() {
-    if let Some(vol) = EXT2_VOLUME.lock().as_ref() {
-        vol.invalidate_block_cache();
+    // Lock ordering: `EXT2_VOLUME` is a YieldingMutex (its `lock()` may
+    // deschedule), so it must be acquired OUTSIDE the `PENDING_DIRTY` spinlock —
+    // never hold a spinlock across a yielding acquire. `PENDING_DIRTY` (and the
+    // volume's `block_cache`) are then taken briefly inside, with no yield.
+    {
+        let vol_guard = EXT2_VOLUME.lock();
+        let mut pd = PENDING_DIRTY.lock();
+        if let Some(vol) = vol_guard.as_ref() {
+            if pd.overflow {
+                vol.invalidate_block_cache();
+            } else {
+                for i in 0..pd.len {
+                    let (lba, count) = pd.ranges[i];
+                    vol.invalidate_lba_range(lba, count as usize);
+                }
+            }
+        }
+        pd.len = 0;
+        pd.overflow = false;
     }
-    // Phase 89: the syscall layer calls this after every ext2 mutation it routes
-    // to the `vfs_server` write authority, so it is the natural choke point to
-    // also invalidate the kernel path-metadata (stat) cache — a routed write /
-    // create / unlink / rename / truncate changes the very stat results that
-    // cache holds.
+    // The path-metadata (stat) cache is small and the kernel cannot map a block
+    // range back to affected paths, so it stays a whole bump — the re-reads it
+    // forces now hit the (still-warm) block cache rather than the device.
     crate::fs::metacache::bump();
 }
 
@@ -1754,18 +1863,4 @@ pub fn reap_unused_ext2_inode(inode_num: u32) {
     }
     let _ = vol.truncate_file(inode_num, &mut inode);
     let _ = vol.free_inode(inode_num);
-}
-
-/// Check if a root-relative ext2 path is a regular file (not directory/symlink).
-/// Returns `false` if the volume is not mounted or the path does not exist.
-pub fn is_ext2_regular_file(path: &str) -> bool {
-    use kernel_core::fs::ext2::{S_IFMT, S_IFREG};
-    let vol = EXT2_VOLUME.lock();
-    match vol.as_ref() {
-        Some(vol) => match vol.metadata(path) {
-            Ok((_, _, mode, _, _)) => mode & S_IFMT == S_IFREG,
-            Err(_) => false,
-        },
-        None => false,
-    }
 }

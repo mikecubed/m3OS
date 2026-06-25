@@ -1,0 +1,508 @@
+---
+forward-plan: ➜ The remaining work to finish Phase 95 is tracked in
+  `docs/handoffs/2026-06-24-phase-95-completion-plan.md` (the canonical plan). The CRASH
+  CHAIN this doc is named for is DONE — `rustc --version` (1.96.0) and `rustc --print sysroot`
+  (/usr) run on-device. The only remaining `RUSTC_OK` blocker is the `rustc hello.rs`
+  multithreaded-compile stall (plan Step 1). This doc remains the technical record + the
+  repro gotchas.
+status: VALIDATED (page-table fix works) + PERF REFRAMED. The intermediate-writable
+  page-table fix is CONFIRMED on-device: with it, `rustc --version` → `rustc 1.96.0`
+  and `rustc --print sysroot` → `/usr` both RUN (serial-captured) — the 165 M-iteration
+  fault loop is GONE. The remaining `RUSTC_OK` gap is **`rustc hello.rs`** (the real
+  compile + `rust-lld` link): it loads, spawns its codegen threads, then goes silent —
+  a multithreaded-compile hang/very-slow, NOT a page-table or filesystem issue (a
+  `[sched] dequeue-drop … state-not-ready` warning on a rustc worker is a lead).
+  PERF FINDINGS (measured under KVM via the enhanced `vfs-throughput-probe`): the
+  long-assumed "40-min install / slow filesystem" was a **TCG artifact** — under KVM the
+  filesystem is FAST (136 MB/s write, 422 MB/s read, 217 µs IPC round-trip), `pkg install
+  rust` is **25 s**, and the 169 MB `librustc_driver.so` cold-load is **9.6 s** (not 8 min;
+  302 K relocs, 94% cheap RELATIVE, GNU-hash O(1) — reloc CPU was never the wall). The one
+  real FS pathology found: **O(N²) metadata-create** — every `open(O_CREAT)` resolves the
+  full path, scanning the (growing) target directory for a name that isn't there
+  (`resolve_path` → per-component block scan), so a burst of N creates was O(N²) (measured
+  196→935 ms per 100 files, growing). FIX (vfs_server, Phase 95c): a per-directory
+  **entry-name→inode index** (`DirIndex`) keyed by inode number, making `resolve_path`'s
+  per-component lookup + `create_file`'s EEXIST check + `add_directory_entry`'s free-slot
+  search all O(1) amortised; coherence funnels through `add_directory_entry` (insert),
+  `remove_directory_entry` (clear), `update_dotdot` (clear). Measured (1000-file bench):
+  many-files 5083→3001 ms (−41%), last-batch 935→400 ms, super-linear growth 4.8×→2.1×,
+  `verify=ok`. SECOND FIX — the residual 2.1× growth was the block/inode-bitmap free-search
+  scanning from bit 0 (`claim_block_run`/`allocate_inode`, O(fill) per alloc); added a
+  **per-group free-search cursor** (`block_search_cursor`/`inode_search_cursor`) that
+  resumes where the last alloc in that group left off and wraps to 0 (correctness is
+  cursor-independent — every bit is still visited), with a free rewinding the cursor so the
+  slot is reused. Combined result (300-file bench): per-create 5.08→3.00→**2.11 ms/file**,
+  growth 4.8×→2.1×→**1.30× (flat)**, device reads flat across batches (1042→1084),
+  `write_calls_delta=649` unchanged, gate PASSES. THIRD FIX — the device-op floor: profiling
+  showed vfs_server's own block cache is 99.9% effective (9 misses / 300 creates), so the
+  ~17 device reads/create are KERNEL-side: `open(O_CREAT|O_WRONLY|O_TRUNC)`+writes aren't
+  routed to vfs_server (`vfs_service_should_route` only routes read-only opens), so the
+  create/write runs partly through the in-kernel ext2 engine, which the kernel WHOLE-cleared
+  (`invalidate_cache`) after every routed mutation — evicting the hot inode-table/dir/bitmap
+  blocks the read-heavy path re-reads. Fix (kernel-only): `sys_block_write` (the choke point
+  for every vfs_server root mutation) records the written sector ranges
+  (`record_dirty_root_write` → a `PENDING_DIRTY` buffer); `invalidate_cache` invalidates ONLY
+  those (`Ext2Volume::invalidate_lba_range`), keeping unchanged metadata warm; overflow →
+  whole-clear (cannot under-invalidate — ring-3 vfs_server can only touch the device via
+  `sys_block_write`, so the recorded set is complete). Measured: device reads 1042→186/batch
+  (−82%, ~17→~3 reads/create), per-create 2.11→**1.61 ms**, 621 files/s, `verify=ok`
+  (write-then-read-back coherence holds). Remaining lever: the ~7 metadata write-throughs
+  per create (a durability-vs-speed tradeoff). ALSO landed:
+  `vfs-throughput-smoke` honors `M3OS_KVM`; the probe gained `ipc_rtt`/per-phase
+  throughput + per-batch block-op sentinels; `run_smoke_script` prints per-step `[timing]`.
+  ---PRIOR STATUS (page-table root-cause) BELOW---
+status: ROOT-CAUSED + FIXED (verification run pending) — the KERNEL mm fault-LOOP
+  is a **non-writable intermediate page-table entry**. Definitive err code captured:
+  `addr=0x200c79f000 rip=0x200a204838 err=0x7` = PRESENT|WRITE|USER (NO protection-key
+  bit) — i.e. the page is mapped but the WRITE is denied, repeating forever. The page is
+  mallocng's freshly-mmap'd anon RW group (`alloc_group`'s `mov %rbp,(%rsi)` storing
+  `g->meta`). Mechanism: on x86-64 the effective writability of a 4 KiB page is the AND
+  of WRITABLE across **all four** paging levels, but the kernel's spurious-write-fault
+  recovery (`interrupts.rs`) and `leaf_pte_flag_bits` only inspected the **leaf** PTE.
+  The leaf was WRITABLE|USER, so the handler treated each fault as a benign SMP race
+  (`invlpg`+retry) and returned — but an **intermediate** (PDPT/PD) entry had WRITABLE
+  clear, so the retry re-faulted → 165 M-iteration loop, `demand_pages` frozen at 35631.
+  WHY the intermediate was RO: the `x86_64` crate's default `Mapper::map_to` derives its
+  parent-table flags from the *leaf* flags (`flags & (PRESENT|WRITABLE|USER)`). m3OS's
+  eager file-backed mmap (`map_user_frames`), the kernel ELF loader (`mm/elf.rs`), and
+  `map_user_pages`/`_contiguous` all used plain `map_to` — so a **PROT_READ** segment
+  (a DSO `.text`/`.rodata`, the loader maps these for rustc's DSOs) created **non-writable
+  intermediate tables**; a later writable anon mmap landing in the same 1 GiB/2 MiB
+  region reused that RO intermediate (`map_current_user_page_inner` reused existing
+  intermediates without upgrading them) → effective-RO leaf-writable page. FIX (4 parts,
+  all in-kernel, `cargo xtask check` green): (1) `user_space::USER_PARENT_TABLE_FLAGS`
+  const = PRESENT|WRITABLE|USER, and `map_user_frames`/`_contiguous`/`map_user_pages`
+  switched from `map_to` → `map_to_with_table_flags` with it; (2) `mm/elf.rs` PT_LOAD +
+  stack maps likewise; (3) `map_current_user_page_inner` now OR-upgrades any pre-existing
+  intermediate to PRESENT|WRITABLE|USER (defense-in-depth + directly heals the anon
+  demand-fault that was reusing a RO intermediate); (4) the spurious-write recovery now
+  walks ALL FOUR levels (`user_walk_level_flags`) and recovers only when every level is
+  writable+user — a deficient intermediate logs per-level flags ONCE
+  (`INTERMEDIATE_PERM_FAULTS`) and falls through to a visible KILL instead of an infinite
+  loop, so any future variant fails fast/diagnosable rather than hanging a 60-min run.
+  NEXT: rustc-smoke verification run — expect `demand_pages` to keep climbing past 35631,
+  no `[pf-loop]`, rustc reaches rust-lld → `RUSTC_OK`. (The `rustc-profile` `[pf]`
+  instrumentation should be removed before the final commit.)
+  ---PRIOR STATUS (fault-loop OPEN, pre-root-cause) BELOW---
+status: MILESTONE+ — `rustc` EXECUTES AND COMPILES on m3OS; all libc/loader
+  correctness blockers FIXED; the remaining `RUSTC_OK` gate is now a KERNEL mm
+  fault-LOOP (perf/correctness, not a libc global). After the TLS fix, `rustc hello.rs`
+  panicked `Failed finding sysroot: "dladdr failed"` (filesearch.rs:255) — m3OS's
+  `dladdr` returned 0 (musl's real one is in the replaced `dynlink.c`; libc.so ships a
+  return-0 stub). FIXED: implemented `dladdr` in the loader (`dl.rs` — iterates the
+  published DSO list, returns `dli_fname=/usr/lib/<soname>` + `dli_fbase=load_bias`;
+  exported, resolves before libc.so's stub). VALIDATED: the sysroot panic is GONE and
+  rustc compiles MUCH further — `demand_pages≈35631` (~140 MiB, vs 19153 at the panic),
+  no crash, runs codegen + spawns rust-lld. `rustc-smoke` step 20 still times out, but
+  for a NEW reason: a **kernel fault LOOP** — the `[pf]` trace shows the SAME
+  `addr=0x200c79f000 rip=0x200a204838` (`libc.so+0x28838`, mallocng) faulting **43
+  MILLION** times with `demand_pages` FROZEN at 35631. The kernel #PF handler "returns"
+  without actually resolving that page, so mallocng's access re-faults forever. Likely
+  a perm/mapping bug on a mallocng anon/`mprotect`/W^X/guard page (the fault is NOT
+  counted as a file-backed demand page → it's an anon/CoW/perm fault the handler mis-
+  handles). NEXT: log the fault ERR code (write/present/protection) for `0x200c79f000`
+  + trace the kernel #PF path for that addr (anon VMA? wrong perms? W^X/PKU? a
+  not-present→present that doesn't stick?). Also: the `rustc-profile` `[pf]` logging
+  (LOG_EVERY_FAULTS=32 → 360K serial writes here) is itself a big overhead at this fault
+  volume — raise it / disable the feature for timing runs. Once the fault loop is fixed,
+  the 95c VFS page-cache/throughput levers become relevant for cold-load speed.
+  ---PRIOR MILESTONE (rustc executes) BELOW---
+status: MILESTONE — **`rustc` EXECUTES ON m3OS.** `rustc --version` (`rustc 1.96.0`)
+  and `rustc --print sysroot` both COMPLETE with NO crash, and `rustc hello.rs` runs
+  codegen on its worker thread (paged ~75 MiB) before a downstream panic. The
+  multi-week `CR2=0` blocker is BROKEN. It took THREE foreign-loader/libc fixes this
+  session (each a global rustc was the first program to exercise):
+  (1) **`__libc.auxv`** — musl patch `0003` exports `__m3os_set_auxv`, loader calls it
+  before constructors (mallocng first-malloc crash at `libc.so+0x28188`);
+  (2) **`libc.tls_*` + no-op `static_init_tls`** — musl patch `0004` exports
+  `__m3os_set_tls(head,size,align,cnt)` and no-ops `static_init_tls`;
+  (3) **the `tls_module` list** — the loader builds musl's `struct tls_module` list in
+  `setup_static_tls` and publishes it via `__m3os_set_tls`, so `pthread_create →
+  __copy_tls` sets up the worker thread's per-module TLS correctly (the `__copy_tls`
+  `td=0` WRITE-to-0x8 crash + the follow-on worker-thread TLS-read fault are GONE).
+  VALIDATED: `process killed = 0`; rustc runs its codegen thread.
+  NEXT BLOCKER (different class — a rustc/std issue, NOT a loader/libc global):
+  `rustc hello.rs` panics `thread 'main' panicked at
+  compiler/rustc_session/src/filesearch.rs:255:60` → SIGABRT. rustc's library/path
+  search hits a `std`-on-m3OS filesystem/path difference (likely `canonicalize` /
+  `current_exe` (`/proc/self/exe`) / `read_dir`). `--print sysroot` works, so it's a
+  DIFFERENT search than the sysroot root. This is the `RUSTC_OK` gate now — investigate
+  `filesearch.rs:255` (what path op fails) + the relevant m3OS VFS/`/proc` syscall.
+  rust-lld (another big dynamic binary) hasn't been reached yet (the panic precedes it).
+  ---PRE-MILESTONE-STATUS-BELOW (historical)---
+status: OPEN — FIRST null-deref FIXED + validated; rustc now 2× further, hits the
+  NEXT one. The `__libc.auxv` NULL-deref at `libc.so+0x28188` is FIXED (loader calls
+  the new exported `__m3os_set_auxv(envp)` before constructors; musl patch `0003`).
+  VALIDATED: on `rustc-smoke` rustc went from the old crash at ~16 MiB
+  (`demand_pages≈4115`) to **~36 MiB (`demand_pages≈9126`)** and the `addr=0x0` READ
+  crash is GONE. (Superseded by the MILESTONE above.)
+  ---PRE-FIX-STATUS-BELOW (historical)---
+status: OPEN — crash LOCALIZED to `libc.so + 0x28188`; the original `CR2=0` is NOT
+  fixed (CORRECTION below). `rustc` loads + runs LLVM (paged ~16 MiB) then NULL-derefs
+  (`addr=0x0`, USER_MODE) at userspace rip `0x200a204188` = **`libc.so` vaddr
+  `0x28188`** — the SAME rip the original diagnosis recorded (mis-attributed then to
+  `librustc_driver.so`; with runtime bases `libc.so=0x200a1dc000` /
+  `librustc_driver=0x2000010000`, the rip is in `libc.so`). CORRECTION: the loader
+  init-array `(argc,argv,envp)` fix (`cdb48a11`, glibc-ABI) did NOT clear this crash;
+  the earlier "cleared" claim was a MEASUREMENT ERROR — the rustc-smoke cargo log
+  carries NO guest serial unless `M3OS_SMOKE_SERIAL_DUMP` is set, so the
+  `process killed` line was invisible and the ~25-min CPU-bound time was the headless
+  GUI servers busy-looping AFTER rustc died, not rustc running. The init-array fix is
+  still a correct glibc-ABI improvement (keep it; rustc now reaches LLVM before
+  crashing) but is necessary-not-sufficient. NEXT: disassemble `libc.so+0x28188`
+  (`fs:` TLS access vs plain null) — in progress. ---OLD-STATUS-BELOW---
+status: OPEN — root cause NOT yet confirmed, but a NEW high-confidence CANDIDATE FIX
+  has landed and needs a `rustc-smoke` run to confirm. The on-device `rustc`
+  (Phase 95b RUSTC_OK milestone) cold-loads + relocates + executes
+  `librustc_driver.so` but NULL-derefs (`CR2=0`) early in startup. The multi-module
+  static-TLS loader gap (commit `59cd0c00`) was ruled OUT — rustc crashed identically
+  with it fixed. A **separate loader ABI gap** was then found by static analysis: the
+  from-scratch ld-musl ran shared-object `DT_INIT`/`DT_INIT_ARRAY` constructors with
+  NO arguments (matching musl's `do_init_fini`), but **glibc's loader passes
+  `(argc, argv, envp)` to every init_array entry including shared libraries**, and
+  Rust's `std` captures `argv`/`envp` via exactly such an `.init_array` entry. A
+  dynamic (`prefer-dynamic`) rustc keeps `std` in a shared `libstd-*.so`, so its
+  argv-capture ctor was run with no args → null/garbage argv → `std::env::args()`
+  derefs null → `CR2=0`. **Fix landed (commit `cdb48a11`): the loader now passes
+  `(argc, argv, envp)` to all constructors, glibc-style.** Regression-guarded by
+  `dynamic-hello-smoke` (existing C ctors ignore the extra register args — harmless
+  on the SysV ABI). **NOT yet confirmed against rustc** — a full `rustc-smoke`
+  (~90 min, KVM) is required. If rustc still `CR2=0`s, the remaining candidate is a
+  TLS-residual / different null deref — use the offline disassembly path below
+  (`rip - base = offset`, check for an `fs:` prefix to distinguish TLS from a plain
+  null).
+owner: unassigned (follow-up to the Phase 95c VFS-perf + loader-TLS work)
+---
+
+# rustc runtime NULL-deref (`CR2=0`) after the loader-TLS gap was closed
+
+## TL;DR
+
+`pkg install rust` now **completes** and `rustc --version` **cold-loads, relocates,
+and starts executing** the 162 MiB `librustc_driver.so` — the two original Phase 95b
+blockers (install timeout + load timeout) are **cleared** by the Phase 95c work
+(zero-copy SHM read-window, larger VFS caps, ext2 block-cache LRU, 3 GiB data disk).
+rustc then **NULL-derefs**: a userspace page fault, `addr=0x0` / `CR2=0`, read
+(`err=USER_MODE` only), at a **fixed offset inside `librustc_driver.so`** (the
+absolute `rip` varies per boot with the DSO load base; observed `0x200a204188` and
+`0x10000b50a51` on different boots).
+
+The leading hypothesis was the **dynamic-TLS loader gap** (the from-scratch ld-musl
+deferred `DTPMOD64`/`TPOFF64` relocs and only set up the main exe's TLS, so a
+DT_NEEDED DSO carrying thread-local storage got no TLS block). That gap is now
+**closed** — multi-module static TLS landed in `59cd0c00`, is regression-clean
+(`dynamic-hello-smoke` + `cargo xtask check` pass), and the boot log confirms it sets
+up `librustc_driver.so`'s `0x5ff0` TLS segment as module 1 and resolves its relocs
+(`ldso: tls modules=1 total_off=0x5ff0`). **rustc still crashes at the identical
+spot.** So the crash is **NOT** the DSO-TLS gap.
+
+## What is already done (committed + pushed, branch `feat/phase-95b-on-device-rustc`)
+
+| Commit | What |
+|---|---|
+| `857a7818`, `01a14c4a` | Phase 95c A.2 — VFS read/write caps 64 KiB→256 KiB, `MAX_BULK_LEN`→512 KiB, `MAX_COPY_LEN`→576 KiB (~4× fewer sequential-read IPC round-trips) |
+| `b4bc6986` | Phase 95c A.1 — zero-copy SHM read-window demand-fill (no IPC-bulk copy; `vfs_service_handle_for_fd` resolves the real vfs_server handle; legacy fallback for non-VfsService fds) |
+| `38a92459` | Phase 95c C — `kernel_core::fs::lru_cache::LruBlockCache`, vfs_server ext2 block cache → LRU (kills fill-and-hold thrash) |
+| `f1f731ee` | `M3OS_DATA_DISK_GB` (clamped 1..=64); rustc-smoke uses **3 GiB** (1 GiB ENOSPC'd mid-install after ~330 MiB) |
+| `59cd0c00` | **Multi-module static TLS** in ld-musl (DT_NEEDED DSO TLS: `DsoTls`, `assign_tls_modules`, multi-module block + DTV, `TPOFF64`/`DTPMOD64`/`DTPOFF64` resolution). Regression-clean. Does NOT fix rustc. |
+| `cdb48a11` | **Loader init-array ABI fix (CANDIDATE FIX for this CR2=0).** ld-musl now passes `(argc, argv, envp)` to every `DT_INIT`/`DT_INIT_ARRAY` constructor (`run_constructors_for`), matching glibc's `dl-init.c::call_init`. Adds `InitFn`, `startup_args_from_stack`, a process-lifetime arg stash (for dlopen-time ctors), + a host unit test. `cargo xtask check` clean, independently reviewed (APPROVE on all ABI/safety axes). NOT yet confirmed against rustc — needs a `rustc-smoke` run. |
+
+Net effect proven on-device: install completes, the 162 MiB DSO demand-pages in and
+executes. The runtime NULL-deref is the last thing between here and `RUSTC_OK`;
+`cdb48a11` is the leading candidate fix for it.
+
+## The new leading candidate: the init-array ABI gap (commit `cdb48a11`)
+
+**The mechanism.** Rust's `std` registers an `.init_array` entry — `ARGV_INIT_ARRAY`
+/ `init_wrapper(argc, argv, envp)` in `std::sys::pal::unix::args` — that captures
+`argv`/`envp` into module-level statics so `std::env::args()` works. On the
+`x86_64-*-linux-*` targets (musl included, since `target_os = "linux"`) this is the
+**only** argv source for a shared `std`. The capture **requires the loader to invoke
+init_array entries with `(argc, argv, envp)`**:
+
+- **glibc** does this — `dl-init.c::call_init` calls every init_array entry
+  (executable AND shared library) as `void (*)(int, char**, char**)`.
+- **musl** does NOT — `do_init_fini` calls library ctors as `void (*)(void)`. A
+  static musl Rust binary is unaffected because the *main executable's* init_array
+  is run by `__libc_start_main`/`__libc_start_init` with the three args; only the
+  exe's std matters there.
+- m3OS's from-scratch ld-musl matched **musl** (no args). For a **dynamic
+  `prefer-dynamic` rustc**, `std` lives in a shared `libstd-*.so` whose argv-capture
+  init_array is run by **the loader**, not `__libc_start_main` — so it got no args →
+  the captured `argv`/`envp` statics are null/garbage → the first `std::env::args()`
+  (rustc reads its args immediately) derefs null → `CR2=0`, a raw page fault (NOT a
+  Rust panic), early in `librustc_driver.so` startup — exactly the observed symptom.
+
+**The fix.** `run_constructors_for` now calls each `DT_INIT`/`DT_INIT_ARRAY` entry as
+`InitFn = extern "C" fn(i32, *const *const u8, *const *const u8)` with the real
+`(argc, argv, envp)` (derived from the kernel-built SysV startup stack in `dl_entry`,
+stashed for dlopen-time ctors). Passing three register args to a `void(void)` C ctor
+is harmless on the x86-64 SysV ABI (the callee ignores `rdi`/`rsi`/`rdx`), so every
+existing C/musl DSO keeps working — `dynamic-hello-smoke` is the regression guard.
+
+**Confidence + caveat.** This is a textbook glibc-vs-musl loader divergence and the
+symptom (raw null deref, no panic, fixed offset in a Rust shared object, early
+startup) fits.
+
+## UPDATE 2026-06-23 (latest): crash LOCALIZED to `libc.so+0x28188` — and the "CLEARED" claim was WRONG
+
+**RETRACTION.** An interim update here claimed the init-array fix "cleared the
+CR2=0". That was a **measurement error**, now corrected. The `rustc-smoke` cargo log
+carries only the harness `[step N]` markers — it does **NOT** echo guest serial
+unless `M3OS_SMOKE_SERIAL_DUMP=<path>` is set (see `run_smoke_script` in
+`xtask/src/main.rs`; `dump_serial` writes the full history only at a terminal
+point — timeout/error/end). So grepping the cargo log for `process killed` found
+nothing because the guest serial was never there. And the "~25-min CPU-bound at
+110–366%" was the **headless GUI servers busy-looping AFTER rustc died** (the prior
+session's `READ_KBD_SCANCODE`/`FRAME_TICK_DRAIN` spin), not rustc running.
+
+**How to actually see it.** Run with the serial dump and grep with `-a` (the dump
+has control bytes):
+```
+cargo xtask clean
+M3OS_SMOKE_SERIAL_DUMP=/tmp/s.txt M3OS_KERNEL_FEATURES=rustc-profile \
+  M3OS_KVM=1 cargo xtask rustc-smoke --timeout 5400 &
+# after install + a few min of rustc load, `pkill -TERM -x qemu-system-x86` to
+# force dump_serial, then:
+grep -a 'process killed\|\[pf\]\|loaded .* base=' /tmp/s.txt
+```
+
+**What the dump shows (clean disk, KVM):**
+- `[int] userspace page fault: pid=43 addr=Ok(VirtAddr(0x0)) err=USER_MODE`
+  `rip=0x200a204188 — process killed`.
+- Loader bases (the loader DOES log them; they're just invisible without the dump):
+  `librustc_driver-….so base=0x2000010000 len=0xa1bc000`, `libc.so base=0x200a1dc000
+  len=0xb3000`. So **`rip 0x200a204188 = libc.so + 0x28188`** (NOT librustc_driver —
+  the original diagnosis mis-attributed it; `0x200a204188 > driver_end 0x20081cc000`).
+- The crash rip `0x200a204188` is **identical** to one the original diagnosis
+  recorded → same crash, **unchanged by the init-array fix**.
+
+**The `rustc-profile` kernel feature (added this pass; off by default, zero prod
+residue)** confirms rustc *does* run before crashing — a `[pf]` heartbeat at the #PF
+handler top (`kernel/src/arch/x86_64/interrupts.rs::rustc_prof`, every 32 faults)
+shows: ~2300 anonymous faults at loader rip `0x244cc3` (the streaming PT_LOAD
+read into anon, ~7 MiB), then `demand_pages` climbs 0→~4115 (~16 MiB file-backed) as
+LLVM executes (rip `0x40002xxx`), THEN the libc.so null-deref. So rustc reaches LLVM
+execution — this is a real null-deref ~16 MiB in, **not** a slow-load/throughput
+problem (only ~16 MiB paged before the crash).
+
+## NEXT BLOCKER (root-caused, disassembled): `__copy_tls` `td=0` — zero `libc.tls_*` globals
+
+After the `__libc.auxv` fix, rustc runs ~2× further and hits a **WRITE to `addr=0x8`** at
+`libc.so+0x1df09` = `mov %r13,0x8(%r12)` = `td->dtv = dtv` in musl's **`__copy_tls`**
+(`src/env/__init_tls.c`), with `td == 0`. `__copy_tls` computes
+`td = (mem + libc.tls_size − 0xc8) & −libc.tls_align`; with `libc.tls_size`,
+`tls_align`, `tls_head`, `tls_cnt` (globals at `0xaf8d0/d8/e0/e8`) all **ZERO**,
+`td = 0` → the `->dtv` store faults at `0x8`.
+
+**Why:** the app's `crt1 _start → __libc_start_main → __init_libc → __init_tls →
+static_init_tls → __copy_tls` runs musl's own static TLS setup. In real musl-dynamic
+the linker (`dynlink.c`, part of the ld.so) BOTH (a) populates `libc.tls_*` and
+(b) provides a strong **no-op `__init_tls`** that overrides the static one — so the
+app's `__init_libc → __init_tls` does nothing. The m3OS loader REPLACED the ld.so
+(no `dynlink.c` compiled into the shared `libc.so`), so `libc.so` keeps the **static**
+`__init_tls` AND the `libc.tls_*` globals stay zero. rustc is the first program whose
+`__init_tls` actually reaches `__copy_tls` (it has static TLS the trivial test
+programs lack — hence `dynamic-hello`/`dynamic-python` don't hit it).
+
+**FIX — VALIDATED REQUIREMENTS (a `0004`-no-op experiment was run + reverted):**
+The COMPLETE fix mirrors musl's `dynlink.c` and needs BOTH parts; the no-op ALONE is
+insufficient AND regressing:
+- **A no-op `static_init_tls` ALONE is INSUFFICIENT.** A patch making
+  `static_init_tls` (the weak alias `__init_tls`) a no-op was built + run: the crash
+  is UNCHANGED (`addr=0x8`, same `rip` in `__copy_tls`, same `demand_pages≈9051`),
+  because rustc spawns its worker thread immediately and **`pthread_create →
+  __copy_tls`** hits the SAME zero `libc.tls_*` globals. `__copy_tls` (used by
+  pthread_create) was correctly left intact, so the fault site is identical.
+- **A no-op `static_init_tls` ALONE also REGRESSES `dynamic-python`.** `static_init_tls`
+  is what POPULATES `libc.tls_head/tls_size/tls_align/tls_cnt`. It mis-derives the
+  main-exe TLS base for dynamic programs (per patch `0002`) — it found nothing for
+  rustc (→ zero globals → crash) but worked by luck for python's simpler TLS. No-op'ing
+  it removes python's (lucky-correct) globals → python's threads would then crash in
+  `pthread_create` too.
+
+**So the complete fix is BOTH, together (mirror `dynlink.c`):**
+1. **Loader POPULATES `libc.tls_head/tls_size/tls_align/tls_cnt`** (the `__libc` fields
+   at `0xaf8d0/d8/e0/e8`) with the CORRECT TLS layout it already computed in
+   `setup_static_tls` (it derives the base properly from `AT_PHDR`, which
+   `static_init_tls` botches). Add an exported musl setter (like `__m3os_set_auxv`) —
+   e.g. `__m3os_set_tls(head, size, align, cnt)` — and call it from the loader.
+   Caveat: `tls_head` is musl's `struct tls_module *` linked list, which differs from
+   the loader's `DsoTls`; either build a compatible `tls_module` list, OR (simpler,
+   verify it suffices) set `size`/`align`/`cnt` non-zero with `tls_head=NULL` so
+   `__copy_tls` computes a valid `td` and skips the per-module copy loop — new threads
+   then get a correctly-sized but zero-initialized TLS block (fine unless a
+   thread-local has a non-zero initial image; verify against rustc's worker thread).
+2. **No-op `static_init_tls`** (the reverted `0004`) so the app's mis-deriving
+   `__init_tls` does NOT overwrite the loader's correct globals.
+
+**Validate against BOTH** `rustc-smoke` AND `dynamic-python-smoke` (the python-thread
+regression is the trap). Loader TLS internals: `userspace/ld-musl-x86_64.so.1/src/
+{main.rs::setup_static_tls, tls.rs}`.
+
+---
+
+## ROOT CAUSE (disassembled + verified): `__libc.auxv` is NULL → mallocng first-malloc crash
+
+Disassembly of `libc.so` (musl 1.2.5, `target/port-stage/musl/usr/lib/libc.so`) at
+vaddr `0x28188`:
+```
+28175:  mov    0xaf8c8(%rip),%rdx     ; rdx = __libc.auxv   (the global; it is NULL)
+28188:  mov    (%rdx),%rax            ; FAULT: deref __libc.auxv == NULL  (addr 0x0)
+...     (loop scanning auxv for a_type==0x19 AT_RANDOM, 16-byte stride → memcpy 16 bytes)
+```
+- **NOT TLS** — no `fs:` prefix; a plain dereference of the global `__libc.auxv`
+  (at libc.so vaddr `0xaf8c8`; neighbour `0xaf8c3` = `__libc.secure`).
+- The faulting function is musl **mallocng's secret-init** (`get_random_secret` /
+  `alloc_meta` path, `src/malloc/mallocng/{meta.c,glue.h}`), which runs on the
+  **first `malloc`** and seeds the allocator from `AT_RANDOM`.
+- `__libc.auxv`'s ONLY writer is `__init_libc` (`0x1df89: mov %rax,0xaf8c8(%rip)`),
+  called ONLY from `__libc_start_main` (`0x1e1bc`).
+
+**Why NULL on m3OS:** for a dynamic program, `__init_libc` is the **ld.so's**
+responsibility (musl's own `__dls2`/`__dls3`), and even via `__libc_start_main` it
+runs only at app entry — but the m3OS Rust loader **replaces the ld.so and never
+calls `__init_libc`**, and it runs the DSO constructors (`run_constructors`) BEFORE
+the app's `__libc_start_main`. librustc_driver's LLVM static ctors `malloc` during
+`run_constructors` → mallocng secret-init → walk NULL `__libc.auxv` → fault.
+**Same foreign-loader-NULL-global class already patched twice** (`main_ctor_queue`
+patch `0001`, `__init_tp` un-hide patch `0002`); `__libc.auxv` is the third.
+
+**THE FIX (loader must do the ld.so's `__init_libc` job before constructors):**
+The loader already has `argc/argv/envp` (the init-array fix stashed them in
+`STARTUP_ARGV`/`STARTUP_ENVP`). Two options, ranked:
+1. **Un-hide + call `__init_libc(envp, argv[0])`** (preferred — it's the canonical
+   function; sets `auxv` + `page_size` + `secure` + `environ` + `hwcap`). Add
+   `ports/lib/musl/patches/0003-export-init-libc.patch` mirroring `0002` (drop
+   `hidden` from `__init_libc`'s decl in `src/internal/libc.h`), then in
+   `userspace/ld-musl-x86_64.so.1/src/main.rs` `sym::lookup(b"__init_libc")` and call
+   it **after `__init_tp` / `setup_static_tls`, BEFORE `run_constructors`**. RISK:
+   `__init_libc` calls `__init_tls(aux)` — verify that resolves to the **no-op weak
+   stub** in this shared libc.so (the handoff already relies on `static_init_tls`
+   being a no-op stub, so this is expected safe); if it instead redoes TLS and
+   conflicts with the loader's multi-module `setup_static_tls`, fall back to option 2.
+2. **Minimal exported setter** (lower risk): patch musl to add an exported
+   `void __m3os_set_auxv(size_t *auxv)` that sets `libc.auxv = auxv` + derives
+   `libc.page_size` from `AT_PAGESZ` (mallocng needs both), `__attribute__((visibility
+   ("default")))` so it survives `-fvisibility=hidden`; loader calls it with the auxv
+   pointer (`= envp` walked to NULL, +1). No TLS interaction.
+
+**Confirming insight — why `dynamic-hello-smoke` passes despite `malloc`ing:** its
+malloc is in `main`, which runs AFTER the app's `crt1 _start → __libc_start_main →
+__init_libc` (auxv set). rustc crashes because its **first** malloc is in an LLVM
+**static constructor**, which the loader runs (`run_constructors`) BEFORE the app's
+`__libc_start_main`. So the fix MUST set `__libc.auxv` before `run_constructors`.
+This also means option 1 would run `__init_libc` **twice** (loader + the app's
+`__libc_start_main`); the auxv/environ/page_size sets are idempotent, but the
+`__init_tls(aux)` inside `__init_libc` is NOT obviously safe to run twice (verify it
+resolves to the no-op weak TLS stub this libc.so uses; if not, **prefer option 2**,
+the auxv+page_size-only setter, which is idempotent and TLS-free).
+
+**Loader insertion point:** `userspace/ld-musl-x86_64.so.1/src/main.rs`, in
+`dl_entry` between the `store_startup_args(...)` block (~line 2894) and
+`run_constructors(&dsos)` (~line 2905). Use `sym::lookup(dsos.as_slice(), b"__init_libc"
+/* or the setter */, None)` (mirrors the `__init_tp` lookup at ~line 2356), transmute
+to `extern "C" fn(*const *const u8, *const u8)` (envp, argv[0]) / the setter's sig,
+and call it; skip gracefully if the symbol is absent (un-patched libc — no regression).
+
+**Validation:** musl rebuild (`cargo xtask port build musl`) → `M3OS_WITH_RUST` image
+→ `cargo xtask clean` → `M3OS_SMOKE_SERIAL_DUMP=/tmp/s.txt M3OS_KERNEL_FEATURES=rustc-profile
+M3OS_KVM=1 cargo xtask rustc-smoke --timeout 5400`; after the install + a few min of
+rustc load, `pkill -TERM -x qemu-system-x86` to force the dump, then `grep -a` for
+`process killed` (should be GONE), a higher `[pf] demand_pages` (rustc gets further),
+and ideally `rustc 1.96.0`. Use a CLEAN disk (NOT `M3OS_RUST_FAST_ITER`, which
+recursive-faults on a reused disk). The 95c throughput levers are NOT on the
+`RUSTC_OK` critical path — this correctness crash is the blocker.
+
+(A kernel-mode fault was also seen once — `InterruptStackFrame ip=0x10000b53f61
+rpl:Ring0` reading `0x0` — likely a secondary effect of the user crash or a
+`rustc-profile` interaction; revisit only if it recurs after the `__libc.auxv` fix.)
+
+## Hypotheses for the remaining `CR2=0` (ranked)
+
+1. **A non-TLS null pointer in rustc's runtime init** that the TLS-reloc history
+   misled us toward. `CR2=0` (exactly 0) is the signature of dereferencing a null
+   *pointer-typed value*, which can itself come from an uninitialized/zero TLS
+   variable (`mov rax, fs:[X]` loading a pointer that is 0, then `mov rbx, [rax]`).
+   Could be an environment expectation rustc has that m3OS does not satisfy
+   (an env var, a `/proc` read, a syscall returning 0 that rustc assumes non-null).
+2. **A cached `__tls_get_addr` pointer** — if rustc's runtime caches a TLS-block
+   pointer computed *before* the static block/DTV is fully wired, it would read the
+   wrong (zero) slot. The multi-module DTV is built in `setup_static_tls`; verify the
+   ordering vs. first `__tls_get_addr` use.
+3. **A subtle multi-module TLS offset/DTV error** that the single TLS-module case
+   (`modules=1`) doesn't exercise correctly (e.g. `dtv[1]` vs `dtv[0]` indexing,
+   DTP_OFFSET, or the `TPOFF = st_value - tls_offset` sign on variant II). Less
+   likely (the math is host-tested and dynamic-hello passes), but `modules=1` with a
+   non-main module-1 is a path dynamic-hello does NOT cover.
+
+## The next diagnostic — SAFE and mostly OFFLINE
+
+A loader load-base log is now wired in `userspace/ld-musl-x86_64.so.1/src/main.rs`
+(in the DT_NEEDED load loop): each loaded DSO prints
+`ldso: loaded <soname> base=<load_bias> len=<image_len>`. So:
+
+1. Run a full `rustc-smoke` (see infra notes), capture serial, and read both the
+   crash `rip` AND the `ldso: loaded librustc_driver... base=…` line.
+2. **Offline:** `offset = rip - base`. Disassemble the on-host
+   `librustc_driver-*.so` (in the rust port build output / the staged `.m3pkg`) at
+   that offset: `objdump -d --start-address=<offset> … | head`, or
+   `gdb -batch -ex "disas <offset>,<offset>+0x40"`.
+   - If the faulting instruction carries an **`fs:` override (opcode prefix `0x64`)**
+     → it IS a TLS access → hypothesis 2/3; inspect the TLS reloc value + DTV.
+   - If it's a **plain `mov reg,[reg]`** with no fs prefix → a non-TLS null
+     (hypothesis 1); trace which register is 0 back through the basic block (and map
+     the offset to a symbol with `addr2line`/`objdump -d` to see which rustc/std
+     function is in `_start`/runtime init).
+
+This avoids the trap that wasted the last run: an **in-kernel "dump bytes at rip"**
+probe in the page-fault handler is UNSAFE — calling `get_mapper()`/`translate_addr`
+or reading user memory from that context recurse-faulted the kernel
+(`RECURSIVE KERNEL PAGE FAULT cr2=0x8`) and destroyed the signal. Do NOT re-add an
+in-kernel instruction read; use the offline disassembly above. (If an in-OS read is
+truly needed, do it from a *userspace* helper that mmaps the `.so`, not the kernel.)
+
+## Test-infra gotchas (these cost hours last time)
+
+- **`cargo xtask clean` between rustc runs.** A failed rustc run leaves m3OS idling
+  at the shell with the ext2 disk mounted **rw**; the smoke harness does NOT kill
+  that QEMU. Killing the orphan (`kill <pid>`) mid-mount **corrupts `disk.img`**, and
+  the next boot is **firmware-only** (`=3h=3h…`, no kernel banner). `cargo xtask
+  clean` deletes `disk.img` and recovers it (confirmed: dynamic-hello booted clean
+  afterward).
+- **Do NOT set `M3OS_SERIAL_LOG` for these runs.** The serial tee races the harness's
+  step-1 "kernel first message" detection → spurious `QEMU exited while waiting for
+  step 1` even though the kernel booted fine (you'll find the orphan QEMU alive). Run
+  *without* it and rely on the harness's own trace-ring dump — BUT note the next bug:
+- **dhcpv6 retransmit spam floods the failure buffer.** The guest's IPv6 stack
+  retransmits an Information-Request ~1×/s forever (no DHCPv6 server), and after a
+  userspace crash the kernel stays alive emitting it, so the harness's "last serial
+  output" is all `[dhcpv6] retransmit` and the crash line scrolls off. To capture the
+  crash reliably, either (a) grep the full serial (accepting the step-1 flake risk +
+  retrying), or (b) quiet the dhcpv6 retransmits for the diagnostic, or (c) the
+  offline-disassembly path above, which only needs the `rip` + `base` (both printed
+  once, near the crash).
+- **`M3OS_RUST_FAST_ITER=1` reuses `disk.img`** (skips the ~30 min install) — only
+  valid when a *prior* run left a COMPLETE install (the install step passed). A
+  half-installed or corrupted disk → `ion: command not found: rustc`.
+
+## Reproduction
+
+```
+cargo xtask clean
+M3OS_KVM=1 cargo xtask rustc-smoke --timeout 5400   # full: build + 3 GiB disk + install + cold-load
+```
+Expect: `pkg install: rust: OK` (install completes), then `rustc --version` crashes
+(`userspace page fault … addr=0x0 … rip=0x… — process killed`). The
+`ldso: loaded librustc_driver… base=…` line is in the same boot's serial.
+
+## Relevant code
+
+- `userspace/ld-musl-x86_64.so.1/src/main.rs` — `setup_static_tls` (multi-module
+  block + DTV), `assign_tls_modules`, the `TPOFF64`/`DTPMOD64`/`DTPOFF64` reloc arms,
+  `tls_module_for_reloc`, and the new `ldso: loaded …` log.
+- `userspace/ld-musl-x86_64.so.1/src/tls.rs` — `next_tls_offset` (variant-II), host
+  tests.
+- `userspace/ld-musl-x86_64.so.1/src/sym.rs` — `lookup_tls`.
+- `xtask/src/main.rs` — `cmd_rustc_smoke`, `create_data_disk` (`M3OS_DATA_DISK_GB`).
+- The rust port: `ports/lang/rust/`, `build_rust` in `xtask/src/port_build.rs`.

@@ -1,0 +1,81 @@
+Phase 95b (on-device rustc) — fix the `__copy_tls` td=0 crash on the m3OS
+foreign-loader path by (A) exporting a setter the Rust loader calls to publish
+musl's TLS-descriptor globals, and (B) neutralizing musl's own `static_init_tls`
+so it can never overwrite them with values it mis-derives.
+
+m3OS's from-scratch Rust loader (`userspace/ld-musl-x86_64.so.1`) REPLACES
+musl's `__dls3`/`dynlink.c` and lays out the main thread's TLS/TCB itself before
+crt1's `_start`. It does NOT run musl's `static_init_tls`, so `libc.tls_size` /
+`tls_align` / `tls_cnt` stay zero. A later `pthread_create` -> `__copy_tls` then
+reads those zero globals and computes a thread descriptor `td=0`, faulting.
+
+(A) `__m3os_set_tls` lets the loader publish the TLS descriptors it already
+computed during its own layout, so `__copy_tls` sizes/places a new thread's TLS
+block from valid values AND copies each module's `.tdata` image. The loader now
+builds the musl `struct tls_module` linked list itself (matching musl 1.2.5's
+`{ next; image; len, size, align, offset }` layout) and passes its `head`, so
+`libc.tls_head = head;` makes `__copy_tls`'s `for (p=libc.tls_head; p; p=p->next)`
+loop walk the loader-built list and `memcpy(mem - p->offset, p->image, p->len)`
+each thread-local image — a spawned thread's per-module `.tdata` is now copied
+and its `dtv[i]` set, so thread-local accesses no longer fault. It is exported
+(NOT `hidden`) so the loader resolves it via `.dynsym`, mirroring the 0002
+(`__init_tp`) and 0003 (`__m3os_set_auxv`) export mechanism. The `struct __libc`
+field names (`tls_size`/`tls_align`/`tls_cnt`/`tls_head`) are from
+`src/internal/libc.h` and are already in scope in this TU; `tls_head`'s type is
+`struct tls_module *`, so the `void *head` argument is assigned directly (a
+`void *`→struct-pointer assignment is well-formed in C).
+
+(B) `static_init_tls` (the `weak_alias` target for `__init_tls`, called from the
+app's own `__init_libc`) is made a no-op via `(void)aux; return;` at the top of
+the body. Without this, the app's `__init_libc -> __init_tls` would re-run
+musl's static-TLS derivation against an executable the foreign loader already
+relocated, clobbering the loader-published globals (and itself faulting in
+`__copy_tls`). This mirrors `dynlink.c`'s strong `__init_tls` override for
+dynamic programs. `__copy_tls` and the `weak_alias` line are left UNTOUCHED, so
+`pthread_create`'s `__copy_tls` path stays live.
+
+--- a/src/env/__init_tls.c
++++ b/src/env/__init_tls.c
+@@ -70,7 +70,24 @@ void *__copy_tls(unsigned char *mem)
+ 	td->dtv = dtv;
+ 	return td;
+ }
+ 
++/* m3OS Phase 95b — let the foreign Rust loader (which replaced musl's __dls3 and
++ * lays out TLS itself) publish musl's TLS-descriptor globals so the application's
++ * later pthread_create -> __copy_tls sizes/places a new thread's TLS block from
++ * valid values instead of computing td=0. The loader now builds the musl
++ * `struct tls_module` linked list itself (matching musl 1.2.5's layout) and
++ * passes its head, which `libc.tls_head = head;` publishes so __copy_tls walks it
++ * (for (p=libc.tls_head; p; p=p->next)) and copies each module's .tdata image.
++ * `tls_head`'s type is `struct tls_module *`; assigning a `void *` is well-formed
++ * in C. Exported (no `hidden`). */
++void __m3os_set_tls(void *head, size_t size, size_t align, size_t cnt)
++{
++	libc.tls_head = head;
++	libc.tls_size = size;
++	libc.tls_align = align;
++	libc.tls_cnt = cnt;
++}
++
+ #if ULONG_MAX == 0xffffffff
+ typedef Elf32_Phdr Phdr;
+ #else
+@@ -81,6 +98,17 @@ extern weak hidden const size_t _DYNAMIC[];
+ 
+ static void static_init_tls(size_t *aux)
+ {
++	/* m3OS Phase 95b — no-op. The from-scratch Rust loader that replaces
++	 * musl's ld.so (userspace/ld-musl-x86_64.so.1) builds the TCB + DTV and
++	 * installs the thread pointer itself before crt1 runs, and publishes the
++	 * TLS-descriptor globals via __m3os_set_tls. The app's __init_libc ->
++	 * __init_tls (this weak_alias target) would otherwise re-run musl's static
++	 * TLS derivation against an executable the loader already relocated,
++	 * clobbering those globals and faulting in __copy_tls (td=0). This mirrors
++	 * dynlink.c's strong __init_tls override for dynamic programs.
++	 * __copy_tls/__init_tp stay live for pthread_create. */
++	(void)aux;
++	return;
+ 	unsigned char *p;
+ 	size_t n;
+ 	Phdr *phdr, *tls_phdr=0;

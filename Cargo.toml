@@ -226,6 +226,8 @@ members = [
     "userspace/ld-musl-x86_64.so.1",
     # Phase 85a Track C — offline .m3pkg package installer + installed-file DB.
     "userspace/pkg",
+    # Phase 95c Track E.1 — VFS throughput measurement probe.
+    "userspace/vfs-throughput-probe",
 ]
 
 # Exclude xtask and userspace from default build — kernel only

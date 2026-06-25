@@ -295,6 +295,12 @@ pub const SYS_SHM_DESTROY: u64 = 0x101B;
 /// peer-supplied region.
 pub const SYS_SHM_SIZE: u64 = 0x1022;
 
+/// Phase 95c (Area A.1): `vfs_server` registers a shared "read window" — an SHM
+/// region it created + mapped — as the destination the kernel's zero-copy
+/// demand-fault read path (`VFS_READ_WINDOW`) reads file data into. Called once
+/// at startup. `sys_vfs_register_read_window(shm_id) -> 0 | u64::MAX`.
+pub const SYS_VFS_REGISTER_READ_WINDOW: u64 = 0x1024;
+
 /// Phase 57d follow-up: temporarily release framebuffer ownership
 /// without unmapping the caller's FB VMA (so a future
 /// `SYS_FB_REACQUIRE` can resume composing without re-walking page
@@ -2958,6 +2964,18 @@ pub fn shm_create(byte_len: usize) -> u32 {
         return 0;
     }
     raw as u32
+}
+
+/// Register a shared-memory region as the kernel's zero-copy demand-fault
+/// "read window" (Phase 95c Area A.1). `vfs_server` creates + maps an SHM
+/// region once at startup and registers it here; the kernel then resolves its
+/// physical frames and, on a `MAP_LAZY_FILE` demand fault, issues `VFS_READ_WINDOW`
+/// so the server reads file bytes straight into the window — the kernel fills the
+/// faulting frame from the window's frames via its physical map, with no IPC bulk
+/// copy. Returns `0` on success, `u64::MAX` on error. Idempotent (re-registration
+/// overwrites). Only honoured for the registered VFS service owner.
+pub fn vfs_register_read_window(shm_id: u32) -> u64 {
+    unsafe { syscall1(SYS_VFS_REGISTER_READ_WINDOW, u64::from(shm_id)) }
 }
 
 /// Map an existing shared-memory region into the caller's address

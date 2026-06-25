@@ -1,0 +1,50 @@
+Phase 95b (on-device rustc) — export a minimal `__m3os_set_auxv` so the m3OS
+foreign Rust loader can populate `__libc.auxv` + `__libc.page_size` before the
+app's own `__init_libc` runs.
+
+In a normal dynamic musl process the auxiliary vector is parsed by
+`__init_libc` (called from `__libc_start_main` -> stage2), which sets
+`libc.auxv = (void *)(envp+i+1)` and `libc.page_size = aux[AT_PAGESZ]`. m3OS's
+from-scratch Rust loader REPLACES musl's ld.so and runs every DSO constructor
+BEFORE crt1's `_start` -> `__libc_start_main` -> `__init_libc`. So the first
+heap allocation a constructor performs runs while `__libc.auxv` is still NULL:
+mallocng's secret-init walks `libc.auxv` looking for `AT_RANDOM`, dereferences
+the NULL `auxv`, and faults at `libc.so+0x28188`.
+
+`__m3os_set_auxv` does ONLY the auxv-derived field setup `__init_libc` does —
+it sets `libc.auxv` to the auxv array (found just past the NUL-terminated
+`envp`) and `libc.page_size` to `aux[AT_PAGESZ]`. It deliberately does NOT call
+`__init_tls`/`__init_ssp`/the secure-mode plumbing, so it is idempotent and
+safe to run before the app's own `__init_libc` (which re-derives the same
+values). `AUX_CNT`/`AT_PAGESZ`/`libc` are already in scope in this TU (it
+defines `__init_libc`). The function is NOT declared `hidden`, so musl's
+default visibility exports it via `.dynsym` and the loader resolves it (mirror
+of the 0002 mechanism, which exports `__init_tp` by dropping `hidden`).
+
+--- a/src/env/__libc_start_main.c
++++ b/src/env/__libc_start_main.c
+@@ -54,8 +54,24 @@ void __init_libc(char **envp, char *pn)
+ 			if (__sys_open("/dev/null", O_RDWR)<0)
+ 				a_crash();
+ 	libc.secure = 1;
+ }
+ 
++/* m3OS Phase 95b — populate __libc.auxv + page_size for the foreign Rust loader.
++ * The m3OS loader replaces musl's ld.so and runs DSO constructors before the
++ * app's crt1 _start -> __libc_start_main -> __init_libc, so the first malloc
++ * (mallocng secret-init walking auxv for AT_RANDOM) would deref a NULL
++ * __libc.auxv and fault. This sets ONLY auxv + page_size (no __init_tls /
++ * __init_ssp), so it is idempotent and safe to precede the app's own
++ * __init_libc. Exported (no `hidden`) so the loader resolves it via .dynsym. */
++void __m3os_set_auxv(char **envp)
++{
++	size_t i, *auxv, aux[AUX_CNT] = { 0 };
++	for (i=0; envp[i]; i++);
++	libc.auxv = auxv = (void *)(envp+i+1);
++	for (i=0; auxv[i]; i+=2) if (auxv[i]<AUX_CNT) aux[auxv[i]] = auxv[i+1];
++	libc.page_size = aux[AT_PAGESZ];
++}
++
+ static void libc_start_init(void)
+ {
+ 	_init();

@@ -2199,6 +2199,27 @@ pub fn preempt_disable() {
     preempt_disable_at(core::panic::Location::caller());
 }
 
+/// Read the current task's preempt-disable depth (lock-free). 0 = preemption
+/// enabled / no `IrqSafeMutex` held by this task; >0 = a lock is held. Used by
+/// the deadlock-guard to detect "scheduling while atomic" — the Phase-95b
+/// lazy-file-fault-under-lock hazard where a blocking demand-fault taken under a
+/// held lock strands it across a context switch and wedges every core.
+#[inline]
+pub fn current_preempt_count() -> i32 {
+    let Some(pc) = crate::smp::try_per_core() else {
+        return 0;
+    };
+    let ptr = pc
+        .current_preempt_count_ptr
+        .load(core::sync::atomic::Ordering::Acquire);
+    if ptr.is_null() {
+        return 0;
+    }
+    // SAFETY: same pointee invariant as `preempt_disable_at` — the per-core
+    // pointer targets a `'static` dummy or the live task's `preempt_count`.
+    unsafe { (*ptr).load(core::sync::atomic::Ordering::Acquire) }
+}
+
 /// Variant of [`preempt_disable`] that accepts an explicit caller location.
 ///
 /// Used by [`IrqSafeMutex::lock`] / [`IrqSafeMutex::try_lock`] so the
