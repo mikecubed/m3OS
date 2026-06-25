@@ -1,7 +1,7 @@
 # On-Device `rustc` Code Generation
 
 **Aligned Roadmap Phase:** Phase 95b
-**Status:** Partial — Areas A + B landed & validated; the `RUSTC_OK` milestone (Area D) is re-diagnosed but still BLOCKED
+**Status:** ✅ Complete (milestone) — Areas A + B landed & validated **and the `RUSTC_OK` milestone (Area D) is ACHIEVED + MULTITHREADED (2026-06-25)**: `rustc hello.rs` → multithreaded `rust-lld` → native binary runs (`RUSTC_OK`) under `M3OS_KVM=1`. Beyond Areas A+B's streaming loader, the milestone needed a crash-chain fix, a **cross-DSO TLS-at-offset-0** loader fix (drops `--threads=1`), and a **thread-group fatal-kill** (`addr=0x8`) robustness fix (see "How the milestone was actually unblocked" below). Deferred: a TCG-runnable gate (Phase 95c) + the cargo/proc-macro stretch (Track E).
 **Source Ref:** phase-95b
 **Supersedes Legacy Doc:** N/A (extends `docs/95-native-rust-toolchain.md` with the unblocking kernel + loader work)
 
@@ -30,6 +30,55 @@ This doc is the pedagogical companion to the implementation-focused
 kernel memory concepts the phase exercises — concepts that also apply to every
 other large dynamic binary (dynamic `python3`, `ctypes` `.so`s) after the
 rework lands.
+
+## How the milestone was actually unblocked (2026-06-25)
+
+The Areas A+B streaming/demand-paged loader (below) cleared Phase 95's
+**eager-load** wall, but it turned out **not** to be the last thing between us
+and `RUSTC_OK`. The original diagnosis ("the loader still wedges loading the
+162 MB DSO" / "the FS-throughput is the binding constraint") was a **plain-TCG
+artifact** — measured under `M3OS_KVM=1` the install is ~25 s and the cold load
+~10 s. Once that red herring was set aside, three concrete bugs stood between a
+*running* `rustc` and a *code-generating* one (full record:
+[`docs/handoffs/2026-06-24-phase-95-completion-plan.md`](./handoffs/2026-06-24-phase-95-completion-plan.md)):
+
+1. **A crash chain so `rustc` even starts.** A process-page-table fix (commit
+   `841fd53f`), a `FIONBIO` `ioctl` that was returning `ENOTTY` (rust's pipe
+   setup looped on it), and — so rust-lld can find its sibling `libLLVM.so` —
+   kernel `AT_EXECFN` support plus loader `DT_RUNPATH`/`$ORIGIN` expansion (the
+   loader previously ignored `RUNPATH`, so the `$ORIGIN`-relative `libLLVM.so`
+   next to the `rust-lld` binary was never searched).
+2. **The cross-DSO TLS-at-offset-0 loader bug** (the reason `--threads=1` was a
+   temporary workaround). rust-lld's parallel relocation scan indexes
+   `relocsVec[llvm::parallel::threadIndex]`; `threadIndex` is a `thread_local`
+   *exported by one DSO and read initial-exec by another*, and it legitimately
+   lives at **TLS offset 0** in its module. The loader's symbol lookup used
+   `st_value != 0` as the "is this symbol defined?" test — which silently
+   rejected a thread-local *defined* at offset 0, so every worker read a stale
+   `threadIndex` (`UINT_MAX`) and indexed out of bounds → a deterministic
+   userspace fault on the pool workers. The fix threads an `accept_tls_zero`
+   flag through the TLS lookup path so it tests `st_shndx != SHN_UNDEF`
+   (genuine definedness) instead of `st_value != 0`. Guarded forever by the
+   `dynamic-tls` reproducer (a `DT_NEEDED` DSO thread-local written
+   general-dynamic + read initial-exec across pthreads) in `dynamic-hello-smoke`.
+3. **The thread-group fatal-kill (`addr=0x8`) robustness hole.** The worker
+   fault in (2) then exposed a second, independent kernel bug: an unhandled
+   fatal fault in *one* thread of a multithreaded process killed only the
+   faulting TID and freed the **shared** address space, stranding sibling
+   threads parked `BlockedOnFutex` (single-core hang) or — on SMP — racing the
+   page-table free into a kernel NULL+8 deref. Fixed by routing the fatal-fault
+   kill through the same group-quiesce + full-process-exit path as
+   `exit_group(2)` (SIGSEGV-encoded). Guarded by the `thread-fault` reproducer
+   (`leader-ok` + `worker-ok` arms) in `dynamic-hello-smoke`. This is a general
+   kernel-robustness fix, not strictly on the `RUSTC_OK` critical path once (2)
+   was fixed (the workers no longer fault), but it closes the hole that any
+   multithreaded crash would hit.
+
+With (1)+(2) fixed, **multithreaded** rust-lld links a native ELF and
+`rustc /usr/src/hello.rs && /tmp/hello` prints `RUSTC_OK` on m3OS — the
+`--threads=1` constraint is dropped. The streaming loader (Areas A+B) below
+remains the substrate that makes loading the 162 MB DSO tractable in the first
+place; the rest of this doc teaches it.
 
 ## What This Doc Covers
 
