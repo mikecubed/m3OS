@@ -26,6 +26,23 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 ovmf musl-tools qemu-utils e2fsprogs
 
+      - name: Enable KVM (best-effort; falls back to TCG)
+        # GitHub-hosted runners expose /dev/kvm (Phase 95 completion plan). Make
+        # the kvm node usable by the runner user and set M3OS_KVM=1 only when it
+        # is actually writable, so the QEMU smoke/device/regression steps below run
+        # KVM-accelerated where available and gracefully fall back to TCG otherwise.
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm || true
+          [ -e /dev/kvm ] && sudo chmod 666 /dev/kvm || true
+          if [ -w /dev/kvm ]; then
+            echo "M3OS_KVM=1" >> "$GITHUB_ENV"
+            echo "KVM available — gates run KVM-accelerated (M3OS_KVM=1)."
+          else
+            echo "KVM unavailable — gates run under TCG."
+          fi
+
       - name: Cargo cache
         uses: actions/cache@v5
         with:
@@ -67,9 +84,11 @@ jobs:
           cargo xtask smoke-test --timeout 400
 
       - name: "Device-smoke parity lane (NVMe ± IOMMU + e1000 IOMMU)"
-        # Timeouts widened off the old 90s lanes (CI runners have no KVM; QEMU
-        # runs under TCG). The NVMe lanes are reliable now that the ring-3 NVMe
-        # driver enables MSI-X before creating its I/O completion queue.
+        # Timeouts stay widened off the old 90s lanes to cover the TCG-fallback
+        # case (the job enables KVM best-effort above; GitHub runners expose
+        # /dev/kvm, but the timeouts must still hold if a runner ever lacks it).
+        # The NVMe lanes are reliable now that the ring-3 NVMe driver enables
+        # MSI-X before creating its I/O completion queue.
         run: |
           cargo xtask device-smoke --device nvme --iommu --timeout 180
           cargo xtask device-smoke --device nvme --timeout 180

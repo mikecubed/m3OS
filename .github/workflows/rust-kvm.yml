@@ -1,0 +1,119 @@
+name: Rust on-device (rustc-smoke, KVM)
+
+# The dedicated KVM lane for the Phase 95b milestone gate — `rustc-smoke`'s
+# INSIDE-m3OS code-generation arm (`rustc hello.rs` → multithreaded `rust-lld`
+# → `RUSTC_OK`). Per the Phase 95 completion plan (Step 2): this gate is
+# KVM-gated (it skips-with-reason without M3OS_KVM=1, like node-jit-smoke), and
+# GitHub-hosted runners DO expose /dev/kvm, so the milestone is CI-runnable here.
+# KVM buys speed (the compiler does not JIT, so it needs no PKU); Azure masks
+# PKU, which only matters for the JIT gates that live on self-hosted runners.
+#
+# NOT part of the per-PR merge gate: the cold host build of the rust toolchain
+# (LLVM 22 + rustc 1.96 from source) is multi-hour, so this runs weekly +
+# on-demand with an aggressive pkgcache cache — once a build is sealed, later
+# runs resolve it from the cache and only pay the (~25 s under KVM) install +
+# the in-guest compile/link/run. A cold first run may approach the 6-hour job
+# limit on a standard runner; warm the pkgcache (or use a larger runner) if it
+# times out.
+#   gh workflow run rust-kvm.yml --ref <branch>
+
+on:
+  schedule:
+    - cron: '0 4 * * 0'  # 04:00 UTC Sundays
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rustc-smoke:
+    name: rustc-smoke (RUSTC_OK, KVM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          targets: x86_64-unknown-linux-musl
+          components: rustfmt, clippy, rust-src
+
+      - name: Install system dependencies
+        # The rustc port host-cross-builds LLVM + rustc from source, so it needs
+        # clang/cmake/ninja/lld/python3/musl-dev in addition to the QEMU stack.
+        # rustc-smoke skips-with-reason if any are absent, so a missing dep yields
+        # a clean skip rather than a false failure.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 ovmf musl-tools qemu-utils e2fsprogs \
+            clang cmake ninja-build lld python3 python3-venv
+
+      - name: Enable KVM (required for this lane; skips-with-reason if absent)
+        # Same best-effort enablement as pr.yml. rustc-smoke is KVM-gated, so when
+        # /dev/kvm is unavailable we deliberately leave M3OS_KVM unset → the gate
+        # skips-with-reason (clean pass) rather than failing on a -enable-kvm abort.
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm || true
+          [ -e /dev/kvm ] && sudo chmod 666 /dev/kvm || true
+          if [ -w /dev/kvm ]; then
+            echo "M3OS_KVM=1" >> "$GITHUB_ENV"
+            echo "KVM available — rustc-smoke runs the codegen arm (M3OS_KVM=1)."
+          else
+            echo "KVM unavailable — rustc-smoke will skip-with-reason."
+          fi
+
+      - name: Cargo cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Rust toolchain pkgcache (sealed .m3pkg + sources)
+        # The expensive part: the sealed rust/llvm/musl .m3pkgs + downloaded
+        # sources. A warm cache turns the multi-hour LLVM+rustc build into a
+        # zero-compiler pkgcache hit (resolve-before-build gate), so only the
+        # first run pays the full build cost.
+        uses: actions/cache@v5
+        with:
+          path: |
+            target/pkgcache
+            target/ports-src
+          key: ${{ runner.os }}-rustpkg-${{ hashFiles('ports/lang/rust/Portfile', 'ports/lib/llvm/Portfile', 'ports/lib/musl/Portfile', 'xtask/src/port_build.rs') }}
+          restore-keys: ${{ runner.os }}-rustpkg-
+
+      - name: TCC build cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            target/tcc-src
+            target/tcc-staging
+          key: ${{ runner.os }}-tcc-${{ hashFiles('xtask/src/main.rs') }}
+          restore-keys: ${{ runner.os }}-tcc-
+
+      - name: Fetch Nerd Font asset
+        run: cargo xtask fetch-fonts
+
+      - name: "rustc-smoke (pkg install rust → rustc hello.rs → RUSTC_OK)"
+        env:
+          M3OS_RUST_REGRESSION: "1"
+        run: |
+          rm -f target/x86_64-unknown-none/release/disk.img || true
+          cargo xtask rustc-smoke --timeout 5400
+
+      - name: Upload serial artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: rustc-smoke-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            target/regression/
+          retention-days: 7
+          if-no-files-found: ignore

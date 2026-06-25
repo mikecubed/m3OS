@@ -53,13 +53,14 @@ jobs:
       - name: Allocator loom concurrency tests
         run: RUSTFLAGS='--cfg loom' cargo test -p kernel-core --target x86_64-unknown-linux-gnu --test allocator_loom
 
-  # Headless QEMU gates on the PR. Runs in parallel with `check`. Timeouts are
-  # deliberately generous (vs. build.yml's tighter post-merge lanes) because
-  # GitHub runners have no KVM — QEMU executes under TCG, which is markedly
-  # slower than developer hardware. The device-smoke NVMe lane was unreliable
-  # under TCG until the ring-3 NVMe driver was fixed to enable MSI-X *before*
-  # creating its I/O completion queue (PR re-enabling this gate); it is now
-  # verified 10/10 under TCG, so both NVMe (± IOMMU) lanes are gated here.
+  # Headless QEMU gates on the PR. Runs in parallel with `check`. The job enables
+  # KVM best-effort (the "Enable KVM" step below — GitHub-hosted runners expose
+  # /dev/kvm per the Phase 95 completion plan) and gracefully falls back to TCG if
+  # it is ever unavailable, so the deliberately generous timeouts (vs. build.yml's
+  # tighter post-merge lanes) still cover the TCG-fallback case. The device-smoke
+  # NVMe lane was unreliable under TCG until the ring-3 NVMe driver was fixed to
+  # enable MSI-X *before* creating its I/O completion queue; it is now verified
+  # 10/10, so both NVMe (± IOMMU) lanes are gated here.
   qemu-gates:
     name: QEMU smoke + device + regression gates
     runs-on: ubuntu-latest
@@ -77,6 +78,26 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 ovmf musl-tools qemu-utils e2fsprogs
+
+      - name: Enable KVM (best-effort; falls back to TCG)
+        # Phase 95 completion plan verified GitHub-hosted runners expose /dev/kvm
+        # (Azure EPYC, nested KVM). The udev rule + chmod make the kvm node usable
+        # by the non-root runner user; we set M3OS_KVM=1 ONLY when /dev/kvm is
+        # actually writable, so the gates run KVM-accelerated where available and
+        # gracefully fall back to TCG otherwise — this never breaks CI if a future
+        # runner image drops KVM. (Azure masks PKU, so PKU-dependent JIT gates are
+        # unaffected; KVM here buys speed, not PKU.)
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm || true
+          [ -e /dev/kvm ] && sudo chmod 666 /dev/kvm || true
+          if [ -w /dev/kvm ]; then
+            echo "M3OS_KVM=1" >> "$GITHUB_ENV"
+            echo "KVM available — gates run KVM-accelerated (M3OS_KVM=1)."
+          else
+            echo "KVM unavailable — gates run under TCG."
+          fi
 
       - name: Cargo cache
         uses: actions/cache@v5

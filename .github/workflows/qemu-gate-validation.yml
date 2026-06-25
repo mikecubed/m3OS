@@ -1,8 +1,11 @@
 name: QEMU Gate Reliability (manual)
 
 # On-demand harness to measure whether a headless QEMU gate runs reliably
-# enough on GitHub's TCG runners (no KVM) before wiring it into the PR merge
-# gate. Each gate is an INDEPENDENT matrix leg with `fail-fast: false`, so one
+# enough on GitHub's runners before wiring it into the PR merge gate. The job
+# enables KVM best-effort (GitHub-hosted runners expose /dev/kvm — Phase 95
+# completion plan) and falls back to TCG if unavailable, matching the pr.yml
+# qemu-gates job it onboards gates for. Each gate is an INDEPENDENT matrix leg
+# with `fail-fast: false`, so one
 # flaky gate does not mask the others — every run yields a clean per-gate
 # pass/fail sample. (This is how the NVMe device-smoke MSI-X bug was isolated:
 # the non-IOMMU vs. IOMMU legs proved the IOMMU path was not the trigger.)
@@ -56,6 +59,21 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 ovmf musl-tools qemu-utils e2fsprogs
+
+      - name: Enable KVM (best-effort; falls back to TCG)
+        # Mirror pr.yml's qemu-gates KVM enablement so the reliability harness
+        # measures gates under the same acceleration the merge gate uses.
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm || true
+          [ -e /dev/kvm ] && sudo chmod 666 /dev/kvm || true
+          if [ -w /dev/kvm ]; then
+            echo "M3OS_KVM=1" >> "$GITHUB_ENV"
+            echo "KVM available — gate runs KVM-accelerated (M3OS_KVM=1)."
+          else
+            echo "KVM unavailable — gate runs under TCG."
+          fi
 
       - name: Cargo cache
         uses: actions/cache@v5
