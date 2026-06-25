@@ -347,11 +347,46 @@ thread is left `BlockedOnFutex` after the lock fixes.
     — the Rust analog of Phase 85d clang — reached with a single-threaded-linker constraint
     (analogous to Go's single-core constraint). The gate now bakes in `--threads=1`.
     **Deferred follow-ups (NOT milestone blockers):** (a) the **multithreaded rust-lld**
-    `threadIndex`-vs-`relocsVec`-size bug (so `--threads=1` can be dropped) — investigate how
-    LLD sizes `relocsVec` (`parallel::getThreadCount()`) vs how each worker's `threadIndex`
-    `thread_local` is set under m3OS's clone_thread TLS; (b) the **thread-group fatal-kill**
-    kernel-robustness fix (so a faulting thread in ANY multithreaded process doesn't
-    hang/`addr=0x8` the kernel) per the addr=0x8 update above; (c) the fault-dump stack-safety.
+    worker-TLS bug (so `--threads=1` can be dropped) — deep-diagnosed below; (b) the
+    **thread-group fatal-kill** kernel-robustness fix (so a faulting thread in ANY
+    multithreaded process doesn't hang/`addr=0x8` the kernel) per the addr=0x8 update above;
+    (c) the fault-dump stack-safety.
+  - **UPDATE (2026-06-25) — multithreaded rust-lld deep-diagnosed to the EXACT mechanism; the
+    loader/musl/kernel TLS chain is provably consistent ON PAPER, so the remaining defect is a
+    subtle RUNTIME TLS bug needing instrumentation, NOT a layout error.** Findings:
+    - The crash is `llvm::parallel::threadIndex` (an exported `extern thread_local` in
+      **libLLVM.so**) reading its `.tdata` default `UINT_MAX` on an LLD pool **worker** thread,
+      so `relocsVec[UINT_MAX]` (`SyntheticSections.h:556`, sized to `ctx.arg.threadCount`) faults
+      ~64 GB out of bounds (the fault math: `relocsVec.data()≈0x10ac1bc9a0 + UINT_MAX*16 + 8 =
+      0x20ac1bc998`). `work()` (`Parallel.cpp:124`) sets `threadIndex = ThreadID` at worker
+      start, but the read sees the default ⇒ the write didn't reach the slot the read uses.
+    - **It is a TLS MODEL MIX over 2 modules** — the path neither rustc (1 TLS module:
+      librustc_driver.so) nor `dynamic-mt` (0 DSO thread-locals) exercises. Confirmed by relocs:
+      the WRITE in libLLVM is **general-dynamic** (`R_X86_64_DTPMOD64`/`DTPOFF64` →
+      `__tls_get_addr(self->dtv[id]+off)`); the READ in rust-lld is **initial-exec**
+      (`R_X86_64_TPOFF64` → `%fs + TPOFF`); both name the same symbol `_ZN4llvm8parallel11threadIndexE`.
+    - **Every link was verified consistent**, so a layout fix is NOT indicated: loader
+      `DTPMOD64 → m.tls_id` (matches DTV index), `TPOFF64 = st_value − tls_offset`,
+      `assign_tls_modules` offset `ALIGN(running+memsz,align)` == musl `__copy_tls` placement
+      `td − p->offset`, the `struct tls_module` chain is built in `tls_id` order (so
+      `__copy_tls`'s iteration `i` == `tls_id`), `__copy_tls` sets per-thread `dtv[i] = td −
+      offset`, `__tls_get_addr` is musl's per-thread `self->dtv[v[0]]+v[1]`, the `0004-tls-globals`
+      patch publishes all of `libc.tls_head/size/align/cnt`, and `sys_clone_thread` sets
+      `child_fs_base = tls` on `CLONE_SETTLS`. On paper the GD write and IE read resolve to the
+      SAME per-thread address `worker_TP − libLLVM.tls_offset + st_value`.
+    - **CONCLUSION + NEXT STEP:** since the static chain is correct, the bug is a runtime
+      interaction (candidates: the worker's `dtv`/`%fs` not what `__copy_tls`/clone think at the
+      moment `work()` writes vs when `addReloc` reads; a `__copy_tls`/`pthread_create`
+      allocation/DTV edge with 2 modules; or an FS_BASE/DTV save-restore subtlety that only the
+      GD+IE *mix* exposes). Source analysis is exhausted — pin it down with a **minimal 2-TLS-
+      module reproducer**: a `DT_NEEDED` `libfoo.so` defining an exported `__thread int t=-1;`,
+      a main exe that (i) WRITES it via a libfoo accessor (general-dynamic, like `work()`) and
+      (ii) READS it via `extern __thread` initial-exec (like `addReloc`) from N pthreads, asserting
+      `read==written` per thread. Build it like `build_dynamic_mt_fixture` + the `libhello.so`
+      shared-lib path; wire it as `dynamic-tls-smoke`. It reproduces in ~2 min (vs the 15-min rust
+      gate) and is the permanent regression guard once fixed. With the repro, dump (on the worker)
+      the resolved `%fs`/`TPOFF`, `dtv[id]`, and `__tls_get_addr` result to see where write/read
+      diverge. (`--threads=1` stays the milestone path until this lands.)
 
 ### Step 2 (DECISION — RESOLVED 2026-06-24) — `rustc-smoke` is KVM-gated; CI uses KVM
 
