@@ -476,6 +476,31 @@ struct DeviceSet {
 /// [`DeviceSet::iommu`] so launchers append [`IOMMU_QEMU_ARGS`] to the QEMU
 /// command line. Remaining args (e.g. `--fresh`, `--gui`) pass through.
 fn extract_device_flags(args: &[String]) -> Result<(DeviceSet, Vec<String>), String> {
+    let (mut devices, remaining) = parse_device_flags(args)?;
+
+    // Env-var alias for the same flag — useful for CI scripts that don't
+    // want to thread `--kvm` through every xtask invocation.
+    if !devices.kvm && std::env::var_os("M3OS_KVM").is_some_and(|v| v != "0" && !v.is_empty()) {
+        devices.kvm = true;
+    }
+
+    // `M3OS_MEM` env-var alias — matches the `-m`/`--memory` flag for CI
+    // and tmux-session use where flag-plumbing is awkward. Flag wins if
+    // both are set (handed to `extract_device_flags` first).
+    apply_memory_env_fallback(&mut devices)?;
+
+    Ok((devices, remaining))
+}
+
+/// Pure, env-free device-flag parser: walks `args` and populates a
+/// [`DeviceSet`] from explicit flags only, returning the unconsumed
+/// arguments. [`extract_device_flags`] wraps this and then layers the
+/// `M3OS_KVM` / `M3OS_MEM` env-var fallbacks on top.
+///
+/// Kept separate so unit tests asserting exact defaults (`DeviceSet::default()`)
+/// stay deterministic regardless of ambient CI env vars — e.g. a build job that
+/// exports `M3OS_KVM=1` must not flip `kvm` on for a no-args parse.
+fn parse_device_flags(args: &[String]) -> Result<(DeviceSet, Vec<String>), String> {
     let mut devices = DeviceSet::default();
     let mut remaining = Vec::with_capacity(args.len());
     let mut index = 0;
@@ -510,17 +535,6 @@ fn extract_device_flags(args: &[String]) -> Result<(DeviceSet, Vec<String>), Str
         }
         index += 1;
     }
-
-    // Env-var alias for the same flag — useful for CI scripts that don't
-    // want to thread `--kvm` through every xtask invocation.
-    if !devices.kvm && std::env::var_os("M3OS_KVM").is_some_and(|v| v != "0" && !v.is_empty()) {
-        devices.kvm = true;
-    }
-
-    // `M3OS_MEM` env-var alias — matches the `-m`/`--memory` flag for CI
-    // and tmux-session use where flag-plumbing is awkward. Flag wins if
-    // both are set (handed to `extract_device_flags` first).
-    apply_memory_env_fallback(&mut devices)?;
 
     Ok((devices, remaining))
 }
@@ -32963,7 +32977,9 @@ mod tests {
 
     #[test]
     fn extract_device_flags_defaults_empty() {
-        let (devices, rest) = extract_device_flags(&[]).unwrap();
+        // Use the pure parser so ambient CI env vars (e.g. a build job that
+        // exports `M3OS_KVM=1`) can't contaminate the exact-default assertion.
+        let (devices, rest) = parse_device_flags(&[]).unwrap();
         assert_eq!(devices, DeviceSet::default());
         assert!(rest.is_empty());
     }
