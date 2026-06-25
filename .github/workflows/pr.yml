@@ -129,7 +129,13 @@ jobs:
           # Regenerate the data disk so a stale cached image cannot mask a
           # build/boot regression (mirrors build.yml's smoke-test recipe).
           rm -f target/x86_64-unknown-none/release/disk.img
-          cargo xtask smoke-test --timeout 400
+          # Tee the full serial output (incl. any "=== CRASH DIAGNOSTICS ==="
+          # register dump + trace ring) to a file so the failure-artifact upload
+          # below captures the COMPLETE backtrace for offline addr2line against
+          # the uploaded kernel ELF. The GH default shell is `bash -eo pipefail`,
+          # so a smoke-test failure still fails the step despite the tee.
+          mkdir -p target/ci-crash
+          cargo xtask smoke-test --timeout 400 2>&1 | tee target/ci-crash/smoke-test.log
 
       - name: "Device-smoke (NVMe ± IOMMU + e1000 IOMMU)"
         run: |
@@ -214,5 +220,13 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: pr-regression-artifacts
-          path: target/regression/
+          # Includes the exact CI-built kernel ELF + teed smoke-test serial log
+          # so a CI-only crash (e.g. a layout-exposed kernel fault that does not
+          # reproduce locally) can be symbolized offline: addr2line the crash rip
+          # (rip − PIE load base = ELF file vaddr) against this kernel binary.
+          path: |
+            target/regression/
+            target/ci-crash/
+            target/x86_64-unknown-none/release/kernel
           retention-days: 14
+          if-no-files-found: ignore
