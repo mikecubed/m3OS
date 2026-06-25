@@ -724,6 +724,14 @@ pub struct DlInfo {
 /// used for single-threaded, startup sysroot detection (rustc's
 /// `current_dll_path`), so one reused buffer suffices; the returned pointer is
 /// valid until the next `dladdr` call.
+///
+/// This shares the loader-wide single-threaded `DlState` invariant
+/// (see [`DlStateCell`]'s `unsafe impl Sync`, documented in
+/// `docs/76-dynamic-linker.md`): `dladdr`'s own slot scan reads
+/// `refcounts[]`/`dsos[]`/`name()` from that same unsynchronized state, so this
+/// buffer is no less safe than the surrounding libdl entry points. Making
+/// concurrent `dladdr` safe is the whole-`DlState`-locking follow-up, not a
+/// per-buffer change.
 static mut DLADDR_PATH: [u8; 320] = [0; 320];
 
 /// `int dladdr(void *addr, Dl_info *info)` — given an address, fill `info` with

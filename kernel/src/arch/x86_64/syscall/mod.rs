@@ -12714,7 +12714,16 @@ fn sys_mmap_file_backed(
         // Frame is pre-zeroed by allocate_frame_zeroed (D.4); fill from file.
         let frame_ptr = (phys_off + frame.start_address().as_u64()) as *mut u8;
 
-        let read_offset = file_offset + (i as usize) * 4096;
+        // Same unbounded-user-`file_offset` overflow guard as the lazy
+        // demand-fault path (`shared_vma_demand_file`): a near-`usize::MAX`
+        // page-aligned mmap offset would wrap `file_offset + i*4096` (release
+        // build, no panic). Treat overflow as a past-EOF page and leave the
+        // already-zeroed frame — never read a wrapped/aliased file region.
+        // (`i*4096 < total_size <= 2^47`, so only the outer add can overflow.)
+        let Some(read_offset) = file_offset.checked_add((i as usize) * 4096) else {
+            mapped_frames.push(frame);
+            continue;
+        };
         match kernel_read_fd_at(pid, fd, read_offset, &mut page_buf) {
             Ok(n) if n > 0 => unsafe {
                 core::ptr::copy_nonoverlapping(page_buf.as_ptr(), frame_ptr, n);

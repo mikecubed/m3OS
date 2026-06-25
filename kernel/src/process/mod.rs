@@ -1316,7 +1316,13 @@ pub fn shared_vma_demand_file(pid: Pid, addr: u64) -> Option<(u64, u8, u32, u64,
     let fb = vma.file_backing?;
     let page_base = addr & !0xFFF;
     // file offset of this page = first-byte offset + distance from vma.start.
-    let page_file_off = fb.offset.wrapping_add(page_base.saturating_sub(vma.start));
+    // `MAP_LAZY_FILE` and `file_offset` are both userspace-controlled via `mmap`
+    // (the offset is only page-alignment-checked, not bounded against u64::MAX),
+    // so a bogus near-`u64::MAX` offset could overflow here. Treat overflow as an
+    // invalid lazy mapping and return `None` — the caller then falls back to
+    // zero-fill demand paging (this function's documented `None` contract)
+    // instead of `wrapping_add` silently aliasing the wrong file region.
+    let page_file_off = fb.offset.checked_add(page_base.saturating_sub(vma.start))?;
     let vma_end = vma.start.saturating_add(vma.len);
     Some((vma.prot, vma.pkey, fb.fd, page_file_off, vma_end))
 }
