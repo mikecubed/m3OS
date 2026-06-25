@@ -7,7 +7,7 @@
 //!   slot_base                        slot_base + GUARD       slot_base + SLOT_VSIZE
 //!   |                                |                       |
 //!   v                                v                       v
-//!   +----------- 4 KiB --------------+----------- 32 KiB ----+
+//!   +----------- 4 KiB --------------+----------- 96 KiB ----+
 //!   |       guard page (unmapped)    |   usable stack bytes  |
 //!   +--------------------------------+-----------------------+
 //! ```
@@ -42,14 +42,29 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use x86_64::VirtAddr;
 use x86_64::structures::paging::{Mapper, Page, PageTableFlags, Size4KiB};
 
-/// Size of one kernel stack's usable region in bytes (64 KiB).
+/// Size of one kernel stack's usable region in bytes (96 KiB).
 ///
-/// Bumped from the prior 32 KiB after the guard-page rework surfaced an
-/// AP-boot stack overflow (~33 KiB peak) that previously spilled silently
-/// into the adjacent `.bss` slot. With the guard page now catching that
-/// overflow as a real fault, the usable region must accommodate worst-case
-/// boot-time stack usage with a comfortable margin.
-pub const KERNEL_STACK_SIZE: usize = 4096 * 16;
+/// History:
+/// - 32 KiB → 64 KiB after the guard-page rework surfaced an AP-boot stack
+///   overflow (~33 KiB peak) that previously spilled silently into the adjacent
+///   `.bss` slot.
+/// - 64 KiB → 96 KiB (Phase 95b): the deep lazy file-backed demand-fault chain
+///   (`page_fault_handler → shared_vma_demand_file → blocking vfs_server read →
+///   map cluster`, hammered by a strict-mode `LD_BIND_NOW` loader relocating a
+///   versioned DSO) runs on the *faulting task's* kstack and sat right at the
+///   prior 64 KiB budget — close enough that an unrelated kernel code-*layout*
+///   shift tipped it over the guard page in CI (the
+///   `dynlink-hello-versioned-mismatch-smoke` overflow on slot 13, on a kernel
+///   that passed pre-shift). The path is bounded and already heap-buffers its
+///   file read (see `interrupts.rs` "Heap (not stack) buffer" — no large stack
+///   frame to trim), so the correct lever is headroom: 96 KiB gives ~50% margin
+///   over the prior worst-case depth, and a uniform pool bump is robust to
+///   whether the deepest frame is the demand-fault chain or the fault-kill
+///   teardown (both run on the same per-task kstack).
+///
+/// Cost: this region is mapped *eagerly* per slot across [`MAX_KERNEL_STACKS`]
+/// (542 slots as built), so each +32 KiB adds ~17 MiB committed RAM.
+pub const KERNEL_STACK_SIZE: usize = 4096 * 24;
 
 /// Size of the unmapped guard page below each stack (one 4 KiB page).
 pub const KSTACK_GUARD_SIZE: usize = 4096;

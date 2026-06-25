@@ -19503,7 +19503,7 @@ pub(super) fn sys_set_spec_ctrl(enable: u64) -> u64 {
 pub const SYS_KSTACK_OVERFLOW_TEST: u64 = 0x1150;
 
 /// Recurse with a sizable written local buffer so each frame consumes ~1 KiB
-/// and the 64 KiB kernel stack is exhausted in well under 100 frames. Not tail
+/// and the kernel stack (`KERNEL_STACK_SIZE`) is exhausted in ~100 frames. Not tail
 /// recursion (the result is combined *after* the recursive call), so the
 /// compiler cannot rewrite it into a loop; `black_box` + volatile keep the
 /// buffer live and un-elided.
