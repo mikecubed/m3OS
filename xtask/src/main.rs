@@ -22003,6 +22003,134 @@ int main(void) {
     Ok(true)
 }
 
+/// Phase 95b follow-up — the multi-module-TLS reproducer for the rust-lld
+/// worker-thread `threadIndex` bug (so the `--threads=1` rust-lld constraint can
+/// eventually be dropped). It recreates rust-lld's EXACT failing pattern in a
+/// ~2-min fixture instead of the 15-min rust gate:
+///
+/// * `libfoo.so` — a `DT_NEEDED` DSO with an EXPORTED `__thread int foo_tls`,
+///   written via a general-dynamic accessor `foo_set()` (mirrors libLLVM's
+///   `work(): threadIndex = ThreadID`, an exported `extern thread_local` written
+///   inside the DSO ⇒ `R_X86_64_DTPMOD64`/`DTPOFF64`).
+/// * `dynamic-tls` — a `-pie` main exe with its OWN `__thread` (TLS module 1,
+///   like rust-lld's PT_TLS) that READS libfoo's `foo_tls` (TLS module 2) via
+///   INITIAL-EXEC (`__attribute__((tls_model("initial-exec")))` ⇒
+///   `R_X86_64_TPOFF64`, mirroring rust-lld's `addReloc`), across N pthreads.
+///
+/// Two TLS modules + a general-dynamic-write/initial-exec-read MIX on a worker
+/// thread — the exact case neither rustc (1 TLS module) nor `dynamic-mt` (0 DSO
+/// thread-locals) exercises. Each worker asserts the GD write is visible through
+/// the IE read; a divergence prints `DYNAMIC_TLS:FAIL …` (the bug, with the
+/// observed values), success prints `DYNAMIC_TLS:ok`. Staged at
+/// `/usr/bin/dynamic-tls` (+ `/usr/lib/libfoo.so` via the generated-libs `.so`
+/// auto-stage) and run by `dynamic-hello-smoke`.
+fn build_dynamic_tls_fixture() -> Result<bool, String> {
+    let cc = match find_musl_cc() {
+        Some(cc) => cc,
+        None => return Ok(false),
+    };
+    let root = workspace_root();
+    let libs = ensure_generated_libs_dir(&root);
+
+    // 1. libfoo.so — exported __thread var + general-dynamic accessors.
+    let foo_src = libs.join("libfoo.c");
+    let foo_so = libs.join("libfoo.so");
+    let _ = fs::remove_file(&foo_so);
+    let foo_c = r#"/* m3OS Phase 95b TLS repro DSO. An exported thread_local written
+   via a general-dynamic accessor — mirrors libLLVM's work(): threadIndex=ThreadID
+   (an exported `extern thread_local` written INSIDE the DSO -> DTPMOD64/DTPOFF64). */
+__thread int foo_tls = -1;
+void foo_set(int v) { foo_tls = v; }
+int  foo_get(void)  { return foo_tls; }
+"#;
+    fs::write(&foo_src, foo_c).map_err(|e| format!("write libfoo.c: {e}"))?;
+    let status = Command::new(cc)
+        .args(["-shared", "-fPIC", "-O2", "-Wl,-soname,libfoo.so", "-o"])
+        .arg(&foo_so)
+        .arg(&foo_src)
+        .status()
+        .map_err(|e| format!("invoke musl cc {cc}: {e}"))?;
+    if !status.success() {
+        return Err("libfoo.so failed to compile".to_string());
+    }
+
+    // 2. dynamic-tls — -pie main exe: own __thread (module 1) + INITIAL-EXEC read
+    //    of libfoo's __thread (module 2) + general-dynamic write via foo_set, from
+    //    N pthreads with a sched_yield between write and read to force a context
+    //    switch (exercises any FS_BASE/DTV save-restore subtlety too).
+    let src = libs.join("dynamic-tls.c");
+    let out = libs.join("dynamic-tls");
+    let _ = fs::remove_file(&out);
+    let c_src = r#"#include <stdio.h>
+#include <pthread.h>
+#include <sched.h>
+/* main-exe thread_local — TLS module 1 (mirrors rust-lld's own PT_TLS). */
+static __thread int main_tls = 222;
+/* libfoo's thread_local — TLS module 2 — read via INITIAL-EXEC. The attribute
+   forces the IE model so this matches rust-lld's addReloc (R_X86_64_TPOFF64)
+   rather than defaulting to general-dynamic for a PIE-referenced DSO var. */
+extern __thread int foo_tls __attribute__((tls_model("initial-exec")));
+extern void foo_set(int v);   /* general-dynamic write inside libfoo (like work()) */
+extern int  foo_get(void);    /* general-dynamic read inside libfoo */
+#define N 4
+#define ITERS 2000
+static volatile int g_fail = 0;
+static volatile int g_id = 0, g_ie = 0, g_gd = 0, g_main = 0;
+static void *worker(void *arg) {
+    int id = (int)(long)arg + 1;   /* 1-based, like an LLVM worker ThreadID */
+    for (int i = 0; i < ITERS && !g_fail; i++) {
+        foo_set(id);               /* general-dynamic WRITE of the DSO thread_local */
+        main_tls = id;             /* write the main-exe thread_local */
+        sched_yield();             /* force a context switch between write and read */
+        int ie = foo_tls;          /* INITIAL-EXEC READ (the rust-lld addReloc pattern) */
+        int gd = foo_get();        /* general-dynamic read (same var) */
+        if (ie != id || gd != id || main_tls != id) {
+            g_id = id; g_ie = ie; g_gd = gd; g_main = main_tls;
+            g_fail = 1;
+            return (void *)0;
+        }
+    }
+    return (void *)0;
+}
+int main(void) {
+    pthread_t t[N];
+    for (long i = 0; i < N; i++) {
+        if (pthread_create(&t[i], (void *)0, worker, (void *)i) != 0) {
+            printf("DYNAMIC_TLS:create-fail\n"); fflush(stdout); return 1;
+        }
+    }
+    for (int i = 0; i < N; i++) pthread_join(t[i], (void *)0);
+    if (g_fail)
+        printf("DYNAMIC_TLS:FAIL id=%d ie=%d gd=%d main=%d\n", g_id, g_ie, g_gd, g_main);
+    else
+        printf("DYNAMIC_TLS:ok\n");
+    fflush(stdout);
+    return 0;
+}
+"#;
+    fs::write(&src, c_src).map_err(|e| format!("write dynamic-tls.c: {e}"))?;
+    let status = Command::new(cc)
+        .args(["-O2", "-fPIE", "-pie", "-pthread", "-o"])
+        .arg(&out)
+        .arg(&src)
+        .arg(format!("-L{}", libs.display()))
+        .arg("-lfoo")
+        .status()
+        .map_err(|e| format!("invoke musl cc {cc}: {e}"))?;
+    if !status.success() {
+        return Err("dynamic-tls.c failed to compile/link".to_string());
+    }
+    if !out.exists() {
+        return Err("dynamic-tls binary missing after compile".to_string());
+    }
+    let sz = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+    println!(
+        "dynamic-hello-smoke: built dynamic-tls fixture {} + libfoo.so ({sz} bytes)",
+        out.display()
+    );
+    Ok(true)
+}
+
 fn build_dynamic_hello_fixture() -> Result<bool, String> {
     let cc = match find_musl_cc() {
         Some(cc) => cc,
@@ -22095,6 +22223,9 @@ int main(void) {
     // Also build the multithreaded deadlock-repro companion (staged + run by the
     // same gate as the lazy-file-fault-under-lock regression guard).
     build_dynamic_mt_fixture()?;
+    // Phase 95b follow-up — the multi-module-TLS reproducer (libfoo.so + a -pie
+    // main exe) for the rust-lld worker-thread `threadIndex` bug.
+    build_dynamic_tls_fixture()?;
 
     Ok(true)
 }
@@ -22279,6 +22410,28 @@ fn dynamic_hello_smoke_steps() -> Vec<SmokeStep> {
         ],
         timeout_secs: 60,
         label: "dynamic-hello-smoke: DYNAMIC_MT:ok (multithreaded)",
+        exit_code_on_fail: SMOKE_EXIT_DYNAMIC_HELLO_FAILED,
+    });
+    // Phase 95b follow-up — the multi-module-TLS reproducer for the rust-lld
+    // worker `threadIndex` bug: a general-dynamic write of a DT_NEEDED DSO's
+    // thread_local + an initial-exec read of it on each pthread. `DYNAMIC_TLS:ok`
+    // means the GD write is visible through the IE read on workers (the fix);
+    // `DYNAMIC_TLS:FAIL id=N ie=-1 …` is the rust-lld bug reproduced.
+    steps.push(SmokeStep::Send {
+        input: "/usr/bin/dynamic-tls\n",
+        label: "dynamic-hello-smoke: run multi-module TLS repro",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "DYNAMIC_TLS:ok",
+        fail_prefixes: &[
+            "DYNAMIC_TLS:FAIL",
+            "DYNAMIC_TLS:create-fail",
+            "Segmentation fault",
+            "ended by signal SIGSEGV",
+            "process killed",
+        ],
+        timeout_secs: 60,
+        label: "dynamic-hello-smoke: DYNAMIC_TLS:ok (DSO thread_local on workers)",
         exit_code_on_fail: SMOKE_EXIT_DYNAMIC_HELLO_FAILED,
     });
     steps
@@ -23889,8 +24042,8 @@ fn rustc_smoke_steps() -> Vec<SmokeStep> {
     //    working native binary — not merely cross-built. No proc-macros in the
     //    dependency graph (the milestone is proc-macro-free by construction).
     steps.push(SmokeStep::Send {
-        input: "rustc -C linker=rust-lld -C linker-flavor=ld.lld -C link-self-contained=yes -C link-arg=--threads=1 /usr/src/hello.rs -o /tmp/hello && /tmp/hello\n",
-        label: "rustc-smoke: rustc hello.rs (rust-lld, --threads=1) + run",
+        input: "rustc -C linker=rust-lld -C linker-flavor=ld.lld -C link-self-contained=yes /usr/src/hello.rs -o /tmp/hello && /tmp/hello\n",
+        label: "rustc-smoke: rustc hello.rs (rust-lld, multithreaded) + run",
     });
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: "RUSTC_OK hello from rustc",
@@ -25793,6 +25946,15 @@ fn populate_ext2_files(
             s.push_str(&format!(
                 "write \"{src}\" usr/bin/dynamic-mt\nsif usr/bin/dynamic-mt mode 0x81ED\nsif usr/bin/dynamic-mt uid 0\nsif usr/bin/dynamic-mt gid 0\n",
                 src = dynamic_mt_bin.display(),
+            ));
+        }
+        // Phase 95b follow-up — stage the multi-module-TLS reproducer (its
+        // libfoo.so auto-stages to /usr/lib via the generated-libs `.so` loop).
+        let dynamic_tls_bin = workspace_root().join("target/generated-libs/dynamic-tls");
+        if dynamic_tls_bin.exists() {
+            s.push_str(&format!(
+                "write \"{src}\" usr/bin/dynamic-tls\nsif usr/bin/dynamic-tls mode 0x81ED\nsif usr/bin/dynamic-tls uid 0\nsif usr/bin/dynamic-tls gid 0\n",
+                src = dynamic_tls_bin.display(),
             ));
         }
         s

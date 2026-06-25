@@ -13,16 +13,18 @@ updated: 2026-06-24
 
 ## TL;DR — where we actually are
 
-- **✅ `RUSTC_OK` ACHIEVED (2026-06-24) — on-device Rust code generation works on m3OS.**
-  `rustc-smoke` PASSES end-to-end under `M3OS_KVM=1`: `rustc hello.rs` compiles, rust-lld links
-  it, and the native binary runs (`RUSTC_OK hello from rustc`), 0 kernel faults, ~41 s. The
-  Phase-95b milestone (the Rust analog of Phase 85d clang) is reached with a **single-threaded
-  linker** constraint — `-C link-arg=--threads=1` (now baked into the gate; analogous to Go's
-  single-core constraint). This required, in order: FIONBIO ioctl (ENOTTY fix); kernel
-  `AT_EXECFN` + loader `DT_RUNPATH`/`$ORIGIN` (so rust-lld finds `libLLVM.so`); and `--threads=1`
-  (so rust-lld avoids the multithreaded `relocsVec[threadIndex]` OOB fault + the worker-kill
-  `addr=0x8`/deadlock). See Step 1's dated updates. Deferred (non-blocking): the multithreaded
-  rust-lld `threadIndex`/pool-size bug; the thread-group fatal-kill kernel-robustness fix.
+- **✅ `RUSTC_OK` ACHIEVED + MULTITHREADED (2026-06-25) — on-device Rust code generation works
+  on m3OS, no linker constraint.** `rustc-smoke` PASSES end-to-end under `M3OS_KVM=1`: `rustc
+  hello.rs` compiles, **multithreaded `rust-lld`** links it, and the native binary runs
+  (`RUSTC_OK hello from rustc`), 0 kernel faults, ~53 s fresh-install. The `--threads=1`
+  constraint is **DROPPED** — the underlying multithreaded-TLS bug is fixed. The full chain that
+  got here: FIONBIO ioctl (ENOTTY fix); kernel `AT_EXECFN` + loader `DT_RUNPATH`/`$ORIGIN` (so
+  rust-lld finds `libLLVM.so`); and the **cross-DSO TLS-at-offset-0 loader fix** (below) so
+  rust-lld's parallel relocation scan reads `llvm::parallel::threadIndex` correctly on worker
+  threads. Built a permanent `dynamic-tls` reproducer (a `DT_NEEDED` DSO thread-local written
+  general-dynamic + read initial-exec across pthreads) wired into `dynamic-hello-smoke`. The
+  thread-group fatal-kill kernel-robustness fix (addr=0x8 on an *unhandled* fatal fault in any
+  multithreaded process) remains a separate, non-blocking follow-up.
 - **`rustc` runs on m3OS.** After the loader/libc/page-table crash chain was fully fixed
   (see "What is done"), `rustc --version` → `rustc 1.96.0` and `rustc --print sysroot` →
   `/usr` both **execute on-device, serial-captured**. The multi-week `CR2=0` blocker is gone.
@@ -387,6 +389,34 @@ thread is left `BlockedOnFutex` after the lock fixes.
       gate) and is the permanent regression guard once fixed. With the repro, dump (on the worker)
       the resolved `%fs`/`TPOFF`, `dtv[id]`, and `__tls_get_addr` result to see where write/read
       diverge. (`--threads=1` stays the milestone path until this lands.)
+  - **✅ FIXED (2026-06-25) — the runtime defect was a ONE-LINE loader symbol-lookup bug; the
+    reproducer found it, `--threads=1` is dropped, multithreaded rust-lld links.** Built the
+    `dynamic-tls` reproducer exactly as planned (it faithfully emits the same relocs as rust-lld:
+    `DTPMOD64`/`DTPOFF64` write in `libfoo.so`, `TPOFF64` read in the exe). First run reproduced
+    deterministically: `DYNAMIC_TLS:FAIL id=2 ie=<garbage> gd=2 main=2` — i.e. the **GD write +
+    GD read agree (gd=2), but the INITIAL-EXEC read returns garbage**. So the bug is in the
+    cross-DSO IE resolution, NOT the GD/DTV path. A loader diag showed the main exe's `TPOFF64`
+    for `foo_tls` resolving to **`tls_id=0 tpoff=0`** (the `None` / "deferred" branch) even though
+    the module WAS assigned (`tls mod id=2 offset=8`). Traced to **`sym::lookup_gnu`/`lookup_sysv`**:
+    their definedness test was `nm == name && sym.st_value != 0`. A **TLS** symbol's `st_value` is
+    its offset WITHIN the TLS block — **0 for the first/only thread-local** (`foo_tls`, and
+    libLLVM's `threadIndex`) — so `lookup_tls`'s cross-DSO walk **rejected it**, `tls_module_for_reloc`
+    returned `None`, and `TPOFF` was left 0 → the IE read hit the TCB (the `%fs+0` self pointer =
+    garbage). (`st_value != 0` was a sloppy "is-defined" heuristic; the correct test is
+    `st_shndx != SHN_UNDEF`. The doc comment on `lookup_tls` had even flagged this exact case as a
+    known "rare" limitation — it's precisely rust-lld's.) **Fix:** thread an `accept_tls_zero: bool`
+    through `lookup_in_dso`/`lookup_gnu`/`lookup_sysv`; `lookup()` passes `false` (keeps
+    `st_value != 0` **byte-for-byte**, so normal symbol resolution / rustc startup is untouched),
+    `lookup_tls()` passes `true` (tests `st_shndx != SHN_UNDEF`, accepting a defined TLS symbol at
+    offset 0). After the fix the diag shows `TPOFF64 tls_id=2 tpoff=-8` and the reproducer prints
+    `DYNAMIC_TLS:ok`. **Verified end-to-end:** `dynamic-hello-smoke` PASSES (incl. `DYNAMIC_TLS:ok`,
+    the permanent regression guard), and **`rustc-smoke` with multithreaded `rust-lld` (no
+    `--threads=1`, fresh install) → `RUSTC_OK`, 20 steps in 53 s, 0 kernel faults.** (Diagnostic
+    rabbit-hole note for the record: three intermediate "version wedge" runs were a TEST-HARNESS
+    artifact — running `dynamic-hello-smoke` recreates `disk.img` fresh, so a subsequent
+    `M3OS_RUST_FAST_ITER` rustc-smoke reused a rust-LESS disk → `rustc: command not found` → the
+    version step timed out. NOT a code regression; use a fresh install, or don't interleave the two
+    gates' disks.)
 
 ### Step 2 (DECISION — RESOLVED 2026-06-24) — `rustc-smoke` is KVM-gated; CI uses KVM
 
