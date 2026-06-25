@@ -16,7 +16,9 @@
 > compile-thread stall. See the
 > [completion plan](../handoffs/2026-06-24-phase-95-completion-plan.md).
 
-**The infrastructure landed; the milestone moved but is still blocked.**
+**[Superseded pre-fix picture — the milestone has since LANDED; see the header + the
+[completion plan](../handoffs/2026-06-24-phase-95-completion-plan.md). Kept as the forensic
+record of the bring-up.]**
 
 - **Area A landed & validated.** The `ld-musl` loader + kernel mm were reworked from
   whole-file read+copy to **streaming / demand-paged file-backed** loading: a new
@@ -32,8 +34,9 @@
   invalidation. `smp-smoke` is the guard.
 - **Area C is unnecessary.** The kstack overflow was a symptom of the eager-read chain;
   A.2 removed it, and rustc no longer overflows the 64 KiB kstack.
-- **Area D (the `RUSTC_OK` milestone) is STILL BLOCKED — re-diagnosed.** With the eager
-  load gone, `rustc --version` now blocks for a **different, deeper** reason:
+- **Area D (the `RUSTC_OK` milestone) — [SUPERSEDED pre-fix re-diagnosis; the milestone
+  LANDED 2026-06-25, see the header].** At the time, with the eager
+  load gone, `rustc --version` appeared to block for a **different, deeper** reason:
   instrumentation (a timer-ISR userspace-RIP sampler + a demand-fill page counter +
   a syscall sampler, on SMP=1 and SMP=4 under KVM) showed **rustc never runs userspace**
   (zero RIP samples), **demand-pages < 1 MB** of `librustc_driver.so`, and is **blocked
@@ -42,10 +45,11 @@
   dominant cost is the ~368 MB `pkg install rust` over the **~100–200 KB/s ring-3 VFS**
   (≈40 min of I/O, at/over the 50-min install-step timeout — so the on-device rustc is
   likely never properly installed). The binding constraint is **VFS / block-I/O
-  throughput**, which A.2's demand-side laziness cannot fix. **The `RUSTC_OK` milestone
-  is carried into [Phase 95c](./95c-vfs-block-io-perf.md)** — the supply-side
-  VFS/block-I/O performance subphase whose explicit goal is to flip this `rustc-smoke`
-  arm to PASS and close the 95-series.
+  throughput**, which A.2's demand-side laziness cannot fix. *(This conclusion was a
+  pre-page-table-fix, TCG-only artifact. Under KVM the FS is fast and the milestone in
+  fact landed via the multithreaded-TLS loader fix — see the header. [Phase 95c](./95c-vfs-block-io-perf.md)
+  remains the supply-side follow-up for a **TCG-runnable** `rustc-smoke` gate, not the
+  `RUSTC_OK` blocker.)*
 - **Area E (cargo + proc-macros) was not started** (gated behind D).
 
 The remainder of this doc describes the originally-planned design; the

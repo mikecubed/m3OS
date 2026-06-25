@@ -22158,10 +22158,10 @@ int main(void) {
     Ok(true)
 }
 
-/// Phase 95b follow-up — the multi-module-TLS reproducer for the rust-lld
-/// worker-thread `threadIndex` bug (so the `--threads=1` rust-lld constraint can
-/// eventually be dropped). It recreates rust-lld's EXACT failing pattern in a
-/// ~2-min fixture instead of the 15-min rust gate:
+/// Phase 95b — the multi-module-TLS reproducer for the rust-lld worker-thread
+/// `threadIndex` bug that previously forced `--threads=1` (now dropped, commit
+/// 653391d7); kept as the permanent regression guard. It recreates rust-lld's
+/// EXACT failing pattern in a ~2-min fixture instead of the 15-min rust gate:
 ///
 /// * `libfoo.so` — a `DT_NEEDED` DSO with an EXPORTED `__thread int foo_tls`,
 ///   written via a general-dynamic accessor `foo_set()` (mirrors libLLVM's

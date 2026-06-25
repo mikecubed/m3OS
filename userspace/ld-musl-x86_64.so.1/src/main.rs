@@ -2353,14 +2353,6 @@ unsafe fn setup_static_tls(dsos: &[LoadedDso]) {
     }
     let place_align = max_align;
 
-    // Diagnostic: report the assembled TLS module count + total span so a load
-    // failure can be triaged from the serial log (Phase 95c follow-up).
-    serial(b"ldso: tls modules=");
-    serial_hex(module_count);
-    serial(b" total_off=");
-    serial_hex(total_off);
-    serial(b"\n");
-
     // Reserve [tls block (total_off)][TCB (TCB_RESERVE)] + alignment slack.
     let region_len = (total_off + TCB_RESERVE + place_align + 4095) & !4095u64;
     let region = sys_mmap(
@@ -2843,19 +2835,6 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
         } else {
             name
         };
-        // Diagnostic aid — log each loaded DSO's soname, load base, and image
-        // length. A userspace fault's `rip` (e.g. rustc's CR2=0 NULL-deref) can
-        // then be mapped to its DSO + offset (`rip - base`) for OFFLINE
-        // disassembly of the faulting instruction — no risky in-kernel
-        // instruction read needed. Low-volume: one line per DT_NEEDED dependency
-        // at process startup.
-        serial(b"ldso: loaded ");
-        serial(display_name);
-        serial(b" base=");
-        serial_hex(loaded.load_bias);
-        serial(b" len=");
-        serial_hex(loaded.image_len);
-        serial(b"\n");
         let new_idx = dsos.len();
         if dsos.push(loaded).is_err() || loaded_names.push(display_name).is_err() {
             serial(b"ldso: too many DSOs\n");

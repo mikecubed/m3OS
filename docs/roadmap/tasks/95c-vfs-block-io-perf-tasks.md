@@ -1,6 +1,6 @@
 # Phase 95c — VFS / Block-I/O Performance: Task List
 
-**Status:** Planned
+**Status:** Partial — Tracks A (zero-copy + readahead) / C (vfs_server LRU eviction) / E (throughput gate) landed; B (kernel page cache) + D (installer coalescing) + G/H deferred; F **rejected** (arch decision). Not the `RUSTC_OK` blocker under KVM (the milestone landed in 95b) — see the [completion plan](../../handoffs/2026-06-24-phase-95-completion-plan.md). Track statuses below are authoritative.
 **Source Ref:** phase-95c
 **Depends on:** Phase 95b (demand-side loader) ✅ (A+B), Phase 95 ✅ (rust toolchain + `pkg install rust`), Phase 88 ✅ (vfs_server ext2 ownership), Phase 87 ✅ (VFS bulk-I/O + `/proc/blkstats`)
 **Goal:** Make the ring-3 VFS read/write path fast enough that `pkg install rust` completes inside the install-step timeout and `rustc --version` cold-loads in reasonable time — flipping the Phase 95b `rustc-smoke` INSIDE-m3OS arm to PASS (`RUSTC_OK`) — **using the microkernel-idiomatic techniques** (zero-copy page-grant transfer, server-side readahead, a kernel page cache acting as the external-pager amortizer) **rather than moving the filesystem into the kernel.** `vfs_server` stays the sole ext2 authority for reads and writes.

@@ -1,6 +1,6 @@
 # Phase 95c — VFS / Block-I/O Performance (unblock the on-device rust build)
 
-**Status:** Planned
+**Status:** Partial — A (zero-copy + readahead) / C (LRU eviction) / E (throughput gate) landed; B (kernel page cache) + D (installer coalescing) deferred; F **rejected** (arch decision). Reframed (2026-06-24): not the `RUSTC_OK` blocker under KVM — see the [completion plan](../handoffs/2026-06-24-phase-95-completion-plan.md). Matches the [README row](./README.md).
 **Source Ref:** phase-95c
 **Depends on:** Phase 95b (the demand-side streaming/demand-paged file-backed loader — `MAP_LAZY_FILE` + the blocking vfs-IPC read from the page-fault handler) ✅ (Areas A+B landed), Phase 95 ✅ (the host rust toolchain + `pkg install rust`), Phase 88 ✅ (vfs_server as the single ext2 owner), Phase 87 ✅ (VFS bulk-I/O + `/proc/blkstats`)
 **Builds on:** Phase 87 made the ext2 read/write path *coalesce contiguous runs* and added `/proc/blkstats`; Phase 95b made large-DSO loading *demand-paged* so only the touched working set is read. 95c is the **supply-side** complement: make the ring-3 VFS path itself fast enough that the heavy-toolchain install + cold-load story stops being I/O-bound — finishing the `RUSTC_OK` milestone Phase 95b is gated on.

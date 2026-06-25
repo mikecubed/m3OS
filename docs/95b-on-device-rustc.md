@@ -295,10 +295,16 @@ faults up to a per-task-class cap. The `kstack-overflow-smoke` gate (the
 `KSTACK_OVF:done` sequence) validates the recovery path regardless of strategy;
 boot-time kstack memory is asserted materially lower than a flat 256 KiB bump.
 
-### Track D — The on-device `RUSTC_OK` milestone (STILL BLOCKED — re-diagnosed)
+### Track D — The on-device `RUSTC_OK` milestone (✅ ACHIEVED — re-diagnosis below SUPERSEDED)
+
+> **➜ SUPERSEDED (2026-06-25).** The milestone is **ACHIEVED + MULTITHREADED** — see
+> "How the milestone was actually unblocked" above. The blocked re-diagnosis below is the
+> **pre-page-table-fix, TCG-only** record (rustc *does* run; the FS was never the milestone
+> blocker under KVM; the real blocker was the multithreaded cross-DSO TLS loader bug, now
+> fixed). Preserved for the forensic trail.
 
 Area A.2 cleared the **Phase 95 wall** (the CPU/IPC-bound eager 162 MB read+copy).
-But `rustc --version` (step 14 of `rustc-smoke`) still times out — for a **new,
+At the time, `rustc --version` (step 14 of `rustc-smoke`) still timed out — for a **new,
 deeper reason** this phase instrumented and pinned down:
 
 - **rustc never runs userspace.** A timer-ISR userspace-RIP sampler (logging the
