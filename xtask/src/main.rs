@@ -22003,6 +22003,161 @@ int main(void) {
     Ok(true)
 }
 
+/// Phase 95b follow-up — the thread-group fatal-fault reproducer (the `addr=0x8`
+/// kernel bug). When ONE thread of a multithreaded process takes an unhandled
+/// fatal fault (NULL deref → SIGSEGV), the WHOLE thread group must die (Linux
+/// semantics). The pre-fix kernel killed only the FAULTING TID and freed the
+/// SHARED address space, so sibling threads parked `BlockedOnFutex` were either
+/// stranded forever (single-core hang) or — on SMP — raced against the
+/// page-table free into a kernel NULL+8 deref. This was hit by rust-lld's pool
+/// workers (a fault induced by the separately-fixed cross-DSO TLS bug). The fix
+/// routes the fatal-fault kill through the same group-quiesce + full-process-exit
+/// path as `exit_group(2)` (with SIGSEGV-encoded status -11).
+///
+/// Two falsifiable arms, both with N sibling threads blocked in
+/// `pthread_cond_wait` (i.e. `BlockedOnFutex`) at the instant of the fault:
+/// * `THREAD_FAULT:leader-ok` — the GROUP LEADER thread faults (caller == leader,
+///   the normal exit_group shape); the parent `waitpid(leader)` observes
+///   `WIFSIGNALED && SIGSEGV`.
+/// * `THREAD_FAULT:worker-ok` — a NON-leader worker faults while the leader +
+///   sleepers are all blocked (the exact rust-lld shape); the faulting tid
+///   becomes the group zombie, so the parent `waitpid(-1)` observes
+///   `WIFSIGNALED && SIGSEGV`.
+/// A regression hangs (siblings stranded → `waitpid` never returns → gate
+/// timeout) or panics the kernel (`process killed` / `KERNEL PANIC` /
+/// `RECURSIVE KERNEL PAGE FAULT` / `addr=0x8`). Staged at `/usr/bin/thread-fault`,
+/// run by `dynamic-hello-smoke` (`-smp` default exercises the SMP race arm).
+fn build_thread_fault_fixture() -> Result<bool, String> {
+    let cc = match find_musl_cc() {
+        Some(cc) => cc,
+        None => return Ok(false),
+    };
+    let root = workspace_root();
+    let libs = ensure_generated_libs_dir(&root);
+    let src = libs.join("thread-fault.c");
+    let out = libs.join("thread-fault");
+    let _ = fs::remove_file(&out);
+    let c_src = r#"#include <stdio.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <sched.h>
+#include <time.h>
+#include <signal.h>
+#include <sys/wait.h>
+/* N sibling threads parked in pthread_cond_wait (BlockedOnFutex) when the fault
+   fires — the threads the pre-fix kernel stranded after freeing the shared
+   address space out from under them. */
+#define NSLEEP 3
+static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_cond = PTHREAD_COND_INITIALIZER;
+static volatile int g_parked = 0;
+static void *sleeper(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&g_mtx);
+    g_parked++;
+    while (1) pthread_cond_wait(&g_cond, &g_mtx);   /* never signaled */
+    pthread_mutex_unlock(&g_mtx);
+    return (void *)0;
+}
+/* Spin until at least `want` threads have parked, then settle so they are truly
+   inside the futex wait (past `g_parked++`, in pthread_cond_wait). */
+static void wait_until_parked(int want) {
+    for (;;) {
+        pthread_mutex_lock(&g_mtx);
+        int p = g_parked;
+        pthread_mutex_unlock(&g_mtx);
+        if (p >= want) break;
+        sched_yield();
+    }
+    struct timespec ts = { 0, 150 * 1000 * 1000 };  /* 150 ms */
+    nanosleep(&ts, (void *)0);
+}
+static void crash_null(void) { *(volatile int *)0 = 0xdead; }  /* SIGSEGV */
+static void *crasher(void *arg) {
+    int want = (int)(long)arg;
+    wait_until_parked(want);
+    crash_null();
+    return (void *)0;   /* unreachable */
+}
+/* Child mode 0 (leader faults): spawn NSLEEP sleepers, then THIS (leader) thread
+   faults once they are all parked. Child mode 1 (worker faults): spawn NSLEEP
+   sleepers + 1 crasher worker, then the leader parks in cond_wait too; the
+   crasher faults once leader+sleepers are all parked. */
+static void child_body(int worker_mode) {
+    pthread_t t[NSLEEP];
+    for (int i = 0; i < NSLEEP; i++)
+        pthread_create(&t[i], (void *)0, sleeper, (void *)0);
+    if (!worker_mode) {
+        wait_until_parked(NSLEEP);
+        crash_null();           /* leader thread takes the fatal fault */
+        _exit(99);              /* unreachable if the kill works */
+    }
+    /* worker_mode: a non-leader worker faults; the leader blocks too (NSLEEP+1
+       parked) so every other thread is BlockedOnFutex at the fault instant. */
+    pthread_t cr;
+    pthread_create(&cr, (void *)0, crasher, (void *)(long)(NSLEEP + 1));
+    pthread_mutex_lock(&g_mtx);
+    g_parked++;
+    while (1) pthread_cond_wait(&g_cond, &g_mtx);   /* leader blocks forever */
+    _exit(98);                  /* unreachable */
+}
+int main(void) {
+    /* Arm 1 — leader faults; parent waits for the specific child pid. */
+    fflush(stdout);
+    pid_t k1 = fork();
+    if (k1 < 0) { printf("THREAD_FAULT:FAIL fork1\n"); fflush(stdout); return 1; }
+    if (k1 == 0) { child_body(0); _exit(97); }
+    int st = 0;
+    pid_t w = waitpid(k1, &st, 0);
+    if (w != k1) { printf("THREAD_FAULT:FAIL wait1=%d\n", (int)w); fflush(stdout); return 1; }
+    if (!(WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV)) {
+        printf("THREAD_FAULT:FAIL leader status=0x%x exited=%d\n",
+               st, WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+        fflush(stdout); return 1;
+    }
+    printf("THREAD_FAULT:leader-ok sig=%d\n", WTERMSIG(st));
+    fflush(stdout);
+    /* Arm 2 — a non-leader worker faults; the leader is reaped as a sibling, so
+       the faulting tid is the group zombie -> reap via waitpid(-1). */
+    g_parked = 0;
+    pid_t k2 = fork();
+    if (k2 < 0) { printf("THREAD_FAULT:FAIL fork2\n"); fflush(stdout); return 1; }
+    if (k2 == 0) { child_body(1); _exit(96); }
+    st = 0;
+    w = waitpid(-1, &st, 0);
+    if (w <= 0) { printf("THREAD_FAULT:FAIL wait2=%d\n", (int)w); fflush(stdout); return 1; }
+    if (!(WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV)) {
+        printf("THREAD_FAULT:FAIL worker status=0x%x exited=%d\n",
+               st, WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+        fflush(stdout); return 1;
+    }
+    printf("THREAD_FAULT:worker-ok sig=%d\n", WTERMSIG(st));
+    printf("THREAD_FAULT:ok\n");
+    fflush(stdout);
+    return 0;
+}
+"#;
+    fs::write(&src, c_src).map_err(|e| format!("write thread-fault.c: {e}"))?;
+    let status = Command::new(cc)
+        .args(["-O2", "-fPIE", "-pie", "-pthread", "-o"])
+        .arg(&out)
+        .arg(&src)
+        .status()
+        .map_err(|e| format!("invoke musl cc {cc}: {e}"))?;
+    if !status.success() {
+        return Err("thread-fault.c failed to compile".to_string());
+    }
+    if !out.exists() {
+        return Err("thread-fault binary missing after compile".to_string());
+    }
+    let sz = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+    println!(
+        "dynamic-hello-smoke: built thread-fault fixture {} ({sz} bytes)",
+        out.display()
+    );
+    Ok(true)
+}
+
 /// Phase 95b follow-up — the multi-module-TLS reproducer for the rust-lld
 /// worker-thread `threadIndex` bug (so the `--threads=1` rust-lld constraint can
 /// eventually be dropped). It recreates rust-lld's EXACT failing pattern in a
@@ -22226,6 +22381,9 @@ int main(void) {
     // Phase 95b follow-up — the multi-module-TLS reproducer (libfoo.so + a -pie
     // main exe) for the rust-lld worker-thread `threadIndex` bug.
     build_dynamic_tls_fixture()?;
+    // Phase 95b follow-up — the thread-group fatal-fault reproducer (the addr=0x8
+    // bug): a fault in one thread must kill the whole group, not strand siblings.
+    build_thread_fault_fixture()?;
 
     Ok(true)
 }
@@ -22432,6 +22590,34 @@ fn dynamic_hello_smoke_steps() -> Vec<SmokeStep> {
         ],
         timeout_secs: 60,
         label: "dynamic-hello-smoke: DYNAMIC_TLS:ok (DSO thread_local on workers)",
+        exit_code_on_fail: SMOKE_EXIT_DYNAMIC_HELLO_FAILED,
+    });
+    // Phase 95b follow-up — the thread-group fatal-fault reproducer (the addr=0x8
+    // bug). A fatal fault in ONE thread of a multithreaded process must terminate
+    // the WHOLE group; the pre-fix kernel killed only the faulting TID and freed
+    // the shared address space, stranding siblings BlockedOnFutex (single-core
+    // hang) or racing the page-table free into a kernel NULL+8 deref (SMP). The
+    // binary forks two multithreaded children (leader-faults + worker-faults) and
+    // asserts each is reaped with WIFSIGNALED && SIGSEGV. A regression HANGS (the
+    // stranded-sibling deadlock → waitpid never returns → this step times out) or
+    // PANICS the kernel (the fail-prefixes below). The `process killed` / panic /
+    // recursive-#PF / `addr=0x8` prefixes catch the SMP race; note `THREAD_FAULT`
+    // itself prints no such line on success — the children die *cleanly* via the
+    // group teardown, no `process killed` log.
+    steps.push(SmokeStep::Send {
+        input: "/usr/bin/thread-fault\n",
+        label: "dynamic-hello-smoke: run thread-group fatal-fault repro",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "THREAD_FAULT:ok",
+        fail_prefixes: &[
+            "THREAD_FAULT:FAIL",
+            "KERNEL PANIC",
+            "RECURSIVE KERNEL PAGE FAULT",
+            "addr=0x8",
+        ],
+        timeout_secs: 90,
+        label: "dynamic-hello-smoke: THREAD_FAULT:ok (group dies on one-thread fault)",
         exit_code_on_fail: SMOKE_EXIT_DYNAMIC_HELLO_FAILED,
     });
     steps
@@ -25955,6 +26141,15 @@ fn populate_ext2_files(
             s.push_str(&format!(
                 "write \"{src}\" usr/bin/dynamic-tls\nsif usr/bin/dynamic-tls mode 0x81ED\nsif usr/bin/dynamic-tls uid 0\nsif usr/bin/dynamic-tls gid 0\n",
                 src = dynamic_tls_bin.display(),
+            ));
+        }
+        // Phase 95b follow-up — stage the thread-group fatal-fault reproducer
+        // (the addr=0x8 bug guard).
+        let thread_fault_bin = workspace_root().join("target/generated-libs/thread-fault");
+        if thread_fault_bin.exists() {
+            s.push_str(&format!(
+                "write \"{src}\" usr/bin/thread-fault\nsif usr/bin/thread-fault mode 0x81ED\nsif usr/bin/thread-fault uid 0\nsif usr/bin/thread-fault gid 0\n",
+                src = thread_fault_bin.display(),
             ));
         }
         s

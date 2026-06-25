@@ -3236,7 +3236,31 @@ pub(super) fn sys_exit(code: i32) -> ! {
 pub(super) fn sys_exit_group(code: i32) -> ! {
     let pid = crate::process::current_pid();
     log::debug!("[p{}] exit_group({})", pid, code);
+    terminate_thread_group_and_exit(pid, code);
+}
 
+/// Terminate the whole thread group of `pid` and exit with `code`, then mark the
+/// caller's scheduler task dead (never returns). Quiesces any still-running
+/// siblings first (an off-core sibling — including one parked `BlockedOnFutex` —
+/// is marked Dead in place by `quiesce_task_for_remote_reap_by_pid`; a running
+/// one is requested to group-exit and IPI'd until it quiesces), reaps them, then
+/// performs the caller's final `do_full_process_exit` once it is the last thread
+/// standing. Single-threaded callers (`thread_group == None`) skip straight to the
+/// full exit.
+///
+/// Used by `exit_group(2)` (normal exit code) AND by the fatal-fault kill path
+/// (`fault_kill_trampoline`, SIGSEGV-encoded `code = -11`): an unhandled fatal
+/// fault in one thread of a multithreaded process must terminate the ENTIRE
+/// group (Linux semantics). Without this the fault path killed only the faulting
+/// TID, stranding siblings `BlockedOnFutex` forever (single-core hang) and — on
+/// SMP — racing a sibling against the shared-address-space teardown into a kernel
+/// `addr=0x8` NULL deref. Reusing this path also gives the crash the same
+/// cap/SHM/flock/IOMMU cleanup a clean exit gets.
+///
+/// MUST be called from a normal ring-0 task continuation with interrupts enabled
+/// (the quiesce loop yields / sends reschedule IPIs), exactly like the
+/// `exit_group` syscall context.
+pub(crate) fn terminate_thread_group_and_exit(pid: crate::process::Pid, code: i32) -> ! {
     if pid != 0 {
         // Check if we are in a thread group.
         let thread_group = {

@@ -22,9 +22,24 @@ updated: 2026-06-24
   rust-lld finds `libLLVM.so`); and the **cross-DSO TLS-at-offset-0 loader fix** (below) so
   rust-lld's parallel relocation scan reads `llvm::parallel::threadIndex` correctly on worker
   threads. Built a permanent `dynamic-tls` reproducer (a `DT_NEEDED` DSO thread-local written
-  general-dynamic + read initial-exec across pthreads) wired into `dynamic-hello-smoke`. The
-  thread-group fatal-kill kernel-robustness fix (addr=0x8 on an *unhandled* fatal fault in any
-  multithreaded process) remains a separate, non-blocking follow-up.
+  general-dynamic + read initial-exec across pthreads) wired into `dynamic-hello-smoke`.
+- **✅ Thread-group fatal-kill / `addr=0x8` kernel-robustness fix LANDED (2026-06-25).** An
+  unhandled fatal fault (SIGSEGV) in ONE thread of a multithreaded process now terminates the
+  WHOLE thread group (Linux semantics) instead of killing only the faulting TID and freeing the
+  shared address space out from under siblings. The fix: `fault_kill_trampoline`
+  (`kernel/src/arch/x86_64/interrupts.rs`) routes the *normal* page-fault/GPF kill (which runs
+  on the faulting task's full kernel stack) through a new
+  `terminate_thread_group_and_exit(pid, -11)` — `sys_exit_group`'s group-quiesce +
+  `do_full_process_exit` machinery extracted into a shared helper (`syscall/mod.rs`), with the
+  SIGSEGV exit code. Off-core siblings (including ones parked `BlockedOnFutex`) are quiesced and
+  reaped BEFORE the shared page table is freed, killing the single-core sibling-deadlock and the
+  SMP NULL+8-deref race, and giving the crash path the same cap/SHM/flock/IOMMU cleanup a clean
+  exit gets. The **kstack-overflow recovery path is deliberately unchanged** — it runs on the
+  small (16 KiB) single-use per-core recovery stack, so it keeps the minimal never-yielding
+  teardown (`kstack_overflow_minimal_kill`, the pre-fix body verbatim); only the full-kstack
+  fault paths take the group-aware exit. Validated by a new permanent `thread-fault` reproducer
+  (`leader-ok` + `worker-ok` arms, both reaped `WIFSIGNALED && SIGSEGV`, default `-smp 4`) wired
+  into `dynamic-hello-smoke` → `THREAD_FAULT:ok`.
 - **`rustc` runs on m3OS.** After the loader/libc/page-table crash chain was fully fixed
   (see "What is done"), `rustc --version` → `rustc 1.96.0` and `rustc --print sysroot` →
   `/usr` both **execute on-device, serial-captured**. The multi-week `CR2=0` blocker is gone.

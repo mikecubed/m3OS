@@ -302,7 +302,8 @@ fn bump_current_addr_space_generation() {
 /// context-switching (which are forbidden inside an ISR) can happen safely.
 fn fault_kill_trampoline() -> ! {
     // Disable interrupts immediately — IRET restored user RFLAGS which may
-    // have IF set, and we must not take interrupts before acquiring locks.
+    // have IF set, and we must not take interrupts before reading the latched
+    // fault state / printing the kstack-overflow diagnostic.
     x86_64::instructions::interrupts::disable();
     let pid = FAULT_KILL_PID.load(Ordering::Relaxed);
     // Phase 95 diag: if this kill is a recovered kstack overflow, print the
@@ -311,8 +312,48 @@ fn fault_kill_trampoline() -> ! {
     let ovf_slot = KSTACK_OVF_SLOT.swap(usize::MAX, Ordering::Relaxed);
     if ovf_slot != usize::MAX {
         dump_kstack_overflow_backtrace(ovf_slot, KSTACK_OVF_RSP.load(Ordering::Relaxed));
+        log::warn!(
+            "[fault_kill] trampoline running for pid {} (kstack overflow)",
+            pid
+        );
+        // KSTACK-OVERFLOW RECOVERY PATH — runs on the small (16 KiB) per-core
+        // recovery stack, which has a single-use invariant (the recovery must run
+        // to completion before the core takes another fault). Keep this teardown
+        // MINIMAL and never-yielding: the heavier, possibly-yielding group-aware
+        // exit could overflow the recovery stack or re-enter it. A multithreaded
+        // process that kstack-overflows therefore still strands its siblings (a
+        // rare double-corner); the priority here is killing the offender and
+        // keeping the core alive. (The common fatal-fault paths take the
+        // group-aware branch below.)
+        kstack_overflow_minimal_kill(pid);
     }
     log::warn!("[fault_kill] trampoline running for pid {}", pid);
+    // NORMAL fatal-fault kill (page fault / GPF) — runs on the faulting task's
+    // FULL kernel stack. Phase 95b: an unhandled fatal fault in ONE thread must
+    // terminate the WHOLE thread group (Linux semantics), reusing the exit_group
+    // teardown with SIGSEGV-encoded status (-11). The previous code here killed
+    // only the faulting TID and freed the SHARED address space, which (a)
+    // stranded sibling threads `BlockedOnFutex` forever on single-core and (b) on
+    // SMP raced a sibling against the page-table free into a kernel `addr=0x8`
+    // NULL deref. `terminate_thread_group_and_exit` quiesces every sibling (an
+    // off-core one — including a blocked one — is marked Dead in place) BEFORE the
+    // final `do_full_process_exit` frees the shared resources, and gives the crash
+    // the same cap/SHM/flock/IOMMU cleanup a clean exit gets. It runs the quiesce
+    // loop (yield / reschedule IPIs) exactly like the exit_group syscall context,
+    // so re-enable interrupts: this trampoline is a normal ring-0 task
+    // continuation (entered via IRETQ onto the kernel stack), not interrupt
+    // context. Single-threaded processes take the same path (thread_group == None
+    // → straight to do_full_process_exit), a superset of the old teardown.
+    x86_64::instructions::interrupts::enable();
+    crate::arch::x86_64::syscall::terminate_thread_group_and_exit(pid, -11);
+}
+
+/// Minimal, never-yielding single-process SIGSEGV teardown for the
+/// kstack-overflow recovery path (see `fault_kill_trampoline`). This is the
+/// pre-Phase-95b fault-kill body, kept verbatim because it must fit the small
+/// per-core recovery stack and run to completion without rescheduling. Interrupts
+/// stay disabled (the caller already cleared IF). Never returns.
+fn kstack_overflow_minimal_kill(pid: crate::process::Pid) -> ! {
     // Close all open FDs so pipe ref-counts reach 0 and EOF propagates.
     crate::process::close_all_fds_for(pid);
     // Deactivate this core's tracked AddressSpace *before* marking Zombie.
