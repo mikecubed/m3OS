@@ -288,6 +288,23 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
         // touch the framebuffer region.
         if unsafe { fb::init_from_parts(buf_ptr, info) } {
             log::info!("[fb] framebuffer console initialised");
+            // Make the framebuffer write-combining. The bootloader maps it
+            // uncacheable, so on real hardware every pixel write is a separate
+            // bus transaction (~0.2 s per scrolled line — the bare-metal console
+            // lag). Program a WC PAT slot (also done on every AP) and remap the
+            // FB region to it: the CPU then batches pixel writes into burst
+            // transactions. QEMU's RAM-backed FB is unaffected either way.
+            arch::x86_64::pat::init();
+            if let Some((base, len)) = fb::framebuffer_region() {
+                // SAFETY: pat::init() ran on this (BSP) core just above; `base`
+                // is the live FB mapping and WC is sound for a framebuffer.
+                let leaves = unsafe { arch::x86_64::pat::set_range_write_combining(base, len) };
+                log::info!(
+                    "[fb] framebuffer remapped write-combining ({} leaves, {} KiB)",
+                    leaves,
+                    len / 1024
+                );
+            }
             // Update TTY0 winsize to match the actual framebuffer dimensions.
             if let Some((rows, cols)) = fb::console_text_size() {
                 let mut tty = tty::TTY0.lock();

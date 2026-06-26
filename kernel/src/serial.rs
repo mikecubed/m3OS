@@ -8,7 +8,16 @@ use uart_16550::SerialPort;
 use crate::task::scheduler::IrqSafeMutex;
 
 const COM1_PORT: u16 = 0x3F8;
-const DMESG_RING_SIZE: usize = 64 * 1024;
+/// dmesg ring capacity. Sized to hold a full bare-metal boot (hundreds of
+/// `[INFO]`/`[WARN]` lines, incl. per-DMA-buffer device-host logs) so the
+/// USB-logsink snapshot to disk preserves *early* boot — the 64 KiB original
+/// wrapped before logsink could capture the kernel init region (the `[ps2] kbd
+/// cfg` line, xHCI enumeration, usbhub walk). Paired with the capped
+/// preempt-trace dump (scheduler.rs) which removed the watchdog flood that was
+/// the main evictor. Kept modest (256 KiB, not 1 MiB) — a 1 MiB bump correlated
+/// with an early-boot hang on the bare-metal laptop and the extra headroom is
+/// unnecessary once the flood is capped.
+const DMESG_RING_SIZE: usize = 256 * 1024;
 
 /// Phase 57b G.7 — IrqSafeMutex inherits Track F.1's preempt-discipline.
 /// SERIAL1 is only acquired from task / panic context (kernel logs and the

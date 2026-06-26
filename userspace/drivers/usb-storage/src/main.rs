@@ -972,8 +972,40 @@ fn handle_bot_read(
             Some((data, 0)) if data.len() == byte_count as usize => {
                 all_data.extend_from_slice(&data);
             }
-            _ => {
-                write_str(STDOUT_FILENO, "usb-storage: BLK_READ BOT error\n");
+            // Bare-metal diagnostic: name the failure shape + LBA so the boot log
+            // says WHY READ(10) failed instead of a bare "BOT error".
+            //   short-read  → CSW passed but the bulk-IN data phase came up short
+            //   csw-status  → device reported command-failed(1)/phase-error(2)
+            //   transport   → CBW/CSW/bulk-IN transfer itself failed (None)
+            Some((data, 0)) => {
+                write_str(STDOUT_FILENO, "usb-storage: BLK_READ BOT short-read lba=");
+                write_u32_dec(lba32);
+                write_str(STDOUT_FILENO, " got=");
+                write_u32_dec(data.len() as u32);
+                write_str(STDOUT_FILENO, " want=");
+                write_u32_dec(byte_count as u32);
+                write_str(STDOUT_FILENO, "\n");
+                return err_reply(cmd_id);
+            }
+            Some((_, status)) => {
+                write_str(STDOUT_FILENO, "usb-storage: BLK_READ BOT csw-status=");
+                write_u8_dec(status);
+                write_str(STDOUT_FILENO, " lba=");
+                write_u32_dec(lba32);
+                write_str(STDOUT_FILENO, " sectors=");
+                write_u8_dec(chunk as u8);
+                write_str(STDOUT_FILENO, "\n");
+                return err_reply(cmd_id);
+            }
+            None => {
+                write_str(
+                    STDOUT_FILENO,
+                    "usb-storage: BLK_READ BOT transport-fail lba=",
+                );
+                write_u32_dec(lba32);
+                write_str(STDOUT_FILENO, " sectors=");
+                write_u8_dec(chunk as u8);
+                write_str(STDOUT_FILENO, "\n");
                 return err_reply(cmd_id);
             }
         }

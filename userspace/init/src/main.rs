@@ -1328,9 +1328,23 @@ impl ServiceManager {
             // kernel framebuffer console / login tty.
             b"name=console\ncommand=/bin/console_server\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=\n",
             b"name=kbd\ncommand=/bin/kbd_server\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=console\n",
+            // stdin_feeder is the pump that makes physical keyboard input reach
+            // the text console: it drains PS/2 scancodes from kbd_server (which is
+            // purely reactive) and pushes decoded bytes into the kernel line
+            // discipline / login TTY. Without it the framebuffer login is deaf to
+            // the keyboard (SSH still works — sshd feeds its pty directly). It was
+            // only in the data-disk KNOWN_CONFIGS, so bare-metal builtin-defaults
+            // boots had no keyboard echo at all.
+            b"name=stdin_feeder\ncommand=/bin/stdin_feeder\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=console,kbd\n",
             // xHCI host controller + USB HID class driver (USB keyboard/mouse).
             b"name=xhci_driver\ncommand=/drivers/xhci\ntype=daemon\nrestart=on-failure\nmax_restart=5\n",
             b"name=usb_hid\ncommand=/drivers/usb-hid\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=xhci_driver\n",
+            // USB hub walker (Phase 92a): brings up external/dock hubs (descriptor
+            // + per-port power/reset) so devices behind a hub — e.g. a USB keyboard
+            // on a dock when all the laptop's own ports are full — get enumerated
+            // and surfaced to usb_hid. Without this, the xhci driver only reaches
+            // root-port devices and logs "USB HUB … NOT enumerated (no hub driver)".
+            b"name=usbhub\ncommand=/drivers/usbhub\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=xhci_driver\n",
             // USB Mass Storage (Phase 92a): probes the boot stick / any attached
             // stick as a `usb0.block` device. On bare metal this answers whether
             // the boot USB is reachable as mass storage (the writable-USB-root

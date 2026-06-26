@@ -61,6 +61,10 @@ const CONFIG_KBD_IRQ: u8 = 1 << 0; // keyboard (first port) generates IRQ1
 const CONFIG_AUX_IRQ: u8 = 1 << 1;
 const CONFIG_KBD_DISABLE: u8 = 1 << 4; // keyboard (first port) clock disabled
 const CONFIG_AUX_DISABLE: u8 = 1 << 5;
+const CONFIG_TRANSLATE: u8 = 1 << 6; // controller translates set-2 → set-1 scancodes
+
+/// Keyboard ACK byte (0xFA) — every keyboard command is acknowledged with it.
+const KBD_RESPONSE_ACK: u8 = 0xFA;
 
 // Keyboard (first port) device command.
 const KBD_CMD_ENABLE_SCANNING: u8 = 0xF4;
@@ -437,13 +441,42 @@ pub unsafe fn init_keyboard() -> Result<(), Ps2Error> {
     write_command(CMD_ENABLE_KBD)?;
     // Read config; enable the keyboard clock + its IRQ, keep everything else.
     write_command(CMD_READ_CONFIG)?;
-    let mut config = read_data()?;
+    let config_before = read_data()?;
+    let mut config = config_before;
     config &= !CONFIG_KBD_DISABLE;
     config |= CONFIG_KBD_IRQ;
     write_command(CMD_WRITE_CONFIG)?;
     write_data(config)?;
-    // Best-effort: tell the keyboard device to (re)enable scanning.
-    let _ = write_data(KBD_CMD_ENABLE_SCANNING);
+    // Read the config back to confirm the controller accepted the write.
+    write_command(CMD_READ_CONFIG)?;
+    let config_after = read_data().unwrap_or(0);
+    // Best-effort: tell the keyboard device to (re)enable scanning, and capture
+    // its ACK (0xFA) so the boot log proves a real keyboard is present + talking.
+    let ack = match write_data(KBD_CMD_ENABLE_SCANNING) {
+        Ok(()) => read_data().unwrap_or(0x00), // 0x00 = no response within budget
+        Err(_) => 0x00,
+    };
+    // Bare-metal diagnostic (no serial port on the target laptop): one fb line
+    // says whether the 8042 keyboard port is live and how it's framed, so a dead
+    // keyboard can be triaged from a photo of the screen:
+    //   xlate=1 → controller gives set-1 codes (what the kernel decoder expects);
+    //             xlate=0 means raw set-2 → the decoder sees garbage → no keys.
+    //   irq=1   → KBD_IRQ enabled (IRQ1 should fire on each keypress).
+    //   dis=0   → keyboard clock enabled.
+    //   ack=fa  → keyboard ACK'd enable-scanning (present + responding);
+    //             ack=00 → no response (no real 8042 keyboard, or wedged).
+    log::info!(
+        "[ps2] kbd cfg before=0x{:02x} after=0x{:02x} xlate={} irq={} dis={} ack=0x{:02x}",
+        config_before,
+        config_after,
+        (config_after & CONFIG_TRANSLATE != 0) as u8,
+        (config_after & CONFIG_KBD_IRQ != 0) as u8,
+        (config_after & CONFIG_KBD_DISABLE != 0) as u8,
+        ack,
+    );
+    if ack != KBD_RESPONSE_ACK {
+        log::warn!("[ps2] keyboard did not ACK enable-scanning (ack=0x{ack:02x})");
+    }
     drain_output();
     Ok(())
 }

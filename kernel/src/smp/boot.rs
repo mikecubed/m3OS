@@ -415,6 +415,13 @@ extern "C" fn ap_entry(per_core_data_ptr: *mut super::PerCoreData) -> ! {
         core::arch::asm!("mov cr4, {}", in(reg) bsp_cr4, options(nostack));
     }
 
+    // Program this AP's PAT identically to the BSP so the framebuffer's
+    // write-combining PTE (PAT index 2, remapped in `kernel_main`) decodes to the
+    // same memory type on every core — the Intel SDM requires all CPUs mapping a
+    // shared page to agree on its type. Done early, before this AP can write to
+    // the FB console (it does not until it reaches the scheduler, well past here).
+    crate::arch::x86_64::pat::init();
+
     // Phase 57e Track J — write this AP's XCR0 to the enabled mask
     // (x87 + SSE + AVX, plus PKRU component 9 on a PKU CPU).  XCR0 is per-core:
     // CR4.OSXSAVE was inherited from the BSP via the trampoline copy above, but

@@ -1149,7 +1149,24 @@ pub fn write_str(s: &str) {
     }
     if let Some(ref mut console) = *guard {
         console.write_str(s);
+        // The framebuffer is mapped write-combining (see `arch::x86_64::pat`).
+        // WC stores are weakly ordered and held in the CPU's WC buffers, so a
+        // final partial line (e.g. a login prompt that prints nothing further)
+        // could otherwise linger off-screen until the next write. One SFENCE per
+        // console write pushes the batch to the panel. Cheap; `sfence` needs no
+        // SSE state, so it is safe in the soft-float kernel.
+        unsafe {
+            core::arch::asm!("sfence", options(nostack, preserves_flags));
+        }
     }
+}
+
+/// Live framebuffer mapping as `(base_virtual_address, byte_len)`, or `None`
+/// before the console is initialised. Used by `arch::x86_64::pat` to remap the
+/// framebuffer write-combining at boot.
+pub fn framebuffer_region() -> Option<(usize, usize)> {
+    let guard = CONSOLE.lock();
+    guard.as_ref().map(|c| (c.buf as usize, c.byte_len))
 }
 
 /// Write formatted output to the framebuffer console.

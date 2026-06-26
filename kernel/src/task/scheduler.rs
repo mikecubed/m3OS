@@ -2139,12 +2139,27 @@ fn dump_preempt_trace_for_task(task_idx: usize) {
         [EMPTY_PREEMPT_TRACE_ENTRY; PREEMPT_TRACE_RING_SIZE];
     let n_cores = crate::smp::core_count();
     let mut total = 0usize;
+    // A tight-looping (hogging) task fills its per-core preempt ring with
+    // hundreds of entries; dumping all of them floods the bounded dmesg ring and
+    // evicts the rest of the boot log (the exact failure on the bare-metal
+    // laptop). Print only the most recent few per core — enough to identify the
+    // unbalanced call site — and note how many were elided.
+    const MAX_PREEMPT_TRACE_LINES: usize = 24;
     for core_id in 0..n_cores {
         let n = PREEMPT_TRACE_RINGS[core_id as usize].snapshot_matching(task_idx as u32, &mut buf);
         if n == 0 {
             continue;
         }
-        for entry in &buf[..n] {
+        let start = n.saturating_sub(MAX_PREEMPT_TRACE_LINES);
+        if start > 0 {
+            log::warn!(
+                "[sched] dispatch-dump:   preempt-trace core={} task_idx={} (… {} earlier entries elided)",
+                core_id,
+                task_idx,
+                start,
+            );
+        }
+        for entry in &buf[start..n] {
             let op_label = match entry.op {
                 1 => "DISABLE",
                 2 => "ENABLE ",
