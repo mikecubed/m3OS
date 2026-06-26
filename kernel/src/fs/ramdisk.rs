@@ -1546,10 +1546,28 @@ static RAMDISK_ROOT: RamdiskNode = RamdiskNode::Dir {
 /// ramdisk_lookup("/bin/cat")       // → File
 /// ramdisk_lookup("/etc/hello.txt") // → File
 /// ```
+/// Ramdisk paths that exist ONLY as a no-data-disk fallback and must defer to a
+/// mounted ext2 root. Matched on the leading-slash-trimmed path. The user
+/// database is baked into the ramdisk so remote login works on bare metal (no
+/// data disk); when a real ext2 root is mounted it owns the persistent `/etc`.
+fn is_etc_fallback(trimmed_path: &str) -> bool {
+    matches!(trimmed_path, "etc/passwd" | "etc/group" | "etc/shadow")
+}
+
 pub fn ramdisk_lookup(path: &str) -> Option<&'static RamdiskNode> {
     let trimmed = path.trim_start_matches('/');
     if trimmed.is_empty() {
         return Some(&RAMDISK_ROOT);
+    }
+
+    // Don't let the bare-metal user-database fallback shadow a mounted ext2 root:
+    // otherwise an ext2-served `/etc/passwd` is reported with the ramdisk's
+    // synthetic `st_ino = 0` (the Phase 96 stat-identity regression) and on-disk
+    // adduser/passwd changes are ignored at login. Bare-metal boots (ext2 not
+    // mounted) still get the fallback. Cheap: `is_mounted()` is only consulted
+    // for the three fallback paths.
+    if is_etc_fallback(trimmed) && crate::fs::ext2::is_mounted() {
+        return None;
     }
 
     let mut current = &RAMDISK_ROOT;

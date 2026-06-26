@@ -8365,7 +8365,14 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     steps.push(SmokeStep::WaitEither {
         pattern_a: "SMOKE:dlopen-test-smoke:PASS",
         pattern_b: "SMOKE:dlopen-test-smoke:SKIP",
-        timeout_secs: 30,
+        // The test dlopen()s a `.so` and runs its DT_FINI_ARRAY destructors over
+        // the slow ring-3 VFS; on a loaded TCG host (after several builds/QEMU
+        // runs) the PASS sentinel reliably lands but exceeds the original 30 s
+        // window, falsely timing out the pre-push gate. The test emits PASS/SKIP
+        // regardless, so widening the wait only adds headroom for slow hosts
+        // (KVM still completes in seconds); a real failure emits FAIL or never
+        // PASSes and still trips this step.
+        timeout_secs: 120,
         label: "guest/dlopen-test-smoke: libdl runtime + DT_FINI_ARRAY destructors",
         extra_steps_a: &[],
         extra_steps_b: &[],
