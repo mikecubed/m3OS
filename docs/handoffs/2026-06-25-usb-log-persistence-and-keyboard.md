@@ -118,3 +118,36 @@ firmware translation bit (→ set-1 scancodes). Wired into `lib.rs` before
 - `usb-logsink` is only in `add_builtin_defaults` (bare-metal path), deliberately
   NOT in `KNOWN_CONFIGS`, so it doesn't perturb the QEMU smoke gates. If you want
   it on data-disk boots too, add `/etc/services.d/usb-logsink.conf`.
+
+## ✅ COMPLETED (2026-06-26) — bare-metal bring-up landed; Phase 96 closed
+
+Validated on the real laptop and merged to `docs/96-bare-metal-usb-ethernet`
+(commits `fc93b7d`→`30657e1`→`ae01ed4`→`7c77288`):
+
+- **Built-in (PS/2) keyboard WORKS** — root cause was `stdin_feeder` (the
+  scancode→TTY pump) **and** `usbhub` missing from `add_builtin_defaults`
+  `BUILTIN_CONFIGS` (they were only in the data-disk `KNOWN_CONFIGS`). Added both.
+  The `[ps2] kbd cfg` diagnostic confirmed the controller side was already perfect
+  (`xlate=1 irq=1 dis=0 ack=0xfa`); the gap was purely the missing pump.
+- **USB log persistence WORKS end-to-end** — `flasher.sh` had been flashing the
+  plain `boot-uefi-m3os.img` (no ext2 partition); the combined `m3os-usb-log.img`
+  mounts at `/mnt/usb0` and `usb-logsink` persists `boot.log`. Read off the drive
+  repeatedly this session. The original goal — read the boot log off the drive — is met.
+- **Network validated on bare metal** — `[remote_nic] up=true 2500Mbps` +
+  `[dhcp] bound ip=192.168.1.221`. **Closes Phase 96's RX milestone** (the
+  passthrough-blocked datapath; a DHCP lease requires RX). `lapic_ticks_per_ms=2411`
+  (sane — PIT-ch2 calibration solid on this CPU).
+- **Framebuffer write-combining** (new `kernel/src/arch/x86_64/pat.rs`) — the
+  "Root lever" deferred above is **done**: PAT index 2 → WC, the FB remapped, +
+  per-core PAT + an SFENCE on console writes. Console is now fast on bare metal.
+- **stat-identity smoke failure FIXED** (`ae01ed4`) — was NOT a stale disk; a real
+  Phase 96 regression (ramdisk `/etc/passwd`/`group`/`shadow` shadowing the ext2
+  root). `ramdisk_lookup` now defers those to a mounted ext2 root.
+
+**Remaining (now tracked elsewhere, not Phase 96 blockers):** USB keyboard in
+text mode (`stdin_feeder` to also drain usb-hid's `KBD_EVENT_PULL` events); the
+`usb-hid`/`usbhub` CPU-hog busy-poll; bring-up-diagnostic cleanup (POST markers /
+AHCI dots / `[timer]` line); GUI mode (needs a pointer — the I2C-HID touchpad
+driver, a future phase). The `dlopen-test-smoke` TCG stall is **Phase 97**
+(`2026-06-26-dlopen-smoke-tcg-stall.md`). The GUI-on-real-hardware roadmap
+(trackpad, Wi-Fi, …) + a phase-quality audit are proposed as **Phase 98**.
