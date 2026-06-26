@@ -46,6 +46,15 @@ const RETRANSMIT_TICKS: u32 = 10;
 /// the very traffic it reports.
 const HB_INTERVAL_MS: u64 = 3000;
 
+/// Bare-metal debug toggle: mirror the network-state heartbeat to the
+/// framebuffer console. Default `false` so a normal boot screen stays clean and
+/// fast (each fb line costs ~hundreds of ms on the uncached bare-metal
+/// framebuffer). The same data always reaches the dmesg ring / drive log via the
+/// `log::info!("[net] HB …")` line below, so disabling this loses nothing for
+/// post-hoc debugging — flip it to `true` and rebuild when actively eyeballing
+/// the packet path on a physical screen with no log drive attached.
+const FB_NET_HEARTBEAT: bool = false;
+
 struct DhcpDriver {
     client: DhcpClient,
     started: bool,
@@ -130,28 +139,32 @@ pub fn tick() {
             echo_rx,
             echo_tx,
         );
-        // Two SHORT framebuffer lines (the single long line wrapped to unreadable
-        // tiny text on a real screen). Line 1 = identity, line 2 = packet-path
-        // counters. `a4u`/`rep` = ARP requests for our IP / replies sent;
-        // `erx`/`etx` = ICMP echo requests received / replies sent.
-        crate::fb::write_fmt(format_args!(
-            "[net] ip={}.{}.{}.{} bnd={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
-            ip[0], ip[1], ip[2], ip[3], d.bound, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-        ));
-        crate::fb::write_fmt(format_args!(
-            "[net] rx={} arp={} ip4={} off={} a4u={} rep={} erx={} etx={}\n",
-            rx_total, rx_arp, rx_ipv4, d.offers, arp_for_us, arp_replies, echo_rx, echo_tx,
-        ));
-        // Line 3 = kernel TX-drop attribution (bare-metal visible; the matching
-        // log::warn lines are serial-only). `rf` = dropped, TX queue full;
-        // `rs` = dropped, restart-suspected latched; `si` = interrupted sends
-        // recovered (re-queued); `susp` = restart latch currently set. A wedged
-        // link shows here exactly where outbound frames are being lost.
-        let (tx_rf, tx_rs, tx_si, tx_susp) = super::remote::tx_drop_counts();
-        crate::fb::write_fmt(format_args!(
-            "[net] txdrop rf={} rs={} si={} susp={}\n",
-            tx_rf, tx_rs, tx_si, tx_susp as u8,
-        ));
+        // Framebuffer mirror (gated by FB_NET_HEARTBEAT — off by default so the
+        // boot screen stays clean/fast; the log::info! above already captured
+        // the same data for the dmesg ring / drive log). Two SHORT lines (a
+        // single long line wraps to unreadable tiny text on a real screen):
+        // line 1 = identity, line 2 = packet-path counters, line 3 = TX-drop
+        // attribution. `a4u`/`rep` = ARP requests for our IP / replies sent;
+        // `erx`/`etx` = ICMP echo requests received / replies sent. For txdrop:
+        // `rf` = dropped (TX queue full); `rs` = dropped (restart-suspected
+        // latched); `si` = interrupted sends recovered (re-queued); `susp` =
+        // restart latch currently set. A wedged link shows here exactly where
+        // outbound frames are being lost.
+        if FB_NET_HEARTBEAT {
+            crate::fb::write_fmt(format_args!(
+                "[net] ip={}.{}.{}.{} bnd={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
+                ip[0], ip[1], ip[2], ip[3], d.bound, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+            ));
+            crate::fb::write_fmt(format_args!(
+                "[net] rx={} arp={} ip4={} off={} a4u={} rep={} erx={} etx={}\n",
+                rx_total, rx_arp, rx_ipv4, d.offers, arp_for_us, arp_replies, echo_rx, echo_tx,
+            ));
+            let (tx_rf, tx_rs, tx_si, tx_susp) = super::remote::tx_drop_counts();
+            crate::fb::write_fmt(format_args!(
+                "[net] txdrop rf={} rs={} si={} susp={}\n",
+                tx_rf, tx_rs, tx_si, tx_susp as u8,
+            ));
+        }
     }
 
     if d.bound {

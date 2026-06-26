@@ -1307,16 +1307,21 @@ impl ServiceManager {
     /// Fallback: register built-in service definitions when no on-disk service
     /// configs are available.
     ///
-    /// This fires on a **bare-metal USB boot with no ext2 data disk**: root
-    /// mount fails (m3OS has no USB mass-storage driver — Phase 90 — so the boot
-    /// USB itself can't be mounted as the rootfs), `/etc/services.d` is absent,
+    /// This fires on a **bare-metal USB boot with no ext2 data disk**: the
+    /// root mount falls back to the ramdisk root (using the boot USB as a
+    /// writable root is future work — `blk::remote` slot 0 only auto-discovers
+    /// `nvme.block`/`ahci.block`, and the boot stick is a GPT-partitioned device
+    /// the secondary-mount path can't yet target), `/etc/services.d` is absent,
     /// and without this the box would come up with only `telnetd`/`sshd` — no
     /// keyboard, no USB, no NIC. We parse embedded copies of the essential
     /// configs (mirrors xtask's `populate_ext2_files`) through the same
     /// `parse_service_def` path the on-disk configs use, so the dependency graph
     /// and restart policy behave identically. Kept minimal — no display/greeter/
-    /// audio/storage: a USB-only boot uses the kernel framebuffer console + the
-    /// ramdisk root. Order is irrelevant (deps resolve by name across the set).
+    /// audio: a USB-only boot uses the kernel framebuffer console + the ramdisk
+    /// root. `usb_storage` IS included (Phase 92a added the mass-storage driver)
+    /// so a USB stick can be probed/mounted for persistent logs and as a
+    /// stepping stone toward a writable USB root. Order is irrelevant (deps
+    /// resolve by name across the set).
     fn add_builtin_defaults(&mut self) {
         const BUILTIN_CONFIGS: &[&[u8]] = &[
             // console + kbd: the PS/2 and USB keyboard input pipeline to the
@@ -1326,6 +1331,17 @@ impl ServiceManager {
             // xHCI host controller + USB HID class driver (USB keyboard/mouse).
             b"name=xhci_driver\ncommand=/drivers/xhci\ntype=daemon\nrestart=on-failure\nmax_restart=5\n",
             b"name=usb_hid\ncommand=/drivers/usb-hid\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=xhci_driver\n",
+            // USB Mass Storage (Phase 92a): probes the boot stick / any attached
+            // stick as a `usb0.block` device. On bare metal this answers whether
+            // the boot USB is reachable as mass storage (the writable-USB-root
+            // de-risk) and provides a persistent ext2 volume for boot-log capture.
+            b"name=usb_storage\ncommand=/drivers/usb-storage\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=xhci_driver\n",
+            // Phase 96: persist the kernel dmesg ring to the USB log partition
+            // (/mnt/usb0/boot.log) so a bare-metal boot can be read off the drive
+            // afterward. Separate process from usb_storage (it mounts the device
+            // usb_storage serves). restart=on-failure: it exits cleanly when no
+            // ext2 log partition is present, so it must NOT be restarted then.
+            b"name=usb_logsink\ncommand=/bin/usb-logsink\ntype=daemon\nrestart=on-failure\nmax_restart=2\ndepends=usb_storage\n",
             // RTL8156 USB-Ethernet NIC (the only networking on a Phase 96 laptop
             // with no Ethernet port) — brings the link up for in-kernel DHCP.
             b"name=ure_driver\ncommand=/drivers/ure\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=xhci_driver\n",
@@ -2629,20 +2645,30 @@ fn bootstrap_ring3_root_disk() -> isize {
         // "negative errno ... otherwise" contract.
         return pid;
     }
-    // Retry the mount up to 40 × 100 ms = 4 s, giving the driver time to reset
+    // Retry the mount up to 15 × 100 ms = 1.5 s, giving the driver time to reset
     // the HBA, bring up the port (COMRESET), IDENTIFY the disk, and register
     // ahci.block. Bring-up takes well under a second on QEMU; the headroom
-    // covers a slow bare-metal COMRESET.
+    // covers a slow bare-metal COMRESET. (Was 40×100 ms; trimmed because on a
+    // bare-metal USB boot there is no AHCI controller, so this is a pure detour
+    // before the ramdisk-defaults fallback.)
+    //
+    // A '.' is printed per attempt so a bare-metal boot can distinguish a working
+    // timer (dots tick by ~10/s → fall through to defaults) from a wedged
+    // `nanosleep` (stuck on the first dot) — the kernel log is serial-only and
+    // invisible without a serial port.
     let mut ret: isize = -19; // -ENODEV
     let mut attempts = 0u32;
-    while attempts < 40 {
+    while attempts < 15 {
+        write_str(STDOUT_FILENO, ".");
         let _ = nanosleep_for(0, 100_000_000); // 100 ms
         ret = mount(b"/dev/blk0\0".as_ptr(), b"/\0".as_ptr(), b"ext2\0".as_ptr());
         if ret == 0 {
+            write_str(STDOUT_FILENO, "\n");
             return 0;
         }
         attempts += 1;
     }
+    write_str(STDOUT_FILENO, "\n");
     ret
 }
 

@@ -86,6 +86,15 @@ syscall_lib::entry_point!(program_main);
 /// USB vendor ID for Realtek.
 const VENDOR_REALTEK: u16 = 0x0bda;
 
+/// Bare-metal log-spam gate. The Dell 5560 has no serial port, so all driver
+/// stdout lands on the *uncached* framebuffer console where each line costs
+/// ~hundreds of ms — flooding it both hides the useful lines (de-risk banner,
+/// timer readout) and throttles the very traffic the diagnostics report (the SSH
+/// lockups). Default `false` keeps only one-shot bring-up + sentinels; flip to
+/// `true` and rebuild for the full RX/TX/heartbeat trace during driver debug.
+/// (Once on-drive log persistence lands, the full detail lives there anyway.)
+pub(crate) const VERBOSE: bool = false;
+
 /// Product ID for the RTL8156 USB-Ethernet adapter (the Phase 96 target).
 const PRODUCT_RTL8156: u16 = 0x8156;
 

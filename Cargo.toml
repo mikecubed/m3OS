@@ -53,6 +53,8 @@ members = [
     "userspace/coreutils-tests",
     # Phase 46 syslogd
     "userspace/syslogd",
+    # Phase 96 — USB log-volume persistence (kernel dmesg → /mnt/usb0/boot.log)
+    "userspace/usb-logsink",
     # Phase 46 crond
     "userspace/crond",
     # Phase 52 extracted services:

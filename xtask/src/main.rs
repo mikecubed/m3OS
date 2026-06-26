@@ -1773,6 +1773,9 @@ fn build_userspace_bins() {
         // Phase 92 Track D: ring-3 USB Mass Storage (BOT) class driver.
         // `needs_alloc = true` for kernel-core (mass_storage) + usb-core deps.
         ("usb_storage", "usb_storage", true),
+        // Phase 96: mount the USB log partition + snapshot the kernel dmesg ring
+        // to /mnt/usb0/boot.log (bare-metal post-mortem). needs_alloc (Vec buf).
+        ("usb-logsink", "usb-logsink", true),
         // Phase 92e Track G: ring-3 USB-Ethernet (CDC-ECM/NCM) RemoteNic driver.
         // `needs_alloc = true` for driver_runtime + kernel-core + usb-core deps.
         ("usb_net", "usb_net", true),
@@ -4068,7 +4071,7 @@ fn build_doom() {
     if let Ok(entries) = fs::read_dir(&dg_game_src) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.extension().is_some_and(|e| e == "c") {
+            if path.extension().is_none_or(|e| e != "c") {
                 continue;
             }
             let name = path.file_name().unwrap().to_str().unwrap_or("");

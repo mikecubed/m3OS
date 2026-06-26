@@ -273,9 +273,19 @@ fn drain_uart_rx_locked() -> bool {
         return false;
     }
     let mut got_data = false;
-    loop {
+    // Bound the drain. On hardware with no real 16550 UART at 0x3F8 (modern
+    // laptops have no serial port — the Phase 96 Tiger Lake box), the port floats
+    // and reads 0xFF, so LSR bit 0 ("data ready") is *permanently* set; the old
+    // unbounded `loop` spun forever, hanging the timer ISR the first time it
+    // fired after the PIC→APIC switch re-enabled IRQs (the bare-metal boot hang,
+    // localized via POST markers to apic::init's exit). The `lsr == 0xFF` guard
+    // treats an all-ones LSR as "no UART present" — a real UART never asserts
+    // every error+status bit at once — and the iteration cap is a belt-and-
+    // suspenders backstop; a genuine RX burst is picked up across later ISR calls.
+    const MAX_RX_DRAIN: usize = 64;
+    for _ in 0..MAX_RX_DRAIN {
         let lsr: u8 = unsafe { x86_64::instructions::port::Port::new(0x3FDu16).read() };
-        if lsr & 1 == 0 {
+        if lsr == 0xFF || lsr & 1 == 0 {
             break;
         }
         let byte: u8 = unsafe { x86_64::instructions::port::Port::new(0x3F8u16).read() };

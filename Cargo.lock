@@ -2435,6 +2435,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "usb-logsink"
+version = "0.96.0"
+dependencies = [
+ "syscall-lib",
+]
+
+[[package]]
 name = "usb-mount-smoke"
 version = "0.1.0"
 dependencies = [

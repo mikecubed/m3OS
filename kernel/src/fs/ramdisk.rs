@@ -201,6 +201,8 @@ static TODO_RUST_ELF: &[u8] = generated_initrd_asset!("todo-rust");
 // Phase 46: background daemons managed by init
 static SYSLOGD_ELF: &[u8] = generated_initrd_asset!("syslogd");
 static CROND_ELF: &[u8] = generated_initrd_asset!("crond");
+// Phase 96: USB log-volume persistence daemon (kernel dmesg → /mnt/usb0/boot.log).
+static USB_LOGSINK_ELF: &[u8] = generated_initrd_asset!("usb-logsink");
 // Phase 52: ring-3 extracted services
 static CONSOLE_SERVER_ELF: &[u8] = generated_initrd_asset!("console_server");
 static KBD_SERVER_ELF: &[u8] = generated_initrd_asset!("kbd_server");
@@ -593,6 +595,13 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "syslogd",
         RamdiskNode::File {
             content: SYSLOGD_ELF,
+        },
+    ),
+    // Phase 96: USB log-volume persistence daemon (→ /bin/usb-logsink).
+    (
+        "usb-logsink",
+        RamdiskNode::File {
+            content: USB_LOGSINK_ELF,
         },
     ),
     ("crond", RamdiskNode::File { content: CROND_ELF }),

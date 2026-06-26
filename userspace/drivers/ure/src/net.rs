@@ -111,6 +111,9 @@ const RX_SANITY_LOG_COUNT: u32 = 8;
 /// Sanity-log one received frame's length + EtherType (`ure: rx len=… etype=…`).
 /// Bounded by `RX_SANITY_LOG_COUNT` via the caller's counter.
 fn log_rx_frame(frame: &[u8]) {
+    if !crate::VERBOSE {
+        return;
+    }
     syscall_lib::write_str(STDOUT_FILENO, "ure: rx len=0x");
     crate::write_u8_hex((frame.len() >> 8) as u8);
     crate::write_u8_hex((frame.len() & 0xff) as u8);
@@ -237,7 +240,7 @@ pub fn run_io_loop(usb_ep: u32, slot_id: u8, bulk_in_dci: u8, bulk_out_dci: u8, 
                             tx_ok = tx_ok.wrapping_add(1);
                         } else {
                             tx_fail = tx_fail.wrapping_add(1);
-                            if tx_fail_logged < 8 {
+                            if crate::VERBOSE && tx_fail_logged < 8 {
                                 tx_fail_logged += 1;
                                 syscall_lib::write_str(STDOUT_FILENO, "ure: tx FAIL len=0x");
                                 crate::write_u8_hex((req.frame.len() >> 8) as u8);
@@ -305,7 +308,7 @@ pub fn run_io_loop(usb_ep: u32, slot_id: u8, bulk_in_dci: u8, bulk_out_dci: u8, 
         if rx_idle >= RX_STALL_KICK_ITERS {
             rx_idle = 0;
             crate::ure_kick_rx(usb_ep, slot_id);
-            if kick_logged < 8 {
+            if crate::VERBOSE && kick_logged < 8 {
                 kick_logged += 1;
                 syscall_lib::write_str(STDOUT_FILENO, "ure: RX idle — kicked RX datapath\n");
             }
@@ -325,7 +328,7 @@ pub fn run_io_loop(usb_ep: u32, slot_id: u8, bulk_in_dci: u8, bulk_out_dci: u8, 
         if drained == 0 && !rx_got {
             hb_tick = hb_tick.wrapping_add(1);
         }
-        if drained == 0 && !rx_got && hb_tick.is_multiple_of(3000) {
+        if crate::VERBOSE && drained == 0 && !rx_got && hb_tick.is_multiple_of(3000) {
             syscall_lib::write_str(STDOUT_FILENO, "ure: hb rxp=");
             syscall_lib::write_u64(STDOUT_FILENO, rx_polls);
             syscall_lib::write_str(STDOUT_FILENO, " rxd=");

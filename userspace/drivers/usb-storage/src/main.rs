@@ -92,6 +92,17 @@ syscall_lib::entry_point!(program_main);
 /// Boot-log marker written when the daemon starts.
 pub const BOOT_LOG_MARKER: &str = "usb-storage: spawned\n";
 
+/// Bare-metal de-risk toggle: emit the big, photo-legible PASS/FAIL banner
+/// (`print_storage_pass_banner` / `print_storage_fail_banner`). Default `true`
+/// while validating whether the boot USB is reachable as mass storage on real
+/// hardware — the banner is unmistakable in a phone photo of the framebuffer.
+/// The PASS banner only fires when a device is actually found; the FAIL banner
+/// fires on the no-device timeout, so on a normal QEMU boot (where `usb_storage`
+/// runs without a stick) it would print every boot — flip this to `false` to
+/// silence both once the de-risk is concluded.
+#[cfg(not(test))]
+const PROBE_BANNER: bool = true;
+
 /// USB Mass Storage interface class (USB-IF base-class 0x08).
 const CLASS_MASS_STORAGE: u8 = 0x08;
 /// USB Mass Storage BOT protocol (bInterfaceProtocol 0x50).
@@ -469,6 +480,65 @@ fn detect_real_fs(usb_ep: u32, notice: &AttachNotice) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Bare-metal de-risk: big, photo-legible PASS/FAIL banner
+// ---------------------------------------------------------------------------
+//
+// On bare metal there is no serial console — the result is read off a phone
+// photo of the framebuffer. A multi-line bordered banner with a distinct fill
+// character per outcome (`=` PASS / `#` FAIL) stays recognisable even in a
+// blurry photo, where a single buried sentinel line would not.
+
+/// PASS banner — emitted once the device answers GET_MAX_LUN → TEST UNIT READY
+/// → INQUIRY → READ CAPACITY, i.e. it is fully reachable as USB mass storage.
+#[cfg(not(test))]
+fn print_storage_pass_banner(blocks: u32, bsize: u32) {
+    if !PROBE_BANNER {
+        return;
+    }
+    write_str(
+        STDOUT_FILENO,
+        "\n==================================================\n",
+    );
+    write_str(
+        STDOUT_FILENO,
+        "==  USB MASS STORAGE:  PASS  -  usb0 reachable\n",
+    );
+    write_str(STDOUT_FILENO, "==  blocks=");
+    write_u32_dec(blocks);
+    write_str(STDOUT_FILENO, "  bsize=");
+    write_u32_dec(bsize);
+    write_str(
+        STDOUT_FILENO,
+        "\n==================================================\n\n",
+    );
+}
+
+/// FAIL banner — emitted when the discovery walk times out with no
+/// mass-storage device (e.g. the boot stick did not re-enumerate via xHCI).
+#[cfg(not(test))]
+fn print_storage_fail_banner() {
+    if !PROBE_BANNER {
+        return;
+    }
+    write_str(
+        STDOUT_FILENO,
+        "\n##################################################\n",
+    );
+    write_str(
+        STDOUT_FILENO,
+        "##  USB MASS STORAGE:  FAIL  -  no device found\n",
+    );
+    write_str(
+        STDOUT_FILENO,
+        "##  boot stick NOT reachable as USB mass storage\n",
+    );
+    write_str(
+        STDOUT_FILENO,
+        "##################################################\n\n",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Bind + probe one mass-storage device
 // ---------------------------------------------------------------------------
 
@@ -573,6 +643,10 @@ fn probe_device(usb_ep: u32, notice: &AttachNotice) -> Option<ReadCapacity10> {
     write_str(STDOUT_FILENO, " bsize=");
     write_u32_dec(cap.block_size);
     write_str(STDOUT_FILENO, "\n");
+    // Reaching here means BOT + INQUIRY + READ CAPACITY all succeeded: the
+    // device is fully reachable as mass storage. Paint the photo-legible PASS
+    // banner (bare-metal de-risk).
+    print_storage_pass_banner(blocks, cap.block_size);
 
     Some(cap)
 }
@@ -1030,6 +1104,7 @@ fn program_main(_args: &[&str]) -> i32 {
             STDOUT_FILENO,
             "usb-storage: no mass-storage device attached — exiting cleanly\n",
         );
+        print_storage_fail_banner();
         return 0;
     }
 

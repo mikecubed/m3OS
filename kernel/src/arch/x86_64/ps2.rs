@@ -50,14 +50,20 @@ const STATUS_OUTPUT_FULL: u8 = 1 << 0;
 const STATUS_INPUT_FULL: u8 = 1 << 1;
 
 // 8042 controller commands (written to PS2_STATUS).
+const CMD_ENABLE_KBD: u8 = 0xAE; // enable first (keyboard) PS/2 port
 const CMD_ENABLE_AUX: u8 = 0xA8;
 const CMD_READ_CONFIG: u8 = 0x20;
 const CMD_WRITE_CONFIG: u8 = 0x60;
 const CMD_WRITE_TO_AUX: u8 = 0xD4;
 
 // 8042 controller config byte bits (read/written via 0x20 / 0x60).
+const CONFIG_KBD_IRQ: u8 = 1 << 0; // keyboard (first port) generates IRQ1
 const CONFIG_AUX_IRQ: u8 = 1 << 1;
+const CONFIG_KBD_DISABLE: u8 = 1 << 4; // keyboard (first port) clock disabled
 const CONFIG_AUX_DISABLE: u8 = 1 << 5;
+
+// Keyboard (first port) device command.
+const KBD_CMD_ENABLE_SCANNING: u8 = 0xF4;
 
 // Mouse (AUX device) commands (written via 0xD4 prefix).
 const MOUSE_CMD_SET_DEFAULTS: u8 = 0xF6;
@@ -409,6 +415,36 @@ pub unsafe fn init_mouse() -> Result<(), Ps2Error> {
     // Drain any acks/leftover bytes the device may have queued.
     drain_output();
     MOUSE_READY.store(true, Ordering::Release);
+    Ok(())
+}
+
+/// Enable the PS/2 *keyboard* (first 8042 port). The kernel feeds the IRQ1
+/// scancode path for the built-in keyboard on EC-emulated-8042 laptops, but the
+/// boot path only ever ran [`init_mouse`] — it assumed the firmware left the
+/// keyboard port enabled. Make it explicit: enable the first port, clear
+/// `KBD_DISABLE` + set `KBD_IRQ` in the controller config (preserving the other
+/// firmware-set bits, e.g. scancode-set-1 translation), and tell the keyboard to
+/// enable scanning. Bounded (the wait helpers cap their spins) and safe — a
+/// no-op effect on a pure I2C-HID laptop with no real 8042 keyboard. Returns
+/// `Ok(())` even when the device ACK is absent (the firmware may already have
+/// enabled scanning); the goal is only to guarantee the port + IRQ1 are live.
+///
+/// # Safety
+/// Direct 8042 controller/data port I/O; call once at boot with IRQ1 masked.
+pub unsafe fn init_keyboard() -> Result<(), Ps2Error> {
+    drain_output();
+    // Enable the first (keyboard) PS/2 port at the controller.
+    write_command(CMD_ENABLE_KBD)?;
+    // Read config; enable the keyboard clock + its IRQ, keep everything else.
+    write_command(CMD_READ_CONFIG)?;
+    let mut config = read_data()?;
+    config &= !CONFIG_KBD_DISABLE;
+    config |= CONFIG_KBD_IRQ;
+    write_command(CMD_WRITE_CONFIG)?;
+    write_data(config)?;
+    // Best-effort: tell the keyboard device to (re)enable scanning.
+    let _ = write_data(KBD_CMD_ENABLE_SCANNING);
+    drain_output();
     Ok(())
 }
 

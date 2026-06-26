@@ -301,9 +301,11 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
     } else {
         log::warn!("[fb] no framebuffer provided by bootloader");
     }
+    post_marker(6); // fb console init done (this step cleared the screen)
 
     // P15: ACPI table discovery — parse RSDP, RSDT/XSDT, MADT, FADT.
     acpi::init(rsdp_addr);
+    post_marker(7); // ACPI tables parsed (real-firmware path)
 
     // Read the launch-time boot-mode override from QEMU fw_cfg (if present) so
     // `/proc/m3os-boot-mode` reflects it before `init` makes its greeter-vs-serial
@@ -314,6 +316,7 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
     // build unit descriptor list, device-to-unit map, and reserved-region
     // set. No hardware bring-up yet (Tracks C / D / E follow).
     iommu::init();
+    post_marker(8); // IOMMU (VT-d/DMAR) discovery done
 
     // Phase 34: Read RTC and establish boot wall-clock time.
     rtc::init_rtc();
@@ -330,6 +333,7 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
 
     // P15: Enumerate PCI buses and log discovered devices.
     pci::init();
+    post_marker(9); // PCI enumeration done (real device tree)
 
     // Phase 24: Initialize virtio-blk driver.
     blk::init();
@@ -339,6 +343,18 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
     // so it is safe to run with the PIC still masked. After
     // `enable_interrupts()` the IRQ12 line is live and the mouse handler
     // begins draining packets into the lock-free ring.
+    // Phase 96: explicitly enable the PS/2 *keyboard* port + IRQ1. Previously the
+    // boot only ran `init_mouse` and assumed firmware left the keyboard enabled;
+    // on a laptop where the built-in keyboard is EC-emulated 8042 this makes the
+    // port + IRQ1 live. Safe no-op effect on a pure I2C-HID laptop (no real 8042
+    // keyboard). The USB keyboard path (xHCI + usb-hid) is independent.
+    match unsafe { arch::x86_64::ps2::init_keyboard() } {
+        Ok(()) => log::info!("[ps2] keyboard initialised (IRQ1 ready)"),
+        Err(e) => log::warn!(
+            "[ps2] keyboard init failed: {:?} — booting without PS/2 kbd",
+            e
+        ),
+    }
     match unsafe { arch::x86_64::ps2::init_mouse() } {
         Ok(()) => log::info!("[ps2] mouse initialised (IRQ12 ready)"),
         Err(e) => log::warn!("[ps2] mouse init failed: {:?} — booting without mouse", e),
@@ -356,11 +372,13 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
     } else {
         log::warn!("[apic] MADT/I/O APIC not found — staying on legacy PIC");
     }
+    post_marker(10); // interrupts enabled + APIC routing init done
 
     // Phase 25: Initialize per-core data structures for the BSP.
     // Always called — gs_base must be set for the scheduler. If no MADT is
     // available, init_bsp_per_core() falls back to single-core BSP-only mode.
     smp::init_bsp_per_core();
+    post_marker(11); // BSP per-core (GS base) init done
 
     // Phase 57e Track J — enable XSAVE/AVX state preservation on the BSP.
     //
@@ -430,6 +448,7 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
             pku_features.pkru_component_supported,
         );
     }
+    post_marker(12); // XSAVE/AVX enable + size assert + PKU report done (real-silicon-first path)
 
     // Phase 77 Track B — enable CR4.SMEP (bit 20) + CR4.SMAP (bit 21) on the
     // BSP when the CPU supports them.  Ordering matters for the same reason as
@@ -481,6 +500,7 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
     // the ring-3 e1000 driver registers its `RemoteNic` facade via IPC on
     // startup.
     net::virtio_net::init();
+    post_marker(13); // SMEP/SMAP + microcode + Spectre mitigations + virtio-net done
 
     // Trigger a breakpoint to verify the IDT is working (P3-T007).
     if cfg!(debug_assertions) {
@@ -521,10 +541,24 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
         task::scheduler::reserve_for_smp_boot();
         smp::boot::boot_aps();
     }
+    post_marker(14); // SMP boot_aps done — all APs online (AP rendezvous survived)
 
     task::spawn(init_task, "init");
     task::spawn_idle(idle_task);
 
+    post_marker(15); // pre-task kernel init complete — entering scheduler
+    // Bare-metal diagnostic: surface the LAPIC timer calibration on the
+    // framebuffer (serial is invisible without a serial port). A sane value is
+    // ~1500–60000 ticks/ms; the `6250 (default)`-class fallback or a wildly
+    // different number flags a bad PIT-ch2 calibration (→ wrong nanosleep/timer
+    // pacing). Printed just before the scheduler so it sits right above init's
+    // first output. Guarded: `lapic_ticks_per_ms` panics if APIC wasn't inited.
+    if acpi::io_apic_address().is_some() {
+        crate::fb::write_fmt(format_args!(
+            "[timer] lapic_ticks_per_ms={}\n",
+            arch::x86_64::apic::lapic_ticks_per_ms()
+        ));
+    }
     log::info!("[kernel] entering scheduler — init will start service set");
     task::run()
 }
@@ -536,6 +570,7 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
 /// init task: creates service endpoints, registers them, spawns servers,
 /// then loads the userspace `/sbin/init` as PID 1.
 fn init_task() -> ! {
+    post_marker(19); // scheduler running; kernel-side init_task started
     // Phase 7: console service endpoint.
     let console_ep = ipc::endpoint::ENDPOINTS.lock().create();
     ipc::registry::register("console", console_ep)
@@ -595,6 +630,7 @@ fn init_task() -> ! {
     task::spawn_on_current_core(serial_stdin_feeder_task, "serial-stdin");
 
     // Phase 20: load /sbin/init from ramdisk as userspace PID 1.
+    post_marker(20); // kernel service tasks spawned — exec'ing userspace PID 1
     spawn_userspace_init();
 
     // Phase 60 Track C — One-shot diagnostic.  After every kernel-side
