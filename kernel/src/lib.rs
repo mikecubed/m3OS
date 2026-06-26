@@ -79,6 +79,15 @@ struct PostFb {
 
 static POST_FB: spin::Once<PostFb> = spin::Once::new();
 
+/// Master switch for the bare-metal bring-up diagnostics: the `post_marker`
+/// POST squares, the `[timer] lapic_ticks_per_ms` framebuffer line, and init's
+/// AHCI-retry dots. **Default OFF.** These debugged the Phase 96 Tiger Lake
+/// early-boot hang and are invisible on a normal boot (the fb console overwrites
+/// the strip immediately), but they stay compiled out unless a future bare-metal
+/// bring-up needs them again — flip to `true` and rebuild. Same default-off-const
+/// idiom as `net::dhcp::FB_NET_HEARTBEAT` / the xhci driver's `VERBOSE_ENUM`.
+pub(crate) const BRINGUP_DIAG: bool = false;
+
 /// Record the framebuffer for `post_marker`. Called once at boot entry.
 fn post_fb_set(ptr: *mut u8, info: &bootloader_api::info::FrameBufferInfo) {
     let bpp = info.bytes_per_pixel.max(1);
@@ -105,7 +114,10 @@ fn post_fb_set(ptr: *mut u8, info: &bootloader_api::info::FrameBufferInfo) {
 /// `write_volatile` keeps it from being elided.
 #[inline(never)]
 pub(crate) fn post_marker(step: usize) {
-    let Some(fb) = POST_FB.get() else {
+    // Gated off by default via BRINGUP_DIAG, folded into the framebuffer-presence
+    // guard so the body stays a single conditional early-return (a positive guard
+    // also sidesteps the const-false `unreachable_code` lint).
+    let Some(fb) = POST_FB.get().filter(|_| BRINGUP_DIAG) else {
         return;
     };
     const SQ: usize = 28;
@@ -570,7 +582,10 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
     // different number flags a bad PIT-ch2 calibration (→ wrong nanosleep/timer
     // pacing). Printed just before the scheduler so it sits right above init's
     // first output. Guarded: `lapic_ticks_per_ms` panics if APIC wasn't inited.
-    if acpi::io_apic_address().is_some() {
+    // The calibration value also goes to the always-on kernel log
+    // (`[apic] LAPIC timer calibration: … ticks/ms`); this is just the
+    // bare-metal fb mirror, gated with the other bring-up diagnostics.
+    if BRINGUP_DIAG && acpi::io_apic_address().is_some() {
         crate::fb::write_fmt(format_args!(
             "[timer] lapic_ticks_per_ms={}\n",
             arch::x86_64::apic::lapic_ticks_per_ms()

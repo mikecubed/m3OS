@@ -93,15 +93,16 @@ syscall_lib::entry_point!(program_main);
 pub const BOOT_LOG_MARKER: &str = "usb-storage: spawned\n";
 
 /// Bare-metal de-risk toggle: emit the big, photo-legible PASS/FAIL banner
-/// (`print_storage_pass_banner` / `print_storage_fail_banner`). Default `true`
-/// while validating whether the boot USB is reachable as mass storage on real
-/// hardware — the banner is unmistakable in a phone photo of the framebuffer.
-/// The PASS banner only fires when a device is actually found; the FAIL banner
-/// fires on the no-device timeout, so on a normal QEMU boot (where `usb_storage`
-/// runs without a stick) it would print every boot — flip this to `false` to
-/// silence both once the de-risk is concluded.
+/// (`print_storage_pass_banner` / `print_storage_fail_banner`).
+///
+/// **Now `false` — the de-risk is concluded** (USB mass storage was validated on
+/// the real Tiger Lake laptop, Phase 96). The FAIL banner fired on the no-device
+/// timeout, so on a normal QEMU boot (where `usb_storage` runs without a stick)
+/// it printed mid-boot every time and corrupted the `security-floor` regression's
+/// prompt matching. Flip back to `true` only for another bare-metal photo-debug
+/// session.
 #[cfg(not(test))]
-const PROBE_BANNER: bool = true;
+const PROBE_BANNER: bool = false;
 
 /// USB Mass Storage interface class (USB-IF base-class 0x08).
 const CLASS_MASS_STORAGE: u8 = 0x08;
@@ -1372,8 +1373,6 @@ fn discover_storage_devices(usb_ep: u32) -> Vec<(AttachNotice, u8)> {
             if stable >= STABLE_WALKS {
                 break;
             }
-        } else if attempt % 5 == 1 {
-            write_str(STDOUT_FILENO, "usb-storage: waiting for device\n");
         }
 
         let _ = syscall_lib::nanosleep_for(0, POLL_INTERVAL_MS * 1_000_000);

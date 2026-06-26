@@ -2670,14 +2670,23 @@ fn bootstrap_ring3_root_disk() -> isize {
     // timer (dots tick by ~10/s → fall through to defaults) from a wedged
     // `nanosleep` (stuck on the first dot) — the kernel log is serial-only and
     // invisible without a serial port.
+    // Bare-metal bring-up diagnostic (default OFF, mirrors the kernel's
+    // `BRINGUP_DIAG`): a '.' per attempt lets a real-silicon boot tell a working
+    // timer (dots tick ~10/s) from a wedged `nanosleep` (stuck on dot 1). Flip
+    // to `true` + rebuild to re-enable for the next bare-metal bring-up.
+    const BRINGUP_DIAG: bool = false;
     let mut ret: isize = -19; // -ENODEV
     let mut attempts = 0u32;
     while attempts < 15 {
-        write_str(STDOUT_FILENO, ".");
+        if BRINGUP_DIAG {
+            write_str(STDOUT_FILENO, ".");
+        }
         let _ = nanosleep_for(0, 100_000_000); // 100 ms
         ret = mount(b"/dev/blk0\0".as_ptr(), b"/\0".as_ptr(), b"ext2\0".as_ptr());
         if ret == 0 {
-            write_str(STDOUT_FILENO, "\n");
+            if BRINGUP_DIAG {
+                write_str(STDOUT_FILENO, "\n");
+            }
             return 0;
         }
         attempts += 1;
