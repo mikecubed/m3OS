@@ -54,29 +54,59 @@ attempts. The captured serial dump is decisive:
      never reaching `LIBHELLO_FINI:RAN` / `PASS`.
    - A second attempt faulted identically at `rip=0x0` (`pid=72`).
 
-3. **Mechanism: an unrelocated `DT_FINI_ARRAY` destructor pointer.** `0x2a0` is
-   the **pristine file value** of a `DT_FINI_ARRAY` slot — the raw
-   `R_X86_64_RELATIVE` addend with `load_bias` **not** added.
-   `dlclose` → `runtime::run_destructors_for` (`ld-musl-x86_64.so.1/src/main.rs:2038`)
-   reads `fini_array[i]` and calls it raw (assuming it is pre-relocated); the
-   slot intermittently holds the unrelocated value, so the call jumps to the
-   bare addend and instruction-fetch-faults. The DSO data segment carrying
-   `DT_FINI_ARRAY` is mapped `MAP_PRIVATE | MAP_FIXED | MAP_LAZY_FILE`
-   (demand-paged from the file); the relocation write the loader applied is
-   intermittently **lost / the page reverts to pristine** under `-smp 4` TCG.
+3. **Confirmed root cause: the loader has no `DT_RELR` support, and the DSO's
+   sole relocation is `DT_RELR`-encoded.** `0x2a0` is the **pristine file value**
+   of the `DT_FINI_ARRAY` slot — the destructor function's in-DSO vaddr, with
+   `load_bias` never added. `dlclose` → `runtime::run_destructors_for`
+   (`ld-musl-x86_64.so.1/src/main.rs`) reads `fini_array[i]` and calls it raw
+   (assuming it is pre-relocated), so the call jumps to the bare `0x2a0` and
+   instruction-fetch-faults. `readelf -d libhello_fini.so` is decisive:
+   `RELA: 0x0 / RELASZ: 0` (**no `DT_RELA` relocations**) but
+   `RELR: 0x1070 / RELRSZ: 8` — the relocation lives in `.relr.dyn`, the compact
+   relative-relocation table that needs `*0x2ea0 += load_bias`. The loader's
+   relocation engine handled `DT_RELA` / `DT_JMPREL` only and **silently ignored
+   `DT_RELR`** (`DT_RELR`/`DT_RELRSZ`/`DT_RELRENT` were not even defined), so the
+   destructor pointer was never relocated.
 
-4. **Two distinct defects, both in scope:**
-   - **(B)** the kernel/loader bug that intermittently loses the relocation on a
-     `MAP_LAZY_FILE` page (the root cause of the fault — confirmed cause under
-     investigation in Track B);
-   - **(C)** the gate has **no FAIL pattern**, so the runner's already-emitted
-     `SMOKE:dlopen-test-smoke:FAIL` is ignored and the `WaitEither` times out at
-     120 s instead of failing fast and naming the cause.
+   An *intermediate* hypothesis — a `MAP_LAZY_FILE` page reverting to pristine
+   file content — was **tried and refuted**: eager-mapping the writable
+   (relocated) segments did **not** change the symptom, because the page never
+   reverts; the slot is simply never written in the first place.
+
+4. **Why it looked "intermittent / TCG-correlated."** `DT_RELR` is what *modern*
+   linkers (lld, recent binutils with `-z pack-relative-relocs`) emit for
+   relative relocations; older toolchains emit the equivalent `DT_RELA` stream,
+   which the loader **did** handle. So the gate passed when the host that built
+   the image used an older linker (`.rela.dyn`) and failed deterministically when
+   it used a newer one (`.relr.dyn`). The apparent "intermittent TCG stall" was a
+   misdiagnosis: it is a *toolchain-dependent* deterministic failure, surfaced as
+   a "stall" only because the gate had no FAIL pattern (defect C below).
+
+5. **Two defects, both fixed in this phase:**
+   - **(B) the real bug** — the loader ignored `DT_RELR`. Fixed by adding the
+     `DT_RELR` decode (`crate::reloc::apply_relr`, host-tested) wired into the
+     `Dyn` parse and all three relocation sites (`dlopen`'d DSOs, bring-up
+     `DT_NEEDED` DSOs, and the main binary).
+   - **(C) the blind gate** — the `dlopen-test-smoke` step was `WaitEither{PASS,
+     SKIP}` with **no FAIL pattern**, so the runner's already-emitted
+     `SMOKE:dlopen-test-smoke:FAIL` was ignored and the step timed out at 120 s.
+     Fixed by switching it to `WaitPassOrFail` matching the runner's FAIL verdict
+     and the kernel `process killed` / panic markers (fail-fast, named cause).
+
+**Fix verified.** `cargo xtask dlopen-repro` (the Task A.1 harness) under load:
+*before* the fix, the destructor fault reproduced on **iteration 1** every run
+(`process killed`, `rip=0x2a0`, `LIBHELLO_FINI:RAN` never printed). *After* the
+`DT_RELR` fix, **232 consecutive iterations passed with `LIBHELLO_FINI:RAN`
+printed every time** (the destructor now actually runs) and **zero** faults; the
+run was only cut short by a per-iteration 20 s wait tripping under extreme host
+load (the benign "slow-PASS" TCG-latency shape, not the fault). The `ldso_core`
+host tests (`reloc::tests::relr_*`) pin the decode logic, including the exact
+`libhello_fini.so` shape.
 
 **Repro tooling (Task A.1).** `cargo xtask dlopen-repro` boots `-smp 4` TCG, logs
 in, and runs `/bin/dlopen_test` in a host-driven loop (`M3OS_DLOPEN_ITERS`,
 default 100), matching `DLOPEN_TEST:PASS` directly on serial and FAIL-fasting on
-`process killed`. This reproduces the destructor fault on the original
+`process killed` / a destructor fault. This reproduces the bug on the original
 execution path and is the soak harness for the fix (Task C.4).
 
 ## Learning Goals

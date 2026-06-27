@@ -390,6 +390,13 @@ const SMOKE_EXIT_RUSTC_SMOKE_FAILED: i32 = 91;
 /// under size-derived ceilings — the regression guard for VFS IPC-call count.
 const SMOKE_EXIT_VFS_THROUGHPUT_FAILED: i32 = 92;
 
+/// Phase 97 — `guest/dlopen-test-smoke` failure exit code. The dlopen step now
+/// fails fast (`WaitPassOrFail`) on the runner's `SMOKE:dlopen-test-smoke:FAIL`
+/// line and on the kernel `process killed` / panic markers, instead of the old
+/// PASS-or-SKIP `WaitEither` that timed out at 120 s when the `dlclose`
+/// destructor faulted (the DT_RELR-relocation bug fixed in this phase).
+const SMOKE_EXIT_DLOPEN_SMOKE_FAILED: i32 = 93;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
     Headless,
@@ -8376,20 +8383,32 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     // dlclose / dlerror through `dlopen_test` and asserts that
     // DT_FINI_ARRAY destructors fire in the right serial order
     // between the test's FINI_PENDING and PASS bracket sentinels.
-    steps.push(SmokeStep::WaitEither {
-        pattern_a: "SMOKE:dlopen-test-smoke:PASS",
-        pattern_b: "SMOKE:dlopen-test-smoke:SKIP",
-        // The test dlopen()s a `.so` and runs its DT_FINI_ARRAY destructors over
-        // the slow ring-3 VFS; on a loaded TCG host (after several builds/QEMU
-        // runs) the PASS sentinel reliably lands but exceeds the original 30 s
-        // window, falsely timing out the pre-push gate. The test emits PASS/SKIP
-        // regardless, so widening the wait only adds headroom for slow hosts
-        // (KVM still completes in seconds); a real failure emits FAIL or never
-        // PASSes and still trips this step.
+    //
+    // Phase 97 — honest gate. The old `WaitEither{PASS, SKIP}` had NO FAIL
+    // pattern, so when the `dlclose` destructor faulted (the DT_RELR-relocation
+    // bug — an unrelocated `DT_FINI_ARRAY` pointer → near-NULL `INSTRUCTION_FETCH`
+    // → `process killed`) the runner's `SMOKE:dlopen-test-smoke:FAIL` was ignored
+    // and the step timed out at 120 s, masquerading as a "stall". `WaitPassOrFail`
+    // matches the runner's FAIL verdict and the kernel fault/panic markers, so a
+    // regression FAILS FAST with a named cause instead of an opaque timeout.
+    // `dlopen_test` is always ramdisk-embedded (the build enforces it, see the
+    // placeholder-rejection checks earlier in this file), so the old SKIP arm was
+    // unreachable in the always-on gate and is dropped.
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "SMOKE:dlopen-test-smoke:PASS",
+        fail_prefixes: &[
+            "SMOKE:dlopen-test-smoke:FAIL",
+            "process killed",
+            "KERNEL PANIC",
+            "RECURSIVE KERNEL PAGE FAULT",
+            "no waker registered",
+        ],
+        // Generous headroom for a slow/loaded TCG host (KVM completes in seconds);
+        // a real failure now trips a fail-prefix immediately rather than waiting
+        // out the window.
         timeout_secs: 120,
         label: "guest/dlopen-test-smoke: libdl runtime + DT_FINI_ARRAY destructors",
-        extra_steps_a: &[],
-        extra_steps_b: &[],
+        exit_code_on_fail: SMOKE_EXIT_DLOPEN_SMOKE_FAILED,
     });
     steps.push(SmokeStep::Wait {
         pattern: "SMOKE:PASS",

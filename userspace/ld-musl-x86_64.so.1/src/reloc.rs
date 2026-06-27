@@ -74,6 +74,81 @@ pub fn apply_relative(reloc: &Rela, load_bias: u64, image: &mut [u8]) -> Result<
     Ok(())
 }
 
+/// Relocate one 8-byte slot at byte `offset` within `image`: read the existing
+/// value, add `load_bias`, write it back. Alignment- and bounds-checked.
+///
+/// This is the per-slot primitive both `DT_RELR` ([`apply_relr`]) and a future
+/// in-place `R_X86_64_RELATIVE` could share; today only `apply_relr` uses it.
+fn relocate_slot(image: &mut [u8], offset: u64, load_bias: u64) -> Result<(), RelocError> {
+    if !offset.is_multiple_of(8) {
+        return Err(RelocError::MisalignedOffset(offset));
+    }
+    let off = offset as usize;
+    let end = off.checked_add(8).ok_or(RelocError::OutOfBounds {
+        r_offset: offset,
+        image_len: image.len(),
+    })?;
+    if end > image.len() {
+        return Err(RelocError::OutOfBounds {
+            r_offset: offset,
+            image_len: image.len(),
+        });
+    }
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&image[off..end]);
+    let value = u64::from_le_bytes(buf).wrapping_add(load_bias);
+    image[off..end].copy_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+/// Apply a `DT_RELR` (compact relative-relocation) table against an image
+/// buffer. `DT_RELR` is what modern linkers emit *instead of* the equivalent
+/// stream of `R_X86_64_RELATIVE` `DT_RELA` entries — e.g. `libhello_fini.so`'s
+/// sole relocation (its `DT_FINI_ARRAY` destructor pointer) is RELR-encoded, so
+/// a loader that ignores `DT_RELR` leaves that pointer holding its unrelocated
+/// in-file value and `dlclose` jumps to a near-NULL address. Each entry is
+/// interpreted per the SysV RELR encoding:
+///
+/// * **Address word** (LSB == 0): the word is the image-relative byte offset of
+///   a slot; relocate that slot (`*slot += load_bias`) and set the running
+///   cursor to the next slot.
+/// * **Bitmap word** (LSB == 1): bits `1..=63` each select a slot starting at
+///   the running cursor — bit `k` relocates the slot at `cursor + (k-1)*8`. The
+///   cursor then advances by 63 slots regardless of which bits were set.
+///
+/// `relr` is the raw `.relr.dyn` table (one `u64` per `DT_RELRENT`, always 8).
+/// Pure logic: every write is bounds- and alignment-checked against `image`, so
+/// a malformed table errors instead of writing out of bounds. Returns the
+/// number of slots relocated.
+pub fn apply_relr(relr: &[u64], load_bias: u64, image: &mut [u8]) -> Result<usize, RelocError> {
+    // Byte offset (into `image`) of the next slot a bitmap word describes.
+    let mut cursor: u64 = 0;
+    let mut applied = 0usize;
+    for &entry in relr {
+        if entry & 1 == 0 {
+            // Address word: `entry` is the offset of a single slot.
+            relocate_slot(image, entry, load_bias)?;
+            applied += 1;
+            cursor = entry.wrapping_add(8);
+        } else {
+            // Bitmap word: bits 1..=63 select slots relative to `cursor`.
+            let mut bits = entry >> 1;
+            let mut k: u64 = 0;
+            while bits != 0 {
+                if bits & 1 != 0 {
+                    relocate_slot(image, cursor.wrapping_add(k.wrapping_mul(8)), load_bias)?;
+                    applied += 1;
+                }
+                bits >>= 1;
+                k += 1;
+            }
+            // A bitmap always covers 63 slots; advance the cursor past them.
+            cursor = cursor.wrapping_add(63 * 8);
+        }
+    }
+    Ok(applied)
+}
+
 /// Apply a single `R_X86_64_64` write — `*(load_bias + r_offset) =
 /// sym_addr + r_addend`.
 pub fn apply_abs64(
@@ -393,5 +468,67 @@ mod tests {
         let r = rela(3, 0);
         apply_copy(&r, &provider, &mut consumer).unwrap();
         assert_eq!(&consumer[3..6], &provider);
+    }
+
+    // ---- DT_RELR --------------------------------------------------------
+
+    fn slot(image: &[u8], byte_off: usize) -> u64 {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&image[byte_off..byte_off + 8]);
+        u64::from_le_bytes(buf)
+    }
+
+    fn put(image: &mut [u8], byte_off: usize, value: u64) {
+        image[byte_off..byte_off + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn relr_address_word_relocates_single_slot() {
+        // The exact libhello_fini.so shape: one address word naming the
+        // .fini_array slot, whose in-file value (the destructor's in-DSO vaddr)
+        // must have load_bias added.
+        let mut image = vec![0u8; 0x40];
+        put(&mut image, 0x10, 0x2a0); // unrelocated destructor vaddr
+        let n = apply_relr(&[0x10], 0x4000_0000, &mut image).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(slot(&image, 0x10), 0x4000_02a0);
+    }
+
+    #[test]
+    fn relr_bitmap_word_relocates_selected_slots() {
+        // Address word sets the cursor at byte 0; the following bitmap word
+        // (LSB=1) selects bits 1 and 3 → the slots at cursor+0 and cursor+16.
+        let mut image = vec![0u8; 0x80];
+        put(&mut image, 0x00, 0x1000); // address-word target
+        put(&mut image, 0x08, 0x10); // cursor+0 (bit 1)
+        put(&mut image, 0x18, 0x30); // cursor+16 (bit 3)
+        put(&mut image, 0x10, 0x99); // cursor+8 (bit 2, NOT set) — untouched
+        // entries: address word 0x00, then bitmap with bits 1 and 3 set.
+        // bitmap = (1<<0)tag | (1<<1) | (1<<3) = 0b1011 = 0xB.
+        let n = apply_relr(&[0x00, 0xB], 0x4000_0000, &mut image).unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(slot(&image, 0x00), 0x4000_1000); // address word
+        assert_eq!(slot(&image, 0x08), 0x4000_0010); // bit 1
+        assert_eq!(slot(&image, 0x18), 0x4000_0030); // bit 3
+        assert_eq!(slot(&image, 0x10), 0x99); // bit 2 unset — untouched
+    }
+
+    #[test]
+    fn relr_rejects_out_of_bounds_offset() {
+        let mut image = vec![0u8; 16];
+        // Address word naming a slot whose 8-byte write exceeds the image.
+        assert!(matches!(
+            apply_relr(&[0x10], 0x4000_0000, &mut image),
+            Err(RelocError::OutOfBounds { .. })
+        ));
+    }
+
+    #[test]
+    fn relr_rejects_misaligned_offset() {
+        let mut image = vec![0u8; 64];
+        assert!(matches!(
+            apply_relr(&[0x4], 0x4000_0000, &mut image),
+            Err(RelocError::MisalignedOffset(4))
+        ));
     }
 }

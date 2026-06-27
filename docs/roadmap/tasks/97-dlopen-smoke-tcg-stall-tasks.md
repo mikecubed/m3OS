@@ -5,14 +5,35 @@
 **Depends on:** Phase 95b ✅ (`MAP_LAZY_FILE` demand-paged loader + blocking page-fault→`vfs_server` read), the SMP TLB-shootdown / lost-wakeup hardening ✅ (`docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md`)
 **Goal:** Get observability on the intermittent `smoke-test` step-26 (`dlopen-test-smoke`) failure, **confirm** the real cause (the handoff's blocking-`vfs` lost-wakeup hypothesis is falsified at the artifact level — all DSOs are ramdisk-embedded/synchronous; the leading surviving suspect is the cross-core TLB shootdown `dlclose`'s `munmap` runs twice on the `FINI`→`PASS` path under `-smp 4` TCG oversubscription), land only the confirmed fix plus a couple of always-safe hardenings, and replace the observability-blind PASS-or-SKIP gate with a falsifiable, CI-deterministic one.
 
+## Outcome (2026-06-27)
+
+**Confirmed root cause: the `ld-musl` loader had no `DT_RELR` support.**
+`libhello_fini.so`'s only relocation (its `DT_FINI_ARRAY` destructor pointer) is
+`DT_RELR`-encoded (`RELASZ: 0`, `RELR: 0x1070`), so the destructor pointer was
+never relocated → `dlclose` → `run_destructors_for` jumped to the unrelocated
+in-file vaddr `0x2a0` → near-NULL `INSTRUCTION_FETCH` → `process killed`. The
+"intermittent TCG stall" framing in the design doc's hypotheses is **refuted**:
+both the blocking-`vfs` and the cross-core TLB-shootdown hypotheses produced
+**zero** corroborating evidence (no `[tlb]` lines), and the failure is a
+*toolchain-dependent deterministic* fault (modern linkers emit `.relr.dyn`,
+older emit `.rela.dyn` which the loader already handled) that *looked* like a
+stall only because the gate had no FAIL pattern. See the design doc's
+**Investigation Findings** for the full verdict.
+
+**Fix:** `DT_RELR` decode (`reloc::apply_relr`, host-tested) wired into the `Dyn`
+parser and all three relocation sites; the `dlopen-test-smoke` gate switched to
+`WaitPassOrFail` (real FAIL pattern). Several planned tasks below are **N/A** —
+they were keyed to the refuted shootdown hypothesis (A.4 shootdown
+instrumentation, B.2 shootdown fix, B.4 lazy-file/`vfs` hardenings).
+
 ## Track Layout
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Observability & reproduction (standalone repro, base-rate, backend + shootdown + watchdog instrumentation, `-smp 1` discriminator) | — | Planned |
-| B | Root-cause fix keyed to Area A's confirmed cause + always-safe hardenings | A | Planned |
-| C | Honest, CI-deterministic regression gate (serial-direct + FAIL pattern + COM1-RX guard + soak) | A, B | Planned |
-| D | Docs & version bump | — | In Progress |
+| A | Observability & reproduction (standalone repro, instrumentation, discriminators) | — | Done (repro built; `readelf` + serial dump confirmed the `DT_RELR` cause; shootdown/`vfs` instrumentation N/A) |
+| B | Root-cause fix + honest-gate fail-fast | A | Done (`DT_RELR` loader support; gate FAIL pattern. Shootdown fix B.2 / lazy-file hardenings B.4 N/A — refuted) |
+| C | Honest, CI-deterministic regression gate (FAIL pattern + soak) | A, B | Done (dlopen step → `WaitPassOrFail`; soaked via `dlopen-repro`) |
+| D | Docs & version bump | — | Done (findings recorded; kernel `v0.96.0`→`v0.97.0`) |
 
 ---
 
