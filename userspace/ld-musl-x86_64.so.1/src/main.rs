@@ -71,7 +71,7 @@ use ldso_core::elf64::{
 };
 use ldso_core::reloc::{
     apply_abs64, apply_copy, apply_glob_dat, apply_irelative, apply_relative, apply_relr,
-    apply_tls_word,
+    apply_tls_word, relr_table_entries,
 };
 
 // ---------------------------------------------------------------------------
@@ -1435,13 +1435,28 @@ unsafe fn apply_relr_for_dso(dso: &LoadedDso) -> Result<(), &'static str> {
     let Some(relr) = dso.dyn_.relr else {
         return Ok(());
     };
-    if dso.dyn_.relrsz < 8 || dso.image_len == 0 {
+    if dso.image_len == 0 {
         return Ok(());
     }
-    let n = (dso.dyn_.relrsz / 8) as usize;
-    // SAFETY: `relr` points into the mapped image; `n` 8-byte entries fit in
-    // `relrsz`. The image slice spans the whole mapping; `apply_relr`
-    // bounds-checks every slot write against it.
+    // VALIDATE the table is 8-aligned and lies fully within the mapped image
+    // BEFORE building a `&[u64]` over it. A malformed (or hostile `dlopen`'d)
+    // DSO whose `DT_RELR`/`DT_RELRSZ` is unaligned or out-of-bounds would
+    // otherwise make `from_raw_parts::<u64>` immediate UB — the slice validity
+    // invariant is violated before `apply_relr` can run any per-slot bounds
+    // check. `relr_table_entries` returns the entry count only for a sound table.
+    let Some(n) = relr_table_entries(
+        relr.as_ptr() as u64,
+        dso.dyn_.relrsz,
+        dso.load_bias,
+        dso.image_len,
+    ) else {
+        serial(b"ldso: DT_RELR table misaligned or outside image\n");
+        return Err("DT_RELR table out of image");
+    };
+    // SAFETY: `relr_table_entries` confirmed `relr` is 8-aligned and the whole
+    // `n * 8`-byte table lies within the mapped image (a single allocation), so
+    // the `&[u64]` is sound. The image slice spans the whole mapping;
+    // `apply_relr` bounds-checks every slot write against it.
     let entries: &[u64] = unsafe { core::slice::from_raw_parts(relr.as_ptr() as *const u64, n) };
     let image: &mut [u8] = unsafe {
         core::slice::from_raw_parts_mut(dso.load_bias as *mut u8, dso.image_len as usize)
