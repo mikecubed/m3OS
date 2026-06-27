@@ -2,7 +2,7 @@
 
 **Status:** Planned
 **Source Ref:** phase-106
-**Depends on:** Phase 82/87 (AHCI fork-and-retry root bootstrap + writable ext2) ✅, Phase 92a (USB mass-storage with writable `/mnt/usb`) ✅, Phase 55b (ring-3 NVMe driver) ✅, Phase 98 (GUI-workstation re-charter + bare-metal validation strategy) ✅
+**Depends on:** Phase 82/87 (AHCI fork-and-retry root bootstrap + writable ext2) ✅, Phase 92a (USB mass-storage with writable `/mnt/usb`) ✅, Phase 55b (ring-3 NVMe driver) ✅, Phase 98 (GUI-workstation re-charter + bare-metal validation strategy) ✅. **Gate:** the NVMe-root milestone is gated on **bare-metal NVMe root boot validated** per the [bare-metal validation strategy](../../appendix/bare-metal-validation.md).
 **Goal:** Climb the M1→M3 ladder from "boots a flashed read-only image" to "installs m3OS onto the Dell's internal NVMe": **M1** a single combined GPT(ESP+ext2) USB image that boots writable from USB; **M2** an NVMe root boot mirroring the AHCI path, with `nvme-rw`/`nvme-persist` gates passing in QEMU; **M3** an on-device installer that writes the NVMe from a USB-resident image and creates the first user. Reuse the Phase 82 `bootstrap_ring3_root_disk` template, the Phase 87 writable-ext2 path, the Phase 92a `usb-storage` write path + `usb_ext2_base_lba` GPT probe, and the Phase 55b ring-3 NVMe driver. HW rungs follow the Phase 98 bare-metal protocol (`docs/appendix/bare-metal-validation.md`) and land as `Validated-on-HW (run N, date)`.
 
 ## Track Layout

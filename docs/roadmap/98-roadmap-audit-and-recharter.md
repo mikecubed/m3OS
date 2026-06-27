@@ -1,6 +1,6 @@
 # Phase 98 — Roadmap Audit & Re-Charter (toward a real-hardware GUI workstation)
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-98
 **Depends on:** the full Phase 1→97 arc being nominally "done" (hardware substrate → drivers → toolchains → bare-metal bring-up)
 **Builds on:** Phase 58 (Documentation Reconciliation Pass) and `docs/appendix/audit-status/` established the precedent that a phase's *claimed* status and its *validated* status drift over time. That audit corpus stopped at Phase 57e (2026-05-08); the pre-1.0 audit (`74a-pre-1.0-audit.md`) extended it to Phase 75. This phase brings the evidence standard up to **Phase 97**, institutionalizes it (a gate / recorded run / host test behind every Status), and pairs the backward audit with a forward re-charter of the next arc.

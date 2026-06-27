@@ -2,7 +2,7 @@
 
 **Status:** Planned
 **Source Ref:** phase-108
-**Depends on:** Phase 96 (bare-metal bring-up + boot rescue) ✅, Phase 55a/67 (AMD-Vi IOMMU coded + host-tested) ✅, Phase 81 (mt792x connac2 Wi-Fi) ✅, Phase 102 (I2C-HID protocol layer), Phase 104 (Wi-Fi supplicant daemon)
+**Depends on:** Phase 96 (bare-metal bring-up + boot rescue) ✅, Phase 55a/67 (AMD-Vi IOMMU coded + host-tested) ✅, Phase 81 (mt792x connac2 Wi-Fi) ✅, Phase 102 (I2C-HID protocol layer), Phase 104 (Wi-Fi supplicant daemon), Phase 107 (Networked & Signed Package Distribution — sequencing prerequisite: starts after the Dell line 99–107)
 **Goal:** Boot the HP OmniBook Ultra 14-fd0xxx (Ryzen AI 9 365, Strix Point / Zen 5, board "SBKPF") to a usable login + GUI on bare metal, *after* the Dell line proves the stack. The boot/usability layer is a small delta over the bus-agnostic substrate (GOP FB + xHCI + NVMe + 8-bit-ID xAPIC + the Phase-96 boot-rescue fixes carry over free); the new work is the **MT7925 connac3 Wi-Fi** driver (gating), the **first bare-metal AMD-Vi validation** (risk), the **fam1Ah Zen 5 microcode blob** (trivial), and the **AMD I2C-HID touchpad backend** behind the Phase 102 transport. Every acceptance item is a recorded hardware run under `docs/appendix/bare-metal-validation.md` — there is no QEMU model and no CI safety net.
 
 ## Track Layout

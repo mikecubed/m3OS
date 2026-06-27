@@ -1,7 +1,7 @@
 # Bare-Metal Validation Strategy
 
 **Aligned Roadmap Phase:** Phase 98 (Track A.5), reused by every HW-only phase in the GUI-workstation arc (99→110)
-**Status:** Planned
+**Status:** Adopted (Phase 98 deliverable; the standing protocol for the 99→110 hardware-only arc)
 **Source Ref:** phase-98
 
 ## Why this exists
