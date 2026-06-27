@@ -63,61 +63,63 @@ const FSTYPE_EXT2: &[u8] = b"ext2\0";
 const LOG_PATH: &[u8] = b"/mnt/usb0/boot.log\0";
 const KMSG_PATH: &[u8] = b"/proc/kmsg\0";
 
-/// Snapshot the full `/proc/kmsg` ring into `/mnt/usb0/boot.log` (overwrite, so
-/// the file always holds the latest complete snapshot — the ring is bounded
-/// (256 KiB), so this never grows without limit). Returns the byte count
-/// written, or a negative value on failure (open, read, or write error). A
-/// truncated snapshot is reported as a failure, never as a short success.
+/// Snapshot the full `/proc/kmsg` ring into `/mnt/usb0/boot.log`. Returns the
+/// byte count written, or a negative value on failure (open/read/write error).
+///
+/// The whole (bounded, 256 KiB) ring is read into memory FIRST, and `boot.log`
+/// is only opened with `O_TRUNC` and rewritten once the complete snapshot is in
+/// hand. So a `/proc/kmsg` read failure — the dominant failure mode on a flaky
+/// bare-metal USB/VFS — leaves the previous, known-good `boot.log` untouched
+/// instead of truncating it to a partial file. (A fully atomic
+/// temp-then-rename replace isn't available here: `rename()` is not routed for
+/// `/mnt/usbN` mounts — it returns `EROFS` — so the residual exposure is a
+/// write failure during the final contiguous rewrite, which is surfaced as a
+/// negative errno rather than mistaken for success.)
 fn snapshot_kmsg(buf: &mut [u8]) -> isize {
     let kfd = open(KMSG_PATH, O_RDONLY, 0);
     if kfd < 0 {
         return kfd;
     }
-    let lfd = open(LOG_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0o644);
-    if lfd < 0 {
-        close(kfd as i32);
-        return lfd;
-    }
-    let mut total: isize = 0;
+    // 1. Read the entire ring into memory before touching boot.log, so a read
+    //    error leaves the previous snapshot intact (boot.log is not opened yet).
+    let mut snapshot: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     loop {
         let n = read(kfd as i32, buf);
         if n < 0 {
-            // Read error mid-stream: fail loudly rather than reporting the
-            // partial snapshot copied so far as a success.
-            let _ = fsync(lfd as i32);
-            close(lfd as i32);
             close(kfd as i32);
-            return n;
+            return n; // boot.log untouched — previous snapshot preserved.
         }
         if n == 0 {
-            break; // EOF — the full ring has been copied.
+            break; // EOF — the full ring has been captured.
         }
-        // Write the FULL chunk — a short or failed write would otherwise silently
-        // truncate boot.log while `total` still counts bytes read from kmsg,
-        // defeating the post-mortem log persistence this daemon exists for.
-        let mut off = 0usize;
-        while off < n as usize {
-            let w = write(lfd as i32, &buf[off..n as usize]);
-            if w <= 0 {
-                // Write failure: surface a negative errno so the caller does not
-                // treat a truncated boot.log as a successful snapshot.
-                let _ = fsync(lfd as i32);
-                close(lfd as i32);
-                close(kfd as i32);
-                return if w < 0 {
-                    w
-                } else {
-                    -5 /* EIO */
-                };
-            }
-            off += w as usize;
+        snapshot.extend_from_slice(&buf[..n as usize]);
+    }
+    close(kfd as i32);
+
+    // 2. Only now overwrite boot.log with the complete in-memory snapshot.
+    let lfd = open(LOG_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0o644);
+    if lfd < 0 {
+        return lfd;
+    }
+    let mut off = 0usize;
+    while off < snapshot.len() {
+        let w = write(lfd as i32, &snapshot[off..]);
+        if w <= 0 {
+            // Write failure: surface a negative errno so the caller does not
+            // treat a truncated boot.log as a successful snapshot.
+            let _ = fsync(lfd as i32);
+            close(lfd as i32);
+            return if w < 0 {
+                w
+            } else {
+                -5 /* EIO */
+            };
         }
-        total += n;
+        off += w as usize;
     }
     let _ = fsync(lfd as i32);
     close(lfd as i32);
-    close(kfd as i32);
-    total
+    snapshot.len() as isize
 }
 
 fn program_main(_args: &[&str]) -> i32 {

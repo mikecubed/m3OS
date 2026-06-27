@@ -9,9 +9,13 @@
 //! [`set_range_write_combining`] runs — the framebuffer. We therefore reprogram
 //! **index 2 from UC- to WC**, which (a) costs nothing for any existing strong-UC
 //! mapping (those use index 3, `NO_CACHE | WRITE_THROUGH`) and (b) upgrades the
-//! framebuffer + prefetchable BARs to real write-combining. Selecting WC via PCD
-//! (bit 4) — identical in 4 KiB and 2 MiB leaves — sidesteps the position-
-//! dependent PAT bit (bit 7 in a 4 KiB PTE vs bit 12 in a 2 MiB PDE).
+//! framebuffer + prefetchable BARs to real write-combining. Index 2 is selected
+//! by PCD (bit 4) set, PWT (bit 3) clear, **and the PAT bit clear** — otherwise
+//! the type decodes as index 6 (UC-). The PAT bit's position is leaf-dependent
+//! (bit 7 in a 4 KiB PTE, bit 12 in a 2 MiB PDE): [`set_range_write_combining`]
+//! clears it explicitly on 4 KiB leaves (the framebuffer case) and relies on it
+//! already being 0 on 2 MiB leaves, which `update_flags` cannot reach (there bit
+//! 12 is part of the frame address).
 //!
 //! PAT is **per-core**: the Intel SDM requires every logical CPU mapping a shared
 //! page to agree on its memory type, so [`init`] runs on the BSP and on every AP
@@ -83,12 +87,22 @@ pub unsafe fn set_range_write_combining(virt_base: usize, size: usize) -> usize 
         let vaddr = VirtAddr::new(addr as u64);
         match mapper.translate(vaddr) {
             TranslateResult::Mapped { frame, flags, .. } => {
-                // Select PAT index 2 (WC): set PCD, clear PWT. Every other flag
-                // (PRESENT, WRITABLE, NO_EXECUTE, GLOBAL, and HUGE_PAGE/PS on a
-                // 2 MiB leaf) is preserved so we don't change page semantics.
-                let wc = (flags | PageTableFlags::NO_CACHE) & !PageTableFlags::WRITE_THROUGH;
+                // Select PAT index 2 (WC) = PAT 0 / PCD 1 / PWT 0. Set PCD, clear
+                // PWT — and the PAT bit must be 0 too, or the index becomes 6
+                // (UC-) and the WC upgrade silently no-ops. The PAT bit's
+                // position is leaf-size dependent, so it is handled per arm.
+                // Every other flag (PRESENT, WRITABLE, NO_EXECUTE, GLOBAL) is
+                // preserved so page semantics are unchanged.
+                let base = (flags | PageTableFlags::NO_CACHE) & !PageTableFlags::WRITE_THROUGH;
                 match frame {
                     MappedFrame::Size4KiB(_) => {
+                        // In a 4 KiB PTE the PAT bit is bit 7, which the x86_64
+                        // crate models as HUGE_PAGE. Clear it so the type is
+                        // unambiguously index 2 even if the prior mapping had
+                        // PAT=1 — a 4 KiB leaf never legitimately has PS set, so
+                        // this is always safe and reaches the bit via set_flags
+                        // (bit 7 is outside the bits-12..51 address mask).
+                        let wc = base & !PageTableFlags::HUGE_PAGE;
                         let page = Page::<Size4KiB>::containing_address(vaddr);
                         if let Ok(f) = unsafe { mapper.update_flags(page, wc) } {
                             f.flush();
@@ -97,6 +111,15 @@ pub unsafe fn set_range_write_combining(virt_base: usize, size: usize) -> usize 
                         addr += 0x1000;
                     }
                     MappedFrame::Size2MiB(_) => {
+                        // In a 2 MiB PDE the PAT bit is bit 12, which sits inside
+                        // the crate's bits-12..51 frame-address mask, so
+                        // update_flags() preserves it and cannot clear it (and
+                        // HUGE_PAGE/PS must stay set). The only callers — the
+                        // bootloader framebuffer (4 KiB in practice) and
+                        // prefetchable BARs — map with PAT=0, so index 2 holds;
+                        // a 2 MiB leaf arriving with PAT=1 would need a raw PDE
+                        // rewrite outside the Mapper API to correct.
+                        let wc = base;
                         let page = Page::<Size2MiB>::containing_address(vaddr);
                         if let Ok(f) = unsafe { mapper.update_flags(page, wc) } {
                             f.flush();
