@@ -70,7 +70,8 @@ use ldso_core::elf64::{
     r_sym, r_type, st_bind, st_type,
 };
 use ldso_core::reloc::{
-    apply_abs64, apply_copy, apply_glob_dat, apply_irelative, apply_relative, apply_tls_word,
+    apply_abs64, apply_copy, apply_glob_dat, apply_irelative, apply_relative, apply_relr,
+    apply_tls_word, relr_table_entries,
 };
 
 // ---------------------------------------------------------------------------
@@ -1417,6 +1418,67 @@ unsafe fn tls_module_for_reloc(
     dsos.get(idx).and_then(|d| d.tls).map(|t| (t, st_value))
 }
 
+/// Apply a DSO's `DT_RELR` (compact relative-relocation / `.relr.dyn`) table,
+/// if present. Modern linkers emit `R_X86_64_RELATIVE` runs here instead of in
+/// `DT_RELA` — e.g. `libhello_fini.so`'s sole relocation, its `DT_FINI_ARRAY`
+/// destructor pointer, is RELR-encoded, and a loader that ignored `DT_RELR`
+/// left that pointer holding its in-file vaddr so `dlclose` →
+/// `run_destructors_for` jumped to a near-NULL address. Routes through the
+/// host-tested [`apply_relr`] slice helper, mirroring the `R_X86_64_RELATIVE`
+/// arm of [`apply_rela`]. A no-op when the DSO carries no `DT_RELR`.
+///
+/// # Safety
+/// `dso.dyn_.relr` was bias-relocated to point into `dso`'s mapped image at
+/// parse time; `dso.load_bias` / `dso.image_len` reference a live mmap. The
+/// loader is single-threaded during relocation.
+unsafe fn apply_relr_for_dso(dso: &LoadedDso) -> Result<(), &'static str> {
+    let Some(relr) = dso.dyn_.relr else {
+        return Ok(());
+    };
+    if dso.image_len == 0 {
+        return Ok(());
+    }
+    // VALIDATE the table is 8-aligned and lies fully within the mapped image
+    // BEFORE building a `&[u64]` over it. A malformed (or hostile `dlopen`'d)
+    // DSO whose `DT_RELR`/`DT_RELRSZ` is unaligned or out-of-bounds would
+    // otherwise make `from_raw_parts::<u64>` immediate UB — the slice validity
+    // invariant is violated before `apply_relr` can run any per-slot bounds
+    // check. `relr_table_entries` returns the entry count only for a sound table.
+    let Some(n) = relr_table_entries(
+        relr.as_ptr() as u64,
+        dso.dyn_.relrsz,
+        dso.load_bias,
+        dso.image_len,
+    ) else {
+        serial(b"ldso: DT_RELR table misaligned or outside image\n");
+        return Err("DT_RELR table out of image");
+    };
+    // SAFETY: `relr_table_entries` confirmed `relr` is 8-aligned and the whole
+    // `n * 8`-byte table lies within the mapped image (a single allocation), so
+    // the `&[u64]` is sound. The image slice spans the whole mapping;
+    // `apply_relr` bounds-checks every slot write against it.
+    let entries: &[u64] = unsafe { core::slice::from_raw_parts(relr.as_ptr() as *const u64, n) };
+    let image: &mut [u8] = unsafe {
+        core::slice::from_raw_parts_mut(dso.load_bias as *mut u8, dso.image_len as usize)
+    };
+    if let Err(e) = apply_relr(entries, dso.load_bias, image) {
+        // Surface the specific failure (misaligned slot vs out-of-image) so a
+        // malformed/hostile DSO is easier to diagnose; control flow is unchanged.
+        let msg: &[u8] = match e {
+            ldso_core::reloc::RelocError::MisalignedOffset(_) => {
+                b"ldso: apply_relr failed: misaligned RELR slot offset\n"
+            }
+            ldso_core::reloc::RelocError::OutOfBounds { .. } => {
+                b"ldso: apply_relr failed: RELR slot out of image bounds\n"
+            }
+            _ => b"ldso: apply_relr failed\n",
+        };
+        serial(msg);
+        return Err("apply_relr failed");
+    }
+    Ok(())
+}
+
 /// Walk a `Rela` table at `table` of `count` entries and apply each
 /// relocation against `dso.load_bias`. Symbol resolution routes
 /// through [`sym::lookup`] (Phase 76d.S1.1's unified dispatch) against
@@ -2109,6 +2171,11 @@ pub(crate) unsafe fn apply_relocations_for(
             )?
         };
     }
+    // DT_RELR (.relr.dyn) — the compact relative-relocation table modern
+    // linkers emit instead of DT_RELA. libhello_fini.so's destructor pointer
+    // lives here, so without this a `dlopen`'d DSO's DT_FINI_ARRAY stays
+    // unrelocated and `dlclose` faults at a near-NULL address.
+    unsafe { apply_relr_for_dso(&dso)? };
     Ok(())
 }
 
@@ -2950,6 +3017,11 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
                 return 0;
             }
         }
+        // DT_RELR (.relr.dyn) for this bring-up DSO — see apply_relr_for_dso.
+        if unsafe { apply_relr_for_dso(&dso) }.is_err() {
+            serial(b"ldso: apply_relr on DSO failed\n");
+            return 0;
+        }
     }
 
     // -- Apply relocations against the main binary LAST --------------------
@@ -2994,6 +3066,21 @@ pub unsafe extern "C" fn dl_entry(stack: *const u64) -> u64 {
             serial(b"ldso: apply_rela (main DT_JMPREL) failed: ");
             serial(e.as_bytes());
             serial(b"\n");
+            return 0;
+        }
+    }
+    // DT_RELR (.relr.dyn) against the main binary — the compact relative
+    // relocations a PIE main carries when the linker packs them (see
+    // apply_relr_for_dso).
+    if main_dyn_section.relr.is_some() {
+        let dso_main = LoadedDso {
+            load_bias: main_load_bias,
+            image_len: main_image_len,
+            dyn_: main_dyn_section,
+            tls: dsos.as_slice().first().and_then(|d| d.tls),
+        };
+        if unsafe { apply_relr_for_dso(&dso_main) }.is_err() {
+            serial(b"ldso: apply_relr (main DT_RELR) failed\n");
             return 0;
         }
     }

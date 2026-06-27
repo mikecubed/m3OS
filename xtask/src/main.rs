@@ -390,6 +390,13 @@ const SMOKE_EXIT_RUSTC_SMOKE_FAILED: i32 = 91;
 /// under size-derived ceilings — the regression guard for VFS IPC-call count.
 const SMOKE_EXIT_VFS_THROUGHPUT_FAILED: i32 = 92;
 
+/// Phase 97 — `guest/dlopen-test-smoke` failure exit code. The dlopen step now
+/// fails fast (`WaitPassOrFail`) on the runner's `SMOKE:dlopen-test-smoke:FAIL`
+/// line and on the kernel `process killed` / panic markers, instead of the old
+/// PASS-or-SKIP `WaitEither` that timed out at 120 s when the `dlclose`
+/// destructor faulted (the DT_RELR-relocation bug fixed in this phase).
+const SMOKE_EXIT_DLOPEN_SMOKE_FAILED: i32 = 93;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
     Headless,
@@ -1327,6 +1334,20 @@ fn main() {
                 std::process::exit(1);
             });
             cmd_smp_smoke(&smoke_args);
+        }
+        // Phase 97 Track A.1 — standalone dlopen_test reproduction loop. Boots
+        // m3OS at -smp 4 TCG, logs in, and runs /bin/dlopen_test in a host-driven
+        // loop (M3OS_DLOPEN_ITERS, default 100), FAIL-fasting on the intermittent
+        // destructor `process killed` fault. Used to confirm the cause and to
+        // soak-verify the fix on the original execution path.
+        Some("dlopen-repro") => {
+            let smoke_args =
+                parse_smoke_boot_args("dlopen-repro", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_dlopen_repro(&smoke_args);
         }
         // Phase 90a Track D.3 — Node.js JIT + WASM gate. Boots the JIT
         // `build_node` variant (M3OS_NODE_JIT=1) under PKU (M3OS_KVM=1 on a
@@ -7170,6 +7191,31 @@ fn find_terminated_fail_line(serial: &str, fail_prefixes: &[&str]) -> Option<Str
     None
 }
 
+/// Phase 97 (Track B.3) — kernel-fatal markers scanned on EVERY smoke step's
+/// wait loop (hoisted from `cmd_smp_smoke`'s per-step `fail_prefixes` via
+/// [`global_fatal_line`]). These never appear in a healthy boot, so any always-on
+/// step that hits one fails fast with a NAMED cause instead of collapsing into an
+/// opaque per-step timeout. `process killed` is deliberately **not** here —
+/// legitimate negative tests fork-and-kill children — so it stays in the per-step
+/// `fail_prefixes` where a kill is expected (e.g. the dlopen step).
+const GLOBAL_FATAL_PATTERNS: &[&str] = &[
+    "KERNEL PANIC",
+    "RECURSIVE KERNEL PAGE FAULT",
+    "no waker registered",
+];
+
+/// Return the first [`GLOBAL_FATAL_PATTERNS`] entry that appears in a *complete*
+/// (newline-terminated) line of `serial`, or `None`. Requiring the terminating
+/// newline means a marker split across two serial chunks can't false-trigger
+/// mid-arrival.
+fn global_fatal_line(serial: &str) -> Option<&'static str> {
+    GLOBAL_FATAL_PATTERNS.iter().copied().find(|p| {
+        serial
+            .find(p)
+            .is_some_and(|start| serial[start..].contains('\n'))
+    })
+}
+
 fn strip_background_noise(input: &str) -> String {
     // Kernel log prefixes — always `[LEVEL] [subsystem] message...\n`.
     // Match the second bracket to avoid false positives on userspace text
@@ -7638,6 +7684,17 @@ fn run_smoke_script(
                     // output and preventing a contiguous match.
                     let stripped = strip_ansi(&serial_buf);
                     let cleaned = strip_background_noise(&stripped);
+                    if let Some(fatal) = global_fatal_line(&stripped) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        dump_serial(&serial_history);
+                        let tail = tail_lines(&strip_ansi(&serial_history), 80);
+                        return Err(format!(
+                            "step {} aborted: kernel-fatal marker \"{fatal}\" on serial during: {label}\n\
+                             last serial output:\n{tail}",
+                            step_num
+                        ));
+                    }
                     if find_serial_match(&stripped, &cleaned, pattern).is_some() {
                         // Non-consuming: see `SmokeStep::Wait` doc. We deliberately
                         // do NOT drain through the match, so a later `Wait` for an
@@ -7756,6 +7813,17 @@ fn run_smoke_script(
                     }
                     let stripped = strip_ansi(&serial_buf);
                     let cleaned = strip_background_noise(&stripped);
+                    if let Some(fatal) = global_fatal_line(&stripped) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        dump_serial(&serial_history);
+                        let tail = tail_lines(&strip_ansi(&serial_history), 80);
+                        return Err(format!(
+                            "step {} aborted: kernel-fatal marker \"{fatal}\" on serial during: {label}\n\
+                             last serial output:\n{tail}",
+                            step_num
+                        ));
+                    }
                     if let Some((mode, match_end)) =
                         find_serial_match(&stripped, &cleaned, pattern_a)
                     {
@@ -7838,6 +7906,17 @@ fn run_smoke_script(
                     }
                     let stripped = strip_ansi(&serial_buf);
                     let cleaned = strip_background_noise(&stripped);
+                    if let Some(fatal) = global_fatal_line(&stripped) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        dump_serial(&serial_history);
+                        let tail = tail_lines(&strip_ansi(&serial_history), 80);
+                        return Err(format!(
+                            "step {} aborted: kernel-fatal marker \"{fatal}\" on serial during: {label}\n\
+                             last serial output:\n{tail}",
+                            step_num
+                        ));
+                    }
 
                     // Find the first complete (newline-terminated) line that contains `pattern`.
                     // Iterate with `split_inclusive('\n')` and a running byte cursor so the
@@ -7965,6 +8044,17 @@ fn run_smoke_script(
                     }
                     let stripped = strip_ansi(&serial_buf);
                     let cleaned = strip_background_noise(&stripped);
+                    if let Some(fatal) = global_fatal_line(&stripped) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        dump_serial(&serial_history);
+                        let tail = tail_lines(&strip_ansi(&serial_history), 80);
+                        return Err(format!(
+                            "step {} aborted: kernel-fatal marker \"{fatal}\" on serial during: {label}\n\
+                             last serial output:\n{tail}",
+                            step_num
+                        ));
+                    }
 
                     // Check pass first, then fail.
                     if let Some((mode, match_end)) =
@@ -8362,20 +8452,32 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     // dlclose / dlerror through `dlopen_test` and asserts that
     // DT_FINI_ARRAY destructors fire in the right serial order
     // between the test's FINI_PENDING and PASS bracket sentinels.
-    steps.push(SmokeStep::WaitEither {
-        pattern_a: "SMOKE:dlopen-test-smoke:PASS",
-        pattern_b: "SMOKE:dlopen-test-smoke:SKIP",
-        // The test dlopen()s a `.so` and runs its DT_FINI_ARRAY destructors over
-        // the slow ring-3 VFS; on a loaded TCG host (after several builds/QEMU
-        // runs) the PASS sentinel reliably lands but exceeds the original 30 s
-        // window, falsely timing out the pre-push gate. The test emits PASS/SKIP
-        // regardless, so widening the wait only adds headroom for slow hosts
-        // (KVM still completes in seconds); a real failure emits FAIL or never
-        // PASSes and still trips this step.
+    //
+    // Phase 97 — honest gate. The old `WaitEither{PASS, SKIP}` had NO FAIL
+    // pattern, so when the `dlclose` destructor faulted (the DT_RELR-relocation
+    // bug — an unrelocated `DT_FINI_ARRAY` pointer → near-NULL `INSTRUCTION_FETCH`
+    // → `process killed`) the runner's `SMOKE:dlopen-test-smoke:FAIL` was ignored
+    // and the step timed out at 120 s, masquerading as a "stall". `WaitPassOrFail`
+    // matches the runner's FAIL verdict and the kernel fault/panic markers, so a
+    // regression FAILS FAST with a named cause instead of an opaque timeout.
+    // `dlopen_test` is always ramdisk-embedded (the build enforces it, see the
+    // placeholder-rejection checks earlier in this file), so the old SKIP arm was
+    // unreachable in the always-on gate and is dropped.
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "SMOKE:dlopen-test-smoke:PASS",
+        // Only the dlopen-specific failure signatures. The shared kernel-fatal
+        // markers (`KERNEL PANIC` / `RECURSIVE KERNEL PAGE FAULT` /
+        // `no waker registered`) are caught earlier by `global_fatal_line()` in
+        // every wait arm, so listing them here too would be dead (and would
+        // misrepresent the exit path — a panic aborts via the global check, not
+        // `exit_code_on_fail`).
+        fail_prefixes: &["SMOKE:dlopen-test-smoke:FAIL", "process killed"],
+        // Generous headroom for a slow/loaded TCG host (KVM completes in seconds);
+        // a real failure now trips a fail-prefix immediately rather than waiting
+        // out the window.
         timeout_secs: 120,
         label: "guest/dlopen-test-smoke: libdl runtime + DT_FINI_ARRAY destructors",
-        extra_steps_a: &[],
-        extra_steps_b: &[],
+        exit_code_on_fail: SMOKE_EXIT_DLOPEN_SMOKE_FAILED,
     });
     steps.push(SmokeStep::Wait {
         pattern: "SMOKE:PASS",
@@ -18474,6 +18576,144 @@ fn cmd_smp_smoke(args: &SmokeBootArgs) {
             let _ = child.wait();
             eprintln!("smp-smoke: FAILED\n{msg}");
             std::process::exit(SMOKE_EXIT_SMP_SMOKE_FAILED);
+        }
+    }
+}
+
+/// Phase 97 Track A.1 — standalone `dlopen_test` reproduction loop.
+///
+/// Boots m3OS at the smoke default `-smp 4` TCG, logs in, then runs
+/// `/bin/dlopen_test` in a host-driven loop, asserting `DLOPEN_TEST:PASS` each
+/// iteration and FAIL-fasting on the intermittent destructor fault (the
+/// `dlclose` → `run_destructors_for` path calling an unrelocated
+/// `DT_FINI_ARRAY` pointer, observed as a near-NULL `INSTRUCTION_FETCH` page
+/// fault → `process killed`). Unlike the gate's `WaitEither` (PASS-or-SKIP, no
+/// FAIL), every iteration matches the `DLOPEN_TEST:PASS` sentinel **directly on
+/// serial** (standalone `dlopen_test` writes to fd 1 = the shell TTY, not the
+/// gate's tmpfs capture file), so a fault is named and stops at the FIRST
+/// reproduction with the full serial captured via `M3OS_SMOKE_SERIAL_DUMP`.
+///
+/// Iteration count via `M3OS_DLOPEN_ITERS` (default 100). Keeps `-smp 4` by
+/// default (override with `M3OS_SMP`) to preserve the multi-core window the
+/// flake needs; `M3OS_DLOPEN_FAST_ITER` reuses an existing data disk.
+fn cmd_dlopen_repro(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    let fast_iter = std::env::var("M3OS_DLOPEN_FAST_ITER").is_ok();
+    if fast_iter && disk_img.exists() {
+        println!("dlopen-repro: M3OS_DLOPEN_FAST_ITER — reusing existing disk");
+    } else {
+        if disk_img.exists() {
+            let _ = fs::remove_file(&disk_img);
+        }
+        create_data_disk(
+            uefi_image.parent().unwrap(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false, // graphical_login — serial autologin path
+        );
+    }
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let kvm = std::env::var_os("M3OS_KVM").is_some_and(|v| v != "0" && !v.is_empty());
+    let mut qemu_args = qemu_args_with_devices(
+        &uefi_image,
+        &ovmf,
+        display_mode,
+        DeviceSet {
+            kvm,
+            ..DeviceSet::default()
+        },
+    );
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    // Default `-smp 4` (the smoke default + the flake's native habitat). A value
+    // < 1 is ignored; M3OS_SMP=1 is allowed here as the single-core discriminator
+    // (Track A.6 — a cross-core cause must vanish single-core).
+    let cores = std::env::var("M3OS_SMP")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(4);
+    for i in 0..qemu_args.len() {
+        if qemu_args[i] == "-smp" && i + 1 < qemu_args.len() {
+            qemu_args[i + 1] = cores.to_string();
+        }
+    }
+
+    let iters: usize = std::env::var("M3OS_DLOPEN_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(100);
+
+    let mut steps = boot_and_login_steps();
+    for _ in 0..iters {
+        steps.push(SmokeStep::Send {
+            input: "/bin/dlopen_test\n",
+            label: "dlopen-repro: run /bin/dlopen_test",
+        });
+        steps.push(SmokeStep::WaitPassOrFail {
+            pass_pattern: "DLOPEN_TEST:PASS",
+            // Just the destructor-fault signature + an explicit FAIL. The shared
+            // kernel-fatal markers are caught first by `global_fatal_line()` in
+            // every wait arm, so they would be dead duplicates here.
+            fail_prefixes: &["process killed", "DLOPEN_TEST:FAIL"],
+            timeout_secs: 20,
+            label: "dlopen-repro: dlopen_test PASS or destructor fault",
+            exit_code_on_fail: 1,
+        });
+    }
+
+    println!(
+        "dlopen-repro: launching QEMU (-smp {cores}, {}, {iters} iteration(s))",
+        if kvm { "KVM" } else { "TCG" }
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("dlopen-repro: failed to launch QEMU");
+
+    // Ceiling generous enough for the boot + every iteration even on a slow,
+    // oversubscribed TCG host; the per-step 20s window is the real gate.
+    let global_timeout =
+        std::time::Duration::from_secs(args.timeout_secs.max(iters as u64 * 25 + 120));
+    let start = std::time::Instant::now();
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            println!(
+                "dlopen-repro: ALL {iters} ITERATION(S) PASSED in {}s (-smp {cores}) — no fault reproduced",
+                start.elapsed().as_secs()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!(
+                "dlopen-repro: REPRODUCED / FAILED after {}s\n{msg}",
+                start.elapsed().as_secs()
+            );
+            std::process::exit(1);
         }
     }
 }

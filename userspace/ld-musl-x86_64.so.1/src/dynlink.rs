@@ -12,8 +12,9 @@
 use crate::elf64::{
     DT_FINI, DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_GNU_HASH, DT_HASH, DT_INIT, DT_INIT_ARRAY,
     DT_INIT_ARRAYSZ, DT_JMPREL, DT_NEEDED, DT_NULL, DT_PLTGOT, DT_PLTREL, DT_PLTRELSZ, DT_RELA,
-    DT_RELAENT, DT_RELASZ, DT_RPATH, DT_RUNPATH, DT_SONAME, DT_STRSZ, DT_STRTAB, DT_SYMENT,
-    DT_SYMTAB, DT_VERDEF, DT_VERDEFNUM, DT_VERNEED, DT_VERNEEDNUM, DT_VERSYM, Dyn, Sym,
+    DT_RELAENT, DT_RELASZ, DT_RELR, DT_RELRSZ, DT_RPATH, DT_RUNPATH, DT_SONAME, DT_STRSZ,
+    DT_STRTAB, DT_SYMENT, DT_SYMTAB, DT_VERDEF, DT_VERDEFNUM, DT_VERNEED, DT_VERNEEDNUM, DT_VERSYM,
+    Dyn, Sym,
 };
 use core::ptr::NonNull;
 
@@ -41,6 +42,14 @@ pub struct DynamicSection {
     pub relasz: u64,
     /// `DT_RELAENT` — size of one `Rela` entry (must be 24).
     pub relaent: u64,
+    /// `DT_RELR` — address of the compact relative-relocation (`.relr.dyn`)
+    /// table. Modern linkers emit `R_X86_64_RELATIVE` runs here instead of in
+    /// `DT_RELA`; a loader that ignores it leaves those slots unrelocated
+    /// (e.g. `libhello_fini.so`'s `DT_FINI_ARRAY` destructor pointer). Applied
+    /// by `crate::reloc::apply_relr`.
+    pub relr: Option<NonNull<u8>>,
+    /// `DT_RELRSZ` — total size in bytes of the `DT_RELR` table.
+    pub relrsz: u64,
     /// `DT_JMPREL` — address of the PLT relocation table.
     pub jmprel: Option<NonNull<u8>>,
     /// `DT_PLTRELSZ` — size in bytes of the PLT relocation table.
@@ -119,6 +128,8 @@ impl DynamicSection {
             rela: None,
             relasz: 0,
             relaent: 0,
+            relr: None,
+            relrsz: 0,
             jmprel: None,
             pltrelsz: 0,
             pltrel: 0,
@@ -181,6 +192,12 @@ impl DynamicSection {
                 }
                 DT_RELASZ => out.relasz = entry.d_val,
                 DT_RELAENT => out.relaent = entry.d_val,
+                // Compact relative relocations (`.relr.dyn`). DT_RELRENT is
+                // always 8 (one u64 per entry) so it is not stored.
+                DT_RELR => {
+                    out.relr = NonNull::new((entry.d_val.wrapping_add(load_bias)) as *mut u8);
+                }
+                DT_RELRSZ => out.relrsz = entry.d_val,
                 DT_STRSZ => out.strsz = entry.d_val,
                 DT_SYMENT => out.syment = entry.d_val,
                 DT_INIT => {

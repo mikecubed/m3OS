@@ -1,18 +1,67 @@
 # Phase 97 — `dlopen-test-smoke` Intermittent TCG Stall: Task List
 
-**Status:** In Progress
+**Status:** Complete (landed in PR #268; kernel `v0.97.0`)
 **Source Ref:** phase-97
 **Depends on:** Phase 95b ✅ (`MAP_LAZY_FILE` demand-paged loader + blocking page-fault→`vfs_server` read), the SMP TLB-shootdown / lost-wakeup hardening ✅ (`docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md`)
 **Goal:** Get observability on the intermittent `smoke-test` step-26 (`dlopen-test-smoke`) failure, **confirm** the real cause (the handoff's blocking-`vfs` lost-wakeup hypothesis is falsified at the artifact level — all DSOs are ramdisk-embedded/synchronous; the leading surviving suspect is the cross-core TLB shootdown `dlclose`'s `munmap` runs twice on the `FINI`→`PASS` path under `-smp 4` TCG oversubscription), land only the confirmed fix plus a couple of always-safe hardenings, and replace the observability-blind PASS-or-SKIP gate with a falsifiable, CI-deterministic one.
+
+## Outcome (2026-06-27)
+
+**Confirmed root cause: the `ld-musl` loader had no `DT_RELR` support.**
+`libhello_fini.so`'s only relocation (its `DT_FINI_ARRAY` destructor pointer) is
+`DT_RELR`-encoded (`RELASZ: 0`, `RELR: 0x1070`), so the destructor pointer was
+never relocated → `dlclose` → `run_destructors_for` jumped to the unrelocated
+in-file vaddr `0x2a0` → near-NULL `INSTRUCTION_FETCH` → `process killed`. The
+"intermittent TCG stall" framing in the design doc's hypotheses is **refuted**:
+both the blocking-`vfs` and the cross-core TLB-shootdown hypotheses produced
+**zero** corroborating evidence (no `[tlb]` lines), and the failure is a
+*toolchain-dependent deterministic* fault (modern linkers emit `.relr.dyn`,
+older emit `.rela.dyn` which the loader already handled) that *looked* like a
+stall only because the gate had no FAIL pattern. See the design doc's
+**Investigation Findings** for the full verdict.
+
+**Fix:** `DT_RELR` decode (`reloc::apply_relr`, host-tested) wired into the `Dyn`
+parser and all three relocation sites; the `dlopen-test-smoke` gate switched to
+`WaitPassOrFail` (real FAIL pattern) and the kernel-fatal scan was hoisted into
+every `run_smoke_script` wait arm.
+
+### Per-task resolution
+
+The tasks below were written under the (now refuted) shootdown/`vfs` hypotheses,
+so several are **N/A**. The original task text is kept verbatim as the planning
+record; this list is the authoritative status.
+
+| Task | Status | Notes |
+|---|---|---|
+| **A.1** repro harness | ✅ Done | `cargo xtask dlopen-repro` (`-smp 4` default, `M3OS_DLOPEN_ITERS`); classifies PASS vs the destructor fault by fail-fast rather than a 3-way bucket (unnecessary once the fault was identified as deterministic). Counts recorded in the design doc. |
+| **A.2** base-rate ≥200× | ⛔ N/A | The bug is *deterministic* (DT_RELR ignored → 100 % fault under load on any RELR-emitting linker), not probabilistic — there is no rate to measure. Reproduced 100 % on iteration 1 every run (and on 2 consecutive baseline-smoke attempts). |
+| **A.3** backend Ramdisk-vs-VfsService log | ⛔ N/A | Confirmed at the code level (`kernel_read_fd_at` `FdBackend::Ramdisk` is a synchronous memcpy); a runtime log was moot once the cause was pinned to a userspace relocation bug, not the demand-fill backend. |
+| **A.4** shootdown instrumentation | ⛔ N/A | Shootdown refuted: the reproduced dump had **zero** `[tlb]` lines (the always-on `wait_for_shootdown_acks` degrade/ack-timeout logging would have printed them). No debug-gated instrumentation needed. |
+| **A.5** watchdog / deadlock-guard verdict | ✅ Done | Dump grepped: `no waker registered` = 0, `[deadlock-guard]` = 0 (budget not exhausted); the one `[stallcensus]` line was a benign timed-sleep daemon. Recorded — consistent with a userspace fault, not a wedge. |
+| **A.6** `-smp 1` vs `-smp 4` | ⛔ N/A | The confirmed cause (DT_RELR, a userspace relocation bug) is core-count-independent, so the cross-core discriminator is moot. The repro harness supports `M3OS_SMP=1` if ever needed. |
+| **B.1** verdict | ✅ Done | Written in the design doc's Investigation Findings: shootdown + `vfs` **excluded** (no evidence); DT_RELR **confirmed** with `readelf` + the reproduced dump. |
+| **B.2** minimal fix | ✅ Done | The fix is DT_RELR loader support (not the speculated shootdown fix). `cargo xtask check` + `smoke-test` + `test` + `regression` all green. |
+| **B.3** global fatal-pattern hoist | ✅ Done | `global_fatal_line` (`KERNEL PANIC` / `RECURSIVE KERNEL PAGE FAULT` / `no waker registered`) checked in every `run_smoke_script` wait arm; `process killed` stays per-step (negative tests fork-and-kill). |
+| **B.4** lazy-file / `vfs` hardenings | ⛔ N/A | Targeted the refuted lazy-file/`vfs` hypotheses; the real bug is a userspace reloc miss, so adding speculative kernel hardenings would violate "minimal confirmed fix". Noted in the design doc's Deferred Until Later. |
+| **B.5** record kernel demand-read deferral | ✅ Done | Recorded in the design doc's Deferred Until Later (and B.4 noted unnecessary). |
+| **C.1** FAIL pattern + ordering | ✅ Done (lighter form) | Gate → `WaitPassOrFail` on the runner's existing `SMOKE:dlopen-test-smoke:FAIL` verdict; the `FINI_PENDING < RAN < PASS` ordering assert is preserved guest-side in `run_command_expect_dlopen_order` (unchanged), so no `smoke-runner` serial-direct rewrite was needed. The real (pre-fix) bug *did* make the runner emit FAIL, which the new gate catches fast. |
+| **C.2** COM1-RX guard | ⛔ N/A | The chosen (lighter) gate does not host-inject the dlopen command — the `smoke-runner` forks/execs it internally — so there is no injected command to RX-guard. |
+| **C.3** TCG posture | ✅ Done | Decided **always-on under TCG** (no KVM-gate): the cause is a deterministic DT_RELR miss, not an irreducible TCG-latency tail, so the fix is binary. Recorded in the design doc. |
+| **C.4** controlled-load soak | ✅ Done (deterministic-bug form) | The "20/20" target was framed for a probabilistic flake; the cause is deterministic, so a single green full `smoke-test` on the **original** `fork`+`dup2(capture)`+`waitpid` path + the 232-iter `dlopen-repro` soak + the host-tested decoder are conclusive. Bug shown reproduced (pre-fix baseline smoke, original path) then fixed (post-fix smoke, original path). |
+| **D.1** docs | ✅ Done | Design + task docs authored and kept current. |
+| **D.2** README row | ✅ Done | Repointed to the phase docs; status updated. |
+| **D.3** version bump | ✅ Done | `AGENTS.md` kernel `v0.96.0` → `v0.97.0`. |
+| **D.4** handoff cross-link | ✅ Done | The 2026-06-26 handoff points forward to the phase docs and flags its hypothesis as falsified; Phase 98's audit folding-in is a forward reference (out of this phase's scope). |
+| **D.5** learning doc | ✅ Done | `docs/97-dlopen-smoke-tcg-stall.md` authored to the learning-doc template; README row links it. (This task was missing from the original Track D and added here.) |
 
 ## Track Layout
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Observability & reproduction (standalone repro, base-rate, backend + shootdown + watchdog instrumentation, `-smp 1` discriminator) | — | Planned |
-| B | Root-cause fix keyed to Area A's confirmed cause + always-safe hardenings | A | Planned |
-| C | Honest, CI-deterministic regression gate (serial-direct + FAIL pattern + COM1-RX guard + soak) | A, B | Planned |
-| D | Docs & version bump | — | In Progress |
+| A | Observability & reproduction (standalone repro, instrumentation, discriminators) | — | Done (repro built; `readelf` + serial dump confirmed the `DT_RELR` cause; shootdown/`vfs` instrumentation N/A) |
+| B | Root-cause fix + honest-gate fail-fast | A | Done (`DT_RELR` loader support; gate FAIL pattern. Shootdown fix B.2 / lazy-file hardenings B.4 N/A — refuted) |
+| C | Honest, CI-deterministic regression gate (FAIL pattern + soak) | A, B | Done (dlopen step → `WaitPassOrFail`; soaked via `dlopen-repro`) |
+| D | Docs & version bump | — | Done (findings recorded; kernel `v0.96.0`→`v0.97.0`) |
 
 ---
 
@@ -245,11 +294,27 @@
 - [x] The 2026-06-26 handoff is annotated to point at the Phase 97 design doc and note its leading hypothesis was falsified.
 - [ ] Phase 97 remains a standalone phase; Phase 98's audit folds in its deferred items.
 
+### D.5 — Author the Phase 97 learning doc
+
+**File:** `docs/97-dlopen-smoke-tcg-stall.md`
+
+**Symbol:** n/a (documentation)
+**Why it matters:** Every recent phase ships a `docs/NN-*.md` learning doc (90a–96), and a debugging phase's teaching value (observability-first falsification, the `DT_RELR` relocation format, why "intermittent" lied, honest-CI verdicts) is exactly the transferable lesson worth a standalone doc.
+
+**Acceptance:**
+- [x] `docs/97-dlopen-smoke-tcg-stall.md` exists, conforms to the learning-doc template (Overview / What This Doc Covers / Core Implementation / Key Files / How This Phase Differs / Related Roadmap Docs / Deferred), and teaches the `DT_RELR` root cause, the falsification of the SMP-race hypotheses, and the honest-gate change.
+- [x] The roadmap README Phase 97 row links the learning doc.
+
 ---
 
 ## Documentation Notes
 
 - The handoff (`docs/handoffs/2026-06-26-dlopen-smoke-tcg-stall.md`) named the blocking-`vfs_server` demand-read lost-wakeup as the leading hypothesis; Phase 97 **falsifies** it for this gate at the artifact level (`readelf` — all `dlopen_test` DSOs are ramdisk-embedded → synchronous in-kernel memcpy via `kernel_read_fd_at`'s `FdBackend::Ramdisk` arm, no `call_msg`, no parking). Do not re-chase the `vfs`/IPC-reply path for `dlopen-test-smoke`.
-- The leading **surviving** hypothesis is the cross-core TLB shootdown that `dlclose`'s `munmap` runs twice on the `FINI`→`PASS` path (`unmap_dso` → `sys_munmap` → `sys_linux_munmap` → `tlb_shootdown_range`), under `-smp 4` TCG host oversubscription — verified to exist (`dl.rs:670`, `mod.rs:12820/13006`, `tlb.rs:130/313`); it survives the `readelf` falsification, is SMP-TCG-specific, and can explain both the slow-PASS and no-output manifestations with one mechanism. It must still be **confirmed** by Track A instrumentation before B.2 patches it.
+- **The cross-core TLB-shootdown hypothesis (below) was ALSO refuted** — see the
+  design doc's Investigation Findings and the Outcome section above. The
+  *confirmed* root cause is the loader's missing `DT_RELR` support, not any
+  shootdown/`vfs`/lazy-file mechanism. The original note is kept (struck through
+  in spirit) only as a record of the planning hypothesis:
+  - ~~The leading **surviving** hypothesis is the cross-core TLB shootdown that `dlclose`'s `munmap` runs twice on the `FINI`→`PASS` path... under `-smp 4` TCG host oversubscription.~~ The reproduced serial dump contains **zero** `[tlb]` lines, so the shootdown never fired; the failure is a userspace near-NULL `INSTRUCTION_FETCH` from an unrelocated `DT_RELR`-encoded `DT_FINI_ARRAY` destructor pointer.
 - Observability (Track A) is sequenced **before** any kernel fix (Track B) deliberately: the current gate is PASS-or-SKIP with the child's output `dup2`'d to an unlinked tmpfs file and matched serial consumed, so slow / stalled / faulted are indistinguishable today.
 - Per the AGENTS.md policy, the kernel version bump (D.3) lands with the implementation, not this planning-docs PR.

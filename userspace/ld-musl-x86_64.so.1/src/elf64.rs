@@ -188,3 +188,16 @@ pub const fn r_sym(r_info: u64) -> u32 {
 
 pub const DT_REL: i64 = 17;
 pub const DT_RELA_TYPE: i64 = 7; // `Rela`; matches `DT_RELA`'s d_tag value
+
+// ---------------------------------------------------------------------------
+// `DT_RELR` — compact relative-relocation table (the `.relr.dyn` section).
+// Modern linkers (lld, recent binutils with `-z pack-relative-relocs`) emit
+// every `R_X86_64_RELATIVE` here instead of `DT_RELA` to shrink the relocation
+// table. Each `DT_RELRENT`-sized (8) entry is either an address word (LSB=0)
+// or a bitmap word (LSB=1) per the SysV RELR encoding; the apply loop lives in
+// `crate::reloc::apply_relr`.
+// ---------------------------------------------------------------------------
+
+pub const DT_RELRSZ: i64 = 35;
+pub const DT_RELR: i64 = 36;
+pub const DT_RELRENT: i64 = 37;
