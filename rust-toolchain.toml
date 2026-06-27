@@ -1,5 +1,12 @@
 [toolchain]
-channel = "nightly"
+# Pinned to a dated nightly (was the floating `nightly` channel). The floating
+# channel advanced mid-PR and newer clippy promoted `chunks_exact_to_as_chunks`
+# then `needless_late_init` to default-warn, failing `cargo xtask check`
+# (`-D warnings`) on pre-existing code that passed on the prior nightly — pure CI
+# toolchain drift, not a code defect. Pinning freezes the lint set so CI matches
+# the local toolchain and builds are reproducible. Bump deliberately, fixing any
+# newly-surfaced lints in the same change.
+channel = "nightly-2026-04-13"
 components = ["rustfmt", "clippy", "rust-src"]
 # Phase 94 — the Rust-cargo musl port class (`build_uutils`) cross-compiles std
 # Rust for `x86_64-unknown-linux-musl`. Unlike the bare-metal `x86_64-unknown-none`
