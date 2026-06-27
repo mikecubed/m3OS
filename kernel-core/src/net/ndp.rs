@@ -231,10 +231,12 @@ pub fn parse_router_advertisement(icmpv6_msg: &[u8]) -> Option<RouterAdvertiseme
     parse_ndp_options(&body[8..], |opt| match opt {
         NdpOption::PrefixInfo(pi) => prefix = Some(pi),
         NdpOption::Rdnss(addrs) => {
-            for chunk in addrs.chunks_exact(16) {
-                let mut a = [0u8; 16];
-                a.copy_from_slice(chunk);
-                rdnss.push(a);
+            // `as_chunks::<16>()` (satisfies clippy::chunks_exact_to_as_chunks,
+            // added in a newer floating-nightly clippy) yields `&[u8; 16]`
+            // directly — no intermediate `copy_from_slice`. `.0` drops the
+            // trailing partial chunk, exactly as `chunks_exact` did.
+            for chunk in addrs.as_chunks::<16>().0 {
+                rdnss.push(*chunk);
             }
         }
         NdpOption::SourceLlAddr(mac) => src_lladdr = Some(mac),
