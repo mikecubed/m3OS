@@ -22,6 +22,63 @@ Two facts make this its own phase rather than a one-line patch:
 
 Phase 97 exists to (1) **get observability**, (2) **confirm** the cause, (3) **fix** what is confirmed (plus a couple of always-safe hardenings), and (4) **replace** the blind gate with a falsifiable one.
 
+## Investigation Findings (running log)
+
+> This section is the live verdict (Task B.1). It supersedes the *leading
+> surviving hypothesis* (the cross-core `dlclose` `munmap` TLB shootdown) stated
+> elsewhere in this doc — **that hypothesis is also refuted by the reproduction
+> below.** The cause is a userspace fault in the destructor pipeline, not a
+> shootdown wedge.
+
+**Reproduced (2026-06-27).** A baseline `M3OS_SMOKE_SERIAL_DUMP=… cargo xtask
+smoke-test` under moderate host load timed out at step 26 on two consecutive
+attempts. The captured serial dump is decisive:
+
+1. **The TLB-shootdown hypothesis is refuted.** The stall dump contains **zero**
+   `[tlb]` lines — no `tlb_shootdown_range` ack-timeout, no `DEGRADED`, no
+   `ack stuck`, no re-NMI. The `dlclose` munmaps did **not** broadcast a
+   degrading cross-core shootdown. (Consistent with `active_cores` being
+   correctly deactivated on switch-away — a single-threaded child takes the
+   `remote_mask == 0` local-only fast path in `tlb_shootdown_range`.)
+
+2. **The real failure is a userspace near-NULL instruction-fetch fault in the
+   destructor pipeline.** The dump shows:
+   - `SMOKE:dlopen-test-smoke:BEGIN` → child `pid=73` ELF mapped, `PT_INTERP`
+     set.
+   - `[int] userspace page fault: pid=73 addr=0x2a0 err=USER_MODE|INSTRUCTION_FETCH rip=0x2a0 … process killed`
+     — the child **jumped to `0x2a0`**, a never-mapped low address, and was
+     killed by the fault handler.
+   - `SMOKE:dlopen-test-smoke:FAIL dlopen_test did not exit normally` — the
+     runner **did** emit FAIL, with the captured child output ending at
+     `DLOPEN_TEST:FINI_PENDING` (printed immediately before `dlclose(hf)`),
+     never reaching `LIBHELLO_FINI:RAN` / `PASS`.
+   - A second attempt faulted identically at `rip=0x0` (`pid=72`).
+
+3. **Mechanism: an unrelocated `DT_FINI_ARRAY` destructor pointer.** `0x2a0` is
+   the **pristine file value** of a `DT_FINI_ARRAY` slot — the raw
+   `R_X86_64_RELATIVE` addend with `load_bias` **not** added.
+   `dlclose` → `runtime::run_destructors_for` (`ld-musl-x86_64.so.1/src/main.rs:2038`)
+   reads `fini_array[i]` and calls it raw (assuming it is pre-relocated); the
+   slot intermittently holds the unrelocated value, so the call jumps to the
+   bare addend and instruction-fetch-faults. The DSO data segment carrying
+   `DT_FINI_ARRAY` is mapped `MAP_PRIVATE | MAP_FIXED | MAP_LAZY_FILE`
+   (demand-paged from the file); the relocation write the loader applied is
+   intermittently **lost / the page reverts to pristine** under `-smp 4` TCG.
+
+4. **Two distinct defects, both in scope:**
+   - **(B)** the kernel/loader bug that intermittently loses the relocation on a
+     `MAP_LAZY_FILE` page (the root cause of the fault — confirmed cause under
+     investigation in Track B);
+   - **(C)** the gate has **no FAIL pattern**, so the runner's already-emitted
+     `SMOKE:dlopen-test-smoke:FAIL` is ignored and the `WaitEither` times out at
+     120 s instead of failing fast and naming the cause.
+
+**Repro tooling (Task A.1).** `cargo xtask dlopen-repro` boots `-smp 4` TCG, logs
+in, and runs `/bin/dlopen_test` in a host-driven loop (`M3OS_DLOPEN_ITERS`,
+default 100), matching `DLOPEN_TEST:PASS` directly on serial and FAIL-fasting on
+`process killed`. This reproduces the destructor fault on the original
+execution path and is the soak harness for the fix (Task C.4).
+
 ## Learning Goals
 
 - The real cost of a **cross-core TLB shootdown** on an *oversubscribed* TCG host, and why it amplifies into both a latency tail and a hard stall.
