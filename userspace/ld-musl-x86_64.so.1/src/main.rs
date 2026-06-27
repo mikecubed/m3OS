@@ -1461,8 +1461,19 @@ unsafe fn apply_relr_for_dso(dso: &LoadedDso) -> Result<(), &'static str> {
     let image: &mut [u8] = unsafe {
         core::slice::from_raw_parts_mut(dso.load_bias as *mut u8, dso.image_len as usize)
     };
-    if apply_relr(entries, dso.load_bias, image).is_err() {
-        serial(b"ldso: apply_relr failed\n");
+    if let Err(e) = apply_relr(entries, dso.load_bias, image) {
+        // Surface the specific failure (misaligned slot vs out-of-image) so a
+        // malformed/hostile DSO is easier to diagnose; control flow is unchanged.
+        let msg: &[u8] = match e {
+            ldso_core::reloc::RelocError::MisalignedOffset(_) => {
+                b"ldso: apply_relr failed: misaligned RELR slot offset\n"
+            }
+            ldso_core::reloc::RelocError::OutOfBounds { .. } => {
+                b"ldso: apply_relr failed: RELR slot out of image bounds\n"
+            }
+            _ => b"ldso: apply_relr failed\n",
+        };
+        serial(msg);
         return Err("apply_relr failed");
     }
     Ok(())

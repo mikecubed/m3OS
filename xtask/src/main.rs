@@ -8465,13 +8465,13 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     // unreachable in the always-on gate and is dropped.
     steps.push(SmokeStep::WaitPassOrFail {
         pass_pattern: "SMOKE:dlopen-test-smoke:PASS",
-        fail_prefixes: &[
-            "SMOKE:dlopen-test-smoke:FAIL",
-            "process killed",
-            "KERNEL PANIC",
-            "RECURSIVE KERNEL PAGE FAULT",
-            "no waker registered",
-        ],
+        // Only the dlopen-specific failure signatures. The shared kernel-fatal
+        // markers (`KERNEL PANIC` / `RECURSIVE KERNEL PAGE FAULT` /
+        // `no waker registered`) are caught earlier by `global_fatal_line()` in
+        // every wait arm, so listing them here too would be dead (and would
+        // misrepresent the exit path — a panic aborts via the global check, not
+        // `exit_code_on_fail`).
+        fail_prefixes: &["SMOKE:dlopen-test-smoke:FAIL", "process killed"],
         // Generous headroom for a slow/loaded TCG host (KVM completes in seconds);
         // a real failure now trips a fail-prefix immediately rather than waiting
         // out the window.
@@ -18669,13 +18669,10 @@ fn cmd_dlopen_repro(args: &SmokeBootArgs) {
         });
         steps.push(SmokeStep::WaitPassOrFail {
             pass_pattern: "DLOPEN_TEST:PASS",
-            fail_prefixes: &[
-                "process killed",
-                "DLOPEN_TEST:FAIL",
-                "KERNEL PANIC",
-                "RECURSIVE KERNEL PAGE FAULT",
-                "no waker registered",
-            ],
+            // Just the destructor-fault signature + an explicit FAIL. The shared
+            // kernel-fatal markers are caught first by `global_fatal_line()` in
+            // every wait arm, so they would be dead duplicates here.
+            fail_prefixes: &["process killed", "DLOPEN_TEST:FAIL"],
             timeout_secs: 20,
             label: "dlopen-repro: dlopen_test PASS or destructor fault",
             exit_code_on_fail: 1,
