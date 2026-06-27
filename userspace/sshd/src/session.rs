@@ -89,8 +89,9 @@ fn log_sshd_step_i64(step: &str, value_name: &str, value: i64) {
 
 fn log_sshd_loop_counter(step: &str, count: u64) {
     // Bare-metal performance: `STDOUT_FILENO` is the kernel console, which on
-    // real hardware is an UNCACHED framebuffer — each line costs ~hundreds of ms
-    // (per-pixel uncached writes + a full-screen scroll blit). These counters
+    // real hardware is a write-combined framebuffer — each line still costs
+    // ~hundreds of ms (per-pixel framebuffer writes + a full-screen scroll blit;
+    // write-combining is far slower than cached RAM). These counters
     // sit on the sshd event-loop HOT PATH (io_task wakes, progress_task events),
     // so logging them periodically throttled the whole SSH session to the
     // framebuffer's write speed — observed as the screen flooding with `count=`

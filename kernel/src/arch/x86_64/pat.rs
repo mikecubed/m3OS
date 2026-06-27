@@ -73,10 +73,12 @@ pub unsafe fn set_range_write_combining(virt_base: usize, size: usize) -> usize 
     let end = virt_base.saturating_add(size);
     let mut addr = virt_base & !0xFFF;
     let mut updated = 0usize;
-    // Bound the walk (16 MiB at 4 KiB granularity) so a bad size can't spin.
-    const MAX_ITERS: usize = 8192;
+    // Bound the walk to the range's own 4 KiB-page count (+slack) so a bad size
+    // can't spin, while never truncating a large (e.g. 4K/8K) framebuffer the way
+    // a fixed cap would — `kernel_main` passes the real framebuffer `byte_len`.
+    let max_iters = (size >> 12) + 16;
     let mut iters = 0;
-    while addr < end && iters < MAX_ITERS {
+    while addr < end && iters < max_iters {
         iters += 1;
         let vaddr = VirtAddr::new(addr as u64);
         match mapper.translate(vaddr) {

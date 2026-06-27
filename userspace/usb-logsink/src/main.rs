@@ -4,7 +4,7 @@
 //! On the Phase 96 Tiger Lake laptop there is no serial port and the
 //! framebuffer scrolls, so the kernel/driver log (`[mm]`/`[net]`/`ure:`/xHCI …)
 //! is effectively unreadable live. The kernel already mirrors every `log::*`
-//! line into a 64 KiB dmesg ring exposed at `/proc/kmsg`; this daemon mounts the
+//! line into a bounded (256 KiB) dmesg ring exposed at `/proc/kmsg`; this daemon mounts the
 //! USB log volume and snapshots that ring to `/mnt/usb0/boot.log` periodically,
 //! so the user can pull the stick, mount the ext2 partition on their host, and
 //! read the whole boot.
@@ -64,9 +64,10 @@ const LOG_PATH: &[u8] = b"/mnt/usb0/boot.log\0";
 const KMSG_PATH: &[u8] = b"/proc/kmsg\0";
 
 /// Snapshot the full `/proc/kmsg` ring into `/mnt/usb0/boot.log` (overwrite, so
-/// the file always holds the latest complete snapshot — the ring is bounded at
-/// 64 KiB, so this never grows without limit). Returns the byte count written,
-/// or a negative value on failure.
+/// the file always holds the latest complete snapshot — the ring is bounded
+/// (256 KiB), so this never grows without limit). Returns the byte count
+/// written, or a negative value on failure (open, read, or write error). A
+/// truncated snapshot is reported as a failure, never as a short success.
 fn snapshot_kmsg(buf: &mut [u8]) -> isize {
     let kfd = open(KMSG_PATH, O_RDONLY, 0);
     if kfd < 0 {
@@ -78,10 +79,18 @@ fn snapshot_kmsg(buf: &mut [u8]) -> isize {
         return lfd;
     }
     let mut total: isize = 0;
-    'copy: loop {
+    loop {
         let n = read(kfd as i32, buf);
-        if n <= 0 {
-            break;
+        if n < 0 {
+            // Read error mid-stream: fail loudly rather than reporting the
+            // partial snapshot copied so far as a success.
+            let _ = fsync(lfd as i32);
+            close(lfd as i32);
+            close(kfd as i32);
+            return n;
+        }
+        if n == 0 {
+            break; // EOF — the full ring has been copied.
         }
         // Write the FULL chunk — a short or failed write would otherwise silently
         // truncate boot.log while `total` still counts bytes read from kmsg,
@@ -90,7 +99,16 @@ fn snapshot_kmsg(buf: &mut [u8]) -> isize {
         while off < n as usize {
             let w = write(lfd as i32, &buf[off..n as usize]);
             if w <= 0 {
-                break 'copy;
+                // Write failure: surface a negative errno so the caller does not
+                // treat a truncated boot.log as a successful snapshot.
+                let _ = fsync(lfd as i32);
+                close(lfd as i32);
+                close(kfd as i32);
+                return if w < 0 {
+                    w
+                } else {
+                    -5 /* EIO */
+                };
             }
             off += w as usize;
         }

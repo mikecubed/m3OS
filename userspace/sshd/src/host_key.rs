@@ -13,10 +13,12 @@ use sunset::{KeyType, SignKey};
 // host-key write failed — which aborted the SSH key exchange right after the
 // TCP connection established. The (cheap) Ed25519 key is regenerated each boot.
 //
-// Two candidates are tried in order. **Flat paths, no subdirectory** — creating
-// `/run/ssh/` failed on the bare-metal VFS (nested mkdir / `/run` is mode 0755
-// root-only), which is what left sshd printing "cannot write host key". `/tmp`
-// is mode 1777 (world-writable), so the fallback always succeeds; the key file
+// Two candidates are tried in order. **Flat paths, no subdirectory** — a nested
+// `/run/ssh/` proved unreliable on the bare-metal VFS (nested mkdir under `/run`,
+// which is mode 0755 root-only), which is what left sshd printing "cannot write
+// host key". `sshd::ensure_ssh_dir` creates `/run` itself (not the subdir); the
+// preferred key lives directly under it (`/run/ssh_host_ed25519_key`). `/tmp` is
+// mode 1777 (world-writable), so the fallback always succeeds; the key file
 // itself is created mode 0600 so it is never world-readable wherever it lands.
 const HOST_KEY_PATHS: [&[u8]; 2] = [
     b"/run/ssh_host_ed25519_key\0",
