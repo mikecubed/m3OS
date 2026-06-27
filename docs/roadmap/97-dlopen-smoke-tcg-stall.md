@@ -1,6 +1,11 @@
 # Phase 97 - `dlopen-test-smoke` Intermittent TCG Stall (debugging)
 
-**Status:** In Progress
+> **Resolved (PR #268):** root cause was the `ld-musl` loader's **missing
+> `DT_RELR` support** (a userspace relocation bug), **not** the "TCG stall" the
+> title describes. The title is kept for traceability; read the **Investigation
+> Findings** below for the actual cause and fix.
+
+**Status:** Complete (landed in PR #268; kernel `v0.97.0`)
 **Source Ref:** phase-97
 **Depends on:** Phase 95b ✅ (the `MAP_LAZY_FILE` demand-paged loader + blocking page-fault→`vfs_server` read), the SMP TLB-shootdown / lost-wakeup hardening (`docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md`) ✅
 **Builds on:** the Phase 95b demand-paging path, the SMP cross-core TLB shootdown (`kernel/src/smp/tlb.rs`), the scheduler block/wake + stuck-task watchdog, and the always-on `smoke-test` harness
@@ -22,13 +27,16 @@ Two facts make this its own phase rather than a one-line patch:
 
 Phase 97 exists to (1) **get observability**, (2) **confirm** the cause, (3) **fix** what is confirmed (plus a couple of always-safe hardenings), and (4) **replace** the blind gate with a falsifiable one.
 
-## Investigation Findings (running log)
+## Investigation Findings
 
-> This section is the live verdict (Task B.1). It supersedes the *leading
-> surviving hypothesis* (the cross-core `dlclose` `munmap` TLB shootdown) stated
-> elsewhere in this doc — **that hypothesis is also refuted by the reproduction
-> below.** The cause is a userspace fault in the destructor pipeline, not a
-> shootdown wedge.
+> **This section is the authoritative verdict (Task B.1) and supersedes the
+> hypotheses stated in the rest of this doc** — including the *Why This Phase
+> Exists*, *Implementation Outline*, and *Acceptance Criteria* sections, which
+> were written under the (refuted) blocking-`vfs` and cross-core TLB-shootdown
+> theories and are kept as the planning record. The confirmed cause is a
+> userspace relocation bug (missing `DT_RELR` support), not a shootdown wedge or
+> a demand-read lost-wakeup. The companion task doc's *Per-task resolution* table
+> maps each planned task to Done / N/A.
 
 **Reproduced (2026-06-27).** A baseline `M3OS_SMOKE_SERIAL_DUMP=… cargo xtask
 smoke-test` under moderate host load timed out at step 26 on two consecutive
@@ -188,8 +196,29 @@ Author this design doc + the companion task doc to template, repoint the roadmap
 - **Hung-task policy.** Linux's hung-task detector can `panic` (a recoverable, debuggable signal) on configurable timeout; m3OS's watchdog is **log-only** and exempts idle servers, so a wedge is silent — which is why observability, not just a watchdog, is the lever here.
 - **Test-harness honesty.** Mature CI distinguishes timeout / crash / assertion-failure as separate verdicts with per-step diagnostics; the current gate collapses all non-PASS into one opaque timeout, which this phase fixes.
 
+## Gate posture (Task C.3)
+
+The `dlopen-test-smoke` step stays **always-on under plain TCG** (no KVM-gate).
+The confirmed cause is a *deterministic* `DT_RELR` miss, not an irreducible
+TCG-oversubscription latency tail, so the fix is binary — there is no residual
+flake to gate away. The step is `WaitPassOrFail` (fails fast on the runner's
+FAIL / kernel `process killed`), and the global kernel-fatal scan (B.3) backs
+every step.
+
 ## Deferred Until Later
 
+- The two **always-safe kernel hardenings** the task list planned (B.4 — the
+  lazy-file-fault-under-lock prevention + the `vfs_server` self-read guard) are
+  **not landed**: they targeted the *refuted* lazy-file/`vfs` hypotheses, so
+  shipping them would have violated "minimal confirmed fix". They remain a
+  latent-only concern (the log-only deadlock-guard still catches the class) and
+  can be revisited if a genuinely `vfs`-backed wedge is ever observed.
+- **Loader self-relocation `DT_RELR`** — `apply_relr` is wired into the three
+  *loaded-DSO* relocation sites; `dl_relocate_self` (the loader's own startup
+  relocation) still handles only `DT_RELA`. The `ld-musl` binary is built for
+  `x86_64-unknown-none` and currently emits `DT_RELA` (verified: `RELASZ: 96`),
+  so this is not reachable today, but if that build ever starts emitting
+  `.relr.dyn` the self-reloc path would need the same decode.
 - The heavier **kernel demand-read timeout / watchdog-kill** work — bounding the `vfs_service_read_kernel` `call_msg` and making the watchdog kill-capable — targets the genuinely `vfs`-backed gates (`rustc`/`clang`/install), **not** this gate's ramdisk-synchronous path, and is explicitly out of Phase 97's critical path.
 - The full **page cache for file-backed pages** (Phase 95c Track B) that would change the demand-fill cost profile for `vfs`-backed gates.
 - **Folding into Phase 98** — Phase 98's roadmap audit re-charters the next arc and folds in Phase 97's *deferred* items; Phase 97 is authored and delivered standalone first.

@@ -7191,6 +7191,31 @@ fn find_terminated_fail_line(serial: &str, fail_prefixes: &[&str]) -> Option<Str
     None
 }
 
+/// Phase 97 (Track B.3) — kernel-fatal markers scanned on EVERY smoke step's
+/// wait loop (hoisted from `cmd_smp_smoke`'s per-step `fail_prefixes` via
+/// [`global_fatal_line`]). These never appear in a healthy boot, so any always-on
+/// step that hits one fails fast with a NAMED cause instead of collapsing into an
+/// opaque per-step timeout. `process killed` is deliberately **not** here —
+/// legitimate negative tests fork-and-kill children — so it stays in the per-step
+/// `fail_prefixes` where a kill is expected (e.g. the dlopen step).
+const GLOBAL_FATAL_PATTERNS: &[&str] = &[
+    "KERNEL PANIC",
+    "RECURSIVE KERNEL PAGE FAULT",
+    "no waker registered",
+];
+
+/// Return the first [`GLOBAL_FATAL_PATTERNS`] entry that appears in a *complete*
+/// (newline-terminated) line of `serial`, or `None`. Requiring the terminating
+/// newline means a marker split across two serial chunks can't false-trigger
+/// mid-arrival.
+fn global_fatal_line(serial: &str) -> Option<&'static str> {
+    GLOBAL_FATAL_PATTERNS.iter().copied().find(|p| {
+        serial
+            .find(p)
+            .is_some_and(|start| serial[start..].contains('\n'))
+    })
+}
+
 fn strip_background_noise(input: &str) -> String {
     // Kernel log prefixes — always `[LEVEL] [subsystem] message...\n`.
     // Match the second bracket to avoid false positives on userspace text
@@ -7659,6 +7684,17 @@ fn run_smoke_script(
                     // output and preventing a contiguous match.
                     let stripped = strip_ansi(&serial_buf);
                     let cleaned = strip_background_noise(&stripped);
+                    if let Some(fatal) = global_fatal_line(&stripped) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        dump_serial(&serial_history);
+                        let tail = tail_lines(&strip_ansi(&serial_history), 80);
+                        return Err(format!(
+                            "step {} aborted: kernel-fatal marker \"{fatal}\" on serial during: {label}\n\
+                             last serial output:\n{tail}",
+                            step_num
+                        ));
+                    }
                     if find_serial_match(&stripped, &cleaned, pattern).is_some() {
                         // Non-consuming: see `SmokeStep::Wait` doc. We deliberately
                         // do NOT drain through the match, so a later `Wait` for an
@@ -7777,6 +7813,17 @@ fn run_smoke_script(
                     }
                     let stripped = strip_ansi(&serial_buf);
                     let cleaned = strip_background_noise(&stripped);
+                    if let Some(fatal) = global_fatal_line(&stripped) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        dump_serial(&serial_history);
+                        let tail = tail_lines(&strip_ansi(&serial_history), 80);
+                        return Err(format!(
+                            "step {} aborted: kernel-fatal marker \"{fatal}\" on serial during: {label}\n\
+                             last serial output:\n{tail}",
+                            step_num
+                        ));
+                    }
                     if let Some((mode, match_end)) =
                         find_serial_match(&stripped, &cleaned, pattern_a)
                     {
@@ -7859,6 +7906,17 @@ fn run_smoke_script(
                     }
                     let stripped = strip_ansi(&serial_buf);
                     let cleaned = strip_background_noise(&stripped);
+                    if let Some(fatal) = global_fatal_line(&stripped) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        dump_serial(&serial_history);
+                        let tail = tail_lines(&strip_ansi(&serial_history), 80);
+                        return Err(format!(
+                            "step {} aborted: kernel-fatal marker \"{fatal}\" on serial during: {label}\n\
+                             last serial output:\n{tail}",
+                            step_num
+                        ));
+                    }
 
                     // Find the first complete (newline-terminated) line that contains `pattern`.
                     // Iterate with `split_inclusive('\n')` and a running byte cursor so the
@@ -7986,6 +8044,17 @@ fn run_smoke_script(
                     }
                     let stripped = strip_ansi(&serial_buf);
                     let cleaned = strip_background_noise(&stripped);
+                    if let Some(fatal) = global_fatal_line(&stripped) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        dump_serial(&serial_history);
+                        let tail = tail_lines(&strip_ansi(&serial_history), 80);
+                        return Err(format!(
+                            "step {} aborted: kernel-fatal marker \"{fatal}\" on serial during: {label}\n\
+                             last serial output:\n{tail}",
+                            step_num
+                        ));
+                    }
 
                     // Check pass first, then fail.
                     if let Some((mode, match_end)) =
