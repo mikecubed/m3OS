@@ -1128,7 +1128,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.95.1"
+version = "0.96.0"
 dependencies = [
  "bootloader_api",
  "kernel-core",
@@ -2418,10 +2418,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "ure_driver"
+version = "0.96.0"
+dependencies = [
+ "driver_runtime",
+ "kernel-core",
+ "syscall-lib",
+ "usb-core",
+]
+
+[[package]]
 name = "usb-core"
 version = "0.78.2"
 dependencies = [
  "kernel-core",
+]
+
+[[package]]
+name = "usb-logsink"
+version = "0.96.0"
+dependencies = [
+ "syscall-lib",
 ]
 
 [[package]]

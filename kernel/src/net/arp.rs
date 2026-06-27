@@ -1,10 +1,30 @@
 //! ARP (Address Resolution Protocol) — pure logic re-exported from kernel-core,
 //! kernel-specific cache and send/handle functions remain here.
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use crate::task::scheduler::IrqSafeMutex;
 
 use super::ethernet::{self, MAC_BROADCAST};
 use super::virtio_net::MacAddr;
+
+/// Per-boot ARP-responder counters surfaced by the DHCP heartbeat. `req_for_us`
+/// counts inbound ARP requests whose target IP equals our configured IP;
+/// `replies` counts replies actually transmitted. On a bare-metal boot these
+/// localize an unreachable host: `req_for_us == 0` means nothing on the LAN is
+/// ARPing our IP (so DHCP gave us a different address than the one being pinged,
+/// or no lease at all); `req_for_us > 0` with `replies == 0` means the responder
+/// saw the request but could not send (no MAC).
+static ARP_REQ_FOR_US: AtomicU32 = AtomicU32::new(0);
+static ARP_REPLIES: AtomicU32 = AtomicU32::new(0);
+
+/// Snapshot of `(req_for_us, replies)` for the ARP responder this boot.
+pub fn responder_counts() -> (u32, u32) {
+    (
+        ARP_REQ_FOR_US.load(Ordering::Relaxed),
+        ARP_REPLIES.load(Ordering::Relaxed),
+    )
+}
 
 pub use kernel_core::net::arp::{ARP_OP_REPLY, ARP_OP_REQUEST, ArpPacket, build, parse};
 pub use kernel_core::types::Ipv4Addr;
@@ -156,6 +176,7 @@ pub fn handle_arp(pkt: &ArpPacket) {
         ARP_OP_REQUEST => {
             let our_ip = super::config::our_ip();
             if pkt.target_ip == our_ip {
+                ARP_REQ_FOR_US.fetch_add(1, Ordering::Relaxed);
                 let our_mac = match super::mac_address() {
                     Some(m) => m,
                     None => return,
@@ -165,6 +186,7 @@ pub fn handle_arp(pkt: &ArpPacket) {
                 let frame =
                     ethernet::build(pkt.sender_mac, our_mac, ethernet::ETHERTYPE_ARP, &reply);
                 super::send_frame(&frame);
+                ARP_REPLIES.fetch_add(1, Ordering::Relaxed);
 
                 log::debug!(
                     "[arp] sent reply to {}.{}.{}.{}",

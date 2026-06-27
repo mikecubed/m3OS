@@ -84,15 +84,16 @@ fn wait_for_prompt_ready() {
     }
 }
 
-/// B.1: Create /etc/ssh/ with mode 0755 if it does not exist.
+/// B.1: Ensure `/run` (a writable tmpfs) exists for the host key. The previous
+/// /etc/ssh location is on the read-only ramdisk root on a bare-metal no-disk
+/// boot, so the key write failed and aborted key exchange. The host key files
+/// are flat (`/run/ssh_host_ed25519_key*`, see `host_key.rs`) — no `/run/ssh/`
+/// subdirectory is created (a nested mkdir under the 0755 root-only `/run` was
+/// unreliable on the bare-metal VFS and the flat layout sidesteps it).
 fn ensure_ssh_dir() {
-    let ret = mkdir(b"/etc\0", 0o755);
+    let ret = mkdir(b"/run\0", 0o755);
     if ret < 0 && ret != NEG_EEXIST {
-        write_str(STDOUT_FILENO, "sshd: warning: cannot create /etc\n");
-    }
-    let ret = mkdir(b"/etc/ssh\0", 0o755);
-    if ret < 0 && ret != NEG_EEXIST {
-        write_str(STDOUT_FILENO, "sshd: warning: cannot create /etc/ssh\n");
+        write_str(STDOUT_FILENO, "sshd: warning: cannot create /run\n");
     }
 }
 

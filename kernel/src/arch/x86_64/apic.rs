@@ -431,27 +431,57 @@ fn calibrate_lapic_timer() -> u32 {
 
         pit_gate.write(gate | 0x01); // gate high — starts countdown
 
-        // Spin until PIT channel 2 output goes high (bit 5 of port 0x61).
-        // HW-bounded: 8254 PIT channel 2 sets bit 5 of port 0x61 after exactly
-        // 10 ms (the configured countdown period).  This spin runs once during
-        // LAPIC timer calibration at boot; it is not attributable to any user
-        // workload.
+        // Time the 10 ms window by polling PIT channel 2's COUNTER for its
+        // terminal-count wrap — NOT the port-0x61 bit-5 gate-output readback the
+        // original code spun on. On modern laptops (e.g. the Phase 96 Tiger Lake
+        // box) that 0x61 output bit is frequently dead/unwired, so the original
+        // `while pit_gate.read() & 0x20 == 0` spun forever and HUNG bare-metal
+        // boot. It is a *latent* hang: it only bites when the gate readback is
+        // broken, which is why an earlier boot got past here and a later one
+        // wedged on the same unchanged code. Channel 2 (mode 0) counts
+        // 11932 → 0 (the 10 ms window) then wraps up past 0xFFFF; a counter read
+        // whose value INCREASES vs the previous read marks the window's end.
         //
-        // Phase 57e Track B.2: `calibrate_lapic_timer` runs at BSP init
-        // before any task is dispatched, so `preempt_disable` is a no-op
-        // here — the wrapper is preserved for discipline only.  Critically,
-        // the calibration measurement depends on a precise 10 ms wall-clock
-        // window; a kernel-mode preemption would extend `tsc_end - tsc_start`
-        // and silently corrupt the calibration.  Wrapping with
-        // `preempt_disable` future-proofs the calibration against any
-        // refactor that runs it after userspace is live.
+        // The loop is BOUNDED: if channel 2 never counts at all (fully dead
+        // PIT), we fall back to a default ticks/ms below instead of hanging.
+        // Each iteration is ~3 port-I/O ops (~0.1–3 µs each), and the 10 ms
+        // wrap needs only a few thousand–tens-of-thousands of iterations, so a
+        // 500k budget covers a working PIT (even with fast port I/O) while
+        // bounding a fully-dead one to well under a couple of seconds.
+        //
+        // `preempt_disable` (Phase 57e Track B.2): future-proofs the precise
+        // measurement against any refactor that runs calibration after userspace
+        // is live — a kernel-mode preemption would stretch the window. A no-op
+        // here (BSP, pre-scheduler).
+        const PIT_SPIN_BUDGET: u64 = 500_000;
+        let latch_ch2 = |cmd: &mut Port<u8>, data: &mut Port<u8>| -> u16 {
+            // SAFETY: ports 0x43/0x42 are the 8254 PIT command + channel-2 data
+            // registers — standard x86 I/O; covered by the enclosing `unsafe`.
+            cmd.write(0x80); // counter-latch command, channel 2
+            let lo = data.read() as u16;
+            let hi = data.read() as u16;
+            lo | (hi << 8)
+        };
         crate::task::scheduler::preempt_disable();
-        while pit_gate.read() & 0x20 == 0 {
+        let mut prev_count = latch_ch2(&mut pit_cmd, &mut pit_ch2);
+        let mut pit_fired = false;
+        let mut spin_budget = PIT_SPIN_BUDGET;
+        loop {
+            let cur = latch_ch2(&mut pit_cmd, &mut pit_ch2);
+            if cur > prev_count {
+                pit_fired = true; // counted past 0 and wrapped → ~10 ms elapsed
+                break;
+            }
+            prev_count = cur;
+            spin_budget -= 1;
+            if spin_budget == 0 {
+                break;
+            }
             core::hint::spin_loop();
         }
         crate::task::scheduler::preempt_enable();
 
-        // Snapshot TSC immediately after the 10ms window ends.
+        // Snapshot TSC immediately after the window ends.
         let tsc_end = core::arch::x86_64::_rdtsc();
 
         // Read how many LAPIC timer ticks elapsed.
@@ -461,8 +491,43 @@ fn calibrate_lapic_timer() -> u32 {
         // Stop the LAPIC timer.
         lapic_write(LAPIC_TIMER_INIT_COUNT, 0);
 
+        if !pit_fired {
+            // PIT channel 2 never advanced — keep the box bootable with a
+            // conservative default LAPIC rate rather than hanging. ~100 MHz bus
+            // / 16 ≈ 6250 ticks/ms; the scheduler tolerates an imprecise rate.
+            const DEFAULT_TICKS_PER_MS: u32 = 6250;
+            log::warn!(
+                "[apic] PIT channel 2 did not count in {} spins — using default {} LAPIC ticks/ms (timer imprecise)",
+                PIT_SPIN_BUDGET,
+                DEFAULT_TICKS_PER_MS
+            );
+            TSC_PER_MS.call_once(|| 0);
+            BOOT_TSC.call_once(|| tsc_end);
+            return DEFAULT_TICKS_PER_MS;
+        }
+
         // elapsed ticks in ~10 ms with divide-by-16 → ticks_per_ms = elapsed / 10.
         let ticks_per_ms = elapsed / 10;
+
+        // Sanity-guard the calibration. A real LAPIC timer runs ~1.5k–63k
+        // ticks/ms (a 25 MHz–1 GHz bus / 16). A value far outside that means the
+        // PIT-ch2 window was bogus — e.g. a glitched counter read on emulated/
+        // quirky hardware gave a far-too-short window — and using it would load a
+        // tiny LAPIC init count that storms the CPU with timer interrupts the
+        // instant IRQs re-enable at the end of `init()` (a hang with no console
+        // output). Fall back to the safe default instead of trusting it.
+        if !(1_000..=200_000).contains(&ticks_per_ms) {
+            const DEFAULT_TICKS_PER_MS: u32 = 6250;
+            log::warn!(
+                "[apic] implausible LAPIC calibration ({} ticks/ms, elapsed={}) — using default {}",
+                ticks_per_ms,
+                elapsed,
+                DEFAULT_TICKS_PER_MS
+            );
+            TSC_PER_MS.call_once(|| 0);
+            BOOT_TSC.call_once(|| tsc_end);
+            return DEFAULT_TICKS_PER_MS;
+        }
 
         // TSC ticks in ~10 ms → tsc_per_ms = delta / 10.
         let tsc_delta = tsc_end.wrapping_sub(tsc_start);
@@ -613,19 +678,23 @@ pub fn init() {
     x86_64::instructions::interrupts::without_interrupts(|| {
         // 1. Enable Local APIC.
         lapic_init();
+        crate::post_marker(24); // apic: Local APIC enabled
 
         // 2. Program I/O APIC redirection entries.
         ioapic_init();
+        crate::post_marker(25); // apic: I/O APIC programmed — about to calibrate LAPIC timer
 
         // 3. Calibrate LAPIC timer against PIT channel 2.
         let tpm = calibrate_lapic_timer();
         LAPIC_TICKS_PER_MS.call_once(|| tpm);
+        crate::post_marker(26); // apic: LAPIC timer calibrated (PIT ch2 counter wrap or fallback)
 
         // 4. Start LAPIC timer (1 ms periodic → 1000 Hz).
         if !start_lapic_timer(1) {
             log::error!("[apic] LAPIC timer failed to start; staying on PIC");
             return;
         }
+        crate::post_marker(27); // apic: LAPIC timer started (periodic)
 
         // 5. Mask the PIT's I/O APIC entry now that the LAPIC timer is running.
         //    Preserve the override's polarity/trigger flags in case the entry
@@ -655,6 +724,7 @@ pub fn init() {
         // disabled, so no handler can observe the flag until after this
         // closure returns and interrupts are re-enabled.
         USING_APIC.store(true, core::sync::atomic::Ordering::Relaxed);
+        crate::post_marker(28); // apic: PIC masked + APIC EOI active — closure about to re-enable IRQs
 
         log::info!("[apic] APIC interrupt routing active");
     });

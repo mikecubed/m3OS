@@ -70,6 +70,16 @@ macro_rules! generated_initrd_asset {
 
 static HELLO_TXT: &[u8] = static_initrd_asset!("hello.txt");
 static README_TXT: &[u8] = static_initrd_asset!("readme.txt");
+
+// User database. On a normal boot these come from the ext2 data disk, but a
+// bare-metal USB boot has no data disk (no USB mass-storage driver) and runs
+// off the read-only ramdisk root — without these files `/bin/login` (telnet)
+// and `sshd` auth have no user database, so remote login is impossible. The
+// shadow hashes are the same seeded `$sha256i$10000$…` values the data-disk
+// builder generates (root password `root`, user password `user`).
+static PASSWD_FILE: &[u8] = static_initrd_asset!("etc/passwd");
+static GROUP_FILE: &[u8] = static_initrd_asset!("etc/group");
+static SHADOW_FILE: &[u8] = static_initrd_asset!("etc/shadow");
 static EXIT0_ELF: &[u8] = generated_initrd_asset!("exit0");
 static FORK_TEST_ELF: &[u8] = generated_initrd_asset!("fork-test");
 static ECHO_ARGS_ELF: &[u8] = generated_initrd_asset!("echo-args");
@@ -191,6 +201,8 @@ static TODO_RUST_ELF: &[u8] = generated_initrd_asset!("todo-rust");
 // Phase 46: background daemons managed by init
 static SYSLOGD_ELF: &[u8] = generated_initrd_asset!("syslogd");
 static CROND_ELF: &[u8] = generated_initrd_asset!("crond");
+// Phase 96: USB log-volume persistence daemon (kernel dmesg → /mnt/usb0/boot.log).
+static USB_LOGSINK_ELF: &[u8] = generated_initrd_asset!("usb-logsink");
 // Phase 52: ring-3 extracted services
 static CONSOLE_SERVER_ELF: &[u8] = generated_initrd_asset!("console_server");
 static KBD_SERVER_ELF: &[u8] = generated_initrd_asset!("kbd_server");
@@ -220,6 +232,8 @@ static IGB_DRIVER_ELF: &[u8] = generated_initrd_asset!("igb_driver");
 static IGC_DRIVER_ELF: &[u8] = generated_initrd_asset!("igc_driver");
 static R8169_DRIVER_ELF: &[u8] = generated_initrd_asset!("r8169_driver");
 static R8125_DRIVER_ELF: &[u8] = generated_initrd_asset!("r8125_driver");
+// Phase 96 Stage-1a: ring-3 USB-Ethernet driver for RTL815x (RTL8156 bring-up probe).
+static URE_DRIVER_ELF: &[u8] = generated_initrd_asset!("ure_driver");
 // Phase 81: ring-3 MediaTek mt792x Wi-Fi driver.
 static MT792X_DRIVER_ELF: &[u8] = generated_initrd_asset!("mt792x_driver");
 // Phase 78a Track B.2: ring-3 xHCI USB host-controller driver.
@@ -581,6 +595,13 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "syslogd",
         RamdiskNode::File {
             content: SYSLOGD_ELF,
+        },
+    ),
+    // Phase 96: USB log-volume persistence daemon (→ /bin/usb-logsink).
+    (
+        "usb-logsink",
+        RamdiskNode::File {
+            content: USB_LOGSINK_ELF,
         },
     ),
     ("crond", RamdiskNode::File { content: CROND_ELF }),
@@ -1190,6 +1211,25 @@ static ETC_ENTRIES: &[(&str, RamdiskNode)] = &[
             content: README_TXT,
         },
     ),
+    // User database for bare-metal (no-data-disk) remote login.
+    (
+        "passwd",
+        RamdiskNode::File {
+            content: PASSWD_FILE,
+        },
+    ),
+    (
+        "group",
+        RamdiskNode::File {
+            content: GROUP_FILE,
+        },
+    ),
+    (
+        "shadow",
+        RamdiskNode::File {
+            content: SHADOW_FILE,
+        },
+    ),
 ];
 
 static SBIN_ENTRIES: &[(&str, RamdiskNode)] = &[("init", RamdiskNode::File { content: INIT_ELF })];
@@ -1307,6 +1347,13 @@ static DRIVERS_ENTRIES: &[(&str, RamdiskNode)] = &[
         "r8125",
         RamdiskNode::File {
             content: R8125_DRIVER_ELF,
+        },
+    ),
+    // Phase 96 Stage-1a: ring-3 USB-Ethernet driver → /drivers/ure.
+    (
+        "ure",
+        RamdiskNode::File {
+            content: URE_DRIVER_ELF,
         },
     ),
     // Phase 81: ring-3 MediaTek mt792x Wi-Fi driver → /drivers/mt792x.
@@ -1499,10 +1546,28 @@ static RAMDISK_ROOT: RamdiskNode = RamdiskNode::Dir {
 /// ramdisk_lookup("/bin/cat")       // → File
 /// ramdisk_lookup("/etc/hello.txt") // → File
 /// ```
+/// Ramdisk paths that exist ONLY as a no-data-disk fallback and must defer to a
+/// mounted ext2 root. Matched on the leading-slash-trimmed path. The user
+/// database is baked into the ramdisk so remote login works on bare metal (no
+/// data disk); when a real ext2 root is mounted it owns the persistent `/etc`.
+fn is_etc_fallback(trimmed_path: &str) -> bool {
+    matches!(trimmed_path, "etc/passwd" | "etc/group" | "etc/shadow")
+}
+
 pub fn ramdisk_lookup(path: &str) -> Option<&'static RamdiskNode> {
     let trimmed = path.trim_start_matches('/');
     if trimmed.is_empty() {
         return Some(&RAMDISK_ROOT);
+    }
+
+    // Don't let the bare-metal user-database fallback shadow a mounted ext2 root:
+    // otherwise an ext2-served `/etc/passwd` is reported with the ramdisk's
+    // synthetic `st_ino = 0` (the Phase 96 stat-identity regression) and on-disk
+    // adduser/passwd changes are ignored at login. Bare-metal boots (ext2 not
+    // mounted) still get the fallback. Cheap: `is_mounted()` is only consulted
+    // for the three fallback paths.
+    if is_etc_fallback(trimmed) && crate::fs::ext2::is_mounted() {
+        return None;
     }
 
     let mut current = &RAMDISK_ROOT;

@@ -92,6 +92,18 @@ syscall_lib::entry_point!(program_main);
 /// Boot-log marker written when the daemon starts.
 pub const BOOT_LOG_MARKER: &str = "usb-storage: spawned\n";
 
+/// Bare-metal de-risk toggle: emit the big, photo-legible PASS/FAIL banner
+/// (`print_storage_pass_banner` / `print_storage_fail_banner`).
+///
+/// **Now `false` — the de-risk is concluded** (USB mass storage was validated on
+/// the real Tiger Lake laptop, Phase 96). The FAIL banner fired on the no-device
+/// timeout, so on a normal QEMU boot (where `usb_storage` runs without a stick)
+/// it printed mid-boot every time and corrupted the `security-floor` regression's
+/// prompt matching. Flip back to `true` only for another bare-metal photo-debug
+/// session.
+#[cfg(not(test))]
+const PROBE_BANNER: bool = false;
+
 /// USB Mass Storage interface class (USB-IF base-class 0x08).
 const CLASS_MASS_STORAGE: u8 = 0x08;
 /// USB Mass Storage BOT protocol (bInterfaceProtocol 0x50).
@@ -469,6 +481,65 @@ fn detect_real_fs(usb_ep: u32, notice: &AttachNotice) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Bare-metal de-risk: big, photo-legible PASS/FAIL banner
+// ---------------------------------------------------------------------------
+//
+// On bare metal there is no serial console — the result is read off a phone
+// photo of the framebuffer. A multi-line bordered banner with a distinct fill
+// character per outcome (`=` PASS / `#` FAIL) stays recognisable even in a
+// blurry photo, where a single buried sentinel line would not.
+
+/// PASS banner — emitted once the device answers GET_MAX_LUN → TEST UNIT READY
+/// → INQUIRY → READ CAPACITY, i.e. it is fully reachable as USB mass storage.
+#[cfg(not(test))]
+fn print_storage_pass_banner(blocks: u32, bsize: u32) {
+    if !PROBE_BANNER {
+        return;
+    }
+    write_str(
+        STDOUT_FILENO,
+        "\n==================================================\n",
+    );
+    write_str(
+        STDOUT_FILENO,
+        "==  USB MASS STORAGE:  PASS  -  usb0 reachable\n",
+    );
+    write_str(STDOUT_FILENO, "==  blocks=");
+    write_u32_dec(blocks);
+    write_str(STDOUT_FILENO, "  bsize=");
+    write_u32_dec(bsize);
+    write_str(
+        STDOUT_FILENO,
+        "\n==================================================\n\n",
+    );
+}
+
+/// FAIL banner — emitted when the discovery walk times out with no
+/// mass-storage device (e.g. the boot stick did not re-enumerate via xHCI).
+#[cfg(not(test))]
+fn print_storage_fail_banner() {
+    if !PROBE_BANNER {
+        return;
+    }
+    write_str(
+        STDOUT_FILENO,
+        "\n##################################################\n",
+    );
+    write_str(
+        STDOUT_FILENO,
+        "##  USB MASS STORAGE:  FAIL  -  no device found\n",
+    );
+    write_str(
+        STDOUT_FILENO,
+        "##  boot stick NOT reachable as USB mass storage\n",
+    );
+    write_str(
+        STDOUT_FILENO,
+        "##################################################\n\n",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Bind + probe one mass-storage device
 // ---------------------------------------------------------------------------
 
@@ -573,6 +644,10 @@ fn probe_device(usb_ep: u32, notice: &AttachNotice) -> Option<ReadCapacity10> {
     write_str(STDOUT_FILENO, " bsize=");
     write_u32_dec(cap.block_size);
     write_str(STDOUT_FILENO, "\n");
+    // Reaching here means BOT + INQUIRY + READ CAPACITY all succeeded: the
+    // device is fully reachable as mass storage. Paint the photo-legible PASS
+    // banner (bare-metal de-risk).
+    print_storage_pass_banner(blocks, cap.block_size);
 
     Some(cap)
 }
@@ -898,8 +973,40 @@ fn handle_bot_read(
             Some((data, 0)) if data.len() == byte_count as usize => {
                 all_data.extend_from_slice(&data);
             }
-            _ => {
-                write_str(STDOUT_FILENO, "usb-storage: BLK_READ BOT error\n");
+            // Bare-metal diagnostic: name the failure shape + LBA so the boot log
+            // says WHY READ(10) failed instead of a bare "BOT error".
+            //   short-read  → CSW passed but the bulk-IN data phase came up short
+            //   csw-status  → device reported command-failed(1)/phase-error(2)
+            //   transport   → CBW/CSW/bulk-IN transfer itself failed (None)
+            Some((data, 0)) => {
+                write_str(STDOUT_FILENO, "usb-storage: BLK_READ BOT short-read lba=");
+                write_u32_dec(lba32);
+                write_str(STDOUT_FILENO, " got=");
+                write_u32_dec(data.len() as u32);
+                write_str(STDOUT_FILENO, " want=");
+                write_u32_dec(byte_count as u32);
+                write_str(STDOUT_FILENO, "\n");
+                return err_reply(cmd_id);
+            }
+            Some((_, status)) => {
+                write_str(STDOUT_FILENO, "usb-storage: BLK_READ BOT csw-status=");
+                write_u8_dec(status);
+                write_str(STDOUT_FILENO, " lba=");
+                write_u32_dec(lba32);
+                write_str(STDOUT_FILENO, " sectors=");
+                write_u8_dec(chunk as u8);
+                write_str(STDOUT_FILENO, "\n");
+                return err_reply(cmd_id);
+            }
+            None => {
+                write_str(
+                    STDOUT_FILENO,
+                    "usb-storage: BLK_READ BOT transport-fail lba=",
+                );
+                write_u32_dec(lba32);
+                write_str(STDOUT_FILENO, " sectors=");
+                write_u8_dec(chunk as u8);
+                write_str(STDOUT_FILENO, "\n");
                 return err_reply(cmd_id);
             }
         }
@@ -1030,6 +1137,7 @@ fn program_main(_args: &[&str]) -> i32 {
             STDOUT_FILENO,
             "usb-storage: no mass-storage device attached — exiting cleanly\n",
         );
+        print_storage_fail_banner();
         return 0;
     }
 
@@ -1265,8 +1373,6 @@ fn discover_storage_devices(usb_ep: u32) -> Vec<(AttachNotice, u8)> {
             if stable >= STABLE_WALKS {
                 break;
             }
-        } else if attempt % 5 == 1 {
-            write_str(STDOUT_FILENO, "usb-storage: waiting for device\n");
         }
 
         let _ = syscall_lib::nanosleep_for(0, POLL_INTERVAL_MS * 1_000_000);

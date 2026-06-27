@@ -1,0 +1,12 @@
+[package]
+name = "usb-logsink"
+version = "0.96.0"
+edition = "2024"
+description = "Phase 96 — mount the USB log partition and persist the kernel dmesg ring to it for bare-metal post-mortem."
+
+[[bin]]
+name = "usb-logsink"
+path = "src/main.rs"
+
+[dependencies]
+syscall-lib = { path = "../syscall-lib", features = ["alloc"] }

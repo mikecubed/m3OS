@@ -66,6 +66,87 @@ pub mod tty;
 use alloc::{boxed::Box, string::String, vec, vec::Vec};
 use bootloader_api::BootInfo;
 
+/// Framebuffer geometry captured at boot entry so `post_marker` can paint from
+/// anywhere (including inside `mm::init`) without threading the pointer through.
+#[derive(Clone, Copy)]
+struct PostFb {
+    base: usize,
+    width: usize,
+    height: usize,
+    stride_bytes: usize,
+    bpp: usize,
+}
+
+static POST_FB: spin::Once<PostFb> = spin::Once::new();
+
+/// Master switch for the bare-metal bring-up diagnostics: the `post_marker`
+/// POST squares, the `[timer] lapic_ticks_per_ms` framebuffer line, and init's
+/// AHCI-retry dots. **Default OFF.** These debugged the Phase 96 Tiger Lake
+/// early-boot hang and are invisible on a normal boot (the fb console overwrites
+/// the strip immediately), but they stay compiled out unless a future bare-metal
+/// bring-up needs them again — flip to `true` and rebuild. Same default-off-const
+/// idiom as `net::dhcp::FB_NET_HEARTBEAT` / the xhci driver's `VERBOSE_ENUM`.
+pub(crate) const BRINGUP_DIAG: bool = false;
+
+/// Record the framebuffer for `post_marker`. Called once at boot entry.
+fn post_fb_set(ptr: *mut u8, info: &bootloader_api::info::FrameBufferInfo) {
+    let bpp = info.bytes_per_pixel.max(1);
+    POST_FB.call_once(|| PostFb {
+        base: ptr as usize,
+        width: info.width,
+        height: info.height,
+        stride_bytes: info.stride * bpp,
+        bpp,
+    });
+}
+
+/// Bring-up diagnostic — paint a small solid square at grid slot `step` as a
+/// serial-free "POST code". Slots tile left-to-right, 16 per row (`step / 16`
+/// chooses the row): row 0 (slots 0–15) holds top-level boot steps, row 1
+/// (slots 16+) a subsystem's internal steps.
+///
+/// Early boot logs go only to the COM1 UART, invisible on a machine without a
+/// serial port or AMT capture (the Phase 96 Tiger Lake laptop). These squares
+/// make a bare-metal early-boot hang *visible*: the **last square shown is the
+/// last step that completed** — the hang is in the step after it. Harmless on
+/// success (the fb console + compositor overwrite the strip immediately).
+/// Format-agnostic (same byte to every channel, shows on RGB or BGR);
+/// `write_volatile` keeps it from being elided.
+#[inline(never)]
+pub(crate) fn post_marker(step: usize) {
+    // Gated off by default via BRINGUP_DIAG, folded into the framebuffer-presence
+    // guard so the body stays a single conditional early-return (a positive guard
+    // also sidesteps the const-false `unreachable_code` lint).
+    let Some(fb) = POST_FB.get().filter(|_| BRINGUP_DIAG) else {
+        return;
+    };
+    const SQ: usize = 28;
+    const GAP: usize = 8;
+    const PER_ROW: usize = 16;
+    let col = step % PER_ROW;
+    let row = step / PER_ROW;
+    let x0 = GAP + col * (SQ + GAP);
+    let y0 = GAP + row * (SQ + GAP);
+    if x0 + SQ > fb.width || y0 + SQ > fb.height {
+        return;
+    }
+    // Distinct brightness per column (0x48, 0x70, 0x98, …) so neighbours differ.
+    let byte: u8 = 0x48u8.wrapping_add((col as u8).wrapping_mul(0x28));
+    let base = fb.base as *mut u8;
+    for y in y0..y0 + SQ {
+        // SAFETY: the bootloader mapped + rendered to this framebuffer before
+        // jumping to the kernel, and mm::init preserves that mapping; the square
+        // is bounds-checked against width/height above.
+        let line = unsafe { base.add(y * fb.stride_bytes) };
+        for x in x0..x0 + SQ {
+            let px = unsafe { line.add(x * fb.bpp) };
+            for b in 0..fb.bpp {
+                unsafe { px.add(b).write_volatile(byte) };
+            }
+        }
+    }
+}
+
 /// Top-level kernel boot entry. Called from the binary `main.rs` which owns
 /// the `entry_point!` macro. Performs all pre-task init (serial, GDT/IDT,
 /// frame allocator, heap, framebuffer, ACPI, IOMMU, RTC, SMP, scheduler,
@@ -77,12 +158,11 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
     serial_println!("[m3os] Hello from kernel! v{}", env!("CARGO_PKG_VERSION"));
     log::info!("Kernel initialized");
 
-    // Load GDT/IDT — no IRQs yet.
-    arch::init();
-
     // P9-T001: parse framebuffer info before mm::init consumes boot_info.
     // `mm::init` takes `&'static mut BootInfo` which borrows the whole struct
-    // for 'static, so we must extract the raw pointer + layout first.
+    // for 'static, so we must extract the raw pointer + layout first.  Hoisted
+    // above arch::init so the bring-up POST markers can paint from the very
+    // first init step (see `post_marker`).
     let fb_parts: Option<(*mut u8, bootloader_api::info::FrameBufferInfo)> =
         boot_info.framebuffer.as_mut().map(|fb| {
             let info = fb.info();
@@ -94,16 +174,30 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
             (ptr, info)
         });
 
+    // BRING-UP DIAGNOSTIC (serial-free POST codes) — see `post_marker`. Record
+    // the framebuffer so any code (incl. mm::init) can paint progress squares.
+    // The last square shown on a hung bare-metal boot is the last step done.
+    if let Some((ptr, info)) = fb_parts.as_ref() {
+        post_fb_set(*ptr, info);
+    }
+    post_marker(0); // square 0 = kernel entry reached + framebuffer paintable
+
+    // Load GDT/IDT — no IRQs yet.
+    arch::init();
+    post_marker(1); // GDT/IDT loaded
+
     // P15-T001: extract RSDP address before mm::init consumes boot_info.
     let rsdp_addr: Option<u64> = boot_info.rsdp_addr.into_option();
 
     mm::init(boot_info);
+    post_marker(2); // mm::init returned (frame alloc + heap + buddy)
 
     // Map the kernel-stack pool with guard pages. Must precede any code
     // that claims a slot — Task::new, AP boot, per-process syscall-stack
     // setup, and the test harness's task spawns all go through
     // `kstack::alloc` / `alloc_leaked_top`.
     task::kstack::init();
+    post_marker(3); // kernel-stack pool mapped
 
     // Phase 86a Track A.3 — Seed the CSPRNG from hardware entropy as early as
     // possible in the boot sequence.
@@ -142,6 +236,7 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
     //       used by AT_RANDOM, the TCP ISN fallback, and /dev/urandom; boot
     //       reaches login prompt without deadlock.  Status: ACCEPTED DEGRADED.
     arch::x86_64::syscall::seed_csprng_early();
+    post_marker(4); // CSPRNG seeded (RDSEED/RDRAND)
 
     // When built with `cargo test`, run the generated test harness and exit.
     // Placed after mm::init so that tests can use heap allocations.
@@ -155,6 +250,7 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
     // Must run after heap init so tmpfs allocations succeed, before any
     // task that opens files under those paths.
     fs::tmpfs::init();
+    post_marker(5); // tmpfs up — next: framebuffer console
 
     // P9-T002: initialise framebuffer text console (fixed-font renderer).
     if let Some((buf_ptr, mut info)) = fb_parts {
@@ -204,6 +300,23 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
         // touch the framebuffer region.
         if unsafe { fb::init_from_parts(buf_ptr, info) } {
             log::info!("[fb] framebuffer console initialised");
+            // Make the framebuffer write-combining. The bootloader maps it
+            // uncacheable, so on real hardware every pixel write is a separate
+            // bus transaction (~0.2 s per scrolled line — the bare-metal console
+            // lag). Program a WC PAT slot (also done on every AP) and remap the
+            // FB region to it: the CPU then batches pixel writes into burst
+            // transactions. QEMU's RAM-backed FB is unaffected either way.
+            arch::x86_64::pat::init();
+            if let Some((base, len)) = fb::framebuffer_region() {
+                // SAFETY: pat::init() ran on this (BSP) core just above; `base`
+                // is the live FB mapping and WC is sound for a framebuffer.
+                let leaves = unsafe { arch::x86_64::pat::set_range_write_combining(base, len) };
+                log::info!(
+                    "[fb] framebuffer remapped write-combining ({} leaves, {} KiB)",
+                    leaves,
+                    len / 1024
+                );
+            }
             // Update TTY0 winsize to match the actual framebuffer dimensions.
             if let Some((rows, cols)) = fb::console_text_size() {
                 let mut tty = tty::TTY0.lock();
@@ -217,9 +330,11 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
     } else {
         log::warn!("[fb] no framebuffer provided by bootloader");
     }
+    post_marker(6); // fb console init done (this step cleared the screen)
 
     // P15: ACPI table discovery — parse RSDP, RSDT/XSDT, MADT, FADT.
     acpi::init(rsdp_addr);
+    post_marker(7); // ACPI tables parsed (real-firmware path)
 
     // Read the launch-time boot-mode override from QEMU fw_cfg (if present) so
     // `/proc/m3os-boot-mode` reflects it before `init` makes its greeter-vs-serial
@@ -230,6 +345,7 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
     // build unit descriptor list, device-to-unit map, and reserved-region
     // set. No hardware bring-up yet (Tracks C / D / E follow).
     iommu::init();
+    post_marker(8); // IOMMU (VT-d/DMAR) discovery done
 
     // Phase 34: Read RTC and establish boot wall-clock time.
     rtc::init_rtc();
@@ -246,6 +362,7 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
 
     // P15: Enumerate PCI buses and log discovered devices.
     pci::init();
+    post_marker(9); // PCI enumeration done (real device tree)
 
     // Phase 24: Initialize virtio-blk driver.
     blk::init();
@@ -255,6 +372,18 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
     // so it is safe to run with the PIC still masked. After
     // `enable_interrupts()` the IRQ12 line is live and the mouse handler
     // begins draining packets into the lock-free ring.
+    // Phase 96: explicitly enable the PS/2 *keyboard* port + IRQ1. Previously the
+    // boot only ran `init_mouse` and assumed firmware left the keyboard enabled;
+    // on a laptop where the built-in keyboard is EC-emulated 8042 this makes the
+    // port + IRQ1 live. Safe no-op effect on a pure I2C-HID laptop (no real 8042
+    // keyboard). The USB keyboard path (xHCI + usb-hid) is independent.
+    match unsafe { arch::x86_64::ps2::init_keyboard() } {
+        Ok(()) => log::info!("[ps2] keyboard initialised (IRQ1 ready)"),
+        Err(e) => log::warn!(
+            "[ps2] keyboard init failed: {:?} — booting without PS/2 kbd",
+            e
+        ),
+    }
     match unsafe { arch::x86_64::ps2::init_mouse() } {
         Ok(()) => log::info!("[ps2] mouse initialised (IRQ12 ready)"),
         Err(e) => log::warn!("[ps2] mouse init failed: {:?} — booting without mouse", e),
@@ -272,11 +401,13 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
     } else {
         log::warn!("[apic] MADT/I/O APIC not found — staying on legacy PIC");
     }
+    post_marker(10); // interrupts enabled + APIC routing init done
 
     // Phase 25: Initialize per-core data structures for the BSP.
     // Always called — gs_base must be set for the scheduler. If no MADT is
     // available, init_bsp_per_core() falls back to single-core BSP-only mode.
     smp::init_bsp_per_core();
+    post_marker(11); // BSP per-core (GS base) init done
 
     // Phase 57e Track J — enable XSAVE/AVX state preservation on the BSP.
     //
@@ -346,6 +477,7 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
             pku_features.pkru_component_supported,
         );
     }
+    post_marker(12); // XSAVE/AVX enable + size assert + PKU report done (real-silicon-first path)
 
     // Phase 77 Track B — enable CR4.SMEP (bit 20) + CR4.SMAP (bit 21) on the
     // BSP when the CPU supports them.  Ordering matters for the same reason as
@@ -397,6 +529,7 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
     // the ring-3 e1000 driver registers its `RemoteNic` facade via IPC on
     // startup.
     net::virtio_net::init();
+    post_marker(13); // SMEP/SMAP + microcode + Spectre mitigations + virtio-net done
 
     // Trigger a breakpoint to verify the IDT is working (P3-T007).
     if cfg!(debug_assertions) {
@@ -437,10 +570,27 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
         task::scheduler::reserve_for_smp_boot();
         smp::boot::boot_aps();
     }
+    post_marker(14); // SMP boot_aps done — all APs online (AP rendezvous survived)
 
     task::spawn(init_task, "init");
     task::spawn_idle(idle_task);
 
+    post_marker(15); // pre-task kernel init complete — entering scheduler
+    // Bare-metal diagnostic: surface the LAPIC timer calibration on the
+    // framebuffer (serial is invisible without a serial port). A sane value is
+    // ~1500–60000 ticks/ms; the `6250 (default)`-class fallback or a wildly
+    // different number flags a bad PIT-ch2 calibration (→ wrong nanosleep/timer
+    // pacing). Printed just before the scheduler so it sits right above init's
+    // first output. Guarded: `lapic_ticks_per_ms` panics if APIC wasn't inited.
+    // The calibration value also goes to the always-on kernel log
+    // (`[apic] LAPIC timer calibration: … ticks/ms`); this is just the
+    // bare-metal fb mirror, gated with the other bring-up diagnostics.
+    if BRINGUP_DIAG && acpi::io_apic_address().is_some() {
+        crate::fb::write_fmt(format_args!(
+            "[timer] lapic_ticks_per_ms={}\n",
+            arch::x86_64::apic::lapic_ticks_per_ms()
+        ));
+    }
     log::info!("[kernel] entering scheduler — init will start service set");
     task::run()
 }
@@ -452,6 +602,7 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
 /// init task: creates service endpoints, registers them, spawns servers,
 /// then loads the userspace `/sbin/init` as PID 1.
 fn init_task() -> ! {
+    post_marker(21); // scheduler running; kernel-side init_task started
     // Phase 7: console service endpoint.
     let console_ep = ipc::endpoint::ENDPOINTS.lock().create();
     ipc::registry::register("console", console_ep)
@@ -511,6 +662,7 @@ fn init_task() -> ! {
     task::spawn_on_current_core(serial_stdin_feeder_task, "serial-stdin");
 
     // Phase 20: load /sbin/init from ramdisk as userspace PID 1.
+    post_marker(22); // kernel service tasks spawned — exec'ing userspace PID 1
     spawn_userspace_init();
 
     // Phase 60 Track C — One-shot diagnostic.  After every kernel-side
@@ -996,6 +1148,11 @@ fn net_task() -> ! {
         // periodic ~200 ms deadline so it advances on an otherwise idle link.
         net::ipv6::v6_tick();
 
+        // Phase 96 R4 — drive the DHCP client one step (no-op unless a RemoteNic
+        // is registered and not yet bound). Runs after `process_rx` so an OFFER/
+        // ACK queued on UDP:68 this pass is consumed immediately.
+        net::dhcp::tick();
+
         // Park on the unified flag: the virtio-net ISR, RemoteNic, and the
         // ingress pending-send hook all set it, so a wake from any path
         // reliably unblocks the task.
@@ -1003,6 +1160,13 @@ fn net_task() -> ! {
         // F.6: under sched-v2 use block_current_until (v2 CAS primitive).
         // Phase 77 Track D.2: a ~200 ms deadline turns the park into a periodic
         // wake so the RTO scan above runs even on an otherwise idle link.
+        //
+        // Phase 96: TX is now fire-and-forget (`send_tx_owned`) — queued frames
+        // carry their own bytes and the net task never blocks waiting for the
+        // polled driver to pick one up, so there is no in-flight state to
+        // fast-poll. `send_frame` already wakes this task (`wake_net_task`) the
+        // moment TCP queues an outbound frame, so the 200 ms deadline only has
+        // to backstop the periodic RTO scan on an idle link.
         {
             const TCP_RTO_TICK_INTERVAL_MS: u64 = 200;
             let deadline = crate::arch::x86_64::interrupts::tick_count()
@@ -1117,8 +1281,22 @@ pub fn handle_panic(info: &core::panic::PanicInfo) -> ! {
                 location.file(),
                 location.line()
             ));
+            // Also surface the panic on the framebuffer console: the serial
+            // banner is invisible on bare metal (no serial cable), so a kernel
+            // panic would otherwise look like a silent freeze. This is the only
+            // way to read a crash location off a physical screen.
+            crate::fb::write_fmt(format_args!(
+                "\nKERNEL PANIC at {}:{}\n  {}\n",
+                location.file(),
+                location.line(),
+                info.message(),
+            ));
         } else {
             serial::_panic_print(format_args!("KERNEL PANIC at unknown location\n"));
+            crate::fb::write_fmt(format_args!(
+                "\nKERNEL PANIC (unknown location)\n  {}\n",
+                info.message()
+            ));
         }
         serial::_panic_print(format_args!("  {}\n", info.message()));
         panic_diag::dump_crash_context();
@@ -1146,6 +1324,13 @@ pub fn handle_alloc_error(layout: alloc::alloc::Layout) -> ! {
         layout,
         free,
         total,
+        (free * 4) / 1024,
+        (total * 4) / 1024,
+        pid,
+    ));
+    // Bare-metal-visible copy (serial is invisible without a cable).
+    crate::fb::write_fmt(format_args!(
+        "\n[alloc_error] {} MiB free / {} MiB total, pid={}\n",
         (free * 4) / 1024,
         (total * 4) / 1024,
         pid,

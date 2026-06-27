@@ -17560,6 +17560,86 @@ pub(super) fn sys_linux_rename(old_ptr: u64, new_ptr: u64) -> u64 {
 // Phase 24: mount(source, target, fstype) — syscall 165
 // ---------------------------------------------------------------------------
 
+/// Probe a USB block device (`dev_id`) for an ext2 partition and return its
+/// start LBA (the `base_lba` for [`crate::fs::ext2::mount_usb`]). Handles:
+///   * whole-disk ext2, no partition table → 0 (the `usb-mount-smoke` case);
+///   * a classic MBR with a Linux (0x83) partition;
+///   * a GPT (protective MBR + "EFI PART" header), e.g. the bare-metal boot
+///     stick which is `[ESP FAT] + [ext2 logs]` — find the ext2 partition.
+///
+/// Detection is by the ext2 magic at the candidate start (not the partition
+/// type byte), so any layout that actually holds an ext2 is found. The ext2
+/// superblock sits 1024 B into the partition → LBA `start + 2`, magic `0xEF53`
+/// (LE) at superblock offset 56. Returns 0 when no ext2 is found (the caller's
+/// mount then fails cleanly).
+fn usb_ext2_base_lba(dev_id: u32) -> u64 {
+    let has_ext2_at = |lba: u64| -> bool {
+        let mut sb = [0u8; 512];
+        crate::blk::read_sectors_dev(dev_id, lba + 2, 1, &mut sb).is_ok()
+            && sb[56] == 0x53
+            && sb[57] == 0xEF
+    };
+    // 1. Whole-disk ext2 (base_lba = 0) — preserves the existing behaviour.
+    if has_ext2_at(0) {
+        return 0;
+    }
+    // 2. Partition table at LBA 0 (MBR signature required).
+    let mut lba0 = [0u8; 512];
+    if crate::blk::read_sectors_dev(dev_id, 0, 1, &mut lba0).is_err()
+        || lba0[510] != 0x55
+        || lba0[511] != 0xAA
+    {
+        return 0;
+    }
+    // GPT: a protective MBR's first partition entry (offset 446) has type 0xEE.
+    if lba0[450] == 0xEE {
+        let mut hdr = [0u8; 512];
+        if crate::blk::read_sectors_dev(dev_id, 1, 1, &mut hdr).is_ok() && &hdr[0..8] == b"EFI PART"
+        {
+            let part_lba = u64::from_le_bytes(hdr[72..80].try_into().unwrap_or([0; 8]));
+            let esize = u32::from_le_bytes(hdr[84..88].try_into().unwrap_or([0; 4])) as usize;
+            if part_lba != 0 && esize == 128 {
+                // Size the scan from the GPT header's partition-entry count
+                // (bytes 80..84) instead of assuming the 128-entry default, so an
+                // ext2 partition beyond entry 128 is still found. Capped at 256
+                // sectors (≥1024 standard entries) to keep mount bounded against
+                // a hostile header.
+                let num_entries =
+                    u32::from_le_bytes(hdr[80..84].try_into().unwrap_or([0; 4])) as u64;
+                let scan_sectors = ((num_entries * esize as u64).div_ceil(512)).min(256);
+                for sec in 0..scan_sectors {
+                    let mut ent = [0u8; 512];
+                    if crate::blk::read_sectors_dev(dev_id, part_lba + sec, 1, &mut ent).is_err() {
+                        break;
+                    }
+                    for k in 0..4usize {
+                        let off = k * 128;
+                        let first = u64::from_le_bytes(
+                            ent[off + 32..off + 40].try_into().unwrap_or([0; 8]),
+                        );
+                        if first != 0 && has_ext2_at(first) {
+                            return first;
+                        }
+                    }
+                }
+            }
+        }
+        return 0;
+    }
+    // 3. Classic MBR: 4 × 16-byte entries at offset 446 (type at +4, LBA at +8).
+    for e in 0..4usize {
+        let off = 446 + e * 16;
+        if lba0[off + 4] == 0 {
+            continue;
+        }
+        let start = u32::from_le_bytes(lba0[off + 8..off + 12].try_into().unwrap_or([0; 4])) as u64;
+        if start != 0 && has_ext2_at(start) {
+            return start;
+        }
+    }
+    0
+}
+
 pub(super) fn sys_linux_mount(source_ptr: u64, target_ptr: u64, fstype_ptr: u64) -> u64 {
     let (_, _, euid, _) = current_process_ids();
     if euid != 0 {
@@ -17623,9 +17703,12 @@ pub(super) fn sys_linux_mount(source_ptr: u64, target_ptr: u64, fstype_ptr: u64)
                     return NEG_ENODEV;
                 }
             };
-            // The USB image is a bare ext2 (no partition table), so the
-            // superblock is at LBA 2 from device start (base_lba = 0).
-            match crate::fs::ext2::mount_usb(&resolved_target, 0, dev_id) {
+            // Locate the ext2: a bare whole-disk ext2 (base_lba = 0, the
+            // smoke-test case) OR a partition on a GPT/MBR-partitioned device
+            // (the bare-metal boot stick is `[ESP] + [ext2 logs]`). See
+            // `usb_ext2_base_lba`.
+            let base_lba = usb_ext2_base_lba(dev_id);
+            match crate::fs::ext2::mount_usb(&resolved_target, base_lba, dev_id) {
                 Ok(displaced) => {
                     // Replacing a mount at the same prefix orphans the old
                     // backend's registry slot — free it so repeated remounts

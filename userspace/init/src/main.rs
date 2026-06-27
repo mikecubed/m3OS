@@ -206,6 +206,8 @@ const KNOWN_CONFIGS: &[&[u8]] = &[
     b"/etc/services.d/igc_driver.conf\0",
     b"/etc/services.d/r8169_driver.conf\0",
     b"/etc/services.d/r8125_driver.conf\0",
+    // Phase 96 Stage-1a: ring-3 USB-Ethernet driver for RTL815x.
+    b"/etc/services.d/ure_driver.conf\0",
     // Phase 81: ring-3 MediaTek mt792x Wi-Fi driver.
     b"/etc/services.d/mt792x_driver.conf\0",
     // Phase 78a B.2: ring-3 xHCI USB host-controller driver.
@@ -1302,31 +1304,78 @@ impl ServiceManager {
         }
     }
 
-    /// Fallback: register built-in service definitions for telnetd and sshd.
+    /// Fallback: register built-in service definitions when no on-disk service
+    /// configs are available.
+    ///
+    /// This fires on a **bare-metal USB boot with no ext2 data disk**: the
+    /// root mount falls back to the ramdisk root (using the boot USB as a
+    /// writable root is future work — `blk::remote` slot 0 only auto-discovers
+    /// `nvme.block`/`ahci.block`, and the boot stick is a GPT-partitioned device
+    /// the secondary-mount path can't yet target), `/etc/services.d` is absent,
+    /// and without this the box would come up with only `telnetd`/`sshd` — no
+    /// keyboard, no USB, no NIC. We parse embedded copies of the essential
+    /// configs (mirrors xtask's `populate_ext2_files`) through the same
+    /// `parse_service_def` path the on-disk configs use, so the dependency graph
+    /// and restart policy behave identically. Kept minimal — no display/greeter/
+    /// audio: a USB-only boot uses the kernel framebuffer console + the ramdisk
+    /// root. `usb_storage` IS included (Phase 92a added the mass-storage driver)
+    /// so a USB stick can be probed/mounted for persistent logs and as a
+    /// stepping stone toward a writable USB root. Order is irrelevant (deps
+    /// resolve by name across the set).
     fn add_builtin_defaults(&mut self) {
-        // telnetd
-        if self.count < MAX_SERVICES {
-            let mut svc = ServiceDef::empty();
-            svc.name = FixedStr::from_bytes(b"telnetd");
-            svc.command = FixedStr::from_bytes(b"/bin/telnetd");
-            svc.service_type = ServiceType::Daemon;
-            svc.restart_policy = RestartPolicy::Always;
-            svc.max_restart = 10;
-            svc.active = true;
-            self.services[self.count] = svc;
-            self.count += 1;
-        }
-        // sshd
-        if self.count < MAX_SERVICES {
-            let mut svc = ServiceDef::empty();
-            svc.name = FixedStr::from_bytes(b"sshd");
-            svc.command = FixedStr::from_bytes(b"/bin/sshd");
-            svc.service_type = ServiceType::Daemon;
-            svc.restart_policy = RestartPolicy::Always;
-            svc.max_restart = 10;
-            svc.active = true;
-            self.services[self.count] = svc;
-            self.count += 1;
+        const BUILTIN_CONFIGS: &[&[u8]] = &[
+            // console + kbd: the PS/2 and USB keyboard input pipeline to the
+            // kernel framebuffer console / login tty.
+            b"name=console\ncommand=/bin/console_server\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=\n",
+            b"name=kbd\ncommand=/bin/kbd_server\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=console\n",
+            // stdin_feeder is the pump that makes physical keyboard input reach
+            // the text console: it drains PS/2 scancodes from kbd_server (which is
+            // purely reactive) and pushes decoded bytes into the kernel line
+            // discipline / login TTY. Without it the framebuffer login is deaf to
+            // the keyboard (SSH still works — sshd feeds its pty directly). It was
+            // only in the data-disk KNOWN_CONFIGS, so bare-metal builtin-defaults
+            // boots had no keyboard echo at all.
+            b"name=stdin_feeder\ncommand=/bin/stdin_feeder\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=console,kbd\n",
+            // xHCI host controller + USB HID class driver (USB keyboard/mouse).
+            b"name=xhci_driver\ncommand=/drivers/xhci\ntype=daemon\nrestart=on-failure\nmax_restart=5\n",
+            b"name=usb_hid\ncommand=/drivers/usb-hid\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=xhci_driver\n",
+            // USB hub walker (Phase 92a): brings up external/dock hubs (descriptor
+            // + per-port power/reset) so devices behind a hub — e.g. a USB keyboard
+            // on a dock when all the laptop's own ports are full — get enumerated
+            // and surfaced to usb_hid. Without this, the xhci driver only reaches
+            // root-port devices and logs "USB HUB … NOT enumerated (no hub driver)".
+            b"name=usbhub\ncommand=/drivers/usbhub\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=xhci_driver\n",
+            // USB Mass Storage (Phase 92a): probes the boot stick / any attached
+            // stick as a `usb0.block` device. On bare metal this answers whether
+            // the boot USB is reachable as mass storage (the writable-USB-root
+            // de-risk) and provides a persistent ext2 volume for boot-log capture.
+            b"name=usb_storage\ncommand=/drivers/usb-storage\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=xhci_driver\n",
+            // Phase 96: persist the kernel dmesg ring to the USB log partition
+            // (/mnt/usb0/boot.log) so a bare-metal boot can be read off the drive
+            // afterward. Separate process from usb_storage (it mounts the device
+            // usb_storage serves). restart=on-failure: it exits cleanly when no
+            // ext2 log partition is present, so it must NOT be restarted then.
+            b"name=usb_logsink\ncommand=/bin/usb-logsink\ntype=daemon\nrestart=on-failure\nmax_restart=2\ndepends=usb_storage\n",
+            // RTL8156 USB-Ethernet NIC (the only networking on a Phase 96 laptop
+            // with no Ethernet port) — brings the link up for in-kernel DHCP.
+            b"name=ure_driver\ncommand=/drivers/ure\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=xhci_driver\n",
+            // Remote-login daemons (previously the only built-in defaults).
+            b"name=telnetd\ncommand=/bin/telnetd\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=\n",
+            b"name=sshd\ncommand=/bin/sshd\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=\n",
+        ];
+        let mut i = 0;
+        while i < BUILTIN_CONFIGS.len() {
+            if self.count >= MAX_SERVICES {
+                break;
+            }
+            let cfg = BUILTIN_CONFIGS[i];
+            if let Some(svc) = parse_service_def(cfg, cfg.len())
+                && !Self::is_disabled(svc.name.as_bytes())
+            {
+                self.services[self.count] = svc;
+                self.count += 1;
+            }
+            i += 1;
         }
     }
 
@@ -2610,19 +2659,40 @@ fn bootstrap_ring3_root_disk() -> isize {
         // "negative errno ... otherwise" contract.
         return pid;
     }
-    // Retry the mount up to 40 × 100 ms = 4 s, giving the driver time to reset
+    // Retry the mount up to 15 × 100 ms = 1.5 s, giving the driver time to reset
     // the HBA, bring up the port (COMRESET), IDENTIFY the disk, and register
     // ahci.block. Bring-up takes well under a second on QEMU; the headroom
-    // covers a slow bare-metal COMRESET.
+    // covers a slow bare-metal COMRESET. (Was 40×100 ms; trimmed because on a
+    // bare-metal USB boot there is no AHCI controller, so this is a pure detour
+    // before the ramdisk-defaults fallback.)
+    //
+    // A '.' is printed per attempt so a bare-metal boot can distinguish a working
+    // timer (dots tick by ~10/s → fall through to defaults) from a wedged
+    // `nanosleep` (stuck on the first dot) — the kernel log is serial-only and
+    // invisible without a serial port.
+    // Bare-metal bring-up diagnostic (default OFF, mirrors the kernel's
+    // `BRINGUP_DIAG`): a '.' per attempt lets a real-silicon boot tell a working
+    // timer (dots tick ~10/s) from a wedged `nanosleep` (stuck on dot 1). Flip
+    // to `true` + rebuild to re-enable for the next bare-metal bring-up.
+    const BRINGUP_DIAG: bool = false;
     let mut ret: isize = -19; // -ENODEV
     let mut attempts = 0u32;
-    while attempts < 40 {
+    while attempts < 15 {
+        if BRINGUP_DIAG {
+            write_str(STDOUT_FILENO, ".");
+        }
         let _ = nanosleep_for(0, 100_000_000); // 100 ms
         ret = mount(b"/dev/blk0\0".as_ptr(), b"/\0".as_ptr(), b"ext2\0".as_ptr());
         if ret == 0 {
+            if BRINGUP_DIAG {
+                write_str(STDOUT_FILENO, "\n");
+            }
             return 0;
         }
         attempts += 1;
+    }
+    if BRINGUP_DIAG {
+        write_str(STDOUT_FILENO, "\n");
     }
     ret
 }

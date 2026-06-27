@@ -1,6 +1,6 @@
-//! Static network configuration (P16-T029).
+//! Network configuration (P16-T029; Phase 96 R4: runtime-mutable for DHCP).
 //!
-//! QEMU user-mode networking defaults:
+//! Defaults match QEMU user-mode (SLIRP) networking:
 //! - Guest IP: 10.0.2.15/24
 //! - Gateway:  10.0.2.2
 //! - DNS:      10.0.2.3
@@ -14,24 +14,55 @@
 //! this kernel `dns_servers()` store into that resolver path (so a learned
 //! v6 nameserver is actually queried) is a tracked follow-up — see the Phase 91
 //! task doc D.1 (`config::dns_servers` is currently write-only).
+//!
+//! Phase 96 makes the IPv4 values runtime-mutable too: they are no longer
+//! compile-time constants — a DHCP client installs a learned lease via
+//! [`set_config`], and `our_ip`/`subnet_mask`/`gateway_ip` read it back. Backed
+//! by atomics (lock-free, IRQ-safe) since the net polling task, socket
+//! syscalls, and the DHCP path all read them.
+
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use super::arp::Ipv4Addr;
 use crate::task::scheduler::IrqSafeMutex;
 use kernel_core::types::Ipv6Addr;
 
-/// Our static IPv4 address.
-pub fn our_ip() -> Ipv4Addr {
-    [10, 0, 2, 15]
+/// Pack `[a, b, c, d]` into a `u32` (`a` in the high byte).
+const fn pack(a: Ipv4Addr) -> u32 {
+    ((a[0] as u32) << 24) | ((a[1] as u32) << 16) | ((a[2] as u32) << 8) | (a[3] as u32)
 }
 
-/// Subnet mask (/24).
+/// Inverse of [`pack`].
+const fn unpack(v: u32) -> Ipv4Addr {
+    [(v >> 24) as u8, (v >> 16) as u8, (v >> 8) as u8, v as u8]
+}
+
+static OUR_IP: AtomicU32 = AtomicU32::new(pack([10, 0, 2, 15]));
+static SUBNET_MASK: AtomicU32 = AtomicU32::new(pack([255, 255, 255, 0]));
+static GATEWAY: AtomicU32 = AtomicU32::new(pack([10, 0, 2, 2]));
+
+/// Our IPv4 address (mutable — DHCP installs a lease via [`set_config`]).
+pub fn our_ip() -> Ipv4Addr {
+    unpack(OUR_IP.load(Ordering::Relaxed))
+}
+
+/// Subnet mask.
 pub fn subnet_mask() -> Ipv4Addr {
-    [255, 255, 255, 0]
+    unpack(SUBNET_MASK.load(Ordering::Relaxed))
 }
 
 /// Default gateway.
 pub fn gateway_ip() -> Ipv4Addr {
-    [10, 0, 2, 2]
+    unpack(GATEWAY.load(Ordering::Relaxed))
+}
+
+/// Install a network configuration learned at runtime (e.g. from a DHCP ACK).
+/// Phase 96. Stored atomically; subsequent `our_ip`/`subnet_mask`/`gateway_ip`
+/// reads observe the new values.
+pub fn set_config(ip: Ipv4Addr, mask: Ipv4Addr, gateway: Ipv4Addr) {
+    OUR_IP.store(pack(ip), Ordering::Relaxed);
+    SUBNET_MASK.store(pack(mask), Ordering::Relaxed);
+    GATEWAY.store(pack(gateway), Ordering::Relaxed);
 }
 
 /// Check if `ip` is on the local subnet.

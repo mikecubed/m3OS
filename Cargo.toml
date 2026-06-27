@@ -53,6 +53,8 @@ members = [
     "userspace/coreutils-tests",
     # Phase 46 syslogd
     "userspace/syslogd",
+    # Phase 96 — USB log-volume persistence (kernel dmesg → /mnt/usb0/boot.log)
+    "userspace/usb-logsink",
     # Phase 46 crond
     "userspace/crond",
     # Phase 52 extracted services:
@@ -75,6 +77,8 @@ members = [
     "userspace/drivers/igc",
     "userspace/drivers/r8169",
     "userspace/drivers/r8125",
+    # Phase 96 Stage-1a — ring-3 USB-Ethernet driver for RTL815x (RTL8156 bring-up probe)
+    "userspace/drivers/ure",
     # Phase 78a Track B.2 — ring-3 xHCI USB host-controller driver
     "userspace/drivers/xhci",
     # Phase 78b Track A — host↔class IPC protocol crate

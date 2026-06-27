@@ -120,6 +120,16 @@ pub const ENABLE_SLOT_OK_SENTINEL: &str = "XHCI_BRINGUP:enable-slot:OK\n";
 /// load-bearing.
 pub const XHCI_ENUM_CONFIGURED_SENTINEL: &str = "XHCI_ENUM:configured\n";
 
+/// Bare-metal debug toggle: emit the verbose per-port / per-device enumeration
+/// chatter (`[xhci] starting enumeration on port …`, `[xhci] enumeration
+/// complete`, and the full descriptor tree). Default `false` so a normal boot
+/// screen stays clean and fast on the uncached bare-metal framebuffer, where
+/// each line costs ~hundreds of ms. The concise one-line `[xhci] surfaced
+/// device vid=… pid=… class=…` summary and the sentinels are kept regardless —
+/// they identify what enumerated, which is exactly what a FAIL verdict needs.
+/// Flip to `true` and rebuild for full USB enumeration tracing.
+const VERBOSE_ENUM: bool = false;
+
 /// Fallback PCI BDF used when `sys_device_pci_enumerate` returns no matches.
 ///
 /// QEMU assigns this address to `-device qemu-xhci,addr=0x6` under m3OS
@@ -282,9 +292,11 @@ fn bring_up_controller(
         // Phase 78c: enumerate each connected port into its own slot context so
         // a keyboard AND mouse are both Configured and served.
         for (port_num, speed) in connected {
-            syscall_lib::write_str(STDOUT_FILENO, "[xhci] starting enumeration on port ");
-            write_u8_dec(port_num);
-            syscall_lib::write_str(STDOUT_FILENO, "\n");
+            if VERBOSE_ENUM {
+                syscall_lib::write_str(STDOUT_FILENO, "[xhci] starting enumeration on port ");
+                write_u8_dec(port_num);
+                syscall_lib::write_str(STDOUT_FILENO, "\n");
+            }
 
             // ep0_ring_iova is 0 here; enable_slot allocates the per-slot
             // context and the ops impl patches the real IOVA before Address
@@ -301,7 +313,9 @@ fn bring_up_controller(
 
             match final_state {
                 EnumState::Configured => {
-                    syscall_lib::write_str(STDOUT_FILENO, "[xhci] enumeration complete\n");
+                    if VERBOSE_ENUM {
+                        syscall_lib::write_str(STDOUT_FILENO, "[xhci] enumeration complete\n");
+                    }
                     // Bare-metal diagnostic: m3OS has no hub driver, so any device
                     // behind a hub (e.g. a keyboard with a built-in USB hub) is
                     // invisible. Flag a hub loudly so the boot log explains a
@@ -329,7 +343,9 @@ fn bring_up_controller(
                             " — devices behind it are NOT enumerated (no hub driver yet)\n",
                         );
                     }
-                    print_descriptor_tree(&final_ctx);
+                    if VERBOSE_ENUM {
+                        print_descriptor_tree(&final_ctx);
+                    }
                     syscall_lib::write_str(STDOUT_FILENO, XHCI_ENUM_CONFIGURED_SENTINEL);
                     // Phase 78c/96: record any surfaceable interface (HID, or a
                     // bulk IN+OUT pair for the NIC) so the server can hand it to a

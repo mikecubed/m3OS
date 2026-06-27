@@ -5,6 +5,7 @@ pub mod cpuid;
 pub mod gdt;
 pub mod interrupts;
 pub mod microcode;
+pub mod pat;
 pub mod pkru;
 pub mod preempt_trap_frame;
 pub mod ps2;

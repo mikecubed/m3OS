@@ -7,6 +7,7 @@
 
 pub mod arp;
 pub mod config;
+pub mod dhcp;
 pub mod dhcpv6;
 #[allow(dead_code)]
 pub mod dispatch;

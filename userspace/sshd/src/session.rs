@@ -88,7 +88,18 @@ fn log_sshd_step_i64(step: &str, value_name: &str, value: i64) {
 }
 
 fn log_sshd_loop_counter(step: &str, count: u64) {
-    if count == 1 || count.is_multiple_of(1000) {
+    // Bare-metal performance: `STDOUT_FILENO` is the kernel console, which on
+    // real hardware is a write-combined framebuffer — each line still costs
+    // ~hundreds of ms (per-pixel framebuffer writes + a full-screen scroll blit;
+    // write-combining is far slower than cached RAM). These counters
+    // sit on the sshd event-loop HOT PATH (io_task wakes, progress_task events),
+    // so logging them periodically throttled the whole SSH session to the
+    // framebuffer's write speed — observed as the screen flooding with `count=`
+    // lines and SSH being unusable. Log only the FIRST occurrence of each
+    // counter (a one-time breadcrumb that a loop started turning); never the
+    // periodic flood. To re-enable verbose loop tracing for debugging, restore
+    // the `|| count.is_multiple_of(N)` term with a large N.
+    if count == 1 {
         log_sshd_step_u64(step, "count", count);
     }
 }

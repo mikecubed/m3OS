@@ -1,12 +1,29 @@
 //! ICMP echo request/reply — pure logic re-exported from kernel-core.
 
-use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 use super::ipv4::{self, Ipv4Header};
 
 #[allow(unused_imports)]
 pub use kernel_core::net::icmp::{ICMP_ECHO_REPLY, ICMP_ECHO_REQUEST, IcmpHeader};
 use kernel_core::net::icmp::{build, parse};
+
+/// Per-boot echo counters surfaced by the DHCP/network heartbeat. `echo_rx`
+/// counts inbound echo *requests* (a host pinging us — proof the unicast frame
+/// passed the dongle RX filter and reached the stack); `echo_tx` counts echo
+/// *replies* we sent. `echo_rx == 0` while a host is pinging means the ping is
+/// still being dropped before us (RX filter); `echo_rx > 0, echo_tx == 0` means
+/// we saw it but failed to reply (e.g. ARP-resolve miss for the reply route).
+static ECHO_RX: AtomicU32 = AtomicU32::new(0);
+static ECHO_TX: AtomicU32 = AtomicU32::new(0);
+
+/// Snapshot of `(echo_requests_received, echo_replies_sent)` this boot.
+pub fn echo_counts() -> (u32, u32) {
+    (
+        ECHO_RX.load(Ordering::Relaxed),
+        ECHO_TX.load(Ordering::Relaxed),
+    )
+}
 
 /// Handle an incoming ICMP packet.
 pub fn handle_icmp(ip_header: &Ipv4Header, payload: &[u8]) {
@@ -17,8 +34,10 @@ pub fn handle_icmp(ip_header: &Ipv4Header, payload: &[u8]) {
 
     match icmp_hdr.icmp_type {
         ICMP_ECHO_REQUEST => {
+            ECHO_RX.fetch_add(1, Ordering::Relaxed);
             let reply = build(ICMP_ECHO_REPLY, 0, icmp_hdr.rest, icmp_data);
             ipv4::send(ip_header.src, ipv4::PROTO_ICMP, &reply);
+            ECHO_TX.fetch_add(1, Ordering::Relaxed);
             log::debug!(
                 "[icmp] echo reply sent to {}.{}.{}.{}",
                 ip_header.src[0],

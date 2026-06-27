@@ -50,14 +50,24 @@ const STATUS_OUTPUT_FULL: u8 = 1 << 0;
 const STATUS_INPUT_FULL: u8 = 1 << 1;
 
 // 8042 controller commands (written to PS2_STATUS).
+const CMD_ENABLE_KBD: u8 = 0xAE; // enable first (keyboard) PS/2 port
 const CMD_ENABLE_AUX: u8 = 0xA8;
 const CMD_READ_CONFIG: u8 = 0x20;
 const CMD_WRITE_CONFIG: u8 = 0x60;
 const CMD_WRITE_TO_AUX: u8 = 0xD4;
 
 // 8042 controller config byte bits (read/written via 0x20 / 0x60).
+const CONFIG_KBD_IRQ: u8 = 1 << 0; // keyboard (first port) generates IRQ1
 const CONFIG_AUX_IRQ: u8 = 1 << 1;
+const CONFIG_KBD_DISABLE: u8 = 1 << 4; // keyboard (first port) clock disabled
 const CONFIG_AUX_DISABLE: u8 = 1 << 5;
+const CONFIG_TRANSLATE: u8 = 1 << 6; // controller translates set-2 → set-1 scancodes
+
+/// Keyboard ACK byte (0xFA) — every keyboard command is acknowledged with it.
+const KBD_RESPONSE_ACK: u8 = 0xFA;
+
+// Keyboard (first port) device command.
+const KBD_CMD_ENABLE_SCANNING: u8 = 0xF4;
 
 // Mouse (AUX device) commands (written via 0xD4 prefix).
 const MOUSE_CMD_SET_DEFAULTS: u8 = 0xF6;
@@ -409,6 +419,65 @@ pub unsafe fn init_mouse() -> Result<(), Ps2Error> {
     // Drain any acks/leftover bytes the device may have queued.
     drain_output();
     MOUSE_READY.store(true, Ordering::Release);
+    Ok(())
+}
+
+/// Enable the PS/2 *keyboard* (first 8042 port). The kernel feeds the IRQ1
+/// scancode path for the built-in keyboard on EC-emulated-8042 laptops, but the
+/// boot path only ever ran [`init_mouse`] — it assumed the firmware left the
+/// keyboard port enabled. Make it explicit: enable the first port, clear
+/// `KBD_DISABLE` + set `KBD_IRQ` in the controller config (preserving the other
+/// firmware-set bits, e.g. scancode-set-1 translation), and tell the keyboard to
+/// enable scanning. Bounded (the wait helpers cap their spins) and safe — a
+/// no-op effect on a pure I2C-HID laptop with no real 8042 keyboard. Returns
+/// `Ok(())` even when the device ACK is absent (the firmware may already have
+/// enabled scanning); the goal is only to guarantee the port + IRQ1 are live.
+///
+/// # Safety
+/// Direct 8042 controller/data port I/O; call once at boot with IRQ1 masked.
+pub unsafe fn init_keyboard() -> Result<(), Ps2Error> {
+    drain_output();
+    // Enable the first (keyboard) PS/2 port at the controller.
+    write_command(CMD_ENABLE_KBD)?;
+    // Read config; enable the keyboard clock + its IRQ, keep everything else.
+    write_command(CMD_READ_CONFIG)?;
+    let config_before = read_data()?;
+    let mut config = config_before;
+    config &= !CONFIG_KBD_DISABLE;
+    config |= CONFIG_KBD_IRQ;
+    write_command(CMD_WRITE_CONFIG)?;
+    write_data(config)?;
+    // Read the config back to confirm the controller accepted the write.
+    write_command(CMD_READ_CONFIG)?;
+    let config_after = read_data().unwrap_or(0);
+    // Best-effort: tell the keyboard device to (re)enable scanning, and capture
+    // its ACK (0xFA) so the boot log proves a real keyboard is present + talking.
+    let ack = match write_data(KBD_CMD_ENABLE_SCANNING) {
+        Ok(()) => read_data().unwrap_or(0x00), // 0x00 = no response within budget
+        Err(_) => 0x00,
+    };
+    // Bare-metal diagnostic (no serial port on the target laptop): one fb line
+    // says whether the 8042 keyboard port is live and how it's framed, so a dead
+    // keyboard can be triaged from a photo of the screen:
+    //   xlate=1 → controller gives set-1 codes (what the kernel decoder expects);
+    //             xlate=0 means raw set-2 → the decoder sees garbage → no keys.
+    //   irq=1   → KBD_IRQ enabled (IRQ1 should fire on each keypress).
+    //   dis=0   → keyboard clock enabled.
+    //   ack=fa  → keyboard ACK'd enable-scanning (present + responding);
+    //             ack=00 → no response (no real 8042 keyboard, or wedged).
+    log::info!(
+        "[ps2] kbd cfg before=0x{:02x} after=0x{:02x} xlate={} irq={} dis={} ack=0x{:02x}",
+        config_before,
+        config_after,
+        (config_after & CONFIG_TRANSLATE != 0) as u8,
+        (config_after & CONFIG_KBD_IRQ != 0) as u8,
+        (config_after & CONFIG_KBD_DISABLE != 0) as u8,
+        ack,
+    );
+    if ack != KBD_RESPONSE_ACK {
+        log::warn!("[ps2] keyboard did not ACK enable-scanning (ack=0x{ack:02x})");
+    }
+    drain_output();
     Ok(())
 }
 
