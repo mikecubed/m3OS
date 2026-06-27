@@ -1,8 +1,24 @@
 # Handoff — `dlopen-test-smoke` intermittent TCG stall (Phase 97 debugging)
 
-**Status:** Open / deferred. Tracked as **Phase 97** in the [roadmap README](../roadmap/README.md).
+**Status:** Superseded by the Phase 97 design + task docs — see
+[`docs/roadmap/97-dlopen-smoke-tcg-stall.md`](../roadmap/97-dlopen-smoke-tcg-stall.md)
+and [`docs/roadmap/tasks/97-dlopen-smoke-tcg-stall-tasks.md`](../roadmap/tasks/97-dlopen-smoke-tcg-stall-tasks.md).
+Tracked as **Phase 97** in the [roadmap README](../roadmap/README.md).
 **Created:** 2026-06-26.
 **Owner area:** kernel demand-paging / `vfs_server` blocking-read path (Phase 95b `MAP_LAZY_FILE`), the dynamic linker (`ld-musl-x86_64.so.1`), and the `smoke-test` harness.
+
+> **⚠️ Correction (Phase 97 investigation).** The "Leading hypothesis" below — a
+> blocking-`vfs_server` demand-read lost-wakeup — is **falsified for this gate**.
+> `readelf -d` shows `dlopen_test`'s whole dependency graph (`ld-musl`, `libdl.so`,
+> `libhello.so`, `libhello_fini.so`) is **ramdisk-embedded**, so every demand fill is a
+> **synchronous in-kernel `copy_from_slice`** (`kernel_read_fd_at`'s `FdBackend::Ramdisk`
+> arm, `syscall/mod.rs:12098`) — there is no `call_msg`, no parking, and no `vfs_server`
+> reply to lose on this gate's hot path (the blocking `vfs` path is only exercised by
+> `/usr` ext2 files: the `rustc`/`clang`/install reads). The leading **surviving** suspect
+> is the cross-core **TLB shootdown** that `dlclose`'s `munmap` runs **twice** on the
+> `FINI_PENDING`→`PASS` critical path (`unmap_dso` → `sys_munmap` → `sys_linux_munmap` →
+> `crate::smp::tlb::tlb_shootdown_range`, `dl.rs:670` / `mod.rs:12820,13006`) under `-smp 4`
+> TCG host oversubscription. Read the Phase 97 design doc, not this hypothesis, before fixing.
 
 ## Symptom
 
