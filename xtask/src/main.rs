@@ -567,7 +567,7 @@ fn parse_vid_pid(spec: &str) -> Result<(u16, u16), String> {
     let (vid_str, pid_str) = spec.split_once(':').ok_or_else(|| {
         format!(
             "invalid `--usb-passthrough` spec {:?}: expected `<vid>:<pid>` \
-             (four-hex-digit vendor:product, e.g. `0bda:8156`)",
+             (1-4 hex digits each, e.g. `0bda:8156`)",
             spec
         )
     })?;

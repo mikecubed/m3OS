@@ -1152,6 +1152,11 @@ fn program_main(_args: &[&str]) -> i32 {
             bulk_out_dci = notice.bulk_out_dci;
             break;
         }
+        // The protocol cursor is a u8; stop before `saturating_add` would pin it
+        // at 255 and re-request cursor 255 forever (server with 256+ notices).
+        if cursor == u8::MAX {
+            break;
+        }
         cursor = cursor.saturating_add(1);
     }
 

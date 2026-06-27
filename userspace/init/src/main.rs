@@ -2691,7 +2691,9 @@ fn bootstrap_ring3_root_disk() -> isize {
         }
         attempts += 1;
     }
-    write_str(STDOUT_FILENO, "\n");
+    if BRINGUP_DIAG {
+        write_str(STDOUT_FILENO, "\n");
+    }
     ret
 }
 

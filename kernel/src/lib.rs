@@ -602,7 +602,7 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
 /// init task: creates service endpoints, registers them, spawns servers,
 /// then loads the userspace `/sbin/init` as PID 1.
 fn init_task() -> ! {
-    post_marker(19); // scheduler running; kernel-side init_task started
+    post_marker(21); // scheduler running; kernel-side init_task started
     // Phase 7: console service endpoint.
     let console_ep = ipc::endpoint::ENDPOINTS.lock().create();
     ipc::registry::register("console", console_ep)
@@ -662,7 +662,7 @@ fn init_task() -> ! {
     task::spawn_on_current_core(serial_stdin_feeder_task, "serial-stdin");
 
     // Phase 20: load /sbin/init from ramdisk as userspace PID 1.
-    post_marker(20); // kernel service tasks spawned — exec'ing userspace PID 1
+    post_marker(22); // kernel service tasks spawned — exec'ing userspace PID 1
     spawn_userspace_init();
 
     // Phase 60 Track C — One-shot diagnostic.  After every kernel-side

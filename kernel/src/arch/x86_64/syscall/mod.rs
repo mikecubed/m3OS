@@ -17598,9 +17598,16 @@ fn usb_ext2_base_lba(dev_id: u32) -> u64 {
         {
             let part_lba = u64::from_le_bytes(hdr[72..80].try_into().unwrap_or([0; 8]));
             let esize = u32::from_le_bytes(hdr[84..88].try_into().unwrap_or([0; 4])) as usize;
-            // Standard 128-byte GPT entries: 4 per 512-byte sector, ≤128 entries.
             if part_lba != 0 && esize == 128 {
-                for sec in 0..32u64 {
+                // Size the scan from the GPT header's partition-entry count
+                // (bytes 80..84) instead of assuming the 128-entry default, so an
+                // ext2 partition beyond entry 128 is still found. Capped at 256
+                // sectors (≥1024 standard entries) to keep mount bounded against
+                // a hostile header.
+                let num_entries =
+                    u32::from_le_bytes(hdr[80..84].try_into().unwrap_or([0; 4])) as u64;
+                let scan_sectors = ((num_entries * esize as u64).div_ceil(512)).min(256);
+                for sec in 0..scan_sectors {
                     let mut ent = [0u8; 512];
                     if crate::blk::read_sectors_dev(dev_id, part_lba + sec, 1, &mut ent).is_err() {
                         break;

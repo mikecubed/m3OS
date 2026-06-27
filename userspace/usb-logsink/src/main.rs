@@ -78,12 +78,22 @@ fn snapshot_kmsg(buf: &mut [u8]) -> isize {
         return lfd;
     }
     let mut total: isize = 0;
-    loop {
+    'copy: loop {
         let n = read(kfd as i32, buf);
         if n <= 0 {
             break;
         }
-        let _ = write(lfd as i32, &buf[..n as usize]);
+        // Write the FULL chunk — a short or failed write would otherwise silently
+        // truncate boot.log while `total` still counts bytes read from kmsg,
+        // defeating the post-mortem log persistence this daemon exists for.
+        let mut off = 0usize;
+        while off < n as usize {
+            let w = write(lfd as i32, &buf[off..n as usize]);
+            if w <= 0 {
+                break 'copy;
+            }
+            off += w as usize;
+        }
         total += n;
     }
     let _ = fsync(lfd as i32);
