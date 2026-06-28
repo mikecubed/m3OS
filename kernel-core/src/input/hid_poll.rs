@@ -34,8 +34,11 @@ pub const HID_POLL_MAX_IDLE_NS: u32 = 100_000_000; // 100 ms
 
 /// Number of consecutive empty polls per backoff doubling step.
 ///
-/// At `HID_POLL_FAST_NS` (5 ms) each doubling step is 20 ms of wall-clock
-/// idle before the sleep lengthens.  Six steps reach `HID_POLL_MAX_IDLE_NS`.
+/// The sleep stays at `HID_POLL_FAST_NS` (5 ms) for the first
+/// `HID_BACKOFF_STEP` (4) empty polls, then doubles every further 4 empty
+/// polls — 10 → 20 → 40 → 80 ms — and saturates at `HID_POLL_MAX_IDLE_NS`
+/// (100 ms) once `consecutive_empty` reaches ~20 (the `.min(5)` doubling
+/// clamp in [`next_hid_backoff_ns`]).
 const HID_BACKOFF_STEP: u32 = 4;
 
 /// Compute the next `nanosleep_for` duration for `usb-hid`'s poll loop.

@@ -467,7 +467,13 @@ fn set_keyboard_leds(usb_ep: u32, dev: &HidDevice) {
 /// (`decode_pointer_report`, B.2), and inject motion + wheel + button edges into
 /// `mouse_server`. A tablet reports an absolute position; a gaming mouse reports
 /// relative deltas + a scroll wheel + extra buttons.
-/// Returns `true` if a non-empty report was received.
+///
+/// Returns `true` only when the report carried new pointer activity (motion,
+/// wheel, or a button-state change). Returns `false` both when no report was
+/// available and when an idle report decoded to no movement and no button
+/// change — e.g. a tablet that re-reports its static position every frame.
+/// The caller uses this to drive the adaptive-backoff state machine, so
+/// "empty" here means "no new activity", not "no USB transfer".
 fn poll_report_pointer(usb_ep: u32, mouse_ep: u32, dev: &mut HidDevice) -> bool {
     let report = match poll_report(usb_ep, dev) {
         Some(r) => r,
