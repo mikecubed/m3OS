@@ -9,11 +9,11 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Blocking-primitive consolidation: call-site audit, futex conformance, scheduler-state diagnostic, `smp-smoke` raised to `-smp 8` | 57a–e | In Progress — audit+fix+diagnostic+`-smp 8` landed; SMP-8 validation pending |
-| B | Fault-handling robustness: locks-across-faults audit, kstack-overflow origin, recovery-stack review | 2026-06-14 tracks A–D | In Progress — audit+`debug_assert`+origin doc landed; gate validation pending |
-| C | 4 GiB SMP panic-path AP-quiesce (diagnosability) + residual OOM/race pass | A (diagnostic reuse) | In Progress — C.1 quiesce landed; capture/C.2 pass pending |
-| D | Step-25 `dynlink-hello-versioned-mismatch-smoke` demand-fault NULL-deref flake → root-cause + fix + soak | B (fault-handler audit) | In Progress — CI-correlated; local repro + root-cause-by-inspection |
-| E | Two correctness bugs: `copy_file_range`/`sendfile`→EFAULT, 55c `net::remote` RX-test encoder | — | In Progress — E.2 already fixed (f39ca133, Phase 57b); E.1 in progress |
+| A | Blocking-primitive consolidation: call-site audit, futex conformance, scheduler-state diagnostic, `smp-smoke` raised to `-smp 8` | 57a–e | **Complete** — audit (29 sites, 1 lost-wake fixed) + `dump_scheduler_state` + `-smp 8`; smp-smoke @ -smp 8 PASS |
+| B | Fault-handling robustness: locks-across-faults audit, kstack-overflow origin, recovery-stack review | 2026-06-14 tracks A–D | **Complete** — audit + `debug_assert` + origin doc; kstack-overflow-smoke + dynamic-hello PASS |
+| C | 4 GiB SMP panic-path AP-quiesce (diagnosability) + residual OOM/race pass | A (diagnostic reuse) | **Mostly complete** — C.1 quiesce landed + no-regression; C.2 4 GiB run captured (clean boot, no panic, RAM-scaling slowness); readable-banner demo deferred (no panic to force) |
+| D | Step-25 `dynlink-hello-versioned-mismatch-smoke` demand-fault NULL-deref flake → root-cause + fix + soak | B (fault-handler audit) | **Blocked** — CI-host-correlated flake, no red artifact captured; inspection + C.1 diagnosability advance landed; definitive fix needs a red CI ELF |
+| E | Two correctness bugs: `copy_file_range`/`sendfile`→EFAULT, 55c `net::remote` RX-test encoder | — | **Complete** — E.1 clean-ENOSYS + `fs.copyFile` probe folded into node-smoke (PASS); E.2 already fixed (f39ca133, Phase 57b) |
 
 ---
 
@@ -123,9 +123,9 @@
 **Why it matters:** The 2026-06-05 handoff's blocking ask — at 4 GiB + `--kvm` + SMP the panic banner is unreadable because other cores keep writing COM1 during the print/dump; a legible banner is the prerequisite for root-causing the residual instability.
 
 **Acceptance:**
-- [ ] `handle_panic` broadcasts a halt IPI/NMI to sibling cores and spins a bounded grace window for them to stop before printing the banner + trace-ring dump.
-- [ ] A captured 4 GiB panic shows an **uninterleaved**, readable banner + `=== CRASH DIAGNOSTICS ===` block (no SMP byte-interleave garbage).
-- [ ] The quiesce is bounded (does not itself hang if a core is already wedged) and does not regress the single-core panic path used by the test harness ISA-debug-exit.
+- [x] `handle_panic` broadcasts a halt NMI to sibling cores (`panic_quiesce_aps`) and spins a bounded grace window for them to ack-and-park before printing; the `nmi_handler` parks non-owner cores. → `kernel/src/smp/mod.rs`, `kernel/src/lib.rs`, `kernel/src/arch/x86_64/interrupts.rs`.
+- [~] A captured 4 GiB panic shows an uninterleaved banner — **mechanism landed; positive demonstration deferred**: no panic fired in the 4 GiB + smp-8 runs (no panic-trigger exists to force one). The diagnosability mechanism is in place for the next real panic. See `docs/handoffs/2026-06-28-phase-99-panic-quiesce-and-stepd25-flake.md`.
+- [x] The quiesce is bounded (`SPIN_BUDGET` cap — never hangs on a wedged core) and does not regress the single-core/test panic path: `cfg(test)` `handle_panic` short-circuits to the ISA-debug-exit handler before the quiesce. No-regression validated (smoke-test + smp-smoke + 4 GiB boot all clean).
 
 ### C.2 — Residual 4 GiB OOM/race investigation pass
 
@@ -134,8 +134,8 @@
 **Why it matters:** With a readable banner (C.1), one diagnostic pass at the residual >2 GiB instability can either close it or record a precise next-step, rather than leaving it permanently masked by the 2 GiB workaround.
 
 **Acceptance:**
-- [ ] At least one 4 GiB + `--kvm` + `-smp 8` boot/stress run is captured with the C.1 readable banner; the panic site (if it fires) is symbolized and recorded.
-- [ ] Either the residual race is fixed, or a handoff records the symbolized panic site + a concrete hypothesis (closing the diagnosability gap the 2026-06-05 handoff opened).
+- [x] A 4 GiB + `--kvm` + `-smp 8` boot/stress run is captured (2026-06-28): boots clean (8 cores, ≈4 GiB), no panic, no wedge, scheduler stays live. No panic fired → nothing to symbolize this pass.
+- [x] A handoff records the result + hypothesis: the residual >2 GiB effect manifests as cold-`node`-load **slowness** (RAM-scaling demand-fault/shootdown traffic), not a lost-wake or crash; the 30 s stuck-no-waker watchdog did not fire. Full root-cause of the RAM-scaling slowdown is **Deferred** per the design doc. → `docs/handoffs/2026-06-28-phase-99-panic-quiesce-and-stepd25-flake.md`.
 
 ---
 
@@ -147,10 +147,10 @@
 **Symbol:** `dynlink-hello-versioned-mismatch-smoke` step 25; the crash `rip` / PIE load base from `target/ci-crash/smoke-test.log`
 **Why it matters:** The flake is host-correlated, low-rate (~11–15 %), and does not reproduce locally; the kernel ELF is not bit-reproducible, so the crash can only be symbolized against CI's own uploaded ELF.
 
-**Acceptance:**
-- [ ] A red step-25 run is captured via `gh run download <run-id> -n pr-regression-artifacts`.
-- [ ] `addr2line -fiCe <CI-built kernel> <rip − load_base>` resolves the faulting function (and trace-ring addresses) against the **uploaded** ELF — not a locally-built kernel.
-- [ ] The verdict (NULL deref vs. true stack-depth) is recorded; the 2026-06-25 hypothesis (single primary fault, varying secondary manifestation) is confirmed or refuted.
+**Acceptance:** (BLOCKED on a red CI artifact — probabilistic/external; cannot be forced from the dev box. See `docs/handoffs/2026-06-28-phase-99-panic-quiesce-and-stepd25-flake.md`.)
+- [ ] A red step-25 run is captured via `gh run download …` — **not yet captured** (the flake is ~11–15% CI-host-correlated and did not flake red during this work).
+- [ ] `addr2line` against the **uploaded** ELF — pending a red artifact (local ELF gives a misleading symbol; the kernel is not bit-reproducible).
+- [~] Verdict: the faulting `rip` is in kernel `.text` (a kernel NULL deref), **not** a kstack guard-page fault; inspection of the chain found no unchecked NULL deref in the current tree (`current_addr_space` cannot return `Some(null)`; the window-slice path is `?`-guarded). Definitive verdict still needs the symbolized CI frame.
 
 ### D.2 — Root-cause + fix the `cr2=0` NULL deref in the `MAP_LAZY_FILE` chain
 
@@ -158,9 +158,9 @@
 **Symbol:** `shared_vma_demand_file`, `demand_map_user_page_from_buf_locked`, the blocking `vfs_server` read issued from the fault handler
 **Why it matters:** This path demand-pages every multi-hundred-MB toolchain DSO (rustc/node/clang) and is exercised far harder on the slow bare-metal VFS, so a 1-in-7 kernel fault is unacceptable for the GUI arc.
 
-**Acceptance:**
-- [ ] The NULL deref (kernel-mode read of address 0x0 in the demand-fault chain) is root-caused to a specific unchecked pointer / `Option` / lock-state and fixed.
-- [ ] The fix is grounded in the symbolized faulting function from D.1 (not a speculative kstack bump — the reverted 64→96 KiB experiment is explicitly not the fix).
+**Acceptance:** (BLOCKED on D.1.)
+- [ ] Root-cause + fix — **pending D.1's symbolization**. Inspection narrowed candidates (no obvious null deref in the current tree) but did not pin the exact NULL read; a fix without the symbolized frame would be speculative.
+- [x] No speculative fix applied — honoring "grounded in the symbolized faulting function from D.1, not a speculative kstack bump." (The C.1 panic AP-quiesce is the concrete advance: it makes the next red CI banner readable so D.1 becomes actionable.)
 
 ### D.3 — N-iteration soak proving flake = 0
 
@@ -169,8 +169,8 @@
 **Why it matters:** A flake this rate only proves fixed by a soak, not a single green run.
 
 **Acceptance:**
-- [ ] Step 25 passes **N≥50** consecutive iterations (mixed CI runners where possible) with 0 kernel faults — recorded run IDs / log.
-- [ ] `smoke-test` overall stays green; no new flake is introduced elsewhere.
+- [ ] N≥50 consecutive step-25 iterations — **not achievable locally** (the flake is CI-host-correlated and does not reproduce on the dev box: the 2026-06-25 handoff already recorded 5/5 + an 8-run hunt with no red). A local soak only confirms known local non-repro; the real proof needs CI runs after a D.2 fix.
+- [x] `smoke-test` overall stays green (PASSED, includes step 25) and no new flake is introduced; `dynamic-hello-smoke` + `smp-smoke @ -smp 8` (same `MAP_LAZY_FILE` chain, heavy SMP churn) also green. **Validated 2026-06-28.**
 
 ---
 
@@ -213,4 +213,5 @@
 - Cross-reference the three open handoffs this phase closes/advances: `docs/handoffs/2026-06-14-claude-smp-tlb-shootdown-kstack-panic.md` (Track D origin audit → Track B here), `docs/handoffs/2026-06-05-4gib-smp-panic-corrupted-output.md` (panic AP-quiesce → Track C here), `docs/handoffs/2026-06-25-flaky-dynlink-mismatch-demand-fault-kernel-fault.md` (step-25 flake → Track D here), and the design source `docs/handoffs/2026-04-25-scheduler-design-comparison.md`.
 - This phase is the **gating prerequisite for Phase 100** (Bare-Metal GUI Session, Dell) per the Phase 98 charter dependency graph — the laptop is 8-core and cannot pin `-smp 1`; keep that edge consistent in `docs/roadmap/README.md`'s next-arc section and mermaid (`P99 --> P100`).
 - Prefer exact files/symbols over directories as these tasks land; update the checkboxes and the Track Layout status column as tracks complete.
-- Mark the design doc + this task doc Status `Complete` only when `smp-smoke` PASSES at `-smp 8`, the step-25 soak shows flake=0, and the two Track-E bugs are fixed with their gates green.
+- **Phase 99 deliverable docs (committed this phase):** `docs/handoffs/2026-06-28-phase-99-block-wake-callsite-audit.md` (A.1/A.5), `docs/handoffs/2026-06-28-phase-99-fault-handler-lock-audit.md` (B.1/B.2/B.3), `docs/handoffs/2026-06-28-phase-99-panic-quiesce-and-stepd25-flake.md` (C + D).
+- Mark the design doc + this task doc Status `Complete` only when `smp-smoke` PASSES at `-smp 8`, the step-25 soak shows flake=0, and the two Track-E bugs are fixed with their gates green. **Status as of 2026-06-28:** `smp-smoke @ -smp 8` ✅, Track-E bugs ✅ — but the step-25 **flake=0 proof is BLOCKED on a red CI artifact** (CI-host-correlated, does not reproduce locally), so the phase is **not** yet markable `Complete`. Tracks A/B/E + C.1 are done and validated; Track D is advanced (inspection + the C.1 diagnosability that makes the next red CI run actionable) but its definitive fix + soak await CI.
