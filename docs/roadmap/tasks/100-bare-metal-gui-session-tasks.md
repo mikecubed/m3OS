@@ -12,8 +12,8 @@
 | A | Spawn `display_server`/`mouse_server`/`session_manager`/`greeter` (+`audio_server`/`term`) on init's bare-metal `BUILTIN_CONFIGS` path + resolve the graphical skip-filter so init yields the tty to the greeter | — | Implemented (CI-green) |
 | B | Write-combining user framebuffer — WC PAT attribute on the `sys_framebuffer_mmap` VMA + present-path `sfence` + blit-latency measurement | — | Implemented (CI-green; B.3 blit-ratio HW-pending) |
 | C | Interim USB-mouse pointer — bare-metal-validate `usb-hid` PointerEvent → `mouse_server` → `InputDispatcher` focus routing on the dock-hub topology | A, B | Planned |
-| D | Input polish — `stdin_feeder` USB-keyboard text-mode drain + convert `usb-hid`/`usbhub` busy-poll to notification-driven waits | A | Planned |
-| E | Bare-metal validation method ("the screen shows the greeter") — on-device render assertion over the log sink + photo evidence convention | A, C | Planned |
+| D | Input polish — `stdin_feeder` USB-keyboard text-mode drain + convert `usb-hid`/`usbhub` busy-poll to notification-driven waits | A | Implemented (CI-green; idle-CPU + USB-kbd-echo HW-pending; full notification → Phase 103) |
+| E | Bare-metal validation method ("the screen shows the greeter") — on-device render assertion over the log sink + photo evidence convention | A, C | E.1 Implemented (CI-green); E.2 photo + recorded HW run pending |
 
 ---
 
@@ -139,9 +139,9 @@
 **Why it matters:** `stdin_feeder` only drains PS/2 scancodes (`KBD_TRY_READ`); a USB keyboard's input reaches `kbd_server` as typed `KeyEvent`s via `usb-hid`'s `KBD_EVENT_INJECT`, which `stdin_feeder` never reads — so a USB keyboard is dead at the text login on a machine with no PS/2 keyboard.
 
 **Acceptance:**
-- [ ] `stdin_feeder` also drains typed `KeyEvent`s on `KBD_EVENT_PULL` (honoring the `KBD_EVENT_NONE` empty/timeout sentinel) and converts them to stdin bytes, alongside the existing PS/2 `KBD_TRY_READ` path.
-- [ ] The two drains do not starve `display_server`'s concurrent `KBD_EVENT_PULL` requests (the non-blocking-probe discipline is preserved).
-- [ ] On the laptop (or via `--usb-passthrough` of a USB keyboard), typing on a USB keyboard echoes at the framebuffer text login before the compositor takes the FB.
+- [x] `stdin_feeder` also drains typed `KeyEvent`s on `KBD_EVENT_PULL` (honoring the `KBD_EVENT_NONE` empty/timeout sentinel) and converts them to stdin bytes (`kernel_core::input::hid_poll::key_event_to_stdin`, host-tested), alongside the existing PS/2 `KBD_TRY_READ` path. `termios-smoke` PASS confirms the PS/2 line-discipline path is unregressed.
+- [x] The two drains do not starve `display_server`'s concurrent `KBD_EVENT_PULL` requests — `stdin_feeder` keeps the non-blocking probe and stands down entirely once `display.input-owner` is registered.
+- [ ] **HW/passthrough-pending**: on the laptop (or via `--usb-passthrough` of a USB keyboard), typing on a USB keyboard echoes at the framebuffer text login before the compositor takes the FB.
 
 ### D.2 — Convert `usb-hid` from 5 ms busy-poll to a notification-driven wait
 
@@ -150,9 +150,9 @@
 **Why it matters:** `usb-hid` polls every device's interrupt-IN endpoint every 5 ms forever, pinning a core at idle (and burning battery the moment Phase 103 lands); the xHCI server already captures reports on its IRQ, so the driver can block on a notification instead.
 
 **Acceptance:**
-- [ ] `usb-hid` blocks on an xHCI transfer-event notification (or a bounded wait that idles the core) rather than spinning on the fixed 5 ms cadence; input latency stays below one report period when events arrive.
-- [ ] Hot-plug attach/detach reconcile (the existing ~200 ms cadence behavior) still works without the busy spin.
-- [ ] Recorded idle-CPU evidence shows `usb-hid` no longer keeps a core hot at idle.
+- [x] `usb-hid` uses a bounded adaptive backoff that idles the core (fast 5 ms cadence preserved while reports arrive — `usb-smoke` confirms live HID decode latency is unchanged — growing to a 100 ms idle cap via the host-tested `next_hid_backoff_ns`) rather than spinning on the fixed 5 ms cadence. *(Full xHCI transfer-event notification needs xHCI-server + `usb-core` protocol changes → deferred to Phase 103, as the design doc scopes; the adaptive backoff is the Phase 100 bring-up step.)*
+- [x] Hot-plug attach/detach reconcile (now a monotonic ~200 ms timestamp, independent of backoff) still works without the busy spin: `usb-hotplug-smoke` PASS (3 attach/detach cycles, no slot exhaustion / daemon restart).
+- [ ] **HW/long-run-pending**: recorded idle-CPU evidence shows `usb-hid` no longer keeps a core hot at idle. The `USB_HID:idle ticks=<n> backoff_ns=<n>` sentinel is in place; the idle-occupancy measurement is recorded on a longer/HW run.
 
 ### D.3 — Convert `usbhub` walker off the busy-poll
 
@@ -161,8 +161,8 @@
 **Why it matters:** The hub walker similarly spins; combined with `usb-hid` it keeps cores hot at idle on the laptop.
 
 **Acceptance:**
-- [ ] `usbhub` waits on a notification / bounded idle rather than a tight walk loop once enumeration is steady; port-status-change still triggers (re)enumeration promptly.
-- [ ] Recorded idle-CPU evidence shows the hub walker no longer pins a core.
+- [x] `usbhub` uses a bounded steady-state monitoring loop (50 ms → 200 ms backoff via host-tested `hub_next_backoff_ns`) rather than a tight walk once enumeration is steady; a `wPortChange` on `GET_PORT_STATUS` still triggers prompt (re)enumeration — `usb-hub-smoke` PASS (tier-2 enumeration via route string works).
+- [ ] **HW/long-run-pending**: recorded idle-CPU evidence shows the hub walker no longer pins a core. The `USB_HUB:idle ticks=<n> backoff_ns=<n>` sentinel is in place.
 
 ---
 
@@ -178,8 +178,8 @@
 **Why it matters:** There is no QMP/PPM screendump on bare metal (the QEMU-only path the `less-render-probe`/`claude_tui_render_arm` gates use), so "the screen shows the greeter" needs a falsifiable on-metal substitute — the on-device analog of the PPM band-diff.
 
 **Acceptance:**
-- [ ] The compositor/greeter computes and prints a cheap render fingerprint (changed-scanline count or hash) over the log sink; a blank screen yields ≈0 and the rendered greeter yields a non-trivial value (threshold recorded), so the sentinel falsifiably distinguishes "rendered" from "black."
-- [ ] The sentinel string is quoted in the Track-E / phase acceptance and reused for the Track C cursor-motion delta.
+- [x] The compositor computes and prints a cheap render fingerprint (changed-scanline count + sampled FNV hash) over the log sink on each damage-driven compose. Sentinel: **`RENDER_FP frame=<n> rows_nonblank=<R> rows_changed=<C> hash=0x<8hex>`**. Falsifiable: a blank/background frame yields `rows_nonblank=0` (host test `all_background_yields_zero_nonblank`); rendered content yields a non-trivial value — confirmed in QEMU (`compositor-stress` log: `RENDER_FP frame=2 rows_nonblank=1072 rows_changed=1064 …`, `rows_changed=0` when static). Threshold: `rows_nonblank ≥ 50` (≥ 200 on 1080p) distinguishes "rendered" from "black."
+- [x] The sentinel string `RENDER_FP … rows_changed=<C>` is quoted here and reused for the Track C cursor-motion delta (a small `rows_changed` value on pointer motion).
 
 ### E.2 — Photo evidence convention + recorded HW run
 
