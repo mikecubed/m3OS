@@ -27,7 +27,7 @@ None of these crates are published to crates.io. Cargo version fields exist sole
 
 ## 1. Target Root Block
 
-Add the following block to `/home/mikecubed/projects/ostest/Cargo.toml` immediately before the existing `[workspace.dependencies]` block (currently line 252). The root Cargo.toml currently has **no** `[workspace.package]` section.
+Add the following block to `Cargo.toml` immediately before the existing `[workspace.dependencies]` block (currently line 252). The root Cargo.toml currently has **no** `[workspace.package]` section.
 
 ```toml
 [workspace.package]
@@ -43,7 +43,7 @@ Nothing else changes in the root Cargo.toml. The existing `[workspace]`, `[profi
 
 ### Scope
 
-The conversion applies to **exactly the 110 workspace member `Cargo.toml` files** listed in the `members` array of `/home/mikecubed/projects/ostest/Cargo.toml`. Derive the list from that array — **do not** use `git grep '[package]'`, because the tree has 116 `[package]` manifests and 6 of them are **not** members and must keep standalone versions:
+The conversion applies to **exactly the 110 workspace member `Cargo.toml` files** listed in the `members` array of `Cargo.toml`. Derive the list from that array — **do not** use `git grep '[package]'`, because the tree has 116 `[package]` manifests and 6 of them are **not** members and must keep standalone versions:
 
 - `sunset-local/Cargo.toml` — vendored, not a workspace member (see Section 3)
 - `userspace/calc-rust/Cargo.toml` — present in the tree but **not in `members`**
@@ -62,17 +62,17 @@ For every member Cargo.toml, apply two line-level substitutions:
 
 **Why inline dependency version specs are untouched:** Lines of the form `foo = { version = "1", ... }` are TOML inline tables in `[dependencies]` or `[workspace.dependencies]`. They do not start with `^version =` at column 0; they appear mid-line after a key name. A regex anchored to `^version = ` (caret + `version = `, no leading content) does not match them. The substitution is therefore safe to apply as a column-0–anchored replacement.
 
-**Verified precondition:** All 114 member Cargo.toml files already use `edition = "2024"`. The check `git grep -lE '^\[package\]' -- '**/Cargo.toml' | grep -v 'sunset-local\|calc-rust' | xargs -I{} sh -c 'grep -qE "^edition" {} || echo {}'` returns no output, confirming no member is missing an edition line. The `edition.workspace = true` substitution can therefore be applied universally across all 114 files without first checking for presence.
+**Verified precondition:** All 110 members already use `edition = "2024"` (verified during execution), so the `edition.workspace = true` substitution can be applied universally without first checking for presence.
 
 ### Candidate script approach
 
-The following `sed` invocation processes one member at a time. Run it over all 114 files:
+The following `sed` invocation processes one member at a time. Run it over the 110 members:
 
 ```bash
-# Generate the file list
-git grep -lE '^\[package\]' -- '**/Cargo.toml' \
-  | grep -v 'sunset-local\|calc-rust' \
-  > /tmp/member-cargo-toml-list.txt
+# Generate the member file list from the workspace `members` array — NOT `git grep '[package]'`,
+# which also matches sunset-local, calc-rust, and the four userspace/*-rust example crates (non-members).
+awk '/^members = \[/{f=1;next} /^\]/{f=0} f && /^[[:space:]]*"/{gsub(/[",[:space:]]/,""); print $0"/Cargo.toml"}' \
+  Cargo.toml > /tmp/member-cargo-toml-list.txt
 
 # Apply both substitutions in place
 while IFS= read -r f; do
@@ -126,7 +126,7 @@ Note: `AGENTS.md` line 7 currently reads `kernel **v0.97.0**` while `kernel/Carg
 
 ### Current text (to replace)
 
-Located in `/home/mikecubed/projects/ostest/AGENTS.md`, the maintenance-policy block currently reads (line 26):
+Located in `AGENTS.md`, the maintenance-policy block currently reads (line 26):
 
 > When a phase lands, the only edits permitted in this file are: bump the kernel version above, and add a bullet to the capability inventory **only if it introduces a new capability class** (not for changes within an existing one). Prefer rewriting an existing bullet over adding prose. If a section starts listing internal symbols or per-change detail, move it to `docs/` and link instead.
 

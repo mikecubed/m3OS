@@ -9,6 +9,8 @@
 
 Executed as part of Phase 98 (not deferred). As-landed: `AGENTS.md` went **82,868 B → 22,313 B** (~73%, leaner than the ~28–30 KB estimate because the capability bullets + stale blocks were larger than estimated); `docs/appendix/regression-gates.md` was created with **54** `## <gate>` sections carrying every gate description verbatim; the lean inline table retained all **39** top-level gate→env-var rows; `.github/copilot-instructions.md` became a 533-byte thin pointer; the header was bumped to `v0.98.0` and the version-bump policy rewritten for the single workspace version (Track C). Relocation integrity verified: every lean-table gate has a `regression-gates.md` section, and the sub-gate env-vars `M3OS_CARGO_REGRESSION` / `M3OS_USB_ETH_REGRESSION` remain documented inside their parent gate sections.
 
+**Reading note:** Sections 1–9 below are the original specification, preserved verbatim as the design record. Wherever they say "the follow-on PR", that work **landed in this PR (#270)** — read them as the historical spec, not as pending future work.
+
 ---
 
 ## 1. Current Measurements
@@ -192,7 +194,7 @@ After the Track C versioning reform (`docs/appendix/versioning-reform.md`) adopt
 **m3OS** (technical name: `m3os`) is a bootable microkernel OS in Rust: x86_64, UEFI boot, kernel **v0.98.0**.
 ```
 
-The slimming PR executes after Track C's follow-on PR. If executed before, set the header to `v0.97.0` temporarily (matching what a clean build actually reports from the kernel crate's bumped version) and note the pending Track C reconciliation in a comment.
+As landed in PR #270, Track C and Track D executed together in one PR, so the header is set directly to `v0.98.0` (the unified `[workspace.package]` version). (The original spec contemplated the two reforms landing in separate PRs, which would have needed a temporary `v0.97.0` step — moot here.)
 
 ### 5.3 Version-bump policy rewrite
 
