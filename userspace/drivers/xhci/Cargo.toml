@@ -1,7 +1,7 @@
 [package]
 name = "xhci_driver"
-version = "0.78.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 description = "Phase 78a — ring-3 xHCI USB host-controller driver (host-controller bring-up)."
 
 [[bin]]

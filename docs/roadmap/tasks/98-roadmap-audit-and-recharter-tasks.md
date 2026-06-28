@@ -3,7 +3,7 @@
 **Status:** Complete
 **Source Ref:** phase-98
 **Depends on:** the full Phase 1→97 arc being nominally "done"
-**Goal:** Reconcile every Phase 1→97 Status against falsifiable evidence and repair the rotted index layer (Track A); charter the GUI-workstation arc (Phases 99–110) as template-conformant docs that schedule every open deferral and handoff (Track B); and specify two repository-hygiene reforms — a single unified workspace version (Track C) and a slimmed `AGENTS.md` (Track D) — precisely enough to execute mechanically in follow-on PRs. This PR is planning docs only.
+**Goal:** Reconcile every Phase 1→97 Status against falsifiable evidence and repair the rotted index layer (Track A); charter the GUI-workstation arc (Phases 99–110) as template-conformant docs that schedule every open deferral and handoff (Track B); and **execute** two repository-hygiene reforms — a single unified workspace version (Track C) and a slimmed `AGENTS.md` (Track D), both landed in this PR (with spec docs retained as their design record).
 
 ## Track Layout
 
@@ -137,7 +137,7 @@
 - [x] `sunset-local` (vendored, edition 2021) is explicitly excluded.
 - [x] The behavior change is noted: `env!("CARGO_PKG_VERSION")` makes the boot banner / `uname` report `0.98.0`; no source changes needed.
 - [x] The `AGENTS.md` policy rewrite is specified: "phase number → `docs/roadmap/` + a `phase-NN` git tag + commit message; do NOT bump Cargo versions per phase; the single `[workspace.package]` version is an OS release version bumped only at release."
-- [x] A verification step is named for the follow-on PR: `cargo xtask check` + `git grep -nE '^version = "0\.'` returns only the root block + `sunset-local`.
+- [x] A verification step is named **and executed**: `cargo xtask check` passes; `git grep -lE '^version = "'` excluding the non-members (`sunset-local`/`calc-rust`/the four `userspace/*-rust` example crates) returns **only** the root `Cargo.toml`, and exactly 110 members carry `version.workspace = true`.
 
 ---
 
@@ -165,7 +165,7 @@
 
 ## Documentation Notes
 
-- This PR adds planning docs only; Tracks C and D are **specs** executed in follow-on PRs (the user's chosen scope keeps this PR reviewable).
+- Tracks A & B are planning/audit docs; Tracks C and D are **executed in this PR** (the spec docs `docs/appendix/versioning-reform.md` + `docs/appendix/agents-md-slimming.md` are retained as the design record). `cargo xtask check` passes with the unified workspace version.
 - The audit (Track A) extends — does not replace — the `docs/appendix/audit-status/` corpus; cite the 57e (2026-05) and 75 (`74a`) cutoffs it builds on.
 - Prefer a generated manifest over hand-maintained crate lists in `codebase-map.md` so it cannot rot again.
 - Every chartered phase doc must name the bare-metal validation protocol (Track A.5) and adopt the "Validated-on-HW (run N, date)" status convention — the HW-only arc has no CI safety net.

@@ -1,7 +1,7 @@
 [package]
 name = "tcsmoke"
-version = "0.69.1"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 description = "Phase 69a Track I — byte-level validator for the m3OS termios contract. Runs from the post-login shell; each subcommand exercises one termios path against a real PTY pair and prints TC_SMOKE:<name>:ok or TC_SMOKE:<name>:fail <reason>."
 
 [[bin]]

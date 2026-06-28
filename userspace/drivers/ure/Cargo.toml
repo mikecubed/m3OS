@@ -1,7 +1,7 @@
 [package]
 name = "ure_driver"
-version = "0.96.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 description = "Phase 96 Stage-1a — ring-3 USB-Ethernet driver for RTL815x (RTL8156 bring-up probe)."
 
 [[bin]]

@@ -12,9 +12,9 @@ Three deliverables that turn the end of the original roadmap into a trustworthy 
 
 1. **An honest, evidence-backed audit** of the completed roadmap (Phases 1→97). Every phase's Status is reconciled against falsifiable evidence — a named passing gate, a recorded hardware run, or a host test — and the **index layer** (`codebase-map.md`, the two `README` indexes, the delivery gantt) is repaired so the map matches the tree. Output: a per-phase **Validated / Claimed-unvalidated / Regressed** verdict and the corrected README.
 2. **A re-chartered roadmap (Phases 99–110)** for the next arc: a **usable GUI workstation on the real Dell Tiger Lake laptop**, then the **HP OmniBook (AMD Ryzen AI 9 365 / Strix Point)**. The arc is sequenced by dependency and each phase ships as a template-conformant design + task doc.
-3. **Two repository-hygiene reforms specified for execution in follow-on PRs:** a **single unified workspace version** (kill the phase-encoded per-crate versions that conflict when phases land in parallel) and a **slimmed `AGENTS.md`** (it loads every session and currently violates its own "keep it small" policy by ~63%).
+3. **Two repository-hygiene reforms, executed in this PR:** a **single unified workspace version** (kill the phase-encoded per-crate versions that conflict when phases land in parallel) and a **slimmed `AGENTS.md`** (it loads every session and currently violates its own "keep it small" policy by ~63%). Each carries a spec doc (`docs/appendix/versioning-reform.md`, `docs/appendix/agents-md-slimming.md`) as its design record.
 
-This phase **charters and specifies**; the chartered phases and the two reforms **execute as their own PRs**. This PR is planning docs only.
+This phase **charters** the 99–110 arc (those phases execute as their own PRs) and **executes** the two repository-hygiene reforms (Tracks C & D) in this PR, alongside the audit + index-repair docs.
 
 ## Why This Phase Exists
 
@@ -60,11 +60,11 @@ Charter the next arc as template-conformant design + task docs, sequenced by dep
 | **109** | **Bare-Metal Audio** | First **determine** the Dell codec path (legacy Intel HDA vs SoundWire + SOF DSP — modern Tiger Lake laptops often route audio over SoundWire, in which case the Phase 80 HDA driver may not bind), then HDA bare-metal validation **or** a new SoundWire+SOF driver. A scoping-risk the original charter missed. |
 | **110** | **Real-Hardware Security Hardening** | Activate + **bare-metal-validate KPTI** (Phase 84 Track A scaffolding, never activated), add ASLR + stack canaries / CET shadow stacks, move password hashing to **argon2id**, and formally validate/record **Secure Boot on metal** (retiring the long-stale Phase 59 item). Real silicon storing real user data is exactly when these matter. |
 
-### Track C — Versioning reform (specified; executes in a follow-on PR)
+### Track C — Versioning reform (executed in this PR)
 
 Adopt a **single unified workspace version**. Add `[workspace.package] version = "0.98.0"` + `edition = "2024"` to the root `Cargo.toml`; convert every first-party member's `[package]` to `version.workspace = true` / `edition.workspace = true`; leave the vendored `sunset-local` on its own version. After the reform there is exactly **one** version line in the tree, bumped only by a deliberate release step — phase branches touch **zero** version lines, so they cannot conflict on versions. The phase number lives entirely in `docs/roadmap/`, a `phase-NN` git tag, and commit messages. `env!("CARGO_PKG_VERSION")` then makes the boot banner / `uname` report the unified OS release version (the one intended behavior change: `uname` release `0.96.0 → 0.98.0`).
 
-### Track D — Rules / `AGENTS.md` slimming (specified; executes in a follow-on PR)
+### Track D — Rules / `AGENTS.md` slimming (executed in this PR)
 
 Cut `AGENTS.md` from ~83 KB to ~28–30 KB (~63 %, ~37 K → ~13 K tokens/session) with **zero operational info lost**: replace the 48 KB regression-gate table with a lean `Gate | Env var | one-line purpose` table and move every full description verbatim into a new `docs/appendix/regression-gates.md` (exactly what the file's own "keep it small" policy prescribes); collapse the run-on capability-inventory bullets to one line per capability *class* (the 9 KB "Package management" saga → one line pointing at `docs/roadmap/`); fix the version-bump policy (rewrite for Track C) and the `v0.97.0`-header-vs-`0.96.0`-`Cargo.toml` drift; trim the stale ASCII architecture diagram and the duplicated doc-template rules; and make `.github/copilot-instructions.md` a thin pointer to `AGENTS.md` to stop drift.
 
@@ -93,8 +93,8 @@ QEMU models none of the new hardware, so the always-on-gate quality story does n
 
 1. **Track A — audit + index repair.** Build the Phase 1→97 verdict matrix (cite a gate / HW run / host test per row); batch the README Status edits + fix the stale 54a/96/gantt entries; regenerate `codebase-map.md` and fix the two README indexes + `file-backed-mmap.md`; reconcile the 1.0/version posture; write the bare-metal validation strategy doc.
 2. **Track B — re-charter.** Author template-conformant design + task docs for Phases 99–110 from the dependency graph above; add their README rows + a "Next Arc (99→110)" section + gantt nodes; map every still-open deferred item and open handoff onto a phase or the accepted-deferred backlog.
-3. **Track C — versioning spec.** Write the exact migration (root `[workspace.package]` block + the `version.workspace = true` mass-conversion of all members except `sunset-local` + the `AGENTS.md` policy rewrite); flag it for a follow-on PR that runs `cargo xtask check`.
-4. **Track D — rules spec.** Write the `AGENTS.md` slimming plan + the new `docs/appendix/regression-gates.md` target structure; flag it for a follow-on PR.
+3. **Track C — versioning reform (executed).** Add the root `[workspace.package]` block + `version.workspace = true` mass-conversion of all 110 members (excluding `sunset-local`, `calc-rust`, and the four `userspace/*-rust` example crates) + the `AGENTS.md` policy rewrite; `cargo xtask check` passes.
+4. **Track D — rules slim (executed).** Slim `AGENTS.md` and move the verbose gate descriptions verbatim into the new `docs/appendix/regression-gates.md`; thin-pointer `.github/copilot-instructions.md`.
 
 ## Acceptance Criteria
 
@@ -103,7 +103,7 @@ QEMU models none of the new hardware, so the always-on-gate quality story does n
 - The index layer is repaired: `codebase-map.md` lists all ~116 crates + the GUI/audio/driver/toolchain trees, `docs/README.md` and `tasks/README.md` are current, the delivery-gantt P78–81 labels are corrected, and `file-backed-mmap.md` no longer contradicts Phase 95b.
 - Phases 99–110 each exist as a template-conformant design doc (with Milestone Goal + Acceptance Criteria) **and** a companion task doc, with README rows + a sequenced "next arc" section. Every still-open deferred item and the 7 open-unscheduled handoffs are either assigned to a chartered phase or recorded in the accepted-deferred backlog with an acceptance gate.
 - A **bare-metal validation strategy** doc exists and is referenced by the HW-only phases (101/102/103/104/108/109/110), with the "Validated-on-HW (run N, date)" status convention.
-- The **versioning reform** (Track C) and **`AGENTS.md` slimming** (Track D) are specified precisely enough to execute mechanically in a follow-on PR (exact files, the `[workspace.package]` block, the gate-table relocation target).
+- The **versioning reform** (Track C) and **`AGENTS.md` slimming** (Track D) are **executed in this PR** (spec docs `docs/appendix/versioning-reform.md` + `docs/appendix/agents-md-slimming.md` retained as the design record): the single `[workspace.package] version = "0.98.0"` lands across all 110 members and `AGENTS.md` is slimmed with the gate descriptions relocated to `docs/appendix/regression-gates.md` — `cargo xtask check` green.
 
 ## Companion Task List
 
@@ -117,7 +117,7 @@ QEMU models none of the new hardware, so the always-on-gate quality story does n
 
 ## Deferred Until Later
 
-The chartered phases (99–110) **execute as their own PRs** — this phase charters them. The two reforms (Track C versioning, Track D rules) **execute as follow-on PRs** — this phase specifies them. Beyond the chartered arc, these items are **consciously accepted-deferred backlog** (recorded so they are scheduled-by-decision, not lost), each with a future home or acceptance gate noted:
+The chartered phases (99–110) **execute as their own PRs** — this phase charters them. The two reforms (Track C versioning, Track D rules) were **executed in this PR** (their spec docs are retained as the design record). Beyond the chartered arc, these items are **consciously accepted-deferred backlog** (recorded so they are scheduled-by-decision, not lost), each with a future home or acceptance gate noted:
 
 - **On-device `cargo` + proc-macros** (the Phase 95 Step-5 stretch) — acceptance is the existing `cargo-smoke` / `M3OS_CARGO_REGRESSION` gate; charter as a small toolchain-completion phase when the GUI arc frees capacity.
 - **Networking depth** — TCP congestion control / reassembly / keepalive-prober, DNS caching / DNSSEC, TLS revocation, raw sockets / multicast / `SCM_RIGHTS`, the modern-NIC scaling ladder + more vendors/offloads, generic CDC-ECM live + RNDIS/ASIX, live UAS, USB4 fabric / USB-C-PD / DbC.

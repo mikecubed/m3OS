@@ -1,7 +1,7 @@
 [package]
 name = "vfs_server"
-version = "0.55.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 
 [[bin]]
 name = "vfs_server"

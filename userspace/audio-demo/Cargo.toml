@@ -1,7 +1,7 @@
 [package]
 name = "audio-demo"
-version = "0.57.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 description = "Phase 57 Track E.2 — userspace audio reference client. Generates a 440 Hz sine wave and submits it through `audio_client` to prove the audio path end-to-end."
 
 [[bin]]

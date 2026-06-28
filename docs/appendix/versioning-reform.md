@@ -1,9 +1,19 @@
 # Versioning Reform — Single Workspace Version (Spec)
 
-**Status:** Specified (executes in a follow-on PR)
+**Status:** Executed in PR #270 (folded into Phase 98 — see the Execution Note below)
 **Source Ref:** phase-98
 **Track:** C
-**Summary:** Replace 114 divergent per-phase per-crate versions with a single `[workspace.package] version = "0.98.0"` so phase branches touch zero version lines and can no longer conflict on Cargo metadata.
+**Summary:** Replace the divergent per-phase per-crate versions across the 110 workspace members with a single `[workspace.package] version = "0.98.0"` so phase branches touch zero version lines and can no longer conflict on Cargo metadata.
+
+## Execution Note (PR #270)
+
+This reform was executed as part of Phase 98 (not deferred). What landed:
+
+- Added `[workspace.package] version = "0.98.0"` + `edition = "2024"` to the root `Cargo.toml`.
+- Converted **exactly the 110 workspace members** (derived from the `members` array, **not** from `git grep '[package]'`) to `version.workspace = true` / `edition.workspace = true`.
+- **Correction to the original spec's member set:** besides `sunset-local` and `userspace/calc-rust`, four more tree crates carry `[package]` but are **not** in `members` and must stay standalone — `userspace/hello-rust`, `userspace/httpd-rust`, `userspace/sysinfo-rust`, `userspace/todo-rust` (example crates). Converting a non-member to `version.workspace = true` makes `cargo` error, so the conversion is driven off the `members` array, which is the only correct source.
+- Verified: `cargo metadata --no-deps` parses + inherits cleanly across all 110 members, `kernel` resolves to `0.98.0`, and `cargo xtask check` passes.
+- The `AGENTS.md` version-bump-policy rewrite + header bump to `v0.98.0` landed together with the Track D slimming (same PR).
 
 ---
 
@@ -33,12 +43,13 @@ Nothing else changes in the root Cargo.toml. The existing `[workspace]`, `[profi
 
 ### Scope
 
-The conversion applies to **114 workspace member Cargo.toml files**: all files listed in the `members` array of `/home/mikecubed/projects/ostest/Cargo.toml` (lines 2–235), which excludes:
+The conversion applies to **exactly the 110 workspace member `Cargo.toml` files** listed in the `members` array of `/home/mikecubed/projects/ostest/Cargo.toml`. Derive the list from that array — **do not** use `git grep '[package]'`, because the tree has 116 `[package]` manifests and 6 of them are **not** members and must keep standalone versions:
 
 - `sunset-local/Cargo.toml` — vendored, not a workspace member (see Section 3)
-- `userspace/calc-rust/Cargo.toml` — present in the tree but **not listed in `members`**; it retains its own version
+- `userspace/calc-rust/Cargo.toml` — present in the tree but **not in `members`**
+- `userspace/hello-rust/`, `userspace/httpd-rust/`, `userspace/sysinfo-rust/`, `userspace/todo-rust/` — example crates, also not in `members`
 
-Ground truth: `git grep -lE '^\[package\]' -- '**/Cargo.toml' | grep -v 'sunset-local\|calc-rust'` returns exactly 114 files as of phase-98.
+Ground truth for the member list: `awk '/^members = \[/{f=1;next} /^\]/{f=0} f && /^[[:space:]]*"/{gsub(/[",[:space:]]/,""); print $0"/Cargo.toml"}' Cargo.toml` returns exactly the 110 files to convert.
 
 ### Transformation per member
 
@@ -145,26 +156,20 @@ Must exit 0: clippy (`-D warnings`), rustfmt, and all host-side unit tests pass.
 
 ### Step B — Version grep audit
 
+The invariant: **no workspace member retains a standalone `version = "…"` line.** Note that `git grep '^version = "'` returns *many* legitimate non-member hits — the root `[workspace.package]` block, the ~32 column-0 dependency-version lines inside the vendored `sunset-local/Cargo.toml`, `userspace/calc-rust`, and the four `userspace/*-rust` example crates — so the audit must *exclude* the non-members and confirm only the root remains:
+
 ```bash
-git grep -nE '^version = "' -- '**/Cargo.toml'
+# (1) The only NON-EXCLUDED file with a standalone version line must be the root Cargo.toml:
+git grep -lE '^version = "' -- '**/Cargo.toml' \
+  | grep -vE 'sunset-local|calc-rust|hello-rust|httpd-rust|sysinfo-rust|todo-rust'
+#   → expected output: a single line, `Cargo.toml`
+
+# (2) Exactly the 110 members now inherit:
+git grep -lE '^version\.workspace = true' -- '**/Cargo.toml' | wc -l
+#   → expected: 110
 ```
 
-After the reform, this command must return **exactly two entries**:
-
-1. The root `[workspace.package]` block — `Cargo.toml:N:version = "0.98.0"` (the single source of truth, where N is its line number after insertion)
-2. `sunset-local/Cargo.toml:16:version = "0.4.0"` (the excluded vendored library)
-
-`userspace/calc-rust/Cargo.toml` is not a workspace member and will still carry its own `version = "0.1.0"` line; it is an acceptable third entry and should be listed as such in the PR description. It is not converted because `version.workspace = true` is only valid in workspace members.
-
-The expected output shape (order may vary by filesystem):
-
-```
-Cargo.toml:<line>:version = "0.98.0"
-sunset-local/Cargo.toml:16:version = "0.4.0"
-userspace/calc-rust/Cargo.toml:5:version = "0.1.0"
-```
-
-Any line beyond these three indicates an unconverted member and must be fixed before the PR merges.
+Any member appearing in (1), or a count ≠ 110 in (2), indicates an unconverted member and must be fixed before the PR merges. As-executed in PR #270 both checks passed.
 
 ---
 
@@ -174,6 +179,7 @@ Any line beyond these three indicates an unconverted member and must be fixed be
 |---|---|
 | `Cargo.toml` | Add `[workspace.package]` block with `version = "0.98.0"` and `edition = "2024"` |
 | `AGENTS.md` | Update header from `v0.96.0`/`v0.97.0` to `v0.98.0`; replace version-bump policy sentence |
-| 114 × `<member>/Cargo.toml` | Replace `version = "…"` with `version.workspace = true`; replace `edition = "…"` with `edition.workspace = true` |
-| `sunset-local/Cargo.toml` | No change |
+| 110 × `<member>/Cargo.toml` | Replace `version = "…"` with `version.workspace = true`; replace `edition = "…"` with `edition.workspace = true` |
+| `sunset-local/Cargo.toml` | No change (vendored, non-member) |
 | `userspace/calc-rust/Cargo.toml` | No change (non-member) |
+| `userspace/{hello,httpd,sysinfo,todo}-rust/Cargo.toml` | No change (example crates, non-members) |

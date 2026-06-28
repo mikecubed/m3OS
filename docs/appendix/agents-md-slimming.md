@@ -1,9 +1,13 @@
 # AGENTS.md Slimming (Spec)
 
-**Status:** Specified (executes in a follow-on PR)
+**Status:** Executed in PR #270 (folded into Phase 98 — see the Execution Note below)
 **Source Ref:** phase-98
 **Track:** D
-**Summary:** Specification for cutting `AGENTS.md` from ~83 KB to ~28–30 KB (~63% reduction) by relocating the regression-gate table to `docs/appendix/regression-gates.md`, collapsing the capability-inventory bullets, and removing stale/duplicated content — with zero operational info lost.
+**Summary:** Specification (and now execution record) for cutting `AGENTS.md` by relocating the regression-gate table to `docs/appendix/regression-gates.md`, collapsing the capability-inventory bullets, and removing stale/duplicated content — with zero operational info lost.
+
+## Execution Note (PR #270)
+
+Executed as part of Phase 98 (not deferred). As-landed: `AGENTS.md` went **82,868 B → 22,313 B** (~73%, leaner than the ~28–30 KB estimate because the capability bullets + stale blocks were larger than estimated); `docs/appendix/regression-gates.md` was created with **54** `## <gate>` sections carrying every gate description verbatim; the lean inline table retained all **39** top-level gate→env-var rows; `.github/copilot-instructions.md` became a 533-byte thin pointer; the header was bumped to `v0.98.0` and the version-bump policy rewritten for the single workspace version (Track C). Relocation integrity verified: every lean-table gate has a `regression-gates.md` section, and the sub-gate env-vars `M3OS_CARGO_REGRESSION` / `M3OS_USB_ETH_REGRESSION` remain documented inside their parent gate sections.
 
 ---
 
