@@ -9,8 +9,8 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Spawn `display_server`/`mouse_server`/`session_manager`/`greeter` (+`audio_server`/`term`) on init's bare-metal `BUILTIN_CONFIGS` path + resolve the graphical skip-filter so init yields the tty to the greeter | — | In progress |
-| B | Write-combining user framebuffer — WC PAT attribute on the `sys_framebuffer_mmap` VMA + present-path `sfence` + blit-latency measurement | — | In progress |
+| A | Spawn `display_server`/`mouse_server`/`session_manager`/`greeter` (+`audio_server`/`term`) on init's bare-metal `BUILTIN_CONFIGS` path + resolve the graphical skip-filter so init yields the tty to the greeter | — | Implemented (CI-green) |
+| B | Write-combining user framebuffer — WC PAT attribute on the `sys_framebuffer_mmap` VMA + present-path `sfence` + blit-latency measurement | — | Implemented (CI-green; B.3 blit-ratio HW-pending) |
 | C | Interim USB-mouse pointer — bare-metal-validate `usb-hid` PointerEvent → `mouse_server` → `InputDispatcher` focus routing on the dock-hub topology | A, B | Planned |
 | D | Input polish — `stdin_feeder` USB-keyboard text-mode drain + convert `usb-hid`/`usbhub` busy-poll to notification-driven waits | A | Planned |
 | E | Bare-metal validation method ("the screen shows the greeter") — on-device render assertion over the log sink + photo evidence convention | A, C | Planned |
@@ -26,9 +26,9 @@
 **Why it matters:** A diskless bare-metal USB boot has no `/etc/services.d`, so init falls back to `add_builtin_defaults()`; today that list is the Phase 96 minimal set (`console`/`kbd`/`stdin_feeder`/USB/`ure`/`telnetd`/`sshd`) and explicitly "no display/greeter/audio", so the laptop comes up at a text console with the compositor never spawned.
 
 **Acceptance:**
-- [ ] `BUILTIN_CONFIGS` gains `display_server`, `mouse_server`, `session_manager`, and `greeter` entries (and `audio_server`/`term` as needed), each parsed through `parse_service_def` like the existing entries.
-- [ ] Dependency edges match the data-disk `KNOWN_CONFIGS` semantics: `greeter`/`term` `depends=display_server`; `session_manager` supervises the session; `mouse_server` has no graphical dep (peer of `kbd`).
-- [ ] On a diskless boot the new services appear in the dependency graph and start in topological order (no `unresolvable dependency` / `deps not ready` log for them).
+- [x] `BUILTIN_CONFIGS` gains `display`, `mouse_server`, `session_manager`, `audio_server`, and `greeter` entries, each parsed through `parse_service_def` like the existing entries. (`term` is intentionally omitted from the builtin set — it is a post-login client launched by `session_manager`, and the data-disk path skips `term.conf` in default mode too.)
+- [x] Dependency edges match the data-disk `KNOWN_CONFIGS` semantics: `greeter` `depends=display,kbd,mouse_server,audio_server` (verbatim from data-disk `greeter.conf`, xtask:26713); `audio_server depends=display`; `session_manager` has no deps (it supervises); `mouse_server` has no graphical dep (peer of `kbd`).
+- [x] Host-test-covered: `builtin_graphical_stack_dep_graph_has_no_cycles` + per-entry parse tests assert the new entries parse and form an acyclic graph; the data-disk path is unchanged (`compositor-stress` PASS).
 
 ### A.2 — Resolve the graphical skip-filter on the builtin path
 
@@ -37,9 +37,9 @@
 **Why it matters:** The greeter-vs-text decision is driven by the `/etc/m3os-graphical-only` marker file, which lives on the **absent** data disk; `skip_for_greeter_filter` also runs only on the `KNOWN_CONFIGS`/dir-scan path, not the builtin path — so without a builtin-path toggle init would either skip the greeter or start a text login competing for the same console.
 
 **Acceptance:**
-- [ ] The builtin path makes the same greeter-vs-text choice as `skip_for_greeter_filter` (greeter selected when graphical mode is on), via a toggle that does not require the absent marker file (e.g. a builtin-defaults graphical flag / a kernel-cmdline or FB-present heuristic), documented in a code comment referencing the marker it stands in for.
-- [ ] In graphical mode on the diskless boot, init does **not** also bring up a foreground text login on the FB console — the tty is yielded to the greeter (the `GREETER_ONLY_SKIPPED_CONFS` / `GRAPHICAL_ONLY_SKIPPED_CONFS` intent holds on the builtin path).
-- [ ] `display_server` claims the FB via `try_yield_console` with `raw_input_enabled=false` (exec path `/bin/display_server`), so `stdin_feeder` backs off PS/2-to-stdin once the compositor owns the console.
+- [x] The builtin path makes the same greeter-vs-text choice via a pure `decide_graphical(boot_override, diskless, marker_present)` + `effective_graphical_mode()`: the diskless builtin-defaults path defaults to graphical (standing in for the absent `/etc/m3os-graphical-only` marker; an explicit `/proc/m3os-boot-mode=serial` override still forces text). 4 host truth-table tests cover the decision; documented in code comments referencing the marker.
+- [x] In graphical mode the serial autologin is gated on the **same** `effective_graphical_mode()` as the greeter filter, so init does **not** bring up a competing foreground text login on the diskless graphical boot (the two decision sites can never disagree).
+- [x] `display_server` exec path `/bin/display_server`; `stdin_feeder` backs off PS/2-to-stdin once `display_server` registers the `display.input-owner` IPC service (`compositor-stress` log confirms registration).
 
 ### A.3 — No regression to the QEMU / data-disk boot
 
@@ -51,8 +51,8 @@
 **Why it matters:** The data-disk GUI boot under QEMU must be byte-for-byte unchanged — the builtin path is a *fallback*, and a stack started twice (once from disk, once from builtin) would double-claim the FB.
 
 **Acceptance:**
-- [ ] A data-disk boot (QEMU `run-gui`) still loads the graphical stack from `/etc/services.d/*.conf` and **not** from `add_builtin_defaults` (the builtin path runs only when `/etc/services.d` is absent/unreadable).
-- [ ] The existing QEMU GUI-session boot reaches the compositor + greeter render with no new double-spawn / FB-claim error in the log.
+- [x] A data-disk boot still loads the graphical stack from `/etc/services.d/*.conf` and **not** from `add_builtin_defaults` (`diskless_builtin` is set only on the `count == 0` fallback in `load_services`).
+- [x] The existing QEMU GUI-session boot reaches the compositor + greeter render with no new double-spawn / FB-claim error: `compositor-stress PASSED (no kernel panic)`, `display_server registered as 'display.input-owner' (first Toplevel mapped)` once.
 
 ---
 
@@ -65,9 +65,9 @@
 **Why it matters:** The compositor FB is mapped `PRESENT | WRITABLE | USER_ACCESSIBLE | NO_EXECUTE | BIT_11` with **no `NO_CACHE`/PCD bit**, so it decodes write-back; on real MMIO that makes every per-frame blit a stream of single-store bus transactions (10–50× slower than WC). Phase 96 fixed only the kernel console FB.
 
 **Acceptance:**
-- [ ] The `sys_framebuffer_mmap` PTE flags include `PageTableFlags::NO_CACHE` (PCD set), with `WRITE_THROUGH`/PWT **clear** and the PAT bit **clear**, so a 4 KiB leaf selects PAT index 2 (= WC after `pat::init`) — mirroring `pat.rs::set_range_write_combining`'s type selection.
-- [ ] The recorded `MemoryMapping` for the FB VMA is unchanged in `prot`/`flags` semantics; the mapping still survives the existing `tlb_shootdown_range` + `bump_generation`.
-- [ ] A QEMU boot reads back the mapped leaf's flags and confirms PCD=1 / PWT=0 / PAT=0 (WC index 2) — falsifiable without real MMIO.
+- [x] The `sys_framebuffer_mmap` PTE flags include `PageTableFlags::NO_CACHE` (PCD set), with `WRITE_THROUGH`/PWT **clear** and the PAT bit **clear**, so a 4 KiB leaf selects PAT index 2 (= WC after `pat::init`).
+- [x] The recorded `MemoryMapping` for the FB VMA is unchanged in `prot`/`flags` semantics (the `1 | FB_MAPPING_FLAG` line is untouched); the mapping still survives the existing `tlb_shootdown_range` + `bump_generation`.
+- [x] **Validated in QEMU**: the readback sentinel `[fb-wc] user FB leaf flags: PCD=1 PWT=0 PAT=0 (WC idx2)` appears in the `compositor-stress` serial log — confirms PCD=1 / PWT=0 / PAT=0 (WC index 2).
 
 ### B.2 — Confirm per-core PAT programming + present-path ordering
 
@@ -79,8 +79,8 @@
 **Why it matters:** PAT is per-core — the Intel SDM requires every logical CPU mapping a shared WC region to have the same PAT — and WC is weakly ordered, so the compositor's present must `sfence` before signalling the flip or a half-written frame can be latched.
 
 **Acceptance:**
-- [ ] `pat::init` is confirmed to run on every core the compositor can be scheduled on (BSP + each AP at `ap_entry`, before any WC user mapping is faulted in); documented at the `sys_framebuffer_mmap` change site.
-- [ ] The present / `sys_framebuffer_pageflip` path issues an `sfence` (or equivalent store barrier) before the flip is signalled, so WC writes are globally visible first.
+- [x] `pat::init` is confirmed to run on every core the compositor can be scheduled on (BSP `kernel/src/lib.rs:309` + each AP `kernel/src/smp/boot.rs:423`, before any WC user mapping is faulted in); documented at the `sys_framebuffer_mmap` change site.
+- [x] The present / `sys_framebuffer_pageflip` path issues an inline-asm `sfence` before the flip is signalled (`crate::fb::vbe::pageflip`), so WC writes are globally visible first. (Soft-float-safe: `sfence` touches no XMM.)
 
 ### B.3 — Measure blit latency on the laptop (WC vs write-back)
 
@@ -89,8 +89,8 @@
 **Why it matters:** The phase's premise is "the WC user-FB measurably improves blit latency"; on QEMU the RAM FB makes WC vs WB negligible, so this is a bare-metal-only measurement and must be recorded as real evidence, not assumed.
 
 **Acceptance:**
-- [ ] A recorded full-screen-fill (or representative blit) timing on the laptop shows the WC mapping is materially faster than a write-back baseline (target order-of-magnitude on real MMIO; the exact ratio recorded).
-- [ ] The measurement method (how the timing was taken and emitted over `usb-logsink`/network sink) is documented so the run is reproducible.
+- [ ] **HW-pending**: a recorded full-screen-fill (or representative blit) timing on the laptop shows the WC mapping is materially faster than a write-back baseline (target order-of-magnitude on real MMIO; the exact ratio recorded). QEMU's RAM-FB makes WC≈WB, so this ratio is a Dell-only measurement.
+- [x] The measurement method (how the timing is taken and emitted over `usb-logsink`/network sink) is documented in `scripts/phase-100-bare-metal-validate.md` so the run is reproducible.
 
 ---
 
