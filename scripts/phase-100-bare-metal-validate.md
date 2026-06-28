@@ -1,4 +1,8 @@
-# Phase 100 Track B — Write-Combining User Framebuffer: Bare-Metal Validation Runbook
+# Phase 100 — Bare-Metal GUI Session: Bare-Metal Validation Runbook
+
+> Started as the Track B (write-combining) runbook; §§0–3 cover the WC arm. §4
+> is the combined Phase-100 sentinel index + the five-arm recorded-run checklist
+> (Tracks B/C/D/E) referenced by the Track E.2 acceptance.
 
 **Aligned Roadmap Phase:** Phase 100 Track B (B.1/B.2/B.3)
 **Status:** Implemented (HW-unvalidated) — awaiting recorded run on Dell Precision 5560
@@ -137,6 +141,42 @@ These assertions are verifiable in QEMU and must pass before bare-metal iteratio
   `sys_framebuffer_pageflip` — the `sfence` and VMA record are non-disruptive.
 - **Existing GUI gates still pass** — `compositor-stress`, `less-render-probe`,
   `tiling-smoke` all pass, confirming no regression from the WC flag addition.
+
+## 4. Full Phase-100 sentinel index + recorded-run checklist (all five arms)
+
+### Sentinel index (grep these in the captured log: `usb-logsink` boot.log / AMT SOL / network sink)
+
+| Track | Sentinel (greppable) | Proves | CI status |
+|---|---|---|---|
+| B | `[fb-wc] user FB leaf flags: PCD=1 PWT=0 PAT=0 (WC idx2)` | user FB mapped Write-Combining (PAT idx 2) | ✅ QEMU (`compositor-stress`) |
+| B | `[fb-blit] full-screen fill elapsed_ns=<N>` (WC vs WB builds — see §1) | WC blit faster than write-back | ⏳ HW-only (QEMU RAM-FB makes WC≈WB) |
+| E.1 | `RENDER_FP frame=<n> rows_nonblank=<R> rows_changed=<C> hash=0x<hex>` | the panel actually rendered (`rows_nonblank≥50`, ≥200 @1080p) vs black (`=0`) | ✅ QEMU (`rows_nonblank=1072` observed) |
+| C.1 | `USB_HID:pointer-injected count=<n>` | a real USB mouse's reports were decoded + injected (non-zero count) | ✅ path via `usb-smoke`; dock-hub topology HW |
+| C.2 | `INPUT:pointer-focus-change surface=<id>` | focus follows a button-down over a `Toplevel` (focus-on-click) | dispatch host-tested; real-click firing HW |
+| D.2 | `USB_HID:idle ticks=<n> backoff_ns=<n>` | `usb-hid` reached the idle-backoff plateau (no busy-spin) | ⏳ HW/long-run idle measurement |
+| D.3 | `USB_HUB:idle ticks=<n> backoff_ns=<n>` | the hub walker reached the idle-backoff plateau | ⏳ HW/long-run idle measurement |
+
+### Photo evidence convention (E.2)
+
+For "the screen shows the greeter" — where an on-device sentinel cannot cover panel
+colour/backlight — commit a **dated** photo of the panel under the phase evidence
+directory (kept small), referenced by path from the task doc. Pair it with the
+`RENDER_FP` sentinel line from the same boot's captured log so the photo is
+corroborated by a falsifiable in-log fingerprint, not asserted from memory.
+
+### Five-arm recorded-run checklist (all must clear together for `Validated-on-HW`)
+
+Boot the Dell Precision 5560 from the USB image (`cargo xtask image` → `dd` → UEFI
+boot). On the diskless USB boot, `init` takes the builtin-defaults path and (no
+`/proc/m3os-boot-mode=serial` override) defaults to **graphical**, so the greeter
+should come up. Capture pre-network logs over AMT SOL and post-network over the
+network sink + `usb-logsink` boot.log, then confirm:
+
+- [ ] **Greeter renders on the panel** — `RENDER_FP … rows_nonblank≥200` in the log **and** a dated panel photo.
+- [ ] **USB mouse moves the cursor + focus follows** — non-zero `USB_HID:pointer-injected count=<n>`; cursor motion shows as small-`rows_changed` `RENDER_FP` lines; a click over a window emits `INPUT:pointer-focus-change surface=<id>`.
+- [ ] **WC blit-latency win** — `[fb-blit] … elapsed_ns` on a WC build materially below the write-back baseline build (record the ratio in the Results table).
+- [ ] **USB keyboard works in text mode** — boot with `/proc/m3os-boot-mode=serial` (or before the compositor claims the FB): typing on a USB keyboard echoes at the framebuffer login (`stdin_feeder` USB `KBD_EVENT_PULL` drain).
+- [ ] **Idle-CPU is flat** — after input settles, `USB_HID:idle` / `USB_HUB:idle` plateau sentinels appear and a CPU-occupancy probe shows no core pinned hot.
 
 ## Results
 

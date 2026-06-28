@@ -1,6 +1,6 @@
 # Phase 100 — Bare-Metal GUI Session (Dell Tiger Lake): Task List
 
-**Status:** In progress (target: `Implemented (HW-unvalidated)` — see Track E; terminal `Validated-on-HW` requires a recorded run on the physical Dell Precision 5560)
+**Status:** Implemented (HW-unvalidated) — all five tracks' CI-testable surface is green (per-track acceptance below). Terminal `Validated-on-HW (run N, date)` awaits a recorded run on the physical Dell Precision 5560 for the un-modelable arms (panel render, real USB pointer + focus-on-click, WC blit-latency ratio, USB-kbd text login, flat idle-CPU).
 **Source Ref:** phase-100
 **Depends on:** Phase 99 (SMP & Scheduler Robustness Hardening) ✅, Phase 56/68/71/72/73 (display_server / compositor clients / greeter / session_manager) ✅, Phase 96 (Bare-Metal Bring-up + console-FB write-combining) ✅
 **Goal:** Boot the physical Dell Precision 5560 (Tiger Lake) to a usable graphical session — `display_server` takes the framebuffer, `greeter` renders the login, an interim USB mouse moves the cursor with focus following, and the keyboard works — by (A) spawning the existing-but-unspawned graphical stack on init's diskless bare-metal boot path, (B) finishing the Phase 96 write-combining work for the *userspace* framebuffer in `sys_framebuffer_mmap`, (C) bare-metal-validating the `usb-hid → mouse_server → InputDispatcher` pointer datapath, (D) folding in the open Phase 96 input-polish handoff (USB text-mode keyboard + de-busy-polling `usb-hid`/`usbhub`), and (E) defining the on-metal "the screen shows the greeter" validation method. HW-only: there is no QEMU model for the real panel/MMIO-FB/pointer behavior, so validation follows `docs/appendix/bare-metal-validation.md` and the status convention is **Validated-on-HW (run N, date)**, not a bare "Complete."
@@ -11,7 +11,7 @@
 |---|---|---|---|
 | A | Spawn `display_server`/`mouse_server`/`session_manager`/`greeter` (+`audio_server`/`term`) on init's bare-metal `BUILTIN_CONFIGS` path + resolve the graphical skip-filter so init yields the tty to the greeter | — | Implemented (CI-green) |
 | B | Write-combining user framebuffer — WC PAT attribute on the `sys_framebuffer_mmap` VMA + present-path `sfence` + blit-latency measurement | — | Implemented (CI-green; B.3 blit-ratio HW-pending) |
-| C | Interim USB-mouse pointer — bare-metal-validate `usb-hid` PointerEvent → `mouse_server` → `InputDispatcher` focus routing on the dock-hub topology | A, B | Planned |
+| C | Interim USB-mouse pointer — bare-metal-validate `usb-hid` PointerEvent → `mouse_server` → `InputDispatcher` focus routing on the dock-hub topology | A, B | Sentinels in place (CI-green decode/inject + dispatch host tests); cursor-on-panel + focus-on-real-click HW-pending |
 | D | Input polish — `stdin_feeder` USB-keyboard text-mode drain + convert `usb-hid`/`usbhub` busy-poll to notification-driven waits | A | Implemented (CI-green; idle-CPU + USB-kbd-echo HW-pending; full notification → Phase 103) |
 | E | Bare-metal validation method ("the screen shows the greeter") — on-device render assertion over the log sink + photo evidence convention | A, C | E.1 Implemented (CI-green); E.2 photo + recorded HW run pending |
 
@@ -106,8 +106,8 @@
 **Why it matters:** The decode + inject path has only ever run against an emulated PS/2 mouse under QEMU; the laptop's pointer is a USB mouse behind the dock/`usbhub` walker, so this is the first time the path runs against a real pointer through a real hub on bare metal.
 
 **Acceptance:**
-- [ ] With a USB mouse attached (behind the dock/`usbhub`), `usb-hid` decodes its reports into `PointerEvent`s and injects them; a **non-zero** injected-event count is captured in the log over the dock-hub topology.
-- [ ] `mouse_server` serves the injected events ahead of its PS/2 pipeline (injected-first drain) and `display_server`'s pointer source pulls them on `MOUSE_EVENT_PULL`.
+- [x] `usb-hid` decodes pointer reports into `PointerEvent`s and injects them; the `USB_HID:pointer-injected count=<n>` sentinel fires in `usb-smoke` (serial: `USB_HID:mouse … moved=1` → `USB_HID:pointer-injected count=`). The inject path is CI-exercised; the **dock-hub topology** specificity is the HW arm.
+- [x] `mouse_server` serves injected events ahead of its PS/2 pipeline (Phase 78c `PendingEdges` injected-first drain, unchanged) and `display_server`'s pointer source pulls them on `MOUSE_EVENT_PULL` — exercised end-to-end by `usb-smoke` (mouse decoded → injected → served → rendered at the term prompt).
 
 ### C.2 — Cursor motion + focus-follows-pointer on the panel
 
@@ -119,9 +119,9 @@
 **Why it matters:** The dispatcher and its focus routing are pure-logic + QEMU-PS/2-validated only; this proves the compositor cursor and focus state respond to a real pointer on hardware (the falsifiable "the pointer works" arm).
 
 **Acceptance:**
-- [ ] Moving the USB mouse moves the compositor cursor on the panel (captured as continuous `PointerEvent` motion + a render-assertion delta, cross-referenced with Track E).
-- [ ] A button-down over a `Toplevel` produces a `PointerRouteDecision` with a `focus_change`, and the focus sentinel is captured in the log — focus follows the click.
-- [ ] No new dispatch logic was added (this is a validation arm); any change is confined to logging/sentinels.
+- [ ] **HW-pending**: moving the USB mouse moves the compositor cursor on the panel — captured as the small-`rows_changed` `RENDER_FP` delta (Track E reuse). `usb-smoke` confirms the `moved=1` decode + inject; cursor-on-real-panel is the HW arm.
+- [ ] **HW-pending capture** (code done): a button-down over a `Toplevel` produces a `PointerRouteDecision.focus_change` and emits `INPUT:pointer-focus-change surface=<id>`. The focus-on-click logic is host-tested (`pointer_button_down_on_toplevel_requests_focus_change`) and the sentinel is wired at the apply site; capturing it on a real click is HW.
+- [x] No new dispatch logic was added — `kernel-core/src/input/dispatch.rs` is untouched and its 3 `pointer_button_down` tests pass; the change is confined to the two log sentinels.
 
 ---
 
@@ -191,9 +191,9 @@
 **Why it matters:** Per the bare-metal validation strategy, a HW-only phase is Validated only when the host/QEMU surface is green **and** a recorded physical run cleared the un-modelable remainder — captured, not asserted from memory.
 
 **Acceptance:**
-- [ ] A dated panel photo (and/or the captured boot.log + render sentinel) is committed/referenced as the evidence artifact for the greeter render on `Dell Precision 5560 / Tiger Lake`.
-- [ ] The phase design doc + README Status carry `Validated-on-HW (run N, YYYY-MM-DD)` with the machine + evidence pointer once the run is recorded (Status stays `Planned` / `Implemented (HW-unvalidated)` until then — never a bare "Complete").
-- [ ] The recorded run confirms all five HW acceptance arms together: greeter renders, USB mouse moves the cursor + focus follows, WC blit-latency win measured, USB keyboard works in text mode, and `usb-hid`/`usbhub` idle-CPU is flat.
+- [ ] **HW-pending**: a dated panel photo (and/or the captured boot.log + `RENDER_FP` sentinel) is committed/referenced as the evidence artifact for the greeter render on `Dell Precision 5560 / Tiger Lake`. The capture convention + sentinel index are documented in `scripts/phase-100-bare-metal-validate.md`.
+- [x] The phase design doc + README Status now carry **`Implemented (HW-unvalidated)`** (the correct intermediate — never a bare "Complete"); they flip to `Validated-on-HW (run N, YYYY-MM-DD)` with the machine + evidence pointer once the run is recorded.
+- [ ] **HW-pending**: the recorded run confirms all five HW acceptance arms together: greeter renders, USB mouse moves the cursor + focus follows, WC blit-latency win measured, USB keyboard works in text mode, and `usb-hid`/`usbhub` idle-CPU is flat.
 
 ---
 
