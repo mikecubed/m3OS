@@ -1316,13 +1316,42 @@ impl ServiceManager {
     /// keyboard, no USB, no NIC. We parse embedded copies of the essential
     /// configs (mirrors xtask's `populate_ext2_files`) through the same
     /// `parse_service_def` path the on-disk configs use, so the dependency graph
-    /// and restart policy behave identically. Kept minimal — no display/greeter/
-    /// audio: a USB-only boot uses the kernel framebuffer console + the ramdisk
-    /// root. `usb_storage` IS included (Phase 92a added the mass-storage driver)
-    /// so a USB stick can be probed/mounted for persistent logs and as a
-    /// stepping stone toward a writable USB root. Order is irrelevant (deps
-    /// resolve by name across the set).
+    /// and restart policy behave identically.
+    ///
+    /// Phase 100 Track A.1: the graphical stack (`display_server`, `mouse_server`,
+    /// `session_manager`, `audio_server`, `greeter`) is now included so a
+    /// diskless bare-metal boot lands at the GUI greeter rather than a plain
+    /// text console. Dependency edges mirror the data-disk confs:
+    ///   - `display`  (display_server) depends on `kbd`
+    ///   - `mouse_server` has NO graphical dependency — it is a peer of `kbd`
+    ///     and starts before the compositor so pointer events are buffered early
+    ///   - `audio_server` depends on `display`
+    ///   - `greeter`  depends on `display`, `kbd`, `mouse_server`, `audio_server`
+    ///   - `session_manager` has no explicit deps (it is the session orchestrator)
+    ///
+    /// Phase 100 Track A.2: the greeter-vs-text decision is gated on
+    /// `graphical_only_enabled()` (which reads `/proc/m3os-boot-mode` — a
+    /// data-disk-free kernel proc entry — before falling back to the on-disk
+    /// `/etc/m3os-graphical-only` marker). This mirrors the
+    /// `GREETER_ONLY_SKIPPED_CONFS` / `GRAPHICAL_ONLY_SKIPPED_CONFS` filter
+    /// that `skip_for_greeter_filter` applies on the dir-scan/KNOWN_CONFIGS
+    /// path — "greeter" is skipped in non-graphical mode so init does not
+    /// start a competing text login while the compositor owns the framebuffer.
+    ///
+    /// `usb_storage` IS included so a USB stick can be probed/mounted for
+    /// persistent logs and as a stepping stone toward a writable USB root.
+    /// Order is irrelevant (deps resolve by name across the set).
     fn add_builtin_defaults(&mut self) {
+        // Phase 100 Track A.2: determine the boot mode once for the greeter
+        // filter below. `graphical_only_enabled()` reads /proc/m3os-boot-mode
+        // (exposed by the kernel — available without the data disk), then falls
+        // back to /etc/m3os-graphical-only (GRAPHICAL_ONLY_MARKER_PATH). On a
+        // diskless bare-metal boot the proc entry is the only toggle available;
+        // this call therefore stands in for the absent marker file on the
+        // builtin path, mirroring how skip_for_greeter_filter uses it on the
+        // dir-scan path.
+        let graphical = graphical_only_enabled();
+
         const BUILTIN_CONFIGS: &[&[u8]] = &[
             // console + kbd: the PS/2 and USB keyboard input pipeline to the
             // kernel framebuffer console / login tty.
@@ -1335,6 +1364,9 @@ impl ServiceManager {
             // the keyboard (SSH still works — sshd feeds its pty directly). It was
             // only in the data-disk KNOWN_CONFIGS, so bare-metal builtin-defaults
             // boots had no keyboard echo at all.
+            // In graphical mode stdin_feeder backs off PS/2-to-stdin automatically
+            // once display_server (exec path /bin/display_server) claims the
+            // console via try_yield_console — no competing text login occurs.
             b"name=stdin_feeder\ncommand=/bin/stdin_feeder\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=console,kbd\n",
             // xHCI host controller + USB HID class driver (USB keyboard/mouse).
             b"name=xhci_driver\ncommand=/drivers/xhci\ntype=daemon\nrestart=on-failure\nmax_restart=5\n",
@@ -1362,6 +1394,51 @@ impl ServiceManager {
             // Remote-login daemons (previously the only built-in defaults).
             b"name=telnetd\ncommand=/bin/telnetd\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=\n",
             b"name=sshd\ncommand=/bin/sshd\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=\n",
+
+            // ----------------------------------------------------------------
+            // Phase 100 Track A.1 — graphical stack.
+            //
+            // These entries mirror the data-disk service manifests written by
+            // xtask's `populate_ext2_files`. The builtin path is a FALLBACK
+            // (runs only when /etc/services.d is absent/unreadable and the
+            // KNOWN_CONFIGS path yields 0 services), so these cannot be
+            // double-spawned with the data-disk path — see load_services().
+            // ----------------------------------------------------------------
+
+            // display_server (registered as "display", matching data-disk conf):
+            // claims the framebuffer via try_yield_console. Exec path
+            // /bin/display_server causes stdin_feeder to back off PS/2-to-stdin
+            // once the compositor owns the console (the stdin_feeder backing-off
+            // mechanism checks the console-owner exec path). Depends on kbd so
+            // input is available before the compositor binds the framebuffer.
+            b"name=display\ncommand=/bin/display_server\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=kbd\n",
+
+            // mouse_server: a peer of kbd with NO graphical dependency. Starts
+            // before display_server so pointer events are buffered from the
+            // moment USB-HID decodes them — the display_server can drain the
+            // injected queue immediately on first compose. The data-disk conf
+            // carries depends=display for ordering purposes, but the builtin
+            // path omits that edge so the server is available as early as kbd.
+            b"name=mouse_server\ncommand=/bin/mouse_server\ntype=daemon\nrestart=on-failure\nmax_restart=5\n",
+
+            // session_manager: graphical-session orchestrator. No explicit
+            // depends= — session_manager IS the orchestrator; all downstream
+            // session services depend on it, not vice versa. Mirrors data-disk
+            // session_manager.conf (restart=on-failure max_restart=3).
+            b"name=session_manager\ncommand=/bin/session_manager\ntype=daemon\nrestart=on-failure\nmax_restart=3\n",
+
+            // audio_server: ring-3 AC'97/HDA audio driver. Depends on display
+            // matching the data-disk ordering (display brings up before audio).
+            // Command /drivers/audio_server (not /bin/) so the kernel's
+            // is_authorized_driver_process gate accepts the sys_device_claim.
+            b"name=audio_server\ncommand=/drivers/audio_server\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display\n",
+
+            // greeter: GUI login manager. Depends on display, kbd, mouse_server,
+            // audio_server — matching data-disk greeter.conf exactly. Gated by
+            // the graphical_only_enabled() check in the loop below (mirrors
+            // GREETER_ONLY_SKIPPED_CONFS on the dir-scan path): greeter is
+            // added only when graphical mode is active.
+            b"name=greeter\ncommand=/bin/greeter\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display,kbd,mouse_server,audio_server\n",
         ];
         let mut i = 0;
         while i < BUILTIN_CONFIGS.len() {
@@ -1372,8 +1449,23 @@ impl ServiceManager {
             if let Some(svc) = parse_service_def(cfg, cfg.len())
                 && !Self::is_disabled(svc.name.as_bytes())
             {
-                self.services[self.count] = svc;
-                self.count += 1;
+                // Phase 100 Track A.2: greeter-vs-text filter on the builtin
+                // path. Mirrors the GREETER_ONLY_SKIPPED_CONFS decision that
+                // skip_for_greeter_filter makes on the dir-scan path:
+                //   - graphical mode  → add greeter (graphical_only_enabled()
+                //     read /proc/m3os-boot-mode, which is data-disk-free,
+                //     standing in for the absent /etc/m3os-graphical-only marker)
+                //   - non-graphical   → skip greeter so init does not start a
+                //     competing text login on the framebuffer console
+                if bytes_eq(svc.name.as_bytes(), b"greeter") && !graphical {
+                    write_str(
+                        STDOUT_FILENO,
+                        "init: skipped greeter (greeter disabled in default boot; serial path active)\n",
+                    );
+                } else {
+                    self.services[self.count] = svc;
+                    self.count += 1;
+                }
             }
             i += 1;
         }
