@@ -18441,7 +18441,7 @@ fn smp_smoke_steps(fast_iter: bool) -> Vec<SmokeStep> {
 }
 
 /// `cargo xtask smp-smoke` — permanent multi-core SMP regression gate. Boots Node
-/// on **multiple cores** (default `-smp 4`; `M3OS_SMP=<N≥2>` overrides) and runs
+/// on **multiple cores** (default `-smp 8`; `M3OS_SMP=<N≥2>` overrides) and runs
 /// the futex-heavy threadpool stress above. Honors `M3OS_KVM=1` (near-native; also
 /// exposes real PKU so the JIT/W^X-v2 paths are covered) and
 /// `M3OS_NODE_FAST_ITER=1` (reuse an installed disk). SKIPs cleanly when the host
@@ -18529,14 +18529,17 @@ fn cmd_smp_smoke(args: &SmokeBootArgs) {
             *arg = "user,id=net0".to_string();
         }
     }
-    // FORCE multi-core — the whole point of the gate. Default 4; M3OS_SMP=<N≥2>
-    // overrides (a value < 2 is ignored, since a single core cannot exercise the
-    // cross-core races this gate guards).
+    // FORCE multi-core — the whole point of the gate. Default 8 (Phase 99: the
+    // Dell Tiger Lake laptop the bare-metal GUI arc targets is 8-core/16-thread
+    // and cannot pin `-smp 1`, so the futex WAIT/WAKE handshake must be proven at
+    // that core count). `M3OS_SMP=<N≥2>` overrides — CI's 2-vCPU runners set
+    // `M3OS_SMP=2` (a value < 2 is ignored, since a single core cannot exercise
+    // the cross-core races this gate guards).
     let cores = std::env::var("M3OS_SMP")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .filter(|n| *n >= 2)
-        .unwrap_or(4);
+        .unwrap_or(8);
     for i in 0..qemu_args.len() {
         if qemu_args[i] == "-smp" && i + 1 < qemu_args.len() {
             qemu_args[i + 1] = cores.to_string();

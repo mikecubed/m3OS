@@ -6466,6 +6466,100 @@ fn dump_dispatch_state() {
     log::warn!("[sched] dispatch-dump: end");
 }
 
+/// Phase 99 (Track A.3) — on-demand / watchdog scheduler-state dump.
+///
+/// Emits ONE `[sched] task pid=X state=Y wake_deadline=Z on_cpu=W` line per
+/// live task in the scheduler table — the diagnostic the 2026-04-25
+/// scheduler-design handoff (recommendation #3) asked for. It turns a "task
+/// stuck in `Blocked*` forever" symptom into direct per-task evidence at the
+/// moment of hang, which is exactly what the prior lost-wake debugging
+/// (Phase 89/90b/95, the 2026-06-14 cross-core lost-wake) lacked.
+///
+/// Unlike [`dump_dispatch_state`] (which only covers `Ready`/`Running` tasks for
+/// the fairness-failure fingerprint), this covers **every** non-`Dead` task —
+/// the whole point is to surface the blocked waiters whose wake never arrived.
+///
+/// # Lock discipline (ISR-safe / lock-aware)
+///
+/// Uses the **non-blocking** [`try_scheduler_lock`]: if `SCHEDULER.lock` is
+/// already held (a raced dispatcher, or a caller that holds it), it logs a
+/// note and returns rather than deadlocking or panicking — mirroring the
+/// existing `try_lock_scheduler` usage elsewhere. It acquires ONLY
+/// `SCHEDULER.lock`, never `pi_lock`, so it cannot invert the `pi_lock`-outer /
+/// `SCHEDULER.lock`-inner invariant. `on_cpu` is an atomic read with `Relaxed`;
+/// all logging happens after the guard is dropped (log macros may allocate).
+pub fn dump_scheduler_state() {
+    struct Row {
+        pid: u32,
+        name: &'static str,
+        idx: usize,
+        state: super::TaskState,
+        wake_deadline: Option<u64>,
+        on_cpu: bool,
+        blocked_since: u64,
+    }
+
+    let mut rows: alloc::vec::Vec<Row> = alloc::vec::Vec::new();
+    {
+        // Non-blocking: never deadlock the diagnostic against the dispatcher.
+        let Some(sched) = try_scheduler_lock() else {
+            log::warn!("[sched] dump_scheduler_state: SCHEDULER.lock busy — skipped (best-effort)");
+            return;
+        };
+        for (idx, task) in sched.tasks.iter().enumerate() {
+            // Recycled dead slots carry no wait state worth printing.
+            if task.state == super::TaskState::Dead {
+                continue;
+            }
+            rows.push(Row {
+                pid: task.pid,
+                name: task.name,
+                idx,
+                state: task.state,
+                wake_deadline: task.wake_deadline,
+                on_cpu: task.on_cpu.load(Ordering::Relaxed),
+                blocked_since: task.blocked_since_tick,
+            });
+        }
+        // SCHEDULER.lock released here (before logging, which may allocate).
+    }
+
+    let now = crate::arch::x86_64::interrupts::tick_count();
+    log::warn!(
+        "[sched] dump_scheduler_state: now-tick={} live-tasks={}",
+        now,
+        rows.len()
+    );
+    for row in &rows {
+        // The canonical four fields (`pid` `state` `wake_deadline` `on_cpu`) are
+        // emitted contiguously and in order so the line is greppable; `name`,
+        // `idx`, and the derived `blocked_since` age trail as context.
+        match row.wake_deadline {
+            Some(d) => log::warn!(
+                "[sched] task pid={} state={:?} wake_deadline={} on_cpu={} name={} idx={} (deadline in {}ms, blocked~{}ms)",
+                row.pid,
+                row.state,
+                d,
+                row.on_cpu,
+                row.name,
+                row.idx,
+                d as i64 - now as i64,
+                now.saturating_sub(row.blocked_since),
+            ),
+            None => log::warn!(
+                "[sched] task pid={} state={:?} wake_deadline=none on_cpu={} name={} idx={} (blocked~{}ms)",
+                row.pid,
+                row.state,
+                row.on_cpu,
+                row.name,
+                row.idx,
+                now.saturating_sub(row.blocked_since),
+            ),
+        }
+    }
+    log::warn!("[sched] dump_scheduler_state: end");
+}
+
 /// Periodic stuck-task watchdog scan.
 ///
 /// Called from the BSP's scheduler dispatch loop on every iteration.
@@ -6612,6 +6706,14 @@ pub fn watchdog_scan() {
                 // without holding scheduler locks across the dump.
                 if !TRACE_DUMP_FIRED.swap(true, Ordering::AcqRel) {
                     TRACE_DUMP_PENDING.store(true, Ordering::Release);
+                    // Phase 99 (Track A.3) — emit the per-task scheduler-state
+                    // census exactly at the stuck-no-waker verdict, so the
+                    // lost-wake forensic (which task is parked on what state,
+                    // with what deadline / on_cpu) is captured at the moment of
+                    // hang. Safe here: SCHEDULER.lock is released (the snapshot
+                    // loop above dropped it), so the non-blocking
+                    // `dump_scheduler_state` re-take cannot self-deadlock.
+                    dump_scheduler_state();
                     // Dump notification waiter/pending/signal state to classify
                     // a BlockedOnNotif strand (lost-wakeup-after-register vs a
                     // never-fired device IRQ). Safe here: SCHEDULER.lock is

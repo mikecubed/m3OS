@@ -9,11 +9,11 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Blocking-primitive consolidation: call-site audit, futex conformance, scheduler-state diagnostic, `smp-smoke` raised to `-smp 8` | 57a–e | Planned |
-| B | Fault-handling robustness: locks-across-faults audit, kstack-overflow origin, recovery-stack review | 2026-06-14 tracks A–D | Planned |
-| C | 4 GiB SMP panic-path AP-quiesce (diagnosability) + residual OOM/race pass | A (diagnostic reuse) | Planned |
-| D | Step-25 `dynlink-hello-versioned-mismatch-smoke` demand-fault NULL-deref flake → root-cause + fix + soak | B (fault-handler audit) | Planned |
-| E | Two correctness bugs: `copy_file_range`/`sendfile`→EFAULT, 55c `net::remote` RX-test encoder | — | Planned |
+| A | Blocking-primitive consolidation: call-site audit, futex conformance, scheduler-state diagnostic, `smp-smoke` raised to `-smp 8` | 57a–e | In Progress — audit+fix+diagnostic+`-smp 8` landed; SMP-8 validation pending |
+| B | Fault-handling robustness: locks-across-faults audit, kstack-overflow origin, recovery-stack review | 2026-06-14 tracks A–D | In Progress — audit+`debug_assert`+origin doc landed; gate validation pending |
+| C | 4 GiB SMP panic-path AP-quiesce (diagnosability) + residual OOM/race pass | A (diagnostic reuse) | In Progress — C.1 quiesce landed; capture/C.2 pass pending |
+| D | Step-25 `dynlink-hello-versioned-mismatch-smoke` demand-fault NULL-deref flake → root-cause + fix + soak | B (fault-handler audit) | In Progress — CI-correlated; local repro + root-cause-by-inspection |
+| E | Two correctness bugs: `copy_file_range`/`sendfile`→EFAULT, 55c `net::remote` RX-test encoder | — | In Progress — E.2 already fixed (f39ca133, Phase 57b); E.1 in progress |
 
 ---
 
